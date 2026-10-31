@@ -452,15 +452,22 @@ pub struct PerCpuScheduler {
 Each `Task` carries its scheduling entity (`Task.se`, Linux
 sched_entity + `__state`/`on_rq`): `state` (`SleepState` as an
 atomic), `on_rq` (queued or running), `on_cpu` (running, or its CPU
-still switching away from it), `prio`, the priority-list `link`, the
-saved switch frame, and the WakeQ link; plus
+still switching away from it), the scheduling class and Linux
+parameters (`class`, `policy`, `static_prio`, `rt_priority`,
+`reset_on_fork`; SCHED_RR's slice), the run-list `link`, the saved
+switch frame, and the WakeQ link; plus
 `Task.pi_lock` (IrqSpinlock, Linux pi_lock). The run queue owns one
 reference to each task of its CPU, from its first wakeup (or creation
 asleep) until its final switch away (`DeadTask`; Linux: the task's own
 usage count put in finish_task_switch); its lists and `curr` hold none
-of their own. `prio` is written under TASKLIST (setpriority,
-sched_setscheduler) and read lock-free; a queued task moves at its
-next enqueue.
+of their own. The class and parameters are written under the task's
+pi_lock and rq lock (`change_class`: setpriority, sched_setscheduler;
+a queued task is taken off its list first and put back on its new one)
+and read lock-free. Classes (Linux sched_class), highest first: stop
+(`migration/N`), rt (SCHED_FIFO/RR: 99 levels, FIFO never time-sliced,
+RR every 100 ms, a preempted rt task keeps the head of its level), fair
+(SCHED_NORMAL/BATCH/IDLE, one-tick round robin), idle (never queued).
+A woken task preempts a lower class or a lower rt priority.
 
 Each `PerCpu` (per-CPU data) contains:
 ```rust

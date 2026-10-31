@@ -70,17 +70,14 @@ pub fn sys_getcpu<A: crate::uaccess::UaccessArch>(cpu: u32, cpup: u64, nodep: u6
 /// # Locking
 /// Acquires TASKLIST lock briefly to read priority.
 pub fn sys_getpriority(which: i32, who: u64, caller_pid: Pid) -> i64 {
-    use super::{PRIO_PGRP, PRIO_PROCESS, PRIO_USER, priority_to_nice};
+    use super::{PRIO_PGRP, PRIO_PROCESS, PRIO_USER};
 
     match which {
         PRIO_PROCESS => {
             let target_pid = if who == 0 { caller_pid } else { who };
-            match super::percpu::lookup_task_priority(target_pid) {
-                Some(priority) => {
-                    let nice = priority_to_nice(priority);
-                    // Return 20 - nice (range 1-40) to avoid negative return values
-                    (20 - nice) as i64
-                }
+            match super::percpu::lookup_task_nice(target_pid) {
+                // 20 - nice (range 1-40) to avoid negative return values
+                Some(nice) => (20 - nice) as i64,
                 None => KernelError::NoProcess.sysret(),
             }
         }
@@ -94,8 +91,8 @@ pub fn sys_getpriority(which: i32, who: u64, caller_pid: Pid) -> i64 {
             };
             super::percpu::get_tids_by_pgid(pgid)
                 .into_iter()
-                .filter_map(super::percpu::lookup_task_priority)
-                .map(|p| (20 - priority_to_nice(p)) as i64)
+                .filter_map(super::percpu::lookup_task_nice)
+                .map(|n| (20 - n) as i64)
                 .max()
                 .unwrap_or(KernelError::NoProcess.sysret())
         }
@@ -112,8 +109,8 @@ pub fn sys_getpriority(which: i32, who: u64, caller_pid: Pid) -> i64 {
 /// EACCES for a lower nice beyond RLIMIT_NICE without CAP_SYS_NICE.
 /// `error` is the result so far: a success turns ESRCH into 0.
 fn set_one_prio(tid: Pid, niceval: i32, caller_euid: super::Uid, error: i64) -> i64 {
-    use super::{CAP_SYS_NICE, capable, nice_to_priority, priority_to_nice};
-    let Some(prio) = super::percpu::lookup_task_priority(tid) else {
+    use super::{CAP_SYS_NICE, capable};
+    let Some(cur_nice) = super::percpu::lookup_task_nice(tid) else {
         return error;
     };
     let target = super::percpu::TASKLIST.read().get(tid).map(|t| t.cred());
@@ -126,11 +123,11 @@ fn set_one_prio(tid: Pid, niceval: i32, caller_euid: super::Uid, error: i64) -> 
     // Linux can_nice: 20 - nice within the target's RLIMIT_NICE
     let rlim = crate::rlimit::get_task_rlimit(tid, crate::rlimit::RLIMIT_NICE)
         .map_or(crate::rlimit::RLIM_INFINITY, |r| r.rlim_cur);
-    let lower = niceval < priority_to_nice(prio);
+    let lower = niceval < cur_nice;
     if lower && (20 - niceval) as u64 > rlim && !capable(CAP_SYS_NICE) {
         return KernelError::PermissionDenied.sysret();
     }
-    match super::percpu::set_task_priority(tid, nice_to_priority(niceval)) {
+    match super::percpu::set_task_nice(tid, niceval) {
         Ok(()) if error == KernelError::NoProcess.sysret() => 0,
         Ok(()) => error,
         Err(errno) => -(errno as i64),

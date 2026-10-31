@@ -17,6 +17,14 @@
 //! - BALANCE: spinners started together on one CPU spread to at least
 //!   two once allowed everywhere (load balancing; widening the mask
 //!   alone moves nothing, as their CPU stays allowed).
+//! - SCHED_PRIO_FIELDS: nice and policy changes read back as on Linux
+//!   (getpriority, sched_get*, /proc/self/stat priority, nice,
+//!   rt_priority, policy); an rt task set back to SCHED_OTHER keeps its
+//!   nice; SCHED_RESET_ON_FORK gives an rt parent a nice-0 SCHED_OTHER
+//!   child.
+//! - RT_FIFO: a SCHED_FIFO spinner keeps a SCHED_OTHER spinner on its
+//!   CPU from running, and is not time-sliced against another FIFO task
+//!   of the same priority.
 //! - ASYNC_SIG_REGS: every general register (rcx/r11 on x86, x0-x30 on
 //!   arm64) holds its value across a SIGUSR1 handler that interrupts a
 //!   spin loop; on x86 the loop runs with DF set (`std`), which the
@@ -40,7 +48,178 @@ pub fn run_tests() {
     test_smp_spread();
     test_affinity_migrate();
     test_balance();
+    test_sched_prio_fields();
+    test_rt_fifo();
     test_async_sig_regs();
+}
+
+/// Fields 18 (priority), 19 (nice), 40 (rt_priority), 41 (policy) of
+/// /proc/self/stat
+fn stat_sched() -> [i64; 4] {
+    use hk_syscall::{O_RDONLY, sys_close, sys_open, sys_read};
+    let mut b = [0u8; 1024];
+    let fd = sys_open(b"/proc/self/stat\0".as_ptr(), O_RDONLY, 0);
+    if fd < 0 {
+        return [i64::MIN; 4];
+    }
+    let n = sys_read(fd as u64, b.as_mut_ptr(), b.len() as u64).max(0) as usize;
+    sys_close(fd as u64);
+    let b = &b[..n];
+    let Some(rp) = b.iter().rposition(|&c| c == b')') else {
+        return [i64::MIN; 4];
+    };
+    // Fields after the comm: the state is field 3
+    let mut out = [i64::MIN; 4];
+    for (k, f) in b[rp + 2..].split(|&c| c == b' ' || c == b'\n').enumerate() {
+        let slot = match k + 3 {
+            18 => 0,
+            19 => 1,
+            40 => 2,
+            41 => 3,
+            _ => continue,
+        };
+        let (neg, d) = match f.first() {
+            Some(b'-') => (true, &f[1..]),
+            _ => (false, f),
+        };
+        let v = d.iter().fold(0i64, |a, &c| a * 10 + (c - b'0') as i64);
+        out[slot] = if neg { -v } else { v };
+    }
+    out
+}
+
+/// SCHED_PRIO_FIELDS: see the module doc (in a child: it changes its own
+/// policy)
+fn test_sched_prio_fields() {
+    use super::sk::T;
+    use hk_syscall::{
+        SchedParam, sys_getpriority, sys_sched_getparam, sys_sched_getscheduler,
+        sys_sched_setscheduler, sys_setpriority,
+    };
+    const SCHED_OTHER: i32 = 0;
+    const SCHED_FIFO: i32 = 1;
+    const RESET_ON_FORK: i32 = 0x4000_0000;
+    let pid = sys_fork();
+    if pid == 0 {
+        let mut t = T::new(b"SCHED_PRIO_FIELDS");
+        t.eq(b"setpriority", sys_setpriority(0, 0, 5), 0);
+        t.eq(b"getpriority", sys_getpriority(0, 0), 15);
+        let s = stat_sched();
+        t.eq(b"stat prio nice", s[0] * 100 + s[1], 25 * 100 + 5);
+        let p = SchedParam { sched_priority: 10 };
+        t.eq(b"set fifo", sys_sched_setscheduler(0, SCHED_FIFO, &p), 0);
+        t.eq(b"getscheduler", sys_sched_getscheduler(0), SCHED_FIFO as i64);
+        let mut q = SchedParam { sched_priority: 0 };
+        sys_sched_getparam(0, &mut q);
+        t.eq(b"getparam", q.sched_priority as i64, 10);
+        let s = stat_sched();
+        t.eq(b"stat fifo prio", s[0], -11);
+        t.eq(b"stat fifo nice", s[1], 5);
+        t.eq(b"stat rt_priority policy", s[2] * 100 + s[3], 10 * 100 + 1);
+        let z = SchedParam { sched_priority: 0 };
+        t.eq(b"set other", sys_sched_setscheduler(0, SCHED_OTHER, &z), 0);
+        let s = stat_sched();
+        t.eq(b"other keeps nice", s[0] * 100 + s[1], 25 * 100 + 5);
+        t.eq(
+            b"fifo reset",
+            sys_sched_setscheduler(0, SCHED_FIFO | RESET_ON_FORK, &p),
+            0,
+        );
+        t.eq(
+            b"getscheduler reset",
+            sys_sched_getscheduler(0),
+            (SCHED_FIFO | RESET_ON_FORK) as i64,
+        );
+        let c = sys_fork();
+        if c == 0 {
+            let s = stat_sched();
+            let ok = sys_sched_getscheduler(0) == SCHED_OTHER as i64 && s[0] == 20 && s[1] == 0;
+            sys_exit(if ok { 0 } else { 1 });
+        }
+        let mut st = 0i32;
+        sys_wait4(c, &mut st, 0, 0);
+        t.eq(b"reset child", st as i64, 0);
+        t.done();
+        sys_exit(0);
+    }
+    let mut st = 0i32;
+    sys_wait4(pid, &mut st, 0, 0);
+}
+
+/// A child pinned to `cpu`, SCHED_FIFO at `prio` if nonzero, counting in
+/// `counter` for `ms` (forever if 0), then exiting
+fn spinner(cpu: u32, prio: i32, counter: *mut u64, ms: i64) -> i64 {
+    use hk_syscall::{SchedParam, sys_sched_setscheduler};
+    let pid = sys_fork();
+    if pid == 0 {
+        let m = 1u64 << cpu;
+        sys_sched_setaffinity(0, 8, &m);
+        if prio != 0 {
+            sys_sched_setscheduler(0, 1, &SchedParam { sched_priority: prio });
+        }
+        let end = now_ms() + ms;
+        loop {
+            // SAFETY: the shared page the parent mapped
+            unsafe { counter.write_volatile(counter.read_volatile() + 1) };
+            if ms != 0 && now_ms() >= end {
+                sys_exit(0);
+            }
+        }
+    }
+    pid
+}
+
+/// RT_FIFO: see the module doc. The FIFO spinners run for 300 ms (Linux
+/// throttles rt tasks to 95% of each second, so no throttling within
+/// the window)
+fn test_rt_fifo() {
+    use super::sk::T;
+    let mut t = T::new(b"RT_FIFO");
+    let page = sys_mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if !t.ok(b"mmap", page >= 0, page) {
+        t.done();
+        return;
+    }
+    let c = page as *mut u64;
+    let cpu = {
+        let mut m = [0u64; 16];
+        sys_sched_getaffinity(0, core::mem::size_of_val(&m), m.as_mut_ptr());
+        63 - m[0].leading_zeros()
+    };
+    // SAFETY: counters 0..3 of the shared page
+    let at = |i: usize| unsafe { c.add(i).read_volatile() };
+    let other = spinner(cpu, 0, c, 0);
+    sleep_ms(50);
+    let fifo = spinner(cpu, 10, unsafe { c.add(1) }, 300);
+    // Let the FIFO spinner start, then measure the other one during it
+    sleep_ms(50);
+    let o0 = at(0);
+    sleep_ms(150);
+    let o1 = at(0);
+    let f = at(1);
+    let mut st = 0i32;
+    sys_wait4(fifo, &mut st, 0, 0);
+    sleep_ms(20);
+    let s0 = at(0);
+    sleep_ms(150);
+    let solo = at(0) - s0;
+    reap(other);
+    t.ok(b"fifo ran", f > 0, f as i64);
+    // Starved while the FIFO task spins: under a fifth of its solo rate
+    t.ok(b"other starved", (o1 - o0) * 5 < solo.max(1), (o1 - o0) as i64);
+    // Two FIFO tasks of one priority on one CPU: the second waits for
+    // the first to finish
+    let a = spinner(cpu, 10, unsafe { c.add(2) }, 300);
+    sleep_ms(50);
+    let b = spinner(cpu, 10, unsafe { c.add(3) }, 50);
+    sleep_ms(100);
+    let (ca, cb) = (at(2), at(3));
+    sys_wait4(a, &mut st, 0, 0);
+    sys_wait4(b, &mut st, 0, 0);
+    t.ok(b"first ran", ca > 0, ca as i64);
+    t.eq(b"no time slice", cb as i64, 0);
+    sys_munmap(page as u64, 4096);
+    t.done();
 }
 
 /// BALANCE: see the module doc (Linux sched_balance_rq)

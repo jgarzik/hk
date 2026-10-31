@@ -19,7 +19,7 @@ use crate::arch::{
 use crate::cpu::PerCpu;
 use crate::printkln;
 use crate::sync::spin::RwLock;
-use crate::task::sched::PrioQueue;
+use crate::task::sched::{self, Class, ClassQueues};
 use crate::task::{Cred, PRIORITY_IDLE, Pid, Priority, Task, TaskKind, TaskState, Tid};
 
 /// Clear the child TID and wake futex waiters
@@ -103,8 +103,6 @@ pub struct UserTaskConfig {
     pub pgid: Pid,
     /// Session ID
     pub sid: Pid,
-    /// Scheduling priority
-    pub priority: Priority,
     /// Kernel stack top address
     pub kstack_top: u64,
     /// User stack top address
@@ -174,7 +172,7 @@ crate::adapter!(RunAdapter, KernelTask, se.link);
 pub struct CpuRunQueue {
     /// Runnable tasks but the running one and the idle task (allocated
     /// with the idle task)
-    queue: Option<alloc::boxed::Box<PrioQueue<RunAdapter>>>,
+    queue: Option<alloc::boxed::Box<ClassQueues<RunAdapter>>>,
     /// The running task (null until this CPU's first switch)
     curr: *const KernelTask,
     /// This CPU's idle task (Linux rq->idle): runs when nothing is
@@ -260,15 +258,33 @@ impl CpuRunQueue {
         }
     }
 
-    fn queue(&mut self) -> &mut PrioQueue<RunAdapter> {
+    fn queue(&mut self) -> &mut ClassQueues<RunAdapter> {
         self.queue.as_mut().expect("run queue not initialized")
     }
 
-    /// Put `p` (runnable, neither running nor queued) on its priority's
+    /// Put `p` (runnable, neither running nor queued) on its class's
     /// list (Linux enqueue_task)
     fn enqueue(&mut self, p: &KernelTask) {
         // SAFETY: the rq owns a reference to `p`; it is on no list
-        unsafe { self.queue().push(p, p.se.prio()) };
+        unsafe {
+            self.queue()
+                .push(p, p.se.class(), p.se.rt_priority(), false)
+        };
+    }
+
+    /// Put the task switched away from back: an rt task preempted
+    /// before its slice ran out keeps the head of its level (Linux
+    /// put_prev_task_rt), anything else goes to the tail
+    fn enqueue_prev(&mut self, p: &KernelTask, preempted: bool) {
+        let head = preempted && p.se.class() == Class::Rt && !p.se.take_requeue_tail();
+        // SAFETY: as for `enqueue`
+        unsafe { self.queue().push(p, p.se.class(), p.se.rt_priority(), head) };
+    }
+
+    /// Take queued `p` off its list (Linux dequeue_task)
+    fn dequeue(&mut self, p: &KernelTask) {
+        // SAFETY: queued, so on its class's list of this run queue
+        unsafe { self.queue().remove(p, p.se.class(), p.se.rt_priority()) };
     }
 
     /// Make `p` runnable (Linux ttwu_do_activate): Running, and queued
@@ -290,14 +306,20 @@ impl CpuRunQueue {
         }
     }
 
-    /// A task made runnable preempts the idle task or a running task of
-    /// lower priority (Linux check_preempt_curr -> resched_curr)
+    /// A task made runnable preempts the running one of a lower class,
+    /// or of the rt class at a lower rt priority (Linux wakeup_preempt:
+    /// a higher class always wins; within rt, the higher priority);
+    /// a fair task waits for the tick
     fn check_preempt(&self, p: &KernelTask) {
         // SAFETY: the running task, kept alive by this run queue
         let Some(curr) = (unsafe { self.curr.as_ref() }) else {
             return;
         };
-        if self.curr_is_idle() || p.se.prio() > curr.se.prio() {
+        let (pc, cc) = (p.se.class(), curr.se.class());
+        if self.curr_is_idle()
+            || pc < cc
+            || (pc == Class::Rt && cc == Class::Rt && p.se.rt_priority() > curr.se.rt_priority())
+        {
             self.resched_curr();
         }
     }
@@ -1066,13 +1088,6 @@ fn create_kernel_task(
         exit_signal: 0, // Kernel threads don't send exit signals
         pdeath_signal: 0,
         state: TaskState::Ready,
-        policy: if priority == PRIORITY_IDLE {
-            crate::task::SCHED_IDLE
-        } else {
-            crate::task::SCHED_NORMAL
-        },
-        rt_priority: 0,
-        reset_on_fork: false,
         page_table: ArchPageTable::kernel_identity(),
         // TLS fields (not used for idle task)
         clear_child_tid: 0,
@@ -1123,7 +1138,7 @@ fn create_kernel_task(
         task_inner,
     );
 
-    task.se.set_prio(priority);
+    set_kthread_class(&task.se, priority);
     // SAFETY: not on a run queue yet
     unsafe { *task.se.ctx() = TaskContext::new_kernel_thread(entry, stack_top) };
     let task = Arc::new(task);
@@ -1139,7 +1154,7 @@ fn create_kernel_task(
 /// Make `idle` the idle task of `cpu`, allocating its priority lists
 /// (bring-up, before the CPU schedules)
 fn set_idle(cpu: u32, idle: &TaskRef) {
-    let q = alloc::boxed::Box::new(PrioQueue::new());
+    let q = alloc::boxed::Box::new(ClassQueues::new());
     idle.se.set_on_rq(true);
     let mut rq = get_percpu_sched(cpu).lock.lock();
     rq.queue = Some(q);
@@ -1275,9 +1290,6 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<Tid, &'static str> {
         exit_signal: crate::signal::SIGCHLD as i32, // Default: notify parent with SIGCHLD
         pdeath_signal: 0,
         state: TaskState::Running, // Will be running immediately
-        policy: crate::task::SCHED_NORMAL,
-        rt_priority: 0,
-        reset_on_fork: false,
         page_table: config.page_table,
         // TLS fields (initialized to 0, set by syscalls)
         clear_child_tid: 0,
@@ -1335,7 +1347,6 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<Tid, &'static str> {
     // The boot-allocated stack of the first task is never freed; its
     // switch frame is saved at its first switch out
     task.se.disown_stack();
-    task.se.set_prio(config.priority);
     task.se.set_state(RUNNING);
     task.se.set_on_rq(true);
     task.se.set_on_cpu(true);
@@ -1794,10 +1805,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         parent_ppid,
         parent_pgid,
         parent_sid,
-        parent_priority,
-        parent_policy,
-        parent_rt_priority,
-        parent_reset_on_fork,
+        parent_sched,
         parent_cpus_allowed,
         parent_pt_phys,
         parent_cred,
@@ -1816,10 +1824,12 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
             parent.task.ppid(),
             parent.task.pgid(),
             parent.task.sid(),
-            parent.task.se.prio(),
-            parent.policy,
-            parent.rt_priority,
-            parent.reset_on_fork,
+            (
+                parent.task.se.policy(),
+                parent.task.se.static_prio(),
+                parent.task.se.rt_priority(),
+                parent.task.se.reset_on_fork(),
+            ),
             parent.task.cpus_mask.snapshot(),
             parent.page_table.root_table_phys(),
             parent.cred_arc(),
@@ -1856,12 +1866,17 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         return Err(22); // EINVAL
     }
 
-    // Handle SCHED_RESET_ON_FORK: child gets SCHED_NORMAL with nice 0
-    let (child_policy, child_rt_priority, child_priority) = if parent_reset_on_fork {
-        (crate::task::SCHED_NORMAL, 0, crate::task::PRIORITY_NORMAL)
-    } else {
-        (parent_policy, parent_rt_priority, parent_priority)
-    };
+    // The child inherits the policy and priorities; with
+    // SCHED_RESET_ON_FORK an rt parent's child is SCHED_NORMAL nice 0,
+    // and a negative nice becomes 0 (Linux sched_fork)
+    let (mut c_policy, mut c_static, mut c_rt, reset) = parent_sched;
+    if reset {
+        if crate::task::is_rt_policy(c_policy) {
+            (c_policy, c_static, c_rt) = (crate::task::SCHED_NORMAL, sched::DEFAULT_PRIO, 0);
+        } else if c_static < sched::DEFAULT_PRIO {
+            c_static = sched::DEFAULT_PRIO;
+        }
+    }
 
     // The child's pid, numbered in each level of the parent's pid
     // namespace (Linux alloc_pid); a new process's pid is its tid
@@ -1938,9 +1953,6 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         exit_signal: config.exit_signal, // From clone3 args (SIGCHLD for fork, 0 for threads)
         pdeath_signal: 0,                // Never inherited, must be set explicitly via prctl
         state: TaskState::Ready,
-        policy: child_policy,
-        rt_priority: child_rt_priority,
-        reset_on_fork: false, // Never inherited - child must set explicitly
         page_table: child_pt,
         // TLS fields - will be set based on clone flags below
         clear_child_tid: 0,
@@ -2028,7 +2040,9 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     if parent_nproc_exceeded {
         child_task.set_flag(crate::task::pf::NPROC_EXCEEDED);
     }
-    child_task.se.set_prio(child_priority);
+    child_task
+        .se
+        .set_params(policy_class(c_policy), c_policy, c_static, c_rt);
     // SAFETY: not on a run queue yet
     unsafe { *child_task.se.ctx() = context };
 
@@ -2697,6 +2711,30 @@ fn set_task_cpu(p: &KernelTask, cpu: u32) {
     p.cpu.store(cpu, Ordering::Release);
 }
 
+/// The class of SCHED_* `policy` (Linux __setscheduler_class)
+fn policy_class(policy: i32) -> Class {
+    if crate::task::is_rt_policy(policy) {
+        Class::Rt
+    } else {
+        Class::Fair
+    }
+}
+
+/// A kernel thread's class from its creator's priority hint: the idle
+/// task, the stoppers (Linux sched_set_stop_task, shown as FIFO 99),
+/// SCHED_FIFO 1 for the high ones (`ktimers/N`, as Linux PREEMPT_RT
+/// ktimers), the rest SCHED_NORMAL nice 0
+fn set_kthread_class(se: &sched::SchedEntity, prio: Priority) {
+    use crate::task::{PRIORITY_HIGH, PRIORITY_REALTIME, SCHED_FIFO, SCHED_NORMAL};
+    let d = sched::DEFAULT_PRIO;
+    match prio {
+        PRIORITY_IDLE => se.set_params(Class::Idle, SCHED_NORMAL, d, 0),
+        PRIORITY_REALTIME => se.set_params(Class::Stop, SCHED_FIFO, d, 99),
+        PRIORITY_HIGH => se.set_params(Class::Rt, SCHED_FIFO, d, 1),
+        _ => se.set_params(Class::Fair, SCHED_NORMAL, d, 0),
+    }
+}
+
 /// Why a CPU is being chosen (Linux WF_TTWU / WF_FORK)
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Placement {
@@ -2892,8 +2930,9 @@ fn sched_balance_rq(this: u32) {
     }
     let mut moved = [core::ptr::null::<KernelTask>(); NR_MIGRATE];
     let want = (((sn - dn) / 2) as usize).clamp(1, NR_MIGRATE);
-    // Queued tasks are on the lists; the running one and idle are not
-    let n = src.queue().take(&mut moved[..want], |t| {
+    // Queued fair tasks (Linux load_balance moves cfs tasks; rt tasks
+    // are placed at wakeup): the running one and idle are on no list
+    let n = src.queue().take_fair(&mut moved[..want], |t| {
         // SAFETY: on this run queue's list, kept alive by the scheduler
         unsafe { &*t }.cpus_mask.test(this)
     });
@@ -2956,8 +2995,7 @@ fn move_queued_task(
     p: &KernelTask,
     dest: u32,
 ) {
-    // SAFETY: queued, so on its priority's list of this run queue
-    unsafe { rq.queue().remove(p, p.se.prio()) };
+    rq.dequeue(p);
     rq.add_nr(-1);
     set_task_cpu(p, dest);
     drop(rq);
@@ -3160,7 +3198,18 @@ pub fn scheduler_tick() {
     if let Some(cpu) = crate::cpu::try_this_id() {
         balance_tick(cpu);
     }
-    current().set_tif(crate::task::tif::NEED_RESCHED);
+    // The running task's slice (Linux task_tick of its class): fair and
+    // idle one tick, SCHED_RR its RR_TICKS, SCHED_FIFO and the stoppers
+    // none (they run until they block or something higher wakes)
+    let me = current();
+    let resched = match me.se.class() {
+        Class::Stop => false,
+        Class::Rt => me.se.policy() == crate::task::SCHED_RR && me.se.rr_tick(),
+        Class::Fair | Class::Idle => true,
+    };
+    if resched {
+        me.set_tif(crate::task::tif::NEED_RESCHED);
+    }
 }
 
 /// Get current tick count
@@ -3275,14 +3324,14 @@ pub fn sleep_current_until(wake_tick: u64) {
 /// The current thread stays runnable and goes to the back of its priority
 /// queue; another runnable thread (if any) gets to run.
 pub fn yield_now() {
-    yield_cpu();
+    yield_cpu(false);
 }
 
 /// A scheduling point in a long kernel loop (Linux cond_resched): yield
 /// only if this task's slice is used up (TIF_NEED_RESCHED)
 pub fn cond_resched() {
     if current().has_tif(crate::task::tif::NEED_RESCHED) {
-        yield_cpu();
+        yield_cpu(true);
     }
 }
 
@@ -3290,13 +3339,15 @@ pub fn cond_resched() {
 /// (TIF_NEED_RESCHED; Linux schedule() in exit_to_user_mode_loop): like
 /// `yield_now`, an involuntary switch if another task runs
 pub fn preempt_schedule_user() {
-    if yield_cpu() {
+    if yield_cpu(true) {
         current().nivcsw.fetch_add(1, Ordering::Relaxed);
     }
 }
 
-/// `yield_now`; true if another task ran meanwhile
-fn yield_cpu() -> bool {
+/// Switch to the next task if there is one, staying runnable: true if
+/// another task ran meanwhile. `preempted`: a preemption (NEED_RESCHED),
+/// not sched_yield, so an rt task keeps its place (`enqueue_prev`)
+fn yield_cpu(preempted: bool) -> bool {
     crate::sync::might_sleep();
     let Some(sched) = this_sched() else {
         return false;
@@ -3307,11 +3358,10 @@ fn yield_cpu() -> bool {
     if rq.curr.is_null() {
         return false;
     }
-    // Back of its priority's list (at its current priority); the idle
-    // task is never queued
+    // Back on its class's list; the idle task is never queued
     me.se.set_state(RUNNING);
     if !rq.curr_is_idle() {
-        rq.enqueue(&me);
+        rq.enqueue_prev(&me, preempted);
     }
     let next = rq.pick_next();
     if core::ptr::eq(next, &*me) {
@@ -3448,12 +3498,12 @@ pub fn lookup_task_sid(pid: Pid) -> Option<Pid> {
     table.get(pid).map(|t| t.task.sid())
 }
 
-/// Look up a task's priority by PID
+/// Look up a task's nice value by PID
 ///
 /// Returns None if the process is not found.
-pub fn lookup_task_priority(pid: Pid) -> Option<Priority> {
+pub fn lookup_task_nice(pid: Pid) -> Option<i32> {
     let table = TASKLIST.read();
-    table.get(pid).map(|t| t.task.se.prio())
+    table.get(pid).map(|t| t.task.se.nice())
 }
 
 /// Look up a task's scheduling policy by PID
@@ -3463,8 +3513,8 @@ pub fn lookup_task_priority(pid: Pid) -> Option<Priority> {
 pub fn lookup_task_policy(pid: Pid) -> Option<i32> {
     let table = TASKLIST.read();
     table.get(pid).map(|t| {
-        let mut policy = t.policy;
-        if t.reset_on_fork {
+        let mut policy = t.task.se.policy();
+        if t.task.se.reset_on_fork() {
             policy |= crate::task::SCHED_RESET_ON_FORK;
         }
         policy
@@ -3477,7 +3527,7 @@ pub fn lookup_task_policy(pid: Pid) -> Option<i32> {
 /// For SCHED_NORMAL tasks, returns 0.
 pub fn lookup_task_rt_priority(pid: Pid) -> Option<i32> {
     let table = TASKLIST.read();
-    table.get(pid).map(|t| t.rt_priority)
+    table.get(pid).map(|t| t.task.se.rt_priority() as i32)
 }
 
 /// Get a task's CPU time statistics by TID
@@ -3546,8 +3596,8 @@ pub fn lookup_task_cpus_allowed(pid: Pid) -> Option<crate::cpumask::CpuSet> {
 ///   - EINVAL (22): Invalid policy or priority
 ///
 /// # Locking
-/// Acquires TASKLIST lock. Does not re-queue task in run queue (policy
-/// change takes effect on next schedule).
+/// The task's pi_lock and rq lock (`change_class`): a queued task moves
+/// to its new class's list at once.
 pub fn set_task_scheduler(pid: Pid, policy: i32, rt_priority: i32) -> Result<(), i32> {
     use crate::task::{
         MAX_RT_PRIO, MIN_RT_PRIO, SCHED_BATCH, SCHED_FIFO, SCHED_IDLE, SCHED_NORMAL,
@@ -3575,29 +3625,18 @@ pub fn set_task_scheduler(pid: Pid, policy: i32, rt_priority: i32) -> Result<(),
         return Err(22); // EINVAL - non-RT policies must have priority 0
     }
 
-    let mut table = TASKLIST.write();
-    match table.get_mut(pid) {
-        Some(mut task) => {
-            task.policy = base_policy;
-            task.rt_priority = rt_priority;
-            task.reset_on_fork = reset_on_fork;
-
-            // Update internal priority based on policy
-            // RT tasks get priority in range 200-254 (higher than normal)
-            // Normal tasks keep their nice-based priority
-            if is_rt_policy(base_policy) {
-                // Map rt_priority 1-99 to internal priority 156-254
-                // (above PRIORITY_NORMAL=128, below PRIORITY_REALTIME=255)
-                task.task.se.set_prio((155 + rt_priority) as Priority);
-            } else if base_policy == SCHED_IDLE {
-                task.task.se.set_prio(crate::task::PRIORITY_IDLE);
-            }
-            // For SCHED_NORMAL/BATCH, keep existing nice-based priority
-
-            Ok(())
-        }
-        None => Err(3), // ESRCH
-    }
+    let task = TASKLIST.read().task(pid).ok_or(3)?; // ESRCH
+    let static_prio = task.se.static_prio();
+    change_class(&task, |se| {
+        se.set_params(
+            policy_class(base_policy),
+            base_policy,
+            static_prio,
+            rt_priority as u8,
+        );
+        se.set_reset_on_fork(reset_on_fork);
+    });
+    Ok(())
 }
 
 /// Set a task's CPU affinity mask by PID
@@ -3633,41 +3672,43 @@ pub fn task_count() -> usize {
     table.len()
 }
 
-/// Set a task's priority by PID
+/// Set a task's nice value by PID (Linux set_user_nice: static_prio,
+/// whatever its policy; it counts for the fair class)
 ///
-/// Returns Ok(()) on success, Err(errno) on failure.
 /// Error codes:
 /// - ESRCH (3): Process not found
-pub fn set_task_priority(pid: Pid, priority: Priority) -> Result<(), i32> {
+pub fn set_task_nice(pid: Pid, nice: i32) -> Result<(), i32> {
     let task = TASKLIST.read().task(pid).ok_or(3)?; // ESRCH
-    reprio(&task, priority);
+    let static_prio = (sched::DEFAULT_PRIO as i32 + nice.clamp(-20, 19)) as u8;
+    change_class(&task, |se| {
+        se.set_params(se.class(), se.policy(), static_prio, se.rt_priority())
+    });
     Ok(())
 }
 
-/// Give `p` priority `prio`: a queued task moves to its new priority's
-/// list and may preempt (Linux set_user_nice: dequeue, change, enqueue
-/// under the task's rq lock)
-fn reprio(p: &KernelTask, prio: Priority) {
+/// Change `p`'s scheduling class or parameters with `f` (Linux
+/// __sched_setscheduler, set_user_nice: dequeue, change, enqueue under
+/// its pi_lock and rq lock): a queued task moves to its new list and
+/// may preempt; the running one reschedules, so the next pick sees the
+/// change
+fn change_class(p: &KernelTask, f: impl FnOnce(&sched::SchedEntity)) {
     let _pi = p.pi_lock.lock();
     if !cpu_has_scheduler(p.cpu()) {
-        p.se.set_prio(prio);
+        f(&p.se);
         return;
     }
     let mut rq = task_rq_lock(p);
     let pp = p as *const KernelTask;
-    let queued = p.se.on_rq() && !core::ptr::eq(rq.curr, pp) && !core::ptr::eq(rq.idle, pp);
+    let running = core::ptr::eq(rq.curr, pp);
+    let queued = p.se.on_rq() && !running && !core::ptr::eq(rq.idle, pp);
     if queued {
-        // SAFETY: a queued task is on its priority's list of this rq
-        unsafe { rq.queue().remove(p, p.se.prio()) };
+        rq.dequeue(p);
     }
-    let old = p.se.prio();
-    p.se.set_prio(prio);
+    f(&p.se);
     if queued {
         rq.enqueue(p);
         rq.check_preempt(p);
-    } else if core::ptr::eq(rq.curr, pp) && prio < old {
-        // The running task dropped: a queued one may now outrank it
-        // (Linux set_user_nice -> resched_curr)
+    } else if running {
         rq.resched_curr();
     }
 }

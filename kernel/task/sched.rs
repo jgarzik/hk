@@ -1,15 +1,48 @@
 //! The scheduler's part of a task (Linux sched_entity plus the
-//! run-queue fields of task_struct) and the priority queue built from
-//! it: 256 intrusive lists with an O(1) highest-priority lookup
-//! (bitmap). Nothing here allocates, so run queues change in interrupt
-//! context.
+//! scheduling fields of task_struct) and the run queue lists built from
+//! it, one set per scheduling class (Linux sched_class): stop (the CPU
+//! stoppers), rt (SCHED_FIFO/RR: 100 levels with an O(1)
+//! highest-priority lookup), fair (SCHED_NORMAL/BATCH/IDLE) and idle
+//! (the idle task, never queued). Nothing here allocates, so run queues
+//! change in interrupt context.
 
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU32, Ordering};
 
 use super::Priority;
 use crate::list::{Adapter, Link, List};
+
+/// Scheduling class, highest first (Linux stop/rt/fair/idle_sched_class)
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(u8)]
+pub enum Class {
+    /// The CPU stoppers (`migration/N`)
+    Stop = 0,
+    /// SCHED_FIFO, SCHED_RR
+    Rt = 1,
+    /// SCHED_NORMAL, SCHED_BATCH, SCHED_IDLE
+    Fair = 2,
+    /// The idle task
+    Idle = 3,
+}
+
+impl Class {
+    fn from_u8(v: u8) -> Self {
+        match v {
+            0 => Class::Stop,
+            1 => Class::Rt,
+            2 => Class::Fair,
+            _ => Class::Idle,
+        }
+    }
+}
+
+/// Linux NICE_TO_PRIO(0): static_prio of nice 0
+pub const DEFAULT_PRIO: u8 = 120;
+
+/// SCHED_RR's time slice in ticks (Linux RR_TIMESLICE, 100 ms)
+pub const RR_TICKS: u32 = 10;
 
 /// The arch's switch frame (callee-saved registers)
 pub type TaskContext = <crate::arch::CurrentArch as crate::arch::ContextOps>::TaskContext;
@@ -37,9 +70,21 @@ pub struct SchedEntity {
     /// p->on_cpu): set when it is made current, cleared by the task
     /// switched to once the switch is complete (finish_task_switch)
     on_cpu: AtomicBool,
-    /// Priority (Linux p->prio): written under TASKLIST, read lock-free;
-    /// a queued task moves at its next enqueue
-    prio: AtomicU8,
+    /// Scheduling class (`Class`)
+    class: AtomicU8,
+    /// SCHED_* policy (Linux p->policy)
+    policy: AtomicU8,
+    /// 100 + 20 + nice (Linux p->static_prio)
+    static_prio: AtomicU8,
+    /// 1..99 for SCHED_FIFO/RR, else 0 (Linux p->rt_priority)
+    rt_priority: AtomicU8,
+    /// A fork child starts with SCHED_NORMAL and nice >= 0 (Linux
+    /// p->sched_reset_on_fork)
+    reset_on_fork: AtomicBool,
+    /// SCHED_RR: ticks left of its slice (Linux p->rt.time_slice)
+    rr_left: AtomicU32,
+    /// Its slice ran out: requeued at the tail, not the head
+    requeue_tail: AtomicBool,
     /// Its place in a priority list (under the rq lock)
     pub link: Link,
     /// Saved kernel context while switched out (under the rq lock)
@@ -57,13 +102,20 @@ unsafe impl Sync for SchedEntity {}
 unsafe impl Send for SchedEntity {}
 
 impl SchedEntity {
-    pub const fn new(prio: Priority, state: u8) -> Self {
+    /// A SCHED_NORMAL nice 0 entity in sleep state `state`
+    pub const fn new(state: u8) -> Self {
         Self {
             state: AtomicU8::new(state),
             on_rq: AtomicBool::new(false),
             on_cpu: AtomicBool::new(false),
             contrib_load: AtomicBool::new(false),
-            prio: AtomicU8::new(prio),
+            class: AtomicU8::new(Class::Fair as u8),
+            policy: AtomicU8::new(0),
+            static_prio: AtomicU8::new(DEFAULT_PRIO),
+            rt_priority: AtomicU8::new(0),
+            reset_on_fork: AtomicBool::new(false),
+            rr_left: AtomicU32::new(RR_TICKS),
+            requeue_tail: AtomicBool::new(false),
             link: Link::new(),
             // SAFETY: a switch frame is plain integers; zero is valid
             ctx: UnsafeCell::new(unsafe { MaybeUninit::zeroed().assume_init() }),
@@ -109,12 +161,61 @@ impl SchedEntity {
         self.on_cpu.store(v, Ordering::Release);
     }
 
-    pub fn prio(&self) -> Priority {
-        self.prio.load(Ordering::Relaxed)
+    pub fn class(&self) -> Class {
+        Class::from_u8(self.class.load(Ordering::Relaxed))
     }
 
-    pub fn set_prio(&self, p: Priority) {
-        self.prio.store(p, Ordering::Relaxed);
+    pub fn policy(&self) -> i32 {
+        self.policy.load(Ordering::Relaxed) as i32
+    }
+
+    pub fn static_prio(&self) -> u8 {
+        self.static_prio.load(Ordering::Relaxed)
+    }
+
+    /// Linux task_nice
+    pub fn nice(&self) -> i32 {
+        self.static_prio() as i32 - DEFAULT_PRIO as i32
+    }
+
+    pub fn rt_priority(&self) -> u8 {
+        self.rt_priority.load(Ordering::Relaxed)
+    }
+
+    pub fn reset_on_fork(&self) -> bool {
+        self.reset_on_fork.load(Ordering::Relaxed)
+    }
+
+    /// Set the scheduling class and parameters (the task's pi_lock and
+    /// rq lock held, and off the run queue lists, or not yet started)
+    pub fn set_params(&self, class: Class, policy: i32, static_prio: u8, rt_priority: u8) {
+        self.class.store(class as u8, Ordering::Relaxed);
+        self.policy.store(policy as u8, Ordering::Relaxed);
+        self.static_prio.store(static_prio, Ordering::Relaxed);
+        self.rt_priority.store(rt_priority, Ordering::Relaxed);
+        self.rr_left.store(RR_TICKS, Ordering::Relaxed);
+    }
+
+    pub fn set_reset_on_fork(&self, v: bool) {
+        self.reset_on_fork.store(v, Ordering::Relaxed);
+    }
+
+    /// SCHED_RR tick (its own CPU's tick): true once its slice is used
+    /// up, which starts a new one and requeues it at the tail (Linux
+    /// task_tick_rt)
+    pub fn rr_tick(&self) -> bool {
+        if self.rr_left.fetch_sub(1, Ordering::Relaxed) > 1 {
+            return false;
+        }
+        self.rr_left.store(RR_TICKS, Ordering::Relaxed);
+        self.requeue_tail.store(true, Ordering::Relaxed);
+        true
+    }
+
+    /// Whether a preempted task goes to the tail (its slice ran out),
+    /// clearing that
+    pub fn take_requeue_tail(&self) -> bool {
+        self.requeue_tail.swap(false, Ordering::Relaxed)
     }
 
     /// The switch frame
@@ -168,6 +269,17 @@ impl<A: Adapter> PrioQueue<A> {
         self.bitmap[p / 64] |= 1u64 << (p % 64);
     }
 
+    /// Put `item` first at priority `prio`
+    ///
+    /// # Safety
+    /// As for `push`.
+    pub unsafe fn push_front(&mut self, item: *const A::Item, prio: Priority) {
+        let p = prio as usize;
+        // SAFETY: see above
+        unsafe { self.lists[p].push_front(item) };
+        self.bitmap[p / 64] |= 1u64 << (p % 64);
+    }
+
     /// Remove `item`, queued at `prio`
     ///
     /// # Safety
@@ -200,39 +312,102 @@ impl<A: Adapter> PrioQueue<A> {
     pub fn is_empty(&self) -> bool {
         self.bitmap == [0; 4]
     }
+}
 
-    /// Remove up to `out.len()` items `f` accepts, highest priority
-    /// first, each list from its front; the number taken (into `out`)
-    pub fn take(
+impl<A: Adapter> Default for PrioQueue<A> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A run queue's lists, one set per class (Linux rq->{stop, rt, cfs}):
+/// the stoppers, the rt priority levels (by rt_priority, 1..99), and the
+/// fair tasks in arrival order
+pub struct ClassQueues<A: Adapter> {
+    stop: List<A>,
+    rt: PrioQueue<A>,
+    fair: List<A>,
+}
+
+impl<A: Adapter> ClassQueues<A> {
+    pub const fn new() -> Self {
+        Self {
+            stop: List::new(),
+            rt: PrioQueue::new(),
+            fair: List::new(),
+        }
+    }
+
+    /// Queue `item` of `class` (rt: at `rt_prio`); at the front of its
+    /// list if `head` (a preempted rt task keeps its place)
+    ///
+    /// # Safety
+    /// `item` is live, on no list, and stays live until removed.
+    pub unsafe fn push(&mut self, item: *const A::Item, class: Class, rt_prio: u8, head: bool) {
+        // SAFETY: see above
+        unsafe {
+            match class {
+                Class::Stop => self.stop.push_back(item),
+                Class::Rt if head => self.rt.push_front(item, rt_prio),
+                Class::Rt => self.rt.push(item, rt_prio),
+                Class::Fair => self.fair.push_back(item),
+                Class::Idle => unreachable!("the idle task is never queued"),
+            }
+        }
+    }
+
+    /// Remove `item`, queued as `class` (rt: at `rt_prio`)
+    ///
+    /// # Safety
+    /// `item` is on that list.
+    pub unsafe fn remove(&mut self, item: *const A::Item, class: Class, rt_prio: u8) {
+        // SAFETY: see above
+        unsafe {
+            match class {
+                Class::Stop => self.stop.remove(item),
+                Class::Rt => self.rt.remove(item, rt_prio),
+                Class::Fair => self.fair.remove(item),
+                Class::Idle => {}
+            }
+        }
+    }
+
+    /// Remove and return the next task to run: stop, then the highest
+    /// rt priority, then the first fair task (Linux pick_next_task)
+    pub fn pop(&mut self) -> Option<*const A::Item> {
+        self.stop
+            .pop_front()
+            .or_else(|| self.rt.pop())
+            .or_else(|| self.fair.pop_front())
+    }
+
+    /// Remove up to `out.len()` fair tasks `f` accepts, oldest first
+    /// (the load balancer moves fair tasks); the number taken
+    pub fn take_fair(
         &mut self,
         out: &mut [*const A::Item],
         mut f: impl FnMut(*const A::Item) -> bool,
     ) -> usize {
         let mut n = 0;
-        for p in (0..NUM_PRIORITIES).rev() {
-            if self.bitmap[p / 64] & (1u64 << (p % 64)) == 0 {
-                continue;
+        let mut it = self.fair.front();
+        while let Some(item) = it {
+            if n == out.len() {
+                break;
             }
-            let mut it = self.lists[p].front();
-            while let Some(item) = it {
-                if n == out.len() {
-                    return n;
-                }
-                // SAFETY: `item` is on this list
-                it = unsafe { self.lists[p].next(item) };
-                if f(item) {
-                    // SAFETY: as above
-                    unsafe { self.remove(item, p as Priority) };
-                    out[n] = item;
-                    n += 1;
-                }
+            // SAFETY: `item` is on the fair list
+            it = unsafe { self.fair.next(item) };
+            if f(item) {
+                // SAFETY: as above
+                unsafe { self.fair.remove(item) };
+                out[n] = item;
+                n += 1;
             }
         }
         n
     }
 }
 
-impl<A: Adapter> Default for PrioQueue<A> {
+impl<A: Adapter> Default for ClassQueues<A> {
     fn default() -> Self {
         Self::new()
     }

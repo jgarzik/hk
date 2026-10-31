@@ -372,6 +372,17 @@ GFP_KERNEL allocation in atomic context. LOCKDEP has no such report
 call site to attribute it to, so the sites (allocations under spin locks
 across net, fs, ipc) cannot be audited yet.
 
+## Rare arm64 hang: a CPU stops answering cross-CPU calls
+
+**Location**: unknown (`make check-arm`, right after CLOCK_NANOSLEEP)
+
+Seen once during phase K (class rework under test): `csd: CPU#3
+waiting 1000 ms for CPU#2 to run a cross-CPU call` (and CPU#1), then
+no progress until the boot timeout, no panic or soft lockup report:
+CPU 2 sat with interrupts off. Not reproduced in the following runs.
+Next occurrence: dump CPU 2's state from the csd report (send it an
+NMI-like FIQ, or record the last IrqSpinlock taken per CPU).
+
 ## Unconfirmed: Arc<T> field corruption in the USB mass-storage driver
 
 **Location**: `kernel/usb/msc.rs`

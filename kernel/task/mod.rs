@@ -350,25 +350,6 @@ pub const PRIO_MIN: i32 = -20;
 /// Maximum nice value (lowest priority)
 pub const PRIO_MAX: i32 = 19;
 
-/// Convert Linux nice value to internal priority
-///
-/// Nice values range from -20 (highest priority) to 19 (lowest priority).
-/// Internal priority ranges from 0 (lowest) to 255 (highest).
-///
-/// Mapping: nice -20 -> 188, nice 0 -> 128, nice 19 -> 71
-pub fn nice_to_priority(nice: i32) -> Priority {
-    let clamped = nice.clamp(PRIO_MIN, PRIO_MAX);
-    // Map nice -20..19 to priority ~188..71
-    (128 - (clamped * 3)) as Priority
-}
-
-/// Convert internal priority to Linux nice value
-///
-/// This is the inverse of nice_to_priority.
-pub fn priority_to_nice(priority: Priority) -> i32 {
-    ((128i32 - priority as i32) / 3).clamp(PRIO_MIN, PRIO_MAX)
-}
-
 // =============================================================================
 // Linux scheduling policy constants (from include/uapi/linux/sched.h)
 // =============================================================================
@@ -1031,12 +1012,6 @@ pub struct TaskInner<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A
     // =========================================================================
     /// Current state
     pub state: TaskState,
-    /// Scheduling policy (SCHED_NORMAL, SCHED_FIFO, SCHED_RR, etc.)
-    pub policy: i32,
-    /// Real-time priority (1-99 for SCHED_FIFO/RR, 0 otherwise)
-    pub rt_priority: i32,
-    /// Reset scheduling policy on fork (SCHED_RESET_ON_FORK was set)
-    pub reset_on_fork: bool,
     /// CPU affinity mask (bit N = CPU N is allowed)
     /// Page table for this task
     pub page_table: PT,
@@ -1480,7 +1455,7 @@ impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Tas
             cpus_mask: crate::cpumask::CpuMask::from_set(cpus),
             pagefault_disabled: AtomicU32::new(0),
             rx_cpu: AtomicU32::new(u32::MAX),
-            se: sched::SchedEntity::new(PRIORITY_NORMAL, 0),
+            se: sched::SchedEntity::new(0),
             pi_lock: crate::arch::IrqSpinlock::new(()),
             ppid: AtomicU64::new(ids.ppid),
             pgid: AtomicU64::new(ids.pgid),
@@ -1535,7 +1510,7 @@ impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Tas
             cpus_mask: crate::cpumask::CpuMask::new(),
             pagefault_disabled: AtomicU32::new(0),
             rx_cpu: AtomicU32::new(u32::MAX),
-            se: sched::SchedEntity::new(PRIORITY_NORMAL, 0),
+            se: sched::SchedEntity::new(0),
             pi_lock: crate::arch::IrqSpinlock::new(()),
             ppid: AtomicU64::new(0),
             pgid: AtomicU64::new(0),
