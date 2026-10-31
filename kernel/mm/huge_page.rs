@@ -172,9 +172,13 @@ pub fn split_huge_pmd(mm: &super::Mm, va: u64) -> Option<u64> {
     // The hardware may have set accessed/dirty until the clear: `old`
     // is the value cleared
     let base = paging::split_table(pt, old);
-    paging::pmd_populate(pmdp, pt);
+    // The 512 pages are separate pages (refcounts, rmap) before any walker
+    // can see them: a zap waiting out PMD_SPLITTING frees them through
+    // the table the moment it appears (Linux __split_huge_pmd_locked:
+    // pmd_populate last)
     crate::FRAME_ALLOCATOR.split_huge(base);
     split_rmap(base);
+    paging::pmd_populate(pmdp, pt);
     Some(base)
 }
 
