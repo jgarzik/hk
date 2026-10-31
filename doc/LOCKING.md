@@ -194,13 +194,21 @@ each, as `LOCKDEP:FAIL` (so the boot test fails):
   not checked (listener -> child `cb`, `lock2` of two unix sockets).
 - **IRQ safety:** a tracked lock taken in an interrupt handler (the timer
   tick and device IRQ dispatch call `lockdep::irq_enter/exit`).
+- **Interrupts on with an `IrqSpinlock` held** (Linux lockdep's
+  inconsistent lock state): each guard saves the interrupt state it
+  found and restores it on release, so guards must be released in
+  reverse order; one released early turns interrupts back on under the
+  other lock, and an interrupt that takes it spins forever on its own
+  CPU. A per-CPU count of held `IrqSpinlock`s (a lock held across a
+  context switch counts on the CPU) catches a release that re-enables
+  interrupts while the count is nonzero.
 
 The held-lock stacks are per CPU (the kernel is not preemptive and a task
 never sleeps holding a spin lock, which is itself checked), the edge
 table is a fixed array: nothing allocates. Power-off prints a
 `lockdep: N reports, M order edges` summary. `IrqSpinlock` acquisitions
 are not tracked for order (they are leaves or near-leaves); they count
-through the preempt count.
+through the preempt count and the held count above.
 
 ### 1.6 Atomic Types
 
@@ -509,7 +517,9 @@ only at that task's return to user mode (`entry::exit_to_user_mode`).
    balancer (`sched_balance_rq`, Linux; from the tick, every tick on an
    idle CPU and every 8 on a busy one, and from the idle loop before it
    halts) finds the busiest CPU by `nr_running`, takes both run queues
-   with `double_rq_lock` (lowest CPU first) and moves queued tasks that
+   with `double_rq_lock` (lowest CPU first, released in reverse: one
+   `DoubleRq` guard, so interrupts come back on only once both are
+   free) and moves queued tasks that
    may run here, never the running one, at most 32 per pass, with no
    pi_lock: it found them on the list, and `set_task_cpu` is under both
    rq locks.

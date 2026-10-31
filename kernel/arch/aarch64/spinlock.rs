@@ -83,6 +83,7 @@ impl<T> IrqSpinlock<T> {
             core::hint::spin_loop();
         }
 
+        crate::sync::lockdep::irqsafe_acquire();
         IrqSpinlockGuard {
             lock: self,
             irq_state,
@@ -107,6 +108,7 @@ impl<T> IrqSpinlock<T> {
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_ok()
         {
+            crate::sync::lockdep::irqsafe_acquire();
             Some(IrqSpinlockGuard {
                 lock: self,
                 irq_state,
@@ -184,6 +186,10 @@ impl<T> Drop for IrqSpinlockGuard<'_, T> {
 
         // Re-enable preemption (decrement preempt_count)
         percpu::preempt_enable();
+        crate::sync::lockdep::irqsafe_release(
+            self.lock as *const _ as *const u8 as usize,
+            self.irq_state & (1 << 7) == 0,
+        );
 
         // Restore interrupt state (must be LAST, after preempt_enable)
         restore_irq(self.irq_state);

@@ -2959,21 +2959,38 @@ pub fn try_to_wake_up(p: &KernelTask, mode: WakeMode) -> bool {
 /// Most tasks one balancing pass moves (Linux sysctl_sched_nr_migrate)
 const NR_MIGRATE: usize = 32;
 
+/// Two run queues locked lowest CPU first (Linux double_rq_lock),
+/// released in reverse: each guard restores the interrupt state it
+/// found, so the second lock's (interrupts off) goes first and the
+/// first lock's turns them back on once both are free
+struct DoubleRq {
+    /// Taken second: fields drop in declaration order
+    inner: crate::arch::IrqSpinlockGuard<'static, CpuRunQueue>,
+    outer: crate::arch::IrqSpinlockGuard<'static, CpuRunQueue>,
+    /// `outer` is `b`'s
+    swapped: bool,
+}
+
+impl DoubleRq {
+    /// The run queues of `a` and `b`, in that order
+    fn split(&mut self) -> (&mut CpuRunQueue, &mut CpuRunQueue) {
+        if self.swapped {
+            (&mut self.inner, &mut self.outer)
+        } else {
+            (&mut self.outer, &mut self.inner)
+        }
+    }
+}
+
 /// Lock the run queues of CPUs `a` and `b` (different), lowest CPU
-/// first (Linux double_rq_lock); the guards in (a, b) order
-fn double_rq_lock(
-    a: u32,
-    b: u32,
-) -> (
-    crate::arch::IrqSpinlockGuard<'static, CpuRunQueue>,
-    crate::arch::IrqSpinlockGuard<'static, CpuRunQueue>,
-) {
-    if a < b {
-        let ga = get_percpu_sched(a).lock.lock();
-        (ga, get_percpu_sched(b).lock.lock())
-    } else {
-        let gb = get_percpu_sched(b).lock.lock();
-        (get_percpu_sched(a).lock.lock(), gb)
+/// first (Linux double_rq_lock)
+fn double_rq_lock(a: u32, b: u32) -> DoubleRq {
+    let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+    let outer = get_percpu_sched(lo).lock.lock();
+    DoubleRq {
+        inner: get_percpu_sched(hi).lock.lock(),
+        outer,
+        swapped: a > b,
     }
 }
 
@@ -3020,7 +3037,8 @@ fn sched_balance_rq(this: u32) {
     if busiest == this || max <= nr_running(this) + 1 {
         return;
     }
-    let (mut src, mut dst) = double_rq_lock(busiest, this);
+    let mut rqs = double_rq_lock(busiest, this);
+    let (src, dst) = rqs.split();
     let (sn, dn) = (nr_running(busiest), nr_running(this));
     if sn <= dn + 1 {
         return;

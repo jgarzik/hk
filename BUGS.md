@@ -389,16 +389,6 @@ across net, fs, ipc) cannot be audited yet.
 - Kernel preemption is off: a long kernel path delays a woken task of
   a higher class until its next scheduling point.
 
-## Rare arm64 hang: a CPU stops answering cross-CPU calls
-
-**Location**: unknown (`make check-arm`, right after CLOCK_NANOSLEEP)
-
-Rare: `csd: CPU#3 waiting 1000 ms for CPU#2 to run a cross-CPU call`
-(and CPU#1), then no progress until the boot timeout, no panic or soft
-lockup report: CPU 2 sat with interrupts off.
-Next occurrence: dump CPU 2's state from the csd report (send it an
-NMI-like FIQ, or record the last IrqSpinlock taken per CPU).
-
 ## Unconfirmed: Arc<T> field corruption in the USB mass-storage driver
 
 **Location**: `kernel/usb/msc.rs`
