@@ -146,10 +146,15 @@ impl SchedEntity {
     }
 
     /// Set the sleep state; a full barrier orders it before the caller's
-    /// condition check (Linux smp_store_mb in set_current_state)
+    /// condition check (Linux smp_store_mb in set_current_state). The
+    /// fence is needed: a SeqCst swap alone (arm64 ldaxr/stlxr) lets a
+    /// later relaxed load, such as the TIF_SIGPENDING or flag a waker set
+    /// before its try_to_wake_up, be satisfied before the store is
+    /// visible, and both sides then miss each other (a lost wakeup)
     #[inline]
     pub fn set_state(&self, s: u8) {
-        self.state.swap(s, Ordering::SeqCst);
+        self.state.store(s, Ordering::SeqCst);
+        core::sync::atomic::fence(Ordering::SeqCst);
     }
 
     #[inline]
