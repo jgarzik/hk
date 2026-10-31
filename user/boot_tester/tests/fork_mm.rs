@@ -1186,15 +1186,26 @@ pub(super) unsafe fn spawn_thread_ptid(
     ret
 }
 
-/// Wait (bounded) for the thread whose tid word is `ctid` to exit
+/// Wait (up to 60 s) for the thread whose tid word is `ctid` to exit:
+/// its exit clears the word and wakes a futex wait on it
+/// (CLONE_CHILD_CLEARTID). Bounded by time, not by a count of yields,
+/// which a waiter alone on its CPU runs through at once.
 pub(super) fn join(ctid: *mut u32) -> bool {
-    for _ in 0..2_000_000u32 {
-        if unsafe { core::ptr::read_volatile(ctid) } == 0 {
+    let t0 = super::sk::now_ms();
+    loop {
+        let v = unsafe { core::ptr::read_volatile(ctid) };
+        if v == 0 {
             return true;
         }
-        sys_sched_yield();
+        if super::sk::now_ms() - t0 > 60_000 {
+            return false;
+        }
+        let ts = hk_syscall::Timespec {
+            tv_sec: 0,
+            tv_nsec: 100_000_000,
+        };
+        hk_syscall::sys_futex(ctid, hk_syscall::FUTEX_WAIT, v, &ts, core::ptr::null_mut(), 0);
     }
-    false
 }
 
 /// Child of one race round: its pages must not change (the writer

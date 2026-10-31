@@ -214,7 +214,11 @@ fn test_fault_storm() {
     STORM_STOP.store(1, Ordering::Relaxed);
     ok &= wait_thread(3);
     let bad = STORM_BAD.load(Ordering::Relaxed);
-    sys_munmap(base, STORM_PAGES * PAGE);
+    // Unmapped only once every thread is done with it (one still running
+    // would fault on the hole and kill the group)
+    if ok {
+        sys_munmap(base, STORM_PAGES * PAGE);
+    }
     report(b"MM_FAULT_STORM", ok && bad == 0, bad as i64);
 }
 
