@@ -276,9 +276,7 @@ fn test_churn() {
 }
 
 /// Readers race on one connection: two copy, one discards with
-/// MSG_TRUNC; every byte is consumed exactly once (a 4-byte sequence
-/// number stream read in whole words: copied words strictly increase,
-/// consecutive within a read; counts add up)
+/// MSG_TRUNC; every byte is consumed exactly once (the counts add up)
 fn test_trunc_race() {
     let mut t = T::new(b"NET_STRESS_TRUNC_RACE");
     const WORDS: u32 = 64 * 1024;
@@ -291,7 +289,7 @@ fn test_trunc_race() {
     connect(c, LO, port);
     let s = sys_accept(l, core::ptr::null_mut(), core::ptr::null_mut()) as i32;
     set_timeo(s, 2000);
-    // Counts come back through a pipe: (copied words, discarded words)
+    // Each reader's byte count comes back through a pipe
     let mut p = [-1i32; 2];
     sys_pipe(p.as_mut_ptr());
     let mut pids = [0i64; 3];
@@ -328,43 +326,28 @@ fn test_trunc_race() {
     }
     t.ok(b"readers finished", all, 0);
     t.eq(b"reader status", worst as i64, 0);
-    t.eq(b"words consumed", total, WORDS as i64);
+    t.eq(b"bytes consumed", total, WORDS as i64 * 4);
     for fd in [c, l, p[0], p[1]] {
         close(fd);
     }
     t.done();
 }
 
-/// Read 4-word-aligned pieces until EOF: Some count, -1 on a broken
-/// sequence; `trunc` discards with MSG_TRUNC instead of copying
+/// One of three readers sharing a socket: bytes consumed (MSG_TRUNC:
+/// discarded) until EOF or the receive timeout, or -1 on an error.
+/// With MSG_WAITALL a reader waits for the rest of its 256 bytes with
+/// the socket unlocked (Linux sk_wait_data), so the others take bytes in
+/// between: a recv need not hold consecutive bytes, nor whole words, so
+/// only the total says whether every byte arrived exactly once
 fn trunc_reader(s: i32, trunc: bool) -> i64 {
-    let mut b = [0u8; 1024];
-    let mut words = 0i64;
-    let mut last: i64 = -1;
+    let mut b = [0u8; 256];
+    let mut bytes = 0i64;
     loop {
         let flags = MSG_WAITALL | if trunc { MSG_TRUNC } else { 0 };
-        let n = recv(s, &mut b[..256], flags);
+        let n = recv(s, &mut b, flags);
         if n <= 0 {
-            return if n == 0 || n == EAGAIN { words } else { -1 };
+            return if n == 0 || n == EAGAIN { bytes } else { -1 };
         }
-        if n % 4 != 0 {
-            return -1;
-        }
-        words += n as i64 / 4;
-        if trunc {
-            continue;
-        }
-        // Stream order: every word later than the last one this reader
-        // saw. Not contiguous within one recv: MSG_WAITALL waits with
-        // the socket unlocked (Linux sk_wait_data), so another reader
-        // may take the bytes in between (the writer's 4096-byte sends
-        // keep that word-aligned)
-        for w in b[..n as usize].chunks(4) {
-            let v = u32::from_be_bytes([w[0], w[1], w[2], w[3]]) as i64;
-            if v <= last {
-                return -1;
-            }
-            last = v;
-        }
+        bytes += n as i64;
     }
 }
