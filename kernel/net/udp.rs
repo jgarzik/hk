@@ -33,7 +33,7 @@ use crate::net::af_inet::{
 };
 use crate::net::dgram::{self, Dgram, RxQueue};
 use crate::net::inet::fib::RouteType;
-use crate::net::inet::port::{self, BindInfo, Flow};
+use crate::net::inet::port::{self, BindInfo, Flow, Parity};
 use crate::net::inet::route;
 use crate::net::ipv4::{self, IpParams, Ipv4Addr};
 use crate::net::msg::{MSG_ERRQUEUE, MSG_OOB, RecvMsg, SendMsg, cmsgs};
@@ -535,7 +535,7 @@ impl UdpTable {
             port
         } else {
             let range = s.sk.net.port_range.get();
-            port::ephemeral(range, flow, |p| Self::free(&map, p, info))
+            port::ephemeral(range, flow, Parity::Any, |p| Self::free(&map, p, info))
                 .ok_or(KernelError::AddressInUse)?
         };
         map.entry(port).or_default().push(s.clone());

@@ -171,14 +171,38 @@ pub struct Flow {
     pub dport: u16,
 }
 
+/// Which ports [`ephemeral`] tries first (Linux): bind(0) odd offsets
+/// from the range's low end, connect even ones, then the other half,
+/// so a listener's port and a connection's source port rarely meet
+/// (no self-connect to a just-closed listener); UDP any
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Parity {
+    Any,
+    Bind,
+    Connect,
+}
+
 /// First port of `range` for which `free(port)` holds, starting at the
-/// flow's keyed offset; None if every port is taken (EADDRINUSE)
-pub fn ephemeral(range: (u16, u16), f: Flow, mut free: impl FnMut(u16) -> bool) -> Option<u16> {
+/// flow's keyed offset, `parity`'s ports first (Linux
+/// inet_csk_find_open_port / __inet_hash_connect: by twos, an odd-sized
+/// range losing its top port); None if every port is taken (EADDRINUSE)
+pub fn ephemeral(
+    range: (u16, u16),
+    f: Flow,
+    parity: Parity,
+    mut free: impl FnMut(u16) -> bool,
+) -> Option<u16> {
     let (lo, hi) = range;
     if hi < lo {
         return None;
     }
-    let n = (hi - lo) as u32 + 1;
+    let mut n = (hi - lo) as u32 + 1;
+    let step = if parity == Parity::Any || n == 1 {
+        1
+    } else {
+        2
+    };
+    n &= !(step - 1);
     let words = [
         f.proto as u64,
         ((f.saddr.0 as u64) << 32) | f.daddr.0 as u64,
@@ -187,16 +211,40 @@ pub fn ephemeral(range: (u16, u16), f: Flow, mut free: impl FnMut(u16) -> bool) 
     let k = secret();
     let offset = siphash(k, &words) as u32;
     let idx = (siphash([k[1], k[0]], &words) as usize) % TABLE;
-    let start = offset.wrapping_add(PERTURB[idx].load(Ordering::Relaxed));
-    for i in 0..n {
-        let port = lo + (start.wrapping_add(i) % n) as u16;
-        if free(port) {
-            // Next selection for this flow starts further on
-            PERTURB[idx].fetch_add(i + 1, Ordering::Relaxed);
-            return Some(port);
+    let start = offset.wrapping_add(PERTURB[idx].load(Ordering::Relaxed)) % n;
+    let first = match parity {
+        Parity::Bind if step == 2 => start | 1,
+        Parity::Connect => start & !1,
+        _ => start,
+    };
+    let mut tried = 0;
+    for pass in 0..step {
+        let base = first ^ pass;
+        for i in 0..n / step {
+            let port = lo + ((base + i * step) % n) as u16;
+            tried += 1;
+            if free(port) {
+                // Next selection for this flow starts further on, by
+                // whole steps (Linux table_perturb += i + step): a
+                // parity scan must not land on the same port again
+                PERTURB[idx].fetch_add(tried * step, Ordering::Relaxed);
+                return Some(port);
+            }
         }
     }
     None
+}
+
+/// bind(0)'s range: with SO_REUSEADDR the lower half first, then the
+/// upper (Linux attempt_half: those ports can be shared, so leave the
+/// upper half to connect); else all of it
+pub fn bind_halves(range: (u16, u16), reuse: bool) -> [(u16, u16); 2] {
+    let (lo, hi) = range;
+    if !reuse || hi < lo || hi - lo < 3 {
+        return [range, (1, 0)];
+    }
+    let half = lo + (((hi - lo + 1) >> 2) << 1);
+    [(lo, half - 1), (half, hi)]
 }
 
 #[cfg(test)]
@@ -282,9 +330,52 @@ mod tests {
     #[test]
     fn ephemeral_in_range_and_skips_busy() {
         let f = Flow::default();
-        let p = ephemeral((40000, 40009), f, |p| p != 40000 && p % 2 == 1).unwrap();
+        let p = ephemeral((40000, 40009), f, Parity::Any, |p| p != 40000 && p % 2 == 1).unwrap();
         assert!((40000..=40009).contains(&p) && p % 2 == 1);
-        assert!(ephemeral((40000, 40009), f, |_| false).is_none());
-        assert_eq!(ephemeral((5, 5), f, |_| true), Some(5));
+        assert!(ephemeral((40000, 40009), f, Parity::Any, |_| false).is_none());
+        assert_eq!(ephemeral((5, 5), f, Parity::Any, |_| true), Some(5));
+        assert_eq!(ephemeral((5, 5), f, Parity::Bind, |_| true), Some(5));
+    }
+
+    #[test]
+    fn ephemeral_parity() {
+        for dport in 0..64 {
+            let f = Flow {
+                dport,
+                ..Default::default()
+            };
+            let b = ephemeral((32768, 60999), f, Parity::Bind, |_| true).unwrap();
+            let c = ephemeral((32768, 60999), f, Parity::Connect, |_| true).unwrap();
+            assert!(b % 2 == 1 && c % 2 == 0 && (32768..=60999).contains(&b));
+        }
+        // The other parity once one is used up; every port of an even
+        // range is reachable
+        let f = Flow::default();
+        let p = ephemeral((100, 109), f, Parity::Connect, |p| p % 2 == 1).unwrap();
+        assert!(p % 2 == 1);
+        let mut seen = [false; 10];
+        assert!(
+            ephemeral((100, 109), f, Parity::Bind, |p| {
+                seen[(p - 100) as usize] = true;
+                false
+            })
+            .is_none()
+        );
+        assert!(seen.iter().all(|&s| s));
+        // Back-to-back picks for one flow differ (a port just given up
+        // is not handed out again at once)
+        for parity in [Parity::Any, Parity::Bind, Parity::Connect] {
+            let mut pick = || ephemeral((32768, 60999), f, parity, |_| true);
+            let (a, b, c) = (pick(), pick(), pick());
+            assert!(a != b && b != c);
+        }
+    }
+
+    #[test]
+    fn bind_halves_split() {
+        assert_eq!(bind_halves((32768, 60999), false)[0], (32768, 60999));
+        let [a, b] = bind_halves((32768, 60999), true);
+        assert_eq!((a.0, a.1 + 1, b.1), (32768, b.0, 60999));
+        assert_eq!(b.0, 32768 + ((28232 >> 2) << 1));
     }
 }
