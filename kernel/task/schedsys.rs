@@ -344,10 +344,11 @@ fn check_setscheduler(
             return Err(KernelError::NotPermitted);
         }
     }
-    if cur == SCHED_IDLE && policy != SCHED_IDLE {
-        if (20 - nice) as u64 > limit(crate::rlimit::RLIMIT_NICE) {
-            return Err(KernelError::NotPermitted);
-        }
+    if cur == SCHED_IDLE
+        && policy != SCHED_IDLE
+        && (20 - nice) as u64 > limit(crate::rlimit::RLIMIT_NICE)
+    {
+        return Err(KernelError::NotPermitted);
     }
     Ok(())
 }
