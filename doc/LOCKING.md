@@ -184,8 +184,8 @@ each, as `LOCKDEP:FAIL` (so the boot test fails):
   `might_fault`, skipped while page faults are disabled) with a tracked
   spin lock held, a nonzero preempt count (any `IrqSpinlock`), in an
   interrupt handler, or with interrupts disabled (syscalls and faults
-  run with them on, 7.5). Without the feature it is the old debug-build
-  preempt-count assertion.
+  run with them on, 7.5). Without the feature it is the
+  `MIGHT_SLEEP:FAIL` check above.
 - **Lock order:** a lock's class is the source location of its `new()`
   (`#[track_caller]`, like Linux's static lock_class_key: all `TcpSock.cb`
   share one class). Taking B while holding A records A -> B; taking B
@@ -388,9 +388,9 @@ Printk locks (ALL IRQ-safe - can be acquired from interrupt context):
 
 ### Why IrqSpinlock → TASKLIST is Safe
 
-Some IrqSpinlock holders may take `TASKLIST` (the scheduler no longer
-does: the run queue keeps everything a switch or wakeup needs in the
-`Task`, 3.1):
+Some IrqSpinlock holders may take `TASKLIST` (the scheduler does not:
+the run queue keeps everything a switch or wakeup needs in the `Task`,
+3.1):
 
 1. `IrqSpinlock` disables interrupts on the local CPU
 2. While interrupts are disabled, no ISR can run on this CPU

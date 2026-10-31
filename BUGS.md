@@ -383,7 +383,8 @@ across net, fs, ipc) cannot be audited yet.
   nice change of a queued task, no RUN_TO_PARITY or delayed dequeue.
 - No PELT: load balancing counts tasks and wakeup placement looks for
   an idle CPU; one flat domain (no SMT/LLC/NUMA topology), no active
-  balancing, no rt push/pull beyond wakeup placement.
+  balancing; rt tasks move at wakeup placement and in the balancer's
+  pulls only (no push from an overloaded CPU).
 - No RT throttling (sched_rt_runtime_us) or dl_server: a SCHED_FIFO
   spinner starves its CPU's fair tasks; no SCHED_DEADLINE (EINVAL).
 - Kernel preemption is off: a long kernel path delays a woken task of
@@ -589,7 +590,7 @@ From the P4 /code-review (unverified unless noted). Tag = when to fix.
    allocator, cached sorted device list.
 6. **read_swap_page busy-yields on SWAP_HAS_CACHE** (P6).
    `kernel/mm/swap_state.rs:186`: sleep instead.
-7. **One AnonVma per fork family, Vec chain** (P7).
+7. **One AnonVma per fork family, Vec chain** (J).
    `kernel/mm/anon_vma.rs:85`: O(N×VMAs) under one family write lock.
 
 ## T0 findings (open)

@@ -36,7 +36,9 @@ Uses the Linux syscall ABI for each respective architecture.
 ## Status
 
 Boots SMP on x86-64 and arm64 under QEMU. Working today: a scheduler with
-per-CPU run queues; memory management with a buddy/slab allocator, TLB
+per-CPU run queues and Linux's classes (stop, SCHED_FIFO/RR, EEVDF fair,
+idle), with tasks placed on and balanced across every CPU and CPU
+affinity; memory management with a buddy/slab allocator, TLB
 shootdown, copy-on-write, shared memory, LRU reclaim and swap; a
 VFS with ramfs, vfat, procfs, devtmpfs and cgroupfs; a block layer
 (virtio-blk, GPT partitions); networking (virtio-net, e1000, IPv4, TCP,
