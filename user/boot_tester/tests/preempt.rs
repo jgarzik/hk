@@ -24,7 +24,7 @@
 //!   child.
 //! - RT_FIFO: a SCHED_FIFO spinner keeps a SCHED_OTHER spinner on its
 //!   CPU from running, and is not time-sliced against another FIFO task
-//!   of the same priority.
+//!   of the same priority (measured from another CPU: 2 CPUs needed).
 //! - RT_PLACE: a waking SCHED_FIFO task whose last CPU runs a higher
 //!   FIFO task (one that turned FIFO while running there) goes at once
 //!   to a CPU running a SCHED_OTHER one (every CPU busy).
@@ -366,11 +366,17 @@ fn test_rt_fifo() {
         return;
     }
     let c = page as *mut u64;
-    let cpu = {
-        let mut m = [0u64; 16];
-        sys_sched_getaffinity(0, core::mem::size_of_val(&m), m.as_mut_ptr());
-        63 - m[0].leading_zeros()
-    };
+    let mut all = [0u64; 16];
+    let len = sys_sched_getaffinity(0, core::mem::size_of_val(&all), all.as_mut_ptr());
+    if all[0].count_ones() < 2 {
+        sys_munmap(page as u64, 4096);
+        println(b"RT_FIFO:SKIP (needs 2 CPUs)");
+        return;
+    }
+    let cpu = 63 - all[0].leading_zeros();
+    // This task measures from another CPU (behind the FIFO spinner it
+    // would not run until that ends)
+    sys_sched_setaffinity(0, 8, &(1u64 << all[0].trailing_zeros()));
     // SAFETY: counters 0..3 of the shared page
     let at = |i: usize| unsafe { c.add(i).read_volatile() };
     let other = spinner(cpu, 0, c, 0);
@@ -403,6 +409,7 @@ fn test_rt_fifo() {
     sys_wait4(b, &mut st, 0, 0);
     t.ok(b"first ran", ca > 0, ca as i64);
     t.eq(b"no time slice", cb as i64, 0);
+    sys_sched_setaffinity(0, len as usize, all.as_ptr());
     sys_munmap(page as u64, 4096);
     t.done();
 }
