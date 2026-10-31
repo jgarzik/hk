@@ -186,7 +186,7 @@ make run-arm        # aarch64
 ### QEMU Configuration
 
 The default QEMU setup:
-- Memory: 512MB, 4 CPUs (`-smp 4`)
+- Memory: 512MB, 4 CPUs (`-smp 4`; `QEMU_SMP=N` overrides, for hk and the Linux reference)
 - Serial output: logged to `target/qemu/serial.log` (x86-64) or `target/qemu/serial_arm.log` (aarch64); `QEMU_LOG_DIR` overrides the directory
 - Display: `-nographic` (console mode)
 - x86-64: Boots from ISO with GRUB

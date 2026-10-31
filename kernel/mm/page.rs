@@ -374,6 +374,19 @@ pub fn phys_to_page(phys: u64) -> Option<&'static Page> {
     pfn_valid(pfn).then(|| pfn_to_page(pfn))
 }
 
+/// Bytes of one section's struct pages: one 2MB block
+const SECTION_MAP: u64 = SECTION_PFNS * 64;
+const _: () = assert!(SECTION_MAP == 2 << 20 && core::mem::size_of::<Page>() == 64);
+
+/// Fill the `len` bytes of fresh boot memory at `pa` with struct pages
+fn init_pages(pa: u64, len: u64) {
+    let p = crate::arch::phys_to_virt(pa) as *mut Page;
+    for i in 0..(len as usize / core::mem::size_of::<Page>()) {
+        // SAFETY: fresh memory for that many struct pages
+        unsafe { p.add(i).write(Page::new()) };
+    }
+}
+
 /// A zeroed boot frame for the memory map's page tables
 fn zeroed_frame() -> u64 {
     let pa = crate::mm::memblock::alloc(4096, 4096);
@@ -406,20 +419,27 @@ fn next_ram_section(after: Option<u64>) -> Option<u64> {
 /// and before memblock's free ranges are handed out.
 pub fn vmemmap_init() {
     use crate::arch::{CurrentArch, MemoryLayoutOps};
-    let per_frame = 4096 / core::mem::size_of::<Page>();
     let mut cur = None;
     while let Some(sec) = next_ram_section(cur) {
         cur = Some(sec);
-        let va = crate::arch::paging::VMEMMAP_START + sec * SECTION_PFNS * 64;
-        for off in (0..SECTION_PFNS * 64).step_by(4096) {
-            let pa = crate::mm::memblock::alloc(4096, 4096);
-            let p = crate::arch::phys_to_virt(pa) as *mut Page;
-            for i in 0..per_frame {
-                // SAFETY: a fresh frame of `per_frame` struct pages
-                unsafe { p.add(i).write(Page::new()) };
-            }
+        let va = crate::arch::paging::VMEMMAP_START + sec * SECTION_MAP;
+        // One 2MB block per section if memblock has one, else 4KB pages
+        // (Linux vmemmap_populate_hugepages, falling back to
+        // vmemmap_populate_basepages)
+        let block = crate::mm::memblock::MEMBLOCK
+            .lock()
+            .alloc(SECTION_MAP, SECTION_MAP);
+        if let Some(pa) = block {
+            init_pages(pa, SECTION_MAP);
             // SAFETY: boot CPU, before SMP; the vmemmap range is unused
-            unsafe { CurrentArch::map_kernel_page(va + off, pa, &mut zeroed_frame) };
+            unsafe { CurrentArch::map_kernel_pmd(va, pa, &mut zeroed_frame) };
+        } else {
+            for off in (0..SECTION_MAP).step_by(4096) {
+                let pa = crate::mm::memblock::alloc(4096, 4096);
+                init_pages(pa, 4096);
+                // SAFETY: as above
+                unsafe { CurrentArch::map_kernel_page(va + off, pa, &mut zeroed_frame) };
+            }
         }
         let s = sec as usize;
         SECTIONS[s / 64].fetch_or(1 << (s % 64), Ordering::Release);

@@ -11,10 +11,14 @@
 //! - Test: membarrier() - memory barrier syscall
 //! - Test: readahead() - file readahead syscall
 
-use super::helpers::{print, print_num, println};
+use super::helpers::{add_fails, fail_count, print, print_num, println};
+use super::sk::T;
 use hk_syscall::{
-    MEMBARRIER_CMD_GLOBAL, MEMBARRIER_CMD_PRIVATE_EXPEDITED, MEMBARRIER_CMD_QUERY,
-    MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED, O_CREAT, O_RDONLY, O_WRONLY, sys_close,
+    MEMBARRIER_CMD_FLAG_CPU, MEMBARRIER_CMD_GET_REGISTRATIONS, MEMBARRIER_CMD_GLOBAL,
+    MEMBARRIER_CMD_GLOBAL_EXPEDITED, MEMBARRIER_CMD_PRIVATE_EXPEDITED,
+    MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE, MEMBARRIER_CMD_QUERY,
+    MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED, MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED,
+    MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE, O_CREAT, O_RDONLY, O_WRONLY, sys_close,
     sys_fdatasync, sys_fsync, sys_membarrier, sys_open, sys_readahead, sys_sync, sys_syncfs,
     sys_unlink, sys_write,
 };
@@ -28,6 +32,7 @@ pub fn run_tests() {
     test_fdatasync_ebadf();
     test_syncfs();
     test_syncfs_ebadf();
+    test_membarrier_reg();
     test_membarrier();
     test_readahead();
 }
@@ -149,6 +154,81 @@ fn test_syncfs_ebadf() {
         print(b"SYNCFS_EBADF:FAIL: expected -9 (EBADF), got ");
         print_num(ret);
     }
+}
+
+/// MEMBARRIER_REG: registration rules (Linux kernel/sched/membarrier.c),
+/// in a child of a fresh exec-less fork of init, before init registers:
+/// the expedited private commands need their own registration (EPERM
+/// before), GLOBAL_EXPEDITED needs none, the SYNC_CORE registration
+/// also reports the private one, FLAG_CPU is for the RSEQ command only,
+/// and a fork child inherits what its parent registered
+fn test_membarrier_reg() {
+    use hk_syscall::{sys_exit, sys_fork, sys_wait4};
+    let before = fail_count();
+    let pid = sys_fork();
+    if pid == 0 {
+        let mut t = T::new(b"MEMBARRIER_REG");
+        let q = sys_membarrier(MEMBARRIER_CMD_QUERY, 0, 0);
+        let want = MEMBARRIER_CMD_GLOBAL_EXPEDITED
+            | MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED
+            | MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE
+            | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE
+            | MEMBARRIER_CMD_GET_REGISTRATIONS;
+        t.ok(b"query", q >= 0 && q as i32 & want == want, q);
+        t.eq(b"regs none", sys_membarrier(MEMBARRIER_CMD_GET_REGISTRATIONS, 0, 0), 0);
+        t.eq(b"private unreg", sys_membarrier(MEMBARRIER_CMD_PRIVATE_EXPEDITED, 0, 0), -1);
+        t.eq(
+            b"sync_core unreg",
+            sys_membarrier(MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE, 0, 0),
+            -1,
+        );
+        t.eq(b"global exp", sys_membarrier(MEMBARRIER_CMD_GLOBAL_EXPEDITED, 0, 0), 0);
+        t.eq(
+            b"flag cpu",
+            sys_membarrier(MEMBARRIER_CMD_PRIVATE_EXPEDITED, MEMBARRIER_CMD_FLAG_CPU, 0),
+            -22,
+        );
+        t.eq(b"bad cmd", sys_membarrier(1 << 12, 0, 0), -22);
+        t.eq(
+            b"reg sync_core",
+            sys_membarrier(MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE, 0, 0),
+            0,
+        );
+        t.eq(
+            b"sync_core",
+            sys_membarrier(MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE, 0, 0),
+            0,
+        );
+        // Registering SYNC_CORE marks the private state but not its
+        // readiness (Linux sets PRIVATE_EXPEDITED, not its _READY)
+        t.eq(b"private after sync", sys_membarrier(MEMBARRIER_CMD_PRIVATE_EXPEDITED, 0, 0), -1);
+        t.eq(
+            b"regs sync",
+            sys_membarrier(MEMBARRIER_CMD_GET_REGISTRATIONS, 0, 0),
+            (MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED
+                | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE) as i64,
+        );
+        t.eq(b"reg global", sys_membarrier(MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED, 0, 0), 0);
+        t.eq(b"reg private", sys_membarrier(MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED, 0, 0), 0);
+        t.eq(b"private", sys_membarrier(MEMBARRIER_CMD_PRIVATE_EXPEDITED, 0, 0), 0);
+        let all = (MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED
+            | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED
+            | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE) as i64;
+        t.eq(b"regs all", sys_membarrier(MEMBARRIER_CMD_GET_REGISTRATIONS, 0, 0), all);
+        let c = sys_fork();
+        if c == 0 {
+            let r = sys_membarrier(MEMBARRIER_CMD_GET_REGISTRATIONS, 0, 0);
+            sys_exit(if r == all { 0 } else { 1 });
+        }
+        let mut st = 0i32;
+        sys_wait4(c, &mut st, 0, 0);
+        t.eq(b"fork inherits", st as i64, 0);
+        t.done();
+        sys_exit((fail_count() - before).min(255) as u64);
+    }
+    let mut st = 0i32;
+    sys_wait4(pid, &mut st, 0, 0);
+    add_fails(((st >> 8) & 0xff) as u32);
 }
 
 /// Test: membarrier() - memory barrier syscall

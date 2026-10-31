@@ -415,6 +415,10 @@ impl MemoryLayoutOps for X86_64Arch {
     unsafe fn map_kernel_page(va: u64, pa: u64, table: &mut dyn FnMut() -> u64) {
         unsafe { kmap::map_page(va, pa, table) }
     }
+
+    unsafe fn map_kernel_pmd(va: u64, pa: u64, table: &mut dyn FnMut() -> u64) {
+        unsafe { kmap::map_pmd(va, pa, table) }
+    }
 }
 
 impl ExceptionOps for X86_64Arch {

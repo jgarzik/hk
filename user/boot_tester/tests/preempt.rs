@@ -9,6 +9,28 @@
 //! - TIMESLICE: two children pinned to one CPU spin, counting; both make
 //!   progress (within 1:10 of each other over 300ms), and the parent's
 //!   nanosleep(20ms) meanwhile returns within 1s.
+//! - SMP_SPREAD: with two or more CPUs, spinning children forked one
+//!   after the other run on at least two CPUs at once.
+//! - AFFINITY_MIGRATE: right after sched_setaffinity to one CPU, the
+//!   caller runs there, for every CPU; a child asleep in a pipe read,
+//!   pinned elsewhere by its parent, wakes on the new CPU.
+//! - BALANCE: spinners started together on one CPU spread to at least
+//!   two once allowed everywhere (load balancing; widening the mask
+//!   alone moves nothing, as their CPU stays allowed).
+//! - SCHED_PRIO_FIELDS: nice and policy changes read back as on Linux
+//!   (getpriority, sched_get*, /proc/self/stat priority, nice,
+//!   rt_priority, policy); an rt task set back to SCHED_OTHER keeps its
+//!   nice; SCHED_RESET_ON_FORK gives an rt parent a nice-0 SCHED_OTHER
+//!   child.
+//! - RT_FIFO: a SCHED_FIFO spinner keeps a SCHED_OTHER spinner on its
+//!   CPU from running, and is not time-sliced against another FIFO task
+//!   of the same priority (measured from another CPU: 2 CPUs needed).
+//! - RT_PLACE: a waking SCHED_FIFO task whose last CPU runs a higher
+//!   FIFO task (one that turned FIFO while running there) goes at once
+//!   to a CPU running a SCHED_OTHER one (every CPU busy).
+//! - NICE_WEIGHT, NICE_ADJACENT, SCHED_IDLE_SHARE: two spinners on
+//!   one CPU share it by weight (EEVDF): nice 0 vs 5 about 3:1, nice 0
+//!   vs 1 about 5:4 (neither starves), SCHED_IDLE under a tenth.
 //! - ASYNC_SIG_REGS: every general register (rcx/r11 on x86, x0-x30 on
 //!   arm64) holds its value across a SIGUSR1 handler that interrupts a
 //!   spin loop; on x86 the loop runs with DF set (`std`), which the
@@ -18,8 +40,9 @@
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
     CLOCK_MONOTONIC, MAP_ANONYMOUS, MAP_SHARED, PROT_READ, PROT_WRITE, SA_RESTORER, SIG_DFL,
-    SIGKILL, SIGUSR1, Timespec, sys_clock_gettime, sys_exit, sys_fork, sys_kill, sys_mmap,
-    sys_munmap, sys_nanosleep, sys_rt_sigaction, sys_sched_setaffinity, sys_wait4,
+    SIGKILL, SIGUSR1, Timespec, sys_clock_gettime, sys_exit, sys_fork, sys_getcpu, sys_kill,
+    sys_mmap, sys_munmap, sys_nanosleep, sys_rt_sigaction, sys_sched_getaffinity,
+    sys_sched_setaffinity, sys_wait4,
 };
 
 const WNOHANG: i32 = 1;
@@ -28,7 +51,554 @@ const WNOHANG: i32 = 1;
 pub fn run_tests() {
     test_sigkill_spin();
     test_timeslice();
+    test_smp_spread();
+    test_affinity_migrate();
+    test_balance();
+    test_sched_prio_fields();
+    test_sched_perm();
+    test_rt_fifo();
+    test_rt_place();
+    test_fair_share(b"NICE_WEIGHT", (0, 0), (5, 0), (18, 50));
+    test_fair_share(b"NICE_ADJACENT", (0, 0), (1, 0), (6, 25));
+    test_fair_share(b"SCHED_IDLE_SHARE", (0, 0), (0, 5), (100, u64::MAX));
     test_async_sig_regs();
+}
+
+/// RT_PLACE: see the module doc (Linux select_task_rq_rt)
+fn test_rt_place() {
+    use super::sk::T;
+    use hk_syscall::{SchedParam, sys_sched_setscheduler};
+    let mut t = T::new(b"RT_PLACE");
+    let mut all = [0u64; 16];
+    let len = sys_sched_getaffinity(0, core::mem::size_of_val(&all), all.as_mut_ptr());
+    let cpus = all[0];
+    if cpus.count_ones() < 2 || cpus.count_ones() > 8 {
+        println(b"RT_PLACE:SKIP (2 to 8 CPUs)");
+        return;
+    }
+    let page = sys_mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if !t.ok(b"mmap", page >= 0, page) {
+        t.done();
+        return;
+    }
+    let c = page as *mut u64;
+    let x = cpus.trailing_zeros();
+    // SAFETY: counters of the shared page: 0 its progress, 2 ready, 8..
+    // the spinners'
+    let at = |i: usize| unsafe { c.add(i).read_volatile() };
+    // The FIFO 10 task: on CPU x, then allowed everywhere; it sleeps
+    // past the spinners' start, so its wakeup finds x running FIFO 20
+    let task = sys_fork();
+    if task == 0 {
+        let m = 1u64 << x;
+        sys_sched_setaffinity(0, 8, &m);
+        sys_sched_setscheduler(0, 1, &SchedParam { sched_priority: 10 });
+        sys_sched_setaffinity(0, len as usize, all.as_ptr());
+        // SAFETY: counter 2 of the shared page: ready
+        unsafe { c.add(2).write_volatile(1) };
+        sleep_ms(3000);
+        loop {
+            // SAFETY: counter 0 of the shared page
+            unsafe { c.write_volatile(c.read_volatile() + 1) };
+        }
+    }
+    // Its mask widened before anything occupies x
+    let t0 = now_ms();
+    while at(2) == 0 && now_ms() - t0 < 5000 {
+        sleep_ms(10);
+    }
+    let ready = now_ms();
+    // This task stays off x (behind its FIFO spinner it would not run)
+    let y = 63 - cpus.leading_zeros();
+    sys_sched_setaffinity(0, 8, &(1u64 << y));
+    let t0 = now_ms();
+    let mut pids = [0i64; 9];
+    let mut n = 0;
+    // Every other CPU: a SCHED_OTHER spinner, running before x gets
+    // its FIFO 20 one, which turns FIFO while it runs there (nothing
+    // else switches on x afterwards: the wakeup must see its new class)
+    for cpu in (0..64u32).filter(|&c| c != x && cpus & (1 << c) != 0) {
+        // SAFETY: counters 8.. of the shared page
+        pids[n] = spinner(cpu, 0, unsafe { c.add(8 + n) }, 0);
+        n += 1;
+    }
+    let started = |n: usize| (0..n).all(|i| at(8 + i) > 0);
+    while !started(n) && now_ms() - t0 < 1500 {
+        sleep_ms(10);
+    }
+    // SAFETY: counters 8.. of the shared page
+    pids[n] = spinner(x, 20, unsafe { c.add(8 + n) }, 0);
+    n += 1;
+    while !started(n) && now_ms() - t0 < 2600 {
+        sleep_ms(10);
+    }
+    // Every spinner runs with its final policy and the task has not run
+    // yet (it woke after all of them started)
+    let settled = started(n) && at(0) == 0;
+    // It runs at once when it wakes (not when x next switches)
+    while at(0) == 0 && now_ms() - ready < 3300 {
+        sleep_ms(10);
+    }
+    let progress = at(0);
+    sys_sched_setaffinity(0, len as usize, all.as_ptr());
+    // The rt tasks first: a task starved by one could not die
+    reap(task);
+    for pid in pids.iter().take(n) {
+        reap(*pid);
+    }
+    sys_munmap(page as u64, 4096);
+    if !settled {
+        println(b"RT_PLACE:SKIP (spinners slow to start)");
+        return;
+    }
+    t.ok(b"fifo 10 ran", progress > 0, progress as i64);
+    t.done();
+}
+
+/// A child pinned to `cpu` with `nice` and fair `policy` counting in
+/// `counter` forever
+fn fair_spinner(cpu: u32, nice: i32, policy: i32, counter: *mut u64) -> i64 {
+    use hk_syscall::{SchedParam, sys_sched_setscheduler, sys_setpriority};
+    let pid = sys_fork();
+    if pid == 0 {
+        let m = 1u64 << cpu;
+        sys_sched_setaffinity(0, 8, &m);
+        sys_setpriority(0, 0, nice);
+        if policy != 0 {
+            sys_sched_setscheduler(0, policy, &SchedParam { sched_priority: 0 });
+        }
+        loop {
+            // SAFETY: the shared page the parent mapped
+            unsafe { counter.write_volatile(counter.read_volatile() + 1) };
+        }
+    }
+    pid
+}
+
+/// Two fair spinners `a` and `b` ((nice, policy)) on one CPU for 400 ms:
+/// a's progress over b's, in tenths, within `range` (Linux EEVDF shares
+/// a CPU by weight)
+fn test_fair_share(name: &'static [u8], a: (i32, i32), b: (i32, i32), range: (u64, u64)) {
+    use super::sk::T;
+    let mut t = T::new(name);
+    let page = sys_mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if !t.ok(b"mmap", page >= 0, page) {
+        t.done();
+        return;
+    }
+    let c = page as *mut u64;
+    let cpu = {
+        let mut m = [0u64; 16];
+        sys_sched_getaffinity(0, core::mem::size_of_val(&m), m.as_mut_ptr());
+        63 - m[0].leading_zeros()
+    };
+    let pa = fair_spinner(cpu, a.0, a.1, c);
+    // SAFETY: the second counter of the page
+    let pb = fair_spinner(cpu, b.0, b.1, unsafe { c.add(1) });
+    sleep_ms(100);
+    // SAFETY: counters 0 and 1 of the shared page
+    let at = |i: usize| unsafe { c.add(i).read_volatile() };
+    let (a0, b0) = (at(0), at(1));
+    sleep_ms(400);
+    let (da, db) = (at(0) - a0, at(1) - b0);
+    reap(pa);
+    reap(pb);
+    sys_munmap(page as u64, 4096);
+    let tenths = da * 10 / db.max(1);
+    t.ok(b"both ran", da > 0, da as i64);
+    t.ok(b"share a:b tenths", (range.0..=range.1).contains(&tenths), tenths as i64);
+    t.done();
+}
+
+/// Fields 18 (priority), 19 (nice), 40 (rt_priority), 41 (policy) of
+/// /proc/self/stat
+fn stat_sched() -> [i64; 4] {
+    use hk_syscall::{O_RDONLY, sys_close, sys_open, sys_read};
+    let mut b = [0u8; 1024];
+    let fd = sys_open(b"/proc/self/stat\0".as_ptr(), O_RDONLY, 0);
+    if fd < 0 {
+        return [i64::MIN; 4];
+    }
+    let n = sys_read(fd as u64, b.as_mut_ptr(), b.len() as u64).max(0) as usize;
+    sys_close(fd as u64);
+    let b = &b[..n];
+    let Some(rp) = b.iter().rposition(|&c| c == b')') else {
+        return [i64::MIN; 4];
+    };
+    // Fields after the comm: the state is field 3
+    let mut out = [i64::MIN; 4];
+    for (k, f) in b[rp + 2..].split(|&c| c == b' ' || c == b'\n').enumerate() {
+        let slot = match k + 3 {
+            18 => 0,
+            19 => 1,
+            40 => 2,
+            41 => 3,
+            _ => continue,
+        };
+        let (neg, d) = match f.first() {
+            Some(b'-') => (true, &f[1..]),
+            _ => (false, f),
+        };
+        let v = d.iter().fold(0i64, |a, &c| a * 10 + (c - b'0') as i64);
+        out[slot] = if neg { -v } else { v };
+    }
+    out
+}
+
+/// SCHED_PRIO_FIELDS: see the module doc (in a child: it changes its own
+/// policy)
+fn test_sched_prio_fields() {
+    use super::sk::T;
+    use hk_syscall::{
+        SchedParam, sys_getpriority, sys_sched_getparam, sys_sched_getscheduler,
+        sys_sched_setscheduler, sys_setpriority,
+    };
+    const SCHED_OTHER: i32 = 0;
+    const SCHED_FIFO: i32 = 1;
+    const RESET_ON_FORK: i32 = 0x4000_0000;
+    let pid = sys_fork();
+    if pid == 0 {
+        let mut t = T::new(b"SCHED_PRIO_FIELDS");
+        t.eq(b"setpriority", sys_setpriority(0, 0, 5), 0);
+        t.eq(b"getpriority", sys_getpriority(0, 0), 15);
+        let s = stat_sched();
+        t.eq(b"stat prio nice", s[0] * 100 + s[1], 25 * 100 + 5);
+        let p = SchedParam { sched_priority: 10 };
+        t.eq(b"set fifo", sys_sched_setscheduler(0, SCHED_FIFO, &p), 0);
+        t.eq(b"getscheduler", sys_sched_getscheduler(0), SCHED_FIFO as i64);
+        let mut q = SchedParam { sched_priority: 0 };
+        sys_sched_getparam(0, &mut q);
+        t.eq(b"getparam", q.sched_priority as i64, 10);
+        let s = stat_sched();
+        t.eq(b"stat fifo prio", s[0], -11);
+        t.eq(b"stat fifo nice", s[1], 5);
+        t.eq(b"stat rt_priority policy", s[2] * 100 + s[3], 10 * 100 + 1);
+        let z = SchedParam { sched_priority: 0 };
+        t.eq(b"set other", sys_sched_setscheduler(0, SCHED_OTHER, &z), 0);
+        let s = stat_sched();
+        t.eq(b"other keeps nice", s[0] * 100 + s[1], 25 * 100 + 5);
+        t.eq(
+            b"fifo reset",
+            sys_sched_setscheduler(0, SCHED_FIFO | RESET_ON_FORK, &p),
+            0,
+        );
+        t.eq(
+            b"getscheduler reset",
+            sys_sched_getscheduler(0),
+            (SCHED_FIFO | RESET_ON_FORK) as i64,
+        );
+        let c = sys_fork();
+        if c == 0 {
+            let s = stat_sched();
+            let ok = sys_sched_getscheduler(0) == SCHED_OTHER as i64 && s[0] == 20 && s[1] == 0;
+            sys_exit(if ok { 0 } else { 1 });
+        }
+        let mut st = 0i32;
+        sys_wait4(c, &mut st, 0, 0);
+        t.eq(b"reset child", st as i64, 0);
+        t.done();
+        sys_exit(0);
+    }
+    let mut st = 0i32;
+    sys_wait4(pid, &mut st, 0, 0);
+}
+
+/// SCHED_PERM: without CAP_SYS_NICE (uid 1000) an rt policy needs
+/// RLIMIT_RTPRIO (0 by default: EPERM), and another user's task cannot
+/// be changed (EPERM, Linux check_same_owner); its own SCHED_OTHER is fine
+fn test_sched_perm() {
+    use super::sk::T;
+    use hk_syscall::{SchedParam, sys_sched_setscheduler, sys_setresgid, sys_setresuid};
+    let pid = sys_fork();
+    if pid == 0 {
+        let mut t = T::new(b"SCHED_PERM");
+        let z = SchedParam { sched_priority: 0 };
+        const RESET: i32 = 0x4000_0000;
+        t.eq(b"set reset", sys_sched_setscheduler(0, RESET, &z), 0);
+        sys_setresgid(1000, 1000, 1000);
+        sys_setresuid(1000, 1000, 1000);
+        // An unprivileged task keeps SCHED_RESET_ON_FORK once set
+        t.eq(b"clear reset", sys_sched_setscheduler(0, 0, &z), -1);
+        t.eq(b"keep reset", sys_sched_setscheduler(0, RESET, &z), 0);
+        let p = SchedParam { sched_priority: 10 };
+        t.eq(b"fifo", sys_sched_setscheduler(0, 1 | RESET, &p), -1);
+        t.eq(b"other own", sys_sched_setscheduler(0, RESET, &z), 0);
+        t.eq(b"other init", sys_sched_setscheduler(1, 0, &z), -1);
+        t.done();
+        sys_exit(0);
+    }
+    let mut st = 0i32;
+    sys_wait4(pid, &mut st, 0, 0);
+}
+
+/// A child pinned to `cpu`, SCHED_FIFO at `prio` if nonzero, counting in
+/// `counter` for `ms` (forever if 0), then exiting
+fn spinner(cpu: u32, prio: i32, counter: *mut u64, ms: i64) -> i64 {
+    use hk_syscall::{SchedParam, sys_sched_setscheduler};
+    let pid = sys_fork();
+    if pid == 0 {
+        let m = 1u64 << cpu;
+        sys_sched_setaffinity(0, 8, &m);
+        if prio != 0 {
+            sys_sched_setscheduler(0, 1, &SchedParam { sched_priority: prio });
+        }
+        let end = now_ms() + ms;
+        loop {
+            // SAFETY: the shared page the parent mapped
+            unsafe { counter.write_volatile(counter.read_volatile() + 1) };
+            if ms != 0 && now_ms() >= end {
+                sys_exit(0);
+            }
+        }
+    }
+    pid
+}
+
+/// RT_FIFO: see the module doc. The FIFO spinners run for 300 ms (Linux
+/// throttles rt tasks to 95% of each second, so no throttling within
+/// the window)
+fn test_rt_fifo() {
+    use super::sk::T;
+    let mut t = T::new(b"RT_FIFO");
+    let page = sys_mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if !t.ok(b"mmap", page >= 0, page) {
+        t.done();
+        return;
+    }
+    let c = page as *mut u64;
+    let mut all = [0u64; 16];
+    let len = sys_sched_getaffinity(0, core::mem::size_of_val(&all), all.as_mut_ptr());
+    if all[0].count_ones() < 2 {
+        sys_munmap(page as u64, 4096);
+        println(b"RT_FIFO:SKIP (needs 2 CPUs)");
+        return;
+    }
+    let cpu = 63 - all[0].leading_zeros();
+    // This task measures from another CPU (behind the FIFO spinner it
+    // would not run until that ends)
+    sys_sched_setaffinity(0, 8, &(1u64 << all[0].trailing_zeros()));
+    // SAFETY: counters 0..3 of the shared page
+    let at = |i: usize| unsafe { c.add(i).read_volatile() };
+    let other = spinner(cpu, 0, c, 0);
+    sleep_ms(50);
+    let fifo = spinner(cpu, 10, unsafe { c.add(1) }, 300);
+    // Let the FIFO spinner start, then measure the other one during it
+    sleep_ms(50);
+    let o0 = at(0);
+    sleep_ms(150);
+    let o1 = at(0);
+    let f = at(1);
+    let mut st = 0i32;
+    sys_wait4(fifo, &mut st, 0, 0);
+    sleep_ms(20);
+    let s0 = at(0);
+    sleep_ms(150);
+    let solo = at(0) - s0;
+    reap(other);
+    t.ok(b"fifo ran", f > 0, f as i64);
+    // Starved while the FIFO task spins: under a fifth of its solo rate
+    t.ok(b"other starved", (o1 - o0) * 5 < solo.max(1), (o1 - o0) as i64);
+    // Two FIFO tasks of one priority on one CPU: the second waits for
+    // the first to finish
+    let a = spinner(cpu, 10, unsafe { c.add(2) }, 300);
+    sleep_ms(50);
+    let b = spinner(cpu, 10, unsafe { c.add(3) }, 50);
+    sleep_ms(100);
+    let (ca, cb) = (at(2), at(3));
+    sys_wait4(a, &mut st, 0, 0);
+    sys_wait4(b, &mut st, 0, 0);
+    t.ok(b"first ran", ca > 0, ca as i64);
+    t.eq(b"no time slice", cb as i64, 0);
+    sys_sched_setaffinity(0, len as usize, all.as_ptr());
+    sys_munmap(page as u64, 4096);
+    t.done();
+}
+
+/// BALANCE: see the module doc (Linux sched_balance_rq)
+fn test_balance() {
+    let ncpu = ncpus_allowed();
+    if ncpu < 2 {
+        println(b"BALANCE:SKIP (one CPU)");
+        return;
+    }
+    let n = ncpu.clamp(2, 4) as usize;
+    let page = sys_mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if page < 0 {
+        print(b"BALANCE:FAIL mmap ");
+        print_num(page);
+        println(b"");
+        return;
+    }
+    let slots = page as *mut u32;
+    let mut all = [0u64; 16];
+    let len = sys_sched_getaffinity(0, core::mem::size_of_val(&all), all.as_mut_ptr());
+    let first = 1u64 << all[0].trailing_zeros();
+    let mut pids = [0i64; 4];
+    for (i, pid) in pids.iter_mut().enumerate().take(n) {
+        // SAFETY: slot i of the shared page
+        unsafe { slots.add(i).write_volatile(u32::MAX) };
+        *pid = sys_fork();
+        if *pid == 0 {
+            sys_sched_setaffinity(0, 8, &first);
+            loop {
+                let mut cpu = 0u32;
+                sys_getcpu(&mut cpu, core::ptr::null_mut());
+                // SAFETY: as above
+                unsafe { slots.add(i).write_volatile(cpu) };
+            }
+        }
+    }
+    sleep_ms(100);
+    for pid in pids.iter().take(n) {
+        sys_sched_setaffinity(*pid, len as usize, all.as_ptr());
+    }
+    // Then allowed everywhere: the balancer spreads them
+    let mut seen = 0u64;
+    for _ in 0..20 {
+        sleep_ms(50);
+        seen = 0;
+        for i in 0..n {
+            // SAFETY: as above
+            let cpu = unsafe { slots.add(i).read_volatile() };
+            if cpu < 64 {
+                seen |= 1 << cpu;
+            }
+        }
+        if seen.count_ones() >= 2 {
+            break;
+        }
+    }
+    for pid in pids.iter().take(n) {
+        reap(*pid);
+    }
+    sys_munmap(page as u64, 4096);
+    if seen.count_ones() >= 2 {
+        println(b"BALANCE:OK");
+    } else {
+        print(b"BALANCE:FAIL spinners on cpus mask ");
+        print_num(seen as i64);
+        println(b"");
+    }
+}
+
+/// The CPU the caller runs on
+fn getcpu() -> i64 {
+    let mut cpu = 0u32;
+    let r = sys_getcpu(&mut cpu, core::ptr::null_mut());
+    if r < 0 { r } else { cpu as i64 }
+}
+
+/// AFFINITY_MIGRATE: sched_setaffinity moves a running task before it
+/// returns (Linux affine_move_task), and a sleeping one at its wakeup
+fn test_affinity_migrate() {
+    use super::sk::T;
+    use hk_syscall::{sys_close, sys_pipe2, sys_read, sys_write};
+    let mut t = T::new(b"AFFINITY_MIGRATE");
+    let mut orig = [0u64; 16];
+    let len = sys_sched_getaffinity(0, core::mem::size_of_val(&orig), orig.as_mut_ptr());
+    if !t.ok(b"getaffinity", len > 0, len) {
+        t.done();
+        return;
+    }
+    let cpus: u64 = orig[0];
+    for cpu in 0..64u32 {
+        if cpus & (1 << cpu) == 0 {
+            continue;
+        }
+        let m = 1u64 << cpu;
+        t.eq(b"setaffinity", sys_sched_setaffinity(0, 8, &m), 0);
+        t.eq(b"runs on the cpu", getcpu(), cpu as i64);
+    }
+    sys_sched_setaffinity(0, len as usize, orig.as_ptr());
+    let last = 63 - cpus.leading_zeros();
+    if cpus.count_ones() >= 2 {
+        let mut fds = [0i32; 2];
+        sys_pipe2(fds.as_mut_ptr(), 0);
+        let child = sys_fork();
+        if child == 0 {
+            let first = 1u64 << cpus.trailing_zeros();
+            sys_sched_setaffinity(0, 8, &first);
+            let mut b = [0u8; 1];
+            sys_read(fds[0] as u64, b.as_mut_ptr(), 1);
+            sys_exit(getcpu() as u64 & 0xff);
+        }
+        sleep_ms(50);
+        let m = 1u64 << last;
+        t.eq(b"pin child", sys_sched_setaffinity(child, 8, &m), 0);
+        sys_write(fds[1] as u64, b"x".as_ptr(), 1);
+        let mut st = 0i32;
+        sys_wait4(child, &mut st, 0, 0);
+        t.eq(b"child woke on", ((st >> 8) & 0xff) as i64, last as i64);
+        sys_close(fds[0] as u64);
+        sys_close(fds[1] as u64);
+    }
+    t.done();
+}
+
+/// CPUs the caller may run on (sched_getaffinity, up to 1024 CPUs)
+pub fn ncpus_allowed() -> u32 {
+    let mut mask = [0u64; 16];
+    let n = sys_sched_getaffinity(0, core::mem::size_of_val(&mask), mask.as_mut_ptr());
+    if n <= 0 {
+        return 1;
+    }
+    mask.iter().map(|w| w.count_ones()).sum()
+}
+
+/// SMP_SPREAD: spinners forked one after another run on distinct CPUs
+/// (fork places a child on the least loaded CPU, Linux
+/// sched_balance_find_dst_cpu); each publishes the CPU it runs on
+fn test_smp_spread() {
+    let ncpu = ncpus_allowed();
+    if ncpu < 2 {
+        println(b"SMP_SPREAD:SKIP (one CPU)");
+        return;
+    }
+    let n = ncpu.min(4) as usize;
+    let page = sys_mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if page < 0 {
+        print(b"SMP_SPREAD:FAIL mmap ");
+        print_num(page);
+        println(b"");
+        return;
+    }
+    let slots = page as *mut u32;
+    let mut pids = [0i64; 4];
+    for (i, pid) in pids.iter_mut().enumerate().take(n) {
+        // SAFETY: slot i of the shared page; u32::MAX = not yet running
+        unsafe { slots.add(i).write_volatile(u32::MAX) };
+        *pid = sys_fork();
+        if *pid == 0 {
+            loop {
+                let mut cpu = 0u32;
+                sys_getcpu(&mut cpu, core::ptr::null_mut());
+                // SAFETY: as above
+                unsafe { slots.add(i).write_volatile(cpu) };
+            }
+        }
+    }
+    sleep_ms(300);
+    let mut seen = 0u64;
+    for i in 0..n {
+        // SAFETY: as above
+        let cpu = unsafe { slots.add(i).read_volatile() };
+        if cpu < 64 {
+            seen |= 1 << cpu;
+        }
+    }
+    for pid in pids.iter().take(n) {
+        reap(*pid);
+    }
+    sys_munmap(page as u64, 4096);
+    if seen.count_ones() >= 2 {
+        println(b"SMP_SPREAD:OK");
+    } else {
+        print(b"SMP_SPREAD:FAIL children on cpus mask ");
+        print_num(seen as i64);
+        print(b" of ");
+        print_num(n as i64);
+        println(b" children");
+    }
 }
 
 /// CLOCK_MONOTONIC in ms

@@ -184,8 +184,8 @@ each, as `LOCKDEP:FAIL` (so the boot test fails):
   `might_fault`, skipped while page faults are disabled) with a tracked
   spin lock held, a nonzero preempt count (any `IrqSpinlock`), in an
   interrupt handler, or with interrupts disabled (syscalls and faults
-  run with them on, 7.5). Without the feature it is the old debug-build
-  preempt-count assertion.
+  run with them on, 7.5). Without the feature it is the
+  `MIGHT_SLEEP:FAIL` check above.
 - **Lock order:** a lock's class is the source location of its `new()`
   (`#[track_caller]`, like Linux's static lock_class_key: all `TcpSock.cb`
   share one class). Taking B while holding A records A -> B; taking B
@@ -194,13 +194,21 @@ each, as `LOCKDEP:FAIL` (so the boot test fails):
   not checked (listener -> child `cb`, `lock2` of two unix sockets).
 - **IRQ safety:** a tracked lock taken in an interrupt handler (the timer
   tick and device IRQ dispatch call `lockdep::irq_enter/exit`).
+- **Interrupts on with an `IrqSpinlock` held** (Linux lockdep's
+  inconsistent lock state): each guard saves the interrupt state it
+  found and restores it on release, so guards must be released in
+  reverse order; one released early turns interrupts back on under the
+  other lock, and an interrupt that takes it spins forever on its own
+  CPU. A per-CPU count of held `IrqSpinlock`s (a lock held across a
+  context switch counts on the CPU) catches a release that re-enables
+  interrupts while the count is nonzero.
 
 The held-lock stacks are per CPU (the kernel is not preemptive and a task
 never sleeps holding a spin lock, which is itself checked), the edge
 table is a fixed array: nothing allocates. Power-off prints a
 `lockdep: N reports, M order edges` summary. `IrqSpinlock` acquisitions
 are not tracked for order (they are leaves or near-leaves); they count
-through the preempt count.
+through the preempt count and the held count above.
 
 ### 1.6 Atomic Types
 
@@ -380,9 +388,9 @@ Printk locks (ALL IRQ-safe - can be acquired from interrupt context):
 
 ### Why IrqSpinlock → TASKLIST is Safe
 
-Some IrqSpinlock holders may take `TASKLIST` (the scheduler no longer
-does: the run queue keeps everything a switch or wakeup needs in the
-`Task`, 3.1):
+Some IrqSpinlock holders may take `TASKLIST` (the scheduler does not:
+the run queue keeps everything a switch or wakeup needs in the `Task`,
+3.1):
 
 1. `IrqSpinlock` disables interrupts on the local CPU
 2. While interrupts are disabled, no ISR can run on this CPU
@@ -425,38 +433,59 @@ Other CPUs cannot cause deadlock because:
 
 **Location:** `kernel/task/percpu.rs`
 
-The scheduler uses a per-CPU locking model to minimize contention.
+Each CPU has its own run queue and lock (Linux struct rq); a wakeup
+takes the lock of the run queue it queues on, whichever CPU that is.
 
 #### Global State
 
 | Variable | Type | Purpose |
 |----------|------|---------|
 | `PERCPU_SCHEDS` | `PerCpu<PerCpuScheduler>` | Per-CPU scheduler array |
+| `SCHED_CPUS` | `CpuMask` | CPUs that are active and run a scheduler (Linux cpu_active_mask): set once per CPU at bring-up (`sched_cpu_update`, Release fence), read lock-free by every wakeup placement and balancing pass (Acquire fence) |
 | `TASKLIST` | `RwLock<GlobalTaskTable>` | Every task (Linux tasklist_lock + task list) |
-| `TICK_COUNT` | `AtomicU64` | Global tick counter (jiffies, TICK_MS = 10 ms); advanced only by CPU 0's tick; every CPU's tick applies its remote wakeups (`sched_ipi`) and runs its own timers (`timer::run_local`; Timers, 3.3) |
+| `TICK_COUNT` | `AtomicU64` | Global tick counter (jiffies, TICK_MS = 10 ms); advanced only by CPU 0's tick; every CPU's tick runs its own timers (`timer::run_local`; Timers, 3.3) |
 
 #### Per-CPU State
 
 Each `PerCpuScheduler` contains:
 ```rust
 pub struct PerCpuScheduler {
-    pub lock: IrqSpinlock<CpuRunQueue>,  // curr, idle, 256 priority lists, dead
-    wake_list: AtomicPtr<()>,            // remote wakeups (lock-free llist)
+    pub lock: IrqSpinlock<CpuRunQueue>,  // curr, idle, prev, class queues, dead
     pub initialized: AtomicBool,          // Init flag
+    pub nr_switches: AtomicU64,           // context switches (QSBR hook)
+    pub curr_mm: AtomicUsize,             // running task's Mm address (membarrier)
+    pub membarrier_state: AtomicU32,      // its membarrier registrations
+    pub curr_rank: AtomicU32,             // running task's importance (rt placement)
+    pub ticks: AtomicU64,                 // this CPU's ticks (balancing interval)
+    pub nr_running: AtomicU32,            // queued + running tasks
+    pub nr_uninterruptible: AtomicI64,    // loadavg's D-state count
 }
 ```
 
 Each `Task` carries its scheduling entity (`Task.se`, Linux
 sched_entity + `__state`/`on_rq`): `state` (`SleepState` as an
-atomic), `on_rq` (queued or running), `prio`, the priority-list `link`,
-the saved switch frame, and the wake-list / WakeQ links; plus
+atomic), `on_rq` (queued or running), `on_cpu` (running, or its CPU
+still switching away from it), the scheduling class and Linux
+parameters (`class`, `policy`, `static_prio`, `rt_priority`,
+`reset_on_fork`; SCHED_RR's slice), the run-list `link`, the saved
+switch frame, and the WakeQ link; plus
 `Task.pi_lock` (IrqSpinlock, Linux pi_lock). The run queue owns one
 reference to each task of its CPU, from its first wakeup (or creation
 asleep) until its final switch away (`DeadTask`; Linux: the task's own
 usage count put in finish_task_switch); its lists and `curr` hold none
-of their own. `prio` is written under TASKLIST (setpriority,
-sched_setscheduler) and read lock-free; a queued task moves at its
-next enqueue.
+of their own. The class and parameters are written under the task's
+pi_lock and rq lock (`change_class`: setpriority, sched_setscheduler;
+a queued task is taken off its list first and put back on its new one)
+and read lock-free. Classes (Linux sched_class), highest first: stop
+(`migration/N`), rt (SCHED_FIFO/RR: 99 levels, FIFO never time-sliced,
+RR every 100 ms, a preempted rt task keeps the head of its level), fair
+(SCHED_NORMAL/BATCH/IDLE: EEVDF, `task/fair.rs`; the entity's
+vruntime, deadline, lag and exec_start change under the rq lock of its
+CPU, and the tick charges the running one under it), idle (never
+queued). A woken task preempts a lower class, a lower rt priority, or
+a fair task EEVDF would not pick at that point (not for SCHED_BATCH/IDLE).
+`CpuRunQueue.min_vruntime` (under the rq lock) stands for the average
+when no fair task is there.
 
 Each `PerCpu` (per-CPU data) contains:
 ```rust
@@ -471,31 +500,56 @@ only at that task's return to user mode (`entry::exit_to_user_mode`).
 
 #### Locking Rules
 
-1. **Each CPU only locks its own run queue** - no CPU takes another
-   CPU's `PerCpuScheduler.lock` (bring-up aside: the BSP installs the
-   APs' idle tasks). A wakeup for a task owned by another CPU is pushed
-   onto that CPU's `wake_list` (a lock-free stack linked through
-   `Task.se.wake_next`, one entry per task via `se.wake_pending`, pushed
-   under the task's pi_lock; nothing allocates) and a reschedule IPI;
-   the owner applies it under its rq lock (`ttwu_pending`: in the IPI,
-   and at every `schedule()`/`yield_now()`/tick; Linux
-   ttwu_queue_wakelist / sched_ttwu_pending). Entries hold no task
-   reference: an exiting task sets Dead under its pi_lock (no new
-   pushes) and drains its CPU's list before its final switch, and tasks
-   never migrate (`Task.cpu` names the owning run queue; migration, P7,
-   must drain the old CPU's list first).
+1. **Any CPU may lock any run queue** (Linux) - `Task.cpu` names the
+   run queue a task belongs to (Linux task_cpu); it changes only in
+   `set_task_cpu`, under the task's pi_lock while it is on no run queue
+   (a wakeup, a new task), or under its rq lock while queued (a
+   migration). `task_rq_lock` locks the run queue it names and rechecks
+   it. A wakeup (`try_to_wake_up`, Linux ttwu) holds the task's pi_lock
+   throughout: under its rq lock it sees whether the task is still on
+   it (then only sets Running, Linux ttwu_runnable); if not, it waits
+   for `se.on_cpu` to clear (its old CPU is off its stack), chooses the
+   CPU (`select_task_rq`), sets it and activates the task under that
+   CPU's rq lock. `resched_curr` flags the running task and sends a
+   reschedule IPI when the run queue is another CPU's. The rq holds no
+   task reference per CPU: the scheduler's reference (rule 8) follows
+   the task. A queued task moves (`move_queued_task`, from the stopper
+   of its CPU) under its pi_lock: off the old list under the old rq
+   lock, `set_task_cpu`, then onto the new one under the new lock, never
+   both locks at once. In between it is `on_rq` on no list, so whatever
+   touches a queued task on its run queue holds its pi_lock (wakeup,
+   priority and affinity changes) or found it on that list. The load
+   balancer (`sched_balance_rq`, Linux; from the tick, every tick on an
+   idle CPU and every 8 on a busy one, and from the idle loop before it
+   halts) finds the busiest CPU by `nr_running`, takes both run queues
+   with `double_rq_lock` (lowest CPU first, released in reverse: one
+   `DoubleRq` guard, so interrupts come back on only once both are
+   free) and moves queued tasks that
+   may run here, never the running one, at most 32 per pass, with no
+   pi_lock: it found them on the list, and `set_task_cpu` is under both
+   rq locks.
 
 2. **Run queue lock is IRQ-safe** - Timer interrupts cannot cause deadlocks.
-   Lock order: pi_lock → rq lock; nothing is taken under the rq lock but
-   the arm64 ASID leaf (no TASKLIST: the switch and the wakeup use only
-   `Task` atomics). Never call a wakeup (`try_to_wake_up`,
-   `WaitQueue::wake*`) while holding this CPU's rq lock (it is not
-   recursive); `schedule_timeout`'s HARD timer wakes its sleeper from
-   the tick with no rq lock held.
+   Lock order: pi_lock → rq lock; two rq locks lowest CPU first
+   (`double_rq_lock`); nothing is taken under an rq lock but the arm64
+   ASID leaf (no TASKLIST: the switch and the wakeup use only `Task`
+   atomics). Never call a wakeup (`try_to_wake_up`, `WaitQueue::wake*`)
+   while holding an rq lock (it is not recursive); `schedule_timeout`'s
+   HARD timer wakes its sleeper from the tick with no rq lock held. A
+   waker spinning on `on_cpu` holds only the pi_lock: the CPU it waits
+   for finishes its switch with interrupts off and no pi_lock, so it is
+   never the waker's own CPU.
 
 3. **Context switch happens with lock held** - The lock is released by the
-   task switched to (its guard drop, or `finish_context_switch` for a new
-   task).
+   task switched to, in `finish_task_switch` (Linux), always on the run
+   queue of the CPU it runs on now: a resumed task rebinds its guard to
+   that CPU's rq lock (`IrqSpinlockGuard::rebind`, keeping its own saved
+   interrupt state), a new task takes it over (`assume_held`, from the
+   arch trampoline via `finish_context_switch`). Before the switch the
+   CPU records the outgoing task in `rq.prev` and sets the incoming
+   task's `se.on_cpu`; `finish_task_switch` clears `prev.se.on_cpu`
+   (Release) once off its stack (Linux p->on_cpu: a task is not run
+   anywhere else while it is set).
 
 4. **`context_switch_first()`** - An exiting task (`exit_current`) keeps
    the lock held across its final switch like any other switch (the guard
@@ -503,10 +557,10 @@ only at that task's return to user mode (`entry::exit_to_user_mode`).
    between leaving the dead task and the next task taking over. The
    boot-time first switch (`try_schedule`) does the same, so the per-CPU
    preempt count stays balanced (dropping the guard there and releasing
-   again in `finish_context_switch` left it at -1).
+   again in `finish_task_switch` left it at -1).
 
-5. **Timer ISR only touches local CPU** - the tick drains the local
-   `wake_list` and runs the local CPU's timers only.
+5. **Timer ISR only touches local CPU** - the tick runs the local
+   CPU's timers only.
 
 9. **The idle task is never queued** - `rq.idle` runs when the lists are
    empty. Making a task runnable flags the running task NEED_RESCHED if
@@ -523,7 +577,10 @@ only at that task's return to user mode (`entry::exit_to_user_mode`).
    nothing to save, and signal frames (`do_signal`, `force_sig_fault`),
    fork (`do_clone` copies it), exec (`jump_to_user` rebuilds it) and
    ptrace read and write it there with no lock: the task itself, or a
-   stopped tracee under TASKLIST.
+   stopped tracee under TASKLIST. A tracer first waits for the tracee's
+   `se.on_cpu` to clear (`wait_task_inactive`, in ptrace_check_attach):
+   its TLS and GS base are saved by its switch-out, which may still be
+   finishing on another CPU.
 
 7. **User FP/SIMD state is saved eagerly, per task, never lazily** - no
    lock is involved; the state always lives with the task it belongs to:
@@ -547,9 +604,9 @@ only at that task's return to user mode (`entry::exit_to_user_mode`).
    `DeadTask` (stack, mm_count reference, the run queue's task
    reference) in its rq's `dead` slot (one: the next task takes it
    before anything else can exit here), under
-   the rq lock held across the switch. The task switched to takes the list
-   under the rq lock and frees it after releasing the lock (in
-   `context_switch_locked`, or `finish_context_switch` for a new task):
+   the rq lock held across the switch. The task switched to takes it
+   under the rq lock and frees it after releasing the lock
+   (`finish_task_switch`):
    frame frees and the last `Arc<Mm>` drop (top-level table, heap) never
    happen under the rq lock.
 
@@ -566,20 +623,19 @@ register on wait queue                    make condition true
 set_current_state(Interruptible)          try_to_wake_up(&task, mode):
   (store state, full barrier)               lock task.pi_lock, full barrier
 if condition: done                          state matches mode? else return
-if signal_pending(): -ERESTARTSYS           state = Running
-schedule():                                 on_rq? return (its schedule()
-  lock rq; state Running? return              sees Running)
-  on_rq = false                             own CPU: lock rq, activate
-  state Running? on_rq = true; return       remote: push wake_list + IPI
-  switch                                  activate (under the rq lock):
-                                            on_rq = true, enqueue
+if signal_pending(): -ERESTARTSYS           lock task's rq: on_rq?
+schedule():                                   state = Running; return
+  lock rq; state Running? return            wait until !on_cpu
+  on_rq = false                             cpu = select_task_rq
+  switch (finish_task_switch on the         lock that rq, activate:
+    next task clears on_cpu)                  state = Running, on_rq,
+                                              enqueue, resched_curr
 ```
 
-Both `on_rq` and `state` are SeqCst: a waker that still saw `on_rq`
-left `state` Running, which `schedule()` sees after clearing `on_rq`
-(it stays); a waker that saw it cleared queues the task. A wakeup
-racing a sleeper that stayed may leave a stale wake-list entry, applied
-later as a spurious wakeup (allowed: every sleeper re-checks).
+The sleeper tests `state` and clears `on_rq` under its rq lock; the
+waker tests `on_rq` under the same lock: either it saw the sleeper still
+on it and set Running first (the sleeper stays), or the sleeper is off
+it and the waker queues it, once its CPU is off its stack.
 
 `WakeMode::Interruptible` (signals) wakes only `Interruptible` sleepers;
 `WakeMode::Fatal` (SIGKILL) also wakes `Killable` ones (Linux
@@ -616,17 +672,45 @@ CPU being idle) is a quiescent state for a future QSBR RCU.
 a wakeup/sleep; order: may be taken while holding nothing else) maps tid ->
 control block. `kthread_should_stop/should_park/parkme` and
 `kthread_stop/park/unpark` use atomics + `try_to_wake_up` + the block's
-`ack` WaitQueue. Unbound threads go round-robin to APs (CPU 0 runs the
-cooperative user tasks). Standing threads: `ktimers/N` (one per CPU, runs its SOFT
+`ack` WaitQueue. A thread created without a CPU gets one round-robin;
+every kernel thread stays on its CPU (`cpus_mask` holds only it, Linux
+kthread_bind). Standing threads: `ktimers/N` (one per CPU, runs its SOFT
 timer callbacks), the system workqueue worker, `softnet/N` (one per CPU,
 network receive; see 3.10), `kselftest` (boot only).
 
+**Stoppers (kernel/task/stop_machine.rs, Linux stop_machine.c):**
+`migration/N`, one per CPU at the highest priority, runs calls queued
+with `stop_one_cpu` (thread context; the caller sleeps until done). Per
+CPU: `Stopper.lock` (sleeping `sync::Mutex`, one caller at a time, held
+until the call completes) → `Stopper.work` (IrqSpinlock leaf, the
+slot). `stop_one_cpu_nowait` (any context) only fills an empty slot:
+the soft lockup detector (`watchdog.rs`, Linux kernel/watchdog.c) queues
+a touch from each CPU's tick every `watchdog_thresh * 2 / 5` s and
+reports `BUG: soft lockup` when the last one ran over `2 *
+watchdog_thresh` s ago (per-CPU atomics only). `migration_cpu_stop` takes the task's pi_lock → this CPU's rq
+lock: a task still queued here moves; one asleep gets `wake_cpu` (Linux
+p->wake_cpu, under the pi_lock), where its next wakeup starts.
+`set_cpus_allowed_ptr` (sched_setaffinity; Linux affine_move_task)
+writes `cpus_mask` under pi_lock + rq lock and, if the task runs or is
+queued on a CPU now excluded, calls that CPU's stopper with no lock held;
+`sched_exec` (do_execve) moves the caller to the least loaded CPU the
+same way. Kernel threads are PF_NO_SETAFFINITY (sched_setaffinity:
+EINVAL).
+
 Every online AP gets an idle task (`init_ap_schedulers`) and enters the
-scheduler from its boot idle loop. User tasks still run only on CPU 0. On
-x86-64 the TSS (RSP0) and the syscall entry stack are global: kernel
-threads switch with kernel stack 0, which leaves them untouched, so an AP
-switch cannot clobber CPU 0's user-entry stack. Per-CPU TSS is required
-before user tasks run on APs.
+scheduler from its boot idle loop. User tasks run on every CPU:
+`select_task_rq` places a new task on the allowed CPU with the fewest
+tasks (`find_idlest_cpu`, Linux sched_balance_find_dst_cpu) and a
+waking one on its previous CPU if idle, else an idle allowed CPU, else
+its previous one (`select_idle_sibling`); all CPUs form one domain (no
+topology yet). `PerCpuScheduler.nr_running` (queued or running, idle
+aside; changed under the rq lock, read locklessly for placement) is
+Linux rq->nr_running. `nr_uninterruptible` (Linux, per CPU, only the
+sum counts) goes up under the rq lock when a task sleeps uninterruptibly
+or killably (`se.contrib_load` set) and down on the run queue that wakes
+it; CPU 0's tick folds both into the load averages every 5 s
+(`task/loadavg.rs`, atomics only; /proc/loadavg, sysinfo). On x86-64 each CPU has its own TSS (RSP0) and
+syscall entry stack top, set at each switch to a user task.
 
 ### 3.1.1 Task Struct and Credentials
 
@@ -1130,8 +1214,13 @@ pub struct Zone {
   (`fault::replace_pte`, Linux ptep_clear_flush) first clear the entry
   and flush its TLB entry, then write the new one (required on arm64,
   ARM ARM D8.16; x86 needs it for the page-size change). In between
-  the address faults; the fault waits for the mm lock the writer holds,
-  then finds the new entry.
+  the address faults; the fault waits for the lock the writer holds,
+  then finds the new entry. A split leaves `PMD_SPLITTING` (invalid to
+  the MMU, Linux's invalidated pmd) rather than 0 in between, under the
+  page_table_lock: lockless walkers (`walk_pmd`, `pte_alloc`) wait it
+  out (`pmd_settled`) instead of taking the slot for empty (a racing
+  MADV_DONTNEED of the whole 2MB would otherwise miss the 4KB entries
+  the split then installs).
 - Teardown TLB: `exit_mmap` detaches the user half from the top-level
   table (`paging::detach_user`) into a full-mm `Gather`, which flushes
   the whole address space with its paging-structure caches
@@ -1143,7 +1232,9 @@ pub struct Zone {
 #### Swap (kernel/mm/swap.rs, swap_state.rs; Linux mm/swapfile.c, swap_state.c)
 
 - `SwapInfo.map` (`spin::Mutex`, Linux si->lock): a device's slot
-  counts (swap PTEs + SWAP_HAS_CACHE) and allocation hint. Thread
+  counts (swap PTEs + SWAP_HAS_CACHE) and allocation hint; swapoff
+  clears SWP_WRITEOK under it, and the allocator rechecks it there, so
+  no slot is taken after swapoff's scans begin. Thread
   context only; a leaf taken under the PTE lock (fork's swap_duplicate,
   zap's free_swap_and_cache, swap-in's swap_free), never with a swap
   cache lock held.
@@ -1268,9 +1359,9 @@ No lock: the state is atomics and per-CPU data (Linux arch/x86/mm/tlb.c).
 No lock (Linux kernel/smp.c): `smp_call_function_many(mask, func,
 info, wait)` runs `func(info)` on other CPUs from their call-function
 IPI (x86 vector 0xfc, arm64 SGI 1); `on_each_cpu` adds this CPU;
-`smp_send_reschedule` (x86 0xfd, arm64 SGI 0) wakes a remote CPU after
-a remote wakeup was queued (`try_to_wake_up`); its handler applies the
-CPU's queued wakeups (`sched_ipi`).
+`smp_send_reschedule` (x86 0xfd, arm64 SGI 0) makes a remote CPU
+reschedule (`resched_curr` after queueing a task on its run queue,
+`kick_process`); its handler flags the running task NEED_RESCHED.
 
 - `QUEUE[cpu]` (per CPU): the calls queued for a CPU, a lock-free list
   (Linux llist). Senders push with a compare-and-swap (Release); only
@@ -1297,8 +1388,11 @@ CPU's queued wakeups (`sched_ipi`).
   the sender's own wait loop): it may only touch atomics, per-CPU data
   and IrqSpinlocks (7.4 applies).
 - **Rules** (a broken one is a deadlock): never call from interrupt
-  context or with an IrqSpinlock held (reported as `LOCKDEP:FAIL
-  smp_call_function_many in atomic context`); never with a lock held
+  context or with an IrqSpinlock held (a raised preempt count with
+  interrupts off; reported as `LOCKDEP:FAIL smp_call_function_many in
+  atomic context`). A `spin::Mutex` may be held (e.g. a THP split's
+  shootdown under the page_table_lock, as Linux under the pmd lock):
+  its waiters spin with interrupts on. Never with a lock held
   that another CPU may spin on with interrupts off (TASKLIST: taken
   under run-queue locks), as that CPU cannot answer. Syscalls and faults
   run with interrupts on (7.5), so a target answers at once; a call may
@@ -1361,7 +1455,8 @@ layout in `doc/MEMORY.md`
 
 - Before the page allocator is up, allocations come from a static boot
   arena (first-fit list under an `IrqSpinlock` leaf); afterwards from
-  kmalloc caches. A block goes back to whichever gave it.
+  kmalloc caches. A block goes back to whichever gave it, told apart by
+  the arena's static bounds (no lock on the free path).
 - Each `KmemCache` has a per-CPU object array, used by its CPU with
   interrupts off (no lock), and `list_lock` (`IrqSpinlock`) over its
   partial and empty slab lists. Order: per-CPU array → `list_lock` →
@@ -1888,7 +1983,11 @@ a HARD hrtimer re-armed every TICK_NS.
   `inner` with the list dropped. Absolute realtime hrtimers see the new
   time at the next clock event (at most a tick away).
 - `start` queues and reprograms with interrupts off (no migration or
-  timer interrupt in between). `cancel_sync` waits out a running
+  timer interrupt in between), on the starting CPU's base: it moves the
+  timer there unless its callback is running on the old one (Linux
+  switch_hrtimer_base). `HrTimer.base` changes only under the old base's
+  lock, and every locker rechecks it after locking (`lock_base`, Linux
+  lock_hrtimer_base). `cancel_sync` waits out a running
   callback (spinning for HARD, sleeping on the `ktimers/N` wait queue
   for SOFT); dropping an `HrTimer` does that.
 - `HrBase.q` is a leaf: callbacks run with it dropped, and
@@ -2672,7 +2771,7 @@ thread context, the driver completes it from its interrupt handler and
 | `Disk.open_mutex` | `sync::Mutex` (sleeping; Linux disk->open_mutex) | thread only | outermost block lock: block device open/release, partition scans (and rescans, BLKRRPART); I/O, `BLKDEV_REGISTRY`, `MAJORS` and the devtmpfs root's `i_rwsem` are taken under it |
 | `BLKDEV_REGISTRY` | spin `RwLock` (dev_t -> block device; global like Linux's bdev map) | thread only | leaf |
 | `MAJORS` | spin `Mutex` (block majors, register_blkdev) | thread only | leaf |
-| blk-mq software queue (`BlkMq.ctxs[cpu]`) | `IrqSpinlock<BioList>`, one per CPU | thread (submit) | leaf: never taken with the hardware queue lock held |
+| blk-mq software queue (`BlkMq.ctxs[cpu]`) | `IrqSpinlock<BioList>`, one per CPU | thread (submit) | leaf: never taken with the hardware queue lock held; its pending bit in the hardware queue's `ctx_map` (Linux) is set and cleared under it, and a run visits only set bits (one that misses a bit being set is followed by the submitter's own run) |
 | blk-mq hardware queue (`BlkMq.hctxs[i]`) | `IrqSpinlock` over the dispatch list and the driver queue (virtio-blk: one virtqueue and its tags; Linux virtio_blk_vq.lock) | thread (dispatch) and hardirq (completion, restart) | leaf: `queue_rq`/`complete` only touch the ring, MMIO and the lock-free DMA API (`DMA_OPS` is a `Once`), never allocate or sleep; taken under `IRQ_TABLE` in the ISR |
 | `Completion.done` | `IrqSpinlock<u32>` | any context | -> its wait queue head -> run-queue lock (the wakeup is issued under it, Linux complete()) |
 | `RamDisk.pages` | spin `Mutex` | thread only (bio-based driver) | leaf |
@@ -2720,11 +2819,10 @@ locks (Linux runs pending softirqs at `local_bh_enable()` after
 `sendto()` returns. A received packet's namespace is its device's
 (`skb.net()`), never `current_net_ns()`; a socket's is `Sock.net`.
 
-Today all device IRQs are routed to CPU 0 (PIC / GIC IROUTER) and user
-tasks run only on CPU 0, so in practice protocol work for eth0 and lo runs
-on CPU 0 (`softnet/0` or a CPU-0 task); kernel threads on other CPUs (e.g.
-the ICMP self-test on CPU 1) use their own CPU's softnet. The locks below
-do not rely on that.
+Today all device IRQs are routed to CPU 0 (PIC / GIC IROUTER), so
+received traffic for eth0 runs on `softnet/0`; `lo` traffic goes to the
+backlog of the sending task's CPU, whichever that is. The locks below do
+not rely on either.
 
 | Lock | Type | IRQ class | Notes |
 |------|------|-----------|-------|
@@ -2837,10 +2935,10 @@ RTNL and `sk_lock` are never held together. No network lock is held
 while taking a socket lock (lookups return `Arc` handles), and no lock is
 held across `netif_rx_flush_local()` (it delivers, taking socket locks):
 socket calls run it at their end, after every step. It flushes the
-calling CPU's backlog, which is where the task's `lo` transmits went
-because tasks never migrate (`Task.cpu` is fixed); a migrating scheduler
-must record the CPU `netif_rx` used. Missing the flush only delays
-delivery to that CPU's softnet thread. Netlink requests are processed in
+backlog the task's last `lo` transmit went to (`Task.rx_cpu`, written
+by `netif_rx`), which is another CPU's if the task moved during the
+call (a user copy that slept); earlier packets on yet another CPU, and
+any flush that is missed, only wait for that CPU's softnet thread. Netlink requests are processed in
 the sender's `sendmsg` with no lock held on entry; mutating handlers take
 RTNL. Carrier changes (`netif_carrier_on/off`, from a driver's NAPI poll
 or `open()`) send RTM_NEWLINK without RTNL (NlTable.socks -> NlSock.rxq
@@ -2927,7 +3025,7 @@ else is taken under it) unless an order is given. "spin" is the
 | `PosixTimer.inner` | posix_timer.rs | IrqSpinlock | one timer's state; -> its hrtimer's base (re-armed under it); cancelled with `cancel_sync` before it is taken (settime) or with it dropped (delete) |
 | timerfd `CANCEL_LIST` | timerfd.rs | spin::Mutex | thread only: weak refs to TFD_TIMER_CANCEL_ON_SET timerfds; -> `Timerfd.inner` (setup_cancel); `clock_was_set` copies it out and drops it first |
 | `TimerBase.wheel` (per CPU, HARD and SOFT) | timer.rs | IrqSpinlock leaf | a 64-slot wheel of `TimerList`s (their links, `expires`, `pending`); callbacks run with it dropped (`running` set); taken in the tick, by `ktimers/N` and by arming/deleting code in any context |
-| `HrBase.q` (per CPU, HARD and SOFT) | hrtimer.rs | IrqSpinlock leaf | sorted lists of `HrTimer`s per clock (their links, `expires`, `pending`); callbacks run with it dropped (`running` set); taken in the clock event interrupt, by `ktimers/N` and by start/cancel in any context |
+| `HrBase.q` (per CPU, HARD and SOFT) | hrtimer.rs | IrqSpinlock leaf | sorted lists of `HrTimer`s per clock (their links, `expires`, `pending`); callbacks run with it dropped (`running` set); taken in the clock event interrupt, by `ktimers/N` and by start/cancel in any context. `SOFT_ACTIVATED` (per-CPU atomic, Linux softirq_activated): set by the clock interrupt when it hands due SOFT timers to `ktimers/N`, cleared by it after its pass (interrupts off, then reprogram); while set the clock event counts only HARD timers |
 | `Eventfd.inner`, `Eventpoll.inner`, `Inotify.inner`, `Fanotify.inner`, `IoUring.inner`, `Pidfd.inner`, `Signalfd.inner`, `Timerfd.inner` | eventfd.rs, epoll.rs, inotify.rs, fanotify.rs, io_uring.rs, pidfd.rs, signalfd.rs, timerfd.rs | IrqSpinlock | per-object state of the anon-inode files; their wait queues are woken after unlocking (pidfd: under it -> wait queue head) |
 | `SIGNALFD_REGISTRY`, `PIDFD_REGISTRY` | signalfd.rs, pidfd.rs | IrqSpinlock | live instances for signal and exit notification; registry -> the instance's `inner` |
 | `Workqueue.inner` | workqueue.rs | IrqSpinlock | pending and delayed work lists (`SYSTEM_WQ`, `BDI_WORKQUEUE`); a work item's own `spin::Mutex<Work>` is taken and dropped before it |
@@ -2941,6 +3039,7 @@ else is taken under it) unless an order is given. "spin" is the
 | `File.f_lock` | fs/file.rs | spin Mutex | file status flags (Linux f_lock) |
 | `SuperBlock.{root, private}`, `DentryCache.root` | fs/superblock.rs, fs/dentry.rs | spin RwLock | superblock root and private data, the dcache root |
 | `RamfsInodeData.xattrs`, `RamfsSbData.sb` | fs/ramfs.rs | spin | ramfs xattrs and superblock back-pointer (under VFS locks) |
+| membarrier `GLOBAL_MUTEX` → `IPI_MUTEX` | membarrier.rs | sleeping (`sync::Mutex`; `IPI_MUTEX` is Linux membarrier_ipi_mutex) | `IPI_MUTEX` serializes the membarrier commands that interrupt other CPUs, so callers cannot multiply the IPIs; held only across `smp_call_function_many` (waited); nothing is taken under it. `GLOBAL_MUTEX` (killable) paces MEMBARRIER_CMD_GLOBAL to one call per tick: held across its IPIs and its one-tick sleep, so GLOBAL callers never delay the expedited ones. The targets are chosen from each CPU's `PerCpuScheduler.curr_mm` / `membarrier_state` (atomics written at every switch in `make_current`: `curr_mm` SeqCst, then a full fence, then the registrations read, so a registration either sees the CPU in its mm and refreshes it by IPI or is seen by the switch; Linux rq->curr->mm and rq->membarrier_state), compared, never dereferenced |
 | `Pipe.inner` | pipe.rs | sleeping (`sync::Mutex`, Linux pipe->mutex) | the pipe's buffer ring; held across page allocation, never under a spin lock; two pipes (splice, tee) in address order (Linux pipe_double_lock); -> frame allocator. `Pipe.head`/`tail` (atomics) are published as the guard unlocks and read locklessly by wait conditions and poll (poll runs under `Eventpoll.inner`, an IrqSpinlock); wakeups follow the unlock |
 | `NTtyLdisc.data` | tty/n_tty.rs | spin Mutex | line discipline buffer (input is polled, not IRQ-fed) |
 | `VgaCon.state` | arch/x86_64/vgacon.rs | IrqSpinlock | VGA text console state, under `CONSOLE_REGISTRY` (3.9) |
@@ -2976,8 +3075,8 @@ circular wait conditions.
 
 ### 4.4 Per-CPU Data Structures
 
-The scheduler uses per-CPU run queues. Each CPU only locks its own run queue,
-eliminating cross-CPU lock contention for the hot path.
+The scheduler uses per-CPU run queues: a CPU's own scheduling takes only
+its own lock; a wakeup takes the target's (3.1).
 
 ### 4.5 Lock-Free Reads (Seqlock)
 
@@ -3281,8 +3380,10 @@ calls; an interrupt from user mode may switch on its way back, with
 nothing held), so code between explicit schedule points still runs
 uninterrupted by other tasks. What this changes, and why it holds:
 
-- Per-CPU data and the current task: a task stays on its CPU (no
-  preemption, no migration), so per-CPU reads stay valid; state an
+- Per-CPU data and the current task: a task stays on its CPU between
+  scheduling points (no preemption), so per-CPU reads stay valid until
+  the next sleep, yield or return to user mode, after which it may run
+  on another CPU (a slot is not kept across one: re-read it); state an
   interrupt handler also touches is atomic or taken with interrupts
   off (`IrqSpinlock`, `local_irq_save`: per-CPU page lists, slab arrays,
   TLB state, cross-CPU queues); `curr` is written only by thread

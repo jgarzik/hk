@@ -10,26 +10,32 @@
 //!
 //! The CPU's clock event device runs one-shot (`arch::clockevent_next`:
 //! LAPIC one-shot count on x86-64, CNTP_CVAL on arm64), programmed for
-//! the earliest pending timer. The scheduler tick is itself a HARD
+//! the earliest pending timer; due SOFT timers waiting for `ktimers/N`
+//! do not count until it has run them (`SOFT_ACTIVATED`). The scheduler tick is itself a HARD
 //! timer re-armed every TICK_NS, so an interrupt comes at least that
 //! often: a CLOCK_REALTIME timer is compared with the realtime clock at
 //! every interrupt, so a clock step (clock_settime) delays it by at most
-//! a tick (no clock_was_set retrigger). A timer started from another
-//! CPU than its base's does not reprogram that CPU: it fires by that
-//! CPU's next tick at the latest.
+//! a tick (no clock_was_set retrigger). Starting a timer moves it to the
+//! starting CPU's base unless its callback is running (Linux
+//! switch_hrtimer_base), so a task that moved CPUs re-arms its timers
+//! where it runs; a timer started while its callback runs elsewhere stays
+//! there, and does not reprogram that CPU: it fires by that CPU's next
+//! tick at the latest.
 //!
 //! Callbacks run with the base lock dropped and `running` set;
 //! `cancel_sync` waits out a running callback like `del_timer_sync`,
 //! and dropping a timer does that.
 //!
 //! Locking: `HrBase.q` is an IrqSpinlock leaf; callbacks run with no
-//! timer lock held.
+//! timer lock held. A timer's `base` changes only under its old base's
+//! lock, so lockers recheck it once they hold a lock (Linux
+//! lock_hrtimer_base); two base locks are never held together.
 
 use core::marker::PhantomPinned;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
-use crate::arch::IrqSpinlock;
+use crate::arch::{IrqSpinlock, IrqSpinlockGuard};
 use crate::cpu::PerCpu;
 use crate::list::{Link, List};
 use crate::task::percpu::TICK_NS;
@@ -145,15 +151,41 @@ impl HrTimer {
         }
     }
 
+    /// Its base, locked: the one `base` names once the lock is held
+    /// (Linux lock_hrtimer_base); None if it was never started
+    fn lock_base(&self) -> Option<(&'static HrBase, IrqSpinlockGuard<'static, HrQueues>)> {
+        loop {
+            // SAFETY: bases are static
+            let base = unsafe { self.base.load(Ordering::Acquire).as_ref() }?;
+            let q = base.q.lock();
+            if core::ptr::eq(self.base.load(Ordering::Acquire), base) {
+                return Some((base, q));
+            }
+        }
+    }
+
     /// (Re)start to fire at `expires` ns on `clock` (Linux
     /// hrtimer_start, absolute mode); true if it was pending
     pub fn start(self: Pin<&Self>, expires: u64, clock: HrClock) -> bool {
         // Interrupts off: no migration or timer interrupt between
         // queueing and programming this CPU's clock event
         let flags = crate::arch::local_irq_save();
-        let base = self.home();
-        let mut q = base.q.lock();
+        self.home();
+        let (mut base, mut q) = self.lock_base().expect("hrtimer: no base");
         let was = q.detach(&self);
+        // Linux switch_hrtimer_base: onto this CPU's base, unless its
+        // callback is running on the old one (cancel_sync waits there)
+        if let Some(cpu) = crate::cpu::try_this_id() {
+            let here = base_of(cpu, self.flags);
+            let me = &*self as *const HrTimer as *mut HrTimer;
+            if !core::ptr::eq(base, here) && base.running.load(Ordering::Acquire) != me {
+                self.base
+                    .store(here as *const HrBase as *mut HrBase, Ordering::Release);
+                drop(q);
+                base = here;
+                q = here.q.lock();
+            }
+        }
         self.expires.store(expires, Ordering::Relaxed);
         self.clock.store(clock as u8, Ordering::Relaxed);
         q.insert(&self);
@@ -169,24 +201,20 @@ impl HrTimer {
     /// Stop it if queued (Linux hrtimer_try_to_cancel without the
     /// running check); true if it was pending
     pub fn cancel(&self) -> bool {
-        // SAFETY: bases are static
-        let Some(base) = (unsafe { self.base.load(Ordering::Acquire).as_ref() }) else {
-            return false;
-        };
-        base.q.lock().detach(self)
+        self.lock_base().is_some_and(|(_, mut q)| q.detach(self))
     }
 
     /// Stop it and wait out a running callback (Linux hrtimer_cancel);
     /// thread context unless HARD, never from its own callback
     pub fn cancel_sync(&self) -> bool {
-        // SAFETY: bases are static
-        let Some(base) = (unsafe { self.base.load(Ordering::Acquire).as_ref() }) else {
-            return false;
-        };
         let me = self as *const HrTimer as *mut HrTimer;
         let mut was = false;
         loop {
-            was |= base.q.lock().detach(self);
+            let Some((base, mut q)) = self.lock_base() else {
+                return was;
+            };
+            was |= q.detach(self);
+            drop(q);
             if base.running.load(Ordering::Acquire) != me {
                 return was;
             }
@@ -336,6 +364,13 @@ impl HrBase {
 /// Per CPU: [HARD, SOFT]
 static BASES: PerCpu<[HrBase; 2]> = crate::percpu![[HrBase::new(), HrBase::new()]];
 
+/// Per CPU: due SOFT timers were handed to `ktimers/N`, which has not
+/// run them yet (Linux cpu_base->softirq_activated): the clock event
+/// is programmed from the HARD timers only meanwhile, or the expired
+/// SOFT expiry would make it fire again at once, over and over, and
+/// keep the CPU in the interrupt instead of letting `ktimers/N` run
+static SOFT_ACTIVATED: PerCpu<AtomicBool> = crate::percpu![AtomicBool::new(false)];
+
 /// The CPU whose base `b` is
 fn base_cpu(b: &HrBase) -> u32 {
     let first = BASES.get(0).as_ptr() as usize;
@@ -352,10 +387,12 @@ fn reprogram(cpu: u32) {
     let mono = crate::time::monotonic_ns();
     let off = crate::time::realtime_ns() as i128 - mono as i128;
     let [hard, soft] = BASES.get(cpu);
-    let next = [hard, soft]
-        .iter()
-        .filter_map(|b| b.q.lock().next(off))
-        .min();
+    // SOFT timers handed to ktimers/N are its to run (SOFT_ACTIVATED)
+    let bases: &[&HrBase] = match SOFT_ACTIVATED.get(cpu).load(Ordering::Relaxed) {
+        true => &[hard],
+        false => &[hard, soft],
+    };
+    let next = bases.iter().filter_map(|b| b.q.lock().next(off)).min();
     let delta = next.map_or(TICK_NS, |n| {
         n.saturating_sub(mono).clamp(MIN_DELTA_NS, TICK_NS)
     });
@@ -403,7 +440,11 @@ pub fn interrupt() {
     }
     let [hard, soft] = BASES.get(cpu);
     hard.run();
-    if soft.due() {
+    // Set or cleared at every interrupt: a due timer cancelled before
+    // ktimers/N ran leaves nothing to wait for
+    let due = soft.due();
+    SOFT_ACTIVATED.get(cpu).store(due, Ordering::Relaxed);
+    if due {
         crate::timer::wake_ktimers(cpu);
     }
     reprogram(cpu);
@@ -415,9 +456,15 @@ pub fn soft_due(cpu: u32) -> bool {
     BASES.get(cpu)[1].due()
 }
 
-/// Run `cpu`'s due SOFT timers (`ktimers/N`, process context)
+/// Run `cpu`'s due SOFT timers (`ktimers/N` of `cpu`, process
+/// context), then program the clock event with the SOFT timers counted
+/// again (Linux hrtimer_run_softirq)
 pub fn run_soft(cpu: u32) {
     BASES.get(cpu)[1].run();
+    let flags = crate::arch::local_irq_save();
+    SOFT_ACTIVATED.get(cpu).store(false, Ordering::Relaxed);
+    reprogram(cpu);
+    crate::arch::local_irq_restore(flags);
 }
 
 /// Sleep until woken or `deadline` ns on `clock` passes (Linux

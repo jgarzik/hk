@@ -32,7 +32,7 @@ use super::TcpSock;
 use super::output::Tuple;
 use super::timewait::TimeWait;
 use crate::error::KernelError;
-use crate::net::inet::port::{self, BindInfo, Flow};
+use crate::net::inet::port::{self, BindInfo, Flow, Parity};
 use crate::net::ipv4::{IPPROTO_TCP, Ipv4Addr};
 
 /// An ehash entry
@@ -109,7 +109,9 @@ impl TcpTables {
                 saddr: info.addr,
                 ..Default::default()
             };
-            port::ephemeral(range, flow, |p| !b.contains_key(&p))
+            port::bind_halves(range, info.reuse)
+                .into_iter()
+                .find_map(|r| port::ephemeral(r, flow, Parity::Bind, |p| !b.contains_key(&p)))
                 .ok_or(KernelError::AddressInUse)?
         };
         b.entry(port).or_default().push(Owner {
@@ -177,8 +179,8 @@ impl TcpTables {
                 let tp = Tuple { lport: p, ..t };
                 b.get(&p).is_none_or(|v| v.iter().all(|o| !o.by_bind)) && !e.contains_key(&tp)
             };
-            t.lport =
-                port::ephemeral(range, flow, usable).ok_or(KernelError::AddressNotAvailable)?;
+            t.lport = port::ephemeral(range, flow, Parity::Connect, usable)
+                .ok_or(KernelError::AddressNotAvailable)?;
             drop(e);
             b.entry(t.lport).or_default().push(Owner {
                 ent: me.clone(),

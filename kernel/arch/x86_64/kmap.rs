@@ -254,20 +254,45 @@ pub unsafe fn init(mbi: u64) {
 /// Boot CPU, before SMP; `va` is unmapped and not in use.
 pub unsafe fn map_page(va: u64, pa: u64, table: &mut dyn FnMut() -> u64) {
     unsafe {
+        let t = walk(va, &[39, 30, 21], table);
+        let flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_NO_EXECUTE;
+        (*t).entry_mut(idx(va, 12)).set(pa, flags);
+    }
+}
+
+/// `map_page` for a 2MB page: `va` and `pa` 2MB aligned, no page table
+/// below that entry yet
+///
+/// # Safety
+/// As for `map_page`.
+pub unsafe fn map_pmd(va: u64, pa: u64, table: &mut dyn FnMut() -> u64) {
+    unsafe {
+        let t = walk(va, &[39, 30], table);
+        let flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_NO_EXECUTE | PAGE_HUGE;
+        (*t).entry_mut(idx(va, 21)).set(pa, flags);
+    }
+}
+
+/// The table `shifts` lead to from the top level for `va`, missing ones
+/// from `table`
+///
+/// # Safety
+/// As for `map_page`.
+unsafe fn walk(va: u64, shifts: &[u32], table: &mut dyn FnMut() -> u64) -> *mut RawPageTable {
+    unsafe {
         let mut t = &raw mut SWAPPER;
         assert!(
             (*t).entry(idx(va, 39)).is_present(),
             "kmap: no top-level entry"
         );
-        for shift in [39, 30, 21] {
+        for &shift in shifts {
             let e = (*t).entry_mut(idx(va, shift));
             if !e.is_present() {
                 e.set(table(), PAGE_PRESENT | PAGE_WRITABLE);
             }
             t = phys_to_virt_table(e.addr());
         }
-        let flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_NO_EXECUTE;
-        (*t).entry_mut(idx(va, 12)).set(pa, flags);
+        t
     }
 }
 

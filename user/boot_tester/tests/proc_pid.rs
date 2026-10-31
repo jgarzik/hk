@@ -249,9 +249,22 @@ fn exec_child() {
     verdict(b"PROC_PID_CMDLINE", n > 0 && &buf[..n as usize] == ARGS, n);
     let n = slurp(&proc_path(pid, b"environ\0"), &mut buf);
     verdict(b"PROC_PID_ENVIRON", n > 0 && &buf[..n as usize] == ENV, n);
-    let n = slurp(&proc_path(pid, b"stat\0"), &mut buf);
+    // The child may still be on its way to sleep on another CPU after
+    // its write: give it up to a second to show S
     let want = b" (boot_tester2) S ";
-    let ok = n > 0 && buf[..n as usize].windows(want.len()).any(|w| w == want);
+    let (mut ok, mut n) = (false, 0);
+    for _ in 0..100 {
+        n = slurp(&proc_path(pid, b"stat\0"), &mut buf);
+        ok = n > 0 && buf[..n as usize].windows(want.len()).any(|w| w == want);
+        if ok {
+            break;
+        }
+        let ts = hk_syscall::Timespec {
+            tv_sec: 0,
+            tv_nsec: 10_000_000,
+        };
+        hk_syscall::sys_nanosleep(&ts, core::ptr::null_mut());
+    }
     verdict(b"PROC_PID_STAT_CHILD", ok, n);
     reap(pid);
 }

@@ -777,6 +777,13 @@ pub trait MemoryLayoutOps {
     /// # Safety
     /// Boot CPU, before SMP; `va` is unmapped and not in use.
     unsafe fn map_kernel_page(va: u64, pa: u64, table: &mut dyn FnMut() -> u64);
+
+    /// Map the 2MB of kernel addresses at `va` to RAM at `pa` (both 2MB
+    /// aligned) with one block entry, otherwise as `map_kernel_page`
+    ///
+    /// # Safety
+    /// As for `map_kernel_page`; no table exists for the 2MB at `va`.
+    unsafe fn map_kernel_pmd(va: u64, pa: u64, table: &mut dyn FnMut() -> u64);
 }
 
 /// Exception and interrupt controller initialization

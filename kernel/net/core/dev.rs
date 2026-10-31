@@ -411,7 +411,11 @@ fn process_backlog(sd: &Softnet, quota: usize) -> usize {
 /// path calling it never re-enters the receive path. Returns false if the
 /// packet was dropped (backlog full).
 pub fn netif_rx(skb: Box<SkBuff>) -> bool {
-    let sd = this_softnet();
+    let cpu = crate::cpu::this_id();
+    let sd = SOFTNET.get(cpu);
+    crate::task::percpu::current()
+        .rx_cpu
+        .store(cpu, Ordering::Relaxed);
     {
         let mut q = sd.backlog.lock();
         if q.len() >= NETDEV_MAX_BACKLOG {
@@ -428,20 +432,28 @@ pub fn netif_rx(skb: Box<SkBuff>) -> bool {
     true
 }
 
-/// Process this CPU's backlog in the calling task (Linux: softirqs run at
-/// `local_bh_enable()` right after `dev_queue_xmit`, so loopback traffic
-/// is delivered before `sendto()` returns).
+/// Process the backlog the calling task last queued to (Linux: softirqs
+/// run at `local_bh_enable()` right after `dev_queue_xmit`, so loopback
+/// traffic is delivered before `sendto()` returns).
 ///
 /// Call only at a point where the caller holds no locks (end of a socket
 /// send; never under a socket lock: delivery takes socket locks). If the
 /// softnet thread is mid-round, the packets are left to it.
 ///
-/// Relies on tasks never migrating: the backlog `lo` queued to in this
-/// task's transmit is this CPU's. With migration, the CPU used by
-/// `netif_rx` must be recorded (or every CPU's backlog flushed);
-/// otherwise the packets still arrive, via that CPU's softnet thread.
+/// A send may sleep between its transmits (a user copy that faults) and
+/// resume on another CPU: the backlog is the one `netif_rx` last used
+/// (`Task.rx_cpu`), possibly another CPU's (deviation: Linux processes
+/// only the local CPU's softirqs). Packets queued before an earlier move
+/// still arrive, through that CPU's softnet thread.
 pub fn netif_rx_flush_local() {
-    let sd = this_softnet();
+    let cpu = match crate::task::percpu::current()
+        .rx_cpu
+        .swap(u32::MAX, Ordering::Relaxed)
+    {
+        u32::MAX => crate::cpu::this_id(),
+        cpu => cpu,
+    };
+    let sd = SOFTNET.get(cpu);
     let mut budget = NETDEV_BUDGET;
     while budget > 0 && !sd.backlog.lock().is_empty() {
         let n = process_backlog(sd, budget.min(NAPI_POLL_WEIGHT));

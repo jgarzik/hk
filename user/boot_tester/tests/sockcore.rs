@@ -2,8 +2,8 @@
 //! /proc/self/fd readlink socket:[N]), socket() argument errors,
 //! ENOTSOCK/EBADF/ESPIPE, EFAULT per socket syscall, getsockname/
 //! getpeername rules, TCP port ownership (bind conflicts, privileged
-//! ports, SO_REUSEPORT owner, unique four-tuples), nonblocking connect
-//! with SO_ERROR.
+//! ports, SO_REUSEPORT owner, unique four-tuples, ephemeral port
+//! parity), nonblocking connect with SO_ERROR.
 
 use hk_syscall::{
     AF_INET, SOCK_DGRAM, SOCK_NONBLOCK, SOCK_STREAM, SockAddrIn, Stat, sys_accept, sys_bind,
@@ -26,6 +26,7 @@ pub fn run_tests() {
     test_privileged_port();
     test_reuseport_owner();
     test_unique_tuple();
+    test_port_parity();
     test_nonblock_refused();
     test_churn();
 }
@@ -414,6 +415,36 @@ fn test_unique_tuple() {
     for f in [a, b, c, l] {
         close(f);
     }
+    t.done();
+}
+
+/// Ephemeral ports (Linux): bind(0) takes odd ones of the default range
+/// (32768-60999), connect() even ones, so a connection never lands on a
+/// port a bind(0) listener just gave up
+fn test_port_parity() {
+    let mut t = T::new(b"SOCKCORE_PORT_PARITY");
+    let l = tcp();
+    bind(l, LO, 0);
+    t.eq(b"listen", sys_listen(l, 16), 0);
+    let lp = port(l);
+    t.ok(b"listener odd", lp % 2 == 1, lp as i64);
+    let mut fds = [0i32; 16];
+    for i in 0..8 {
+        fds[i] = tcp();
+        bind(fds[i], LO, 0);
+        let p = port(fds[i]);
+        t.ok(b"bind odd", p % 2 == 1, p as i64);
+    }
+    for i in 8..16 {
+        fds[i] = tcp();
+        t.eq(b"connect", connect(fds[i], LO, lp), 0);
+        let p = port(fds[i]);
+        t.ok(b"connect even", p % 2 == 0, p as i64);
+    }
+    for f in fds {
+        close(f);
+    }
+    close(l);
     t.done();
 }
 

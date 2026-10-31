@@ -8,7 +8,8 @@
 # STRESS-OK or STRESS-FAILED with the counts. Make variables pass
 # through the environment, e.g. NO_KVM=1 LOCKDEP=1 tools/stress.sh
 #
-# Environment: STRESS_N (10), STRESS_JOBS (3), STRESS_ARCHS ("x86 arm")
+# Environment: STRESS_N (10), STRESS_JOBS (3), STRESS_ARCHS ("x86 arm"),
+# QEMU_SMP (guest CPUs, 4)
 
 set -uo pipefail
 cd "$(dirname "$0")/.."

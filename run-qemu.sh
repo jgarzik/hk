@@ -128,7 +128,7 @@ setup_x86_config() {
             -boot d
             -nographic
             -m 512M
-            -smp 4
+            -smp "${QEMU_SMP:-4}"
         )
     else
         QEMU_ARGS=(
@@ -138,7 +138,7 @@ setup_x86_config() {
             -boot d
             -nographic
             -m 512M
-            -smp 4
+            -smp "${QEMU_SMP:-4}"
         )
     fi
 
@@ -218,7 +218,7 @@ setup_arm_config() {
     # Base QEMU arguments
     QEMU_ARGS=(
         "${ARM_MACHINE[@]}"
-        -smp 4
+        -smp "${QEMU_SMP:-4}"
         -m 512M
         -kernel "$KERNEL"
         -initrd "$INITRAMFS"

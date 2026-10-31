@@ -372,23 +372,23 @@ GFP_KERNEL allocation in atomic context. LOCKDEP has no such report
 call site to attribute it to, so the sites (allocations under spin locks
 across net, fs, ipc) cannot be audited yet.
 
-## Multi-second CPU stalls when the host is overcommitted
+## Scheduler gaps (deviations from Linux)
 
-**Location**: unknown (CPU 0 of the x86 guest)
+**Location**: `kernel/task/fair.rs`, `kernel/task/percpu.rs`
 
-With several QEMUs (4 vCPUs each) on the 24-thread host, CPU 0 of an hk
-guest sometimes runs nothing else for 1-45 s. SOFT timers wait that
-long for `ktimers/0` (TIMERFD_ABSTIME_RT took 2-45 s while timerfd used
-a SOFT timer), and a 20 ms nanosleep took 1.5-29 s in TIMER_TINY_PERIOD
-(1 ns periodic timers armed). Seen about 5 times in ~60 gated x86 boots
-with 8-12 QEMUs at once, once with 8 (two gate lanes), never in a lone
-gate. The Linux reference runs the same tests in the same runs and
-never stalled, so the cause is in hk, made likely by vCPU preemption.
-HARD timers and the tick stay on time and no SOFT callback ran long, so
-some kernel path on CPU 0 does not reach a scheduling point: suspected
-spinning on another vCPU (a lock holder or an IPI target descheduled by
-the host). Next: log long non-scheduling stretches per CPU (a tick-time
-check of the current task's time in kernel mode) and the IPI/csd waits.
+- EEVDF scans a list per pick and computes the average vruntime per use
+  (Linux: an rbtree augmented with min_vruntime and incremental sums,
+  O(log n)); fine for short run queues.
+- Slices end at tick granularity (10 ms; no hrtick), no reweight on a
+  nice change of a queued task, no RUN_TO_PARITY or delayed dequeue.
+- No PELT: load balancing counts tasks and wakeup placement looks for
+  an idle CPU; one flat domain (no SMT/LLC/NUMA topology), no active
+  balancing; rt tasks move at wakeup placement and in the balancer's
+  pulls only (no push from an overloaded CPU).
+- No RT throttling (sched_rt_runtime_us) or dl_server: a SCHED_FIFO
+  spinner starves its CPU's fair tasks; no SCHED_DEADLINE (EINVAL).
+- Kernel preemption is off: a long kernel path delays a woken task of
+  a higher class until its next scheduling point.
 
 ## Unconfirmed: Arc<T> field corruption in the USB mass-storage driver
 
@@ -528,10 +528,6 @@ From the P1 /code-review (unverified unless noted). Tag = phase that fixes it.
    max_io assumes PAGE/seg per page; bdev_rw_frame ignores
    max_segments: SIZE_MAX < 4096 without SEG_MAX overflows SEG_MAX /
    MAX_SEGS → EIO.
-8. **blk-mq run() locks every CPU's sw queue per bio** (P7).
-   `kernel/storage/blk_mq.rs:135`: O(MAX_CPUS) IRQ-off lock pairs and
-   cacheline bounces per submit; use a per-hctx pending bitmap (Linux
-   ctx_map).
 9. **Write path copies** (P5). `kernel/storage/blkdev.rs:749`:
    writes take `&mut [u8]` (to_vec + bounce copy per page); unaligned
    bdev_rw_bytes allocates a request-sized temp buffer.
@@ -545,13 +541,6 @@ From the P2 /code-review (unverified). Tag = when to fix.
    (next batch; real HW). `kernel/arch/aarch64/dtb.rs:175`: Linux
    memblock_mark_nomap removes them (speculative access to secure
    carve-outs).
-3. **Allocator fast-path costs** (P7, with SMP tuning):
-   `kernel/heap.rs:262` every free takes the boot arena's lock
-   (`contains`) and an AcqRel swap (`arena()`) (compare against the
-   static arena bounds instead); `kernel/mm/page_alloc.rs:209`
-   this_cpu() does RDMSR GS_BASE per call (use a gs-relative load);
-   `kernel/mm/page.rs:379` vmemmap uses 4KB PTEs and one memblock
-   alloc per page (Linux: 2MB PMD per section).
 
 ## P3 review findings (open)
 From the P3 /code-review (unverified). Tag = when to fix.
@@ -589,10 +578,6 @@ From the P4 /code-review (unverified unless noted). Tag = when to fix.
    confirmed by reading). `kernel/mm/fault.rs:478` map_swap_page (via
    unuse_pte) → mk_pte(page, area.prot) with prot 0 is PRESENT|USER
    on x86. Use a protnone PTE (Linux vm_page_prot).
-2. **Slot allocated after swapoff's final scan** (P7 blocker).
-   `kernel/mm/swap.rs:181`: alloc_slot doesn't recheck SWP_WRITEOK
-   under SwapInfo.map; swap PTEs of a removed type livelock faults or
-   read a later device's slots.
 3. **Swap file size not capped by i_size** (next batch).
    `kernel/mm/swap.rs:455`: header last_page sizes a heap Vec (8GB →
    panic) and slots past EOF (only block devices are capped).
@@ -605,7 +590,7 @@ From the P4 /code-review (unverified unless noted). Tag = when to fix.
    allocator, cached sorted device list.
 6. **read_swap_page busy-yields on SWAP_HAS_CACHE** (P6).
    `kernel/mm/swap_state.rs:186`: sleep instead.
-7. **One AnonVma per fork family, Vec chain** (P7).
+7. **One AnonVma per fork family, Vec chain** (J).
    `kernel/mm/anon_vma.rs:85`: O(N×VMAs) under one family write lock.
 
 ## T0 findings (open)
@@ -615,9 +600,6 @@ Found during T0 (2026-10-19). Tag = when to fix.
    getpid/gettid/kill/wait//proc use the root number; a CLONE_NEWPID
    child is not pid 1 in its namespace. Use `Pid::nr_in(caller's ns)`
    at the syscall boundary.
-2. **CLOCK_SETTIME_STORM ignores the sched_getaffinity result** (next
-   batch). The test assumes an 8-byte mask (EINVAL past 64 CPUs),
-   stays pinned, and drifts CLOCK_REALTIME. Fix the test if touched.
 3. **mremap Prep allocates page tables under the old PTE lock** (next
    batch). `kernel/mm/mremap.rs:53`: it uses CAS-only
    `paging::pte_alloc` there, skipping page_table_lock; allocate before
@@ -625,9 +607,10 @@ Found during T0 (2026-10-19). Tag = when to fix.
 4. **`virt_to_phys(p & !0xfff)` duplicated** (next batch) in
    `Move::ptes`, `PteRange::at` and `ptl::pte_lock`: add one
    `ptl::table_of_ptep()`.
-5. **BUSYBOX_NC_LO flaky on the Linux reference** (next batch): 1 of 5
-   x86 `check-linux` runs reported `BUSYBOX_NC_LO:FAIL status=0`
-   (nc over loopback). Cause unknown: the test waits for the listener
+5. **BUSYBOX_NC_LO flaky, on hk and the Linux reference** (next
+   batch): `BUSYBOX_NC_LO:FAIL status=0` (nc over loopback) in 1 of 5
+   x86 `check-linux` runs, and in an hk x86 boot with one CPU
+   (`QEMU_SMP=1`). Cause unknown: the test waits for the listener
    (`wait_listen`) and retries the client.
 6. **No ptrace exec stop** (P9): a traced task's execve does not stop
    with SIGTRAP / PTRACE_EVENT_EXEC (`kernel/task/exec.rs`), so a
@@ -642,14 +625,19 @@ Found during T0 (2026-10-19). Tag = when to fix.
    (23, 17, 281, 169, 170) but have no arm in
    `kernel/arch/aarch64/syscall.rs`, so they return ENOSYS. Add them
    with boot tests.
-10. **Network test flakes seen in the phase A sweep** (I). Once each:
+10. **Network test flake** (I):
    `SOCKCORE_CONNECT_REFUSED:FAIL SO_ERROR got 0` (hk arm64, 1 of 10
    `check-stress` boots: poll reported POLLOUT for a nonblocking
    connect to a just-closed loopback port, but no ECONNREFUSED was
-   pending); `NET_STRESS_TRUNC_RACE:FAIL reader status got 256` on the
-   x86 Linux reference (a reader hit its 2 s receive timeout under host
-   load).
+   pending).
 12. **arm64 overflow check misses a frame over 32 KB** (next batch):
    vectors.S KERNEL_ENTRY tests bit 15 of SP only, so an SP that jumped
    more than 32 KB below a stack base (one huge frame) lands where the
    bit is clear and is not caught (the guard gap still faults).
+13. **MM_LIFE_FORK_EXEC over its 128 kB tolerance at 8 CPUs** (next
+   batch): 1 of 20 `QEMU_SMP=8 make check-stress` boots (arm64, TCG)
+   lost 184 kB of MemFree+Slab over 500 fork+exec rounds, never at 4
+   CPUs. Suspects that scale with CPUs: the stack area's page tables
+   (never freed; more concurrent stacks reach higher slots) and frees
+   deferred until other CPUs switch. Find which, then fix it or scale
+   the tolerance with the CPU count.

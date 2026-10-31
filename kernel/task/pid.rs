@@ -131,6 +131,11 @@ pub struct PidMap {
 }
 
 impl PidMap {
+    /// The number handed out last (Linux idr_get_cursor - 1)
+    pub fn last(&self) -> u32 {
+        self.last.load(Ordering::Relaxed)
+    }
+
     pub fn new() -> Self {
         let max = PID_MAX_LIMIT;
         let pages = (0..max.div_ceil(PER_PAGE))

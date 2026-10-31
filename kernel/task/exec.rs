@@ -676,6 +676,9 @@ pub fn do_execve<FA: FrameAlloc<PhysAddr = u64>>(
         Ok(f) => f,
         Err(e) => return -e,
     };
+    // To the least loaded CPU while the footprint is small (Linux
+    // bprm_execve -> sched_exec)
+    percpu::sched_exec();
 
     // The file is read where needed: headers now, segments as they load
     let image = match FileImage::new(&file) {

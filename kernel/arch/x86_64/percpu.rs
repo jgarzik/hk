@@ -139,7 +139,9 @@ pub unsafe fn current_cpu_mut() -> &'static mut PerCpu {
         ::core::arch::asm!(
             "mov {}, gs:0",
             out(reg) ptr,
-            options(pure, nomem, nostack, preserves_flags)
+            // Not pure: a task may resume on another CPU after any call
+            // that schedules, so the load must not be reused across one
+            options(nomem, nostack, preserves_flags)
         );
         &mut *ptr
     }

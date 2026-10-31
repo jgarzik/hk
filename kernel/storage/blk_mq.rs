@@ -5,9 +5,11 @@
 //!
 //! A submitter puts its bio on its CPU's software queue (Linux
 //! blk_mq_ctx), then runs the hardware queue that CPU maps to (Linux
-//! blk_mq_hw_ctx; `cpu % nr_hw`): every software queue of that hardware
-//! queue is spliced onto its dispatch list and the driver's `queue_rq`
-//! takes bios until it is full. The driver's interrupt handler calls
+//! blk_mq_hw_ctx; `cpu % nr_hw`): the software queues of that hardware
+//! queue with bios pending (its `ctx_map` bitmap, Linux
+//! blk_mq_hctx_mark_pending / flush_busy_ctxs) are spliced onto its
+//! dispatch list and the driver's `queue_rq` takes bios until it is
+//! full. The driver's interrupt handler calls
 //! [`BlkMq::complete`]: finished bios are collected, the dispatch list is
 //! run again (room was freed: Linux restarts the queue from completion)
 //! and the bios are ended after the lock is dropped.
@@ -15,6 +17,9 @@
 //! ## Locking (doc/LOCKING.md 3.10)
 //!
 //! - Software queue (`ctx`): `IrqSpinlock<BioList>`, one per CPU, leaf.
+//!   Its pending bit in the hardware queue's `ctx_map` is set and
+//!   cleared under it; a run that misses a bit being set is followed by
+//!   the submitter's own run.
 //! - Hardware queue: one `IrqSpinlock` over the dispatch list and the
 //!   driver's queue state (for virtio-blk the virtqueue: Linux
 //!   `virtio_blk_vq.lock`), taken in thread context (dispatch) and in
@@ -25,6 +30,7 @@
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::arch::IrqSpinlock;
 
@@ -94,14 +100,21 @@ fn end_all(l: &mut BioList) {
 pub struct BlkMq {
     ctxs: Vec<IrqSpinlock<BioList>>,
     hctxs: Vec<IrqSpinlock<HwState>>,
+    /// Per hardware queue, a bit per software queue mapped to it with
+    /// bios pending (bit `cpu / nr_hw`; Linux hctx->ctx_map)
+    ctx_maps: Vec<Box<[AtomicU64]>>,
 }
 
 impl BlkMq {
     /// One hardware queue per element of `ops`
     pub fn new(ops: Vec<Box<dyn MqOps>>) -> Self {
         let n = crate::cpu::nr_cpu_ids() as usize;
+        let words = n.div_ceil(ops.len().max(1)).div_ceil(64);
         Self {
             ctxs: (0..n).map(|_| IrqSpinlock::new(BioList::new())).collect(),
+            ctx_maps: (0..ops.len())
+                .map(|_| (0..words).map(|_| AtomicU64::new(0)).collect())
+                .collect(),
             hctxs: ops
                 .into_iter()
                 .map(|ops| {
@@ -123,20 +136,39 @@ impl BlkMq {
         cpu % self.hctxs.len()
     }
 
+    /// `cpu`'s word and bit in its hardware queue's `ctx_map`
+    fn ctx_bit(&self, cpu: usize) -> (usize, u64) {
+        let i = cpu / self.hctxs.len();
+        (i / 64, 1 << (i % 64))
+    }
+
     /// Queue a bio from thread context and run its hardware queue
     pub fn submit(&self, bio: Box<Bio>) {
         let cpu = crate::cpu::this_id() as usize % self.ctxs.len();
-        self.ctxs[cpu].lock().push(bio);
-        self.run(self.map(cpu));
+        let h = self.map(cpu);
+        let (w, bit) = self.ctx_bit(cpu);
+        {
+            let mut ctx = self.ctxs[cpu].lock();
+            ctx.push(bio);
+            self.ctx_maps[h][w].fetch_or(bit, Ordering::Relaxed);
+        }
+        self.run(h);
     }
 
-    /// Splice the software queues of hardware queue `h`, then dispatch
-    /// (Linux blk_mq_run_hw_queue)
+    /// Splice the software queues of hardware queue `h` with bios
+    /// pending, then dispatch (Linux blk_mq_run_hw_queue)
     fn run(&self, h: usize) {
         let mut batch = BioList::new();
-        for (cpu, ctx) in self.ctxs.iter().enumerate() {
-            if self.map(cpu) == h {
-                batch.append(&mut ctx.lock());
+        let nr_hw = self.hctxs.len();
+        for (w, word) in self.ctx_maps[h].iter().enumerate() {
+            let mut bits = word.load(Ordering::Relaxed);
+            while bits != 0 {
+                let b = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let cpu = (w * 64 + b) * nr_hw + h;
+                let mut ctx = self.ctxs[cpu].lock();
+                batch.append(&mut ctx);
+                word.fetch_and(!(1 << b), Ordering::Relaxed);
             }
         }
         let mut failed = BioList::new();

@@ -46,6 +46,7 @@ pub mod timer;
 pub mod timerfd;
 pub mod uaccess;
 pub mod waitqueue;
+pub mod watchdog;
 pub mod workqueue;
 
 // Device subsystems
@@ -726,7 +727,6 @@ fn kmain() -> ! {
         ppid: 0, // init has no parent
         pgid: 0, // inherited from init_task, not a group leader
         sid: 0,  // not a session leader until setsid()
-        priority: task::PRIORITY_NORMAL,
         kstack_top: kernel_stack,
         user_stack_top,
         page_table: user_pt,
@@ -738,6 +738,7 @@ fn kmain() -> ! {
     // softnet threads. Then interrupts on: pid 1 may sleep from here.
     task::percpu::init_ap_schedulers();
     crate::timer::start_ktimers();
+    crate::task::stop_machine::start();
     crate::workqueue::init();
     crate::net::start_threads();
     CurrentArch::enable_interrupts();

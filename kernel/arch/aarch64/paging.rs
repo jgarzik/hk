@@ -304,7 +304,7 @@ pub fn pte_alloc(root: u64, va: u64) -> Option<*mut u64> {
     let mut table = phys_to_virt(root) as *mut u64;
     for shift in [39, 30, 21] {
         let slot = entry_atomic(table, va >> shift);
-        let mut e = slot.load(Ordering::Acquire);
+        let mut e = crate::mm::huge_page::pmd_settled(slot);
         if e & 0b11 == DESC_INVALID {
             // User page tables stop at the low watermark like the
             // user pages they map: a process touching sparse addresses

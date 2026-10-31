@@ -14,7 +14,8 @@
 //!
 //! Kernel threads run in kernel mode only, with pid 0 (user pids are
 //! unaffected), the kernel page table and no user resources. A thread is
-//! bound to one CPU for its life (hk tasks never migrate).
+//! bound to one CPU for its life (its `cpus_mask` holds only that CPU,
+//! so wakeups never place it elsewhere; Linux kthread_bind).
 //!
 //! ## Locking
 //!
@@ -124,14 +125,14 @@ pub fn kthread_run_prio(
     Ok(k)
 }
 
-/// CPU for an unbound thread: round-robin over the APs (CPU 0 runs all
-/// user tasks, and scheduling is cooperative), CPU 0 if there are none
+/// CPU for a thread created without one: round-robin over the CPUs
+/// that schedule (it stays bound to it)
 fn pick_cpu() -> u32 {
     let ncpu = crate::cpu::nr_cpu_ids();
     for _ in 0..ncpu {
         let c = NEXT_CPU.load(Ordering::Relaxed) % ncpu;
         NEXT_CPU.store(c + 1, Ordering::Relaxed);
-        if c != 0 && cpu_has_scheduler(c) {
+        if cpu_has_scheduler(c) {
             return c;
         }
     }
