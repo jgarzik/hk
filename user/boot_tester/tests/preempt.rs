@@ -26,7 +26,8 @@
 //!   CPU from running, and is not time-sliced against another FIFO task
 //!   of the same priority.
 //! - RT_PLACE: a waking SCHED_FIFO task whose last CPU runs a higher
-//!   FIFO task goes to a CPU running a SCHED_OTHER one (every CPU busy).
+//!   FIFO task (one that turned FIFO while running there) goes at once
+//!   to a CPU running a SCHED_OTHER one (every CPU busy).
 //! - NICE_WEIGHT, NICE_ADJACENT, SCHED_IDLE_SHARE: two spinners on
 //!   one CPU share it by weight (EEVDF): nice 0 vs 5 about 3:1, nice 0
 //!   vs 1 about 5:4 (neither starves), SCHED_IDLE under a tenth.
@@ -95,7 +96,7 @@ fn test_rt_place() {
         sys_sched_setaffinity(0, len as usize, all.as_ptr());
         // SAFETY: counter 2 of the shared page: ready
         unsafe { c.add(2).write_volatile(1) };
-        sleep_ms(1500);
+        sleep_ms(3000);
         loop {
             // SAFETY: counter 0 of the shared page
             unsafe { c.write_volatile(c.read_volatile() + 1) };
@@ -106,27 +107,40 @@ fn test_rt_place() {
     while at(2) == 0 && now_ms() - t0 < 5000 {
         sleep_ms(10);
     }
+    let ready = now_ms();
+    // This task stays off x (behind its FIFO spinner it would not run)
+    let y = 63 - cpus.leading_zeros();
+    sys_sched_setaffinity(0, 8, &(1u64 << y));
+    let t0 = now_ms();
     let mut pids = [0i64; 9];
     let mut n = 0;
-    // CPU x: a FIFO 20 spinner; every other CPU: a SCHED_OTHER spinner
-    for cpu in 0..64u32 {
-        if cpus & (1 << cpu) != 0 {
-            let prio = if cpu == x { 20 } else { 0 };
-            // SAFETY: counters 8.. of the shared page
-            pids[n] = spinner(cpu, prio, unsafe { c.add(8 + n) }, 0);
-            n += 1;
-        }
+    // Every other CPU: a SCHED_OTHER spinner, running before x gets
+    // its FIFO 20 one, which turns FIFO while it runs there (nothing
+    // else switches on x afterwards: the wakeup must see its new class)
+    for cpu in (0..64u32).filter(|&c| c != x && cpus & (1 << c) != 0) {
+        // SAFETY: counters 8.. of the shared page
+        pids[n] = spinner(cpu, 0, unsafe { c.add(8 + n) }, 0);
+        n += 1;
     }
-    // Every spinner runs with its final policy before it wakes
-    let t0 = now_ms();
-    while (0..n).any(|i| at(8 + i) == 0) && now_ms() - t0 < 1400 {
+    let started = |n: usize| (0..n).all(|i| at(8 + i) > 0);
+    while !started(n) && now_ms() - t0 < 1500 {
         sleep_ms(10);
     }
-    let settled = (0..n).all(|i| at(8 + i) > 0);
-    while at(0) == 0 && now_ms() - t0 < 3500 {
+    // SAFETY: counters 8.. of the shared page
+    pids[n] = spinner(x, 20, unsafe { c.add(8 + n) }, 0);
+    n += 1;
+    while !started(n) && now_ms() - t0 < 2600 {
+        sleep_ms(10);
+    }
+    // Every spinner runs with its final policy and the task has not run
+    // yet (it woke after all of them started)
+    let settled = started(n) && at(0) == 0;
+    // It runs at once when it wakes (not when x next switches)
+    while at(0) == 0 && now_ms() - ready < 3300 {
         sleep_ms(10);
     }
     let progress = at(0);
+    sys_sched_setaffinity(0, len as usize, all.as_ptr());
     // The rt tasks first: a task starved by one could not die
     reap(task);
     for pid in pids.iter().take(n) {

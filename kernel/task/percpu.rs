@@ -470,8 +470,9 @@ pub struct PerCpuScheduler {
     /// That address space's membarrier registrations, cached at each
     /// switch (Linux rq->membarrier_state)
     pub membarrier_state: AtomicU32,
-    /// The running task's `rank`, set at each switch (Linux cpupri: rt
-    /// wakeups look for the CPU running the least important task)
+    /// The running task's `rank`, set at each switch and when it changes
+    /// class or priority (Linux cpupri: rt wakeups look for the CPU
+    /// running the least important task)
     pub curr_rank: AtomicU32,
     /// This CPU's ticks, for its balancing interval (Linux
     /// rq->next_balance)
@@ -3897,6 +3898,11 @@ fn change_class(p: &KernelTask, f: impl FnOnce(&sched::SchedEntity)) {
         rq.enqueue(p);
         rq.check_preempt(p);
     } else if running {
+        // Its CPU's rank follows now: it may run on without a switch
+        // (Linux updates cpupri in __sched_setscheduler)
+        get_percpu_sched(rq.cpu)
+            .curr_rank
+            .store(rank(p), Ordering::Relaxed);
         rq.resched_curr();
     }
 }
