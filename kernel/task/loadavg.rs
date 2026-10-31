@@ -65,7 +65,11 @@ fn last_pid() -> u32 {
 /// /proc/loadavg (Linux loadavg_proc_show): the three loads with two
 /// decimals, runnable/total tasks, the last pid handed out
 pub fn proc_loadavg() -> alloc::vec::Vec<u8> {
-    let part = |a: u64| (a >> FSHIFT, ((a & (FIXED_1 - 1)) * 100) >> FSHIFT);
+    // Rounded to the nearest hundredth (Linux get_avenrun(.., FIXED_1/200, 0))
+    let part = |a: u64| {
+        let a = a + FIXED_1 / 200;
+        (a >> FSHIFT, ((a & (FIXED_1 - 1)) * 100) >> FSHIFT)
+    };
     let [a, b, c] = avenrun().map(part);
     alloc::format!(
         "{}.{:02} {}.{:02} {}.{:02} {}/{} {}\n",
