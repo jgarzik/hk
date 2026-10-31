@@ -282,9 +282,8 @@ pub fn sys_sched_setscheduler<A: crate::uaccess::UaccessArch>(
         return KernelError::InvalidArgument.sysret();
     }
 
-    let base_policy = policy & !super::SCHED_RESET_ON_FORK;
     let target_pid = if pid == 0 { caller_pid } else { pid as u64 };
-    if let Err(e) = check_setscheduler(target_pid, base_policy, param.sched_priority, caller_euid) {
+    if let Err(e) = check_setscheduler(target_pid, policy, param.sched_priority, caller_euid) {
         return e.sysret();
     }
 
@@ -299,18 +298,21 @@ pub fn sys_sched_setscheduler<A: crate::uaccess::UaccessArch>(
 /// user_check_sched_setscheduler): with CAP_SYS_NICE anything; else
 /// only its own tasks (check_same_owner: its euid is their uid or euid),
 /// an rt policy within RLIMIT_RTPRIO (none to switch to one, and no
-/// raise past it), and leaving SCHED_IDLE only as far as RLIMIT_NICE
-/// allows its nice
+/// raise past it), leaving SCHED_IDLE only as far as RLIMIT_NICE allows
+/// its nice, and never clearing its SCHED_RESET_ON_FORK (`policy` may
+/// carry the flag)
 fn check_setscheduler(
     tid: Pid,
     policy: i32,
     prio: i32,
     euid: super::Uid,
 ) -> Result<(), KernelError> {
-    use super::{CAP_SYS_NICE, SCHED_IDLE, capable, is_rt_policy};
+    use super::{CAP_SYS_NICE, SCHED_IDLE, SCHED_RESET_ON_FORK, capable, is_rt_policy};
     if capable(CAP_SYS_NICE) {
         return Ok(());
     }
+    let reset = policy & SCHED_RESET_ON_FORK != 0;
+    let policy = policy & !SCHED_RESET_ON_FORK;
     let cred = super::percpu::TASKLIST.read().get(tid).map(|t| t.cred());
     let Some(c) = cred else {
         return Err(KernelError::NoProcess);
@@ -318,7 +320,11 @@ fn check_setscheduler(
     if c.uid != euid && c.euid != euid {
         return Err(KernelError::NotPermitted);
     }
-    let cur = super::percpu::lookup_task_policy(tid).unwrap_or(0) & !super::SCHED_RESET_ON_FORK;
+    let cur_full = super::percpu::lookup_task_policy(tid).unwrap_or(0);
+    if cur_full & SCHED_RESET_ON_FORK != 0 && !reset {
+        return Err(KernelError::NotPermitted);
+    }
+    let cur = cur_full & !SCHED_RESET_ON_FORK;
     let cur_prio = super::percpu::lookup_task_rt_priority(tid).unwrap_or(0);
     let limit =
         |r| crate::rlimit::get_task_rlimit(tid, r).map_or(0, |l: crate::rlimit::RLimit| l.rlim_cur);
@@ -455,8 +461,12 @@ pub fn sys_sched_setparam<A: crate::uaccess::UaccessArch>(
         None => return KernelError::NoProcess.sysret(),
     };
 
-    let base_policy = current_policy & !super::SCHED_RESET_ON_FORK;
-    if let Err(e) = check_setscheduler(target_pid, base_policy, param.sched_priority, caller_euid) {
+    if let Err(e) = check_setscheduler(
+        target_pid,
+        current_policy,
+        param.sched_priority,
+        caller_euid,
+    ) {
         return e.sysret();
     }
 

@@ -156,12 +156,17 @@ fn test_sched_perm() {
     let pid = sys_fork();
     if pid == 0 {
         let mut t = T::new(b"SCHED_PERM");
+        let z = SchedParam { sched_priority: 0 };
+        const RESET: i32 = 0x4000_0000;
+        t.eq(b"set reset", sys_sched_setscheduler(0, RESET, &z), 0);
         sys_setresgid(1000, 1000, 1000);
         sys_setresuid(1000, 1000, 1000);
+        // An unprivileged task keeps SCHED_RESET_ON_FORK once set
+        t.eq(b"clear reset", sys_sched_setscheduler(0, 0, &z), -1);
+        t.eq(b"keep reset", sys_sched_setscheduler(0, RESET, &z), 0);
         let p = SchedParam { sched_priority: 10 };
-        t.eq(b"fifo", sys_sched_setscheduler(0, 1, &p), -1);
-        let z = SchedParam { sched_priority: 0 };
-        t.eq(b"other own", sys_sched_setscheduler(0, 0, &z), 0);
+        t.eq(b"fifo", sys_sched_setscheduler(0, 1 | RESET, &p), -1);
+        t.eq(b"other own", sys_sched_setscheduler(0, RESET, &z), 0);
         t.eq(b"other init", sys_sched_setscheduler(1, 0, &z), -1);
         t.done();
         sys_exit(0);
