@@ -3626,6 +3626,10 @@ pub fn set_task_scheduler(pid: Pid, policy: i32, rt_priority: i32) -> Result<(),
     }
 
     let task = TASKLIST.read().task(pid).ok_or(3)?; // ESRCH
+    // Not the stoppers nor an idle task (Linux: EINVAL for rq->stop)
+    if matches!(task.se.class(), Class::Stop | Class::Idle) {
+        return Err(22);
+    }
     let static_prio = task.se.static_prio();
     change_class(&task, |se| {
         se.set_params(

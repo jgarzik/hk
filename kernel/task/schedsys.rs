@@ -244,7 +244,7 @@ pub fn sys_sched_getscheduler(pid: i64, caller_pid: Pid) -> i64 {
 ///
 /// # Permission Model
 /// - Root (euid=0): Can set any policy
-/// - Non-root: Can only set SCHED_NORMAL/BATCH/IDLE (not RT policies)
+/// - Without CAP_SYS_NICE: see `check_setscheduler`
 ///
 /// # Locking
 /// Acquires TASKLIST lock to modify policy.
@@ -282,19 +282,62 @@ pub fn sys_sched_setscheduler<A: crate::uaccess::UaccessArch>(
         return KernelError::InvalidArgument.sysret();
     }
 
-    // Permission check: non-root cannot set RT policies
     let base_policy = policy & !super::SCHED_RESET_ON_FORK;
-    if super::is_rt_policy(base_policy) && caller_euid != 0 {
-        return KernelError::NotPermitted.sysret();
-    }
-
     let target_pid = if pid == 0 { caller_pid } else { pid as u64 };
+    if let Err(e) = check_setscheduler(target_pid, base_policy, param.sched_priority, caller_euid) {
+        return e.sysret();
+    }
 
     // Set the scheduler
     match super::percpu::set_task_scheduler(target_pid, policy, param.sched_priority) {
         Ok(()) => 0,
         Err(errno) => -(errno as i64),
     }
+}
+
+/// May the caller give task `tid` `policy` at rt priority `prio` (Linux
+/// user_check_sched_setscheduler): with CAP_SYS_NICE anything; else
+/// only its own tasks (check_same_owner: its euid is their uid or euid),
+/// an rt policy within RLIMIT_RTPRIO (none to switch to one, and no
+/// raise past it), and leaving SCHED_IDLE only as far as RLIMIT_NICE
+/// allows its nice
+fn check_setscheduler(
+    tid: Pid,
+    policy: i32,
+    prio: i32,
+    euid: super::Uid,
+) -> Result<(), KernelError> {
+    use super::{CAP_SYS_NICE, SCHED_IDLE, capable, is_rt_policy};
+    if capable(CAP_SYS_NICE) {
+        return Ok(());
+    }
+    let cred = super::percpu::TASKLIST.read().get(tid).map(|t| t.cred());
+    let Some(c) = cred else {
+        return Err(KernelError::NoProcess);
+    };
+    if c.uid != euid && c.euid != euid {
+        return Err(KernelError::NotPermitted);
+    }
+    let cur = super::percpu::lookup_task_policy(tid).unwrap_or(0) & !super::SCHED_RESET_ON_FORK;
+    let cur_prio = super::percpu::lookup_task_rt_priority(tid).unwrap_or(0);
+    let limit =
+        |r| crate::rlimit::get_task_rlimit(tid, r).map_or(0, |l: crate::rlimit::RLimit| l.rlim_cur);
+    if is_rt_policy(policy) {
+        let rtprio = limit(crate::rlimit::RLIMIT_RTPRIO);
+        if policy != cur && rtprio == 0 {
+            return Err(KernelError::NotPermitted);
+        }
+        if prio > cur_prio && prio as u64 > rtprio {
+            return Err(KernelError::NotPermitted);
+        }
+    }
+    if cur == SCHED_IDLE && policy != SCHED_IDLE {
+        let nice = super::percpu::lookup_task_nice(tid).unwrap_or(0);
+        if (20 - nice) as u64 > limit(crate::rlimit::RLIMIT_NICE) {
+            return Err(KernelError::NotPermitted);
+        }
+    }
+    Ok(())
 }
 
 /// sys_sched_getparam - get scheduling parameters
@@ -372,7 +415,7 @@ pub fn sys_sched_getparam<A: crate::uaccess::UaccessArch>(
 ///
 /// # Permission Model
 /// - Root (euid=0): Can set any parameters
-/// - Non-root: Can only set parameters for non-RT policies
+/// - Without CAP_SYS_NICE: see `check_setscheduler`
 ///
 /// # Locking
 /// Acquires TASKLIST lock to modify parameters.
@@ -412,10 +455,9 @@ pub fn sys_sched_setparam<A: crate::uaccess::UaccessArch>(
         None => return KernelError::NoProcess.sysret(),
     };
 
-    // Permission check: non-root cannot set RT parameters
     let base_policy = current_policy & !super::SCHED_RESET_ON_FORK;
-    if super::is_rt_policy(base_policy) && caller_euid != 0 {
-        return KernelError::NotPermitted.sysret();
+    if let Err(e) = check_setscheduler(target_pid, base_policy, param.sched_priority, caller_euid) {
+        return e.sysret();
     }
 
     // Set the scheduler with current policy

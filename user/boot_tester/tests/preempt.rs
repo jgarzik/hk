@@ -49,6 +49,7 @@ pub fn run_tests() {
     test_affinity_migrate();
     test_balance();
     test_sched_prio_fields();
+    test_sched_perm();
     test_rt_fifo();
     test_async_sig_regs();
 }
@@ -139,6 +140,29 @@ fn test_sched_prio_fields() {
         let mut st = 0i32;
         sys_wait4(c, &mut st, 0, 0);
         t.eq(b"reset child", st as i64, 0);
+        t.done();
+        sys_exit(0);
+    }
+    let mut st = 0i32;
+    sys_wait4(pid, &mut st, 0, 0);
+}
+
+/// SCHED_PERM: without CAP_SYS_NICE (uid 1000) an rt policy needs
+/// RLIMIT_RTPRIO (0 by default: EPERM), and another user's task cannot
+/// be changed (EPERM, Linux check_same_owner); its own SCHED_OTHER is fine
+fn test_sched_perm() {
+    use super::sk::T;
+    use hk_syscall::{SchedParam, sys_sched_setscheduler, sys_setresgid, sys_setresuid};
+    let pid = sys_fork();
+    if pid == 0 {
+        let mut t = T::new(b"SCHED_PERM");
+        sys_setresgid(1000, 1000, 1000);
+        sys_setresuid(1000, 1000, 1000);
+        let p = SchedParam { sched_priority: 10 };
+        t.eq(b"fifo", sys_sched_setscheduler(0, 1, &p), -1);
+        let z = SchedParam { sched_priority: 0 };
+        t.eq(b"other own", sys_sched_setscheduler(0, 0, &z), 0);
+        t.eq(b"other init", sys_sched_setscheduler(1, 0, &z), -1);
         t.done();
         sys_exit(0);
     }
