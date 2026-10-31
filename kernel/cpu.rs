@@ -4,8 +4,10 @@
 //! [`PerCpu<T>`] holds one `T` per possible CPU, indexed by logical CPU
 //! id (Linux DEFINE_PER_CPU). [`PerCpu::this`] is the calling CPU's
 //! slot: the kernel is not preemptive, so a thread stays on its CPU
-//! between scheduling points; IRQ-reachable slots still need their own
-//! IRQ discipline, and cross-CPU reads their own barriers.
+//! between scheduling points, but may resume on another after one (a
+//! sleep, a yield, a return to user mode): a slot must not be used
+//! across one. IRQ-reachable slots still need their own IRQ discipline,
+//! and cross-CPU reads their own barriers.
 
 use core::sync::atomic::{AtomicU32, Ordering};
 

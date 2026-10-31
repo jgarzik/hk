@@ -11,7 +11,11 @@
 //!   while A is held; taking B under A after A was seen under B reports
 //!   both orders (direct inversions only, no transitive cycles; nesting
 //!   within one class is not checked);
-//! - a tracked (non-IRQ-safe) spin lock taken in interrupt context.
+//! - a tracked (non-IRQ-safe) spin lock taken in interrupt context;
+//! - interrupts enabled with an `IrqSpinlock` held (Linux lockdep's
+//!   inconsistent lock state): a guard released out of nesting order
+//!   restores the outer interrupt state while an inner lock is held,
+//!   and an interrupt that takes that lock spins forever on its CPU.
 //!
 //! State: a per-CPU stack of held tracked locks (the kernel is not
 //! preemptive and a task never sleeps holding one, so per-CPU equals
@@ -20,7 +24,9 @@
 //! empty inline function.
 
 #[cfg(feature = "lockdep")]
-pub use imp::{acquire, irq_enter, irq_exit, might_sleep, release};
+pub use imp::{
+    acquire, irq_enter, irq_exit, irqsafe_acquire, irqsafe_release, might_sleep, release,
+};
 
 /// Interrupt handler entry/exit (no-ops without `lockdep`)
 #[cfg(not(feature = "lockdep"))]
@@ -30,6 +36,16 @@ pub fn irq_enter() {}
 #[cfg(not(feature = "lockdep"))]
 #[inline(always)]
 pub fn irq_exit() {}
+
+/// An `IrqSpinlock` was taken / is being released (no-ops without
+/// `lockdep`)
+#[cfg(not(feature = "lockdep"))]
+#[inline(always)]
+pub fn irqsafe_acquire() {}
+
+#[cfg(not(feature = "lockdep"))]
+#[inline(always)]
+pub fn irqsafe_release(_lock: usize, _enables: bool) {}
 
 /// Sleeping is about to be possible here (no-op without `lockdep`)
 #[cfg(not(feature = "lockdep"))]
@@ -68,6 +84,9 @@ mod imp {
         busy: bool,
         /// Interrupt handler nesting
         irq: u32,
+        /// `IrqSpinlock`s held (a lock held across a context switch
+        /// counts on the CPU, which the task switched to releases it on)
+        irqsafe: u32,
     }
 
     struct Slot(UnsafeCell<Cpu>);
@@ -80,6 +99,7 @@ mod imp {
         depth: 0,
         busy: false,
         irq: 0,
+        irqsafe: 0,
     }))];
 
     #[derive(Clone, Copy)]
@@ -282,6 +302,43 @@ mod imp {
         if let Some(c) = cpu() {
             c.irq = c.irq.saturating_sub(1);
         }
+    }
+
+    /// This CPU's slot once its per-CPU data exists (an AP coming up
+    /// takes `IrqSpinlock`s before; they are not counted)
+    fn this_cpu() -> Option<&'static mut Cpu> {
+        crate::cpu::try_this_id()?;
+        cpu()
+    }
+
+    /// An `IrqSpinlock` was taken (interrupts off)
+    pub fn irqsafe_acquire() {
+        if let Some(c) = this_cpu() {
+            c.irqsafe += 1;
+        }
+    }
+
+    /// `IrqSpinlock` `lock` was released, interrupts still off; `enables`:
+    /// its guard turns them back on, which another one held forbids
+    pub fn irqsafe_release(lock: usize, enables: bool) {
+        static REPORTED: AtomicBool = AtomicBool::new(false);
+        let Some(c) = this_cpu() else {
+            return;
+        };
+        c.irqsafe = c.irqsafe.saturating_sub(1);
+        if !enables || c.irqsafe == 0 || c.busy || REPORTED.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let held = c.irqsafe;
+        report(c, || {
+            crate::printkln!(
+                "LOCKDEP:FAIL interrupts enabled with {} IRQ-safe spin lock(s) held: \
+                 releasing {:#x} out of order (tid {})",
+                held,
+                lock,
+                crate::task::percpu::current_tid()
+            );
+        });
     }
 
     /// Linux might_sleep: no spinlock may be held (tracked spin locks, or

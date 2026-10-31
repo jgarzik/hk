@@ -49,6 +49,21 @@ impl CpuMask {
         self.0[w].load(Ordering::Relaxed) & b != 0
     }
 
+    /// A mask holding the CPUs of `s`
+    pub fn from_set(s: &CpuSet) -> Self {
+        let m = Self::new();
+        m.assign(s);
+        m
+    }
+
+    /// Make the mask `s` (word by word: a concurrent reader may see a mix
+    /// unless the caller's locks exclude it)
+    pub fn assign(&self, s: &CpuSet) {
+        for (w, v) in self.0.iter().zip(&s.0) {
+            w.store(*v, Ordering::Relaxed);
+        }
+    }
+
     /// The CPUs in the mask now
     pub fn snapshot(&self) -> CpuSet {
         let mut s = CpuSet::default();

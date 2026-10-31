@@ -20,28 +20,32 @@
 
 extern crate alloc;
 
-use core::sync::atomic::{AtomicU32, Ordering};
-
-use crate::cpu::PerCpu;
-
-/// Per-CPU page-fault-disable depth (Linux pagefault_disable)
-static PF_DISABLE: PerCpu<AtomicU32> = crate::percpu![AtomicU32::new(0)];
+use core::sync::atomic::Ordering;
 
 /// Linux pagefault_disable: until `pagefault_enable`, a user access that
 /// faults is not resolved (no sleeping fault-in) but fails at once
 /// (EFAULT through the copy's fixup). For user reads under a spinlock
-/// (futex values); the caller stays on this CPU (it holds a spinlock).
+/// (futex values). The depth is the current task's (Linux
+/// p->pagefault_disabled), so it follows the task to whatever CPU it
+/// runs on.
 pub fn pagefault_disable() {
-    PF_DISABLE.this().fetch_add(1, Ordering::Relaxed);
+    crate::task::percpu::current()
+        .pagefault_disabled
+        .fetch_add(1, Ordering::Relaxed);
 }
 
 pub fn pagefault_enable() {
-    PF_DISABLE.this().fetch_sub(1, Ordering::Relaxed);
+    crate::task::percpu::current()
+        .pagefault_disabled
+        .fetch_sub(1, Ordering::Relaxed);
 }
 
 /// Faults on user addresses must not be resolved here
 pub fn pagefault_disabled() -> bool {
-    PF_DISABLE.this().load(Ordering::Relaxed) != 0
+    crate::task::percpu::current()
+        .pagefault_disabled
+        .load(Ordering::Relaxed)
+        != 0
 }
 
 /// Linux might_fault: a user access may sleep resolving a fault, unless

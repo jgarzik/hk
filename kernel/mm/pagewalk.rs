@@ -11,7 +11,9 @@
 //! the AnonVma chain of a VMA in the range, so no table is freed
 //! meanwhile. Every software write of a 4KB entry happens under its
 //! table's PTE lock; a 2MB entry changes under the page_table_lock
-//! (`huge_page`), so `huge` runs with no PTE lock held and may split.
+//! (`huge_page`), so `huge` runs with no PTE lock held and may split;
+//! a 2MB entry in the middle of a split (`PMD_SPLITTING`) is waited
+//! out, never taken for an empty slot.
 //! Under the PTE lock only the MMU still changes an entry (accessed and
 //! dirty bits): a compare-and-swap that fails sees such an update, the
 //! same page with more bits, and nothing else.
@@ -144,13 +146,15 @@ fn walk_level<W: PteWalk>(
 /// One 2MB-level entry for [addr, end): its 2MB page, then its PTE
 /// table under the table's PTE lock
 fn walk_pmd<W: PteWalk>(pmd: &AtomicU64, addr: u64, end: u64, w: &mut W) -> Result<(), W::Err> {
-    if paging::pmd_huge(pmd.load(Ordering::Acquire)) && w.huge(pmd, addr, end)? {
+    // A split under way is waited out: its slot is about to hold a PTE
+    // table (huge_page::PMD_SPLITTING)
+    if paging::pmd_huge(super::huge_page::pmd_settled(pmd)) && w.huge(pmd, addr, end)? {
         return Ok(());
     }
     if !W::PTES {
         return Ok(());
     }
-    let Some(table) = paging::table_of(pmd.load(Ordering::Acquire)) else {
+    let Some(table) = paging::table_of(super::huge_page::pmd_settled(pmd)) else {
         return Ok(());
     };
     let _l = super::ptl::table_lock(table);

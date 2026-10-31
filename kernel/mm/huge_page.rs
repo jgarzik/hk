@@ -116,6 +116,26 @@ pub fn offset_in_huge_page(addr: u64) -> u64 {
     addr & HUGE_PAGE_MASK
 }
 
+/// A 2MB entry in the middle of a split (Linux pmdp_invalidate's
+/// invalid-but-not-none entry): invalid to the MMU on both arches (bit
+/// 0 clear), neither a block nor a table to software. Lockless walkers
+/// that meet it wait for the split, which holds the page_table_lock
+/// from writing it until the PTE table replaces it, rather than taking
+/// the slot for empty and missing the 4KB entries about to appear.
+pub const PMD_SPLITTING: u64 = 0b10;
+
+/// The value of the 2MB-level entry `pmd` once no split is under way
+pub fn pmd_settled(pmd: &core::sync::atomic::AtomicU64) -> u64 {
+    use core::sync::atomic::Ordering;
+    loop {
+        let v = pmd.load(Ordering::Acquire);
+        if v != PMD_SPLITTING {
+            return v;
+        }
+        core::hint::spin_loop();
+    }
+}
+
 /// The 2MB-level entry at `p`, as an atomic
 fn pmd_entry(p: *mut u64) -> &'static core::sync::atomic::AtomicU64 {
     // SAFETY: `p` points into a live page table of the locked mm
@@ -126,11 +146,11 @@ fn pmd_entry(p: *mut u64) -> &'static core::sync::atomic::AtomicU64 {
 /// __split_huge_pmd_locked), mm lock held; takes the page_table_lock
 /// (a racing fault may split or map at the same time). The page table
 /// is allocated first, so a failure (ENOMEM) changes nothing. Then break before
-/// make (Linux pmdp_invalidate): the 2MB entry is cleared and flushed
-/// on every CPU before the table replaces it, so no CPU caches a 2MB
-/// and a 4KB translation of one address at once (ARM ARM D8.16, Intel
-/// SDM 4.10.2.3); accessed/dirty bits set until then are kept. Each
-/// 4KB frame gets the head's reference count.
+/// make (Linux pmdp_invalidate): the 2MB entry becomes `PMD_SPLITTING`
+/// and is flushed on every CPU before the table replaces it, so no CPU
+/// caches a 2MB and a 4KB translation of one address at once (ARM ARM
+/// D8.16, Intel SDM 4.10.2.3); accessed/dirty bits set until then are
+/// kept. Each 4KB frame gets the head's reference count.
 ///
 /// Returns the physical base of the split page; None if `va` is not
 /// mapped by a 2MB page or out of memory.
@@ -143,7 +163,7 @@ pub fn split_huge_pmd(mm: &super::Mm, va: u64) -> Option<u64> {
     }
     let pt = crate::FRAME_ALLOCATOR.alloc()?;
     let _l = super::ptl::pt_lock(mm);
-    let Some(old) = clear_huge(pmd_entry(pmdp)) else {
+    let Some(old) = clear_huge(pmd_entry(pmdp), PMD_SPLITTING) else {
         crate::FRAME_ALLOCATOR.free(pt);
         return None;
     };
@@ -152,9 +172,13 @@ pub fn split_huge_pmd(mm: &super::Mm, va: u64) -> Option<u64> {
     // The hardware may have set accessed/dirty until the clear: `old`
     // is the value cleared
     let base = paging::split_table(pt, old);
-    paging::pmd_populate(pmdp, pt);
+    // The 512 pages are separate pages (refcounts, rmap) before any walker
+    // can see them: a zap waiting out PMD_SPLITTING frees them through
+    // the table the moment it appears (Linux __split_huge_pmd_locked:
+    // pmd_populate last)
     crate::FRAME_ALLOCATOR.split_huge(base);
     split_rmap(base);
+    paging::pmd_populate(pmdp, pt);
     Some(base)
 }
 
@@ -193,22 +217,23 @@ pub fn take_huge_pmd(mm: &super::Mm, base: u64) -> Option<u64> {
     use crate::arch::paging;
     let pmd = pmd_entry(paging::pmd_ptr(mm.pgd(), base)?);
     let _l = super::ptl::pt_lock(mm);
-    let old = clear_huge(pmd)?;
+    let old = clear_huge(pmd, 0)?;
     Some(paging::pte_addr(old) & !HUGE_PAGE_MASK)
 }
 
-/// Clear a 2MB page entry, page_table_lock held (Linux
-/// pmdp_huge_get_and_clear): the value cleared, None if it maps no 2MB
-/// page. An exchange, not a compare-and-swap: the MMU may set the
+/// Replace a 2MB page entry with `with` (0, or `PMD_SPLITTING`),
+/// page_table_lock held (Linux pmdp_huge_get_and_clear,
+/// pmdp_invalidate): the value replaced, None if it maps no 2MB page.
+/// An exchange, not a compare-and-swap: the MMU may set the
 /// accessed/dirty bits at any time, but only software turns a 2MB entry
 /// into something else, and every software writer of one holds the
 /// page_table_lock or the mmap_lock for writing (excluding the caller).
-fn clear_huge(pmd: &core::sync::atomic::AtomicU64) -> Option<u64> {
+fn clear_huge(pmd: &core::sync::atomic::AtomicU64, with: u64) -> Option<u64> {
     use core::sync::atomic::Ordering;
     if !crate::arch::paging::pmd_huge(pmd.load(Ordering::Acquire)) {
         return None;
     }
-    let old = pmd.swap(0, Ordering::AcqRel);
+    let old = pmd.swap(with, Ordering::AcqRel);
     debug_assert!(crate::arch::paging::pmd_huge(old));
     Some(old)
 }

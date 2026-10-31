@@ -83,6 +83,7 @@ impl<T> IrqSpinlock<T> {
             core::hint::spin_loop();
         }
 
+        crate::sync::lockdep::irqsafe_acquire();
         IrqSpinlockGuard {
             lock: self,
             irq_state,
@@ -107,6 +108,7 @@ impl<T> IrqSpinlock<T> {
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_ok()
         {
+            crate::sync::lockdep::irqsafe_acquire();
             Some(IrqSpinlockGuard {
                 lock: self,
                 irq_state,
@@ -119,19 +121,19 @@ impl<T> IrqSpinlock<T> {
         }
     }
 
-    /// Force unlock the spinlock without restoring state
+    /// A guard for this lock, which this CPU holds on behalf of a task
+    /// that switched away (Linux finish_task_switch: the task switched
+    /// to releases the rq lock). Interrupts stay as they are on drop.
     ///
     /// # Safety
-    /// This should only be called after a context switch when the previous
-    /// holder will never run again on this CPU (e.g., the guard is on the
-    /// old task's stack and will be dropped when that task resumes).
-    ///
-    /// The caller is responsible for ensuring no concurrent access.
-    /// Note: This does NOT decrement preempt_count or restore interrupts.
-    pub unsafe fn force_unlock(&self) {
-        self.lock.store(false, Ordering::Release);
-        // Decrement preempt_count since we're releasing the lock
-        percpu::preempt_enable();
+    /// This CPU holds the lock (its preempt count includes it), interrupts
+    /// are disabled, and nothing else releases it.
+    #[inline]
+    pub unsafe fn assume_held(&self) -> IrqSpinlockGuard<'_, T> {
+        IrqSpinlockGuard {
+            lock: self,
+            irq_state: save_and_disable_irq(),
+        }
     }
 }
 
@@ -160,6 +162,23 @@ impl<T> DerefMut for IrqSpinlockGuard<'_, T> {
     }
 }
 
+impl<'a, T> IrqSpinlockGuard<'a, T> {
+    /// Hand this guard's interrupt state to a guard of `lock`, which this
+    /// CPU holds instead (a context switch: the task resumes on a CPU
+    /// whose rq lock the task switched from there took). This guard's
+    /// lock is not released.
+    ///
+    /// # Safety
+    /// As for [`IrqSpinlock::assume_held`] for `lock`; the lock of this
+    /// guard is released by someone else.
+    #[inline]
+    pub unsafe fn rebind<'b>(self, lock: &'b IrqSpinlock<T>) -> IrqSpinlockGuard<'b, T> {
+        let irq_state = self.irq_state;
+        core::mem::forget(self);
+        IrqSpinlockGuard { lock, irq_state }
+    }
+}
+
 impl<T> Drop for IrqSpinlockGuard<'_, T> {
     fn drop(&mut self) {
         // Release the lock
@@ -167,6 +186,10 @@ impl<T> Drop for IrqSpinlockGuard<'_, T> {
 
         // Re-enable preemption (decrement preempt_count)
         percpu::preempt_enable();
+        crate::sync::lockdep::irqsafe_release(
+            self.lock as *const _ as *const u8 as usize,
+            self.irq_state & (1 << 7) == 0,
+        );
 
         // Restore interrupt state (must be LAST, after preempt_enable)
         restore_irq(self.irq_state);

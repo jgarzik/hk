@@ -16,8 +16,6 @@ pub mod spin;
 pub use mutex::{Mutex, MutexGuard};
 pub use rwsem::{RwSem, RwSemReadGuard, RwSemWriteGuard};
 
-use core::sync::atomic::Ordering;
-
 /// The caller is a task that may sleep (not tid 0: an idle task or the
 /// boot context, which never contend for a sleeping lock)
 fn can_sleep() -> bool {
@@ -55,7 +53,7 @@ pub fn in_atomic() -> bool {
 #[cold]
 fn atomic_sleep(at: &'static core::panic::Location<'static>) {
     use crate::arch::{CurrentArch, PerCpuOps};
-    use core::sync::atomic::AtomicBool;
+    use core::sync::atomic::{AtomicBool, Ordering};
     static REPORTED: AtomicBool = AtomicBool::new(false);
     if REPORTED.swap(true, Ordering::Relaxed) {
         return;

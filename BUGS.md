@@ -372,23 +372,22 @@ GFP_KERNEL allocation in atomic context. LOCKDEP has no such report
 call site to attribute it to, so the sites (allocations under spin locks
 across net, fs, ipc) cannot be audited yet.
 
-## Multi-second CPU stalls when the host is overcommitted
+## Scheduler gaps (deviations from Linux)
 
-**Location**: unknown (CPU 0 of the x86 guest)
+**Location**: `kernel/task/fair.rs`, `kernel/task/percpu.rs`
 
-With several QEMUs (4 vCPUs each) on the 24-thread host, CPU 0 of an hk
-guest sometimes runs nothing else for 1-45 s. SOFT timers wait that
-long for `ktimers/0` (TIMERFD_ABSTIME_RT took 2-45 s while timerfd used
-a SOFT timer), and a 20 ms nanosleep took 1.5-29 s in TIMER_TINY_PERIOD
-(1 ns periodic timers armed). Seen about 5 times in ~60 gated x86 boots
-with 8-12 QEMUs at once, once with 8 (two gate lanes), never in a lone
-gate. The Linux reference runs the same tests in the same runs and
-never stalled, so the cause is in hk, made likely by vCPU preemption.
-HARD timers and the tick stay on time and no SOFT callback ran long, so
-some kernel path on CPU 0 does not reach a scheduling point: suspected
-spinning on another vCPU (a lock holder or an IPI target descheduled by
-the host). Next: log long non-scheduling stretches per CPU (a tick-time
-check of the current task's time in kernel mode) and the IPI/csd waits.
+- EEVDF scans a list per pick and computes the average vruntime per use
+  (Linux: an rbtree augmented with min_vruntime and incremental sums,
+  O(log n)); fine for short run queues.
+- Slices end at tick granularity (10 ms; no hrtick), no reweight on a
+  nice change of a queued task, no RUN_TO_PARITY or delayed dequeue.
+- No PELT: load balancing counts tasks and wakeup placement looks for
+  an idle CPU; one flat domain (no SMT/LLC/NUMA topology), no active
+  balancing, no rt push/pull beyond wakeup placement.
+- No RT throttling (sched_rt_runtime_us) or dl_server: a SCHED_FIFO
+  spinner starves its CPU's fair tasks; no SCHED_DEADLINE (EINVAL).
+- Kernel preemption is off: a long kernel path delays a woken task of
+  a higher class until its next scheduling point.
 
 ## Unconfirmed: Arc<T> field corruption in the USB mass-storage driver
 
@@ -589,10 +588,6 @@ From the P4 /code-review (unverified unless noted). Tag = when to fix.
    confirmed by reading). `kernel/mm/fault.rs:478` map_swap_page (via
    unuse_pte) → mk_pte(page, area.prot) with prot 0 is PRESENT|USER
    on x86. Use a protnone PTE (Linux vm_page_prot).
-2. **Slot allocated after swapoff's final scan** (P7 blocker).
-   `kernel/mm/swap.rs:181`: alloc_slot doesn't recheck SWP_WRITEOK
-   under SwapInfo.map; swap PTEs of a removed type livelock faults or
-   read a later device's slots.
 3. **Swap file size not capped by i_size** (next batch).
    `kernel/mm/swap.rs:455`: header last_page sizes a heap Vec (8GB →
    panic) and slots past EOF (only block devices are capped).
@@ -615,9 +610,6 @@ Found during T0 (2026-10-19). Tag = when to fix.
    getpid/gettid/kill/wait//proc use the root number; a CLONE_NEWPID
    child is not pid 1 in its namespace. Use `Pid::nr_in(caller's ns)`
    at the syscall boundary.
-2. **CLOCK_SETTIME_STORM ignores the sched_getaffinity result** (next
-   batch). The test assumes an 8-byte mask (EINVAL past 64 CPUs),
-   stays pinned, and drifts CLOCK_REALTIME. Fix the test if touched.
 3. **mremap Prep allocates page tables under the old PTE lock** (next
    batch). `kernel/mm/mremap.rs:53`: it uses CAS-only
    `paging::pte_alloc` there, skipping page_table_lock; allocate before
@@ -642,13 +634,11 @@ Found during T0 (2026-10-19). Tag = when to fix.
    (23, 17, 281, 169, 170) but have no arm in
    `kernel/arch/aarch64/syscall.rs`, so they return ENOSYS. Add them
    with boot tests.
-10. **Network test flakes seen in the phase A sweep** (I). Once each:
+10. **Network test flake** (I):
    `SOCKCORE_CONNECT_REFUSED:FAIL SO_ERROR got 0` (hk arm64, 1 of 10
    `check-stress` boots: poll reported POLLOUT for a nonblocking
    connect to a just-closed loopback port, but no ECONNREFUSED was
-   pending); `NET_STRESS_TRUNC_RACE:FAIL reader status got 256` on the
-   x86 Linux reference (a reader hit its 2 s receive timeout under host
-   load).
+   pending).
 12. **arm64 overflow check misses a frame over 32 KB** (next batch):
    vectors.S KERNEL_ENTRY tests bit 15 of SP only, so an SP that jumped
    more than 32 KB below a stack base (one huge frame) lands where the

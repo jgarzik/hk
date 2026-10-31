@@ -7,7 +7,7 @@ extern crate alloc;
 
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU32, AtomicUsize, Ordering};
 
 use crate::error::KernelError;
 use crate::sync::spin::Mutex;
@@ -842,6 +842,9 @@ pub struct Mm {
     dumpable: AtomicU8,
     /// TLB state: where it is loaded, flush generation, ASID
     ctx: tlb::MmContext,
+    /// membarrier registrations (Linux mm->membarrier_state,
+    /// MEMBARRIER_STATE_*); a new address space starts with none
+    membarrier: AtomicU32,
 }
 
 impl Mm {
@@ -898,6 +901,11 @@ impl Mm {
         &self.ctx
     }
 
+    /// membarrier registration state (`membarrier`)
+    pub fn membarrier_state(&self) -> &AtomicU32 {
+        &self.membarrier
+    }
+
     /// Current mm_users (diagnostics)
     pub fn users(&self) -> usize {
         self.users.load(Ordering::Relaxed)
@@ -934,6 +942,7 @@ impl MmRef {
             page_table_lock: Mutex::new(()),
             dumpable: AtomicU8::new(crate::task::dumpable::SUID_DUMP_USER),
             ctx: tlb::MmContext::new(),
+            membarrier: AtomicU32::new(0),
         }))
     }
 
@@ -1072,6 +1081,11 @@ pub fn dup_mm(parent: &MmRef, pgd: u64) -> Result<MmRef, i32> {
     // A fork child's address space holds the same secrets (Linux
     // dup_mmap copies mm->flags)
     child.set_dumpable(parent.dumpable());
+    // Linux dup_mm copies the whole mm_struct: membarrier registrations
+    // survive fork (exec's new address space starts without them)
+    child
+        .membarrier
+        .store(parent.membarrier.load(Ordering::Relaxed), Ordering::Relaxed);
     // On error `child` goes with its partial copy (outside the lock)
     res.map(|_| child)
 }

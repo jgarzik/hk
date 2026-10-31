@@ -162,6 +162,11 @@ BOOT_TEST_TIMEOUT ?= 600
 # QEMU -cpu override for the boot tests (see run-qemu.sh), e.g. QEMU_CPU=max
 export QEMU_CPU
 
+# Guest CPU count for every boot test, hk and Linux (run-qemu.sh,
+# tools/linux-boot-tester.sh), e.g. QEMU_SMP=8 make check-stress
+QEMU_SMP ?= 4
+export QEMU_SMP
+
 # hk boot test NIC (see run-qemu.sh): virtio (default) or e1000
 export NIC
 

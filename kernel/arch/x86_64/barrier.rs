@@ -24,3 +24,23 @@ pub fn dma_rmb() {
 pub fn wmb() {
     unsafe { core::arch::asm!("sfence", options(nostack, preserves_flags)) };
 }
+
+/// Serialize this CPU's instruction stream (Linux sync_core): CPUID is
+/// architecturally serializing, so code modified by another CPU is
+/// fetched afresh after it
+#[inline]
+pub fn sync_core() {
+    // SAFETY: CPUID leaf 0 has no side effects; rbx is preserved by hand
+    unsafe {
+        core::arch::asm!(
+            "mov {t}, rbx",
+            "cpuid",
+            "mov rbx, {t}",
+            t = out(reg) _,
+            inout("eax") 0u32 => _,
+            out("ecx") _,
+            out("edx") _,
+            options(nostack, preserves_flags)
+        );
+    }
+}

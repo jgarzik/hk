@@ -299,6 +299,13 @@ pub extern "C" fn ap_entry(boot_cpu_id: u32, apic_id: u32) -> ! {
     // Same FP/SIMD setup as the BSP (CR4.OSXSAVE/XCR0 are per CPU)
     super::fpu::init_cpu(false);
 
+    // The rest of the BSP's per-CPU user-mode setup (Linux cpu_init,
+    // syscall_init): SMEP/SMAP in CR4 and the SYSCALL MSRs (EFER.SCE,
+    // STAR, LSTAR, SFMASK); EFER.NXE comes from the trampoline
+    super::uaccess::enable_smep();
+    super::uaccess::enable_smap();
+    super::syscall::init();
+
     // Enable local APIC for this AP
     let lapic = super::lapic::LocalApic::get();
     lapic.enable();

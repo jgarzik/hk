@@ -1,9 +1,11 @@
 //! Task management
 
 pub mod exec;
+pub mod fair;
 pub mod fdtable;
 pub mod id;
 pub mod kthread;
+pub mod loadavg;
 pub mod misc;
 pub mod percpu;
 pub mod pgrp;
@@ -13,6 +15,7 @@ pub mod process_vm;
 pub mod ptrace;
 pub mod sched;
 pub mod schedsys;
+pub mod stop_machine;
 pub mod syscall;
 
 /// Clone flags for clone() syscall (subset of Linux flags)
@@ -347,25 +350,6 @@ pub const PRIO_USER: i32 = 2;
 pub const PRIO_MIN: i32 = -20;
 /// Maximum nice value (lowest priority)
 pub const PRIO_MAX: i32 = 19;
-
-/// Convert Linux nice value to internal priority
-///
-/// Nice values range from -20 (highest priority) to 19 (lowest priority).
-/// Internal priority ranges from 0 (lowest) to 255 (highest).
-///
-/// Mapping: nice -20 -> 188, nice 0 -> 128, nice 19 -> 71
-pub fn nice_to_priority(nice: i32) -> Priority {
-    let clamped = nice.clamp(PRIO_MIN, PRIO_MAX);
-    // Map nice -20..19 to priority ~188..71
-    (128 - (clamped * 3)) as Priority
-}
-
-/// Convert internal priority to Linux nice value
-///
-/// This is the inverse of nice_to_priority.
-pub fn priority_to_nice(priority: Priority) -> i32 {
-    ((128i32 - priority as i32) / 3).clamp(PRIO_MIN, PRIO_MAX)
-}
 
 // =============================================================================
 // Linux scheduling policy constants (from include/uapi/linux/sched.h)
@@ -818,6 +802,9 @@ pub mod pf {
     pub const MEMALLOC_NOIO: u32 = 0x0008_0000;
     /// Kernel thread (Linux PF_KTHREAD)
     pub const KTHREAD: u32 = 0x0020_0000;
+    /// Its CPU affinity is not the user's to change (Linux
+    /// PF_NO_SETAFFINITY): every hk kernel thread is bound to its CPU
+    pub const NO_SETAFFINITY: u32 = 0x0400_0000;
 }
 
 /// Thread flags (Linux TIF_*, `Task.thread_flags`): work to do on the way
@@ -877,8 +864,23 @@ pub struct Task<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::Phy
     pub flags: AtomicU32,
     /// Linux TIF_* ([`tif`])
     pub thread_flags: AtomicU32,
-    /// CPU whose run queue owns this task (tasks never migrate)
+    /// CPU whose run queue owns this task (Linux task_cpu): changed by
+    /// `set_task_cpu` only
     pub cpu: AtomicU32,
+    /// CPU its next wakeup starts its search from (Linux p->wake_cpu):
+    /// its own, or where a stopper wanted to move it while it slept;
+    /// under its pi_lock
+    pub wake_cpu: AtomicU32,
+    /// CPUs it may run on (Linux p->cpus_mask, sched_setaffinity):
+    /// written under its pi_lock and rq lock, read under either
+    pub cpus_mask: crate::cpumask::CpuMask,
+    /// Page-fault-disable depth (Linux p->pagefault_disabled), written
+    /// by the task itself (`uaccess::pagefault_disable`)
+    pub pagefault_disabled: AtomicU32,
+    /// CPU whose network backlog this task last queued a packet to
+    /// (`netif_rx`; u32::MAX: none), written by the task itself: its
+    /// loopback flush covers that backlog even if it moved since
+    pub rx_cpu: AtomicU32,
     /// Scheduling state: sleep state, run-queue link, priority, switch
     /// frame (Linux __state, on_rq, sched_entity)
     pub se: sched::SchedEntity,
@@ -1011,14 +1013,7 @@ pub struct TaskInner<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A
     // =========================================================================
     /// Current state
     pub state: TaskState,
-    /// Scheduling policy (SCHED_NORMAL, SCHED_FIFO, SCHED_RR, etc.)
-    pub policy: i32,
-    /// Real-time priority (1-99 for SCHED_FIFO/RR, 0 otherwise)
-    pub rt_priority: i32,
-    /// Reset scheduling policy on fork (SCHED_RESET_ON_FORK was set)
-    pub reset_on_fork: bool,
     /// CPU affinity mask (bit N = CPU N is allowed)
-    pub cpus_allowed: crate::cpumask::CpuSet,
     /// Page table for this task
     pub page_table: PT,
 
@@ -1437,6 +1432,7 @@ impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Tas
         kind: TaskKind,
         kstack_top: A::VirtAddr,
         cpu: u32,
+        cpus: &crate::cpumask::CpuSet,
         cred: Arc<Cred>,
         mm: Option<crate::mm::MmRef>,
         alloc: TaskAlloc,
@@ -1444,7 +1440,7 @@ impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Tas
     ) -> Self {
         let now = crate::time::monotonic_ns();
         let flags = match kind {
-            TaskKind::KernelThread => pf::KTHREAD,
+            TaskKind::KernelThread => pf::KTHREAD | pf::NO_SETAFFINITY,
             TaskKind::UserProcess => 0,
         };
         Self {
@@ -1456,7 +1452,11 @@ impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Tas
             flags: AtomicU32::new(flags),
             thread_flags: AtomicU32::new(0),
             cpu: AtomicU32::new(cpu),
-            se: sched::SchedEntity::new(PRIORITY_NORMAL, 0),
+            wake_cpu: AtomicU32::new(cpu),
+            cpus_mask: crate::cpumask::CpuMask::from_set(cpus),
+            pagefault_disabled: AtomicU32::new(0),
+            rx_cpu: AtomicU32::new(u32::MAX),
+            se: sched::SchedEntity::new(0),
             pi_lock: crate::arch::IrqSpinlock::new(()),
             ppid: AtomicU64::new(ids.ppid),
             pgid: AtomicU64::new(ids.pgid),
@@ -1504,10 +1504,14 @@ impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Tas
             kind: TaskKind::KernelThread,
             kstack_top,
             start_time: AtomicU64::new(0),
-            flags: AtomicU32::new(pf::KTHREAD),
+            flags: AtomicU32::new(pf::KTHREAD | pf::NO_SETAFFINITY),
             thread_flags: AtomicU32::new(0),
             cpu: AtomicU32::new(0),
-            se: sched::SchedEntity::new(PRIORITY_NORMAL, 0),
+            wake_cpu: AtomicU32::new(0),
+            cpus_mask: crate::cpumask::CpuMask::new(),
+            pagefault_disabled: AtomicU32::new(0),
+            rx_cpu: AtomicU32::new(u32::MAX),
+            se: sched::SchedEntity::new(0),
             pi_lock: crate::arch::IrqSpinlock::new(()),
             ppid: AtomicU64::new(0),
             pgid: AtomicU64::new(0),

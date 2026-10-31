@@ -108,7 +108,7 @@ pub fn smp_call_function_many(mask: &CpuSet, func: fn(usize), info: usize, wait:
     for cpu in targets.iter() {
         let csd = &row[cpu as usize];
         // The slot's last (async) call must be done before reuse
-        csd_wait(csd, me);
+        csd_wait(csd, me, cpu);
         csd.func.store(func as usize, Ordering::Relaxed);
         csd.info.store(info, Ordering::Relaxed);
         csd.locked.store(true, Ordering::Relaxed);
@@ -118,7 +118,7 @@ pub fn smp_call_function_many(mask: &CpuSet, func: fn(usize), info: usize, wait:
     }
     if wait {
         for cpu in targets.iter() {
-            csd_wait(&row[cpu as usize], me);
+            csd_wait(&row[cpu as usize], me, cpu);
         }
     }
 }
@@ -157,10 +157,28 @@ fn enqueue(head: &AtomicPtr<Csd>, csd: &Csd) -> bool {
 }
 
 /// Spin until `csd` is free, running this CPU's queued calls meanwhile
-fn csd_wait(csd: &Csd, me: u32) {
+fn csd_wait(csd: &Csd, me: u32, cpu: u32) {
+    let mut start = 0;
+    let mut reported = false;
     while csd.locked.load(Ordering::Acquire) {
         poll(me);
         core::hint::spin_loop();
+        // A target that does not answer for a second is reported once
+        // per wait (Linux CSD_LOCK_WAIT_DEBUG csd_lock_wait_toolong)
+        if !reported && crate::time::TIMEKEEPER.is_initialized() {
+            let now = crate::time::monotonic_ns();
+            if start == 0 {
+                start = now;
+            } else if now - start > 1_000_000_000 {
+                reported = true;
+                crate::printkln!(
+                    "csd: CPU#{} waiting {} ms for CPU#{} to run a cross-CPU call",
+                    me,
+                    (now - start) / 1_000_000,
+                    cpu
+                );
+            }
+        }
     }
 }
 
@@ -180,13 +198,12 @@ pub fn call_function_interrupt() {
     run_queue(this_id());
 }
 
-/// Reschedule IPI handler (Linux scheduler_ipi): the remote wakeups
-/// queued for this CPU are applied now; the woken task is picked at
-/// this CPU's next scheduling point (the idle loop's, right after this
-/// interrupt), or the running task's return to user mode
-/// (TIF_NEED_RESCHED; a kick_process for a signal also lands here)
+/// Reschedule IPI handler (Linux scheduler_ipi): another CPU queued a
+/// task here that should run now (`resched_curr`) or wants the running
+/// task to notice new work (`kick_process`); it switches at this CPU's
+/// next scheduling point (the idle loop's, right after this interrupt),
+/// or the running task's return to user mode (TIF_NEED_RESCHED)
 pub fn reschedule_interrupt() {
-    crate::task::percpu::sched_ipi();
     crate::task::percpu::current().set_tif(crate::task::tif::NEED_RESCHED);
 }
 
@@ -222,7 +239,12 @@ fn run_queue(me: u32) {
 /// A cross-CPU call from interrupt context, or with this CPU's interrupt
 /// state owned by an IrqSpinlock, could deadlock (reported once)
 fn check_context() {
-    if CurrentArch::interrupt_depth() > 0 || crate::arch::preempt_count() > 0 {
+    // An IrqSpinlock raises the preempt count with interrupts off; a
+    // spin Mutex raises it too, but its waiters spin with interrupts on
+    // and so answer the call (Linux flushes TLBs under spinlocks too)
+    if CurrentArch::interrupt_depth() > 0
+        || (crate::arch::preempt_count() > 0 && crate::arch::irqs_disabled())
+    {
         static WARNED: AtomicBool = AtomicBool::new(false);
         if !WARNED.swap(true, Ordering::Relaxed) {
             crate::printkln!(

@@ -17,3 +17,12 @@ pub fn dma_rmb() {
 pub fn wmb() {
     unsafe { core::arch::asm!("dsb st", options(nostack, preserves_flags)) };
 }
+
+/// Serialize this CPU's instruction stream (Linux sync_core): an ISB is
+/// context synchronizing, so code modified by another CPU (made visible
+/// by its cache maintenance) is fetched afresh after it
+#[inline]
+pub fn sync_core() {
+    // SAFETY: a barrier; no memory or register effects
+    unsafe { core::arch::asm!("isb", options(nostack, preserves_flags)) };
+}
