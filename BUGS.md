@@ -633,3 +633,10 @@ Found during T0 (2026-10-19). Tag = when to fix.
    vectors.S KERNEL_ENTRY tests bit 15 of SP only, so an SP that jumped
    more than 32 KB below a stack base (one huge frame) lands where the
    bit is clear and is not caught (the guard gap still faults).
+13. **MM_LIFE_FORK_EXEC over its 128 kB tolerance at 8 CPUs** (next
+   batch): 1 of 20 `QEMU_SMP=8 make check-stress` boots (arm64, TCG)
+   lost 184 kB of MemFree+Slab over 500 fork+exec rounds, never at 4
+   CPUs. Suspects that scale with CPUs: the stack area's page tables
+   (never freed; more concurrent stacks reach higher slots) and frees
+   deferred until other CPUs switch. Find which, then fix it or scale
+   the tolerance with the CPU count.
