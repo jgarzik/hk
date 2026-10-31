@@ -187,14 +187,6 @@ unsafe impl GlobalAlloc for HeapAllocator {
 
 unsafe impl Sync for HeapAllocator {}
 
-impl HeapAllocator {
-    /// The block came from this arena
-    fn contains(&self, p: *mut u8) -> bool {
-        let inner = self.inner.lock();
-        (inner.heap_start..inner.heap_end).contains(&(p as usize))
-    }
-}
-
 /// Boot arena size: what boot allocates before the page allocator is up
 /// (cmdline, early device tree and console state), with ample margin
 const ARENA_SIZE: usize = 256 * 1024;
@@ -206,6 +198,12 @@ struct ArenaBuf(core::cell::UnsafeCell<[u8; ARENA_SIZE]>);
 unsafe impl Sync for ArenaBuf {}
 
 static ARENA_BUF: ArenaBuf = ArenaBuf(core::cell::UnsafeCell::new([0; ARENA_SIZE]));
+
+/// The block came from the boot arena (its static bounds: no lock)
+fn in_arena(p: *mut u8) -> bool {
+    let base = ARENA_BUF.0.get() as usize;
+    (base..base + ARENA_SIZE).contains(&(p as usize))
+}
 
 /// The global allocator: boot arena, then slab
 pub struct KernelAlloc {
@@ -260,7 +258,7 @@ unsafe impl GlobalAlloc for KernelAlloc {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        if self.arena().contains(ptr) {
+        if in_arena(ptr) {
             unsafe { self.arena.dealloc(ptr, layout) };
         } else {
             crate::mm::slab::kfree(ptr, layout.size(), layout.align());
@@ -268,7 +266,7 @@ unsafe impl GlobalAlloc for KernelAlloc {
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new: usize) -> *mut u8 {
-        let slab = !self.arena().contains(ptr);
+        let slab = !in_arena(ptr);
         if slab && crate::mm::slab::fits(layout.size(), new, layout.align()) {
             return ptr;
         }

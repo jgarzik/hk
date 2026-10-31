@@ -218,18 +218,45 @@ pub unsafe fn init(dtb: u64) {
 /// Boot CPU, before SMP; `va` is unmapped and not in use.
 pub unsafe fn map_page(va: u64, pa: u64, table: &mut dyn FnMut() -> u64) {
     unsafe {
+        let t = walk(va, &[39, 30, 21], table);
+        (*t).entry_mut(idx(va, 12)).set_page(pa, KERNEL_RW);
+        // The walker sees the entry before the first access
+        asm!("dsb ishst", "isb", options(nostack));
+    }
+}
+
+/// `map_page` for a 2MB block: `va` and `pa` 2MB aligned, no table
+/// below that entry yet
+///
+/// # Safety
+/// As for `map_page`.
+pub unsafe fn map_pmd(va: u64, pa: u64, table: &mut dyn FnMut() -> u64) {
+    unsafe {
+        let t = walk(va, &[39, 30], table);
+        (*t).entry_mut(idx(va, 21)).set_block(pa, KERNEL_RW);
+        asm!("dsb ishst", "isb", options(nostack));
+    }
+}
+
+/// Kernel data: read-write, never executable
+const KERNEL_RW: u64 = AF | SH_INNER | ATTR_IDX_NORMAL | AP_EL1_RW | PXN | UXN;
+
+/// The table `shifts` lead to from TTBR1's root for `va`, missing ones
+/// from `table`
+///
+/// # Safety
+/// As for `map_page`.
+unsafe fn walk(va: u64, shifts: &[u32], table: &mut dyn FnMut() -> u64) -> *mut RawPageTable {
+    unsafe {
         let mut t = &raw mut SWAPPER;
-        for shift in [39, 30, 21] {
+        for &shift in shifts {
             let e = (*t).entry_mut(idx(va, shift));
             if !e.is_valid() {
                 e.set_table(table());
             }
             t = phys_to_virt_table(e.addr());
         }
-        let attrs = AF | SH_INNER | ATTR_IDX_NORMAL | AP_EL1_RW | PXN | UXN;
-        (*t).entry_mut(idx(va, 12)).set_page(pa, attrs);
-        // The walker sees the entry before the first access
-        asm!("dsb ishst", "isb", options(nostack));
+        t
     }
 }
 

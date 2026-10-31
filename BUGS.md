@@ -540,13 +540,6 @@ From the P2 /code-review (unverified). Tag = when to fix.
    (next batch; real HW). `kernel/arch/aarch64/dtb.rs:175`: Linux
    memblock_mark_nomap removes them (speculative access to secure
    carve-outs).
-3. **Allocator fast-path costs** (P7, with SMP tuning):
-   `kernel/heap.rs:262` every free takes the boot arena's lock
-   (`contains`) and an AcqRel swap (`arena()`) (compare against the
-   static arena bounds instead); `kernel/mm/page_alloc.rs:209`
-   this_cpu() does RDMSR GS_BASE per call (use a gs-relative load);
-   `kernel/mm/page.rs:379` vmemmap uses 4KB PTEs and one memblock
-   alloc per page (Linux: 2MB PMD per section).
 
 ## P3 review findings (open)
 From the P3 /code-review (unverified). Tag = when to fix.

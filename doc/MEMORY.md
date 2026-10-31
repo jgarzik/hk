@@ -117,9 +117,10 @@ Linux: `Documentation/arch/arm64/memory.rst`.
   once; MemTotal counts those pages (Linux totalram_pages).
 - **struct page** (`mm/page.rs`, Linux SPARSEMEM_VMEMMAP): every pfn
   of a 128 MB section holding RAM has a 64-byte `Page` at
-  `VMEMMAP_START + pfn * 64`, in frames memblock gives at boot (4 KB
-  mappings; sections without RAM are not backed, `pfn_valid` checks a
-  section bitmap). Pages memblock kept start `PG_RESERVED` and are
+  `VMEMMAP_START + pfn * 64`, in memory memblock gives at boot (a
+  section's 2 MB of struct pages is one 2 MB block mapping, 4 KB pages
+  if memblock has no free aligned 2 MB; sections without RAM are not
+  backed, `pfn_valid` checks a section bitmap). Pages memblock kept start `PG_RESERVED` and are
   never freed. Flags, map count, mapping (an anonymous page's AnonVma,
   which it holds a reference on) and list links live there.
 - **Page allocator** (`mm/page_alloc.rs`, Linux buddy allocator): one

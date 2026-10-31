@@ -1450,7 +1450,8 @@ layout in `doc/MEMORY.md`
 
 - Before the page allocator is up, allocations come from a static boot
   arena (first-fit list under an `IrqSpinlock` leaf); afterwards from
-  kmalloc caches. A block goes back to whichever gave it.
+  kmalloc caches. A block goes back to whichever gave it, told apart by
+  the arena's static bounds (no lock on the free path).
 - Each `KmemCache` has a per-CPU object array, used by its CPU with
   interrupts off (no lock), and `list_lock` (`IrqSpinlock`) over its
   partial and empty slab lists. Order: per-CPU array → `list_lock` →
