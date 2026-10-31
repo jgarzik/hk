@@ -372,26 +372,6 @@ GFP_KERNEL allocation in atomic context. LOCKDEP has no such report
 call site to attribute it to, so the sites (allocations under spin locks
 across net, fs, ipc) cannot be audited yet.
 
-## Multi-second CPU stalls when the host is overcommitted
-
-**Location**: unknown (CPU 0 of the x86 guest)
-
-With several QEMUs (4 vCPUs each) on the 24-thread host, CPU 0 of an hk
-guest sometimes runs nothing else for 1-45 s. SOFT timers wait that
-long for `ktimers/0` (TIMERFD_ABSTIME_RT took 2-45 s while timerfd used
-a SOFT timer), and a 20 ms nanosleep took 1.5-29 s in TIMER_TINY_PERIOD
-(1 ns periodic timers armed). Seen about 5 times in ~60 gated x86 boots
-with 8-12 QEMUs at once, once with 8 (two gate lanes), never in a lone
-gate. The Linux reference runs the same tests in the same runs and
-never stalled, so the cause is in hk, made likely by vCPU preemption.
-HARD timers and the tick stay on time and no SOFT callback ran long, so
-some kernel path on CPU 0 does not reach a scheduling point: suspected
-spinning on another vCPU (a lock holder or an IPI target descheduled by
-the host). Seen again once with user tasks on all CPUs (ALARM: SIGALRM
-not within 2 s). Next: boot with `watchdog_thresh=1` (the soft lockup
-detector reports a CPU that does not schedule for 2 s, with the tid it
-runs) and watch for `csd:` reports of cross-CPU calls waited on over 1 s.
-
 ## Unconfirmed: Arc<T> field corruption in the USB mass-storage driver
 
 **Location**: `kernel/usb/msc.rs`
@@ -643,7 +623,11 @@ Found during T0 (2026-10-19). Tag = when to fix.
    connect to a just-closed loopback port, but no ECONNREFUSED was
    pending); `NET_STRESS_TRUNC_RACE:FAIL reader status got 256` on the
    x86 Linux reference (a reader hit its 2 s receive timeout under host
-   load).
+   load), and on hk now and then since user tasks run on all CPUs. The
+   test expects each 256-byte MSG_WAITALL recv of its three concurrent
+   readers to be contiguous, which Linux does not promise (tcp_recvmsg
+   drops the socket lock while it waits, so another reader takes the
+   bytes in between; a timeout returns a partial count): fix the test.
 12. **arm64 overflow check misses a frame over 32 KB** (next batch):
    vectors.S KERNEL_ENTRY tests bit 15 of SP only, so an SP that jumped
    more than 32 KB below a stack base (one huge frame) lands where the

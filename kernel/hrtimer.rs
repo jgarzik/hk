@@ -10,7 +10,8 @@
 //!
 //! The CPU's clock event device runs one-shot (`arch::clockevent_next`:
 //! LAPIC one-shot count on x86-64, CNTP_CVAL on arm64), programmed for
-//! the earliest pending timer. The scheduler tick is itself a HARD
+//! the earliest pending timer; due SOFT timers waiting for `ktimers/N`
+//! do not count until it has run them (`SOFT_ACTIVATED`). The scheduler tick is itself a HARD
 //! timer re-armed every TICK_NS, so an interrupt comes at least that
 //! often: a CLOCK_REALTIME timer is compared with the realtime clock at
 //! every interrupt, so a clock step (clock_settime) delays it by at most
@@ -363,6 +364,13 @@ impl HrBase {
 /// Per CPU: [HARD, SOFT]
 static BASES: PerCpu<[HrBase; 2]> = crate::percpu![[HrBase::new(), HrBase::new()]];
 
+/// Per CPU: due SOFT timers were handed to `ktimers/N`, which has not
+/// run them yet (Linux cpu_base->softirq_activated): the clock event
+/// is programmed from the HARD timers only meanwhile, or the expired
+/// SOFT expiry would make it fire again at once, over and over, and
+/// keep the CPU in the interrupt instead of letting `ktimers/N` run
+static SOFT_ACTIVATED: PerCpu<AtomicBool> = crate::percpu![AtomicBool::new(false)];
+
 /// The CPU whose base `b` is
 fn base_cpu(b: &HrBase) -> u32 {
     let first = BASES.get(0).as_ptr() as usize;
@@ -379,10 +387,12 @@ fn reprogram(cpu: u32) {
     let mono = crate::time::monotonic_ns();
     let off = crate::time::realtime_ns() as i128 - mono as i128;
     let [hard, soft] = BASES.get(cpu);
-    let next = [hard, soft]
-        .iter()
-        .filter_map(|b| b.q.lock().next(off))
-        .min();
+    // SOFT timers handed to ktimers/N are its to run (SOFT_ACTIVATED)
+    let bases: &[&HrBase] = match SOFT_ACTIVATED.get(cpu).load(Ordering::Relaxed) {
+        true => &[hard],
+        false => &[hard, soft],
+    };
+    let next = bases.iter().filter_map(|b| b.q.lock().next(off)).min();
     let delta = next.map_or(TICK_NS, |n| {
         n.saturating_sub(mono).clamp(MIN_DELTA_NS, TICK_NS)
     });
@@ -430,7 +440,11 @@ pub fn interrupt() {
     }
     let [hard, soft] = BASES.get(cpu);
     hard.run();
-    if soft.due() {
+    // Set or cleared at every interrupt: a due timer cancelled before
+    // ktimers/N ran leaves nothing to wait for
+    let due = soft.due();
+    SOFT_ACTIVATED.get(cpu).store(due, Ordering::Relaxed);
+    if due {
         crate::timer::wake_ktimers(cpu);
     }
     reprogram(cpu);
@@ -442,9 +456,15 @@ pub fn soft_due(cpu: u32) -> bool {
     BASES.get(cpu)[1].due()
 }
 
-/// Run `cpu`'s due SOFT timers (`ktimers/N`, process context)
+/// Run `cpu`'s due SOFT timers (`ktimers/N` of `cpu`, process
+/// context), then program the clock event with the SOFT timers counted
+/// again (Linux hrtimer_run_softirq)
 pub fn run_soft(cpu: u32) {
     BASES.get(cpu)[1].run();
+    let flags = crate::arch::local_irq_save();
+    SOFT_ACTIVATED.get(cpu).store(false, Ordering::Relaxed);
+    reprogram(cpu);
+    crate::arch::local_irq_restore(flags);
 }
 
 /// Sleep until woken or `deadline` ns on `clock` passes (Linux
