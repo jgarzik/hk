@@ -107,9 +107,10 @@ pub fn pick<'a, T: Copy>(ents: impl Iterator<Item = (T, &'a SchedEntity)> + Clon
 }
 
 /// Remember how far `se`, leaving the run queue, is behind the average
-/// `avg` (Linux update_entity_lag: clamped to about two slices)
+/// `avg` (Linux entity_lag: clamped to the longest slice plus a tick,
+/// the timing granularity; every slice here is the base slice)
 pub fn save_lag(se: &SchedEntity, avg: u64) {
-    let limit = calc_delta_fair(2 * base_slice().max(super::percpu::TICK_NS), se) as i64;
+    let limit = calc_delta_fair(base_slice() + super::percpu::TICK_NS, se) as i64;
     let lag = (avg as i128 - se.vruntime.load(Ordering::Relaxed) as i128)
         .clamp(-limit as i128, limit as i128) as i64;
     se.vlag.store(lag, Ordering::Relaxed);
