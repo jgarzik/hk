@@ -408,9 +408,38 @@ impl<A: Adapter> ClassQueues<A> {
         !self.fair.is_empty()
     }
 
-    /// Remove up to `out.len()` fair tasks `f` accepts, oldest first
-    /// (the load balancer moves fair tasks); the number taken
-    pub fn take_fair(
+    /// Remove up to `out.len()` queued tasks `f` accepts, rt ones first
+    /// (highest priority first: they wait behind a higher one, Linux
+    /// pull_rt_task), then fair ones oldest first (Linux load_balance);
+    /// the number taken. Stoppers stay.
+    pub fn take(
+        &mut self,
+        out: &mut [*const A::Item],
+        mut f: impl FnMut(*const A::Item) -> bool,
+    ) -> usize {
+        let mut n = 0;
+        for p in (0..NUM_PRIORITIES).rev() {
+            let mut it = self.rt.lists[p].front();
+            while let Some(item) = it {
+                if n == out.len() {
+                    return n;
+                }
+                // SAFETY: `item` is on this list
+                it = unsafe { self.rt.lists[p].next(item) };
+                if f(item) {
+                    // SAFETY: as above
+                    unsafe { self.rt.remove(item, p as Priority) };
+                    out[n] = item;
+                    n += 1;
+                }
+            }
+        }
+        n + self.take_fair(&mut out[n..], f)
+    }
+
+    /// Remove up to `out.len()` fair tasks `f` accepts, oldest first;
+    /// the number taken
+    fn take_fair(
         &mut self,
         out: &mut [*const A::Item],
         mut f: impl FnMut(*const A::Item) -> bool,

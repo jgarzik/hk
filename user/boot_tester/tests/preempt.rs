@@ -25,6 +25,8 @@
 //! - RT_FIFO: a SCHED_FIFO spinner keeps a SCHED_OTHER spinner on its
 //!   CPU from running, and is not time-sliced against another FIFO task
 //!   of the same priority.
+//! - RT_PLACE: a waking SCHED_FIFO task whose last CPU runs a higher
+//!   FIFO task goes to a CPU running a SCHED_OTHER one (every CPU busy).
 //! - NICE_WEIGHT, NICE_ADJACENT, SCHED_IDLE_SHARE: two spinners on
 //!   one CPU share it by weight (EEVDF): nice 0 vs 5 about 3:1, nice 0
 //!   vs 1 about 5:4 (neither starves), SCHED_IDLE under a tenth.
@@ -54,10 +56,89 @@ pub fn run_tests() {
     test_sched_prio_fields();
     test_sched_perm();
     test_rt_fifo();
+    test_rt_place();
     test_fair_share(b"NICE_WEIGHT", (0, 0), (5, 0), (18, 50));
     test_fair_share(b"NICE_ADJACENT", (0, 0), (1, 0), (6, 25));
     test_fair_share(b"SCHED_IDLE_SHARE", (0, 0), (0, 5), (100, u64::MAX));
     test_async_sig_regs();
+}
+
+/// RT_PLACE: see the module doc (Linux select_task_rq_rt)
+fn test_rt_place() {
+    use super::sk::T;
+    use hk_syscall::{SchedParam, sys_sched_setscheduler};
+    let mut t = T::new(b"RT_PLACE");
+    let mut all = [0u64; 16];
+    let len = sys_sched_getaffinity(0, core::mem::size_of_val(&all), all.as_mut_ptr());
+    let cpus = all[0];
+    if cpus.count_ones() < 2 || cpus.count_ones() > 8 {
+        println(b"RT_PLACE:SKIP (2 to 8 CPUs)");
+        return;
+    }
+    let page = sys_mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if !t.ok(b"mmap", page >= 0, page) {
+        t.done();
+        return;
+    }
+    let c = page as *mut u64;
+    let x = cpus.trailing_zeros();
+    // SAFETY: counters of the shared page: 0 its progress, 2 ready, 8..
+    // the spinners'
+    let at = |i: usize| unsafe { c.add(i).read_volatile() };
+    // The FIFO 10 task: on CPU x, then allowed everywhere; it sleeps
+    // past the spinners' start, so its wakeup finds x running FIFO 20
+    let task = sys_fork();
+    if task == 0 {
+        let m = 1u64 << x;
+        sys_sched_setaffinity(0, 8, &m);
+        sys_sched_setscheduler(0, 1, &SchedParam { sched_priority: 10 });
+        sys_sched_setaffinity(0, len as usize, all.as_ptr());
+        // SAFETY: counter 2 of the shared page: ready
+        unsafe { c.add(2).write_volatile(1) };
+        sleep_ms(1500);
+        loop {
+            // SAFETY: counter 0 of the shared page
+            unsafe { c.write_volatile(c.read_volatile() + 1) };
+        }
+    }
+    // Its mask widened before anything occupies x
+    let t0 = now_ms();
+    while at(2) == 0 && now_ms() - t0 < 5000 {
+        sleep_ms(10);
+    }
+    let mut pids = [0i64; 9];
+    let mut n = 0;
+    // CPU x: a FIFO 20 spinner; every other CPU: a SCHED_OTHER spinner
+    for cpu in 0..64u32 {
+        if cpus & (1 << cpu) != 0 {
+            let prio = if cpu == x { 20 } else { 0 };
+            // SAFETY: counters 8.. of the shared page
+            pids[n] = spinner(cpu, prio, unsafe { c.add(8 + n) }, 0);
+            n += 1;
+        }
+    }
+    // Every spinner runs with its final policy before it wakes
+    let t0 = now_ms();
+    while (0..n).any(|i| at(8 + i) == 0) && now_ms() - t0 < 1400 {
+        sleep_ms(10);
+    }
+    let settled = (0..n).all(|i| at(8 + i) > 0);
+    while at(0) == 0 && now_ms() - t0 < 3500 {
+        sleep_ms(10);
+    }
+    let progress = at(0);
+    // The rt tasks first: a task starved by one could not die
+    reap(task);
+    for pid in pids.iter().take(n) {
+        reap(*pid);
+    }
+    sys_munmap(page as u64, 4096);
+    if !settled {
+        println(b"RT_PLACE:SKIP (spinners slow to start)");
+        return;
+    }
+    t.ok(b"fifo 10 ran", progress > 0, progress as i64);
+    t.done();
 }
 
 /// A child pinned to `cpu` with `nice` and fair `policy` counting in

@@ -470,6 +470,12 @@ pub struct PerCpuScheduler {
     /// That address space's membarrier registrations, cached at each
     /// switch (Linux rq->membarrier_state)
     pub membarrier_state: AtomicU32,
+    /// The running task's `rank`, set at each switch (Linux cpupri: rt
+    /// wakeups look for the CPU running the least important task)
+    pub curr_rank: AtomicU32,
+    /// This CPU's ticks, for its balancing interval (Linux
+    /// rq->next_balance)
+    pub ticks: AtomicU64,
     /// Tasks on this run queue, queued or running, the idle task aside
     /// (Linux rq->nr_running): changed under the rq lock, read without
     /// it to place tasks
@@ -491,6 +497,8 @@ impl PerCpuScheduler {
             nr_switches: AtomicU64::new(0),
             curr_mm: AtomicUsize::new(0),
             membarrier_state: AtomicU32::new(0),
+            curr_rank: AtomicU32::new(0),
+            ticks: AtomicU64::new(0),
         }
     }
 }
@@ -2599,6 +2607,7 @@ fn make_current(t: &KernelTask) -> (u64, *const crate::mm::Mm, (u64, u64)) {
         // address space is ordered before the task's return to user
         // mode (Linux: the barriers around rq->curr's update)
         s.curr_mm.store(mm as usize, Ordering::SeqCst);
+        s.curr_rank.store(rank(t), Ordering::Relaxed);
     }
     CurrentArch::set_current_task_ptr(t as *const KernelTask as usize);
     // Linux prepare_task
@@ -2850,6 +2859,35 @@ fn sched_cpus() -> crate::cpumask::CpuSet {
     s
 }
 
+/// How important `p` is to keep running, for rt placement (Linux
+/// cpupri): idle 0, fair 1, rt 2 + its priority, stop above all
+fn rank(p: &KernelTask) -> u32 {
+    match p.se.class() {
+        Class::Idle => 0,
+        Class::Fair => 1,
+        Class::Rt => 2 + p.se.rt_priority() as u32,
+        Class::Stop => 200,
+    }
+}
+
+/// An rt task's CPU (Linux select_task_rq_rt / find_lowest_rq): its
+/// previous one if it would preempt what runs there, else the allowed
+/// CPU running the least important task if `p` would preempt that,
+/// else its previous one
+fn select_task_rq_rt(p: &KernelTask, allowed: &crate::cpumask::CpuSet, prev: u32) -> u32 {
+    let r = rank(p);
+    let at = |c: u32| PERCPU_SCHEDS.get(c).curr_rank.load(Ordering::Relaxed);
+    if allowed.test(prev) && at(prev) < r {
+        return prev;
+    }
+    let lowest = allowed.iter().min_by_key(|&c| (at(c), c != prev));
+    match lowest {
+        Some(c) if at(c) < r => c,
+        _ if allowed.test(prev) => prev,
+        _ => find_idlest_cpu(allowed, prev),
+    }
+}
+
 /// CPU `cpu` has nothing to run but its idle task (Linux idle_cpu)
 fn idle_cpu(cpu: u32) -> bool {
     PERCPU_SCHEDS.get(cpu).nr_running.load(Ordering::Relaxed) == 0
@@ -2864,6 +2902,9 @@ fn select_task_rq(p: &KernelTask, why: Placement) -> u32 {
     let allowed = p.cpus_mask.snapshot().and(&sched_cpus());
     if allowed.is_empty() {
         return prev;
+    }
+    if p.se.class() == Class::Rt && why == Placement::Wake {
+        return select_task_rq_rt(p, &allowed, prev);
     }
     match why {
         Placement::Fork => find_idlest_cpu(&allowed, crate::cpu::this_id()),
@@ -3012,9 +3053,12 @@ pub fn nr_active() -> u64 {
     nr_running_all() as u64 + unint.max(0) as u64
 }
 
-/// Tasks on `cpu`'s run queue (read without its lock)
-fn nr_running(cpu: u32) -> u32 {
-    PERCPU_SCHEDS.get(cpu).nr_running.load(Ordering::Relaxed)
+/// `cpu`'s load for balancing: its task count, one more while an rt or
+/// stop task runs there, which keeps the tasks queued behind it from
+/// running (Linux lowers such a CPU's capacity, scale_rt_capacity)
+fn balance_load(cpu: u32) -> u32 {
+    let s = PERCPU_SCHEDS.get(cpu);
+    s.nr_running.load(Ordering::Relaxed) + (s.curr_rank.load(Ordering::Relaxed) > 1) as u32
 }
 
 /// Pull queued tasks from the busiest CPU to `this` until the two are
@@ -3029,25 +3073,25 @@ fn sched_balance_rq(this: u32) {
     }
     let (mut busiest, mut max) = (this, 0);
     for c in cpus.iter() {
-        let n = nr_running(c);
+        let n = balance_load(c);
         if c != this && n > max {
             (busiest, max) = (c, n);
         }
     }
-    if busiest == this || max <= nr_running(this) + 1 {
+    if busiest == this || max <= balance_load(this) + 1 {
         return;
     }
     let mut rqs = double_rq_lock(busiest, this);
     let (src, dst) = rqs.split();
-    let (sn, dn) = (nr_running(busiest), nr_running(this));
+    let (sn, dn) = (balance_load(busiest), balance_load(this));
     if sn <= dn + 1 {
         return;
     }
     let mut moved = [core::ptr::null::<KernelTask>(); NR_MIGRATE];
     let want = (((sn - dn) / 2) as usize).clamp(1, NR_MIGRATE);
-    // Queued fair tasks (Linux load_balance moves cfs tasks; rt tasks
-    // are placed at wakeup): the running one and idle are on no list
-    let n = src.queue().take_fair(&mut moved[..want], |t| {
+    // Queued rt tasks, then fair ones: the running one and idle are on
+    // no list
+    let n = src.queue().take(&mut moved[..want], |t| {
         // SAFETY: on this run queue's list, kept alive by the scheduler
         unsafe { &*t }.cpus_mask.test(this)
     });
@@ -3069,7 +3113,8 @@ fn sched_balance_rq(this: u32) {
 /// every tick, a busy one every 8
 fn balance_tick(cpu: u32) {
     let interval = if idle_cpu(cpu) { 1 } else { 8 };
-    if (get_ticks() + cpu as u64).is_multiple_of(interval) {
+    let t = PERCPU_SCHEDS.get(cpu).ticks.fetch_add(1, Ordering::Relaxed);
+    if t.is_multiple_of(interval) {
         sched_balance_rq(cpu);
     }
 }
