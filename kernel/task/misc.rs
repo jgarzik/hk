@@ -179,7 +179,8 @@ pub fn sys_sysinfo<A: crate::uaccess::UaccessArch>(info_ptr: u64) -> i64 {
     // Build the sysinfo structure
     let info = SysInfo {
         uptime: uptime_secs,
-        loads: [0; 3], // Load averages not implemented yet
+        // Linux: avenrun << (SI_LOAD_SHIFT - FSHIFT)
+        loads: crate::task::loadavg::avenrun().map(|a| a << (16 - crate::task::loadavg::FSHIFT)),
         totalram: mem_stats.total_bytes,
         freeram: mem_stats.free_bytes,
         sharedram: 0,

@@ -29,6 +29,10 @@ pub struct SchedEntity {
     state: AtomicU8,
     /// Queued or running on its CPU's run queue
     on_rq: AtomicBool,
+    /// It went to sleep counted in its run queue's `nr_uninterruptible`
+    /// (Linux p->sched_contributes_to_load), under that rq lock; its
+    /// wakeup uncounts it
+    pub contrib_load: AtomicBool,
     /// Its CPU runs it or is still switching away from it (Linux
     /// p->on_cpu): set when it is made current, cleared by the task
     /// switched to once the switch is complete (finish_task_switch)
@@ -58,6 +62,7 @@ impl SchedEntity {
             state: AtomicU8::new(state),
             on_rq: AtomicBool::new(false),
             on_cpu: AtomicBool::new(false),
+            contrib_load: AtomicBool::new(false),
             prio: AtomicU8::new(prio),
             link: Link::new(),
             // SAFETY: a switch frame is plain integers; zero is valid

@@ -37,6 +37,7 @@ pub fn run_tests() {
     test_clock_settime_monotonic_fails();
     test_clock_settime_invalid_nsec();
     test_clock_settime_storm();
+    test_loadavg();
     #[cfg(target_arch = "x86_64")]
     {
         test_settimeofday_basic();
@@ -265,6 +266,70 @@ fn test_clock_settime_storm() {
     }
     t.ok(b"iterations", n > 0, n);
     sys_sched_setaffinity(0, len as usize, mask.as_ptr());
+    t.done();
+}
+
+/// Parse a decimal at `*i` of `b`, moving past it
+fn num(b: &[u8], i: &mut usize) -> Option<u64> {
+    let start = *i;
+    let mut v = 0u64;
+    while *i < b.len() && b[*i].is_ascii_digit() {
+        v = v * 10 + (b[*i] - b'0') as u64;
+        *i += 1;
+    }
+    (*i > start).then_some(v)
+}
+
+/// Skip the byte `c` at `*i` of `b`
+fn skip(b: &[u8], i: &mut usize, c: u8) -> bool {
+    let ok = *i < b.len() && b[*i] == c;
+    *i += ok as usize;
+    ok
+}
+
+/// LOADAVG: /proc/loadavg reads "a.bb c.dd e.ff run/total lastpid"
+/// (Linux loadavg_proc_show): the reader itself is runnable, run <=
+/// total, a pid was handed out; sysinfo's loads are the same averages
+/// (16-bit fraction, at least as large as 1/100 resolution allows)
+fn test_loadavg() {
+    use hk_syscall::{O_RDONLY, sys_close, sys_open, sys_read, sys_sysinfo};
+    let mut t = T::new(b"LOADAVG");
+    let fd = sys_open(b"/proc/loadavg\0".as_ptr(), O_RDONLY, 0);
+    if !t.ok(b"open", fd >= 0, fd) {
+        t.done();
+        return;
+    }
+    let mut b = [0u8; 128];
+    let n = sys_read(fd as u64, b.as_mut_ptr(), b.len() as u64);
+    sys_close(fd as u64);
+    let b = &b[..n.max(0) as usize];
+    let mut i = 0;
+    let mut loads = [0u64; 3];
+    let mut ok = n > 0;
+    for l in loads.iter_mut() {
+        let int = num(b, &mut i);
+        ok &= skip(b, &mut i, b'.');
+        let frac = num(b, &mut i);
+        ok &= int.is_some() && frac.is_some_and(|f| f < 100);
+        *l = int.unwrap_or(0) * 100 + frac.unwrap_or(0);
+        ok &= skip(b, &mut i, b' ');
+    }
+    let run = num(b, &mut i).unwrap_or(0);
+    ok &= skip(b, &mut i, b'/');
+    let total = num(b, &mut i).unwrap_or(0);
+    ok &= skip(b, &mut i, b' ');
+    let last = num(b, &mut i).unwrap_or(0);
+    ok &= skip(b, &mut i, b'\n') && i == b.len();
+    t.ok(b"format", ok, n);
+    t.ok(b"running", run >= 1 && run <= total, run as i64);
+    t.ok(b"last pid", last > 0, last as i64);
+    let mut si = [0u64; 16];
+    t.eq(b"sysinfo", sys_sysinfo(si.as_mut_ptr() as *mut u8), 0);
+    // Same averages: each sysinfo load, in hundredths, within 1 of the file
+    for (k, l) in loads.iter().enumerate() {
+        let h = (si[1 + k] * 100) >> 16;
+        t.ok(b"sysinfo load", h.abs_diff(*l) <= 1, h as i64);
+    }
     t.done();
 }
 

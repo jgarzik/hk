@@ -1939,6 +1939,11 @@ fn procfs_mount(fs_type: &'static FileSystemType) -> Result<Arc<SuperBlock>, Ker
         InodeMode::regular(0o444),
         ProcfsInodeData::new_file(gen_meminfo),
     );
+    let loadavg_inode = mk_inode(
+        &sb,
+        InodeMode::regular(0o444),
+        ProcfsInodeData::new_file(crate::task::loadavg::proc_loadavg),
+    );
 
     // Create /proc/net (directory) with /proc/net/{dev,route}; contents follow
     // the reader's network namespace
@@ -2028,6 +2033,7 @@ fn procfs_mount(fs_type: &'static FileSystemType) -> Result<Arc<SuperBlock>, Ker
             children.insert(String::from("version"), version_inode);
             children.insert(String::from("mounts"), mounts_inode);
             children.insert(String::from("meminfo"), meminfo_inode);
+            children.insert(String::from("loadavg"), loadavg_inode);
             let slabinfo = mk_inode(
                 &sb,
                 InodeMode::regular(0o400),

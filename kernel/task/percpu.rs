@@ -9,7 +9,7 @@
 //! - Run queue lock must be held with IRQs disabled
 //! - Context switch happens with the run queue lock held
 
-use ::core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use ::core::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
@@ -276,6 +276,12 @@ impl CpuRunQueue {
     /// out)
     fn activate(&mut self, p: &KernelTask) {
         p.se.set_state(RUNNING);
+        if p.se.contrib_load.swap(false, Ordering::Relaxed) {
+            PERCPU_SCHEDS
+                .get(self.cpu)
+                .nr_uninterruptible
+                .fetch_sub(1, Ordering::Relaxed);
+        }
         if !p.se.on_rq() {
             p.se.set_on_rq(true);
             self.add_nr(1);
@@ -358,6 +364,10 @@ pub struct PerCpuScheduler {
     /// (Linux rq->nr_running): changed under the rq lock, read without
     /// it to place tasks
     pub nr_running: AtomicU32,
+    /// Tasks that went to sleep here uninterruptibly (or killably) less
+    /// those woken here (Linux rq->nr_uninterruptible: only the sum over
+    /// CPUs means anything; one CPU's may be negative)
+    pub nr_uninterruptible: AtomicI64,
 }
 
 impl PerCpuScheduler {
@@ -366,6 +376,7 @@ impl PerCpuScheduler {
         Self {
             lock: IrqSpinlock::new(CpuRunQueue::uninit()),
             nr_running: AtomicU32::new(0),
+            nr_uninterruptible: AtomicI64::new(0),
             initialized: AtomicBool::new(false),
             nr_switches: AtomicU64::new(0),
             curr_mm: AtomicUsize::new(0),
@@ -2612,9 +2623,15 @@ pub fn schedule() {
     if rq.curr.is_null() || rq.curr_is_idle() || me.se.state() == RUNNING {
         return;
     }
-    // Leave the run queue (Linux deactivate_task)
+    // Leave the run queue (Linux deactivate_task); an uninterruptible
+    // or killable sleep counts in the load (task_contributes_to_load)
     me.se.set_on_rq(false);
     rq.add_nr(-1);
+    let st = me.se.state();
+    if st == SleepState::Uninterruptible as u8 || st == SleepState::Killable as u8 {
+        me.se.contrib_load.store(true, Ordering::Relaxed);
+        sched.nr_uninterruptible.fetch_add(1, Ordering::Relaxed);
+    }
     me.nvcsw.fetch_add(1, Ordering::Relaxed);
     let next = rq.pick_next();
     context_switch_locked(sched, rq, &me, next);
@@ -2823,6 +2840,24 @@ fn double_rq_lock(
         let gb = get_percpu_sched(b).lock.lock();
         (get_percpu_sched(a).lock.lock(), gb)
     }
+}
+
+/// Runnable tasks on every CPU (Linux nr_running())
+pub fn nr_running_all() -> u32 {
+    (0..crate::cpu::nr_cpu_ids())
+        .filter_map(|c| PERCPU_SCHEDS.try_get(c))
+        .map(|s| s.nr_running.load(Ordering::Relaxed))
+        .sum()
+}
+
+/// Tasks counting in the load: runnable, or asleep uninterruptibly
+/// (Linux calc_load_fold_active, summed at once)
+pub fn nr_active() -> u64 {
+    let unint: i64 = (0..crate::cpu::nr_cpu_ids())
+        .filter_map(|c| PERCPU_SCHEDS.try_get(c))
+        .map(|s| s.nr_uninterruptible.load(Ordering::Relaxed))
+        .sum();
+    nr_running_all() as u64 + unint.max(0) as u64
 }
 
 /// Tasks on `cpu`'s run queue (read without its lock)
@@ -3117,7 +3152,8 @@ pub fn ns_to_ticks(ns: u64) -> u64 {
 /// Linux scheduler_tick -> resched_curr).
 pub fn scheduler_tick() {
     if crate::cpu::try_this_id() == Some(0) {
-        TICK_COUNT.fetch_add(1, Ordering::Relaxed);
+        let t = TICK_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        crate::task::loadavg::tick(t);
     }
     crate::timer::run_local();
     crate::watchdog::tick();

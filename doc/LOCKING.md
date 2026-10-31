@@ -678,7 +678,11 @@ waking one on its previous CPU if idle, else an idle allowed CPU, else
 its previous one (`select_idle_sibling`); all CPUs form one domain (no
 topology yet). `PerCpuScheduler.nr_running` (queued or running, idle
 aside; changed under the rq lock, read locklessly for placement) is
-Linux rq->nr_running. On x86-64 each CPU has its own TSS (RSP0) and
+Linux rq->nr_running. `nr_uninterruptible` (Linux, per CPU, only the
+sum counts) goes up under the rq lock when a task sleeps uninterruptibly
+or killably (`se.contrib_load` set) and down on the run queue that wakes
+it; CPU 0's tick folds both into the load averages every 5 s
+(`task/loadavg.rs`, atomics only; /proc/loadavg, sysinfo). On x86-64 each CPU has its own TSS (RSP0) and
 syscall entry stack top, set at each switch to a user task.
 
 ### 3.1.1 Task Struct and Credentials
