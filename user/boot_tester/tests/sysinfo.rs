@@ -234,8 +234,14 @@ fn clock_ns(clock: i32) -> i64 {
 /// tick spins on it forever. CLOCK_MONOTONIC must never go backwards
 fn test_clock_settime_storm() {
     let mut t = T::new(b"CLOCK_SETTIME_STORM");
-    let mut mask: u64 = 0;
-    sys_sched_getaffinity(0, 8, &mut mask);
+    // The whole mask (more than 64 CPUs need more than 8 bytes), put
+    // back as it was read
+    let mut mask = [0u64; 16];
+    let len = sys_sched_getaffinity(0, core::mem::size_of_val(&mask), mask.as_mut_ptr());
+    if !t.ok(b"getaffinity", len > 0, len) {
+        t.done();
+        return;
+    }
     t.eq(b"pin cpu0", sys_sched_setaffinity(0, 8, &1u64), 0);
     let start = clock_ns(CLOCK_MONOTONIC);
     let mut prev = start;
@@ -258,7 +264,7 @@ fn test_clock_settime_storm() {
         n += 1;
     }
     t.ok(b"iterations", n > 0, n);
-    sys_sched_setaffinity(0, 8, &mask);
+    sys_sched_setaffinity(0, len as usize, mask.as_ptr());
     t.done();
 }
 

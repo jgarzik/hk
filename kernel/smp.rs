@@ -221,7 +221,12 @@ fn run_queue(me: u32) {
 /// A cross-CPU call from interrupt context, or with this CPU's interrupt
 /// state owned by an IrqSpinlock, could deadlock (reported once)
 fn check_context() {
-    if CurrentArch::interrupt_depth() > 0 || crate::arch::preempt_count() > 0 {
+    // An IrqSpinlock raises the preempt count with interrupts off; a
+    // spin Mutex raises it too, but its waiters spin with interrupts on
+    // and so answer the call (Linux flushes TLBs under spinlocks too)
+    if CurrentArch::interrupt_depth() > 0
+        || (crate::arch::preempt_count() > 0 && crate::arch::irqs_disabled())
+    {
         static WARNED: AtomicBool = AtomicBool::new(false);
         if !WARNED.swap(true, Ordering::Relaxed) {
             crate::printkln!(

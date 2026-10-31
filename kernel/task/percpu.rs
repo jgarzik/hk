@@ -2673,6 +2673,7 @@ fn task_rq_lock(p: &KernelTask) -> crate::arch::IrqSpinlockGuard<'static, CpuRun
 /// under its pi_lock while it is off every run queue (a wakeup, a new
 /// task), or under its old rq lock while queued (a migration)
 fn set_task_cpu(p: &KernelTask, cpu: u32) {
+    p.wake_cpu.store(cpu, Ordering::Relaxed);
     p.cpu.store(cpu, Ordering::Release);
 }
 
@@ -2704,7 +2705,7 @@ fn idle_cpu(cpu: u32) -> bool {
 /// domain walk reduces to a scan; a task that may run nowhere active
 /// stays where it is.
 fn select_task_rq(p: &KernelTask, why: Placement) -> u32 {
-    let prev = p.cpu();
+    let prev = p.wake_cpu.load(Ordering::Relaxed);
     let allowed = p.cpus_mask.snapshot().and(&sched_cpus());
     if allowed.is_empty() {
         return prev;
@@ -2798,6 +2799,114 @@ pub fn try_to_wake_up(p: &KernelTask, mode: WakeMode) -> bool {
     set_task_cpu(p, cpu);
     get_percpu_sched(cpu).lock.lock().activate(p);
     true
+}
+
+/// A task to move and where (`migration_cpu_stop`'s argument)
+struct Migration {
+    task: *const KernelTask,
+    dest: u32,
+}
+
+/// On the stopper of the task's CPU (Linux migration_cpu_stop): move
+/// it to `dest` if it is still on this CPU's run queue. Nothing of this
+/// CPU runs meanwhile, so a task on it is queued, not running. One that
+/// sleeps (it moved meanwhile, or it is the caller waiting for this)
+/// wakes on `dest` if it can (its `wake_cpu`).
+fn migration_cpu_stop(arg: usize) {
+    // SAFETY: the caller waits for this call, holding the task
+    let m = unsafe { &*(arg as *const Migration) };
+    // SAFETY: as above
+    let p = unsafe { &*m.task };
+    let _pi = p.pi_lock.lock();
+    let Some(sched) = this_sched() else { return };
+    let rq = sched.lock.lock();
+    if p.cpu() != rq.cpu || !p.cpus_mask.test(m.dest) {
+        return;
+    }
+    if p.se.on_rq() && !core::ptr::eq(rq.curr, m.task) {
+        move_queued_task(rq, p, m.dest);
+    } else if !p.se.on_rq() {
+        p.wake_cpu.store(m.dest, Ordering::Relaxed);
+    }
+}
+
+/// Move queued `p` from the run queue `rq` (locked, its CPU's) to
+/// `dest`'s (Linux move_queued_task), its pi_lock held: off one list,
+/// on the other, the two locks one after the other. In between it is on
+/// no list while `on_rq`: everything that touches a queued task on its
+/// run queue holds its pi_lock or found it on that list.
+fn move_queued_task(
+    mut rq: crate::arch::IrqSpinlockGuard<'_, CpuRunQueue>,
+    p: &KernelTask,
+    dest: u32,
+) {
+    // SAFETY: queued, so on its priority's list of this run queue
+    unsafe { rq.queue().remove(p, p.se.prio()) };
+    rq.add_nr(-1);
+    set_task_cpu(p, dest);
+    drop(rq);
+    let mut d = get_percpu_sched(dest).lock.lock();
+    d.add_nr(1);
+    d.enqueue(p);
+    d.check_preempt(p);
+}
+
+/// Restrict `p` to `mask` (Linux __set_cpus_allowed_ptr ->
+/// affine_move_task): written under its pi_lock and rq lock; if it runs
+/// or is queued on a CPU it may no longer use, that CPU's stopper moves
+/// it (the caller sleeps meanwhile, which for a task restricting itself
+/// is what lets the stopper find it off the CPU). EINVAL if no active
+/// CPU is in `mask`.
+pub fn set_cpus_allowed_ptr(p: &KernelTask, mask: &crate::cpumask::CpuSet) -> Result<(), i32> {
+    let allowed = mask.and(&sched_cpus());
+    if mask.and(&crate::smp::active_cpus()).is_empty() {
+        return Err(22); // EINVAL
+    }
+    let (cpu, dest) = {
+        let _pi = p.pi_lock.lock();
+        if !cpu_has_scheduler(p.cpu()) {
+            p.cpus_mask.assign(mask);
+            return Ok(());
+        }
+        let _rq = task_rq_lock(p);
+        p.cpus_mask.assign(mask);
+        let cpu = p.cpu();
+        if mask.test(cpu) || !p.se.on_rq() || allowed.is_empty() {
+            return Ok(());
+        }
+        (cpu, find_idlest_cpu(&allowed, cpu))
+    };
+    let m = Migration { task: p, dest };
+    crate::task::stop_machine::stop_one_cpu(
+        cpu,
+        migration_cpu_stop,
+        &m as *const Migration as usize,
+    );
+    Ok(())
+}
+
+/// At exec, move to the least loaded allowed CPU if that is another
+/// one (Linux sched_exec: the image is small and the cache cold)
+pub fn sched_exec() {
+    let me = current();
+    let this = crate::cpu::this_id();
+    let dest = {
+        let _pi = me.pi_lock.lock();
+        let allowed = me.cpus_mask.snapshot().and(&sched_cpus());
+        if allowed.is_empty() {
+            return;
+        }
+        find_idlest_cpu(&allowed, this)
+    };
+    if dest == this {
+        return;
+    }
+    let m = Migration { task: &*me, dest };
+    crate::task::stop_machine::stop_one_cpu(
+        this,
+        migration_cpu_stop,
+        &m as *const Migration as usize,
+    );
 }
 
 /// Wait until `p`, asleep, is off its CPU (Linux wait_task_inactive):
@@ -3383,20 +3492,15 @@ pub fn set_task_scheduler(pid: Pid, policy: i32, rt_priority: i32) -> Result<(),
 ///   - EINVAL (22): Empty mask (no CPUs allowed)
 ///
 /// # Locking
-/// The mask is written under the task's pi_lock and rq lock (Linux
-/// __set_cpus_allowed_ptr); a task running elsewhere moves at its next
-/// wakeup (`select_task_rq`).
+/// See [`set_cpus_allowed_ptr`]: a task on a CPU it may no longer use
+/// is moved before this returns.
 pub fn set_task_cpus_allowed(pid: Pid, mask: crate::cpumask::CpuSet) -> Result<(), i32> {
-    // At least one CPU the task can run on (Linux __sched_setaffinity:
-    // the mask and cpu_active_mask intersect)
-    if mask.and(&crate::smp::active_cpus()).is_empty() {
-        return Err(22); // EINVAL
-    }
     let task = TASKLIST.read().task(pid).ok_or(3)?; // ESRCH
-    let _pi = task.pi_lock.lock();
-    let _rq = cpu_has_scheduler(task.cpu()).then(|| task_rq_lock(&task));
-    task.cpus_mask.assign(&mask);
-    Ok(())
+    // Bound kernel threads (Linux sched_setaffinity: EINVAL)
+    if task.has_flag(crate::task::pf::NO_SETAFFINITY) {
+        return Err(22);
+    }
+    set_cpus_allowed_ptr(&task, &mask)
 }
 
 /// Get the total number of tasks in the system

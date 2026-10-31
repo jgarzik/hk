@@ -738,6 +738,7 @@ fn kmain() -> ! {
     // softnet threads. Then interrupts on: pid 1 may sleep from here.
     task::percpu::init_ap_schedulers();
     crate::timer::start_ktimers();
+    crate::task::stop_machine::start();
     crate::workqueue::init();
     crate::net::start_threads();
     CurrentArch::enable_interrupts();

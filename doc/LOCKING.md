@@ -488,7 +488,12 @@ only at that task's return to user mode (`entry::exit_to_user_mode`).
    CPU's rq lock. `resched_curr` flags the running task and sends a
    reschedule IPI when the run queue is another CPU's. The rq holds no
    task reference per CPU: the scheduler's reference (rule 8) follows
-   the task.
+   the task. A queued task moves (`move_queued_task`, from the stopper
+   of its CPU) under its pi_lock: off the old list under the old rq
+   lock, `set_task_cpu`, then onto the new one under the new lock, never
+   both locks at once. In between it is `on_rq` on no list, so whatever
+   touches a queued task on its run queue holds its pi_lock (wakeup,
+   priority and affinity changes) or found it on that list.
 
 2. **Run queue lock is IRQ-safe** - Timer interrupts cannot cause deadlocks.
    Lock order: pi_lock → rq lock; two rq locks lowest CPU first
@@ -638,6 +643,21 @@ every kernel thread stays on its CPU (`cpus_mask` holds only it, Linux
 kthread_bind). Standing threads: `ktimers/N` (one per CPU, runs its SOFT
 timer callbacks), the system workqueue worker, `softnet/N` (one per CPU,
 network receive; see 3.10), `kselftest` (boot only).
+
+**Stoppers (kernel/task/stop_machine.rs, Linux stop_machine.c):**
+`migration/N`, one per CPU at the highest priority, runs calls queued
+with `stop_one_cpu` (thread context; the caller sleeps until done). Per
+CPU: `Stopper.lock` (sleeping `sync::Mutex`, one caller at a time, held
+until the call completes) → `Stopper.work` (IrqSpinlock leaf, the
+slot). `migration_cpu_stop` takes the task's pi_lock → this CPU's rq
+lock: a task still queued here moves; one asleep gets `wake_cpu` (Linux
+p->wake_cpu, under the pi_lock), where its next wakeup starts.
+`set_cpus_allowed_ptr` (sched_setaffinity; Linux affine_move_task)
+writes `cpus_mask` under pi_lock + rq lock and, if the task runs or is
+queued on a CPU now excluded, calls that CPU's stopper with no lock held;
+`sched_exec` (do_execve) moves the caller to the least loaded CPU the
+same way. Kernel threads are PF_NO_SETAFFINITY (sched_setaffinity:
+EINVAL).
 
 Every online AP gets an idle task (`init_ap_schedulers`) and enters the
 scheduler from its boot idle loop. User tasks run on every CPU:
@@ -1326,8 +1346,11 @@ reschedule (`resched_curr` after queueing a task on its run queue,
   the sender's own wait loop): it may only touch atomics, per-CPU data
   and IrqSpinlocks (7.4 applies).
 - **Rules** (a broken one is a deadlock): never call from interrupt
-  context or with an IrqSpinlock held (reported as `LOCKDEP:FAIL
-  smp_call_function_many in atomic context`); never with a lock held
+  context or with an IrqSpinlock held (a raised preempt count with
+  interrupts off; reported as `LOCKDEP:FAIL smp_call_function_many in
+  atomic context`). A `spin::Mutex` may be held (e.g. a THP split's
+  shootdown under the page_table_lock, as Linux under the pmd lock):
+  its waiters spin with interrupts on. Never with a lock held
   that another CPU may spin on with interrupts off (TASKLIST: taken
   under run-queue locks), as that CPU cannot answer. Syscalls and faults
   run with interrupts on (7.5), so a target answers at once; a call may

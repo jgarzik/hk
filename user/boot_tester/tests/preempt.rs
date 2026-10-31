@@ -11,6 +11,9 @@
 //!   nanosleep(20ms) meanwhile returns within 1s.
 //! - SMP_SPREAD: with two or more CPUs, spinning children forked one
 //!   after the other run on at least two CPUs at once.
+//! - AFFINITY_MIGRATE: right after sched_setaffinity to one CPU, the
+//!   caller runs there, for every CPU; a child asleep in a pipe read,
+//!   pinned elsewhere by its parent, wakes on the new CPU.
 //! - ASYNC_SIG_REGS: every general register (rcx/r11 on x86, x0-x30 on
 //!   arm64) holds its value across a SIGUSR1 handler that interrupts a
 //!   spin loop; on x86 the loop runs with DF set (`std`), which the
@@ -32,7 +35,62 @@ pub fn run_tests() {
     test_sigkill_spin();
     test_timeslice();
     test_smp_spread();
+    test_affinity_migrate();
     test_async_sig_regs();
+}
+
+/// The CPU the caller runs on
+fn getcpu() -> i64 {
+    let mut cpu = 0u32;
+    let r = sys_getcpu(&mut cpu, core::ptr::null_mut());
+    if r < 0 { r } else { cpu as i64 }
+}
+
+/// AFFINITY_MIGRATE: sched_setaffinity moves a running task before it
+/// returns (Linux affine_move_task), and a sleeping one at its wakeup
+fn test_affinity_migrate() {
+    use super::sk::T;
+    use hk_syscall::{sys_close, sys_pipe2, sys_read, sys_write};
+    let mut t = T::new(b"AFFINITY_MIGRATE");
+    let mut orig = [0u64; 16];
+    let len = sys_sched_getaffinity(0, core::mem::size_of_val(&orig), orig.as_mut_ptr());
+    if !t.ok(b"getaffinity", len > 0, len) {
+        t.done();
+        return;
+    }
+    let cpus: u64 = orig[0];
+    for cpu in 0..64u32 {
+        if cpus & (1 << cpu) == 0 {
+            continue;
+        }
+        let m = 1u64 << cpu;
+        t.eq(b"setaffinity", sys_sched_setaffinity(0, 8, &m), 0);
+        t.eq(b"runs on the cpu", getcpu(), cpu as i64);
+    }
+    sys_sched_setaffinity(0, len as usize, orig.as_ptr());
+    let last = 63 - cpus.leading_zeros();
+    if cpus.count_ones() >= 2 {
+        let mut fds = [0i32; 2];
+        sys_pipe2(fds.as_mut_ptr(), 0);
+        let child = sys_fork();
+        if child == 0 {
+            let first = 1u64 << cpus.trailing_zeros();
+            sys_sched_setaffinity(0, 8, &first);
+            let mut b = [0u8; 1];
+            sys_read(fds[0] as u64, b.as_mut_ptr(), 1);
+            sys_exit(getcpu() as u64 & 0xff);
+        }
+        sleep_ms(50);
+        let m = 1u64 << last;
+        t.eq(b"pin child", sys_sched_setaffinity(child, 8, &m), 0);
+        sys_write(fds[1] as u64, b"x".as_ptr(), 1);
+        let mut st = 0i32;
+        sys_wait4(child, &mut st, 0, 0);
+        t.eq(b"child woke on", ((st >> 8) & 0xff) as i64, last as i64);
+        sys_close(fds[0] as u64);
+        sys_close(fds[1] as u64);
+    }
+    t.done();
 }
 
 /// CPUs the caller may run on (sched_getaffinity, up to 1024 CPUs)

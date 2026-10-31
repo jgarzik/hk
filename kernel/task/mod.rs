@@ -13,6 +13,7 @@ pub mod process_vm;
 pub mod ptrace;
 pub mod sched;
 pub mod schedsys;
+pub mod stop_machine;
 pub mod syscall;
 
 /// Clone flags for clone() syscall (subset of Linux flags)
@@ -818,6 +819,9 @@ pub mod pf {
     pub const MEMALLOC_NOIO: u32 = 0x0008_0000;
     /// Kernel thread (Linux PF_KTHREAD)
     pub const KTHREAD: u32 = 0x0020_0000;
+    /// Its CPU affinity is not the user's to change (Linux
+    /// PF_NO_SETAFFINITY): every hk kernel thread is bound to its CPU
+    pub const NO_SETAFFINITY: u32 = 0x0400_0000;
 }
 
 /// Thread flags (Linux TIF_*, `Task.thread_flags`): work to do on the way
@@ -880,6 +884,10 @@ pub struct Task<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::Phy
     /// CPU whose run queue owns this task (Linux task_cpu): changed by
     /// `set_task_cpu` only
     pub cpu: AtomicU32,
+    /// CPU its next wakeup starts its search from (Linux p->wake_cpu):
+    /// its own, or where a stopper wanted to move it while it slept;
+    /// under its pi_lock
+    pub wake_cpu: AtomicU32,
     /// CPUs it may run on (Linux p->cpus_mask, sched_setaffinity):
     /// written under its pi_lock and rq lock, read under either
     pub cpus_mask: crate::cpumask::CpuMask,
@@ -1455,7 +1463,7 @@ impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Tas
     ) -> Self {
         let now = crate::time::monotonic_ns();
         let flags = match kind {
-            TaskKind::KernelThread => pf::KTHREAD,
+            TaskKind::KernelThread => pf::KTHREAD | pf::NO_SETAFFINITY,
             TaskKind::UserProcess => 0,
         };
         Self {
@@ -1467,6 +1475,7 @@ impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Tas
             flags: AtomicU32::new(flags),
             thread_flags: AtomicU32::new(0),
             cpu: AtomicU32::new(cpu),
+            wake_cpu: AtomicU32::new(cpu),
             cpus_mask: crate::cpumask::CpuMask::from_set(cpus),
             pagefault_disabled: AtomicU32::new(0),
             rx_cpu: AtomicU32::new(u32::MAX),
@@ -1518,9 +1527,10 @@ impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Tas
             kind: TaskKind::KernelThread,
             kstack_top,
             start_time: AtomicU64::new(0),
-            flags: AtomicU32::new(pf::KTHREAD),
+            flags: AtomicU32::new(pf::KTHREAD | pf::NO_SETAFFINITY),
             thread_flags: AtomicU32::new(0),
             cpu: AtomicU32::new(0),
+            wake_cpu: AtomicU32::new(0),
             cpus_mask: crate::cpumask::CpuMask::new(),
             pagefault_disabled: AtomicU32::new(0),
             rx_cpu: AtomicU32::new(u32::MAX),

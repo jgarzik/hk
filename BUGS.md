@@ -611,9 +611,6 @@ Found during T0 (2026-10-19). Tag = when to fix.
    getpid/gettid/kill/wait//proc use the root number; a CLONE_NEWPID
    child is not pid 1 in its namespace. Use `Pid::nr_in(caller's ns)`
    at the syscall boundary.
-2. **CLOCK_SETTIME_STORM ignores the sched_getaffinity result** (next
-   batch). The test assumes an 8-byte mask (EINVAL past 64 CPUs),
-   stays pinned, and drifts CLOCK_REALTIME. Fix the test if touched.
 3. **mremap Prep allocates page tables under the old PTE lock** (next
    batch). `kernel/mm/mremap.rs:53`: it uses CAS-only
    `paging::pte_alloc` there, skipping page_table_lock; allocate before
