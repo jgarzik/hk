@@ -792,6 +792,11 @@ pub fn ptrace_stop(code: u32) -> u32 {
         }
         t.state = TaskState::Traced(code as i32);
         t.ptrace_code = code;
+        // Asleep before the tracer can see the stop (Linux
+        // set_special_state(TASK_TRACED) before notifying it): a tracer
+        // on another CPU waits for us to switch out
+        // (wait_task_inactive), and gives up on a Running tracee
+        set_current_state(SleepState::Killable);
         t.tracer()
     };
     // The tracer's wait finds the stop; SIGCHLD tells it (Linux
