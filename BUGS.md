@@ -532,12 +532,6 @@ expected to fix it; "next batch" means the next fix batch.
    d_exchange (dentry name under `d_lock`); vfat must then update the
    moved inode's `parent_cluster`/`short_name` (fs rename needs the
    source inode).
-2. **process_vm on own process fails from a sibling thread** (next
-   batch). `kernel/task/process_vm.rs:310` exempts only
-   `target_tid == current_tid()`; Linux mm_access exempts the caller's
-   own mm and `__ptrace_may_access` the thread group. Scenario: a
-   non-dumpable uid-1000 process; its second thread gets EPERM from
-   `process_vm_readv(getpid())`.
 6. **ptrace "init only with CAP_SYS_PTRACE" guard is wrong** (next
    batch). `kernel/task/ptrace.rs:179` refuses init (tid 1) without
    CAP_SYS_PTRACE; Linux has no such rule. ptrace_attach should instead
