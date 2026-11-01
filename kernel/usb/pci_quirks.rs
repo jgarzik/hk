@@ -41,7 +41,7 @@ pub const EARLY_HANDOFF: crate::bus::quirks::PciFixup = crate::bus::quirks::PciF
 
 /// Take a USB controller over from the firmware (Linux
 /// quirk_usb_early_handoff)
-fn quirk_usb_early_handoff(dev: &PciDevice, _all: &[PciDevice]) {
+fn quirk_usb_early_handoff(dev: &PciDevice, all: &[PciDevice]) {
     if !matches!(dev.header.prog_if, PROG_IF_EHCI | PROG_IF_XHCI) {
         return;
     }
@@ -57,7 +57,7 @@ fn quirk_usb_early_handoff(dev: &PciDevice, _all: &[PciDevice]) {
     if dev.header.prog_if == PROG_IF_EHCI {
         quirk_usb_disable_ehci(dev, &bar);
     } else {
-        quirk_usb_handoff_xhci(dev, &bar);
+        quirk_usb_handoff_xhci(dev, all, &bar);
     }
 }
 
@@ -187,8 +187,15 @@ pub struct XhciHandoff {
 /// clear (else take it), then disable and acknowledge every SMI; in any
 /// case wait for the controller to be ready, then halt it with its
 /// interrupts off. `force`: controllers whose firmware never answers
-/// (TI 8241, Renesas 0014) are taken outright.
-pub fn handoff_xhci(r: &impl Mmio, clock: &mut impl Clock, force: bool) -> XhciHandoff {
+/// (TI 8241, Renesas 0014) are taken outright. `hc_init` runs once the
+/// firmware is out, before the controller is touched (Linux hc_init:
+/// the Intel port switch).
+pub fn handoff_xhci(
+    r: &impl Mmio,
+    clock: &mut impl Clock,
+    force: bool,
+    hc_init: impl FnOnce(),
+) -> XhciHandoff {
     let mut out = XhciHandoff::default();
     let ext = ext_caps::find_ext_cap(r, 0, ext_caps::CAP_LEGACY);
     if ext != 0 && ext + 8 <= r.len() {
@@ -215,6 +222,7 @@ pub fn handoff_xhci(r: &impl Mmio, clock: &mut impl Clock, force: bool) -> XhciH
         r.write32(ext + XHCI_LEGACY_CONTROL, off);
         out.smi = (ctl, r.read32(ext + XHCI_LEGACY_CONTROL));
     }
+    hc_init();
     halt_xhci(r, clock, &mut out);
     out
 }
@@ -245,9 +253,23 @@ fn xhci_force_handoff(dev: &PciDevice) -> bool {
     )
 }
 
-fn quirk_usb_handoff_xhci(dev: &PciDevice, bar: &Bar) {
-    let h = handoff_xhci(bar, &mut Monotonic::new(), xhci_force_handoff(dev));
+fn quirk_usb_handoff_xhci(dev: &PciDevice, all: &[PciDevice], bar: &Bar) {
+    let mut ports = None;
+    let switch = || {
+        if dev.header.vendor_id == PCI_VENDOR_INTEL {
+            ports = usb_enable_intel_xhci_ports(dev, all);
+        }
+    };
+    let h = handoff_xhci(bar, &mut Monotonic::new(), xhci_force_handoff(dev), switch);
     let id = dev.bus_id();
+    if let Some((ss, hs)) = ports {
+        printkln!(
+            "{}: xHCI: ports switched from EHCI: USB3_PSSEN {:#x} XUSB2PR {:#x}",
+            id,
+            ss,
+            hs
+        );
+    }
     if h.legacy == 0 {
         printkln!("{}: xHCI: no legacy support capability", id);
     } else if h.legsup & XHCI_HC_BIOS_OWNED == 0 {
@@ -283,6 +305,58 @@ fn quirk_usb_handoff_xhci(dev: &PciDevice, bar: &Bar) {
             XHCI_MAX_HALT_US
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Intel EHCI/xHCI port routing (Linux usb_enable_intel_xhci_ports)
+//
+// Intel chipsets from Panther Point on (the Dell's Lynx Point included)
+// pair an xHCI with EHCI controllers that share ports; each port is
+// routed to one of them by xHCI config registers, and firmware leaves
+// them on EHCI. hk drives the xHCI only, so devices on routed ports
+// would be invisible: switch every switchable port to the xHCI, the
+// SuperSpeed terminations first so USB 3 devices connect at
+// SuperSpeed, before any driver probes.
+
+const PCI_VENDOR_INTEL: u16 = 0x8086;
+/// xHC USB 2.0 Port Routing, and the mask of ports the OS may route
+const USB_INTEL_XUSB2PR: u8 = 0xD0;
+const USB_INTEL_USB2PRM: u8 = 0xD4;
+/// USB 3.0 Port SuperSpeed Enable, and the mask of ports the OS may
+/// enable
+const USB_INTEL_USB3_PSSEN: u8 = 0xD8;
+const USB_INTEL_USB3PRM: u8 = 0xDC;
+
+/// The class of an EHCI controller (Linux PCI_CLASS_SERIAL_USB_EHCI)
+const CLASS_EHCI: u32 = 0x0c0320;
+
+/// Route the switchable ports to the xHCI: (USB3_PSSEN, XUSB2PR) as
+/// read back
+pub fn switch_intel_ports(cfg: &impl Config) -> (u32, u32) {
+    let ss = cfg.read32(USB_INTEL_USB3PRM);
+    cfg.write32(USB_INTEL_USB3_PSSEN, ss);
+    let ss = cfg.read32(USB_INTEL_USB3_PSSEN);
+    let hs = cfg.read32(USB_INTEL_USB2PRM);
+    cfg.write32(USB_INTEL_XUSB2PR, hs);
+    (ss, cfg.read32(USB_INTEL_XUSB2PR))
+}
+
+/// Route ports back to EHCI (Linux usb_disable_xhci_ports)
+pub fn disable_intel_ports(cfg: &impl Config) {
+    cfg.write32(USB_INTEL_USB3_PSSEN, 0);
+    cfg.write32(USB_INTEL_XUSB2PR, 0);
+}
+
+/// Switch an Intel xHCI's ports over, if an Intel EHCI shares them
+/// (Linux usb_enable_intel_xhci_ports). Sony VAIO T-series (subsystem
+/// 104d:90a8) cannot switch.
+fn usb_enable_intel_xhci_ports(xhci: &PciDevice, all: &[PciDevice]) -> Option<(u32, u32)> {
+    let h = &xhci.header;
+    if (h.subsystem_vendor_id, h.subsystem_id) == (0x104d, 0x90a8) {
+        return None;
+    }
+    let ehci = |d: &PciDevice| d.class24() == CLASS_EHCI && d.header.vendor_id == PCI_VENDOR_INTEL;
+    all.iter().any(ehci).then(|| switch_intel_ports(xhci))
 }
 
 // ---------------------------------------------------------------------------
@@ -506,7 +580,7 @@ mod tests {
     #[test]
     fn bios_releases() {
         let x = FakeXhci::new(Some(XHCI_HC_BIOS_OWNED), Some(3));
-        let h = handoff_xhci(&x, &mut clock(), false);
+        let h = handoff_xhci(&x, &mut clock(), false, || {});
         assert_eq!(h.legacy, LEG);
         assert!(h.released && h.ready && h.halted);
         let l = x.regs.get(LEG);
@@ -523,7 +597,7 @@ mod tests {
     fn bios_never_releases() {
         let x = FakeXhci::new(Some(XHCI_HC_BIOS_OWNED), None);
         let mut c = clock();
-        let h = handoff_xhci(&x, &mut c, false);
+        let h = handoff_xhci(&x, &mut c, false, || {});
         assert!(!h.released);
         // Gave up after about a second, took it
         assert!(c.now >= 1_000_000_000 && c.now < 1_100_000_000);
@@ -538,7 +612,7 @@ mod tests {
     #[test]
     fn not_bios_owned() {
         let x = FakeXhci::new(Some(0), Some(1));
-        let h = handoff_xhci(&x, &mut clock(), false);
+        let h = handoff_xhci(&x, &mut clock(), false, || {});
         assert!(!h.released);
         assert_eq!(x.regs.get(LEG) & XHCI_HC_OS_OWNED, 0);
         assert_eq!(x.regs.get(LEG + 4), 0xe001_e011 & XHCI_LEGACY_DISABLE_SMI);
@@ -549,7 +623,7 @@ mod tests {
     #[test]
     fn no_legacy_cap() {
         let x = FakeXhci::new(None, None);
-        let h = handoff_xhci(&x, &mut clock(), false);
+        let h = handoff_xhci(&x, &mut clock(), false, || {});
         assert_eq!(h.legacy, 0);
         assert!(h.ready && h.halted);
         assert_eq!(x.regs.get(OP + XHCI_CMD) & XHCI_CMD_RUN, 0);
@@ -559,7 +633,7 @@ mod tests {
     fn forced() {
         let x = FakeXhci::new(Some(XHCI_HC_BIOS_OWNED), None);
         let mut c = clock();
-        let h = handoff_xhci(&x, &mut c, true);
+        let h = handoff_xhci(&x, &mut c, true, || {});
         assert_eq!(x.regs.get(LEG) & XHCI_HC_BIOS_OWNED, 0);
         assert!(c.now < 1_000_000_000); // no wait
         assert!(h.halted);
@@ -571,7 +645,7 @@ mod tests {
         let x = FakeXhci::new(None, None);
         x.regs.set(OP + XHCI_STS, XHCI_STS_CNR);
         let mut c = clock();
-        let h = handoff_xhci(&x, &mut c, false);
+        let h = handoff_xhci(&x, &mut c, false, || {});
         assert!(!h.ready && h.halted);
         assert!(c.now >= 5_000_000_000);
     }
@@ -728,5 +802,47 @@ mod tests {
         assert_eq!(h.legacy, 0);
         assert_eq!(h.unknown, 64);
         ehci_halted_and_quiet(&r);
+    }
+
+    /// Writable bits of the routing registers follow their masks
+    struct FakePorts {
+        regs: core::cell::RefCell<[u32; 4]>, // XUSB2PR, USB2PRM, PSSEN, USB3PRM
+    }
+
+    impl Config for FakePorts {
+        fn read32(&self, off: u8) -> u32 {
+            self.regs.borrow()[((off - 0xD0) / 4) as usize]
+        }
+        fn write32(&self, off: u8, val: u32) {
+            let mut r = self.regs.borrow_mut();
+            let i = ((off - 0xD0) / 4) as usize;
+            r[i] = val & r[i + 1]; // only the masked ports take
+        }
+        fn write8(&self, _: u8, _: u8) {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn intel_port_switch() {
+        let p = FakePorts {
+            regs: core::cell::RefCell::new([0, 0x7fff, 0, 0x3f]),
+        };
+        assert_eq!(switch_intel_ports(&p), (0x3f, 0x7fff));
+        disable_intel_ports(&p);
+        assert_eq!(*p.regs.borrow(), [0, 0x7fff, 0, 0x3f]);
+    }
+
+    /// The hc_init hook runs after the SMIs are off, before the halt
+    #[test]
+    fn hc_init_order() {
+        let x = FakeXhci::new(Some(XHCI_HC_BIOS_OWNED), Some(1));
+        let seen = Cell::new((0, 0));
+        handoff_xhci(&x, &mut clock(), false, || {
+            seen.set((x.regs.get(LEG + 4), x.regs.get(OP + XHCI_CMD)))
+        });
+        let (smi, cmd) = seen.get();
+        assert_eq!(smi, 0xe001_e011 & XHCI_LEGACY_DISABLE_SMI);
+        assert_ne!(cmd & XHCI_CMD_RUN, 0);
     }
 }
