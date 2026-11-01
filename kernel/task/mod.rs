@@ -13,6 +13,7 @@ pub mod pid;
 pub mod proc;
 pub mod process_vm;
 pub mod ptrace;
+pub mod rt;
 pub mod sched;
 pub mod schedsys;
 pub mod stop_machine;

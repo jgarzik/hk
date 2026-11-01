@@ -28,6 +28,10 @@
 //! - RT_PLACE: a waking SCHED_FIFO task whose last CPU runs a higher
 //!   FIFO task (one that turned FIFO while running there) goes at once
 //!   to a CPU running a SCHED_OTHER one (every CPU busy).
+//! - RT_THROTTLE: a SCHED_FIFO spinner on the caller's own CPU starves
+//!   it for at most about a second (rt throttling: rt tasks get 950 ms
+//!   of each 1 s period while fair tasks wait; Linux
+//!   sched_rt_runtime_us, now the fair server's default reservation).
 //! - NICE_WEIGHT, NICE_ADJACENT, SCHED_IDLE_SHARE: two spinners on
 //!   one CPU share it by weight (EEVDF): nice 0 vs 5 about 3:1, nice 0
 //!   vs 1 about 5:4 (neither starves), SCHED_IDLE under a tenth.
@@ -58,10 +62,37 @@ pub fn run_tests() {
     test_sched_perm();
     test_rt_fifo();
     test_rt_place();
+    test_rt_throttle();
     test_fair_share(b"NICE_WEIGHT", (0, 0), (5, 0), (18, 50));
     test_fair_share(b"NICE_ADJACENT", (0, 0), (1, 0), (6, 25));
     test_fair_share(b"SCHED_IDLE_SHARE", (0, 0), (0, 5), (100, u64::MAX));
     test_async_sig_regs();
+}
+
+/// RT_THROTTLE: see the module doc. The spinner gives up after 3 s, so
+/// a kernel without throttling fails the test instead of hanging
+fn test_rt_throttle() {
+    use super::sk::T;
+    let mut t = T::new(b"RT_THROTTLE");
+    let cpu = getcpu();
+    if !t.ok(b"getcpu", cpu >= 0, cpu) {
+        t.done();
+        return;
+    }
+    let mut all = [0u64; 16];
+    let len = sys_sched_getaffinity(0, core::mem::size_of_val(&all), all.as_mut_ptr());
+    sys_sched_setaffinity(0, 8, &(1u64 << cpu));
+    let mut counter = 0u64;
+    let t0 = now_ms();
+    let fifo = spinner(cpu as u32, 10, &mut counter, 3000);
+    // The spinner takes this CPU once pinned there; this task, fair,
+    // runs again when the spinner is throttled
+    sleep_ms(20);
+    let waited = now_ms() - t0;
+    reap(fifo);
+    sys_sched_setaffinity(0, len as usize, all.as_ptr());
+    t.ok(b"fair task ran within 2 s", waited < 2000, waited);
+    t.done();
 }
 
 /// RT_PLACE: see the module doc (Linux select_task_rq_rt)

@@ -484,6 +484,13 @@ vruntime, deadline, lag and exec_start change under the rq lock of its
 CPU, and the tick charges the running one under it), idle (never
 queued). A woken task preempts a lower class, a lower rt priority, or
 a fair task EEVDF would not pick at that point (not for SCHED_BATCH/IDLE).
+rt bandwidth (`task/rt.rs`, Linux rt_rq->rt_time): `CpuRunQueue.rt_bw`
+holds the rt time run on that CPU in the current 1 s period, under its
+rq lock (charged by the tick and when an rt task switches out). Once
+it reaches 950 ms, fair tasks rank above rt ones there (pick and
+wakeup preemption) while any is runnable, until the period ends (the
+tick of a running fair task rolls it over and reschedules).
+It has no lock of its own.
 `CpuRunQueue.min_vruntime` (under the rq lock) stands for the average
 when no fair task is there.
 
