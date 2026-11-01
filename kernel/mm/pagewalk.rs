@@ -83,6 +83,18 @@ pub trait PteWalk {
     /// Whether to visit PTE tables (false: 2MB entries only)
     const PTES: bool = true;
 
+    /// Whether `ptes` runs under the table's PTE lock (false: only for
+    /// a walker that reads entries as hints, with the mmap_lock held
+    /// for writing)
+    const LOCKED: bool = true;
+
+    /// Before a PTE table's lock is taken (no spin lock held): work
+    /// that may sleep or reclaim, such as allocating the tables an
+    /// update of [addr, end) will need
+    fn prepare(&mut self, _addr: u64, _end: u64) -> Result<(), Self::Err> {
+        Ok(())
+    }
+
     /// A 2MB page maps [addr, end) (inside its 2MB region; no PTE lock
     /// held): true if done with the region, false to walk its PTE table
     /// if it has one now (it was split)
@@ -157,7 +169,8 @@ fn walk_pmd<W: PteWalk>(pmd: &AtomicU64, addr: u64, end: u64, w: &mut W) -> Resu
     let Some(table) = paging::table_of(super::huge_page::pmd_settled(pmd)) else {
         return Ok(());
     };
-    let _l = super::ptl::table_lock(table);
+    w.prepare(addr, end)?;
+    let _l = W::LOCKED.then(|| super::ptl::table_lock(table));
     w.ptes(&PteRange {
         table,
         start: addr,

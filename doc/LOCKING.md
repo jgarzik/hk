@@ -1201,9 +1201,15 @@ pub struct Zone {
   chains, and only once empty and outside every remaining VMA's span:
   an entry pointer stays valid under any mm lock hold, or under the
   AnonVma.chain lock of a VMA it lies in (the reverse map). Order: mm lock -> page_table_lock -> PTE lock ->
-  `FRAME_ALLOCATOR` (pages and tables are allocated, and the TLB is
-  flushed, under them); never in interrupt context; no sleeping under
-  them. A holder may flush other CPUs' TLBs: their waiters spin with
+  `FRAME_ALLOCATOR` (the TLB is flushed under them); never in
+  interrupt context; no sleeping under them. Both disable preemption
+  (in_atomic), so an allocation under them never enters direct reclaim:
+  reclaim's reverse-map walk takes PTE locks, the held one included (a
+  self-deadlock). Allocations that must not fail are made first: fork
+  and mremap allocate the destination tables before the source's PTE
+  lock (`PteWalk::prepare`, mremap's prep walk reads entries unlocked
+  under the write-held mmap_lock), a copy-on-write break retries its
+  page allocation without the lock. A holder may flush other CPUs' TLBs: their waiters spin with
   interrupts on (syscalls and faults run with them on, 7.5) and answer
   the IPI, as in Linux. Deviation: the PTE lock is a bare lock word in
   the table's struct page (Linux: a `spinlock_t` in the ptdesc).

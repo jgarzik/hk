@@ -614,10 +614,6 @@ Found during T0 (2026-10-19). Tag = when to fix.
    getpid/gettid/kill/wait//proc use the root number; a CLONE_NEWPID
    child is not pid 1 in its namespace. Use `Pid::nr_in(caller's ns)`
    at the syscall boundary.
-3. **mremap Prep allocates page tables under the old PTE lock** (next
-   batch). `kernel/mm/mremap.rs:53`: it uses CAS-only
-   `paging::pte_alloc` there, skipping page_table_lock; allocate before
-   taking the PTE lock (Linux move_page_tables).
 4. **`virt_to_phys(p & !0xfff)` duplicated** (next batch) in
    `Move::ptes`, `PteRange::at` and `ptl::pte_lock`: add one
    `ptl::table_of_ptep()`.
@@ -646,14 +642,6 @@ Found during T0 (2026-10-19). Tag = when to fix.
    (never freed; more concurrent stacks reach higher slots) and frees
    deferred until other CPUs switch. Find which, then fix it or scale
    the tolerance with the CPU count.
-
-15. **Soft lockup after the SWAPOUT tests** (J): one x86 `make gate`
-   boot (KVM, 4 CPUs, under the gate's parallel load) printed `BUG:
-   soft lockup - CPU#2 stuck for 20s! [tid 8623]` right after
-   SWAPOUT_MUNMAP_FREES (the isolated child exiting with swap entries
-   and swap-cache pages, or the parent reaping it) and timed out; two
-   reruns and the next gate passed. The watchdog prints no backtrace:
-   add one, then stress the swap tests.
 
 14. **SWAPOUT_PAGEOUT flaky on the Linux reference** (J): one x86
    `check-linux` run had free swap 364 kB off the expected value after
