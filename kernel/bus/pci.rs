@@ -537,6 +537,9 @@ pub struct PciDevice {
     pub header: PciDeviceHeader,
     /// DMA configuration (addressing masks)
     pub dma_config: DmaConfig,
+    /// BAR sizes in bytes, probed once at scan (0: unused, or the upper
+    /// half of a 64-bit BAR)
+    bar_sizes: [u64; 6],
 }
 
 impl PciDevice {
@@ -547,13 +550,73 @@ impl PciDevice {
             return None;
         }
 
-        Some(Self {
+        let mut dev = Self {
             bus,
             device,
             function,
             header: PciDeviceHeader::read(bus, device, function),
             dma_config: DmaConfig::default(), // 32-bit DMA by default
-        })
+            bar_sizes: [0; 6],
+        };
+        dev.size_bars();
+        Some(dev)
+    }
+
+    /// Probe every BAR's size, once, with decoding off (Linux
+    /// __pci_read_base): writing all ones to a live BAR moves the device
+    /// for the moment, under its driver - or under firmware still using
+    /// it (USB legacy emulation in SMM). Host bridges keep decoding
+    /// (Linux mmio_always_on).
+    fn size_bars(&mut self) {
+        let nbars = match self.header.header_type_number() {
+            0 => 6,
+            1 => 2,
+            _ => return,
+        };
+        let host_bridge = self.class24() >> 8 == 0x0600;
+        let cmd = self.cfg_read16(offset::COMMAND);
+        let decode = command::IO_SPACE | command::MEMORY_SPACE;
+        if !host_bridge && cmd & decode != 0 {
+            self.cfg_write16(offset::COMMAND, cmd & !decode);
+        }
+        let mut i = 0;
+        while i < nbars {
+            let wide = self.bar_is_64bit(i) && i + 1 < nbars;
+            self.bar_sizes[i] = self.probe_bar(i, wide);
+            i += if wide { 2 } else { 1 };
+        }
+        if !host_bridge && cmd & decode != 0 {
+            self.cfg_write16(offset::COMMAND, cmd);
+        }
+    }
+
+    /// Size BAR `i` (and `i + 1` as its upper half if `wide`): write all
+    /// ones, read the mask back, restore
+    fn probe_bar(&self, i: usize, wide: bool) -> u64 {
+        let size_of = |off: u8| {
+            let orig = self.cfg_read32(off);
+            self.cfg_write32(off, 0xFFFF_FFFF);
+            let mask = self.cfg_read32(off);
+            self.cfg_write32(off, orig);
+            (orig, mask)
+        };
+        let off = offset::BAR0 + i as u8 * 4;
+        let (orig, lo) = size_of(off);
+        if lo == 0 || lo == 0xFFFF_FFFF {
+            return 0;
+        }
+        let lo = if orig & 1 != 0 {
+            lo & !0x3 | 0xFFFF_0000
+        } else {
+            lo & !0xF
+        };
+        let hi = if wide {
+            size_of(off + 4).1
+        } else {
+            0xFFFF_FFFF
+        };
+        let mask = (hi as u64) << 32 | lo as u64;
+        (!mask).wrapping_add(1)
     }
 
     /// Set the DMA mask for streaming DMA mappings
@@ -623,43 +686,9 @@ impl PciDevice {
         (self.header.bar[bar_index] & 1) == 0
     }
 
-    /// Get BAR size by writing all 1s and reading back
+    /// Size of BAR `bar_index` in bytes, as probed at scan (0: none)
     pub fn bar_size(&self, bar_index: usize) -> u64 {
-        if bar_index >= 6 {
-            return 0;
-        }
-
-        let bar_offset = offset::BAR0 + (bar_index as u8 * 4);
-
-        // Save original value
-        let original = pci_read32(self.bus, self.device, self.function, bar_offset);
-
-        // Write all 1s
-        pci_write32(
-            self.bus,
-            self.device,
-            self.function,
-            bar_offset,
-            0xFFFF_FFFF,
-        );
-
-        // Read back and restore
-        let size_mask = pci_read32(self.bus, self.device, self.function, bar_offset);
-        pci_write32(self.bus, self.device, self.function, bar_offset, original);
-
-        if size_mask == 0 {
-            return 0;
-        }
-
-        // For memory BARs, mask out type bits
-        let size_mask = if (original & 1) == 0 {
-            size_mask & !0xF
-        } else {
-            size_mask & !0x3
-        };
-
-        // Size is (~mask) + 1
-        ((!size_mask) as u64) + 1
+        self.bar_sizes.get(bar_index).copied().unwrap_or(0)
     }
 
     /// Check if a BAR is a 64-bit BAR
