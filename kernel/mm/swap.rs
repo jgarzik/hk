@@ -17,7 +17,6 @@
 extern crate alloc;
 
 use alloc::sync::Arc;
-use alloc::vec;
 use alloc::vec::Vec;
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -153,11 +152,16 @@ impl SwapInfo {
         swap_type: u8,
         max: u64,
         priority: i16,
-    ) -> Self {
-        let mut count = vec![0u16; max as usize];
+    ) -> Result<Self, KernelError> {
+        // A large sparse file may still ask for more than there is
+        let mut count = Vec::new();
+        count
+            .try_reserve_exact(max as usize)
+            .map_err(|_| KernelError::OutOfMemory)?;
+        count.resize(max as usize, 0u16);
         // The header page is never handed out
         count[0] = SWAP_MAP_MAX;
-        Self {
+        Ok(Self {
             inode: backing.0,
             bdev: backing.1,
             path,
@@ -169,7 +173,7 @@ impl SwapInfo {
             inuse: AtomicU64::new(0),
             cache: IrqSpinlock::new(XArray::new()),
             cached: AtomicU64::new(0),
-        }
+        })
     }
 
     fn writeok(&self) -> bool {
@@ -452,10 +456,11 @@ fn user_path(ptr: u64) -> Result<alloc::string::String, KernelError> {
     strncpy_from_user::<Uaccess>(ptr, 4096).map_err(|_| KernelError::BadAddress)
 }
 
-/// The slots of the area whose header page is `hdr`, at most `cap`
-/// (the device size): one past the last usable one (Linux
-/// read_swap_header: last_page is the last usable page)
-fn parse_header(hdr: &[u8; PAGE_SIZE], cap: u64) -> Result<u64, KernelError> {
+/// The slots of the area whose header page is `hdr` on a file or
+/// device of `size` pages: one past the last usable one (Linux
+/// read_swap_header: last_page is the last usable page; 0, or an area
+/// longer than the file or device, is EINVAL, not clamped)
+fn parse_header(hdr: &[u8; PAGE_SIZE], size: u64) -> Result<u64, KernelError> {
     if &hdr[SWAP_MAGIC_OFFSET..SWAP_MAGIC_OFFSET + 10] != SWAP_MAGIC {
         return Err(KernelError::InvalidArgument);
     }
@@ -463,8 +468,8 @@ fn parse_header(hdr: &[u8; PAGE_SIZE], cap: u64) -> Result<u64, KernelError> {
     let info = unsafe {
         core::ptr::read_unaligned(hdr[SWAP_HEADER_INFO_OFFSET..].as_ptr() as *const SwapHeaderInfo)
     };
-    let max = (info.last_page as u64 + 1).min(cap);
-    if info.version != 1 || max < 2 {
+    let max = info.last_page as u64 + 1;
+    if info.version != 1 || info.last_page == 0 || max > size {
         return Err(KernelError::InvalidArgument);
     }
     Ok(max)
@@ -510,11 +515,14 @@ fn swapon(path_ptr: u64, swap_flags: i32) -> Result<(), KernelError> {
     if read.unwrap_or(0) < PAGE_SIZE {
         return Err(KernelError::InvalidArgument);
     }
-    // No slots past the end of the device (Linux read_swap_header)
-    let cap = bdev
+    // No slots past the end of the file or device (Linux
+    // read_swap_header: i_size of either)
+    let size = bdev
         .as_ref()
-        .map_or(u64::MAX, |b| b.nr_sects() / SECTORS_PER_PAGE);
-    let max = parse_header(&hdr, cap)?;
+        .map_or(inode.get_size() / PAGE_SIZE as u64, |b| {
+            b.nr_sects() / SECTORS_PER_PAGE
+        });
+    let max = parse_header(&hdr, size)?;
     let priority = if swap_flags & SWAP_FLAG_PREFER != 0 {
         (swap_flags & SWAP_FLAG_PRIO_MASK) as i16
     } else {
@@ -524,7 +532,7 @@ fn swapon(path_ptr: u64, swap_flags: i32) -> Result<(), KernelError> {
         Some(b) => (None, Some(b)),
         None => (Some(inode), None),
     };
-    let si = SwapInfo::new(backing, path.into_bytes(), swap_type, max, priority);
+    let si = SwapInfo::new(backing, path.into_bytes(), swap_type, max, priority)?;
     SWAP_INFO.write()[swap_type as usize] = Some(Arc::new(si));
     TOTAL_SWAP_PAGES.fetch_add(max - 1, Ordering::Relaxed);
     Ok(())
@@ -602,7 +610,8 @@ mod tests {
     fn header_sizes_the_area() {
         // mkswap of 64MB: last_page 16383, slots 1..=16383
         assert_eq!(parse_header(&hdr(16383, 1), u64::MAX), Ok(16384));
-        assert_eq!(parse_header(&hdr(16383, 1), 1000), Ok(1000));
+        assert!(parse_header(&hdr(16383, 1), 1000).is_err());
+        assert_eq!(parse_header(&hdr(16383, 1), 16384), Ok(16384));
         assert!(parse_header(&hdr(16383, 2), u64::MAX).is_err());
         assert!(parse_header(&hdr(0, 1), u64::MAX).is_err());
         let mut bad = hdr(10, 1);
@@ -612,7 +621,7 @@ mod tests {
 
     #[test]
     fn slot_counts_and_cache_bit() {
-        let si = SwapInfo::new((None, None), Vec::new(), 0, 4, 0);
+        let si = SwapInfo::new((None, None), Vec::new(), 0, 4, 0).unwrap();
         let a = si.alloc_slot().unwrap();
         let b = si.alloc_slot().unwrap();
         assert_eq!((a, b), (1, 2));
