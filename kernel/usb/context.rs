@@ -346,6 +346,8 @@ pub fn dci_to_endpoint(dci: u8) -> u8 {
 pub struct InputContext {
     /// DMA allocation for the context
     dma: DmaCoherent,
+    /// Bytes per context: 32, or 64 (HCCPARAMS1.CSZ)
+    ctx_size: usize,
 }
 
 impl InputContext {
@@ -353,10 +355,10 @@ impl InputContext {
     /// We round up to 4096 for page alignment
     pub const SIZE: usize = 4096;
 
-    /// Create a new Input Context
-    pub fn new<D: DmaDevice>(dev: &D) -> Option<Self> {
+    /// Create a new Input Context with `ctx_size`-byte contexts
+    pub fn new<D: DmaDevice>(dev: &D, ctx_size: usize) -> Option<Self> {
         let dma = dma_alloc_coherent(dev, Self::SIZE)?;
-        Some(Self { dma })
+        Some(Self { dma, ctx_size })
     }
 
     /// Get DMA address
@@ -371,7 +373,7 @@ impl InputContext {
 
     /// Get mutable pointer to Slot Context
     pub fn slot_mut(&mut self) -> &mut SlotContext {
-        unsafe { &mut *((self.dma.cpu_addr as usize + 0x20) as *mut SlotContext) }
+        unsafe { &mut *((self.dma.cpu_addr as usize + self.ctx_size) as *mut SlotContext) }
     }
 
     /// Get mutable pointer to Endpoint Context by DCI (1-31)
@@ -379,7 +381,7 @@ impl InputContext {
         if dci == 0 || dci > 31 {
             return None;
         }
-        let offset = 0x20 + (dci as usize * 0x20);
+        let offset = input_ep_offset(self.ctx_size, dci);
         unsafe { Some(&mut *((self.dma.cpu_addr as usize + offset) as *mut EndpointContext)) }
     }
 
@@ -389,6 +391,17 @@ impl InputContext {
             core::ptr::write_bytes(self.dma.cpu_addr, 0, Self::SIZE);
         }
     }
+}
+
+/// Offset of endpoint context `dci` in an input context: after the
+/// input control and slot contexts (xHCI 6.2.5)
+fn input_ep_offset(ctx_size: usize, dci: u8) -> usize {
+    ctx_size * (dci as usize + 1)
+}
+
+/// Bytes per context from HCCPARAMS1 (Linux CTX_SIZE: CSZ, bit 2)
+pub fn ctx_size(hcc_params1: u32) -> usize {
+    if hcc_params1 & (1 << 2) != 0 { 64 } else { 32 }
 }
 
 /// Output Device Context (also called Device Context)
@@ -404,6 +417,8 @@ impl InputContext {
 pub struct OutputDeviceContext {
     /// DMA allocation for the context
     dma: DmaCoherent,
+    /// Bytes per context: 32, or 64 (HCCPARAMS1.CSZ)
+    ctx_size: usize,
 }
 
 impl OutputDeviceContext {
@@ -411,10 +426,10 @@ impl OutputDeviceContext {
     /// We round up to 4096 for page alignment
     pub const SIZE: usize = 4096;
 
-    /// Create a new Output Device Context
-    pub fn new<D: DmaDevice>(dev: &D) -> Option<Self> {
+    /// Create a new Output Device Context with `ctx_size`-byte contexts
+    pub fn new<D: DmaDevice>(dev: &D, ctx_size: usize) -> Option<Self> {
         let dma = dma_alloc_coherent(dev, Self::SIZE)?;
-        Some(Self { dma })
+        Some(Self { dma, ctx_size })
     }
 
     /// Get DMA address
@@ -432,7 +447,7 @@ impl OutputDeviceContext {
         if dci == 0 || dci > 31 {
             return None;
         }
-        let offset = dci as usize * 0x20;
+        let offset = dci as usize * self.ctx_size;
         unsafe { Some(&*((self.dma.cpu_addr as usize + offset) as *const EndpointContext)) }
     }
 
@@ -441,5 +456,21 @@ impl OutputDeviceContext {
         unsafe {
             core::ptr::write_bytes(self.dma.cpu_addr, 0, Self::SIZE);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn context_layout() {
+        assert_eq!(ctx_size(0), 32);
+        assert_eq!(ctx_size(1 << 2), 64);
+        // EP0 (DCI 1) follows input control + slot
+        assert_eq!(input_ep_offset(32, 1), 0x40);
+        assert_eq!(input_ep_offset(64, 1), 0x80);
+        // the last endpoint still fits the 4 KiB allocation
+        assert!(input_ep_offset(64, 31) + 64 <= InputContext::SIZE);
     }
 }

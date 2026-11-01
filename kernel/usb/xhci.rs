@@ -673,6 +673,8 @@ pub struct XhciController {
     max_slots: u8,
     /// Maximum ports
     max_ports: u8,
+    /// Bytes per device context (HCCPARAMS1.CSZ)
+    ctx_size: usize,
     /// Initialized flag
     initialized: bool,
     /// Connected devices
@@ -699,6 +701,7 @@ impl XhciController {
             dcbaa_phys: 0,
             max_slots: 0,
             max_ports: 0,
+            ctx_size: 32,
             initialized: false,
             devices: Vec::new(),
             device_states: BTreeMap::new(),
@@ -800,6 +803,7 @@ impl XhciController {
         let rtsoff = self.read_cap(0x18);
 
         self.max_slots = (hcsparams1 & 0xFF) as u8;
+        self.ctx_size = super::context::ctx_size(self.read_cap(0x10));
         self.max_ports = ((hcsparams1 >> 24) & 0xFF) as u8;
 
         // Calculate register offsets
@@ -809,11 +813,12 @@ impl XhciController {
         self.port_regs = self.op_regs + 0x400;
 
         printkln!(
-            "xHCI: version={:x}.{:x}, max_slots={}, max_ports={}",
+            "xHCI: version={:x}.{:x}, max_slots={}, max_ports={}, context={} bytes",
             (hciversion >> 8) & 0xFF,
             hciversion & 0xFF,
             self.max_slots,
-            self.max_ports
+            self.max_ports,
+            self.ctx_size
         );
 
         // Stop controller if running
@@ -882,6 +887,7 @@ impl XhciController {
         let rtsoff = self.read_cap(0x18);
 
         self.max_slots = (hcsparams1 & 0xFF) as u8;
+        self.ctx_size = super::context::ctx_size(self.read_cap(0x10));
         self.max_ports = ((hcsparams1 >> 24) & 0xFF) as u8;
 
         // Calculate register offsets
@@ -891,11 +897,12 @@ impl XhciController {
         self.port_regs = self.op_regs + 0x400; // Port registers start at offset 0x400
 
         printkln!(
-            "xHCI: version={:x}.{:x}, max_slots={}, max_ports={}",
+            "xHCI: version={:x}.{:x}, max_slots={}, max_ports={}, context={} bytes",
             (hciversion >> 8) & 0xFF,
             hciversion & 0xFF,
             self.max_slots,
-            self.max_ports
+            self.max_ports,
+            self.ctx_size
         );
 
         // Stop controller if running
@@ -1228,8 +1235,10 @@ impl XhciController {
     /// This sets up the Device Context and Control Endpoint (EP0) for the device.
     fn address_device(&mut self, slot_id: u8, port: u8, speed: UsbSpeed) -> Result<(), UsbError> {
         // Create Device State with contexts
-        let output_ctx = OutputDeviceContext::new(&self.pci_dev).ok_or(UsbError::NoResources)?;
-        let mut input_ctx = InputContext::new(&self.pci_dev).ok_or(UsbError::NoResources)?;
+        let output_ctx =
+            OutputDeviceContext::new(&self.pci_dev, self.ctx_size).ok_or(UsbError::NoResources)?;
+        let mut input_ctx =
+            InputContext::new(&self.pci_dev, self.ctx_size).ok_or(UsbError::NoResources)?;
 
         // Create Transfer Ring for EP0 (Control Endpoint)
         let ep0_ring = TransferRing::new(&self.pci_dev).ok_or(UsbError::NoResources)?;
