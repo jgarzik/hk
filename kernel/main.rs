@@ -27,6 +27,7 @@ pub mod futex;
 pub mod hrtimer;
 pub mod inotify;
 pub mod io_uring;
+pub mod irq;
 pub mod kcmp;
 pub mod kmem;
 pub mod list;

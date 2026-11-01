@@ -22,11 +22,6 @@ use crate::arch::IrqSpinlock;
 /// Maximum number of SPI interrupts supported
 const MAX_SPI: usize = 256;
 
-/// Consecutive unclaimed interrupts after which a line is masked (Linux
-/// note_interrupt's "nobody cared"; a stuck level-triggered line would
-/// otherwise storm forever)
-const UNHANDLED_LIMIT: u32 = 100_000;
-
 /// IRQ handler function signature (same on all arches)
 ///
 /// Arguments:
@@ -50,7 +45,7 @@ unsafe impl Sync for IrqEntry {}
 /// One SPI line
 struct IrqLine {
     handlers: Vec<IrqEntry>,
-    unhandled: u32,
+    spurious: crate::irq::Spurious,
 }
 
 /// IRQ handler table for SPIs (32-287)
@@ -62,7 +57,7 @@ impl IrqTable {
     const fn new() -> Self {
         const EMPTY: IrqLine = IrqLine {
             handlers: Vec::new(),
-            unhandled: 0,
+            spurious: crate::irq::Spurious::new(),
         };
         Self {
             lines: [EMPTY; MAX_SPI],
@@ -105,7 +100,7 @@ pub fn register_irq_handler(
             return Err("Handler with this ID already registered");
         }
         line.handlers.push(IrqEntry { handler, data, id });
-        line.unhandled = 0;
+        line.spurious.reset();
         line.handlers.len() == 1
     };
     if first {
@@ -149,13 +144,13 @@ pub fn dispatch_irq(irq: u32) -> bool {
         handled |= (entry.handler)(irq, entry.data);
         crate::sync::lockdep::irq_exit();
     }
-    if handled {
-        line.unhandled = 0;
-    } else {
-        line.unhandled += 1;
-        if line.handlers.is_empty() || line.unhandled >= UNHANDLED_LIMIT {
-            gic::disable_spi(irq);
-        }
+    let bad = !line.handlers.is_empty() && line.spurious.note(handled, crate::time::monotonic_ns());
+    if bad || line.handlers.is_empty() {
+        gic::disable_spi(irq);
+    }
+    drop(table);
+    if bad {
+        crate::irq::report_nobody_cared(irq);
     }
     handled
 }
