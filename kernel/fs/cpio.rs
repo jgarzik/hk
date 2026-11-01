@@ -153,6 +153,22 @@ fn do_entry(root: &Arc<Dentry>, e: &Entry<'_>, links: &mut Links) -> Result<bool
         ramfs_mkpath_with_timestamp(root, parent_path, e.uid, e.gid, e.mtime).map_err(fs_err)?
     };
     let dir = parent.get_inode().ok_or(CpioError::KernelError)?;
+    // Linux maybe_link: a later name of a hard-linked file replaces
+    // whatever has that name (clean_path(collected, 0)) and links to
+    // the first; the body, if this name carries it, goes to the file
+    let key = (e.dev.0, e.dev.1, e.ino);
+    if ty == S_IFREG
+        && e.nlink >= 2
+        && let Some((_, inode)) = links.iter().find(|(k, _)| *k == key)
+    {
+        let inode = inode.clone();
+        clean_path(&parent, &dir, name, u32::MAX);
+        dir.i_op.link(&dir, name, &inode).map_err(fs_err)?;
+        if !e.body.is_empty() {
+            ramfs_fill_file(&inode, e.body).map_err(fs_err)?;
+        }
+        return Ok(true);
+    }
     let existing = clean_path(&parent, &dir, name, ty);
     match ty {
         S_IFREG if existing.is_some() => {
@@ -165,22 +181,14 @@ fn do_entry(root: &Arc<Dentry>, e: &Entry<'_>, links: &mut Links) -> Result<bool
             old.set_uid(e.uid);
             old.set_gid(e.gid);
             old.set_mtime(e.mtime);
+            if e.nlink >= 2 {
+                links.push((key, old));
+            }
         }
         // Another entry of the same type stays (Linux: mknod/symlink
         // fail with EEXIST and are skipped)
         _ if existing.is_some() => {}
         S_IFREG => {
-            let key = (e.dev.0, e.dev.1, e.ino);
-            if e.nlink >= 2
-                && let Some((_, inode)) = links.iter().find(|(k, _)| *k == key)
-            {
-                // A later name of a hard-linked file
-                dir.i_op.link(&dir, name, inode).map_err(fs_err)?;
-                if !e.body.is_empty() {
-                    ramfs_fill_file(inode, e.body).map_err(fs_err)?;
-                }
-                return Ok(true);
-            }
             let mode = InodeMode(e.mode as u16);
             let d = ramfs_create_file_with_timestamp(
                 &parent, name, e.body, mode, e.uid, e.gid, e.mtime,

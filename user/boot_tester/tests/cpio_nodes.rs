@@ -10,6 +10,9 @@
 //!   is unpacked (1:3, usable like /dev/null)
 //! - CPIO_OVERLAY: a file in the second archive replaces the same name
 //!   from the first (Linux opens it O_TRUNC)
+//! - CPIO_OVERLAY_LINK: two names of one hard-linked file in the second
+//!   archive, over two separate files of the first, end up one inode
+//!   holding the second archive's body (Linux maybe_link)
 
 use super::helpers::{print, println};
 use hk_syscall::{O_RDONLY, O_WRONLY, Stat, sys_close, sys_open, sys_read, sys_stat, sys_write};
@@ -25,6 +28,20 @@ pub fn run_tests() {
     fifo();
     concat();
     overlay();
+    overlay_link();
+}
+
+fn overlay_link() {
+    let (Some(a), Some(b)) = (stat(b"/cpio_test/hl_a\0"), stat(b"/cpio_test/hl_b\0")) else {
+        return report(b"CPIO_OVERLAY_LINK", b"missing");
+    };
+    if a.st_ino != b.st_ino {
+        return report(b"CPIO_OVERLAY_LINK", b"not one inode");
+    }
+    let mut x = [0u8; 16];
+    let n = read_all(b"/cpio_test/hl_a\0", &mut x);
+    let ok = n == 8 && &x[..8] == b"linked2\n";
+    report(b"CPIO_OVERLAY_LINK", if ok { b"" } else { b"body" });
 }
 
 fn overlay() {
