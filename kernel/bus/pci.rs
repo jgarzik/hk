@@ -528,6 +528,16 @@ impl PciDeviceHeader {
     }
 }
 
+/// A BAR's size from the mask read back after writing all ones (`lo`,
+/// and `hi` for the upper half of a 64-bit BAR, else 0): the lowest
+/// address bit that sticks (Linux pci_size). Upper address bits may be
+/// hardwired to zero, so the size is not the mask's complement.
+fn bar_size_from_mask(io: bool, lo: u32, hi: u32) -> u64 {
+    let lo = if io { lo & !0x3 } else { lo & !0xF };
+    let mask = (hi as u64) << 32 | lo as u64;
+    mask.isolate_lowest_one()
+}
+
 /// Represents a discovered PCI device
 #[derive(Debug, Clone)]
 pub struct PciDevice {
@@ -605,18 +615,8 @@ impl PciDevice {
         if lo == 0 || lo == 0xFFFF_FFFF {
             return 0;
         }
-        let lo = if orig & 1 != 0 {
-            lo & !0x3 | 0xFFFF_0000
-        } else {
-            lo & !0xF
-        };
-        let hi = if wide {
-            size_of(off + 4).1
-        } else {
-            0xFFFF_FFFF
-        };
-        let mask = (hi as u64) << 32 | lo as u64;
-        (!mask).wrapping_add(1)
+        let hi = if wide { size_of(off + 4).1 } else { 0 };
+        bar_size_from_mask(orig & 1 != 0, lo, hi)
     }
 
     /// Set the DMA mask for streaming DMA mappings
@@ -1300,5 +1300,26 @@ mod tests {
         // An all-ones read (device gone) ends the walk
         let gone = [0xFFu8; 256];
         assert!(walk(&gone, 0x40).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod bar_size_tests {
+    use super::bar_size_from_mask;
+
+    #[test]
+    fn bar_size_masks() {
+        // 16 KiB 32-bit memory BAR, prefetchable bit set
+        assert_eq!(bar_size_from_mask(false, 0xFFFF_C008, 0), 0x4000);
+        // 64-bit BAR decoding only 40 address bits (upper bits hardwired 0)
+        assert_eq!(bar_size_from_mask(false, 0xFFFF_C00C, 0x0000_00FF), 0x4000);
+        // 8 GiB 64-bit BAR
+        assert_eq!(
+            bar_size_from_mask(false, 0x0000_000C, 0xFFFF_FFFE),
+            0x2_0000_0000
+        );
+        // 32-byte I/O BAR whose upper 16 bits read 0
+        assert_eq!(bar_size_from_mask(true, 0x0000_FFE1, 0), 0x20);
+        assert_eq!(bar_size_from_mask(false, 0, 0), 0);
     }
 }
