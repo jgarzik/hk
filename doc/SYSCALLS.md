@@ -5,7 +5,7 @@
 - [x] vfork (x86-64 only, legacy; use clone with CLONE_VFORK)
 - [x] clone (Linux thread/process creation)
 - [x] clone3
-- [x] execve
+- [x] execve (ELF, #! scripts up to 5 levels)
 - [x] execveat (dirfd, AT_EMPTY_PATH for fexecve, AT_SYMLINK_NOFOLLOW)
 - [x] _exit
 - [x] set_tid_address

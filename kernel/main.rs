@@ -65,6 +65,7 @@ pub mod virtio;
 // Multiboot2 header is in boot.S
 
 mod arch;
+mod binfmt_script;
 pub mod bpf;
 pub mod cgroup;
 mod cmdline;

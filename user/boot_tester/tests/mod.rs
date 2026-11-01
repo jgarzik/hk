@@ -108,6 +108,7 @@ pub mod fifo;
 pub mod groups;
 pub mod kmsg;
 pub mod exec_at;
+pub mod script_exec;
 pub mod gencalls;
 pub mod sysinfo;
 pub mod tcp;
@@ -173,6 +174,7 @@ pub fn run_all_tests() {
     sysinfo::run_tests();
     gencalls::run_tests();
     exec_at::run_tests();
+    script_exec::run_tests();
     clock_ids::run_tests();
     dev_mem::run_tests();
     kmsg::run_tests();

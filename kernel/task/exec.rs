@@ -45,6 +45,7 @@ pub const EFAULT: i32 = 14; // Bad address
 pub const E2BIG: i32 = 7; // Argument list too long
 pub const EAGAIN: i32 = 11; // Try again
 pub const EINVAL: i32 = 22; // Invalid argument
+pub const ELOOP: i32 = 40; // Too many levels of symbolic links
 
 /// Maximum path length (matching Linux PATH_MAX)
 const PATH_MAX: usize = 4096;
@@ -515,6 +516,43 @@ fn apply_relocations(
 
 /// The executable being loaded, read in place (Linux bprm->file and
 /// elf_read): never copied whole into memory
+/// Follow `#!` lines from the opened file to the program that runs
+/// (Linux exec_binprm with binfmt_script): each script level puts its
+/// interpreter (and argument) in front of argv and opens it; more than
+/// MAX_DEPTH levels is ELOOP. A script named through a close-on-exec fd
+/// (execveat) cannot be reopened by its interpreter: ENOENT.
+fn resolve_scripts(
+    mut file: Arc<File>,
+    mut argv: Vec<Vec<u8>>,
+    path: &[u8],
+    path_inaccessible: bool,
+) -> Result<(Arc<File>, Vec<Vec<u8>>), i32> {
+    use crate::binfmt_script::{BINPRM_BUF_SIZE, MAX_DEPTH, parse, rewrite_argv};
+    let mut name = path.to_vec();
+    for depth in 0.. {
+        let head = {
+            let image = FileImage::new(&file)?;
+            let n = (image.size as usize).min(BINPRM_BUF_SIZE);
+            crate::elf::ElfSource::read_at(&image, 0, n).ok_or(EIO)?
+        };
+        let (interp, arg) = match parse(&head) {
+            None => break,
+            Some(r) => r?,
+        };
+        if depth >= MAX_DEPTH {
+            return Err(ELOOP);
+        }
+        if path_inaccessible {
+            return Err(ENOENT);
+        }
+        argv = rewrite_argv(&argv, interp, arg, &name);
+        name = interp.to_vec();
+        let p = core::str::from_utf8(interp).map_err(|_| ENOENT)?;
+        file = kernel_open_exec(p)?;
+    }
+    Ok((file, argv))
+}
+
 struct FileImage<'a> {
     file: &'a File,
     /// Size when exec opened it (segments past it read as zeros)
@@ -662,7 +700,7 @@ pub fn do_execve<FA: FrameAlloc<PhysAddr = u64>>(
         Ok(s) => kernel_open_exec(s),
         Err(_) => Err(ENOENT),
     };
-    exec_file(path, open, argv, envp, frame_alloc)
+    exec_file(path, open, false, argv, envp, frame_alloc)
 }
 
 /// do_execve with the file opened by `open` from the name (Linux
@@ -671,6 +709,7 @@ pub fn do_execve<FA: FrameAlloc<PhysAddr = u64>>(
 fn exec_file<FA, F>(
     path: Vec<u8>,
     open: F,
+    path_inaccessible: bool,
     argv: Vec<Vec<u8>>,
     envp: Vec<Vec<u8>>,
     frame_alloc: &mut FA,
@@ -690,6 +729,10 @@ where
     let pathname = &path[..];
     let file = match open(pathname) {
         Ok(f) => f,
+        Err(e) => return -e,
+    };
+    let (file, argv) = match resolve_scripts(file, argv, pathname, path_inaccessible) {
+        Ok(r) => r,
         Err(e) => return -e,
     };
     // To the least loaded CPU while the footprint is small (Linux
@@ -921,9 +964,18 @@ pub fn sys_execveat(dirfd: i32, pathname: u64, argv_ptr: u64, envp_ptr: u64, fla
         return -(E2BIG as i64);
     }
     let name = exec_name(dirfd, &path);
+    // Linux BINPRM_FLAGS_PATH_INACCESSIBLE: the program came through a
+    // close-on-exec fd, so a script's interpreter could not open it
+    let via_fd = dirfd != AT_FDCWD && path.first() != Some(&b'/');
+    let inaccessible = via_fd
+        && crate::fs::syscall::current_fd_table()
+            .lock()
+            .get_fd_flags(dirfd)
+            & crate::pipe::FD_CLOEXEC
+            != 0;
     let open = |_: &[u8]| exec_lookup(dirfd, &path, flags).and_then(crate::fs::open_exec);
     let mut frame_alloc = FrameAllocRef(&FRAME_ALLOCATOR);
-    exec_file(name, open, argv, envp, &mut frame_alloc) as i64
+    exec_file(name, open, inaccessible, argv, envp, &mut frame_alloc) as i64
 }
 
 /// bprm->filename for execveat: the path itself when absolute or from
