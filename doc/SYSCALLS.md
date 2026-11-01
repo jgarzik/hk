@@ -6,7 +6,7 @@
 - [x] clone (Linux thread/process creation)
 - [x] clone3
 - [x] execve
-- [x] execveat
+- [x] execveat (dirfd, AT_EMPTY_PATH for fexecve, AT_SYMLINK_NOFOLLOW)
 - [x] _exit
 - [x] set_tid_address
 - [x] exit_group

@@ -2,6 +2,7 @@
 //!
 //! Replaces the current process image with a new program.
 
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 #[cfg(target_arch = "x86_64")]
@@ -43,6 +44,7 @@ pub const EIO: i32 = 5; // I/O error
 pub const EFAULT: i32 = 14; // Bad address
 pub const E2BIG: i32 = 7; // Argument list too long
 pub const EAGAIN: i32 = 11; // Try again
+pub const EINVAL: i32 = 22; // Invalid argument
 
 /// Maximum path length (matching Linux PATH_MAX)
 const PATH_MAX: usize = 4096;
@@ -656,6 +658,27 @@ pub fn do_execve<FA: FrameAlloc<PhysAddr = u64>>(
     envp: Vec<Vec<u8>>,
     frame_alloc: &mut FA,
 ) -> i32 {
+    let open = |p: &[u8]| match core::str::from_utf8(p) {
+        Ok(s) => kernel_open_exec(s),
+        Err(_) => Err(ENOENT),
+    };
+    exec_file(path, open, argv, envp, frame_alloc)
+}
+
+/// do_execve with the file opened by `open` from the name (Linux
+/// bprm->filename: the path, or /dev/fd/N[/path] for execveat), once
+/// the credential guard is held
+fn exec_file<FA, F>(
+    path: Vec<u8>,
+    open: F,
+    argv: Vec<Vec<u8>>,
+    envp: Vec<Vec<u8>>,
+    frame_alloc: &mut FA,
+) -> i32
+where
+    FA: FrameAlloc<PhysAddr = u64>,
+    F: FnOnce(&[u8]) -> Result<Arc<File>, i32>,
+{
     // Linux prepare_bprm_creds: the thread group's cred_guard_mutex from
     // the first credential check until the new image is in place, so
     // ptrace attach and mm_access never see the new mm with the old
@@ -665,14 +688,7 @@ pub fn do_execve<FA: FrameAlloc<PhysAddr = u64>>(
         return -e;
     }
     let pathname = &path[..];
-    // Convert pathname to string for VFS lookup
-    let path_str = match core::str::from_utf8(pathname) {
-        Ok(s) => s,
-        Err(_) => return -ENOENT,
-    };
-
-    // Open the executable file using the kernel-internal VFS function
-    let file = match kernel_open_exec(path_str) {
+    let file = match open(pathname) {
         Ok(f) => f,
         Err(e) => return -e,
     };
@@ -866,14 +882,17 @@ pub const AT_FDCWD: i32 = -100;
 /// AT_EMPTY_PATH - path is empty, use the fd directly
 pub const AT_EMPTY_PATH: i32 = 0x1000;
 
+/// AT_SYMLINK_NOFOLLOW - a final symlink is not followed (ELOOP)
+pub const AT_SYMLINK_NOFOLLOW: i32 = 0x100;
+
 /// sys_execveat - execute a program relative to a directory file descriptor
+/// (Linux do_execveat_common)
 ///
-/// # Arguments
-/// * `dirfd` - Directory file descriptor, or AT_FDCWD for current directory
-/// * `pathname` - Path to the executable (relative to dirfd, or absolute)
-/// * `argv` - Pointer to null-terminated array of argument strings
-/// * `envp` - Pointer to null-terminated array of environment strings
-/// * `flags` - AT_EMPTY_PATH to execute dirfd itself, 0 otherwise
+/// A relative `pathname` is resolved from `dirfd` (AT_FDCWD: the current
+/// directory); an empty one with AT_EMPTY_PATH executes dirfd's own file
+/// (fexecve); AT_SYMLINK_NOFOLLOW makes a final symlink ELOOP. Other
+/// flags are EINVAL. The program's name (AT_EXECFN, comm) is the path,
+/// or "/dev/fd/N" / "/dev/fd/N/path" when it came through dirfd.
 ///
 /// # Returns
 /// On success, does not return (new program is executing).
@@ -882,47 +901,82 @@ pub fn sys_execveat(dirfd: i32, pathname: u64, argv_ptr: u64, envp_ptr: u64, fla
     use crate::FRAME_ALLOCATOR;
     use crate::frame_alloc::FrameAllocRef;
 
-    // For now, we only support AT_FDCWD with an absolute path
-    // Relative paths need: fd table lookup, directory resolution from fd
-    if dirfd != AT_FDCWD && flags & AT_EMPTY_PATH == 0 {
-        // We don't support relative paths to arbitrary fds yet
-        // Return ENOENT for now
-        return -(ENOENT as i64);
+    if flags & !(AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW) != 0 {
+        return -(EINVAL as i64);
     }
-
-    // Copy pathname from user space
     let path = match copy_string_from_user(pathname, PATH_MAX) {
         Ok(p) => p,
         Err(e) => return -(e as i64),
     };
-
-    // For AT_FDCWD, the path must be absolute or we treat it as relative to cwd
-    // Our VFS currently treats relative paths as if relative to /
-    // This is a simplification
-
-    // Copy argv from user space
     let argv = match copy_string_array_from_user(argv_ptr, 1024) {
         Ok(a) => a,
         Err(e) => return -(e as i64),
     };
-
-    // Copy envp from user space
     let envp = match copy_string_array_from_user(envp_ptr, 1024) {
         Ok(e) => e,
         Err(e) => return -(e as i64),
     };
-
-    // Check total size of arguments
     let total_bytes = total_string_bytes(&argv) + total_string_bytes(&envp);
     if total_bytes > MAX_ARG_PAGES * PAGE_SIZE as usize {
         return -(E2BIG as i64);
     }
-
-    // Get frame allocator
+    let name = exec_name(dirfd, &path);
+    let open = |_: &[u8]| exec_lookup(dirfd, &path, flags).and_then(crate::fs::open_exec);
     let mut frame_alloc = FrameAllocRef(&FRAME_ALLOCATOR);
+    exec_file(name, open, argv, envp, &mut frame_alloc) as i64
+}
 
-    // Do the exec - on success this never returns, on error returns negative errno
-    let result = do_execve(path, argv, envp, &mut frame_alloc);
-    // If we get here, exec failed - result is already negative
-    result as i64
+/// bprm->filename for execveat: the path itself when absolute or from
+/// the current directory, else "/dev/fd/N" with "/path" if not empty
+fn exec_name(dirfd: i32, path: &[u8]) -> Vec<u8> {
+    if dirfd == AT_FDCWD || path.first() == Some(&b'/') {
+        return path.to_vec();
+    }
+    let mut name = alloc::format!("/dev/fd/{dirfd}").into_bytes();
+    if !path.is_empty() {
+        name.push(b'/');
+        name.extend_from_slice(path);
+    }
+    name
+}
+
+/// The dentry execveat runs: `path` from dirfd (or the current
+/// directory, or the root if absolute), or with AT_EMPTY_PATH and an
+/// empty path dirfd's own file
+fn exec_lookup(dirfd: i32, path: &[u8], flags: i32) -> Result<Arc<crate::fs::Dentry>, i32> {
+    use crate::fs::path::{LookupFlags, lookup_path_at};
+    use crate::fs::path_ref::Path;
+    use crate::fs::syscall::current_fd_table;
+    let fd_file = || {
+        current_fd_table()
+            .lock()
+            .get(dirfd)
+            .ok_or(crate::error::KernelError::BadFd as i32)
+    };
+    if path.is_empty() {
+        if flags & AT_EMPTY_PATH == 0 {
+            return Err(ENOENT);
+        }
+        if dirfd == AT_FDCWD {
+            return percpu::current_cwd()
+                .map(|p| p.dentry.clone())
+                .ok_or(ENOENT);
+        }
+        return Ok(fd_file()?.dentry.clone());
+    }
+    let path = core::str::from_utf8(path).map_err(|_| ENOENT)?;
+    let start = if path.starts_with('/') {
+        None
+    } else if dirfd == AT_FDCWD {
+        percpu::current_cwd()
+    } else {
+        let file = fd_file()?;
+        if !file.is_dir() {
+            return Err(crate::error::KernelError::NotDirectory as i32);
+        }
+        Path::from_dentry(file.dentry.clone())
+    };
+    let mut lf = LookupFlags::open();
+    lf.follow = flags & AT_SYMLINK_NOFOLLOW == 0;
+    lookup_path_at(start, path, lf).map_err(|e| e as i32)
 }
