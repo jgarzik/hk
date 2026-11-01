@@ -19,9 +19,25 @@ use crate::arch::{CurrentArch, FrameAlloc, IoremapOps, phys_to_virt};
 use crate::bus::bus::{BusContext, BusDevice, BusDriver};
 use crate::bus::driver::{Device, DriverError};
 use crate::bus::pci::PciDevice;
+use crate::delay::{poll_timeout, udelay};
 use crate::dma::{DmaDirection, dma_map_single, dma_unmap_single};
 use crate::downcast_bus_device;
 use crate::printkln;
+
+/// Halt and start handshakes (Linux XHCI_MAX_HALT_USEC)
+const XHCI_MAX_HALT_US: u64 = 32_000;
+/// Reset handshakes at initialization (Linux XHCI_RESET_LONG_USEC)
+const XHCI_RESET_LONG_US: u64 = 10_000_000;
+/// Reset handshakes later on (Linux XHCI_RESET_SHORT_USEC)
+const XHCI_RESET_SHORT_US: u64 = 250_000;
+/// Command completion (Linux XHCI_CMD_DEFAULT_TIMEOUT)
+const XHCI_CMD_US: u64 = 5_000_000;
+/// Transfer completion (Linux USB_CTRL_GET_TIMEOUT)
+const XHCI_TRANSFER_US: u64 = 5_000_000;
+/// Root port reset (Linux HUB_RESET_TIMEOUT)
+const PORT_RESET_US: u64 = 800_000;
+
+const PCI_VENDOR_INTEL: u16 = 0x8086;
 
 use super::context::{InputContext, OutputDeviceContext, endpoint_to_dci};
 use super::transfer::{CompletionCode, TransferRing, Trb as TransferTrb, TrbType};
@@ -798,7 +814,7 @@ impl XhciController {
         self.halt()?;
 
         // Reset controller
-        self.reset_controller()?;
+        self.reset_controller(XHCI_RESET_LONG_US)?;
 
         // Allocate Device Context Base Address Array
         let dcbaa_phys = frame_alloc.alloc_frame().ok_or(UsbError::NoResources)?;
@@ -879,7 +895,7 @@ impl XhciController {
         self.halt()?;
 
         // Reset controller
-        self.reset_controller()?;
+        self.reset_controller(XHCI_RESET_LONG_US)?;
 
         // Allocate Device Context Base Address Array
         let dcbaa_phys = frame_alloc.alloc_frame().ok_or(UsbError::NoResources)?;
@@ -915,41 +931,45 @@ impl XhciController {
         let cmd = self.read_op(0x00);
         self.write_op(0x00, cmd & !usbcmd::RUN_STOP);
 
-        // Wait for HCH (halted) bit
-        for _ in 0..1000 {
-            if (self.read_op(0x04) & usbsts::HCH) != 0 {
-                return Ok(());
-            }
-            // Small delay
-            for _ in 0..1000 {
-                core::hint::spin_loop();
-            }
-        }
-
-        printkln!("xHCI: Timeout waiting for halt");
-        Err(UsbError::Timeout)
+        // Wait for HCH (halted) bit, polled per microframe (Linux
+        // xhci_halt)
+        let halted = || self.read_op(0x04) & usbsts::HCH != 0;
+        poll_timeout(XHCI_MAX_HALT_US, 125, halted).map_err(|_| {
+            printkln!("xHCI: Timeout waiting for halt");
+            UsbError::Timeout
+        })
     }
 
-    /// Reset the controller
-    fn reset_controller(&self) -> Result<(), UsbError> {
-        // Set reset bit
-        self.write_op(0x00, usbcmd::HCRST);
+    /// Reset the halted controller (Linux xhci_reset)
+    fn reset_controller(&self, timeout_us: u64) -> Result<(), UsbError> {
+        let sts = self.read_op(0x04);
+        if sts == !0 {
+            printkln!("xHCI: Host not accessible, reset failed.");
+            return Err(UsbError::NoDevice);
+        }
+        if sts & usbsts::HCH == 0 {
+            printkln!("xHCI: Host controller not halted, aborting reset.");
+            return Err(UsbError::Timeout);
+        }
+        let cmd = self.read_op(0x00);
+        self.write_op(0x00, cmd | usbcmd::HCRST);
 
-        // Wait for reset to complete
-        for _ in 0..1000 {
-            let cmd = self.read_op(0x00);
-            let sts = self.read_op(0x04);
-            if (cmd & usbcmd::HCRST) == 0 && (sts & usbsts::CNR) == 0 {
-                return Ok(());
-            }
-            // Small delay
-            for _ in 0..1000 {
-                core::hint::spin_loop();
-            }
+        // Intel xHCs need 1 ms after setting HCRST before any register
+        // access, or that access "may result in a system hang very
+        // rarely" (Linux XHCI_INTEL_HOST)
+        if self.pci_dev.header.vendor_id == PCI_VENDOR_INTEL {
+            udelay(1000);
         }
 
-        printkln!("xHCI: Timeout waiting for reset");
-        Err(UsbError::Timeout)
+        let reset_done = || self.read_op(0x00) & usbcmd::HCRST == 0;
+        // No register but USBSTS until Controller Not Ready clears
+        let ready = || self.read_op(0x04) & usbsts::CNR == 0;
+        poll_timeout(timeout_us, 10, reset_done)
+            .and_then(|_| poll_timeout(timeout_us, 10, ready))
+            .map_err(|_| {
+                printkln!("xHCI: Timeout waiting for reset");
+                UsbError::Timeout
+            })
     }
 
     /// Configure the controller
@@ -1031,43 +1051,28 @@ impl XhciController {
         let cmd = self.read_op(0x00);
         self.write_op(0x00, cmd | usbcmd::RUN_STOP);
 
-        // Wait for not halted
-        for _ in 0..1000 {
-            if (self.read_op(0x04) & usbsts::HCH) == 0 {
-                return Ok(());
-            }
-            // Small delay
-            for _ in 0..1000 {
-                core::hint::spin_loop();
-            }
-        }
-
-        printkln!("xHCI: Timeout waiting for start");
-        Err(UsbError::Timeout)
+        // Wait for not halted (Linux xhci_start)
+        let running = || self.read_op(0x04) & usbsts::HCH == 0;
+        poll_timeout(XHCI_MAX_HALT_US, 10, running).map_err(|_| {
+            printkln!("xHCI: Timeout waiting for start");
+            UsbError::Timeout
+        })
     }
 
     /// Wait for a command completion event
     fn wait_for_command(&mut self, _trb_addr: u64) -> Result<Trb, UsbError> {
         // Always poll the event ring - interrupt is just an optimization hint
         // to reduce polling frequency when we know hardware hasn't signaled yet
-        for _ in 0..10000 {
+        let mut result = None;
+        let _ = poll_timeout(XHCI_CMD_US, 0, || {
             // Clear any pending interrupt flag (to allow future interrupts)
             let _ = XHCI_IRQ_STATE
                 .interrupt_pending
                 .swap(false, Ordering::AcqRel);
-
-            // Always check the event ring
-            if let Some(result) = self.try_dequeue_command_event() {
-                return result;
-            }
-
-            // Small delay between polls
-            for _ in 0..100 {
-                core::hint::spin_loop();
-            }
-        }
-
-        Err(UsbError::Timeout)
+            result = self.try_dequeue_command_event();
+            result.is_some()
+        });
+        result.unwrap_or(Err(UsbError::Timeout))
     }
 
     /// Try to dequeue a command completion event
@@ -1156,20 +1161,17 @@ impl XhciController {
         // Set port reset, preserve power
         self.write_port(port, 0, (portsc & 0x0E00_00E0) | portsc::PR);
 
-        // Wait for reset to complete
-        for _ in 0..1000 {
-            let portsc = self.read_port(port, 0);
-            if (portsc & portsc::PR) == 0 && (portsc & portsc::PED) != 0 {
-                // Clear status change bits
-                self.write_port(port, 0, portsc | portsc::CSC | portsc::PRC);
-                return Ok(());
-            }
-            for _ in 0..1000 {
-                core::hint::spin_loop();
-            }
-        }
-
-        Err(UsbError::Timeout)
+        // Wait for reset to complete (Linux hub_port_wait_reset:
+        // HUB_RESET_TIMEOUT)
+        let mut portsc = 0;
+        let done = || {
+            portsc = self.read_port(port, 0);
+            portsc & portsc::PR == 0 && portsc & portsc::PED != 0
+        };
+        poll_timeout(PORT_RESET_US, 100, done).map_err(|_| UsbError::Timeout)?;
+        // Clear status change bits
+        self.write_port(port, 0, portsc | portsc::CSC | portsc::PRC);
+        Ok(())
     }
 
     /// Address a device (xHCI Address Device command)
@@ -1367,30 +1369,25 @@ impl XhciController {
     /// Wait for a transfer completion event
     fn wait_for_transfer(&mut self, slot_id: u8, ep_dci: u8) -> Result<(u32, u8), UsbError> {
         // Always poll the event ring - interrupt is just an optimization hint
-        for i in 0..100000 {
+        let mut result = None;
+        let _ = poll_timeout(XHCI_TRANSFER_US, 0, || {
             // Clear any pending interrupt flag
             let _ = XHCI_IRQ_STATE
                 .interrupt_pending
                 .swap(false, Ordering::AcqRel);
-
-            // Always check the event ring
-            if let Some(result) = self.try_dequeue_transfer_event(slot_id, ep_dci) {
-                TRANSFER_COUNT.fetch_add(1, Ordering::Relaxed);
-                if usb_trace() {
-                    printkln!(
-                        "xHCI TRACE: transfer complete slot={} dci={} iter={}",
-                        slot_id,
-                        ep_dci,
-                        i
-                    );
-                }
-                return result;
+            result = self.try_dequeue_transfer_event(slot_id, ep_dci);
+            result.is_some()
+        });
+        if let Some(result) = result {
+            TRANSFER_COUNT.fetch_add(1, Ordering::Relaxed);
+            if usb_trace() {
+                printkln!(
+                    "xHCI TRACE: transfer complete slot={} dci={}",
+                    slot_id,
+                    ep_dci
+                );
             }
-
-            // Small delay between polls
-            for _ in 0..100 {
-                core::hint::spin_loop();
-            }
+            return result;
         }
 
         // More detailed timeout message for debugging
@@ -1776,7 +1773,7 @@ impl Device for XhciController {
 impl UsbController for XhciController {
     fn reset(&mut self) -> Result<(), UsbError> {
         self.halt()?;
-        self.reset_controller()
+        self.reset_controller(XHCI_RESET_SHORT_US)
     }
 
     fn start(&mut self) -> Result<(), UsbError> {
