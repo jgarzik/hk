@@ -18,7 +18,12 @@ use crate::printkln;
 // I/O syscalls
 /// fcntl(fd, cmd, arg)
 pub const SYS_FCNTL: u64 = 25;
+pub const SYS_DUP: u64 = 23;
 pub const SYS_DUP3: u64 = 24;
+pub const SYS_GETCWD: u64 = 17;
+pub const SYS_EXECVEAT: u64 = 281;
+pub const SYS_GETTIMEOFDAY: u64 = 169;
+pub const SYS_SETTIMEOFDAY: u64 = 170;
 pub const SYS_PIPE2: u64 = 59;
 pub const SYS_PPOLL: u64 = 73;
 pub const SYS_PSELECT6: u64 = 72;
@@ -529,6 +534,7 @@ pub fn aarch64_syscall_dispatch(
         sys_chroot,
         sys_close,
         sys_close_range,
+        sys_dup,
         sys_dup3,
         sys_faccessat,
         sys_faccessat2,
@@ -593,7 +599,7 @@ pub fn aarch64_syscall_dispatch(
         sys_write,
         sys_writev,
     };
-    use crate::task::exec::sys_execve;
+    use crate::task::exec::{sys_execve, sys_execveat};
     use crate::task::percpu;
     use crate::task::syscall::{
         sys_clone, sys_exit, sys_getegid, sys_geteuid, sys_getgid, sys_getpgid, sys_getpid,
@@ -602,7 +608,8 @@ pub fn aarch64_syscall_dispatch(
     };
     use crate::time_syscall::{
         sys_adjtimex, sys_clock_getres, sys_clock_gettime, sys_clock_nanosleep, sys_clock_settime,
-        sys_eventfd2, sys_nanosleep, sys_timerfd_create, sys_timerfd_gettime, sys_timerfd_settime,
+        sys_eventfd2, sys_gettimeofday, sys_nanosleep, sys_settimeofday, sys_timerfd_create,
+        sys_timerfd_gettime, sys_timerfd_settime,
     };
 
     // Account for entering kernel mode
@@ -636,7 +643,9 @@ pub fn aarch64_syscall_dispatch(
         SYS_CLOSE_RANGE => sys_close_range(arg0 as u32, arg1 as u32, arg2 as u32) as u64,
         SYS_LSEEK => sys_lseek(arg0 as i32, arg1 as i64, arg2 as i32) as u64,
         SYS_FTRUNCATE => sys_ftruncate(arg0 as i32, arg1 as i64) as u64,
+        SYS_DUP => sys_dup(arg0 as i32) as u64,
         SYS_DUP3 => sys_dup3(arg0 as i32, arg1 as i32, arg2 as u32) as u64,
+        SYS_GETCWD => crate::fs::nav::sys_getcwd(arg0, arg1) as u64,
         SYS_FCNTL => sys_fcntl(arg0 as i32, arg1 as i32, arg2) as u64,
         SYS_PIPE2 => sys_pipe2(arg0, arg1 as u32) as u64,
         SYS_PPOLL => sys_ppoll(arg0, arg1 as u32, arg2, arg3, arg4) as u64,
@@ -824,6 +833,8 @@ pub fn aarch64_syscall_dispatch(
 
         // Time syscalls
         SYS_CLOCK_GETTIME => sys_clock_gettime(arg0 as i32, arg1) as u64,
+        SYS_GETTIMEOFDAY => sys_gettimeofday(arg0, arg1) as u64,
+        SYS_SETTIMEOFDAY => sys_settimeofday(arg0, arg1) as u64,
         SYS_CLOCK_GETRES => sys_clock_getres(arg0 as i32, arg1) as u64,
         SYS_CLOCK_SETTIME => sys_clock_settime(arg0 as i32, arg1) as u64,
         SYS_NANOSLEEP => sys_nanosleep(arg0, arg1) as u64,
@@ -918,6 +929,7 @@ pub fn aarch64_syscall_dispatch(
             sys_clone3(arg0, arg1) as u64
         }
         SYS_EXECVE => sys_execve(arg0, arg1, arg2) as u64,
+        SYS_EXECVEAT => sys_execveat(arg0 as i32, arg1, arg2, arg3, arg4 as i32) as u64,
         SYS_WAIT4 => sys_wait4(arg0 as i64, arg1, arg2 as i32, arg3) as u64,
 
         // Personality (execution domain)

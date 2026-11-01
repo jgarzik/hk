@@ -36,7 +36,6 @@ pub struct Timeval {
 }
 
 /// Linux timezone structure for gettimeofday (deprecated, usually ignored)
-#[cfg(target_arch = "x86_64")]
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Timezone {
@@ -85,7 +84,6 @@ pub fn sys_clock_gettime(clockid: i32, tp: u64) -> i64 {
 /// * `tz` - Pointer to user space timezone structure (may be NULL, deprecated)
 ///
 /// Returns 0 on success, negative errno on error.
-#[cfg(target_arch = "x86_64")]
 pub fn sys_gettimeofday(tv: u64, tz: u64) -> i64 {
     // Get wall-clock time (realtime)
     if tv != 0 {
@@ -354,8 +352,6 @@ pub fn sys_clock_settime(clockid: i32, tp: u64) -> i64 {
 /// - EINVAL: tv_usec out of range [0, 999999]
 /// - EFAULT: Invalid pointer
 ///
-/// Note: This is a legacy syscall. aarch64 uses clock_settime instead.
-#[cfg(target_arch = "x86_64")]
 pub fn sys_settimeofday(tv: u64, tz: u64) -> i64 {
     // If tv is provided, set the time
     if tv != 0 {

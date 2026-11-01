@@ -6,7 +6,7 @@
 - [x] clone (Linux thread/process creation)
 - [x] clone3
 - [x] execve
-- [x] execveat (x86-64 only for now; not dispatched on aarch64: ENOSYS)
+- [x] execveat
 - [x] _exit
 - [x] set_tid_address
 - [x] exit_group
@@ -57,7 +57,7 @@
 - [x] close
 - [x] close_range (CLOSE_RANGE_UNSHARE, CLOSE_RANGE_CLOEXEC)
 - [ ] creat (x86-64 only, legacy; use openat with O_CREAT)
-- [x] dup (x86-64 only for now; not dispatched on aarch64: ENOSYS)
+- [x] dup
 - [x] dup2 (x86-64 only, legacy; use dup3)
 - [x] dup3
 - [x] fcntl (F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_SETFD, F_GETFL, F_SETFL, F_GETLK, F_SETLK, F_SETLKW, F_GETOWN, F_SETOWN, F_GETSIG, F_SETSIG)
@@ -117,7 +117,7 @@
   regular files for now)
 - [x] chdir
 - [x] fchdir
-- [x] getcwd (x86-64 only for now; not dispatched on aarch64: ENOSYS)
+- [x] getcwd
 - [x] chroot
 
 3.2 Stat & attributes
@@ -223,8 +223,8 @@ Linux has an "old" and a "rt_*" (real-time) signal set; modern userspace uses th
 6.1 Basic time
 
 - [x] time (x86-64 only, legacy; use clock_gettime)
-- [x] gettimeofday (x86-64 only for now; not dispatched on aarch64: ENOSYS)
-- [x] settimeofday (x86-64 only for now; not dispatched on aarch64: ENOSYS)
+- [x] gettimeofday
+- [x] settimeofday
 - [x] adjtimex (NTP)
 - [x] clock_gettime
 - [x] clock_settime

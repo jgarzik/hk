@@ -210,6 +210,9 @@ pub const SYS_CLONE: u64 = 56;
 pub const SYS_FORK: u64 = 57;
 pub const SYS_VFORK: u64 = 58;
 pub const SYS_EXECVE: u64 = 59;
+pub const SYS_DUP: u64 = 32;
+pub const SYS_GETCWD: u64 = 79;
+pub const SYS_EXECVEAT: u64 = 322;
 pub const SYS_EXIT: u64 = 60;
 pub const SYS_EXIT_GROUP: u64 = 231;
 pub const SYS_WAIT4: u64 = 61;
@@ -834,6 +837,30 @@ pub fn sys_vfork() -> i64 {
 #[inline(always)]
 pub fn sys_execve(pathname: *const u8, argv: *const *const u8, envp: *const *const u8) -> i64 {
     unsafe { syscall3!(SYS_EXECVE, pathname, argv, envp) }
+}
+
+/// dup(oldfd)
+#[inline(always)]
+pub fn sys_dup(oldfd: i32) -> i64 {
+    unsafe { syscall1!(SYS_DUP, oldfd) }
+}
+
+/// getcwd(buf, size)
+#[inline(always)]
+pub fn sys_getcwd(buf: *mut u8, size: usize) -> i64 {
+    unsafe { syscall2!(SYS_GETCWD, buf, size) }
+}
+
+/// execveat(dirfd, pathname, argv, envp, flags)
+#[inline(always)]
+pub fn sys_execveat(
+    dirfd: i32,
+    pathname: *const u8,
+    argv: *const *const u8,
+    envp: *const *const u8,
+    flags: i32,
+) -> i64 {
+    unsafe { syscall5!(SYS_EXECVEAT, dirfd, pathname, argv, envp, flags) }
 }
 
 #[inline(always)]

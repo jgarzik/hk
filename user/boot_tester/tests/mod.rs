@@ -101,6 +101,7 @@ pub mod swap;
 pub mod swapout;
 pub mod sync;
 pub mod sysctl;
+pub mod gencalls;
 pub mod sysinfo;
 pub mod tcp;
 pub mod tcp_close;
@@ -163,6 +164,7 @@ pub fn run_all_tests() {
     dac::run_tests();
     sync::run_tests();
     sysinfo::run_tests();
+    gencalls::run_tests();
     signals::run_tests();
     sigmask::run_tests();
     fpu::run_tests();

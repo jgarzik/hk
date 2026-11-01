@@ -706,11 +706,6 @@ Found during T0 (2026-10-19). Tag = when to fix.
    `MM_LIFE_EXEC_CHAIN:FAIL -2`: both warmup chains passed, then the
    first measured one's child (busybox `env` x40 then `true`, i.e. 41
    execs in one process) exited nonzero. A failed exec, not a leak.
-9. **aarch64 does not dispatch dup, getcwd, execveat, gettimeofday,
-   settimeofday** (next batch): all are in the generic arm64 table
-   (23, 17, 281, 169, 170) but have no arm in
-   `kernel/arch/aarch64/syscall.rs`, so they return ENOSYS. Add them
-   with boot tests.
 10. **Network test flake** (I):
    `SOCKCORE_CONNECT_REFUSED:FAIL SO_ERROR got 0` (hk arm64, 1 of 10
    `check-stress` boots: poll reported POLLOUT for a nonblocking
