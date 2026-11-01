@@ -17,6 +17,7 @@ pub mod completion;
 pub mod console;
 pub mod cpu;
 pub mod cpumask;
+pub mod delay;
 pub mod dma;
 pub mod elf;
 pub mod entry;
