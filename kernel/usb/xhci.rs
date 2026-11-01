@@ -25,7 +25,7 @@ use crate::downcast_bus_device;
 use crate::printkln;
 
 /// Halt and start handshakes (Linux XHCI_MAX_HALT_USEC)
-const XHCI_MAX_HALT_US: u64 = 32_000;
+pub(super) const XHCI_MAX_HALT_US: u64 = 32_000;
 /// Reset handshakes at initialization (Linux XHCI_RESET_LONG_USEC)
 const XHCI_RESET_LONG_US: u64 = 10_000_000;
 /// Reset handshakes later on (Linux XHCI_RESET_SHORT_USEC)
@@ -39,11 +39,36 @@ const XHCI_CONSOLE_US: u64 = 100_000;
 /// Root port reset (Linux HUB_RESET_TIMEOUT)
 const PORT_RESET_US: u64 = 800_000;
 
-const PCI_VENDOR_INTEL: u16 = 0x8086;
+pub(super) const PCI_VENDOR_INTEL: u16 = 0x8086;
 
 /// USBCMD interrupter, host system error and wrap event enables (Linux
 /// XHCI_IRQS)
-const XHCI_IRQS: u32 = (1 << 2) | (1 << 3) | (1 << 10);
+pub(super) const XHCI_IRQS: u32 = (1 << 2) | (1 << 3) | (1 << 10);
+
+/// Chipset quirks, set once from the PCI IDs (Linux xhci_pci_quirks)
+mod quirk {
+    use super::PCI_VENDOR_INTEL;
+    use crate::bus::pci::PciDevice;
+
+    /// Intel host: 1 ms after HCRST before any register access
+    pub const INTEL_HOST: u32 = 1 << 0;
+    /// Ports go back to EHCI at shutdown, or the machine powers back on
+    pub const SPURIOUS_REBOOT: u32 = 1 << 1;
+    /// Reset and D3hot at shutdown, or spurious wakeups follow
+    pub const SPURIOUS_WAKEUP: u32 = 1 << 2;
+
+    pub fn of(dev: &PciDevice) -> u32 {
+        if dev.header.vendor_id != PCI_VENDOR_INTEL {
+            return 0;
+        }
+        INTEL_HOST
+            | match dev.header.device_id {
+                0x1e31 => SPURIOUS_REBOOT,                            // Panther Point
+                0x9c31 | 0x9cb1 => SPURIOUS_REBOOT | SPURIOUS_WAKEUP, // LPT-LP, WPT-LP
+                _ => 0,
+            }
+    }
+}
 
 /// Scratchpad buffers the controller needs, from HCSPARAMS2 (Linux
 /// HCS_MAX_SCRATCHPAD: bits 25:21 high, 31:27 low)
@@ -713,6 +738,8 @@ pub struct XhciController {
     max_ports: u8,
     /// Bytes per device context (HCCPARAMS1.CSZ)
     ctx_size: usize,
+    /// Chipset quirks (`quirk::*`), from the PCI IDs at creation
+    quirks: u32,
     /// Initialized flag
     initialized: bool,
     /// Connected devices
@@ -728,6 +755,7 @@ impl XhciController {
     pub fn new(mmio_base: u64, pci_dev: PciDevice) -> Self {
         Self {
             mmio_base,
+            quirks: quirk::of(&pci_dev),
             pci_dev,
             cap_regs: mmio_base,
             op_regs: 0,
@@ -1021,9 +1049,9 @@ impl XhciController {
 
     /// Halt the controller
     fn halt(&self) -> Result<(), UsbError> {
-        // Clear run bit
+        // Stop, with interrupts off (Linux xhci_halt, xhci_quiesce)
         let cmd = self.read_op(0x00);
-        self.write_op(0x00, cmd & !usbcmd::RUN_STOP);
+        self.write_op(0x00, cmd & !(usbcmd::RUN_STOP | XHCI_IRQS));
 
         // Wait for HCH (halted) bit, polled per microframe (Linux
         // xhci_halt)
@@ -1051,7 +1079,7 @@ impl XhciController {
         // Intel xHCs need 1 ms after setting HCRST before any register
         // access, or that access "may result in a system hang very
         // rarely" (Linux XHCI_INTEL_HOST)
-        if self.pci_dev.header.vendor_id == PCI_VENDOR_INTEL {
+        if self.quirks & quirk::INTEL_HOST != 0 {
             udelay(1000);
         }
 
@@ -1837,7 +1865,6 @@ impl XhciController {
         Ok(())
     }
 
-    /// Shutdown the entire xHCI controller (driver unload/hotplug)
     ///
     /// Stops all devices, halts the controller, and unregisters IRQ.
     /// Quiesce the controller for power-off or restart (Linux
@@ -1848,18 +1875,11 @@ impl XhciController {
     /// leaves spurious wakeups (XHCI_SPURIOUS_WAKEUP). Transfers fail
     /// from here on.
     fn shutdown_hc(&mut self) {
-        let h = &self.pci_dev.header;
-        let intel = h.vendor_id == PCI_VENDOR_INTEL;
-        // Panther Point, Lynx Point-LP, Wildcat Point-LP
-        let spurious_reboot = intel && matches!(h.device_id, 0x1e31 | 0x9c31 | 0x9cb1);
-        let spurious_wakeup = intel && matches!(h.device_id, 0x9c31 | 0x9cb1);
-        if spurious_reboot {
+        let spurious_wakeup = self.quirks & quirk::SPURIOUS_WAKEUP != 0;
+        if self.quirks & quirk::SPURIOUS_REBOOT != 0 {
             super::pci_quirks::disable_intel_ports(&self.pci_dev);
         }
-        let cmd = self.read_op(0x00);
-        self.write_op(0x00, cmd & !(usbcmd::RUN_STOP | XHCI_IRQS));
-        let halted = || self.read_op(0x04) & usbsts::HCH != 0;
-        let _ = poll_timeout(XHCI_MAX_HALT_US, 125, halted);
+        let _ = self.halt();
         if spurious_wakeup {
             let _ = self.reset_controller(XHCI_RESET_SHORT_US);
         }
@@ -1870,6 +1890,7 @@ impl XhciController {
         }
     }
 
+    /// Shutdown the entire xHCI controller (driver unload/hotplug)
     pub fn shutdown(&mut self) {
         printkln!("xHCI: Shutting down controller");
 

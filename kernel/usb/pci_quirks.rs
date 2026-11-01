@@ -23,6 +23,7 @@ use crate::delay::{Clock, Monotonic, poll_on};
 use crate::printkln;
 
 use super::ext_caps::{self, Mmio};
+use super::xhci::{PCI_VENDOR_INTEL, XHCI_IRQS, XHCI_MAX_HALT_US};
 
 /// Programming interfaces of class 0x0c03 (serial bus, USB)
 const PROG_IF_EHCI: u8 = 0x20;
@@ -150,9 +151,6 @@ const XHCI_LEGACY_SMI_EVENTS: u32 = 0x7 << 29;
 const XHCI_CMD: u32 = 0x00;
 const XHCI_STS: u32 = 0x04;
 const XHCI_CMD_RUN: u32 = 1 << 0;
-/// Interrupter, host system error and wrap event enables (Linux
-/// XHCI_IRQS)
-const XHCI_IRQS: u32 = (1 << 2) | (1 << 3) | (1 << 10);
 const XHCI_STS_HALT: u32 = 1 << 0;
 const XHCI_STS_CNR: u32 = 1 << 11;
 
@@ -161,8 +159,6 @@ const XHCI_STS_CNR: u32 = 1 << 11;
 const XHCI_HANDOFF_US: u64 = 1_000_000;
 /// Wait for Controller Not Ready to clear (Linux: 5 s)
 const XHCI_CNR_US: u64 = 5_000_000;
-/// Wait for the halt (Linux XHCI_MAX_HALT_USEC, polled per microframe)
-const XHCI_MAX_HALT_US: u64 = 32_000;
 
 /// What the xHCI hand-off found and did, for the report
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -318,7 +314,6 @@ fn quirk_usb_handoff_xhci(dev: &PciDevice, all: &[PciDevice], bar: &Bar) {
 // SuperSpeed terminations first so USB 3 devices connect at
 // SuperSpeed, before any driver probes.
 
-const PCI_VENDOR_INTEL: u16 = 0x8086;
 /// xHC USB 2.0 Port Routing, and the mask of ports the OS may route
 const USB_INTEL_XUSB2PR: u8 = 0xD0;
 const USB_INTEL_USB2PRM: u8 = 0xD4;
