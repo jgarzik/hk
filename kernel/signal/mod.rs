@@ -1043,16 +1043,12 @@ fn check_send_context() {
 pub fn send_signal_to_process(pid: Pid, sig: u32) -> i32 {
     let tid = {
         let table = crate::task::percpu::TASKLIST.read();
-        let live = |t: &crate::task::percpu::TaskView<'_>| {
-            !t.task.has_flag(crate::task::pf::EXITING)
-                && !matches!(t.state, crate::task::TaskState::Zombie(_))
-        };
         let leader = table.get(pid);
         match leader {
-            Some(l) if live(&l) => Some(l.task.tid()),
+            Some(l) if task_live(&l) => Some(l.task.tid()),
             _ => table
                 .threads(pid)
-                .find(live)
+                .find(task_live)
                 .or(leader)
                 .map(|t| t.task.tid()),
         }
@@ -1114,12 +1110,15 @@ fn fatal(sighand: Option<&Arc<SigHand>>, sig: u32) -> bool {
 
 /// A fatal signal reached `tid`: its group exits with that status and
 /// every thread gets SIGKILL (Linux complete_signal; a traced target
-/// sees anything but SIGKILL first)
+/// sees anything but SIGKILL first). Not if `tid` itself is exiting or
+/// a zombie (Linux wants_signal skips PF_EXITING): a process-directed
+/// signal was already sent to a live thread if there was one.
 fn group_kill(tid: Tid, sig: u32) {
     let found = {
         let table = TASKLIST.read();
         table
             .get(tid)
+            .filter(task_live)
             .map(|t| (t.task.pid, t.ptrace != 0, group_signal(&table, t.task.pid)))
     };
     let Some((tgid, traced, Some(s))) = found else {
@@ -1128,6 +1127,12 @@ fn group_kill(tid: Tid, sig: u32) {
     if (sig == SIGKILL || !traced) && s.start_exit(sig as i32, true) {
         zap_threads(tgid, None);
     }
+}
+
+/// `t` has not started exiting (Linux !PF_EXITING, not a zombie)
+pub fn task_live(t: &crate::task::percpu::TaskView<'_>) -> bool {
+    !t.task.has_flag(crate::task::pf::EXITING)
+        && !matches!(t.state, crate::task::TaskState::Zombie(_))
 }
 
 /// The SignalStruct of thread group `tgid` (its leader keeps it until
@@ -1152,11 +1157,7 @@ fn zap_threads(tgid: Pid, except: Option<Tid>) {
         let mut table = TASKLIST.write();
         let tids: alloc::vec::Vec<Tid> = table
             .threads(tgid)
-            .filter(|t| {
-                Some(t.task.tid()) != except
-                    && !t.task.has_flag(crate::task::pf::EXITING)
-                    && !matches!(t.state, crate::task::TaskState::Zombie(_))
-            })
+            .filter(|t| Some(t.task.tid()) != except && task_live(t))
             .map(|t| t.task.tid())
             .collect();
         for &t in &tids {
@@ -1441,10 +1442,18 @@ impl SignalStruct {
         self.live.fetch_add(1, Ordering::AcqRel);
     }
 
-    /// A thread starts its exit; true if it was the group's last live
-    /// one (Linux do_exit: group_dead = atomic_dec_and_test(&live))
-    pub fn thread_exiting(&self) -> bool {
-        self.live.fetch_sub(1, Ordering::AcqRel) == 1
+    /// A thread starts its exit with wait status `code`; true if it was
+    /// the group's last live one (Linux do_exit: group_dead =
+    /// atomic_dec_and_test(&live)). The last one with no group exit
+    /// under way makes its status the group's (Linux
+    /// synchronize_group_exit, quick_threads): a fatal signal after
+    /// that starts nothing.
+    pub fn thread_exiting(&self, code: Option<i32>) -> bool {
+        let dead = self.live.fetch_sub(1, Ordering::AcqRel) == 1;
+        if dead && let Some(c) = code {
+            self.start_exit(c, true);
+        }
+        dead
     }
 
     /// The group's exit state

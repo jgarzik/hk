@@ -594,18 +594,10 @@ From the P3 /code-review (unverified). Tag = when to fix.
 
 ## Fix batch 1 review findings (open)
 From the fix-batch-1 /code-review (unverified). Tag = when to fix.
-1. **Fatal signal to an exiting thread or a zombie leader starts a
-   group exit** (next batch). `kernel/signal/mod.rs:1076` group_kill:
-   a signal to a PF_EXITING thread not yet released (or a traced
-   zombie) kills the live process (Linux wants_signal skips
-   PF_EXITING); a kill -9 of a zombie leader whose threads all called
-   exit() overwrites its exit status.
 3. **memblock holds at most 128 ranges** (J). `kernel/mm/memblock.rs:18`:
    a firmware map with more RAM or reserved ranges panics at boot
    (asserts in add/remove/reserve); Linux grows the array
    (memblock_double_array).
-5. **group_alive duplicates group_others** (next batch).
-   `kernel/task/percpu.rs:1570` vs `:1459`.
 
 ## P4 review findings (open)
 From the P4 /code-review (unverified unless noted). Tag = when to fix.
@@ -666,6 +658,14 @@ Found during T0 (2026-10-19). Tag = when to fix.
    (never freed; more concurrent stacks reach higher slots) and frees
    deferred until other CPUs switch. Find which, then fix it or scale
    the tolerance with the CPU count.
+
+15. **Soft lockup after the SWAPOUT tests** (J): one x86 `make gate`
+   boot (KVM, 4 CPUs, under the gate's parallel load) printed `BUG:
+   soft lockup - CPU#2 stuck for 20s! [tid 8623]` right after
+   SWAPOUT_MUNMAP_FREES (the isolated child exiting with swap entries
+   and swap-cache pages, or the parent reaping it) and timed out; two
+   reruns and the next gate passed. The watchdog prints no backtrace:
+   add one, then stress the swap tests.
 
 14. **SWAPOUT_PAGEOUT flaky on the Linux reference** (J): one x86
    `check-linux` run had free swap 364 kB off the expected value after
