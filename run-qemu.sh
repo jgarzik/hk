@@ -127,7 +127,7 @@ setup_x86_config() {
             -cdrom "$ISO"
             -boot d
             -nographic
-            -m 512M
+            -m "${QEMU_MEM:-512M}"
             -smp "${QEMU_SMP:-4}"
         )
     else
@@ -137,7 +137,7 @@ setup_x86_config() {
             -cdrom "$ISO"
             -boot d
             -nographic
-            -m 512M
+            -m "${QEMU_MEM:-512M}"
             -smp "${QEMU_SMP:-4}"
         )
     fi
@@ -224,7 +224,7 @@ setup_arm_config() {
     QEMU_ARGS=(
         "${ARM_MACHINE[@]}"
         -smp "${QEMU_SMP:-4}"
-        -m 512M
+        -m "${QEMU_MEM:-512M}"
         -kernel "$KERNEL"
         -initrd "$INITRAMFS"
         -nographic

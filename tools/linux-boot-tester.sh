@@ -18,6 +18,7 @@
 #        LINUX_CACHE_DIR   cache (default ~/.cache/hk-linux-check)
 #        QEMU_LOG_DIR      serial log directory (default target/qemu)
 #        QEMU_SMP          guest CPUs (default 4)
+#        QEMU_MEM          guest RAM (default 512M)
 
 set -euo pipefail
 
@@ -26,6 +27,7 @@ TOP=$PWD
 
 TIMEOUT=120
 SMP=${QEMU_SMP:-4}
+MEM=${QEMU_MEM:-512M}
 ARCH=$(uname -m)
 while getopts "a:T:" opt; do
     case $opt in
@@ -150,7 +152,7 @@ linux_cache_key() {
         tools/linux-boot-tester.sh tools/mkdisk.sh tools/busybox-root.sh \
         tools/fetch-deb.sh tools/qemu-net.sh tools/netpeer | LC_ALL=C sort -u) || return 1
     {
-        echo "$ARCH $TIMEOUT $SMP ${KVM[*]} ${QEMU_MACHINE[*]} ${DISK[*]}" &&
+        echo "$ARCH $TIMEOUT $SMP $MEM ${KVM[*]} ${QEMU_MACHINE[*]} ${DISK[*]}" &&
             echo "${QEMU_NET[*]//"$TOP"/}" &&
             "$QEMU_BIN" --version &&
             uname -r &&
@@ -175,7 +177,7 @@ fi
 
 echo "Booting boot_tester on Linux ($([ ${#KVM[@]} = 0 ] && echo TCG || echo KVM), ${TIMEOUT}s timeout)..."
 timeout "$TIMEOUT" "$QEMU_BIN" "${KVM[@]}" "${QEMU_MACHINE[@]}" \
-    -m 512M -smp "$SMP" -nographic -no-reboot -monitor none "${QEMU_NET[@]}" "${DISK[@]}" \
+    -m "$MEM" -smp "$SMP" -nographic -no-reboot -monitor none "${QEMU_NET[@]}" "${DISK[@]}" \
     -kernel "$LINUX_KERNEL" -initrd "$WORK/initramfs.cpio" \
     -append "console=$CONSOLE rdinit=/bin/init panic=-1 quiet" \
     -serial file:"$SERIAL_LOG" </dev/null || true
