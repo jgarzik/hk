@@ -67,9 +67,12 @@ pub fn sys_reboot(magic1: u32, magic2: u32, cmd: u32, _arg: u64) -> i64 {
     let _transition = SYSTEM_TRANSITION.lock();
 
     // Devices quiesce first (Linux kernel_shutdown_prepare and
-    // kernel_restart_prepare: device_shutdown)
+    // kernel_restart_prepare: device_shutdown), then the other CPUs stop
+    // (Linux machine_shutdown -> stop_other_cpus), so nothing goes on
+    // running against quiesced hardware
     if matches!(cmd, cmd::POWER_OFF | cmd::RESTART | cmd::HALT) {
         crate::bus::bus::device_shutdown();
+        crate::smp::stop_other_cpus();
     }
 
     // Dispatch to architecture-specific implementation

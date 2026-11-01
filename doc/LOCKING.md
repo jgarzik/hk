@@ -1389,7 +1389,12 @@ reschedule (`resched_curr` after queueing a task on its run queue,
 - `ACTIVE` (global `CpuMask`): CPUs that service IPIs, each set once at
   boot after its interrupt controller is up and interrupts enabled
   (`smp::set_active`, which then flushes its own TLB: a kernel-range
-  flush may have skipped it). Global: every sender needs every CPU's
+  flush may have skipped it), and cleared once more at the very end:
+  `smp::stop_other_cpus` (halt, power-off, restart, after
+  device_shutdown; Linux smp_send_stop) sends each other CPU
+  `stop_this_cpu`, which clears its bit and halts with interrupts off
+  inside the IPI, never releasing its call slot. The stopper waits up
+  to 1 s for the bits to clear. Global: every sender needs every CPU's
   state, and it changes once per CPU.
 - `func` runs in interrupt context with interrupts off (IPI handler, or
   the sender's own wait loop): it may only touch atomics, per-CPU data
