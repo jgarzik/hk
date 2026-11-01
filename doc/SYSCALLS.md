@@ -473,6 +473,8 @@ goes down later.
 - [x] setregid
 - [x] setresuid
 - [x] setresgid
+- [x] getgroups
+- [x] setgroups (CAP_SETGID; sorted, shared per credential set)
 - [x] setfsuid
 - [x] setfsgid
 

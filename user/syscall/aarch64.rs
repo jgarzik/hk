@@ -279,6 +279,8 @@ pub const SYS_SETUID: u64 = 146;
 pub const SYS_SETRESUID: u64 = 147;
 pub const SYS_GETRESUID: u64 = 148;
 pub const SYS_SETRESGID: u64 = 149;
+pub const SYS_GETGROUPS: u64 = 158;
+pub const SYS_SETGROUPS: u64 = 159;
 pub const SYS_GETRESGID: u64 = 150;
 pub const SYS_SETFSUID: u64 = 151;
 pub const SYS_SETFSGID: u64 = 152;
@@ -908,6 +910,18 @@ pub fn sys_waitid(idtype: i32, id: u64, infop: *mut SigInfo, options: i32, rusag
 #[inline(always)]
 pub fn sys_execve(pathname: *const u8, argv: *const *const u8, envp: *const *const u8) -> i64 {
     unsafe { syscall3!(SYS_EXECVE, pathname, argv, envp) }
+}
+
+/// getgroups(size, list)
+#[inline(always)]
+pub fn sys_getgroups(size: i32, list: *mut u32) -> i64 {
+    unsafe { syscall2!(SYS_GETGROUPS, size, list) }
+}
+
+/// setgroups(size, list)
+#[inline(always)]
+pub fn sys_setgroups(size: i32, list: *const u32) -> i64 {
+    unsafe { syscall2!(SYS_SETGROUPS, size, list) }
 }
 
 /// dup(oldfd)

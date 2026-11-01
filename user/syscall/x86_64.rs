@@ -266,6 +266,8 @@ pub const SYS_SETREGID: u64 = 114;
 pub const SYS_SETRESUID: u64 = 117;
 pub const SYS_GETRESUID: u64 = 118;
 pub const SYS_SETRESGID: u64 = 119;
+pub const SYS_GETGROUPS: u64 = 115;
+pub const SYS_SETGROUPS: u64 = 116;
 pub const SYS_GETRESGID: u64 = 120;
 pub const SYS_GETPGID: u64 = 121;
 pub const SYS_SETFSUID: u64 = 122;
@@ -837,6 +839,18 @@ pub fn sys_vfork() -> i64 {
 #[inline(always)]
 pub fn sys_execve(pathname: *const u8, argv: *const *const u8, envp: *const *const u8) -> i64 {
     unsafe { syscall3!(SYS_EXECVE, pathname, argv, envp) }
+}
+
+/// getgroups(size, list)
+#[inline(always)]
+pub fn sys_getgroups(size: i32, list: *mut u32) -> i64 {
+    unsafe { syscall2!(SYS_GETGROUPS, size, list) }
+}
+
+/// setgroups(size, list)
+#[inline(always)]
+pub fn sys_setgroups(size: i32, list: *const u32) -> i64 {
+    unsafe { syscall2!(SYS_SETGROUPS, size, list) }
 }
 
 /// dup(oldfd)

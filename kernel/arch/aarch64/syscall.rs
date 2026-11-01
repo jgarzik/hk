@@ -253,6 +253,8 @@ pub const SYS_SETRESUID: u64 = 147;
 /// getresuid(ruid*, euid*, suid*)
 pub const SYS_GETRESUID: u64 = 148;
 /// setresgid(rgid, egid, sgid)
+pub const SYS_GETGROUPS: u64 = 158;
+pub const SYS_SETGROUPS: u64 = 159;
 pub const SYS_SETRESGID: u64 = 149;
 /// getresgid(rgid*, egid*, sgid*)
 pub const SYS_GETRESGID: u64 = 150;
@@ -789,6 +791,12 @@ pub fn aarch64_syscall_dispatch(
             use crate::arch::Uaccess;
             use crate::task::syscall::sys_getresuid;
             sys_getresuid::<Uaccess>(arg0, arg1, arg2, percpu::current_cred()) as u64
+        }
+        SYS_GETGROUPS => {
+            crate::task::syscall::sys_getgroups::<crate::arch::Uaccess>(arg0 as i32, arg1) as u64
+        }
+        SYS_SETGROUPS => {
+            crate::task::syscall::sys_setgroups::<crate::arch::Uaccess>(arg0 as i32, arg1) as u64
         }
         SYS_SETRESGID => {
             use crate::task::syscall::sys_setresgid;

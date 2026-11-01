@@ -135,7 +135,7 @@ pub type Gid = u32;
 /// as Linux does, plus the five capability sets.
 ///
 /// Mirrors Linux's `struct cred` from include/linux/cred.h
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cred {
     /// Real user ID
     pub uid: Uid,
@@ -165,6 +165,39 @@ pub struct Cred {
     pub cap_bset: KernelCap,
     /// Ambient capability set (automatically inherited by children)
     pub cap_ambient: KernelCap,
+    /// Supplementary groups, sorted (Linux group_info)
+    pub groups: GroupInfo,
+}
+
+/// Supplementary group list (Linux struct group_info): sorted and
+/// shared, replaced whole by setgroups; empty without an allocation
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GroupInfo(Option<Arc<[Gid]>>);
+
+/// Linux NGROUPS_MAX
+pub const NGROUPS_MAX: usize = 65536;
+
+impl GroupInfo {
+    pub const EMPTY: Self = Self(None);
+
+    /// A list from any order (Linux groups_sort; duplicates kept, as
+    /// Linux does)
+    pub fn new(mut gids: alloc::vec::Vec<Gid>) -> Self {
+        if gids.is_empty() {
+            return Self::EMPTY;
+        }
+        gids.sort_unstable();
+        Self(Some(gids.into()))
+    }
+
+    pub fn as_slice(&self) -> &[Gid] {
+        self.0.as_deref().unwrap_or(&[])
+    }
+
+    /// Linux groups_search
+    pub fn contains(&self, gid: Gid) -> bool {
+        self.as_slice().binary_search(&gid).is_ok()
+    }
 }
 
 impl Cred {
@@ -183,6 +216,7 @@ impl Cred {
         cap_effective: CAP_FULL_SET,
         cap_bset: CAP_FULL_SET,
         cap_ambient: CAP_EMPTY_SET, // Ambient starts empty even for root
+        groups: GroupInfo::EMPTY,
     };
 
     /// No privileges at all (overflow uid/gid 65534, no capabilities,
@@ -202,6 +236,7 @@ impl Cred {
         cap_effective: CAP_EMPTY_SET,
         cap_bset: CAP_EMPTY_SET,
         cap_ambient: CAP_EMPTY_SET,
+        groups: GroupInfo::EMPTY,
     };
 
     /// Create credentials for a specific user/group
@@ -231,6 +266,7 @@ impl Cred {
             cap_effective: caps,
             cap_bset: bset,
             cap_ambient: CAP_EMPTY_SET,
+            groups: GroupInfo::EMPTY,
         }
     }
 
@@ -322,7 +358,7 @@ pub fn copy_creds(clone_flags: u64, parent_cred: &Arc<Cred>) -> Arc<Cred> {
         parent_cred.clone()
     } else {
         // Fork: deep copy credentials (child gets independent copy)
-        Arc::new(**parent_cred)
+        Arc::new((**parent_cred).clone())
     }
 }
 
@@ -1258,7 +1294,7 @@ impl TaskCred {
     /// The caller is the task itself, or holds TASKLIST.
     unsafe fn get(&self) -> Cred {
         // SAFETY: the pointer is live (see above)
-        unsafe { *self.0.load(Ordering::Acquire) }
+        unsafe { (*self.0.load(Ordering::Acquire)).clone() }
     }
 
     /// # Safety
@@ -1266,7 +1302,7 @@ impl TaskCred {
     unsafe fn arc(&self) -> Arc<Cred> {
         let p = self.0.load(Ordering::Acquire);
         if Self::is_static(p) {
-            return Arc::new(INIT_CRED);
+            return Arc::new(INIT_CRED.clone());
         }
         // SAFETY: `p` came from Arc::into_raw and holds a count
         unsafe {

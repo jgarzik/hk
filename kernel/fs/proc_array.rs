@@ -269,7 +269,12 @@ pub fn gen_status(pid: Pid) -> Vec<u8> {
     let _ = writeln!(o, "PPid:\t{}\nTracerPid:\t{}", s.ppid, s.tracer);
     let _ = writeln!(o, "Uid:\t{}\t{}\t{}\t{}", c.uid, c.euid, c.suid, c.fsuid);
     let _ = writeln!(o, "Gid:\t{}\t{}\t{}\t{}", c.gid, c.egid, c.sgid, c.fsgid);
-    let _ = writeln!(o, "FDSize:\t{}\nGroups:\t ", fd_size(&s));
+    let _ = write!(o, "FDSize:\t{}\nGroups:\t", fd_size(&s));
+    // Linux: the groups space-separated, then a trailing space
+    for (i, g) in c.groups.as_slice().iter().enumerate() {
+        let _ = write!(o, "{}{g}", if i > 0 { " " } else { "" });
+    }
+    let _ = writeln!(o, " ");
     let _ = writeln!(o, "NStgid:\t{}\nNSpid:\t{}", s.tgid, s.pid);
     let _ = writeln!(o, "NSpgid:\t{}\nNSsid:\t{}", s.pgid, s.sid);
     let _ = writeln!(o, "Kthread:\t{}", s.kthread as u8);

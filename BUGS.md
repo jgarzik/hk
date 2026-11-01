@@ -26,8 +26,7 @@ Neighbour entries are not confirmed by TCP progress (only ARP), there is
 no proxy ARP and no per-device neighbour sysctls (net/ipv4/neigh/*).
 IP: no ipfrag_max_dist, no IP options on output (received options are
 validated and skipped; source-routed packets are dropped), no
-IP_TRANSPARENT. Ping sockets check only the effective gid against
-ping_group_range (hk has no supplementary groups). /proc/net/raw and
+IP_TRANSPARENT. /proc/net/raw and
 /proc/net/icmp do not exist.
 UDP_CORK/MSG_MORE are not implemented (each send is one datagram) and
 SO_PEEK_OFF is EOPNOTSUPP.
@@ -157,8 +156,7 @@ mknod(S_IFIFO) still creates a regular file.
 
 **Location**: `kernel/fs/dac.rs`, `kernel/task/exec.rs`
 
-Missing: no supplementary groups (no setgroups/getgroups; group class
-checks use the fsgid only); fs.protected_hardlinks/symlinks/fifos/regular do not exist
+Missing: fs.protected_hardlinks/symlinks/fifos/regular do not exist
 (behave as their kernel default 0); execve ignores S_ISUID/S_ISGID and file
 capabilities (so MS_NOSUID has nothing to suppress); no
 immutable/append-only inodes (no IS_APPEND/IS_IMMUTABLE EPERM);
