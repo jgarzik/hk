@@ -798,6 +798,9 @@ fn kmain() -> ! {
         let _ = crate::storage::create_scsi_disk(handle.scsi_host(), 0, 0);
     }
 
+    // Kept for device_shutdown at power-off/restart
+    crate::bus::bus::set_system_buses(bus_manager);
+
     // ========================================================================
     // Phase 5: VFS Initialization
     // ========================================================================

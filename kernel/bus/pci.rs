@@ -1062,6 +1062,10 @@ impl Bus for PciBus {
         "pci"
     }
 
+    fn probed_devices(&self) -> &[Box<dyn Device>] {
+        &self.probed_devices
+    }
+
     fn register_driver(&mut self, driver: Box<dyn BusDriver>) {
         printkln!("PCI: Registered driver '{}'", driver.name());
         self.drivers.push(driver);

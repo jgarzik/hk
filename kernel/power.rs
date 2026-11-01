@@ -53,6 +53,12 @@ pub fn sys_reboot(magic1: u32, magic2: u32, cmd: u32, _arg: u64) -> i64 {
         return KernelError::InvalidArgument.sysret();
     }
 
+    // Devices quiesce first (Linux kernel_shutdown_prepare and
+    // kernel_restart_prepare: device_shutdown)
+    if matches!(cmd, cmd::POWER_OFF | cmd::RESTART | cmd::HALT) {
+        crate::bus::bus::device_shutdown();
+    }
+
     // Dispatch to architecture-specific implementation
     match cmd {
         cmd::POWER_OFF => {

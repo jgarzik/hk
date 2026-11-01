@@ -2889,6 +2889,7 @@ not rely on either.
 | virtio-net `config_pending`; `VringCb` (RX avail NO_INTERRUPT flag) | atomics / lock-free MMIO-style store | IRQ + thread | the ISR suppresses RX interrupts and flags config changes; the poll re-enables under `rx` only while `netif_running`, and `stop` suppresses under `rx` |
 | virtio-PCI transport (`virtio/pci.rs`) | none | probe (single-threaded enumeration), then IRQ (ISR byte) | common config written only during probe; device config reads are generation-checked and lock-free; queue notify writes happen under the caller's queue lock |
 | `virtio::DRIVERS` | `spin::Mutex<Vec>` | thread only (boot) | leaf; registered before bus enumeration, read by the PCI match/probe |
+| `bus::SYSTEM_BUSES` (`bus/bus.rs`) | sleeping `sync::Mutex<Option<BusManager>>` | thread only | set once after boot enumeration; `device_shutdown` (reboot(2), Linux device_shutdown) takes the manager out under it and runs the `Device::shutdown` callbacks after dropping it, so callbacks (which may poll hardware or take driver locks such as `USB_CONTROLLER`) never run under it |
 
 **Lock order (outermost first):**
 
