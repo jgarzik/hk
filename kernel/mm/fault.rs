@@ -468,6 +468,8 @@ fn map_swap_page(
     let write = access == Access::Write;
     let freed = (write || super::swap::swap_full()) && super::swap_state::try_free_swap(page);
     let exclusive = write && freed && FRAME_ALLOCATOR.refcount(page) == 1;
+    // A PROT_NONE VMA (swapoff's unuse_pte skips the access check) gets
+    // a protnone entry from mk_pte, not a readable one
     let mut entry = paging::mk_pte(page, area.prot);
     if !exclusive && !area.shared {
         entry = paging::pte_mkcow(entry);

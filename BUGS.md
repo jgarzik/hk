@@ -593,10 +593,6 @@ From the fix-batch-1 /code-review (unverified). Tag = when to fix.
 ## P4 review findings (open)
 From the P4 /code-review (unverified unless noted). Tag = when to fix.
 
-1. **swapoff makes PROT_NONE swap pages readable** (next batch;
-   confirmed by reading). `kernel/mm/fault.rs:478` map_swap_page (via
-   unuse_pte) → mk_pte(page, area.prot) with prot 0 is PRESENT|USER
-   on x86. Use a protnone PTE (Linux vm_page_prot).
 4. **LRU batch refs defeat exclusivity checks** (next batch).
    `kernel/mm/fault.rs:477` / `:545`: refcount==1 tests fail while a
    page sits in the per-CPU add batch → needless COW copies after
