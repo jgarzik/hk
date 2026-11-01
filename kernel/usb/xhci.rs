@@ -377,6 +377,21 @@ mod portsc {
     pub fn speed(portsc: u32) -> u8 {
         ((portsc >> 10) & 0xF) as u8
     }
+
+    /// Read-only bits, written back as read: connect status, over-
+    /// current, speed, device removable (Linux XHCI_PORT_RO)
+    const RO: u32 = (1 << 0) | (1 << 3) | (0xf << 10) | (1 << 30);
+    /// Read/write bits, written back as read: link state, port power,
+    /// indicator, wake enables (Linux XHCI_PORT_RWS)
+    const RWS: u32 = (0xf << 5) | (1 << 9) | (0x3 << 14) | (0x7 << 25);
+
+    /// A PORTSC value that changes nothing when written (Linux
+    /// xhci_port_state_to_neutral): writing back what was read would
+    /// clear every pending change bit and, through PED (write 1 to
+    /// clear), disable the port; masking would drop port power
+    pub fn to_neutral(portsc: u32) -> u32 {
+        portsc & (RO | RWS)
+    }
 }
 
 /// Wrapper around raw pointer for Send+Sync
@@ -1211,11 +1226,9 @@ impl XhciController {
 
     /// Reset a port
     fn reset_port(&self, port: u8) -> Result<(), UsbError> {
-        // Read current value and preserve RW1C bits
+        // Set port reset, writing every other bit back neutrally
         let portsc = self.read_port(port, 0);
-
-        // Set port reset, preserve power
-        self.write_port(port, 0, (portsc & 0x0E00_00E0) | portsc::PR);
+        self.write_port(port, 0, portsc::to_neutral(portsc) | portsc::PR);
 
         // Wait for reset to complete (Linux hub_port_wait_reset:
         // HUB_RESET_TIMEOUT)
@@ -1225,8 +1238,12 @@ impl XhciController {
             portsc & portsc::PR == 0 && portsc & portsc::PED != 0
         };
         poll_timeout(PORT_RESET_US, 100, done).map_err(|_| UsbError::Timeout)?;
-        // Clear status change bits
-        self.write_port(port, 0, portsc | portsc::CSC | portsc::PRC);
+        // Acknowledge the connect and reset changes (write 1 to clear)
+        self.write_port(
+            port,
+            0,
+            portsc::to_neutral(portsc) | portsc::CSC | portsc::PRC,
+        );
         Ok(())
     }
 
@@ -1948,6 +1965,20 @@ pub fn init_xhci<FA: FrameAlloc<PhysAddr = u64>>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Neutral keeps power and status, never writes PED, PR or the
+    /// change bits
+    #[test]
+    fn portsc_neutral() {
+        let live = 0x0002_1203 | portsc::PRC | (1 << 9); // connected, enabled, changes pending, powered
+        let n = portsc::to_neutral(live);
+        assert_eq!(n & (1 << 9), 1 << 9);
+        assert_eq!(n & portsc::CCS, portsc::CCS);
+        assert_eq!(
+            n & (portsc::PED | portsc::PR | portsc::CSC | portsc::PRC),
+            0
+        );
+    }
 
     #[test]
     fn scratchpad_count() {
