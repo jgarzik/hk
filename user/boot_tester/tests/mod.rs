@@ -58,6 +58,7 @@ pub mod mm_life;
 pub mod mm_oom;
 pub mod mmap;
 pub mod mmlock;
+pub mod mm_populate;
 pub mod mountflags;
 pub mod mprotect;
 pub mod mqueue;
@@ -248,6 +249,7 @@ pub fn run_all_tests() {
     tcp::run_tests();
     isolated(b"MEMCORE", memcore::run_tests);
     isolated(b"MMLOCK", mmlock::run_tests);
+    isolated(b"MM_POPULATE", mm_populate::run_tests);
     isolated(b"MAPCOUNT", mapcount::run_tests);
     group_exit::run_tests();
     pid_tid::run_tests();

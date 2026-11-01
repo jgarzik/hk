@@ -307,7 +307,7 @@ pub fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: 
     drop(replaced);
 
     if should_populate {
-        let _ = populate_range(map_addr, length);
+        let _ = populate_range(map_addr, length, true);
     }
 
     // Note: Pages are allocated on demand in the page fault handler
@@ -516,15 +516,16 @@ fn can_do_mlock() -> bool {
 /// are jumped over, inaccessible VMAs skipped, so the work is bounded by
 /// the pages mapped, not the length. A write fault for a private
 /// writable mapping (copy-on-write is broken now), a read fault
-/// otherwise. False if memory ran out (mlock reports it; MAP_POPULATE
-/// and mlockall ignore it, like Linux mm_populate). The mm lock is not
-/// held between faults (the kernel is preemptible: no cond_resched
-/// needed); a VMA changed meanwhile is looked up again.
-///
-/// Used by MAP_POPULATE, MAP_LOCKED and mlock/mlockall.
-fn populate_range(start: u64, len: u64) -> bool {
+/// otherwise. A VMA stops at its first page that cannot be faulted in:
+/// OutOfMemory, or BadAddress for SIGSEGV/SIGBUS (past a file's end).
+/// With `ignore_errors` (MAP_POPULATE, mlockall: Linux mm_populate)
+/// the next VMA goes on, else that error is returned (mlock). A pending
+/// SIGKILL ends it with Interrupted (Linux __get_user_pages -EINTR).
+/// The mm lock is not held between faults (the kernel is preemptible:
+/// no cond_resched needed); a VMA changed meanwhile is looked up again.
+fn populate_range(start: u64, len: u64, ignore_errors: bool) -> Result<(), KernelError> {
     let Some(mm) = get_task_mm(current_tid()) else {
-        return true;
+        return Ok(());
     };
     let end = start.saturating_add(len).min(TASK_SIZE);
     let mut addr = start & !(PAGE_SIZE - 1);
@@ -535,13 +536,14 @@ fn populate_range(start: u64, len: u64) -> bool {
         let from = addr.max(vs);
         let to = ve.min(end);
         if let Some(a) = access
-            && !populate_pages(&mm, from, to, a)
+            && let Err(e) = populate_pages(&mm, from, to, a)
+            && (!ignore_errors || e == KernelError::Interrupted)
         {
-            return false;
+            return Err(e);
         }
         addr = to;
     }
-    true
+    Ok(())
 }
 
 /// The next VMA meeting [addr, end): its bounds and the fault that
@@ -566,12 +568,26 @@ fn populate_vma(
     Some((v.start, v.end, access))
 }
 
-/// Fault in [from, to) of one VMA: false if memory ran out
-fn populate_pages(mm: &super::Mm, from: u64, to: u64, access: super::fault::Access) -> bool {
+/// Fault in [from, to) of one VMA, stopping at the first page that
+/// fails or at a pending SIGKILL
+fn populate_pages(
+    mm: &super::Mm,
+    from: u64,
+    to: u64,
+    access: super::fault::Access,
+) -> Result<(), KernelError> {
     use super::fault::{VmFault, handle_mm_fault};
-    (from..to)
-        .step_by(PAGE_SIZE as usize)
-        .all(|a| handle_mm_fault(mm, a, access) != Err(VmFault::Oom))
+    for a in (from..to).step_by(PAGE_SIZE as usize) {
+        if crate::signal::fatal_signal_pending() {
+            return Err(KernelError::Interrupted);
+        }
+        match handle_mm_fault(mm, a, access) {
+            Ok(_) => {}
+            Err(VmFault::Oom) => return Err(KernelError::OutOfMemory),
+            Err(_) => return Err(KernelError::BadAddress),
+        }
+    }
+    Ok(())
 }
 
 /// mlock syscall - Lock pages in memory
@@ -643,10 +659,17 @@ fn do_mlock(start: u64, len: u64, vm_flags: u32) -> i64 {
     if let Err(e) = r {
         return e.sysret();
     }
-    // Out of memory faulting the pages in is EAGAIN (Linux
-    // __mlock_posix_error_return)
-    if vm_flags & VM_LOCKONFAULT == 0 && !populate_range(start, len) {
-        return KernelError::WouldBlock.sysret();
+    // Linux __mlock_posix_error_return: out of memory faulting the
+    // pages in is EAGAIN, an unfaultable page ENOMEM, SIGKILL EINTR
+    if vm_flags & VM_LOCKONFAULT == 0
+        && let Err(e) = populate_range(start, len, false)
+    {
+        return match e {
+            KernelError::OutOfMemory => KernelError::WouldBlock,
+            KernelError::BadAddress => KernelError::OutOfMemory,
+            e => e,
+        }
+        .sysret();
     }
     0
 }
@@ -864,7 +887,7 @@ pub fn sys_mlockall(flags: i32) -> i64 {
 
         // Populate pages if not ONFAULT
         for (start, len) in ranges_to_populate {
-            let _ = populate_range(start, len);
+            let _ = populate_range(start, len, true);
         }
     }
 

@@ -584,8 +584,6 @@ From the P3 /code-review (unverified). Tag = when to fix.
 1. **Remote write gives up after 16 COW tries** (next batch).
    `kernel/mm/remote.rs:176`: spurious EFAULT; break COW and write
    under one PTE-lock hold, or loop until fatal_signal_pending.
-2. **populate_pages not killable** (next batch).
-   `kernel/mm/syscall.rs:570`: mlock/MAP_POPULATE ignore SIGKILL.
 3. **Minor** (next batch): `kernel/uaccess.rs:235` fault_in_writeable
    unused and duplicates populate_pages; `kernel/fs/io.rs:68`
    copy_in always uses the atomic+fault-in copy (only i_rwsem writers
