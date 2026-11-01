@@ -404,6 +404,20 @@ pub fn elf_hwcap() -> u64 {
 /// ELF auxv AT_PLATFORM string
 pub const ELF_PLATFORM: &[u8] = b"x86_64";
 
+/// ELF auxv AT_HWCAP2 (Linux elf_hwcap2): HWCAP2_RING3MWAIT and
+/// HWCAP2_FSGSBASE report features the kernel turned on; hk enables
+/// neither (CR4.FSGSBASE stays clear), so none
+pub fn elf_hwcap2() -> u64 {
+    0
+}
+
+/// ELF auxv AT_MINSIGSTKSZ (Linux signal_frame_size): the largest signal
+/// frame, the FPU/XSAVE image included, with its 64-byte alignment
+pub fn min_sigstksz() -> u64 {
+    let size = super::signal::signal_frame_size() + super::fpu::sigframe_size() + 64;
+    (size as u64 + 15) & !15
+}
+
 /// A hardware random seed (Linux arch_get_random_seed_longs): RDSEED,
 /// else RDRAND, each retried a few times as they may underflow; None if
 /// the CPU has neither

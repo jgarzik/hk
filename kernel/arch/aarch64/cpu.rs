@@ -137,6 +137,48 @@ pub fn elf_hwcap() -> u64 {
 /// ELF auxv AT_PLATFORM string
 pub const ELF_PLATFORM: &[u8] = b"aarch64";
 
+/// ELF auxv AT_HWCAP2 (Linux arch/arm64/include/uapi/asm/hwcap.h): the
+/// ID-register features usable at EL0 without kernel support; ones that
+/// need it (SVE, BTI, MTE, SME) are not reported
+pub fn elf_hwcap2() -> u64 {
+    const DCPODP: u64 = 1 << 0;
+    const FLAGM2: u64 = 1 << 7;
+    const FRINT: u64 = 1 << 8;
+    const I8MM: u64 = 1 << 13;
+    const BF16: u64 = 1 << 14;
+    const DGH: u64 = 1 << 15;
+    const RNG: u64 = 1 << 16;
+    let (isar0, isar1): (u64, u64);
+    // SAFETY: ID register reads
+    unsafe {
+        core::arch::asm!("mrs {}, id_aa64isar0_el1", out(reg) isar0, options(nomem, nostack));
+        core::arch::asm!("mrs {}, id_aa64isar1_el1", out(reg) isar1, options(nomem, nostack));
+    }
+    let f = |r: u64, shift: u32| (r >> shift) & 0xf;
+    let mut hwcap2 = 0;
+    for (on, bit) in [
+        (f(isar1, 0) >= 2, DCPODP),
+        (f(isar0, 52) >= 2, FLAGM2),
+        (f(isar1, 32) >= 1, FRINT),
+        (f(isar1, 52) >= 1, I8MM),
+        (f(isar1, 44) >= 1, BF16),
+        (f(isar1, 48) >= 1, DGH),
+        (f(isar0, 60) >= 1, RNG),
+    ] {
+        if on {
+            hwcap2 |= bit;
+        }
+    }
+    hwcap2
+}
+
+/// ELF auxv AT_MINSIGSTKSZ (Linux signal_minsigstksz): the signal frame
+/// plus the frame record above it, 16-byte aligned
+pub fn min_sigstksz() -> u64 {
+    let size = super::signal::signal_frame_size() + 16 + 16;
+    (size as u64 + 15) & !15
+}
+
 /// A hardware random seed (Linux arch_get_random_seed_longs): RNDRRS,
 /// reseeded from the true source, when ID_AA64ISAR0_EL1.RNDR says it
 /// exists; it reports failure in PSTATE.Z

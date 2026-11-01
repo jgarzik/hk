@@ -131,7 +131,7 @@ impl StackWriter<'_> {
 }
 
 /// Auxiliary vector (Linux fs/binfmt_elf.c create_elf_tables)
-fn auxv(info: &ExecInfo, random: u64, execfn: u64, platform: u64) -> [(u64, u64); 19] {
+fn auxv(info: &ExecInfo, random: u64, execfn: u64, platform: u64) -> [(u64, u64); 20] {
     const AT_NULL: u64 = 0;
     const AT_PHDR: u64 = 3;
     const AT_PHENT: u64 = 4;
@@ -151,6 +151,7 @@ fn auxv(info: &ExecInfo, random: u64, execfn: u64, platform: u64) -> [(u64, u64)
     const AT_RANDOM: u64 = 25;
     const AT_HWCAP2: u64 = 26;
     const AT_EXECFN: u64 = 31;
+    const AT_MINSIGSTKSZ: u64 = 51;
     let c = crate::task::current_cred();
     let secure = secureexec(&c);
     [
@@ -169,8 +170,9 @@ fn auxv(info: &ExecInfo, random: u64, execfn: u64, platform: u64) -> [(u64, u64)
         (AT_EGID, c.egid as u64),
         (AT_SECURE, secure as u64),
         (AT_RANDOM, random),
-        (AT_HWCAP2, 0),
+        (AT_HWCAP2, crate::arch::elf_hwcap2()),
         (AT_EXECFN, execfn),
+        (AT_MINSIGSTKSZ, crate::arch::min_sigstksz()),
         (AT_PLATFORM, platform),
         (AT_NULL, 0),
     ]

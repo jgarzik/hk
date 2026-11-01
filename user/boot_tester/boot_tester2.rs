@@ -151,6 +151,8 @@ fn auxv_check(sp: *const u64) -> ! {
     const AT_SECURE: u64 = 23;
     const AT_RANDOM: u64 = 25;
     const AT_EXECFN: u64 = 31;
+    const AT_HWCAP2: u64 = 26;
+    const AT_MINSIGSTKSZ: u64 = 51;
     const PT_LOAD: u32 = 1;
     #[cfg(target_arch = "x86_64")]
     const PLATFORM: &[u8] = b"x86_64";
@@ -208,6 +210,15 @@ fn auxv_check(sp: *const u64) -> ! {
     }
     if aux(auxv, AT_HWCAP).is_none() {
         sys_exit(19);
+    }
+    // Both arches report AT_HWCAP2 (possibly 0) and the minimum signal
+    // stack: frame plus FPU state (varies with the XSAVE features the
+    // kernel enables: about 1.7KB with AVX), at most 64KB
+    if aux(auxv, AT_HWCAP2).is_none() {
+        sys_exit(20);
+    }
+    if !(1024..=65536).contains(&get(AT_MINSIGSTKSZ)) {
+        sys_exit(21);
     }
     sys_exit(0);
 }
