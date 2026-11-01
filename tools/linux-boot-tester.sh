@@ -111,6 +111,7 @@ ROOT=$WORK/root
 rm -rf "$ROOT"
 mkdir -p "$ROOT/bin" "$ROOT/mnt"
 tools/busybox-root.sh "$ROOT" "$ARCH"
+tools/dyn-root.sh "$ROOT" "$ARCH"
 cp "$BIN/boot_tester" "$BIN/boot_tester2" "$ROOT/bin/"
 ln -sf boot_tester "$ROOT/bin/init"
 echo -n "Hello from ramfs!" > "$ROOT/test.txt"
@@ -152,7 +153,8 @@ linux_cache_key() {
     local f files
     files=$(git ls-files -co --exclude-standard -- user Makefile rust-toolchain.toml \
         tools/linux-boot-tester.sh tools/mkdisk.sh tools/busybox-root.sh \
-        tools/fetch-deb.sh tools/qemu-net.sh tools/netpeer tools/cpio-test.sh | LC_ALL=C sort -u) || return 1
+        tools/fetch-deb.sh tools/qemu-net.sh tools/netpeer tools/cpio-test.sh \
+        tools/dyn-root.sh | LC_ALL=C sort -u) || return 1
     {
         echo "$ARCH $TIMEOUT $SMP $MEM ${KVM[*]} ${QEMU_MACHINE[*]} ${DISK[*]}" &&
             echo "${QEMU_NET[*]//"$TOP"/}" &&

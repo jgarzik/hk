@@ -104,6 +104,7 @@ pub mod sysctl;
 pub mod clock_ids;
 pub mod cpio_nodes;
 pub mod dev_mem;
+pub mod dyn_exec;
 pub mod fifo;
 pub mod groups;
 pub mod kmsg;
@@ -275,6 +276,7 @@ pub fn run_all_tests() {
     enomem::run_tests();
     uaccess::run_tests();
     isolated(b"BUSYBOX", busybox::run_tests);
+    isolated(b"DYN_EXEC", dyn_exec::run_tests);
     #[cfg(target_arch = "x86_64")]
     ioport::run_tests();
     #[cfg(target_arch = "x86_64")]

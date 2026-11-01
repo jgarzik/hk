@@ -88,18 +88,34 @@ const ENVP_HOME: &[u8] = b"HOME=/\0";
 /// Printed by the child when execve fails (followed by the errno)
 const EXEC_FAILED: &[u8] = b"execve failed: ";
 
+/// What to run: the program, its argv[0] and its PATH (all
+/// NUL-terminated)
+#[derive(Clone, Copy)]
+pub struct Prog {
+    pub path: &'static [u8],
+    pub argv0: &'static [u8],
+    pub env_path: &'static [u8],
+}
+
+/// busybox, its applets found in /bin
+pub const BUSYBOX: Prog = Prog {
+    path: b"/bin/busybox\0",
+    argv0: b"busybox\0",
+    env_path: ENVP_PATH,
+};
+
 /// Child side: stdin from `inp`, stdout/stderr to `outw`, exec
-fn child(args: &[&[u8]], inp: i32, outw: i32) -> ! {
+fn child(prog: Prog, args: &[&[u8]], inp: i32, outw: i32) -> ! {
     sys_dup3(inp, 0, 0);
     sys_dup3(outw, 1, 0);
     sys_dup3(outw, 2, 0);
     let mut argv: [*const u8; 16] = [core::ptr::null(); 16];
-    argv[0] = b"busybox\0".as_ptr();
+    argv[0] = prog.argv0.as_ptr();
     for (i, a) in args.iter().take(14).enumerate() {
         argv[i + 1] = a.as_ptr();
     }
-    let envp: [*const u8; 3] = [ENVP_PATH.as_ptr(), ENVP_HOME.as_ptr(), core::ptr::null()];
-    let e = sys_execve(b"/bin/busybox\0".as_ptr(), argv.as_ptr(), envp.as_ptr());
+    let envp: [*const u8; 3] = [prog.env_path.as_ptr(), ENVP_HOME.as_ptr(), core::ptr::null()];
+    let e = sys_execve(prog.path.as_ptr(), argv.as_ptr(), envp.as_ptr());
     print(EXEC_FAILED);
     print_num(e);
     sys_exit(127)
@@ -114,6 +130,11 @@ pub struct Child {
 /// Start `busybox args...` (each arg NUL-terminated) with `stdin` as
 /// its input
 pub fn spawn(args: &[&[u8]], stdin: &[u8]) -> Option<Child> {
+    spawn_prog(BUSYBOX, args, stdin)
+}
+
+/// Start `prog args...` with `stdin` as its input
+pub fn spawn_prog(prog: Prog, args: &[&[u8]], stdin: &[u8]) -> Option<Child> {
     let mut outp = [0i32; 2];
     let mut inp = [0i32; 2];
     if sys_pipe2(outp.as_mut_ptr(), O_CLOEXEC) < 0 {
@@ -126,7 +147,7 @@ pub fn spawn(args: &[&[u8]], stdin: &[u8]) -> Option<Child> {
     }
     let pid = sys_fork();
     if pid == 0 {
-        child(args, inp[0], outp[1]);
+        child(prog, args, inp[0], outp[1]);
     }
     sys_close(outp[1] as u64);
     sys_close(inp[0] as u64);
@@ -160,7 +181,12 @@ pub fn finish(c: Child, timeout_ms: i64) -> Run {
 
 /// Run `busybox args...` with `stdin` as input
 pub fn bb_input(args: &[&[u8]], stdin: &[u8], timeout_ms: i64) -> Run {
-    match spawn(args, stdin) {
+    run_prog(BUSYBOX, args, stdin, timeout_ms)
+}
+
+/// Run `prog args...` with `stdin` as input, collecting its output
+pub fn run_prog(prog: Prog, args: &[&[u8]], stdin: &[u8], timeout_ms: i64) -> Run {
+    match spawn_prog(prog, args, stdin) {
         Some(c) => finish(c, timeout_ms),
         None => Run {
             status: -1,

@@ -35,13 +35,14 @@ $(BOOT_TESTER) $(BOOT_TESTER2): boot_tester/main.rs boot_tester/boot_tester2.rs 
 	$(CARGO) build --release --target $(TARGET)
 
 # busybox + /etc (shared with the Linux harness)
-ROOTFS_DEPS = ../tools/busybox-root.sh ../tools/fetch-deb.sh ../tools/cpio-test.sh $(shell find rootfs -type f)
+ROOTFS_DEPS = ../tools/busybox-root.sh ../tools/fetch-deb.sh ../tools/cpio-test.sh ../tools/dyn-root.sh $(shell find rootfs -type f)
 
 $(INITRAMFS): $(BOOT_TESTER) $(BOOT_TESTER2) $(ROOTFS_DEPS)
 	@rm -rf $(INITRD_ROOT)
 	@mkdir -p $(INITRD_ROOT)/bin
 	@mkdir -p $(INITRD_ROOT)/mnt
 	../tools/busybox-root.sh $(INITRD_ROOT) $(ARCH)
+	../tools/dyn-root.sh $(INITRD_ROOT) $(ARCH)
 	cp $(BOOT_TESTER) $(INITRD_ROOT)/bin/boot_tester
 	cp $(BOOT_TESTER2) $(INITRD_ROOT)/bin/boot_tester2
 	ln -sf boot_tester $(INITRD_ROOT)/bin/init

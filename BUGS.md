@@ -84,14 +84,6 @@ capabilities (security.capability) raise the permitted set
 (bprm_fill_uid, cap_bprm_creds_from_file). hk exec keeps the caller's
 credentials unchanged, so set-id programs run unprivileged.
 
-## No dynamically linked executables
-
-**Location**: `kernel/task/exec.rs` (`do_execve`)
-
-A PT_INTERP program interpreter is never loaded: exec of a dynamic
-executable fails with ENOEXEC (ENOENT if the interpreter does not
-exist, as on Linux). Only static and static-pie programs run.
-
 ## CPU-time clocks: no timers or sleeps
 
 **Location**: `kernel/time_syscall.rs`, `kernel/posix_timer.rs`
