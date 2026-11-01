@@ -136,3 +136,43 @@ pub fn elf_hwcap() -> u64 {
 
 /// ELF auxv AT_PLATFORM string
 pub const ELF_PLATFORM: &[u8] = b"aarch64";
+
+/// A hardware random seed (Linux arch_get_random_seed_longs): RNDRRS,
+/// reseeded from the true source, when ID_AA64ISAR0_EL1.RNDR says it
+/// exists; it reports failure in PSTATE.Z
+pub fn arch_random_seed() -> Option<u64> {
+    let isar0: u64;
+    // SAFETY: an ID register read
+    unsafe {
+        core::arch::asm!("mrs {}, id_aa64isar0_el1", out(reg) isar0, options(nomem, nostack))
+    };
+    if (isar0 >> 60) & 0xf == 0 {
+        return None;
+    }
+    for _ in 0..10 {
+        let (v, fail): (u64, u64);
+        // SAFETY: FEAT_RNG is present; s3_3_c2_c4_1 is RNDRRS
+        unsafe {
+            core::arch::asm!(
+                "mrs {v}, s3_3_c2_c4_1",
+                "cset {f}, eq",
+                v = out(reg) v,
+                f = out(reg) fail,
+                options(nomem, nostack)
+            )
+        };
+        if fail == 0 {
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// A fast-changing counter to mix in as entropy (Linux
+/// random_get_entropy: the virtual counter)
+pub fn random_get_entropy() -> u64 {
+    let c: u64;
+    // SAFETY: CNTVCT_EL0 is readable at EL1
+    unsafe { core::arch::asm!("mrs {}, cntvct_el0", out(reg) c, options(nomem, nostack)) };
+    c
+}

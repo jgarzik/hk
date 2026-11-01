@@ -14,6 +14,7 @@
 //! - Test 32: fcntl(F_DUPFD_CLOEXEC) - duplicate with cloexec
 //! - Test 33: fcntl() with invalid fd returns -EBADF
 //! - Test 34: getrandom() - get random bytes
+//! - GETRANDOM_STREAM: a 64KB read is whole and evenly spread
 //! - Test 35: getrandom() with invalid flags returns -EINVAL
 //! - Test 36: ioctl() with invalid fd returns -EBADF
 //! - Test 37: ioctl() on regular file returns -ENOTTY
@@ -65,6 +66,7 @@ pub fn run_tests() {
     test_fcntl_ebadf();
     test_getrandom();
     test_getrandom_einval();
+    test_getrandom_stream();
     test_ioctl_ebadf();
     test_ioctl_enotty();
     // preadv2/pwritev2 tests
@@ -852,6 +854,46 @@ fn test_getrandom_einval() {
         print(b"GETRANDOM_EINVAL:FAIL: expected -22 (EINVAL), got ");
         print_num(ret);
         println(b"");
+    }
+}
+
+/// GETRANDOM_STREAM: a 64KB read is one fast-key-erased ChaCha20
+/// stream: every byte value turns up near 256 times (none under 150 or
+/// over 380), two reads differ, and GRND_INSECURE|GRND_RANDOM is EINVAL
+fn test_getrandom_stream() {
+    const GRND_RANDOM: u32 = 2;
+    const GRND_INSECURE: u32 = 4;
+    static mut BUF: [u8; 65536] = [0; 65536];
+    // SAFETY: the boot tester is single-threaded here
+    let buf = unsafe { &mut *core::ptr::addr_of_mut!(BUF) };
+    let mut a = [0u8; 32];
+    let mut b = [0u8; 32];
+    let n = sys_getrandom(buf.as_mut_ptr(), buf.len(), 0);
+    sys_getrandom(a.as_mut_ptr(), 32, 0);
+    sys_getrandom(b.as_mut_ptr(), 32, GRND_RANDOM);
+    let mut count = [0u32; 256];
+    for &x in buf.iter() {
+        count[x as usize] += 1;
+    }
+    let lo = *count.iter().min().unwrap();
+    let hi = *count.iter().max().unwrap();
+    let both = sys_getrandom(a.as_mut_ptr(), 1, GRND_INSECURE | GRND_RANDOM);
+    let why: &[u8] = if n != buf.len() as i64 {
+        b"short read"
+    } else if lo < 150 || hi > 380 {
+        b"skewed bytes"
+    } else if a == b {
+        b"repeated output"
+    } else if both != -22 {
+        b"INSECURE|RANDOM not EINVAL"
+    } else {
+        b""
+    };
+    if why.is_empty() {
+        println(b"GETRANDOM_STREAM:OK");
+    } else {
+        print(b"GETRANDOM_STREAM:FAIL ");
+        println(why);
     }
 }
 

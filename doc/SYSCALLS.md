@@ -521,7 +521,7 @@ There are very few direct "cgroup_*" syscalls; the cgroup v1/v2 APIs are primari
 
 - [x] uname
 - [x] sysinfo
-- [x] getrandom
+- [x] getrandom (ChaCha20 CRNG, up to MAX_RW_COUNT per call)
 - [x] reboot
 - [x] kexec_load (stub, returns -ENOSYS; requires CAP_SYS_BOOT)
 - [x] syslog

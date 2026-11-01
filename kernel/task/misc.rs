@@ -359,39 +359,24 @@ pub fn sys_getrandom<A: crate::uaccess::UaccessArch>(buf: u64, buflen: usize, fl
     use crate::random;
     use crate::uaccess::copy_to_user;
 
-    // Limit buffer size per call to prevent stack overflow
-    const MAX_GETRANDOM: usize = 256;
-
-    if buflen == 0 {
+    // Flags first (EINVAL even for an empty buffer, as on Linux)
+    if let Err(e) = random::get_random_bytes(&mut [], flags) {
+        return e as i64;
+    }
+    // Linux getrandom: at most MAX_RW_COUNT per call; a fault before
+    // any byte is EFAULT, after some returns the count
+    let len = buflen.min(crate::fs::syscall::MAX_RW_COUNT);
+    if len == 0 {
         return 0;
     }
-
-    // Validate flags first
-    const VALID_FLAGS: u32 = random::GRND_NONBLOCK | random::GRND_RANDOM | random::GRND_INSECURE;
-    if flags & !VALID_FLAGS != 0 {
-        return KernelError::InvalidArgument.sysret();
-    }
-
-    // Limit single read to stack buffer size
-    let len = buflen.min(MAX_GETRANDOM);
-
-    // Validate user buffer
     if !A::access_ok(buf, len) {
         return KernelError::BadAddress.sysret();
     }
-
-    // Generate random bytes
-    let mut tmp = [0u8; MAX_GETRANDOM];
-    match random::get_random_bytes(&mut tmp[..len], flags) {
-        Ok(n) => {
-            // Copy to user space
-            if copy_to_user::<A>(buf, &tmp[..n]).is_err() {
-                return KernelError::BadAddress.sysret();
-            }
-            n as i64
-        }
-        Err(e) => e as i64,
+    let n = random::stream(len, |off, b| copy_to_user::<A>(buf + off as u64, b).is_ok());
+    if n == 0 {
+        return KernelError::BadAddress.sysret();
     }
+    n as i64
 }
 
 // =============================================================================

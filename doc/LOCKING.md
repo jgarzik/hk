@@ -3063,7 +3063,8 @@ else is taken under it) unless an order is given. "spin" is the
 | `INTX_MAP` | arch/aarch64/pci_irq.rs | spin Mutex | PCI INTx routing from the device tree (boot) |
 | `PCI_LOCK` | arch/x86_64/pci_conf.rs (port I/O config access) | IrqSpinlock | Linux pci_lock: the CF8 address write and the CFC data access of one config read/write; leaf (port I/O only). ECAM accesses are single MMIO operations and take no lock |
 | PCI fixups (`bus/quirks.rs`) | none | thread only (boot) | run by bus enumeration (single-threaded) on each function before driver probe |
-| `CMDLINE_CONSOLE`, `CRNG` | cmdline.rs, random.rs | spin Mutex | console= choice, CRNG state |
+| `CMDLINE_CONSOLE` | cmdline.rs | spin Mutex | console= choice |
+| `CPU_CRNG` (per CPU) -> `BASE` | random.rs | IrqSpinlock | ChaCha20 CRNG: this CPU's key, then the base key when the CPU key is refreshed or the base reseeded; both leaves otherwise (callers include softirq net code). `GENERATION`/`BIRTH_NS` are atomics read unlocked, rechecked under `BASE` |
 | `NUMA_TOPOLOGY` | numa.rs | IrqSpinlock | NUMA node table |
 | `BpfHashMap.data`, `BpfArrayMap.data` | bpf/map.rs | IrqSpinlock | BPF map contents |
 
