@@ -70,6 +70,12 @@ const ALL_FIXED_STATUS: u16 = 0xc731;
 /// PM1 status: the ignored bit, written as zero (ACPICA
 /// ACPI_PM1_STATUS_PRESERVED_BITS)
 const PM1_STS_PRESERVED: u16 = 1 << 11;
+/// PM1 control: GBL_RLS (a write raises an SMI to release the global
+/// lock)
+const GBL_RLS: u16 = 1 << 2;
+/// PM1 control: write-only bits, masked out of every read (ACPICA
+/// ACPI_PM1_CONTROL_WRITEONLY_BITS)
+const PM1_CNT_WRITEONLY: u16 = SLP_EN | GBL_RLS;
 
 /// The firmware never set SCI_EN after the ACPI enable command
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -166,14 +172,15 @@ fn gpe_blocks(regs: &PmRegs) -> impl Iterator<Item = (u16, u16)> {
         .map(|(base, len)| (base, len as u16 / 2))
 }
 
-/// PM1 control, a and b ORed (Linux acpi_hw_read_multiple)
+/// PM1 control, a and b ORed, write-only bits clear (Linux
+/// acpi_hw_register_read: a read-modify-write never sets GBL_RLS)
 fn pm1_cnt_read(io: &mut impl PortIo, regs: &PmRegs) -> u16 {
     let b = if regs.pm1b_cnt != 0 {
         io.inw(regs.pm1b_cnt)
     } else {
         0
     };
-    io.inw(regs.pm1a_cnt) | b
+    (io.inw(regs.pm1a_cnt) | b) & !PM1_CNT_WRITEONLY
 }
 
 /// Write PM1a and PM1b control (Linux acpi_hw_write_pm1_control)
@@ -323,17 +330,17 @@ mod tests {
 
     /// The Linux sequence: wake status cleared, GPEs disabled, then
     /// PM1 control read-modify-written twice, SLP_TYP alone first,
-    /// SCI_EN and the other bits kept
+    /// SCI_EN and the other bits kept, write-only GBL_RLS never set
     #[test]
     fn s5_sequence() {
         let mut hw = FakeChipset::new(LPT);
-        hw.setw(LPT.pm1a_cnt, SCI_EN | (1 << 2) | (5 << SLP_TYP_SHIFT));
+        hw.setw(LPT.pm1a_cnt, SCI_EN | GBL_RLS | (1 << 1) | (5 << SLP_TYP_SHIFT));
         hw.setw(LPT.pm1a_evt, WAK_STS);
         for i in 0..LPT.gpe0_len as u16 {
             hw.ports[(LPT.gpe0 + i) as usize] = 0xff;
         }
         enter_s5(&mut hw, &LPT, S5);
-        let keep = SCI_EN | (1 << 2);
+        let keep = SCI_EN | (1 << 1);
         let typ = 7 << SLP_TYP_SHIFT;
         assert_eq!(
             hw.writes_to(LPT.pm1a_cnt),
