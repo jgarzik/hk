@@ -13,19 +13,24 @@
 //!   runner survive, its memory comes back and the next fork works
 //! - OOM_SHARED_KILL (hk only): the same with shared anonymous memory
 //! - OOM_SPARSE_KILL (hk only): the same touching one page per 2MB, so
-//!   every touch also costs page tables: those stop at the same
+//!   every touch also costs a page table page (the mapping is sized so
+//!   twice RAM's worth of touches fit): those stop at the same
 //!   watermark as user pages, the kernel keeps its reserve (MemFree at
 //!   least vm.min_free_kbytes afterwards) and the next fork works
 //! - OOM_PIPE_RESERVE (hk only: Linux would OOM-kill): kernel objects
-//!   driven by a user, pipes full of data, until memory runs out: pipe
+//!   driven by a user, pipes full of data (enough pipes, and fds for
+//!   them, to hold twice RAM), until memory runs out: pipe
 //!   pages stop at the low watermark, so at that point MemFree is still
 //!   at least vm.min_free_kbytes, nothing panics, and it all comes back
 //! - OOM_MLOCK_EAGAIN (hk only: Linux would OOM-kill instead): mlock of
 //!   more memory than there is fails with EAGAIN, and the memory comes
 //!   back when the process exits
+//!
+//! OOM_*_KILL, OOM_PIPE_RESERVE and OOM_MLOCK_EAGAIN fill all of RAM,
+//! sized from MemTotal; above 4GB they are skipped (mm_life::exhaust_ok)
 
 use super::helpers::{host_mode, print, print_num, println, skip};
-use super::mm_life::meminfo;
+use super::mm_life::{exhaust_ok, meminfo};
 use hk_syscall::{
     MAP_ANONYMOUS, MAP_PRIVATE, MAP_SHARED, MREMAP_DONTUNMAP, MREMAP_MAYMOVE, O_NONBLOCK, O_RDONLY,
     PROT_READ, PROT_WRITE, RLIMIT_AS, RLIMIT_MEMLOCK, RLIMIT_NOFILE, RLimit, Timespec, sys_brk,
@@ -53,7 +58,7 @@ pub fn run_tests() {
 /// Child: mlock more than the machine has; EAGAIN expected (exit 0x80
 /// stands in for the SIGKILL the other children expect)
 fn mlock_hog() -> u64 {
-    let len = (meminfo(b"MemTotal:").max(0) as u64 * 1024 * 2) & !(PAGE - 1);
+    let len = (ram() * 2) & !(PAGE - 1);
     let flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE;
     let p = sys_mmap(0, len, PROT_READ | PROT_WRITE, flags, -1, 0);
     if p < 0 {
@@ -232,18 +237,23 @@ fn hog_shared() -> u64 {
     touch_all(MAP_SHARED)
 }
 
-/// Child: one page per 2MB of a mapping far larger than RAM's worth of
-/// page tables
+/// All RAM in bytes
+fn ram() -> u64 {
+    meminfo(b"MemTotal:").max(0) as u64 * 1024
+}
+
+/// Child: one page per 2MB of a mapping with room for twice RAM's worth
+/// of touches (each costs a data page and a page table page)
 fn hog_sparse() -> u64 {
-    const LEN: u64 = 512 << 30;
     const STEP: u64 = 2 * MB;
+    let len = ram() / (2 * PAGE) * 2 * STEP;
     let flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE;
-    let p = sys_mmap(0, LEN, PROT_READ | PROT_WRITE, flags, -1, 0);
+    let p = sys_mmap(0, len, PROT_READ | PROT_WRITE, flags, -1, 0);
     if p < 0 {
         return 2;
     }
     let mut a = p as u64;
-    while a < p as u64 + LEN {
+    while a < p as u64 + len {
         unsafe { core::ptr::write_volatile(a as *mut u8, 1) };
         a += STEP;
     }
@@ -252,12 +262,16 @@ fn hog_sparse() -> u64 {
 
 static PIPE_DATA: [u8; 65536] = [0x5a; 65536];
 
-/// Child: fill pipes (64KB each) until writes come up short; exit 0x80
-/// if free memory then is still at least min_free_kbytes
+/// Child: fill pipes (64KB each, enough for twice RAM) until writes
+/// come up short; exit 0x80 if free memory then is still at least
+/// min_free_kbytes
 fn pipe_hog() -> u64 {
+    let pipes = 2 * ram() / PIPE_DATA.len() as u64;
+    // Two fds per pipe
+    let fds = 2 * pipes + 64;
     let lim = RLimit {
-        rlim_cur: 65536,
-        rlim_max: 65536,
+        rlim_cur: fds,
+        rlim_max: fds,
     };
     if sys_setrlimit(RLIMIT_NOFILE, &lim) != 0 {
         return 2;
@@ -267,7 +281,7 @@ fn pipe_hog() -> u64 {
     let min = read_int(b"/proc/sys/vm/min_free_kbytes\0");
     meminfo(b"MemFree:");
     let mut full = false;
-    for _ in 0..32000 {
+    for _ in 0..pipes {
         let mut fds = [0i32; 2];
         if sys_pipe2(fds.as_mut_ptr(), O_NONBLOCK) < 0 {
             full = true;
@@ -317,7 +331,7 @@ fn read_int(path: &[u8]) -> i64 {
 }
 
 fn touch_all(share: u32) -> u64 {
-    let len = (meminfo(b"MemTotal:").max(0) as u64 * 1024 * 2) & !(PAGE - 1);
+    let len = (ram() * 2) & !(PAGE - 1);
     let flags = share | MAP_ANONYMOUS | MAP_NORESERVE;
     let p = sys_mmap(0, len, PROT_READ | PROT_WRITE, flags, -1, 0);
     if p < 0 {
@@ -342,6 +356,9 @@ fn settle() {
 fn fault_kill(name: &[u8], f: fn() -> u64) {
     if host_mode() {
         skip(name, b"Linux OOM killer victim choice depends on the host");
+        return;
+    }
+    if !exhaust_ok(name) {
         return;
     }
     settle();

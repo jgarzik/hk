@@ -3,7 +3,7 @@
 //! blocked in big reads at once must not exhaust kernel memory.
 
 use super::helpers::{print, print_num, println};
-use super::mm_life::{SI_FREERAM, sysinfo_ram};
+use super::mm_life::{SI_FREERAM, SI_TOTALRAM, exhaust_ok, sysinfo_ram};
 use hk_syscall::{
     MAP_ANONYMOUS, MAP_PRIVATE, O_CREAT, O_RDWR, O_TRUNC, PROT_READ, PROT_WRITE, Timespec,
     sys_close, sys_exit, sys_fork, sys_mmap, sys_nanosleep, sys_open, sys_pipe, sys_pread64,
@@ -154,6 +154,9 @@ fn test_ramfs_unlink() {
 /// kernel; Linux's rootfs tmpfs is limited to half of RAM), the kernel
 /// keeps working, and deleting the file makes the space usable again
 fn test_ramfs_full() {
+    if !exhaust_ok(b"BIGIO_RAMFS_FULL") {
+        return;
+    }
     fn body() -> i32 {
         const ENOSPC: i64 = -28;
         let fd = sys_open(RFILE.as_ptr(), O_CREAT | O_RDWR | O_TRUNC, 0o644);
@@ -161,6 +164,8 @@ fn test_ramfs_full() {
             return 1;
         }
         let chunk = [0x5au8; 65536];
+        // More than all of RAM fitting means ramfs has no limit at all
+        let limit = sysinfo_ram(SI_TOTALRAM) + 256 * MB as u64;
         let mut total = 0u64;
         let err = loop {
             let n = sys_write(fd as u64, chunk.as_ptr(), chunk.len() as u64);
@@ -168,7 +173,7 @@ fn test_ramfs_full() {
                 break n;
             }
             total += n as u64;
-            if total > 1024 * MB as u64 {
+            if total > limit {
                 break 0;
             }
         };
