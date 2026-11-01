@@ -1110,16 +1110,23 @@ fn fatal(sighand: Option<&Arc<SigHand>>, sig: u32) -> bool {
 
 /// A fatal signal reached `tid`: its group exits with that status and
 /// every thread gets SIGKILL (Linux complete_signal; a traced target
-/// sees anything but SIGKILL first). Not if `tid` itself is exiting or
-/// a zombie (Linux wants_signal skips PF_EXITING): a process-directed
-/// signal was already sent to a live thread if there was one.
+/// sees anything but SIGKILL first). Not once every thread of the group
+/// has started exiting (Linux complete_signal finds no thread that
+/// wants it): the status the last thread set stays. Decided under the
+/// same TASKLIST hold as the group lookup, so a process-directed signal
+/// whose chosen thread began exiting after it was picked still ends
+/// the threads left. Unlike Linux, a thread-directed one to an exiting
+/// thread with live siblings ends them too.
 fn group_kill(tid: Tid, sig: u32) {
     let found = {
         let table = TASKLIST.read();
-        table
-            .get(tid)
-            .filter(task_live)
-            .map(|t| (t.task.pid, t.ptrace != 0, group_signal(&table, t.task.pid)))
+        table.get(tid).and_then(|t| {
+            let pid = t.task.pid;
+            table
+                .threads(pid)
+                .any(|u| task_live(&u))
+                .then(|| (pid, t.ptrace != 0, group_signal(&table, pid)))
+        })
     };
     let Some((tgid, traced, Some(s))) = found else {
         return;
