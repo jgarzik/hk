@@ -402,6 +402,39 @@ atomics. No such workaround exists in this tree: since the first commit
 fields, and the USB vfat boot tests (both arches) pass on them. Kept
 only as a pointer if wrong USB slot/endpoint values ever show up again.
 
+## xHCI driver gaps on real hardware
+
+**Location**: `kernel/usb/xhci.rs`, `kernel/usb/msc.rs`
+
+Found while chasing the Dell OptiPlex 3020 freeze; QEMU's xHCI hides
+all of them.
+- Command completions are not matched to their TRB (`wait_for_command`
+  ignores `_trb_addr`): a late completion for a timed-out command is
+  taken by the next command.
+- A timed-out bulk transfer returns early (`do_bulk_out`/`do_bulk_in`
+  via `?`) without `dma_unmap` and with its TRB still queued; the
+  buffer (heap, freed by the caller) can still be written by the
+  controller.
+- Enumeration reads no descriptors and sends no SET_CONFIGURATION
+  (`control_transfer` is a stub); devices get class 0 and no
+  interfaces. No hub support (route string 0).
+- `UsbMscBusDriver::matches` accepts any device and assumes QEMU's
+  endpoints (0x81/0x02); `main.rs` makes `sda` of the first one.
+- Only 4 KiB controller pages and up to 512 scratchpad buffers.
+- The second, unused init path (`XhciController::init`, `init_xhci`)
+  has none of the fixes and should go.
+
+## x86 has no IOAPIC or MSI
+
+**Location**: `kernel/arch/x86_64/irq.rs`, `kernel/bus/pci.rs`
+
+Device interrupts reach the CPUs only through the 8259 PIC, on the
+line firmware wrote into each function's Interrupt Line register (PIC
+mode, legacy BIOS boot), delivered to the boot CPU only. Real hardware
+in APIC mode (UEFI boot; Linux on the Dell uses IOAPIC 16-23 and MSI)
+needs IOAPIC with ACPI `_PRT` routing, or MSI/MSI-X, which xHCI, AHCI
+and r8169 all support.
+
 ## Block layer gaps (P1)
 
 **Location**: `kernel/storage/`, `kernel/virtio/blk.rs`,
