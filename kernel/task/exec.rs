@@ -406,22 +406,49 @@ fn segment_vmas(elf: &ElfExecutable, base: u64) -> Vec<crate::mm::Vma> {
     vmas
 }
 
-/// Where a program interpreter goes (Linux load_elf_interp: the first
-/// free area below mmap_base big enough for all its segments, at their
-/// alignment); an ET_EXEC interpreter at its link address
-fn interp_base(elf: &ElfExecutable) -> u64 {
-    if !elf.is_pie {
-        return 0;
-    }
+/// The page-aligned [lo, hi) of `elf`'s loaded segments (before any
+/// load bias); None for an image without one or a span past u64
+fn image_span(elf: &ElfExecutable) -> Option<(u64, u64)> {
     let segs = elf.segments.iter().filter(|s| s.mem_size > 0);
-    let lo = segs.clone().map(|s| s.vaddr).min().unwrap_or(0) & !(PAGE_SIZE - 1);
+    let lo = segs.clone().map(|s| s.vaddr).min()? & !(PAGE_SIZE - 1);
     let hi = segs
-        .map(|s| s.vaddr + s.mem_size as u64)
-        .max()
-        .unwrap_or(0)
-        .next_multiple_of(PAGE_SIZE);
-    let align = elf.align.max(PAGE_SIZE);
-    ((crate::mm::mmap_base() - (hi - lo)) & !(align - 1)) - lo
+        .map(|s| s.vaddr.checked_add(s.mem_size as u64))
+        .try_fold(0u64, |m, e| e.map(|e| m.max(e)))?
+        .checked_next_multiple_of(PAGE_SIZE)?;
+    Some((lo, hi))
+}
+
+/// Where a program interpreter goes (Linux load_elf_interp): the first
+/// free area below mmap_base big enough for all its segments, at their
+/// alignment, and below the program's own image if that is in the way;
+/// ENOMEM if there is no such room. An ET_EXEC interpreter goes at its
+/// link address, EINVAL if that overlaps the program or the stack area
+/// (Linux would map it over them).
+fn interp_base(interp: &ElfExecutable, prog: &ElfExecutable, prog_base: u64) -> Result<u64, i32> {
+    let (lo, hi) = image_span(interp).ok_or(ENOEXEC)?;
+    let (plo, phi) = image_span(prog).ok_or(ENOEXEC)?;
+    let (plo, phi) = (plo + prog_base, phi + prog_base);
+    let top = crate::mm::mmap_base();
+    let overlaps = |a: u64, b: u64| a < phi && plo < b;
+    if !interp.is_pie {
+        if overlaps(lo, hi) || hi > top {
+            return Err(EINVAL);
+        }
+        return Ok(0);
+    }
+    let span = hi - lo;
+    let align = interp.align.max(PAGE_SIZE);
+    // Where `lo` lands when the image ends at or below `limit`
+    let below = |limit: u64| limit.checked_sub(span).map(|s| s & !(align - 1));
+    let mut start = below(top).ok_or(ENOMEM)?;
+    if overlaps(start, start + span) {
+        start = below(plo).ok_or(ENOMEM)?;
+    }
+    // Keep clear of the lowest pages (mmap_min_addr)
+    if start < PAGE_SIZE * 16 {
+        return Err(ENOMEM);
+    }
+    start.checked_sub(lo).ok_or(ENOMEM)
 }
 
 /// Load ELF segments into a page table
@@ -807,12 +834,6 @@ where
         Ok(i) => i,
         Err(_) => return -ELIBBAD,
     };
-    let interp_base = interp.as_ref().map_or(0, interp_base);
-    if let Some(ie) = &interp
-        && let Err(e) = check_segments(ie, interp_base)
-    {
-        return -e;
-    }
 
     // Release all POSIX advisory locks (POSIX semantics: locks released on exec)
     crate::fs::posix_lock::release_all_posix_locks_for_pid(crate::task::percpu::current_pid());
@@ -825,6 +846,16 @@ where
         0
     };
     if let Err(e) = check_segments(&elf, base_addr) {
+        return -e;
+    }
+    let interp_base = match interp.as_ref().map(|ie| interp_base(ie, &elf, base_addr)) {
+        Some(Ok(b)) => b,
+        Some(Err(e)) => return -e,
+        None => 0,
+    };
+    if let Some(ie) = &interp
+        && let Err(e) = check_segments(ie, interp_base)
+    {
         return -e;
     }
     // With an interpreter the program starts there; it finds the
