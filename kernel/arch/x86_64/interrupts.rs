@@ -299,8 +299,8 @@ pub extern "C" fn idt_dispatch(regs: &mut PtRegs, vector: u64) {
         v if v == LAPIC_TIMER_VECTOR as u64 => handle_lapic_timer(),
         v if v == CALL_FUNCTION_VECTOR as u64 => handle_call_function(),
         v if v == RESCHEDULE_VECTOR as u64 => handle_reschedule(),
-        v if v == lapic::ERROR_APIC_VECTOR as u64 => handle_apic_error(),
-        v => handle_spurious(v as u8),
+        v if v == lapic::ERROR_APIC_VECTOR as u64 => in_irq(handle_apic_error),
+        v => in_irq(|| handle_spurious(v as u8)),
     }
     // Back to user mode: its pending work first (Linux
     // irqentry_exit_to_user_mode); not for NMI, #DF, #MC (paranoid)
@@ -614,7 +614,7 @@ pub const RESCHEDULE_VECTOR: u8 = 0xfd;
 
 /// Run `f` as an interrupt handler: interrupt depth and lockdep's
 /// interrupt context account for it
-fn in_irq(f: fn()) {
+fn in_irq(f: impl FnOnce()) {
     let percpu = super::percpu::try_current_cpu();
     if let Some(p) = percpu {
         p.interrupt_depth.fetch_add(1, Ordering::Relaxed);
