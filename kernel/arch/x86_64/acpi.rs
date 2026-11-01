@@ -12,6 +12,9 @@
 //! accessing them.
 
 use super::ioremap::{ioremap, iounmap};
+use crate::acpi::aml::{self, SleepType};
+use crate::acpi::hw::PmRegs;
+use crate::arch::PowerInfo;
 use alloc::vec::Vec;
 
 /// RSDP signature "RSD PTR "
@@ -22,6 +25,12 @@ const MADT_SIGNATURE: &[u8; 4] = b"APIC";
 
 /// FADT signature "FACP" (Fixed ACPI Description Table)
 const FADT_SIGNATURE: &[u8; 4] = b"FACP";
+
+/// DSDT signature "DSDT" (Differentiated System Description Table)
+const DSDT_SIGNATURE: &[u8; 4] = b"DSDT";
+
+/// SSDT signature "SSDT" (Secondary System Description Table)
+const SSDT_SIGNATURE: &[u8; 4] = b"SSDT";
 
 /// SRAT signature "SRAT" (System Resource Affinity Table)
 const SRAT_SIGNATURE: &[u8; 4] = b"SRAT";
@@ -63,17 +72,6 @@ pub struct IoApicInfo {
     pub address: u32,
     /// Global System Interrupt base
     pub gsi_base: u32,
-}
-
-/// Power management information from FADT
-#[derive(Debug, Clone, Copy)]
-pub struct PowerInfo {
-    /// PM1a Control Block I/O port address
-    pub pm1a_cnt_blk: u16,
-    /// PM1b Control Block I/O port address (optional)
-    pub pm1b_cnt_blk: Option<u16>,
-    /// Sleep type value for S5 (soft-off) state
-    pub slp_typa: u8,
 }
 
 /// ACPI information extracted from tables
@@ -148,9 +146,6 @@ struct MadtHeader {
 // - LAPIC (type 0): header (2) + processor_id (1) + apic_id (1) + flags (4)
 // - LAPIC_64 (type 5): header (2) + reserved (2) + address (8)
 //
-// FADT layout (for power management):
-// - pm1a_cnt_blk at offset 64
-// - pm1b_cnt_blk at offset 68
 
 /// Map an entire ACPI table given its physical address
 /// Returns mapped pointer or error. Caller must iounmap when done.
@@ -197,9 +192,10 @@ pub fn parse_acpi() -> Result<AcpiInfo, &'static str> {
 
     // Find and parse FADT for power management info
     if let Ok(fadt_phys) = find_fadt_phys(sdt_phys, is_xsdt)
-        && let Ok(power_info) = parse_fadt_mapped(fadt_phys)
+        && let Ok((pm, dsdt_phys)) = parse_fadt_mapped(fadt_phys)
     {
-        info.power_info = Some(power_info);
+        let s5 = find_s5(dsdt_phys, sdt_phys, is_xsdt);
+        info.power_info = Some(PowerInfo { pm, s5 });
     }
 
     Ok(info)
@@ -300,6 +296,22 @@ fn find_fadt_phys(sdt_phys: u64, is_xsdt: bool) -> Result<u64, &'static str> {
 
 /// Find a table's physical address in RSDT or XSDT by signature (uses ioremap)
 fn find_table_phys(sdt_phys: u64, is_xsdt: bool, signature: &[u8; 4]) -> Result<u64, &'static str> {
+    let mut found = None;
+    for_each_table(sdt_phys, is_xsdt, signature, |phys| {
+        found = Some(phys);
+        false
+    })?;
+    found.ok_or("Table not found in RSDT/XSDT")
+}
+
+/// Call `f` with the physical address of each RSDT/XSDT table whose
+/// signature is `signature`, until it returns false (uses ioremap)
+fn for_each_table(
+    sdt_phys: u64,
+    is_xsdt: bool,
+    signature: &[u8; 4],
+    mut f: impl FnMut(u64) -> bool,
+) -> Result<(), &'static str> {
     unsafe {
         // Map the RSDT/XSDT
         let sdt_ptr = map_acpi_table(sdt_phys)?;
@@ -314,11 +326,9 @@ fn find_table_phys(sdt_phys: u64, is_xsdt: bool, signature: &[u8; 4]) -> Result<
 
         let header_size = core::mem::size_of::<SdtHeader>();
         let entry_size = if is_xsdt { 8 } else { 4 };
-        let num_entries = (total_length - header_size) / entry_size;
+        let num_entries = total_length.saturating_sub(header_size) / entry_size;
 
         let entries_start = sdt_ptr.add(header_size);
-
-        let mut result: Option<u64> = None;
 
         for i in 0..num_entries {
             let entry_ptr = entries_start.add(i * entry_size);
@@ -328,26 +338,25 @@ fn find_table_phys(sdt_phys: u64, is_xsdt: bool, signature: &[u8; 4]) -> Result<
                 core::ptr::read_unaligned(entry_ptr as *const u32) as u64
             };
 
-            // Map just the header of this table to check signature
-            let header_size_u64 = core::mem::size_of::<SdtHeader>() as u64;
-            if let Ok(entry_header_ptr) = ioremap(entry_phys, header_size_u64) {
-                // Read signature (first 4 bytes, no alignment issue)
-                let entry_sig_ptr = entry_header_ptr as *const [u8; 4];
-                let entry_sig = core::ptr::read_unaligned(entry_sig_ptr);
-                iounmap(entry_header_ptr, header_size_u64);
-
-                if &entry_sig == signature {
-                    result = Some(entry_phys);
-                    break;
-                }
+            if table_signature(entry_phys).as_ref() == Some(signature) && !f(entry_phys) {
+                break;
             }
         }
 
         // Unmap the RSDT/XSDT
         iounmap(sdt_ptr, total_length as u64);
-
-        result.ok_or("Table not found in RSDT/XSDT")
+        Ok(())
     }
+}
+
+/// The signature of the table at `phys` (maps just its header)
+fn table_signature(phys: u64) -> Option<[u8; 4]> {
+    let size = core::mem::size_of::<SdtHeader>() as u64;
+    let ptr = ioremap(phys, size).ok()?;
+    // SAFETY: the header is mapped; the signature is its first 4 bytes
+    let sig = unsafe { core::ptr::read_unaligned(ptr as *const [u8; 4]) };
+    iounmap(ptr, size);
+    Some(sig)
 }
 
 /// Parse MADT and extract CPU/APIC information (uses ioremap)
@@ -477,38 +486,128 @@ fn parse_madt_mapped(madt_phys: u64) -> Result<AcpiInfo, &'static str> {
     }
 }
 
-/// Parse FADT and extract power management information (uses ioremap)
-fn parse_fadt_mapped(fadt_phys: u64) -> Result<PowerInfo, &'static str> {
-    unsafe {
-        // Map the FADT
-        let fadt_ptr = map_acpi_table(fadt_phys)?;
+/// FADT field offsets (ACPI 6.5 table 5.9)
+mod fadt {
+    pub const DSDT: usize = 40;
+    pub const SMI_CMD: usize = 48;
+    pub const ACPI_ENABLE: usize = 52;
+    pub const PM1A_EVT_BLK: usize = 56;
+    pub const PM1B_EVT_BLK: usize = 60;
+    pub const PM1A_CNT_BLK: usize = 64;
+    pub const PM1B_CNT_BLK: usize = 68;
+    pub const GPE0_BLK: usize = 80;
+    pub const GPE1_BLK: usize = 84;
+    pub const PM1_EVT_LEN: usize = 88;
+    pub const GPE0_BLK_LEN: usize = 92;
+    pub const GPE1_BLK_LEN: usize = 93;
+    pub const X_DSDT: usize = 140;
+}
 
-        // Read length from SDT header (offset 4)
-        let length_ptr = fadt_ptr.add(4) as *const u32;
-        let fadt_length = core::ptr::read_unaligned(length_ptr) as usize;
+/// A mapped ACPI table, read by offset with bounds checks (fields past
+/// its length read as zero, as Linux treats a short FADT)
+struct Table {
+    ptr: *const u8,
+    len: usize,
+}
 
-        // Validate FADT checksum (warn but continue per Linux behavior)
-        validate_table_checksum(fadt_ptr as *const u8, fadt_length, "FADT");
-
-        // FADT layout: SdtHeader (36) + various fields
-        // pm1a_cnt_blk is at offset 64, pm1b_cnt_blk at offset 68
-        let pm1a = core::ptr::read_unaligned(fadt_ptr.add(64) as *const u32) as u16;
-        let pm1b = core::ptr::read_unaligned(fadt_ptr.add(68) as *const u32);
-
-        let info = PowerInfo {
-            pm1a_cnt_blk: pm1a,
-            pm1b_cnt_blk: if pm1b != 0 { Some(pm1b as u16) } else { None },
-            // Default SLP_TYPa for S5 state
-            // QEMU uses 0 for S5; real hardware varies (usually 5 or 7)
-            // A full implementation would parse DSDT/SSDT AML _S5 object
-            slp_typa: 0,
-        };
-
-        // Unmap the FADT
-        iounmap(fadt_ptr, fadt_length as u64);
-
-        Ok(info)
+impl Table {
+    fn bytes<const N: usize>(&self, off: usize) -> [u8; N] {
+        let mut b = [0; N];
+        if off + N <= self.len {
+            // SAFETY: in bounds of the mapped table
+            b = unsafe { core::ptr::read_unaligned(self.ptr.add(off) as *const [u8; N]) };
+        }
+        b
     }
+    fn u8(&self, off: usize) -> u8 {
+        self.bytes::<1>(off)[0]
+    }
+    fn u32(&self, off: usize) -> u32 {
+        u32::from_le_bytes(self.bytes(off))
+    }
+    fn u64(&self, off: usize) -> u64 {
+        u64::from_le_bytes(self.bytes(off))
+    }
+    /// A port number from a 32-bit block address field
+    fn port(&self, off: usize) -> u16 {
+        self.u32(off) as u16
+    }
+}
+
+/// Parse FADT: power management registers and the DSDT's physical
+/// address (X_DSDT if set, as Linux prefers it) (uses ioremap)
+fn parse_fadt_mapped(fadt_phys: u64) -> Result<(PmRegs, u64), &'static str> {
+    let ptr = map_acpi_table(fadt_phys)?;
+    // SAFETY: the header is mapped
+    let len = unsafe { core::ptr::read_unaligned(ptr.add(4) as *const u32) } as usize;
+
+    // Validate FADT checksum (warn but continue per Linux behavior)
+    validate_table_checksum(ptr, len, "FADT");
+
+    let t = Table { ptr, len };
+    let pm = PmRegs {
+        pm1a_evt: t.port(fadt::PM1A_EVT_BLK),
+        pm1b_evt: t.port(fadt::PM1B_EVT_BLK),
+        pm1_evt_len: t.u8(fadt::PM1_EVT_LEN),
+        pm1a_cnt: t.port(fadt::PM1A_CNT_BLK),
+        pm1b_cnt: t.port(fadt::PM1B_CNT_BLK),
+        gpe0: t.port(fadt::GPE0_BLK),
+        gpe0_len: t.u8(fadt::GPE0_BLK_LEN),
+        gpe1: t.port(fadt::GPE1_BLK),
+        gpe1_len: t.u8(fadt::GPE1_BLK_LEN),
+        smi_cmd: t.port(fadt::SMI_CMD),
+        acpi_enable: t.u8(fadt::ACPI_ENABLE),
+    };
+    let dsdt = match t.u64(fadt::X_DSDT) {
+        0 => t.u32(fadt::DSDT) as u64,
+        x => x,
+    };
+
+    iounmap(ptr, len as u64);
+    Ok((pm, dsdt))
+}
+
+/// SLP_TYP for S5: \_S5 in the DSDT, else in an SSDT; 0 (QEMU's value)
+/// with a warning if neither has it
+fn find_s5(dsdt_phys: u64, sdt_phys: u64, is_xsdt: bool) -> SleepType {
+    let mut s5 = table_s5(dsdt_phys, DSDT_SIGNATURE);
+    if s5.is_none() {
+        let _ = for_each_table(sdt_phys, is_xsdt, SSDT_SIGNATURE, |phys| {
+            s5 = table_s5(phys, SSDT_SIGNATURE);
+            s5.is_none()
+        });
+    }
+    match s5 {
+        Some(t) => {
+            crate::printkln!("ACPI: S5 SLP_TYP a={} b={}", t.a, t.b);
+            t
+        }
+        None => {
+            crate::printkln!("ACPI Warning: no \\_S5 package found, using SLP_TYP 0");
+            SleepType::default()
+        }
+    }
+}
+
+/// The \_S5 package in the AML table at `phys`, if it has signature
+/// `sig` (uses ioremap)
+fn table_s5(phys: u64, sig: &[u8; 4]) -> Option<SleepType> {
+    if phys == 0 || table_signature(phys).as_ref() != Some(sig) {
+        return None;
+    }
+    let ptr = map_acpi_table(phys).ok()?;
+    // SAFETY: the header is mapped
+    let len = unsafe { core::ptr::read_unaligned(ptr.add(4) as *const u32) } as usize;
+    let hdr = core::mem::size_of::<SdtHeader>();
+    let s5 = if len > hdr {
+        // SAFETY: the whole table is mapped (map_acpi_table maps `len`)
+        let body = unsafe { core::slice::from_raw_parts(ptr.add(hdr), len - hdr) };
+        aml::find_s5(body)
+    } else {
+        None
+    };
+    iounmap(ptr, len as u64);
+    s5
 }
 
 /// Initialize NUMA topology from ACPI SRAT/SLIT tables

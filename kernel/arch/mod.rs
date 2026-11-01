@@ -591,12 +591,10 @@ pub struct CpuInfo {
 #[derive(Debug, Clone, Copy, Default)]
 #[allow(dead_code)]
 pub struct PowerInfo {
-    /// PM1a control block I/O port (x86 ACPI)
-    pub pm1a_cnt_blk: u16,
-    /// PM1b control block I/O port (optional)
-    pub pm1b_cnt_blk: Option<u16>,
-    /// Sleep type value for S5 (shutdown)
-    pub slp_typa: u8,
+    /// The FADT's power management register blocks
+    pub pm: crate::acpi::hw::PmRegs,
+    /// SLP_TYP values for S5 (soft-off), from \_S5 in the DSDT/SSDTs
+    pub s5: crate::acpi::aml::SleepType,
 }
 
 /// Platform hardware information from ACPI or device tree

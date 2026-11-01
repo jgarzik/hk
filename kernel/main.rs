@@ -11,6 +11,7 @@ extern crate alloc;
 
 // Core modules (formerly in core/ subdir)
 pub mod acct;
+pub mod acpi;
 pub mod bus;
 pub mod chardev;
 pub mod completion;

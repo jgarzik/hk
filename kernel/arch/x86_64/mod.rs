@@ -278,11 +278,7 @@ impl AcpiOps for X86_64Arch {
                 })
                 .collect(),
             bsp_cpu_id: acpi_info.bsp_apic_id,
-            power_info: acpi_info.power_info.map(|p| PowerInfo {
-                pm1a_cnt_blk: p.pm1a_cnt_blk,
-                pm1b_cnt_blk: p.pm1b_cnt_blk,
-                slp_typa: p.slp_typa,
-            }),
+            power_info: acpi_info.power_info,
         })
     }
 }
@@ -306,11 +302,7 @@ impl SmpOps for X86_64Arch {
                 .collect(),
             ioapics: alloc::vec::Vec::new(), // I/O APICs not needed for SMP init
             bsp_apic_id: acpi.bsp_cpu_id,
-            power_info: acpi.power_info.map(|p| acpi::PowerInfo {
-                pm1a_cnt_blk: p.pm1a_cnt_blk,
-                pm1b_cnt_blk: p.pm1b_cnt_blk,
-                slp_typa: p.slp_typa,
-            }),
+            power_info: acpi.power_info,
         };
 
         smp::init(&x86_acpi, frame_alloc)
@@ -373,7 +365,7 @@ impl TimekeeperOps for X86_64Arch {
 
 impl PowerOps for X86_64Arch {
     fn power_init(info: &PowerInfo) {
-        power::init(info.pm1a_cnt_blk, info.pm1b_cnt_blk, info.slp_typa);
+        power::init(info);
     }
 }
 

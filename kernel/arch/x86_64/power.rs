@@ -1,57 +1,67 @@
 //! x86-64 power management via ACPI
 //!
-//! Implements system shutdown and reboot using standard ACPI mechanisms.
-//! This works on real x86-64 hardware as well as virtual machines (QEMU, etc.).
+//! Power-off enters ACPI S5 through the FADT's fixed hardware
+//! (`crate::acpi::hw`); reboot pulses the keyboard controller's reset
+//! line. Works on real hardware and on QEMU.
+//!
+//! Locking: `POWER` is a `spin::Once`, set at boot before any caller
+//! can power off and read-only after.
 
 use core::arch::asm;
-use core::sync::atomic::{AtomicU8, AtomicU16, Ordering};
 
-use super::io::{inb, outb, outw};
+use super::io::{inb, inw, outb, outw};
+use crate::acpi::aml::SleepType;
+use crate::acpi::hw::{self, PmRegs, PortIo};
+use crate::arch::PowerInfo;
+use crate::printkln;
 
-/// ACPI SLP_EN bit - enables transition to sleep state
-const SLP_EN: u16 = 1 << 13;
-
-/// Power management registers from FADT
-/// Using atomics for safe initialization from boot code
-static PM1A_CNT_BLK: AtomicU16 = AtomicU16::new(0);
-static PM1B_CNT_BLK: AtomicU16 = AtomicU16::new(0);
-static SLP_TYPA: AtomicU8 = AtomicU8::new(0); // Default S5 sleep type (0 for QEMU)
-
-/// Initialize power management with values from ACPI FADT
-///
-/// Called during boot after ACPI tables are parsed.
-pub fn init(pm1a: u16, pm1b: Option<u16>, slp_typa: u8) {
-    PM1A_CNT_BLK.store(pm1a, Ordering::SeqCst);
-    PM1B_CNT_BLK.store(pm1b.unwrap_or(0), Ordering::SeqCst);
-    SLP_TYPA.store(slp_typa, Ordering::SeqCst);
+/// The FADT's registers and the S5 sleep type, once parsed
+struct Power {
+    pm: PmRegs,
+    s5: SleepType,
 }
 
-/// Shutdown the system using ACPI S5 (soft-off)
-///
-/// Writes to the PM1a (and optionally PM1b) control registers to trigger
-/// the S5 sleep state, which powers off the system.
-///
-/// # Panics
-/// This function never returns. If ACPI shutdown fails, it falls back to halt.
-pub fn shutdown() -> ! {
-    let pm1a = PM1A_CNT_BLK.load(Ordering::SeqCst);
-    let pm1b = PM1B_CNT_BLK.load(Ordering::SeqCst);
-    let slp_typ = SLP_TYPA.load(Ordering::SeqCst);
+static POWER: spin::Once<Power> = spin::Once::new();
 
-    if pm1a != 0 {
-        // Build the value: SLP_TYPa in bits 10-12, SLP_EN in bit 13
-        let val = ((slp_typ as u16) << 10) | SLP_EN;
+/// The CPU's I/O ports
+struct Ports;
 
-        // Write to PM1a control block
-        outw(pm1a, val);
-
-        // Write to PM1b if present
-        if pm1b != 0 {
-            outw(pm1b, val);
-        }
+impl PortIo for Ports {
+    fn inb(&mut self, port: u16) -> u8 {
+        inb(port)
     }
+    fn outb(&mut self, port: u16, val: u8) {
+        outb(port, val)
+    }
+    fn inw(&mut self, port: u16) -> u16 {
+        inw(port)
+    }
+    fn outw(&mut self, port: u16, val: u16) {
+        outw(port, val)
+    }
+}
 
-    // If we get here, ACPI shutdown didn't work - fall back to halt
+/// Record the ACPI power management info (boot, after table parsing)
+pub fn init(info: &PowerInfo) {
+    POWER.call_once(|| Power {
+        pm: info.pm,
+        s5: info.s5,
+    });
+}
+
+/// Power off through ACPI S5 (Linux acpi_power_off ->
+/// acpi_enter_sleep_state(ACPI_STATE_S5)); halts if the machine stays on
+pub fn shutdown() -> ! {
+    if let Some(p) = POWER.get().filter(|p| p.pm.pm1a_cnt != 0) {
+        hw::enter_s5(&mut Ports, &p.pm, p.s5);
+        // Linux acpi_hw_legacy_sleep: wait ten seconds for chipsets that
+        // poll PM1 control slowly, then set SLP_EN again
+        crate::delay::mdelay(10_000);
+        printkln!("ACPI: still on 10 s after S5, retrying");
+        hw::sleep_retry(&mut Ports, &p.pm, p.s5);
+        crate::delay::mdelay(1000);
+        printkln!("ACPI: power-off failed, halting");
+    }
     halt()
 }
 
