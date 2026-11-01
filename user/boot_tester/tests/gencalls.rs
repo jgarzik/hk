@@ -7,11 +7,15 @@
 //! - GEN_GETCWD: getcwd returns "/" with its length (NUL included), and
 //!   ERANGE for a buffer too small
 //! - GEN_EXECVEAT: execveat(AT_FDCWD, path) runs the program
+//! - GEN_INT_ARGS: an int (pid_t) argument uses only the low 32 bits of
+//!   its register, as Linux's syscall wrappers truncate it: pid -1 with
+//!   the upper half zero (how glibc passes it) waits for any child, and
+//!   is EINVAL to sched_getscheduler
 
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
     O_RDONLY, sys_close, sys_dup, sys_execveat, sys_exit, sys_fork, sys_getcwd, sys_lseek,
-    sys_open, sys_wait4,
+    sys_open, sys_sched_getscheduler, sys_wait4,
 };
 
 const AT_FDCWD: i32 = -100;
@@ -21,6 +25,27 @@ pub fn run_tests() {
     dup();
     getcwd();
     execveat();
+    int_args();
+}
+
+/// -1 as a 32-bit int in a 64-bit register, upper half zero
+const MINUS_ONE_32: i64 = 0xffff_ffff;
+
+fn int_args() {
+    let pid = sys_fork();
+    if pid == 0 {
+        sys_exit(3);
+    }
+    let mut st = 0i32;
+    let w = sys_wait4(MINUS_ONE_32, &mut st, 0, 0);
+    if w != pid {
+        // Reap it anyway
+        sys_wait4(pid, &mut st, 0, 0);
+        report(b"GEN_INT_ARGS", false, w);
+        return;
+    }
+    let s = sys_sched_getscheduler(MINUS_ONE_32);
+    report(b"GEN_INT_ARGS", st == 3 << 8 && s == -22, s);
 }
 
 fn report(name: &[u8], ok: bool, detail: i64) {
