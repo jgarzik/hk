@@ -27,6 +27,7 @@ pub mod irq;
 pub mod kmap;
 pub mod lapic;
 pub mod paging;
+pub mod pci_conf;
 pub mod percpu;
 pub mod pic;
 pub mod pit;

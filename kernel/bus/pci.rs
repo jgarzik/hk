@@ -18,13 +18,6 @@ use crate::printkln;
 use super::bus::{Bus, BusContext, BusDevice, BusDriver};
 use super::driver::{Device, DriverError};
 
-/// PCI configuration address port (x86 port I/O)
-#[cfg(target_arch = "x86_64")]
-const PCI_CONFIG_ADDR: u16 = 0x0CF8;
-/// PCI configuration data port (x86 port I/O)
-#[cfg(target_arch = "x86_64")]
-const PCI_CONFIG_DATA: u16 = 0x0CFC;
-
 // ============================================================================
 // PCI BAR Allocator (for platforms without firmware BAR assignment)
 // ============================================================================
@@ -254,73 +247,6 @@ pub trait PciConfigAccess: Send + Sync {
     }
 }
 
-/// Port I/O based PCI config access (x86 legacy)
-///
-/// Uses CF8/CFC port I/O mechanism for PCI configuration space access.
-#[cfg(target_arch = "x86_64")]
-pub struct PortIoConfigAccess;
-
-#[cfg(target_arch = "x86_64")]
-impl PortIoConfigAccess {
-    /// Encode BDF + offset into config address
-    #[inline]
-    fn encode_addr(bus: u8, dev: u8, func: u8, offset: u8) -> u32 {
-        0x8000_0000
-            | ((bus as u32) << 16)
-            | ((dev as u32) << 11)
-            | ((func as u32) << 8)
-            | ((offset as u32) & 0xFC)
-    }
-}
-
-/// Serializes the CF8 address / CFC data pair (Linux pci_lock): another
-/// CPU's access between the two would redirect this one
-#[cfg(target_arch = "x86_64")]
-static PCI_LOCK: crate::arch::IrqSpinlock<()> = crate::arch::IrqSpinlock::new(());
-
-#[cfg(target_arch = "x86_64")]
-impl PortIoConfigAccess {
-    /// Select the register; the data port then reads/writes it, at
-    /// CFC + the offset's low bits for a byte or word
-    fn select(bus: u8, dev: u8, func: u8, offset: u8) -> u16 {
-        crate::arch::outl(PCI_CONFIG_ADDR, Self::encode_addr(bus, dev, func, offset));
-        PCI_CONFIG_DATA + (offset & 3) as u16
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-impl PciConfigAccess for PortIoConfigAccess {
-    fn read32(&self, bus: u8, dev: u8, func: u8, offset: u8) -> u32 {
-        let _g = PCI_LOCK.lock();
-        crate::arch::inl(Self::select(bus, dev, func, offset & 0xFC))
-    }
-
-    fn write32(&self, bus: u8, dev: u8, func: u8, offset: u8, val: u32) {
-        let _g = PCI_LOCK.lock();
-        crate::arch::outl(Self::select(bus, dev, func, offset & 0xFC), val);
-    }
-
-    fn read16(&self, bus: u8, dev: u8, func: u8, offset: u8) -> u16 {
-        let _g = PCI_LOCK.lock();
-        crate::arch::inw(Self::select(bus, dev, func, offset & 0xFE))
-    }
-
-    fn read8(&self, bus: u8, dev: u8, func: u8, offset: u8) -> u8 {
-        let _g = PCI_LOCK.lock();
-        crate::arch::inb(Self::select(bus, dev, func, offset))
-    }
-
-    fn write16(&self, bus: u8, dev: u8, func: u8, offset: u8, val: u16) {
-        let _g = PCI_LOCK.lock();
-        crate::arch::outw(Self::select(bus, dev, func, offset & 0xFE), val);
-    }
-
-    fn write8(&self, bus: u8, dev: u8, func: u8, offset: u8, val: u8) {
-        let _g = PCI_LOCK.lock();
-        crate::arch::outb(Self::select(bus, dev, func, offset), val);
-    }
-}
-
 /// ECAM (Enhanced Configuration Access Mechanism) for PCIe
 ///
 /// Memory-mapped PCI config space access. Works on all architectures.
@@ -393,8 +319,7 @@ static PCI_CONFIG: Once<&'static dyn PciConfigAccess> = Once::new();
 /// Initialize PCI config access with port I/O (x86 legacy)
 #[cfg(target_arch = "x86_64")]
 pub fn init_port_io() {
-    static ACCESSOR: PortIoConfigAccess = PortIoConfigAccess;
-    PCI_CONFIG.call_once(|| &ACCESSOR);
+    PCI_CONFIG.call_once(|| &crate::arch::x86_64::pci_conf::PORT_IO);
 }
 
 /// Initialize PCI config access with ECAM (memory-mapped)
