@@ -34,6 +34,8 @@ const XHCI_RESET_SHORT_US: u64 = 250_000;
 const XHCI_CMD_US: u64 = 5_000_000;
 /// Transfer completion (Linux USB_CTRL_GET_TIMEOUT)
 const XHCI_TRANSFER_US: u64 = 5_000_000;
+/// USB serial console transfer completion
+const XHCI_CONSOLE_US: u64 = 100_000;
 /// Root port reset (Linux HUB_RESET_TIMEOUT)
 const PORT_RESET_US: u64 = 800_000;
 
@@ -222,14 +224,23 @@ fn acquire_usb_controller() -> UsbControllerGuard {
 pub fn usb_bulk_out(slot_id: u8, endpoint: u8, data: &[u8]) -> Result<usize, UsbError> {
     let mut guard = acquire_usb_controller();
     let controller = guard.as_mut().ok_or(UsbError::NoDevice)?;
-    controller.do_bulk_out(slot_id, endpoint, data)
+    controller.do_bulk_out(slot_id, endpoint, data, XHCI_TRANSFER_US)
+}
+
+/// A bulk OUT transfer for the USB serial console: a short timeout, so
+/// a stalled console device costs each printk little (the controller
+/// lock, a spin lock, is held throughout)
+pub fn usb_console_out(slot_id: u8, endpoint: u8, data: &[u8]) -> Result<usize, UsbError> {
+    let mut guard = acquire_usb_controller();
+    let controller = guard.as_mut().ok_or(UsbError::NoDevice)?;
+    controller.do_bulk_out(slot_id, endpoint, data, XHCI_CONSOLE_US)
 }
 
 /// Perform a bulk IN transfer (device to host)
 pub fn usb_bulk_in(slot_id: u8, endpoint: u8, data: &mut [u8]) -> Result<usize, UsbError> {
     let mut guard = acquire_usb_controller();
     let controller = guard.as_mut().ok_or(UsbError::NoDevice)?;
-    controller.do_bulk_in(slot_id, endpoint, data)
+    controller.do_bulk_in(slot_id, endpoint, data, XHCI_TRANSFER_US)
 }
 
 /// Store the USB host controller for global access
@@ -1454,10 +1465,15 @@ impl XhciController {
     }
 
     /// Wait for a transfer completion event
-    fn wait_for_transfer(&mut self, slot_id: u8, ep_dci: u8) -> Result<(u32, u8), UsbError> {
+    fn wait_for_transfer(
+        &mut self,
+        slot_id: u8,
+        ep_dci: u8,
+        timeout_us: u64,
+    ) -> Result<(u32, u8), UsbError> {
         // Always poll the event ring - interrupt is just an optimization hint
         let mut result = None;
-        let _ = poll_timeout(XHCI_TRANSFER_US, 0, || {
+        let _ = poll_timeout(timeout_us, 0, || {
             // Clear any pending interrupt flag
             let _ = XHCI_IRQ_STATE
                 .interrupt_pending
@@ -1558,7 +1574,13 @@ impl XhciController {
     }
 
     /// Perform a bulk OUT transfer
-    fn do_bulk_out(&mut self, slot_id: u8, endpoint: u8, data: &[u8]) -> Result<usize, UsbError> {
+    fn do_bulk_out(
+        &mut self,
+        slot_id: u8,
+        endpoint: u8,
+        data: &[u8],
+        timeout_us: u64,
+    ) -> Result<usize, UsbError> {
         if !self.initialized {
             return Err(UsbError::NoDevice);
         }
@@ -1609,7 +1631,7 @@ impl XhciController {
         self.ring_doorbell(slot_id, ep_dci);
 
         // Wait for completion
-        let (residue, cc) = self.wait_for_transfer(slot_id, ep_dci)?;
+        let (residue, cc) = self.wait_for_transfer(slot_id, ep_dci, timeout_us)?;
 
         // Advance transfer ring dequeue pointer to track completion
         if let Some(state) = self.device_states.get_mut(&slot_id)
@@ -1637,6 +1659,7 @@ impl XhciController {
         slot_id: u8,
         endpoint: u8,
         data: &mut [u8],
+        timeout_us: u64,
     ) -> Result<usize, UsbError> {
         if !self.initialized {
             return Err(UsbError::NoDevice);
@@ -1688,7 +1711,7 @@ impl XhciController {
         self.ring_doorbell(slot_id, ep_dci);
 
         // Wait for completion
-        let (residue, cc) = self.wait_for_transfer(slot_id, ep_dci)?;
+        let (residue, cc) = self.wait_for_transfer(slot_id, ep_dci, timeout_us)?;
 
         // Advance transfer ring dequeue pointer to track completion
         if let Some(state) = self.device_states.get_mut(&slot_id)
@@ -1980,7 +2003,7 @@ impl UsbController for XhciController {
         endpoint: u8,
         data: &[u8],
     ) -> Result<usize, UsbError> {
-        self.do_bulk_out(device.slot_id, endpoint, data)
+        self.do_bulk_out(device.slot_id, endpoint, data, XHCI_TRANSFER_US)
     }
 
     fn bulk_in(
@@ -1989,7 +2012,7 @@ impl UsbController for XhciController {
         endpoint: u8,
         data: &mut [u8],
     ) -> Result<usize, UsbError> {
-        self.do_bulk_in(device.slot_id, endpoint, data)
+        self.do_bulk_in(device.slot_id, endpoint, data, XHCI_TRANSFER_US)
     }
 }
 
