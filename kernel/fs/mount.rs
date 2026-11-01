@@ -402,6 +402,28 @@ pub fn do_umount(mount: Arc<Mount>, flags: i32) -> Result<(), KernelError> {
     Ok(())
 }
 
+/// Something is mounted on `d` in the caller's mount namespace (Linux
+/// is_local_mountpoint): d_mountpoint, then a walk of the namespace's
+/// mounts for one whose mountpoint is `d`
+pub fn is_local_mountpoint(d: &Arc<Dentry>) -> bool {
+    if !d.is_mountpoint() {
+        return false;
+    }
+    let Some(root) = crate::ns::current_mnt_ns().get_root() else {
+        return false;
+    };
+    let mut todo = alloc::vec![root];
+    while let Some(m) = todo.pop() {
+        for c in m.children.read().iter() {
+            if c.get_mountpoint().is_some_and(|mp| Arc::ptr_eq(&mp, d)) {
+                return true;
+            }
+            todo.push(c.clone());
+        }
+    }
+    false
+}
+
 /// MNT_* flags of the mount `dentry` belongs to (0 if none)
 pub fn mnt_flags_of(dentry: &Arc<Dentry>) -> u32 {
     crate::ns::current_mnt_ns()

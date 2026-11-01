@@ -1683,6 +1683,10 @@ Each open `File` holds a reference to its mount via the `mnt` field:
 4. Dentry.d_lock (DentryInner.inode: read)
 ```
 
+`is_local_mountpoint` (rmdir, unlink, rename: EBUSY) takes the same
+locks in the same order, one mount's `children` at a time, inside the
+directory inode locks those syscalls hold (sleeping, outer).
+
 #### VFS Locking Notes
 
 **No RCU (future optimization):** The current implementation uses `RwLock` for all

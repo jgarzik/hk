@@ -236,6 +236,10 @@ pub fn delete_entry(parent: &Arc<Dentry>, name: &str, isdir: bool) -> Result<(),
         let victim = lookup_one(parent, name)?;
         let inode = victim.get_inode().ok_or(KernelError::NotFound)?;
         super::dac::may_delete(&c, &dir, &inode, isdir)?;
+        // Linux vfs_rmdir / vfs_unlink: not a mountpoint in this namespace
+        if super::mount::is_local_mountpoint(&victim) {
+            return Err(KernelError::Busy);
+        }
         // The victim's lock, inside the parent's (Linux vfs_unlink /
         // vfs_rmdir): its link count never drops under a link of it
         inode.inode_lock();

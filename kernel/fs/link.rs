@@ -577,6 +577,12 @@ fn rename_locked(old: Side, new: Side, flags: u32) -> Result<(), KernelError> {
             if exchange { d.mode().is_dir() } else { is_dir },
         )?,
     }
+    // Linux vfs_rename: neither side may be a mountpoint here
+    if super::mount::is_local_mountpoint(&src)
+        || dst.as_ref().is_some_and(super::mount::is_local_mountpoint)
+    {
+        return Err(KernelError::Busy);
+    }
     if !Arc::ptr_eq(odir, ndir) {
         if is_dir {
             dac::permission_as(&c, &sinode, MAY_WRITE)?;

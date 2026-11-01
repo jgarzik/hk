@@ -522,14 +522,7 @@ expected to fix it; "next batch" means the next fix batch.
    on every walk. Scenario: stat environ of a uid-1000 child, child
    sets `PR_SET_DUMPABLE 0`, stat again: hk still says uid 1000
    (Linux 0).
-8. **Mounts in link.rs** (from the security review).
-   (a) (next batch) rename, rmdir and unlink never check for a
-   mountpoint (`kernel/fs/link.rs:525` rename_locked,
-   `kernel/fs/path.rs:248`); Linux returns EBUSY for a mounted-on
-   source or target. Scenario: mount ramfs on /tmp/m; `rmdir`,
-   `rename` of /tmp/m, or renaming another dir onto it, orphans the
-   mount. (Code reading; not yet test-verified.)
-   (b) (fix in V1) EXDEV compares superblocks, not mounts
+8. **EXDEV compares superblocks, not mounts** (fix in V1)
    (`kernel/fs/link.rs:298`, `:484`): a link or rename across two
    mounts of one superblock (bind mounts) is EXDEV on Linux. Needs
    Path{mnt,dentry}; TODO in place for linkat.
