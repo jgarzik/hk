@@ -691,6 +691,10 @@ fn kmain() -> ! {
         printkln!("SMP: Platform discovery failed (ACPI/device tree)");
     }
 
+    // ACPI mode (Linux acpi_bus_init -> acpi_enable_subsystem), timed by
+    // the timekeeper started above
+    CurrentArch::power_enable();
+
     // Initialize network subsystem (sets up loopback, static IP config)
     crate::net::init();
 

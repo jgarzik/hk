@@ -13,6 +13,7 @@ use super::io::{inb, inw, outb, outw};
 use crate::acpi::aml::SleepType;
 use crate::acpi::hw::{self, PmRegs, PortIo};
 use crate::arch::PowerInfo;
+use crate::delay::Monotonic;
 use crate::printkln;
 
 /// The FADT's registers and the S5 sleep type, once parsed
@@ -47,6 +48,27 @@ pub fn init(info: &PowerInfo) {
         pm: info.pm,
         s5: info.s5,
     });
+}
+
+/// Put the fixed hardware in ACPI mode, then disable every fixed event
+/// and GPE (Linux acpi_enable_subsystem): no SCI handler exists yet, so
+/// IRQ 9 stays masked and nothing may raise an SCI
+pub fn enable() {
+    let Some(p) = POWER.get().filter(|p| p.pm.pm1a_cnt != 0) else {
+        return;
+    };
+    if hw::acpi_mode(&mut Ports, &p.pm) {
+        printkln!("ACPI: already in ACPI mode");
+    } else if hw::acpi_enable(&mut Ports, &p.pm, &mut Monotonic::new()).is_ok() {
+        printkln!("ACPI: enabled ACPI mode");
+    } else {
+        printkln!(
+            "ACPI: timeout entering ACPI mode (SMI_CMD {:#x})",
+            p.pm.smi_cmd
+        );
+        return;
+    }
+    hw::disable_events(&mut Ports, &p.pm);
 }
 
 /// Power off through ACPI S5 (Linux acpi_power_off ->

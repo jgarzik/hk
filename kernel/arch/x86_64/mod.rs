@@ -367,6 +367,10 @@ impl PowerOps for X86_64Arch {
     fn power_init(info: &PowerInfo) {
         power::init(info);
     }
+
+    fn power_enable() {
+        power::enable();
+    }
 }
 
 impl ArchBusOps for X86_64Arch {

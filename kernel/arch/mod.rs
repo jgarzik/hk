@@ -738,6 +738,10 @@ pub trait PowerOps {
     /// # Arguments
     /// * `info` - Power management info from ACPI/device tree
     fn power_init(info: &PowerInfo);
+
+    /// Take the power management hardware from the firmware (Linux
+    /// acpi_enable_subsystem: ACPI mode on x86), once timekeeping runs
+    fn power_enable() {}
 }
 
 /// Architecture-specific bus and driver initialization
