@@ -11,7 +11,8 @@
 //! - CLOCK_IDS_CPU: process CPU time grows while spinning, the thread
 //!   clock is not past the process clock; a CPU clock id built from a
 //!   pid reads that process (another process too), a thread clock of
-//!   another process or a missing pid is EINVAL
+//!   another process or a missing pid is EINVAL; a second thread's
+//!   process clock built from its own tid reads the process
 //! - CLOCK_IDS_SLEEP: clock_nanosleep on boottime (relative) and TAI
 //!   (absolute) sleeps; raw and coarse clocks are EOPNOTSUPP
 //! - CLOCK_IDS_TIMERS: timerfd and timer_create on boottime work (the
@@ -174,7 +175,43 @@ fn cpu() {
     if now(cpuclock(pid, false)) != Err(EINVAL) {
         return report(n, b"missing pid not EINVAL", pid);
     }
+    let r = own_tid_clock();
+    if r != 0 {
+        return report(n, b"own tid process clock", r);
+    }
     report(n, b"", 0);
+}
+
+static OWN_TID_RESULT: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(1);
+
+#[repr(C, align(16))]
+struct ThreadStack([u8; 16384]);
+static mut OWN_STACK: ThreadStack = ThreadStack([0; 16384]);
+static mut OWN_CTID: u32 = 0;
+
+extern "C" fn own_tid_thread(_: u64) -> ! {
+    let r = match now(cpuclock(hk_syscall::sys_gettid(), false)) {
+        Ok(_) => 0,
+        Err(e) => e,
+    };
+    OWN_TID_RESULT.store(r, core::sync::atomic::Ordering::Relaxed);
+    sys_exit(0)
+}
+
+/// A second thread reads the process clock named by its own tid (Linux
+/// pid_for_clock maps it to the process); 0 or the errno
+fn own_tid_clock() -> i64 {
+    unsafe {
+        let top = (&raw mut OWN_STACK as *mut u8).add(16384) as u64;
+        let ctid = &raw mut OWN_CTID;
+        core::ptr::write_volatile(ctid, 1);
+        if super::fork_mm::spawn_thread(top, own_tid_thread, 0, ctid) < 0
+            || !super::fork_mm::join(ctid)
+        {
+            return -1000;
+        }
+    }
+    OWN_TID_RESULT.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 fn ts(ns: i64) -> Timespec {

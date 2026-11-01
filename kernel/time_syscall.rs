@@ -135,7 +135,7 @@ fn tai_offset_ns() -> i128 {
 
 /// A CPU clock's time (Linux posix_cpu_clock_get / lookup_task): a
 /// thread clock only for the caller's thread group, a process clock
-/// only for a thread group leader
+/// only for a thread group leader or the caller's own tid
 fn cpu_clock_ns(pid: u64, thread: bool, which: u8) -> Result<u64, KernelError> {
     use crate::task::percpu;
     let me = percpu::current_tid();
@@ -152,7 +152,9 @@ fn cpu_clock_ns(pid: u64, thread: bool, which: u8) -> Result<u64, KernelError> {
         }
         t.task.times()
     } else {
-        let tgid = if pid == 0 {
+        // Linux pid_for_clock (gettime): pid 0, or the caller's own tid
+        // from any thread, is its process
+        let tgid = if pid == 0 || pid == me {
             percpu::current_pid()
         } else {
             let table = percpu::TASKLIST.read();
