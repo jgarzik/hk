@@ -43,10 +43,12 @@ impl Spurious {
         *self = Self::new();
     }
 
-    /// Account one interrupt at `now_ns`; true if the line must now be
+    /// Account one interrupt; `now_ns` is read only for an unclaimed
+    /// one (the claimed path stays cheap). True if the line must now be
     /// disabled (Linux note_interrupt)
-    pub fn note(&mut self, handled: bool, now_ns: u64) -> bool {
+    pub fn note(&mut self, handled: bool, now_ns: impl FnOnce() -> u64) -> bool {
         if !handled {
+            let now_ns = now_ns();
             if now_ns.saturating_sub(self.last_unhandled_ns) > UNHANDLED_GAP_NS {
                 self.unhandled = 1;
             } else {
@@ -86,9 +88,9 @@ mod tests {
     fn storm_disabled() {
         let mut s = Spurious::new();
         for i in 1..WINDOW {
-            assert!(!s.note(false, i as u64 * 1000));
+            assert!(!s.note(false, || i as u64 * 1000));
         }
-        assert!(s.note(false, WINDOW as u64 * 1000));
+        assert!(s.note(false, || WINDOW as u64 * 1000));
     }
 
     /// The old consecutive count never fired when a driver claimed one
@@ -99,7 +101,7 @@ mod tests {
         let mut s = Spurious::new();
         let mut bad = false;
         for i in 0..WINDOW {
-            bad |= s.note(i % 2000 == 0, i as u64 * 1000);
+            bad |= s.note(i % 2000 == 0, || i as u64 * 1000);
         }
         assert!(bad);
     }
@@ -109,7 +111,7 @@ mod tests {
     fn mostly_claimed_kept() {
         let mut s = Spurious::new();
         for i in 0..3 * WINDOW {
-            assert!(!s.note(i % 10 != 0, i as u64 * 1000));
+            assert!(!s.note(i % 10 != 0, || i as u64 * 1000));
         }
     }
 
@@ -118,7 +120,7 @@ mod tests {
     fn sparse_strays_kept() {
         let mut s = Spurious::new();
         for i in 0..2 * WINDOW as u64 {
-            assert!(!s.note(false, i * (UNHANDLED_GAP_NS + 1)));
+            assert!(!s.note(false, || i * (UNHANDLED_GAP_NS + 1)));
         }
     }
 }

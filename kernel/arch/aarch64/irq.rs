@@ -144,7 +144,7 @@ pub fn dispatch_irq(irq: u32) -> bool {
         handled |= (entry.handler)(irq, entry.data);
         crate::sync::lockdep::irq_exit();
     }
-    let bad = !line.handlers.is_empty() && line.spurious.note(handled, crate::time::monotonic_ns());
+    let bad = !line.handlers.is_empty() && line.spurious.note(handled, crate::time::monotonic_ns);
     if bad || line.handlers.is_empty() {
         gic::disable_spi(irq);
     }

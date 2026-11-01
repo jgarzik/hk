@@ -128,7 +128,7 @@ pub fn dispatch_irq(irq: u8) -> bool {
         crate::sync::lockdep::irq_exit();
     }
     // A line without handlers is masked already (spurious IRQ7/15)
-    let bad = !line.handlers.is_empty() && line.spurious.note(handled, crate::time::monotonic_ns());
+    let bad = !line.handlers.is_empty() && line.spurious.note(handled, crate::time::monotonic_ns);
     if bad {
         super::pic::disable_irq(irq);
     }
