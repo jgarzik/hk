@@ -34,7 +34,7 @@ impl PciFixup {
 }
 
 /// The final fixups, in order
-static FIXUPS_FINAL: &[PciFixup] = &[];
+static FIXUPS_FINAL: &[PciFixup] = &[crate::usb::pci_quirks::EARLY_HANDOFF];
 
 /// Run the final fixups on each function of a scanned bus (Linux
 /// pci_fixup_device(pci_fixup_final, ...) from pci_bus_add_device)
