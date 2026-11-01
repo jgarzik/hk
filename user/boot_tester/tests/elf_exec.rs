@@ -13,6 +13,7 @@ const EM: u16 = 62;
 const EM: u16 = 183;
 
 const PATH: &[u8] = b"/elf_bad\0";
+const BAD_INTERP: &[u8] = b"/elf_bad_interp\0";
 const LEN: usize = 0x2000;
 
 /// How Linux treats the file
@@ -26,7 +27,11 @@ enum Want {
 }
 
 pub fn run_tests() {
-    let cases: [(&[u8], fn(&mut [u8]) -> usize, Want); 7] = [
+    // An executable file that is not ELF, for ELF_EXEC_BAD_INTERP
+    let fd = sys_open(BAD_INTERP.as_ptr(), O_WRONLY | O_CREAT | O_TRUNC, 0o755);
+    sys_write(fd as u64, [b'x'; 128].as_ptr(), 128);
+    sys_close(fd as u64);
+    let cases: [(&[u8], fn(&mut [u8]) -> usize, Want); 8] = [
         (b"ELF_EXEC_TRUNCATED", |_| 20, Want::Errno(8)),
         (
             b"ELF_EXEC_BAD_MACHINE",
@@ -49,6 +54,8 @@ pub fn run_tests() {
             Want::Errno(8),
         ),
         (b"ELF_EXEC_MISSING_INTERP", missing_interp, Want::Errno(2)),
+        // Linux load_elf_binary: an interpreter that is not ELF
+        (b"ELF_EXEC_BAD_INTERP", bad_interp, Want::Errno(80)),
         (
             b"ELF_EXEC_FILESZ_GT_MEMSZ",
             |f| set64(f, 64 + 40, 0x100),
@@ -77,6 +84,7 @@ fn large_files() {
     set64(&mut f, 32, BIG as u64 + 0x1000); // phoff past EOF
     check_big(b"ELF_EXEC_LARGE_TRUNCATED", &f[..64], Want::Errno(8));
     exec_still_works();
+    sys_unlink(BAD_INTERP.as_ptr());
 }
 
 /// `head` followed by zeros up to BIG bytes, exec'd as in `check`
@@ -165,8 +173,17 @@ fn valid(f: &mut [u8]) {
 
 /// PT_INTERP naming a file that does not exist
 fn missing_interp(f: &mut [u8]) -> usize {
+    with_interp(f, b"/no/such/ld.so\0")
+}
+
+/// PT_INTERP naming an executable file that is not ELF
+fn bad_interp(f: &mut [u8]) -> usize {
+    with_interp(f, BAD_INTERP)
+}
+
+/// A second program header: PT_INTERP naming `path`
+fn with_interp(f: &mut [u8], path: &[u8]) -> usize {
     set16(f, 56, 2);
-    let path = b"/no/such/ld.so\0";
     f[0x1000..0x1000 + path.len()].copy_from_slice(path);
     phdr(
         f,

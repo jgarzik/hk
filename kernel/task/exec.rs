@@ -47,6 +47,7 @@ pub const E2BIG: i32 = 7; // Argument list too long
 pub const EAGAIN: i32 = 11; // Try again
 pub const EINVAL: i32 = 22; // Invalid argument
 pub const ELOOP: i32 = 40; // Too many levels of symbolic links
+pub const ELIBBAD: i32 = 80; // Accessing a corrupted shared library
 
 /// Maximum path length (matching Linux PATH_MAX)
 const PATH_MAX: usize = 4096;
@@ -98,6 +99,8 @@ pub struct ExecInfo<'a> {
     pub phnum: u64,
     /// Path the program was executed as (AT_EXECFN)
     pub execfn: &'a [u8],
+    /// Where the program interpreter was loaded (AT_BASE; 0 without one)
+    pub base: u64,
 }
 
 /// Writes the initial stack image through the new page table
@@ -165,7 +168,7 @@ fn auxv(info: &ExecInfo, random: u64, execfn: u64, platform: u64) -> [(u64, u64)
         (AT_PHDR, info.phdr),
         (AT_PHENT, info.phent),
         (AT_PHNUM, info.phnum),
-        (AT_BASE, 0),
+        (AT_BASE, info.base),
         (AT_FLAGS, 0),
         (AT_ENTRY, info.entry),
         (AT_UID, c.uid as u64),
@@ -361,19 +364,29 @@ pub fn image_layout(elf: &ElfExecutable, base: u64) -> MmLayout {
 /// PT_LOAD segment (pages already populated) and the stack
 /// (growsdown), so mprotect/munmap/brk and /proc/<pid>/maps see them
 pub fn image_vmas(elf: &ElfExecutable, base: u64, stack_bottom: u64) -> Vec<crate::mm::Vma> {
-    use crate::mm::{
-        MAP_ANONYMOUS, MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE, VM_GROWSDOWN, Vma,
-        anon_vma::AnonVma,
-    };
-    let anon = |start: u64, end: u64, prot: u32| {
-        Vma::new_anon(
-            start,
-            end,
-            prot,
-            MAP_PRIVATE | MAP_ANONYMOUS,
-            AnonVma::new(),
-        )
-    };
+    use crate::mm::{PROT_READ, PROT_WRITE, VM_GROWSDOWN};
+    let mut vmas = segment_vmas(elf, base);
+    let mut stack = anon_vma(stack_bottom, STACK_TOP, PROT_READ | PROT_WRITE);
+    stack.flags |= VM_GROWSDOWN;
+    vmas.push(stack);
+    vmas
+}
+
+fn anon_vma(start: u64, end: u64, prot: u32) -> crate::mm::Vma {
+    use crate::mm::{MAP_ANONYMOUS, MAP_PRIVATE, Vma, anon_vma::AnonVma};
+    Vma::new_anon(
+        start,
+        end,
+        prot,
+        MAP_PRIVATE | MAP_ANONYMOUS,
+        AnonVma::new(),
+    )
+}
+
+/// One VMA per loaded segment of `elf` at `base`
+fn segment_vmas(elf: &ElfExecutable, base: u64) -> Vec<crate::mm::Vma> {
+    use crate::mm::{PROT_EXEC, PROT_READ, PROT_WRITE, Vma};
+    let anon = anon_vma;
     let mut vmas: Vec<Vma> = Vec::new();
     let mut prev_end = 0;
     for seg in elf.segments.iter().filter(|s| s.mem_size > 0) {
@@ -390,10 +403,25 @@ pub fn image_vmas(elf: &ElfExecutable, base: u64, stack_bottom: u64) -> Vec<crat
         vmas.push(anon(start, end, prot));
         prev_end = end;
     }
-    let mut stack = anon(stack_bottom, STACK_TOP, PROT_READ | PROT_WRITE);
-    stack.flags |= VM_GROWSDOWN;
-    vmas.push(stack);
     vmas
+}
+
+/// Where a program interpreter goes (Linux load_elf_interp: the first
+/// free area below mmap_base big enough for all its segments, at their
+/// alignment); an ET_EXEC interpreter at its link address
+fn interp_base(elf: &ElfExecutable) -> u64 {
+    if !elf.is_pie {
+        return 0;
+    }
+    let segs = elf.segments.iter().filter(|s| s.mem_size > 0);
+    let lo = segs.clone().map(|s| s.vaddr).min().unwrap_or(0) & !(PAGE_SIZE - 1);
+    let hi = segs
+        .map(|s| s.vaddr + s.mem_size as u64)
+        .max()
+        .unwrap_or(0)
+        .next_multiple_of(PAGE_SIZE);
+    let align = elf.align.max(PAGE_SIZE);
+    ((crate::mm::mmap_base() - (hi - lo)) & !(align - 1)) - lo
 }
 
 /// Load ELF segments into a page table
@@ -758,13 +786,32 @@ where
         Ok(e) => e,
         Err(e) => return -e.errno(),
     };
-    // Dynamically linked: no program interpreter is loaded yet (BUGS.md);
-    // a missing one is ENOENT like Linux's open_exec of it
-    if let Some(interp) = &elf.interp {
-        let found = core::str::from_utf8(interp)
-            .ok()
-            .is_some_and(|p| kernel_open_exec(p).is_ok());
-        return if found { -ENOEXEC } else { -ENOENT };
+    // Dynamically linked: the program interpreter (Linux
+    // load_elf_binary): ENOENT if missing (open_exec), ELIBBAD if it is
+    // not an ELF file for this machine
+    let interp_file = match &elf.interp {
+        Some(i) => match core::str::from_utf8(i)
+            .map_err(|_| ENOENT)
+            .and_then(kernel_open_exec)
+        {
+            Ok(f) => Some(f),
+            Err(e) => return -e,
+        },
+        None => None,
+    };
+    let interp_image = match interp_file.as_deref().map(FileImage::new).transpose() {
+        Ok(i) => i,
+        Err(_) => return -ELIBBAD,
+    };
+    let interp = match interp_image.as_ref().map(ElfExecutable::parse).transpose() {
+        Ok(i) => i,
+        Err(_) => return -ELIBBAD,
+    };
+    let interp_base = interp.as_ref().map_or(0, interp_base);
+    if let Some(ie) = &interp
+        && let Err(e) = check_segments(ie, interp_base)
+    {
+        return -e;
     }
 
     // Release all POSIX advisory locks (POSIX semantics: locks released on exec)
@@ -780,7 +827,12 @@ where
     if let Err(e) = check_segments(&elf, base_addr) {
         return -e;
     }
-    let entry_point = elf.entry + base_addr;
+    // With an interpreter the program starts there; it finds the
+    // program's own entry in AT_ENTRY
+    let entry_point = match &interp {
+        Some(ie) => ie.entry + interp_base,
+        None => elf.entry + base_addr,
+    };
 
     // Create new page table for the process
     let mut new_page_table = match ArchPageTable::new_user(frame_alloc) {
@@ -802,14 +854,23 @@ where
             Err(e) => return -e,
         };
 
-    // Apply relocations for PIE
-    if elf.is_pie {
+    if let (Some(ie), Some(iimg)) = (&interp, &interp_image)
+        && let Err(e) = load_elf_segments(ie, iimg, &mut new_page_table, frame_alloc, interp_base)
+    {
+        return -e;
+    }
+
+    // A static PIE's relocations (hk's boot programs need them; glibc's
+    // relocate themselves, idempotently). Never with an interpreter: it
+    // relocates itself and the program (Linux applies none at all).
+    if elf.is_pie && interp.is_none() {
         apply_relocations(&elf, &image, base_addr, &new_page_table);
     }
 
     // Set up user stack with argv, envp and the auxiliary vector
     let info = ExecInfo {
-        entry: entry_point,
+        entry: elf.entry + base_addr,
+        base: interp_base,
         phdr: if elf.phdr != 0 {
             elf.phdr + base_addr
         } else {
@@ -866,11 +927,18 @@ where
         for vma in image_vmas(&elf, base_addr, stack_bottom) {
             m.insert_vma(vma);
         }
+        if let Some(ie) = &interp {
+            for vma in segment_vmas(ie, interp_base) {
+                m.insert_vma(vma);
+            }
+        }
     }
 
     // exec_replace_image never returns: free everything owned here first
     // (the file image alone is megabytes of heap)
     drop(elf);
+    drop(interp);
+    drop(interp_file);
     drop(file);
     drop(argv);
     drop(envp);
