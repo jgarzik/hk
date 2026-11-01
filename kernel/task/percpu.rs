@@ -3467,6 +3467,7 @@ pub fn scheduler_tick() {
     }
     crate::timer::run_local();
     crate::watchdog::tick();
+    crate::kmsg::tick();
     if let Some(cpu) = crate::cpu::try_this_id() {
         balance_tick(cpu);
     }

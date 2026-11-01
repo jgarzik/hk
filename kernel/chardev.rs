@@ -169,6 +169,12 @@ pub trait CharDevice: Send + Sync {
         Err(DeviceError::NotTty)
     }
 
+    /// File operations of its own (Linux chrdev_open installs the
+    /// cdev's fops): None uses the generic ones over read/write above
+    fn fops(&self) -> Option<&'static dyn crate::fs::FileOps> {
+        None
+    }
+
     /// Check if data is available for reading (non-blocking)
     fn poll_read(&self) -> bool {
         true // Default: always ready
@@ -362,4 +368,7 @@ pub fn register_builtin_chardevs() {
     let _ = register_chardev(DevId::new(major::MEM, 8), random);
     let urandom = Arc::new(RandomCharDevice("urandom"));
     let _ = register_chardev(DevId::new(major::MEM, 9), urandom);
+    // /dev/kmsg (1,11)
+    let kmsg = Arc::new(crate::kmsg::KmsgCharDevice);
+    let _ = register_chardev(DevId::new(major::MEM, 11), kmsg);
 }

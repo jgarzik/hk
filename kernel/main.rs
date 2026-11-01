@@ -74,6 +74,7 @@ pub mod fs;
 mod heap;
 pub mod ipc;
 pub mod keys;
+mod kmsg;
 pub mod membarrier;
 pub mod mm;
 #[cfg(target_arch = "x86_64")]
@@ -1079,6 +1080,7 @@ fn init_vfs_core() {
         ("full", DevId::new(chardev_major::MEM, 7), 0o666),
         ("random", DevId::new(chardev_major::MEM, 8), 0o666),
         ("urandom", DevId::new(chardev_major::MEM, 9), 0o666),
+        ("kmsg", DevId::new(chardev_major::MEM, 11), 0o644),
         ("tty", DevId::new(chardev_major::TTYAUX, 0), 0o666),
         ("console", DevId::new(chardev_major::TTYAUX, 1), 0o666),
     ];

@@ -930,13 +930,21 @@ pub fn sys_syslog<A: crate::uaccess::UaccessArch>(type_: i32, buf: u64, len: i32
                 return KernelError::BadAddress.sysret();
             }
 
-            // For now, we don't have a kernel log buffer implementation
-            // Just return 0 bytes read (empty buffer)
-            0
+            let data = match type_ {
+                SYSLOG_ACTION_READ => match crate::kmsg::syslog_read(len as usize) {
+                    Ok(d) => d,
+                    Err(e) => return e.sysret(),
+                },
+                _ => crate::kmsg::syslog_read_all(len as usize, type_ == SYSLOG_ACTION_READ_CLEAR),
+            };
+            if crate::uaccess::copy_to_user::<A>(buf, &data).is_err() {
+                return KernelError::BadAddress.sysret();
+            }
+            data.len() as i64
         }
 
         SYSLOG_ACTION_CLEAR => {
-            // Clear the ring buffer - no-op for now
+            crate::kmsg::syslog_clear();
             0
         }
 
@@ -960,17 +968,9 @@ pub fn sys_syslog<A: crate::uaccess::UaccessArch>(type_: i32, buf: u64, len: i32
             0
         }
 
-        SYSLOG_ACTION_SIZE_UNREAD => {
-            // Return number of unread bytes
-            // We don't track this, so return 0
-            0
-        }
+        SYSLOG_ACTION_SIZE_UNREAD => crate::kmsg::syslog_size_unread() as i64,
 
-        SYSLOG_ACTION_SIZE_BUFFER => {
-            // Return size of log buffer
-            // We don't have one, so return a reasonable default
-            0
-        }
+        SYSLOG_ACTION_SIZE_BUFFER => crate::kmsg::syslog_size_buffer() as i64,
 
         _ => KernelError::InvalidArgument.sysret(),
     }

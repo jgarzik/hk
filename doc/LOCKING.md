@@ -361,9 +361,15 @@ Timekeeping (3.5):
 Printk locks (ALL IRQ-safe - can be acquired from interrupt context):
     OUTPUT_LOCK (IrqSpinlock, held for entire message)
         ↓
+    kmsg LOG (IrqSpinlock leaf, the record log; taken and released
+              before PRINTK)
     PRINTK (IrqSpinlock, ring buffer)
         ↓
     CONSOLE_REGISTRY (IrqSpinlock, console dispatch)
+
+/dev/kmsg (kmsg.rs):
+    KmsgUser.cur (spin, per open; never held across a wait) → LOG
+    KmsgUser.rate (spin leaf)
 ```
 
 ### Key Rules
@@ -2231,6 +2237,16 @@ static CONSOLE_REGISTRY: IrqSpinlock<ConsoleRegistry> = IrqSpinlock::new(...);
    ↓
 3. CONSOLE_REGISTRY (held during console_write) - IrqSpinlock
 ```
+
+**The record log** (`kernel/kmsg.rs`): `LOG` (IrqSpinlock) holds the
+records that /dev/kmsg and syslog(2) read. printk adds each complete
+line under OUTPUT_LOCK (try_lock while panicking); a /dev/kmsg write
+adds its record under `LOG` alone, then writes the console under
+OUTPUT_LOCK. Nothing allocates under `LOG`: readers size their
+buffers before taking it. printk may run with run-queue locks held,
+so it never wakes readers itself: it sets `WAKE_PENDING`, and the
+scheduler tick (no locks held) wakes them (Linux defers the klogd
+wakeup through irq_work).
 
 **Why IRQ-Safe:**
 
