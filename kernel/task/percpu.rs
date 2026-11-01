@@ -2448,6 +2448,16 @@ pub fn exit_current(status: Option<i32>) -> ! {
         // group_dead = atomic_dec_and_test(&signal->live))
         group_dead = crate::signal::get_task_signal_struct(tid).is_none_or(|s| s.thread_exiting());
 
+        // Nothing reaps orphans or keeps userspace going without the
+        // global init: its death is fatal, and loud (Linux do_exit:
+        // is_global_init when group_dead), not a silent idle machine
+        if group_dead
+            && current_pid() == 1
+            && let Some(st) = status
+        {
+            panic!("Attempted to kill init! exitcode={:#010x}", st);
+        }
+
         // The group's last thread writes the accounting record while the
         // task still has its mm, files and identity (Linux acct_process
         // when group_dead, before exit_mm/exit_files)
