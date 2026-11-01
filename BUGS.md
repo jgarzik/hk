@@ -221,14 +221,6 @@ global init (SIGNAL_UNKILLABLE), e.g. SIGPIPE from a write to a broken
 socket. hk delivers them, so pid 1 (the boot tester) dies. Socket tests
 use MSG_NOSIGNAL / SIG_IGN and check SIGPIPE in forked children.
 
-## init's stack does not grow
-
-**Location**: `kernel/main.rs` (init)
-
-init is loaded by hand, not by exec: its 1 MB stack is mapped eagerly
-and is not a growable VMA. Programs started by execve map only their
-argument pages and grow on demand up to RLIMIT_STACK, as on Linux.
-
 ## NETLINK_ROUTE / SIOC* subset gaps (P3)
 
 **Location**: `kernel/net/netlink/rtnetlink.rs`, `kernel/net/devioctl.rs`
@@ -564,11 +556,6 @@ expected to fix it; "next batch" means the next fix batch.
    `kernel/fs/proc_array.rs:145` pushes `b as char`; Linux
    proc_task_name emits raw bytes (status escapes only `\n` and `\\`).
    Scenario: `PR_SET_NAME "\xe9"`; stat/status show `\xc3\xa9`.
-5. **init has no argv/envp/auxv** (next batch). `kernel/main.rs:994`:
-   init's stack is zeroed (argc 0, no auxv) and its mm has no
-   arg/env/start_stack layout, so /proc/1/cmdline and environ are
-   empty. Linux run_init_process: argv { "/bin/init" }, envp
-   { "HOME=/", "TERM=linux" }. Fix: build it with exec's stack builder.
 6. **ptrace "init only with CAP_SYS_PTRACE" guard is wrong** (next
    batch). `kernel/task/ptrace.rs:179` refuses init (tid 1) without
    CAP_SYS_PTRACE; Linux has no such rule. ptrace_attach should instead

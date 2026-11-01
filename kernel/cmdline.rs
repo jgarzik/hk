@@ -67,6 +67,81 @@ impl CmdlineConsole {
 
 static CMDLINE_CONSOLE: Mutex<CmdlineConsole> = Mutex::new(CmdlineConsole::new());
 
+/// Longest command line kept (Linux COMMAND_LINE_SIZE on x86)
+const COMMAND_LINE_SIZE: usize = 2048;
+
+/// The command line, saved at parse time (before the heap exists) for
+/// what reads it later: init's arguments (Linux saved_command_line)
+static SAVED: Mutex<([u8; COMMAND_LINE_SIZE], usize)> = Mutex::new(([0; COMMAND_LINE_SIZE], 0));
+
+/// The saved command line
+pub fn saved() -> alloc::string::String {
+    let s = SAVED.lock();
+    alloc::string::String::from_utf8_lossy(&s.0[..s.1]).into_owned()
+}
+
+/// Parameters the kernel takes itself (Linux: __setup handlers and
+/// core params); anything else goes to init
+const KERNEL_PARAMS: &[&str] = &[
+    "console",
+    "earlycon",
+    "usb_trace",
+    "watchdog_thresh",
+    "root",
+    "rootfstype",
+    "rootwait",
+    "ro",
+    "rw",
+    "quiet",
+    "debug",
+    "loglevel",
+    "panic",
+    "init",
+    "rdinit",
+    "nokaslr",
+];
+
+/// What init gets from the command line (Linux init/main.c
+/// unknown_bootoption): `rdinit=`, `init=`, words the kernel does not
+/// know and without '=' as extra argv, `name=value` ones without a '.'
+/// (module parameters) as extra envp; everything after `--` is argv
+pub struct InitArgs {
+    pub rdinit: Option<alloc::string::String>,
+    pub init: Option<alloc::string::String>,
+    pub argv: alloc::vec::Vec<alloc::string::String>,
+    pub envp: alloc::vec::Vec<alloc::string::String>,
+}
+
+/// Split a command line into init's arguments (see [`InitArgs`])
+pub fn init_args(cmdline: &str) -> InitArgs {
+    use alloc::string::ToString;
+    let mut a = InitArgs {
+        rdinit: None,
+        init: None,
+        argv: alloc::vec::Vec::new(),
+        envp: alloc::vec::Vec::new(),
+    };
+    let mut words = cmdline.split_whitespace();
+    for w in words.by_ref() {
+        if w == "--" {
+            break;
+        }
+        let (name, value) = match w.split_once('=') {
+            Some((n, v)) => (n, Some(v)),
+            None => (w, None),
+        };
+        match (name, value) {
+            ("rdinit", Some(v)) => a.rdinit = Some(v.to_string()),
+            ("init", Some(v)) => a.init = Some(v.to_string()),
+            _ if KERNEL_PARAMS.contains(&name) || name.contains('.') => {}
+            (_, Some(_)) => a.envp.push(w.to_string()),
+            (_, None) => a.argv.push(w.to_string()),
+        }
+    }
+    a.argv.extend(words.map(|w| w.to_string()));
+    a
+}
+
 /// Parse kernel command line and apply options
 ///
 /// Supported options:
@@ -74,6 +149,12 @@ static CMDLINE_CONSOLE: Mutex<CmdlineConsole> = Mutex::new(CmdlineConsole::new()
 /// - `console=<device>[,<baud>]`: Set kernel console device
 /// - `watchdog_thresh=<seconds>`: soft lockup threshold (`watchdog`)
 pub fn parse_cmdline(cmdline: &str) {
+    {
+        let mut s = SAVED.lock();
+        let n = cmdline.len().min(COMMAND_LINE_SIZE);
+        s.0[..n].copy_from_slice(&cmdline.as_bytes()[..n]);
+        s.1 = n;
+    }
     for option in cmdline.split_whitespace() {
         if option == "usb_trace" {
             usb::enable_usb_trace();
@@ -173,5 +254,21 @@ pub fn primary_cmdline_console() -> Option<ConsoleSpec> {
         Some(console.specs[console.count - 1])
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn init_args_split() {
+        let a = init_args(
+            "console=ttyS0 root=/dev/ram0 rdinit=/bin/init single FOO=bar mod.p=1 quiet -- -x y=z",
+        );
+        assert_eq!(a.rdinit.as_deref(), Some("/bin/init"));
+        assert_eq!(a.init, None);
+        assert_eq!(a.argv, ["single", "-x", "y=z"]);
+        assert_eq!(a.envp, ["FOO=bar"]);
     }
 }
