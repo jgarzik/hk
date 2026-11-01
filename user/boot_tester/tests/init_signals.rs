@@ -6,6 +6,8 @@
 //! - INIT_UNKILLABLE: a child sends pid 1 SIGTERM, SIGINT, SIGUSR1,
 //!   SIGPIPE and SIGKILL (as root); init lives on
 //! - INIT_HANDLED: a signal init has a handler for is still delivered
+//! - INIT_BLOCKED_DFL: SIGSEGV and SIGTERM sent while init blocks them
+//!   (action SIG_DFL) are queued, and discarded when it unblocks them
 
 use super::helpers::{print, print_num, println};
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -30,6 +32,27 @@ extern "C" fn on_usr2(_sig: i32) {
 pub fn run_tests() {
     unkillable();
     handled();
+    blocked_dfl();
+}
+
+fn blocked_dfl() {
+    const SIG_BLOCK: i32 = 0;
+    const SIG_UNBLOCK: i32 = 1;
+    const SIGSEGV: u32 = 11;
+    let set: u64 = (1 << (SIGSEGV - 1)) | (1 << (SIGTERM - 1));
+    hk_syscall::sys_rt_sigprocmask(SIG_BLOCK, &set as *const u64 as u64, 0, 8);
+    let st = send_to_init(&[SIGSEGV, SIGTERM]);
+    hk_syscall::sys_rt_sigprocmask(SIG_UNBLOCK, &set as *const u64 as u64, 0, 8);
+    settle();
+    // Still running: we print
+    print(b"INIT_BLOCKED_DFL");
+    if st == 0 {
+        println(b":OK");
+    } else {
+        print(b":FAIL kill step ");
+        print_num((st >> 8) as i64);
+        println(b"");
+    }
 }
 
 fn settle() {

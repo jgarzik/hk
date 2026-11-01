@@ -886,11 +886,16 @@ fn sig_ignored(state: &TaskSignalState, sighand: Option<&Arc<SigHand>>, sig: u32
     }
 }
 
+/// The global init lost SIGNAL_UNKILLABLE (Linux
+/// force_sig_info_to_task clears it when the kernel forces a signal
+/// whose action is SIG_DFL): one flag, as there is one global init
+static INIT_KILLABLE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 /// Whether `tid` is a thread of the global init (pid 1 of the initial
-/// pid namespace; Linux is_global_init, its signal_struct carrying
-/// SIGNAL_UNKILLABLE)
-fn is_global_init(tid: Tid) -> bool {
-    TASKLIST.read().get(tid).is_some_and(|t| t.task.pid == 1)
+/// pid namespace; Linux is_global_init) and still SIGNAL_UNKILLABLE
+fn init_unkillable(tid: Tid) -> bool {
+    !INIT_KILLABLE.load(core::sync::atomic::Ordering::Acquire)
+        && TASKLIST.read().get(tid).is_some_and(|t| t.task.pid == 1)
 }
 
 /// Linux sig_task_ignored for the global init: SIGKILL and SIGSTOP never
@@ -947,20 +952,27 @@ fn send_signal_force(tid: Tid, sig: u32, force: bool) -> i32 {
 
     // Kernel threads ignore every signal (Linux ignore_signals in
     // kthreadd): they are processes now (pid == tid), reachable by
-    // kill(-1) and kill(pid)
-    let kthread = TASKLIST
+    // kill(-1) and kill(pid). One lookup also finds the global init.
+    let kind = TASKLIST
         .read()
         .get(tid)
-        .map(|t| t.task.has_flag(crate::task::pf::KTHREAD));
-    match kthread {
+        .map(|t| (t.task.has_flag(crate::task::pf::KTHREAD), t.task.pid == 1));
+    let init = match kind {
         None => return -3, // ESRCH
-        Some(true) => return 0,
-        Some(false) => {}
-    }
+        Some((true, _)) => return 0,
+        Some((false, init)) => init,
+    };
+    // A forced signal lifts the global init's protection (Linux
+    // force_sig_info_to_task); the flag is read once here
+    let init = if init && force {
+        INIT_KILLABLE.store(true, core::sync::atomic::Ordering::Release);
+        false
+    } else {
+        init && !INIT_KILLABLE.load(core::sync::atomic::Ordering::Acquire)
+    };
 
     // Queue unless ignored; note whether it is deliverable now
     let sighand = get_task_sighand(tid);
-    let init = is_global_init(tid);
     let result = with_task_signal_state(tid, |state| {
         if sig_ignored(state, sighand.as_ref(), sig)
             || (init && init_ignores(state, sighand.as_ref(), sig, force))
@@ -1670,10 +1682,8 @@ pub fn do_signal(regs: &mut PtRegs) {
             SigHandler::Default => match default_action(sig) {
                 // A signal queued while blocked does not kill the global
                 // init either (Linux get_signal: SIGNAL_UNKILLABLE),
-                // except SIGSEGV forced on a bad signal frame
-                DefaultAction::Terminate | DefaultAction::Core
-                    if is_global_init(tid) && sig != SIGSEGV =>
-                {
+                // unless the kernel forced one (it lifts the protection)
+                DefaultAction::Terminate | DefaultAction::Core if init_unkillable(tid) => {
                     continue;
                 }
                 DefaultAction::Terminate | DefaultAction::Core => {
