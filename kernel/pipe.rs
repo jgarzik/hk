@@ -945,19 +945,35 @@ impl FileOps for FifoFileOps {
                     p.w_counter.fetch_add(1, Ordering::AcqRel);
                 }
             }
-            p.clone()
+            // Decided under the slot lock, as every open changes the
+            // counters under it (Linux holds pipe->mutex until it sleeps):
+            // a partner that opens, even and closes, after the unlock moves
+            // the counter this waits on, so the wait ends at once
+            let wait = match mode {
+                flags::O_RDONLY if !nonblock && !p.has_writers() => {
+                    Some((true, p.w_counter.load(Ordering::Acquire)))
+                }
+                flags::O_WRONLY if !p.has_readers() => {
+                    Some((false, p.r_counter.load(Ordering::Acquire)))
+                }
+                _ => None,
+            };
+            // Linux f_version: a nonblocking reader that found no writer
+            // gets POLLHUP only after one comes and goes; any other open
+            // compares against 0, so POLLHUP shows once writers are gone
+            let w_version = if mode == flags::O_RDONLY && nonblock && !p.has_writers() {
+                p.w_counter.load(Ordering::Acquire)
+            } else {
+                0
+            };
+            (p.clone(), wait, w_version)
         };
+        let (pipe, wait, w_version) = pipe;
         pipe.wait_queue.wake_all();
-        let w_version = pipe.w_counter.load(Ordering::Acquire);
-        let waited = match mode {
-            flags::O_RDONLY if !nonblock && !pipe.has_writers() => {
-                wait_for_partner(&pipe, &pipe.w_counter, w_version)
-            }
-            flags::O_WRONLY if !pipe.has_readers() => {
-                let seen = pipe.r_counter.load(Ordering::Acquire);
-                wait_for_partner(&pipe, &pipe.r_counter, seen)
-            }
-            _ => Ok(()),
+        let waited = match wait {
+            Some((true, seen)) => wait_for_partner(&pipe, &pipe.w_counter, seen),
+            Some((false, seen)) => wait_for_partner(&pipe, &pipe.r_counter, seen),
+            None => Ok(()),
         };
         if let Err(e) = waited {
             // Interrupted: undo this open (release without a file)
@@ -1027,15 +1043,16 @@ impl FileOps for FifoFileOps {
 }
 
 /// Drop one open of a FIFO in `mode`: its reader/writer counts (waking
-/// the other side), and the inode's pipe with the last file
+/// the other side), and the inode's pipe with the last file; all under
+/// the slot lock, like the open side
 fn fifo_put(inode: &crate::fs::inode::Inode, pipe: &Pipe, mode: u32) {
+    let mut slot = inode.i_pipe.lock();
     if mode != flags::O_WRONLY {
         pipe.remove_reader();
     }
     if mode != flags::O_RDONLY {
         pipe.remove_writer();
     }
-    let mut slot = inode.i_pipe.lock();
     if let Some((_, files)) = slot.as_mut() {
         *files -= 1;
         if *files == 0 {

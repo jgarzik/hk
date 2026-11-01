@@ -13,6 +13,8 @@
 //!   is gone at the next open
 //! - FIFO_POLLHUP: a reader that never had a writer gets no POLLHUP; it
 //!   does once a writer came and went
+//! - FIFO_POLLHUP_PRESENT: a reader that opened while a writer was
+//!   there gets POLLHUP when that writer closes
 
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
@@ -41,6 +43,7 @@ pub fn run_tests() {
     blocking();
     rdwr();
     pollhup();
+    pollhup_present();
     sys_unlink(PATH.as_ptr());
 }
 
@@ -175,4 +178,23 @@ fn pollhup() {
         0
     };
     report(n, step);
+}
+
+fn pollhup_present() {
+    let n = b"FIFO_POLLHUP_PRESENT";
+    let r1 = open(O_RDONLY | O_NONBLOCK);
+    let w = open(O_WRONLY | O_NONBLOCK);
+    let r2 = open(O_RDONLY | O_NONBLOCK);
+    if r1 < 0 || w < 0 || r2 < 0 {
+        close(r1);
+        close(w);
+        close(r2);
+        return report(n, 1);
+    }
+    close(w);
+    let mut p = PollFd::new(r2 as i32, POLLIN);
+    sys_poll(&mut p, 1, 0);
+    close(r1);
+    close(r2);
+    report(n, if p.revents & POLLHUP != 0 { 0 } else { 2 });
 }
