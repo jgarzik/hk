@@ -532,11 +532,6 @@ expected to fix it; "next batch" means the next fix batch.
    d_exchange (dentry name under `d_lock`); vfat must then update the
    moved inode's `parent_cluster`/`short_name` (fs rename needs the
    source inode).
-6. **ptrace "init only with CAP_SYS_PTRACE" guard is wrong** (next
-   batch). `kernel/task/ptrace.rs:179` refuses init (tid 1) without
-   CAP_SYS_PTRACE; Linux has no such rule. ptrace_attach should instead
-   refuse kernel threads and the caller's own thread group (EPERM); hk
-   refuses only the calling thread.
 7. **/proc/<pid>/* owner not refreshed on stat** (fix in V2).
    `kernel/fs/procfs.rs:370`: the owner (task_dump_owner) is updated
    at lookup and in permission() only; Linux pid_revalidate updates it

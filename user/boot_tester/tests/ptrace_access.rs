@@ -2,8 +2,14 @@
 //! __ptrace_may_access, PTRACE_MODE_ATTACH_REALCREDS, for PTRACE_ATTACH
 //! and process_vm_readv): same real uid/gid as all of the target's ids,
 //! and a dumpable target, unless the caller has CAP_SYS_PTRACE
+//!
+//! PTRACE_ATTACH_OWN_GROUP: attaching to a thread of one's own thread
+//! group is EPERM (Linux ptrace_attach: same_thread_group), though the
+//! credentials would allow it
 
+use super::fork_mm::{join, spawn_thread};
 use super::helpers::{print, print_num, println};
+use core::sync::atomic::{AtomicI64, Ordering};
 use hk_syscall::{
     IoVec, sys_close, sys_exit, sys_fork, sys_kill, sys_pause, sys_pipe2, sys_prctl,
     sys_process_vm_readv, sys_ptrace, sys_read, sys_setresgid, sys_setresuid, sys_wait4, sys_write,
@@ -22,6 +28,38 @@ pub fn run_tests() {
     report(b"PTRACE_ACCESS_SAME_UID", in_prober(own_child, 1), 0);
     report(b"PTRACE_ACCESS_NONDUMPABLE", in_prober(own_child, 0), 1);
     report(b"PTRACE_ACCESS_OTHER_UID", other_uid(), 1);
+    report(b"PTRACE_ATTACH_OWN_GROUP", in_prober(own_group, 0), 0);
+}
+
+static SIB_RESULT: AtomicI64 = AtomicI64::new(1);
+
+#[repr(C, align(16))]
+struct SibStack([u8; 16384]);
+static mut SIB_STACK: SibStack = SibStack([0; 16384]);
+static mut SIB_CTID: u32 = 0;
+
+/// Second thread: PTRACE_ATTACH to its own thread group leader
+extern "C" fn sibling(_: u64) -> ! {
+    let r = sys_ptrace(PTRACE_ATTACH, hk_syscall::sys_getpid(), 0, 0);
+    SIB_RESULT.store(r, Ordering::Relaxed);
+    sys_exit(0)
+}
+
+/// In a fresh process: a second thread attaches to the first; exit 0
+/// if that is EPERM
+fn own_group(_: u64) -> u64 {
+    // Dumpable again after the uid change, so only the thread-group
+    // rule can refuse
+    sys_prctl(PR_SET_DUMPABLE, 1, 0, 0, 0);
+    unsafe {
+        let top = (&raw mut SIB_STACK as *mut u8).add(16384) as u64;
+        let ctid = &raw mut SIB_CTID;
+        core::ptr::write_volatile(ctid, 1);
+        if spawn_thread(top, sibling, 0, ctid) < 0 || !join(ctid) {
+            return 2;
+        }
+    }
+    if SIB_RESULT.load(Ordering::Relaxed) == EPERM { 0 } else { 3 }
 }
 
 fn report(name: &[u8], st: i32, want: i32) {
