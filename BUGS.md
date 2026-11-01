@@ -212,15 +212,6 @@ to an untraced task is ignored: stop/continue are not implemented),
 waiting on a tracee by process group, and the tracee's exit being
 reported to a tracer that is not its parent.
 
-## Global init is not protected from default-action signals
-
-**Location**: `kernel/signal/mod.rs` send_signal
-
-Linux drops signals with a default action of terminate/stop sent to
-global init (SIGNAL_UNKILLABLE), e.g. SIGPIPE from a write to a broken
-socket. hk delivers them, so pid 1 (the boot tester) dies. Socket tests
-use MSG_NOSIGNAL / SIG_IGN and check SIGPIPE in forked children.
-
 ## NETLINK_ROUTE / SIOC* subset gaps (P3)
 
 **Location**: `kernel/net/netlink/rtnetlink.rs`, `kernel/net/devioctl.rs`

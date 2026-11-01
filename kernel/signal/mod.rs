@@ -886,6 +886,35 @@ fn sig_ignored(state: &TaskSignalState, sighand: Option<&Arc<SigHand>>, sig: u32
     }
 }
 
+/// Whether `tid` is a thread of the global init (pid 1 of the initial
+/// pid namespace; Linux is_global_init, its signal_struct carrying
+/// SIGNAL_UNKILLABLE)
+fn is_global_init(tid: Tid) -> bool {
+    TASKLIST.read().get(tid).is_some_and(|t| t.task.pid == 1)
+}
+
+/// Linux sig_task_ignored for the global init: SIGKILL and SIGSTOP never
+/// reach it, nor any signal whose action is SIG_DFL (so a stray SIGTERM
+/// or SIGPIPE does not kill it), unless the kernel forces one of the
+/// signals it may not block. A blocked signal is still queued (its
+/// action may change before it is unblocked).
+fn init_ignores(
+    state: &TaskSignalState,
+    sighand: Option<&Arc<SigHand>>,
+    sig: u32,
+    force: bool,
+) -> bool {
+    let kernel_only = sig == SIGKILL || sig == SIGSTOP;
+    if kernel_only {
+        return true;
+    }
+    if state.blocked.contains(sig) || state.real_blocked.contains(sig) || force {
+        return false;
+    }
+    let action = sighand.and_then(|h| h.get_action(sig)).unwrap_or_default();
+    action.handler == SigHandler::Default
+}
+
 /// Send a signal to a specific task (thread)
 ///
 /// Queues the signal and, if it is deliverable, wakes the task from an
@@ -895,6 +924,12 @@ fn sig_ignored(state: &TaskSignalState, sighand: Option<&Arc<SigHand>>, sig: u32
 ///
 /// Returns 0 on success, negative errno on error.
 pub fn send_signal(tid: Tid, sig: u32) -> i32 {
+    send_signal_force(tid, sig, false)
+}
+
+/// send_signal; `force` (a kernel-forced signal, Linux force_sig) is
+/// delivered to the global init even with its action SIG_DFL
+fn send_signal_force(tid: Tid, sig: u32, force: bool) -> i32 {
     check_send_context();
     if sig == 0 {
         // Signal 0 is null signal - just check if task exists
@@ -925,8 +960,11 @@ pub fn send_signal(tid: Tid, sig: u32) -> i32 {
 
     // Queue unless ignored; note whether it is deliverable now
     let sighand = get_task_sighand(tid);
+    let init = is_global_init(tid);
     let result = with_task_signal_state(tid, |state| {
-        if sig_ignored(state, sighand.as_ref(), sig) {
+        if sig_ignored(state, sighand.as_ref(), sig)
+            || (init && init_ignores(state, sighand.as_ref(), sig, force))
+        {
             return (false, false);
         }
         state.pending.add(sig);
@@ -1630,6 +1668,14 @@ pub fn do_signal(regs: &mut PtRegs) {
         match action.handler {
             SigHandler::Ignore => continue,
             SigHandler::Default => match default_action(sig) {
+                // A signal queued while blocked does not kill the global
+                // init either (Linux get_signal: SIGNAL_UNKILLABLE),
+                // except SIGSEGV forced on a bad signal frame
+                DefaultAction::Terminate | DefaultAction::Core
+                    if is_global_init(tid) && sig != SIGSEGV =>
+                {
+                    continue;
+                }
                 DefaultAction::Terminate | DefaultAction::Core => {
                     // Killed by the signal: wait status = signal number,
                     // for every thread of the group
@@ -1784,8 +1830,9 @@ pub fn force_sigsegv(tid: Tid) {
         let _ = sighand.set_action(SIGSEGV, SigAction::default());
     }
     with_task_signal_state(tid, |state| state.blocked.remove(SIGSEGV));
-    // Send SIGSEGV to self
-    send_signal(tid, SIGSEGV);
+    // Send SIGSEGV to self, forced: it kills even the global init (Linux
+    // force_sig_info_to_task clears SIGNAL_UNKILLABLE for SIG_DFL)
+    send_signal_force(tid, SIGSEGV, true);
 }
 
 /// A synchronous fault in user mode (page fault, illegal instruction, ...)

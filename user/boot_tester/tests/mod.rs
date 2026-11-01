@@ -108,6 +108,7 @@ pub mod dyn_exec;
 pub mod fifo;
 pub mod groups;
 pub mod init_args;
+pub mod init_signals;
 pub mod kmsg;
 pub mod exec_at;
 pub mod script_exec;
@@ -176,6 +177,7 @@ pub fn run_all_tests() {
     sysinfo::run_tests();
     gencalls::run_tests();
     init_args::run_tests();
+    init_signals::run_tests();
     exec_at::run_tests();
     script_exec::run_tests();
     clock_ids::run_tests();
