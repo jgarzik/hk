@@ -93,6 +93,19 @@ A PT_INTERP program interpreter is never loaded: exec of a dynamic
 executable fails with ENOEXEC (ENOENT if the interpreter does not
 exist, as on Linux). Only static and static-pie programs run.
 
+## CPU-time clocks: no timers or sleeps
+
+**Location**: `kernel/time_syscall.rs`, `kernel/posix_timer.rs`
+
+CPU-time clocks (CLOCK_PROCESS/THREAD_CPUTIME_ID, per-pid ids) can be
+read but not waited on: clock_nanosleep on the process CPU clock is
+EOPNOTSUPP and timer_create on any CPU clock is EINVAL (Linux
+posix_cpu_nsleep / posix_cpu_timer_create run them from the tick).
+timer_create on CLOCK_TAI is EINVAL too. A process clock sums its live
+threads only: exited threads' time is lost (Linux keeps it in
+signal_struct), and other threads' running slices are not included
+until their next accounting point (Linux task_sched_runtime).
+
 ## Interval timers: ITIMER_VIRTUAL and ITIMER_PROF
 
 **Location**: `kernel/posix_timer.rs` (`sys_setitimer`)

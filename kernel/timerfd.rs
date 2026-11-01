@@ -22,7 +22,7 @@
 //! - One-shot and periodic timers
 //! - Blocking and non-blocking reads
 //! - poll() support for integration with select/poll/epoll
-//! - CLOCK_REALTIME and CLOCK_MONOTONIC support
+//! - CLOCK_REALTIME, CLOCK_MONOTONIC, CLOCK_BOOTTIME and the alarm clocks
 
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
@@ -378,11 +378,9 @@ impl Timerfd {
 
 /// The timer clock of a timerfd clock id
 fn clock_of(clockid: i32) -> HrClock {
-    if clockid == 0 {
-        HrClock::Realtime
-    } else {
-        HrClock::Monotonic
-    }
+    crate::time_syscall::PosixClock::decode(clockid)
+        .and_then(|c| c.timer_base())
+        .unwrap_or(HrClock::Monotonic)
 }
 
 /// Timerfds with TFD_TIMER_CANCEL_ON_SET armed (Linux cancel_list)

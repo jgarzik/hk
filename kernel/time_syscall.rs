@@ -15,6 +15,160 @@ use core::sync::atomic::Ordering;
 /// Linux clock IDs
 pub const CLOCK_REALTIME: i32 = 0;
 pub const CLOCK_MONOTONIC: i32 = 1;
+pub const CLOCK_PROCESS_CPUTIME_ID: i32 = 2;
+pub const CLOCK_THREAD_CPUTIME_ID: i32 = 3;
+pub const CLOCK_MONOTONIC_RAW: i32 = 4;
+pub const CLOCK_REALTIME_COARSE: i32 = 5;
+pub const CLOCK_MONOTONIC_COARSE: i32 = 6;
+pub const CLOCK_BOOTTIME: i32 = 7;
+pub const CLOCK_REALTIME_ALARM: i32 = 8;
+pub const CLOCK_BOOTTIME_ALARM: i32 = 9;
+pub const CLOCK_TAI: i32 = 11;
+
+/// CPU clock kinds (Linux CPUCLOCK_PROF/VIRT/SCHED): user+system,
+/// user only, scheduler runtime (user+system on hk)
+pub const CPUCLOCK_PROF: u8 = 0;
+pub const CPUCLOCK_VIRT: u8 = 1;
+pub const CPUCLOCK_SCHED: u8 = 2;
+
+/// A clock id decoded (Linux clockid_to_kclock and the CPU clock
+/// encoding of posix-cpu-timers)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PosixClock {
+    Realtime,
+    Monotonic,
+    MonotonicRaw,
+    RealtimeCoarse,
+    MonotonicCoarse,
+    Boottime,
+    RealtimeAlarm,
+    BoottimeAlarm,
+    Tai,
+    /// Process or thread CPU time: `pid` 0 is the caller
+    Cpu {
+        pid: u64,
+        thread: bool,
+        which: u8,
+    },
+}
+
+impl PosixClock {
+    /// Decode a clockid_t; None for an id Linux rejects (EINVAL). A
+    /// negative id is a CPU clock: ~pid << 3 | thread << 2 | which.
+    pub fn decode(id: i32) -> Option<Self> {
+        if id < 0 {
+            let which = (id & 3) as u8;
+            if which > CPUCLOCK_SCHED {
+                return None;
+            }
+            let pid = (!id >> 3) as u64;
+            let thread = id & 4 != 0;
+            return Some(Self::Cpu { pid, thread, which });
+        }
+        let cpu = |thread| Self::Cpu {
+            pid: 0,
+            thread,
+            which: CPUCLOCK_SCHED,
+        };
+        Some(match id {
+            CLOCK_REALTIME => Self::Realtime,
+            CLOCK_MONOTONIC => Self::Monotonic,
+            CLOCK_PROCESS_CPUTIME_ID => cpu(false),
+            CLOCK_THREAD_CPUTIME_ID => cpu(true),
+            CLOCK_MONOTONIC_RAW => Self::MonotonicRaw,
+            CLOCK_REALTIME_COARSE => Self::RealtimeCoarse,
+            CLOCK_MONOTONIC_COARSE => Self::MonotonicCoarse,
+            CLOCK_BOOTTIME => Self::Boottime,
+            CLOCK_REALTIME_ALARM => Self::RealtimeAlarm,
+            CLOCK_BOOTTIME_ALARM => Self::BoottimeAlarm,
+            CLOCK_TAI => Self::Tai,
+            _ => return None,
+        })
+    }
+
+    /// The hrtimer base a timer or sleep on this clock runs on, if it
+    /// can have one: realtime-based clocks follow clock_settime. hk
+    /// never suspends, so boottime is monotonic.
+    pub fn timer_base(self) -> Option<HrClock> {
+        match self {
+            Self::Realtime | Self::RealtimeAlarm | Self::Tai => Some(HrClock::Realtime),
+            Self::Monotonic | Self::Boottime | Self::BoottimeAlarm => Some(HrClock::Monotonic),
+            _ => None,
+        }
+    }
+
+    /// The clock's resolution in ns (Linux clock_getres: hrtimer clocks
+    /// 1, coarse clocks a tick, CPU clocks 1 for SCHED else a tick)
+    pub fn res_ns(self) -> u64 {
+        match self {
+            Self::RealtimeCoarse | Self::MonotonicCoarse => crate::task::percpu::TICK_NS,
+            Self::Cpu {
+                which: CPUCLOCK_PROF | CPUCLOCK_VIRT,
+                ..
+            } => crate::task::percpu::TICK_NS,
+            _ => 1,
+        }
+    }
+
+    /// The clock's time now in ns; Err for a CPU clock whose task does
+    /// not exist or may not be read (EINVAL)
+    pub fn now_ns(self) -> Result<i128, KernelError> {
+        let read = |c| TIMEKEEPER.read(c, TIMEKEEPER.get_read_cycles()).to_nanos();
+        let coarse = |ns: i128| ns - ns.rem_euclid(crate::task::percpu::TICK_NS as i128);
+        Ok(match self {
+            Self::Realtime | Self::RealtimeAlarm => read(ClockId::Realtime),
+            Self::Monotonic | Self::MonotonicRaw | Self::Boottime | Self::BoottimeAlarm => {
+                read(ClockId::Monotonic)
+            }
+            Self::RealtimeCoarse => coarse(read(ClockId::Realtime)),
+            Self::MonotonicCoarse => coarse(read(ClockId::Monotonic)),
+            Self::Tai => read(ClockId::Realtime) + tai_offset_ns(),
+            Self::Cpu { pid, thread, which } => cpu_clock_ns(pid, thread, which)? as i128,
+        })
+    }
+}
+
+/// TAI - UTC (adjtimex ADJ_TAI), in ns
+fn tai_offset_ns() -> i128 {
+    NTP_STATE.tai_offset.load(Ordering::Relaxed) as i128 * 1_000_000_000
+}
+
+/// A CPU clock's time (Linux posix_cpu_clock_get / lookup_task): a
+/// thread clock only for the caller's thread group, a process clock
+/// only for a thread group leader
+fn cpu_clock_ns(pid: u64, thread: bool, which: u8) -> Result<u64, KernelError> {
+    use crate::task::percpu;
+    let me = percpu::current_tid();
+    let (utime, stime) = if thread {
+        let tid = if pid == 0 {
+            me
+        } else {
+            pid as crate::task::Tid
+        };
+        let table = percpu::TASKLIST.read();
+        let t = table.get(tid).ok_or(KernelError::InvalidArgument)?;
+        if t.task.pid != percpu::current_pid() {
+            return Err(KernelError::InvalidArgument);
+        }
+        t.task.times()
+    } else {
+        let tgid = if pid == 0 {
+            percpu::current_pid()
+        } else {
+            let table = percpu::TASKLIST.read();
+            let t = table.get(pid as crate::task::Tid);
+            if !t.is_some_and(|t| t.task.pid == pid) {
+                return Err(KernelError::InvalidArgument);
+            }
+            pid
+        };
+        percpu::get_process_times(tgid)
+    };
+    Ok(match which {
+        CPUCLOCK_VIRT => utime,
+        _ => utime.saturating_add(stime), // PROF, SCHED
+    })
+}
 
 /// TIMER_ABSTIME flag for clock_nanosleep
 pub const TIMER_ABSTIME: i32 = 1;
@@ -56,14 +210,11 @@ pub fn sys_clock_gettime(clockid: i32, tp: u64) -> i64 {
         return KernelError::BadAddress.sysret();
     }
 
-    let clock_id = match clockid {
-        CLOCK_REALTIME => ClockId::Realtime,
-        CLOCK_MONOTONIC => ClockId::Monotonic,
+    let ns = match PosixClock::decode(clockid).map(PosixClock::now_ns) {
+        Some(Ok(ns)) => ns,
         _ => return KernelError::InvalidArgument.sysret(),
     };
-
-    let ts = TIMEKEEPER.read(clock_id, TIMEKEEPER.get_read_cycles());
-
+    let ts = crate::time::Timespec::from_nanos(ns);
     let result = LinuxTimespec {
         tv_sec: ts.sec,
         tv_nsec: ts.nsec as i64,
@@ -164,10 +315,20 @@ pub fn sys_nanosleep(req: u64, rem: u64) -> i64 {
 ///
 /// Returns 0 on success, or negative errno on error.
 pub fn sys_clock_nanosleep(clockid: i32, flags: i32, req: u64, rem: u64) -> i64 {
-    // Validate clock ID
-    if clockid != CLOCK_REALTIME && clockid != CLOCK_MONOTONIC {
-        return KernelError::InvalidArgument.sysret();
-    }
+    // Linux: an unknown clock is EINVAL, one that cannot sleep
+    // EOPNOTSUPP (coarse, raw; CPU clocks: BUGS.md), the caller's own
+    // thread CPU clock EINVAL
+    let pclock = match PosixClock::decode(clockid) {
+        Some(c) => c,
+        None => return KernelError::InvalidArgument.sysret(),
+    };
+    let base = match pclock.timer_base() {
+        Some(b) => b,
+        None if matches!(pclock, PosixClock::Cpu { thread: true, .. }) => {
+            return KernelError::InvalidArgument.sysret();
+        }
+        None => return KernelError::OperationNotSupported.sysret(),
+    };
 
     // Validate and read request timespec
     if req == 0 || !Uaccess::access_ok(req, core::mem::size_of::<LinuxTimespec>()) {
@@ -188,13 +349,14 @@ pub fn sys_clock_nanosleep(clockid: i32, flags: i32, req: u64, rem: u64) -> i64 
     if flags & TIMER_ABSTIME != 0 {
         // Absolute time on `clockid`, kept on that clock: a realtime
         // sleep follows clock_settime (Linux hrtimer_nanosleep)
-        let clock = if clockid == CLOCK_REALTIME {
-            HrClock::Realtime
+        // A TAI deadline is a realtime one TAI - UTC earlier
+        let deadline = if pclock == PosixClock::Tai {
+            (req_ns as i128 - tai_offset_ns()).max(0) as u64
         } else {
-            HrClock::Monotonic
+            req_ns
         };
         // Absolute sleeps are restarted unchanged; no remaining time
-        match crate::task::percpu::sleep_until(req_ns, clock, true) {
+        match crate::task::percpu::sleep_until(deadline, base, true) {
             Ok(()) => 0,
             Err(_) => KernelError::RestartNoHand.sysret(),
         }
@@ -212,10 +374,12 @@ pub fn sys_clock_nanosleep(clockid: i32, flags: i32, req: u64, rem: u64) -> i64 
 ///
 /// Returns 0 on success, negative errno on error.
 pub fn sys_clock_getres(clockid: i32, res: u64) -> i64 {
-    // Validate clock ID first (even if res is NULL per POSIX)
-    if clockid != CLOCK_REALTIME && clockid != CLOCK_MONOTONIC {
-        return KernelError::InvalidArgument.sysret();
-    }
+    // Validate clock ID first (even if res is NULL per POSIX); a CPU
+    // clock's task must exist
+    let pclock = match PosixClock::decode(clockid) {
+        Some(c) if c.now_ns().is_ok() => c,
+        _ => return KernelError::InvalidArgument.sysret(),
+    };
 
     // If res is NULL, just return success (validates clock ID only)
     if res == 0 {
@@ -227,10 +391,10 @@ pub fn sys_clock_getres(clockid: i32, res: u64) -> i64 {
         return KernelError::BadAddress.sysret();
     }
 
-    // Return 1 nanosecond resolution (high-resolution mode)
+    let res_ns = pclock.res_ns();
     let result = LinuxTimespec {
-        tv_sec: 0,
-        tv_nsec: 1,
+        tv_sec: (res_ns / 1_000_000_000) as i64,
+        tv_nsec: (res_ns % 1_000_000_000) as i64,
     };
 
     if put_user::<Uaccess, LinuxTimespec>(res, result).is_err() {
@@ -418,9 +582,16 @@ fn get_nofile_limit() -> u64 {
 ///
 /// Returns fd on success, negative errno on error.
 pub fn sys_timerfd_create(clockid: i32, flags: i32) -> i64 {
-    // Validate clockid
-    if clockid != CLOCK_REALTIME && clockid != CLOCK_MONOTONIC {
-        return KernelError::InvalidArgument.sysret();
+    // Linux timerfd_create: realtime, monotonic, boottime and the two
+    // alarm clocks (CAP_WAKE_ALARM, else EPERM)
+    match clockid {
+        CLOCK_REALTIME | CLOCK_MONOTONIC | CLOCK_BOOTTIME => {}
+        CLOCK_REALTIME_ALARM | CLOCK_BOOTTIME_ALARM => {
+            if !crate::task::capable(crate::task::CAP_WAKE_ALARM) {
+                return KernelError::NotPermitted.sysret();
+            }
+        }
+        _ => return KernelError::InvalidArgument.sysret(),
     }
 
     // Validate flags (only TFD_CLOEXEC and TFD_NONBLOCK are allowed)
@@ -856,5 +1027,69 @@ pub fn sys_adjtimex(txc_p: u64) -> i64 {
         TIME_ERROR as i64
     } else {
         TIME_OK as i64
+    }
+}
+
+#[cfg(test)]
+mod clock_tests {
+    use super::*;
+
+    /// Linux MAKE_PROCESS_CPUCLOCK / MAKE_THREAD_CPUCLOCK
+    fn cpuclock(pid: i32, thread: bool, which: i32) -> i32 {
+        (!pid << 3) | if thread { 4 } else { 0 } | which
+    }
+
+    #[test]
+    fn decode_fixed_ids() {
+        assert_eq!(PosixClock::decode(0), Some(PosixClock::Realtime));
+        assert_eq!(PosixClock::decode(7), Some(PosixClock::Boottime));
+        assert_eq!(PosixClock::decode(11), Some(PosixClock::Tai));
+        assert_eq!(
+            PosixClock::decode(CLOCK_THREAD_CPUTIME_ID),
+            Some(PosixClock::Cpu {
+                pid: 0,
+                thread: true,
+                which: CPUCLOCK_SCHED
+            })
+        );
+        // CLOCK_SGI_CYCLE (10) and unknown ids
+        assert_eq!(PosixClock::decode(10), None);
+        assert_eq!(PosixClock::decode(16), None);
+    }
+
+    #[test]
+    fn decode_cpu_ids() {
+        let c = PosixClock::decode(cpuclock(42, false, CPUCLOCK_PROF as i32));
+        assert_eq!(
+            c,
+            Some(PosixClock::Cpu {
+                pid: 42,
+                thread: false,
+                which: CPUCLOCK_PROF
+            })
+        );
+        let c = PosixClock::decode(cpuclock(7, true, CPUCLOCK_VIRT as i32));
+        assert_eq!(
+            c,
+            Some(PosixClock::Cpu {
+                pid: 7,
+                thread: true,
+                which: CPUCLOCK_VIRT
+            })
+        );
+        // CPUCLOCK_MAX (3) is not a clock
+        assert_eq!(PosixClock::decode(cpuclock(1, false, 3)), None);
+    }
+
+    #[test]
+    fn timer_bases() {
+        assert_eq!(PosixClock::Tai.timer_base(), Some(HrClock::Realtime));
+        assert_eq!(PosixClock::Boottime.timer_base(), Some(HrClock::Monotonic));
+        assert_eq!(PosixClock::MonotonicRaw.timer_base(), None);
+        assert_eq!(
+            PosixClock::RealtimeCoarse.res_ns(),
+            crate::task::percpu::TICK_NS
+        );
+        assert_eq!(PosixClock::Monotonic.res_ns(), 1);
     }
 }
