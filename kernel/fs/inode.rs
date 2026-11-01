@@ -112,6 +112,11 @@ impl InodeMode {
         self.file_type() == Some(FileType::BlockDev)
     }
 
+    /// Check if this is a FIFO (named pipe)
+    pub fn is_fifo(&self) -> bool {
+        self.file_type() == Some(FileType::Fifo)
+    }
+
     /// Check if this is a socket
     pub fn is_socket(&self) -> bool {
         self.file_type() == Some(FileType::Socket)
@@ -471,6 +476,10 @@ pub struct Inode {
 
     /// Filesystem-specific private data
     pub private: RwLock<Option<Arc<dyn InodeData>>>,
+
+    /// A FIFO's pipe while it is open, and how many files have it open
+    /// (Linux inode->i_pipe and pipe->files)
+    pub i_pipe: crate::sync::spin::Mutex<Option<(Arc<crate::pipe::Pipe>, usize)>>,
 }
 
 impl Inode {
@@ -504,6 +513,7 @@ impl Inode {
             i_op,
             i_rwsem: RwSem::new(()),
             private: RwLock::new(None),
+            i_pipe: crate::sync::spin::Mutex::new(None),
         }
     }
 
@@ -538,6 +548,7 @@ impl Inode {
             i_op,
             i_rwsem: RwSem::new(()),
             private: RwLock::new(None),
+            i_pipe: crate::sync::spin::Mutex::new(None),
         }
     }
 

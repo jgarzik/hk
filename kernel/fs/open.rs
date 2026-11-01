@@ -218,6 +218,8 @@ fn filp_open(
     // Get the file operations based on inode type
     let f_op: &'static dyn super::FileOps = if inode.mode().is_blkdev() {
         &super::BLOCK_FILE_OPS
+    } else if inode.mode().is_fifo() {
+        &crate::pipe::FIFO_FOPS
     } else if inode.mode().is_chrdev() {
         crate::chardev::get_chardev(inode.rdev)
             .and_then(|d| d.fops())

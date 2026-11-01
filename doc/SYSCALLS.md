@@ -113,8 +113,7 @@
 - [x] readlink (x86-64 only, legacy; use readlinkat)
 - [x] readlinkat
 - [x] mknod (x86-64 only, legacy; use mknodat)
-- [x] mknodat (S_IFSOCK makes a socket inode; FIFOs are created as
-  regular files for now)
+- [x] mknodat (S_IFSOCK makes a socket inode, S_IFIFO a named pipe)
 - [x] chdir
 - [x] fchdir
 - [x] getcwd
