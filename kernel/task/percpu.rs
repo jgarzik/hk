@@ -415,10 +415,13 @@ impl CpuRunQueue {
     /// This CPU's rt tasks give way to its fair ones: their runtime in
     /// this period is used up and a fair task waits or runs (Linux
     /// rt_rq->rt_throttled; the fair server's rule that throttling
-    /// never idles the CPU)
+    /// never idles the CPU). The clock is read only once the runtime is
+    /// used up.
     fn rt_throttled(&self) -> bool {
         let q = self.queue.as_ref().expect("run queue not initialized");
-        self.rt_bw.exceeded() && (q.has_fair() || self.curr_fair().is_some())
+        self.rt_bw.exceeded()
+            && self.rt_bw.exceeded_at(crate::time::monotonic_ns())
+            && (q.has_fair() || self.curr_fair().is_some())
     }
 
     /// Charge the running task's CPU time if it is an rt task (Linux

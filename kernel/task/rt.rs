@@ -48,6 +48,13 @@ impl RtBandwidth {
     pub fn exceeded(&self) -> bool {
         self.time >= RT_RUNTIME_NS
     }
+
+    /// Used up, and the period it was used up in has not ended by `now`
+    /// (a throttle ends with its period even before anything rolls it,
+    /// as Linux's period timer would end it)
+    pub fn exceeded_at(&self, now: u64) -> bool {
+        self.exceeded() && now < self.end
+    }
 }
 
 impl Default for RtBandwidth {
@@ -90,6 +97,18 @@ mod tests {
         assert!(!b.exceeded());
         // A roll that ends no throttle says so
         assert!(!b.roll(t0 + 5 * RT_PERIOD_NS));
+    }
+
+    /// A throttle nothing rolled over still ends with its period
+    #[test]
+    fn stale_throttle_ends() {
+        let mut b = RtBandwidth::new();
+        let t0 = 2 * RT_PERIOD_NS;
+        b.charge(t0, RT_RUNTIME_NS);
+        assert!(b.exceeded_at(t0 + 1));
+        assert!(b.exceeded_at(t0 + RT_PERIOD_NS - 1));
+        assert!(!b.exceeded_at(t0 + RT_PERIOD_NS));
+        assert!(!b.exceeded_at(t0 + 7 * RT_PERIOD_NS));
     }
 
     #[test]
