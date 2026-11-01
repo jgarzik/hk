@@ -236,15 +236,15 @@ pub fn delete_entry(parent: &Arc<Dentry>, name: &str, isdir: bool) -> Result<(),
         let victim = lookup_one(parent, name)?;
         let inode = victim.get_inode().ok_or(KernelError::NotFound)?;
         super::dac::may_delete(&c, &dir, &inode, isdir)?;
-        // Linux vfs_rmdir / vfs_unlink: not a mountpoint in this namespace
-        if super::mount::is_local_mountpoint(&victim) {
-            return Err(KernelError::Busy);
-        }
         // The victim's lock, inside the parent's (Linux vfs_unlink /
-        // vfs_rmdir): its link count never drops under a link of it
+        // vfs_rmdir): its link count never drops under a link of it, and
+        // a mount on it (attach takes it too) is either seen here or
+        // refused for the dead directory
         inode.inode_lock();
-        let r = if isdir {
-            dir.i_op.rmdir(&dir, name)
+        let r = if super::mount::is_local_mountpoint(&victim) {
+            Err(KernelError::Busy)
+        } else if isdir {
+            dir.i_op.rmdir(&dir, name).inspect(|_| inode.set_dead())
         } else {
             dir.i_op.unlink(&dir, name)
         };

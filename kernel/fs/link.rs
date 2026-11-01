@@ -577,12 +577,6 @@ fn rename_locked(old: Side, new: Side, flags: u32) -> Result<(), KernelError> {
             if exchange { d.mode().is_dir() } else { is_dir },
         )?,
     }
-    // Linux vfs_rename: neither side may be a mountpoint here
-    if super::mount::is_local_mountpoint(&src)
-        || dst.as_ref().is_some_and(super::mount::is_local_mountpoint)
-    {
-        return Err(KernelError::Busy);
-    }
     if !Arc::ptr_eq(odir, ndir) {
         if is_dir {
             dac::permission_as(&c, &sinode, MAY_WRITE)?;
@@ -593,9 +587,28 @@ fn rename_locked(old: Side, new: Side, flags: u32) -> Result<(), KernelError> {
     }
 
     // The link counts that change, under their inodes' locks (Linux
-    // lock_two_nondirectories)
+    // lock_two_nondirectories); a directory being replaced is locked
+    // too (Linux vfs_rename), so a mount on it is either seen here or
+    // refused for the dead directory
+    let dead = dinode.as_ref().filter(|d| !exchange && d.mode().is_dir());
     lock_two_nondirs(Some(&sinode), dinode.as_ref());
-    let r = odir.i_op.rename(odir, oname, ndir, nname, flags);
+    if let Some(d) = dead {
+        d.inode_lock();
+    }
+    // Linux vfs_rename: neither side may be a mountpoint here
+    let r = if super::mount::is_local_mountpoint(&src)
+        || dst.as_ref().is_some_and(super::mount::is_local_mountpoint)
+    {
+        Err(KernelError::Busy)
+    } else {
+        odir.i_op.rename(odir, oname, ndir, nname, flags)
+    };
+    if let Some(d) = dead {
+        if r.is_ok() {
+            d.set_dead();
+        }
+        unsafe { d.inode_unlock() };
+    }
     unsafe { unlock_two_nondirs(Some(&sinode), dinode.as_ref()) };
     r?;
     // New lookups re-create both dentries

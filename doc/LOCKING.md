@@ -1685,7 +1685,14 @@ Each open `File` holds a reference to its mount via the `mnt` field:
 
 `is_local_mountpoint` (rmdir, unlink, rename: EBUSY) takes the same
 locks in the same order, one mount's `children` at a time, inside the
-directory inode locks those syscalls hold (sleeping, outer).
+inode locks those syscalls hold (sleeping, outer): the parents' and the
+victim's (rmdir/unlink) or the renamed and replaced inodes' (a
+directory being replaced included, like Linux vfs_rename). `attach`
+takes the mountpoint directory's i_rwsem (Linux lock_mount) around
+linking the new mount in and refuses a directory marked dead
+(`Inode::set_dead`, set by rmdir or a rename replacing it under that
+same lock), so a mount and a removal of its mountpoint serialize:
+i_rwsem -> MntNamespace.root -> Mount.children -> Mount.mountpoint.
 
 #### VFS Locking Notes
 
