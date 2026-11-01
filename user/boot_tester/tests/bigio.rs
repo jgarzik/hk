@@ -3,6 +3,7 @@
 //! blocked in big reads at once must not exhaust kernel memory.
 
 use super::helpers::{print, print_num, println};
+use super::mm_life::{SI_FREERAM, sysinfo_ram};
 use hk_syscall::{
     MAP_ANONYMOUS, MAP_PRIVATE, O_CREAT, O_RDWR, O_TRUNC, PROT_READ, PROT_WRITE, Timespec,
     sys_close, sys_exit, sys_fork, sys_mmap, sys_nanosleep, sys_open, sys_pipe, sys_pread64,
@@ -90,17 +91,6 @@ fn write_mb(fd: i64, mb: usize) -> i64 {
     done as i64
 }
 
-/// Free RAM in bytes (sysinfo)
-fn free_ram() -> u64 {
-    let mut si = [0u8; 112];
-    if hk_syscall::sys_sysinfo(si.as_mut_ptr()) != 0 {
-        return 0;
-    }
-    let free = u64::from_ne_bytes(si[40..48].try_into().unwrap());
-    let unit = u32::from_ne_bytes(si[104..108].try_into().unwrap()).max(1);
-    free * unit as u64
-}
-
 /// Directory every user may write in
 const RDIR: &[u8] = b"/ramfs_t\0";
 const RFILE: &[u8] = b"/ramfs_t/f\0";
@@ -140,11 +130,11 @@ fn test_ramfs_unlink() {
                 return 2;
             }
             if i == 0 {
-                base = free_ram();
+                base = sysinfo_ram(SI_FREERAM);
             }
         }
         // Allow some slack for unrelated allocations
-        if base > free_ram() + (8 * MB) as u64 {
+        if base > sysinfo_ram(SI_FREERAM) + (8 * MB) as u64 {
             return 3;
         }
         0

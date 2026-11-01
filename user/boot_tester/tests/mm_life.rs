@@ -59,6 +59,21 @@ fn line<'a>(text: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
     text.split(|&b| b == b'\n').find(|l| l.starts_with(key))
 }
 
+/// struct sysinfo offsets of totalram and freeram
+pub const SI_TOTALRAM: usize = 32;
+pub const SI_FREERAM: usize = 40;
+
+/// A sysinfo RAM field (SI_TOTALRAM, SI_FREERAM) in bytes, 0 on error
+pub fn sysinfo_ram(off: usize) -> u64 {
+    let mut si = [0u8; 112];
+    if hk_syscall::sys_sysinfo(si.as_mut_ptr()) != 0 {
+        return 0;
+    }
+    let v = u64::from_ne_bytes(si[off..off + 8].try_into().unwrap());
+    let unit = u32::from_ne_bytes(si[104..108].try_into().unwrap()).max(1);
+    v * unit as u64
+}
+
 /// Value in kB of a /proc/meminfo field, -1 if missing
 pub fn meminfo(key: &[u8]) -> i64 {
     let mut buf = [0u8; 4096];
