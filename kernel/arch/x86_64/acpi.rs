@@ -13,7 +13,7 @@
 
 use super::ioremap::{ioremap, iounmap};
 use crate::acpi::aml::{self, SleepType};
-use crate::acpi::hw::PmRegs;
+use crate::acpi::hw::{PmRegs, ResetReg, Space};
 use crate::arch::PowerInfo;
 use alloc::vec::Vec;
 
@@ -192,10 +192,10 @@ pub fn parse_acpi() -> Result<AcpiInfo, &'static str> {
 
     // Find and parse FADT for power management info
     if let Ok(fadt_phys) = find_fadt_phys(sdt_phys, is_xsdt)
-        && let Ok((pm, dsdt_phys)) = parse_fadt_mapped(fadt_phys)
+        && let Ok((mut power, dsdt_phys)) = parse_fadt_mapped(fadt_phys)
     {
-        let s5 = find_s5(dsdt_phys, sdt_phys, is_xsdt);
-        info.power_info = Some(PowerInfo { pm, s5 });
+        power.s5 = find_s5(dsdt_phys, sdt_phys, is_xsdt);
+        info.power_info = Some(power);
     }
 
     Ok(info)
@@ -500,7 +500,20 @@ mod fadt {
     pub const PM1_EVT_LEN: usize = 88;
     pub const GPE0_BLK_LEN: usize = 92;
     pub const GPE1_BLK_LEN: usize = 93;
+    pub const FLAGS: usize = 112;
+    pub const RESET_REG: usize = 116;
+    pub const RESET_VALUE: usize = 128;
     pub const X_DSDT: usize = 140;
+
+    /// Header revision (the FADT's major version)
+    pub const REVISION: usize = 8;
+    /// Flags: RESET_REG_SUP
+    pub const RESET_REG_SUP: u32 = 1 << 10;
+    /// Generic Address Structure: address space ID, then the address at 4
+    pub const GAS_SPACE: usize = 0;
+    pub const GAS_ADDR: usize = 4;
+    pub const SPACE_MEM: u8 = 0;
+    pub const SPACE_IO: u8 = 1;
 }
 
 /// A mapped ACPI table, read by offset with bounds checks (fields past
@@ -534,9 +547,10 @@ impl Table {
     }
 }
 
-/// Parse FADT: power management registers and the DSDT's physical
-/// address (X_DSDT if set, as Linux prefers it) (uses ioremap)
-fn parse_fadt_mapped(fadt_phys: u64) -> Result<(PmRegs, u64), &'static str> {
+/// Parse FADT: power management registers, the reset register, and
+/// the DSDT's physical address (X_DSDT if set, as Linux prefers it); S5
+/// is left for the caller (uses ioremap)
+fn parse_fadt_mapped(fadt_phys: u64) -> Result<(PowerInfo, u64), &'static str> {
     let ptr = map_acpi_table(fadt_phys)?;
     // SAFETY: the header is mapped
     let len = unsafe { core::ptr::read_unaligned(ptr.add(4) as *const u32) } as usize;
@@ -563,8 +577,40 @@ fn parse_fadt_mapped(fadt_phys: u64) -> Result<(PmRegs, u64), &'static str> {
         x => x,
     };
 
+    let reset = reset_reg(&t);
+
     iounmap(ptr, len as u64);
-    Ok((pm, dsdt))
+    let power = PowerInfo {
+        pm,
+        s5: SleepType::default(),
+        reset,
+    };
+    Ok((power, dsdt))
+}
+
+/// The FADT reset register, if supported (Linux acpi_reboot: FADT
+/// revision 2 or later, RESET_REG_SUP, I/O or memory space)
+fn reset_reg(t: &Table) -> Option<ResetReg> {
+    if t.u8(fadt::REVISION) < 2 || t.u32(fadt::FLAGS) & fadt::RESET_REG_SUP == 0 {
+        return None;
+    }
+    let space = match t.u8(fadt::RESET_REG + fadt::GAS_SPACE) {
+        fadt::SPACE_MEM => Space::Mem,
+        fadt::SPACE_IO => Space::Io,
+        _ => return None,
+    };
+    let addr = t.u64(fadt::RESET_REG + fadt::GAS_ADDR);
+    let value = t.u8(fadt::RESET_VALUE);
+    if addr == 0 {
+        return None;
+    }
+    crate::printkln!(
+        "ACPI: reset register {:?} {:#x} value {:#x}",
+        space,
+        addr,
+        value
+    );
+    Some(ResetReg { space, addr, value })
 }
 
 /// SLP_TYP for S5: \_S5 in the DSDT, else in an SSDT; 0 (QEMU's value)

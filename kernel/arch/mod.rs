@@ -595,6 +595,8 @@ pub struct PowerInfo {
     pub pm: crate::acpi::hw::PmRegs,
     /// SLP_TYP values for S5 (soft-off), from \_S5 in the DSDT/SSDTs
     pub s5: crate::acpi::aml::SleepType,
+    /// The FADT reset register, if the firmware offers one
+    pub reset: Option<crate::acpi::hw::ResetReg>,
 }
 
 /// Platform hardware information from ACPI or device tree

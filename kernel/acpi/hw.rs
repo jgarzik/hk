@@ -38,6 +38,22 @@ pub struct PmRegs {
     pub acpi_enable: u8,
 }
 
+/// Where the FADT reset register lives (GAS address space IDs 0 and 1;
+/// PCI configuration space is not supported)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Space {
+    Mem,
+    Io,
+}
+
+/// The FADT reset register and the value that resets the machine
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResetReg {
+    pub space: Space,
+    pub addr: u64,
+    pub value: u8,
+}
+
 /// PM1 control: SCI_EN (ACPI mode)
 pub const SCI_EN: u16 = 1 << 0;
 /// PM1 control: SLP_TYP field shift (3 bits)
