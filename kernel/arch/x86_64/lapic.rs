@@ -356,15 +356,22 @@ pub const ERROR_APIC_VECTOR: u8 = 0xfe;
 pub const SPURIOUS_APIC_VECTOR: u8 = SVR_SPURIOUS_VECTOR as u8;
 
 /// Latch and read this CPU's Error Status Register (the write latches
-/// the errors seen since the last one)
+/// the errors seen since the last one); 0 before the LAPIC is mapped
 pub fn read_esr() -> u32 {
+    if LAPIC_BASE.load(Ordering::Relaxed) == 0 {
+        return 0;
+    }
     let lapic = LocalApic::get();
     lapic.write(LAPIC_ESR, 0);
     lapic.read(LAPIC_ESR)
 }
 
-/// `vector` is in service on this CPU (its ISR bit is set)
+/// `vector` is in service on this CPU (its ISR bit is set); false
+/// before the LAPIC is mapped (a stray vector then is only reported)
 pub fn in_service(vector: u8) -> bool {
+    if LAPIC_BASE.load(Ordering::Relaxed) == 0 {
+        return false;
+    }
     let reg = LAPIC_ISR + ((vector as u32) >> 5) * 0x10;
     LocalApic::get().read(reg) & (1 << (vector & 0x1f)) != 0
 }
