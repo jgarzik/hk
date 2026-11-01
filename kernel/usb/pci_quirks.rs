@@ -24,7 +24,8 @@ use crate::printkln;
 
 use super::ext_caps::{self, Mmio};
 
-/// Programming interface of class 0x0c03 (serial bus, USB)
+/// Programming interfaces of class 0x0c03 (serial bus, USB)
+const PROG_IF_EHCI: u8 = 0x20;
 const PROG_IF_XHCI: u8 = 0x30;
 
 /// The final fixup for every USB controller (Linux
@@ -41,7 +42,7 @@ pub const EARLY_HANDOFF: crate::bus::quirks::PciFixup = crate::bus::quirks::PciF
 /// Take a USB controller over from the firmware (Linux
 /// quirk_usb_early_handoff)
 fn quirk_usb_early_handoff(dev: &PciDevice, _all: &[PciDevice]) {
-    if dev.header.prog_if != PROG_IF_XHCI {
+    if !matches!(dev.header.prog_if, PROG_IF_EHCI | PROG_IF_XHCI) {
         return;
     }
     // Its registers must decode (Linux mmio_resource_enabled)
@@ -53,7 +54,30 @@ fn quirk_usb_early_handoff(dev: &PciDevice, _all: &[PciDevice]) {
         );
         return;
     };
-    quirk_usb_handoff_xhci(dev, &bar);
+    if dev.header.prog_if == PROG_IF_EHCI {
+        quirk_usb_disable_ehci(dev, &bar);
+    } else {
+        quirk_usb_handoff_xhci(dev, &bar);
+    }
+}
+
+/// PCI config space of one function (the device, or a host-test double)
+pub trait Config {
+    fn read32(&self, off: u8) -> u32;
+    fn write32(&self, off: u8, val: u32);
+    fn write8(&self, off: u8, val: u8);
+}
+
+impl Config for PciDevice {
+    fn read32(&self, off: u8) -> u32 {
+        self.cfg_read32(off)
+    }
+    fn write32(&self, off: u8, val: u32) {
+        self.cfg_write32(off, val)
+    }
+    fn write8(&self, off: u8, val: u8) {
+        self.cfg_write8(off, val)
+    }
 }
 
 /// A mapped memory BAR, unmapped on drop
@@ -261,6 +285,157 @@ fn quirk_usb_handoff_xhci(dev: &PciDevice, bar: &Bar) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// EHCI (EHCI spec 2.1.7-2.1.8 and 5.1, USBLEGSUP/USBLEGCTLSTS in config
+// space; Linux quirk_usb_disable_ehci, ehci_bios_handoff)
+
+/// HCCPARAMS (capability register): EHCI Extended Capabilities Pointer
+/// in bits 15:8, a config space offset
+const EHCI_HCC_PARAMS: u32 = 0x08;
+/// Extended capability ID of USBLEGSUP
+const EHCI_CAP_LEGACY: u32 = 1;
+/// USBLEGSUP: HC BIOS Owned semaphore (bit 16, byte 2) and HC OS Owned
+/// semaphore (bit 24, byte 3)
+const EHCI_USBLEGSUP_BIOS: u32 = 1 << 16;
+/// USBLEGCTLSTS: SMI enables and status, after USBLEGSUP
+const EHCI_USBLEGCTLSTS: u8 = 4;
+/// Operational registers
+const EHCI_USBCMD: u32 = 0x00;
+const EHCI_USBSTS: u32 = 0x04;
+const EHCI_USBINTR: u32 = 0x08;
+const EHCI_CONFIGFLAG: u32 = 0x40;
+const EHCI_USBCMD_RUN: u32 = 1 << 0;
+const EHCI_USBSTS_HALTED: u32 = 1 << 12;
+/// USBSTS interrupt status bits, write-1-to-clear
+const EHCI_USBSTS_INTS: u32 = 0x3f;
+
+/// Wait for the firmware to release the controller (Linux: 1 s, every
+/// 10 ms)
+const EHCI_HANDOFF_US: u64 = 1_000_000;
+const EHCI_HANDOFF_POLL_US: u64 = 10_000;
+/// Wait for the halt (Linux: 2 ms, every 100 us)
+const EHCI_HALT_US: u64 = 2_000;
+
+/// What the EHCI hand-off found and did, for the report
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct EhciHandoff {
+    /// Config offset of USBLEGSUP (0: none)
+    pub legacy: u8,
+    /// The firmware owned the controller
+    pub bios_owned: bool,
+    /// ... and released it when asked (false: it had to be taken)
+    pub released: bool,
+    /// Extended capabilities with other IDs (reported, skipped)
+    pub unknown: u32,
+    /// The controller halted in time
+    pub halted: bool,
+}
+
+/// Take an EHCI controller over (Linux quirk_usb_disable_ehci): hand off
+/// through each USBLEGSUP in the extended capability list, then halt
+/// the controller and disable its interrupts
+pub fn handoff_ehci(r: &impl Mmio, cfg: &impl Config, clock: &mut impl Clock) -> EhciHandoff {
+    let mut out = EhciHandoff::default();
+    let op = r.read32(0) & 0xff;
+    if op + EHCI_CONFIGFLAG + 4 > r.len() {
+        return out;
+    }
+    // The list lives in config space after the standard header; at most
+    // 64 entries (Linux: count = 256/4)
+    let mut offset = ((r.read32(EHCI_HCC_PARAMS) >> 8) & 0xff) as u8;
+    for _ in 0..64 {
+        if offset < 0x40 {
+            break;
+        }
+        let cap = cfg.read32(offset);
+        match cap & 0xff {
+            EHCI_CAP_LEGACY => ehci_bios_handoff(r, op, cfg, offset, cap, clock, &mut out),
+            0 => break, // reserved ID: a broken list
+            _ => out.unknown += 1,
+        }
+        offset = (cap >> 8) as u8;
+    }
+    halt_ehci(r, op, clock, &mut out);
+    out
+}
+
+/// Hand-off through the USBLEGSUP at config `offset` (Linux
+/// ehci_bios_handoff). Linux skips it on a few ancient boards (a DMI
+/// table for ICH 283a/27cc tablets that hang on the semaphore); none is
+/// a hk target.
+fn ehci_bios_handoff(
+    r: &impl Mmio,
+    op: u32,
+    cfg: &impl Config,
+    offset: u8,
+    mut cap: u32,
+    clock: &mut impl Clock,
+    out: &mut EhciHandoff,
+) {
+    out.legacy = offset;
+    out.bios_owned = cap & EHCI_USBLEGSUP_BIOS != 0;
+    if out.bios_owned {
+        // The OS semaphore alone, by a byte write: some firmware gets
+        // upset when the semaphores are written for any other reason
+        cfg.write8(offset + 3, 1);
+        let done = || {
+            cap = cfg.read32(offset);
+            cap & EHCI_USBLEGSUP_BIOS == 0
+        };
+        out.released = poll_on(clock, EHCI_HANDOFF_US, EHCI_HANDOFF_POLL_US, done).is_ok();
+        if !out.released {
+            // A buggy BIOS: clear its semaphore and hope for the best
+            cfg.write8(offset + 2, 0);
+        }
+    }
+    // Always disable the SMIs
+    cfg.write32(offset + EHCI_USBLEGCTLSTS, 0);
+    // Firmware ran the ports: their power sessions are not to be trusted
+    if out.bios_owned {
+        r.write32(op + EHCI_CONFIGFLAG, 0);
+    }
+}
+
+/// Halt the controller and disable and acknowledge its interrupts, in
+/// any case (Linux quirk_usb_disable_ehci)
+fn halt_ehci(r: &impl Mmio, op: u32, clock: &mut impl Clock, out: &mut EhciHandoff) {
+    let sts = r.read32(op + EHCI_USBSTS);
+    if sts & EHCI_USBSTS_HALTED == 0 {
+        let cmd = r.read32(op + EHCI_USBCMD);
+        r.write32(op + EHCI_USBCMD, cmd & !EHCI_USBCMD_RUN);
+        let halted = || {
+            r.write32(op + EHCI_USBSTS, EHCI_USBSTS_INTS);
+            let sts = r.read32(op + EHCI_USBSTS);
+            sts == !0 || sts & EHCI_USBSTS_HALTED != 0
+        };
+        out.halted = poll_on(clock, EHCI_HALT_US, 100, halted).is_ok();
+    } else {
+        out.halted = true;
+    }
+    r.write32(op + EHCI_USBINTR, 0);
+    r.write32(op + EHCI_USBSTS, EHCI_USBSTS_INTS);
+}
+
+fn quirk_usb_disable_ehci(dev: &PciDevice, bar: &Bar) {
+    let h = handoff_ehci(bar, dev, &mut Monotonic::new());
+    let id = dev.bus_id();
+    if h.unknown != 0 {
+        printkln!("{}: EHCI: {} unrecognized capabilities", id, h.unknown);
+    }
+    if h.legacy == 0 {
+        printkln!("{}: EHCI: no legacy support capability", id);
+    } else if !h.bios_owned {
+        printkln!("{}: EHCI: not BIOS-owned, SMIs off", id);
+    } else if h.released {
+        printkln!("{}: EHCI: BIOS handoff done, SMIs off", id);
+    } else {
+        printkln!("{}: EHCI: BIOS handoff failed (BIOS bug?), SMIs off", id);
+    }
+    if !h.halted {
+        printkln!("{}: EHCI: did not halt within {} usec", id, EHCI_HALT_US);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -399,5 +574,159 @@ mod tests {
         let h = handoff_xhci(&x, &mut c, false);
         assert!(!h.ready && h.halted);
         assert!(c.now >= 5_000_000_000);
+    }
+
+    const EECP: u8 = 0x68;
+    const EOP: u32 = 0x20;
+
+    /// EHCI config space: USBLEGSUP at EECP; the firmware lets go
+    /// `release_after` reads after the OS asks (None: never)
+    struct FakeCfg {
+        mem: core::cell::RefCell<[u8; 256]>,
+        release_after: Option<u32>,
+        reads: Cell<u32>,
+        byte_writes: core::cell::RefCell<alloc::vec::Vec<(u8, u8)>>,
+    }
+
+    impl FakeCfg {
+        fn new(legsup: u32, release_after: Option<u32>) -> Self {
+            let c = Self {
+                mem: core::cell::RefCell::new([0; 256]),
+                release_after,
+                reads: Cell::new(0),
+                byte_writes: core::cell::RefCell::new(alloc::vec::Vec::new()),
+            };
+            c.put(EECP, legsup | EHCI_CAP_LEGACY);
+            c.put(EECP + 4, 0x003f_e03f); // SMIs on
+            c
+        }
+        fn put(&self, off: u8, v: u32) {
+            self.mem.borrow_mut()[off as usize..off as usize + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        fn get(&self, off: u8) -> u32 {
+            let m = self.mem.borrow();
+            u32::from_le_bytes(m[off as usize..off as usize + 4].try_into().unwrap())
+        }
+    }
+
+    impl Config for FakeCfg {
+        fn read32(&self, off: u8) -> u32 {
+            if off == EECP && self.get(EECP) & (1 << 24) != 0 {
+                self.reads.set(self.reads.get() + 1);
+                if self.release_after.is_some_and(|n| self.reads.get() >= n) {
+                    self.mem.borrow_mut()[EECP as usize + 2] = 0;
+                }
+            }
+            self.get(off)
+        }
+        fn write32(&self, off: u8, val: u32) {
+            self.put(off, val)
+        }
+        fn write8(&self, off: u8, val: u8) {
+            self.byte_writes.borrow_mut().push((off, val));
+            self.mem.borrow_mut()[off as usize] = val;
+        }
+    }
+
+    /// A running EHCI that halts when RUN is cleared
+    struct FakeEhci(FakeRegs);
+
+    impl FakeEhci {
+        fn new() -> Self {
+            let r = FakeRegs::new(0x400);
+            r.set(0, EOP);
+            r.set(EHCI_HCC_PARAMS, (EECP as u32) << 8);
+            r.set(EOP + EHCI_USBCMD, EHCI_USBCMD_RUN);
+            r.set(EOP + EHCI_USBINTR, 0x3f);
+            r.set(EOP + EHCI_CONFIGFLAG, 1);
+            Self(r)
+        }
+    }
+
+    impl Mmio for FakeEhci {
+        fn read32(&self, off: u32) -> u32 {
+            self.0.get(off)
+        }
+        fn write32(&self, off: u32, val: u32) {
+            if off == EOP + EHCI_USBSTS {
+                let v = self.0.get(off) & !(val & EHCI_USBSTS_INTS);
+                self.0.set(off, v);
+                return;
+            }
+            self.0.set(off, val);
+            if off == EOP + EHCI_USBCMD && val & EHCI_USBCMD_RUN == 0 {
+                self.0.set(EOP + EHCI_USBSTS, EHCI_USBSTS_HALTED);
+            }
+        }
+        fn len(&self) -> u32 {
+            self.0.len()
+        }
+    }
+
+    fn ehci_halted_and_quiet(r: &FakeEhci) {
+        assert_eq!(r.0.get(EOP + EHCI_USBCMD) & EHCI_USBCMD_RUN, 0);
+        assert_eq!(r.0.get(EOP + EHCI_USBINTR), 0);
+    }
+
+    #[test]
+    fn ehci_bios_releases() {
+        let (r, c) = (FakeEhci::new(), FakeCfg::new(EHCI_USBLEGSUP_BIOS, Some(2)));
+        let h = handoff_ehci(&r, &c, &mut clock());
+        assert_eq!(h.legacy, EECP);
+        assert!(h.bios_owned && h.released && h.halted);
+        // Only the OS semaphore byte was written
+        assert_eq!(*c.byte_writes.borrow(), alloc::vec![(EECP + 3, 1)]);
+        assert_eq!(c.get(EECP + 4), 0);
+        assert_eq!(r.0.get(EOP + EHCI_CONFIGFLAG), 0);
+        ehci_halted_and_quiet(&r);
+    }
+
+    #[test]
+    fn ehci_bios_never_releases() {
+        let (r, c) = (FakeEhci::new(), FakeCfg::new(EHCI_USBLEGSUP_BIOS, None));
+        let mut ck = clock();
+        let h = handoff_ehci(&r, &c, &mut ck);
+        assert!(h.bios_owned && !h.released);
+        assert!(ck.now >= 1_000_000_000);
+        assert_eq!(
+            *c.byte_writes.borrow(),
+            alloc::vec![(EECP + 3, 1), (EECP + 2, 0)]
+        );
+        assert_eq!(c.get(EECP + 4), 0);
+        ehci_halted_and_quiet(&r);
+    }
+
+    /// Not BIOS-owned: no semaphore writes, CONFIGFLAG kept, SMIs off
+    #[test]
+    fn ehci_not_owned() {
+        let (r, c) = (FakeEhci::new(), FakeCfg::new(0, None));
+        let h = handoff_ehci(&r, &c, &mut clock());
+        assert!(!h.bios_owned);
+        assert!(c.byte_writes.borrow().is_empty());
+        assert_eq!(c.get(EECP + 4), 0);
+        assert_eq!(r.0.get(EOP + EHCI_CONFIGFLAG), 1);
+        ehci_halted_and_quiet(&r);
+    }
+
+    /// No extended capabilities (QEMU's EHCI): only the halt
+    #[test]
+    fn ehci_no_caps() {
+        let (r, c) = (FakeEhci::new(), FakeCfg::new(0, None));
+        r.0.set(EHCI_HCC_PARAMS, 0);
+        let h = handoff_ehci(&r, &c, &mut clock());
+        assert_eq!(h.legacy, 0);
+        assert_eq!(c.get(EECP + 4), 0x003f_e03f);
+        ehci_halted_and_quiet(&r);
+    }
+
+    /// An unknown capability is skipped, a looping list ends
+    #[test]
+    fn ehci_cap_list() {
+        let (r, c) = (FakeEhci::new(), FakeCfg::new(0, None));
+        c.put(EECP, ((EECP as u32) << 8) | 0x0a); // unknown, points at itself
+        let h = handoff_ehci(&r, &c, &mut clock());
+        assert_eq!(h.legacy, 0);
+        assert_eq!(h.unknown, 64);
+        ehci_halted_and_quiet(&r);
     }
 }
