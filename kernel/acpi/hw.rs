@@ -334,7 +334,10 @@ mod tests {
     #[test]
     fn s5_sequence() {
         let mut hw = FakeChipset::new(LPT);
-        hw.setw(LPT.pm1a_cnt, SCI_EN | GBL_RLS | (1 << 1) | (5 << SLP_TYP_SHIFT));
+        hw.setw(
+            LPT.pm1a_cnt,
+            SCI_EN | GBL_RLS | (1 << 1) | (5 << SLP_TYP_SHIFT),
+        );
         hw.setw(LPT.pm1a_evt, WAK_STS);
         for i in 0..LPT.gpe0_len as u16 {
             hw.ports[(LPT.gpe0 + i) as usize] = 0xff;
