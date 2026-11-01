@@ -759,6 +759,7 @@ impl CharDevFileOps {
             DeviceError::NotFound => KernelError::NotFound,
             DeviceError::NotTty => KernelError::NotTty,
             DeviceError::Fault => KernelError::BadAddress,
+            DeviceError::NoSpace => KernelError::NoSpace,
         }
     }
 }

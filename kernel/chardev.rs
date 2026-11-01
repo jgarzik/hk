@@ -133,6 +133,8 @@ pub enum DeviceError {
     NotTty,
     /// Bad user pointer (EFAULT)
     Fault,
+    /// No space left (ENOSPC)
+    NoSpace,
 }
 
 /// Character device trait
@@ -292,16 +294,59 @@ impl CharDevice for ZeroCharDevice {
     }
 }
 
+/// /dev/full (Linux drivers/char/mem.c): reads zeros, every write fails
+/// with ENOSPC
+pub struct FullCharDevice;
+
+impl CharDevice for FullCharDevice {
+    fn name(&self) -> &str {
+        "full"
+    }
+
+    fn read(&self, buf: &mut [u8]) -> Result<usize, DeviceError> {
+        buf.fill(0);
+        Ok(buf.len())
+    }
+
+    fn write(&self, _buf: &[u8]) -> Result<usize, DeviceError> {
+        Err(DeviceError::NoSpace)
+    }
+}
+
+/// /dev/random and /dev/urandom (Linux random_fops/urandom_fops): reads
+/// come from the CRNG, which is ready from boot, so neither blocks (as
+/// on Linux once the CRNG is initialized); writes are mixed into it
+pub struct RandomCharDevice(&'static str);
+
+impl CharDevice for RandomCharDevice {
+    fn name(&self) -> &str {
+        self.0
+    }
+
+    fn read(&self, buf: &mut [u8]) -> Result<usize, DeviceError> {
+        let n = crate::random::stream(buf.len(), |off, b| {
+            buf[off..off + b.len()].copy_from_slice(b);
+            true
+        });
+        Ok(n)
+    }
+
+    fn write(&self, buf: &[u8]) -> Result<usize, DeviceError> {
+        crate::random::add_device_randomness(buf);
+        Ok(buf.len())
+    }
+}
+
 /// Static null device instance
 pub static NULL_CHARDEV: NullCharDevice = NullCharDevice;
 
 /// Static zero device instance
 pub static ZERO_CHARDEV: ZeroCharDevice = ZeroCharDevice;
 
-/// Register built-in character devices (null, zero)
+/// Register built-in character devices (null, zero, full, random,
+/// urandom)
 ///
 /// This must be called after the heap allocator is available.
-/// Creates entries for /dev/null (1,3) and /dev/zero (1,5).
 pub fn register_builtin_chardevs() {
     // /dev/null = major 1 (MEM), minor 3 (Linux convention)
     let null_dev = Arc::new(NullCharDevice);
@@ -310,4 +355,11 @@ pub fn register_builtin_chardevs() {
     // /dev/zero = major 1 (MEM), minor 5 (Linux convention)
     let zero_dev = Arc::new(ZeroCharDevice);
     let _ = register_chardev(DevId::new(major::MEM, 5), zero_dev);
+
+    // /dev/full (1,7), /dev/random (1,8), /dev/urandom (1,9)
+    let _ = register_chardev(DevId::new(major::MEM, 7), Arc::new(FullCharDevice));
+    let random = Arc::new(RandomCharDevice("random"));
+    let _ = register_chardev(DevId::new(major::MEM, 8), random);
+    let urandom = Arc::new(RandomCharDevice("urandom"));
+    let _ = register_chardev(DevId::new(major::MEM, 9), urandom);
 }

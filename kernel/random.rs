@@ -215,6 +215,27 @@ pub fn stream(len: usize, mut out: impl FnMut(usize, &[u8]) -> bool) -> usize {
     done
 }
 
+/// Mix caller-supplied bytes into the base key (Linux
+/// add_device_randomness / write to /dev/random): never credited as
+/// entropy, but they change every later key
+pub fn add_device_randomness(data: &[u8]) {
+    // One block per lock hold: a big write does not keep IRQs off long
+    for chunk in data.chunks(32) {
+        let mut base = BASE.lock();
+        let mut key = base.key;
+        for (i, b) in chunk.iter().enumerate() {
+            key[i / 4] ^= (*b as u32) << (8 * (i % 4));
+        }
+        let mut blk = chacha20_block(&key, 0, &[0x6d69_7800, 0, 0]);
+        base.key.copy_from_slice(&blk[..8]);
+        wipe(&mut blk);
+        wipe(&mut key);
+    }
+    // CPUs take a fresh key from the new base
+    let g = GENERATION.load(Ordering::Relaxed).wrapping_add(1).max(1);
+    GENERATION.store(g, Ordering::Release);
+}
+
 /// Seed the base CRNG (boot, after the clocks)
 pub fn init() {
     let now = crate::time::monotonic_ns();

@@ -1076,6 +1076,9 @@ fn init_vfs_core() {
     let mut nodes = alloc::vec![
         ("null", DevId::new(chardev_major::MEM, 3), 0o666),
         ("zero", DevId::new(chardev_major::MEM, 5), 0o666),
+        ("full", DevId::new(chardev_major::MEM, 7), 0o666),
+        ("random", DevId::new(chardev_major::MEM, 8), 0o666),
+        ("urandom", DevId::new(chardev_major::MEM, 9), 0o666),
         ("tty", DevId::new(chardev_major::TTYAUX, 0), 0o666),
         ("console", DevId::new(chardev_major::TTYAUX, 1), 0o666),
     ];
