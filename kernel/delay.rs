@@ -4,8 +4,10 @@
 //! Drivers wait for hardware in real time, not in loop iterations: an
 //! iteration count tuned under KVM (where PAUSE exits make each spin
 //! slow) is far too short on bare metal. The clock is the monotonic
-//! timekeeper; before it runs (early boot), each PAUSE counts as one
-//! nanosecond, which overestimates the time waited on any real CPU.
+//! timekeeper, chosen once per wait; without it (early boot, or no
+//! clock source), each PAUSE counts as a nanosecond and each poll of
+//! the condition (a device register read) as a microsecond: rough, but
+//! bounded either way.
 //!
 //! These spin and may run in any context (interrupts off included);
 //! code that may sleep should prefer `task::percpu::sleep_current_ms`
@@ -22,16 +24,23 @@ pub struct Timeout;
 pub trait Clock {
     fn now_ns(&mut self) -> u64;
     fn relax(&mut self);
+    /// The condition was polled once (a counting clock charges for it)
+    fn polled(&mut self) {}
 }
 
-/// The kernel's clock: TIMEKEEPER, else PAUSE counting
+/// The kernel's clock: TIMEKEEPER, else counting (decided at creation,
+/// so one wait never mixes the two)
 pub struct Monotonic {
-    spins: u64,
+    timekeeper: bool,
+    count_ns: u64,
 }
 
 impl Monotonic {
     pub fn new() -> Self {
-        Self { spins: 0 }
+        Self {
+            timekeeper: crate::time::TIMEKEEPER.is_initialized(),
+            count_ns: 0,
+        }
     }
 }
 
@@ -43,16 +52,20 @@ impl Default for Monotonic {
 
 impl Clock for Monotonic {
     fn now_ns(&mut self) -> u64 {
-        if crate::time::TIMEKEEPER.is_initialized() {
+        if self.timekeeper {
             crate::time::monotonic_ns()
         } else {
-            self.spins
+            self.count_ns
         }
     }
 
     fn relax(&mut self) {
         core::hint::spin_loop();
-        self.spins += 1;
+        self.count_ns += 1;
+    }
+
+    fn polled(&mut self) {
+        self.count_ns += 1000;
     }
 }
 
@@ -86,7 +99,9 @@ pub fn poll_on(
     let start = clock.now_ns();
     let timeout_ns = timeout_us.saturating_mul(1000);
     loop {
-        if cond() {
+        let ok = cond();
+        clock.polled();
+        if ok {
             return Ok(());
         }
         if clock.now_ns().saturating_sub(start) > timeout_ns {
