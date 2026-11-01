@@ -524,7 +524,7 @@ There are very few direct "cgroup_*" syscalls; the cgroup v1/v2 APIs are primari
 - [x] getrandom (ChaCha20 CRNG, up to MAX_RW_COUNT per call)
 - [x] reboot
 - [x] kexec_load (stub, returns -ENOSYS; requires CAP_SYS_BOOT)
-- [x] syslog (READ, READ_ALL, READ_CLEAR, CLEAR, SIZE_UNREAD, SIZE_BUFFER over the record log; console actions no-ops)
+- [x] syslog (READ, READ_ALL, READ_CLEAR, CLEAR, SIZE_UNREAD, SIZE_BUFFER over the record log; console actions no-ops; CAP_SYSLOG for all, as with dmesg_restrict=1)
 - [x] acct
 - [x] swapon
 - [x] swapoff

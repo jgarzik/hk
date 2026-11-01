@@ -898,20 +898,10 @@ pub fn sys_syslog<A: crate::uaccess::UaccessArch>(type_: i32, buf: u64, len: i32
         return KernelError::InvalidArgument.sysret();
     }
 
-    // Check permissions for privileged operations
-    // SYSLOG_ACTION_READ_ALL, READ_CLEAR, CLEAR, CONSOLE_* require CAP_SYSLOG
-    let needs_cap = matches!(
-        type_,
-        SYSLOG_ACTION_READ
-            | SYSLOG_ACTION_READ_ALL
-            | SYSLOG_ACTION_READ_CLEAR
-            | SYSLOG_ACTION_CLEAR
-            | SYSLOG_ACTION_CONSOLE_OFF
-            | SYSLOG_ACTION_CONSOLE_ON
-            | SYSLOG_ACTION_CONSOLE_LEVEL
-    );
-
-    if needs_cap && !super::capable(super::CAP_SYSLOG) && !super::capable(super::CAP_SYS_ADMIN) {
+    // Linux check_syslog_permissions with dmesg_restrict = 1
+    // (syslog_action_restricted is then true for every action): all of
+    // them need CAP_SYSLOG
+    if !crate::kmsg::syslog_read_allowed() {
         return KernelError::NotPermitted.sysret();
     }
 

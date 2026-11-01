@@ -6,6 +6,8 @@
 //! dropped to make room. printk output still goes to the console as
 //! before (printk.rs keeps its byte ring for the boot-time flush).
 //!
+//! - Reading needs CAP_SYSLOG (dmesg_restrict = 1): every syslog(2)
+//!   action, and opening /dev/kmsg other than write-only.
 //! - /dev/kmsg (1:11): each open has its own cursor (seq + ring index,
 //!   valid while seq >= the first record's). A read returns one record
 //!   as `pri,seq,usec,-;text\n` (non-printable bytes as `\xNN`), EINVAL
@@ -336,6 +338,14 @@ const MAX_RECS: usize = LOG_BUF_LEN / HDR;
 /// Longest formatted record: header text plus every byte escaped
 const MAX_FMT: usize = 64 + 4 * LOG_LINE_MAX;
 
+/// Whether the caller may read the log (Linux check_syslog_permissions
+/// with dmesg_restrict = 1, CONFIG_SECURITY_DMESG_RESTRICT as in
+/// Ubuntu's kernel): CAP_SYSLOG, or the deprecated CAP_SYS_ADMIN
+pub fn syslog_read_allowed() -> bool {
+    use crate::task::{CAP_SYS_ADMIN, CAP_SYSLOG, capable};
+    capable(CAP_SYSLOG) || capable(CAP_SYS_ADMIN)
+}
+
 /// syslog(2) SIZE_BUFFER
 pub fn syslog_size_buffer() -> usize {
     LOG_BUF_LEN
@@ -457,6 +467,12 @@ impl crate::fs::FileOps for KmsgFileOps {
     }
 
     fn open(&self, file: &crate::fs::File) -> Result<(), KernelError> {
+        // Linux devkmsg_open: reading needs syslog READ_ALL rights
+        if file.get_flags() & crate::fs::flags::O_ACCMODE != crate::fs::flags::O_WRONLY
+            && !syslog_read_allowed()
+        {
+            return Err(KernelError::NotPermitted);
+        }
         let first = {
             let log = LOG.lock();
             (log.buf.first_seq(), log.buf.first_idx())
@@ -547,14 +563,15 @@ impl crate::fs::FileOps for KmsgFileOps {
         if offset != 0 {
             return Err(KernelError::IllegalSeek);
         }
+        // Lock order cur -> LOG, as in read and poll
+        let mut cur = u.cur.lock();
         let log = LOG.lock();
-        let pos = match whence {
+        *cur = match whence {
             SEEK_SET => (log.buf.first_seq(), log.buf.first_idx()),
             SEEK_DATA => valid(&log.buf, log.clear),
             SEEK_END => (log.buf.next_seq(), log.buf.next_idx()),
             _ => return Err(KernelError::InvalidArgument),
         };
-        *u.cur.lock() = pos;
         Ok(0)
     }
 

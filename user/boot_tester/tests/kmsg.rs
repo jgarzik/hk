@@ -8,9 +8,16 @@
 //!   EINVAL; lseek with a nonzero offset is ESPIPE, SEEK_CUR is EINVAL
 //! - KMSG_SYSLOG: syslog READ_ALL returns `<pri>[` lines including the
 //!   record written; SIZE_BUFFER is positive
+//! - KMSG_RESTRICT: without CAP_SYSLOG (dmesg_restrict = 1, Ubuntu's
+//!   kernel default) opening /dev/kmsg to read and every syslog action
+//!   (READ_ALL, SIZE_UNREAD, SIZE_BUFFER) are EPERM (a write-only open
+//!   is EACCES only by the node's 0644 mode)
 
 use super::helpers::{print, print_num, println};
-use hk_syscall::{O_NONBLOCK, O_RDWR, sys_close, sys_lseek, sys_open, sys_read, sys_syslog, sys_write};
+use hk_syscall::{
+    O_NONBLOCK, O_RDONLY, O_RDWR, O_WRONLY, sys_close, sys_exit, sys_fork, sys_lseek, sys_open,
+    sys_read, sys_setresuid, sys_syslog, sys_wait4, sys_write,
+};
 
 const EAGAIN: i64 = -11;
 const EINVAL: i64 = -22;
@@ -19,7 +26,10 @@ const SEEK_SET: i32 = 0;
 const SEEK_CUR: i32 = 1;
 const SEEK_END: i32 = 2;
 const SYSLOG_ACTION_READ_ALL: i32 = 3;
+const SYSLOG_ACTION_SIZE_UNREAD: i32 = 9;
 const SYSLOG_ACTION_SIZE_BUFFER: i32 = 10;
+const EPERM: i64 = -1;
+const EACCES: i64 = -13;
 const TEXT: &[u8] = b"hk kmsg test record 4711";
 
 pub fn run_tests() {
@@ -32,6 +42,41 @@ pub fn run_tests() {
     seek(fd);
     sys_close(fd as u64);
     syslog();
+    restrict();
+}
+
+/// As nobody, in a child: exit status is the first failed step
+fn restrict() {
+    let pid = sys_fork();
+    if pid == 0 {
+        if sys_setresuid(65534, 65534, 65534) != 0 {
+            sys_exit(1);
+        }
+        let r = sys_open(b"/dev/kmsg\0".as_ptr(), O_RDONLY, 0);
+        if r != EPERM {
+            sys_exit(2);
+        }
+        // Write-only is not restricted, but the node is 0644 root
+        let w = sys_open(b"/dev/kmsg\0".as_ptr(), O_WRONLY, 0);
+        if w != EACCES {
+            sys_exit(3);
+        }
+        let mut b = [0u8; 64];
+        if sys_syslog(SYSLOG_ACTION_READ_ALL, b.as_mut_ptr(), 64) != EPERM {
+            sys_exit(4);
+        }
+        if sys_syslog(SYSLOG_ACTION_SIZE_UNREAD, core::ptr::null_mut(), 0) != EPERM {
+            sys_exit(5);
+        }
+        if sys_syslog(SYSLOG_ACTION_SIZE_BUFFER, core::ptr::null_mut(), 0) != EPERM {
+            sys_exit(6);
+        }
+        sys_exit(0);
+    }
+    let mut st = 0i32;
+    sys_wait4(pid, &mut st, 0, 0);
+    let step = if st & 0x7f == 0 { (st >> 8) & 0xff } else { 100 };
+    report(b"KMSG_RESTRICT", if step == 0 { b"" } else { b"step" }, step as i64);
 }
 
 fn report(name: &[u8], why: &[u8], detail: i64) {
