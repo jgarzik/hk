@@ -22,6 +22,7 @@ pub mod elf_exec;
 pub mod epoll;
 pub mod eventfd;
 pub mod exec_identity;
+pub mod exec_race;
 pub mod fanotify;
 pub mod fault_signals;
 pub mod fcntl_owner;
@@ -205,6 +206,7 @@ pub fn run_all_tests() {
     isolated(b"STARTUP", startup::run_tests);
     isolated(b"ELF_EXEC", elf_exec::run_tests);
     isolated(b"EXEC_IDENTITY", exec_identity::run_tests);
+    isolated(b"EXEC_RACE", exec_race::run_tests);
     isolated(b"PROCFS_ACCESS", procfs_access::run_tests);
     isolated(b"PTRACE_ACCESS", ptrace_access::run_tests);
     isolated(b"PROC_PID", proc_pid::run_tests);

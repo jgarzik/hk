@@ -291,7 +291,10 @@ fn ptrace_attach(target_pid: Pid) -> i64 {
 
     // Check permissions and attach under the target's cred_guard_mutex
     // (Linux ptrace_attach): no exec of it changes its dumpability between
-    let _guard = crate::signal::CredGuard::lock(target_tid);
+    let _guard = match crate::signal::CredGuard::lock(target_tid) {
+        Ok(g) => g,
+        Err(e) => return e.sysret(),
+    };
     if !ptrace_may_access(target_tid) {
         return -EPERM;
     }
@@ -346,7 +349,10 @@ fn ptrace_seize(target_pid: Pid, options: u32) -> i64 {
 
     // Check permissions and attach under the target's cred_guard_mutex
     // (Linux ptrace_attach): no exec of it changes its dumpability between
-    let _guard = crate::signal::CredGuard::lock(target_tid);
+    let _guard = match crate::signal::CredGuard::lock(target_tid) {
+        Ok(g) => g,
+        Err(e) => return e.sysret(),
+    };
     if !ptrace_may_access(target_tid) {
         return -EPERM;
     }

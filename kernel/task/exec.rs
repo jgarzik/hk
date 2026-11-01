@@ -785,7 +785,10 @@ where
     // the first credential check until the new image is in place, so
     // ptrace attach and mm_access never see the new mm with the old
     // dumpability or the reverse; dropped on every error return
-    let guard = crate::signal::CredGuard::lock(percpu::current_tid());
+    let guard = match crate::signal::CredGuard::lock(percpu::current_tid()) {
+        Ok(g) => g,
+        Err(e) => return e.sysret() as i32,
+    };
     if let Err(e) = crate::task::nproc_exec_check() {
         return -e;
     }

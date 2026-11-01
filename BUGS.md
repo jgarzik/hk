@@ -190,10 +190,6 @@ Phase G (Path{mnt, dentry} from the walk) fixes the lookup.
 **Location**: `kernel/signal/mod.rs` (group exit), `kernel/task/exec.rs`
 de_thread
 
-- A sibling blocked uninterruptibly on its group's cred_guard (a second
-  exec, or ptrace attach) while another thread's exec waits in
-  de_thread never wakes: both wait (Linux takes cred_guard_mutex
-  interruptibly there).
 - Process-directed signals go to one thread's private queue (the
   leader, or a live thread once it has exited), not the shared queue
   with Linux's thread choice at delivery; a pidfd polls readable when

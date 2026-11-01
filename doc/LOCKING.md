@@ -882,7 +882,9 @@ taken, except `cred_guard` around `exec_update`):
   mmap_lock, the fd table, TASKLIST) until the new image is in
   place; an error return drops it with nothing changed. PTRACE_ATTACH /
   PTRACE_SEIZE hold the target's around the access decision and the
-  attach.
+  attach. Both take it interruptibly (Linux mutex_lock_interruptible,
+  ERESTARTNOINTR): a sibling waiting for it while the holder's exec
+  waits in de_thread for that sibling to die is woken by the SIGKILL.
 - `exec_update` (`sync::RwSem`): `exec_replace_image` holds it for
   writing, inside `cred_guard`, while it installs the new mm, name and
   dumpability under TASKLIST and the task's alloc_lock; process_vm_readv/writev (`access_mm`),
@@ -2539,7 +2541,9 @@ de_thread, exit_group does not.
   after dropping it.
 - de_thread (exec) holds cred_guard (sleeping, outermost) while it waits
   for the other threads on CHILD_EXIT_WQ (killable); it holds no
-  spinlock. The old leader and exited threads are removed under
+  spinlock. A thread blocked on that cred_guard (its own exec, or an
+  attach to the group) sleeps interruptibly, so the SIGKILL de_thread
+  sends ends it. The old leader and exited threads are removed under
   TASKLIST and released after it.
 
 #### Reference Counting

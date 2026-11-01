@@ -68,6 +68,13 @@ impl<T> Mutex<T> {
         debug_assert!(r.is_ok());
     }
 
+    /// Acquire without a guard, or EINTR if a signal is pending while
+    /// contended (pair with `unlock_raw`; Linux mutex_lock_interruptible)
+    #[track_caller]
+    pub fn lock_raw_interruptible(&self) -> Result<(), KernelError> {
+        self.lock_wait(SleepState::Interruptible)
+    }
+
     /// Acquire, sleeping in `state` while contended (Linux
     /// __mutex_lock_common): EINTR if that sleep ends on a signal
     #[track_caller]

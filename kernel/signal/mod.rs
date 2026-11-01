@@ -1398,13 +1398,19 @@ impl CredGuard {
 pub struct CredGuard(Option<Arc<SignalStruct>>);
 
 impl CredGuard {
-    /// Take task `tid`'s (none for a task without a SignalStruct)
-    pub fn lock(tid: Tid) -> Self {
+    /// Take task `tid`'s (none for a task without a SignalStruct),
+    /// sleeping interruptibly (Linux prepare_bprm_creds, ptrace_attach):
+    /// a thread waiting here while its group's exec waits in de_thread
+    /// for it to die must see the SIGKILL. A signal gives
+    /// ERESTARTNOINTR (the syscall restarts once the signal is handled).
+    pub fn lock(tid: Tid) -> Result<Self, crate::error::KernelError> {
         let s = get_task_signal_struct(tid);
         if let Some(s) = &s {
-            s.cred_guard.lock_raw();
+            s.cred_guard
+                .lock_raw_interruptible()
+                .map_err(|_| crate::error::KernelError::RestartNoIntr)?;
         }
-        Self(s)
+        Ok(Self(s))
     }
 }
 
