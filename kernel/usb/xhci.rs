@@ -15,7 +15,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering, fence};
 
 use crate::sync::spin::Mutex;
 
-use crate::arch::{CurrentArch, FrameAlloc, IoremapOps, phys_to_virt};
+use crate::arch::{CurrentArch, IoremapOps, phys_to_virt};
 use crate::bus::bus::{BusContext, BusDevice, BusDriver};
 use crate::bus::driver::{Device, DriverError};
 use crate::bus::pci::PciDevice;
@@ -545,12 +545,6 @@ struct CommandRing {
 impl CommandRing {
     const SIZE: usize = 64;
 
-    fn new<FA: FrameAlloc<PhysAddr = u64>>(frame_alloc: &mut FA) -> Option<Self> {
-        // Allocate a page for command ring
-        let phys = frame_alloc.alloc_frame()?;
-        Self::init_from_phys(phys)
-    }
-
     fn new_with_wrapper(frame_alloc: &mut dyn crate::bus::bus::FrameAllocWrapper) -> Option<Self> {
         let phys = frame_alloc.alloc_frame()?;
         Self::init_from_phys(phys)
@@ -643,12 +637,6 @@ struct EventRing {
 
 impl EventRing {
     const SIZE: usize = 64;
-
-    fn new<FA: FrameAlloc<PhysAddr = u64>>(frame_alloc: &mut FA) -> Option<Self> {
-        let phys = frame_alloc.alloc_frame()?;
-        let erst_phys = frame_alloc.alloc_frame()?;
-        Self::init_from_phys(phys, erst_phys)
-    }
 
     fn new_with_wrapper(frame_alloc: &mut dyn crate::bus::bus::FrameAllocWrapper) -> Option<Self> {
         let phys = frame_alloc.alloc_frame()?;
@@ -908,87 +896,6 @@ impl XhciController {
         // Allocate event ring
         self.event_ring =
             Some(EventRing::new_with_wrapper(frame_alloc).ok_or(UsbError::NoResources)?);
-
-        // Configure controller
-        self.configure()?;
-
-        // Enable interrupt mode (optional - falls back to polling if IRQ unavailable)
-        self.enable_interrupts()?;
-
-        // Start controller
-        self.start_controller()?;
-
-        self.initialized = true;
-        printkln!("xHCI: Controller initialized and running");
-
-        Ok(())
-    }
-
-    /// Initialize the controller with a frame allocator
-    pub fn init<FA: FrameAlloc<PhysAddr = u64>>(
-        &mut self,
-        frame_alloc: &mut FA,
-    ) -> Result<(), UsbError> {
-        // Map MMIO region using ioremap (allocates virtual addresses from dedicated region)
-        let bar_size = self.pci_dev.bar_size(0);
-        match CurrentArch::ioremap(self.mmio_base, bar_size) {
-            Ok(virt) => {
-                // Update all base addresses to virtual address
-                let virt_base = virt as u64;
-                self.mmio_base = virt_base;
-                self.cap_regs = virt_base;
-            }
-            Err(e) => {
-                printkln!("xHCI: Failed to ioremap MMIO region: {:?}", e);
-                return Err(UsbError::NoResources);
-            }
-        }
-        // frame_alloc still used for device context allocations below
-
-        // Read capability registers
-        let caplength = (self.read_cap(0) & 0xFF) as u64;
-        let hciversion = self.read_cap(0) >> 16;
-        let hcsparams1 = self.read_cap(0x04);
-        let dboff = self.read_cap(0x14);
-        let rtsoff = self.read_cap(0x18);
-
-        self.max_slots = (hcsparams1 & 0xFF) as u8;
-        self.ctx_size = super::context::ctx_size(self.read_cap(0x10));
-        self.max_ports = ((hcsparams1 >> 24) & 0xFF) as u8;
-
-        // Calculate register offsets
-        self.op_regs = self.mmio_base + caplength;
-        self.db_regs = self.mmio_base + (dboff as u64);
-        self.rt_regs = self.mmio_base + (rtsoff as u64);
-        self.port_regs = self.op_regs + 0x400; // Port registers start at offset 0x400
-
-        printkln!(
-            "xHCI: version={:x}.{:x}, max_slots={}, max_ports={}, context={} bytes",
-            (hciversion >> 8) & 0xFF,
-            hciversion & 0xFF,
-            self.max_slots,
-            self.max_ports,
-            self.ctx_size
-        );
-
-        // Stop controller if running
-        self.halt()?;
-
-        // Reset controller
-        self.reset_controller(XHCI_RESET_LONG_US)?;
-
-        // Allocate Device Context Base Address Array
-        let dcbaa_phys = frame_alloc.alloc_frame().ok_or(UsbError::NoResources)?;
-        unsafe {
-            core::ptr::write_bytes(phys_to_virt(dcbaa_phys), 0, 4096);
-        }
-        self.dcbaa_phys = dcbaa_phys;
-
-        // Allocate command ring
-        self.cmd_ring = Some(CommandRing::new(frame_alloc).ok_or(UsbError::NoResources)?);
-
-        // Allocate event ring
-        self.event_ring = Some(EventRing::new(frame_alloc).ok_or(UsbError::NoResources)?);
 
         // Configure controller
         self.configure()?;
@@ -2035,23 +1942,6 @@ impl UsbController for XhciController {
     ) -> Result<usize, UsbError> {
         self.do_bulk_in(device.slot_id, endpoint, data, XHCI_TRANSFER_US)
     }
-}
-
-/// Initialize xHCI and enumerate devices
-pub fn init_xhci<FA: FrameAlloc<PhysAddr = u64>>(
-    pci_dev: &PciDevice,
-    frame_alloc: &mut FA,
-) -> Result<XhciController, UsbError> {
-    let mmio_base = pci_dev.bar_address(0).ok_or(UsbError::NoResources)?;
-
-    // Enable memory space and bus mastering
-    pci_dev.enable_memory_space();
-    pci_dev.enable_bus_master();
-
-    let mut controller = XhciController::new(mmio_base, pci_dev.clone());
-    controller.init(frame_alloc)?;
-
-    Ok(controller)
 }
 
 #[cfg(test)]

@@ -428,8 +428,6 @@ all of them.
 - `UsbMscBusDriver::matches` accepts any device and assumes QEMU's
   endpoints (0x81/0x02); `main.rs` makes `sda` of the first one.
 - Only 4 KiB controller pages and up to 512 scratchpad buffers.
-- The second, unused init path (`XhciController::init`, `init_xhci`)
-  has none of the fixes and should go.
 
 ## x86 has no IOAPIC or MSI
 
