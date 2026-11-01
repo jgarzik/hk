@@ -229,14 +229,13 @@ global init (SIGNAL_UNKILLABLE), e.g. SIGPIPE from a write to a broken
 socket. hk delivers them, so pid 1 (the boot tester) dies. Socket tests
 use MSG_NOSIGNAL / SIG_IGN and check SIGPIPE in forked children.
 
-## The initial user stack does not grow
+## init's stack does not grow
 
-**Location**: `kernel/task/exec.rs` setup_user_stack, `kernel/main.rs`
-(init)
+**Location**: `kernel/main.rs` (init)
 
-The main thread's stack is mapped eagerly at exec (RLIMIT_STACK, or
-1 MB when unlimited; init's is 1 MB) and is not a growable VMA: Linux maps it lazily and expands it on demand
-up to RLIMIT_STACK.
+init is loaded by hand, not by exec: its 1 MB stack is mapped eagerly
+and is not a growable VMA. Programs started by execve map only their
+argument pages and grow on demand up to RLIMIT_STACK, as on Linux.
 
 ## NETLINK_ROUTE / SIOC* subset gaps (P3)
 
@@ -740,3 +739,9 @@ Found during T0 (2026-10-19). Tag = when to fix.
    (never freed; more concurrent stacks reach higher slots) and frees
    deferred until other CPUs switch. Find which, then fix it or scale
    the tolerance with the CPU count.
+
+14. **SWAPOUT_PAGEOUT flaky on the Linux reference** (J): one x86
+   `check-linux` run had free swap 364 kB off the expected value after
+   MADV_PAGEOUT of 16 MiB (beyond the test's tolerance), passing on the
+   rerun. Linux's swap accounting after pageout is not exact (swap
+   cache); the tolerance may need to grow on Linux.

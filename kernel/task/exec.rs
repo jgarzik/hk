@@ -24,9 +24,10 @@ use crate::mm::{ELF_ET_DYN_BASE, MmLayout, STACK_TOP};
 /// Page size constant
 const PAGE_SIZE: u64 = 4096;
 
-/// Pages of user stack mapped at exec when RLIMIT_STACK is unlimited
-/// (1 MB; the stack does not grow on demand yet, see BUGS.md). It was
-/// 16 KB, which deep frames (signal delivery, large locals) overran.
+/// Pages of the main stack's initial VMA when RLIMIT_STACK is
+/// unlimited or small (1 MB); only the pages holding the arguments are
+/// mapped at exec, the rest fault in, and the VMA grows down on demand
+/// up to RLIMIT_STACK (mm::expand_downwards)
 const USER_STACK_PAGES: usize = 256;
 
 /// Maximum number of pages for user stack (8MB, matching default RLIMIT_STACK)
@@ -131,7 +132,10 @@ impl StackWriter<'_> {
 }
 
 /// Auxiliary vector (Linux fs/binfmt_elf.c create_elf_tables)
-fn auxv(info: &ExecInfo, random: u64, execfn: u64, platform: u64) -> [(u64, u64); 20] {
+/// Entries of the auxiliary vector, AT_NULL included
+const AUXV_LEN: usize = 20;
+
+fn auxv(info: &ExecInfo, random: u64, execfn: u64, platform: u64) -> [(u64, u64); AUXV_LEN] {
     const AT_NULL: u64 = 0;
     const AT_PHDR: u64 = 3;
     const AT_PHENT: u64 = 4;
@@ -199,10 +203,20 @@ fn setup_user_stack<FA: FrameAlloc<PhysAddr = u64>>(
     } else {
         ((stack_limit / PAGE_SIZE) as usize).clamp(USER_STACK_PAGES, MAX_STACK_PAGES)
     };
-    let stack_bottom = STACK_TOP - (stack_pages as u64 * PAGE_SIZE);
+    // Everything must fit in the stack, with room to run
+    let strings: usize = argv.iter().chain(envp).map(|s| s.len() + 1).sum();
+    let words = 1 + argv.len() + 1 + envp.len() + 1 + 2 * AUXV_LEN;
+    let need = strings + info.execfn.len() + 64 + 16 + words * 8 + 64;
+    if need > stack_pages * PAGE_SIZE as usize / 2 {
+        return Err(E2BIG);
+    }
 
-    for i in 0..stack_pages {
-        let va = stack_bottom + (i as u64 * PAGE_SIZE);
+    // Map only what the arguments use (Linux setup_arg_pages: the rest
+    // of the stack VMA faults in on first touch)
+    let mapped = need.div_ceil(PAGE_SIZE as usize) + 1;
+    let map_bottom = STACK_TOP - (mapped as u64 * PAGE_SIZE);
+    for i in 0..mapped {
+        let va = map_bottom + (i as u64 * PAGE_SIZE);
         let frame = user_frame()?;
         unsafe {
             ::core::ptr::write_bytes(crate::arch::phys_to_virt(frame), 0, PAGE_SIZE as usize);
@@ -215,14 +229,6 @@ fn setup_user_stack<FA: FrameAlloc<PhysAddr = u64>>(
             crate::FRAME_ALLOCATOR.free(frame);
             return Err(ENOMEM);
         }
-    }
-
-    // Everything must fit in the mapped stack, with room to run
-    let strings: usize = argv.iter().chain(envp).map(|s| s.len() + 1).sum();
-    let words = 1 + argv.len() + 1 + envp.len() + 1 + 2 * 19;
-    let need = strings + info.execfn.len() + 64 + 16 + words * 8 + 64;
-    if need > stack_pages * PAGE_SIZE as usize / 2 {
-        return Err(E2BIG);
     }
 
     let mut w = StackWriter {
@@ -283,7 +289,7 @@ fn setup_user_stack<FA: FrameAlloc<PhysAddr = u64>>(
         start_stack: sp,
         ..MmLayout::default()
     };
-    Ok((area, stack_bottom))
+    Ok((area, STACK_TOP - (stack_pages as u64 * PAGE_SIZE)))
 }
 
 /// Every PT_LOAD segment and the entry point must land in mappable
