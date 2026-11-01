@@ -133,6 +133,8 @@ mod offset {
     pub const BAR3: u8 = 0x1C;
     pub const BAR4: u8 = 0x20;
     pub const BAR5: u8 = 0x24;
+    pub const SUBSYSTEM_VENDOR_ID: u8 = 0x2C;
+    pub const SUBSYSTEM_ID: u8 = 0x2E;
     pub const CAPABILITY_LIST: u8 = 0x34;
     pub const INTERRUPT_LINE: u8 = 0x3C;
     pub const INTERRUPT_PIN: u8 = 0x3D;
@@ -146,6 +148,7 @@ mod status {
 
 /// PCI capability IDs (Linux PCI_CAP_ID_*)
 pub mod cap_id {
+    pub const PM: u8 = 0x01;
     pub const VNDR: u8 = 0x09;
     pub const MSIX: u8 = 0x11;
 }
@@ -229,10 +232,22 @@ pub trait PciConfigAccess: Send + Sync {
         ((val >> ((offset & 3) * 8)) & 0xFF) as u8
     }
 
-    /// Write 16-bit value (default: read-modify-write)
+    /// Write 16-bit value (default: read-modify-write of the dword, for
+    /// test doubles; real accessors write just the word, since a dword
+    /// write would also write back the neighbour's write-1-to-clear bits,
+    /// e.g. STATUS when writing COMMAND)
     fn write16(&self, bus: u8, dev: u8, func: u8, offset: u8, val: u16) {
         let shift = (offset & 2) * 8;
         let mask = !(0xFFFF << shift);
+        let old = self.read32(bus, dev, func, offset & 0xFC);
+        let new = (old & mask) | ((val as u32) << shift);
+        self.write32(bus, dev, func, offset & 0xFC, new);
+    }
+
+    /// Write 8-bit value (default: read-modify-write, as `write16`)
+    fn write8(&self, bus: u8, dev: u8, func: u8, offset: u8, val: u8) {
+        let shift = (offset & 3) * 8;
+        let mask = !(0xFF << shift);
         let old = self.read32(bus, dev, func, offset & 0xFC);
         let new = (old & mask) | ((val as u32) << shift);
         self.write32(bus, dev, func, offset & 0xFC, new);
@@ -258,18 +273,51 @@ impl PortIoConfigAccess {
     }
 }
 
+/// Serializes the CF8 address / CFC data pair (Linux pci_lock): another
+/// CPU's access between the two would redirect this one
+#[cfg(target_arch = "x86_64")]
+static PCI_LOCK: crate::arch::IrqSpinlock<()> = crate::arch::IrqSpinlock::new(());
+
+#[cfg(target_arch = "x86_64")]
+impl PortIoConfigAccess {
+    /// Select the register; the data port then reads/writes it, at
+    /// CFC + the offset's low bits for a byte or word
+    fn select(bus: u8, dev: u8, func: u8, offset: u8) -> u16 {
+        crate::arch::outl(PCI_CONFIG_ADDR, Self::encode_addr(bus, dev, func, offset));
+        PCI_CONFIG_DATA + (offset & 3) as u16
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 impl PciConfigAccess for PortIoConfigAccess {
     fn read32(&self, bus: u8, dev: u8, func: u8, offset: u8) -> u32 {
-        use crate::arch::{inl, outl};
-        outl(PCI_CONFIG_ADDR, Self::encode_addr(bus, dev, func, offset));
-        inl(PCI_CONFIG_DATA)
+        let _g = PCI_LOCK.lock();
+        crate::arch::inl(Self::select(bus, dev, func, offset & 0xFC))
     }
 
     fn write32(&self, bus: u8, dev: u8, func: u8, offset: u8, val: u32) {
-        use crate::arch::outl;
-        outl(PCI_CONFIG_ADDR, Self::encode_addr(bus, dev, func, offset));
-        outl(PCI_CONFIG_DATA, val);
+        let _g = PCI_LOCK.lock();
+        crate::arch::outl(Self::select(bus, dev, func, offset & 0xFC), val);
+    }
+
+    fn read16(&self, bus: u8, dev: u8, func: u8, offset: u8) -> u16 {
+        let _g = PCI_LOCK.lock();
+        crate::arch::inw(Self::select(bus, dev, func, offset & 0xFE))
+    }
+
+    fn read8(&self, bus: u8, dev: u8, func: u8, offset: u8) -> u8 {
+        let _g = PCI_LOCK.lock();
+        crate::arch::inb(Self::select(bus, dev, func, offset))
+    }
+
+    fn write16(&self, bus: u8, dev: u8, func: u8, offset: u8, val: u16) {
+        let _g = PCI_LOCK.lock();
+        crate::arch::outw(Self::select(bus, dev, func, offset & 0xFE), val);
+    }
+
+    fn write8(&self, bus: u8, dev: u8, func: u8, offset: u8, val: u8) {
+        let _g = PCI_LOCK.lock();
+        crate::arch::outb(Self::select(bus, dev, func, offset), val);
     }
 }
 
@@ -312,6 +360,26 @@ impl PciConfigAccess for EcamConfigAccess {
     fn write32(&self, bus: u8, dev: u8, func: u8, offset: u8, val: u32) {
         let addr = unsafe { self.base.add(Self::offset(bus, dev, func, offset)) };
         unsafe { core::ptr::write_volatile(addr as *mut u32, val) }
+    }
+
+    fn read16(&self, bus: u8, dev: u8, func: u8, offset: u8) -> u16 {
+        let addr = unsafe { self.base.add(Self::offset(bus, dev, func, offset & 0xFE)) };
+        unsafe { core::ptr::read_volatile(addr as *const u16) }
+    }
+
+    fn read8(&self, bus: u8, dev: u8, func: u8, offset: u8) -> u8 {
+        let addr = unsafe { self.base.add(Self::offset(bus, dev, func, offset)) };
+        unsafe { core::ptr::read_volatile(addr) }
+    }
+
+    fn write16(&self, bus: u8, dev: u8, func: u8, offset: u8, val: u16) {
+        let addr = unsafe { self.base.add(Self::offset(bus, dev, func, offset & 0xFE)) };
+        unsafe { core::ptr::write_volatile(addr as *mut u16, val) }
+    }
+
+    fn write8(&self, bus: u8, dev: u8, func: u8, offset: u8, val: u8) {
+        let addr = unsafe { self.base.add(Self::offset(bus, dev, func, offset)) };
+        unsafe { core::ptr::write_volatile(addr, val) }
     }
 }
 
@@ -381,6 +449,11 @@ pub fn pci_read8(bus: u8, dev: u8, func: u8, offset: u8) -> u8 {
     config().read8(bus, dev, func, offset)
 }
 
+/// Write 8-bit value to PCI configuration space
+pub fn pci_write8(bus: u8, dev: u8, func: u8, offset: u8, val: u8) {
+    config().write8(bus, dev, func, offset, val)
+}
+
 /// PCI device header (Type 0 - standard)
 #[derive(Debug, Clone)]
 pub struct PciDeviceHeader {
@@ -399,11 +472,23 @@ pub struct PciDeviceHeader {
     pub bar: [u32; 6],
     pub interrupt_line: u8,
     pub interrupt_pin: u8,
+    /// Subsystem vendor and device (type 0 headers; 0 otherwise): the
+    /// board, for quirks keyed on it
+    pub subsystem_vendor_id: u16,
+    pub subsystem_id: u16,
 }
 
 impl PciDeviceHeader {
     /// Read header from PCI configuration space
     pub fn read(bus: u8, dev: u8, func: u8) -> Self {
+        let type0 = pci_read8(bus, dev, func, offset::HEADER_TYPE) & 0x7F == 0;
+        let subsys = |off| {
+            if type0 {
+                pci_read16(bus, dev, func, off)
+            } else {
+                0
+            }
+        };
         Self {
             vendor_id: pci_read16(bus, dev, func, offset::VENDOR_ID),
             device_id: pci_read16(bus, dev, func, offset::DEVICE_ID),
@@ -427,6 +512,8 @@ impl PciDeviceHeader {
             ],
             interrupt_line: pci_read8(bus, dev, func, offset::INTERRUPT_LINE),
             interrupt_pin: pci_read8(bus, dev, func, offset::INTERRUPT_PIN),
+            subsystem_vendor_id: subsys(offset::SUBSYSTEM_VENDOR_ID),
+            subsystem_id: subsys(offset::SUBSYSTEM_ID),
         }
     }
 
@@ -714,6 +801,45 @@ impl PciDevice {
         pci_read32(self.bus, self.device, self.function, off)
     }
 
+    /// Write a config space byte of this function
+    pub fn cfg_write8(&self, off: u8, val: u8) {
+        pci_write8(self.bus, self.device, self.function, off, val)
+    }
+
+    /// Write a config space word of this function
+    pub fn cfg_write16(&self, off: u8, val: u16) {
+        pci_write16(self.bus, self.device, self.function, off, val)
+    }
+
+    /// Write a config space dword of this function
+    pub fn cfg_write32(&self, off: u8, val: u32) {
+        pci_write32(self.bus, self.device, self.function, off, val)
+    }
+
+    /// Class code, subclass and programming interface as one 24-bit value
+    /// (Linux pci_dev.class)
+    pub fn class24(&self) -> u32 {
+        (self.header.class_code as u32) << 16
+            | (self.header.subclass as u32) << 8
+            | self.header.prog_if as u32
+    }
+
+    /// Put the function in D3hot, if it has power management (Linux
+    /// pci_set_power_state(PCI_D3hot) for a shutdown): PMCSR power state
+    /// 3, then the 10 ms the spec allows before the next access
+    pub fn set_power_d3hot(&self) {
+        // PMCSR: power state in bits 1:0; PME_Status (bit 15) is
+        // write-1-to-clear, keep it out of the write
+        const PMCSR: u8 = 4;
+        const PME_STATUS: u16 = 1 << 15;
+        let Some((pm, _)) = self.caps().find(|&(_, id)| id == cap_id::PM) else {
+            return;
+        };
+        let csr = self.cfg_read16(pm + PMCSR);
+        self.cfg_write16(pm + PMCSR, (csr & !(PME_STATUS | 3)) | 3);
+        crate::delay::mdelay(10);
+    }
+
     /// The capability list: (offset, ID) pairs (Linux pci_find_capability)
     pub fn caps(&self) -> PciCapIter<impl Fn(u8) -> u8 + '_> {
         let first = if self.cfg_read16(offset::STATUS) & status::CAP_LIST != 0 {
@@ -985,6 +1111,10 @@ impl Bus for PciBus {
             // Enable memory space access (needed for newly assigned BARs)
             device.enable_memory_space();
         }
+
+        // Firmware hand-offs and chipset fixups, before any driver
+        // touches a device (Linux FIXUP_FINAL, pci_bus_add_device)
+        super::quirks::fixup_final(&self.devices);
 
         // Match devices to drivers and probe
         for device in &self.devices {

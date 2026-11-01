@@ -8,6 +8,7 @@ pub mod driver;
 pub mod pci;
 pub mod pci_intx;
 pub mod platform;
+pub mod quirks;
 
 pub use bus::{Bus, BusContext, BusDevice, BusDriver, BusManager, FrameAllocWrapper};
 pub use driver::{Device, DriverError, InterruptController, Timer};
