@@ -207,11 +207,9 @@ impl PosixTimer {
         let (expires_ns, clock) = if flags & timer_flags::TIMER_ABSTIME != 0 {
             // Absolute, kept on its clock: a realtime one follows
             // clock_settime
-            let clock = if self.clockid == CLOCK_REALTIME {
-                HrClock::Realtime
-            } else {
-                HrClock::Monotonic
-            };
+            let clock = crate::time_syscall::PosixClock::decode(self.clockid)
+                .and_then(|c| c.timer_base())
+                .unwrap_or(HrClock::Monotonic);
             (value_ns, clock)
         } else {
             // Relative time (saturates: a huge value never fires)
@@ -404,9 +402,20 @@ pub fn create_posix_timer(
     clockid: i32,
     sigevent: Option<SigEvent>,
 ) -> Result<TimerT, i32> {
-    // Validate clockid
-    if clockid != 0 && clockid != 1 {
-        return Err(-22); // EINVAL - only CLOCK_REALTIME (0) and CLOCK_MONOTONIC (1)
+    // Realtime, monotonic and boottime; the alarm clocks need
+    // CAP_WAKE_ALARM (EPERM). TAI and CPU-time timers are not
+    // implemented (BUGS.md): EINVAL.
+    use crate::time_syscall::{
+        CLOCK_BOOTTIME, CLOCK_BOOTTIME_ALARM, CLOCK_MONOTONIC, CLOCK_REALTIME_ALARM,
+    };
+    match clockid {
+        CLOCK_REALTIME | CLOCK_MONOTONIC | CLOCK_BOOTTIME => {}
+        CLOCK_REALTIME_ALARM | CLOCK_BOOTTIME_ALARM => {
+            if !crate::task::capable(crate::task::CAP_WAKE_ALARM) {
+                return Err(-1); // EPERM
+            }
+        }
+        _ => return Err(-22), // EINVAL
     }
 
     let sev = sigevent.unwrap_or_default();

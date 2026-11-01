@@ -173,13 +173,18 @@ const EINVAL: i64 = 22;
 
 /// May the caller attach to the target (Linux ptrace_attach ->
 /// __ptrace_may_access, PTRACE_MODE_ATTACH_REALCREDS): [`may_access`]
-/// with the caller's real ids; init only with CAP_SYS_PTRACE
+/// with the caller's real ids
 fn ptrace_may_access(target_tid: Tid) -> bool {
-    // Cannot trace init
-    if target_tid == 1 && !capable(CAP_SYS_PTRACE) {
-        return false;
-    }
     may_access(|t| t.task.tid() == target_tid, false)
+}
+
+/// Linux ptrace_attach's first refusals (EPERM): a kernel thread, or a
+/// thread of the caller's own thread group
+fn attach_refused(target_tid: Tid) -> bool {
+    let table = TASKLIST.read();
+    table.get(target_tid).is_none_or(|t| {
+        t.task.has_flag(crate::task::pf::KTHREAD) || t.task.pid == percpu::current_pid()
+    })
 }
 
 /// Check if tracee is stopped and caller is its tracer.
@@ -280,16 +285,16 @@ fn ptrace_attach(target_pid: Pid) -> i64 {
         None => return -ESRCH,
     };
 
-    let caller_tid = percpu::current_tid();
-
-    // Cannot attach to self
-    if target_tid == caller_tid {
+    if attach_refused(target_tid) {
         return -EPERM;
     }
 
     // Check permissions and attach under the target's cred_guard_mutex
     // (Linux ptrace_attach): no exec of it changes its dumpability between
-    let _guard = crate::signal::CredGuard::lock(target_tid);
+    let _guard = match crate::signal::CredGuard::lock(target_tid) {
+        Ok(g) => g,
+        Err(e) => return e.sysret(),
+    };
     if !ptrace_may_access(target_tid) {
         return -EPERM;
     }
@@ -338,16 +343,16 @@ fn ptrace_seize(target_pid: Pid, options: u32) -> i64 {
         None => return -ESRCH,
     };
 
-    let caller_tid = percpu::current_tid();
-
-    // Cannot attach to self
-    if target_tid == caller_tid {
+    if attach_refused(target_tid) {
         return -EPERM;
     }
 
     // Check permissions and attach under the target's cred_guard_mutex
     // (Linux ptrace_attach): no exec of it changes its dumpability between
-    let _guard = crate::signal::CredGuard::lock(target_tid);
+    let _guard = match crate::signal::CredGuard::lock(target_tid) {
+        Ok(g) => g,
+        Err(e) => return e.sysret(),
+    };
     if !ptrace_may_access(target_tid) {
         return -EPERM;
     }

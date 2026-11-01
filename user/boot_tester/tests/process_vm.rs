@@ -2,8 +2,13 @@
 //!
 //! Tests for cross-process memory access syscalls.
 
+use super::fork_mm::{join, spawn_thread};
 use super::helpers::{print, print_num, println};
-use hk_syscall::{IoVec, sys_getpid, sys_process_vm_readv, sys_process_vm_writev};
+use core::sync::atomic::{AtomicI64, Ordering};
+use hk_syscall::{
+    IoVec, sys_exit, sys_fork, sys_getpid, sys_prctl, sys_process_vm_readv, sys_process_vm_writev,
+    sys_setresgid, sys_setresuid, sys_wait4,
+};
 
 const ESRCH: i64 = -3;
 const EINVAL: i64 = -22;
@@ -17,6 +22,65 @@ pub fn run_tests() {
     test_process_vm_invalid_pid();
     test_process_vm_invalid_flags();
     test_process_vm_zero_iovecs();
+    test_process_vm_sibling();
+}
+
+static SIB_RESULT: AtomicI64 = AtomicI64::new(0);
+static SIB_DATA: [u8; 8] = *b"sibling!";
+
+#[repr(C, align(16))]
+struct SibStack([u8; 16384]);
+static mut SIB_STACK: SibStack = SibStack([0; 16384]);
+static mut SIB_CTID: u32 = 0;
+
+/// Thread body: read the process's own memory by pid
+extern "C" fn sib_reader(_: u64) -> ! {
+    let mut dest = [0u8; 8];
+    let local = IoVec {
+        iov_base: dest.as_mut_ptr() as *const u8,
+        iov_len: 8,
+    };
+    let remote = IoVec {
+        iov_base: SIB_DATA.as_ptr(),
+        iov_len: 8,
+    };
+    let r = sys_process_vm_readv(sys_getpid() as i32, &local, 1, &remote, 1, 0);
+    let ok = r == 8 && dest == SIB_DATA;
+    SIB_RESULT.store(if ok { 1 } else { r.min(-1) }, Ordering::Relaxed);
+    sys_exit(0)
+}
+
+/// PROCESS_VM_SIBLING: a non-dumpable uid-1000 process's second thread
+/// reads its own process by pid (Linux mm_access exempts the caller's
+/// own mm, whatever the thread)
+fn test_process_vm_sibling() {
+    const PR_SET_DUMPABLE: i32 = 4;
+    let pid = sys_fork();
+    if pid == 0 {
+        if sys_setresgid(1000, 1000, 1000) != 0 || sys_setresuid(1000, 1000, 1000) != 0 {
+            sys_exit(2);
+        }
+        sys_prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
+        unsafe {
+            let top = (&raw mut SIB_STACK as *mut u8).add(16384) as u64;
+            let ctid = &raw mut SIB_CTID;
+            core::ptr::write_volatile(ctid, 1);
+            if spawn_thread(top, sib_reader, 0, ctid) < 0 || !join(ctid) {
+                sys_exit(3);
+            }
+        }
+        sys_exit(if SIB_RESULT.load(Ordering::Relaxed) == 1 { 0 } else { 1 });
+    }
+    let mut st = 0i32;
+    sys_wait4(pid, &mut st, 0, 0);
+    print(b"PROCESS_VM_SIBLING");
+    if st == 0 {
+        println(b":OK");
+    } else {
+        print(b":FAIL ");
+        print_num((st >> 8) as i64);
+        println(b"");
+    }
 }
 
 /// Test: Read own memory using process_vm_readv (pid = getpid())

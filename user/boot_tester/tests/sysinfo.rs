@@ -10,8 +10,8 @@
 //! - Test 75: clock_settime() EINVAL - cannot set CLOCK_MONOTONIC
 //! - Test 76: clock_settime() EINVAL - invalid nsec value
 //! - CLOCK_SETTIME_STORM: clock_settime() racing the timer tick on CPU 0
-//! - Test 77: settimeofday() - set time (x86_64 only)
-//! - Test 78: settimeofday() EINVAL - invalid usec (x86_64 only)
+//! - Test 77: settimeofday() - set time
+//! - Test 78: settimeofday() EINVAL - invalid usec
 
 use super::sk::T;
 use super::helpers::{host_mode, print, print_cstr, print_num, println, starts_with};
@@ -19,7 +19,6 @@ use hk_syscall::{
     Timespec, UtsName, sys_clock_gettime, sys_clock_settime, sys_sched_getaffinity,
     sys_sched_setaffinity, sys_setdomainname, sys_sethostname, sys_times, sys_uname,
 };
-#[cfg(target_arch = "x86_64")]
 use hk_syscall::{Timeval, sys_gettimeofday, sys_settimeofday};
 
 // Clock IDs
@@ -38,11 +37,8 @@ pub fn run_tests() {
     test_clock_settime_invalid_nsec();
     test_clock_settime_storm();
     test_loadavg();
-    #[cfg(target_arch = "x86_64")]
-    {
-        test_settimeofday_basic();
-        test_settimeofday_invalid_usec();
-    }
+    test_settimeofday_basic();
+    test_settimeofday_invalid_usec();
 }
 
 /// Test 70: uname() - get system identification
@@ -333,8 +329,7 @@ fn test_loadavg() {
     t.done();
 }
 
-/// Test 77: settimeofday() - set time (x86_64 only)
-#[cfg(target_arch = "x86_64")]
+/// Test 77: settimeofday() - set time
 fn test_settimeofday_basic() {
     // Get current time
     let mut tv_before = Timeval {
@@ -382,8 +377,7 @@ fn test_settimeofday_basic() {
     }
 }
 
-/// Test 78: settimeofday() EINVAL - invalid usec (x86_64 only)
-#[cfg(target_arch = "x86_64")]
+/// Test 78: settimeofday() EINVAL - invalid usec
 fn test_settimeofday_invalid_usec() {
     let tv = Timeval {
         tv_sec: 1000,

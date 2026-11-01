@@ -2,6 +2,7 @@
 
 pub mod exec;
 pub mod fair;
+pub mod fdbits;
 pub mod fdtable;
 pub mod id;
 pub mod kthread;
@@ -135,7 +136,7 @@ pub type Gid = u32;
 /// as Linux does, plus the five capability sets.
 ///
 /// Mirrors Linux's `struct cred` from include/linux/cred.h
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cred {
     /// Real user ID
     pub uid: Uid,
@@ -165,6 +166,39 @@ pub struct Cred {
     pub cap_bset: KernelCap,
     /// Ambient capability set (automatically inherited by children)
     pub cap_ambient: KernelCap,
+    /// Supplementary groups, sorted (Linux group_info)
+    pub groups: GroupInfo,
+}
+
+/// Supplementary group list (Linux struct group_info): sorted and
+/// shared, replaced whole by setgroups; empty without an allocation
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GroupInfo(Option<Arc<[Gid]>>);
+
+/// Linux NGROUPS_MAX
+pub const NGROUPS_MAX: usize = 65536;
+
+impl GroupInfo {
+    pub const EMPTY: Self = Self(None);
+
+    /// A list from any order (Linux groups_sort; duplicates kept, as
+    /// Linux does)
+    pub fn new(mut gids: alloc::vec::Vec<Gid>) -> Self {
+        if gids.is_empty() {
+            return Self::EMPTY;
+        }
+        gids.sort_unstable();
+        Self(Some(gids.into()))
+    }
+
+    pub fn as_slice(&self) -> &[Gid] {
+        self.0.as_deref().unwrap_or(&[])
+    }
+
+    /// Linux groups_search
+    pub fn contains(&self, gid: Gid) -> bool {
+        self.as_slice().binary_search(&gid).is_ok()
+    }
 }
 
 impl Cred {
@@ -183,6 +217,7 @@ impl Cred {
         cap_effective: CAP_FULL_SET,
         cap_bset: CAP_FULL_SET,
         cap_ambient: CAP_EMPTY_SET, // Ambient starts empty even for root
+        groups: GroupInfo::EMPTY,
     };
 
     /// No privileges at all (overflow uid/gid 65534, no capabilities,
@@ -202,6 +237,7 @@ impl Cred {
         cap_effective: CAP_EMPTY_SET,
         cap_bset: CAP_EMPTY_SET,
         cap_ambient: CAP_EMPTY_SET,
+        groups: GroupInfo::EMPTY,
     };
 
     /// Create credentials for a specific user/group
@@ -231,6 +267,7 @@ impl Cred {
             cap_effective: caps,
             cap_bset: bset,
             cap_ambient: CAP_EMPTY_SET,
+            groups: GroupInfo::EMPTY,
         }
     }
 
@@ -322,7 +359,7 @@ pub fn copy_creds(clone_flags: u64, parent_cred: &Arc<Cred>) -> Arc<Cred> {
         parent_cred.clone()
     } else {
         // Fork: deep copy credentials (child gets independent copy)
-        Arc::new(**parent_cred)
+        Arc::new((**parent_cred).clone())
     }
 }
 
@@ -551,6 +588,9 @@ pub const FD_CLOEXEC: u32 = 1;
 pub struct FdTable<F> {
     /// Mapping from fd number to file object
     files: BTreeMap<Fd, Arc<F>>,
+    /// Which descriptors are open, for the lowest-free search; agrees
+    /// with the keys of `files`
+    bits: fdbits::OpenFds,
     /// Per-fd flags (FD_CLOEXEC, etc.)
     fd_flags: BTreeMap<Fd, u32>,
     /// Detached files, released once the lock is dropped
@@ -567,9 +607,24 @@ impl<F> FdTable<F> {
     pub const fn new_const() -> Self {
         Self {
             files: BTreeMap::new(),
+            bits: fdbits::OpenFds::new(),
             fd_flags: BTreeMap::new(),
             dead: Vec::new(),
         }
+    }
+
+    /// Install `file` at `fd`, free in both `files` and `bits`; false
+    /// (file parked) if the bitmap cannot grow
+    fn install(&mut self, fd: Fd, file: Arc<F>, flags: u32) -> bool {
+        if !self.bits.set(fd as usize) {
+            self.defer(file);
+            return false;
+        }
+        self.files.insert(fd, file);
+        if flags != 0 {
+            self.fd_flags.insert(fd, flags);
+        }
+        true
     }
 
     /// Park `file` for release after the table lock is dropped
@@ -598,12 +653,17 @@ impl<F> FdTable<F> {
     /// This does NOT enforce RLIMIT_NOFILE as it's used for initial fd setup
     /// (stdin=0, stdout=1, stderr=2) where limits don't apply.
     pub fn alloc_at(&mut self, fd: Fd, file: Arc<F>) -> bool {
-        if self.files.contains_key(&fd) {
+        if fd < 0 || self.files.contains_key(&fd) {
             self.defer(file);
             return false;
         }
-        self.files.insert(fd, file);
-        true
+        self.install(fd, file, 0)
+    }
+
+    /// Make room for `fd` before installing it there (Linux
+    /// expand_files): Err(EMFILE) at or past fs.nr_open, Err(ENOMEM)
+    pub fn expand(&mut self, fd: Fd) -> Result<(), i32> {
+        self.bits.reserve(fd as usize)
     }
 
     /// Get a file by descriptor
@@ -617,6 +677,7 @@ impl<F> FdTable<F> {
         self.fd_flags.remove(&fd);
         match self.files.remove(&fd) {
             Some(f) => {
+                self.bits.clear(fd as usize);
                 self.defer(f);
                 true
             }
@@ -663,20 +724,20 @@ impl<F> FdTable<F> {
             self.defer(file);
             return Err(24); // EMFILE - too many open files
         }
-        if self.files.contains_key(&fd) {
+        if fd < 0 || self.files.contains_key(&fd) {
             self.defer(file);
             return Err(9); // EBADF - fd already in use
         }
-        self.files.insert(fd, file);
-        if flags != 0 {
-            self.fd_flags.insert(fd, flags);
+        if !self.install(fd, file, flags) {
+            return Err(12); // ENOMEM
         }
         Ok(())
     }
 
     /// Allocate a file descriptor at or above min_fd (for F_DUPFD).
     ///
-    /// Finds the lowest available fd >= min_fd and allocates the file there.
+    /// Finds the lowest available fd >= min_fd and allocates the file
+    /// there; the search reads the open-fd bitmap (`fdbits`), not each fd.
     /// The `nofile` parameter is the RLIMIT_NOFILE limit. If the found fd
     /// would be >= nofile, returns Err(EMFILE).
     ///
@@ -688,15 +749,14 @@ impl<F> FdTable<F> {
         flags: u32,
         nofile: u64,
     ) -> Result<Fd, i32> {
-        let mut fd = min_fd;
-        while self.files.contains_key(&fd) {
-            fd += 1;
-        }
-        // RLIMIT_NOFILE enforcement
-        if (fd as u64) >= nofile {
-            self.defer(file);
-            return Err(24); // EMFILE - too many open files
-        }
+        // RLIMIT_NOFILE enforced inside (EMFILE)
+        let fd = match self.bits.alloc(min_fd.max(0) as usize, nofile) {
+            Ok(fd) => fd as Fd,
+            Err(e) => {
+                self.defer(file);
+                return Err(e);
+            }
+        };
         self.files.insert(fd, file);
         if flags != 0 {
             self.fd_flags.insert(fd, flags);
@@ -732,6 +792,7 @@ impl<F> FdTable<F> {
     pub fn deep_clone(&self) -> Self {
         Self {
             files: self.files.clone(),
+            bits: self.bits.clone(),
             fd_flags: self.fd_flags.clone(),
             dead: Vec::new(),
         }
@@ -741,13 +802,16 @@ impl<F> FdTable<F> {
     /// descriptors without FD_CLOEXEC, with their flags
     pub fn exec_copy(&self) -> Self {
         let mut t = Self::new();
+        t.bits = self.bits.clone();
         for (&fd, file) in &self.files {
             let fl = self.get_fd_flags(fd);
-            if fl & FD_CLOEXEC == 0 {
-                t.files.insert(fd, file.clone());
-                if fl != 0 {
-                    t.fd_flags.insert(fd, fl);
-                }
+            if fl & FD_CLOEXEC != 0 {
+                t.bits.clear(fd as usize);
+                continue;
+            }
+            t.files.insert(fd, file.clone());
+            if fl != 0 {
+                t.fd_flags.insert(fd, fl);
             }
         }
         t
@@ -761,6 +825,9 @@ impl<F> FdTable<F> {
         if let Some(next) = hi.checked_add(1) {
             self.files.append(&mut mid.split_off(&next));
             self.fd_flags.append(&mut flags.split_off(&next));
+        }
+        for &fd in mid.keys() {
+            self.bits.clear(fd as usize);
         }
         self.dead.extend(mid.into_values());
     }
@@ -1258,7 +1325,7 @@ impl TaskCred {
     /// The caller is the task itself, or holds TASKLIST.
     unsafe fn get(&self) -> Cred {
         // SAFETY: the pointer is live (see above)
-        unsafe { *self.0.load(Ordering::Acquire) }
+        unsafe { (*self.0.load(Ordering::Acquire)).clone() }
     }
 
     /// # Safety
@@ -1266,7 +1333,7 @@ impl TaskCred {
     unsafe fn arc(&self) -> Arc<Cred> {
         let p = self.0.load(Ordering::Acquire);
         if Self::is_static(p) {
-            return Arc::new(INIT_CRED);
+            return Arc::new(INIT_CRED.clone());
         }
         // SAFETY: `p` came from Arc::into_raw and holds a count
         unsafe {

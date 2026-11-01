@@ -309,11 +309,22 @@ fn find_task_by_pid(pid: Pid) -> Option<Tid> {
 }
 
 /// May the caller access the target's memory (Linux process_vm_rw_core
-/// -> mm_access, PTRACE_MODE_ATTACH_REALCREDS): its own process, else
-/// the ptrace rules with the real ids
+/// -> mm_access, PTRACE_MODE_ATTACH_REALCREDS): its own address space
+/// (any thread of it, or a CLONE_VM sharer), else the ptrace rules with
+/// the real ids
 fn check_process_vm_permission(target_tid: Tid) -> bool {
-    target_tid == current_tid()
-        || crate::task::ptrace::may_access(|t| t.task.tid() == target_tid, false)
+    let me = current_tid();
+    if target_tid == me {
+        return true;
+    }
+    let same_mm = match (
+        crate::mm::get_task_mm(target_tid),
+        crate::mm::get_task_mm(me),
+    ) {
+        (Some(a), Some(b)) => alloc::sync::Arc::ptr_eq(&a, &b),
+        _ => false,
+    };
+    same_mm || crate::task::ptrace::may_access(|t| t.task.tid() == target_tid, false)
 }
 
 /// The target's address space if the caller may access it (Linux

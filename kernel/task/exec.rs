@@ -2,6 +2,7 @@
 //!
 //! Replaces the current process image with a new program.
 
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 #[cfg(target_arch = "x86_64")]
@@ -23,9 +24,10 @@ use crate::mm::{ELF_ET_DYN_BASE, MmLayout, STACK_TOP};
 /// Page size constant
 const PAGE_SIZE: u64 = 4096;
 
-/// Pages of user stack mapped at exec when RLIMIT_STACK is unlimited
-/// (1 MB; the stack does not grow on demand yet, see BUGS.md). It was
-/// 16 KB, which deep frames (signal delivery, large locals) overran.
+/// Pages of the main stack's initial VMA when RLIMIT_STACK is
+/// unlimited or small (1 MB); only the pages holding the arguments are
+/// mapped at exec, the rest fault in, and the VMA grows down on demand
+/// up to RLIMIT_STACK (mm::expand_downwards)
 const USER_STACK_PAGES: usize = 256;
 
 /// Maximum number of pages for user stack (8MB, matching default RLIMIT_STACK)
@@ -43,6 +45,9 @@ pub const EIO: i32 = 5; // I/O error
 pub const EFAULT: i32 = 14; // Bad address
 pub const E2BIG: i32 = 7; // Argument list too long
 pub const EAGAIN: i32 = 11; // Try again
+pub const EINVAL: i32 = 22; // Invalid argument
+pub const ELOOP: i32 = 40; // Too many levels of symbolic links
+pub const ELIBBAD: i32 = 80; // Accessing a corrupted shared library
 
 /// Maximum path length (matching Linux PATH_MAX)
 const PATH_MAX: usize = 4096;
@@ -94,6 +99,8 @@ pub struct ExecInfo<'a> {
     pub phnum: u64,
     /// Path the program was executed as (AT_EXECFN)
     pub execfn: &'a [u8],
+    /// Where the program interpreter was loaded (AT_BASE; 0 without one)
+    pub base: u64,
 }
 
 /// Writes the initial stack image through the new page table
@@ -128,7 +135,10 @@ impl StackWriter<'_> {
 }
 
 /// Auxiliary vector (Linux fs/binfmt_elf.c create_elf_tables)
-fn auxv(info: &ExecInfo, random: u64, execfn: u64, platform: u64) -> [(u64, u64); 19] {
+/// Entries of the auxiliary vector, AT_NULL included
+const AUXV_LEN: usize = 20;
+
+fn auxv(info: &ExecInfo, random: u64, execfn: u64, platform: u64) -> [(u64, u64); AUXV_LEN] {
     const AT_NULL: u64 = 0;
     const AT_PHDR: u64 = 3;
     const AT_PHENT: u64 = 4;
@@ -148,6 +158,7 @@ fn auxv(info: &ExecInfo, random: u64, execfn: u64, platform: u64) -> [(u64, u64)
     const AT_RANDOM: u64 = 25;
     const AT_HWCAP2: u64 = 26;
     const AT_EXECFN: u64 = 31;
+    const AT_MINSIGSTKSZ: u64 = 51;
     let c = crate::task::current_cred();
     let secure = secureexec(&c);
     [
@@ -157,7 +168,7 @@ fn auxv(info: &ExecInfo, random: u64, execfn: u64, platform: u64) -> [(u64, u64)
         (AT_PHDR, info.phdr),
         (AT_PHENT, info.phent),
         (AT_PHNUM, info.phnum),
-        (AT_BASE, 0),
+        (AT_BASE, info.base),
         (AT_FLAGS, 0),
         (AT_ENTRY, info.entry),
         (AT_UID, c.uid as u64),
@@ -166,8 +177,9 @@ fn auxv(info: &ExecInfo, random: u64, execfn: u64, platform: u64) -> [(u64, u64)
         (AT_EGID, c.egid as u64),
         (AT_SECURE, secure as u64),
         (AT_RANDOM, random),
-        (AT_HWCAP2, 0),
+        (AT_HWCAP2, crate::arch::elf_hwcap2()),
         (AT_EXECFN, execfn),
+        (AT_MINSIGSTKSZ, crate::arch::min_sigstksz()),
         (AT_PLATFORM, platform),
         (AT_NULL, 0),
     ]
@@ -194,10 +206,20 @@ fn setup_user_stack<FA: FrameAlloc<PhysAddr = u64>>(
     } else {
         ((stack_limit / PAGE_SIZE) as usize).clamp(USER_STACK_PAGES, MAX_STACK_PAGES)
     };
-    let stack_bottom = STACK_TOP - (stack_pages as u64 * PAGE_SIZE);
+    // Everything must fit in the stack, with room to run
+    let strings: usize = argv.iter().chain(envp).map(|s| s.len() + 1).sum();
+    let words = 1 + argv.len() + 1 + envp.len() + 1 + 2 * AUXV_LEN;
+    let need = strings + info.execfn.len() + 64 + 16 + words * 8 + 64;
+    if need > stack_pages * PAGE_SIZE as usize / 2 {
+        return Err(E2BIG);
+    }
 
-    for i in 0..stack_pages {
-        let va = stack_bottom + (i as u64 * PAGE_SIZE);
+    // Map only what the arguments use (Linux setup_arg_pages: the rest
+    // of the stack VMA faults in on first touch)
+    let mapped = need.div_ceil(PAGE_SIZE as usize) + 1;
+    let map_bottom = STACK_TOP - (mapped as u64 * PAGE_SIZE);
+    for i in 0..mapped {
+        let va = map_bottom + (i as u64 * PAGE_SIZE);
         let frame = user_frame()?;
         unsafe {
             ::core::ptr::write_bytes(crate::arch::phys_to_virt(frame), 0, PAGE_SIZE as usize);
@@ -210,14 +232,6 @@ fn setup_user_stack<FA: FrameAlloc<PhysAddr = u64>>(
             crate::FRAME_ALLOCATOR.free(frame);
             return Err(ENOMEM);
         }
-    }
-
-    // Everything must fit in the mapped stack, with room to run
-    let strings: usize = argv.iter().chain(envp).map(|s| s.len() + 1).sum();
-    let words = 1 + argv.len() + 1 + envp.len() + 1 + 2 * 19;
-    let need = strings + info.execfn.len() + 64 + 16 + words * 8 + 64;
-    if need > stack_pages * PAGE_SIZE as usize / 2 {
-        return Err(E2BIG);
     }
 
     let mut w = StackWriter {
@@ -278,7 +292,7 @@ fn setup_user_stack<FA: FrameAlloc<PhysAddr = u64>>(
         start_stack: sp,
         ..MmLayout::default()
     };
-    Ok((area, stack_bottom))
+    Ok((area, STACK_TOP - (stack_pages as u64 * PAGE_SIZE)))
 }
 
 /// Every PT_LOAD segment and the entry point must land in mappable
@@ -350,19 +364,29 @@ pub fn image_layout(elf: &ElfExecutable, base: u64) -> MmLayout {
 /// PT_LOAD segment (pages already populated) and the stack
 /// (growsdown), so mprotect/munmap/brk and /proc/<pid>/maps see them
 pub fn image_vmas(elf: &ElfExecutable, base: u64, stack_bottom: u64) -> Vec<crate::mm::Vma> {
-    use crate::mm::{
-        MAP_ANONYMOUS, MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE, VM_GROWSDOWN, Vma,
-        anon_vma::AnonVma,
-    };
-    let anon = |start: u64, end: u64, prot: u32| {
-        Vma::new_anon(
-            start,
-            end,
-            prot,
-            MAP_PRIVATE | MAP_ANONYMOUS,
-            AnonVma::new(),
-        )
-    };
+    use crate::mm::{PROT_READ, PROT_WRITE, VM_GROWSDOWN};
+    let mut vmas = segment_vmas(elf, base);
+    let mut stack = anon_vma(stack_bottom, STACK_TOP, PROT_READ | PROT_WRITE);
+    stack.flags |= VM_GROWSDOWN;
+    vmas.push(stack);
+    vmas
+}
+
+fn anon_vma(start: u64, end: u64, prot: u32) -> crate::mm::Vma {
+    use crate::mm::{MAP_ANONYMOUS, MAP_PRIVATE, Vma, anon_vma::AnonVma};
+    Vma::new_anon(
+        start,
+        end,
+        prot,
+        MAP_PRIVATE | MAP_ANONYMOUS,
+        AnonVma::new(),
+    )
+}
+
+/// One VMA per loaded segment of `elf` at `base`
+fn segment_vmas(elf: &ElfExecutable, base: u64) -> Vec<crate::mm::Vma> {
+    use crate::mm::{PROT_EXEC, PROT_READ, PROT_WRITE, Vma};
+    let anon = anon_vma;
     let mut vmas: Vec<Vma> = Vec::new();
     let mut prev_end = 0;
     for seg in elf.segments.iter().filter(|s| s.mem_size > 0) {
@@ -379,10 +403,52 @@ pub fn image_vmas(elf: &ElfExecutable, base: u64, stack_bottom: u64) -> Vec<crat
         vmas.push(anon(start, end, prot));
         prev_end = end;
     }
-    let mut stack = anon(stack_bottom, STACK_TOP, PROT_READ | PROT_WRITE);
-    stack.flags |= VM_GROWSDOWN;
-    vmas.push(stack);
     vmas
+}
+
+/// The page-aligned [lo, hi) of `elf`'s loaded segments (before any
+/// load bias); None for an image without one or a span past u64
+fn image_span(elf: &ElfExecutable) -> Option<(u64, u64)> {
+    let segs = elf.segments.iter().filter(|s| s.mem_size > 0);
+    let lo = segs.clone().map(|s| s.vaddr).min()? & !(PAGE_SIZE - 1);
+    let hi = segs
+        .map(|s| s.vaddr.checked_add(s.mem_size as u64))
+        .try_fold(0u64, |m, e| e.map(|e| m.max(e)))?
+        .checked_next_multiple_of(PAGE_SIZE)?;
+    Some((lo, hi))
+}
+
+/// Where a program interpreter goes (Linux load_elf_interp): the first
+/// free area below mmap_base big enough for all its segments, at their
+/// alignment, and below the program's own image if that is in the way;
+/// ENOMEM if there is no such room. An ET_EXEC interpreter goes at its
+/// link address, EINVAL if that overlaps the program or the stack area
+/// (Linux would map it over them).
+fn interp_base(interp: &ElfExecutable, prog: &ElfExecutable, prog_base: u64) -> Result<u64, i32> {
+    let (lo, hi) = image_span(interp).ok_or(ENOEXEC)?;
+    let (plo, phi) = image_span(prog).ok_or(ENOEXEC)?;
+    let (plo, phi) = (plo + prog_base, phi + prog_base);
+    let top = crate::mm::mmap_base();
+    let overlaps = |a: u64, b: u64| a < phi && plo < b;
+    if !interp.is_pie {
+        if overlaps(lo, hi) || hi > top {
+            return Err(EINVAL);
+        }
+        return Ok(0);
+    }
+    let span = hi - lo;
+    let align = interp.align.max(PAGE_SIZE);
+    // Where `lo` lands when the image ends at or below `limit`
+    let below = |limit: u64| limit.checked_sub(span).map(|s| s & !(align - 1));
+    let mut start = below(top).ok_or(ENOMEM)?;
+    if overlaps(start, start + span) {
+        start = below(plo).ok_or(ENOMEM)?;
+    }
+    // Keep clear of the lowest pages (mmap_min_addr)
+    if start < PAGE_SIZE * 16 {
+        return Err(ENOMEM);
+    }
+    start.checked_sub(lo).ok_or(ENOMEM)
 }
 
 /// Load ELF segments into a page table
@@ -513,6 +579,43 @@ fn apply_relocations(
 
 /// The executable being loaded, read in place (Linux bprm->file and
 /// elf_read): never copied whole into memory
+/// Follow `#!` lines from the opened file to the program that runs
+/// (Linux exec_binprm with binfmt_script): each script level puts its
+/// interpreter (and argument) in front of argv and opens it; more than
+/// MAX_DEPTH levels is ELOOP. A script named through a close-on-exec fd
+/// (execveat) cannot be reopened by its interpreter: ENOENT.
+fn resolve_scripts(
+    mut file: Arc<File>,
+    mut argv: Vec<Vec<u8>>,
+    path: &[u8],
+    path_inaccessible: bool,
+) -> Result<(Arc<File>, Vec<Vec<u8>>), i32> {
+    use crate::binfmt_script::{BINPRM_BUF_SIZE, MAX_DEPTH, parse, rewrite_argv};
+    let mut name = path.to_vec();
+    for depth in 0.. {
+        let head = {
+            let image = FileImage::new(&file)?;
+            let n = (image.size as usize).min(BINPRM_BUF_SIZE);
+            crate::elf::ElfSource::read_at(&image, 0, n).ok_or(EIO)?
+        };
+        let (interp, arg) = match parse(&head) {
+            None => break,
+            Some(r) => r?,
+        };
+        if depth >= MAX_DEPTH {
+            return Err(ELOOP);
+        }
+        if path_inaccessible {
+            return Err(ENOENT);
+        }
+        argv = rewrite_argv(&argv, interp, arg, &name);
+        name = interp.to_vec();
+        let p = core::str::from_utf8(interp).map_err(|_| ENOENT)?;
+        file = kernel_open_exec(p)?;
+    }
+    Ok((file, argv))
+}
+
 struct FileImage<'a> {
     file: &'a File,
     /// Size when exec opened it (segments past it read as zeros)
@@ -656,24 +759,46 @@ pub fn do_execve<FA: FrameAlloc<PhysAddr = u64>>(
     envp: Vec<Vec<u8>>,
     frame_alloc: &mut FA,
 ) -> i32 {
+    let open = |p: &[u8]| match core::str::from_utf8(p) {
+        Ok(s) => kernel_open_exec(s),
+        Err(_) => Err(ENOENT),
+    };
+    exec_file(path, open, false, argv, envp, frame_alloc)
+}
+
+/// do_execve with the file opened by `open` from the name (Linux
+/// bprm->filename: the path, or /dev/fd/N[/path] for execveat), once
+/// the credential guard is held
+fn exec_file<FA, F>(
+    path: Vec<u8>,
+    open: F,
+    path_inaccessible: bool,
+    argv: Vec<Vec<u8>>,
+    envp: Vec<Vec<u8>>,
+    frame_alloc: &mut FA,
+) -> i32
+where
+    FA: FrameAlloc<PhysAddr = u64>,
+    F: FnOnce(&[u8]) -> Result<Arc<File>, i32>,
+{
     // Linux prepare_bprm_creds: the thread group's cred_guard_mutex from
     // the first credential check until the new image is in place, so
     // ptrace attach and mm_access never see the new mm with the old
     // dumpability or the reverse; dropped on every error return
-    let guard = crate::signal::CredGuard::lock(percpu::current_tid());
+    let guard = match crate::signal::CredGuard::lock(percpu::current_tid()) {
+        Ok(g) => g,
+        Err(e) => return e.sysret() as i32,
+    };
     if let Err(e) = crate::task::nproc_exec_check() {
         return -e;
     }
     let pathname = &path[..];
-    // Convert pathname to string for VFS lookup
-    let path_str = match core::str::from_utf8(pathname) {
-        Ok(s) => s,
-        Err(_) => return -ENOENT,
-    };
-
-    // Open the executable file using the kernel-internal VFS function
-    let file = match kernel_open_exec(path_str) {
+    let file = match open(pathname) {
         Ok(f) => f,
+        Err(e) => return -e,
+    };
+    let (file, argv) = match resolve_scripts(file, argv, pathname, path_inaccessible) {
+        Ok(r) => r,
         Err(e) => return -e,
     };
     // To the least loaded CPU while the footprint is small (Linux
@@ -691,14 +816,27 @@ pub fn do_execve<FA: FrameAlloc<PhysAddr = u64>>(
         Ok(e) => e,
         Err(e) => return -e.errno(),
     };
-    // Dynamically linked: no program interpreter is loaded yet (BUGS.md);
-    // a missing one is ENOENT like Linux's open_exec of it
-    if let Some(interp) = &elf.interp {
-        let found = core::str::from_utf8(interp)
-            .ok()
-            .is_some_and(|p| kernel_open_exec(p).is_ok());
-        return if found { -ENOEXEC } else { -ENOENT };
-    }
+    // Dynamically linked: the program interpreter (Linux
+    // load_elf_binary): ENOENT if missing (open_exec), ELIBBAD if it is
+    // not an ELF file for this machine
+    let interp_file = match &elf.interp {
+        Some(i) => match core::str::from_utf8(i)
+            .map_err(|_| ENOENT)
+            .and_then(kernel_open_exec)
+        {
+            Ok(f) => Some(f),
+            Err(e) => return -e,
+        },
+        None => None,
+    };
+    let interp_image = match interp_file.as_deref().map(FileImage::new).transpose() {
+        Ok(i) => i,
+        Err(_) => return -ELIBBAD,
+    };
+    let interp = match interp_image.as_ref().map(ElfExecutable::parse).transpose() {
+        Ok(i) => i,
+        Err(_) => return -ELIBBAD,
+    };
 
     // Release all POSIX advisory locks (POSIX semantics: locks released on exec)
     crate::fs::posix_lock::release_all_posix_locks_for_pid(crate::task::percpu::current_pid());
@@ -713,7 +851,22 @@ pub fn do_execve<FA: FrameAlloc<PhysAddr = u64>>(
     if let Err(e) = check_segments(&elf, base_addr) {
         return -e;
     }
-    let entry_point = elf.entry + base_addr;
+    let interp_base = match interp.as_ref().map(|ie| interp_base(ie, &elf, base_addr)) {
+        Some(Ok(b)) => b,
+        Some(Err(e)) => return -e,
+        None => 0,
+    };
+    if let Some(ie) = &interp
+        && let Err(e) = check_segments(ie, interp_base)
+    {
+        return -e;
+    }
+    // With an interpreter the program starts there; it finds the
+    // program's own entry in AT_ENTRY
+    let entry_point = match &interp {
+        Some(ie) => ie.entry + interp_base,
+        None => elf.entry + base_addr,
+    };
 
     // Create new page table for the process
     let mut new_page_table = match ArchPageTable::new_user(frame_alloc) {
@@ -735,14 +888,23 @@ pub fn do_execve<FA: FrameAlloc<PhysAddr = u64>>(
             Err(e) => return -e,
         };
 
-    // Apply relocations for PIE
-    if elf.is_pie {
+    if let (Some(ie), Some(iimg)) = (&interp, &interp_image)
+        && let Err(e) = load_elf_segments(ie, iimg, &mut new_page_table, frame_alloc, interp_base)
+    {
+        return -e;
+    }
+
+    // A static PIE's relocations (hk's boot programs need them; glibc's
+    // relocate themselves, idempotently). Never with an interpreter: it
+    // relocates itself and the program (Linux applies none at all).
+    if elf.is_pie && interp.is_none() {
         apply_relocations(&elf, &image, base_addr, &new_page_table);
     }
 
     // Set up user stack with argv, envp and the auxiliary vector
     let info = ExecInfo {
-        entry: entry_point,
+        entry: elf.entry + base_addr,
+        base: interp_base,
         phdr: if elf.phdr != 0 {
             elf.phdr + base_addr
         } else {
@@ -799,11 +961,18 @@ pub fn do_execve<FA: FrameAlloc<PhysAddr = u64>>(
         for vma in image_vmas(&elf, base_addr, stack_bottom) {
             m.insert_vma(vma);
         }
+        if let Some(ie) = &interp {
+            for vma in segment_vmas(ie, interp_base) {
+                m.insert_vma(vma);
+            }
+        }
     }
 
     // exec_replace_image never returns: free everything owned here first
     // (the file image alone is megabytes of heap)
     drop(elf);
+    drop(interp);
+    drop(interp_file);
     drop(file);
     drop(argv);
     drop(envp);
@@ -866,14 +1035,17 @@ pub const AT_FDCWD: i32 = -100;
 /// AT_EMPTY_PATH - path is empty, use the fd directly
 pub const AT_EMPTY_PATH: i32 = 0x1000;
 
+/// AT_SYMLINK_NOFOLLOW - a final symlink is not followed (ELOOP)
+pub const AT_SYMLINK_NOFOLLOW: i32 = 0x100;
+
 /// sys_execveat - execute a program relative to a directory file descriptor
+/// (Linux do_execveat_common)
 ///
-/// # Arguments
-/// * `dirfd` - Directory file descriptor, or AT_FDCWD for current directory
-/// * `pathname` - Path to the executable (relative to dirfd, or absolute)
-/// * `argv` - Pointer to null-terminated array of argument strings
-/// * `envp` - Pointer to null-terminated array of environment strings
-/// * `flags` - AT_EMPTY_PATH to execute dirfd itself, 0 otherwise
+/// A relative `pathname` is resolved from `dirfd` (AT_FDCWD: the current
+/// directory); an empty one with AT_EMPTY_PATH executes dirfd's own file
+/// (fexecve); AT_SYMLINK_NOFOLLOW makes a final symlink ELOOP. Other
+/// flags are EINVAL. The program's name (AT_EXECFN, comm) is the path,
+/// or "/dev/fd/N" / "/dev/fd/N/path" when it came through dirfd.
 ///
 /// # Returns
 /// On success, does not return (new program is executing).
@@ -882,47 +1054,91 @@ pub fn sys_execveat(dirfd: i32, pathname: u64, argv_ptr: u64, envp_ptr: u64, fla
     use crate::FRAME_ALLOCATOR;
     use crate::frame_alloc::FrameAllocRef;
 
-    // For now, we only support AT_FDCWD with an absolute path
-    // Relative paths need: fd table lookup, directory resolution from fd
-    if dirfd != AT_FDCWD && flags & AT_EMPTY_PATH == 0 {
-        // We don't support relative paths to arbitrary fds yet
-        // Return ENOENT for now
-        return -(ENOENT as i64);
+    if flags & !(AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW) != 0 {
+        return -(EINVAL as i64);
     }
-
-    // Copy pathname from user space
     let path = match copy_string_from_user(pathname, PATH_MAX) {
         Ok(p) => p,
         Err(e) => return -(e as i64),
     };
-
-    // For AT_FDCWD, the path must be absolute or we treat it as relative to cwd
-    // Our VFS currently treats relative paths as if relative to /
-    // This is a simplification
-
-    // Copy argv from user space
     let argv = match copy_string_array_from_user(argv_ptr, 1024) {
         Ok(a) => a,
         Err(e) => return -(e as i64),
     };
-
-    // Copy envp from user space
     let envp = match copy_string_array_from_user(envp_ptr, 1024) {
         Ok(e) => e,
         Err(e) => return -(e as i64),
     };
-
-    // Check total size of arguments
     let total_bytes = total_string_bytes(&argv) + total_string_bytes(&envp);
     if total_bytes > MAX_ARG_PAGES * PAGE_SIZE as usize {
         return -(E2BIG as i64);
     }
-
-    // Get frame allocator
+    let name = exec_name(dirfd, &path);
+    // Linux BINPRM_FLAGS_PATH_INACCESSIBLE: the program came through a
+    // close-on-exec fd, so a script's interpreter could not open it
+    let via_fd = dirfd != AT_FDCWD && path.first() != Some(&b'/');
+    let inaccessible = via_fd
+        && crate::fs::syscall::current_fd_table()
+            .lock()
+            .get_fd_flags(dirfd)
+            & crate::pipe::FD_CLOEXEC
+            != 0;
+    let open = |_: &[u8]| exec_lookup(dirfd, &path, flags).and_then(crate::fs::open_exec);
     let mut frame_alloc = FrameAllocRef(&FRAME_ALLOCATOR);
+    exec_file(name, open, inaccessible, argv, envp, &mut frame_alloc) as i64
+}
 
-    // Do the exec - on success this never returns, on error returns negative errno
-    let result = do_execve(path, argv, envp, &mut frame_alloc);
-    // If we get here, exec failed - result is already negative
-    result as i64
+/// bprm->filename for execveat: the path itself when absolute or from
+/// the current directory, else "/dev/fd/N" with "/path" if not empty
+fn exec_name(dirfd: i32, path: &[u8]) -> Vec<u8> {
+    if dirfd == AT_FDCWD || path.first() == Some(&b'/') {
+        return path.to_vec();
+    }
+    let mut name = alloc::format!("/dev/fd/{dirfd}").into_bytes();
+    if !path.is_empty() {
+        name.push(b'/');
+        name.extend_from_slice(path);
+    }
+    name
+}
+
+/// The dentry execveat runs: `path` from dirfd (or the current
+/// directory, or the root if absolute), or with AT_EMPTY_PATH and an
+/// empty path dirfd's own file
+fn exec_lookup(dirfd: i32, path: &[u8], flags: i32) -> Result<Arc<crate::fs::Dentry>, i32> {
+    use crate::fs::path::{LookupFlags, lookup_path_at};
+    use crate::fs::path_ref::Path;
+    use crate::fs::syscall::current_fd_table;
+    let fd_file = || {
+        current_fd_table()
+            .lock()
+            .get(dirfd)
+            .ok_or(crate::error::KernelError::BadFd as i32)
+    };
+    if path.is_empty() {
+        if flags & AT_EMPTY_PATH == 0 {
+            return Err(ENOENT);
+        }
+        if dirfd == AT_FDCWD {
+            return percpu::current_cwd()
+                .map(|p| p.dentry.clone())
+                .ok_or(ENOENT);
+        }
+        return Ok(fd_file()?.dentry.clone());
+    }
+    let path = core::str::from_utf8(path).map_err(|_| ENOENT)?;
+    let start = if path.starts_with('/') {
+        None
+    } else if dirfd == AT_FDCWD {
+        percpu::current_cwd()
+    } else {
+        let file = fd_file()?;
+        if !file.is_dir() {
+            return Err(crate::error::KernelError::NotDirectory as i32);
+        }
+        Path::from_dentry(file.dentry.clone())
+    };
+    let mut lf = LookupFlags::open();
+    lf.follow = flags & AT_SYMLINK_NOFOLLOW == 0;
+    lookup_path_at(start, path, lf).map_err(|e| e as i32)
 }

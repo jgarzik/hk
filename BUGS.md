@@ -26,8 +26,7 @@ Neighbour entries are not confirmed by TCP progress (only ARP), there is
 no proxy ARP and no per-device neighbour sysctls (net/ipv4/neigh/*).
 IP: no ipfrag_max_dist, no IP options on output (received options are
 validated and skipped; source-routed packets are dropped), no
-IP_TRANSPARENT. Ping sockets check only the effective gid against
-ping_group_range (hk has no supplementary groups). /proc/net/raw and
+IP_TRANSPARENT. /proc/net/raw and
 /proc/net/icmp do not exist.
 UDP_CORK/MSG_MORE are not implemented (each send is one datagram) and
 SO_PEEK_OFF is EOPNOTSUPP.
@@ -44,11 +43,11 @@ Missing:
   off the LRU (never reclaimed whole; a split puts their 4KB pages on
   it). Pages exec copies the image into are not on the reverse map
   (never swapped). Swap files go through the inode's readpage /
-  writepage, a page at a time. Only page faults (and swapoff) reclaim:
-  heap, pipe-buffer and page-cache allocations never do (they run
-  under spinlocks or cannot sleep), so with anonymous memory filling
-  RAM they fail at the low watermark until kswapd (P6) keeps free
-  memory above it.
+  writepage, a page at a time. Page faults, swapoff, and heap and pipe
+  allocations that may sleep reclaim directly; page-cache allocations
+  (under the PAGE_CACHE spinlock) and atomic heap allocations never
+  do, so with anonymous memory filling RAM they fail at the low
+  watermark until kswapd (P6) keeps free memory above it.
 - SysV shm: IPC_RMID removes the id at once (Linux keeps it, as
   IPC_PRIVATE with SHM_DEST, until the last detach: IPC_STAT and shmat
   by id still work there).
@@ -85,13 +84,18 @@ capabilities (security.capability) raise the permitted set
 (bprm_fill_uid, cap_bprm_creds_from_file). hk exec keeps the caller's
 credentials unchanged, so set-id programs run unprivileged.
 
-## No dynamically linked executables
+## CPU-time clocks: no timers or sleeps
 
-**Location**: `kernel/task/exec.rs` (`do_execve`)
+**Location**: `kernel/time_syscall.rs`, `kernel/posix_timer.rs`
 
-A PT_INTERP program interpreter is never loaded: exec of a dynamic
-executable fails with ENOEXEC (ENOENT if the interpreter does not
-exist, as on Linux). Only static and static-pie programs run.
+CPU-time clocks (CLOCK_PROCESS/THREAD_CPUTIME_ID, per-pid ids) can be
+read but not waited on: clock_nanosleep on the process CPU clock is
+EOPNOTSUPP and timer_create on any CPU clock is EINVAL (Linux
+posix_cpu_nsleep / posix_cpu_timer_create run them from the tick).
+timer_create on CLOCK_TAI is EINVAL too. A process clock sums its live
+threads only: exited threads' time is lost (Linux keeps it in
+signal_struct), and other threads' running slices are not included
+until their next accounting point (Linux task_sched_runtime).
 
 ## Interval timers: ITIMER_VIRTUAL and ITIMER_PROF
 
@@ -138,16 +142,13 @@ Not implemented: MSG_OOB on streams (EOPNOTSUPP; Linux supports one
 out-of-band byte), SO_PEEK_OFF, SO_PASSPIDFD / SCM_PIDFD /
 SO_PEERPIDFD, SO_PEERGROUPS, SO_INQ / SCM_INQ, SO_RIGHTS_NOTRUNC,
 SIOCUNIXFILE, SO_PEERSEC (ENOPROTOOPT, as on Linux without an LSM).
-mknod(S_IFIFO) still creates a regular file.
 
 ## File permission (DAC) gaps
 
 **Location**: `kernel/fs/dac.rs`, `kernel/task/exec.rs`
 
-Missing: no supplementary groups (no setgroups/getgroups; group class
-checks use the fsgid only); fs.protected_hardlinks/symlinks/fifos/regular do not exist
-(behave as their kernel default 0); execve ignores S_ISUID/S_ISGID and file
-capabilities (so MS_NOSUID has nothing to suppress); no
+Missing: fs.protected_hardlinks/symlinks/fifos/regular do not exist
+(behave as their kernel default 0); no
 immutable/append-only inodes (no IS_APPEND/IS_IMMUTABLE EPERM);
 chmod/chown do not update ctime; ETXTBSY is not enforced.
 
@@ -176,15 +177,19 @@ has one mount per namespace). Unlike Linux (MNT_WRITE_HOLD), a
 EBUSY can see a spurious EROFS. Mount data/options strings are
 ignored; mounts are not user-namespace aware (plain capable()).
 
+mmap PROT_EXEC (`kernel/mm/syscall.rs:64`) and open's NODEV check
+(`kernel/fs/open.rs:187`) find MNT_NOEXEC/NODEV by looking the dentry
+up in the caller's namespace (`mount::mnt_flags_of`, by superblock
+dev_id), not from the file's own mount (`File.mnt`, also picked by
+dev_id at open): for a file from another namespace (an fd passed over
+SCM_RIGHTS) none is found and the flags read as 0. exec fails closed.
+Phase G (Path{mnt, dentry} from the walk) fixes the lookup.
+
 ## Thread-group exit gaps
 
 **Location**: `kernel/signal/mod.rs` (group exit), `kernel/task/exec.rs`
 de_thread
 
-- A sibling blocked uninterruptibly on its group's cred_guard (a second
-  exec, or ptrace attach) while another thread's exec waits in
-  de_thread never wakes: both wait (Linux takes cred_guard_mutex
-  interruptibly there).
 - Process-directed signals go to one thread's private queue (the
   leader, or a live thread once it has exited), not the shared queue
   with Linux's thread choice at delivery; a pidfd polls readable when
@@ -199,26 +204,8 @@ Signal-delivery and PTRACE_SYSCALL stops work. Missing: exec, fork,
 clone and exit event stops (PTRACE_O_TRACEEXEC and friends,
 PTRACE_EVENT_*), PTRACE_INTERRUPT/LISTEN, group-stop interaction (SIGSTOP
 to an untraced task is ignored: stop/continue are not implemented),
-waiting on a tracee by process group, and the tracee's exit being
+and the tracee's exit being
 reported to a tracer that is not its parent.
-
-## Global init is not protected from default-action signals
-
-**Location**: `kernel/signal/mod.rs` send_signal
-
-Linux drops signals with a default action of terminate/stop sent to
-global init (SIGNAL_UNKILLABLE), e.g. SIGPIPE from a write to a broken
-socket. hk delivers them, so pid 1 (the boot tester) dies. Socket tests
-use MSG_NOSIGNAL / SIG_IGN and check SIGPIPE in forked children.
-
-## The initial user stack does not grow
-
-**Location**: `kernel/task/exec.rs` setup_user_stack, `kernel/main.rs`
-(init)
-
-The main thread's stack is mapped eagerly at exec (RLIMIT_STACK, or
-1 MB when unlimited; init's is 1 MB) and is not a growable VMA: Linux maps it lazily and expands it on demand
-up to RLIMIT_STACK.
 
 ## NETLINK_ROUTE / SIOC* subset gaps (P3)
 
@@ -351,6 +338,23 @@ bytes of kmalloc (~1.3KB; suspected: procfs entries of dead pids, for
 the dcache work). The MM_LIFE tests count MemFree + Slab so they check user memory only; these leaks
 are listed here instead.
 
+## The memory cgroup's memory.max is not enforced
+
+**Location**: `kernel/cgroup/memory.rs`, `kernel/mm/fault.rs`, `kernel/mm/shmem.rs`
+
+memory.max, memory.current and memory.events exist, but nothing calls
+`try_charge_memory`/`uncharge_memory`: page faults (anonymous and
+shmem) and page tables are never charged, freed pages never uncharged,
+and memory.events oom/oom_kill stay 0. Linux charges each page to its
+memcg (folio memcg_data, mem_cgroup_charge), uncharges on free, and
+over the limit reclaims, then OOM-kills a task in the cgroup
+(mem_cgroup_out_of_memory).
+
+Once enforced, OOM_FAULT_KILL and OOM_SHARED_KILL can run in a small
+cgroup (say memory.max 64MB) at any RAM size, and on Linux too,
+instead of filling all of RAM and being skipped above 4GB
+(`user/boot_tester/tests/mm_oom.rs`).
+
 ## BPF map memory is not charged
 
 **Location**: `kernel/bpf/map.rs`
@@ -385,22 +389,11 @@ across net, fs, ipc) cannot be audited yet.
   an idle CPU; one flat domain (no SMT/LLC/NUMA topology), no active
   balancing; rt tasks move at wakeup placement and in the balancer's
   pulls only (no push from an overloaded CPU).
-- No RT throttling (sched_rt_runtime_us) or dl_server: a SCHED_FIFO
-  spinner starves its CPU's fair tasks; no SCHED_DEADLINE (EINVAL).
+- RT throttling has fixed values (950 ms of each 1 s): no
+  sched_rt_runtime_us / sched_rt_period_us sysctls; no dl_server, no
+  SCHED_DEADLINE (EINVAL).
 - Kernel preemption is off: a long kernel path delays a woken task of
   a higher class until its next scheduling point.
-
-## Unconfirmed: Arc<T> field corruption in the USB mass-storage driver
-
-**Location**: `kernel/usb/msc.rs`
-
-An early report (before this repository's history) saw `UsbMscDevice`
-fields (slot id, bulk endpoints) read back corrupted from an
-`Arc<UsbMscDevice>` kept in a static, and worked around it with static
-atomics. No such workaround exists in this tree: since the first commit
-`UsbMscDevice` keeps `slot_id`, `bulk_in_ep` and `bulk_out_ep` as plain
-fields, and the USB vfat boot tests (both arches) pass on them. Kept
-only as a pointer if wrong USB slot/endpoint values ever show up again.
 
 ## xHCI driver gaps on real hardware
 
@@ -428,6 +421,22 @@ all of them.
 - `UsbMscBusDriver::matches` accepts any device and assumes QEMU's
   endpoints (0x81/0x02); `main.rs` makes `sda` of the first one.
 - Only 4 KiB controller pages and up to 512 scratchpad buffers.
+
+## No DMA for 32-bit devices with RAM above 4GB
+
+**Location**: `kernel/dma.rs`, `kernel/frame_alloc.rs`,
+`kernel/net/driver/e1000.rs`, `kernel/usb/xhci.rs`
+
+`DirectDmaOps` only checks the mask: a buffer or coherent frame above
+the device's mask fails (`None`) instead of being bounced (Linux
+swiotlb) or allocated low (Linux ZONE_DMA32 / GFP_DMA32). PCI devices
+default to a 32-bit mask, so with RAM above 4GB:
+- e1000 never widens its mask (Linux does only for PCI-X; QEMU's e1000
+  is PCI): its ring and buffer allocations fail once frames above 4GB
+  are handed out (`NIC=e1000` with `QEMU_MEM` > ~3.5G).
+- An xHCI without HCCPARAMS1.AC64 gets the 32-bit mask, but its DCBAA,
+  scratchpads, command and event rings come straight from the frame
+  allocator with no mask check.
 
 ## x86 has no IOAPIC or MSI
 
@@ -507,45 +516,13 @@ expected to fix it; "next batch" means the next fix batch.
    d_exchange (dentry name under `d_lock`); vfat must then update the
    moved inode's `parent_cluster`/`short_name` (fs rename needs the
    source inode).
-2. **process_vm on own process fails from a sibling thread** (next
-   batch). `kernel/task/process_vm.rs:310` exempts only
-   `target_tid == current_tid()`; Linux mm_access exempts the caller's
-   own mm and `__ptrace_may_access` the thread group. Scenario: a
-   non-dumpable uid-1000 process; its second thread gets EPERM from
-   `process_vm_readv(getpid())`.
-3. **linkat AT_EMPTY_PATH capability check only for empty paths**
-   (next batch). `kernel/fs/link.rs:221`: Linux 6.8 do_linkat returns
-   ENOENT for AT_EMPTY_PATH without CAP_DAC_READ_SEARCH whatever the
-   path. Scenario: unprivileged `linkat(AT_FDCWD, "f", AT_FDCWD, "g",
-   AT_EMPTY_PATH)` succeeds on hk, ENOENT on Linux.
-4. **comm bytes >= 0x80 re-encoded as UTF-8** (next batch).
-   `kernel/fs/proc_array.rs:145` pushes `b as char`; Linux
-   proc_task_name emits raw bytes (status escapes only `\n` and `\\`).
-   Scenario: `PR_SET_NAME "\xe9"`; stat/status show `\xc3\xa9`.
-5. **init has no argv/envp/auxv** (next batch). `kernel/main.rs:994`:
-   init's stack is zeroed (argc 0, no auxv) and its mm has no
-   arg/env/start_stack layout, so /proc/1/cmdline and environ are
-   empty. Linux run_init_process: argv { "/bin/init" }, envp
-   { "HOME=/", "TERM=linux" }. Fix: build it with exec's stack builder.
-6. **ptrace "init only with CAP_SYS_PTRACE" guard is wrong** (next
-   batch). `kernel/task/ptrace.rs:179` refuses init (tid 1) without
-   CAP_SYS_PTRACE; Linux has no such rule. ptrace_attach should instead
-   refuse kernel threads and the caller's own thread group (EPERM); hk
-   refuses only the calling thread.
 7. **/proc/<pid>/* owner not refreshed on stat** (fix in V2).
    `kernel/fs/procfs.rs:370`: the owner (task_dump_owner) is updated
    at lookup and in permission() only; Linux pid_revalidate updates it
    on every walk. Scenario: stat environ of a uid-1000 child, child
    sets `PR_SET_DUMPABLE 0`, stat again: hk still says uid 1000
    (Linux 0).
-8. **Mounts in link.rs** (from the security review).
-   (a) (next batch) rename, rmdir and unlink never check for a
-   mountpoint (`kernel/fs/link.rs:525` rename_locked,
-   `kernel/fs/path.rs:248`); Linux returns EBUSY for a mounted-on
-   source or target. Scenario: mount ramfs on /tmp/m; `rmdir`,
-   `rename` of /tmp/m, or renaming another dir onto it, orphans the
-   mount. (Code reading; not yet test-verified.)
-   (b) (fix in V1) EXDEV compares superblocks, not mounts
+8. **EXDEV compares superblocks, not mounts** (fix in V1)
    (`kernel/fs/link.rs:298`, `:484`): a link or rename across two
    mounts of one superblock (bind mounts) is EXDEV on Linux. Needs
    Path{mnt,dentry}; TODO in place for linkat.
@@ -600,8 +577,6 @@ From the P3 /code-review (unverified). Tag = when to fix.
 1. **Remote write gives up after 16 COW tries** (next batch).
    `kernel/mm/remote.rs:176`: spurious EFAULT; break COW and write
    under one PTE-lock hold, or loop until fatal_signal_pending.
-2. **populate_pages not killable** (next batch).
-   `kernel/mm/syscall.rs:570`: mlock/MAP_POPULATE ignore SIGKILL.
 3. **Minor** (next batch): `kernel/uaccess.rs:235` fault_in_writeable
    unused and duplicates populate_pages; `kernel/fs/io.rs:68`
    copy_in always uses the atomic+fault-in copy (only i_rwsem writers
@@ -610,30 +585,14 @@ From the P3 /code-review (unverified). Tag = when to fix.
 
 ## Fix batch 1 review findings (open)
 From the fix-batch-1 /code-review (unverified). Tag = when to fix.
-1. **Fatal signal to an exiting thread or a zombie leader starts a
-   group exit** (next batch). `kernel/signal/mod.rs:1076` group_kill:
-   a signal to a PF_EXITING thread not yet released (or a traced
-   zombie) kills the live process (Linux wants_signal skips
-   PF_EXITING); a kill -9 of a zombie leader whose threads all called
-   exit() overwrites its exit status.
-2. **init is killable by SIG_DFL signals** (next batch).
-   `kernel/signal/mod.rs:952`: no SIGNAL_UNKILLABLE check on the
-   fatal-on-arrival path; kill(1, SIGTERM) by root ends the system.
-3. **memblock MAX_REGIONS = 128 drops RAM silently** (next batch).
-   `kernel/mm/memblock.rs:66`.
-5. **group_alive duplicates group_others** (next batch).
-   `kernel/task/percpu.rs:1570` vs `:1459`.
+3. **memblock holds at most 128 ranges** (J). `kernel/mm/memblock.rs:18`:
+   a firmware map with more RAM or reserved ranges panics at boot
+   (asserts in add/remove/reserve); Linux grows the array
+   (memblock_double_array).
 
 ## P4 review findings (open)
 From the P4 /code-review (unverified unless noted). Tag = when to fix.
 
-1. **swapoff makes PROT_NONE swap pages readable** (next batch;
-   confirmed by reading). `kernel/mm/fault.rs:478` map_swap_page (via
-   unuse_pte) → mk_pte(page, area.prot) with prot 0 is PRESENT|USER
-   on x86. Use a protnone PTE (Linux vm_page_prot).
-3. **Swap file size not capped by i_size** (next batch).
-   `kernel/mm/swap.rs:455`: header last_page sizes a heap Vec (8GB →
-   panic) and slots past EOF (only block devices are capped).
 4. **LRU batch refs defeat exclusivity checks** (next batch).
    `kernel/mm/fault.rs:477` / `:545`: refcount==1 tests fail while a
    page sits in the per-CPU add batch → needless COW copies after
@@ -641,8 +600,6 @@ From the P4 /code-review (unverified unless noted). Tag = when to fix.
 5. **alloc_slot linear scan under SwapInfo.map; two Vecs + sort per
    reclaimed page** (P6). `kernel/mm/swap.rs:184`: cluster/free-hint
    allocator, cached sorted device list.
-6. **read_swap_page busy-yields on SWAP_HAS_CACHE** (P6).
-   `kernel/mm/swap_state.rs:186`: sleep instead.
 7. **One AnonVma per fork family, Vec chain** (J).
    `kernel/mm/anon_vma.rs:85`: O(N×VMAs) under one family write lock.
 
@@ -653,10 +610,6 @@ Found during T0 (2026-10-19). Tag = when to fix.
    getpid/gettid/kill/wait//proc use the root number; a CLONE_NEWPID
    child is not pid 1 in its namespace. Use `Pid::nr_in(caller's ns)`
    at the syscall boundary.
-3. **mremap Prep allocates page tables under the old PTE lock** (next
-   batch). `kernel/mm/mremap.rs:53`: it uses CAS-only
-   `paging::pte_alloc` there, skipping page_table_lock; allocate before
-   taking the PTE lock (Linux move_page_tables).
 4. **`virt_to_phys(p & !0xfff)` duplicated** (next batch) in
    `Move::ptes`, `PteRange::at` and `ptl::pte_lock`: add one
    `ptl::table_of_ptep()`.
@@ -673,20 +626,11 @@ Found during T0 (2026-10-19). Tag = when to fix.
    `MM_LIFE_EXEC_CHAIN:FAIL -2`: both warmup chains passed, then the
    first measured one's child (busybox `env` x40 then `true`, i.e. 41
    execs in one process) exited nonzero. A failed exec, not a leak.
-9. **aarch64 does not dispatch dup, getcwd, execveat, gettimeofday,
-   settimeofday** (next batch): all are in the generic arm64 table
-   (23, 17, 281, 169, 170) but have no arm in
-   `kernel/arch/aarch64/syscall.rs`, so they return ENOSYS. Add them
-   with boot tests.
 10. **Network test flake** (I):
    `SOCKCORE_CONNECT_REFUSED:FAIL SO_ERROR got 0` (hk arm64, 1 of 10
    `check-stress` boots: poll reported POLLOUT for a nonblocking
    connect to a just-closed loopback port, but no ECONNREFUSED was
    pending).
-12. **arm64 overflow check misses a frame over 32 KB** (next batch):
-   vectors.S KERNEL_ENTRY tests bit 15 of SP only, so an SP that jumped
-   more than 32 KB below a stack base (one huge frame) lands where the
-   bit is clear and is not caught (the guard gap still faults).
 13. **MM_LIFE_FORK_EXEC over its 128 kB tolerance at 8 CPUs** (next
    batch): 1 of 20 `QEMU_SMP=8 make check-stress` boots (arm64, TCG)
    lost 184 kB of MemFree+Slab over 500 fork+exec rounds, never at 4
@@ -694,3 +638,9 @@ Found during T0 (2026-10-19). Tag = when to fix.
    (never freed; more concurrent stacks reach higher slots) and frees
    deferred until other CPUs switch. Find which, then fix it or scale
    the tolerance with the CPU count.
+
+14. **SWAPOUT_PAGEOUT flaky on the Linux reference** (J): one x86
+   `check-linux` run had free swap 364 kB off the expected value after
+   MADV_PAGEOUT of 16 MiB (beyond the test's tolerance), passing on the
+   rerun. Linux's swap accounting after pageout is not exact (swap
+   cache); the tolerance may need to grow on Linux.

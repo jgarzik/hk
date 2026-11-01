@@ -151,6 +151,8 @@ fn auxv_check(sp: *const u64) -> ! {
     const AT_SECURE: u64 = 23;
     const AT_RANDOM: u64 = 25;
     const AT_EXECFN: u64 = 31;
+    const AT_HWCAP2: u64 = 26;
+    const AT_MINSIGSTKSZ: u64 = 51;
     const PT_LOAD: u32 = 1;
     #[cfg(target_arch = "x86_64")]
     const PLATFORM: &[u8] = b"x86_64";
@@ -209,6 +211,40 @@ fn auxv_check(sp: *const u64) -> ! {
     if aux(auxv, AT_HWCAP).is_none() {
         sys_exit(19);
     }
+    // Both arches report AT_HWCAP2 (possibly 0) and the minimum signal
+    // stack: frame plus FPU state (varies with the XSAVE features the
+    // kernel enables: about 1.7KB with AVX), at most 64KB
+    if aux(auxv, AT_HWCAP2).is_none() {
+        sys_exit(20);
+    }
+    if !(1024..=65536).contains(&get(AT_MINSIGSTKSZ)) {
+        sys_exit(21);
+    }
+    sys_exit(0);
+}
+
+/// stack mode: exec maps only the stack pages holding the arguments
+/// (Linux setup_arg_pages): a page 64KB below the initial stack pointer
+/// (inside Linux's 128KB stack_expand) is not resident until touched;
+/// touching 2MB below it grows the stack
+fn stack_check(sp: *const u64) -> ! {
+    let probe = (sp as u64 & !4095) - 64 * 1024;
+    let mut vec = [0u8; 1];
+    if hk_syscall::sys_mincore(probe, 4096, vec.as_mut_ptr()) != 0 {
+        sys_exit(1);
+    }
+    if vec[0] & 1 != 0 {
+        sys_exit(2);
+    }
+    let mut a = sp as u64 & !4095;
+    let low = a - 2 * 1024 * 1024;
+    while a > low {
+        a -= 4096;
+        unsafe { core::ptr::write_volatile(a as *mut u8, 1) };
+    }
+    if hk_syscall::sys_mincore(probe, 4096, vec.as_mut_ptr()) != 0 || vec[0] & 1 == 0 {
+        sys_exit(3);
+    }
     sys_exit(0);
 }
 
@@ -244,6 +280,7 @@ extern "C" fn rust_start(sp: *const u64) -> ! {
     match arg1(sp) {
         b"fdcheck" => fdcheck(),
         b"auxv" => auxv_check(sp),
+        b"stack" => stack_check(sp),
         b"exe" => exe_check(),
         b"comm" => comm_check(),
         b"dumpable" => sys_exit(sys_prctl(PR_GET_DUMPABLE, 0, 0, 0, 0) as u64),

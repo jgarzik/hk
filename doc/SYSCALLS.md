@@ -5,8 +5,8 @@
 - [x] vfork (x86-64 only, legacy; use clone with CLONE_VFORK)
 - [x] clone (Linux thread/process creation)
 - [x] clone3
-- [x] execve
-- [x] execveat (x86-64 only for now; not dispatched on aarch64: ENOSYS)
+- [x] execve (ELF, #! scripts up to 5 levels)
+- [x] execveat (dirfd, AT_EMPTY_PATH for fexecve, AT_SYMLINK_NOFOLLOW)
 - [x] _exit
 - [x] set_tid_address
 - [x] exit_group
@@ -57,7 +57,7 @@
 - [x] close
 - [x] close_range (CLOSE_RANGE_UNSHARE, CLOSE_RANGE_CLOEXEC)
 - [ ] creat (x86-64 only, legacy; use openat with O_CREAT)
-- [x] dup (x86-64 only for now; not dispatched on aarch64: ENOSYS)
+- [x] dup
 - [x] dup2 (x86-64 only, legacy; use dup3)
 - [x] dup3
 - [x] fcntl (F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_SETFD, F_GETFL, F_SETFL, F_GETLK, F_SETLK, F_SETLKW, F_GETOWN, F_SETOWN, F_GETSIG, F_SETSIG)
@@ -113,11 +113,10 @@
 - [x] readlink (x86-64 only, legacy; use readlinkat)
 - [x] readlinkat
 - [x] mknod (x86-64 only, legacy; use mknodat)
-- [x] mknodat (S_IFSOCK makes a socket inode; FIFOs are created as
-  regular files for now)
+- [x] mknodat (S_IFSOCK makes a socket inode, S_IFIFO a named pipe)
 - [x] chdir
 - [x] fchdir
-- [x] getcwd (x86-64 only for now; not dispatched on aarch64: ENOSYS)
+- [x] getcwd
 - [x] chroot
 
 3.2 Stat & attributes
@@ -223,20 +222,20 @@ Linux has an "old" and a "rt_*" (real-time) signal set; modern userspace uses th
 6.1 Basic time
 
 - [x] time (x86-64 only, legacy; use clock_gettime)
-- [x] gettimeofday (x86-64 only for now; not dispatched on aarch64: ENOSYS)
-- [x] settimeofday (x86-64 only for now; not dispatched on aarch64: ENOSYS)
+- [x] gettimeofday
+- [x] settimeofday
 - [x] adjtimex (NTP)
-- [x] clock_gettime
+- [x] clock_gettime (realtime, monotonic, raw, coarse, boottime, TAI, alarms, process/thread and per-pid CPU clocks)
 - [x] clock_settime
-- [x] clock_getres
-- [x] clock_nanosleep
+- [x] clock_getres (1ns, a tick for coarse and PROF/VIRT CPU clocks)
+- [x] clock_nanosleep (realtime, monotonic, boottime, TAI, alarms; raw/coarse EOPNOTSUPP; CPU clocks not yet)
 - [x] nanosleep
 
 6.2 POSIX timers
 
 - [x] setitimer (ITIMER_REAL; ITIMER_VIRTUAL/PROF → EINVAL, BUGS.md)
 - [x] getitimer (ITIMER_REAL)
-- [x] timer_create
+- [x] timer_create (realtime, monotonic, boottime, alarms; TAI and CPU clocks not yet)
 - [x] timer_settime
 - [x] timer_gettime
 - [x] timer_getoverrun
@@ -244,7 +243,7 @@ Linux has an "old" and a "rt_*" (real-time) signal set; modern userspace uses th
 
 6.3 Timer FDs
 
-- [x] timerfd_create
+- [x] timerfd_create (realtime, monotonic, boottime, alarms)
 - [x] timerfd_settime
 - [x] timerfd_gettime
 
@@ -473,6 +472,8 @@ goes down later.
 - [x] setregid
 - [x] setresuid
 - [x] setresgid
+- [x] getgroups
+- [x] setgroups (CAP_SETGID; sorted, shared per credential set)
 - [x] setfsuid
 - [x] setfsgid
 
@@ -521,10 +522,10 @@ There are very few direct "cgroup_*" syscalls; the cgroup v1/v2 APIs are primari
 
 - [x] uname
 - [x] sysinfo
-- [x] getrandom
+- [x] getrandom (ChaCha20 CRNG, up to MAX_RW_COUNT per call)
 - [x] reboot
 - [x] kexec_load (stub, returns -ENOSYS; requires CAP_SYS_BOOT)
-- [x] syslog
+- [x] syslog (READ, READ_ALL, READ_CLEAR, CLEAR, SIZE_UNREAD, SIZE_BUFFER over the record log; console actions no-ops; CAP_SYSLOG for all, as with dmesg_restrict=1)
 - [x] acct
 - [x] swapon
 - [x] swapoff

@@ -39,6 +39,7 @@ pub fn run_tests() {
     test_ro_ops();
     test_remount_busy();
     test_noexec_mmap();
+    test_mountpoint_busy();
 }
 
 /// Every modifying syscall on a read-only mount is EROFS
@@ -127,6 +128,44 @@ fn test_remount_busy() {
     sys_unlink(b"/tmp/mnt_busy/f\0".as_ptr());
     sys_umount2(mp.as_ptr(), 0);
     sys_rmdir(mp.as_ptr());
+    done(n, f);
+}
+
+/// A directory something is mounted on cannot be removed, renamed or
+/// renamed over (Linux vfs_rmdir / vfs_rename is_local_mountpoint:
+/// EBUSY); after the umount it can
+fn test_mountpoint_busy() {
+    let n = b"MOUNT_MOUNTPOINT_BUSY";
+    let mp = b"/tmp/mnt_mp\0";
+    let other = b"/tmp/mnt_mp_other\0";
+    sys_mkdir(mp.as_ptr(), 0o755);
+    sys_mkdir(other.as_ptr(), 0o755);
+    let mut f = chk(n, b"mount", ramfs(mp, 0), 0);
+    f += chk(n, b"rmdir", sys_rmdir(mp.as_ptr()), EBUSY);
+    f += chk(
+        n,
+        b"rename away",
+        sys_rename(mp.as_ptr(), b"/tmp/mnt_mp2\0".as_ptr()),
+        EBUSY,
+    );
+    f += chk(n, b"rename over", sys_rename(other.as_ptr(), mp.as_ptr()), EBUSY);
+    f += chk(n, b"umount", sys_umount2(mp.as_ptr(), 0), 0);
+    f += chk(n, b"rename over after", sys_rename(other.as_ptr(), mp.as_ptr()), 0);
+    f += chk(n, b"rmdir after", sys_rmdir(mp.as_ptr()), 0);
+    sys_rmdir(other.as_ptr());
+    sys_rmdir(b"/tmp/mnt_mp2\0".as_ptr());
+    // Still busy after a rename of its parent directory
+    let pa = b"/tmp/mnt_pa\0";
+    let pb = b"/tmp/mnt_pb\0";
+    let m = b"/tmp/mnt_pb/m\0";
+    sys_mkdir(pa.as_ptr(), 0o755);
+    sys_mkdir(b"/tmp/mnt_pa/m\0".as_ptr(), 0o755);
+    f += chk(n, b"mount in parent", ramfs(b"/tmp/mnt_pa/m\0", 0), 0);
+    f += chk(n, b"rename parent", sys_rename(pa.as_ptr(), pb.as_ptr()), 0);
+    f += chk(n, b"rmdir after parent rename", sys_rmdir(m.as_ptr()), EBUSY);
+    sys_umount2(m.as_ptr(), 0);
+    sys_rmdir(m.as_ptr());
+    sys_rmdir(pb.as_ptr());
     done(n, f);
 }
 

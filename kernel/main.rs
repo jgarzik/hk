@@ -65,6 +65,7 @@ pub mod virtio;
 // Multiboot2 header is in boot.S
 
 mod arch;
+mod binfmt_script;
 pub mod bpf;
 pub mod cgroup;
 mod cmdline;
@@ -74,6 +75,7 @@ pub mod fs;
 mod heap;
 pub mod ipc;
 pub mod keys;
+mod kmsg;
 pub mod membarrier;
 pub mod mm;
 #[cfg(target_arch = "x86_64")]
@@ -100,17 +102,17 @@ type CurrentArch = crate::arch::aarch64::Aarch64Arch;
 
 // Import architecture traits for trait method calls
 use crate::arch::ArchBusOps;
+use crate::arch::SchedArch;
 use crate::arch::{
     AcpiOps, CpuOps, EarlyArchInit, ExceptionOps, HaltOps, InitramfsOps, IoremapOps, LocalTimerOps,
-    MemoryLayoutOps, PowerOps, SmpOps, TimekeeperOps, VfsInitOps, phys_to_virt,
+    MemoryLayoutOps, PowerOps, SmpOps, TimekeeperOps, VfsInitOps,
 };
-use crate::arch::{SchedArch, UserModeOps};
 
 // Page table type alias (used by ELF loading)
 type ArchPageTable = <CurrentArch as SchedArch>::SchedPageTable;
 
 use crate::dma::{DirectDmaOps, dma_init};
-use crate::mm::page_cache::{FileId, NULL_AOPS, PAGE_SIZE as PC_PAGE_SIZE, PageCache};
+use crate::mm::page_cache::PageCache;
 
 #[allow(unused_imports)]
 use fs::inode::AsAny; // Trait needed for .as_any() on dyn InodeData
@@ -215,7 +217,9 @@ pub extern "C" fn _start_rust(dtb_ptr: u64) -> ! {
     // the boot tables linear-map the first RAM gigabyte
     {
         const DTB_MAGIC_BE: u32 = 0xd00dfeed;
-        let magic = |pa: u64| unsafe { ::core::ptr::read_volatile(phys_to_virt(pa) as *const u32) };
+        let magic = |pa: u64| unsafe {
+            ::core::ptr::read_volatile(crate::arch::phys_to_virt(pa) as *const u32)
+        };
         let found = [0x4000_0000, 0x4008_0000, 0x4400_0000, 0x4800_0000]
             .into_iter()
             .chain((0x4200_0000u64..0x6000_0000).step_by(0x1000))
@@ -244,257 +248,7 @@ pub extern "C" fn _start_rust(dtb_ptr: u64) -> ! {
     kmain()
 }
 
-// ELF loading constants - shared by both architectures
-const PAGE_SIZE: u64 = 4096;
-const USER_STACK_PAGES: usize = 256;
-
-use crate::mm::{ELF_ET_DYN_BASE, STACK_TOP as USER_STACK_TOP};
-
-fn load_elf_with_cache<PT, FA>(
-    elf: &crate::elf::ElfExecutable,
-    file_id: FileId,
-    elf_data: &[u8],
-    page_table: &mut PT,
-    frame_alloc: &mut FA,
-    base_addr: u64,
-) -> Result<(), &'static str>
-where
-    PT: crate::arch::PageTable<VirtAddr = u64, PhysAddr = u64>,
-    FA: crate::arch::FrameAlloc<PhysAddr = u64>,
-{
-    use crate::arch::PageFlags;
-
-    // Track which virtual pages we've already mapped
-    let mut mapped_pages: [(u64, u64); 32] = [(0, 0); 32];
-    let mut mapped_count = 0;
-
-    for segment in &elf.segments {
-        if segment.mem_size == 0 {
-            continue;
-        }
-
-        // Add base address for PIE binaries
-        let seg_start = segment.vaddr + base_addr;
-        let seg_end = segment.vaddr + base_addr + segment.mem_size as u64;
-        let page_start = seg_start & !(PAGE_SIZE - 1);
-        let page_end = (seg_end + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-
-        // Convert ELF flags to PageFlags
-        let mut flags = PageFlags::READ | PageFlags::USER;
-        if segment.flags.write {
-            flags |= PageFlags::WRITE;
-        }
-        if segment.flags.execute {
-            flags |= PageFlags::EXECUTE;
-        }
-
-        let mut va = page_start;
-        while va < page_end {
-            // Check if already mapped
-            let existing = mapped_pages[..mapped_count]
-                .iter()
-                .find(|(v, _)| *v == va)
-                .map(|(_, f)| *f);
-
-            let frame = if let Some(f) = existing {
-                f
-            } else {
-                // Calculate the file offset for this page
-                let page_va_offset = va.saturating_sub(seg_start);
-                let file_page_offset = (segment.offset + page_va_offset) / PC_PAGE_SIZE as u64;
-
-                let f = if segment.flags.write {
-                    // Writable segment: must have private copy
-                    let private_frame = frame_alloc
-                        .alloc_frame()
-                        .ok_or("Out of memory for writable segment")?;
-
-                    // Zero the frame first
-                    unsafe {
-                        ::core::ptr::write_bytes(
-                            phys_to_virt(private_frame),
-                            0,
-                            PAGE_SIZE as usize,
-                        );
-                    }
-
-                    // Try to get data from cache or directly from file
-                    let cache = PAGE_CACHE.lock();
-                    if let Some(cached_page) = cache.find_get_page(file_id, file_page_offset) {
-                        // Copy from cached page
-                        unsafe {
-                            ::core::ptr::copy_nonoverlapping(
-                                phys_to_virt(cached_page.frame) as *const u8,
-                                phys_to_virt(private_frame),
-                                PC_PAGE_SIZE,
-                            );
-                        }
-                        cache.put_page(&cached_page);
-                    } else {
-                        // Cache miss for writable - copy directly from file
-                        let file_offset = file_page_offset * PC_PAGE_SIZE as u64;
-                        if (file_offset as usize) < elf_data.len() {
-                            let copy_len = ::core::cmp::min(
-                                PC_PAGE_SIZE,
-                                elf_data.len() - file_offset as usize,
-                            );
-                            unsafe {
-                                ::core::ptr::copy_nonoverlapping(
-                                    elf_data.as_ptr().add(file_offset as usize),
-                                    phys_to_virt(private_frame),
-                                    copy_len,
-                                );
-                            }
-                        }
-                    }
-
-                    // The page came whole from the file: clear what lies
-                    // past the segment's file data (.bss), which would
-                    // otherwise hold the following file bytes
-                    let file_end = seg_start + segment.file_size as u64;
-                    zero_bss(private_frame, va, file_end, seg_end);
-
-                    private_frame
-                } else {
-                    // Read-only segment: can share cached pages
-                    let mut cache = PAGE_CACHE.lock();
-
-                    // Try cache lookup first
-                    let cached = if let Some(page) = cache.find_get_page(file_id, file_page_offset)
-                    {
-                        page
-                    } else {
-                        // Cache miss: add to cache
-                        cache
-                            .add_page(
-                                file_id,
-                                file_page_offset,
-                                elf_data,
-                                elf_data.len() as u64,
-                                frame_alloc,
-                                true,  // can_writeback: ELF pages are read-only, evictable
-                                false, // not unevictable (ELF pages can be re-read)
-                                &NULL_AOPS,
-                            )
-                            .map_err(|_| "Failed to add page to cache")?
-                    };
-
-                    cached.frame
-                };
-
-                // Map the page
-                page_table
-                    .map_with_alloc(va, f, flags, frame_alloc)
-                    .map_err(|_| "Failed to map ELF page")?;
-
-                // Track mapping
-                if mapped_count < mapped_pages.len() {
-                    mapped_pages[mapped_count] = (va, f);
-                    mapped_count += 1;
-                }
-
-                f
-            };
-
-            // For pages that span segment boundaries or have BSS, we may need
-            // additional handling. The cache pre-zeros frames, so BSS is covered.
-            // The page's code reaches the instruction caches
-            crate::arch::paging::sync_page(frame, segment.flags.execute);
-
-            va += PAGE_SIZE;
-        }
-    }
-
-    // Log cache stats
-    let (cached, max) = PAGE_CACHE.lock().stats();
-    printkln!("Page cache: {}/{} pages", cached, max);
-
-    Ok(())
-}
-
-/// Zero the part of the page at `va` (backed by `frame`) that lies in
-/// [file_end, mem_end): a segment's .bss (Linux padzero + anonymous
-/// pages)
-fn zero_bss(frame: u64, va: u64, file_end: u64, mem_end: u64) {
-    let lo = file_end.max(va);
-    let hi = mem_end.min(va + PAGE_SIZE);
-    if lo < hi {
-        unsafe {
-            ::core::ptr::write_bytes(phys_to_virt(frame + (lo - va)), 0, (hi - lo) as usize);
-        }
-    }
-}
-
-/// Apply ELF relocations for PIE binaries
-///
-/// For R_*_RELATIVE relocations: *(base + offset) = base + addend
-fn apply_relocations<PT>(
-    elf: &crate::elf::ElfExecutable,
-    elf_data: &[u8],
-    base_addr: u64,
-    page_table: &PT,
-) where
-    PT: crate::arch::PageTable<VirtAddr = u64, PhysAddr = u64>,
-{
-    let mut n = 0;
-    elf.for_each_relocation(elf_data, &mut |reloc| {
-        let target_vaddr = base_addr + reloc.offset;
-        let value = (base_addr as i64 + reloc.addend) as u64;
-
-        // Look up the physical address for this virtual address
-        if let Some(phys) = page_table.translate(target_vaddr) {
-            // Write the relocated value to physical memory
-            unsafe {
-                let ptr = phys_to_virt(phys) as *mut u64;
-                ::core::ptr::write_volatile(ptr, value);
-            }
-            crate::arch::paging::sync_icache(phys, 8);
-        }
-        n += 1;
-    });
-
-    if n != 0 {
-        printkln!("Applied {} relocations", n);
-    }
-}
-
-/// Allocate user stack pages
-///
-/// Returns the stack top (highest address, stack grows down).
-fn allocate_user_stack<PT, FA>(
-    page_table: &mut PT,
-    frame_alloc: &mut FA,
-) -> Result<u64, &'static str>
-where
-    PT: crate::arch::PageTable<VirtAddr = u64, PhysAddr = u64>,
-    FA: crate::arch::FrameAlloc<PhysAddr = u64>,
-{
-    use crate::arch::PageFlags;
-
-    let stack_bottom = USER_STACK_TOP - (USER_STACK_PAGES as u64 * PAGE_SIZE);
-    let flags = PageFlags::READ | PageFlags::WRITE | PageFlags::USER;
-
-    for i in 0..USER_STACK_PAGES {
-        let va = stack_bottom + (i as u64 * PAGE_SIZE);
-
-        // Allocate a physical frame
-        let frame = frame_alloc
-            .alloc_frame()
-            .ok_or("Out of memory allocating stack frame")?;
-
-        // Zero the frame
-        unsafe {
-            ::core::ptr::write_bytes(phys_to_virt(frame), 0, PAGE_SIZE as usize);
-        }
-
-        // Map the page
-        page_table
-            .map_with_alloc(va, frame, flags, frame_alloc)
-            .map_err(|_| "Failed to map stack page")?;
-    }
-
-    Ok(USER_STACK_TOP)
-}
+use crate::mm::STACK_TOP as USER_STACK_TOP;
 
 /// Initialize NUMA topology from firmware
 ///
@@ -713,14 +467,8 @@ fn kmain() -> ! {
         }
     };
     user_pt.copy_kernel_mappings();
-    let init_pgd = user_pt.root_table_phys();
-    let user_stack_top = match allocate_user_stack(&mut user_pt, &mut frame_alloc) {
-        Ok(sp) => sp,
-        Err(e) => {
-            printkln!("ERR: {}", e);
-            CurrentArch::halt_loop();
-        }
-    };
+    // Its stack comes with the program exec loads into it (run_init)
+    let user_stack_top = USER_STACK_TOP;
     // Kernel stack for PID 1 (init process)
     let kernel_stack = mm::vmstack::alloc().expect("Failed to allocate kernel stack for init")
         + task::percpu::KERNEL_STACK_SIZE as u64;
@@ -854,138 +602,10 @@ fn kmain() -> ! {
         printkln!("gfx: SimpleDRM device registered as card{}", minor);
     }
 
-    // Load /bin/init from ramfs via VFS
-    let init_dentry = match fs::lookup_path("/bin/init") {
-        Ok(d) => d,
-        Err(e) => {
-            printkln!("ERROR: /bin/init not found: {:?}", e);
-            CurrentArch::halt_loop();
-        }
-    };
-    let init_inode = init_dentry.get_inode().expect("/bin/init has no inode");
-
-    // Get file_id from ramfs inode for page cache access
-    let private = init_inode
-        .get_private()
-        .expect("/bin/init has no private data");
-    let ramfs_data = private
-        .as_ref()
-        .as_any()
-        .downcast_ref::<fs::RamfsInodeData>()
-        .expect("/bin/init is not a ramfs file");
-    let file_id = ramfs_data.file_id.expect("/bin/init has no file_id");
-    let file_size = init_inode.get_size() as usize;
-
-    // Read entire file from page cache into buffer
-    let mut init_data_vec = alloc::vec![0u8; file_size];
-    {
-        let mut bytes_read = 0;
-        while bytes_read < file_size {
-            let page_offset = (bytes_read / PC_PAGE_SIZE) as u64;
-            let offset_in_page = bytes_read % PC_PAGE_SIZE;
-            let chunk_size =
-                ::core::cmp::min(PC_PAGE_SIZE - offset_in_page, file_size - bytes_read);
-
-            // Get page from cache (pages should exist since file was populated at boot)
-            let page = {
-                let mut cache = PAGE_CACHE.lock();
-                let (page, _) = cache
-                    .find_or_create_page(
-                        file_id,
-                        page_offset,
-                        file_size as u64,
-                        &mut frame_alloc,
-                        false,      // can_writeback
-                        true,       // unevictable (ramfs pages)
-                        &NULL_AOPS, // Generic ops - page should already exist
-                    )
-                    .expect("Failed to get page for /bin/init");
-                page
-            };
-
-            // Copy from page to buffer
-            unsafe {
-                ::core::ptr::copy_nonoverlapping(
-                    (phys_to_virt(page.frame) as *const u8).add(offset_in_page),
-                    init_data_vec[bytes_read..].as_mut_ptr(),
-                    chunk_size,
-                );
-            }
-
-            bytes_read += chunk_size;
-        }
-    }
-    let init_bytes: &[u8] = &init_data_vec;
-
-    // Parse ELF header
-    let elf = match crate::elf::ElfExecutable::parse(init_bytes) {
-        Ok(e) => e,
-        Err(_) => {
-            printkln!("ERR: ELF parse failed");
-            CurrentArch::halt_loop();
-        }
-    };
-    printkln!("ELF: entry=0x{:x}", elf.entry);
-
-    // pid 1's page table, made with its task: kernel mappings added
-    // since then (probe, ioremap) are copied again
-    let mut user_pt = ArchPageTable::new(init_pgd);
-    user_pt.copy_kernel_mappings();
-
-    // Load ELF segments into user page table using page cache
-    let base_addr = if elf.is_pie {
-        ELF_ET_DYN_BASE & !(elf.align.max(PAGE_SIZE) - 1)
-    } else {
-        0
-    };
-    if let Err(e) = load_elf_with_cache(
-        &elf,
-        file_id,
-        init_bytes,
-        &mut user_pt,
-        &mut frame_alloc,
-        base_addr,
-    ) {
-        printkln!("ERR: {}", e);
-        CurrentArch::halt_loop();
-    }
-
-    // Apply relocations for PIE binaries
-    apply_relocations(&elf, init_bytes, base_addr, &user_pt);
-
-    // Calculate highest segment end for brk initialization
-    let mut highest_end: u64 = 0;
-    for segment in &elf.segments {
-        if segment.mem_size > 0 {
-            let seg_end = segment.vaddr + base_addr + segment.mem_size as u64;
-            if seg_end > highest_end {
-                highest_end = seg_end;
-            }
-        }
-    }
-    // Page-align to get start_brk
-    let start_brk = (highest_end + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-
     printkln!("KERNEL_READY");
 
     // Run locking infrastructure self-tests
     crate::waitqueue::run_locking_tests();
-
-    // Calculate actual entry point (add base for PIE)
-    let entry_point = elf.entry + base_addr;
-
-    // Initialize brk for the init task
-    // This must be done after create_user_task which creates a default mm
-    if let Some(mm) = mm::get_task_mm(init_tid) {
-        let mut m = mm.mmap_write();
-        m.set_brk(start_brk);
-        m.set_exe(alloc::string::String::from("/bin/init"));
-        m.set_args(task::exec::image_layout(&elf, base_addr));
-        let stack_bottom = USER_STACK_TOP - USER_STACK_PAGES as u64 * PAGE_SIZE;
-        for vma in task::exec::image_vmas(&elf, base_addr, stack_bottom) {
-            m.insert_vma(vma);
-        }
-    }
 
     // The boot self-test
     crate::selftest::start();
@@ -993,35 +613,47 @@ fn kmain() -> ! {
     // stdin/stdout/stderr of init: /dev/console (Linux kernel_init)
     fs::open::console_on_rootfs();
 
-    // Jump to user mode!
-    // This never returns.
-    //
-    // Note: x86-64 ABI requires RSP to be 8 bytes below 16-byte alignment at function entry
-    // (because 'call' would push an 8-byte return address). Since we're entering via IRET
-    // not CALL, we need to subtract 8 from the stack top to maintain ABI alignment.
-    let user_sp = user_stack_top - 8;
+    run_init()
+}
 
-    // ARM64: Final cache flush barrier before jumping to user mode.
-    // The ELF segments were cache-flushed earlier, but between then and now
-    // we've done a lot of kernel operations. This ensures all cache operations
-    // are truly visible before the ERET to user mode.
-    #[cfg(target_arch = "aarch64")]
-    unsafe {
-        core::arch::asm!(
-            "dsb sy", // Full system data synchronization barrier
-            "isb",    // Instruction synchronization barrier
-            options(nostack, preserves_flags)
-        );
+/// Run the first user program in pid 1 (Linux init/main.c kernel_init):
+/// `rdinit=` (default /init) if it exists, then `init=` (a failure is
+/// fatal), then /sbin/init, /etc/init, /bin/init and /bin/sh. Each runs
+/// through execve with argv {path, the command line's extra words} and
+/// envp {HOME=/, TERM=linux, its extra name=value words}.
+fn run_init() -> ! {
+    let args = cmdline::init_args(&cmdline::saved());
+    let rdinit = args.rdinit.as_deref().unwrap_or("/init");
+    if fs::lookup_path(rdinit).is_ok() {
+        let e = try_init(rdinit, &args);
+        printkln!("Failed to execute {} (error {})", rdinit, e);
     }
+    if let Some(init) = args.init.as_deref() {
+        let e = try_init(init, &args);
+        panic!("Requested init {} failed (error {}).", init, e);
+    }
+    for path in ["/sbin/init", "/etc/init", "/bin/init", "/bin/sh"] {
+        let e = try_init(path, &args);
+        if e != -2 {
+            printkln!(
+                "Starting init: {} exists but couldn't execute it (error {})",
+                path,
+                e
+            );
+        }
+    }
+    panic!("No working init found.  Try passing init= option to kernel.");
+}
 
-    // Load init's address space (its task holds the mm reference)
-    match mm::get_task_mm(init_tid) {
-        Some(mm) => mm::tlb::switch_mm(Some(&mm)),
-        None => panic!("init has no address space"),
-    }
-    unsafe {
-        CurrentArch::jump_to_user(entry_point, user_sp, kernel_stack);
-    }
+/// execve `path` as init; returns only on failure, with the errno
+fn try_init(path: &str, args: &cmdline::InitArgs) -> i32 {
+    use alloc::vec::Vec;
+    let mut argv: Vec<Vec<u8>> = alloc::vec![path.as_bytes().to_vec()];
+    argv.extend(args.argv.iter().map(|a| a.as_bytes().to_vec()));
+    let mut envp: Vec<Vec<u8>> = alloc::vec![b"HOME=/".to_vec(), b"TERM=linux".to_vec()];
+    envp.extend(args.envp.iter().map(|e| e.as_bytes().to_vec()));
+    let mut frame_alloc = frame_alloc::FrameAllocRef(&FRAME_ALLOCATOR);
+    task::exec::do_execve(path.as_bytes().to_vec(), argv, envp, &mut frame_alloc)
 }
 
 /// Default RAM disk size in MB
@@ -1076,6 +708,10 @@ fn init_vfs_core() {
     let mut nodes = alloc::vec![
         ("null", DevId::new(chardev_major::MEM, 3), 0o666),
         ("zero", DevId::new(chardev_major::MEM, 5), 0o666),
+        ("full", DevId::new(chardev_major::MEM, 7), 0o666),
+        ("random", DevId::new(chardev_major::MEM, 8), 0o666),
+        ("urandom", DevId::new(chardev_major::MEM, 9), 0o666),
+        ("kmsg", DevId::new(chardev_major::MEM, 11), 0o644),
         ("tty", DevId::new(chardev_major::TTYAUX, 0), 0o666),
         ("console", DevId::new(chardev_major::TTYAUX, 1), 0o666),
     ];

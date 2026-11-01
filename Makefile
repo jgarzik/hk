@@ -25,7 +25,7 @@ KERNEL_FEATURES = $(if $(LOCKDEP),--features lockdep)
 MACHINE ?=
 
 .PHONY: all build debug user iso iso-debug run run-debug test check clean info help vfat-image disk-image
-.PHONY: build-arm run-arm check-arm check-linux check-linux-arm user-arm clippy clippy-arm fmt list-machines gate check-stress
+.PHONY: build-arm run-arm check-arm check-linux check-linux-arm user-arm clippy clippy-arm fmt list-machines gate check-stress check-bigmem
 
 # Default: build everything (kernel, user binaries, ISO)
 all: iso
@@ -58,6 +58,7 @@ help:
 	@echo "  make gate     - Full per-commit gate, the four boots in parallel"
 	@echo "  make check-stress - Flake sweep: repeated check/check-arm boots"
 	@echo "                  (STRESS_N=10 per arch, STRESS_JOBS=3 at a time)"
+	@echo "  make check-bigmem - x86 boot test with 6GB RAM (RAM above 4GB)"
 	@echo ""
 	@echo "  make clippy   - Run clippy linter (x86-64)"
 	@echo "  make clippy-arm - Run clippy linter (aarch64)"
@@ -166,6 +167,11 @@ export QEMU_CPU
 # tools/linux-boot-tester.sh), e.g. QEMU_SMP=8 make check-stress
 QEMU_SMP ?= 4
 export QEMU_SMP
+
+# Guest RAM for every boot test, hk and Linux, e.g. QEMU_MEM=3400M
+# (the Dell's size); check-bigmem puts RAM above 4GB
+QEMU_MEM ?= 512M
+export QEMU_MEM
 
 # hk boot test NIC (see run-qemu.sh): virtio (default) or e1000
 export NIC
@@ -281,6 +287,11 @@ fmt:
 # Check formatting without modifying
 fmt-check:
 	cargo fmt --check
+
+# x86 boot test with RAM above 4GB (DMA addressing); by hand, not in
+# the gate
+check-bigmem:
+	@$(MAKE) check QEMU_MEM=6G
 
 # The full per-commit gate (tools/gate.sh)
 gate:

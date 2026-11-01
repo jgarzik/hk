@@ -42,9 +42,14 @@ affinity; memory management with a buddy/slab allocator, TLB
 shootdown, copy-on-write, shared memory, LRU reclaim and swap; a
 VFS with ramfs, vfat, procfs, devtmpfs and cgroupfs; a block layer
 (virtio-blk, GPT partitions); networking (virtio-net, e1000, IPv4, TCP,
-UDP, ICMP, AF_UNIX, AF_PACKET, netlink); and Ubuntu's static busybox as
-userland. The boot tester runs the same tests on hk and on a real Linux
-kernel, which defines the expected behavior.
+UDP, ICMP, AF_UNIX, AF_PACKET, netlink); exec of dynamically linked
+programs (the PT_INTERP interpreter) and #! scripts, with init started
+by execve and Linux's init=/rdinit=; supplementary groups, named FIFOs,
+every clock id, a ChaCha20 CRNG behind getrandom and /dev/urandom, and
+/dev/kmsg over a record-based kernel log. Userland: Ubuntu's static
+busybox, plus glibc's dynamic linker, bash and coreutils. The boot
+tester runs the same tests on hk and on a real Linux kernel, which
+defines the expected behavior.
 
 ## Building etc
 

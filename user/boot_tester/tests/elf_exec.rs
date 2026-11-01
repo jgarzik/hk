@@ -13,6 +13,9 @@ const EM: u16 = 62;
 const EM: u16 = 183;
 
 const PATH: &[u8] = b"/elf_bad\0";
+const BAD_INTERP: &[u8] = b"/elf_bad_interp\0";
+const HUGE_INTERP: &[u8] = b"/elf_huge_interp\0";
+const FIXED_INTERP: &[u8] = b"/elf_fixed_interp\0";
 const LEN: usize = 0x2000;
 
 /// How Linux treats the file
@@ -23,10 +26,23 @@ enum Want {
     /// After the point of no return: Linux kills the task with
     /// SIGSEGV, hk rejects it earlier with this errno; either passes
     Fatal(i64),
+    /// hk rejects it with this errno; Linux runs into whatever it mapped
+    /// and dies of some signal; either passes
+    Dies(i64),
 }
 
 pub fn run_tests() {
-    let cases: [(&[u8], fn(&mut [u8]) -> usize, Want); 7] = [
+    // An executable file that is not ELF, for ELF_EXEC_BAD_INTERP
+    let fd = sys_open(BAD_INTERP.as_ptr(), O_WRONLY | O_CREAT | O_TRUNC, 0o755);
+    sys_write(fd as u64, [b'x'; 128].as_ptr(), 128);
+    sys_close(fd as u64);
+    // Interpreters that cannot be placed
+    write_interp(HUGE_INTERP, |f| {
+        set16(f, 16, 3); // ET_DYN
+        set64(f, 64 + 40, 0x7fff_ffff_0000); // p_memsz
+    });
+    write_interp(FIXED_INTERP, |_| {}); // ET_EXEC at the program's address
+    let cases: [(&[u8], fn(&mut [u8]) -> usize, Want); 10] = [
         (b"ELF_EXEC_TRUNCATED", |_| 20, Want::Errno(8)),
         (
             b"ELF_EXEC_BAD_MACHINE",
@@ -49,6 +65,24 @@ pub fn run_tests() {
             Want::Errno(8),
         ),
         (b"ELF_EXEC_MISSING_INTERP", missing_interp, Want::Errno(2)),
+        // Linux load_elf_binary: an interpreter that is not ELF
+        (b"ELF_EXEC_BAD_INTERP", bad_interp, Want::Errno(80)),
+        // An interpreter spanning more than the address space below
+        // mmap_base: ENOMEM on hk; Linux fails mapping it after the point
+        // of no return (SIGSEGV)
+        (
+            b"ELF_EXEC_INTERP_HUGE",
+            |f| with_interp(f, HUGE_INTERP),
+            Want::Dies(12),
+        ),
+        // A fixed-address interpreter on top of the program: refused on
+        // hk; Linux maps it over the program (MAP_FIXED) and the result
+        // dies
+        (
+            b"ELF_EXEC_INTERP_OVERLAP",
+            |f| with_interp(f, FIXED_INTERP),
+            Want::Dies(22),
+        ),
         (
             b"ELF_EXEC_FILESZ_GT_MEMSZ",
             |f| set64(f, 64 + 40, 0x100),
@@ -77,6 +111,9 @@ fn large_files() {
     set64(&mut f, 32, BIG as u64 + 0x1000); // phoff past EOF
     check_big(b"ELF_EXEC_LARGE_TRUNCATED", &f[..64], Want::Errno(8));
     exec_still_works();
+    sys_unlink(BAD_INTERP.as_ptr());
+    sys_unlink(HUGE_INTERP.as_ptr());
+    sys_unlink(FIXED_INTERP.as_ptr());
 }
 
 /// `head` followed by zeros up to BIG bytes, exec'd as in `check`
@@ -165,8 +202,27 @@ fn valid(f: &mut [u8]) {
 
 /// PT_INTERP naming a file that does not exist
 fn missing_interp(f: &mut [u8]) -> usize {
+    with_interp(f, b"/no/such/ld.so\0")
+}
+
+/// Write an interpreter: the template ELF, changed by `mutate`
+fn write_interp(path: &[u8], mutate: fn(&mut [u8])) {
+    let mut f = [0u8; LEN];
+    valid(&mut f);
+    mutate(&mut f);
+    let fd = sys_open(path.as_ptr(), O_WRONLY | O_CREAT | O_TRUNC, 0o755);
+    sys_write(fd as u64, f.as_ptr(), LEN as u64);
+    sys_close(fd as u64);
+}
+
+/// PT_INTERP naming an executable file that is not ELF
+fn bad_interp(f: &mut [u8]) -> usize {
+    with_interp(f, BAD_INTERP)
+}
+
+/// A second program header: PT_INTERP naming `path`
+fn with_interp(f: &mut [u8], path: &[u8]) -> usize {
     set16(f, 56, 2);
-    let path = b"/no/such/ld.so\0";
     f[0x1000..0x1000 + path.len()].copy_from_slice(path);
     phdr(
         f,
@@ -206,6 +262,7 @@ fn run(name: &[u8], want: Want) {
     let ok = match want {
         Want::Errno(e) => exited && code == e,
         Want::Fatal(e) => (exited && code == e) || st & 0x7f == 11,
+        Want::Dies(e) => (exited && code == e) || !exited,
     };
     print(name);
     if ok {

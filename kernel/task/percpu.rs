@@ -1612,7 +1612,8 @@ pub fn reap_zombie_child_times(
         }
 
         // Must be a zombie
-        if !matches!(t.state, TaskState::Zombie(_)) || group_alive(&table, t) {
+        if !matches!(t.state, TaskState::Zombie(_)) || group_alive(&table, t.task.pid, t.task.tid())
+        {
             return false;
         }
 
@@ -1657,10 +1658,7 @@ pub fn reap_zombie_child_times(
 
 /// A thread of group `tgid` other than `tid` has not exited yet
 pub fn group_others(tgid: Pid, tid: Tid) -> bool {
-    let table = TASKLIST.read();
-    table
-        .threads(tgid)
-        .any(|u| u.task.tid() != tid && !matches!(u.state, TaskState::Zombie(_)))
+    group_alive(&TASKLIST.read(), tgid, tid)
 }
 
 /// After de_thread: `tid` is the only thread of `tgid` left running and
@@ -1759,11 +1757,12 @@ pub fn take_leadership(tgid: Pid, tid: Tid) -> Vec<TaskRef> {
     gone
 }
 
-/// A thread of `t`'s group other than `t` has not exited yet
-fn group_alive(table: &GlobalTaskTable, t: &TaskView<'_>) -> bool {
+/// A thread of group `tgid` other than `tid` has not exited yet (Linux
+/// thread_group_empty / delay_group_leader)
+fn group_alive(table: &GlobalTaskTable, tgid: Pid, tid: Tid) -> bool {
     table
-        .threads(t.task.pid)
-        .any(|u| u.task.tid() != t.task.tid() && !matches!(u.state, TaskState::Zombie(_)))
+        .threads(tgid)
+        .any(|u| u.task.tid() != tid && !matches!(u.state, TaskState::Zombie(_)))
 }
 
 /// The wait status a zombie leader reports (Linux wait_task_zombie):
@@ -2434,9 +2433,7 @@ fn forget_original_parent() {
     if table.get(me.tid()).is_none_or(|t| t.children.is_empty()) {
         return;
     }
-    let live = |t: &TaskView<'_>| {
-        !t.task.has_flag(crate::task::pf::EXITING) && !matches!(t.state, TaskState::Zombie(_))
-    };
+    let live = crate::signal::task_live;
     let mut reaper = table
         .threads(me.pid)
         .find(|t| !core::ptr::eq(t.task, &*me) && live(t))
@@ -2499,7 +2496,8 @@ pub fn exit_current(status: Option<i32>) -> ! {
         // Exactly one thread, the one taking the group's live count to
         // zero, does the group-level exit work (Linux do_exit:
         // group_dead = atomic_dec_and_test(&signal->live))
-        group_dead = crate::signal::get_task_signal_struct(tid).is_none_or(|s| s.thread_exiting());
+        group_dead =
+            crate::signal::get_task_signal_struct(tid).is_none_or(|s| s.thread_exiting(status));
 
         // Nothing reaps orphans or keeps userspace going without the
         // global init: its death is fatal, and loud (Linux do_exit:
@@ -3467,6 +3465,7 @@ pub fn scheduler_tick() {
     }
     crate::timer::run_local();
     crate::watchdog::tick();
+    crate::kmsg::tick();
     if let Some(cpu) = crate::cpu::try_this_id() {
         balance_tick(cpu);
     }

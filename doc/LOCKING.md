@@ -361,9 +361,15 @@ Timekeeping (3.5):
 Printk locks (ALL IRQ-safe - can be acquired from interrupt context):
     OUTPUT_LOCK (IrqSpinlock, held for entire message)
         ↓
+    kmsg LOG (IrqSpinlock leaf, the record log; taken and released
+              before PRINTK)
     PRINTK (IrqSpinlock, ring buffer)
         ↓
     CONSOLE_REGISTRY (IrqSpinlock, console dispatch)
+
+/dev/kmsg (kmsg.rs):
+    KmsgUser.cur (spin, per open; never held across a wait) → LOG
+    KmsgUser.rate (spin leaf)
 ```
 
 ### Key Rules
@@ -876,7 +882,9 @@ taken, except `cred_guard` around `exec_update`):
   mmap_lock, the fd table, TASKLIST) until the new image is in
   place; an error return drops it with nothing changed. PTRACE_ATTACH /
   PTRACE_SEIZE hold the target's around the access decision and the
-  attach.
+  attach. Both take it interruptibly (Linux mutex_lock_interruptible,
+  ERESTARTNOINTR): a sibling waiting for it while the holder's exec
+  waits in de_thread for that sibling to die is woken by the SIGKILL.
 - `exec_update` (`sync::RwSem`): `exec_replace_image` holds it for
   writing, inside `cred_guard`, while it installs the new mm, name and
   dumpability under TASKLIST and the task's alloc_lock; process_vm_readv/writev (`access_mm`),
@@ -1193,9 +1201,15 @@ pub struct Zone {
   chains, and only once empty and outside every remaining VMA's span:
   an entry pointer stays valid under any mm lock hold, or under the
   AnonVma.chain lock of a VMA it lies in (the reverse map). Order: mm lock -> page_table_lock -> PTE lock ->
-  `FRAME_ALLOCATOR` (pages and tables are allocated, and the TLB is
-  flushed, under them); never in interrupt context; no sleeping under
-  them. A holder may flush other CPUs' TLBs: their waiters spin with
+  `FRAME_ALLOCATOR` (the TLB is flushed under them); never in
+  interrupt context; no sleeping under them. Both disable preemption
+  (in_atomic), so an allocation under them never enters direct reclaim:
+  reclaim's reverse-map walk takes PTE locks, the held one included (a
+  self-deadlock). Allocations that must not fail are made first: fork
+  and mremap allocate the destination tables before the source's PTE
+  lock (`PteWalk::prepare`, mremap's prep walk reads entries unlocked
+  under the write-held mmap_lock), a copy-on-write break retries its
+  page allocation without the lock. A holder may flush other CPUs' TLBs: their waiters spin with
   interrupts on (syscalls and faults run with them on, 7.5) and answer
   the IPI, as in Linux. Deviation: the PTE lock is a bare lock word in
   the table's struct page (Linux: a `spinlock_t` in the ptdesc).
@@ -1674,6 +1688,17 @@ Each open `File` holds a reference to its mount via the `mnt` field:
 3. child.mountpoint (read)
 4. Dentry.d_lock (DentryInner.inode: read)
 ```
+
+`is_local_mountpoint` (rmdir, unlink, rename: EBUSY) takes the same
+locks in the same order, one mount's `children` at a time, inside the
+inode locks those syscalls hold (sleeping, outer): the parents' and the
+victim's (rmdir/unlink) or the renamed and replaced inodes' (a
+directory being replaced included, like Linux vfs_rename). `attach`
+takes the mountpoint directory's i_rwsem (Linux lock_mount) around
+linking the new mount in and refuses a directory marked dead
+(`Inode::set_dead`, set by rmdir or a rename replacing it under that
+same lock), so a mount and a removal of its mountpoint serialize:
+i_rwsem -> MntNamespace.root -> Mount.children -> Mount.mountpoint.
 
 #### VFS Locking Notes
 
@@ -2232,6 +2257,17 @@ static CONSOLE_REGISTRY: IrqSpinlock<ConsoleRegistry> = IrqSpinlock::new(...);
 3. CONSOLE_REGISTRY (held during console_write) - IrqSpinlock
 ```
 
+**The record log** (`kernel/kmsg.rs`): `LOG` (IrqSpinlock) holds the
+records that /dev/kmsg and syslog(2) read. printk adds each complete
+line under OUTPUT_LOCK (try_lock while panicking); a /dev/kmsg write
+adds its record under `LOG` alone, then writes the console under
+OUTPUT_LOCK. Nothing allocates under `LOG`: readers size their
+buffers before taking it, and syslog reads copy the ring out (one
+memcpy) and format after releasing it. printk may run with run-queue locks held,
+so it never wakes readers itself: it sets `WAKE_PENDING`, and the
+scheduler tick (no locks held) wakes them (Linux defers the klogd
+wakeup through irq_work).
+
 **Why IRQ-Safe:**
 
 All three locks use `IrqSpinlock` because printk can be called from:
@@ -2522,7 +2558,9 @@ de_thread, exit_group does not.
   after dropping it.
 - de_thread (exec) holds cred_guard (sleeping, outermost) while it waits
   for the other threads on CHILD_EXIT_WQ (killable); it holds no
-  spinlock. The old leader and exited threads are removed under
+  spinlock. A thread blocked on that cred_guard (its own exec, or an
+  attach to the group) sleeps interruptibly, so the SIGKILL de_thread
+  sends ends it. The old leader and exited threads are removed under
   TASKLIST and released after it.
 
 #### Reference Counting
@@ -3055,6 +3093,7 @@ else is taken under it) unless an order is given. "spin" is the
 | `SuperBlock.{root, private}`, `DentryCache.root` | fs/superblock.rs, fs/dentry.rs | spin RwLock | superblock root and private data, the dcache root |
 | `RamfsInodeData.xattrs`, `RamfsSbData.sb` | fs/ramfs.rs | spin | ramfs xattrs and superblock back-pointer (under VFS locks) |
 | membarrier `GLOBAL_MUTEX` → `IPI_MUTEX` | membarrier.rs | sleeping (`sync::Mutex`; `IPI_MUTEX` is Linux membarrier_ipi_mutex) | `IPI_MUTEX` serializes the membarrier commands that interrupt other CPUs, so callers cannot multiply the IPIs; held only across `smp_call_function_many` (waited); nothing is taken under it. `GLOBAL_MUTEX` (killable) paces MEMBARRIER_CMD_GLOBAL to one call per tick: held across its IPIs and its one-tick sleep, so GLOBAL callers never delay the expedited ones. The targets are chosen from each CPU's `PerCpuScheduler.curr_mm` / `membarrier_state` (atomics written at every switch in `make_current`: `curr_mm` SeqCst, then a full fence, then the registrations read, so a registration either sees the CPU in its mm and refreshes it by IPI or is seen by the switch; Linux rq->curr->mm and rq->membarrier_state), compared, never dereferenced |
+| `Inode.i_pipe` | fs/inode.rs, pipe.rs (FIFOs) | spin Mutex leaf (Linux inode->i_lock around i_pipe) | a FIFO's pipe and its open-file count: attached by the first open, dropped by the last release; every change of the pipe's reader/writer counts and open counters happens under it (so a blocking open decides, and samples the counter it waits on, before unlocking; the release wakes the other side under it: -> `Pipe.wait_queue`); never held across a wait (a blocking open waits on `Pipe.wait_queue` after unlocking) or under `Pipe.inner` |
 | `Pipe.inner` | pipe.rs | sleeping (`sync::Mutex`, Linux pipe->mutex) | the pipe's buffer ring; held across page allocation, never under a spin lock; two pipes (splice, tee) in address order (Linux pipe_double_lock); -> frame allocator. `Pipe.head`/`tail` (atomics) are published as the guard unlocks and read locklessly by wait conditions and poll (poll runs under `Eventpoll.inner`, an IrqSpinlock); wakeups follow the unlock |
 | `NTtyLdisc.data` | tty/n_tty.rs | spin Mutex | line discipline buffer (input is polled, not IRQ-fed) |
 | `VgaCon.state` | arch/x86_64/vgacon.rs | IrqSpinlock | VGA text console state, under `CONSOLE_REGISTRY` (3.9) |
@@ -3063,7 +3102,8 @@ else is taken under it) unless an order is given. "spin" is the
 | `INTX_MAP` | arch/aarch64/pci_irq.rs | spin Mutex | PCI INTx routing from the device tree (boot) |
 | `PCI_LOCK` | arch/x86_64/pci_conf.rs (port I/O config access) | IrqSpinlock | Linux pci_lock: the CF8 address write and the CFC data access of one config read/write; leaf (port I/O only). ECAM accesses are single MMIO operations and take no lock |
 | PCI fixups (`bus/quirks.rs`) | none | thread only (boot) | run by bus enumeration (single-threaded) on each function before driver probe |
-| `CMDLINE_CONSOLE`, `CRNG` | cmdline.rs, random.rs | spin Mutex | console= choice, CRNG state |
+| `CMDLINE_CONSOLE` | cmdline.rs | spin Mutex | console= choice |
+| `CPU_CRNG` (per CPU) -> `BASE` | random.rs | IrqSpinlock | ChaCha20 CRNG: this CPU's key, then the base key when the CPU key is refreshed or the base reseeded; both leaves otherwise (callers include softirq net code). `GENERATION`/`BIRTH_NS` are atomics read unlocked, rechecked under `BASE` |
 | `NUMA_TOPOLOGY` | numa.rs | IrqSpinlock | NUMA node table |
 | `BpfHashMap.data`, `BpfArrayMap.data` | bpf/map.rs | IrqSpinlock | BPF map contents |
 

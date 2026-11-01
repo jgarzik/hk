@@ -76,6 +76,16 @@ fn hcs_max_scratchpad(params2: u32) -> u32 {
     ((params2 >> 21) & 0x1f) << 5 | (params2 >> 27)
 }
 
+/// DMA mask from HCCPARAMS1: AC64 (bit 0) means 64-bit addressing,
+/// else only 32 (Linux xhci_gen_setup, HCC_64BIT_ADDR)
+fn hcc_dma_mask(params1: u32) -> u64 {
+    if params1 & 1 != 0 {
+        u64::MAX
+    } else {
+        u32::MAX as u64
+    }
+}
+
 use super::context::{InputContext, OutputDeviceContext, endpoint_to_dci};
 use super::transfer::{CompletionCode, TransferRing, Trb as TransferTrb, TrbType};
 use super::{SetupPacket, UsbBus, UsbController, UsbDevice, UsbError, UsbSpeed};
@@ -857,7 +867,12 @@ impl XhciController {
         let rtsoff = self.read_cap(0x18);
 
         self.max_slots = (hcsparams1 & 0xFF) as u8;
-        self.ctx_size = super::context::ctx_size(self.read_cap(0x10));
+        let hccparams1 = self.read_cap(0x10);
+        self.ctx_size = super::context::ctx_size(hccparams1);
+        // Contexts, transfer rings and bulk buffers may sit above 4GB:
+        // under the default 32-bit mask their DMA mapping fails
+        self.pci_dev
+            .set_dma_mask_and_coherent(hcc_dma_mask(hccparams1));
         self.max_ports = ((hcsparams1 >> 24) & 0xFF) as u8;
 
         // Calculate register offsets
@@ -1968,5 +1983,12 @@ mod tests {
         assert_eq!(hcs_max_scratchpad(4 << 27), 4);
         assert_eq!(hcs_max_scratchpad(1 << 21), 32);
         assert_eq!(hcs_max_scratchpad(0xffff_ffff), 1023);
+    }
+
+    #[test]
+    fn dma_mask() {
+        assert_eq!(hcc_dma_mask(0), 0xffff_ffff);
+        assert_eq!(hcc_dma_mask(0x0008_0001), u64::MAX); // QEMU qemu-xhci
+        assert_eq!(hcc_dma_mask(!1), 0xffff_ffff);
     }
 }

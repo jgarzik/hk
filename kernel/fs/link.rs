@@ -209,16 +209,19 @@ fn link_locked(dir: &Arc<Inode>, name: &str, inode: &Arc<Inode>) -> Result<(), K
 const AT_SYMLINK_FOLLOW: i32 = 0x400;
 const AT_EMPTY_PATH: i32 = 0x1000;
 
-/// The dentry linkat links to (Linux filename_linkat lookup): an empty
-/// path with AT_EMPTY_PATH names `dirfd` itself, which takes
-/// CAP_DAC_READ_SEARCH (else ENOENT), so a descriptor passed to an
-/// unprivileged process cannot be linked back into the tree; the final
+/// The dentry linkat links to (Linux 6.8 do_linkat): AT_EMPTY_PATH at
+/// all takes CAP_DAC_READ_SEARCH (else ENOENT, whatever the path), so
+/// a descriptor passed to an unprivileged process cannot be linked back
+/// into the tree; an empty path with it names `dirfd` itself; the final
 /// symlink is followed only with AT_SYMLINK_FOLLOW
 fn link_source(dirfd: i32, path_ptr: u64, flags: i32) -> Result<Arc<Dentry>, KernelError> {
     let path =
         strncpy_from_user::<Uaccess>(path_ptr, PATH_MAX).map_err(|_| KernelError::BadAddress)?;
+    if flags & AT_EMPTY_PATH != 0 && !crate::task::capable(crate::task::CAP_DAC_READ_SEARCH) {
+        return Err(KernelError::NotFound);
+    }
     if path.is_empty() {
-        if flags & AT_EMPTY_PATH == 0 || !crate::task::capable(crate::task::CAP_DAC_READ_SEARCH) {
+        if flags & AT_EMPTY_PATH == 0 {
             return Err(KernelError::NotFound);
         }
         if dirfd == AT_FDCWD {
@@ -584,9 +587,28 @@ fn rename_locked(old: Side, new: Side, flags: u32) -> Result<(), KernelError> {
     }
 
     // The link counts that change, under their inodes' locks (Linux
-    // lock_two_nondirectories)
+    // lock_two_nondirectories); a directory being replaced is locked
+    // too (Linux vfs_rename), so a mount on it is either seen here or
+    // refused for the dead directory
+    let dead = dinode.as_ref().filter(|d| !exchange && d.mode().is_dir());
     lock_two_nondirs(Some(&sinode), dinode.as_ref());
-    let r = odir.i_op.rename(odir, oname, ndir, nname, flags);
+    if let Some(d) = dead {
+        d.inode_lock();
+    }
+    // Linux vfs_rename: neither side may be a mountpoint here
+    let r = if super::mount::is_local_mountpoint(&src)
+        || dst.as_ref().is_some_and(super::mount::is_local_mountpoint)
+    {
+        Err(KernelError::Busy)
+    } else {
+        odir.i_op.rename(odir, oname, ndir, nname, flags)
+    };
+    if let Some(d) = dead {
+        if r.is_ok() {
+            d.set_dead();
+        }
+        unsafe { d.inode_unlock() };
+    }
     unsafe { unlock_two_nondirs(Some(&sinode), dinode.as_ref()) };
     r?;
     // New lookups re-create both dentries

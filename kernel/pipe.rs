@@ -434,6 +434,11 @@ pub struct Pipe {
     pub wait_queue: WaitQueue,
     /// Number of read end references
     readers: AtomicU32,
+    /// Opens of a FIFO for reading and writing so far (Linux
+    /// r_counter/w_counter): an opener waiting for its partner wakes
+    /// when the other count moves
+    r_counter: AtomicU32,
+    w_counter: AtomicU32,
     /// Number of write end references
     writers: AtomicU32,
 }
@@ -528,6 +533,8 @@ impl Default for Pipe {
             wait_queue: WaitQueue::new(),
             readers: AtomicU32::new(1),
             writers: AtomicU32::new(1),
+            r_counter: AtomicU32::new(0),
+            w_counter: AtomicU32::new(0),
         }
     }
 }
@@ -860,9 +867,198 @@ impl FileOps for PipeWriteFileOps {
 
 use crate::fs::dentry::Dentry;
 
-/// The pipe behind a pipe file
+/// The pipe behind a pipe file or an open FIFO
 pub fn pipe_of(file: &File) -> Result<&Pipe, KernelError> {
-    file.private_ref::<Pipe>().ok_or(KernelError::BadFd)
+    file.private_ref::<Pipe>()
+        .or_else(|| file.private_ref::<FifoFile>().map(|f| &*f.pipe))
+        .ok_or(KernelError::BadFd)
+}
+
+// =============================================================================
+// FIFOs (Linux fs/pipe.c fifo_open)
+// =============================================================================
+
+/// An open FIFO: its inode's pipe, and the write-open count when it was
+/// opened (POLLHUP needs a writer to have come and gone since)
+pub struct FifoFile {
+    pipe: Arc<Pipe>,
+    w_version: u32,
+}
+
+/// File operations of a FIFO: read and write per open mode, like the
+/// two ends of a pipe
+pub struct FifoFileOps;
+
+pub static FIFO_FOPS: FifoFileOps = FifoFileOps;
+
+fn fifo_of(file: &File) -> Result<&FifoFile, KernelError> {
+    file.private_ref::<FifoFile>().ok_or(KernelError::BadFd)
+}
+
+/// Sleep until `counter` moves from `seen` (Linux wait_for_partner)
+fn wait_for_partner(pipe: &Pipe, counter: &AtomicU32, seen: u32) -> Result<(), KernelError> {
+    pipe.wait_queue
+        .wait_event_interruptible(|| counter.load(Ordering::Acquire) != seen)
+}
+
+impl FileOps for FifoFileOps {
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+
+    /// Linux fifo_open: a reader waits for a writer and a writer for a
+    /// reader, unless O_NONBLOCK (a nonblocking writer without readers
+    /// is ENXIO); O_RDWR never waits. The pipe exists while any file
+    /// has the FIFO open; its data goes with the last close.
+    fn open(&self, file: &File) -> Result<(), KernelError> {
+        let inode = file.get_inode().ok_or(KernelError::BadFd)?;
+        let nonblock = file.get_flags() & flags::O_NONBLOCK != 0;
+        let mode = file.get_flags() & flags::O_ACCMODE;
+        let pipe = {
+            let mut slot = inode.i_pipe.lock();
+            let (p, files) = slot.get_or_insert_with(|| {
+                let p = Pipe::new();
+                p.readers.store(0, Ordering::Relaxed);
+                p.writers.store(0, Ordering::Relaxed);
+                (p, 0)
+            });
+            if mode == flags::O_WRONLY && nonblock && !p.has_readers() {
+                if *files == 0 {
+                    *slot = None;
+                }
+                return Err(KernelError::NoDeviceOrAddress);
+            }
+            *files += 1;
+            match mode {
+                flags::O_RDONLY => {
+                    p.readers.fetch_add(1, Ordering::AcqRel);
+                    p.r_counter.fetch_add(1, Ordering::AcqRel);
+                }
+                flags::O_WRONLY => {
+                    p.writers.fetch_add(1, Ordering::AcqRel);
+                    p.w_counter.fetch_add(1, Ordering::AcqRel);
+                }
+                _ => {
+                    p.readers.fetch_add(1, Ordering::AcqRel);
+                    p.writers.fetch_add(1, Ordering::AcqRel);
+                    p.r_counter.fetch_add(1, Ordering::AcqRel);
+                    p.w_counter.fetch_add(1, Ordering::AcqRel);
+                }
+            }
+            // Decided under the slot lock, as every open changes the
+            // counters under it (Linux holds pipe->mutex until it sleeps):
+            // a partner that opens, even and closes, after the unlock moves
+            // the counter this waits on, so the wait ends at once
+            let wait = match mode {
+                flags::O_RDONLY if !nonblock && !p.has_writers() => {
+                    Some((true, p.w_counter.load(Ordering::Acquire)))
+                }
+                flags::O_WRONLY if !p.has_readers() => {
+                    Some((false, p.r_counter.load(Ordering::Acquire)))
+                }
+                _ => None,
+            };
+            // Linux f_version: a nonblocking reader that found no writer
+            // gets POLLHUP only after one comes and goes; any other open
+            // compares against 0, so POLLHUP shows once writers are gone
+            let w_version = if mode == flags::O_RDONLY && nonblock && !p.has_writers() {
+                p.w_counter.load(Ordering::Acquire)
+            } else {
+                0
+            };
+            (p.clone(), wait, w_version)
+        };
+        let (pipe, wait, w_version) = pipe;
+        pipe.wait_queue.wake_all();
+        let waited = match wait {
+            Some((true, seen)) => wait_for_partner(&pipe, &pipe.w_counter, seen),
+            Some((false, seen)) => wait_for_partner(&pipe, &pipe.r_counter, seen),
+            None => Ok(()),
+        };
+        if let Err(e) = waited {
+            // Interrupted: undo this open (release without a file)
+            fifo_put(&inode, &pipe, mode);
+            return Err(e);
+        }
+        file.private
+            .call_once(|| Arc::new(FifoFile { pipe, w_version }));
+        Ok(())
+    }
+
+    fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {
+        if file.get_flags() & flags::O_ACCMODE == flags::O_WRONLY {
+            return Err(KernelError::BadFd);
+        }
+        PIPE_READ_FOPS.read(file, buf)
+    }
+
+    fn write(&self, file: &File, buf: &[u8]) -> Result<usize, KernelError> {
+        if file.get_flags() & flags::O_ACCMODE == flags::O_RDONLY {
+            return Err(KernelError::BadFd);
+        }
+        PIPE_WRITE_FOPS.write(file, buf)
+    }
+
+    fn llseek(&self, _file: &File, _offset: i64, _whence: i32) -> Result<u64, KernelError> {
+        Err(KernelError::IllegalSeek)
+    }
+
+    /// Linux pipe_poll for a FIFO: POLLHUP only once a writer has come
+    /// and gone since this reader opened
+    fn poll(&self, file: &File, pt: Option<&mut PollTable>) -> u16 {
+        let Ok(f) = fifo_of(file) else {
+            return POLLERR;
+        };
+        let pipe = &f.pipe;
+        if let Some(pt) = pt {
+            pt.poll_wait(&pipe.wait_queue);
+        }
+        let mode = file.get_flags() & flags::O_ACCMODE;
+        let mut mask = 0u16;
+        if mode != flags::O_WRONLY {
+            if !pipe.ring_empty() {
+                mask |= POLLIN | POLLRDNORM;
+            }
+            if !pipe.has_writers() && pipe.w_counter.load(Ordering::Acquire) != f.w_version {
+                mask |= POLLHUP;
+            }
+        }
+        if mode != flags::O_RDONLY {
+            if !pipe.ring_full() {
+                mask |= POLLOUT | POLLWRNORM;
+            }
+            if !pipe.has_readers() {
+                mask |= POLLERR;
+            }
+        }
+        mask
+    }
+
+    fn release(&self, file: &File) -> Result<(), KernelError> {
+        let inode = file.get_inode().ok_or(KernelError::BadFd)?;
+        let f = fifo_of(file)?;
+        fifo_put(&inode, &f.pipe, file.get_flags() & flags::O_ACCMODE);
+        Ok(())
+    }
+}
+
+/// Drop one open of a FIFO in `mode`: its reader/writer counts (waking
+/// the other side), and the inode's pipe with the last file; all under
+/// the slot lock, like the open side
+fn fifo_put(inode: &crate::fs::inode::Inode, pipe: &Pipe, mode: u32) {
+    let mut slot = inode.i_pipe.lock();
+    if mode != flags::O_WRONLY {
+        pipe.remove_reader();
+    }
+    if mode != flags::O_RDONLY {
+        pipe.remove_writer();
+    }
+    if let Some((_, files)) = slot.as_mut() {
+        *files -= 1;
+        if *files == 0 {
+            *slot = None;
+        }
+    }
 }
 
 /// Create a pipe and return (read_file, write_file)

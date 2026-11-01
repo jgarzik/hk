@@ -279,6 +279,8 @@ pub const SYS_SETUID: u64 = 146;
 pub const SYS_SETRESUID: u64 = 147;
 pub const SYS_GETRESUID: u64 = 148;
 pub const SYS_SETRESGID: u64 = 149;
+pub const SYS_GETGROUPS: u64 = 158;
+pub const SYS_SETGROUPS: u64 = 159;
 pub const SYS_GETRESGID: u64 = 150;
 pub const SYS_SETFSUID: u64 = 151;
 pub const SYS_SETFSGID: u64 = 152;
@@ -291,6 +293,11 @@ pub const SYS_GETEGID: u64 = 177;
 pub const SYS_GETTID: u64 = 178;
 pub const SYS_CLONE: u64 = 220;
 pub const SYS_EXECVE: u64 = 221;
+pub const SYS_DUP: u64 = 23;
+pub const SYS_GETCWD: u64 = 17;
+pub const SYS_EXECVEAT: u64 = 281;
+pub const SYS_GETTIMEOFDAY: u64 = 169;
+pub const SYS_SETTIMEOFDAY: u64 = 170;
 pub const SYS_WAIT4: u64 = 260;
 pub const SYS_WAITID: u64 = 95;
 pub const SYS_UTIMENSAT: u64 = 88;
@@ -903,6 +910,54 @@ pub fn sys_waitid(idtype: i32, id: u64, infop: *mut SigInfo, options: i32, rusag
 #[inline(always)]
 pub fn sys_execve(pathname: *const u8, argv: *const *const u8, envp: *const *const u8) -> i64 {
     unsafe { syscall3!(SYS_EXECVE, pathname, argv, envp) }
+}
+
+/// getgroups(size, list)
+#[inline(always)]
+pub fn sys_getgroups(size: i32, list: *mut u32) -> i64 {
+    unsafe { syscall2!(SYS_GETGROUPS, size, list) }
+}
+
+/// setgroups(size, list)
+#[inline(always)]
+pub fn sys_setgroups(size: i32, list: *const u32) -> i64 {
+    unsafe { syscall2!(SYS_SETGROUPS, size, list) }
+}
+
+/// dup(oldfd)
+#[inline(always)]
+pub fn sys_dup(oldfd: i32) -> i64 {
+    unsafe { syscall1!(SYS_DUP, oldfd) }
+}
+
+/// getcwd(buf, size)
+#[inline(always)]
+pub fn sys_getcwd(buf: *mut u8, size: usize) -> i64 {
+    unsafe { syscall2!(SYS_GETCWD, buf, size) }
+}
+
+/// execveat(dirfd, pathname, argv, envp, flags)
+#[inline(always)]
+pub fn sys_execveat(
+    dirfd: i32,
+    pathname: *const u8,
+    argv: *const *const u8,
+    envp: *const *const u8,
+    flags: i32,
+) -> i64 {
+    unsafe { syscall5!(SYS_EXECVEAT, dirfd, pathname, argv, envp, flags) }
+}
+
+/// gettimeofday(tv, tz)
+#[inline(always)]
+pub fn sys_gettimeofday(tv: *mut Timeval, tz: *mut u8) -> i64 {
+    unsafe { syscall2!(SYS_GETTIMEOFDAY, tv, tz) }
+}
+
+/// settimeofday(tv, tz)
+#[inline(always)]
+pub fn sys_settimeofday(tv: *const Timeval, tz: *const u8) -> i64 {
+    unsafe { syscall2!(SYS_SETTIMEOFDAY, tv, tz) }
 }
 
 /// readv(fd, iov, iovcnt)

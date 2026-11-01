@@ -149,7 +149,8 @@ fn drop_dac_read_search() -> bool {
     sys_capset(&h, d.as_ptr()) == 0
 }
 
-/// Without CAP_DAC_READ_SEARCH, AT_EMPTY_PATH is ENOENT
+/// Without CAP_DAC_READ_SEARCH, AT_EMPTY_PATH is ENOENT, also with a
+/// non-empty path (Linux 6.8 do_linkat checks the flag, not the path)
 fn empty_nocap() {
     let fd = sys_open(F.as_ptr(), O_RDONLY, 0) as i32;
     let pid = sys_fork();
@@ -158,7 +159,14 @@ fn empty_nocap() {
             sys_exit(2);
         }
         let r = link(fd, b"\0", NAMES[3], EMPTY);
-        sys_exit(if r == ENOENT { 0 } else { 1 });
+        let named = link(AT_FDCWD, F, NAMES[3], EMPTY);
+        sys_exit(if r != ENOENT {
+            1
+        } else if named != ENOENT {
+            3
+        } else {
+            0
+        });
     }
     let mut status = 0;
     sys_wait4(pid, &mut status, 0, 0);

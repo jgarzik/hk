@@ -1,7 +1,7 @@
 //! Address-space lifecycle: /proc/meminfo, and memory handed back when
 //! processes exit or exec (Linux mmput/exit_mmap, exec_mmap)
 
-use super::helpers::{host_mode, print, print_num, println};
+use super::helpers::{host_mode, print, print_num, println, skip};
 use hk_syscall::{
     CLONE_SIGHAND, CLONE_VM, MAP_ANONYMOUS, MAP_FIXED, MAP_PRIVATE, MREMAP_FIXED, MREMAP_MAYMOVE,
     O_RDONLY, P_PID, PROT_NONE, PROT_READ, PROT_WRITE, SigInfo, Timespec, WEXITED, sys_clone,
@@ -57,6 +57,36 @@ fn read_meminfo(buf: &mut [u8]) -> usize {
 /// The line of /proc/meminfo starting with `key` (e.g. b"MemFree:")
 fn line<'a>(text: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
     text.split(|&b| b == b'\n').find(|l| l.starts_with(key))
+}
+
+/// struct sysinfo offsets of totalram and freeram
+pub const SI_TOTALRAM: usize = 32;
+pub const SI_FREERAM: usize = 40;
+
+/// A sysinfo RAM field (SI_TOTALRAM, SI_FREERAM) in bytes, 0 on error
+pub fn sysinfo_ram(off: usize) -> u64 {
+    let mut si = [0u8; 112];
+    if hk_syscall::sys_sysinfo(si.as_mut_ptr()) != 0 {
+        return 0;
+    }
+    let v = u64::from_ne_bytes(si[off..off + 8].try_into().unwrap());
+    let unit = u32::from_ne_bytes(si[104..108].try_into().unwrap()).max(1);
+    v * unit as u64
+}
+
+/// RAM above which tests skip filling all of it
+const EXHAUST_MAX_KB: i64 = 4 << 20;
+
+/// Whether a test that fills all of RAM should run (else it is
+/// skipped): what it checks does not depend on RAM size, its cost
+/// grows with it, and past a few GB its sizing would meet the fd and
+/// address-space limits
+pub fn exhaust_ok(name: &[u8]) -> bool {
+    if meminfo(b"MemTotal:") <= EXHAUST_MAX_KB {
+        return true;
+    }
+    skip(name, b"filling more than 4GB of RAM is too slow");
+    false
 }
 
 /// Value in kB of a /proc/meminfo field, -1 if missing

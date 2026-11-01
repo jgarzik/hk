@@ -19,9 +19,10 @@ sudo apt install build-essential cpio grub-pc-bin grub-common mtools xorriso dos
 # Cross-compiler for aarch64 userspace
 sudo apt install gcc-aarch64-linux-gnu
 
-# Verified .deb downloads (busybox-static for the initramfs, Linux kernels
-# for make check-linux*) and the HTTP test peer of the QEMU network
-sudo apt install curl gpgv xz-utils ubuntu-keyring python3
+# Verified .deb downloads (busybox-static, glibc, bash and coreutils for
+# the initramfs, Linux kernels for make check-linux*), the initramfs
+# library closure (readelf) and the HTTP test peer of the QEMU network
+sudo apt install curl gpgv xz-utils ubuntu-keyring python3 binutils
 ```
 
 ### Rust Components
@@ -96,6 +97,12 @@ with `tools/fetch-deb.sh` (apt for the native architecture, otherwise
 the Ubuntu archive/ports with the InRelease signature and hashes
 checked) and cached under `target/busybox/`; the first build needs
 network access and current apt lists (`sudo apt-get update`).
+`tools/dyn-root.sh` adds dynamically linked programs the same way
+(cached under `target/glibc/`): glibc's dynamic linker at the path the
+programs' PT_INTERP names, bash and a few coreutils programs in
+`/usr/bin`, and their library closure in `/usr/lib/<triplet>`.
+`tools/cpio-test.sh` adds the CPIO_* test entries (an empty file, hard
+links, a FIFO, and an appended second archive with a device node).
 
 The boot tests (hk and `make check-linux*`) attach `target/disk.img` as
 a virtio-blk disk (`-drive ...,snapshot=on`: every boot sees it
@@ -152,7 +159,7 @@ in `~/.cache/hk-linux-check/<arch>/<hash>` (`LINUX_CACHE_DIR`), shared by
 all worktrees; a rerun with the same hash prints `check-linux: cached
 PASS (<arch> <hash>)` and skips the boot. The hash covers the tracked
 and untracked files of `user/`, `Makefile`, `rust-toolchain.toml`,
-`tools/{linux-boot-tester,mkdisk,busybox-root,fetch-deb,qemu-net}.sh`
+`tools/{linux-boot-tester,mkdisk,busybox-root,fetch-deb,qemu-net,cpio-test,dyn-root}.sh`
 and `tools/netpeer/`; the Linux kernel and its config, the initramfs
 tree (paths, modes, link targets, contents), the versions of the tools
 `mkdisk.sh` uses (the image's FAT timestamps differ per build); the
@@ -186,7 +193,7 @@ make run-arm        # aarch64
 ### QEMU Configuration
 
 The default QEMU setup:
-- Memory: 512MB, 4 CPUs (`-smp 4`; `QEMU_SMP=N` overrides, for hk and the Linux reference)
+- Memory: 512MB, 4 CPUs (`QEMU_MEM=SIZE` and `QEMU_SMP=N` override, for hk and the Linux reference; `make check-bigmem` boots x86 with 6GB, RAM above 4GB)
 - Serial output: logged to `target/qemu/serial.log` (x86-64) or `target/qemu/serial_arm.log` (aarch64); `QEMU_LOG_DIR` overrides the directory
 - Display: `-nographic` (console mode)
 - x86-64: Boots from ISO with GRUB
