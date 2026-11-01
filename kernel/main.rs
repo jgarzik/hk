@@ -11,12 +11,14 @@ extern crate alloc;
 
 // Core modules (formerly in core/ subdir)
 pub mod acct;
+pub mod acpi;
 pub mod bus;
 pub mod chardev;
 pub mod completion;
 pub mod console;
 pub mod cpu;
 pub mod cpumask;
+pub mod delay;
 pub mod dma;
 pub mod elf;
 pub mod entry;
@@ -27,6 +29,7 @@ pub mod futex;
 pub mod hrtimer;
 pub mod inotify;
 pub mod io_uring;
+pub mod irq;
 pub mod kcmp;
 pub mod kmem;
 pub mod list;
@@ -688,6 +691,10 @@ fn kmain() -> ! {
         printkln!("SMP: Platform discovery failed (ACPI/device tree)");
     }
 
+    // ACPI mode (Linux acpi_bus_init -> acpi_enable_subsystem), timed by
+    // the timekeeper started above
+    CurrentArch::power_enable();
+
     // Initialize network subsystem (sets up loopback, static IP config)
     crate::net::init();
 
@@ -795,6 +802,9 @@ fn kmain() -> ! {
     if let Some(handle) = bus_manager.find_device::<UsbMscDeviceHandle>() {
         let _ = crate::storage::create_scsi_disk(handle.scsi_host(), 0, 0);
     }
+
+    // Kept for device_shutdown at power-off/restart
+    crate::bus::bus::set_system_buses(bus_manager);
 
     // ========================================================================
     // Phase 5: VFS Initialization

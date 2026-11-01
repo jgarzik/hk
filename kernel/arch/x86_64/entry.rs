@@ -217,6 +217,38 @@ idt_stub!(
     idt_common
 );
 
+// One 16-byte stub per vector 0-255 for the vectors without a stub of
+// their own (Linux irq_entries_start / spurious_entries_start): push -1
+// as orig_ax, then the vector, like `idt_stub!` without an error code.
+// Vector v's stub is at `idt_vector_stubs + 16 * v`.
+core::arch::global_asm!(
+    ".pushsection .text",
+    ".p2align 4",
+    ".globl idt_vector_stubs",
+    "idt_vector_stubs:",
+    ".set hk_vec, 0",
+    ".rept 256",
+    ".p2align 4",
+    "push -1",
+    "push rdi",
+    "mov edi, hk_vec",
+    "jmp {common}",
+    ".set hk_vec, hk_vec + 1",
+    ".endr",
+    ".popsection",
+    common = sym idt_common,
+);
+
+unsafe extern "C" {
+    /// Start of the per-vector stub table (see the `global_asm!` above)
+    pub safe static idt_vector_stubs: [u8; 256 * 16];
+}
+
+/// Address of the catch-all stub for `vector`
+pub fn vector_stub(vector: u8) -> u64 {
+    (&raw const idt_vector_stubs) as u64 + vector as u64 * 16
+}
+
 /// Common IDT entry: interrupts are off (interrupt gates); from user
 /// mode (saved CS RPL 3) the kernel GS base comes first. Stack on entry:
 /// [rdi, orig_ax, ip, cs, flags, sp, ss]; edi = vector.

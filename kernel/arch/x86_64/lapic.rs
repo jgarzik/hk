@@ -15,6 +15,7 @@ const LAPIC_TPR: u32 = 0x080; // Task Priority Register
 const LAPIC_EOI: u32 = 0x0B0; // End of Interrupt
 const LAPIC_SVR: u32 = 0x0F0; // Spurious Interrupt Vector Register
 const LAPIC_ESR: u32 = 0x280; // Error Status Register
+const LAPIC_CMCI_LVT: u32 = 0x2F0; // Corrected machine-check interrupt
 const LAPIC_ICR_LOW: u32 = 0x300; // Interrupt Command Register (bits 0-31)
 const LAPIC_ICR_HIGH: u32 = 0x310; // Interrupt Command Register (bits 32-63)
 const LAPIC_TIMER_LVT: u32 = 0x320; // Timer Local Vector Table entry
@@ -22,6 +23,8 @@ const LAPIC_THERMAL_LVT: u32 = 0x330;
 const LAPIC_PERF_LVT: u32 = 0x340;
 const LAPIC_LINT0_LVT: u32 = 0x350;
 const LAPIC_LINT1_LVT: u32 = 0x360;
+const LAPIC_ERROR_LVT: u32 = 0x370;
+const LAPIC_ISR: u32 = 0x100; // In-Service Register (8 x 32 bits, 0x10 apart)
 const LAPIC_TIMER_INIT: u32 = 0x380; // Timer Initial Count
 const LAPIC_TIMER_CURRENT: u32 = 0x390; // Timer Current Count
 const LAPIC_TIMER_DIV: u32 = 0x3E0; // Timer Divide Configuration
@@ -146,14 +149,30 @@ impl LocalApic {
         self.write(LAPIC_LINT0_LVT, TIMER_MASKED);
         self.write(LAPIC_LINT1_LVT, TIMER_MASKED);
 
-        // Disable performance counter and thermal interrupts
-        if (self.version() >> 16) >= 4 {
+        // Disable performance counter, thermal and corrected
+        // machine-check interrupts: firmware may leave them unmasked on
+        // the BSP, on vectors nothing handles (Linux clear_local_APIC)
+        let maxlvt = self.maxlvt();
+        if maxlvt >= 4 {
             self.write(LAPIC_PERF_LVT, TIMER_MASKED);
         }
-        self.write(LAPIC_THERMAL_LVT, TIMER_MASKED);
+        if maxlvt >= 5 {
+            self.write(LAPIC_THERMAL_LVT, TIMER_MASKED);
+        }
+        if maxlvt >= 6 {
+            self.write(LAPIC_CMCI_LVT, TIMER_MASKED);
+        }
 
-        // Clear any pending errors
+        // APIC errors raise ERROR_APIC_VECTOR (Linux setup_local_APIC
+        // and lapic_setup_esr): clear the ESR, then unmask
         self.write(LAPIC_ESR, 0);
+        self.write(LAPIC_ERROR_LVT, ERROR_APIC_VECTOR as u32);
+        self.write(LAPIC_ESR, 0);
+    }
+
+    /// Index of the highest LVT entry (Linux lapic_get_maxlvt)
+    fn maxlvt(&self) -> u32 {
+        (self.version() >> 16) & 0xFF
     }
 
     /// Wait for IPI delivery to complete
@@ -327,6 +346,34 @@ pub fn eoi() {
             core::ptr::write_volatile(addr, 0);
         }
     }
+}
+
+/// Vector of the LVT Error entry (Linux ERROR_APIC_VECTOR)
+pub const ERROR_APIC_VECTOR: u8 = 0xfe;
+
+/// Vector the LAPIC delivers for a spurious interrupt (SVR; Linux
+/// SPURIOUS_APIC_VECTOR)
+pub const SPURIOUS_APIC_VECTOR: u8 = SVR_SPURIOUS_VECTOR as u8;
+
+/// Latch and read this CPU's Error Status Register (the write latches
+/// the errors seen since the last one); 0 before the LAPIC is mapped
+pub fn read_esr() -> u32 {
+    if LAPIC_BASE.load(Ordering::Relaxed) == 0 {
+        return 0;
+    }
+    let lapic = LocalApic::get();
+    lapic.write(LAPIC_ESR, 0);
+    lapic.read(LAPIC_ESR)
+}
+
+/// `vector` is in service on this CPU (its ISR bit is set); false
+/// before the LAPIC is mapped (a stray vector then is only reported)
+pub fn in_service(vector: u8) -> bool {
+    if LAPIC_BASE.load(Ordering::Relaxed) == 0 {
+        return false;
+    }
+    let reg = LAPIC_ISR + ((vector as u32) >> 5) * 0x10;
+    LocalApic::get().read(reg) & (1 << (vector & 0x1f)) != 0
 }
 
 /// Get the current CPU's APIC ID

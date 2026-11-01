@@ -91,8 +91,8 @@ pub struct SchedEntity {
     pub deadline: AtomicU64,
     /// Fair: lag saved when it left its run queue (Linux se->vlag)
     pub vlag: AtomicI64,
-    /// Fair: when it last started running or was charged (monotonic ns;
-    /// 0 while not running)
+    /// Fair and rt: when it last started running or was charged
+    /// (monotonic ns; 0 before it first runs)
     pub exec_start: AtomicU64,
     /// Its slice ran out: requeued at the tail, not the head
     requeue_tail: AtomicBool,
@@ -392,10 +392,18 @@ impl<A: Adapter> ClassQueues<A> {
         }
     }
 
-    /// Remove and return the next stop or rt task (Linux pick_next_task
-    /// down to the rt class); the fair one is EEVDF's to choose
-    pub fn pop_stop_rt(&mut self) -> Option<*const A::Item> {
-        self.stop.pop_front().or_else(|| self.rt.pop())
+    /// Remove and return the next stop task, or rt task if `rt` (Linux
+    /// pick_next_task down to the rt class); the fair one is EEVDF's to
+    /// choose
+    pub fn pop_stop_rt(&mut self, rt: bool) -> Option<*const A::Item> {
+        self.stop
+            .pop_front()
+            .or_else(|| if rt { self.rt.pop() } else { None })
+    }
+
+    /// rt tasks are queued
+    pub fn has_rt(&self) -> bool {
+        !self.rt.is_empty()
     }
 
     /// The queued fair tasks

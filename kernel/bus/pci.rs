@@ -18,13 +18,6 @@ use crate::printkln;
 use super::bus::{Bus, BusContext, BusDevice, BusDriver};
 use super::driver::{Device, DriverError};
 
-/// PCI configuration address port (x86 port I/O)
-#[cfg(target_arch = "x86_64")]
-const PCI_CONFIG_ADDR: u16 = 0x0CF8;
-/// PCI configuration data port (x86 port I/O)
-#[cfg(target_arch = "x86_64")]
-const PCI_CONFIG_DATA: u16 = 0x0CFC;
-
 // ============================================================================
 // PCI BAR Allocator (for platforms without firmware BAR assignment)
 // ============================================================================
@@ -133,6 +126,8 @@ mod offset {
     pub const BAR3: u8 = 0x1C;
     pub const BAR4: u8 = 0x20;
     pub const BAR5: u8 = 0x24;
+    pub const SUBSYSTEM_VENDOR_ID: u8 = 0x2C;
+    pub const SUBSYSTEM_ID: u8 = 0x2E;
     pub const CAPABILITY_LIST: u8 = 0x34;
     pub const INTERRUPT_LINE: u8 = 0x3C;
     pub const INTERRUPT_PIN: u8 = 0x3D;
@@ -146,6 +141,7 @@ mod status {
 
 /// PCI capability IDs (Linux PCI_CAP_ID_*)
 pub mod cap_id {
+    pub const PM: u8 = 0x01;
     pub const VNDR: u8 = 0x09;
     pub const MSIX: u8 = 0x11;
 }
@@ -229,7 +225,10 @@ pub trait PciConfigAccess: Send + Sync {
         ((val >> ((offset & 3) * 8)) & 0xFF) as u8
     }
 
-    /// Write 16-bit value (default: read-modify-write)
+    /// Write 16-bit value (default: read-modify-write of the dword, for
+    /// test doubles; real accessors write just the word, since a dword
+    /// write would also write back the neighbour's write-1-to-clear bits,
+    /// e.g. STATUS when writing COMMAND)
     fn write16(&self, bus: u8, dev: u8, func: u8, offset: u8, val: u16) {
         let shift = (offset & 2) * 8;
         let mask = !(0xFFFF << shift);
@@ -237,39 +236,14 @@ pub trait PciConfigAccess: Send + Sync {
         let new = (old & mask) | ((val as u32) << shift);
         self.write32(bus, dev, func, offset & 0xFC, new);
     }
-}
 
-/// Port I/O based PCI config access (x86 legacy)
-///
-/// Uses CF8/CFC port I/O mechanism for PCI configuration space access.
-#[cfg(target_arch = "x86_64")]
-pub struct PortIoConfigAccess;
-
-#[cfg(target_arch = "x86_64")]
-impl PortIoConfigAccess {
-    /// Encode BDF + offset into config address
-    #[inline]
-    fn encode_addr(bus: u8, dev: u8, func: u8, offset: u8) -> u32 {
-        0x8000_0000
-            | ((bus as u32) << 16)
-            | ((dev as u32) << 11)
-            | ((func as u32) << 8)
-            | ((offset as u32) & 0xFC)
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-impl PciConfigAccess for PortIoConfigAccess {
-    fn read32(&self, bus: u8, dev: u8, func: u8, offset: u8) -> u32 {
-        use crate::arch::{inl, outl};
-        outl(PCI_CONFIG_ADDR, Self::encode_addr(bus, dev, func, offset));
-        inl(PCI_CONFIG_DATA)
-    }
-
-    fn write32(&self, bus: u8, dev: u8, func: u8, offset: u8, val: u32) {
-        use crate::arch::outl;
-        outl(PCI_CONFIG_ADDR, Self::encode_addr(bus, dev, func, offset));
-        outl(PCI_CONFIG_DATA, val);
+    /// Write 8-bit value (default: read-modify-write, as `write16`)
+    fn write8(&self, bus: u8, dev: u8, func: u8, offset: u8, val: u8) {
+        let shift = (offset & 3) * 8;
+        let mask = !(0xFF << shift);
+        let old = self.read32(bus, dev, func, offset & 0xFC);
+        let new = (old & mask) | ((val as u32) << shift);
+        self.write32(bus, dev, func, offset & 0xFC, new);
     }
 }
 
@@ -313,6 +287,26 @@ impl PciConfigAccess for EcamConfigAccess {
         let addr = unsafe { self.base.add(Self::offset(bus, dev, func, offset)) };
         unsafe { core::ptr::write_volatile(addr as *mut u32, val) }
     }
+
+    fn read16(&self, bus: u8, dev: u8, func: u8, offset: u8) -> u16 {
+        let addr = unsafe { self.base.add(Self::offset(bus, dev, func, offset & 0xFE)) };
+        unsafe { core::ptr::read_volatile(addr as *const u16) }
+    }
+
+    fn read8(&self, bus: u8, dev: u8, func: u8, offset: u8) -> u8 {
+        let addr = unsafe { self.base.add(Self::offset(bus, dev, func, offset)) };
+        unsafe { core::ptr::read_volatile(addr) }
+    }
+
+    fn write16(&self, bus: u8, dev: u8, func: u8, offset: u8, val: u16) {
+        let addr = unsafe { self.base.add(Self::offset(bus, dev, func, offset & 0xFE)) };
+        unsafe { core::ptr::write_volatile(addr as *mut u16, val) }
+    }
+
+    fn write8(&self, bus: u8, dev: u8, func: u8, offset: u8, val: u8) {
+        let addr = unsafe { self.base.add(Self::offset(bus, dev, func, offset)) };
+        unsafe { core::ptr::write_volatile(addr, val) }
+    }
 }
 
 // ============================================================================
@@ -325,8 +319,7 @@ static PCI_CONFIG: Once<&'static dyn PciConfigAccess> = Once::new();
 /// Initialize PCI config access with port I/O (x86 legacy)
 #[cfg(target_arch = "x86_64")]
 pub fn init_port_io() {
-    static ACCESSOR: PortIoConfigAccess = PortIoConfigAccess;
-    PCI_CONFIG.call_once(|| &ACCESSOR);
+    PCI_CONFIG.call_once(|| &crate::arch::x86_64::pci_conf::PORT_IO);
 }
 
 /// Initialize PCI config access with ECAM (memory-mapped)
@@ -381,6 +374,11 @@ pub fn pci_read8(bus: u8, dev: u8, func: u8, offset: u8) -> u8 {
     config().read8(bus, dev, func, offset)
 }
 
+/// Write 8-bit value to PCI configuration space
+pub fn pci_write8(bus: u8, dev: u8, func: u8, offset: u8, val: u8) {
+    config().write8(bus, dev, func, offset, val)
+}
+
 /// PCI device header (Type 0 - standard)
 #[derive(Debug, Clone)]
 pub struct PciDeviceHeader {
@@ -399,11 +397,23 @@ pub struct PciDeviceHeader {
     pub bar: [u32; 6],
     pub interrupt_line: u8,
     pub interrupt_pin: u8,
+    /// Subsystem vendor and device (type 0 headers; 0 otherwise): the
+    /// board, for quirks keyed on it
+    pub subsystem_vendor_id: u16,
+    pub subsystem_id: u16,
 }
 
 impl PciDeviceHeader {
     /// Read header from PCI configuration space
     pub fn read(bus: u8, dev: u8, func: u8) -> Self {
+        let type0 = pci_read8(bus, dev, func, offset::HEADER_TYPE) & 0x7F == 0;
+        let subsys = |off| {
+            if type0 {
+                pci_read16(bus, dev, func, off)
+            } else {
+                0
+            }
+        };
         Self {
             vendor_id: pci_read16(bus, dev, func, offset::VENDOR_ID),
             device_id: pci_read16(bus, dev, func, offset::DEVICE_ID),
@@ -427,6 +437,8 @@ impl PciDeviceHeader {
             ],
             interrupt_line: pci_read8(bus, dev, func, offset::INTERRUPT_LINE),
             interrupt_pin: pci_read8(bus, dev, func, offset::INTERRUPT_PIN),
+            subsystem_vendor_id: subsys(offset::SUBSYSTEM_VENDOR_ID),
+            subsystem_id: subsys(offset::SUBSYSTEM_ID),
         }
     }
 
@@ -441,6 +453,16 @@ impl PciDeviceHeader {
     }
 }
 
+/// A BAR's size from the mask read back after writing all ones (`lo`,
+/// and `hi` for the upper half of a 64-bit BAR, else 0): the lowest
+/// address bit that sticks (Linux pci_size). Upper address bits may be
+/// hardwired to zero, so the size is not the mask's complement.
+fn bar_size_from_mask(io: bool, lo: u32, hi: u32) -> u64 {
+    let lo = if io { lo & !0x3 } else { lo & !0xF };
+    let mask = (hi as u64) << 32 | lo as u64;
+    mask.isolate_lowest_one()
+}
+
 /// Represents a discovered PCI device
 #[derive(Debug, Clone)]
 pub struct PciDevice {
@@ -450,6 +472,9 @@ pub struct PciDevice {
     pub header: PciDeviceHeader,
     /// DMA configuration (addressing masks)
     pub dma_config: DmaConfig,
+    /// BAR sizes in bytes, probed once at scan (0: unused, or the upper
+    /// half of a 64-bit BAR)
+    bar_sizes: [u64; 6],
 }
 
 impl PciDevice {
@@ -460,13 +485,63 @@ impl PciDevice {
             return None;
         }
 
-        Some(Self {
+        let mut dev = Self {
             bus,
             device,
             function,
             header: PciDeviceHeader::read(bus, device, function),
             dma_config: DmaConfig::default(), // 32-bit DMA by default
-        })
+            bar_sizes: [0; 6],
+        };
+        dev.size_bars();
+        Some(dev)
+    }
+
+    /// Probe every BAR's size, once, with decoding off (Linux
+    /// __pci_read_base): writing all ones to a live BAR moves the device
+    /// for the moment, under its driver - or under firmware still using
+    /// it (USB legacy emulation in SMM). Host bridges keep decoding
+    /// (Linux mmio_always_on).
+    fn size_bars(&mut self) {
+        let nbars = match self.header.header_type_number() {
+            0 => 6,
+            1 => 2,
+            _ => return,
+        };
+        let host_bridge = self.class24() >> 8 == 0x0600;
+        let cmd = self.cfg_read16(offset::COMMAND);
+        let decode = command::IO_SPACE | command::MEMORY_SPACE;
+        if !host_bridge && cmd & decode != 0 {
+            self.cfg_write16(offset::COMMAND, cmd & !decode);
+        }
+        let mut i = 0;
+        while i < nbars {
+            let wide = self.bar_is_64bit(i) && i + 1 < nbars;
+            self.bar_sizes[i] = self.probe_bar(i, wide);
+            i += if wide { 2 } else { 1 };
+        }
+        if !host_bridge && cmd & decode != 0 {
+            self.cfg_write16(offset::COMMAND, cmd);
+        }
+    }
+
+    /// Size BAR `i` (and `i + 1` as its upper half if `wide`): write all
+    /// ones, read the mask back, restore
+    fn probe_bar(&self, i: usize, wide: bool) -> u64 {
+        let size_of = |off: u8| {
+            let orig = self.cfg_read32(off);
+            self.cfg_write32(off, 0xFFFF_FFFF);
+            let mask = self.cfg_read32(off);
+            self.cfg_write32(off, orig);
+            (orig, mask)
+        };
+        let off = offset::BAR0 + i as u8 * 4;
+        let (orig, lo) = size_of(off);
+        if lo == 0 || lo == 0xFFFF_FFFF {
+            return 0;
+        }
+        let hi = if wide { size_of(off + 4).1 } else { 0 };
+        bar_size_from_mask(orig & 1 != 0, lo, hi)
     }
 
     /// Set the DMA mask for streaming DMA mappings
@@ -536,43 +611,9 @@ impl PciDevice {
         (self.header.bar[bar_index] & 1) == 0
     }
 
-    /// Get BAR size by writing all 1s and reading back
+    /// Size of BAR `bar_index` in bytes, as probed at scan (0: none)
     pub fn bar_size(&self, bar_index: usize) -> u64 {
-        if bar_index >= 6 {
-            return 0;
-        }
-
-        let bar_offset = offset::BAR0 + (bar_index as u8 * 4);
-
-        // Save original value
-        let original = pci_read32(self.bus, self.device, self.function, bar_offset);
-
-        // Write all 1s
-        pci_write32(
-            self.bus,
-            self.device,
-            self.function,
-            bar_offset,
-            0xFFFF_FFFF,
-        );
-
-        // Read back and restore
-        let size_mask = pci_read32(self.bus, self.device, self.function, bar_offset);
-        pci_write32(self.bus, self.device, self.function, bar_offset, original);
-
-        if size_mask == 0 {
-            return 0;
-        }
-
-        // For memory BARs, mask out type bits
-        let size_mask = if (original & 1) == 0 {
-            size_mask & !0xF
-        } else {
-            size_mask & !0x3
-        };
-
-        // Size is (~mask) + 1
-        ((!size_mask) as u64) + 1
+        self.bar_sizes.get(bar_index).copied().unwrap_or(0)
     }
 
     /// Check if a BAR is a 64-bit BAR
@@ -712,6 +753,45 @@ impl PciDevice {
     /// Read a config space dword of this function
     pub fn cfg_read32(&self, off: u8) -> u32 {
         pci_read32(self.bus, self.device, self.function, off)
+    }
+
+    /// Write a config space byte of this function
+    pub fn cfg_write8(&self, off: u8, val: u8) {
+        pci_write8(self.bus, self.device, self.function, off, val)
+    }
+
+    /// Write a config space word of this function
+    pub fn cfg_write16(&self, off: u8, val: u16) {
+        pci_write16(self.bus, self.device, self.function, off, val)
+    }
+
+    /// Write a config space dword of this function
+    pub fn cfg_write32(&self, off: u8, val: u32) {
+        pci_write32(self.bus, self.device, self.function, off, val)
+    }
+
+    /// Class code, subclass and programming interface as one 24-bit value
+    /// (Linux pci_dev.class)
+    pub fn class24(&self) -> u32 {
+        (self.header.class_code as u32) << 16
+            | (self.header.subclass as u32) << 8
+            | self.header.prog_if as u32
+    }
+
+    /// Put the function in D3hot, if it has power management (Linux
+    /// pci_set_power_state(PCI_D3hot) for a shutdown): PMCSR power state
+    /// 3, then the 10 ms the spec allows before the next access
+    pub fn set_power_d3hot(&self) {
+        // PMCSR: power state in bits 1:0; PME_Status (bit 15) is
+        // write-1-to-clear, keep it out of the write
+        const PMCSR: u8 = 4;
+        const PME_STATUS: u16 = 1 << 15;
+        let Some((pm, _)) = self.caps().find(|&(_, id)| id == cap_id::PM) else {
+            return;
+        };
+        let csr = self.cfg_read16(pm + PMCSR);
+        self.cfg_write16(pm + PMCSR, (csr & !(PME_STATUS | 3)) | 3);
+        crate::delay::mdelay(10);
     }
 
     /// The capability list: (offset, ID) pairs (Linux pci_find_capability)
@@ -907,6 +987,10 @@ impl Bus for PciBus {
         "pci"
     }
 
+    fn probed_devices(&self) -> &[Box<dyn Device>] {
+        &self.probed_devices
+    }
+
     fn register_driver(&mut self, driver: Box<dyn BusDriver>) {
         printkln!("PCI: Registered driver '{}'", driver.name());
         self.drivers.push(driver);
@@ -985,6 +1069,10 @@ impl Bus for PciBus {
             // Enable memory space access (needed for newly assigned BARs)
             device.enable_memory_space();
         }
+
+        // Firmware hand-offs and chipset fixups, before any driver
+        // touches a device (Linux FIXUP_FINAL, pci_bus_add_device)
+        super::quirks::fixup_final(&self.devices);
 
         // Match devices to drivers and probe
         for device in &self.devices {
@@ -1137,5 +1225,26 @@ mod tests {
         // An all-ones read (device gone) ends the walk
         let gone = [0xFFu8; 256];
         assert!(walk(&gone, 0x40).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod bar_size_tests {
+    use super::bar_size_from_mask;
+
+    #[test]
+    fn bar_size_masks() {
+        // 16 KiB 32-bit memory BAR, prefetchable bit set
+        assert_eq!(bar_size_from_mask(false, 0xFFFF_C008, 0), 0x4000);
+        // 64-bit BAR decoding only 40 address bits (upper bits hardwired 0)
+        assert_eq!(bar_size_from_mask(false, 0xFFFF_C00C, 0x0000_00FF), 0x4000);
+        // 8 GiB 64-bit BAR
+        assert_eq!(
+            bar_size_from_mask(false, 0x0000_000C, 0xFFFF_FFFE),
+            0x2_0000_0000
+        );
+        // 32-byte I/O BAR whose upper 16 bits read 0
+        assert_eq!(bar_size_from_mask(true, 0x0000_FFE1, 0), 0x20);
+        assert_eq!(bar_size_from_mask(false, 0, 0), 0);
     }
 }

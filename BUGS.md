@@ -402,6 +402,59 @@ atomics. No such workaround exists in this tree: since the first commit
 fields, and the USB vfat boot tests (both arches) pass on them. Kept
 only as a pointer if wrong USB slot/endpoint values ever show up again.
 
+## xHCI driver gaps on real hardware
+
+**Location**: `kernel/usb/xhci.rs`, `kernel/usb/msc.rs`
+
+Found while chasing the Dell OptiPlex 3020 freeze; QEMU's xHCI hides
+all of them.
+- Command completions are not matched to their TRB (`wait_for_command`
+  ignores `_trb_addr`), and transfer events only by slot and endpoint:
+  a late completion for a timed-out command or transfer is credited to
+  the next one (most likely on the USB serial console, whose transfers
+  time out after 100 ms). A timeout should stop the endpoint and move
+  its dequeue pointer past the TRB (Linux xhci_handle_cmd_stop_ep).
+- One controller only: the driver keeps a single global
+  `USB_CONTROLLER`; a second xHCI's probe replaces the first, which is
+  left running, and both device handles act on the survivor at
+  shutdown.
+- A timed-out bulk transfer returns early (`do_bulk_out`/`do_bulk_in`
+  via `?`) without `dma_unmap` and with its TRB still queued; the
+  buffer (heap, freed by the caller) can still be written by the
+  controller.
+- Enumeration reads no descriptors and sends no SET_CONFIGURATION
+  (`control_transfer` is a stub); devices get class 0 and no
+  interfaces. No hub support (route string 0).
+- `UsbMscBusDriver::matches` accepts any device and assumes QEMU's
+  endpoints (0x81/0x02); `main.rs` makes `sda` of the first one.
+- Only 4 KiB controller pages and up to 512 scratchpad buffers.
+
+## x86 has no IOAPIC or MSI
+
+**Location**: `kernel/arch/x86_64/irq.rs`, `kernel/bus/pci.rs`
+
+Device interrupts reach the CPUs only through the 8259 PIC, on the
+line firmware wrote into each function's Interrupt Line register (PIC
+mode, legacy BIOS boot), delivered to the boot CPU only. Real hardware
+in APIC mode (UEFI boot; Linux on the Dell uses IOAPIC 16-23 and MSI)
+needs IOAPIC with ACPI `_PRT` routing, or MSI/MSI-X, which xHCI, AHCI
+and r8169 all support.
+
+## ACPI power management gaps
+
+**Location**: `kernel/acpi/`, `kernel/arch/x86_64/{acpi,power}.rs`
+
+hk has no AML interpreter: `\_S5` is found by a byte scan of the DSDT
+and SSDTs for a plain `Name (_S5, Package ...)`: one returned by a
+method is missed (SLP_TYP 0 is used, with a warning), and one inside
+an `If` is taken whatever the condition. `_PTS` and `_TTS` are not evaluated before S5, which some
+firmware needs to power off cleanly. There is no SCI handler: IRQ 9
+stays masked and every fixed event and GPE is disabled at boot, so
+ACPI power-button, lid and GPE events are not handled (once in ACPI
+mode, a short power-button press does nothing). Only the 32-bit FADT
+block fields are read (no X_ GAS forms, no hardware-reduced ACPI), and
+a reset register in PCI configuration space is ignored.
+
 ## Block layer gaps (P1)
 
 **Location**: `kernel/storage/`, `kernel/virtio/blk.rs`,

@@ -1539,6 +1539,13 @@ pub fn sys_setdomainname(name: *const u8, len: u64) -> i64 {
     unsafe { syscall2!(SYS_SETDOMAINNAME, name, len) }
 }
 
+/// reboot(2) that returns its result (the error cases: bad magic,
+/// unknown command, no CAP_SYS_BOOT)
+#[inline(always)]
+pub fn sys_reboot_ret(magic1: u64, magic2: u64, cmd: u64) -> i64 {
+    unsafe { syscall3!(SYS_REBOOT, magic1, magic2, cmd) }
+}
+
 #[inline(always)]
 pub fn sys_reboot(magic1: u64, magic2: u64, cmd: u64) -> ! {
     unsafe { syscall3!(SYS_REBOOT, magic1, magic2, cmd) };

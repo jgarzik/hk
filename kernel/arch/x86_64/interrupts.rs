@@ -3,7 +3,7 @@
 //! Sets up the IDT with exception handlers and IRQ handlers.
 
 use ::core::mem::size_of;
-use ::core::sync::atomic::Ordering;
+use ::core::sync::atomic::{AtomicU64, Ordering};
 
 use super::PtRegs;
 use super::cpu::KERNEL_CODE_SELECTOR;
@@ -13,6 +13,7 @@ use super::pic;
 use crate::mm::fault::{Access, VmFault};
 use crate::signal::{KSigInfo, si_code};
 use crate::uaccess::pagefault_disabled;
+use crate::{printk, printkln};
 
 /// LAPIC timer interrupt vector
 pub const LAPIC_TIMER_VECTOR: u8 = 0x40;
@@ -242,6 +243,19 @@ pub fn init_idt() {
             .set_handler(entry::call_function_ipi as *const () as u64, GATE_INTERRUPT);
         IDT[RESCHEDULE_VECTOR as usize]
             .set_handler(entry::reschedule_ipi as *const () as u64, GATE_INTERRUPT);
+
+        // Every other vector gets a catch-all stub (Linux idt_setup_apic_
+        // and_irq_gates: spurious_entries_start), so a stray interrupt (the
+        // LAPIC spurious vector, APIC errors, a vector left programmed by
+        // firmware) is reported instead of raising #NP. Not #VC/#SX
+        // (29, 30): they push an error code and hk never enables them.
+        let idt = &raw mut IDT;
+        for v in 0..IDT_ENTRIES {
+            let gate = &mut (*idt)[v];
+            if gate.type_attr == 0 && !matches!(v, 29 | 30) {
+                gate.set_handler(entry::vector_stub(v as u8), GATE_INTERRUPT);
+            }
+        }
     }
     load_idt();
 }
@@ -285,7 +299,8 @@ pub extern "C" fn idt_dispatch(regs: &mut PtRegs, vector: u64) {
         v if v == LAPIC_TIMER_VECTOR as u64 => handle_lapic_timer(),
         v if v == CALL_FUNCTION_VECTOR as u64 => handle_call_function(),
         v if v == RESCHEDULE_VECTOR as u64 => handle_reschedule(),
-        _ => {}
+        v if v == lapic::ERROR_APIC_VECTOR as u64 => in_irq(handle_apic_error),
+        v => in_irq(|| handle_spurious(v as u8)),
     }
     // Back to user mode: its pending work first (Linux
     // irqentry_exit_to_user_mode); not for NMI, #DF, #MC (paranoid)
@@ -457,165 +472,116 @@ fn handle_exception(frame: &mut PtRegs, vector: u64) {
         );
     }
 
-    // Cast to u8 for the rest of the handler
-    let vector = vector as u8;
+    die(frame, vector as u8, error_code, cr2)
+}
 
-    // Direct serial output for debugging
-    serial_print(b"\r\n========================================\r\n");
-    serial_print(b"!!! CPU EXCEPTION !!!\r\n");
-    serial_print(b"========================================\r\n");
-
-    // Print exception name if known
-    if vector < 32 {
-        serial_print(b"Exception: ");
-        serial_print(EXCEPTION_NAMES[vector as usize].as_bytes());
-        serial_print(b" (#");
-        print_dec(vector as u64);
-        serial_print(b")\r\n");
-    }
-
-    // Print CPU ID if available
-    if let Some(cpu) = super::percpu::try_current_cpu() {
-        serial_print(b"CPU: ");
-        print_dec(cpu.cpu_id as u64);
-        serial_print(b"\r\n");
-    }
-
-    serial_print(b"\r\nRegisters:\r\n");
-    serial_print(b"  RAX: 0x");
-    print_hex(frame.rax);
-    serial_print(b"  RBX: 0x");
-    print_hex(frame.rbx);
-    serial_print(b"\r\n");
-    serial_print(b"  RCX: 0x");
-    print_hex(frame.rcx);
-    serial_print(b"  RDX: 0x");
-    print_hex(frame.rdx);
-    serial_print(b"\r\n");
-    serial_print(b"  RSI: 0x");
-    print_hex(frame.rsi);
-    serial_print(b"  RDI: 0x");
-    print_hex(frame.rdi);
-    serial_print(b"\r\n");
-    serial_print(b"  RBP: 0x");
-    print_hex(frame.rbp);
-    serial_print(b"  RSP: 0x");
-    print_hex(frame.rsp);
-    serial_print(b"\r\n");
-    serial_print(b"  R8:  0x");
-    print_hex(frame.r8);
-    serial_print(b"  R9:  0x");
-    print_hex(frame.r9);
-    serial_print(b"\r\n");
-    serial_print(b"  R10: 0x");
-    print_hex(frame.r10);
-    serial_print(b"  R11: 0x");
-    print_hex(frame.r11);
-    serial_print(b"\r\n");
-    serial_print(b"  R12: 0x");
-    print_hex(frame.r12);
-    serial_print(b"  R13: 0x");
-    print_hex(frame.r13);
-    serial_print(b"\r\n");
-    serial_print(b"  R14: 0x");
-    print_hex(frame.r14);
-    serial_print(b"  R15: 0x");
-    print_hex(frame.r15);
-    serial_print(b"\r\n");
-    serial_print(b"  RIP: 0x");
-    print_hex(frame.rip);
-    serial_print(b"  CS:  0x");
-    print_hex(frame.cs);
-    serial_print(b"\r\n");
-    serial_print(b"  RFLAGS: 0x");
-    print_hex(frame.rflags);
-    serial_print(b"  SS:  0x");
-    print_hex(frame.ss);
-    serial_print(b"\r\n");
-    serial_print(b"  Error Code: 0x");
-    print_hex(error_code);
-    serial_print(b"\r\n");
-
-    // Print CR2 for page faults
+/// A fatal kernel-mode exception (Linux die + "Fatal exception"
+/// panic): dump the faulting context through printk, so it reaches
+/// every console (VGA on machines without a serial port), then panic
+fn die(frame: &PtRegs, vector: u8, error_code: u64, cr2: u64) -> ! {
+    crate::printk::set_oops_in_progress();
+    let name = EXCEPTION_NAMES.get(vector as usize).copied().unwrap_or("?");
+    let cpu = crate::cpu::try_this_id().map_or(-1, |c| c as i64);
+    printkln!(
+        "Oops: {} (#{}) error {:#x} CPU {} tid {}",
+        name,
+        vector,
+        error_code,
+        cpu,
+        crate::task::percpu::current_tid()
+    );
+    printkln!(
+        "RIP: {:#018x} CS: {:#x} RFLAGS: {:#x}",
+        frame.rip,
+        frame.cs,
+        frame.rflags
+    );
+    printkln!(
+        "RSP: {:#018x} SS: {:#x} CR2: {:#018x}",
+        frame.rsp,
+        frame.ss,
+        cr2
+    );
+    printkln!(
+        "RAX: {:#018x} RBX: {:#018x} RCX: {:#018x}",
+        frame.rax,
+        frame.rbx,
+        frame.rcx
+    );
+    printkln!(
+        "RDX: {:#018x} RSI: {:#018x} RDI: {:#018x}",
+        frame.rdx,
+        frame.rsi,
+        frame.rdi
+    );
+    printkln!(
+        "RBP: {:#018x} R08: {:#018x} R09: {:#018x}",
+        frame.rbp,
+        frame.r8,
+        frame.r9
+    );
+    printkln!(
+        "R10: {:#018x} R11: {:#018x} R12: {:#018x}",
+        frame.r10,
+        frame.r11,
+        frame.r12
+    );
+    printkln!(
+        "R13: {:#018x} R14: {:#018x} R15: {:#018x}",
+        frame.r13,
+        frame.r14,
+        frame.r15
+    );
     if vector == 14 {
-        serial_print(b"  CR2 (fault addr): 0x");
-        print_hex(cr2);
-        serial_print(b"\r\n");
-
-        // Decode page fault error code
-        serial_print(b"  Page Fault: ");
-        if error_code & 1 == 0 {
-            serial_print(b"non-present ");
-        } else {
-            serial_print(b"protection ");
-        }
-        if error_code & 2 != 0 {
-            serial_print(b"write ");
-        } else {
-            serial_print(b"read ");
-        }
-        if error_code & 4 != 0 {
-            serial_print(b"user ");
-        } else {
-            serial_print(b"kernel ");
-        }
-        if error_code & 8 != 0 {
-            serial_print(b"reserved-bit ");
-        }
-        if error_code & 16 != 0 {
-            serial_print(b"instruction-fetch ");
-        }
-        serial_print(b"\r\n");
+        printkln!(
+            "#PF: {} {} {}{}{}",
+            if error_code & 1 == 0 {
+                "not-present"
+            } else {
+                "protection"
+            },
+            if error_code & 2 != 0 { "write" } else { "read" },
+            if error_code & 4 != 0 {
+                "user"
+            } else {
+                "kernel"
+            },
+            if error_code & 8 != 0 {
+                " reserved-bit"
+            } else {
+                ""
+            },
+            if error_code & 16 != 0 { " ifetch" } else { "" }
+        );
     }
+    oops_backtrace(frame);
+    panic!("Fatal exception: {} at RIP={:#x}", name, frame.rip);
+}
 
-    // Stack backtrace
-    serial_print(b"\r\nStack backtrace:\r\n");
-    let mut frame_ptr = frame.rbp;
-    let mut frame_count = 0;
-    const MAX_FRAMES: usize = 16;
-
-    while frame_ptr != 0 && frame_count < MAX_FRAMES {
-        // Only follow frame pointers on the faulting kernel stack: RBP may
-        // hold a user value (no frame pointers, or a user-mode fault), and
-        // dereferencing it here would fault again under SMAP.
-        if frame.cs & 3 != 0 || !(frame.rsp..frame.rsp.saturating_add(0x10000)).contains(&frame_ptr)
-        {
+/// Frame-pointer backtrace of the faulting kernel stack
+fn oops_backtrace(frame: &PtRegs) {
+    // Only follow frame pointers on the faulting kernel stack: RBP may
+    // hold a user value (no frame pointers, or a user-mode fault), and
+    // dereferencing it here would fault again under SMAP
+    if frame.cs & 3 != 0 {
+        return;
+    }
+    let stack = frame.rsp..frame.rsp.saturating_add(0x10000);
+    let mut fp = frame.rbp;
+    for depth in 0..16 {
+        if fp == 0 || !stack.contains(&fp) {
             break;
         }
-
-        // Read return address (stored at frame_ptr + 8)
-        let return_addr = unsafe { *((frame_ptr + 8) as *const u64) };
-        if return_addr == 0 {
+        // SAFETY: fp lies within the faulting kernel stack
+        let (prev, ret) = unsafe { (*(fp as *const u64), *((fp + 8) as *const u64)) };
+        if ret == 0 {
             break;
         }
-
-        serial_print(b"  #");
-        print_dec(frame_count as u64);
-        serial_print(b": 0x");
-        print_hex(return_addr);
-        serial_print(b"\r\n");
-
-        // Move to previous frame
-        let prev_frame = unsafe { *(frame_ptr as *const u64) };
-        if prev_frame <= frame_ptr {
+        printkln!("  #{}: {:#018x}", depth, ret);
+        if prev <= fp {
             break;
         }
-        frame_ptr = prev_frame;
-        frame_count += 1;
-    }
-
-    if frame_count == 0 {
-        serial_print(b"  <no frames available>\r\n");
-    }
-
-    serial_print(b"========================================\r\n");
-    serial_print(b"System halted.\r\n");
-
-    // Halt forever
-    loop {
-        unsafe {
-            ::core::arch::asm!("hlt", options(nomem, nostack, preserves_flags));
-        }
+        fp = prev;
     }
 }
 
@@ -641,42 +607,6 @@ fn handle_page_fault(ec: u64, addr: u64) -> Result<(), VmFault> {
     crate::mm::fault::handle_mm_fault(&mm, addr, access)
 }
 
-fn serial_print(s: &[u8]) {
-    for &b in s {
-        super::io::outb(0x3F8, b);
-    }
-}
-
-fn print_hex(val: u64) {
-    for i in (0..16).rev() {
-        let nibble = ((val >> (i * 4)) & 0xF) as u8;
-        let c = if nibble < 10 {
-            b'0' + nibble
-        } else {
-            b'a' + nibble - 10
-        };
-        super::io::outb(0x3F8, c);
-    }
-}
-
-fn print_dec(mut val: u64) {
-    if val == 0 {
-        super::io::outb(0x3F8, b'0');
-        return;
-    }
-    let mut digits = [0u8; 20];
-    let mut i = 0;
-    while val > 0 {
-        digits[i] = (val % 10) as u8 + b'0';
-        val /= 10;
-        i += 1;
-    }
-    while i > 0 {
-        i -= 1;
-        super::io::outb(0x3F8, digits[i]);
-    }
-}
-
 /// Call-function IPI vector (Linux CALL_FUNCTION_VECTOR)
 pub const CALL_FUNCTION_VECTOR: u8 = 0xfc;
 /// Reschedule IPI vector (Linux RESCHEDULE_VECTOR)
@@ -684,7 +614,7 @@ pub const RESCHEDULE_VECTOR: u8 = 0xfd;
 
 /// Run `f` as an interrupt handler: interrupt depth and lockdep's
 /// interrupt context account for it
-fn in_irq(f: fn()) {
+fn in_irq(f: impl FnOnce()) {
     let percpu = super::percpu::try_current_cpu();
     if let Some(p) = percpu {
         p.interrupt_depth.fetch_add(1, Ordering::Relaxed);
@@ -708,6 +638,72 @@ fn handle_call_function() {
 fn handle_reschedule() {
     lapic::eoi();
     in_irq(crate::smp::reschedule_interrupt);
+}
+
+/// Spurious interrupts so far (Linux IRQ_COUNT_SPURIOUS)
+static SPURIOUS_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Report the first few of a kind, then only count (printk from
+/// interrupt context is slow; an interrupt storm would flood it)
+fn report_irq(count: &AtomicU64) -> bool {
+    count.fetch_add(1, Ordering::Relaxed) < 10
+}
+
+/// An interrupt on a vector with no handler (Linux spurious_interrupt,
+/// handle_spurious_interrupt): the LAPIC's spurious vector is never
+/// acknowledged (SDM vol 3); any other is acknowledged if in service
+fn handle_spurious(vector: u8) {
+    let cpu = crate::cpu::try_this_id().map_or(-1, |c| c as i64);
+    let report = report_irq(&SPURIOUS_COUNT);
+    if vector == lapic::SPURIOUS_APIC_VECTOR {
+        if report {
+            printkln!("Spurious APIC interrupt (vector 0xFF) on CPU#{}", cpu);
+        }
+        return;
+    }
+    let acked = lapic::in_service(vector);
+    if acked {
+        lapic::eoi();
+    }
+    if report {
+        printkln!(
+            "Spurious interrupt (vector {:#04x}) on CPU#{}. {}",
+            vector,
+            cpu,
+            if acked { "Acked" } else { "Not pending!" }
+        );
+    }
+}
+
+/// APIC errors so far (Linux IRQ_COUNT_PIC_APIC_ERROR)
+static APIC_ERROR_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// LVT Error interrupt (Linux sysvec_error_interrupt): latch the ESR,
+/// acknowledge, report the error bits
+fn handle_apic_error() {
+    const REASONS: [&str; 8] = [
+        "Send CS error",
+        "Receive CS error",
+        "Send accept error",
+        "Receive accept error",
+        "Redirectable IPI",
+        "Send illegal vector",
+        "Received illegal vector",
+        "Illegal register address",
+    ];
+    let esr = lapic::read_esr();
+    lapic::eoi();
+    if !report_irq(&APIC_ERROR_COUNT) {
+        return;
+    }
+    let cpu = crate::cpu::try_this_id().map_or(-1, |c| c as i64);
+    printk!("APIC error on CPU{}: {:02x}", cpu, esr & 0xff);
+    for (i, why) in REASONS.iter().enumerate() {
+        if esr & (1 << i) != 0 {
+            printk!(" : {}", why);
+        }
+    }
+    printkln!("");
 }
 
 /// LAPIC timer interrupt

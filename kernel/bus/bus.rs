@@ -149,6 +149,10 @@ pub struct BusManager {
 
     /// Order in which root buses should be enumerated
     root_buses: Vec<String>,
+
+    /// Every bus in registration order: a child bus (USB) after the bus
+    /// of the device that created it (PCI)
+    order: Vec<String>,
 }
 
 impl BusManager {
@@ -158,6 +162,7 @@ impl BusManager {
             buses: BTreeMap::new(),
             pending_drivers: Vec::new(),
             root_buses: Vec::new(),
+            order: Vec::new(),
         }
     }
 
@@ -187,6 +192,7 @@ impl BusManager {
             self.root_buses.push(name.to_string());
         }
 
+        self.order.push(name.to_string());
         self.buses.insert(name.to_string(), bus);
     }
 
@@ -295,6 +301,35 @@ impl BusManager {
             Err(DriverError::MissingResource)
         }
     }
+}
+
+/// The system's buses and their bound devices, kept once boot
+/// enumeration is done, for `device_shutdown`. A sleeping lock: shutdown
+/// callbacks may wait for hardware.
+static SYSTEM_BUSES: crate::sync::Mutex<Option<BusManager>> = crate::sync::Mutex::new(None);
+
+/// Keep the boot-time bus manager (its devices stay bound for good)
+pub fn set_system_buses(buses: BusManager) {
+    *SYSTEM_BUSES.lock() = Some(buses);
+}
+
+/// Shut every bound device down before power-off, restart or halt
+/// (Linux device_shutdown): children first, so devices on a child bus
+/// (USB) go before the controller (PCI) they hang off, each bus's in
+/// reverse probe order. Runs once: a second caller finds nothing left.
+pub fn device_shutdown() {
+    let Some(buses) = SYSTEM_BUSES.lock().take() else {
+        return;
+    };
+    for name in buses.order.iter().rev() {
+        if let Some(bus) = buses.buses.get(name) {
+            for dev in bus.probed_devices().iter().rev() {
+                dev.shutdown();
+            }
+        }
+    }
+    // The devices stay bound: the machine goes down next
+    core::mem::forget(buses);
 }
 
 impl Default for BusManager {

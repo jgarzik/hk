@@ -22,7 +22,7 @@
 
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering, fence};
 
-use crate::arch::{CurrentArch, PerCpuOps, local_irq_restore, local_irq_save};
+use crate::arch::{CurrentArch, HaltOps, PerCpuOps, local_irq_restore, local_irq_save};
 use alloc::boxed::Box;
 use spin::Once;
 
@@ -65,6 +65,34 @@ static QUEUE: PerCpu<AtomicPtr<Csd>> = crate::percpu![AtomicPtr::new(core::ptr::
 /// each CPU once it services interrupts. One global mask: every sender
 /// needs every CPU's state, and it changes once per CPU at boot.
 static ACTIVE: CpuMask = CpuMask::new();
+
+/// Stop every other CPU for good (Linux smp_send_stop, x86
+/// native_stop_other_cpus): each leaves the active mask, so no cross-CPU
+/// call or TLB flush waits for it, and halts with interrupts off. Waits
+/// up to 1 s for them (Linux's wait before its NMI fallback, which hk
+/// lacks: a CPU spinning with interrupts off is reported and left
+/// running). For the end of halt, power-off and restart, after
+/// device_shutdown.
+pub fn stop_other_cpus() {
+    let mut others = ACTIVE.snapshot();
+    others.clear(this_id());
+    if others.is_empty() {
+        return;
+    }
+    smp_call_function_many(&others, stop_this_cpu, 0, false);
+    let gone = || ACTIVE.snapshot().and(&others).is_empty();
+    if crate::delay::poll_timeout(1_000_000, 10, gone).is_err() {
+        let left = ACTIVE.snapshot().and(&others);
+        crate::printkln!("smp: CPUs {} did not stop", left.fmt_list());
+    }
+}
+
+/// Leave the active mask and halt (Linux stop_this_cpu), from the
+/// call-function IPI
+fn stop_this_cpu(_: usize) {
+    ACTIVE.clear(this_id());
+    CurrentArch::halt_loop();
+}
 
 /// SMP bring-up found `n` CPUs (ids 0..n): record them (nr_cpu_ids) and
 /// give each its call slots, before any of them is active

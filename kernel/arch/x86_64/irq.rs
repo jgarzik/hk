@@ -21,10 +21,6 @@ use crate::arch::IrqSpinlock;
 /// Number of legacy PIC lines
 const NR_IRQS: usize = 16;
 
-/// Consecutive unclaimed interrupts after which a line is masked (Linux
-/// note_interrupt's "nobody cared")
-const UNHANDLED_LIMIT: u32 = 100_000;
-
 /// IRQ handler function signature (same on all arches)
 ///
 /// Arguments:
@@ -48,7 +44,7 @@ unsafe impl Sync for IrqEntry {}
 /// One PIC line
 struct IrqLine {
     handlers: Vec<IrqEntry>,
-    unhandled: u32,
+    spurious: crate::irq::Spurious,
 }
 
 /// IRQ handler table - 16 lines
@@ -60,7 +56,7 @@ impl IrqTable {
     const fn new() -> Self {
         const EMPTY: IrqLine = IrqLine {
             handlers: Vec::new(),
-            unhandled: 0,
+            spurious: crate::irq::Spurious::new(),
         };
         Self {
             lines: [EMPTY; NR_IRQS],
@@ -87,7 +83,7 @@ pub fn register_irq_handler(
         return Err("Handler with this ID already registered");
     }
     line.handlers.push(IrqEntry { handler, data, id });
-    line.unhandled = 0;
+    line.spurious.reset();
     if line.handlers.len() == 1 {
         super::pic::enable_irq(irq as u8);
     }
@@ -131,13 +127,14 @@ pub fn dispatch_irq(irq: u8) -> bool {
         handled |= (entry.handler)(irq as u32, entry.data);
         crate::sync::lockdep::irq_exit();
     }
-    if handled {
-        line.unhandled = 0;
-    } else {
-        line.unhandled += 1;
-        if !line.handlers.is_empty() && line.unhandled >= UNHANDLED_LIMIT {
-            super::pic::disable_irq(irq);
-        }
+    // A line without handlers is masked already (spurious IRQ7/15)
+    let bad = !line.handlers.is_empty() && line.spurious.note(handled, crate::time::monotonic_ns);
+    if bad {
+        super::pic::disable_irq(irq);
+    }
+    drop(table);
+    if bad {
+        crate::irq::report_nobody_cared(irq as u32);
     }
     handled
 }

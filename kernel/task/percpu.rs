@@ -192,6 +192,8 @@ pub struct CpuRunQueue {
     /// Fair: a vruntime no fair task here is behind (Linux
     /// cfs_rq->min_vruntime), the average when none is queued
     min_vruntime: u64,
+    /// rt time used in this period (Linux rt_rq rt_time)
+    rt_bw: crate::task::rt::RtBandwidth,
 }
 
 // SAFETY: the task pointers are owned references (see above), used
@@ -259,6 +261,7 @@ impl CpuRunQueue {
             prev: core::ptr::null(),
             cpu: 0,
             min_vruntime: 0,
+            rt_bw: crate::task::rt::RtBandwidth::new(),
         }
     }
 
@@ -314,16 +317,19 @@ impl CpuRunQueue {
 
     /// A task made runnable preempts the running one of a lower class,
     /// or of the rt class at a lower rt priority (Linux wakeup_preempt:
-    /// a higher class always wins; within rt, the higher priority);
-    /// a fair task waits for the tick
+    /// a higher class always wins; within rt, the higher priority;
+    /// once this CPU's rt runtime is used up, fair wins over rt,
+    /// `rt_throttled`); a fair task waits for the tick
     fn check_preempt(&self, p: &KernelTask) {
         // SAFETY: the running task, kept alive by this run queue
         let Some(curr) = (unsafe { self.curr.as_ref() }) else {
             return;
         };
         let (pc, cc) = (p.se.class(), curr.se.class());
+        // Throttling swaps rt and fair's order
+        let throttled = pc.max(cc) == Class::Fair && pc.min(cc) == Class::Rt && self.rt_throttled();
         if self.curr_is_idle()
-            || pc < cc
+            || (pc < cc) != throttled
             || (pc == Class::Rt && cc == Class::Rt && p.se.rt_priority() > curr.se.rt_priority())
             || (pc == Class::Fair && cc == Class::Fair && self.fair_wakeup_preempts(p, curr))
         {
@@ -378,27 +384,74 @@ impl CpuRunQueue {
         }
     }
 
-    /// The next task to run: a stopper, else the highest rt task, else
-    /// EEVDF's fair pick, else the idle task (Linux pick_next_task)
+    /// The next task to run: a stopper, else the highest rt task
+    /// (unless throttled), else EEVDF's fair pick, else an rt task,
+    /// else the idle task (Linux pick_next_task)
     fn pick_next(&mut self) -> *const KernelTask {
-        if let Some(t) = self.queue().pop_stop_rt() {
+        let rt = !self.rt_throttled();
+        if let Some(t) = self.queue().pop_stop_rt(rt) {
             return t;
         }
-        let pick = {
-            let q = self.queue.as_ref().expect("run queue not initialized");
-            crate::task::fair::pick(q.fair_iter().map(|t| (t as *const KernelTask, &t.se)))
-        };
-        match pick {
-            Some(t) => {
-                // SAFETY: on the fair list (just found there)
-                unsafe { self.queue().remove(t, Class::Fair, 0) };
-                // SAFETY: as above
-                let v = unsafe { &*t }.se.vruntime.load(Ordering::Relaxed);
-                self.min_vruntime = self.min_vruntime.max(v.min(self.fair_avg(false)));
-                t
-            }
-            None => self.idle,
+        if let Some(t) = self.pick_fair() {
+            return t;
         }
+        self.queue().pop_stop_rt(true).unwrap_or(self.idle)
+    }
+
+    /// EEVDF's pick among the queued fair tasks, taken off their list
+    fn pick_fair(&mut self) -> Option<*const KernelTask> {
+        let t = {
+            let q = self.queue.as_ref().expect("run queue not initialized");
+            crate::task::fair::pick(q.fair_iter().map(|t| (t as *const KernelTask, &t.se)))?
+        };
+        // SAFETY: on the fair list (just found there)
+        unsafe { self.queue().remove(t, Class::Fair, 0) };
+        // SAFETY: as above
+        let v = unsafe { &*t }.se.vruntime.load(Ordering::Relaxed);
+        self.min_vruntime = self.min_vruntime.max(v.min(self.fair_avg(false)));
+        Some(t)
+    }
+
+    /// This CPU's rt tasks give way to its fair ones: their runtime in
+    /// this period is used up and a fair task waits or runs (Linux
+    /// rt_rq->rt_throttled; the fair server's rule that throttling
+    /// never idles the CPU). The clock is read only once the runtime is
+    /// used up.
+    fn rt_throttled(&self) -> bool {
+        let q = self.queue.as_ref().expect("run queue not initialized");
+        self.rt_bw.exceeded()
+            && self.rt_bw.exceeded_at(crate::time::monotonic_ns())
+            && (q.has_fair() || self.curr_fair().is_some())
+    }
+
+    /// Charge the running task's CPU time if it is an rt task (Linux
+    /// update_curr_rt)
+    fn update_curr_rt(&mut self, now: u64) {
+        // SAFETY: the running task, kept alive by this run queue
+        let Some(curr) = (unsafe { self.curr.as_ref() }) else {
+            return;
+        };
+        if self.curr_is_idle() || curr.se.class() != Class::Rt {
+            return;
+        }
+        let start = curr.se.exec_start.swap(now, Ordering::Relaxed);
+        if start != 0 && now > start {
+            self.rt_bw.charge(now, now - start);
+        }
+    }
+
+    /// The tick of a running rt task: charged, true if that used up
+    /// its CPU's rt runtime with fair tasks waiting (Linux
+    /// sched_rt_runtime_exceeded -> resched_curr)
+    fn rt_tick(&mut self, now: u64) -> bool {
+        self.update_curr_rt(now);
+        self.rt_throttled()
+    }
+
+    /// The tick of a running fair task: true if a new period ends a
+    /// throttle with rt tasks waiting (Linux do_sched_rt_period_timer)
+    fn rt_period_tick(&mut self, now: u64) -> bool {
+        self.rt_bw.roll(now) && self.queue().has_rt()
     }
 
     /// The running task if it is a fair task still on this run queue
@@ -2448,6 +2501,16 @@ pub fn exit_current(status: Option<i32>) -> ! {
         // group_dead = atomic_dec_and_test(&signal->live))
         group_dead = crate::signal::get_task_signal_struct(tid).is_none_or(|s| s.thread_exiting());
 
+        // Nothing reaps orphans or keeps userspace going without the
+        // global init: its death is fatal, and loud (Linux do_exit:
+        // is_global_init when group_dead), not a silent idle machine
+        if group_dead
+            && current_pid() == 1
+            && let Some(st) = status
+        {
+            panic!("Attempted to kill init! exitcode={:#010x}", st);
+        }
+
         // The group's last thread writes the accounting record while the
         // task still has its mm, files and identity (Linux acct_process
         // when group_dead, before exit_mm/exit_files)
@@ -2748,10 +2811,12 @@ pub fn schedule() {
     // Leave the run queue (Linux deactivate_task), a fair task keeping
     // its lag; an uninterruptible or killable sleep counts in the load
     // (task_contributes_to_load)
+    let now = crate::time::monotonic_ns();
     if me.se.class() == Class::Fair {
-        crate::task::fair::update_curr(&me.se, crate::time::monotonic_ns());
+        crate::task::fair::update_curr(&me.se, now);
         rq.save_lag(&me);
     }
+    rq.update_curr_rt(now);
     me.se.set_on_rq(false);
     rq.add_nr(-1);
     // A slice that ran out is not carried past the sleep
@@ -3408,15 +3473,21 @@ pub fn scheduler_tick() {
     // The running task's slice (Linux task_tick of its class): fair and
     // idle one tick, SCHED_RR its RR_TICKS, SCHED_FIFO and the stoppers
     // none (they run until they block or something higher wakes)
+    // rt and fair tasks are charged under the rq lock, rt time against
+    // the CPU's rt runtime (`rt_tick`, `rt_period_tick`)
     let me = current();
+    let now = crate::time::monotonic_ns();
     let resched = match me.se.class() {
         Class::Stop => false,
-        Class::Rt => me.se.policy() == crate::task::SCHED_RR && me.se.rr_tick(),
-        // Charged under its rq lock; a used-up slice (new deadline) lets
-        // EEVDF pick again (Linux task_tick_fair -> update_deadline)
+        Class::Rt => {
+            let rr = me.se.policy() == crate::task::SCHED_RR && me.se.rr_tick();
+            rr | this_sched().is_some_and(|s| s.lock.lock().rt_tick(now))
+        }
+        // A used-up slice (new deadline) lets EEVDF pick again (Linux
+        // task_tick_fair -> update_deadline)
         Class::Fair => this_sched().is_some_and(|s| {
-            let _rq = s.lock.lock();
-            crate::task::fair::update_curr(&me.se, crate::time::monotonic_ns())
+            let mut rq = s.lock.lock();
+            crate::task::fair::update_curr(&me.se, now) | rq.rt_period_tick(now)
         }),
         Class::Idle => true,
     };
@@ -3575,8 +3646,10 @@ fn yield_cpu(preempted: bool) -> bool {
     // sched_yield moves its deadline on); the idle task is never queued
     me.se.set_state(RUNNING);
     if !rq.curr_is_idle() {
+        let now = crate::time::monotonic_ns();
+        rq.update_curr_rt(now);
         if me.se.class() == Class::Fair {
-            crate::task::fair::update_curr(&me.se, crate::time::monotonic_ns());
+            crate::task::fair::update_curr(&me.se, now);
             if !preempted {
                 crate::task::fair::yield_task(&me.se);
             }

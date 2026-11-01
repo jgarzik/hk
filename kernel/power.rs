@@ -24,6 +24,9 @@ pub mod cmd {
     pub const HALT: u32 = 0xcdef0123;
 }
 
+/// Serializes power-off, restart and halt (Linux system_transition_mutex)
+static SYSTEM_TRANSITION: crate::sync::Mutex<()> = crate::sync::Mutex::new(());
+
 /// sys_reboot implementation
 ///
 /// Implements the Linux reboot(2) syscall. The caller must provide valid
@@ -39,6 +42,11 @@ pub mod cmd {
 /// Does not return on success (system shuts down/reboots/halts).
 /// Returns -EINVAL on invalid magic numbers or unknown command.
 pub fn sys_reboot(magic1: u32, magic2: u32, cmd: u32, _arg: u64) -> i64 {
+    // The capability first, then the magic numbers (Linux)
+    if !crate::task::capable(crate::task::CAP_SYS_BOOT) {
+        return KernelError::NotPermitted.sysret();
+    }
+
     // Validate magic number 1
     if magic1 != cmd::LINUX_REBOOT_MAGIC1 {
         return KernelError::InvalidArgument.sysret();
@@ -51,6 +59,20 @@ pub fn sys_reboot(magic1: u32, magic2: u32, cmd: u32, _arg: u64) -> i64 {
         && magic2 != cmd::LINUX_REBOOT_MAGIC2C
     {
         return KernelError::InvalidArgument.sysret();
+    }
+
+    // One transition at a time (Linux system_transition_mutex): a second
+    // caller waits here, and the machine is gone before it gets the lock,
+    // rather than powering off while the first still quiesces devices
+    let _transition = SYSTEM_TRANSITION.lock();
+
+    // Devices quiesce first (Linux kernel_shutdown_prepare and
+    // kernel_restart_prepare: device_shutdown), then the other CPUs stop
+    // (Linux machine_shutdown -> stop_other_cpus), so nothing goes on
+    // running against quiesced hardware
+    if matches!(cmd, cmd::POWER_OFF | cmd::RESTART | cmd::HALT) {
+        crate::bus::bus::device_shutdown();
+        crate::smp::stop_other_cpus();
     }
 
     // Dispatch to architecture-specific implementation

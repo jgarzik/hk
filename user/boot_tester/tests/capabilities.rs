@@ -6,10 +6,13 @@
 //! - Test: capget() with invalid version (returns current version)
 //! - Test: capset() - drop a capability
 //! - Test: capset() - verify dropped capability can't be restored
+//! - Test: reboot() checks CAP_SYS_BOOT before its magic numbers
 
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
-    _LINUX_CAPABILITY_VERSION_3, CAP_SYS_ADMIN, CapUserData, CapUserHeader, sys_capget, sys_capset,
+    _LINUX_CAPABILITY_VERSION_3, CAP_SYS_ADMIN, CAP_SYS_BOOT, CapUserData, CapUserHeader,
+    LINUX_REBOOT_CMD_POWER_OFF, LINUX_REBOOT_MAGIC2, sys_capget, sys_capset, sys_exit, sys_fork,
+    sys_reboot_ret, sys_wait4,
 };
 
 /// Run all capabilities tests
@@ -19,6 +22,67 @@ pub fn run_tests() {
     test_capget_invalid_version();
     test_capset_drop_cap();
     test_capset_restore_fails();
+    test_reboot_needs_cap();
+}
+
+/// Effective capability `cap` of this process
+fn has_cap(cap: u32) -> bool {
+    let mut header = CapUserHeader {
+        version: _LINUX_CAPABILITY_VERSION_3,
+        pid: 0,
+    };
+    let mut data: [CapUserData; 2] = [CapUserData::default(); 2];
+    sys_capget(&mut header as *mut _, data.as_mut_ptr()) == 0
+        && data[(cap / 32) as usize].effective & (1 << (cap % 32)) != 0
+}
+
+/// Drop `cap` from this process's effective set
+fn drop_cap(cap: u32) -> bool {
+    let mut header = CapUserHeader {
+        version: _LINUX_CAPABILITY_VERSION_3,
+        pid: 0,
+    };
+    let mut data: [CapUserData; 2] = [CapUserData::default(); 2];
+    if sys_capget(&mut header as *mut _, data.as_mut_ptr()) != 0 {
+        return false;
+    }
+    data[(cap / 32) as usize].effective &= !(1 << (cap % 32));
+    sys_capset(&header as *const _, data.as_ptr()) == 0
+}
+
+/// reboot(2) needs CAP_SYS_BOOT, checked before the magic numbers
+/// (Linux): EPERM without it even with a bad magic, EINVAL with it. The
+/// magic is never valid, so the machine stays up whatever the kernel
+/// does.
+fn test_reboot_needs_cap() {
+    const EPERM: i64 = -1;
+    const EINVAL: i64 = -22;
+    const BAD_MAGIC: u64 = 0x1234_5678;
+    let reboot = || sys_reboot_ret(BAD_MAGIC, LINUX_REBOOT_MAGIC2, LINUX_REBOOT_CMD_POWER_OFF);
+    if has_cap(CAP_SYS_BOOT) {
+        let r = reboot();
+        if r == EINVAL {
+            println(b"REBOOT_BAD_MAGIC:OK");
+        } else {
+            print(b"REBOOT_BAD_MAGIC:FAIL: expected EINVAL, got ");
+            print_num(r);
+            println(b"");
+        }
+    }
+    let pid = sys_fork();
+    if pid == 0 {
+        let ok = drop_cap(CAP_SYS_BOOT) && reboot() == EPERM;
+        sys_exit(!ok as u64);
+    }
+    let mut status = 0;
+    sys_wait4(pid, &mut status, 0, 0);
+    if pid > 0 && status == 0 {
+        println(b"REBOOT_NEEDS_CAP:OK");
+    } else {
+        print(b"REBOOT_NEEDS_CAP:FAIL: status ");
+        print_num(status as i64);
+        println(b"");
+    }
 }
 
 /// Test capget() - get current process capabilities (should have full caps as root)

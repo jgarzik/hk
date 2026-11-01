@@ -7,7 +7,9 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use crate::printkln;
 
 pub mod context;
+pub mod ext_caps;
 pub mod msc;
+pub mod pci_quirks;
 pub mod serial;
 pub mod transfer;
 pub mod xhci;

@@ -1,76 +1,190 @@
 //! x86-64 power management via ACPI
 //!
-//! Implements system shutdown and reboot using standard ACPI mechanisms.
-//! This works on real x86-64 hardware as well as virtual machines (QEMU, etc.).
+//! Power-off enters ACPI S5 through the FADT's fixed hardware
+//! (`crate::acpi::hw`); reboot tries the FADT reset register, the
+//! keyboard controller and port 0xCF9. Works on real hardware and on
+//! QEMU.
+//!
+//! Locking: `POWER` is a `spin::Once`, set at boot before any caller
+//! can power off and read-only after.
 
 use core::arch::asm;
-use core::sync::atomic::{AtomicU8, AtomicU16, Ordering};
 
-use super::io::{inb, outb, outw};
+use super::io::{inb, inw, outb, outw};
+use super::ioremap::ioremap;
+use crate::acpi::aml::SleepType;
+use crate::acpi::hw::{self, PmRegs, PortIo, ResetReg, Space};
+use crate::arch::PowerInfo;
+use crate::delay::Monotonic;
+use crate::printkln;
 
-/// ACPI SLP_EN bit - enables transition to sleep state
-const SLP_EN: u16 = 1 << 13;
-
-/// Power management registers from FADT
-/// Using atomics for safe initialization from boot code
-static PM1A_CNT_BLK: AtomicU16 = AtomicU16::new(0);
-static PM1B_CNT_BLK: AtomicU16 = AtomicU16::new(0);
-static SLP_TYPA: AtomicU8 = AtomicU8::new(0); // Default S5 sleep type (0 for QEMU)
-
-/// Initialize power management with values from ACPI FADT
-///
-/// Called during boot after ACPI tables are parsed.
-pub fn init(pm1a: u16, pm1b: Option<u16>, slp_typa: u8) {
-    PM1A_CNT_BLK.store(pm1a, Ordering::SeqCst);
-    PM1B_CNT_BLK.store(pm1b.unwrap_or(0), Ordering::SeqCst);
-    SLP_TYPA.store(slp_typa, Ordering::SeqCst);
+/// The FADT's registers, the S5 sleep type and the reset register,
+/// once parsed
+struct Power {
+    pm: PmRegs,
+    s5: SleepType,
+    reset: Option<Reset>,
 }
 
-/// Shutdown the system using ACPI S5 (soft-off)
-///
-/// Writes to the PM1a (and optionally PM1b) control registers to trigger
-/// the S5 sleep state, which powers off the system.
-///
-/// # Panics
-/// This function never returns. If ACPI shutdown fails, it falls back to halt.
+/// The FADT reset register, ready to write: a port, or a mapped
+/// address (as usize, so `Power` is Sync), and the reset value
+#[derive(Clone, Copy)]
+enum Reset {
+    Io(u16, u8),
+    Mem(usize, u8),
+}
+
+static POWER: spin::Once<Power> = spin::Once::new();
+
+/// The CPU's I/O ports
+struct Ports;
+
+impl PortIo for Ports {
+    fn inb(&mut self, port: u16) -> u8 {
+        inb(port)
+    }
+    fn outb(&mut self, port: u16, val: u8) {
+        outb(port, val)
+    }
+    fn inw(&mut self, port: u16) -> u16 {
+        inw(port)
+    }
+    fn outw(&mut self, port: u16, val: u16) {
+        outw(port, val)
+    }
+}
+
+/// Record the ACPI power management info (boot, after table parsing)
+pub fn init(info: &PowerInfo) {
+    POWER.call_once(|| Power {
+        pm: info.pm,
+        s5: info.s5,
+        reset: info.reset.and_then(reset_map),
+    });
+}
+
+/// Ready the reset register: memory space is mapped now, since reboot
+/// may run where mapping is unwise
+fn reset_map(r: ResetReg) -> Option<Reset> {
+    match r.space {
+        Space::Io => Some(Reset::Io(r.addr as u16, r.value)),
+        Space::Mem => ioremap(r.addr, 1)
+            .ok()
+            .map(|virt| Reset::Mem(virt as usize, r.value)),
+    }
+}
+
+/// Put the fixed hardware in ACPI mode, then disable every fixed event
+/// and GPE (Linux acpi_enable_subsystem): no SCI handler exists yet, so
+/// IRQ 9 stays masked and nothing may raise an SCI
+pub fn enable() {
+    let Some(p) = POWER.get().filter(|p| p.pm.pm1a_cnt != 0) else {
+        return;
+    };
+    if hw::acpi_mode(&mut Ports, &p.pm) {
+        printkln!("ACPI: already in ACPI mode");
+    } else if hw::acpi_enable(&mut Ports, &p.pm, &mut Monotonic::new()).is_ok() {
+        printkln!("ACPI: enabled ACPI mode");
+    } else {
+        printkln!(
+            "ACPI: hardware did not enter ACPI mode (SMI_CMD {:#x} ACPI_ENABLE {:#x})",
+            p.pm.smi_cmd,
+            p.pm.acpi_enable
+        );
+        return;
+    }
+    hw::disable_events(&mut Ports, &p.pm);
+}
+
+/// Power off through ACPI S5 (Linux acpi_power_off ->
+/// acpi_enter_sleep_state(ACPI_STATE_S5)); halts if the machine stays on
 pub fn shutdown() -> ! {
-    let pm1a = PM1A_CNT_BLK.load(Ordering::SeqCst);
-    let pm1b = PM1B_CNT_BLK.load(Ordering::SeqCst);
-    let slp_typ = SLP_TYPA.load(Ordering::SeqCst);
-
-    if pm1a != 0 {
-        // Build the value: SLP_TYPa in bits 10-12, SLP_EN in bit 13
-        let val = ((slp_typ as u16) << 10) | SLP_EN;
-
-        // Write to PM1a control block
-        outw(pm1a, val);
-
-        // Write to PM1b if present
-        if pm1b != 0 {
-            outw(pm1b, val);
-        }
+    if let Some(p) = POWER.get().filter(|p| p.pm.pm1a_cnt != 0) {
+        hw::enter_s5(&mut Ports, &p.pm, p.s5);
+        // Linux acpi_hw_legacy_sleep: wait ten seconds for chipsets that
+        // poll PM1 control slowly, then set SLP_EN again
+        crate::delay::mdelay(10_000);
+        printkln!("ACPI: still on 10 s after S5, retrying");
+        hw::sleep_retry(&mut Ports, &p.pm, p.s5);
+        crate::delay::mdelay(1000);
+        printkln!("ACPI: power-off failed, halting");
     }
-
-    // If we get here, ACPI shutdown didn't work - fall back to halt
     halt()
 }
 
-/// Reboot the system
-///
-/// Uses the keyboard controller reset method (pulse CPU reset line).
-/// This is the standard way to reboot x86 systems.
+/// Restart: the ACPI reset register, then the keyboard controller,
+/// twice, then the PCH reset control port (Linux
+/// native_machine_emergency_restart's BOOT_ACPI -> BOOT_KBD order, with
+/// CF9 last); halts if all fail
 pub fn reboot() -> ! {
-    // Wait for keyboard controller to be ready
-    // Clear any pending data
-    while (inb(0x64) & 0x02) != 0 {
-        core::hint::spin_loop();
+    for _ in 0..2 {
+        acpi_reset();
+        kbd_reset();
     }
-
-    // Send reset command (0xFE) to keyboard controller command port
-    outb(0x64, 0xFE);
-
-    // If keyboard reset didn't work, fall back to halt
+    cf9_reset();
+    printkln!("reboot: still running, halting");
     halt()
+}
+
+/// Write RESET_VALUE to the FADT reset register (Linux acpi_reboot),
+/// then give the platform 15 ms to act on it
+fn acpi_reset() {
+    let Some(reset) = POWER.get().and_then(|p| p.reset) else {
+        return;
+    };
+    match reset {
+        Reset::Io(port, val) => outb(port, val),
+        // SAFETY: mapped by init for this register
+        Reset::Mem(virt, val) => unsafe { core::ptr::write_volatile(virt as *mut u8, val) },
+    }
+    crate::delay::mdelay(15);
+}
+
+/// 8042 status and command port
+const KBD_PORT: u16 = 0x64;
+/// 8042 status: input buffer full
+const KBD_IBF: u8 = 1 << 1;
+/// 8042 command: pulse the reset line low
+const KBD_RESET: u8 = 0xfe;
+
+/// Pulse the reset line through the keyboard controller, ten times
+/// (Linux BOOT_KBD)
+fn kbd_reset() {
+    for _ in 0..10 {
+        kb_wait();
+        crate::delay::udelay(50);
+        outb(KBD_PORT, KBD_RESET);
+        crate::delay::udelay(50);
+    }
+}
+
+/// Wait, bounded, for the 8042 input buffer to drain (Linux kb_wait)
+fn kb_wait() {
+    for _ in 0..0x10000 {
+        if inb(KBD_PORT) & KBD_IBF == 0 {
+            break;
+        }
+        crate::delay::udelay(2);
+    }
+}
+
+/// PCH reset control register
+const RST_CNT: u16 = 0xcf9;
+/// RST_CNT: SYS_RST (hard reset), RST_CPU (do it) and FULL_RST (power
+/// cycle)
+const RST_SYS: u8 = 1 << 1;
+const RST_CPU: u8 = 1 << 2;
+const RST_FULL: u8 = 1 << 3;
+
+/// Cold reset through port 0xCF9 (Linux BOOT_CF9_SAFE with its default
+/// REBOOT_COLD: code 0x0e)
+fn cf9_reset() {
+    let code = RST_SYS | RST_CPU | RST_FULL;
+    let cf9 = inb(RST_CNT) & !code;
+    outb(RST_CNT, cf9 | RST_SYS);
+    crate::delay::udelay(50);
+    outb(RST_CNT, cf9 | code);
+    crate::delay::udelay(50);
 }
 
 /// Halt the system

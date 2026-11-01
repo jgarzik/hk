@@ -1253,6 +1253,13 @@ pub fn sys_syncfs(fd: i32) -> i64 {
     unsafe { syscall1!(SYS_SYNCFS, fd) }
 }
 
+/// reboot(2) that returns its result (the error cases: bad magic,
+/// unknown command, no CAP_SYS_BOOT)
+#[inline(always)]
+pub fn sys_reboot_ret(magic1: u64, magic2: u64, cmd: u64) -> i64 {
+    unsafe { syscall3!(SYS_REBOOT, magic1, magic2, cmd) }
+}
+
 /// reboot(magic1, magic2, cmd) - does not return
 #[inline(always)]
 pub fn sys_reboot(magic1: u64, magic2: u64, cmd: u64) -> ! {

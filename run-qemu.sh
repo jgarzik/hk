@@ -172,6 +172,11 @@ setup_x86_config() {
         )
     fi
 
+    # An idle EHCI next to the xHCI, like the Intel chipsets that pair
+    # them: boots run the USB BIOS hand-off's EHCI path (QEMU's EHCI has
+    # no legacy support capability: halt and quiesce only)
+    QEMU_ARGS+=(-device ich9-usb-ehci1,id=ehci)
+
     QEMU_ARGS+=("${QEMU_DISK[@]}")
 
     # Network: virtio-net (or NIC=e1000) on the shared slirp network
@@ -232,8 +237,8 @@ setup_arm_config() {
         QEMU_ARGS+=(-serial mon:stdio)
     fi
 
-    # Add xHCI USB controller
-    QEMU_ARGS+=(-device qemu-xhci,id=xhci)
+    # xHCI USB controller, and an idle EHCI (as on x86)
+    QEMU_ARGS+=(-device qemu-xhci,id=xhci -device ich9-usb-ehci1,id=ehci)
 
     # USB mass storage (make vfat-image), snapshot=on as on x86
     VFAT_IMG="target/vfat.img"

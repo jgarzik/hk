@@ -15,13 +15,66 @@ use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering, fence};
 
 use crate::sync::spin::Mutex;
 
-use crate::arch::{CurrentArch, FrameAlloc, IoremapOps, phys_to_virt};
+use crate::arch::{CurrentArch, IoremapOps, phys_to_virt};
 use crate::bus::bus::{BusContext, BusDevice, BusDriver};
 use crate::bus::driver::{Device, DriverError};
 use crate::bus::pci::PciDevice;
+use crate::delay::{poll_timeout, udelay};
 use crate::dma::{DmaDirection, dma_map_single, dma_unmap_single};
 use crate::downcast_bus_device;
 use crate::printkln;
+
+/// Halt and start handshakes (Linux XHCI_MAX_HALT_USEC)
+pub(super) const XHCI_MAX_HALT_US: u64 = 32_000;
+/// Reset handshakes at initialization (Linux XHCI_RESET_LONG_USEC)
+const XHCI_RESET_LONG_US: u64 = 10_000_000;
+/// Reset handshakes later on (Linux XHCI_RESET_SHORT_USEC)
+const XHCI_RESET_SHORT_US: u64 = 250_000;
+/// Command completion (Linux XHCI_CMD_DEFAULT_TIMEOUT)
+const XHCI_CMD_US: u64 = 5_000_000;
+/// Transfer completion (Linux USB_CTRL_GET_TIMEOUT)
+const XHCI_TRANSFER_US: u64 = 5_000_000;
+/// USB serial console transfer completion
+const XHCI_CONSOLE_US: u64 = 100_000;
+/// Root port reset (Linux HUB_RESET_TIMEOUT)
+const PORT_RESET_US: u64 = 800_000;
+
+pub(super) const PCI_VENDOR_INTEL: u16 = 0x8086;
+
+/// USBCMD interrupter, host system error and wrap event enables (Linux
+/// XHCI_IRQS)
+pub(super) const XHCI_IRQS: u32 = (1 << 2) | (1 << 3) | (1 << 10);
+
+/// Chipset quirks, set once from the PCI IDs (Linux xhci_pci_quirks)
+mod quirk {
+    use super::PCI_VENDOR_INTEL;
+    use crate::bus::pci::PciDevice;
+
+    /// Intel host: 1 ms after HCRST before any register access
+    pub const INTEL_HOST: u32 = 1 << 0;
+    /// Ports go back to EHCI at shutdown, or the machine powers back on
+    pub const SPURIOUS_REBOOT: u32 = 1 << 1;
+    /// Reset and D3hot at shutdown, or spurious wakeups follow
+    pub const SPURIOUS_WAKEUP: u32 = 1 << 2;
+
+    pub fn of(dev: &PciDevice) -> u32 {
+        if dev.header.vendor_id != PCI_VENDOR_INTEL {
+            return 0;
+        }
+        INTEL_HOST
+            | match dev.header.device_id {
+                0x1e31 => SPURIOUS_REBOOT,                            // Panther Point
+                0x9c31 | 0x9cb1 => SPURIOUS_REBOOT | SPURIOUS_WAKEUP, // LPT-LP, WPT-LP
+                _ => 0,
+            }
+    }
+}
+
+/// Scratchpad buffers the controller needs, from HCSPARAMS2 (Linux
+/// HCS_MAX_SCRATCHPAD: bits 25:21 high, 31:27 low)
+fn hcs_max_scratchpad(params2: u32) -> u32 {
+    ((params2 >> 21) & 0x1f) << 5 | (params2 >> 27)
+}
 
 use super::context::{InputContext, OutputDeviceContext, endpoint_to_dci};
 use super::transfer::{CompletionCode, TransferRing, Trb as TransferTrb, TrbType};
@@ -196,14 +249,23 @@ fn acquire_usb_controller() -> UsbControllerGuard {
 pub fn usb_bulk_out(slot_id: u8, endpoint: u8, data: &[u8]) -> Result<usize, UsbError> {
     let mut guard = acquire_usb_controller();
     let controller = guard.as_mut().ok_or(UsbError::NoDevice)?;
-    controller.do_bulk_out(slot_id, endpoint, data)
+    controller.do_bulk_out(slot_id, endpoint, data, XHCI_TRANSFER_US)
+}
+
+/// A bulk OUT transfer for the USB serial console: a short timeout, so
+/// a stalled console device costs each printk little (the controller
+/// lock, a spin lock, is held throughout)
+pub fn usb_console_out(slot_id: u8, endpoint: u8, data: &[u8]) -> Result<usize, UsbError> {
+    let mut guard = acquire_usb_controller();
+    let controller = guard.as_mut().ok_or(UsbError::NoDevice)?;
+    controller.do_bulk_out(slot_id, endpoint, data, XHCI_CONSOLE_US)
 }
 
 /// Perform a bulk IN transfer (device to host)
 pub fn usb_bulk_in(slot_id: u8, endpoint: u8, data: &mut [u8]) -> Result<usize, UsbError> {
     let mut guard = acquire_usb_controller();
     let controller = guard.as_mut().ok_or(UsbError::NoDevice)?;
-    controller.do_bulk_in(slot_id, endpoint, data)
+    controller.do_bulk_in(slot_id, endpoint, data, XHCI_TRANSFER_US)
 }
 
 /// Store the USB host controller for global access
@@ -330,6 +392,14 @@ impl Device for XhciDeviceHandle {
     fn as_any(&self) -> &dyn Any {
         self
     }
+
+    /// Power-off/restart (Linux xhci_pci_shutdown)
+    fn shutdown(&self) {
+        let mut guard = acquire_usb_controller();
+        if let Some(controller) = guard.as_mut() {
+            controller.shutdown_hc();
+        }
+    }
 }
 
 /// USBCMD register bits
@@ -354,6 +424,21 @@ mod portsc {
 
     pub fn speed(portsc: u32) -> u8 {
         ((portsc >> 10) & 0xF) as u8
+    }
+
+    /// Read-only bits, written back as read: connect status, over-
+    /// current, speed, device removable (Linux XHCI_PORT_RO)
+    const RO: u32 = (1 << 0) | (1 << 3) | (0xf << 10) | (1 << 30);
+    /// Read/write bits, written back as read: link state, port power,
+    /// indicator, wake enables (Linux XHCI_PORT_RWS)
+    const RWS: u32 = (0xf << 5) | (1 << 9) | (0x3 << 14) | (0x7 << 25);
+
+    /// A PORTSC value that changes nothing when written (Linux
+    /// xhci_port_state_to_neutral): writing back what was read would
+    /// clear every pending change bit and, through PED (write 1 to
+    /// clear), disable the port; masking would drop port power
+    pub fn to_neutral(portsc: u32) -> u32 {
+        portsc & (RO | RWS)
     }
 }
 
@@ -460,12 +545,6 @@ struct CommandRing {
 impl CommandRing {
     const SIZE: usize = 64;
 
-    fn new<FA: FrameAlloc<PhysAddr = u64>>(frame_alloc: &mut FA) -> Option<Self> {
-        // Allocate a page for command ring
-        let phys = frame_alloc.alloc_frame()?;
-        Self::init_from_phys(phys)
-    }
-
     fn new_with_wrapper(frame_alloc: &mut dyn crate::bus::bus::FrameAllocWrapper) -> Option<Self> {
         let phys = frame_alloc.alloc_frame()?;
         Self::init_from_phys(phys)
@@ -559,12 +638,6 @@ struct EventRing {
 impl EventRing {
     const SIZE: usize = 64;
 
-    fn new<FA: FrameAlloc<PhysAddr = u64>>(frame_alloc: &mut FA) -> Option<Self> {
-        let phys = frame_alloc.alloc_frame()?;
-        let erst_phys = frame_alloc.alloc_frame()?;
-        Self::init_from_phys(phys, erst_phys)
-    }
-
     fn new_with_wrapper(frame_alloc: &mut dyn crate::bus::bus::FrameAllocWrapper) -> Option<Self> {
         let phys = frame_alloc.alloc_frame()?;
         let erst_phys = frame_alloc.alloc_frame()?;
@@ -651,6 +724,10 @@ pub struct XhciController {
     max_slots: u8,
     /// Maximum ports
     max_ports: u8,
+    /// Bytes per device context (HCCPARAMS1.CSZ)
+    ctx_size: usize,
+    /// Chipset quirks (`quirk::*`), from the PCI IDs at creation
+    quirks: u32,
     /// Initialized flag
     initialized: bool,
     /// Connected devices
@@ -666,6 +743,7 @@ impl XhciController {
     pub fn new(mmio_base: u64, pci_dev: PciDevice) -> Self {
         Self {
             mmio_base,
+            quirks: quirk::of(&pci_dev),
             pci_dev,
             cap_regs: mmio_base,
             op_regs: 0,
@@ -677,6 +755,7 @@ impl XhciController {
             dcbaa_phys: 0,
             max_slots: 0,
             max_ports: 0,
+            ctx_size: 32,
             initialized: false,
             devices: Vec::new(),
             device_states: BTreeMap::new(),
@@ -778,6 +857,7 @@ impl XhciController {
         let rtsoff = self.read_cap(0x18);
 
         self.max_slots = (hcsparams1 & 0xFF) as u8;
+        self.ctx_size = super::context::ctx_size(self.read_cap(0x10));
         self.max_ports = ((hcsparams1 >> 24) & 0xFF) as u8;
 
         // Calculate register offsets
@@ -787,18 +867,19 @@ impl XhciController {
         self.port_regs = self.op_regs + 0x400;
 
         printkln!(
-            "xHCI: version={:x}.{:x}, max_slots={}, max_ports={}",
+            "xHCI: version={:x}.{:x}, max_slots={}, max_ports={}, context={} bytes",
             (hciversion >> 8) & 0xFF,
             hciversion & 0xFF,
             self.max_slots,
-            self.max_ports
+            self.max_ports,
+            self.ctx_size
         );
 
         // Stop controller if running
         self.halt()?;
 
         // Reset controller
-        self.reset_controller()?;
+        self.reset_controller(XHCI_RESET_LONG_US)?;
 
         // Allocate Device Context Base Address Array
         let dcbaa_phys = frame_alloc.alloc_frame().ok_or(UsbError::NoResources)?;
@@ -806,6 +887,7 @@ impl XhciController {
             core::ptr::write_bytes(phys_to_virt(dcbaa_phys), 0, 4096);
         }
         self.dcbaa_phys = dcbaa_phys;
+        self.alloc_scratchpads(frame_alloc)?;
 
         // Allocate command ring
         self.cmd_ring =
@@ -830,126 +912,93 @@ impl XhciController {
         Ok(())
     }
 
-    /// Initialize the controller with a frame allocator
-    pub fn init<FA: FrameAlloc<PhysAddr = u64>>(
+    /// Give the controller the scratchpad memory it asks for (xHCI 4.20,
+    /// Linux scratchpad_alloc): zeroed pages, listed in an array that
+    /// DCBAA entry 0 points at. The controller keeps internal state
+    /// there; without it, it would take entry 0 - zero - as the array's
+    /// address and use whatever that memory holds as page pointers.
+    fn alloc_scratchpads(
         &mut self,
-        frame_alloc: &mut FA,
+        frame_alloc: &mut dyn crate::bus::bus::FrameAllocWrapper,
     ) -> Result<(), UsbError> {
-        // Map MMIO region using ioremap (allocates virtual addresses from dedicated region)
-        let bar_size = self.pci_dev.bar_size(0);
-        match CurrentArch::ioremap(self.mmio_base, bar_size) {
-            Ok(virt) => {
-                // Update all base addresses to virtual address
-                let virt_base = virt as u64;
-                self.mmio_base = virt_base;
-                self.cap_regs = virt_base;
-            }
-            Err(e) => {
-                printkln!("xHCI: Failed to ioremap MMIO region: {:?}", e);
-                return Err(UsbError::NoResources);
-            }
+        let n = hcs_max_scratchpad(self.read_cap(0x08));
+        if n == 0 {
+            return Ok(());
         }
-        // frame_alloc still used for device context allocations below
-
-        // Read capability registers
-        let caplength = (self.read_cap(0) & 0xFF) as u64;
-        let hciversion = self.read_cap(0) >> 16;
-        let hcsparams1 = self.read_cap(0x04);
-        let dboff = self.read_cap(0x14);
-        let rtsoff = self.read_cap(0x18);
-
-        self.max_slots = (hcsparams1 & 0xFF) as u8;
-        self.max_ports = ((hcsparams1 >> 24) & 0xFF) as u8;
-
-        // Calculate register offsets
-        self.op_regs = self.mmio_base + caplength;
-        self.db_regs = self.mmio_base + (dboff as u64);
-        self.rt_regs = self.mmio_base + (rtsoff as u64);
-        self.port_regs = self.op_regs + 0x400; // Port registers start at offset 0x400
-
-        printkln!(
-            "xHCI: version={:x}.{:x}, max_slots={}, max_ports={}",
-            (hciversion >> 8) & 0xFF,
-            hciversion & 0xFF,
-            self.max_slots,
-            self.max_ports
-        );
-
-        // Stop controller if running
-        self.halt()?;
-
-        // Reset controller
-        self.reset_controller()?;
-
-        // Allocate Device Context Base Address Array
-        let dcbaa_phys = frame_alloc.alloc_frame().ok_or(UsbError::NoResources)?;
-        unsafe {
-            core::ptr::write_bytes(phys_to_virt(dcbaa_phys), 0, 4096);
+        // PAGESIZE bit 0: 4 KiB pages, the frame size; the array (8
+        // bytes per buffer) must fit one frame
+        if self.read_op(0x08) & 1 == 0 || n > 512 {
+            printkln!(
+                "xHCI: unsupported scratchpad layout: {} buffers, PAGESIZE {:#x}",
+                n,
+                self.read_op(0x08)
+            );
+            return Err(UsbError::NoResources);
         }
-        self.dcbaa_phys = dcbaa_phys;
-
-        // Allocate command ring
-        self.cmd_ring = Some(CommandRing::new(frame_alloc).ok_or(UsbError::NoResources)?);
-
-        // Allocate event ring
-        self.event_ring = Some(EventRing::new(frame_alloc).ok_or(UsbError::NoResources)?);
-
-        // Configure controller
-        self.configure()?;
-
-        // Enable interrupt mode (optional - falls back to polling if IRQ unavailable)
-        self.enable_interrupts()?;
-
-        // Start controller
-        self.start_controller()?;
-
-        self.initialized = true;
-        printkln!("xHCI: Controller initialized and running");
-
+        let zeroed = |fa: &mut dyn crate::bus::bus::FrameAllocWrapper| {
+            let phys = fa.alloc_frame()?;
+            // SAFETY: a fresh frame, in the direct map
+            unsafe { core::ptr::write_bytes(phys_to_virt(phys), 0, 4096) };
+            Some(phys)
+        };
+        let array = zeroed(frame_alloc).ok_or(UsbError::NoResources)?;
+        let entries = phys_to_virt(array) as *mut u64;
+        for i in 0..n {
+            let buf = zeroed(frame_alloc).ok_or(UsbError::NoResources)?;
+            // SAFETY: entry i of the array frame (n <= 512)
+            unsafe { write_volatile(entries.add(i as usize), buf) };
+        }
+        // SAFETY: entry 0 of the DCBAA frame
+        unsafe { write_volatile(phys_to_virt(self.dcbaa_phys) as *mut u64, array) };
+        printkln!("xHCI: {} scratchpad buffers", n);
         Ok(())
     }
 
     /// Halt the controller
     fn halt(&self) -> Result<(), UsbError> {
-        // Clear run bit
+        // Stop, with interrupts off (Linux xhci_halt, xhci_quiesce)
         let cmd = self.read_op(0x00);
-        self.write_op(0x00, cmd & !usbcmd::RUN_STOP);
+        self.write_op(0x00, cmd & !(usbcmd::RUN_STOP | XHCI_IRQS));
 
-        // Wait for HCH (halted) bit
-        for _ in 0..1000 {
-            if (self.read_op(0x04) & usbsts::HCH) != 0 {
-                return Ok(());
-            }
-            // Small delay
-            for _ in 0..1000 {
-                core::hint::spin_loop();
-            }
-        }
-
-        printkln!("xHCI: Timeout waiting for halt");
-        Err(UsbError::Timeout)
+        // Wait for HCH (halted) bit, polled per microframe (Linux
+        // xhci_halt)
+        let halted = || self.read_op(0x04) & usbsts::HCH != 0;
+        poll_timeout(XHCI_MAX_HALT_US, 125, halted).map_err(|_| {
+            printkln!("xHCI: Timeout waiting for halt");
+            UsbError::Timeout
+        })
     }
 
-    /// Reset the controller
-    fn reset_controller(&self) -> Result<(), UsbError> {
-        // Set reset bit
-        self.write_op(0x00, usbcmd::HCRST);
+    /// Reset the halted controller (Linux xhci_reset)
+    fn reset_controller(&self, timeout_us: u64) -> Result<(), UsbError> {
+        let sts = self.read_op(0x04);
+        if sts == !0 {
+            printkln!("xHCI: Host not accessible, reset failed.");
+            return Err(UsbError::NoDevice);
+        }
+        if sts & usbsts::HCH == 0 {
+            printkln!("xHCI: Host controller not halted, aborting reset.");
+            return Err(UsbError::Timeout);
+        }
+        let cmd = self.read_op(0x00);
+        self.write_op(0x00, cmd | usbcmd::HCRST);
 
-        // Wait for reset to complete
-        for _ in 0..1000 {
-            let cmd = self.read_op(0x00);
-            let sts = self.read_op(0x04);
-            if (cmd & usbcmd::HCRST) == 0 && (sts & usbsts::CNR) == 0 {
-                return Ok(());
-            }
-            // Small delay
-            for _ in 0..1000 {
-                core::hint::spin_loop();
-            }
+        // Intel xHCs need 1 ms after setting HCRST before any register
+        // access, or that access "may result in a system hang very
+        // rarely" (Linux XHCI_INTEL_HOST)
+        if self.quirks & quirk::INTEL_HOST != 0 {
+            udelay(1000);
         }
 
-        printkln!("xHCI: Timeout waiting for reset");
-        Err(UsbError::Timeout)
+        let reset_done = || self.read_op(0x00) & usbcmd::HCRST == 0;
+        // No register but USBSTS until Controller Not Ready clears
+        let ready = || self.read_op(0x04) & usbsts::CNR == 0;
+        poll_timeout(timeout_us, 10, reset_done)
+            .and_then(|_| poll_timeout(timeout_us, 10, ready))
+            .map_err(|_| {
+                printkln!("xHCI: Timeout waiting for reset");
+                UsbError::Timeout
+            })
     }
 
     /// Configure the controller
@@ -1031,43 +1080,28 @@ impl XhciController {
         let cmd = self.read_op(0x00);
         self.write_op(0x00, cmd | usbcmd::RUN_STOP);
 
-        // Wait for not halted
-        for _ in 0..1000 {
-            if (self.read_op(0x04) & usbsts::HCH) == 0 {
-                return Ok(());
-            }
-            // Small delay
-            for _ in 0..1000 {
-                core::hint::spin_loop();
-            }
-        }
-
-        printkln!("xHCI: Timeout waiting for start");
-        Err(UsbError::Timeout)
+        // Wait for not halted (Linux xhci_start)
+        let running = || self.read_op(0x04) & usbsts::HCH == 0;
+        poll_timeout(XHCI_MAX_HALT_US, 10, running).map_err(|_| {
+            printkln!("xHCI: Timeout waiting for start");
+            UsbError::Timeout
+        })
     }
 
     /// Wait for a command completion event
     fn wait_for_command(&mut self, _trb_addr: u64) -> Result<Trb, UsbError> {
         // Always poll the event ring - interrupt is just an optimization hint
         // to reduce polling frequency when we know hardware hasn't signaled yet
-        for _ in 0..10000 {
+        let mut result = None;
+        let _ = poll_timeout(XHCI_CMD_US, 0, || {
             // Clear any pending interrupt flag (to allow future interrupts)
             let _ = XHCI_IRQ_STATE
                 .interrupt_pending
                 .swap(false, Ordering::AcqRel);
-
-            // Always check the event ring
-            if let Some(result) = self.try_dequeue_command_event() {
-                return result;
-            }
-
-            // Small delay between polls
-            for _ in 0..100 {
-                core::hint::spin_loop();
-            }
-        }
-
-        Err(UsbError::Timeout)
+            result = self.try_dequeue_command_event();
+            result.is_some()
+        });
+        result.unwrap_or(Err(UsbError::Timeout))
     }
 
     /// Try to dequeue a command completion event
@@ -1150,26 +1184,25 @@ impl XhciController {
 
     /// Reset a port
     fn reset_port(&self, port: u8) -> Result<(), UsbError> {
-        // Read current value and preserve RW1C bits
+        // Set port reset, writing every other bit back neutrally
         let portsc = self.read_port(port, 0);
+        self.write_port(port, 0, portsc::to_neutral(portsc) | portsc::PR);
 
-        // Set port reset, preserve power
-        self.write_port(port, 0, (portsc & 0x0E00_00E0) | portsc::PR);
-
-        // Wait for reset to complete
-        for _ in 0..1000 {
-            let portsc = self.read_port(port, 0);
-            if (portsc & portsc::PR) == 0 && (portsc & portsc::PED) != 0 {
-                // Clear status change bits
-                self.write_port(port, 0, portsc | portsc::CSC | portsc::PRC);
-                return Ok(());
-            }
-            for _ in 0..1000 {
-                core::hint::spin_loop();
-            }
-        }
-
-        Err(UsbError::Timeout)
+        // Wait for reset to complete (Linux hub_port_wait_reset:
+        // HUB_RESET_TIMEOUT)
+        let mut portsc = 0;
+        let done = || {
+            portsc = self.read_port(port, 0);
+            portsc & portsc::PR == 0 && portsc & portsc::PED != 0
+        };
+        poll_timeout(PORT_RESET_US, 100, done).map_err(|_| UsbError::Timeout)?;
+        // Acknowledge the connect and reset changes (write 1 to clear)
+        self.write_port(
+            port,
+            0,
+            portsc::to_neutral(portsc) | portsc::CSC | portsc::PRC,
+        );
+        Ok(())
     }
 
     /// Address a device (xHCI Address Device command)
@@ -1177,8 +1210,10 @@ impl XhciController {
     /// This sets up the Device Context and Control Endpoint (EP0) for the device.
     fn address_device(&mut self, slot_id: u8, port: u8, speed: UsbSpeed) -> Result<(), UsbError> {
         // Create Device State with contexts
-        let output_ctx = OutputDeviceContext::new(&self.pci_dev).ok_or(UsbError::NoResources)?;
-        let mut input_ctx = InputContext::new(&self.pci_dev).ok_or(UsbError::NoResources)?;
+        let output_ctx =
+            OutputDeviceContext::new(&self.pci_dev, self.ctx_size).ok_or(UsbError::NoResources)?;
+        let mut input_ctx =
+            InputContext::new(&self.pci_dev, self.ctx_size).ok_or(UsbError::NoResources)?;
 
         // Create Transfer Ring for EP0 (Control Endpoint)
         let ep0_ring = TransferRing::new(&self.pci_dev).ok_or(UsbError::NoResources)?;
@@ -1365,32 +1400,32 @@ impl XhciController {
     }
 
     /// Wait for a transfer completion event
-    fn wait_for_transfer(&mut self, slot_id: u8, ep_dci: u8) -> Result<(u32, u8), UsbError> {
+    fn wait_for_transfer(
+        &mut self,
+        slot_id: u8,
+        ep_dci: u8,
+        timeout_us: u64,
+    ) -> Result<(u32, u8), UsbError> {
         // Always poll the event ring - interrupt is just an optimization hint
-        for i in 0..100000 {
+        let mut result = None;
+        let _ = poll_timeout(timeout_us, 0, || {
             // Clear any pending interrupt flag
             let _ = XHCI_IRQ_STATE
                 .interrupt_pending
                 .swap(false, Ordering::AcqRel);
-
-            // Always check the event ring
-            if let Some(result) = self.try_dequeue_transfer_event(slot_id, ep_dci) {
-                TRANSFER_COUNT.fetch_add(1, Ordering::Relaxed);
-                if usb_trace() {
-                    printkln!(
-                        "xHCI TRACE: transfer complete slot={} dci={} iter={}",
-                        slot_id,
-                        ep_dci,
-                        i
-                    );
-                }
-                return result;
+            result = self.try_dequeue_transfer_event(slot_id, ep_dci);
+            result.is_some()
+        });
+        if let Some(result) = result {
+            TRANSFER_COUNT.fetch_add(1, Ordering::Relaxed);
+            if usb_trace() {
+                printkln!(
+                    "xHCI TRACE: transfer complete slot={} dci={}",
+                    slot_id,
+                    ep_dci
+                );
             }
-
-            // Small delay between polls
-            for _ in 0..100 {
-                core::hint::spin_loop();
-            }
+            return result;
         }
 
         // More detailed timeout message for debugging
@@ -1474,7 +1509,16 @@ impl XhciController {
     }
 
     /// Perform a bulk OUT transfer
-    fn do_bulk_out(&mut self, slot_id: u8, endpoint: u8, data: &[u8]) -> Result<usize, UsbError> {
+    fn do_bulk_out(
+        &mut self,
+        slot_id: u8,
+        endpoint: u8,
+        data: &[u8],
+        timeout_us: u64,
+    ) -> Result<usize, UsbError> {
+        if !self.initialized {
+            return Err(UsbError::NoDevice);
+        }
         let ep_dci = endpoint_to_dci(endpoint);
 
         if usb_trace() {
@@ -1522,7 +1566,7 @@ impl XhciController {
         self.ring_doorbell(slot_id, ep_dci);
 
         // Wait for completion
-        let (residue, cc) = self.wait_for_transfer(slot_id, ep_dci)?;
+        let (residue, cc) = self.wait_for_transfer(slot_id, ep_dci, timeout_us)?;
 
         // Advance transfer ring dequeue pointer to track completion
         if let Some(state) = self.device_states.get_mut(&slot_id)
@@ -1550,7 +1594,11 @@ impl XhciController {
         slot_id: u8,
         endpoint: u8,
         data: &mut [u8],
+        timeout_us: u64,
     ) -> Result<usize, UsbError> {
+        if !self.initialized {
+            return Err(UsbError::NoDevice);
+        }
         let ep_dci = endpoint_to_dci(endpoint | 0x80); // IN direction
 
         if usb_trace() {
@@ -1598,7 +1646,7 @@ impl XhciController {
         self.ring_doorbell(slot_id, ep_dci);
 
         // Wait for completion
-        let (residue, cc) = self.wait_for_transfer(slot_id, ep_dci)?;
+        let (residue, cc) = self.wait_for_transfer(slot_id, ep_dci, timeout_us)?;
 
         // Advance transfer ring dequeue pointer to track completion
         if let Some(state) = self.device_states.get_mut(&slot_id)
@@ -1724,6 +1772,29 @@ impl XhciController {
         Ok(())
     }
 
+    /// Quiesce the controller for power-off or restart (Linux
+    /// xhci_shutdown, xhci_pci_shutdown): no freeing, the machine goes
+    /// down next. Ports routed back to EHCI on the Intel chipsets that
+    /// otherwise power back on (XHCI_SPURIOUS_REBOOT); halted with
+    /// interrupts off; reset and put in D3hot where the halt alone
+    /// leaves spurious wakeups (XHCI_SPURIOUS_WAKEUP). Transfers fail
+    /// from here on.
+    fn shutdown_hc(&mut self) {
+        let spurious_wakeup = self.quirks & quirk::SPURIOUS_WAKEUP != 0;
+        if self.quirks & quirk::SPURIOUS_REBOOT != 0 {
+            super::pci_quirks::disable_intel_ports(&self.pci_dev);
+        }
+        let _ = self.halt();
+        if spurious_wakeup {
+            let _ = self.reset_controller(XHCI_RESET_SHORT_US);
+        }
+        self.initialized = false;
+        XHCI_IRQ_STATE.enabled.store(false, Ordering::Release);
+        if spurious_wakeup {
+            self.pci_dev.set_power_d3hot();
+        }
+    }
+
     /// Shutdown the entire xHCI controller (driver unload/hotplug)
     ///
     /// Stops all devices, halts the controller, and unregisters IRQ.
@@ -1776,7 +1847,7 @@ impl Device for XhciController {
 impl UsbController for XhciController {
     fn reset(&mut self) -> Result<(), UsbError> {
         self.halt()?;
-        self.reset_controller()
+        self.reset_controller(XHCI_RESET_SHORT_US)
     }
 
     fn start(&mut self) -> Result<(), UsbError> {
@@ -1860,7 +1931,7 @@ impl UsbController for XhciController {
         endpoint: u8,
         data: &[u8],
     ) -> Result<usize, UsbError> {
-        self.do_bulk_out(device.slot_id, endpoint, data)
+        self.do_bulk_out(device.slot_id, endpoint, data, XHCI_TRANSFER_US)
     }
 
     fn bulk_in(
@@ -1869,23 +1940,33 @@ impl UsbController for XhciController {
         endpoint: u8,
         data: &mut [u8],
     ) -> Result<usize, UsbError> {
-        self.do_bulk_in(device.slot_id, endpoint, data)
+        self.do_bulk_in(device.slot_id, endpoint, data, XHCI_TRANSFER_US)
     }
 }
 
-/// Initialize xHCI and enumerate devices
-pub fn init_xhci<FA: FrameAlloc<PhysAddr = u64>>(
-    pci_dev: &PciDevice,
-    frame_alloc: &mut FA,
-) -> Result<XhciController, UsbError> {
-    let mmio_base = pci_dev.bar_address(0).ok_or(UsbError::NoResources)?;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    // Enable memory space and bus mastering
-    pci_dev.enable_memory_space();
-    pci_dev.enable_bus_master();
+    /// Neutral keeps power and status, never writes PED, PR or the
+    /// change bits
+    #[test]
+    fn portsc_neutral() {
+        let live = 0x0002_1203 | portsc::PRC | (1 << 9); // connected, enabled, changes pending, powered
+        let n = portsc::to_neutral(live);
+        assert_eq!(n & (1 << 9), 1 << 9);
+        assert_eq!(n & portsc::CCS, portsc::CCS);
+        assert_eq!(
+            n & (portsc::PED | portsc::PR | portsc::CSC | portsc::PRC),
+            0
+        );
+    }
 
-    let mut controller = XhciController::new(mmio_base, pci_dev.clone());
-    controller.init(frame_alloc)?;
-
-    Ok(controller)
+    #[test]
+    fn scratchpad_count() {
+        assert_eq!(hcs_max_scratchpad(0), 0);
+        assert_eq!(hcs_max_scratchpad(4 << 27), 4);
+        assert_eq!(hcs_max_scratchpad(1 << 21), 32);
+        assert_eq!(hcs_max_scratchpad(0xffff_ffff), 1023);
+    }
 }

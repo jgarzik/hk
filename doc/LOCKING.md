@@ -484,6 +484,13 @@ vruntime, deadline, lag and exec_start change under the rq lock of its
 CPU, and the tick charges the running one under it), idle (never
 queued). A woken task preempts a lower class, a lower rt priority, or
 a fair task EEVDF would not pick at that point (not for SCHED_BATCH/IDLE).
+rt bandwidth (`task/rt.rs`, Linux rt_rq->rt_time): `CpuRunQueue.rt_bw`
+holds the rt time run on that CPU in the current 1 s period, under its
+rq lock (charged by the tick and when an rt task switches out). Once
+it reaches 950 ms, fair tasks rank above rt ones there (pick and
+wakeup preemption) while any is runnable, until the period ends (the
+tick of a running fair task rolls it over and reschedules).
+It has no lock of its own.
 `CpuRunQueue.min_vruntime` (under the rq lock) stands for the average
 when no fair task is there.
 
@@ -1382,7 +1389,12 @@ reschedule (`resched_curr` after queueing a task on its run queue,
 - `ACTIVE` (global `CpuMask`): CPUs that service IPIs, each set once at
   boot after its interrupt controller is up and interrupts enabled
   (`smp::set_active`, which then flushes its own TLB: a kernel-range
-  flush may have skipped it). Global: every sender needs every CPU's
+  flush may have skipped it), and cleared once more at the very end:
+  `smp::stop_other_cpus` (halt, power-off, restart, after
+  device_shutdown; Linux smp_send_stop) sends each other CPU
+  `stop_this_cpu`, which clears its bit and halts with interrupts off
+  inside the IPI, never releasing its call slot. The stopper waits up
+  to 1 s for the bits to clear. Global: every sender needs every CPU's
   state, and it changes once per CPU.
 - `func` runs in interrupt context with interrupts off (IPI handler, or
   the sender's own wait loop): it may only touch atomics, per-CPU data
@@ -2889,6 +2901,9 @@ not rely on either.
 | virtio-net `config_pending`; `VringCb` (RX avail NO_INTERRUPT flag) | atomics / lock-free MMIO-style store | IRQ + thread | the ISR suppresses RX interrupts and flags config changes; the poll re-enables under `rx` only while `netif_running`, and `stop` suppresses under `rx` |
 | virtio-PCI transport (`virtio/pci.rs`) | none | probe (single-threaded enumeration), then IRQ (ISR byte) | common config written only during probe; device config reads are generation-checked and lock-free; queue notify writes happen under the caller's queue lock |
 | `virtio::DRIVERS` | `spin::Mutex<Vec>` | thread only (boot) | leaf; registered before bus enumeration, read by the PCI match/probe |
+| `SYSTEM_TRANSITION` (`power.rs`) | sleeping `sync::Mutex<()>` | thread only (reboot(2)) | Linux system_transition_mutex: held from after the permission and magic checks through `device_shutdown` and the arch power-off/restart/halt, which do not return; outermost: taken before `SYSTEM_BUSES` and every driver lock the shutdown callbacks take |
+| x86 `power::POWER` (`arch/x86_64/power.rs`) | `spin::Once` | thread only (boot set; power-off/reboot read) | set once from the FADT before `reboot(2)` can run, read lock-free after; the ACPI register sequences (`acpi/hw.rs`) take no locks |
+| `bus::SYSTEM_BUSES` (`bus/bus.rs`) | sleeping `sync::Mutex<Option<BusManager>>` | thread only | set once after boot enumeration; `device_shutdown` (reboot(2), Linux device_shutdown) takes the manager out under it and runs the `Device::shutdown` callbacks after dropping it, so callbacks (which may poll hardware or take driver locks such as `USB_CONTROLLER`) never run under it |
 
 **Lock order (outermost first):**
 
@@ -3046,6 +3061,8 @@ else is taken under it) unless an order is given. "spin" is the
 | `SimpleGfxDevice.state`, `GFX_DEVICES`, `NEXT_MINOR` | gfx/ | spin | framebuffer device state and registry |
 | `UsbMscDevice.state` | usb/msc.rs | spin | USB mass-storage device state |
 | `INTX_MAP` | arch/aarch64/pci_irq.rs | spin Mutex | PCI INTx routing from the device tree (boot) |
+| `PCI_LOCK` | arch/x86_64/pci_conf.rs (port I/O config access) | IrqSpinlock | Linux pci_lock: the CF8 address write and the CFC data access of one config read/write; leaf (port I/O only). ECAM accesses are single MMIO operations and take no lock |
+| PCI fixups (`bus/quirks.rs`) | none | thread only (boot) | run by bus enumeration (single-threaded) on each function before driver probe |
 | `CMDLINE_CONSOLE`, `CRNG` | cmdline.rs, random.rs | spin Mutex | console= choice, CRNG state |
 | `NUMA_TOPOLOGY` | numa.rs | IrqSpinlock | NUMA node table |
 | `BpfHashMap.data`, `BpfArrayMap.data` | bpf/map.rs | IrqSpinlock | BPF map contents |
