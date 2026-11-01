@@ -351,6 +351,23 @@ bytes of kmalloc (~1.3KB; suspected: procfs entries of dead pids, for
 the dcache work). The MM_LIFE tests count MemFree + Slab so they check user memory only; these leaks
 are listed here instead.
 
+## The memory cgroup's memory.max is not enforced
+
+**Location**: `kernel/cgroup/memory.rs`, `kernel/mm/fault.rs`, `kernel/mm/shmem.rs`
+
+memory.max, memory.current and memory.events exist, but nothing calls
+`try_charge_memory`/`uncharge_memory`: page faults (anonymous and
+shmem) and page tables are never charged, freed pages never uncharged,
+and memory.events oom/oom_kill stay 0. Linux charges each page to its
+memcg (folio memcg_data, mem_cgroup_charge), uncharges on free, and
+over the limit reclaims, then OOM-kills a task in the cgroup
+(mem_cgroup_out_of_memory).
+
+Once enforced, OOM_FAULT_KILL and OOM_SHARED_KILL can run in a small
+cgroup (say memory.max 64MB) at any RAM size, and on Linux too,
+instead of filling all of RAM and being skipped above 4GB
+(`user/boot_tester/tests/mm_oom.rs`).
+
 ## BPF map memory is not charged
 
 **Location**: `kernel/bpf/map.rs`
