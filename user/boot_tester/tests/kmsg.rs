@@ -4,6 +4,8 @@
 //! - KMSG_WRITE_READ: after SEEK_END, a written `<5>text\n` comes back as
 //!   one record `13,seq,usec,...;text\n` (facility 0 becomes LOG_USER),
 //!   then a nonblocking read is EAGAIN
+//! - KMSG_FACILITY: `<256>` is facility 32 (pri 256), not wrapped into
+//!   facility 0 (a kernel message)
 //! - KMSG_SEEK: a read into a buffer smaller than the first record is
 //!   EINVAL; lseek with a nonzero offset is ESPIPE, SEEK_CUR is EINVAL
 //! - KMSG_SYSLOG: syslog READ_ALL returns `<pri>[` lines including the
@@ -39,6 +41,7 @@ pub fn run_tests() {
         return;
     }
     write_read(fd);
+    facility(fd);
     seek(fd);
     sys_close(fd as u64);
     syslog();
@@ -128,6 +131,21 @@ fn write_read(fd: i32) {
     let again = sys_read(fd as u64, buf.as_mut_ptr(), buf.len() as u64);
     if again != EAGAIN {
         return report(n, b"not EAGAIN at end", again);
+    }
+    report(n, b"", 0);
+}
+
+fn facility(fd: i32) {
+    let n = b"KMSG_FACILITY";
+    sys_lseek(fd, 0, SEEK_END);
+    let msg = b"<256>hk kmsg facility\n";
+    if sys_write(fd as u64, msg.as_ptr(), msg.len() as u64) != msg.len() as i64 {
+        return report(n, b"write", 0);
+    }
+    let mut buf = [0u8; 256];
+    let r = sys_read(fd as u64, buf.as_mut_ptr(), buf.len() as u64);
+    if r <= 0 || !buf.starts_with(b"256,") {
+        return report(n, b"pri", r);
     }
     report(n, b"", 0);
 }

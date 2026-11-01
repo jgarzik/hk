@@ -42,15 +42,15 @@ pub const LOG_LINE_MAX: usize = 992;
 pub const DEFAULT_LEVEL: u8 = 4;
 /// syslog facility of user-written records (Linux LOG_USER)
 const LOG_USER: u8 = 1;
-/// Record header: len u16, text_len u16, pri u8, 3 pad, ts u64
+/// Record header: len u16, text_len u16, pri u16, 2 pad, ts u64
 const HDR: usize = 16;
 
 /// One record as read from the ring
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Rec<'a> {
     pub seq: u64,
-    /// facility << 3 | level
-    pub pri: u8,
+    /// facility << 3 | level (Linux: facility up to 127)
+    pub pri: u16,
     pub ts_ns: u64,
     pub text: &'a [u8],
 }
@@ -121,7 +121,7 @@ impl LogBuf {
         let at = self.unwrap_idx(idx);
         let len = self.rd16(at);
         let text_len = self.rd16(at + 2);
-        let pri = self.data[at + 4];
+        let pri = u16::from_le_bytes([self.data[at + 4], self.data[at + 5]]);
         let ts = u64::from_le_bytes(self.data[at + 8..at + 16].try_into().unwrap());
         let text = &self.data[at + HDR..at + HDR + text_len];
         Some((
@@ -159,7 +159,7 @@ impl LogBuf {
 
     /// Append a record (text cut at LOG_LINE_MAX), dropping the oldest
     /// ones as needed; returns its seq
-    pub fn push(&mut self, pri: u8, ts_ns: u64, text: &[u8]) -> u64 {
+    pub fn push(&mut self, pri: u16, ts_ns: u64, text: &[u8]) -> u64 {
         let text = &text[..text.len().min(LOG_LINE_MAX)];
         let size = (HDR + text.len() + 3) & !3;
         if self.first_seq == self.next_seq {
@@ -179,8 +179,8 @@ impl LogBuf {
         let at = self.next_idx;
         self.data[at..at + 2].copy_from_slice(&(size as u16).to_le_bytes());
         self.data[at + 2..at + 4].copy_from_slice(&(text.len() as u16).to_le_bytes());
-        self.data[at + 4] = pri;
-        self.data[at + 5..at + 8].fill(0);
+        self.data[at + 4..at + 6].copy_from_slice(&pri.to_le_bytes());
+        self.data[at + 6..at + 8].fill(0);
         self.data[at + 8..at + 16].copy_from_slice(&ts_ns.to_le_bytes());
         self.data[at + HDR..at + HDR + text.len()].copy_from_slice(text);
         self.next_idx = at + size;
@@ -237,7 +237,13 @@ pub fn log_text(bytes: &[u8], panicking: bool) {
     } else {
         LOG.lock()
     };
-    let now = crate::time::monotonic_ns();
+    // No clock read while panicking: the panic may be inside the
+    // timekeeper's write section, where a read would spin
+    let now = if panicking {
+        0
+    } else {
+        crate::time::monotonic_ns()
+    };
     for &b in bytes {
         if log.line_len == 0 {
             log.line_ts = now;
@@ -251,8 +257,8 @@ pub fn log_text(bytes: &[u8], panicking: bool) {
                 ..
             } = &mut *log;
             let (level, text) = match &line[..*line_len] {
-                [1, l @ b'0'..=b'7', rest @ ..] => (l - b'0', rest),
-                t => (DEFAULT_LEVEL, t),
+                [1, l @ b'0'..=b'7', rest @ ..] => ((l - b'0') as u16, rest),
+                t => (DEFAULT_LEVEL as u16, t),
             };
             buf.push(level, *line_ts, text);
             *line_len = 0;
@@ -267,13 +273,14 @@ pub fn log_text(bytes: &[u8], panicking: bool) {
 
 /// Wake readers if records came in (the scheduler tick: no locks held)
 pub fn tick() {
-    if WAKE_PENDING.swap(false, Ordering::AcqRel) {
+    // A plain load first: every CPU's tick would otherwise write the line
+    if WAKE_PENDING.load(Ordering::Relaxed) && WAKE_PENDING.swap(false, Ordering::AcqRel) {
         WAITERS.wake_all();
     }
 }
 
 /// Add a record directly (a /dev/kmsg write) and show it on the console
-fn emit(pri: u8, text: &[u8]) {
+fn emit(pri: u16, text: &[u8]) {
     LOG.lock().buf.push(pri, crate::time::monotonic_ns(), text);
     WAKE_PENDING.store(true, Ordering::Release);
     crate::printk::console_line(text);
@@ -333,8 +340,6 @@ fn format_syslog(r: &Rec<'_>, out: &mut Vec<u8>) {
     out.push(b'\n');
 }
 
-/// Most records the ring can hold (each at least a header)
-const MAX_RECS: usize = LOG_BUF_LEN / HDR;
 /// Longest formatted record: header text plus every byte escaped
 const MAX_FMT: usize = 64 + 4 * LOG_LINE_MAX;
 
@@ -351,20 +356,73 @@ pub fn syslog_size_buffer() -> usize {
     LOG_BUF_LEN
 }
 
-/// syslog(2) SIZE_UNREAD: bytes READ would return
-pub fn syslog_size_unread() -> usize {
-    let mut tmp = Vec::with_capacity(MAX_FMT);
+/// A copy of the ring and a cursor, taken under LOG (one memcpy into a
+/// buffer allocated before locking) so formatting runs with IRQs on
+fn snapshot(
+    cursor: impl FnOnce(&Log) -> (u64, usize),
+) -> (alloc::boxed::Box<LogBuf>, (u64, usize)) {
+    // Zeroed on the heap (all zero is an empty ring): built on the stack
+    // first, 128KB would overflow a kernel stack
+    // SAFETY: every field of LogBuf is an integer or integer array
+    let mut snap = unsafe { alloc::boxed::Box::<LogBuf>::new_zeroed().assume_init() };
     let log = LOG.lock();
-    let (mut seq, mut idx) = valid(&log.buf, log.syslog);
-    let mut n = 0;
-    while let Some((r, next)) = log.buf.read(seq, idx) {
+    snap.data.copy_from_slice(&log.buf.data);
+    snap.first_idx = log.buf.first_idx;
+    snap.next_idx = log.buf.next_idx;
+    snap.first_seq = log.buf.first_seq;
+    snap.next_seq = log.buf.next_seq;
+    let c = valid(&log.buf, cursor(&log));
+    (snap, c)
+}
+
+/// syslog-format the records of `buf` from `start` on: the bytes, and
+/// the cursor after the last record that fit in `len`; with `newest`,
+/// the oldest records are the ones left out
+fn format_from(
+    buf: &LogBuf,
+    start: (u64, usize),
+    len: usize,
+    newest: bool,
+) -> (Vec<u8>, (u64, usize)) {
+    let mut tmp = Vec::new();
+    let mut sizes = Vec::new();
+    let (mut seq, mut idx) = start;
+    while let Some((r, next)) = buf.read(seq, idx) {
         tmp.clear();
         format_syslog(&r, &mut tmp);
-        n += tmp.len();
+        sizes.push(tmp.len());
         seq += 1;
         idx = next;
     }
-    n
+    let mut skip = 0;
+    if newest {
+        let mut total: usize = sizes.iter().sum();
+        while total > len && skip < sizes.len() {
+            total -= sizes[skip];
+            skip += 1;
+        }
+    }
+    let mut out = Vec::new();
+    let (mut seq, mut idx) = start;
+    let mut i = 0;
+    while let Some((r, next)) = buf.read(seq, idx) {
+        if i >= skip {
+            if !newest && out.len() + sizes[i] > len {
+                break;
+            }
+            format_syslog(&r, &mut out);
+        }
+        i += 1;
+        seq += 1;
+        idx = next;
+    }
+    (out, (seq, idx))
+}
+
+/// syslog(2) SIZE_UNREAD: bytes READ would return
+pub fn syslog_size_unread() -> usize {
+    let (snap, start) = snapshot(|l| l.syslog);
+    format_from(&snap, start, usize::MAX, false).0.len()
 }
 
 /// syslog(2) CLEAR: later READ_ALL starts after the current records
@@ -376,39 +434,14 @@ pub fn syslog_clear() {
 /// syslog(2) READ_ALL (and READ_CLEAR with `clear`): the newest records
 /// since the last CLEAR that fit in `len` bytes, oldest first
 pub fn syslog_read_all(len: usize, clear: bool) -> Vec<u8> {
-    // Allocated before LOG (IRQs off) is taken, large enough not to grow
-    let mut sizes = Vec::with_capacity(MAX_RECS);
-    let mut tmp = Vec::with_capacity(MAX_FMT);
-    let mut out = Vec::with_capacity(len.min(LOG_BUF_LEN + MAX_RECS * 64));
-    let mut log = LOG.lock();
-    let start = valid(&log.buf, log.clear);
-    // Formatted sizes, to skip the oldest that do not fit
-    let (mut seq, mut idx) = start;
-    while let Some((r, next)) = log.buf.read(seq, idx) {
-        tmp.clear();
-        format_syslog(&r, &mut tmp);
-        sizes.push(tmp.len());
-        seq += 1;
-        idx = next;
-    }
-    let mut total: usize = sizes.iter().sum();
-    let (mut seq, mut idx) = start;
-    let mut skip = 0;
-    while total > len && skip < sizes.len() {
-        total -= sizes[skip];
-        skip += 1;
-    }
-    let mut i = 0;
-    while let Some((r, next)) = log.buf.read(seq, idx) {
-        if i >= skip {
-            format_syslog(&r, &mut out);
-        }
-        i += 1;
-        seq += 1;
-        idx = next;
-    }
+    let (snap, start) = snapshot(|l| l.clear);
+    let (out, end) = format_from(&snap, start, len, true);
     if clear {
-        log.clear = (log.buf.next_seq(), log.buf.next_idx());
+        let mut log = LOG.lock();
+        // Records added since the snapshot stay after the clear point
+        if log.clear.0 <= end.0 {
+            log.clear = end;
+        }
     }
     out
 }
@@ -420,21 +453,12 @@ pub fn syslog_read(len: usize) -> Result<Vec<u8>, KernelError> {
         let log = LOG.lock();
         valid(&log.buf, log.syslog).0 < log.buf.next_seq()
     })?;
-    let mut out = Vec::with_capacity(len.min(LOG_BUF_LEN + MAX_RECS * 64));
-    let mut tmp = Vec::with_capacity(MAX_FMT);
+    let (snap, start) = snapshot(|l| l.syslog);
+    let (out, end) = format_from(&snap, start, len, false);
     let mut log = LOG.lock();
-    let (mut seq, mut idx) = valid(&log.buf, log.syslog);
-    while let Some((r, next)) = log.buf.read(seq, idx) {
-        tmp.clear();
-        format_syslog(&r, &mut tmp);
-        if out.len() + tmp.len() > len {
-            break;
-        }
-        out.extend_from_slice(&tmp);
-        seq += 1;
-        idx = next;
+    if log.syslog.0 <= end.0 {
+        log.syslog = end;
     }
-    log.syslog = (seq, idx);
     Ok(out)
 }
 
@@ -535,7 +559,7 @@ impl crate::fs::FileOps for KmsgFileOps {
                 return Ok(buf.len());
             }
         }
-        let (mut fac, mut level, mut text) = (LOG_USER, DEFAULT_LEVEL, buf);
+        let (mut fac, mut level, mut text) = (LOG_USER as u16, DEFAULT_LEVEL as u16, buf);
         if let [b'<', rest @ ..] = buf
             && let Some(end) = rest.iter().position(|&c| c == b'>')
             && end > 0
@@ -543,10 +567,12 @@ impl crate::fs::FileOps for KmsgFileOps {
                 .ok()
                 .and_then(|s| s.parse::<u32>().ok())
         {
-            level = (n & 7) as u8;
-            fac = ((n >> 3) & 0xff) as u8;
+            // Linux LOG_LEVEL / LOG_FACILITY (LOG_FACMASK 0x3f8): the
+            // facility is 0..127, and 0 (the kernel) becomes LOG_USER
+            level = (n & 7) as u16;
+            fac = ((n & 0x3f8) >> 3) as u16;
             if fac == 0 {
-                fac = LOG_USER;
+                fac = LOG_USER as u16;
             }
             text = &rest[end + 1..];
         }

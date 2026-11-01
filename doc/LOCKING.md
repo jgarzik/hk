@@ -2243,7 +2243,8 @@ records that /dev/kmsg and syslog(2) read. printk adds each complete
 line under OUTPUT_LOCK (try_lock while panicking); a /dev/kmsg write
 adds its record under `LOG` alone, then writes the console under
 OUTPUT_LOCK. Nothing allocates under `LOG`: readers size their
-buffers before taking it. printk may run with run-queue locks held,
+buffers before taking it, and syslog reads copy the ring out (one
+memcpy) and format after releasing it. printk may run with run-queue locks held,
 so it never wakes readers itself: it sets `WAKE_PENDING`, and the
 scheduler tick (no locks held) wakes them (Linux defers the klogd
 wakeup through irq_work).
