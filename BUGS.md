@@ -446,6 +446,22 @@ all of them.
   endpoints (0x81/0x02); `main.rs` makes `sda` of the first one.
 - Only 4 KiB controller pages and up to 512 scratchpad buffers.
 
+## No DMA for 32-bit devices with RAM above 4GB
+
+**Location**: `kernel/dma.rs`, `kernel/frame_alloc.rs`,
+`kernel/net/driver/e1000.rs`, `kernel/usb/xhci.rs`
+
+`DirectDmaOps` only checks the mask: a buffer or coherent frame above
+the device's mask fails (`None`) instead of being bounced (Linux
+swiotlb) or allocated low (Linux ZONE_DMA32 / GFP_DMA32). PCI devices
+default to a 32-bit mask, so with RAM above 4GB:
+- e1000 never widens its mask (Linux does only for PCI-X; QEMU's e1000
+  is PCI): its ring and buffer allocations fail once frames above 4GB
+  are handed out (`NIC=e1000` with `QEMU_MEM` > ~3.5G).
+- An xHCI without HCCPARAMS1.AC64 gets the 32-bit mask, but its DCBAA,
+  scratchpads, command and event rings come straight from the frame
+  allocator with no mask check.
+
 ## x86 has no IOAPIC or MSI
 
 **Location**: `kernel/arch/x86_64/irq.rs`, `kernel/bus/pci.rs`
