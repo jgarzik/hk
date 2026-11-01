@@ -3,7 +3,7 @@
 //! Sets up the IDT with exception handlers and IRQ handlers.
 
 use ::core::mem::size_of;
-use ::core::sync::atomic::Ordering;
+use ::core::sync::atomic::{AtomicU64, Ordering};
 
 use super::PtRegs;
 use super::cpu::KERNEL_CODE_SELECTOR;
@@ -11,9 +11,9 @@ use super::entry;
 use super::lapic;
 use super::pic;
 use crate::mm::fault::{Access, VmFault};
-use crate::printkln;
 use crate::signal::{KSigInfo, si_code};
 use crate::uaccess::pagefault_disabled;
+use crate::{printk, printkln};
 
 /// LAPIC timer interrupt vector
 pub const LAPIC_TIMER_VECTOR: u8 = 0x40;
@@ -243,6 +243,19 @@ pub fn init_idt() {
             .set_handler(entry::call_function_ipi as *const () as u64, GATE_INTERRUPT);
         IDT[RESCHEDULE_VECTOR as usize]
             .set_handler(entry::reschedule_ipi as *const () as u64, GATE_INTERRUPT);
+
+        // Every other vector gets a catch-all stub (Linux idt_setup_apic_
+        // and_irq_gates: spurious_entries_start), so a stray interrupt (the
+        // LAPIC spurious vector, APIC errors, a vector left programmed by
+        // firmware) is reported instead of raising #NP. Not #VC/#SX
+        // (29, 30): they push an error code and hk never enables them.
+        let idt = &raw mut IDT;
+        for v in 0..IDT_ENTRIES {
+            let gate = &mut (*idt)[v];
+            if gate.type_attr == 0 && !matches!(v, 29 | 30) {
+                gate.set_handler(entry::vector_stub(v as u8), GATE_INTERRUPT);
+            }
+        }
     }
     load_idt();
 }
@@ -286,7 +299,8 @@ pub extern "C" fn idt_dispatch(regs: &mut PtRegs, vector: u64) {
         v if v == LAPIC_TIMER_VECTOR as u64 => handle_lapic_timer(),
         v if v == CALL_FUNCTION_VECTOR as u64 => handle_call_function(),
         v if v == RESCHEDULE_VECTOR as u64 => handle_reschedule(),
-        _ => {}
+        v if v == lapic::ERROR_APIC_VECTOR as u64 => handle_apic_error(),
+        v => handle_spurious(v as u8),
     }
     // Back to user mode: its pending work first (Linux
     // irqentry_exit_to_user_mode); not for NMI, #DF, #MC (paranoid)
@@ -624,6 +638,72 @@ fn handle_call_function() {
 fn handle_reschedule() {
     lapic::eoi();
     in_irq(crate::smp::reschedule_interrupt);
+}
+
+/// Spurious interrupts so far (Linux IRQ_COUNT_SPURIOUS)
+static SPURIOUS_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Report the first few of a kind, then only count (printk from
+/// interrupt context is slow; an interrupt storm would flood it)
+fn report_irq(count: &AtomicU64) -> bool {
+    count.fetch_add(1, Ordering::Relaxed) < 10
+}
+
+/// An interrupt on a vector with no handler (Linux spurious_interrupt,
+/// handle_spurious_interrupt): the LAPIC's spurious vector is never
+/// acknowledged (SDM vol 3); any other is acknowledged if in service
+fn handle_spurious(vector: u8) {
+    let cpu = crate::cpu::try_this_id().map_or(-1, |c| c as i64);
+    let report = report_irq(&SPURIOUS_COUNT);
+    if vector == lapic::SPURIOUS_APIC_VECTOR {
+        if report {
+            printkln!("Spurious APIC interrupt (vector 0xFF) on CPU#{}", cpu);
+        }
+        return;
+    }
+    let acked = lapic::in_service(vector);
+    if acked {
+        lapic::eoi();
+    }
+    if report {
+        printkln!(
+            "Spurious interrupt (vector {:#04x}) on CPU#{}. {}",
+            vector,
+            cpu,
+            if acked { "Acked" } else { "Not pending!" }
+        );
+    }
+}
+
+/// APIC errors so far (Linux IRQ_COUNT_PIC_APIC_ERROR)
+static APIC_ERROR_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// LVT Error interrupt (Linux sysvec_error_interrupt): latch the ESR,
+/// acknowledge, report the error bits
+fn handle_apic_error() {
+    const REASONS: [&str; 8] = [
+        "Send CS error",
+        "Receive CS error",
+        "Send accept error",
+        "Receive accept error",
+        "Redirectable IPI",
+        "Send illegal vector",
+        "Received illegal vector",
+        "Illegal register address",
+    ];
+    let esr = lapic::read_esr();
+    lapic::eoi();
+    if !report_irq(&APIC_ERROR_COUNT) {
+        return;
+    }
+    let cpu = crate::cpu::try_this_id().map_or(-1, |c| c as i64);
+    printk!("APIC error on CPU{}: {:02x}", cpu, esr & 0xff);
+    for (i, why) in REASONS.iter().enumerate() {
+        if esr & (1 << i) != 0 {
+            printk!(" : {}", why);
+        }
+    }
+    printkln!("");
 }
 
 /// LAPIC timer interrupt
