@@ -87,8 +87,9 @@ pub fn enable() {
         printkln!("ACPI: enabled ACPI mode");
     } else {
         printkln!(
-            "ACPI: timeout entering ACPI mode (SMI_CMD {:#x})",
-            p.pm.smi_cmd
+            "ACPI: hardware did not enter ACPI mode (SMI_CMD {:#x} ACPI_ENABLE {:#x})",
+            p.pm.smi_cmd,
+            p.pm.acpi_enable
         );
         return;
     }
@@ -169,13 +170,16 @@ fn kb_wait() {
 
 /// PCH reset control register
 const RST_CNT: u16 = 0xcf9;
-/// RST_CNT: SYS_RST (hard reset) and RST_CPU (do it)
+/// RST_CNT: SYS_RST (hard reset), RST_CPU (do it) and FULL_RST (power
+/// cycle)
 const RST_SYS: u8 = 1 << 1;
 const RST_CPU: u8 = 1 << 2;
+const RST_FULL: u8 = 1 << 3;
 
-/// Hard reset through port 0xCF9 (Linux BOOT_CF9_SAFE)
+/// Cold reset through port 0xCF9 (Linux BOOT_CF9_SAFE with its default
+/// REBOOT_COLD: code 0x0e)
 fn cf9_reset() {
-    let code = RST_SYS | RST_CPU;
+    let code = RST_SYS | RST_CPU | RST_FULL;
     let cf9 = inb(RST_CNT) & !code;
     outb(RST_CNT, cf9 | RST_SYS);
     crate::delay::udelay(50);

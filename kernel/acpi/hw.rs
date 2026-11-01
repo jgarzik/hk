@@ -77,7 +77,8 @@ const GBL_RLS: u16 = 1 << 2;
 /// ACPI_PM1_CONTROL_WRITEONLY_BITS)
 const PM1_CNT_WRITEONLY: u16 = SLP_EN | GBL_RLS;
 
-/// The firmware never set SCI_EN after the ACPI enable command
+/// The hardware did not enter ACPI mode: SCI_EN stayed clear after the
+/// enable command, or there is no enable command to send
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EnableTimeout;
 
@@ -90,14 +91,19 @@ pub fn acpi_mode(io: &mut impl PortIo, regs: &PmRegs) -> bool {
 /// Put the fixed hardware in ACPI mode (Linux acpi_enable ->
 /// acpi_hw_set_mode(ACPI_SYS_MODE_ACPI)): if SCI_EN is clear, write
 /// ACPI_ENABLE to SMI_CMD and wait for SCI_EN, up to 3 s (Linux
-/// acpi_enable's wait)
+/// acpi_enable's wait). With no ACPI_ENABLE value there is nothing to
+/// send, and the hardware stays in legacy mode: an error, as in Linux
+/// ("Hardware did not enter ACPI mode")
 pub fn acpi_enable(
     io: &mut impl PortIo,
     regs: &PmRegs,
     clock: &mut impl crate::delay::Clock,
 ) -> Result<(), EnableTimeout> {
-    if acpi_mode(io, regs) || regs.acpi_enable == 0 {
+    if acpi_mode(io, regs) {
         return Ok(());
+    }
+    if regs.acpi_enable == 0 {
+        return Err(EnableTimeout);
     }
     io.outb(regs.smi_cmd, regs.acpi_enable);
     crate::delay::poll_on(clock, 3_000_000, 100, || acpi_mode(io, regs)).map_err(|_| EnableTimeout)
@@ -315,6 +321,19 @@ mod tests {
         let mut hw = FakeChipset::new(regs);
         let mut clock = FakeClock { now: 0, step: 1000 };
         assert_eq!(acpi_enable(&mut hw, &regs, &mut clock), Ok(()));
+        assert!(hw.writes.is_empty());
+    }
+
+    /// Legacy mode and no ACPI_ENABLE value: an error, nothing written
+    #[test]
+    fn enable_no_enable_value() {
+        let regs = PmRegs {
+            acpi_enable: 0,
+            ..LPT
+        };
+        let mut hw = FakeChipset::new(regs);
+        let mut clock = FakeClock { now: 0, step: 1000 };
+        assert_eq!(acpi_enable(&mut hw, &regs, &mut clock), Err(EnableTimeout));
         assert!(hw.writes.is_empty());
     }
 
