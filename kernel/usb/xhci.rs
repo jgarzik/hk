@@ -39,6 +39,10 @@ const PORT_RESET_US: u64 = 800_000;
 
 const PCI_VENDOR_INTEL: u16 = 0x8086;
 
+/// USBCMD interrupter, host system error and wrap event enables (Linux
+/// XHCI_IRQS)
+const XHCI_IRQS: u32 = (1 << 2) | (1 << 3) | (1 << 10);
+
 /// Scratchpad buffers the controller needs, from HCSPARAMS2 (Linux
 /// HCS_MAX_SCRATCHPAD: bits 25:21 high, 31:27 low)
 fn hcs_max_scratchpad(params2: u32) -> u32 {
@@ -351,6 +355,14 @@ impl Device for XhciDeviceHandle {
 
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    /// Power-off/restart (Linux xhci_pci_shutdown)
+    fn shutdown(&self) {
+        let mut guard = acquire_usb_controller();
+        if let Some(controller) = guard.as_mut() {
+            controller.shutdown_hc();
+        }
     }
 }
 
@@ -1547,6 +1559,9 @@ impl XhciController {
 
     /// Perform a bulk OUT transfer
     fn do_bulk_out(&mut self, slot_id: u8, endpoint: u8, data: &[u8]) -> Result<usize, UsbError> {
+        if !self.initialized {
+            return Err(UsbError::NoDevice);
+        }
         let ep_dci = endpoint_to_dci(endpoint);
 
         if usb_trace() {
@@ -1623,6 +1638,9 @@ impl XhciController {
         endpoint: u8,
         data: &mut [u8],
     ) -> Result<usize, UsbError> {
+        if !self.initialized {
+            return Err(UsbError::NoDevice);
+        }
         let ep_dci = endpoint_to_dci(endpoint | 0x80); // IN direction
 
         if usb_trace() {
@@ -1799,6 +1817,36 @@ impl XhciController {
     /// Shutdown the entire xHCI controller (driver unload/hotplug)
     ///
     /// Stops all devices, halts the controller, and unregisters IRQ.
+    /// Quiesce the controller for power-off or restart (Linux
+    /// xhci_shutdown, xhci_pci_shutdown): no freeing, the machine goes
+    /// down next. Ports routed back to EHCI on the Intel chipsets that
+    /// otherwise power back on (XHCI_SPURIOUS_REBOOT); halted with
+    /// interrupts off; reset and put in D3hot where the halt alone
+    /// leaves spurious wakeups (XHCI_SPURIOUS_WAKEUP). Transfers fail
+    /// from here on.
+    fn shutdown_hc(&mut self) {
+        let h = &self.pci_dev.header;
+        let intel = h.vendor_id == PCI_VENDOR_INTEL;
+        // Panther Point, Lynx Point-LP, Wildcat Point-LP
+        let spurious_reboot = intel && matches!(h.device_id, 0x1e31 | 0x9c31 | 0x9cb1);
+        let spurious_wakeup = intel && matches!(h.device_id, 0x9c31 | 0x9cb1);
+        if spurious_reboot {
+            super::pci_quirks::disable_intel_ports(&self.pci_dev);
+        }
+        let cmd = self.read_op(0x00);
+        self.write_op(0x00, cmd & !(usbcmd::RUN_STOP | XHCI_IRQS));
+        let halted = || self.read_op(0x04) & usbsts::HCH != 0;
+        let _ = poll_timeout(XHCI_MAX_HALT_US, 125, halted);
+        if spurious_wakeup {
+            let _ = self.reset_controller(XHCI_RESET_SHORT_US);
+        }
+        self.initialized = false;
+        XHCI_IRQ_STATE.enabled.store(false, Ordering::Release);
+        if spurious_wakeup {
+            self.pci_dev.set_power_d3hot();
+        }
+    }
+
     pub fn shutdown(&mut self) {
         printkln!("xHCI: Shutting down controller");
 
