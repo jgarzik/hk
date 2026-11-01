@@ -538,11 +538,6 @@ expected to fix it; "next batch" means the next fix batch.
    own mm and `__ptrace_may_access` the thread group. Scenario: a
    non-dumpable uid-1000 process; its second thread gets EPERM from
    `process_vm_readv(getpid())`.
-3. **linkat AT_EMPTY_PATH capability check only for empty paths**
-   (next batch). `kernel/fs/link.rs:221`: Linux 6.8 do_linkat returns
-   ENOENT for AT_EMPTY_PATH without CAP_DAC_READ_SEARCH whatever the
-   path. Scenario: unprivileged `linkat(AT_FDCWD, "f", AT_FDCWD, "g",
-   AT_EMPTY_PATH)` succeeds on hk, ENOENT on Linux.
 6. **ptrace "init only with CAP_SYS_PTRACE" guard is wrong** (next
    batch). `kernel/task/ptrace.rs:179` refuses init (tid 1) without
    CAP_SYS_PTRACE; Linux has no such rule. ptrace_attach should instead

@@ -209,16 +209,19 @@ fn link_locked(dir: &Arc<Inode>, name: &str, inode: &Arc<Inode>) -> Result<(), K
 const AT_SYMLINK_FOLLOW: i32 = 0x400;
 const AT_EMPTY_PATH: i32 = 0x1000;
 
-/// The dentry linkat links to (Linux filename_linkat lookup): an empty
-/// path with AT_EMPTY_PATH names `dirfd` itself, which takes
-/// CAP_DAC_READ_SEARCH (else ENOENT), so a descriptor passed to an
-/// unprivileged process cannot be linked back into the tree; the final
+/// The dentry linkat links to (Linux 6.8 do_linkat): AT_EMPTY_PATH at
+/// all takes CAP_DAC_READ_SEARCH (else ENOENT, whatever the path), so
+/// a descriptor passed to an unprivileged process cannot be linked back
+/// into the tree; an empty path with it names `dirfd` itself; the final
 /// symlink is followed only with AT_SYMLINK_FOLLOW
 fn link_source(dirfd: i32, path_ptr: u64, flags: i32) -> Result<Arc<Dentry>, KernelError> {
     let path =
         strncpy_from_user::<Uaccess>(path_ptr, PATH_MAX).map_err(|_| KernelError::BadAddress)?;
+    if flags & AT_EMPTY_PATH != 0 && !crate::task::capable(crate::task::CAP_DAC_READ_SEARCH) {
+        return Err(KernelError::NotFound);
+    }
     if path.is_empty() {
-        if flags & AT_EMPTY_PATH == 0 || !crate::task::capable(crate::task::CAP_DAC_READ_SEARCH) {
+        if flags & AT_EMPTY_PATH == 0 {
             return Err(KernelError::NotFound);
         }
         if dirfd == AT_FDCWD {
