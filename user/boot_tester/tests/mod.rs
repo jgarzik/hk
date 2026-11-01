@@ -70,6 +70,7 @@ pub mod netlink;
 pub mod nl;
 pub mod nonblock;
 pub mod nproc;
+pub mod nr_open;
 pub mod packet;
 pub mod permissions;
 pub mod pgrp_links;
@@ -211,6 +212,7 @@ pub fn run_all_tests() {
     isolated(b"FD_LEAK", fd_leak::run_tests);
     isolated(b"FD_SCALE", fd_scale::run_tests);
     rlimit::run_tests();
+    isolated(b"NR_OPEN", nr_open::run_tests);
     namespace::run_tests();
     sockets::run_tests();
     sockcore::run_tests();

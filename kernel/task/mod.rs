@@ -660,6 +660,12 @@ impl<F> FdTable<F> {
         self.install(fd, file, 0)
     }
 
+    /// Make room for `fd` before installing it there (Linux
+    /// expand_files): Err(EMFILE) at or past fs.nr_open, Err(ENOMEM)
+    pub fn expand(&mut self, fd: Fd) -> Result<(), i32> {
+        self.bits.reserve(fd as usize)
+    }
+
     /// Get a file by descriptor
     pub fn get(&self, fd: Fd) -> Option<Arc<F>> {
         self.files.get(&fd).cloned()

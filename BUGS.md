@@ -153,16 +153,6 @@ capabilities (so MS_NOSUID has nothing to suppress); no
 immutable/append-only inodes (no IS_APPEND/IS_IMMUTABLE EPERM);
 chmod/chown do not update ctime; ETXTBSY is not enforced.
 
-## No fs.nr_open cap on descriptors
-
-**Location**: `kernel/task/fdbits.rs`, setrlimit
-
-Linux caps RLIMIT_NOFILE at fs.nr_open (1048576; setrlimit above it is
-EPERM) and dup2/dup3 past it are EBADF. hk has neither, so root with an
-unlimited RLIMIT_NOFILE can dup2 to fd ~2^31: the open-fd bitmap then
-asks for ~256MB and the call fails with ENOMEM, after dup2 has already
-closed newfd (Linux expands the table before closing).
-
 ## Spinlocks where Linux uses sleeping locks
 
 **Location**: `kernel/sync` (Mutex, RwSem), various

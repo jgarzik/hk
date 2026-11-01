@@ -124,7 +124,7 @@ pub fn default_rlimits() -> [RLimit; RLIM_NLIMITS] {
         RLimit::new(0, RLIM_INFINITY),                 // RLIMIT_CORE (0 = no core)
         RLimit::INFINITY,                              // RLIMIT_RSS
         RLimit::INFINITY,                              // RLIMIT_NPROC
-        RLimit::new(1024, 1024 * 1024),                // RLIMIT_NOFILE (1024 soft, 1M hard)
+        RLimit::new(1024, 4096),                       // RLIMIT_NOFILE (INR_OPEN_CUR, INR_OPEN_MAX)
         RLimit::new(8 * 1024 * 1024, 8 * 1024 * 1024), // RLIMIT_MEMLOCK (8MB)
         RLimit::INFINITY,                              // RLIMIT_AS
         RLimit::INFINITY,                              // RLIMIT_LOCKS
@@ -256,9 +256,8 @@ pub fn sys_setrlimit(resource: u32, rlim_ptr: u64) -> i64 {
         Err(_) => return -14, // EFAULT
     };
 
-    // Validate: cur <= max
-    if new_rlim.rlim_cur > new_rlim.rlim_max {
-        return -22; // EINVAL
+    if let Err(e) = check(resource, &new_rlim) {
+        return e;
     }
 
     let tid = current_tid();
@@ -268,6 +267,19 @@ pub fn sys_setrlimit(resource: u32, rlim_ptr: u64) -> i64 {
         Ok(()) => 0,
         Err(e) => e as i64,
     }
+}
+
+/// Checks on a new limit before any permission check (Linux
+/// do_prlimit): cur above max is EINVAL; a RLIMIT_NOFILE hard limit
+/// above fs.nr_open is EPERM, even for CAP_SYS_RESOURCE
+fn check(resource: u32, new: &RLimit) -> Result<(), i64> {
+    if new.rlim_cur > new.rlim_max {
+        return Err(-22); // EINVAL
+    }
+    if resource == RLIMIT_NOFILE && new.rlim_max > crate::task::fdbits::nr_open() {
+        return Err(-1); // EPERM
+    }
+    Ok(())
 }
 
 /// sys_prlimit64 - get/set resource limits (can target other processes)
@@ -317,8 +329,8 @@ pub fn sys_prlimit64(pid: i32, resource: u32, new_rlim_ptr: u64, old_rlim_ptr: u
             Err(_) => return -14, // EFAULT
         };
 
-        if new.rlim_cur > new.rlim_max {
-            return -22; // EINVAL
+        if let Err(e) = check(resource, &new) {
+            return e;
         }
 
         let has_cap = current_cred().euid == 0;

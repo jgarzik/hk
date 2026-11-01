@@ -1,5 +1,5 @@
 //! Open-descriptor bitmap (Linux fs/file.c: fdtable open_fds +
-//! full_fds_bits, files_struct.next_fd)
+//! full_fds_bits, files_struct.next_fd) and the fs.nr_open cap
 //!
 //! Bit `fd` of `open` is set while `fd` is open; bit `w` of `full` is
 //! set while word `w` of `open` is all ones. Finding the lowest free
@@ -7,8 +7,33 @@
 //! `full` word per 4096 open descriptors instead of probing each fd.
 
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 const BITS: usize = u64::BITS as usize;
+
+/// fs.nr_open (Linux sysctl_nr_open): no descriptor at or above it, and
+/// no RLIMIT_NOFILE hard limit above it
+static NR_OPEN: AtomicU32 = AtomicU32::new(1024 * 1024);
+/// Its range (Linux sysctl_nr_open_min, sysctl_nr_open_max)
+const NR_OPEN_MIN: i64 = BITS as i64;
+const NR_OPEN_MAX: i64 = i32::MAX as i64 & -(BITS as i64);
+
+pub fn nr_open() -> u64 {
+    NR_OPEN.load(Ordering::Relaxed) as u64
+}
+
+/// /proc/sys/fs files of the descriptor table
+pub static FS_CTLS: &[crate::sysctl::Ctl] = &[crate::sysctl::Ctl {
+    path: "fs/nr_open",
+    mode: 0o644,
+    show: || alloc::vec![nr_open() as i64],
+    store: |v| {
+        crate::sysctl::range(v[0], NR_OPEN_MIN, NR_OPEN_MAX)?;
+        NR_OPEN.store(v[0] as u32, Ordering::Relaxed);
+        Ok(())
+    },
+    text: None,
+}];
 
 /// Two-level bitmap of open descriptors; both levels grow on demand
 #[derive(Clone)]
@@ -77,11 +102,11 @@ impl OpenFds {
     }
 
     /// Claim the lowest free descriptor at or above `start` and below
-    /// `limit` (Linux alloc_fd): Err(EMFILE) past the limit,
-    /// Err(ENOMEM) if the bitmap cannot grow
+    /// `limit` (Linux alloc_fd): Err(EMFILE) past the limit or
+    /// fs.nr_open, Err(ENOMEM) if the bitmap cannot grow
     pub fn alloc(&mut self, start: usize, limit: u64) -> Result<usize, i32> {
         let fd = self.find(start);
-        if fd as u64 >= limit || fd > i32::MAX as usize {
+        if fd as u64 >= limit.min(nr_open()) {
             return Err(24); // EMFILE
         }
         let lowest = start <= self.next;
@@ -93,6 +118,21 @@ impl OpenFds {
             self.next = fd + 1;
         }
         Ok(fd)
+    }
+
+    /// Make room for `fd` (Linux expand_files): Err(EMFILE) at or past
+    /// fs.nr_open, Err(ENOMEM) if the bitmap cannot grow. Unlike Linux,
+    /// whose table may already cover a descriptor past a lowered
+    /// fs.nr_open, the cap always applies.
+    pub fn reserve(&mut self, fd: usize) -> Result<(), i32> {
+        if fd as u64 >= nr_open() {
+            return Err(24); // EMFILE
+        }
+        let w = fd / BITS;
+        if !grow(&mut self.open, w) || !grow(&mut self.full, w / BITS) {
+            return Err(12); // ENOMEM
+        }
+        Ok(())
     }
 
     /// Mark `fd` open (Linux __set_open_fd); false if memory is short
@@ -167,6 +207,16 @@ mod tests {
         b.clear(63);
         assert_eq!(b.find(0), 63);
         assert_eq!(b.find(64), 4096);
+    }
+
+    #[test]
+    fn nr_open_cap() {
+        let mut b = OpenFds::new();
+        let cap = nr_open() as usize;
+        assert_eq!(b.reserve(cap), Err(24));
+        assert_eq!(b.reserve(cap - 1), Ok(()));
+        assert!(!b.test(cap - 1));
+        assert_eq!(b.alloc(cap, u64::MAX), Err(24));
     }
 
     #[test]
