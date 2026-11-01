@@ -43,11 +43,11 @@ Missing:
   off the LRU (never reclaimed whole; a split puts their 4KB pages on
   it). Pages exec copies the image into are not on the reverse map
   (never swapped). Swap files go through the inode's readpage /
-  writepage, a page at a time. Only page faults (and swapoff) reclaim:
-  heap, pipe-buffer and page-cache allocations never do (they run
-  under spinlocks or cannot sleep), so with anonymous memory filling
-  RAM they fail at the low watermark until kswapd (P6) keeps free
-  memory above it.
+  writepage, a page at a time. Page faults, swapoff, and heap and pipe
+  allocations that may sleep reclaim directly; page-cache allocations
+  (under the PAGE_CACHE spinlock) and atomic heap allocations never
+  do, so with anonymous memory filling RAM they fail at the low
+  watermark until kswapd (P6) keeps free memory above it.
 - SysV shm: IPC_RMID removes the id at once (Linux keeps it, as
   IPC_PRIVATE with SHM_DEST, until the last detach: IPC_STAT and shmat
   by id still work there).
@@ -148,8 +148,7 @@ SIOCUNIXFILE, SO_PEERSEC (ENOPROTOOPT, as on Linux without an LSM).
 **Location**: `kernel/fs/dac.rs`, `kernel/task/exec.rs`
 
 Missing: fs.protected_hardlinks/symlinks/fifos/regular do not exist
-(behave as their kernel default 0); execve ignores S_ISUID/S_ISGID and file
-capabilities (so MS_NOSUID has nothing to suppress); no
+(behave as their kernel default 0); no
 immutable/append-only inodes (no IS_APPEND/IS_IMMUTABLE EPERM);
 chmod/chown do not update ctime; ETXTBSY is not enforced.
 
@@ -178,13 +177,13 @@ has one mount per namespace). Unlike Linux (MNT_WRITE_HOLD), a
 EBUSY can see a spurious EROFS. Mount data/options strings are
 ignored; mounts are not user-namespace aware (plain capable()).
 
-A file keeps no mount (Linux file->f_path.mnt), so MNT_NOEXEC/NODEV
-are found by looking the dentry up in the caller's namespace
-(`mount::mnt_flags_of`). For a file from another namespace (an fd
-passed over SCM_RIGHTS) none is found: exec fails closed (EACCES), but
 mmap PROT_EXEC (`kernel/mm/syscall.rs:64`) and open's NODEV check
-(`kernel/fs/open.rs:187`) treat the flags as 0. Phase G (Path in File)
-fixes all three.
+(`kernel/fs/open.rs:187`) find MNT_NOEXEC/NODEV by looking the dentry
+up in the caller's namespace (`mount::mnt_flags_of`, by superblock
+dev_id), not from the file's own mount (`File.mnt`, also picked by
+dev_id at open): for a file from another namespace (an fd passed over
+SCM_RIGHTS) none is found and the flags read as 0. exec fails closed.
+Phase G (Path{mnt, dentry} from the walk) fixes the lookup.
 
 ## Thread-group exit gaps
 
@@ -209,7 +208,7 @@ Signal-delivery and PTRACE_SYSCALL stops work. Missing: exec, fork,
 clone and exit event stops (PTRACE_O_TRACEEXEC and friends,
 PTRACE_EVENT_*), PTRACE_INTERRUPT/LISTEN, group-stop interaction (SIGSTOP
 to an untraced task is ignored: stop/continue are not implemented),
-waiting on a tracee by process group, and the tracee's exit being
+and the tracee's exit being
 reported to a tracer that is not its parent.
 
 ## NETLINK_ROUTE / SIOC* subset gaps (P3)
@@ -394,22 +393,11 @@ across net, fs, ipc) cannot be audited yet.
   an idle CPU; one flat domain (no SMT/LLC/NUMA topology), no active
   balancing; rt tasks move at wakeup placement and in the balancer's
   pulls only (no push from an overloaded CPU).
-- No RT throttling (sched_rt_runtime_us) or dl_server: a SCHED_FIFO
-  spinner starves its CPU's fair tasks; no SCHED_DEADLINE (EINVAL).
+- RT throttling has fixed values (950 ms of each 1 s): no
+  sched_rt_runtime_us / sched_rt_period_us sysctls; no dl_server, no
+  SCHED_DEADLINE (EINVAL).
 - Kernel preemption is off: a long kernel path delays a woken task of
   a higher class until its next scheduling point.
-
-## Unconfirmed: Arc<T> field corruption in the USB mass-storage driver
-
-**Location**: `kernel/usb/msc.rs`
-
-An early report (before this repository's history) saw `UsbMscDevice`
-fields (slot id, bulk endpoints) read back corrupted from an
-`Arc<UsbMscDevice>` kept in a static, and worked around it with static
-atomics. No such workaround exists in this tree: since the first commit
-`UsbMscDevice` keeps `slot_id`, `bulk_in_ep` and `bulk_out_ep` as plain
-fields, and the USB vfat boot tests (both arches) pass on them. Kept
-only as a pointer if wrong USB slot/endpoint values ever show up again.
 
 ## xHCI driver gaps on real hardware
 
@@ -616,11 +604,10 @@ From the fix-batch-1 /code-review (unverified). Tag = when to fix.
    zombie) kills the live process (Linux wants_signal skips
    PF_EXITING); a kill -9 of a zombie leader whose threads all called
    exit() overwrites its exit status.
-2. **init is killable by SIG_DFL signals** (next batch).
-   `kernel/signal/mod.rs:952`: no SIGNAL_UNKILLABLE check on the
-   fatal-on-arrival path; kill(1, SIGTERM) by root ends the system.
-3. **memblock MAX_REGIONS = 128 drops RAM silently** (next batch).
-   `kernel/mm/memblock.rs:66`.
+3. **memblock holds at most 128 ranges** (J). `kernel/mm/memblock.rs:18`:
+   a firmware map with more RAM or reserved ranges panics at boot
+   (asserts in add/remove/reserve); Linux grows the array
+   (memblock_double_array).
 5. **group_alive duplicates group_others** (next batch).
    `kernel/task/percpu.rs:1570` vs `:1459`.
 
@@ -641,8 +628,6 @@ From the P4 /code-review (unverified unless noted). Tag = when to fix.
 5. **alloc_slot linear scan under SwapInfo.map; two Vecs + sort per
    reclaimed page** (P6). `kernel/mm/swap.rs:184`: cluster/free-hint
    allocator, cached sorted device list.
-6. **read_swap_page busy-yields on SWAP_HAS_CACHE** (P6).
-   `kernel/mm/swap_state.rs:186`: sleep instead.
 7. **One AnonVma per fork family, Vec chain** (J).
    `kernel/mm/anon_vma.rs:85`: O(N×VMAs) under one family write lock.
 
@@ -678,10 +663,6 @@ Found during T0 (2026-10-19). Tag = when to fix.
    `check-stress` boots: poll reported POLLOUT for a nonblocking
    connect to a just-closed loopback port, but no ECONNREFUSED was
    pending).
-12. **arm64 overflow check misses a frame over 32 KB** (next batch):
-   vectors.S KERNEL_ENTRY tests bit 15 of SP only, so an SP that jumped
-   more than 32 KB below a stack base (one huge frame) lands where the
-   bit is clear and is not caught (the guard gap still faults).
 13. **MM_LIFE_FORK_EXEC over its 128 kB tolerance at 8 CPUs** (next
    batch): 1 of 20 `QEMU_SMP=8 make check-stress` boots (arm64, TCG)
    lost 184 kB of MemFree+Slab over 500 fork+exec rounds, never at 4
