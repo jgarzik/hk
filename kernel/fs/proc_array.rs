@@ -8,7 +8,6 @@
 //! remote reads of cmdline/environ), the sighand action lock, the shared
 //! pending set, `FsStruct.inner` (umask) and the descriptor table lock.
 
-use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt::Write;
@@ -138,19 +137,30 @@ fn state(s: &Snap) -> (char, &'static str) {
     }
 }
 
-/// comm as text, with '\n' and '\\' escaped for status (Linux
-/// seq_escape_str ESCAPE_SPACE | ESCAPE_SPECIAL, "\n\\")
-fn comm(s: &Snap, escape: bool) -> String {
+/// comm's raw bytes (Linux proc_task_name: not re-encoded), with '\n'
+/// and '\\' escaped for status (seq_escape_str ESCAPE_SPACE |
+/// ESCAPE_SPECIAL, "\n\\")
+fn comm(s: &Snap, escape: bool) -> Vec<u8> {
     let n = s.comm.iter().position(|&b| b == 0).unwrap_or(16);
-    let mut out = String::new();
+    let mut out = Vec::new();
     for &b in &s.comm[..n] {
         match b {
-            b'\n' if escape => out.push_str("\\n"),
-            b'\\' if escape => out.push_str("\\\\"),
-            _ => out.push(b as char),
+            b'\n' if escape => out.extend_from_slice(b"\\n"),
+            b'\\' if escape => out.extend_from_slice(b"\\\\"),
+            _ => out.push(b),
         }
     }
     out
+}
+
+/// A byte buffer that formats like a String but also takes raw bytes
+struct Out(Vec<u8>);
+
+impl core::fmt::Write for Out {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        self.0.extend_from_slice(s.as_bytes());
+        Ok(())
+    }
 }
 
 /// (ignored, caught) signals (Linux collect_sigign_sigcatch)
@@ -257,10 +267,12 @@ pub fn gen_status(pid: Pid) -> Vec<u8> {
     let Some(s) = snap(pid) else {
         return Vec::new();
     };
-    let mut o = String::new();
+    let mut o = Out(Vec::new());
     let c = &s.cred;
     let (letter, name) = state(&s);
-    let _ = writeln!(o, "Name:\t{}", comm(&s, true));
+    o.0.extend_from_slice(b"Name:\t");
+    o.0.extend_from_slice(&comm(&s, true));
+    o.0.push(b'\n');
     if let Some(fs) = &s.fs {
         let _ = writeln!(o, "Umask:\t{:04o}", fs.get_umask());
     }
@@ -303,12 +315,12 @@ pub fn gen_status(pid: Pid) -> Vec<u8> {
     let _ = writeln!(o, "Mems_allowed:\t1\nMems_allowed_list:\t0");
     let _ = writeln!(o, "voluntary_ctxt_switches:\t{}", s.nvcsw);
     let _ = writeln!(o, "nonvoluntary_ctxt_switches:\t{}", s.nivcsw);
-    o.into_bytes()
+    o.0
 }
 
 /// The Vm* lines (Linux task_mem; hk keeps no high-water marks, so
 /// VmPeak/VmHWM are the current sizes)
-fn status_mem(o: &mut String, v: &VmStat) {
+fn status_mem(o: &mut Out, v: &VmStat) {
     let kb = |pages: u64| pages * 4;
     let lines = [
         ("VmPeak", kb(v.total)),
@@ -335,7 +347,7 @@ fn status_mem(o: &mut String, v: &VmStat) {
 }
 
 /// Threads, SigQ and the signal sets (Linux task_sig)
-fn status_sig(o: &mut String, s: &Snap) {
+fn status_sig(o: &mut Out, s: &Snap) {
     let qlim = s
         .signal
         .as_ref()
@@ -375,8 +387,10 @@ pub fn gen_stat(pid: Pid) -> Vec<u8> {
     let flags = if s.kthread { PF_KTHREAD } else { 0 } | if s.exiting { PF_EXITING } else { 0 };
     let running = matches!(s.state, TaskState::Running | TaskState::Ready);
     let wchan = (permitted && s.threads < 2 && !running) as u8;
-    let mut o = String::new();
-    let _ = write!(o, "{} ({}) {} ", s.pid, comm(&s, false), state(&s).0);
+    let mut o = Out(Vec::new());
+    let _ = write!(o, "{} (", s.pid);
+    o.0.extend_from_slice(&comm(&s, false));
+    let _ = write!(o, ") {} ", state(&s).0);
     let _ = write!(o, "{} {} {} 0 -1 {} ", s.ppid, s.pgid, s.sid, flags);
     let _ = write!(o, "{} 0 {} 0 ", s.min_flt, s.maj_flt);
     let _ = write!(o, "{} {} 0 0 ", ticks(s.utime), ticks(s.stime));
@@ -419,10 +433,10 @@ pub fn gen_stat(pid: Pid) -> Vec<u8> {
                 a.env_end
             );
         }
-        _ => o.push_str(" 0 0 0 0 0 0 0"),
+        _ => o.0.extend_from_slice(b" 0 0 0 0 0 0 0"),
     }
     let _ = writeln!(o, " {}", if permitted { s.exit_code } else { 0 });
-    o.into_bytes()
+    o.0
 }
 
 /// Read [start, end) of `mm` (Linux access_remote_vm), mmap_lock held;

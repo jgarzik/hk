@@ -543,10 +543,6 @@ expected to fix it; "next batch" means the next fix batch.
    ENOENT for AT_EMPTY_PATH without CAP_DAC_READ_SEARCH whatever the
    path. Scenario: unprivileged `linkat(AT_FDCWD, "f", AT_FDCWD, "g",
    AT_EMPTY_PATH)` succeeds on hk, ENOENT on Linux.
-4. **comm bytes >= 0x80 re-encoded as UTF-8** (next batch).
-   `kernel/fs/proc_array.rs:145` pushes `b as char`; Linux
-   proc_task_name emits raw bytes (status escapes only `\n` and `\\`).
-   Scenario: `PR_SET_NAME "\xe9"`; stat/status show `\xc3\xa9`.
 6. **ptrace "init only with CAP_SYS_PTRACE" guard is wrong** (next
    batch). `kernel/task/ptrace.rs:179` refuses init (tid 1) without
    CAP_SYS_PTRACE; Linux has no such rule. ptrace_attach should instead
