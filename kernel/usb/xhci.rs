@@ -1865,8 +1865,6 @@ impl XhciController {
         Ok(())
     }
 
-    ///
-    /// Stops all devices, halts the controller, and unregisters IRQ.
     /// Quiesce the controller for power-off or restart (Linux
     /// xhci_shutdown, xhci_pci_shutdown): no freeing, the machine goes
     /// down next. Ports routed back to EHCI on the Intel chipsets that
@@ -1891,6 +1889,8 @@ impl XhciController {
     }
 
     /// Shutdown the entire xHCI controller (driver unload/hotplug)
+    ///
+    /// Stops all devices, halts the controller, and unregisters IRQ.
     pub fn shutdown(&mut self) {
         printkln!("xHCI: Shutting down controller");
 
