@@ -39,6 +39,11 @@ pub mod cmd {
 /// Does not return on success (system shuts down/reboots/halts).
 /// Returns -EINVAL on invalid magic numbers or unknown command.
 pub fn sys_reboot(magic1: u32, magic2: u32, cmd: u32, _arg: u64) -> i64 {
+    // The capability first, then the magic numbers (Linux)
+    if !crate::task::capable(crate::task::CAP_SYS_BOOT) {
+        return KernelError::NotPermitted.sysret();
+    }
+
     // Validate magic number 1
     if magic1 != cmd::LINUX_REBOOT_MAGIC1 {
         return KernelError::InvalidArgument.sysret();
