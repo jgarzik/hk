@@ -442,6 +442,21 @@ in APIC mode (UEFI boot; Linux on the Dell uses IOAPIC 16-23 and MSI)
 needs IOAPIC with ACPI `_PRT` routing, or MSI/MSI-X, which xHCI, AHCI
 and r8169 all support.
 
+## ACPI power management gaps
+
+**Location**: `kernel/acpi/`, `kernel/arch/x86_64/{acpi,power}.rs`
+
+hk has no AML interpreter: `\_S5` is found by a byte scan of the DSDT
+and SSDTs for a plain `Name (_S5, Package ...)`: one returned by a
+method is missed (SLP_TYP 0 is used, with a warning), and one inside
+an `If` is taken whatever the condition. `_PTS` and `_TTS` are not evaluated before S5, which some
+firmware needs to power off cleanly. There is no SCI handler: IRQ 9
+stays masked and every fixed event and GPE is disabled at boot, so
+ACPI power-button, lid and GPE events are not handled (once in ACPI
+mode, a short power-button press does nothing). Only the 32-bit FADT
+block fields are read (no X_ GAS forms, no hardware-reduced ACPI), and
+a reset register in PCI configuration space is ignored.
+
 ## Block layer gaps (P1)
 
 **Location**: `kernel/storage/`, `kernel/virtio/blk.rs`,
