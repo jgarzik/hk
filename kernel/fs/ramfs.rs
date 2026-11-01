@@ -1585,9 +1585,6 @@ pub fn ramfs_create_file_with_timestamp(
     gid: Gid,
     mtime: Timespec,
 ) -> Result<Arc<Dentry>, KernelError> {
-    use crate::frame_alloc::FrameAllocRef;
-    use crate::{FRAME_ALLOCATOR, PAGE_CACHE};
-
     let parent_inode = parent.get_inode().ok_or(KernelError::NotFound)?;
     let sb = parent_inode.superblock().ok_or(KernelError::Io)?;
 
@@ -1619,46 +1616,7 @@ pub fn ramfs_create_file_with_timestamp(
         &RAMFS_INODE_OPS,
     ));
     new_inode.set_private(Arc::new(RamfsInodeData::new_file(file_id)));
-
-    // Write initial content to page cache
-    if !content.is_empty() {
-        let file_size = content.len() as u64;
-        let mut bytes_written = 0;
-
-        while bytes_written < content.len() {
-            let page_offset = bytes_written / PAGE_SIZE;
-            let offset_in_page = bytes_written % PAGE_SIZE;
-            let chunk_size = min(PAGE_SIZE - offset_in_page, content.len() - bytes_written);
-
-            // Get or create page
-            let page = {
-                let mut cache = PAGE_CACHE.lock();
-                let mut frame_alloc = FrameAllocRef(&FRAME_ALLOCATOR);
-
-                let (page, _) = cache
-                    .find_or_create_page(
-                        file_id,
-                        page_offset as u64,
-                        file_size,
-                        &mut frame_alloc,
-                        false, // can_writeback
-                        true,  // unevictable
-                        &RAMFS_AOPS,
-                    )
-                    .map_err(page_err)?;
-                page
-            };
-
-            // Copy content to page
-            unsafe {
-                let dst = crate::arch::phys_to_virt(page.frame).add(offset_in_page);
-                core::ptr::copy_nonoverlapping(content[bytes_written..].as_ptr(), dst, chunk_size);
-            }
-            page.mark_dirty();
-
-            bytes_written += chunk_size;
-        }
-    }
+    fill_pages(file_id, content)?;
 
     // Add to parent directory
     parent_data
@@ -1676,6 +1634,58 @@ pub fn ramfs_create_file_with_timestamp(
     parent.add_child(new_dentry.clone());
 
     Ok(new_dentry)
+}
+
+/// Write `content` at offset 0 of a ramfs file's pages
+fn fill_pages(file_id: FileId, content: &[u8]) -> Result<(), KernelError> {
+    use crate::frame_alloc::FrameAllocRef;
+    use crate::{FRAME_ALLOCATOR, PAGE_CACHE};
+    let file_size = content.len() as u64;
+    let mut bytes_written = 0;
+    while bytes_written < content.len() {
+        let page_offset = bytes_written / PAGE_SIZE;
+        let offset_in_page = bytes_written % PAGE_SIZE;
+        let chunk_size = min(PAGE_SIZE - offset_in_page, content.len() - bytes_written);
+        let page = {
+            let mut cache = PAGE_CACHE.lock();
+            let mut frame_alloc = FrameAllocRef(&FRAME_ALLOCATOR);
+            let (page, _) = cache
+                .find_or_create_page(
+                    file_id,
+                    page_offset as u64,
+                    file_size,
+                    &mut frame_alloc,
+                    false, // can_writeback
+                    true,  // unevictable
+                    &RAMFS_AOPS,
+                )
+                .map_err(page_err)?;
+            page
+        };
+        // SAFETY: the page is this file's, mapped in the direct map
+        unsafe {
+            let dst = crate::arch::phys_to_virt(page.frame).add(offset_in_page);
+            core::ptr::copy_nonoverlapping(content[bytes_written..].as_ptr(), dst, chunk_size);
+        }
+        page.mark_dirty();
+        bytes_written += chunk_size;
+    }
+    Ok(())
+}
+
+/// Give an existing (empty) ramfs regular file `content`: the body a
+/// hard-linked initramfs entry brings after its first name was made
+pub fn ramfs_fill_file(inode: &Inode, content: &[u8]) -> Result<(), KernelError> {
+    let private = inode.get_private().ok_or(KernelError::Io)?;
+    let data = private
+        .as_ref()
+        .as_any()
+        .downcast_ref::<RamfsInodeData>()
+        .ok_or(KernelError::Io)?;
+    let file_id = data.file_id.ok_or(KernelError::InvalidArgument)?;
+    fill_pages(file_id, content)?;
+    inode.set_size(content.len() as u64);
+    Ok(())
 }
 
 /// Create a directory in ramfs with ownership and explicit timestamp

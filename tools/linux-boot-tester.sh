@@ -114,7 +114,9 @@ tools/busybox-root.sh "$ROOT" "$ARCH"
 cp "$BIN/boot_tester" "$BIN/boot_tester2" "$ROOT/bin/"
 ln -sf boot_tester "$ROOT/bin/init"
 echo -n "Hello from ramfs!" > "$ROOT/test.txt"
+tools/cpio-test.sh tree "$ROOT"
 (cd "$ROOT" && find . | cpio -o -H newc --quiet) > "$WORK/initramfs.cpio"
+tools/cpio-test.sh append "$WORK/initramfs.cpio"
 
 # KVM whenever the host can run this arch natively (x86_64 on x86_64,
 # aarch64 on an arm64 host such as CI's ubuntu-24.04-arm if it exposes
@@ -150,7 +152,7 @@ linux_cache_key() {
     local f files
     files=$(git ls-files -co --exclude-standard -- user Makefile rust-toolchain.toml \
         tools/linux-boot-tester.sh tools/mkdisk.sh tools/busybox-root.sh \
-        tools/fetch-deb.sh tools/qemu-net.sh tools/netpeer | LC_ALL=C sort -u) || return 1
+        tools/fetch-deb.sh tools/qemu-net.sh tools/netpeer tools/cpio-test.sh | LC_ALL=C sort -u) || return 1
     {
         echo "$ARCH $TIMEOUT $SMP $MEM ${KVM[*]} ${QEMU_MACHINE[*]} ${DISK[*]}" &&
             echo "${QEMU_NET[*]//"$TOP"/}" &&

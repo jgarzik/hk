@@ -35,7 +35,7 @@ $(BOOT_TESTER) $(BOOT_TESTER2): boot_tester/main.rs boot_tester/boot_tester2.rs 
 	$(CARGO) build --release --target $(TARGET)
 
 # busybox + /etc (shared with the Linux harness)
-ROOTFS_DEPS = ../tools/busybox-root.sh ../tools/fetch-deb.sh $(shell find rootfs -type f)
+ROOTFS_DEPS = ../tools/busybox-root.sh ../tools/fetch-deb.sh ../tools/cpio-test.sh $(shell find rootfs -type f)
 
 $(INITRAMFS): $(BOOT_TESTER) $(BOOT_TESTER2) $(ROOTFS_DEPS)
 	@rm -rf $(INITRD_ROOT)
@@ -46,7 +46,9 @@ $(INITRAMFS): $(BOOT_TESTER) $(BOOT_TESTER2) $(ROOTFS_DEPS)
 	cp $(BOOT_TESTER2) $(INITRD_ROOT)/bin/boot_tester2
 	ln -sf boot_tester $(INITRD_ROOT)/bin/init
 	echo -n "Hello from ramfs!" > $(INITRD_ROOT)/test.txt
+	../tools/cpio-test.sh tree $(INITRD_ROOT)
 	cd $(INITRD_ROOT) && find . | cpio -o -H newc > ../$(INITRAMFS) 2>/dev/null
+	../tools/cpio-test.sh append $(INITRAMFS)
 	@rm -rf $(INITRD_ROOT)
 	@echo "Created $(INITRAMFS)"
 	@ls -la $(INITRAMFS)

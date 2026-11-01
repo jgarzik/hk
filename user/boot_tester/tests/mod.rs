@@ -102,6 +102,7 @@ pub mod swapout;
 pub mod sync;
 pub mod sysctl;
 pub mod clock_ids;
+pub mod cpio_nodes;
 pub mod dev_mem;
 pub mod fifo;
 pub mod groups;
@@ -177,6 +178,7 @@ pub fn run_all_tests() {
     kmsg::run_tests();
     groups::run_tests();
     fifo::run_tests();
+    cpio_nodes::run_tests();
     signals::run_tests();
     sigmask::run_tests();
     fpu::run_tests();
