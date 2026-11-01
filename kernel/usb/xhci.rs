@@ -39,6 +39,12 @@ const PORT_RESET_US: u64 = 800_000;
 
 const PCI_VENDOR_INTEL: u16 = 0x8086;
 
+/// Scratchpad buffers the controller needs, from HCSPARAMS2 (Linux
+/// HCS_MAX_SCRATCHPAD: bits 25:21 high, 31:27 low)
+fn hcs_max_scratchpad(params2: u32) -> u32 {
+    ((params2 >> 21) & 0x1f) << 5 | (params2 >> 27)
+}
+
 use super::context::{InputContext, OutputDeviceContext, endpoint_to_dci};
 use super::transfer::{CompletionCode, TransferRing, Trb as TransferTrb, TrbType};
 use super::{SetupPacket, UsbBus, UsbController, UsbDevice, UsbError, UsbSpeed};
@@ -822,6 +828,7 @@ impl XhciController {
             core::ptr::write_bytes(phys_to_virt(dcbaa_phys), 0, 4096);
         }
         self.dcbaa_phys = dcbaa_phys;
+        self.alloc_scratchpads(frame_alloc)?;
 
         // Allocate command ring
         self.cmd_ring =
@@ -922,6 +929,48 @@ impl XhciController {
         self.initialized = true;
         printkln!("xHCI: Controller initialized and running");
 
+        Ok(())
+    }
+
+    /// Give the controller the scratchpad memory it asks for (xHCI 4.20,
+    /// Linux scratchpad_alloc): zeroed pages, listed in an array that
+    /// DCBAA entry 0 points at. The controller keeps internal state
+    /// there; without it, it would take entry 0 - zero - as the array's
+    /// address and use whatever that memory holds as page pointers.
+    fn alloc_scratchpads(
+        &mut self,
+        frame_alloc: &mut dyn crate::bus::bus::FrameAllocWrapper,
+    ) -> Result<(), UsbError> {
+        let n = hcs_max_scratchpad(self.read_cap(0x08));
+        if n == 0 {
+            return Ok(());
+        }
+        // PAGESIZE bit 0: 4 KiB pages, the frame size; the array (8
+        // bytes per buffer) must fit one frame
+        if self.read_op(0x08) & 1 == 0 || n > 512 {
+            printkln!(
+                "xHCI: unsupported scratchpad layout: {} buffers, PAGESIZE {:#x}",
+                n,
+                self.read_op(0x08)
+            );
+            return Err(UsbError::NoResources);
+        }
+        let zeroed = |fa: &mut dyn crate::bus::bus::FrameAllocWrapper| {
+            let phys = fa.alloc_frame()?;
+            // SAFETY: a fresh frame, in the direct map
+            unsafe { core::ptr::write_bytes(phys_to_virt(phys), 0, 4096) };
+            Some(phys)
+        };
+        let array = zeroed(frame_alloc).ok_or(UsbError::NoResources)?;
+        let entries = phys_to_virt(array) as *mut u64;
+        for i in 0..n {
+            let buf = zeroed(frame_alloc).ok_or(UsbError::NoResources)?;
+            // SAFETY: entry i of the array frame (n <= 512)
+            unsafe { write_volatile(entries.add(i as usize), buf) };
+        }
+        // SAFETY: entry 0 of the DCBAA frame
+        unsafe { write_volatile(phys_to_virt(self.dcbaa_phys) as *mut u64, array) };
+        printkln!("xHCI: {} scratchpad buffers", n);
         Ok(())
     }
 
@@ -1885,4 +1934,17 @@ pub fn init_xhci<FA: FrameAlloc<PhysAddr = u64>>(
     controller.init(frame_alloc)?;
 
     Ok(controller)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scratchpad_count() {
+        assert_eq!(hcs_max_scratchpad(0), 0);
+        assert_eq!(hcs_max_scratchpad(4 << 27), 4);
+        assert_eq!(hcs_max_scratchpad(1 << 21), 32);
+        assert_eq!(hcs_max_scratchpad(0xffff_ffff), 1023);
+    }
 }
