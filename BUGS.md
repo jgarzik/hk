@@ -409,8 +409,15 @@ only as a pointer if wrong USB slot/endpoint values ever show up again.
 Found while chasing the Dell OptiPlex 3020 freeze; QEMU's xHCI hides
 all of them.
 - Command completions are not matched to their TRB (`wait_for_command`
-  ignores `_trb_addr`): a late completion for a timed-out command is
-  taken by the next command.
+  ignores `_trb_addr`), and transfer events only by slot and endpoint:
+  a late completion for a timed-out command or transfer is credited to
+  the next one (most likely on the USB serial console, whose transfers
+  time out after 100 ms). A timeout should stop the endpoint and move
+  its dequeue pointer past the TRB (Linux xhci_handle_cmd_stop_ep).
+- One controller only: the driver keeps a single global
+  `USB_CONTROLLER`; a second xHCI's probe replaces the first, which is
+  left running, and both device handles act on the survivor at
+  shutdown.
 - A timed-out bulk transfer returns early (`do_bulk_out`/`do_bulk_in`
   via `?`) without `dma_unmap` and with its TRB still queued; the
   buffer (heap, freed by the caller) can still be written by the
