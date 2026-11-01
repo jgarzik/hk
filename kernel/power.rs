@@ -24,6 +24,9 @@ pub mod cmd {
     pub const HALT: u32 = 0xcdef0123;
 }
 
+/// Serializes power-off, restart and halt (Linux system_transition_mutex)
+static SYSTEM_TRANSITION: crate::sync::Mutex<()> = crate::sync::Mutex::new(());
+
 /// sys_reboot implementation
 ///
 /// Implements the Linux reboot(2) syscall. The caller must provide valid
@@ -57,6 +60,11 @@ pub fn sys_reboot(magic1: u32, magic2: u32, cmd: u32, _arg: u64) -> i64 {
     {
         return KernelError::InvalidArgument.sysret();
     }
+
+    // One transition at a time (Linux system_transition_mutex): a second
+    // caller waits here, and the machine is gone before it gets the lock,
+    // rather than powering off while the first still quiesces devices
+    let _transition = SYSTEM_TRANSITION.lock();
 
     // Devices quiesce first (Linux kernel_shutdown_prepare and
     // kernel_restart_prepare: device_shutdown)
