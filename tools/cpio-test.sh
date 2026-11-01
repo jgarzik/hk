@@ -4,11 +4,13 @@
 # and tools/linux-boot-tester.sh (Linux), so both kernels unpack the same.
 #
 #   tools/cpio-test.sh tree <root-dir>
-#       /cpio_test/: an empty file, two hard links to one file, a FIFO
+#       /cpio_test/: an empty file, two hard links to one file, a FIFO,
+#       and /cpio_test/overlay holding "base"
 #   tools/cpio-test.sh append <archive>
 #       Append a second newc archive (what a concatenated initramfs
 #       looks like) holding /cpio_test/null, character device 1:3,
-#       which needs root to create in a tree
+#       which needs root to create in a tree, and a new
+#       /cpio_test/overlay ("overlay") that replaces the first
 #
 # Linux init/initramfs.c unpacks all of these.
 
@@ -23,6 +25,7 @@ tree)
     ln -f "$d/link1" "$d/link2"
     rm -f "$d/fifo"
     mkfifo -m 0644 "$d/fifo"
+    printf 'base\n' > "$d/overlay"
     ;;
 append)
     python3 -I - "$2" <<'EOF'
@@ -37,7 +40,9 @@ def entry(name, mode, nlink=1, rdev=(0, 0), body=b""):
     out += body + b"\0" * (-len(body) % 4)
     return out
 
-data = entry("cpio_test/null", 0o020666, rdev=(1, 3)) + entry("TRAILER!!!", 0)
+data = entry("cpio_test/null", 0o020666, rdev=(1, 3))
+data += entry("cpio_test/overlay", 0o100644, body=b"overlay\n")
+data += entry("TRAILER!!!", 0)
 data += b"\0" * (-len(data) % 512)
 with open(sys.argv[1], "ab") as f:
     f.write(data)

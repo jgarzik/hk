@@ -153,7 +153,22 @@ fn do_entry(root: &Arc<Dentry>, e: &Entry<'_>, links: &mut Links) -> Result<bool
         ramfs_mkpath_with_timestamp(root, parent_path, e.uid, e.gid, e.mtime).map_err(fs_err)?
     };
     let dir = parent.get_inode().ok_or(CpioError::KernelError)?;
+    let existing = clean_path(&parent, &dir, name, ty);
     match ty {
+        S_IFREG if existing.is_some() => {
+            // Linux opens an existing file O_TRUNC and writes the body:
+            // a later archive (an overlay) replaces it
+            let old = existing.ok_or(CpioError::KernelError)?;
+            old.i_op.truncate(&old, 0).map_err(fs_err)?;
+            ramfs_fill_file(&old, e.body).map_err(fs_err)?;
+            old.set_mode_perm((e.mode & 0o7777) as u16);
+            old.set_uid(e.uid);
+            old.set_gid(e.gid);
+            old.set_mtime(e.mtime);
+        }
+        // Another entry of the same type stays (Linux: mknod/symlink
+        // fail with EEXIST and are skipped)
+        _ if existing.is_some() => {}
         S_IFREG => {
             let key = (e.dev.0, e.dev.1, e.ino);
             if e.nlink >= 2
@@ -199,6 +214,24 @@ fn do_entry(root: &Arc<Dentry>, e: &Entry<'_>, links: &mut Links) -> Result<bool
         _ => return Err(CpioError::InvalidHeader),
     }
     Ok(true)
+}
+
+/// Linux clean_path: an existing entry of another type is removed
+/// (rmdir for a directory); one of the same type is returned
+fn clean_path(parent: &Arc<Dentry>, dir: &Inode, name: &str, ty: u32) -> Option<Arc<Inode>> {
+    let old = dir.i_op.lookup(dir, name).ok()?;
+    if old.mode().0 as u32 & S_IFMT == ty {
+        return Some(old);
+    }
+    let gone = if old.mode().is_dir() {
+        dir.i_op.rmdir(dir, name)
+    } else {
+        dir.i_op.unlink(dir, name)
+    };
+    if gone.is_ok() {
+        parent.remove_child(name);
+    }
+    None
 }
 
 /// Parse an 8-character ASCII hex field

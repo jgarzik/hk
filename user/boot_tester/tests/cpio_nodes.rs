@@ -8,6 +8,8 @@
 //! - CPIO_FIFO: a FIFO entry is a FIFO
 //! - CPIO_CONCAT: a character device from a second, concatenated archive
 //!   is unpacked (1:3, usable like /dev/null)
+//! - CPIO_OVERLAY: a file in the second archive replaces the same name
+//!   from the first (Linux opens it O_TRUNC)
 
 use super::helpers::{print, println};
 use hk_syscall::{O_RDONLY, O_WRONLY, Stat, sys_close, sys_open, sys_read, sys_stat, sys_write};
@@ -22,6 +24,20 @@ pub fn run_tests() {
     hardlink();
     fifo();
     concat();
+    overlay();
+}
+
+fn overlay() {
+    let mut b = [0u8; 32];
+    let n = read_all(b"/cpio_test/overlay\0", &mut b);
+    report(
+        b"CPIO_OVERLAY",
+        if n == 8 && &b[..8] == b"overlay\n" {
+            b""
+        } else {
+            b"not replaced"
+        },
+    );
 }
 
 fn report(name: &[u8], why: &[u8]) {
