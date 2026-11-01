@@ -176,6 +176,14 @@ has one mount per namespace). Unlike Linux (MNT_WRITE_HOLD), a
 EBUSY can see a spurious EROFS. Mount data/options strings are
 ignored; mounts are not user-namespace aware (plain capable()).
 
+A file keeps no mount (Linux file->f_path.mnt), so MNT_NOEXEC/NODEV
+are found by looking the dentry up in the caller's namespace
+(`mount::mnt_flags_of`). For a file from another namespace (an fd
+passed over SCM_RIGHTS) none is found: exec fails closed (EACCES), but
+mmap PROT_EXEC (`kernel/mm/syscall.rs:64`) and open's NODEV check
+(`kernel/fs/open.rs:187`) treat the flags as 0. Phase G (Path in File)
+fixes all three.
+
 ## Thread-group exit gaps
 
 **Location**: `kernel/signal/mod.rs` (group exit), `kernel/task/exec.rs`

@@ -90,9 +90,14 @@ pub fn open_exec(dentry: Arc<Dentry>) -> Result<Arc<File>, i32> {
     if inode.mode().is_symlink() {
         return Err(KernelError::TooManySymlinks as i32);
     }
-    // may_open: no exec from a noexec mount (path_noexec)
-    if inode.mode().is_file() && mount::mnt_flags_of(&dentry) & mount::MNT_NOEXEC != 0 {
-        return Err(KernelError::PermissionDenied as i32);
+    // may_open: no exec from a noexec mount (path_noexec). A file
+    // keeps no mount, so it is looked up in the caller's namespace; one
+    // not found there (an fd from another namespace) fails closed
+    if inode.mode().is_file() {
+        let mnt = crate::ns::current_mnt_ns().find_mount_for_dentry(&dentry);
+        if mnt.is_none_or(|m| m.flags() & mount::MNT_NOEXEC != 0) {
+            return Err(KernelError::PermissionDenied as i32);
+        }
     }
     dac::may_open(&dac::cred(), &inode, MAY_EXEC, flags::O_RDONLY).map_err(|e| e as i32)?;
     if !inode.mode().is_file() {
