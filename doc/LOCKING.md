@@ -1540,7 +1540,10 @@ into the device cache marking only the 512-byte sectors it changes
 (`bdev_write_meta`: bits in `Page.private`, set under the page lock;
 Linux dirty buffer heads), and the device's writepage writes only
 those: a device-cache page may also hold file-data clusters, which
-the file's own cache writes.
+the file's own cache writes. (A write-back widened to the device's logical
+block stays inside one FAT sector: vfat refuses a FAT sector smaller
+than that block. A newly allocated cluster's device-cache pages are
+dropped before and after it is zeroed on the disk.)
 
 - `AddressSpace.i_pages` (`spin::Mutex<XArray>`, Linux xa_lock): the
   cached pages by index. Thread context only (no I/O completion or

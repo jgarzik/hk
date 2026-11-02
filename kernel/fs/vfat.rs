@@ -596,6 +596,9 @@ fn allocate_cluster(sb_data: &VfatSbData) -> Result<u32, KernelError> {
             filemap::invalidate_range(&sb_data.bdev.bd_inode, off, off + len)?;
             let mut zeros = vec![0u8; len as usize];
             bdev_rw_bytes(&sb_data.bdev, BioOp::Write, off, &mut zeros)?;
+            // Again: a page a reader cached before the zeros landed
+            // holds the old bytes
+            filemap::invalidate_range(&sb_data.bdev.bd_inode, off, off + len)?;
 
             return Ok(cluster);
         }
@@ -2183,6 +2186,12 @@ fn vfat_mount_dev(
     // Check for valid bytes per sector (must be power of 2, 512-4096)
     let bytes_per_sector = boot_sector.bytes_per_sector;
     if !(512..=4096).contains(&bytes_per_sector) || !bytes_per_sector.is_power_of_two() {
+        return Err(KernelError::InvalidArgument);
+    }
+    // A FAT sector smaller than the device's logical block (Linux
+    // fat_fill_super: "logical sector size too small for device"): a
+    // metadata write-back of one block would cover other sectors
+    if (bytes_per_sector as u32) < bdev.logical_block_size() {
         return Err(KernelError::InvalidArgument);
     }
 
