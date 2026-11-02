@@ -51,6 +51,7 @@ pub fn run_tests() {
     test_lock_exec();
     test_lock_close_any();
     test_blocking();
+    test_contended_waiters();
 }
 
 /// Test F_SETLK with F_WRLCK (write lock) and F_UNLCK
@@ -462,4 +463,46 @@ fn test_blocking() {
     let child = (st >> 8) & 0xff;
     let ok = (dl == -35 && child == 0) || (dl == 0 && child == 35);
     verdict(b"SETLKW_EDEADLK", ok, dl, child as i64);
+}
+
+/// Two F_SETLKW waiters behind one holder sleep (no busy retry): a
+/// refused attempt does not wake the other waiter. Their CPU time while
+/// the holder keeps the lock 300 ms stays far below that.
+fn test_contended_waiters() {
+    use hk_syscall::{sys_exit, sys_fork, sys_getrusage, sys_wait4};
+    let path = b"/tmp/posix_contend_test\0";
+    let fd = sys_open(path.as_ptr(), O_CREAT | O_RDWR | O_TRUNC, 0o644) as i32;
+    // struct rusage: ru_utime, ru_stime (timeval) first; children's
+    // totals so far, subtracted below
+    let cpu = || {
+        let mut ru = [0i64; 18];
+        sys_getrusage(-1, ru.as_mut_ptr() as *mut u8);
+        (ru[0] + ru[2]) * 1000 + (ru[1] + ru[3]) / 1000
+    };
+    let before = cpu();
+    let holder = sys_fork();
+    if holder == 0 {
+        wrlck(fd, F_SETLK, 0);
+        sleep_ms(300);
+        sys_exit(0);
+    }
+    sleep_ms(50);
+    let mut pids = [0i64; 2];
+    for p in pids.iter_mut() {
+        *p = sys_fork();
+        if *p == 0 {
+            let r = wrlck(fd, F_SETLKW, 0);
+            sys_exit(if r == 0 { 0 } else { 1 });
+        }
+    }
+    let mut st = 0i32;
+    let mut bad = 0;
+    for p in [holder, pids[0], pids[1]] {
+        sys_wait4(p, &mut st, 0, 0);
+        bad += ((st >> 8) & 0xff) as i64;
+    }
+    let cpu_ms = cpu() - before;
+    sys_close(fd as u64);
+    hk_syscall::sys_unlink(path.as_ptr());
+    verdict(b"SETLKW_NO_SPIN", bad == 0 && cpu_ms < 150, bad, cpu_ms);
 }

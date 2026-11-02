@@ -390,8 +390,11 @@ fn set(
                 .map(|c| c.owner);
             (e, owner)
         });
-        // A lock replacing or splitting one of ours may release a range
-        (r, true)
+        // A lock set may replace or split one of ours, releasing a
+        // range; a refused one changed nothing (counting it would wake
+        // the other waiters into a retry loop)
+        let changed = r.is_ok();
+        (r, changed)
     })
 }
 

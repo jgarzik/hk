@@ -78,6 +78,11 @@ impl FileLockCtx {
     /// Sleep until the locks change after generation `g` (Linux
     /// wait_event_interruptible on fl_wait): Err(Interrupted) on a signal
     pub fn wait_change(&self, g: u64) -> Result<(), KernelError> {
+        // A pending signal ends the wait even when the locks already
+        // changed: every pass of a lock retry loop can be interrupted
+        if crate::task::percpu::current().sigpending() {
+            return Err(KernelError::Interrupted);
+        }
         self.wait
             .wait_event_interruptible(|| self.generation() != g)
     }
