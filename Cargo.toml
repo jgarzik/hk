@@ -17,3 +17,13 @@ license = "MIT"
 # Shared dependencies across workspace
 spin = "0.9"
 bitflags = "2"
+
+# doc/UNSAFE.md. The gate runs clippy with -D warnings: warn = deny there.
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+static_mut_refs = "deny"
+unused_unsafe = "deny"
+
+[workspace.lints.clippy]
+missing_safety_doc = "deny"
+mut_mut = "warn"

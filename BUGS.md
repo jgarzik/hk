@@ -1,5 +1,77 @@
 # Known Bugs
 
+## Safe kernel code that can cause UB (doc/UNSAFE.md)
+
+These are safe fns or patterns whose use leads to undefined behaviour.
+None is known to fail today, but each is a soundness bug:
+
+- **Per-CPU:**
+  - `get_percpu` (both arches) returns `&'static mut PerCpu`.
+  - `current_pt_regs` returns `&'static mut` to the trap frame, and the
+    syscall entry holds `&mut` to the same frame.
+  - lockdep's per-CPU `&'static mut Cpu` is also reached from IRQs.
+  - aarch64 `set_tpidr_el1` is a safe fn.
+  - aarch64 `early_print!` takes `&mut` to a `static mut` UART.
+- **Locks and lists:**
+  - `MutexGuard` is `Sync` for `T: Send` without `T: Sync`.
+  - `List` is `Send` without `Item: Send`.
+  - `ArcList::push_*` doesn't check that the node is unlinked.
+  - `task_ref` guards against the static boot task only in debug
+    builds.
+  - xarray `node()` hands out `&mut` from `&self` paths.
+- **IPC:** `msgctl(IPC_SET)` writes `qbytes` through a shared reference,
+  racing with `msgsnd`. The sem/msg/shm downcasts are unchecked.
+- **uaccess:**
+  - `get_user`/`put_user`/`copy_val_*` accept any `Copy` type, so a user
+    can make an invalid `bool`/enum/reference, and padding bytes get
+    copied out.
+  - The path copy-in allocates while user access is open and counts
+    chars, not bytes.
+  - aarch64 signal `as_bytes`/`read_user` have the same `Copy`-bound
+    problem.
+- **Signals:** x86 `rt_sigreturn` reads `UContext` from a byte array
+  without regard to alignment.
+- **Task setters:** `exit_task_fd`, the fs/ns setters and `exit_task_mm`
+  are safe fns, yet they take any tid and replace another task's
+  pointers without a lock.
+- **Drivers:**
+  - USB serial removal frees the console that the console list still
+    points to.
+  - `SkBuff` `reset`/`trim`/`frame_from_mac` can overflow from safe
+    calls.
+  - PCI ECAM `read32`/`write32` do no bounds or alignment checks.
+  - `DmaCoherent` has public fields and `dma_free_coherent` is safe.
+  - `dma_map_single` takes a raw pointer, not tied to the buffer's
+    lifetime.
+  - xHCI `OutputContext` hands out `&` into memory the device writes.
+  - virtio `cfg16`/`cfg32` bounds checks can overflow.
+- **Safe fns that take addresses:**
+  - `load_mm`, `dtb::blob`, `psci_cpu_on`.
+  - `save_for_clone_child`, `write_fs_base`, `fpu::restore`.
+  - `entry_atomic`, `virtio_net::rx_skb`.
+  - mm `pte` helpers that take `*mut u64`.
+  - `pfn_to_page` (checks its argument only in debug builds).
+- **asm options:** `nomem` on aarch64 `enable_and_halt`, on x86
+  `stac`/`clac` and on `wrmsr`.
+- **Inode locks:** `unlock_rename` and `inode_lock`/`inode_unlock` are
+  hand-paired, and `unlock_rename` is a safe fn.
+
+## user/ does not follow doc/UNSAFE.md
+
+The `user/syscall` wrappers are safe `pub fn`s, and about 330 of them take
+raw pointers, so `sys_read(fd, 0x1234 as *mut u8, n)` corrupts memory
+without `unsafe`. The boot tester uses about 80 `static mut`, open-codes
+volatile access to mmap'd memory, and defines `mem*` without
+`#![no_builtins]`.
+
+Planned fix:
+- one `unsafe fn syscall6` per arch;
+- wrappers that take slices, `&CStr` and `&mut T`;
+- `unsafe fn` for address-space operations (mmap, munmap, brk, clone,
+  futex);
+- an `Mmap` RAII type for mmap'd memory;
+- atomics in place of `static mut`.
+
 ## chroot() does not affect path resolution (security)
 
 **Location**: `kernel/fs/path.rs` ~131-135 (`walk`, absolute-path lookup)

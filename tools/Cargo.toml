@@ -8,3 +8,6 @@ description = "Development tools for hk kernel"
 [[bin]]
 name = "boot-test"
 path = "boot_test.rs"
+
+[lints]
+workspace = true

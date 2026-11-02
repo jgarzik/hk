@@ -21,3 +21,6 @@ lockdep = ["mmcheck"]
 # VMA/PTE agreement check after each address-range operation
 # (`mm::check`, MMCHECK:FAIL reports; debug aid)
 mmcheck = []
+
+[lints]
+workspace = true
