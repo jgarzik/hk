@@ -595,6 +595,10 @@ pub struct FdTable<F> {
     fd_flags: BTreeMap<Fd, u32>,
     /// Detached files, released once the lock is dropped
     dead: Vec<Arc<F>>,
+    /// The ones of them a descriptor was closed for (close, dup2 over
+    /// it, close_range), not files refused an install: their closer's
+    /// POSIX locks go (`fdtable::FilesGuard`)
+    closed: Vec<Arc<F>>,
 }
 
 impl<F> FdTable<F> {
@@ -610,6 +614,7 @@ impl<F> FdTable<F> {
             bits: fdbits::OpenFds::new(),
             fd_flags: BTreeMap::new(),
             dead: Vec::new(),
+            closed: Vec::new(),
         }
     }
 
@@ -636,6 +641,12 @@ impl<F> FdTable<F> {
     /// them after unlocking)
     pub fn take_dead(&mut self) -> Vec<Arc<F>> {
         core::mem::take(&mut self.dead)
+    }
+
+    /// The files whose descriptors were closed since the lock was taken
+    /// (also released after unlocking)
+    pub fn take_closed(&mut self) -> Vec<Arc<F>> {
+        core::mem::take(&mut self.closed)
     }
 
     /// Allocate the lowest free file descriptor for a file (POSIX).
@@ -678,7 +689,7 @@ impl<F> FdTable<F> {
         match self.files.remove(&fd) {
             Some(f) => {
                 self.bits.clear(fd as usize);
-                self.defer(f);
+                self.closed.push(f);
                 true
             }
             None => false,
@@ -795,6 +806,7 @@ impl<F> FdTable<F> {
             bits: self.bits.clone(),
             fd_flags: self.fd_flags.clone(),
             dead: Vec::new(),
+            closed: Vec::new(),
         }
     }
 
@@ -829,7 +841,7 @@ impl<F> FdTable<F> {
         for &fd in mid.keys() {
             self.bits.clear(fd as usize);
         }
-        self.dead.extend(mid.into_values());
+        self.closed.extend(mid.into_values());
     }
 
     /// Set FD_CLOEXEC on the open descriptors in `lo..=hi` (Linux

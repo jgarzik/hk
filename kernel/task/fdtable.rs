@@ -58,14 +58,17 @@ impl DerefMut for FilesGuard<'_> {
 impl Drop for FilesGuard<'_> {
     fn drop(&mut self) {
         let dead = self.0.take_dead();
+        let closed = self.0.take_closed();
         // SAFETY: dropped exactly once, here
         unsafe { ManuallyDrop::drop(&mut self.0) };
         // A descriptor closed (close, dup2 over it, close_range): the
         // caller's POSIX locks on its inode go (Linux filp_flush ->
-        // locks_remove_posix), however many other descriptors it has
-        for f in &dead {
+        // locks_remove_posix), however many other descriptors it has.
+        // Files refused an install (`dead`) were never the caller's.
+        for f in &closed {
             crate::fs::posix_lock::release_posix_locks_on_close(f);
         }
+        drop(closed);
         drop(dead);
     }
 }

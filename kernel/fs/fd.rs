@@ -378,6 +378,19 @@ mod fcntl_cmd {
     pub const F_DUPFD_CLOEXEC: i32 = 1030;
 }
 
+/// A lock was just set through `fd`: if a close (by another thread)
+/// took the descriptor away meanwhile, its release came too early, so
+/// the lock goes now (Linux fcntl_setlk rechecks with files_lookup_fd)
+fn setlk_recheck(fd: i32, file: &Arc<crate::fs::File>) {
+    let same = current_fd_table()
+        .lock()
+        .get(fd)
+        .is_some_and(|f| Arc::ptr_eq(&f, file));
+    if !same {
+        crate::fs::posix_lock::release_posix_locks_on_close(file);
+    }
+}
+
 /// sys_fcntl - file control operations
 ///
 /// Performs various operations on file descriptors.
@@ -532,7 +545,10 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> i64 {
             }
 
             match posix_setlk(&file, &flock) {
-                Ok(()) => 0,
+                Ok(()) => {
+                    setlk_recheck(fd, &file);
+                    0
+                }
                 Err(e) => e.sysret(),
             }
         }
@@ -556,7 +572,10 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> i64 {
             }
 
             match posix_setlkw(&file, &flock) {
-                Ok(()) => 0,
+                Ok(()) => {
+                    setlk_recheck(fd, &file);
+                    0
+                }
                 Err(e) => e.sysret(),
             }
         }
