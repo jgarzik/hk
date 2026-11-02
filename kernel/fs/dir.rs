@@ -288,6 +288,9 @@ pub fn sys_mknodat(dirfd: i32, pathname_ptr: u64, mode: u32, dev: u64) -> i64 {
             S_IFSOCK => dir
                 .i_op
                 .mknod(dir, &name, InodeMode::socket(perm), DevId::from_user(0)),
+            S_IFIFO => dir
+                .i_op
+                .mknod(dir, &name, InodeMode::fifo(perm), DevId::from_user(0)),
             _ => dir.i_op.create(dir, &name, InodeMode::regular(perm)),
         }
     });

@@ -2,8 +2,10 @@
 //! RAM and the kernel heap
 //!
 //! Tests:
-//! - MEM_TOTAL: MemTotal is the QEMU RAM (512MB) less what boot keeps
-//!   (kernel image, memory map): between 400MB and 512MB
+//! - MEM_TOTAL: MemTotal is whole pages, matches sysinfo's totalram
+//!   (both are totalram_pages on Linux), exceeds MemFree, and leaves room
+//!   for this suite (MEM_TOUCH_FREE's 300MB and more); nothing assumes
+//!   one machine's RAM size
 //! - MEM_TOUCH_FREE: a child touching 300MB of anonymous memory takes
 //!   about that much MemFree, and it all comes back when the child exits
 //!   (within 8MB on hk, 32MB on Linux)
@@ -17,7 +19,7 @@
 //!   the entries are checked)
 
 use super::helpers::{host_mode, print, print_num, println};
-use super::mm_life::meminfo;
+use super::mm_life::{SI_TOTALRAM, meminfo, sysinfo_ram};
 use super::sk::{bind, close, connect, now_ms, port, tcp};
 use super::sysctl::{read_file, write_file};
 use super::tcp_xfer::accept;
@@ -60,7 +62,22 @@ fn mem_total() {
     print(b"MEM_TOTAL: ");
     print_num(t);
     println(b" kB");
-    report(b"MEM_TOTAL", (400 * MB..=512 * MB).contains(&t), t);
+    let why: &[u8] = if t <= 0 || t % 4 != 0 {
+        b"not whole pages"
+    } else if t as u64 != sysinfo_ram(SI_TOTALRAM) >> 10 {
+        b"sysinfo totalram differs"
+    } else if meminfo(b"MemFree:") >= t {
+        b"MemFree not below it"
+    } else if t < (TOUCH as i64 >> 10) + 64 * MB {
+        b"too small for the suite"
+    } else {
+        b""
+    };
+    if !why.is_empty() {
+        print(b"MEM_TOTAL: ");
+        println(why);
+    }
+    report(b"MEM_TOTAL", why.is_empty(), t);
 }
 
 /// Child: touch TOUCH bytes; exit 0 if MemFree dropped by at least 90%

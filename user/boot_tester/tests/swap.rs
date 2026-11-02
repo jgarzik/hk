@@ -20,6 +20,62 @@ pub fn run_tests() {
     test_swapon_enoent();
     test_swapoff_einval();
     test_swapon_invalid_header();
+    test_swapon_size();
+}
+
+/// A 256-page file whose swap header says the area ends at `last_page`
+fn swap_file(path: &[u8], last_page: u32) -> bool {
+    use hk_syscall::{O_CREAT, O_TRUNC, O_WRONLY, sys_close, sys_ftruncate, sys_open, sys_write};
+    let fd = sys_open(path.as_ptr(), O_CREAT | O_TRUNC | O_WRONLY, 0o600);
+    if fd < 0 {
+        return false;
+    }
+    let mut hdr = [0u8; 4096];
+    // union swap_header: info.version at 1024, info.last_page at 1028
+    hdr[1024..1028].copy_from_slice(&1u32.to_ne_bytes());
+    hdr[1028..1032].copy_from_slice(&last_page.to_ne_bytes());
+    hdr[4086..].copy_from_slice(b"SWAPSPACE2");
+    let ok = sys_write(fd as u64, hdr.as_ptr(), 4096) == 4096
+        && sys_ftruncate(fd as i32, 256 * 4096) == 0;
+    sys_close(fd as u64);
+    ok
+}
+
+/// swapon checks the header against the file (Linux read_swap_header):
+/// last_page 0 is EINVAL, an area longer than the file is EINVAL (not
+/// clamped), however long it says it is; one that fits works (hk only:
+/// Linux tmpfs and ramfs files cannot be swap files)
+fn test_swapon_size() {
+    use super::helpers::{host_mode, print_num as num};
+    let path = b"/tmp/size_swap\0";
+    let mut got = [0i64; 4];
+    for (i, last) in [0u32, 256, 0x7fff_ffff, 255].into_iter().enumerate() {
+        if i == 3 && host_mode() {
+            got[i] = 0;
+            break;
+        }
+        got[i] = if swap_file(path, last) {
+            sys_swapon(path.as_ptr(), 0)
+        } else {
+            -1000
+        };
+        if got[i] == 0 {
+            sys_swapoff(path.as_ptr());
+        }
+    }
+    hk_syscall::sys_unlink(path.as_ptr());
+    let ok = got[0] == EINVAL && got[1] == EINVAL && got[2] == EINVAL && got[3] == 0;
+    print(b"SWAPON_SIZE");
+    if ok {
+        println(b":OK");
+    } else {
+        print(b":FAIL got");
+        for g in got {
+            print(b" ");
+            num(g);
+        }
+        println(b"");
+    }
 }
 
 /// Test: swapon on non-existent path returns ENOENT

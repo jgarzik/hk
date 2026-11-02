@@ -383,6 +383,16 @@ pub struct File {
 }
 
 impl File {
+    /// The file's mount is noexec (Linux path_noexec on f_path.mnt): the
+    /// mount chosen when it was opened, in the opener's namespace, so a
+    /// file passed to another namespace keeps it. A file with no mount
+    /// (an internal object: pipe, memfd) is not noexec.
+    pub fn noexec(&self) -> bool {
+        self.mnt
+            .as_ref()
+            .is_some_and(|m| m.flags() & super::mount::MNT_NOEXEC != 0)
+    }
+
     /// Create a new file
     ///
     /// Finds the mount for the dentry and increments its reference count
@@ -703,9 +713,11 @@ impl Drop for File {
         // Call release on file operations to allow cleanup (e.g., decrement pipe reader/writer counts)
         let _ = self.f_op.release(self);
 
-        // Release POSIX advisory locks (must be before releasing mount ref)
-        // POSIX semantics: closing ANY fd releases ALL locks by this process
-        super::posix_lock::release_posix_locks_on_close(self);
+        // The open file description is gone: its flock locks go (Linux
+        // __fput -> locks_remove_file). POSIX locks are the closer's,
+        // released at each close (fdtable::FilesGuard), not here (this
+        // may run in another process's context)
+        super::flock::release_file_locks(self);
 
         // Decrement mount reference count via mntput
         // This mirrors Linux's fput() -> mntput()
@@ -759,6 +771,7 @@ impl CharDevFileOps {
             DeviceError::NotFound => KernelError::NotFound,
             DeviceError::NotTty => KernelError::NotTty,
             DeviceError::Fault => KernelError::BadAddress,
+            DeviceError::NoSpace => KernelError::NoSpace,
         }
     }
 }

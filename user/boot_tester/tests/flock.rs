@@ -5,6 +5,13 @@
 //! - Test flock with LOCK_SH
 //! - Test flock with LOCK_NB on locked file
 //! - Test flock returns EBADF for invalid fd
+//! - FLOCK_RELEASE_EXIT: a lock is gone once its holder exits (the last
+//!   descriptor of its open file closes, Linux locks_remove_file)
+//! - FLOCK_OFD: the lock belongs to the open file description: a forked
+//!   child's inherited descriptor holds it too, a separate open in the
+//!   child conflicts
+//! - FLOCK_HARDLINK: a lock taken through one name of a file conflicts
+//!   with one through a hard link to it (Linux keys flock on the inode)
 //! - Test fallocate extends file
 //! - Test fallocate with FALLOC_FL_KEEP_SIZE
 //! - Test fallocate returns EBADF for invalid fd
@@ -38,6 +45,9 @@ pub fn run_tests() {
     test_flock_exclusive();
     test_flock_shared();
     test_flock_nonblock();
+    test_flock_release_exit();
+    test_flock_ofd();
+    test_flock_hardlink();
     test_flock_ebadf();
     test_fallocate_extend();
     test_fallocate_keep_size();
@@ -456,5 +466,88 @@ fn test_copy_file_range_ebadf() {
     } else {
         print(b"COPY_FILE_RANGE_EBADF:FAIL: expected -9, got ");
         print_num(ret);
+    }
+}
+
+fn test_flock_release_exit() {
+    use hk_syscall::{sys_exit, sys_fork, sys_wait4};
+    let path = b"/tmp/flock_exit_test\0";
+    let pid = sys_fork();
+    if pid == 0 {
+        let fd = sys_open(path.as_ptr(), O_RDWR | O_CREAT, 0o644);
+        sys_exit(if fd >= 0 && sys_flock(fd as i32, LOCK_EX) == 0 { 0 } else { 1 });
+    }
+    let mut st = 0i32;
+    sys_wait4(pid, &mut st, 0, 0);
+    let fd = sys_open(path.as_ptr(), O_RDWR | O_CREAT, 0o644);
+    let r = sys_flock(fd as i32, LOCK_EX | LOCK_NB);
+    sys_close(fd as u64);
+    if st == 0 && r == 0 {
+        println(b"FLOCK_RELEASE_EXIT:OK");
+    } else {
+        print(b"FLOCK_RELEASE_EXIT:FAIL got ");
+        print_num(r);
+        println(b"");
+    }
+}
+
+fn test_flock_ofd() {
+    use hk_syscall::{sys_exit, sys_fork, sys_wait4};
+    const EWOULDBLOCK: i64 = -11;
+    let path = b"/tmp/flock_ofd_test\0";
+    let fd = sys_open(path.as_ptr(), O_RDWR | O_CREAT | O_TRUNC, 0o644);
+    if fd < 0 || sys_flock(fd as i32, LOCK_EX) != 0 {
+        sys_close(fd as u64);
+        println(b"FLOCK_OFD:FAIL setup");
+        return;
+    }
+    let pid = sys_fork();
+    if pid == 0 {
+        let same = sys_flock(fd as i32, LOCK_EX | LOCK_NB);
+        let other = sys_open(path.as_ptr(), O_RDWR, 0);
+        let conflict = sys_flock(other as i32, LOCK_EX | LOCK_NB);
+        sys_exit(if same != 0 {
+            1
+        } else if conflict != EWOULDBLOCK {
+            2
+        } else {
+            0
+        });
+    }
+    let mut st = 0i32;
+    sys_wait4(pid, &mut st, 0, 0);
+    sys_flock(fd as i32, LOCK_UN);
+    sys_close(fd as u64);
+    if st == 0 {
+        println(b"FLOCK_OFD:OK");
+    } else {
+        print(b"FLOCK_OFD:FAIL status ");
+        print_num(st as i64);
+        println(b"");
+    }
+}
+
+fn test_flock_hardlink() {
+    use hk_syscall::{sys_link, sys_unlink};
+    const EWOULDBLOCK: i64 = -11;
+    let a = b"/tmp/flock_hl_a\0";
+    let b = b"/tmp/flock_hl_b\0";
+    sys_unlink(b.as_ptr());
+    let fa = sys_open(a.as_ptr(), O_RDWR | O_CREAT | O_TRUNC, 0o644);
+    let linked = sys_link(a.as_ptr(), b.as_ptr());
+    let fb = sys_open(b.as_ptr(), O_RDWR, 0);
+    let ex = sys_flock(fa as i32, LOCK_EX);
+    let other = sys_flock(fb as i32, LOCK_EX | LOCK_NB);
+    sys_flock(fa as i32, LOCK_UN);
+    sys_close(fa as u64);
+    sys_close(fb as u64);
+    sys_unlink(a.as_ptr());
+    sys_unlink(b.as_ptr());
+    if linked == 0 && ex == 0 && other == EWOULDBLOCK {
+        println(b"FLOCK_HARDLINK:OK");
+    } else {
+        print(b"FLOCK_HARDLINK:FAIL got ");
+        print_num(other);
+        println(b"");
     }
 }

@@ -1600,6 +1600,7 @@ pub fn reap_zombie_child_times(
     target_pid: i64,
     wflags: i32,
 ) -> Option<(Pid, i32, u64, u64)> {
+    let pgid = current_pgid();
     let mut table = TASKLIST.write();
 
     // Find a zombie child matching the criteria: a thread-group leader
@@ -1612,7 +1613,8 @@ pub fn reap_zombie_child_times(
         }
 
         // Must be a zombie
-        if !matches!(t.state, TaskState::Zombie(_)) || group_alive(&table, t) {
+        if !matches!(t.state, TaskState::Zombie(_)) || group_alive(&table, t.task.pid, t.task.tid())
+        {
             return false;
         }
 
@@ -1620,23 +1622,23 @@ pub fn reap_zombie_child_times(
             return false;
         }
 
-        // Check PID matching
-        if target_pid > 0 {
-            // Wait for specific PID
-            t.task.pid == target_pid as u64
-        } else if target_pid == -1 {
-            // Wait for any child
-            true
-        } else {
-            // target_pid == 0: wait for same process group (not implemented)
-            false
-        }
+        // Linux: pid > 0 that child, -1 any, 0 the caller's process
+        // group, < -1 that process group
+        wait_match(t, target_pid, pgid)
     })?;
     let TaskState::Zombie(status) = zombie.state else {
         return None;
     };
-    let (utime, stime) = zombie.task.times();
+    // The child's own time (every thread gone, so the group's) and its
+    // children's: wait's rusage (Linux RUSAGE_BOTH), and the reaper's
+    // cutime/cstime
     let (tid, pid, uid) = (zombie.task.tid(), zombie.task.pid, zombie.cred().uid);
+    let (mut utime, mut stime) = group_times(&table, pid);
+    if let Some(s) = &zombie.signal {
+        let (cu, cs) = s.child_times();
+        utime = utime.saturating_add(cu);
+        stime = stime.saturating_add(cs);
+    }
     let report = (pid, group_status(&zombie, status), utime, stime);
 
     // WNOWAIT (waitid): report the zombie, leave it waitable
@@ -1644,6 +1646,9 @@ pub fn reap_zombie_child_times(
         return Some(report);
     }
 
+    if let Some(s) = table.get(current_tid()).and_then(|t| t.signal.clone()) {
+        s.add_child_times((utime, stime));
+    }
     let task = table.remove(tid);
     // The Task is released after TASKLIST (nothing is released under it)
     drop(table);
@@ -1657,10 +1662,7 @@ pub fn reap_zombie_child_times(
 
 /// A thread of group `tgid` other than `tid` has not exited yet
 pub fn group_others(tgid: Pid, tid: Tid) -> bool {
-    let table = TASKLIST.read();
-    table
-        .threads(tgid)
-        .any(|u| u.task.tid() != tid && !matches!(u.state, TaskState::Zombie(_)))
+    group_alive(&TASKLIST.read(), tgid, tid)
 }
 
 /// After de_thread: `tid` is the only thread of `tgid` left running and
@@ -1713,6 +1715,11 @@ pub fn take_leadership(tgid: Pid, tid: Tid) -> Vec<TaskRef> {
         // and the old leader is dead
         let (mi, li) = unsafe { (me.inner().get_mut(), l.inner().get_mut()) };
         if let (Some(mi), Some(li)) = (mi.as_mut(), li.as_mut()) {
+            // The old leader's CPU time stays the group's (Linux
+            // release_task -> __exit_signal)
+            if let Some(s) = &li.signal {
+                s.add_dead_times(l.times());
+            }
             core::mem::swap(&mut mi.thread_pid, &mut li.thread_pid);
             // The pid hash names the caller by its new number
             if let Some(p) = &mi.thread_pid {
@@ -1759,11 +1766,12 @@ pub fn take_leadership(tgid: Pid, tid: Tid) -> Vec<TaskRef> {
     gone
 }
 
-/// A thread of `t`'s group other than `t` has not exited yet
-fn group_alive(table: &GlobalTaskTable, t: &TaskView<'_>) -> bool {
+/// A thread of group `tgid` other than `tid` has not exited yet (Linux
+/// thread_group_empty / delay_group_leader)
+fn group_alive(table: &GlobalTaskTable, tgid: Pid, tid: Tid) -> bool {
     table
-        .threads(t.task.pid)
-        .any(|u| u.task.tid() != t.task.tid() && !matches!(u.state, TaskState::Zombie(_)))
+        .threads(tgid)
+        .any(|u| u.task.tid() != tid && !matches!(u.state, TaskState::Zombie(_)))
 }
 
 /// The wait status a zombie leader reports (Linux wait_task_zombie):
@@ -1838,6 +1846,7 @@ pub fn has_tracees(tracer_pid: Pid, target_pid: i64) -> bool {
 ///   - -1: check for any child
 ///   - 0: check for any child in same process group
 pub fn has_children(parent_pid: Pid, target_pid: i64, wflags: i32) -> bool {
+    let pgid = current_pgid();
     let table = TASKLIST.read();
 
     table.iter().any(|t| {
@@ -1850,15 +1859,7 @@ pub fn has_children(parent_pid: Pid, target_pid: i64, wflags: i32) -> bool {
             return false;
         }
 
-        // Check PID matching
-        if target_pid > 0 {
-            t.task.pid == target_pid as u64
-        } else if target_pid == -1 {
-            true
-        } else {
-            // target_pid == 0: same process group
-            false
-        }
+        wait_match(&t, target_pid, pgid)
     })
 }
 
@@ -2434,9 +2435,7 @@ fn forget_original_parent() {
     if table.get(me.tid()).is_none_or(|t| t.children.is_empty()) {
         return;
     }
-    let live = |t: &TaskView<'_>| {
-        !t.task.has_flag(crate::task::pf::EXITING) && !matches!(t.state, TaskState::Zombie(_))
-    };
+    let live = crate::signal::task_live;
     let mut reaper = table
         .threads(me.pid)
         .find(|t| !core::ptr::eq(t.task, &*me) && live(t))
@@ -2499,7 +2498,8 @@ pub fn exit_current(status: Option<i32>) -> ! {
         // Exactly one thread, the one taking the group's live count to
         // zero, does the group-level exit work (Linux do_exit:
         // group_dead = atomic_dec_and_test(&signal->live))
-        group_dead = crate::signal::get_task_signal_struct(tid).is_none_or(|s| s.thread_exiting());
+        group_dead =
+            crate::signal::get_task_signal_struct(tid).is_none_or(|s| s.thread_exiting(status));
 
         // Nothing reaps orphans or keeps userspace going without the
         // global init: its death is fatal, and loud (Linux do_exit:
@@ -2536,6 +2536,11 @@ pub fn exit_current(status: Option<i32>) -> ! {
 
         // Clean up FD table for exiting task
         crate::task::fdtable::exit_task_fd(tid);
+        // The process's descriptors are all closed now: its POSIX locks
+        // go (Linux close_files -> filp_flush -> locks_remove_posix)
+        if group_dead {
+            crate::fs::posix_lock::release_all_posix_locks_for_pid(current_pid());
+        }
 
         // Clean up SysV semaphore undo list for exiting task
         // This may apply undo operations if this is the last holder
@@ -2726,6 +2731,13 @@ fn context_switch_locked(
     }
     // SAFETY: a task of this run queue, alive while it holds it
     let n = unsafe { &*next };
+    // The outgoing task's time up to now; the incoming one counts from
+    // now (its time off the CPU is nobody's)
+    let now = crate::time::monotonic_ns();
+    if prev.tid() != 0 {
+        prev.switch_out(now);
+    }
+    n.switch_in(now);
     let (next_kstack, next_mm, (next_tls, next_gs)) = make_current(n);
     rq.curr = next;
     rq.prev = prev;
@@ -3467,6 +3479,7 @@ pub fn scheduler_tick() {
     }
     crate::timer::run_local();
     crate::watchdog::tick();
+    crate::kmsg::tick();
     if let Some(cpu) = crate::cpu::try_this_id() {
         balance_tick(cpu);
     }
@@ -3477,6 +3490,12 @@ pub fn scheduler_tick() {
     // the CPU's rt runtime (`rt_tick`, `rt_period_tick`)
     let me = current();
     let now = crate::time::monotonic_ns();
+    // Its CPU time so far, so a task that never makes a syscall or
+    // switches is charged too (Linux account_process_tick)
+    if me.tid() != 0 {
+        me.account_now(now);
+        crate::cpu_timer::tick(&me);
+    }
     let resched = match me.se.class() {
         Class::Stop => false,
         Class::Rt => {
@@ -3829,7 +3848,11 @@ pub fn lookup_task_rt_priority(pid: Pid) -> Option<i32> {
 /// Returns (0, 0) if the task is not found.
 pub fn get_task_times(tid: Tid) -> (u64, u64) {
     let table = TASKLIST.read();
-    table.get(tid).map(|t| t.task.times()).unwrap_or((0, 0))
+    let now = crate::time::monotonic_ns();
+    table
+        .get(tid)
+        .map(|t| t.task.cputime(now))
+        .unwrap_or((0, 0))
 }
 
 /// Get aggregate CPU times for a process (all threads)
@@ -3838,14 +3861,41 @@ pub fn get_task_times(tid: Tid) -> (u64, u64) {
 /// Returns (0, 0) if no threads are found.
 pub fn get_process_times(pid: Pid) -> (u64, u64) {
     let table = TASKLIST.read();
-    let mut utime = 0u64;
-    let mut stime = 0u64;
+    group_times(&table, pid)
+}
+
+/// Thread group `pid`'s CPU time (Linux thread_group_cputime): its
+/// threads gone (in its SignalStruct) plus those still holding the
+/// SignalStruct, each with its running slice. A thread that left gave
+/// its time to the struct when it lost it, so none counts twice.
+pub fn group_times(table: &GlobalTaskTable, pid: Pid) -> (u64, u64) {
+    let now = crate::time::monotonic_ns();
+    let mut sig = None;
+    let (mut utime, mut stime) = (0u64, 0u64);
     for task in table.threads(pid) {
-        let (u, s) = task.task.times();
+        let Some(s) = &task.signal else {
+            continue;
+        };
+        sig.get_or_insert_with(|| s.clone());
+        let (u, st) = task.task.cputime(now);
         utime = utime.saturating_add(u);
-        stime = stime.saturating_add(s);
+        stime = stime.saturating_add(st);
+    }
+    if let Some(s) = sig {
+        let (u, st) = s.dead_times();
+        utime = utime.saturating_add(u);
+        stime = stime.saturating_add(st);
     }
     (utime, stime)
+}
+
+/// The calling process's children's CPU time (cutime, cstime)
+pub fn children_times() -> (u64, u64) {
+    let table = TASKLIST.read();
+    table
+        .get(current_tid())
+        .and_then(|t| t.signal.clone())
+        .map_or((0, 0), |s| s.child_times())
 }
 
 /// Syscall entry: user time ends, system time starts
@@ -3861,7 +3911,10 @@ pub fn account_syscall_exit() {
 fn account_current(kernel: bool) {
     let me = current();
     if me.tid() != 0 {
+        // Interrupts off: the tick charges this task too (acct_seq)
+        let irq = crate::arch::local_irq_save();
         me.account(crate::time::monotonic_ns(), kernel);
+        crate::arch::local_irq_restore(irq);
     }
 }
 
@@ -4043,15 +4096,51 @@ fn change_class(p: &KernelTask, f: impl FnOnce(&sched::SchedEntity)) {
 /// - ESRCH (3): Process not found
 /// - EPERM (1): a session leader, another session, or no group
 ///   `new_pgid` in the caller's session
-pub fn set_task_pgid(target_pid: Pid, new_pgid: Pid, caller_sid: Pid) -> Result<(), i32> {
+pub fn set_task_pgid(
+    caller_pid: Pid,
+    target_pid: Pid,
+    new_pgid: Pid,
+    caller_sid: Pid,
+) -> Result<(), i32> {
     // Found before TASKLIST (the pid hash's lock is not nested in it)
     let target = crate::task::pid::find_pgrp(new_pgid);
     let mut old = Vec::new();
     let mut table = TASKLIST.write();
+    setpgid_who(&table, caller_pid, target_pid, caller_sid)?;
     let pg = setpgid_target(&table, target_pid, new_pgid, target.as_ref(), caller_sid)?;
     table.change_pids(target_pid, &pg, None, &mut old);
     drop(table);
     drop(old);
+    Ok(())
+}
+
+/// Process `pid` is the caller's own (`caller_pid`, its group leader)
+/// or a child of the caller's process in its session that has not
+/// exec'd (Linux sys_setpgid: ESRCH, EPERM, EACCES)
+fn setpgid_who(
+    table: &GlobalTaskTable,
+    caller_pid: Pid,
+    pid: Pid,
+    caller_sid: Pid,
+) -> Result<(), i32> {
+    if pid == caller_pid {
+        return Ok(());
+    }
+    let p = table.get(pid).ok_or(3)?; // ESRCH
+    let child = p
+        .real_parent
+        .as_ref()
+        .and_then(|w| w.upgrade())
+        .is_some_and(|parent| parent.pid == caller_pid);
+    if !child {
+        return Err(3); // ESRCH
+    }
+    if p.task.sid() != caller_sid {
+        return Err(1); // EPERM
+    }
+    if !p.task.has_flag(crate::task::pf::FORKNOEXEC) {
+        return Err(13); // EACCES
+    }
     Ok(())
 }
 

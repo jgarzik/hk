@@ -8,7 +8,6 @@
 //! remote reads of cmdline/environ), the sighand action lock, the shared
 //! pending set, `FsStruct.inner` (umask) and the descriptor table lock.
 
-use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt::Write;
@@ -41,6 +40,9 @@ struct Snap {
     exiting: bool,
     utime: u64,
     stime: u64,
+    /// Reaped children's (Linux signal->cutime/cstime)
+    cutime: u64,
+    cstime: u64,
     start: u64,
     nvcsw: u64,
     nivcsw: u64,
@@ -78,6 +80,8 @@ fn snap(pid: Pid) -> Option<Snap> {
         (a.comm(), a.fs().cloned(), a.files().cloned())
     };
     let sig = t.task.sig.lock().clone();
+    // The whole thread group's CPU time (Linux do_task_stat with whole)
+    let (utime, stime) = crate::task::percpu::group_times(&table, pid);
     Some(Snap {
         pid,
         tid: t.task.tid(),
@@ -100,8 +104,10 @@ fn snap(pid: Pid) -> Option<Snap> {
         cred: t.cred(),
         kthread: matches!(t.task.kind, TaskKind::KernelThread),
         exiting: t.task.has_flag(crate::task::pf::EXITING),
-        utime: t.task.utime.load(core::sync::atomic::Ordering::Relaxed),
-        stime: t.task.stime.load(core::sync::atomic::Ordering::Relaxed),
+        utime,
+        stime,
+        cutime: t.signal.as_ref().map_or(0, |s| s.child_times().0),
+        cstime: t.signal.as_ref().map_or(0, |s| s.child_times().1),
         start: t.task.start_time(),
         nvcsw: t.task.nvcsw.load(core::sync::atomic::Ordering::Relaxed),
         nivcsw: t.task.nivcsw.load(core::sync::atomic::Ordering::Relaxed),
@@ -138,19 +144,30 @@ fn state(s: &Snap) -> (char, &'static str) {
     }
 }
 
-/// comm as text, with '\n' and '\\' escaped for status (Linux
-/// seq_escape_str ESCAPE_SPACE | ESCAPE_SPECIAL, "\n\\")
-fn comm(s: &Snap, escape: bool) -> String {
+/// comm's raw bytes (Linux proc_task_name: not re-encoded), with '\n'
+/// and '\\' escaped for status (seq_escape_str ESCAPE_SPACE |
+/// ESCAPE_SPECIAL, "\n\\")
+fn comm(s: &Snap, escape: bool) -> Vec<u8> {
     let n = s.comm.iter().position(|&b| b == 0).unwrap_or(16);
-    let mut out = String::new();
+    let mut out = Vec::new();
     for &b in &s.comm[..n] {
         match b {
-            b'\n' if escape => out.push_str("\\n"),
-            b'\\' if escape => out.push_str("\\\\"),
-            _ => out.push(b as char),
+            b'\n' if escape => out.extend_from_slice(b"\\n"),
+            b'\\' if escape => out.extend_from_slice(b"\\\\"),
+            _ => out.push(b),
         }
     }
     out
+}
+
+/// A byte buffer that formats like a String but also takes raw bytes
+struct Out(Vec<u8>);
+
+impl core::fmt::Write for Out {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        self.0.extend_from_slice(s.as_bytes());
+        Ok(())
+    }
 }
 
 /// (ignored, caught) signals (Linux collect_sigign_sigcatch)
@@ -257,10 +274,12 @@ pub fn gen_status(pid: Pid) -> Vec<u8> {
     let Some(s) = snap(pid) else {
         return Vec::new();
     };
-    let mut o = String::new();
+    let mut o = Out(Vec::new());
     let c = &s.cred;
     let (letter, name) = state(&s);
-    let _ = writeln!(o, "Name:\t{}", comm(&s, true));
+    o.0.extend_from_slice(b"Name:\t");
+    o.0.extend_from_slice(&comm(&s, true));
+    o.0.push(b'\n');
     if let Some(fs) = &s.fs {
         let _ = writeln!(o, "Umask:\t{:04o}", fs.get_umask());
     }
@@ -269,7 +288,12 @@ pub fn gen_status(pid: Pid) -> Vec<u8> {
     let _ = writeln!(o, "PPid:\t{}\nTracerPid:\t{}", s.ppid, s.tracer);
     let _ = writeln!(o, "Uid:\t{}\t{}\t{}\t{}", c.uid, c.euid, c.suid, c.fsuid);
     let _ = writeln!(o, "Gid:\t{}\t{}\t{}\t{}", c.gid, c.egid, c.sgid, c.fsgid);
-    let _ = writeln!(o, "FDSize:\t{}\nGroups:\t ", fd_size(&s));
+    let _ = write!(o, "FDSize:\t{}\nGroups:\t", fd_size(&s));
+    // Linux: the groups space-separated, then a trailing space
+    for (i, g) in c.groups.as_slice().iter().enumerate() {
+        let _ = write!(o, "{}{g}", if i > 0 { " " } else { "" });
+    }
+    let _ = writeln!(o, " ");
     let _ = writeln!(o, "NStgid:\t{}\nNSpid:\t{}", s.tgid, s.pid);
     let _ = writeln!(o, "NSpgid:\t{}\nNSsid:\t{}", s.pgid, s.sid);
     let _ = writeln!(o, "Kthread:\t{}", s.kthread as u8);
@@ -298,12 +322,12 @@ pub fn gen_status(pid: Pid) -> Vec<u8> {
     let _ = writeln!(o, "Mems_allowed:\t1\nMems_allowed_list:\t0");
     let _ = writeln!(o, "voluntary_ctxt_switches:\t{}", s.nvcsw);
     let _ = writeln!(o, "nonvoluntary_ctxt_switches:\t{}", s.nivcsw);
-    o.into_bytes()
+    o.0
 }
 
 /// The Vm* lines (Linux task_mem; hk keeps no high-water marks, so
 /// VmPeak/VmHWM are the current sizes)
-fn status_mem(o: &mut String, v: &VmStat) {
+fn status_mem(o: &mut Out, v: &VmStat) {
     let kb = |pages: u64| pages * 4;
     let lines = [
         ("VmPeak", kb(v.total)),
@@ -330,7 +354,7 @@ fn status_mem(o: &mut String, v: &VmStat) {
 }
 
 /// Threads, SigQ and the signal sets (Linux task_sig)
-fn status_sig(o: &mut String, s: &Snap) {
+fn status_sig(o: &mut Out, s: &Snap) {
     let qlim = s
         .signal
         .as_ref()
@@ -370,11 +394,20 @@ pub fn gen_stat(pid: Pid) -> Vec<u8> {
     let flags = if s.kthread { PF_KTHREAD } else { 0 } | if s.exiting { PF_EXITING } else { 0 };
     let running = matches!(s.state, TaskState::Running | TaskState::Ready);
     let wchan = (permitted && s.threads < 2 && !running) as u8;
-    let mut o = String::new();
-    let _ = write!(o, "{} ({}) {} ", s.pid, comm(&s, false), state(&s).0);
+    let mut o = Out(Vec::new());
+    let _ = write!(o, "{} (", s.pid);
+    o.0.extend_from_slice(&comm(&s, false));
+    let _ = write!(o, ") {} ", state(&s).0);
     let _ = write!(o, "{} {} {} 0 -1 {} ", s.ppid, s.pgid, s.sid, flags);
     let _ = write!(o, "{} 0 {} 0 ", s.min_flt, s.maj_flt);
-    let _ = write!(o, "{} {} 0 0 ", ticks(s.utime), ticks(s.stime));
+    let _ = write!(
+        o,
+        "{} {} {} {} ",
+        ticks(s.utime),
+        ticks(s.stime),
+        ticks(s.cutime),
+        ticks(s.cstime)
+    );
     let _ = write!(o, "{} {} {} 0 {} ", prio, s.nice, s.threads, ticks(s.start));
     let (vsize, rss) = v.as_ref().map_or((0, 0), |v| (v.total * 4096, v.rss));
     let _ = write!(o, "{} {} {} ", vsize, rss, rss_lim(&s));
@@ -414,10 +447,10 @@ pub fn gen_stat(pid: Pid) -> Vec<u8> {
                 a.env_end
             );
         }
-        _ => o.push_str(" 0 0 0 0 0 0 0"),
+        _ => o.0.extend_from_slice(b" 0 0 0 0 0 0 0"),
     }
     let _ = writeln!(o, " {}", if permitted { s.exit_code } else { 0 });
-    o.into_bytes()
+    o.0
 }
 
 /// Read [start, end) of `mm` (Linux access_remote_vm), mmap_lock held;

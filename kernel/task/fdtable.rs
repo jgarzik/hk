@@ -58,8 +58,17 @@ impl DerefMut for FilesGuard<'_> {
 impl Drop for FilesGuard<'_> {
     fn drop(&mut self) {
         let dead = self.0.take_dead();
+        let closed = self.0.take_closed();
         // SAFETY: dropped exactly once, here
         unsafe { ManuallyDrop::drop(&mut self.0) };
+        // A descriptor closed (close, dup2 over it, close_range): the
+        // caller's POSIX locks on its inode go (Linux filp_flush ->
+        // locks_remove_posix), however many other descriptors it has.
+        // Files refused an install (`dead`) were never the caller's.
+        for f in &closed {
+            crate::fs::posix_lock::release_posix_locks_on_close(f);
+        }
+        drop(closed);
         drop(dead);
     }
 }
@@ -100,8 +109,22 @@ pub fn exec_task_fd(tid: Tid) {
     let Some(old) = get_task_fd(tid) else {
         return;
     };
-    let new = Arc::new(Files::new(old.lock().exec_copy()));
+    let (new, cloexec) = {
+        let t = old.lock();
+        let cloexec: alloc::vec::Vec<_> = t
+            .fds()
+            .filter(|&&fd| t.get_fd_flags(fd) & super::FD_CLOEXEC != 0)
+            .filter_map(|&fd| t.get(fd))
+            .collect();
+        (Arc::new(Files::new(t.exec_copy())), cloexec)
+    };
     init_task_fd(tid, new);
+    // Linux do_close_on_exec closes them (filp_close): their POSIX locks
+    // go; every other lock stays across the exec
+    for f in &cloexec {
+        crate::fs::posix_lock::release_posix_locks_on_close(f);
+    }
+    drop(cloexec);
     drop(old);
 }
 

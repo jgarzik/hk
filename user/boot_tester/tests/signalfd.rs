@@ -6,6 +6,10 @@
 //! - Test signalfd nonblock (EAGAIN when empty)
 //! - Test signalfd poll
 //! - Test signalfd mask update
+//! - SIGNALFD_FORK: a signalfd reads the signals of the task reading it
+//!   (Linux signalfd_read on current): after fork, the child's read of
+//!   the inherited signalfd dequeues the child's own SIGUSR1, and the
+//!   parent's sees none
 
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
@@ -26,6 +30,44 @@ pub fn run_tests() {
     test_signalfd_read();
     test_signalfd_poll();
     test_signalfd_mask_update();
+    test_signalfd_fork();
+}
+
+fn test_signalfd_fork() {
+    use hk_syscall::{sys_exit, sys_fork, sys_wait4};
+    const EAGAIN: i64 = -11;
+    let mask: u64 = 1 << (SIGUSR1 - 1);
+    sys_rt_sigprocmask(SIG_BLOCK, &mask as *const u64 as u64, 0, 8);
+    let fd = sys_signalfd4(-1, &mask as *const u64, 8, SFD_NONBLOCK);
+    if fd < 0 {
+        println(b"SIGNALFD_FORK:FAIL signalfd4");
+        return;
+    }
+    // A SIGUSR1 earlier tests left pending goes first
+    let mut drain = [0u8; 128];
+    while sys_read(fd as u64, drain.as_mut_ptr(), 128) > 0 {}
+    let pid = sys_fork();
+    if pid == 0 {
+        sys_tgkill(sys_getpid(), sys_gettid(), SIGUSR1);
+        let mut info = [0u8; 128];
+        let n = sys_read(fd as u64, info.as_mut_ptr(), 128);
+        let signo = u32::from_ne_bytes([info[0], info[1], info[2], info[3]]);
+        sys_exit(if n == 128 && signo == SIGUSR1 { 0 } else { 1 });
+    }
+    let mut st = 0i32;
+    sys_wait4(pid, &mut st, 0, 0);
+    let mut info = [0u8; 128];
+    let mine = sys_read(fd as u64, info.as_mut_ptr(), 128);
+    sys_close(fd as u64);
+    if st == 0 && mine == EAGAIN {
+        println(b"SIGNALFD_FORK:OK");
+    } else {
+        print(b"SIGNALFD_FORK:FAIL status ");
+        print_num(st as i64);
+        print(b" parent read ");
+        print_num(mine);
+        println(b"");
+    }
 }
 
 /// Test signalfd4 creation

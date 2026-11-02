@@ -54,9 +54,9 @@ pub fn capable(c: &Cred, cap: u32) -> bool {
     c.cap_effective.has(cap)
 }
 
-/// in_group_p: hk has no supplementary groups, so only the fsgid
+/// in_group_p: the fsgid or a supplementary group
 pub fn in_group(c: &Cred, gid: Gid) -> bool {
-    c.fsgid == gid
+    c.fsgid == gid || c.groups.contains(gid)
 }
 
 /// in_group_or_capable: may keep or set S_ISGID for group `gid`
@@ -147,7 +147,7 @@ pub fn permission(inode: &Inode, mask: u32) -> Result<(), KernelError> {
 /// with the real ids; capabilities follow the real uid (root keeps its
 /// permitted set, anyone else has none)
 pub fn access_cred(c: &Cred) -> Cred {
-    let mut o = *c;
+    let mut o = c.clone();
     o.fsuid = c.uid;
     o.fsgid = c.gid;
     o.cap_effective = if c.uid == 0 {

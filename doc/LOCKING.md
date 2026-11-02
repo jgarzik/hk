@@ -338,8 +338,9 @@ Tasks (3.1.1, 3.7; Linux tasklist_lock → pidmap_lock → task_lock →
     IRQ-safe; Linux task_lock; one task's at a time) → Task.sig (spin
     Mutex, per task) → TaskSignalState.shared_pending (spin Mutex) →
     SigHand.action (IrqSpinlock leaf); Task.keyrings, Task.cgroup,
-    Task.fput_defer, SignalStruct.posix_timers: per-task leaves reached
-    through a TaskRef, never under TASKLIST
+    Task.fput_defer: per-task leaves reached through a TaskRef, never
+    under TASKLIST; SignalStruct.posix_timers (never under TASKLIST)
+    → PosixTimer.inner, SignalStruct.rlim (cpu_timer's expiry pass)
 
 Wakeups (3.1; any context, under any of the above):
     WaitQueue head (IrqSpinlock) → Task.pi_lock (IrqSpinlock, per task)
@@ -361,9 +362,15 @@ Timekeeping (3.5):
 Printk locks (ALL IRQ-safe - can be acquired from interrupt context):
     OUTPUT_LOCK (IrqSpinlock, held for entire message)
         ↓
+    kmsg LOG (IrqSpinlock leaf, the record log; taken and released
+              before PRINTK)
     PRINTK (IrqSpinlock, ring buffer)
         ↓
     CONSOLE_REGISTRY (IrqSpinlock, console dispatch)
+
+/dev/kmsg (kmsg.rs):
+    KmsgUser.cur (spin, per open; never held across a wait) → LOG
+    KmsgUser.rate (spin leaf)
 ```
 
 ### Key Rules
@@ -798,7 +805,11 @@ A `Task` has five kinds of fields: fixed at creation (`tid`, `pid`,
 creator before it first runs) or under TASKLIST, and read lock-free
 by anyone (`flags` = Linux PF_*, `thread_flags` = TIF_*, `cpu`,
 `start_time`, `ppid`/`pgid`/`sid`, `seccomp_mode`, `tls`, utime/stime
-and the other counters); `cred` (below); the alloc_lock fields; and
+and the other counters; utime/stime/last_run_ns/in_kernel are written
+only on the task's own CPU with interrupts off (its syscall entry and
+exit, its context switches, the tick) inside the `acct_seq` sequence
+count, which readers on other CPUs retry on); `cred` (below); the
+alloc_lock fields; and
 the rest, `TaskInner`, in a `TableCell` that only the locked
 table's views reach (`GlobalTaskTable::get`/`iter` read it,
 `get_mut`/`iter_mut` write it with the table borrowed mutably; Linux
@@ -876,7 +887,11 @@ taken, except `cred_guard` around `exec_update`):
   mmap_lock, the fd table, TASKLIST) until the new image is in
   place; an error return drops it with nothing changed. PTRACE_ATTACH /
   PTRACE_SEIZE hold the target's around the access decision and the
-  attach.
+  attach; seccomp TSYNC holds the caller's group's around syncing the
+  other threads' filters (TASKLIST written inside). These take it
+  interruptibly (Linux mutex_lock_interruptible,
+  ERESTARTNOINTR): a sibling waiting for it while the holder's exec
+  waits in de_thread for that sibling to die is woken by the SIGKILL.
 - `exec_update` (`sync::RwSem`): `exec_replace_image` holds it for
   writing, inside `cred_guard`, while it installs the new mm, name and
   dumpability under TASKLIST and the task's alloc_lock; process_vm_readv/writev (`access_mm`),
@@ -1193,9 +1208,15 @@ pub struct Zone {
   chains, and only once empty and outside every remaining VMA's span:
   an entry pointer stays valid under any mm lock hold, or under the
   AnonVma.chain lock of a VMA it lies in (the reverse map). Order: mm lock -> page_table_lock -> PTE lock ->
-  `FRAME_ALLOCATOR` (pages and tables are allocated, and the TLB is
-  flushed, under them); never in interrupt context; no sleeping under
-  them. A holder may flush other CPUs' TLBs: their waiters spin with
+  `FRAME_ALLOCATOR` (the TLB is flushed under them); never in
+  interrupt context; no sleeping under them. Both disable preemption
+  (in_atomic), so an allocation under them never enters direct reclaim:
+  reclaim's reverse-map walk takes PTE locks, the held one included (a
+  self-deadlock). Allocations that must not fail are made first: fork
+  and mremap allocate the destination tables before the source's PTE
+  lock (`PteWalk::prepare`, mremap's prep walk reads entries unlocked
+  under the write-held mmap_lock), a copy-on-write break retries its
+  page allocation without the lock. A holder may flush other CPUs' TLBs: their waiters spin with
   interrupts on (syscalls and faults run with them on, 7.5) and answer
   the IPI, as in Linux. Deviation: the PTE lock is a bare lock word in
   the table's struct page (Linux: a `spinlock_t` in the ptdesc).
@@ -1274,7 +1295,8 @@ pub struct Zone {
   allocator lock held), and pages are freed in any context. A leaf:
   nothing is taken under it but page reference atomics; no reference is
   dropped under it (a drop may free the page and take it again).
-- Per-CPU add batches (`IrqSpinlock`, one per CPU; Linux cpu_fbatches):
+- Per-CPU add batches (`BATCHES`, `IrqSpinlock`, one per CPU; Linux
+  cpu_fbatches):
   a batch holds a reference on each page; a full batch is taken out
   under its lock, then added under `Lruvec.lock` (never both held), then
   its references dropped. `lru_add_drain_all` drains every CPU's batch
@@ -1674,6 +1696,17 @@ Each open `File` holds a reference to its mount via the `mnt` field:
 3. child.mountpoint (read)
 4. Dentry.d_lock (DentryInner.inode: read)
 ```
+
+`is_local_mountpoint` (rmdir, unlink, rename: EBUSY) takes the same
+locks in the same order, one mount's `children` at a time, inside the
+inode locks those syscalls hold (sleeping, outer): the parents' and the
+victim's (rmdir/unlink) or the renamed and replaced inodes' (a
+directory being replaced included, like Linux vfs_rename). `attach`
+takes the mountpoint directory's i_rwsem (Linux lock_mount) around
+linking the new mount in and refuses a directory marked dead
+(`Inode::set_dead`, set by rmdir or a rename replacing it under that
+same lock), so a mount and a removal of its mountpoint serialize:
+i_rwsem -> MntNamespace.root -> Mount.children -> Mount.mountpoint.
 
 #### VFS Locking Notes
 
@@ -2232,6 +2265,17 @@ static CONSOLE_REGISTRY: IrqSpinlock<ConsoleRegistry> = IrqSpinlock::new(...);
 3. CONSOLE_REGISTRY (held during console_write) - IrqSpinlock
 ```
 
+**The record log** (`kernel/kmsg.rs`): `LOG` (IrqSpinlock) holds the
+records that /dev/kmsg and syslog(2) read. printk adds each complete
+line under OUTPUT_LOCK (try_lock while panicking); a /dev/kmsg write
+adds its record under `LOG` alone, then writes the console under
+OUTPUT_LOCK. Nothing allocates under `LOG`: readers size their
+buffers before taking it, and syslog reads copy the ring out (one
+memcpy) and format after releasing it. printk may run with run-queue locks held,
+so it never wakes readers itself: it sets `WAKE_PENDING`, and the
+scheduler tick (no locks held) wakes them (Linux defers the klogd
+wakeup through irq_work).
+
 **Why IRQ-Safe:**
 
 All three locks use `IrqSpinlock` because printk can be called from:
@@ -2522,7 +2566,9 @@ de_thread, exit_group does not.
   after dropping it.
 - de_thread (exec) holds cred_guard (sleeping, outermost) while it waits
   for the other threads on CHILD_EXIT_WQ (killable); it holds no
-  spinlock. The old leader and exited threads are removed under
+  spinlock. A thread blocked on that cred_guard (its own exec, or an
+  attach to the group) sleeps interruptibly, so the SIGKILL de_thread
+  sends ends it. The old leader and exited threads are removed under
   TASKLIST and released after it.
 
 #### Reference Counting
@@ -3036,25 +3082,30 @@ else is taken under it) unless an order is given. "spin" is the
 | Lock | Location | Class | Protects / order |
 |------|----------|-------|------------------|
 | `Task.vfork_done` | task/mod.rs | atomic pointer | the vforking parent's on-stack `Completion` (Linux vfork_done): set before the child runs, taken once by the child at exec/exit, which completes it; the parent waits uninterruptibly so the completion outlives that use |
-| `SignalStruct.posix_timers` | signal/mod.rs, posix_timer.rs | spin Mutex | the thread group's POSIX timers and ITIMER_REAL (Linux signal->posix_timers); leaf, thread context; deleted at the group's last exit (`exit_itimers`, timers stopped after the lock) or with the SignalStruct |
-| `PosixTimer.inner` | posix_timer.rs | IrqSpinlock | one timer's state; -> its hrtimer's base (re-armed under it); cancelled with `cancel_sync` before it is taken (settime) or with it dropped (delete) |
+| `SignalStruct.posix_timers` | signal/mod.rs, posix_timer.rs | spin Mutex | the thread group's POSIX timers and itimers (Linux signal->posix_timers); thread context, never under TASKLIST; cpu_timer holds it around arming the group's CPU-timer state and its whole expiry pass (`PosixTimer.inner` and `SignalStruct.rlim` inside); deleted at the group's last exit (`exit_itimers`, timers stopped after the lock) or with the SignalStruct |
+| `PosixTimer.inner` | posix_timer.rs | IrqSpinlock | one timer's state; -> its hrtimer's base (re-armed under it); cancelled with `cancel_sync` before it is taken (settime) or with it dropped (delete). A CPU-time timer's clock value is read before it (that may take TASKLIST) |
+| CPU-timer state (`cpu_timer.rs`): `SignalStruct.cputimer`, `Task.cpu_next` | cpu_timer.rs | atomics | the group's running CPU totals and expiry hints, a thread's hints; written by the tick and accounting (interrupts off) and by `run` in task context. `run` (TIF_NOTIFY_RESUME on the way to user mode) takes `posix_timers` -> `PosixTimer.inner`, then `SignalStruct.rlim`, and sends signals after dropping them |
 | timerfd `CANCEL_LIST` | timerfd.rs | spin::Mutex | thread only: weak refs to TFD_TIMER_CANCEL_ON_SET timerfds; -> `Timerfd.inner` (setup_cancel); `clock_was_set` copies it out and drops it first |
 | `TimerBase.wheel` (per CPU, HARD and SOFT) | timer.rs | IrqSpinlock leaf | a 64-slot wheel of `TimerList`s (their links, `expires`, `pending`); callbacks run with it dropped (`running` set); taken in the tick, by `ktimers/N` and by arming/deleting code in any context |
 | `HrBase.q` (per CPU, HARD and SOFT) | hrtimer.rs | IrqSpinlock leaf | sorted lists of `HrTimer`s per clock (their links, `expires`, `pending`); callbacks run with it dropped (`running` set); taken in the clock event interrupt, by `ktimers/N` and by start/cancel in any context. `SOFT_ACTIVATED` (per-CPU atomic, Linux softirq_activated): set by the clock interrupt when it hands due SOFT timers to `ktimers/N`, cleared by it after its pass (interrupts off, then reprogram); while set the clock event counts only HARD timers |
 | `Eventfd.inner`, `Eventpoll.inner`, `Inotify.inner`, `Fanotify.inner`, `IoUring.inner`, `Pidfd.inner`, `Signalfd.inner`, `Timerfd.inner` | eventfd.rs, epoll.rs, inotify.rs, fanotify.rs, io_uring.rs, pidfd.rs, signalfd.rs, timerfd.rs | IrqSpinlock | per-object state of the anon-inode files; their wait queues are woken after unlocking (pidfd: under it -> wait queue head) |
-| `SIGNALFD_REGISTRY`, `PIDFD_REGISTRY` | signalfd.rs, pidfd.rs | IrqSpinlock | live instances for signal and exit notification; registry -> the instance's `inner` |
+| `PIDFD_REGISTRY` | pidfd.rs | IrqSpinlock | live pidfds for exit notification; registry -> the instance's `inner` |
+| `SigHand.signalfd_wq` | signal/mod.rs | WaitQueue (its own IrqSpinlock) | signalfd readers and pollers of the tasks sharing a handler table (Linux sighand->signalfd_wqh); woken by send_signal after the target's signal state is unlocked; readers take `Signalfd.inner` and the caller's signal state only in its condition, after the queue's lock is dropped |
 | `Workqueue.inner` | workqueue.rs | IrqSpinlock | pending and delayed work lists (`SYSTEM_WQ`, `BDI_WORKQUEUE`); a work item's own `spin::Mutex<Work>` is taken and dropped before it |
 | `BDI_REGISTRY`, `BdiWriteback.dirty_inodes`, `BdiWriteback.dwork` | mm/writeback.rs | spin | per-device writeback state |
 | `DIRTY_ADDRESS_SPACES` | mm/page_cache.rs | spin Mutex | files with dirty pages (sync) |
 | `Task.cgroup`, `CSS_SET_CACHE`, `CgroupRoot.{root_cgrp, controllers}`, `Cgroup.{parent, children, ancestors, subsys, tasks}`, `CssSet.subsys`, `CgroupSubsysState.private`, `IoState.devices` | cgroup/ | spin (RwLock; `CSS_SET_CACHE`, `Task.cgroup` Mutex) | cgroup hierarchy and membership (`Task.cgroup`: the task's cgroup, a leaf reached through a `TaskRef` cloned out of TASKLIST, Linux task->cgroups); parent before child; never under TASKLIST |
 | `IpcIds.inner`, `KernIpcPerm.lock`, `MsgQueue.{messages, receivers, senders}`, `MsgReceiver.result`, `SemArray.pending`, `SemUndoList.undos`, `MQ_REGISTRY`, `MqQueue.{messages, flags, notify}` | ipc/ | spin | SysV and POSIX IPC objects; `IpcIds.inner` -> the object's lock |
 | `Task.keyrings` → `KEY_DATABASE`, `USER_KEYRINGS`, `Key.payload`, `Key.keyring_keys` | keys/ | spin (RwLock; `Task.keyrings` Mutex) | a task's thread/process/session keyring references (`Task.keyrings`, reached through a `TaskRef` cloned out of TASKLIST; creating a keyring registers it under it), key registry and keyrings (lookups clone the `Arc<Key>` out) |
-| `FILE_LOCKS` (flock), `POSIX_LOCKS` | fs/flock.rs, fs/posix_lock.rs | spin Mutex | file lock tables; waiters sleep with them dropped |
+| `FILE_LOCKS` (flock), `POSIX_LOCKS` | fs/flock.rs, fs/posix_lock.rs | spin Mutex | file lock tables; leaves. No waiters: blocking flock and F_SETLKW are EAGAIN (BUGS.md) |
+| `cmdline::SAVED` | cmdline.rs | spin Mutex | the saved kernel command line (Linux saved_command_line): written once while parsing, before SMP; read in thread context (init's arguments); a leaf |
+| `signal::NO_SHARED` | signal/mod.rs | spin Mutex | the empty shared pending set the boot task (no SignalStruct) reads; locked where a thread group's `shared_pending` would be, same position (Task.sig -> shared_pending) |
 | `FS_TYPES`, `CHARDEV_REGISTRY` | fs/superblock.rs, chardev.rs | spin | filesystem types, character device registry |
 | `File.f_lock` | fs/file.rs | spin Mutex | file status flags (Linux f_lock) |
 | `SuperBlock.{root, private}`, `DentryCache.root` | fs/superblock.rs, fs/dentry.rs | spin RwLock | superblock root and private data, the dcache root |
 | `RamfsInodeData.xattrs`, `RamfsSbData.sb` | fs/ramfs.rs | spin | ramfs xattrs and superblock back-pointer (under VFS locks) |
 | membarrier `GLOBAL_MUTEX` → `IPI_MUTEX` | membarrier.rs | sleeping (`sync::Mutex`; `IPI_MUTEX` is Linux membarrier_ipi_mutex) | `IPI_MUTEX` serializes the membarrier commands that interrupt other CPUs, so callers cannot multiply the IPIs; held only across `smp_call_function_many` (waited); nothing is taken under it. `GLOBAL_MUTEX` (killable) paces MEMBARRIER_CMD_GLOBAL to one call per tick: held across its IPIs and its one-tick sleep, so GLOBAL callers never delay the expedited ones. The targets are chosen from each CPU's `PerCpuScheduler.curr_mm` / `membarrier_state` (atomics written at every switch in `make_current`: `curr_mm` SeqCst, then a full fence, then the registrations read, so a registration either sees the CPU in its mm and refreshes it by IPI or is seen by the switch; Linux rq->curr->mm and rq->membarrier_state), compared, never dereferenced |
+| `Inode.i_pipe` | fs/inode.rs, pipe.rs (FIFOs) | spin Mutex leaf (Linux inode->i_lock around i_pipe) | a FIFO's pipe and its open-file count: attached by the first open, dropped by the last release; every change of the pipe's reader/writer counts and open counters happens under it (so a blocking open decides, and samples the counter it waits on, before unlocking; the release wakes the other side under it: -> `Pipe.wait_queue`); never held across a wait (a blocking open waits on `Pipe.wait_queue` after unlocking) or under `Pipe.inner` |
 | `Pipe.inner` | pipe.rs | sleeping (`sync::Mutex`, Linux pipe->mutex) | the pipe's buffer ring; held across page allocation, never under a spin lock; two pipes (splice, tee) in address order (Linux pipe_double_lock); -> frame allocator. `Pipe.head`/`tail` (atomics) are published as the guard unlocks and read locklessly by wait conditions and poll (poll runs under `Eventpoll.inner`, an IrqSpinlock); wakeups follow the unlock |
 | `NTtyLdisc.data` | tty/n_tty.rs | spin Mutex | line discipline buffer (input is polled, not IRQ-fed) |
 | `VgaCon.state` | arch/x86_64/vgacon.rs | IrqSpinlock | VGA text console state, under `CONSOLE_REGISTRY` (3.9) |
@@ -3063,7 +3114,8 @@ else is taken under it) unless an order is given. "spin" is the
 | `INTX_MAP` | arch/aarch64/pci_irq.rs | spin Mutex | PCI INTx routing from the device tree (boot) |
 | `PCI_LOCK` | arch/x86_64/pci_conf.rs (port I/O config access) | IrqSpinlock | Linux pci_lock: the CF8 address write and the CFC data access of one config read/write; leaf (port I/O only). ECAM accesses are single MMIO operations and take no lock |
 | PCI fixups (`bus/quirks.rs`) | none | thread only (boot) | run by bus enumeration (single-threaded) on each function before driver probe |
-| `CMDLINE_CONSOLE`, `CRNG` | cmdline.rs, random.rs | spin Mutex | console= choice, CRNG state |
+| `CMDLINE_CONSOLE` | cmdline.rs | spin Mutex | console= choice |
+| `CPU_CRNG` (per CPU) -> `BASE` | random.rs | IrqSpinlock | ChaCha20 CRNG: this CPU's key, then the base key when the CPU key is refreshed or the base reseeded; both leaves otherwise (callers include softirq net code). `GENERATION`/`BIRTH_NS` are atomics read unlocked, rechecked under `BASE` |
 | `NUMA_TOPOLOGY` | numa.rs | IrqSpinlock | NUMA node table |
 | `BpfHashMap.data`, `BpfArrayMap.data` | bpf/map.rs | IrqSpinlock | BPF map contents |
 

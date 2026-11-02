@@ -167,7 +167,7 @@ impl Sock {
     /// whatever task runs the receive path)
     pub fn clone_from(p: &Sock) -> Self {
         let mut s = Self::new(p.net.clone(), p.family, p.stype, p.protocol);
-        s.cred = p.cred;
+        s.cred = p.cred.clone();
         s.rcvbuf.store(p.rcvbuf(), Ordering::Relaxed);
         s.sndbuf.store(p.sndbuf(), Ordering::Relaxed);
         s.rcvtimeo

@@ -708,15 +708,8 @@ fn resolve_path_to_ino(pathname: &str, mask: u32) -> Result<(u64, bool), i64> {
     // Lookup path
     let dentry = match lookup_path_at(start, pathname, lookup_flags) {
         Ok(d) => d,
-        Err(e) => {
-            return Err(match e {
-                KernelError::NotFound => -2,          // ENOENT
-                KernelError::NotDirectory => -20,     // ENOTDIR
-                KernelError::PermissionDenied => -13, // EACCES
-                KernelError::TooManySymlinks => -40,  // ELOOP
-                _ => -22,                             // EINVAL
-            });
-        }
+        // Any lookup error as is (Linux user_path_at)
+        Err(e) => return Err(e.sysret()),
     };
 
     let inode = match dentry.get_inode() {

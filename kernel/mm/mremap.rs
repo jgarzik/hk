@@ -49,8 +49,12 @@ pub fn move_prep(
             split_huge_pmd(self.mm, addr).ok_or(KernelError::OutOfMemory)?;
             Ok(false)
         }
-        /// Tables are allocated under the old table's PTE lock (the
-        /// allocator nests inside it); nothing is written there
+        /// Entries are read without the old table's PTE lock, so the
+        /// allocation may reclaim: with the mmap_lock held for writing
+        /// no entry goes from empty to set meanwhile (reclaim only turns
+        /// a present one into a swap entry); nothing is written there
+        const LOCKED: bool = false;
+
         fn pte(&mut self, e: &AtomicU64, addr: u64) -> Result<(), KernelError> {
             if e.load(Ordering::Acquire) != 0
                 && (self.alloc)(addr.wrapping_add(self.delta)).is_none()

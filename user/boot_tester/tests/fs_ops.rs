@@ -61,7 +61,7 @@ pub fn run_tests() {
         return;
     }
     if !mount_vfat() {
-        println(b"VFAT mount failed, skipping VFAT tests");
+        println(b"VFAT tests not run: no mount");
         return;
     }
 
@@ -463,9 +463,11 @@ fn mount_vfat() -> bool {
     if ret == 0 {
         println(b"OK");
     } else {
-        print(b"FAILED (");
+        println(b"");
+        // The USB disk is always attached: not mounting it is a failure
+        print(b"VFAT_MOUNT:FAIL ");
         print_num(ret);
-        println(b")");
+        println(b"");
         return false;
     }
 

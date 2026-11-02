@@ -149,10 +149,14 @@ pub use aarch64::percpu::tpidr_ok as user_tls_ok;
 
 // ELF auxv hardware capabilities and platform string
 #[cfg(target_arch = "x86_64")]
-pub use x86_64::cpu::{ELF_PLATFORM, elf_hwcap};
+pub use x86_64::cpu::{
+    ELF_PLATFORM, arch_random_seed, elf_hwcap, elf_hwcap2, min_sigstksz, random_get_entropy,
+};
 
 #[cfg(target_arch = "aarch64")]
-pub use aarch64::cpu::{ELF_PLATFORM, elf_hwcap};
+pub use aarch64::cpu::{
+    ELF_PLATFORM, arch_random_seed, elf_hwcap, elf_hwcap2, min_sigstksz, random_get_entropy,
+};
 
 // Physical-to-virtual address conversion
 #[cfg(target_arch = "x86_64")]
@@ -219,6 +223,8 @@ pub trait UserRegs {
     /// Its syscall number, u64::MAX if none (Linux syscall_get_nr:
     /// orig_ax / syscallno; a tracer may change it at the entry stop)
     fn syscall_nr(&self) -> u64;
+    /// Its six arguments (Linux syscall_get_arguments)
+    fn syscall_args(&self) -> [u64; 6];
     /// No restart from here on (Linux forget_syscall; x86 keeps orig_ax,
     /// as Linux does: its restart leaves the syscall number in RAX, never
     /// an -ERESTART* code)

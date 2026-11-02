@@ -18,7 +18,12 @@ use crate::printkln;
 // I/O syscalls
 /// fcntl(fd, cmd, arg)
 pub const SYS_FCNTL: u64 = 25;
+pub const SYS_DUP: u64 = 23;
 pub const SYS_DUP3: u64 = 24;
+pub const SYS_GETCWD: u64 = 17;
+pub const SYS_EXECVEAT: u64 = 281;
+pub const SYS_GETTIMEOFDAY: u64 = 169;
+pub const SYS_SETTIMEOFDAY: u64 = 170;
 pub const SYS_PIPE2: u64 = 59;
 pub const SYS_PPOLL: u64 = 73;
 pub const SYS_PSELECT6: u64 = 72;
@@ -248,6 +253,8 @@ pub const SYS_SETRESUID: u64 = 147;
 /// getresuid(ruid*, euid*, suid*)
 pub const SYS_GETRESUID: u64 = 148;
 /// setresgid(rgid, egid, sgid)
+pub const SYS_GETGROUPS: u64 = 158;
+pub const SYS_SETGROUPS: u64 = 159;
 pub const SYS_SETRESGID: u64 = 149;
 /// getresgid(rgid*, egid*, sgid*)
 pub const SYS_GETRESGID: u64 = 150;
@@ -529,6 +536,7 @@ pub fn aarch64_syscall_dispatch(
         sys_chroot,
         sys_close,
         sys_close_range,
+        sys_dup,
         sys_dup3,
         sys_faccessat,
         sys_faccessat2,
@@ -593,7 +601,7 @@ pub fn aarch64_syscall_dispatch(
         sys_write,
         sys_writev,
     };
-    use crate::task::exec::sys_execve;
+    use crate::task::exec::{sys_execve, sys_execveat};
     use crate::task::percpu;
     use crate::task::syscall::{
         sys_clone, sys_exit, sys_getegid, sys_geteuid, sys_getgid, sys_getpgid, sys_getpid,
@@ -602,20 +610,9 @@ pub fn aarch64_syscall_dispatch(
     };
     use crate::time_syscall::{
         sys_adjtimex, sys_clock_getres, sys_clock_gettime, sys_clock_nanosleep, sys_clock_settime,
-        sys_eventfd2, sys_nanosleep, sys_timerfd_create, sys_timerfd_gettime, sys_timerfd_settime,
+        sys_eventfd2, sys_gettimeofday, sys_nanosleep, sys_settimeofday, sys_timerfd_create,
+        sys_timerfd_gettime, sys_timerfd_settime,
     };
-
-    // Account for entering kernel mode
-    percpu::account_syscall_enter();
-
-    // Check seccomp policy before executing syscall
-    // Note: ip is not available here, pass 0 for now
-    if let Some(result) =
-        crate::seccomp::check::check_syscall_aarch64(num, 0, arg0, arg1, arg2, arg3, arg4, arg5)
-    {
-        percpu::account_syscall_exit();
-        return result;
-    }
 
     match num {
         // I/O syscalls
@@ -636,7 +633,9 @@ pub fn aarch64_syscall_dispatch(
         SYS_CLOSE_RANGE => sys_close_range(arg0 as u32, arg1 as u32, arg2 as u32) as u64,
         SYS_LSEEK => sys_lseek(arg0 as i32, arg1 as i64, arg2 as i32) as u64,
         SYS_FTRUNCATE => sys_ftruncate(arg0 as i32, arg1 as i64) as u64,
+        SYS_DUP => sys_dup(arg0 as i32) as u64,
         SYS_DUP3 => sys_dup3(arg0 as i32, arg1 as i32, arg2 as u32) as u64,
+        SYS_GETCWD => crate::fs::nav::sys_getcwd(arg0, arg1) as u64,
         SYS_FCNTL => sys_fcntl(arg0 as i32, arg1 as i32, arg2) as u64,
         SYS_PIPE2 => sys_pipe2(arg0, arg1 as u32) as u64,
         SYS_PPOLL => sys_ppoll(arg0, arg1 as u32, arg2, arg3, arg4) as u64,
@@ -743,11 +742,13 @@ pub fn aarch64_syscall_dispatch(
         SYS_GETPID => sys_getpid(percpu::current_pid()) as u64,
         SYS_GETTID => sys_gettid(percpu::current_tid()) as u64,
         SYS_GETPPID => sys_getppid(percpu::current_ppid()) as u64,
-        SYS_GETPGID => sys_getpgid(arg0, percpu::current_pid(), percpu::current_pgid()) as u64,
-        SYS_GETSID => sys_getsid(arg0, percpu::current_pid(), percpu::current_sid()) as u64,
+        SYS_GETPGID => {
+            sys_getpgid(arg0 as i32, percpu::current_pid(), percpu::current_pgid()) as u64
+        }
+        SYS_GETSID => sys_getsid(arg0 as i32, percpu::current_pid(), percpu::current_sid()) as u64,
         SYS_SETPGID => sys_setpgid(
-            arg0,
-            arg1,
+            arg0 as i32,
+            arg1 as i32,
             percpu::current_pid(),
             percpu::current_pgid(),
             percpu::current_sid(),
@@ -780,6 +781,12 @@ pub fn aarch64_syscall_dispatch(
             use crate::arch::Uaccess;
             use crate::task::syscall::sys_getresuid;
             sys_getresuid::<Uaccess>(arg0, arg1, arg2, percpu::current_cred()) as u64
+        }
+        SYS_GETGROUPS => {
+            crate::task::syscall::sys_getgroups::<crate::arch::Uaccess>(arg0 as i32, arg1) as u64
+        }
+        SYS_SETGROUPS => {
+            crate::task::syscall::sys_setgroups::<crate::arch::Uaccess>(arg0 as i32, arg1) as u64
         }
         SYS_SETRESGID => {
             use crate::task::syscall::sys_setresgid;
@@ -824,6 +831,8 @@ pub fn aarch64_syscall_dispatch(
 
         // Time syscalls
         SYS_CLOCK_GETTIME => sys_clock_gettime(arg0 as i32, arg1) as u64,
+        SYS_GETTIMEOFDAY => sys_gettimeofday(arg0, arg1) as u64,
+        SYS_SETTIMEOFDAY => sys_settimeofday(arg0, arg1) as u64,
         SYS_CLOCK_GETRES => sys_clock_getres(arg0 as i32, arg1) as u64,
         SYS_CLOCK_SETTIME => sys_clock_settime(arg0 as i32, arg1) as u64,
         SYS_NANOSLEEP => sys_nanosleep(arg0, arg1) as u64,
@@ -918,7 +927,8 @@ pub fn aarch64_syscall_dispatch(
             sys_clone3(arg0, arg1) as u64
         }
         SYS_EXECVE => sys_execve(arg0, arg1, arg2) as u64,
-        SYS_WAIT4 => sys_wait4(arg0 as i64, arg1, arg2 as i32, arg3) as u64,
+        SYS_EXECVEAT => sys_execveat(arg0 as i32, arg1, arg2, arg3, arg4 as i32) as u64,
+        SYS_WAIT4 => sys_wait4(arg0 as i32 as i64, arg1, arg2 as i32, arg3) as u64,
 
         // Personality (execution domain)
         SYS_PERSONALITY => {
@@ -934,7 +944,9 @@ pub fn aarch64_syscall_dispatch(
         }
 
         // Process tracing/debugging
-        SYS_PTRACE => crate::task::ptrace::sys_ptrace(arg0 as i64, arg1 as i64, arg2, arg3) as u64,
+        SYS_PTRACE => {
+            crate::task::ptrace::sys_ptrace(arg0 as i64, arg1 as i32 as i64, arg2, arg3) as u64
+        }
 
         // TTY control
         SYS_VHANGUP => crate::tty::sys_vhangup() as u64,
@@ -942,7 +954,7 @@ pub fn aarch64_syscall_dispatch(
         // pidfd syscalls
         SYS_PIDFD_OPEN => {
             use crate::task::syscall::sys_pidfd_open;
-            sys_pidfd_open(arg0 as i64, arg1 as u32) as u64
+            sys_pidfd_open(arg0 as i32 as i64, arg1 as u32) as u64
         }
         SYS_PIDFD_SEND_SIGNAL => {
             use crate::task::syscall::sys_pidfd_send_signal;
@@ -977,19 +989,21 @@ pub fn aarch64_syscall_dispatch(
             crate::signal::syscall::sys_rt_sigtimedwait(arg0, arg1, arg2, arg3) as u64
         }
         SYS_SIGALTSTACK => crate::signal::syscall::sys_sigaltstack(arg0, arg1) as u64,
-        SYS_KILL => crate::signal::syscall::sys_kill(arg0 as i64, arg1 as u32) as u64,
+        SYS_KILL => crate::signal::syscall::sys_kill(arg0 as i32 as i64, arg1 as u32) as u64,
         SYS_TGKILL => {
-            crate::signal::syscall::sys_tgkill(arg0 as i64, arg1 as i64, arg2 as u32) as u64
+            crate::signal::syscall::sys_tgkill(arg0 as i32 as i64, arg1 as i32 as i64, arg2 as u32)
+                as u64
         }
-        SYS_TKILL => crate::signal::syscall::sys_tkill(arg0 as i64, arg1 as u32) as u64,
+        SYS_TKILL => crate::signal::syscall::sys_tkill(arg0 as i32 as i64, arg1 as u32) as u64,
         SYS_RT_SIGQUEUEINFO => {
-            crate::signal::syscall::sys_rt_sigqueueinfo(arg0 as i64, arg1 as u32, arg2) as u64
+            crate::signal::syscall::sys_rt_sigqueueinfo(arg0 as i32 as i64, arg1 as u32, arg2)
+                as u64
         }
         SYS_RT_SIGSUSPEND => crate::signal::syscall::sys_rt_sigsuspend(arg0, arg1) as u64,
         SYS_RT_SIGRETURN => super::signal::sys_rt_sigreturn() as u64,
         SYS_RT_TGSIGQUEUEINFO => crate::signal::syscall::sys_rt_tgsigqueueinfo(
-            arg0 as i64,
-            arg1 as i64,
+            arg0 as i32 as i64,
+            arg1 as i32 as i64,
             arg2 as u32,
             arg3,
         ) as u64,
@@ -1015,27 +1029,25 @@ pub fn aarch64_syscall_dispatch(
             crate::mm::mempolicy::sys_mbind(arg0, arg1, arg2, arg3, arg4, arg5 as u32) as u64
         }
         SYS_MIGRATE_PAGES => {
-            crate::mm::mempolicy::sys_migrate_pages(arg0 as i64, arg1, arg2, arg3) as u64
+            crate::mm::mempolicy::sys_migrate_pages(arg0 as i32 as i64, arg1, arg2, arg3) as u64
         }
-        SYS_MOVE_PAGES => {
-            crate::mm::mempolicy::sys_move_pages(arg0 as i64, arg1, arg2, arg3, arg4, arg5 as i32)
-                as u64
-        }
+        SYS_MOVE_PAGES => crate::mm::mempolicy::sys_move_pages(
+            arg0 as i32 as i64,
+            arg1,
+            arg2,
+            arg3,
+            arg4,
+            arg5 as i32,
+        ) as u64,
 
         // Scheduling priority
         SYS_GETPRIORITY => {
             use crate::task::syscall::sys_getpriority;
-            sys_getpriority(arg0 as i32, arg1, percpu::current_pid()) as u64
+            sys_getpriority(arg0 as i32, arg1 as i32) as u64
         }
         SYS_SETPRIORITY => {
             use crate::task::syscall::sys_setpriority;
-            sys_setpriority(
-                arg0 as i32,
-                arg1,
-                arg2 as i32,
-                percpu::current_pid(),
-                percpu::current_cred().euid,
-            ) as u64
+            sys_setpriority(arg0 as i32, arg1 as i32, arg2 as i32) as u64
         }
 
         // I/O priority
@@ -1068,54 +1080,37 @@ pub fn aarch64_syscall_dispatch(
         }
         SYS_SCHED_GETSCHEDULER => {
             use crate::task::syscall::sys_sched_getscheduler;
-            sys_sched_getscheduler(arg0 as i64, percpu::current_pid()) as u64
+            sys_sched_getscheduler(arg0 as i32 as i64) as u64
         }
         SYS_SCHED_SETSCHEDULER => {
             use crate::arch::Uaccess;
             use crate::task::syscall::sys_sched_setscheduler;
-            sys_sched_setscheduler::<Uaccess>(
-                arg0 as i64,
-                arg1 as i32,
-                arg2,
-                percpu::current_pid(),
-                percpu::current_cred().euid,
-            ) as u64
+            sys_sched_setscheduler::<Uaccess>(arg0 as i32 as i64, arg1 as i32, arg2) as u64
         }
         SYS_SCHED_GETPARAM => {
             use crate::arch::Uaccess;
             use crate::task::syscall::sys_sched_getparam;
-            sys_sched_getparam::<Uaccess>(arg0 as i64, arg1, percpu::current_pid()) as u64
+            sys_sched_getparam::<Uaccess>(arg0 as i32 as i64, arg1) as u64
         }
         SYS_SCHED_SETPARAM => {
             use crate::arch::Uaccess;
             use crate::task::syscall::sys_sched_setparam;
-            sys_sched_setparam::<Uaccess>(
-                arg0 as i64,
-                arg1,
-                percpu::current_pid(),
-                percpu::current_cred().euid,
-            ) as u64
+            sys_sched_setparam::<Uaccess>(arg0 as i32 as i64, arg1) as u64
         }
         SYS_SCHED_GETAFFINITY => {
             use crate::arch::Uaccess;
             use crate::task::syscall::sys_sched_getaffinity;
-            sys_sched_getaffinity::<Uaccess>(arg0 as i64, arg1, arg2, percpu::current_pid()) as u64
+            sys_sched_getaffinity::<Uaccess>(arg0 as i32 as i64, arg1, arg2) as u64
         }
         SYS_SCHED_SETAFFINITY => {
             use crate::arch::Uaccess;
             use crate::task::syscall::sys_sched_setaffinity;
-            sys_sched_setaffinity::<Uaccess>(
-                arg0 as i64,
-                arg1,
-                arg2,
-                percpu::current_pid(),
-                percpu::current_cred().euid,
-            ) as u64
+            sys_sched_setaffinity::<Uaccess>(arg0 as i32 as i64, arg1, arg2) as u64
         }
         SYS_SCHED_RR_GET_INTERVAL => {
             use crate::arch::Uaccess;
             use crate::task::syscall::sys_sched_rr_get_interval;
-            sys_sched_rr_get_interval::<Uaccess>(arg0 as i64, arg1, percpu::current_pid()) as u64
+            sys_sched_rr_get_interval::<Uaccess>(arg0 as i32 as i64, arg1) as u64
         }
 
         // Memory management syscalls
@@ -1281,7 +1276,7 @@ pub fn aarch64_syscall_dispatch(
         ) as u64,
 
         // Process inspection (Section 13)
-        SYS_KCMP => crate::kcmp::sys_kcmp(arg0, arg1, arg2 as i32, arg3, arg4) as u64,
+        SYS_KCMP => crate::kcmp::sys_kcmp(arg0 as i32, arg1 as i32, arg2 as i32, arg3, arg4) as u64,
 
         // Syscall stubs (not fully implemented)
         SYS_RSEQ => {

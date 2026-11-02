@@ -24,6 +24,7 @@ pub fn run_tests() {
     test_fatal_signal();
     test_leader_delay();
     test_kill_zombie_leader();
+    test_kill_dead_group();
     test_exec_leader();
     test_exec_thread();
 }
@@ -235,6 +236,34 @@ fn test_kill_zombie_leader() {
         st == Some(SIGKILL as i32) && gone,
         st.unwrap_or(-1) as i64 * if gone { 1 } else { -1 },
     );
+}
+
+/// Sleep, then end this thread alone with status 5
+extern "C" fn thread_exit5(_: u64) -> ! {
+    sleep_ms(20);
+    sys_exit(5)
+}
+
+/// A process whose threads all exit one by one (exit, not exit_group)
+/// reports the last thread's status (Linux 6.x do_exit: the last of
+/// the group's threads sets the group exit code); a SIGKILL to it
+/// before the reap changes nothing
+fn test_kill_dead_group() {
+    let mut got = [0i64; 2];
+    for (i, kill) in [false, true].into_iter().enumerate() {
+        let pid = sys_fork();
+        if pid == 0 {
+            start(0, thread_exit5, 0);
+            sys_exit(3);
+        }
+        sleep_ms(200);
+        let k = if kill { sys_kill(pid, SIGKILL) } else { 0 };
+        let mut st = 0i32;
+        let w = sys_wait4(pid, &mut st, 0, 0);
+        got[i] = if k != 0 || w != pid { -1 } else { st as i64 };
+    }
+    report(b"GROUP_LAST_THREAD_STATUS", got[0] == 5 << 8, got[0]);
+    report(b"GROUP_KILL_DEAD_STATUS", got[1] == 5 << 8, got[1]);
 }
 
 /// exec `busybox sh -c "exit <code>"`

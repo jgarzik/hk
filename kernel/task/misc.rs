@@ -247,19 +247,21 @@ fn ns_to_clock_t(ns: u64) -> i64 {
     (ns / 10_000_000) as i64
 }
 
-/// times(2) (Linux kernel/sys.c sys_times): the process's user and
-/// system time into `buf` (if not NULL; children's times are not
-/// tracked: 0), and the clock ticks since boot (Linux jiffies in
+/// times(2) (Linux kernel/sys.c sys_times): the process's and its
+/// reaped children's user and system time into `buf` (if not NULL),
+/// and the clock ticks since boot (Linux jiffies in
 /// USER_HZ units; hk's scheduler tick is 10 ms, one USER_HZ tick, and
 /// counts from 0 where Linux starts 5 minutes before the wrap)
 pub fn sys_times<A: crate::uaccess::UaccessArch>(buf: u64) -> i64 {
     use crate::task::percpu;
     if buf != 0 {
         let (utime, stime) = percpu::get_process_times(percpu::current_pid());
+        let (cutime, cstime) = percpu::children_times();
         let t = Tms {
             tms_utime: ns_to_clock_t(utime),
             tms_stime: ns_to_clock_t(stime),
-            ..Tms::default()
+            tms_cutime: ns_to_clock_t(cutime),
+            tms_cstime: ns_to_clock_t(cstime),
         };
         if crate::uaccess::put_user::<A, Tms>(buf, t).is_err() {
             return KernelError::BadAddress.sysret();
@@ -325,9 +327,13 @@ pub fn sys_getrusage<A: crate::uaccess::UaccessArch>(who: i32, usage_ptr: u64) -
             }
         }
         RUSAGE_CHILDREN => {
-            // RUSAGE_CHILDREN: return stats of terminated and waited-for children
-            // We don't track child resource usage yet, so return zeros
-            Rusage::default()
+            // Reaped children and theirs (Linux signal->cutime/cstime)
+            let (utime_ns, stime_ns) = percpu::children_times();
+            Rusage {
+                ru_utime: timeval_from_ns(utime_ns),
+                ru_stime: timeval_from_ns(stime_ns),
+                ..Rusage::default()
+            }
         }
         _ => return KernelError::InvalidArgument.sysret(),
     };
@@ -359,39 +365,24 @@ pub fn sys_getrandom<A: crate::uaccess::UaccessArch>(buf: u64, buflen: usize, fl
     use crate::random;
     use crate::uaccess::copy_to_user;
 
-    // Limit buffer size per call to prevent stack overflow
-    const MAX_GETRANDOM: usize = 256;
-
-    if buflen == 0 {
+    // Flags first (EINVAL even for an empty buffer, as on Linux)
+    if let Err(e) = random::get_random_bytes(&mut [], flags) {
+        return e as i64;
+    }
+    // Linux getrandom: at most MAX_RW_COUNT per call; a fault before
+    // any byte is EFAULT, after some returns the count
+    let len = buflen.min(crate::fs::syscall::MAX_RW_COUNT);
+    if len == 0 {
         return 0;
     }
-
-    // Validate flags first
-    const VALID_FLAGS: u32 = random::GRND_NONBLOCK | random::GRND_RANDOM | random::GRND_INSECURE;
-    if flags & !VALID_FLAGS != 0 {
-        return KernelError::InvalidArgument.sysret();
-    }
-
-    // Limit single read to stack buffer size
-    let len = buflen.min(MAX_GETRANDOM);
-
-    // Validate user buffer
     if !A::access_ok(buf, len) {
         return KernelError::BadAddress.sysret();
     }
-
-    // Generate random bytes
-    let mut tmp = [0u8; MAX_GETRANDOM];
-    match random::get_random_bytes(&mut tmp[..len], flags) {
-        Ok(n) => {
-            // Copy to user space
-            if copy_to_user::<A>(buf, &tmp[..n]).is_err() {
-                return KernelError::BadAddress.sysret();
-            }
-            n as i64
-        }
-        Err(e) => e as i64,
+    let n = random::stream(len, |off, b| copy_to_user::<A>(buf + off as u64, b).is_ok());
+    if n == 0 {
+        return KernelError::BadAddress.sysret();
     }
+    n as i64
 }
 
 // =============================================================================
@@ -913,20 +904,10 @@ pub fn sys_syslog<A: crate::uaccess::UaccessArch>(type_: i32, buf: u64, len: i32
         return KernelError::InvalidArgument.sysret();
     }
 
-    // Check permissions for privileged operations
-    // SYSLOG_ACTION_READ_ALL, READ_CLEAR, CLEAR, CONSOLE_* require CAP_SYSLOG
-    let needs_cap = matches!(
-        type_,
-        SYSLOG_ACTION_READ
-            | SYSLOG_ACTION_READ_ALL
-            | SYSLOG_ACTION_READ_CLEAR
-            | SYSLOG_ACTION_CLEAR
-            | SYSLOG_ACTION_CONSOLE_OFF
-            | SYSLOG_ACTION_CONSOLE_ON
-            | SYSLOG_ACTION_CONSOLE_LEVEL
-    );
-
-    if needs_cap && !super::capable(super::CAP_SYSLOG) && !super::capable(super::CAP_SYS_ADMIN) {
+    // Linux check_syslog_permissions with dmesg_restrict = 1
+    // (syslog_action_restricted is then true for every action): all of
+    // them need CAP_SYSLOG
+    if !crate::kmsg::syslog_read_allowed() {
         return KernelError::NotPermitted.sysret();
     }
 
@@ -945,13 +926,21 @@ pub fn sys_syslog<A: crate::uaccess::UaccessArch>(type_: i32, buf: u64, len: i32
                 return KernelError::BadAddress.sysret();
             }
 
-            // For now, we don't have a kernel log buffer implementation
-            // Just return 0 bytes read (empty buffer)
-            0
+            let data = match type_ {
+                SYSLOG_ACTION_READ => match crate::kmsg::syslog_read(len as usize) {
+                    Ok(d) => d,
+                    Err(e) => return e.sysret(),
+                },
+                _ => crate::kmsg::syslog_read_all(len as usize, type_ == SYSLOG_ACTION_READ_CLEAR),
+            };
+            if crate::uaccess::copy_to_user::<A>(buf, &data).is_err() {
+                return KernelError::BadAddress.sysret();
+            }
+            data.len() as i64
         }
 
         SYSLOG_ACTION_CLEAR => {
-            // Clear the ring buffer - no-op for now
+            crate::kmsg::syslog_clear();
             0
         }
 
@@ -975,17 +964,9 @@ pub fn sys_syslog<A: crate::uaccess::UaccessArch>(type_: i32, buf: u64, len: i32
             0
         }
 
-        SYSLOG_ACTION_SIZE_UNREAD => {
-            // Return number of unread bytes
-            // We don't track this, so return 0
-            0
-        }
+        SYSLOG_ACTION_SIZE_UNREAD => crate::kmsg::syslog_size_unread() as i64,
 
-        SYSLOG_ACTION_SIZE_BUFFER => {
-            // Return size of log buffer
-            // We don't have one, so return a reasonable default
-            0
-        }
+        SYSLOG_ACTION_SIZE_BUFFER => crate::kmsg::syslog_size_buffer() as i64,
 
         _ => KernelError::InvalidArgument.sysret(),
     }
@@ -1367,8 +1348,10 @@ pub fn sys_pidfd_getfd(pidfd: i32, targetfd: i32, flags: u32) -> i64 {
         None => return KernelError::NoProcess.sysret(),
     };
 
-    // Permission check: CAP_SYS_PTRACE or same euid
-    if !check_pidfd_getfd_permission(target_tid) {
+    // Linux __pidfd_fget: under the target's exec_update_lock,
+    // ptrace_may_access(PTRACE_MODE_ATTACH_REALCREDS)
+    let _exec = crate::signal::ExecUpdateRead::lock(target_tid);
+    if !super::ptrace::may_access_tid(target_tid, false) {
         return KernelError::NotPermitted.sysret();
     }
 
@@ -1404,33 +1387,6 @@ pub fn sys_pidfd_getfd(pidfd: i32, targetfd: i32, flags: u32) -> i64 {
 fn find_task_by_pid(pid: super::Pid) -> Option<super::Tid> {
     let table = super::percpu::TASKLIST.read();
     table.get(pid).map(|t| t.task.tid())
-}
-
-/// Check permission for pidfd_getfd
-///
-/// Simplified PTRACE_MODE_ATTACH check:
-/// - Allow if caller has CAP_SYS_PTRACE
-/// - Allow if same effective UID
-fn check_pidfd_getfd_permission(target_tid: super::Tid) -> bool {
-    // CAP_SYS_PTRACE bypasses all checks
-    if super::capable(super::CAP_SYS_PTRACE) {
-        return true;
-    }
-
-    // Get caller credentials
-    let caller_cred = super::percpu::current_cred();
-
-    // Get target credentials from task table
-    let target_euid = {
-        let table = super::percpu::TASKLIST.read();
-        table.get(target_tid).map(|t| t.cred().euid)
-    };
-
-    // Same effective UID check
-    match target_euid {
-        Some(euid) => caller_cred.euid == euid,
-        None => false, // Target doesn't exist
-    }
 }
 
 // =============================================================================

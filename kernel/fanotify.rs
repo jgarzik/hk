@@ -782,15 +782,8 @@ pub fn sys_fanotify_mark(fd: i32, mark_flags: u32, mask: u64, dirfd: i32, pathna
         // Lookup path
         let dentry = match lookup_path_at(start, &pathname_str, lookup_flags) {
             Ok(d) => d,
-            Err(e) => {
-                return match e {
-                    KernelError::NotFound => -2,          // ENOENT
-                    KernelError::NotDirectory => -20,     // ENOTDIR
-                    KernelError::PermissionDenied => -13, // EACCES
-                    KernelError::TooManySymlinks => -40,  // ELOOP
-                    _ => -22,                             // EINVAL
-                };
-            }
+            // Any lookup error as is (Linux fanotify_find_path)
+            Err(e) => return e.sysret(),
         };
 
         // Check ONLYDIR

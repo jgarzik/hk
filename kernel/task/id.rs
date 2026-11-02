@@ -584,3 +584,55 @@ pub fn sys_setfsgid(gid: u32, current_cred: super::Cred) -> i64 {
 
     old_fsgid as i64
 }
+
+/// getgroups(size, list) (Linux kernel/groups.c): the supplementary
+/// groups; size 0 asks for the count only, a smaller nonzero size is
+/// EINVAL
+pub fn sys_getgroups<A: crate::uaccess::UaccessArch>(size: i32, list: u64) -> i64 {
+    if size < 0 {
+        return KernelError::InvalidArgument.sysret();
+    }
+    let cred = super::current_cred();
+    let groups = cred.groups.as_slice();
+    if size == 0 {
+        return groups.len() as i64;
+    }
+    if (size as usize) < groups.len() {
+        return KernelError::InvalidArgument.sysret();
+    }
+    let bytes: alloc::vec::Vec<u8> = groups.iter().flat_map(|g| g.to_ne_bytes()).collect();
+    if crate::uaccess::copy_to_user::<A>(list, &bytes).is_err() {
+        return KernelError::BadAddress.sysret();
+    }
+    groups.len() as i64
+}
+
+/// setgroups(size, list) (Linux kernel/groups.c): replace the
+/// supplementary groups; CAP_SETGID (EPERM), at most NGROUPS_MAX and no
+/// invalid gid -1 (EINVAL)
+pub fn sys_setgroups<A: crate::uaccess::UaccessArch>(size: i32, list: u64) -> i64 {
+    if !super::capable(super::CAP_SETGID) {
+        return KernelError::NotPermitted.sysret();
+    }
+    if size < 0 || size as usize > super::NGROUPS_MAX {
+        return KernelError::InvalidArgument.sysret();
+    }
+    let n = size as usize;
+    let mut bytes = alloc::vec![0u8; n * 4];
+    if n > 0 && crate::uaccess::copy_from_user::<A>(&mut bytes, list, n * 4).is_err() {
+        return KernelError::BadAddress.sysret();
+    }
+    let gids: alloc::vec::Vec<u32> = bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| u32::from_ne_bytes(*b))
+        .collect();
+    if gids.contains(&u32::MAX) {
+        return KernelError::InvalidArgument.sysret();
+    }
+    let mut new = super::prepare_creds();
+    new.groups = super::GroupInfo::new(gids);
+    super::commit_creds(alloc::sync::Arc::new(new));
+    0
+}

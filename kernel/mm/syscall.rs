@@ -48,21 +48,16 @@ pub const MCL_ONFAULT: i32 = 4;
 ///
 /// # Returns
 /// Address of mapping on success, negative errno on failure
-/// File checks of do_mmap (Linux): the file must be readable, a shared
-/// writable mapping needs it open for writing and not append-only, and
-/// PROT_EXEC is refused on a noexec mount (`noexec`: EPERM for mmap,
-/// EACCES for mprotect, where Linux clears VM_MAYEXEC)
-fn file_prot_ok(f: &File, prot: u32, shared: bool, noexec: KernelError) -> Result<(), KernelError> {
+/// File checks of do_mmap (Linux): the file must be readable, and a
+/// shared writable mapping needs it open for writing and not
+/// append-only (EACCES)
+fn file_prot_ok(f: &File, prot: u32, shared: bool) -> Result<(), KernelError> {
     use crate::fs::flags::O_APPEND;
-    use crate::fs::mount::{MNT_NOEXEC, mnt_flags_of};
     if !f.is_readable() {
         return Err(KernelError::PermissionDenied);
     }
     if shared && prot & PROT_WRITE != 0 && (!f.is_writable() || f.get_flags() & O_APPEND != 0) {
         return Err(KernelError::PermissionDenied);
-    }
-    if prot & super::PROT_EXEC != 0 && mnt_flags_of(&f.dentry) & MNT_NOEXEC != 0 {
-        return Err(noexec);
     }
     Ok(())
 }
@@ -127,10 +122,15 @@ pub fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: 
         None
     };
     if let Some(f) = &file
-        && let Err(e) =
-            file_prot_ok(f, prot, is_shared, KernelError::NotPermitted).and_then(|_| f.f_op.mmap(f))
+        && let Err(e) = file_prot_ok(f, prot, is_shared).and_then(|_| f.f_op.mmap(f))
     {
         return e.sysret();
+    }
+    // PROT_EXEC of a file on a noexec mount (its own mount: Linux
+    // path_noexec): EPERM; without it the mapping never gets it later
+    let noexec = file.as_ref().is_some_and(|f| f.noexec());
+    if noexec && prot & super::PROT_EXEC != 0 {
+        return KernelError::NotPermitted.sysret();
     }
 
     // Every user task has an address space; kernel threads have none
@@ -221,6 +221,9 @@ pub fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: 
     if is_shared {
         vma.flags |= VM_SHARED;
     }
+    if noexec {
+        vma.flags |= super::vma::VM_NOMAYEXEC;
+    }
 
     // Set VM_GROWSDOWN for stack-like mappings that grow downward
     // Linux: calc_vm_flag_bits() translates MAP_GROWSDOWN to VM_GROWSDOWN
@@ -307,7 +310,7 @@ pub fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: 
     drop(replaced);
 
     if should_populate {
-        let _ = populate_range(map_addr, length);
+        let _ = populate_range(map_addr, length, true);
     }
 
     // Note: Pages are allocated on demand in the page fault handler
@@ -516,15 +519,16 @@ fn can_do_mlock() -> bool {
 /// are jumped over, inaccessible VMAs skipped, so the work is bounded by
 /// the pages mapped, not the length. A write fault for a private
 /// writable mapping (copy-on-write is broken now), a read fault
-/// otherwise. False if memory ran out (mlock reports it; MAP_POPULATE
-/// and mlockall ignore it, like Linux mm_populate). The mm lock is not
-/// held between faults (the kernel is preemptible: no cond_resched
-/// needed); a VMA changed meanwhile is looked up again.
-///
-/// Used by MAP_POPULATE, MAP_LOCKED and mlock/mlockall.
-fn populate_range(start: u64, len: u64) -> bool {
+/// otherwise. A VMA stops at its first page that cannot be faulted in:
+/// OutOfMemory, or BadAddress for SIGSEGV/SIGBUS (past a file's end).
+/// With `ignore_errors` (MAP_POPULATE, mlockall: Linux mm_populate)
+/// the next VMA goes on, else that error is returned (mlock). A pending
+/// SIGKILL ends it with Interrupted (Linux __get_user_pages -EINTR).
+/// The mm lock is not held between faults (the kernel is preemptible:
+/// no cond_resched needed); a VMA changed meanwhile is looked up again.
+fn populate_range(start: u64, len: u64, ignore_errors: bool) -> Result<(), KernelError> {
     let Some(mm) = get_task_mm(current_tid()) else {
-        return true;
+        return Ok(());
     };
     let end = start.saturating_add(len).min(TASK_SIZE);
     let mut addr = start & !(PAGE_SIZE - 1);
@@ -535,13 +539,14 @@ fn populate_range(start: u64, len: u64) -> bool {
         let from = addr.max(vs);
         let to = ve.min(end);
         if let Some(a) = access
-            && !populate_pages(&mm, from, to, a)
+            && let Err(e) = populate_pages(&mm, from, to, a)
+            && (!ignore_errors || e == KernelError::Interrupted)
         {
-            return false;
+            return Err(e);
         }
         addr = to;
     }
-    true
+    Ok(())
 }
 
 /// The next VMA meeting [addr, end): its bounds and the fault that
@@ -566,12 +571,26 @@ fn populate_vma(
     Some((v.start, v.end, access))
 }
 
-/// Fault in [from, to) of one VMA: false if memory ran out
-fn populate_pages(mm: &super::Mm, from: u64, to: u64, access: super::fault::Access) -> bool {
+/// Fault in [from, to) of one VMA, stopping at the first page that
+/// fails or at a pending SIGKILL
+fn populate_pages(
+    mm: &super::Mm,
+    from: u64,
+    to: u64,
+    access: super::fault::Access,
+) -> Result<(), KernelError> {
     use super::fault::{VmFault, handle_mm_fault};
-    (from..to)
-        .step_by(PAGE_SIZE as usize)
-        .all(|a| handle_mm_fault(mm, a, access) != Err(VmFault::Oom))
+    for a in (from..to).step_by(PAGE_SIZE as usize) {
+        if crate::signal::fatal_signal_pending() {
+            return Err(KernelError::Interrupted);
+        }
+        match handle_mm_fault(mm, a, access) {
+            Ok(_) => {}
+            Err(VmFault::Oom) => return Err(KernelError::OutOfMemory),
+            Err(_) => return Err(KernelError::BadAddress),
+        }
+    }
+    Ok(())
 }
 
 /// mlock syscall - Lock pages in memory
@@ -643,10 +662,17 @@ fn do_mlock(start: u64, len: u64, vm_flags: u32) -> i64 {
     if let Err(e) = r {
         return e.sysret();
     }
-    // Out of memory faulting the pages in is EAGAIN (Linux
-    // __mlock_posix_error_return)
-    if vm_flags & VM_LOCKONFAULT == 0 && !populate_range(start, len) {
-        return KernelError::WouldBlock.sysret();
+    // Linux __mlock_posix_error_return: out of memory faulting the
+    // pages in is EAGAIN, an unfaultable page ENOMEM, SIGKILL EINTR
+    if vm_flags & VM_LOCKONFAULT == 0
+        && let Err(e) = populate_range(start, len, false)
+    {
+        return match e {
+            KernelError::OutOfMemory => KernelError::WouldBlock,
+            KernelError::BadAddress => KernelError::OutOfMemory,
+            e => e,
+        }
+        .sysret();
     }
     0
 }
@@ -864,7 +890,7 @@ pub fn sys_mlockall(flags: i32) -> i64 {
 
         // Populate pages if not ONFAULT
         for (start, len) in ranges_to_populate {
-            let _ = populate_range(start, len);
+            let _ = populate_range(start, len, true);
         }
     }
 
@@ -1015,15 +1041,14 @@ fn mapped_end(mm: &super::MmStruct, start: u64, end: u64) -> u64 {
 }
 
 /// The VMA may take protection `prot` (Linux: VM_MAYWRITE / VM_MAYEXEC
-/// of its file; no write to a SHM_RDONLY attachment): EACCES otherwise
+/// of its file, decided at mmap; no write to a SHM_RDONLY attachment):
+/// EACCES otherwise
 fn prot_allowed(vma: &Vma, prot: u32) -> Result<(), KernelError> {
     if let Some(f) = &vma.file {
-        file_prot_ok(
-            f,
-            prot & !vma.prot,
-            vma.is_shared(),
-            KernelError::PermissionDenied,
-        )?;
+        file_prot_ok(f, prot & !vma.prot, vma.is_shared())?;
+    }
+    if prot & super::PROT_EXEC != 0 && vma.flags & super::vma::VM_NOMAYEXEC != 0 {
+        return Err(KernelError::PermissionDenied);
     }
     if prot & PROT_WRITE != 0 && vma.shm.as_ref().is_some_and(|a| a.rdonly()) {
         return Err(KernelError::PermissionDenied);

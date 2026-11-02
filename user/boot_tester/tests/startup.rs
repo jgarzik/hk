@@ -16,6 +16,7 @@ const SIG_UNBLOCK: i32 = 1;
 
 pub fn run_tests() {
     test_exec_mode(b"EXEC_AUXV", b"auxv\0");
+    test_exec_mode(b"EXEC_STACK_LAZY", b"stack\0");
     test_exec_mode(b"PROC_SELF_EXE", b"exe\0");
     test_fork_tls();
     test_tls_switch();

@@ -2,6 +2,7 @@
 
 pub mod exec;
 pub mod fair;
+pub mod fdbits;
 pub mod fdtable;
 pub mod id;
 pub mod kthread;
@@ -135,7 +136,7 @@ pub type Gid = u32;
 /// as Linux does, plus the five capability sets.
 ///
 /// Mirrors Linux's `struct cred` from include/linux/cred.h
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cred {
     /// Real user ID
     pub uid: Uid,
@@ -165,6 +166,39 @@ pub struct Cred {
     pub cap_bset: KernelCap,
     /// Ambient capability set (automatically inherited by children)
     pub cap_ambient: KernelCap,
+    /// Supplementary groups, sorted (Linux group_info)
+    pub groups: GroupInfo,
+}
+
+/// Supplementary group list (Linux struct group_info): sorted and
+/// shared, replaced whole by setgroups; empty without an allocation
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GroupInfo(Option<Arc<[Gid]>>);
+
+/// Linux NGROUPS_MAX
+pub const NGROUPS_MAX: usize = 65536;
+
+impl GroupInfo {
+    pub const EMPTY: Self = Self(None);
+
+    /// A list from any order (Linux groups_sort; duplicates kept, as
+    /// Linux does)
+    pub fn new(mut gids: alloc::vec::Vec<Gid>) -> Self {
+        if gids.is_empty() {
+            return Self::EMPTY;
+        }
+        gids.sort_unstable();
+        Self(Some(gids.into()))
+    }
+
+    pub fn as_slice(&self) -> &[Gid] {
+        self.0.as_deref().unwrap_or(&[])
+    }
+
+    /// Linux groups_search
+    pub fn contains(&self, gid: Gid) -> bool {
+        self.as_slice().binary_search(&gid).is_ok()
+    }
 }
 
 impl Cred {
@@ -183,6 +217,7 @@ impl Cred {
         cap_effective: CAP_FULL_SET,
         cap_bset: CAP_FULL_SET,
         cap_ambient: CAP_EMPTY_SET, // Ambient starts empty even for root
+        groups: GroupInfo::EMPTY,
     };
 
     /// No privileges at all (overflow uid/gid 65534, no capabilities,
@@ -202,6 +237,7 @@ impl Cred {
         cap_effective: CAP_EMPTY_SET,
         cap_bset: CAP_EMPTY_SET,
         cap_ambient: CAP_EMPTY_SET,
+        groups: GroupInfo::EMPTY,
     };
 
     /// Create credentials for a specific user/group
@@ -231,6 +267,7 @@ impl Cred {
             cap_effective: caps,
             cap_bset: bset,
             cap_ambient: CAP_EMPTY_SET,
+            groups: GroupInfo::EMPTY,
         }
     }
 
@@ -322,7 +359,7 @@ pub fn copy_creds(clone_flags: u64, parent_cred: &Arc<Cred>) -> Arc<Cred> {
         parent_cred.clone()
     } else {
         // Fork: deep copy credentials (child gets independent copy)
-        Arc::new(**parent_cred)
+        Arc::new((**parent_cred).clone())
     }
 }
 
@@ -551,10 +588,17 @@ pub const FD_CLOEXEC: u32 = 1;
 pub struct FdTable<F> {
     /// Mapping from fd number to file object
     files: BTreeMap<Fd, Arc<F>>,
+    /// Which descriptors are open, for the lowest-free search; agrees
+    /// with the keys of `files`
+    bits: fdbits::OpenFds,
     /// Per-fd flags (FD_CLOEXEC, etc.)
     fd_flags: BTreeMap<Fd, u32>,
     /// Detached files, released once the lock is dropped
     dead: Vec<Arc<F>>,
+    /// The ones of them a descriptor was closed for (close, dup2 over
+    /// it, close_range), not files refused an install: their closer's
+    /// POSIX locks go (`fdtable::FilesGuard`)
+    closed: Vec<Arc<F>>,
 }
 
 impl<F> FdTable<F> {
@@ -567,9 +611,25 @@ impl<F> FdTable<F> {
     pub const fn new_const() -> Self {
         Self {
             files: BTreeMap::new(),
+            bits: fdbits::OpenFds::new(),
             fd_flags: BTreeMap::new(),
             dead: Vec::new(),
+            closed: Vec::new(),
         }
+    }
+
+    /// Install `file` at `fd`, free in both `files` and `bits`; false
+    /// (file parked) if the bitmap cannot grow
+    fn install(&mut self, fd: Fd, file: Arc<F>, flags: u32) -> bool {
+        if !self.bits.set(fd as usize) {
+            self.defer(file);
+            return false;
+        }
+        self.files.insert(fd, file);
+        if flags != 0 {
+            self.fd_flags.insert(fd, flags);
+        }
+        true
     }
 
     /// Park `file` for release after the table lock is dropped
@@ -581,6 +641,12 @@ impl<F> FdTable<F> {
     /// them after unlocking)
     pub fn take_dead(&mut self) -> Vec<Arc<F>> {
         core::mem::take(&mut self.dead)
+    }
+
+    /// The files whose descriptors were closed since the lock was taken
+    /// (also released after unlocking)
+    pub fn take_closed(&mut self) -> Vec<Arc<F>> {
+        core::mem::take(&mut self.closed)
     }
 
     /// Allocate the lowest free file descriptor for a file (POSIX).
@@ -598,12 +664,17 @@ impl<F> FdTable<F> {
     /// This does NOT enforce RLIMIT_NOFILE as it's used for initial fd setup
     /// (stdin=0, stdout=1, stderr=2) where limits don't apply.
     pub fn alloc_at(&mut self, fd: Fd, file: Arc<F>) -> bool {
-        if self.files.contains_key(&fd) {
+        if fd < 0 || self.files.contains_key(&fd) {
             self.defer(file);
             return false;
         }
-        self.files.insert(fd, file);
-        true
+        self.install(fd, file, 0)
+    }
+
+    /// Make room for `fd` before installing it there (Linux
+    /// expand_files): Err(EMFILE) at or past fs.nr_open, Err(ENOMEM)
+    pub fn expand(&mut self, fd: Fd) -> Result<(), i32> {
+        self.bits.reserve(fd as usize)
     }
 
     /// Get a file by descriptor
@@ -617,7 +688,8 @@ impl<F> FdTable<F> {
         self.fd_flags.remove(&fd);
         match self.files.remove(&fd) {
             Some(f) => {
-                self.defer(f);
+                self.bits.clear(fd as usize);
+                self.closed.push(f);
                 true
             }
             None => false,
@@ -663,20 +735,20 @@ impl<F> FdTable<F> {
             self.defer(file);
             return Err(24); // EMFILE - too many open files
         }
-        if self.files.contains_key(&fd) {
+        if fd < 0 || self.files.contains_key(&fd) {
             self.defer(file);
             return Err(9); // EBADF - fd already in use
         }
-        self.files.insert(fd, file);
-        if flags != 0 {
-            self.fd_flags.insert(fd, flags);
+        if !self.install(fd, file, flags) {
+            return Err(12); // ENOMEM
         }
         Ok(())
     }
 
     /// Allocate a file descriptor at or above min_fd (for F_DUPFD).
     ///
-    /// Finds the lowest available fd >= min_fd and allocates the file there.
+    /// Finds the lowest available fd >= min_fd and allocates the file
+    /// there; the search reads the open-fd bitmap (`fdbits`), not each fd.
     /// The `nofile` parameter is the RLIMIT_NOFILE limit. If the found fd
     /// would be >= nofile, returns Err(EMFILE).
     ///
@@ -688,15 +760,14 @@ impl<F> FdTable<F> {
         flags: u32,
         nofile: u64,
     ) -> Result<Fd, i32> {
-        let mut fd = min_fd;
-        while self.files.contains_key(&fd) {
-            fd += 1;
-        }
-        // RLIMIT_NOFILE enforcement
-        if (fd as u64) >= nofile {
-            self.defer(file);
-            return Err(24); // EMFILE - too many open files
-        }
+        // RLIMIT_NOFILE enforced inside (EMFILE)
+        let fd = match self.bits.alloc(min_fd.max(0) as usize, nofile) {
+            Ok(fd) => fd as Fd,
+            Err(e) => {
+                self.defer(file);
+                return Err(e);
+            }
+        };
         self.files.insert(fd, file);
         if flags != 0 {
             self.fd_flags.insert(fd, flags);
@@ -732,8 +803,10 @@ impl<F> FdTable<F> {
     pub fn deep_clone(&self) -> Self {
         Self {
             files: self.files.clone(),
+            bits: self.bits.clone(),
             fd_flags: self.fd_flags.clone(),
             dead: Vec::new(),
+            closed: Vec::new(),
         }
     }
 
@@ -741,13 +814,16 @@ impl<F> FdTable<F> {
     /// descriptors without FD_CLOEXEC, with their flags
     pub fn exec_copy(&self) -> Self {
         let mut t = Self::new();
+        t.bits = self.bits.clone();
         for (&fd, file) in &self.files {
             let fl = self.get_fd_flags(fd);
-            if fl & FD_CLOEXEC == 0 {
-                t.files.insert(fd, file.clone());
-                if fl != 0 {
-                    t.fd_flags.insert(fd, fl);
-                }
+            if fl & FD_CLOEXEC != 0 {
+                t.bits.clear(fd as usize);
+                continue;
+            }
+            t.files.insert(fd, file.clone());
+            if fl != 0 {
+                t.fd_flags.insert(fd, fl);
             }
         }
         t
@@ -762,7 +838,10 @@ impl<F> FdTable<F> {
             self.files.append(&mut mid.split_off(&next));
             self.fd_flags.append(&mut flags.split_off(&next));
         }
-        self.dead.extend(mid.into_values());
+        for &fd in mid.keys() {
+            self.bits.clear(fd as usize);
+        }
+        self.closed.extend(mid.into_values());
     }
 
     /// Set FD_CLOEXEC on the open descriptors in `lo..=hi` (Linux
@@ -801,6 +880,9 @@ pub mod pf {
     /// Its allocations do no I/O to reclaim, so no direct reclaim (Linux
     /// PF_MEMALLOC_NOIO, memalloc_noio_save)
     pub const MEMALLOC_NOIO: u32 = 0x0008_0000;
+    /// Forked and not yet exec'd (Linux PF_FORKNOEXEC): its parent may
+    /// still move it to another process group (setpgid)
+    pub const FORKNOEXEC: u32 = 0x0000_0040;
     /// Kernel thread (Linux PF_KTHREAD)
     pub const KTHREAD: u32 = 0x0020_0000;
     /// Its CPU affinity is not the user's to change (Linux
@@ -959,6 +1041,23 @@ pub struct Task<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::Phy
     pub last_run_ns: AtomicU64,
     /// In kernel mode (for the utime/stime split)
     pub in_kernel: AtomicBool,
+    /// Sequence count around changes of utime/stime/last_run_ns/in_kernel
+    /// (Linux seqcount, as vtime->seqcount): odd while one is under way.
+    /// Their only writer is the task's own CPU with interrupts off (its
+    /// syscalls, its switches, the tick), so readers on other CPUs retry
+    acct_seq: AtomicU32,
+    /// On a CPU since its last accounting point, for readers adding
+    /// the current slice: set by `switch_in`, cleared by `switch_out`,
+    /// both inside `acct_seq` (`se.on_cpu` clears only after the
+    /// switch, which would add a slice already charged)
+    acct_running: AtomicBool,
+    /// Earliest expiry (ns of its PROF, VIRT time) of a CPU timer on
+    /// this thread's clock: a hint for the tick (`cpu_timer`)
+    pub cpu_next: [AtomicU64; 2],
+    /// Its thread group's SignalStruct, set once when the task gets it
+    /// (never changes): the tick and the accounting reach the group's
+    /// CPU timer state through it without TASKLIST
+    cpu_group: spin::Once<Arc<crate::signal::SignalStruct>>,
     /// Voluntary context switches (task yielded or slept)
     pub nvcsw: AtomicU64,
     /// Involuntary context switches (preempted by scheduler)
@@ -1258,7 +1357,7 @@ impl TaskCred {
     /// The caller is the task itself, or holds TASKLIST.
     unsafe fn get(&self) -> Cred {
         // SAFETY: the pointer is live (see above)
-        unsafe { *self.0.load(Ordering::Acquire) }
+        unsafe { (*self.0.load(Ordering::Acquire)).clone() }
     }
 
     /// # Safety
@@ -1266,7 +1365,7 @@ impl TaskCred {
     unsafe fn arc(&self) -> Arc<Cred> {
         let p = self.0.load(Ordering::Acquire);
         if Self::is_static(p) {
-            return Arc::new(INIT_CRED);
+            return Arc::new(INIT_CRED.clone());
         }
         // SAFETY: `p` came from Arc::into_raw and holds a count
         unsafe {
@@ -1442,7 +1541,7 @@ impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Tas
         let now = crate::time::monotonic_ns();
         let flags = match kind {
             TaskKind::KernelThread => pf::KTHREAD | pf::NO_SETAFFINITY,
-            TaskKind::UserProcess => 0,
+            TaskKind::UserProcess => pf::FORKNOEXEC,
         };
         Self {
             tid: AtomicU64::new(tid),
@@ -1483,6 +1582,13 @@ impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Tas
             stime: AtomicU64::new(0),
             last_run_ns: AtomicU64::new(now),
             in_kernel: AtomicBool::new(kind == TaskKind::KernelThread),
+            acct_seq: AtomicU32::new(0),
+            acct_running: AtomicBool::new(false),
+            cpu_next: [
+                AtomicU64::new(crate::cpu_timer::NONE),
+                AtomicU64::new(crate::cpu_timer::NONE),
+            ],
+            cpu_group: spin::Once::new(),
             nvcsw: AtomicU64::new(0),
             nivcsw: AtomicU64::new(0),
             min_flt: AtomicU64::new(0),
@@ -1538,6 +1644,13 @@ impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Tas
             stime: AtomicU64::new(0),
             last_run_ns: AtomicU64::new(0),
             in_kernel: AtomicBool::new(true),
+            acct_seq: AtomicU32::new(0),
+            acct_running: AtomicBool::new(false),
+            cpu_next: [
+                AtomicU64::new(crate::cpu_timer::NONE),
+                AtomicU64::new(crate::cpu_timer::NONE),
+            ],
+            cpu_group: spin::Once::new(),
             nvcsw: AtomicU64::new(0),
             nivcsw: AtomicU64::new(0),
             min_flt: AtomicU64::new(0),
@@ -1723,18 +1836,99 @@ impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Tas
     /// and start a new interval in `kernel` mode (the task itself: the
     /// only writer, so plain loads and stores suffice)
     pub fn account(&self, now: u64, kernel: bool) {
+        self.acct_begin();
+        self.charge(now, kernel);
+        self.acct_end();
+    }
+
+    /// The body of `account`, inside the caller's sequence window
+    fn charge(&self, now: u64, kernel: bool) {
         let delta = now.saturating_sub(self.last_run_ns.load(Ordering::Relaxed));
-        let t = if self.in_kernel.load(Ordering::Relaxed) {
-            &self.stime
-        } else {
-            &self.utime
-        };
+        let was_kernel = self.in_kernel.load(Ordering::Relaxed);
+        // The group's running totals for its CPU timers (when kept)
+        if let Some(g) = self.cpu_group.get() {
+            g.cputimer.charge(delta, was_kernel);
+        }
+        let t = if was_kernel { &self.stime } else { &self.utime };
         t.store(
             t.load(Ordering::Relaxed).saturating_add(delta),
             Ordering::Relaxed,
         );
         self.last_run_ns.store(now, Ordering::Relaxed);
         self.in_kernel.store(kernel, Ordering::Relaxed);
+    }
+
+    /// Charge the time since the last accounting point to the mode the
+    /// task is in, staying in it (a context switch away, the tick)
+    pub fn account_now(&self, now: u64) {
+        self.account(now, self.in_kernel.load(Ordering::Relaxed));
+    }
+
+    /// Its thread group's SignalStruct (none for kernel threads)
+    pub fn cpu_group(&self) -> Option<&Arc<crate::signal::SignalStruct>> {
+        self.cpu_group.get()
+    }
+
+    /// Record the thread group's SignalStruct (once, when assigned)
+    pub fn set_cpu_group(&self, s: &Arc<crate::signal::SignalStruct>) {
+        self.cpu_group.call_once(|| s.clone());
+    }
+
+    /// The task starts running at `now`: the time it was off a CPU is
+    /// nobody's (Linux vtime_task_switch)
+    pub fn switch_in(&self, now: u64) {
+        self.acct_begin();
+        self.last_run_ns.store(now, Ordering::Relaxed);
+        self.acct_running.store(true, Ordering::Relaxed);
+        self.acct_end();
+    }
+
+    /// The task leaves its CPU at `now`: charge its time up to now and
+    /// stop counting a running slice, in one sequence window
+    pub fn switch_out(&self, now: u64) {
+        self.acct_begin();
+        self.charge(now, self.in_kernel.load(Ordering::Relaxed));
+        self.acct_running.store(false, Ordering::Relaxed);
+        self.acct_end();
+    }
+
+    fn acct_begin(&self) {
+        self.acct_seq.fetch_add(1, Ordering::Relaxed);
+        core::sync::atomic::fence(Ordering::Release);
+    }
+
+    fn acct_end(&self) {
+        self.acct_seq.fetch_add(1, Ordering::Release);
+    }
+
+    /// (utime, stime) at `now`, including the slice of a task running
+    /// on a CPU since its last accounting point (Linux task_cputime with
+    /// vtime_delta), consistent from any CPU
+    pub fn cputime(&self, now: u64) -> (u64, u64) {
+        loop {
+            let s1 = self.acct_seq.load(Ordering::Acquire);
+            if s1 & 1 != 0 {
+                core::hint::spin_loop();
+                continue;
+            }
+            let (mut u, mut s) = self.times();
+            let last = self.last_run_ns.load(Ordering::Relaxed);
+            let kernel = self.in_kernel.load(Ordering::Relaxed);
+            let running = self.acct_running.load(Ordering::Relaxed);
+            core::sync::atomic::fence(Ordering::Acquire);
+            if self.acct_seq.load(Ordering::Relaxed) != s1 {
+                continue;
+            }
+            if running {
+                let d = now.saturating_sub(last);
+                if kernel {
+                    s += d;
+                } else {
+                    u += d;
+                }
+            }
+            return (u, s);
+        }
     }
 
     /// Start time (monotonic ns)

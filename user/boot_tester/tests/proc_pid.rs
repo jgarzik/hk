@@ -3,6 +3,10 @@
 //! stat's 52 fields, status lines, the argument and environment strings
 //! of an exec'd child, and environ's access rule (mode 0400 owned by
 //! the task, plus ptrace-read access; cmdline is world-readable)
+//!
+//! PROC_COMM_RAW: a name with a byte >= 0x80 (PR_SET_NAME "\xe9x") shows
+//! as that raw byte in stat's (comm) and status's Name: (Linux
+//! proc_task_name), not re-encoded
 
 use super::exec_identity::proc_path;
 use super::helpers::{print, print_num, println};
@@ -23,6 +27,31 @@ pub fn run_tests() {
     status_self();
     exec_child();
     environ_perm();
+    comm_raw();
+}
+
+/// In a child: name it "\xe9x", then find the raw bytes in stat and
+/// status; exit status is the failed step
+fn comm_raw() {
+    const PR_SET_NAME: i32 = 15;
+    let pid = sys_fork();
+    if pid == 0 {
+        let name = b"\xe9x\0";
+        sys_prctl(PR_SET_NAME, name.as_ptr() as u64, 0, 0, 0);
+        let mut buf = [0u8; 2048];
+        let n = slurp(b"/proc/self/stat\0", &mut buf);
+        if n <= 0 || !buf[..n as usize].windows(4).any(|w| w == b"(\xe9x)") {
+            sys_exit(1);
+        }
+        let n = slurp(b"/proc/self/status\0", &mut buf);
+        if n <= 0 || !buf[..n as usize].windows(9).any(|w| w == b"Name:\t\xe9x\n") {
+            sys_exit(2);
+        }
+        sys_exit(0);
+    }
+    let mut st = 0i32;
+    sys_wait4(pid, &mut st, 0, 0);
+    verdict(b"PROC_COMM_RAW", st == 0, (st >> 8) as i64);
 }
 
 fn verdict(name: &[u8], ok: bool, got: i64) {

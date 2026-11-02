@@ -218,6 +218,12 @@ pub struct SuperBlock {
     /// Next inode number to allocate
     next_ino: AtomicU64,
 
+    /// Mounts whose mountpoint is a dentry of this filesystem, in any
+    /// namespace: 0 lets unlink/rmdir/rename skip the mountpoint walk
+    /// (Linux checks DCACHE_MOUNTED first). Never low; a stale high
+    /// count only costs the walk.
+    mounted_on: AtomicU32,
+
     /// Unique device ID for this filesystem instance (for stat st_dev)
     pub dev_id: u64,
 
@@ -238,6 +244,21 @@ use super::inode::AsAny;
 pub trait SuperBlockData: Send + Sync + AsAny {}
 
 impl SuperBlock {
+    /// A mount was put on (`+1`) or taken off (`-1`) one of this
+    /// filesystem's dentries
+    pub fn note_mounted_on(&self, delta: i32) {
+        if delta > 0 {
+            self.mounted_on.fetch_add(1, Ordering::AcqRel);
+        } else {
+            self.mounted_on.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    /// Something may be mounted on a dentry of this filesystem
+    pub fn has_mounts_on(&self) -> bool {
+        self.mounted_on.load(Ordering::Acquire) != 0
+    }
+
     /// Create a new superblock
     pub fn new(
         fs_type: &'static FileSystemType,
@@ -249,6 +270,7 @@ impl SuperBlock {
             root: RwLock::new(None),
             s_op,
             s_flags: AtomicU32::new(flags),
+            mounted_on: AtomicU32::new(0),
             s_writers: AtomicU64::new(0),
             next_ino: AtomicU64::new(1), // Start inode numbers at 1
             dev_id: NEXT_DEV_ID.fetch_add(1, Ordering::Relaxed),

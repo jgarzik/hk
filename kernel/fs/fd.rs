@@ -183,10 +183,6 @@ pub fn sys_dup(oldfd: i32) -> i64 {
 /// # Returns
 /// newfd on success, negative errno on error.
 pub fn sys_dup2(oldfd: i32, newfd: i32) -> i64 {
-    if newfd < 0 {
-        return KernelError::BadFd.sysret();
-    }
-
     // If oldfd == newfd, just verify oldfd is valid
     if oldfd == newfd {
         let fd_table = current_fd_table();
@@ -197,22 +193,7 @@ pub fn sys_dup2(oldfd: i32, newfd: i32) -> i64 {
             KernelError::BadFd.sysret()
         };
     }
-
-    let fd_table = current_fd_table();
-    let mut table = fd_table.lock();
-    let file = match table.get(oldfd) {
-        Some(f) => f,
-        None => return KernelError::BadFd.sysret(),
-    };
-
-    // Close newfd if open (silently ignore errors)
-    table.close(newfd);
-
-    // Allocate at specific fd (RLIMIT_NOFILE enforced inside)
-    match table.alloc_at_with_flags(newfd, file, 0, get_nofile_limit()) {
-        Ok(()) => newfd as i64,
-        Err(e) => -(e as i64),
-    }
+    dup_to(oldfd, newfd, 0)
 }
 
 /// sys_dup3 - duplicate a file descriptor with flags
@@ -228,38 +209,44 @@ pub fn sys_dup2(oldfd: i32, newfd: i32) -> i64 {
 /// # Returns
 /// newfd on success, negative errno on error.
 pub fn sys_dup3(oldfd: i32, newfd: i32, flags: u32) -> i64 {
-    // dup3 requires oldfd != newfd (unlike dup2)
-    if oldfd == newfd {
-        return KernelError::InvalidArgument.sysret();
-    }
-    if newfd < 0 {
-        return KernelError::BadFd.sysret();
-    }
-
     // Only O_CLOEXEC is valid for dup3
     if flags & !super::file::flags::O_CLOEXEC != 0 {
         return KernelError::InvalidArgument.sysret();
     }
-
-    let fd_table = current_fd_table();
-    let mut table = fd_table.lock();
-    let file = match table.get(oldfd) {
-        Some(f) => f,
-        None => return KernelError::BadFd.sysret(),
-    };
-
-    // Close newfd if open
-    table.close(newfd);
-
-    // Convert O_CLOEXEC to FD_CLOEXEC
+    // dup3 requires oldfd != newfd (unlike dup2)
+    if oldfd == newfd {
+        return KernelError::InvalidArgument.sysret();
+    }
     let fd_flags = if flags & super::file::flags::O_CLOEXEC != 0 {
         crate::task::FD_CLOEXEC
     } else {
         0
     };
+    dup_to(oldfd, newfd, fd_flags)
+}
 
-    // Allocate at specific fd (RLIMIT_NOFILE enforced inside)
-    match table.alloc_at_with_flags(newfd, file, fd_flags, get_nofile_limit()) {
+/// Make `newfd` a copy of `oldfd` (Linux ksys_dup3 + do_dup2): a newfd
+/// at or past RLIMIT_NOFILE or fs.nr_open is EBADF, and every check,
+/// including room for newfd, comes before newfd is closed
+fn dup_to(oldfd: i32, newfd: i32, fd_flags: u32) -> i64 {
+    let nofile = get_nofile_limit();
+    // Linux takes newfd unsigned: a negative one is past any limit
+    if newfd as u32 as u64 >= nofile {
+        return KernelError::BadFd.sysret();
+    }
+    let fd_table = current_fd_table();
+    let mut table = fd_table.lock();
+    let room = table.expand(newfd);
+    let Some(file) = table.get(oldfd) else {
+        return KernelError::BadFd.sysret();
+    };
+    match room {
+        Ok(()) => {}
+        Err(24) => return KernelError::BadFd.sysret(), // EMFILE
+        Err(e) => return -(e as i64),
+    }
+    table.close(newfd);
+    match table.alloc_at_with_flags(newfd, file, fd_flags, nofile) {
         Ok(()) => newfd as i64,
         Err(e) => -(e as i64),
     }
@@ -389,6 +376,22 @@ mod fcntl_cmd {
     pub const F_SETSIG: i32 = 10;
     pub const F_GETSIG: i32 = 11;
     pub const F_DUPFD_CLOEXEC: i32 = 1030;
+}
+
+/// Lock `flock` was just set through `fd`: if a close (by another
+/// thread) took the descriptor away meanwhile, its release came too
+/// early, so that range is unlocked now; the process's other locks
+/// stay (Linux fcntl_setlk rechecks with files_lookup_fd and sets
+/// F_UNLCK over the same, already resolved, region)
+fn setlk_recheck(fd: i32, file: &Arc<crate::fs::File>, flock: &Flock, range: (u64, u64)) {
+    use crate::fs::posix_lock::{F_UNLCK, posix_unlock};
+    let same = current_fd_table()
+        .lock()
+        .get(fd)
+        .is_some_and(|f| Arc::ptr_eq(&f, file));
+    if !same && flock.l_type != F_UNLCK {
+        posix_unlock(file, range);
+    }
 }
 
 /// sys_fcntl - file control operations
@@ -545,7 +548,10 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> i64 {
             }
 
             match posix_setlk(&file, &flock) {
-                Ok(()) => 0,
+                Ok(range) => {
+                    setlk_recheck(fd, &file, &flock, range);
+                    0
+                }
                 Err(e) => e.sysret(),
             }
         }
@@ -569,7 +575,10 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> i64 {
             }
 
             match posix_setlkw(&file, &flock) {
-                Ok(()) => 0,
+                Ok(range) => {
+                    setlk_recheck(fd, &file, &flock, range);
+                    0
+                }
                 Err(e) => e.sysret(),
             }
         }

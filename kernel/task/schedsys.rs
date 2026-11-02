@@ -9,6 +9,7 @@
 //! - ioprio_get, ioprio_set
 //! - getcpu
 
+use super::percpu::current_tid;
 use crate::error::KernelError;
 
 use super::Pid;
@@ -61,7 +62,6 @@ pub fn sys_getcpu<A: crate::uaccess::UaccessArch>(cpu: u32, cpup: u64, nodep: u6
 /// # Arguments
 /// * `which` - PRIO_PROCESS, PRIO_PGRP, or PRIO_USER
 /// * `who` - PID, PGID, or UID depending on `which` (0 = calling process)
-/// * `caller_pid` - PID of calling process
 ///
 /// # Returns
 /// * 20 - nice (range 1-40) on success, to avoid negative return values
@@ -69,12 +69,18 @@ pub fn sys_getcpu<A: crate::uaccess::UaccessArch>(cpu: u32, cpup: u64, nodep: u6
 ///
 /// # Locking
 /// Acquires TASKLIST lock briefly to read priority.
-pub fn sys_getpriority(which: i32, who: u64, caller_pid: Pid) -> i64 {
+pub fn sys_getpriority(which: i32, who: i32) -> i64 {
     use super::{PRIO_PGRP, PRIO_PROCESS, PRIO_USER};
 
+    // `who` is an int (id_t of a pid or pgid): a negative one names none
+    if which != PRIO_USER && who < 0 {
+        return KernelError::NoProcess.sysret();
+    }
+    let who = who as u32 as u64;
     match which {
         PRIO_PROCESS => {
-            let target_pid = if who == 0 { caller_pid } else { who };
+            // 0 is the calling thread (Linux: current)
+            let target_pid = if who == 0 { current_tid() } else { who };
             match super::percpu::lookup_task_nice(target_pid) {
                 // 20 - nice (range 1-40) to avoid negative return values
                 Some(nice) => (20 - nice) as i64,
@@ -96,12 +102,30 @@ pub fn sys_getpriority(which: i32, who: u64, caller_pid: Pid) -> i64 {
                 .max()
                 .unwrap_or(KernelError::NoProcess.sysret())
         }
-        PRIO_USER => {
-            // Not implemented yet - would require task iteration
-            KernelError::NoProcess.sysret() // Return ESRCH for now (no matching processes)
-        }
+        PRIO_USER => tids_of_user(who)
+            .into_iter()
+            .filter_map(super::percpu::lookup_task_nice)
+            .map(|n| (20 - n) as i64)
+            .max()
+            .unwrap_or(KernelError::NoProcess.sysret()),
         _ => KernelError::InvalidArgument.sysret(),
     }
+}
+
+/// The threads whose real uid is `who` (0: the caller's), for PRIO_USER
+/// (Linux for_each_process_thread with uid_eq(task_uid(p), uid))
+fn tids_of_user(who: u64) -> alloc::vec::Vec<Pid> {
+    let uid = if who == 0 {
+        super::percpu::current_cred().uid
+    } else {
+        who as super::Uid
+    };
+    super::percpu::TASKLIST
+        .read()
+        .iter()
+        .filter(|t| !t.task.has_flag(super::pf::KTHREAD) && t.cred().uid == uid)
+        .map(|t| t.task.tid())
+        .collect()
 }
 
 /// Set task `tid`'s nice value (Linux set_one_prio): EPERM unless the
@@ -140,8 +164,6 @@ fn set_one_prio(tid: Pid, niceval: i32, caller_euid: super::Uid, error: i64) -> 
 /// * `which` - PRIO_PROCESS, PRIO_PGRP, or PRIO_USER
 /// * `who` - PID, PGID, or UID depending on `which` (0 = calling process)
 /// * `niceval` - New nice value (-20 to 19)
-/// * `caller_pid` - PID of calling process
-/// * `caller_euid` - Effective UID of calling process
 ///
 /// # Returns
 /// * 0 on success
@@ -153,21 +175,20 @@ fn set_one_prio(tid: Pid, niceval: i32, caller_euid: super::Uid, error: i64) -> 
 /// # Permission Model
 /// - Root (euid=0): Can set any priority for any process
 /// - Non-root: Can only lower priority (increase nice value), not raise it
-pub fn sys_setpriority(
-    which: i32,
-    who: u64,
-    niceval: i32,
-    caller_pid: Pid,
-    caller_euid: super::Uid,
-) -> i64 {
+pub fn sys_setpriority(which: i32, who: i32, niceval: i32) -> i64 {
     use super::{PRIO_MAX, PRIO_MIN, PRIO_PGRP, PRIO_PROCESS, PRIO_USER};
 
     // Clamp nice value to valid range (Linux does this)
     let niceval = niceval.clamp(PRIO_MIN, PRIO_MAX);
+    if which != PRIO_USER && who < 0 {
+        return KernelError::NoProcess.sysret();
+    }
+    let who = who as u32 as u64;
+    let caller_euid = super::percpu::current_cred().euid;
 
     match which {
         PRIO_PROCESS => {
-            let target_pid = if who == 0 { caller_pid } else { who };
+            let target_pid = if who == 0 { current_tid() } else { who };
             set_one_prio(
                 target_pid,
                 niceval,
@@ -190,8 +211,11 @@ pub fn sys_setpriority(
             ret
         }
         PRIO_USER => {
-            // Not implemented yet
-            KernelError::NoProcess.sysret()
+            let mut ret = KernelError::NoProcess.sysret();
+            for tid in tids_of_user(who) {
+                ret = set_one_prio(tid, niceval, caller_euid, ret);
+            }
+            ret
         }
         _ => KernelError::InvalidArgument.sysret(),
     }
@@ -204,7 +228,6 @@ pub fn sys_setpriority(
 ///
 /// # Arguments
 /// * `pid` - Process ID (0 = calling process)
-/// * `caller_pid` - PID of calling process
 ///
 /// # Returns
 /// * Scheduling policy (SCHED_NORMAL, SCHED_FIFO, SCHED_RR, etc.) on success
@@ -212,13 +235,13 @@ pub fn sys_setpriority(
 ///
 /// # Locking
 /// Acquires TASKLIST lock briefly to read policy.
-pub fn sys_sched_getscheduler(pid: i64, caller_pid: Pid) -> i64 {
+pub fn sys_sched_getscheduler(pid: i64) -> i64 {
     // pid < 0 is invalid
     if pid < 0 {
         return KernelError::InvalidArgument.sysret();
     }
 
-    let target_pid = if pid == 0 { caller_pid } else { pid as u64 };
+    let target_pid = if pid == 0 { current_tid() } else { pid as u64 };
 
     match super::percpu::lookup_task_policy(target_pid) {
         Some(policy) => policy as i64,
@@ -235,8 +258,6 @@ pub fn sys_sched_getscheduler(pid: i64, caller_pid: Pid) -> i64 {
 /// * `pid` - Process ID (0 = calling process)
 /// * `policy` - Scheduling policy (SCHED_NORMAL, SCHED_FIFO, etc.)
 /// * `param_ptr` - Pointer to sched_param struct
-/// * `caller_pid` - PID of calling process
-/// * `caller_euid` - Effective UID of calling process
 ///
 /// # Returns
 /// * 0 on success
@@ -252,8 +273,6 @@ pub fn sys_sched_setscheduler<A: crate::uaccess::UaccessArch>(
     pid: i64,
     policy: i32,
     param_ptr: u64,
-    caller_pid: Pid,
-    caller_euid: super::Uid,
 ) -> i64 {
     use super::SchedParam;
     use crate::uaccess::get_user;
@@ -282,8 +301,9 @@ pub fn sys_sched_setscheduler<A: crate::uaccess::UaccessArch>(
         return KernelError::InvalidArgument.sysret();
     }
 
-    let target_pid = if pid == 0 { caller_pid } else { pid as u64 };
-    if let Err(e) = check_setscheduler(target_pid, policy, param.sched_priority, caller_euid) {
+    let target_pid = if pid == 0 { current_tid() } else { pid as u64 };
+    let euid = super::percpu::current_cred().euid;
+    if let Err(e) = check_setscheduler(target_pid, policy, param.sched_priority, euid) {
         return e.sysret();
     }
 
@@ -361,7 +381,6 @@ fn check_setscheduler(
 /// # Arguments
 /// * `pid` - Process ID (0 = calling process)
 /// * `param_ptr` - Pointer to sched_param struct to fill
-/// * `caller_pid` - PID of calling process
 ///
 /// # Returns
 /// * 0 on success
@@ -369,11 +388,7 @@ fn check_setscheduler(
 ///
 /// # Locking
 /// Acquires TASKLIST lock briefly to read parameters.
-pub fn sys_sched_getparam<A: crate::uaccess::UaccessArch>(
-    pid: i64,
-    param_ptr: u64,
-    caller_pid: Pid,
-) -> i64 {
+pub fn sys_sched_getparam<A: crate::uaccess::UaccessArch>(pid: i64, param_ptr: u64) -> i64 {
     use super::SchedParam;
     use crate::uaccess::put_user;
 
@@ -390,7 +405,7 @@ pub fn sys_sched_getparam<A: crate::uaccess::UaccessArch>(
         return KernelError::BadAddress.sysret();
     }
 
-    let target_pid = if pid == 0 { caller_pid } else { pid as u64 };
+    let target_pid = if pid == 0 { current_tid() } else { pid as u64 };
 
     // Get the RT priority (0 for non-RT tasks)
     let rt_prio = match super::percpu::lookup_task_rt_priority(target_pid) {
@@ -419,8 +434,6 @@ pub fn sys_sched_getparam<A: crate::uaccess::UaccessArch>(
 /// # Arguments
 /// * `pid` - Process ID (0 = calling process)
 /// * `param_ptr` - Pointer to sched_param struct
-/// * `caller_pid` - PID of calling process
-/// * `caller_euid` - Effective UID of calling process
 ///
 /// # Returns
 /// * 0 on success
@@ -432,12 +445,7 @@ pub fn sys_sched_getparam<A: crate::uaccess::UaccessArch>(
 ///
 /// # Locking
 /// Acquires TASKLIST lock to modify parameters.
-pub fn sys_sched_setparam<A: crate::uaccess::UaccessArch>(
-    pid: i64,
-    param_ptr: u64,
-    caller_pid: Pid,
-    caller_euid: super::Uid,
-) -> i64 {
+pub fn sys_sched_setparam<A: crate::uaccess::UaccessArch>(pid: i64, param_ptr: u64) -> i64 {
     use super::SchedParam;
     use crate::uaccess::get_user;
 
@@ -460,7 +468,7 @@ pub fn sys_sched_setparam<A: crate::uaccess::UaccessArch>(
         Err(_) => return KernelError::BadAddress.sysret(),
     };
 
-    let target_pid = if pid == 0 { caller_pid } else { pid as u64 };
+    let target_pid = if pid == 0 { current_tid() } else { pid as u64 };
 
     // Get current policy to preserve it
     let current_policy = match super::percpu::lookup_task_policy(target_pid) {
@@ -472,7 +480,7 @@ pub fn sys_sched_setparam<A: crate::uaccess::UaccessArch>(
         target_pid,
         current_policy,
         param.sched_priority,
-        caller_euid,
+        super::percpu::current_cred().euid,
     ) {
         return e.sysret();
     }
@@ -493,7 +501,6 @@ pub fn sys_sched_setparam<A: crate::uaccess::UaccessArch>(
 /// * `pid` - Process ID (0 = calling process)
 /// * `cpusetsize` - Size of the user buffer in bytes
 /// * `mask_ptr` - Pointer to user buffer for the CPU mask
-/// * `caller_pid` - PID of calling process
 ///
 /// # Returns
 /// * Number of bytes written on success (minimum of cpusetsize and sizeof(cpu_set_t))
@@ -505,7 +512,6 @@ pub fn sys_sched_getaffinity<A: crate::uaccess::UaccessArch>(
     pid: i64,
     cpusetsize: u64,
     mask_ptr: u64,
-    caller_pid: Pid,
 ) -> i64 {
     use crate::uaccess::copy_to_user;
 
@@ -521,7 +527,7 @@ pub fn sys_sched_getaffinity<A: crate::uaccess::UaccessArch>(
         return KernelError::InvalidArgument.sysret();
     }
 
-    let target_pid = if pid == 0 { caller_pid } else { pid as u64 };
+    let target_pid = if pid == 0 { current_tid() } else { pid as u64 };
 
     // The allowed CPUs that are up (Linux: & cpu_active_mask)
     let mask = match super::percpu::lookup_task_cpus_allowed(target_pid) {
@@ -556,8 +562,6 @@ fn cpumask_size() -> usize {
 /// * `pid` - Process ID (0 = calling process)
 /// * `cpusetsize` - Size of the user buffer in bytes
 /// * `mask_ptr` - Pointer to user buffer containing the CPU mask
-/// * `caller_pid` - PID of calling process
-/// * `caller_euid` - Effective UID of calling process
 ///
 /// # Returns
 /// * 0 on success
@@ -573,8 +577,6 @@ pub fn sys_sched_setaffinity<A: crate::uaccess::UaccessArch>(
     pid: i64,
     cpusetsize: u64,
     mask_ptr: u64,
-    caller_pid: Pid,
-    caller_euid: super::Uid,
 ) -> i64 {
     use crate::uaccess::copy_from_user;
 
@@ -598,11 +600,22 @@ pub fn sys_sched_setaffinity<A: crate::uaccess::UaccessArch>(
         .collect();
     let mask = crate::cpumask::CpuSet::from_words(&words);
 
-    let target_pid = if pid == 0 { caller_pid } else { pid as u64 };
+    let target_pid = if pid == 0 { current_tid() } else { pid as u64 };
 
-    // Permission check: non-root can only set own affinity
-    if target_pid != caller_pid && caller_euid != 0 {
-        return KernelError::NotPermitted.sysret();
+    // Linux sched_setaffinity: the caller's own tasks (check_same_owner:
+    // its euid is their uid or euid) or CAP_SYS_NICE
+    let euid = super::percpu::current_cred().euid;
+    let owner = super::percpu::TASKLIST
+        .read()
+        .get(target_pid)
+        .map(|t| t.cred())
+        .map(|c| c.uid == euid || c.euid == euid);
+    match owner {
+        None => return KernelError::NoProcess.sysret(),
+        Some(false) if !super::capable(super::CAP_SYS_NICE) => {
+            return KernelError::NotPermitted.sysret();
+        }
+        _ => {}
     }
 
     // Set the CPU affinity mask
@@ -622,7 +635,6 @@ pub fn sys_sched_setaffinity<A: crate::uaccess::UaccessArch>(
 /// # Arguments
 /// * `pid` - Process ID (0 = calling process)
 /// * `tp_ptr` - Pointer to timespec structure to fill
-/// * `caller_pid` - PID of calling process
 ///
 /// # Returns
 /// * 0 on success
@@ -630,11 +642,7 @@ pub fn sys_sched_setaffinity<A: crate::uaccess::UaccessArch>(
 ///
 /// # Locking
 /// Acquires TASKLIST lock briefly to read policy.
-pub fn sys_sched_rr_get_interval<A: crate::uaccess::UaccessArch>(
-    pid: i64,
-    tp_ptr: u64,
-    caller_pid: Pid,
-) -> i64 {
+pub fn sys_sched_rr_get_interval<A: crate::uaccess::UaccessArch>(pid: i64, tp_ptr: u64) -> i64 {
     use crate::uaccess::put_user;
 
     // Timespec structure for return value
@@ -658,7 +666,7 @@ pub fn sys_sched_rr_get_interval<A: crate::uaccess::UaccessArch>(
         return KernelError::BadAddress.sysret();
     }
 
-    let target_pid = if pid == 0 { caller_pid } else { pid as u64 };
+    let target_pid = if pid == 0 { current_tid() } else { pid as u64 };
 
     // Get the scheduling policy
     let policy = match super::percpu::lookup_task_policy(target_pid) {
@@ -706,8 +714,8 @@ pub fn sys_sched_rr_get_interval<A: crate::uaccess::UaccessArch>(
 /// * -EPERM if not permitted
 pub fn sys_ioprio_set(which: i32, who: i32, ioprio: i32) -> i64 {
     use super::{
-        IOPRIO_CLASS_IDLE, IOPRIO_CLASS_RT, IOPRIO_WHO_PGRP, IOPRIO_WHO_PROCESS, IOPRIO_WHO_USER,
-        ioprio_prio_class, ioprio_valid,
+        IOPRIO_CLASS_RT, IOPRIO_WHO_PGRP, IOPRIO_WHO_PROCESS, IOPRIO_WHO_USER, ioprio_prio_class,
+        ioprio_valid,
     };
 
     let ioprio = ioprio as u16;
@@ -718,10 +726,13 @@ pub fn sys_ioprio_set(which: i32, who: i32, ioprio: i32) -> i64 {
     }
 
     let class = ioprio_prio_class(ioprio);
-    let caller_euid = super::percpu::current_cred().euid;
 
-    // Permission check: RT and IDLE classes require CAP_SYS_NICE (or root)
-    if (class == IOPRIO_CLASS_RT || class == IOPRIO_CLASS_IDLE) && caller_euid != 0 {
+    // Linux ioprio_check_cap: the RT class needs CAP_SYS_NICE or
+    // CAP_SYS_ADMIN; IDLE and BE anyone
+    if class == IOPRIO_CLASS_RT
+        && !super::capable(super::CAP_SYS_NICE)
+        && !super::capable(super::CAP_SYS_ADMIN)
+    {
         return KernelError::NotPermitted.sysret();
     }
 
@@ -733,6 +744,12 @@ pub fn sys_ioprio_set(which: i32, who: i32, ioprio: i32) -> i64 {
                 who as u64
             };
 
+            if !super::percpu::task_exists(tid) {
+                return KernelError::NoProcess.sysret();
+            }
+            if !ioprio_owner_ok(tid) {
+                return KernelError::NotPermitted.sysret();
+            }
             // Get or create IoContext for the target
             let Some(ctx) = super::task_io_context(tid) else {
                 return KernelError::NoProcess.sysret();
@@ -755,6 +772,9 @@ pub fn sys_ioprio_set(which: i32, who: i32, ioprio: i32) -> i64 {
             }
 
             for tid in tids {
+                if !ioprio_owner_ok(tid) {
+                    return KernelError::NotPermitted.sysret();
+                }
                 if let Some(ctx) = super::task_io_context(tid) {
                     ctx.set_ioprio(ioprio);
                 }
@@ -768,6 +788,18 @@ pub fn sys_ioprio_set(which: i32, who: i32, ioprio: i32) -> i64 {
         }
         _ => KernelError::InvalidArgument.sysret(),
     }
+}
+
+/// May the caller change task `tid`'s I/O priority (Linux
+/// set_task_ioprio): its uid is the caller's euid or uid, or the caller
+/// has CAP_SYS_NICE
+fn ioprio_owner_ok(tid: Pid) -> bool {
+    let me = super::percpu::current_cred();
+    let ok = super::percpu::TASKLIST
+        .read()
+        .get(tid)
+        .is_some_and(|t| t.cred().uid == me.euid || t.cred().uid == me.uid);
+    ok || super::capable(super::CAP_SYS_NICE)
 }
 
 /// sys_ioprio_get - get I/O scheduling class and priority

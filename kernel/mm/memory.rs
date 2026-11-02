@@ -286,11 +286,18 @@ impl PteWalk for CopyRange<'_> {
     /// copy_pte_range), into the child's table under that table's PTE
     /// lock (dup_mm already put the child's VMA on the reverse-map
     /// chains). Parent, then child: only fork nests these two.
+    /// The child's table, allocated before the parent's PTE lock is
+    /// taken (Linux copy_pte_range: pte_alloc_map_lock of the child
+    /// first): the allocation may reclaim
+    fn prepare(&mut self, addr: u64, _end: u64) -> Result<(), i32> {
+        paging::pte_alloc(self.dst, addr).map(|_| ()).ok_or(ENOMEM)
+    }
+
     fn ptes(&mut self, r: &PteRange) -> Result<(), i32> {
         if r.iter().all(|(_, e)| e.load(Ordering::Acquire) == 0) {
             return Ok(());
         }
-        let dp = paging::pte_alloc(self.dst, r.start).ok_or(ENOMEM)?;
+        let dp = paging::pte_ptr(self.dst, r.start).ok_or(ENOMEM)?;
         let _l = super::ptl::pte_lock(dp);
         let d = PteRange::at(dp, r.start, r.end);
         for (a, se) in r.iter() {

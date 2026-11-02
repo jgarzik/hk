@@ -54,12 +54,13 @@ pub struct PingSock {
     me: Weak<PingSock>,
 }
 
-/// Linux ping_init_sock: the effective group must be in
-/// ping_group_range (hk has no supplementary groups yet)
+/// Linux ping_init_sock: the effective group or a supplementary group
+/// must be in ping_group_range
 fn group_ok(net: &NetNamespace) -> bool {
     let (lo, hi) = net.sysctl.ping_group();
-    let g = crate::task::current_cred().egid;
-    lo <= g && g <= hi
+    let c = crate::task::current_cred();
+    let ok = |g: u32| lo <= g && g <= hi;
+    ok(c.egid) || c.groups.as_slice().iter().any(|&g| ok(g))
 }
 
 /// socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP)

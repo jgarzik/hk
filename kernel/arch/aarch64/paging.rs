@@ -360,7 +360,8 @@ pub fn pmd_populate(pmdp: *mut u64, pt: u64) {
 }
 
 /// A user leaf entry for `phys` with the protection of a VMA (PROT_*),
-/// access flag set (Linux mk_pte + pte_mkyoung)
+/// access flag set (Linux mk_pte + pte_mkyoung); PROT_NONE gives a
+/// protnone entry (Linux vm_page_prot PAGE_NONE)
 pub fn mk_pte(phys: u64, prot: u32) -> u64 {
     let mut pte = phys | DESC_PAGE | AF | SH_INNER | ATTR_IDX_NORMAL | NG;
     pte |= if prot & crate::mm::PROT_WRITE != 0 {
@@ -372,6 +373,9 @@ pub fn mk_pte(phys: u64, prot: u32) -> u64 {
     pte |= PXN;
     if prot & crate::mm::PROT_EXEC == 0 {
         pte |= UXN;
+    }
+    if prot & (crate::mm::PROT_READ | crate::mm::PROT_WRITE | crate::mm::PROT_EXEC) == 0 {
+        return pte_modify(pte, prot);
     }
     pte
 }

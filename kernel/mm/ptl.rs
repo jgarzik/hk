@@ -23,8 +23,13 @@
 //! VMAs left the reverse-map chains, so a pointer to an entry stays
 //! valid under any mmap_lock hold, or the AnonVma lock of a VMA there.
 //!
-//! Order: mmap_lock -> page_table_lock -> PTE lock -> allocator (page
-//! tables and pages are allocated under them), never the reverse; no
+//! Order: mmap_lock -> page_table_lock -> PTE lock -> allocator, never
+//! the reverse. Both are spin locks with preemption off: an allocation
+//! under them never reclaims (reclaim walks the reverse map, which
+//! takes PTE locks), so it may fail where one without them would
+//! not -- allocate first where that matters (fork and mremap allocate
+//! the destination tables before taking the source's PTE lock, a
+//! copy-on-write break its page: `PteWalk::prepare`, `do_wp_page`); no
 //! lock is taken in interrupt context. A holder may flush the TLB
 //! (x86: IPIs): waiters spin with interrupts on (syscalls and faults
 //! run with them on) and answer the IPI, as in Linux.
@@ -59,6 +64,11 @@ pub fn pte_lock(ptep: *mut u64) -> PteLock {
 pub fn table_lock(table: u64) -> PteLock {
     let page: &'static Page = phys_to_page(table).expect("page table outside RAM");
     let word = &page.ptl;
+    // A spin lock like Linux spin_lock: no preemption, and in_atomic()
+    // for what runs under it, so an allocation there never enters
+    // direct reclaim (whose reverse-map walk takes PTE locks: this one
+    // too, a self-deadlock) and a sleep there is reported
+    preempt_disable();
     #[cfg(feature = "lockdep")]
     crate::sync::lockdep::acquire(
         word as *const _ as usize,
@@ -82,8 +92,16 @@ impl Drop for PteLock {
         self.word.store(0, Ordering::Release);
         #[cfg(feature = "lockdep")]
         crate::sync::lockdep::release(self.word as *const _ as usize);
+        preempt_enable();
     }
 }
+
+#[cfg(not(test))]
+use crate::arch::{preempt_disable, preempt_enable};
+#[cfg(test)]
+fn preempt_disable() {}
+#[cfg(test)]
+fn preempt_enable() {}
 
 /// `mm`'s page_table_lock (Linux mm->page_table_lock)
 #[track_caller]

@@ -112,6 +112,11 @@ impl InodeMode {
         self.file_type() == Some(FileType::BlockDev)
     }
 
+    /// Check if this is a FIFO (named pipe)
+    pub fn is_fifo(&self) -> bool {
+        self.file_type() == Some(FileType::Fifo)
+    }
+
     /// Check if this is a socket
     pub fn is_socket(&self) -> bool {
         self.file_type() == Some(FileType::Socket)
@@ -440,6 +445,10 @@ pub struct Inode {
     /// Link count (atomic for thread-safe hard link management)
     pub nlink: AtomicU32,
 
+    /// A removed directory (Linux S_DEAD): set by rmdir, or a rename
+    /// replacing it, under its i_rwsem; mount refuses it
+    dead: core::sync::atomic::AtomicBool,
+
     /// Device ID for character/block devices (major/minor)
     /// For non-device files, this is DevId::null()
     pub rdev: DevId,
@@ -471,6 +480,10 @@ pub struct Inode {
 
     /// Filesystem-specific private data
     pub private: RwLock<Option<Arc<dyn InodeData>>>,
+
+    /// A FIFO's pipe while it is open, and how many files have it open
+    /// (Linux inode->i_pipe and pipe->files)
+    pub i_pipe: crate::sync::spin::Mutex<Option<(Arc<crate::pipe::Pipe>, usize)>>,
 }
 
 impl Inode {
@@ -496,6 +509,7 @@ impl Inode {
             gid: AtomicU32::new(gid),
             size: AtomicU64::new(size),
             nlink: AtomicU32::new(1),
+            dead: core::sync::atomic::AtomicBool::new(false),
             rdev: DevId::null(),
             atime: InodeTime::new(mtime),
             mtime: InodeTime::new(mtime),
@@ -504,6 +518,7 @@ impl Inode {
             i_op,
             i_rwsem: RwSem::new(()),
             private: RwLock::new(None),
+            i_pipe: crate::sync::spin::Mutex::new(None),
         }
     }
 
@@ -530,6 +545,7 @@ impl Inode {
             gid: AtomicU32::new(gid),
             size: AtomicU64::new(0),
             nlink: AtomicU32::new(1),
+            dead: core::sync::atomic::AtomicBool::new(false),
             rdev,
             atime: InodeTime::new(mtime),
             mtime: InodeTime::new(mtime),
@@ -538,7 +554,18 @@ impl Inode {
             i_op,
             i_rwsem: RwSem::new(()),
             private: RwLock::new(None),
+            i_pipe: crate::sync::spin::Mutex::new(None),
         }
+    }
+
+    /// Mark a removed directory dead (caller holds its i_rwsem)
+    pub fn set_dead(&self) {
+        self.dead.store(true, Ordering::Release);
+    }
+
+    /// Removed directory (Linux IS_DEADDIR)
+    pub fn is_dead(&self) -> bool {
+        self.dead.load(Ordering::Acquire)
     }
 
     /// Get file mode (type + permissions)

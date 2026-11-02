@@ -175,7 +175,7 @@ pub fn sys_vfork() -> i64 {
 /// * > 0: PID of terminated child
 /// * 0: WNOHANG and no child ready
 /// * -ECHILD: No matching children
-pub fn sys_wait4(pid: i64, wstatus: u64, options: i32, _rusage: u64) -> i64 {
+pub fn sys_wait4(pid: i64, wstatus: u64, options: i32, rusage: u64) -> i64 {
     use super::wait_options::WNOHANG;
 
     // Linux kernel_wait4: WEXITED/WNOWAIT and the like are waitid-only
@@ -214,15 +214,22 @@ pub fn sys_wait4(pid: i64, wstatus: u64, options: i32, _rusage: u64) -> i64 {
             }
             break tid as i64;
         }
-        if let Some((child_pid, wait_status)) =
-            super::percpu::reap_zombie_child(current_pid, pid, options)
+        if let Some((child_pid, wait_status, utime, stime)) =
+            super::percpu::reap_zombie_child_times(current_pid, pid, options)
         {
+            use crate::arch::Uaccess;
             // The zombie holds the Linux wait status word
-            if wstatus != 0 {
-                use crate::arch::Uaccess;
-                if crate::uaccess::put_user::<Uaccess, i32>(wstatus, wait_status).is_err() {
-                    break KernelError::BadAddress.sysret();
-                }
+            if wstatus != 0
+                && crate::uaccess::put_user::<Uaccess, i32>(wstatus, wait_status).is_err()
+            {
+                break KernelError::BadAddress.sysret();
+            }
+            // The child's and its children's CPU time (Linux
+            // getrusage(RUSAGE_BOTH))
+            if rusage != 0
+                && super::misc::put_rusage_times::<Uaccess>(rusage, utime, stime).is_err()
+            {
+                break KernelError::BadAddress.sysret();
             }
             break child_pid as i64;
         }

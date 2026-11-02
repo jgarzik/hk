@@ -3,6 +3,7 @@
 //! blocked in big reads at once must not exhaust kernel memory.
 
 use super::helpers::{print, print_num, println};
+use super::mm_life::{SI_FREERAM, SI_TOTALRAM, exhaust_ok, sysinfo_ram};
 use hk_syscall::{
     MAP_ANONYMOUS, MAP_PRIVATE, O_CREAT, O_RDWR, O_TRUNC, PROT_READ, PROT_WRITE, Timespec,
     sys_close, sys_exit, sys_fork, sys_mmap, sys_nanosleep, sys_open, sys_pipe, sys_pread64,
@@ -90,17 +91,6 @@ fn write_mb(fd: i64, mb: usize) -> i64 {
     done as i64
 }
 
-/// Free RAM in bytes (sysinfo)
-fn free_ram() -> u64 {
-    let mut si = [0u8; 112];
-    if hk_syscall::sys_sysinfo(si.as_mut_ptr()) != 0 {
-        return 0;
-    }
-    let free = u64::from_ne_bytes(si[40..48].try_into().unwrap());
-    let unit = u32::from_ne_bytes(si[104..108].try_into().unwrap()).max(1);
-    free * unit as u64
-}
-
 /// Directory every user may write in
 const RDIR: &[u8] = b"/ramfs_t\0";
 const RFILE: &[u8] = b"/ramfs_t/f\0";
@@ -140,11 +130,11 @@ fn test_ramfs_unlink() {
                 return 2;
             }
             if i == 0 {
-                base = free_ram();
+                base = sysinfo_ram(SI_FREERAM);
             }
         }
         // Allow some slack for unrelated allocations
-        if base > free_ram() + (8 * MB) as u64 {
+        if base > sysinfo_ram(SI_FREERAM) + (8 * MB) as u64 {
             return 3;
         }
         0
@@ -164,6 +154,9 @@ fn test_ramfs_unlink() {
 /// kernel; Linux's rootfs tmpfs is limited to half of RAM), the kernel
 /// keeps working, and deleting the file makes the space usable again
 fn test_ramfs_full() {
+    if !exhaust_ok(b"BIGIO_RAMFS_FULL") {
+        return;
+    }
     fn body() -> i32 {
         const ENOSPC: i64 = -28;
         let fd = sys_open(RFILE.as_ptr(), O_CREAT | O_RDWR | O_TRUNC, 0o644);
@@ -171,6 +164,8 @@ fn test_ramfs_full() {
             return 1;
         }
         let chunk = [0x5au8; 65536];
+        // More than all of RAM fitting means ramfs has no limit at all
+        let limit = sysinfo_ram(SI_TOTALRAM) + 256 * MB as u64;
         let mut total = 0u64;
         let err = loop {
             let n = sys_write(fd as u64, chunk.as_ptr(), chunk.len() as u64);
@@ -178,7 +173,7 @@ fn test_ramfs_full() {
                 break n;
             }
             total += n as u64;
-            if total > 1024 * MB as u64 {
+            if total > limit {
                 break 0;
             }
         };

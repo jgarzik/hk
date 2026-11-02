@@ -80,6 +80,11 @@ pub fn lookup_path_at(
 /// Child `name` of directory `parent`: the dcache, else the file system
 /// (the new dentry is cached). Permission is the caller's business.
 pub fn lookup_one(parent: &Arc<Dentry>, name: &str) -> Result<Arc<Dentry>, KernelError> {
+    // No file system here has longer names (Linux simple_lookup and the
+    // disk file systems' lookups: ENAMETOOLONG)
+    if name.len() > NAME_MAX {
+        return Err(KernelError::NameTooLong);
+    }
     if let Some(child) = parent.lookup_child(name) {
         return Ok(child);
     }
@@ -98,7 +103,13 @@ pub fn lookup_one(parent: &Arc<Dentry>, name: &str) -> Result<Arc<Dentry>, Kerne
 /// Path-walk lookup (Linux lookup_fast + lookup_slow): a dcache hit
 /// needs no lock; a miss asks the file system under the directory's
 /// shared inode lock, so it cannot race a create/unlink/rename there
+/// Longest name of one path component (Linux NAME_MAX)
+pub const NAME_MAX: usize = 255;
+
 fn lookup_slow(parent: &Arc<Dentry>, name: &str) -> Result<Arc<Dentry>, KernelError> {
+    if name.len() > NAME_MAX {
+        return Err(KernelError::NameTooLong);
+    }
     if let Some(child) = parent.lookup_child(name) {
         return Ok(child);
     }
@@ -237,10 +248,14 @@ pub fn delete_entry(parent: &Arc<Dentry>, name: &str, isdir: bool) -> Result<(),
         let inode = victim.get_inode().ok_or(KernelError::NotFound)?;
         super::dac::may_delete(&c, &dir, &inode, isdir)?;
         // The victim's lock, inside the parent's (Linux vfs_unlink /
-        // vfs_rmdir): its link count never drops under a link of it
+        // vfs_rmdir): its link count never drops under a link of it, and
+        // a mount on it (attach takes it too) is either seen here or
+        // refused for the dead directory
         inode.inode_lock();
-        let r = if isdir {
-            dir.i_op.rmdir(&dir, name)
+        let r = if super::mount::is_local_mountpoint(&victim) {
+            Err(KernelError::Busy)
+        } else if isdir {
+            dir.i_op.rmdir(&dir, name).inspect(|_| inode.set_dead())
         } else {
             dir.i_op.unlink(&dir, name)
         };

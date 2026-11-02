@@ -203,6 +203,20 @@ pub fn flush() {
 
 /// Write bytes to printk (internal) - must be called with OUTPUT_LOCK held
 fn printk_write_locked(bytes: &[u8]) {
+    crate::kmsg::log_text(bytes, OOPS_IN_PROGRESS.load(Ordering::Acquire));
+    console_write_locked(bytes);
+}
+
+/// A line written by user space (/dev/kmsg), already a log record: to
+/// the console the way printk output goes
+pub fn console_line(text: &[u8]) {
+    let _output = OUTPUT_LOCK.lock();
+    console_write_locked(text);
+    console_write_locked(b"\n");
+}
+
+/// The byte ring and the console (OUTPUT_LOCK held)
+fn console_write_locked(bytes: &[u8]) {
     // Buffer the message and get flushed state
     let should_write = {
         let mut state = PRINTK.lock();
@@ -304,6 +318,7 @@ impl Write for PrintkWriter {
             printk_write_locked(s.as_bytes());
         } else {
             // Panic path: couldn't get lock, write directly to serial
+            crate::kmsg::log_text(s.as_bytes(), true);
             direct_serial_write(s.as_bytes());
         }
         Ok(())

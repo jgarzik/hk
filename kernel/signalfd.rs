@@ -24,8 +24,6 @@
 
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
-use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::arch::IrqSpinlock;
 use crate::fs::KernelError;
@@ -34,8 +32,7 @@ use crate::fs::file::{File, FileOps, flags};
 use crate::fs::inode::{Inode, InodeMode, NULL_INODE_OPS, Timespec as InodeTimespec};
 use crate::poll::{POLLIN, POLLRDNORM, PollTable};
 use crate::signal::{SigSet, UNMASKABLE_SIGNALS, with_task_signal_state};
-use crate::task::Tid;
-use crate::waitqueue::WaitQueue;
+use crate::task::percpu::current_tid;
 
 /// Signalfd flags
 pub mod sfd_flags {
@@ -104,45 +101,24 @@ struct SignalfdInner {
     mask: SigSet,
 }
 
-/// Signalfd structure
+/// Signalfd structure: only a mask. Reads and polls see the signals of
+/// the task doing them (Linux signalfd_read / signalfd_poll on
+/// current), so after fork a child reads its own
 pub struct Signalfd {
     /// Inner state protected by IRQ spinlock
     inner: IrqSpinlock<SignalfdInner>,
-    /// Wait queue for blocking readers
-    wait_queue: WaitQueue,
-    /// Unique ID for this signalfd
-    id: u64,
-    /// Task ID that created this signalfd (for signal access)
-    owner_tid: Tid,
 }
-
-/// Global counter for signalfd IDs
-static NEXT_SIGNALFD_ID: AtomicU64 = AtomicU64::new(1);
-
-/// Global signalfd registry (maps ID -> weak ref)
-static SIGNALFD_REGISTRY: IrqSpinlock<Vec<(u64, Weak<Signalfd>)>> = IrqSpinlock::new(Vec::new());
 
 impl Signalfd {
     /// Create a new signalfd
-    pub fn new(mask: SigSet, tid: Tid) -> Arc<Self> {
-        let id = NEXT_SIGNALFD_ID.fetch_add(1, Ordering::Relaxed);
+    pub fn new(mask: SigSet) -> Arc<Self> {
         // Cannot monitor SIGKILL or SIGSTOP
         let filtered_mask = mask.subtract(&UNMASKABLE_SIGNALS);
-
-        let signalfd = Arc::new(Self {
+        Arc::new(Self {
             inner: IrqSpinlock::new(SignalfdInner {
                 mask: filtered_mask,
             }),
-            wait_queue: WaitQueue::new(),
-            id,
-            owner_tid: tid,
-        });
-
-        // Register in global registry for signal wake integration
-        let weak = Arc::downgrade(&signalfd);
-        SIGNALFD_REGISTRY.lock().push((id, weak));
-
-        signalfd
+        })
     }
 
     /// Update the signal mask (for signalfd reuse)
@@ -159,7 +135,7 @@ impl Signalfd {
     /// Check if any monitored signals are pending
     fn has_pending_signals(&self) -> bool {
         let mask = self.inner.lock().mask;
-        with_task_signal_state(self.owner_tid, |state| {
+        with_task_signal_state(current_tid(), |state| {
             let shared = state.shared_pending.lock();
             let pending = state.pending.signal.union(&shared.signal);
             pending.intersect(&mask).any()
@@ -170,7 +146,7 @@ impl Signalfd {
     /// Dequeue a pending signal that matches our mask
     fn dequeue_signal(&self) -> Option<u32> {
         let mask = self.inner.lock().mask;
-        with_task_signal_state(self.owner_tid, |state| {
+        with_task_signal_state(current_tid(), |state| {
             // First check private pending
             let deliverable = state.pending.signal.intersect(&mask);
             if let Some(sig) = deliverable.first() {
@@ -232,8 +208,13 @@ impl Signalfd {
                 return Err(KernelError::WouldBlock);
             }
 
-            // Wait for signals (a signal ends the wait)
-            self.wait_queue
+            // Wait on the caller's handler table for a matching signal
+            // (a signal ends the wait)
+            let Some(sighand) = crate::signal::get_task_sighand(current_tid()) else {
+                return Err(KernelError::WouldBlock);
+            };
+            sighand
+                .signalfd_wq
                 .wait_event_interruptible(|| self.has_pending_signals())?;
         }
     }
@@ -250,8 +231,14 @@ impl Signalfd {
 
     /// Poll for readiness
     pub fn poll(&self, pt: Option<&mut PollTable>) -> u16 {
-        if let Some(poll_table) = pt {
-            poll_table.poll_wait(&self.wait_queue);
+        // The caller's handler table, held by the poll for as long as it
+        // stays registered on its queue (Linux instead detaches pollers
+        // when it is freed, signalfd_cleanup)
+        if let Some(poll_table) = pt
+            && let Some(sighand) = crate::signal::get_task_sighand(current_tid())
+        {
+            poll_table.hold(sighand.clone());
+            poll_table.poll_wait(&sighand.signalfd_wq);
         }
 
         if self.has_pending_signals() {
@@ -259,17 +246,6 @@ impl Signalfd {
         } else {
             0
         }
-    }
-
-    /// Called when a matching signal is delivered to wake waiters
-    pub fn notify_signal(&self) {
-        self.wait_queue.wake_all();
-    }
-
-    /// Release the signalfd (unregister)
-    fn release(&self) {
-        let mut registry = SIGNALFD_REGISTRY.lock();
-        registry.retain(|(id, _)| *id != self.id);
     }
 }
 
@@ -300,12 +276,6 @@ impl FileOps for SignalfdFileOps {
         };
         signalfd.poll(pt)
     }
-
-    fn release(&self, file: &File) -> Result<(), KernelError> {
-        let signalfd = file.private_ref::<Signalfd>().ok_or(KernelError::BadFd)?;
-        signalfd.release();
-        Ok(())
-    }
 }
 
 /// Create a signalfd file
@@ -317,8 +287,7 @@ impl FileOps for SignalfdFileOps {
 /// # Returns
 /// Arc<File> for the new signalfd
 pub fn create_signalfd(mask: SigSet, sfd_flags: i32) -> Result<Arc<File>, KernelError> {
-    let tid = crate::task::percpu::current_tid();
-    let signalfd = Signalfd::new(mask, tid);
+    let signalfd = Signalfd::new(mask);
 
     // Create dummy dentry for signalfd
     let dentry = create_signalfd_dentry()?;
@@ -354,22 +323,4 @@ fn create_signalfd_dentry() -> Result<Arc<Dentry>, KernelError> {
 /// Get the Signalfd from a File (for syscall implementations)
 pub fn get_signalfd(file: &File) -> Option<Arc<Signalfd>> {
     file.private_arc::<Signalfd>()
-}
-
-/// Wake all signalfds that are interested in signal `sig` for task `tid`
-///
-/// Called from send_signal() when a signal is added to pending.
-pub fn wake_signalfds_for_signal(tid: Tid, sig: u32) {
-    let registry = SIGNALFD_REGISTRY.lock();
-    for (_, weak) in registry.iter() {
-        if let Some(signalfd) = weak.upgrade() {
-            // Only wake signalfds owned by this task that are monitoring this signal
-            if signalfd.owner_tid == tid {
-                let mask = signalfd.inner.lock().mask;
-                if mask.contains(sig) {
-                    signalfd.notify_signal();
-                }
-            }
-        }
-    }
 }

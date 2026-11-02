@@ -10,7 +10,8 @@ use super::helpers::{
 };
 use hk_syscall::{
     MADV_COLD, MADV_PAGEOUT, MAP_ANONYMOUS, MAP_PRIVATE, MREMAP_FIXED, MREMAP_MAYMOVE, PROT_READ,
-    PROT_WRITE, sys_exit, sys_fork, sys_madvise, sys_mmap, sys_mremap, sys_munmap, sys_wait4,
+    PROT_WRITE, sys_exit, sys_fork, sys_madvise, sys_mmap, sys_mprotect, sys_mremap, sys_munmap,
+    sys_wait4,
 };
 
 const MIB: u64 = 1024 * 1024;
@@ -226,6 +227,26 @@ fn wait_bounded(pid: i64, secs: u64) -> i32 {
     -1
 }
 
+/// After swapoff: a read of PROT_NONE `q` is SIGSEGV; made readable
+/// again it holds its data
+fn protnone_after_swapoff(q: u64) {
+    let pid = sys_fork();
+    if pid == 0 {
+        let v = unsafe { core::ptr::read_volatile(q as *const u64) };
+        sys_exit(if v == 0 { 3 } else { 4 });
+    }
+    let mut st = 0i32;
+    sys_wait4(pid, &mut st, 0, 0);
+    sys_mprotect(q, MIB, PROT_READ);
+    let bad = check(q, MIB, 4);
+    sys_munmap(q, MIB);
+    verdict(
+        b"SWAPOUT_SWAPOFF_PROTNONE",
+        st & 0x7f == 11 && bad.is_none(),
+        st as i64,
+    );
+}
+
 /// swapoff with pages out reads them all back
 fn swapoff_swapped(path: &[u8]) {
     let len = 4 * MIB;
@@ -235,9 +256,20 @@ fn swapoff_swapped(path: &[u8]) {
         return;
     }
     fill(p, len, 3);
+    // A PROT_NONE range swapped out stays inaccessible after swapoff
+    // reads it back (Linux unuse_pte: vma->vm_page_prot)
+    let q = map(MIB);
+    if q != 0 {
+        fill(q, MIB, 4);
+        sys_madvise(q, MIB, MADV_PAGEOUT);
+        sys_mprotect(q, MIB, 0);
+    }
     sys_madvise(p, len, MADV_PAGEOUT);
     let out = vmswap();
     let off = swap_off(path);
+    if q != 0 {
+        protnone_after_swapoff(q);
+    }
     let total = proc_kb(b"/proc/meminfo\0", b"SwapTotal:");
     let bad = check(p, len, 3);
     let ok = out >= (len / 1024) as i64 - TOL
