@@ -721,19 +721,13 @@ Found during T0 (2026-10-19). Tag = when to fix.
    `MM_LIFE_EXEC_CHAIN:FAIL -2`: both warmup chains passed, then the
    first measured one's child (busybox `env` x40 then `true`, i.e. 41
    execs in one process) exited nonzero. A failed exec, not a leak.
+   MM_LIFE now prints a failing child's wait status (exit code vs
+   signal); 16 eight-CPU arm64 stress boots did not repeat it.
 10. **Network test flake** (I):
    `SOCKCORE_CONNECT_REFUSED:FAIL SO_ERROR got 0` (hk arm64, 1 of 10
    `check-stress` boots: poll reported POLLOUT for a nonblocking
    connect to a just-closed loopback port, but no ECONNREFUSED was
    pending).
-13. **MM_LIFE_FORK_EXEC over its 128 kB tolerance at 8 CPUs** (next
-   batch): 1 of 20 `QEMU_SMP=8 make check-stress` boots (arm64, TCG)
-   lost 184 kB of MemFree+Slab over 500 fork+exec rounds, never at 4
-   CPUs. Suspects that scale with CPUs: the stack area's page tables
-   (never freed; more concurrent stacks reach higher slots) and frees
-   deferred until other CPUs switch. Find which, then fix it or scale
-   the tolerance with the CPU count.
-
 14. **SWAPOUT_PAGEOUT flaky on the Linux reference** (J): one x86
    `check-linux` run had free swap 364 kB off the expected value after
    MADV_PAGEOUT of 16 MiB (beyond the test's tolerance), passing on the
