@@ -1041,6 +1041,11 @@ pub struct Task<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::Phy
     pub last_run_ns: AtomicU64,
     /// In kernel mode (for the utime/stime split)
     pub in_kernel: AtomicBool,
+    /// Sequence count around changes of utime/stime/last_run_ns/in_kernel
+    /// (Linux seqcount, as vtime->seqcount): odd while one is under way.
+    /// Their only writer is the task's own CPU with interrupts off (its
+    /// syscalls, its switches, the tick), so readers on other CPUs retry
+    acct_seq: AtomicU32,
     /// Voluntary context switches (task yielded or slept)
     pub nvcsw: AtomicU64,
     /// Involuntary context switches (preempted by scheduler)
@@ -1565,6 +1570,7 @@ impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Tas
             stime: AtomicU64::new(0),
             last_run_ns: AtomicU64::new(now),
             in_kernel: AtomicBool::new(kind == TaskKind::KernelThread),
+            acct_seq: AtomicU32::new(0),
             nvcsw: AtomicU64::new(0),
             nivcsw: AtomicU64::new(0),
             min_flt: AtomicU64::new(0),
@@ -1620,6 +1626,7 @@ impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Tas
             stime: AtomicU64::new(0),
             last_run_ns: AtomicU64::new(0),
             in_kernel: AtomicBool::new(true),
+            acct_seq: AtomicU32::new(0),
             nvcsw: AtomicU64::new(0),
             nivcsw: AtomicU64::new(0),
             min_flt: AtomicU64::new(0),
@@ -1805,6 +1812,7 @@ impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Tas
     /// and start a new interval in `kernel` mode (the task itself: the
     /// only writer, so plain loads and stores suffice)
     pub fn account(&self, now: u64, kernel: bool) {
+        self.acct_begin();
         let delta = now.saturating_sub(self.last_run_ns.load(Ordering::Relaxed));
         let t = if self.in_kernel.load(Ordering::Relaxed) {
             &self.stime
@@ -1817,6 +1825,59 @@ impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Tas
         );
         self.last_run_ns.store(now, Ordering::Relaxed);
         self.in_kernel.store(kernel, Ordering::Relaxed);
+        self.acct_end();
+    }
+
+    /// Charge the time since the last accounting point to the mode the
+    /// task is in, staying in it (a context switch away, the tick)
+    pub fn account_now(&self, now: u64) {
+        self.account(now, self.in_kernel.load(Ordering::Relaxed));
+    }
+
+    /// The task starts running at `now`: the time it was off a CPU is
+    /// nobody's (Linux vtime_task_switch)
+    pub fn switch_in(&self, now: u64) {
+        self.acct_begin();
+        self.last_run_ns.store(now, Ordering::Relaxed);
+        self.acct_end();
+    }
+
+    fn acct_begin(&self) {
+        self.acct_seq.fetch_add(1, Ordering::Relaxed);
+        core::sync::atomic::fence(Ordering::Release);
+    }
+
+    fn acct_end(&self) {
+        self.acct_seq.fetch_add(1, Ordering::Release);
+    }
+
+    /// (utime, stime) at `now`, including the slice of a task running
+    /// on a CPU since its last accounting point (Linux task_cputime with
+    /// vtime_delta), consistent from any CPU
+    pub fn cputime(&self, now: u64) -> (u64, u64) {
+        loop {
+            let s1 = self.acct_seq.load(Ordering::Acquire);
+            if s1 & 1 != 0 {
+                core::hint::spin_loop();
+                continue;
+            }
+            let (mut u, mut s) = self.times();
+            let last = self.last_run_ns.load(Ordering::Relaxed);
+            let kernel = self.in_kernel.load(Ordering::Relaxed);
+            core::sync::atomic::fence(Ordering::Acquire);
+            if self.acct_seq.load(Ordering::Relaxed) != s1 {
+                continue;
+            }
+            if self.se.on_cpu() {
+                let d = now.saturating_sub(last);
+                if kernel {
+                    s += d;
+                } else {
+                    u += d;
+                }
+            }
+            return (u, s);
+        }
     }
 
     /// Start time (monotonic ns)

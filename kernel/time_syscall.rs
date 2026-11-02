@@ -161,7 +161,7 @@ fn cpu_clock_ns(pid: u64, thread: bool, which: u8, gettime: bool) -> Result<u64,
         if t.task.pid != percpu::current_pid() {
             return Err(KernelError::InvalidArgument);
         }
-        t.task.times()
+        t.task.cputime(crate::time::monotonic_ns())
     } else {
         // Linux pid_for_clock (gettime): pid 0, or the caller's own tid
         // from any thread, is its process

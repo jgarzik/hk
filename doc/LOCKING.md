@@ -804,7 +804,11 @@ A `Task` has five kinds of fields: fixed at creation (`tid`, `pid`,
 creator before it first runs) or under TASKLIST, and read lock-free
 by anyone (`flags` = Linux PF_*, `thread_flags` = TIF_*, `cpu`,
 `start_time`, `ppid`/`pgid`/`sid`, `seccomp_mode`, `tls`, utime/stime
-and the other counters); `cred` (below); the alloc_lock fields; and
+and the other counters; utime/stime/last_run_ns/in_kernel are written
+only on the task's own CPU with interrupts off (its syscall entry and
+exit, its context switches, the tick) inside the `acct_seq` sequence
+count, which readers on other CPUs retry on); `cred` (below); the
+alloc_lock fields; and
 the rest, `TaskInner`, in a `TableCell` that only the locked
 table's views reach (`GlobalTaskTable::get`/`iter` read it,
 `get_mut`/`iter_mut` write it with the table borrowed mutably; Linux

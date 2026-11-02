@@ -2729,6 +2729,13 @@ fn context_switch_locked(
     }
     // SAFETY: a task of this run queue, alive while it holds it
     let n = unsafe { &*next };
+    // The outgoing task's time up to now; the incoming one counts from
+    // now (its time off the CPU is nobody's)
+    let now = crate::time::monotonic_ns();
+    if prev.tid() != 0 {
+        prev.account_now(now);
+    }
+    n.switch_in(now);
     let (next_kstack, next_mm, (next_tls, next_gs)) = make_current(n);
     rq.curr = next;
     rq.prev = prev;
@@ -3481,6 +3488,11 @@ pub fn scheduler_tick() {
     // the CPU's rt runtime (`rt_tick`, `rt_period_tick`)
     let me = current();
     let now = crate::time::monotonic_ns();
+    // Its CPU time so far, so a task that never makes a syscall or
+    // switches is charged too (Linux account_process_tick)
+    if me.tid() != 0 {
+        me.account_now(now);
+    }
     let resched = match me.se.class() {
         Class::Stop => false,
         Class::Rt => {
@@ -3833,7 +3845,11 @@ pub fn lookup_task_rt_priority(pid: Pid) -> Option<i32> {
 /// Returns (0, 0) if the task is not found.
 pub fn get_task_times(tid: Tid) -> (u64, u64) {
     let table = TASKLIST.read();
-    table.get(tid).map(|t| t.task.times()).unwrap_or((0, 0))
+    let now = crate::time::monotonic_ns();
+    table
+        .get(tid)
+        .map(|t| t.task.cputime(now))
+        .unwrap_or((0, 0))
 }
 
 /// Get aggregate CPU times for a process (all threads)
@@ -3841,11 +3857,12 @@ pub fn get_task_times(tid: Tid) -> (u64, u64) {
 /// Returns (utime_ns, stime_ns) summed across all threads in the process.
 /// Returns (0, 0) if no threads are found.
 pub fn get_process_times(pid: Pid) -> (u64, u64) {
+    let now = crate::time::monotonic_ns();
     let table = TASKLIST.read();
     let mut utime = 0u64;
     let mut stime = 0u64;
     for task in table.threads(pid) {
-        let (u, s) = task.task.times();
+        let (u, s) = task.task.cputime(now);
         utime = utime.saturating_add(u);
         stime = stime.saturating_add(s);
     }
@@ -3865,7 +3882,10 @@ pub fn account_syscall_exit() {
 fn account_current(kernel: bool) {
     let me = current();
     if me.tid() != 0 {
+        // Interrupts off: the tick charges this task too (acct_seq)
+        let irq = crate::arch::local_irq_save();
         me.account(crate::time::monotonic_ns(), kernel);
+        crate::arch::local_irq_restore(irq);
     }
 }
 
