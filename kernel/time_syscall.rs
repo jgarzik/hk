@@ -123,8 +123,18 @@ impl PosixClock {
             Self::RealtimeCoarse => coarse(read(ClockId::Realtime)),
             Self::MonotonicCoarse => coarse(read(ClockId::Monotonic)),
             Self::Tai => read(ClockId::Realtime) + tai_offset_ns(),
-            Self::Cpu { pid, thread, which } => cpu_clock_ns(pid, thread, which)? as i128,
+            Self::Cpu { pid, thread, which } => cpu_clock_ns(pid, thread, which, true)? as i128,
         })
+    }
+
+    /// The clock exists for clock_getres (Linux posix_cpu_clock_getres:
+    /// lookup_task without gettime, so a process clock needs a group
+    /// leader's pid, not the caller's own tid)
+    pub fn getres_ok(self) -> bool {
+        match self {
+            Self::Cpu { pid, thread, which } => cpu_clock_ns(pid, thread, which, false).is_ok(),
+            _ => self.now_ns().is_ok(),
+        }
     }
 }
 
@@ -135,8 +145,9 @@ fn tai_offset_ns() -> i128 {
 
 /// A CPU clock's time (Linux posix_cpu_clock_get / lookup_task): a
 /// thread clock only for the caller's thread group, a process clock
-/// only for a thread group leader or the caller's own tid
-fn cpu_clock_ns(pid: u64, thread: bool, which: u8) -> Result<u64, KernelError> {
+/// only for a thread group leader, or (`gettime`: clock_gettime) the
+/// caller's own tid
+fn cpu_clock_ns(pid: u64, thread: bool, which: u8, gettime: bool) -> Result<u64, KernelError> {
     use crate::task::percpu;
     let me = percpu::current_tid();
     let (utime, stime) = if thread {
@@ -154,7 +165,7 @@ fn cpu_clock_ns(pid: u64, thread: bool, which: u8) -> Result<u64, KernelError> {
     } else {
         // Linux pid_for_clock (gettime): pid 0, or the caller's own tid
         // from any thread, is its process
-        let tgid = if pid == 0 || pid == me {
+        let tgid = if pid == 0 || (gettime && pid == me) {
             percpu::current_pid()
         } else {
             let table = percpu::TASKLIST.read();
@@ -379,7 +390,7 @@ pub fn sys_clock_getres(clockid: i32, res: u64) -> i64 {
     // Validate clock ID first (even if res is NULL per POSIX); a CPU
     // clock's task must exist
     let pclock = match PosixClock::decode(clockid) {
-        Some(c) if c.now_ns().is_ok() => c,
+        Some(c) if c.getres_ok() => c,
         _ => return KernelError::InvalidArgument.sysret(),
     };
 

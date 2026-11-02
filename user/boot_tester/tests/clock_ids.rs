@@ -190,8 +190,16 @@ static mut OWN_STACK: ThreadStack = ThreadStack([0; 16384]);
 static mut OWN_CTID: u32 = 0;
 
 extern "C" fn own_tid_thread(_: u64) -> ! {
-    let r = match now(cpuclock(hk_syscall::sys_gettid(), false)) {
-        Ok(_) => 0,
+    let clock = cpuclock(hk_syscall::sys_gettid(), false);
+    let mut res = Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // clock_gettime maps the own tid to the process; clock_getres does
+    // not (Linux lookup_task without gettime): EINVAL
+    let r = match now(clock) {
+        Ok(_) if sys_clock_getres(clock, &mut res) == EINVAL => 0,
+        Ok(_) => -2000,
         Err(e) => e,
     };
     OWN_TID_RESULT.store(r, core::sync::atomic::Ordering::Relaxed);
@@ -199,7 +207,8 @@ extern "C" fn own_tid_thread(_: u64) -> ! {
 }
 
 /// A second thread reads the process clock named by its own tid (Linux
-/// pid_for_clock maps it to the process); 0 or the errno
+/// pid_for_clock maps it to the process) and clock_getres of it is
+/// EINVAL; 0, the errno, or -2000 if getres accepted it
 fn own_tid_clock() -> i64 {
     unsafe {
         let top = (&raw mut OWN_STACK as *mut u8).add(16384) as u64;
