@@ -54,6 +54,23 @@ pub struct SysInfo {
     /// empty on 64-bit; this covers the struct alignment tail). Always zero.
     pub _f: u32,
 }
+crate::pod!(SysInfo {
+    uptime,
+    loads,
+    totalram,
+    freeram,
+    sharedram,
+    bufferram,
+    totalswap,
+    freeswap,
+    procs,
+    pad,
+    _pad2,
+    totalhigh,
+    freehigh,
+    mem_unit,
+    _f
+});
 
 // Compile-time assertion that SysInfo is 112 bytes (matches Linux and userspace)
 const _: () = assert!(core::mem::size_of::<SysInfo>() == 112);
@@ -89,6 +106,7 @@ pub struct Timeval {
     /// Microseconds
     pub tv_usec: i64,
 }
+crate::pod!(Timeval { tv_sec, tv_usec });
 
 /// Linux rusage structure (144 bytes)
 ///
@@ -130,6 +148,24 @@ pub struct Rusage {
     /// Involuntary context switches
     pub ru_nivcsw: i64,
 }
+crate::pod!(Rusage {
+    ru_utime,
+    ru_stime,
+    ru_maxrss,
+    ru_ixrss,
+    ru_idrss,
+    ru_isrss,
+    ru_minflt,
+    ru_majflt,
+    ru_nswap,
+    ru_inblock,
+    ru_oublock,
+    ru_msgsnd,
+    ru_msgrcv,
+    ru_nsignals,
+    ru_nvcsw,
+    ru_nivcsw
+});
 
 // Compile-time assertion that Rusage is 144 bytes (matches Linux)
 const _: () = assert!(core::mem::size_of::<Rusage>() == 144);
@@ -241,6 +277,12 @@ struct Tms {
     tms_cutime: i64,
     tms_cstime: i64,
 }
+crate::pod!(Tms {
+    tms_utime,
+    tms_stime,
+    tms_cutime,
+    tms_cstime
+});
 
 fn ns_to_clock_t(ns: u64) -> i64 {
     crate::time::ns_to_clock_t(ns) as i64

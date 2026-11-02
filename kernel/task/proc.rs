@@ -276,6 +276,15 @@ pub struct SigInfo {
     /// Exit status or signal number
     pub si_status: i32,
 }
+crate::pod!(SigInfo {
+    si_signo,
+    si_errno,
+    si_code,
+    _pad0,
+    si_pid,
+    si_uid,
+    si_status
+});
 
 // Signal codes for SIGCHLD
 const CLD_EXITED: i32 = 1; // Child has exited

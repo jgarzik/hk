@@ -729,6 +729,7 @@ pub fn sys_vmsplice(fd: i32, iov: u64, nr_segs: usize, flags: u32) -> i64 {
         base: u64,
         len: u64,
     }
+    crate::pod!(IoVec { base, len });
 
     let iov_size = core::mem::size_of::<IoVec>();
     let mut total = 0usize;

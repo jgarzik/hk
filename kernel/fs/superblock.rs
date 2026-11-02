@@ -108,6 +108,20 @@ pub struct LinuxStatFs {
     /// Padding for future use
     pub f_spare: [i64; 4],
 }
+crate::pod!(LinuxStatFs {
+    f_type,
+    f_bsize,
+    f_blocks,
+    f_bfree,
+    f_bavail,
+    f_files,
+    f_ffree,
+    f_fsid,
+    f_namelen,
+    f_frsize,
+    f_flags,
+    f_spare
+});
 
 impl StatFs {
     /// Convert internal StatFs to Linux ABI format

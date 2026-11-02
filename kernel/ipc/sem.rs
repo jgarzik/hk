@@ -325,6 +325,7 @@ struct SemTimespec {
     tv_sec: i64,
     tv_nsec: i64,
 }
+crate::pod!(SemTimespec { tv_sec, tv_nsec });
 
 fn do_semtimedop(semid: i32, sops_ptr: u64, nsops: usize, timeout_ptr: u64) -> Result<i32, i32> {
     let ns = current_ipc_ns();

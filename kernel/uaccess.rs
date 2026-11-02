@@ -20,7 +20,10 @@
 
 extern crate alloc;
 
+use core::mem::MaybeUninit;
 use core::sync::atomic::Ordering;
+
+use crate::pod::{FromBytes, IntoBytes};
 
 /// Linux pagefault_disable: until `pagefault_enable`, a user access that
 /// faults is not resolved (no sleeping fault-in) but fails at once
@@ -266,7 +269,7 @@ pub fn copy_from_user_atomic<A: UaccessArch>(
 /// * `Ok(())` on success
 /// * `Err(UaccessError::BadAddress)` if user address is invalid
 #[track_caller]
-pub fn put_user<A: UaccessArch, T: Copy>(to: u64, value: T) -> UaccessResult<()> {
+pub fn put_user<A: UaccessArch, T: IntoBytes>(to: u64, value: T) -> UaccessResult<()> {
     might_fault();
     let size = ::core::mem::size_of::<T>();
 
@@ -281,9 +284,12 @@ pub fn put_user<A: UaccessArch, T: Copy>(to: u64, value: T) -> UaccessResult<()>
     }
 
     // Perform the write with SMAP protection disabled
+    let src = value.as_bytes();
+    // SAFETY: `to` passed access_ok for `size` bytes (a fault is caught
+    // and counted); `src` is the value's `size` initialized bytes
     let left = unsafe {
         A::user_access_begin();
-        let left = A::copy_user_raw(to as *mut u8, &value as *const T as *const u8, size);
+        let left = A::copy_user_raw(to as *mut u8, src.as_ptr(), size);
         A::user_access_end();
         left
     };
@@ -305,7 +311,7 @@ pub fn put_user<A: UaccessArch, T: Copy>(to: u64, value: T) -> UaccessResult<()>
 /// * `Ok(value)` on success
 /// * `Err(UaccessError::BadAddress)` if user address is invalid
 #[track_caller]
-pub fn get_user<A: UaccessArch, T: Copy + Default>(from: u64) -> UaccessResult<T> {
+pub fn get_user<A: UaccessArch, T: FromBytes>(from: u64) -> UaccessResult<T> {
     might_fault();
     let size = ::core::mem::size_of::<T>();
 
@@ -320,10 +326,12 @@ pub fn get_user<A: UaccessArch, T: Copy + Default>(from: u64) -> UaccessResult<T
     }
 
     // Perform the read with SMAP protection disabled
-    let mut value = T::default();
+    let mut value = MaybeUninit::<T>::zeroed();
+    // SAFETY: `from` passed access_ok for `size` bytes (a fault is caught
+    // and counted); the destination is `value`'s `size` bytes
     let left = unsafe {
         A::user_access_begin();
-        let left = A::copy_user_raw(&mut value as *mut T as *mut u8, from as *const u8, size);
+        let left = A::copy_user_raw(value.as_mut_ptr().cast::<u8>(), from as *const u8, size);
         A::user_access_end();
         left
     };
@@ -331,30 +339,27 @@ pub fn get_user<A: UaccessArch, T: Copy + Default>(from: u64) -> UaccessResult<T
     if left != 0 {
         return Err(UaccessError::Fault);
     }
-    Ok(value)
+    // SAFETY: every byte is set (zeroed, then copied over), and any bit
+    // pattern is a valid T (FromBytes)
+    Ok(unsafe { value.assume_init() })
 }
 
 /// Copy a plain-data value from user space (no alignment requirement,
-/// unlike [`get_user`]); for user structs such as `struct timespec[2]`.
-///
-/// `T` must be valid for any bit pattern (repr(C) integer fields).
-pub fn copy_val_from_user<A: UaccessArch, T: Copy + Default>(from: u64) -> UaccessResult<T> {
-    let mut value = T::default();
+/// unlike [`get_user`]); for user structs such as `struct timespec[2]`
+pub fn copy_val_from_user<A: UaccessArch, T: FromBytes>(from: u64) -> UaccessResult<T> {
+    let mut value = MaybeUninit::<T>::zeroed();
     let size = ::core::mem::size_of::<T>();
-    // SAFETY: the byte view covers exactly `value`; T is plain data.
-    let bytes = unsafe { ::core::slice::from_raw_parts_mut(&mut value as *mut T as *mut u8, size) };
+    // SAFETY: `value`'s own bytes, all initialized (zeroed)
+    let bytes = unsafe { ::core::slice::from_raw_parts_mut(value.as_mut_ptr().cast::<u8>(), size) };
     copy_from_user::<A>(bytes, from, size)?;
-    Ok(value)
+    // SAFETY: any bit pattern is a valid T (FromBytes)
+    Ok(unsafe { value.assume_init() })
 }
 
 /// Copy a plain-data value to user space (no alignment requirement, unlike
-/// [`put_user`]). `T` must have no implicit padding (it would leak kernel
-/// stack bytes).
-pub fn copy_val_to_user<A: UaccessArch, T: Copy>(to: u64, value: &T) -> UaccessResult<()> {
-    let size = ::core::mem::size_of::<T>();
-    // SAFETY: the byte view covers exactly `*value`.
-    let bytes = unsafe { ::core::slice::from_raw_parts(value as *const T as *const u8, size) };
-    copy_to_user::<A>(to, bytes)?;
+/// [`put_user`]); `T` has no padding, which would leak kernel stack bytes
+pub fn copy_val_to_user<A: UaccessArch, T: IntoBytes>(to: u64, value: &T) -> UaccessResult<()> {
+    copy_to_user::<A>(to, value.as_bytes())?;
     Ok(())
 }
 
@@ -376,47 +381,14 @@ pub fn strncpy_from_user<A: UaccessArch>(
     max_len: usize,
 ) -> UaccessResult<alloc::string::String> {
     might_fault();
-    use alloc::string::String;
-
-    // Validate initial address (we'll check byte by byte)
-    if !A::access_ok(from, 1) {
-        return Err(UaccessError::BadAddress);
-    }
-
-    let mut result = String::new();
-    let mut ptr = from;
-
-    unsafe {
-        A::user_access_begin();
-
-        for _ in 0..max_len {
-            // Check each byte is in valid user space
-            if !A::access_ok(ptr, 1) {
-                A::user_access_end();
-                return Err(UaccessError::BadAddress);
-            }
-
-            let mut byte = 0u8;
-            if A::copy_user_raw(&mut byte, ptr as *const u8, 1) != 0 {
-                A::user_access_end();
-                return Err(UaccessError::Fault);
-            }
-            if byte == 0 {
-                break;
-            }
-            result.push(byte as char);
-            ptr += 1;
-        }
-
-        A::user_access_end();
-    }
-
-    // If we hit max_len without finding null, it's an overflow
-    if result.len() == max_len {
-        return Err(UaccessError::Overflow);
-    }
-
-    Ok(result)
+    let bytes = strndup_user_bytes::<A>(from, max_len)?;
+    // Names are bytes on Linux; hk's VFS still holds Strings. Valid
+    // UTF-8 is kept as is, anything else byte for byte as Latin-1 (the
+    // VFS names are byte strings in a later chunk)
+    Ok(match alloc::string::String::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(e) => e.into_bytes().iter().map(|&b| b as char).collect(),
+    })
 }
 
 /// Copy a NUL-terminated byte string from user space (Linux

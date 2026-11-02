@@ -196,6 +196,17 @@ pub struct SqRingOffsets {
     pub resv1: u32,
     pub user_addr: u64,
 }
+crate::pod!(SqRingOffsets {
+    head,
+    tail,
+    ring_mask,
+    ring_entries,
+    flags,
+    dropped,
+    array,
+    resv1,
+    user_addr
+});
 
 /// CQ ring offsets (returned in io_uring_params)
 #[repr(C)]
@@ -211,6 +222,17 @@ pub struct CqRingOffsets {
     pub resv1: u32,
     pub user_addr: u64,
 }
+crate::pod!(CqRingOffsets {
+    head,
+    tail,
+    ring_mask,
+    ring_entries,
+    overflow,
+    cqes,
+    flags,
+    resv1,
+    user_addr
+});
 
 /// io_uring_params structure passed to io_uring_setup (248 bytes)
 #[repr(C)]
@@ -227,6 +249,18 @@ pub struct IoUringParams {
     pub sq_off: SqRingOffsets,
     pub cq_off: CqRingOffsets,
 }
+crate::pod!(IoUringParams {
+    sq_entries,
+    cq_entries,
+    flags,
+    sq_thread_cpu,
+    sq_thread_idle,
+    features,
+    wq_fd,
+    resv,
+    sq_off,
+    cq_off
+});
 
 /// Submission queue entry (64 bytes)
 #[repr(C)]

@@ -423,6 +423,7 @@ pub struct SchedParam {
     /// Scheduling priority (1-99 for SCHED_FIFO/RR, 0 for SCHED_NORMAL)
     pub sched_priority: i32,
 }
+crate::pod!(SchedParam { sched_priority });
 
 /// Check if a scheduling policy is real-time
 pub fn is_rt_policy(policy: i32) -> bool {
@@ -2147,6 +2148,7 @@ pub struct CapUserHeader {
     pub version: u32,
     pub pid: i32,
 }
+crate::pod!(CapUserHeader { version, pid });
 
 /// User-space capability data (for syscall ABI)
 ///
@@ -2159,6 +2161,11 @@ pub struct CapUserData {
     pub permitted: u32,
     pub inheritable: u32,
 }
+crate::pod!(CapUserData {
+    effective,
+    permitted,
+    inheritable
+});
 
 /// Check if a capability number is valid
 #[inline]

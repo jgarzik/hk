@@ -55,22 +55,6 @@ pub mod timer_flags {
     pub const TIMER_ABSTIME: i32 = 1;
 }
 
-/// union sigval (Linux ABI compatible)
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub union SigVal {
-    /// Integer value
-    pub sival_int: i32,
-    /// Pointer value (as u64)
-    pub sival_ptr: u64,
-}
-
-impl Default for SigVal {
-    fn default() -> Self {
-        Self { sival_int: 0 }
-    }
-}
-
 /// struct sigevent (Linux ABI compatible)
 ///
 /// Note: Linux sigevent is 64 bytes with padding. We use the minimal
@@ -78,8 +62,9 @@ impl Default for SigVal {
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct SigEvent {
-    /// Data passed with notification
-    pub sigev_value: SigVal,
+    /// Data passed with notification (union sigval: an int or a
+    /// pointer, its 8 bytes)
+    pub sigev_value: u64,
     /// Signal number (for SIGEV_SIGNAL)
     pub sigev_signo: i32,
     /// Notification method (SIGEV_SIGNAL, SIGEV_NONE, etc.)
@@ -89,11 +74,18 @@ pub struct SigEvent {
     /// Padding to match Linux sigevent size (64 bytes)
     pub _pad: [i32; 11],
 }
+crate::pod!(SigEvent {
+    sigev_value,
+    sigev_signo,
+    sigev_notify,
+    sigev_notify_thread_id,
+    _pad
+});
 
 impl Default for SigEvent {
     fn default() -> Self {
         Self {
-            sigev_value: SigVal::default(),
+            sigev_value: 0,
             sigev_signo: SIGALRM as i32,
             sigev_notify: sigev_notify::SIGEV_SIGNAL,
             sigev_notify_thread_id: 0,
@@ -913,6 +905,10 @@ struct ITimerVal {
     it_interval: crate::time_syscall::Timeval,
     it_value: crate::time_syscall::Timeval,
 }
+crate::pod!(ITimerVal {
+    it_interval,
+    it_value
+});
 
 /// The current task's ITIMER_REAL timer, created on first use
 fn itimer_real() -> Arc<PosixTimer> {

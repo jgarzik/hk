@@ -281,6 +281,11 @@ pub struct StatxTimestamp {
     /// Reserved for future use
     pub __reserved: i32,
 }
+crate::pod!(StatxTimestamp {
+    tv_sec,
+    tv_nsec,
+    __reserved
+});
 
 /// Extended file status structure (256 bytes)
 ///
@@ -351,6 +356,39 @@ pub struct Statx {
     /// Reserved for future use
     pub __spare3: [u64; 8],
 }
+crate::pod!(Statx {
+    stx_mask,
+    stx_blksize,
+    stx_attributes,
+    stx_nlink,
+    stx_uid,
+    stx_gid,
+    stx_mode,
+    __spare0,
+    stx_ino,
+    stx_size,
+    stx_blocks,
+    stx_attributes_mask,
+    stx_atime,
+    stx_btime,
+    stx_ctime,
+    stx_mtime,
+    stx_rdev_major,
+    stx_rdev_minor,
+    stx_dev_major,
+    stx_dev_minor,
+    stx_mnt_id,
+    stx_dio_mem_align,
+    stx_dio_offset_align,
+    stx_subvol,
+    stx_atomic_write_unit_min,
+    stx_atomic_write_unit_max,
+    stx_atomic_write_segments_max,
+    stx_dio_read_offset_align,
+    stx_atomic_write_unit_max_opt,
+    __spare2,
+    __spare3
+});
 
 // STATX mask bits - what fields caller wants / kernel provided
 /// Want/got stx_mode & S_IFMT

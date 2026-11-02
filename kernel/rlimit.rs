@@ -85,6 +85,7 @@ pub struct RLimit {
     /// Hard limit (maximum allowed)
     pub rlim_max: u64,
 }
+crate::pod!(RLimit { rlim_cur, rlim_max });
 
 impl RLimit {
     /// Unlimited resource limit

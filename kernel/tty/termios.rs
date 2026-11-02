@@ -30,6 +30,14 @@ pub struct Termios {
     /// Control characters
     pub c_cc: [u8; NCCS],
 }
+crate::pod!(Termios {
+    c_iflag,
+    c_oflag,
+    c_cflag,
+    c_lflag,
+    c_line,
+    c_cc
+});
 
 impl Termios {
     /// Create default termios settings (raw mode)
@@ -111,6 +119,12 @@ pub struct Winsize {
     /// Vertical pixels (unused)
     pub ws_ypixel: u16,
 }
+crate::pod!(Winsize {
+    ws_row,
+    ws_col,
+    ws_xpixel,
+    ws_ypixel
+});
 
 impl Winsize {
     /// Default 80x25 terminal size

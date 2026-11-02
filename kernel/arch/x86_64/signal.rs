@@ -27,7 +27,7 @@ use crate::uaccess::{UaccessArch, copy_from_user, copy_to_user};
 /// This is the saved register state from when the signal was delivered.
 /// The signal handler can read/modify this to affect the return state.
 #[repr(C)]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Copy)]
 pub struct SigContext {
     pub r8: u64,
     pub r9: u64,
@@ -59,6 +59,36 @@ pub struct SigContext {
     pub fpstate: u64,
     pub reserved: [u64; 8],
 }
+crate::pod!(SigContext {
+    r8,
+    r9,
+    r10,
+    r11,
+    r12,
+    r13,
+    r14,
+    r15,
+    rdi,
+    rsi,
+    rbp,
+    rbx,
+    rdx,
+    rax,
+    rcx,
+    rsp,
+    rip,
+    eflags,
+    cs,
+    gs,
+    fs,
+    ss,
+    err,
+    trapno,
+    oldmask,
+    cr2,
+    fpstate,
+    reserved
+});
 
 // =============================================================================
 // Stack Info (stack_t)

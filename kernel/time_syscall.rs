@@ -227,6 +227,7 @@ pub struct LinuxTimespec {
     pub tv_sec: i64,
     pub tv_nsec: i64,
 }
+crate::pod!(LinuxTimespec { tv_sec, tv_nsec });
 
 /// Linux timeval structure (gettimeofday, itimerval)
 #[repr(C)]
@@ -235,6 +236,7 @@ pub struct Timeval {
     pub tv_sec: i64,
     pub tv_usec: i64,
 }
+crate::pod!(Timeval { tv_sec, tv_usec });
 
 /// Linux timezone structure for gettimeofday (deprecated, usually ignored)
 #[repr(C)]
@@ -243,6 +245,10 @@ pub struct Timezone {
     pub tz_minuteswest: i32,
     pub tz_dsttime: i32,
 }
+crate::pod!(Timezone {
+    tz_minuteswest,
+    tz_dsttime
+});
 
 /// sys_clock_gettime - get time from specified clock
 ///
@@ -858,6 +864,7 @@ pub struct TimexTimeval {
     pub tv_sec: i64,
     pub tv_usec: i64,
 }
+crate::pod!(TimexTimeval { tv_sec, tv_usec });
 
 /// Linux __kernel_timex structure for adjtimex syscall
 #[repr(C)]
@@ -909,6 +916,32 @@ pub struct Timex {
     /// Padding for 11 more i32 fields
     _reserved: [i32; 11],
 }
+crate::pod!(Timex {
+    modes,
+    _pad1,
+    offset,
+    freq,
+    maxerror,
+    esterror,
+    status,
+    _pad2,
+    constant,
+    precision,
+    tolerance,
+    time,
+    tick,
+    ppsfreq,
+    jitter,
+    shift,
+    _pad3,
+    stabil,
+    jitcnt,
+    calcnt,
+    errcnt,
+    stbcnt,
+    tai,
+    _reserved
+});
 
 impl Default for Timex {
     fn default() -> Self {

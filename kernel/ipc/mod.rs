@@ -212,6 +212,20 @@ pub struct Ipc64Perm {
     pub __unused1: u64,
     pub __unused2: u64,
 }
+crate::pod!(Ipc64Perm {
+    key,
+    uid,
+    gid,
+    cuid,
+    cgid,
+    mode,
+    __pad1,
+    seq,
+    __pad2,
+    __pad3,
+    __unused1,
+    __unused2
+});
 
 const _: () = assert!(core::mem::size_of::<Ipc64Perm>() == 48);
 
@@ -230,6 +244,18 @@ pub struct Shmid64Ds {
     pub __unused4: u64,
     pub __unused5: u64,
 }
+crate::pod!(Shmid64Ds {
+    shm_perm,
+    shm_segsz,
+    shm_atime,
+    shm_dtime,
+    shm_ctime,
+    shm_cpid,
+    shm_lpid,
+    shm_nattch,
+    __unused4,
+    __unused5
+});
 
 /// Semaphore array descriptor (64-bit version; layout differs per arch)
 pub use crate::arch::uapi::Semid64Ds;
@@ -250,6 +276,19 @@ pub struct Msqid64Ds {
     pub __unused4: u64,
     pub __unused5: u64,
 }
+crate::pod!(Msqid64Ds {
+    msg_perm,
+    msg_stime,
+    msg_rtime,
+    msg_ctime,
+    msg_cbytes,
+    msg_qnum,
+    msg_qbytes,
+    msg_lspid,
+    msg_lrpid,
+    __unused4,
+    __unused5
+});
 
 /// Semaphore operation buffer
 #[repr(C)]
@@ -259,6 +298,11 @@ pub struct Sembuf {
     pub sem_op: i16,
     pub sem_flg: i16,
 }
+crate::pod!(Sembuf {
+    sem_num,
+    sem_op,
+    sem_flg
+});
 
 // ============================================================================
 // Helper to get current IPC namespace

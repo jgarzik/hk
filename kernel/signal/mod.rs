@@ -113,6 +113,11 @@ pub const NSIG: u32 = 64;
 #[repr(transparent)]
 pub struct SigSet(pub u64);
 
+// SAFETY: repr(transparent) over a u64: any bits valid, no padding
+unsafe impl crate::pod::FromBytes for SigSet {}
+// SAFETY: as above
+unsafe impl crate::pod::IntoBytes for SigSet {}
+
 impl SigSet {
     /// Empty signal set (no signals)
     pub const EMPTY: Self = Self(0);

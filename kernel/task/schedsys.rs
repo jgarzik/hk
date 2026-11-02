@@ -652,6 +652,7 @@ pub fn sys_sched_rr_get_interval<A: crate::uaccess::UaccessArch>(pid: i64, tp_pt
         tv_sec: i64,
         tv_nsec: i64,
     }
+    crate::pod!(Timespec { tv_sec, tv_nsec });
 
     // pid < 0 is invalid
     if pid < 0 {

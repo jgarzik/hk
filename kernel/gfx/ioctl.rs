@@ -147,6 +147,18 @@ pub struct GfxVersion {
     pub desc_len: u64,
     pub desc: u64, // pointer
 }
+crate::pod!(GfxVersion {
+    version_major,
+    version_minor,
+    version_patchlevel,
+    _pad0,
+    name_len,
+    name,
+    date_len,
+    date,
+    desc_len,
+    desc
+});
 
 const _: () = assert!(core::mem::size_of::<GfxVersion>() == 64);
 
@@ -157,6 +169,7 @@ pub struct GfxGetCap {
     pub capability: u64,
     pub value: u64,
 }
+crate::pod!(GfxGetCap { capability, value });
 
 /// Mode info structure (matches Linux gfx_mode_modeinfo)
 #[repr(C)]
@@ -178,6 +191,23 @@ pub struct GfxModeModeinfo {
     pub type_: u32,
     pub name: [u8; 32],
 }
+crate::pod!(GfxModeModeinfo {
+    clock,
+    hdisplay,
+    hsync_start,
+    hsync_end,
+    htotal,
+    hskew,
+    vdisplay,
+    vsync_start,
+    vsync_end,
+    vtotal,
+    vscan,
+    vrefresh,
+    flags,
+    type_,
+    name
+});
 
 impl From<&GfxModeInfo> for GfxModeModeinfo {
     fn from(m: &GfxModeInfo) -> Self {
@@ -223,6 +253,20 @@ pub struct GfxModeCardRes {
     pub min_height: u32,
     pub max_height: u32,
 }
+crate::pod!(GfxModeCardRes {
+    fb_id_ptr,
+    crtc_id_ptr,
+    connector_id_ptr,
+    encoder_id_ptr,
+    count_fbs,
+    count_crtcs,
+    count_connectors,
+    count_encoders,
+    min_width,
+    max_width,
+    min_height,
+    max_height
+});
 
 /// Mode CRTC structure
 #[repr(C)]
@@ -238,6 +282,17 @@ pub struct GfxModeCrtc {
     pub mode_valid: u32,
     pub mode: GfxModeModeinfo,
 }
+crate::pod!(GfxModeCrtc {
+    set_connectors_ptr,
+    count_connectors,
+    crtc_id,
+    fb_id,
+    x,
+    y,
+    gamma_size,
+    mode_valid,
+    mode
+});
 
 /// Mode get encoder structure
 #[repr(C)]
@@ -249,6 +304,13 @@ pub struct GfxModeGetEncoder {
     pub possible_crtcs: u32,
     pub possible_clones: u32,
 }
+crate::pod!(GfxModeGetEncoder {
+    encoder_id,
+    encoder_type,
+    crtc_id,
+    possible_crtcs,
+    possible_clones
+});
 
 /// Mode get connector structure
 #[repr(C)]
@@ -271,6 +333,24 @@ pub struct GfxModeGetConnector {
     pub subpixel: u32,
     pub pad: u32,
 }
+crate::pod!(GfxModeGetConnector {
+    encoders_ptr,
+    modes_ptr,
+    props_ptr,
+    prop_values_ptr,
+    count_modes,
+    count_props,
+    count_encoders,
+    encoder_id,
+    connector_id,
+    connector_type,
+    connector_type_id,
+    connection,
+    mm_width,
+    mm_height,
+    subpixel,
+    pad
+});
 
 /// Framebuffer command structure
 #[repr(C)]
@@ -284,6 +364,15 @@ pub struct GfxModeFbCmd {
     pub depth: u32,
     pub handle: u32,
 }
+crate::pod!(GfxModeFbCmd {
+    fb_id,
+    width,
+    height,
+    pitch,
+    bpp,
+    depth,
+    handle
+});
 
 /// Create dumb buffer structure
 #[repr(C)]
@@ -297,6 +386,15 @@ pub struct GfxModeCreateDumb {
     pub pitch: u32,
     pub size: u64,
 }
+crate::pod!(GfxModeCreateDumb {
+    height,
+    width,
+    bpp,
+    flags,
+    handle,
+    pitch,
+    size
+});
 
 /// Map dumb buffer structure
 #[repr(C)]
@@ -306,6 +404,11 @@ pub struct GfxModeMapDumb {
     pub pad: u32,
     pub offset: u64,
 }
+crate::pod!(GfxModeMapDumb {
+    handle,
+    pad,
+    offset
+});
 
 /// Destroy dumb buffer structure
 #[repr(C)]
@@ -313,6 +416,7 @@ pub struct GfxModeMapDumb {
 pub struct GfxModeDestroyDumb {
     pub handle: u32,
 }
+crate::pod!(GfxModeDestroyDumb { handle });
 
 /// Extract the ioctl number from a command
 fn ioctl_nr(cmd: u32) -> u8 {
@@ -341,12 +445,12 @@ pub fn dispatch_ioctl(driver: &dyn GfxDriver, cmd: u32, arg: u64) -> Result<i64,
 }
 
 /// Copy an ioctl argument struct in from user space
-fn read_arg<T: Copy + Default>(addr: u64) -> Result<T, GfxError> {
+fn read_arg<T: crate::pod::FromBytes>(addr: u64) -> Result<T, GfxError> {
     copy_val_from_user::<Uaccess, T>(addr).map_err(|_| GfxError::Fault)
 }
 
 /// Copy an ioctl argument struct back out to user space
-fn write_arg<T: Copy>(addr: u64, val: &T) -> Result<(), GfxError> {
+fn write_arg<T: crate::pod::IntoBytes>(addr: u64, val: &T) -> Result<(), GfxError> {
     copy_val_to_user::<Uaccess, T>(addr, val).map_err(|_| GfxError::Fault)
 }
 

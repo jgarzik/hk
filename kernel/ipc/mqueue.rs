@@ -103,6 +103,13 @@ pub struct MqAttr {
     pub mq_curmsgs: i64,
     pub __reserved: [i64; 4],
 }
+crate::pod!(MqAttr {
+    mq_flags,
+    mq_maxmsg,
+    mq_msgsize,
+    mq_curmsgs,
+    __reserved
+});
 
 /// sigevent structure (Linux ABI compatible)
 #[repr(C)]
@@ -114,6 +121,13 @@ pub struct SigEvent {
     pub sigev_notify_tid: i32,
     pub _pad: [i32; 11],
 }
+crate::pod!(SigEvent {
+    sigev_value,
+    sigev_signo,
+    sigev_notify,
+    sigev_notify_tid,
+    _pad
+});
 
 /// Internal message structure
 struct MqMessage {

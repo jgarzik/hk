@@ -25,8 +25,9 @@
 #![allow(dead_code)]
 
 use crate::arch::Uaccess;
+use crate::pod::{FromBytes, IntoBytes};
 use crate::signal::{KSigInfo, SigAction, SigHandler, SigSet, sa_flags};
-use crate::uaccess::{UaccessArch, copy_from_user, copy_to_user};
+use crate::uaccess::{UaccessArch, copy_to_user};
 
 // =============================================================================
 // Signal Context (sigcontext)
@@ -51,6 +52,14 @@ pub struct SigContext {
     /// implicit padding would copy uninitialized kernel stack to user
     pub _pad: u64,
 }
+crate::pod!(SigContext {
+    fault_address,
+    regs,
+    sp,
+    pc,
+    pstate,
+    _pad
+});
 
 /// Size of `sigcontext.__reserved`
 pub const RESERVED_SIZE: usize = 4096;
@@ -61,7 +70,7 @@ pub const RESERVED_SIZE: usize = 4096;
 
 /// Stack info structure (matches Linux stack_t)
 #[repr(C)]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Copy)]
 pub struct StackT {
     /// Stack base address
     pub ss_sp: u64,
@@ -72,6 +81,12 @@ pub struct StackT {
     /// Stack size
     pub ss_size: u64,
 }
+crate::pod!(StackT {
+    ss_sp,
+    ss_flags,
+    _pad,
+    ss_size
+});
 
 // =============================================================================
 // User Context (ucontext_t)
@@ -80,7 +95,7 @@ pub struct StackT {
 /// aarch64 ucontext structure (matches Linux struct ucontext up to
 /// `uc_mcontext.__reserved`)
 #[repr(C)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct UContext {
     /// Flags
     pub uc_flags: u64,
@@ -97,6 +112,14 @@ pub struct UContext {
     /// Machine context (16-byte aligned, starts at offset 176)
     pub uc_mcontext: SigContext,
 }
+crate::pod!(UContext {
+    uc_flags,
+    uc_link,
+    uc_stack,
+    uc_sigmask,
+    _pad,
+    uc_mcontext
+});
 
 impl Default for UContext {
     fn default() -> Self {
@@ -117,7 +140,7 @@ impl Default for UContext {
 
 /// siginfo_t structure (simplified, same as x86_64)
 #[repr(C)]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Copy)]
 pub struct SigInfo {
     /// Signal number
     pub si_signo: i32,
@@ -130,6 +153,13 @@ pub struct SigInfo {
     /// Signal-specific fields
     pub _fields: [u64; 14],
 }
+crate::pod!(SigInfo {
+    si_signo,
+    si_errno,
+    si_code,
+    _pad,
+    _fields
+});
 
 // =============================================================================
 // RT Signal Frame
@@ -140,12 +170,14 @@ pub struct SigInfo {
 /// On aarch64, the trampoline address is set in x30 (LR), not pushed
 /// as a return address like on x86_64.
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct RtSigFrame {
     /// Signal info
     pub info: SigInfo,
     /// User context
     pub uc: UContext,
 }
+crate::pod!(RtSigFrame { info, uc });
 
 /// Offset of `uc.uc_mcontext.__reserved` in the frame
 pub const RESERVED_OFFSET: usize = core::mem::size_of::<RtSigFrame>();
@@ -174,6 +206,7 @@ struct CtxHead {
     magic: u32,
     size: u32,
 }
+crate::pod!(CtxHead { magic, size });
 
 /// FP/SIMD record (struct fpsimd_context)
 #[repr(C)]
@@ -184,6 +217,12 @@ struct FpsimdContext {
     fpcr: u32,
     vregs: [u128; 32],
 }
+crate::pod!(FpsimdContext {
+    head,
+    fpsr,
+    fpcr,
+    vregs
+});
 
 /// Fault syndrome record (struct esr_context)
 #[repr(C)]
@@ -192,6 +231,7 @@ struct EsrContext {
     head: CtxHead,
     esr: u64,
 }
+crate::pod!(EsrContext { head, esr });
 
 /// fpsimd_context magic
 pub const FPSIMD_MAGIC: u32 = 0x4650_8001;
@@ -314,7 +354,7 @@ pub fn setup_rt_frame(
     };
     let reserved_addr = frame_addr + RESERVED_OFFSET as u64;
     let mut end = reserved_addr + FPSIMD_SIZE as u64;
-    if copy_to_user::<Uaccess>(reserved_addr, as_bytes(&fpsimd)).is_err() {
+    if copy_to_user::<Uaccess>(reserved_addr, fpsimd.as_bytes()).is_err() {
         return Err(-14);
     }
     if info.error != 0 {
@@ -325,18 +365,18 @@ pub fn setup_rt_frame(
             },
             esr: info.error,
         };
-        if copy_to_user::<Uaccess>(end, as_bytes(&esr)).is_err() {
+        if copy_to_user::<Uaccess>(end, esr.as_bytes()).is_err() {
             return Err(-14);
         }
         end += core::mem::size_of::<EsrContext>() as u64;
     }
-    if copy_to_user::<Uaccess>(end, as_bytes(&CtxHead::default())).is_err() {
+    if copy_to_user::<Uaccess>(end, CtxHead::default().as_bytes()).is_err() {
         return Err(-14);
     }
 
     // Frame record for unwinders: {x29, x30} of the interrupted code
     let record = [user_regs[29], user_regs[30]];
-    if copy_to_user::<Uaccess>(record_addr, as_bytes(&record)).is_err() {
+    if copy_to_user::<Uaccess>(record_addr, record.as_bytes()).is_err() {
         return Err(-14);
     }
 
@@ -374,7 +414,7 @@ pub fn setup_rt_frame(
             },
         },
     };
-    if copy_to_user::<Uaccess>(frame_addr, as_bytes(&frame)).is_err() {
+    if copy_to_user::<Uaccess>(frame_addr, frame.as_bytes()).is_err() {
         return Err(-14); // EFAULT
     }
 
@@ -401,19 +441,9 @@ pub fn setup_rt_frame(
     Ok(())
 }
 
-/// View a plain-data value as bytes
-fn as_bytes<T>(v: &T) -> &[u8] {
-    unsafe { core::slice::from_raw_parts(v as *const T as *const u8, core::mem::size_of::<T>()) }
-}
-
 /// Read a plain-data `T` from user memory
-fn read_user<T: Copy>(addr: u64) -> Option<T> {
-    let mut v = core::mem::MaybeUninit::<T>::uninit();
-    let buf = unsafe {
-        core::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, core::mem::size_of::<T>())
-    };
-    copy_from_user::<Uaccess>(buf, addr, buf.len()).ok()?;
-    Some(unsafe { v.assume_init() })
+fn read_user<T: FromBytes>(addr: u64) -> Option<T> {
+    crate::uaccess::copy_val_from_user::<Uaccess, T>(addr).ok()
 }
 
 /// Walk the `__reserved` records at `addr` (Linux parse_user_sigframe):

@@ -61,6 +61,10 @@ pub struct ITimerSpec {
     /// Initial expiration time
     pub it_value: LinuxTimespec,
 }
+crate::pod!(ITimerSpec {
+    it_interval,
+    it_value
+});
 
 impl ITimerSpec {
     /// Check if this timer spec represents a disarmed timer

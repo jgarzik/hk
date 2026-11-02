@@ -242,6 +242,7 @@ struct UserTimespec {
     tv_sec: i64,
     tv_nsec: i64,
 }
+crate::pod!(UserTimespec { tv_sec, tv_nsec });
 
 /// Get current time from timekeeper
 fn current_time() -> crate::time::Timespec {
@@ -316,7 +317,7 @@ fn do_utimes(dirfd: i32, pathname: u64, times: Option<[UserTimespec; 2]>, flags:
 }
 
 /// Copy a user array of two `T`
-fn copy_pair<T: Copy + Default>(ptr: u64) -> Result<[T; 2], KernelError> {
+fn copy_pair<T: crate::pod::FromBytes>(ptr: u64) -> Result<[T; 2], KernelError> {
     if !Uaccess::access_ok(ptr, core::mem::size_of::<[T; 2]>()) {
         return Err(KernelError::BadAddress);
     }
@@ -353,6 +354,7 @@ pub fn sys_utimes(pathname: u64, times: u64) -> i64 {
         tv_sec: i64,
         tv_usec: i64,
     }
+    crate::pod!(Timeval { tv_sec, tv_usec });
     let ts = if times == 0 {
         None
     } else {
@@ -379,6 +381,7 @@ pub fn sys_utime(pathname: u64, times: u64) -> i64 {
         actime: i64,
         modtime: i64,
     }
+    crate::pod!(Utimbuf { actime, modtime });
     let ts = if times == 0 {
         None
     } else {

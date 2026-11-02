@@ -24,6 +24,7 @@ pub struct IoVec {
     /// Length of the buffer in bytes (size_t)
     pub iov_len: u64,
 }
+crate::pod!(IoVec { iov_base, iov_len });
 
 /// Validate an iovec array from user space
 ///

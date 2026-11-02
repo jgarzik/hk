@@ -25,6 +25,26 @@ pub struct Stat {
     pub st_ctime_nsec: i64,
     pub __unused: [i64; 3],
 }
+crate::pod!(Stat {
+    st_dev,
+    st_ino,
+    st_nlink,
+    st_mode,
+    st_uid,
+    st_gid,
+    __pad0,
+    st_rdev,
+    st_size,
+    st_blksize,
+    st_blocks,
+    st_atime,
+    st_atime_nsec,
+    st_mtime,
+    st_mtime_nsec,
+    st_ctime,
+    st_ctime_nsec,
+    __unused
+});
 
 // O_* flags whose values differ per arch (include/uapi/asm-generic/fcntl.h)
 /// Must be a directory
@@ -42,6 +62,7 @@ pub struct EpollEvent {
     /// User data (passed back unchanged)
     pub data: u64,
 }
+crate::pod!(EpollEvent { events, data });
 
 impl EpollEvent {
     /// Build an event
@@ -64,3 +85,13 @@ pub struct Semid64Ds {
     pub __unused3: u64,
     pub __unused4: u64,
 }
+crate::pod!(Semid64Ds {
+    sem_perm,
+    sem_otime,
+    __unused1,
+    sem_ctime,
+    __unused2,
+    sem_nsems,
+    __unused3,
+    __unused4
+});
