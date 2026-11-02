@@ -501,6 +501,9 @@ pub struct Inode {
     /// (Linux inode->i_pipe and pipe->files)
     pub i_pipe: crate::sync::spin::Mutex<Option<(Arc<crate::pipe::Pipe>, usize)>>,
 
+    /// The file's page cache (Linux i_data)
+    pub i_data: crate::mm::filemap::AddressSpace,
+
     /// The inode cache key it is hashed under (`fs::icache`)
     pub(super) i_hash: AtomicU64,
     /// Hashed in the inode cache (Linux !inode_unhashed)
@@ -542,6 +545,7 @@ impl Inode {
             i_pipe: crate::sync::spin::Mutex::new(None),
             i_hash: AtomicU64::new(0),
             i_hashed: core::sync::atomic::AtomicBool::new(false),
+            i_data: crate::mm::filemap::AddressSpace::new(),
         }
     }
 
@@ -580,6 +584,7 @@ impl Inode {
             i_pipe: crate::sync::spin::Mutex::new(None),
             i_hash: AtomicU64::new(0),
             i_hashed: core::sync::atomic::AtomicBool::new(false),
+            i_data: crate::mm::filemap::AddressSpace::new(),
         }
     }
 

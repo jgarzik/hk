@@ -41,19 +41,13 @@ fn swap_file(path: &[u8], last_page: u32) -> bool {
     ok
 }
 
-/// swapon checks the header against the file (Linux read_swap_header):
-/// last_page 0 is EINVAL, an area longer than the file is EINVAL (not
-/// clamped), however long it says it is; one that fits works (hk only:
-/// Linux tmpfs and ramfs files cannot be swap files)
+/// A ramfs/tmpfs file cannot be a swap area (Linux: no ->swap_activate
+/// and no bmap, EINVAL), whatever its header says
 fn test_swapon_size() {
-    use super::helpers::{host_mode, print_num as num};
+    use super::helpers::print_num as num;
     let path = b"/tmp/size_swap\0";
-    let mut got = [0i64; 4];
-    for (i, last) in [0u32, 256, 0x7fff_ffff, 255].into_iter().enumerate() {
-        if i == 3 && host_mode() {
-            got[i] = 0;
-            break;
-        }
+    let mut got = [0i64; 2];
+    for (i, last) in [0u32, 255].into_iter().enumerate() {
         got[i] = if swap_file(path, last) {
             sys_swapon(path.as_ptr(), 0)
         } else {
@@ -64,7 +58,7 @@ fn test_swapon_size() {
         }
     }
     hk_syscall::sys_unlink(path.as_ptr());
-    let ok = got[0] == EINVAL && got[1] == EINVAL && got[2] == EINVAL && got[3] == 0;
+    let ok = got.iter().all(|&g| g == EINVAL);
     print(b"SWAPON_SIZE");
     if ok {
         println(b":OK");

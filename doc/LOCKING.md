@@ -287,6 +287,7 @@ Global subsystem locks (TASKLIST, PAGE_CACHE, fd table `Files`)  ← NOT IRQ-saf
     ↓
 Address space: mmap_lock (sleeping RwSem; under i_rwsem: a write's user
     copy may fault) → page lock (PG_locked, sleeping; Linux folio_lock)
+    [→ AddressSpace.i_pages (spin leaf, Linux xa_lock; 3.2)]
     → AnonVma.chain (sleeping RwSem, Linux anon_vma->rwsem)
     → page_table_lock → PTE lock (spin)
     → SwapInfo.map (spin, Linux si->lock) | swap cache (IrqSpinlock,
@@ -1529,9 +1530,39 @@ layout in `doc/MEMORY.md`
   whose page table cannot be allocated (under the page_table_lock)
   reclaims after dropping it and retries.
 
-#### Page Cache
+#### Per-inode page cache (Linux i_pages)
+
+**Location:** `kernel/mm/filemap.rs` (`AddressSpace`, the inode's
+`i_data`); users so far: ramfs.
+
+- `AddressSpace.i_pages` (`spin::Mutex<XArray>`, Linux xa_lock): the
+  cached pages by index. Thread context only (no I/O completion or
+  page free touches it from an interrupt). A leaf apart from the heap
+  (index nodes: tried atomically under it, else preloaded with it
+  dropped, Linux xas_nomem) and page reference counts. A lookup takes
+  its page reference under it (get_page_unless_zero), so a page
+  removed meanwhile is never returned.
+- Page lock (`PG_locked`): a page is inserted locked, filled
+  (`->read_folio`), written into (`write_begin`..`write_end`) and
+  removed (truncate) under it. Order: i_rwsem -> page lock ->
+  i_pages. Removal also needs `i_pages`; a lookup that then locks the
+  page rechecks `Page.mapping` (truncated meanwhile: retry).
+- Page allocation (`alloc_user`, may reclaim) happens with no
+  spinlock held: writes under i_rwsem, faults under the mmap_lock read
+  side (mmap_lock -> page lock -> i_pages).
+- The cache holds one reference per page; a MAP_SHARED PTE holds its
+  own, so truncate or eviction (dropping only the cache's) never frees
+  a page a mapping still uses.
+- Eviction (`Drop for AddressSpace`, the inode's last reference)
+  empties `i_pages` without page locks: nothing else can reach the
+  mapping any more.
+
+#### Global page cache (vfat, block devices)
 
 **Location:** `kernel/mm/page_cache.rs`, `kernel/main.rs` (`PAGE_CACHE`)
+
+The old global cache, keyed by FileId, still holds vfat and block
+device pages; ramfs is on the per-inode cache below.
 
 ```rust
 static PAGE_CACHE: Mutex<PageCache> = Mutex::new(PageCache::new(1024));
@@ -1574,24 +1605,6 @@ The page cache uses a hierarchical locking model similar to Linux:
 held) skips dirty pages; while every evictable page is dirty the cache
 may exceed its limit by an eighth, then allocation fails (ENOMEM). Dirty pages are written by the flusher, fsync and sync, which
 call `writepage` with no spinlock held (it does block I/O and sleeps).
-
-**Mapped ramfs pages (Linux filemap_fault):** a MAP_SHARED fault on a
-ramfs file (`InodeOps::map_page`) takes PAGE_CACHE with no spinlock
-held (the mmap_lock held for reading: mmap_lock -> PAGE_CACHE) and,
-still under it, a frame reference for the PTE
-(PAGE_CACHE -> FRAME_ALLOCATOR), so truncate or inode eviction, which
-drop only the cache's own reference (`FrameAlloc::put_frame`), cannot
-free a frame a mapping still uses.
-
-**Freeing ramfs pages (Linux evict_inode):** dropping a ramfs inode's
-`RamfsInodeData` (no directory entry, open file, mapping or dentry left)
-takes PAGE_CACHE -> FRAME_ALLOCATOR (its `Pcp.lock` -> `Zone.lock`
-IrqSpinlocks) to free its
-pages. The page cache never holds inode references, so the last inode
-reference is never dropped with PAGE_CACHE held. Unevictable (ramfs)
-pages are kept off the eviction FIFO and are refused at the low
-watermark (`FrameAlloc::reserve_low`: the zone's free count, an atomic
-read while PAGE_CACHE is held).
 
 ### 3.3 Virtual File System (VFS)
 

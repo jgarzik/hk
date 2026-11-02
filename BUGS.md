@@ -319,7 +319,7 @@ parallel). Next occurrence: capture the Message line.
 
 ## ramfs has no size limit
 
-**Location**: `kernel/fs/ramfs.rs`, `kernel/mm/page_cache.rs`,
+**Location**: `kernel/fs/ramfs.rs`, `kernel/mm/filemap.rs`,
 `kernel/frame_alloc.rs`
 
 ramfs (the root filesystem and every ramfs mount) is bounded only by

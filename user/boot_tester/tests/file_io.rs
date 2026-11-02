@@ -32,7 +32,7 @@ use hk_syscall::{
     O_RDONLY, O_RDWR, O_TRUNC, PROC_SUPER_MAGIC, RAMFS_MAGIC, STATX_BASIC_STATS, Statx, sys_close,
     sys_fcntl, sys_fstatfs, sys_getrandom, sys_ioctl, sys_lseek, sys_open, sys_pipe2, sys_pread64,
     sys_preadv, sys_preadv2, sys_pwrite64, sys_pwritev, sys_pwritev2, sys_read, sys_readv,
-    sys_statfs, sys_statx, sys_write, sys_writev,
+    sys_ftruncate, sys_statfs, sys_statx, sys_unlink, sys_write, sys_writev,
 };
 
 // RWF flags for preadv2/pwritev2
@@ -64,6 +64,7 @@ pub fn run_tests() {
     test_fcntl_cloexec();
     test_fcntl_dupfd_cloexec();
     test_fcntl_ebadf();
+    test_trunc_tail();
     test_getrandom();
     test_getrandom_einval();
     test_getrandom_stream();
@@ -1623,6 +1624,37 @@ fn test_ioctl_fioclex() {
         print_num(has_cloexec as i64);
         print(b", still=");
         print_num(still_cloexec as i64);
+        println(b"");
+    }
+}
+
+/// Shrinking a file then growing it again reads zeros where the cut
+/// data was, also inside the last page kept (Linux truncate_setsize
+/// zeroes the partial page)
+fn test_trunc_tail() {
+    let path = b"/tmp/trunc_tail\0";
+    let fd = sys_open(path.as_ptr(), O_CREAT | O_RDWR | O_TRUNC, 0o644) as i32;
+    let mut buf = [b'a'; 8192];
+    let w = sys_pwrite64(fd, buf.as_ptr(), buf.len() as u64, 0);
+    let t1 = sys_ftruncate(fd, 100);
+    let t2 = sys_ftruncate(fd, 8192);
+    buf.fill(b'x');
+    let n = sys_pread64(fd, buf.as_mut_ptr(), buf.len() as u64, 0);
+    sys_close(fd as u64);
+    sys_unlink(path.as_ptr());
+    let ok = w == 8192
+        && t1 == 0
+        && t2 == 0
+        && n == 8192
+        && buf[..100].iter().all(|&c| c == b'a')
+        && buf[100..].iter().all(|&c| c == 0);
+    if ok {
+        println(b"TRUNC_TAIL_ZERO:OK");
+    } else {
+        print(b"TRUNC_TAIL_ZERO:FAIL n=");
+        print_num(n);
+        print(b" byte100=");
+        print_num(buf[100] as i64);
         println(b"");
     }
 }

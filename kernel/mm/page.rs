@@ -61,6 +61,9 @@ pub const PG_TAIL: u32 = 1 << 11;
 /// Page (head) of a slab
 pub const PG_SLAB: u32 = 1 << 12;
 
+/// A page-cache page's data is valid (Linux PG_uptodate)
+pub const PG_UPTODATE: u32 = 1 << 13;
+
 /// Page frame size
 pub const PAGE_SHIFT: u32 = 12;
 
