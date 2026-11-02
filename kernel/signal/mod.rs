@@ -452,6 +452,10 @@ pub struct SigHand {
     /// valid), built in the heap: a 65-entry array moved through fork's
     /// stack frames used ~9 KB of the 16 KB kernel stack
     action: IrqSpinlock<Box<[SigAction]>>,
+    /// Readers and pollers of a signalfd among the tasks sharing this
+    /// table (Linux sighand->signalfd_wqh): woken by every signal sent
+    /// to one of them
+    pub signalfd_wq: crate::waitqueue::WaitQueue,
 }
 
 /// A handler table with every action at its default
@@ -464,6 +468,7 @@ impl SigHand {
     pub fn new() -> Self {
         Self {
             action: IrqSpinlock::new(default_actions()),
+            signalfd_wq: crate::waitqueue::WaitQueue::new(),
         }
     }
 
@@ -503,6 +508,7 @@ impl SigHand {
         actions.clone_from_slice(&self.action.lock());
         Arc::new(Self {
             action: IrqSpinlock::new(actions),
+            signalfd_wq: crate::waitqueue::WaitQueue::new(),
         })
     }
 
@@ -988,8 +994,11 @@ fn send_signal_force(tid: Tid, sig: u32, force: bool) -> i32 {
         group_kill(tid, sig);
     }
 
-    // Wake any signalfds monitoring this signal
-    crate::signalfd::wake_signalfds_for_signal(tid, sig);
+    // Signalfd readers of the target's handler table recheck (Linux
+    // signalfd_notify)
+    if let Some(h) = &sighand {
+        h.signalfd_wq.wake_all();
+    }
 
     if deliverable {
         use crate::task::percpu::WakeMode;
