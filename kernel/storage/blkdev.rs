@@ -855,6 +855,27 @@ pub fn all_bdev_inodes() -> Vec<Arc<crate::fs::Inode>> {
         .collect()
 }
 
+/// `f` on each block device's page-cache inode until it returns false,
+/// allocating nothing (reclaim): the reference is taken under the
+/// registry lock, `f` runs with no lock held
+pub fn for_each_bdev_inode(f: &mut dyn FnMut(&Arc<crate::fs::Inode>) -> bool) {
+    let mut i = 0;
+    loop {
+        let inode = BLKDEV_REGISTRY
+            .read()
+            .values()
+            .nth(i)
+            .map(|b| b.bd_inode.clone());
+        let Some(inode) = inode else {
+            return;
+        };
+        if !f(&inode) {
+            return;
+        }
+        i += 1;
+    }
+}
+
 /// Write back every block device's cache (sync(2): Linux sync_bdevs)
 pub fn sync_bdevs() {
     let all: Vec<Arc<BlockDevice>> = BLKDEV_REGISTRY.read().values().cloned().collect();

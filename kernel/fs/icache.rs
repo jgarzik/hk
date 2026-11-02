@@ -190,18 +190,26 @@ pub fn evict(inode: &Inode) {
     inode.i_op.evict_inode(inode);
 }
 
-/// Every hashed inode still alive (drop_caches, reclaim): collected
-/// bucket by bucket, each reference taken under its lock and the
-/// inodes returned with no lock held
-pub fn all_inodes() -> Vec<Arc<Inode>> {
-    let mut v = Vec::new();
+/// `f` on every hashed inode still alive until it returns false
+/// (drop_caches, reclaim), allocating nothing: each inode's reference
+/// is taken under its bucket's lock, `f` runs (and the reference goes)
+/// with no lock held; a bucket is walked by position, so an inode
+/// hashed or unhashed meanwhile may be seen twice or missed
+pub fn for_each_inode(f: &mut dyn FnMut(&Arc<Inode>) -> bool) {
     for b in table() {
-        let mut held = Vec::new();
-        {
-            let list = b.lock();
-            held.extend(list.iter().filter_map(|(_, _, w)| w.upgrade()));
+        let mut i = 0;
+        loop {
+            let inode = {
+                let list = b.lock();
+                list.iter().skip(i).find_map(|(_, _, w)| w.upgrade())
+            };
+            let Some(inode) = inode else {
+                break;
+            };
+            if !f(&inode) {
+                return;
+            }
+            i += 1;
         }
-        v.append(&mut held);
     }
-    v
 }

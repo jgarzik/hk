@@ -1583,11 +1583,12 @@ dropped before and after it is zeroed on the disk.)
 - Dirty, cached and unevictable pages are counted per CPU
   (`NR_DIRTY`, `NR_FILE`, `NR_UNEVICT`: atomics, Linux vmstat), summed
   lock-free for the dirty limits and /proc/meminfo.
-- Reclaim and drop_caches (`shrink_cache`, `drop_pagecache`) collect
-  the cached inodes first (each inode-cache bucket lock in turn, the
-  block device registry), then drop clean pages with no lock held but
-  each page's, taken with trylock (reclaim never waits for one); an
-  unevictable mapping (ramfs) is never touched.
+- Reclaim and drop_caches (`shrink_cache`, `drop_pagecache`) walk
+  the cached inodes in place, allocating nothing: one inode reference
+  at a time is taken under its inode-cache bucket lock (or the block
+  device registry lock), then its clean pages are dropped with no lock
+  held but each page's, taken with trylock (reclaim never waits for
+  one); an unevictable mapping (ramfs) is never touched.
 - Eviction (`Drop for AddressSpace`, the inode's last reference)
   empties `i_pages` without page locks: nothing else can reach the
   mapping any more.

@@ -784,34 +784,38 @@ pub fn fault(inode: &Inode, index: u64) -> Result<u64, VmFault> {
     }
 }
 
-/// The inodes that may hold reclaimable cache: every hashed inode
-/// (on-disk filesystems) and every block device's
-fn cache_inodes() -> alloc::vec::Vec<alloc::sync::Arc<Inode>> {
-    let mut v = crate::fs::icache::all_inodes();
-    v.extend(crate::storage::blkdev::all_bdev_inodes());
-    v.retain(|i| i.i_data.nrpages() != 0);
-    v
+/// `f` on each inode that may hold reclaimable cache (every hashed
+/// inode, every block device's) until it returns false; no allocation
+fn for_each_cache_inode(f: &mut dyn FnMut(&Inode) -> bool) {
+    let mut more = true;
+    crate::fs::icache::for_each_inode(&mut |i| {
+        more = i.i_data.nrpages() == 0 || f(i);
+        more
+    });
+    if more {
+        crate::storage::blkdev::for_each_bdev_inode(&mut |i| i.i_data.nrpages() == 0 || f(i));
+    }
 }
 
 /// Drop up to `nr` clean, unmapped page-cache pages for direct reclaim
 /// (Linux shrink_inactive_list of the file LRU). Deviation: no file
-/// LRU, so the pages go inode by inode, not oldest first. Never
-/// sleeps on a page lock (trylock); the number freed.
+/// LRU, so the pages go inode by inode, not oldest first. Allocates
+/// nothing (it runs when memory is short) and never sleeps on a page
+/// lock (trylock); stops once `nr` are freed. The number freed.
 pub fn shrink_cache(nr: usize) -> usize {
     let mut freed = 0;
-    for inode in cache_inodes() {
-        if freed >= nr {
-            break;
-        }
-        freed += invalidate_clean(&inode, 0, u64::MAX) as usize;
-    }
+    for_each_cache_inode(&mut |inode| {
+        freed += invalidate_clean(inode, 0, u64::MAX) as usize;
+        freed < nr
+    });
     freed
 }
 
 /// vm.drop_caches 1 (Linux drop_pagecache_sb over every superblock):
 /// drop every clean, unmapped page-cache page
 pub fn drop_pagecache() {
-    for inode in cache_inodes() {
-        invalidate_clean(&inode, 0, u64::MAX);
-    }
+    for_each_cache_inode(&mut |inode| {
+        invalidate_clean(inode, 0, u64::MAX);
+        true
+    });
 }
