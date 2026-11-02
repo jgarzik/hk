@@ -2090,7 +2090,8 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
 
     // Create TaskContext pointing to clone_child_entry, its frame below
     // the TrapFrame and the saved FP state
-    let frame_top = CurrentArch::clone_child_fpu(trapframe_ptr);
+    // SAFETY: the child's TrapFrame, on its new kernel stack (not run)
+    let frame_top = unsafe { CurrentArch::clone_child_fpu(trapframe_ptr) };
     let context = CurrentArch::new_clone_child_context(frame_top);
 
     // Determine child's parent PID

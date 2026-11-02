@@ -6,11 +6,9 @@ These are safe fns or patterns whose use leads to undefined behaviour.
 None is known to fail today, but each is a soundness bug:
 
 - **Safe fns that take addresses:**
-  - `load_mm`, `dtb::blob`, `psci_cpu_on`.
-  - `save_for_clone_child`, `write_fs_base`, `fpu::restore`.
-  - `entry_atomic`, `virtio_net::rx_skb`.
-  - mm `pte` helpers that take `*mut u64`.
-  - `pfn_to_page` (checks its argument only in debug builds).
+  - `dtb::blob` and the dtb parsers take a physical address.
+  - aarch64/x86 paging `entry_atomic` returns `&'static AtomicU64` into
+    a table that can be freed; the mm `pte` helpers take `*mut u64`.
 - **Inode locks:** `unlock_rename` and `inode_lock`/`inode_unlock` are
   hand-paired, and `unlock_rename` is a safe fn.
 

@@ -214,8 +214,9 @@ impl UserModeOps for X86_64Arch {
 impl SchedArch for X86_64Arch {
     type SchedPageTable = paging::X86_64PageTable;
 
-    fn clone_child_fpu(regs: u64) -> u64 {
-        fpu::save_for_clone_child(regs)
+    unsafe fn clone_child_fpu(regs: u64) -> u64 {
+        // SAFETY: the trait's contract
+        unsafe { fpu::save_for_clone_child(regs) }
     }
 }
 

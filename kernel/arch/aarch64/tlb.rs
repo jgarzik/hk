@@ -218,7 +218,10 @@ fn rollover_flush() {
 /// rollover asks this CPU for one; no instruction-cache maintenance
 /// either (done where a page becomes executable: `paging::sync_page`). Kernel threads (`ctx` None) run on
 /// the empty table with ASID 0.
-pub fn load_mm(root: u64, ctx: Option<&ArchCtx>) {
+///
+/// # Safety
+/// `root` is a live user top-level table, alive while loaded.
+pub unsafe fn load_mm(root: u64, ctx: Option<&ArchCtx>) {
     let asid = match ctx {
         Some(c) => {
             let cpu = crate::cpu::this_id();

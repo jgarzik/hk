@@ -208,7 +208,11 @@ impl VirtioNet {
     }
 
     /// Copy a received buffer into an skb
-    fn rx_skb(dev: &Arc<NetDevice>, buf: *const u8, len: usize) -> Option<Box<SkBuff>> {
+    ///
+    /// # Safety
+    /// `buf` is a receive buffer of at least HDR_LEN + MAX_FRAME bytes
+    /// that the device has returned and that is not reposted meanwhile.
+    unsafe fn rx_skb(dev: &Arc<NetDevice>, buf: *const u8, len: usize) -> Option<Box<SkBuff>> {
         if !(HDR_LEN + 14..=HDR_LEN + MAX_FRAME).contains(&len) {
             dev.stats.inc_rx_errors();
             return None;
@@ -219,6 +223,8 @@ impl VirtioNet {
             dev.stats.inc_rx_dropped();
             return None;
         };
+        // SAFETY: inside the returned buffer (len checked against
+        // MAX_FRAME above; caller)
         let src = unsafe { core::slice::from_raw_parts(buf.add(HDR_LEN), len) };
         let _ = skb.put_slice(src);
         skb.dev = Some(Arc::clone(dev));
@@ -238,7 +244,9 @@ impl VirtioNet {
         let mut n = 0;
         while n < budget {
             let Some((i, len)) = rx.vq.get() else { break };
-            if let Some(skb) = Self::rx_skb(dev, rx.pool.cpu(i), len as usize) {
+            // SAFETY: buffer `i` came back from the device (vq.get) and
+            // is reposted only below
+            if let Some(skb) = unsafe { Self::rx_skb(dev, rx.pool.cpu(i), len as usize) } {
                 out.push(skb);
             }
             rx.post(i);

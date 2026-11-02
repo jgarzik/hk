@@ -400,10 +400,11 @@ pub fn pfn_valid(pfn: u64) -> bool {
     sec < NR_SECTIONS && SECTIONS[sec / 64].load(Ordering::Acquire) & (1 << (sec % 64)) != 0
 }
 
-/// The struct page of `pfn`, which must be valid
+/// The struct page of `pfn`, which must be valid (checked: one bitmap
+/// test keeps this safe fn from reading unmapped memory)
 #[inline]
 pub fn pfn_to_page(pfn: u64) -> &'static Page {
-    debug_assert!(pfn_valid(pfn));
+    assert!(pfn_valid(pfn), "pfn_to_page: invalid pfn {pfn:#x}");
     // SAFETY: the memory map of a valid pfn's section is mapped for good
     unsafe { &*((crate::arch::paging::VMEMMAP_START + pfn * 64) as *const Page) }
 }

@@ -279,7 +279,9 @@ fn switch_mm_irqs_off(next: Option<&Mm>) {
         }
         None => (kernel_root(), 0),
     };
-    arch::load_mm(root, next.map(|m| &m.context().arch));
+    // SAFETY: `next`'s table (its mm is pinned by the caller until the
+    // next switch away) or the kernel's, which lives forever
+    unsafe { arch::load_mm(root, next.map(|m| &m.context().arch)) };
     st.loaded_gen.store(cur_gen, Ordering::Relaxed);
     st.loaded_mm.store(next_ptr, Ordering::Relaxed);
 }

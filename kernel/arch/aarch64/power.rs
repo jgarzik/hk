@@ -53,7 +53,11 @@ pub fn psci_version() -> u32 {
 ///
 /// # Returns
 /// PSCI return code (0 = success)
-pub fn psci_cpu_on(target_mpidr: u64, entry_point: u64, context_id: u64) -> i64 {
+///
+/// # Safety
+/// `entry_point` is the physical address of code that can start a CPU
+/// with the MMU off, and `context_id` what that code expects in x0.
+pub unsafe fn psci_cpu_on(target_mpidr: u64, entry_point: u64, context_id: u64) -> i64 {
     let result: i64;
     unsafe {
         core::arch::asm!(

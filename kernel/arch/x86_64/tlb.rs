@@ -63,8 +63,12 @@ pub fn flush_kernel_range(_start: u64, _end: u64) -> bool {
 /// Load the table `root` on this CPU (interrupts disabled): the CR3
 /// write flushes everything, so the new address space starts with no
 /// stale entry
+///
+/// # Safety
+/// `root` is a live top-level table with the kernel half, which stays
+/// alive while loaded.
 #[inline]
-pub fn load_mm(root: u64, _ctx: Option<&ArchCtx>) {
-    // SAFETY: `root` is a live top-level table with the kernel half
+pub unsafe fn load_mm(root: u64, _ctx: Option<&ArchCtx>) {
+    // SAFETY: per the caller
     unsafe { core::arch::asm!("mov cr3, {}", in(reg) root, options(nostack, preserves_flags)) };
 }

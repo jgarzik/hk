@@ -518,7 +518,10 @@ pub trait SchedArch: Arch + PerCpuOps + CpuOps + ContextOps + UserModeOps {
     /// TrapFrame (at the top of its kernel stack) is at `regs`; returns
     /// where the child's first switch frame ends (below the saved state,
     /// or `regs` when the TrapFrame itself carries the FP state)
-    fn clone_child_fpu(regs: u64) -> u64;
+    ///
+    /// # Safety
+    /// `regs` is the TrapFrame of a kernel stack whose task has not run.
+    unsafe fn clone_child_fpu(regs: u64) -> u64;
 }
 
 // ============================================================================

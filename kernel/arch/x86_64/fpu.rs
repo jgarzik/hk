@@ -267,9 +267,13 @@ pub fn load_init_state() {
 /// Save the current (parent) FP state for a clone child, just below its
 /// pt_regs at `regs` (64-byte aligned, as XSAVE wants); returns the area,
 /// where the child's first switch frame ends (`ret_from_fork` loads it)
-pub fn save_for_clone_child(regs: u64) -> u64 {
+///
+/// # Safety
+/// `regs` is the TrapFrame address at the top of a kernel stack whose
+/// task has not run yet, with room below it for the area.
+pub unsafe fn save_for_clone_child(regs: u64) -> u64 {
     let area = (regs - FPU_AREA_SIZE as u64) & !63;
-    // SAFETY: the child's kernel stack, not running yet
+    // SAFETY: the child's kernel stack, not running yet (caller)
     unsafe { save(&mut *(area as *mut FpuArea)) };
     area
 }

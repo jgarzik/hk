@@ -137,7 +137,8 @@ pub fn init<FA: FrameAlloc<PhysAddr = u64>>(acpi: &AcpiInfo, _frame_alloc: &mut 
         let context_phys = pa_symbol(unsafe { &raw const AP_BOOT_DATA[cpu_id as usize] } as u64);
 
         // Call PSCI CPU_ON
-        let result = power::psci_cpu_on(target_mpidr, entry_phys, context_phys);
+        // SAFETY: the AP entry stub and this CPU's boot data
+        let result = unsafe { power::psci_cpu_on(target_mpidr, entry_phys, context_phys) };
 
         if result == power::psci::SUCCESS {
             // Wait for AP to signal ready (5 seconds to account for slow boot)
