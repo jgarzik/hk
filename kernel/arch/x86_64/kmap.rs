@@ -17,7 +17,9 @@
 //! every address space (Linux: preallocate_vmalloc_pages). Boot-time
 //! tables come from a static pool (the frame allocator does not exist yet).
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+use crate::sync::RacyCell;
 
 use super::paging::{
     KERNEL_MAP, PAGE_HUGE, PAGE_NO_EXECUTE, PAGE_OFFSET, PAGE_PRESENT, PAGE_SIZE, PAGE_WRITABLE,
@@ -34,11 +36,12 @@ const SZ_1G: u64 = 1 << 30;
 #[repr(C, align(4096))]
 struct Pool([RawPageTable; POOL_PAGES]);
 
-static mut POOL: Pool = Pool([const { RawPageTable::new() }; POOL_PAGES]);
-static mut POOL_USED: usize = 0;
+static POOL: RacyCell<Pool> = RacyCell::new(Pool([const { RawPageTable::new() }; POOL_PAGES]));
+/// Pool pages handed out
+static POOL_USED: AtomicUsize = AtomicUsize::new(0);
 
 /// The kernel's top-level table (Linux: swapper_pg_dir / init_top_pgt)
-static mut SWAPPER: RawPageTable = RawPageTable::new();
+static SWAPPER: RacyCell<RawPageTable> = RacyCell::new(RawPageTable::new());
 
 /// End of the direct map (physical): RAM above it is not mapped
 static DIRECT_END: AtomicU64 = AtomicU64::new(0);
@@ -66,7 +69,7 @@ pub fn image_range() -> (u64, u64) {
 
 /// Physical address of the kernel top-level table
 pub fn swapper_phys() -> u64 {
-    pa_symbol(&raw const SWAPPER as u64)
+    pa_symbol(SWAPPER.get() as u64)
 }
 
 /// Physical end of the direct map
@@ -76,12 +79,12 @@ pub fn direct_end() -> u64 {
 
 /// A zeroed page-table page from the pool, as (virt, phys)
 fn pool_page() -> (*mut RawPageTable, u64) {
-    unsafe {
-        assert!(POOL_USED < POOL_PAGES, "kmap: page-table pool exhausted");
-        let t = &raw mut POOL.0[POOL_USED];
-        POOL_USED += 1;
-        (t, pa_symbol(t as u64))
-    }
+    let n = POOL_USED.fetch_add(1, Ordering::Relaxed);
+    assert!(n < POOL_PAGES, "kmap: page-table pool exhausted");
+    // SAFETY: page `n` of the pool, in bounds, handed out once (the
+    // counter); no reference to the pool exists
+    let t = unsafe { &raw mut (*POOL.get()).0[n] };
+    (t, pa_symbol(t as u64))
 }
 
 /// Next-level table under `table[idx]`, created if absent
@@ -235,7 +238,7 @@ unsafe fn map_image(pml4: *mut RawPageTable) {
 /// Once, on the BSP, before anything uses the direct map past 4GB.
 pub unsafe fn init(mbi: u64) {
     unsafe {
-        let pml4 = &raw mut SWAPPER;
+        let pml4 = SWAPPER.get();
         map_direct(pml4, &BootRam(mbi));
         map_image(pml4);
         // vmalloc/ioremap and vmemmap PDPTs: present before any address
@@ -280,7 +283,7 @@ pub unsafe fn map_pmd(va: u64, pa: u64, table: &mut dyn FnMut() -> u64) {
 /// As for `map_page`.
 unsafe fn walk(va: u64, shifts: &[u32], table: &mut dyn FnMut() -> u64) -> *mut RawPageTable {
     unsafe {
-        let mut t = &raw mut SWAPPER;
+        let mut t = SWAPPER.get();
         assert!(
             (*t).entry(idx(va, 39)).is_present(),
             "kmap: no top-level entry"
@@ -303,7 +306,7 @@ pub fn trampoline_pgd() -> u64 {
     let phys = &raw const boot_pml4 as u64;
     unsafe {
         let boot = phys_to_virt_table(phys);
-        let swapper = &raw const SWAPPER;
+        let swapper = SWAPPER.get().cast_const();
         for i in 256..512 {
             *(*boot).entry_mut(i) = *(*swapper).entry(i);
         }

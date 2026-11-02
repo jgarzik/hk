@@ -251,17 +251,14 @@ impl IoremapOps for Aarch64Arch {
 
 impl AcpiOps for Aarch64Arch {
     fn parse_acpi() -> Option<AcpiInfo> {
-        // Get DTB pointer saved by _start_rust
-        let dtb_ptr = unsafe { crate::DTB_PTR };
-
-        if dtb_ptr == 0 {
+        if dtb::boot_phys() == 0 {
             // Fallback to hardcoded values if no DTB
             crate::printkln!("DTB: no pointer, using fallback");
             return Some(fallback_acpi_info());
         }
 
         // Parse DTB
-        match dtb::parse_dtb(dtb_ptr) {
+        match dtb::parse_dtb() {
             Some(info) => {
                 crate::printkln!(
                     "DTB: GIC at {:#x}, {} CPUs",
@@ -586,18 +583,18 @@ impl SchedArch for Aarch64Arch {
 impl MemoryLayoutOps for Aarch64Arch {
     fn memblock_init() {
         // RAM was added by `kmap::init` (it linear-maps every range)
-        let dtb = unsafe { crate::DTB_PTR };
+        let dtb = dtb::boot_phys();
         let mut mb = crate::mm::memblock::MEMBLOCK.lock();
         mb.set_limit(kmap::direct_end());
         let (start, end) = kmap::image_range();
         mb.reserve(start, end - start);
-        if let Some(n) = dtb::total_size(dtb) {
+        if let Some(n) = dtb::total_size() {
             mb.reserve(dtb, n as u64);
         }
-        if let Some(i) = dtb::extract_initramfs(dtb) {
+        if let Some(i) = dtb::extract_initramfs() {
             mb.reserve(i.start, i.end.saturating_sub(i.start));
         }
-        dtb::for_each_firmware_reserved(dtb, |base, size| mb.reserve(base, size));
+        dtb::for_each_firmware_reserved(|base, size| mb.reserve(base, size));
     }
 
     unsafe fn map_kernel_page(va: u64, pa: u64, table: &mut dyn FnMut() -> u64) {
@@ -622,11 +619,8 @@ impl ExceptionOps for Aarch64Arch {
 
 impl InitramfsOps for Aarch64Arch {
     fn get_initramfs() -> &'static [u8] {
-        // Get DTB pointer saved by _start_rust
-        let dtb_ptr = unsafe { crate::DTB_PTR };
-
         // Try to extract initramfs from DTB
-        if let Some(info) = dtb::extract_initramfs(dtb_ptr) {
+        if let Some(info) = dtb::extract_initramfs() {
             crate::printkln!(
                 "Found initramfs in DTB: 0x{:x}-0x{:x} ({} bytes)",
                 info.start,

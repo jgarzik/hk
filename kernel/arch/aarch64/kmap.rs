@@ -19,7 +19,9 @@
 //! user mappings. Boot-time tables come from a static pool.
 
 use core::arch::asm;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+use crate::sync::RacyCell;
 
 use super::paging::{
     AF, AP_EL1_RO, AP_EL1_RW, ATTR_IDX_DEVICE, ATTR_IDX_NORMAL, IO_BASE, IO_SIZE, KIMAGE_OFFSET,
@@ -38,11 +40,12 @@ const DEFAULT_RAM: (u64, u64) = (0x4000_0000, 512 << 20);
 #[repr(C, align(4096))]
 struct Pool([RawPageTable; POOL_PAGES]);
 
-static mut POOL: Pool = Pool([const { RawPageTable::new() }; POOL_PAGES]);
-static mut POOL_USED: usize = 0;
+static POOL: RacyCell<Pool> = RacyCell::new(Pool([const { RawPageTable::new() }; POOL_PAGES]));
+/// Pool pages handed out
+static POOL_USED: AtomicUsize = AtomicUsize::new(0);
 
 /// TTBR1 root (Linux: swapper_pg_dir)
-static mut SWAPPER: RawPageTable = RawPageTable::new();
+static SWAPPER: RacyCell<RawPageTable> = RacyCell::new(RawPageTable::new());
 
 /// Empty TTBR0 root for kernel threads (Linux: reserved_pg_dir)
 static RESERVED: RawPageTable = RawPageTable::new();
@@ -77,7 +80,7 @@ pub fn image_range() -> (u64, u64) {
 
 /// Physical address of the TTBR1 root
 pub fn swapper_phys() -> u64 {
-    pa_symbol(&raw const SWAPPER as u64)
+    pa_symbol(SWAPPER.get() as u64)
 }
 
 /// Physical address of the empty TTBR0 root
@@ -92,12 +95,12 @@ pub fn direct_end() -> u64 {
 
 /// A zeroed page-table page from the pool, as its physical address
 fn pool_page() -> u64 {
-    unsafe {
-        assert!(POOL_USED < POOL_PAGES, "kmap: page-table pool exhausted");
-        let t = &raw mut POOL.0[POOL_USED];
-        POOL_USED += 1;
-        pa_symbol(t as u64)
-    }
+    let n = POOL_USED.fetch_add(1, Ordering::Relaxed);
+    assert!(n < POOL_PAGES, "kmap: page-table pool exhausted");
+    // SAFETY: page `n` of the pool, in bounds, handed out once (the
+    // counter); only its address is taken
+    let t = unsafe { &raw mut (*POOL.get()).0[n] };
+    pa_symbol(t as u64)
 }
 
 /// Next-level table under `table[idx]`, created if absent
@@ -182,13 +185,13 @@ unsafe fn map_io(root: *mut RawPageTable) {
 ///
 /// # Safety
 /// Once, on the BSP, before SMP and before any user address space.
-pub unsafe fn init(dtb: u64) {
+pub unsafe fn init() {
     use crate::mm::memblock;
-    if !super::dtb::for_each_memory(dtb, memblock::add) {
+    if !super::dtb::for_each_memory(memblock::add) {
         memblock::add(DEFAULT_RAM.0, DEFAULT_RAM.1);
     }
     unsafe {
-        let root = &raw mut SWAPPER;
+        let root = SWAPPER.get();
         let mut end = 0;
         for r in memblock::MEMBLOCK.lock().memory.ranges() {
             end = end.max(map_linear(root, r.base, r.size()));
@@ -248,7 +251,7 @@ const KERNEL_RW: u64 = AF | SH_INNER | ATTR_IDX_NORMAL | AP_EL1_RW | PXN | UXN;
 /// As for `map_page`.
 unsafe fn walk(va: u64, shifts: &[u32], table: &mut dyn FnMut() -> u64) -> *mut RawPageTable {
     unsafe {
-        let mut t = &raw mut SWAPPER;
+        let mut t = SWAPPER.get();
         for &shift in shifts {
             let e = (*t).entry_mut(idx(va, shift));
             if !e.is_valid() {

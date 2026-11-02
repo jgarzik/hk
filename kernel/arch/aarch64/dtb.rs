@@ -7,20 +7,32 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::arch::{AcpiInfo, CpuInfo, phys_to_virt};
 use crate::dt::DeviceTree;
 
-/// Parse DTB and extract hardware configuration
+/// Physical address of the boot DTB (0: none); set once by `set_boot`
+static DTB_PHYS: AtomicU64 = AtomicU64::new(0);
+
+/// Record the boot DTB
 ///
 /// # Safety
-/// The dtb_ptr must point to a valid FDT blob in memory.
-pub fn parse_dtb(dtb_ptr: u64) -> Option<AcpiInfo> {
-    if dtb_ptr == 0 {
-        return None;
-    }
+/// `pa` is 0 or the physical address of readable RAM (through the
+/// direct map), at least 8 bytes, holding the bootloader's FDT if its
+/// magic matches; it stays reserved for the kernel's life.
+pub unsafe fn set_boot(pa: u64) {
+    DTB_PHYS.store(pa, Ordering::Relaxed);
+}
 
-    let dtb_data = blob(dtb_ptr)?;
+/// Physical address of the boot DTB (0: none)
+pub fn boot_phys() -> u64 {
+    DTB_PHYS.load(Ordering::Relaxed)
+}
+
+/// Parse DTB and extract hardware configuration
+pub fn parse_dtb() -> Option<AcpiInfo> {
+    let dtb_data = blob()?;
 
     let dt = DeviceTree::from_fdt(dtb_data).ok()?;
 
@@ -121,20 +133,22 @@ fn extract_cpus(dt: &DeviceTree) -> Vec<CpuInfo> {
     cpus
 }
 
-/// Total size of the FDT blob at `dtb_ptr` (header `totalsize`), if
+/// Total size of the boot FDT blob (header `totalsize`), if
 /// the magic matches; reads only the header, so it is usable before the
 /// heap exists
-pub fn total_size(dtb_ptr: u64) -> Option<usize> {
-    blob(dtb_ptr).map(|b| b.len())
+pub fn total_size() -> Option<usize> {
+    blob().map(|b| b.len())
 }
 
-/// The FDT blob at physical `dtb` (read through the direct map), if
-/// the header magic matches and the size is sane (1KB-16MB)
-pub fn blob(dtb: u64) -> Option<&'static [u8]> {
+/// The boot FDT blob (read through the direct map), if the header magic
+/// matches and the size is sane (1KB-16MB)
+fn blob() -> Option<&'static [u8]> {
+    let dtb = boot_phys();
     if dtb == 0 {
         return None;
     }
     let p = phys_to_virt(dtb) as *const u8;
+    // SAFETY: 8 readable bytes at the recorded address (`set_boot`)
     let h = unsafe { core::slice::from_raw_parts(p, 8) };
     if h[..4] != [0xd0, 0x0d, 0xfe, 0xed] {
         return None;
@@ -143,13 +157,15 @@ pub fn blob(dtb: u64) -> Option<&'static [u8]> {
     if !(1024..=16 * 1024 * 1024).contains(&size) {
         return None;
     }
+    // SAFETY: an FDT (magic checked) of `size` bytes, reserved RAM
+    // (`set_boot`)
     Some(unsafe { core::slice::from_raw_parts(p, size) })
 }
 
 /// Call `f(base, size)` for every RAM range of every /memory node
 /// (each `reg` pair); false if the DTB has none
-pub fn for_each_memory(dtb_ptr: u64, mut f: impl FnMut(u64, u64)) -> bool {
-    let Some(dt) = blob(dtb_ptr).and_then(|b| DeviceTree::from_fdt(b).ok()) else {
+pub fn for_each_memory(mut f: impl FnMut(u64, u64)) -> bool {
+    let Some(dt) = blob().and_then(|b| DeviceTree::from_fdt(b).ok()) else {
         return false;
     };
     let Some(root) = dt.find_node("/") else {
@@ -174,8 +190,8 @@ pub fn for_each_memory(dtb_ptr: u64, mut f: impl FnMut(u64, u64)) -> bool {
 /// the FDT memory reservation block and each /reserved-memory child
 /// (Linux early_init_fdt_scan_reserved_mem; `no-map` ranges are only
 /// reserved, they stay in the linear map)
-pub fn for_each_firmware_reserved(dtb_ptr: u64, mut f: impl FnMut(u64, u64)) {
-    let Some(b) = blob(dtb_ptr) else {
+pub fn for_each_firmware_reserved(mut f: impl FnMut(u64, u64)) {
+    let Some(b) = blob() else {
         return;
     };
     let be64 = |o: usize| u64::from_be_bytes(b[o..o + 8].try_into().unwrap_or([0; 8]));
@@ -226,15 +242,8 @@ impl InitramfsInfo {
 /// Extract initramfs location from DTB /chosen node
 ///
 /// Looks for `linux,initrd-start` and `linux,initrd-end` properties.
-///
-/// # Safety
-/// The dtb_ptr must point to a valid FDT blob in memory.
-pub fn extract_initramfs(dtb_ptr: u64) -> Option<InitramfsInfo> {
-    if dtb_ptr == 0 {
-        return None;
-    }
-
-    let dtb_data = blob(dtb_ptr)?;
+pub fn extract_initramfs() -> Option<InitramfsInfo> {
+    let dtb_data = blob()?;
 
     let dt = DeviceTree::from_fdt(dtb_data).ok()?;
 
@@ -267,8 +276,8 @@ pub fn extract_initramfs(dtb_ptr: u64) -> Option<InitramfsInfo> {
 /// Extract kernel command line from DTB /chosen node bootargs property
 ///
 /// Returns the command line string if found, or None if not present.
-pub fn extract_bootargs(dtb_ptr: u64) -> Option<&'static str> {
-    let dtb_data = blob(dtb_ptr)?;
+pub fn extract_bootargs() -> Option<&'static str> {
+    let dtb_data = blob()?;
 
     let dt = DeviceTree::from_fdt(dtb_data).ok()?;
 
@@ -286,17 +295,10 @@ pub fn extract_bootargs(dtb_ptr: u64) -> Option<&'static str> {
 ///
 /// Looks for nodes with compatible = "simple-framebuffer" and extracts
 /// the framebuffer parameters (address, size, width, height, stride, format).
-///
-/// # Safety
-/// The dtb_ptr must point to a valid FDT blob in memory.
-pub unsafe fn extract_simple_framebuffer(dtb_ptr: u64) -> Option<crate::gfx::FramebufferInfo> {
+pub fn extract_simple_framebuffer() -> Option<crate::gfx::FramebufferInfo> {
     use crate::gfx::{FramebufferInfo, PixelFormat};
 
-    if dtb_ptr == 0 {
-        return None;
-    }
-
-    let dtb_data = blob(dtb_ptr)?;
+    let dtb_data = blob()?;
 
     let dt = DeviceTree::from_fdt(dtb_data).ok()?;
 
@@ -350,17 +352,10 @@ pub unsafe fn extract_simple_framebuffer(dtb_ptr: u64) -> Option<crate::gfx::Fra
 /// Looks for `numa-node-id` properties on `/memory` and `/cpus/cpu@N` nodes.
 /// Returns Ok(true) if NUMA topology was found, Ok(false) if no NUMA info
 /// (caller should use single-node fallback).
-///
-/// # Safety
-/// The dtb_ptr must point to a valid FDT blob in memory.
-pub fn init_numa_topology(dtb_ptr: u64) -> Result<bool, &'static str> {
+pub fn init_numa_topology() -> Result<bool, &'static str> {
     use crate::numa::{LOCAL_DISTANCE, MAX_NUMA_NODES, NUMA_TOPOLOGY, NumaNode, REMOTE_DISTANCE};
 
-    if dtb_ptr == 0 {
-        return Ok(false);
-    }
-
-    let Some(dtb_data) = blob(dtb_ptr) else {
+    let Some(dtb_data) = blob() else {
         return Ok(false);
     };
 

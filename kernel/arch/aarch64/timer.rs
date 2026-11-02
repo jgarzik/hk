@@ -25,12 +25,6 @@ static TICKS_PER_MS: AtomicU64 = AtomicU64::new(0);
 /// Timer interval in milliseconds
 static TIMER_INTERVAL_MS: AtomicU64 = AtomicU64::new(10);
 
-/// Timer tick counter
-static TIMER_TICKS: AtomicU64 = AtomicU64::new(0);
-
-/// Preemption callback (set by scheduler)
-static mut TIMER_CALLBACK: Option<fn()> = None;
-
 /// Read the counter frequency from CNTFRQ_EL0
 #[inline]
 pub fn read_frequency() -> u64 {
@@ -147,9 +141,6 @@ pub fn set_next_event(delta_ns: u64) {
 /// Called from the IRQ handler when the timer fires. The interrupt
 /// handler (`hrtimer::interrupt`) programs the next event.
 pub fn handle_timer_irq() {
-    // Increment tick counter
-    let _ticks = TIMER_TICKS.fetch_add(1, Ordering::Relaxed) + 1;
-
     // Update global timekeeper (only on CPU 0 to avoid contention)
     if super::percpu::try_current_cpu()
         .map(|p| p.id() == 0)
@@ -160,11 +151,4 @@ pub fn handle_timer_irq() {
 
     // Due timers (the scheduler tick among them), the next event
     crate::hrtimer::interrupt();
-
-    // Call preemption callback if registered
-    unsafe {
-        if let Some(callback) = TIMER_CALLBACK {
-            callback();
-        }
-    }
 }

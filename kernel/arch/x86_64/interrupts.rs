@@ -78,8 +78,9 @@ struct IdtPointer {
     base: u64,
 }
 
-/// The Interrupt Descriptor Table
-static mut IDT: [IdtEntry; IDT_ENTRIES] = [IdtEntry::missing(); IDT_ENTRIES];
+/// The Interrupt Descriptor Table: built once (`init_idt`), then only
+/// read by every CPU's `lidt`
+static IDT: spin::Once<[IdtEntry; IDT_ENTRIES]> = spin::Once::new();
 
 /// Exception names for debugging
 const EXCEPTION_NAMES: [&str; 32] = [
@@ -119,130 +120,137 @@ const EXCEPTION_NAMES: [&str; 32] = [
 
 /// Initialize the IDT
 pub fn init_idt() {
-    unsafe {
+    IDT.call_once(build_idt);
+    load_idt();
+}
+
+/// The table: every vector's gate
+fn build_idt() -> [IdtEntry; IDT_ENTRIES] {
+    let mut idt = [IdtEntry::missing(); IDT_ENTRIES];
+    {
         // Set up exception handlers (vectors 0-31)
-        IDT[0].set_handler(
+        idt[0].set_handler(
             entry::exception_handler_0 as *const () as u64,
             GATE_INTERRUPT,
         );
-        IDT[1].set_handler(
+        idt[1].set_handler(
             entry::exception_handler_1 as *const () as u64,
             GATE_INTERRUPT,
         );
         // NMI uses IST2 for safety
-        IDT[2].set_handler_with_ist(
+        idt[2].set_handler_with_ist(
             entry::exception_handler_2 as *const () as u64,
             GATE_INTERRUPT,
             super::cpu::IST_NMI,
         );
-        IDT[3].set_handler(
+        idt[3].set_handler(
             entry::exception_handler_3 as *const () as u64,
             GATE_INT_USER,
         );
-        IDT[4].set_handler(
+        idt[4].set_handler(
             entry::exception_handler_4 as *const () as u64,
             GATE_INT_USER,
         );
-        IDT[5].set_handler(
+        idt[5].set_handler(
             entry::exception_handler_5 as *const () as u64,
             GATE_INTERRUPT,
         );
-        IDT[6].set_handler(
+        idt[6].set_handler(
             entry::exception_handler_6 as *const () as u64,
             GATE_INTERRUPT,
         );
-        IDT[7].set_handler(
+        idt[7].set_handler(
             entry::exception_handler_7 as *const () as u64,
             GATE_INTERRUPT,
         );
         // Double fault uses IST1 to avoid stack issues
-        IDT[8].set_handler_with_ist(
+        idt[8].set_handler_with_ist(
             entry::exception_handler_8 as *const () as u64,
             GATE_INTERRUPT,
             super::cpu::IST_DOUBLE_FAULT,
         );
-        IDT[9].set_handler(
+        idt[9].set_handler(
             entry::exception_handler_9 as *const () as u64,
             GATE_INTERRUPT,
         );
-        IDT[10].set_handler(
+        idt[10].set_handler(
             entry::exception_handler_10 as *const () as u64,
             GATE_INTERRUPT,
         );
-        IDT[11].set_handler(
+        idt[11].set_handler(
             entry::exception_handler_11 as *const () as u64,
             GATE_INTERRUPT,
         );
-        IDT[12].set_handler(
+        idt[12].set_handler(
             entry::exception_handler_12 as *const () as u64,
             GATE_INTERRUPT,
         );
-        IDT[13].set_handler(
+        idt[13].set_handler(
             entry::exception_handler_13 as *const () as u64,
             GATE_INTERRUPT,
         );
-        IDT[14].set_handler(
+        idt[14].set_handler(
             entry::exception_handler_14 as *const () as u64,
             GATE_INTERRUPT,
         );
         // 15 is reserved
-        IDT[16].set_handler(
+        idt[16].set_handler(
             entry::exception_handler_16 as *const () as u64,
             GATE_INTERRUPT,
         );
-        IDT[17].set_handler(
+        idt[17].set_handler(
             entry::exception_handler_17 as *const () as u64,
             GATE_INTERRUPT,
         );
         // Machine check: its own IST stack too
-        IDT[18].set_handler_with_ist(
+        idt[18].set_handler_with_ist(
             entry::exception_handler_18 as *const () as u64,
             GATE_INTERRUPT,
             super::cpu::IST_MCE,
         );
-        IDT[19].set_handler(
+        idt[19].set_handler(
             entry::exception_handler_19 as *const () as u64,
             GATE_INTERRUPT,
         );
-        IDT[20].set_handler(
+        idt[20].set_handler(
             entry::exception_handler_20 as *const () as u64,
             GATE_INTERRUPT,
         );
-        IDT[21].set_handler(
+        idt[21].set_handler(
             entry::exception_handler_21 as *const () as u64,
             GATE_INTERRUPT,
         );
 
         // Set up IRQ handlers (vectors 32-47, after PIC remapping)
         // Master PIC: IRQs 0-7 -> vectors 32-39
-        IDT[32].set_handler(entry::irq_handler_0 as *const () as u64, GATE_INTERRUPT); // Timer
-        IDT[33].set_handler(entry::irq_handler_1 as *const () as u64, GATE_INTERRUPT); // Keyboard
-        IDT[34].set_handler(entry::irq_handler_2 as *const () as u64, GATE_INTERRUPT); // Cascade
-        IDT[35].set_handler(entry::irq_handler_3 as *const () as u64, GATE_INTERRUPT); // COM2
-        IDT[36].set_handler(entry::irq_handler_4 as *const () as u64, GATE_INTERRUPT); // COM1
-        IDT[37].set_handler(entry::irq_handler_5 as *const () as u64, GATE_INTERRUPT); // LPT2
-        IDT[38].set_handler(entry::irq_handler_6 as *const () as u64, GATE_INTERRUPT); // Floppy
-        IDT[39].set_handler(entry::irq_handler_7 as *const () as u64, GATE_INTERRUPT); // LPT1/Spurious
+        idt[32].set_handler(entry::irq_handler_0 as *const () as u64, GATE_INTERRUPT); // Timer
+        idt[33].set_handler(entry::irq_handler_1 as *const () as u64, GATE_INTERRUPT); // Keyboard
+        idt[34].set_handler(entry::irq_handler_2 as *const () as u64, GATE_INTERRUPT); // Cascade
+        idt[35].set_handler(entry::irq_handler_3 as *const () as u64, GATE_INTERRUPT); // COM2
+        idt[36].set_handler(entry::irq_handler_4 as *const () as u64, GATE_INTERRUPT); // COM1
+        idt[37].set_handler(entry::irq_handler_5 as *const () as u64, GATE_INTERRUPT); // LPT2
+        idt[38].set_handler(entry::irq_handler_6 as *const () as u64, GATE_INTERRUPT); // Floppy
+        idt[39].set_handler(entry::irq_handler_7 as *const () as u64, GATE_INTERRUPT); // LPT1/Spurious
         // Slave PIC: IRQs 8-15 -> vectors 40-47
-        IDT[40].set_handler(entry::irq_handler_8 as *const () as u64, GATE_INTERRUPT); // RTC
-        IDT[41].set_handler(entry::irq_handler_9 as *const () as u64, GATE_INTERRUPT); // ACPI/PCI
-        IDT[42].set_handler(entry::irq_handler_10 as *const () as u64, GATE_INTERRUPT); // PCI
-        IDT[43].set_handler(entry::irq_handler_11 as *const () as u64, GATE_INTERRUPT); // PCI
-        IDT[44].set_handler(entry::irq_handler_12 as *const () as u64, GATE_INTERRUPT); // PS/2 Mouse
-        IDT[45].set_handler(entry::irq_handler_13 as *const () as u64, GATE_INTERRUPT); // FPU
-        IDT[46].set_handler(entry::irq_handler_14 as *const () as u64, GATE_INTERRUPT); // Primary ATA
-        IDT[47].set_handler(entry::irq_handler_15 as *const () as u64, GATE_INTERRUPT); // Secondary ATA
+        idt[40].set_handler(entry::irq_handler_8 as *const () as u64, GATE_INTERRUPT); // RTC
+        idt[41].set_handler(entry::irq_handler_9 as *const () as u64, GATE_INTERRUPT); // ACPI/PCI
+        idt[42].set_handler(entry::irq_handler_10 as *const () as u64, GATE_INTERRUPT); // PCI
+        idt[43].set_handler(entry::irq_handler_11 as *const () as u64, GATE_INTERRUPT); // PCI
+        idt[44].set_handler(entry::irq_handler_12 as *const () as u64, GATE_INTERRUPT); // PS/2 Mouse
+        idt[45].set_handler(entry::irq_handler_13 as *const () as u64, GATE_INTERRUPT); // FPU
+        idt[46].set_handler(entry::irq_handler_14 as *const () as u64, GATE_INTERRUPT); // Primary ATA
+        idt[47].set_handler(entry::irq_handler_15 as *const () as u64, GATE_INTERRUPT); // Secondary ATA
 
         // LAPIC timer interrupt (vector 0x40)
-        IDT[LAPIC_TIMER_VECTOR as usize].set_handler(
+        idt[LAPIC_TIMER_VECTOR as usize].set_handler(
             entry::lapic_timer_handler as *const () as u64,
             GATE_INTERRUPT,
         );
 
         // IPIs (mm::tlb shootdown, smp calls, remote wakeups)
-        IDT[CALL_FUNCTION_VECTOR as usize]
+        idt[CALL_FUNCTION_VECTOR as usize]
             .set_handler(entry::call_function_ipi as *const () as u64, GATE_INTERRUPT);
-        IDT[RESCHEDULE_VECTOR as usize]
+        idt[RESCHEDULE_VECTOR as usize]
             .set_handler(entry::reschedule_ipi as *const () as u64, GATE_INTERRUPT);
 
         // Every other vector gets a catch-all stub (Linux idt_setup_apic_
@@ -250,23 +258,23 @@ pub fn init_idt() {
         // LAPIC spurious vector, APIC errors, a vector left programmed by
         // firmware) is reported instead of raising #NP. Not #VC/#SX
         // (29, 30): they push an error code and hk never enables them.
-        let idt = &raw mut IDT;
-        for v in 0..IDT_ENTRIES {
-            let gate = &mut (*idt)[v];
+        for (v, gate) in idt.iter_mut().enumerate() {
             if gate.type_attr == 0 && !matches!(v, 29 | 30) {
                 gate.set_handler(entry::vector_stub(v as u8), GATE_INTERRUPT);
             }
         }
     }
-    load_idt();
+    idt
 }
 
 /// Load the IDT (shared by every CPU) on this CPU
 pub fn load_idt() {
     let idt_ptr = IdtPointer {
         limit: (size_of::<[IdtEntry; IDT_ENTRIES]>() - 1) as u16,
-        base: (&raw const IDT) as *const _ as u64,
+        base: IDT.get().expect("load_idt before init_idt").as_ptr() as u64,
     };
+    // SAFETY: a static table of valid gates (`build_idt`), never freed
+    // or changed
     unsafe {
         ::core::arch::asm!(
             "lidt [{}]",
@@ -744,19 +752,13 @@ fn handle_lapic_timer() {
     percpu.interrupt_depth.fetch_sub(1, Ordering::Relaxed);
 }
 
-/// Timer tick counter
-static mut TIMER_TICKS: u64 = 0;
-
 /// Legacy PIC interrupt `irq` (0-15)
 fn handle_irq(irq: u64) {
     let irq = irq as u8;
 
     match irq {
         0 => {
-            // Timer interrupt (PIT)
-            unsafe {
-                TIMER_TICKS += 1;
-            }
+            // Timer interrupt (PIT): the LAPIC timer drives the tick
         }
         4 => {
             // COM1 - serial interrupt (input not implemented, output-only console)

@@ -6,7 +6,6 @@ These are safe fns or patterns whose use leads to undefined behaviour.
 None is known to fail today, but each is a soundness bug:
 
 - **Safe fns that take addresses:**
-  - `dtb::blob` and the dtb parsers take a physical address.
   - aarch64/x86 paging `entry_atomic` returns `&'static AtomicU64` into
     a table that can be freed; the mm `pte` helpers take `*mut u64`.
 - **Inode locks:** `unlock_rename` and `inode_lock`/`inode_unlock` are

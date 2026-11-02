@@ -391,7 +391,7 @@ impl ArchBusOps for X86_64Arch {
 impl MemoryLayoutOps for X86_64Arch {
     fn memblock_init() {
         use crate::mm::memblock;
-        let mbi = unsafe { crate::MULTIBOOT2_INFO };
+        let mbi = crate::multiboot2_info();
         unsafe {
             crate::multiboot2::for_each_region(mbi, |base, len, kind| {
                 if kind == crate::multiboot2::MEMORY_AVAILABLE {
@@ -431,7 +431,7 @@ impl ExceptionOps for X86_64Arch {
 
 impl InitramfsOps for X86_64Arch {
     fn get_initramfs() -> &'static [u8] {
-        let multiboot_info = unsafe { crate::MULTIBOOT2_INFO };
+        let multiboot_info = crate::multiboot2_info();
         unsafe { crate::multiboot2::find_module(multiboot_info, "initramfs") }
             .expect("initramfs module not loaded by bootloader")
     }

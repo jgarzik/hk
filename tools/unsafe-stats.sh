@@ -47,3 +47,4 @@ out=$(find kernel -name '*.rs' | sort | xargs awk '
 printf "%-16s %7s %7s %7s %9s\n" dir blocks fns impls SAFETY%
 grep -v '^TOTAL' <<< "$out" | sort -k2 -rn
 grep '^TOTAL' <<< "$out"
+printf "static mut: %d\n" "$(grep -rn --include=*.rs -E '^[^/]*\bstatic mut\b' kernel | wc -l)"

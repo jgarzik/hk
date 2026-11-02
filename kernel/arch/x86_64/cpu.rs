@@ -246,7 +246,8 @@ struct IstStack([u8; IST_STACK_SIZE]);
 
 /// The boot CPU's IST stacks (it sets up its tables before the frame
 /// allocator exists; the APs get theirs from `alloc_ist`)
-static mut BOOT_IST: [IstStack; IST_COUNT] = [const { IstStack([0; IST_STACK_SIZE]) }; IST_COUNT];
+static BOOT_IST: crate::sync::RacyCell<[IstStack; IST_COUNT]> =
+    crate::sync::RacyCell::new([const { IstStack([0; IST_STACK_SIZE]) }; IST_COUNT]);
 
 /// Create a TSS descriptor (128 bits split into two 64-bit entries)
 fn create_tss_descriptor(tss_addr: u64) -> (u64, u64) {
@@ -326,8 +327,12 @@ pub fn load_tables(cpu: u32) {
 /// Initialize the boot CPU's GDT and TSS (early boot, before per-CPU
 /// data: CPU 0's tables) and clear the data segment registers
 pub fn init_gdt() {
+    // SAFETY: the end address of stack `i` (in bounds; the CPU alone
+    // uses the stacks, on IST entries)
     let tops = core::array::from_fn(|i| unsafe {
-        (&raw const BOOT_IST[i]).cast::<u8>().add(IST_STACK_SIZE) as u64
+        (&raw const (*BOOT_IST.get())[i])
+            .cast::<u8>()
+            .add(IST_STACK_SIZE) as u64
     });
     set_ist(0, tops);
     load_tables(0);

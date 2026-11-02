@@ -46,8 +46,8 @@ impl ApBootData {
 }
 
 /// Static boot data for each AP (read by the AP with the MMU off)
-static mut AP_BOOT_DATA: [ApBootData; percpu::MAX_CPUS] =
-    [const { ApBootData::zeroed() }; percpu::MAX_CPUS];
+static AP_BOOT_DATA: crate::sync::RacyCell<[ApBootData; percpu::MAX_CPUS]> =
+    crate::sync::RacyCell::new([const { ApBootData::zeroed() }; percpu::MAX_CPUS]);
 
 /// Flag set by AP when ready
 static AP_READY: AtomicU32 = AtomicU32::new(0);
@@ -117,8 +117,10 @@ pub fn init<FA: FrameAlloc<PhysAddr = u64>>(acpi: &AcpiInfo, _frame_alloc: &mut 
         let target_mpidr = cpu_info.hw_cpu_id as u64;
 
         // Set up boot data for this AP
+        // SAFETY: this AP's slot, written by the BSP alone while the AP
+        // is off; the AP reads it only after PSCI CPU_ON below
         unsafe {
-            let boot_data = &mut AP_BOOT_DATA[cpu_id as usize];
+            let boot_data = &mut (*AP_BOOT_DATA.get())[cpu_id as usize];
             boot_data.stack_top = stack_top;
             boot_data.ttbr1 = super::kmap::swapper_phys();
             boot_data.entry_point = ap_rust_entry as *const () as u64;
@@ -134,7 +136,9 @@ pub fn init<FA: FrameAlloc<PhysAddr = u64>>(acpi: &AcpiInfo, _frame_alloc: &mut 
 
         // Physical addresses of the AP entry point and its boot data
         let entry_phys = pa_symbol(ap_entry_point as *const () as u64);
-        let context_phys = pa_symbol(unsafe { &raw const AP_BOOT_DATA[cpu_id as usize] } as u64);
+        // SAFETY: the address of an in-bounds slot (no access)
+        let context_phys =
+            pa_symbol(unsafe { &raw const (*AP_BOOT_DATA.get())[cpu_id as usize] } as u64);
 
         // Call PSCI CPU_ON
         // SAFETY: the AP entry stub and this CPU's boot data

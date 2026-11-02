@@ -10,10 +10,12 @@
 
 pub mod lockdep;
 mod mutex;
+mod racy;
 mod rwsem;
 pub mod spin;
 
 pub use mutex::{Mutex, MutexGuard};
+pub use racy::RacyCell;
 pub use rwsem::{RwSem, RwSemReadGuard, RwSemWriteGuard};
 
 /// The caller is a task that may sleep (not tid 0: an idle task or the

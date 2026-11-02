@@ -131,11 +131,13 @@ static DIRECT_DMA_OPS: DirectDmaOps = DirectDmaOps::new(&FRAME_ALLOCATOR);
 
 /// Multiboot2 info pointer (set by _start, used by kmain) - x86_64 only
 #[cfg(target_arch = "x86_64")]
-pub static mut MULTIBOOT2_INFO: u64 = 0;
+pub static MULTIBOOT2_INFO: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-/// Device Tree Blob pointer (set by _start_rust, used by kmain) - aarch64 only
-#[cfg(target_arch = "aarch64")]
-pub static mut DTB_PTR: u64 = 0;
+/// The multiboot2 info pointer
+#[cfg(target_arch = "x86_64")]
+pub fn multiboot2_info() -> u64 {
+    MULTIBOOT2_INFO.load(core::sync::atomic::Ordering::Relaxed)
+}
 
 /// Embedded initramfs for aarch64 (fallback when DTB doesn't provide initramfs)
 /// This embeds the initramfs directly into the kernel binary.
@@ -151,8 +153,8 @@ pub extern "C" fn _start(multiboot_info: u64) -> ! {
     // Kernel page table first: the boot tables' identity map goes away
     unsafe {
         arch::x86_64::kmap::init(multiboot_info);
-        MULTIBOOT2_INFO = multiboot_info;
     }
+    MULTIBOOT2_INFO.store(multiboot_info, core::sync::atomic::Ordering::Relaxed);
 
     // Messages before console attach are buffered
     printkln!("hk kernel starting...");
@@ -190,10 +192,9 @@ pub extern "C" fn _start_rust(dtb_ptr: u64) -> ! {
     // Initialize serial FIRST before anything else
     crate::arch::aarch64::serial::init();
 
-    // Save DTB pointer for later use
-    unsafe {
-        DTB_PTR = dtb_ptr;
-    }
+    // SAFETY: the bootloader's DTB pointer (x0), in RAM the boot tables
+    // linear-map
+    unsafe { crate::arch::aarch64::dtb::set_boot(dtb_ptr) };
 
     // Direct serial output for early boot debugging (bypasses console subsystem)
     crate::arch::aarch64::serial::write_str("hk kernel starting... (aarch64)\r\n");
@@ -210,7 +211,9 @@ pub extern "C" fn _start_rust(dtb_ptr: u64) -> ! {
             .chain((0x4200_0000u64..0x6000_0000).step_by(0x1000))
             .find(|&pa| magic(pa).swap_bytes() == DTB_MAGIC_BE);
         if let Some(pa) = found {
-            unsafe { DTB_PTR = pa };
+            // SAFETY: RAM (the first gigabyte, linear-mapped) with the FDT
+            // magic
+            unsafe { crate::arch::aarch64::dtb::set_boot(pa) };
         }
     }
 
@@ -219,10 +222,10 @@ pub extern "C" fn _start_rust(dtb_ptr: u64) -> ! {
 
     // Final kernel page tables (linear map of all RAM, which goes to
     // memblock)
-    unsafe { crate::arch::aarch64::kmap::init(DTB_PTR) };
+    unsafe { crate::arch::aarch64::kmap::init() };
 
     // Extract and parse kernel command line from DTB /chosen/bootargs
-    if let Some(cmdline) = crate::arch::aarch64::dtb::extract_bootargs(unsafe { DTB_PTR })
+    if let Some(cmdline) = crate::arch::aarch64::dtb::extract_bootargs()
         && !cmdline.is_empty()
     {
         printkln!("Cmdline: {}", cmdline);
@@ -263,8 +266,7 @@ fn init_numa_topology() {
 
     #[cfg(target_arch = "aarch64")]
     {
-        let dtb_ptr = unsafe { DTB_PTR };
-        match arch::aarch64::dtb::init_numa_topology(dtb_ptr) {
+        match arch::aarch64::dtb::init_numa_topology() {
             Ok(true) => {
                 numa::print_topology();
                 return;
@@ -296,13 +298,13 @@ fn discover_boot_framebuffer() {
     #[cfg(target_arch = "x86_64")]
     {
         // Parse multiboot2 framebuffer tag
-        fb_info = unsafe { multiboot2::get_framebuffer(MULTIBOOT2_INFO) };
+        fb_info = unsafe { multiboot2::get_framebuffer(multiboot2_info()) };
     }
 
     #[cfg(target_arch = "aarch64")]
     {
         // Parse device tree simple-framebuffer node
-        fb_info = unsafe { arch::aarch64::dtb::extract_simple_framebuffer(DTB_PTR) };
+        fb_info = arch::aarch64::dtb::extract_simple_framebuffer();
     }
 
     if let Some(info) = fb_info {
@@ -732,7 +734,7 @@ pub fn init_vfat_ramdisk(
     use fs::ramfs_create_dir;
 
     // Look for vfat module loaded by bootloader
-    let vfat_data = match unsafe { multiboot2::find_module(MULTIBOOT2_INFO, "vfat") } {
+    let vfat_data = match unsafe { multiboot2::find_module(multiboot2_info(), "vfat") } {
         Some(data) => data,
         None => return,
     };

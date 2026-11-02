@@ -31,11 +31,12 @@ const PAGE_SIZE: usize = 4096;
 unsafe extern "C" {
     static __trampoline_start: u8;
     static __trampoline_end: u8;
-    static mut __ap_data_pml4: u64;
-    static mut __ap_data_entry: u64;
-    static mut __ap_data_stack: u64;
-    static mut __ap_data_cpu_id: u32;
-    static mut __ap_data_apic_id: u32;
+    // Only their addresses are used (offsets into the trampoline copy)
+    static __ap_data_pml4: u64;
+    static __ap_data_entry: u64;
+    static __ap_data_stack: u64;
+    static __ap_data_cpu_id: u32;
+    static __ap_data_apic_id: u32;
 }
 
 /// Flag set by AP when it's ready

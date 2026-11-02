@@ -85,9 +85,12 @@ carries CPU-local state (IRQ flags, a preempt count) is `!Send`.
 
 ### 6. No `static mut`
 
-Use atomics, `Once`/`spin::Once`, a lock, or a cell type with a documented
-`unsafe impl Sync`. Linker symbols are declared in `unsafe extern` blocks
-and only their addresses are used (`&raw const`).
+Use atomics, `Once`/`spin::Once`, or a lock. For memory that hardware
+or code outside Rust's view also uses (boot page tables, IST stacks, AP
+boot data), use `sync::RacyCell`: it hands out only a raw pointer, so
+each access is an `unsafe` block with its own reason. Linker symbols are
+declared in `unsafe extern` blocks and only their addresses are used
+(`&raw const`). `make unsafe-stats` counts any `static mut` (0).
 
 ### 7. Pointers and provenance
 
