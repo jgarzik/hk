@@ -29,6 +29,7 @@ use super::file::{
     DirContext, DirEntry as VfsDirEntry, File, FileOps, generic_file_pread, generic_file_pwrite,
     generic_file_read, generic_file_write,
 };
+use super::icache;
 use super::inode::{AsAny, FileType, Inode, InodeData, InodeMode, InodeOps, Timespec};
 use super::superblock::{
     FileSystemType, MSDOS_SUPER_MAGIC, StatFs, SuperBlock, SuperBlockData, SuperOps, fs_flags,
@@ -1669,11 +1670,36 @@ impl InodeOps for VfatInodeOps {
         // Find matching entry (case-insensitive for FAT)
         for entry in entries {
             if entry.name.eq_ignore_ascii_case(name) {
-                return create_inode_for_entry(&sb, &entry, inode_data.start_cluster);
+                return vfat_iget(&sb, &entry, inode_data.start_cluster);
             }
         }
 
         Err(KernelError::NotFound)
+    }
+
+    /// An unlinked file's clusters are freed with its inode (Linux
+    /// fat_evict_inode), on the system workqueue: the last reference can
+    /// go where no I/O may be done
+    fn evict_inode(&self, inode: &Inode) {
+        if inode.get_nlink() != 0 {
+            return;
+        }
+        let (Ok(d), Some(sb)) = (get_inode_data(inode), inode.superblock()) else {
+            return;
+        };
+        let Ok(sb_data) = get_sb_data(&sb) else {
+            return;
+        };
+        if d.start_cluster == 0 {
+            return;
+        }
+        let mut job = Some((sb_data, d.start_cluster));
+        let work = crate::workqueue::Work::new(move || {
+            if let Some((sb_data, start)) = job.take() {
+                let _ = free_cluster_chain(&sb_data, start);
+            }
+        });
+        crate::workqueue::SYSTEM_WQ.queue_work(Arc::new(crate::sync::spin::Mutex::new(work)));
     }
 
     fn readpage(
@@ -1899,6 +1925,7 @@ impl InodeOps for VfatInodeOps {
             short_name,
             file_id: vfat_file_id(sb_data.bdev.dev_id(), start_cluster),
         }));
+        icache::insert_inode_hash(&inode, ikey(parent_cluster, &short_name));
 
         Ok(inode)
     }
@@ -1982,6 +2009,7 @@ impl InodeOps for VfatInodeOps {
             short_name,
             file_id: vfat_file_id(sb_data.bdev.dev_id(), new_cluster),
         }));
+        icache::insert_inode_hash(&inode, ikey(parent_cluster, &short_name));
 
         Ok(inode)
     }
@@ -2006,15 +2034,16 @@ impl InodeOps for VfatInodeOps {
             return Err(KernelError::IsDirectory);
         }
 
-        // Delete the directory entry
+        // Delete the directory entry; its clusters go now, or with the
+        // last reference to its inode (Linux fat_unlink + fat_evict_inode)
         let start_cluster = delete_dir_entry(&sb_data, dir_inode_data.start_cluster, name)?;
-
-        // Free the cluster chain if the file had data
-        if start_cluster != 0 {
-            free_cluster_chain(&sb_data, start_cluster)?;
-        }
-
-        Ok(())
+        drop_link(
+            &sb,
+            &sb_data,
+            dir_inode_data.start_cluster,
+            entry,
+            start_cluster,
+        )
     }
 
     fn rmdir(&self, dir: &Inode, name: &str) -> Result<(), KernelError> {
@@ -2045,15 +2074,15 @@ impl InodeOps for VfatInodeOps {
             }
         }
 
-        // Delete the directory entry
+        // Delete the directory entry (clusters as for unlink)
         let start_cluster = delete_dir_entry(&sb_data, dir_inode_data.start_cluster, name)?;
-
-        // Free the cluster chain
-        if start_cluster != 0 {
-            free_cluster_chain(&sb_data, start_cluster)?;
-        }
-
-        Ok(())
+        drop_link(
+            &sb,
+            &sb_data,
+            dir_inode_data.start_cluster,
+            entry,
+            start_cluster,
+        )
     }
 
     fn truncate(&self, inode: &Inode, length: u64) -> Result<(), KernelError> {
@@ -2263,12 +2292,16 @@ impl InodeOps for VfatInodeOps {
                     }
                 }
             }
-            // Delete existing entry
+            // Delete existing entry (its clusters as for unlink)
             let existing_cluster =
                 delete_dir_entry(&sb_data, new_dir_data.start_cluster, new_name)?;
-            if existing_cluster != 0 {
-                free_cluster_chain(&sb_data, existing_cluster)?;
-            }
+            drop_link(
+                &sb,
+                &sb_data,
+                new_dir_data.start_cluster,
+                existing,
+                existing_cluster,
+            )?;
         }
 
         // Create new entry with old entry's data
@@ -2277,7 +2310,7 @@ impl InodeOps for VfatInodeOps {
         } else {
             attr::ARCHIVE
         };
-        create_dir_entry_with_lfn(
+        let new_short = create_dir_entry_with_lfn(
             &sb_data,
             new_dir_data.start_cluster,
             new_name,
@@ -2289,11 +2322,78 @@ impl InodeOps for VfatInodeOps {
         // Delete old entry (don't free clusters - they belong to new entry now)
         delete_dir_entry(&sb_data, old_dir_data.start_cluster, old_name)?;
 
+        // The moved object keeps its inode (Linux fat_detach + fat_attach)
+        if let Some(inode) = cached(&sb, old_dir_data.start_cluster, &old_entry.short_name) {
+            let mut d = get_inode_data(&inode)?;
+            d.parent_cluster = new_dir_data.start_cluster;
+            d.short_name = new_short;
+            inode.set_private(Arc::new(d));
+            icache::rehash(&inode, ikey(new_dir_data.start_cluster, &new_short));
+        }
         Ok(())
     }
 }
 
 pub static VFAT_INODE_OPS: VfatInodeOps = VfatInodeOps;
+
+/// Inode cache key of the entry `short` in the directory at `parent`
+/// (Linux fat i_pos: the entry's place on disk)
+fn ikey(parent: u32, short: &[u8; 11]) -> u64 {
+    short
+        .iter()
+        .fold(parent as u64 ^ 0xcbf2_9ce4_8422_2325, |h, &b| {
+            (h ^ b as u64).wrapping_mul(0x100_0000_01b3)
+        })
+}
+
+/// `inode` is the object at (parent, short); runs under the inode
+/// cache's bucket lock (takes only `Inode.private`)
+fn is_obj(inode: &Inode, parent: u32, short: &[u8; 11]) -> bool {
+    get_inode_data(inode).is_ok_and(|d| d.parent_cluster == parent && d.short_name == *short)
+}
+
+/// The cached inode of the entry `short` in the directory at `parent`
+fn cached(sb: &Arc<SuperBlock>, parent: u32, short: &[u8; 11]) -> Option<Arc<Inode>> {
+    icache::ilookup5(sb, ikey(parent, short), &|i| is_obj(i, parent, short))
+}
+
+/// The one inode of a directory entry (Linux fat_build_inode: fat_iget,
+/// else a new inode hashed by its position)
+fn vfat_iget(
+    sb: &Arc<SuperBlock>,
+    entry: &ParsedDirEntry,
+    parent: u32,
+) -> Result<Arc<Inode>, KernelError> {
+    let short = entry.short_name;
+    icache::iget5(
+        sb,
+        ikey(parent, &short),
+        &|i| is_obj(i, parent, &short),
+        || create_inode_for_entry(sb, entry, parent),
+    )
+}
+
+/// The entry `entry` of the directory at `parent` was removed: its
+/// cached inode becomes unlinked (nlink 0, unhashed) and keeps its
+/// clusters until its last reference goes (`evict_inode`); with no
+/// cached inode they are freed now
+fn drop_link(
+    sb: &Arc<SuperBlock>,
+    sb_data: &VfatSbData,
+    parent: u32,
+    entry: &ParsedDirEntry,
+    start_cluster: u32,
+) -> Result<(), KernelError> {
+    if let Some(inode) = cached(sb, parent, &entry.short_name) {
+        inode.nlink.store(0, core::sync::atomic::Ordering::Release);
+        icache::remove_inode_hash(&inode);
+        return Ok(());
+    }
+    if start_cluster != 0 {
+        free_cluster_chain(sb_data, start_cluster)?;
+    }
+    Ok(())
+}
 
 /// Create an inode for a parsed directory entry
 fn create_inode_for_entry(

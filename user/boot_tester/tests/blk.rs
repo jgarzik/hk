@@ -14,7 +14,7 @@ use super::helpers::{
 use hk_syscall::{
     O_CREAT, O_RDONLY, O_RDWR, Stat, sys_close, sys_fstat, sys_fsync, sys_ioctl, sys_lseek,
     sys_mkdir, sys_mount, sys_open, sys_pread64, sys_pwrite64, sys_read, sys_stat, sys_swapoff,
-    sys_swapon, sys_umount2,
+    sys_rename, sys_swapon, sys_umount2, sys_unlink,
 };
 
 const BLKROGET: u64 = 0x125e;
@@ -349,8 +349,56 @@ fn vfat(p1: &BlkDev) {
         ok && n == 7,
         if fd < 0 { fd as i64 } else { n },
     );
+    vfat_rename_ino();
+    vfat_unlink_open();
     let u = sys_umount2(b"/mnt/vd1\0".as_ptr(), 0);
     verdict(b"BLK_VFAT_UMOUNT", u == 0, u);
+}
+
+/// An open file renamed is still the same inode under its new name
+/// (one inode per FAT entry, moved with it: Linux fat_iget/fat_attach)
+fn vfat_rename_ino() {
+    let fd = sys_open(b"/mnt/vd1/A.TXT\0".as_ptr(), O_RDWR | O_CREAT, 0o644) as i32;
+    let r = sys_rename(b"/mnt/vd1/A.TXT\0".as_ptr(), b"/mnt/vd1/B.TXT\0".as_ptr());
+    let mut a: Stat = unsafe { core::mem::zeroed() };
+    let mut b: Stat = unsafe { core::mem::zeroed() };
+    sys_fstat(fd, &mut a);
+    let s = sys_stat(b"/mnt/vd1/B.TXT\0".as_ptr(), &mut b);
+    sys_close(fd as u64);
+    sys_unlink(b"/mnt/vd1/B.TXT\0".as_ptr());
+    verdict(
+        b"VFAT_RENAME_INO",
+        fd >= 0 && r == 0 && s == 0 && a.st_ino == b.st_ino,
+        r * 1000 + s,
+    );
+}
+
+/// An unlinked file still open keeps its data: its clusters are not
+/// reused by a new file until the last close (Linux fat_evict_inode)
+fn vfat_unlink_open() {
+    let mut buf = [0u8; 16384];
+    buf.fill(b'u');
+    let fd = sys_open(b"/mnt/vd1/U.TXT\0".as_ptr(), O_RDWR | O_CREAT, 0o644) as i32;
+    let w = sys_pwrite64(fd, buf.as_ptr(), buf.len() as u64, 0);
+    sys_fsync(fd);
+    let un = sys_unlink(b"/mnt/vd1/U.TXT\0".as_ptr());
+    buf.fill(b'v');
+    let v = sys_open(b"/mnt/vd1/V.TXT\0".as_ptr(), O_RDWR | O_CREAT, 0o644) as i32;
+    let wv = sys_pwrite64(v, buf.as_ptr(), buf.len() as u64, 0);
+    sys_fsync(v);
+    sys_close(v as u64);
+    buf.fill(0);
+    let n = sys_pread64(fd, buf.as_mut_ptr(), buf.len() as u64, 0);
+    let mut st: Stat = unsafe { core::mem::zeroed() };
+    sys_fstat(fd, &mut st);
+    sys_close(fd as u64);
+    sys_unlink(b"/mnt/vd1/V.TXT\0".as_ptr());
+    let kept = buf.iter().all(|&c| c == b'u');
+    verdict(
+        b"VFAT_UNLINK_OPEN",
+        w == 16384 && un == 0 && wv == 16384 && n == 16384 && kept && st.st_nlink == 0,
+        n,
+    );
 }
 
 /// swapon reads vda2's swap header through the block layer

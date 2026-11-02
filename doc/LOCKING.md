@@ -1634,6 +1634,23 @@ pub struct Inode {
 }
 ```
 
+**Inode cache** (`fs/icache.rs`, Linux inode_hashtable): vfat inodes
+(by directory-entry position) are hashed so each on-disk object has one
+`Inode`. One `IrqSpinlock` per bucket (a RAM-sized table), a leaf:
+under it only the bucket vector, `Weak` counts and the filesystem's
+`test` (which may take `Inode.private`, a spin RwLock). IRQ-safe
+because a last reference could go anywhere. The hash holds `Weak`s;
+an inode upgraded under a bucket lock is never dropped there (its last
+reference's eviction takes the same lock): lookups keep them in a
+vector dropped after unlocking. Eviction (`Drop for Inode` ->
+`icache::evict`, Linux iput_final -> evict) runs where the last `Arc`
+goes, possibly under spin locks: it takes the bucket lock (if hashed)
+and calls `->evict_inode`, which must not sleep; vfat queues the
+cluster freeing of an unlinked file on `SYSTEM_WQ`
+(`Workqueue.inner`, IrqSpinlock leaf). Deviation from Linux: no
+unused-inode LRU or I_NEW state (an inode is complete before it is
+hashed; the losing builder's inode is dropped unhashed).
+
 **Dentry** (`fs/dentry.rs`):
 
 Following Linux's `d_lock` pattern, each dentry has a single RwLock protecting

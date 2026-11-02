@@ -297,6 +297,14 @@ pub trait InodeOps: Send + Sync {
         Err(KernelError::OperationNotSupported)
     }
 
+    /// The last reference to the inode is gone (Linux ->evict_inode):
+    /// release what the object still owns, e.g. the blocks of an
+    /// unlinked file. Called from `Drop for Inode` in any context:
+    /// must not sleep (defer I/O to a workqueue).
+    fn evict_inode(&self, inode: &Inode) {
+        let _ = inode;
+    }
+
     /// Get file size (may be dynamically computed for procfs)
     ///
     /// Timestamps are read lock-free (Linux generic_fillattr).
@@ -492,6 +500,11 @@ pub struct Inode {
     /// A FIFO's pipe while it is open, and how many files have it open
     /// (Linux inode->i_pipe and pipe->files)
     pub i_pipe: crate::sync::spin::Mutex<Option<(Arc<crate::pipe::Pipe>, usize)>>,
+
+    /// The inode cache key it is hashed under (`fs::icache`)
+    pub(super) i_hash: AtomicU64,
+    /// Hashed in the inode cache (Linux !inode_unhashed)
+    pub(super) i_hashed: core::sync::atomic::AtomicBool,
 }
 
 impl Inode {
@@ -527,6 +540,8 @@ impl Inode {
             i_rwsem: RwSem::new(()),
             private: RwLock::new(None),
             i_pipe: crate::sync::spin::Mutex::new(None),
+            i_hash: AtomicU64::new(0),
+            i_hashed: core::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -563,6 +578,8 @@ impl Inode {
             i_rwsem: RwSem::new(()),
             private: RwLock::new(None),
             i_pipe: crate::sync::spin::Mutex::new(None),
+            i_hash: AtomicU64::new(0),
+            i_hashed: core::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -758,3 +775,9 @@ impl InodeOps for NullInodeOps {
 
 /// Static null inode ops instance
 pub static NULL_INODE_OPS: NullInodeOps = NullInodeOps;
+
+impl Drop for Inode {
+    fn drop(&mut self) {
+        super::icache::evict(self);
+    }
+}
