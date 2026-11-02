@@ -112,6 +112,12 @@ impl crate::arch::UserRegs for Aarch64TrapFrame {
         self.syscallno
     }
 
+    /// The first from orig_x0, as Linux syscall_get_arguments
+    fn syscall_args(&self) -> [u64; 6] {
+        let x = &self.x;
+        [self.orig_x0, x[1], x[2], x[3], x[4], x[5]]
+    }
+
     fn forget_syscall(&mut self) {
         self.syscallno = NO_SYSCALL;
     }

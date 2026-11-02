@@ -617,15 +617,6 @@ pub fn aarch64_syscall_dispatch(
     // Account for entering kernel mode
     percpu::account_syscall_enter();
 
-    // Check seccomp policy before executing syscall
-    // Note: ip is not available here, pass 0 for now
-    if let Some(result) =
-        crate::seccomp::check::check_syscall_aarch64(num, 0, arg0, arg1, arg2, arg3, arg4, arg5)
-    {
-        percpu::account_syscall_exit();
-        return result;
-    }
-
     match num {
         // I/O syscalls
         SYS_READ => sys_read(arg0 as i32, arg1, arg2) as u64,

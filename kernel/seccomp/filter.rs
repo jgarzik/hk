@@ -29,6 +29,22 @@ pub struct SeccompFilter {
 }
 
 impl SeccompFilter {
+    /// `self` is `filter` or one of the filters it stacks on (Linux
+    /// is_ancestor; no filter is everyone's ancestor)
+    pub fn is_ancestor_of(this: Option<&Arc<Self>>, filter: Option<&Arc<Self>>) -> bool {
+        let Some(this) = this else {
+            return true;
+        };
+        let mut f = filter;
+        while let Some(cur) = f {
+            if Arc::ptr_eq(cur, this) {
+                return true;
+            }
+            f = cur.prev.as_ref();
+        }
+        false
+    }
+
     /// Create a new seccomp filter from a cBPF program
     ///
     /// # Arguments

@@ -1847,6 +1847,26 @@ fn deliver_to_handler(
     }
 }
 
+/// Force `sig` on task `tid` (Linux force_sig_info_to_task with
+/// HANDLER_CURRENT): if blocked or ignored, its action goes back to
+/// SIG_DFL and it is unblocked, so it cannot be dodged; a handler that
+/// is not blocked still runs. Delivered on the way back to user mode.
+pub fn force_sig(tid: Tid, sig: u32) {
+    let sighand = get_task_sighand(tid);
+    let ignored = sighand
+        .as_ref()
+        .and_then(|h| h.get_action(sig))
+        .is_some_and(|a| a.handler == SigHandler::Ignore);
+    let blocked = with_task_signal_state(tid, |s| s.blocked.contains(sig)).unwrap_or(false);
+    if blocked || ignored {
+        if let Some(h) = &sighand {
+            let _ = h.set_action(sig, SigAction::default());
+        }
+        with_task_signal_state(tid, |s| s.blocked.remove(sig));
+    }
+    send_signal_force(tid, sig, true);
+}
+
 /// Force delivery of SIGSEGV (for stack errors during signal setup)
 ///
 /// Like Linux force_sigsegv: the handler is reset to SIG_DFL and SIGSEGV is

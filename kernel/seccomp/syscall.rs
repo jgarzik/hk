@@ -5,7 +5,7 @@
 use crate::error::KernelError;
 use crate::task::percpu::TASKLIST;
 
-use super::filter::create_filter_from_user;
+use super::filter::{SeccompFilter, create_filter_from_user};
 use super::{
     SECCOMP_FILTER_FLAG_LOG, SECCOMP_FILTER_FLAG_TSYNC, SECCOMP_GET_ACTION_AVAIL,
     SECCOMP_GET_NOTIF_SIZES, SECCOMP_MODE_DISABLED, SECCOMP_MODE_FILTER, SECCOMP_MODE_STRICT,
@@ -86,8 +86,9 @@ fn set_seccomp_strict() -> i64 {
     0
 }
 
-/// Enable FILTER seccomp mode with a BPF program
-fn set_seccomp_filter(fprog_ptr: u64, log: bool, _tsync: bool) -> i64 {
+/// Enable FILTER seccomp mode with a BPF program; `tsync` puts it on
+/// every thread of the group (Linux SECCOMP_FILTER_FLAG_TSYNC)
+fn set_seccomp_filter(fprog_ptr: u64, log: bool, tsync: bool) -> i64 {
     use crate::arch::Uaccess;
 
     if fprog_ptr == 0 {
@@ -107,7 +108,7 @@ fn set_seccomp_filter(fprog_ptr: u64, log: bool, _tsync: bool) -> i64 {
         (
             task.seccomp_filter.clone(),
             task.prctl.no_new_privs,
-            task.cred().euid == 0, // Root is privileged
+            crate::task::capable(crate::task::CAP_SYS_ADMIN),
         )
     };
 
@@ -122,24 +123,53 @@ fn set_seccomp_filter(fprog_ptr: u64, log: bool, _tsync: bool) -> i64 {
         Err(e) => return -(e as i64),
     };
 
-    // Update task's seccomp state
-    {
-        let mut table = TASKLIST.write();
-        let mut task = match table.get_mut(tid) {
-            Some(t) => t,
-            None => return KernelError::NoProcess.sysret(),
+    // TSYNC holds the group's cred_guard (Linux: killable) so no exec
+    // changes the threads meanwhile
+    let _guard = if tsync {
+        match crate::signal::CredGuard::lock(tid) {
+            Ok(g) => Some(g),
+            Err(e) => return e.sysret(),
+        }
+    } else {
+        None
+    };
+    let mut table = TASKLIST.write();
+    let Some(me) = table.get(tid) else {
+        return KernelError::NoProcess.sysret();
+    };
+    let (pid, mine, nnp) = (
+        me.task.pid,
+        me.seccomp_filter.clone(),
+        me.prctl.no_new_privs,
+    );
+    let mut targets = alloc::vec![tid];
+    if tsync {
+        // Linux seccomp_can_sync_threads: every other thread's filter is
+        // ours or one ours stacks on; else that thread's tid
+        for t in table.threads(pid).filter(|t| t.task.tid() != tid) {
+            let mode = t.task.seccomp_mode();
+            let ok = (mode == SECCOMP_MODE_DISABLED || mode == SECCOMP_MODE_FILTER)
+                && SeccompFilter::is_ancestor_of(t.seccomp_filter.as_ref(), mine.as_ref());
+            if !ok {
+                return t.task.tid() as i64;
+            }
+            targets.push(t.task.tid());
+        }
+    }
+    for t in targets {
+        let Some(mut task) = table.get_mut(t) else {
+            continue;
         };
-
         // Filter first: syscall entry reads the mode lock-free, then
         // the filter under TASKLIST
-        task.seccomp_filter = Some(new_filter);
+        task.seccomp_filter = Some(new_filter.clone());
+        if nnp {
+            task.prctl.no_new_privs = true;
+        }
         task.task
             .seccomp_mode
             .store(SECCOMP_MODE_FILTER, core::sync::atomic::Ordering::Release);
     }
-
-    // TODO: If tsync, sync across all threads in thread group
-
     0
 }
 

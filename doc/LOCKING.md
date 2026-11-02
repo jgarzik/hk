@@ -882,7 +882,9 @@ taken, except `cred_guard` around `exec_update`):
   mmap_lock, the fd table, TASKLIST) until the new image is in
   place; an error return drops it with nothing changed. PTRACE_ATTACH /
   PTRACE_SEIZE hold the target's around the access decision and the
-  attach. Both take it interruptibly (Linux mutex_lock_interruptible,
+  attach; seccomp TSYNC holds the caller's group's around syncing the
+  other threads' filters (TASKLIST written inside). These take it
+  interruptibly (Linux mutex_lock_interruptible,
   ERESTARTNOINTR): a sibling waiting for it while the holder's exec
   waits in de_thread for that sibling to die is woken by the SIGKILL.
 - `exec_update` (`sync::RwSem`): `exec_replace_image` holds it for

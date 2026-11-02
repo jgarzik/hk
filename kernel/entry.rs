@@ -75,16 +75,24 @@ pub fn syscall_exit_to_user_mode(regs: &mut PtRegs) {
     exit_to_user_mode(regs);
 }
 
-/// The syscall entry work (Linux syscall_enter_from_user_mode): a
-/// PTRACE_SYSCALL entry stop, after which the tracer may have changed the
-/// syscall number and arguments in `regs`. Returns the number to run;
-/// u64::MAX (the tracer set it) skips the syscall, keeping the return
-/// register as the tracer left it.
+/// The syscall entry work (Linux syscall_enter_from_user_mode,
+/// syscall_trace_enter): a PTRACE_SYSCALL entry stop, after which the
+/// tracer may have changed the syscall number and arguments in `regs`,
+/// then seccomp on what is left. Returns the number to run; u64::MAX
+/// skips the syscall, keeping the return register as the tracer or
+/// seccomp left it.
 pub fn syscall_enter_from_user_mode(regs: &mut PtRegs) -> u64 {
     if crate::task::percpu::current().has_tif(tif::SYSCALL_TRACE) {
         crate::task::ptrace::ptrace_report_syscall(true);
     }
-    regs.syscall_nr()
+    let nr = regs.syscall_nr();
+    if nr != u64::MAX
+        && let Some(ret) = crate::seccomp::check::secure_computing(regs, nr)
+    {
+        regs.set_ret(ret);
+        return u64::MAX;
+    }
+    nr
 }
 
 /// Nothing may be held on the way to user mode: no spin lock (each

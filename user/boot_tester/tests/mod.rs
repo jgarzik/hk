@@ -5,6 +5,7 @@
 pub mod acct;
 pub mod adjtimex;
 pub mod settime;
+pub mod seccomp;
 pub mod append;
 #[cfg(target_arch = "x86_64")]
 pub mod arch_gs;
@@ -248,6 +249,7 @@ pub fn run_all_tests() {
     isolated(b"SWAPOUT", swapout::run_tests);
     adjtimex::run_tests();
     isolated(b"SETTIME", settime::run_tests);
+    isolated(b"SECCOMP", seccomp::run_tests);
     io_uring::run_tests();
     tcp::run_tests();
     isolated(b"MEMCORE", memcore::run_tests);

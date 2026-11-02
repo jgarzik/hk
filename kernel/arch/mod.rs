@@ -223,6 +223,8 @@ pub trait UserRegs {
     /// Its syscall number, u64::MAX if none (Linux syscall_get_nr:
     /// orig_ax / syscallno; a tracer may change it at the entry stop)
     fn syscall_nr(&self) -> u64;
+    /// Its six arguments (Linux syscall_get_arguments)
+    fn syscall_args(&self) -> [u64; 6];
     /// No restart from here on (Linux forget_syscall; x86 keeps orig_ax,
     /// as Linux does: its restart leaves the syscall number in RAX, never
     /// an -ERESTART* code)
