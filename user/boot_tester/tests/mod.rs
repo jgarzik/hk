@@ -7,6 +7,7 @@ pub mod adjtimex;
 pub mod settime;
 pub mod seccomp;
 pub mod sched_ids;
+pub mod errno_pass;
 pub mod append;
 #[cfg(target_arch = "x86_64")]
 pub mod arch_gs;
@@ -252,6 +253,7 @@ pub fn run_all_tests() {
     isolated(b"SETTIME", settime::run_tests);
     isolated(b"SECCOMP", seccomp::run_tests);
     isolated(b"SCHED_IDS", sched_ids::run_tests);
+    errno_pass::run_tests();
     io_uring::run_tests();
     tcp::run_tests();
     isolated(b"MEMCORE", memcore::run_tests);

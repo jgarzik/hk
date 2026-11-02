@@ -217,14 +217,8 @@ fn open_acct_file(path: &str) -> Result<Arc<File>, i64> {
     // Lookup the file
     let dentry = match lookup_path_flags(path, LookupFlags::open()) {
         Ok(d) => d,
-        Err(e) => {
-            return Err(match e {
-                KernelError::NotFound => -2,          // ENOENT
-                KernelError::NotDirectory => -20,     // ENOTDIR
-                KernelError::PermissionDenied => -13, // EACCES
-                _ => -22,                             // EINVAL
-            });
-        }
+        // Any lookup error as is (Linux filp_open)
+        Err(e) => return Err(e.sysret()),
     };
 
     // file_open_name(O_WRONLY | O_APPEND): may_open, then a regular file
