@@ -172,20 +172,4 @@ pub fn enable_smep() {
     }
 }
 
-/// Execute CPUID instruction
-fn cpuid(leaf: u32, subleaf: u32) -> (u32, u32, u32, u32) {
-    let (eax, ebx, ecx, edx): (u32, u32, u32, u32);
-    unsafe {
-        ::core::arch::asm!(
-            "push rbx",
-            "cpuid",
-            "mov {ebx_out:e}, ebx",
-            "pop rbx",
-            inout("eax") leaf => eax,
-            inout("ecx") subleaf => ecx,
-            ebx_out = out(reg) ebx,
-            lateout("edx") edx,
-        );
-    }
-    (eax, ebx, ecx, edx)
-}
+use super::msr::cpuid;

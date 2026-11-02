@@ -295,14 +295,7 @@ const APIC_BASE_EXTD: u64 = 1 << 10;
 /// x2APIC ICR MSR
 const X2APIC_ICR: u32 = 0x830;
 
-fn rdmsr(msr: u32) -> u64 {
-    let (lo, hi): (u32, u32);
-    // SAFETY: reads an architectural MSR
-    unsafe {
-        core::arch::asm!("rdmsr", in("ecx") msr, out("eax") lo, out("edx") hi, options(nostack))
-    };
-    ((hi as u64) << 32) | lo as u64
-}
+use super::msr::rdmsr;
 
 /// Send the fixed IPI `vector` to the CPU with APIC id `apic_id`
 /// (physical destination; Linux __default_send_IPI_dest_field,

@@ -26,63 +26,13 @@ pub const IST_MCE: u8 = 3;
 /// IST stacks per CPU (one per index above)
 const IST_COUNT: usize = 3;
 
-/// Execute CPUID instruction
-///
-/// Note: We need to preserve rbx since LLVM uses it internally.
-/// We push/pop it manually in the asm block.
-pub(crate) fn cpuid(leaf: u32, subleaf: u32) -> (u32, u32, u32, u32) {
-    let (eax, ebx, ecx, edx): (u32, u32, u32, u32);
-    unsafe {
-        ::core::arch::asm!(
-            "push rbx",
-            "cpuid",
-            "mov {ebx_out:e}, ebx",
-            "pop rbx",
-            inout("eax") leaf => eax,
-            inout("ecx") subleaf => ecx,
-            ebx_out = out(reg) ebx,
-            lateout("edx") edx,
-        );
-    }
-    (eax, ebx, ecx, edx)
-}
+pub(crate) use super::msr::cpuid;
+use super::msr::{rdmsr, wrmsr};
 
 /// EFER MSR address
 const MSR_EFER: u32 = 0xC0000080;
 /// EFER.NXE bit (enables NX/XD bit in page tables)
 const EFER_NXE: u64 = 1 << 11;
-
-/// Read a Model Specific Register
-#[inline]
-fn rdmsr(msr: u32) -> u64 {
-    let (low, high): (u32, u32);
-    unsafe {
-        ::core::arch::asm!(
-            "rdmsr",
-            in("ecx") msr,
-            out("eax") low,
-            out("edx") high,
-            options(nomem, nostack, preserves_flags)
-        );
-    }
-    ((high as u64) << 32) | (low as u64)
-}
-
-/// Write a Model Specific Register
-#[inline]
-fn wrmsr(msr: u32, value: u64) {
-    let low = value as u32;
-    let high = (value >> 32) as u32;
-    unsafe {
-        ::core::arch::asm!(
-            "wrmsr",
-            in("ecx") msr,
-            in("eax") low,
-            in("edx") high,
-            options(nostack, preserves_flags)
-        );
-    }
-}
 
 /// Check required CPU features, panic if missing
 pub fn check_cpu_features() {
@@ -119,7 +69,9 @@ pub fn check_cpu_features() {
 pub fn enable_nx() {
     let efer = rdmsr(MSR_EFER);
     if efer & EFER_NXE == 0 {
-        wrmsr(MSR_EFER, efer | EFER_NXE);
+        // SAFETY: NXE only lets page tables mark pages no-execute; the
+        // kernel's tables set NX only after this runs
+        unsafe { wrmsr(MSR_EFER, efer | EFER_NXE) };
     }
 }
 

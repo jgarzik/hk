@@ -225,16 +225,9 @@ const MSR_TSC_AUX: u32 = 0xC0000103;
 
 /// Record this CPU's index in TSC_AUX (user code cannot write it)
 fn set_tsc_aux(cpu_id: u32) {
-    // SAFETY: TSC_AUX exists (RDTSCP checked at boot)
-    unsafe {
-        ::core::arch::asm!(
-            "wrmsr",
-            in("ecx") MSR_TSC_AUX,
-            in("eax") cpu_id,
-            in("edx") 0u32,
-            options(nostack, preserves_flags)
-        );
-    }
+    // SAFETY: TSC_AUX exists (RDTSCP checked at boot) and only feeds
+    // RDTSCP/RDPID
+    unsafe { super::msr::wrmsr(MSR_TSC_AUX, cpu_id as u64) };
 }
 
 /// MSR_GS_BASE: the live GS base (in the kernel: this CPU's PerCpu)
@@ -243,35 +236,15 @@ pub const MSR_GS_BASE: u32 = 0xC0000101;
 /// kernel: the user's GS base)
 const MSR_KERNEL_GS_BASE: u32 = 0xC0000102;
 
-/// Write an MSR
+/// Write a base MSR (the GS/FS bases above take any canonical value)
 fn wrmsr(msr: u32, v: u64) {
-    // SAFETY: the base MSRs above take any canonical value
-    unsafe {
-        ::core::arch::asm!(
-            "wrmsr",
-            in("ecx") msr,
-            in("eax") v as u32,
-            in("edx") (v >> 32) as u32,
-            options(nostack, preserves_flags)
-        );
-    }
+    // SAFETY: a segment base: user code reaches it only through FS/GS,
+    // the kernel's GS base only by these fns (callers pass canonical
+    // values; a bad one is a #GP, an oops)
+    unsafe { super::msr::wrmsr(msr, v) };
 }
 
-/// Read an MSR
-fn rdmsr(msr: u32) -> u64 {
-    let (low, high): (u32, u32);
-    // SAFETY: reading the base MSRs above
-    unsafe {
-        ::core::arch::asm!(
-            "rdmsr",
-            in("ecx") msr,
-            out("eax") low,
-            out("edx") high,
-            options(nostack, preserves_flags)
-        );
-    }
-    ((high as u64) << 32) | (low as u64)
-}
+use super::msr::rdmsr;
 
 /// Set the GS base register (this CPU's per-CPU pointer)
 pub fn set_gs_base(addr: u64) {
@@ -328,31 +301,12 @@ pub fn fs_base_ok(addr: u64) -> bool {
 }
 
 pub fn write_fs_base(addr: u64) {
-    unsafe {
-        ::core::arch::asm!(
-            "wrmsr",
-            in("ecx") MSR_FS_BASE,
-            in("eax") addr as u32,
-            in("edx") (addr >> 32) as u32,
-            options(nostack, preserves_flags)
-        );
-    }
+    wrmsr(MSR_FS_BASE, addr);
 }
 
 /// Read the FS base register
 pub fn read_fs_base() -> u64 {
-    let low: u32;
-    let high: u32;
-    unsafe {
-        ::core::arch::asm!(
-            "rdmsr",
-            in("ecx") MSR_FS_BASE,
-            out("eax") low,
-            out("edx") high,
-            options(nostack, preserves_flags)
-        );
-    }
-    ((high as u64) << 32) | (low as u64)
+    rdmsr(MSR_FS_BASE)
 }
 
 // ============================================================================

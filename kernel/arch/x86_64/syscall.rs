@@ -736,44 +736,7 @@ pub fn init() {
     }
 }
 
-/// Write to MSR
-///
-/// # Safety
-/// Writing `value` to `msr` is valid now (the syscall MSRs, at init).
-#[inline]
-unsafe fn wrmsr(msr: u32, value: u64) {
-    let low = value as u32;
-    let high = (value >> 32) as u32;
-    unsafe {
-        ::core::arch::asm!(
-            "wrmsr",
-            in("ecx") msr,
-            in("eax") low,
-            in("edx") high,
-            options(nostack, preserves_flags)
-        );
-    }
-}
-
-/// Read from MSR
-///
-/// # Safety
-/// `msr` exists on this CPU.
-#[inline]
-unsafe fn rdmsr(msr: u32) -> u64 {
-    let low: u32;
-    let high: u32;
-    unsafe {
-        ::core::arch::asm!(
-            "rdmsr",
-            in("ecx") msr,
-            out("eax") low,
-            out("edx") high,
-            options(nostack, preserves_flags)
-        );
-    }
-    ((high as u64) << 32) | (low as u64)
-}
+use super::msr::{rdmsr, wrmsr};
 
 // =============================================================================
 // x86-64 syscall dispatcher

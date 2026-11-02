@@ -73,45 +73,11 @@ impl TscClockSource {
 ///
 /// Invariant TSC is indicated by CPUID leaf 0x80000007, EDX bit 8
 fn has_invariant_tsc() -> bool {
-    // First check if extended CPUID is supported
-    let max_extended: u32;
-    let ebx_out: u32;
-    unsafe {
-        ::core::arch::asm!(
-            "push rbx",      // Save rbx (LLVM uses it)
-            "cpuid",
-            "mov {ebx_out:e}, ebx",
-            "pop rbx",       // Restore rbx
-            inout("eax") 0x80000000u32 => max_extended,
-            ebx_out = out(reg) ebx_out,
-            out("ecx") _,
-            out("edx") _,
-            options(nomem, nostack, preserves_flags)
-        );
-    }
-    let _ = ebx_out; // suppress unused warning
-
-    if max_extended < 0x80000007 {
+    let (max_extended, _, _, _) = super::msr::cpuid(0x8000_0000, 0);
+    if max_extended < 0x8000_0007 {
         return false;
     }
-
-    // Check for invariant TSC
-    let edx: u32;
-    let ebx_out2: u32;
-    unsafe {
-        ::core::arch::asm!(
-            "push rbx",
-            "cpuid",
-            "mov {ebx_out:e}, ebx",
-            "pop rbx",
-            inout("eax") 0x80000007u32 => _,
-            ebx_out = out(reg) ebx_out2,
-            out("ecx") _,
-            out("edx") edx,
-            options(nomem, nostack, preserves_flags)
-        );
-    }
-    let _ = ebx_out2;
+    let (_, _, _, edx) = super::msr::cpuid(0x8000_0007, 0);
 
     // Bit 8 = Invariant TSC
     edx & (1 << 8) != 0
