@@ -455,7 +455,7 @@ impl UserModeOps for Aarch64Arch {
         // used up), with IRQs masked
         cpu::disable_interrupts();
         // SAFETY: the frame above, this task's
-        crate::entry::exit_to_user_mode(unsafe { &mut *regs });
+        crate::entry::exit_to_user_mode(unsafe { crate::arch::UserFrame::from_ptr(regs) });
         unsafe {
             asm!(
                 // Exec runs with interrupts on: masked for the return
@@ -476,7 +476,7 @@ impl UserModeOps for Aarch64Arch {
 impl PerCpuOps for Aarch64Arch {
     #[inline]
     fn try_current_cpu_id() -> Option<u32> {
-        percpu::try_current_cpu().map(|p| p.cpu_id)
+        percpu::try_current_cpu().map(percpu::PerCpu::id)
     }
 
     #[inline]

@@ -3,7 +3,7 @@
 //! This is a simple polled driver for the ARM PL011 UART found in
 //! QEMU's virt machine and many real ARM platforms.
 
-use core::fmt::{self, Write};
+use core::fmt;
 use core::ptr::{read_volatile, write_volatile};
 
 /// PL011 UART base address on QEMU virt machine
@@ -54,25 +54,32 @@ mod cr {
 }
 
 /// PL011 UART driver
-pub struct Pl011 {
+///
+/// # Invariants
+/// `base` is the PL011's register block, mapped for the kernel's life.
+struct Pl011 {
     base: usize,
 }
 
 impl Pl011 {
-    /// Create a new PL011 driver instance
-    pub const fn new(base: usize) -> Self {
+    /// The driver for the UART at `base` (only `UART`, at PL011_BASE)
+    const fn new(base: usize) -> Self {
+        // INVARIANT: PL011_BASE is mapped by the early page tables and
+        // stays mapped
         Self { base }
     }
 
     /// Read a register
     #[inline]
     fn read_reg(&self, offset: usize) -> u32 {
+        // SAFETY: a register of the block (type invariant)
         unsafe { read_volatile((self.base + offset) as *const u32) }
     }
 
     /// Write a register
     #[inline]
     fn write_reg(&self, offset: usize, value: u32) {
+        // SAFETY: a register of the block (type invariant)
         unsafe { write_volatile((self.base + offset) as *mut u32, value) }
     }
 
@@ -125,35 +132,22 @@ impl Pl011 {
     }
 }
 
-impl Write for Pl011 {
-    fn write_str(&mut self, s: &str) -> fmt::Result {
-        Pl011::write_str(self, s);
-        Ok(())
-    }
-}
-
-/// Global UART instance
-static mut UART: Pl011 = Pl011::new(PL011_BASE);
+/// Global UART instance (its methods take `&self`: MMIO only)
+static UART: Pl011 = Pl011::new(PL011_BASE);
 
 /// Initialize the serial console
 pub fn init() {
-    unsafe {
-        (*core::ptr::addr_of_mut!(UART)).init();
-    }
+    UART.init();
 }
 
 /// Write a string to the serial console
 pub fn write_str(s: &str) {
-    unsafe {
-        (*core::ptr::addr_of_mut!(UART)).write_str(s);
-    }
+    UART.write_str(s);
 }
 
 /// Write a single byte to the serial console
 pub fn write_byte(byte: u8) {
-    unsafe {
-        (*core::ptr::addr_of_mut!(UART)).write_byte(byte);
-    }
+    UART.write_byte(byte);
 }
 
 /// Boot-time writer for direct serial output
@@ -174,7 +168,7 @@ impl fmt::Write for BootWriter {
 macro_rules! early_print {
     ($($arg:tt)*) => {{
         use core::fmt::Write;
-        let _ = write!(unsafe { &mut *core::ptr::addr_of_mut!($crate::arch::aarch64::serial::UART) }, $($arg)*);
+        let _ = write!($crate::arch::aarch64::serial::BootWriter, $($arg)*);
     }};
 }
 

@@ -172,7 +172,10 @@ fn set_overflow_stack(cpu: u32) -> bool {
     let Some(base) = crate::mm::vmstack::alloc() else {
         return false;
     };
-    percpu::get_percpu(cpu).overflow_stack = base + crate::mm::vmstack::THREAD_SIZE as u64;
+    percpu::get_percpu(cpu).overflow_stack.store(
+        base + crate::mm::vmstack::THREAD_SIZE as u64,
+        core::sync::atomic::Ordering::Relaxed,
+    );
     true
 }
 

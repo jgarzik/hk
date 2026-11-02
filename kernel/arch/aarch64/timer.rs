@@ -152,7 +152,7 @@ pub fn handle_timer_irq() {
 
     // Update global timekeeper (only on CPU 0 to avoid contention)
     if super::percpu::try_current_cpu()
-        .map(|p| p.cpu_id == 0)
+        .map(|p| p.id() == 0)
         .unwrap_or(false)
     {
         crate::time::TIMEKEEPER.update(crate::time::TIMEKEEPER.get_read_cycles());

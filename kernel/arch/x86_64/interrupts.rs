@@ -10,6 +10,7 @@ use super::cpu::KERNEL_CODE_SELECTOR;
 use super::entry;
 use super::lapic;
 use super::pic;
+use crate::arch::UserFrame;
 use crate::mm::fault::{Access, VmFault};
 use crate::signal::{KSigInfo, si_code};
 use crate::uaccess::pagefault_disabled;
@@ -292,7 +293,7 @@ fn has_error_code(vector: u64) -> bool {
 /// Every IDT vector lands here from `entry::idt_common` (or
 /// `paranoid_common`), with the frame at `regs` (Linux idtentry
 /// handlers, sysvec_*, common_interrupt)
-pub extern "C" fn idt_dispatch(regs: &mut PtRegs, vector: u64) {
+pub extern "C" fn idt_dispatch(regs: &UserFrame, vector: u64) {
     match vector {
         0..=31 => handle_exception(regs, vector),
         32..=47 => handle_irq(vector - 32),
@@ -304,7 +305,9 @@ pub extern "C" fn idt_dispatch(regs: &mut PtRegs, vector: u64) {
     }
     // Back to user mode: its pending work first (Linux
     // irqentry_exit_to_user_mode); not for NMI, #DF, #MC (paranoid)
-    if regs.cs & 3 == 3 && !matches!(vector, 2 | 8 | 18) {
+    // SAFETY: a field load
+    let cs = unsafe { regs.with(|r| r.cs) };
+    if cs & 3 == 3 && !matches!(vector, 2 | 8 | 18) {
         // SAFETY: interrupts off for the exit work's checks
         unsafe { ::core::arch::asm!("cli", options(nostack)) };
         crate::entry::exit_to_user_mode(regs);
@@ -351,21 +354,21 @@ fn math_error_code(vector: u64) -> i32 {
 /// Deliver a synchronous fault signal (force_sig_fault) for the user
 /// context in `frame`: the task's pt_regs (an entry from user mode), so
 /// a handler's frame is set up there and IRETQ enters it
-fn user_fault(frame: &mut PtRegs, sig: u32, info: KSigInfo) {
+fn user_fault(frame: &UserFrame, sig: u32, info: KSigInfo) {
     crate::signal::force_sig_fault(sig, info, frame);
 }
 
 /// Rust exception handler (interrupts off: interrupt gates); it returns
 /// when execution can resume, else halts
-fn handle_exception(frame: &mut PtRegs, vector: u64) {
+fn handle_exception(uframe: &UserFrame, vector: u64) {
     // The error code leaves orig_ax, which says "no syscall" from now on
     // (Linux idtentry)
-    let error_code = if has_error_code(vector) {
-        frame.orig_rax
-    } else {
-        0
-    };
-    frame.orig_rax = u64::MAX;
+    // SAFETY: a field load and store
+    let orig = unsafe { uframe.with(|r| core::mem::replace(&mut r.orig_rax, u64::MAX)) };
+    let error_code = if has_error_code(vector) { orig } else { 0 };
+    // The registers as the exception left them (handling may sleep, so
+    // never a borrow of the frame itself)
+    let frame = &uframe.get();
 
     // Read CR2 for page faults
     let cr2: u64;
@@ -403,14 +406,15 @@ fn handle_exception(frame: &mut PtRegs, vector: u64) {
                 trapno: 14,
                 error: error_code,
             };
-            user_fault(frame, sig, info);
+            user_fault(uframe, sig, info);
             return;
         }
         // Kernel-mode fault inside a user-copy routine (out of memory
         // included, Linux kernelmode_fixup_or_oops): resume at its
         // fixup, which reports the uncopied bytes (-> EFAULT)
         if let Some(fixup) = super::uaccess::uaccess_fixup(frame.rip) {
-            frame.rip = fixup;
+            // SAFETY: a field store
+            unsafe { uframe.with(|r| r.rip = fixup) };
             return;
         }
         // Kernel mode fault - fall through to fatal handler
@@ -453,7 +457,7 @@ fn handle_exception(frame: &mut PtRegs, vector: u64) {
             trapno: vector,
             error: error_code,
         };
-        user_fault(frame, sig, info);
+        user_fault(uframe, sig, info);
         return;
     }
 
@@ -726,7 +730,7 @@ fn handle_lapic_timer() {
     percpu.ticks.fetch_add(1, Ordering::Relaxed);
 
     // Update global timekeeper (only on CPU 0 to avoid contention)
-    if percpu.cpu_id == 0 {
+    if percpu.id() == 0 {
         crate::time::TIMEKEEPER.update(super::tsc::read_tsc);
     }
 

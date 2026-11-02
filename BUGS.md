@@ -5,13 +5,6 @@
 These are safe fns or patterns whose use leads to undefined behaviour.
 None is known to fail today, but each is a soundness bug:
 
-- **Per-CPU:**
-  - `get_percpu` (both arches) returns `&'static mut PerCpu`.
-  - `current_pt_regs` returns `&'static mut` to the trap frame, and the
-    syscall entry holds `&mut` to the same frame.
-  - lockdep's per-CPU `&'static mut Cpu` is also reached from IRQs.
-  - aarch64 `set_tpidr_el1` is a safe fn.
-  - aarch64 `early_print!` takes `&mut` to a `static mut` UART.
 - **Locks and lists:**
   - `MutexGuard` is `Sync` for `T: Send` without `T: Sync`.
   - `List` is `Send` without `Item: Send`.

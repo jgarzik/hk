@@ -54,7 +54,7 @@ pub fn might_sleep() {}
 
 #[cfg(feature = "lockdep")]
 mod imp {
-    use core::cell::UnsafeCell;
+    use core::cell::Cell;
     use core::panic::Location;
     use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -77,30 +77,33 @@ mod imp {
         at: Loc,
     }
 
+    /// A CPU's lockdep state: `Cell`s, because the same CPU re-enters
+    /// it (an interrupt arriving mid-update, the `IrqSpinlock` of the
+    /// graph taken while a slot is in use), so no `&mut` to it may exist
     struct Cpu {
-        held: [Option<HeldLock>; DEPTH],
-        depth: usize,
+        held: [Cell<Option<HeldLock>>; DEPTH],
+        depth: Cell<usize>,
         /// Inside lockdep's own reporting: track nothing
-        busy: bool,
+        busy: Cell<bool>,
         /// Interrupt handler nesting
-        irq: u32,
+        irq: Cell<u32>,
         /// `IrqSpinlock`s held (a lock held across a context switch
         /// counts on the CPU, which the task switched to releases it on)
-        irqsafe: u32,
+        irqsafe: Cell<u32>,
     }
 
-    struct Slot(UnsafeCell<Cpu>);
-    // SAFETY: each CPU touches only its own slot, with no tracked lock
-    // taken in interrupt context (reported otherwise)
+    struct Slot(Cpu);
+    // SAFETY: each CPU touches only its own slot (`PerCpu::this`; the
+    // kernel switches tasks only at points that hold no slot reference)
     unsafe impl Sync for Slot {}
 
-    static CPUS: PerCpu<Slot> = crate::percpu![Slot(UnsafeCell::new(Cpu {
-        held: [None; DEPTH],
-        depth: 0,
-        busy: false,
-        irq: 0,
-        irqsafe: 0,
-    }))];
+    static CPUS: PerCpu<Slot> = crate::percpu![Slot(Cpu {
+        held: [const { Cell::new(None) }; DEPTH],
+        depth: Cell::new(0),
+        busy: Cell::new(false),
+        irq: Cell::new(0),
+        irqsafe: Cell::new(0),
+    })];
 
     #[derive(Clone, Copy)]
     struct Edge {
@@ -128,9 +131,17 @@ mod imp {
     /// Reports printed (for the summary line)
     static NREPORTS: AtomicU32 = AtomicU32::new(0);
 
-    fn cpu() -> Option<&'static mut Cpu> {
-        // SAFETY: see Slot
-        Some(unsafe { &mut *CPUS.this().0.get() })
+    fn cpu() -> Option<&'static Cpu> {
+        Some(&CPUS.this().0)
+    }
+
+    impl Cpu {
+        /// The held locks, oldest first
+        fn held(&self) -> impl Iterator<Item = HeldLock> + '_ {
+            self.held[..self.depth.get().min(DEPTH)]
+                .iter()
+                .filter_map(Cell::get)
+        }
     }
 
     fn key(l: Loc) -> u64 {
@@ -188,11 +199,11 @@ mod imp {
         }
     }
 
-    fn report(c: &mut Cpu, f: impl FnOnce()) {
-        c.busy = true;
+    fn report(c: &Cpu, f: impl FnOnce()) {
+        c.busy.set(true);
         NREPORTS.fetch_add(1, Ordering::Relaxed);
         f();
-        c.busy = false;
+        c.busy.set(false);
     }
 
     /// Before taking tracked lock `id` of `class` at `at` (`check`:
@@ -201,22 +212,23 @@ mod imp {
         let Some(c) = cpu() else {
             return;
         };
-        if c.busy {
+        if c.busy.get() {
             return;
         }
-        if c.irq > 0 {
+        if c.irq.get() > 0 {
             irq_report(c, class, at);
         }
         if check {
             order(c, class, at);
         }
-        if c.depth < DEPTH {
-            c.held[c.depth] = Some(HeldLock { id, class, at });
-            c.depth += 1;
+        let d = c.depth.get();
+        if d < DEPTH {
+            c.held[d].set(Some(HeldLock { id, class, at }));
+            c.depth.set(d + 1);
         }
     }
 
-    fn irq_report(c: &mut Cpu, class: Loc, at: Loc) {
+    fn irq_report(c: &Cpu, class: Loc, at: Loc) {
         let first = GRAPH.lock().first(key(class) ^ 0x1);
         if first {
             report(c, || {
@@ -230,12 +242,12 @@ mod imp {
     }
 
     /// Record held -> `class` edges; report an inverse edge
-    fn order(c: &mut Cpu, class: Loc, at: Loc) {
+    fn order(c: &Cpu, class: Loc, at: Loc) {
         let b = key(class);
         let mut bad: Option<(HeldLock, Edge)> = None;
         {
             let mut g = GRAPH.lock();
-            for h in c.held[..c.depth].iter().flatten() {
+            for h in c.held() {
                 let a = key(h.class);
                 if a == b {
                     continue;
@@ -252,7 +264,7 @@ mod imp {
                     && let Some(inv) = g.find(b, a)
                     && g.first(a.rotate_left(1) ^ b)
                 {
-                    bad = Some((*h, inv));
+                    bad = Some((h, inv));
                 }
             }
         }
@@ -279,34 +291,36 @@ mod imp {
         let Some(c) = cpu() else {
             return;
         };
-        let n = c.depth;
+        let n = c.depth.get().min(DEPTH);
         let Some(i) = (0..n)
             .rev()
-            .find(|&i| c.held[i].is_some_and(|h| h.id == id))
+            .find(|&i| c.held[i].get().is_some_and(|h| h.id == id))
         else {
             return;
         };
-        c.held.copy_within(i + 1..n, i);
-        c.held[n - 1] = None;
-        c.depth = n - 1;
+        for j in i..n - 1 {
+            c.held[j].set(c.held[j + 1].get());
+        }
+        c.held[n - 1].set(None);
+        c.depth.set(n - 1);
     }
 
     /// Interrupt handler entry (generic tick and device IRQ dispatch)
     pub fn irq_enter() {
         if let Some(c) = cpu() {
-            c.irq += 1;
+            c.irq.set(c.irq.get() + 1);
         }
     }
 
     pub fn irq_exit() {
         if let Some(c) = cpu() {
-            c.irq = c.irq.saturating_sub(1);
+            c.irq.set(c.irq.get().saturating_sub(1));
         }
     }
 
     /// This CPU's slot once its per-CPU data exists (an AP coming up
     /// takes `IrqSpinlock`s before; they are not counted)
-    fn this_cpu() -> Option<&'static mut Cpu> {
+    fn this_cpu() -> Option<&'static Cpu> {
         crate::cpu::try_this_id()?;
         cpu()
     }
@@ -314,7 +328,7 @@ mod imp {
     /// An `IrqSpinlock` was taken (interrupts off)
     pub fn irqsafe_acquire() {
         if let Some(c) = this_cpu() {
-            c.irqsafe += 1;
+            c.irqsafe.set(c.irqsafe.get() + 1);
         }
     }
 
@@ -325,11 +339,11 @@ mod imp {
         let Some(c) = this_cpu() else {
             return;
         };
-        c.irqsafe = c.irqsafe.saturating_sub(1);
-        if !enables || c.irqsafe == 0 || c.busy || REPORTED.swap(true, Ordering::Relaxed) {
+        let held = c.irqsafe.get().saturating_sub(1);
+        c.irqsafe.set(held);
+        if !enables || held == 0 || c.busy.get() || REPORTED.swap(true, Ordering::Relaxed) {
             return;
         }
-        let held = c.irqsafe;
         report(c, || {
             crate::printkln!(
                 "LOCKDEP:FAIL interrupts enabled with {} IRQ-safe spin lock(s) held: \
@@ -356,7 +370,9 @@ mod imp {
         // off (and no spinlock owning them) is a bug (Linux might_sleep's
         // irqs_disabled check)
         let irqs_off = crate::arch::irqs_disabled();
-        if c.busy || (c.depth == 0 && pc == 0 && c.irq == 0 && !irqs_off) {
+        let depth = c.depth.get().min(DEPTH);
+        let irq = c.irq.get();
+        if c.busy.get() || (depth == 0 && pc == 0 && irq == 0 && !irqs_off) {
             return;
         }
         let at = Location::caller();
@@ -364,9 +380,7 @@ mod imp {
         if !first {
             return;
         }
-        let held = c.held;
-        let depth = c.depth;
-        let irq = c.irq;
+        let held: [Option<HeldLock>; DEPTH] = core::array::from_fn(|i| c.held[i].get());
         report(c, || {
             crate::printkln!(
                 "LOCKDEP:FAIL sleeping function called from atomic context at {} \

@@ -21,7 +21,7 @@
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use crate::arch::{CpuOps, CurrentArch, PtRegs, UserRegs};
+use crate::arch::{CpuOps, CurrentArch, UserFrame};
 use crate::task::tif;
 
 /// Work for the return to user mode (Linux EXIT_TO_USER_MODE_WORK)
@@ -33,7 +33,7 @@ const SIGNAL_WORK: u32 = tif::SIGPENDING | tif::RESTORE_SIGMASK;
 /// Run the pending work of the return to user mode (Linux
 /// exit_to_user_mode_prepare / exit_to_user_mode_loop). Interrupts are
 /// off on entry and on return; `regs` is the current task's pt_regs.
-pub fn exit_to_user_mode(regs: &mut PtRegs) {
+pub fn exit_to_user_mode(regs: &UserFrame) {
     loop {
         let flags = &crate::task::percpu::current().thread_flags;
         let work = flags.load(Ordering::Acquire) & EXIT_WORK;
@@ -63,7 +63,7 @@ pub fn exit_to_user_mode(regs: &mut PtRegs) {
 /// as Linux arch_do_signal_or_restart does), then the common work with
 /// interrupts off. Returns with them off. The common case takes no
 /// lock: only the thread flags and the result register are read.
-pub fn syscall_exit_to_user_mode(regs: &mut PtRegs) {
+pub fn syscall_exit_to_user_mode(regs: &UserFrame) {
     let me = crate::task::percpu::current();
     // System time ends, user time starts once back (Linux
     // vtime_user_enter; the exit work below is short)
@@ -87,7 +87,7 @@ pub fn syscall_exit_to_user_mode(regs: &mut PtRegs) {
 /// then seccomp on what is left. Returns the number to run; u64::MAX
 /// skips the syscall, keeping the return register as the tracer or
 /// seccomp left it.
-pub fn syscall_enter_from_user_mode(regs: &mut PtRegs) -> u64 {
+pub fn syscall_enter_from_user_mode(regs: &UserFrame) -> u64 {
     // User time ends, system time starts (Linux vtime_user_exit)
     crate::task::percpu::account_syscall_enter();
     if crate::task::percpu::current().has_tif(tif::SYSCALL_TRACE) {

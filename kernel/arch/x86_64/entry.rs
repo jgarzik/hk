@@ -106,20 +106,21 @@ pub unsafe extern "C" fn syscall_entry() {
 
 /// The syscall in C (Linux do_syscall_64): interrupts on while it runs,
 /// off again on return; true if the return may use SYSRET
-extern "C" fn do_syscall_64(regs: &mut PtRegs) -> bool {
+extern "C" fn do_syscall_64(regs: &crate::arch::UserFrame) -> bool {
     crate::arch::x86_64::interrupts::enable();
     let nr = crate::entry::syscall_enter_from_user_mode(regs);
     if nr != u64::MAX {
-        regs.rax = super::syscall::x86_64_syscall_dispatch(
-            nr, regs.rdi, regs.rsi, regs.rdx, regs.r10, regs.r8, regs.r9,
-        );
+        let [a0, a1, a2, a3, a4, a5] = regs.syscall_args();
+        let ret = super::syscall::x86_64_syscall_dispatch(nr, a0, a1, a2, a3, a4, a5);
+        regs.set_ret(ret);
     }
     // Signals, -ERESTART* rules, rescheduling before returning to user
     // space (they may redirect the frame to a handler or back up over
     // the syscall instruction; rt_sigreturn restored a whole user
     // context, orig_ax -1, and is not restarted); interrupts off after
     crate::entry::syscall_exit_to_user_mode(regs);
-    sysret_ok(regs)
+    // SAFETY: sysret_ok only reads the registers
+    unsafe { regs.with(|r| sysret_ok(r)) }
 }
 
 /// SYSRET can return to the frame (Linux syscall_return_via_sysret
@@ -485,7 +486,8 @@ pub unsafe fn enter_user(entry: u64, sp: u64, kstack_top: u64) -> ! {
     // Its return to user mode (a signal may be pending, the slice used up)
     // SAFETY: the frame above, this task's
     unsafe { core::arch::asm!("cli", options(nostack)) };
-    crate::entry::exit_to_user_mode(unsafe { &mut *regs });
+    // SAFETY: this task's frame, built above
+    crate::entry::exit_to_user_mode(unsafe { crate::arch::UserFrame::from_ptr(regs) });
     // SAFETY: the frame above; nothing below it is used again
     unsafe {
         core::arch::asm!(

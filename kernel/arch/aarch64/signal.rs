@@ -24,7 +24,6 @@
 
 #![allow(dead_code)]
 
-use super::Aarch64TrapFrame;
 use crate::arch::Uaccess;
 use crate::signal::{KSigInfo, SigAction, SigHandler, SigSet, sa_flags};
 use crate::uaccess::{UaccessArch, copy_from_user, copy_to_user};
@@ -255,8 +254,11 @@ pub fn setup_rt_frame(
     action: &SigAction,
     blocked: SigSet,
     info: &KSigInfo,
-    regs: &mut Aarch64TrapFrame,
+    uframe: &crate::arch::UserFrame,
 ) -> Result<(), i32> {
+    // A copy, written back once the handler frame is in place
+    let mut r = uframe.get();
+    let regs = &mut r;
     // The interrupted user context (the task's pt_regs)
     let user_elr = regs.elr;
     let user_spsr = regs.spsr;
@@ -394,6 +396,7 @@ pub fn setup_rt_frame(
     regs.x[30] = restorer; // x30 (LR) = restorer
     // Clear other argument registers for security
     regs.x[3..8].fill(0);
+    uframe.set(r);
 
     Ok(())
 }
@@ -449,7 +452,10 @@ fn parse_reserved(addr: u64) -> Option<FpsimdContext> {
 /// Returns the value that should be in x0 (return value),
 /// or error code if restore fails.
 pub fn sys_rt_sigreturn() -> i64 {
-    let tf = crate::task::percpu::current_pt_regs();
+    let frame = crate::task::percpu::current_pt_regs();
+    // A copy, written back once the whole context is restored
+    let mut r = frame.get();
+    let tf = &mut r;
 
     // The current SP points to the signal frame
     let frame_addr = tf.sp;
@@ -496,6 +502,7 @@ pub fn sys_rt_sigreturn() -> i64 {
     tf.x = sc.regs;
     // No syscall to restart from here on (Linux forget_syscall)
     tf.syscallno = super::NO_SYSCALL;
+    frame.set(r);
 
     // Return x0 from saved context
     sc.regs[0] as i64

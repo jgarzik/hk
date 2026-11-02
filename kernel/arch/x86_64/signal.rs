@@ -240,9 +240,13 @@ pub fn setup_rt_frame(
     action: &SigAction,
     blocked: SigSet,
     info: &KSigInfo,
-    regs: &mut super::PtRegs,
+    uframe: &crate::arch::UserFrame,
 ) -> Result<(), i32> {
     use super::fpu;
+
+    // A copy, written back once the handler frame is in place
+    let mut r = uframe.get();
+    let regs = &mut r;
 
     // The interrupted user context (the task's pt_regs)
     let user_rip = regs.rip;
@@ -395,6 +399,7 @@ pub fn setup_rt_frame(
     regs.r8 = 0;
     regs.r9 = 0;
     regs.r10 = 0;
+    uframe.set(r);
 
     Ok(())
 }
@@ -441,7 +446,10 @@ fn restore_sigframe_fpu(fpstate: u64) -> bool {
 /// Returns the value that should be in RAX (usually -EINTR for interrupted syscall),
 /// or error code if restore fails.
 pub fn sys_rt_sigreturn() -> i64 {
-    let regs = crate::task::percpu::current_pt_regs();
+    let frame = crate::task::percpu::current_pt_regs();
+    // A copy, written back once the whole context is restored
+    let mut r = frame.get();
+    let regs = &mut r;
 
     // When the signal handler returns (via `ret`), the restorer's return address
     // (pretcode) has been popped from the stack, so RSP has moved up by 8 bytes.
@@ -510,6 +518,7 @@ pub fn sys_rt_sigreturn() -> i64 {
     regs.r11 = sc.r11;
     // No syscall to restart from here on (Linux: regs->orig_ax = -1)
     regs.orig_rax = u64::MAX;
+    frame.set(r);
 
     // Return RAX from saved context
     // This allows signal handler to modify the return value

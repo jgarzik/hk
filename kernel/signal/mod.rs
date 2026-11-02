@@ -24,7 +24,7 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use crate::arch::{IrqSpinlock, PtRegs, UserRegs};
+use crate::arch::{IrqSpinlock, UserFrame};
 use crate::task::{Pid, Tid};
 
 // =============================================================================
@@ -1749,7 +1749,7 @@ fn traced_signal(tid: Tid, sig: u32, action: SigAction) -> Option<(u32, SigActio
 /// If a syscall left a temporary mask in place (TIF_RESTORE_SIGMASK,
 /// e.g. rt_sigsuspend), signals are dequeued under it and the saved mask
 /// goes into the signal frame; with no frame it is restored here.
-pub fn do_signal(regs: &mut PtRegs) {
+pub fn do_signal(regs: &UserFrame) {
     use crate::error::KernelError;
 
     const ERESTARTSYS: i64 = KernelError::RestartSys.sysret();
@@ -1821,7 +1821,7 @@ pub fn do_signal(regs: &mut PtRegs) {
 /// The syscall returning on `regs` asks for a restart (-ERESTARTSYS,
 /// -ERESTARTNOINTR, -ERESTARTNOHAND): only `do_signal` may turn that
 /// into a result. A plain register test, no lock.
-pub fn syscall_restarting(regs: &PtRegs) -> bool {
+pub fn syscall_restarting(regs: &UserFrame) -> bool {
     use crate::error::KernelError;
     const FIRST: i64 = KernelError::RestartSys.sysret();
     const LAST: i64 = KernelError::RestartNoHand.sysret();
@@ -1886,7 +1886,7 @@ fn deliver_to_handler(
     sig: u32,
     action: &SigAction,
     info: &KSigInfo,
-    regs: &mut PtRegs,
+    regs: &UserFrame,
 ) -> bool {
     use crate::arch::signal;
 
@@ -1976,7 +1976,7 @@ pub fn force_sigsegv(tid: Tid) {
 ///   the task, as does SIG_DFL.
 ///
 /// Process context (the faulting task), interrupts enabled.
-pub fn force_sig_fault(sig: u32, info: KSigInfo, regs: &mut PtRegs) {
+pub fn force_sig_fault(sig: u32, info: KSigInfo, regs: &UserFrame) {
     let do_exit = do_group_exit;
 
     let tid = crate::task::percpu::current_tid();

@@ -13,7 +13,7 @@
 //! MSR_GS_BASE instead (a kernel address is negative; a user one is
 //! below TASK_SIZE).
 
-use ::core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use ::core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 /// Per-CPU data slots (logical CPU ids are below this)
 pub const MAX_CPUS: usize = crate::cpumask::NR_CPUS;
@@ -22,28 +22,31 @@ pub const MAX_CPUS: usize = crate::cpumask::NR_CPUS;
 ///
 /// Accessed via the GS segment base register. The first field must be
 /// a self-pointer so that `mov rax, gs:0` gives us the PerCpu address.
+/// Every field is an atomic or set once at `init` before the CPU is
+/// published, so other CPUs, IRQs and the asm entry code only ever need
+/// `&PerCpu` (no `&mut` exists after boot).
 #[repr(C, align(64))]
 pub struct PerCpu {
     /// Self-pointer for GS:0 access
-    pub self_ptr: *mut PerCpu,
+    pub self_ptr: AtomicPtr<PerCpu>,
 
     /// Top of the current task's kernel stack: `syscall_entry` switches
     /// to it (Linux cpu_current_top_of_stack); set with TSS.RSP0 at
     /// every switch to a user task
-    pub top_of_stack: u64,
+    pub top_of_stack: AtomicU64,
 
     /// The user RSP while `syscall_entry` switches stacks (Linux
     /// cpu_tss_rw.x86_tss.sp2 scratch)
-    pub user_rsp: u64,
+    pub user_rsp: AtomicU64,
 
     /// Logical CPU ID (0 = BSP, 1+ = APs)
-    pub cpu_id: u32,
+    pub cpu_id: AtomicU32,
 
     /// Hardware APIC ID
-    pub apic_id: u32,
+    pub apic_id: AtomicU32,
 
     /// Is this the bootstrap processor?
-    pub is_bsp: bool,
+    pub is_bsp: AtomicBool,
 
     /// Has this CPU completed initialization?
     pub is_online: AtomicBool,
@@ -73,12 +76,12 @@ impl PerCpu {
     /// Create an uninitialized PerCpu
     const fn uninit() -> Self {
         Self {
-            self_ptr: core::ptr::null_mut(),
-            top_of_stack: 0,
-            user_rsp: 0,
-            cpu_id: 0,
-            apic_id: 0,
-            is_bsp: false,
+            self_ptr: AtomicPtr::new(core::ptr::null_mut()),
+            top_of_stack: AtomicU64::new(0),
+            user_rsp: AtomicU64::new(0),
+            cpu_id: AtomicU32::new(0),
+            apic_id: AtomicU32::new(0),
+            is_bsp: AtomicBool::new(false),
             is_online: AtomicBool::new(false),
             ticks: AtomicU64::new(0),
             curr: AtomicUsize::new(0),
@@ -88,17 +91,28 @@ impl PerCpu {
     }
 
     /// Initialize the PerCpu structure
-    pub fn init(&mut self, cpu_id: u32, apic_id: u32, is_bsp: bool) {
+    pub fn init(&self, cpu_id: u32, apic_id: u32, is_bsp: bool) {
         set_tsc_aux(cpu_id);
-        self.self_ptr = self as *mut PerCpu;
-        self.cpu_id = cpu_id;
-        self.apic_id = apic_id;
-        self.is_bsp = is_bsp;
+        self.self_ptr.store(self.as_ptr(), Ordering::Relaxed);
+        self.cpu_id.store(cpu_id, Ordering::Relaxed);
+        self.apic_id.store(apic_id, Ordering::Relaxed);
+        self.is_bsp.store(is_bsp, Ordering::Relaxed);
         self.ticks.store(0, Ordering::Relaxed);
         self.curr.store(0, Ordering::Relaxed);
         self.interrupt_depth.store(0, Ordering::Relaxed);
         self.preempt_count.store(0, Ordering::Relaxed);
         // Don't set is_online yet - that happens after full init
+    }
+
+    /// This CPU's address, for GS base (only ever read through as
+    /// `&PerCpu`, whose mutable fields are atomics)
+    fn as_ptr(&self) -> *mut PerCpu {
+        (&raw const *self).cast_mut()
+    }
+
+    /// Logical CPU id
+    pub fn id(&self) -> u32 {
+        self.cpu_id.load(Ordering::Relaxed)
     }
 
     /// Mark this CPU as online
@@ -110,7 +124,7 @@ impl PerCpu {
 /// Global array of per-CPU data
 ///
 /// This is statically allocated to avoid heap allocation during early boot.
-static mut PERCPU_ARRAY: [PerCpu; MAX_CPUS] = [const { PerCpu::uninit() }; MAX_CPUS];
+static PERCPU_ARRAY: [PerCpu; MAX_CPUS] = [const { PerCpu::uninit() }; MAX_CPUS];
 
 /// Number of CPUs that have come online
 pub static CPU_COUNT: AtomicU32 = AtomicU32::new(0);
@@ -118,33 +132,32 @@ pub static CPU_COUNT: AtomicU32 = AtomicU32::new(0);
 /// BSP's APIC ID (set during init)
 static BSP_APIC_ID: AtomicU32 = AtomicU32::new(0);
 
-/// Get a reference to a CPU's per-CPU data by CPU ID
-///
-/// # Safety
-/// The CPU ID must be valid (< MAX_CPUS).
-pub fn get_percpu(cpu_id: u32) -> &'static mut PerCpu {
-    assert!((cpu_id as usize) < MAX_CPUS, "CPU ID out of range");
-    unsafe { &mut PERCPU_ARRAY[cpu_id as usize] }
+/// A CPU's per-CPU data by CPU id (panics past MAX_CPUS)
+pub fn get_percpu(cpu_id: u32) -> &'static PerCpu {
+    &PERCPU_ARRAY[cpu_id as usize]
 }
 
-/// Get a mutable reference to the current CPU's per-CPU data
+/// The current CPU's per-CPU data, from GS:0
 ///
 /// # Safety
-/// The GS base must have been set up correctly, and the caller must ensure
-/// no other references exist.
+/// GS base must be this CPU's `PerCpu` (`init_bsp`/`init_ap` ran on it).
 #[inline]
-pub unsafe fn current_cpu_mut() -> &'static mut PerCpu {
-    let ptr: *mut PerCpu;
+pub unsafe fn current_cpu() -> &'static PerCpu {
+    let ptr: *const PerCpu;
+    // SAFETY: a load from GS:0, which the caller guarantees is mapped.
+    // nomem: reads only the self-pointer that never changes after init.
+    // Not pure: a task may resume on another CPU after any call that
+    // schedules, so the load must not be reused across one
     unsafe {
         ::core::arch::asm!(
             "mov {}, gs:0",
             out(reg) ptr,
-            // Not pure: a task may resume on another CPU after any call
-            // that schedules, so the load must not be reused across one
             options(nomem, nostack, preserves_flags)
         );
-        &mut *ptr
     }
+    // SAFETY: GS:0 holds the address of an element of the static
+    // PERCPU_ARRAY (`init`), and PerCpu is only shared (`&`)
+    unsafe { &*ptr }
 }
 
 /// Try to get current CPU data (None before the boot CPU's per-CPU
@@ -156,7 +169,7 @@ pub fn try_current_cpu() -> Option<&'static PerCpu> {
         return None;
     }
     // SAFETY: GS base is this CPU's PerCpu (see above)
-    unsafe { Some(current_cpu_mut()) }
+    unsafe { Some(current_cpu()) }
 }
 
 /// Initialize per-CPU data for the BSP (CPU 0)
@@ -169,7 +182,7 @@ pub fn init_bsp(apic_id: u8) {
     percpu.init(0, apic_id as u32, true);
 
     // Set GS base to point to our per-CPU data; no user GS base yet
-    set_gs_base(percpu as *mut PerCpu as u64);
+    set_gs_base(percpu.as_ptr() as u64);
     write_user_gsbase(0);
     crate::task::percpu::PERCPU_UP.store(true, Ordering::Release);
 
@@ -191,7 +204,7 @@ pub fn init_ap(apic_id: u8) -> u32 {
     percpu.init(cpu_id, apic_id as u32, false);
 
     // Set GS base to point to our per-CPU data; no user GS base yet
-    set_gs_base(percpu as *mut PerCpu as u64);
+    set_gs_base(percpu.as_ptr() as u64);
     write_user_gsbase(0);
 
     // Mark as online
@@ -425,7 +438,7 @@ use super::X86_64Arch;
 impl PerCpuOps for X86_64Arch {
     #[inline]
     fn try_current_cpu_id() -> Option<u32> {
-        try_current_cpu().map(|percpu| percpu.cpu_id)
+        try_current_cpu().map(PerCpu::id)
     }
 
     #[inline]

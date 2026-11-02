@@ -4,7 +4,9 @@ use super::interrupts::{CALL_FUNCTION_VECTOR, RESCHEDULE_VECTOR};
 
 /// APIC id of logical CPU `cpu`
 fn apic_id(cpu: u32) -> u32 {
-    super::percpu::get_percpu(cpu).apic_id
+    super::percpu::get_percpu(cpu)
+        .apic_id
+        .load(core::sync::atomic::Ordering::Relaxed)
 }
 
 /// Raise the call-function IPI on `cpu` (`smp::call_function_interrupt`)

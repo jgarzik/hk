@@ -913,10 +913,7 @@ pub fn sys_sigaltstack(ss_ptr: u64, oss_ptr: u64) -> i64 {
     let tid = current_tid();
 
     // Get current user stack pointer to check if on signal stack
-    let user_sp = {
-        use crate::arch::UserRegs;
-        crate::task::percpu::current_pt_regs().sp()
-    };
+    let user_sp = crate::task::percpu::current_pt_regs().sp();
 
     // Read the new stack before locking the signal state (Linux
     // copy_from_user, then do_sigaltstack, then copy_to_user)

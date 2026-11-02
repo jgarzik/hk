@@ -6,6 +6,7 @@ use crate::printkln;
 use core::arch::asm;
 
 use super::Aarch64TrapFrame;
+use crate::arch::UserFrame;
 use crate::mm::fault::{Access, VmFault};
 use crate::signal::{KSigInfo, si_code};
 
@@ -129,7 +130,12 @@ extern "C" fn handle_stack_overflow(sp: u64, elr: u64, far: u64) -> ! {
 
 /// Handle IRQ from EL1 (kernel mode)
 #[unsafe(no_mangle)]
-extern "C" fn handle_el1_irq(_frame: &mut Aarch64TrapFrame) {
+extern "C" fn handle_el1_irq(_frame: *mut Aarch64TrapFrame) {
+    irq_body();
+}
+
+/// An interrupt, from either level
+fn irq_body() {
     // In an interrupt handler from here to the end (in_atomic(), the
     // signal-context check)
     let depth = super::percpu::try_current_cpu().map(|p| &p.interrupt_depth);
@@ -181,18 +187,24 @@ fn irq_dispatch() {
 
 /// Handle synchronous exception from EL0 (user mode)
 #[unsafe(no_mangle)]
-extern "C" fn handle_el0_sync(frame: &mut Aarch64TrapFrame, esr: u64) {
+extern "C" fn handle_el0_sync(frame: &UserFrame, esr: u64) {
     let ec = (esr >> 26) & 0x3F;
     let iss = esr & 0x1FFFFFF;
     // Not a syscall frame unless it is one (Linux el0t_64_sync)
-    frame.syscallno = super::NO_SYSCALL;
+    // SAFETY: a field store
+    unsafe { frame.with(|f| f.syscallno = super::NO_SYSCALL) };
 
     match ec {
         EC_SVC64 => {
             // System call: its number and first argument, for the
             // restart (Linux el0_svc_common)
-            frame.orig_x0 = frame.x[0];
-            frame.syscallno = frame.x[8];
+            // SAFETY: field loads and stores
+            unsafe {
+                frame.with(|f| {
+                    f.orig_x0 = f.x[0];
+                    f.syscallno = f.x[8];
+                })
+            };
             // The user state is saved: run the syscall with IRQs
             // unmasked (Linux el0_svc). The kernel is not preemptive, so
             // an interrupt never switches tasks here (doc/LOCKING.md 7)
@@ -203,9 +215,9 @@ extern "C" fn handle_el0_sync(frame: &mut Aarch64TrapFrame, esr: u64) {
             if nr != super::NO_SYSCALL {
                 // Syscall number in x8, arguments in x0-x5, return value
                 // in x0
-                frame.x[0] = super::syscall::aarch64_syscall_dispatch(
-                    nr, frame.x[0], frame.x[1], frame.x[2], frame.x[3], frame.x[4], frame.x[5],
-                );
+                let [a0, a1, a2, a3, a4, a5] = frame.syscall_args();
+                let ret = super::syscall::aarch64_syscall_dispatch(nr, a0, a1, a2, a3, a4, a5);
+                frame.set_ret(ret);
             }
             // Signals, -ERESTART* rules, rescheduling before returning to
             // user space (they may redirect the frame to a handler or
@@ -250,16 +262,16 @@ extern "C" fn handle_el0_sync(frame: &mut Aarch64TrapFrame, esr: u64) {
             // brk #imm: PC still points at it
             let info = KSigInfo {
                 code: si_code::TRAP_BRKPT,
-                addr: frame.elr,
+                addr: frame.ip(),
                 ..Default::default()
             };
             user_fault(frame, crate::signal::SIGTRAP, info);
         }
         EC_PC_ALIGN | EC_SP_ALIGN => {
             let addr = if ec == EC_SP_ALIGN {
-                frame.sp
+                frame.sp()
             } else {
-                frame.elr
+                frame.ip()
             };
             let info = KSigInfo {
                 code: si_code::BUS_ADRALN,
@@ -275,11 +287,11 @@ extern "C" fn handle_el0_sync(frame: &mut Aarch64TrapFrame, esr: u64) {
                 "Unhandled EL0 sync exception: EC={:#x}, ISS={:#x}, ELR={:#x}",
                 ec,
                 iss,
-                frame.elr
+                frame.ip()
             );
             let info = KSigInfo {
                 code: si_code::ILL_ILLOPC,
-                addr: frame.elr,
+                addr: frame.ip(),
                 ..Default::default()
             };
             user_fault(frame, crate::signal::SIGILL, info);
@@ -320,13 +332,7 @@ fn mm_fault(far: u64, access: Access) -> Result<(), VmFault> {
 /// do_page_fault/do_alignment_fault): SIGSEGV for translation, access-flag
 /// and permission faults, SIGBUS for a mapping without a page there,
 /// alignment and other aborts; out of memory kills the process
-fn user_abort(
-    frame: &mut Aarch64TrapFrame,
-    esr: u64,
-    far: u64,
-    fsc: u64,
-    res: Result<(), VmFault>,
-) {
+fn user_abort(frame: &UserFrame, esr: u64, far: u64, fsc: u64, res: Result<(), VmFault>) {
     use crate::signal::{SIGBUS, SIGSEGV};
 
     if res == Err(VmFault::Oom) {
@@ -341,7 +347,7 @@ fn user_abort(
     };
     printkln!(
         "User abort at ELR={:#x}, FAR={:#x}, ESR={:#x} -> signal {}",
-        frame.elr,
+        frame.ip(),
         far,
         esr,
         sig
@@ -358,16 +364,17 @@ fn user_abort(
 /// Deliver a synchronous fault signal (force_sig_fault) for the user
 /// context in `frame`, the task's pt_regs: a handler runs when this
 /// exception returns
-fn user_fault(frame: &mut Aarch64TrapFrame, sig: u32, info: KSigInfo) {
+fn user_fault(frame: &UserFrame, sig: u32, info: KSigInfo) {
     super::cpu::enable_interrupts();
     crate::signal::force_sig_fault(sig, info, frame);
 }
 
 /// Handle IRQ from EL0 (user mode)
 #[unsafe(no_mangle)]
-extern "C" fn handle_el0_irq(frame: &mut Aarch64TrapFrame) {
-    frame.syscallno = super::NO_SYSCALL;
-    handle_el1_irq(frame);
+extern "C" fn handle_el0_irq(frame: &UserFrame) {
+    // SAFETY: a field store
+    unsafe { frame.with(|f| f.syscallno = super::NO_SYSCALL) };
+    irq_body();
     // Back to user mode: its pending work first (Linux
     // irqentry_exit_to_user_mode)
     crate::entry::exit_to_user_mode(frame);

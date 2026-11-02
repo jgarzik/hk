@@ -6,7 +6,7 @@ pub const SGI_CALL_FUNCTION: u32 = 1;
 
 /// MPIDR of logical CPU `cpu`
 fn mpidr(cpu: u32) -> u64 {
-    super::percpu::get_percpu(cpu).mpidr
+    super::percpu::get_percpu(cpu).mpidr()
 }
 
 /// Raise the call-function SGI on `cpu` (`smp::call_function_interrupt`)

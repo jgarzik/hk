@@ -1141,11 +1141,13 @@ pub fn task_pt_regs(t: &KernelTask) -> *mut <CurrentArch as crate::arch::Arch>::
 }
 
 /// The current task's user registers (Linux current_pt_regs); only for a
-/// task that entered from user mode (not kernel threads)
-#[allow(clippy::mut_from_ref)]
-pub fn current_pt_regs() -> &'static mut <CurrentArch as crate::arch::Arch>::TrapFrame {
-    // SAFETY: the running task's own frame, on its own kernel stack
-    unsafe { &mut *task_pt_regs(&current()) }
+/// task that entered from user mode (not kernel threads). `'static`: the
+/// kernel stack outlives every use by the task itself, and `&UserFrame`
+/// is `!Send`, so it never leaves the task.
+pub fn current_pt_regs() -> &'static crate::arch::UserFrame {
+    // SAFETY: the running task's own frame, on its own kernel stack;
+    // only the task and a tracer (while it is stopped) access it
+    unsafe { crate::arch::UserFrame::from_ptr(task_pt_regs(&current())) }
 }
 
 /// Timer tick counter (global)
@@ -2070,7 +2072,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     // Every user register of the parent's syscall (Linux copy_thread:
     // *childregs = *current_pt_regs()), returning 0, on its own stack
     // unless it shares the parent's (fork: child_stack 0)
-    let mut child_trapframe = current_pt_regs().clone();
+    let mut child_trapframe = current_pt_regs().get();
     child_trapframe.set_ret(0);
     if config.child_stack != 0 {
         child_trapframe.set_sp(config.child_stack);

@@ -108,8 +108,7 @@ fn verdict(result: u32) -> Verdict {
 /// syscall, Some(return value) to skip it. A kill verdict does not
 /// return. The mode is read lock-free (Linux TIF_SECCOMP), the filter
 /// only when it is on.
-pub fn secure_computing(regs: &crate::arch::PtRegs, nr: u64) -> Option<u64> {
-    use crate::arch::UserRegs;
+pub fn secure_computing(regs: &crate::arch::UserFrame, nr: u64) -> Option<u64> {
     let me = crate::task::percpu::current();
     let mode = me.seccomp_mode();
     if mode == SECCOMP_MODE_DISABLED {

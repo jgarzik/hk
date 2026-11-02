@@ -191,7 +191,7 @@ extern "C" fn ret_from_fork(fpu: *const FpuArea) -> *mut super::PtRegs {
     crate::task::percpu::write_child_tid_if_needed();
     let regs = crate::task::percpu::current_pt_regs();
     crate::entry::syscall_exit_to_user_mode(regs);
-    regs
+    regs.as_ptr()
 }
 
 impl TaskContext {

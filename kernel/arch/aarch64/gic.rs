@@ -259,7 +259,7 @@ pub fn enable_spi(intid: u32, trigger: Trigger) {
         write_volatile((GICD_IPRIORITYR + n) as *mut u8, 0x80);
 
         // Route to CPU 0 by affinity (ARE is enabled; IRM = 0)
-        let mpidr = super::percpu::get_percpu(0).mpidr & 0xFF_00FF_FFFF;
+        let mpidr = super::percpu::get_percpu(0).mpidr() & 0xFF_00FF_FFFF;
         write_volatile((GICD_IROUTER + n * 8) as *mut u64, mpidr);
 
         // Unmask

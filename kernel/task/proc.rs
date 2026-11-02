@@ -143,7 +143,6 @@ pub fn sys_fork() -> i64 {
 /// * 0: Child returns 0
 /// * < 0: Error code
 pub fn sys_vfork() -> i64 {
-    use crate::arch::UserRegs;
     use crate::task::clone_flags::{CLONE_VFORK, CLONE_VM};
 
     // vfork() = clone(CLONE_VM | CLONE_VFORK, parent_stack)

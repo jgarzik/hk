@@ -155,7 +155,7 @@ pub extern "C" fn clone_child_entry() -> ! {
 
 /// A fork child's first return to user mode: the work of a syscall's
 /// return (Linux ret_from_fork -> syscall_exit_to_user_mode)
-extern "C" fn ret_from_fork(regs: &mut super::Aarch64TrapFrame) {
+extern "C" fn ret_from_fork(regs: &crate::arch::UserFrame) {
     crate::entry::syscall_exit_to_user_mode(regs);
 }
 

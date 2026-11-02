@@ -11,6 +11,7 @@
 
 use ::core::cell::UnsafeCell;
 use ::core::mem::size_of;
+use ::core::sync::atomic::Ordering;
 
 use crate::cpu::PerCpu;
 
@@ -352,11 +353,14 @@ pub extern "C" fn set_kernel_stack(stack_top: u64) {
     if stack_top == 0 {
         return;
     }
-    // SAFETY: this CPU's own TSS and per-CPU data
+    // SAFETY: this CPU's own TSS, written only here (switch path,
+    // IRQs off) and read by the CPU on a privilege change
     unsafe {
         (*tables(crate::cpu::this_id())).tss.privilege_stack_table[0] = stack_top;
-        super::percpu::current_cpu_mut().top_of_stack = stack_top;
     }
+    // SAFETY: GS base is set before any task switch
+    let pc = unsafe { super::percpu::current_cpu() };
+    pc.top_of_stack.store(stack_top, Ordering::Relaxed);
 }
 
 /// Load a GDT from raw pointer values

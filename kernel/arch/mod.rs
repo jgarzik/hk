@@ -30,6 +30,8 @@ extern crate alloc;
 use alloc::vec::Vec;
 use bitflags::bitflags;
 
+pub mod frame;
+
 #[cfg(target_arch = "x86_64")]
 pub mod x86_64;
 
@@ -102,6 +104,9 @@ pub use x86_64::PtRegs;
 
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::Aarch64TrapFrame as PtRegs;
+
+/// The current task's user register frame, as the entry code holds it
+pub type UserFrame = frame::Frame<PtRegs>;
 
 // Signal frame setup (setup_rt_frame) / rt_sigreturn
 #[cfg(target_arch = "x86_64")]
