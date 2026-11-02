@@ -935,6 +935,11 @@ where
     // Now we need to update the current task and switch to the new address space
     // This is the point of no return
 
+    // Linux begin_new_exec clears PF_FORKNOEXEC before it closes the
+    // close-on-exec descriptors: whoever sees one of them close (EOF on
+    // a pipe) sees the exec, and its setpgid is EACCES
+    percpu::current().clear_flag(crate::task::pf::FORKNOEXEC);
+
     // Private fd table without the close-on-exec descriptors
     crate::task::fdtable::exec_task_fd(percpu::current_tid());
 

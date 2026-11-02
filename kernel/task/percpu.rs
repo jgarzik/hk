@@ -4438,8 +4438,6 @@ pub fn exec_replace_image(
         new.set_dumpable(ident.dumpable);
         // The mm and name change as one under task_lock (Linux
         // exec_mmap, __set_task_comm): a reader sees both or neither
-        // Linux begin_new_exec clears PF_FORKNOEXEC
-        task.task.clear_flag(crate::task::pf::FORKNOEXEC);
         let mut a = task.task.task_lock();
         // SAFETY: the task itself
         unsafe {
