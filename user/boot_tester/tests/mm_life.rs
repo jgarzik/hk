@@ -5,7 +5,8 @@ use super::helpers::{host_mode, print, print_num, println, skip};
 use hk_syscall::{
     CLONE_SIGHAND, CLONE_VM, MAP_ANONYMOUS, MAP_FIXED, MAP_PRIVATE, MREMAP_FIXED, MREMAP_MAYMOVE,
     O_RDONLY, P_PID, PROT_NONE, PROT_READ, PROT_WRITE, SigInfo, Timespec, WEXITED, sys_clone,
-    sys_close, sys_execve, sys_exit, sys_fork, sys_kill, sys_mincore, sys_mmap, sys_mprotect,
+    sys_close, sys_execve, sys_exit, sys_fork, sys_kill, sys_madvise, sys_mincore, sys_mmap,
+    sys_mprotect,
     sys_mremap, sys_munmap, sys_nanosleep, sys_open, sys_pread64, sys_read, sys_sched_yield,
     sys_vfork, sys_wait4, sys_waitid,
 };
@@ -199,19 +200,53 @@ fn leak(name: &[u8], n: u32, f: fn() -> bool) {
     report(name, ok, lost);
 }
 
-/// Let exited tasks' CPUs switch away (their stacks are freed then)
+/// Let exited tasks' CPUs switch away (their stacks are freed then),
+/// and empty the per-CPU LRU add batches: each holds a reference on up
+/// to 15 pages of exited processes, on every CPU children ran on, until
+/// it fills (Linux cpu_fbatches likewise); MADV_COLD drains them all on
+/// hk (lru_add_drain_all) and is harmless on Linux
 fn settle() {
     let ts = Timespec {
         tv_sec: 0,
         tv_nsec: 20_000_000,
     };
     sys_nanosleep(&ts, core::ptr::null_mut());
+    let p = sys_mmap(
+        0,
+        PAGE,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS,
+        -1,
+        0,
+    );
+    if p > 0 {
+        unsafe { core::ptr::write_volatile(p as *mut u8, 1) };
+        const MADV_COLD: i32 = 20;
+        sys_madvise(p as u64, PAGE, MADV_COLD);
+        sys_munmap(p as u64, PAGE);
+    }
 }
 
-/// Reap `pid`; true if it exited with status 0
+/// Reap `pid`; true if it exited with status 0. Anything else is
+/// printed (a failed exec exits nonzero, a crash is killed by a
+/// signal: the status tells them apart)
 fn reap_ok(pid: i64) -> bool {
     let mut st = 0i32;
-    pid > 0 && sys_wait4(pid, &mut st, 0, 0) == pid && st == 0
+    let w = if pid > 0 {
+        sys_wait4(pid, &mut st, 0, 0)
+    } else {
+        pid
+    };
+    if w != pid || st != 0 {
+        print(b"MM_LIFE: child pid ");
+        print_num(pid);
+        print(b" wait ");
+        print_num(w);
+        print(b" status ");
+        print_num(st as i64);
+        println(b"");
+    }
+    w == pid && pid > 0 && st == 0
 }
 
 /// 64 pages written, then made PROT_NONE: their address
