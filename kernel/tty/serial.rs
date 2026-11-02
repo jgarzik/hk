@@ -170,7 +170,7 @@ impl SerialTty {
                 "out dx, al",
                 in("dx") self.port + offset,
                 in("al") value,
-                options(nomem, nostack, preserves_flags)
+                options(nostack, preserves_flags)
             );
         }
     }
@@ -184,7 +184,7 @@ impl SerialTty {
                 "in al, dx",
                 in("dx") self.port + offset,
                 out("al") value,
-                options(nomem, nostack, preserves_flags)
+                options(nostack, preserves_flags)
             );
         }
         value

@@ -49,7 +49,7 @@ impl UaccessArch for X86_64Uaccess {
         // at boot time.
         if smap_enabled() {
             unsafe {
-                ::core::arch::asm!("stac", options(nomem, nostack, preserves_flags));
+                ::core::arch::asm!("stac", options(nostack, preserves_flags));
             }
         }
     }
@@ -67,7 +67,7 @@ impl UaccessArch for X86_64Uaccess {
     unsafe fn user_access_end() {
         if smap_enabled() {
             unsafe {
-                ::core::arch::asm!("clac", options(nomem, nostack, preserves_flags));
+                ::core::arch::asm!("clac", options(nostack, preserves_flags));
             }
         }
     }
@@ -151,7 +151,7 @@ pub fn enable_smap() {
         unsafe {
             ::core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags));
             cr4 |= CR4_SMAP;
-            ::core::arch::asm!("mov cr4, {}", in(reg) cr4, options(nomem, nostack, preserves_flags));
+            ::core::arch::asm!("mov cr4, {}", in(reg) cr4, options(nostack, preserves_flags));
         }
     }
 }
@@ -166,7 +166,7 @@ pub fn enable_smep() {
         unsafe {
             ::core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags));
             cr4 |= CR4_SMEP;
-            ::core::arch::asm!("mov cr4, {}", in(reg) cr4, options(nomem, nostack, preserves_flags));
+            ::core::arch::asm!("mov cr4, {}", in(reg) cr4, options(nostack, preserves_flags));
         }
     }
 }

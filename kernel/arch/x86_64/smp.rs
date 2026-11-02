@@ -343,7 +343,7 @@ fn ap_idle_loop() -> ! {
 
         // If no task was scheduled, wait for next interrupt
         unsafe {
-            ::core::arch::asm!("hlt", options(nomem, nostack));
+            ::core::arch::asm!("hlt", options(nostack));
         }
     }
 }

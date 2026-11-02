@@ -11,8 +11,6 @@ None is known to fail today, but each is a soundness bug:
   - `entry_atomic`, `virtio_net::rx_skb`.
   - mm `pte` helpers that take `*mut u64`.
   - `pfn_to_page` (checks its argument only in debug builds).
-- **asm options:** `nomem` on aarch64 `enable_and_halt`, on x86
-  `stac`/`clac` and on `wrmsr`.
 - **Inode locks:** `unlock_rename` and `inode_lock`/`inode_unlock` are
   hand-paired, and `unlock_rename` is a safe fn.
 

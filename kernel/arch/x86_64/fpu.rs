@@ -109,7 +109,7 @@ fn read_cr4() -> u64 {
 }
 
 fn write_cr4(v: u64) {
-    unsafe { core::arch::asm!("mov cr4, {}", in(reg) v, options(nomem, nostack)) };
+    unsafe { core::arch::asm!("mov cr4, {}", in(reg) v, options(nostack)) };
 }
 
 fn xsetbv(xcr0: u64) {
@@ -134,7 +134,7 @@ pub fn init_cpu(bsp: bool) {
         cr0 &= !(1 << 2); // EM: no emulation
         cr0 &= !(1 << 3); // TS: no lazy #NM
         cr0 |= 1 << 1; // MP
-        core::arch::asm!("mov cr0, {}", in(reg) cr0, options(nomem, nostack));
+        core::arch::asm!("mov cr0, {}", in(reg) cr0, options(nostack));
     }
     let mut cr4 = read_cr4() | CR4_OSFXSR | CR4_OSXMMEXCPT;
 

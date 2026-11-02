@@ -182,7 +182,7 @@ impl CpuOps for Aarch64Arch {
             asm!(
                 "msr daifclr, #2", // Clear I bit (enable IRQ)
                 "wfi",
-                options(nomem, nostack)
+                options(nostack)
             );
         }
     }

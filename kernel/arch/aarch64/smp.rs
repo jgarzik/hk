@@ -216,7 +216,7 @@ fn wait_for_ap(timeout_ms: u32) -> bool {
 
         // Wait for event (AP sends SEV after setting AP_READY)
         unsafe {
-            core::arch::asm!("wfe", options(nomem, nostack));
+            core::arch::asm!("wfe", options(nostack));
         }
     }
 }
@@ -254,7 +254,7 @@ extern "C" fn ap_rust_entry(boot_data_phys: u64) -> ! {
     AP_READY.store(1, Ordering::SeqCst);
     // Ensure the store is visible to other CPUs
     unsafe {
-        core::arch::asm!("dsb sy", "sev", options(nomem, nostack));
+        core::arch::asm!("dsb sy", "sev", options(nostack));
     }
 
     // Wait for BSP to finish initialization and enable scheduling
@@ -285,7 +285,7 @@ fn ap_idle_loop() -> ! {
 
         // Wait for next interrupt
         unsafe {
-            core::arch::asm!("wfi", options(nomem, nostack));
+            core::arch::asm!("wfi", options(nostack));
         }
     }
 }

@@ -78,7 +78,7 @@ fn wrmsr(msr: u32, value: u64) {
             in("ecx") msr,
             in("eax") low,
             in("edx") high,
-            options(nomem, nostack, preserves_flags)
+            options(nostack, preserves_flags)
         );
     }
 }

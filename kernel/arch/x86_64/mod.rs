@@ -72,7 +72,7 @@ impl CpuOps for X86_64Arch {
     #[inline]
     fn halt() {
         unsafe {
-            core::arch::asm!("hlt", options(nomem, nostack, preserves_flags));
+            core::arch::asm!("hlt", options(nostack, preserves_flags));
         }
     }
 
@@ -237,7 +237,7 @@ impl HaltOps for X86_64Arch {
         }
         loop {
             unsafe {
-                core::arch::asm!("hlt", options(nomem, nostack, preserves_flags));
+                core::arch::asm!("hlt", options(nostack, preserves_flags));
             }
         }
     }

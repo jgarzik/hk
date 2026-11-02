@@ -80,7 +80,7 @@ pub fn init() {
 #[inline]
 pub fn halt() {
     unsafe {
-        asm!("wfi", options(nomem, nostack));
+        asm!("wfi", options(nostack));
     }
 }
 
