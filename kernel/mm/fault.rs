@@ -405,6 +405,7 @@ fn file_page(
     if area.shared {
         if area.prot & PROT_WRITE != 0 {
             super::filemap::dirty_page(&inode.i_data, page);
+            crate::fs::fs_writeback::mark_inode_dirty(&inode);
         }
         return Some(Ok((page, true, false)));
     }
@@ -544,6 +545,19 @@ pub fn unuse_pte(mm: &Mm, vma: &super::Vma, addr: u64) -> Result<(), VmFault> {
 /// is made writable in place; a private page still shared (fork's
 /// copy-on-write) is copied first
 fn do_wp_page(mm: &Mm, ptep: *mut u64, pte: u64, addr: u64, area: &Area) -> Result<(), VmFault> {
+    // A shared file page written back (write-protected by mkclean) is
+    // dirty again once writable (Linux wp_page_shared ->
+    // fault_dirty_shared_page)
+    if area.shared
+        && let Some(inode) = area.file.as_ref().and_then(|f| f.mapping_inode())
+        && inode.i_op.maps_cache()
+    {
+        let r = wp_locked(mm, ptep, pte, addr, area, &mut None);
+        super::filemap::dirty_page(&inode.i_data, paging::pte_addr(pte));
+        crate::fs::fs_writeback::mark_inode_dirty(&inode);
+        super::writeback::balance_dirty_pages(&inode);
+        return r;
+    }
     let mut spare = None;
     loop {
         match wp_locked(mm, ptep, pte, addr, area, &mut spare) {

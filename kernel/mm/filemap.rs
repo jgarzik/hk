@@ -174,6 +174,33 @@ impl Drop for AddressSpace {
     }
 }
 
+/// Dirty page-cache pages, per CPU (Linux NR_FILE_DIRTY vmstat): summed
+/// for balance_dirty_pages and /proc/meminfo
+static NR_DIRTY: crate::cpu::PerCpu<core::sync::atomic::AtomicI64> =
+    crate::percpu![core::sync::atomic::AtomicI64::new(0)];
+
+fn count_dirty(d: i64) {
+    NR_DIRTY.this().fetch_add(d, Ordering::Relaxed);
+}
+
+/// Dirty page-cache pages (Linux global_node_page_state(NR_FILE_DIRTY))
+pub fn nr_dirty() -> u64 {
+    NR_DIRTY
+        .for_each_possible()
+        .map(|(_, c)| c.load(Ordering::Relaxed))
+        .sum::<i64>()
+        .max(0) as u64
+}
+
+/// Clear the page's dirty bit; true (and uncounted) if it was set
+fn test_clear_dirty(pg: &Page) -> bool {
+    let was = pg.flags.fetch_and(!PG_DIRTY, Ordering::AcqRel) & PG_DIRTY != 0;
+    if was {
+        count_dirty(-1);
+    }
+    was
+}
+
 fn page(phys: u64) -> &'static Page {
     phys_to_page(phys).expect("page cache frame outside RAM")
 }
@@ -322,8 +349,8 @@ pub fn remove(m: &AddressSpace, phys: u64) {
         debug_assert_eq!(old, phys);
         pg.mapping.store(0, Ordering::Release);
     }
-    pg.flags
-        .fetch_and(!(PG_DIRTY | PG_UPTODATE), Ordering::Relaxed);
+    test_clear_dirty(pg);
+    pg.flags.fetch_and(!PG_UPTODATE, Ordering::Relaxed);
     pg.private.store(0, Ordering::Relaxed);
     m.nrpages.fetch_sub(1, Ordering::Relaxed);
     put_page(phys);
@@ -359,8 +386,8 @@ fn truncate_final(m: &AddressSpace) {
     pages.destroy(&mut |phys| {
         let pg = page(phys);
         pg.mapping.store(0, Ordering::Release);
-        pg.flags
-            .fetch_and(!(PG_DIRTY | PG_UPTODATE), Ordering::Relaxed);
+        test_clear_dirty(pg);
+        pg.flags.fetch_and(!PG_UPTODATE, Ordering::Relaxed);
         pg.private.store(0, Ordering::Relaxed);
         put_page(phys);
     });
@@ -374,12 +401,38 @@ pub fn dirty_page(m: &AddressSpace, phys: u64) {
         return;
     }
     let pg = page(phys);
-    if pg.flags.fetch_or(PG_DIRTY, Ordering::AcqRel) & PG_DIRTY == 0
-        && pg.mapping.load(Ordering::Acquire) == m.key()
+    if pg.mapping.load(Ordering::Acquire) == m.key()
+        && pg.flags.fetch_or(PG_DIRTY, Ordering::AcqRel) & PG_DIRTY == 0
     {
+        count_dirty(1);
         m.i_pages
             .lock()
             .set_mark(pg.index.load(Ordering::Relaxed), MARK_DIRTY);
+    }
+}
+
+/// Write-protect every writable PTE mapping page `index` (`phys`) of
+/// `m` (Linux folio_mkclean through i_mmap), so the next write through
+/// a shared mapping faults and dirties the page again. Sleeps (the
+/// chain); takes each PTE lock.
+fn mkclean(m: &AddressSpace, index: u64, phys: u64) {
+    use crate::arch::paging;
+    let chain = m.i_mmap.read();
+    for avc in chain.iter() {
+        let (Some(addr), Some(mm)) = (avc.address(index), avc.mm.upgrade()) else {
+            continue;
+        };
+        let Some(ptep) = paging::pte_ptr(avc.pgd, addr) else {
+            continue;
+        };
+        let _l = super::ptl::pte_lock(ptep);
+        // SAFETY: a live table of a VMA in the chain, under its PTE lock
+        let e = unsafe { AtomicU64::from_ptr(ptep) };
+        let pte = e.load(Ordering::Acquire);
+        if paging::pte_present(pte) && paging::pte_addr(pte) == phys && paging::pte_write(pte) {
+            e.store(paging::pte_wrprotect(pte), Ordering::Release);
+            super::tlb::flush_tlb_page(&mm, addr);
+        }
     }
 }
 
@@ -406,7 +459,10 @@ pub fn write_and_wait(inode: &Inode) -> Result<(), KernelError> {
         let pg = page(phys);
         if pg.mapping.load(Ordering::Acquire) == m.key() {
             m.i_pages.lock().clear_mark(index, MARK_DIRTY);
-            if pg.flags.fetch_and(!PG_DIRTY, Ordering::AcqRel) & PG_DIRTY != 0
+            // Write-protected first: a write through a mapping after
+            // this faults and dirties the page again (folio_mkclean)
+            mkclean(m, index, phys);
+            if test_clear_dirty(pg)
                 && let Err(e) = m.aops().writepage(inode, phys, index)
                 && err.is_ok()
             {
@@ -443,7 +499,7 @@ pub fn invalidate_range(inode: &Inode, start: u64, end: u64) -> Result<(), Kerne
         let pg = page(phys);
         let mut r = Ok(());
         if pg.mapping.load(Ordering::Acquire) == m.key() {
-            if pg.flags.fetch_and(!PG_DIRTY, Ordering::AcqRel) & PG_DIRTY != 0 {
+            if test_clear_dirty(pg) {
                 m.i_pages.lock().clear_mark(index, MARK_DIRTY);
                 r = m.aops().writepage(inode, phys, index);
             }

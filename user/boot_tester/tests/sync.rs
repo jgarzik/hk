@@ -35,6 +35,52 @@ pub fn run_tests() {
     test_membarrier_reg();
     test_membarrier();
     test_readahead();
+    test_dirty_sysctls();
+}
+
+/// vm.dirty_* (Linux page-writeback.c): defaults 20/10 percent; setting
+/// dirty_bytes clears dirty_ratio and setting the ratio clears the bytes
+fn test_dirty_sysctls() {
+    use super::helpers::read_file;
+    use hk_syscall::{O_WRONLY, sys_close, sys_open, sys_write};
+    let get = |p: &[u8]| {
+        let mut b = [0u8; 32];
+        let n = read_file(p, &mut b);
+        let mut v = 0i64;
+        for &c in &b[..n.max(0) as usize] {
+            if c.is_ascii_digit() {
+                v = v * 10 + (c - b'0') as i64;
+            }
+        }
+        if n > 0 { v } else { -1 }
+    };
+    let put = |p: &[u8], v: &[u8]| {
+        let fd = sys_open(p.as_ptr(), O_WRONLY, 0);
+        let r = sys_write(fd as u64, v.as_ptr(), v.len() as u64);
+        sys_close(fd as u64);
+        r
+    };
+    let ratio = b"/proc/sys/vm/dirty_ratio\0";
+    let bytes = b"/proc/sys/vm/dirty_bytes\0";
+    let (r0, b0) = (get(ratio), get(b"/proc/sys/vm/dirty_background_ratio\0"));
+    let w1 = put(bytes, b"67108864\n");
+    let (r1, y1) = (get(ratio), get(bytes));
+    let w2 = put(ratio, b"20\n");
+    let (r2, y2) = (get(ratio), get(bytes));
+    let ok = r0 == 20 && b0 == 10 && w1 > 0 && r1 == 0 && y1 == 67108864 && w2 > 0 && r2 == 20 && y2 == 0;
+    if ok {
+        println(b"VM_DIRTY_SYSCTLS:OK");
+    } else {
+        print(b"VM_DIRTY_SYSCTLS:FAIL ");
+        print_num(r0);
+        print(b" ");
+        print_num(b0);
+        print(b" ");
+        print_num(r1);
+        print(b" ");
+        print_num(y2);
+        println(b"");
+    }
 }
 
 /// Test 63: sync() - synchronize all filesystems

@@ -1573,6 +1573,14 @@ dropped before and after it is zeroed on the disk.)
   take_rmap_locks). A file fault maps its page under the page lock and
   rechecks i_size there; truncate sets i_size, unmaps, removes the
   pages under their locks and unmaps again.
+- Writeback write-protects a page in every mapping of it before
+  writing it (`mkclean`, Linux folio_mkclean): under the page lock,
+  i_mmap read -> each PTE lock, a TLB flush per entry. The write fault
+  that follows makes it writable and dirties it again (no lock held
+  but the mmap_lock read side), then may throttle (balance_dirty_pages
+  writes the inode back: mmap_lock -> page lock -> i_mmap).
+- Dirty pages are counted per CPU (`NR_DIRTY`, atomics, Linux
+  NR_FILE_DIRTY), summed lock-free for the dirty limits.
 - Eviction (`Drop for AddressSpace`, the inode's last reference)
   empties `i_pages` without page locks: nothing else can reach the
   mapping any more.

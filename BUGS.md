@@ -37,6 +37,14 @@ SO_PEEK_OFF is EOPNOTSUPP.
 
 Missing:
 
+- Writeback (P5): the periodic pass writes every dirty inode of a
+  device (Linux only those dirty for vm.dirty_expire_centisecs, which
+  is stored but unused); past vm.dirty_ratio the writer writes its own
+  inode back synchronously instead of sleeping in balance_dirty_pages;
+  the limits are fractions of all managed memory (Linux: dirtyable
+  memory). No errseq: fsync reports a writeback error once, to the
+  caller that ran the writeback, not to every open file.
+
 - Reclaim (P4) swaps out private anonymous pages only, for
   MADV_PAGEOUT: no accessed-bit aging (pages are reclaimed oldest
   first), synchronous writes, no kswapd, no file pages; 2MB pages stay

@@ -15,13 +15,18 @@ extern crate alloc;
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::storage::blkdev::DevId;
 use crate::sync::spin::{Mutex, RwLock};
 use crate::workqueue::{DelayedWork, Workqueue, wq_flags};
 
-/// Writeback interval in timer ticks (500 ticks = ~5 seconds at 100Hz)
-pub const WRITEBACK_INTERVAL_TICKS: u64 = 500;
+/// The periodic writeback's interval in scheduler ticks
+/// (vm.dirty_writeback_centisecs)
+fn interval() -> u64 {
+    let cs = WRITEBACK_CS.load(Ordering::Relaxed).max(1);
+    cs * 10 / crate::task::percpu::TICK_MS
+}
 
 /// The writeback workqueue (Linux bdi_wq: WQ_MEM_RECLAIM, so writeback
 /// proceeds under memory pressure)
@@ -63,8 +68,16 @@ impl BdiWriteback {
             first
         };
         if first {
-            BDI_WORKQUEUE.queue_delayed_work(self.dwork.clone(), WRITEBACK_INTERVAL_TICKS);
+            BDI_WORKQUEUE.queue_delayed_work(self.dwork.clone(), interval());
         }
+    }
+
+    /// Start writing `dev` back now (past the background limit; Linux
+    /// wb_start_background_writeback)
+    pub fn wakeup(&self, dev: DevId) {
+        self.dirty.lock().insert(dev);
+        self.dwork.lock().cancel_timer();
+        BDI_WORKQUEUE.queue_delayed_work(self.dwork.clone(), 0);
     }
 }
 
@@ -81,6 +94,115 @@ fn do_device_writeback(disk: DevId) {
         }
     }
 }
+
+// ============================================================================
+// Dirty limits (Linux mm/page-writeback.c)
+// ============================================================================
+
+/// vm.dirty_background_ratio / _bytes, vm.dirty_ratio / _bytes: one of
+/// each pair is in effect (writing one clears the other, as on Linux)
+static BG_RATIO: AtomicU64 = AtomicU64::new(10);
+static BG_BYTES: AtomicU64 = AtomicU64::new(0);
+static DIRTY_RATIO: AtomicU64 = AtomicU64::new(20);
+static DIRTY_BYTES: AtomicU64 = AtomicU64::new(0);
+/// vm.dirty_expire_centisecs (stored; hk writes every dirty inode of a
+/// device at each pass) and vm.dirty_writeback_centisecs
+static EXPIRE_CS: AtomicU64 = AtomicU64::new(3000);
+static WRITEBACK_CS: AtomicU64 = AtomicU64::new(500);
+
+/// Pages a limit of `ratio` percent / `bytes` stands for, of the memory
+/// the page allocator manages (Linux: of dirtyable memory)
+fn limit(ratio: &AtomicU64, bytes: &AtomicU64) -> u64 {
+    let b = bytes.load(Ordering::Relaxed);
+    if b != 0 {
+        return b / 4096;
+    }
+    let total = crate::FRAME_ALLOCATOR.stats().total_bytes / 4096;
+    total * ratio.load(Ordering::Relaxed) / 100
+}
+
+/// After a write dirtied pages of `inode` (Linux
+/// balance_dirty_pages_ratelimited): past the background limit its
+/// device's writeback starts now; past the dirty limit the writer
+/// writes the inode back itself (Linux throttles it until the flusher
+/// catches up). Sleeps; no lock held.
+pub fn balance_dirty_pages(inode: &crate::fs::Inode) {
+    let dirty = crate::mm::filemap::nr_dirty();
+    if dirty > limit(&DIRTY_RATIO, &DIRTY_BYTES) {
+        let _ = crate::fs::fs_writeback::writeback_inode(inode);
+    } else if dirty > limit(&BG_RATIO, &BG_BYTES)
+        && let Some(b) = inode.superblock().and_then(|sb| sb.bdev().cloned())
+    {
+        b.disk.bdi.wakeup(b.dev_id());
+    }
+}
+
+fn set_pair(
+    on: &AtomicU64,
+    off: &AtomicU64,
+    v: i64,
+    lo: i64,
+    hi: i64,
+) -> Result<(), crate::error::KernelError> {
+    crate::sysctl::range(v, lo, hi)?;
+    on.store(v as u64, Ordering::Relaxed);
+    off.store(0, Ordering::Relaxed);
+    Ok(())
+}
+
+/// /proc/sys/vm dirty limits (Linux vm_table)
+pub static WB_CTLS: &[crate::sysctl::Ctl] = &[
+    crate::sysctl::Ctl {
+        path: "vm/dirty_background_ratio",
+        mode: 0o644,
+        show: || alloc::vec![BG_RATIO.load(Ordering::Relaxed) as i64],
+        store: |v| set_pair(&BG_RATIO, &BG_BYTES, v[0], 0, 100),
+        text: None,
+    },
+    crate::sysctl::Ctl {
+        path: "vm/dirty_background_bytes",
+        mode: 0o644,
+        show: || alloc::vec![BG_BYTES.load(Ordering::Relaxed) as i64],
+        store: |v| set_pair(&BG_BYTES, &BG_RATIO, v[0], 1, i64::MAX),
+        text: None,
+    },
+    crate::sysctl::Ctl {
+        path: "vm/dirty_ratio",
+        mode: 0o644,
+        show: || alloc::vec![DIRTY_RATIO.load(Ordering::Relaxed) as i64],
+        store: |v| set_pair(&DIRTY_RATIO, &DIRTY_BYTES, v[0], 0, 100),
+        text: None,
+    },
+    crate::sysctl::Ctl {
+        path: "vm/dirty_bytes",
+        mode: 0o644,
+        show: || alloc::vec![DIRTY_BYTES.load(Ordering::Relaxed) as i64],
+        store: |v| set_pair(&DIRTY_BYTES, &DIRTY_RATIO, v[0], 2 * 4096, i64::MAX),
+        text: None,
+    },
+    crate::sysctl::Ctl {
+        path: "vm/dirty_expire_centisecs",
+        mode: 0o644,
+        show: || alloc::vec![EXPIRE_CS.load(Ordering::Relaxed) as i64],
+        store: |v| {
+            crate::sysctl::range(v[0], 0, i32::MAX as i64)?;
+            EXPIRE_CS.store(v[0] as u64, Ordering::Relaxed);
+            Ok(())
+        },
+        text: None,
+    },
+    crate::sysctl::Ctl {
+        path: "vm/dirty_writeback_centisecs",
+        mode: 0o644,
+        show: || alloc::vec![WRITEBACK_CS.load(Ordering::Relaxed) as i64],
+        store: |v| {
+            crate::sysctl::range(v[0], 0, i32::MAX as i64)?;
+            WRITEBACK_CS.store(v[0] as u64, Ordering::Relaxed);
+            Ok(())
+        },
+        text: None,
+    },
+];
 
 /// Write back everything (sync(2), Linux ksys_sync): every
 /// filesystem's dirty inodes, then the devices' caches

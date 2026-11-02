@@ -233,6 +233,7 @@ fn vfat_write(inode: &Arc<Inode>, buf: &[u8], pos: u64) -> Result<usize, KernelE
     }
     let n = filemap::perform_write(inode, buf, pos)?;
     super::fs_writeback::mark_inode_dirty(inode);
+    crate::mm::writeback::balance_dirty_pages(inode);
     if inode.get_size() != old {
         update_size(inode, &sb_data)?;
     }

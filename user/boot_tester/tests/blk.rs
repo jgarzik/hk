@@ -414,7 +414,7 @@ fn vfat_remount(p1: &BlkDev) {
     let ok = r == 0
         && n == 8192
         && b[..4096].iter().all(|&c| c == b'w')
-        && &b[4096..4100] == b"mmap"
+        && &b[4096..4100] == b"MMAP"
         && b[4100..8192].iter().all(|&c| c == 0);
     sys_unlink(b"/mnt/vd1/M.TXT\0".as_ptr());
     let u = sys_umount2(b"/mnt/vd1\0".as_ptr(), 0);
@@ -424,7 +424,7 @@ fn vfat_remount(p1: &BlkDev) {
             b[i] != if i < 4096 {
                 b'w'
             } else if i < 4100 {
-                b"mmap"[i - 4096]
+                b"MMAP"[i - 4096]
             } else {
                 0
             }
@@ -483,13 +483,17 @@ fn vfat_mmap_write() {
         v[4096..4100].copy_from_slice(b"mmap");
         sys_pwrite64(fd, b"W".as_ptr(), 1, 11);
         ok &= v[11] == b'W';
+        // Written back (and write-protected): a write through the
+        // mapping now must dirty the page again (Linux folio_mkclean)
+        ok &= sys_fsync(fd) == 0;
+        v[4096..4100].copy_from_slice(b"MMAP");
         sys_munmap(m as u64, 8192);
     }
     let mut got = [0u8; 4];
     sys_pread64(fd, got.as_mut_ptr(), 4, 4096);
     sys_pwrite64(fd, b"w".as_ptr(), 1, 11);
     sys_close(fd as u64);
-    verdict(b"VFAT_MAP_SHARED", ok && &got == b"mmap", w);
+    verdict(b"VFAT_MAP_SHARED", ok && &got == b"MMAP", w);
 }
 
 /// An open file renamed is still the same inode under its new name

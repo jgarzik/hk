@@ -405,6 +405,12 @@ pub fn pte_mkwrite(pte: u64) -> u64 {
     (pte & !(PAGE_COW | AP_RDONLY)) | AP_EL0_RW | AF
 }
 
+/// Read-only (a shared file page written back: the next write faults
+/// and dirties it again, Linux folio_mkclean)
+pub fn pte_wrprotect(pte: u64) -> u64 {
+    pte | AP_EL0_RO
+}
+
 /// Read-only and copy-on-write (fork of a private mapping)
 pub fn pte_mkcow(pte: u64) -> u64 {
     pte | AP_EL0_RO | PAGE_COW

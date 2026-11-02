@@ -55,6 +55,7 @@ pub fn tables() -> &'static [&'static [Ctl]] {
     static TABLES: &[&[Ctl]] = &[
         crate::net::sysctl::CTLS,
         crate::frame_alloc::VM_CTLS,
+        crate::mm::writeback::WB_CTLS,
         crate::mm::MM_CTLS,
         crate::task::fdbits::FS_CTLS,
     ];
