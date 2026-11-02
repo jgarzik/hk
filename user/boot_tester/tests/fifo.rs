@@ -19,6 +19,8 @@
 //!   get_pipe_info); splice into a FIFO open only for reading is EBADF;
 //!   preadv2 RWF_NOWAIT of a FIFO is EOPNOTSUPP (no FMODE_NOWAIT), not a
 //!   blocking read
+//! - FIFO_RDONLY_INJECT: a FIFO open only for reading takes no data:
+//!   sendfile into it is EBADF, vmsplice on it puts nothing in the FIFO
 
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
@@ -49,6 +51,7 @@ pub fn run_tests() {
     pollhup();
     pollhup_present();
     splice();
+    rdonly_inject();
     sys_unlink(PATH.as_ptr());
 }
 
@@ -270,4 +273,42 @@ fn splice() {
         step = 6;
     }
     report(n, step);
+}
+
+fn rdonly_inject() {
+    use hk_syscall::{IoVec, sys_sendfile, sys_vmsplice};
+    const EBADF: i64 = -9;
+    const SPLICE_F_NONBLOCK: u32 = 2;
+    let n = b"FIFO_RDONLY_INJECT";
+    let rw = open(O_RDWR | O_NONBLOCK);
+    let r = open(O_RDONLY | O_NONBLOCK);
+    let src = sys_open(b"/test.txt\0".as_ptr(), O_RDONLY, 0);
+    if rw < 0 || r < 0 || src < 0 {
+        close(rw);
+        close(r);
+        close(src);
+        return report(n, 1);
+    }
+    let sf = sys_sendfile(r as i32, src as i32, core::ptr::null_mut(), 4);
+    let data = b"evil";
+    let iov = IoVec {
+        iov_base: data.as_ptr(),
+        iov_len: 4,
+    };
+    sys_vmsplice(r as i32, &iov, 1, SPLICE_F_NONBLOCK);
+    let mut b = [0u8; 16];
+    let got = sys_read(rw as u64, b.as_mut_ptr(), 16);
+    close(src);
+    close(r);
+    close(rw);
+    report(
+        n,
+        if sf != EBADF {
+            2
+        } else if got != EAGAIN {
+            3
+        } else {
+            0
+        },
+    );
 }

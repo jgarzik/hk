@@ -121,6 +121,14 @@ which has no control queue: QEMU then delivers all frames).
 PACKET_AUXDATA reports TP_STATUS_CSUM_VALID only for frames received on
 lo (hk has no checksum offload states).
 
+## vmsplice from a pipe is not done
+
+**Location**: `kernel/fs/splice.rs` (`sys_vmsplice`)
+
+vmsplice on a pipe or FIFO open for writing copies user memory into it
+(Linux vmsplice_to_pipe). On one open only for reading Linux copies the
+pipe's data into the user iovecs (vmsplice_to_user); hk returns EBADF.
+
 ## AF_UNIX gaps
 
 **Location**: `kernel/net/unix/`

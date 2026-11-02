@@ -243,12 +243,9 @@ pub fn link_pipe(src: &Pipe, dst: &Pipe, len: usize, _flags: u32) -> Result<usiz
 // Helper: Extract pipe from file if it's a pipe
 // =============================================================================
 
-/// Try to get a Pipe from a file descriptor
-fn get_pipe_from_fd(fd: i32) -> Option<Arc<Pipe>> {
-    let tid = current_tid();
-    let fd_table = get_task_fd(tid)?;
-    let file = fd_table.lock().get(fd)?;
-
+/// The pipe behind `file`, a pipe end or a FIFO (Linux get_pipe_info);
+/// callers check the file's direction on the same `File` they looked up
+fn pipe_of_file(file: &File) -> Option<Arc<Pipe>> {
     let ops = file.f_op.as_any();
     // A FIFO is a pipe too (Linux get_pipe_info)
     if ops.is::<crate::pipe::FifoFileOps>() {
@@ -260,11 +257,6 @@ fn get_pipe_from_fd(fd: i32) -> Option<Arc<Pipe>> {
         return None;
     }
     file.private_arc::<Pipe>()
-}
-
-/// Check if fd is a pipe (either read or write end)
-fn is_pipe_fd(fd: i32) -> bool {
-    get_pipe_from_fd(fd).is_some()
 }
 
 /// Get file from fd
@@ -343,36 +335,17 @@ pub fn sys_splice(
         return KernelError::BadFd.sysret();
     }
 
-    let in_is_pipe = is_pipe_fd(fd_in);
-    let out_is_pipe = is_pipe_fd(fd_out);
-
-    // At least one must be a pipe
-    if !in_is_pipe && !out_is_pipe {
-        return KernelError::InvalidArgument.sysret();
-    }
+    // The pipes of the files just checked (one lookup per fd)
+    let in_pipe = pipe_of_file(&in_file);
+    let out_pipe = pipe_of_file(&out_file);
 
     // Pipe-to-pipe splice
-    if in_is_pipe && out_is_pipe {
-        let in_pipe = match get_pipe_from_fd(fd_in) {
-            Some(p) => p,
-            None => return KernelError::BadFd.sysret(),
-        };
-        let out_pipe = match get_pipe_from_fd(fd_out) {
-            Some(p) => p,
-            None => return KernelError::BadFd.sysret(),
-        };
-
-        // Move data from in_pipe to out_pipe
-        return do_splice_pipe_to_pipe(&in_pipe, &out_pipe, len, flags);
+    if let (Some(in_pipe), Some(out_pipe)) = (&in_pipe, &out_pipe) {
+        return do_splice_pipe_to_pipe(in_pipe, out_pipe, len, flags);
     }
 
     // File-to-pipe splice
-    if out_is_pipe {
-        let out_pipe = match get_pipe_from_fd(fd_out) {
-            Some(p) => p,
-            None => return KernelError::BadFd.sysret(),
-        };
-
+    if let Some(out_pipe) = out_pipe {
         // Pipes don't support offsets
         if off_out != 0 {
             return KernelError::IllegalSeek.sysret();
@@ -387,12 +360,7 @@ pub fn sys_splice(
     }
 
     // Pipe-to-file splice
-    if in_is_pipe {
-        let in_pipe = match get_pipe_from_fd(fd_in) {
-            Some(p) => p,
-            None => return KernelError::BadFd.sysret(),
-        };
-
+    if let Some(in_pipe) = in_pipe {
         // Pipes don't support offsets
         if off_in != 0 {
             return KernelError::IllegalSeek.sysret();
@@ -698,19 +666,14 @@ pub fn sys_tee(fd_in: i32, fd_out: i32, len: usize, flags: u32) -> i64 {
     }
 
     // Linux do_tee: EBADF for a bad fd or the wrong direction first
-    match (get_file_from_fd(fd_in), get_file_from_fd(fd_out)) {
-        (Some(i), Some(o)) if i.is_readable() && o.is_writable() => {}
+    let (in_file, out_file) = match (get_file_from_fd(fd_in), get_file_from_fd(fd_out)) {
+        (Some(i), Some(o)) if i.is_readable() && o.is_writable() => (i, o),
         _ => return KernelError::BadFd.sysret(),
-    }
+    };
 
     // Both must be pipes
-    let in_pipe = match get_pipe_from_fd(fd_in) {
-        Some(p) => p,
-        None => return KernelError::InvalidArgument.sysret(),
-    };
-    let out_pipe = match get_pipe_from_fd(fd_out) {
-        Some(p) => p,
-        None => return KernelError::InvalidArgument.sysret(),
+    let (Some(in_pipe), Some(out_pipe)) = (pipe_of_file(&in_file), pipe_of_file(&out_file)) else {
+        return KernelError::InvalidArgument.sysret();
     };
 
     // Cannot tee to same pipe
@@ -748,11 +711,17 @@ pub fn sys_vmsplice(fd: i32, iov: u64, nr_segs: usize, flags: u32) -> i64 {
         return 0;
     }
 
-    // fd must be a pipe
-    let pipe = match get_pipe_from_fd(fd) {
-        Some(p) => p,
-        None => return KernelError::InvalidArgument.sysret(),
+    // A pipe open for writing (Linux vmsplice_to_pipe); vmsplice from
+    // a pipe open only for reading (vmsplice_to_user) is not done: EBADF
+    let Some(file) = get_file_from_fd(fd) else {
+        return KernelError::BadFd.sysret();
     };
+    let Some(pipe) = pipe_of_file(&file) else {
+        return KernelError::InvalidArgument.sysret();
+    };
+    if !file.is_writable() {
+        return KernelError::BadFd.sysret();
+    }
 
     let nonblock = flags & SPLICE_F_NONBLOCK != 0;
 
@@ -866,8 +835,12 @@ pub fn sys_sendfile64(out_fd: i32, in_fd: i32, offset: u64, count: usize) -> i64
         None => return KernelError::BadFd.sysret(),
     };
 
-    // Input cannot be a pipe (sendfile is for regular files)
-    if is_pipe_fd(in_fd) {
+    // Linux do_sendfile: read from a readable file, write to a writable
+    // one; the input cannot be a pipe
+    if !in_file.is_readable() || !out_file.is_writable() {
+        return KernelError::BadFd.sysret();
+    }
+    if pipe_of_file(&in_file).is_some() {
         return KernelError::InvalidArgument.sysret();
     }
 
@@ -876,7 +849,7 @@ pub fn sys_sendfile64(out_fd: i32, in_fd: i32, offset: u64, count: usize) -> i64
         Err(e) => return e.sysret(),
     };
 
-    let ret = if let Some(out_pipe) = get_pipe_from_fd(out_fd) {
+    let ret = if let Some(out_pipe) = pipe_of_file(&out_file) {
         do_splice_file_to_pipe(&in_file, pos, &out_pipe, count, 0)
     } else {
         // File to file (rare, but supported)
