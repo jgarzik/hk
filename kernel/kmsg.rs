@@ -344,6 +344,23 @@ fn format_syslog(r: &Rec<'_>, out: &mut Vec<u8>) {
     out.push(b'\n');
 }
 
+/// Decimal digits of `n`
+fn ndigits(mut n: u64) -> usize {
+    let mut d = 1;
+    while n >= 10 {
+        n /= 10;
+        d += 1;
+    }
+    d
+}
+
+/// Length of `format_syslog(r)`, without formatting
+fn syslog_len(r: &Rec<'_>) -> usize {
+    // '<' pri ">[" secs '.' usecs "] " text '\n'
+    let secs = ndigits(r.ts_ns / 1_000_000_000).max(5);
+    1 + ndigits(r.pri as u64) + 2 + secs + 1 + 6 + 2 + r.text.len() + 1
+}
+
 /// Longest formatted record: header text plus every byte escaped
 const MAX_FMT: usize = 64 + 4 * LOG_LINE_MAX;
 
@@ -388,13 +405,10 @@ fn format_from(
     len: usize,
     newest: bool,
 ) -> (Vec<u8>, (u64, usize)) {
-    let mut tmp = Vec::new();
     let mut sizes = Vec::new();
     let (mut seq, mut idx) = start;
     while let Some((r, next)) = buf.read(seq, idx) {
-        tmp.clear();
-        format_syslog(&r, &mut tmp);
-        sizes.push(tmp.len());
+        sizes.push(syslog_len(&r));
         seq += 1;
         idx = next;
     }
@@ -423,16 +437,24 @@ fn format_from(
     (out, (seq, idx))
 }
 
-/// syslog(2) SIZE_UNREAD: bytes READ would return
+/// syslog(2) SIZE_UNREAD: bytes READ would return, counted under LOG
+/// from record headers (no copy, no formatting)
 pub fn syslog_size_unread() -> usize {
-    let (seq, part) = {
-        let l = LOG.lock();
-        (l.syslog.0, l.syslog_partial)
-    };
-    let (snap, start) = snapshot(|l| l.syslog);
-    let all = format_from(&snap, start, usize::MAX, false).0.len();
+    let log = LOG.lock();
+    let (mut seq, mut idx) = valid(&log.buf, log.syslog);
     // Linux: minus what a partial READ already returned
-    all.saturating_sub(if start.0 == seq { part } else { 0 })
+    let part = if seq == log.syslog.0 {
+        log.syslog_partial
+    } else {
+        0
+    };
+    let mut all = 0;
+    while let Some((r, next)) = log.buf.read(seq, idx) {
+        all += syslog_len(&r);
+        seq += 1;
+        idx = next;
+    }
+    all.saturating_sub(part)
 }
 
 /// syslog(2) CLEAR: later READ_ALL starts after the current records
@@ -735,6 +757,21 @@ mod tests {
         for (k, t) in all.iter().enumerate() {
             let want = b.first_seq() + k as u64;
             assert_eq!(u64::from_le_bytes(t[..8].try_into().unwrap()), want);
+        }
+    }
+
+    #[test]
+    fn syslog_len_matches() {
+        for (ts, pri) in [(0, 0), (1_234_567_891, 6), (123_456 * 1_000_000_000, 191)] {
+            let r = Rec {
+                seq: 0,
+                pri,
+                ts_ns: ts,
+                text: b"hello",
+            };
+            let mut out = Vec::new();
+            format_syslog(&r, &mut out);
+            assert_eq!(syslog_len(&r), out.len());
         }
     }
 
