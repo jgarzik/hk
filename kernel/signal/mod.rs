@@ -900,20 +900,15 @@ fn init_unkillable(tid: Tid) -> bool {
 
 /// Linux sig_task_ignored for the global init: SIGKILL and SIGSTOP never
 /// reach it, nor any signal whose action is SIG_DFL (so a stray SIGTERM
-/// or SIGPIPE does not kill it), unless the kernel forces one of the
-/// signals it may not block. A blocked signal is still queued (its
-/// action may change before it is unblocked).
-fn init_ignores(
-    state: &TaskSignalState,
-    sighand: Option<&Arc<SigHand>>,
-    sig: u32,
-    force: bool,
-) -> bool {
+/// or SIGPIPE does not kill it). A blocked signal is still queued (its
+/// action may change before it is unblocked). A kernel-forced signal
+/// never gets here: it lifts the protection (`send_signal_force`).
+fn init_ignores(state: &TaskSignalState, sighand: Option<&Arc<SigHand>>, sig: u32) -> bool {
     let kernel_only = sig == SIGKILL || sig == SIGSTOP;
     if kernel_only {
         return true;
     }
-    if state.blocked.contains(sig) || state.real_blocked.contains(sig) || force {
+    if state.blocked.contains(sig) || state.real_blocked.contains(sig) {
         return false;
     }
     let action = sighand.and_then(|h| h.get_action(sig)).unwrap_or_default();
@@ -975,7 +970,7 @@ fn send_signal_force(tid: Tid, sig: u32, force: bool) -> i32 {
     let sighand = get_task_sighand(tid);
     let result = with_task_signal_state(tid, |state| {
         if sig_ignored(state, sighand.as_ref(), sig)
-            || (init && init_ignores(state, sighand.as_ref(), sig, force))
+            || (init && init_ignores(state, sighand.as_ref(), sig))
         {
             return (false, false);
         }

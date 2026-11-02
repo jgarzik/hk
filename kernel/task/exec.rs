@@ -436,19 +436,20 @@ fn interp_base(interp: &ElfExecutable, prog: &ElfExecutable, prog_base: u64) -> 
         }
         return Ok(0);
     }
-    let span = hi - lo;
     let align = interp.align.max(PAGE_SIZE);
-    // Where `lo` lands when the image ends at or below `limit`
-    let below = |limit: u64| limit.checked_sub(span).map(|s| s & !(align - 1));
-    let mut start = below(top).ok_or(ENOMEM)?;
-    if overlaps(start, start + span) {
-        start = below(plo).ok_or(ENOMEM)?;
+    // The highest bias, a multiple of the alignment (so every segment
+    // keeps its offset modulo p_align), with the image ending at or
+    // below `limit`
+    let below = |limit: u64| limit.checked_sub(hi).map(|b| b & !(align - 1));
+    let mut bias = below(top).ok_or(ENOMEM)?;
+    if overlaps(lo + bias, hi + bias) {
+        bias = below(plo).ok_or(ENOMEM)?;
     }
     // Keep clear of the lowest pages (mmap_min_addr)
-    if start < PAGE_SIZE * 16 {
+    if lo + bias < PAGE_SIZE * 16 {
         return Err(ENOMEM);
     }
-    start.checked_sub(lo).ok_or(ENOMEM)
+    Ok(bias)
 }
 
 /// Load ELF segments into a page table
