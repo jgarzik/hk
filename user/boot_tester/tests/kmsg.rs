@@ -10,6 +10,9 @@
 //!   EINVAL; lseek with a nonzero offset is ESPIPE, SEEK_CUR is EINVAL
 //! - KMSG_SYSLOG: syslog READ_ALL returns `<pri>[` lines including the
 //!   record written; SIZE_BUFFER is positive
+//! - KMSG_SYSLOG_PARTIAL: syslog READ into a buffer smaller than the
+//!   next record returns that much of it, and the next READ the rest
+//!   (Linux syslog_partial), not 0 forever
 //! - KMSG_RESTRICT: without CAP_SYSLOG (dmesg_restrict = 1, Ubuntu's
 //!   kernel default) opening /dev/kmsg to read and every syslog action
 //!   (READ_ALL, SIZE_UNREAD, SIZE_BUFFER) are EPERM (a write-only open
@@ -27,6 +30,7 @@ const ESPIPE: i64 = -29;
 const SEEK_SET: i32 = 0;
 const SEEK_CUR: i32 = 1;
 const SEEK_END: i32 = 2;
+const SYSLOG_ACTION_READ: i32 = 2;
 const SYSLOG_ACTION_READ_ALL: i32 = 3;
 const SYSLOG_ACTION_SIZE_UNREAD: i32 = 9;
 const SYSLOG_ACTION_SIZE_BUFFER: i32 = 10;
@@ -45,7 +49,38 @@ pub fn run_tests() {
     seek(fd);
     sys_close(fd as u64);
     syslog();
+    syslog_partial();
     restrict();
+}
+
+fn syslog_partial() {
+    let n = b"KMSG_SYSLOG_PARTIAL";
+    static mut BIG: [u8; 1 << 17] = [0; 1 << 17];
+    // SAFETY: the boot tester is single-threaded here
+    let big = unsafe { &mut *core::ptr::addr_of_mut!(BIG) };
+    // Read what is unread (READ waits only when nothing is)
+    while sys_syslog(SYSLOG_ACTION_SIZE_UNREAD, core::ptr::null_mut(), 0) > 0 {
+        if sys_syslog(SYSLOG_ACTION_READ, big.as_mut_ptr(), big.len() as i32) <= 0 {
+            return report(n, b"drain", 0);
+        }
+    }
+    let line = b"<6>hk kmsg partial record 0815\n";
+    let fd = sys_open(b"/dev/kmsg\0".as_ptr(), O_WRONLY, 0);
+    let w = sys_write(fd as u64, line.as_ptr(), line.len() as u64);
+    sys_close(fd as u64);
+    if w != line.len() as i64 {
+        return report(n, b"write", w);
+    }
+    let mut head = [0u8; 16];
+    let a = sys_syslog(SYSLOG_ACTION_READ, head.as_mut_ptr(), 16);
+    if a != 16 || head[0] != b'<' {
+        return report(n, b"short read", a);
+    }
+    let b = sys_syslog(SYSLOG_ACTION_READ, big.as_mut_ptr(), big.len() as i32);
+    if b <= 0 || !find(&big[..b as usize], b"hk kmsg partial record 0815\n") {
+        return report(n, b"rest", b);
+    }
+    report(n, b"", 0);
 }
 
 /// As nobody, in a child: exit status is the first failed step

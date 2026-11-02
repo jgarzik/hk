@@ -201,6 +201,9 @@ struct Log {
     clear: (u64, usize),
     /// syslog READ's destructive cursor
     syslog: (u64, usize),
+    /// Bytes of the record at `syslog` that READ already returned
+    /// (Linux syslog_partial)
+    syslog_partial: usize,
 }
 
 static LOG: IrqSpinlock<Log> = IrqSpinlock::new(Log {
@@ -210,6 +213,7 @@ static LOG: IrqSpinlock<Log> = IrqSpinlock::new(Log {
     line_ts: 0,
     clear: (0, 0),
     syslog: (0, 0),
+    syslog_partial: 0,
 });
 
 /// Readers of /dev/kmsg and syslog READ
@@ -421,8 +425,14 @@ fn format_from(
 
 /// syslog(2) SIZE_UNREAD: bytes READ would return
 pub fn syslog_size_unread() -> usize {
+    let (seq, part) = {
+        let l = LOG.lock();
+        (l.syslog.0, l.syslog_partial)
+    };
     let (snap, start) = snapshot(|l| l.syslog);
-    format_from(&snap, start, usize::MAX, false).0.len()
+    let all = format_from(&snap, start, usize::MAX, false).0.len();
+    // Linux: minus what a partial READ already returned
+    all.saturating_sub(if start.0 == seq { part } else { 0 })
 }
 
 /// syslog(2) CLEAR: later READ_ALL starts after the current records
@@ -446,20 +456,61 @@ pub fn syslog_read_all(len: usize, clear: bool) -> Vec<u8> {
     out
 }
 
-/// syslog(2) READ: records not yet read this way, as many as fit (at
-/// least one record if any; waits for one if there are none)
+/// syslog(2) READ: records not yet read this way, as many whole ones as
+/// fit; when not even the first does, as much of it as fits, the rest
+/// on the next READ (Linux syslog_print, syslog_partial). Waits for a
+/// record if there are none.
 pub fn syslog_read(len: usize) -> Result<Vec<u8>, KernelError> {
     WAITERS.wait_event_interruptible(|| {
         let log = LOG.lock();
         valid(&log.buf, log.syslog).0 < log.buf.next_seq()
     })?;
+    let (seq, part) = {
+        let l = LOG.lock();
+        (l.syslog.0, l.syslog_partial)
+    };
     let (snap, start) = snapshot(|l| l.syslog);
-    let (out, end) = format_from(&snap, start, len, false);
+    // A record overwritten meanwhile starts its successor from the top
+    let skip = if start.0 == seq { part } else { 0 };
+    let (out, end, part) = syslog_take(&snap, start, skip, len);
     let mut log = LOG.lock();
     if log.syslog.0 <= end.0 {
         log.syslog = end;
+        log.syslog_partial = part;
     }
     Ok(out)
+}
+
+/// READ's records from `start`, the first `skip` bytes of the first
+/// already returned: the bytes, the new cursor, and how much of the
+/// record at it is returned now
+fn syslog_take(
+    buf: &LogBuf,
+    start: (u64, usize),
+    mut skip: usize,
+    len: usize,
+) -> (Vec<u8>, (u64, usize), usize) {
+    let mut out = Vec::new();
+    let mut tmp = Vec::new();
+    let (mut seq, mut idx) = start;
+    while let Some((r, next)) = buf.read(seq, idx) {
+        tmp.clear();
+        format_syslog(&r, &mut tmp);
+        let text = &tmp[skip.min(tmp.len())..];
+        if out.len() + text.len() <= len {
+            out.extend_from_slice(text);
+            seq += 1;
+            idx = next;
+            skip = 0;
+            continue;
+        }
+        if out.is_empty() {
+            out.extend_from_slice(&text[..len]);
+            skip += len;
+        }
+        break;
+    }
+    (out, (seq, idx), skip)
 }
 
 // ============================================================================
