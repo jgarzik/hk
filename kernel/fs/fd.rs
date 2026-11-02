@@ -35,17 +35,19 @@ fn do_truncate(inode: &Arc<super::Inode>, length: u64) -> i64 {
     }
 
     // Write access first (Linux vfs_truncate / do_sys_ftruncate):
-    // ETXTBSY while the file runs or is an active swap area
-    if inode.i_swapfile.load(core::sync::atomic::Ordering::Acquire) {
-        return KernelError::TextBusy.sysret();
-    }
+    // ETXTBSY while the file runs
     let _w = match inode.get_write_access() {
         Ok(w) => w,
         Err(e) => return e.sysret(),
     };
-    // Under i_rwsem, like Linux do_truncate: atomic with writes
+    // Under i_rwsem, like Linux do_truncate: atomic with writes; an
+    // active swap area (set by swapon under i_rwsem) is ETXTBSY
     inode.inode_lock();
-    let r = inode.i_op.truncate(inode, length);
+    let r = if inode.i_swapfile.load(core::sync::atomic::Ordering::Acquire) {
+        Err(KernelError::TextBusy)
+    } else {
+        inode.i_op.truncate(inode, length)
+    };
     // SAFETY: taken above by this thread
     unsafe { inode.inode_unlock() };
     match r {
@@ -54,6 +56,7 @@ fn do_truncate(inode: &Arc<super::Inode>, length: u64) -> i64 {
         Err(KernelError::OperationNotSupported) => KernelError::InvalidArgument.sysret(),
         Err(KernelError::PermissionDenied) => KernelError::PermissionDenied.sysret(),
         Err(KernelError::FileTooLarge) => KernelError::FileTooLarge.sysret(),
+        Err(KernelError::TextBusy) => KernelError::TextBusy.sysret(),
         Err(_) => KernelError::InvalidArgument.sysret(),
     }
 }

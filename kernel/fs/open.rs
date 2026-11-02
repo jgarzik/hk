@@ -222,6 +222,12 @@ fn filp_open(
     // O_TRUNC of an existing regular file (Linux handle_truncate)
     if flags & O_TRUNC != 0 && !created && inode.mode().is_file() {
         inode.inode_lock();
+        // An active swap file (S_SWAPFILE, set under i_rwsem): ETXTBSY
+        if inode.i_swapfile.load(core::sync::atomic::Ordering::Acquire) {
+            // SAFETY: taken above by this thread
+            unsafe { inode.inode_unlock() };
+            return Err(KernelError::TextBusy);
+        }
         dac::remove_privs(&inode);
         inode.i_op.truncate(&inode, 0).ok();
         // SAFETY: taken above by this thread

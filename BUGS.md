@@ -52,9 +52,10 @@ Missing:
   (pages are reclaimed oldest first), synchronous writes, no kswapd; 2MB pages stay
   off the LRU (never reclaimed whole; a split puts their 4KB pages on
   it). Pages exec copies the image into (see the heap section) are not
-  on the reverse map (never swapped). An active swap file can still be mapped writable
-  (Linux: no write access to an S_SWAPFILE inode). Swap files go
-  through their filesystem's swap_rw,
+  on the reverse map (never swapped). An active swap file can still
+  be mapped writable (Linux: no write access to an S_SWAPFILE inode),
+  and copy_file_range into it is not refused (Linux ETXTBSY). Swap
+  files go through their filesystem's swap_rw,
   a page at a time (walking the cluster chain each time; Linux maps
   the extents once at swapon). Page faults, swapoff, page-cache, heap
   and pipe allocations that may sleep reclaim directly; atomic heap

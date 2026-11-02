@@ -12,7 +12,7 @@ use super::helpers::{
     BlkDev, dev_major, dev_minor, find_blkdev, print, print_num, println, read_file,
 };
 use hk_syscall::{
-    O_CREAT, O_RDONLY, O_RDWR, O_WRONLY, Stat, sys_close, sys_fstat, sys_fsync, sys_ioctl, sys_lseek,
+    O_CREAT, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY, Stat, sys_close, sys_fstat, sys_fsync, sys_ioctl, sys_lseek,
     sys_mkdir, sys_mount, sys_open, sys_pread64, sys_pwrite64, sys_read, sys_stat, sys_swapoff,
     sys_rename, sys_swapon, sys_umount2, sys_unlink,
 };
@@ -488,6 +488,7 @@ fn vfat_swapfile() {
     use hk_syscall::sys_ftruncate;
     let path = b"/mnt/vd1/SWAP.BIN\0";
     let mut got = [0i64; 3];
+    let mut busy = [0i64; 4];
     for (i, last) in [0u32, 0x7fff_ffff, 255].into_iter().enumerate() {
         let fd = sys_open(path.as_ptr(), O_RDWR | O_CREAT, 0o600) as i32;
         let mut hdr = [0u8; 4096];
@@ -499,6 +500,15 @@ fn vfat_swapfile() {
         sys_close(fd as u64);
         got[i] = if ok { sys_swapon(path.as_ptr(), 0) } else { -1000 };
         if got[i] == 0 {
+            // Active: no write, truncate (also by O_TRUNC) or unlink
+            // (Linux IS_SWAPFILE: ETXTBSY, EPERM for unlink)
+            let fd = sys_open(path.as_ptr(), O_WRONLY, 0) as i32;
+            let w = sys_pwrite64(fd, b"x".as_ptr(), 1, 8192);
+            let t = sys_ftruncate(fd, 4096);
+            sys_close(fd as u64);
+            let ot = sys_open(path.as_ptr(), O_WRONLY | O_TRUNC, 0);
+            let un = hk_syscall::sys_unlink(path.as_ptr());
+            busy = [w, t, ot, un];
             got[i] = sys_swapoff(path.as_ptr()) * 100;
         }
     }
@@ -507,6 +517,11 @@ fn vfat_swapfile() {
         b"VFAT_SWAPFILE",
         got[0] == EINVAL && got[1] == EINVAL && got[2] == 0,
         got[0] * 10000 + got[1] * 100 + got[2],
+    );
+    verdict(
+        b"VFAT_SWAPFILE_BUSY",
+        busy == [-26, -26, -26, -1],
+        busy[0] * 1000 + busy[1] * 100 + busy[2] * 10 + busy[3],
     );
 }
 

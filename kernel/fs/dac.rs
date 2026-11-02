@@ -220,6 +220,14 @@ pub fn may_delete(c: &Cred, dir: &Inode, victim: &Inode, isdir: bool) -> Result<
     if sticky(c, dir, victim) {
         return Err(KernelError::NotPermitted);
     }
+    // An active swap file is neither unlinked nor renamed (Linux
+    // vfs_unlink / vfs_rename: IS_SWAPFILE -> EPERM)
+    if victim
+        .i_swapfile
+        .load(core::sync::atomic::Ordering::Acquire)
+    {
+        return Err(KernelError::NotPermitted);
+    }
     let is_dir = victim.mode().is_dir();
     if isdir && !is_dir {
         return Err(KernelError::NotDirectory);

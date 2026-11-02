@@ -629,13 +629,14 @@ impl File {
             Some(i) if i.mode().is_file() => i,
             _ => return self.write_chunks(len, at, flags, src),
         };
-        // An active swap file (Linux generic_write_checks: IS_SWAPFILE)
-        if inode.i_swapfile.load(Ordering::Acquire) {
-            return Err(KernelError::TextBusy);
-        }
         let append = append.unwrap_or(self.get_flags() & flags::O_APPEND != 0);
         inode.inode_lock();
         let r = (|| {
+            // An active swap file (Linux generic_write_checks:
+            // IS_SWAPFILE), checked under i_rwsem: swapon sets it there
+            if inode.i_swapfile.load(Ordering::Acquire) {
+                return Err(KernelError::TextBusy);
+            }
             let at = match (append, at) {
                 (true, None) => {
                     self.set_pos(inode.get_size());
