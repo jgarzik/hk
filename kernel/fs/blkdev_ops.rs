@@ -148,14 +148,8 @@ pub fn bdev_write_meta(b: &BlockDevice, pos: u64, buf: &[u8]) -> Result<(), Kern
             filemap::put_page(phys);
             return Err(e);
         }
-        // SAFETY: the locked, uptodate page with our reference
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                buf[done..].as_ptr(),
-                crate::arch::phys_to_virt(phys).add(off),
-                n,
-            )
-        };
+        // The locked, uptodate page with our reference
+        crate::mm::page::frame_bytes(phys)[off..off + n].copy_from_slice(&buf[done..done + n]);
         let bits: u64 = (off / 512..(off + n).div_ceil(512)).fold(0, |a, s| a | 1 << s);
         page_struct(phys)?.private.fetch_or(bits, Ordering::Relaxed);
         filemap::dirty_page(&inode.i_data, phys);
@@ -186,9 +180,8 @@ impl Aops for BdevAops {
         }
         // Just the dirty sectors, in runs rounded out to logical blocks
         let lbs = (b.logical_block_size() as usize / 512).clamp(1, SECTORS);
-        // SAFETY: the locked page with our reference, direct map
-        let page =
-            unsafe { core::slice::from_raw_parts_mut(crate::arch::phys_to_virt(phys), PAGE_SIZE) };
+        // The locked page with our reference
+        let page = crate::mm::page::frame_bytes(phys);
         let base = index * PAGE_SIZE as u64;
         let mut s = 0;
         while s < SECTORS {

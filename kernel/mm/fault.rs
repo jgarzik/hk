@@ -363,8 +363,7 @@ fn fault_page(addr: u64, area: &Area, access: Access) -> Result<(u64, bool, bool
         return r;
     }
     let frame = alloc_user().ok_or(VmFault::Oom)?;
-    // SAFETY: a fresh frame, reached through the direct map
-    let buf = unsafe { core::slice::from_raw_parts_mut(phys_to_virt(frame), PAGE_SIZE as usize) };
+    let buf = super::page::frame_bytes(frame);
     buf.fill(0);
     let file = matches!((area.anon, &area.file), (false, Some(_)));
     if let (false, Some(f)) = (area.anon, &area.file) {
@@ -414,15 +413,8 @@ fn file_page(
     }
     let copy = alloc_user();
     if let Some(new) = copy {
-        // SAFETY: both frames through the direct map; the cache page is
-        // locked and referenced, the new one ours
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                phys_to_virt(page),
-                phys_to_virt(new),
-                PAGE_SIZE as usize,
-            )
-        };
+        // The cache page is locked and referenced, the new one ours
+        super::page::copy_page(new, page);
         paging::sync_page(new, exec);
     }
     super::page::unlock_page(page);
@@ -612,11 +604,8 @@ fn wp_locked(
         return Ok(());
     }
     let new = spare.take().or_else(alloc_user).ok_or(VmFault::Retry)?;
-    // SAFETY: both frames are reached through the direct map; `old`
-    // stays mapped (and referenced) until the PTE is switched
-    unsafe {
-        core::ptr::copy_nonoverlapping(phys_to_virt(old), phys_to_virt(new), PAGE_SIZE as usize)
-    };
+    // `old` stays mapped (and referenced) until the PTE is switched
+    super::page::copy_page(new, old);
     paging::sync_page(new, paging::pte_exec(pte));
     let entry = paging::pte_mkwrite((pte & !paging::PTE_ADDR_MASK) | new);
     if !replace_pte(mm, ptep, pte, entry, addr) {

@@ -364,10 +364,6 @@ impl SuperBlock {
     }
 }
 
-// SuperBlock is Send + Sync because all interior mutability is through atomic or lock
-unsafe impl Send for SuperBlock {}
-unsafe impl Sync for SuperBlock {}
-
 /// Null superblock ops - minimal implementation
 pub struct NullSuperOps;
 

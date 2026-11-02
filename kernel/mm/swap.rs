@@ -27,6 +27,7 @@ use crate::arch::{IrqSpinlock, Uaccess};
 use crate::error::KernelError;
 use crate::fs::{Inode, lookup_path};
 use crate::mm::filemap::PAGE_SIZE;
+use crate::mm::page::frame_bytes;
 use crate::mm::swap_entry::{MAX_SWAPFILES, SwapEntry};
 use crate::mm::xarray::XArray;
 use crate::storage::blkdev::{BioOp, bdev_rw, bdev_rw_frame};
@@ -385,12 +386,6 @@ pub fn free_swap_and_cache(e: SwapEntry) {
 // ============================================================================
 // Swap I/O
 // ============================================================================
-
-/// A swap frame as bytes
-fn frame_bytes<'a>(phys: u64) -> &'a mut [u8] {
-    // SAFETY: the caller's frame (locked swap-cache page), direct map
-    unsafe { core::slice::from_raw_parts_mut(crate::arch::phys_to_virt(phys), PAGE_SIZE) }
-}
 
 /// Read slot `entry` into the frame at `frame_phys` (may sleep)
 pub fn swap_read_page(entry: SwapEntry, frame_phys: u64) -> Result<(), i64> {

@@ -242,10 +242,6 @@ impl Mount {
     }
 }
 
-// Mount is Send + Sync
-unsafe impl Send for Mount {}
-unsafe impl Sync for Mount {}
-
 /// Mount a filesystem at a path
 ///
 /// If path is None or "/", this becomes the root mount.

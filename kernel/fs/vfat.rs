@@ -19,6 +19,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::mm::filemap::{self, Aops, PAGE_SIZE};
+use crate::mm::page::frame_bytes;
 use crate::storage::BlockDevice;
 use crate::storage::blkdev::{BioOp, bdev_rw_bytes};
 
@@ -80,12 +81,6 @@ fn page_runs(inode: &Inode, index: u64) -> Result<PageRuns, KernelError> {
     };
     let runs = disk_runs(&sb_data, &chain, pos, valid);
     Ok((sb_data.bdev.clone(), runs))
-}
-
-/// The page frame as bytes
-fn frame_bytes<'a>(phys: u64) -> &'a mut [u8] {
-    // SAFETY: a locked page-cache frame, through the direct map
-    unsafe { core::slice::from_raw_parts_mut(crate::arch::phys_to_virt(phys), PAGE_SIZE) }
 }
 
 /// Transfer `runs` between the disk and `page` (in order from its start)

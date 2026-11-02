@@ -24,7 +24,6 @@ use alloc::sync::Arc;
 use super::fault::VmFault;
 use super::xarray::{XArray, node_alloc};
 use crate::FRAME_ALLOCATOR;
-use crate::arch::phys_to_virt;
 use crate::sync::spin::Mutex;
 
 /// The pages of a shared anonymous object, by page index
@@ -38,8 +37,7 @@ pub struct Shmem {
 /// A zeroed frame of user memory
 fn zeroed() -> Option<u64> {
     let f = super::fault::alloc_user()?;
-    // SAFETY: a fresh frame, reached through the direct map
-    unsafe { core::ptr::write_bytes(phys_to_virt(f), 0, 4096) };
+    super::page::clear_page(f);
     Some(f)
 }
 
@@ -91,8 +89,7 @@ impl Shmem {
                 root.erase(i);
                 FRAME_ALLOCATOR.decref(e);
             } else {
-                // SAFETY: a page of the object, through the direct map
-                unsafe { core::ptr::write_bytes(phys_to_virt(e), 0, 4096) };
+                super::page::clear_page(e);
             }
             at = i + 1;
         }

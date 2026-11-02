@@ -713,10 +713,6 @@ impl File {
     }
 }
 
-// File is Send + Sync because all interior mutability is through atomic
-unsafe impl Send for File {}
-unsafe impl Sync for File {}
-
 impl Drop for File {
     fn drop(&mut self) {
         // Call release on file operations to allow cleanup (e.g., decrement pipe reader/writer counts)

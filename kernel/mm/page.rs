@@ -328,6 +328,36 @@ pub fn trylock_page(phys: u64) -> bool {
     phys_to_page(phys).is_some_and(|pg| pg.try_lock())
 }
 
+// ============================================================================
+// Page contents (Linux clear_page, copy_page, kmap_local_page)
+// ============================================================================
+
+/// The bytes of the 4KB page frame at `phys`, through the direct map.
+/// Contract (not checked): the caller may write the frame now (it owns
+/// it, holds its page lock, or keeps it referenced with no other
+/// writer) and holds no other slice of it.
+#[inline]
+pub fn frame_bytes<'a>(phys: u64) -> &'a mut [u8] {
+    // SAFETY: a RAM frame, mapped in the direct map; exclusive use is the
+    // caller's contract above
+    unsafe { core::slice::from_raw_parts_mut(crate::arch::phys_to_virt(phys), 1 << PAGE_SHIFT) }
+}
+
+/// Zero the page frame at `phys` (Linux clear_page); contract of
+/// [`frame_bytes`]
+#[inline]
+pub fn clear_page(phys: u64) {
+    frame_bytes(phys).fill(0);
+}
+
+/// Copy the page frame `src` to `dst` (Linux copy_page), two different
+/// frames; contract of [`frame_bytes`] for `dst`, `src` readable
+#[inline]
+pub fn copy_page(dst: u64, src: u64) {
+    debug_assert_ne!(dst, src);
+    frame_bytes(dst).copy_from_slice(frame_bytes(src));
+}
+
 /// Release a mapping word taken off a page: an anon_vma reference
 pub fn put_mapping(word: u64) {
     if word & 1 != 0 && word & !1 != 0 {

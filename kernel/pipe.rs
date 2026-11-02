@@ -90,6 +90,12 @@ impl PipePage {
     pub fn new(frame: u64) -> Self {
         Self { frame }
     }
+
+    /// Its bytes; written only by the pipe holding `Pipe.inner` while no
+    /// other buffer shares the page (CAN_MERGE), read under it
+    pub fn bytes(&self) -> &mut [u8] {
+        crate::mm::page::frame_bytes(self.frame)
+    }
 }
 
 impl Drop for PipePage {
@@ -319,11 +325,7 @@ impl PipeInner {
                 // Get page frame and write data
                 if let Some(ref page) = buf.page {
                     let offset = (buf.offset + buf.len) as usize;
-                    let dst_addr = crate::arch::phys_to_virt(page.frame) as usize + offset;
-                    unsafe {
-                        let dst = dst_addr as *mut u8;
-                        core::ptr::copy_nonoverlapping(data.as_ptr(), dst, to_write);
-                    }
+                    page.bytes()[offset..offset + to_write].copy_from_slice(&data[..to_write]);
                     buf.len += to_write as u32;
                     self.total_len += to_write;
                     written += to_write;
@@ -343,10 +345,7 @@ impl PipeInner {
             let to_write = remaining.min(PAGE_SIZE);
 
             // Copy data to the new page
-            unsafe {
-                let dst = crate::arch::phys_to_virt(page.frame);
-                core::ptr::copy_nonoverlapping(data[written..].as_ptr(), dst, to_write);
-            }
+            page.bytes()[..to_write].copy_from_slice(&data[written..written + to_write]);
 
             // Create buffer with OWNED and CAN_MERGE flags
             let buf = PipeBuffer::new(
@@ -392,12 +391,8 @@ impl PipeInner {
 
             // Copy data from page to user buffer
             if let Some(ref page) = pipe_buf.page {
-                let src_addr =
-                    crate::arch::phys_to_virt(page.frame) as usize + pipe_buf.offset as usize;
-                unsafe {
-                    let src = src_addr as *const u8;
-                    core::ptr::copy_nonoverlapping(src, buf[read..].as_mut_ptr(), to_read);
-                }
+                let off = pipe_buf.offset as usize;
+                buf[read..read + to_read].copy_from_slice(&page.bytes()[off..off + to_read]);
 
                 pipe_buf.offset += to_read as u32;
                 pipe_buf.len -= to_read as u32;

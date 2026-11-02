@@ -28,10 +28,11 @@ use spin::Once;
 
 use super::anon_vma::AnonVma;
 use super::fault::VmFault;
-use super::page::{PG_DIRTY, PG_LOCKED, PG_UPTODATE, Page, lock_page, phys_to_page, unlock_page};
+use super::page::{
+    PG_DIRTY, PG_LOCKED, PG_UPTODATE, Page, frame_bytes, lock_page, phys_to_page, unlock_page,
+};
 use super::xarray::{MARK_DIRTY, Preload, XArray, node_alloc};
 use crate::FRAME_ALLOCATOR;
-use crate::arch::phys_to_virt;
 use crate::error::KernelError;
 use crate::fs::inode::Inode;
 use crate::sync::spin::Mutex;
@@ -247,9 +248,8 @@ pub fn set_uptodate(phys: u64) {
 /// Zero the page from byte `from` to its end
 pub fn zero_page(phys: u64, from: usize) {
     if from < PAGE_SIZE {
-        // SAFETY: a page frame through the direct map, owned by the
-        // caller (locked or not yet visible)
-        unsafe { core::ptr::write_bytes(phys_to_virt(phys).add(from), 0, PAGE_SIZE - from) };
+        // The caller owns it: locked or not yet visible
+        frame_bytes(phys)[from..].fill(0);
     }
 }
 
@@ -661,11 +661,8 @@ pub fn read(inode: &Inode, buf: &mut [u8], pos: u64) -> Result<usize, KernelErro
         let n = (PAGE_SIZE - off)
             .min(buf.len() - done)
             .min(size.saturating_sub(at) as usize);
-        // SAFETY: an uptodate page with our reference, through the
-        // direct map
-        unsafe {
-            core::ptr::copy_nonoverlapping(phys_to_virt(phys).add(off), buf[done..].as_mut_ptr(), n)
-        };
+        // An uptodate page with our reference
+        buf[done..done + n].copy_from_slice(&frame_bytes(phys)[off..off + n]);
         put_page(phys);
         if n == 0 {
             break;
@@ -690,10 +687,8 @@ pub fn perform_write(inode: &Inode, buf: &[u8], pos: u64) -> Result<usize, Kerne
             Err(_) if done > 0 => break,
             Err(e) => return Err(e),
         };
-        // SAFETY: the locked page with our reference, direct map
-        unsafe {
-            core::ptr::copy_nonoverlapping(buf[done..].as_ptr(), phys_to_virt(phys).add(off), n)
-        };
+        // The locked page with our reference
+        frame_bytes(phys)[off..off + n].copy_from_slice(&buf[done..done + n]);
         done += a.write_end(inode, at, n, phys);
     }
     Ok(done)
