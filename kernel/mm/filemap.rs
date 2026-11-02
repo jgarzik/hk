@@ -71,6 +71,21 @@ pub trait Aops: Sync {
         Err(KernelError::Io)
     }
 
+    /// Read (`write` false) or write page `index` of a swap file to or
+    /// from `buf` straight on the disk, bypassing the cache (Linux
+    /// ->swap_rw after ->swap_activate). Default: the file cannot be a
+    /// swap area (swapon EINVAL).
+    fn swap_rw(
+        &self,
+        inode: &Inode,
+        index: u64,
+        buf: &mut [u8],
+        write: bool,
+    ) -> Result<(), KernelError> {
+        let _ = (inode, index, buf, write);
+        Err(KernelError::OperationNotSupported)
+    }
+
     /// Pages get dirty (false: Linux noop_dirty_folio, a mapping with
     /// no backing store, e.g. ramfs, never writes back)
     fn can_dirty(&self) -> bool {

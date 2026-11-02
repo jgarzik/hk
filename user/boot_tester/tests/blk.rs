@@ -389,6 +389,7 @@ fn vfat(d: &Disk) {
     sys_close(disk as u64);
     verdict(b"BLK_RRPART_MOUNTED", busy == EBUSY, busy);
     vfat_mmap_write();
+    vfat_swapfile();
     vfat_rename_ino();
     vfat_unlink_open();
     vfat_unlink_reuse();
@@ -435,6 +436,35 @@ fn vfat_remount(p1: &BlkDev) {
         println(b"");
     }
     verdict(b"VFAT_REMOUNT_DATA", ok && u == 0, n);
+}
+
+/// A vfat file can be a swap area (Linux: bmap, generic swapfile
+/// activation): swapon checks its header against the file (last_page
+/// 0 and an area past the file are EINVAL); one that fits works
+fn vfat_swapfile() {
+    use hk_syscall::sys_ftruncate;
+    let path = b"/mnt/vd1/SWAP.BIN\0";
+    let mut got = [0i64; 3];
+    for (i, last) in [0u32, 0x7fff_ffff, 255].into_iter().enumerate() {
+        let fd = sys_open(path.as_ptr(), O_RDWR | O_CREAT, 0o600) as i32;
+        let mut hdr = [0u8; 4096];
+        hdr[1024..1028].copy_from_slice(&1u32.to_ne_bytes());
+        hdr[1028..1032].copy_from_slice(&last.to_ne_bytes());
+        hdr[4086..].copy_from_slice(b"SWAPSPACE2");
+        let ok = sys_pwrite64(fd, hdr.as_ptr(), 4096, 0) == 4096 && sys_ftruncate(fd, 256 * 4096) == 0;
+        sys_fsync(fd);
+        sys_close(fd as u64);
+        got[i] = if ok { sys_swapon(path.as_ptr(), 0) } else { -1000 };
+        if got[i] == 0 {
+            got[i] = sys_swapoff(path.as_ptr()) * 100;
+        }
+    }
+    sys_unlink(path.as_ptr());
+    verdict(
+        b"VFAT_SWAPFILE",
+        got[0] == EINVAL && got[1] == EINVAL && got[2] == 0,
+        got[0] * 10000 + got[1] * 100 + got[2],
+    );
 }
 
 /// A shared mapping of a vfat file is its page cache (Linux

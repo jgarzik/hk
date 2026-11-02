@@ -125,23 +125,10 @@ fn poll_sleep_only(deadline: Deadline) -> i64 {
 // Sync Syscalls - Flush dirty pages to backing store
 // ============================================================================
 
-/// sys_sync - sync all filesystems
-///
-/// Schedules writeback of all dirty pages in all address spaces.
-/// Linux semantics: blocks until all I/O completes.
-///
-/// # Returns
-/// Always returns 0 (sync never fails in our implementation)
+/// sync(2) (Linux ksys_sync): every filesystem's dirty inodes, then
+/// every block device's cache, written and waited for
 pub fn sys_sync() -> i64 {
-    use crate::mm::writeback::sync_all;
-
-    // Sync all dirty pages across all address spaces
-    // This uses the writeback infrastructure to:
-    // 1. Iterate DIRTY_ADDRESS_SPACES
-    // 2. Write dirty pages via do_writepages
-    // 3. Wait for writeback to complete
-    let _ = sync_all();
-
+    crate::mm::writeback::sync_all();
     0
 }
 
@@ -187,45 +174,20 @@ pub fn sys_fdatasync(fd: i32) -> i64 {
     sys_fsync(fd)
 }
 
-/// sys_syncfs - sync filesystem containing file descriptor
-///
-/// Syncs all dirty pages for the filesystem that contains the file
-/// referred to by fd. For block device-based filesystems (vfat, ext4, etc.),
-/// this syncs all address spaces associated with that mount.
-///
-/// # Implementation
-///
-/// Linux syncfs:
-/// 1. Gets the superblock from the file's mount (f_path.mnt->mnt_sb)
-/// 2. Calls sync_filesystem(sb) which:
-///    - Calls sb->s_op->sync_fs if defined
-///    - Writes back all dirty inodes via writeback_inodes_sb
-///    - Syncs the underlying block device via sync_blockdev
-///
-/// Our implementation uses the writeback module:
-/// 1. Gets the mount from the file's dentry
-/// 2. Uses writeback_all() to flush dirty pages with proper writeback tracking
-/// 3. Returns 0 on success
-///
-/// # Arguments
-/// * `fd` - File descriptor in the target filesystem
-///
-/// # Returns
-/// 0 on success, negative errno on error
+/// syncfs(2) (Linux sync_filesystem of the file's superblock): its
+/// dirty inodes, then its device's cache; a write error is returned
 pub fn sys_syncfs(fd: i32) -> i64 {
-    use crate::mm::writeback::sync_all;
-
-    // Validate fd exists (but we sync all filesystems currently)
-    let _file = match current_fd_table().lock().get(fd) {
+    let file = match current_fd_table().lock().get(fd) {
         Some(f) => f.clone(),
         None => return KernelError::BadFd.sysret(),
     };
-
-    // Use the writeback module to sync all dirty pages
-    // TODO: When we have per-superblock tracking, only sync the target filesystem
-    let _ = sync_all();
-
-    0
+    let Some(sb) = file.get_inode().and_then(|i| i.superblock()) else {
+        return 0;
+    };
+    match crate::fs::fs_writeback::writeback_sb(&sb) {
+        Ok(()) => 0,
+        Err(_) => KernelError::Io.sysret(),
+    }
 }
 
 // =============================================================================

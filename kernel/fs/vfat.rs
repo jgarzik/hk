@@ -113,6 +113,23 @@ impl Aops for VfatAops {
         Ok(())
     }
 
+    /// Swap files: the slot's clusters, read or written directly (Linux
+    /// generic_swapfile_activate maps the file's blocks)
+    fn swap_rw(
+        &self,
+        inode: &Inode,
+        index: u64,
+        buf: &mut [u8],
+        write: bool,
+    ) -> Result<(), KernelError> {
+        let (bdev, runs) = page_runs(inode, index)?;
+        if write {
+            return page_io(&bdev, BioOp::Write, buf, &runs);
+        }
+        buf.fill(0);
+        page_io(&bdev, BioOp::Read, buf, &runs)
+    }
+
     fn writepage(&self, inode: &Inode, phys: u64, index: u64) -> Result<(), KernelError> {
         let (bdev, runs) = page_runs(inode, index)?;
         page_io(&bdev, BioOp::Write, frame_bytes(phys), &runs)
@@ -1541,174 +1558,6 @@ impl InodeOps for VfatInodeOps {
             }
         });
         crate::workqueue::SYSTEM_WQ.queue_work(Arc::new(crate::sync::spin::Mutex::new(work)));
-    }
-
-    fn readpage(
-        &self,
-        inode: &Inode,
-        page_offset: u64,
-        buf: &mut [u8],
-    ) -> Result<usize, KernelError> {
-        let sb = inode.superblock().ok_or(KernelError::Io)?;
-        let sb_data = get_sb_data(&sb)?;
-        let inode_data = get_inode_data(inode)?;
-
-        let file_size = inode_data.file_size as u64;
-        let byte_offset = page_offset * PAGE_SIZE as u64;
-
-        if byte_offset >= file_size {
-            buf.fill(0);
-            return Ok(0);
-        }
-
-        // Read cluster chain
-        let chain = read_cluster_chain(&sb_data, inode_data.start_cluster)?;
-        let cluster_size = sb_data.cluster_size as u64;
-
-        // Find which cluster contains this offset
-        let cluster_index = (byte_offset / cluster_size) as usize;
-        if cluster_index >= chain.len() {
-            buf.fill(0);
-            return Ok(0);
-        }
-
-        // Read data from clusters
-        let mut bytes_read = 0;
-        let mut current_offset = byte_offset;
-
-        while bytes_read < buf.len() && current_offset < file_size {
-            let cluster_idx = (current_offset / cluster_size) as usize;
-            if cluster_idx >= chain.len() {
-                break;
-            }
-
-            let cluster = chain[cluster_idx];
-            let offset_in_cluster = (current_offset % cluster_size) as usize;
-            let cluster_remaining = cluster_size as usize - offset_in_cluster;
-            let file_remaining = (file_size - current_offset) as usize;
-            let buf_remaining = buf.len() - bytes_read;
-            let chunk_size = core::cmp::min(
-                core::cmp::min(cluster_remaining, file_remaining),
-                buf_remaining,
-            );
-
-            let disk_offset = cluster_to_offset(&sb_data, cluster) + offset_in_cluster as u64;
-            read_bytes(
-                &sb_data.bdev,
-                disk_offset,
-                &mut buf[bytes_read..bytes_read + chunk_size],
-            )?;
-
-            bytes_read += chunk_size;
-            current_offset += chunk_size as u64;
-        }
-
-        // Zero remaining buffer if we hit EOF
-        if bytes_read < buf.len() {
-            buf[bytes_read..].fill(0);
-        }
-
-        Ok(bytes_read)
-    }
-
-    fn writepage(&self, inode: &Inode, page_offset: u64, buf: &[u8]) -> Result<usize, KernelError> {
-        let sb = inode.superblock().ok_or(KernelError::Io)?;
-        let sb_data = get_sb_data(&sb)?;
-        let inode_data = get_inode_data(inode)?;
-
-        let byte_offset = page_offset * PAGE_SIZE as u64;
-
-        // Get or extend cluster chain
-        let mut chain = if inode_data.start_cluster != 0 {
-            read_cluster_chain(&sb_data, inode_data.start_cluster)?
-        } else {
-            Vec::new()
-        };
-
-        let cluster_size = sb_data.cluster_size as u64;
-
-        // Calculate how many clusters we need
-        let end_offset = byte_offset + buf.len() as u64;
-        let clusters_needed = end_offset.div_ceil(cluster_size) as usize;
-
-        // Extend chain if needed
-        let mut new_start_cluster: Option<u32> = None;
-        if clusters_needed > chain.len() {
-            let additional = clusters_needed - chain.len();
-            let last_cluster = if chain.is_empty() {
-                0
-            } else {
-                *chain.last().unwrap()
-            };
-            let new_clusters = extend_cluster_chain(&sb_data, last_cluster, additional)?;
-
-            // If this was an empty file, record the new start cluster
-            if chain.is_empty() && !new_clusters.is_empty() {
-                new_start_cluster = Some(new_clusters[0]);
-                chain = new_clusters;
-            } else {
-                chain.extend(new_clusters);
-            }
-        }
-
-        // Write data to clusters
-        let mut bytes_written = 0;
-        let mut current_offset = byte_offset;
-
-        while bytes_written < buf.len() {
-            let cluster_idx = (current_offset / cluster_size) as usize;
-            if cluster_idx >= chain.len() {
-                break;
-            }
-
-            let cluster = chain[cluster_idx];
-            let offset_in_cluster = (current_offset % cluster_size) as usize;
-            let cluster_remaining = cluster_size as usize - offset_in_cluster;
-            let buf_remaining = buf.len() - bytes_written;
-            let chunk_size = core::cmp::min(cluster_remaining, buf_remaining);
-
-            let disk_offset = cluster_to_offset(&sb_data, cluster) + offset_in_cluster as u64;
-            write_bytes(
-                &sb_data.bdev,
-                disk_offset,
-                &buf[bytes_written..bytes_written + chunk_size],
-            )?;
-
-            bytes_written += chunk_size;
-            current_offset += chunk_size as u64;
-        }
-
-        // If we allocated a new start cluster for a previously empty file,
-        // update the directory entry immediately AND the inode's private data
-        if let Some(start_cluster) = new_start_cluster {
-            // Calculate the new file size (might grow)
-            let new_size = core::cmp::max(
-                inode_data.file_size as u64,
-                byte_offset + bytes_written as u64,
-            ) as u32;
-
-            // Update directory entry with new start_cluster and size
-            if inode_data.parent_cluster != 0 && inode.get_nlink() != 0 {
-                update_dir_entry_by_short_name(
-                    &sb_data,
-                    inode_data.parent_cluster,
-                    &inode_data.short_name,
-                    start_cluster,
-                    new_size,
-                )?;
-            }
-
-            // Also update the inode's private data so future reads use the correct cluster
-            inode.set_private(Arc::new(VfatInodeData {
-                start_cluster,
-                file_size: new_size,
-                is_dir: inode_data.is_dir,
-                parent_cluster: inode_data.parent_cluster,
-                short_name: inode_data.short_name,
-            }));
-        }
-
-        Ok(bytes_written)
     }
 
     fn create(&self, dir: &Inode, name: &str, mode: InodeMode) -> Result<Arc<Inode>, KernelError> {

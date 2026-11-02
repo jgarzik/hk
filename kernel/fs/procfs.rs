@@ -461,66 +461,6 @@ impl InodeOps for ProcfsInodeOps {
             | ProcfsInodeData::Sysctl { .. } => Err(KernelError::NotDirectory),
         }
     }
-
-    fn readpage(
-        &self,
-        inode: &Inode,
-        page_offset: u64,
-        buf: &mut [u8],
-    ) -> Result<usize, KernelError> {
-        // For procfs, we generate content on demand
-        // This is called for page cache integration but procfs typically
-        // doesn't use the page cache (content is ephemeral)
-        let private = inode.get_private().ok_or(KernelError::Io)?;
-        let wrapper = private
-            .as_ref()
-            .as_any()
-            .downcast_ref::<ProcfsInodeWrapper>()
-            .ok_or(KernelError::Io)?;
-
-        let data = wrapper.0.read();
-        let content = match &*data {
-            ProcfsInodeData::File { generator } => generator(),
-            ProcfsInodeData::NamespaceFile { pid, ns_type } => {
-                // Generate namespace identifier content
-                // Format matches Linux: "ns:[<inode>]" but we use a simpler format
-                gen_namespace_content(*pid, *ns_type)
-            }
-            ProcfsInodeData::FdinfoFile { pid, fd } => gen_fdinfo_content(*pid, *fd),
-            ProcfsInodeData::PidFile { pid, generator } => pid_content(None, *pid, *generator)?,
-            ProcfsInodeData::Sysctl { ctl } => crate::sysctl::read(ctl),
-            ProcfsInodeData::FdSymlink { .. }
-            | ProcfsInodeData::PidLink { .. }
-            | ProcfsInodeData::SelfLink => {
-                // Symlinks don't have content, readlink() handles them
-                return Err(KernelError::Io);
-            }
-            ProcfsInodeData::Directory { .. }
-            | ProcfsInodeData::PidDirectory { .. }
-            | ProcfsInodeData::PidTaskDirectory { .. }
-            | ProcfsInodeData::PidNsDirectory { .. }
-            | ProcfsInodeData::PidFdDirectory { .. }
-            | ProcfsInodeData::PidFdinfoDirectory { .. } => return Err(KernelError::IsDirectory),
-        };
-
-        let page_size = buf.len();
-        let offset = page_offset as usize * page_size;
-
-        if offset >= content.len() {
-            buf.fill(0);
-            return Ok(0);
-        }
-
-        let available = content.len() - offset;
-        let to_copy = min(page_size, available);
-
-        buf[..to_copy].copy_from_slice(&content[offset..offset + to_copy]);
-        if to_copy < page_size {
-            buf[to_copy..].fill(0);
-        }
-
-        Ok(to_copy)
-    }
 }
 
 // ============================================================================

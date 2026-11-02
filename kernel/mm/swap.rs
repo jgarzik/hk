@@ -26,7 +26,7 @@ use crate::sync::spin::{Mutex, RwLock};
 use crate::arch::{IrqSpinlock, Uaccess};
 use crate::error::KernelError;
 use crate::fs::{Inode, lookup_path};
-use crate::mm::page_cache::PAGE_SIZE;
+use crate::mm::filemap::PAGE_SIZE;
 use crate::mm::swap_entry::{MAX_SWAPFILES, SwapEntry};
 use crate::mm::xarray::XArray;
 use crate::storage::blkdev::{BioOp, bdev_rw, bdev_rw_frame};
@@ -376,26 +376,22 @@ pub fn free_swap_and_cache(e: SwapEntry) {
 // Swap I/O
 // ============================================================================
 
+/// A swap frame as bytes
+fn frame_bytes<'a>(phys: u64) -> &'a mut [u8] {
+    // SAFETY: the caller's frame (locked swap-cache page), direct map
+    unsafe { core::slice::from_raw_parts_mut(crate::arch::phys_to_virt(phys), PAGE_SIZE) }
+}
+
 /// Read slot `entry` into the frame at `frame_phys` (may sleep)
 pub fn swap_read_page(entry: SwapEntry, frame_phys: u64) -> Result<(), i64> {
     let si = info_of(entry).ok_or(KernelError::InvalidArgument.sysret())?;
     let off = entry.offset();
     if let Some(ref inode) = si.inode {
-        let mut buf = alloc::vec![0u8; PAGE_SIZE];
-        let n = inode
-            .i_op
-            .readpage(inode, off, &mut buf)
-            .map_err(|_| KernelError::Io.sysret())?;
-        buf[n.min(PAGE_SIZE)..].fill(0);
-        // SAFETY: the caller's frame, reached through the direct map
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                buf.as_ptr(),
-                crate::arch::phys_to_virt(frame_phys),
-                PAGE_SIZE,
-            )
-        };
-        Ok(())
+        inode
+            .i_data
+            .aops()
+            .swap_rw(inode, off, frame_bytes(frame_phys), false)
+            .map_err(|_| KernelError::Io.sysret())
     } else if let Some(ref bdev) = si.bdev {
         bdev_rw_frame(bdev, BioOp::Read, off * SECTORS_PER_PAGE, frame_phys).map_err(|e| e.sysret())
     } else {
@@ -424,23 +420,11 @@ fn write_page(entry: SwapEntry, frame_phys: u64) -> Result<(), i64> {
         if crate::task::percpu::current().has_flag(crate::task::pf::MEMALLOC) {
             return Err(KernelError::WouldBlock.sysret());
         }
-        let mut buf = alloc::vec![0u8; PAGE_SIZE];
-        // SAFETY: the caller's frame, reached through the direct map
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                crate::arch::phys_to_virt(frame_phys),
-                buf.as_mut_ptr(),
-                PAGE_SIZE,
-            )
-        };
-        let n = inode
-            .i_op
-            .writepage(inode, off, &buf)
-            .map_err(|_| KernelError::Io.sysret())?;
-        if n != PAGE_SIZE {
-            return Err(KernelError::Io.sysret());
-        }
-        Ok(())
+        inode
+            .i_data
+            .aops()
+            .swap_rw(inode, off, frame_bytes(frame_phys), true)
+            .map_err(|_| KernelError::Io.sysret())
     } else if let Some(ref bdev) = si.bdev {
         bdev_rw_frame(bdev, BioOp::Write, off * SECTORS_PER_PAGE, frame_phys)
             .map_err(|e| e.sysret())
@@ -514,7 +498,11 @@ fn swapon(path_ptr: u64, swap_flags: i32) -> Result<(), KernelError> {
     let mut hdr = [0u8; PAGE_SIZE];
     let read = match &bdev {
         Some(b) => bdev_rw(b, BioOp::Read, 0, &mut hdr).map(|_| PAGE_SIZE),
-        None => inode.i_op.readpage(&inode, 0, &mut hdr),
+        None => inode
+            .i_data
+            .aops()
+            .swap_rw(&inode, 0, &mut hdr, false)
+            .map(|_| PAGE_SIZE),
     };
     if read.unwrap_or(0) < PAGE_SIZE {
         return Err(KernelError::InvalidArgument);

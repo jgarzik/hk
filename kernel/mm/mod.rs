@@ -33,7 +33,6 @@ pub mod mprotect;
 pub mod mremap;
 pub mod page;
 pub mod page_alloc;
-pub mod page_cache;
 pub mod pagewalk;
 pub mod ptl;
 pub mod remote;

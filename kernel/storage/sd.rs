@@ -378,11 +378,8 @@ pub fn unregister_scsi_disk(index: u16) -> Result<(), KernelError> {
     // device, never a new one: indexes and minors are not reused) and
     // their cached pages dropped
     let all = disk_bdevs(&bdev.disk);
+    let pages: u64 = all.iter().map(|b| b.bd_inode.i_data.nrpages()).sum();
     del_gendisk(&bdev.disk);
-    let mut freed = 0;
-    for b in &all {
-        freed += crate::invalidate_blkdev_pages(b.dev.major, b.dev.minor);
-    }
-    crate::printkln!("SCSI: {} removed ({} cached pages freed)", bdev.name, freed);
+    crate::printkln!("SCSI: {} removed ({} cached pages freed)", bdev.name, pages);
     Ok(())
 }

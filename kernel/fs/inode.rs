@@ -264,24 +264,6 @@ pub trait InodeOps: Send + Sync {
         Err(KernelError::OperationNotSupported)
     }
 
-    /// Read a page of data from a file
-    /// Returns the number of bytes read (may be less than PAGE_SIZE at EOF)
-    fn readpage(
-        &self,
-        inode: &Inode,
-        page_offset: u64,
-        buf: &mut [u8],
-    ) -> Result<usize, KernelError> {
-        let _ = (inode, page_offset, buf);
-        Err(KernelError::OperationNotSupported)
-    }
-
-    /// Write a page of data to a file
-    fn writepage(&self, inode: &Inode, page_offset: u64, buf: &[u8]) -> Result<usize, KernelError> {
-        let _ = (inode, page_offset, buf);
-        Err(KernelError::OperationNotSupported)
-    }
-
     /// MAP_SHARED mappings of the file map its page cache (`i_data`,
     /// `filemap::fault`) rather than private copies
     fn maps_cache(&self) -> bool {

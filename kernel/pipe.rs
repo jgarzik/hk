@@ -50,7 +50,7 @@ use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use crate::fs::KernelError;
 use crate::fs::file::{File, FileOps, RwFlags, flags};
-use crate::mm::page_cache::{CachedPage, PAGE_SIZE};
+use crate::mm::filemap::PAGE_SIZE;
 use crate::poll::{POLLERR, POLLHUP, POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM, PollTable};
 use crate::waitqueue::WaitQueue;
 
@@ -80,6 +80,24 @@ pub mod pipe_buf_flags {
     pub const OWNED: u32 = 0x20;
 }
 
+/// A page of pipe data (Linux the page of a pipe_buffer): shared by
+/// the buffers that hold it (tee, splice), freed with the last
+pub struct PipePage {
+    pub frame: u64,
+}
+
+impl PipePage {
+    pub fn new(frame: u64) -> Self {
+        Self { frame }
+    }
+}
+
+impl Drop for PipePage {
+    fn drop(&mut self) {
+        crate::FRAME_ALLOCATOR.free(self.frame);
+    }
+}
+
 /// A single buffer slot in a pipe
 ///
 /// Similar to Linux's struct pipe_buffer, this holds a reference to a page
@@ -87,7 +105,7 @@ pub mod pipe_buf_flags {
 pub struct PipeBuffer {
     /// Page holding the buffer data
     /// None if this slot is empty, Some if it contains data
-    pub page: Option<Arc<CachedPage>>,
+    pub page: Option<Arc<PipePage>>,
     /// Offset within the page where data starts
     pub offset: u32,
     /// Length of valid data in this buffer
@@ -108,7 +126,7 @@ impl PipeBuffer {
     }
 
     /// Create a new pipe buffer with a page
-    pub fn new(page: Arc<CachedPage>, offset: u32, len: u32, flags: u32) -> Self {
+    pub fn new(page: Arc<PipePage>, offset: u32, len: u32, flags: u32) -> Self {
         Self {
             page: Some(page),
             offset,
@@ -143,11 +161,8 @@ impl PipeBuffer {
     /// Release the page reference
     pub fn release(&mut self) {
         if let Some(ref page) = self.page {
-            // Only call put() if we own the page (OWNED flag)
-            // For splice'd pages, the caller manages the refcount
-            if self.flags & pipe_buf_flags::OWNED != 0 {
-                page.put();
-            }
+            // The Arc counts every buffer sharing the page (tee)
+            let _ = page;
         }
         self.page = None;
         self.offset = 0;
@@ -407,8 +422,8 @@ impl PipeInner {
 
 /// Allocate a page for pipe buffer data
 ///
-/// Creates an anonymous CachedPage for holding pipe data.
-fn allocate_pipe_page() -> Option<Arc<CachedPage>> {
+/// Creates a page for holding pipe data.
+fn allocate_pipe_page() -> Option<Arc<PipePage>> {
     use crate::FRAME_ALLOCATOR;
 
     // Allocate a physical frame
@@ -416,8 +431,7 @@ fn allocate_pipe_page() -> Option<Arc<CachedPage>> {
     // watermark like the user pages it was copied from
     let frame = FRAME_ALLOCATOR.alloc_gfp(crate::mm::page_alloc::Gfp::HIGHUSER_MOVABLE)?;
 
-    // Create an anonymous CachedPage (file_id 0, offset 0)
-    let page = Arc::new(CachedPage::new_owned(frame));
+    let page = Arc::new(PipePage::new(frame));
 
     Some(page)
 }

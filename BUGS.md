@@ -42,12 +42,12 @@ Missing:
   first), synchronous writes, no kswapd, no file pages; 2MB pages stay
   off the LRU (never reclaimed whole; a split puts their 4KB pages on
   it). Pages exec copies the image into are not on the reverse map
-  (never swapped). Swap files go through the inode's readpage /
-  writepage, a page at a time. Page faults, swapoff, and heap and pipe
-  allocations that may sleep reclaim directly; page-cache allocations
-  (under the PAGE_CACHE spinlock) and atomic heap allocations never
-  do, so with anonymous memory filling RAM they fail at the low
-  watermark until kswapd (P6) keeps free memory above it.
+  (never swapped). Swap files go through their filesystem's swap_rw,
+  a page at a time (walking the cluster chain each time; Linux maps
+  the extents once at swapon). Page faults, swapoff, page-cache, heap
+  and pipe allocations that may sleep reclaim directly; atomic heap
+  allocations never do, so with anonymous memory filling RAM they fail
+  at the low watermark until kswapd (P6) keeps free memory above it.
 - SysV shm: IPC_RMID removes the id at once (Linux keeps it, as
   IPC_PRIVATE with SHM_DEST, until the last detach: IPC_STAT and shmat
   by id still work there).
@@ -566,9 +566,6 @@ sched pid 0, flock/POSIX release, signalfd reader, errno flattening.
   (no seq_file records, so chunked reads of /proc/net/* can tear);
   global generators run under the procfs inode's read lock and take
   TASKLIST and network locks inside it (not in LOCKING.md).
-- **Two page-I/O interfaces** (E): `InodeOps::readpage/writepage` and
-  page_cache's own, with a FileId-keyed global cache and
-  DIRTY_ADDRESS_SPACES.
 - **Stale comments and dead code** (as touched): about 155
   `#[allow(dead_code)]`, 90 "for now"/TODO markers; comments that
   contradict the code in `task/id.rs:87`, `ns/mod.rs:558`,

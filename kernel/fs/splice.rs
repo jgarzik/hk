@@ -29,7 +29,8 @@ use alloc::sync::Arc;
 use crate::arch::Uaccess;
 use crate::fs::KernelError;
 use crate::fs::file::File;
-use crate::mm::page_cache::{CachedPage, PAGE_SIZE};
+use crate::mm::filemap::PAGE_SIZE;
+use crate::pipe::PipePage;
 use crate::pipe::{PIPE_RING, Pipe, PipeBuffer, PipeReadFileOps, PipeWriteFileOps, pipe_buf_flags};
 use crate::task::fdtable::get_task_fd;
 use crate::task::percpu::current_tid;
@@ -86,7 +87,7 @@ pub enum SpliceDirection {
 /// Number of bytes inserted, or error
 pub fn splice_to_pipe(
     pipe: &Pipe,
-    page: Arc<CachedPage>,
+    page: Arc<PipePage>,
     offset: u32,
     len: u32,
 ) -> Result<usize, KernelError> {
@@ -120,7 +121,7 @@ pub fn splice_to_pipe(
 ///
 /// # Returns
 /// The pipe buffer containing page reference, or None if pipe is empty
-pub fn splice_from_pipe(pipe: &Pipe) -> Option<(Arc<CachedPage>, u32, u32)> {
+pub fn splice_from_pipe(pipe: &Pipe) -> Option<(Arc<PipePage>, u32, u32)> {
     let mut inner = pipe.lock();
 
     if inner.is_empty() {
@@ -206,9 +207,6 @@ pub fn link_pipe(src: &Pipe, dst: &Pipe, len: usize, _flags: u32) -> Result<usiz
             let to_copy = (len - copied).min(src_buf.len as usize);
 
             if to_copy > 0 {
-                // Increment page refcount
-                page.get();
-
                 // Create new buffer pointing to same page
                 // Clear GIFT and CAN_MERGE flags
                 let new_buf = PipeBuffer::new(
@@ -219,8 +217,6 @@ pub fn link_pipe(src: &Pipe, dst: &Pipe, len: usize, _flags: u32) -> Result<usiz
                 );
 
                 if dst_guard.push_buffer(new_buf).is_err() {
-                    // Undo the refcount increment
-                    page.put();
                     break;
                 }
 
@@ -638,13 +634,13 @@ fn do_splice_pipe_to_file(
 }
 
 /// Allocate a page for pipe buffer
-fn allocate_pipe_page() -> Option<Arc<CachedPage>> {
+fn allocate_pipe_page() -> Option<Arc<PipePage>> {
     use crate::FRAME_ALLOCATOR;
 
     // User data (Linux GFP_HIGHUSER | __GFP_ACCOUNT): stops at the low
     // watermark like the user pages it was copied from
     let frame = FRAME_ALLOCATOR.alloc_gfp(crate::mm::page_alloc::Gfp::HIGHUSER_MOVABLE)?;
-    let page = Arc::new(CachedPage::new_owned(frame));
+    let page = Arc::new(PipePage::new(frame));
     Some(page)
 }
 
