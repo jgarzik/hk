@@ -7,6 +7,8 @@
 //!   job); a process that is not its child is ESRCH
 //! - SETPGID_CHILD_EXEC: once the child has exec'd it is EACCES
 //!   (PF_FORKNOEXEC cleared)
+//! - WAIT_PGRP: waitpid(0) waits for a child in the caller's process
+//!   group only, waitpid(-pgid) for one in that group (both were ECHILD)
 //! - SETPGID_INT_ARGS: pid_t arguments use the low 32 bits of their
 //!   register: -1 with the upper half zero is EINVAL as setpgid's pgid,
 //!   ESRCH as getpgid's, getsid's and kcmp's pid
@@ -27,7 +29,41 @@ const MINUS_ONE_32: u64 = 0xffff_ffff;
 pub fn run_tests() {
     child();
     child_exec();
+    wait_pgrp();
     int_args();
+}
+
+fn wait_pgrp() {
+    let a = sys_fork();
+    if a == 0 {
+        sys_exit(3);
+    }
+    // Moved to its own group before it can be waited for
+    let moved = sys_setpgid(a as u64, a as u64);
+    let b = sys_fork();
+    if b == 0 {
+        sys_exit(4);
+    }
+    let mut st = 0i32;
+    let w0 = sys_wait4(0, &mut st, 0, 0);
+    let st0 = st;
+    let wa = sys_wait4(-a, &mut st, 0, 0);
+    let sta = st;
+    let none = sys_wait4(0, &mut st, 0, 0);
+    report(
+        b"WAIT_PGRP",
+        if moved != 0 {
+            1
+        } else if w0 != b || st0 != 4 << 8 {
+            2
+        } else if wa != a || sta != 3 << 8 {
+            3
+        } else if none != -10 {
+            4
+        } else {
+            0
+        },
+    );
 }
 
 fn report(name: &[u8], step: i64) {

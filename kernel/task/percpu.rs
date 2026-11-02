@@ -1600,6 +1600,7 @@ pub fn reap_zombie_child_times(
     target_pid: i64,
     wflags: i32,
 ) -> Option<(Pid, i32, u64, u64)> {
+    let pgid = current_pgid();
     let mut table = TASKLIST.write();
 
     // Find a zombie child matching the criteria: a thread-group leader
@@ -1621,17 +1622,9 @@ pub fn reap_zombie_child_times(
             return false;
         }
 
-        // Check PID matching
-        if target_pid > 0 {
-            // Wait for specific PID
-            t.task.pid == target_pid as u64
-        } else if target_pid == -1 {
-            // Wait for any child
-            true
-        } else {
-            // target_pid == 0: wait for same process group (not implemented)
-            false
-        }
+        // Linux: pid > 0 that child, -1 any, 0 the caller's process
+        // group, < -1 that process group
+        wait_match(t, target_pid, pgid)
     })?;
     let TaskState::Zombie(status) = zombie.state else {
         return None;
@@ -1837,6 +1830,7 @@ pub fn has_tracees(tracer_pid: Pid, target_pid: i64) -> bool {
 ///   - -1: check for any child
 ///   - 0: check for any child in same process group
 pub fn has_children(parent_pid: Pid, target_pid: i64, wflags: i32) -> bool {
+    let pgid = current_pgid();
     let table = TASKLIST.read();
 
     table.iter().any(|t| {
@@ -1849,15 +1843,7 @@ pub fn has_children(parent_pid: Pid, target_pid: i64, wflags: i32) -> bool {
             return false;
         }
 
-        // Check PID matching
-        if target_pid > 0 {
-            t.task.pid == target_pid as u64
-        } else if target_pid == -1 {
-            true
-        } else {
-            // target_pid == 0: same process group
-            false
-        }
+        wait_match(&t, target_pid, pgid)
     })
 }
 
