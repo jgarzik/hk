@@ -59,7 +59,7 @@ pub fn add(e: SwapEntry, phys: u64) -> bool {
     let stored = si
         .cache
         .lock()
-        .store(e.offset(), phys, &mut || FRAME_ALLOCATOR.alloc());
+        .store(e.offset(), phys, &mut crate::mm::xarray::node_alloc);
     debug_assert!(stored.is_none_or(|old| old == 0));
     if stored.is_none() {
         unhash(pg);
@@ -290,7 +290,7 @@ fn drop_cache(si: &SwapInfo) {
     let mut pages = Vec::new();
     si.cache
         .lock()
-        .for_each(0, si.max, &mut |off, _| pages.push(off));
+        .for_each(0, si.max.saturating_sub(1), &mut |off, _| pages.push(off));
     for off in pages {
         let e = SwapEntry::new(si.swap_type, off);
         if let Some(phys) = lookup(e) {

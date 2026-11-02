@@ -1132,8 +1132,8 @@ pub struct Zone {
 - Shared anonymous memory (`mm::shmem::Shmem`, Linux shmem): its page
   index `Shmem.root` is a `spin::Mutex` taken by the fault path under
   the mm lock (mm lock -> Shmem.root) and by MADV_REMOVE after the mm
-  lock is dropped; under it only `FRAME_ALLOCATOR` is taken (index
-  nodes are frames, no heap). The object goes with its last VMA
+  lock is dropped; under it only `FRAME_ALLOCATOR` and the heap (index
+  nodes, atomic under the spin lock) are taken. The object goes with its last VMA
   (possibly under the mm lock): its drop takes no lock but
   `FRAME_ALLOCATOR`.
 - A SysV shm attachment (`ipc::shm::ShmAttach`, in its VMA) is cloned
@@ -1268,7 +1268,7 @@ pub struct Zone {
   cache lock held.
 - `SwapInfo.cache` (`IrqSpinlock<XArray>`, Linux i_pages xa_lock_irq):
   the swap cache of a device, page by slot. A leaf: under it only the
-  allocator (index nodes, never sleeping). A lookup takes its page
+  allocators (a page, a heap index node; atomic, never sleeping). A lookup takes its page
   reference under it (get_page_unless_zero); reclaim deletes a page
   from it by freezing its count (expected -> 0) under it, so no lookup
   revives a page being freed. Slot counts change after it is dropped.
