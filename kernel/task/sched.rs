@@ -108,9 +108,9 @@ pub struct SchedEntity {
     pub wake_q: AtomicPtr<()>,
 }
 
-// SAFETY: `ctx` is only touched under the rq lock of the task's CPU
+// SAFETY: `ctx` (the UnsafeCell) is only touched under the rq lock of the
+// task's CPU; every other field is atomic
 unsafe impl Sync for SchedEntity {}
-unsafe impl Send for SchedEntity {}
 
 impl SchedEntity {
     /// A SCHED_NORMAL nice 0 entity in sleep state `state`

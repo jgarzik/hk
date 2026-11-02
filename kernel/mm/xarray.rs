@@ -77,9 +77,6 @@ pub struct Preload {
     nodes: [Option<NonNull<Node>>; MAX_LEVELS + 1],
 }
 
-// SAFETY: the preload owns its unlinked nodes exclusively
-unsafe impl Send for Preload {}
-
 impl Preload {
     /// A preload holding enough nodes for any one store; None when out
     /// of memory
@@ -117,11 +114,6 @@ pub struct XArray {
     /// Marks of the entry held in `head` (height 0)
     head_marks: u8,
 }
-
-// SAFETY: the tree owns its nodes; its owner's lock serializes access
-unsafe impl Send for XArray {}
-// SAFETY: as above (`&XArray` only reads)
-unsafe impl Sync for XArray {}
 
 /// Node `p`, shared (the `&self` paths)
 ///

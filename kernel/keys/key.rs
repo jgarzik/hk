@@ -167,10 +167,6 @@ pub struct Key {
     key_type: Arc<dyn KeyType>,
 }
 
-// Safety: Key uses atomic operations and RwLock for synchronization
-unsafe impl Send for Key {}
-unsafe impl Sync for Key {}
-
 impl Key {
     /// Create a new key
     pub fn new(

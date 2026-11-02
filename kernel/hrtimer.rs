@@ -87,11 +87,6 @@ pub struct HrTimer {
     _pin: PhantomPinned,
 }
 
-// SAFETY: links and fields shared with the expiry code are used under
-// the base lock or through atomics
-unsafe impl Sync for HrTimer {}
-unsafe impl Send for HrTimer {}
-
 crate::adapter!(HrAdapter, HrTimer, link);
 
 impl HrTimer {

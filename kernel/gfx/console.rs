@@ -16,6 +16,10 @@ use crate::console::{ConsoleDriver, ConsolePriority};
 ///
 /// The console renders to this surface without knowing about
 /// the underlying hardware (GOP, DRM, etc.).
+///
+/// # Invariants
+/// `pitch * height` bytes at `buffer` are mapped framebuffer memory, and
+/// a row's `width` pixels fit in `pitch`.
 pub struct ScanoutSurface {
     /// CPU-accessible buffer pointer (ioremap'd)
     buffer: *mut u8,
@@ -29,8 +33,10 @@ pub struct ScanoutSurface {
     format: PixelFormat,
 }
 
-// SAFETY: The buffer pointer is only accessed through synchronized methods
+// SAFETY: device memory reached only by volatile access through `&self`
+// methods of the console, which serializes them (its state Mutex)
 unsafe impl Send for ScanoutSurface {}
+// SAFETY: as above
 unsafe impl Sync for ScanoutSurface {}
 
 impl ScanoutSurface {
@@ -40,11 +46,20 @@ impl ScanoutSurface {
     /// The buffer must be a valid, mapped pointer to framebuffer memory
     /// with at least `fb_info.size` bytes accessible.
     pub unsafe fn new(fb_info: &FramebufferInfo, buffer: *mut u8) -> Self {
+        // INVARIANT: the size the firmware reports bounds the rows used,
+        // and a row's pixels fit its pitch (a bad mode shrinks, never
+        // writes past the mapping)
+        let bpp = match fb_info.format {
+            PixelFormat::Rgb565 => 2,
+            _ => 4,
+        };
+        let pitch = fb_info.pitch.max(1);
+        let rows = (fb_info.size / pitch as u64).min(u32::MAX as u64) as u32;
         Self {
             buffer,
-            width: fb_info.width,
-            height: fb_info.height,
-            pitch: fb_info.pitch,
+            width: fb_info.width.min(pitch / bpp),
+            height: fb_info.height.min(rows),
+            pitch,
             format: fb_info.format,
         }
     }
@@ -235,11 +250,8 @@ pub struct GfxConsole {
 }
 
 impl GfxConsole {
-    /// Create a new DRM console
-    ///
-    /// # Safety
-    /// The surface must contain a valid, mapped framebuffer pointer.
-    pub unsafe fn new(name: &'static str, surface: ScanoutSurface, font: &'static Font) -> Self {
+    /// Create a new DRM console on `surface` (its invariant holds)
+    pub fn new(name: &'static str, surface: ScanoutSurface, font: &'static Font) -> Self {
         let cols = surface.width() / font.width as u32;
         let rows = surface.height() / font.height as u32;
 
@@ -402,8 +414,7 @@ pub unsafe fn init_graphics_console() -> bool {
     let surface = unsafe { ScanoutSurface::new(fb_info, fb_ptr) };
 
     // Create the console
-    // SAFETY: surface contains a valid mapped framebuffer pointer
-    let console = unsafe { GfxConsole::new("gfx0", surface, &DEFAULT_FONT) };
+    let console = GfxConsole::new("gfx0", surface, &DEFAULT_FONT);
     let (cols, rows) = console.dimensions();
 
     // Clear the screen

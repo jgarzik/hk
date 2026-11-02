@@ -67,11 +67,6 @@ pub struct TimerList {
     _pin: PhantomPinned,
 }
 
-// SAFETY: links and fields shared with the expiry code are used under
-// the base lock or through atomics
-unsafe impl Sync for TimerList {}
-unsafe impl Send for TimerList {}
-
 crate::adapter!(TimerAdapter, TimerList, link);
 
 impl TimerList {

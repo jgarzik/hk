@@ -97,10 +97,6 @@ pub struct Work {
     state: AtomicU32,
 }
 
-// Safety: Work uses atomic state and boxed callback with Send bound
-unsafe impl Send for Work {}
-unsafe impl Sync for Work {}
-
 impl Work {
     /// Create a new work item with the given callback
     pub fn new<F: FnMut() + Send + 'static>(func: F) -> Self {
@@ -179,10 +175,6 @@ pub struct DelayedWork {
     wake_tick: AtomicU64,
 }
 
-// Safety: DelayedWork uses atomic wake_tick and inherits Work's safety
-unsafe impl Send for DelayedWork {}
-unsafe impl Sync for DelayedWork {}
-
 impl DelayedWork {
     /// Create a new delayed work item
     pub fn new<F: FnMut() + Send + 'static>(func: F) -> Self {
@@ -256,10 +248,6 @@ pub struct Workqueue {
     /// Initialization flag
     initialized: AtomicBool,
 }
-
-// Safety: Workqueue uses internal synchronization
-unsafe impl Send for Workqueue {}
-unsafe impl Sync for Workqueue {}
 
 impl Workqueue {
     /// Create a new workqueue
