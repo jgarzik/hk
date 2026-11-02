@@ -1576,8 +1576,9 @@ dropped before and after it is zeroed on the disk.)
 - Writeback write-protects a page in every mapping of it before
   writing it (`mkclean`, Linux folio_mkclean): under the page lock,
   i_mmap read -> each PTE lock, a TLB flush per entry. The write fault
-  that follows makes it writable and dirties it again (no lock held
-  but the mmap_lock read side), then may throttle (balance_dirty_pages
+  that follows makes it writable and dirties it again under the page
+  lock (mmap_lock read -> page lock -> PTE lock), so writeback never
+  sees it writable but clean; then it may throttle (balance_dirty_pages
   writes the inode back: mmap_lock -> page lock -> i_mmap).
 - Dirty pages are counted per CPU (`NR_DIRTY`, atomics, Linux
   NR_FILE_DIRTY), summed lock-free for the dirty limits.

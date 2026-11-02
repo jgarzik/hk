@@ -548,12 +548,24 @@ fn do_wp_page(mm: &Mm, ptep: *mut u64, pte: u64, addr: u64, area: &Area) -> Resu
     // A shared file page written back (write-protected by mkclean) is
     // dirty again once writable (Linux wp_page_shared ->
     // fault_dirty_shared_page)
+    // Under the page lock, like Linux wp_page_shared: writeback holds it
+    // across mkclean and clearing the dirty bit, so it never sees the
+    // PTE writable but the page still clean (a later write would be
+    // lost). The PTE's page is referenced first (it may be unmapped
+    // meanwhile; wp_locked rechecks the entry).
     if area.shared
         && let Some(inode) = area.file.as_ref().and_then(|f| f.mapping_inode())
         && inode.i_op.maps_cache()
     {
+        let phys = paging::pte_addr(pte);
+        if !FRAME_ALLOCATOR.incref(phys) {
+            return Ok(());
+        }
+        super::page::lock_page(phys);
         let r = wp_locked(mm, ptep, pte, addr, area, &mut None);
-        super::filemap::dirty_page(&inode.i_data, paging::pte_addr(pte));
+        super::filemap::dirty_page(&inode.i_data, phys);
+        super::page::unlock_page(phys);
+        FRAME_ALLOCATOR.decref(phys);
         crate::fs::fs_writeback::mark_inode_dirty(&inode);
         super::writeback::balance_dirty_pages(&inode);
         return r;
