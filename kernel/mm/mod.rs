@@ -176,6 +176,9 @@ pub struct MmStruct {
     def_flags: u32,
     /// Path of the executable (Linux mm->exe_file), for /proc/<pid>/exe
     exe: Option<alloc::string::String>,
+    /// Writes to the executable denied while this image runs (Linux
+    /// mm->exe_file's deny_write_access)
+    exe_deny: Option<crate::fs::inode::DenyWrite>,
     /// Where exec put the image, arguments and environment
     args: MmLayout,
     /// The address space these VMAs belong to and its top-level table,
@@ -235,6 +238,7 @@ impl MmStruct {
             total_vm: 0,
             def_flags: 0,
             exe: None,
+            exe_deny: None,
             args: MmLayout::default(),
             owner: Weak::new(),
             pgd: 0,
@@ -317,8 +321,13 @@ impl MmStruct {
     }
 
     /// Record the executable at exec
-    pub fn set_exe(&mut self, path: alloc::string::String) {
+    pub fn set_exe(
+        &mut self,
+        path: alloc::string::String,
+        deny: Option<crate::fs::inode::DenyWrite>,
+    ) {
         self.exe = Some(path);
+        self.exe_deny = deny;
     }
 
     /// Set the program break region (called during ELF loading)
@@ -1069,6 +1078,7 @@ pub fn dup_mm(parent: &MmRef, pgd: u64) -> Result<MmRef, i32> {
         map.brk = guard.brk;
         map.total_vm = guard.total_vm;
         map.exe = guard.exe.clone();
+        map.exe_deny = guard.exe_deny.clone();
         map.args = guard.args;
         for vma in guard.iter() {
             if vma.flags & VM_DONTCOPY != 0 {

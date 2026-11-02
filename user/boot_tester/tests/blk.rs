@@ -614,7 +614,13 @@ fn swap(p2: &BlkDev) {
     let path = p2.path(&mut p);
     let on = sys_swapon(path.as_ptr(), 0);
     let again = sys_swapon(path.as_ptr(), 0);
+    // An active swap partition cannot be written (Linux
+    // blkdev_write_iter: IS_SWAPFILE -> ETXTBSY)
+    let fd = sys_open(path.as_ptr(), O_WRONLY, 0) as i32;
+    let w = sys_pwrite64(fd, b"x".as_ptr(), 1, 8192);
+    sys_close(fd as u64);
     let off = sys_swapoff(path.as_ptr());
     let ok = on == 0 && again == EBUSY && off == 0;
     verdict(b"BLK_SWAPON", ok, on * 1000 + again);
+    verdict(b"SWAP_ETXTBSY", on == 0 && fd >= 0 && w == -26, w);
 }

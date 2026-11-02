@@ -480,6 +480,14 @@ pub struct Inode {
     /// On its superblock's dirty list (Linux I_DIRTY_PAGES; fs_writeback)
     pub(crate) i_dirty: core::sync::atomic::AtomicBool,
 
+    /// Writers (> 0) or executions denying them (< 0) (Linux
+    /// i_writecount; `get_write_access`, `deny_write_access`)
+    i_writecount: core::sync::atomic::AtomicI32,
+
+    /// An active swap area (Linux S_SWAPFILE): writes and truncates are
+    /// ETXTBSY
+    pub i_swapfile: core::sync::atomic::AtomicBool,
+
     /// The inode cache key it is hashed under (`fs::icache`)
     pub(super) i_hash: AtomicU64,
     /// Hashed in the inode cache (Linux !inode_unhashed)
@@ -523,6 +531,8 @@ impl Inode {
             i_hashed: core::sync::atomic::AtomicBool::new(false),
             i_data: crate::mm::filemap::AddressSpace::new(),
             i_dirty: core::sync::atomic::AtomicBool::new(false),
+            i_writecount: core::sync::atomic::AtomicI32::new(0),
+            i_swapfile: core::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -563,6 +573,8 @@ impl Inode {
             i_hashed: core::sync::atomic::AtomicBool::new(false),
             i_data: crate::mm::filemap::AddressSpace::new(),
             i_dirty: core::sync::atomic::AtomicBool::new(false),
+            i_writecount: core::sync::atomic::AtomicI32::new(0),
+            i_swapfile: core::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -758,6 +770,75 @@ impl InodeOps for NullInodeOps {
 
 /// Static null inode ops instance
 pub static NULL_INODE_OPS: NullInodeOps = NullInodeOps;
+
+/// Write access to an inode, held by a file open for writing and by a
+/// truncate (Linux get_write_access / put_write_access)
+pub struct InodeWrite(Arc<Inode>);
+
+/// Writes denied while a program runs from the inode (Linux
+/// deny_write_access / allow_write_access, held by the address space)
+pub struct DenyWrite(Arc<Inode>);
+
+impl Inode {
+    /// Take write access (Linux get_write_access): ETXTBSY while the
+    /// file is being executed
+    pub fn get_write_access(self: &Arc<Self>) -> Result<InodeWrite, KernelError> {
+        let c = &self.i_writecount;
+        let mut v = c.load(Ordering::Relaxed);
+        loop {
+            if v < 0 {
+                return Err(KernelError::TextBusy);
+            }
+            match c.compare_exchange_weak(v, v + 1, Ordering::AcqRel, Ordering::Relaxed) {
+                Ok(_) => return Ok(InodeWrite(self.clone())),
+                Err(now) => v = now,
+            }
+        }
+    }
+
+    /// Deny writes while executing it (Linux exe_file_deny_write_access):
+    /// ETXTBSY while it is open for writing
+    pub fn deny_write_access(self: &Arc<Self>) -> Result<DenyWrite, KernelError> {
+        let c = &self.i_writecount;
+        let mut v = c.load(Ordering::Relaxed);
+        loop {
+            if v > 0 {
+                return Err(KernelError::TextBusy);
+            }
+            match c.compare_exchange_weak(v, v - 1, Ordering::AcqRel, Ordering::Relaxed) {
+                Ok(_) => return Ok(DenyWrite(self.clone())),
+                Err(now) => v = now,
+            }
+        }
+    }
+}
+
+impl Drop for InodeWrite {
+    fn drop(&mut self) {
+        self.0.i_writecount.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+impl DenyWrite {
+    /// The inode executed
+    pub fn inode(&self) -> &Arc<Inode> {
+        &self.0
+    }
+}
+
+/// fork's copy of the address space denies writes again
+impl Clone for DenyWrite {
+    fn clone(&self) -> Self {
+        self.0.i_writecount.fetch_sub(1, Ordering::AcqRel);
+        DenyWrite(self.0.clone())
+    }
+}
+
+impl Drop for DenyWrite {
+    fn drop(&mut self) {
+        self.0.i_writecount.fetch_add(1, Ordering::AcqRel);
+    }
+}
 
 impl Drop for Inode {
     fn drop(&mut self) {

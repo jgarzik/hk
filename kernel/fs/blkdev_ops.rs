@@ -67,6 +67,10 @@ fn write_at(file: &File, buf: &[u8], pos: u64) -> Result<usize, KernelError> {
     if b.ro() {
         return Err(KernelError::NotPermitted);
     }
+    // An active swap partition (Linux blkdev_write_iter: IS_SWAPFILE)
+    if b.bd_inode.i_swapfile.load(Ordering::Acquire) {
+        return Err(KernelError::TextBusy);
+    }
     if buf.is_empty() {
         return Ok(0);
     }

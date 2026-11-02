@@ -145,6 +145,16 @@ pub struct SwapInfo {
 }
 
 impl SwapInfo {
+    /// The inode writes to which are ETXTBSY while active (Linux
+    /// S_SWAPFILE): the swap file's, or the partition's bdev inode
+    pub fn swapfile_inode(&self) -> &Inode {
+        match (&self.inode, &self.bdev) {
+            (Some(i), _) => i,
+            (None, Some(b)) => &b.bd_inode,
+            (None, None) => unreachable!("a swap area has a backing"),
+        }
+    }
+
     fn new(
         backing: (
             Option<Arc<Inode>>,
@@ -532,6 +542,9 @@ fn swapon(path_ptr: u64, swap_flags: i32) -> Result<(), KernelError> {
         None => (Some(inode), None),
     };
     let si = SwapInfo::new(backing, path.into_bytes(), swap_type, max, priority)?;
+    si.swapfile_inode()
+        .i_swapfile
+        .store(true, Ordering::Release);
     SWAP_INFO.write()[swap_type as usize] = Some(Arc::new(si));
     TOTAL_SWAP_PAGES.fetch_add(max - 1, Ordering::Relaxed);
     Ok(())
@@ -565,6 +578,9 @@ fn swapoff(path_ptr: u64) -> Result<(), KernelError> {
         return Err(e);
     }
     SWAP_INFO.write()[t as usize] = None;
+    si.swapfile_inode()
+        .i_swapfile
+        .store(false, Ordering::Release);
     TOTAL_SWAP_PAGES.fetch_sub(si.max - 1, Ordering::Relaxed);
     super::swap_state::destroy_cache(&si);
     Ok(())

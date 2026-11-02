@@ -362,6 +362,8 @@ pub struct File {
     /// Write access to the file system while open for writing (Linux
     /// FMODE_WRITER): a read-only remount is EBUSY until it is released
     pub write_access: Option<super::superblock::WriteAccess>,
+    /// The inode's write access (Linux FMODE_WRITER's get_write_access)
+    pub i_write: Option<super::inode::InodeWrite>,
 
     /// Credentials of the opener (Linux file->f_cred): permission checks
     /// that must not be satisfied by whoever later uses the descriptor
@@ -406,6 +408,7 @@ impl File {
             owner_pid: AtomicI32::new(0),
             owner_sig: AtomicI32::new(0),
             write_access: None,
+            i_write: None,
             f_cred: crate::task::current_cred(),
             private: spin::Once::new(),
         }
@@ -626,6 +629,10 @@ impl File {
             Some(i) if i.mode().is_file() => i,
             _ => return self.write_chunks(len, at, flags, src),
         };
+        // An active swap file (Linux generic_write_checks: IS_SWAPFILE)
+        if inode.i_swapfile.load(Ordering::Acquire) {
+            return Err(KernelError::TextBusy);
+        }
         let append = append.unwrap_or(self.get_flags() & flags::O_APPEND != 0);
         inode.inode_lock();
         let r = (|| {

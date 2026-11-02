@@ -34,6 +34,15 @@ fn do_truncate(inode: &Arc<super::Inode>, length: u64) -> i64 {
         }
     }
 
+    // Write access first (Linux vfs_truncate / do_sys_ftruncate):
+    // ETXTBSY while the file runs or is an active swap area
+    if inode.i_swapfile.load(core::sync::atomic::Ordering::Acquire) {
+        return KernelError::TextBusy.sysret();
+    }
+    let _w = match inode.get_write_access() {
+        Ok(w) => w,
+        Err(e) => return e.sysret(),
+    };
     // Under i_rwsem, like Linux do_truncate: atomic with writes
     inode.inode_lock();
     let r = inode.i_op.truncate(inode, length);

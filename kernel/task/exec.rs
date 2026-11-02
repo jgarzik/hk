@@ -802,6 +802,12 @@ where
         Ok(r) => r,
         Err(e) => return -e,
     };
+    // No writer while it runs, and none now (Linux do_open_execat ->
+    // exe_file_deny_write_access): ETXTBSY if open for writing
+    let deny = match file.get_inode().map(|i| i.deny_write_access()).transpose() {
+        Ok(d) => d,
+        Err(e) => return e.sysret() as i32,
+    };
     // To the least loaded CPU while the footprint is small (Linux
     // bprm_execve -> sched_exec)
     percpu::sched_exec();
@@ -829,6 +835,17 @@ where
             Err(e) => return -e,
         },
         None => None,
+    };
+    // Denied while it loads (Linux open_exec of the interpreter,
+    // allowed again once it is loaded)
+    let _interp_deny = match interp_file
+        .as_ref()
+        .and_then(|f| f.get_inode())
+        .map(|i| i.deny_write_access())
+        .transpose()
+    {
+        Ok(d) => d,
+        Err(e) => return e.sysret() as i32,
     };
     let interp_image = match interp_file.as_deref().map(FileImage::new).transpose() {
         Ok(i) => i,
@@ -952,7 +969,7 @@ where
     {
         let mut m = mm.mmap_write();
         m.set_brk(start_brk);
-        m.set_exe(file.dentry.full_path());
+        m.set_exe(file.dentry.full_path(), deny);
         let code = image_layout(&elf, base_addr);
         m.set_args(MmLayout {
             start_code: code.start_code,

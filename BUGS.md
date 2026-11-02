@@ -52,9 +52,9 @@ Missing:
   (pages are reclaimed oldest first), synchronous writes, no kswapd; 2MB pages stay
   off the LRU (never reclaimed whole; a split puts their 4KB pages on
   it). Pages exec copies the image into are not on the reverse map
-  (never swapped). An active swap file can still be written,
-  truncated and mapped writable (Linux S_SWAPFILE: ETXTBSY; Phase E
-  ETXTBSY commit). Swap files go through their filesystem's swap_rw,
+  (never swapped). An active swap file can still be mapped writable
+  (Linux: no write access to an S_SWAPFILE inode). Swap files go
+  through their filesystem's swap_rw,
   a page at a time (walking the cluster chain each time; Linux maps
   the extents once at swapon). Page faults, swapoff, page-cache, heap
   and pipe allocations that may sleep reclaim directly; atomic heap
@@ -186,8 +186,7 @@ SIOCUNIXFILE, SO_PEERSEC (ENOPROTOOPT, as on Linux without an LSM).
 
 Missing: fs.protected_hardlinks/symlinks/fifos/regular do not exist
 (behave as their kernel default 0); no
-immutable/append-only inodes (no IS_APPEND/IS_IMMUTABLE EPERM);
-ETXTBSY is not enforced.
+immutable/append-only inodes (no IS_APPEND/IS_IMMUTABLE EPERM).
 
 ## Spinlocks where Linux uses sleeping locks
 
@@ -526,8 +525,8 @@ a reset register in PCI configuration space is ignored.
   registered decides the dynamic major (254 down, like Linux, but Linux
   usually has other dynamic majors registered first).
 - A mounted filesystem or active swap opens its block device, but not
-  exclusively: opening it O_EXCL, writes to a swap partition (Linux
-  ETXTBSY) and BLKBSZSET on a mounted partition are not refused.
+  exclusively: opening it O_EXCL and BLKBSZSET on a mounted partition
+  are not refused.
 
 ## Code-quality audit findings (2026-11-01), by phase
 

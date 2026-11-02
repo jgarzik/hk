@@ -11,6 +11,7 @@ pub mod errno_pass;
 pub mod cpu_acct;
 pub mod cpu_timers;
 pub mod anon_inode;
+pub mod etxtbsy;
 mod append;
 #[cfg(target_arch = "x86_64")]
 pub mod arch_gs;
@@ -198,6 +199,7 @@ pub fn run_all_tests() {
     groups::run_tests();
     fifo::run_tests();
     anon_inode::run_tests();
+    etxtbsy::run_tests();
     cpio_nodes::run_tests();
     signals::run_tests();
     sigmask::run_tests();
