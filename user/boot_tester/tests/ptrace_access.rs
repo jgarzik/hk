@@ -6,6 +6,10 @@
 //! PTRACE_ATTACH_OWN_GROUP: attaching to a thread of one's own thread
 //! group is EPERM (Linux ptrace_attach: same_thread_group), though the
 //! credentials would allow it
+//!
+//! KCMP_PIDFD_GETFD_PERM: kcmp (PTRACE_MODE_READ_REALCREDS on both) and
+//! pidfd_getfd (PTRACE_MODE_ATTACH_REALCREDS) of a root process are
+//! EPERM for nobody; kcmp of one's own process works
 
 use super::fork_mm::{join, spawn_thread};
 use super::helpers::{print, print_num, println};
@@ -29,6 +33,61 @@ pub fn run_tests() {
     report(b"PTRACE_ACCESS_NONDUMPABLE", in_prober(own_child, 0), 1);
     report(b"PTRACE_ACCESS_OTHER_UID", other_uid(), 1);
     report(b"PTRACE_ATTACH_OWN_GROUP", in_prober(own_group, 0), 0);
+    kcmp_pidfd_perm();
+}
+
+fn kcmp_pidfd_perm() {
+    use hk_syscall::{sys_getpid, sys_kcmp, sys_pidfd_getfd, sys_pidfd_open};
+    const KCMP_FILE: i32 = 0;
+    const KCMP_VM: i32 = 1;
+    let mut p = [0i32; 2];
+    sys_pipe2(p.as_mut_ptr(), 0);
+    // A root process that waits
+    let target = sys_fork();
+    if target == 0 {
+        sys_close(p[1] as u64);
+        let mut c = [0u8; 1];
+        sys_read(p[0] as u64, c.as_mut_ptr(), 1);
+        sys_exit(0);
+    }
+    let prober = sys_fork();
+    if prober == 0 {
+        if sys_setresuid(65534, 65534, 65534) != 0 {
+            sys_exit(1);
+        }
+        let me = sys_getpid() as u64;
+        let k = sys_kcmp(target as u64, me, KCMP_FILE, 0, 0);
+        let own = sys_kcmp(me, me, KCMP_VM, 0, 0);
+        let pfd = sys_pidfd_open(target as i32, 0);
+        let g = if pfd >= 0 {
+            sys_pidfd_getfd(pfd as i32, 0, 0)
+        } else {
+            -1000
+        };
+        sys_exit(if k != EPERM {
+            2
+        } else if own != 0 {
+            3
+        } else if g != EPERM {
+            4
+        } else {
+            0
+        });
+    }
+    let mut st = 0i32;
+    sys_wait4(prober, &mut st, 0, 0);
+    sys_close(p[1] as u64);
+    sys_close(p[0] as u64);
+    let mut t = 0i32;
+    sys_wait4(target, &mut t, 0, 0);
+    print(b"KCMP_PIDFD_GETFD_PERM");
+    if st == 0 {
+        println(b":OK");
+    } else {
+        print(b":FAIL status ");
+        print_num(st as i64);
+        println(b"");
+    }
 }
 
 static SIB_RESULT: AtomicI64 = AtomicI64::new(1);

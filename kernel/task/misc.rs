@@ -1342,8 +1342,10 @@ pub fn sys_pidfd_getfd(pidfd: i32, targetfd: i32, flags: u32) -> i64 {
         None => return KernelError::NoProcess.sysret(),
     };
 
-    // Permission check: CAP_SYS_PTRACE or same euid
-    if !check_pidfd_getfd_permission(target_tid) {
+    // Linux __pidfd_fget: under the target's exec_update_lock,
+    // ptrace_may_access(PTRACE_MODE_ATTACH_REALCREDS)
+    let _exec = crate::signal::ExecUpdateRead::lock(target_tid);
+    if !super::ptrace::may_access_tid(target_tid, false) {
         return KernelError::NotPermitted.sysret();
     }
 
@@ -1379,33 +1381,6 @@ pub fn sys_pidfd_getfd(pidfd: i32, targetfd: i32, flags: u32) -> i64 {
 fn find_task_by_pid(pid: super::Pid) -> Option<super::Tid> {
     let table = super::percpu::TASKLIST.read();
     table.get(pid).map(|t| t.task.tid())
-}
-
-/// Check permission for pidfd_getfd
-///
-/// Simplified PTRACE_MODE_ATTACH check:
-/// - Allow if caller has CAP_SYS_PTRACE
-/// - Allow if same effective UID
-fn check_pidfd_getfd_permission(target_tid: super::Tid) -> bool {
-    // CAP_SYS_PTRACE bypasses all checks
-    if super::capable(super::CAP_SYS_PTRACE) {
-        return true;
-    }
-
-    // Get caller credentials
-    let caller_cred = super::percpu::current_cred();
-
-    // Get target credentials from task table
-    let target_euid = {
-        let table = super::percpu::TASKLIST.read();
-        table.get(target_tid).map(|t| t.cred().euid)
-    };
-
-    // Same effective UID check
-    match target_euid {
-        Some(euid) => caller_cred.euid == euid,
-        None => false, // Target doesn't exist
-    }
 }
 
 // =============================================================================

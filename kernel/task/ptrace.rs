@@ -987,12 +987,19 @@ pub fn may_read_proc(pid: crate::task::Pid) -> bool {
 /// [`may_read_proc`] for task `tid` itself (tids are never reused): a
 /// caller that resolved a pid once checks the very task it then uses
 pub fn may_read_task(tid: Tid) -> bool {
+    may_access_tid(tid, true)
+}
+
+/// Linux ptrace_may_access for task `tid`: the caller's own thread
+/// group always, else [`may_access`] with its fsuid/fsgid (`fscreds`,
+/// PTRACE_MODE_*_FSCREDS) or its real ids (PTRACE_MODE_*_REALCREDS)
+pub fn may_access_tid(tid: Tid, fscreds: bool) -> bool {
     let me = percpu::current_pid();
     let own = TASKLIST
         .read()
         .iter()
         .any(|t| t.task.tid() == tid && t.task.pid == me);
-    own || may_access(|t| t.task.tid() == tid, true)
+    own || may_access(|t| t.task.tid() == tid, fscreds)
 }
 
 /// Linux __ptrace_may_access for the first task `pick` selects: the

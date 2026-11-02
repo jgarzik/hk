@@ -193,6 +193,12 @@ pub fn sys_kcmp(pid1: i32, pid2: i32, kcmp_type: i32, idx1: u64, idx2: u64) -> i
             (arc_key(&task1.sysvsem), arc_key(&task2.sysvsem)),
         )
     };
+    // Linux: ptrace_may_access(PTRACE_MODE_READ_REALCREDS) on both
+    if !crate::task::ptrace::may_access_tid(t1.tid(), false)
+        || !crate::task::ptrace::may_access_tid(t2.tid(), false)
+    {
+        return KernelError::NotPermitted.sysret();
+    }
 
     match kcmp_type {
         KCMP_FILE => {
