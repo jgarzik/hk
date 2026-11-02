@@ -15,6 +15,7 @@
 #![allow(dead_code)]
 
 use crate::arch::Uaccess;
+use crate::pod::IntoBytes;
 use crate::signal::{KSigInfo, SigAction, SigHandler, SigSet, sa_flags};
 use crate::uaccess::{UaccessArch, copy_from_user, copy_to_user};
 
@@ -98,7 +99,7 @@ crate::pod!(SigContext {
 ///
 /// Describes an alternate signal stack.
 #[repr(C)]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct StackT {
     /// Stack base address
     pub ss_sp: u64,
@@ -109,6 +110,12 @@ pub struct StackT {
     /// Stack size
     pub ss_size: u64,
 }
+crate::pod!(StackT {
+    ss_sp,
+    ss_flags,
+    _pad,
+    ss_size
+});
 
 /// Alternate stack is disabled
 pub const SS_DISABLE: i32 = 2;
@@ -123,7 +130,7 @@ pub const SS_ONSTACK: i32 = 1;
 ///
 /// This is the complete context saved for signal handling.
 #[repr(C)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct UContext {
     /// Context flags
     pub uc_flags: u64,
@@ -137,6 +144,13 @@ pub struct UContext {
     pub uc_sigmask: SigSet,
     // Extended FPU state would follow
 }
+crate::pod!(UContext {
+    uc_flags,
+    uc_link,
+    uc_stack,
+    uc_mcontext,
+    uc_sigmask
+});
 
 impl Default for UContext {
     fn default() -> Self {
@@ -158,7 +172,7 @@ impl Default for UContext {
 ///
 /// Contains information about why a signal was raised.
 #[repr(C)]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct SigInfo {
     /// Signal number
     pub si_signo: i32,
@@ -171,6 +185,13 @@ pub struct SigInfo {
     /// Union of signal-specific fields
     pub _fields: [u64; 14],
 }
+crate::pod!(SigInfo {
+    si_signo,
+    si_errno,
+    si_code,
+    _pad,
+    _fields
+});
 
 /// Signal sent by kill/sigsend/raise
 pub const SI_USER: i32 = 0;
@@ -195,6 +216,7 @@ pub const SI_MESGQ: i32 = -3;
 /// when delivering a signal. The pretcode field serves as the return
 /// address, pointing to the signal trampoline that calls rt_sigreturn.
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct RtSigFrame {
     /// Return address (points to restorer trampoline)
     /// When handler does `ret`, it returns here
@@ -205,6 +227,7 @@ pub struct RtSigFrame {
     pub info: SigInfo,
     // The FP image (sigcontext.fpstate) lives above the frame, 64-aligned
 }
+crate::pod!(RtSigFrame { pretcode, uc, info });
 
 // Layouts match Linux (arch/x86/include/uapi/asm/sigcontext.h, ucontext.h,
 // asm-generic siginfo, rt_sigframe) and every byte is a named field: the
@@ -399,11 +422,7 @@ pub fn setup_rt_frame(
     };
 
     // Copy frame to user stack
-    let frame_bytes = unsafe {
-        core::slice::from_raw_parts(&frame as *const RtSigFrame as *const u8, frame_size)
-    };
-
-    if copy_to_user::<Uaccess>(frame_addr, frame_bytes).is_err() {
+    if copy_to_user::<Uaccess>(frame_addr, &frame.as_bytes()[..frame_size]).is_err() {
         return Err(-14); // EFAULT
     }
 
@@ -501,14 +520,10 @@ pub fn sys_rt_sigreturn() -> i64 {
         return crate::signal::sigreturn_badframe();
     }
 
-    // Read UContext from user stack
-    let mut uc_bytes = [0u8; core::mem::size_of::<UContext>()];
-    if copy_from_user::<Uaccess>(&mut uc_bytes, uc_addr, uc_size).is_err() {
+    // Read UContext from user stack (any alignment: copied as bytes)
+    let Ok(uc) = crate::uaccess::copy_val_from_user::<Uaccess, UContext>(uc_addr) else {
         return crate::signal::sigreturn_badframe();
-    }
-
-    // Safety: UContext is repr(C) and we read the correct size
-    let uc: UContext = unsafe { core::ptr::read(uc_bytes.as_ptr() as *const UContext) };
+    };
     let sc = &uc.uc_mcontext;
 
     // Any RIP is taken, as by Linux restore_sigcontext: a non-canonical

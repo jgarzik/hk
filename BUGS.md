@@ -5,8 +5,6 @@
 These are safe fns or patterns whose use leads to undefined behaviour.
 None is known to fail today, but each is a soundness bug:
 
-- **Signals:** x86 `rt_sigreturn` reads `UContext` from a byte array
-  without regard to alignment.
 - **Task setters:** `exit_task_fd`, the fs/ns setters and `exit_task_mm`
   are safe fns, yet they take any tid and replace another task's
   pointers without a lock.
