@@ -37,7 +37,8 @@ pub struct Shmem {
 /// A zeroed frame of user memory
 fn zeroed() -> Option<u64> {
     let f = super::fault::alloc_user()?;
-    super::page::clear_page(f);
+    // SAFETY: a fresh frame, ours alone
+    unsafe { super::page::clear_page(f) };
     Some(f)
 }
 
@@ -89,7 +90,9 @@ impl Shmem {
                 root.erase(i);
                 FRAME_ALLOCATOR.decref(e);
             } else {
-                super::page::clear_page(e);
+                // SAFETY: a page of the object, under `root`; the zeroing
+                // races user writes through mappings as on Linux
+                unsafe { super::page::clear_page(e) };
             }
             at = i + 1;
         }

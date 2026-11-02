@@ -395,7 +395,8 @@ pub fn swap_read_page(entry: SwapEntry, frame_phys: u64) -> Result<(), i64> {
         inode
             .i_data
             .aops()
-            .swap_rw(inode, off, frame_bytes(frame_phys), false)
+            // SAFETY: the locked swap-cache page being filled
+            .swap_rw(inode, off, unsafe { frame_bytes(frame_phys) }, false)
             .map_err(|_| KernelError::Io.sysret())
     } else if let Some(ref bdev) = si.bdev {
         bdev_rw_frame(bdev, BioOp::Read, off * SECTORS_PER_PAGE, frame_phys).map_err(|e| e.sysret())
@@ -428,7 +429,8 @@ fn write_page(entry: SwapEntry, frame_phys: u64) -> Result<(), i64> {
         inode
             .i_data
             .aops()
-            .swap_rw(inode, off, frame_bytes(frame_phys), true)
+            // SAFETY: the locked swap-cache page being written
+            .swap_rw(inode, off, unsafe { frame_bytes(frame_phys) }, true)
             .map_err(|_| KernelError::Io.sysret())
     } else if let Some(ref bdev) = si.bdev {
         bdev_rw_frame(bdev, BioOp::Write, off * SECTORS_PER_PAGE, frame_phys)

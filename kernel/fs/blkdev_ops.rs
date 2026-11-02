@@ -149,7 +149,9 @@ pub fn bdev_write_meta(b: &BlockDevice, pos: u64, buf: &[u8]) -> Result<(), Kern
             return Err(e);
         }
         // The locked, uptodate page with our reference
-        crate::mm::page::frame_bytes(phys)[off..off + n].copy_from_slice(&buf[done..done + n]);
+        // SAFETY: the locked page with our reference
+        let bytes = unsafe { crate::mm::page::frame_bytes(phys) };
+        bytes[off..off + n].copy_from_slice(&buf[done..done + n]);
         let bits: u64 = (off / 512..(off + n).div_ceil(512)).fold(0, |a, s| a | 1 << s);
         page_struct(phys)?.private.fetch_or(bits, Ordering::Relaxed);
         // Not through the aops: they mark the whole page
@@ -192,7 +194,8 @@ impl Aops for BdevAops {
         // Just the dirty sectors, in runs rounded out to logical blocks
         let lbs = (b.logical_block_size() as usize / 512).clamp(1, SECTORS);
         // The locked page with our reference
-        let page = crate::mm::page::frame_bytes(phys);
+        // SAFETY: the locked page with our reference
+        let page = unsafe { crate::mm::page::frame_bytes(phys) };
         let base = index * PAGE_SIZE as u64;
         let mut s = 0;
         while s < SECTORS {

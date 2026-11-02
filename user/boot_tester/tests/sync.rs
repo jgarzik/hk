@@ -161,13 +161,22 @@ fn test_dirty_sysctls() {
     if ok {
         println(b"VM_DIRTY_SYSCTLS:OK");
     } else {
-        print(b"VM_DIRTY_SYSCTLS:FAIL ");
+        // Each step's values: defaults, after dirty_bytes, after the ratio
+        print(b"VM_DIRTY_SYSCTLS:FAIL ratio,bg=");
         print_num(r0);
-        print(b" ");
+        print(b",");
         print_num(b0);
-        print(b" ");
+        print(b" after-bytes w,ratio,bytes=");
+        print_num(w1);
+        print(b",");
         print_num(r1);
-        print(b" ");
+        print(b",");
+        print_num(y1);
+        print(b" after-ratio w,ratio,bytes=");
+        print_num(w2);
+        print(b",");
+        print_num(r2);
+        print(b",");
         print_num(y2);
         println(b"");
     }

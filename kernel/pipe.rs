@@ -91,10 +91,15 @@ impl PipePage {
         Self { frame }
     }
 
-    /// Its bytes; written only by the pipe holding `Pipe.inner` while no
-    /// other buffer shares the page (CAN_MERGE), read under it
-    pub fn bytes(&self) -> &mut [u8] {
-        crate::mm::page::frame_bytes(self.frame)
+    /// Its bytes
+    ///
+    /// # Safety
+    /// Under the pipe's `Pipe.inner`; written only while no other buffer
+    /// shares the page (CAN_MERGE).
+    #[allow(clippy::mut_from_ref)]
+    pub unsafe fn bytes(&self) -> &mut [u8] {
+        // SAFETY: the page's own frame; the caller's contract
+        unsafe { crate::mm::page::frame_bytes(self.frame) }
     }
 }
 
@@ -325,7 +330,9 @@ impl PipeInner {
                 // Get page frame and write data
                 if let Some(ref page) = buf.page {
                     let offset = (buf.offset + buf.len) as usize;
-                    page.bytes()[offset..offset + to_write].copy_from_slice(&data[..to_write]);
+                    // SAFETY: under Pipe.inner, an unshared CAN_MERGE page
+                    let bytes = unsafe { page.bytes() };
+                    bytes[offset..offset + to_write].copy_from_slice(&data[..to_write]);
                     buf.len += to_write as u32;
                     self.total_len += to_write;
                     written += to_write;
@@ -345,7 +352,9 @@ impl PipeInner {
             let to_write = remaining.min(PAGE_SIZE);
 
             // Copy data to the new page
-            page.bytes()[..to_write].copy_from_slice(&data[written..written + to_write]);
+            // SAFETY: a page just allocated for this buffer, under Pipe.inner
+            let bytes = unsafe { page.bytes() };
+            bytes[..to_write].copy_from_slice(&data[written..written + to_write]);
 
             // Create buffer with OWNED and CAN_MERGE flags
             let buf = PipeBuffer::new(
@@ -392,7 +401,9 @@ impl PipeInner {
             // Copy data from page to user buffer
             if let Some(ref page) = pipe_buf.page {
                 let off = pipe_buf.offset as usize;
-                buf[read..read + to_read].copy_from_slice(&page.bytes()[off..off + to_read]);
+                // SAFETY: read under Pipe.inner
+                buf[read..read + to_read]
+                    .copy_from_slice(&unsafe { page.bytes() }[off..off + to_read]);
 
                 pipe_buf.offset += to_read as u32;
                 pipe_buf.len -= to_read as u32;

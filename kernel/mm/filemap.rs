@@ -253,8 +253,9 @@ pub fn set_uptodate(phys: u64) {
 /// Zero the page from byte `from` to its end
 pub fn zero_page(phys: u64, from: usize) {
     if from < PAGE_SIZE {
-        // The caller owns it: locked or not yet visible
-        frame_bytes(phys)[from..].fill(0);
+        // SAFETY: the caller owns it (locked or not yet visible)
+        let bytes = unsafe { frame_bytes(phys) };
+        bytes[from..].fill(0);
     }
 }
 
@@ -718,7 +719,10 @@ pub fn read(inode: &Inode, buf: &mut [u8], pos: u64) -> Result<usize, KernelErro
             .min(buf.len() - done)
             .min(size.saturating_sub(at) as usize);
         // An uptodate page with our reference
-        buf[done..done + n].copy_from_slice(&frame_bytes(phys)[off..off + n]);
+        // SAFETY: an uptodate page with our reference; writers hold its
+        // lock, a racing one gives torn data as on Linux, never UB here
+        // beyond the byte copy
+        buf[done..done + n].copy_from_slice(&unsafe { frame_bytes(phys) }[off..off + n]);
         put_page(phys);
         if n == 0 {
             break;
@@ -744,7 +748,9 @@ pub fn perform_write(inode: &Inode, buf: &[u8], pos: u64) -> Result<usize, Kerne
             Err(e) => return Err(e),
         };
         // The locked page with our reference
-        frame_bytes(phys)[off..off + n].copy_from_slice(&buf[done..done + n]);
+        // SAFETY: the locked page with our reference
+        let bytes = unsafe { frame_bytes(phys) };
+        bytes[off..off + n].copy_from_slice(&buf[done..done + n]);
         done += a.write_end(inode, at, n, phys);
     }
     Ok(done)

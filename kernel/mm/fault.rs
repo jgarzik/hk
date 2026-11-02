@@ -363,7 +363,8 @@ fn fault_page(addr: u64, area: &Area, access: Access) -> Result<(u64, bool, bool
         return r;
     }
     let frame = alloc_user().ok_or(VmFault::Oom)?;
-    let buf = super::page::frame_bytes(frame);
+    // SAFETY: a fresh frame, ours alone
+    let buf = unsafe { super::page::frame_bytes(frame) };
     buf.fill(0);
     let file = matches!((area.anon, &area.file), (false, Some(_)));
     if let (false, Some(f)) = (area.anon, &area.file) {
@@ -414,7 +415,8 @@ fn file_page(
     let copy = alloc_user();
     if let Some(new) = copy {
         // The cache page is locked and referenced, the new one ours
-        super::page::copy_page(new, page);
+        // SAFETY: the new frame is ours; the cache page is locked
+        unsafe { super::page::copy_page(new, page) };
         paging::sync_page(new, exec);
     }
     super::page::unlock_page(page);
@@ -605,7 +607,8 @@ fn wp_locked(
     }
     let new = spare.take().or_else(alloc_user).ok_or(VmFault::Retry)?;
     // `old` stays mapped (and referenced) until the PTE is switched
-    super::page::copy_page(new, old);
+    // SAFETY: the new frame is ours; `old` stays mapped and referenced
+    unsafe { super::page::copy_page(new, old) };
     paging::sync_page(new, paging::pte_exec(pte));
     let entry = paging::pte_mkwrite((pte & !paging::PTE_ADDR_MASK) | new);
     if !replace_pte(mm, ptep, pte, entry, addr) {

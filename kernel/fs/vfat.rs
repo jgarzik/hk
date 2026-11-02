@@ -101,7 +101,8 @@ fn page_io(
 impl Aops for VfatAops {
     fn read_folio(&self, inode: &Inode, phys: u64, index: u64) -> Result<(), KernelError> {
         let (bdev, runs) = page_runs(inode, index)?;
-        let page = frame_bytes(phys);
+        // SAFETY: the locked page being filled, ours alone
+        let page = unsafe { frame_bytes(phys) };
         page.fill(0);
         page_io(&bdev, BioOp::Read, page, &runs)?;
         filemap::set_uptodate(phys);
@@ -132,7 +133,8 @@ impl Aops for VfatAops {
 
     fn writepage(&self, inode: &Inode, phys: u64, index: u64) -> Result<(), KernelError> {
         let (bdev, runs) = page_runs(inode, index)?;
-        page_io(&bdev, BioOp::Write, frame_bytes(phys), &runs)
+        // SAFETY: the locked page with our reference
+        page_io(&bdev, BioOp::Write, unsafe { frame_bytes(phys) }, &runs)
     }
 }
 
