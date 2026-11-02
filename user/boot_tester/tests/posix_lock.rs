@@ -50,6 +50,7 @@ pub fn run_tests() {
     test_setlk_ebadf();
     test_lock_exec();
     test_lock_close_any();
+    test_blocking();
 }
 
 /// Test F_SETLK with F_WRLCK (write lock) and F_UNLCK
@@ -345,4 +346,120 @@ fn test_lock_close_any() {
         print_num(ty as i64);
         println(b"");
     }
+}
+
+fn now_ms() -> i64 {
+    let mut ts = hk_syscall::Timespec { tv_sec: 0, tv_nsec: 0 };
+    hk_syscall::sys_clock_gettime(1, &mut ts);
+    ts.tv_sec * 1000 + ts.tv_nsec / 1_000_000
+}
+
+fn sleep_ms(ms: i64) {
+    let ts = hk_syscall::Timespec { tv_sec: 0, tv_nsec: ms * 1_000_000 };
+    hk_syscall::sys_nanosleep(&ts, core::ptr::null_mut());
+}
+
+fn wrlck(fd: i32, cmd: i32, start: i64) -> i64 {
+    let mut fl = Flock {
+        l_type: F_WRLCK,
+        l_whence: SEEK_SET,
+        l_start: start,
+        l_len: 1,
+        l_pid: 0,
+    };
+    sys_fcntl(fd, cmd, &mut fl as *mut Flock as u64)
+}
+
+fn verdict(name: &[u8], ok: bool, a: i64, b: i64) {
+    print(name);
+    if ok {
+        println(b":OK");
+    } else {
+        print(b":FAIL ");
+        print_num(a);
+        print(b" ");
+        print_num(b);
+        println(b"");
+    }
+}
+
+/// Blocking locks wait for the holder (Linux flock_lock_inode_wait,
+/// F_SETLKW): a child holds the lock 200 ms; the parent's blocking
+/// request returns 0 only after the child lets go. Two processes each
+/// holding a byte and waiting for the other's: EDEADLK for the second.
+fn test_blocking() {
+    use hk_syscall::{sys_exit, sys_flock, sys_fork, sys_wait4};
+    const LOCK_EX: i32 = 2;
+    const LOCK_UN: i32 = 8;
+    let path = b"/tmp/posix_block_test\0";
+    let fd = sys_open(path.as_ptr(), O_CREAT | O_RDWR | O_TRUNC, 0o644) as i32;
+    sys_write(fd as u64, b"0123456789".as_ptr(), 10);
+
+    // flock: child takes LOCK_EX on its own open, holds 200 ms
+    let pid = sys_fork();
+    if pid == 0 {
+        let c = sys_open(path.as_ptr(), O_RDWR, 0) as i32;
+        sys_flock(c, LOCK_EX);
+        sleep_ms(200);
+        sys_flock(c, LOCK_UN);
+        sys_exit(0);
+    }
+    sleep_ms(50);
+    let t0 = now_ms();
+    let r = sys_flock(fd, LOCK_EX);
+    let waited = now_ms() - t0;
+    sys_flock(fd, LOCK_UN);
+    let mut st = 0i32;
+    sys_wait4(pid, &mut st, 0, 0);
+    verdict(b"FLOCK_BLOCK", r == 0 && waited >= 100, r, waited);
+
+    // F_SETLKW: the same with a byte-range lock
+    let pid = sys_fork();
+    if pid == 0 {
+        wrlck(fd, F_SETLK, 0);
+        sleep_ms(200);
+        sys_exit(0);
+    }
+    sleep_ms(50);
+    let t0 = now_ms();
+    let r = wrlck(fd, F_SETLKW, 0);
+    let waited = now_ms() - t0;
+    sys_wait4(pid, &mut st, 0, 0);
+    verdict(b"SETLKW_BLOCK", r == 0 && waited >= 100, r, waited);
+    let mut un = Flock {
+        l_type: F_UNLCK,
+        l_whence: SEEK_SET,
+        l_start: 0,
+        l_len: 0,
+        l_pid: 0,
+    };
+    sys_fcntl(fd, F_SETLK, &mut un as *mut Flock as u64);
+
+    // Deadlock: parent holds byte 0, child byte 1; each then waits for
+    // the other's: whichever request closes the cycle is EDEADLK (Linux
+    // posix_locks_deadlock), the other gets its lock once that one gives
+    // up (the child exits, releasing byte 1)
+    wrlck(fd, F_SETLK, 0);
+    let mut p = [0i32; 2];
+    hk_syscall::sys_pipe2(p.as_mut_ptr(), 0);
+    let pid = sys_fork();
+    if pid == 0 {
+        wrlck(fd, F_SETLK, 1);
+        sys_write(p[1] as u64, b"x".as_ptr(), 1);
+        let r = wrlck(fd, F_SETLKW, 0);
+        sys_exit(if r == 0 { 0 } else { (-r) as u64 });
+    }
+    let mut b = [0u8; 1];
+    hk_syscall::sys_read(p[0] as u64, b.as_mut_ptr(), 1);
+    sleep_ms(100);
+    let dl = wrlck(fd, F_SETLKW, 1);
+    sys_fcntl(fd, F_SETLK, &mut un as *mut Flock as u64);
+    sys_wait4(pid, &mut st, 0, 0);
+    sys_close(p[0] as u64);
+    sys_close(p[1] as u64);
+    sys_close(fd as u64);
+    hk_syscall::sys_unlink(path.as_ptr());
+    let child = (st >> 8) & 0xff;
+    let ok = (dl == -35 && child == 0) || (dl == 0 && child == 35);
+    verdict(b"SETLKW_EDEADLK", ok, dl, child as i64);
 }

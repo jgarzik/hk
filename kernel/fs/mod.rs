@@ -27,6 +27,7 @@ pub mod icache;
 pub mod io;
 pub mod iov;
 pub mod link;
+pub mod locks;
 pub mod misc;
 pub mod nav;
 pub mod open;

@@ -127,17 +127,15 @@ which has no control queue: QEMU then delivers all frames).
 PACKET_AUXDATA reports TP_STATUS_CSUM_VALID only for frames received on
 lo (hk has no checksum offload states).
 
-## File lock gaps (Phase E)
+## File lock gaps
 
-**Location**: `kernel/fs/flock.rs`, `kernel/fs/posix_lock.rs`
+**Location**: `kernel/fs/locks.rs`, `kernel/fs/posix_lock.rs`
 
-Blocking flock and fcntl F_SETLKW / F_OFD_SETLKW never wait: a
-conflicting lock is EAGAIN (Linux sleeps, interruptibly, with deadlock
-detection for POSIX locks: EDEADLK). The tables are global and keyed
-by raw dentry / inode pointers with no reference held (an inode freed
-and reused, once Phase E's icache evicts, inherits stale locks); POSIX
-lock owners are pids, not the files_struct (Linux fl_owner). Linux
-keeps them per inode (i_flctx: flock, posix and lease lists).
+POSIX lock owners are pids, not the files_struct (Linux fl_owner):
+threads of one process share them, but a CLONE_FILES child that is
+another process has its own (Linux: one owner), and a process's locks
+are released at its exit through a list of the inodes with POSIX
+locks. No leases (F_SETLEASE) and no OFD locks (F_OFD_*).
 
 ## seccomp gaps
 
@@ -572,7 +570,7 @@ sched pid 0, flock/POSIX release, signalfd reader, errno flattening.
   arch), 32 direct `arch::x86_64::`/`aarch64::` references, three
   `CurrentArch` redefinitions.
 - **Globals where per-CPU fits** (I/C/E): TCP timers in one map run on
-  softnet/0 only; CHILD_EXIT_WQ; the file lock tables.
+  softnet/0 only; CHILD_EXIT_WQ.
 - **ID allocators** (J): PidMap, fdbits, IPC ids, and plain counters
   (bpf, keys, mqueue, posix timers, which wrap with no collision
   check): one IDR/IDA.

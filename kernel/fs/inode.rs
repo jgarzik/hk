@@ -488,6 +488,9 @@ pub struct Inode {
     /// ETXTBSY
     pub i_swapfile: core::sync::atomic::AtomicBool,
 
+    /// Its flock and POSIX locks (Linux i_flctx; `fs::locks`)
+    pub i_flctx: super::locks::FileLockCtx,
+
     /// The inode cache key it is hashed under (`fs::icache`)
     pub(super) i_hash: AtomicU64,
     /// Hashed in the inode cache (Linux !inode_unhashed)
@@ -533,6 +536,7 @@ impl Inode {
             i_dirty: core::sync::atomic::AtomicBool::new(false),
             i_writecount: core::sync::atomic::AtomicI32::new(0),
             i_swapfile: core::sync::atomic::AtomicBool::new(false),
+            i_flctx: super::locks::FileLockCtx::new(),
         }
     }
 
@@ -575,6 +579,7 @@ impl Inode {
             i_dirty: core::sync::atomic::AtomicBool::new(false),
             i_writecount: core::sync::atomic::AtomicI32::new(0),
             i_swapfile: core::sync::atomic::AtomicBool::new(false),
+            i_flctx: super::locks::FileLockCtx::new(),
         }
     }
 

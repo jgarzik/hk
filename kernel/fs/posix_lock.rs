@@ -13,14 +13,12 @@
 //! - Locks are NOT inherited across fork() but ARE released on exec()
 //! - Length 0 means "to end of file" (EOF lock)
 
-use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::error::KernelError;
 use crate::fs::file::seek;
 use crate::fs::{File, Inode};
-use crate::sync::spin::Mutex;
 use crate::task::percpu::current_pid;
 
 // =============================================================================
@@ -136,7 +134,7 @@ impl PosixLock {
 
 /// Locks held on a single inode
 #[derive(Default)]
-struct InodeLocks {
+pub struct InodeLocks {
     locks: Vec<PosixLock>,
 }
 
@@ -283,25 +281,11 @@ impl InodeLocks {
         }
         self.locks = merged;
     }
-
-    fn is_empty(&self) -> bool {
-        self.locks.is_empty()
-    }
 }
 
 // =============================================================================
 // Global Lock Registry
 // =============================================================================
-
-/// Key for the global lock table - uses inode pointer for uniqueness
-type InodeKey = u64;
-
-/// Global POSIX lock registry
-static POSIX_LOCKS: Mutex<BTreeMap<InodeKey, InodeLocks>> = Mutex::new(BTreeMap::new());
-
-fn inode_key(inode: &Arc<Inode>) -> InodeKey {
-    Arc::as_ptr(inode) as u64
-}
 
 // =============================================================================
 // Range Resolution
@@ -359,29 +343,56 @@ pub fn posix_getlk(file: &File, flock: &mut Flock) -> Result<(), KernelError> {
     let (start, end) = resolve_range(flock, file)?;
     let lock_type = PosixLockType::from_flock(flock.l_type).ok_or(KernelError::InvalidArgument)?;
     let pid = current_pid();
+    let conflict = inode.i_flctx.with(|l| {
+        let c = l.posix.find_conflict(start, end, lock_type, pid).cloned();
+        (c, false)
+    });
+    match conflict {
+        Some(c) => {
+            flock.l_type = c.lock_type.to_flock();
+            flock.l_whence = 0; // SEEK_SET
+            flock.l_start = c.start as i64;
+            flock.l_len = if c.end == u64::MAX {
+                0
+            } else {
+                (c.end - c.start) as i64
+            };
+            flock.l_pid = c.owner as i32;
+        }
+        None => flock.l_type = F_UNLCK,
+    }
+    Ok(())
+}
 
-    let locks = POSIX_LOCKS.lock();
-    let key = inode_key(&inode);
-
-    if let Some(inode_locks) = locks.get(&key)
-        && let Some(conflict) = inode_locks.find_conflict(start, end, lock_type, pid)
-    {
-        // Return info about conflicting lock
-        flock.l_type = conflict.lock_type.to_flock();
-        flock.l_whence = 0; // SEEK_SET
-        flock.l_start = conflict.start as i64;
-        flock.l_len = if conflict.end == u64::MAX {
-            0
-        } else {
-            (conflict.end - conflict.start) as i64
-        };
-        flock.l_pid = conflict.owner as i32;
+/// Set (or with F_UNLCK clear) the caller's lock on [start, end) of
+/// `inode`: Err(WouldBlock) on a conflict, with its owner
+fn set(
+    inode: &Arc<Inode>,
+    (start, end): (u64, u64),
+    l_type: i16,
+) -> Result<(), (KernelError, Option<u64>)> {
+    let pid = current_pid();
+    if l_type == F_UNLCK {
+        inode.i_flctx.with(|l| {
+            l.posix.unlock_range(pid, start, end);
+            ((), true)
+        });
         return Ok(());
     }
-
-    // No conflict - lock would succeed
-    flock.l_type = F_UNLCK;
-    Ok(())
+    let lock_type =
+        PosixLockType::from_flock(l_type).ok_or((KernelError::InvalidArgument, None))?;
+    super::locks::note_posix_inode(inode);
+    inode.i_flctx.with(|l| {
+        let r = l.posix.try_lock(pid, start, end, lock_type).map_err(|e| {
+            let owner = l
+                .posix
+                .find_conflict(start, end, lock_type, pid)
+                .map(|c| c.owner);
+            (e, owner)
+        });
+        // A lock replacing or splitting one of ours may release a range
+        (r, true)
+    })
 }
 
 /// F_SETLK - set/clear lock (non-blocking): the absolute range it
@@ -391,46 +402,41 @@ pub fn posix_getlk(file: &File, flock: &mut Flock) -> Result<(), KernelError> {
 /// cannot be acquired due to a conflict.
 pub fn posix_setlk(file: &File, flock: &Flock) -> Result<(u64, u64), KernelError> {
     let inode = file.get_inode().ok_or(KernelError::BadFd)?;
-    let (start, end) = resolve_range(flock, file)?;
-    if flock.l_type == F_UNLCK {
-        unlock(&inode, start, end);
-        return Ok((start, end));
-    }
-    let lock_type = PosixLockType::from_flock(flock.l_type).ok_or(KernelError::InvalidArgument)?;
-    let mut locks = POSIX_LOCKS.lock();
-    let inode_locks = locks.entry(inode_key(&inode)).or_default();
-    inode_locks.try_lock(current_pid(), start, end, lock_type)?;
-    Ok((start, end))
+    let range = resolve_range(flock, file)?;
+    set(&inode, range, flock.l_type).map_err(|(e, _)| e)?;
+    Ok(range)
 }
 
 /// Unlock the current process's locks on `file` over `[start, end)`,
 /// a range already resolved (Linux fcntl_setlk's F_UNLCK retry reuses
 /// the resolved file_lock: offset or size changes don't move it)
-pub fn posix_unlock(file: &File, (start, end): (u64, u64)) {
+pub fn posix_unlock(file: &File, range: (u64, u64)) {
     if let Some(inode) = file.get_inode() {
-        unlock(&inode, start, end);
+        let _ = set(&inode, range, F_UNLCK);
     }
 }
 
-fn unlock(inode: &Arc<Inode>, start: u64, end: u64) {
-    let key = inode_key(inode);
-    let mut locks = POSIX_LOCKS.lock();
-    if let Some(inode_locks) = locks.get_mut(&key) {
-        inode_locks.unlock_range(current_pid(), start, end);
-        if inode_locks.is_empty() {
-            locks.remove(&key);
+/// F_SETLKW - set/clear lock, waiting while it conflicts (Linux
+/// fcntl_setlk with F_SETLKW: locks_insert_block, posix_locks_deadlock):
+/// EDEADLK if the owner it would wait on waits, through a chain, on the
+/// caller; EINTR if a signal ends the wait
+pub fn posix_setlkw(file: &File, flock: &Flock) -> Result<(u64, u64), KernelError> {
+    let inode = file.get_inode().ok_or(KernelError::BadFd)?;
+    let range = resolve_range(flock, file)?;
+    let me = current_pid();
+    loop {
+        let g = inode.i_flctx.generation();
+        match set(&inode, range, flock.l_type) {
+            Ok(()) => return Ok(range),
+            Err((KernelError::WouldBlock, Some(blocker))) => {
+                super::locks::block_on(me, blocker)?;
+                let r = inode.i_flctx.wait_change(g);
+                super::locks::unblock(me);
+                r?;
+            }
+            Err((e, _)) => return Err(e),
         }
     }
-}
-
-/// F_SETLKW - set/clear lock (blocking)
-///
-/// Like F_SETLK, but waits for the lock to become available.
-/// Note: We don't implement actual blocking - returns EAGAIN like flock() does.
-pub fn posix_setlkw(file: &File, flock: &Flock) -> Result<(u64, u64), KernelError> {
-    // For now, just call setlk - we don't implement actual blocking
-    // A real implementation would sleep and retry
-    posix_setlk(file, flock)
 }
 
 /// Release all POSIX locks held by current process on a file
@@ -438,30 +444,21 @@ pub fn posix_setlkw(file: &File, flock: &Flock) -> Result<(u64, u64), KernelErro
 /// Called when any fd to file is closed. POSIX semantics require
 /// releasing ALL locks when ANY fd to the file is closed.
 pub fn release_posix_locks_on_close(file: &File) {
-    let inode = match file.get_inode() {
-        Some(i) => i,
-        None => return,
-    };
-
-    let pid = current_pid();
-    let key = inode_key(&inode);
-
-    let mut locks = POSIX_LOCKS.lock();
-    if let Some(inode_locks) = locks.get_mut(&key) {
-        inode_locks.remove_all_for_pid(pid);
-        if inode_locks.is_empty() {
-            locks.remove(&key);
-        }
+    if let Some(inode) = file.get_inode() {
+        let pid = current_pid();
+        inode.i_flctx.with(|l| {
+            l.posix.remove_all_for_pid(pid);
+            ((), true)
+        });
     }
 }
 
-/// Release all POSIX locks held by a process
-///
-/// Called during execve to release all locks (POSIX semantics).
+/// Release all POSIX locks held by a process (at its exit)
 pub fn release_all_posix_locks_for_pid(pid: u64) {
-    let mut locks = POSIX_LOCKS.lock();
-    locks.retain(|_, inode_locks| {
-        inode_locks.remove_all_for_pid(pid);
-        !inode_locks.is_empty()
-    });
+    for inode in super::locks::posix_inodes() {
+        inode.i_flctx.with(|l| {
+            l.posix.remove_all_for_pid(pid);
+            ((), true)
+        });
+    }
 }
