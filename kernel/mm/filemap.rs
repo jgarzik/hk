@@ -309,6 +309,7 @@ pub fn remove(m: &AddressSpace, phys: u64) {
     }
     pg.flags
         .fetch_and(!(PG_DIRTY | PG_UPTODATE), Ordering::Relaxed);
+    pg.private.store(0, Ordering::Relaxed);
     m.nrpages.fetch_sub(1, Ordering::Relaxed);
     put_page(phys);
 }
@@ -345,6 +346,7 @@ fn truncate_final(m: &AddressSpace) {
         pg.mapping.store(0, Ordering::Release);
         pg.flags
             .fetch_and(!(PG_DIRTY | PG_UPTODATE), Ordering::Relaxed);
+        pg.private.store(0, Ordering::Relaxed);
         put_page(phys);
     });
     m.nrpages.store(0, Ordering::Relaxed);
@@ -403,6 +405,45 @@ pub fn write_and_wait(inode: &Inode) -> Result<(), KernelError> {
             None => return err,
         }
     }
+}
+
+/// Write back and drop the pages holding bytes [start, end) of `inode`
+/// (Linux clean_bdev_aliases on the device's cache): a dirty page is
+/// written first, since it may hold other blocks too
+pub fn invalidate_range(inode: &Inode, start: u64, end: u64) -> Result<(), KernelError> {
+    let m = &inode.i_data;
+    let (first, last) = (start / PAGE_SIZE as u64, end.div_ceil(PAGE_SIZE as u64));
+    let mut at = first;
+    while at < last {
+        let next = {
+            let pages = m.i_pages.lock();
+            pages
+                .find(at, last - 1, None)
+                .filter(|&(_, p)| FRAME_ALLOCATOR.incref(p))
+        };
+        let Some((index, phys)) = next else {
+            return Ok(());
+        };
+        lock_page(phys);
+        let pg = page(phys);
+        let mut r = Ok(());
+        if pg.mapping.load(Ordering::Acquire) == m.key() {
+            if pg.flags.fetch_and(!PG_DIRTY, Ordering::AcqRel) & PG_DIRTY != 0 {
+                m.i_pages.lock().clear_mark(index, MARK_DIRTY);
+                r = m.aops().writepage(inode, phys, index);
+            }
+            if r.is_ok() {
+                remove(m, phys);
+            } else {
+                dirty_page(m, phys);
+            }
+        }
+        unlock_page(phys);
+        put_page(phys);
+        r?;
+        at = index + 1;
+    }
+    Ok(())
 }
 
 /// Drop every page of `inode` (Linux kill_bdev / truncate_inode_pages

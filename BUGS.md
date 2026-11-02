@@ -51,11 +51,9 @@ Missing:
 - SysV shm: IPC_RMID removes the id at once (Linux keeps it, as
   IPC_PRIVATE with SHM_DEST, until the last detach: IPC_STAT and shmat
   by id still work there).
-- File mappings: MAP_SHARED of a file on a filesystem other than ramfs
-  (vfat) maps a private copy (writes do not reach the file or other
-  mappings), and vfat MAP_PRIVATE pages are copied at fault (ramfs
-  shares the page cache until written). No fault-around (Linux maps up
-  to 16 cached pages per read fault). A truncate racing an mremap or fork of a mapping of
+- File mappings: no fault-around (Linux maps up to 16 cached pages
+  per read fault); filesystems without a page cache (procfs) still
+  map a private copy. A truncate racing an mremap or fork of a mapping of
   the file can miss entries in flight: mremap unlinks the old VMA from
   i_mmap before its i_mmap-locked entry move, fork copies the parent's
   entries after linking the child (Linux takes the rmap locks across

@@ -312,8 +312,9 @@ pub fn sync_all() -> Result<usize, i32> {
     for file_id in dirty_files {
         wait_on_writeback(file_id);
     }
-    // Then the devices' own caches: filesystem metadata the file pages'
-    // writeback just dirtied (Linux ksys_sync: sync_bdevs last)
+    // The filesystems' dirty inodes, then the devices' own caches:
+    // metadata the inodes' writeback dirtied (Linux ksys_sync)
+    crate::fs::fs_writeback::sync_all_sbs();
     crate::storage::blkdev::sync_bdevs();
 
     Ok(wbc.pages_written)
@@ -383,6 +384,12 @@ impl BdiWriteback {
         }
     }
 
+    /// Device `dev` (a partition of this disk) has dirty data: arm the
+    /// periodic writeback (Linux wb_wakeup_delayed)
+    pub fn kick(&self, dev: DevId) {
+        self.mark_dirty(FileId::from_blkdev(dev.major, dev.minor));
+    }
+
     /// Schedule periodic writeback (delayed)
     ///
     /// Schedules writeback to occur after WRITEBACK_INTERVAL_TICKS.
@@ -445,10 +452,12 @@ fn do_device_writeback(dev_id: DevId) {
         }
         // A device's own cache (filesystem metadata): its bdev mapping
         if let Some((major, minor)) = file_id.to_blkdev() {
-            if let Some(b) = crate::storage::get_blkdev(DevId::new(major, minor))
-                && crate::storage::blkdev::sync_blockdev(&b).is_ok()
-            {
-                bdi.dirty_inodes.lock().remove(&file_id);
+            // Its filesystems' dirty inodes, then the device's own cache
+            let dev = DevId::new(major, minor);
+            bdi.dirty_inodes.lock().remove(&file_id);
+            crate::fs::fs_writeback::writeback_dev(dev);
+            if let Some(b) = crate::storage::get_blkdev(dev) {
+                let _ = crate::storage::blkdev::sync_blockdev(&b);
             }
             continue;
         }

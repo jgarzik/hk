@@ -18,15 +18,12 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use crate::PAGE_CACHE;
-use crate::mm::page_cache::{AddressSpaceOps, FileId, PAGE_SIZE};
-use crate::storage::{BlockDevice, DevId, get_blkdev};
+use crate::mm::filemap::{self, Aops, PAGE_SIZE};
+use crate::storage::BlockDevice;
+use crate::storage::blkdev::{BioOp, bdev_rw_bytes};
 
 use super::dentry::Dentry;
-use super::file::{
-    DirContext, DirEntry as VfsDirEntry, File, FileOps, generic_file_pread, generic_file_pwrite,
-    generic_file_read, generic_file_write,
-};
+use super::file::{DirContext, DirEntry as VfsDirEntry, File, FileOps};
 use super::icache;
 use super::inode::{AsAny, FileType, Inode, InodeData, InodeMode, InodeOps, Timespec};
 use super::superblock::{
@@ -35,159 +32,190 @@ use super::superblock::{
 use crate::error::KernelError;
 
 // ============================================================================
-// VFAT File AddressSpaceOps - Page I/O for file pages
+// VFAT file pages (Linux fat_aops: fat_read_folio, fat_writepages)
 // ============================================================================
 
-/// VFAT file address space operations for file page cache
-///
-/// This implements readpage/writepage for VFAT **file** pages (FileId 0x2000...).
-/// Unlike VfatAddressSpaceOps (for block device pages), this translates file
-/// page offsets to disk offsets via the FAT cluster chain.
-///
-/// ## Locking Context
-///
-/// These methods are called with:
-/// - Per-page lock held (CachedPage.locked)
-/// - PAGE_CACHE and AddressSpace.inner NOT held
-///
-/// This allows us to safely call read_bytes()/write_bytes() which acquire
-/// PAGE_CACHE for block device pages (different FileId namespace: 0x8000...).
-pub struct VfatFileAddressSpaceOps;
+/// A file's page cache reads and writes its clusters directly (not
+/// through the device's cache, which holds only FAT and directory
+/// blocks; a cluster's device-cache pages are dropped when it is
+/// allocated, Linux clean_bdev_aliases)
+pub struct VfatAops;
 
-impl VfatFileAddressSpaceOps {
-    /// Translate a file page offset to disk byte offset via cluster chain
-    ///
-    /// Returns (bdev, disk_byte_offset) or error.
-    fn translate_offset(file_id: FileId, page_offset: u64) -> Result<(Arc<BlockDevice>, u64), i32> {
-        // Decode the VFAT file FileId
-        let (major, minor, start_cluster) = decode_vfat_file_id(file_id).ok_or(-5)?; // EIO
-
-        // Get block device
-        let bdev = get_blkdev(DevId::new(major as u16, minor as u16)).ok_or(-5)?;
-
-        // Need to get superblock data to walk the cluster chain
-        // We read the boot sector to get FAT parameters
-        let sb_data = VfatFileAddressSpaceOps::read_sb_data(&bdev)?;
-
-        // Convert page offset to cluster index within the file
-        let bytes_per_page = PAGE_SIZE as u64;
-        let file_byte_offset = page_offset * bytes_per_page;
-        let cluster_index = file_byte_offset / sb_data.cluster_size as u64;
-
-        // Walk the cluster chain to find the cluster for this offset
-        let mut current_cluster = start_cluster;
-        for _ in 0..cluster_index {
-            if !is_valid_cluster(current_cluster) {
-                return Err(-5); // EIO - tried to read past end of file
-            }
-            current_cluster =
-                VfatFileAddressSpaceOps::get_fat_entry_cached(&bdev, &sb_data, current_cluster)?;
-            if is_end_of_chain(current_cluster) {
-                return Err(-5); // EIO - cluster chain shorter than expected
-            }
-        }
-
-        if !is_valid_cluster(current_cluster) {
-            return Err(-5); // EIO - invalid cluster
-        }
-
-        // Calculate disk byte offset
-        let cluster_offset = (current_cluster as u64 - 2) * sb_data.cluster_size as u64;
-        let data_region_offset = sb_data.data_start_sector * sb_data.bytes_per_sector as u64;
-        let offset_within_cluster = file_byte_offset % sb_data.cluster_size as u64;
-        let disk_byte_offset = data_region_offset + cluster_offset + offset_within_cluster;
-
-        Ok((bdev, disk_byte_offset))
-    }
-
-    /// Read boot sector to get superblock data (used during a_ops callbacks)
-    ///
-    /// Uses read_bytes to go through the block device page cache, ensuring
-    /// we see any cached updates to the boot sector.
-    fn read_sb_data(bdev: &Arc<BlockDevice>) -> Result<VfatSbData, i32> {
-        // Read boot sector (first 512 bytes) via page cache
-        let mut boot_buf = [0u8; 512];
-        read_bytes(bdev, 0, &mut boot_buf).map_err(|_| -5)?;
-
-        // Parse boot sector
-        let boot: VfatBootSector =
-            unsafe { core::ptr::read_unaligned(boot_buf.as_ptr() as *const _) };
-
-        let bytes_per_sector = boot.bytes_per_sector as u32;
-        let sectors_per_cluster = boot.sectors_per_cluster as u32;
-        let fat_start_sector = boot.reserved_sector_count as u64;
-        let fat_sectors = if boot.fat_size_16 != 0 {
-            boot.fat_size_16 as u64
-        } else {
-            boot.fat_size_32 as u64
+/// The disk runs (byte offset, length) holding bytes [pos, pos + len)
+/// of the file whose cluster chain is `chain`, within its clusters
+fn disk_runs(sb: &VfatSbData, chain: &[u32], pos: u64, len: usize) -> Vec<(u64, usize)> {
+    let cs = sb.cluster_size as u64;
+    let mut runs: Vec<(u64, usize)> = Vec::new();
+    let mut at = pos;
+    let end = pos + len as u64;
+    while at < end {
+        let Some(&c) = chain.get((at / cs) as usize) else {
+            break;
         };
-        let num_fats = boot.num_fats as u64;
-        let data_start_sector = fat_start_sector + (fat_sectors * num_fats);
+        let off = cluster_to_offset(sb, c) + at % cs;
+        let n = (cs - at % cs).min(end - at) as usize;
+        match runs.last_mut() {
+            Some((o, l)) if *o + *l as u64 == off => *l += n,
+            _ => runs.push((off, n)),
+        }
+        at += n as u64;
+    }
+    runs
+}
 
-        Ok(VfatSbData {
-            bdev: bdev.clone(),
-            bytes_per_sector,
-            sectors_per_cluster,
-            fat_start_sector,
-            fat_sectors,
-            data_start_sector,
-            root_cluster: boot.root_cluster,
-            cluster_size: bytes_per_sector * sectors_per_cluster,
-        })
+/// A page's device and the disk runs holding its bytes
+type PageRuns = (Arc<BlockDevice>, Vec<(u64, usize)>);
+
+/// The runs on disk holding the page's bytes within the file
+fn page_runs(inode: &Inode, index: u64) -> Result<PageRuns, KernelError> {
+    let sb = inode.superblock().ok_or(KernelError::Io)?;
+    let sb_data = get_sb_data(&sb)?;
+    let d = get_inode_data(inode)?;
+    let pos = index * PAGE_SIZE as u64;
+    let valid = inode.get_size().saturating_sub(pos).min(PAGE_SIZE as u64) as usize;
+    let chain = if d.start_cluster == 0 || valid == 0 {
+        Vec::new()
+    } else {
+        read_cluster_chain(&sb_data, d.start_cluster)?
+    };
+    let runs = disk_runs(&sb_data, &chain, pos, valid);
+    Ok((sb_data.bdev.clone(), runs))
+}
+
+/// The page frame as bytes
+fn frame_bytes<'a>(phys: u64) -> &'a mut [u8] {
+    // SAFETY: a locked page-cache frame, through the direct map
+    unsafe { core::slice::from_raw_parts_mut(crate::arch::phys_to_virt(phys), PAGE_SIZE) }
+}
+
+/// Transfer `runs` between the disk and `page` (in order from its start)
+fn page_io(
+    bdev: &BlockDevice,
+    op: BioOp,
+    page: &mut [u8],
+    runs: &[(u64, usize)],
+) -> Result<(), KernelError> {
+    let mut at = 0;
+    for &(off, n) in runs {
+        bdev_rw_bytes(bdev, op, off, &mut page[at..at + n])?;
+        at += n;
+    }
+    Ok(())
+}
+
+impl Aops for VfatAops {
+    fn read_folio(&self, inode: &Inode, phys: u64, index: u64) -> Result<(), KernelError> {
+        let (bdev, runs) = page_runs(inode, index)?;
+        let page = frame_bytes(phys);
+        page.fill(0);
+        page_io(&bdev, BioOp::Read, page, &runs)?;
+        filemap::set_uptodate(phys);
+        Ok(())
     }
 
-    /// Read a FAT entry via page cache
-    ///
-    /// Uses read_bytes to go through the block device page cache, ensuring
-    /// we see any cached updates to the FAT table.
-    ///
-    /// This is safe to call from file AddressSpaceOps because file pages
-    /// (FileId 0x2000_xxxx) and block device pages (FileId 0x8000_xxxx)
-    /// are in different namespaces, so there's no recursion.
-    fn get_fat_entry_cached(
-        bdev: &Arc<BlockDevice>,
-        sb_data: &VfatSbData,
-        cluster: u32,
-    ) -> Result<u32, i32> {
-        let fat_offset = (cluster as u64) * 4;
-        let fat_byte_offset =
-            sb_data.fat_start_sector * sb_data.bytes_per_sector as u64 + fat_offset;
-
-        // Read the 4-byte FAT entry via page cache
-        let mut fat_entry_buf = [0u8; 4];
-        read_bytes(bdev, fat_byte_offset, &mut fat_entry_buf).map_err(|_| -5)?;
-
-        Ok(u32::from_le_bytes(fat_entry_buf) & 0x0FFF_FFFF)
+    fn writepage(&self, inode: &Inode, phys: u64, index: u64) -> Result<(), KernelError> {
+        let (bdev, runs) = page_runs(inode, index)?;
+        page_io(&bdev, BioOp::Write, frame_bytes(phys), &runs)
     }
 }
 
-impl AddressSpaceOps for VfatFileAddressSpaceOps {
-    fn readpage(&self, file_id: FileId, page_offset: u64, buf: &mut [u8]) -> Result<usize, i32> {
-        // Translate file offset to disk offset
-        let (bdev, disk_byte_offset) =
-            VfatFileAddressSpaceOps::translate_offset(file_id, page_offset)?;
+pub static VFAT_FILE_AOPS: VfatAops = VfatAops;
 
-        // Read from block device via page cache to ensure we see cached writes
-        // (e.g., zeros written by truncate extend)
-        read_bytes(&bdev, disk_byte_offset, buf).map_err(|_| -5)?;
-
-        Ok(PAGE_SIZE)
+/// Zero [from, to) of the file through its page cache, within the
+/// clusters it already has (Linux cont_write_begin / fat_cont_expand):
+/// bytes past the old end in its last cluster may be stale on disk
+fn cont_expand(inode: &Inode, cs: u64, from: u64, to: u64) -> Result<(), KernelError> {
+    let to = to.min(from.next_multiple_of(cs));
+    let zeros = [0u8; PAGE_SIZE];
+    let mut at = from;
+    while at < to {
+        let n = ((to - at) as usize).min(PAGE_SIZE - (at % PAGE_SIZE as u64) as usize);
+        if filemap::perform_write(inode, &zeros[..n], at)? != n {
+            return Err(KernelError::NoSpace);
+        }
+        at += n as u64;
     }
-
-    fn writepage(&self, file_id: FileId, page_offset: u64, buf: &[u8]) -> Result<usize, i32> {
-        // Translate file offset to disk offset
-        let (bdev, disk_byte_offset) =
-            VfatFileAddressSpaceOps::translate_offset(file_id, page_offset)?;
-
-        // Write to block device via page cache
-        write_bytes(&bdev, disk_byte_offset, buf).map_err(|_| -5)?;
-
-        Ok(PAGE_SIZE)
-    }
+    Ok(())
 }
 
-/// Global VFAT file address space ops instance (for file pages)
-pub static VFAT_FILE_AOPS: VfatFileAddressSpaceOps = VfatFileAddressSpaceOps;
+/// Give the file the clusters `size` bytes need (FAT has no holes; new
+/// clusters are zeroed on disk by `allocate_cluster`), recording a new
+/// first cluster in the inode and its directory entry
+fn ensure_clusters(inode: &Inode, sb_data: &VfatSbData, size: u64) -> Result<(), KernelError> {
+    let d = get_inode_data(inode)?;
+    let cs = sb_data.cluster_size as u64;
+    let need = size.div_ceil(cs) as usize;
+    let chain = if d.start_cluster != 0 {
+        read_cluster_chain(sb_data, d.start_cluster)?
+    } else {
+        Vec::new()
+    };
+    if need <= chain.len() {
+        return Ok(());
+    }
+    let last = chain.last().copied().unwrap_or(0);
+    let new = extend_cluster_chain(sb_data, last, need - chain.len())?;
+    if d.start_cluster == 0
+        && let Some(&first) = new.first()
+    {
+        if d.parent_cluster != 0 && inode.get_nlink() != 0 {
+            update_dir_entry_by_short_name(
+                sb_data,
+                d.parent_cluster,
+                &d.short_name,
+                first,
+                inode.get_size() as u32,
+            )?;
+        }
+        inode.set_private(Arc::new(VfatInodeData {
+            start_cluster: first,
+            ..d
+        }));
+    }
+    Ok(())
+}
+
+/// Record the file's size in its directory entry
+fn update_size(inode: &Inode, sb_data: &VfatSbData) -> Result<(), KernelError> {
+    let d = get_inode_data(inode)?;
+    if d.parent_cluster == 0 || inode.get_nlink() == 0 {
+        return Ok(());
+    }
+    update_dir_entry_by_short_name(
+        sb_data,
+        d.parent_cluster,
+        &d.short_name,
+        d.start_cluster,
+        inode.get_size() as u32,
+    )
+}
+
+/// Write to a vfat file (Linux fat_write_begin/end over
+/// generic_perform_write): clusters first, a gap past the old end
+/// zeroed, the data through the page cache (written back later), then
+/// the new size in the directory entry. The VFS holds i_rwsem.
+fn vfat_write(inode: &Arc<Inode>, buf: &[u8], pos: u64) -> Result<usize, KernelError> {
+    if buf.is_empty() {
+        return Ok(0);
+    }
+    let sb = inode.superblock().ok_or(KernelError::Io)?;
+    let sb_data = get_sb_data(&sb)?;
+    let end = pos + buf.len() as u64;
+    if end > u32::MAX as u64 {
+        return Err(KernelError::FileTooLarge);
+    }
+    let old = inode.get_size();
+    ensure_clusters(inode, &sb_data, end.max(old))?;
+    if pos > old {
+        cont_expand(inode, sb_data.cluster_size as u64, old, pos)?;
+    }
+    let n = filemap::perform_write(inode, buf, pos)?;
+    super::fs_writeback::mark_inode_dirty(inode);
+    if inode.get_size() != old {
+        update_size(inode, &sb_data)?;
+    }
+    Ok(n)
+}
 
 // ============================================================================
 // VFAT On-Disk Structures
@@ -382,8 +410,6 @@ pub struct VfatInodeData {
     pub parent_cluster: u32,
     /// Short name for directory entry lookup (8+3 format)
     pub short_name: [u8; 11],
-    /// FileId for page cache (unique per file)
-    pub file_id: FileId,
 }
 
 impl InodeData for VfatInodeData {}
@@ -392,38 +418,6 @@ impl AsAny for VfatInodeData {
     fn as_any(&self) -> &dyn core::any::Any {
         self
     }
-}
-
-/// Create a unique FileId for a VFAT file
-///
-/// Format: 0x2000_0000_0000_0000 | (major << 40) | (minor << 32) | (start_cluster)
-///
-/// This namespace (0x2000...) is distinct from block device FileIds (0x8000...)
-/// which prevents deadlocks when file readpage calls block device read_bytes.
-///
-/// We encode start_cluster (not inode number) because readpage needs to traverse
-/// the cluster chain, and start_cluster is all we need for that.
-fn vfat_file_id(dev: DevId, start_cluster: u32) -> FileId {
-    FileId::new(
-        0x2000_0000_0000_0000
-            | ((dev.major as u64) << 40)
-            | ((dev.minor as u64) << 32)
-            | (start_cluster as u64),
-    )
-}
-
-/// Decode a VFAT file FileId to extract device info and start cluster
-///
-/// Returns (major, minor, start_cluster) or None if not a VFAT file FileId
-fn decode_vfat_file_id(file_id: FileId) -> Option<(u8, u8, u32)> {
-    let raw = file_id.0;
-    if (raw >> 60) != 0x2 {
-        return None;
-    }
-    let major = ((raw >> 40) & 0xFF) as u8;
-    let minor = ((raw >> 32) & 0xFF) as u8;
-    let start_cluster = (raw & 0xFFFF_FFFF) as u32;
-    Some((major, minor, start_cluster))
 }
 
 // ============================================================================
@@ -439,18 +433,11 @@ fn read_bytes(bdev: &BlockDevice, offset: u64, buf: &mut [u8]) -> Result<(), Ker
     }
 }
 
-/// Write bytes of the device through its page cache (Linux
-/// mark_buffer_dirty): written back by fsync, sync, the periodic
-/// device writeback (`BdiWriteback`) and the last close (umount)
+/// Write bytes of the device through its cache, only the sectors
+/// touched dirtied (`bdev_write_meta`): a cache page may also hold
+/// file-data clusters, which the file's own cache writes
 fn write_bytes(bdev: &BlockDevice, offset: u64, buf: &[u8]) -> Result<(), KernelError> {
-    if crate::mm::filemap::perform_write(&bdev.bd_inode, buf, offset)? != buf.len() {
-        return Err(KernelError::Io);
-    }
-    bdev.disk.bdi.mark_dirty(FileId::from_blkdev(
-        bdev.dev_id().major,
-        bdev.dev_id().minor,
-    ));
-    Ok(())
+    super::blkdev_ops::bdev_write_meta(bdev, offset, buf)
 }
 
 // ============================================================================
@@ -480,7 +467,6 @@ fn get_inode_data(inode: &Inode) -> Result<VfatInodeData, KernelError> {
         is_dir: data.is_dir,
         parent_cluster: data.parent_cluster,
         short_name: data.short_name,
-        file_id: data.file_id,
     })
 }
 
@@ -583,10 +569,16 @@ fn allocate_cluster(sb_data: &VfatSbData) -> Result<u32, KernelError> {
             // Found free cluster, mark as end-of-chain
             set_fat_entry(sb_data, cluster, FAT_EOC)?;
 
-            // Zero the cluster data
-            let cluster_offset = cluster_to_offset(sb_data, cluster);
-            let zeros = vec![0u8; sb_data.cluster_size as usize];
-            write_bytes(&sb_data.bdev, cluster_offset, &zeros)?;
+            // Zeroed on the disk itself, after the device cache's pages
+            // of it are written back and dropped (Linux
+            // clean_bdev_aliases): a file's data never goes through the
+            // device cache, so no stale or dirty copy of an old
+            // directory block may outlive the reuse
+            let off = cluster_to_offset(sb_data, cluster);
+            let len = sb_data.cluster_size as u64;
+            filemap::invalidate_range(&sb_data.bdev.bd_inode, off, off + len)?;
+            let mut zeros = vec![0u8; len as usize];
+            bdev_rw_bytes(&sb_data.bdev, BioOp::Write, off, &mut zeros)?;
 
             return Ok(cluster);
         }
@@ -1521,6 +1513,11 @@ impl InodeOps for VfatInodeOps {
         Err(KernelError::NotFound)
     }
 
+    /// Shared mappings map the page cache (Linux fat_file_mmap)
+    fn maps_cache(&self) -> bool {
+        true
+    }
+
     /// An unlinked file's clusters are freed with its inode (Linux
     /// fat_evict_inode), on the system workqueue: the last reference can
     /// go where no I/O may be done
@@ -1708,7 +1705,6 @@ impl InodeOps for VfatInodeOps {
                 is_dir: inode_data.is_dir,
                 parent_cluster: inode_data.parent_cluster,
                 short_name: inode_data.short_name,
-                file_id: inode_data.file_id,
             }));
         }
 
@@ -1760,6 +1756,7 @@ impl InodeOps for VfatInodeOps {
             Arc::downgrade(&sb),
             &VFAT_INODE_OPS,
         ));
+        inode.i_data.set_aops(&VFAT_FILE_AOPS);
 
         inode.set_private(Arc::new(VfatInodeData {
             start_cluster,
@@ -1767,7 +1764,6 @@ impl InodeOps for VfatInodeOps {
             is_dir: false,
             parent_cluster,
             short_name,
-            file_id: vfat_file_id(sb_data.bdev.dev_id(), start_cluster),
         }));
         icache::insert_inode_hash(&inode, ikey(parent_cluster, &short_name));
 
@@ -1844,6 +1840,7 @@ impl InodeOps for VfatInodeOps {
             Arc::downgrade(&sb),
             &VFAT_INODE_OPS,
         ));
+        inode.i_data.set_aops(&VFAT_FILE_AOPS);
 
         inode.set_private(Arc::new(VfatInodeData {
             start_cluster: new_cluster,
@@ -1851,7 +1848,6 @@ impl InodeOps for VfatInodeOps {
             is_dir: true,
             parent_cluster,
             short_name,
-            file_id: vfat_file_id(sb_data.bdev.dev_id(), new_cluster),
         }));
         icache::insert_inode_hash(&inode, ikey(parent_cluster, &short_name));
 
@@ -1929,164 +1925,50 @@ impl InodeOps for VfatInodeOps {
         )
     }
 
-    fn truncate(&self, inode: &Inode, length: u64) -> Result<(), KernelError> {
+    /// Linux fat_setattr(ATTR_SIZE): shrinking drops the pages past
+    /// the end (truncate_setsize, mappings included) before the clusters
+    /// go; growing zeroes the rest of the last cluster through the page
+    /// cache and gives the file zeroed clusters. The VFS holds i_rwsem.
+    fn truncate(&self, inode: &Arc<Inode>, length: u64) -> Result<(), KernelError> {
         let sb = inode.superblock().ok_or(KernelError::Io)?;
         let sb_data = get_sb_data(&sb)?;
-        let inode_data = get_inode_data(inode)?;
-
-        // Directories cannot be truncated
-        if inode_data.is_dir {
+        let d = get_inode_data(inode)?;
+        if d.is_dir {
             return Err(KernelError::IsDirectory);
         }
-
-        // FAT32 file size limit is 4 GiB - 1 (u32::MAX)
         if length > u32::MAX as u64 {
             return Err(KernelError::FileTooLarge);
         }
-
-        let old_size = inode_data.file_size as u64;
-        let new_size = length as u32;
-        let cluster_size = sb_data.cluster_size as u64;
-
-        // Calculate cluster counts
-        let old_clusters = if old_size == 0 {
-            0
-        } else {
-            old_size.div_ceil(cluster_size) as usize
-        };
-        let new_clusters = if length == 0 {
-            0
-        } else {
-            length.div_ceil(cluster_size) as usize
-        };
-
-        let mut new_start_cluster = inode_data.start_cluster;
-
-        if new_clusters < old_clusters {
-            // Shrinking: truncate cluster chain
-            if new_clusters == 0 {
-                // Free all clusters
-                if inode_data.start_cluster != 0 {
-                    free_cluster_chain(&sb_data, inode_data.start_cluster)?;
-                }
-                new_start_cluster = 0;
-            } else {
-                // Keep first new_clusters, free the rest
-                let chain = read_cluster_chain(&sb_data, inode_data.start_cluster)?;
-                if new_clusters < chain.len() {
-                    // Mark last kept cluster as end-of-chain
-                    set_fat_entry(&sb_data, chain[new_clusters - 1], FAT_EOC)?;
-                    // Free remaining clusters
-                    free_cluster_chain(&sb_data, chain[new_clusters])?;
-                }
-                // If chain.len() <= new_clusters, the on-disk chain is already
-                // at or below the target size (possibly due to FS inconsistency).
-                // Nothing to free; the chain's last cluster should already be EOC.
-            }
-        } else if new_clusters > old_clusters {
-            // Extending: allocate more clusters
-            let additional = new_clusters - old_clusters;
-            if inode_data.start_cluster == 0 {
-                // File was empty, allocate new chain
-                let new_chain = extend_cluster_chain(&sb_data, 0, additional)?;
-                if !new_chain.is_empty() {
-                    new_start_cluster = new_chain[0];
-                    // Zero the new clusters
-                    for &cluster in &new_chain {
-                        let offset = cluster_to_offset(&sb_data, cluster);
-                        let zeros = vec![0u8; cluster_size as usize];
-                        write_bytes(&sb_data.bdev, offset, &zeros)?;
+        let old = inode.get_size();
+        let cs = sb_data.cluster_size as u64;
+        if length < old {
+            filemap::truncate_setsize(inode, length);
+            let keep = length.div_ceil(cs) as usize;
+            let mut start = d.start_cluster;
+            if d.start_cluster != 0 {
+                if keep == 0 {
+                    free_cluster_chain(&sb_data, d.start_cluster)?;
+                    start = 0;
+                } else {
+                    let chain = read_cluster_chain(&sb_data, d.start_cluster)?;
+                    if keep < chain.len() {
+                        set_fat_entry(&sb_data, chain[keep - 1], FAT_EOC)?;
+                        free_cluster_chain(&sb_data, chain[keep])?;
                     }
                 }
-            } else {
-                // Extend existing chain
-                let chain = read_cluster_chain(&sb_data, inode_data.start_cluster)?;
-                let last = *chain.last().unwrap_or(&0);
-                let new_chain = extend_cluster_chain(&sb_data, last, additional)?;
-                // Zero the new clusters
-                for &cluster in &new_chain {
-                    let offset = cluster_to_offset(&sb_data, cluster);
-                    let zeros = vec![0u8; cluster_size as usize];
-                    write_bytes(&sb_data.bdev, offset, &zeros)?;
-                }
             }
+            inode.set_private(Arc::new(VfatInodeData {
+                start_cluster: start,
+                file_size: length as u32,
+                ..d
+            }));
+        } else if length > old {
+            ensure_clusters(inode, &sb_data, length)?;
+            cont_expand(inode, cs, old, length)?;
+            super::fs_writeback::mark_inode_dirty(inode);
+            inode.set_size(length);
         }
-
-        // When extending the file, zero the bytes between old_size and new_size
-        // in any cached file pages. This is necessary because:
-        // 1. New clusters are zeroed on disk, but may already be cached with stale data
-        // 2. Extending within the same cluster doesn't allocate new clusters, so the
-        //    region between old_size and new_size may contain garbage in the page cache
-        //
-        // We zero directly in cached pages (if any) and mark them dirty.
-        // Pages not yet cached will read correctly from disk (new clusters are zeroed).
-        if length > old_size {
-            let file_id = inode_data.file_id;
-            let page_size = PAGE_SIZE as u64;
-
-            // Calculate which pages contain the extended region
-            let first_page = old_size / page_size;
-            let last_page = length.saturating_sub(1) / page_size;
-
-            // Lock PAGE_CACHE to find cached pages
-            let cache = PAGE_CACHE.lock();
-
-            for page_num in first_page..=last_page {
-                // Try to find this page in the cache
-                if let Some(page) = cache.find_get_page(file_id, page_num) {
-                    // Calculate byte range to zero within this page
-                    let page_start = page_num * page_size;
-                    let page_end = page_start + page_size;
-
-                    // Zero from max(old_size, page_start) to min(new_size, page_end)
-                    let zero_start = core::cmp::max(old_size, page_start);
-                    let zero_end = core::cmp::min(length, page_end);
-
-                    if zero_start < zero_end {
-                        let offset_in_page = (zero_start - page_start) as usize;
-                        let zero_len = (zero_end - zero_start) as usize;
-
-                        // Lock the page, zero the bytes, mark dirty, unlock
-                        page.lock();
-                        unsafe {
-                            let ptr = crate::arch::phys_to_virt(page.frame).add(offset_in_page);
-                            core::ptr::write_bytes(ptr, 0, zero_len);
-                        }
-                        page.mark_dirty();
-                        page.unlock();
-                    }
-
-                    // Release the page reference (find_get_page incremented refcount)
-                    page.put();
-                }
-            }
-        }
-
-        // Update directory entry
-        if inode_data.parent_cluster != 0 && inode.get_nlink() != 0 {
-            update_dir_entry_by_short_name(
-                &sb_data,
-                inode_data.parent_cluster,
-                &inode_data.short_name,
-                new_start_cluster,
-                new_size,
-            )?;
-        }
-
-        // Update inode metadata
-        // IMPORTANT: Update file_id when start_cluster changes, as file_id encodes the cluster
-        let new_file_id = vfat_file_id(sb_data.bdev.dev_id(), new_start_cluster);
-        inode.set_size(length);
-        inode.set_private(Arc::new(VfatInodeData {
-            start_cluster: new_start_cluster,
-            file_size: new_size,
-            is_dir: false,
-            parent_cluster: inode_data.parent_cluster,
-            short_name: inode_data.short_name,
-            file_id: new_file_id,
-        }));
-
-        Ok(())
+        update_size(inode, &sb_data)
     }
 
     fn rename(
@@ -2247,7 +2129,6 @@ fn create_inode_for_entry(
     entry: &ParsedDirEntry,
     parent_cluster: u32,
 ) -> Result<Arc<Inode>, KernelError> {
-    let sb_data = get_sb_data(sb)?;
     let mode = if entry.is_dir() {
         InodeMode::directory(0o755)
     } else {
@@ -2265,6 +2146,7 @@ fn create_inode_for_entry(
         Arc::downgrade(sb),
         &VFAT_INODE_OPS,
     ));
+    inode.i_data.set_aops(&VFAT_FILE_AOPS);
 
     inode.set_private(Arc::new(VfatInodeData {
         start_cluster: entry.start_cluster,
@@ -2272,7 +2154,6 @@ fn create_inode_for_entry(
         is_dir: entry.is_dir(),
         parent_cluster,
         short_name: entry.short_name,
-        file_id: vfat_file_id(sb_data.bdev.dev_id(), entry.start_cluster),
     }));
 
     Ok(inode)
@@ -2300,254 +2181,36 @@ impl FileOps for VfatFileOps {
     }
 
     fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {
-        let inode = file.get_inode().ok_or(KernelError::BadFd)?;
-        let inode_data = get_inode_data(&inode)?;
-
-        // Use generic_file_read with VFAT file address space ops
-        // This properly uses the page cache for file pages
-        generic_file_read(
-            file,
-            buf,
-            inode_data.file_id,
-            inode.get_size(),
-            true,  // can_writeback - VFAT is disk-backed
-            false, // not unevictable
-            &VFAT_FILE_AOPS,
-        )
+        let n = self.pread(file, buf, file.get_pos())?;
+        file.advance_pos(n as u64);
+        Ok(n)
     }
 
     fn write(&self, file: &File, buf: &[u8]) -> Result<usize, KernelError> {
-        if buf.is_empty() {
-            return Ok(0);
-        }
-
-        let inode = file.get_inode().ok_or(KernelError::BadFd)?;
-        let mut inode_data = get_inode_data(&inode)?;
-        let sb = inode.superblock().ok_or(KernelError::Io)?;
-        let sb_data = get_sb_data(&sb)?;
-        let pos = file.get_pos();
-        let old_size = inode.get_size();
-
-        // For file writes, we need to allow growing the file
-        let new_end = pos + buf.len() as u64;
-        let effective_size = core::cmp::max(old_size, new_end);
-
-        // Pre-allocate clusters if needed (VFAT requires clusters before data can be written)
-        // This is necessary because VfatFileAddressSpaceOps::writepage cannot allocate clusters
-        // (it only has FileId, not access to the inode).
-        let cluster_size = sb_data.cluster_size as u64;
-        let clusters_needed = effective_size.div_ceil(cluster_size) as usize;
-
-        let current_clusters = if inode_data.start_cluster != 0 {
-            read_cluster_chain(&sb_data, inode_data.start_cluster)?.len()
-        } else {
-            0
-        };
-
-        if clusters_needed > current_clusters {
-            let additional = clusters_needed - current_clusters;
-            let last_cluster = if inode_data.start_cluster != 0 {
-                // Get last cluster in chain
-                let chain = read_cluster_chain(&sb_data, inode_data.start_cluster)?;
-                *chain.last().unwrap_or(&0)
-            } else {
-                0
-            };
-
-            let new_clusters = extend_cluster_chain(&sb_data, last_cluster, additional)?;
-
-            // If this was an empty file, update inode with new start_cluster
-            if inode_data.start_cluster == 0 && !new_clusters.is_empty() {
-                let new_start = new_clusters[0];
-
-                // Update directory entry
-                if inode_data.parent_cluster != 0 && inode.get_nlink() != 0 {
-                    update_dir_entry_by_short_name(
-                        &sb_data,
-                        inode_data.parent_cluster,
-                        &inode_data.short_name,
-                        new_start,
-                        effective_size as u32,
-                    )?;
-                }
-
-                // Update inode's private data with new start_cluster
-                let new_file_id = vfat_file_id(sb_data.bdev.dev_id(), new_start);
-                inode.set_private(Arc::new(VfatInodeData {
-                    start_cluster: new_start,
-                    file_size: effective_size as u32,
-                    is_dir: inode_data.is_dir,
-                    parent_cluster: inode_data.parent_cluster,
-                    short_name: inode_data.short_name,
-                    file_id: new_file_id,
-                }));
-
-                // Re-read inode_data with updated start_cluster
-                inode_data = get_inode_data(&inode)?;
-            }
-        }
-
-        // Use generic_file_write with VFAT file address space ops
-        let bytes_written = generic_file_write(
-            file,
-            buf,
-            inode_data.file_id,
-            effective_size,
-            true,  // can_writeback
-            false, // not unevictable
-            &VFAT_FILE_AOPS,
-        )?;
-
-        // Update inode size if file grew
-        let new_pos = pos + bytes_written as u64;
-        if new_pos > old_size {
-            inode.set_size(new_pos);
-
-            // Also update directory entry size on disk
-            #[allow(clippy::collapsible_if)]
-            if inode_data.parent_cluster != 0 && inode.get_nlink() != 0 {
-                let entries = read_directory_entries(&sb_data, inode_data.parent_cluster).ok();
-                let start_cluster = entries
-                    .as_ref()
-                    .and_then(|e| e.iter().find(|en| en.short_name == inode_data.short_name))
-                    .map(|e| e.start_cluster)
-                    .unwrap_or(inode_data.start_cluster);
-
-                let _ = update_dir_entry_by_short_name(
-                    &sb_data,
-                    inode_data.parent_cluster,
-                    &inode_data.short_name,
-                    start_cluster,
-                    new_pos as u32,
-                );
-            }
-        }
-
-        Ok(bytes_written)
+        let n = self.pwrite(file, buf, file.get_pos())?;
+        file.advance_pos(n as u64);
+        Ok(n)
     }
 
     fn pread(&self, file: &File, buf: &mut [u8], offset: u64) -> Result<usize, KernelError> {
         let inode = file.get_inode().ok_or(KernelError::BadFd)?;
-        let inode_data = get_inode_data(&inode)?;
-
-        // Use generic_file_pread with VFAT file address space ops
-        generic_file_pread(
-            file,
-            buf,
-            offset,
-            inode_data.file_id,
-            inode.get_size(),
-            true,  // can_writeback
-            false, // not unevictable
-            &VFAT_FILE_AOPS,
-        )
+        filemap::read(&inode, buf, offset)
     }
 
     fn pwrite(&self, file: &File, buf: &[u8], offset: u64) -> Result<usize, KernelError> {
-        if buf.is_empty() {
-            return Ok(0);
-        }
-
         let inode = file.get_inode().ok_or(KernelError::BadFd)?;
-        let mut inode_data = get_inode_data(&inode)?;
+        vfat_write(&inode, buf, offset)
+    }
+
+    /// Write the file's pages, the FAT and directory blocks, then flush
+    /// the disk (Linux fat_file_fsync: generic_file_fsync + blkdev flush)
+    fn fsync(&self, file: &File) -> Result<(), KernelError> {
+        let inode = file.get_inode().ok_or(KernelError::BadFd)?;
         let sb = inode.superblock().ok_or(KernelError::Io)?;
         let sb_data = get_sb_data(&sb)?;
-        let old_size = inode.get_size();
-
-        // For file writes, allow growing the file
-        let new_end = offset + buf.len() as u64;
-        let effective_size = core::cmp::max(old_size, new_end);
-
-        // Pre-allocate clusters if needed (VFAT requires clusters before data can be written)
-        let cluster_size = sb_data.cluster_size as u64;
-        let clusters_needed = effective_size.div_ceil(cluster_size) as usize;
-
-        let current_clusters = if inode_data.start_cluster != 0 {
-            read_cluster_chain(&sb_data, inode_data.start_cluster)?.len()
-        } else {
-            0
-        };
-
-        if clusters_needed > current_clusters {
-            let additional = clusters_needed - current_clusters;
-            let last_cluster = if inode_data.start_cluster != 0 {
-                let chain = read_cluster_chain(&sb_data, inode_data.start_cluster)?;
-                *chain.last().unwrap_or(&0)
-            } else {
-                0
-            };
-
-            let new_clusters = extend_cluster_chain(&sb_data, last_cluster, additional)?;
-
-            // If this was an empty file, update inode with new start_cluster
-            if inode_data.start_cluster == 0 && !new_clusters.is_empty() {
-                let new_start = new_clusters[0];
-
-                // Update directory entry
-                if inode_data.parent_cluster != 0 && inode.get_nlink() != 0 {
-                    update_dir_entry_by_short_name(
-                        &sb_data,
-                        inode_data.parent_cluster,
-                        &inode_data.short_name,
-                        new_start,
-                        effective_size as u32,
-                    )?;
-                }
-
-                // Update inode's private data with new start_cluster
-                let new_file_id = vfat_file_id(sb_data.bdev.dev_id(), new_start);
-                inode.set_private(Arc::new(VfatInodeData {
-                    start_cluster: new_start,
-                    file_size: effective_size as u32,
-                    is_dir: inode_data.is_dir,
-                    parent_cluster: inode_data.parent_cluster,
-                    short_name: inode_data.short_name,
-                    file_id: new_file_id,
-                }));
-
-                // Re-read inode_data with updated start_cluster
-                inode_data = get_inode_data(&inode)?;
-            }
-        }
-
-        // Use generic_file_pwrite with VFAT file address space ops
-        let bytes_written = generic_file_pwrite(
-            file,
-            buf,
-            offset,
-            inode_data.file_id,
-            effective_size,
-            true,  // can_writeback
-            false, // not unevictable
-            &VFAT_FILE_AOPS,
-        )?;
-
-        // Update inode size if file grew
-        let new_pos = offset + bytes_written as u64;
-        if new_pos > old_size {
-            inode.set_size(new_pos);
-
-            // Also update directory entry size on disk
-            #[allow(clippy::collapsible_if)]
-            if inode_data.parent_cluster != 0 && inode.get_nlink() != 0 {
-                let entries = read_directory_entries(&sb_data, inode_data.parent_cluster).ok();
-                let start_cluster = entries
-                    .as_ref()
-                    .and_then(|e| e.iter().find(|en| en.short_name == inode_data.short_name))
-                    .map(|e| e.start_cluster)
-                    .unwrap_or(inode_data.start_cluster);
-
-                let _ = update_dir_entry_by_short_name(
-                    &sb_data,
-                    inode_data.parent_cluster,
-                    &inode_data.short_name,
-                    start_cluster,
-                    new_pos as u32,
-                );
-            }
-        }
-
-        Ok(bytes_written)
+        super::fs_writeback::writeback_inode(&inode)?;
+        crate::storage::blkdev::sync_blockdev(&sb_data.bdev)?;
+        crate::storage::blkdev::blkdev_issue_flush(&sb_data.bdev)
     }
 
     // llseek: use default implementation from FileOps trait
@@ -2719,6 +2382,7 @@ fn vfat_mount_dev(
         Arc::downgrade(&sb),
         &VFAT_INODE_OPS,
     ));
+    root_inode.i_data.set_aops(&VFAT_FILE_AOPS);
 
     root_inode.set_private(Arc::new(VfatInodeData {
         start_cluster: boot_sector.root_cluster,
@@ -2726,7 +2390,6 @@ fn vfat_mount_dev(
         is_dir: true,
         parent_cluster: 0,      // Root has no parent
         short_name: [b' '; 11], // Root has no short name
-        file_id: vfat_file_id(sb_data.bdev.dev_id(), boot_sector.root_cluster),
     }));
 
     // Create root dentry

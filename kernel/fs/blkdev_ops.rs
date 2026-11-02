@@ -13,13 +13,15 @@ use alloc::sync::Arc;
 use crate::arch::Uaccess;
 use crate::error::KernelError;
 use crate::fs::inode::{Inode, InodeMode, Timespec};
-use crate::mm::filemap::{self, Aops};
+use crate::mm::filemap::{self, Aops, PAGE_SIZE};
 use crate::storage::DevId;
 use crate::storage::blkdev::{
-    BioOp, BlockDevice, SECTOR_SHIFT, bdev_rw_frame, blkdev_issue_flush, get_blkdev, sync_blockdev,
+    BioOp, BlockDevice, SECTOR_SHIFT, bdev_rw_bytes, bdev_rw_frame, blkdev_issue_flush, get_blkdev,
+    sync_blockdev,
 };
 use crate::storage::genhd;
 use crate::uaccess::{get_user, put_user};
+use core::sync::atomic::Ordering;
 
 use super::file::{File, FileOps, seek};
 
@@ -107,6 +109,60 @@ impl crate::fs::inode::AsAny for BdevOwner {
     }
 }
 
+/// Dirty 512-byte sectors of a device-cache page (`Page.private` bits,
+/// Linux's dirty buffer heads): metadata writes mark just what they
+/// change, and writeback writes only those, since the page may also
+/// hold blocks the device cache does not own (vfat file-data clusters
+/// smaller than a page, written from the file's own cache). No bits:
+/// the whole page (device-node writes).
+const SECTORS: usize = PAGE_SIZE / 512;
+
+fn page_struct(phys: u64) -> Result<&'static crate::mm::page::Page, KernelError> {
+    crate::mm::page::phys_to_page(phys).ok_or(KernelError::Io)
+}
+
+/// Write `buf` at byte `pos` of the device into its cache, dirtying
+/// only the sectors it touches (Linux mark_buffer_dirty); written back
+/// by fsync, sync, umount (the last close) and the periodic writeback
+pub fn bdev_write_meta(b: &BlockDevice, pos: u64, buf: &[u8]) -> Result<(), KernelError> {
+    let inode = &b.bd_inode;
+    let mut done = 0;
+    while done < buf.len() {
+        let at = pos + done as u64;
+        let index = at / PAGE_SIZE as u64;
+        let off = (at % PAGE_SIZE as u64) as usize;
+        let n = (PAGE_SIZE - off).min(buf.len() - done);
+        let phys = filemap::grab(&inode.i_data, index)?;
+        let r = if filemap::uptodate(phys) {
+            Ok(())
+        } else {
+            BDEV_AOPS.read_folio(inode, phys, index)
+        };
+        if let Err(e) = r {
+            filemap::remove(&inode.i_data, phys);
+            crate::mm::page::unlock_page(phys);
+            filemap::put_page(phys);
+            return Err(e);
+        }
+        // SAFETY: the locked, uptodate page with our reference
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                buf[done..].as_ptr(),
+                crate::arch::phys_to_virt(phys).add(off),
+                n,
+            )
+        };
+        let bits: u64 = (off / 512..(off + n).div_ceil(512)).fold(0, |a, s| a | 1 << s);
+        page_struct(phys)?.private.fetch_or(bits, Ordering::Relaxed);
+        filemap::dirty_page(&inode.i_data, phys);
+        crate::mm::page::unlock_page(phys);
+        filemap::put_page(phys);
+        done += n;
+    }
+    b.disk.bdi.kick(b.dev_id());
+    Ok(())
+}
+
 impl Aops for BdevAops {
     fn read_folio(&self, inode: &Inode, phys: u64, index: u64) -> Result<(), KernelError> {
         let b = inode_bdev(inode)?;
@@ -120,7 +176,41 @@ impl Aops for BdevAops {
         if b.ro() {
             return Err(KernelError::NotPermitted);
         }
-        bdev_rw_frame(&b, BioOp::Write, index << (12 - SECTOR_SHIFT), phys)
+        let bits = page_struct(phys)?.private.swap(0, Ordering::Relaxed);
+        if bits == 0 {
+            return bdev_rw_frame(&b, BioOp::Write, index << (12 - SECTOR_SHIFT), phys);
+        }
+        // Just the dirty sectors, in runs rounded out to logical blocks
+        let lbs = (b.logical_block_size() as usize / 512).clamp(1, SECTORS);
+        // SAFETY: the locked page with our reference, direct map
+        let page =
+            unsafe { core::slice::from_raw_parts_mut(crate::arch::phys_to_virt(phys), PAGE_SIZE) };
+        let base = index * PAGE_SIZE as u64;
+        let mut s = 0;
+        while s < SECTORS {
+            if bits & 1 << s == 0 {
+                s += 1;
+                continue;
+            }
+            let mut e = s;
+            while e < SECTORS && bits & 1 << e != 0 {
+                e += 1;
+            }
+            let (a, z) = (s / lbs * lbs, e.next_multiple_of(lbs).min(SECTORS));
+            let r = bdev_rw_bytes(
+                &b,
+                BioOp::Write,
+                base + a as u64 * 512,
+                &mut page[a * 512..z * 512],
+            );
+            if r.is_err() {
+                // Keep what was not written dirty
+                page_struct(phys)?.private.fetch_or(bits, Ordering::Relaxed);
+                return r;
+            }
+            s = z;
+        }
+        Ok(())
     }
 }
 

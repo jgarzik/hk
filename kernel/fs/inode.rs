@@ -259,7 +259,7 @@ pub trait InodeOps: Send + Sync {
     ///
     /// If the file was larger than length, the extra data is discarded.
     /// If the file was shorter, it is extended with null bytes.
-    fn truncate(&self, inode: &Inode, length: u64) -> Result<(), KernelError> {
+    fn truncate(&self, inode: &Arc<Inode>, length: u64) -> Result<(), KernelError> {
         let _ = (inode, length);
         Err(KernelError::OperationNotSupported)
     }
@@ -495,6 +495,9 @@ pub struct Inode {
     /// The file's page cache (Linux i_data)
     pub i_data: crate::mm::filemap::AddressSpace,
 
+    /// On its superblock's dirty list (Linux I_DIRTY_PAGES; fs_writeback)
+    pub(crate) i_dirty: core::sync::atomic::AtomicBool,
+
     /// The inode cache key it is hashed under (`fs::icache`)
     pub(super) i_hash: AtomicU64,
     /// Hashed in the inode cache (Linux !inode_unhashed)
@@ -537,6 +540,7 @@ impl Inode {
             i_hash: AtomicU64::new(0),
             i_hashed: core::sync::atomic::AtomicBool::new(false),
             i_data: crate::mm::filemap::AddressSpace::new(),
+            i_dirty: core::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -576,6 +580,7 @@ impl Inode {
             i_hash: AtomicU64::new(0),
             i_hashed: core::sync::atomic::AtomicBool::new(false),
             i_data: crate::mm::filemap::AddressSpace::new(),
+            i_dirty: core::sync::atomic::AtomicBool::new(false),
         }
     }
 

@@ -22,6 +22,7 @@ pub mod anon_inodes;
 pub mod dir;
 pub mod fd;
 pub mod flock;
+pub mod fs_writeback;
 pub mod icache;
 pub mod io;
 pub mod iov;

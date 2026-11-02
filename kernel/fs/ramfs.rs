@@ -518,7 +518,7 @@ impl InodeOps for RamfsInodeOps {
         Ok(())
     }
 
-    fn truncate(&self, inode: &Inode, length: u64) -> Result<(), KernelError> {
+    fn truncate(&self, inode: &Arc<Inode>, length: u64) -> Result<(), KernelError> {
         if inode.mode().is_dir() {
             return Err(KernelError::IsDirectory);
         }

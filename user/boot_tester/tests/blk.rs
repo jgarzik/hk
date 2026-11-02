@@ -388,11 +388,78 @@ fn vfat(d: &Disk) {
     let busy = sys_ioctl(disk, BLKRRPART, 0);
     sys_close(disk as u64);
     verdict(b"BLK_RRPART_MOUNTED", busy == EBUSY, busy);
+    vfat_mmap_write();
     vfat_rename_ino();
     vfat_unlink_open();
     vfat_unlink_reuse();
     let u = sys_umount2(b"/mnt/vd1\0".as_ptr(), 0);
     verdict(b"BLK_VFAT_UMOUNT", u == 0, u);
+    vfat_remount(p1);
+}
+
+/// What was written through the page cache (write() and a shared
+/// mapping) reached the disk at umount: a new mount reads it
+fn vfat_remount(p1: &BlkDev) {
+    let mut p = [0u8; 48];
+    let r = sys_mount(
+        p1.path(&mut p).as_ptr(),
+        b"/mnt/vd1\0".as_ptr(),
+        b"vfat\0".as_ptr(),
+        0,
+        b"iocharset=cp437\0".as_ptr() as u64,
+    );
+    let mut b = [0u8; 9000];
+    let n = read_file(b"/mnt/vd1/M.TXT\0", &mut b);
+    let ok = r == 0
+        && n == 8192
+        && b[..4096].iter().all(|&c| c == b'w')
+        && &b[4096..4100] == b"mmap"
+        && b[4100..8192].iter().all(|&c| c == 0);
+    sys_unlink(b"/mnt/vd1/M.TXT\0".as_ptr());
+    let u = sys_umount2(b"/mnt/vd1\0".as_ptr(), 0);
+    if !ok {
+        // Where the data differs: first bad offset and its byte
+        let bad = (0..n.max(0) as usize).find(|&i| {
+            b[i] != if i < 4096 {
+                b'w'
+            } else if i < 4100 {
+                b"mmap"[i - 4096]
+            } else {
+                0
+            }
+        });
+        print(b"VFAT_REMOUNT_DATA: bad at ");
+        print_num(bad.map_or(-1, |i| i as i64));
+        print(b" byte ");
+        print_num(bad.map_or(-1, |i| b[i] as i64));
+        println(b"");
+    }
+    verdict(b"VFAT_REMOUNT_DATA", ok && u == 0, n);
+}
+
+/// A shared mapping of a vfat file is its page cache (Linux
+/// fat_file_mmap): read() sees a write through it, and it sees write()
+fn vfat_mmap_write() {
+    use hk_syscall::{MAP_SHARED, PROT_READ, PROT_WRITE, sys_ftruncate, sys_mmap, sys_munmap};
+    let fd = sys_open(b"/mnt/vd1/M.TXT\0".as_ptr(), O_RDWR | O_CREAT, 0o644) as i32;
+    let page = [b'w'; 4096];
+    let w = sys_pwrite64(fd, page.as_ptr(), 4096, 0);
+    let t = sys_ftruncate(fd, 8192);
+    let m = sys_mmap(0, 8192, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    let mut ok = fd >= 0 && w == 4096 && t == 0 && m > 0;
+    if m > 0 {
+        let v = unsafe { core::slice::from_raw_parts_mut(m as *mut u8, 8192) };
+        ok &= v[10] == b'w' && v[5000] == 0;
+        v[4096..4100].copy_from_slice(b"mmap");
+        sys_pwrite64(fd, b"W".as_ptr(), 1, 11);
+        ok &= v[11] == b'W';
+        sys_munmap(m as u64, 8192);
+    }
+    let mut got = [0u8; 4];
+    sys_pread64(fd, got.as_mut_ptr(), 4, 4096);
+    sys_pwrite64(fd, b"w".as_ptr(), 1, 11);
+    sys_close(fd as u64);
+    verdict(b"VFAT_MAP_SHARED", ok && &got == b"mmap", w);
 }
 
 /// An open file renamed is still the same inode under its new name

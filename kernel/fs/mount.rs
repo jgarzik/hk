@@ -341,6 +341,7 @@ pub fn dev_super(
     let h = bdev.open_handle()?;
     let sb = mount_dev_fn(fs_type, bdev)?;
     sb.set_bdev(h);
+    super::fs_writeback::register_sb(&sb);
     Ok(sb)
 }
 
@@ -400,6 +401,10 @@ pub fn do_umount(mount: Arc<Mount>, flags: i32) -> Result<(), KernelError> {
     if !force && !detach && is_mount_busy(&mount) {
         return Err(KernelError::Busy);
     }
+
+    // Write the filesystem back before it goes (Linux
+    // generic_shutdown_super -> sync_filesystem)
+    let _ = super::fs_writeback::writeback_sb(&mount.sb);
 
     // Clear the mountpoint flag on the dentry
     if let Some(mp) = mount.get_mountpoint() {

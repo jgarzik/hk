@@ -234,6 +234,10 @@ pub struct SuperBlock {
     /// while the superblock lives (Linux s_bdev_file)
     s_bdev: spin::Once<crate::storage::blkdev::BdevHandle>,
 
+    /// Inodes with dirty pages, each held until written back (Linux
+    /// wb->b_dirty; `fs_writeback`)
+    pub(crate) s_dirty: crate::sync::spin::Mutex<alloc::vec::Vec<Arc<Inode>>>,
+
     /// Mutex for cross-directory renames (like Linux s_vfs_rename_mutex)
     ///
     /// Serializes all cross-directory renames on this filesystem to
@@ -280,6 +284,7 @@ impl SuperBlock {
             dev_id: NEXT_DEV_ID.fetch_add(1, Ordering::Relaxed),
             private: RwLock::new(None),
             s_bdev: spin::Once::new(),
+            s_dirty: crate::sync::spin::Mutex::new(alloc::vec::Vec::new()),
             s_vfs_rename_mutex: sync::Mutex::new(()),
         })
     }
@@ -341,6 +346,11 @@ impl SuperBlock {
     /// Hold the block device open for the superblock's life
     pub fn set_bdev(&self, h: crate::storage::blkdev::BdevHandle) {
         self.s_bdev.call_once(|| h);
+    }
+
+    /// The block device the filesystem is mounted from
+    pub fn bdev(&self) -> Option<&Arc<crate::storage::BlockDevice>> {
+        self.s_bdev.get().map(|h| h.bdev())
     }
 
     /// Set filesystem-specific private data
