@@ -5,8 +5,6 @@
 These are safe fns or patterns whose use leads to undefined behaviour.
 None is known to fail today, but each is a soundness bug:
 
-- **IPC:** `msgctl(IPC_SET)` writes `qbytes` through a shared reference,
-  racing with `msgsnd`. The sem/msg/shm downcasts are unchecked.
 - **uaccess:**
   - `get_user`/`put_user`/`copy_val_*` accept any `Copy` type, so a user
     can make an invalid `bool`/enum/reference, and padding bytes get

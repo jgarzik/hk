@@ -18,7 +18,7 @@ use core::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, Ordering};
 use crate::arch::Uaccess;
 use crate::error::KernelError;
 use crate::ipc::util::{
-    IPC_PERM_READ, IPC_PERM_WRITE, IpcObject, IpcType, KernIpcPerm, ipc_checkperm, ipcget,
+    IPC_PERM_READ, IPC_PERM_WRITE, IpcObject, KernIpcPerm, ipc_checkperm, ipcget,
 };
 use crate::ipc::{IPC_64, IPC_RMID, IPC_SET, IPC_STAT, IpcNamespace, Shmid64Ds, current_ipc_ns};
 use crate::mm::shmem::Shmem;
@@ -134,10 +134,6 @@ impl IpcObject for ShmidKernel {
         &self.perm
     }
 
-    fn ipc_type(&self) -> IpcType {
-        IpcType::Shm
-    }
-
     /// Linux shm_destroy: once removed (IPC_RMID) and detached. The
     /// pages go with the last reference to the segment's object.
     fn destroy(&self) {
@@ -146,24 +142,6 @@ impl IpcObject for ShmidKernel {
         }
         let pages = self.segsz.div_ceil(PAGE_SIZE) as u64;
         self.ns.shm_tot.fetch_sub(pages, Ordering::Relaxed);
-    }
-}
-
-// ============================================================================
-// Safe Downcasting
-// ============================================================================
-
-/// Safely downcast an IpcObject to ShmidKernel
-///
-/// Returns None if the object is not a shared memory segment.
-/// This is safe because we verify the type tag before casting.
-fn downcast_shm(obj: &dyn IpcObject) -> Option<&ShmidKernel> {
-    if obj.ipc_type() == IpcType::Shm {
-        // SAFETY: We verified the type tag matches, so this cast is valid.
-        // The IpcType::Shm tag is only returned by ShmidKernel::ipc_type().
-        Some(unsafe { &*(obj as *const dyn IpcObject as *const ShmidKernel) })
-    } else {
-        None
     }
 }
 
@@ -177,29 +155,27 @@ fn downcast_shm(obj: &dyn IpcObject) -> Option<&ShmidKernel> {
 /// it (munmap, shmdt, exit, exec); the last drop of a removed segment
 /// destroys it. Takes no lock (safe under the mm lock).
 pub struct ShmAttach {
-    seg: Arc<dyn IpcObject>,
+    seg: Arc<ShmidKernel>,
     /// Attached SHM_RDONLY: never writable (Linux: no VM_MAYWRITE)
     rdonly: bool,
 }
 
 impl ShmAttach {
-    fn new(seg: Arc<dyn IpcObject>, rdonly: bool) -> Option<Self> {
-        downcast_shm(seg.as_ref())?;
+    fn new(seg: Arc<ShmidKernel>, rdonly: bool) -> Self {
         let a = Self { seg, rdonly };
         a.open();
-        Some(a)
+        a
     }
 
     fn shm(&self) -> &ShmidKernel {
-        // SAFETY of the unwrap: checked in `new`
-        downcast_shm(self.seg.as_ref()).unwrap()
+        &self.seg
     }
 
     /// A new attachment, unless the segment was removed meanwhile
     /// (IPC_RMID raced the lookup): then backed out, EINVAL like a
     /// removed id. Pairs with the fence in IPC_RMID.
-    fn attach_live(seg: Arc<dyn IpcObject>, rdonly: bool) -> Option<Self> {
-        let a = Self::new(seg, rdonly)?;
+    fn attach_live(seg: Arc<ShmidKernel>, rdonly: bool) -> Option<Self> {
+        let a = Self::new(seg, rdonly);
         core::sync::atomic::fence(Ordering::SeqCst);
         if a.seg.perm().is_deleted() {
             return None; // the drop detaches (and destroys if last)
@@ -328,7 +304,7 @@ fn do_shmat(shmid: i32, shmaddr: u64, shmflg: i32) -> Result<u64, i32> {
         IPC_PERM_READ | IPC_PERM_WRITE
     };
     ipc_checkperm(shm_obj.perm(), access)?;
-    let shm_kernel = downcast_shm(shm_obj.as_ref()).ok_or(einval)?;
+    let shm_kernel: &ShmidKernel = &shm_obj;
     let size = (shm_kernel.segsz as u64).div_ceil(PAGE_SIZE as u64) * PAGE_SIZE as u64;
     let shmem = shm_kernel.shmem.clone();
 
@@ -462,12 +438,7 @@ fn do_shmctl(shmid: i32, cmd: i32, buf: u64) -> Result<i32, i32> {
             // Fill and copy structure
             let mut ds = Shmid64Ds::default();
 
-            // Downcast safely with type verification
-            let shm_kernel: &ShmidKernel = match downcast_shm(shm.as_ref()) {
-                Some(shm) => shm,
-                None => return Err(KernelError::InvalidArgument.errno()),
-            };
-            shm_kernel.fill_shmid64_ds(&mut ds);
+            shm.fill_shmid64_ds(&mut ds);
 
             if buf != 0 {
                 put_user::<Uaccess, Shmid64Ds>(buf, ds)
@@ -488,31 +459,20 @@ fn do_shmctl(shmid: i32, cmd: i32, buf: u64) -> Result<i32, i32> {
             let ds: Shmid64Ds =
                 get_user::<Uaccess, Shmid64Ds>(buf).map_err(|_| KernelError::BadAddress.errno())?;
 
-            // Must be owner or have CAP_SYS_ADMIN
-            let cred = crate::task::percpu::current_cred();
-            let uid = cred.euid;
+            // Must be owner or have CAP_SYS_ADMIN; only uid, gid, mode
+            // change
+            let uid = crate::task::percpu::current_cred().euid;
             let perm = shm.perm();
-            let _lock = perm.lock.lock();
-            // SAFETY: We hold the lock
-            let perm_mutable = unsafe { perm.mutable() };
-            if uid != perm_mutable.uid && uid != perm.cuid && uid != 0 {
-                drop(_lock);
-                return Err(KernelError::NotPermitted.errno());
+            {
+                let mut p = perm.lock.lock();
+                if !KernIpcPerm::is_owner(&p, perm.cuid, uid) {
+                    return Err(KernelError::NotPermitted.errno());
+                }
+                p.uid = ds.shm_perm.uid;
+                p.gid = ds.shm_perm.gid;
+                p.mode = ds.shm_perm.mode & 0o777;
             }
-
-            // Update fields (only uid, gid, mode can be changed)
-            perm_mutable.uid = ds.shm_perm.uid;
-            perm_mutable.gid = ds.shm_perm.gid;
-            perm_mutable.mode = ds.shm_perm.mode & 0o777;
-
-            // Update ctime (safe downcast with type verification)
-            let shm_kernel: &ShmidKernel = match downcast_shm(shm.as_ref()) {
-                Some(shm) => shm,
-                None => return Err(KernelError::InvalidArgument.errno()),
-            };
-            shm_kernel
-                .ctim
-                .store(current_time_secs(), Ordering::Relaxed);
+            shm.ctim.store(current_time_secs(), Ordering::Relaxed);
 
             Ok(0)
         }
@@ -524,17 +484,10 @@ fn do_shmctl(shmid: i32, cmd: i32, buf: u64) -> Result<i32, i32> {
                 .find_by_id(shmid)
                 .ok_or(KernelError::InvalidArgument.errno())?;
 
-            let cred = crate::task::percpu::current_cred();
-            let uid = cred.euid;
+            let uid = crate::task::percpu::current_cred().euid;
             let perm = shm.perm();
-            {
-                let _lock = perm.lock.lock();
-                // SAFETY: We hold the lock
-                let perm_mutable = unsafe { perm.mutable_ref() };
-                if uid != perm_mutable.uid && uid != perm.cuid && uid != 0 {
-                    drop(_lock);
-                    return Err(KernelError::NotPermitted.errno());
-                }
+            if !KernIpcPerm::is_owner(&perm.lock.lock(), perm.cuid, uid) {
+                return Err(KernelError::NotPermitted.errno());
             }
 
             // Remove from ID table (marks it deleted). With no attachment
@@ -543,9 +496,7 @@ fn do_shmctl(shmid: i32, cmd: i32, buf: u64) -> Result<i32, i32> {
             // (`attach_live`), so it is destroyed exactly once
             if let Some(removed) = ns.shm_ids().remove(shmid) {
                 core::sync::atomic::fence(Ordering::SeqCst);
-                if let Some(shm_kernel) = downcast_shm(removed.as_ref())
-                    && shm_kernel.nattch.load(Ordering::SeqCst) == 0
-                {
+                if removed.nattch.load(Ordering::SeqCst) == 0 {
                     removed.destroy();
                 }
             }
@@ -562,11 +513,7 @@ fn do_shmctl(shmid: i32, cmd: i32, buf: u64) -> Result<i32, i32> {
                 .ok_or(KernelError::InvalidArgument.errno())?;
             let uid = crate::task::percpu::current_cred().euid;
             let perm = shm.perm();
-            let owner = {
-                let _lock = perm.lock.lock();
-                // SAFETY: We hold the lock
-                unsafe { perm.mutable_ref() }.uid
-            };
+            let owner = perm.lock.lock().uid;
             if !crate::task::capable(crate::task::CAP_IPC_LOCK) && uid != owner && uid != perm.cuid
             {
                 return Err(KernelError::NotPermitted.errno());

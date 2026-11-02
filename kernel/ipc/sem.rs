@@ -15,7 +15,7 @@ use core::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, Ordering};
 use crate::arch::Uaccess;
 use crate::error::KernelError;
 use crate::ipc::util::{
-    IPC_PERM_READ, IPC_PERM_WRITE, IpcObject, IpcType, KernIpcPerm, ipc_checkperm, ipcget,
+    IPC_PERM_READ, IPC_PERM_WRITE, IpcObject, KernIpcPerm, ipc_checkperm, ipcget,
 };
 use crate::ipc::{
     IPC_64, IPC_NOWAIT, IPC_RMID, IPC_SET, IPC_STAT, IpcNamespace, Sembuf, Semid64Ds,
@@ -229,10 +229,6 @@ impl IpcObject for SemArray {
         &self.perm
     }
 
-    fn ipc_type(&self) -> IpcType {
-        IpcType::Sem
-    }
-
     fn destroy(&self) {
         // Wake all pending operations with EIDRM
         let mut pending = self.pending.lock();
@@ -247,24 +243,6 @@ impl IpcObject for SemArray {
 
         // Update namespace count
         self.ns.used_sems.fetch_sub(self.nsems, Ordering::Relaxed);
-    }
-}
-
-// ============================================================================
-// Safe Downcasting
-// ============================================================================
-
-/// Safely downcast an IpcObject to SemArray
-///
-/// Returns None if the object is not a semaphore array.
-/// This is safe because we verify the type tag before casting.
-fn downcast_sem(obj: &dyn IpcObject) -> Option<&SemArray> {
-    if obj.ipc_type() == IpcType::Sem {
-        // SAFETY: We verified the type tag matches, so this cast is valid.
-        // The IpcType::Sem tag is only returned by SemArray::ipc_type().
-        Some(unsafe { &*(obj as *const dyn IpcObject as *const SemArray) })
-    } else {
-        None
     }
 }
 
@@ -391,10 +369,7 @@ fn do_semtimedop(semid: i32, sops_ptr: u64, nsops: usize, timeout_ptr: u64) -> R
         .sem_ids()
         .find_by_id(semid)
         .ok_or(KernelError::InvalidArgument.errno())?;
-
-    // Downcast
-    let sem_array: &SemArray =
-        unsafe { &*(sem_array.as_ref() as *const dyn IpcObject as *const SemArray) };
+    let sem_array: &SemArray = &sem_array;
 
     // Check permissions
     let alter = sops.iter().any(|s| s.sem_op != 0);
@@ -502,8 +477,7 @@ fn do_semctl(semid: i32, semnum: i32, cmd: i32, arg: u64) -> Result<i32, i32> {
 
             ipc_checkperm(sem.perm(), IPC_PERM_READ)?;
 
-            let sem_array: &SemArray =
-                unsafe { &*(sem.as_ref() as *const dyn IpcObject as *const SemArray) };
+            let sem_array: &SemArray = &sem;
 
             let mut ds = Semid64Ds::default();
             sem_array.fill_semid64_ds(&mut ds);
@@ -522,33 +496,21 @@ fn do_semctl(semid: i32, semnum: i32, cmd: i32, arg: u64) -> Result<i32, i32> {
                 .find_by_id(semid)
                 .ok_or(KernelError::InvalidArgument.errno())?;
 
-            let cred = crate::task::percpu::current_cred();
-            let uid = cred.euid;
-            let perm = sem.perm();
-            let _lock = perm.lock.lock();
-            // SAFETY: We hold the lock
-            let perm_mutable = unsafe { perm.mutable() };
-            if uid != perm_mutable.uid && uid != perm.cuid && uid != 0 {
-                drop(_lock);
-                return Err(KernelError::NotPermitted.errno());
-            }
-
+            let uid = crate::task::percpu::current_cred().euid;
+            // Copied in before the spin lock (the copy may fault)
             let ds: Semid64Ds =
                 get_user::<Uaccess, Semid64Ds>(arg).map_err(|_| KernelError::BadAddress.errno())?;
-
-            // Update fields
-            perm_mutable.uid = ds.sem_perm.uid;
-            perm_mutable.gid = ds.sem_perm.gid;
-            perm_mutable.mode = ds.sem_perm.mode & 0o777;
-
-            // Safe downcast with type verification
-            let sem_array: &SemArray = match downcast_sem(sem.as_ref()) {
-                Some(s) => s,
-                None => return Err(KernelError::InvalidArgument.errno()),
-            };
-            sem_array
-                .ctime
-                .store(current_time_secs(), Ordering::Relaxed);
+            let perm = sem.perm();
+            {
+                let mut p = perm.lock.lock();
+                if !KernIpcPerm::is_owner(&p, perm.cuid, uid) {
+                    return Err(KernelError::NotPermitted.errno());
+                }
+                p.uid = ds.sem_perm.uid;
+                p.gid = ds.sem_perm.gid;
+                p.mode = ds.sem_perm.mode & 0o777;
+            }
+            sem.ctime.store(current_time_secs(), Ordering::Relaxed);
 
             Ok(0)
         }
@@ -559,17 +521,10 @@ fn do_semctl(semid: i32, semnum: i32, cmd: i32, arg: u64) -> Result<i32, i32> {
                 .find_by_id(semid)
                 .ok_or(KernelError::InvalidArgument.errno())?;
 
-            let cred = crate::task::percpu::current_cred();
-            let uid = cred.euid;
+            let uid = crate::task::percpu::current_cred().euid;
             let perm = sem.perm();
-            {
-                let _lock = perm.lock.lock();
-                // SAFETY: We hold the lock
-                let perm_mutable = unsafe { perm.mutable_ref() };
-                if uid != perm_mutable.uid && uid != perm.cuid && uid != 0 {
-                    drop(_lock);
-                    return Err(KernelError::NotPermitted.errno());
-                }
+            if !KernIpcPerm::is_owner(&perm.lock.lock(), perm.cuid, uid) {
+                return Err(KernelError::NotPermitted.errno());
             }
 
             if let Some(removed) = ns.sem_ids().remove(semid) {
@@ -587,8 +542,7 @@ fn do_semctl(semid: i32, semnum: i32, cmd: i32, arg: u64) -> Result<i32, i32> {
 
             ipc_checkperm(sem.perm(), IPC_PERM_READ)?;
 
-            let sem_array: &SemArray =
-                unsafe { &*(sem.as_ref() as *const dyn IpcObject as *const SemArray) };
+            let sem_array: &SemArray = &sem;
 
             if semnum < 0 || semnum as u32 >= sem_array.nsems {
                 return Err(KernelError::InvalidArgument.errno());
@@ -608,8 +562,7 @@ fn do_semctl(semid: i32, semnum: i32, cmd: i32, arg: u64) -> Result<i32, i32> {
 
             ipc_checkperm(sem.perm(), IPC_PERM_WRITE)?;
 
-            let sem_array: &SemArray =
-                unsafe { &*(sem.as_ref() as *const dyn IpcObject as *const SemArray) };
+            let sem_array: &SemArray = &sem;
 
             if semnum < 0 || semnum as u32 >= sem_array.nsems {
                 return Err(KernelError::InvalidArgument.errno());
@@ -644,8 +597,7 @@ fn do_semctl(semid: i32, semnum: i32, cmd: i32, arg: u64) -> Result<i32, i32> {
 
             ipc_checkperm(sem.perm(), IPC_PERM_READ)?;
 
-            let sem_array: &SemArray =
-                unsafe { &*(sem.as_ref() as *const dyn IpcObject as *const SemArray) };
+            let sem_array: &SemArray = &sem;
 
             for (i, s) in sem_array.sems[..sem_array.nsems as usize]
                 .iter()
@@ -668,8 +620,7 @@ fn do_semctl(semid: i32, semnum: i32, cmd: i32, arg: u64) -> Result<i32, i32> {
 
             ipc_checkperm(sem.perm(), IPC_PERM_WRITE)?;
 
-            let sem_array: &SemArray =
-                unsafe { &*(sem.as_ref() as *const dyn IpcObject as *const SemArray) };
+            let sem_array: &SemArray = &sem;
 
             let pid = current_pid() as i32;
             for (i, s) in sem_array.sems[..sem_array.nsems as usize]
@@ -704,8 +655,7 @@ fn do_semctl(semid: i32, semnum: i32, cmd: i32, arg: u64) -> Result<i32, i32> {
 
             ipc_checkperm(sem.perm(), IPC_PERM_READ)?;
 
-            let sem_array: &SemArray =
-                unsafe { &*(sem.as_ref() as *const dyn IpcObject as *const SemArray) };
+            let sem_array: &SemArray = &sem;
 
             if semnum < 0 || semnum as u32 >= sem_array.nsems {
                 return Err(KernelError::InvalidArgument.errno());
@@ -925,10 +875,7 @@ pub fn exit_sem(tid: Tid) {
             continue; // Semaphore array was deleted
         };
 
-        // Downcast to SemArray
-        let Some(sem_array) = downcast_sem(sem_obj.as_ref()) else {
-            continue;
-        };
+        let sem_array: &SemArray = &sem_obj;
 
         // Apply adjustments
         let pid = current_pid() as i32;

@@ -14,7 +14,7 @@ use core::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicU64,
 use crate::arch::Uaccess;
 use crate::error::KernelError;
 use crate::ipc::util::{
-    IPC_PERM_READ, IPC_PERM_WRITE, IpcObject, IpcType, KernIpcPerm, ipc_checkperm, ipcget,
+    IPC_PERM_READ, IPC_PERM_WRITE, IpcObject, KernIpcPerm, ipc_checkperm, ipcget,
 };
 use crate::ipc::{
     IPC_64, IPC_NOWAIT, IPC_RMID, IPC_SET, IPC_STAT, IpcNamespace, Msqid64Ds, current_ipc_ns,
@@ -91,8 +91,9 @@ pub struct MsgQueue {
     pub cbytes: AtomicU64,
     /// Current number of messages
     pub qnum: AtomicU32,
-    /// Maximum bytes allowed
-    pub qbytes: u64,
+    /// Maximum bytes allowed (IPC_SET changes it, msgsnd reads it
+    /// unlocked)
+    pub qbytes: AtomicU64,
     /// Last sender PID
     pub lspid: AtomicI32,
     /// Last receiver PID
@@ -121,7 +122,7 @@ impl MsgQueue {
             ctime: AtomicI64::new(now),
             cbytes: AtomicU64::new(0),
             qnum: AtomicU32::new(0),
-            qbytes: ns.msg_ctlmnb as u64,
+            qbytes: AtomicU64::new(ns.msg_ctlmnb as u64),
             lspid: AtomicI32::new(0),
             lrpid: AtomicI32::new(0),
             messages: Mutex::new(VecDeque::new()),
@@ -252,7 +253,7 @@ impl MsgQueue {
         ds.msg_ctime = self.ctime.load(Ordering::Relaxed);
         ds.msg_cbytes = self.cbytes.load(Ordering::Relaxed);
         ds.msg_qnum = self.qnum.load(Ordering::Relaxed) as u64;
-        ds.msg_qbytes = self.qbytes;
+        ds.msg_qbytes = self.qbytes.load(Ordering::Relaxed);
         ds.msg_lspid = self.lspid.load(Ordering::Relaxed);
         ds.msg_lrpid = self.lrpid.load(Ordering::Relaxed);
         ds.__unused4 = 0;
@@ -263,10 +264,6 @@ impl MsgQueue {
 impl IpcObject for MsgQueue {
     fn perm(&self) -> &KernIpcPerm {
         &self.perm
-    }
-
-    fn ipc_type(&self) -> IpcType {
-        IpcType::Msg
     }
 
     fn destroy(&self) {
@@ -301,24 +298,6 @@ impl IpcObject for MsgQueue {
         let hdrs = self.qnum.load(Ordering::Relaxed) as u64;
         self.ns.msg_bytes.fetch_sub(bytes, Ordering::Relaxed);
         self.ns.msg_hdrs.fetch_sub(hdrs, Ordering::Relaxed);
-    }
-}
-
-// ============================================================================
-// Safe Downcasting
-// ============================================================================
-
-/// Safely downcast an IpcObject to MsgQueue
-///
-/// Returns None if the object is not a message queue.
-/// This is safe because we verify the type tag before casting.
-fn downcast_msg(obj: &dyn IpcObject) -> Option<&MsgQueue> {
-    if obj.ipc_type() == IpcType::Msg {
-        // SAFETY: We verified the type tag matches, so this cast is valid.
-        // The IpcType::Msg tag is only returned by MsgQueue::ipc_type().
-        Some(unsafe { &*(obj as *const dyn IpcObject as *const MsgQueue) })
-    } else {
-        None
     }
 }
 
@@ -394,8 +373,6 @@ fn do_msgsnd(msqid: i32, msgp: u64, msgsz: usize, msgflg: i32) -> Result<i32, i3
         .find_by_id(msqid)
         .ok_or(KernelError::InvalidArgument.errno())?;
 
-    let queue: &MsgQueue = unsafe { &*(queue.as_ref() as *const dyn IpcObject as *const MsgQueue) };
-
     // Check write permission
     ipc_checkperm(&queue.perm, IPC_PERM_WRITE)?;
 
@@ -412,7 +389,7 @@ fn do_msgsnd(msqid: i32, msgp: u64, msgsz: usize, msgflg: i32) -> Result<i32, i3
 
         // Check queue limits
         let current_bytes = queue.cbytes.load(Ordering::Acquire);
-        if current_bytes + msgsz as u64 > queue.qbytes {
+        if current_bytes + msgsz as u64 > queue.qbytes.load(Ordering::Relaxed) {
             if nowait {
                 return Err(KernelError::WouldBlock.errno());
             }
@@ -420,7 +397,8 @@ fn do_msgsnd(msqid: i32, msgp: u64, msgsz: usize, msgflg: i32) -> Result<i32, i3
             // Sleep until space or removal; a signal ends the call
             // (System V IPC is never restarted after a handler)
             let room = || {
-                queue.cbytes.load(Ordering::Acquire) + msgsz as u64 <= queue.qbytes
+                queue.cbytes.load(Ordering::Acquire) + msgsz as u64
+                    <= queue.qbytes.load(Ordering::Relaxed)
                     || queue.perm.is_deleted()
             };
             queue
@@ -478,8 +456,6 @@ fn do_msgrcv(msqid: i32, msgp: u64, msgsz: usize, msgtyp: i64, msgflg: i32) -> R
         .msg_ids()
         .find_by_id(msqid)
         .ok_or(KernelError::InvalidArgument.errno())?;
-
-    let queue: &MsgQueue = unsafe { &*(queue.as_ref() as *const dyn IpcObject as *const MsgQueue) };
 
     // Check read permission
     ipc_checkperm(&queue.perm, IPC_PERM_READ)?;
@@ -565,11 +541,8 @@ fn do_msgctl(msqid: i32, cmd: i32, buf: u64) -> Result<i32, i32> {
 
             ipc_checkperm(queue.perm(), IPC_PERM_READ)?;
 
-            let queue_inner: &MsgQueue =
-                unsafe { &*(queue.as_ref() as *const dyn IpcObject as *const MsgQueue) };
-
             let mut ds = Msqid64Ds::default();
-            queue_inner.fill_msqid64_ds(&mut ds);
+            queue.fill_msqid64_ds(&mut ds);
 
             if buf != 0 {
                 put_user::<Uaccess, Msqid64Ds>(buf, ds)
@@ -585,43 +558,26 @@ fn do_msgctl(msqid: i32, cmd: i32, buf: u64) -> Result<i32, i32> {
                 .find_by_id(msqid)
                 .ok_or(KernelError::InvalidArgument.errno())?;
 
-            let cred = crate::task::percpu::current_cred();
-            let uid = cred.euid;
-            let perm = queue.perm();
-            let _lock = perm.lock.lock();
-            // SAFETY: We hold the lock
-            let perm_mutable = unsafe { perm.mutable() };
-            if uid != perm_mutable.uid && uid != perm.cuid && uid != 0 {
-                drop(_lock);
-                return Err(KernelError::NotPermitted.errno());
-            }
-
+            let uid = crate::task::percpu::current_cred().euid;
+            // Copied in before the spin lock (the copy may fault)
             let ds: Msqid64Ds =
                 get_user::<Uaccess, Msqid64Ds>(buf).map_err(|_| KernelError::BadAddress.errno())?;
-
-            // Update fields
-            perm_mutable.uid = ds.msg_perm.uid;
-            perm_mutable.gid = ds.msg_perm.gid;
-            perm_mutable.mode = ds.msg_perm.mode & 0o777;
-
-            // Safe downcast with type verification
-            let queue_inner: &MsgQueue = match downcast_msg(queue.as_ref()) {
-                Some(q) => q,
-                None => return Err(KernelError::InvalidArgument.errno()),
-            };
-
-            // Update qbytes if root
-            if uid == 0 {
-                // Safety: single writer with lock held
-                let queue_mut = queue_inner as *const MsgQueue as *mut MsgQueue;
-                unsafe {
-                    (*queue_mut).qbytes = ds.msg_qbytes;
+            let perm = queue.perm();
+            {
+                let mut p = perm.lock.lock();
+                if !KernIpcPerm::is_owner(&p, perm.cuid, uid) {
+                    return Err(KernelError::NotPermitted.errno());
+                }
+                p.uid = ds.msg_perm.uid;
+                p.gid = ds.msg_perm.gid;
+                p.mode = ds.msg_perm.mode & 0o777;
+                // Only root raises the limit
+                if uid == 0 {
+                    queue.qbytes.store(ds.msg_qbytes, Ordering::Relaxed);
                 }
             }
 
-            queue_inner
-                .ctime
-                .store(current_time_secs(), Ordering::Release);
+            queue.ctime.store(current_time_secs(), Ordering::Release);
 
             Ok(0)
         }
@@ -632,17 +588,10 @@ fn do_msgctl(msqid: i32, cmd: i32, buf: u64) -> Result<i32, i32> {
                 .find_by_id(msqid)
                 .ok_or(KernelError::InvalidArgument.errno())?;
 
-            let cred = crate::task::percpu::current_cred();
-            let uid = cred.euid;
+            let uid = crate::task::percpu::current_cred().euid;
             let perm = queue.perm();
-            {
-                let _lock = perm.lock.lock();
-                // SAFETY: We hold the lock
-                let perm_mutable = unsafe { perm.mutable_ref() };
-                if uid != perm_mutable.uid && uid != perm.cuid && uid != 0 {
-                    drop(_lock);
-                    return Err(KernelError::NotPermitted.errno());
-                }
+            if !KernIpcPerm::is_owner(&perm.lock.lock(), perm.cuid, uid) {
+                return Err(KernelError::NotPermitted.errno());
             }
 
             if let Some(removed) = ns.msg_ids().remove(msqid) {

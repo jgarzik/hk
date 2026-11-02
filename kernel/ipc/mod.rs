@@ -70,11 +70,6 @@ pub const IPC_PRIVATE: i32 = 0;
 /// New version flag for *ctl commands
 pub const IPC_64: i32 = 0x0100;
 
-// Subsystem indices in IpcNamespace.ids array
-const IPC_SEM_IDS: usize = 0;
-const IPC_MSG_IDS: usize = 1;
-const IPC_SHM_IDS: usize = 2;
-
 // ============================================================================
 // IPC Namespace
 // ============================================================================
@@ -87,8 +82,10 @@ const IPC_SHM_IDS: usize = 2;
 /// - Message queues
 /// - Resource limits
 pub struct IpcNamespace {
-    /// ID tables: [0]=sem, [1]=msg, [2]=shm
-    pub ids: [IpcIds; 3],
+    /// ID tables, one per object type
+    sem_ids: IpcIds<sem::SemArray>,
+    msg_ids: IpcIds<msg::MsgQueue>,
+    shm_ids: IpcIds<shm::ShmidKernel>,
 
     // Semaphore limits (SEMMSL, SEMMNS, SEMOPM, SEMMNI)
     pub sem_ctls: [i32; 4],
@@ -112,7 +109,9 @@ impl IpcNamespace {
     /// Create a new IPC namespace with default limits
     pub fn new() -> Self {
         Self {
-            ids: [IpcIds::new(), IpcIds::new(), IpcIds::new()],
+            sem_ids: IpcIds::new(),
+            msg_ids: IpcIds::new(),
+            shm_ids: IpcIds::new(),
 
             // Semaphore defaults (from Linux)
             sem_ctls: [
@@ -144,7 +143,9 @@ impl IpcNamespace {
     /// IPC objects are NOT copied - new namespace starts empty.
     pub fn clone_ns(&self) -> Result<Arc<Self>, i32> {
         Ok(Arc::new(Self {
-            ids: [IpcIds::new(), IpcIds::new(), IpcIds::new()],
+            sem_ids: IpcIds::new(),
+            msg_ids: IpcIds::new(),
+            shm_ids: IpcIds::new(),
             sem_ctls: self.sem_ctls,
             used_sems: AtomicU32::new(0),
             msg_ctlmax: self.msg_ctlmax,
@@ -161,20 +162,20 @@ impl IpcNamespace {
 
     /// Get semaphore IDs table
     #[inline]
-    pub fn sem_ids(&self) -> &IpcIds {
-        &self.ids[IPC_SEM_IDS]
+    pub fn sem_ids(&self) -> &IpcIds<sem::SemArray> {
+        &self.sem_ids
     }
 
     /// Get message queue IDs table
     #[inline]
-    pub fn msg_ids(&self) -> &IpcIds {
-        &self.ids[IPC_MSG_IDS]
+    pub fn msg_ids(&self) -> &IpcIds<msg::MsgQueue> {
+        &self.msg_ids
     }
 
     /// Get shared memory IDs table
     #[inline]
-    pub fn shm_ids(&self) -> &IpcIds {
-        &self.ids[IPC_SHM_IDS]
+    pub fn shm_ids(&self) -> &IpcIds<shm::ShmidKernel> {
+        &self.shm_ids
     }
 }
 
