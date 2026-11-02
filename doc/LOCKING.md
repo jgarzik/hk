@@ -1580,8 +1580,14 @@ dropped before and after it is zeroed on the disk.)
   lock (mmap_lock read -> page lock -> PTE lock), so writeback never
   sees it writable but clean; then it may throttle (balance_dirty_pages
   writes the inode back: mmap_lock -> page lock -> i_mmap).
-- Dirty pages are counted per CPU (`NR_DIRTY`, atomics, Linux
-  NR_FILE_DIRTY), summed lock-free for the dirty limits.
+- Dirty, cached and unevictable pages are counted per CPU
+  (`NR_DIRTY`, `NR_FILE`, `NR_UNEVICT`: atomics, Linux vmstat), summed
+  lock-free for the dirty limits and /proc/meminfo.
+- Reclaim and drop_caches (`shrink_cache`, `drop_pagecache`) collect
+  the cached inodes first (each inode-cache bucket lock in turn, the
+  block device registry), then drop clean pages with no lock held but
+  each page's, taken with trylock (reclaim never waits for one); an
+  unevictable mapping (ramfs) is never touched.
 - Eviction (`Drop for AddressSpace`, the inode's last reference)
   empties `i_pages` without page locks: nothing else can reach the
   mapping any more.

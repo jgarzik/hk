@@ -1,4 +1,5 @@
-//! Page reclaim (Linux mm/vmscan.c, anonymous pages only)
+//! Page reclaim (Linux mm/vmscan.c): clean page cache, then anonymous
+//! pages
 //!
 //! `shrink_folio_list` frees isolated LRU pages by swapping them out:
 //! each page is locked (trylock: reclaim never waits for a page lock),
@@ -17,8 +18,9 @@
 //!
 //! Deviation from Linux: no accessed-bit aging (a page's PTE young bit
 //! is not consulted: pages go inactive at fault and are reclaimed
-//! oldest first), no file pages (P5), no kswapd (P6), writes are
-//! synchronous.
+//! oldest first), no file LRU (clean, unmapped cache pages are dropped
+//! inode by inode, `filemap::shrink_cache`; dirty or mapped ones stay),
+//! no kswapd (P6), writes are synchronous.
 
 use alloc::vec::Vec;
 
@@ -126,9 +128,16 @@ pub fn reclaim_pages(pages: Vec<u64>) -> usize {
 /// active list aged into it first when it runs short. Only with swap.
 /// The number freed.
 pub fn try_to_free_pages(nr: usize) -> usize {
+    // Clean page cache first: no I/O to free it (Linux balances the file
+    // and anon LRUs; with no file LRU hk takes the cache first)
+    let cached = super::filemap::shrink_cache(nr);
+    if cached >= nr {
+        return cached;
+    }
+    let nr = nr - cached;
     let (total, free) = super::swap::swap_totals();
     if total == 0 || free == 0 || !super::swap::bdev_swap_active() {
-        return 0;
+        return cached;
     }
     lru::lru_add_drain_all();
     if lru::LRUVEC.len(Lru::InactiveAnon) < nr {
@@ -136,7 +145,7 @@ pub fn try_to_free_pages(nr: usize) -> usize {
     }
     let mut pages = Vec::with_capacity(nr);
     lru::isolate_tail(Lru::InactiveAnon, nr, &mut pages);
-    shrink_folio_list(pages)
+    cached + shrink_folio_list(pages)
 }
 
 /// Move up to `nr` pages from the active tail to the inactive head

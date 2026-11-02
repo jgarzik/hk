@@ -189,3 +189,19 @@ pub fn evict(inode: &Inode) {
     remove_inode_hash(inode);
     inode.i_op.evict_inode(inode);
 }
+
+/// Every hashed inode still alive (drop_caches, reclaim): collected
+/// bucket by bucket, each reference taken under its lock and the
+/// inodes returned with no lock held
+pub fn all_inodes() -> Vec<Arc<Inode>> {
+    let mut v = Vec::new();
+    for b in table() {
+        let mut held = Vec::new();
+        {
+            let list = b.lock();
+            held.extend(list.iter().filter_map(|(_, _, w)| w.upgrade()));
+        }
+        v.append(&mut held);
+    }
+    v
+}

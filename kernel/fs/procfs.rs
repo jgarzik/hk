@@ -1674,8 +1674,11 @@ fn gen_version() -> Vec<u8> {
 
 /// Generate /proc/meminfo content (Linux meminfo_proc_show subset:
 /// 16-column labels, values in kB). Free memory is the frame
-/// allocator's exact count; hk has no reclaimable caches counted yet,
-/// so MemAvailable equals MemFree. Slab is the slab caches' pages.
+/// allocator's exact count; Buffers is the block devices' caches,
+/// Cached the rest of the page cache (ramfs included, as Linux counts
+/// tmpfs), Unevictable ramfs's, MemAvailable free plus the clean
+/// evictable cache. Writeback is 0 (writes are synchronous). Slab is
+/// the slab caches' pages.
 fn gen_meminfo() -> Vec<u8> {
     use alloc::fmt::Write;
     let fa = &crate::FRAME_ALLOCATOR;
@@ -1685,15 +1688,29 @@ fn gen_meminfo() -> Vec<u8> {
     let (swap_total, swap_free) = crate::mm::swap::swap_totals();
     let swap_cached = crate::mm::swap_state::total_cached();
     let mut out = String::new();
+    use crate::mm::filemap;
+    let file = filemap::nr_file_pages() * 4;
+    let buffers: u64 = crate::storage::blkdev::all_bdev_inodes()
+        .iter()
+        .map(|i| i.i_data.nrpages() * 4)
+        .sum();
+    let dirty = filemap::nr_dirty() * 4;
+    let unevict = filemap::nr_unevictable() * 4;
+    // What reclaim could free without I/O (Linux si_mem_available,
+    // without the low-watermark and half-of-cache reserve)
+    let avail = free + file.saturating_sub(unevict + dirty);
     for (label, kb) in [
         ("MemTotal:", total),
         ("MemFree:", free),
-        ("MemAvailable:", free),
-        ("Buffers:", 0),
-        ("Cached:", 0),
+        ("MemAvailable:", avail),
+        ("Buffers:", buffers),
+        ("Cached:", file.saturating_sub(buffers)),
         ("SwapCached:", swap_cached * 4),
+        ("Unevictable:", unevict),
         ("SwapTotal:", swap_total * 4),
         ("SwapFree:", swap_free * 4),
+        ("Dirty:", dirty),
+        ("Writeback:", 0),
         ("Slab:", slab),
     ] {
         let _ = writeln!(out, "{label:<16}{kb:>8} kB");

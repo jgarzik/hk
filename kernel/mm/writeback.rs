@@ -150,8 +150,28 @@ fn set_pair(
     Ok(())
 }
 
-/// /proc/sys/vm dirty limits (Linux vm_table)
+/// vm.drop_caches: the last value written
+static DROP_CACHES: AtomicU64 = AtomicU64::new(0);
+
+/// /proc/sys/vm dirty limits and drop_caches (Linux vm_table)
 pub static WB_CTLS: &[crate::sysctl::Ctl] = &[
+    // Linux drop_caches_sysctl_handler: 1 drops clean page cache, 2
+    // the reclaimable slab (hk: dentries and inodes have no LRU yet, so
+    // nothing), 3 both; 4 only silences the log
+    crate::sysctl::Ctl {
+        path: "vm/drop_caches",
+        mode: 0o200,
+        show: || alloc::vec![DROP_CACHES.load(Ordering::Relaxed) as i64],
+        store: |v| {
+            crate::sysctl::range(v[0], 1, 4)?;
+            DROP_CACHES.store(v[0] as u64, Ordering::Relaxed);
+            if v[0] & 1 != 0 {
+                crate::mm::filemap::drop_pagecache();
+            }
+            Ok(())
+        },
+        text: None,
+    },
     crate::sysctl::Ctl {
         path: "vm/dirty_background_ratio",
         mode: 0o644,

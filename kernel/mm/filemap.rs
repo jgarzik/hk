@@ -179,17 +179,45 @@ impl Drop for AddressSpace {
 static NR_DIRTY: crate::cpu::PerCpu<core::sync::atomic::AtomicI64> =
     crate::percpu![core::sync::atomic::AtomicI64::new(0)];
 
+/// Page-cache pages, and those of unevictable mappings, per CPU
+/// (Linux NR_FILE_PAGES, NR_UNEVICTABLE): /proc/meminfo
+static NR_FILE: crate::cpu::PerCpu<core::sync::atomic::AtomicI64> =
+    crate::percpu![core::sync::atomic::AtomicI64::new(0)];
+static NR_UNEVICT: crate::cpu::PerCpu<core::sync::atomic::AtomicI64> =
+    crate::percpu![core::sync::atomic::AtomicI64::new(0)];
+
+fn sum(c: &crate::cpu::PerCpu<core::sync::atomic::AtomicI64>) -> u64 {
+    c.for_each_possible()
+        .map(|(_, c)| c.load(Ordering::Relaxed))
+        .sum::<i64>()
+        .max(0) as u64
+}
+
+/// `d` pages entered (or left) the cache of `m`
+fn count_file(m: &AddressSpace, d: i64) {
+    NR_FILE.this().fetch_add(d, Ordering::Relaxed);
+    if m.has_flag(AS_UNEVICTABLE) {
+        NR_UNEVICT.this().fetch_add(d, Ordering::Relaxed);
+    }
+}
+
+/// Page-cache pages (Linux NR_FILE_PAGES)
+pub fn nr_file_pages() -> u64 {
+    sum(&NR_FILE)
+}
+
+/// Page-cache pages that never leave memory (ramfs; Linux Unevictable)
+pub fn nr_unevictable() -> u64 {
+    sum(&NR_UNEVICT)
+}
+
 fn count_dirty(d: i64) {
     NR_DIRTY.this().fetch_add(d, Ordering::Relaxed);
 }
 
 /// Dirty page-cache pages (Linux global_node_page_state(NR_FILE_DIRTY))
 pub fn nr_dirty() -> u64 {
-    NR_DIRTY
-        .for_each_possible()
-        .map(|(_, c)| c.load(Ordering::Relaxed))
-        .sum::<i64>()
-        .max(0) as u64
+    sum(&NR_DIRTY)
 }
 
 /// Clear the page's dirty bit; true (and uncounted) if it was set
@@ -260,6 +288,7 @@ fn add(m: &AddressSpace, phys: u64, index: u64) -> Result<(), KernelError> {
         };
         if stored.is_some() {
             m.nrpages.fetch_add(1, Ordering::Relaxed);
+            count_file(m, 1);
             return Ok(());
         }
         drop(pages);
@@ -353,6 +382,7 @@ pub fn remove(m: &AddressSpace, phys: u64) {
     pg.flags.fetch_and(!PG_UPTODATE, Ordering::Relaxed);
     pg.private.store(0, Ordering::Relaxed);
     m.nrpages.fetch_sub(1, Ordering::Relaxed);
+    count_file(m, -1);
     put_page(phys);
 }
 
@@ -382,6 +412,7 @@ pub fn truncate_from(m: &AddressSpace, from: u64) {
 /// Drop every page of a mapping nobody else can reach any more (Linux
 /// truncate_inode_pages_final, from eviction): no page lock, no sleep
 fn truncate_final(m: &AddressSpace) {
+    count_file(m, -(m.nrpages() as i64));
     let mut pages = m.i_pages.lock();
     pages.destroy(&mut |phys| {
         let pg = page(phys);
@@ -526,13 +557,14 @@ pub fn invalidate_range(inode: &Inode, start: u64, end: u64) -> Result<(), Kerne
 /// Drop the clean, unmapped, unused pages of `inode` with index in
 /// [first, last] (Linux invalidate_mapping_pages: best effort; dirty,
 /// locked, mapped or otherwise referenced pages stay)
-pub fn invalidate_clean(inode: &Inode, first: u64, last: u64) {
+pub fn invalidate_clean(inode: &Inode, first: u64, last: u64) -> u64 {
     let m = &inode.i_data;
     // The cache is the only copy of an unevictable mapping's data
     // (ramfs: its pages are never dirty, yet cannot be re-read)
     if m.has_flag(AS_UNEVICTABLE) {
-        return;
+        return 0;
     }
+    let mut freed = 0;
     let mut at = first;
     while at <= last {
         let next = {
@@ -542,7 +574,7 @@ pub fn invalidate_clean(inode: &Inode, first: u64, last: u64) {
                 .filter(|&(_, p)| FRAME_ALLOCATOR.incref(p))
         };
         let Some((index, phys)) = next else {
-            return;
+            return freed;
         };
         if super::page::trylock_page(phys) {
             let pg = page(phys);
@@ -552,15 +584,17 @@ pub fn invalidate_clean(inode: &Inode, first: u64, last: u64) {
                 && FRAME_ALLOCATOR.refcount(phys) == 2
             {
                 remove(m, phys);
+                freed += 1;
             }
             unlock_page(phys);
         }
         put_page(phys);
         match index.checked_add(1) {
             Some(n) => at = n,
-            None => return,
+            None => return freed,
         }
     }
+    freed
 }
 
 /// Drop every page of `inode` (Linux kill_bdev / truncate_inode_pages
@@ -747,5 +781,37 @@ pub fn fault(inode: &Inode, index: u64) -> Result<u64, VmFault> {
             return Err(VmFault::Bus);
         }
         return Ok(phys);
+    }
+}
+
+/// The inodes that may hold reclaimable cache: every hashed inode
+/// (on-disk filesystems) and every block device's
+fn cache_inodes() -> alloc::vec::Vec<alloc::sync::Arc<Inode>> {
+    let mut v = crate::fs::icache::all_inodes();
+    v.extend(crate::storage::blkdev::all_bdev_inodes());
+    v.retain(|i| i.i_data.nrpages() != 0);
+    v
+}
+
+/// Drop up to `nr` clean, unmapped page-cache pages for direct reclaim
+/// (Linux shrink_inactive_list of the file LRU). Deviation: no file
+/// LRU, so the pages go inode by inode, not oldest first. Never
+/// sleeps on a page lock (trylock); the number freed.
+pub fn shrink_cache(nr: usize) -> usize {
+    let mut freed = 0;
+    for inode in cache_inodes() {
+        if freed >= nr {
+            break;
+        }
+        freed += invalidate_clean(&inode, 0, u64::MAX) as usize;
+    }
+    freed
+}
+
+/// vm.drop_caches 1 (Linux drop_pagecache_sb over every superblock):
+/// drop every clean, unmapped page-cache page
+pub fn drop_pagecache() {
+    for inode in cache_inodes() {
+        invalidate_clean(&inode, 0, u64::MAX);
     }
 }

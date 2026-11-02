@@ -846,6 +846,15 @@ pub fn sync_blockdev(bdev: &BlockDevice) -> Result<(), KernelError> {
     crate::mm::filemap::write_and_wait(&bdev.bd_inode)
 }
 
+/// The page-cache inode of every block device (drop_caches, reclaim)
+pub fn all_bdev_inodes() -> Vec<Arc<crate::fs::Inode>> {
+    BLKDEV_REGISTRY
+        .read()
+        .values()
+        .map(|b| b.bd_inode.clone())
+        .collect()
+}
+
 /// Write back every block device's cache (sync(2): Linux sync_bdevs)
 pub fn sync_bdevs() {
     let all: Vec<Arc<BlockDevice>> = BLKDEV_REGISTRY.read().values().cloned().collect();

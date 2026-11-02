@@ -12,7 +12,7 @@ use super::helpers::{
     BlkDev, dev_major, dev_minor, find_blkdev, print, print_num, println, read_file,
 };
 use hk_syscall::{
-    O_CREAT, O_RDONLY, O_RDWR, Stat, sys_close, sys_fstat, sys_fsync, sys_ioctl, sys_lseek,
+    O_CREAT, O_RDONLY, O_RDWR, O_WRONLY, Stat, sys_close, sys_fstat, sys_fsync, sys_ioctl, sys_lseek,
     sys_mkdir, sys_mount, sys_open, sys_pread64, sys_pwrite64, sys_read, sys_stat, sys_swapoff,
     sys_rename, sys_swapon, sys_umount2, sys_unlink,
 };
@@ -390,6 +390,7 @@ fn vfat(d: &Disk) {
     verdict(b"BLK_RRPART_MOUNTED", busy == EBUSY, busy);
     vfat_mmap_write();
     vfat_swapfile();
+    drop_caches();
     vfat_rename_ino();
     vfat_unlink_open();
     vfat_unlink_reuse();
@@ -436,6 +437,48 @@ fn vfat_remount(p1: &BlkDev) {
         println(b"");
     }
     verdict(b"VFAT_REMOUNT_DATA", ok && u == 0, n);
+}
+
+/// Write `v` to /proc/sys/vm/drop_caches
+fn drop_caches_write(v: &[u8]) -> i64 {
+    let fd = sys_open(b"/proc/sys/vm/drop_caches\0".as_ptr(), O_WRONLY, 0) as i32;
+    let r = hk_syscall::sys_write(fd as u64, v.as_ptr(), v.len() as u64);
+    sys_close(fd as u64);
+    r
+}
+
+/// vm.drop_caches 1 frees the clean page cache of a vfat file (Linux
+/// drop_pagecache_sb): Cached falls by at least half its size (other
+/// activity moves Cached on Linux); ramfs data
+/// (only in the cache) survives it
+fn drop_caches() {
+    use super::helpers::proc_kb;
+    let fd = sys_open(b"/mnt/vd1/DC.BIN\0".as_ptr(), O_RDWR | O_CREAT, 0o644) as i32;
+    let buf = [b'd'; 4096];
+    for i in 0..256 {
+        sys_pwrite64(fd, buf.as_ptr(), 4096, i * 4096);
+    }
+    sys_fsync(fd);
+    let before = proc_kb(b"/proc/meminfo\0", b"Cached:");
+    let w = drop_caches_write(b"1\n");
+    let after = proc_kb(b"/proc/meminfo\0", b"Cached:");
+    let mut back = [0u8; 4096];
+    let n = sys_pread64(fd, back.as_mut_ptr(), 4096, 255 * 4096);
+    sys_close(fd as u64);
+    sys_unlink(b"/mnt/vd1/DC.BIN\0".as_ptr());
+    verdict(
+        b"DROP_CACHES",
+        w == 2 && before - after >= 512 && n == 4096 && back == buf,
+        before - after,
+    );
+    let t = sys_open(b"/tmp/dc_ramfs\0".as_ptr(), O_RDWR | O_CREAT, 0o644) as i32;
+    sys_pwrite64(t, b"ramfs keeps it".as_ptr(), 14, 0);
+    let w = drop_caches_write(b"3\n");
+    let mut r = [0u8; 14];
+    let n = sys_pread64(t, r.as_mut_ptr(), 14, 0);
+    sys_close(t as u64);
+    sys_unlink(b"/tmp/dc_ramfs\0".as_ptr());
+    verdict(b"DROP_CACHES_RAMFS", w == 2 && n == 14 && &r == b"ramfs keeps it", n);
 }
 
 /// A vfat file can be a swap area (Linux: bmap, generic swapfile

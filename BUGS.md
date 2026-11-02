@@ -45,9 +45,11 @@ Missing:
   memory). No errseq: fsync reports a writeback error once, to the
   caller that ran the writeback, not to every open file.
 
-- Reclaim (P4) swaps out private anonymous pages only, for
-  MADV_PAGEOUT: no accessed-bit aging (pages are reclaimed oldest
-  first), synchronous writes, no kswapd, no file pages; 2MB pages stay
+- Reclaim (P4) drops clean, unmapped page-cache pages inode by inode
+  (no file LRU, no aging: Linux reclaims the oldest file pages; dirty
+  or mapped ones stay until written back or unmapped), then swaps out
+  private anonymous pages, also for MADV_PAGEOUT: no accessed-bit aging
+  (pages are reclaimed oldest first), synchronous writes, no kswapd; 2MB pages stay
   off the LRU (never reclaimed whole; a split puts their 4KB pages on
   it). Pages exec copies the image into are not on the reverse map
   (never swapped). An active swap file can still be written,
