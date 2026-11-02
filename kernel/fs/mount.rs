@@ -128,6 +128,7 @@ impl Mount {
     /// Set the mount point
     pub fn set_mountpoint(&self, dentry: Arc<Dentry>) {
         dentry.set_mountpoint(true);
+        note_mp(&dentry, 1);
         *self.mountpoint.write() = Some(dentry);
     }
 
@@ -225,6 +226,9 @@ impl Mount {
             mnt_flags: AtomicU32::new(old_mount.flags()),
             mnt_count: AtomicU64::new(0),
         });
+        if let Some(mp) = new_mount.get_mountpoint() {
+            note_mp(&mp, 1);
+        }
 
         // Add to parent's children
         new_parent.children.write().push(new_mount.clone());
@@ -407,9 +411,28 @@ pub fn do_umount(mount: Arc<Mount>, flags: i32) -> Result<(), KernelError> {
     *mount.parent.write() = None;
 
     // Clear mountpoint reference
-    *mount.mountpoint.write() = None;
+    if let Some(mp) = mount.mountpoint.write().take() {
+        note_mp(&mp, -1);
+    }
 
     Ok(())
+}
+
+/// Count a mount on (`+1`) or off (`-1`) the filesystem `mp` is in
+fn note_mp(mp: &Dentry, delta: i32) {
+    if let Some(sb) = mp.superblock() {
+        sb.note_mounted_on(delta);
+    }
+}
+
+impl Drop for Mount {
+    /// A mount dropped without an umount (a namespace going away) still
+    /// had its mountpoint counted
+    fn drop(&mut self) {
+        if let Some(mp) = self.mountpoint.get_mut().take() {
+            note_mp(&mp, -1);
+        }
+    }
 }
 
 /// Something is mounted on `d` in the caller's mount namespace (Linux
@@ -421,6 +444,10 @@ pub fn is_local_mountpoint(d: &Arc<Dentry>) -> bool {
     let Some(inode) = d.get_inode() else {
         return false;
     };
+    // Nothing is mounted anywhere on this filesystem: no walk
+    if inode.sb.upgrade().is_none_or(|sb| !sb.has_mounts_on()) {
+        return false;
+    }
     let Some(root) = crate::ns::current_mnt_ns().get_root() else {
         return false;
     };
