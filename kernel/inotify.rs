@@ -31,15 +31,13 @@
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
-use alloc::sync::{Arc, Weak};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicI32, Ordering};
 
 use crate::arch::IrqSpinlock;
 use crate::fs::KernelError;
-use crate::fs::dentry::Dentry;
 use crate::fs::file::{File, FileOps, flags};
-use crate::fs::inode::{Inode, InodeMode, NULL_INODE_OPS, Timespec as InodeTimespec};
 use crate::poll::{POLLIN, POLLRDNORM, PollTable};
 use crate::waitqueue::WaitQueue;
 
@@ -494,7 +492,6 @@ pub fn create_inotify(in_flags: i32) -> Result<Arc<File>, KernelError> {
     let inotify = Inotify::new();
 
     // Create dummy dentry for inotify
-    let dentry = create_inotify_dentry()?;
 
     // Determine file flags
     let mut file_flags = flags::O_RDONLY;
@@ -502,26 +499,9 @@ pub fn create_inotify(in_flags: i32) -> Result<Arc<File>, KernelError> {
         file_flags |= flags::O_NONBLOCK;
     }
 
-    let file = Arc::new(File::new_anon(dentry, file_flags, &INOTIFY_FOPS, inotify));
+    let file =
+        crate::fs::anon_inodes::anon_inode_getfile("inotify", &INOTIFY_FOPS, inotify, file_flags);
     Ok(file)
-}
-
-/// Create a dummy dentry for inotify
-fn create_inotify_dentry() -> Result<Arc<Dentry>, KernelError> {
-    let mode = InodeMode::regular(0o600);
-    let inode = Arc::new(Inode::new(
-        0,
-        mode,
-        0,
-        0,
-        0,
-        InodeTimespec::from_secs(0),
-        Weak::new(),
-        &NULL_INODE_OPS,
-    ));
-
-    let dentry = Arc::new(Dentry::new_anonymous(String::from("inotify"), Some(inode)));
-    Ok(dentry)
 }
 
 /// Get the Inotify from a File

@@ -18,7 +18,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::Ordering;
 
 use crate::arch::Uaccess;
 use crate::error::KernelError;
@@ -170,9 +170,6 @@ impl AsAny for SockInode {
 }
 impl InodeData for SockInode {}
 
-/// Next sockfs inode number (Linux get_next_ino)
-static NEXT_INO: AtomicU64 = AtomicU64::new(1);
-
 /// The protocol socket behind a file, if it is a socket
 pub fn sock_of(file: &File) -> Option<Arc<dyn ProtoOps>> {
     let inode = file.get_inode()?;
@@ -185,7 +182,7 @@ pub fn sock_of(file: &File) -> Option<Arc<dyn ProtoOps>> {
 
 /// Wrap a protocol socket in a new sockfs file (Linux sock_alloc_file)
 pub fn sock_alloc_file(sock: Arc<dyn ProtoOps>, nonblock: bool) -> Arc<File> {
-    let ino = NEXT_INO.fetch_add(1, Ordering::Relaxed);
+    let ino = crate::fs::anon_inodes::get_next_ino();
     sock.sk().ino.store(ino, Ordering::Release);
     let cred = &sock.sk().cred;
     let now = crate::time::TIMEKEEPER.current_time();

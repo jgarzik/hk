@@ -173,7 +173,7 @@ SIOCUNIXFILE, SO_PEERSEC (ENOPROTOOPT, as on Linux without an LSM).
 Missing: fs.protected_hardlinks/symlinks/fifos/regular do not exist
 (behave as their kernel default 0); no
 immutable/append-only inodes (no IS_APPEND/IS_IMMUTABLE EPERM);
-chmod/chown do not update ctime; ETXTBSY is not enforced.
+ETXTBSY is not enforced.
 
 ## Spinlocks where Linux uses sleeping locks
 
@@ -542,12 +542,6 @@ sched pid 0, flock/POSIX release, signalfd reader, errno flattening.
   and RT signal queueing are lost); waitid without WEXITED is EINVAL
   (C); semctl GETNCNT/GETZCNT are 0; fallocate PUNCH_HOLE succeeds
   without zeroing (F).
-- **Anonymous-inode files** (E): eleven copies of the dentry setup
-  (eventfd, timerfd, epoll, signalfd, pidfd, inotify, fanotify,
-  io_uring, bpf, pipe, mqueue), all inode number 0 (every pipe is
-  `pipe:[0]`), mode S_IFREG|0600 (Linux: 0600, no type), names unlike
-  Linux's (`epoll` vs `[eventpoll]`). One anon_inode_getfile, pipefs
-  numbers from get_next_ino.
 - **Copied helpers** (J, or as touched): `get_nofile_limit` in eight
   places; `find_task_by_pid` in four (all root-namespace pids); four
   `current_time`s; about ten user-timespec readers each validating

@@ -1126,20 +1126,21 @@ pub fn create_pipe(pipe_flags: u32) -> Result<(Arc<File>, Arc<File>), KernelErro
 /// requires a dentry. This creates a minimal anonymous dentry.
 fn create_pipe_dentry() -> Result<Arc<Dentry>, KernelError> {
     use crate::fs::dentry::Dentry;
-    use crate::fs::inode::{Inode, InodeMode, NULL_INODE_OPS, Timespec};
+    use crate::fs::inode::{Inode, InodeMode, NULL_INODE_OPS};
     use alloc::string::String;
     use alloc::sync::Weak;
 
-    // Create anonymous inode for pipe
-    let mode = InodeMode::fifo(0o600);
+    // A pipefs inode (Linux get_pipe_inode): its own number, the
+    // creator's fsuid/fsgid, the current time
+    let cred = crate::task::percpu::current_cred();
     let inode = Arc::new(Inode::new(
-        0, // ino=0 for anonymous
-        mode,
-        0,                      // uid (root)
-        0,                      // gid (root)
-        0,                      // size
-        Timespec::from_secs(0), // mtime
-        Weak::new(),            // no superblock for anonymous inode
+        crate::fs::anon_inodes::get_next_ino(),
+        InodeMode::fifo(0o600),
+        cred.fsuid,
+        cred.fsgid,
+        0,
+        crate::time::TIMEKEEPER.current_time(),
+        Weak::new(),
         &NULL_INODE_OPS,
     ));
 

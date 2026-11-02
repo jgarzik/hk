@@ -22,14 +22,11 @@
 //! - poll() support for integration with select/poll/epoll
 //! - Mask can be updated by calling signalfd4 with existing fd
 
-use alloc::string::String;
-use alloc::sync::{Arc, Weak};
+use alloc::sync::Arc;
 
 use crate::arch::IrqSpinlock;
 use crate::fs::KernelError;
-use crate::fs::dentry::Dentry;
 use crate::fs::file::{File, FileOps, flags};
-use crate::fs::inode::{Inode, InodeMode, NULL_INODE_OPS, Timespec as InodeTimespec};
 use crate::poll::{POLLIN, POLLRDNORM, PollTable};
 use crate::signal::{SigSet, UNMASKABLE_SIGNALS, with_task_signal_state};
 use crate::task::percpu::current_tid;
@@ -290,7 +287,6 @@ pub fn create_signalfd(mask: SigSet, sfd_flags: i32) -> Result<Arc<File>, Kernel
     let signalfd = Signalfd::new(mask);
 
     // Create dummy dentry for signalfd
-    let dentry = create_signalfd_dentry()?;
 
     // Determine file flags - signalfd is read-only
     let mut file_flags = flags::O_RDONLY;
@@ -298,26 +294,13 @@ pub fn create_signalfd(mask: SigSet, sfd_flags: i32) -> Result<Arc<File>, Kernel
         file_flags |= flags::O_NONBLOCK;
     }
 
-    let file = Arc::new(File::new_anon(dentry, file_flags, &SIGNALFD_FOPS, signalfd));
+    let file = crate::fs::anon_inodes::anon_inode_getfile(
+        "[signalfd]",
+        &SIGNALFD_FOPS,
+        signalfd,
+        file_flags,
+    );
     Ok(file)
-}
-
-/// Create a dummy dentry for signalfd
-fn create_signalfd_dentry() -> Result<Arc<Dentry>, KernelError> {
-    let mode = InodeMode::regular(0o600);
-    let inode = Arc::new(Inode::new(
-        0, // ino=0 for anonymous
-        mode,
-        0,                           // uid (root)
-        0,                           // gid (root)
-        0,                           // size
-        InodeTimespec::from_secs(0), // mtime
-        Weak::new(),                 // no superblock
-        &NULL_INODE_OPS,
-    ));
-
-    let dentry = Arc::new(Dentry::new_anonymous(String::from("signalfd"), Some(inode)));
-    Ok(dentry)
 }
 
 /// Get the Signalfd from a File (for syscall implementations)

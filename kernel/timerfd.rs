@@ -24,15 +24,12 @@
 //! - poll() support for integration with select/poll/epoll
 //! - CLOCK_REALTIME, CLOCK_MONOTONIC, CLOCK_BOOTTIME and the alarm clocks
 
-use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use core::pin::Pin;
 
 use crate::arch::IrqSpinlock;
 use crate::fs::KernelError;
-use crate::fs::dentry::Dentry;
 use crate::fs::file::{File, FileOps, flags};
-use crate::fs::inode::{Inode, InodeMode, NULL_INODE_OPS, Timespec as InodeTimespec};
 use crate::hrtimer::{HRTIMER_HARD, HrClock, HrTimer};
 use crate::poll::{POLLIN, POLLRDNORM, PollTable};
 use crate::time_syscall::LinuxTimespec;
@@ -463,7 +460,6 @@ pub fn create_timerfd(clockid: i32, tfd_flags: i32) -> Result<Arc<File>, KernelE
     let timerfd = Timerfd::new(clockid);
 
     // Create dummy dentry for timerfd
-    let dentry = create_timerfd_dentry()?;
 
     // Determine file flags
     let mut file_flags = flags::O_RDONLY;
@@ -471,26 +467,9 @@ pub fn create_timerfd(clockid: i32, tfd_flags: i32) -> Result<Arc<File>, KernelE
         file_flags |= flags::O_NONBLOCK;
     }
 
-    let file = Arc::new(File::new_anon(dentry, file_flags, &TIMERFD_FOPS, timerfd));
+    let file =
+        crate::fs::anon_inodes::anon_inode_getfile("[timerfd]", &TIMERFD_FOPS, timerfd, file_flags);
     Ok(file)
-}
-
-/// Create a dummy dentry for timerfd
-fn create_timerfd_dentry() -> Result<Arc<Dentry>, KernelError> {
-    let mode = InodeMode::regular(0o600);
-    let inode = Arc::new(Inode::new(
-        0, // ino=0 for anonymous
-        mode,
-        0,                           // uid (root)
-        0,                           // gid (root)
-        0,                           // size
-        InodeTimespec::from_secs(0), // mtime
-        Weak::new(),                 // no superblock
-        &NULL_INODE_OPS,
-    ));
-
-    let dentry = Arc::new(Dentry::new_anonymous(String::from("timerfd"), Some(inode)));
-    Ok(dentry)
 }
 
 /// Get the Timerfd from a File (for syscall implementations)

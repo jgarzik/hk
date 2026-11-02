@@ -39,16 +39,13 @@
 //! - Optional kernel-side polling (SQPOLL)
 //! - Registered buffers and files for performance
 
-use alloc::string::String;
-use alloc::sync::{Arc, Weak};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::AtomicU32;
 
 use crate::arch::{IrqSpinlock, Uaccess};
 use crate::fs::KernelError;
-use crate::fs::dentry::Dentry;
 use crate::fs::file::{File, FileOps, flags};
-use crate::fs::inode::{Inode, InodeMode, NULL_INODE_OPS, Timespec as InodeTimespec};
 use crate::fs::iov::IoVec;
 use crate::mm::PAGE_SIZE;
 use crate::pipe::FD_CLOEXEC;
@@ -1263,23 +1260,12 @@ pub fn get_io_uring(file: &File) -> Option<Arc<IoUring>> {
 
 /// Create an io_uring file
 fn create_io_uring_file(ring: Arc<IoUring>) -> Result<Arc<File>, KernelError> {
-    // Create dummy dentry
-    let mode = InodeMode::regular(0o600);
-    let inode = Arc::new(Inode::new(
-        0,
-        mode,
-        0,
-        0,
-        0,
-        InodeTimespec::from_secs(0),
-        Weak::new(),
-        &NULL_INODE_OPS,
-    ));
-
-    let dentry = Arc::new(Dentry::new_anonymous(String::from("io_uring"), Some(inode)));
-    let file = Arc::new(File::new_anon(dentry, flags::O_RDWR, &IO_URING_FOPS, ring));
-
-    Ok(file)
+    Ok(crate::fs::anon_inodes::anon_inode_getfile(
+        "[io_uring]",
+        &IO_URING_FOPS,
+        ring,
+        flags::O_RDWR,
+    ))
 }
 
 // ============================================================================

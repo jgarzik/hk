@@ -18,6 +18,7 @@ pub mod superblock;
 pub mod syscall;
 
 // Syscall implementation modules
+pub mod anon_inodes;
 pub mod dir;
 pub mod fd;
 pub mod flock;

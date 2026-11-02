@@ -4,15 +4,13 @@
 //! BPF objects are exposed as file descriptors to userspace, allowing them to be
 //! managed with standard fd operations (close, dup, etc.).
 
-use alloc::string::String;
-use alloc::sync::{Arc, Weak};
+use alloc::sync::Arc;
 
 use super::map::BpfMap;
 use super::prog::BpfProg;
 use crate::error::KernelError;
-use crate::fs::dentry::Dentry;
+use crate::fs::anon_inodes::anon_inode_getfile;
 use crate::fs::file::{File, FileOps, flags};
-use crate::fs::inode::{Inode, InodeMode, NULL_INODE_OPS, Timespec as InodeTimespec};
 use crate::fs::syscall::{current_fd_table, get_nofile_limit};
 use crate::poll::PollTable;
 
@@ -99,11 +97,7 @@ impl FileOps for BpfProgFileOps {
 
 /// Create a file descriptor for a BPF map
 pub fn create_bpf_map_fd(map: Arc<BpfMap>) -> Result<i32, KernelError> {
-    // Create dummy dentry for the BPF map
-    let dentry = create_bpf_dentry("bpf-map");
-
-    // Create file with read/write flags
-    let file = Arc::new(File::new_anon(dentry, flags::O_RDWR, &BPF_MAP_FOPS, map));
+    let file = anon_inode_getfile("bpf-map", &BPF_MAP_FOPS, map, flags::O_RDWR);
 
     // Allocate file descriptor using the fd table
     let fd_table = current_fd_table();
@@ -119,16 +113,7 @@ pub fn create_bpf_map_fd(map: Arc<BpfMap>) -> Result<i32, KernelError> {
 pub fn create_bpf_prog_fd(prog: Arc<BpfProg>, prog_type: u32) -> Result<i32, KernelError> {
     let private = Arc::new(BpfProgFile { prog, prog_type });
 
-    // Create dummy dentry for the BPF program
-    let dentry = create_bpf_dentry("bpf-prog");
-
-    // Create file with read/write flags
-    let file = Arc::new(File::new_anon(
-        dentry,
-        flags::O_RDWR,
-        &BPF_PROG_FOPS,
-        private,
-    ));
+    let file = anon_inode_getfile("bpf-prog", &BPF_PROG_FOPS, private, flags::O_RDWR);
 
     // Allocate file descriptor using the fd table
     let fd_table = current_fd_table();
@@ -138,23 +123,6 @@ pub fn create_bpf_prog_fd(prog: Arc<BpfProg>, prog_type: u32) -> Result<i32, Ker
         Ok(fd) => Ok(fd),
         Err(e) => Err(KernelError::from_errno(e).unwrap_or(KernelError::Io)),
     }
-}
-
-/// Create a dummy dentry for BPF objects
-fn create_bpf_dentry(name: &str) -> Arc<Dentry> {
-    let mode = InodeMode::regular(0o600);
-    let inode = Arc::new(Inode::new(
-        0, // ino=0 for anonymous
-        mode,
-        0,                           // uid (root)
-        0,                           // gid (root)
-        0,                           // size
-        InodeTimespec::from_secs(0), // mtime
-        Weak::new(),                 // no superblock
-        &NULL_INODE_OPS,
-    ));
-
-    Arc::new(Dentry::new_anonymous(String::from(name), Some(inode)))
 }
 
 // =============================================================================

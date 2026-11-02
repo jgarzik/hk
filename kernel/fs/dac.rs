@@ -307,6 +307,7 @@ pub fn chmod(inode: &Inode, perm: u16) -> Result<(), KernelError> {
         perm &= !S_ISGID;
     }
     inode.set_mode_perm(perm);
+    inode.set_ctime(crate::time::TIMEKEEPER.current_time());
     Ok(())
 }
 
@@ -353,6 +354,8 @@ pub fn chown(inode: &Inode, uid: Option<Uid>, gid: Option<Gid>) -> Result<(), Ke
     if kill != 0 {
         inode.clear_mode_bits(kill);
     }
+    // chown_common: ATTR_CTIME even when no id changes
+    inode.set_ctime(crate::time::TIMEKEEPER.current_time());
     Ok(())
 }
 
