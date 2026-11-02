@@ -62,6 +62,20 @@ pub trait Aops: Sync {
     fn write_end(&self, inode: &Inode, pos: u64, copied: usize, phys: u64) -> usize {
         simple_write_end(inode, pos, copied, phys)
     }
+
+    /// Write the locked, dirty page `phys`, index `index`, to the
+    /// backing store (Linux ->writepage, synchronous); the page stays
+    /// locked. Default: no backing store (EIO).
+    fn writepage(&self, inode: &Inode, phys: u64, index: u64) -> Result<(), KernelError> {
+        let _ = (inode, phys, index);
+        Err(KernelError::Io)
+    }
+
+    /// Pages get dirty (false: Linux noop_dirty_folio, a mapping with
+    /// no backing store, e.g. ramfs, never writes back)
+    fn can_dirty(&self) -> bool {
+        true
+    }
 }
 
 /// A mapping with no I/O: pages read as zeros (a new inode before its
@@ -339,6 +353,9 @@ fn truncate_final(m: &AddressSpace) {
 /// Set the page's dirty bit and the mapping's DIRTY mark (Linux
 /// filemap_dirty_folio)
 pub fn dirty_page(m: &AddressSpace, phys: u64) {
+    if !m.aops().can_dirty() {
+        return;
+    }
     let pg = page(phys);
     if pg.flags.fetch_or(PG_DIRTY, Ordering::AcqRel) & PG_DIRTY == 0
         && pg.mapping.load(Ordering::Acquire) == m.key()
@@ -347,6 +364,51 @@ pub fn dirty_page(m: &AddressSpace, phys: u64) {
             .lock()
             .set_mark(pg.index.load(Ordering::Relaxed), MARK_DIRTY);
     }
+}
+
+/// Write every dirty page of `inode` and wait (Linux
+/// filemap_write_and_wait, synchronous I/O): each is locked, its dirty
+/// bit and mark cleared, then written. The first error is returned
+/// after the others were tried; a page that failed stays clean (Linux
+/// records the error on the mapping; the data is in the page still).
+pub fn write_and_wait(inode: &Inode) -> Result<(), KernelError> {
+    let m = &inode.i_data;
+    let mut err = Ok(());
+    let mut at = 0;
+    loop {
+        let next = {
+            let pages = m.i_pages.lock();
+            pages
+                .find(at, u64::MAX, Some(MARK_DIRTY))
+                .filter(|&(_, p)| FRAME_ALLOCATOR.incref(p))
+        };
+        let Some((index, phys)) = next else {
+            return err;
+        };
+        lock_page(phys);
+        let pg = page(phys);
+        if pg.mapping.load(Ordering::Acquire) == m.key() {
+            m.i_pages.lock().clear_mark(index, MARK_DIRTY);
+            if pg.flags.fetch_and(!PG_DIRTY, Ordering::AcqRel) & PG_DIRTY != 0
+                && let Err(e) = m.aops().writepage(inode, phys, index)
+                && err.is_ok()
+            {
+                err = Err(e);
+            }
+        }
+        unlock_page(phys);
+        put_page(phys);
+        match index.checked_add(1) {
+            Some(n) => at = n,
+            None => return err,
+        }
+    }
+}
+
+/// Drop every page of `inode` (Linux kill_bdev / truncate_inode_pages
+/// from 0), after `write_and_wait` if they must reach the disk
+pub fn invalidate(inode: &Inode) {
+    truncate_from(&inode.i_data, 0);
 }
 
 /// Linux simple_write_begin: the page, read first unless the write

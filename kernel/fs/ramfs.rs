@@ -48,6 +48,11 @@ impl Aops for RamfsAops {
         filemap::set_uptodate(phys);
         Ok(())
     }
+
+    /// The cache is the only copy: nothing to write back
+    fn can_dirty(&self) -> bool {
+        false
+    }
 }
 
 /// Page-cache errors of ramfs writes: no memory for a new page is

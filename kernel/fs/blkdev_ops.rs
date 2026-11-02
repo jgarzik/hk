@@ -1,8 +1,10 @@
 //! Block device files (Linux block/fops.c, block/ioctl.c)
 //!
-//! Reads and writes are synchronous bios through kernel bounce buffers
-//! (no page cache in front of block devices yet); a partial sector is
-//! read, patched and rewritten. fsync flushes the disk's write cache.
+//! Reads and writes go through the device's page cache: the page cache
+//! of its inode in the bdev pseudo filesystem (`BlockDevice.bd_inode`,
+//! Linux bd_mapping), shared with filesystems' metadata on the device
+//! (vfat), written back by fsync, sync, BLKFLSBUF and the last close,
+//! which also drops it (Linux blkdev_flush_mapping). mmap maps it.
 //! The open file holds its block device (`File.private`), counted as an
 //! opener (BLKRRPART, BLKBSZGET's initial value).
 
@@ -10,8 +12,11 @@ use alloc::sync::Arc;
 
 use crate::arch::Uaccess;
 use crate::error::KernelError;
+use crate::fs::inode::{Inode, InodeMode, Timespec};
+use crate::mm::filemap::{self, Aops};
+use crate::storage::DevId;
 use crate::storage::blkdev::{
-    BioOp, BlockDevice, SECTOR_SHIFT, bdev_rw_bytes, blkdev_issue_flush, get_blkdev,
+    BioOp, BlockDevice, SECTOR_SHIFT, bdev_rw_frame, blkdev_issue_flush, get_blkdev, sync_blockdev,
 };
 use crate::storage::genhd;
 use crate::uaccess::{get_user, put_user};
@@ -50,8 +55,7 @@ fn read_at(file: &File, buf: &mut [u8], pos: u64) -> Result<usize, KernelError> 
         return Ok(0);
     }
     let n = buf.len().min((size - pos) as usize);
-    bdev_rw_bytes(&b, BioOp::Read, pos, &mut buf[..n])?;
-    Ok(n)
+    filemap::read(&b.bd_inode, &mut buf[..n], pos)
 }
 
 /// Write at `pos`: EPERM if read-only, ENOSPC at or past the end, short
@@ -69,10 +73,66 @@ fn write_at(file: &File, buf: &[u8], pos: u64) -> Result<usize, KernelError> {
         return Err(KernelError::NoSpace);
     }
     let n = buf.len().min((size - pos) as usize);
-    let mut tmp = alloc::vec::Vec::from(&buf[..n]);
-    bdev_rw_bytes(&b, BioOp::Write, pos, &mut tmp)?;
-    Ok(n)
+    filemap::perform_write(&b.bd_inode, &buf[..n], pos)
 }
+
+/// The pages of a block device's inode are its sectors (Linux
+/// def_blk_aops: blkdev_read_folio, blkdev_writepages), read and
+/// written a page per bio straight into the cache frame
+struct BdevAops;
+
+fn inode_bdev(inode: &Inode) -> Result<Arc<BlockDevice>, KernelError> {
+    get_blkdev(inode.rdev).ok_or(KernelError::Io)
+}
+
+impl Aops for BdevAops {
+    fn read_folio(&self, inode: &Inode, phys: u64, index: u64) -> Result<(), KernelError> {
+        let b = inode_bdev(inode)?;
+        bdev_rw_frame(&b, BioOp::Read, index << (12 - SECTOR_SHIFT), phys)?;
+        filemap::set_uptodate(phys);
+        Ok(())
+    }
+
+    fn writepage(&self, inode: &Inode, phys: u64, index: u64) -> Result<(), KernelError> {
+        let b = inode_bdev(inode)?;
+        bdev_rw_frame(&b, BioOp::Write, index << (12 - SECTOR_SHIFT), phys)
+    }
+}
+
+static BDEV_AOPS: BdevAops = BdevAops;
+
+/// The bdev pseudo filesystem's inode of device `dev` with `size`
+/// bytes (Linux bdev_alloc): unhashed, no superblock
+pub fn bdev_inode(dev: DevId, size: u64) -> Arc<Inode> {
+    let inode = Arc::new(Inode::new_device(
+        0,
+        InodeMode::blockdev(0o600),
+        0,
+        0,
+        dev,
+        Timespec::ZERO,
+        alloc::sync::Weak::new(),
+        &BDEV_INODE_OPS,
+    ));
+    inode.set_size(size);
+    inode.i_data.set_aops(&BDEV_AOPS);
+    inode
+}
+
+/// The bdev inode's operations: its page cache maps (mmap of the node)
+struct BdevInodeOps;
+
+impl crate::fs::inode::InodeOps for BdevInodeOps {
+    fn lookup(&self, _dir: &Inode, _name: &str) -> Result<Arc<Inode>, KernelError> {
+        Err(KernelError::NotDirectory)
+    }
+
+    fn maps_cache(&self) -> bool {
+        true
+    }
+}
+
+static BDEV_INODE_OPS: BdevInodeOps = BdevInodeOps;
 
 fn put_int(arg: u64, v: i32) -> Result<i64, KernelError> {
     put_user::<Uaccess, i32>(arg, v).map_err(|_| KernelError::BadAddress)?;
@@ -114,7 +174,13 @@ fn blkdev_ioctl(b: &BlockDevice, cmd: u32, arg: u64) -> Result<i64, KernelError>
             genhd::rescan(b).map(|_| 0)
         }
         // No buffer cache to write back or drop yet
-        ioc::BLKFLSBUF => need_admin().map(|_| 0),
+        // Write the cache back and drop it (Linux blkdev_flushbuf)
+        ioc::BLKFLSBUF => {
+            need_admin()?;
+            sync_blockdev(b)?;
+            filemap::invalidate(&b.bd_inode);
+            Ok(0)
+        }
         _ => Err(KernelError::NotTty),
     }
 }
@@ -185,9 +251,12 @@ impl FileOps for BlockFileOps {
         Ok(pos as u64)
     }
 
-    /// Data is written through; make it durable (Linux blkdev_fsync)
+    /// Write the cache back, then flush the disk's write cache (Linux
+    /// blkdev_fsync)
     fn fsync(&self, file: &File) -> Result<(), KernelError> {
-        blkdev_issue_flush(&*bdev(file)?)
+        let b = bdev(file)?;
+        sync_blockdev(&b)?;
+        blkdev_issue_flush(&b)
     }
 
     fn ioctl(&self, file: &File, cmd: u32, arg: u64) -> Result<i64, KernelError> {

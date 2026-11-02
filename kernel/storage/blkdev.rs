@@ -12,8 +12,10 @@
 //!
 //! A [`Disk`] (Linux gendisk) is the device; a [`BlockDevice`] (Linux
 //! block_device) is the whole disk (partno 0) or one partition of it.
-//! There is no page cache in front of the block device files yet: file
-//! I/O and partition scans are synchronous bios (`submit_bio_wait`).
+//! Each block device has an inode (`bd_inode`, Linux bdev inode) whose
+//! page cache serves device-file I/O and filesystem metadata
+//! (`fs::blkdev_ops`); its pages are read and written a page per bio.
+//! Partition scans are synchronous bios (`submit_bio_wait`).
 //!
 //! ## Locking (doc/LOCKING.md 3.10, Block Device Subsystem)
 //!
@@ -407,6 +409,9 @@ pub struct BlockDevice {
     bsize: AtomicU32,
     /// Removed (hot unplug or partition rescan): I/O fails
     dead: AtomicBool,
+    /// The device's inode in the bdev pseudo filesystem: its page cache
+    /// (Linux bd_mapping) serves device-node I/O and filesystem metadata
+    pub bd_inode: Arc<crate::fs::Inode>,
 }
 
 impl BlockDevice {
@@ -422,6 +427,7 @@ impl BlockDevice {
             openers: AtomicU32::new(0),
             bsize: AtomicU32::new(512),
             dead: AtomicBool::new(false),
+            bd_inode: crate::fs::blkdev_ops::bdev_inode(dev, nr_sects << SECTOR_SHIFT),
         }
     }
 
@@ -511,11 +517,18 @@ impl BlockDevice {
         Ok(BdevHandle(self.clone()))
     }
 
-    /// The last reference of an open file went away
+    /// The last reference of an open file went away; the last opener
+    /// writes the cache back and drops it (Linux blkdev_put_whole ->
+    /// blkdev_flush_mapping: sync_blockdev + kill_bdev), under
+    /// open_mutex, so the next opener reads the disk
     pub fn release(&self) {
         let _g = self.disk.open_mutex.lock();
-        if self.openers.fetch_sub(1, Ordering::Relaxed) == 1 && self.partno != 0 {
-            self.disk.open_partitions.fetch_sub(1, Ordering::Relaxed);
+        if self.openers.fetch_sub(1, Ordering::Relaxed) == 1 {
+            let _ = sync_blockdev(self);
+            crate::mm::filemap::invalidate(&self.bd_inode);
+            if self.partno != 0 {
+                self.disk.open_partitions.fetch_sub(1, Ordering::Relaxed);
+            }
         }
     }
 }
@@ -816,6 +829,19 @@ pub fn bdev_rw_bytes(
     }
     tmp[head..head + buf.len()].copy_from_slice(buf);
     bdev_rw(bdev, BioOp::Write, first, &mut tmp)
+}
+
+/// Write the device's dirty cache pages and wait (Linux sync_blockdev)
+pub fn sync_blockdev(bdev: &BlockDevice) -> Result<(), KernelError> {
+    crate::mm::filemap::write_and_wait(&bdev.bd_inode)
+}
+
+/// Write back every block device's cache (sync(2): Linux sync_bdevs)
+pub fn sync_bdevs() {
+    let all: Vec<Arc<BlockDevice>> = BLKDEV_REGISTRY.read().values().cloned().collect();
+    for b in all {
+        let _ = sync_blockdev(&b);
+    }
 }
 
 /// Flush the disk's volatile write cache (Linux blkdev_issue_flush)

@@ -108,6 +108,38 @@ pub fn run_tests() {
     rrpart(&d);
     vfat(&d);
     swap(&d.p2);
+    cache(&d.p3);
+}
+
+/// A block device's page cache (Linux bd_mapping): pwrite, pread and a
+/// MAP_SHARED mapping of the node see one copy; the last close writes
+/// it to the disk (a new open reads it back from there)
+fn cache(p3: &BlkDev) {
+    use hk_syscall::{MAP_SHARED, PROT_READ, PROT_WRITE, sys_mmap, sys_munmap};
+    const OFF: u64 = 8 << 20;
+    let a = open_dev(p3, O_RDWR);
+    let b = open_dev(p3, O_RDWR);
+    let w = sys_pwrite64(a, b"coherent".as_ptr(), 8, OFF as i64);
+    let p = sys_mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, b, OFF);
+    let mut ok = w == 8 && p > 0;
+    if p > 0 {
+        let m = unsafe { core::slice::from_raw_parts_mut(p as *mut u8, 4096) };
+        ok &= &m[..8] == b"coherent";
+        m[100..104].copy_from_slice(b"mmap");
+        sys_munmap(p as u64, 4096);
+    }
+    let mut got = [0u8; 4];
+    sys_pread64(a, got.as_mut_ptr(), 4, OFF as i64 + 100);
+    ok &= &got == b"mmap";
+    verdict(b"BLK_CACHE_COHERENT", ok, w);
+    let w2 = sys_pwrite64(a, b"on disk!".as_ptr(), 8, OFF as i64 + 512);
+    sys_close(a as u64);
+    sys_close(b as u64);
+    let c = open_dev(p3, O_RDONLY);
+    let mut back = [0u8; 8];
+    let n = sys_pread64(c, back.as_mut_ptr(), 8, OFF as i64 + 512);
+    sys_close(c as u64);
+    verdict(b"BLK_WRITEBACK_CLOSE", w2 == 8 && n == 8 && &back == b"on disk!", n);
 }
 
 /// vda1..3 are partitions 1..3 of vda: same major, minors follow

@@ -495,13 +495,6 @@ a reset register in PCI configuration space is ignored.
 **Location**: `kernel/storage/`, `kernel/virtio/blk.rs`,
 `kernel/fs/blkdev_ops.rs`, `kernel/fs/vfat.rs`
 
-- No page cache in front of block device files (P5): reads and writes
-  are synchronous bios. A filesystem's cached block device pages (vfat
-  keeps the FAT, directories and data of its partition in the global
-  page cache) are not coherent with I/O through the device node; Linux
-  shares one bdev mapping. Two writers of the same sector through
-  unaligned writes can lose one update (each reads, patches and writes
-  the sector without a page lock).
 - Partition tables are parsed in 512-byte sectors: on a disk with
   larger logical blocks, GPT LBAs and MBR sector counts are misread
   (Linux scales by the logical block size). MBR: no BSD, Solaris,
@@ -609,26 +602,6 @@ expected to fix it; "next batch" means the next fix batch.
    (`kernel/fs/link.rs:298`, `:484`): a link or rename across two
    mounts of one superblock (bind mounts) is EXDEV on Linux. Needs
    Path{mnt,dentry}; TODO in place for linkat.
-
-## P1 review findings (open)
-From the P1 /code-review (unverified unless noted). Tag = phase that fixes it.
-1. **Failed-read pages never discarded** (P5; confirmed by reading).
-   `kernel/mm/page_cache.rs:892` discard_page needs refcount 0, but
-   find_or_create_page returns refcount 1 and vfat read_bytes /
-   write_bytes never put it, so the discard is a no-op: after an I/O
-   error the zero page is served as FAT/dir data.
-2. **No uptodate/page lock on block-device pages** (P5).
-   `kernel/fs/vfat.rs:503` inserts the page before the bio read; a
-   concurrent reader copies zeros, a concurrent partial write is
-   overwritten when the DMA lands. Linux: folio locked + !uptodate
-   until read completes.
-3. **BLKRRPART/umount don't invalidate the bdev page cache** (P5).
-   `kernel/storage/genhd.rs:118`: cache keyed by (major, minor); a
-   re-created partition reusing a minor inherits stale and dirty
-   pages, which write back at old offsets.
-9. **Write path copies** (P5). `kernel/storage/blkdev.rs:749`:
-   writes take `&mut [u8]` (to_vec + bounce copy per page); unaligned
-   bdev_rw_bytes allocates a request-sized temp buffer.
 
 ## P2 review findings (open)
 From the P2 /code-review (unverified). Tag = when to fix.

@@ -18,11 +18,9 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use crate::frame_alloc::FrameAllocRef;
+use crate::PAGE_CACHE;
 use crate::mm::page_cache::{AddressSpaceOps, FileId, PAGE_SIZE};
-use crate::storage::blkdev::{BioOp, bdev_rw_frame, bdev_rw_page};
 use crate::storage::{BlockDevice, DevId, get_blkdev};
-use crate::{FRAME_ALLOCATOR, PAGE_CACHE};
 
 use super::dentry::Dentry;
 use super::file::{
@@ -35,40 +33,6 @@ use super::superblock::{
     FileSystemType, MSDOS_SUPER_MAGIC, StatFs, SuperBlock, SuperBlockData, SuperOps, fs_flags,
 };
 use crate::error::KernelError;
-
-// ============================================================================
-// VFAT AddressSpaceOps - Page I/O for writeback
-// ============================================================================
-
-/// VFAT address space operations for page cache writeback
-///
-/// Provides readpage/writepage implementations that translate FileId
-/// to block device and perform I/O via the block driver.
-pub struct VfatAddressSpaceOps;
-
-impl AddressSpaceOps for VfatAddressSpaceOps {
-    fn readpage(&self, file_id: FileId, page_offset: u64, buf: &mut [u8]) -> Result<usize, i32> {
-        // Decode FileId to get block device
-        let (major, minor) = file_id.to_blkdev().ok_or(-5)?; // EIO if not blkdev
-        let bdev = get_blkdev(DevId::new(major, minor)).ok_or(-5)?;
-
-        bdev_rw_page(&bdev, BioOp::Read, page_offset, buf).map_err(|_| -5)?;
-        Ok(PAGE_SIZE)
-    }
-
-    fn writepage(&self, file_id: FileId, page_offset: u64, buf: &[u8]) -> Result<usize, i32> {
-        // Decode FileId to get block device
-        let (major, minor) = file_id.to_blkdev().ok_or(-5)?; // EIO if not blkdev
-        let bdev = get_blkdev(DevId::new(major, minor)).ok_or(-5)?;
-
-        let mut tmp = buf.to_vec();
-        bdev_rw_page(&bdev, BioOp::Write, page_offset, &mut tmp).map_err(|_| -5)?;
-        Ok(PAGE_SIZE)
-    }
-}
-
-/// Global VFAT address space ops instance (for block device pages)
-pub static VFAT_AOPS: VfatAddressSpaceOps = VfatAddressSpaceOps;
 
 // ============================================================================
 // VFAT File AddressSpaceOps - Page I/O for file pages
@@ -466,146 +430,26 @@ fn decode_vfat_file_id(file_id: FileId) -> Option<(u8, u8, u32)> {
 // Block Device I/O
 // ============================================================================
 
-/// Fill a new block device page cache frame from the device; on a read
-/// error the page is dropped from the cache, not left there as data
-fn read_frame(bdev: &BlockDevice, page_offset: u64, frame: u64) -> Result<(), KernelError> {
-    let sector = page_offset * (PAGE_SIZE as u64 / 512);
-    let r = bdev_rw_frame(bdev, BioOp::Read, sector, frame);
-    if r.is_err() {
-        let id = FileId::from_blkdev(bdev.dev_id().major, bdev.dev_id().minor);
-        PAGE_CACHE
-            .lock()
-            .discard_page(id, page_offset, &mut FrameAllocRef(&FRAME_ALLOCATOR));
-    }
-    r
-}
-
-/// Read bytes from block device via page cache
+/// Read bytes of the device through its page cache (Linux sb_bread:
+/// the bdev mapping, shared with device-node I/O)
 fn read_bytes(bdev: &BlockDevice, offset: u64, buf: &mut [u8]) -> Result<(), KernelError> {
-    let file_id = FileId::from_blkdev(bdev.dev_id().major, bdev.dev_id().minor);
-    let capacity = bdev.capacity();
-
-    let mut pos = offset;
-    let mut remaining = buf.len();
-    let mut buf_offset = 0;
-
-    while remaining > 0 {
-        let page_offset = pos / PAGE_SIZE as u64;
-        let offset_in_page = (pos % PAGE_SIZE as u64) as usize;
-        let chunk_size = core::cmp::min(remaining, PAGE_SIZE - offset_in_page);
-
-        // Get or allocate page from cache atomically
-        // Using find_or_create_page() prevents TOCTOU race
-        let (frame, needs_read) = {
-            let mut cache = PAGE_CACHE.lock();
-            let mut frame_alloc = FrameAllocRef(&FRAME_ALLOCATOR);
-            // Use VFAT_AOPS for disk-backed page cache with writeback support
-            let (page, is_new) = cache
-                .find_or_create_page(
-                    file_id,
-                    page_offset,
-                    capacity,
-                    &mut frame_alloc,
-                    true,  // can_writeback for vfat
-                    false, // not unevictable (disk-backed)
-                    &VFAT_AOPS,
-                )
-                .map_err(|_| KernelError::Io)?;
-            (page.frame, is_new)
-        };
-
-        // Read from block device AFTER releasing the lock
-        if needs_read {
-            read_frame(bdev, page_offset, frame)?;
-        }
-
-        // Copy data from page to buffer
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                (crate::arch::phys_to_virt(frame) as *const u8).add(offset_in_page),
-                buf.as_mut_ptr().add(buf_offset),
-                chunk_size,
-            );
-        }
-
-        pos += chunk_size as u64;
-        buf_offset += chunk_size;
-        remaining -= chunk_size;
+    match crate::mm::filemap::read(&bdev.bd_inode, buf, offset)? {
+        n if n == buf.len() => Ok(()),
+        _ => Err(KernelError::Io),
     }
-
-    Ok(())
 }
 
-/// Write bytes to block device via page cache (LAZY WRITEBACK)
-///
-/// Data is written to the page cache and marked dirty. The actual disk write
-/// happens later via:
-/// - Periodic writeback daemon (every ~5 seconds)
-/// - Explicit fsync() or sync() calls
-/// - Page cache eviction pressure
+/// Write bytes of the device through its page cache (Linux
+/// mark_buffer_dirty): written back by fsync, sync, the periodic
+/// device writeback (`BdiWriteback`) and the last close (umount)
 fn write_bytes(bdev: &BlockDevice, offset: u64, buf: &[u8]) -> Result<(), KernelError> {
-    use crate::mm::page_cache::DIRTY_ADDRESS_SPACES;
-
-    let file_id = FileId::from_blkdev(bdev.dev_id().major, bdev.dev_id().minor);
-    let capacity = bdev.capacity();
-
-    let mut pos = offset;
-    let mut remaining = buf.len();
-    let mut buf_offset = 0;
-
-    while remaining > 0 {
-        let page_offset = pos / PAGE_SIZE as u64;
-        let offset_in_page = (pos % PAGE_SIZE as u64) as usize;
-        let chunk_size = core::cmp::min(remaining, PAGE_SIZE - offset_in_page);
-
-        // Get or allocate page from cache atomically
-        let (page, needs_read) = {
-            let mut cache = PAGE_CACHE.lock();
-            let mut frame_alloc = FrameAllocRef(&FRAME_ALLOCATOR);
-            let (page, is_new) = cache
-                .find_or_create_page(
-                    file_id,
-                    page_offset,
-                    capacity,
-                    &mut frame_alloc,
-                    true,       // can_writeback for vfat
-                    false,      // not unevictable (disk-backed)
-                    &VFAT_AOPS, // Use VFAT ops for writeback
-                )
-                .map_err(|_| KernelError::Io)?;
-            (page, is_new)
-        };
-
-        // If this is a partial page write and the page is new, read existing data first
-        if needs_read && (offset_in_page != 0 || chunk_size != PAGE_SIZE) {
-            read_frame(bdev, page_offset, page.frame)?;
-        }
-
-        // Write data to page
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                buf.as_ptr().add(buf_offset),
-                crate::arch::phys_to_virt(page.frame).add(offset_in_page),
-                chunk_size,
-            );
-        }
-
-        // Mark page as dirty - writeback daemon will flush later
-        page.mark_dirty();
-
-        // Track this address space as having dirty pages
-        DIRTY_ADDRESS_SPACES.lock().insert(file_id);
-
-        // Notify the device's BDI for per-device writeback scheduling
-        bdev.disk.bdi.mark_dirty(file_id);
-
-        // NO writepage() call here - lazy writeback!
-
-        pos += chunk_size as u64;
-        buf_offset += chunk_size;
-        remaining -= chunk_size;
+    if crate::mm::filemap::perform_write(&bdev.bd_inode, buf, offset)? != buf.len() {
+        return Err(KernelError::Io);
     }
-
+    bdev.disk.bdi.mark_dirty(FileId::from_blkdev(
+        bdev.dev_id().major,
+        bdev.dev_id().minor,
+    ));
     Ok(())
 }
 

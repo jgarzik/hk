@@ -392,7 +392,7 @@ fn file_page(
     area: &Area,
     access: Access,
 ) -> Option<Result<(u64, bool, bool), VmFault>> {
-    let inode = file.get_inode()?;
+    let inode = file.mapping_inode()?;
     if !inode.i_op.maps_cache() {
         return None;
     }

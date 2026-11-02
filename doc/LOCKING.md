@@ -2894,10 +2894,13 @@ Rules:
   the devtmpfs root's `i_rwsem`. No path holding a directory `i_rwsem`
   takes `open_mutex` (a block device is opened after the path walk), so
   `open_mutex -> i_rwsem` cannot invert.
-- **No page cache in front of block devices yet:** device file I/O is
-  synchronous bios through bounce frames, never under a spinlock. The
-  page cache never writes a page back under `PAGE_CACHE` (3.2 Page
-  Cache): writepage sleeps on block I/O.
+- **Block device page cache (`BlockDevice.bd_inode`, Linux
+  bd_mapping):** device-file I/O and vfat metadata go through it (3.2
+  Per-inode page cache); pages are read and written synchronously
+  under their page lock, never under a spinlock. The last opener's
+  release writes it back and drops it under `open_mutex` (Linux
+  blkdev_flush_mapping): open_mutex -> page lock -> i_pages. The old
+  global cache never writes a page back under `PAGE_CACHE`.
 
 #### Network Subsystem
 

@@ -444,6 +444,16 @@ impl File {
         self.private.get()?.clone().downcast::<T>().ok()
     }
 
+    /// The inode whose page cache holds the file's data (Linux
+    /// f_mapping->host): a block device node's is the device's bdev
+    /// inode, every other file's its own
+    pub fn mapping_inode(&self) -> Option<Arc<Inode>> {
+        if let Some(b) = self.private_ref::<crate::storage::BlockDevice>() {
+            return Some(b.bd_inode.clone());
+        }
+        self.get_inode()
+    }
+
     /// Get the inode for this file
     pub fn get_inode(&self) -> Option<Arc<Inode>> {
         self.dentry.get_inode()

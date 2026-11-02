@@ -312,6 +312,9 @@ pub fn sync_all() -> Result<usize, i32> {
     for file_id in dirty_files {
         wait_on_writeback(file_id);
     }
+    // Then the devices' own caches: filesystem metadata the file pages'
+    // writeback just dirtied (Linux ksys_sync: sync_bdevs last)
+    crate::storage::blkdev::sync_bdevs();
 
     Ok(wbc.pages_written)
 }
@@ -439,6 +442,15 @@ fn do_device_writeback(dev_id: DevId) {
     for file_id in dirty_files {
         if wbc.nr_to_write <= 0 {
             break;
+        }
+        // A device's own cache (filesystem metadata): its bdev mapping
+        if let Some((major, minor)) = file_id.to_blkdev() {
+            if let Some(b) = crate::storage::get_blkdev(DevId::new(major, minor))
+                && crate::storage::blkdev::sync_blockdev(&b).is_ok()
+            {
+                bdi.dirty_inodes.lock().remove(&file_id);
+            }
+            continue;
         }
 
         if let Ok(written) = do_writepages_for_file(file_id, &mut wbc) {
