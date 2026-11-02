@@ -8,6 +8,11 @@
 //! - CPU_ACCT_SPINNER: a sibling thread spinning in user mode, making no
 //!   syscall, shows its CPU time in its thread CPU clock while it still
 //!   spins
+//! - CPU_ACCT_EXITED: a thread's CPU time stays the process's after it
+//!   exits (Linux signal->utime/stime)
+//! - CPU_ACCT_CHILDREN: a reaped child's CPU time shows in wait4's
+//!   rusage, getrusage(RUSAGE_CHILDREN), times()'s tms_cutime/cstime and
+//!   /proc/self/stat's cutime/cstime
 
 use super::fork_mm::{join, spawn_thread};
 use super::helpers::{print, print_num, println};
@@ -28,6 +33,118 @@ const MS: i64 = 1_000_000;
 pub fn run_tests() {
     sleep();
     spinner();
+    exited();
+    children();
+}
+
+/// The calling thread's (`process`: process's) CPU time in ms
+fn own_cpu_ms(process: bool) -> i64 {
+    let mut ts = Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // CLOCK_PROCESS_CPUTIME_ID, CLOCK_THREAD_CPUTIME_ID
+    sys_clock_gettime(if process { 2 } else { 3 }, &mut ts);
+    ts.tv_sec * 1000 + ts.tv_nsec / MS
+}
+
+/// Use `ms` of the caller's own CPU (checking with syscalls)
+fn burn(ms: i64, process: bool) {
+    let start = own_cpu_ms(process);
+    while own_cpu_ms(process) - start < ms {
+        for _ in 0..10_000 {
+            core::hint::spin_loop();
+        }
+    }
+}
+
+extern "C" fn burn_and_exit(_: u64) -> ! {
+    burn(200, false);
+    hk_syscall::sys_exit(0)
+}
+
+fn exited() {
+    let before = own_cpu_ms(true);
+    let ok = unsafe {
+        let top = (&raw mut STACK as *mut u8).add(16384) as u64;
+        let ctid = &raw mut CTID;
+        core::ptr::write_volatile(ctid, 1);
+        spawn_thread(top, burn_and_exit, 0, ctid) > 0 && join(ctid)
+    };
+    let grew = own_cpu_ms(true) - before;
+    report(b"CPU_ACCT_EXITED", ok && grew >= 180, grew);
+}
+
+fn ms_of(t: &Timeval) -> i64 {
+    t.tv_sec * 1000 + t.tv_usec / 1000
+}
+
+/// cutime + cstime from /proc/self/stat (fields 16 and 17), in ticks
+fn stat_children_ticks() -> i64 {
+    let mut buf = [0u8; 1024];
+    let n = super::helpers::read_file(b"/proc/self/stat\0", &mut buf);
+    if n <= 0 {
+        return -1;
+    }
+    let b = &buf[..n as usize];
+    // Fields after the ")" of comm: state is field 3
+    let Some(close) = b.iter().rposition(|&c| c == b')') else {
+        return -1;
+    };
+    let mut field = 2;
+    let mut sum = 0i64;
+    for tok in b[close + 1..].split(|&c| c == b' ').filter(|t| !t.is_empty()) {
+        field += 1;
+        if field == 16 || field == 17 {
+            let mut v = 0i64;
+            for &c in tok {
+                v = v * 10 + (c - b'0') as i64;
+            }
+            sum += v;
+        }
+    }
+    sum
+}
+
+fn children() {
+    use hk_syscall::{sys_exit, sys_fork, sys_times, sys_wait4};
+    // SAFETY: plain integers
+    let mut base: Rusage = unsafe { core::mem::zeroed() };
+    sys_getrusage(-1, &mut base as *mut Rusage as *mut u8);
+    let base_ms = ms_of(&base.ru_utime) + ms_of(&base.ru_stime);
+    let mut tb = [0i64; 4];
+    sys_times(tb.as_mut_ptr() as *mut u8);
+    let base_stat = stat_children_ticks();
+    let pid = sys_fork();
+    if pid == 0 {
+        burn(200, true);
+        sys_exit(0);
+    }
+    let mut st = 0i32;
+    // SAFETY: plain integers
+    let mut ru: Rusage = unsafe { core::mem::zeroed() };
+    sys_wait4(pid, &mut st, 0, &mut ru as *mut Rusage as u64);
+    let waited = ms_of(&ru.ru_utime) + ms_of(&ru.ru_stime);
+    // SAFETY: plain integers
+    let mut ch: Rusage = unsafe { core::mem::zeroed() };
+    sys_getrusage(-1, &mut ch as *mut Rusage as *mut u8);
+    let children = ms_of(&ch.ru_utime) + ms_of(&ch.ru_stime) - base_ms;
+    let mut t = [0i64; 4];
+    sys_times(t.as_mut_ptr() as *mut u8);
+    let ticks = t[2] + t[3] - tb[2] - tb[3];
+    let stat = stat_children_ticks() - base_stat;
+    let step = if waited < 180 {
+        1
+    } else if children < 180 {
+        2
+    } else if ticks < 18 {
+        3
+    } else if stat < 18 {
+        4
+    } else {
+        0
+    };
+    report(b"CPU_ACCT_CHILDREN", step == 0, step * 100_000 + waited);
 }
 
 fn report(name: &[u8], ok: bool, v: i64) {

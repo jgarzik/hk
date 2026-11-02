@@ -837,6 +837,11 @@ pub fn exit_task_signal(tid: Tid) {
             let signal = if task.leader {
                 None
             } else {
+                // Its CPU time stays the group's (Linux __exit_signal)
+                let t = task.task.cputime(crate::time::monotonic_ns());
+                if let Some(s) = &task.signal {
+                    s.add_dead_times(t);
+                }
                 task.signal.take()
             };
             (task.sighand.take(), signal, old)
@@ -1352,6 +1357,12 @@ pub struct SignalStruct {
     /// CLONE_THREAD, -1 when a thread starts its exit; the thread that
     /// takes it to 0 is the group's last (group_dead)
     live: AtomicU32,
+    /// CPU time (ns) of the group's threads already gone (Linux
+    /// signal->utime/stime): added when one leaves the group
+    dead_times: [AtomicU64; 2],
+    /// CPU time (ns) of reaped children and theirs (Linux
+    /// signal->cutime/cstime)
+    child_times: [AtomicU64; 2],
 }
 
 const GROUP_EXIT: u64 = 1 << 63;
@@ -1445,7 +1456,39 @@ impl SignalStruct {
             group_exit: AtomicU64::new(0),
             posix_timers: Mutex::new(crate::posix_timer::PosixTimerRegistry::new()),
             live: AtomicU32::new(1),
+            dead_times: [AtomicU64::new(0), AtomicU64::new(0)],
+            child_times: [AtomicU64::new(0), AtomicU64::new(0)],
         }
+    }
+
+    /// A thread leaving the group takes its (utime, stime) here (Linux
+    /// __exit_signal)
+    pub fn add_dead_times(&self, (u, s): (u64, u64)) {
+        self.dead_times[0].fetch_add(u, Ordering::Relaxed);
+        self.dead_times[1].fetch_add(s, Ordering::Relaxed);
+    }
+
+    /// (utime, stime) of the group's threads already gone
+    pub fn dead_times(&self) -> (u64, u64) {
+        (
+            self.dead_times[0].load(Ordering::Relaxed),
+            self.dead_times[1].load(Ordering::Relaxed),
+        )
+    }
+
+    /// A reaped child's own and its children's (utime, stime) (Linux
+    /// wait_task_zombie: psig->cutime += ...)
+    pub fn add_child_times(&self, (u, s): (u64, u64)) {
+        self.child_times[0].fetch_add(u, Ordering::Relaxed);
+        self.child_times[1].fetch_add(s, Ordering::Relaxed);
+    }
+
+    /// (cutime, cstime)
+    pub fn child_times(&self) -> (u64, u64) {
+        (
+            self.child_times[0].load(Ordering::Relaxed),
+            self.child_times[1].load(Ordering::Relaxed),
+        )
     }
 
     /// A thread joins the group (CLONE_THREAD)
@@ -1578,6 +1621,8 @@ impl SignalStruct {
             // Timers are not inherited (Linux copy_signal)
             posix_timers: Mutex::new(crate::posix_timer::PosixTimerRegistry::new()),
             live: AtomicU32::new(1),
+            dead_times: [AtomicU64::new(0), AtomicU64::new(0)],
+            child_times: [AtomicU64::new(0), AtomicU64::new(0)],
         })
     }
 }

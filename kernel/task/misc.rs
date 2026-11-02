@@ -247,19 +247,21 @@ fn ns_to_clock_t(ns: u64) -> i64 {
     (ns / 10_000_000) as i64
 }
 
-/// times(2) (Linux kernel/sys.c sys_times): the process's user and
-/// system time into `buf` (if not NULL; children's times are not
-/// tracked: 0), and the clock ticks since boot (Linux jiffies in
+/// times(2) (Linux kernel/sys.c sys_times): the process's and its
+/// reaped children's user and system time into `buf` (if not NULL),
+/// and the clock ticks since boot (Linux jiffies in
 /// USER_HZ units; hk's scheduler tick is 10 ms, one USER_HZ tick, and
 /// counts from 0 where Linux starts 5 minutes before the wrap)
 pub fn sys_times<A: crate::uaccess::UaccessArch>(buf: u64) -> i64 {
     use crate::task::percpu;
     if buf != 0 {
         let (utime, stime) = percpu::get_process_times(percpu::current_pid());
+        let (cutime, cstime) = percpu::children_times();
         let t = Tms {
             tms_utime: ns_to_clock_t(utime),
             tms_stime: ns_to_clock_t(stime),
-            ..Tms::default()
+            tms_cutime: ns_to_clock_t(cutime),
+            tms_cstime: ns_to_clock_t(cstime),
         };
         if crate::uaccess::put_user::<A, Tms>(buf, t).is_err() {
             return KernelError::BadAddress.sysret();
@@ -325,9 +327,13 @@ pub fn sys_getrusage<A: crate::uaccess::UaccessArch>(who: i32, usage_ptr: u64) -
             }
         }
         RUSAGE_CHILDREN => {
-            // RUSAGE_CHILDREN: return stats of terminated and waited-for children
-            // We don't track child resource usage yet, so return zeros
-            Rusage::default()
+            // Reaped children and theirs (Linux signal->cutime/cstime)
+            let (utime_ns, stime_ns) = percpu::children_times();
+            Rusage {
+                ru_utime: timeval_from_ns(utime_ns),
+                ru_stime: timeval_from_ns(stime_ns),
+                ..Rusage::default()
+            }
         }
         _ => return KernelError::InvalidArgument.sysret(),
     };

@@ -1629,8 +1629,16 @@ pub fn reap_zombie_child_times(
     let TaskState::Zombie(status) = zombie.state else {
         return None;
     };
-    let (utime, stime) = zombie.task.times();
+    // The child's own time (every thread gone, so the group's) and its
+    // children's: wait's rusage (Linux RUSAGE_BOTH), and the reaper's
+    // cutime/cstime
     let (tid, pid, uid) = (zombie.task.tid(), zombie.task.pid, zombie.cred().uid);
+    let (mut utime, mut stime) = group_times(&table, pid);
+    if let Some(s) = &zombie.signal {
+        let (cu, cs) = s.child_times();
+        utime = utime.saturating_add(cu);
+        stime = stime.saturating_add(cs);
+    }
     let report = (pid, group_status(&zombie, status), utime, stime);
 
     // WNOWAIT (waitid): report the zombie, leave it waitable
@@ -1638,6 +1646,9 @@ pub fn reap_zombie_child_times(
         return Some(report);
     }
 
+    if let Some(s) = table.get(current_tid()).and_then(|t| t.signal.clone()) {
+        s.add_child_times((utime, stime));
+    }
     let task = table.remove(tid);
     // The Task is released after TASKLIST (nothing is released under it)
     drop(table);
@@ -1704,6 +1715,11 @@ pub fn take_leadership(tgid: Pid, tid: Tid) -> Vec<TaskRef> {
         // and the old leader is dead
         let (mi, li) = unsafe { (me.inner().get_mut(), l.inner().get_mut()) };
         if let (Some(mi), Some(li)) = (mi.as_mut(), li.as_mut()) {
+            // The old leader's CPU time stays the group's (Linux
+            // release_task -> __exit_signal)
+            if let Some(s) = &li.signal {
+                s.add_dead_times(l.times());
+            }
             core::mem::swap(&mut mi.thread_pid, &mut li.thread_pid);
             // The pid hash names the caller by its new number
             if let Some(p) = &mi.thread_pid {
@@ -3843,16 +3859,42 @@ pub fn get_task_times(tid: Tid) -> (u64, u64) {
 /// Returns (utime_ns, stime_ns) summed across all threads in the process.
 /// Returns (0, 0) if no threads are found.
 pub fn get_process_times(pid: Pid) -> (u64, u64) {
-    let now = crate::time::monotonic_ns();
     let table = TASKLIST.read();
-    let mut utime = 0u64;
-    let mut stime = 0u64;
+    group_times(&table, pid)
+}
+
+/// Thread group `pid`'s CPU time (Linux thread_group_cputime): its
+/// threads gone (in its SignalStruct) plus those still holding the
+/// SignalStruct, each with its running slice. A thread that left gave
+/// its time to the struct when it lost it, so none counts twice.
+pub fn group_times(table: &GlobalTaskTable, pid: Pid) -> (u64, u64) {
+    let now = crate::time::monotonic_ns();
+    let mut sig = None;
+    let (mut utime, mut stime) = (0u64, 0u64);
     for task in table.threads(pid) {
-        let (u, s) = task.task.cputime(now);
+        let Some(s) = &task.signal else {
+            continue;
+        };
+        sig.get_or_insert_with(|| s.clone());
+        let (u, st) = task.task.cputime(now);
         utime = utime.saturating_add(u);
-        stime = stime.saturating_add(s);
+        stime = stime.saturating_add(st);
+    }
+    if let Some(s) = sig {
+        let (u, st) = s.dead_times();
+        utime = utime.saturating_add(u);
+        stime = stime.saturating_add(st);
     }
     (utime, stime)
+}
+
+/// The calling process's children's CPU time (cutime, cstime)
+pub fn children_times() -> (u64, u64) {
+    let table = TASKLIST.read();
+    table
+        .get(current_tid())
+        .and_then(|t| t.signal.clone())
+        .map_or((0, 0), |s| s.child_times())
 }
 
 /// Syscall entry: user time ends, system time starts

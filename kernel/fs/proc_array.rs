@@ -40,6 +40,9 @@ struct Snap {
     exiting: bool,
     utime: u64,
     stime: u64,
+    /// Reaped children's (Linux signal->cutime/cstime)
+    cutime: u64,
+    cstime: u64,
     start: u64,
     nvcsw: u64,
     nivcsw: u64,
@@ -77,6 +80,8 @@ fn snap(pid: Pid) -> Option<Snap> {
         (a.comm(), a.fs().cloned(), a.files().cloned())
     };
     let sig = t.task.sig.lock().clone();
+    // The whole thread group's CPU time (Linux do_task_stat with whole)
+    let (utime, stime) = crate::task::percpu::group_times(&table, pid);
     Some(Snap {
         pid,
         tid: t.task.tid(),
@@ -99,8 +104,10 @@ fn snap(pid: Pid) -> Option<Snap> {
         cred: t.cred(),
         kthread: matches!(t.task.kind, TaskKind::KernelThread),
         exiting: t.task.has_flag(crate::task::pf::EXITING),
-        utime: t.task.utime.load(core::sync::atomic::Ordering::Relaxed),
-        stime: t.task.stime.load(core::sync::atomic::Ordering::Relaxed),
+        utime,
+        stime,
+        cutime: t.signal.as_ref().map_or(0, |s| s.child_times().0),
+        cstime: t.signal.as_ref().map_or(0, |s| s.child_times().1),
         start: t.task.start_time(),
         nvcsw: t.task.nvcsw.load(core::sync::atomic::Ordering::Relaxed),
         nivcsw: t.task.nivcsw.load(core::sync::atomic::Ordering::Relaxed),
@@ -393,7 +400,14 @@ pub fn gen_stat(pid: Pid) -> Vec<u8> {
     let _ = write!(o, ") {} ", state(&s).0);
     let _ = write!(o, "{} {} {} 0 -1 {} ", s.ppid, s.pgid, s.sid, flags);
     let _ = write!(o, "{} 0 {} 0 ", s.min_flt, s.maj_flt);
-    let _ = write!(o, "{} {} 0 0 ", ticks(s.utime), ticks(s.stime));
+    let _ = write!(
+        o,
+        "{} {} {} {} ",
+        ticks(s.utime),
+        ticks(s.stime),
+        ticks(s.cutime),
+        ticks(s.cstime)
+    );
     let _ = write!(o, "{} {} {} 0 {} ", prio, s.nice, s.threads, ticks(s.start));
     let (vsize, rss) = v.as_ref().map_or((0, 0), |v| (v.total * 4096, v.rss));
     let _ = write!(o, "{} {} {} ", vsize, rss, rss_lim(&s));
