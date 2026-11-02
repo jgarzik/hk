@@ -15,6 +15,10 @@
 //!   does once a writer came and went
 //! - FIFO_POLLHUP_PRESENT: a reader that opened while a writer was
 //!   there gets POLLHUP when that writer closes
+//! - FIFO_SPLICE: a FIFO is a pipe to splice and tee (Linux
+//!   get_pipe_info); splice into a FIFO open only for reading is EBADF;
+//!   preadv2 RWF_NOWAIT of a FIFO is EOPNOTSUPP (no FMODE_NOWAIT), not a
+//!   blocking read
 
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
@@ -44,6 +48,7 @@ pub fn run_tests() {
     rdwr();
     pollhup();
     pollhup_present();
+    splice();
     sys_unlink(PATH.as_ptr());
 }
 
@@ -197,4 +202,72 @@ fn pollhup_present() {
     close(r1);
     close(r2);
     report(n, if p.revents & POLLHUP != 0 { 0 } else { 2 });
+}
+
+fn splice() {
+    use hk_syscall::{IoVec, sys_kill, sys_pipe2, sys_preadv2, sys_splice, sys_tee};
+    const EBADF: i64 = -9;
+    const RWF_NOWAIT: i32 = 8;
+    let n = b"FIFO_SPLICE";
+    let f = open(O_RDWR | O_NONBLOCK);
+    let mut p = [0i32; 2];
+    if f < 0 || sys_pipe2(p.as_mut_ptr(), 0) != 0 {
+        close(f);
+        return report(n, 1);
+    }
+    let null = core::ptr::null_mut();
+    let mut b = [0u8; 8];
+    let mut step = 0;
+    sys_write(f as u64, b"abc".as_ptr(), 3);
+    if sys_splice(f as i32, null, p[1], null, 3, 0) != 3
+        || sys_read(p[0] as u64, b.as_mut_ptr(), 8) != 3
+        || &b[..3] != b"abc"
+    {
+        step = 2;
+    }
+    sys_write(p[1] as u64, b"xyz".as_ptr(), 3);
+    if step == 0
+        && (sys_tee(p[0], f as i32, 3, 0) != 3
+            || sys_read(f as u64, b.as_mut_ptr(), 8) != 3
+            || &b[..3] != b"xyz")
+    {
+        step = 3;
+    }
+    let r = open(O_RDONLY | O_NONBLOCK);
+    if step == 0 && sys_splice(p[0], null, r as i32, null, 3, 0) != EBADF {
+        step = 4;
+    }
+    close(r);
+    close(f);
+    sys_close(p[0] as u64);
+    sys_close(p[1] as u64);
+    // A blocking open (O_RDWR never waits): RWF_NOWAIT must not block
+    let pid = sys_fork();
+    if pid == 0 {
+        let fd = open(O_RDWR);
+        let mut c = [0u8; 4];
+        let iov = IoVec {
+            iov_base: c.as_mut_ptr(),
+            iov_len: 4,
+        };
+        let got = sys_preadv2(fd as i32, &iov, 1, -1, RWF_NOWAIT);
+        // EOPNOTSUPP
+        sys_exit(if got == -95 { 0 } else { 1 });
+    }
+    let ts = Timespec {
+        tv_sec: 2,
+        tv_nsec: 0,
+    };
+    sys_nanosleep(&ts, core::ptr::null_mut());
+    let mut st = 0i32;
+    if sys_wait4(pid, &mut st, 1, 0) != pid {
+        sys_kill(pid, 9);
+        sys_wait4(pid, &mut st, 0, 0);
+        if step == 0 {
+            step = 5;
+        }
+    } else if st != 0 && step == 0 {
+        step = 6;
+    }
+    report(n, step);
 }

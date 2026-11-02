@@ -250,6 +250,12 @@ fn get_pipe_from_fd(fd: i32) -> Option<Arc<Pipe>> {
     let file = fd_table.lock().get(fd)?;
 
     let ops = file.f_op.as_any();
+    // A FIFO is a pipe too (Linux get_pipe_info)
+    if ops.is::<crate::pipe::FifoFileOps>() {
+        return file
+            .private_arc::<crate::pipe::FifoFile>()
+            .map(|f| f.pipe());
+    }
     if !ops.is::<PipeReadFileOps>() && !ops.is::<PipeWriteFileOps>() {
         return None;
     }
@@ -322,14 +328,6 @@ pub fn sys_splice(
         return 0;
     }
 
-    let in_is_pipe = is_pipe_fd(fd_in);
-    let out_is_pipe = is_pipe_fd(fd_out);
-
-    // At least one must be a pipe
-    if !in_is_pipe && !out_is_pipe {
-        return KernelError::InvalidArgument.sysret();
-    }
-
     // Get the files
     let in_file = match get_file_from_fd(fd_in) {
         Some(f) => f,
@@ -339,6 +337,19 @@ pub fn sys_splice(
         Some(f) => f,
         None => return KernelError::BadFd.sysret(),
     };
+    // Linux do_splice: read from a readable file, write to a writable
+    // one (a FIFO is open one way or both)
+    if !in_file.is_readable() || !out_file.is_writable() {
+        return KernelError::BadFd.sysret();
+    }
+
+    let in_is_pipe = is_pipe_fd(fd_in);
+    let out_is_pipe = is_pipe_fd(fd_out);
+
+    // At least one must be a pipe
+    if !in_is_pipe && !out_is_pipe {
+        return KernelError::InvalidArgument.sysret();
+    }
 
     // Pipe-to-pipe splice
     if in_is_pipe && out_is_pipe {
@@ -684,6 +695,12 @@ fn allocate_pipe_page() -> Option<Arc<CachedPage>> {
 pub fn sys_tee(fd_in: i32, fd_out: i32, len: usize, flags: u32) -> i64 {
     if len == 0 {
         return 0;
+    }
+
+    // Linux do_tee: EBADF for a bad fd or the wrong direction first
+    match (get_file_from_fd(fd_in), get_file_from_fd(fd_out)) {
+        (Some(i), Some(o)) if i.is_readable() && o.is_writable() => {}
+        _ => return KernelError::BadFd.sysret(),
     }
 
     // Both must be pipes

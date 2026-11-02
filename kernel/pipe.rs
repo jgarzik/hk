@@ -885,6 +885,13 @@ pub struct FifoFile {
     w_version: u32,
 }
 
+impl FifoFile {
+    /// The FIFO's pipe (splice and tee treat a FIFO as a pipe)
+    pub fn pipe(&self) -> Arc<Pipe> {
+        self.pipe.clone()
+    }
+}
+
 /// File operations of a FIFO: read and write per open mode, like the
 /// two ends of a pipe
 pub struct FifoFileOps;
@@ -997,6 +1004,28 @@ impl FileOps for FifoFileOps {
             return Err(KernelError::BadFd);
         }
         PIPE_WRITE_FOPS.write(file, buf)
+    }
+
+    /// preadv2 / pwritev2 flags: a FIFO has no FMODE_NOWAIT (Linux sets
+    /// it only on pipe() files), so RWF_NOWAIT is EOPNOTSUPP
+    /// (kiocb_set_rw_flags)
+    fn read_with_flags(
+        &self,
+        file: &File,
+        buf: &mut [u8],
+        rw: RwFlags,
+    ) -> Result<usize, KernelError> {
+        if rw.nowait {
+            return Err(KernelError::OperationNotSupported);
+        }
+        self.read(file, buf)
+    }
+
+    fn write_with_flags(&self, file: &File, buf: &[u8], rw: RwFlags) -> Result<usize, KernelError> {
+        if rw.nowait {
+            return Err(KernelError::OperationNotSupported);
+        }
+        self.write(file, buf)
     }
 
     fn llseek(&self, _file: &File, _offset: i64, _whence: i32) -> Result<u64, KernelError> {
