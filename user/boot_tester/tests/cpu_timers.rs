@@ -8,6 +8,8 @@
 //! - CPU_TIMER_THREAD: likewise on CLOCK_THREAD_CPUTIME_ID
 //! - CPU_TIMER_PERIODIC: a 20 ms periodic one fires again and again
 //! - TIMER_CREATE_TAI: timer_create(CLOCK_TAI) works
+//! - CPU_TIMER_DEAD_THREAD: timer_settime of a timer on an exited
+//!   sibling's thread CPU clock is ESRCH
 //! - ITIMER_CPU: ITIMER_PROF and ITIMER_VIRTUAL send SIGPROF and
 //!   SIGVTALRM after their CPU time; getitimer shows the time left
 //! - RLIMIT_CPU_XCPU: past the soft limit SIGXCPU comes (and the soft
@@ -127,6 +129,7 @@ pub fn run_tests() {
     one_shot(b"CPU_TIMER_THREAD", THREAD_CLOCK);
     periodic();
     tai();
+    dead_thread();
     itimers();
     rlimit_cpu();
     nsleep();
@@ -296,4 +299,34 @@ fn nsleep() {
         joined && r == 0 && used >= 100 && thread == EOPNOTSUPP,
         v,
     );
+}
+
+fn dead_thread() {
+    let tid = unsafe {
+        let top = (&raw mut STACK as *mut u8).add(16384) as u64;
+        let ctid = &raw mut CTID;
+        core::ptr::write_volatile(ctid, 1);
+        spawn_thread(top, spinner, 0, ctid)
+    };
+    if tid <= 0 {
+        return report(b"CPU_TIMER_DEAD_THREAD", false, tid);
+    }
+    // MAKE_THREAD_CPUCLOCK(tid, CPUCLOCK_SCHED), while it runs
+    let clock = ((!(tid as i32)) << 3) | 4 | 2;
+    let id = timer(clock);
+    STOP.store(1, Ordering::Relaxed);
+    let joined = join(&raw mut CTID);
+    STOP.store(0, Ordering::Relaxed);
+    if id < 0 || !joined {
+        return report(b"CPU_TIMER_DEAD_THREAD", false, id);
+    }
+    // Its tid word clears before it is released (Linux too): let it go
+    let ts = Timespec {
+        tv_sec: 0,
+        tv_nsec: 50 * MS,
+    };
+    hk_syscall::sys_nanosleep(&ts, core::ptr::null_mut());
+    let r = sys_timer_settime(id as i32, 0, &spec(10, 0), core::ptr::null_mut());
+    sys_timer_delete(id as i32);
+    report(b"CPU_TIMER_DEAD_THREAD", r == -3, r);
 }

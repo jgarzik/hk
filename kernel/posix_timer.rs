@@ -788,6 +788,16 @@ pub fn sys_timer_settime(timerid: TimerT, flags: i32, new_value: u64, old_value:
         return -22;
     }
 
+    // A thread CPU clock whose thread is gone: ESRCH (Linux
+    // posix_cpu_timer_set finds no task)
+    if let Some(crate::cpu_timer::CpuClock {
+        thread: Some(t), ..
+    }) = timer.cpu
+        && crate::cpu_timer::thread_sample(t).is_none()
+    {
+        return -3;
+    }
+
     // Set the timer
     let old_spec = timer.settime(&new_spec, flags);
 
