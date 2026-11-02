@@ -141,6 +141,33 @@ pub struct ElfSegment {
 }
 
 impl ElfSegment {
+    /// The pages of the segment loaded `base` higher that a private
+    /// mapping of the file can supply (Linux elf_map): those wholly
+    /// within its file part, from `from` on (a page shared with the
+    /// previous segment stays with it): (start, end, file offset of
+    /// start). None if there are none, or if the file offset is not
+    /// congruent with the address (no mmap of it is possible); the
+    /// partial last page and the bss are loaded otherwise.
+    pub fn file_pages(&self, base: u64, from: u64) -> Option<(u64, u64, u64)> {
+        let start = self.vaddr.checked_add(base)?;
+        if start % PAGE != self.offset % PAGE {
+            return None;
+        }
+        let lo = (start & !(PAGE - 1)).max(from);
+        let hi = start.checked_add(self.file_size as u64)? & !(PAGE - 1);
+        if lo >= hi {
+            return None;
+        }
+        // lo is below start by under a page, or above it (a first page
+        // the previous segment owns)
+        let off = if lo <= start {
+            self.offset.checked_sub(start - lo)?
+        } else {
+            self.offset.checked_add(lo - start)?
+        };
+        Some((lo, hi, off))
+    }
+
     /// The file bytes that land in the user page at `page` when the
     /// segment is loaded `base` higher: (offset in the page, offset in
     /// the file, length), clamped to the page, the segment's file part
@@ -592,6 +619,26 @@ mod tests {
             flags: SegmentFlags::from_elf_flags(4),
             offset,
         }
+    }
+
+    #[test]
+    fn file_pages_are_whole_pages_of_the_file_part() {
+        // Text at 0x401000, file 0x1000..0x3800: two whole pages
+        let t = seg(0x401000, 0x1000, 0x2800, 0x2800);
+        assert_eq!(t.file_pages(0, 0), Some((0x401000, 0x403000, 0x1000)));
+        // Unaligned start: the first page from its page of the file
+        let d = seg(0x403e10, 0x2e10, 0x1300, 0x5000);
+        assert_eq!(d.file_pages(0, 0), Some((0x403000, 0x405000, 0x2000)));
+        // Its first page already the previous segment's
+        assert_eq!(
+            d.file_pages(0, 0x404000),
+            Some((0x404000, 0x405000, 0x3000))
+        );
+        // Under a page of file data, or offset not congruent: none
+        assert_eq!(seg(0x405000, 0x4000, 0x800, 0x2000).file_pages(0, 0), None);
+        assert_eq!(seg(0x405000, 0x4010, 0x4000, 0x4000).file_pages(0, 0), None);
+        // Overflow: none, no panic
+        assert_eq!(t.file_pages(u64::MAX, 0), None);
     }
 
     #[test]

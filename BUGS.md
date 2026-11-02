@@ -51,8 +51,8 @@ Missing:
   private anonymous pages, also for MADV_PAGEOUT: no accessed-bit aging
   (pages are reclaimed oldest first), synchronous writes, no kswapd; 2MB pages stay
   off the LRU (never reclaimed whole; a split puts their 4KB pages on
-  it). Pages exec copies the image into are not on the reverse map
-  (never swapped). An active swap file can still be mapped writable
+  it). Pages exec copies the image into (see the heap section) are not
+  on the reverse map (never swapped). An active swap file can still be mapped writable
   (Linux: no write access to an S_SWAPFILE inode). Swap files go
   through their filesystem's swap_rw,
   a page at a time (walking the cluster chain each time; Linux maps
@@ -366,8 +366,10 @@ sockets or fds); a large contiguous kmalloc can fail first (over 4MB
 always, no vmalloc; above low - min, about 700KB at 512MB, once free
 memory is near the low watermark).
 
-exec copies the PT_LOAD segments page by page (not mapped from the
-page cache like Linux binfmt_elf). Kernel object leaks cost free
+exec maps PT_LOAD segments from the page cache, except a static PIE
+with no interpreter (hk relocates it in the kernel, so its pages are
+private copies; Linux applies no relocations at all) and the partial
+last page and bss of each segment (copied). Kernel object leaks cost free
 memory: each fork+exec keeps two dentries and two inodes plus ~900
 bytes of kmalloc (~1.3KB; suspected: procfs entries of dead pids, for
 the dcache work). The MM_LIFE tests count MemFree + Slab so they check user memory only; these leaks

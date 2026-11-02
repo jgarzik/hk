@@ -363,9 +363,14 @@ pub fn image_layout(elf: &ElfExecutable, base: u64) -> MmLayout {
 /// VMAs of a freshly loaded image: one private anonymous VMA per
 /// PT_LOAD segment (pages already populated) and the stack
 /// (growsdown), so mprotect/munmap/brk and /proc/<pid>/maps see them
-pub fn image_vmas(elf: &ElfExecutable, base: u64, stack_bottom: u64) -> Vec<crate::mm::Vma> {
+pub fn image_vmas(
+    elf: &ElfExecutable,
+    base: u64,
+    stack_bottom: u64,
+    file: Option<&Arc<File>>,
+) -> Vec<crate::mm::Vma> {
     use crate::mm::{PROT_READ, PROT_WRITE, VM_GROWSDOWN};
-    let mut vmas = segment_vmas(elf, base);
+    let mut vmas = segment_vmas(elf, base, file);
     let mut stack = anon_vma(stack_bottom, STACK_TOP, PROT_READ | PROT_WRITE);
     stack.flags |= VM_GROWSDOWN;
     vmas.push(stack);
@@ -383,13 +388,33 @@ fn anon_vma(start: u64, end: u64, prot: u32) -> crate::mm::Vma {
     )
 }
 
-/// One VMA per loaded segment of `elf` at `base`
-fn segment_vmas(elf: &ElfExecutable, base: u64) -> Vec<crate::mm::Vma> {
-    use crate::mm::{PROT_EXEC, PROT_READ, PROT_WRITE, Vma};
+/// The whole pages of each loaded segment of `elf` at `base` that a
+/// private mapping of `file` supplies (Linux elf_map), with the page
+/// before which a segment's pages belong to the previous one; the same
+/// computation decides what `load_elf_segments` leaves unfilled and
+/// which VMAs are file-backed
+fn file_mapped(elf: &ElfExecutable, base: u64) -> Vec<Option<(u64, u64, u64)>> {
+    let mut prev_end = 0;
+    let mut out = Vec::new();
+    for seg in elf.segments.iter().filter(|s| s.mem_size > 0) {
+        out.push(seg.file_pages(base, prev_end));
+        let end = (seg.vaddr + base + seg.mem_size as u64).next_multiple_of(PAGE_SIZE);
+        prev_end = prev_end.max(end);
+    }
+    out
+}
+
+/// One VMA per loaded segment of `elf` at `base`; with `file` (the
+/// image mapped from the page cache) a segment's whole file pages are a
+/// private file VMA and the rest (the partial last page, the bss) an
+/// anonymous one after it
+fn segment_vmas(elf: &ElfExecutable, base: u64, file: Option<&Arc<File>>) -> Vec<crate::mm::Vma> {
+    use crate::mm::{MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE, Vma};
     let anon = anon_vma;
+    let mapped = file.map(|_| file_mapped(elf, base));
     let mut vmas: Vec<Vma> = Vec::new();
     let mut prev_end = 0;
-    for seg in elf.segments.iter().filter(|s| s.mem_size > 0) {
+    for (k, seg) in elf.segments.iter().filter(|s| s.mem_size > 0).enumerate() {
         // A page shared with the previous segment stays in its VMA
         let start = ((seg.vaddr + base) & !(PAGE_SIZE - 1)).max(prev_end);
         let end = (seg.vaddr + base + seg.mem_size as u64).next_multiple_of(PAGE_SIZE);
@@ -400,7 +425,19 @@ fn segment_vmas(elf: &ElfExecutable, base: u64) -> Vec<crate::mm::Vma> {
         let prot = (f.read as u32 * PROT_READ)
             | (f.write as u32 * PROT_WRITE)
             | (f.execute as u32 * PROT_EXEC);
-        vmas.push(anon(start, end, prot));
+        let fm = mapped
+            .as_ref()
+            .and_then(|m| m[k])
+            .filter(|&(lo, _, _)| lo == start);
+        match (file, fm) {
+            (Some(f), Some((lo, hi, off))) => {
+                vmas.push(Vma::new_file(lo, hi, prot, MAP_PRIVATE, f.clone(), off));
+                if hi < end {
+                    vmas.push(anon(hi, end, prot));
+                }
+            }
+            _ => vmas.push(anon(start, end, prot)),
+        }
         prev_end = end;
     }
     vmas
@@ -461,13 +498,23 @@ fn load_elf_segments<FA: FrameAlloc<PhysAddr = u64>>(
     page_table: &mut ArchPageTable,
     frame_alloc: &mut FA,
     base_addr: u64,
+    lazy: bool,
 ) -> Result<u64, i32> {
     let mut highest_end: u64 = 0;
+    // Pages the file mapping supplies at fault time (`segment_vmas`)
+    let mapped = if lazy {
+        file_mapped(elf, base_addr)
+    } else {
+        Vec::new()
+    };
+    let mut k = 0;
 
     for segment in &elf.segments {
         if segment.mem_size == 0 {
             continue;
         }
+        let from_file = mapped.get(k).copied().flatten();
+        k += 1;
 
         let seg_start = segment.vaddr + base_addr;
         let seg_end = seg_start + segment.mem_size as u64;
@@ -490,6 +537,10 @@ fn load_elf_segments<FA: FrameAlloc<PhysAddr = u64>>(
 
         let mut va = page_start;
         while va < page_end {
+            if from_file.is_some_and(|(lo, hi, _)| (lo..hi).contains(&va)) {
+                va += PAGE_SIZE;
+                continue;
+            }
             // A page shared with the previous segment is filled in place
             let mapped = page_table.translate(va).map(|p| p & !(PAGE_SIZE - 1));
             let frame = match mapped {
@@ -897,14 +948,35 @@ where
     let mm = crate::mm::mm_alloc(new_page_table.root_table_phys());
 
     // Load ELF segments and get the end address for brk initialization
-    let segments_end =
-        match load_elf_segments(&elf, &image, &mut new_page_table, frame_alloc, base_addr) {
-            Ok(end) => end,
-            Err(e) => return -e,
-        };
+    // The image is mapped from the page cache (Linux elf_map: private
+    // file mappings, the text shared by every process running it) when
+    // its filesystem maps its cache and the kernel writes nothing into
+    // it: a static PIE without an interpreter is relocated here, so its
+    // pages are private copies made now
+    let maps = |f: &File| f.get_inode().is_some_and(|i| i.i_op.maps_cache());
+    let exe_map = (maps(&file) && !(elf.is_pie && interp.is_none())).then_some(&file);
+    let interp_map = interp_file.as_ref().filter(|f| maps(f));
+    let segments_end = match load_elf_segments(
+        &elf,
+        &image,
+        &mut new_page_table,
+        frame_alloc,
+        base_addr,
+        exe_map.is_some(),
+    ) {
+        Ok(end) => end,
+        Err(e) => return -e,
+    };
 
     if let (Some(ie), Some(iimg)) = (&interp, &interp_image)
-        && let Err(e) = load_elf_segments(ie, iimg, &mut new_page_table, frame_alloc, interp_base)
+        && let Err(e) = load_elf_segments(
+            ie,
+            iimg,
+            &mut new_page_table,
+            frame_alloc,
+            interp_base,
+            interp_map.is_some(),
+        )
     {
         return -e;
     }
@@ -978,11 +1050,11 @@ where
             end_data: code.end_data,
             ..args
         });
-        for vma in image_vmas(&elf, base_addr, stack_bottom) {
+        for vma in image_vmas(&elf, base_addr, stack_bottom, exe_map) {
             m.insert_vma(vma);
         }
         if let Some(ie) = &interp {
-            for vma in segment_vmas(ie, interp_base) {
+            for vma in segment_vmas(ie, interp_base, interp_map) {
                 m.insert_vma(vma);
             }
         }
