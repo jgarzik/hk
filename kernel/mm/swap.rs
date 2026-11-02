@@ -29,7 +29,6 @@ use crate::fs::{Inode, lookup_path};
 use crate::mm::page_cache::PAGE_SIZE;
 use crate::mm::swap_entry::{MAX_SWAPFILES, SwapEntry};
 use crate::mm::xarray::XArray;
-use crate::storage::BlockDevice;
 use crate::storage::blkdev::{BioOp, bdev_rw, bdev_rw_frame};
 use crate::task::{CAP_SYS_ADMIN, capable};
 use crate::uaccess::strncpy_from_user;
@@ -123,7 +122,7 @@ pub struct SwapInfo {
     /// Backing file (a swap file)
     pub inode: Option<Arc<Inode>>,
     /// Backing block device (a swap partition)
-    pub bdev: Option<Arc<BlockDevice>>,
+    pub bdev: Option<crate::storage::blkdev::BdevHandle>,
     /// Path given to swapon
     pub path: Vec<u8>,
     /// Device state (SWP_WRITEOK)
@@ -147,7 +146,10 @@ pub struct SwapInfo {
 
 impl SwapInfo {
     fn new(
-        backing: (Option<Arc<Inode>>, Option<Arc<BlockDevice>>),
+        backing: (
+            Option<Arc<Inode>>,
+            Option<crate::storage::blkdev::BdevHandle>,
+        ),
         path: Vec<u8>,
         swap_type: u8,
         max: u64,
@@ -503,7 +505,9 @@ fn swapon(path_ptr: u64, swap_flags: i32) -> Result<(), KernelError> {
         .ok_or(KernelError::Busy)? as u8;
     // A block device swaps through bios, a file through its inode
     let bdev = if inode.mode().is_blkdev() {
-        Some(crate::storage::get_blkdev(inode.rdev).ok_or(KernelError::NoDeviceOrAddress)?)
+        // Opened for the swap's life (Linux swapon opens the device)
+        let b = crate::storage::get_blkdev(inode.rdev).ok_or(KernelError::NoDeviceOrAddress)?;
+        Some(b.open_handle()?)
     } else {
         None
     };

@@ -106,7 +106,7 @@ pub fn run_tests() {
     pattern_write(&d.p3);
     eof(&d.p3);
     rrpart(&d);
-    vfat(&d.p1);
+    vfat(&d);
     swap(&d.p2);
 }
 
@@ -312,7 +312,8 @@ fn rrpart(d: &Disk) {
 }
 
 /// Mount vda1 (vfat) and read the file mkdisk.sh put there; write one
-fn vfat(p1: &BlkDev) {
+fn vfat(d: &Disk) {
+    let p1 = &d.p1;
     let mut p = [0u8; 48];
     sys_mkdir(b"/mnt\0".as_ptr(), 0o755);
     sys_mkdir(b"/mnt/vd1\0".as_ptr(), 0o755);
@@ -349,6 +350,12 @@ fn vfat(p1: &BlkDev) {
         ok && n == 7,
         if fd < 0 { fd as i64 } else { n },
     );
+    // A mounted partition is open (Linux: the mount opens the device):
+    // a rescan of its disk is EBUSY
+    let disk = open_dev(&d.whole, O_RDONLY);
+    let busy = sys_ioctl(disk, BLKRRPART, 0);
+    sys_close(disk as u64);
+    verdict(b"BLK_RRPART_MOUNTED", busy == EBUSY, busy);
     vfat_rename_ino();
     vfat_unlink_open();
     vfat_unlink_reuse();

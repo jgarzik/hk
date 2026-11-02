@@ -522,9 +522,9 @@ a reset register in PCI configuration space is ignored.
 - No /proc/devices block section, no /sys/block; the first disk
   registered decides the dynamic major (254 down, like Linux, but Linux
   usually has other dynamic majors registered first).
-- A mounted filesystem or active swap does not open its block device:
-  opening it O_EXCL, writes to a swap partition (Linux ETXTBSY) and
-  BLKBSZSET on a mounted partition are not refused.
+- A mounted filesystem or active swap opens its block device, but not
+  exclusively: opening it O_EXCL, writes to a swap partition (Linux
+  ETXTBSY) and BLKBSZSET on a mounted partition are not refused.
 
 ## Code-quality audit findings (2026-11-01), by phase
 
@@ -626,21 +626,6 @@ From the P1 /code-review (unverified unless noted). Tag = phase that fixes it.
    `kernel/storage/genhd.rs:118`: cache keyed by (major, minor); a
    re-created partition reusing a minor inherits stale and dirty
    pages, which write back at old offsets.
-4. **logical_block_size ignored** (next batch).
-   `kernel/storage/blkdev.rs:768`: partition scan and RMW issue 512B
-   bios; a 4Kn disk shows no partitions and 512B pread gives EIO.
-5. **parts_held uses Arc::strong_count** (next batch).
-   `kernel/storage/genhd.rs:107`: transient clones (writeback,
-   readpage) give spurious EBUSY; mount doesn't take open_mutex, so a
-   mount can race drop_bdevs and get a dead device.
-6. **Disk removal without open_mutex** (next batch).
-   `kernel/storage/sd.rs:381` del_gendisk → drop_bdevs unlocked: races
-   BlockDevice::open (opener of a removed partition) and BLKRRPART
-   rescans (stale registry entries / /dev nodes).
-7. **Segment limits** (next batch). `kernel/storage/blkdev.rs:674`
-   max_io assumes PAGE/seg per page; bdev_rw_frame ignores
-   max_segments: SIZE_MAX < 4096 without SEG_MAX overflows SEG_MAX /
-   MAX_SEGS → EIO.
 9. **Write path copies** (P5). `kernel/storage/blkdev.rs:749`:
    writes take `&mut [u8]` (to_vec + bounce copy per page); unaligned
    bdev_rw_bytes allocates a request-sized temp buffer.

@@ -230,6 +230,10 @@ pub struct SuperBlock {
     /// Filesystem-specific private data
     pub private: RwLock<Option<Arc<dyn SuperBlockData>>>,
 
+    /// The block device a device filesystem is mounted from, held open
+    /// while the superblock lives (Linux s_bdev_file)
+    s_bdev: spin::Once<crate::storage::blkdev::BdevHandle>,
+
     /// Mutex for cross-directory renames (like Linux s_vfs_rename_mutex)
     ///
     /// Serializes all cross-directory renames on this filesystem to
@@ -275,6 +279,7 @@ impl SuperBlock {
             next_ino: AtomicU64::new(1), // Start inode numbers at 1
             dev_id: NEXT_DEV_ID.fetch_add(1, Ordering::Relaxed),
             private: RwLock::new(None),
+            s_bdev: spin::Once::new(),
             s_vfs_rename_mutex: sync::Mutex::new(()),
         })
     }
@@ -331,6 +336,11 @@ impl SuperBlock {
     /// Allocate the next inode number
     pub fn alloc_ino(&self) -> InodeId {
         self.next_ino.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Hold the block device open for the superblock's life
+    pub fn set_bdev(&self, h: crate::storage::blkdev::BdevHandle) {
+        self.s_bdev.call_once(|| h);
     }
 
     /// Set filesystem-specific private data

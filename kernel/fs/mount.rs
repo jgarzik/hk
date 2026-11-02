@@ -336,8 +336,12 @@ pub fn dev_super(
     // Get the BlockDevice from the registry using the inode's rdev
     let bdev = get_blkdev(source_inode.rdev).ok_or(KernelError::NoDevice)?;
 
-    // Call the filesystem's mount_dev function
-    mount_dev_fn(fs_type, bdev)
+    // Opened (under the disk's open_mutex, failing for a removed
+    // device) for the superblock's life: a rescan sees it in use
+    let h = bdev.open_handle()?;
+    let sb = mount_dev_fn(fs_type, bdev)?;
+    sb.set_bdev(h);
+    Ok(sb)
 }
 
 // ============================================================================

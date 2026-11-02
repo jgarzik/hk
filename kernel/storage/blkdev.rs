@@ -503,12 +503,45 @@ impl BlockDevice {
         Ok(())
     }
 
+    /// Open the device for the kernel (a mount, active swap; Linux
+    /// bdev_file_open_by_dev): counted like an open file, so a rescan
+    /// sees the partition in use, until the handle is dropped
+    pub fn open_handle(self: &Arc<Self>) -> Result<BdevHandle, KernelError> {
+        self.open()?;
+        Ok(BdevHandle(self.clone()))
+    }
+
     /// The last reference of an open file went away
     pub fn release(&self) {
         let _g = self.disk.open_mutex.lock();
         if self.openers.fetch_sub(1, Ordering::Relaxed) == 1 && self.partno != 0 {
             self.disk.open_partitions.fetch_sub(1, Ordering::Relaxed);
         }
+    }
+}
+
+/// A kernel open of a block device (`BlockDevice::open_handle`)
+pub struct BdevHandle(Arc<BlockDevice>);
+
+impl BdevHandle {
+    pub fn bdev(&self) -> &Arc<BlockDevice> {
+        &self.0
+    }
+}
+
+impl core::ops::Deref for BdevHandle {
+    type Target = BlockDevice;
+    fn deref(&self) -> &BlockDevice {
+        &self.0
+    }
+}
+
+impl Drop for BdevHandle {
+    fn drop(&mut self) {
+        // Host tests make superblocks but never open devices (and
+        // cannot sleep on open_mutex)
+        #[cfg(not(test))]
+        self.0.release();
     }
 }
 
@@ -724,10 +757,19 @@ pub fn bdev_rw_frame(
     if len < PAGE && op == BioOp::Read {
         unsafe { core::ptr::write_bytes(crate::arch::phys_to_virt(frame).add(len), 0, PAGE - len) };
     }
-    let mut bio = Bio::new(op, sector);
+    // One bio per piece the queue limits allow (segments of at most
+    // max_segment_size, at most max_segments of them)
     let seg_max = bdev.disk.queue.limits.max_segment_size as usize;
-    add_frame(&mut bio, frame, 0, len, seg_max);
-    submit_bio_wait(bdev, bio).1
+    let chunk = max_io(bdev).min(PAGE);
+    let mut off = 0;
+    while off < len {
+        let n = chunk.min(len - off);
+        let mut bio = Bio::new(op, sector + (off as u64 >> SECTOR_SHIFT));
+        add_frame(&mut bio, frame, off, n, seg_max);
+        submit_bio_wait(bdev, bio).1?;
+        off += n;
+    }
+    Ok(())
 }
 
 /// Read or write page `idx` of the device from/to `buf` (a page; the
@@ -749,21 +791,23 @@ pub fn bdev_rw_page(
     bdev_rw_bytes(bdev, op, pos, &mut buf[..len])
 }
 
-/// Read or write `buf` at byte offset `pos`, any alignment (a partial
-/// sector is read first, then rewritten)
+/// Read or write `buf` at byte offset `pos`, any alignment: the I/O is
+/// in logical blocks (a 4Kn disk takes no 512-byte request), a partial
+/// block read first, then rewritten
 pub fn bdev_rw_bytes(
     bdev: &BlockDevice,
     op: BioOp,
     pos: u64,
     buf: &mut [u8],
 ) -> Result<(), KernelError> {
-    let ss = SECTOR_SIZE as usize;
-    let first = pos / SECTOR_SIZE;
-    let head = (pos % SECTOR_SIZE) as usize;
-    if head == 0 && buf.len().is_multiple_of(ss) {
+    let lbs = (bdev.logical_block_size() as usize).max(SECTOR_SIZE as usize);
+    let head = pos as usize % lbs;
+    let start = pos - head as u64;
+    let first = start / SECTOR_SIZE;
+    if head == 0 && buf.len().is_multiple_of(lbs) {
         return bdev_rw(bdev, op, first, buf);
     }
-    let span = (head + buf.len()).next_multiple_of(ss);
+    let span = (head + buf.len()).next_multiple_of(lbs);
     let mut tmp = alloc::vec![0u8; span];
     bdev_rw(bdev, BioOp::Read, first, &mut tmp)?;
     if op == BioOp::Read {
