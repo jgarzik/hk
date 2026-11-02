@@ -139,7 +139,7 @@ impl PosixClock {
 }
 
 /// TAI - UTC (adjtimex ADJ_TAI), in ns
-fn tai_offset_ns() -> i128 {
+pub fn tai_offset_ns() -> i128 {
     NTP_STATE.tai_offset.load(Ordering::Relaxed) as i128 * 1_000_000_000
 }
 
@@ -1045,8 +1045,12 @@ pub fn sys_adjtimex(txc_p: u64) -> i64 {
         let new_status = txc.status & STA_RW_MASK;
         NTP_STATE.status.store(new_status, Ordering::Relaxed);
     }
-    if txc.modes & ADJ_TAI != 0 {
-        NTP_STATE.tai_offset.store(txc.tai, Ordering::Relaxed);
+    // Linux __do_adjtimex: the new TAI offset is `constant`, ignored
+    // outside 0..=MAX_TAI_OFFSET (`tai` is only read back)
+    if txc.modes & ADJ_TAI != 0 && (0..=100_000).contains(&txc.constant) {
+        NTP_STATE
+            .tai_offset
+            .store(txc.constant as i32, Ordering::Relaxed);
     }
     if txc.modes & ADJ_TIMECONST != 0 {
         NTP_STATE.constant.store(txc.constant, Ordering::Relaxed);

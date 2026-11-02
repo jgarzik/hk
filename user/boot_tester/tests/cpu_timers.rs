@@ -7,7 +7,10 @@
 //!   once 100 ms of CPU are used, not before
 //! - CPU_TIMER_THREAD: likewise on CLOCK_THREAD_CPUTIME_ID
 //! - CPU_TIMER_PERIODIC: a 20 ms periodic one fires again and again
-//! - TIMER_CREATE_TAI: timer_create(CLOCK_TAI) works
+//! - TIMER_CREATE_TAI: timer_create(CLOCK_TAI) works; with a TAI offset
+//!   of 37 s set, an absolute timer 200 ms ahead on CLOCK_TAI fires
+//!   then, not 37 s later (and CLOCK_TAI runs 37 s ahead of realtime:
+//!   ADJ_TAI takes the offset from `constant`)
 //! - CPU_TIMER_DEAD_THREAD: timer_settime of a timer on an exited
 //!   sibling's thread CPU clock is ESRCH
 //! - ITIMER_CPU: ITIMER_PROF and ITIMER_VIRTUAL send SIGPROF and
@@ -164,11 +167,68 @@ fn periodic() {
 }
 
 fn tai() {
+    use hk_syscall::{Timex, sys_adjtimex, sys_nanosleep};
+    const ADJ_TAI: u32 = 0x80;
+    const TIMER_ABSTIME: i32 = 1;
     let id = timer(CLOCK_TAI);
-    if id >= 0 {
-        sys_timer_delete(id as i32);
+    if id < 0 {
+        return report(b"TIMER_CREATE_TAI", false, id);
     }
-    report(b"TIMER_CREATE_TAI", id >= 0, id);
+    // SAFETY: plain integers
+    let mut tx: Timex = unsafe { core::mem::zeroed() };
+    tx.modes = ADJ_TAI;
+    tx.constant = 37;
+    sys_adjtimex(&mut tx);
+    HITS.store(0, Ordering::Relaxed);
+    let mut now = Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    sys_clock_gettime(CLOCK_TAI, &mut now);
+    // ADJ_TAI took the offset from `constant` (Linux)
+    let mut real = Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    sys_clock_gettime(0, &mut real);
+    let ahead = now.tv_sec - real.tv_sec;
+    let mut at = Timespec {
+        tv_sec: now.tv_sec,
+        tv_nsec: now.tv_nsec + 200 * MS,
+    };
+    if at.tv_nsec >= 1000 * MS {
+        at.tv_sec += 1;
+        at.tv_nsec -= 1000 * MS;
+    }
+    let s = ITimerSpec {
+        it_interval: Timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        },
+        it_value: at,
+    };
+    sys_timer_settime(id as i32, TIMER_ABSTIME, &s, core::ptr::null_mut());
+    // Up to 2 s for it
+    let ts = Timespec {
+        tv_sec: 0,
+        tv_nsec: 50 * MS,
+    };
+    for _ in 0..40 {
+        if HITS.load(Ordering::Relaxed) > 0 {
+            break;
+        }
+        sys_nanosleep(&ts, core::ptr::null_mut());
+    }
+    sys_timer_delete(id as i32);
+    tx.modes = ADJ_TAI;
+    tx.constant = 0;
+    sys_adjtimex(&mut tx);
+    let hits = HITS.load(Ordering::Relaxed) as i64;
+    report(
+        b"TIMER_CREATE_TAI",
+        hits >= 1 && (36..=38).contains(&ahead),
+        hits * 1000 + ahead,
+    );
 }
 
 fn itimer_hits(which: i32, sig: u32, clock: i32) -> (u32, i64) {

@@ -232,10 +232,17 @@ impl PosixTimer {
 
         let (expires_ns, clock) = if flags & timer_flags::TIMER_ABSTIME != 0 {
             // Absolute, kept on its clock: a realtime one follows
-            // clock_settime
-            let clock = crate::time_syscall::PosixClock::decode(self.clockid)
+            // clock_settime. A TAI deadline is the realtime one TAI - UTC
+            // earlier (as clock_nanosleep's)
+            let pclock = crate::time_syscall::PosixClock::decode(self.clockid);
+            let clock = pclock
                 .and_then(|c| c.timer_base())
                 .unwrap_or(HrClock::Monotonic);
+            let value_ns = if pclock == Some(crate::time_syscall::PosixClock::Tai) {
+                (value_ns as i128 - crate::time_syscall::tai_offset_ns()).max(0) as u64
+            } else {
+                value_ns
+            };
             (value_ns, clock)
         } else {
             // Relative time (saturates: a huge value never fires)
