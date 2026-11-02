@@ -185,6 +185,9 @@ pub struct PollContext {
     entries: Vec<(*const WaitQueue, Pin<Box<WaitEntry>>)>,
     /// Files whose wait queues we registered on (keeps them alive)
     files: Vec<Arc<File>>,
+    /// Other owners of wait queues registered on (a signalfd's poll
+    /// registers on the caller's SigHand), kept alive likewise
+    owners: Vec<Arc<dyn core::any::Any + Send + Sync>>,
 }
 
 impl PollContext {
@@ -194,6 +197,7 @@ impl PollContext {
             task: tid,
             entries: Vec::new(),
             files: Vec::new(),
+            owners: Vec::new(),
         }
     }
 
@@ -222,11 +226,13 @@ impl PollContext {
 impl Drop for PollContext {
     fn drop(&mut self) {
         for (wq, entry) in self.entries.drain(..) {
-            // Safety: the wait queues belong to files in `self.files`,
-            // which are still alive (dropped after this loop)
+            // Safety: the wait queues belong to files in `self.files` or
+            // objects in `self.owners`, still alive (dropped after this
+            // loop)
             unsafe { (*wq).remove_wait_queue(entry.as_ref()) };
         }
         self.files.clear();
+        self.owners.clear();
     }
 }
 
@@ -277,6 +283,15 @@ impl<'a> PollTable<'a> {
     pub fn hold_file(&mut self, file: &Arc<File>) {
         if self.qproc_enabled {
             self.ctx.hold_file(file.clone());
+        }
+    }
+
+    /// Keep `owner` (what a wait queue about to be registered on lives
+    /// in) alive while registered, like `hold_file` (no-op once
+    /// registration is disabled)
+    pub fn hold(&mut self, owner: Arc<dyn core::any::Any + Send + Sync>) {
+        if self.qproc_enabled {
+            self.ctx.owners.push(owner);
         }
     }
 

@@ -231,9 +231,13 @@ impl Signalfd {
 
     /// Poll for readiness
     pub fn poll(&self, pt: Option<&mut PollTable>) -> u16 {
+        // The caller's handler table, held by the poll for as long as it
+        // stays registered on its queue (Linux instead detaches pollers
+        // when it is freed, signalfd_cleanup)
         if let Some(poll_table) = pt
             && let Some(sighand) = crate::signal::get_task_sighand(current_tid())
         {
+            poll_table.hold(sighand.clone());
             poll_table.poll_wait(&sighand.signalfd_wq);
         }
 
