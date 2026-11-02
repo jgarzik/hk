@@ -351,6 +351,7 @@ fn vfat(p1: &BlkDev) {
     );
     vfat_rename_ino();
     vfat_unlink_open();
+    vfat_unlink_reuse();
     let u = sys_umount2(b"/mnt/vd1\0".as_ptr(), 0);
     verdict(b"BLK_VFAT_UMOUNT", u == 0, u);
 }
@@ -370,6 +371,29 @@ fn vfat_rename_ino() {
         b"VFAT_RENAME_INO",
         fd >= 0 && r == 0 && s == 0 && a.st_ino == b.st_ino,
         r * 1000 + s,
+    );
+}
+
+/// Growing an unlinked, still open file never touches the directory
+/// entry of a new file that took its name (Linux fat_detach)
+fn vfat_unlink_reuse() {
+    let p = b"/mnt/vd1/R.TXT\0";
+    let old = sys_open(p.as_ptr(), O_RDWR | O_CREAT, 0o644) as i32;
+    let un = sys_unlink(p.as_ptr());
+    let new = sys_open(p.as_ptr(), O_RDWR | O_CREAT, 0o644) as i32;
+    let wn = sys_pwrite64(new, b"new".as_ptr(), 3, 0);
+    sys_close(new as u64);
+    let big = [b'o'; 8192];
+    let wo = sys_pwrite64(old, big.as_ptr(), big.len() as u64, 0);
+    sys_fsync(old);
+    let mut b = [0u8; 16];
+    let n = read_file(p, &mut b);
+    sys_close(old as u64);
+    sys_unlink(p.as_ptr());
+    verdict(
+        b"VFAT_UNLINK_REUSE",
+        un == 0 && wn == 3 && wo == 8192 && n == 3 && &b[..3] == b"new",
+        n,
     );
 }
 

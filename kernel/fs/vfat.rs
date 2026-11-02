@@ -1847,7 +1847,7 @@ impl InodeOps for VfatInodeOps {
             ) as u32;
 
             // Update directory entry with new start_cluster and size
-            if inode_data.parent_cluster != 0 {
+            if inode_data.parent_cluster != 0 && inode.get_nlink() != 0 {
                 update_dir_entry_by_short_name(
                     &sb_data,
                     inode_data.parent_cluster,
@@ -2219,7 +2219,7 @@ impl InodeOps for VfatInodeOps {
         }
 
         // Update directory entry
-        if inode_data.parent_cluster != 0 {
+        if inode_data.parent_cluster != 0 && inode.get_nlink() != 0 {
             update_dir_entry_by_short_name(
                 &sb_data,
                 inode_data.parent_cluster,
@@ -2376,7 +2376,9 @@ fn vfat_iget(
 /// The entry `entry` of the directory at `parent` was removed: its
 /// cached inode becomes unlinked (nlink 0, unhashed) and keeps its
 /// clusters until its last reference goes (`evict_inode`); with no
-/// cached inode they are freed now
+/// cached inode they are freed now. An unlinked inode has no directory
+/// entry any more (Linux fat_detach): writes and truncates never update
+/// one (the name may belong to a new file by then).
 fn drop_link(
     sb: &Arc<SuperBlock>,
     sb_data: &VfatSbData,
@@ -2515,7 +2517,7 @@ impl FileOps for VfatFileOps {
                 let new_start = new_clusters[0];
 
                 // Update directory entry
-                if inode_data.parent_cluster != 0 {
+                if inode_data.parent_cluster != 0 && inode.get_nlink() != 0 {
                     update_dir_entry_by_short_name(
                         &sb_data,
                         inode_data.parent_cluster,
@@ -2559,7 +2561,7 @@ impl FileOps for VfatFileOps {
 
             // Also update directory entry size on disk
             #[allow(clippy::collapsible_if)]
-            if inode_data.parent_cluster != 0 {
+            if inode_data.parent_cluster != 0 && inode.get_nlink() != 0 {
                 let entries = read_directory_entries(&sb_data, inode_data.parent_cluster).ok();
                 let start_cluster = entries
                     .as_ref()
@@ -2638,7 +2640,7 @@ impl FileOps for VfatFileOps {
                 let new_start = new_clusters[0];
 
                 // Update directory entry
-                if inode_data.parent_cluster != 0 {
+                if inode_data.parent_cluster != 0 && inode.get_nlink() != 0 {
                     update_dir_entry_by_short_name(
                         &sb_data,
                         inode_data.parent_cluster,
@@ -2683,7 +2685,7 @@ impl FileOps for VfatFileOps {
 
             // Also update directory entry size on disk
             #[allow(clippy::collapsible_if)]
-            if inode_data.parent_cluster != 0 {
+            if inode_data.parent_cluster != 0 && inode.get_nlink() != 0 {
                 let entries = read_directory_entries(&sb_data, inode_data.parent_cluster).ok();
                 let start_cluster = entries
                     .as_ref()
