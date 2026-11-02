@@ -568,6 +568,12 @@ pub static BLKDEV_REGISTRY: RwLock<BTreeMap<DevId, Arc<BlockDevice>>> =
     RwLock::new(BTreeMap::new());
 
 pub fn register_bdev(bdev: Arc<BlockDevice>) -> Result<(), KernelError> {
+    // The device's inode does I/O on this device only (never a later
+    // one with the same number)
+    bdev.bd_inode
+        .set_private(Arc::new(crate::fs::blkdev_ops::BdevOwner(Arc::downgrade(
+            &bdev,
+        ))));
     let mut r = BLKDEV_REGISTRY.write();
     if r.contains_key(&bdev.dev) {
         return Err(KernelError::AlreadyExists);
@@ -576,10 +582,14 @@ pub fn register_bdev(bdev: Arc<BlockDevice>) -> Result<(), KernelError> {
     Ok(())
 }
 
-/// Remove one block device; I/O on it fails from now on
+/// Remove one block device; I/O on it fails from now on, and its page
+/// cache goes without writeback, unmapped from every mapping (Linux
+/// del_gendisk / blk_drop_partitions: kill_bdev). Sleeps.
 pub fn unregister_bdev(dev: DevId) -> Option<Arc<BlockDevice>> {
     let b = BLKDEV_REGISTRY.write().remove(&dev)?;
     b.mark_dead();
+    crate::mm::filemap::unmap_mapping_range(&b.bd_inode.i_data, 0);
+    crate::mm::filemap::invalidate(&b.bd_inode);
     Some(b)
 }
 

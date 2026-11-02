@@ -81,8 +81,30 @@ fn write_at(file: &File, buf: &[u8], pos: u64) -> Result<usize, KernelError> {
 /// written a page per bio straight into the cache frame
 struct BdevAops;
 
+/// The bdev inode's device: its own, never another one registered
+/// under the same number later; EIO once it is removed
 fn inode_bdev(inode: &Inode) -> Result<Arc<BlockDevice>, KernelError> {
-    get_blkdev(inode.rdev).ok_or(KernelError::Io)
+    let p = inode.get_private().ok_or(KernelError::Io)?;
+    let b = p
+        .as_any()
+        .downcast_ref::<BdevOwner>()
+        .and_then(|o| o.0.upgrade())
+        .ok_or(KernelError::Io)?;
+    if b.is_dead() {
+        return Err(KernelError::Io);
+    }
+    Ok(b)
+}
+
+/// A bdev inode's back reference to its device (set at registration)
+pub struct BdevOwner(pub alloc::sync::Weak<BlockDevice>);
+
+impl crate::fs::inode::InodeData for BdevOwner {}
+
+impl crate::fs::inode::AsAny for BdevOwner {
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
 }
 
 impl Aops for BdevAops {
@@ -95,6 +117,9 @@ impl Aops for BdevAops {
 
     fn writepage(&self, inode: &Inode, phys: u64, index: u64) -> Result<(), KernelError> {
         let b = inode_bdev(inode)?;
+        if b.ro() {
+            return Err(KernelError::NotPermitted);
+        }
         bdev_rw_frame(&b, BioOp::Write, index << (12 - SECTOR_SHIFT), phys)
     }
 }
@@ -190,8 +215,13 @@ impl FileOps for BlockFileOps {
         self
     }
 
-    /// The device's page cache maps (Linux blkdev_mmap)
-    fn mmap(&self, _file: &File) -> Result<(), KernelError> {
+    /// The device's page cache maps (Linux blkdev_mmap); a read-only
+    /// device only privately or through a read-only file (Linux
+    /// generic_file_readonly_mmap: no shared mapping that may write)
+    fn mmap(&self, file: &File, shared: bool) -> Result<(), KernelError> {
+        if shared && file.is_writable() && bdev(file)?.ro() {
+            return Err(KernelError::InvalidArgument);
+        }
         Ok(())
     }
 

@@ -1217,7 +1217,7 @@ impl FileOps for ProcfsFileOps {
     /// No procfs file maps (its readers may take the mmap_lock a fault
     /// holds): proc_dir_entry files fail in pde_mmap (EIO), per-process
     /// and sysctl files have no mmap (ENODEV)
-    fn mmap(&self, file: &File) -> Result<(), KernelError> {
+    fn mmap(&self, file: &File, _shared: bool) -> Result<(), KernelError> {
         let pde = file
             .get_inode()
             .and_then(|i| i.get_private())

@@ -231,8 +231,8 @@ pub trait FileOps: Send + Sync {
     }
 
     /// May the file be mapped (Linux: f_op->mmap exists and accepts
-    /// it)? Default: no mmap, ENODEV from mmap(2)
-    fn mmap(&self, _file: &File) -> Result<(), KernelError> {
+    /// it), shared or private? Default: no mmap, ENODEV from mmap(2)
+    fn mmap(&self, _file: &File, _shared: bool) -> Result<(), KernelError> {
         Err(KernelError::NoDevice)
     }
 
@@ -791,7 +791,7 @@ impl FileOps for CharDevFileOps {
         self
     }
 
-    fn mmap(&self, file: &File) -> Result<(), KernelError> {
+    fn mmap(&self, file: &File, _shared: bool) -> Result<(), KernelError> {
         let inode = file.get_inode().ok_or(KernelError::BadFd)?;
         match get_chardev(inode.rdev) {
             Some(d) if d.mmap_ok() => Ok(()),

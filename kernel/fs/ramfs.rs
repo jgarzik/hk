@@ -872,7 +872,7 @@ impl FileOps for RamfsFileOps {
 
     /// Regular files map their data (Linux generic_file_mmap);
     /// directories have no mmap
-    fn mmap(&self, file: &File) -> Result<(), KernelError> {
+    fn mmap(&self, file: &File, _shared: bool) -> Result<(), KernelError> {
         match file.get_inode() {
             Some(i) if i.mode().is_dir() => Err(KernelError::NoDevice),
             _ => Ok(()),
