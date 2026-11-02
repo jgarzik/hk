@@ -6,7 +6,9 @@
 //! - SETTIME_PERM: as nobody, clock_settime(CLOCK_REALTIME),
 //!   settimeofday and adjtimex with a mode bit set are EPERM;
 //!   clock_settime of a clock that cannot be set is EINVAL first;
-//!   adjtimex with no mode (a read) works
+//!   adjtimex with no mode (a read) works; the read-only old-adjtime
+//!   query (ADJ_OFFSET_SS_READ) is allowed but sets nothing else it
+//!   carries (Linux __do_adjtimex ignores the other bits there)
 
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
@@ -17,6 +19,7 @@ use hk_syscall::{
 const EPERM: i64 = -1;
 const EINVAL: i64 = -22;
 const ADJ_MAXERROR: u32 = 0x0004;
+const ADJ_OFFSET_SS_READ: u32 = 0xa001;
 const NOBODY: u32 = 65534;
 
 pub fn run_tests() {
@@ -70,6 +73,21 @@ fn child() -> u64 {
     let mut rd: Timex = unsafe { core::mem::zeroed() };
     if sys_adjtimex(&mut rd) < 0 {
         return 6;
+    }
+    // SAFETY: plain integers
+    let mut ss: Timex = unsafe { core::mem::zeroed() };
+    ss.modes = ADJ_OFFSET_SS_READ | ADJ_MAXERROR;
+    ss.maxerror = rd.maxerror + 12345;
+    if sys_adjtimex(&mut ss) < 0 {
+        return 7;
+    }
+    // SAFETY: plain integers
+    let mut after: Timex = unsafe { core::mem::zeroed() };
+    sys_adjtimex(&mut after);
+    // maxerror grows by itself over time; a jump by the value given is
+    // the bypass
+    if after.maxerror >= rd.maxerror + 12345 {
+        return 8;
     }
     0
 }

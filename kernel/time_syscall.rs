@@ -991,6 +991,13 @@ pub fn sys_adjtimex(txc_p: u64) -> i64 {
         }
     }
 
+    // Linux __do_adjtimex: in the old adjtime mode only the single-shot
+    // offset (not kept by hk) is looked at, no other mode bit applies
+    let user_modes = txc.modes;
+    if txc.modes & ADJ_ADJTIME != 0 {
+        txc.modes = 0;
+    }
+
     // Apply modifications to kernel state
     if txc.modes & ADJ_MAXERROR != 0 {
         NTP_STATE.maxerror.store(txc.maxerror, Ordering::Relaxed);
@@ -1066,6 +1073,7 @@ pub fn sys_adjtimex(txc_p: u64) -> i64 {
     txc.tai = NTP_STATE.tai_offset.load(Ordering::Relaxed);
 
     // Copy result back to user space
+    txc.modes = user_modes;
     if put_user::<Uaccess, Timex>(txc_p, txc).is_err() {
         return KernelError::BadAddress.sysret();
     }
