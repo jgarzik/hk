@@ -545,8 +545,7 @@ sched pid 0, flock/POSIX release, signalfd reader, errno flattening.
 - **Copied helpers** (J, or as touched): `get_nofile_limit` in eight
   places; `find_task_by_pid` in four (all root-namespace pids); four
   `current_time`s; about ten user-timespec readers each validating
-  (Linux get_timespec64); USER_HZ open-coded in three (times() assumes
-  a scheduler tick is a USER_HZ tick); three iovec structs and five
+  (Linux get_timespec64); three iovec structs and five
   importers; five SigInfo, three Timeval, two Timespec types; two path
   splitters that disagree on `.`/`..` (G).
 - **Error conventions** (as touched): Result<_, KernelError> about 618
@@ -657,11 +656,6 @@ From the P3 /code-review (unverified). Tag = when to fix.
 1. **Remote write gives up after 16 COW tries** (next batch).
    `kernel/mm/remote.rs:176`: spurious EFAULT; break COW and write
    under one PTE-lock hold, or loop until fatal_signal_pending.
-3. **Minor** (next batch): `kernel/uaccess.rs:235` fault_in_writeable
-   unused and duplicates populate_pages; `kernel/fs/io.rs:68`
-   copy_in always uses the atomic+fault-in copy (only i_rwsem writers
-   need it); `kernel/task/misc.rs:244` USER_HZ duplicated, times()
-   assumes TICK_MS == 10.
 
 ## Fix batch 1 review findings (open)
 From the fix-batch-1 /code-review (unverified). Tag = when to fix.
@@ -690,9 +684,6 @@ Found during T0 (2026-10-19). Tag = when to fix.
    getpid/gettid/kill/wait//proc use the root number; a CLONE_NEWPID
    child is not pid 1 in its namespace. Use `Pid::nr_in(caller's ns)`
    at the syscall boundary.
-4. **`virt_to_phys(p & !0xfff)` duplicated** (next batch) in
-   `Move::ptes`, `PteRange::at` and `ptl::pte_lock`: add one
-   `ptl::table_of_ptep()`.
 5. **BUSYBOX_NC_LO flaky, on hk and the Linux reference** (next
    batch): `BUSYBOX_NC_LO:FAIL status=0` (nc over loopback) in 1 of 5
    x86 `check-linux` runs, and in an hk x86 boot with one CPU

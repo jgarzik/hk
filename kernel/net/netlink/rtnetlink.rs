@@ -919,11 +919,11 @@ fn fill_neigh(e: &NeighInfo, ty: u16, flags: u16, seq: u32, pid: u32) -> Vec<u8>
     if e.state & nud::VALID != 0 {
         m.attr(NDA_LLADDR, &e.ha);
     }
-    // struct nda_cacheinfo: ages in clock_t (USER_HZ = 100)
+    // struct nda_cacheinfo: ages in clock_t
     let mut ci = [0u8; 16];
-    ci[0..4].copy_from_slice(&((e.confirmed / 10) as u32).to_ne_bytes());
-    ci[4..8].copy_from_slice(&((e.used / 10) as u32).to_ne_bytes());
-    ci[8..12].copy_from_slice(&((e.updated / 10) as u32).to_ne_bytes());
+    ci[0..4].copy_from_slice(&(crate::time::ms_to_clock_t(e.confirmed) as u32).to_ne_bytes());
+    ci[4..8].copy_from_slice(&(crate::time::ms_to_clock_t(e.used) as u32).to_ne_bytes());
+    ci[8..12].copy_from_slice(&(crate::time::ms_to_clock_t(e.updated) as u32).to_ne_bytes());
     m.u32(NDA_PROBES, e.probes).attr(NDA_CACHEINFO, &ci);
     m.finish()
 }

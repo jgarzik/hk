@@ -242,16 +242,14 @@ struct Tms {
     tms_cstime: i64,
 }
 
-/// Nanoseconds to clock ticks (USER_HZ = 100)
 fn ns_to_clock_t(ns: u64) -> i64 {
-    (ns / 10_000_000) as i64
+    crate::time::ns_to_clock_t(ns) as i64
 }
 
 /// times(2) (Linux kernel/sys.c sys_times): the process's and its
 /// reaped children's user and system time into `buf` (if not NULL),
-/// and the clock ticks since boot (Linux jiffies in
-/// USER_HZ units; hk's scheduler tick is 10 ms, one USER_HZ tick, and
-/// counts from 0 where Linux starts 5 minutes before the wrap)
+/// and the clock ticks since boot (Linux jiffies in USER_HZ units,
+/// counted from 0 where Linux starts 5 minutes before the wrap)
 pub fn sys_times<A: crate::uaccess::UaccessArch>(buf: u64) -> i64 {
     use crate::task::percpu;
     if buf != 0 {
@@ -267,7 +265,7 @@ pub fn sys_times<A: crate::uaccess::UaccessArch>(buf: u64) -> i64 {
             return KernelError::BadAddress.sysret();
         }
     }
-    percpu::get_ticks() as i64
+    crate::time::ticks_to_clock_t(percpu::get_ticks()) as i64
 }
 
 /// sys_getrusage - get resource usage

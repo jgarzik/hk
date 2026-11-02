@@ -232,31 +232,6 @@ pub fn fault_in_readable<A: UaccessArch>(addr: u64, len: usize) -> usize {
     0
 }
 
-/// Linux fault_in_safe_writeable: fault in every page of [addr, addr +
-/// len) for writing through the fault path (no write to user memory:
-/// copy-on-write broken, missing pages mapped). Returns the bytes not
-/// faulted in, as `fault_in_readable`; same locking rules.
-pub fn fault_in_writeable<A: UaccessArch>(addr: u64, len: usize) -> usize {
-    use crate::mm::fault::{Access, handle_mm_fault};
-    let end = addr.saturating_add(len as u64);
-    if !A::access_ok(addr, len) {
-        return len;
-    }
-    let mm = crate::mm::get_task_mm(crate::task::percpu::current_tid());
-    let mut a = addr;
-    while a < end {
-        let page = a & !0xfff;
-        if mm
-            .as_ref()
-            .is_none_or(|m| handle_mm_fault(m, page, Access::Write).is_err())
-        {
-            return (end - a) as usize;
-        }
-        a = page + 0x1000;
-    }
-    0
-}
-
 /// `copy_from_user` for a copy made under a lock that a fault must not
 /// nest under (Linux generic_perform_write: i_rwsem, later the page
 /// lock): the copy runs with page faults disabled; a missing page is
