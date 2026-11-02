@@ -900,10 +900,7 @@ pub fn x86_64_syscall_dispatch(
         sys_timerfd_create, sys_timerfd_gettime, sys_timerfd_settime,
     };
 
-    // Account for entering kernel mode
-    percpu::account_syscall_enter();
-
-    let result = match num {
+    match num {
         SYS_READ => sys_read(arg0 as i32, arg1, arg2) as u64,
         SYS_WRITE => sys_write(arg0 as i32, arg1, arg2) as u64,
         SYS_READV => sys_readv(arg0 as i32, arg1, arg2 as i32) as u64,
@@ -1613,10 +1610,5 @@ pub fn x86_64_syscall_dispatch(
         }
 
         _ => (-38i64) as u64, // ENOSYS
-    };
-
-    // Account for exiting kernel mode
-    percpu::account_syscall_exit();
-
-    result
+    }
 }

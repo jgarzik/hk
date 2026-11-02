@@ -614,9 +614,6 @@ pub fn aarch64_syscall_dispatch(
         sys_timerfd_gettime, sys_timerfd_settime,
     };
 
-    // Account for entering kernel mode
-    percpu::account_syscall_enter();
-
     match num {
         // I/O syscalls
         SYS_READ => sys_read(arg0 as i32, arg1, arg2) as u64,

@@ -62,6 +62,9 @@ pub fn exit_to_user_mode(regs: &mut PtRegs) {
 /// lock: only the thread flags and the result register are read.
 pub fn syscall_exit_to_user_mode(regs: &mut PtRegs) {
     let me = crate::task::percpu::current();
+    // System time ends, user time starts once back (Linux
+    // vtime_user_enter; the exit work below is short)
+    crate::task::percpu::account_syscall_exit();
     if me.has_tif(tif::SYSCALL_TRACE) {
         // The PTRACE_SYSCALL exit stop (Linux syscall_exit_work)
         crate::task::ptrace::ptrace_report_syscall(false);
@@ -82,6 +85,8 @@ pub fn syscall_exit_to_user_mode(regs: &mut PtRegs) {
 /// skips the syscall, keeping the return register as the tracer or
 /// seccomp left it.
 pub fn syscall_enter_from_user_mode(regs: &mut PtRegs) -> u64 {
+    // User time ends, system time starts (Linux vtime_user_exit)
+    crate::task::percpu::account_syscall_enter();
     if crate::task::percpu::current().has_tif(tif::SYSCALL_TRACE) {
         crate::task::ptrace::ptrace_report_syscall(true);
     }

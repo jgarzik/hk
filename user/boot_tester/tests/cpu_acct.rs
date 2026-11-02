@@ -5,6 +5,8 @@
 //! Tests:
 //! - CPU_ACCT_SLEEP: 300 ms asleep in nanosleep adds well under 100 ms
 //!   of system time (time off the CPU is nobody's)
+//! - CPU_ACCT_USER: time spinning in user mode is user time (arm64
+//!   counted it as system time: its syscall return never switched)
 //! - CPU_ACCT_SPINNER: a sibling thread spinning in user mode, making no
 //!   syscall, shows its CPU time in its thread CPU clock while it still
 //!   spins
@@ -32,6 +34,7 @@ const MS: i64 = 1_000_000;
 
 pub fn run_tests() {
     sleep();
+    user();
     spinner();
     exited();
     children();
@@ -179,6 +182,29 @@ fn sleep() {
     nap(300);
     let grew = stime_ms() - before;
     report(b"CPU_ACCT_SLEEP", grew < 100, grew);
+}
+
+/// User time so far, in ms
+fn utime_ms() -> i64 {
+    // SAFETY: plain integers
+    let mut ru: Rusage = unsafe { core::mem::zeroed() };
+    sys_getrusage(RUSAGE_SELF, &mut ru as *mut Rusage as *mut u8);
+    ru.ru_utime.tv_sec * 1000 + ru.ru_utime.tv_usec / 1000
+}
+
+fn user() {
+    let (u0, s0) = (utime_ms(), stime_ms());
+    // About 200 ms of CPU, a syscall only every few million spins
+    loop {
+        for _ in 0..2_000_000 {
+            core::hint::spin_loop();
+        }
+        if utime_ms() + stime_ms() - u0 - s0 >= 200 {
+            break;
+        }
+    }
+    let du = utime_ms() - u0;
+    report(b"CPU_ACCT_USER", du >= 100, du);
 }
 
 static STOP: AtomicU32 = AtomicU32::new(0);
