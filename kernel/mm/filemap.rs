@@ -31,7 +31,7 @@ use super::fault::VmFault;
 use super::page::{
     PG_DIRTY, PG_LOCKED, PG_UPTODATE, Page, frame_bytes, lock_page, phys_to_page, unlock_page,
 };
-use super::xarray::{MARK_DIRTY, Preload, XArray, node_alloc};
+use super::xarray::{MARK_DIRTY, MARK_WRITEBACK, Preload, XArray, node_alloc};
 use crate::FRAME_ALLOCATOR;
 use crate::error::KernelError;
 use crate::fs::inode::Inode;
@@ -85,6 +85,11 @@ pub trait Aops: Sync {
     ) -> Result<(), KernelError> {
         let _ = (inode, index, buf, write);
         Err(KernelError::OperationNotSupported)
+    }
+
+    /// Dirty the page (Linux ->dirty_folio); default `filemap::dirty_folio`
+    fn dirty_folio(&self, m: &AddressSpace, phys: u64) {
+        dirty_folio(m, phys);
     }
 
     /// Pages get dirty (false: Linux noop_dirty_folio, a mapping with
@@ -431,6 +436,12 @@ pub fn dirty_page(m: &AddressSpace, phys: u64) {
     if !m.aops().can_dirty() {
         return;
     }
+    m.aops().dirty_folio(m, phys);
+}
+
+/// The generic dirtying (Linux filemap_dirty_folio): PG_dirty and the
+/// DIRTY mark, counted
+pub fn dirty_folio(m: &AddressSpace, phys: u64) {
     let pg = page(phys);
     if pg.mapping.load(Ordering::Acquire) == m.key()
         && pg.flags.fetch_or(PG_DIRTY, Ordering::AcqRel) & PG_DIRTY == 0
@@ -490,12 +501,19 @@ pub fn write_range(inode: &Inode, first: u64, last: u64) -> Result<(), KernelErr
                 .filter(|&(_, p)| FRAME_ALLOCATOR.incref(p))
         };
         let Some((index, phys)) = next else {
-            return err;
+            break;
         };
         lock_page(phys);
         let pg = page(phys);
         if pg.mapping.load(Ordering::Acquire) == m.key() {
-            m.i_pages.lock().clear_mark(index, MARK_DIRTY);
+            // Under writeback while it is written (Linux
+            // folio_start_writeback): a concurrent write_range of the
+            // same pages, which no longer finds it dirty, waits for it
+            {
+                let mut pages = m.i_pages.lock();
+                pages.clear_mark(index, MARK_DIRTY);
+                pages.set_mark(index, MARK_WRITEBACK);
+            }
             // Write-protected first: a write through a mapping after
             // this faults and dirties the page again (folio_mkclean)
             mkclean(m, index, phys);
@@ -505,12 +523,40 @@ pub fn write_range(inode: &Inode, first: u64, last: u64) -> Result<(), KernelErr
             {
                 err = Err(e);
             }
+            m.i_pages.lock().clear_mark(index, MARK_WRITEBACK);
         }
         unlock_page(phys);
         put_page(phys);
         match index.checked_add(1) {
             Some(n) => at = n,
-            None => return err,
+            None => break,
+        }
+    }
+    wait_writeback(m, first, last);
+    err
+}
+
+/// Wait for the pages with index in [first, last] that another thread
+/// is writing back (Linux filemap_fdatawait_range): it holds each one's
+/// page lock across the write
+fn wait_writeback(m: &AddressSpace, first: u64, last: u64) {
+    let mut at = first;
+    loop {
+        let next = {
+            let pages = m.i_pages.lock();
+            pages
+                .find(at, last, Some(MARK_WRITEBACK))
+                .filter(|&(_, p)| FRAME_ALLOCATOR.incref(p))
+        };
+        let Some((index, phys)) = next else {
+            return;
+        };
+        lock_page(phys);
+        unlock_page(phys);
+        put_page(phys);
+        match index.checked_add(1) {
+            Some(n) => at = n,
+            None => return,
         }
     }
 }

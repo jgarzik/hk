@@ -238,6 +238,10 @@ pub struct SuperBlock {
     /// wb->b_dirty; `fs_writeback`)
     pub(crate) s_dirty: crate::sync::spin::Mutex<alloc::vec::Vec<Arc<Inode>>>,
 
+    /// Serializes whole-filesystem writeback passes (sleeping: held
+    /// across the I/O; `fs_writeback::writeback_sb`)
+    pub(crate) s_wb_lock: crate::sync::Mutex<()>,
+
     /// Mutex for cross-directory renames (like Linux s_vfs_rename_mutex)
     ///
     /// Serializes all cross-directory renames on this filesystem to
@@ -285,6 +289,7 @@ impl SuperBlock {
             private: RwLock::new(None),
             s_bdev: spin::Once::new(),
             s_dirty: crate::sync::spin::Mutex::new(alloc::vec::Vec::new()),
+            s_wb_lock: crate::sync::Mutex::new(()),
             s_vfs_rename_mutex: sync::Mutex::new(()),
         })
     }

@@ -63,10 +63,10 @@ pub fn mark_inode_dirty(inode: &Arc<Inode>) {
     }
 }
 
-/// Write back one inode's dirty pages (Linux writeback_single_inode):
-/// clean first, so a page dirtied meanwhile puts it back on the list
+/// Write back one inode's dirty pages (Linux writeback_single_inode,
+/// for fsync and the dirty limits). The inode stays on its dirty list
+/// (`i_dirty` is that membership): the next pass finds it clean.
 pub fn writeback_inode(inode: &Inode) -> Result<(), KernelError> {
-    inode.i_dirty.store(false, Ordering::Release);
     crate::mm::filemap::write_and_wait(inode)
 }
 
@@ -74,9 +74,16 @@ pub fn writeback_inode(inode: &Inode) -> Result<(), KernelError> {
 /// (Linux sync_filesystem: sync_inodes_sb + sync_blockdev). The first
 /// error is returned after the rest were tried.
 pub fn writeback_sb(sb: &SuperBlock) -> Result<(), KernelError> {
+    // One pass at a time (Linux wb->work serializes them): a sync or
+    // syncfs racing the periodic writeback waits until the inodes the
+    // other pass took are written
+    let _pass = sb.s_wb_lock.lock();
     let dirty = core::mem::take(&mut *sb.s_dirty.lock());
     let mut err = Ok(());
     for inode in dirty {
+        // Off the list before its pages are written: one dirtied
+        // meanwhile goes back on it
+        inode.i_dirty.store(false, Ordering::Release);
         if let Err(e) = writeback_inode(&inode)
             && err.is_ok()
         {

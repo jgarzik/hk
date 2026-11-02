@@ -152,7 +152,8 @@ pub fn bdev_write_meta(b: &BlockDevice, pos: u64, buf: &[u8]) -> Result<(), Kern
         crate::mm::page::frame_bytes(phys)[off..off + n].copy_from_slice(&buf[done..done + n]);
         let bits: u64 = (off / 512..(off + n).div_ceil(512)).fold(0, |a, s| a | 1 << s);
         page_struct(phys)?.private.fetch_or(bits, Ordering::Relaxed);
-        filemap::dirty_page(&inode.i_data, phys);
+        // Not through the aops: they mark the whole page
+        filemap::dirty_folio(&inode.i_data, phys);
         crate::mm::page::unlock_page(phys);
         filemap::put_page(phys);
         done += n;
@@ -162,6 +163,16 @@ pub fn bdev_write_meta(b: &BlockDevice, pos: u64, buf: &[u8]) -> Result<(), Kern
 }
 
 impl Aops for BdevAops {
+    /// A whole-page dirtying (a device-node write, a store through a
+    /// mapping): every sector is written back, whatever metadata
+    /// marked before
+    fn dirty_folio(&self, m: &filemap::AddressSpace, phys: u64) {
+        if let Ok(p) = page_struct(phys) {
+            p.private.fetch_or((1u64 << SECTORS) - 1, Ordering::Relaxed);
+        }
+        filemap::dirty_folio(m, phys);
+    }
+
     fn read_folio(&self, inode: &Inode, phys: u64, index: u64) -> Result<(), KernelError> {
         let b = inode_bdev(inode)?;
         bdev_rw_frame(&b, BioOp::Read, index << (12 - SECTOR_SHIFT), phys)?;
