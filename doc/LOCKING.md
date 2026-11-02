@@ -288,6 +288,7 @@ Global subsystem locks (TASKLIST, PAGE_CACHE, fd table `Files`)  ← NOT IRQ-saf
 Address space: mmap_lock (sleeping RwSem; under i_rwsem: a write's user
     copy may fault) → page lock (PG_locked, sleeping; Linux folio_lock)
     [→ AddressSpace.i_pages (spin leaf, Linux xa_lock; 3.2)]
+    → AddressSpace.i_mmap (sleeping RwSem, Linux i_mmap_rwsem)
     → AnonVma.chain (sleeping RwSem, Linux anon_vma->rwsem)
     → page_table_lock → PTE lock (spin)
     → SwapInfo.map (spin, Linux si->lock) | swap cache (IrqSpinlock,
@@ -1553,6 +1554,16 @@ layout in `doc/MEMORY.md`
 - The cache holds one reference per page; a MAP_SHARED PTE holds its
   own, so truncate or eviction (dropping only the cache's) never frees
   a page a mapping still uses.
+- `AddressSpace.i_mmap` (the anon_vma chain type, a sleeping RwSem;
+  Linux i_mmap_rwsem): every VMA mapping the file, written by the VMA
+  changes (link/unlink/relink) under the mmap_lock held for writing
+  (mmap_lock -> i_mmap), read by truncate (`unmap_mapping_range`,
+  under i_rwsem, with no mmap_lock: the chain keeps each listed VMA's
+  page tables, since an unmap unlinks the VMA first) -> PTE lock.
+  mremap holds it for writing across the entry move (Linux
+  take_rmap_locks). A file fault maps its page under the page lock and
+  rechecks i_size there; truncate sets i_size, unmaps, removes the
+  pages under their locks and unmaps again.
 - Eviction (`Drop for AddressSpace`, the inode's last reference)
   empties `i_pages` without page locks: nothing else can reach the
   mapping any more.

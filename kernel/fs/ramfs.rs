@@ -424,14 +424,6 @@ impl InodeOps for RamfsInodeOps {
         true
     }
 
-    /// The page for a MAP_SHARED fault, with a reference for its PTE;
-    /// mapped writable, so dirty from now on
-    fn map_page(&self, inode: &Inode, index: u64) -> Result<u64, KernelError> {
-        let phys = filemap::read_page(inode, index).map_err(page_err)?;
-        filemap::dirty_page(&inode.i_data, phys);
-        Ok(phys)
-    }
-
     fn readlink(&self, inode: &Inode) -> Result<String, KernelError> {
         // Must be a symlink
         if !inode.mode().is_symlink() {

@@ -247,8 +247,13 @@ fn fault(mm: &Mm, addr: u64, access: Access) -> Result<(), VmFault> {
     if SwapEntry::is_swap_pte(pte) {
         return do_swap_page(mm, ptep, pte, addr, &area, access);
     }
-    let page = fault_page(addr, &area)?;
+    let (page, locked) = fault_page(addr, &area)?;
     let r = do_fault(mm, ptep, pte, page, addr, &area);
+    if locked {
+        // Mapped under the page lock (Linux finish_fault): see
+        // filemap::fault
+        super::page::unlock_page(page);
+    }
     drop(map);
     r
 }
@@ -341,17 +346,20 @@ fn do_huge_anon(mm: &Mm, addr: u64, area: &Area) -> bool {
 /// anonymous memory (Linux shmem_fault), else a new page, zeroed for
 /// anonymous memory or holding a private copy of the file data (Linux
 /// do_anonymous_page, do_read_fault)
-fn fault_page(addr: u64, area: &Area) -> Result<u64, VmFault> {
+/// Also whether the page comes locked (a page-cache page: unlocked
+/// once mapped).
+fn fault_page(addr: u64, area: &Area) -> Result<(u64, bool), VmFault> {
     let exec = area.prot & PROT_EXEC != 0;
     if let Some(sh) = &area.shmem {
         return sh
             .get_page(area.pgoff(addr) / PAGE_SIZE)
-            .inspect(|&f| paging::sync_page(f, exec));
+            .inspect(|&f| paging::sync_page(f, exec))
+            .map(|f| (f, false));
     }
     if let (true, false, Some(f)) = (area.shared, area.anon, &area.file)
-        && let Some(r) = file_page(f, area.pgoff(addr), area.prot & PROT_EXEC != 0)
+        && let Some(r) = file_page(f, area.pgoff(addr), area.prot)
     {
-        return r;
+        return r.map(|f| (f, true));
     }
     let frame = alloc_user().ok_or(VmFault::Oom)?;
     // SAFETY: a fresh frame, reached through the direct map
@@ -367,31 +375,26 @@ fn fault_page(addr: u64, area: &Area) -> Result<u64, VmFault> {
     if file || exec {
         paging::sync_page(frame, exec);
     }
-    Ok(frame)
+    Ok((frame, false))
 }
 
 /// The page-cache page at byte offset `off` of `file`, for a shared
 /// mapping of a filesystem that maps its cache (Linux filemap_fault):
 /// SIGBUS past the end of the file. None: the fault copies the data.
-fn file_page(file: &File, off: u64, exec: bool) -> Option<Result<u64, VmFault>> {
-    use crate::error::KernelError;
-
+/// The page comes locked, with a reference for the PTE; a writable
+/// mapping dirties it (Linux do_shared_fault: the PTE is mapped dirty).
+fn file_page(file: &File, off: u64, prot: u32) -> Option<Result<u64, VmFault>> {
     let inode = file.get_inode()?;
     if !inode.i_op.maps_cache() {
         return None;
     }
-    if off >= inode.get_size().div_ceil(PAGE_SIZE) * PAGE_SIZE {
-        return Some(Err(VmFault::Bus));
-    }
     Some(
-        inode
-            .i_op
-            .map_page(&inode, off / PAGE_SIZE)
-            .inspect(|&f| paging::sync_page(f, exec))
-            .map_err(|e| match e {
-                KernelError::OutOfMemory | KernelError::NoSpace => VmFault::Oom,
-                _ => VmFault::Bus,
-            }),
+        super::filemap::fault(&inode, off / PAGE_SIZE).inspect(|&f| {
+            paging::sync_page(f, prot & PROT_EXEC != 0);
+            if prot & PROT_WRITE != 0 {
+                super::filemap::dirty_page(&inode.i_data, f);
+            }
+        }),
     )
 }
 

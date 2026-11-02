@@ -368,6 +368,11 @@ impl Vma {
         self.prot & PROT_EXEC != 0
     }
 
+    /// The inode of the mapped file (its i_mmap lists this VMA)
+    pub fn inode(&self) -> Option<Arc<crate::fs::Inode>> {
+        self.file.as_ref().and_then(|f| f.get_inode())
+    }
+
     /// Check if this VMA is memory-locked
     #[inline]
     pub fn is_locked(&self) -> bool {

@@ -282,19 +282,10 @@ pub trait InodeOps: Send + Sync {
         Err(KernelError::OperationNotSupported)
     }
 
-    /// MAP_SHARED mappings of the file map its page-cache pages
-    /// (`map_page`) rather than private copies
+    /// MAP_SHARED mappings of the file map its page cache (`i_data`,
+    /// `filemap::fault`) rather than private copies
     fn maps_cache(&self) -> bool {
         false
-    }
-
-    /// The page-cache frame of page `index` of the file, for a MAP_SHARED
-    /// mapping (Linux ->fault, filemap_fault), with a frame reference
-    /// taken for the mapping's PTE. OperationNotSupported: the
-    /// filesystem does not map its cache, the fault copies the data.
-    fn map_page(&self, inode: &Inode, index: u64) -> Result<u64, KernelError> {
-        let _ = (inode, index);
-        Err(KernelError::OperationNotSupported)
     }
 
     /// The last reference to the inode is gone (Linux ->evict_inode):

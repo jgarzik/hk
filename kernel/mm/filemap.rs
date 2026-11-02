@@ -26,6 +26,7 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use spin::Once;
 
+use super::anon_vma::AnonVma;
 use super::fault::VmFault;
 use super::page::{PG_DIRTY, PG_LOCKED, PG_UPTODATE, Page, lock_page, phys_to_page, unlock_page};
 use super::xarray::{MARK_DIRTY, Preload, XArray, node_alloc};
@@ -87,15 +88,21 @@ pub struct AddressSpace {
     flags: AtomicU32,
     /// The filesystem's I/O
     a_ops: Once<&'static dyn Aops>,
+    /// Every VMA mapping the file (Linux i_mmap + i_mmap_rwsem; the
+    /// same chain type as an anon_vma's): written under the mmap_lock
+    /// held for writing, read by truncate and the reverse map
+    pub i_mmap: AnonVma,
 }
 
 impl AddressSpace {
-    pub const fn new() -> Self {
+    #[track_caller]
+    pub fn new() -> Self {
         Self {
             i_pages: Mutex::new(XArray::new()),
             nrpages: AtomicU64::new(0),
             flags: AtomicU32::new(0),
             a_ops: Once::new(),
+            i_mmap: AnonVma::default(),
         }
     }
 
@@ -438,9 +445,31 @@ pub fn perform_write(inode: &Inode, buf: &[u8], pos: u64) -> Result<usize, Kerne
     Ok(done)
 }
 
+/// Unmap the file's pages from index `from` on in every mapping of it
+/// (Linux unmap_mapping_range with even_cows: private copies too, so
+/// they go SIGBUS with the file). The chain held for reading keeps each
+/// VMA's page tables (an unmap unlinks the VMA first). Sleeps.
+pub fn unmap_mapping_range(m: &AddressSpace, from: u64) {
+    let chain = m.i_mmap.read();
+    for avc in chain.iter() {
+        let pages = (avc.end - avc.start) / PAGE_SIZE as u64;
+        if avc.pgoff + pages <= from {
+            continue;
+        }
+        let Some(mm) = avc.mm.upgrade() else {
+            continue;
+        };
+        let start = avc.start + from.saturating_sub(avc.pgoff) * PAGE_SIZE as u64;
+        let mut tlb = super::gather::Gather::new(&mm);
+        super::memory::zap_range(&mut tlb, start, avc.end);
+    }
+}
+
 /// Set i_size and drop the cache beyond it (Linux truncate_setsize +
-/// truncate_pagecache): pages wholly past the new size go, the partial
-/// last page is zeroed past it. The caller holds i_rwsem.
+/// truncate_pagecache): mappings of the pages past the new size are
+/// zapped (before and after, catching a fault that raced), the pages
+/// removed, and the partial last page zeroed past the size. The
+/// caller holds i_rwsem.
 pub fn truncate_setsize(inode: &Inode, size: u64) {
     let old = inode.get_size();
     inode.set_size(size);
@@ -448,7 +477,10 @@ pub fn truncate_setsize(inode: &Inode, size: u64) {
         return;
     }
     let m = &inode.i_data;
-    truncate_from(m, size.div_ceil(PAGE_SIZE as u64));
+    let from = size.div_ceil(PAGE_SIZE as u64);
+    unmap_mapping_range(m, from);
+    truncate_from(m, from);
+    unmap_mapping_range(m, from);
     let off = (size % PAGE_SIZE as u64) as usize;
     if off != 0
         && let Some(phys) = find_get(m, size / PAGE_SIZE as u64)
@@ -462,15 +494,38 @@ pub fn truncate_setsize(inode: &Inode, size: u64) {
     }
 }
 
-/// The page at `index` for a shared mapping's fault (Linux
-/// filemap_fault): uptodate, with a reference for the PTE; past EOF
-/// or a read error is SIGBUS
+/// The page at `index` for a mapping's fault (Linux filemap_fault):
+/// uptodate, LOCKED, with a reference for the PTE; past EOF or a read
+/// error is SIGBUS. The size is checked again under the page lock and
+/// the caller maps the page before unlocking it, so a truncate (which
+/// sets the size, then removes pages under their lock, then unmaps)
+/// never leaves a mapping of a page past EOF.
 pub fn fault(inode: &Inode, index: u64) -> Result<u64, VmFault> {
-    if index >= inode.get_size().div_ceil(PAGE_SIZE as u64) {
+    let past = |i: &Inode| index >= i.get_size().div_ceil(PAGE_SIZE as u64);
+    if past(inode) {
         return Err(VmFault::Bus);
     }
-    read_page(inode, index).map_err(|e| match e {
-        KernelError::OutOfMemory => VmFault::Oom,
+    let err = |e| match e {
+        KernelError::OutOfMemory | KernelError::NoSpace => VmFault::Oom,
         _ => VmFault::Bus,
-    })
+    };
+    loop {
+        let phys = read_page(inode, index).map_err(err)?;
+        lock_page(phys);
+        if page(phys).mapping.load(Ordering::Acquire) != inode.i_data.key() {
+            // Truncated meanwhile
+            unlock_page(phys);
+            put_page(phys);
+            if past(inode) {
+                return Err(VmFault::Bus);
+            }
+            continue;
+        }
+        if past(inode) {
+            unlock_page(phys);
+            put_page(phys);
+            return Err(VmFault::Bus);
+        }
+        return Ok(phys);
+    }
 }

@@ -1479,10 +1479,16 @@ fn move_mapping(
     if new_vma.is_locked() {
         mm.add_locked_vm(new_len / PAGE_SIZE);
     }
+    let inode = new_vma.inode();
     let idx = mm.insert_vma(new_vma);
     mm.add_total_vm(new_len / PAGE_SIZE);
     mm.merge_adjacent(idx);
-    super::mremap::move_ptes(owner, old_addr, new_addr, old_len);
+    // A file's i_mmap held across the move (Linux take_rmap_locks): a
+    // truncate walking it sees the entries at the old address or the new
+    {
+        let _rmap = inode.as_ref().map(|i| i.i_data.i_mmap.lock_write());
+        super::mremap::move_ptes(owner, old_addr, new_addr, old_len);
+    }
     if !dontunmap {
         // The old range's tables, now empty (Linux move_vma unmaps it)
         let (floor, ceiling) = mm.gap_around(old_addr, old_addr + old_len);

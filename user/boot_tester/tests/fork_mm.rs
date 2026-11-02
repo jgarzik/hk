@@ -15,6 +15,9 @@
 //!   MAP_SHARED one cannot be made writable (EACCES)
 //! - FILE_SHARED_EOF: a shared file mapping is SIGBUS past the page
 //!   holding the end of the file
+//! - TRUNC_SHARED_SIGBUS: truncating a shared-mapped file unmaps the
+//!   pages past the new end: touching one is SIGBUS, and after growing
+//!   the file again it reads zeros, not the old data
 //! - SHMEM_REMOVE_SHARED: MADV_REMOVE by one process zeroes the page
 //!   for the other too, and the page stays shared
 //! - SHMEM_REMOVE_PAST_SIZE: MADV_REMOVE of a range past the object
@@ -317,6 +320,35 @@ fn file_shared() {
         }
         None => report(b"FILE_SHARED_EOF", -1),
     }
+    match map_file(2 * PAGE as i64, 2 * PAGE) {
+        Some((fd, p)) => {
+            report(b"TRUNC_SHARED_SIGBUS", trunc_shared(fd, p));
+            unmap_file(fd, p, 2 * PAGE);
+        }
+        None => report(b"TRUNC_SHARED_SIGBUS", -1),
+    }
+}
+
+/// Truncate unmaps (Linux truncate_pagecache): SIGBUS past the new end
+/// in every process mapping the file, zeros once it grows back
+fn trunc_shared(fd: i32, p: u64) -> i64 {
+    put(p + PAGE + 8, PARENT);
+    if sys_ftruncate(fd, PAGE as i64) != 0 {
+        return 1;
+    }
+    let pid = sys_fork();
+    if pid == 0 {
+        get(p + PAGE + 8);
+        sys_exit(0);
+    }
+    let r = reap(pid);
+    if r != 0x100 + SIGBUS {
+        return 10 + r;
+    }
+    if sys_ftruncate(fd, 2 * PAGE as i64) != 0 {
+        return 2;
+    }
+    if get(p + PAGE + 8) != 0 { 3 } else { 0 }
 }
 
 /// Writes through the mapping, a second mapping and write() meet

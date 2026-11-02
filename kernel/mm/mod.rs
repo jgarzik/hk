@@ -198,6 +198,15 @@ fn avc_of(owner: &Weak<Mm>, pgd: u64, v: &Vma) -> anon_vma::Avc {
     }
 }
 
+/// A file VMA's i_mmap entry: its page offset is the file page of its
+/// start (Linux vm_pgoff of a file VMA)
+fn file_avc_of(owner: &Weak<Mm>, pgd: u64, v: &Vma) -> anon_vma::Avc {
+    anon_vma::Avc {
+        pgoff: v.offset / PAGE_SIZE,
+        ..avc_of(owner, pgd, v)
+    }
+}
+
 /// Where exec put the image and the initial stack (Linux mm->start_code
 /// .. env_end, start_stack): /proc/<pid>/cmdline, environ, stat and
 /// status read it
@@ -245,26 +254,37 @@ impl MmStruct {
     // its entry (anon_vma lock under the mmap_lock held for writing)
     // ------------------------------------------------------------------
 
-    /// Add the chain entry of `v`
+    /// Add the chain entries of `v`: its anon_vma's, and its file's
+    /// i_mmap (Linux vma_link -> vma_link_file)
     fn link(&self, v: &Vma) {
         if let Some(av) = &v.anon_vma {
             av.link(avc_of(&self.owner, self.pgd, v));
         }
+        if let Some(i) = v.inode() {
+            i.i_data.i_mmap.link(file_avc_of(&self.owner, self.pgd, v));
+        }
     }
 
-    /// Drop the chain entry of `v`
+    /// Drop the chain entries of `v`
     fn unlink(&self, v: &Vma) {
         if let Some(av) = &v.anon_vma {
             av.unlink(self.pgd, v.start);
         }
+        if let Some(i) = v.inode() {
+            i.i_data.i_mmap.unlink(self.pgd, v.start);
+        }
     }
 
-    /// Refresh the entry of the VMA at `idx`, which started at `old_start`
+    /// Refresh the entries of the VMA at `idx`, which started at `old_start`
     fn relink(&self, idx: usize, old_start: u64) {
         let v = &self.vmas[idx];
         if let Some(av) = &v.anon_vma {
             let new = avc_of(&self.owner, self.pgd, v);
             av.update(self.pgd, old_start, |c| *c = new);
+        }
+        if let Some(i) = v.inode() {
+            let new = file_avc_of(&self.owner, self.pgd, v);
+            i.i_data.i_mmap.update(self.pgd, old_start, |c| *c = new);
         }
     }
 
