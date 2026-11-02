@@ -713,7 +713,9 @@ pub fn init_task_signal(tid: Tid, sighand: Arc<SigHand>) {
         task.sighand = Some(sighand);
         *task.task.sig.lock() = TaskSignalState::new();
         task.task.set_sigpending(false);
-        task.signal = Some(Arc::new(SignalStruct::new()));
+        let s = Arc::new(SignalStruct::new());
+        task.task.set_cpu_group(&s);
+        task.signal = Some(s);
     }
 }
 
@@ -1363,6 +1365,8 @@ pub struct SignalStruct {
     /// CPU time (ns) of reaped children and theirs (Linux
     /// signal->cutime/cstime)
     child_times: [AtomicU64; 2],
+    /// Process CPU timers' state (Linux signal->cputimer)
+    pub cputimer: crate::cpu_timer::GroupCputimer,
 }
 
 const GROUP_EXIT: u64 = 1 << 63;
@@ -1458,6 +1462,7 @@ impl SignalStruct {
             live: AtomicU32::new(1),
             dead_times: [AtomicU64::new(0), AtomicU64::new(0)],
             child_times: [AtomicU64::new(0), AtomicU64::new(0)],
+            cputimer: crate::cpu_timer::GroupCputimer::new(),
         }
     }
 
@@ -1577,6 +1582,13 @@ impl SignalStruct {
         core::mem::replace(&mut rlim[resource as usize].rlim_cur, cur)
     }
 
+    /// Set a soft limit (RLIMIT_CPU's moves up as SIGXCPU is sent)
+    pub fn set_rlimit_cur(&self, resource: u32, cur: u64) {
+        if let Some(r) = self.rlim.lock().get_mut(resource as usize) {
+            r.rlim_cur = cur;
+        }
+    }
+
     /// Set a resource limit (with permission checks)
     ///
     /// Validates:
@@ -1623,6 +1635,7 @@ impl SignalStruct {
             live: AtomicU32::new(1),
             dead_times: [AtomicU64::new(0), AtomicU64::new(0)],
             child_times: [AtomicU64::new(0), AtomicU64::new(0)],
+            cputimer: crate::cpu_timer::GroupCputimer::new(),
         })
     }
 }
@@ -1669,8 +1682,14 @@ fn clone_task_signal_struct(parent_tid: Tid, child_tid: Tid, share_signal: bool)
             .unwrap_or_else(|| Arc::new(SignalStruct::new()))
     };
 
+    // An inherited finite RLIMIT_CPU is watched from the start (Linux
+    // posix_cpu_timers_init_group)
+    if !share_signal {
+        crate::cpu_timer::rlimit_cpu_changed(&child_signal, child_tid);
+    }
     let mut table = TASKLIST.write();
     if let Some(mut child) = table.get_mut(child_tid) {
+        child.task.set_cpu_group(&child_signal);
         child.signal = Some(child_signal);
     }
 }

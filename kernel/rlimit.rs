@@ -165,7 +165,18 @@ pub fn set_task_rlimit(
 ) -> Result<(), i32> {
     let signal = get_task_signal_struct(tid).ok_or(-3)?; // ESRCH
     let old = signal.get_rlimit(resource).ok_or(-22)?; // EINVAL
-    signal.set_rlimit(resource, new, &old, has_cap_sys_resource)
+    signal.set_rlimit(resource, new, &old, has_cap_sys_resource)?;
+    // A finite CPU limit is watched from now (Linux update_rlimit_cpu)
+    if resource == RLIMIT_CPU {
+        let pid = crate::task::percpu::TASKLIST
+            .read()
+            .get(tid)
+            .map(|t| t.task.pid);
+        if let Some(pid) = pid {
+            crate::cpu_timer::rlimit_cpu_changed(&signal, pid);
+        }
+    }
+    Ok(())
 }
 
 /// Convenience function: get soft limit for current task

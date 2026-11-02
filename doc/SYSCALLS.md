@@ -228,14 +228,14 @@ Linux has an "old" and a "rt_*" (real-time) signal set; modern userspace uses th
 - [x] clock_gettime (realtime, monotonic, raw, coarse, boottime, TAI, alarms, process/thread and per-pid CPU clocks)
 - [x] clock_settime
 - [x] clock_getres (1ns, a tick for coarse and PROF/VIRT CPU clocks)
-- [x] clock_nanosleep (realtime, monotonic, boottime, TAI, alarms; raw/coarse EOPNOTSUPP; CPU clocks not yet)
+- [x] clock_nanosleep (realtime, monotonic, boottime, TAI, alarms, the caller's process CPU clock; raw/coarse and thread CPU clocks EOPNOTSUPP)
 - [x] nanosleep
 
 6.2 POSIX timers
 
-- [x] setitimer (ITIMER_REAL; ITIMER_VIRTUAL/PROF → EINVAL, BUGS.md)
-- [x] getitimer (ITIMER_REAL)
-- [x] timer_create (realtime, monotonic, boottime, alarms; TAI and CPU clocks not yet)
+- [x] setitimer (ITIMER_REAL, ITIMER_VIRTUAL, ITIMER_PROF)
+- [x] getitimer (ITIMER_REAL, ITIMER_VIRTUAL, ITIMER_PROF)
+- [x] timer_create (realtime, monotonic, boottime, TAI, alarms, the caller's process and thread CPU clocks)
 - [x] timer_settime
 - [x] timer_gettime
 - [x] timer_getoverrun

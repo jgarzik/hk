@@ -12,7 +12,8 @@
 //! - TIF_SIGPENDING: `signal::do_signal` delivers (or acts on) it;
 //! - TIF_RESTORE_SIGMASK: a syscall's temporary signal mask is still in
 //!   place; `do_signal` puts the old one back;
-//! - TIF_NOTIFY_RESUME: work queued for the return (none yet).
+//! - TIF_NOTIFY_RESUME: work queued for the return: CPU-time timers the
+//!   tick found due (`cpu_timer::run`).
 //!
 //! So a task spinning in user mode still takes SIGKILL or a handler
 //! (the next tick or a kick IPI interrupts it, and the interrupt returns
@@ -48,6 +49,8 @@ pub fn exit_to_user_mode(regs: &mut PtRegs) {
         }
         if work & tif::NOTIFY_RESUME != 0 {
             crate::task::percpu::current().clear_tif(tif::NOTIFY_RESUME);
+            // CPU-time timers the tick found due (cpu_timer)
+            crate::cpu_timer::run();
         }
         CurrentArch::disable_interrupts();
     }

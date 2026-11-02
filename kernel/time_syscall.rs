@@ -183,6 +183,40 @@ fn cpu_clock_ns(pid: u64, thread: bool, which: u8, gettime: bool) -> Result<u64,
     })
 }
 
+/// clock_nanosleep on a process CPU clock (Linux posix_cpu_nsleep): a
+/// relative sleep interrupted by a signal writes the CPU time left to
+/// `rem` and is ERESTART_RESTARTBLOCK-like (hk restarts with the
+/// original request: ERESTARTNOHAND); an absolute one restarts as is
+fn cpu_nanosleep(clockid: i32, flags: i32, req: u64, rem: u64) -> i64 {
+    if req == 0 || !Uaccess::access_ok(req, core::mem::size_of::<LinuxTimespec>()) {
+        return KernelError::BadAddress.sysret();
+    }
+    let Ok(request) = get_user::<Uaccess, LinuxTimespec>(req) else {
+        return KernelError::BadAddress.sysret();
+    };
+    if request.tv_sec < 0 || request.tv_nsec < 0 || request.tv_nsec >= 1_000_000_000 {
+        return KernelError::InvalidArgument.sysret();
+    }
+    let ns = crate::time::timespec_to_ns(request.tv_sec, request.tv_nsec);
+    let abs = flags & TIMER_ABSTIME != 0;
+    match crate::posix_timer::cpu_nanosleep(clockid, abs, ns) {
+        Ok(()) => 0,
+        Err((KernelError::Interrupted, left)) => {
+            if !abs && rem != 0 {
+                let ts = LinuxTimespec {
+                    tv_sec: (left / 1_000_000_000) as i64,
+                    tv_nsec: (left % 1_000_000_000) as i64,
+                };
+                if put_user::<Uaccess, LinuxTimespec>(rem, ts).is_err() {
+                    return KernelError::BadAddress.sysret();
+                }
+            }
+            KernelError::RestartNoHand.sysret()
+        }
+        Err((e, _)) => e.sysret(),
+    }
+}
+
 /// TIMER_ABSTIME flag for clock_nanosleep
 pub const TIMER_ABSTIME: i32 = 1;
 
@@ -329,16 +363,17 @@ pub fn sys_nanosleep(req: u64, rem: u64) -> i64 {
 /// Returns 0 on success, or negative errno on error.
 pub fn sys_clock_nanosleep(clockid: i32, flags: i32, req: u64, rem: u64) -> i64 {
     // Linux: an unknown clock is EINVAL, one that cannot sleep
-    // EOPNOTSUPP (coarse, raw; CPU clocks: BUGS.md), the caller's own
-    // thread CPU clock EINVAL
+    // EOPNOTSUPP (coarse, raw, thread CPU clocks: no nsleep); a process
+    // CPU clock sleeps until that process has used the time
+    // (posix_cpu_nsleep; the caller's own process here, BUGS.md)
     let pclock = match PosixClock::decode(clockid) {
         Some(c) => c,
         None => return KernelError::InvalidArgument.sysret(),
     };
     let base = match pclock.timer_base() {
         Some(b) => b,
-        None if matches!(pclock, PosixClock::Cpu { thread: true, .. }) => {
-            return KernelError::InvalidArgument.sysret();
+        None if matches!(pclock, PosixClock::Cpu { thread: false, .. }) => {
+            return cpu_nanosleep(clockid, flags, req, rem);
         }
         None => return KernelError::OperationNotSupported.sysret(),
     };

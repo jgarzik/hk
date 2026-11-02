@@ -84,22 +84,16 @@ capabilities (security.capability) raise the permitted set
 (bprm_fill_uid, cap_bprm_creds_from_file). hk exec keeps the caller's
 credentials unchanged, so set-id programs run unprivileged.
 
-## CPU-time clocks: no timers or sleeps
+## CPU-time timer gaps
 
-**Location**: `kernel/time_syscall.rs`, `kernel/posix_timer.rs`
+**Location**: `kernel/cpu_timer.rs`, `kernel/posix_timer.rs`
 
-CPU-time clocks (CLOCK_PROCESS/THREAD_CPUTIME_ID, per-pid ids) can be
-read but not waited on: clock_nanosleep on the process CPU clock is
-EOPNOTSUPP and timer_create on any CPU clock is EINVAL (Linux
-posix_cpu_nsleep / posix_cpu_timer_create run them from the tick).
-timer_create on CLOCK_TAI is EINVAL too.
-
-## Interval timers: ITIMER_VIRTUAL and ITIMER_PROF
-
-**Location**: `kernel/posix_timer.rs` (`sys_setitimer`)
-
-Only ITIMER_REAL (and alarm) exist; the CPU-time timers return EINVAL
-(Linux supports them). rseq is ENOSYS (glibc runs without it).
+timer_create and clock_nanosleep take only the caller's own process
+CPU clock (and its threads' for timer_create): another process's is
+EINVAL (Linux runs those too, checked when that process runs). The
+SCHED CPU clock counts utime + stime like PROF (Linux: exact runtime).
+CPU timer signals carry no siginfo (no si_timerid/si_overrun). rseq is
+ENOSYS (glibc runs without it).
 
 ## AF_PACKET gaps
 

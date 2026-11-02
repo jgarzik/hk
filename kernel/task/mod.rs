@@ -1046,6 +1046,13 @@ pub struct Task<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::Phy
     /// Their only writer is the task's own CPU with interrupts off (its
     /// syscalls, its switches, the tick), so readers on other CPUs retry
     acct_seq: AtomicU32,
+    /// Earliest expiry (ns of its PROF, VIRT time) of a CPU timer on
+    /// this thread's clock: a hint for the tick (`cpu_timer`)
+    pub cpu_next: [AtomicU64; 2],
+    /// Its thread group's SignalStruct, set once when the task gets it
+    /// (never changes): the tick and the accounting reach the group's
+    /// CPU timer state through it without TASKLIST
+    cpu_group: spin::Once<Arc<crate::signal::SignalStruct>>,
     /// Voluntary context switches (task yielded or slept)
     pub nvcsw: AtomicU64,
     /// Involuntary context switches (preempted by scheduler)
@@ -1571,6 +1578,11 @@ impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Tas
             last_run_ns: AtomicU64::new(now),
             in_kernel: AtomicBool::new(kind == TaskKind::KernelThread),
             acct_seq: AtomicU32::new(0),
+            cpu_next: [
+                AtomicU64::new(crate::cpu_timer::NONE),
+                AtomicU64::new(crate::cpu_timer::NONE),
+            ],
+            cpu_group: spin::Once::new(),
             nvcsw: AtomicU64::new(0),
             nivcsw: AtomicU64::new(0),
             min_flt: AtomicU64::new(0),
@@ -1627,6 +1639,11 @@ impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Tas
             last_run_ns: AtomicU64::new(0),
             in_kernel: AtomicBool::new(true),
             acct_seq: AtomicU32::new(0),
+            cpu_next: [
+                AtomicU64::new(crate::cpu_timer::NONE),
+                AtomicU64::new(crate::cpu_timer::NONE),
+            ],
+            cpu_group: spin::Once::new(),
             nvcsw: AtomicU64::new(0),
             nivcsw: AtomicU64::new(0),
             min_flt: AtomicU64::new(0),
@@ -1814,11 +1831,12 @@ impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Tas
     pub fn account(&self, now: u64, kernel: bool) {
         self.acct_begin();
         let delta = now.saturating_sub(self.last_run_ns.load(Ordering::Relaxed));
-        let t = if self.in_kernel.load(Ordering::Relaxed) {
-            &self.stime
-        } else {
-            &self.utime
-        };
+        let was_kernel = self.in_kernel.load(Ordering::Relaxed);
+        // The group's running totals for its CPU timers (when kept)
+        if let Some(g) = self.cpu_group.get() {
+            g.cputimer.charge(delta, was_kernel);
+        }
+        let t = if was_kernel { &self.stime } else { &self.utime };
         t.store(
             t.load(Ordering::Relaxed).saturating_add(delta),
             Ordering::Relaxed,
@@ -1832,6 +1850,16 @@ impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Tas
     /// task is in, staying in it (a context switch away, the tick)
     pub fn account_now(&self, now: u64) {
         self.account(now, self.in_kernel.load(Ordering::Relaxed));
+    }
+
+    /// Its thread group's SignalStruct (none for kernel threads)
+    pub fn cpu_group(&self) -> Option<&Arc<crate::signal::SignalStruct>> {
+        self.cpu_group.get()
+    }
+
+    /// Record the thread group's SignalStruct (once, when assigned)
+    pub fn set_cpu_group(&self, s: &Arc<crate::signal::SignalStruct>) {
+        self.cpu_group.call_once(|| s.clone());
     }
 
     /// The task starts running at `now`: the time it was off a CPU is

@@ -3494,6 +3494,7 @@ pub fn scheduler_tick() {
     // switches is charged too (Linux account_process_tick)
     if me.tid() != 0 {
         me.account_now(now);
+        crate::cpu_timer::tick(&me);
     }
     let resched = match me.se.class() {
         Class::Stop => false,

@@ -17,6 +17,7 @@ pub mod chardev;
 pub mod completion;
 pub mod console;
 pub mod cpu;
+pub mod cpu_timer;
 pub mod cpumask;
 pub mod delay;
 pub mod dma;
