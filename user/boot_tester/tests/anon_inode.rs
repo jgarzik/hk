@@ -7,14 +7,17 @@
 //! - ANON_INODE_SHARED: those files share one inode, mode 0600 with no
 //!   file type
 //! - PIPE_INO: each pipe has its own nonzero inode, `pipe:[ino]`
+//! - ANON_INODE_SETATTR: chmod, chown and utimes of an anonymous file
+//!   are EOPNOTSUPP (Linux 6.16 anon_inode_setattr; the 6.8 reference
+//!   predates it)
 //! - CHMOD_CTIME: chmod and chown (even of nothing) advance ctime
 
-use super::helpers::{print, print_num, println};
+use super::helpers::{host_mode, print, print_num, println, skip};
 use hk_syscall::{
     O_CREAT, O_WRONLY, Stat, Timespec, sys_chmod, sys_chown, sys_close, sys_epoll_create1,
-    sys_eventfd2, sys_fstat, sys_getpid, sys_inotify_init1, sys_nanosleep, sys_open,
+    sys_eventfd2, sys_fchmod, sys_fchown, sys_fstat, sys_getpid, sys_inotify_init1, sys_nanosleep, sys_open,
     sys_pidfd_open, sys_pipe2, sys_readlink, sys_signalfd4, sys_stat, sys_timerfd_create,
-    sys_unlink,
+    sys_unlink, sys_utimensat,
 };
 
 const S_IFMT: u32 = 0o170000;
@@ -25,6 +28,7 @@ pub fn run_tests() {
     anon_link();
     anon_shared();
     pipe_ino();
+    anon_setattr();
     chmod_ctime();
 }
 
@@ -166,6 +170,33 @@ fn pipe_ino() {
         print_num(sa.st_ino as i64);
         print(b" ");
         print_num(sb.st_ino as i64);
+        println(b"");
+    }
+}
+
+const EOPNOTSUPP: i64 = -95;
+
+fn anon_setattr() {
+    if host_mode() {
+        skip(b"ANON_INODE_SETATTR", b"Linux before 6.16 lets setattr change the shared inode");
+        return;
+    }
+    let fd = sys_eventfd2(0, 0);
+    let a = sys_fchmod(fd as i32, 0o644);
+    let b = sys_fchown(fd as i32, u32::MAX, u32::MAX);
+    let c = sys_utimensat(fd as i32, core::ptr::null(), core::ptr::null(), 0);
+    let mut st = zst();
+    sys_fstat(fd as i32, &mut st);
+    sys_close(fd as u64);
+    if a == EOPNOTSUPP && b == EOPNOTSUPP && c == EOPNOTSUPP && st.st_mode == 0o600 {
+        println(b"ANON_INODE_SETATTR:OK");
+    } else {
+        print(b"ANON_INODE_SETATTR:FAIL ");
+        print_num(a);
+        print(b" ");
+        print_num(b);
+        print(b" ");
+        print_num(c);
         println(b"");
     }
 }

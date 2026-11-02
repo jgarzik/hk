@@ -298,6 +298,7 @@ pub fn remove_privs(inode: &Inode) {
 /// caller is in the file's group or has CAP_FSETID
 pub fn chmod(inode: &Inode, perm: u16) -> Result<(), KernelError> {
     let _w = want_write(inode)?;
+    inode.i_op.setattr_ok(inode)?;
     let c = cred();
     if !owner_or_capable(&c, inode) {
         return Err(KernelError::NotPermitted);
@@ -327,6 +328,7 @@ fn chgrp_ok(c: &Cred, inode: &Inode, gid: Gid) -> bool {
 /// group-executable or the caller could not keep it (even for root)
 pub fn chown(inode: &Inode, uid: Option<Uid>, gid: Option<Gid>) -> Result<(), KernelError> {
     let _w = want_write(inode)?;
+    inode.i_op.setattr_ok(inode)?;
     let c = cred();
     if uid.is_some_and(|u| !chown_ok(&c, inode, u)) || gid.is_some_and(|g| !chgrp_ok(&c, inode, g))
     {

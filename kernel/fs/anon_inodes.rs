@@ -8,6 +8,10 @@
 //! given (`[eventfd]`) is what /proc/<pid>/fd shows as
 //! `anon_inode:[eventfd]`.
 //!
+//! Its attributes never change: chmod, chown and utimes on any of these
+//! files are EOPNOTSUPP (Linux anon_inode_setattr), so no file can
+//! alter what every other one reports.
+//!
 //! [`get_next_ino`] numbers inodes of pseudo filesystems (pipes,
 //! sockets): each CPU takes a batch of numbers from a shared counter
 //! and hands them out without touching it (Linux LAST_INO_BATCH).
@@ -21,9 +25,10 @@ use spin::Once;
 
 use crate::arch::IrqSpinlock;
 use crate::cpu::PerCpu;
+use crate::error::KernelError;
 use crate::fs::dentry::Dentry;
 use crate::fs::file::{File, FileOps};
-use crate::fs::inode::{Inode, InodeMode, NULL_INODE_OPS, Timespec};
+use crate::fs::inode::{Inode, InodeMode, InodeOps, Timespec};
 
 /// Numbers one CPU takes from the shared counter at a time
 const LAST_INO_BATCH: u64 = 1024;
@@ -50,6 +55,21 @@ pub fn get_next_ino() -> u64 {
     res
 }
 
+/// Operations of the shared inode: no lookup, no attribute changes
+struct AnonInodeOps;
+
+impl InodeOps for AnonInodeOps {
+    fn lookup(&self, _dir: &Inode, _name: &str) -> Result<Arc<Inode>, KernelError> {
+        Err(KernelError::OperationNotSupported)
+    }
+
+    fn setattr_ok(&self, _inode: &Inode) -> Result<(), KernelError> {
+        Err(KernelError::OperationNotSupported)
+    }
+}
+
+static ANON_INODE_OPS: AnonInodeOps = AnonInodeOps;
+
 /// The inode every anonymous file shares
 static ANON_INODE: Once<Arc<Inode>> = Once::new();
 
@@ -64,7 +84,7 @@ fn anon_inode() -> Arc<Inode> {
                 0,
                 Timespec::from_secs(0),
                 Weak::new(),
-                &NULL_INODE_OPS,
+                &ANON_INODE_OPS,
             ))
         })
         .clone()

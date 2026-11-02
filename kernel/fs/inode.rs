@@ -170,6 +170,14 @@ pub trait InodeOps: Send + Sync {
         super::dac::generic_permission(cred, inode, mask)
     }
 
+    /// Whether attributes may change at all (Linux ->setattr refusing
+    /// before setattr_prepare): chmod, chown and utimes ask first.
+    /// Default yes; the shared anonymous inode refuses (EOPNOTSUPP).
+    fn setattr_ok(&self, inode: &Inode) -> Result<(), KernelError> {
+        let _ = inode;
+        Ok(())
+    }
+
     /// Create a new file in a directory
     fn create(&self, dir: &Inode, name: &str, mode: InodeMode) -> Result<Arc<Inode>, KernelError> {
         let _ = (dir, name, mode);
