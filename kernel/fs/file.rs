@@ -383,6 +383,16 @@ pub struct File {
 }
 
 impl File {
+    /// The file's mount is noexec (Linux path_noexec on f_path.mnt): the
+    /// mount chosen when it was opened, in the opener's namespace, so a
+    /// file passed to another namespace keeps it. A file with no mount
+    /// (an internal object: pipe, memfd) is not noexec.
+    pub fn noexec(&self) -> bool {
+        self.mnt
+            .as_ref()
+            .is_some_and(|m| m.flags() & super::mount::MNT_NOEXEC != 0)
+    }
+
     /// Create a new file
     ///
     /// Finds the mount for the dentry and increments its reference count

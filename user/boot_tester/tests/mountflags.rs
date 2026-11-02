@@ -40,6 +40,8 @@ pub fn run_tests() {
     test_remount_busy();
     test_noexec_mmap();
     test_mountpoint_busy();
+    test_noexec_mayexec();
+    test_noexec_fd_passed();
 }
 
 /// Every modifying syscall on a read-only mount is EROFS
@@ -197,6 +199,92 @@ fn test_noexec_mmap() {
     sys_close(fd as u64);
     sys_unlink(file.as_ptr());
     sys_umount2(mp.as_ptr(), 0);
+    sys_rmdir(mp.as_ptr());
+    done(n, f);
+}
+
+/// A file mapping made on a noexec mount never gets PROT_EXEC, even
+/// after the mount is remounted exec (Linux do_mmap clears VM_MAYEXEC)
+fn test_noexec_mayexec() {
+    let n = b"MOUNT_NOEXEC_MAYEXEC";
+    let mp = b"/tmp/mnt_may\0";
+    let file = b"/tmp/mnt_may/f\0";
+    sys_mkdir(mp.as_ptr(), 0o755);
+    let mut f = chk(n, b"mount", ramfs(mp, MS_NOEXEC), 0);
+    let fd = sys_open(file.as_ptr(), O_CREAT | O_WRONLY, 0o755);
+    let page = [0u8; 4096];
+    sys_write(fd as u64, page.as_ptr(), 4096);
+    sys_close(fd as u64);
+    let fd = sys_open(file.as_ptr(), O_RDONLY, 0);
+    let a = sys_mmap(0, 4096, PROT_READ, MAP_PRIVATE, fd as i32, 0);
+    f += chk(n, b"remount exec", remount(mp, 0), 0);
+    if a > 0 {
+        f += chk(
+            n,
+            b"mprotect exec",
+            sys_mprotect(a as u64, 4096, PROT_READ | PROT_EXEC),
+            EACCES,
+        );
+        sys_munmap(a as u64, 4096);
+    } else {
+        f += chk(n, b"mmap read", a, 0);
+    }
+    sys_close(fd as u64);
+    sys_unlink(file.as_ptr());
+    sys_umount2(mp.as_ptr(), 0);
+    sys_rmdir(mp.as_ptr());
+    done(n, f);
+}
+
+/// A file opened on a noexec mount in another mount namespace and
+/// passed over SCM_RIGHTS keeps that mount's noexec: mmap PROT_EXEC of
+/// it is EPERM here, where its directory is no mount at all (Linux
+/// path_noexec on f_path.mnt)
+fn test_noexec_fd_passed() {
+    use super::sk::recv_msg;
+    use super::unix::{got_fds, send_fds};
+    const CLONE_NEWNS: u64 = 0x20000;
+    let n = b"MOUNT_NOEXEC_FD_PASSED";
+    let mp = b"/tmp/mnt_nxp\0";
+    sys_mkdir(mp.as_ptr(), 0o755);
+    let mut sv = [-1i32; 2];
+    hk_syscall::sys_socketpair(1, 1, 0, &mut sv);
+    let pid = sys_fork();
+    if pid == 0 {
+        if hk_syscall::sys_unshare(CLONE_NEWNS) != 0 || ramfs(mp, MS_NOEXEC) != 0 {
+            sys_exit(2);
+        }
+        let file = b"/tmp/mnt_nxp/f\0";
+        let fd = sys_open(file.as_ptr(), O_CREAT | O_WRONLY, 0o755);
+        let page = [0u8; 4096];
+        sys_write(fd as u64, page.as_ptr(), 4096);
+        sys_close(fd as u64);
+        let fd = sys_open(file.as_ptr(), O_RDONLY, 0);
+        send_fds(sv[1], b"f", &[fd as i32]);
+        // Keep the namespace until the parent is done
+        let mut c = [0u8; 1];
+        sys_read(sv[1] as u64, c.as_mut_ptr(), 1);
+        sys_exit(0);
+    }
+    let mut buf = [0u8; 8];
+    let mut ctl = [0u8; 64];
+    let (r, _, clen) = recv_msg(sv[0], &mut buf, &mut ctl, 0);
+    let (fd, _) = got_fds(&ctl, clen);
+    let mut f = chk(n, b"recv fd", (r == 1 && fd >= 0) as i64, 1);
+    if fd >= 0 {
+        let m = sys_mmap(0, 4096, PROT_READ | PROT_EXEC, MAP_PRIVATE, fd, 0);
+        f += chk(n, b"mmap exec", m, EPERM);
+        if m > 0 {
+            sys_munmap(m as u64, 4096);
+        }
+        sys_close(fd as u64);
+    }
+    sys_write(sv[0] as u64, b"x".as_ptr(), 1);
+    let mut st = 0i32;
+    sys_wait4(pid, &mut st, 0, 0);
+    f += chk(n, b"child", st as i64, 0);
+    sys_close(sv[0] as u64);
+    sys_close(sv[1] as u64);
     sys_rmdir(mp.as_ptr());
     done(n, f);
 }

@@ -48,21 +48,16 @@ pub const MCL_ONFAULT: i32 = 4;
 ///
 /// # Returns
 /// Address of mapping on success, negative errno on failure
-/// File checks of do_mmap (Linux): the file must be readable, a shared
-/// writable mapping needs it open for writing and not append-only, and
-/// PROT_EXEC is refused on a noexec mount (`noexec`: EPERM for mmap,
-/// EACCES for mprotect, where Linux clears VM_MAYEXEC)
-fn file_prot_ok(f: &File, prot: u32, shared: bool, noexec: KernelError) -> Result<(), KernelError> {
+/// File checks of do_mmap (Linux): the file must be readable, and a
+/// shared writable mapping needs it open for writing and not
+/// append-only (EACCES)
+fn file_prot_ok(f: &File, prot: u32, shared: bool) -> Result<(), KernelError> {
     use crate::fs::flags::O_APPEND;
-    use crate::fs::mount::{MNT_NOEXEC, mnt_flags_of};
     if !f.is_readable() {
         return Err(KernelError::PermissionDenied);
     }
     if shared && prot & PROT_WRITE != 0 && (!f.is_writable() || f.get_flags() & O_APPEND != 0) {
         return Err(KernelError::PermissionDenied);
-    }
-    if prot & super::PROT_EXEC != 0 && mnt_flags_of(&f.dentry) & MNT_NOEXEC != 0 {
-        return Err(noexec);
     }
     Ok(())
 }
@@ -127,10 +122,15 @@ pub fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: 
         None
     };
     if let Some(f) = &file
-        && let Err(e) =
-            file_prot_ok(f, prot, is_shared, KernelError::NotPermitted).and_then(|_| f.f_op.mmap(f))
+        && let Err(e) = file_prot_ok(f, prot, is_shared).and_then(|_| f.f_op.mmap(f))
     {
         return e.sysret();
+    }
+    // PROT_EXEC of a file on a noexec mount (its own mount: Linux
+    // path_noexec): EPERM; without it the mapping never gets it later
+    let noexec = file.as_ref().is_some_and(|f| f.noexec());
+    if noexec && prot & super::PROT_EXEC != 0 {
+        return KernelError::NotPermitted.sysret();
     }
 
     // Every user task has an address space; kernel threads have none
@@ -220,6 +220,9 @@ pub fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: 
     // Set VM_SHARED for shared mappings
     if is_shared {
         vma.flags |= VM_SHARED;
+    }
+    if noexec {
+        vma.flags |= super::vma::VM_NOMAYEXEC;
     }
 
     // Set VM_GROWSDOWN for stack-like mappings that grow downward
@@ -1038,15 +1041,14 @@ fn mapped_end(mm: &super::MmStruct, start: u64, end: u64) -> u64 {
 }
 
 /// The VMA may take protection `prot` (Linux: VM_MAYWRITE / VM_MAYEXEC
-/// of its file; no write to a SHM_RDONLY attachment): EACCES otherwise
+/// of its file, decided at mmap; no write to a SHM_RDONLY attachment):
+/// EACCES otherwise
 fn prot_allowed(vma: &Vma, prot: u32) -> Result<(), KernelError> {
     if let Some(f) = &vma.file {
-        file_prot_ok(
-            f,
-            prot & !vma.prot,
-            vma.is_shared(),
-            KernelError::PermissionDenied,
-        )?;
+        file_prot_ok(f, prot & !vma.prot, vma.is_shared())?;
+    }
+    if prot & super::PROT_EXEC != 0 && vma.flags & super::vma::VM_NOMAYEXEC != 0 {
+        return Err(KernelError::PermissionDenied);
     }
     if prot & PROT_WRITE != 0 && vma.shm.as_ref().is_some_and(|a| a.rdonly()) {
         return Err(KernelError::PermissionDenied);

@@ -197,13 +197,12 @@ has one mount per namespace). Unlike Linux (MNT_WRITE_HOLD), a
 EBUSY can see a spurious EROFS. Mount data/options strings are
 ignored; mounts are not user-namespace aware (plain capable()).
 
-mmap PROT_EXEC (`kernel/mm/syscall.rs:64`) and open's NODEV check
-(`kernel/fs/open.rs:187`) find MNT_NOEXEC/NODEV by looking the dentry
-up in the caller's namespace (`mount::mnt_flags_of`, by superblock
-dev_id), not from the file's own mount (`File.mnt`, also picked by
-dev_id at open): for a file from another namespace (an fd passed over
-SCM_RIGHTS) none is found and the flags read as 0. exec fails closed.
-Phase G (Path{mnt, dentry} from the walk) fixes the lookup.
+A mount is found from a dentry by superblock dev_id in the caller's
+namespace (`MntNamespace::find_mount_for_dentry`), not carried by the
+path walk: `File.mnt` is picked that way at open, open's NODEV check
+and statfs flags at the call. Two mounts of one superblock (bind
+mounts, once they exist) would be told apart wrongly. Phase G
+(Path{mnt, dentry} from the walk) fixes the lookup.
 
 ## Thread-group exit gaps
 

@@ -121,6 +121,11 @@ pub const VM_NORESERVE: u32 = 0x0400_0000;
 /// Useful for sensitive data that shouldn't be inherited
 pub const VM_WIPEONFORK: u32 = 0x0800_0000;
 
+/// A file mapping made from a noexec mount: never PROT_EXEC later (Linux
+/// do_mmap clears VM_MAYEXEC, so mprotect is EACCES whatever the mount
+/// becomes)
+pub const VM_NOMAYEXEC: u32 = 0x1000_0000;
+
 // ============================================================================
 // msync flags (MS_*)
 // ============================================================================

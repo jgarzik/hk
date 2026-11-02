@@ -13,7 +13,7 @@ use crate::uaccess::strncpy_from_user;
 use super::flags::{
     O_ACCMODE, O_CLOEXEC, O_CREAT, O_DIRECTORY, O_EXCL, O_NOFOLLOW, O_RDONLY, O_RDWR, O_TRUNC,
 };
-use super::mount::{MNT_NODEV, mnt_flags_of};
+use super::mount::MNT_NODEV;
 use super::syscall::{AT_FDCWD, PATH_MAX, current_fd_table, get_nofile_limit};
 use crate::task::FD_CLOEXEC;
 
@@ -182,9 +182,15 @@ fn filp_open(
     let (dentry, created) = open_target(start, path, flags, mode)?;
     let inode = dentry.get_inode().ok_or(KernelError::NotFound)?;
 
-    // may_open_dev: device nodes on a nodev mount cannot be opened
+    // may_open_dev: device nodes on a nodev mount cannot be opened;
+    // one whose mount is not found in the caller's namespace neither
+    // (fails closed, like open_exec)
     let m = inode.mode();
-    if (m.is_chrdev() || m.is_blkdev()) && mnt_flags_of(&dentry) & MNT_NODEV != 0 {
+    if (m.is_chrdev() || m.is_blkdev())
+        && crate::ns::current_mnt_ns()
+            .find_mount_for_dentry(&dentry)
+            .is_none_or(|mnt| mnt.flags() & MNT_NODEV != 0)
+    {
         return Err(KernelError::PermissionDenied);
     }
 
