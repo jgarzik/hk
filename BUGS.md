@@ -5,13 +5,6 @@
 These are safe fns or patterns whose use leads to undefined behaviour.
 None is known to fail today, but each is a soundness bug:
 
-- **Locks and lists:**
-  - `MutexGuard` is `Sync` for `T: Send` without `T: Sync`.
-  - `List` is `Send` without `Item: Send`.
-  - `ArcList::push_*` doesn't check that the node is unlinked.
-  - `task_ref` guards against the static boot task only in debug
-    builds.
-  - xarray `node()` hands out `&mut` from `&self` paths.
 - **IPC:** `msgctl(IPC_SET)` writes `qbytes` through a shared reference,
   racing with `msgsnd`. The sem/msg/shm downcasts are unchecked.
 - **uaccess:**

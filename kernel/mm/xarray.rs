@@ -123,10 +123,23 @@ unsafe impl Send for XArray {}
 // SAFETY: as above (`&XArray` only reads)
 unsafe impl Sync for XArray {}
 
-/// Node `p` (nonzero, a node of a tree)
-fn node<'a>(p: u64) -> &'a mut Node {
-    // SAFETY: tree nodes are live heap objects reached under the tree
-    // owner's lock (or through `&mut XArray`)
+/// Node `p`, shared (the `&self` paths)
+///
+/// # Safety
+/// `p` is a live node of a tree the caller borrows for `'a`, and no
+/// `&mut` to it exists meanwhile.
+unsafe fn node<'a>(p: u64) -> &'a Node {
+    // SAFETY: per the caller
+    unsafe { &*(p as *const Node) }
+}
+
+/// Node `p`, exclusive (the `&mut self` paths)
+///
+/// # Safety
+/// `p` is a live node of a tree the caller borrows `&mut` for `'a`, and
+/// no other reference to that node is used meanwhile.
+unsafe fn node_mut<'a>(p: u64) -> &'a mut Node {
+    // SAFETY: per the caller
     unsafe { &mut *(p as *mut Node) }
 }
 
@@ -161,7 +174,8 @@ impl XArray {
         }
         let mut n = self.head;
         for level in (2..=self.height).rev() {
-            n = node(n).slots[slot_of(idx, level)];
+            // SAFETY: a live node of this tree, borrowed as the method's self
+            n = unsafe { node(n) }.slots[slot_of(idx, level)];
             if n == 0 {
                 return None;
             }
@@ -174,12 +188,15 @@ impl XArray {
         if self.height == 0 {
             return if idx == 0 { self.head } else { 0 };
         }
-        self.leaf(idx).map_or(0, |(n, s)| node(n).slots[s])
+        // SAFETY: a live node of this tree, borrowed as the method's self
+        self.leaf(idx)
+            .map_or(0, |(n, s)| unsafe { node(n) }.slots[s])
     }
 
     /// Grow by one level: the root becomes slot 0 of a new top node
     fn grow(&mut self, top: NonNull<Node>) {
-        let t = node(top.as_ptr() as u64);
+        // SAFETY: a live node of this tree, borrowed as the method's self
+        let t = unsafe { node_mut(top.as_ptr() as u64) };
         if self.head != 0 {
             t.slots[0] = self.head;
             t.count = 1;
@@ -188,7 +205,8 @@ impl XArray {
                     t.marks[m] = ((self.head_marks >> m) & 1) as u64;
                 }
             } else {
-                let old = node(self.head);
+                // SAFETY: a live node of this tree, borrowed as the method's self
+                let old = unsafe { node_mut(self.head) };
                 old.parent = t;
                 old.offset = 0;
                 for m in 0..MARKS {
@@ -235,20 +253,26 @@ impl XArray {
         let mut n = self.head;
         for level in (2..=self.height).rev() {
             let s = slot_of(idx, level);
-            if node(n).slots[s] == 0 {
+            // SAFETY: a live node of this tree, borrowed as the method's self
+            if unsafe { node_mut(n) }.slots[s] == 0 {
                 let Some(c) = alloc() else {
                     self.prune(n);
                     return None;
                 };
-                let cn = node(c.as_ptr() as u64);
+                // SAFETY: a live node of this tree, borrowed as the method's self
+                let cn = unsafe { node_mut(c.as_ptr() as u64) };
                 cn.parent = n as *mut Node;
                 cn.offset = s as u8;
-                node(n).slots[s] = c.as_ptr() as u64;
-                node(n).count += 1;
+                // SAFETY: a live node of this tree, borrowed as the method's self
+                unsafe { node_mut(n) }.slots[s] = c.as_ptr() as u64;
+                // SAFETY: a live node of this tree, borrowed as the method's self
+                unsafe { node_mut(n) }.count += 1;
             }
-            n = node(n).slots[s];
+            // SAFETY: a live node of this tree, borrowed as the method's self
+            n = unsafe { node_mut(n) }.slots[s];
         }
-        let leaf = node(n);
+        // SAFETY: a live node of this tree, borrowed as the method's self
+        let leaf = unsafe { node_mut(n) };
         let s = slot_of(idx, 1);
         let old = core::mem::replace(&mut leaf.slots[s], val);
         if old == 0 {
@@ -259,15 +283,19 @@ impl XArray {
 
     /// Free `n` and the ancestors a failed store left empty, then shrink
     fn prune(&mut self, mut n: u64) {
-        while n != 0 && node(n).count == 0 {
-            let cur = node(n);
+        // SAFETY: a live node of this tree, borrowed as the method's self
+        while n != 0 && unsafe { node_mut(n) }.count == 0 {
+            // SAFETY: a live node of this tree, borrowed as the method's self
+            let cur = unsafe { node_mut(n) };
             let parent = cur.parent as u64;
             if parent == 0 {
                 self.head = 0;
                 self.height = 0;
             } else {
-                node(parent).slots[cur.offset as usize] = 0;
-                node(parent).count -= 1;
+                // SAFETY: a live node of this tree, borrowed as the method's self
+                unsafe { node_mut(parent) }.slots[cur.offset as usize] = 0;
+                // SAFETY: a live node of this tree, borrowed as the method's self
+                unsafe { node_mut(parent) }.count -= 1;
             }
             // SAFETY: an unlinked, empty node of this tree
             node_free(unsafe { NonNull::new_unchecked(cur) });
@@ -289,7 +317,8 @@ impl XArray {
         let Some((n, s)) = self.leaf(idx) else {
             return 0;
         };
-        let n = node(n);
+        // SAFETY: a live node of this tree, borrowed as the method's self
+        let n = unsafe { node_mut(n) };
         let old = core::mem::take(&mut n.slots[s]);
         if old == 0 {
             return 0;
@@ -300,12 +329,14 @@ impl XArray {
         n.count -= 1;
         let mut n: *mut Node = n;
         loop {
-            let cur = node(n as u64);
+            // SAFETY: a live node of this tree, borrowed as the method's self
+            let cur = unsafe { node_mut(n as u64) };
             let parent = cur.parent;
             if parent.is_null() {
                 break;
             }
-            let p = node(parent as u64);
+            // SAFETY: a live node of this tree, borrowed as the method's self
+            let p = unsafe { node_mut(parent as u64) };
             let o = cur.offset as usize;
             if cur.count == 0 {
                 p.slots[o] = 0;
@@ -314,7 +345,8 @@ impl XArray {
                 node_free(unsafe { NonNull::new_unchecked(n) });
             }
             for m in 0..MARKS {
-                if p.slots[o] == 0 || node(p.slots[o]).marks[m] == 0 {
+                // SAFETY: a live node of this tree, borrowed as the method's self
+                if p.slots[o] == 0 || unsafe { node_mut(p.slots[o]) }.marks[m] == 0 {
                     p.marks[m] &= !(1 << o);
                 }
             }
@@ -328,7 +360,8 @@ impl XArray {
     /// empty tree frees its last node
     fn shrink(&mut self) {
         while self.height > 0 {
-            let top = node(self.head);
+            // SAFETY: a live node of this tree, borrowed as the method's self
+            let top = unsafe { node_mut(self.head) };
             if top.count == 0 {
                 // SAFETY: the tree's own top node
                 node_free(unsafe { NonNull::new_unchecked(top) });
@@ -349,7 +382,8 @@ impl XArray {
             if self.height == 0 {
                 self.head_marks = (0..MARKS).fold(0, |a, m| a | (((marks[m] & 1) as u8) << m));
             } else {
-                node(child).parent = core::ptr::null_mut();
+                // SAFETY: a live node of this tree, borrowed as the method's self
+                unsafe { node_mut(child) }.parent = core::ptr::null_mut();
             }
         }
     }
@@ -366,7 +400,8 @@ impl XArray {
         let Some((n, s)) = self.leaf(idx) else {
             return;
         };
-        let mut n = node(n);
+        // SAFETY: a live node of this tree, borrowed as the method's self
+        let mut n = unsafe { node_mut(n) };
         if n.slots[s] == 0 {
             return;
         }
@@ -380,7 +415,8 @@ impl XArray {
                 return;
             }
             s = n.offset as usize;
-            n = node(n.parent as u64);
+            // SAFETY: a live node of this tree, borrowed as the method's self
+            n = unsafe { node_mut(n.parent as u64) };
         }
     }
 
@@ -395,7 +431,8 @@ impl XArray {
         let Some((n, s)) = self.leaf(idx) else {
             return;
         };
-        let mut n = node(n);
+        // SAFETY: a live node of this tree, borrowed as the method's self
+        let mut n = unsafe { node_mut(n) };
         let mut s = s;
         loop {
             n.marks[m] &= !(1 << s);
@@ -403,7 +440,8 @@ impl XArray {
                 return;
             }
             s = n.offset as usize;
-            n = node(n.parent as u64);
+            // SAFETY: a live node of this tree, borrowed as the method's self
+            n = unsafe { node_mut(n.parent as u64) };
         }
     }
 
@@ -413,7 +451,8 @@ impl XArray {
             return idx == 0 && self.head != 0 && self.head_marks & (1 << m) != 0;
         }
         self.leaf(idx).is_some_and(|(n, s)| {
-            let n = node(n);
+            // SAFETY: a live node of this tree, borrowed as the method's self
+            let n = unsafe { node(n) };
             n.slots[s] != 0 && n.marks[m] & (1 << s) != 0
         })
     }
@@ -422,7 +461,8 @@ impl XArray {
     pub fn marked(&self, m: usize) -> bool {
         match self.height {
             0 => self.head != 0 && self.head_marks & (1 << m) != 0,
-            _ => node(self.head).marks[m] != 0,
+            // SAFETY: a live node of this tree, borrowed as the method's self
+            _ => unsafe { node(self.head) }.marks[m] != 0,
         }
     }
 
@@ -439,7 +479,8 @@ impl XArray {
         if from as u128 >= span(self.height) {
             return None;
         }
-        find_in(node(self.head), self.height, 0, from, to, m)
+        // SAFETY: a live node of this tree, borrowed as the method's self
+        find_in(unsafe { node(self.head) }, self.height, 0, from, to, m)
     }
 
     /// `f(index, entry)` for each entry with index in [from, to], in
@@ -527,7 +568,8 @@ fn find_in(
         if level == 1 {
             return Some((lo, e));
         }
-        if let Some(r) = find_in(node(e), level - 1, lo, from.max(lo), to, m) {
+        // SAFETY: a live node of this tree, borrowed as the method's self
+        if let Some(r) = find_in(unsafe { node(e) }, level - 1, lo, from.max(lo), to, m) {
             return Some(r);
         }
     }
@@ -536,7 +578,8 @@ fn find_in(
 
 /// Free node `n` at `level` and everything below it
 fn destroy(n: u64, level: u8, f: &mut dyn FnMut(u64)) {
-    for &e in node(n).slots.iter().filter(|&&e| e != 0) {
+    // SAFETY: a live node of this tree, borrowed as the method's self
+    for &e in unsafe { node_mut(n) }.slots.iter().filter(|&&e| e != 0) {
         if level == 1 {
             f(e);
         } else {

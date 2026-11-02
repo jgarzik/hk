@@ -12,6 +12,7 @@
 //! nesting order, reporting the first inverse edge.
 
 use core::fmt;
+use core::marker::PhantomData;
 use core::mem::ManuallyDrop;
 use core::ops::{Deref, DerefMut};
 
@@ -77,6 +78,9 @@ pub struct Mutex<T: ?Sized> {
 pub struct MutexGuard<'a, T: ?Sized + 'a> {
     id: usize,
     g: ManuallyDrop<spin::MutexGuard<'a, T>>,
+    /// Holding a lock is CPU state (preempt count, IRQ flags) or owner
+    /// state: the guard stays on the task and CPU that took it
+    _not_send: PhantomData<*const ()>,
 }
 
 impl<T> Mutex<T> {
@@ -102,6 +106,7 @@ impl<T: ?Sized> Mutex<T> {
         MutexGuard {
             id,
             g: ManuallyDrop::new(self.inner.lock()),
+            _not_send: PhantomData,
         }
     }
 
@@ -114,6 +119,7 @@ impl<T: ?Sized> Mutex<T> {
             Some(g) => Some(MutexGuard {
                 id,
                 g: ManuallyDrop::new(g),
+                _not_send: PhantomData,
             }),
             None => {
                 leave(id);
@@ -172,11 +178,17 @@ pub struct RwLock<T: ?Sized> {
 pub struct RwLockReadGuard<'a, T: ?Sized + 'a> {
     id: usize,
     g: ManuallyDrop<spin::RwLockReadGuard<'a, T>>,
+    /// Holding a lock is CPU state (preempt count, IRQ flags) or owner
+    /// state: the guard stays on the task and CPU that took it
+    _not_send: PhantomData<*const ()>,
 }
 
 pub struct RwLockWriteGuard<'a, T: ?Sized + 'a> {
     id: usize,
     g: ManuallyDrop<spin::RwLockWriteGuard<'a, T>>,
+    /// Holding a lock is CPU state (preempt count, IRQ flags) or owner
+    /// state: the guard stays on the task and CPU that took it
+    _not_send: PhantomData<*const ()>,
 }
 
 impl<T> RwLock<T> {
@@ -202,6 +214,7 @@ impl<T: ?Sized> RwLock<T> {
         RwLockReadGuard {
             id,
             g: ManuallyDrop::new(self.inner.read()),
+            _not_send: PhantomData,
         }
     }
 
@@ -213,6 +226,7 @@ impl<T: ?Sized> RwLock<T> {
         RwLockWriteGuard {
             id,
             g: ManuallyDrop::new(self.inner.write()),
+            _not_send: PhantomData,
         }
     }
 
@@ -225,6 +239,7 @@ impl<T: ?Sized> RwLock<T> {
             Some(g) => Some(RwLockReadGuard {
                 id,
                 g: ManuallyDrop::new(g),
+                _not_send: PhantomData,
             }),
             None => {
                 leave(id);
@@ -242,6 +257,7 @@ impl<T: ?Sized> RwLock<T> {
             Some(g) => Some(RwLockWriteGuard {
                 id,
                 g: ManuallyDrop::new(g),
+                _not_send: PhantomData,
             }),
             None => {
                 leave(id);
@@ -305,3 +321,11 @@ impl<T: ?Sized> Drop for RwLockWriteGuard<'_, T> {
         leave(self.id);
     }
 }
+
+// SAFETY: a guard gives `&T` to whoever shares it, so it is Sync only
+// for T: Sync (a guard holding &mut T would otherwise be Sync for any T)
+unsafe impl<T: ?Sized + Sync> Sync for MutexGuard<'_, T> {}
+// SAFETY: as above (readers share &T)
+unsafe impl<T: ?Sized + Sync> Sync for RwLockReadGuard<'_, T> {}
+// SAFETY: as above
+unsafe impl<T: ?Sized + Sync> Sync for RwLockWriteGuard<'_, T> {}

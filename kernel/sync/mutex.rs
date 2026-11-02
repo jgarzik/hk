@@ -12,6 +12,7 @@
 //! (`WaitQueue` exclusive waits). `try_lock` (Linux mutex_trylock) never sleeps.
 
 use core::cell::UnsafeCell;
+use core::marker::PhantomData;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -120,7 +121,10 @@ impl<T> Mutex<T> {
     #[track_caller]
     pub fn lock(&self) -> MutexGuard<'_, T> {
         self.lock_raw();
-        MutexGuard { m: self }
+        MutexGuard {
+            m: self,
+            _not_send: PhantomData,
+        }
     }
 
     /// Acquire, or give up with EINTR if a signal is pending while
@@ -128,7 +132,10 @@ impl<T> Mutex<T> {
     #[track_caller]
     pub fn lock_interruptible(&self) -> Result<MutexGuard<'_, T>, KernelError> {
         self.lock_wait(SleepState::Interruptible)?;
-        Ok(MutexGuard { m: self })
+        Ok(MutexGuard {
+            m: self,
+            _not_send: PhantomData,
+        })
     }
 
     /// Acquire, or give up with EINTR if SIGKILL is pending while
@@ -136,19 +143,32 @@ impl<T> Mutex<T> {
     #[track_caller]
     pub fn lock_killable(&self) -> Result<MutexGuard<'_, T>, KernelError> {
         self.lock_wait(SleepState::Killable)?;
-        Ok(MutexGuard { m: self })
+        Ok(MutexGuard {
+            m: self,
+            _not_send: PhantomData,
+        })
     }
 
     /// Acquire if free, without sleeping (Linux mutex_trylock)
     pub fn try_lock(&self) -> Option<MutexGuard<'_, T>> {
-        self.try_raw(me()).then_some(MutexGuard { m: self })
+        self.try_raw(me()).then_some(MutexGuard {
+            m: self,
+            _not_send: PhantomData,
+        })
     }
 }
 
 /// Holds a `Mutex` until dropped
 pub struct MutexGuard<'a, T> {
     m: &'a Mutex<T>,
+    /// Holding a lock is CPU state (preempt count, IRQ flags) or owner
+    /// state: the guard stays on the task and CPU that took it
+    _not_send: PhantomData<*const ()>,
 }
+
+// SAFETY: sharing the guard shares `&T`: Sync only for T: Sync (the
+// Mutex itself is Sync for any T: Send)
+unsafe impl<T: Sync> Sync for MutexGuard<'_, T> {}
 
 impl<T> Deref for MutexGuard<'_, T> {
     type Target = T;

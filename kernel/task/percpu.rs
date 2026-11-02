@@ -599,7 +599,9 @@ crate::adapter!(pub SessionLink, KernelTask, session_link);
 /// boot task does: the table and run queues hold `TaskRef`s)
 pub fn task_ref(t: &KernelTask) -> TaskRef {
     let p = t as *const KernelTask;
-    debug_assert!(!core::ptr::eq(p, &INIT_TASK));
+    // The static boot task is in no Arc: one pointer compare keeps this
+    // safe fn from corrupting the memory before it
+    assert!(!core::ptr::eq(p, &INIT_TASK), "task_ref of the boot task");
     // SAFETY: `t` is the data of a live `Arc<KernelTask>` (see above)
     unsafe {
         Arc::increment_strong_count(p);

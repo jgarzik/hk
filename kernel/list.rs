@@ -15,12 +15,17 @@
 //! A list and the links of its entries are only touched under the lock
 //! that owns the list (the caller's: `&mut List` is that proof); the
 //! link words are atomics only so items stay `Sync`. An item is on at
-//! most one list per link.
+//! most one list per link: a link off every list holds [`UNLINKED`] (on
+//! a list, the ends hold null), which [`ArcList`] checks on insert.
 
 use alloc::sync::Arc;
 use core::marker::PhantomData;
 use core::ptr::null_mut;
 use core::sync::atomic::{AtomicPtr, Ordering::Relaxed};
+
+/// The pointers of a link that is on no list (Linux LIST_POISON):
+/// never a link's address (no link is at address 8)
+const UNLINKED: *mut Link = core::ptr::dangling_mut();
 
 /// The list hook embedded in an item (Linux struct list_head)
 pub struct Link {
@@ -31,9 +36,14 @@ pub struct Link {
 impl Link {
     pub const fn new() -> Self {
         Self {
-            next: AtomicPtr::new(null_mut()),
-            prev: AtomicPtr::new(null_mut()),
+            next: AtomicPtr::new(UNLINKED),
+            prev: AtomicPtr::new(UNLINKED),
         }
+    }
+
+    /// On a list (read under the lock of the list it may be on)
+    pub fn is_linked(&self) -> bool {
+        self.next.load(Relaxed) != UNLINKED
     }
 }
 
@@ -85,8 +95,10 @@ pub struct List<A: Adapter> {
     _a: PhantomData<A>,
 }
 
-// SAFETY: a list is only used under its owner's lock
+// SAFETY: a list is only used under its owner's lock and hands out
+// `&Item` (so `Item: Sync`); it owns no items (ArcList adds Arc's bound)
 unsafe impl<A: Adapter> Send for List<A> where A::Item: Sync {}
+// SAFETY: as above
 unsafe impl<A: Adapter> Sync for List<A> where A::Item: Sync {}
 
 impl<A: Adapter> List<A> {
@@ -189,8 +201,8 @@ impl<A: Adapter> List<A> {
                 Some(p) => p.next.store(next, Relaxed),
                 None => self.head = next,
             }
-            (*l).next.store(null_mut(), Relaxed);
-            (*l).prev.store(null_mut(), Relaxed);
+            (*l).next.store(UNLINKED, Relaxed);
+            (*l).prev.store(UNLINKED, Relaxed);
         }
         self.len -= 1;
     }
@@ -270,11 +282,16 @@ impl<'a, A: Adapter> Iterator for Iter<'a, A> {
 /// A [`List`] that owns a strong reference to each entry
 pub struct ArcList<A: Adapter> {
     list: List<A>,
+    /// It drops `Arc<Item>`s wherever it goes: Send/Sync as Arc's
+    _owns: PhantomData<Arc<A::Item>>,
 }
 
 impl<A: Adapter> ArcList<A> {
     pub const fn new() -> Self {
-        Self { list: List::new() }
+        Self {
+            list: List::new(),
+            _owns: PhantomData,
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -285,14 +302,17 @@ impl<A: Adapter> ArcList<A> {
         self.list.is_empty()
     }
 
-    /// Append `item`, which must not be on a list through this link
+    /// Append `item`; panics if it is on a list through this link
     pub fn push_back(&mut self, item: Arc<A::Item>) {
-        // SAFETY: the list now owns this reference until removal
+        assert!(!A::link(&item).is_linked(), "ArcList: item already linked");
+        // SAFETY: unlinked (checked), and live while the list owns this
+        // reference
         unsafe { self.list.push_back(Arc::into_raw(item)) };
     }
 
     /// Prepend `item` (as `push_back`)
     pub fn push_front(&mut self, item: Arc<A::Item>) {
+        assert!(!A::link(&item).is_linked(), "ArcList: item already linked");
         // SAFETY: as above
         unsafe { self.list.push_front(Arc::into_raw(item)) };
     }
@@ -383,6 +403,16 @@ mod tests {
         // Reinsert after removal
         l.push_back(a.clone());
         assert_eq!(vals(&l), [1]);
+    }
+
+    #[test]
+    #[should_panic(expected = "already linked")]
+    fn double_insert_panics() {
+        let mut l: ArcList<NodeA> = ArcList::new();
+        let mut m: ArcList<NodeA> = ArcList::new();
+        let a = node(1);
+        l.push_back(a.clone());
+        m.push_back(a);
     }
 
     #[test]

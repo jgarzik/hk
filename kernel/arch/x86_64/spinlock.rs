@@ -16,6 +16,7 @@
 //! lock from interrupt context.
 
 use ::core::cell::UnsafeCell;
+use ::core::marker::PhantomData;
 use ::core::ops::{Deref, DerefMut};
 use ::core::sync::atomic::{AtomicBool, Ordering};
 
@@ -87,6 +88,7 @@ impl<T> IrqSpinlock<T> {
         IrqSpinlockGuard {
             lock: self,
             irq_state,
+            _not_send: PhantomData,
         }
     }
 
@@ -112,6 +114,7 @@ impl<T> IrqSpinlock<T> {
             Some(IrqSpinlockGuard {
                 lock: self,
                 irq_state,
+                _not_send: PhantomData,
             })
         } else {
             // Failed to acquire - restore state
@@ -133,6 +136,7 @@ impl<T> IrqSpinlock<T> {
         IrqSpinlockGuard {
             lock: self,
             irq_state: save_and_disable_irq(),
+            _not_send: PhantomData,
         }
     }
 }
@@ -144,7 +148,13 @@ impl<T> IrqSpinlock<T> {
 pub struct IrqSpinlockGuard<'a, T> {
     lock: &'a IrqSpinlock<T>,
     irq_state: bool, // true if interrupts were enabled before lock
+    /// Holding a lock is CPU state (preempt count, IRQ flags) or owner
+    /// state: the guard stays on the task and CPU that took it
+    _not_send: PhantomData<*const ()>,
 }
+
+// SAFETY: sharing the guard shares `&T`: Sync only for T: Sync
+unsafe impl<T: Sync> Sync for IrqSpinlockGuard<'_, T> {}
 
 impl<T> Deref for IrqSpinlockGuard<'_, T> {
     type Target = T;
@@ -175,7 +185,11 @@ impl<'a, T> IrqSpinlockGuard<'a, T> {
     pub unsafe fn rebind<'b>(self, lock: &'b IrqSpinlock<T>) -> IrqSpinlockGuard<'b, T> {
         let irq_state = self.irq_state;
         core::mem::forget(self);
-        IrqSpinlockGuard { lock, irq_state }
+        IrqSpinlockGuard {
+            lock,
+            irq_state,
+            _not_send: PhantomData,
+        }
     }
 }
 
