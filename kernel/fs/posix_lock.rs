@@ -384,34 +384,42 @@ pub fn posix_getlk(file: &File, flock: &mut Flock) -> Result<(), KernelError> {
     Ok(())
 }
 
-/// F_SETLK - set/clear lock (non-blocking)
+/// F_SETLK - set/clear lock (non-blocking): the absolute range it
+/// covered
 ///
 /// Attempts to acquire or release a lock. Returns EAGAIN if the lock
 /// cannot be acquired due to a conflict.
-pub fn posix_setlk(file: &File, flock: &Flock) -> Result<(), KernelError> {
+pub fn posix_setlk(file: &File, flock: &Flock) -> Result<(u64, u64), KernelError> {
     let inode = file.get_inode().ok_or(KernelError::BadFd)?;
     let (start, end) = resolve_range(flock, file)?;
-    let pid = current_pid();
-    let key = inode_key(&inode);
-
-    let mut locks = POSIX_LOCKS.lock();
-
     if flock.l_type == F_UNLCK {
-        // Unlock
-        if let Some(inode_locks) = locks.get_mut(&key) {
-            inode_locks.unlock_range(pid, start, end);
-            if inode_locks.is_empty() {
-                locks.remove(&key);
-            }
-        }
-        Ok(())
-    } else {
-        // Lock
-        let lock_type =
-            PosixLockType::from_flock(flock.l_type).ok_or(KernelError::InvalidArgument)?;
+        unlock(&inode, start, end);
+        return Ok((start, end));
+    }
+    let lock_type = PosixLockType::from_flock(flock.l_type).ok_or(KernelError::InvalidArgument)?;
+    let mut locks = POSIX_LOCKS.lock();
+    let inode_locks = locks.entry(inode_key(&inode)).or_default();
+    inode_locks.try_lock(current_pid(), start, end, lock_type)?;
+    Ok((start, end))
+}
 
-        let inode_locks = locks.entry(key).or_default();
-        inode_locks.try_lock(pid, start, end, lock_type)
+/// Unlock the current process's locks on `file` over `[start, end)`,
+/// a range already resolved (Linux fcntl_setlk's F_UNLCK retry reuses
+/// the resolved file_lock: offset or size changes don't move it)
+pub fn posix_unlock(file: &File, (start, end): (u64, u64)) {
+    if let Some(inode) = file.get_inode() {
+        unlock(&inode, start, end);
+    }
+}
+
+fn unlock(inode: &Arc<Inode>, start: u64, end: u64) {
+    let key = inode_key(inode);
+    let mut locks = POSIX_LOCKS.lock();
+    if let Some(inode_locks) = locks.get_mut(&key) {
+        inode_locks.unlock_range(current_pid(), start, end);
+        if inode_locks.is_empty() {
+            locks.remove(&key);
+        }
     }
 }
 
@@ -419,7 +427,7 @@ pub fn posix_setlk(file: &File, flock: &Flock) -> Result<(), KernelError> {
 ///
 /// Like F_SETLK, but waits for the lock to become available.
 /// Note: We don't implement actual blocking - returns EAGAIN like flock() does.
-pub fn posix_setlkw(file: &File, flock: &Flock) -> Result<(), KernelError> {
+pub fn posix_setlkw(file: &File, flock: &Flock) -> Result<(u64, u64), KernelError> {
     // For now, just call setlk - we don't implement actual blocking
     // A real implementation would sleep and retry
     posix_setlk(file, flock)

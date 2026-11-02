@@ -382,19 +382,15 @@ mod fcntl_cmd {
 /// thread) took the descriptor away meanwhile, its release came too
 /// early, so that range is unlocked now; the process's other locks
 /// stay (Linux fcntl_setlk rechecks with files_lookup_fd and sets
-/// F_UNLCK over the same region)
-fn setlk_recheck(fd: i32, file: &Arc<crate::fs::File>, flock: &Flock) {
-    use crate::fs::posix_lock::F_UNLCK;
+/// F_UNLCK over the same, already resolved, region)
+fn setlk_recheck(fd: i32, file: &Arc<crate::fs::File>, flock: &Flock, range: (u64, u64)) {
+    use crate::fs::posix_lock::{F_UNLCK, posix_unlock};
     let same = current_fd_table()
         .lock()
         .get(fd)
         .is_some_and(|f| Arc::ptr_eq(&f, file));
     if !same && flock.l_type != F_UNLCK {
-        let undo = Flock {
-            l_type: F_UNLCK,
-            ..*flock
-        };
-        let _ = posix_setlk(file, &undo);
+        posix_unlock(file, range);
     }
 }
 
@@ -552,8 +548,8 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> i64 {
             }
 
             match posix_setlk(&file, &flock) {
-                Ok(()) => {
-                    setlk_recheck(fd, &file, &flock);
+                Ok(range) => {
+                    setlk_recheck(fd, &file, &flock, range);
                     0
                 }
                 Err(e) => e.sysret(),
@@ -579,8 +575,8 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> i64 {
             }
 
             match posix_setlkw(&file, &flock) {
-                Ok(()) => {
-                    setlk_recheck(fd, &file, &flock);
+                Ok(range) => {
+                    setlk_recheck(fd, &file, &flock, range);
                     0
                 }
                 Err(e) => e.sysret(),
