@@ -17,7 +17,11 @@ use super::Pid;
 /// * `pid` - Process ID to query (0 = calling process)
 /// * `caller_pid` - PID of calling process
 /// * `caller_pgid` - PGID of calling process
-pub fn sys_getpgid(pid: Pid, caller_pid: Pid, caller_pgid: Pid) -> i64 {
+pub fn sys_getpgid(pid: i32, caller_pid: Pid, caller_pgid: Pid) -> i64 {
+    if pid < 0 {
+        return KernelError::NoProcess.sysret();
+    }
+    let pid = pid as Pid;
     if pid == 0 || pid == caller_pid {
         caller_pgid as i64
     } else {
@@ -39,7 +43,11 @@ pub fn sys_getpgid(pid: Pid, caller_pid: Pid, caller_pgid: Pid) -> i64 {
 /// * `pid` - Process ID to query (0 = calling process)
 /// * `caller_pid` - PID of calling process
 /// * `caller_sid` - SID of calling process
-pub fn sys_getsid(pid: Pid, caller_pid: Pid, caller_sid: Pid) -> i64 {
+pub fn sys_getsid(pid: i32, caller_pid: Pid, caller_sid: Pid) -> i64 {
+    if pid < 0 {
+        return KernelError::NoProcess.sysret();
+    }
+    let pid = pid as Pid;
     if pid == 0 || pid == caller_pid {
         caller_sid as i64
     } else {
@@ -57,7 +65,8 @@ pub fn sys_getsid(pid: Pid, caller_pid: Pid, caller_sid: Pid) -> i64 {
 /// If pgid is 0, the PID is used as the new PGID (creating a new process group).
 ///
 /// # Restrictions
-/// - Can only set PGID of self or child (we only support self for now)
+/// - Only the caller's own process or a child of it (same session, not
+///   yet exec'd: EPERM, EACCES; anything else ESRCH)
 /// - Cannot change PGID of session leader
 /// - Target PGID must exist in same session, or pgid==pid (new group)
 ///
@@ -68,29 +77,23 @@ pub fn sys_getsid(pid: Pid, caller_pid: Pid, caller_sid: Pid) -> i64 {
 /// * `caller_pgid` - Current PGID of calling process
 /// * `caller_sid` - SID of calling process
 pub fn sys_setpgid(
-    pid: Pid,
-    pgid: Pid,
+    pid: i32,
+    pgid: i32,
     caller_pid: Pid,
     _caller_pgid: Pid,
     caller_sid: Pid,
 ) -> i64 {
-    // Normalize pid and pgid
-    let target_pid = if pid == 0 { caller_pid } else { pid };
-    let new_pgid = if pgid == 0 { target_pid } else { pgid };
-
-    // Validate pgid (cannot be negative in Linux, we use u64 so this is fine)
-    if new_pgid == 0 {
+    // Linux: a negative pgid is EINVAL, a negative pid names no task
+    if pgid < 0 {
         return KernelError::InvalidArgument.sysret();
     }
-
-    // For now, we only support setting own PGID (no child process support yet)
-    if target_pid != caller_pid {
-        // TODO: When we have fork(), allow setting child's PGID
+    if pid < 0 {
         return KernelError::NoProcess.sysret();
     }
+    let target_pid = if pid == 0 { caller_pid } else { pid as Pid };
+    let new_pgid = if pgid == 0 { target_pid } else { pgid as Pid };
 
-    // Call the scheduler function to update the task
-    match super::percpu::set_task_pgid(target_pid, new_pgid, caller_sid) {
+    match super::percpu::set_task_pgid(caller_pid, target_pid, new_pgid, caller_sid) {
         Ok(()) => 0,
         Err(errno) => -(errno as i64),
     }

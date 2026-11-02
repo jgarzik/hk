@@ -4042,15 +4042,51 @@ fn change_class(p: &KernelTask, f: impl FnOnce(&sched::SchedEntity)) {
 /// - ESRCH (3): Process not found
 /// - EPERM (1): a session leader, another session, or no group
 ///   `new_pgid` in the caller's session
-pub fn set_task_pgid(target_pid: Pid, new_pgid: Pid, caller_sid: Pid) -> Result<(), i32> {
+pub fn set_task_pgid(
+    caller_pid: Pid,
+    target_pid: Pid,
+    new_pgid: Pid,
+    caller_sid: Pid,
+) -> Result<(), i32> {
     // Found before TASKLIST (the pid hash's lock is not nested in it)
     let target = crate::task::pid::find_pgrp(new_pgid);
     let mut old = Vec::new();
     let mut table = TASKLIST.write();
+    setpgid_who(&table, caller_pid, target_pid, caller_sid)?;
     let pg = setpgid_target(&table, target_pid, new_pgid, target.as_ref(), caller_sid)?;
     table.change_pids(target_pid, &pg, None, &mut old);
     drop(table);
     drop(old);
+    Ok(())
+}
+
+/// Process `pid` is the caller's own (`caller_pid`, its group leader)
+/// or a child of the caller's process in its session that has not
+/// exec'd (Linux sys_setpgid: ESRCH, EPERM, EACCES)
+fn setpgid_who(
+    table: &GlobalTaskTable,
+    caller_pid: Pid,
+    pid: Pid,
+    caller_sid: Pid,
+) -> Result<(), i32> {
+    if pid == caller_pid {
+        return Ok(());
+    }
+    let p = table.get(pid).ok_or(3)?; // ESRCH
+    let child = p
+        .real_parent
+        .as_ref()
+        .and_then(|w| w.upgrade())
+        .is_some_and(|parent| parent.pid == caller_pid);
+    if !child {
+        return Err(3); // ESRCH
+    }
+    if p.task.sid() != caller_sid {
+        return Err(1); // EPERM
+    }
+    if !p.task.has_flag(crate::task::pf::FORKNOEXEC) {
+        return Err(13); // EACCES
+    }
     Ok(())
 }
 
@@ -4402,6 +4438,8 @@ pub fn exec_replace_image(
         new.set_dumpable(ident.dumpable);
         // The mm and name change as one under task_lock (Linux
         // exec_mmap, __set_task_comm): a reader sees both or neither
+        // Linux begin_new_exec clears PF_FORKNOEXEC
+        task.task.clear_flag(crate::task::pf::FORKNOEXEC);
         let mut a = task.task.task_lock();
         // SAFETY: the task itself
         unsafe {

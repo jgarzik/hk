@@ -868,6 +868,9 @@ pub mod pf {
     /// Its allocations do no I/O to reclaim, so no direct reclaim (Linux
     /// PF_MEMALLOC_NOIO, memalloc_noio_save)
     pub const MEMALLOC_NOIO: u32 = 0x0008_0000;
+    /// Forked and not yet exec'd (Linux PF_FORKNOEXEC): its parent may
+    /// still move it to another process group (setpgid)
+    pub const FORKNOEXEC: u32 = 0x0000_0040;
     /// Kernel thread (Linux PF_KTHREAD)
     pub const KTHREAD: u32 = 0x0020_0000;
     /// Its CPU affinity is not the user's to change (Linux
@@ -1509,7 +1512,7 @@ impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Tas
         let now = crate::time::monotonic_ns();
         let flags = match kind {
             TaskKind::KernelThread => pf::KTHREAD | pf::NO_SETAFFINITY,
-            TaskKind::UserProcess => 0,
+            TaskKind::UserProcess => pf::FORKNOEXEC,
         };
         Self {
             tid: AtomicU64::new(tid),

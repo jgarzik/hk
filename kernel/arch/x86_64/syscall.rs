@@ -1062,11 +1062,13 @@ pub fn x86_64_syscall_dispatch(
 
         // Process IDs & basic info (Section 1.2)
         SYS_GETPPID => sys_getppid(percpu::current_ppid()) as u64,
-        SYS_GETPGID => sys_getpgid(arg0, percpu::current_pid(), percpu::current_pgid()) as u64,
-        SYS_GETSID => sys_getsid(arg0, percpu::current_pid(), percpu::current_sid()) as u64,
+        SYS_GETPGID => {
+            sys_getpgid(arg0 as i32, percpu::current_pid(), percpu::current_pgid()) as u64
+        }
+        SYS_GETSID => sys_getsid(arg0 as i32, percpu::current_pid(), percpu::current_sid()) as u64,
         SYS_SETPGID => sys_setpgid(
-            arg0,
-            arg1,
+            arg0 as i32,
+            arg1 as i32,
             percpu::current_pid(),
             percpu::current_pgid(),
             percpu::current_sid(),
@@ -1624,7 +1626,7 @@ pub fn x86_64_syscall_dispatch(
         ) as u64,
 
         // Process inspection (Section 13)
-        SYS_KCMP => crate::kcmp::sys_kcmp(arg0, arg1, arg2 as i32, arg3, arg4) as u64,
+        SYS_KCMP => crate::kcmp::sys_kcmp(arg0 as i32, arg1 as i32, arg2 as i32, arg3, arg4) as u64,
 
         // Syscall stubs (not fully implemented)
         SYS_RSEQ => {

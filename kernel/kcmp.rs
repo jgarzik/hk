@@ -157,7 +157,12 @@ fn fd_key(t: &KernelTask, idx: u64) -> Option<u64> {
 /// * 1 if first < second
 /// * 2 if first > second
 /// * Negative errno on error
-pub fn sys_kcmp(pid1: u64, pid2: u64, kcmp_type: i32, idx1: u64, idx2: u64) -> i64 {
+pub fn sys_kcmp(pid1: i32, pid2: i32, kcmp_type: i32, idx1: u64, idx2: u64) -> i64 {
+    // pid_t: a negative one names no task (Linux find_task_by_vpid)
+    if pid1 <= 0 || pid2 <= 0 {
+        return KernelError::NoProcess.sysret();
+    }
+    let (pid1, pid2) = (pid1 as u64, pid2 as u64);
     // Initialize cookies on first use
     init_cookies();
 
