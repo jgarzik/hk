@@ -135,65 +135,76 @@ pub fn open_exec(dentry: Arc<Dentry>) -> Result<Arc<File>, i32> {
 /// 4. If p2 is ancestor of p1: lock p2 first, then p1
 /// 5. Otherwise: lock by address order (lower address first)
 ///
-/// Returns the "trap" dentry if one is an ancestor of the other, else None.
-/// The trap is used by callers to detect when the source is being moved
-/// into its own subtree.
+/// Returns the held locks; `trap()` is the parent that is an ancestor
+/// of the other, if one is: the source may not move into its own
+/// subtree.
 ///
 /// # Arguments
 /// * `p1` - First directory dentry (typically old_parent)
 /// * `p2` - Second directory dentry (typically new_parent)
-///
-/// # Returns
-/// * `Some(trap)` - If one directory is ancestor of the other
-/// * `None` - If directories are unrelated or the same
-pub fn lock_rename(p1: &Arc<Dentry>, p2: &Arc<Dentry>) -> Option<Arc<Dentry>> {
+pub fn lock_rename(p1: &Arc<Dentry>, p2: &Arc<Dentry>) -> RenameLock {
+    let lock = |d: &Arc<Dentry>| d.get_inode().map(|i| i.lock_arc());
+    let mut g = RenameLock {
+        trap: None,
+        locks: [None, None],
+        sb: None,
+    };
     // Same directory - single lock, no need for superblock mutex
     if same_dir(p1, p2) {
-        p1.rename_lock();
-        return None;
+        g.locks[0] = lock(p1);
+        return g;
     }
 
-    // Cross-directory: acquire superblock mutex first
-    // This prevents tree topology changes during ancestor check
-    // (matches Linux's s_vfs_rename_mutex pattern)
+    // Cross-directory: the superblock mutex first, so the tree's shape
+    // cannot change during the ancestor checks (Linux s_vfs_rename_mutex)
     if let Some(sb) = p1.superblock() {
-        // Acquire s_vfs_rename_mutex - prevents any other rename
-        // from modifying tree topology during our ancestor check
-        sb.s_vfs_rename_mutex.lock_raw(); // held until unlock_rename
+        sb.s_vfs_rename_mutex.lock_raw(); // released by RenameLock's drop
+        g.sb = Some(sb);
     }
 
-    // Now safe to check ancestor relationships - topology is stable
-    // because we hold s_vfs_rename_mutex
-
-    // Check if p1 is ancestor of p2
-    if is_subdir(p2, p1) {
-        // p1 is ancestor - lock it first (parent before child)
-        p1.rename_lock();
-        p2.rename_lock();
-        return Some(p1.clone());
-    }
-
-    // Check if p2 is ancestor of p1
-    if is_subdir(p1, p2) {
-        // p2 is ancestor - lock it first (parent before child)
-        p2.rename_lock();
-        p1.rename_lock();
-        return Some(p2.clone());
-    }
-
-    // No ancestor relationship - use address ordering to prevent deadlock
-    let p1_ptr = Arc::as_ptr(p1) as usize;
-    let p2_ptr = Arc::as_ptr(p2) as usize;
-
-    if p1_ptr < p2_ptr {
-        p1.rename_lock();
-        p2.rename_lock();
+    // Ancestor first (parent before child), else by address
+    let first_p1 = if is_subdir(p2, p1) {
+        g.trap = Some(p1.clone());
+        true
+    } else if is_subdir(p1, p2) {
+        g.trap = Some(p2.clone());
+        false
     } else {
-        p2.rename_lock();
-        p1.rename_lock();
-    }
+        Arc::as_ptr(p1) < Arc::as_ptr(p2)
+    };
+    let (a, b) = if first_p1 { (p1, p2) } else { (p2, p1) };
+    g.locks[0] = lock(a);
+    g.locks[1] = lock(b);
+    g
+}
 
-    None
+/// The locks of [`lock_rename`]: released in reverse, then the
+/// superblock's rename mutex (Linux unlock_rename)
+#[must_use]
+pub struct RenameLock {
+    trap: Option<Arc<Dentry>>,
+    /// The parents' i_rwsem, in the order taken
+    locks: [Option<inode::InodeLockArc>; 2],
+    /// Its s_vfs_rename_mutex is held (cross-directory)
+    sb: Option<Arc<SuperBlock>>,
+}
+
+impl RenameLock {
+    /// The parent that is an ancestor of the other, if one is
+    pub fn trap(&self) -> Option<&Arc<Dentry>> {
+        self.trap.as_ref()
+    }
+}
+
+impl Drop for RenameLock {
+    fn drop(&mut self) {
+        self.locks[1].take();
+        self.locks[0].take();
+        if let Some(sb) = self.sb.take() {
+            // SAFETY: taken in lock_rename for this guard, released once
+            unsafe { sb.s_vfs_rename_mutex.unlock_raw() };
+        }
+    }
 }
 
 /// Same directory for lock_rename: the same dentry, or two dentries of
@@ -201,33 +212,6 @@ pub fn lock_rename(p1: &Arc<Dentry>, p2: &Arc<Dentry>) -> Option<Arc<Dentry>> {
 fn same_dir(p1: &Arc<Dentry>, p2: &Arc<Dentry>) -> bool {
     Arc::ptr_eq(p1, p2)
         || matches!((p1.get_inode(), p2.get_inode()), (Some(a), Some(b)) if Arc::ptr_eq(&a, &b))
-}
-
-/// Unlock directories after rename operation
-///
-/// Must be called after lock_rename() to release the locks.
-/// Unlocks in reverse order of acquisition:
-/// 1. Release dentry rename_locks
-/// 2. Release SuperBlock.s_vfs_rename_mutex (for cross-directory only)
-///
-/// # Safety
-/// Must only be called after a successful lock_rename() call on the same dentries.
-pub fn unlock_rename(p1: &Arc<Dentry>, p2: &Arc<Dentry>) {
-    // Safety: caller guarantees we acquired these locks via lock_rename()
-    unsafe {
-        // Always unlock p2 first (it was locked second in most cases)
-        p2.rename_unlock();
-
-        // Only unlock p1 and release superblock mutex if cross-directory
-        if !same_dir(p1, p2) {
-            p1.rename_unlock();
-
-            // Release superblock mutex for cross-directory case
-            if let Some(sb) = p1.superblock() {
-                sb.s_vfs_rename_mutex.unlock_raw();
-            }
-        }
-    }
 }
 
 /// The non-directories of `a` and `b`, each once, lowest address first
@@ -249,18 +233,22 @@ fn nondirs<'a>(
 /// locks (Linux vfs_rename -> lock_two_nondirectories): the non-directory
 /// source and target, by address. Directories are skipped: they have no
 /// hard links to race with.
-pub fn lock_two_nondirs(a: Option<&Arc<Inode>>, b: Option<&Arc<Inode>>) {
-    for i in nondirs(a, b).into_iter().flatten() {
-        i.inode_lock();
-    }
+pub fn lock_two_nondirs<'a>(
+    a: Option<&'a Arc<Inode>>,
+    b: Option<&'a Arc<Inode>>,
+) -> NondirsLock<'a> {
+    let [x, y] = nondirs(a, b);
+    let first = x.map(|i| i.lock());
+    NondirsLock([first, y.map(|i| i.lock())])
 }
 
-/// Release lock_two_nondirs()
-///
-/// # Safety
-/// Must pair with lock_two_nondirs() on the same inodes by this thread.
-pub unsafe fn unlock_two_nondirs(a: Option<&Arc<Inode>>, b: Option<&Arc<Inode>>) {
-    for i in nondirs(a, b).into_iter().flatten().rev() {
-        unsafe { i.inode_unlock() };
+/// The locks of [`lock_two_nondirs`], released in reverse order
+#[must_use]
+pub struct NondirsLock<'a>([Option<inode::InodeLock<'a>>; 2]);
+
+impl Drop for NondirsLock<'_> {
+    fn drop(&mut self) {
+        self.0[1].take();
+        self.0[0].take();
     }
 }

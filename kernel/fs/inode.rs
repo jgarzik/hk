@@ -727,40 +727,64 @@ impl Inode {
     // Directory locking (Linux i_rwsem pattern)
     // ========================================================================
 
-    /// Acquire exclusive lock on directory for operations
-    ///
-    /// This implements Linux's inode_lock() pattern. VFS calls this before
-    /// invoking filesystem directory operations (create, mkdir, unlink, etc.).
-    /// The lock serializes directory modifications to prevent races.
-    ///
-    /// # Safety
-    /// Caller must ensure inode_unlock() is called to release the lock.
-    /// For operations on two directories (rename), use lock_rename() instead.
-    pub fn inode_lock(&self) {
+    /// Take i_rwsem for writing (Linux inode_lock): directory changes,
+    /// truncate, attribute changes; held until the guard drops. For two
+    /// directories (rename) use `lock_rename`.
+    #[inline]
+    pub fn lock(&self) -> InodeLock<'_> {
         self.i_rwsem.down_write();
+        InodeLock(self)
     }
 
-    /// Release exclusive lock on directory
-    ///
-    /// # Safety
-    /// Must only be called after a successful inode_lock() call.
-    /// The lock must have been acquired by this thread.
-    pub unsafe fn inode_unlock(&self) {
-        unsafe { self.i_rwsem.up_write() };
+    /// As [`Inode::lock`], the guard owning a reference to the inode (for
+    /// an inode looked up while locking, as `lock_rename` does)
+    pub fn lock_arc(self: &Arc<Self>) -> InodeLockArc {
+        self.i_rwsem.down_write();
+        InodeLockArc(self.clone())
     }
 
-    /// Shared inode lock (Linux inode_lock_shared): lookup and readdir
+    /// Take i_rwsem shared (Linux inode_lock_shared): lookup and readdir
     /// exclude directory changes but not each other
-    pub fn inode_lock_shared(&self) {
+    #[inline]
+    pub fn lock_shared(&self) -> InodeLockShared<'_> {
         self.i_rwsem.down_read();
+        InodeLockShared(self)
     }
+}
 
-    /// Release inode_lock_shared()
-    ///
-    /// # Safety
-    /// Must pair with inode_lock_shared() by this thread.
-    pub unsafe fn inode_unlock_shared(&self) {
-        unsafe { self.i_rwsem.up_read() };
+/// An inode's i_rwsem held for writing ([`Inode::lock`]); a forgotten
+/// guard only leaves it locked (doc/UNSAFE.md rule 9)
+#[must_use]
+pub struct InodeLock<'a>(&'a Inode);
+
+impl Drop for InodeLock<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        // SAFETY: taken in `Inode::lock`, released once (this drop)
+        unsafe { self.0.i_rwsem.up_write() };
+    }
+}
+
+/// [`InodeLock`] owning its inode reference ([`Inode::lock_arc`])
+#[must_use]
+pub struct InodeLockArc(Arc<Inode>);
+
+impl Drop for InodeLockArc {
+    fn drop(&mut self) {
+        // SAFETY: taken in `Inode::lock_arc`, released once (this drop)
+        unsafe { self.0.i_rwsem.up_write() };
+    }
+}
+
+/// An inode's i_rwsem held shared ([`Inode::lock_shared`])
+#[must_use]
+pub struct InodeLockShared<'a>(&'a Inode);
+
+impl Drop for InodeLockShared<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        // SAFETY: taken in `Inode::lock_shared`, released once
+        unsafe { self.0.i_rwsem.up_read() };
     }
 }
 

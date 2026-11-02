@@ -630,8 +630,8 @@ impl File {
             _ => return self.write_chunks(len, at, flags, src),
         };
         let append = append.unwrap_or(self.get_flags() & flags::O_APPEND != 0);
-        inode.inode_lock();
-        let r = (|| {
+        let _lock = inode.lock();
+        (|| {
             // An active swap file (Linux generic_write_checks:
             // IS_SWAPFILE), checked under i_rwsem: swapon sets it there
             if inode.i_swapfile.load(Ordering::Acquire) {
@@ -652,10 +652,7 @@ impl File {
                 super::dac::remove_privs(&inode);
             }
             self.write_chunks(len, at, flags, src)
-        })();
-        // SAFETY: taken above by this thread
-        unsafe { inode.inode_unlock() };
-        r
+        })()
     }
 
     /// The chunk loop of `write_from`

@@ -42,14 +42,13 @@ fn do_truncate(inode: &Arc<super::Inode>, length: u64) -> i64 {
     };
     // Under i_rwsem, like Linux do_truncate: atomic with writes; an
     // active swap area (set by swapon under i_rwsem) is ETXTBSY
-    inode.inode_lock();
+    let lock = inode.lock();
     let r = if inode.i_swapfile.load(core::sync::atomic::Ordering::Acquire) {
         Err(KernelError::TextBusy)
     } else {
         inode.i_op.truncate(inode, length)
     };
-    // SAFETY: taken above by this thread
-    unsafe { inode.inode_unlock() };
+    drop(lock);
     match r {
         Ok(()) => 0,
         Err(KernelError::IsDirectory) => KernelError::IsDirectory.sysret(),

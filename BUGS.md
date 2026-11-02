@@ -8,8 +8,6 @@ None is known to fail today, but each is a soundness bug:
 - **Safe fns that take addresses:**
   - aarch64/x86 paging `entry_atomic` returns `&'static AtomicU64` into
     a table that can be freed; the mm `pte` helpers take `*mut u64`.
-- **Inode locks:** `unlock_rename` and `inode_lock`/`inode_unlock` are
-  hand-paired, and `unlock_rename` is a safe fn.
 
 ## Path names must be valid UTF-8
 

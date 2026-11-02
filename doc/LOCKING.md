@@ -1740,10 +1740,12 @@ Linux design and simplifies lock ordering.
 **Location:** `fs/inode.rs`, `fs/syscall.rs`
 
 Following Linux's `i_rwsem` pattern, directory operations are serialized at the
-VFS layer via `inode_lock()`/`inode_unlock()` on the parent directory's inode.
-This ensures no concurrent modifications to a directory's contents.
+VFS layer by `Inode::lock()` on the parent directory's inode, which returns
+a guard that releases the lock when dropped (Linux inode_lock /
+inode_unlock). This ensures no concurrent modifications to a directory's
+contents.
 
-**Operations requiring inode_lock:**
+**Operations requiring the lock:**
 - `create` (open with O_CREAT)
 - `mkdir` / `mkdirat`
 - `rmdir`
@@ -1753,14 +1755,15 @@ This ensures no concurrent modifications to a directory's contents.
 - `mknod` / `mknodat`
 - `rename` (uses `lock_rename()` for two-directory locking)
 
-**API:**
+**API (RAII guards: every return path releases, no unsafe unlock):**
 ```rust
 impl Inode {
-    /// Acquire exclusive lock for directory operations
-    pub fn inode_lock(&self);
-
-    /// Release exclusive lock
-    pub unsafe fn inode_unlock(&self);
+    /// i_rwsem for writing (Linux inode_lock)
+    pub fn lock(&self) -> InodeLock<'_>;
+    /// The same, the guard owning an `Arc` of the inode
+    pub fn lock_arc(self: &Arc<Self>) -> InodeLockArc;
+    /// i_rwsem shared (Linux inode_lock_shared): lookup, readdir
+    pub fn lock_shared(&self) -> InodeLockShared<'_>;
 }
 ```
 
@@ -1768,24 +1771,17 @@ impl Inode {
 ```rust
 fn sys_mkdir(...) {
     let parent_inode = parent_dentry.get_inode()?;
-
-    // Acquire directory lock
-    parent_inode.inode_lock();
-
-    // Filesystem operation (no concurrent access possible)
-    let result = parent_inode.i_op.mkdir(...);
-
-    // Release lock
-    unsafe { parent_inode.inode_unlock() };
-
-    result
+    let _lock = parent_inode.lock();
+    // Filesystem operation (no concurrent access possible); `?` and
+    // early returns release the lock with the guard
+    parent_inode.i_op.mkdir(...)
 }
 ```
 
 **Lookup and permission under the lock (Linux lookup_open /
 filename_create):** `open.rs::create_in` (O_CREAT), `path.rs::create_entry`
 (mkdir, mknod, symlink, link) and `path.rs::delete_entry` (unlink, rmdir)
-take the parent's `inode_lock()` first and, while holding it, look the name
+take the parent's `Inode::lock()` first and, while holding it, look the name
 up (`lookup_one`: dentry `d_lock`, then the file system's `lookup`), decide
 EEXIST / "created by this call", run the DAC checks (`dac::may_create`,
 `dac::may_delete`; these read the inode's atomic mode/uid/gid and, for the
@@ -1835,7 +1831,7 @@ This ordering prevents deadlocks because:
 - No two concurrent renames can acquire locks in opposite order
 
 **Directory locks:** `lock_rename()` locks each directory's inode
-`i_rwsem` (via `Dentry::rename_lock()` -> `Inode::inode_lock()`), the same
+`i_rwsem` (`Inode::lock_arc()` of each parent dentry's inode), the same
 lock create/mkdir/unlink/rmdir/link/symlink/mknod take on the parent, so a
 rename excludes every other operation on both directories, as in Linux
 (lock_rename -> inode_lock_nested). Order: `SuperBlock.s_vfs_rename_mutex`
@@ -1845,11 +1841,13 @@ address) -> dentry `d_lock` -> fs-internal locks.
 **API:**
 
 ```rust
-/// Lock two directories for rename (returns "trap" if ancestor relationship)
-pub fn lock_rename(p1: &Arc<Dentry>, p2: &Arc<Dentry>) -> Option<Arc<Dentry>>;
+/// Lock two directories for rename; the guard releases them in reverse,
+/// then s_vfs_rename_mutex (Linux unlock_rename); `trap()` is the parent
+/// that is an ancestor of the other, if one is
+pub fn lock_rename(p1: &Arc<Dentry>, p2: &Arc<Dentry>) -> RenameLock;
 
-/// Unlock directories after rename
-pub fn unlock_rename(p1: &Arc<Dentry>, p2: &Arc<Dentry>);
+/// The non-directory source/target of a rename, by address; a guard
+pub fn lock_two_nondirs(a: Option<&Arc<Inode>>, b: Option<&Arc<Inode>>) -> NondirsLock;
 
 /// Check if child is a subdirectory of ancestor
 pub fn is_subdir(child: &Arc<Dentry>, ancestor: &Arc<Dentry>) -> bool;
@@ -1863,12 +1861,9 @@ parent is not a descendant of the source directory. This prevents:
 - Creating unreachable loops in the directory tree
 
 ```rust
-// In sys_renameat2:
-if source_inode.mode().is_dir() {
-    if is_subdir(&new_parent_dentry, &source_dentry) {
-        unlock_rename(...);
-        return EINVAL;  // Would create cycle
-    }
+// In rename_locked, under the RenameLock:
+if source_inode.mode().is_dir() && is_subdir(&new_parent_dentry, &source_dentry) {
+    return Err(EINVAL); // would create a cycle; the guard unlocks
 }
 ```
 

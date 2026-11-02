@@ -34,8 +34,8 @@ fn create_in(
     let c = dac::cred();
     // lookup_open: write access is needed only to create
     let w = dac::want_write(&dir);
-    dir.inode_lock();
-    let r = (|| {
+    let _dir_lock = dir.lock();
+    (|| {
         if let Ok(d) = lookup_one(parent, name) {
             return Ok((d, false));
         }
@@ -51,9 +51,7 @@ fn create_in(
         d.set_parent(parent);
         parent.add_child(d.clone());
         Ok((d, true))
-    })();
-    unsafe { dir.inode_unlock() };
-    r
+    })()
 }
 
 /// Split `path` into its parent and final component (Linux
@@ -221,17 +219,13 @@ fn filp_open(
 
     // O_TRUNC of an existing regular file (Linux handle_truncate)
     if flags & O_TRUNC != 0 && !created && inode.mode().is_file() {
-        inode.inode_lock();
+        let _lock = inode.lock();
         // An active swap file (S_SWAPFILE, set under i_rwsem): ETXTBSY
         if inode.i_swapfile.load(core::sync::atomic::Ordering::Acquire) {
-            // SAFETY: taken above by this thread
-            unsafe { inode.inode_unlock() };
             return Err(KernelError::TextBusy);
         }
         dac::remove_privs(&inode);
         inode.i_op.truncate(&inode, 0).ok();
-        // SAFETY: taken above by this thread
-        unsafe { inode.inode_unlock() };
     }
 
     // Get the file operations based on inode type

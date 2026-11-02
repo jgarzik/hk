@@ -171,26 +171,6 @@ impl Dentry {
     // ========================================================================
     // Rename locking (Linux lock_rename pattern)
     // ========================================================================
-
-    /// lock_rename() step: lock this directory's inode (i_rwsem), the
-    /// same lock every other directory operation takes (Linux
-    /// lock_rename uses inode_lock_nested)
-    pub fn rename_lock(&self) {
-        if let Some(inode) = self.get_inode() {
-            inode.inode_lock();
-        }
-    }
-
-    /// Release rename_lock()
-    ///
-    /// # Safety
-    /// Must only be called after rename_lock() on this dentry by this thread.
-    pub unsafe fn rename_unlock(&self) {
-        if let Some(inode) = self.get_inode() {
-            unsafe { inode.inode_unlock() };
-        }
-    }
-
     /// Get the full path from root to this dentry
     ///
     /// Each parent is held by its Arc while its name is read.

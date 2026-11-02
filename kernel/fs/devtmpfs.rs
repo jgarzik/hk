@@ -62,13 +62,13 @@ pub static DEVTMPFS_TYPE: FileSystemType = FileSystemType {
 
 fn create(root: &Arc<Dentry>, n: &Node) {
     let Some(dir) = root.get_inode() else { return };
-    dir.inode_lock();
+    let lock = dir.lock();
     let r = if n.blk {
         super::ramfs::ramfs_create_blkdev(root, &n.name, n.dev, n.mode)
     } else {
         super::ramfs::ramfs_create_chrdev(root, &n.name, n.dev, n.mode)
     };
-    unsafe { dir.inode_unlock() };
+    drop(lock);
     if let Err(e) = r {
         crate::printkln!("devtmpfs: {}: {:?}", n.name, e);
     }
@@ -98,11 +98,10 @@ pub fn device_del(name: &str) {
     PENDING.lock().retain(|n| n.name != name);
     let Some(r) = root() else { return };
     let Some(dir) = r.get_inode() else { return };
-    dir.inode_lock();
+    let _lock = dir.lock();
     if dir.i_op.unlink(&dir, name).is_ok() {
         r.remove_child(name);
     }
-    unsafe { dir.inode_unlock() };
 }
 
 /// Create the superblock and the nodes queued so far (VFS init)

@@ -303,7 +303,7 @@ fn do_utimes(dirfd: i32, pathname: u64, times: Option<[UserTimespec; 2]>, flags:
         Some(t) => (pick(&t[0]), pick(&t[1])),
     };
     // notify_change under i_rwsem (Linux vfs_utimes: inode_lock)
-    inode.inode_lock();
+    let lock = inode.lock();
     if let Some(t) = atime {
         inode.set_atime(t);
     }
@@ -311,8 +311,7 @@ fn do_utimes(dirfd: i32, pathname: u64, times: Option<[UserTimespec; 2]>, flags:
         inode.set_mtime(t);
     }
     inode.set_ctime(now);
-    // SAFETY: taken above by this thread
-    unsafe { inode.inode_unlock() };
+    drop(lock);
     0
 }
 

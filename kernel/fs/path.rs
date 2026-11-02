@@ -114,11 +114,8 @@ fn lookup_slow(parent: &Arc<Dentry>, name: &str) -> Result<Arc<Dentry>, KernelEr
         return Ok(child);
     }
     let dir = parent.get_inode().ok_or(KernelError::NotFound)?;
-    dir.inode_lock_shared();
-    let r = lookup_one(parent, name);
-    // SAFETY: taken above by this thread
-    unsafe { dir.inode_unlock_shared() };
-    r
+    let _lock = dir.lock_shared();
+    lookup_one(parent, name)
 }
 
 /// may_lookup: `dir` must be a searchable directory
@@ -213,8 +210,8 @@ pub fn create_entry(
     let c = cred();
     // filename_create: write access first, its EROFS reported after EEXIST
     let w = super::dac::want_write(&dir);
-    dir.inode_lock();
-    let r = (|| {
+    let _dir_lock = dir.lock();
+    (|| {
         if lookup_one(parent, name).is_ok() {
             return Err(KernelError::AlreadyExists);
         }
@@ -229,9 +226,7 @@ pub fn create_entry(
         d.set_parent(parent);
         parent.add_child(d.clone());
         Ok(d)
-    })();
-    unsafe { dir.inode_unlock() };
-    r
+    })()
 }
 
 /// Remove entry `name` from directory `parent` (Linux vfs_unlink /
@@ -242,8 +237,8 @@ pub fn delete_entry(parent: &Arc<Dentry>, name: &str, isdir: bool) -> Result<(),
     let dir = parent.get_inode().ok_or(KernelError::NotFound)?;
     let _w = super::dac::want_write(&dir)?;
     let c = cred();
-    dir.inode_lock();
-    let r = (|| {
+    let _dir_lock = dir.lock();
+    (|| {
         let victim = lookup_one(parent, name)?;
         let inode = victim.get_inode().ok_or(KernelError::NotFound)?;
         super::dac::may_delete(&c, &dir, &inode, isdir)?;
@@ -251,7 +246,7 @@ pub fn delete_entry(parent: &Arc<Dentry>, name: &str, isdir: bool) -> Result<(),
         // vfs_rmdir): its link count never drops under a link of it, and
         // a mount on it (attach takes it too) is either seen here or
         // refused for the dead directory
-        inode.inode_lock();
+        let victim_lock = inode.lock();
         let r = if super::mount::is_local_mountpoint(&victim) {
             Err(KernelError::Busy)
         } else if isdir {
@@ -259,11 +254,9 @@ pub fn delete_entry(parent: &Arc<Dentry>, name: &str, isdir: bool) -> Result<(),
         } else {
             dir.i_op.unlink(&dir, name)
         };
-        unsafe { inode.inode_unlock() };
+        drop(victim_lock);
         r?;
         parent.remove_child(name);
         Ok(())
-    })();
-    unsafe { dir.inode_unlock() };
-    r
+    })()
 }

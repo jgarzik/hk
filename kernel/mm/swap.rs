@@ -542,10 +542,9 @@ fn swapon(path_ptr: u64, swap_flags: i32) -> Result<(), KernelError> {
     // S_SWAPFILE under i_rwsem (Linux claim_swapfile under inode_lock):
     // a write or truncate in flight finishes first, later ones see it
     let si_inode = si.swapfile_inode();
-    si_inode.inode_lock();
+    let lock = si_inode.lock();
     si_inode.i_swapfile.store(true, Ordering::Release);
-    // SAFETY: taken above by this thread
-    unsafe { si_inode.inode_unlock() };
+    drop(lock);
     SWAP_INFO.write()[swap_type as usize] = Some(Arc::new(si));
     TOTAL_SWAP_PAGES.fetch_add(max - 1, Ordering::Relaxed);
     Ok(())
@@ -580,10 +579,9 @@ fn swapoff(path_ptr: u64) -> Result<(), KernelError> {
     }
     SWAP_INFO.write()[t as usize] = None;
     let si_inode = si.swapfile_inode();
-    si_inode.inode_lock();
+    let lock = si_inode.lock();
     si_inode.i_swapfile.store(false, Ordering::Release);
-    // SAFETY: taken above by this thread
-    unsafe { si_inode.inode_unlock() };
+    drop(lock);
     TOTAL_SWAP_PAGES.fetch_sub(si.max - 1, Ordering::Relaxed);
     super::swap_state::destroy_cache(&si);
     Ok(())

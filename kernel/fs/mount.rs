@@ -276,9 +276,8 @@ pub fn attach(
         // and a rename replacing it hold: a directory removed meanwhile
         // is refused, one being removed sees this mount (EBUSY)
         let dir = mp.get_inode().ok_or(KernelError::NotFound)?;
-        dir.inode_lock();
+        let _dir_lock = dir.lock();
         if dir.is_dead() {
-            unsafe { dir.inode_unlock() };
             return Err(KernelError::NotFound);
         }
         mount.set_mountpoint(mp.clone());
@@ -287,7 +286,7 @@ pub fn attach(
             mount.set_parent(&root_mount);
             root_mount.add_child(mount.clone());
         }
-        unsafe { dir.inode_unlock() };
+        drop(_dir_lock);
     } else {
         mnt_ns.set_root(mount.clone());
     }
