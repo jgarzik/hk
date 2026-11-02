@@ -80,6 +80,11 @@ pub struct EthHdr {
     /// Protocol type (big-endian)
     pub h_proto: [u8; 2],
 }
+crate::pod!(EthHdr {
+    h_dest,
+    h_source,
+    h_proto
+});
 
 impl EthHdr {
     /// Get the EtherType
@@ -197,10 +202,8 @@ pub fn eth_hdr(skb: &SkBuff) -> Option<&EthHdr> {
         return None;
     }
 
-    let data = skb.data();
-    // Safety: we verified length and EthHdr is packed
-    let hdr = unsafe { &*(data.as_ptr() as *const EthHdr) };
-    Some(hdr)
+    // Packed (alignment 1): always in place
+    crate::pod::FromBytes::ref_from(skb.data())
 }
 
 /// Format a MAC address as string

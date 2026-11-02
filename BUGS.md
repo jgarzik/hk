@@ -6,10 +6,6 @@ These are safe fns or patterns whose use leads to undefined behaviour.
 None is known to fail today, but each is a soundness bug:
 
 - **Drivers:**
-  - USB serial removal frees the console that the console list still
-    points to.
-  - `SkBuff` `reset`/`trim`/`frame_from_mac` can overflow from safe
-    calls.
   - PCI ECAM `read32`/`write32` do no bounds or alignment checks.
   - `DmaCoherent` has public fields and `dma_free_coherent` is safe.
   - `dma_map_single` takes a raw pointer, not tied to the buffer's

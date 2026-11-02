@@ -40,19 +40,17 @@ pub const ETH_FRAME_LEN: usize = 1514;
 pub const MAX_SKB_SIZE: usize = 65536 + 512;
 
 /// Network buffer - equivalent to Linux sk_buff
+///
+/// # Invariants
+/// `data <= tail <= buf.len()`; `mac` and `nh`, when set, are at most
+/// `tail` (moving `tail` below one clears it).
 pub struct SkBuff {
-    // Buffer pointers (all within the same allocation)
-    /// Start of allocated buffer (fixed)
-    head: *mut u8,
-    /// Start of actual packet data (moves with push/pull)
-    data: *mut u8,
-    /// End of actual packet data (moves with put/trim)
-    tail: *mut u8,
-    /// End of allocated buffer (fixed)
-    end: *mut u8,
-
-    /// Total allocation size
-    alloc_size: usize,
+    /// The buffer: headroom, packet data, tailroom
+    buf: Box<[u8]>,
+    /// Start of the packet data (moves with push/pull)
+    data: usize,
+    /// End of the packet data (moves with put/trim)
+    tail: usize,
 
     // Protocol information
     /// EtherType (set by eth_type_trans)
@@ -80,15 +78,11 @@ pub struct SkBuff {
     /// as an id, 0 if none): its own outgoing tap skips it (Linux
     /// skb_loop_sk)
     pub owner: usize,
-    /// Start of the MAC header in the buffer (null until received)
-    mac: *mut u8,
-    /// Start of the IP header of a received packet (null until marked)
-    nh: *mut u8,
+    /// Start of the MAC header in the buffer (None until received)
+    mac: Option<usize>,
+    /// Start of the IP header of a received packet (None until marked)
+    nh: Option<usize>,
 }
-
-// SkBuff contains raw pointers but manages its own memory
-unsafe impl Send for SkBuff {}
-unsafe impl Sync for SkBuff {}
 
 impl SkBuff {
     /// Allocate a new SkBuff with given size
@@ -96,30 +90,18 @@ impl SkBuff {
     /// The buffer will have `headroom` bytes reserved before data
     /// and space for `data_len` bytes of data.
     pub fn alloc(headroom: usize, data_len: usize) -> Option<Box<Self>> {
-        let total_size = headroom + data_len;
+        let total_size = headroom.checked_add(data_len)?;
         if total_size > MAX_SKB_SIZE {
             return None;
         }
-
-        // Allocate aligned buffer
-        let layout = alloc::alloc::Layout::from_size_align(total_size, 16).ok()?;
-        let buffer = unsafe { alloc::alloc::alloc_zeroed(layout) };
-
-        if buffer.is_null() {
-            return None;
-        }
-
-        let head = buffer;
-        let end = unsafe { buffer.add(total_size) };
-        let data = unsafe { buffer.add(headroom) };
-        let tail = data; // Initially empty
+        let mut v = alloc::vec::Vec::new();
+        v.try_reserve_exact(total_size).ok()?;
+        v.resize(total_size, 0u8);
 
         Some(Box::new(Self {
-            head,
-            data,
-            tail,
-            end,
-            alloc_size: total_size,
+            buf: v.into_boxed_slice(),
+            data: headroom,
+            tail: headroom,
             protocol: EtherType::Unknown(0),
             ip_protocol: 0,
             dev: None,
@@ -130,8 +112,8 @@ impl SkBuff {
             ip_ttl: 0,
             ip_tos: 0,
             owner: 0,
-            mac: core::ptr::null_mut(),
-            nh: core::ptr::null_mut(),
+            mac: None,
+            nh: None,
         }))
     }
 
@@ -154,7 +136,7 @@ impl SkBuff {
     /// Get current data length
     #[inline]
     pub fn len(&self) -> usize {
-        self.tail as usize - self.data as usize
+        self.tail - self.data
     }
 
     /// Check if buffer is empty
@@ -166,54 +148,47 @@ impl SkBuff {
     /// Get headroom (space before data)
     #[inline]
     pub fn headroom(&self) -> usize {
-        self.data as usize - self.head as usize
+        self.data
     }
 
     /// Get tailroom (space after tail)
     #[inline]
     pub fn tailroom(&self) -> usize {
-        self.end as usize - self.tail as usize
+        self.buf.len() - self.tail
     }
 
     /// Get the data as a byte slice
     #[inline]
     pub fn data(&self) -> &[u8] {
-        unsafe { core::slice::from_raw_parts(self.data, self.len()) }
+        &self.buf[self.data..self.tail]
     }
 
     /// Get the data as a mutable byte slice
     #[inline]
     pub fn data_mut(&mut self) -> &mut [u8] {
-        unsafe { core::slice::from_raw_parts_mut(self.data, self.len()) }
+        &mut self.buf[self.data..self.tail]
     }
 
     /// Get raw data pointer
     #[inline]
     pub fn data_ptr(&self) -> *const u8 {
-        self.data
+        self.data().as_ptr()
     }
 
     /// Get raw data pointer (mutable)
     #[inline]
     pub fn data_ptr_mut(&mut self) -> *mut u8 {
-        self.data
+        self.data_mut().as_mut_ptr()
     }
 
-    /// Reserve headroom (call before adding data)
-    ///
-    /// Moves the data pointer forward, creating more headroom.
-    /// Must be called on an empty buffer.
+    /// Reserve headroom (call before adding data): moves the (empty) data
+    /// forward; clamped to the buffer
     pub fn reserve(&mut self, len: usize) {
         debug_assert!(self.is_empty(), "reserve called on non-empty skb");
-        debug_assert!(
-            self.headroom() + len <= self.alloc_size,
-            "reserve exceeds buffer"
-        );
-
-        unsafe {
-            self.data = self.data.add(len);
-            self.tail = self.data;
-        }
+        let at = self.tail.saturating_add(len).min(self.buf.len());
+        // INVARIANT: data == tail <= buf.len()
+        self.data = at;
+        self.tail = at;
     }
 
     /// Push header - prepend bytes to the front
@@ -224,11 +199,8 @@ impl SkBuff {
         if self.headroom() < len {
             return None;
         }
-
-        unsafe {
-            self.data = self.data.sub(len);
-            Some(core::slice::from_raw_parts_mut(self.data, len))
-        }
+        self.data -= len;
+        Some(&mut self.buf[self.data..self.data + len])
     }
 
     /// Pull header - consume bytes from the front
@@ -239,12 +211,9 @@ impl SkBuff {
         if self.len() < len {
             return None;
         }
-
-        let result = unsafe { core::slice::from_raw_parts(self.data, len) };
-        unsafe {
-            self.data = self.data.add(len);
-        }
-        Some(result)
+        let start = self.data;
+        self.data += len;
+        Some(&self.buf[start..start + len])
     }
 
     /// Put data - append bytes to the tail
@@ -255,12 +224,9 @@ impl SkBuff {
         if self.tailroom() < len {
             return None;
         }
-
         let start = self.tail;
-        unsafe {
-            self.tail = self.tail.add(len);
-            Some(core::slice::from_raw_parts_mut(start, len))
-        }
+        self.tail += len;
+        Some(&mut self.buf[start..start + len])
     }
 
     /// Put data from a slice
@@ -277,10 +243,11 @@ impl SkBuff {
         if self.len() < len {
             return None;
         }
-
-        unsafe {
-            self.tail = self.tail.sub(len);
-        }
+        self.tail -= len;
+        // INVARIANT: a header mark past the new tail is gone
+        let tail = self.tail;
+        self.mac = self.mac.filter(|&m| m <= tail);
+        self.nh = self.nh.filter(|&n| n <= tail);
         Some(())
     }
 
@@ -295,12 +262,11 @@ impl SkBuff {
         Some(())
     }
 
-    /// Reset the buffer to initial state (keeps allocation)
+    /// Reset the buffer to initial state (keeps allocation); the headroom
+    /// is clamped to the buffer
     pub fn reset(&mut self, headroom: usize) {
-        unsafe {
-            self.data = self.head.add(headroom);
-            self.tail = self.data;
-        }
+        self.data = headroom.min(self.buf.len());
+        self.tail = self.data;
         self.protocol = EtherType::Unknown(0);
         self.ip_protocol = 0;
         self.saddr = None;
@@ -308,56 +274,36 @@ impl SkBuff {
         self.pkt_type = PktType::Host;
         self.ip_bcast = false;
         self.owner = 0;
-        self.mac = core::ptr::null_mut();
-        self.nh = core::ptr::null_mut();
+        self.mac = None;
+        self.nh = None;
     }
 
     /// Record the current data pointer as the start of the MAC header
     pub fn mark_mac_header(&mut self) {
-        self.mac = self.data;
+        self.mac = Some(self.data);
     }
 
     /// The received frame from its MAC header to the end (after the
     /// header was pulled), if one was recorded
     pub fn frame_from_mac(&self) -> Option<&[u8]> {
-        if self.mac.is_null() {
-            return None;
-        }
-        let len = self.tail as usize - self.mac as usize;
-        Some(unsafe { core::slice::from_raw_parts(self.mac, len) })
+        self.buf.get(self.mac?..self.tail)
     }
 
     /// Record the current data pointer as the start of the IP header
     pub fn mark_network_header(&mut self) {
-        self.nh = self.data;
+        self.nh = Some(self.data);
     }
 
     /// The received packet from its IP header to the end (after the
     /// header was pulled), if one was recorded
     pub fn network_packet(&self) -> Option<&[u8]> {
-        if self.nh.is_null() {
-            return None;
-        }
-        let len = self.tail as usize - self.nh as usize;
-        Some(unsafe { core::slice::from_raw_parts(self.nh, len) })
+        self.buf.get(self.nh?..self.tail)
     }
 
     /// Network namespace of the skb's device (receive path: the namespace
     /// the packet arrived in; never the current task's)
     pub fn net(&self) -> Option<Arc<crate::net::NetNamespace>> {
         self.dev.as_ref()?.net()
-    }
-}
-
-impl Drop for SkBuff {
-    fn drop(&mut self) {
-        if !self.head.is_null() {
-            let layout =
-                alloc::alloc::Layout::from_size_align(self.alloc_size, 16).expect("valid layout");
-            unsafe {
-                alloc::alloc::dealloc(self.head, layout);
-            }
-        }
     }
 }
 
@@ -394,5 +340,22 @@ mod tests {
         let pulled = skb.pull(14).unwrap();
         assert_eq!(pulled[0], 0xCD);
         assert_eq!(skb.len(), 100);
+    }
+
+    #[test]
+    fn test_bounds_from_safe_calls() {
+        let mut skb = SkBuff::alloc(16, 32).unwrap();
+        // A headroom past the buffer is clamped: no tailroom overflow
+        skb.reset(1000);
+        assert_eq!(skb.tailroom(), 0);
+        assert!(skb.put(1).is_none());
+        // A MAC mark above a trimmed tail is dropped, not underflowed
+        skb.reset(16);
+        skb.put(20);
+        skb.pull(14);
+        skb.mark_mac_header();
+        skb.push(14);
+        skb.trim(skb.len());
+        assert!(skb.frame_from_mac().is_none());
     }
 }

@@ -54,6 +54,17 @@ pub struct ArpHdr {
     /// Target protocol address
     pub ar_tip: [u8; 4],
 }
+crate::pod!(ArpHdr {
+    ar_hrd,
+    ar_pro,
+    ar_hln,
+    ar_pln,
+    ar_op,
+    ar_sha,
+    ar_sip,
+    ar_tha,
+    ar_tip
+});
 
 impl ArpHdr {
     pub fn hardware_type(&self) -> u16 {
@@ -157,7 +168,9 @@ pub fn arp_rcv(skb: SkBuff) {
     if skb.len() < ARP_HLEN {
         return;
     }
-    let hdr = unsafe { core::ptr::read_unaligned(skb.data().as_ptr() as *const ArpHdr) };
+    let Some(hdr) = <ArpHdr as crate::pod::FromBytes>::read_from(skb.data()) else {
+        return;
+    };
     if hdr.hardware_type() != ARPHRD_ETHER || hdr.protocol_type() != 0x0800 {
         return;
     }

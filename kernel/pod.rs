@@ -38,6 +38,19 @@ pub unsafe trait FromBytes: Copy {
         // pattern is valid (trait)
         Some(unsafe { b.as_ptr().cast::<Self>().read_unaligned() })
     }
+
+    /// The value at the start of `b`, borrowed in place: None if `b` is
+    /// shorter or misaligned for `Self` (packed headers have alignment 1)
+    #[inline]
+    fn ref_from(b: &[u8]) -> Option<&Self> {
+        if b.len() < size_of::<Self>() || !b.as_ptr().cast::<Self>().is_aligned() {
+            return None;
+        }
+        // SAFETY: in bounds and aligned; any bytes are a valid Self
+        // (trait), and plain data has no interior mutability, so shared
+        // bytes give a shared value
+        Some(unsafe { &*b.as_ptr().cast::<Self>() })
+    }
 }
 
 /// The value's bytes are all initialized

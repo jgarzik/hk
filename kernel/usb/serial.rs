@@ -58,10 +58,11 @@ impl BusDriver for UsbSerialBusDriver {
             BusDevice::bus_id(usb_dev)
         );
 
-        // Clear global USB serial console
-        // SAFETY: This is called during hotplug removal, synchronized by bus lock
-        unsafe {
-            USB_SERIAL_CONSOLE = None;
+        // Off the console list; a printk holding a snapshot of the list
+        // may still call it, so it stays allocated and just goes quiet
+        if let Some(c) = USB_SERIAL_CONSOLE.lock().take() {
+            c.alive.store(false, core::sync::atomic::Ordering::Release);
+            crate::console::unregister_console(c.name);
         }
 
         printkln!("UsbSerial: Device slot {} removed", usb_dev.slot_id);
@@ -259,9 +260,11 @@ impl Device for UsbSerial {
     }
 }
 
-/// Static USB serial console instance
-/// Used to register with the console subsystem
-static mut USB_SERIAL_CONSOLE: Option<UsbSerialConsole> = None;
+/// The registered USB serial console (spin leaf). Consoles are
+/// `&'static` (printk writes through a snapshot of the list outside its
+/// lock), so each one is leaked: a removed one stays valid, marked dead.
+static USB_SERIAL_CONSOLE: crate::sync::spin::Mutex<Option<&'static UsbSerialConsole>> =
+    crate::sync::spin::Mutex::new(None);
 
 /// Wrapper for USB serial as a console
 ///
@@ -276,6 +279,8 @@ pub struct UsbSerialConsole {
     slot_id: u8,
     /// Bulk OUT endpoint
     bulk_out_ep: u8,
+    /// The device is still attached
+    alive: core::sync::atomic::AtomicBool,
 }
 
 impl UsbSerialConsole {
@@ -285,6 +290,7 @@ impl UsbSerialConsole {
             name: "ttyUSB0",
             slot_id: serial.usb_device.slot_id,
             bulk_out_ep: serial.bulk_out_ep,
+            alive: core::sync::atomic::AtomicBool::new(true),
         }
     }
 }
@@ -299,7 +305,7 @@ impl ConsoleDriver for UsbSerialConsole {
 
         // Check recursion guard - if USB output is already active, skip to prevent deadlock
         // This can happen when a printkln! inside USB code tries to write to USB serial
-        if is_usb_output_active() {
+        if is_usb_output_active() || !self.alive.load(core::sync::atomic::Ordering::Acquire) {
             return;
         }
 
@@ -329,17 +335,16 @@ static BOUNCE: crate::sync::spin::Mutex<[u8; 256]> = crate::sync::spin::Mutex::n
 pub fn register_usb_serial_console(serial: &UsbSerial) {
     use crate::console::ConsoleFlags;
 
-    // SAFETY: This is only called during driver probe, which happens once
-    // per device during boot on a single CPU
-    unsafe {
-        USB_SERIAL_CONSOLE = Some(UsbSerialConsole::from_usb_serial(serial));
-
-        if let Some(ref console) = USB_SERIAL_CONSOLE {
-            // Register with Normal priority (higher than legacy serial's Fallback)
-            // No special flags - this is a normal runtime console
-            register_console(console, ConsolePriority::Normal, ConsoleFlags::empty());
-        }
+    let mut cur = USB_SERIAL_CONSOLE.lock();
+    if cur.is_some() {
+        return; // one ttyUSB0 console at a time
     }
+    let console: &'static UsbSerialConsole =
+        Box::leak(Box::new(UsbSerialConsole::from_usb_serial(serial)));
+    *cur = Some(console);
+    drop(cur);
+    // Normal priority (above legacy serial's Fallback), no special flags
+    register_console(console, ConsolePriority::Normal, ConsoleFlags::empty());
 }
 
 /// Create a USB serial device from a detected USB device if it's CDC-ACM
