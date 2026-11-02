@@ -495,6 +495,13 @@ fn swapon(path_ptr: u64, swap_flags: i32) -> Result<(), KernelError> {
     } else {
         None
     };
+    // A swap file's pages go straight to the disk from now on: its page
+    // cache is written back and dropped so no cached copy diverges
+    // (Linux claim_swapfile / inode_drain_writes + invalidate)
+    if bdev.is_none() {
+        crate::mm::filemap::write_and_wait(&inode)?;
+        crate::mm::filemap::invalidate(&inode);
+    }
     let mut hdr = [0u8; PAGE_SIZE];
     let read = match &bdev {
         Some(b) => bdev_rw(b, BioOp::Read, 0, &mut hdr).map(|_| PAGE_SIZE),

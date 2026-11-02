@@ -123,6 +123,11 @@ impl Aops for VfatAops {
         write: bool,
     ) -> Result<(), KernelError> {
         let (bdev, runs) = page_runs(inode, index)?;
+        // A slot is a whole page of the file (swapon checks the header
+        // against the size); never part of one
+        if runs.iter().map(|r| r.1).sum::<usize>() != PAGE_SIZE {
+            return Err(KernelError::Io);
+        }
         if write {
             return page_io(&bdev, BioOp::Write, buf, &runs);
         }
