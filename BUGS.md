@@ -53,8 +53,9 @@ Missing:
   by id still work there).
 - File mappings: MAP_SHARED of a file on a filesystem other than ramfs
   (vfat) maps a private copy (writes do not reach the file or other
-  mappings); MAP_PRIVATE file pages are copied at fault, not shared
-  until written. A truncate racing an mremap or fork of a mapping of
+  mappings), and vfat MAP_PRIVATE pages are copied at fault (ramfs
+  shares the page cache until written). No fault-around (Linux maps up
+  to 16 cached pages per read fault). A truncate racing an mremap or fork of a mapping of
   the file can miss entries in flight: mremap unlinks the old VMA from
   i_mmap before its i_mmap-locked entry move, fork copies the parent's
   entries after linking the child (Linux takes the rmap locks across

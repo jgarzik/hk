@@ -18,6 +18,13 @@
 //! - TRUNC_SHARED_SIGBUS: truncating a shared-mapped file unmaps the
 //!   pages past the new end: touching one is SIGBUS, and after growing
 //!   the file again it reads zeros, not the old data
+//! - PRIVATE_SEES_WRITE: a MAP_PRIVATE page not written yet is the
+//!   page cache's: a write() to the file shows through it; after the
+//!   mapping writes it, its copy no longer changes
+//! - PRIVATE_EOF_SIGBUS: a private file mapping is SIGBUS past the
+//!   page holding the end of the file, like a shared one
+//! - TRUNC_PRIVATE_COW: truncate also unmaps a private mapping's
+//!   copies past the new end (SIGBUS)
 //! - SHMEM_REMOVE_SHARED: MADV_REMOVE by one process zeroes the page
 //!   for the other too, and the page stays shared
 //! - SHMEM_REMOVE_PAST_SIZE: MADV_REMOVE of a range past the object
@@ -327,6 +334,74 @@ fn file_shared() {
         }
         None => report(b"TRUNC_SHARED_SIGBUS", -1),
     }
+    report(b"PRIVATE_SEES_WRITE", private_sees_write());
+    report(b"PRIVATE_EOF_SIGBUS", private_eof());
+    report(b"TRUNC_PRIVATE_COW", trunc_private());
+}
+
+/// A file of `size` bytes mapped MAP_PRIVATE over `len`: (fd, address)
+fn map_private(size: i64, len: u64) -> Option<(i32, u64)> {
+    let (fd, p) = map_file(size, len)?;
+    sys_munmap(p, len);
+    let q = sys_mmap(0, len, RW, MAP_PRIVATE, fd, 0);
+    if q < 0 {
+        unmap_file(fd, 0, 0);
+        return None;
+    }
+    Some((fd, q as u64))
+}
+
+fn private_sees_write() -> i64 {
+    let Some((fd, p)) = map_private(2 * PAGE as i64, 2 * PAGE) else {
+        return -1;
+    };
+    let code = (|| {
+        if get(p + 8) != 0 {
+            return 1;
+        }
+        let v = PARENT;
+        sys_pwrite64(fd, (&v as *const u64).cast(), 8, 8);
+        if get(p + 8) != PARENT {
+            return 2;
+        }
+        put(p + 16, BEFORE);
+        let w = 0x5555u64;
+        sys_pwrite64(fd, (&w as *const u64).cast(), 8, 8);
+        let mut f = 0u64;
+        sys_pread64(fd, (&mut f as *mut u64).cast(), 8, 16);
+        if get(p + 8) != PARENT || f != 0 { 3 } else { 0 }
+    })();
+    unmap_file(fd, p, 2 * PAGE);
+    code
+}
+
+fn private_eof() -> i64 {
+    let Some((fd, p)) = map_private(100, 2 * PAGE) else {
+        return -1;
+    };
+    let code = file_eof(p);
+    unmap_file(fd, p, 2 * PAGE);
+    code
+}
+
+fn trunc_private() -> i64 {
+    let Some((fd, p)) = map_private(2 * PAGE as i64, 2 * PAGE) else {
+        return -1;
+    };
+    put(p + PAGE + 8, PARENT);
+    let code = if sys_ftruncate(fd, PAGE as i64) != 0 {
+        1
+    } else {
+        let pid = sys_fork();
+        if pid == 0 {
+            get(p + PAGE + 8);
+            sys_exit(0);
+        }
+        let r = reap(pid);
+        if r == 0x100 + SIGBUS { 0 } else { 10 + r }
+    };
+    unmap_file(fd, p, 2 * PAGE);
+    code
 }
 
 /// Truncate unmaps (Linux truncate_pagecache): SIGBUS past the new end
