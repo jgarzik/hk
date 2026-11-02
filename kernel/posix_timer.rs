@@ -495,9 +495,10 @@ impl PosixTimerRegistry {
         self.timers.remove(&timer_id)
     }
 
-    /// Every timer (cpu_timer's expiry pass)
-    pub fn timers(&self) -> alloc::vec::Vec<Arc<PosixTimer>> {
-        self.timers.values().cloned().collect()
+    /// Every timer, borrowed under the registry lock (cpu_timer's
+    /// expiry pass)
+    pub fn iter(&self) -> impl Iterator<Item = &Arc<PosixTimer>> {
+        self.timers.values()
     }
 }
 

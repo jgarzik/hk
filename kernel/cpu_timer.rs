@@ -202,12 +202,23 @@ fn arm_group(sig: &crate::signal::SignalStruct, s: Sample, at: u64, sample: (u64
 pub fn arm(clock: CpuClock, at: u64) {
     match clock.thread {
         Some(tid) => {
+            // The thread's task, then its hint under the group's
+            // posix_timers (which that thread's `run` holds while it
+            // recomputes the hint), so a pass under way cannot erase it
             let me = crate::task::percpu::current();
-            if me.tid() == tid {
-                me.cpu_next[clock.sample as usize].fetch_min(at, Ordering::Relaxed);
-            } else if let Some(t) = crate::task::percpu::TASKLIST.read().get(tid) {
-                t.task.cpu_next[clock.sample as usize].fetch_min(at, Ordering::Relaxed);
-            }
+            let task = if me.tid() == tid {
+                Some(crate::task::percpu::task_ref(&me))
+            } else {
+                crate::task::percpu::TASKLIST
+                    .read()
+                    .get(tid)
+                    .map(|t| crate::task::percpu::task_ref(t.task))
+            };
+            let (Some(t), Some(g)) = (task, my_group()) else {
+                return;
+            };
+            let _reg = g.posix_timers.lock();
+            t.cpu_next[clock.sample as usize].fetch_min(at, Ordering::Relaxed);
         }
         None => {
             if let Some(g) = my_group() {
@@ -267,7 +278,7 @@ pub fn run() {
     // it too, so what is decided below holds until it is stored
     let reg = sig.posix_timers.lock();
     let group = sig.cputimer.totals();
-    for t in reg.timers() {
+    for t in reg.iter() {
         let Some(clock) = t.cpu_clock() else {
             continue;
         };
@@ -284,7 +295,7 @@ pub fn run() {
             }
         };
         if let Some(f) = t.cpu_expire(now) {
-            fire.push(f.into_fire(&t));
+            fire.push(f.into_fire(t));
         }
         if let Some(at) = t.cpu_expiry() {
             let n = match clock.thread {
@@ -294,6 +305,8 @@ pub fn run() {
             *n = (*n).min(at);
         }
     }
+    // Still under posix_timers: `arm` of a thread timer lowers this
+    // under it too
     for (i, n) in thread_next.iter().enumerate() {
         me.cpu_next[i].store(*n, Ordering::Relaxed);
     }
