@@ -5,9 +5,6 @@
 These are safe fns or patterns whose use leads to undefined behaviour.
 None is known to fail today, but each is a soundness bug:
 
-- **Task setters:** `exit_task_fd`, the fs/ns setters and `exit_task_mm`
-  are safe fns, yet they take any tid and replace another task's
-  pointers without a lock.
 - **Drivers:**
   - USB serial removal frees the console that the console list still
     points to.

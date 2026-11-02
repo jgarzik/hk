@@ -391,8 +391,7 @@ use crate::task::percpu::{current, with_task_lock};
 /// Called when creating a new task to set up its namespace context, or
 /// by the task itself (unshare, setns; Linux switch_task_namespaces).
 pub fn init_task_ns(tid: Tid, nsproxy: Arc<NsProxy>) {
-    // SAFETY: the task itself or a child not yet run (see above)
-    let old = with_task_lock(tid, |a| unsafe { a.set_nsproxy(Some(nsproxy)) });
+    let old = with_task_lock(tid, |a| a.set_nsproxy(Some(nsproxy)));
     drop(old);
 }
 
@@ -415,8 +414,7 @@ pub fn get_task_ns(tid: Tid) -> Option<Arc<NsProxy>> {
 /// which in turn drops the namespace references (after the task's
 /// alloc_lock is released: a network namespace's teardown takes RTNL).
 pub fn exit_task_ns(tid: Tid) {
-    // SAFETY: the exiting task itself
-    let ns = with_task_lock(tid, |a| unsafe { a.set_nsproxy(None) }).flatten();
+    let ns = with_task_lock(tid, |a| a.set_nsproxy(None)).flatten();
     drop(ns);
 }
 

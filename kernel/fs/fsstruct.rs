@@ -141,8 +141,7 @@ use crate::task::percpu::{current, with_task_lock};
 /// Initialize filesystem context for a new task (the task itself, or
 /// its creator before it runs); the old one is dropped after the lock
 pub fn init_task_fs(tid: Tid, fs: Arc<FsStruct>) {
-    // SAFETY: the task itself or a child not yet run (see above)
-    let old = with_task_lock(tid, |a| unsafe { a.set_fs(Some(fs)) });
+    let old = with_task_lock(tid, |a| a.set_fs(Some(fs)));
     drop(old);
 }
 
@@ -163,8 +162,7 @@ pub fn get_task_fs(tid: Tid) -> Option<Arc<FsStruct>> {
 /// which in turn drops the Path references to pwd and root (after
 /// the task's alloc_lock is released: nothing is released under it).
 pub fn exit_task_fs(tid: Tid) {
-    // SAFETY: the exiting task itself
-    let fs = with_task_lock(tid, |a| unsafe { a.set_fs(None) }).flatten();
+    let fs = with_task_lock(tid, |a| a.set_fs(None)).flatten();
     drop(fs);
 }
 

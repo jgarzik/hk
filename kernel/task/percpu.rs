@@ -1328,6 +1328,8 @@ fn attach_asleep(p: &TaskRef) {
 /// Start a new task: the scheduler takes its reference and queues it
 /// on the CPU `select_task_rq` picks (Linux wake_up_new_task)
 fn wake_up_new_task(p: &TaskRef) {
+    // Its owner fields are its own from here (TaskLock::owner_check)
+    p.started.store(true, Ordering::Release);
     let _pi = p.pi_lock.lock();
     set_task_cpu(p, select_task_rq(p, Placement::Fork));
     let mut rq = get_percpu_sched(p.cpu()).lock.lock();
@@ -4497,11 +4499,8 @@ pub fn exec_replace_image(
         // The mm and name change as one under task_lock (Linux
         // exec_mmap, __set_task_comm): a reader sees both or neither
         let mut a = task.task.task_lock();
-        // SAFETY: the task itself
-        unsafe {
-            a.set_comm(ident.name);
-            a.set_mm(Some(mm))
-        }
+        a.set_comm(ident.name);
+        a.set_mm(Some(mm))
     });
 
     // The new image starts with no user GS base (Linux start_thread:

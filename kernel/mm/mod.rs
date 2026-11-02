@@ -1048,8 +1048,7 @@ pub fn get_task_mm_users(tid: Tid) -> Option<MmRef> {
 /// the returned mm_count reference keeps the top-level table, still
 /// loaded on this CPU, until the task has switched away.
 pub fn exit_task_mm(tid: Tid) -> Option<Arc<Mm>> {
-    // SAFETY: the exiting task itself
-    let mm = with_task_lock(tid, |a| unsafe { a.set_mm(None) }).flatten()?;
+    let mm = with_task_lock(tid, |a| a.set_mm(None)).flatten()?;
     let keep = mm.arc().clone();
     drop(mm);
     Some(keep)

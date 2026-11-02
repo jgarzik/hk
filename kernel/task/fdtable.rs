@@ -76,8 +76,7 @@ impl Drop for FilesGuard<'_> {
 /// Point `tid` (the task itself, or a child not yet run) at `files`;
 /// the table it had is dropped after its alloc_lock is released
 pub fn init_task_fd(tid: Tid, files: Arc<Files>) {
-    // SAFETY: the task itself or a child not yet run (see above)
-    let old = with_task_lock(tid, |a| unsafe { a.set_files(Some(files)) });
+    let old = with_task_lock(tid, |a| a.set_files(Some(files)));
     drop(old);
 }
 
@@ -95,8 +94,7 @@ pub fn get_task_fd(tid: Tid) -> Option<Arc<Files>> {
 /// closes every descriptor, after its alloc_lock is released
 /// (releasing a socket can sleep)
 pub fn exit_task_fd(tid: Tid) {
-    // SAFETY: the exiting task itself
-    let files = with_task_lock(tid, |a| unsafe { a.set_files(None) }).flatten();
+    let files = with_task_lock(tid, |a| a.set_files(None)).flatten();
     drop(files);
 }
 

@@ -528,8 +528,7 @@ pub fn sys_prctl(option: i32, arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> 
             // Rename the calling thread under its task_lock (Linux
             // set_task_comm)
             let me = super::percpu::current();
-            // SAFETY: the task itself
-            unsafe { me.task_lock().set_comm(name) };
+            me.task_lock().set_comm(name);
             0
         }
 

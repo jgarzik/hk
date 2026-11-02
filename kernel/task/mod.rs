@@ -106,7 +106,7 @@ use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU32, AtomicU64};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 use crate::arch::{Arch, PageTable};
 use crate::fs::FsStruct;
@@ -968,6 +968,9 @@ pub struct Task<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::Phy
     /// Scheduling state: sleep state, run-queue link, priority, switch
     /// frame (Linux __state, on_rq, sched_entity)
     pub se: sched::SchedEntity,
+    /// Woken for the first time (`wake_up_new_task`): from then on only
+    /// the task itself changes its owner fields ([`OwnCell`])
+    pub started: AtomicBool,
     /// Serializes the task's wakers (Linux pi_lock): IrqSpinlock, taken
     /// before its CPU's rq lock (`try_to_wake_up`)
     pub pi_lock: crate::arch::IrqSpinlock<()>,
@@ -1425,6 +1428,19 @@ pub struct TaskLock<'a, A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr 
 }
 
 impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> TaskLock<'_, A, PT> {
+    /// The owner rule ([`OwnCell`]): only the task itself, or its creator
+    /// before it first runs, replaces an owner field (one load and
+    /// compare: a violation would free what the task is using)
+    fn owner_check(&self) {
+        let me = crate::task::percpu::current_tid();
+        assert!(
+            self.task.tid() == me || !self.task.started.load(Ordering::Acquire),
+            "owner field of task {} changed by task {}",
+            self.task.tid(),
+            me
+        );
+    }
+
     /// Its address space
     pub fn mm(&self) -> Option<&crate::mm::MmRef> {
         // SAFETY: alloc_lock is held (the guard)
@@ -1477,48 +1493,46 @@ impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Tas
 
     /// Install an address space, returning the old one
     ///
-    /// # Safety
-    /// The caller is the task itself, or it has not run yet.
-    pub unsafe fn set_mm(&mut self, mm: Option<crate::mm::MmRef>) -> Option<crate::mm::MmRef> {
-        // SAFETY: alloc_lock is held, owner rule (see above)
+    /// Panics unless the caller is the task itself or it has not run
+    /// yet (the owner rule, [`OwnCell`])
+    pub fn set_mm(&mut self, mm: Option<crate::mm::MmRef>) -> Option<crate::mm::MmRef> {
+        self.owner_check();
+        // SAFETY: alloc_lock is held (the guard), the owner rule checked
         unsafe { self.task.mm.replace(mm) }
     }
 
     /// Install a descriptor table, returning the old one
     ///
-    /// # Safety
-    /// As [`TaskLock::set_mm`].
-    pub unsafe fn set_files(
-        &mut self,
-        f: Option<Arc<fdtable::Files>>,
-    ) -> Option<Arc<fdtable::Files>> {
+    /// Panics as [`TaskLock::set_mm`]
+    pub fn set_files(&mut self, f: Option<Arc<fdtable::Files>>) -> Option<Arc<fdtable::Files>> {
+        self.owner_check();
         // SAFETY: as above
         unsafe { self.task.files.replace(f) }
     }
 
     /// Install a filesystem context, returning the old one
     ///
-    /// # Safety
-    /// As [`TaskLock::set_mm`].
-    pub unsafe fn set_fs(&mut self, fs: Option<Arc<FsStruct>>) -> Option<Arc<FsStruct>> {
+    /// Panics as [`TaskLock::set_mm`]
+    pub fn set_fs(&mut self, fs: Option<Arc<FsStruct>>) -> Option<Arc<FsStruct>> {
+        self.owner_check();
         // SAFETY: as above
         unsafe { self.task.fs.replace(fs) }
     }
 
     /// Install namespaces, returning the old ones
     ///
-    /// # Safety
-    /// As [`TaskLock::set_mm`].
-    pub unsafe fn set_nsproxy(&mut self, ns: Option<Arc<NsProxy>>) -> Option<Arc<NsProxy>> {
+    /// Panics as [`TaskLock::set_mm`]
+    pub fn set_nsproxy(&mut self, ns: Option<Arc<NsProxy>>) -> Option<Arc<NsProxy>> {
+        self.owner_check();
         // SAFETY: as above
         unsafe { self.task.nsproxy.replace(ns) }
     }
 
     /// Rename the task (Linux __set_task_comm)
     ///
-    /// # Safety
-    /// As [`TaskLock::set_mm`].
-    pub unsafe fn set_comm(&mut self, comm: [u8; 16]) {
+    /// Panics as [`TaskLock::set_mm`]
+    pub fn set_comm(&mut self, comm: [u8; 16]) {
+        self.owner_check();
         // SAFETY: as above
         unsafe { self.task.comm.replace(comm) };
     }
@@ -1558,6 +1572,7 @@ impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Tas
             pagefault_disabled: AtomicU32::new(0),
             rx_cpu: AtomicU32::new(u32::MAX),
             se: sched::SchedEntity::new(0),
+            started: AtomicBool::new(false),
             pi_lock: crate::arch::IrqSpinlock::new(()),
             ppid: AtomicU64::new(ids.ppid),
             pgid: AtomicU64::new(ids.pgid),
@@ -1620,6 +1635,7 @@ impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Tas
             pagefault_disabled: AtomicU32::new(0),
             rx_cpu: AtomicU32::new(u32::MAX),
             se: sched::SchedEntity::new(0),
+            started: AtomicBool::new(true),
             pi_lock: crate::arch::IrqSpinlock::new(()),
             ppid: AtomicU64::new(0),
             pgid: AtomicU64::new(0),
@@ -2345,7 +2361,7 @@ fn flag_nproc_exceeded(new: Uid) {
 // I/O Priority (ioprio) support for CLONE_IO
 // =============================================================================
 
-use core::sync::atomic::{AtomicU16, Ordering};
+use core::sync::atomic::AtomicU16;
 
 /// I/O priority type (matches Linux: 3-bit class + 13-bit data)
 pub type IoPrio = u16;
