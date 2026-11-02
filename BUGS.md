@@ -501,6 +501,17 @@ mode, a short power-button press does nothing). Only the 32-bit FADT
 block fields are read (no X_ GAS forms, no hardware-reduced ACPI), and
 a reset register in PCI configuration space is ignored.
 
+## vfat file I/O walks the whole cluster chain per page
+
+**Location**: `kernel/fs/vfat.rs` (`page_runs`)
+
+Every read_folio, writepage and swap_rw of a vfat file rebuilds its
+whole cluster chain from the FAT (through the device cache) to find a
+page's clusters, so reading or writing back a file is quadratic in its
+size (a 1GB file of 4KB clusters: about 3e10 FAT lookups). Linux
+fat_get_cluster keeps a per-inode cache of chain positions
+(fat_cache); one is needed before large vfat files or vfat swap files.
+
 ## Block layer gaps (P1)
 
 **Location**: `kernel/storage/`, `kernel/virtio/blk.rs`,

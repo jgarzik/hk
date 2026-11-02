@@ -416,7 +416,9 @@ fn vfat_remount(p1: &BlkDev) {
         && n == 8192
         && b[..4096].iter().all(|&c| c == b'w')
         && &b[4096..4100] == b"MMAP"
-        && b[4100..8192].iter().all(|&c| c == 0);
+        && &b[4196..4200] == b"MPRO"
+        && b[4100..4196].iter().all(|&c| c == 0)
+        && b[4200..8192].iter().all(|&c| c == 0);
     sys_unlink(b"/mnt/vd1/M.TXT\0".as_ptr());
     let u = sys_umount2(b"/mnt/vd1\0".as_ptr(), 0);
     if !ok {
@@ -426,6 +428,8 @@ fn vfat_remount(p1: &BlkDev) {
                 b'w'
             } else if i < 4100 {
                 b"MMAP"[i - 4096]
+            } else if (4196..4200).contains(&i) {
+                b"MPRO"[i - 4196]
             } else {
                 0
             }
@@ -546,6 +550,21 @@ fn vfat_mmap_write() {
         ok &= sys_fsync(fd) == 0;
         v[4096..4100].copy_from_slice(b"MMAP");
         sys_munmap(m as u64, 8192);
+        // Read-only, read, then made writable by mprotect: the store
+        // must still dirty the page (Linux vma_wants_writenotify keeps
+        // the entry read-only until a write fault). Written back first,
+        // so the page is clean.
+        ok &= sys_fsync(fd) == 0;
+        let r = sys_mmap(0, 4096, PROT_READ, MAP_SHARED, fd, 4096);
+        if r > 0 {
+            let w = unsafe { core::slice::from_raw_parts_mut(r as *mut u8, 4096) };
+            ok &= w[0] == b'M';
+            ok &= hk_syscall::sys_mprotect(r as u64, 4096, PROT_READ | PROT_WRITE) == 0;
+            w[100..104].copy_from_slice(b"MPRO");
+            sys_munmap(r as u64, 4096);
+        } else {
+            ok = false;
+        }
     }
     let mut got = [0u8; 4];
     sys_pread64(fd, got.as_mut_ptr(), 4, 4096);

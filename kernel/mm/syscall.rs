@@ -1115,7 +1115,13 @@ fn mprotect_fixup(
     }
     let vma = mm.get_vma_mut(idx).ok_or(KernelError::OutOfMemory)?;
     vma.prot = prot;
-    let (s, e, shared) = (vma.start, vma.end, vma.is_shared());
+    // A dirty-tracked shared file mapping is written only after a write
+    // fault (which dirties the page): not made writable here
+    let (s, e, shared) = (
+        vma.start,
+        vma.end,
+        vma.is_shared() && !vma.wants_writenotify(),
+    );
     super::mprotect::change_protection(pgd, s, e, prot, shared);
     Ok((idx, e))
 }

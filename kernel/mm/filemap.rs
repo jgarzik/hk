@@ -521,6 +521,11 @@ pub fn write_range(inode: &Inode, first: u64, last: u64) -> Result<(), KernelErr
 pub fn invalidate_range(inode: &Inode, start: u64, end: u64) -> Result<(), KernelError> {
     let m = &inode.i_data;
     let (first, last) = (start / PAGE_SIZE as u64, end.div_ceil(PAGE_SIZE as u64));
+    if first >= last {
+        return Ok(());
+    }
+    // Unmapped (a mapping of the device node) before the pages go
+    unmap_pages(m, first, last - 1);
     let mut at = first;
     while at < last {
         let next = {
@@ -600,7 +605,12 @@ pub fn invalidate_clean(inode: &Inode, first: u64, last: u64) -> u64 {
 /// Drop every page of `inode` (Linux kill_bdev / truncate_inode_pages
 /// from 0), after `write_and_wait` if they must reach the disk
 pub fn invalidate(inode: &Inode) {
+    // Unmapped first and again after (Linux truncate_inode_pages unmaps
+    // a mapped folio): no mapping keeps an orphaned page whose writes
+    // would reach nothing
+    unmap_mapping_range(&inode.i_data, 0);
     truncate_from(&inode.i_data, 0);
+    unmap_mapping_range(&inode.i_data, 0);
 }
 
 /// Linux simple_write_begin: the page, read first unless the write
@@ -699,18 +709,28 @@ pub fn perform_write(inode: &Inode, buf: &[u8], pos: u64) -> Result<usize, Kerne
 /// they go SIGBUS with the file). The chain held for reading keeps each
 /// VMA's page tables (an unmap unlinks the VMA first). Sleeps.
 pub fn unmap_mapping_range(m: &AddressSpace, from: u64) {
+    unmap_pages(m, from, u64::MAX);
+}
+
+/// `unmap_mapping_range` of the pages with index in [from, last]
+pub fn unmap_pages(m: &AddressSpace, from: u64, last: u64) {
     let chain = m.i_mmap.read();
     for avc in chain.iter() {
         let pages = (avc.end - avc.start) / PAGE_SIZE as u64;
-        if avc.pgoff + pages <= from {
+        if avc.pgoff + pages <= from || avc.pgoff > last {
             continue;
         }
         let Some(mm) = avc.mm.upgrade() else {
             continue;
         };
-        let start = avc.start + from.saturating_sub(avc.pgoff) * PAGE_SIZE as u64;
+        let page_addr = |i: u64| {
+            avc.start
+                .saturating_add(i.saturating_sub(avc.pgoff).saturating_mul(PAGE_SIZE as u64))
+        };
+        let start = page_addr(from);
+        let end = page_addr(last.saturating_add(1)).min(avc.end);
         let mut tlb = super::gather::Gather::new(&mm);
-        super::memory::zap_range(&mut tlb, start, avc.end);
+        super::memory::zap_range(&mut tlb, start, end);
     }
 }
 
