@@ -90,7 +90,8 @@
 - [x] fsync
 - [x] fdatasync
 - [x] syncfs
-- [ ] sync_file_range (x86-64) / sync_file_range2 (aarch64; different arg order)
+- [x] sync_file_range (both arches; aarch64 uses this argument order, sync_file_range2 is 32-bit only)
+- [x] fadvise64 (aarch64: fadvise64_64, same arguments)
 - [x] flock (advisory file locking)
 - [x] fallocate (file space manipulation)
 

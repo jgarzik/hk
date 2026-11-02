@@ -36,6 +36,78 @@ pub fn run_tests() {
     test_membarrier();
     test_readahead();
     test_dirty_sysctls();
+    test_sync_file_range();
+    test_fadvise();
+}
+
+fn verdict(name: &[u8], ok: bool, got: [i64; 6]) {
+    print(name);
+    if ok {
+        println(b":OK");
+        return;
+    }
+    print(b":FAIL");
+    for g in got {
+        print(b" ");
+        print_num(g);
+    }
+    println(b"");
+}
+
+/// A temp file with 8KB written, and a pipe: (file, pipe read end)
+fn file_and_pipe() -> (i32, i32) {
+    use hk_syscall::{O_CREAT, O_RDWR, O_TRUNC, sys_open, sys_pipe2, sys_pwrite64};
+    let fd = sys_open(b"/tmp/sfr_test\0".as_ptr(), O_CREAT | O_RDWR | O_TRUNC, 0o600) as i32;
+    let buf = [7u8; 8192];
+    sys_pwrite64(fd, buf.as_ptr(), 8192, 0);
+    let mut p = [0i32; 2];
+    sys_pipe2(p.as_mut_ptr(), 0);
+    hk_syscall::sys_close(p[1] as u64);
+    (fd, p[0])
+}
+
+fn close_both(fd: i32, p: i32) {
+    hk_syscall::sys_close(fd as u64);
+    hk_syscall::sys_close(p as u64);
+    hk_syscall::sys_unlink(b"/tmp/sfr_test\0".as_ptr());
+}
+
+/// sync_file_range (Linux ksys_sync_file_range): unknown flags, a
+/// negative offset or length are EINVAL; a pipe ESPIPE; a closed fd
+/// EBADF; a range of a file 0
+fn test_sync_file_range() {
+    use hk_syscall::sys_sync_file_range as sfr;
+    let (fd, p) = file_and_pipe();
+    let got = [
+        sfr(fd, 0, 0, 8),
+        sfr(fd, -1, 0, 2),
+        sfr(fd, 0, -1, 2),
+        sfr(p, 0, 0, 2),
+        sfr(9999, 0, 0, 2),
+        sfr(fd, 0, 4096, 7),
+    ];
+    close_both(fd, p);
+    let ok = got == [-22, -22, -22, -29, -9, 0];
+    verdict(b"SYNC_FILE_RANGE_ERRNO", ok, got);
+}
+
+/// fadvise64 (Linux generic_fadvise): a pipe is ESPIPE, an unknown
+/// advice or a negative length EINVAL, a closed fd EBADF; WILLNEED,
+/// DONTNEED and SEQUENTIAL on a file 0
+fn test_fadvise() {
+    use hk_syscall::sys_fadvise64 as fa;
+    let (fd, p) = file_and_pipe();
+    let got = [
+        fa(p, 0, 0, 0),
+        fa(fd, 0, 0, 9),
+        fa(fd, 0, -1, 0),
+        fa(9999, 0, 0, 0),
+        fa(fd, 0, 0, 3) + fa(fd, 0, 0, 4),
+        fa(fd, 0, 4096, 2),
+    ];
+    close_both(fd, p);
+    let ok = got == [-29, -22, -22, -9, 0, 0];
+    verdict(b"FADVISE_ERRNO", ok, got);
 }
 
 /// vm.dirty_* (Linux page-writeback.c): defaults 20/10 percent; setting

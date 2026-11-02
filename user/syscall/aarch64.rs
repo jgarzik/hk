@@ -339,6 +339,8 @@ pub const SYS_RT_TGSIGQUEUEINFO: u64 = 240;
 pub const SYS_MEMBARRIER: u64 = 283;
 
 // File readahead syscall
+pub const SYS_FADVISE64: u64 = 223;
+pub const SYS_SYNC_FILE_RANGE: u64 = 84;
 pub const SYS_READAHEAD: u64 = 213;
 
 // Pipe/poll/select syscalls (aarch64 numbers)
@@ -2598,6 +2600,14 @@ pub fn sys_membarrier(cmd: i32, flags: u32, cpu_id: i32) -> i64 {
 
 /// readahead(fd, offset, count) - initiate file readahead
 #[inline(always)]
+pub fn sys_fadvise64(fd: i32, offset: i64, len: i64, advice: i32) -> i64 {
+    unsafe { syscall4!(SYS_FADVISE64, fd, offset, len, advice) }
+}
+
+pub fn sys_sync_file_range(fd: i32, offset: i64, nbytes: i64, flags: u32) -> i64 {
+    unsafe { syscall4!(SYS_SYNC_FILE_RANGE, fd, offset, nbytes, flags) }
+}
+
 pub fn sys_readahead(fd: i32, offset: i64, count: usize) -> i64 {
     unsafe { syscall3!(SYS_READAHEAD, fd, offset, count) }
 }

@@ -442,14 +442,20 @@ fn mkclean(m: &AddressSpace, index: u64, phys: u64) {
 /// after the others were tried; a page that failed stays clean (Linux
 /// records the error on the mapping; the data is in the page still).
 pub fn write_and_wait(inode: &Inode) -> Result<(), KernelError> {
+    write_range(inode, 0, u64::MAX)
+}
+
+/// `write_and_wait` of the pages with index in [first, last] (Linux
+/// filemap_write_and_wait_range)
+pub fn write_range(inode: &Inode, first: u64, last: u64) -> Result<(), KernelError> {
     let m = &inode.i_data;
     let mut err = Ok(());
-    let mut at = 0;
+    let mut at = first;
     loop {
         let next = {
             let pages = m.i_pages.lock();
             pages
-                .find(at, u64::MAX, Some(MARK_DIRTY))
+                .find(at, last, Some(MARK_DIRTY))
                 .filter(|&(_, p)| FRAME_ALLOCATOR.incref(p))
         };
         let Some((index, phys)) = next else {
@@ -515,6 +521,41 @@ pub fn invalidate_range(inode: &Inode, start: u64, end: u64) -> Result<(), Kerne
         at = index + 1;
     }
     Ok(())
+}
+
+/// Drop the clean, unmapped, unused pages of `inode` with index in
+/// [first, last] (Linux invalidate_mapping_pages: best effort; dirty,
+/// locked, mapped or otherwise referenced pages stay)
+pub fn invalidate_clean(inode: &Inode, first: u64, last: u64) {
+    let m = &inode.i_data;
+    let mut at = first;
+    while at <= last {
+        let next = {
+            let pages = m.i_pages.lock();
+            pages
+                .find(at, last, None)
+                .filter(|&(_, p)| FRAME_ALLOCATOR.incref(p))
+        };
+        let Some((index, phys)) = next else {
+            return;
+        };
+        if super::page::trylock_page(phys) {
+            let pg = page(phys);
+            // The cache's reference and ours: no PTE or user holds it
+            if pg.mapping.load(Ordering::Acquire) == m.key()
+                && pg.flags.load(Ordering::Acquire) & PG_DIRTY == 0
+                && FRAME_ALLOCATOR.refcount(phys) == 2
+            {
+                remove(m, phys);
+            }
+            unlock_page(phys);
+        }
+        put_page(phys);
+        match index.checked_add(1) {
+            Some(n) => at = n,
+            None => return,
+        }
+    }
 }
 
 /// Drop every page of `inode` (Linux kill_bdev / truncate_inode_pages

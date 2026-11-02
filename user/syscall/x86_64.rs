@@ -304,6 +304,8 @@ pub const SYS_SWAPOFF: u64 = 168;
 pub const SYS_REBOOT: u64 = 169;
 pub const SYS_SETHOSTNAME: u64 = 170;
 pub const SYS_SETDOMAINNAME: u64 = 171;
+pub const SYS_FADVISE64: u64 = 221;
+pub const SYS_SYNC_FILE_RANGE: u64 = 277;
 pub const SYS_READAHEAD: u64 = 187;
 pub const SYS_GETTID: u64 = 186;
 pub const SYS_TKILL: u64 = 200;
@@ -2288,6 +2290,14 @@ pub fn sys_membarrier(cmd: i32, flags: u32, cpu_id: i32) -> i64 {
 
 /// readahead(fd, offset, count) - initiate file readahead
 #[inline(always)]
+pub fn sys_fadvise64(fd: i32, offset: i64, len: i64, advice: i32) -> i64 {
+    unsafe { syscall4!(SYS_FADVISE64, fd, offset, len, advice) }
+}
+
+pub fn sys_sync_file_range(fd: i32, offset: i64, nbytes: i64, flags: u32) -> i64 {
+    unsafe { syscall4!(SYS_SYNC_FILE_RANGE, fd, offset, nbytes, flags) }
+}
+
 pub fn sys_readahead(fd: i32, offset: i64, count: usize) -> i64 {
     unsafe { syscall3!(SYS_READAHEAD, fd, offset, count) }
 }

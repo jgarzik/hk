@@ -35,6 +35,7 @@ pub mod perm;
 pub mod pollsys;
 pub mod posix_lock;
 pub mod stat;
+pub mod sync;
 
 // Filesystem implementations
 pub mod cgroupfs;
