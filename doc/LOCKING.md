@@ -338,8 +338,9 @@ Tasks (3.1.1, 3.7; Linux tasklist_lock → pidmap_lock → task_lock →
     IRQ-safe; Linux task_lock; one task's at a time) → Task.sig (spin
     Mutex, per task) → TaskSignalState.shared_pending (spin Mutex) →
     SigHand.action (IrqSpinlock leaf); Task.keyrings, Task.cgroup,
-    Task.fput_defer, SignalStruct.posix_timers: per-task leaves reached
-    through a TaskRef, never under TASKLIST
+    Task.fput_defer: per-task leaves reached through a TaskRef, never
+    under TASKLIST; SignalStruct.posix_timers (never under TASKLIST)
+    → PosixTimer.inner, SignalStruct.rlim (cpu_timer's expiry pass)
 
 Wakeups (3.1; any context, under any of the above):
     WaitQueue head (IrqSpinlock) → Task.pi_lock (IrqSpinlock, per task)
@@ -3081,7 +3082,7 @@ else is taken under it) unless an order is given. "spin" is the
 | Lock | Location | Class | Protects / order |
 |------|----------|-------|------------------|
 | `Task.vfork_done` | task/mod.rs | atomic pointer | the vforking parent's on-stack `Completion` (Linux vfork_done): set before the child runs, taken once by the child at exec/exit, which completes it; the parent waits uninterruptibly so the completion outlives that use |
-| `SignalStruct.posix_timers` | signal/mod.rs, posix_timer.rs | spin Mutex | the thread group's POSIX timers and ITIMER_REAL (Linux signal->posix_timers); leaf, thread context; deleted at the group's last exit (`exit_itimers`, timers stopped after the lock) or with the SignalStruct |
+| `SignalStruct.posix_timers` | signal/mod.rs, posix_timer.rs | spin Mutex | the thread group's POSIX timers and itimers (Linux signal->posix_timers); thread context, never under TASKLIST; cpu_timer holds it around arming the group's CPU-timer state and its whole expiry pass (`PosixTimer.inner` and `SignalStruct.rlim` inside); deleted at the group's last exit (`exit_itimers`, timers stopped after the lock) or with the SignalStruct |
 | `PosixTimer.inner` | posix_timer.rs | IrqSpinlock | one timer's state; -> its hrtimer's base (re-armed under it); cancelled with `cancel_sync` before it is taken (settime) or with it dropped (delete). A CPU-time timer's clock value is read before it (that may take TASKLIST) |
 | CPU-timer state (`cpu_timer.rs`): `SignalStruct.cputimer`, `Task.cpu_next` | cpu_timer.rs | atomics | the group's running CPU totals and expiry hints, a thread's hints; written by the tick and accounting (interrupts off) and by `run` in task context. `run` (TIF_NOTIFY_RESUME on the way to user mode) takes `posix_timers` -> `PosixTimer.inner`, then `SignalStruct.rlim`, and sends signals after dropping them |
 | timerfd `CANCEL_LIST` | timerfd.rs | spin::Mutex | thread only: weak refs to TFD_TIMER_CANCEL_ON_SET timerfds; -> `Timerfd.inner` (setup_cancel); `clock_was_set` copies it out and drops it first |

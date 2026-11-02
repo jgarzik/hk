@@ -23,8 +23,11 @@
 //! tick. Thread caches are per-task atomics. Both are hints: a stale
 //! one only costs a pass of `run`.
 //!
-//! Locking: atomics only, except `run`, which takes the group's
-//! `posix_timers` (a leaf) and its rlimit lock, and sends signals after.
+//! Locking: atomics only, except `run` and arming, which hold the
+//! group's `posix_timers` while they decide and store the group's state
+//! (`run` takes each timer's `inner` and the rlimit lock inside it);
+//! the group's CPU time, which may take TASKLIST, is read before it.
+//! Signals go out after it is dropped.
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -185,6 +188,16 @@ pub fn sample_now(clock: CpuClock, pid: crate::task::Pid) -> Option<u64> {
     }
 }
 
+/// Lower group `sig`'s cached expiry of `s` to `at`, keeping its totals
+/// (restarted from `sample`, a fresh group CPU time, if `run` stopped
+/// them meanwhile). Under `posix_timers`, like the end of `run`, so a
+/// pass that found nothing armed cannot stop or overwrite this one.
+fn arm_group(sig: &crate::signal::SignalStruct, s: Sample, at: u64, sample: (u64, u64)) {
+    let _reg = sig.posix_timers.lock();
+    sig.cputimer.start(sample);
+    sig.cputimer.arm(s, at);
+}
+
 /// A timer on `clock` expires at `at`: lower the cache that sees it
 pub fn arm(clock: CpuClock, at: u64) {
     match clock.thread {
@@ -198,7 +211,8 @@ pub fn arm(clock: CpuClock, at: u64) {
         }
         None => {
             if let Some(g) = my_group() {
-                g.cputimer.arm(clock.sample, at);
+                let sample = group_sample(&g, crate::task::percpu::current_pid());
+                arm_group(&g, clock.sample, at, sample);
             }
         }
     }
@@ -245,12 +259,15 @@ pub fn run() {
         return;
     };
     let mine = me.cputime(crate::time::monotonic_ns());
-    let group = sig.cputimer.totals();
     let mut fire: Vec<Fire> = Vec::new();
     let mut thread_next = [NONE; 2];
     let mut proc_next = [NONE; 2];
     let mut any_process = false;
-    for t in sig.posix_timers.lock().timers() {
+    // The whole pass under `posix_timers`: arming (`arm_group`) takes
+    // it too, so what is decided below holds until it is stored
+    let reg = sig.posix_timers.lock();
+    let group = sig.cputimer.totals();
+    for t in reg.timers() {
         let Some(clock) = t.cpu_clock() else {
             continue;
         };
@@ -294,6 +311,7 @@ pub fn run() {
     } else {
         sig.cputimer.stop();
     }
+    drop(reg);
     for f in fire {
         match f {
             Fire::Thread(t, s) => {
@@ -355,8 +373,8 @@ fn rlimit_cpu(
 /// group's totals and look at the limit at its next tick
 pub fn rlimit_cpu_changed(sig: &crate::signal::SignalStruct, pid: crate::task::Pid) {
     if rlimit_finite(sig) {
-        group_sample(sig, pid);
-        sig.cputimer.arm(Sample::Prof, 0);
+        let sample = group_sample(sig, pid);
+        arm_group(sig, Sample::Prof, 0, sample);
     }
 }
 
