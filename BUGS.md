@@ -6,12 +6,10 @@ These are safe fns or patterns whose use leads to undefined behaviour.
 None is known to fail today, but each is a soundness bug:
 
 - **Drivers:**
-  - PCI ECAM `read32`/`write32` do no bounds or alignment checks.
   - `DmaCoherent` has public fields and `dma_free_coherent` is safe.
   - `dma_map_single` takes a raw pointer, not tied to the buffer's
     lifetime.
   - xHCI `OutputContext` hands out `&` into memory the device writes.
-  - virtio `cfg16`/`cfg32` bounds checks can overflow.
 - **Safe fns that take addresses:**
   - `load_mm`, `dtb::blob`, `psci_cpu_on`.
   - `save_for_clone_child`, `write_fs_base`, `fpu::restore`.
