@@ -1,43 +1,12 @@
 //! Multiboot2 information structure parsing
 //!
-//! Parses the multiboot2 info structure passed by the bootloader
-//! to extract the memory map and other boot information.
+//! The bootloader passes the physical address of the info structure;
+//! `set_boot` records it once, and everything else reads it as a byte
+//! slice (through the direct map) with bounds-checked accesses.
+
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::arch::phys_to_virt;
-
-/// Multiboot2 info header
-#[repr(C)]
-pub struct Multiboot2Info {
-    pub total_size: u32,
-    pub reserved: u32,
-    // Tags follow...
-}
-
-/// Multiboot2 tag header
-#[repr(C)]
-pub struct TagHeader {
-    pub tag_type: u32,
-    pub size: u32,
-}
-
-/// Memory map tag (type 6)
-#[repr(C)]
-pub struct MemoryMapTag {
-    pub header: TagHeader,
-    pub entry_size: u32,
-    pub entry_version: u32,
-    // Entries follow...
-}
-
-/// Memory map entry
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct MemoryMapEntry {
-    pub base_addr: u64,
-    pub length: u64,
-    pub mem_type: u32, // 1 = available RAM
-    pub reserved: u32,
-}
 
 /// Tag types
 pub const TAG_END: u32 = 0;
@@ -49,242 +18,167 @@ pub const TAG_FRAMEBUFFER: u32 = 8;
 /// Memory types
 pub const MEMORY_AVAILABLE: u32 = 1;
 
-/// Tags of the info structure; the bootloader passes physical
-/// addresses, read through the direct map
-struct Tags {
-    cur: *const u8,
-    end: *const u8,
-}
+/// Framebuffer type: direct RGB (the only one supported)
+pub const FRAMEBUFFER_TYPE_RGB: u8 = 1;
 
-impl Iterator for Tags {
-    type Item = *const TagHeader;
+/// Physical address of the info structure (0: none)
+static INFO_PHYS: AtomicU64 = AtomicU64::new(0);
 
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.cur >= self.end {
-            return None;
-        }
-        // A tag must hold its header and end inside the info structure
-        // (a short or overlong size ends the walk)
-        let room = self.end as usize - self.cur as usize;
-        if room < 8 {
-            return None;
-        }
-        let tag = self.cur as *const TagHeader;
-        let (kind, size) = unsafe { ((*tag).tag_type, (*tag).size as usize) };
-        if kind == TAG_END || size < 8 || size > room {
-            return None;
-        }
-        self.cur = unsafe { self.cur.add(size.next_multiple_of(8).min(room)) };
-        Some(tag)
-    }
-}
-
+/// Record the bootloader's info structure
+///
 /// # Safety
-/// `info` is the physical address of a valid multiboot2 info structure
-/// (or 0)
-unsafe fn tags(info: u64) -> Tags {
-    if info == 0 {
-        let p = core::ptr::null();
-        return Tags { cur: p, end: p };
-    }
-    let base = phys_to_virt(info) as *const u8;
-    // At least the fixed header, at most 1MB (a bogus size would walk
-    // far past the structure)
-    let total = unsafe { (*(base as *const Multiboot2Info)).total_size }.clamp(8, 1 << 20);
-    Tags {
-        cur: unsafe { base.add(8) },
-        end: unsafe { base.add(total as usize) },
-    }
+/// `pa` is 0, or the physical address of a multiboot2 info structure
+/// readable through the direct map; it and every module it lists stay
+/// reserved for the kernel's life (`boot_ranges`).
+pub unsafe fn set_boot(pa: u64) {
+    INFO_PHYS.store(pa, Ordering::Relaxed);
 }
 
-/// First tag of a type
-unsafe fn find(info: u64, kind: u32) -> Option<*const TagHeader> {
-    unsafe { tags(info) }.find(|&t| unsafe { (*t).tag_type } == kind)
+/// The info structure's physical address (0: none)
+pub fn boot_phys() -> u64 {
+    INFO_PHYS.load(Ordering::Relaxed)
 }
 
-/// NUL-terminated string in the `len` bytes at `p`
-unsafe fn cstr(p: *const u8, len: usize) -> Option<&'static str> {
-    let n = (0..len).find(|&i| unsafe { *p.add(i) } == 0).unwrap_or(len);
-    core::str::from_utf8(unsafe { core::slice::from_raw_parts(p, n) }).ok()
+/// The info structure as bytes: `total_size` long, clamped to [8, 1MB]
+/// (a bogus size never walks far past the structure)
+fn info() -> Option<&'static [u8]> {
+    let pa = boot_phys();
+    if pa == 0 {
+        return None;
+    }
+    let base = phys_to_virt(pa) as *const u8;
+    // SAFETY: the header's 8 bytes of the recorded structure (`set_boot`)
+    let head = unsafe { core::slice::from_raw_parts(base, 8) };
+    let total = (le32(head, 0)? as usize).clamp(8, 1 << 20);
+    // SAFETY: the structure's `total` bytes (`set_boot`)
+    Some(unsafe { core::slice::from_raw_parts(base, total) })
+}
+
+fn le32(b: &[u8], at: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(b.get(at..at + 4)?.try_into().ok()?))
+}
+
+fn le64(b: &[u8], at: usize) -> Option<u64> {
+    Some(u64::from_le_bytes(b.get(at..at + 8)?.try_into().ok()?))
+}
+
+/// The tags, each as its bytes (header included)
+fn tags() -> impl Iterator<Item = &'static [u8]> {
+    let mut rest = info().map_or(&[][..], |b| &b[8..]);
+    core::iter::from_fn(move || {
+        let kind = le32(rest, 0)?;
+        let size = le32(rest, 4)? as usize;
+        // A tag holds its header and ends inside the structure (a short
+        // or overlong size ends the walk)
+        if kind == TAG_END || size < 8 || size > rest.len() {
+            return None;
+        }
+        let tag = &rest[..size];
+        rest = &rest[size.next_multiple_of(8).min(rest.len())..];
+        Some(tag)
+    })
+}
+
+/// The tags of one type
+fn tags_of(kind: u32) -> impl Iterator<Item = &'static [u8]> {
+    tags().filter(move |t| le32(t, 0) == Some(kind))
+}
+
+/// NUL-terminated UTF-8 string at the start of `b`
+fn cstr(b: &'static [u8]) -> Option<&'static str> {
+    let n = b.iter().position(|&c| c == 0).unwrap_or(b.len());
+    core::str::from_utf8(&b[..n]).ok()
 }
 
 /// Call `f(base, length, type)` for every memory map entry
-///
-/// # Safety
-/// `info` is the physical address of a valid multiboot2 info structure.
-pub unsafe fn for_each_region(info: u64, mut f: impl FnMut(u64, u64, u32)) {
-    let Some(tag) = (unsafe { find(info, TAG_MEMORY_MAP) }) else {
+pub fn for_each_region(mut f: impl FnMut(u64, u64, u32)) {
+    let Some(tag) = tags_of(TAG_MEMORY_MAP).next() else {
         return;
     };
-    unsafe {
-        // Step by the tag's entry_size (GRUB, Linux), which must cover
-        // the entry read; every entry lies inside the tag
-        let len = (*tag).size as usize;
-        let want = core::mem::size_of::<MemoryMapEntry>();
-        if len < 16 {
-            return;
-        }
-        let mt = tag as *const MemoryMapTag;
-        let step = (*mt).entry_size as usize;
-        if step < want {
-            return;
-        }
-        let end = (tag as *const u8).add(len);
-        let mut p = (tag as *const u8).add(16);
-        while (end as usize).saturating_sub(p as usize) >= want {
-            let e = core::ptr::read_unaligned(p as *const MemoryMapEntry);
-            f(e.base_addr, e.length, e.mem_type);
-            p = p.add(step);
+    // Step by the tag's entry_size (GRUB, Linux), which must cover the
+    // 24-byte entry read
+    let Some(step) = le32(tag, 8).map(|s| s as usize).filter(|&s| s >= 24) else {
+        return;
+    };
+    for e in tag.get(16..).unwrap_or(&[]).chunks(step) {
+        if let (Some(base), Some(len), Some(kind)) = (le64(e, 0), le64(e, 8), le32(e, 16)) {
+            f(base, len, kind);
         }
     }
 }
 
-/// Extract the kernel command line from multiboot2 info
-///
-/// # Safety
-/// `info` is the physical address of a valid multiboot2 info structure.
-pub unsafe fn get_cmdline(info: u64) -> Option<&'static str> {
-    let tag = unsafe { find(info, TAG_CMDLINE) }?;
-    unsafe { cstr((tag as *const u8).add(8), (*tag).size as usize - 8) }
+/// The kernel command line
+pub fn get_cmdline() -> Option<&'static str> {
+    cstr(tags_of(TAG_CMDLINE).next()?.get(8..)?)
 }
 
 /// Module tag fields: (physical start, physical end, cmdline)
-unsafe fn module(tag: *const TagHeader) -> (u64, u64, Option<&'static str>) {
-    unsafe {
-        let p = tag as *const u8;
-        let size = (*tag).size as usize;
-        if size < 16 {
-            return (0, 0, None);
-        }
-        let start = *(p.add(8) as *const u32) as u64;
-        let end = *(p.add(12) as *const u32) as u64;
-        (start, end, cstr(p.add(16), size - 16))
-    }
+fn module(tag: &'static [u8]) -> Option<(u64, u64, Option<&'static str>)> {
+    let start = le32(tag, 8)? as u64;
+    let end = le32(tag, 12)? as u64;
+    Some((start, end, tag.get(16..).and_then(cstr)))
 }
 
 /// Every physical range the bootloader placed in memory that the
 /// kernel still reads: the info structure itself and each module
-///
-/// # Safety
-/// `info` is the physical address of a valid multiboot2 info structure.
-pub unsafe fn boot_ranges(info: u64, mut f: impl FnMut(&'static str, u64, u64)) {
-    if info == 0 {
+pub fn boot_ranges(mut f: impl FnMut(&'static str, u64, u64)) {
+    let Some(b) = info() else {
         return;
-    }
-    unsafe {
-        let total = (*(phys_to_virt(info) as *const Multiboot2Info)).total_size;
-        f("multiboot info", info, info + total as u64);
-        for tag in tags(info).filter(|&t| (*t).tag_type == TAG_MODULE) {
-            let (start, end, _) = module(tag);
-            if start < end {
-                f("multiboot module", start, end);
-            }
+    };
+    let pa = boot_phys();
+    f("multiboot info", pa, pa + b.len() as u64);
+    for (start, end, _) in tags_of(TAG_MODULE).filter_map(module) {
+        if start < end {
+            f("multiboot module", start, end);
         }
     }
 }
 
 /// Find a module loaded by the bootloader (GRUB `module2`) whose
 /// command line contains `name`; its data through the direct map
-///
-/// # Safety
-/// `info` is the physical address of a valid multiboot2 info structure;
-/// the module memory must stay reserved.
-pub unsafe fn find_module(info: u64, name: &str) -> Option<&'static [u8]> {
-    unsafe {
-        for tag in tags(info).filter(|&t| (*t).tag_type == TAG_MODULE) {
-            let (start, end, cmdline) = module(tag);
-            if start < end && cmdline.is_some_and(|c| c.contains(name)) {
-                let p = phys_to_virt(start) as *const u8;
-                return Some(core::slice::from_raw_parts(p, (end - start) as usize));
-            }
-        }
-    }
-    None
+pub fn find_module(name: &str) -> Option<&'static [u8]> {
+    let (start, end, _) = tags_of(TAG_MODULE)
+        .filter_map(module)
+        .find(|&(s, e, c)| s < e && c.is_some_and(|c| c.contains(name)))?;
+    let p = phys_to_virt(start) as *const u8;
+    // SAFETY: a module the info structure lists, reserved for good
+    // (`set_boot`), `end - start` bytes
+    Some(unsafe { core::slice::from_raw_parts(p, (end - start) as usize) })
 }
 
-/// Framebuffer tag (type 8)
-///
-/// Provides information about the framebuffer set up by the bootloader.
-/// The color_info field varies based on framebuffer_type:
-/// - Type 0 (indexed): palette follows
-/// - Type 1 (direct RGB): color mask info follows
-/// - Type 2 (EGA text): no extra info
-#[repr(C, packed)]
-#[allow(dead_code)]
-pub struct FramebufferTag {
-    pub header: TagHeader,
-    pub framebuffer_addr: u64,
-    pub framebuffer_pitch: u32,
-    pub framebuffer_width: u32,
-    pub framebuffer_height: u32,
-    pub framebuffer_bpp: u8,
-    pub framebuffer_type: u8,
-    pub reserved: u16,
-    // For type 1 (direct RGB), color info follows:
-    // red_field_position: u8,
-    // red_mask_size: u8,
-    // green_field_position: u8,
-    // green_mask_size: u8,
-    // blue_field_position: u8,
-    // blue_mask_size: u8,
-}
-
-/// Framebuffer type constants
-#[allow(dead_code)]
-pub const FRAMEBUFFER_TYPE_INDEXED: u8 = 0;
-pub const FRAMEBUFFER_TYPE_RGB: u8 = 1;
-#[allow(dead_code)]
-pub const FRAMEBUFFER_TYPE_EGA_TEXT: u8 = 2;
-
-/// Parse framebuffer tag and return framebuffer info
-///
-/// Returns None if no framebuffer tag is present, info_ptr is 0,
-/// or the framebuffer type is not supported (e.g., indexed color).
-///
-/// # Safety
-/// The caller must ensure info_ptr points to valid multiboot2 info structure.
-pub unsafe fn get_framebuffer(info_ptr: u64) -> Option<crate::gfx::FramebufferInfo> {
+/// The framebuffer the bootloader set up, if it is direct RGB.
+/// Tag layout: header(8) addr(8) pitch(4) width(4) height(4) bpp(1)
+/// type(1) reserved(2), then the color info (positions and sizes).
+pub fn get_framebuffer() -> Option<crate::gfx::FramebufferInfo> {
     use crate::gfx::{FramebufferInfo, PixelFormat};
 
-    let fb_tag = unsafe { find(info_ptr, TAG_FRAMEBUFFER) }? as *const u8;
-    unsafe {
-        // Layout (packed): header(8) addr(8) pitch(4) width(4) height(4)
-        // bpp(1) type(1) reserved(2), then for direct RGB the color info
-        let addr = core::ptr::read_unaligned(fb_tag.add(8) as *const u64);
-        let pitch = core::ptr::read_unaligned(fb_tag.add(16) as *const u32);
-        let width = core::ptr::read_unaligned(fb_tag.add(20) as *const u32);
-        let height = core::ptr::read_unaligned(fb_tag.add(24) as *const u32);
-        let bpp = *fb_tag.add(28);
-        let fb_type = *fb_tag.add(29);
-
-        // Only support direct RGB framebuffer
-        if fb_type != FRAMEBUFFER_TYPE_RGB {
-            return None;
-        }
-
-        let color = fb_tag.add(32);
-        let red_pos = *color;
-        let red_size = *color.add(1);
-        let green_pos = *color.add(2);
-        let blue_pos = *color.add(4);
-
-        // XRGB8888: R at 16, G at 8, B at 0 (common UEFI GOP format)
-        // XBGR8888: B at 16, G at 8, R at 0
-        let format = if bpp == 32 && red_size == 8 {
-            if blue_pos == 16 && green_pos == 8 && red_pos == 0 {
-                PixelFormat::Xbgr8888
-            } else {
-                PixelFormat::Xrgb8888
-            }
-        } else if bpp == 16 {
-            PixelFormat::Rgb565
-        } else {
-            return None;
-        };
-
-        let size = (pitch as u64) * (height as u64);
-        Some(FramebufferInfo::new(
-            addr, size, width, height, pitch, format,
-        ))
+    let t = tags_of(TAG_FRAMEBUFFER).next()?;
+    let addr = le64(t, 8)?;
+    let pitch = le32(t, 16)?;
+    let width = le32(t, 20)?;
+    let height = le32(t, 24)?;
+    let (bpp, fb_type) = (*t.get(28)?, *t.get(29)?);
+    if fb_type != FRAMEBUFFER_TYPE_RGB {
+        return None;
     }
+    let color = t.get(32..38)?;
+    let (red_pos, red_size, green_pos, blue_pos) = (color[0], color[1], color[2], color[4]);
+
+    // XRGB8888: R at 16, G at 8, B at 0 (common UEFI GOP format)
+    // XBGR8888: B at 16, G at 8, R at 0
+    let format = if bpp == 32 && red_size == 8 {
+        if blue_pos == 16 && green_pos == 8 && red_pos == 0 {
+            PixelFormat::Xbgr8888
+        } else {
+            PixelFormat::Xrgb8888
+        }
+    } else if bpp == 16 {
+        PixelFormat::Rgb565
+    } else {
+        return None;
+    };
+    let size = (pitch as u64) * (height as u64);
+    Some(FramebufferInfo::new(
+        addr, size, width, height, pitch, format,
+    ))
 }

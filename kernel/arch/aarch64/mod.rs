@@ -522,6 +522,14 @@ impl PerCpuOps for Aarch64Arch {
 impl ContextOps for Aarch64Arch {
     type TaskContext = Aarch64TaskContext;
 
+    const ZERO_CONTEXT: Aarch64TaskContext = Aarch64TaskContext {
+        x19_x28: [0; 10],
+        fp: 0,
+        lr: 0,
+        sp: 0,
+        d8_d15: [0; 8],
+    };
+
     #[inline]
     fn new_kernel_thread_context(entry: usize, stack_top: u64) -> Self::TaskContext {
         Aarch64TaskContext::new_kernel_thread(entry, stack_top)

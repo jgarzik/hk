@@ -5,24 +5,27 @@
 
 use super::insn::*;
 
-/// Execute an eBPF program
-///
-/// # Arguments
-/// * `prog` - The eBPF program instructions
-/// * `ctx` - Pointer to context data (e.g., seccomp_data)
-/// * `ctx_len` - Length of context data in bytes
-///
-/// # Returns
-/// The value in R0 when the program exits
-///
-/// # Safety
-/// The caller must ensure `ctx` points to valid memory of at least `ctx_len` bytes.
-pub unsafe fn bpf_run(prog: &[BpfInsn], ctx: *const u8, ctx_len: usize) -> u64 {
+/// `size` bytes (1, 2, 4, 8; native endian) at `off` in `b`, if inside
+fn load(b: &[u8], off: usize, size: usize) -> Option<u64> {
+    let v = b.get(off..off.checked_add(size)?)?;
+    Some(match size {
+        1 => v[0] as u64,
+        2 => u16::from_ne_bytes([v[0], v[1]]) as u64,
+        4 => u32::from_ne_bytes([v[0], v[1], v[2], v[3]]) as u64,
+        _ => u64::from_ne_bytes([v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]]),
+    })
+}
+
+/// Execute an eBPF program over the context bytes `ctx` (e.g.,
+/// seccomp_data); returns R0 when it exits. Loads outside the context
+/// (or the scratch stack) end the program with 0.
+pub fn bpf_run(prog: &[BpfInsn], ctx: &[u8]) -> u64 {
     // eBPF has 11 64-bit registers
     let mut regs = [0u64; MAX_BPF_REG];
 
-    // R1 = context pointer
-    regs[BPF_REG_1 as usize] = ctx as u64;
+    // R1 = context pointer (an address the loads below compare against)
+    regs[BPF_REG_1 as usize] = ctx.as_ptr() as u64;
+    let ctx_len = ctx.len();
 
     // R10 = frame pointer (stack base) - we don't implement stack for seccomp
     regs[BPF_REG_10 as usize] = 0;
@@ -200,35 +203,11 @@ pub unsafe fn bpf_run(prog: &[BpfInsn], ctx: *const u8, ctx_len: usize) -> u64 {
                             _ => return 0,
                         };
 
-                        if offset + load_size > ctx_len {
+                        match load(ctx, offset, load_size) {
+                            Some(v) => regs[dst] = v,
                             // Out of bounds - return 0 (SECCOMP_RET_KILL)
-                            return 0;
+                            None => return 0,
                         }
-
-                        let ptr = unsafe { ctx.add(offset) };
-                        regs[dst] = unsafe {
-                            match size {
-                                BPF_B => *ptr as u64,
-                                BPF_H => u16::from_ne_bytes([*ptr, *ptr.add(1)]) as u64,
-                                BPF_W => u32::from_ne_bytes([
-                                    *ptr,
-                                    *ptr.add(1),
-                                    *ptr.add(2),
-                                    *ptr.add(3),
-                                ]) as u64,
-                                BPF_DW => u64::from_ne_bytes([
-                                    *ptr,
-                                    *ptr.add(1),
-                                    *ptr.add(2),
-                                    *ptr.add(3),
-                                    *ptr.add(4),
-                                    *ptr.add(5),
-                                    *ptr.add(6),
-                                    *ptr.add(7),
-                                ]),
-                                _ => return 0,
-                            }
-                        };
                     }
                     BPF_MEM => {
                         // Memory load: dst = *(size *)(src + off)
@@ -236,7 +215,7 @@ pub unsafe fn bpf_run(prog: &[BpfInsn], ctx: *const u8, ctx_len: usize) -> u64 {
 
                         // For seccomp, we only allow loads from the context
                         // Check if address is within context
-                        let ctx_start = ctx as usize;
+                        let ctx_start = ctx.as_ptr() as usize;
                         let ctx_end = ctx_start + ctx_len;
 
                         let load_size = match size {
@@ -247,31 +226,11 @@ pub unsafe fn bpf_run(prog: &[BpfInsn], ctx: *const u8, ctx_len: usize) -> u64 {
                             _ => return 0,
                         };
 
-                        if addr >= ctx_start && addr + load_size <= ctx_end {
-                            let ptr = addr as *const u8;
-                            regs[dst] = unsafe {
-                                match size {
-                                    BPF_B => *ptr as u64,
-                                    BPF_H => u16::from_ne_bytes([*ptr, *ptr.add(1)]) as u64,
-                                    BPF_W => u32::from_ne_bytes([
-                                        *ptr,
-                                        *ptr.add(1),
-                                        *ptr.add(2),
-                                        *ptr.add(3),
-                                    ]) as u64,
-                                    BPF_DW => u64::from_ne_bytes([
-                                        *ptr,
-                                        *ptr.add(1),
-                                        *ptr.add(2),
-                                        *ptr.add(3),
-                                        *ptr.add(4),
-                                        *ptr.add(5),
-                                        *ptr.add(6),
-                                        *ptr.add(7),
-                                    ]),
-                                    _ => return 0,
-                                }
-                            };
+                        if addr >= ctx_start && addr.saturating_add(load_size) <= ctx_end {
+                            match load(ctx, addr - ctx_start, load_size) {
+                                Some(v) => regs[dst] = v,
+                                None => return 0,
+                            }
                         } else {
                             // Check if it's a stack access
                             let stack_base = stack.as_ptr() as usize;

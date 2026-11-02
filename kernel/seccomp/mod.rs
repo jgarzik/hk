@@ -120,6 +120,12 @@ pub struct SeccompData {
     /// Syscall arguments (always 64-bit, regardless of arch)
     pub args: [u64; 6],
 }
+crate::pod!(SeccompData {
+    nr,
+    arch,
+    instruction_pointer,
+    args
+});
 
 impl SeccompData {
     /// Size of the seccomp_data struct in bytes

@@ -945,8 +945,7 @@ crate::pod!(Timex {
 
 impl Default for Timex {
     fn default() -> Self {
-        // Zero-initialize all fields
-        unsafe { core::mem::zeroed() }
+        <Self as crate::pod::FromBytes>::zeroed()
     }
 }
 

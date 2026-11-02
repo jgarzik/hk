@@ -126,9 +126,7 @@ impl HrTimer {
     }
 
     fn home(&self) -> &'static HrBase {
-        let b = self.base.load(Ordering::Acquire);
-        // SAFETY: bases are static
-        if let Some(b) = unsafe { b.as_ref() } {
+        if let Some(b) = base_ref(self.base.load(Ordering::Acquire)) {
             return b;
         }
         let cpu = crate::cpu::try_this_id().unwrap_or(0);
@@ -141,8 +139,7 @@ impl HrTimer {
             Ordering::Acquire,
         ) {
             Ok(_) => want,
-            // SAFETY: as above
-            Err(cur) => unsafe { &*cur },
+            Err(cur) => base_ref(cur).expect("a stored base is never null"),
         }
     }
 
@@ -150,8 +147,7 @@ impl HrTimer {
     /// (Linux lock_hrtimer_base); None if it was never started
     fn lock_base(&self) -> Option<(&'static HrBase, IrqSpinlockGuard<'static, HrQueues>)> {
         loop {
-            // SAFETY: bases are static
-            let base = unsafe { self.base.load(Ordering::Acquire).as_ref() }?;
+            let base = base_ref(self.base.load(Ordering::Acquire))?;
             let q = base.q.lock();
             if core::ptr::eq(self.base.load(Ordering::Acquire), base) {
                 return Some((base, q));
@@ -406,8 +402,10 @@ fn tick_fire(t: &HrTimer) {
     if next <= now {
         next = now + TICK_NS;
     }
-    // SAFETY: a static
-    unsafe { Pin::new_unchecked(t) }.start(next, HrClock::Monotonic);
+    // The tick is this CPU's static TICK (its callback runs on its CPU)
+    let tick = TICK.this();
+    debug_assert!(core::ptr::eq(tick, t));
+    Pin::static_ref(tick).start(next, HrClock::Monotonic);
 }
 
 /// The clock event interrupt of this CPU (any arch, interrupts off):
@@ -430,8 +428,7 @@ pub fn interrupt() {
     if !tick.pending() && tick.base.load(Ordering::Relaxed).is_null() {
         // First interrupt with a clock: the tick becomes a timer
         let now = crate::time::monotonic_ns();
-        // SAFETY: a static
-        unsafe { Pin::new_unchecked(tick) }.start(now + TICK_NS, HrClock::Monotonic);
+        Pin::static_ref(tick).start(now + TICK_NS, HrClock::Monotonic);
     }
     let [hard, soft] = BASES.get(cpu);
     hard.run();
@@ -487,4 +484,14 @@ fn wakeup_fire(t: &HrTimer) {
     // SAFETY: the sleeper, which cancels the timer before it returns
     let task = unsafe { &*(t.data() as *const crate::task::percpu::KernelTask) };
     crate::task::percpu::try_to_wake_up(task, crate::task::percpu::WakeMode::Any);
+}
+
+/// The base `p` names (null: none)
+///
+/// # Invariants
+/// `base` fields hold null or the address of a static per-CPU base: only
+/// `home` stores one, from `base_of`.
+fn base_ref(p: *mut HrBase) -> Option<&'static HrBase> {
+    // SAFETY: null or a static base (above)
+    unsafe { p.as_ref() }
 }

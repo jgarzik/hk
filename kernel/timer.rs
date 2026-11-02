@@ -103,9 +103,7 @@ impl TimerList {
 
     /// Its base: the one it was first armed on, else this CPU's
     fn home(&self) -> &'static TimerBase {
-        let b = self.base.load(Ordering::Acquire);
-        // SAFETY: bases are static
-        if let Some(b) = unsafe { b.as_ref() } {
+        if let Some(b) = base_ref(self.base.load(Ordering::Acquire)) {
             return b;
         }
         let want = base_of(crate::cpu::try_this_id().unwrap_or(0), self.flags);
@@ -122,8 +120,7 @@ impl TimerList {
             Ordering::Acquire,
         ) {
             Ok(_) => want,
-            // SAFETY: as above
-            Err(cur) => unsafe { &*cur },
+            Err(cur) => base_ref(cur).expect("a stored base is never null"),
         }
     }
 
@@ -155,8 +152,7 @@ impl TimerList {
     /// Disarm (Linux del_timer / timer_delete); true if it was pending.
     /// A callback already running may still be running.
     pub fn del_timer(&self) -> bool {
-        // SAFETY: bases are static
-        let Some(base) = (unsafe { self.base.load(Ordering::Acquire).as_ref() }) else {
+        let Some(base) = base_ref(self.base.load(Ordering::Acquire)) else {
             return false;
         };
         base.wheel.lock().detach(self)
@@ -166,8 +162,7 @@ impl TimerList {
     /// del_timer_sync / timer_delete_sync); thread context unless HARD,
     /// never from its own callback
     pub fn del_timer_sync(&self) -> bool {
-        // SAFETY: bases are static
-        let Some(base) = (unsafe { self.base.load(Ordering::Acquire).as_ref() }) else {
+        let Some(base) = base_ref(self.base.load(Ordering::Acquire)) else {
             return false;
         };
         let me = self as *const TimerList as *mut TimerList;
@@ -464,4 +459,14 @@ fn alarm_fire(t: &TimerList) {
     // SAFETY: set by `arm` to the static alarm owning `t`
     let a = unsafe { &*(t.data() as *const Alarm) };
     (a.cb)(0);
+}
+
+/// The base `p` names (null: none)
+///
+/// # Invariants
+/// `base` fields hold null or the address of a static per-CPU base: only
+/// `home` stores one, from `base_of`.
+fn base_ref(p: *mut TimerBase) -> Option<&'static TimerBase> {
+    // SAFETY: null or a static base (above)
+    unsafe { p.as_ref() }
 }

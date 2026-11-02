@@ -81,11 +81,7 @@ impl SeccompFilter {
     /// Lower action values are more restrictive.
     pub fn run(&self, data: &SeccompData) -> u32 {
         // Run this filter
-        let ctx = data as *const SeccompData as *const u8;
-        let ctx_len = SeccompData::SIZE;
-
-        // SAFETY: ctx points to valid SeccompData, ctx_len is correct
-        let result = unsafe { bpf_run(self.prog.insns(), ctx, ctx_len) } as u32;
+        let result = bpf_run(self.prog.insns(), crate::pod::IntoBytes::as_bytes(data)) as u32;
 
         // If we have a previous filter, run it too
         if let Some(ref prev) = self.prev {

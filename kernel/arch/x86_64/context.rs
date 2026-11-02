@@ -335,6 +335,17 @@ use super::X86_64Arch;
 impl ContextOps for X86_64Arch {
     type TaskContext = TaskContext;
 
+    const ZERO_CONTEXT: TaskContext = TaskContext {
+        r15: 0,
+        r14: 0,
+        r13: 0,
+        r12: 0,
+        rbx: 0,
+        rbp: 0,
+        rsp: 0,
+        rip: 0,
+    };
+
     #[inline]
     fn new_kernel_thread_context(entry: usize, stack_top: u64) -> Self::TaskContext {
         TaskContext::new_kernel_thread(entry, stack_top)

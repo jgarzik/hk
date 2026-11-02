@@ -20,6 +20,7 @@ use alloc::vec::Vec;
 
 use crate::mm::filemap::{self, Aops, PAGE_SIZE};
 use crate::mm::page::frame_bytes;
+use crate::pod::{FromBytes, IntoBytes};
 use crate::storage::BlockDevice;
 use crate::storage::blkdev::{BioOp, bdev_rw_bytes};
 
@@ -303,6 +304,38 @@ pub struct VfatBootSector {
     /// Filesystem type string ("FAT32   ")
     pub fs_type: [u8; 8],
 }
+// On-disk structures are little-endian, as hk's CPUs are: their bytes
+// are the in-memory layout (packed)
+const _: () = assert!(cfg!(target_endian = "little"));
+crate::pod!(VfatBootSector {
+    jump_boot,
+    oem_name,
+    bytes_per_sector,
+    sectors_per_cluster,
+    reserved_sector_count,
+    num_fats,
+    root_entry_count,
+    total_sectors_16,
+    media_type,
+    fat_size_16,
+    sectors_per_track,
+    num_heads,
+    hidden_sectors,
+    total_sectors_32,
+    fat_size_32,
+    ext_flags,
+    fs_version,
+    root_cluster,
+    fs_info,
+    backup_boot_sector,
+    reserved,
+    drive_number,
+    reserved1,
+    boot_signature,
+    volume_id,
+    volume_label,
+    fs_type
+});
 
 /// VFAT Directory Entry (32 bytes)
 #[repr(C, packed)]
@@ -335,6 +368,21 @@ pub struct VfatDirEntry {
     /// File size in bytes
     pub file_size: u32,
 }
+crate::pod!(VfatDirEntry {
+    name,
+    ext,
+    attr,
+    nt_reserved,
+    create_time_tenth,
+    create_time,
+    create_date,
+    access_date,
+    first_cluster_hi,
+    write_time,
+    write_date,
+    first_cluster_lo,
+    file_size
+});
 
 /// VFAT Long Filename Entry (32 bytes)
 #[repr(C, packed)]
@@ -357,6 +405,16 @@ pub struct VfatLfnEntry {
     /// Name characters 12-13 (UCS-2)
     pub name3: [u16; 2],
 }
+crate::pod!(VfatLfnEntry {
+    order,
+    name1,
+    attr,
+    entry_type,
+    checksum,
+    name2,
+    first_cluster,
+    name3
+});
 
 /// Directory entry attributes
 pub mod attr {
@@ -759,25 +817,11 @@ fn lfn_entry_chars(entry: &VfatLfnEntry) -> Vec<char> {
         }
     };
 
-    // Read fields safely from packed struct using read_unaligned
-    // name1: 5 chars, name2: 6 chars, name3: 2 chars
-    unsafe {
-        let name1_ptr = core::ptr::addr_of!(entry.name1);
-        let name2_ptr = core::ptr::addr_of!(entry.name2);
-        let name3_ptr = core::ptr::addr_of!(entry.name3);
-
-        for i in 0..5 {
-            let c = core::ptr::read_unaligned((name1_ptr as *const u16).add(i));
-            add_char(&mut chars, c);
-        }
-        for i in 0..6 {
-            let c = core::ptr::read_unaligned((name2_ptr as *const u16).add(i));
-            add_char(&mut chars, c);
-        }
-        for i in 0..2 {
-            let c = core::ptr::read_unaligned((name3_ptr as *const u16).add(i));
-            add_char(&mut chars, c);
-        }
+    // name1: 5 chars, name2: 6 chars, name3: 2 chars (packed fields,
+    // copied out by value)
+    let (n1, n2, n3) = (entry.name1, entry.name2, entry.name3);
+    for c in n1.into_iter().chain(n2).chain(n3) {
+        add_char(&mut chars, c);
     }
 
     chars
@@ -819,8 +863,7 @@ fn read_directory_entries(
             // Check if this is a long filename entry
             if (attr & attr::LONG_NAME_MASK) == attr::LONG_NAME {
                 // Parse as LFN entry
-                let lfn: VfatLfnEntry =
-                    unsafe { core::ptr::read_unaligned(buf.as_ptr() as *const _) };
+                let lfn = VfatLfnEntry::read_from(&buf).expect("32-byte entry");
                 let order = lfn.order & 0x3F;
                 let is_last = (lfn.order & 0x40) != 0;
 
@@ -833,8 +876,7 @@ fn read_directory_entries(
                 lfn_parts.push((order, chars));
             } else {
                 // Parse as regular directory entry
-                let dirent: VfatDirEntry =
-                    unsafe { core::ptr::read_unaligned(buf.as_ptr() as *const _) };
+                let dirent = VfatDirEntry::read_from(&buf).expect("32-byte entry");
 
                 // Skip volume labels
                 if (attr & attr::VOLUME_ID) != 0 {
@@ -1048,23 +1090,10 @@ fn create_lfn_entries(name: &str, short_name: &[u8; 11]) -> Vec<VfatLfnEntry> {
             name3: [0u16; 2],
         };
 
-        // Copy chars to name fields (use unsafe for packed struct unaligned writes)
-        // Use addr_of_mut! to avoid creating intermediate references to packed fields
-        unsafe {
-            use core::ptr::addr_of_mut;
-            let name1_ptr = addr_of_mut!(entry.name1) as *mut u16;
-            for (k, &c) in chunk[0..5].iter().enumerate() {
-                name1_ptr.add(k).write_unaligned(c);
-            }
-            let name2_ptr = addr_of_mut!(entry.name2) as *mut u16;
-            for (k, &c) in chunk[5..11].iter().enumerate() {
-                name2_ptr.add(k).write_unaligned(c);
-            }
-            let name3_ptr = addr_of_mut!(entry.name3) as *mut u16;
-            for (k, &c) in chunk[11..13].iter().enumerate() {
-                name3_ptr.add(k).write_unaligned(c);
-            }
-        }
+        // The name fields (packed: assigned by value)
+        entry.name1 = chunk[0..5].try_into().expect("5 chars");
+        entry.name2 = chunk[5..11].try_into().expect("6 chars");
+        entry.name3 = chunk[11..13].try_into().expect("2 chars");
 
         entries.push(entry);
     }
@@ -1202,49 +1231,8 @@ fn create_dir_entry_with_lfn(
         let entry_index = first_index + i;
         let mut entry_bytes = [0u8; 32];
 
-        // Convert VfatLfnEntry to bytes (use unsafe for packed struct unaligned reads)
-        // Use addr_of! to avoid creating intermediate references to packed fields
-        entry_bytes[0] = lfn.order;
-        // name1: 5 UCS-2 chars at offset 1
-        unsafe {
-            use core::ptr::addr_of;
-            let name1_ptr = addr_of!(lfn.name1) as *const u16;
-            for j in 0..5 {
-                let c = name1_ptr.add(j).read_unaligned();
-                let offset = 1 + j * 2;
-                entry_bytes[offset..offset + 2].copy_from_slice(&c.to_le_bytes());
-            }
-        }
-        entry_bytes[11] = lfn.attr;
-        entry_bytes[12] = lfn.entry_type;
-        entry_bytes[13] = lfn.checksum;
-        // name2: 6 UCS-2 chars at offset 14
-        unsafe {
-            use core::ptr::addr_of;
-            let name2_ptr = addr_of!(lfn.name2) as *const u16;
-            for j in 0..6 {
-                let c = name2_ptr.add(j).read_unaligned();
-                let offset = 14 + j * 2;
-                entry_bytes[offset..offset + 2].copy_from_slice(&c.to_le_bytes());
-            }
-        }
-        // first_cluster at offset 26 (always 0 for LFN)
-        unsafe {
-            use core::ptr::addr_of;
-            let fc_ptr = addr_of!(lfn.first_cluster);
-            let fc = fc_ptr.read_unaligned();
-            entry_bytes[26..28].copy_from_slice(&fc.to_le_bytes());
-        }
-        // name3: 2 UCS-2 chars at offset 28
-        unsafe {
-            use core::ptr::addr_of;
-            let name3_ptr = addr_of!(lfn.name3) as *const u16;
-            for j in 0..2 {
-                let c = name3_ptr.add(j).read_unaligned();
-                let offset = 28 + j * 2;
-                entry_bytes[offset..offset + 2].copy_from_slice(&c.to_le_bytes());
-            }
-        }
+        // The entry's on-disk bytes (packed, little-endian: its layout)
+        entry_bytes.copy_from_slice(lfn.as_bytes());
 
         write_raw_dir_entry(sb_data, parent_cluster, entry_index, &entry_bytes)?;
     }
@@ -1411,8 +1399,7 @@ fn delete_dir_entry(
             // Track and collect LFN entries
             let attr_byte = buf[11];
             if (attr_byte & attr::LONG_NAME_MASK) == attr::LONG_NAME {
-                let lfn: VfatLfnEntry =
-                    unsafe { core::ptr::read_unaligned(buf.as_ptr() as *const _) };
+                let lfn = VfatLfnEntry::read_from(&buf).expect("32-byte entry");
                 let order = lfn.order & 0x3F;
                 let is_last = (lfn.order & 0x40) != 0;
 
@@ -2182,8 +2169,8 @@ fn vfat_mount_dev(
     let mut boot_sector_buf = [0u8; 512];
     read_bytes(&bdev, 0, &mut boot_sector_buf)?;
 
-    let boot_sector: VfatBootSector =
-        unsafe { core::ptr::read_unaligned(boot_sector_buf.as_ptr() as *const _) };
+    let boot_sector =
+        VfatBootSector::read_from(&boot_sector_buf).expect("boot sector fits 512 bytes");
 
     // Validate FAT32
     // Check for valid bytes per sector (must be power of 2, 512-4096)

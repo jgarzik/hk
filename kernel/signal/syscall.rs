@@ -591,33 +591,28 @@ pub struct SigInfo {
     _sifields: SigInfoFields,
 }
 
-/// Signal-specific fields union (128 bytes total for siginfo_t)
+/// Signal-specific fields (128 bytes total for siginfo_t): hk fills
+/// only the kill variant (sender pid, uid); the rest is zero
 #[repr(C)]
-#[derive(Clone, Copy)]
-union SigInfoFields {
-    /// Common: sender PID and UID
+#[derive(Debug, Clone, Copy)]
+struct SigInfoFields {
     kill: SigInfoKill,
-    /// Padding to ensure 128-byte total size for siginfo_t
-    /// (128 - 16 bytes for header = 112 bytes)
-    _pad: [u8; 112],
+    /// The rest of the 112-byte union
+    _rest: [u8; 104],
 }
 
 impl Default for SigInfoFields {
     fn default() -> Self {
-        Self { _pad: [0; 112] }
-    }
-}
-
-impl core::fmt::Debug for SigInfoFields {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        // Safety: accessing _pad is always safe
-        f.debug_struct("SigInfoFields").finish()
+        Self {
+            kill: SigInfoKill::default(),
+            _rest: [0; 104],
+        }
     }
 }
 
 /// Kill signal info (SI_USER, SI_TKILL)
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default)]
 struct SigInfoKill {
     /// Sender's PID
     si_pid: i32,
@@ -658,6 +653,7 @@ impl SigInfo {
                     si_pid: pid,
                     si_uid: uid,
                 },
+                _rest: [0; 104],
             },
         }
     }
@@ -681,8 +677,7 @@ impl SigInfo {
             return Err(14);
         }
         // Write kill fields (offset 16)
-        // Safety: We always initialize _sifields
-        let kill = unsafe { self._sifields.kill };
+        let kill = self._sifields.kill;
         if put_user::<Uaccess, i32>(ptr + 16, kill.si_pid).is_err() {
             return Err(14);
         }
@@ -739,6 +734,7 @@ impl SigInfo {
             _pad0: 0,
             _sifields: SigInfoFields {
                 kill: SigInfoKill { si_pid, si_uid },
+                _rest: [0; 104],
             },
         })
     }
@@ -750,8 +746,7 @@ impl SigInfo {
 
     /// Get sender's PID from siginfo
     pub fn pid(&self) -> i32 {
-        // Safety: We always initialize _sifields with kill variant
-        unsafe { self._sifields.kill.si_pid }
+        self._sifields.kill.si_pid
     }
 }
 

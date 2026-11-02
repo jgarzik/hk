@@ -7,7 +7,6 @@
 //! change in interrupt context.
 
 use core::cell::UnsafeCell;
-use core::mem::MaybeUninit;
 use core::sync::atomic::{
     AtomicBool, AtomicI64, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, Ordering,
 };
@@ -132,8 +131,9 @@ impl SchedEntity {
             exec_start: AtomicU64::new(0),
             requeue_tail: AtomicBool::new(false),
             link: Link::new(),
-            // SAFETY: a switch frame is plain integers; zero is valid
-            ctx: UnsafeCell::new(unsafe { MaybeUninit::zeroed().assume_init() }),
+            ctx: UnsafeCell::new(
+                <crate::arch::CurrentArch as crate::arch::ContextOps>::ZERO_CONTEXT,
+            ),
             owns_stack: AtomicBool::new(true),
             wake_q: AtomicPtr::new(core::ptr::null_mut()),
         }

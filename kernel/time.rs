@@ -17,7 +17,7 @@
 //!
 //! The seqlock ensures readers get consistent snapshots without blocking.
 
-use ::core::sync::atomic::{AtomicI32, AtomicI64, AtomicPtr, AtomicU32, AtomicU64, Ordering};
+use ::core::sync::atomic::{AtomicI32, AtomicI64, AtomicU32, AtomicU64, Ordering};
 
 use crate::arch::IrqSpinlock;
 
@@ -174,7 +174,7 @@ pub struct TimeKeeper {
     initialized: AtomicU32,
 
     /// Stored function pointer for reading cycles (set during init)
-    read_cycles_fn: AtomicPtr<()>,
+    read_cycles_fn: spin::Once<fn() -> u64>,
 }
 
 impl Default for TimeKeeper {
@@ -196,7 +196,7 @@ impl TimeKeeper {
             shift: AtomicU32::new(0),
             tsc_freq_hz: AtomicU64::new(0),
             initialized: AtomicU32::new(0),
-            read_cycles_fn: AtomicPtr::new(null_read_tsc as *mut ()),
+            read_cycles_fn: spin::Once::new(),
         }
     }
 
@@ -206,8 +206,7 @@ impl TimeKeeper {
     /// Useful for code that needs to call `read()` but doesn't have
     /// direct access to architecture-specific modules.
     pub fn get_read_cycles(&self) -> fn() -> u64 {
-        let ptr = self.read_cycles_fn.load(Ordering::Relaxed);
-        unsafe { ::core::mem::transmute(ptr) }
+        self.read_cycles_fn.get().copied().unwrap_or(null_read_tsc)
     }
 
     /// Initialize the timekeeper with RTC time and TSC frequency
@@ -218,8 +217,7 @@ impl TimeKeeper {
     /// * `read_tsc` - Function to read the current TSC value
     pub fn init(&self, rtc_time_secs: i64, tsc_freq_hz: u64, read_tsc: fn() -> u64) {
         // Store the read_tsc function for later use
-        self.read_cycles_fn
-            .store(read_tsc as *mut (), Ordering::Relaxed);
+        self.read_cycles_fn.call_once(|| read_tsc);
 
         // Calculate mult/shift for cycles->ns conversion
         // We want: ns = cycles * 1_000_000_000 / freq

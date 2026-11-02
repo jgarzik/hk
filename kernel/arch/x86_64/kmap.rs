@@ -140,19 +140,17 @@ trait RamMap {
 /// The boot memory map: available, ACPI and NVS memory plus the first
 /// 1MB (BIOS data, VGA text buffer, AP trampoline). Read in place, as
 /// many regions as firmware reports (no copy to a fixed array).
-struct BootRam(u64);
+struct BootRam;
 
 impl RamMap for BootRam {
     fn each(&self, f: &mut dyn FnMut(u64, u64)) {
         f(0, 1 << 20);
-        unsafe {
-            multiboot2::for_each_region(self.0, |base, len, kind| {
-                if matches!(kind, 1 | 3 | 4) {
-                    let end = base.saturating_add(len);
-                    f(base, end.min(crate::mm::memblock::PHYS_LIMIT));
-                }
-            });
-        }
+        multiboot2::for_each_region(|base, len, kind| {
+            if matches!(kind, 1 | 3 | 4) {
+                let end = base.saturating_add(len);
+                f(base, end.min(crate::mm::memblock::PHYS_LIMIT));
+            }
+        });
     }
 }
 
@@ -236,10 +234,10 @@ unsafe fn map_image(pml4: *mut RawPageTable) {
 ///
 /// # Safety
 /// Once, on the BSP, before anything uses the direct map past 4GB.
-pub unsafe fn init(mbi: u64) {
+pub unsafe fn init() {
     unsafe {
         let pml4 = SWAPPER.get();
-        map_direct(pml4, &BootRam(mbi));
+        map_direct(pml4, &BootRam);
         map_image(pml4);
         // vmalloc/ioremap and vmemmap PDPTs: present before any address
         // space copies the kernel half

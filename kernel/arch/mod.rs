@@ -435,6 +435,9 @@ pub trait ContextOps: Sized {
     /// The task context type (callee-saved registers, etc.)
     type TaskContext: Default + Clone;
 
+    /// An all-zero context (a static task's initial frame)
+    const ZERO_CONTEXT: Self::TaskContext;
+
     /// Create a new kernel thread context
     ///
     /// # Arguments

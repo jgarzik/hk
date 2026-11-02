@@ -129,16 +129,6 @@ static FRAME_ALLOCATOR: frame_alloc::FrameAllocator = frame_alloc::FrameAllocato
 /// Global DMA operations (direct mapping backend)
 static DIRECT_DMA_OPS: DirectDmaOps = DirectDmaOps::new(&FRAME_ALLOCATOR);
 
-/// Multiboot2 info pointer (set by _start, used by kmain) - x86_64 only
-#[cfg(target_arch = "x86_64")]
-pub static MULTIBOOT2_INFO: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-
-/// The multiboot2 info pointer
-#[cfg(target_arch = "x86_64")]
-pub fn multiboot2_info() -> u64 {
-    MULTIBOOT2_INFO.load(core::sync::atomic::Ordering::Relaxed)
-}
-
 /// Embedded initramfs for aarch64 (fallback when DTB doesn't provide initramfs)
 /// This embeds the initramfs directly into the kernel binary.
 #[cfg(target_arch = "aarch64")]
@@ -150,11 +140,13 @@ pub static EMBEDDED_INITRAMFS: &[u8] = include_bytes!("../user/initramfs-aarch64
 #[cfg(all(target_arch = "x86_64", not(test)))]
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(multiboot_info: u64) -> ! {
+    // SAFETY: the bootloader's info structure (RDI), in memory the boot
+    // tables map; it and its modules are reserved (memblock_init)
+    unsafe { multiboot2::set_boot(multiboot_info) };
     // Kernel page table first: the boot tables' identity map goes away
     unsafe {
-        arch::x86_64::kmap::init(multiboot_info);
+        arch::x86_64::kmap::init();
     }
-    MULTIBOOT2_INFO.store(multiboot_info, core::sync::atomic::Ordering::Relaxed);
 
     // Messages before console attach are buffered
     printkln!("hk kernel starting...");
@@ -169,7 +161,7 @@ pub extern "C" fn _start(multiboot_info: u64) -> ! {
     crate::printk::flush();
 
     // Print and parse kernel command line (if any)
-    if let Some(cmdline) = unsafe { multiboot2::get_cmdline(multiboot_info) }
+    if let Some(cmdline) = multiboot2::get_cmdline()
         && !cmdline.is_empty()
     {
         printkln!("Cmdline: {}", cmdline);
@@ -298,7 +290,7 @@ fn discover_boot_framebuffer() {
     #[cfg(target_arch = "x86_64")]
     {
         // Parse multiboot2 framebuffer tag
-        fb_info = unsafe { multiboot2::get_framebuffer(multiboot2_info()) };
+        fb_info = multiboot2::get_framebuffer();
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -734,7 +726,7 @@ pub fn init_vfat_ramdisk(
     use fs::ramfs_create_dir;
 
     // Look for vfat module loaded by bootloader
-    let vfat_data = match unsafe { multiboot2::find_module(multiboot2_info(), "vfat") } {
+    let vfat_data = match multiboot2::find_module("vfat") {
         Some(data) => data,
         None => return,
     };
