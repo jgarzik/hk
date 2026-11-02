@@ -97,32 +97,6 @@ fn set_seccomp_filter(fprog_ptr: u64, log: bool, tsync: bool) -> i64 {
 
     let tid = crate::task::percpu::current_tid();
 
-    // Get current task's existing filter and check no_new_privs
-    let (existing_filter, has_no_new_privs, is_privileged) = {
-        let table = TASKLIST.read();
-        let task = match table.get(tid) {
-            Some(t) => t,
-            None => return KernelError::NoProcess.sysret(),
-        };
-
-        (
-            task.seccomp_filter.clone(),
-            task.prctl.no_new_privs,
-            crate::task::capable(crate::task::CAP_SYS_ADMIN),
-        )
-    };
-
-    // Must have no_new_privs set or be privileged (CAP_SYS_ADMIN)
-    if !has_no_new_privs && !is_privileged {
-        return KernelError::PermissionDenied.sysret();
-    }
-
-    // Create new filter from userspace program
-    let new_filter = match create_filter_from_user::<Uaccess>(fprog_ptr, existing_filter, log) {
-        Ok(f) => f,
-        Err(e) => return -(e as i64),
-    };
-
     // TSYNC holds the group's cred_guard (Linux: killable) so no exec
     // changes the threads meanwhile
     let _guard = if tsync {
@@ -133,7 +107,50 @@ fn set_seccomp_filter(fprog_ptr: u64, log: bool, tsync: bool) -> i64 {
     } else {
         None
     };
-    let mut table = TASKLIST.write();
+
+    // The filter stacks on the thread's current one. It is built from
+    // user memory without TASKLIST, so another thread's TSYNC may
+    // replace the current one meanwhile: then build again on that one,
+    // never dropping it (Linux builds and installs under siglock)
+    let (new_filter, mut table) = loop {
+        // Get current task's existing filter and check no_new_privs
+        let (existing_filter, has_no_new_privs, is_privileged) = {
+            let table = TASKLIST.read();
+            let task = match table.get(tid) {
+                Some(t) => t,
+                None => return KernelError::NoProcess.sysret(),
+            };
+            (
+                task.seccomp_filter.clone(),
+                task.prctl.no_new_privs,
+                crate::task::capable(crate::task::CAP_SYS_ADMIN),
+            )
+        };
+
+        // Must have no_new_privs set or be privileged (CAP_SYS_ADMIN)
+        if !has_no_new_privs && !is_privileged {
+            return KernelError::PermissionDenied.sysret();
+        }
+
+        // Create new filter from userspace program
+        let new_filter =
+            match create_filter_from_user::<Uaccess>(fprog_ptr, existing_filter.clone(), log) {
+                Ok(f) => f,
+                Err(e) => return -(e as i64),
+            };
+        let table = TASKLIST.write();
+        let Some(me) = table.get(tid) else {
+            return KernelError::NoProcess.sysret();
+        };
+        let same = match (&me.seccomp_filter, &existing_filter) {
+            (Some(a), Some(b)) => alloc::sync::Arc::ptr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        };
+        if same {
+            break (new_filter, table);
+        }
+    };
     let Some(me) = table.get(tid) else {
         return KernelError::NoProcess.sysret();
     };
