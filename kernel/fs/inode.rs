@@ -170,6 +170,14 @@ pub trait InodeOps: Send + Sync {
         super::dac::generic_permission(cred, inode, mask)
     }
 
+    /// Whether attributes may change at all (Linux ->setattr refusing
+    /// before setattr_prepare): chmod, chown and utimes ask first.
+    /// Default yes; the shared anonymous inode refuses (EOPNOTSUPP).
+    fn setattr_ok(&self, inode: &Inode) -> Result<(), KernelError> {
+        let _ = inode;
+        Ok(())
+    }
+
     /// Create a new file in a directory
     fn create(&self, dir: &Inode, name: &str, mode: InodeMode) -> Result<Arc<Inode>, KernelError> {
         let _ = (dir, name, mode);
@@ -251,42 +259,23 @@ pub trait InodeOps: Send + Sync {
     ///
     /// If the file was larger than length, the extra data is discarded.
     /// If the file was shorter, it is extended with null bytes.
-    fn truncate(&self, inode: &Inode, length: u64) -> Result<(), KernelError> {
+    fn truncate(&self, inode: &Arc<Inode>, length: u64) -> Result<(), KernelError> {
         let _ = (inode, length);
         Err(KernelError::OperationNotSupported)
     }
 
-    /// Read a page of data from a file
-    /// Returns the number of bytes read (may be less than PAGE_SIZE at EOF)
-    fn readpage(
-        &self,
-        inode: &Inode,
-        page_offset: u64,
-        buf: &mut [u8],
-    ) -> Result<usize, KernelError> {
-        let _ = (inode, page_offset, buf);
-        Err(KernelError::OperationNotSupported)
-    }
-
-    /// Write a page of data to a file
-    fn writepage(&self, inode: &Inode, page_offset: u64, buf: &[u8]) -> Result<usize, KernelError> {
-        let _ = (inode, page_offset, buf);
-        Err(KernelError::OperationNotSupported)
-    }
-
-    /// MAP_SHARED mappings of the file map its page-cache pages
-    /// (`map_page`) rather than private copies
+    /// MAP_SHARED mappings of the file map its page cache (`i_data`,
+    /// `filemap::fault`) rather than private copies
     fn maps_cache(&self) -> bool {
         false
     }
 
-    /// The page-cache frame of page `index` of the file, for a MAP_SHARED
-    /// mapping (Linux ->fault, filemap_fault), with a frame reference
-    /// taken for the mapping's PTE. OperationNotSupported: the
-    /// filesystem does not map its cache, the fault copies the data.
-    fn map_page(&self, inode: &Inode, index: u64) -> Result<u64, KernelError> {
-        let _ = (inode, index);
-        Err(KernelError::OperationNotSupported)
+    /// The last reference to the inode is gone (Linux ->evict_inode):
+    /// release what the object still owns, e.g. the blocks of an
+    /// unlinked file. Called from `Drop for Inode` in any context:
+    /// must not sleep (defer I/O to a workqueue).
+    fn evict_inode(&self, inode: &Inode) {
+        let _ = inode;
     }
 
     /// Get file size (may be dynamically computed for procfs)
@@ -484,6 +473,28 @@ pub struct Inode {
     /// A FIFO's pipe while it is open, and how many files have it open
     /// (Linux inode->i_pipe and pipe->files)
     pub i_pipe: crate::sync::spin::Mutex<Option<(Arc<crate::pipe::Pipe>, usize)>>,
+
+    /// The file's page cache (Linux i_data)
+    pub i_data: crate::mm::filemap::AddressSpace,
+
+    /// On its superblock's dirty list (Linux I_DIRTY_PAGES; fs_writeback)
+    pub(crate) i_dirty: core::sync::atomic::AtomicBool,
+
+    /// Writers (> 0) or executions denying them (< 0) (Linux
+    /// i_writecount; `get_write_access`, `deny_write_access`)
+    i_writecount: core::sync::atomic::AtomicI32,
+
+    /// An active swap area (Linux S_SWAPFILE): writes and truncates are
+    /// ETXTBSY
+    pub i_swapfile: core::sync::atomic::AtomicBool,
+
+    /// Its flock and POSIX locks (Linux i_flctx; `fs::locks`)
+    pub i_flctx: super::locks::FileLockCtx,
+
+    /// The inode cache key it is hashed under (`fs::icache`)
+    pub(super) i_hash: AtomicU64,
+    /// Hashed in the inode cache (Linux !inode_unhashed)
+    pub(super) i_hashed: core::sync::atomic::AtomicBool,
 }
 
 impl Inode {
@@ -519,6 +530,13 @@ impl Inode {
             i_rwsem: RwSem::new(()),
             private: RwLock::new(None),
             i_pipe: crate::sync::spin::Mutex::new(None),
+            i_hash: AtomicU64::new(0),
+            i_hashed: core::sync::atomic::AtomicBool::new(false),
+            i_data: crate::mm::filemap::AddressSpace::new(),
+            i_dirty: core::sync::atomic::AtomicBool::new(false),
+            i_writecount: core::sync::atomic::AtomicI32::new(0),
+            i_swapfile: core::sync::atomic::AtomicBool::new(false),
+            i_flctx: super::locks::FileLockCtx::new(),
         }
     }
 
@@ -555,6 +573,13 @@ impl Inode {
             i_rwsem: RwSem::new(()),
             private: RwLock::new(None),
             i_pipe: crate::sync::spin::Mutex::new(None),
+            i_hash: AtomicU64::new(0),
+            i_hashed: core::sync::atomic::AtomicBool::new(false),
+            i_data: crate::mm::filemap::AddressSpace::new(),
+            i_dirty: core::sync::atomic::AtomicBool::new(false),
+            i_writecount: core::sync::atomic::AtomicI32::new(0),
+            i_swapfile: core::sync::atomic::AtomicBool::new(false),
+            i_flctx: super::locks::FileLockCtx::new(),
         }
     }
 
@@ -750,3 +775,78 @@ impl InodeOps for NullInodeOps {
 
 /// Static null inode ops instance
 pub static NULL_INODE_OPS: NullInodeOps = NullInodeOps;
+
+/// Write access to an inode, held by a file open for writing and by a
+/// truncate (Linux get_write_access / put_write_access)
+pub struct InodeWrite(Arc<Inode>);
+
+/// Writes denied while a program runs from the inode (Linux
+/// deny_write_access / allow_write_access, held by the address space)
+pub struct DenyWrite(Arc<Inode>);
+
+impl Inode {
+    /// Take write access (Linux get_write_access): ETXTBSY while the
+    /// file is being executed
+    pub fn get_write_access(self: &Arc<Self>) -> Result<InodeWrite, KernelError> {
+        let c = &self.i_writecount;
+        let mut v = c.load(Ordering::Relaxed);
+        loop {
+            if v < 0 {
+                return Err(KernelError::TextBusy);
+            }
+            match c.compare_exchange_weak(v, v + 1, Ordering::AcqRel, Ordering::Relaxed) {
+                Ok(_) => return Ok(InodeWrite(self.clone())),
+                Err(now) => v = now,
+            }
+        }
+    }
+
+    /// Deny writes while executing it (Linux exe_file_deny_write_access):
+    /// ETXTBSY while it is open for writing
+    pub fn deny_write_access(self: &Arc<Self>) -> Result<DenyWrite, KernelError> {
+        let c = &self.i_writecount;
+        let mut v = c.load(Ordering::Relaxed);
+        loop {
+            if v > 0 {
+                return Err(KernelError::TextBusy);
+            }
+            match c.compare_exchange_weak(v, v - 1, Ordering::AcqRel, Ordering::Relaxed) {
+                Ok(_) => return Ok(DenyWrite(self.clone())),
+                Err(now) => v = now,
+            }
+        }
+    }
+}
+
+impl Drop for InodeWrite {
+    fn drop(&mut self) {
+        self.0.i_writecount.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+impl DenyWrite {
+    /// The inode executed
+    pub fn inode(&self) -> &Arc<Inode> {
+        &self.0
+    }
+}
+
+/// fork's copy of the address space denies writes again
+impl Clone for DenyWrite {
+    fn clone(&self) -> Self {
+        self.0.i_writecount.fetch_sub(1, Ordering::AcqRel);
+        DenyWrite(self.0.clone())
+    }
+}
+
+impl Drop for DenyWrite {
+    fn drop(&mut self) {
+        self.0.i_writecount.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+impl Drop for Inode {
+    fn drop(&mut self) {
+        super::icache::evict(self);
+    }
+}

@@ -56,7 +56,13 @@ fn class() -> &'static core::panic::Location<'static> {
 /// pte_offset_map_lock); the entry must lie in a live user table
 #[track_caller]
 pub fn pte_lock(ptep: *mut u64) -> PteLock {
-    table_lock(virt_to_phys(ptep as u64 & !0xfff))
+    table_lock(table_of_ptep(ptep))
+}
+
+/// The physical frame of the page table holding the entry at `ptep`
+#[inline]
+pub fn table_of_ptep(ptep: *mut u64) -> u64 {
+    virt_to_phys(ptep as u64 & !0xfff)
 }
 
 /// Lock the PTE table frame `table` (a live user table)

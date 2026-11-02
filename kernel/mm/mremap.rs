@@ -106,7 +106,7 @@ impl PteWalk for Move {
             let Some(dp) = paging::pte_ptr(self.pgd, a.wrapping_add(self.delta)) else {
                 continue;
             };
-            let d = crate::arch::virt_to_phys(dp as u64 & !0xfff);
+            let d = ptl::table_of_ptep(dp);
             if held.as_ref().map(|h| h.0) != Some(d) {
                 drop(held.take());
                 held = Some((d, (d != r.table()).then(|| ptl::table_lock(d))));

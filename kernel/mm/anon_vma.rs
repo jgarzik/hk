@@ -97,6 +97,13 @@ impl AnonVma {
         }
     }
 
+    /// Hold the chain for writing with no change (Linux
+    /// take_rmap_locks): mremap moves a mapping's entries under it, so
+    /// no walk sees the VMA moved but its entries not yet
+    pub fn lock_write(&self) -> impl Drop + '_ {
+        self.chain.write()
+    }
+
     /// The chain, for a reverse-map walk (Linux anon_vma_lock_read)
     pub fn read(&self) -> impl core::ops::Deref<Target = Vec<Avc>> + '_ {
         self.chain.read()

@@ -12,8 +12,10 @@
 //!
 //! A [`Disk`] (Linux gendisk) is the device; a [`BlockDevice`] (Linux
 //! block_device) is the whole disk (partno 0) or one partition of it.
-//! There is no page cache in front of the block device files yet: file
-//! I/O and partition scans are synchronous bios (`submit_bio_wait`).
+//! Each block device has an inode (`bd_inode`, Linux bdev inode) whose
+//! page cache serves device-file I/O and filesystem metadata
+//! (`fs::blkdev_ops`); its pages are read and written a page per bio.
+//! Partition scans are synchronous bios (`submit_bio_wait`).
 //!
 //! ## Locking (doc/LOCKING.md 3.10, Block Device Subsystem)
 //!
@@ -407,6 +409,9 @@ pub struct BlockDevice {
     bsize: AtomicU32,
     /// Removed (hot unplug or partition rescan): I/O fails
     dead: AtomicBool,
+    /// The device's inode in the bdev pseudo filesystem: its page cache
+    /// (Linux bd_mapping) serves device-node I/O and filesystem metadata
+    pub bd_inode: Arc<crate::fs::Inode>,
 }
 
 impl BlockDevice {
@@ -422,6 +427,7 @@ impl BlockDevice {
             openers: AtomicU32::new(0),
             bsize: AtomicU32::new(512),
             dead: AtomicBool::new(false),
+            bd_inode: crate::fs::blkdev_ops::bdev_inode(dev, nr_sects << SECTOR_SHIFT),
         }
     }
 
@@ -503,12 +509,52 @@ impl BlockDevice {
         Ok(())
     }
 
-    /// The last reference of an open file went away
+    /// Open the device for the kernel (a mount, active swap; Linux
+    /// bdev_file_open_by_dev): counted like an open file, so a rescan
+    /// sees the partition in use, until the handle is dropped
+    pub fn open_handle(self: &Arc<Self>) -> Result<BdevHandle, KernelError> {
+        self.open()?;
+        Ok(BdevHandle(self.clone()))
+    }
+
+    /// The last reference of an open file went away; the last opener
+    /// writes the cache back and drops it (Linux blkdev_put_whole ->
+    /// blkdev_flush_mapping: sync_blockdev + kill_bdev), under
+    /// open_mutex, so the next opener reads the disk
     pub fn release(&self) {
         let _g = self.disk.open_mutex.lock();
-        if self.openers.fetch_sub(1, Ordering::Relaxed) == 1 && self.partno != 0 {
-            self.disk.open_partitions.fetch_sub(1, Ordering::Relaxed);
+        if self.openers.fetch_sub(1, Ordering::Relaxed) == 1 {
+            let _ = sync_blockdev(self);
+            crate::mm::filemap::invalidate(&self.bd_inode);
+            if self.partno != 0 {
+                self.disk.open_partitions.fetch_sub(1, Ordering::Relaxed);
+            }
         }
+    }
+}
+
+/// A kernel open of a block device (`BlockDevice::open_handle`)
+pub struct BdevHandle(Arc<BlockDevice>);
+
+impl BdevHandle {
+    pub fn bdev(&self) -> &Arc<BlockDevice> {
+        &self.0
+    }
+}
+
+impl core::ops::Deref for BdevHandle {
+    type Target = BlockDevice;
+    fn deref(&self) -> &BlockDevice {
+        &self.0
+    }
+}
+
+impl Drop for BdevHandle {
+    fn drop(&mut self) {
+        // Host tests make superblocks but never open devices (and
+        // cannot sleep on open_mutex)
+        #[cfg(not(test))]
+        self.0.release();
     }
 }
 
@@ -522,6 +568,12 @@ pub static BLKDEV_REGISTRY: RwLock<BTreeMap<DevId, Arc<BlockDevice>>> =
     RwLock::new(BTreeMap::new());
 
 pub fn register_bdev(bdev: Arc<BlockDevice>) -> Result<(), KernelError> {
+    // The device's inode does I/O on this device only (never a later
+    // one with the same number)
+    bdev.bd_inode
+        .set_private(Arc::new(crate::fs::blkdev_ops::BdevOwner(Arc::downgrade(
+            &bdev,
+        ))));
     let mut r = BLKDEV_REGISTRY.write();
     if r.contains_key(&bdev.dev) {
         return Err(KernelError::AlreadyExists);
@@ -530,10 +582,14 @@ pub fn register_bdev(bdev: Arc<BlockDevice>) -> Result<(), KernelError> {
     Ok(())
 }
 
-/// Remove one block device; I/O on it fails from now on
+/// Remove one block device; I/O on it fails from now on, and its page
+/// cache goes without writeback, unmapped from every mapping (Linux
+/// del_gendisk / blk_drop_partitions: kill_bdev). Sleeps.
 pub fn unregister_bdev(dev: DevId) -> Option<Arc<BlockDevice>> {
     let b = BLKDEV_REGISTRY.write().remove(&dev)?;
     b.mark_dead();
+    crate::mm::filemap::unmap_mapping_range(&b.bd_inode.i_data, 0);
+    crate::mm::filemap::invalidate(&b.bd_inode);
     Some(b)
 }
 
@@ -724,10 +780,19 @@ pub fn bdev_rw_frame(
     if len < PAGE && op == BioOp::Read {
         unsafe { core::ptr::write_bytes(crate::arch::phys_to_virt(frame).add(len), 0, PAGE - len) };
     }
-    let mut bio = Bio::new(op, sector);
+    // One bio per piece the queue limits allow (segments of at most
+    // max_segment_size, at most max_segments of them)
     let seg_max = bdev.disk.queue.limits.max_segment_size as usize;
-    add_frame(&mut bio, frame, 0, len, seg_max);
-    submit_bio_wait(bdev, bio).1
+    let chunk = max_io(bdev).min(PAGE);
+    let mut off = 0;
+    while off < len {
+        let n = chunk.min(len - off);
+        let mut bio = Bio::new(op, sector + (off as u64 >> SECTOR_SHIFT));
+        add_frame(&mut bio, frame, off, n, seg_max);
+        submit_bio_wait(bdev, bio).1?;
+        off += n;
+    }
+    Ok(())
 }
 
 /// Read or write page `idx` of the device from/to `buf` (a page; the
@@ -749,21 +814,23 @@ pub fn bdev_rw_page(
     bdev_rw_bytes(bdev, op, pos, &mut buf[..len])
 }
 
-/// Read or write `buf` at byte offset `pos`, any alignment (a partial
-/// sector is read first, then rewritten)
+/// Read or write `buf` at byte offset `pos`, any alignment: the I/O is
+/// in logical blocks (a 4Kn disk takes no 512-byte request), a partial
+/// block read first, then rewritten
 pub fn bdev_rw_bytes(
     bdev: &BlockDevice,
     op: BioOp,
     pos: u64,
     buf: &mut [u8],
 ) -> Result<(), KernelError> {
-    let ss = SECTOR_SIZE as usize;
-    let first = pos / SECTOR_SIZE;
-    let head = (pos % SECTOR_SIZE) as usize;
-    if head == 0 && buf.len().is_multiple_of(ss) {
+    let lbs = (bdev.logical_block_size() as usize).max(SECTOR_SIZE as usize);
+    let head = pos as usize % lbs;
+    let start = pos - head as u64;
+    let first = start / SECTOR_SIZE;
+    if head == 0 && buf.len().is_multiple_of(lbs) {
         return bdev_rw(bdev, op, first, buf);
     }
-    let span = (head + buf.len()).next_multiple_of(ss);
+    let span = (head + buf.len()).next_multiple_of(lbs);
     let mut tmp = alloc::vec![0u8; span];
     bdev_rw(bdev, BioOp::Read, first, &mut tmp)?;
     if op == BioOp::Read {
@@ -772,6 +839,49 @@ pub fn bdev_rw_bytes(
     }
     tmp[head..head + buf.len()].copy_from_slice(buf);
     bdev_rw(bdev, BioOp::Write, first, &mut tmp)
+}
+
+/// Write the device's dirty cache pages and wait (Linux sync_blockdev)
+pub fn sync_blockdev(bdev: &BlockDevice) -> Result<(), KernelError> {
+    crate::mm::filemap::write_and_wait(&bdev.bd_inode)
+}
+
+/// The page-cache inode of every block device (drop_caches, reclaim)
+pub fn all_bdev_inodes() -> Vec<Arc<crate::fs::Inode>> {
+    BLKDEV_REGISTRY
+        .read()
+        .values()
+        .map(|b| b.bd_inode.clone())
+        .collect()
+}
+
+/// `f` on each block device's page-cache inode until it returns false,
+/// allocating nothing (reclaim): the reference is taken under the
+/// registry lock, `f` runs with no lock held
+pub fn for_each_bdev_inode(f: &mut dyn FnMut(&Arc<crate::fs::Inode>) -> bool) {
+    let mut i = 0;
+    loop {
+        let inode = BLKDEV_REGISTRY
+            .read()
+            .values()
+            .nth(i)
+            .map(|b| b.bd_inode.clone());
+        let Some(inode) = inode else {
+            return;
+        };
+        if !f(&inode) {
+            return;
+        }
+        i += 1;
+    }
+}
+
+/// Write back every block device's cache (sync(2): Linux sync_bdevs)
+pub fn sync_bdevs() {
+    let all: Vec<Arc<BlockDevice>> = BLKDEV_REGISTRY.read().values().cloned().collect();
+    for b in all {
+        let _ = sync_blockdev(&b);
+    }
 }
 
 /// Flush the disk's volatile write cache (Linux blkdev_issue_flush)

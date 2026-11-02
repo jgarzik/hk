@@ -23,14 +23,11 @@
 //! - poll() support for integration with select/poll/epoll
 //! - Semaphore mode (EFD_SEMAPHORE) for decrement-by-1 semantics
 
-use alloc::string::String;
-use alloc::sync::{Arc, Weak};
+use alloc::sync::Arc;
 
 use crate::arch::IrqSpinlock;
 use crate::fs::KernelError;
-use crate::fs::dentry::Dentry;
 use crate::fs::file::{File, FileOps, flags};
-use crate::fs::inode::{Inode, InodeMode, NULL_INODE_OPS, Timespec as InodeTimespec};
 use crate::poll::{POLLERR, POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM, PollTable};
 use crate::waitqueue::WaitQueue;
 
@@ -249,7 +246,6 @@ pub fn create_eventfd(initval: u64, efd_flags: i32) -> Result<Arc<File>, KernelE
     let eventfd = Eventfd::new(initval, efd_flags);
 
     // Create dummy dentry for eventfd
-    let dentry = create_eventfd_dentry()?;
 
     // Determine file flags - eventfd is read/write
     let mut file_flags = flags::O_RDWR;
@@ -257,26 +253,9 @@ pub fn create_eventfd(initval: u64, efd_flags: i32) -> Result<Arc<File>, KernelE
         file_flags |= flags::O_NONBLOCK;
     }
 
-    let file = Arc::new(File::new_anon(dentry, file_flags, &EVENTFD_FOPS, eventfd));
+    let file =
+        crate::fs::anon_inodes::anon_inode_getfile("[eventfd]", &EVENTFD_FOPS, eventfd, file_flags);
     Ok(file)
-}
-
-/// Create a dummy dentry for eventfd
-fn create_eventfd_dentry() -> Result<Arc<Dentry>, KernelError> {
-    let mode = InodeMode::regular(0o600);
-    let inode = Arc::new(Inode::new(
-        0, // ino=0 for anonymous
-        mode,
-        0,                           // uid (root)
-        0,                           // gid (root)
-        0,                           // size
-        InodeTimespec::from_secs(0), // mtime
-        Weak::new(),                 // no superblock
-        &NULL_INODE_OPS,
-    ));
-
-    let dentry = Arc::new(Dentry::new_anonymous(String::from("eventfd"), Some(inode)));
-    Ok(dentry)
 }
 
 /// Get the Eventfd from a File (for syscall implementations)

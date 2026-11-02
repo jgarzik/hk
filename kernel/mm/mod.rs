@@ -21,6 +21,7 @@ pub mod asid;
 #[cfg(feature = "mmcheck")]
 pub mod check;
 pub mod fault;
+pub mod filemap;
 pub mod gather;
 pub mod huge_page;
 pub mod lru;
@@ -32,7 +33,6 @@ pub mod mprotect;
 pub mod mremap;
 pub mod page;
 pub mod page_alloc;
-pub mod page_cache;
 pub mod pagewalk;
 pub mod ptl;
 pub mod remote;
@@ -176,6 +176,9 @@ pub struct MmStruct {
     def_flags: u32,
     /// Path of the executable (Linux mm->exe_file), for /proc/<pid>/exe
     exe: Option<alloc::string::String>,
+    /// Writes to the executable denied while this image runs (Linux
+    /// mm->exe_file's deny_write_access)
+    exe_deny: Option<crate::fs::inode::DenyWrite>,
     /// Where exec put the image, arguments and environment
     args: MmLayout,
     /// The address space these VMAs belong to and its top-level table,
@@ -194,6 +197,15 @@ fn avc_of(owner: &Weak<Mm>, pgd: u64, v: &Vma) -> anon_vma::Avc {
         end: v.end,
         pgoff: v.pgoff,
         locked: v.flags & VM_LOCKED_MASK != 0,
+    }
+}
+
+/// A file VMA's i_mmap entry: its page offset is the file page of its
+/// start (Linux vm_pgoff of a file VMA)
+fn file_avc_of(owner: &Weak<Mm>, pgd: u64, v: &Vma) -> anon_vma::Avc {
+    anon_vma::Avc {
+        pgoff: v.offset / PAGE_SIZE,
+        ..avc_of(owner, pgd, v)
     }
 }
 
@@ -226,6 +238,7 @@ impl MmStruct {
             total_vm: 0,
             def_flags: 0,
             exe: None,
+            exe_deny: None,
             args: MmLayout::default(),
             owner: Weak::new(),
             pgd: 0,
@@ -244,26 +257,37 @@ impl MmStruct {
     // its entry (anon_vma lock under the mmap_lock held for writing)
     // ------------------------------------------------------------------
 
-    /// Add the chain entry of `v`
+    /// Add the chain entries of `v`: its anon_vma's, and its file's
+    /// i_mmap (Linux vma_link -> vma_link_file)
     fn link(&self, v: &Vma) {
         if let Some(av) = &v.anon_vma {
             av.link(avc_of(&self.owner, self.pgd, v));
         }
+        if let Some(i) = v.inode() {
+            i.i_data.i_mmap.link(file_avc_of(&self.owner, self.pgd, v));
+        }
     }
 
-    /// Drop the chain entry of `v`
+    /// Drop the chain entries of `v`
     fn unlink(&self, v: &Vma) {
         if let Some(av) = &v.anon_vma {
             av.unlink(self.pgd, v.start);
         }
+        if let Some(i) = v.inode() {
+            i.i_data.i_mmap.unlink(self.pgd, v.start);
+        }
     }
 
-    /// Refresh the entry of the VMA at `idx`, which started at `old_start`
+    /// Refresh the entries of the VMA at `idx`, which started at `old_start`
     fn relink(&self, idx: usize, old_start: u64) {
         let v = &self.vmas[idx];
         if let Some(av) = &v.anon_vma {
             let new = avc_of(&self.owner, self.pgd, v);
             av.update(self.pgd, old_start, |c| *c = new);
+        }
+        if let Some(i) = v.inode() {
+            let new = file_avc_of(&self.owner, self.pgd, v);
+            i.i_data.i_mmap.update(self.pgd, old_start, |c| *c = new);
         }
     }
 
@@ -297,8 +321,13 @@ impl MmStruct {
     }
 
     /// Record the executable at exec
-    pub fn set_exe(&mut self, path: alloc::string::String) {
+    pub fn set_exe(
+        &mut self,
+        path: alloc::string::String,
+        deny: Option<crate::fs::inode::DenyWrite>,
+    ) {
         self.exe = Some(path);
+        self.exe_deny = deny;
     }
 
     /// Set the program break region (called during ELF loading)
@@ -1049,6 +1078,7 @@ pub fn dup_mm(parent: &MmRef, pgd: u64) -> Result<MmRef, i32> {
         map.brk = guard.brk;
         map.total_vm = guard.total_vm;
         map.exe = guard.exe.clone();
+        map.exe_deny = guard.exe_deny.clone();
         map.args = guard.args;
         for vma in guard.iter() {
             if vma.flags & VM_DONTCOPY != 0 {

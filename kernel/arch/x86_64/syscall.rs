@@ -475,6 +475,8 @@ pub const SYS_MEMBARRIER: u64 = 324;
 
 // File readahead (Section 2.3)
 /// readahead(fd, offset, count)
+pub const SYS_FADVISE64: u64 = 221;
+pub const SYS_SYNC_FILE_RANGE: u64 = 277;
 pub const SYS_READAHEAD: u64 = 187;
 
 // NUMA memory policy (Section 4.2)
@@ -1368,6 +1370,17 @@ pub fn x86_64_syscall_dispatch(
         SYS_MEMBARRIER => {
             crate::membarrier::sys_membarrier(arg0 as i32, arg1 as u32, arg2 as i32) as u64
         }
+
+        SYS_FADVISE64 => {
+            crate::fs::syscall::sys_fadvise64(arg0 as i32, arg1 as i64, arg2 as i64, arg3 as i32)
+                as u64
+        }
+        SYS_SYNC_FILE_RANGE => crate::fs::syscall::sys_sync_file_range(
+            arg0 as i32,
+            arg1 as i64,
+            arg2 as i64,
+            arg3 as u32,
+        ) as u64,
 
         // readahead syscall
         SYS_READAHEAD => {

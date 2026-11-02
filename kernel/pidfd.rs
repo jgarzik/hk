@@ -25,13 +25,10 @@
 //! - Integration with waitid(P_PIDFD)
 //! - CLONE_PIDFD support for automatic pidfd creation
 
-use alloc::string::String;
-use alloc::sync::{Arc, Weak};
+use alloc::sync::Arc;
 
 use crate::fs::KernelError;
-use crate::fs::dentry::Dentry;
 use crate::fs::file::{File, FileOps, flags};
-use crate::fs::inode::{Inode, InodeMode, NULL_INODE_OPS, Timespec as InodeTimespec};
 use crate::poll::{POLLHUP, POLLIN, POLLRDNORM, PollTable};
 use crate::task::Pid;
 
@@ -122,7 +119,6 @@ pub fn create_pidfd(pid: Pid, file_flags: u32) -> Result<Arc<File>, KernelError>
     let pidfd = Arc::new(Pidfd { pid });
 
     // Create dummy dentry for pidfd
-    let dentry = create_pidfd_dentry()?;
 
     // Determine file flags
     let mut f_flags = flags::O_RDONLY;
@@ -130,26 +126,8 @@ pub fn create_pidfd(pid: Pid, file_flags: u32) -> Result<Arc<File>, KernelError>
         f_flags |= flags::O_NONBLOCK;
     }
 
-    let file = Arc::new(File::new_anon(dentry, f_flags, &PIDFD_FOPS, pidfd));
+    let file = crate::fs::anon_inodes::anon_inode_getfile("[pidfd]", &PIDFD_FOPS, pidfd, f_flags);
     Ok(file)
-}
-
-/// Create a dummy dentry for pidfd
-fn create_pidfd_dentry() -> Result<Arc<Dentry>, KernelError> {
-    let mode = InodeMode::regular(0o600);
-    let inode = Arc::new(Inode::new(
-        0, // ino=0 for anonymous
-        mode,
-        0,                           // uid (root)
-        0,                           // gid (root)
-        0,                           // size
-        InodeTimespec::from_secs(0), // mtime
-        Weak::new(),                 // no superblock
-        &NULL_INODE_OPS,
-    ));
-
-    let dentry = Arc::new(Dentry::new_anonymous(String::from("pidfd"), Some(inode)));
-    Ok(dentry)
 }
 
 /// Notify all pidfds for the given PID that the process has exited

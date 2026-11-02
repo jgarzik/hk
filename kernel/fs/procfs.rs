@@ -461,66 +461,6 @@ impl InodeOps for ProcfsInodeOps {
             | ProcfsInodeData::Sysctl { .. } => Err(KernelError::NotDirectory),
         }
     }
-
-    fn readpage(
-        &self,
-        inode: &Inode,
-        page_offset: u64,
-        buf: &mut [u8],
-    ) -> Result<usize, KernelError> {
-        // For procfs, we generate content on demand
-        // This is called for page cache integration but procfs typically
-        // doesn't use the page cache (content is ephemeral)
-        let private = inode.get_private().ok_or(KernelError::Io)?;
-        let wrapper = private
-            .as_ref()
-            .as_any()
-            .downcast_ref::<ProcfsInodeWrapper>()
-            .ok_or(KernelError::Io)?;
-
-        let data = wrapper.0.read();
-        let content = match &*data {
-            ProcfsInodeData::File { generator } => generator(),
-            ProcfsInodeData::NamespaceFile { pid, ns_type } => {
-                // Generate namespace identifier content
-                // Format matches Linux: "ns:[<inode>]" but we use a simpler format
-                gen_namespace_content(*pid, *ns_type)
-            }
-            ProcfsInodeData::FdinfoFile { pid, fd } => gen_fdinfo_content(*pid, *fd),
-            ProcfsInodeData::PidFile { pid, generator } => pid_content(None, *pid, *generator)?,
-            ProcfsInodeData::Sysctl { ctl } => crate::sysctl::read(ctl),
-            ProcfsInodeData::FdSymlink { .. }
-            | ProcfsInodeData::PidLink { .. }
-            | ProcfsInodeData::SelfLink => {
-                // Symlinks don't have content, readlink() handles them
-                return Err(KernelError::Io);
-            }
-            ProcfsInodeData::Directory { .. }
-            | ProcfsInodeData::PidDirectory { .. }
-            | ProcfsInodeData::PidTaskDirectory { .. }
-            | ProcfsInodeData::PidNsDirectory { .. }
-            | ProcfsInodeData::PidFdDirectory { .. }
-            | ProcfsInodeData::PidFdinfoDirectory { .. } => return Err(KernelError::IsDirectory),
-        };
-
-        let page_size = buf.len();
-        let offset = page_offset as usize * page_size;
-
-        if offset >= content.len() {
-            buf.fill(0);
-            return Ok(0);
-        }
-
-        let available = content.len() - offset;
-        let to_copy = min(page_size, available);
-
-        buf[..to_copy].copy_from_slice(&content[offset..offset + to_copy]);
-        if to_copy < page_size {
-            buf[to_copy..].fill(0);
-        }
-
-        Ok(to_copy)
-    }
 }
 
 // ============================================================================
@@ -1217,7 +1157,7 @@ impl FileOps for ProcfsFileOps {
     /// No procfs file maps (its readers may take the mmap_lock a fault
     /// holds): proc_dir_entry files fail in pde_mmap (EIO), per-process
     /// and sysctl files have no mmap (ENODEV)
-    fn mmap(&self, file: &File) -> Result<(), KernelError> {
+    fn mmap(&self, file: &File, _shared: bool) -> Result<(), KernelError> {
         let pde = file
             .get_inode()
             .and_then(|i| i.get_private())
@@ -1734,8 +1674,11 @@ fn gen_version() -> Vec<u8> {
 
 /// Generate /proc/meminfo content (Linux meminfo_proc_show subset:
 /// 16-column labels, values in kB). Free memory is the frame
-/// allocator's exact count; hk has no reclaimable caches counted yet,
-/// so MemAvailable equals MemFree. Slab is the slab caches' pages.
+/// allocator's exact count; Buffers is the block devices' caches,
+/// Cached the rest of the page cache (ramfs included, as Linux counts
+/// tmpfs), Unevictable ramfs's, MemAvailable free plus the clean
+/// evictable cache. Writeback is 0 (writes are synchronous). Slab is
+/// the slab caches' pages.
 fn gen_meminfo() -> Vec<u8> {
     use alloc::fmt::Write;
     let fa = &crate::FRAME_ALLOCATOR;
@@ -1745,15 +1688,29 @@ fn gen_meminfo() -> Vec<u8> {
     let (swap_total, swap_free) = crate::mm::swap::swap_totals();
     let swap_cached = crate::mm::swap_state::total_cached();
     let mut out = String::new();
+    use crate::mm::filemap;
+    let file = filemap::nr_file_pages() * 4;
+    let buffers: u64 = crate::storage::blkdev::all_bdev_inodes()
+        .iter()
+        .map(|i| i.i_data.nrpages() * 4)
+        .sum();
+    let dirty = filemap::nr_dirty() * 4;
+    let unevict = filemap::nr_unevictable() * 4;
+    // What reclaim could free without I/O (Linux si_mem_available,
+    // without the low-watermark and half-of-cache reserve)
+    let avail = free + file.saturating_sub(unevict + dirty);
     for (label, kb) in [
         ("MemTotal:", total),
         ("MemFree:", free),
-        ("MemAvailable:", free),
-        ("Buffers:", 0),
-        ("Cached:", 0),
+        ("MemAvailable:", avail),
+        ("Buffers:", buffers),
+        ("Cached:", file.saturating_sub(buffers)),
         ("SwapCached:", swap_cached * 4),
+        ("Unevictable:", unevict),
         ("SwapTotal:", swap_total * 4),
         ("SwapFree:", swap_free * 4),
+        ("Dirty:", dirty),
+        ("Writeback:", 0),
         ("Slab:", slab),
     ] {
         let _ = writeln!(out, "{label:<16}{kb:>8} kB");

@@ -50,7 +50,7 @@ impl PteRange {
     /// (the caller holds its PTE lock)
     pub fn at(ptep: *mut u64, start: u64, end: u64) -> Self {
         Self {
-            table: crate::arch::virt_to_phys(ptep as u64 & !0xfff),
+            table: crate::mm::ptl::table_of_ptep(ptep),
             start,
             end,
         }

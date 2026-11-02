@@ -368,6 +368,22 @@ impl Vma {
         self.prot & PROT_EXEC != 0
     }
 
+    /// A shared mapping whose pages are dirty-tracked (Linux
+    /// vma_wants_writenotify): its PTEs are made writable only by a
+    /// write fault, which dirties the page; mprotect leaves them
+    /// read-only
+    pub fn wants_writenotify(&self) -> bool {
+        self.is_shared()
+            && self
+                .inode()
+                .is_some_and(|i| i.i_op.maps_cache() && i.i_data.aops().can_dirty())
+    }
+
+    /// The inode of the mapped file (its i_mmap lists this VMA)
+    pub fn inode(&self) -> Option<Arc<crate::fs::Inode>> {
+        self.file.as_ref().and_then(|f| f.mapping_inode())
+    }
+
     /// Check if this VMA is memory-locked
     #[inline]
     pub fn is_locked(&self) -> bool {

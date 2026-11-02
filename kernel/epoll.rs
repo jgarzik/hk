@@ -27,15 +27,12 @@
 //! - Can monitor pipes, sockets, eventfd, timerfd, and other pollable fds
 
 use alloc::collections::BTreeMap;
-use alloc::string::String;
-use alloc::sync::{Arc, Weak};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::arch::{IrqSpinlock, Uaccess};
 use crate::fs::KernelError;
-use crate::fs::dentry::Dentry;
 use crate::fs::file::{File, FileOps, flags};
-use crate::fs::inode::{Inode, InodeMode, NULL_INODE_OPS, Timespec as InodeTimespec};
 use crate::pipe::FD_CLOEXEC;
 use crate::poll::{POLLIN, POLLRDNORM, PollTable};
 use crate::task::Fd;
@@ -342,7 +339,6 @@ pub fn create_epoll_file(eflags: i32) -> Result<Arc<File>, KernelError> {
     let ep = Eventpoll::new();
 
     // Create dummy dentry for epoll
-    let dentry = create_epoll_dentry()?;
 
     // Determine file flags
     let mut file_flags = flags::O_RDWR;
@@ -350,26 +346,9 @@ pub fn create_epoll_file(eflags: i32) -> Result<Arc<File>, KernelError> {
         file_flags |= flags::O_CLOEXEC;
     }
 
-    let file = Arc::new(File::new_anon(dentry, file_flags, &EPOLL_FOPS, ep));
+    let file =
+        crate::fs::anon_inodes::anon_inode_getfile("[eventpoll]", &EPOLL_FOPS, ep, file_flags);
     Ok(file)
-}
-
-/// Create a dummy dentry for epoll
-fn create_epoll_dentry() -> Result<Arc<Dentry>, KernelError> {
-    let mode = InodeMode::regular(0o600);
-    let inode = Arc::new(Inode::new(
-        0, // ino=0 for anonymous
-        mode,
-        0,                           // uid (root)
-        0,                           // gid (root)
-        0,                           // size
-        InodeTimespec::from_secs(0), // mtime
-        Weak::new(),                 // no superblock
-        &NULL_INODE_OPS,
-    ));
-
-    let dentry = Arc::new(Dentry::new_anonymous(String::from("epoll"), Some(inode)));
-    Ok(dentry)
 }
 
 /// Get the Eventpoll from a File (for syscall implementations)

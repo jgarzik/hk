@@ -3,17 +3,12 @@
 //! A File represents an open file handle. Multiple file descriptors
 //! can point to the same file (e.g., after dup()).
 //!
-//! ## Generic Page-Cache File Operations
-//!
-//! This module provides `generic_file_read` and `generic_file_write` which
-//! implement page-cache-backed I/O. Filesystems can use these directly or
-//! as building blocks for their FileOps implementations.
+//! Page-cache file I/O is `mm::filemap` (read, perform_write).
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::sync::spin::Mutex;
-use ::core::cmp::min;
 use ::core::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 
 use crate::sync;
@@ -26,10 +21,6 @@ use crate::ns::current_mnt_ns;
 use crate::poll::{
     DEFAULT_POLLMASK, POLLERR, POLLHUP, POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM, PollTable,
 };
-
-use crate::frame_alloc::FrameAllocRef;
-use crate::mm::page_cache::{AddressSpaceOps, FileId, PAGE_SIZE};
-use crate::{FRAME_ALLOCATOR, PAGE_CACHE};
 
 /// Largest kernel bounce buffer one read/write call uses: transfers
 /// bigger than this go through it in steps
@@ -231,8 +222,8 @@ pub trait FileOps: Send + Sync {
     }
 
     /// May the file be mapped (Linux: f_op->mmap exists and accepts
-    /// it)? Default: no mmap, ENODEV from mmap(2)
-    fn mmap(&self, _file: &File) -> Result<(), KernelError> {
+    /// it), shared or private? Default: no mmap, ENODEV from mmap(2)
+    fn mmap(&self, _file: &File, _shared: bool) -> Result<(), KernelError> {
         Err(KernelError::NoDevice)
     }
 
@@ -371,6 +362,8 @@ pub struct File {
     /// Write access to the file system while open for writing (Linux
     /// FMODE_WRITER): a read-only remount is EBUSY until it is released
     pub write_access: Option<super::superblock::WriteAccess>,
+    /// The inode's write access (Linux FMODE_WRITER's get_write_access)
+    pub i_write: Option<super::inode::InodeWrite>,
 
     /// Credentials of the opener (Linux file->f_cred): permission checks
     /// that must not be satisfied by whoever later uses the descriptor
@@ -415,6 +408,7 @@ impl File {
             owner_pid: AtomicI32::new(0),
             owner_sig: AtomicI32::new(0),
             write_access: None,
+            i_write: None,
             f_cred: crate::task::current_cred(),
             private: spin::Once::new(),
         }
@@ -442,6 +436,16 @@ impl File {
     /// A reference to the per-open state, if it is a `T`
     pub fn private_arc<T: core::any::Any + Send + Sync>(&self) -> Option<Arc<T>> {
         self.private.get()?.clone().downcast::<T>().ok()
+    }
+
+    /// The inode whose page cache holds the file's data (Linux
+    /// f_mapping->host): a block device node's is the device's bdev
+    /// inode, every other file's its own
+    pub fn mapping_inode(&self) -> Option<Arc<Inode>> {
+        if let Some(b) = self.private_ref::<crate::storage::BlockDevice>() {
+            return Some(b.bd_inode.clone());
+        }
+        self.get_inode()
     }
 
     /// Get the inode for this file
@@ -628,6 +632,11 @@ impl File {
         let append = append.unwrap_or(self.get_flags() & flags::O_APPEND != 0);
         inode.inode_lock();
         let r = (|| {
+            // An active swap file (Linux generic_write_checks:
+            // IS_SWAPFILE), checked under i_rwsem: swapon sets it there
+            if inode.i_swapfile.load(Ordering::Acquire) {
+                return Err(KernelError::TextBusy);
+            }
             let at = match (append, at) {
                 (true, None) => {
                     self.set_pos(inode.get_size());
@@ -704,10 +713,6 @@ impl File {
     }
 }
 
-// File is Send + Sync because all interior mutability is through atomic
-unsafe impl Send for File {}
-unsafe impl Sync for File {}
-
 impl Drop for File {
     fn drop(&mut self) {
         // Call release on file operations to allow cleanup (e.g., decrement pipe reader/writer counts)
@@ -781,7 +786,7 @@ impl FileOps for CharDevFileOps {
         self
     }
 
-    fn mmap(&self, file: &File) -> Result<(), KernelError> {
+    fn mmap(&self, file: &File, _shared: bool) -> Result<(), KernelError> {
         let inode = file.get_inode().ok_or(KernelError::BadFd)?;
         match get_chardev(inode.rdev) {
             Some(d) if d.mmap_ok() => Ok(()),
@@ -843,519 +848,3 @@ pub static CHAR_FILE_OPS: CharDevFileOps = CharDevFileOps;
 // ============================================================================
 // Generic Page-Cache File Operations
 // ============================================================================
-
-/// Generic page-cache-backed file read.
-///
-/// Reads data from a file using the page cache. Pages are populated via
-/// `a_ops.readpage()` when first accessed (cache miss).
-///
-/// ## Locking Context
-///
-/// - Acquires PAGE_CACHE lock briefly per page (for find_or_create)
-/// - Releases PAGE_CACHE lock before calling a_ops.readpage
-/// - Acquires per-page lock during readpage if populating
-///
-/// ## Arguments
-///
-/// * `file` - The file being read
-/// * `buf` - Buffer to read into
-/// * `file_id` - Page cache identifier for this file
-/// * `file_size` - Total file size in bytes
-/// * `can_writeback` - Whether dirty pages can be written back
-/// * `unevictable` - Whether pages are completely unevictable (ramfs)
-/// * `a_ops` - Address space operations for page I/O
-///
-/// ## Returns
-///
-/// Number of bytes read, or error
-#[allow(clippy::too_many_arguments)]
-pub fn generic_file_read(
-    file: &File,
-    buf: &mut [u8],
-    file_id: FileId,
-    file_size: u64,
-    can_writeback: bool,
-    unevictable: bool,
-    a_ops: &'static dyn AddressSpaceOps,
-) -> Result<usize, KernelError> {
-    let pos = file.get_pos();
-
-    // EOF check
-    if pos >= file_size {
-        return Ok(0);
-    }
-
-    let available = (file_size - pos) as usize;
-    let to_read = min(buf.len(), available);
-
-    if to_read == 0 {
-        return Ok(0);
-    }
-
-    let mut bytes_read = 0;
-
-    while bytes_read < to_read {
-        let current_pos = pos + bytes_read as u64;
-        let page_offset = current_pos / PAGE_SIZE as u64;
-        let offset_in_page = (current_pos % PAGE_SIZE as u64) as usize;
-        let chunk_size = min(PAGE_SIZE - offset_in_page, to_read - bytes_read);
-
-        // Get or create the page (PAGE_CACHE lock acquired/released)
-        let (page, is_new) = {
-            let mut cache = PAGE_CACHE.lock();
-            let mut frame_alloc = FrameAllocRef(&FRAME_ALLOCATOR);
-
-            cache
-                .find_or_create_page(
-                    file_id,
-                    page_offset,
-                    file_size,
-                    &mut frame_alloc,
-                    can_writeback,
-                    unevictable,
-                    a_ops,
-                )
-                .map_err(|_| KernelError::Io)?
-        };
-        // PAGE_CACHE lock released here
-
-        // If this is a new page, populate it via readpage
-        if is_new {
-            // Lock the page for I/O
-            page.lock();
-
-            // Read page content from backing store
-            let mut page_buf = [0u8; PAGE_SIZE];
-            let read_result = a_ops.readpage(file_id, page_offset, &mut page_buf);
-
-            match read_result {
-                Ok(_) => {
-                    // Copy data to the frame
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(
-                            page_buf.as_ptr(),
-                            crate::arch::phys_to_virt(page.frame),
-                            PAGE_SIZE,
-                        );
-                    }
-                }
-                Err(_) => {
-                    page.unlock();
-                    return Err(KernelError::Io);
-                }
-            }
-
-            page.unlock();
-        }
-
-        // Copy data from page to user buffer (page is refcounted, safe to access)
-        unsafe {
-            let src = (crate::arch::phys_to_virt(page.frame) as *const u8).add(offset_in_page);
-            core::ptr::copy_nonoverlapping(src, buf[bytes_read..].as_mut_ptr(), chunk_size);
-        }
-
-        // Release our reference to the page
-        let cache = PAGE_CACHE.lock();
-        cache.put_page(&page);
-
-        bytes_read += chunk_size;
-    }
-
-    // Advance file position
-    file.advance_pos(bytes_read as u64);
-
-    Ok(bytes_read)
-}
-
-/// Generic page-cache-backed file write.
-///
-/// Writes data to a file using the page cache. Pages are allocated on
-/// first write and marked dirty.
-///
-/// ## Locking Context
-///
-/// - Acquires PAGE_CACHE lock briefly per page (for find_or_create)
-/// - Releases PAGE_CACHE lock before I/O
-/// - Does not call a_ops during write (writeback happens later)
-///
-/// ## Arguments
-///
-/// * `file` - The file being written
-/// * `buf` - Data to write
-/// * `file_id` - Page cache identifier for this file
-/// * `file_size` - Current file size in bytes (may grow)
-/// * `can_writeback` - Whether dirty pages can be written back
-/// * `unevictable` - Whether pages are completely unevictable (ramfs)
-/// * `a_ops` - Address space operations for page I/O
-///
-/// ## Returns
-///
-/// Number of bytes written, or error
-#[allow(clippy::too_many_arguments)]
-pub fn generic_file_write(
-    file: &File,
-    buf: &[u8],
-    file_id: FileId,
-    file_size: u64,
-    can_writeback: bool,
-    unevictable: bool,
-    a_ops: &'static dyn AddressSpaceOps,
-) -> Result<usize, KernelError> {
-    let pos = file.get_pos();
-
-    if buf.is_empty() {
-        return Ok(0);
-    }
-
-    // For block devices, cannot write past end
-    // For regular files, this would extend the file
-    let available = if file_size > pos {
-        (file_size - pos) as usize
-    } else {
-        0
-    };
-
-    let to_write = min(buf.len(), available);
-    if to_write == 0 {
-        return Err(KernelError::InvalidArgument);
-    }
-
-    let mut bytes_written = 0;
-
-    while bytes_written < to_write {
-        let current_pos = pos + bytes_written as u64;
-        let page_offset = current_pos / PAGE_SIZE as u64;
-        let offset_in_page = (current_pos % PAGE_SIZE as u64) as usize;
-        let chunk_size = min(PAGE_SIZE - offset_in_page, to_write - bytes_written);
-
-        // Get or create the page
-        let (page, is_new) = {
-            let mut cache = PAGE_CACHE.lock();
-            let mut frame_alloc = FrameAllocRef(&FRAME_ALLOCATOR);
-
-            cache
-                .find_or_create_page(
-                    file_id,
-                    page_offset,
-                    file_size,
-                    &mut frame_alloc,
-                    can_writeback,
-                    unevictable,
-                    a_ops,
-                )
-                .map_err(|_| KernelError::Io)?
-        };
-
-        // If this is a partial page write and it's new, we need to read existing data first
-        // (for block devices, this ensures we don't corrupt surrounding data)
-        if is_new && (offset_in_page != 0 || chunk_size != PAGE_SIZE) {
-            page.lock();
-
-            let mut page_buf = [0u8; PAGE_SIZE];
-            if a_ops.readpage(file_id, page_offset, &mut page_buf).is_ok() {
-                unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        page_buf.as_ptr(),
-                        crate::arch::phys_to_virt(page.frame),
-                        PAGE_SIZE,
-                    );
-                }
-            }
-            // If readpage fails, the page was already zeroed which is acceptable
-
-            page.unlock();
-        }
-
-        // Write data to the page
-        unsafe {
-            let dst = crate::arch::phys_to_virt(page.frame).add(offset_in_page);
-            core::ptr::copy_nonoverlapping(buf[bytes_written..].as_ptr(), dst, chunk_size);
-        }
-
-        // Mark page as dirty
-        page.mark_dirty();
-
-        // Release our reference
-        let cache = PAGE_CACHE.lock();
-        cache.put_page(&page);
-
-        bytes_written += chunk_size;
-    }
-
-    // Advance file position
-    file.advance_pos(bytes_written as u64);
-
-    Ok(bytes_written)
-}
-
-/// Generic positioned read using page cache.
-///
-/// Like `generic_file_read`, but reads at an explicit offset without
-/// modifying the file position. Used for pread64 syscall.
-///
-/// ## Locking Context
-///
-/// Same as `generic_file_read` - acquires PAGE_CACHE lock briefly per page.
-///
-/// ## Arguments
-///
-/// * `_file` - The file being read (unused, but kept for consistency)
-/// * `buf` - Buffer to read into
-/// * `offset` - Position to read from (does NOT modify file position)
-/// * `file_id` - Page cache identifier for this file
-/// * `file_size` - Total file size in bytes
-/// * `can_writeback` - Whether dirty pages can be written back
-/// * `unevictable` - Whether pages are completely unevictable (ramfs)
-/// * `a_ops` - Address space operations for page I/O
-///
-/// ## Returns
-///
-/// Number of bytes read, or error
-#[allow(clippy::too_many_arguments)]
-pub fn generic_file_pread(
-    _file: &File,
-    buf: &mut [u8],
-    offset: u64,
-    file_id: FileId,
-    file_size: u64,
-    can_writeback: bool,
-    unevictable: bool,
-    a_ops: &'static dyn AddressSpaceOps,
-) -> Result<usize, KernelError> {
-    let pos = offset;
-
-    // EOF check
-    if pos >= file_size {
-        return Ok(0);
-    }
-
-    let available = (file_size - pos) as usize;
-    let to_read = min(buf.len(), available);
-
-    if to_read == 0 {
-        return Ok(0);
-    }
-
-    let mut bytes_read = 0;
-
-    while bytes_read < to_read {
-        let current_pos = pos + bytes_read as u64;
-        let page_offset = current_pos / PAGE_SIZE as u64;
-        let offset_in_page = (current_pos % PAGE_SIZE as u64) as usize;
-        let chunk_size = min(PAGE_SIZE - offset_in_page, to_read - bytes_read);
-
-        // Get or create the page (PAGE_CACHE lock acquired/released)
-        let (page, is_new) = {
-            let mut cache = PAGE_CACHE.lock();
-            let mut frame_alloc = FrameAllocRef(&FRAME_ALLOCATOR);
-
-            cache
-                .find_or_create_page(
-                    file_id,
-                    page_offset,
-                    file_size,
-                    &mut frame_alloc,
-                    can_writeback,
-                    unevictable,
-                    a_ops,
-                )
-                .map_err(|_| KernelError::Io)?
-        };
-        // PAGE_CACHE lock released here
-
-        // If this is a new page, populate it via readpage
-        if is_new {
-            // Lock the page for I/O
-            page.lock();
-
-            // Read page content from backing store
-            let mut page_buf = [0u8; PAGE_SIZE];
-            let read_result = a_ops.readpage(file_id, page_offset, &mut page_buf);
-
-            match read_result {
-                Ok(_) => {
-                    // Copy data to the frame
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(
-                            page_buf.as_ptr(),
-                            crate::arch::phys_to_virt(page.frame),
-                            PAGE_SIZE,
-                        );
-                    }
-                }
-                Err(_) => {
-                    page.unlock();
-                    return Err(KernelError::Io);
-                }
-            }
-
-            page.unlock();
-        }
-
-        // Copy data from page to user buffer (page is refcounted, safe to access)
-        unsafe {
-            let src = (crate::arch::phys_to_virt(page.frame) as *const u8).add(offset_in_page);
-            core::ptr::copy_nonoverlapping(src, buf[bytes_read..].as_mut_ptr(), chunk_size);
-        }
-
-        // Release our reference to the page
-        let cache = PAGE_CACHE.lock();
-        cache.put_page(&page);
-
-        bytes_read += chunk_size;
-    }
-
-    // NOTE: Unlike generic_file_read, we do NOT advance file position
-    Ok(bytes_read)
-}
-
-/// Generic positioned write using page cache.
-///
-/// Like `generic_file_write`, but writes at an explicit offset without
-/// modifying the file position. Used for pwrite64 syscall.
-///
-/// ## Locking Context
-///
-/// Same as `generic_file_write` - acquires PAGE_CACHE lock briefly per page.
-///
-/// ## Arguments
-///
-/// * `_file` - The file being written (unused, but kept for consistency)
-/// * `buf` - Data to write
-/// * `offset` - Position to write to (does NOT modify file position)
-/// * `file_id` - Page cache identifier for this file
-/// * `file_size` - Current file size in bytes (may grow)
-/// * `can_writeback` - Whether dirty pages can be written back
-/// * `unevictable` - Whether pages are completely unevictable (ramfs)
-/// * `a_ops` - Address space operations for page I/O
-///
-/// ## Returns
-///
-/// Number of bytes written, or error
-#[allow(clippy::too_many_arguments)]
-pub fn generic_file_pwrite(
-    _file: &File,
-    buf: &[u8],
-    offset: u64,
-    file_id: FileId,
-    file_size: u64,
-    can_writeback: bool,
-    unevictable: bool,
-    a_ops: &'static dyn AddressSpaceOps,
-) -> Result<usize, KernelError> {
-    let pos = offset;
-
-    if buf.is_empty() {
-        return Ok(0);
-    }
-
-    // For block devices, cannot write past end
-    // For regular files, this would extend the file
-    let available = if file_size > pos {
-        (file_size - pos) as usize
-    } else {
-        0
-    };
-
-    let to_write = min(buf.len(), available);
-    if to_write == 0 {
-        return Err(KernelError::InvalidArgument);
-    }
-
-    let mut bytes_written = 0;
-
-    while bytes_written < to_write {
-        let current_pos = pos + bytes_written as u64;
-        let page_offset = current_pos / PAGE_SIZE as u64;
-        let offset_in_page = (current_pos % PAGE_SIZE as u64) as usize;
-        let chunk_size = min(PAGE_SIZE - offset_in_page, to_write - bytes_written);
-
-        // Get or create the page
-        let (page, is_new) = {
-            let mut cache = PAGE_CACHE.lock();
-            let mut frame_alloc = FrameAllocRef(&FRAME_ALLOCATOR);
-
-            cache
-                .find_or_create_page(
-                    file_id,
-                    page_offset,
-                    file_size,
-                    &mut frame_alloc,
-                    can_writeback,
-                    unevictable,
-                    a_ops,
-                )
-                .map_err(|_| KernelError::Io)?
-        };
-
-        // If this is a partial page write and it's new, we need to read existing data first
-        // (for block devices, this ensures we don't corrupt surrounding data)
-        if is_new && (offset_in_page != 0 || chunk_size != PAGE_SIZE) {
-            page.lock();
-
-            let mut page_buf = [0u8; PAGE_SIZE];
-            if a_ops.readpage(file_id, page_offset, &mut page_buf).is_ok() {
-                unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        page_buf.as_ptr(),
-                        crate::arch::phys_to_virt(page.frame),
-                        PAGE_SIZE,
-                    );
-                }
-            }
-            // If readpage fails, the page was already zeroed which is acceptable
-
-            page.unlock();
-        }
-
-        // Write data to the page
-        unsafe {
-            let dst = crate::arch::phys_to_virt(page.frame).add(offset_in_page);
-            core::ptr::copy_nonoverlapping(buf[bytes_written..].as_ptr(), dst, chunk_size);
-        }
-
-        // Mark page as dirty
-        page.mark_dirty();
-
-        // Release our reference
-        let cache = PAGE_CACHE.lock();
-        cache.put_page(&page);
-
-        bytes_written += chunk_size;
-    }
-
-    // NOTE: Unlike generic_file_write, we do NOT advance file position
-    Ok(bytes_written)
-}
-
-/// Generic fsync implementation using page cache.
-///
-/// Syncs all dirty pages for a file to backing store using the writeback module.
-/// This is the proper async writeback path - it writes pages via do_writepages
-/// and waits for all I/O to complete.
-///
-/// ## Locking Context
-///
-/// - Acquires PAGE_CACHE lock briefly to get AddressSpace
-/// - Uses writeback module for actual I/O (proper writeback flag tracking)
-/// - Waits for all in-flight writeback to complete
-///
-/// ## Arguments
-///
-/// * `file_id` - Page cache identifier for this file
-///
-/// ## Returns
-///
-/// Ok(()) on success, or error
-pub fn generic_file_fsync(file_id: FileId) -> Result<(), KernelError> {
-    use crate::mm::writeback::{WritebackControl, do_writepages_for_file, wait_on_writeback};
-
-    // Write all dirty pages for this file
-    let mut wbc = WritebackControl::for_fsync();
-    do_writepages_for_file(file_id, &mut wbc).map_err(|_| KernelError::Io)?;
-
-    // Wait for all writeback to complete
-    wait_on_writeback(file_id);
-
-    Ok(())
-}

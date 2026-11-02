@@ -247,8 +247,13 @@ fn fault(mm: &Mm, addr: u64, access: Access) -> Result<(), VmFault> {
     if SwapEntry::is_swap_pte(pte) {
         return do_swap_page(mm, ptep, pte, addr, &area, access);
     }
-    let page = fault_page(addr, &area)?;
-    let r = do_fault(mm, ptep, pte, page, addr, &area);
+    let (page, locked, wp) = fault_page(addr, &area, access)?;
+    let r = do_fault(mm, ptep, pte, page, addr, &area, wp);
+    if locked {
+        // Mapped under the page lock (Linux finish_fault): see
+        // filemap::fault
+        super::page::unlock_page(page);
+    }
     drop(map);
     r
 }
@@ -341,21 +346,25 @@ fn do_huge_anon(mm: &Mm, addr: u64, area: &Area) -> bool {
 /// anonymous memory (Linux shmem_fault), else a new page, zeroed for
 /// anonymous memory or holding a private copy of the file data (Linux
 /// do_anonymous_page, do_read_fault)
-fn fault_page(addr: u64, area: &Area) -> Result<u64, VmFault> {
+/// Also whether the page comes locked (a page-cache page: unlocked
+/// once mapped) and whether it must be mapped read-only (a private
+/// mapping's page-cache page: a write copies it, Linux do_read_fault).
+fn fault_page(addr: u64, area: &Area, access: Access) -> Result<(u64, bool, bool), VmFault> {
     let exec = area.prot & PROT_EXEC != 0;
     if let Some(sh) = &area.shmem {
         return sh
             .get_page(area.pgoff(addr) / PAGE_SIZE)
-            .inspect(|&f| paging::sync_page(f, exec));
+            .inspect(|&f| paging::sync_page(f, exec))
+            .map(|f| (f, false, false));
     }
-    if let (true, false, Some(f)) = (area.shared, area.anon, &area.file)
-        && let Some(r) = file_page(f, area.pgoff(addr), area.prot & PROT_EXEC != 0)
+    if let (false, Some(f)) = (area.anon, &area.file)
+        && let Some(r) = file_page(f, area.pgoff(addr), area, access)
     {
         return r;
     }
     let frame = alloc_user().ok_or(VmFault::Oom)?;
-    // SAFETY: a fresh frame, reached through the direct map
-    let buf = unsafe { core::slice::from_raw_parts_mut(phys_to_virt(frame), PAGE_SIZE as usize) };
+    // SAFETY: a fresh frame, ours alone
+    let buf = unsafe { super::page::frame_bytes(frame) };
     buf.fill(0);
     let file = matches!((area.anon, &area.file), (false, Some(_)));
     if let (false, Some(f)) = (area.anon, &area.file) {
@@ -367,36 +376,57 @@ fn fault_page(addr: u64, area: &Area) -> Result<u64, VmFault> {
     if file || exec {
         paging::sync_page(frame, exec);
     }
-    Ok(frame)
+    Ok((frame, false, false))
 }
 
-/// The page-cache page at byte offset `off` of `file`, for a shared
-/// mapping of a filesystem that maps its cache (Linux filemap_fault):
-/// SIGBUS past the end of the file. None: the fault copies the data.
-fn file_page(file: &File, off: u64, exec: bool) -> Option<Result<u64, VmFault>> {
-    use crate::error::KernelError;
-
-    let inode = file.get_inode()?;
+/// The page-cache page at byte offset `off` of `file`, for a mapping
+/// of a filesystem that maps its cache (Linux filemap_fault): SIGBUS
+/// past the end of the file. None: the fault copies the data. A shared
+/// mapping maps the page itself, locked, with a reference for the PTE;
+/// a writable one dirties it (Linux do_shared_fault). A private one
+/// maps it read-only on a read (do_read_fault: the cache page is shared
+/// until written) and a copy on a write (do_cow_fault).
+fn file_page(
+    file: &File,
+    off: u64,
+    area: &Area,
+    access: Access,
+) -> Option<Result<(u64, bool, bool), VmFault>> {
+    let inode = file.mapping_inode()?;
     if !inode.i_op.maps_cache() {
         return None;
     }
-    if off >= inode.get_size().div_ceil(PAGE_SIZE) * PAGE_SIZE {
-        return Some(Err(VmFault::Bus));
+    let exec = area.prot & PROT_EXEC != 0;
+    let page = match super::filemap::fault(&inode, off / PAGE_SIZE) {
+        Ok(p) => p,
+        Err(e) => return Some(Err(e)),
+    };
+    paging::sync_page(page, exec);
+    if area.shared {
+        if area.prot & PROT_WRITE != 0 {
+            super::filemap::dirty_page(&inode.i_data, page);
+            crate::fs::fs_writeback::mark_inode_dirty(&inode);
+        }
+        return Some(Ok((page, true, false)));
     }
-    Some(
-        inode
-            .i_op
-            .map_page(&inode, off / PAGE_SIZE)
-            .inspect(|&f| paging::sync_page(f, exec))
-            .map_err(|e| match e {
-                KernelError::OutOfMemory | KernelError::NoSpace => VmFault::Oom,
-                _ => VmFault::Bus,
-            }),
-    )
+    if access != Access::Write {
+        return Some(Ok((page, true, true)));
+    }
+    let copy = alloc_user();
+    if let Some(new) = copy {
+        // The cache page is locked and referenced, the new one ours
+        // SAFETY: the new frame is ours; the cache page is locked
+        unsafe { super::page::copy_page(new, page) };
+        paging::sync_page(new, exec);
+    }
+    super::page::unlock_page(page);
+    super::filemap::put_page(page);
+    Some(copy.map(|n| (n, false, false)).ok_or(VmFault::Oom))
 }
 
 /// Map `page` (with its reference for the PTE) at `addr`, where the
-/// entry held `old` (none)
+/// entry held `old` (none); read-only with `wp` (a private mapping's
+/// page-cache page: the first write copies it)
 fn do_fault(
     mm: &Mm,
     ptep: *mut u64,
@@ -404,9 +434,15 @@ fn do_fault(
     page: u64,
     addr: u64,
     area: &Area,
+    wp: bool,
 ) -> Result<(), VmFault> {
+    let prot = if wp {
+        area.prot & !PROT_WRITE
+    } else {
+        area.prot
+    };
     let _l = pte_lock(ptep);
-    if !set_pte(ptep, old, paging::mk_pte(page, area.prot)) {
+    if !set_pte(ptep, old, paging::mk_pte(page, prot)) {
         // A racing fault mapped the page first
         super::memory::put_page(page);
         return Ok(());
@@ -503,6 +539,31 @@ pub fn unuse_pte(mm: &Mm, vma: &super::Vma, addr: u64) -> Result<(), VmFault> {
 /// is made writable in place; a private page still shared (fork's
 /// copy-on-write) is copied first
 fn do_wp_page(mm: &Mm, ptep: *mut u64, pte: u64, addr: u64, area: &Area) -> Result<(), VmFault> {
+    // A shared file page written back (write-protected by mkclean) is
+    // dirty again once writable (Linux wp_page_shared ->
+    // fault_dirty_shared_page)
+    // Under the page lock, like Linux wp_page_shared: writeback holds it
+    // across mkclean and clearing the dirty bit, so it never sees the
+    // PTE writable but the page still clean (a later write would be
+    // lost). The PTE's page is referenced first (it may be unmapped
+    // meanwhile; wp_locked rechecks the entry).
+    if area.shared
+        && let Some(inode) = area.file.as_ref().and_then(|f| f.mapping_inode())
+        && inode.i_op.maps_cache()
+    {
+        let phys = paging::pte_addr(pte);
+        if !FRAME_ALLOCATOR.incref(phys) {
+            return Ok(());
+        }
+        super::page::lock_page(phys);
+        let r = wp_locked(mm, ptep, pte, addr, area, &mut None);
+        super::filemap::dirty_page(&inode.i_data, phys);
+        super::page::unlock_page(phys);
+        FRAME_ALLOCATOR.decref(phys);
+        crate::fs::fs_writeback::mark_inode_dirty(&inode);
+        super::writeback::balance_dirty_pages(&inode);
+        return r;
+    }
     let mut spare = None;
     loop {
         match wp_locked(mm, ptep, pte, addr, area, &mut spare) {
@@ -545,11 +606,9 @@ fn wp_locked(
         return Ok(());
     }
     let new = spare.take().or_else(alloc_user).ok_or(VmFault::Retry)?;
-    // SAFETY: both frames are reached through the direct map; `old`
-    // stays mapped (and referenced) until the PTE is switched
-    unsafe {
-        core::ptr::copy_nonoverlapping(phys_to_virt(old), phys_to_virt(new), PAGE_SIZE as usize)
-    };
+    // `old` stays mapped (and referenced) until the PTE is switched
+    // SAFETY: the new frame is ours; `old` stays mapped and referenced
+    unsafe { super::page::copy_page(new, old) };
     paging::sync_page(new, paging::pte_exec(pte));
     let entry = paging::pte_mkwrite((pte & !paging::PTE_ADDR_MASK) | new);
     if !replace_pte(mm, ptep, pte, entry, addr) {

@@ -17,8 +17,8 @@ use crate::error::KernelError;
 use crate::fs::devtmpfs;
 
 use super::blkdev::{
-    BLKDEV_REGISTRY, BioOp, BlockDevice, Disk, bdev_rw, disk_bdevs, disk_release, register_bdev,
-    unregister_bdev,
+    BLKDEV_REGISTRY, BioOp, BlockDevice, Disk, bdev_rw_bytes, disk_bdevs, disk_release,
+    register_bdev, unregister_bdev,
 };
 use super::part;
 
@@ -76,7 +76,7 @@ pub fn add_disk(disk: Arc<Disk>) -> Result<Arc<BlockDevice>, KernelError> {
 /// (Linux blk_add_partitions); called with `open_mutex` held
 fn scan_partitions(whole: &BlockDevice) {
     let disk = &whole.disk;
-    let mut rd = |s: u64, b: &mut [u8; 512]| bdev_rw(whole, BioOp::Read, s, b);
+    let mut rd = |s: u64, b: &mut [u8; 512]| bdev_rw_bytes(whole, BioOp::Read, s << 9, b);
     let parts = part::scan(&mut rd, whole.nr_sects(), disk.minors as usize);
     for (no, p) in parts {
         let b = Arc::new(BlockDevice::new(
@@ -102,14 +102,10 @@ fn drop_bdevs(disk: &Arc<Disk>, from: u16) {
     }
 }
 
-/// A partition is held beyond the registry: an open file, a mounted
-/// filesystem or active swap (each opens the device in Linux)
+/// A partition is open: a file, a mounted filesystem or active swap
+/// (each opens the device, as in Linux)
 fn parts_held(disk: &Arc<Disk>) -> bool {
     disk.open_partitions.load(Ordering::Relaxed) != 0
-        || BLKDEV_REGISTRY
-            .read()
-            .values()
-            .any(|b| Arc::ptr_eq(&b.disk, disk) && b.partno != 0 && Arc::strong_count(b) > 1)
 }
 
 /// BLKRRPART: re-read the partition table (Linux disk_scan_partitions):
@@ -131,7 +127,12 @@ pub fn rescan(bdev: &BlockDevice) -> Result<(), KernelError> {
 
 /// Unregister a disk and its partitions (Linux del_gendisk)
 pub fn del_gendisk(disk: &Arc<Disk>) {
-    drop_bdevs(disk, 0);
+    {
+        // Under open_mutex, like a rescan: an open in progress either
+        // finished before or sees the device dead
+        let _g = disk.open_mutex.lock();
+        drop_bdevs(disk, 0);
+    }
     disk_release(disk);
 }
 

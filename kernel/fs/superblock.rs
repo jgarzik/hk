@@ -230,6 +230,18 @@ pub struct SuperBlock {
     /// Filesystem-specific private data
     pub private: RwLock<Option<Arc<dyn SuperBlockData>>>,
 
+    /// The block device a device filesystem is mounted from, held open
+    /// while the superblock lives (Linux s_bdev_file)
+    s_bdev: spin::Once<crate::storage::blkdev::BdevHandle>,
+
+    /// Inodes with dirty pages, each held until written back (Linux
+    /// wb->b_dirty; `fs_writeback`)
+    pub(crate) s_dirty: crate::sync::spin::Mutex<alloc::vec::Vec<Arc<Inode>>>,
+
+    /// Serializes whole-filesystem writeback passes (sleeping: held
+    /// across the I/O; `fs_writeback::writeback_sb`)
+    pub(crate) s_wb_lock: crate::sync::Mutex<()>,
+
     /// Mutex for cross-directory renames (like Linux s_vfs_rename_mutex)
     ///
     /// Serializes all cross-directory renames on this filesystem to
@@ -275,6 +287,9 @@ impl SuperBlock {
             next_ino: AtomicU64::new(1), // Start inode numbers at 1
             dev_id: NEXT_DEV_ID.fetch_add(1, Ordering::Relaxed),
             private: RwLock::new(None),
+            s_bdev: spin::Once::new(),
+            s_dirty: crate::sync::spin::Mutex::new(alloc::vec::Vec::new()),
+            s_wb_lock: crate::sync::Mutex::new(()),
             s_vfs_rename_mutex: sync::Mutex::new(()),
         })
     }
@@ -333,6 +348,16 @@ impl SuperBlock {
         self.next_ino.fetch_add(1, Ordering::Relaxed)
     }
 
+    /// Hold the block device open for the superblock's life
+    pub fn set_bdev(&self, h: crate::storage::blkdev::BdevHandle) {
+        self.s_bdev.call_once(|| h);
+    }
+
+    /// The block device the filesystem is mounted from
+    pub fn bdev(&self) -> Option<&Arc<crate::storage::BlockDevice>> {
+        self.s_bdev.get().map(|h| h.bdev())
+    }
+
     /// Set filesystem-specific private data
     pub fn set_private(&self, data: Arc<dyn SuperBlockData>) {
         *self.private.write() = Some(data);
@@ -343,10 +368,6 @@ impl SuperBlock {
         self.private.read().clone()
     }
 }
-
-// SuperBlock is Send + Sync because all interior mutability is through atomic or lock
-unsafe impl Send for SuperBlock {}
-unsafe impl Sync for SuperBlock {}
 
 /// Null superblock ops - minimal implementation
 pub struct NullSuperOps;

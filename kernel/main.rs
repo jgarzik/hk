@@ -113,37 +113,20 @@ use crate::arch::{
 type ArchPageTable = <CurrentArch as SchedArch>::SchedPageTable;
 
 use crate::dma::{DirectDmaOps, dma_init};
-use crate::mm::page_cache::PageCache;
 
 #[allow(unused_imports)]
 use fs::inode::AsAny; // Trait needed for .as_any() on dyn InodeData
-
-use crate::sync::spin::Mutex;
 
 /// Kernel heap: boot arena, then slab (host unit tests use the std
 /// allocator)
 #[cfg_attr(not(test), global_allocator)]
 static ALLOCATOR: heap::KernelAlloc = heap::KernelAlloc::new();
 
-/// Global page cache (1024 evictable pages = 4MB max)
-static PAGE_CACHE: Mutex<PageCache> = Mutex::new(PageCache::new(1024));
-
 /// Global frame allocator
 static FRAME_ALLOCATOR: frame_alloc::FrameAllocator = frame_alloc::FrameAllocator::new();
 
 /// Global DMA operations (direct mapping backend)
 static DIRECT_DMA_OPS: DirectDmaOps = DirectDmaOps::new(&FRAME_ALLOCATOR);
-
-/// Invalidate all page cache entries for a block device (hotplug removal)
-///
-/// Called when a block device is removed to free cached pages.
-/// Returns the number of pages that were invalidated.
-pub fn invalidate_blkdev_pages(major: u16, minor: u16) -> usize {
-    let mut alloc_ref = frame_alloc::FrameAllocRef(&FRAME_ALLOCATOR);
-    PAGE_CACHE
-        .lock()
-        .invalidate_blkdev(major, minor, &mut alloc_ref)
-}
 
 /// Multiboot2 info pointer (set by _start, used by kmain) - x86_64 only
 #[cfg(target_arch = "x86_64")]
@@ -364,7 +347,6 @@ fn kmain() -> ! {
     dma_init(&DIRECT_DMA_OPS);
 
     // Run page cache self-tests (verifies locking correctness)
-    crate::mm::page_cache::run_self_tests();
 
     // Initialize ioremap subsystem (MMIO virtual address management)
     CurrentArch::ioremap_init();

@@ -23,9 +23,8 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 
 use crate::sync::spin::RwLock;
-use ::core::cmp::min;
 
-use crate::mm::page_cache::{AddressSpaceOps, FileId, PAGE_SIZE};
+use crate::mm::filemap::{self, Aops};
 
 use super::KernelError;
 use super::dentry::Dentry;
@@ -39,23 +38,20 @@ use super::superblock::{
 // Ramfs Address Space Operations
 // ============================================================================
 
-/// Ramfs address space operations for page cache integration.
-///
-/// Ramfs stores file data in the page cache with `unevictable = true`.
-/// - `readpage`: Returns zeros for new pages (ramfs has no backing store)
-/// - `writepage`: Returns error - should never be called since pages are unevictable
-pub struct RamfsAddressSpaceOps;
+/// Ramfs page I/O: there is no backing store, so a page not in the
+/// cache is a hole and reads as zeros (Linux ramfs simple_read_folio)
+pub struct RamfsAops;
 
-impl AddressSpaceOps for RamfsAddressSpaceOps {
-    fn readpage(&self, _file_id: FileId, _page_offset: u64, buf: &mut [u8]) -> Result<usize, i32> {
-        // New pages in ramfs start as zeros
-        buf.fill(0);
-        Ok(buf.len())
+impl Aops for RamfsAops {
+    fn read_folio(&self, _inode: &Inode, phys: u64, _index: u64) -> Result<(), KernelError> {
+        filemap::zero_page(phys, 0);
+        filemap::set_uptodate(phys);
+        Ok(())
     }
 
-    fn writepage(&self, _file_id: FileId, _page_offset: u64, _buf: &[u8]) -> Result<usize, i32> {
-        // Ramfs pages are unevictable - writepage should never be called
-        Err(-5) // EIO
+    /// The cache is the only copy: nothing to write back
+    fn can_dirty(&self) -> bool {
+        false
     }
 }
 
@@ -76,8 +72,14 @@ fn read_err(e: KernelError) -> KernelError {
     }
 }
 
-/// Global ramfs address space ops instance
-pub static RAMFS_AOPS: RamfsAddressSpaceOps = RamfsAddressSpaceOps;
+pub static RAMFS_AOPS: RamfsAops = RamfsAops;
+
+/// A new regular file's mapping: ramfs operations, never evicted (the
+/// cache is the only copy; Linux ramfs mapping_set_unevictable)
+fn file_mapping(inode: &Inode) {
+    inode.i_data.set_aops(&RAMFS_AOPS);
+    inode.i_data.set_flags(filemap::AS_UNEVICTABLE);
+}
 
 /// Get current timestamp for new inodes
 /// Returns current wall-clock time from TIMEKEEPER if available, otherwise zero
@@ -88,10 +90,6 @@ fn current_time() -> Timespec {
 
 /// Ramfs inode private data
 pub struct RamfsInodeData {
-    /// FileId for page cache lookup (regular files only)
-    /// Used to identify this file's pages in the global page cache.
-    pub file_id: Option<FileId>,
-
     /// Children (for directories) - maps name to inode
     pub children: RwLock<Children>,
 
@@ -101,17 +99,6 @@ pub struct RamfsInodeData {
 
     /// Extended attributes (name -> value)
     pub xattrs: RwLock<BTreeMap<String, Vec<u8>>>,
-}
-
-/// Generate a FileId for a ramfs inode
-///
-/// The FileId is derived from the superblock device ID and inode number,
-/// ensuring uniqueness across different ramfs mounts.
-pub fn ramfs_file_id(sb: &SuperBlock, ino: u64) -> FileId {
-    // Use high bit to distinguish ramfs files from other FileIds
-    // Format: 0x4000_0000_0000_0000 | (dev_id << 32) | (ino & 0xFFFFFFFF)
-    let dev_id = sb.dev_id;
-    FileId::new(0x4000_0000_0000_0000 | (dev_id << 32) | (ino & 0xFFFF_FFFF))
 }
 
 /// Directory entries with stable readdir positions (Linux
@@ -183,36 +170,19 @@ impl Default for Children {
     }
 }
 
-/// The inode is gone: no directory entry and no open file, mapping or
-/// dentry refers to it any more. Free its page-cache pages (Linux
-/// evict_inode -> truncate_inode_pages_final; ramfs has no other copy).
-/// Never runs with PAGE_CACHE held: the page cache holds no inodes.
-impl Drop for RamfsInodeData {
-    fn drop(&mut self) {
-        use crate::frame_alloc::FrameAllocRef;
-        use crate::{FRAME_ALLOCATOR, PAGE_CACHE};
-        if let Some(id) = self.file_id {
-            let mut fa = FrameAllocRef(&FRAME_ALLOCATOR);
-            PAGE_CACHE.lock().invalidate_file(id, &mut fa);
-        }
-    }
-}
-
 impl RamfsInodeData {
-    /// Create empty file data with the given FileId
-    pub fn new_file(file_id: FileId) -> Self {
+    /// Create empty file data (the data lives in the inode's mapping)
+    pub fn new_file() -> Self {
         Self {
-            file_id: Some(file_id),
             children: RwLock::new(Children::new()),
             symlink_target: None,
             xattrs: RwLock::new(BTreeMap::new()),
         }
     }
 
-    /// Create directory data (no FileId, no page cache)
+    /// Create directory data
     pub fn new_dir() -> Self {
         Self {
-            file_id: None,
             children: RwLock::new(Children::new()),
             symlink_target: None,
             xattrs: RwLock::new(BTreeMap::new()),
@@ -222,7 +192,6 @@ impl RamfsInodeData {
     /// Create symlink data (target stored inline)
     pub fn new_symlink(target: String) -> Self {
         Self {
-            file_id: None,
             children: RwLock::new(Children::new()),
             symlink_target: Some(target),
             xattrs: RwLock::new(BTreeMap::new()),
@@ -360,7 +329,6 @@ impl InodeOps for RamfsInodeOps {
 
         // Owner from the caller's fs ids (inode_init_owner)
         let ino = sb.alloc_ino();
-        let file_id = ramfs_file_id(&sb, ino);
         let (uid, gid, mode) = super::dac::init_owner(dir, mode);
 
         let new_inode = Arc::new(Inode::new(
@@ -373,7 +341,8 @@ impl InodeOps for RamfsInodeOps {
             Arc::downgrade(&sb),
             &RAMFS_INODE_OPS,
         ));
-        new_inode.set_private(Arc::new(RamfsInodeData::new_file(file_id)));
+        new_inode.set_private(Arc::new(RamfsInodeData::new_file()));
+        file_mapping(&new_inode);
 
         // Add to directory
         dir_data
@@ -456,141 +425,8 @@ impl InodeOps for RamfsInodeOps {
         Ok(new_inode)
     }
 
-    fn readpage(
-        &self,
-        inode: &Inode,
-        page_offset: u64,
-        buf: &mut [u8],
-    ) -> Result<usize, KernelError> {
-        // Ramfs uses page cache via AddressSpaceOps (RAMFS_AOPS).
-        // This InodeOps::readpage is deprecated for ramfs - use the page cache directly.
-        use crate::frame_alloc::FrameAllocRef;
-        use crate::{FRAME_ALLOCATOR, PAGE_CACHE};
-
-        let private = inode.get_private().ok_or(KernelError::Io)?;
-        let ramfs_data = private
-            .as_ref()
-            .as_any()
-            .downcast_ref::<RamfsInodeData>()
-            .ok_or(KernelError::Io)?;
-
-        let file_id = ramfs_data.file_id.ok_or(KernelError::Io)?;
-        let file_size = inode.get_size();
-
-        // Get the page from cache
-        let page = {
-            let mut cache = PAGE_CACHE.lock();
-            let mut frame_alloc = FrameAllocRef(&FRAME_ALLOCATOR);
-
-            let (page, _) = cache
-                .find_or_create_page(
-                    file_id,
-                    page_offset,
-                    file_size,
-                    &mut frame_alloc,
-                    false, // can_writeback
-                    true,  // unevictable
-                    &RAMFS_AOPS,
-                )
-                .map_err(read_err)?;
-            page
-        };
-
-        // Copy from page to buffer
-        let page_size = buf.len();
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                crate::arch::phys_to_virt(page.frame) as *const u8,
-                buf.as_mut_ptr(),
-                page_size,
-            );
-        }
-
-        Ok(page_size)
-    }
-
     fn maps_cache(&self) -> bool {
         true
-    }
-
-    fn map_page(&self, inode: &Inode, index: u64) -> Result<u64, KernelError> {
-        use crate::frame_alloc::FrameAllocRef;
-        use crate::{FRAME_ALLOCATOR, PAGE_CACHE};
-
-        let private = inode.get_private().ok_or(KernelError::Io)?;
-        let data = private
-            .as_ref()
-            .as_any()
-            .downcast_ref::<RamfsInodeData>()
-            .ok_or(KernelError::Io)?;
-        let file_id = data.file_id.ok_or(KernelError::Io)?;
-        let mut cache = PAGE_CACHE.lock();
-        let (page, _) = cache
-            .find_or_create_page(
-                file_id,
-                index,
-                inode.get_size(),
-                &mut FrameAllocRef(&FRAME_ALLOCATOR),
-                false, // can_writeback
-                true,  // unevictable
-                &RAMFS_AOPS,
-            )
-            .map_err(page_err)?;
-        // Taken before the cache lock goes: truncate cannot free the
-        // frame under the new mapping (the cache holds one meanwhile)
-        let held = FRAME_ALLOCATOR.incref(page.frame);
-        debug_assert!(held);
-        page.mark_dirty();
-        Ok(page.frame)
-    }
-
-    fn writepage(&self, inode: &Inode, page_offset: u64, buf: &[u8]) -> Result<usize, KernelError> {
-        // Ramfs uses page cache via AddressSpaceOps (RAMFS_AOPS).
-        // This InodeOps::writepage is deprecated for ramfs - use the page cache directly.
-        use crate::frame_alloc::FrameAllocRef;
-        use crate::{FRAME_ALLOCATOR, PAGE_CACHE};
-
-        let private = inode.get_private().ok_or(KernelError::Io)?;
-        let ramfs_data = private
-            .as_ref()
-            .as_any()
-            .downcast_ref::<RamfsInodeData>()
-            .ok_or(KernelError::Io)?;
-
-        let file_id = ramfs_data.file_id.ok_or(KernelError::Io)?;
-        let file_size = inode.get_size();
-        let page_size = buf.len();
-
-        // Get or create the page
-        let page = {
-            let mut cache = PAGE_CACHE.lock();
-            let mut frame_alloc = FrameAllocRef(&FRAME_ALLOCATOR);
-
-            let (page, _) = cache
-                .find_or_create_page(
-                    file_id,
-                    page_offset,
-                    file_size,
-                    &mut frame_alloc,
-                    false, // can_writeback
-                    true,  // unevictable
-                    &RAMFS_AOPS,
-                )
-                .map_err(page_err)?;
-            page
-        };
-
-        // Copy from buffer to page
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                buf.as_ptr(),
-                crate::arch::phys_to_virt(page.frame),
-                page_size,
-            );
-        }
-        page.mark_dirty();
-
-        Ok(page_size)
     }
 
     fn readlink(&self, inode: &Inode) -> Result<String, KernelError> {
@@ -682,42 +518,11 @@ impl InodeOps for RamfsInodeOps {
         Ok(())
     }
 
-    fn truncate(&self, inode: &Inode, length: u64) -> Result<(), KernelError> {
-        use crate::frame_alloc::FrameAllocRef;
-        use crate::{FRAME_ALLOCATOR, PAGE_CACHE};
-
-        // Cannot truncate directories
+    fn truncate(&self, inode: &Arc<Inode>, length: u64) -> Result<(), KernelError> {
         if inode.mode().is_dir() {
             return Err(KernelError::IsDirectory);
         }
-
-        let private = inode.get_private().ok_or(KernelError::Io)?;
-        let ramfs_data = private
-            .as_ref()
-            .as_any()
-            .downcast_ref::<RamfsInodeData>()
-            .ok_or(KernelError::Io)?;
-
-        let file_id = ramfs_data.file_id.ok_or(KernelError::Io)?;
-        let old_size = inode.get_size();
-
-        // If shrinking, free pages beyond the new size
-        if length < old_size {
-            // Calculate the first page offset that should be freed
-            // We need to keep partial pages, so round up
-            let from_page_offset = length.div_ceil(PAGE_SIZE as u64);
-
-            let mut cache = PAGE_CACHE.lock();
-            let mut frame_alloc = FrameAllocRef(&FRAME_ALLOCATOR);
-            cache.truncate_pages(file_id, from_page_offset, &mut frame_alloc);
-
-            // Zero the partial page content beyond the new size
-            // (handled by page cache - new reads will see zeros)
-        }
-
-        // Update inode size (pages are allocated lazily for extensions)
-        inode.set_size(length);
-
+        filemap::truncate_setsize(inode, length);
         Ok(())
     }
 
@@ -1067,7 +872,7 @@ impl FileOps for RamfsFileOps {
 
     /// Regular files map their data (Linux generic_file_mmap);
     /// directories have no mmap
-    fn mmap(&self, file: &File) -> Result<(), KernelError> {
+    fn mmap(&self, file: &File, _shared: bool) -> Result<(), KernelError> {
         match file.get_inode() {
             Some(i) if i.mode().is_dir() => Err(KernelError::NoDevice),
             _ => Ok(()),
@@ -1075,295 +880,27 @@ impl FileOps for RamfsFileOps {
     }
 
     fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {
-        use crate::frame_alloc::FrameAllocRef;
-        use crate::{FRAME_ALLOCATOR, PAGE_CACHE};
-
-        let inode = file.get_inode().ok_or(KernelError::BadFd)?;
-        let private = inode.get_private().ok_or(KernelError::Io)?;
-        let ramfs_data = private
-            .as_ref()
-            .as_any()
-            .downcast_ref::<RamfsInodeData>()
-            .ok_or(KernelError::Io)?;
-
-        let file_id = ramfs_data.file_id.ok_or(KernelError::Io)?;
-        let file_size = inode.get_size();
-        let pos = file.get_pos();
-
-        // EOF check
-        if pos >= file_size {
-            return Ok(0);
-        }
-
-        let available = (file_size - pos) as usize;
-        let to_read = min(buf.len(), available);
-
-        if to_read == 0 {
-            return Ok(0);
-        }
-
-        let mut bytes_read = 0;
-
-        while bytes_read < to_read {
-            let current_pos = pos + bytes_read as u64;
-            let page_offset = current_pos / PAGE_SIZE as u64;
-            let offset_in_page = (current_pos % PAGE_SIZE as u64) as usize;
-            let chunk_size = min(PAGE_SIZE - offset_in_page, to_read - bytes_read);
-
-            // Get or create page from cache (unevictable for ramfs)
-            let page = {
-                let mut cache = PAGE_CACHE.lock();
-                let mut frame_alloc = FrameAllocRef(&FRAME_ALLOCATOR);
-
-                let (page, _is_new) = cache
-                    .find_or_create_page(
-                        file_id,
-                        page_offset,
-                        file_size,
-                        &mut frame_alloc,
-                        false, // can_writeback: false for ramfs
-                        true,  // unevictable: true for ramfs
-                        &RAMFS_AOPS,
-                    )
-                    .map_err(read_err)?;
-                page
-            };
-
-            // Copy data from page to user buffer
-            unsafe {
-                let src = (crate::arch::phys_to_virt(page.frame) as *const u8).add(offset_in_page);
-                core::ptr::copy_nonoverlapping(src, buf[bytes_read..].as_mut_ptr(), chunk_size);
-            }
-
-            bytes_read += chunk_size;
-        }
-
-        file.advance_pos(bytes_read as u64);
-        Ok(bytes_read)
+        let n = self.pread(file, buf, file.get_pos())?;
+        file.advance_pos(n as u64);
+        Ok(n)
     }
 
     fn write(&self, file: &File, buf: &[u8]) -> Result<usize, KernelError> {
-        use crate::frame_alloc::FrameAllocRef;
-        use crate::{FRAME_ALLOCATOR, PAGE_CACHE};
-
-        let inode = file.get_inode().ok_or(KernelError::BadFd)?;
-        let private = inode.get_private().ok_or(KernelError::Io)?;
-        let ramfs_data = private
-            .as_ref()
-            .as_any()
-            .downcast_ref::<RamfsInodeData>()
-            .ok_or(KernelError::Io)?;
-
-        let file_id = ramfs_data.file_id.ok_or(KernelError::Io)?;
-        let pos = file.get_pos();
-
-        if buf.is_empty() {
-            return Ok(0);
-        }
-
-        // Calculate new file size if write extends file
-        let new_size = pos + buf.len() as u64;
-        let file_size = core::cmp::max(inode.get_size(), new_size);
-
-        let mut bytes_written = 0;
-
-        while bytes_written < buf.len() {
-            let current_pos = pos + bytes_written as u64;
-            let page_offset = current_pos / PAGE_SIZE as u64;
-            let offset_in_page = (current_pos % PAGE_SIZE as u64) as usize;
-            let chunk_size = min(PAGE_SIZE - offset_in_page, buf.len() - bytes_written);
-
-            // Get or create page from cache (unevictable for ramfs)
-            let page = {
-                let mut cache = PAGE_CACHE.lock();
-                let mut frame_alloc = FrameAllocRef(&FRAME_ALLOCATOR);
-
-                let found = cache
-                    .find_or_create_page(
-                        file_id,
-                        page_offset,
-                        file_size,
-                        &mut frame_alloc,
-                        false, // can_writeback: false for ramfs
-                        true,  // unevictable: true for ramfs
-                        &RAMFS_AOPS,
-                    )
-                    .map_err(page_err);
-                found.map(|(p, _)| p)
-            };
-            // Out of memory: a partial write reports what was written
-            let page = match page {
-                Ok(p) => p,
-                Err(_) if bytes_written > 0 => break,
-                Err(e) => return Err(e),
-            };
-
-            // Copy data from user buffer to page
-            unsafe {
-                let dst = crate::arch::phys_to_virt(page.frame).add(offset_in_page);
-                core::ptr::copy_nonoverlapping(buf[bytes_written..].as_ptr(), dst, chunk_size);
-            }
-
-            // Mark page as dirty (needed for proper reference counting)
-            page.mark_dirty();
-
-            bytes_written += chunk_size;
-        }
-
-        // Update file size if it grew
-        let end = pos + bytes_written as u64;
-        if end > inode.get_size() {
-            inode.set_size(end);
-        }
-
-        file.advance_pos(bytes_written as u64);
-        Ok(bytes_written)
+        let n = self.pwrite(file, buf, file.get_pos())?;
+        file.advance_pos(n as u64);
+        Ok(n)
     }
 
     fn pread(&self, file: &File, buf: &mut [u8], offset: u64) -> Result<usize, KernelError> {
-        use crate::frame_alloc::FrameAllocRef;
-        use crate::{FRAME_ALLOCATOR, PAGE_CACHE};
-
         let inode = file.get_inode().ok_or(KernelError::BadFd)?;
-        let private = inode.get_private().ok_or(KernelError::Io)?;
-        let ramfs_data = private
-            .as_ref()
-            .as_any()
-            .downcast_ref::<RamfsInodeData>()
-            .ok_or(KernelError::Io)?;
-
-        let file_id = ramfs_data.file_id.ok_or(KernelError::Io)?;
-        let file_size = inode.get_size();
-        let pos = offset;
-
-        // EOF check
-        if pos >= file_size {
-            return Ok(0);
-        }
-
-        let available = (file_size - pos) as usize;
-        let to_read = min(buf.len(), available);
-
-        if to_read == 0 {
-            return Ok(0);
-        }
-
-        let mut bytes_read = 0;
-
-        while bytes_read < to_read {
-            let current_pos = pos + bytes_read as u64;
-            let page_offset = current_pos / PAGE_SIZE as u64;
-            let offset_in_page = (current_pos % PAGE_SIZE as u64) as usize;
-            let chunk_size = min(PAGE_SIZE - offset_in_page, to_read - bytes_read);
-
-            // Get or create page from cache (unevictable for ramfs)
-            let page = {
-                let mut cache = PAGE_CACHE.lock();
-                let mut frame_alloc = FrameAllocRef(&FRAME_ALLOCATOR);
-
-                let (page, _is_new) = cache
-                    .find_or_create_page(
-                        file_id,
-                        page_offset,
-                        file_size,
-                        &mut frame_alloc,
-                        false, // can_writeback: false for ramfs
-                        true,  // unevictable: true for ramfs
-                        &RAMFS_AOPS,
-                    )
-                    .map_err(read_err)?;
-                page
-            };
-
-            // Copy data from page to user buffer
-            unsafe {
-                let src = (crate::arch::phys_to_virt(page.frame) as *const u8).add(offset_in_page);
-                core::ptr::copy_nonoverlapping(src, buf[bytes_read..].as_mut_ptr(), chunk_size);
-            }
-
-            bytes_read += chunk_size;
-        }
-
-        // NOTE: Unlike read(), we do NOT advance file position
-        Ok(bytes_read)
+        filemap::read(&inode, buf, offset).map_err(read_err)
     }
 
+    /// Linux generic_perform_write; the VFS holds i_rwsem. Out of
+    /// memory after some bytes is a short write.
     fn pwrite(&self, file: &File, buf: &[u8], offset: u64) -> Result<usize, KernelError> {
-        use crate::frame_alloc::FrameAllocRef;
-        use crate::{FRAME_ALLOCATOR, PAGE_CACHE};
-
         let inode = file.get_inode().ok_or(KernelError::BadFd)?;
-        let private = inode.get_private().ok_or(KernelError::Io)?;
-        let ramfs_data = private
-            .as_ref()
-            .as_any()
-            .downcast_ref::<RamfsInodeData>()
-            .ok_or(KernelError::Io)?;
-
-        let file_id = ramfs_data.file_id.ok_or(KernelError::Io)?;
-        let pos = offset;
-
-        if buf.is_empty() {
-            return Ok(0);
-        }
-
-        // Calculate new file size if write extends file
-        let new_size = pos + buf.len() as u64;
-        let file_size = core::cmp::max(inode.get_size(), new_size);
-
-        let mut bytes_written = 0;
-
-        while bytes_written < buf.len() {
-            let current_pos = pos + bytes_written as u64;
-            let page_offset = current_pos / PAGE_SIZE as u64;
-            let offset_in_page = (current_pos % PAGE_SIZE as u64) as usize;
-            let chunk_size = min(PAGE_SIZE - offset_in_page, buf.len() - bytes_written);
-
-            // Get or create page from cache (unevictable for ramfs)
-            let page = {
-                let mut cache = PAGE_CACHE.lock();
-                let mut frame_alloc = FrameAllocRef(&FRAME_ALLOCATOR);
-
-                let found = cache
-                    .find_or_create_page(
-                        file_id,
-                        page_offset,
-                        file_size,
-                        &mut frame_alloc,
-                        false, // can_writeback: false for ramfs
-                        true,  // unevictable: true for ramfs
-                        &RAMFS_AOPS,
-                    )
-                    .map_err(page_err);
-                found.map(|(p, _)| p)
-            };
-            // Out of memory: a partial write reports what was written
-            let page = match page {
-                Ok(p) => p,
-                Err(_) if bytes_written > 0 => break,
-                Err(e) => return Err(e),
-            };
-
-            // Copy data from user buffer to page
-            unsafe {
-                let dst = crate::arch::phys_to_virt(page.frame).add(offset_in_page);
-                core::ptr::copy_nonoverlapping(buf[bytes_written..].as_ptr(), dst, chunk_size);
-            }
-
-            // Mark page as dirty (needed for proper reference counting)
-            page.mark_dirty();
-
-            bytes_written += chunk_size;
-        }
-
-        // Update file size if it grew
-        let end = pos + bytes_written as u64;
-        if end > inode.get_size() {
-            inode.set_size(end);
-        }
-
-        // NOTE: Unlike write(), we do NOT advance file position
-        Ok(bytes_written)
+        filemap::perform_write(&inode, buf, offset).map_err(page_err)
     }
 
     fn readdir(&self, file: &File, ctx: &mut DirContext) -> Result<(), KernelError> {
@@ -1463,9 +1000,8 @@ impl SuperOps for RamfsSuperOps {
             // Symlinks need to be set up with a target later
             inode.set_private(Arc::new(RamfsInodeData::new_symlink(String::new())));
         } else {
-            // Regular file - needs FileId for page cache
-            let file_id = ramfs_file_id(sb, ino);
-            inode.set_private(Arc::new(RamfsInodeData::new_file(file_id)));
+            inode.set_private(Arc::new(RamfsInodeData::new_file()));
+            file_mapping(&inode);
         }
 
         Ok(inode)
@@ -1603,7 +1139,6 @@ pub fn ramfs_create_file_with_timestamp(
 
     // Create new file inode with content and explicit timestamp
     let ino = sb.alloc_ino();
-    let file_id = ramfs_file_id(&sb, ino);
 
     let new_inode = Arc::new(Inode::new(
         ino,
@@ -1615,8 +1150,9 @@ pub fn ramfs_create_file_with_timestamp(
         Arc::downgrade(&sb),
         &RAMFS_INODE_OPS,
     ));
-    new_inode.set_private(Arc::new(RamfsInodeData::new_file(file_id)));
-    fill_pages(file_id, content)?;
+    new_inode.set_private(Arc::new(RamfsInodeData::new_file()));
+    file_mapping(&new_inode);
+    fill_pages(&new_inode, content)?;
 
     // Add to parent directory
     parent_data
@@ -1637,38 +1173,10 @@ pub fn ramfs_create_file_with_timestamp(
 }
 
 /// Write `content` at offset 0 of a ramfs file's pages
-fn fill_pages(file_id: FileId, content: &[u8]) -> Result<(), KernelError> {
-    use crate::frame_alloc::FrameAllocRef;
-    use crate::{FRAME_ALLOCATOR, PAGE_CACHE};
-    let file_size = content.len() as u64;
-    let mut bytes_written = 0;
-    while bytes_written < content.len() {
-        let page_offset = bytes_written / PAGE_SIZE;
-        let offset_in_page = bytes_written % PAGE_SIZE;
-        let chunk_size = min(PAGE_SIZE - offset_in_page, content.len() - bytes_written);
-        let page = {
-            let mut cache = PAGE_CACHE.lock();
-            let mut frame_alloc = FrameAllocRef(&FRAME_ALLOCATOR);
-            let (page, _) = cache
-                .find_or_create_page(
-                    file_id,
-                    page_offset as u64,
-                    file_size,
-                    &mut frame_alloc,
-                    false, // can_writeback
-                    true,  // unevictable
-                    &RAMFS_AOPS,
-                )
-                .map_err(page_err)?;
-            page
-        };
-        // SAFETY: the page is this file's, mapped in the direct map
-        unsafe {
-            let dst = crate::arch::phys_to_virt(page.frame).add(offset_in_page);
-            core::ptr::copy_nonoverlapping(content[bytes_written..].as_ptr(), dst, chunk_size);
-        }
-        page.mark_dirty();
-        bytes_written += chunk_size;
+fn fill_pages(inode: &Inode, content: &[u8]) -> Result<(), KernelError> {
+    let n = filemap::perform_write(inode, content, 0).map_err(page_err)?;
+    if n < content.len() {
+        return Err(KernelError::NoSpace);
     }
     Ok(())
 }
@@ -1682,8 +1190,10 @@ pub fn ramfs_fill_file(inode: &Inode, content: &[u8]) -> Result<(), KernelError>
         .as_any()
         .downcast_ref::<RamfsInodeData>()
         .ok_or(KernelError::Io)?;
-    let file_id = data.file_id.ok_or(KernelError::InvalidArgument)?;
-    fill_pages(file_id, content)?;
+    if data.symlink_target.is_some() || inode.mode().is_dir() {
+        return Err(KernelError::InvalidArgument);
+    }
+    fill_pages(inode, content)?;
     inode.set_size(content.len() as u64);
     Ok(())
 }

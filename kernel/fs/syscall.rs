@@ -18,6 +18,7 @@ pub use super::open::*;
 pub use super::perm::*;
 pub use super::pollsys::*;
 pub use super::stat::*;
+pub use super::sync::*;
 
 use crate::fs::{KernelError, LookupFlags, Path, lookup_path_at};
 use crate::task::fdtable::get_task_fd;

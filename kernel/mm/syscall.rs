@@ -122,7 +122,7 @@ pub fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: 
         None
     };
     if let Some(f) = &file
-        && let Err(e) = file_prot_ok(f, prot, is_shared).and_then(|_| f.f_op.mmap(f))
+        && let Err(e) = file_prot_ok(f, prot, is_shared).and_then(|_| f.f_op.mmap(f, is_shared))
     {
         return e.sysret();
     }
@@ -1115,7 +1115,13 @@ fn mprotect_fixup(
     }
     let vma = mm.get_vma_mut(idx).ok_or(KernelError::OutOfMemory)?;
     vma.prot = prot;
-    let (s, e, shared) = (vma.start, vma.end, vma.is_shared());
+    // A dirty-tracked shared file mapping is written only after a write
+    // fault (which dirties the page): not made writable here
+    let (s, e, shared) = (
+        vma.start,
+        vma.end,
+        vma.is_shared() && !vma.wants_writenotify(),
+    );
     super::mprotect::change_protection(pgd, s, e, prot, shared);
     Ok((idx, e))
 }
@@ -1479,10 +1485,16 @@ fn move_mapping(
     if new_vma.is_locked() {
         mm.add_locked_vm(new_len / PAGE_SIZE);
     }
+    let inode = new_vma.inode();
     let idx = mm.insert_vma(new_vma);
     mm.add_total_vm(new_len / PAGE_SIZE);
     mm.merge_adjacent(idx);
-    super::mremap::move_ptes(owner, old_addr, new_addr, old_len);
+    // A file's i_mmap held across the move (Linux take_rmap_locks): a
+    // truncate walking it sees the entries at the old address or the new
+    {
+        let _rmap = inode.as_ref().map(|i| i.i_data.i_mmap.lock_write());
+        super::mremap::move_ptes(owner, old_addr, new_addr, old_len);
+    }
     if !dontunmap {
         // The old range's tables, now empty (Linux move_vma unmaps it)
         let (floor, ceiling) = mm.gap_around(old_addr, old_addr + old_len);

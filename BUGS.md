@@ -37,25 +37,40 @@ SO_PEEK_OFF is EOPNOTSUPP.
 
 Missing:
 
-- Reclaim (P4) swaps out private anonymous pages only, for
-  MADV_PAGEOUT: no accessed-bit aging (pages are reclaimed oldest
-  first), synchronous writes, no kswapd, no file pages; 2MB pages stay
+- Writeback (P5): the periodic pass writes every dirty inode of a
+  device (Linux only those dirty for vm.dirty_expire_centisecs, which
+  is stored but unused); past vm.dirty_ratio the writer writes its own
+  inode back synchronously instead of sleeping in balance_dirty_pages;
+  the limits are fractions of all managed memory (Linux: dirtyable
+  memory). No errseq: fsync reports a writeback error once, to the
+  caller that ran the writeback, not to every open file.
+
+- Reclaim (P4) drops clean, unmapped page-cache pages inode by inode
+  (no file LRU, no aging: Linux reclaims the oldest file pages; dirty
+  or mapped ones stay until written back or unmapped), then swaps out
+  private anonymous pages, also for MADV_PAGEOUT: no accessed-bit aging
+  (pages are reclaimed oldest first), synchronous writes, no kswapd; 2MB pages stay
   off the LRU (never reclaimed whole; a split puts their 4KB pages on
-  it). Pages exec copies the image into are not on the reverse map
-  (never swapped). Swap files go through the inode's readpage /
-  writepage, a page at a time. Page faults, swapoff, and heap and pipe
-  allocations that may sleep reclaim directly; page-cache allocations
-  (under the PAGE_CACHE spinlock) and atomic heap allocations never
-  do, so with anonymous memory filling RAM they fail at the low
-  watermark until kswapd (P6) keeps free memory above it.
+  it). Pages exec copies the image into (see the heap section) are not
+  on the reverse map (never swapped). An active swap file can still
+  be mapped writable (Linux: no write access to an S_SWAPFILE inode),
+  and copy_file_range into it is not refused (Linux ETXTBSY). Swap
+  files go through their filesystem's swap_rw,
+  a page at a time (walking the cluster chain each time; Linux maps
+  the extents once at swapon). Page faults, swapoff, page-cache, heap
+  and pipe allocations that may sleep reclaim directly; atomic heap
+  allocations never do, so with anonymous memory filling RAM they fail
+  at the low watermark until kswapd (P6) keeps free memory above it.
 - SysV shm: IPC_RMID removes the id at once (Linux keeps it, as
   IPC_PRIVATE with SHM_DEST, until the last detach: IPC_STAT and shmat
   by id still work there).
-- File mappings: MAP_SHARED of a file on a filesystem other than ramfs
-  (vfat) maps a private copy (writes do not reach the file or other
-  mappings); truncating a ramfs file does not unmap its shared pages
-  (they keep the old data instead of raising SIGBUS); MAP_PRIVATE file
-  pages are copied at fault, not shared until written.
+- File mappings: no fault-around (Linux maps up to 16 cached pages
+  per read fault); filesystems without a page cache (procfs) still
+  map a private copy. A truncate racing an mremap or fork of a mapping of
+  the file can miss entries in flight: mremap unlinks the old VMA from
+  i_mmap before its i_mmap-locked entry move, fork copies the parent's
+  entries after linking the child (Linux takes the rmap locks across
+  move_vma, and fork does not copy shared file entries).
 - MADV_REMOVE of a file mapping is EOPNOTSUPP (no filesystem punches
   holes); shmdt needs the address an attachment starts at (Linux also
   finds a piece moved by mremap); SHM_EXEC is ignored.
@@ -112,17 +127,16 @@ which has no control queue: QEMU then delivers all frames).
 PACKET_AUXDATA reports TP_STATUS_CSUM_VALID only for frames received on
 lo (hk has no checksum offload states).
 
-## File lock gaps (Phase E)
+## File lock gaps
 
-**Location**: `kernel/fs/flock.rs`, `kernel/fs/posix_lock.rs`
+**Location**: `kernel/fs/locks.rs`, `kernel/fs/posix_lock.rs`
 
-Blocking flock and fcntl F_SETLKW / F_OFD_SETLKW never wait: a
-conflicting lock is EAGAIN (Linux sleeps, interruptibly, with deadlock
-detection for POSIX locks: EDEADLK). The tables are global and keyed
-by raw dentry / inode pointers with no reference held (an inode freed
-and reused, once Phase E's icache evicts, inherits stale locks); POSIX
-lock owners are pids, not the files_struct (Linux fl_owner). Linux
-keeps them per inode (i_flctx: flock, posix and lease lists).
+POSIX lock owners are pids, not the files_struct (Linux fl_owner):
+threads of one process share them, but a CLONE_FILES child that is
+another process has its own (Linux: one owner), and a process's locks
+are released at its exit through a global list of the inodes with
+POSIX locks (searched on each F_SETLK, scanned at each exit). No
+leases (F_SETLEASE) and no OFD locks (F_OFD_*).
 
 ## seccomp gaps
 
@@ -172,8 +186,7 @@ SIOCUNIXFILE, SO_PEERSEC (ENOPROTOOPT, as on Linux without an LSM).
 
 Missing: fs.protected_hardlinks/symlinks/fifos/regular do not exist
 (behave as their kernel default 0); no
-immutable/append-only inodes (no IS_APPEND/IS_IMMUTABLE EPERM);
-chmod/chown do not update ctime; ETXTBSY is not enforced.
+immutable/append-only inodes (no IS_APPEND/IS_IMMUTABLE EPERM).
 
 ## Spinlocks where Linux uses sleeping locks
 
@@ -319,7 +332,7 @@ parallel). Next occurrence: capture the Message line.
 
 ## ramfs has no size limit
 
-**Location**: `kernel/fs/ramfs.rs`, `kernel/mm/page_cache.rs`,
+**Location**: `kernel/fs/ramfs.rs`, `kernel/mm/filemap.rs`,
 `kernel/frame_alloc.rs`
 
 ramfs (the root filesystem and every ramfs mount) is bounded only by
@@ -353,8 +366,10 @@ sockets or fds); a large contiguous kmalloc can fail first (over 4MB
 always, no vmalloc; above low - min, about 700KB at 512MB, once free
 memory is near the low watermark).
 
-exec copies the PT_LOAD segments page by page (not mapped from the
-page cache like Linux binfmt_elf). Kernel object leaks cost free
+exec maps PT_LOAD segments from the page cache, except a static PIE
+with no interpreter (hk relocates it in the kernel, so its pages are
+private copies; Linux applies no relocations at all) and the partial
+last page and bss of each segment (copied). Kernel object leaks cost free
 memory: each fork+exec keeps two dentries and two inodes plus ~900
 bytes of kmalloc (~1.3KB; suspected: procfs entries of dead pids, for
 the dcache work). The MM_LIFE tests count MemFree + Slab so they check user memory only; these leaks
@@ -486,18 +501,22 @@ mode, a short power-button press does nothing). Only the 32-bit FADT
 block fields are read (no X_ GAS forms, no hardware-reduced ACPI), and
 a reset register in PCI configuration space is ignored.
 
+## vfat file I/O walks the whole cluster chain per page
+
+**Location**: `kernel/fs/vfat.rs` (`page_runs`)
+
+Every read_folio, writepage and swap_rw of a vfat file rebuilds its
+whole cluster chain from the FAT (through the device cache) to find a
+page's clusters, so reading or writing back a file is quadratic in its
+size (a 1GB file of 4KB clusters: about 3e10 FAT lookups). Linux
+fat_get_cluster keeps a per-inode cache of chain positions
+(fat_cache); one is needed before large vfat files or vfat swap files.
+
 ## Block layer gaps (P1)
 
 **Location**: `kernel/storage/`, `kernel/virtio/blk.rs`,
 `kernel/fs/blkdev_ops.rs`, `kernel/fs/vfat.rs`
 
-- No page cache in front of block device files (P5): reads and writes
-  are synchronous bios. A filesystem's cached block device pages (vfat
-  keeps the FAT, directories and data of its partition in the global
-  page cache) are not coherent with I/O through the device node; Linux
-  shares one bdev mapping. Two writers of the same sector through
-  unaligned writes can lose one update (each reads, patches and writes
-  the sector without a page lock).
 - Partition tables are parsed in 512-byte sectors: on a disk with
   larger logical blocks, GPT LBAs and MBR sector counts are misread
   (Linux scales by the logical block size). MBR: no BSD, Solaris,
@@ -518,9 +537,9 @@ a reset register in PCI configuration space is ignored.
 - No /proc/devices block section, no /sys/block; the first disk
   registered decides the dynamic major (254 down, like Linux, but Linux
   usually has other dynamic majors registered first).
-- A mounted filesystem or active swap does not open its block device:
-  opening it O_EXCL, writes to a swap partition (Linux ETXTBSY) and
-  BLKBSZSET on a mounted partition are not refused.
+- A mounted filesystem or active swap opens its block device, but not
+  exclusively: opening it O_EXCL and BLKBSZSET on a mounted partition
+  are not refused.
 
 ## Code-quality audit findings (2026-11-01), by phase
 
@@ -542,17 +561,10 @@ sched pid 0, flock/POSIX release, signalfd reader, errno flattening.
   and RT signal queueing are lost); waitid without WEXITED is EINVAL
   (C); semctl GETNCNT/GETZCNT are 0; fallocate PUNCH_HOLE succeeds
   without zeroing (F).
-- **Anonymous-inode files** (E): eleven copies of the dentry setup
-  (eventfd, timerfd, epoll, signalfd, pidfd, inotify, fanotify,
-  io_uring, bpf, pipe, mqueue), all inode number 0 (every pipe is
-  `pipe:[0]`), mode S_IFREG|0600 (Linux: 0600, no type), names unlike
-  Linux's (`epoll` vs `[eventpoll]`). One anon_inode_getfile, pipefs
-  numbers from get_next_ino.
 - **Copied helpers** (J, or as touched): `get_nofile_limit` in eight
   places; `find_task_by_pid` in four (all root-namespace pids); four
   `current_time`s; about ten user-timespec readers each validating
-  (Linux get_timespec64); USER_HZ open-coded in three (times() assumes
-  a scheduler tick is a USER_HZ tick); three iovec structs and five
+  (Linux get_timespec64); three iovec structs and five
   importers; five SigInfo, three Timeval, two Timespec types; two path
   splitters that disagree on `.`/`..` (G).
 - **Error conventions** (as touched): Result<_, KernelError> about 618
@@ -570,7 +582,7 @@ sched pid 0, flock/POSIX release, signalfd reader, errno flattening.
   arch), 32 direct `arch::x86_64::`/`aarch64::` references, three
   `CurrentArch` redefinitions.
 - **Globals where per-CPU fits** (I/C/E): TCP timers in one map run on
-  softnet/0 only; CHILD_EXIT_WQ; the file lock tables.
+  softnet/0 only; CHILD_EXIT_WQ.
 - **ID allocators** (J): PidMap, fdbits, IPC ids, and plain counters
   (bpf, keys, mqueue, posix timers, which wrap with no collision
   check): one IDR/IDA.
@@ -578,9 +590,6 @@ sched pid 0, flock/POSIX release, signalfd reader, errno flattening.
   (no seq_file records, so chunked reads of /proc/net/* can tear);
   global generators run under the procfs inode's read lock and take
   TASKLIST and network locks inside it (not in LOCKING.md).
-- **Two page-I/O interfaces** (E): `InodeOps::readpage/writepage` and
-  page_cache's own, with a FileId-keyed global cache and
-  DIRTY_ADDRESS_SPACES.
 - **Stale comments and dead code** (as touched): about 155
   `#[allow(dead_code)]`, 90 "for now"/TODO markers; comments that
   contradict the code in `task/id.rs:87`, `ns/mod.rs:558`,
@@ -613,41 +622,6 @@ expected to fix it; "next batch" means the next fix batch.
    mounts of one superblock (bind mounts) is EXDEV on Linux. Needs
    Path{mnt,dentry}; TODO in place for linkat.
 
-## P1 review findings (open)
-From the P1 /code-review (unverified unless noted). Tag = phase that fixes it.
-1. **Failed-read pages never discarded** (P5; confirmed by reading).
-   `kernel/mm/page_cache.rs:892` discard_page needs refcount 0, but
-   find_or_create_page returns refcount 1 and vfat read_bytes /
-   write_bytes never put it, so the discard is a no-op: after an I/O
-   error the zero page is served as FAT/dir data.
-2. **No uptodate/page lock on block-device pages** (P5).
-   `kernel/fs/vfat.rs:503` inserts the page before the bio read; a
-   concurrent reader copies zeros, a concurrent partial write is
-   overwritten when the DMA lands. Linux: folio locked + !uptodate
-   until read completes.
-3. **BLKRRPART/umount don't invalidate the bdev page cache** (P5).
-   `kernel/storage/genhd.rs:118`: cache keyed by (major, minor); a
-   re-created partition reusing a minor inherits stale and dirty
-   pages, which write back at old offsets.
-4. **logical_block_size ignored** (next batch).
-   `kernel/storage/blkdev.rs:768`: partition scan and RMW issue 512B
-   bios; a 4Kn disk shows no partitions and 512B pread gives EIO.
-5. **parts_held uses Arc::strong_count** (next batch).
-   `kernel/storage/genhd.rs:107`: transient clones (writeback,
-   readpage) give spurious EBUSY; mount doesn't take open_mutex, so a
-   mount can race drop_bdevs and get a dead device.
-6. **Disk removal without open_mutex** (next batch).
-   `kernel/storage/sd.rs:381` del_gendisk → drop_bdevs unlocked: races
-   BlockDevice::open (opener of a removed partition) and BLKRRPART
-   rescans (stale registry entries / /dev nodes).
-7. **Segment limits** (next batch). `kernel/storage/blkdev.rs:674`
-   max_io assumes PAGE/seg per page; bdev_rw_frame ignores
-   max_segments: SIZE_MAX < 4096 without SEG_MAX overflows SEG_MAX /
-   MAX_SEGS → EIO.
-9. **Write path copies** (P5). `kernel/storage/blkdev.rs:749`:
-   writes take `&mut [u8]` (to_vec + bounce copy per page); unaligned
-   bdev_rw_bytes allocates a request-sized temp buffer.
-
 ## P2 review findings (open)
 From the P2 /code-review (unverified). Tag = when to fix.
 1. **pcp_free drains the hot end** (next batch).
@@ -663,11 +637,6 @@ From the P3 /code-review (unverified). Tag = when to fix.
 1. **Remote write gives up after 16 COW tries** (next batch).
    `kernel/mm/remote.rs:176`: spurious EFAULT; break COW and write
    under one PTE-lock hold, or loop until fatal_signal_pending.
-3. **Minor** (next batch): `kernel/uaccess.rs:235` fault_in_writeable
-   unused and duplicates populate_pages; `kernel/fs/io.rs:68`
-   copy_in always uses the atomic+fault-in copy (only i_rwsem writers
-   need it); `kernel/task/misc.rs:244` USER_HZ duplicated, times()
-   assumes TICK_MS == 10.
 
 ## Fix batch 1 review findings (open)
 From the fix-batch-1 /code-review (unverified). Tag = when to fix.
@@ -696,9 +665,6 @@ Found during T0 (2026-10-19). Tag = when to fix.
    getpid/gettid/kill/wait//proc use the root number; a CLONE_NEWPID
    child is not pid 1 in its namespace. Use `Pid::nr_in(caller's ns)`
    at the syscall boundary.
-4. **`virt_to_phys(p & !0xfff)` duplicated** (next batch) in
-   `Move::ptes`, `PteRange::at` and `ptl::pte_lock`: add one
-   `ptl::table_of_ptep()`.
 5. **BUSYBOX_NC_LO flaky, on hk and the Linux reference** (next
    batch): `BUSYBOX_NC_LO:FAIL status=0` (nc over loopback) in 1 of 5
    x86 `check-linux` runs, and in an hk x86 boot with one CPU

@@ -12,22 +12,18 @@
 //! is fixed at creation; a page past it is SIGBUS.
 //!
 //! The page index is an [`XArray`] (Linux uses the page cache's
-//! xarray) whose nodes are frames of user memory, allocated as pages
-//! are touched. Nothing is taken from the kernel heap: what a process
-//! can make the kernel hold for it stops at the low watermark like its
-//! pages.
+//! xarray), its nodes (one per 64 pages) from the kernel heap.
 //!
 //! Locking: `Shmem.root` is a spin lock taken by the fault path under
 //! the mm lock (mm lock -> Shmem.root) and by MADV_REMOVE with no lock
-//! held; under it only `FRAME_ALLOCATOR` is taken. The drop takes no
+//! held; under it only `FRAME_ALLOCATOR` and the heap are taken. The drop takes no
 //! lock (doc/LOCKING.md, Address Spaces).
 
 use alloc::sync::Arc;
 
 use super::fault::VmFault;
-use super::xarray::XArray;
+use super::xarray::{XArray, node_alloc};
 use crate::FRAME_ALLOCATOR;
-use crate::arch::phys_to_virt;
 use crate::sync::spin::Mutex;
 
 /// The pages of a shared anonymous object, by page index
@@ -41,8 +37,8 @@ pub struct Shmem {
 /// A zeroed frame of user memory
 fn zeroed() -> Option<u64> {
     let f = super::fault::alloc_user()?;
-    // SAFETY: a fresh frame, reached through the direct map
-    unsafe { core::ptr::write_bytes(phys_to_virt(f), 0, 4096) };
+    // SAFETY: a fresh frame, ours alone
+    unsafe { super::page::clear_page(f) };
     Some(f)
 }
 
@@ -57,8 +53,8 @@ impl Shmem {
 
     /// The page at index `idx` (Linux shmem_get_folio), zeroed on first
     /// use, with a reference taken for the caller's PTE. Past the size
-    /// (a mapping grown by mremap) is SIGBUS, like Linux; pages and index
-    /// nodes come from user memory, which stops at the low watermark.
+    /// (a mapping grown by mremap) is SIGBUS, like Linux; pages come
+    /// from user memory, which stops at the low watermark.
     pub fn get_page(&self, idx: u64) -> Result<u64, VmFault> {
         if idx >= self.size {
             return Err(VmFault::Bus);
@@ -67,7 +63,7 @@ impl Shmem {
         let mut page = root.load(idx);
         if page == 0 {
             page = zeroed().ok_or(VmFault::Oom)?;
-            if root.store(idx, page, &mut zeroed).is_none() {
+            if root.store(idx, page, &mut node_alloc).is_none() {
                 FRAME_ALLOCATOR.free(page);
                 return Err(VmFault::Oom);
             }
@@ -87,14 +83,19 @@ impl Shmem {
         if from >= to {
             return;
         }
-        self.root.lock().for_each(from, to, &mut |_, e| {
-            if FRAME_ALLOCATOR.refcount(*e) <= 1 {
-                FRAME_ALLOCATOR.decref(core::mem::take(e));
+        let mut root = self.root.lock();
+        let mut at = from;
+        while let Some((i, e)) = root.find(at, to - 1, None) {
+            if FRAME_ALLOCATOR.refcount(e) <= 1 {
+                root.erase(i);
+                FRAME_ALLOCATOR.decref(e);
             } else {
-                // SAFETY: a page of the object, through the direct map
-                unsafe { core::ptr::write_bytes(phys_to_virt(*e), 0, 4096) };
+                // SAFETY: a page of the object, under `root`; the zeroing
+                // races user writes through mappings as on Linux
+                unsafe { super::page::clear_page(e) };
             }
-        });
+            at = i + 1;
+        }
     }
 }
 

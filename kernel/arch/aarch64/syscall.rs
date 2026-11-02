@@ -323,6 +323,8 @@ pub const SYS_RT_TGSIGQUEUEINFO: u64 = 240;
 pub const SYS_MEMBARRIER: u64 = 283;
 
 // File readahead syscall
+pub const SYS_FADVISE64: u64 = 223;
+pub const SYS_SYNC_FILE_RANGE: u64 = 84;
 pub const SYS_READAHEAD: u64 = 213;
 
 // NUMA memory policy (Section 4.2)
@@ -1012,6 +1014,17 @@ pub fn aarch64_syscall_dispatch(
         SYS_MEMBARRIER => {
             crate::membarrier::sys_membarrier(arg0 as i32, arg1 as u32, arg2 as i32) as u64
         }
+
+        SYS_FADVISE64 => {
+            crate::fs::syscall::sys_fadvise64(arg0 as i32, arg1 as i64, arg2 as i64, arg3 as i32)
+                as u64
+        }
+        SYS_SYNC_FILE_RANGE => crate::fs::syscall::sys_sync_file_range(
+            arg0 as i32,
+            arg1 as i64,
+            arg2 as i64,
+            arg3 as u32,
+        ) as u64,
 
         // readahead syscall
         SYS_READAHEAD => {

@@ -12,9 +12,9 @@ use super::helpers::{
     BlkDev, dev_major, dev_minor, find_blkdev, print, print_num, println, read_file,
 };
 use hk_syscall::{
-    O_CREAT, O_RDONLY, O_RDWR, Stat, sys_close, sys_fstat, sys_fsync, sys_ioctl, sys_lseek,
+    O_CREAT, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY, Stat, sys_close, sys_fstat, sys_fsync, sys_ioctl, sys_lseek,
     sys_mkdir, sys_mount, sys_open, sys_pread64, sys_pwrite64, sys_read, sys_stat, sys_swapoff,
-    sys_swapon, sys_umount2,
+    sys_rename, sys_swapon, sys_umount2, sys_unlink,
 };
 
 const BLKROGET: u64 = 0x125e;
@@ -106,8 +106,40 @@ pub fn run_tests() {
     pattern_write(&d.p3);
     eof(&d.p3);
     rrpart(&d);
-    vfat(&d.p1);
+    vfat(&d);
     swap(&d.p2);
+    cache(&d.p3);
+}
+
+/// A block device's page cache (Linux bd_mapping): pwrite, pread and a
+/// MAP_SHARED mapping of the node see one copy; the last close writes
+/// it to the disk (a new open reads it back from there)
+fn cache(p3: &BlkDev) {
+    use hk_syscall::{MAP_SHARED, PROT_READ, PROT_WRITE, sys_mmap, sys_munmap};
+    const OFF: u64 = 8 << 20;
+    let a = open_dev(p3, O_RDWR);
+    let b = open_dev(p3, O_RDWR);
+    let w = sys_pwrite64(a, b"coherent".as_ptr(), 8, OFF as i64);
+    let p = sys_mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, b, OFF);
+    let mut ok = w == 8 && p > 0;
+    if p > 0 {
+        let m = unsafe { core::slice::from_raw_parts_mut(p as *mut u8, 4096) };
+        ok &= &m[..8] == b"coherent";
+        m[100..104].copy_from_slice(b"mmap");
+        sys_munmap(p as u64, 4096);
+    }
+    let mut got = [0u8; 4];
+    sys_pread64(a, got.as_mut_ptr(), 4, OFF as i64 + 100);
+    ok &= &got == b"mmap";
+    verdict(b"BLK_CACHE_COHERENT", ok, w);
+    let w2 = sys_pwrite64(a, b"on disk!".as_ptr(), 8, OFF as i64 + 512);
+    sys_close(a as u64);
+    sys_close(b as u64);
+    let c = open_dev(p3, O_RDONLY);
+    let mut back = [0u8; 8];
+    let n = sys_pread64(c, back.as_mut_ptr(), 8, OFF as i64 + 512);
+    sys_close(c as u64);
+    verdict(b"BLK_WRITEBACK_CLOSE", w2 == 8 && n == 8 && &back == b"on disk!", n);
 }
 
 /// vda1..3 are partitions 1..3 of vda: same major, minors follow
@@ -312,7 +344,8 @@ fn rrpart(d: &Disk) {
 }
 
 /// Mount vda1 (vfat) and read the file mkdisk.sh put there; write one
-fn vfat(p1: &BlkDev) {
+fn vfat(d: &Disk) {
+    let p1 = &d.p1;
     let mut p = [0u8; 48];
     sys_mkdir(b"/mnt\0".as_ptr(), 0o755);
     sys_mkdir(b"/mnt/vd1\0".as_ptr(), 0o755);
@@ -349,8 +382,264 @@ fn vfat(p1: &BlkDev) {
         ok && n == 7,
         if fd < 0 { fd as i64 } else { n },
     );
+    // A mounted partition is open (Linux: the mount opens the device):
+    // a rescan of its disk is EBUSY
+    let disk = open_dev(&d.whole, O_RDONLY);
+    let busy = sys_ioctl(disk, BLKRRPART, 0);
+    sys_close(disk as u64);
+    verdict(b"BLK_RRPART_MOUNTED", busy == EBUSY, busy);
+    vfat_mmap_write();
+    vfat_swapfile();
+    drop_caches();
+    vfat_rename_ino();
+    vfat_unlink_open();
+    vfat_unlink_reuse();
     let u = sys_umount2(b"/mnt/vd1\0".as_ptr(), 0);
     verdict(b"BLK_VFAT_UMOUNT", u == 0, u);
+    vfat_remount(p1);
+}
+
+/// What was written through the page cache (write() and a shared
+/// mapping) reached the disk at umount: a new mount reads it
+fn vfat_remount(p1: &BlkDev) {
+    let mut p = [0u8; 48];
+    let r = sys_mount(
+        p1.path(&mut p).as_ptr(),
+        b"/mnt/vd1\0".as_ptr(),
+        b"vfat\0".as_ptr(),
+        0,
+        b"iocharset=cp437\0".as_ptr() as u64,
+    );
+    let mut b = [0u8; 9000];
+    let n = read_file(b"/mnt/vd1/M.TXT\0", &mut b);
+    let ok = r == 0
+        && n == 8192
+        && b[..4096].iter().all(|&c| c == b'w')
+        && &b[4096..4100] == b"MMAP"
+        && &b[4196..4200] == b"MPRO"
+        && b[4100..4196].iter().all(|&c| c == 0)
+        && b[4200..8192].iter().all(|&c| c == 0);
+    sys_unlink(b"/mnt/vd1/M.TXT\0".as_ptr());
+    let u = sys_umount2(b"/mnt/vd1\0".as_ptr(), 0);
+    if !ok {
+        // Where the data differs: first bad offset and its byte
+        let bad = (0..n.max(0) as usize).find(|&i| {
+            b[i] != if i < 4096 {
+                b'w'
+            } else if i < 4100 {
+                b"MMAP"[i - 4096]
+            } else if (4196..4200).contains(&i) {
+                b"MPRO"[i - 4196]
+            } else {
+                0
+            }
+        });
+        print(b"VFAT_REMOUNT_DATA: bad at ");
+        print_num(bad.map_or(-1, |i| i as i64));
+        print(b" byte ");
+        print_num(bad.map_or(-1, |i| b[i] as i64));
+        println(b"");
+    }
+    verdict(b"VFAT_REMOUNT_DATA", ok && u == 0, n);
+}
+
+/// Write `v` to /proc/sys/vm/drop_caches
+fn drop_caches_write(v: &[u8]) -> i64 {
+    let fd = sys_open(b"/proc/sys/vm/drop_caches\0".as_ptr(), O_WRONLY, 0) as i32;
+    let r = hk_syscall::sys_write(fd as u64, v.as_ptr(), v.len() as u64);
+    sys_close(fd as u64);
+    r
+}
+
+/// vm.drop_caches 1 frees the clean page cache of a vfat file (Linux
+/// drop_pagecache_sb): Cached falls by at least half its size (other
+/// activity moves Cached on Linux); ramfs data
+/// (only in the cache) survives it
+fn drop_caches() {
+    use super::helpers::proc_kb;
+    let fd = sys_open(b"/mnt/vd1/DC.BIN\0".as_ptr(), O_RDWR | O_CREAT, 0o644) as i32;
+    let buf = [b'd'; 4096];
+    for i in 0..256 {
+        sys_pwrite64(fd, buf.as_ptr(), 4096, i * 4096);
+    }
+    sys_fsync(fd);
+    let before = proc_kb(b"/proc/meminfo\0", b"Cached:");
+    let w = drop_caches_write(b"1\n");
+    let after = proc_kb(b"/proc/meminfo\0", b"Cached:");
+    let mut back = [0u8; 4096];
+    let n = sys_pread64(fd, back.as_mut_ptr(), 4096, 255 * 4096);
+    sys_close(fd as u64);
+    sys_unlink(b"/mnt/vd1/DC.BIN\0".as_ptr());
+    verdict(
+        b"DROP_CACHES",
+        w == 2 && before - after >= 512 && n == 4096 && back == buf,
+        before - after,
+    );
+    let t = sys_open(b"/tmp/dc_ramfs\0".as_ptr(), O_RDWR | O_CREAT, 0o644) as i32;
+    sys_pwrite64(t, b"ramfs keeps it".as_ptr(), 14, 0);
+    let w = drop_caches_write(b"3\n");
+    let mut r = [0u8; 14];
+    let n = sys_pread64(t, r.as_mut_ptr(), 14, 0);
+    sys_close(t as u64);
+    sys_unlink(b"/tmp/dc_ramfs\0".as_ptr());
+    verdict(b"DROP_CACHES_RAMFS", w == 2 && n == 14 && &r == b"ramfs keeps it", n);
+}
+
+/// A vfat file can be a swap area (Linux: bmap, generic swapfile
+/// activation): swapon checks its header against the file (last_page
+/// 0 and an area past the file are EINVAL); one that fits works
+fn vfat_swapfile() {
+    use hk_syscall::sys_ftruncate;
+    let path = b"/mnt/vd1/SWAP.BIN\0";
+    let mut got = [0i64; 3];
+    let mut busy = [0i64; 4];
+    for (i, last) in [0u32, 0x7fff_ffff, 255].into_iter().enumerate() {
+        let fd = sys_open(path.as_ptr(), O_RDWR | O_CREAT, 0o600) as i32;
+        let mut hdr = [0u8; 4096];
+        hdr[1024..1028].copy_from_slice(&1u32.to_ne_bytes());
+        hdr[1028..1032].copy_from_slice(&last.to_ne_bytes());
+        hdr[4086..].copy_from_slice(b"SWAPSPACE2");
+        let ok = sys_pwrite64(fd, hdr.as_ptr(), 4096, 0) == 4096 && sys_ftruncate(fd, 256 * 4096) == 0;
+        sys_fsync(fd);
+        sys_close(fd as u64);
+        got[i] = if ok { sys_swapon(path.as_ptr(), 0) } else { -1000 };
+        if got[i] == 0 {
+            // Active: no write, truncate (also by O_TRUNC) or unlink
+            // (Linux IS_SWAPFILE: ETXTBSY, EPERM for unlink)
+            let fd = sys_open(path.as_ptr(), O_WRONLY, 0) as i32;
+            let w = sys_pwrite64(fd, b"x".as_ptr(), 1, 8192);
+            let t = sys_ftruncate(fd, 4096);
+            sys_close(fd as u64);
+            let ot = sys_open(path.as_ptr(), O_WRONLY | O_TRUNC, 0);
+            let un = hk_syscall::sys_unlink(path.as_ptr());
+            busy = [w, t, ot, un];
+            got[i] = sys_swapoff(path.as_ptr()) * 100;
+        }
+    }
+    sys_unlink(path.as_ptr());
+    verdict(
+        b"VFAT_SWAPFILE",
+        got[0] == EINVAL && got[1] == EINVAL && got[2] == 0,
+        got[0] * 10000 + got[1] * 100 + got[2],
+    );
+    verdict(
+        b"VFAT_SWAPFILE_BUSY",
+        busy == [-26, -26, -26, -1],
+        busy[0] * 1000 + busy[1] * 100 + busy[2] * 10 + busy[3],
+    );
+}
+
+/// A shared mapping of a vfat file is its page cache (Linux
+/// fat_file_mmap): read() sees a write through it, and it sees write()
+fn vfat_mmap_write() {
+    use hk_syscall::{MAP_SHARED, PROT_READ, PROT_WRITE, sys_ftruncate, sys_mmap, sys_munmap};
+    let fd = sys_open(b"/mnt/vd1/M.TXT\0".as_ptr(), O_RDWR | O_CREAT, 0o644) as i32;
+    let page = [b'w'; 4096];
+    let w = sys_pwrite64(fd, page.as_ptr(), 4096, 0);
+    let t = sys_ftruncate(fd, 8192);
+    let m = sys_mmap(0, 8192, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    let mut ok = fd >= 0 && w == 4096 && t == 0 && m > 0;
+    if m > 0 {
+        let v = unsafe { core::slice::from_raw_parts_mut(m as *mut u8, 8192) };
+        ok &= v[10] == b'w' && v[5000] == 0;
+        v[4096..4100].copy_from_slice(b"mmap");
+        sys_pwrite64(fd, b"W".as_ptr(), 1, 11);
+        ok &= v[11] == b'W';
+        // Written back (and write-protected): a write through the
+        // mapping now must dirty the page again (Linux folio_mkclean)
+        ok &= sys_fsync(fd) == 0;
+        v[4096..4100].copy_from_slice(b"MMAP");
+        sys_munmap(m as u64, 8192);
+        // Read-only, read, then made writable by mprotect: the store
+        // must still dirty the page (Linux vma_wants_writenotify keeps
+        // the entry read-only until a write fault). Written back first,
+        // so the page is clean.
+        ok &= sys_fsync(fd) == 0;
+        let r = sys_mmap(0, 4096, PROT_READ, MAP_SHARED, fd, 4096);
+        if r > 0 {
+            let w = unsafe { core::slice::from_raw_parts_mut(r as *mut u8, 4096) };
+            ok &= w[0] == b'M';
+            ok &= hk_syscall::sys_mprotect(r as u64, 4096, PROT_READ | PROT_WRITE) == 0;
+            w[100..104].copy_from_slice(b"MPRO");
+            sys_munmap(r as u64, 4096);
+        } else {
+            ok = false;
+        }
+    }
+    let mut got = [0u8; 4];
+    sys_pread64(fd, got.as_mut_ptr(), 4, 4096);
+    sys_pwrite64(fd, b"w".as_ptr(), 1, 11);
+    sys_close(fd as u64);
+    verdict(b"VFAT_MAP_SHARED", ok && &got == b"MMAP", w);
+}
+
+/// An open file renamed is still the same inode under its new name
+/// (one inode per FAT entry, moved with it: Linux fat_iget/fat_attach)
+fn vfat_rename_ino() {
+    let fd = sys_open(b"/mnt/vd1/A.TXT\0".as_ptr(), O_RDWR | O_CREAT, 0o644) as i32;
+    let r = sys_rename(b"/mnt/vd1/A.TXT\0".as_ptr(), b"/mnt/vd1/B.TXT\0".as_ptr());
+    let mut a: Stat = unsafe { core::mem::zeroed() };
+    let mut b: Stat = unsafe { core::mem::zeroed() };
+    sys_fstat(fd, &mut a);
+    let s = sys_stat(b"/mnt/vd1/B.TXT\0".as_ptr(), &mut b);
+    sys_close(fd as u64);
+    sys_unlink(b"/mnt/vd1/B.TXT\0".as_ptr());
+    verdict(
+        b"VFAT_RENAME_INO",
+        fd >= 0 && r == 0 && s == 0 && a.st_ino == b.st_ino,
+        r * 1000 + s,
+    );
+}
+
+/// Growing an unlinked, still open file never touches the directory
+/// entry of a new file that took its name (Linux fat_detach)
+fn vfat_unlink_reuse() {
+    let p = b"/mnt/vd1/R.TXT\0";
+    let old = sys_open(p.as_ptr(), O_RDWR | O_CREAT, 0o644) as i32;
+    let un = sys_unlink(p.as_ptr());
+    let new = sys_open(p.as_ptr(), O_RDWR | O_CREAT, 0o644) as i32;
+    let wn = sys_pwrite64(new, b"new".as_ptr(), 3, 0);
+    sys_close(new as u64);
+    let big = [b'o'; 8192];
+    let wo = sys_pwrite64(old, big.as_ptr(), big.len() as u64, 0);
+    sys_fsync(old);
+    let mut b = [0u8; 16];
+    let n = read_file(p, &mut b);
+    sys_close(old as u64);
+    sys_unlink(p.as_ptr());
+    verdict(
+        b"VFAT_UNLINK_REUSE",
+        un == 0 && wn == 3 && wo == 8192 && n == 3 && &b[..3] == b"new",
+        n,
+    );
+}
+
+/// An unlinked file still open keeps its data: its clusters are not
+/// reused by a new file until the last close (Linux fat_evict_inode)
+fn vfat_unlink_open() {
+    let mut buf = [0u8; 16384];
+    buf.fill(b'u');
+    let fd = sys_open(b"/mnt/vd1/U.TXT\0".as_ptr(), O_RDWR | O_CREAT, 0o644) as i32;
+    let w = sys_pwrite64(fd, buf.as_ptr(), buf.len() as u64, 0);
+    sys_fsync(fd);
+    let un = sys_unlink(b"/mnt/vd1/U.TXT\0".as_ptr());
+    buf.fill(b'v');
+    let v = sys_open(b"/mnt/vd1/V.TXT\0".as_ptr(), O_RDWR | O_CREAT, 0o644) as i32;
+    let wv = sys_pwrite64(v, buf.as_ptr(), buf.len() as u64, 0);
+    sys_fsync(v);
+    sys_close(v as u64);
+    buf.fill(0);
+    let n = sys_pread64(fd, buf.as_mut_ptr(), buf.len() as u64, 0);
+    let mut st: Stat = unsafe { core::mem::zeroed() };
+    sys_fstat(fd, &mut st);
+    sys_close(fd as u64);
+    sys_unlink(b"/mnt/vd1/V.TXT\0".as_ptr());
+    let kept = buf.iter().all(|&c| c == b'u');
+    verdict(
+        b"VFAT_UNLINK_OPEN",
+        w == 16384 && un == 0 && wv == 16384 && n == 16384 && kept && st.st_nlink == 0,
+        n,
+    );
 }
 
 /// swapon reads vda2's swap header through the block layer
@@ -359,7 +648,13 @@ fn swap(p2: &BlkDev) {
     let path = p2.path(&mut p);
     let on = sys_swapon(path.as_ptr(), 0);
     let again = sys_swapon(path.as_ptr(), 0);
+    // An active swap partition cannot be written (Linux
+    // blkdev_write_iter: IS_SWAPFILE -> ETXTBSY)
+    let fd = sys_open(path.as_ptr(), O_WRONLY, 0) as i32;
+    let w = sys_pwrite64(fd, b"x".as_ptr(), 1, 8192);
+    sys_close(fd as u64);
     let off = sys_swapoff(path.as_ptr());
     let ok = on == 0 && again == EBUSY && off == 0;
     verdict(b"BLK_SWAPON", ok, on * 1000 + again);
+    verdict(b"SWAP_ETXTBSY", on == 0 && fd >= 0 && w == -26, w);
 }

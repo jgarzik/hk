@@ -18,12 +18,16 @@ pub mod superblock;
 pub mod syscall;
 
 // Syscall implementation modules
+pub mod anon_inodes;
 pub mod dir;
 pub mod fd;
 pub mod flock;
+pub mod fs_writeback;
+pub mod icache;
 pub mod io;
 pub mod iov;
 pub mod link;
+pub mod locks;
 pub mod misc;
 pub mod nav;
 pub mod open;
@@ -32,6 +36,7 @@ pub mod perm;
 pub mod pollsys;
 pub mod posix_lock;
 pub mod stat;
+pub mod sync;
 
 // Filesystem implementations
 pub mod cgroupfs;

@@ -19,8 +19,6 @@ use crate::task::{Cred, Pid, TaskKind, TaskState, Tid};
 /// Linux PF_KTHREAD / PF_EXITING (stat field 9)
 const PF_EXITING: u64 = 0x0000_0004;
 const PF_KTHREAD: u64 = 0x0020_0000;
-/// USER_HZ: stat times are in clock ticks
-const NS_PER_TICK: u64 = 10_000_000;
 /// The most cmdline/environ return (Linux reads them a page at a time
 /// but exec caps the strings at 128 KiB)
 const ARGS_MAX: u64 = 128 * 1024;
@@ -388,7 +386,7 @@ pub fn gen_stat(pid: Pid) -> Vec<u8> {
     let v = task_vm(s.tid);
     drop(guard);
     let (ign, cgt) = ign_cgt(&s);
-    let ticks = |ns: u64| ns / NS_PER_TICK;
+    let ticks = crate::time::ns_to_clock_t;
     let rt = s.policy == crate::task::SCHED_FIFO || s.policy == crate::task::SCHED_RR;
     let prio = if rt { -1 - s.rt_priority } else { 20 + s.nice };
     let flags = if s.kthread { PF_KTHREAD } else { 0 } | if s.exiting { PF_EXITING } else { 0 };

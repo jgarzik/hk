@@ -220,6 +220,14 @@ pub fn may_delete(c: &Cred, dir: &Inode, victim: &Inode, isdir: bool) -> Result<
     if sticky(c, dir, victim) {
         return Err(KernelError::NotPermitted);
     }
+    // An active swap file is neither unlinked nor renamed (Linux
+    // vfs_unlink / vfs_rename: IS_SWAPFILE -> EPERM)
+    if victim
+        .i_swapfile
+        .load(core::sync::atomic::Ordering::Acquire)
+    {
+        return Err(KernelError::NotPermitted);
+    }
     let is_dir = victim.mode().is_dir();
     if isdir && !is_dir {
         return Err(KernelError::NotDirectory);
@@ -298,6 +306,7 @@ pub fn remove_privs(inode: &Inode) {
 /// caller is in the file's group or has CAP_FSETID
 pub fn chmod(inode: &Inode, perm: u16) -> Result<(), KernelError> {
     let _w = want_write(inode)?;
+    inode.i_op.setattr_ok(inode)?;
     let c = cred();
     if !owner_or_capable(&c, inode) {
         return Err(KernelError::NotPermitted);
@@ -307,6 +316,7 @@ pub fn chmod(inode: &Inode, perm: u16) -> Result<(), KernelError> {
         perm &= !S_ISGID;
     }
     inode.set_mode_perm(perm);
+    inode.set_ctime(crate::time::TIMEKEEPER.current_time());
     Ok(())
 }
 
@@ -326,6 +336,7 @@ fn chgrp_ok(c: &Cred, inode: &Inode, gid: Gid) -> bool {
 /// group-executable or the caller could not keep it (even for root)
 pub fn chown(inode: &Inode, uid: Option<Uid>, gid: Option<Gid>) -> Result<(), KernelError> {
     let _w = want_write(inode)?;
+    inode.i_op.setattr_ok(inode)?;
     let c = cred();
     if uid.is_some_and(|u| !chown_ok(&c, inode, u)) || gid.is_some_and(|g| !chgrp_ok(&c, inode, g))
     {
@@ -353,6 +364,8 @@ pub fn chown(inode: &Inode, uid: Option<Uid>, gid: Option<Gid>) -> Result<(), Ke
     if kill != 0 {
         inode.clear_mode_bits(kill);
     }
+    // chown_common: ATTR_CTIME even when no id changes
+    inode.set_ctime(crate::time::TIMEKEEPER.current_time());
     Ok(())
 }
 

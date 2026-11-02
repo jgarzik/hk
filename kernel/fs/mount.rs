@@ -242,10 +242,6 @@ impl Mount {
     }
 }
 
-// Mount is Send + Sync
-unsafe impl Send for Mount {}
-unsafe impl Sync for Mount {}
-
 /// Mount a filesystem at a path
 ///
 /// If path is None or "/", this becomes the root mount.
@@ -336,8 +332,13 @@ pub fn dev_super(
     // Get the BlockDevice from the registry using the inode's rdev
     let bdev = get_blkdev(source_inode.rdev).ok_or(KernelError::NoDevice)?;
 
-    // Call the filesystem's mount_dev function
-    mount_dev_fn(fs_type, bdev)
+    // Opened (under the disk's open_mutex, failing for a removed
+    // device) for the superblock's life: a rescan sees it in use
+    let h = bdev.open_handle()?;
+    let sb = mount_dev_fn(fs_type, bdev)?;
+    sb.set_bdev(h);
+    super::fs_writeback::register_sb(&sb);
+    Ok(sb)
 }
 
 // ============================================================================
@@ -396,6 +397,10 @@ pub fn do_umount(mount: Arc<Mount>, flags: i32) -> Result<(), KernelError> {
     if !force && !detach && is_mount_busy(&mount) {
         return Err(KernelError::Busy);
     }
+
+    // Write the filesystem back before it goes (Linux
+    // generic_shutdown_super -> sync_filesystem)
+    let _ = super::fs_writeback::writeback_sb(&mount.sb);
 
     // Clear the mountpoint flag on the dentry
     if let Some(mp) = mount.get_mountpoint() {

@@ -71,6 +71,26 @@ fn null_read_tsc() -> u64 {
 // ============================================================================
 
 /// NTP-related status flags (from Linux)
+/// Clock ticks per second of the user ABI (Linux USER_HZ): times(),
+/// /proc stat fields, netlink and /proc/net ages are in these units
+pub const USER_HZ: u64 = 100;
+
+/// Nanoseconds to user clock ticks (Linux nsec_to_clock_t)
+pub fn ns_to_clock_t(ns: u64) -> u64 {
+    ns / (1_000_000_000 / USER_HZ)
+}
+
+/// Milliseconds to user clock ticks (Linux jiffies_to_clock_t of
+/// msecs_to_jiffies)
+pub fn ms_to_clock_t(ms: u64) -> u64 {
+    ms / (1000 / USER_HZ)
+}
+
+/// Scheduler ticks to user clock ticks (Linux jiffies_to_clock_t)
+pub fn ticks_to_clock_t(ticks: u64) -> u64 {
+    ms_to_clock_t(ticks * crate::task::percpu::TICK_MS)
+}
+
 pub const STA_PLL: i32 = 0x0001;
 pub const STA_PPSFREQ: i32 = 0x0002;
 pub const STA_PPSTIME: i32 = 0x0004;

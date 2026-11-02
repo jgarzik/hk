@@ -26,10 +26,10 @@ use crate::sync::spin::{Mutex, RwLock};
 use crate::arch::{IrqSpinlock, Uaccess};
 use crate::error::KernelError;
 use crate::fs::{Inode, lookup_path};
-use crate::mm::page_cache::PAGE_SIZE;
+use crate::mm::filemap::PAGE_SIZE;
+use crate::mm::page::frame_bytes;
 use crate::mm::swap_entry::{MAX_SWAPFILES, SwapEntry};
 use crate::mm::xarray::XArray;
-use crate::storage::BlockDevice;
 use crate::storage::blkdev::{BioOp, bdev_rw, bdev_rw_frame};
 use crate::task::{CAP_SYS_ADMIN, capable};
 use crate::uaccess::strncpy_from_user;
@@ -123,7 +123,7 @@ pub struct SwapInfo {
     /// Backing file (a swap file)
     pub inode: Option<Arc<Inode>>,
     /// Backing block device (a swap partition)
-    pub bdev: Option<Arc<BlockDevice>>,
+    pub bdev: Option<crate::storage::blkdev::BdevHandle>,
     /// Path given to swapon
     pub path: Vec<u8>,
     /// Device state (SWP_WRITEOK)
@@ -146,8 +146,21 @@ pub struct SwapInfo {
 }
 
 impl SwapInfo {
+    /// The inode writes to which are ETXTBSY while active (Linux
+    /// S_SWAPFILE): the swap file's, or the partition's bdev inode
+    pub fn swapfile_inode(&self) -> &Inode {
+        match (&self.inode, &self.bdev) {
+            (Some(i), _) => i,
+            (None, Some(b)) => &b.bd_inode,
+            (None, None) => unreachable!("a swap area has a backing"),
+        }
+    }
+
     fn new(
-        backing: (Option<Arc<Inode>>, Option<Arc<BlockDevice>>),
+        backing: (
+            Option<Arc<Inode>>,
+            Option<crate::storage::blkdev::BdevHandle>,
+        ),
         path: Vec<u8>,
         swap_type: u8,
         max: u64,
@@ -379,21 +392,12 @@ pub fn swap_read_page(entry: SwapEntry, frame_phys: u64) -> Result<(), i64> {
     let si = info_of(entry).ok_or(KernelError::InvalidArgument.sysret())?;
     let off = entry.offset();
     if let Some(ref inode) = si.inode {
-        let mut buf = alloc::vec![0u8; PAGE_SIZE];
-        let n = inode
-            .i_op
-            .readpage(inode, off, &mut buf)
-            .map_err(|_| KernelError::Io.sysret())?;
-        buf[n.min(PAGE_SIZE)..].fill(0);
-        // SAFETY: the caller's frame, reached through the direct map
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                buf.as_ptr(),
-                crate::arch::phys_to_virt(frame_phys),
-                PAGE_SIZE,
-            )
-        };
-        Ok(())
+        inode
+            .i_data
+            .aops()
+            // SAFETY: the locked swap-cache page being filled
+            .swap_rw(inode, off, unsafe { frame_bytes(frame_phys) }, false)
+            .map_err(|_| KernelError::Io.sysret())
     } else if let Some(ref bdev) = si.bdev {
         bdev_rw_frame(bdev, BioOp::Read, off * SECTORS_PER_PAGE, frame_phys).map_err(|e| e.sysret())
     } else {
@@ -422,23 +426,12 @@ fn write_page(entry: SwapEntry, frame_phys: u64) -> Result<(), i64> {
         if crate::task::percpu::current().has_flag(crate::task::pf::MEMALLOC) {
             return Err(KernelError::WouldBlock.sysret());
         }
-        let mut buf = alloc::vec![0u8; PAGE_SIZE];
-        // SAFETY: the caller's frame, reached through the direct map
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                crate::arch::phys_to_virt(frame_phys),
-                buf.as_mut_ptr(),
-                PAGE_SIZE,
-            )
-        };
-        let n = inode
-            .i_op
-            .writepage(inode, off, &buf)
-            .map_err(|_| KernelError::Io.sysret())?;
-        if n != PAGE_SIZE {
-            return Err(KernelError::Io.sysret());
-        }
-        Ok(())
+        inode
+            .i_data
+            .aops()
+            // SAFETY: the locked swap-cache page being written
+            .swap_rw(inode, off, unsafe { frame_bytes(frame_phys) }, true)
+            .map_err(|_| KernelError::Io.sysret())
     } else if let Some(ref bdev) = si.bdev {
         bdev_rw_frame(bdev, BioOp::Write, off * SECTORS_PER_PAGE, frame_phys)
             .map_err(|e| e.sysret())
@@ -503,14 +496,27 @@ fn swapon(path_ptr: u64, swap_flags: i32) -> Result<(), KernelError> {
         .ok_or(KernelError::Busy)? as u8;
     // A block device swaps through bios, a file through its inode
     let bdev = if inode.mode().is_blkdev() {
-        Some(crate::storage::get_blkdev(inode.rdev).ok_or(KernelError::NoDeviceOrAddress)?)
+        // Opened for the swap's life (Linux swapon opens the device)
+        let b = crate::storage::get_blkdev(inode.rdev).ok_or(KernelError::NoDeviceOrAddress)?;
+        Some(b.open_handle()?)
     } else {
         None
     };
+    // A swap file's pages go straight to the disk from now on: its page
+    // cache is written back and dropped so no cached copy diverges
+    // (Linux claim_swapfile / inode_drain_writes + invalidate)
+    if bdev.is_none() {
+        crate::mm::filemap::write_and_wait(&inode)?;
+        crate::mm::filemap::invalidate(&inode);
+    }
     let mut hdr = [0u8; PAGE_SIZE];
     let read = match &bdev {
         Some(b) => bdev_rw(b, BioOp::Read, 0, &mut hdr).map(|_| PAGE_SIZE),
-        None => inode.i_op.readpage(&inode, 0, &mut hdr),
+        None => inode
+            .i_data
+            .aops()
+            .swap_rw(&inode, 0, &mut hdr, false)
+            .map(|_| PAGE_SIZE),
     };
     if read.unwrap_or(0) < PAGE_SIZE {
         return Err(KernelError::InvalidArgument);
@@ -533,6 +539,13 @@ fn swapon(path_ptr: u64, swap_flags: i32) -> Result<(), KernelError> {
         None => (Some(inode), None),
     };
     let si = SwapInfo::new(backing, path.into_bytes(), swap_type, max, priority)?;
+    // S_SWAPFILE under i_rwsem (Linux claim_swapfile under inode_lock):
+    // a write or truncate in flight finishes first, later ones see it
+    let si_inode = si.swapfile_inode();
+    si_inode.inode_lock();
+    si_inode.i_swapfile.store(true, Ordering::Release);
+    // SAFETY: taken above by this thread
+    unsafe { si_inode.inode_unlock() };
     SWAP_INFO.write()[swap_type as usize] = Some(Arc::new(si));
     TOTAL_SWAP_PAGES.fetch_add(max - 1, Ordering::Relaxed);
     Ok(())
@@ -566,6 +579,11 @@ fn swapoff(path_ptr: u64) -> Result<(), KernelError> {
         return Err(e);
     }
     SWAP_INFO.write()[t as usize] = None;
+    let si_inode = si.swapfile_inode();
+    si_inode.inode_lock();
+    si_inode.i_swapfile.store(false, Ordering::Release);
+    // SAFETY: taken above by this thread
+    unsafe { si_inode.inode_unlock() };
     TOTAL_SWAP_PAGES.fetch_sub(si.max - 1, Ordering::Relaxed);
     super::swap_state::destroy_cache(&si);
     Ok(())

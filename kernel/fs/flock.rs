@@ -20,12 +20,10 @@
 
 use alloc::collections::BTreeSet;
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::error::KernelError;
 use crate::fs::File;
 use crate::fs::syscall::current_fd_table;
-use crate::sync::spin::Mutex;
 
 // =============================================================================
 // flock operation constants (Linux ABI)
@@ -149,22 +147,35 @@ impl FileLock {
         }
     }
 
-    /// Release any lock held by this PID
-    pub fn unlock(&mut self, pid: u64) {
+    /// Release any lock held by this owner: whether it held one
+    pub fn unlock(&mut self, pid: u64) -> bool {
         match self.lock_type {
-            LockType::None => {}
+            LockType::None => false,
             LockType::Shared => {
-                self.shared_holders.remove(&pid);
+                let held = self.shared_holders.remove(&pid);
                 if self.shared_holders.is_empty() {
                     self.lock_type = LockType::None;
                 }
+                held
             }
             LockType::Exclusive => {
                 if self.exclusive_holder == Some(pid) {
                     self.lock_type = LockType::None;
                     self.exclusive_holder = None;
+                    true
+                } else {
+                    false
                 }
             }
+        }
+    }
+
+    /// The lock this owner holds
+    pub fn held(&self, pid: u64) -> LockType {
+        match self.lock_type {
+            LockType::Shared if self.shared_holders.contains(&pid) => LockType::Shared,
+            LockType::Exclusive if self.exclusive_holder == Some(pid) => LockType::Exclusive,
+            _ => LockType::None,
         }
     }
 }
@@ -179,41 +190,18 @@ impl Default for FileLock {
 // Global file lock registry
 // =============================================================================
 
-/// Global counter for generating unique file IDs
-static NEXT_FILE_ID: AtomicU32 = AtomicU32::new(1);
-
-/// Generate a unique file ID for lock tracking
-pub fn alloc_file_id() -> u32 {
-    NEXT_FILE_ID.fetch_add(1, Ordering::Relaxed)
-}
-
-/// Global file lock table
-///
-/// Maps file IDs to their lock state. Files are identified by their unique
-/// file ID (assigned at File creation time).
-static FILE_LOCKS: Mutex<alloc::collections::BTreeMap<u64, FileLock>> =
-    Mutex::new(alloc::collections::BTreeMap::new());
-
-/// The file's lock table key: its inode (Linux file_inode(filp)->
-/// i_flctx), so every name of a file (hard links) and every open of it
-/// share one; the dentry only for a file without an inode
-fn lock_key(file: &File) -> u64 {
-    match file.get_inode() {
-        Some(i) => Arc::as_ptr(&i) as u64,
-        None => Arc::as_ptr(&file.dentry) as u64,
-    }
-}
-
-/// Run `f` on `file_id`'s lock state under one FILE_LOCKS hold (an
-/// entry left unlocked is removed)
-fn with_lock<R>(file_id: u64, f: impl FnOnce(&mut FileLock) -> R) -> R {
-    let mut locks = FILE_LOCKS.lock();
-    let l = locks.entry(file_id).or_default();
-    let r = f(l);
-    if l.is_unlocked() {
-        locks.remove(&file_id);
-    }
-    r
+/// Run `f` on the flock state of `file`'s inode (Linux i_flctx
+/// flc_flock), so every name and every open of a file share it; `f`
+/// says whether it released a lock (waking blocked lockers). A file
+/// with no inode has nothing to lock.
+fn with_lock<R>(
+    file: &File,
+    f: impl FnOnce(&mut FileLock) -> (Result<R, KernelError>, bool),
+) -> Result<R, KernelError> {
+    let Some(inode) = file.get_inode() else {
+        return f(&mut FileLock::new()).0;
+    };
+    inode.i_flctx.with(|l| f(&mut l.flock))
 }
 
 // Clone implementation for FileLock
@@ -257,42 +245,55 @@ pub fn sys_flock(fd: i32, operation: i32) -> i64 {
         None => return KernelError::BadFd.sysret(),
     };
 
-    let file_id = lock_key(&file);
-
     // flock locks belong to the open file description (Linux fl_file):
     // every descriptor of it, in any process, holds the same lock
-    let pid = Arc::as_ptr(&file) as u64;
+    let owner = Arc::as_ptr(&file) as u64;
+    let ctx = file.get_inode();
 
-    // Check and change the state under one FILE_LOCKS hold
-    let result = with_lock(file_id, |lock_state| match lock_op {
-        LOCK_SH => lock_state.try_lock_shared(pid),
-        LOCK_EX => lock_state.try_lock_exclusive(pid),
-        LOCK_UN => {
-            lock_state.unlock(pid);
-            Ok(())
+    // Linux flock_lock_inode: a lock of the other type the owner holds
+    // goes first (a conversion is not atomic, even with LOCK_NB: two
+    // upgraders never wait on each other's shared locks, and a
+    // downgrade wakes the shared waiters); then retried after each
+    // change of the inode's locks while it conflicts, unless LOCK_NB.
+    // A signal ends the wait (ERESTARTSYS: restarted under SA_RESTART).
+    let want = match lock_op {
+        LOCK_SH => LockType::Shared,
+        LOCK_EX => LockType::Exclusive,
+        _ => LockType::None,
+    };
+    loop {
+        let g = ctx.as_ref().map_or(0, |i| i.i_flctx.generation());
+        let result = with_lock(&file, |l| {
+            let held = l.held(owner);
+            if held == want && want != LockType::None {
+                return (Ok(()), false);
+            }
+            let dropped = held != LockType::None && l.unlock(owner);
+            let r = match want {
+                LockType::Shared => l.try_lock_shared(owner),
+                LockType::Exclusive => l.try_lock_exclusive(owner),
+                LockType::None => Ok(()),
+            };
+            (r, dropped)
+        });
+        match (result, &ctx) {
+            (Ok(()), _) => return 0,
+            (Err(KernelError::WouldBlock), Some(i)) if !nonblock => {
+                if let Err(e) = i.i_flctx.wait_change(g) {
+                    return e.sysret();
+                }
+            }
+            (Err(e), _) => return e.sysret(),
         }
-        _ => Err(KernelError::InvalidArgument),
-    });
-
-    match result {
-        Ok(()) => 0,
-        Err(KernelError::WouldBlock) if nonblock => KernelError::WouldBlock.sysret(),
-        Err(KernelError::WouldBlock) => {
-            // Blocking case: for now, we don't implement blocking
-            // A full implementation would sleep and retry
-            // For now, return EWOULDBLOCK even without LOCK_NB
-            // (matches behavior of many real-world workloads that use LOCK_NB anyway)
-            KernelError::WouldBlock.sysret()
-        }
-        Err(e) => e.sysret(),
     }
 }
 
 /// The open file description `file` is gone (File::drop, its last
 /// reference): its flock locks go (Linux locks_remove_file)
 pub fn release_file_locks(file: &File) {
-    let file_id = lock_key(file);
-    let pid = file as *const File as u64;
-
-    with_lock(file_id, |l| l.unlock(pid));
+    let owner = file as *const File as u64;
+    let _ = with_lock(file, |l| {
+        let held = l.unlock(owner);
+        (Ok(()), held)
+    });
 }

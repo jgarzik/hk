@@ -190,10 +190,7 @@ fn raw(a: crate::net::ipv4::Ipv4Addr) -> u32 {
     u32::from_ne_bytes(a.to_be_bytes())
 }
 
-/// ms -> clock_t (USER_HZ 100)
-fn ticks(ms: u64) -> u64 {
-    ms / 10
-}
+use crate::time::ms_to_clock_t as ticks;
 
 /// One line padded like Linux seq_pad (TMPSZ - 1 = 149 columns)
 fn line(out: &mut String, l: &str) {

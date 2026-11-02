@@ -271,7 +271,7 @@ UtsNamespace.name (RwLock), FsStruct.inner (Mutex),
 FutexHashBucket.waiters (spin Mutex; wakeups through a WakeQ after
 unlocking)
     ↓
-Global subsystem locks (TASKLIST, PAGE_CACHE, fd table `Files`)  ← NOT IRQ-safe;
+Global subsystem locks (TASKLIST, fd table `Files`)  ← NOT IRQ-safe;
     no file is released under `Files` (3.3, Descriptor Tables); order
     `Files` -> TASKLIST -> Task.alloc_lock (descriptor allocation
     reads RLIMIT_NOFILE under the table lock; kcmp takes a table out
@@ -287,6 +287,8 @@ Global subsystem locks (TASKLIST, PAGE_CACHE, fd table `Files`)  ← NOT IRQ-saf
     ↓
 Address space: mmap_lock (sleeping RwSem; under i_rwsem: a write's user
     copy may fault) → page lock (PG_locked, sleeping; Linux folio_lock)
+    [→ AddressSpace.i_pages (spin leaf, Linux xa_lock; 3.2)]
+    → AddressSpace.i_mmap (sleeping RwSem, Linux i_mmap_rwsem)
     → AnonVma.chain (sleeping RwSem, Linux anon_vma->rwsem)
     → page_table_lock → PTE lock (spin)
     → SwapInfo.map (spin, Linux si->lock) | swap cache (IrqSpinlock,
@@ -379,7 +381,7 @@ Printk locks (ALL IRQ-safe - can be acquired from interrupt context):
    an IRQ-safe lock and a non-IRQ-safe lock, acquire the IrqSpinlock first.
 
 2. **Never acquire non-IRQ-safe locks from interrupt context** - This is the
-   fundamental rule. TASKLIST, PAGE_CACHE, fd tables, and allocator locks must
+   fundamental rule. TASKLIST, fd tables, and allocator locks must
    NEVER be acquired from timer ISR or any interrupt handler.
 
 3. **Parent before child** - When locking multiple inodes in a directory
@@ -1132,8 +1134,8 @@ pub struct Zone {
 - Shared anonymous memory (`mm::shmem::Shmem`, Linux shmem): its page
   index `Shmem.root` is a `spin::Mutex` taken by the fault path under
   the mm lock (mm lock -> Shmem.root) and by MADV_REMOVE after the mm
-  lock is dropped; under it only `FRAME_ALLOCATOR` is taken (index
-  nodes are frames, no heap). The object goes with its last VMA
+  lock is dropped; under it only `FRAME_ALLOCATOR` and the heap (index
+  nodes, atomic under the spin lock) are taken. The object goes with its last VMA
   (possibly under the mm lock): its drop takes no lock but
   `FRAME_ALLOCATOR`.
 - A SysV shm attachment (`ipc::shm::ShmAttach`, in its VMA) is cloned
@@ -1268,7 +1270,7 @@ pub struct Zone {
   cache lock held.
 - `SwapInfo.cache` (`IrqSpinlock<XArray>`, Linux i_pages xa_lock_irq):
   the swap cache of a device, page by slot. A leaf: under it only the
-  allocator (index nodes, never sleeping). A lookup takes its page
+  allocators (a page, a heap index node; atomic, never sleeping). A lookup takes its page
   reference under it (get_page_unless_zero); reclaim deletes a page
   from it by freezing its count (expected -> 0) under it, so no lookup
   revives a page being freed. Slot counts change after it is dropped.
@@ -1524,74 +1526,72 @@ layout in `doc/MEMORY.md`
   only tries the AnonVma chain lock under PF_MEMALLOC (Linux rmap_walk
   with try_lock): an allocating task may hold it for writing. Direct
   reclaim swaps only to block-device areas (`swap::get_swap_page`
-  skips swap files under PF_MEMALLOC), since a file's writepage may
+  skips swap files under PF_MEMALLOC), since a file's swap_rw may
   need filesystem locks the allocating task holds. A fault
   whose page table cannot be allocated (under the page_table_lock)
   reclaims after dropping it and retries.
 
-#### Page Cache
+#### Per-inode page cache (Linux i_pages)
 
-**Location:** `kernel/mm/page_cache.rs`, `kernel/main.rs` (`PAGE_CACHE`)
+**Location:** `kernel/mm/filemap.rs` (`AddressSpace`, the inode's
+`i_data`); users: ramfs, vfat files, block devices
+(`BlockDevice.bd_inode`). vfat writes its FAT and directory blocks
+into the device cache marking only the 512-byte sectors it changes
+(`bdev_write_meta`: bits in `Page.private`, set under the page lock;
+Linux dirty buffer heads), and the device's writepage writes only
+those: a device-cache page may also hold file-data clusters, which
+the file's own cache writes. (A write-back widened to the device's logical
+block stays inside one FAT sector: vfat refuses a FAT sector smaller
+than that block. A newly allocated cluster's device-cache pages are
+dropped before and after it is zeroed on the disk.)
 
-```rust
-static PAGE_CACHE: Mutex<PageCache> = Mutex::new(PageCache::new(1024));
-```
-
-The page cache uses a hierarchical locking model similar to Linux:
-
-**Locking Hierarchy:**
-```
-1. PAGE_CACHE (global Mutex) - find/create AddressSpace
-   ↓
-2. AddressSpace.inner (per-file RwLock) - page operations within a file
-   ↓
-3. AddressSpace.invalidate_lock (RwLock) - truncate/fault serialization
-   ↓
-4. CachedPage.lock() - page contents access (spin-wait)
-```
-
-**Per-Page Locks (CachedPage):**
-- `locked: AtomicBool` - Per-page lock for I/O synchronization
-- `lock()`, `unlock()`, `trylock()` methods
-- Similar to Linux's `PG_locked` / `folio_lock()`
-
-**Per-File Locks (AddressSpace):**
-- `inner: RwLock<AddressSpaceInner>` - Protects page map
-- `invalidate_lock: RwLock<()>` - Like Linux's `mapping->invalidate_lock`
-  - Read path (fault, read): hold shared
-  - Truncate/invalidate path: hold exclusive
-
-**Reference Counting:**
-- `refcount: AtomicU32` with proper memory ordering
-- Uses `Ordering::AcqRel` for increments, `Ordering::Release` for decrements
-- `try_claim_for_eviction()` uses CAS to prevent race during eviction
-
-**Key APIs:**
-- `find_or_create_page()` - Atomic find-or-create (fixes TOCTOU race)
-- `find_get_page()` - Lookup with refcount increment
-
-**No writeback under PAGE_CACHE:** eviction (`evict_one`, PAGE_CACHE
-held) skips dirty pages; while every evictable page is dirty the cache
-may exceed its limit by an eighth, then allocation fails (ENOMEM). Dirty pages are written by the flusher, fsync and sync, which
-call `writepage` with no spinlock held (it does block I/O and sleeps).
-
-**Mapped ramfs pages (Linux filemap_fault):** a MAP_SHARED fault on a
-ramfs file (`InodeOps::map_page`) takes PAGE_CACHE with no spinlock
-held (the mmap_lock held for reading: mmap_lock -> PAGE_CACHE) and,
-still under it, a frame reference for the PTE
-(PAGE_CACHE -> FRAME_ALLOCATOR), so truncate or inode eviction, which
-drop only the cache's own reference (`FrameAlloc::put_frame`), cannot
-free a frame a mapping still uses.
-
-**Freeing ramfs pages (Linux evict_inode):** dropping a ramfs inode's
-`RamfsInodeData` (no directory entry, open file, mapping or dentry left)
-takes PAGE_CACHE -> FRAME_ALLOCATOR (its `Pcp.lock` -> `Zone.lock`
-IrqSpinlocks) to free its
-pages. The page cache never holds inode references, so the last inode
-reference is never dropped with PAGE_CACHE held. Unevictable (ramfs)
-pages are kept off the eviction FIFO and are refused at the low
-watermark (`FrameAlloc::reserve_low`: the zone's free count, an atomic
-read while PAGE_CACHE is held).
+- `AddressSpace.i_pages` (`spin::Mutex<XArray>`, Linux xa_lock): the
+  cached pages by index. Thread context only (no I/O completion or
+  page free touches it from an interrupt). A leaf apart from the heap
+  (index nodes: tried atomically under it, else preloaded with it
+  dropped, Linux xas_nomem) and page reference counts. A lookup takes
+  its page reference under it (get_page_unless_zero), so a page
+  removed meanwhile is never returned.
+- Page lock (`PG_locked`): a page is inserted locked, filled
+  (`->read_folio`), written into (`write_begin`..`write_end`) and
+  removed (truncate) under it. Order: i_rwsem -> page lock ->
+  i_pages. Removal also needs `i_pages`; a lookup that then locks the
+  page rechecks `Page.mapping` (truncated meanwhile: retry).
+- Page allocation (`alloc_user`, may reclaim) happens with no
+  spinlock held: writes under i_rwsem, faults under the mmap_lock read
+  side (mmap_lock -> page lock -> i_pages).
+- The cache holds one reference per page; a MAP_SHARED PTE holds its
+  own, so truncate or eviction (dropping only the cache's) never frees
+  a page a mapping still uses.
+- `AddressSpace.i_mmap` (the anon_vma chain type, a sleeping RwSem;
+  Linux i_mmap_rwsem): every VMA mapping the file, written by the VMA
+  changes (link/unlink/relink) under the mmap_lock held for writing
+  (mmap_lock -> i_mmap), read by truncate (`unmap_mapping_range`,
+  under i_rwsem, with no mmap_lock: the chain keeps each listed VMA's
+  page tables, since an unmap unlinks the VMA first) -> PTE lock.
+  mremap holds it for writing across the entry move (Linux
+  take_rmap_locks). A file fault maps its page under the page lock and
+  rechecks i_size there; truncate sets i_size, unmaps, removes the
+  pages under their locks and unmaps again.
+- Writeback write-protects a page in every mapping of it before
+  writing it (`mkclean`, Linux folio_mkclean): under the page lock,
+  i_mmap read -> each PTE lock, a TLB flush per entry. The write fault
+  that follows makes it writable and dirties it again under the page
+  lock (mmap_lock read -> page lock -> PTE lock), so writeback never
+  sees it writable but clean; then it may throttle (balance_dirty_pages
+  writes the inode back: mmap_lock -> page lock -> i_mmap).
+- Dirty, cached and unevictable pages are counted per CPU
+  (`NR_DIRTY`, `NR_FILE`, `NR_UNEVICT`: atomics, Linux vmstat), summed
+  lock-free for the dirty limits and /proc/meminfo.
+- Reclaim and drop_caches (`shrink_cache`, `drop_pagecache`) walk
+  the cached inodes in place, allocating nothing: one inode reference
+  at a time is taken under its inode-cache bucket lock (or the block
+  device registry lock), then its clean pages are dropped with no lock
+  held but each page's, taken with trylock (reclaim never waits for
+  one); an unevictable mapping (ramfs) is never touched.
+- Eviction (`Drop for AddressSpace`, the inode's last reference)
+  empties `i_pages` without page locks: nothing else can reach the
+  mapping any more.
 
 ### 3.3 Virtual File System (VFS)
 
@@ -1633,6 +1633,23 @@ pub struct Inode {
     pub private: RwLock<Option<Arc<dyn InodeData>>>, // FS-specific data
 }
 ```
+
+**Inode cache** (`fs/icache.rs`, Linux inode_hashtable): vfat inodes
+(by directory-entry position) are hashed so each on-disk object has one
+`Inode`. One `IrqSpinlock` per bucket (a RAM-sized table), a leaf:
+under it only the bucket vector, `Weak` counts and the filesystem's
+`test` (which may take `Inode.private`, a spin RwLock). IRQ-safe
+because a last reference could go anywhere. The hash holds `Weak`s;
+an inode upgraded under a bucket lock is never dropped there (its last
+reference's eviction takes the same lock): lookups keep them in a
+vector dropped after unlocking. Eviction (`Drop for Inode` ->
+`icache::evict`, Linux iput_final -> evict) runs where the last `Arc`
+goes, possibly under spin locks: it takes the bucket lock (if hashed)
+and calls `->evict_inode`, which must not sleep; vfat queues the
+cluster freeing of an unlinked file on `SYSTEM_WQ`
+(`Workqueue.inner`, IrqSpinlock leaf). Deviation from Linux: no
+unused-inode LRU or I_NEW state (an inode is complete before it is
+hashed; the losing builder's inode is dropped unhashed).
 
 **Dentry** (`fs/dentry.rs`):
 
@@ -2826,7 +2843,7 @@ thread context, the driver completes it from its interrupt handler and
 
 | Lock | Type | IRQ class | Order |
 |------|------|-----------|-------|
-| `Disk.open_mutex` | `sync::Mutex` (sleeping; Linux disk->open_mutex) | thread only | outermost block lock: block device open/release, partition scans (and rescans, BLKRRPART); I/O, `BLKDEV_REGISTRY`, `MAJORS` and the devtmpfs root's `i_rwsem` are taken under it |
+| `Disk.open_mutex` | `sync::Mutex` (sleeping; Linux disk->open_mutex) | thread only | outermost block lock: block device open/release (files, and the kernel opens of a mount (`SuperBlock.s_bdev`) and of active swap: `BdevHandle`), partition scans (and rescans, BLKRRPART), disk removal (`del_gendisk` drops its devices under it); I/O, `BLKDEV_REGISTRY`, `MAJORS` and the devtmpfs root's `i_rwsem` are taken under it |
 | `BLKDEV_REGISTRY` | spin `RwLock` (dev_t -> block device; global like Linux's bdev map) | thread only | leaf |
 | `MAJORS` | spin `Mutex` (block majors, register_blkdev) | thread only | leaf |
 | blk-mq software queue (`BlkMq.ctxs[cpu]`) | `IrqSpinlock<BioList>`, one per CPU | thread (submit) | leaf: never taken with the hardware queue lock held; its pending bit in the hardware queue's `ctx_map` (Linux) is set and cleared under it, and a run visits only set bits (one that misses a bit being set is followed by the submitter's own run) |
@@ -2853,10 +2870,12 @@ Rules:
   the devtmpfs root's `i_rwsem`. No path holding a directory `i_rwsem`
   takes `open_mutex` (a block device is opened after the path walk), so
   `open_mutex -> i_rwsem` cannot invert.
-- **No page cache in front of block devices yet:** device file I/O is
-  synchronous bios through bounce frames, never under a spinlock. The
-  page cache never writes a page back under `PAGE_CACHE` (3.2 Page
-  Cache): writepage sleeps on block I/O.
+- **Block device page cache (`BlockDevice.bd_inode`, Linux
+  bd_mapping):** device-file I/O and vfat metadata go through it (3.2
+  Per-inode page cache); pages are read and written synchronously
+  under their page lock, never under a spinlock. The last opener's
+  release writes it back and drops it under `open_mutex` (Linux
+  blkdev_flush_mapping): open_mutex -> page lock -> i_pages.
 
 #### Network Subsystem
 
@@ -3092,12 +3111,11 @@ else is taken under it) unless an order is given. "spin" is the
 | `PIDFD_REGISTRY` | pidfd.rs | IrqSpinlock | live pidfds for exit notification; registry -> the instance's `inner` |
 | `SigHand.signalfd_wq` | signal/mod.rs | WaitQueue (its own IrqSpinlock) | signalfd readers and pollers of the tasks sharing a handler table (Linux sighand->signalfd_wqh); woken by send_signal after the target's signal state is unlocked; readers take `Signalfd.inner` and the caller's signal state only in its condition, after the queue's lock is dropped |
 | `Workqueue.inner` | workqueue.rs | IrqSpinlock | pending and delayed work lists (`SYSTEM_WQ`, `BDI_WORKQUEUE`); a work item's own `spin::Mutex<Work>` is taken and dropped before it |
-| `BDI_REGISTRY`, `BdiWriteback.dirty_inodes`, `BdiWriteback.dwork` | mm/writeback.rs | spin | per-device writeback state |
-| `DIRTY_ADDRESS_SPACES` | mm/page_cache.rs | spin Mutex | files with dirty pages (sync) |
+| `BDI_REGISTRY`, `BdiWriteback.dirty`, `BdiWriteback.dwork` | mm/writeback.rs | spin | per-disk writeback state: the devices with dirty data, the periodic work; leaves, writeback runs with none held |
 | `Task.cgroup`, `CSS_SET_CACHE`, `CgroupRoot.{root_cgrp, controllers}`, `Cgroup.{parent, children, ancestors, subsys, tasks}`, `CssSet.subsys`, `CgroupSubsysState.private`, `IoState.devices` | cgroup/ | spin (RwLock; `CSS_SET_CACHE`, `Task.cgroup` Mutex) | cgroup hierarchy and membership (`Task.cgroup`: the task's cgroup, a leaf reached through a `TaskRef` cloned out of TASKLIST, Linux task->cgroups); parent before child; never under TASKLIST |
 | `IpcIds.inner`, `KernIpcPerm.lock`, `MsgQueue.{messages, receivers, senders}`, `MsgReceiver.result`, `SemArray.pending`, `SemUndoList.undos`, `MQ_REGISTRY`, `MqQueue.{messages, flags, notify}` | ipc/ | spin | SysV and POSIX IPC objects; `IpcIds.inner` -> the object's lock |
 | `Task.keyrings` → `KEY_DATABASE`, `USER_KEYRINGS`, `Key.payload`, `Key.keyring_keys` | keys/ | spin (RwLock; `Task.keyrings` Mutex) | a task's thread/process/session keyring references (`Task.keyrings`, reached through a `TaskRef` cloned out of TASKLIST; creating a keyring registers it under it), key registry and keyrings (lookups clone the `Arc<Key>` out) |
-| `FILE_LOCKS` (flock), `POSIX_LOCKS` | fs/flock.rs, fs/posix_lock.rs | spin Mutex | file lock tables; leaves. No waiters: blocking flock and F_SETLKW are EAGAIN (BUGS.md) |
+| `FileLockCtx.flc_lock` (per inode), `locks::BLOCKED`, `locks::POSIX_INODES` | fs/locks.rs | spin Mutex | an inode's flock and POSIX locks (Linux i_flctx flc_lock), leaf but for BLOCKED (flc_lock -> BLOCKED, Linux blocked_lock_lock: each waiting POSIX owner and the owner it waits on, for EDEADLK); POSIX_INODES (inodes with POSIX locks, for the release at exit) a leaf. A blocked locker sleeps on the inode's wait queue with neither held, interruptibly, until the change count moves |
 | `cmdline::SAVED` | cmdline.rs | spin Mutex | the saved kernel command line (Linux saved_command_line): written once while parsing, before SMP; read in thread context (init's arguments); a leaf |
 | `signal::NO_SHARED` | signal/mod.rs | spin Mutex | the empty shared pending set the boot task (no SignalStruct) reads; locked where a thread group's `shared_pending` would be, same position (Task.sig -> shared_pending) |
 | `FS_TYPES`, `CHARDEV_REGISTRY` | fs/superblock.rs, chardev.rs | spin | filesystem types, character device registry |
@@ -3116,6 +3134,12 @@ else is taken under it) unless an order is given. "spin" is the
 | PCI fixups (`bus/quirks.rs`) | none | thread only (boot) | run by bus enumeration (single-threaded) on each function before driver probe |
 | `CMDLINE_CONSOLE` | cmdline.rs | spin Mutex | console= choice |
 | `CPU_CRNG` (per CPU) -> `BASE` | random.rs | IrqSpinlock | ChaCha20 CRNG: this CPU's key, then the base key when the CPU key is refreshed or the base reseeded; both leaves otherwise (callers include softirq net code). `GENERATION`/`BIRTH_NS` are atomics read unlocked, rechecked under `BASE` |
+| `Inode.i_writecount`, `Inode.i_swapfile` | fs/inode.rs | atomics | writers (> 0) or executions denying them (< 0), Linux i_writecount, changed by CAS (`get_write_access` / `deny_write_access`, ETXTBSY on the wrong sign); an active swap area (S_SWAPFILE: set and cleared by swapon/swapoff
+under its i_rwsem, `SWAPON` -> i_rwsem, and checked under it by
+writes and truncates). The address space holds the executable's denial (`MmStruct.exe_deny`, cloned at fork) |
+| `SuperBlock.s_wb_lock` | fs/superblock.rs | sleeping `sync::Mutex` | serializes whole-filesystem writeback passes (`writeback_sb`: sync, syncfs, umount, the periodic writeback), held across their I/O: s_wb_lock -> page lock -> i_mmap -> PTE lock. fsync writes its inode without it; a page another pass is writing carries the WRITEBACK mark and its writer holds its page lock, so fsync waits on that lock |
+| `SuperBlock.s_dirty`, `SUPER_BLOCKS` | fs/superblock.rs, fs/fs_writeback.rs | spin Mutex leaves | inodes with dirty pages, each held (an `Arc`) until written back (Linux wb->b_dirty), and the device filesystems for sync(2) (Linux super_blocks). `mark_inode_dirty` takes `s_dirty` under a page lock at most (the fault path), then the BDI's spin locks to arm its periodic writeback; writeback takes the list and writes with no spin lock held |
+| `LAST_INO` (per CPU) | fs/anon_inodes.rs | IrqSpinlock leaf | this CPU's batch of pseudo-filesystem inode numbers (Linux get_next_ino, preempt-off per-CPU counter); refilled from the atomic `SHARED_LAST_INO` under it |
 | `NUMA_TOPOLOGY` | numa.rs | IrqSpinlock | NUMA node table |
 | `BpfHashMap.data`, `BpfArrayMap.data` | bpf/map.rs | IrqSpinlock | BPF map contents |
 
@@ -3398,7 +3422,6 @@ this is the interrupt-safety invariant:
 | `NPROC` | kernel/task/mod.rs | `Mutex` | RLIMIT_NPROC tasks per real uid (leaf: may be taken under TASKLIST, takes no lock) |
 | `MEMBLOCK` | kernel/mm/memblock.rs | `Mutex` | Boot memory map (boot CPU, before SMP) |
 | `ACCT_FILE` | kernel/acct.rs | `Mutex` | Process accounting file (leaf: cloned out, the record written and an old file released with no lock held) |
-| `PAGE_CACHE` | kernel/mm/page_cache.rs (static in kernel/main.rs) | `Mutex` | Page cache lookup |
 | All VFS locks | kernel/fs/*.rs | `RwLock` | Inodes, dentries, mounts |
 | Descriptor tables (`Files`) | kernel/task/fdtable.rs | `Mutex` | Per-task fd tables |
 | `RTNL` and every network `spin::Mutex`/`RwLock` | kernel/net/ | `sync::Mutex` / `Mutex` / `RwLock` | Configuration, sockets, tables, queues (3.10) |

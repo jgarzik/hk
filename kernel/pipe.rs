@@ -50,7 +50,7 @@ use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use crate::fs::KernelError;
 use crate::fs::file::{File, FileOps, RwFlags, flags};
-use crate::mm::page_cache::{CachedPage, PAGE_SIZE};
+use crate::mm::filemap::PAGE_SIZE;
 use crate::poll::{POLLERR, POLLHUP, POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM, PollTable};
 use crate::waitqueue::WaitQueue;
 
@@ -80,6 +80,35 @@ pub mod pipe_buf_flags {
     pub const OWNED: u32 = 0x20;
 }
 
+/// A page of pipe data (Linux the page of a pipe_buffer): shared by
+/// the buffers that hold it (tee, splice), freed with the last
+pub struct PipePage {
+    pub frame: u64,
+}
+
+impl PipePage {
+    pub fn new(frame: u64) -> Self {
+        Self { frame }
+    }
+
+    /// Its bytes
+    ///
+    /// # Safety
+    /// Under the pipe's `Pipe.inner`; written only while no other buffer
+    /// shares the page (CAN_MERGE).
+    #[allow(clippy::mut_from_ref)]
+    pub unsafe fn bytes(&self) -> &mut [u8] {
+        // SAFETY: the page's own frame; the caller's contract
+        unsafe { crate::mm::page::frame_bytes(self.frame) }
+    }
+}
+
+impl Drop for PipePage {
+    fn drop(&mut self) {
+        crate::FRAME_ALLOCATOR.free(self.frame);
+    }
+}
+
 /// A single buffer slot in a pipe
 ///
 /// Similar to Linux's struct pipe_buffer, this holds a reference to a page
@@ -87,7 +116,7 @@ pub mod pipe_buf_flags {
 pub struct PipeBuffer {
     /// Page holding the buffer data
     /// None if this slot is empty, Some if it contains data
-    pub page: Option<Arc<CachedPage>>,
+    pub page: Option<Arc<PipePage>>,
     /// Offset within the page where data starts
     pub offset: u32,
     /// Length of valid data in this buffer
@@ -108,7 +137,7 @@ impl PipeBuffer {
     }
 
     /// Create a new pipe buffer with a page
-    pub fn new(page: Arc<CachedPage>, offset: u32, len: u32, flags: u32) -> Self {
+    pub fn new(page: Arc<PipePage>, offset: u32, len: u32, flags: u32) -> Self {
         Self {
             page: Some(page),
             offset,
@@ -143,11 +172,8 @@ impl PipeBuffer {
     /// Release the page reference
     pub fn release(&mut self) {
         if let Some(ref page) = self.page {
-            // Only call put() if we own the page (OWNED flag)
-            // For splice'd pages, the caller manages the refcount
-            if self.flags & pipe_buf_flags::OWNED != 0 {
-                page.put();
-            }
+            // The Arc counts every buffer sharing the page (tee)
+            let _ = page;
         }
         self.page = None;
         self.offset = 0;
@@ -304,11 +330,9 @@ impl PipeInner {
                 // Get page frame and write data
                 if let Some(ref page) = buf.page {
                     let offset = (buf.offset + buf.len) as usize;
-                    let dst_addr = crate::arch::phys_to_virt(page.frame) as usize + offset;
-                    unsafe {
-                        let dst = dst_addr as *mut u8;
-                        core::ptr::copy_nonoverlapping(data.as_ptr(), dst, to_write);
-                    }
+                    // SAFETY: under Pipe.inner, an unshared CAN_MERGE page
+                    let bytes = unsafe { page.bytes() };
+                    bytes[offset..offset + to_write].copy_from_slice(&data[..to_write]);
                     buf.len += to_write as u32;
                     self.total_len += to_write;
                     written += to_write;
@@ -328,10 +352,9 @@ impl PipeInner {
             let to_write = remaining.min(PAGE_SIZE);
 
             // Copy data to the new page
-            unsafe {
-                let dst = crate::arch::phys_to_virt(page.frame);
-                core::ptr::copy_nonoverlapping(data[written..].as_ptr(), dst, to_write);
-            }
+            // SAFETY: a page just allocated for this buffer, under Pipe.inner
+            let bytes = unsafe { page.bytes() };
+            bytes[..to_write].copy_from_slice(&data[written..written + to_write]);
 
             // Create buffer with OWNED and CAN_MERGE flags
             let buf = PipeBuffer::new(
@@ -377,12 +400,10 @@ impl PipeInner {
 
             // Copy data from page to user buffer
             if let Some(ref page) = pipe_buf.page {
-                let src_addr =
-                    crate::arch::phys_to_virt(page.frame) as usize + pipe_buf.offset as usize;
-                unsafe {
-                    let src = src_addr as *const u8;
-                    core::ptr::copy_nonoverlapping(src, buf[read..].as_mut_ptr(), to_read);
-                }
+                let off = pipe_buf.offset as usize;
+                // SAFETY: read under Pipe.inner
+                buf[read..read + to_read]
+                    .copy_from_slice(&unsafe { page.bytes() }[off..off + to_read]);
 
                 pipe_buf.offset += to_read as u32;
                 pipe_buf.len -= to_read as u32;
@@ -407,8 +428,8 @@ impl PipeInner {
 
 /// Allocate a page for pipe buffer data
 ///
-/// Creates an anonymous CachedPage for holding pipe data.
-fn allocate_pipe_page() -> Option<Arc<CachedPage>> {
+/// Creates a page for holding pipe data.
+fn allocate_pipe_page() -> Option<Arc<PipePage>> {
     use crate::FRAME_ALLOCATOR;
 
     // Allocate a physical frame
@@ -416,8 +437,7 @@ fn allocate_pipe_page() -> Option<Arc<CachedPage>> {
     // watermark like the user pages it was copied from
     let frame = FRAME_ALLOCATOR.alloc_gfp(crate::mm::page_alloc::Gfp::HIGHUSER_MOVABLE)?;
 
-    // Create an anonymous CachedPage (file_id 0, offset 0)
-    let page = Arc::new(CachedPage::new_owned(frame));
+    let page = Arc::new(PipePage::new(frame));
 
     Some(page)
 }
@@ -1126,20 +1146,21 @@ pub fn create_pipe(pipe_flags: u32) -> Result<(Arc<File>, Arc<File>), KernelErro
 /// requires a dentry. This creates a minimal anonymous dentry.
 fn create_pipe_dentry() -> Result<Arc<Dentry>, KernelError> {
     use crate::fs::dentry::Dentry;
-    use crate::fs::inode::{Inode, InodeMode, NULL_INODE_OPS, Timespec};
+    use crate::fs::inode::{Inode, InodeMode, NULL_INODE_OPS};
     use alloc::string::String;
     use alloc::sync::Weak;
 
-    // Create anonymous inode for pipe
-    let mode = InodeMode::fifo(0o600);
+    // A pipefs inode (Linux get_pipe_inode): its own number, the
+    // creator's fsuid/fsgid, the current time
+    let cred = crate::task::percpu::current_cred();
     let inode = Arc::new(Inode::new(
-        0, // ino=0 for anonymous
-        mode,
-        0,                      // uid (root)
-        0,                      // gid (root)
-        0,                      // size
-        Timespec::from_secs(0), // mtime
-        Weak::new(),            // no superblock for anonymous inode
+        crate::fs::anon_inodes::get_next_ino(),
+        InodeMode::fifo(0o600),
+        cred.fsuid,
+        cred.fsgid,
+        0,
+        crate::time::TIMEKEEPER.current_time(),
+        Weak::new(),
         &NULL_INODE_OPS,
     ));
 
