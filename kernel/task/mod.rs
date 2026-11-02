@@ -1046,6 +1046,11 @@ pub struct Task<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::Phy
     /// Their only writer is the task's own CPU with interrupts off (its
     /// syscalls, its switches, the tick), so readers on other CPUs retry
     acct_seq: AtomicU32,
+    /// On a CPU since its last accounting point, for readers adding
+    /// the current slice: set by `switch_in`, cleared by `switch_out`,
+    /// both inside `acct_seq` (`se.on_cpu` clears only after the
+    /// switch, which would add a slice already charged)
+    acct_running: AtomicBool,
     /// Earliest expiry (ns of its PROF, VIRT time) of a CPU timer on
     /// this thread's clock: a hint for the tick (`cpu_timer`)
     pub cpu_next: [AtomicU64; 2],
@@ -1578,6 +1583,7 @@ impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Tas
             last_run_ns: AtomicU64::new(now),
             in_kernel: AtomicBool::new(kind == TaskKind::KernelThread),
             acct_seq: AtomicU32::new(0),
+            acct_running: AtomicBool::new(false),
             cpu_next: [
                 AtomicU64::new(crate::cpu_timer::NONE),
                 AtomicU64::new(crate::cpu_timer::NONE),
@@ -1639,6 +1645,7 @@ impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Tas
             last_run_ns: AtomicU64::new(0),
             in_kernel: AtomicBool::new(true),
             acct_seq: AtomicU32::new(0),
+            acct_running: AtomicBool::new(false),
             cpu_next: [
                 AtomicU64::new(crate::cpu_timer::NONE),
                 AtomicU64::new(crate::cpu_timer::NONE),
@@ -1830,6 +1837,12 @@ impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Tas
     /// only writer, so plain loads and stores suffice)
     pub fn account(&self, now: u64, kernel: bool) {
         self.acct_begin();
+        self.charge(now, kernel);
+        self.acct_end();
+    }
+
+    /// The body of `account`, inside the caller's sequence window
+    fn charge(&self, now: u64, kernel: bool) {
         let delta = now.saturating_sub(self.last_run_ns.load(Ordering::Relaxed));
         let was_kernel = self.in_kernel.load(Ordering::Relaxed);
         // The group's running totals for its CPU timers (when kept)
@@ -1843,7 +1856,6 @@ impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Tas
         );
         self.last_run_ns.store(now, Ordering::Relaxed);
         self.in_kernel.store(kernel, Ordering::Relaxed);
-        self.acct_end();
     }
 
     /// Charge the time since the last accounting point to the mode the
@@ -1867,6 +1879,16 @@ impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Tas
     pub fn switch_in(&self, now: u64) {
         self.acct_begin();
         self.last_run_ns.store(now, Ordering::Relaxed);
+        self.acct_running.store(true, Ordering::Relaxed);
+        self.acct_end();
+    }
+
+    /// The task leaves its CPU at `now`: charge its time up to now and
+    /// stop counting a running slice, in one sequence window
+    pub fn switch_out(&self, now: u64) {
+        self.acct_begin();
+        self.charge(now, self.in_kernel.load(Ordering::Relaxed));
+        self.acct_running.store(false, Ordering::Relaxed);
         self.acct_end();
     }
 
@@ -1892,11 +1914,12 @@ impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Tas
             let (mut u, mut s) = self.times();
             let last = self.last_run_ns.load(Ordering::Relaxed);
             let kernel = self.in_kernel.load(Ordering::Relaxed);
+            let running = self.acct_running.load(Ordering::Relaxed);
             core::sync::atomic::fence(Ordering::Acquire);
             if self.acct_seq.load(Ordering::Relaxed) != s1 {
                 continue;
             }
-            if self.se.on_cpu() {
+            if running {
                 let d = now.saturating_sub(last);
                 if kernel {
                     s += d;

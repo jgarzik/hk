@@ -2735,7 +2735,7 @@ fn context_switch_locked(
     // now (its time off the CPU is nobody's)
     let now = crate::time::monotonic_ns();
     if prev.tid() != 0 {
-        prev.account_now(now);
+        prev.switch_out(now);
     }
     n.switch_in(now);
     let (next_kstack, next_mm, (next_tls, next_gs)) = make_current(n);
