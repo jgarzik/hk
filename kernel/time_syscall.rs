@@ -482,14 +482,15 @@ fn do_nanosleep(deadline: u64, rem: u64) -> i64 {
 /// - EINVAL: Invalid timespec (tv_nsec out of range)
 /// - EFAULT: Invalid tp pointer
 pub fn sys_clock_settime(clockid: i32, tp: u64) -> i64 {
+    // Only CLOCK_REALTIME can be set (Linux: no clock_set is EINVAL,
+    // before the copy)
+    if clockid != CLOCK_REALTIME {
+        return KernelError::InvalidArgument.sysret();
+    }
+
     // Validate user buffer address
     if tp == 0 || !Uaccess::access_ok(tp, core::mem::size_of::<LinuxTimespec>()) {
         return KernelError::BadAddress.sysret();
-    }
-
-    // Only CLOCK_REALTIME can be set
-    if clockid != CLOCK_REALTIME {
-        return KernelError::InvalidArgument.sysret();
     }
 
     // Read timespec from user space
@@ -501,6 +502,10 @@ pub fn sys_clock_settime(clockid: i32, tp: u64) -> i64 {
     // Validate timespec values
     if ts.tv_nsec < 0 || ts.tv_nsec >= 1_000_000_000 {
         return KernelError::InvalidArgument.sysret();
+    }
+    // Linux do_sys_settimeofday64 -> security_settime64 (cap_settime)
+    if !crate::task::capable(crate::task::CAP_SYS_TIME) {
+        return KernelError::NotPermitted.sysret();
     }
 
     // Convert to Timespec and set
@@ -553,15 +558,28 @@ pub fn sys_settimeofday(tv: u64, tz: u64) -> i64 {
             nsec: (timeval.tv_usec * 1000) as u32,
         };
 
+        // Linux copies the timezone, then checks CAP_SYS_TIME
+        // (security_settime64)
+        if tz != 0 && !Uaccess::access_ok(tz, core::mem::size_of::<Timezone>()) {
+            return KernelError::BadAddress.sysret();
+        }
+        if !crate::task::capable(crate::task::CAP_SYS_TIME) {
+            return KernelError::NotPermitted.sysret();
+        }
         if !TIMEKEEPER.set_realtime(new_time) {
             return KernelError::InvalidArgument.sysret(); // Timekeeper not initialized
         }
+        return 0;
     }
 
     // Timezone is deprecated; we accept but ignore it
     // Just validate the pointer if provided
     if tz != 0 && !Uaccess::access_ok(tz, core::mem::size_of::<Timezone>()) {
         return KernelError::BadAddress.sysret();
+    }
+    // Linux: even a timezone-only (or empty) call needs CAP_SYS_TIME
+    if !crate::task::capable(crate::task::CAP_SYS_TIME) {
+        return KernelError::NotPermitted.sysret();
     }
 
     0
@@ -929,9 +947,26 @@ pub fn sys_adjtimex(txc_p: u64) -> i64 {
     // Check if any modifications are requested
     let is_read_only = txc.modes == 0;
 
-    // For any modification, require CAP_SYS_TIME
-    // For now, we allow modifications from any process (simplified model)
-    // A full implementation would check cred.has_capability(CAP_SYS_TIME)
+    // Linux timekeeping_validate_timex: changing anything needs
+    // CAP_SYS_TIME; the old adjtime mode only with its read-only bit
+    // does not; ADJ_SETOFFSET always does
+    const ADJ_ADJTIME: u32 = 0x8000;
+    const ADJ_OFFSET_SINGLESHOT: u32 = 0x0001;
+    const ADJ_OFFSET_READONLY: u32 = 0x2000;
+    let cap = || crate::task::capable(crate::task::CAP_SYS_TIME);
+    if txc.modes & ADJ_ADJTIME != 0 {
+        if txc.modes & ADJ_OFFSET_SINGLESHOT == 0 {
+            return KernelError::InvalidArgument.sysret();
+        }
+        if txc.modes & ADJ_OFFSET_READONLY == 0 && !cap() {
+            return KernelError::NotPermitted.sysret();
+        }
+    } else if txc.modes != 0 && !cap() {
+        return KernelError::NotPermitted.sysret();
+    }
+    if txc.modes & ADJ_SETOFFSET != 0 && !cap() {
+        return KernelError::NotPermitted.sysret();
+    }
     if !is_read_only {
         // Validate tick range if being set
         if txc.modes & ADJ_TICK != 0 {
