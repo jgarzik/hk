@@ -14,6 +14,7 @@
 //! Lock ordering: IrqSpinlock should be the innermost lock when combining
 //! with non-IRQ-safe locks (Mutex, RwLock). Never acquire a non-IRQ-safe
 //! lock from interrupt context.
+#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use ::core::cell::UnsafeCell;
 use ::core::marker::PhantomData;

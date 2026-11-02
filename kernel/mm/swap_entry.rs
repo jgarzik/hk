@@ -119,10 +119,8 @@ impl SwapEntry {
         (self.0 << 1) | Self::SWAP_MARKER
     }
 
-    /// Create a swap entry from a PTE value
-    ///
-    /// # Safety
-    /// Caller must ensure the PTE is actually a swap entry (use `is_swap_pte()` first)
+    /// Create a swap entry from a PTE value (meaningful only for a swap
+    /// PTE: check `is_swap_pte()` first)
     #[inline]
     pub fn from_pte(pte: u64) -> Self {
         // Remove swap marker and shift right to get original entry

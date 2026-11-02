@@ -13,6 +13,7 @@
 //! down_read_killable / down_write_killable); `try_*` never sleep. The
 //! raw `down_*`/`up_*` pairs serve callers that lock and unlock in
 //! different scopes.
+#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};

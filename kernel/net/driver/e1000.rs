@@ -24,6 +24,7 @@
 //! - `rx`: `crate::sync::spin::Mutex`, thread context only (NAPI poll). Leaf.
 //! - `tx`: `crate::sync::spin::Mutex`, thread context only (xmit, NAPI poll reclaim).
 //!   Taken under socket/ARP locks (end of the network lock order). Leaf.
+#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use alloc::boxed::Box;
 use alloc::sync::{Arc, Weak};

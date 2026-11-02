@@ -6,6 +6,7 @@
 //! - exit (process termination)
 //! - wait4, waitid (child process waiting)
 //! - set_tid_address (thread exit notification)
+#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use crate::error::KernelError;
 
@@ -132,7 +133,7 @@ pub fn sys_fork() -> i64 {
 ///
 /// This is an optimization for the common fork+exec pattern.
 ///
-/// # Safety
+/// The user-space contract (not a Rust one):
 /// The child MUST NOT:
 /// - Return from the function containing vfork()
 /// - Modify any data except the vfork() return value

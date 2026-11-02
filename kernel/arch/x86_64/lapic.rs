@@ -5,6 +5,7 @@
 //! - Enable/configure the Local APIC
 //! - Send Inter-Processor Interrupts (IPIs)
 //! - Handle the APIC timer
+#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use ::core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 

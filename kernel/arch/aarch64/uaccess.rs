@@ -3,6 +3,7 @@
 //! Provides safe user-space memory access with PAN (Privileged Access Never)
 //! protection. On ARMv8.1+, PAN prevents kernel from accidentally accessing
 //! user memory without explicit permission.
+#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use core::sync::atomic::{AtomicBool, Ordering};
 

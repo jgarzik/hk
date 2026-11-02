@@ -13,6 +13,7 @@
 //! Locking: `IRQ_TABLE` is an `IrqSpinlock` (taken by `dispatch_irq` in IRQ
 //! context, by register/unregister in process context). Handlers run with it
 //! held and must not register/unregister.
+#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use alloc::vec::Vec;
 

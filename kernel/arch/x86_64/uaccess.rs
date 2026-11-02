@@ -18,6 +18,7 @@
 //! On x86_64, valid user addresses are in the range [0, 0x0000_7FFF_FFFF_FFFF].
 //! The "canonical hole" (0x0000_8000_0000_0000 to 0xFFFF_7FFF_FFFF_FFFF) is invalid.
 //! Kernel addresses are in [0xFFFF_8000_0000_0000, 0xFFFF_FFFF_FFFF_FFFF].
+#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use crate::uaccess::UaccessArch;
 

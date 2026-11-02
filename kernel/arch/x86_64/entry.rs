@@ -33,6 +33,9 @@ const SYSRET_BAD_FLAGS: u64 = 0x100 | 0x1_0000;
 /// On entry: RCX = user RIP, R11 = user RFLAGS, RSP = user stack, RAX =
 /// syscall number, RDI, RSI, RDX, R10, R8, R9 = arguments; interrupts
 /// off (SFMASK) until `do_syscall_64` has the frame.
+///
+/// # Safety
+/// Never called from Rust: the CPU enters it (its MSR or IDT gate).
 #[unsafe(naked)]
 pub unsafe extern "C" fn syscall_entry() {
     core::arch::naked_asm!(
@@ -140,6 +143,9 @@ fn sysret_ok(r: &PtRegs) -> bool {
 /// the vector in edi, then `idt_common` (or `paranoid_common`)
 macro_rules! idt_stub {
     ($name:ident, $vector:expr, $err:expr, $common:ident) => {
+        ///
+        /// # Safety
+        /// Never called from Rust: the CPU enters it (its MSR or IDT gate).
         #[unsafe(naked)]
         pub unsafe extern "C" fn $name() {
             core::arch::naked_asm!(
@@ -253,6 +259,9 @@ pub fn vector_stub(vector: u8) -> u64 {
 /// Common IDT entry: interrupts are off (interrupt gates); from user
 /// mode (saved CS RPL 3) the kernel GS base comes first. Stack on entry:
 /// [rdi, orig_ax, ip, cs, flags, sp, ss]; edi = vector.
+///
+/// # Safety
+/// Only jumped to from the IDT stubs, with their stack layout.
 #[unsafe(naked)]
 unsafe extern "C" fn idt_common() {
     core::arch::naked_asm!(
@@ -344,6 +353,9 @@ extern "C" fn fixup_bad_iret(bad: &PtRegs) -> *mut PtRegs {
 /// `swapgs` and its `iretq`, so the saved CS does not tell which GS
 /// base is live. MSR_GS_BASE does: a kernel address is negative. EBX
 /// (callee-saved) remembers whether to swap back.
+///
+/// # Safety
+/// Only jumped to from the paranoid IDT stubs.
 #[unsafe(naked)]
 unsafe extern "C" fn paranoid_common() {
     core::arch::naked_asm!(
@@ -409,6 +421,9 @@ unsafe extern "C" fn paranoid_common() {
 /// Return through IRET to the frame at RSP (Linux
 /// restore_regs_and_return_to_kernel / swapgs_restore_regs_and_return_
 /// to_usermode): interrupts off, then the user GS base for a user CS
+///
+/// # Safety
+/// Only jumped to with RSP at a complete pt_regs frame to return to.
 #[unsafe(naked)]
 pub unsafe extern "C" fn irq_return() {
     core::arch::naked_asm!(

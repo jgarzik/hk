@@ -2,6 +2,7 @@
 //!
 //! Implements the PageTable trait for x86-64 4-level paging:
 //! PML4 -> PDPT -> PD -> PT -> Physical Page
+#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use core::sync::atomic::{AtomicU64, Ordering};
 

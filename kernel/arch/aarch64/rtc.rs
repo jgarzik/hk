@@ -12,6 +12,7 @@
 //! - RTCRIS (0x014): Raw Interrupt Status
 //! - RTCMIS (0x018): Masked Interrupt Status
 //! - RTCICR (0x01C): Interrupt Clear Register
+#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use core::ptr;
 

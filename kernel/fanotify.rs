@@ -26,6 +26,7 @@
 //! - Events can include fd to the affected file
 //! - Support for permission events (blocking operations pending user decision)
 //! - Multiple marks per fanotify instance
+#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;

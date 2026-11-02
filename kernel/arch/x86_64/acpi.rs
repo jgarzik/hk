@@ -10,6 +10,7 @@
 //! NOTE: ACPI tables can be located anywhere in physical memory, including
 //! above the identity-mapped region. We use ioremap to map tables before
 //! accessing them.
+#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use super::ioremap::{ioremap, iounmap};
 use crate::acpi::aml::{self, SleepType};

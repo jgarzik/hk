@@ -1,6 +1,7 @@
 //! Interrupt Descriptor Table (IDT) and interrupt handling
 //!
 //! Sets up the IDT with exception handlers and IRQ handlers.
+#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use ::core::mem::size_of;
 use ::core::sync::atomic::{AtomicU64, Ordering};

@@ -3,6 +3,7 @@
 //! This module handles bringing up Application Processors (APs) on an SMP system.
 //! The Bootstrap Processor (BSP) uses INIT-SIPI-SIPI to wake each AP, which then
 //! executes a trampoline to transition from real mode to long mode.
+#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use ::core::sync::atomic::{AtomicU32, Ordering};
 
@@ -278,9 +279,7 @@ pub fn enable_ap_scheduling() {
 
 /// AP entry point - called from trampoline in 64-bit mode
 ///
-/// # Safety
-/// This is called directly from assembly with the CPU in a partially
-/// initialized state.
+/// Called only from the trampoline, with the CPU partly initialized.
 #[unsafe(no_mangle)]
 pub extern "C" fn ap_entry(boot_cpu_id: u32, apic_id: u32) -> ! {
     // Leave the trampoline table (with its low identity map)

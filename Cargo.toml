@@ -26,4 +26,7 @@ unused_unsafe = "deny"
 
 [workspace.lints.clippy]
 missing_safety_doc = "deny"
+undocumented_unsafe_blocks = "deny"
+unnecessary_safety_comment = "deny"
+unnecessary_safety_doc = "deny"
 mut_mut = "warn"

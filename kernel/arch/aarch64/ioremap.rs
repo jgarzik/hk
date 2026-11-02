@@ -8,6 +8,7 @@
 //! already mapped with device attributes at IO_BASE + phys (kmap.rs);
 //! other addresses get pages in the ioremap window. Both are in TTBR1,
 //! shared by every address space.
+#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use crate::mm::tlb::flush_tlb_kernel_range;
 use crate::sync::spin::Mutex;

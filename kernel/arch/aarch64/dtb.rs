@@ -3,6 +3,7 @@
 //! This module extracts hardware configuration from the Device Tree Blob (DTB)
 //! passed by the bootloader. It produces an AcpiInfo structure compatible with
 //! the architecture-independent kernel code.
+#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 extern crate alloc;
 

@@ -335,7 +335,7 @@ pub fn bpf_run(prog: &[BpfInsn], ctx: &[u8]) -> u64 {
 
         pc += 1;
 
-        // Safety: prevent infinite loops
+        // Bounded: no program runs forever
         if pc > BPF_MAXINSNS {
             return 0;
         }

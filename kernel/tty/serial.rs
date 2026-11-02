@@ -3,6 +3,7 @@
 //! NS16550A-compatible UART driver implementing TtyDriver.
 //!
 //! This provides the hardware interface for serial ports like /dev/ttyS0.
+#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use crate::chardev::DeviceError;
 use crate::console::{ConsolePriority, register_console};
@@ -163,6 +164,9 @@ impl SerialTty {
     }
 
     /// Write byte to I/O port
+    ///
+    /// # Safety
+    /// `offset` is a register of this UART's port range.
     #[inline]
     unsafe fn outb(&self, offset: u16, value: u8) {
         unsafe {
@@ -176,6 +180,9 @@ impl SerialTty {
     }
 
     /// Read byte from I/O port
+    ///
+    /// # Safety
+    /// As [`Self::outb`].
     #[inline]
     unsafe fn inb(&self, offset: u16) -> u8 {
         let value: u8;

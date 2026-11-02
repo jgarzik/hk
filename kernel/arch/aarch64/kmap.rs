@@ -17,6 +17,7 @@
 //! TTBR1 tables once the heap exists (the DTB parser needs it) and
 //! leaves TTBR0 with an empty table; user page tables only ever hold
 //! user mappings. Boot-time tables come from a static pool.
+#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use core::arch::asm;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -104,6 +105,10 @@ fn pool_page() -> u64 {
 }
 
 /// Next-level table under `table[idx]`, created if absent
+///
+/// # Safety
+/// `table` is a boot page table (swapper or pool page), during
+///  single-CPU early boot.
 unsafe fn next(table: *mut RawPageTable, idx: usize) -> *mut RawPageTable {
     unsafe {
         let e = (*table).entry_mut(idx);
@@ -121,6 +126,9 @@ fn idx(va: u64, shift: u32) -> usize {
 /// Linear-map RAM [base, base + size): 1GB blocks where a whole
 /// gigabyte is RAM, else 2MB blocks (normal memory, never executable);
 /// returns the end of the mapping
+///
+/// # Safety
+/// As [`next`] for `root`; [base, base + size) is RAM.
 unsafe fn map_linear(root: *mut RawPageTable, base: u64, size: u64) -> u64 {
     let attrs = AF | SH_INNER | ATTR_IDX_NORMAL | AP_EL1_RW | PXN | UXN;
     let (start, end) = (base & !(SZ_2M - 1), (base + size).next_multiple_of(SZ_2M));
@@ -144,6 +152,9 @@ unsafe fn map_linear(root: *mut RawPageTable, base: u64, size: u64) -> u64 {
 
 /// Map the kernel image with 4KB pages: text read-only executable,
 /// rodata read-only, data and bss writable, neither executable (W^X)
+///
+/// # Safety
+/// As [`next`] for `root`.
 unsafe fn map_image(root: *mut RawPageTable) {
     let normal = AF | SH_INNER | ATTR_IDX_NORMAL | UXN;
     let text = &raw const _text as u64;
@@ -170,6 +181,9 @@ unsafe fn map_image(root: *mut RawPageTable) {
 }
 
 /// Device window: one 1GB Device-nGnRnE block over physical 0-1GB
+///
+/// # Safety
+/// As [`next`] for `root`.
 unsafe fn map_io(root: *mut RawPageTable) {
     let attrs = AF | ATTR_IDX_DEVICE | AP_EL1_RW | PXN | UXN;
     unsafe {

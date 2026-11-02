@@ -9,6 +9,7 @@
 //! `pages` (spin `Mutex`, thread context, leaf; Linux brd_pages
 //! xarray lock): held only to find or insert a frame, never across a
 //! copy into user memory (copies use kernel bounce buffers).
+#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;

@@ -12,6 +12,7 @@
 //! instructions around those swaps: their (paranoid) entries read
 //! MSR_GS_BASE instead (a kernel address is negative; a user one is
 //! below TASK_SIZE).
+#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use ::core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 

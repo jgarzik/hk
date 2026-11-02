@@ -4,6 +4,7 @@
 //!
 //! Also implements `BusDriver` for the PCI bus, so xHCI controllers are discovered
 //! automatically during PCI enumeration.
+#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
@@ -452,11 +453,14 @@ mod portsc {
     }
 }
 
-/// Wrapper around raw pointer for Send+Sync
-/// SAFETY: We only access this from kernel context with proper synchronization
+/// A ring's TRB array (DMA memory, reached only through its owner's
+/// lock, the controller lock)
 struct TrbPtr(*mut Trb);
 
+// SAFETY: an address; the TRBs are touched only under the controller
+// lock (USB_CONTROLLER)
 unsafe impl Send for TrbPtr {}
+// SAFETY: as above
 unsafe impl Sync for TrbPtr {}
 
 /// Transfer Request Block (TRB)

@@ -23,6 +23,7 @@
 //! - Linux fs/splice.c
 //! - Linux include/linux/pipe_fs_i.h
 //! - Linux include/linux/splice.h
+#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use alloc::sync::Arc;
 

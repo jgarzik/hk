@@ -15,6 +15,7 @@
 //! - `Offline` - Device offline, I/O fails
 //! - `TransportOffline` - Transport layer reports offline
 //! - `Block` - Device blocked for I/O
+#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;

@@ -57,6 +57,7 @@
 //! else nests inside it, but what an entry's wake function takes (an
 //! IrqSpinlock leaf). Never call a `wait*` function while holding a
 //! spinlock, and never wake while holding this CPU's run-queue lock.
+#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use core::marker::PhantomPinned;
 use core::pin::Pin;

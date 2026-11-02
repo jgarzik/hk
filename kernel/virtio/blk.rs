@@ -24,6 +24,7 @@
 //! (`IrqSpinlock`, leaf; Linux virtio_blk_vq.lock): `queue_rq` runs in
 //! thread context or, restarting, in the IRQ handler; `complete` in the
 //! IRQ handler or a polling submitter. Neither allocates nor sleeps.
+#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;

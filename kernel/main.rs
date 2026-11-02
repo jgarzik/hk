@@ -144,6 +144,7 @@ pub extern "C" fn _start(multiboot_info: u64) -> ! {
     // tables map; it and its modules are reserved (memblock_init)
     unsafe { multiboot2::set_boot(multiboot_info) };
     // Kernel page table first: the boot tables' identity map goes away
+    // SAFETY: once, first thing on the BSP, before SMP or any user mm
     unsafe {
         arch::x86_64::kmap::init();
     }
@@ -195,6 +196,8 @@ pub extern "C" fn _start_rust(dtb_ptr: u64) -> ! {
     // the boot tables linear-map the first RAM gigabyte
     {
         const DTB_MAGIC_BE: u32 = 0xd00dfeed;
+        // SAFETY: the candidates are in the first RAM gigabyte, which the
+        // boot tables linear-map
         let magic = |pa: u64| unsafe {
             ::core::ptr::read_volatile(crate::arch::phys_to_virt(pa) as *const u32)
         };
@@ -214,6 +217,7 @@ pub extern "C" fn _start_rust(dtb_ptr: u64) -> ! {
 
     // Final kernel page tables (linear map of all RAM, which goes to
     // memblock)
+    // SAFETY: once, on the BSP, before SMP or any user mm
     unsafe { crate::arch::aarch64::kmap::init() };
 
     // Extract and parse kernel command line from DTB /chosen/bootargs
@@ -382,6 +386,7 @@ fn kmain() -> ! {
             }
             Ok(ic_virt) => {
                 // Initialize local interrupt controller
+                // SAFETY: the controller just mapped, on the BSP, once
                 unsafe {
                     CurrentArch::init_local_interrupt_controller(ic_virt as u64);
                 }
@@ -565,6 +570,7 @@ fn kmain() -> ! {
     // ========================================================================
     // Initialize graphics console if framebuffer was discovered
     // This happens after VFS init so we can create /dev/dri if needed later
+    // SAFETY: once, at boot, after ioremap is up (its contract)
     unsafe {
         if gfx::console::init_graphics_console() {
             gfx::console::register_graphics_console();
@@ -774,6 +780,7 @@ fn panic(info: &PanicInfo) -> ! {
         let rsp: u64;
         let rbp: u64;
         let rflags: u64;
+        // SAFETY: register reads only
         unsafe {
             ::core::arch::asm!(
                 "mov {}, rsp",
@@ -805,6 +812,8 @@ fn panic(info: &PanicInfo) -> ! {
             }
 
             // Read return address (stored at frame_ptr + 8)
+            // SAFETY: frame_ptr lies within this kernel stack's 64KB
+            // (checked above), mapped memory; the panic path's best effort
             let return_addr = unsafe { *((frame_ptr + 8) as *const u64) };
             if return_addr == 0 {
                 break;
@@ -813,6 +822,7 @@ fn panic(info: &PanicInfo) -> ! {
             printkln!("  #{}: {:#018x}", frame_count, return_addr);
 
             // Move to previous frame
+            // SAFETY: as above
             let prev_frame = unsafe { *(frame_ptr as *const u64) };
             if prev_frame <= frame_ptr {
                 // Prevent infinite loops

@@ -6,6 +6,7 @@
 //! kmalloc). Memory is freed to whichever gave it (the arena by
 //! address). The arena's lock is an `IrqSpinlock` leaf, like the slab
 //! locks, so the heap is IRQ-safe.
+#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use crate::arch::IrqSpinlock;
 use ::core::alloc::{GlobalAlloc, Layout};

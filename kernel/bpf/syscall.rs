@@ -18,6 +18,7 @@
 //! - `BPF_MAP_GET_NEXT_KEY`: Iterate through map keys
 //! - `BPF_PROG_LOAD`: Load a BPF program
 //! - `BPF_OBJ_GET_INFO_BY_FD`: Get object info
+#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use alloc::vec;
 use alloc::vec::Vec;

@@ -11,6 +11,7 @@
 //! - dma_alloc_coherent / dma_free_coherent for device-accessible buffers
 //! - dma_map_single / dma_unmap_single for streaming mappings
 //! - dma_map_sg / dma_unmap_sg for scatter-gather lists
+#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use alloc::vec::Vec;
 #[cfg(target_arch = "x86_64")]

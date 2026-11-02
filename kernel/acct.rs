@@ -14,6 +14,7 @@
 //!
 //! Uses Linux acct_v3 format (64 bytes per record).
 //! Records are written when processes exit (group leader exits).
+#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use alloc::sync::Arc;
 

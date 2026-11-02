@@ -11,6 +11,7 @@
 //!
 //! TTBR0_EL1 maps user space only (lower half of the address space);
 //! TTBR1_EL1 maps the kernel (upper half): see kmap.rs and doc/MEMORY.md.
+#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use core::arch::asm;
 use core::sync::atomic::{AtomicU64, Ordering};

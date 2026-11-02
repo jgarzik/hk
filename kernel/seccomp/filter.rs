@@ -1,6 +1,7 @@
 //! Seccomp filter management
 //!
 //! This module handles seccomp BPF filter storage, chaining, and execution.
+#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -135,10 +136,8 @@ impl SeccompFilter {
     }
 }
 
-/// Copy a sock_fprog from userspace and create a filter
-///
-/// # Safety
-/// The caller must ensure the sock_fprog pointer is valid.
+/// Copy a sock_fprog from userspace and create a filter (the user
+/// pointer is validated by the copy)
 pub fn create_filter_from_user<A: crate::uaccess::UaccessArch>(
     fprog_ptr: u64,
     prev: Option<Arc<SeccompFilter>>,

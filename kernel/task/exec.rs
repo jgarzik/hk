@@ -1,6 +1,7 @@
 //! execve implementation
 //!
 //! Replaces the current process image with a new program.
+#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;

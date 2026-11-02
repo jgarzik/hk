@@ -3,6 +3,7 @@
 //! The TSC is a 64-bit register present in all x86-64 processors that counts
 //! CPU cycles. On modern processors with invariant TSC, it runs at a constant
 //! rate regardless of CPU frequency changes, making it ideal for timekeeping.
+#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use super::io;
 use crate::printkln;

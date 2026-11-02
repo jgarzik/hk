@@ -5,6 +5,7 @@
 //!
 //! Unlike the Command Ring which is shared across all devices, each endpoint
 //! has a dedicated Transfer Ring for submitting transfer TRBs.
+#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{Ordering, fence};

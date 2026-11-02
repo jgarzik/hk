@@ -5,6 +5,7 @@
 //! QEMU virt addresses:
 //! - Distributor (GICD): 0x0800_0000
 //! - Redistributor (GICR): 0x080A_0000 + (cpu_id * 0x20000)
+#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use crate::printkln;
 use core::arch::asm;
@@ -55,12 +56,19 @@ fn gicr_base() -> u64 {
 }
 
 /// Read a 32-bit value from a GIC register
+///
+/// # Safety
+/// `addr` is a mapped GIC register (distributor or redistributor).
 #[inline]
 unsafe fn read32(addr: u64) -> u32 {
     unsafe { read_volatile(addr as *const u32) }
 }
 
 /// Write a 32-bit value to a GIC register
+///
+/// # Safety
+/// `addr` is a mapped GIC register, and writing `val` there is
+/// valid for the GIC's current state.
 #[inline]
 unsafe fn write32(addr: u64, val: u32) {
     unsafe { write_volatile(addr as *mut u32, val) }
@@ -82,6 +90,9 @@ pub fn init() {
 }
 
 /// Initialize the GIC CPU interface (ICC_* system registers)
+///
+/// # Safety
+/// On the CPU being brought up, interrupts masked, once.
 unsafe fn init_cpu_interface() {
     // Enable system register access (ICC_SRE_EL1.SRE = 1)
     // Also set DFB and DIB to disable IRQ/FIQ bypass
@@ -124,6 +135,9 @@ unsafe fn init_cpu_interface() {
 }
 
 /// Initialize the redistributor for the current CPU
+///
+/// # Safety
+/// On the CPU being brought up, its redistributor mapped, once.
 unsafe fn init_redistributor() {
     let base = gicr_base();
 
@@ -183,6 +197,9 @@ pub fn send_sgi(mpidr: u64, intid: u32) {
 }
 
 /// Initialize the GIC distributor (CPU 0 only)
+///
+/// # Safety
+/// Once, on CPU 0, the distributor mapped, before other CPUs use it.
 unsafe fn init_distributor() {
     unsafe {
         // Disable distributor while configuring
@@ -226,6 +243,9 @@ pub enum Trigger {
 }
 
 /// Wait for a distributor register write to take effect (GICD_CTLR.RWP)
+///
+/// # Safety
+/// The distributor is mapped.
 unsafe fn gicd_wait_rwp() {
     let mut timeout = 1_000_000;
     while unsafe { read32(GICD_CTLR) } & GICD_CTLR_RWP != 0 && timeout > 0 {

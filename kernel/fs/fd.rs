@@ -5,6 +5,7 @@
 //! - fcntl (file control operations)
 //! - truncate, ftruncate (file size modification)
 //! - pipe, pipe2 (pipe creation)
+#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use alloc::sync::Arc;
 

@@ -1,4 +1,5 @@
 //! Memory barriers for device I/O (Linux arch/arm64/include/asm/barrier.h)
+#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 /// Order CPU writes to coherent DMA memory (outer shareable, stores)
 #[inline(always)]

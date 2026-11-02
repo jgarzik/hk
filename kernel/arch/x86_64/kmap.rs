@@ -16,6 +16,7 @@
 //! the vmalloc PDPT is preallocated, so ioremap's PD/PT changes are seen by
 //! every address space (Linux: preallocate_vmalloc_pages). Boot-time
 //! tables come from a static pool (the frame allocator does not exist yet).
+#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -88,6 +89,10 @@ fn pool_page() -> (*mut RawPageTable, u64) {
 }
 
 /// Next-level table under `table[idx]`, created if absent
+///
+/// # Safety
+/// `table` is a boot page table (swapper or pool page), during
+/// single-CPU early boot.
 unsafe fn next(table: *mut RawPageTable, idx: usize) -> *mut RawPageTable {
     unsafe {
         let e = (*table).entry_mut(idx);
@@ -179,6 +184,9 @@ fn direct_pages(ram: &dyn RamMap, gb: bool, cap: u64, mut page: impl FnMut(u64, 
 /// whole gigabyte is RAM and the CPU allows it. Past the page-table
 /// pool's reach nothing is mapped, and memblock drops that RAM
 /// (`direct_end`).
+///
+/// # Safety
+/// As [`next`] for `pml4`.
 unsafe fn map_direct(pml4: *mut RawPageTable, ram: &dyn RamMap) {
     // Each gigabyte may need a PD; keep a reserve for image and vmalloc
     let cap = ((POOL_PAGES as u64 - 16) * SZ_1G).min(ram.top().next_multiple_of(SZ_2M));
@@ -203,6 +211,9 @@ unsafe fn map_direct(pml4: *mut RawPageTable, ram: &dyn RamMap) {
 
 /// Map the kernel image with 4KB pages: text read-only executable,
 /// rodata read-only, data and bss writable, neither executable (W^X)
+///
+/// # Safety
+/// As [`next`] for `pml4`.
 unsafe fn map_image(pml4: *mut RawPageTable) {
     let text = &raw const _text as u64;
     let etext = &raw const _etext as u64;

@@ -8,6 +8,7 @@
 //! - Each CPU only modifies its own run queue
 //! - Run queue lock must be held with IRQs disabled
 //! - Context switch happens with the run queue lock held
+#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use ::core::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use alloc::sync::Arc;
@@ -1122,11 +1123,11 @@ impl Cur {
 #[inline]
 pub fn current() -> Cur {
     let p = CurrentArch::current_task_ptr() as *const KernelTask;
-    // SAFETY: a nonzero `curr` is the task this CPU switched to, kept
-    // alive by its run queue until it has switched away for good
     let task = if p.is_null() {
         &INIT_TASK
     } else {
+        // SAFETY: a nonzero `curr` is the task this CPU switched to,
+        // kept alive by its run queue until it has switched away for good
         unsafe { &*p }
     };
     Cur {

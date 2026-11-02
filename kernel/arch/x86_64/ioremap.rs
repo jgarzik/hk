@@ -3,6 +3,7 @@
 //! Provides Linux-like ioremap/iounmap functions for mapping physical
 //! MMIO regions to kernel virtual addresses. Uses a dedicated virtual
 //! address region separate from the kernel heap and user space.
+#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use crate::sync::spin::Mutex;
 
@@ -210,8 +211,8 @@ pub fn init() {
 /// # Returns
 /// Virtual address pointer (with same offset as physical address had)
 ///
-/// # Safety
-/// The physical address must be a valid MMIO region, not regular RAM.
+/// The physical range should be MMIO, not RAM (an uncached alias of
+/// RAM would conflict with the direct map's attributes).
 pub fn ioremap(phys_addr: u64, size: u64) -> Result<*mut u8, IoremapError> {
     if size == 0 {
         return Err(IoremapError::InvalidSize);
@@ -340,6 +341,9 @@ fn map_page(cr3: u64, va: u64, pa: u64, flags: u64) -> Result<(), IoremapError> 
 }
 
 /// Table under a PDPT or PD entry, allocated if absent
+///
+/// # Safety
+/// `e` is an entry of a live kernel page table, under the ioremap lock.
 unsafe fn table(
     e: &mut super::paging::PageTableEntry,
 ) -> Result<*mut super::paging::RawPageTable, IoremapError> {

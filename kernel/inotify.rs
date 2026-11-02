@@ -28,6 +28,7 @@
 //! - poll/epoll support for integration with event loops
 //! - Multiple watches per inotify instance
 //! - Watch descriptors (wd) are unique per instance
+#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;

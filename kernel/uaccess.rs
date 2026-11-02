@@ -17,6 +17,7 @@
 //!
 //! Functions return the number of bytes that could NOT be copied (0 = success),
 //! following the Linux kernel convention. This allows partial copies to be detected.
+#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 extern crate alloc;
 
@@ -139,18 +140,6 @@ pub trait UaccessArch {
 /// * `Ok(0)` on success (all bytes copied)
 /// * `Err(UaccessError::BadAddress)` if user address is invalid
 /// * `Err(UaccessError::Overflow)` if address range overflows
-///
-/// # Safety
-/// The kernel source slice must be valid. The user destination is validated
-/// by this function.
-///
-/// # Example
-/// ```ignore
-/// let data = [1u8, 2, 3, 4];
-/// if copy_to_user::<X86_64Uaccess>(user_ptr, &data).is_ok() {
-///     // Success
-/// }
-/// ```
 #[track_caller]
 pub fn copy_to_user<A: UaccessArch>(to: u64, from: &[u8]) -> UaccessResult<usize> {
     might_fault();
@@ -186,10 +175,6 @@ pub fn copy_to_user<A: UaccessArch>(to: u64, from: &[u8]) -> UaccessResult<usize
 /// * `Ok(0)` on success (all bytes copied)
 /// * `Err(UaccessError::BadAddress)` if user address is invalid
 /// * `Err(UaccessError::Overflow)` if address range overflows
-///
-/// # Safety
-/// The kernel destination slice must be valid and have capacity >= len.
-/// The user source is validated by this function.
 #[track_caller]
 pub fn copy_from_user<A: UaccessArch>(
     to: &mut [u8],

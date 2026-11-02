@@ -2,6 +2,7 @@
 //!
 //! This module provides per-CPU data storage accessed via the TPIDR_EL1 register.
 //! Each CPU has its own `PerCpu` structure containing CPU-local state.
+#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use core::arch::asm;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};

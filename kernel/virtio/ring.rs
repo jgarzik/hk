@@ -18,6 +18,7 @@
 //! The free list and descriptor chains are tracked in a driver-private
 //! shadow (`next`, Linux `desc_extra`): the driver never trusts link
 //! fields in memory the device can write.
+#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use alloc::vec;
 use alloc::vec::Vec;

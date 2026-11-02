@@ -14,6 +14,7 @@
 //! bus enumeration). Afterwards the transport touches lock-free state
 //! only: config reads (generation-checked), notify writes (under the
 //! caller's queue lock) and the ISR byte (IRQ context).
+#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;

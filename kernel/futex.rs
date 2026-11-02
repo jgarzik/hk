@@ -32,6 +32,7 @@
 //! unlock(bucket)
 //! sleep
 //! ```
+#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;

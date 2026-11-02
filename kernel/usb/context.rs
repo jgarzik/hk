@@ -8,6 +8,7 @@
 //! - EndpointContext: Per-endpoint configuration (type, max packet, ring)
 //! - InputContext: Used for Address Device and Configure Endpoint commands
 //! - OutputDeviceContext: Where xHCI writes device state
+#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use crate::dma::{DmaCoherent, DmaDevice, dma_alloc_coherent};
 

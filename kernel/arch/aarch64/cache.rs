@@ -6,6 +6,7 @@
 //! ARM requires explicit cache maintenance:
 //! - Before DMA from device (FromDevice): Invalidate cache so CPU reads fresh data
 //! - Before DMA to device (ToDevice): Clean cache so device sees CPU writes
+#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use core::arch::asm;
 
