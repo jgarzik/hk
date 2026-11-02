@@ -121,6 +121,18 @@ which has no control queue: QEMU then delivers all frames).
 PACKET_AUXDATA reports TP_STATUS_CSUM_VALID only for frames received on
 lo (hk has no checksum offload states).
 
+## File lock gaps (Phase E)
+
+**Location**: `kernel/fs/flock.rs`, `kernel/fs/posix_lock.rs`
+
+Blocking flock and fcntl F_SETLKW / F_OFD_SETLKW never wait: a
+conflicting lock is EAGAIN (Linux sleeps, interruptibly, with deadlock
+detection for POSIX locks: EDEADLK). The tables are global and keyed
+by raw dentry / inode pointers with no reference held (an inode freed
+and reused, once Phase E's icache evicts, inherits stale locks); POSIX
+lock owners are pids, not the files_struct (Linux fl_owner). Linux
+keeps them per inode (i_flctx: flock, posix and lease lists).
+
 ## vmsplice from a pipe is not done
 
 **Location**: `kernel/fs/splice.rs` (`sys_vmsplice`)
