@@ -528,6 +528,11 @@ pub fn invalidate_range(inode: &Inode, start: u64, end: u64) -> Result<(), Kerne
 /// locked, mapped or otherwise referenced pages stay)
 pub fn invalidate_clean(inode: &Inode, first: u64, last: u64) {
     let m = &inode.i_data;
+    // The cache is the only copy of an unevictable mapping's data
+    // (ramfs: its pages are never dirty, yet cannot be re-read)
+    if m.has_flag(AS_UNEVICTABLE) {
+        return;
+    }
     let mut at = first;
     while at <= last {
         let next = {

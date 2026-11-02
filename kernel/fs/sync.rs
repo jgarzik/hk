@@ -72,7 +72,7 @@ fn page_range(offset: u64, nbytes: u64) -> (u64, u64) {
     let first = offset / PAGE_SIZE as u64;
     let last = match nbytes {
         0 => u64::MAX,
-        n => (offset + n - 1) / PAGE_SIZE as u64,
+        n => offset.saturating_add(n - 1) / PAGE_SIZE as u64,
     };
     (first, last)
 }
@@ -161,7 +161,7 @@ pub fn sys_fadvise64(fd: i32, offset: i64, len: i64, advice: i32) -> i64 {
             let start = off.div_ceil(PAGE_SIZE as u64);
             let end = match len {
                 0 => u64::MAX,
-                _ => (off + len as u64) / PAGE_SIZE as u64,
+                _ => off.saturating_add(len as u64) / PAGE_SIZE as u64,
             };
             if start < end {
                 filemap::invalidate_clean(&host, start, end - 1);
@@ -186,7 +186,9 @@ pub fn sys_readahead(fd: i32, offset: i64, count: usize) -> i64 {
         return KernelError::InvalidArgument.sysret();
     };
     let m = inode.mode();
-    if (!m.is_file() && !m.is_blkdev()) || offset < 0 {
+    // The count reaches fadvise as a loff_t: past i64::MAX it is a
+    // negative length, EINVAL (Linux vfs_fadvise)
+    if (!m.is_file() && !m.is_blkdev()) || offset < 0 || (count as i64) < 0 {
         return KernelError::InvalidArgument.sysret();
     }
     if let Some(host) = file.mapping_inode() {

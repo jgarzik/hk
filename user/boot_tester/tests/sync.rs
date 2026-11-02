@@ -38,6 +38,24 @@ pub fn run_tests() {
     test_dirty_sysctls();
     test_sync_file_range();
     test_fadvise();
+    test_fadvise_ramfs();
+}
+
+/// DONTNEED on a ramfs file keeps its data (the cache is its only
+/// copy, Linux skips unevictable mappings), and huge ranges are fine
+/// (readahead's count past i64::MAX is a negative length: EINVAL)
+fn test_fadvise_ramfs() {
+    use hk_syscall::{sys_fadvise64, sys_pread64, sys_readahead, sys_sync_file_range};
+    let (fd, p) = file_and_pipe();
+    let a = sys_fadvise64(fd, 0, 0, 4);
+    let b = sys_readahead(fd, 0, usize::MAX);
+    let c = sys_fadvise64(fd, 1, i64::MAX, 4);
+    let d = sys_sync_file_range(fd, 1, i64::MAX - 1, 2);
+    let mut back = [0u8; 8192];
+    let n = sys_pread64(fd, back.as_mut_ptr(), 8192, 0);
+    close_both(fd, p);
+    let ok = a == 0 && b == -22 && c == 0 && d == 0 && n == 8192 && back.iter().all(|&x| x == 7);
+    verdict(b"FADVISE_DONTNEED_RAMFS", ok, [a, b, c, d, n, back[0] as i64]);
 }
 
 fn verdict(name: &[u8], ok: bool, got: [i64; 6]) {
