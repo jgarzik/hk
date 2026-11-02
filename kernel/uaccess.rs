@@ -70,6 +70,9 @@ pub enum UaccessError {
     Overflow,
     /// Page fault during access (would block or fail)
     Fault,
+    /// A name that is not valid UTF-8 (hk's VFS names are UTF-8 until
+    /// they become byte strings)
+    Encoding,
 }
 
 /// Result type for user access operations
@@ -382,13 +385,10 @@ pub fn strncpy_from_user<A: UaccessArch>(
 ) -> UaccessResult<alloc::string::String> {
     might_fault();
     let bytes = strndup_user_bytes::<A>(from, max_len)?;
-    // Names are bytes on Linux; hk's VFS still holds Strings. Valid
-    // UTF-8 is kept as is, anything else byte for byte as Latin-1 (the
-    // VFS names are byte strings in a later chunk)
-    Ok(match alloc::string::String::from_utf8(bytes) {
-        Ok(s) => s,
-        Err(e) => e.into_bytes().iter().map(|&b| b as char).collect(),
-    })
+    // Names are bytes on Linux; hk's VFS still holds Strings, so only
+    // valid UTF-8 is taken, as is. Mapping other bytes to chars would let
+    // two different byte names alias one String (BUGS.md)
+    alloc::string::String::from_utf8(bytes).map_err(|_| UaccessError::Encoding)
 }
 
 /// Copy a NUL-terminated byte string from user space (Linux

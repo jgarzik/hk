@@ -30,6 +30,20 @@ None is known to fail today, but each is a soundness bug:
 - **Inode locks:** `unlock_rename` and `inode_lock`/`inode_unlock` are
   hand-paired, and `unlock_rename` is a safe fn.
 
+## Path names must be valid UTF-8
+
+**Location:** `kernel/uaccess.rs` (`strncpy_from_user`).
+
+Linux path names are any bytes except '/' and NUL. hk's VFS holds names
+as `String`, so the path copy-in takes only valid UTF-8 and rejects
+anything else. Mapping the other bytes to chars would let two different
+byte names alias one String.
+
+The callers turn every copy-in error into EFAULT, including the
+rejection here and an overlong path, which Linux reports as
+ENAMETOOLONG. The fix is byte-string names through the VFS, with one
+`user_path_at` that maps errors (Phase G).
+
 ## user/ does not follow doc/UNSAFE.md
 
 The `user/syscall` wrappers are safe `pub fn`s, and about 330 of them take
