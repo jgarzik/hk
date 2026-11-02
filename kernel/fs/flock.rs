@@ -26,7 +26,6 @@ use crate::error::KernelError;
 use crate::fs::File;
 use crate::fs::syscall::current_fd_table;
 use crate::sync::spin::Mutex;
-use crate::task::percpu::current_pid;
 
 // =============================================================================
 // flock operation constants (Linux ABI)
@@ -195,20 +194,16 @@ pub fn alloc_file_id() -> u32 {
 static FILE_LOCKS: Mutex<alloc::collections::BTreeMap<u64, FileLock>> =
     Mutex::new(alloc::collections::BTreeMap::new());
 
-/// Get or create lock state for a file
-fn get_or_create_lock(file_id: u64) -> FileLock {
+/// Run `f` on `file_id`'s lock state under one FILE_LOCKS hold (an
+/// entry left unlocked is removed)
+fn with_lock<R>(file_id: u64, f: impl FnOnce(&mut FileLock) -> R) -> R {
     let mut locks = FILE_LOCKS.lock();
-    locks.entry(file_id).or_default().clone()
-}
-
-/// Update lock state for a file
-fn update_lock(file_id: u64, lock: FileLock) {
-    let mut locks = FILE_LOCKS.lock();
-    if lock.is_unlocked() {
+    let l = locks.entry(file_id).or_default();
+    let r = f(l);
+    if l.is_unlocked() {
         locks.remove(&file_id);
-    } else {
-        locks.insert(file_id, lock);
     }
+    r
 }
 
 // Clone implementation for FileLock
@@ -256,13 +251,12 @@ pub fn sys_flock(fd: i32, operation: i32) -> i64 {
     // We use the file's dentry address as a unique identifier
     let file_id = Arc::as_ptr(&file.dentry) as u64;
 
-    let pid = current_pid();
+    // flock locks belong to the open file description (Linux fl_file):
+    // every descriptor of it, in any process, holds the same lock
+    let pid = Arc::as_ptr(&file) as u64;
 
-    // Get current lock state
-    let mut lock_state = get_or_create_lock(file_id);
-
-    // Perform the requested operation
-    let result = match lock_op {
+    // Check and change the state under one FILE_LOCKS hold
+    let result = with_lock(file_id, |lock_state| match lock_op {
         LOCK_SH => lock_state.try_lock_shared(pid),
         LOCK_EX => lock_state.try_lock_exclusive(pid),
         LOCK_UN => {
@@ -270,13 +264,10 @@ pub fn sys_flock(fd: i32, operation: i32) -> i64 {
             Ok(())
         }
         _ => Err(KernelError::InvalidArgument),
-    };
+    });
 
     match result {
-        Ok(()) => {
-            update_lock(file_id, lock_state);
-            0
-        }
+        Ok(()) => 0,
         Err(KernelError::WouldBlock) if nonblock => KernelError::WouldBlock.sysret(),
         Err(KernelError::WouldBlock) => {
             // Blocking case: for now, we don't implement blocking
@@ -289,14 +280,11 @@ pub fn sys_flock(fd: i32, operation: i32) -> i64 {
     }
 }
 
-/// Clean up locks when a file is closed
-///
-/// Called from File::drop() to release any locks held by this file.
+/// The open file description `file` is gone (File::drop, its last
+/// reference): its flock locks go (Linux locks_remove_file)
 pub fn release_file_locks(file: &File) {
     let file_id = Arc::as_ptr(&file.dentry) as u64;
-    let pid = current_pid();
+    let pid = file as *const File as u64;
 
-    let mut lock_state = get_or_create_lock(file_id);
-    lock_state.unlock(pid);
-    update_lock(file_id, lock_state);
+    with_lock(file_id, |l| l.unlock(pid));
 }

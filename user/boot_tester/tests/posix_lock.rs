@@ -48,6 +48,8 @@ pub fn run_tests() {
     test_getlk_no_conflict();
     test_setlk_unlock();
     test_setlk_ebadf();
+    test_lock_exec();
+    test_lock_close_any();
 }
 
 /// Test F_SETLK with F_WRLCK (write lock) and F_UNLCK
@@ -235,6 +237,112 @@ fn test_setlk_ebadf() {
     } else {
         print(b"POSIX_SETLK_EBADF:FAIL: expected -9, got ");
         print_num(ret);
+        println(b"");
+    }
+}
+
+/// F_GETLK of a write lock over the whole file: (l_type, l_pid)
+fn getlk(path: &[u8]) -> (i16, i32) {
+    let fd = sys_open(path.as_ptr(), O_RDWR, 0);
+    let mut fl = Flock {
+        l_type: F_WRLCK,
+        l_whence: SEEK_SET,
+        l_start: 0,
+        l_len: 0,
+        l_pid: 0,
+    };
+    let r = sys_fcntl(fd as i32, F_GETLK, &mut fl as *mut Flock as u64);
+    sys_close(fd as u64);
+    if r != 0 { (-1, 0) } else { (fl.l_type, fl.l_pid) }
+}
+
+/// Take a write lock over the whole file through `fd`
+fn wrlock(fd: i64) -> i64 {
+    let mut fl = Flock {
+        l_type: F_WRLCK,
+        l_whence: SEEK_SET,
+        l_start: 0,
+        l_len: 0,
+        l_pid: 0,
+    };
+    sys_fcntl(fd as i32, F_SETLK, &mut fl as *mut Flock as u64)
+}
+
+/// POSIX_LOCK_EXEC: a lock survives its holder's exec (Linux keeps them;
+/// only closed descriptors drop theirs)
+fn test_lock_exec() {
+    use hk_syscall::{sys_execve, sys_exit, sys_fork, sys_kill, sys_pipe2, sys_read, sys_wait4};
+    const O_CLOEXEC: u32 = 0o2000000;
+    let path = b"/tmp/posix_exec_test\0";
+    let fd = sys_open(path.as_ptr(), O_RDWR | O_CREAT | O_TRUNC, 0o644);
+    sys_close(fd as u64);
+    let mut p = [0i32; 2];
+    sys_pipe2(p.as_mut_ptr(), O_CLOEXEC);
+    let pid = sys_fork();
+    if pid == 0 {
+        sys_close(p[0] as u64);
+        let fd = sys_open(path.as_ptr(), O_RDWR, 0);
+        if wrlock(fd) != 0 {
+            sys_exit(1);
+        }
+        let argv: [*const u8; 3] = [b"sleep\0".as_ptr(), b"10\0".as_ptr(), core::ptr::null()];
+        let envp: [*const u8; 1] = [core::ptr::null()];
+        sys_execve(b"/bin/busybox\0".as_ptr(), argv.as_ptr(), envp.as_ptr());
+        sys_exit(127);
+    }
+    sys_close(p[1] as u64);
+    let mut c = [0u8; 1];
+    let eof = sys_read(p[0] as u64, c.as_mut_ptr(), 1);
+    sys_close(p[0] as u64);
+    let (ty, owner) = getlk(path);
+    sys_kill(pid, 9);
+    let mut st = 0i32;
+    sys_wait4(pid, &mut st, 0, 0);
+    if eof == 0 && ty == F_WRLCK && owner as i64 == pid {
+        println(b"POSIX_LOCK_EXEC:OK");
+    } else {
+        print(b"POSIX_LOCK_EXEC:FAIL l_type ");
+        print_num(ty as i64);
+        println(b"");
+    }
+}
+
+/// POSIX_LOCK_CLOSE_ANY: closing any descriptor of the file drops the
+/// process's locks on it, though the locking one is still open
+fn test_lock_close_any() {
+    use hk_syscall::{sys_exit, sys_fork, sys_pipe2, sys_read, sys_wait4, sys_write};
+    let path = b"/tmp/posix_close_test\0";
+    let fd = sys_open(path.as_ptr(), O_RDWR | O_CREAT | O_TRUNC, 0o644);
+    sys_close(fd as u64);
+    let mut ready = [0i32; 2];
+    let mut done = [0i32; 2];
+    sys_pipe2(ready.as_mut_ptr(), 0);
+    sys_pipe2(done.as_mut_ptr(), 0);
+    let pid = sys_fork();
+    if pid == 0 {
+        let fd1 = sys_open(path.as_ptr(), O_RDWR, 0);
+        let locked = wrlock(fd1) == 0;
+        let fd2 = sys_open(path.as_ptr(), O_RDWR, 0);
+        sys_close(fd2 as u64);
+        sys_write(ready[1] as u64, b"x".as_ptr(), 1);
+        let mut c = [0u8; 1];
+        sys_read(done[0] as u64, c.as_mut_ptr(), 1);
+        sys_exit(if locked { 0 } else { 1 });
+    }
+    let mut c = [0u8; 1];
+    sys_read(ready[0] as u64, c.as_mut_ptr(), 1);
+    let (ty, _) = getlk(path);
+    sys_write(done[1] as u64, b"x".as_ptr(), 1);
+    let mut st = 0i32;
+    sys_wait4(pid, &mut st, 0, 0);
+    for f in [ready[0], ready[1], done[0], done[1]] {
+        sys_close(f as u64);
+    }
+    if st == 0 && ty == F_UNLCK {
+        println(b"POSIX_LOCK_CLOSE_ANY:OK");
+    } else {
+        print(b"POSIX_LOCK_CLOSE_ANY:FAIL l_type ");
+        print_num(ty as i64);
         println(b"");
     }
 }

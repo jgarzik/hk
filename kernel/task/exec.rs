@@ -839,9 +839,6 @@ where
         Err(_) => return -ELIBBAD,
     };
 
-    // Release all POSIX advisory locks (POSIX semantics: locks released on exec)
-    crate::fs::posix_lock::release_all_posix_locks_for_pid(crate::task::percpu::current_pid());
-
     // PIE images load at ELF_ET_DYN_BASE (aligned to their segments),
     // ET_EXEC at their link address
     let base_addr = if elf.is_pie {

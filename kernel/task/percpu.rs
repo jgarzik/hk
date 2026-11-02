@@ -2534,6 +2534,11 @@ pub fn exit_current(status: Option<i32>) -> ! {
 
         // Clean up FD table for exiting task
         crate::task::fdtable::exit_task_fd(tid);
+        // The process's descriptors are all closed now: its POSIX locks
+        // go (Linux close_files -> filp_flush -> locks_remove_posix)
+        if group_dead {
+            crate::fs::posix_lock::release_all_posix_locks_for_pid(current_pid());
+        }
 
         // Clean up SysV semaphore undo list for exiting task
         // This may apply undo operations if this is the last holder

@@ -713,9 +713,11 @@ impl Drop for File {
         // Call release on file operations to allow cleanup (e.g., decrement pipe reader/writer counts)
         let _ = self.f_op.release(self);
 
-        // Release POSIX advisory locks (must be before releasing mount ref)
-        // POSIX semantics: closing ANY fd releases ALL locks by this process
-        super::posix_lock::release_posix_locks_on_close(self);
+        // The open file description is gone: its flock locks go (Linux
+        // __fput -> locks_remove_file). POSIX locks are the closer's,
+        // released at each close (fdtable::FilesGuard), not here (this
+        // may run in another process's context)
+        super::flock::release_file_locks(self);
 
         // Decrement mount reference count via mntput
         // This mirrors Linux's fput() -> mntput()
