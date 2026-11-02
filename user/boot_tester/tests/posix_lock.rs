@@ -52,6 +52,7 @@ pub fn run_tests() {
     test_lock_close_any();
     test_blocking();
     test_contended_waiters();
+    test_flock_upgrade();
 }
 
 /// Test F_SETLK with F_WRLCK (write lock) and F_UNLCK
@@ -505,4 +506,48 @@ fn test_contended_waiters() {
     sys_close(fd as u64);
     hk_syscall::sys_unlink(path.as_ptr());
     verdict(b"SETLKW_NO_SPIN", bad == 0 && cpu_ms < 150, bad, cpu_ms);
+}
+
+/// A flock conversion drops the old lock first (Linux
+/// flock_lock_inode): two holders of LOCK_SH both asking for LOCK_EX do
+/// not deadlock. The child's blocking LOCK_EX gives up its shared lock,
+/// so the parent's LOCK_EX|LOCK_NB then succeeds; the child gets the
+/// lock once the parent lets go.
+fn test_flock_upgrade() {
+    use hk_syscall::{sys_exit, sys_flock, sys_fork, sys_pipe2, sys_read, sys_wait4};
+    const LOCK_SH: i32 = 1;
+    const LOCK_EX: i32 = 2;
+    const LOCK_NB: i32 = 4;
+    const LOCK_UN: i32 = 8;
+    let path = b"/tmp/flock_upgrade_test\0";
+    let fd = sys_open(path.as_ptr(), O_CREAT | O_RDWR | O_TRUNC, 0o644) as i32;
+    sys_flock(fd, LOCK_SH);
+    let mut p = [0i32; 2];
+    sys_pipe2(p.as_mut_ptr(), 0);
+    let pid = sys_fork();
+    if pid == 0 {
+        let c = sys_open(path.as_ptr(), O_RDWR, 0) as i32;
+        sys_flock(c, LOCK_SH);
+        sys_write(p[1] as u64, b"s".as_ptr(), 1);
+        let r = sys_flock(c, LOCK_EX);
+        sys_exit(if r == 0 { 0 } else { 1 });
+    }
+    let mut b = [0u8; 1];
+    sys_read(p[0] as u64, b.as_mut_ptr(), 1);
+    let mut got = -1;
+    for _ in 0..200 {
+        got = sys_flock(fd, LOCK_EX | LOCK_NB);
+        if got == 0 {
+            break;
+        }
+        sleep_ms(10);
+    }
+    sys_flock(fd, LOCK_UN);
+    let mut st = 0i32;
+    sys_wait4(pid, &mut st, 0, 0);
+    sys_close(p[0] as u64);
+    sys_close(p[1] as u64);
+    sys_close(fd as u64);
+    hk_syscall::sys_unlink(path.as_ptr());
+    verdict(b"FLOCK_UPGRADE", got == 0 && st == 0, got, st as i64);
 }

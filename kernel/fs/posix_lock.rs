@@ -251,8 +251,11 @@ impl InodeLocks {
     }
 
     /// Remove all locks held by a PID
-    fn remove_all_for_pid(&mut self, pid: u64) {
+    /// Drop every lock of `pid`: whether it had any
+    fn remove_all_for_pid(&mut self, pid: u64) -> bool {
+        let n = self.locks.len();
         self.locks.retain(|l| l.owner != pid);
+        self.locks.len() != n
     }
 
     /// Coalesce adjacent locks of same type from same owner
@@ -449,19 +452,17 @@ pub fn posix_setlkw(file: &File, flock: &Flock) -> Result<(u64, u64), KernelErro
 pub fn release_posix_locks_on_close(file: &File) {
     if let Some(inode) = file.get_inode() {
         let pid = current_pid();
-        inode.i_flctx.with(|l| {
-            l.posix.remove_all_for_pid(pid);
-            ((), true)
-        });
+        inode
+            .i_flctx
+            .with(|l| ((), l.posix.remove_all_for_pid(pid)));
     }
 }
 
 /// Release all POSIX locks held by a process (at its exit)
 pub fn release_all_posix_locks_for_pid(pid: u64) {
     for inode in super::locks::posix_inodes() {
-        inode.i_flctx.with(|l| {
-            l.posix.remove_all_for_pid(pid);
-            ((), true)
-        });
+        inode
+            .i_flctx
+            .with(|l| ((), l.posix.remove_all_for_pid(pid)));
     }
 }

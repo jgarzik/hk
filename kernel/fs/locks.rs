@@ -81,7 +81,7 @@ impl FileLockCtx {
         // A pending signal ends the wait even when the locks already
         // changed: every pass of a lock retry loop can be interrupted
         if crate::task::percpu::current().sigpending() {
-            return Err(KernelError::Interrupted);
+            return Err(KernelError::RestartSys);
         }
         self.wait
             .wait_event_interruptible(|| self.generation() != g)

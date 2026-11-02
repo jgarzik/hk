@@ -147,22 +147,35 @@ impl FileLock {
         }
     }
 
-    /// Release any lock held by this PID
-    pub fn unlock(&mut self, pid: u64) {
+    /// Release any lock held by this owner: whether it held one
+    pub fn unlock(&mut self, pid: u64) -> bool {
         match self.lock_type {
-            LockType::None => {}
+            LockType::None => false,
             LockType::Shared => {
-                self.shared_holders.remove(&pid);
+                let held = self.shared_holders.remove(&pid);
                 if self.shared_holders.is_empty() {
                     self.lock_type = LockType::None;
                 }
+                held
             }
             LockType::Exclusive => {
                 if self.exclusive_holder == Some(pid) {
                     self.lock_type = LockType::None;
                     self.exclusive_holder = None;
+                    true
+                } else {
+                    false
                 }
             }
+        }
+    }
+
+    /// The lock this owner holds
+    pub fn held(&self, pid: u64) -> LockType {
+        match self.lock_type {
+            LockType::Shared if self.shared_holders.contains(&pid) => LockType::Shared,
+            LockType::Exclusive if self.exclusive_holder == Some(pid) => LockType::Exclusive,
+            _ => LockType::None,
         }
     }
 }
@@ -237,23 +250,37 @@ pub fn sys_flock(fd: i32, operation: i32) -> i64 {
     let owner = Arc::as_ptr(&file) as u64;
     let ctx = file.get_inode();
 
-    // Linux flock_lock_inode: retried after each change of the inode's
-    // locks while it conflicts, unless LOCK_NB; a signal ends the wait
+    // Linux flock_lock_inode: a lock of the other type the owner holds
+    // goes first (a conversion is not atomic, even with LOCK_NB: two
+    // upgraders never wait on each other's shared locks, and a
+    // downgrade wakes the shared waiters); then retried after each
+    // change of the inode's locks while it conflicts, unless LOCK_NB.
+    // A signal ends the wait (ERESTARTSYS: restarted under SA_RESTART).
+    let want = match lock_op {
+        LOCK_SH => LockType::Shared,
+        LOCK_EX => LockType::Exclusive,
+        _ => LockType::None,
+    };
     loop {
         let g = ctx.as_ref().map_or(0, |i| i.i_flctx.generation());
-        let result = with_lock(&file, |l| match lock_op {
-            LOCK_SH => (l.try_lock_shared(owner), false),
-            LOCK_EX => (l.try_lock_exclusive(owner), false),
-            _ => {
-                l.unlock(owner);
-                (Ok(()), true)
+        let result = with_lock(&file, |l| {
+            let held = l.held(owner);
+            if held == want && want != LockType::None {
+                return (Ok(()), false);
             }
+            let dropped = held != LockType::None && l.unlock(owner);
+            let r = match want {
+                LockType::Shared => l.try_lock_shared(owner),
+                LockType::Exclusive => l.try_lock_exclusive(owner),
+                LockType::None => Ok(()),
+            };
+            (r, dropped)
         });
         match (result, &ctx) {
             (Ok(()), _) => return 0,
             (Err(KernelError::WouldBlock), Some(i)) if !nonblock => {
-                if i.i_flctx.wait_change(g).is_err() {
-                    return KernelError::Interrupted.sysret();
+                if let Err(e) = i.i_flctx.wait_change(g) {
+                    return e.sysret();
                 }
             }
             (Err(e), _) => return e.sysret(),
@@ -266,7 +293,7 @@ pub fn sys_flock(fd: i32, operation: i32) -> i64 {
 pub fn release_file_locks(file: &File) {
     let owner = file as *const File as u64;
     let _ = with_lock(file, |l| {
-        l.unlock(owner);
-        (Ok(()), true)
+        let held = l.unlock(owner);
+        (Ok(()), held)
     });
 }
