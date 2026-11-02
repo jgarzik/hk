@@ -1225,8 +1225,7 @@ impl XhciController {
     /// This sets up the Device Context and Control Endpoint (EP0) for the device.
     fn address_device(&mut self, slot_id: u8, port: u8, speed: UsbSpeed) -> Result<(), UsbError> {
         // Create Device State with contexts
-        let output_ctx =
-            OutputDeviceContext::new(&self.pci_dev, self.ctx_size).ok_or(UsbError::NoResources)?;
+        let output_ctx = OutputDeviceContext::new(&self.pci_dev).ok_or(UsbError::NoResources)?;
         let mut input_ctx =
             InputContext::new(&self.pci_dev, self.ctx_size).ok_or(UsbError::NoResources)?;
 
@@ -1547,12 +1546,17 @@ impl XhciController {
         }
 
         // Map data buffer for DMA
-        let dma_addr = dma_map_single(
-            &self.pci_dev,
-            data.as_ptr(),
-            data.len(),
-            DmaDirection::ToDevice,
-        )
+        // SAFETY: `data` is borrowed for this whole call, which waits for
+        // the transfer and unmaps below; except on a timeout, which
+        // leaves the TRB queued (BUGS.md, xHCI gaps)
+        let dma_addr = unsafe {
+            dma_map_single(
+                &self.pci_dev,
+                data.as_ptr(),
+                data.len(),
+                DmaDirection::ToDevice,
+            )
+        }
         .ok_or(UsbError::NoResources)?;
 
         if usb_trace() {
@@ -1627,12 +1631,17 @@ impl XhciController {
         }
 
         // Map data buffer for DMA
-        let dma_addr = dma_map_single(
-            &self.pci_dev,
-            data.as_ptr(),
-            data.len(),
-            DmaDirection::FromDevice,
-        )
+        // SAFETY: `data` is borrowed for this whole call, which waits for
+        // the transfer and unmaps below; except on a timeout, which
+        // leaves the TRB queued (BUGS.md, xHCI gaps)
+        let dma_addr = unsafe {
+            dma_map_single(
+                &self.pci_dev,
+                data.as_ptr(),
+                data.len(),
+                DmaDirection::FromDevice,
+            )
+        }
         .ok_or(UsbError::NoResources)?;
 
         if usb_trace() {

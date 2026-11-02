@@ -363,17 +363,17 @@ impl InputContext {
 
     /// Get DMA address
     pub fn dma_addr(&self) -> u64 {
-        self.dma.dma_addr.as_u64()
+        self.dma.dma_addr().as_u64()
     }
 
     /// Get mutable pointer to Input Control Context
     pub fn control_mut(&mut self) -> &mut InputControlContext {
-        unsafe { &mut *(self.dma.cpu_addr as *mut InputControlContext) }
+        unsafe { &mut *(self.dma.cpu_addr() as *mut InputControlContext) }
     }
 
     /// Get mutable pointer to Slot Context
     pub fn slot_mut(&mut self) -> &mut SlotContext {
-        unsafe { &mut *((self.dma.cpu_addr as usize + self.ctx_size) as *mut SlotContext) }
+        unsafe { &mut *((self.dma.cpu_addr() as usize + self.ctx_size) as *mut SlotContext) }
     }
 
     /// Get mutable pointer to Endpoint Context by DCI (1-31)
@@ -382,13 +382,13 @@ impl InputContext {
             return None;
         }
         let offset = input_ep_offset(self.ctx_size, dci);
-        unsafe { Some(&mut *((self.dma.cpu_addr as usize + offset) as *mut EndpointContext)) }
+        unsafe { Some(&mut *((self.dma.cpu_addr() as usize + offset) as *mut EndpointContext)) }
     }
 
     /// Zero all contexts
     pub fn clear(&mut self) {
         unsafe {
-            core::ptr::write_bytes(self.dma.cpu_addr, 0, Self::SIZE);
+            core::ptr::write_bytes(self.dma.cpu_addr(), 0, Self::SIZE);
         }
     }
 }
@@ -415,10 +415,9 @@ pub fn ctx_size(hcc_params1: u32) -> usize {
 /// - Offset 0x40: Endpoint Context 1 (32 bytes)
 /// - ...
 pub struct OutputDeviceContext {
-    /// DMA allocation for the context
+    /// DMA allocation for the context (written by the controller; the
+    /// driver never reads it)
     dma: DmaCoherent,
-    /// Bytes per context: 32, or 64 (HCCPARAMS1.CSZ)
-    ctx_size: usize,
 }
 
 impl OutputDeviceContext {
@@ -426,35 +425,21 @@ impl OutputDeviceContext {
     /// We round up to 4096 for page alignment
     pub const SIZE: usize = 4096;
 
-    /// Create a new Output Device Context with `ctx_size`-byte contexts
-    pub fn new<D: DmaDevice>(dev: &D, ctx_size: usize) -> Option<Self> {
+    /// Create a new Output Device Context
+    pub fn new<D: DmaDevice>(dev: &D) -> Option<Self> {
         let dma = dma_alloc_coherent(dev, Self::SIZE)?;
-        Some(Self { dma, ctx_size })
+        Some(Self { dma })
     }
 
     /// Get DMA address
     pub fn dma_addr(&self) -> u64 {
-        self.dma.dma_addr.as_u64()
-    }
-
-    /// Get pointer to Slot Context (read-only, xHCI writes this)
-    pub fn slot(&self) -> &SlotContext {
-        unsafe { &*(self.dma.cpu_addr as *const SlotContext) }
-    }
-
-    /// Get pointer to Endpoint Context by DCI (1-31)
-    pub fn endpoint(&self, dci: u8) -> Option<&EndpointContext> {
-        if dci == 0 || dci > 31 {
-            return None;
-        }
-        let offset = dci as usize * self.ctx_size;
-        unsafe { Some(&*((self.dma.cpu_addr as usize + offset) as *const EndpointContext)) }
+        self.dma.dma_addr().as_u64()
     }
 
     /// Zero all contexts
     pub fn clear(&mut self) {
         unsafe {
-            core::ptr::write_bytes(self.dma.cpu_addr, 0, Self::SIZE);
+            core::ptr::write_bytes(self.dma.cpu_addr(), 0, Self::SIZE);
         }
     }
 }

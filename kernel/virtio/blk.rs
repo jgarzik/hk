@@ -133,16 +133,16 @@ impl VbQueue {
     }
 
     fn hdr_dma(&self, t: u16) -> u64 {
-        self.pool.dma_addr.0 + (t as usize * SLOT) as u64
+        self.pool.dma_addr().0 + (t as usize * SLOT) as u64
     }
 
     fn status(&self, t: u16) -> *mut u8 {
-        unsafe { self.pool.cpu_addr.add(t as usize * SLOT + 16) }
+        unsafe { self.pool.cpu_addr().add(t as usize * SLOT + 16) }
     }
 
     /// Fill the request header of tag `t`
     fn write_hdr(&self, t: u16, ty: u32, sector: u64) {
-        let h = unsafe { self.pool.cpu_addr.add(t as usize * SLOT) };
+        let h = unsafe { self.pool.cpu_addr().add(t as usize * SLOT) };
         unsafe {
             core::ptr::write_volatile(h as *mut u32, ty.to_le());
             core::ptr::write_volatile(h.add(4) as *mut u32, 0);
@@ -158,7 +158,9 @@ impl VbQueue {
         s.n = 0;
         for seg in &bio.segs {
             let p = unsafe { phys_to_virt(seg.frame).add(seg.offset) };
-            match dma_map_single(&*self.vdev, p, seg.len, d) {
+            // SAFETY: the bio's pages stay allocated until it completes,
+            // and `unmap` runs at completion (or on the failure below)
+            match unsafe { dma_map_single(&*self.vdev, p, seg.len, d) } {
                 Some(a) => {
                     s.maps[s.n] = (a.0, seg.len as u32);
                     s.n += 1;

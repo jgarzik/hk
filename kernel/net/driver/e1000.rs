@@ -208,13 +208,13 @@ struct TxRing {
 
 impl RxRing {
     fn desc(&self, i: usize) -> *mut RxDesc {
-        unsafe { (self.desc.cpu_addr as *mut RxDesc).add(i) }
+        unsafe { (self.desc.cpu_addr() as *mut RxDesc).add(i) }
     }
 }
 
 impl TxRing {
     fn desc(&self, i: usize) -> *mut TxDesc {
-        unsafe { (self.desc.cpu_addr as *mut TxDesc).add(i) }
+        unsafe { (self.desc.cpu_addr() as *mut TxDesc).add(i) }
     }
 
     /// Reclaim descriptors the device is done with; returns how many
@@ -305,13 +305,13 @@ impl E1000 {
                 write_volatile(
                     rx.desc(i),
                     RxDesc {
-                        buffer_addr: rx.bufs[i].dma_addr.0,
+                        buffer_addr: rx.bufs[i].dma_addr().0,
                         ..RxDesc::default()
                     },
                 );
             }
         }
-        let phys = rx.desc.dma_addr.0;
+        let phys = rx.desc.dma_addr().0;
         wmb();
         self.write_reg(reg::RDBAL, phys as u32);
         self.write_reg(reg::RDBAH, (phys >> 32) as u32);
@@ -333,13 +333,13 @@ impl E1000 {
                 write_volatile(
                     tx.desc(i),
                     TxDesc {
-                        buffer_addr: tx.bufs[i].dma_addr.0,
+                        buffer_addr: tx.bufs[i].dma_addr().0,
                         ..TxDesc::default()
                     },
                 );
             }
         }
-        let phys = tx.desc.dma_addr.0;
+        let phys = tx.desc.dma_addr().0;
         wmb();
         self.write_reg(reg::TDBAL, phys as u32);
         self.write_reg(reg::TDBAH, (phys >> 32) as u32);
@@ -375,7 +375,7 @@ impl E1000 {
         }
         let i = tx.tail;
         unsafe {
-            core::ptr::copy_nonoverlapping(skb.data_ptr(), tx.bufs[i].cpu_addr, len);
+            core::ptr::copy_nonoverlapping(skb.data_ptr(), tx.bufs[i].cpu_addr(), len);
             let d = tx.desc(i);
             write_volatile(&mut (*d).length, len as u16);
             write_volatile(&mut (*d).cso, 0);
@@ -416,7 +416,8 @@ impl E1000 {
                 // 2 extra bytes of headroom align the IP header (NET_IP_ALIGN)
                 match SkBuff::alloc(NET_SKB_PAD + 2, len) {
                     Some(mut skb) => {
-                        let src = unsafe { core::slice::from_raw_parts(rx.bufs[i].cpu_addr, len) };
+                        let src =
+                            unsafe { core::slice::from_raw_parts(rx.bufs[i].cpu_addr(), len) };
                         let _ = skb.put_slice(src);
                         skb.dev = Some(Arc::clone(dev));
                         dev.stats.rx_packet(len);

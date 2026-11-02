@@ -104,22 +104,44 @@ impl DmaConfig {
 }
 
 /// Result of dma_alloc_coherent - contains both CPU and DMA addresses
+///
+/// # Invariants
+/// Made only by a [`DmaOps::alloc_coherent`]: `size` bytes at
+/// `cpu_addr` (device address `dma_addr`), allocated until
+/// [`dma_free_coherent`]. Not freed on drop: the device may still use
+/// the memory, which only its driver knows.
 pub struct DmaCoherent {
     /// CPU-accessible pointer (kernel virtual address)
-    pub cpu_addr: *mut u8,
+    cpu_addr: *mut u8,
     /// DMA address for programming into device
-    pub dma_addr: DmaAddr,
+    dma_addr: DmaAddr,
     /// Size of the allocation in bytes
-    pub size: usize,
+    size: usize,
 }
 
 impl DmaCoherent {
-    /// Get the CPU pointer as a typed reference
-    ///
-    /// # Safety
-    /// Caller must ensure T is compatible with the allocation size and alignment.
-    pub unsafe fn as_ptr<T>(&self) -> *mut T {
-        self.cpu_addr as *mut T
+    /// The memory's kernel address
+    #[inline]
+    pub fn cpu_addr(&self) -> *mut u8 {
+        self.cpu_addr
+    }
+
+    /// The device address of the memory
+    #[inline]
+    pub fn dma_addr(&self) -> DmaAddr {
+        self.dma_addr
+    }
+
+    /// Size of the allocation in bytes
+    #[inline]
+    pub fn size(&self) -> usize {
+        self.size
+    }
+
+    /// The memory as a `*mut T` (using it is the caller's unsafe part)
+    #[inline]
+    pub fn as_ptr<T>(&self) -> *mut T {
+        self.cpu_addr.cast::<T>()
     }
 
     /// Get a slice view of the coherent memory
@@ -139,8 +161,10 @@ impl DmaCoherent {
     }
 }
 
-// DmaCoherent contains a raw pointer but the allocation is owned
+// SAFETY: an owned allocation; the pointer is only an address until a
+// caller derefs it under its own (unsafe) rules
 unsafe impl Send for DmaCoherent {}
+// SAFETY: as above (no access through &DmaCoherent)
 unsafe impl Sync for DmaCoherent {}
 
 /// A single scatter-gather entry after DMA mapping
@@ -156,8 +180,8 @@ pub struct DmaSgEntry {
 pub struct DmaSgList {
     /// Mapped entries
     pub entries: Vec<DmaSgEntry>,
-    /// Original CPU addresses (for unmapping)
-    original: Vec<(*const u8, usize)>,
+    /// Segment lengths (for unmapping)
+    lengths: Vec<usize>,
     /// Direction for unmapping
     direction: DmaDirection,
 }
@@ -173,10 +197,6 @@ impl DmaSgList {
         self.entries.is_empty()
     }
 }
-
-// Safety: the pointers in DmaSgList are just addresses for unmapping
-unsafe impl Send for DmaSgList {}
-unsafe impl Sync for DmaSgList {}
 
 /// Trait for devices that can perform DMA
 pub trait DmaDevice {
@@ -433,7 +453,7 @@ impl DmaOps for DirectDmaOps {
         direction: DmaDirection,
     ) -> Option<DmaSgList> {
         let mut entries = Vec::with_capacity(sg.len());
-        let mut original = Vec::with_capacity(sg.len());
+        let mut lengths = Vec::with_capacity(sg.len());
 
         for &(cpu_addr, len) in sg {
             let dma_addr = self.map_single(config, cpu_addr, len, direction)?;
@@ -441,18 +461,18 @@ impl DmaOps for DirectDmaOps {
                 dma_addr,
                 length: len,
             });
-            original.push((cpu_addr, len));
+            lengths.push(len);
         }
 
         Some(DmaSgList {
             entries,
-            original,
+            lengths,
             direction,
         })
     }
 
     fn unmap_sg(&self, config: &DmaConfig, sg: DmaSgList) {
-        for (entry, &(_, len)) in sg.entries.iter().zip(sg.original.iter()) {
+        for (entry, &len) in sg.entries.iter().zip(sg.lengths.iter()) {
             self.unmap_single(config, entry.dma_addr, len, sg.direction);
         }
     }
@@ -553,7 +573,11 @@ pub fn dma_alloc_coherent_aligned<D: DmaDevice>(
 }
 
 /// Free coherent DMA memory
-pub fn dma_free_coherent<D: DmaDevice>(_dev: &D, alloc: DmaCoherent) {
+///
+/// # Safety
+/// The device no longer accesses the memory, and no CPU pointer into it
+/// is used after this.
+pub unsafe fn dma_free_coherent<D: DmaDevice>(_dev: &D, alloc: DmaCoherent) {
     if let Some(ops) = ops() {
         ops.free_coherent(alloc);
     }
@@ -563,7 +587,11 @@ pub fn dma_free_coherent<D: DmaDevice>(_dev: &D, alloc: DmaCoherent) {
 ///
 /// Creates a streaming DMA mapping. The CPU should not access the buffer
 /// until unmapped or synced.
-pub fn dma_map_single<D: DmaDevice>(
+///
+/// # Safety
+/// `size` bytes at `cpu_addr` stay allocated, and are not otherwise
+/// accessed against the device's direction, until `dma_unmap_single`.
+pub unsafe fn dma_map_single<D: DmaDevice>(
     dev: &D,
     cpu_addr: *const u8,
     size: usize,
@@ -585,7 +613,10 @@ pub fn dma_unmap_single<D: DmaDevice>(
 }
 
 /// Map a scatter-gather list
-pub fn dma_map_sg<D: DmaDevice>(
+///
+/// # Safety
+/// As [`dma_map_single`] for each segment, until `dma_unmap_sg`.
+pub unsafe fn dma_map_sg<D: DmaDevice>(
     dev: &D,
     sg: &[(*const u8, usize)],
     direction: DmaDirection,

@@ -5,11 +5,6 @@
 These are safe fns or patterns whose use leads to undefined behaviour.
 None is known to fail today, but each is a soundness bug:
 
-- **Drivers:**
-  - `DmaCoherent` has public fields and `dma_free_coherent` is safe.
-  - `dma_map_single` takes a raw pointer, not tied to the buffer's
-    lifetime.
-  - xHCI `OutputContext` hands out `&` into memory the device writes.
 - **Safe fns that take addresses:**
   - `load_mm`, `dtb::blob`, `psci_cpu_on`.
   - `save_for_clone_child`, `write_fs_base`, `fpu::restore`.
@@ -495,6 +490,9 @@ all of them.
   the next one (most likely on the USB serial console, whose transfers
   time out after 100 ms). A timeout should stop the endpoint and move
   its dequeue pointer past the TRB (Linux xhci_handle_cmd_stop_ep).
+  Until then a timed-out bulk transfer leaves its TRB queued with the
+  caller's buffer DMA-mapped: the controller may still write into
+  memory the caller has reused (`bulk_in`/`bulk_out`).
 - One controller only: the driver keeps a single global
   `USB_CONTROLLER`; a second xHCI's probe replaces the first, which is
   left running, and both device handles act on the survivor at

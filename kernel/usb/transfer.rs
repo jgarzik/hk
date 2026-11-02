@@ -292,16 +292,16 @@ impl TransferRing {
 
         // Zero the memory
         unsafe {
-            core::ptr::write_bytes(dma.cpu_addr, 0, FRAME_SIZE);
+            core::ptr::write_bytes(dma.cpu_addr(), 0, FRAME_SIZE);
         }
 
-        let trbs = dma.cpu_addr as *mut Trb;
+        let trbs = dma.cpu_addr() as *mut Trb;
         let size = Self::DEFAULT_SIZE;
 
         // Set up Link TRB at the end
         unsafe {
             let link = trbs.add(size);
-            let link_trb = Trb::link(dma.dma_addr.as_u64(), true); // Toggle cycle
+            let link_trb = Trb::link(dma.dma_addr().as_u64(), true); // Toggle cycle
             write_volatile(link, link_trb);
             // Set initial cycle bit
             (*link).set_cycle(true);
@@ -318,13 +318,13 @@ impl TransferRing {
 
     /// Get the physical/DMA address of the ring
     pub fn dma_addr(&self) -> u64 {
-        self.dma.dma_addr.as_u64()
+        self.dma.dma_addr().as_u64()
     }
 
     /// Get the dequeue pointer (DMA address) with cycle bit
     /// This is programmed into the Endpoint Context
     pub fn dequeue_ptr(&self) -> u64 {
-        let addr = self.dma.dma_addr.as_u64() + (self.dequeue * 16) as u64;
+        let addr = self.dma.dma_addr().as_u64() + (self.dequeue * 16) as u64;
         // Set DCS (Dequeue Cycle State) in bit 0
         if self.cycle { addr | 1 } else { addr }
     }
@@ -332,7 +332,7 @@ impl TransferRing {
     /// Enqueue a TRB and return its DMA address
     pub fn enqueue(&mut self, mut trb: Trb) -> u64 {
         let index = self.enqueue;
-        let trbs = self.dma.cpu_addr as *mut Trb;
+        let trbs = self.dma.cpu_addr() as *mut Trb;
         let trb_ptr = unsafe { trbs.add(index) };
 
         // Set cycle bit to make TRB valid
@@ -349,7 +349,7 @@ impl TransferRing {
         // Memory barrier after writing
         fence(Ordering::SeqCst);
 
-        let trb_addr = self.dma.dma_addr.as_u64() + (index * 16) as u64;
+        let trb_addr = self.dma.dma_addr().as_u64() + (index * 16) as u64;
 
         // Advance enqueue pointer
         self.enqueue += 1;

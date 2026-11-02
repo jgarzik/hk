@@ -94,11 +94,11 @@ impl Pool {
     }
 
     fn cpu(&self, i: usize) -> *mut u8 {
-        unsafe { self.mem.cpu_addr.add(i * BUF_SIZE) }
+        unsafe { self.mem.cpu_addr().add(i * BUF_SIZE) }
     }
 
     fn dma(&self, i: usize) -> u64 {
-        self.mem.dma_addr.0 + (i * BUF_SIZE) as u64
+        self.mem.dma_addr().0 + (i * BUF_SIZE) as u64
     }
 }
 

@@ -356,14 +356,14 @@ impl VirtioDevice {
         // Zeroed, page-aligned: satisfies every ring part's alignment
         let mem =
             crate::dma::dma_alloc_coherent(self, lay.size).ok_or(DriverError::MissingResource)?;
-        let d = mem.dma_addr.0;
+        let d = mem.dma_addr().0;
         self.w16(common::Q_SIZE, num);
         self.w64(common::Q_DESC, d);
         self.w64(common::Q_AVAIL, d + lay.avail as u64);
         self.w64(common::Q_USED, d + lay.used as u64);
         self.w16(common::Q_ENABLE, 1);
         Ok(Virtqueue {
-            ring: unsafe { Vring::new(mem.cpu_addr, num) },
+            ring: unsafe { Vring::new(mem.cpu_addr(), num) },
             _mem: mem,
             index,
             notify: unsafe { self.notify.add(off as usize) as *mut u16 },
