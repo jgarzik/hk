@@ -163,7 +163,11 @@ fn set_seccomp_filter(fprog_ptr: u64, log: bool, tsync: bool) -> i64 {
     if tsync {
         // Linux seccomp_can_sync_threads: every other thread's filter is
         // ours or one ours stacks on; else that thread's tid
-        for t in table.threads(pid).filter(|t| t.task.tid() != tid) {
+        // Exiting and zombie threads are skipped (Linux: PF_EXITING)
+        for t in table
+            .threads(pid)
+            .filter(|t| t.task.tid() != tid && crate::signal::task_live(t))
+        {
             let mode = t.task.seccomp_mode();
             let ok = (mode == SECCOMP_MODE_DISABLED || mode == SECCOMP_MODE_FILTER)
                 && SeccompFilter::is_ancestor_of(t.seccomp_filter.as_ref(), mine.as_ref());

@@ -13,6 +13,9 @@
 //! - SECCOMP_UNKNOWN: an action Linux does not know kills the process
 //! - SECCOMP_STRICT: in strict mode getppid kills by SIGKILL
 //! - SECCOMP_TSYNC: TSYNC puts the filter on the other thread too
+//! - SECCOMP_TSYNC_ZOMBIE: a leader that installed its own filter and
+//!   exited alone (a zombie) does not stop a sibling's TSYNC (Linux
+//!   skips exiting threads)
 //! - SECCOMP_IP: the filter sees the syscall's user instruction pointer
 
 use super::fork_mm::{join, spawn_thread};
@@ -119,6 +122,7 @@ pub fn run_tests() {
     unknown();
     strict();
     tsync();
+    tsync_zombie();
     ip();
 }
 
@@ -311,4 +315,44 @@ fn ip() {
         if sys_getppid() > 0 { 0 } else { 2 }
     });
     report(b"SECCOMP_IP", st == 0, st);
+}
+
+static ZOMBIE_RESULT: AtomicI64 = AtomicI64::new(1);
+
+/// The sibling: once the leader has gone, TSYNC an allow-all filter;
+/// the whole process exits with the result
+extern "C" fn tsync_after_leader(_: u64) -> ! {
+    while GO.load(Ordering::Acquire) == 0 {
+        core::hint::spin_loop();
+    }
+    let ts = hk_syscall::Timespec {
+        tv_sec: 0,
+        tv_nsec: 50_000_000,
+    };
+    hk_syscall::sys_nanosleep(&ts, core::ptr::null_mut());
+    let prog = [ins(RET_K, 0, 0, RET_ALLOW)];
+    let r = load(&prog, SECCOMP_FILTER_FLAG_TSYNC);
+    ZOMBIE_RESULT.store(r, Ordering::Release);
+    hk_syscall::sys_exit_group(if r == 0 { 0 } else { 1 })
+}
+
+fn tsync_zombie() {
+    let st = child(|| {
+        unsafe {
+            let top = (&raw mut STACK as *mut u8).add(16384) as u64;
+            let ctid = &raw mut CTID;
+            core::ptr::write_volatile(ctid, 1);
+            if spawn_thread(top, tsync_after_leader, 0, ctid) <= 0 {
+                return 1;
+            }
+        }
+        // The leader's own filter, then it exits alone
+        let prog = [ins(RET_K, 0, 0, RET_ALLOW)];
+        if load(&prog, 0) != 0 {
+            return 2;
+        }
+        GO.store(1, Ordering::Release);
+        sys_exit(0)
+    });
+    report(b"SECCOMP_TSYNC_ZOMBIE", st == 0, st);
 }
