@@ -194,6 +194,16 @@ pub fn alloc_file_id() -> u32 {
 static FILE_LOCKS: Mutex<alloc::collections::BTreeMap<u64, FileLock>> =
     Mutex::new(alloc::collections::BTreeMap::new());
 
+/// The file's lock table key: its inode (Linux file_inode(filp)->
+/// i_flctx), so every name of a file (hard links) and every open of it
+/// share one; the dentry only for a file without an inode
+fn lock_key(file: &File) -> u64 {
+    match file.get_inode() {
+        Some(i) => Arc::as_ptr(&i) as u64,
+        None => Arc::as_ptr(&file.dentry) as u64,
+    }
+}
+
 /// Run `f` on `file_id`'s lock state under one FILE_LOCKS hold (an
 /// entry left unlocked is removed)
 fn with_lock<R>(file_id: u64, f: impl FnOnce(&mut FileLock) -> R) -> R {
@@ -247,9 +257,7 @@ pub fn sys_flock(fd: i32, operation: i32) -> i64 {
         None => return KernelError::BadFd.sysret(),
     };
 
-    // Get file ID for lock tracking
-    // We use the file's dentry address as a unique identifier
-    let file_id = Arc::as_ptr(&file.dentry) as u64;
+    let file_id = lock_key(&file);
 
     // flock locks belong to the open file description (Linux fl_file):
     // every descriptor of it, in any process, holds the same lock
@@ -283,7 +291,7 @@ pub fn sys_flock(fd: i32, operation: i32) -> i64 {
 /// The open file description `file` is gone (File::drop, its last
 /// reference): its flock locks go (Linux locks_remove_file)
 pub fn release_file_locks(file: &File) {
-    let file_id = Arc::as_ptr(&file.dentry) as u64;
+    let file_id = lock_key(file);
     let pid = file as *const File as u64;
 
     with_lock(file_id, |l| l.unlock(pid));
