@@ -531,6 +531,70 @@ a reset register in PCI configuration space is ignored.
   opening it O_EXCL, writes to a swap partition (Linux ETXTBSY) and
   BLKBSZSET on a mounted partition are not refused.
 
+## Code-quality audit findings (2026-11-01), by phase
+
+From a whole-tree audit for designs that grew one commit at a time.
+Fixed already: clock setting, seccomp actions, kcmp/pidfd_getfd access,
+sched pid 0, flock/POSIX release, signalfd reader, errno flattening.
+
+- **Privilege by uid instead of capable()** (L): about 29 `euid == 0`
+  style checks remain where Linux tests a capability (`task/id.rs` x6
+  CAP_SETUID/SETGID, `ns/uts.rs` and `ns/mod.rs` CAP_SYS_ADMIN,
+  `rlimit.rs` CAP_SYS_RESOURCE, `ipc/msg.rs` CAP_SYS_RESOURCE,
+  `ipc/mqueue.rs` DAC_OVERRIDE, `ipc/util.rs` CAP_IPC_OWNER missing,
+  `keys/key.rs` (fsuid, no root bypass), `acct.rs` ASU flag). Linux's
+  own uid-0 rules (`sysctl.rs`, `fs/dac.rs`) are right as they are.
+  `task::capable` should be the only privilege test.
+- **Syscalls that do not deliver** (H/C): inotify and fanotify never
+  queue an event (no fsnotify hooks in the VFS); there is no siginfo
+  queue (signals are a bitmask: rt_sigqueueinfo's data, si_pid/si_uid
+  and RT signal queueing are lost); waitid without WEXITED is EINVAL
+  (C); semctl GETNCNT/GETZCNT are 0; fallocate PUNCH_HOLE succeeds
+  without zeroing (F).
+- **Anonymous-inode files** (E): eleven copies of the dentry setup
+  (eventfd, timerfd, epoll, signalfd, pidfd, inotify, fanotify,
+  io_uring, bpf, pipe, mqueue), all inode number 0 (every pipe is
+  `pipe:[0]`), mode S_IFREG|0600 (Linux: 0600, no type), names unlike
+  Linux's (`epoll` vs `[eventpoll]`). One anon_inode_getfile, pipefs
+  numbers from get_next_ino.
+- **Copied helpers** (J, or as touched): `get_nofile_limit` in eight
+  places; `find_task_by_pid` in four (all root-namespace pids); four
+  `current_time`s; about ten user-timespec readers each validating
+  (Linux get_timespec64); USER_HZ open-coded in three (times() assumes
+  a scheduler tick is a USER_HZ tick); three iovec structs and five
+  importers; five SigInfo, three Timeval, two Timespec types; two path
+  splitters that disagree on `.`/`..` (G).
+- **Error conventions** (as touched): Result<_, KernelError> about 618
+  times, Result<_, i32> 91 (both signs used), Result<_, i64> 36; about
+  187 raw errno numbers and 62 local errno constants.
+- **Process-wide state per thread** (C): pgid/sid copied into every
+  thread; shared pending signals beside SignalStruct; one global
+  CHILD_EXIT_WQ wakes every waiting parent on every exit.
+- **`task/percpu.rs` is 4,500 lines** (before C): scheduler core,
+  do_clone (523 lines), exit, wait, credential setters, five sleep
+  APIs. Split like Linux (sched/core, fork, exit, cred). Other giants:
+  sys_prctl, do_semctl, sys_mmap, exec_file, sys_fcntl.
+- **Arch code in generic files** (J): 93 `cfg(target_arch)` outside
+  `arch/` (main.rs, dma.rs, percpu.rs, misc, pci, seccomp's audit
+  arch), 32 direct `arch::x86_64::`/`aarch64::` references, three
+  `CurrentArch` redefinitions.
+- **Globals where per-CPU fits** (I/C/E): TCP timers in one map run on
+  softnet/0 only; CHILD_EXIT_WQ; the file lock tables.
+- **ID allocators** (J): PidMap, fdbits, IPC ids, and plain counters
+  (bpf, keys, mqueue, posix timers, which wrap with no collision
+  check): one IDR/IDA.
+- **procfs** (H): every read regenerates the whole file and slices it
+  (no seq_file records, so chunked reads of /proc/net/* can tear);
+  global generators run under the procfs inode's read lock and take
+  TASKLIST and network locks inside it (not in LOCKING.md).
+- **Two page-I/O interfaces** (E): `InodeOps::readpage/writepage` and
+  page_cache's own, with a FileId-keyed global cache and
+  DIRTY_ADDRESS_SPACES.
+- **Stale comments and dead code** (as touched): about 155
+  `#[allow(dead_code)]`, 90 "for now"/TODO markers; comments that
+  contradict the code in `task/id.rs:87`, `ns/mod.rs:558`,
+  `ns/uts.rs:224`, `rlimit.rs:264`, `task/misc.rs:1311`.
+
 ## P0 review findings (open)
 
 Found by the review of the P0 series; each confirmed against the code
