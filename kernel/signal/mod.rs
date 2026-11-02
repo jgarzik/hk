@@ -970,9 +970,16 @@ fn send_signal_force(tid: Tid, sig: u32, force: bool) -> i32 {
         Some((true, _)) => return 0,
         Some((false, init)) => init,
     };
-    // A forced signal lifts the global init's protection (Linux
-    // force_sig_info_to_task); the flag is read once here
-    let init = if init && force {
+    // A forced signal whose action is SIG_DFL (a blocked or ignored one
+    // was reset by the caller) lifts the global init's protection (Linux
+    // force_sig_info_to_task); one init handles leaves it protected. The
+    // flag is read once here.
+    let dfl = || {
+        get_task_sighand(tid)
+            .and_then(|h| h.get_action(sig))
+            .is_none_or(|a| a.handler == SigHandler::Default)
+    };
+    let init = if init && force && dfl() {
         INIT_KILLABLE.store(true, core::sync::atomic::Ordering::Release);
         false
     } else {
