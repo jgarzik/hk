@@ -229,6 +229,8 @@ impl Mount {
     /// to indicate active use of the mount.
     pub fn mntget(&self) {
         self.mnt_count.fetch_add(1, Ordering::Relaxed);
+        // Use clears an MNT_EXPIRE mark (Linux mntput)
+        self.expiry.store(false, Ordering::Relaxed);
     }
 
     /// Decrement mount reference count (like Linux mntput)
@@ -272,18 +274,6 @@ impl Mount {
     /// Add a child mount
     pub fn add_child(&self, child: Arc<Mount>) {
         self.children.write().push(child);
-    }
-
-    /// Find a child mount at the given dentry
-    pub fn find_child_at(&self, dentry: &Dentry) -> Option<Arc<Mount>> {
-        let children = self.children.read();
-        for child in children.iter() {
-            let mp: Option<Arc<Dentry>> = child.get_mountpoint();
-            if mp.is_some_and(|mp| same_inode(&mp, dentry)) {
-                return Some(child.clone());
-            }
-        }
-        None
     }
 
     /// Remove a child mount from this mount's children list
@@ -566,6 +556,10 @@ pub fn do_umount(mount: Arc<Mount>, flags: i32) -> Result<(), KernelError> {
         if is_root || flags & (MNT_FORCE | MNT_DETACH) != 0 {
             return Err(KernelError::InvalidArgument);
         }
+        // Busy first (Linux: mnt_get_count != 2), then the mark
+        if is_mount_busy(&mount) {
+            return Err(KernelError::Busy);
+        }
         if !mount.expiry.swap(true, Ordering::SeqCst) {
             return Err(KernelError::WouldBlock);
         }
@@ -778,15 +772,10 @@ impl Drop for Mount {
 
 /// Something is mounted on `d` in the caller's mount namespace (Linux
 /// is_local_mountpoint): a walk of the namespace's mounts for one whose
-/// mountpoint is `d`'s inode (same superblock and number, the key
-/// follow_mount uses), so a dentry rebuilt after its old one was
-/// dropped (a rename of an ancestor) still counts
+/// mountpoint is the dentry `d`
 pub fn is_local_mountpoint(d: &Arc<Dentry>) -> bool {
-    let Some(inode) = d.get_inode() else {
-        return false;
-    };
-    // Nothing is mounted anywhere on this filesystem: no walk
-    if inode.sb.upgrade().is_none_or(|sb| !sb.has_mounts_on()) {
+    // Nothing is mounted on this dentry in any namespace: no walk
+    if !d.is_mountpoint() {
         return false;
     }
     let Some(root) = crate::ns::current_mnt_ns().get_root() else {
@@ -795,7 +784,7 @@ pub fn is_local_mountpoint(d: &Arc<Dentry>) -> bool {
     let mut todo = alloc::vec![root];
     while let Some(m) = todo.pop() {
         for c in m.children.read().iter() {
-            if c.get_mountpoint().is_some_and(|mp| same_inode(&mp, d)) {
+            if c.get_mountpoint().is_some_and(|mp| Arc::ptr_eq(&mp, d)) {
                 return true;
             }
             todo.push(c.clone());
@@ -818,7 +807,8 @@ pub fn follow_mount(p: Path) -> Path {
 }
 
 /// The mount on `p` (Linux lookup_mnt): a child of `p.mnt` whose
-/// mountpoint is `p.dentry`'s inode
+/// mountpoint is the dentry `p.dentry` (renames move dentries, so it
+/// stays the same object; hard links are other dentries)
 fn lookup_mnt(p: &Path) -> Option<Arc<Mount>> {
     p.mnt
         .children
@@ -826,15 +816,7 @@ fn lookup_mnt(p: &Path) -> Option<Arc<Mount>> {
         .iter()
         .find(|c| {
             c.get_mountpoint()
-                .is_some_and(|mp| same_inode(&mp, &p.dentry))
+                .is_some_and(|mp| Arc::ptr_eq(&mp, &p.dentry))
         })
         .cloned()
-}
-
-/// `a` and `b` are one inode: same superblock and number
-fn same_inode(a: &Dentry, b: &Dentry) -> bool {
-    match (a.get_inode(), b.get_inode()) {
-        (Some(x), Some(y)) => x.ino == y.ino && x.sb.ptr_eq(&y.sb),
-        _ => false,
-    }
 }

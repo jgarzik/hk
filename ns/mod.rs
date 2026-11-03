@@ -597,6 +597,15 @@ pub fn sys_setns(fd: i32, nstype: i32) -> i64 {
 
     let current_ns = get_task_ns(tid).unwrap_or_else(|| INIT_NSPROXY.clone());
 
+    // A mount namespace moves root and cwd: not with an fs struct
+    // shared with other tasks (Linux mntns_install: fs->users != 1)
+    if matches!(ns_type, NamespaceType::Mnt)
+        && crate::task::percpu::current_fs()
+            .is_some_and(|fs| fs.users.load(core::sync::atomic::Ordering::SeqCst) != 1)
+    {
+        return -EINVAL;
+    }
+
     // Create new nsproxy with the target namespace for the specified type
     let new_ns = match ns_type {
         NamespaceType::Uts => Arc::new(NsProxy {

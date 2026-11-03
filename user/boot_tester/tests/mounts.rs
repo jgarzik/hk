@@ -4,7 +4,7 @@
 //! mounts are ramfs on both kernels.
 
 use super::helpers::{print, print_num, println};
-use hk_syscall::{CLONE_NEWNS, O_CREAT, O_RDWR, O_WRONLY, Stat, sys_chdir, sys_chroot, sys_close, sys_exit, sys_faccessat, sys_fork, sys_getcwd, sys_link, sys_mkdir, sys_mount, sys_open, sys_pivot_root, sys_readlink, sys_rename, sys_rmdir, sys_stat, sys_umount2, sys_unlink, sys_unshare, sys_wait4, sys_write};
+use hk_syscall::{CLONE_NEWNS, O_CREAT, O_RDONLY, O_RDWR, O_WRONLY, Stat, sys_chdir, sys_chroot, sys_close, sys_exit, sys_faccessat, sys_fork, sys_getcwd, sys_link, sys_mkdir, sys_mount, sys_open, sys_pipe2, sys_pivot_root, sys_read, sys_readlink, sys_rename, sys_rmdir, sys_stat, sys_umount2, sys_unlink, sys_unshare, sys_wait4, sys_write};
 
 const ENOENT: i64 = -2;
 const EBUSY: i64 = -16;
@@ -42,6 +42,9 @@ pub fn run_tests() {
     report(b"LAZY_UMOUNT", lazy_umount());
     report(b"PIVOT_ROOT_REAL", pivot_real());
     report(b"RAMFS_MOUNT_MODE", ramfs_mode());
+    report(b"UMOUNT_BUSY_CWD", busy_cwd());
+    report(b"UMOUNT_EXPIRE_BUSY", expire_busy());
+    report(b"MOUNT_HARDLINK", hardlink());
 }
 
 type R = Result<(), (&'static [u8], i64)>;
@@ -621,4 +624,92 @@ fn ramfs_mode() -> R {
     sys_rmdir(d.as_ptr());
     check(b"mount", r == 0, r)?;
     check(b"mode", s == 0 && st.st_mode == 0o40710, st.st_mode as i64)
+}
+
+/// A process standing in a mount (its cwd) makes it busy (Linux counts
+/// every reference: the fs struct's path pins the mount)
+fn busy_cwd() -> R {
+    let d = b"/tmp/ubc\0";
+    sys_mkdir(d.as_ptr(), 0o755);
+    if ramfs(d) != 0 {
+        sys_rmdir(d.as_ptr());
+        return Err((b"mount", -1));
+    }
+    let (mut go, mut ready) = ([0i32; 2], [0i32; 2]);
+    sys_pipe2(go.as_mut_ptr(), 0);
+    sys_pipe2(ready.as_mut_ptr(), 0);
+    let pid = sys_fork();
+    if pid == 0 {
+        let mut b = [0u8; 1];
+        sys_chdir(d.as_ptr());
+        sys_write(ready[1] as u64, b"r".as_ptr(), 1);
+        sys_read(go[0] as u64, b.as_mut_ptr(), 1);
+        sys_exit(0);
+    }
+    let mut b = [0u8; 1];
+    sys_read(ready[0] as u64, b.as_mut_ptr(), 1);
+    let busy = sys_umount2(d.as_ptr(), 0);
+    sys_write(go[1] as u64, b"g".as_ptr(), 1);
+    let mut ws = 0i32;
+    sys_wait4(pid, &mut ws, 0, 0);
+    for f in [go[0], go[1], ready[0], ready[1]] {
+        sys_close(f as u64);
+    }
+    let after = sys_umount2(d.as_ptr(), 0);
+    sys_rmdir(d.as_ptr());
+    check(b"busy", busy == EBUSY, busy)?;
+    check(b"umount after", after == 0, after)
+}
+
+/// MNT_EXPIRE: a busy mount is EBUSY (not marked); use between the two
+/// calls clears the mark (Linux mntput), so the next one marks again
+fn expire_busy() -> R {
+    let d = b"/tmp/exb\0";
+    sys_mkdir(d.as_ptr(), 0o755);
+    if ramfs(d) != 0 {
+        sys_rmdir(d.as_ptr());
+        return Err((b"mount", -1));
+    }
+    let r = (|| {
+        let fd = sys_open(b"/tmp/exb/f\0".as_ptr(), O_CREAT | O_WRONLY, 0o644);
+        let busy = sys_umount2(d.as_ptr(), MNT_EXPIRE);
+        sys_close(fd as u64);
+        check(b"busy", busy == EBUSY, busy)?;
+        let r = sys_umount2(d.as_ptr(), MNT_EXPIRE);
+        check(b"mark", r == EAGAIN, r)?;
+        let fd = sys_open(b"/tmp/exb/f\0".as_ptr(), O_RDONLY, 0);
+        sys_close(fd as u64);
+        let r = sys_umount2(d.as_ptr(), MNT_EXPIRE);
+        check(b"used: marked again", r == EAGAIN, r)?;
+        let r = sys_umount2(d.as_ptr(), MNT_EXPIRE);
+        check(b"expire", r == 0, r)
+    })();
+    sys_umount2(d.as_ptr(), 0);
+    sys_rmdir(d.as_ptr());
+    r
+}
+
+/// Hard links are different mountpoints: a bind on one leaves the other
+/// showing the file, and it can be unlinked
+fn hardlink() -> R {
+    touch(b"/tmp/hl_a\0");
+    sys_link(b"/tmp/hl_a\0".as_ptr(), b"/tmp/hl_b\0".as_ptr());
+    let fd = sys_open(b"/tmp/hl_src\0".as_ptr(), O_CREAT | O_WRONLY, 0o644);
+    sys_write(fd as u64, b"S".as_ptr(), 1);
+    sys_close(fd as u64);
+    let r = (|| {
+        check(b"bind", bind(b"/tmp/hl_src\0", b"/tmp/hl_a\0", 0) == 0, -1)?;
+        let mut b = [0u8; 4];
+        let fd = sys_open(b"/tmp/hl_b\0".as_ptr(), O_RDONLY, 0);
+        let n = sys_read(fd as u64, b.as_mut_ptr(), 4);
+        sys_close(fd as u64);
+        check(b"other link unbound", n == 0, n)?;
+        let r = sys_unlink(b"/tmp/hl_b\0".as_ptr());
+        check(b"unlink other", r == 0, r)
+    })();
+    sys_umount2(b"/tmp/hl_a\0".as_ptr(), 0);
+    for p in [&b"/tmp/hl_a\0"[..], b"/tmp/hl_b\0", b"/tmp/hl_src\0"] {
+        sys_unlink(p.as_ptr());
+    }
+    r
 }
