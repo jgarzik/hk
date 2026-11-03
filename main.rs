@@ -10,6 +10,7 @@
 extern crate alloc;
 
 // Core modules (formerly in core/ subdir)
+pub mod base;
 pub mod block;
 pub mod bus;
 pub mod console;
@@ -440,6 +441,7 @@ fn kmain() -> ! {
     // (chr_dev_init), then device initcalls (bus probes below)
     mnt_init();
     fs::devtmpfs::init();
+    base::driver_init();
     ksysfs::init();
     chr_dev_init();
 
@@ -631,31 +633,11 @@ fn chr_dev_init() {
     // Linux chr_dev_init ends in tty_init
     crate::tty::init_tty_chardevs();
 
-    // Device nodes: in devtmpfs, and the console's in the root's /dev
-    // (opened for init before anything mounts devtmpfs; Linux needs
-    // /dev/console in the initramfs)
-    let Ok(dev_dentry) = fs::lookup_path(b"/dev") else {
-        return;
-    };
-    use crate::fs::chardev::major as chardev_major;
-    let mut nodes = alloc::vec![
-        ("null", DevId::new(chardev_major::MEM, 3), 0o666),
-        ("zero", DevId::new(chardev_major::MEM, 5), 0o666),
-        ("full", DevId::new(chardev_major::MEM, 7), 0o666),
-        ("random", DevId::new(chardev_major::MEM, 8), 0o666),
-        ("urandom", DevId::new(chardev_major::MEM, 9), 0o666),
-        ("kmsg", DevId::new(chardev_major::MEM, 11), 0o644),
-        // Ttys: only /dev/tty is 0666, the rest get the devtmpfs
-        // default 0600 (Linux tty_devnode)
-        ("tty", DevId::new(chardev_major::TTYAUX, 0), 0o666),
-        ("console", DevId::new(chardev_major::TTYAUX, 1), 0o600),
-    ];
-    for tty in crate::arch::serial_ttys() {
-        nodes.push((tty.name(), tty.dev(), 0o600));
-    }
-    for (name, dev, mode) in nodes {
-        let _ = fs::ramfs_create_chrdev(&dev_dentry, name.as_bytes(), dev, mode);
-        fs::devtmpfs::device_add(name, dev, false, mode);
+    // The rootfs's /dev/console, opened for init before anything mounts
+    // devtmpfs (Linux default_rootfs)
+    if let Ok(dev) = fs::lookup_path(b"/dev") {
+        let console = DevId::new(crate::fs::chardev::major::TTYAUX, 1);
+        let _ = fs::ramfs_create_chrdev(&dev, b"console", console, 0o600);
     }
 
     printkln!("VFS: ok");

@@ -5,10 +5,10 @@
 
 use hk_syscall::{
     LinuxStatFs, O_DIRECTORY, O_RDONLY, O_WRONLY, Stat, sys_close, sys_getdents64, sys_lseek,
-    sys_open, sys_read, sys_stat, sys_statfs,
+    sys_open, sys_read, sys_readlink, sys_stat, sys_statfs,
 };
 
-use super::helpers::{print, print_num, println};
+use super::helpers::{print, print_num, println, read_file};
 
 const EACCES: i64 = -13;
 const SYSFS_MAGIC: i64 = 0x6265_6572;
@@ -20,6 +20,7 @@ const DT_DIR: u8 = 4;
 pub fn run_tests() {
     println(b"=== sysfs Tests ===");
     test_basic();
+    test_class_mem();
 }
 
 fn fail(name: &[u8], why: &[u8], v: i64) {
@@ -159,4 +160,69 @@ fn attr_reads(path: &[u8]) -> Result<(), (&'static [u8], i64)> {
     })();
     sys_close(fd as u64);
     r
+}
+
+/// `path` (NUL-terminated) holds exactly `want`
+fn file_is(path: &[u8], want: &[u8]) -> bool {
+    let mut b = [0u8; 256];
+    let n = read_file(path, &mut b);
+    n >= 0 && &b[..n as usize] == want
+}
+
+/// Symlink `path` points at `want`
+fn link_is(path: &[u8], want: &[u8]) -> bool {
+    let mut b = [0u8; 256];
+    let n = sys_readlink(path.as_ptr(), b.as_mut_ptr(), b.len() as u64);
+    n >= 0 && &b[..n as usize] == want
+}
+
+/// Class devices: dev, uevent, class/subsystem and /sys/dev links
+fn test_class_mem() {
+    const N: &[u8] = b"SYSFS_CLASS_MEM";
+    let checks: [(&[u8], bool); 8] = [
+        (b"dev", file_is(b"/sys/class/mem/null/dev\0", b"1:3\n")),
+        (
+            b"uevent",
+            file_is(
+                b"/sys/class/mem/null/uevent\0",
+                b"MAJOR=1\nMINOR=3\nDEVNAME=null\nDEVMODE=0666\n",
+            ),
+        ),
+        (
+            b"class link",
+            link_is(b"/sys/class/mem/null\0", b"../../devices/virtual/mem/null"),
+        ),
+        (
+            b"subsystem",
+            link_is(
+                b"/sys/devices/virtual/mem/null/subsystem\0",
+                b"../../../../class/mem",
+            ),
+        ),
+        (
+            b"/sys/dev/char",
+            link_is(b"/sys/dev/char/1:3\0", b"../../devices/virtual/mem/null"),
+        ),
+        (
+            b"tty uevent",
+            file_is(
+                b"/sys/class/tty/tty/uevent\0",
+                b"MAJOR=5\nMINOR=0\nDEVNAME=tty\nDEVMODE=0666\n",
+            ),
+        ),
+        (
+            b"console uevent",
+            file_is(
+                b"/sys/class/tty/console/uevent\0",
+                b"MAJOR=5\nMINOR=1\nDEVNAME=console\n",
+            ),
+        ),
+        (b"console dev", file_is(b"/sys/class/tty/console/dev\0", b"5:1\n")),
+    ];
+    for (why, good) in checks {
+        if !good {
+            return fail(N, why, 0);
+        }
+    }
+    ok(N);
 }

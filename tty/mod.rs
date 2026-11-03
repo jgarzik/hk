@@ -37,6 +37,8 @@ pub mod tty_dev;
 
 use alloc::sync::Arc;
 
+use crate::base::{Class, DevNode, Device, DeviceInfo, device_create};
+
 use crate::arch::IrqSpinlock;
 use crate::sync::spin::Mutex;
 use crate::sync::waitqueue::WaitQueue;
@@ -431,6 +433,39 @@ pub fn init_tty_chardevs() {
     // Register /dev/console (major 5, minor 1) - kernel console
     let console_dev = Arc::new(console_dev::ConsoleCharDevice);
     let _ = register_chardev(DevId::new(major::TTYAUX, 1), console_dev);
+
+    TTY_CLASS.register();
+    let mut devs = alloc::vec![
+        ("tty", DevId::new(major::TTYAUX, 0)),
+        ("console", DevId::new(major::TTYAUX, 1)),
+    ];
+    for &tty in crate::arch::serial_ttys() {
+        devs.push((tty.name(), tty.dev));
+    }
+    for (name, dev) in devs {
+        let _ = device_create(DeviceInfo {
+            name: name.into(),
+            parent: None,
+            class: Some(&TTY_CLASS),
+            devt: Some(dev),
+            devtype: None,
+        });
+    }
+}
+
+/// The tty class (Linux tty_class)
+pub static TTY_CLASS: Class = Class::new("tty", Some(tty_devnode));
+
+/// Linux tty_devnode: /dev/tty and /dev/ptmx are 0666
+fn tty_devnode(d: &Device) -> Option<DevNode> {
+    let dt = d.devt?;
+    if dt.major == crate::fs::chardev::major::TTYAUX && (dt.minor == 0 || dt.minor == 2) {
+        return Some(DevNode {
+            name: d.name().into(),
+            mode: 0o666,
+        });
+    }
+    None
 }
 
 // =============================================================================

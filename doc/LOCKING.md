@@ -1730,6 +1730,9 @@ at a time, with no RENAME_LOCK held (d_move drops it first).
 | `KNode.children`, `.name`, `.parent` | spin RwLock, leaves | alone (lookup, readdir under the walk's i_rwsem) or under KERNFS_RWSEM |
 | `OpenAttr.buf` | sync::Mutex (Linux kernfs_open_file.mutex), per open file | held across show()/store(), which take subsystem locks; under f_pos_lock for read/write |
 
+Device model (base/): `Class.devices` (spin Mutex, leaf; Linux
+klist_devices) is taken alone, after the device's sysfs entries exist.
+
 show()/store() run under an active reference (`KNode::get_active`),
 not a lock. `KNode::remove` deactivates the subtree and sleeps until
 active references drain (Linux kernfs_drain), with no lock held: a
