@@ -14,7 +14,7 @@ pub mod fsstruct;
 pub mod inode;
 pub mod mount;
 pub mod name;
-pub mod path;
+pub mod namei;
 pub mod path_ref;
 pub mod splice;
 pub mod superblock;
@@ -61,7 +61,7 @@ pub use file::{CHAR_FILE_OPS, DirContext, DirEntry, File, FileOps, RwFlags, flag
 pub use fsstruct::{FsStruct, clone_task_fs, exit_task_fs, get_task_fs, init_task_fs};
 pub use inode::{DevId, DeviceType, FileType, Gid, Inode, InodeAttr, InodeMode, InodeOps, Uid};
 pub use mount::{Mount, do_mount, do_umount, follow_mount, mount_at_path, umount_flags};
-pub use path::{LookupFlags, lookup_one, lookup_path, lookup_path_at, lookup_path_flags};
+pub use namei::{LookupFlags, lookup_one, lookup_path, lookup_path_at, lookup_path_flags};
 pub use path_ref::Path;
 pub use procfs::{
     NamespaceType, PROCFS_FILE_OPS, PROCFS_TYPE, ProcfsInodeData, ProcfsInodeWrapper,

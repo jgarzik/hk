@@ -69,6 +69,7 @@ pub mod mmlock;
 pub mod mm_populate;
 pub mod mountflags;
 pub mod mprotect;
+pub mod namei;
 pub mod mqueue;
 pub mod mrange;
 pub mod namespace;
@@ -174,6 +175,7 @@ pub fn run_all_tests() {
     vfs::run_tests();
     stdio::run_tests();
     dirents::run_tests();
+    namei::run_tests();
     cloexec::run_tests();
     close_range::run_tests();
     append::run_tests();

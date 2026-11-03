@@ -303,7 +303,7 @@ pub fn mount_at_path(
         do_mount(fs_type, None)
     } else {
         // Look up the mount point
-        let dentry = super::path::lookup_path(path)?;
+        let dentry = super::namei::lookup_path(path)?;
         do_mount(fs_type, Some(dentry))
     }
 }
@@ -320,7 +320,7 @@ pub fn dev_super(
         .ok_or(KernelError::OperationNotSupported)?;
 
     // Look up the source device path
-    let source_dentry = super::path::lookup_path(source)?;
+    let source_dentry = super::namei::lookup_path(source)?;
     let source_inode = source_dentry.get_inode().ok_or(KernelError::NotFound)?;
 
     // Verify it's a block device

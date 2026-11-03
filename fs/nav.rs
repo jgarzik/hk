@@ -3,9 +3,9 @@
 use crate::arch::Uaccess;
 use crate::fs::dac::{self, MAY_CHDIR, MAY_EXEC};
 use crate::fs::{Dentry, KernelError, LookupFlags, Path, lookup_path_at};
-use crate::uaccess::{UaccessArch, copy_to_user, strncpy_from_user};
+use crate::uaccess::{UaccessArch, copy_to_user};
 
-use super::syscall::{PATH_MAX, current_fd_table};
+use super::syscall::current_fd_table;
 
 /// chdir/fchdir/chroot target: a directory with search permission
 /// (MAY_EXEC | MAY_CHDIR)
@@ -26,9 +26,9 @@ fn may_chdir(d: &Dentry) -> Result<(), KernelError> {
 /// 0 on success, negative errno on error.
 pub fn sys_chdir(path_ptr: u64) -> i64 {
     // Read path from user space
-    let path_str = match strncpy_from_user::<Uaccess>(path_ptr, PATH_MAX) {
+    let path_str = match crate::fs::namei::getname(path_ptr, false) {
         Ok(p) => p,
-        Err(_) => return KernelError::BadAddress.sysret(),
+        Err(e) => return e.sysret(),
     };
 
     // Get current task's cwd as starting point for relative paths
@@ -101,9 +101,9 @@ pub fn sys_fchdir(fd: i32) -> i64 {
 /// * EPERM - Caller lacks CAP_SYS_CHROOT capability
 pub fn sys_chroot(path_ptr: u64) -> i64 {
     // Copy path from user space
-    let path_str = match strncpy_from_user::<Uaccess>(path_ptr, PATH_MAX) {
+    let path_str = match crate::fs::namei::getname(path_ptr, false) {
         Ok(p) => p,
-        Err(_) => return KernelError::BadAddress.sysret(),
+        Err(e) => return e.sysret(),
     };
 
     // Start from current working directory for relative paths

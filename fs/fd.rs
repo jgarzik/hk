@@ -12,11 +12,11 @@ use alloc::sync::Arc;
 use crate::arch::Uaccess;
 use crate::fs::{KernelError, LookupFlags, lookup_path_flags};
 use crate::task::percpu::current_tid;
-use crate::uaccess::{copy_from_user, copy_to_user, strncpy_from_user};
+use crate::uaccess::{copy_from_user, copy_to_user};
 
 use super::file::File;
 use super::posix_lock::{Flock, posix_getlk, posix_setlk, posix_setlkw};
-use super::syscall::{PATH_MAX, current_fd_table, get_nofile_limit};
+use super::syscall::{current_fd_table, get_nofile_limit};
 
 // =============================================================================
 // truncate, ftruncate syscalls
@@ -113,9 +113,9 @@ pub fn sys_truncate(path_ptr: u64, length: i64) -> i64 {
     }
 
     // Read path from user space
-    let path = match strncpy_from_user::<Uaccess>(path_ptr, PATH_MAX) {
+    let path = match crate::fs::namei::getname(path_ptr, false) {
         Ok(p) => p,
-        Err(_) => return KernelError::BadAddress.sysret(),
+        Err(e) => return e.sysret(),
     };
 
     if path.is_empty() {

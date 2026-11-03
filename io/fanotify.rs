@@ -667,16 +667,12 @@ pub fn sys_fanotify_init(init_flags: u32, event_f_flags: u32) -> i64 {
     }
 }
 
-/// Maximum path length
-const PATH_MAX: usize = 4096;
-
 /// sys_fanotify_mark(fd, flags, mask, dirfd, pathname) - add/remove/flush marks
 pub fn sys_fanotify_mark(fd: i32, mark_flags: u32, mask: u64, dirfd: i32, pathname: u64) -> i64 {
     use crate::fs::path_ref::Path;
     use crate::fs::{LookupFlags, lookup_path_at};
     use crate::task::fdtable::get_task_fd;
     use crate::task::percpu::current_tid;
-    use crate::uaccess::strncpy_from_user;
 
     // Get fd table
     let fd_table = match get_task_fd(current_tid()) {
@@ -739,9 +735,9 @@ pub fn sys_fanotify_mark(fd: i32, mark_flags: u32, mask: u64, dirfd: i32, pathna
     // Resolve path to get target ID
     let target_id = if pathname != 0 {
         // Copy pathname from user
-        let pathname_str = match strncpy_from_user::<crate::arch::Uaccess>(pathname, PATH_MAX) {
+        let pathname_str = match crate::fs::namei::getname(pathname, false) {
             Ok(p) => p,
-            Err(_) => return -14, // EFAULT
+            Err(e) => return e.sysret(),
         };
 
         // Get starting directory

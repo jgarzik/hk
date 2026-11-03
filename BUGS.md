@@ -53,16 +53,12 @@ blocks belong in a missing wrapper:
   timer container_of, `smp_call<T: Sync>`) in place of `*mut ()` data
   casts.
 
-## Path copy-in errors
+## cgroup names must be UTF-8
 
-**Location:** `uaccess.rs` (`strncpy_from_user`) and its callers.
+**Location:** `fs/cgroupfs.rs`.
 
-The callers turn every copy-in error into EFAULT, including an
-overlong path, which Linux reports as ENAMETOOLONG. The fix is one
-`user_path_at` that maps errors (Phase G).
-
-cgroup names must be UTF-8 (`fs/cgroupfs.rs`: mkdir of another name is
-EINVAL; Linux kernfs takes any bytes).
+mkdir of a name that is not valid UTF-8 is EINVAL; Linux kernfs takes
+any bytes.
 
 ## user/ does not follow doc/UNSAFE.md
 
@@ -82,7 +78,7 @@ Planned fix:
 
 ## chroot() does not affect path resolution (security)
 
-**Location**: `fs/path.rs` ~131-135 (`walk`, absolute-path lookup)
+**Location**: `fs/namei.rs` (`walk`, absolute-path lookup)
 
 `sys_chroot` records the new root (`fs.set_root`), but path walking
 always starts absolute paths at the mount namespace root
@@ -649,8 +645,7 @@ sched pid 0, flock/POSIX release, signalfd reader, errno flattening.
   places; `find_task_by_pid` in four (all root-namespace pids); four
   `current_time`s; about ten user-timespec readers each validating
   (Linux get_timespec64); three iovec structs and five
-  importers; five SigInfo, three Timeval, two Timespec types; two path
-  splitters that disagree on `.`/`..` (G).
+  importers; five SigInfo, three Timeval, two Timespec types.
 - **Error conventions** (as touched): Result<_, KernelError> about 618
   times, Result<_, i32> 91 (both signs used), Result<_, i64> 36; about
   187 raw errno numbers and 62 local errno constants.
@@ -764,3 +759,10 @@ Found during T0 (2026-10-19). Tag = when to fix.
    `check-stress` boots: poll reported POLLOUT for a nonblocking
    connect to a just-closed loopback port, but no ECONNREFUSED was
    pending).
+11. **xHCI transfer timeout on USB storage** (Dell xHCI work): one
+   x86 `make check` in a parallel gate (2026-11-03) logged
+   `xHCI: wait_for_transfer TIMEOUT slot=1 dci=3` twice; those bulk
+   transfers failed with EIO, so VFAT_GETDENTS (mkdir) and
+   VFAT_LSEEK_SET failed. The rerun passed. Either a completion is
+   missed (an event-ring/interrupt race in `hw/usb/xhci.rs`) or the
+   loaded host stalled QEMU's emulated xHCI past 5 s.

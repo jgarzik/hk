@@ -656,7 +656,7 @@ fn find_other(net: &NetNamespace, a: &[u8], stype: i32) -> Result<Arc<UnixSock>,
             .ok_or(KernelError::ConnectionRefused);
     }
     let (path, _) = bsd_name(a)?;
-    let d = crate::fs::path::lookup_path(&path)?;
+    let d = crate::fs::namei::lookup_path(&path)?;
     let inode = d.get_inode().ok_or(KernelError::NotFound)?;
     crate::fs::dac::permission_as(&crate::task::current_cred(), &inode, crate::fs::MAY_WRITE)?;
     if !inode.mode().is_socket() {

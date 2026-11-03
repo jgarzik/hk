@@ -133,24 +133,30 @@ fn path_mount(
     fstype_ptr: u64,
     mut flags: u64,
 ) -> Result<(), KernelError> {
-    let copy = |p| strncpy_from_user::<Uaccess>(p, PATH_MAX).map_err(|_| KernelError::BadAddress);
-    // Source and type may be absent for remount / propagation changes;
-    // a type is a name of a registered filesystem: not text, no such one
-    let source = if source_ptr != 0 {
-        copy(source_ptr)?
-    } else {
-        Default::default()
+    use crate::uaccess::UaccessError;
+    // Linux copy_mount_string (strndup_user): EFAULT, EINVAL if too long;
+    // type, then source, then the target as a path name. Source and type
+    // may be absent for remount / propagation changes; a type is a name
+    // of a registered filesystem: not text, no such one
+    let too_long = |e| match e {
+        UaccessError::TooLong => KernelError::InvalidArgument,
+        _ => KernelError::BadAddress,
     };
     let fstype = if fstype_ptr != 0 {
         match strncpy_from_user_str::<Uaccess>(fstype_ptr, PATH_MAX) {
             Ok(s) => s,
-            Err(crate::uaccess::UaccessError::Encoding) => return Err(KernelError::NoDevice),
-            Err(_) => return Err(KernelError::BadAddress),
+            Err(UaccessError::Encoding) => return Err(KernelError::NoDevice),
+            Err(e) => return Err(too_long(e)),
         }
     } else {
         Default::default()
     };
-    let target = copy(target_ptr)?;
+    let source = if source_ptr != 0 {
+        strncpy_from_user::<Uaccess>(source_ptr, PATH_MAX).map_err(too_long)?
+    } else {
+        Default::default()
+    };
+    let target = crate::fs::namei::getname(target_ptr, false)?;
     let mp = lookup_path_flags(&target, LookupFlags::opendir())?;
 
     if flags & ms::MGC_MSK == ms::MGC_VAL {
@@ -222,9 +228,9 @@ pub fn sys_umount2(target_ptr: u64, flags: i32) -> i64 {
     }
 
     // Read target path from user space
-    let target = match strncpy_from_user::<Uaccess>(target_ptr, PATH_MAX) {
+    let target = match crate::fs::namei::getname(target_ptr, false) {
         Ok(s) => s,
-        Err(_) => return KernelError::BadAddress.sysret(),
+        Err(e) => return e.sysret(),
     };
 
     // Set up lookup flags - respect UMOUNT_NOFOLLOW
@@ -283,13 +289,13 @@ pub fn sys_pivot_root(new_root_ptr: u64, put_old_ptr: u64) -> i64 {
     }
 
     // 2. Copy paths from user space
-    let new_root_str = match strncpy_from_user::<Uaccess>(new_root_ptr, PATH_MAX) {
+    let new_root_str = match crate::fs::namei::getname(new_root_ptr, false) {
         Ok(s) => s,
-        Err(_) => return KernelError::BadAddress.sysret(),
+        Err(e) => return e.sysret(),
     };
-    let put_old_str = match strncpy_from_user::<Uaccess>(put_old_ptr, PATH_MAX) {
+    let put_old_str = match crate::fs::namei::getname(put_old_ptr, false) {
         Ok(s) => s,
-        Err(_) => return KernelError::BadAddress.sysret(),
+        Err(e) => return e.sysret(),
     };
 
     // 3. Look up new_root path (must be directory)
@@ -572,9 +578,9 @@ fn do_setxattr(
     }
 
     // Copy path from user
-    let path = match strncpy_from_user::<Uaccess>(path_ptr, PATH_MAX) {
+    let path = match crate::fs::namei::getname(path_ptr, false) {
         Ok(p) => p,
-        Err(_) => return KernelError::BadAddress.sysret(),
+        Err(e) => return e.sysret(),
     };
 
     // Copy attribute name from user
@@ -709,9 +715,9 @@ fn do_getxattr(
     follow_symlinks: bool,
 ) -> i64 {
     // Copy path from user
-    let path = match strncpy_from_user::<Uaccess>(path_ptr, PATH_MAX) {
+    let path = match crate::fs::namei::getname(path_ptr, false) {
         Ok(p) => p,
-        Err(_) => return KernelError::BadAddress.sysret(),
+        Err(e) => return e.sysret(),
     };
 
     // Copy attribute name from user
@@ -868,9 +874,9 @@ pub fn sys_llistxattr(path_ptr: u64, list_ptr: u64, size: u64) -> i64 {
 /// Internal helper for listxattr/llistxattr
 fn do_listxattr(path_ptr: u64, list_ptr: u64, size: u64, follow_symlinks: bool) -> i64 {
     // Copy path from user
-    let path = match strncpy_from_user::<Uaccess>(path_ptr, PATH_MAX) {
+    let path = match crate::fs::namei::getname(path_ptr, false) {
         Ok(p) => p,
-        Err(_) => return KernelError::BadAddress.sysret(),
+        Err(e) => return e.sysret(),
     };
 
     // Lookup path
@@ -992,9 +998,9 @@ pub fn sys_lremovexattr(path_ptr: u64, name_ptr: u64) -> i64 {
 /// Internal helper for removexattr/lremovexattr
 fn do_removexattr(path_ptr: u64, name_ptr: u64, follow_symlinks: bool) -> i64 {
     // Copy path from user
-    let path = match strncpy_from_user::<Uaccess>(path_ptr, PATH_MAX) {
+    let path = match crate::fs::namei::getname(path_ptr, false) {
         Ok(p) => p,
-        Err(_) => return KernelError::BadAddress.sysret(),
+        Err(e) => return e.sysret(),
     };
 
     // Copy attribute name from user

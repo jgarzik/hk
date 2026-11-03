@@ -53,6 +53,21 @@ pub mod flags {
     pub use crate::arch::uapi::{O_DIRECTORY, O_NOFOLLOW};
     /// Close on exec
     pub const O_CLOEXEC: u32 = 0o2000000;
+
+    /// The *at() calls' dirfd for the current directory
+    pub const AT_FDCWD: i32 = -100;
+    /// Do not follow a final symlink
+    pub const AT_SYMLINK_NOFOLLOW: i32 = 0x100;
+    /// faccessat: check with the effective ids
+    pub const AT_EACCESS: i32 = 0x200;
+    /// unlinkat: remove a directory
+    pub const AT_REMOVEDIR: i32 = 0x200;
+    /// linkat: follow a final symlink
+    pub const AT_SYMLINK_FOLLOW: i32 = 0x400;
+    /// Do not automount a final component
+    pub const AT_NO_AUTOMOUNT: i32 = 0x800;
+    /// An empty path names dirfd itself
+    pub const AT_EMPTY_PATH: i32 = 0x1000;
 }
 
 /// Seek whence values (for lseek)

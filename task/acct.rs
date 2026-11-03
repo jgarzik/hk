@@ -193,11 +193,10 @@ pub fn sys_acct(filename_ptr: u64) -> i64 {
     }
 
     // Copy filename from user
-    let filename =
-        match crate::uaccess::strncpy_from_user::<crate::arch::Uaccess>(filename_ptr, 4096) {
-            Ok(f) => f,
-            Err(_) => return -14, // EFAULT
-        };
+    let filename = match crate::fs::namei::getname(filename_ptr, false) {
+        Ok(f) => f,
+        Err(e) => return e.sysret(),
+    };
 
     // Open the file for appending
     let file = match open_acct_file(&filename) {

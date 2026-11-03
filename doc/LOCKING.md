@@ -1779,8 +1779,8 @@ fn sys_mkdir(...) {
 ```
 
 **Lookup and permission under the lock (Linux lookup_open /
-filename_create):** `open.rs::create_in` (O_CREAT), `path.rs::create_entry`
-(mkdir, mknod, symlink, link) and `path.rs::delete_entry` (unlink, rmdir)
+filename_create):** `open.rs::create_in` (O_CREAT), `namei.rs::create_entry`
+(mkdir, mknod, symlink, link) and `namei.rs::delete_entry` (unlink, rmdir)
 take the parent's `Inode::lock()` first and, while holding it, look the name
 up (`lookup_one`: dentry `d_lock`, then the file system's `lookup`), decide
 EEXIST / "created by this call", run the DAC checks (`dac::may_create`,
@@ -1976,7 +1976,7 @@ to stay locked between calls. The call holds the file's `f_pos_lock`
 - Both are sleeping locks (`sync`): the vfat write path may wait
   for page locks and block I/O while holding `i_rwsem`, which a spinlock
   would forbid.
-- Path walk (`path.rs::lookup_slow`) takes a directory's `i_rwsem`
+- Path walk (`namei.rs::lookup_slow`) takes a directory's `i_rwsem`
   shared on a dcache miss (Linux lookup_slow); callers already holding
   that directory exclusively (create, unlink, rename) use `lookup_one`
   directly.

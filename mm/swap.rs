@@ -23,7 +23,7 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::sync::spin::{Mutex, RwLock};
 
-use crate::arch::{IrqSpinlock, Uaccess};
+use crate::arch::IrqSpinlock;
 use crate::block::blkdev::{BioOp, bdev_rw, bdev_rw_frame};
 use crate::fs::{Inode, lookup_path};
 use crate::mm::filemap::PAGE_SIZE;
@@ -31,7 +31,6 @@ use crate::mm::page::frame_bytes;
 use crate::mm::swap_entry::{MAX_SWAPFILES, SwapEntry};
 use crate::mm::xarray::XArray;
 use crate::task::{CAP_SYS_ADMIN, capable};
-use crate::uaccess::strncpy_from_user;
 use crate::util::error::KernelError;
 
 /// 512-byte sectors per page
@@ -443,7 +442,7 @@ fn write_page(entry: SwapEntry, frame_phys: u64) -> Result<(), i64> {
 
 /// The path argument of swapon/swapoff
 fn user_path(ptr: u64) -> Result<alloc::vec::Vec<u8>, KernelError> {
-    strncpy_from_user::<Uaccess>(ptr, 4096).map_err(|_| KernelError::BadAddress)
+    crate::fs::namei::getname(ptr, false)
 }
 
 /// The slots of the area whose header page is `hdr` on a file or

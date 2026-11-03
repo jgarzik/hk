@@ -20,7 +20,7 @@ pub use super::pollsys::*;
 pub use super::stat::*;
 pub use super::sync::*;
 
-use crate::fs::{KernelError, LookupFlags, Path, lookup_path_at};
+use crate::fs::KernelError;
 use crate::task::fdtable::get_task_fd;
 use crate::task::percpu::current_tid;
 
@@ -56,13 +56,6 @@ pub const RWF_SUPPORTED: i32 = RWF_HIPRI
     | RWF_ATOMIC
     | RWF_DONTCACHE
     | RWF_NOSIGNAL;
-
-/// AT_FDCWD - special value meaning current working directory
-///
-/// When passed as the dirfd argument to *at syscalls (openat, etc.),
-/// indicates that relative paths should be resolved from the current
-/// working directory.
-pub const AT_FDCWD: i32 = -100;
 
 /// Maximum path length for user strings
 pub const PATH_MAX: usize = 4096;
@@ -130,58 +123,4 @@ pub fn check_fsize_limit(offset: u64, count: usize) -> Result<(), i64> {
 /// which would indicate a kernel bug.
 pub fn current_fd_table() -> alloc::sync::Arc<crate::task::fdtable::Files> {
     get_task_fd(current_tid()).expect("current task has no FD table")
-}
-
-///
-/// Returns the parent dentry and the final component name.
-pub fn lookup_parent_at(
-    dirfd: i32,
-    path: &[u8],
-) -> Result<(alloc::sync::Arc<super::Dentry>, alloc::vec::Vec<u8>), i64> {
-    // Find the last path component
-    let mut end = path.len();
-    while end > 0 && path[end - 1] == b'/' {
-        end -= 1;
-    }
-    let path = &path[..end];
-    if path.is_empty() {
-        return Err(KernelError::InvalidArgument.sysret());
-    }
-
-    let (parent_path, name): (&[u8], &[u8]) = match path.iter().rposition(|&c| c == b'/') {
-        Some(pos) => {
-            let parent: &[u8] = if pos == 0 { b"/" } else { &path[..pos] };
-            (parent, &path[pos + 1..])
-        }
-        // No slash - parent is current directory (or dirfd)
-        None => (b".", path),
-    };
-
-    if name.is_empty() {
-        return Err(KernelError::InvalidArgument.sysret());
-    }
-
-    // Determine starting path
-    let start: Option<Path> = if parent_path.starts_with(b"/") {
-        None
-    } else if dirfd == AT_FDCWD {
-        crate::task::percpu::current_cwd()
-    } else {
-        let file = match current_fd_table().lock().get(dirfd) {
-            Some(f) => f,
-            None => return Err(KernelError::BadFd.sysret()),
-        };
-        if !file.is_dir() {
-            return Err(KernelError::NotDirectory.sysret());
-        }
-        Path::from_dentry(file.dentry.clone())
-    };
-
-    // Look up parent directory
-    let parent_dentry = match lookup_path_at(start, parent_path, LookupFlags::opendir()) {
-        Ok(d) => d,
-        Err(e) => return Err(e.sysret()),
-    };
-
-    Ok((parent_dentry, name.to_vec()))
 }

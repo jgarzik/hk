@@ -74,6 +74,8 @@ pub enum UaccessError {
     /// A string that must be text is not valid UTF-8
     /// ([`strncpy_from_user_str`])
     Encoding,
+    /// No NUL within the string's maximum length
+    TooLong,
 }
 
 /// Result type for user access operations
@@ -360,9 +362,9 @@ pub fn copy_val_to_user<A: UaccessArch, T: IntoBytes>(to: u64, value: &T) -> Uac
 /// * `max_len` - Maximum number of bytes to read (including null terminator)
 ///
 /// # Returns
-/// * `Ok(String)` containing the string (without null terminator) on success
+/// * `Ok(bytes)` without the terminator
 /// * `Err(UaccessError::BadAddress)` if user address is invalid
-/// * `Err(UaccessError::Overflow)` if string exceeds max_len
+/// * `Err(UaccessError::TooLong)` if no NUL is found within `max_len` bytes
 #[track_caller]
 pub fn strncpy_from_user<A: UaccessArch>(
     from: u64,
@@ -394,7 +396,7 @@ pub fn strncpy_from_user_str<A: UaccessArch>(
 /// # Returns
 /// * `Ok(bytes)` without the terminator
 /// * `Err(BadAddress)` / `Err(Fault)` for an invalid or unmapped address
-/// * `Err(Overflow)` if no NUL is found within `max_len` bytes
+/// * `Err(TooLong)` if no NUL is found within `max_len` bytes
 pub fn strndup_user_bytes<A: UaccessArch>(
     from: u64,
     max_len: usize,
@@ -414,5 +416,5 @@ pub fn strndup_user_bytes<A: UaccessArch>(
         out.extend_from_slice(&chunk[..n]);
         ptr = ptr.checked_add(n as u64).ok_or(UaccessError::Overflow)?;
     }
-    Err(UaccessError::Overflow)
+    Err(UaccessError::TooLong)
 }

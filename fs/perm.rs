@@ -11,10 +11,12 @@ use crate::arch::Uaccess;
 use alloc::sync::Arc;
 
 use crate::fs::dac::{self, MAY_ACCESS};
-use crate::fs::{Dentry, Inode, KernelError, LookupFlags, Path, lookup_path_at};
-use crate::uaccess::{UaccessArch, copy_val_from_user, strncpy_from_user};
+use crate::fs::{Dentry, Inode, KernelError, LookupFlags};
+use crate::uaccess::{UaccessArch, copy_val_from_user};
 
-use super::syscall::{AT_FDCWD, PATH_MAX, current_fd_table};
+use super::file::flags::{AT_EACCESS, AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW};
+use super::namei::user_path_at;
+use super::syscall::current_fd_table;
 
 // =============================================================================
 // access, faccessat, faccessat2 syscalls
@@ -30,14 +32,6 @@ const W_OK: i32 = 2;
 /// Check read permission
 const R_OK: i32 = 4;
 
-// faccessat() flags - how to perform the check
-/// Use effective uid/gid instead of real uid/gid
-const AT_EACCESS: i32 = 0x200;
-/// Don't follow symbolic links
-const AT_SYMLINK_NOFOLLOW: i32 = 0x100;
-/// If pathname is empty, check dirfd itself
-const AT_EMPTY_PATH: i32 = 0x1000;
-
 /// Resolve `dirfd` + user path for the *at() attribute syscalls:
 /// AT_EMPTY_PATH (when `empty_ok`) names dirfd itself, AT_SYMLINK_NOFOLLOW
 /// stops at a final symlink
@@ -47,42 +41,8 @@ fn resolve(
     flags: i32,
     empty_ok: bool,
 ) -> Result<Arc<Dentry>, KernelError> {
-    let path =
-        strncpy_from_user::<Uaccess>(path_ptr, PATH_MAX).map_err(|_| KernelError::BadAddress)?;
-    if path.is_empty() {
-        if !empty_ok || flags & AT_EMPTY_PATH == 0 {
-            return Err(KernelError::NotFound);
-        }
-        if dirfd == AT_FDCWD {
-            return crate::task::percpu::current_cwd()
-                .map(|p| p.dentry.clone())
-                .ok_or(KernelError::NotFound);
-        }
-        let file = current_fd_table()
-            .lock()
-            .get(dirfd)
-            .ok_or(KernelError::BadFd)?;
-        return Ok(file.dentry.clone());
-    }
-    let start: Option<Path> = if path.starts_with(b"/") {
-        None
-    } else if dirfd == AT_FDCWD {
-        crate::task::percpu::current_cwd()
-    } else {
-        let file = current_fd_table()
-            .lock()
-            .get(dirfd)
-            .ok_or(KernelError::BadFd)?;
-        if !file.is_dir() {
-            return Err(KernelError::NotDirectory);
-        }
-        Path::from_dentry(file.dentry.clone())
-    };
-    let mut lf = LookupFlags::open();
-    if flags & AT_SYMLINK_NOFOLLOW != 0 {
-        lf.follow = false;
-    }
-    lookup_path_at(start, &path, lf)
+    let empty_ok = empty_ok && flags & AT_EMPTY_PATH != 0;
+    user_path_at(dirfd, path_ptr, LookupFlags::at(flags), empty_ok)
 }
 
 fn inode_of(d: &Dentry) -> Result<Arc<Inode>, KernelError> {
