@@ -658,11 +658,13 @@ fn init_vfs_core() {
         ("random", DevId::new(chardev_major::MEM, 8), 0o666),
         ("urandom", DevId::new(chardev_major::MEM, 9), 0o666),
         ("kmsg", DevId::new(chardev_major::MEM, 11), 0o644),
+        // Ttys: only /dev/tty is 0666, the rest get the devtmpfs
+        // default 0600 (Linux tty_devnode)
         ("tty", DevId::new(chardev_major::TTYAUX, 0), 0o666),
-        ("console", DevId::new(chardev_major::TTYAUX, 1), 0o666),
+        ("console", DevId::new(chardev_major::TTYAUX, 1), 0o600),
     ];
     for tty in crate::arch::serial_ttys() {
-        nodes.push((tty.name(), tty.dev(), 0o666));
+        nodes.push((tty.name(), tty.dev(), 0o600));
     }
     for (name, dev, mode) in nodes {
         let _ = fs::ramfs_create_chrdev(&dev_dentry, name.as_bytes(), dev, mode);
