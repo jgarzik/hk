@@ -264,15 +264,12 @@ immutable/append-only inodes (no IS_APPEND/IS_IMMUTABLE EPERM).
 **Location**: `fs/misc.rs` sys_mount/sys_umount2, `fs/mount.rs`
 
 Accepted without effect: atime flags (no atime updates), MS_SILENT,
-MS_MANDLOCK, MS_POSIXACL, MS_I_VERSION, MS_LAZYTIME, and
-MS_PRIVATE/MS_UNBINDABLE (mounts never propagate, no bind mounts).
-EINVAL instead of Linux behavior: MS_BIND (also MS_REMOUNT|MS_BIND),
-MS_MOVE, MS_SHARED, MS_SLAVE, MS_SYNCHRONOUS, MS_DIRSYNC, MS_NOSYMFOLLOW
-and umount2 MNT_EXPIRE. Read-only state is one flag, SB_RDONLY on the
-superblock (no separate MNT_READONLY: without bind mounts a superblock
-has one mount per namespace). Unlike Linux (MNT_WRITE_HOLD), a
-`SuperBlock::want_write` racing a rw->ro remount that then fails with
-EBUSY can see a spurious EROFS. Mount data/options strings are
+MS_MANDLOCK, MS_POSIXACL, MS_I_VERSION, MS_LAZYTIME, and MS_PRIVATE
+beyond clearing unbindable (mounts never propagate).
+EINVAL instead of Linux behavior: MS_MOVE, MS_SHARED, MS_SLAVE,
+MS_SYNCHRONOUS, MS_DIRSYNC, MS_NOSYMFOLLOW and umount2 MNT_EXPIRE.
+Unlike Linux (MNT_WRITE_HOLD), a write access racing a read-only remount
+that then fails with EBUSY can see a spurious EROFS. Mount data/options strings are
 ignored; mounts are not user-namespace aware (plain capable()).
 Crossing into a mount scans the current mount's children (Linux hashes
 (parent, mountpoint): mount_hashtable). After pivot_root other tasks

@@ -11,7 +11,7 @@ use crate::arch::Uaccess;
 use alloc::sync::Arc;
 
 use crate::fs::dac::{self, MAY_ACCESS};
-use crate::fs::{Dentry, Inode, KernelError, LookupFlags};
+use crate::fs::{Dentry, Inode, KernelError, LookupFlags, Path};
 use crate::uaccess::{UaccessArch, copy_val_from_user};
 
 use super::file::flags::{AT_EACCESS, AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW};
@@ -35,14 +35,9 @@ const R_OK: i32 = 4;
 /// Resolve `dirfd` + user path for the *at() attribute syscalls:
 /// AT_EMPTY_PATH (when `empty_ok`) names dirfd itself, AT_SYMLINK_NOFOLLOW
 /// stops at a final symlink
-fn resolve(
-    dirfd: i32,
-    path_ptr: u64,
-    flags: i32,
-    empty_ok: bool,
-) -> Result<Arc<Dentry>, KernelError> {
+fn resolve(dirfd: i32, path_ptr: u64, flags: i32, empty_ok: bool) -> Result<Path, KernelError> {
     let empty_ok = empty_ok && flags & AT_EMPTY_PATH != 0;
-    user_path_at(dirfd, path_ptr, LookupFlags::at(flags), empty_ok).map(|p| p.dentry)
+    user_path_at(dirfd, path_ptr, LookupFlags::at(flags), empty_ok)
 }
 
 fn inode_of(d: &Dentry) -> Result<Arc<Inode>, KernelError> {
@@ -67,7 +62,7 @@ fn do_faccessat(dirfd: i32, path_ptr: u64, mode: i32, flags: i32) -> i64 {
         return KernelError::InvalidArgument.sysret();
     }
     let r = resolve(dirfd, path_ptr, flags, true).and_then(|d| {
-        let inode = inode_of(&d)?;
+        let inode = inode_of(&d.dentry)?;
         let cur = dac::cred();
         let c = if flags & AT_EACCESS != 0 {
             cur
@@ -75,7 +70,15 @@ fn do_faccessat(dirfd: i32, path_ptr: u64, mode: i32, flags: i32) -> i64 {
             dac::access_cred(&cur)
         };
         // R_OK/W_OK/X_OK are MAY_READ/MAY_WRITE/MAY_EXEC
-        dac::permission_as(&c, &inode, mode as u32 | MAY_ACCESS)
+        dac::permission_as(&c, &inode, mode as u32 | MAY_ACCESS)?;
+        // SuS: W_OK of a file on a read-only mount is EROFS (devices,
+        // FIFOs and sockets are fine)
+        let special =
+            inode.mode().is_device() || inode.mode().is_fifo() || inode.mode().is_socket();
+        if mode & W_OK != 0 && !special && d.mnt.is_readonly() {
+            return Err(KernelError::ReadOnlyFs);
+        }
+        Ok(())
     });
     ret(r)
 }
@@ -105,8 +108,7 @@ fn do_fchmodat(dirfd: i32, pathname: u64, mode: u32, flags: i32) -> i64 {
     if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
         return KernelError::InvalidArgument.sysret();
     }
-    ret(resolve(dirfd, pathname, flags, true)
-        .and_then(|d| dac::chmod(&*inode_of(&d)?, (mode & 0o7777) as u16)))
+    ret(resolve(dirfd, pathname, flags, true).and_then(|p| dac::chmod(&p, (mode & 0o7777) as u16)))
 }
 
 /// sys_fchmodat - change file permissions relative to directory fd
@@ -124,18 +126,18 @@ pub fn sys_chmod(pathname: u64, mode: u32) -> i64 {
     sys_fchmodat(AT_FDCWD, pathname, mode, 0)
 }
 
-/// Inode of an open fd
-fn fd_inode(fd: i32) -> Result<Arc<Inode>, KernelError> {
+/// Path of an open fd
+fn fd_path(fd: i32) -> Result<Path, KernelError> {
     let file = current_fd_table()
         .lock()
         .get(fd)
         .ok_or(KernelError::BadFd)?;
-    file.get_inode().ok_or(KernelError::BadFd)
+    file.f_path().ok_or(KernelError::BadFd)
 }
 
 /// sys_fchmod - change file permissions by fd
 pub fn sys_fchmod(fd: i32, mode: u32) -> i64 {
-    ret(fd_inode(fd).and_then(|i| dac::chmod(&i, (mode & 0o7777) as u16)))
+    ret(fd_path(fd).and_then(|p| dac::chmod(&p, (mode & 0o7777) as u16)))
 }
 
 // =============================================================================
@@ -152,8 +154,7 @@ pub fn sys_fchownat(dirfd: i32, pathname: u64, owner: u32, group: u32, flags: i3
     if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
         return KernelError::InvalidArgument.sysret();
     }
-    ret(resolve(dirfd, pathname, flags, true)
-        .and_then(|d| dac::chown(&*inode_of(&d)?, id(owner), id(group))))
+    ret(resolve(dirfd, pathname, flags, true).and_then(|p| dac::chown(&p, id(owner), id(group))))
 }
 
 /// sys_chown - change file ownership (follows symlinks)
@@ -168,7 +169,7 @@ pub fn sys_lchown(pathname: u64, owner: u32, group: u32) -> i64 {
 
 /// sys_fchown - change file ownership by fd
 pub fn sys_fchown(fd: i32, owner: u32, group: u32) -> i64 {
-    ret(fd_inode(fd).and_then(|i| dac::chown(&i, id(owner), id(group))))
+    ret(fd_path(fd).and_then(|p| dac::chown(&p, id(owner), id(group))))
 }
 
 // =============================================================================
@@ -223,21 +224,21 @@ fn do_utimes(dirfd: i32, pathname: u64, times: Option<[UserTimespec; 2]>, flags:
     if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
         return KernelError::InvalidArgument.sysret();
     }
-    let inode = if pathname == 0 {
+    let path = if pathname == 0 {
         if dirfd == AT_FDCWD {
             return KernelError::InvalidArgument.sysret();
         }
-        fd_inode(dirfd)
+        fd_path(dirfd)
     } else {
-        resolve(dirfd, pathname, flags, true).and_then(|d| inode_of(&d))
+        resolve(dirfd, pathname, flags, true)
     };
-    let inode = match inode {
-        Ok(i) => i,
+    let (path, inode) = match path.and_then(|p| Ok((inode_of(&p.dentry)?, p))) {
+        Ok((i, p)) => (p, i),
         Err(e) => return e.sysret(),
     };
     let times = times.filter(|t| !(t[0].tv_nsec == UTIME_NOW && t[1].tv_nsec == UTIME_NOW));
     // vfs_utimes: write access first (EROFS), held across the update
-    let _w = match dac::want_write(&inode) {
+    let _w = match path.mnt.want_write() {
         Ok(w) => w,
         Err(e) => return e.sysret(),
     };

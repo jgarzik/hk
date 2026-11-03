@@ -54,6 +54,10 @@ fn check(what: &'static [u8], ok: bool, got: i64) -> R {
 }
 
 /// Read a whole (small) file
+pub fn slurp_pub(path: &[u8], buf: &mut [u8]) -> usize {
+    slurp(path, buf)
+}
+
 fn slurp(path: &[u8], buf: &mut [u8]) -> usize {
     let fd = sys_open(path.as_ptr(), O_RDONLY, 0);
     if fd < 0 {

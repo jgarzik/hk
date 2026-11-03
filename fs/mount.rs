@@ -2,7 +2,6 @@
 //!
 //! Manages the mount tree that connects filesystems into a unified namespace.
 
-use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 
@@ -23,6 +22,10 @@ pub const MNT_NOSUID: u32 = 0x1;
 pub const MNT_NODEV: u32 = 0x2;
 /// No program execution (Linux MNT_NOEXEC)
 pub const MNT_NOEXEC: u32 = 0x4;
+/// This mount is read-only, whatever its superblock (Linux MNT_READONLY)
+pub const MNT_READONLY: u32 = 0x40;
+/// Cannot be bind-mounted (Linux MNT_UNBINDABLE)
+pub const MNT_UNBINDABLE: u32 = 0x2000;
 
 /// Old mount -> its copy, from [`Mount::clone_tree`]
 pub type MountMap = Vec<(Arc<Mount>, Arc<Mount>)>;
@@ -86,6 +89,10 @@ pub struct Mount {
     /// MNT_NOEXEC
     mnt_flags: AtomicU32,
 
+    /// Holders of write access through this mount (Linux mnt_writers):
+    /// against making it read-only, the protocol of SuperBlock::s_writers
+    writers: AtomicU64,
+
     /// Id in /proc/<pid>/mountinfo and statx (Linux mnt_id): reused
     pub mnt_id: u32,
     /// Id never reused (Linux mnt_id_unique, STATX_MNT_ID_UNIQUE)
@@ -117,6 +124,7 @@ impl Mount {
             parent: RwLock::new(None),
             children: RwLock::new(Vec::new()),
             mnt_flags: AtomicU32::new(flags),
+            writers: AtomicU64::new(0),
             mnt_id: mnt_alloc_id(),
             mnt_id_unique: MNT_ID_UNIQUE.fetch_add(1, Ordering::Relaxed),
             devname,
@@ -140,25 +148,60 @@ impl Mount {
         self.mnt_flags.load(Ordering::Relaxed)
     }
 
-    /// Replace the MNT_* flags (mount, remount)
-    pub fn set_flags(&self, f: u32) {
-        self.mnt_flags.store(f, Ordering::Relaxed);
+    /// Replace the MNT_* flags (mount, remount): turning MNT_READONLY on
+    /// is EBUSY, nothing changed, while anyone holds write access
+    /// through the mount (Linux mnt_make_readonly)
+    pub fn set_flags(&self, f: u32) -> Result<(), KernelError> {
+        // Propagation state is not the caller's to set here
+        let f = (f & !MNT_UNBINDABLE) | (self.flags() & MNT_UNBINDABLE);
+        let old = self.mnt_flags.fetch_or(f & MNT_READONLY, Ordering::SeqCst);
+        if f & MNT_READONLY != 0
+            && old & MNT_READONLY == 0
+            && self.writers.load(Ordering::SeqCst) != 0
+        {
+            self.mnt_flags.fetch_and(!MNT_READONLY, Ordering::SeqCst);
+            return Err(KernelError::Busy);
+        }
+        self.mnt_flags.store(f, Ordering::SeqCst);
+        Ok(())
     }
 
-    /// Option string for /proc/mounts ("ro,nosuid,nodev,noexec")
-    pub fn opts(&self) -> String {
-        let mut o = String::from(if self.sb.rdonly() { "ro" } else { "rw" });
-        let f = self.flags();
-        for (bit, name) in [
-            (MNT_NOSUID, ",nosuid"),
-            (MNT_NODEV, ",nodev"),
-            (MNT_NOEXEC, ",noexec"),
-        ] {
-            if f & bit != 0 {
-                o.push_str(name);
+    /// Set (`on`) or clear MNT_* bits that need no other checks
+    pub fn mark(&self, bits: u32, on: bool) {
+        if on {
+            self.mnt_flags.fetch_or(bits, Ordering::SeqCst);
+        } else {
+            self.mnt_flags.fetch_and(!bits, Ordering::SeqCst);
+        }
+    }
+
+    /// This mount or its superblock is read-only (Linux
+    /// __mnt_is_readonly)
+    pub fn is_readonly(&self) -> bool {
+        self.flags() & MNT_READONLY != 0 || self.sb.rdonly()
+    }
+
+    /// Write access through this mount (Linux mnt_want_write): EROFS
+    /// for a read-only mount or superblock; hold the guard across the
+    /// modification
+    pub fn want_write(self: &Arc<Self>) -> Result<super::superblock::WriteAccess, KernelError> {
+        self.writers.fetch_add(1, Ordering::SeqCst);
+        if self.flags() & MNT_READONLY != 0 {
+            self.put_write();
+            return Err(KernelError::ReadOnlyFs);
+        }
+        match self.sb.want_write() {
+            Ok(w) => Ok(w.with_mnt(self.clone())),
+            Err(e) => {
+                self.put_write();
+                Err(e)
             }
         }
-        o
+    }
+
+    /// Release what want_write took
+    pub(super) fn put_write(&self) {
+        self.writers.fetch_sub(1, Ordering::SeqCst);
     }
 
     /// Increment mount reference count (like Linux mntget)
@@ -337,6 +380,70 @@ pub fn attach(
         mnt_ns.set_root(mount.clone());
     }
     Ok(mount)
+}
+
+/// A new mount of `m`'s filesystem rooted at `root`, with its flags
+/// and source (Linux clone_mnt); not attached
+pub fn clone_mnt(m: &Mount, root: Arc<Dentry>) -> Arc<Mount> {
+    Mount::new(
+        m.sb.clone(),
+        root,
+        m.flags() & !MNT_UNBINDABLE,
+        m.devname.clone(),
+    )
+}
+
+/// `m` at `root` with the mounts below `root` in it (Linux copy_tree):
+/// an unbindable submount is left out with whatever is under it
+pub fn copy_tree(m: &Arc<Mount>, root: &Arc<Dentry>) -> Arc<Mount> {
+    let top = clone_mnt(m, root.clone());
+    let mut todo = alloc::vec![(m.clone(), top.clone())];
+    while let Some((src, dst)) = todo.pop() {
+        let children: Vec<Arc<Mount>> = src.children.read().clone();
+        for c in children {
+            let Some(mp) = c.get_mountpoint() else {
+                continue;
+            };
+            let below = !Arc::ptr_eq(&src, m) || super::is_subdir(&mp, root);
+            if !below || c.flags() & MNT_UNBINDABLE != 0 {
+                continue;
+            }
+            let n = clone_mnt(&c, c.root.clone());
+            n.set_mountpoint(mp);
+            n.set_parent(&dst);
+            dst.add_child(n.clone());
+            todo.push((c, n));
+        }
+    }
+    top
+}
+
+/// Bind `old` (with its submounts if `rec`) on `mp` (Linux do_loopback
+/// and graft_tree): an unbindable source is EINVAL; a directory goes
+/// only on a directory and a file on a file (ENOTDIR)
+pub fn do_loopback(old: &Path, mp: &Path, rec: bool) -> Result<(), KernelError> {
+    if old.mnt.flags() & MNT_UNBINDABLE != 0 {
+        return Err(KernelError::InvalidArgument);
+    }
+    let is_dir = |d: &Dentry| d.get_inode().is_some_and(|i| i.mode().is_dir());
+    if is_dir(&mp.dentry) != is_dir(&old.dentry) {
+        return Err(KernelError::NotDirectory);
+    }
+    let dir = mp.dentry.get_inode().ok_or(KernelError::NotFound)?;
+    let _dir_lock = dir.lock();
+    if dir.is_dead() {
+        return Err(KernelError::NotFound);
+    }
+    let _ns = NAMESPACE_SEM.write();
+    let m = if rec {
+        copy_tree(&old.mnt, &old.dentry)
+    } else {
+        clone_mnt(&old.mnt, old.dentry.clone())
+    };
+    m.set_mountpoint(mp.dentry.clone());
+    m.set_parent(&mp.mnt);
+    mp.mnt.add_child(m);
+    Ok(())
 }
 
 /// Mount a filesystem at a path string

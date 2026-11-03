@@ -237,7 +237,7 @@ fn open_acct_file(path: &[u8]) -> Result<Arc<File>, i64> {
 
     // Open for writing: hold write access (EROFS on a read-only fs)
     let w = match dentry.get_inode() {
-        Some(i) => Some(dac::want_write(&i).map_err(|e| e.sysret())?),
+        Some(_) => Some(mnt.want_write().map_err(|e| e.sysret())?),
         None => None,
     };
     // The filesystem's file operations, as an open(2) of it gets

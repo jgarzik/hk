@@ -8,7 +8,9 @@ use alloc::vec::Vec;
 
 use super::super::Path;
 use super::super::dentry::{d_path, dentry_path};
-use super::super::mount::{MNT_NODEV, MNT_NOEXEC, MNT_NOSUID, Mount, NAMESPACE_SEM};
+use super::super::mount::{
+    MNT_NODEV, MNT_NOEXEC, MNT_NOSUID, MNT_READONLY, MNT_UNBINDABLE, Mount, NAMESPACE_SEM,
+};
 use super::super::name::mangle;
 use super::get_tid_for_pid;
 use crate::task::Pid;
@@ -44,9 +46,10 @@ fn visible(pid: Pid) -> Vec<(Arc<Mount>, Vec<u8>)> {
         .collect()
 }
 
-/// The per-mount options: rw/ro, then nosuid/nodev/noexec
-fn mnt_opts(out: &mut Vec<u8>, m: &Mount) {
-    out.extend_from_slice(if m.sb.rdonly() { b"ro" } else { b"rw" });
+/// The per-mount options: rw/ro (`ro`: shown read-only), then
+/// nosuid/nodev/noexec
+fn mnt_opts(out: &mut Vec<u8>, m: &Mount, ro: bool) {
+    out.extend_from_slice(if ro { b"ro" } else { b"rw" });
     let f = m.flags();
     for (bit, name) in [
         (MNT_NOSUID, &b",nosuid"[..]),
@@ -70,7 +73,9 @@ pub fn show_mounts(pid: Pid) -> Vec<u8> {
         out.push(b' ');
         mangle(&mut out, m.sb.fs_type.name.as_bytes(), ESC_HASH);
         out.push(b' ');
-        mnt_opts(&mut out, &m);
+        // Read-only through the mount or its superblock (Linux
+        // __mnt_is_readonly)
+        mnt_opts(&mut out, &m, m.is_readonly());
         out.extend_from_slice(b" 0 0\n");
     }
     out
@@ -99,7 +104,11 @@ pub fn show_mountinfo(pid: Pid) -> Vec<u8> {
         out.push(b' ');
         mangle(&mut out, &mp, ESC);
         out.push(b' ');
-        mnt_opts(&mut out, &m);
+        // The mount's own read-only flag (Linux show_mountinfo)
+        mnt_opts(&mut out, &m, m.flags() & MNT_READONLY != 0);
+        if m.flags() & MNT_UNBINDABLE != 0 {
+            out.extend_from_slice(b" unbindable");
+        }
         out.extend_from_slice(b" - ");
         mangle(&mut out, m.sb.fs_type.name.as_bytes(), ESC_HASH);
         out.push(b' ');

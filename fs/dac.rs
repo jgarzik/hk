@@ -304,8 +304,9 @@ pub fn remove_privs(inode: &Inode) {
 
 /// chmod: owner or CAP_FOWNER; S_ISGID silently dropped unless the
 /// caller is in the file's group or has CAP_FSETID
-pub fn chmod(inode: &Inode, perm: u16) -> Result<(), KernelError> {
-    let _w = want_write(inode)?;
+pub fn chmod(p: &super::Path, perm: u16) -> Result<(), KernelError> {
+    let inode = &*p.dentry.get_inode().ok_or(KernelError::NotFound)?;
+    let _w = p.mnt.want_write()?;
     inode.i_op.setattr_ok(inode)?;
     let c = cred();
     if !owner_or_capable(&c, inode) {
@@ -334,8 +335,9 @@ fn chgrp_ok(c: &Cred, inode: &Inode, gid: Gid) -> bool {
 /// chown_common + notify_change: permission per id, then for
 /// non-directories S_ISUID is always cleared and S_ISGID when
 /// group-executable or the caller could not keep it (even for root)
-pub fn chown(inode: &Inode, uid: Option<Uid>, gid: Option<Gid>) -> Result<(), KernelError> {
-    let _w = want_write(inode)?;
+pub fn chown(p: &super::Path, uid: Option<Uid>, gid: Option<Gid>) -> Result<(), KernelError> {
+    let inode = &*p.dentry.get_inode().ok_or(KernelError::NotFound)?;
+    let _w = p.mnt.want_write()?;
     inode.i_op.setattr_ok(inode)?;
     let c = cred();
     if uid.is_some_and(|u| !chown_ok(&c, inode, u)) || gid.is_some_and(|g| !chgrp_ok(&c, inode, g))

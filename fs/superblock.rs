@@ -195,19 +195,35 @@ pub const SB_RDONLY: u32 = 1;
 /// Write access to a file system (from `SuperBlock::want_write`),
 /// released on drop (Linux mnt_drop_write); `none()` for objects without
 /// a superblock
-pub struct WriteAccess(Option<Arc<SuperBlock>>);
+pub struct WriteAccess {
+    sb: Option<Arc<SuperBlock>>,
+    /// The mount's write access too (Linux mnt_want_write on a path)
+    mnt: Option<Arc<super::mount::Mount>>,
+}
 
 impl WriteAccess {
     /// No file system to hold
     pub const fn none() -> Self {
-        Self(None)
+        Self {
+            sb: None,
+            mnt: None,
+        }
+    }
+
+    /// Also hold `mnt`'s write count (taken by the caller)
+    pub(super) fn with_mnt(mut self, mnt: Arc<super::mount::Mount>) -> Self {
+        self.mnt = Some(mnt);
+        self
     }
 }
 
 impl Drop for WriteAccess {
     fn drop(&mut self) {
-        if let Some(sb) = &self.0 {
+        if let Some(sb) = &self.sb {
             sb.s_writers.fetch_sub(1, Ordering::SeqCst);
+        }
+        if let Some(m) = &self.mnt {
+            m.put_write();
         }
     }
 }
@@ -329,7 +345,10 @@ impl SuperBlock {
             self.s_writers.fetch_sub(1, Ordering::SeqCst);
             return Err(KernelError::ReadOnlyFs);
         }
-        Ok(WriteAccess(Some(self.clone())))
+        Ok(WriteAccess {
+            sb: Some(self.clone()),
+            mnt: None,
+        })
     }
 
     /// Make the file system read-only (Linux sb_prepare_remount_readonly

@@ -409,6 +409,16 @@ impl File {
         }
     }
 
+    /// Write access to what the file is on, through its mount (Linux
+    /// mnt_want_write_file); an internal file only checks its superblock
+    pub fn want_write(&self) -> Result<super::superblock::WriteAccess, KernelError> {
+        match (&self.mnt, self.dentry.get_inode()) {
+            (Some(m), _) => m.want_write(),
+            (None, Some(i)) => super::dac::want_write(&i),
+            (None, None) => Ok(super::superblock::WriteAccess::none()),
+        }
+    }
+
     /// Create a new file on `dentry` in mount `mnt` (None: an internal
     /// object), counted in the mount's mnt_count (mntget) so it cannot
     /// be unmounted while this file is open

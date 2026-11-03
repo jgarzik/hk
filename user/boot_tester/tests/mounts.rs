@@ -4,12 +4,19 @@
 //! mounts are ramfs on both kernels.
 
 use super::helpers::{print, print_num, println};
-use hk_syscall::{CLONE_NEWNS, O_CREAT, O_WRONLY, Stat, sys_chdir, sys_close, sys_exit, sys_fork, sys_getcwd, sys_link, sys_mkdir, sys_mount, sys_open, sys_readlink, sys_rename, sys_rmdir, sys_stat, sys_umount2, sys_unlink, sys_unshare, sys_wait4};
+use hk_syscall::{CLONE_NEWNS, O_CREAT, O_WRONLY, Stat, sys_faccessat, sys_chdir, sys_close, sys_exit, sys_fork, sys_getcwd, sys_link, sys_mkdir, sys_mount, sys_open, sys_readlink, sys_rename, sys_rmdir, sys_stat, sys_umount2, sys_unlink, sys_unshare, sys_wait4};
 
 const ENOENT: i64 = -2;
 const EBUSY: i64 = -16;
 const EXDEV: i64 = -18;
+const ENOTDIR: i64 = -20;
 const EINVAL: i64 = -22;
+const EROFS: i64 = -30;
+const MS_RDONLY: u64 = 1;
+const MS_REMOUNT: u64 = 32;
+const MS_BIND: u64 = 4096;
+const MS_REC: u64 = 1 << 14;
+const MS_UNBINDABLE: u64 = 1 << 17;
 
 pub fn run_tests() {
     sys_mkdir(b"/tmp\0".as_ptr(), 0o1777); // hk boots without /tmp
@@ -21,6 +28,10 @@ pub fn run_tests() {
     report(b"GETCWD_IN_MOUNT", getcwd_in_mount());
     report(b"MOUNT_NESTED_BUSY", nested_busy());
     report(b"EXDEV_SAME_SB", exdev_same_sb());
+    report(b"BIND_VIEW", bind_view());
+    report(b"RBIND", rbind());
+    report(b"BIND_RO_REMOUNT", bind_ro());
+    report(b"BIND_UNBINDABLE", bind_unbindable());
 }
 
 type R = Result<(), (&'static [u8], i64)>;
@@ -332,5 +343,134 @@ fn exdev_same_sb() -> R {
     sys_umount2(b.as_ptr(), 0);
     sys_rmdir(a.as_ptr());
     sys_rmdir(b.as_ptr());
+    r
+}
+
+fn bind(src: &[u8], dst: &[u8], extra: u64) -> i64 {
+    sys_mount(src.as_ptr(), dst.as_ptr(), core::ptr::null(), MS_BIND | extra, 0)
+}
+
+/// A bind mount shows the source directory (or file) at the target:
+/// same inodes both ways, the source's path as its mountinfo root, a
+/// directory only on a directory (ENOTDIR), EXDEV between the two
+fn bind_view() -> R {
+    for p in [&b"/tmp/bs\0"[..], b"/tmp/bs/sub\0", b"/tmp/bt\0"] {
+        sys_mkdir(p.as_ptr(), 0o755);
+    }
+    touch(b"/tmp/bs/sub/f\0");
+    touch(b"/tmp/bfile\0");
+    touch(b"/tmp/btgt\0");
+    let r = (|| {
+        check(b"bind", bind(b"/tmp/bs/sub\0", b"/tmp/bt\0", 0) == 0, -1)?;
+        let a = id(b"/tmp/bs/sub/f\0").map_err(|e| (&b"stat src"[..], e))?;
+        check(b"same inode", id(b"/tmp/bt/f\0") == Ok(a), -1)?;
+        check(b"create through", touch(b"/tmp/bt/g\0") >= 0, -1)?;
+        check(b"seen at source", id(b"/tmp/bs/sub/g\0").is_ok(), -1)?;
+        let r = sys_rename(b"/tmp/bt/g\0".as_ptr(), b"/tmp/bs/sub/g2\0".as_ptr());
+        check(b"rename across", r == EXDEV, r)?;
+        let mut buf = [0u8; 8192];
+        let n = super::mountinfo::slurp_pub(b"/proc/self/mountinfo\0", &mut buf);
+        let root_ok = buf[..n]
+            .split(|&c| c == b'\n')
+            .find(|l| l.split(|&c| c == b' ').nth(4) == Some(b"/tmp/bt"))
+            .is_some_and(|l| l.split(|&c| c == b' ').nth(3) == Some(b"/tmp/bs/sub"));
+        check(b"mountinfo root", root_ok, n as i64)?;
+        check(b"file on file", bind(b"/tmp/bfile\0", b"/tmp/btgt\0", 0) == 0, -1)?;
+        let r = bind(b"/tmp/bs\0", b"/tmp/bfile\0", 0);
+        check(b"dir on file", r == ENOTDIR, r)
+    })();
+    sys_umount2(b"/tmp/btgt\0".as_ptr(), 0);
+    sys_umount2(b"/tmp/bt\0".as_ptr(), 0);
+    for p in [&b"/tmp/bs/sub/f\0"[..], b"/tmp/bs/sub/g\0", b"/tmp/bfile\0", b"/tmp/btgt\0"] {
+        sys_unlink(p.as_ptr());
+    }
+    for p in [&b"/tmp/bs/sub\0"[..], b"/tmp/bs\0", b"/tmp/bt\0"] {
+        sys_rmdir(p.as_ptr());
+    }
+    r
+}
+
+/// MS_BIND copies one mount; MS_BIND|MS_REC the mounts below it too
+fn rbind() -> R {
+    for p in [&b"/tmp/rb_s\0"[..], b"/tmp/rb_s/m\0", b"/tmp/rb_t\0", b"/tmp/rb_u\0"] {
+        sys_mkdir(p.as_ptr(), 0o755);
+    }
+    let r = (|| {
+        check(b"mount", ramfs(b"/tmp/rb_s/m\0") == 0, -1)?;
+        check(b"touch", touch(b"/tmp/rb_s/m/x\0") >= 0, -1)?;
+        check(b"bind", bind(b"/tmp/rb_s\0", b"/tmp/rb_t\0", 0) == 0, -1)?;
+        check(b"bind: not below", dev(b"/tmp/rb_t/m/x\0") == Err(ENOENT), -1)?;
+        check(b"rbind", bind(b"/tmp/rb_s\0", b"/tmp/rb_u\0", MS_REC) == 0, -1)?;
+        check(b"rbind: below", dev(b"/tmp/rb_u/m/x\0").is_ok(), -1)
+    })();
+    for p in [&b"/tmp/rb_u/m\0"[..], b"/tmp/rb_u\0", b"/tmp/rb_t\0"] {
+        sys_umount2(p.as_ptr(), 0);
+    }
+    sys_unlink(b"/tmp/rb_s/m/x\0".as_ptr());
+    sys_umount2(b"/tmp/rb_s/m\0".as_ptr(), 0);
+    for p in [&b"/tmp/rb_s/m\0"[..], b"/tmp/rb_s\0", b"/tmp/rb_t\0", b"/tmp/rb_u\0"] {
+        sys_rmdir(p.as_ptr());
+    }
+    r
+}
+
+/// MS_REMOUNT|MS_BIND|MS_RDONLY makes one mount read-only, not its
+/// filesystem; EBUSY while a file is open for writing through it
+fn bind_ro() -> R {
+    for p in [&b"/tmp/ro_s\0"[..], b"/tmp/ro_t\0"] {
+        sys_mkdir(p.as_ptr(), 0o755);
+    }
+    touch(b"/tmp/ro_s/f\0");
+    let r = (|| {
+        check(b"bind", bind(b"/tmp/ro_s\0", b"/tmp/ro_t\0", 0) == 0, -1)?;
+        let fd = sys_open(b"/tmp/ro_t/f\0".as_ptr(), O_WRONLY, 0);
+        check(b"open w", fd >= 0, fd)?;
+        let r = bind(b"none\0", b"/tmp/ro_t\0", MS_REMOUNT | MS_RDONLY);
+        sys_close(fd as u64);
+        check(b"busy", r == -16, r)?;
+        let r = bind(b"none\0", b"/tmp/ro_t\0", MS_REMOUNT | MS_RDONLY);
+        check(b"remount ro", r == 0, r)?;
+        let r = touch(b"/tmp/ro_t/h\0");
+        check(b"create via ro", r == EROFS, r)?;
+        let r = sys_faccessat(-100, b"/tmp/ro_t/f\0".as_ptr(), 2);
+        check(b"access W_OK", r == EROFS, r)?;
+        check(b"source still rw", touch(b"/tmp/ro_s/h\0") >= 0, -1)?;
+        let r = bind(b"none\0", b"/tmp/ro_t\0", MS_REMOUNT);
+        check(b"remount rw", r == 0, r)?;
+        let r = touch(b"/tmp/ro_t/h2\0");
+        check(b"create via rw", r >= 0, r)
+    })();
+    sys_umount2(b"/tmp/ro_t\0".as_ptr(), 0);
+    for p in [&b"/tmp/ro_s/f\0"[..], b"/tmp/ro_s/h\0", b"/tmp/ro_s/h2\0"] {
+        sys_unlink(p.as_ptr());
+    }
+    for p in [&b"/tmp/ro_s\0"[..], b"/tmp/ro_t\0"] {
+        sys_rmdir(p.as_ptr());
+    }
+    r
+}
+
+/// An unbindable mount cannot be bound (EINVAL) and is left out of an
+/// rbind of a tree holding it
+fn bind_unbindable() -> R {
+    for p in [&b"/tmp/ubp\0"[..], b"/tmp/ubp/u\0", b"/tmp/ubq\0", b"/tmp/ub2\0"] {
+        sys_mkdir(p.as_ptr(), 0o755);
+    }
+    let r = (|| {
+        check(b"mount", ramfs(b"/tmp/ubp/u\0") == 0, -1)?;
+        let r = sys_mount(core::ptr::null(), b"/tmp/ubp/u\0".as_ptr(), core::ptr::null(), MS_UNBINDABLE, 0);
+        check(b"make unbindable", r == 0, r)?;
+        let r = bind(b"/tmp/ubp/u\0", b"/tmp/ub2\0", 0);
+        check(b"bind it", r == EINVAL, r)?;
+        check(b"rbind parent", bind(b"/tmp/ubp\0", b"/tmp/ubq\0", MS_REC) == 0, -1)?;
+        let top = dev(b"/tmp/ubq\0").map_err(|e| (&b"stat"[..], e))?;
+        check(b"left out", dev(b"/tmp/ubq/u\0") == Ok(top), -1)
+    })();
+    sys_umount2(b"/tmp/ubq\0".as_ptr(), 0);
+    sys_umount2(b"/tmp/ub2\0".as_ptr(), 0);
+    sys_umount2(b"/tmp/ubp/u\0".as_ptr(), 0);
+    for p in [&b"/tmp/ubp/u\0"[..], b"/tmp/ubp\0", b"/tmp/ubq\0", b"/tmp/ub2\0"] {
+        sys_rmdir(p.as_ptr());
+    }
     r
 }

@@ -21,6 +21,7 @@ use crate::task::FD_CLOEXEC;
 /// write+search on the parent, the mode gets the umask and SGID
 /// stripping, the owner comes from init_owner
 fn create_in(
+    mnt: &Arc<super::mount::Mount>,
     parent: &Arc<Dentry>,
     name: &[u8],
     mode: u32,
@@ -31,7 +32,7 @@ fn create_in(
     }
     let c = dac::cred();
     // lookup_open: write access is needed only to create
-    let w = dac::want_write(&dir);
+    let w = mnt.want_write();
     let _dir_lock = dir.lock();
     (|| {
         if let Ok(d) = lookup_one(parent, name) {
@@ -84,7 +85,7 @@ fn open_target(
     let (d, created) = match path_lookupat(Some(dir), &p.name, lf) {
         Ok(d) => (d, false),
         Err(KernelError::NotFound) => {
-            let (d, c) = create_in(&p.dir, &p.name, mode)?;
+            let (d, c) = create_in(&p.mnt, &p.dir, &p.name, mode)?;
             (Path::new(p.mnt.clone(), d), c)
         }
         Err(e) => return Err(e),
@@ -159,7 +160,7 @@ fn filp_open(dirfd: i32, path: &[u8], flags: u32, mode: u32) -> Result<Arc<File>
     // (Linux FMODE_WRITER); O_TRUNC needs it too (handle_truncate)
     let writer = flags & O_ACCMODE != O_RDONLY || flags & O_TRUNC != 0;
     let w = if writer && inode.mode().is_file() {
-        Some(dac::want_write(&inode)?)
+        Some(path.mnt.want_write()?)
     } else {
         None
     };

@@ -266,7 +266,7 @@ pub fn create_entry(
     }
     let c = cred();
     // filename_create: write access first, its EROFS reported after EEXIST
-    let w = super::dac::want_write(&dir);
+    let w = p.mnt.want_write();
     let _dir_lock = dir.lock();
     (|| {
         if lookup_one(parent, name).is_ok() {
@@ -291,7 +291,7 @@ pub fn create_entry(
 pub fn delete_entry(p: &Parent, isdir: bool) -> Result<(), KernelError> {
     let (parent, name) = (&p.dir, p.name.as_slice());
     let dir = parent.get_inode().ok_or(KernelError::NotFound)?;
-    let _w = super::dac::want_write(&dir)?;
+    let _w = p.mnt.want_write()?;
     let c = cred();
     let _dir_lock = dir.lock();
     (|| {

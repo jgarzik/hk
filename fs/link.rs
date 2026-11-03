@@ -387,7 +387,7 @@ fn do_renameat2(
     }
     let odir = old.dir.get_inode().ok_or(KernelError::NotFound)?;
     let ndir = new.dir.get_inode().ok_or(KernelError::NotFound)?;
-    let _w = super::dac::want_write(&odir)?;
+    let _w = old.mnt.want_write()?;
     let _locks = lock_rename(&old.dir, &new.dir);
     rename_locked((&old, &odir), (&new, &ndir), flags)
 }

@@ -35,6 +35,7 @@ mod ms {
     pub const NODEV: u64 = 4;
     pub const NOEXEC: u64 = 8;
     pub const REMOUNT: u64 = 32;
+    pub const BIND: u64 = 4096;
     pub const MANDLOCK: u64 = 64;
     pub const NOATIME: u64 = 1 << 10;
     pub const NODIRATIME: u64 = 1 << 11;
@@ -52,11 +53,12 @@ mod ms {
     pub const MGC_MSK: u64 = 0xffff_0000;
 
     /// Flags hk honors, or may accept without effect because hk
-    /// already behaves that way (no atime updates, every mount private
-    /// and unbindable, no mandatory locks); everything else (MS_BIND,
-    /// MS_MOVE, MS_SHARED, MS_SLAVE, MS_SYNCHRONOUS, MS_DIRSYNC,
-    /// MS_NOSYMFOLLOW, ...) is EINVAL instead of being ignored
+    /// already behaves that way (no atime updates, every mount private,
+    /// no mandatory locks); everything else (MS_MOVE, MS_SHARED,
+    /// MS_SLAVE, MS_SYNCHRONOUS, MS_DIRSYNC, MS_NOSYMFOLLOW, ...) is
+    /// EINVAL instead of being ignored
     pub const KNOWN: u64 = RDONLY
+        | BIND
         | NOSUID
         | NODEV
         | NOEXEC
@@ -77,8 +79,11 @@ mod ms {
 
 /// Per-mount MNT_* flags of mount(2) flags
 fn mnt_flags(flags: u64) -> u32 {
-    use super::mount::{MNT_NODEV, MNT_NOEXEC, MNT_NOSUID};
+    use super::mount::{MNT_NODEV, MNT_NOEXEC, MNT_NOSUID, MNT_READONLY};
     let mut f = 0;
+    if flags & ms::RDONLY != 0 {
+        f |= MNT_READONLY;
+    }
     if flags & ms::NOSUID != 0 {
         f |= MNT_NOSUID;
     }
@@ -102,7 +107,29 @@ fn remount(m: &Arc<super::mount::Mount>, flags: u64) -> Result<(), KernelError> 
     } else {
         m.sb.make_rdwr();
     }
-    m.set_flags(mnt_flags(flags));
+    m.set_flags(mnt_flags(flags))
+}
+
+/// MS_REMOUNT|MS_BIND (Linux do_reconfigure_mnt): this mount's flags
+/// only, read-only included; the superblock is untouched
+fn reconfigure_mnt(m: &Arc<super::mount::Mount>, flags: u64) -> Result<(), KernelError> {
+    let _s = m.sb.s_umount.write();
+    m.set_flags(mnt_flags(flags))
+}
+
+/// MS_UNBINDABLE / MS_PRIVATE (Linux do_change_type): unbindable or
+/// not, for the subtree with MS_REC
+fn change_type(m: &Arc<super::mount::Mount>, flags: u64) -> Result<(), KernelError> {
+    use super::mount::{MNT_UNBINDABLE, NAMESPACE_SEM};
+    let _ns = NAMESPACE_SEM.write();
+    let on = flags & ms::UNBINDABLE != 0;
+    let mut todo = alloc::vec![m.clone()];
+    while let Some(c) = todo.pop() {
+        c.mark(MNT_UNBINDABLE, on);
+        if flags & ms::REC != 0 {
+            todo.extend(c.children.read().iter().cloned());
+        }
+    }
     Ok(())
 }
 
@@ -160,7 +187,12 @@ fn path_mount(
         Default::default()
     };
     let target = crate::fs::namei::getname(target_ptr, false)?;
-    let mp = crate::fs::namei::path_lookupat(None, &target, LookupFlags::opendir())?;
+    // A mount may cover a file (bind): the target is only followed
+    let mp = crate::fs::namei::path_lookupat(
+        crate::task::percpu::current_cwd(),
+        &target,
+        LookupFlags::open(),
+    )?;
 
     if flags & ms::MGC_MSK == ms::MGC_VAL {
         flags &= !ms::MGC_MSK;
@@ -174,11 +206,26 @@ fn path_mount(
     if flags & !ms::KNOWN != 0 {
         return Err(KernelError::InvalidArgument);
     }
+    // Linux path_mount's order
+    if flags & (ms::REMOUNT | ms::BIND) == ms::REMOUNT | ms::BIND {
+        return reconfigure_mnt(&mount_at(&mp)?, flags);
+    }
     if flags & ms::REMOUNT != 0 {
         return remount(&mount_at(&mp)?, flags);
     }
+    if flags & ms::BIND != 0 {
+        let old = crate::fs::namei::path_lookupat(
+            crate::task::percpu::current_cwd(),
+            &source,
+            LookupFlags::open(),
+        );
+        if source.is_empty() {
+            return Err(KernelError::NotFound);
+        }
+        return super::mount::do_loopback(&old?, &mp, flags & ms::REC != 0);
+    }
     if flags & (ms::PRIVATE | ms::UNBINDABLE) != 0 {
-        return mount_at(&mp).map(|_| ());
+        return change_type(&mount_at(&mp)?, flags);
     }
     new_mount(&source, &fstype, mp, flags)
 }
@@ -626,10 +673,15 @@ fn do_setxattr(
         }
     };
 
-    let dentry = match lookup_path_flags(&path, lookup_flags) {
-        Ok(d) => d,
+    let fpath = match crate::fs::namei::path_lookupat(
+        crate::task::percpu::current_cwd(),
+        &path,
+        lookup_flags,
+    ) {
+        Ok(p) => p,
         Err(e) => return e.sysret(),
     };
+    let dentry = fpath.dentry.clone();
 
     let inode = match dentry.get_inode() {
         Some(i) => i,
@@ -637,7 +689,7 @@ fn do_setxattr(
     };
 
     // setxattr/removexattr: write access first (EROFS), held across
-    let _w = match super::dac::want_write(&inode) {
+    let _w = match fpath.mnt.want_write() {
         Ok(w) => w,
         Err(e) => return e.sysret(),
     };
@@ -688,7 +740,7 @@ pub fn sys_fsetxattr(fd: i32, name_ptr: u64, value_ptr: u64, size: u64, flags: i
     };
 
     // setxattr/removexattr: write access first (EROFS), held across
-    let _w = match super::dac::want_write(&inode) {
+    let _w = match file.want_write() {
         Ok(w) => w,
         Err(e) => return e.sysret(),
     };
@@ -1040,10 +1092,15 @@ fn do_removexattr(path_ptr: u64, name_ptr: u64, follow_symlinks: bool) -> i64 {
         }
     };
 
-    let dentry = match lookup_path_flags(&path, lookup_flags) {
-        Ok(d) => d,
+    let fpath = match crate::fs::namei::path_lookupat(
+        crate::task::percpu::current_cwd(),
+        &path,
+        lookup_flags,
+    ) {
+        Ok(p) => p,
         Err(e) => return e.sysret(),
     };
+    let dentry = fpath.dentry.clone();
 
     let inode = match dentry.get_inode() {
         Some(i) => i,
@@ -1051,7 +1108,7 @@ fn do_removexattr(path_ptr: u64, name_ptr: u64, follow_symlinks: bool) -> i64 {
     };
 
     // setxattr/removexattr: write access first (EROFS), held across
-    let _w = match super::dac::want_write(&inode) {
+    let _w = match fpath.mnt.want_write() {
         Ok(w) => w,
         Err(e) => return e.sysret(),
     };
@@ -1091,7 +1148,7 @@ pub fn sys_fremovexattr(fd: i32, name_ptr: u64) -> i64 {
     };
 
     // setxattr/removexattr: write access first (EROFS), held across
-    let _w = match super::dac::want_write(&inode) {
+    let _w = match file.want_write() {
         Ok(w) => w,
         Err(e) => return e.sysret(),
     };
