@@ -5,7 +5,7 @@
 //!
 //! Reference: include/uapi/asm-generic/ioctls.h
 
-use super::termios::{N_TTY, Termios, Winsize};
+use super::termios::{CLOCAL, N_TTY, Termios, Winsize};
 use super::{Tty, jobctrl};
 use crate::arch::Uaccess;
 use crate::fs::File;
@@ -59,6 +59,12 @@ pub const TIOCGWINSZ: u32 = 0x5413;
 pub const TIOCSWINSZ: u32 = 0x5414;
 /// Get modem bits
 pub const TIOCMGET: u32 = 0x5415;
+/// Modem lines (TIOCMGET bits)
+const TIOCM_DTR: i32 = 0x002;
+const TIOCM_RTS: i32 = 0x004;
+const TIOCM_CTS: i32 = 0x020;
+const TIOCM_CAR: i32 = 0x040;
+const TIOCM_DSR: i32 = 0x100;
 /// Set modem bits
 pub const TIOCMBIS: u32 = 0x5416;
 /// Clear modem bits
@@ -184,7 +190,25 @@ pub fn tty_ioctl(tty: &Tty, file: &File, cmd: u32, arg: u64) -> Result<i64, Kern
             Ok(0)
         }
         TIOCSBRK | TIOCCBRK | TCXONC | TIOCEXCL | TIOCNXCL => Ok(0),
-        TIOCMGET | TIOCMBIS | TIOCMBIC | TIOCMSET | TIOCGSOFTCAR | TIOCSSOFTCAR => Ok(0),
+        // No modem control: the lines read as asserted, sets are ignored
+        TIOCMGET => put(
+            arg,
+            TIOCM_DTR | TIOCM_RTS | TIOCM_CTS | TIOCM_CAR | TIOCM_DSR,
+        ),
+        TIOCMBIS | TIOCMBIC | TIOCMSET => get::<i32>(arg).map(|_| 0),
+        // Soft carrier is CLOCAL (Linux tty_change_softcar)
+        TIOCGSOFTCAR => put(arg, i32::from(tty.get_termios().c_cflag & CLOCAL != 0)),
+        TIOCSSOFTCAR => {
+            let on = get::<i32>(arg)? != 0;
+            let mut t = tty.get_termios();
+            t.c_cflag = if on {
+                t.c_cflag | CLOCAL
+            } else {
+                t.c_cflag & !CLOCAL
+            };
+            tty.set_termios(t);
+            Ok(0)
+        }
         _ => Err(KernelError::NotTty),
     }
 }
