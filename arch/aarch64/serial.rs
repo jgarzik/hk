@@ -273,3 +273,35 @@ macro_rules! early_println {
         $crate::early_print!("\n");
     }};
 }
+
+/// The PL011 driver (Linux amba-pl011 "uart-pl011"): the UART is set up
+/// at boot; probing makes its tty a console and takes input by IRQ
+pub static PL011_DRIVER: crate::base::Driver = crate::base::Driver::new(
+    "uart-pl011",
+    &crate::base::platform::PLATFORM_BUS,
+    None,
+    crate::base::Ids::Names(&["arm,pl011"]),
+    pl011_probe,
+);
+
+/// A bound PL011: its tty device
+struct Pl011Port {
+    _tty: Option<alloc::sync::Arc<crate::base::Device>>,
+}
+
+impl crate::base::Bound for Pl011Port {
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+}
+
+fn pl011_probe(
+    dev: &alloc::sync::Arc<crate::base::Device>,
+) -> Result<alloc::boxed::Box<dyn crate::base::Bound>, crate::util::error::KernelError> {
+    register_console();
+    if let Some(irq) = crate::base::platform::pdev(dev).and_then(|p| p.irq) {
+        rx_irq_init(irq);
+    }
+    let tty = crate::tty::tty_register_device(&TTY_AMA0, dev);
+    Ok(alloc::boxed::Box::new(Pl011Port { _tty: tty }))
+}

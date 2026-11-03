@@ -55,3 +55,26 @@ pub fn set_rtc(seconds_since_epoch: u32) {
         ptr::write_volatile((PL031_BASE + RTCLR) as *mut u32, seconds_since_epoch);
     }
 }
+
+/// The PL031 driver (Linux rtc-pl031); the RTC is set up at boot
+pub static PL031_DRIVER: crate::base::Driver = crate::base::Driver::new(
+    "rtc-pl031",
+    &crate::base::platform::PLATFORM_BUS,
+    None,
+    crate::base::Ids::Names(&["arm,pl031"]),
+    pl031_probe,
+);
+
+struct Pl031;
+
+impl crate::base::Bound for Pl031 {
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+}
+
+fn pl031_probe(
+    _dev: &alloc::sync::Arc<crate::base::Device>,
+) -> Result<alloc::boxed::Box<dyn crate::base::Bound>, crate::util::error::KernelError> {
+    Ok(alloc::boxed::Box::new(Pl031))
+}

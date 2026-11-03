@@ -304,6 +304,9 @@ immutable/append-only inodes (no IS_APPEND/IS_IMMUTABLE EPERM).
 - NETLINK_KOBJECT_UEVENT has no kernel input: messages a
   CAP_SYS_ADMIN sender addresses to port 0 are not rebroadcast (Linux
   uevent_net_rcv, used by container managers).
+- Network namespaces have no owning user namespace, so uevents go to
+  every namespace; Linux sends untagged events only into namespaces
+  owned by the initial user namespace (uevent_sock_list).
 
 ## TTY gaps
 

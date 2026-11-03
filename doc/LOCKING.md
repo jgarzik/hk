@@ -1730,8 +1730,15 @@ at a time, with no RENAME_LOCK held (d_move drops it first).
 | `KNode.children`, `.name`, `.parent` | spin RwLock, leaves | alone (lookup, readdir under the walk's i_rwsem) or under KERNFS_RWSEM |
 | `OpenAttr.buf` | sync::Mutex (Linux kernfs_open_file.mutex), per open file | held across show()/store(), which take subsystem locks; under f_pos_lock for read/write |
 
-Device model (base/): `Class.devices` (spin Mutex, leaf; Linux
-klist_devices) is taken alone, after the device's sysfs entries exist.
+Device model (base/): `Device.lock` (sync::Mutex, Linux device_lock)
+is held across a driver's probe and the release of its binding; a
+probe may register child devices (their sysfs entries, uevents and
+probes), so a parent's lock is taken before its children's, never the
+reverse. `Device.driver` (spin RwLock) and `Device.bound` (spin Mutex)
+are leaves read without the device lock. `Class.devices`,
+`BusType.{devices,drivers}` (Linux klist_devices/klist_drivers) and
+`core::DEVICES_LIST` (Linux devices_kset list) are spin leaves taken
+alone; lists are snapshotted before probing walks them.
 
 uevents (base/uevent.rs) broadcast with `ns::net::NET_NAMESPACE_LIST`
 (spin Mutex, leaf; Linux net_namespace_list) taken only to snapshot

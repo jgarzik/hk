@@ -17,7 +17,6 @@ pub mod acpi;
 pub mod barrier;
 pub mod context;
 pub mod cpu;
-pub mod drivers;
 pub mod entry;
 pub mod fpu;
 pub mod interrupts;
@@ -383,8 +382,17 @@ impl PowerOps for X86_64Arch {
 }
 
 impl ArchBusOps for X86_64Arch {
-    fn arch_bus_init(bus_manager: &mut crate::bus::BusManager) {
-        arch_init(bus_manager);
+    /// The legacy 8250 ports (Linux serial8250 platform device; the
+    /// PIC and PIT are set up at boot, not devices)
+    fn platform_init() {
+        use crate::base::platform::{PlatformDevice, platform_device_register};
+        let _ = platform_device_register(PlatformDevice {
+            name: "serial8250",
+            compatible: &[],
+            base: Some(0x3f8),
+            irq: Some(4),
+        });
+        crate::hw::serial::SERIAL8250_DRIVER.register();
     }
 }
 
@@ -485,26 +493,4 @@ pub fn early_init() {
 
     // Enable timer interrupt
     pic::enable_irq(0);
-}
-
-/// Architecture-specific bus/driver initialization
-///
-/// Called after BusManager is created. Registers the platform bus with
-/// x86-64 specific devices and their drivers.
-pub fn arch_init(bus_manager: &mut crate::bus::BusManager) {
-    use crate::bus::{PlatformBus, PlatformDevice};
-    use alloc::boxed::Box;
-    use alloc::vec;
-
-    // Create platform bus with x86-64 devices
-    let platform_bus = PlatformBus::new(vec![
-        PlatformDevice::new("intel,8259", Some(0x20), Some(0)), // PIC
-        PlatformDevice::new("intel,8254", Some(0x40), Some(0)), // PIT
-        PlatformDevice::new("ns16550a", Some(0x3F8), Some(4)),  // COM1
-    ]);
-
-    bus_manager.register_bus("platform", Box::new(platform_bus));
-
-    // Register x86-64 platform drivers
-    drivers::register_platform_drivers(bus_manager);
 }

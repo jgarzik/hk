@@ -329,3 +329,37 @@ pub fn serial_ttys() -> &'static [&'static Tty] {
     static TTYS: [&Tty; 2] = [&SERIAL_TTY_S0, &SERIAL_TTY_S1];
     &TTYS
 }
+
+/// The 8250 platform driver (Linux serial8250_isa_driver): its ports'
+/// ttys go below the device; COM1's input by interrupt
+pub static SERIAL8250_DRIVER: crate::base::Driver = crate::base::Driver::new(
+    "serial8250",
+    &crate::base::platform::PLATFORM_BUS,
+    None,
+    crate::base::Ids::Names(&["serial8250"]),
+    serial8250_probe,
+);
+
+/// A bound 8250 device: its ports' tty devices
+struct Serial8250 {
+    _ttys: alloc::vec::Vec<alloc::sync::Arc<crate::base::Device>>,
+}
+
+impl crate::base::Bound for Serial8250 {
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+}
+
+fn serial8250_probe(
+    dev: &alloc::sync::Arc<crate::base::Device>,
+) -> Result<alloc::boxed::Box<dyn crate::base::Bound>, crate::util::error::KernelError> {
+    if let Some(irq) = crate::base::platform::pdev(dev).and_then(|p| p.irq) {
+        rx_irq_init(irq);
+    }
+    let ttys = serial_ttys()
+        .iter()
+        .filter_map(|t| crate::tty::tty_register_device(t, dev))
+        .collect();
+    Ok(alloc::boxed::Box::new(Serial8250 { _ttys: ttys }))
+}

@@ -5,13 +5,16 @@
 //! device with a non-class parent sits in the parent's `<class>` glue
 //! directory (Linux get_device_parent). `device_add` creates its
 //! `uevent` and `dev` attributes, the `subsystem`/`device` links, the
-//! class link, `/sys/dev/{char,block}/M:m` and the devtmpfs node, then
-//! sends the "add" uevent; `del` sends "remove" first.
+//! class link, `/sys/dev/{char,block}/M:m` and the devtmpfs node, adds
+//! a bus device to its bus, sends the "add" uevent and probes it; `del`
+//! unbinds it and sends "remove" first.
 //!
 //! ## Locking
 //!
-//! Class device lists are spin leaves; sysfs changes take kernfs's
-//! locks (doc/LOCKING.md 3.3).
+//! `Device.lock` (sleeping Mutex, Linux device_lock) is held across
+//! probe and release; the driver and its state are spin leaves read
+//! without it. Bus, class and `DEVICES_LIST` are spin leaves; sysfs
+//! changes take kernfs's locks (doc/LOCKING.md 3.3).
 
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
@@ -20,11 +23,17 @@ use core::fmt::Write;
 
 use spin::Once;
 
+use core::any::Any;
+
+use super::bus::BusType;
 use super::class::Class;
+use super::driver::{Bound, Driver};
 use crate::fs::KernelError;
 use crate::fs::chardev::DevId;
 use crate::fs::kernfs::{self, Attr, KNode, SysBuf};
 use crate::fs::sysfs;
+use crate::sync::Mutex;
+use crate::sync::spin::{Mutex as SpinMutex, RwLock};
 
 static DEVICES: Once<Arc<KNode>> = Once::new();
 static DEV_CHAR: Once<Arc<KNode>> = Once::new();
@@ -66,24 +75,55 @@ pub struct DevNode {
     pub mode: u16,
 }
 
+/// Bus-specific data of a device (Linux: the structure embedding it)
+pub type DevData = Arc<dyn Any + Send + Sync>;
+
 /// What `device_create` registers
 pub struct DeviceInfo<'a> {
     pub name: String,
     pub parent: Option<&'a Arc<Device>>,
+    pub bus: Option<&'static BusType>,
     pub class: Option<&'static Class>,
     pub devt: Option<DevId>,
     /// DEVTYPE (Linux device_type.name)
     pub devtype: Option<&'static str>,
+    pub data: Option<DevData>,
 }
+
+impl DeviceInfo<'_> {
+    /// A device `name` with nothing else set
+    pub fn named(name: &str) -> Self {
+        Self {
+            name: name.into(),
+            parent: None,
+            bus: None,
+            class: None,
+            devt: None,
+            devtype: None,
+            data: None,
+        }
+    }
+}
+
+/// Every registered device, parents before children (Linux
+/// devices_kset list)
+static DEVICES_LIST: SpinMutex<Vec<Arc<Device>>> = SpinMutex::new(Vec::new());
 
 /// A device (Linux struct device)
 pub struct Device {
     name: String,
     parent: Option<Arc<Device>>,
+    pub bus: Option<&'static BusType>,
     pub class: Option<&'static Class>,
     pub devt: Option<DevId>,
     pub devtype: Option<&'static str>,
+    data: Option<DevData>,
     kobj: Once<Arc<KNode>>,
+    /// Linux device_lock
+    pub lock: Mutex<()>,
+    driver: RwLock<Option<&'static Driver>>,
+    /// The bound driver's state (Linux drvdata)
+    bound: SpinMutex<Option<Arc<dyn Bound>>>,
     me: Weak<Device>,
 }
 
@@ -141,9 +181,33 @@ impl Device {
         }
     }
 
-    /// SUBSYSTEM of its uevents: the class name (Linux dev_uevent_name)
+    /// SUBSYSTEM of its uevents: the bus, else the class (Linux
+    /// dev_uevent_name)
     pub fn subsystem(&self) -> Option<&'static str> {
-        self.class.map(|c| c.name)
+        self.bus.map(|b| b.name).or(self.class.map(|c| c.name))
+    }
+
+    /// The bus-specific data, if it is a `T`
+    pub fn data<T: 'static>(&self) -> Option<&T> {
+        self.data.as_ref()?.downcast_ref::<T>()
+    }
+
+    pub fn driver(&self) -> Option<&'static Driver> {
+        *self.driver.read()
+    }
+
+    pub(super) fn set_driver(&self, d: Option<&'static Driver>) {
+        *self.driver.write() = d;
+    }
+
+    /// Install or take the bound driver's state
+    pub(super) fn set_bound(&self, b: Option<Arc<dyn Bound>>) -> Option<Arc<dyn Bound>> {
+        core::mem::replace(&mut *self.bound.lock(), b)
+    }
+
+    /// The bound driver's state (Linux dev_get_drvdata)
+    pub fn drvdata(&self) -> Option<Arc<dyn Bound>> {
+        self.bound.lock().clone()
     }
 
     fn is_blk(&self) -> bool {
@@ -169,6 +233,12 @@ impl Device {
         }
         if let Some(t) = self.devtype {
             kv(format_args!("DEVTYPE={}", t));
+        }
+        if let Some(d) = self.driver() {
+            kv(format_args!("DRIVER={}", d.name));
+        }
+        if let Some(f) = self.bus.and_then(|b| b.uevent) {
+            f(self, &mut env);
         }
         env
     }
@@ -229,13 +299,26 @@ impl Device {
             let mode = if n.mode != 0 { n.mode } else { 0o600 };
             crate::fs::devtmpfs::device_add(&n.name, dt, self.is_blk(), mode);
         }
+        let me = self.me.upgrade().expect("device alive");
+        if let Some(b) = self.bus {
+            b.add_device(&me)?;
+        }
+        DEVICES_LIST.lock().push(me.clone());
         super::uevent::uevent(self, super::uevent::Action::Add);
+        if self.bus.is_some_and(|b| b.autoprobe()) {
+            super::dd::device_attach(&me);
+        }
         Ok(())
     }
 
-    /// Linux device_del: undo `device_add`
-    pub fn del(&self) {
+    /// Linux device_del: unbind, then undo `device_add`
+    pub fn del(self: &Arc<Self>) {
         let Some(dir) = self.kobj.get() else { return };
+        if let Some(b) = self.bus {
+            super::dd::device_release_driver(self);
+            b.remove_device(self);
+        }
+        DEVICES_LIST.lock().retain(|d| !Arc::ptr_eq(d, self));
         super::uevent::uevent(self, super::uevent::Action::Remove);
         if let Some(dt) = self.devt {
             crate::fs::devtmpfs::device_del(&self.devnode().name);
@@ -263,10 +346,15 @@ pub fn device_create(info: DeviceInfo) -> Result<Arc<Device>, KernelError> {
     let d = Arc::new_cyclic(|me| Device {
         name: info.name,
         parent: info.parent.cloned(),
+        bus: info.bus,
         class: info.class,
         devt: info.devt,
         devtype: info.devtype,
+        data: info.data,
         kobj: Once::new(),
+        lock: Mutex::new(()),
+        driver: RwLock::new(None),
+        bound: SpinMutex::new(None),
         me: me.clone(),
     });
     if let Err(e) = d.add() {
@@ -274,4 +362,18 @@ pub fn device_create(info: DeviceInfo) -> Result<Arc<Device>, KernelError> {
         return Err(e);
     }
     Ok(d)
+}
+
+/// Quiesce every bound device before power-off, restart or halt, the
+/// last registered first (Linux device_shutdown); runs once
+pub fn device_shutdown() {
+    let devs = core::mem::take(&mut *DEVICES_LIST.lock());
+    for d in devs.iter().rev() {
+        let b = d.bound.lock().clone();
+        if let Some(b) = b {
+            b.shutdown();
+        }
+    }
+    // The devices stay registered: the machine goes down next
+    core::mem::forget(devs);
 }

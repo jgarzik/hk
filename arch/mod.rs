@@ -774,17 +774,11 @@ pub trait PowerOps {
     fn power_enable() {}
 }
 
-/// Architecture-specific bus and driver initialization
-///
-/// Called after the bus manager is created to register platform-specific
-/// buses and drivers.
-#[allow(dead_code)]
+/// Architecture platform devices and their drivers
 pub trait ArchBusOps {
-    /// Initialize architecture-specific buses and drivers
-    ///
-    /// # Arguments
-    /// * `bus_manager` - The kernel's bus manager to register with
-    fn arch_bus_init(bus_manager: &mut crate::bus::BusManager);
+    /// Register the platform devices and drivers (Linux: board files,
+    /// DT platform population and the drivers' initcalls)
+    fn platform_init();
 }
 
 // ============================================================================

@@ -472,8 +472,8 @@ fn kmain() -> ! {
     // Create the bus manager
     let mut bus_manager = BusManager::new();
 
-    // Let architecture register its platform bus and drivers
-    CurrentArch::arch_bus_init(&mut bus_manager);
+    // The platform devices and their drivers
+    CurrentArch::platform_init();
 
     // Register PCI bus (root bus)
     bus_manager.register_bus("pci", Box::new(PciBus::new()));

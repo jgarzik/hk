@@ -39,24 +39,3 @@ pub trait Device: Send + Sync {
         None
     }
 }
-
-/// Interrupt controller device trait
-pub trait InterruptController: Device {
-    /// Enable an IRQ
-    fn enable_irq(&self, irq: u8);
-
-    /// Disable an IRQ
-    fn disable_irq(&self, irq: u8);
-
-    /// Send end-of-interrupt signal
-    fn send_eoi(&self, irq: u8);
-}
-
-/// Timer device trait
-pub trait Timer: Device {
-    /// Initialize the timer for periodic interrupts at the given frequency
-    fn init(&self, frequency_hz: u32);
-
-    /// Get the current tick count
-    fn ticks(&self) -> u64;
-}

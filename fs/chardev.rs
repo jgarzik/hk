@@ -377,11 +377,9 @@ pub fn register_builtin_chardevs() {
     MEM_CLASS.register();
     for (name, minor, _) in MEM_DEVS {
         let _ = device_create(DeviceInfo {
-            name: name.into(),
-            parent: None,
             class: Some(&MEM_CLASS),
             devt: Some(DevId::new(major::MEM, minor)),
-            devtype: None,
+            ..DeviceInfo::named(name)
         });
     }
 }

@@ -9,7 +9,7 @@ use hk_syscall::{
     sys_open, sys_read, sys_readlink, sys_stat, sys_statfs,
 };
 
-use super::helpers::{print, print_num, println, read_file};
+use super::helpers::{host_mode, print, print_num, println, read_file};
 use super::nl::{nladdr, recv_creds};
 
 const EACCES: i64 = -13;
@@ -24,6 +24,7 @@ pub fn run_tests() {
     test_basic();
     test_class_mem();
     test_uevent_synth();
+    test_bus_platform();
 }
 
 fn fail(name: &[u8], why: &[u8], v: i64) {
@@ -376,4 +377,115 @@ fn test_uevent_synth() {
         Ok(()) => ok(N),
         Err((why, v)) => fail(N, why, v),
     }
+}
+
+/// Up to 32 names of at most 63 bytes
+struct Names {
+    n: usize,
+    len: [u8; 32],
+    buf: [[u8; 63]; 32],
+}
+
+impl Names {
+    fn of(path: &[u8], want: u8) -> Self {
+        let mut s = Names {
+            n: 0,
+            len: [0; 32],
+            buf: [[0; 63]; 32],
+        };
+        each_entry(path, &mut |name, ty| {
+            if ty == want && s.n < 32 && name.len() < 63 {
+                s.buf[s.n][..name.len()].copy_from_slice(name);
+                s.len[s.n] = name.len() as u8;
+                s.n += 1;
+            }
+        });
+        s
+    }
+
+    fn get(&self, i: usize) -> &[u8] {
+        &self.buf[i][..self.len[i] as usize]
+    }
+}
+
+/// `parts` joined, NUL-terminated, in `buf`
+fn path<'a>(buf: &'a mut [u8; 256], parts: &[&[u8]]) -> &'a [u8] {
+    let mut n = 0;
+    for p in parts {
+        buf[n..n + p.len()].copy_from_slice(p);
+        n += p.len();
+    }
+    buf[n] = 0;
+    &buf[..=n]
+}
+
+fn mode_of(p: &[u8]) -> u32 {
+    stat(p).map_or(0, |st| st.st_mode)
+}
+
+const DT_LNK: u8 = 10;
+
+/// /sys/bus/platform: bus files, driver bind/unbind, and each bound
+/// device's driver link and DRIVER/MODALIAS uevent variables
+fn test_bus_platform() {
+    const N: &[u8] = b"SYSFS_BUS_PLATFORM";
+    let base = b"/sys/bus/platform/";
+    if !file_is(b"/sys/bus/platform/drivers_autoprobe\0", b"1\n") {
+        return fail(N, b"drivers_autoprobe", 0);
+    }
+    for f in [&b"drivers_probe\0"[..], b"uevent\0"] {
+        let mut b = [0u8; 256];
+        if mode_of(path(&mut b, &[base, f])) != S_IFREG | 0o200 {
+            return fail(N, b"bus write-only file", 0);
+        }
+    }
+    let drivers = Names::of(b"/sys/bus/platform/drivers\0", DT_DIR);
+    let mut bound = 0;
+    for i in 0..drivers.n {
+        let d = drivers.get(i);
+        // Both write-only, or neither (Linux suppress_bind_attrs)
+        let mut m = [0u32; 2];
+        for (k, f) in [&b"/bind\0"[..], b"/unbind\0"].iter().enumerate() {
+            let mut b = [0u8; 256];
+            m[k] = mode_of(path(&mut b, &[base, b"drivers/", d, f]));
+        }
+        if m[0] != m[1] || (m[0] != 0 && m[0] != S_IFREG | 0o200) {
+            return fail(N, b"driver bind/unbind mode", i as i64);
+        }
+        let mut db = [0u8; 256];
+        let devs = Names::of(path(&mut db, &[base, b"drivers/", d, b"\0"]), DT_LNK);
+        for j in 0..devs.n {
+            let dev = devs.get(j);
+            if dev == b"module" {
+                continue;
+            }
+            // The device's driver link names this driver
+            let mut lb = [0u8; 256];
+            let mut t = [0u8; 256];
+            let p = path(&mut lb, &[base, b"devices/", dev, b"/driver\0"]);
+            let n = sys_readlink(p.as_ptr(), t.as_mut_ptr(), t.len() as u64);
+            if n <= 0 || !t[..n as usize].ends_with(d) {
+                return fail(N, b"driver link", j as i64);
+            }
+            let mut ub = [0u8; 256];
+            let mut u = [0u8; 1024];
+            let k = read_file(path(&mut ub, &[base, b"devices/", dev, b"/uevent\0"]), &mut u);
+            let u = &u[..k.max(0) as usize];
+            let mut has_drv = false;
+            let mut has_alias = false;
+            for line in u.split(|&c| c == b'\n') {
+                has_drv |= line.strip_prefix(b"DRIVER=") == Some(d);
+                has_alias |= line.starts_with(b"MODALIAS=");
+            }
+            if !has_drv || !has_alias {
+                return fail(N, b"uevent DRIVER/MODALIAS", j as i64);
+            }
+            bound += 1;
+        }
+    }
+    // hk binds its console UART; the Linux reference may use other buses
+    if bound == 0 && !host_mode() {
+        return fail(N, b"no bound device", 0);
+    }
+    ok(N);
 }

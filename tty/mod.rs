@@ -435,22 +435,25 @@ pub fn init_tty_chardevs() {
     let _ = register_chardev(DevId::new(major::TTYAUX, 1), console_dev);
 
     TTY_CLASS.register();
-    let mut devs = alloc::vec![
-        ("tty", DevId::new(major::TTYAUX, 0)),
-        ("console", DevId::new(major::TTYAUX, 1)),
-    ];
-    for &tty in crate::arch::serial_ttys() {
-        devs.push((tty.name(), tty.dev));
-    }
-    for (name, dev) in devs {
+    for (name, minor) in [("tty", 0), ("console", 1)] {
         let _ = device_create(DeviceInfo {
-            name: name.into(),
-            parent: None,
             class: Some(&TTY_CLASS),
-            devt: Some(dev),
-            devtype: None,
+            devt: Some(DevId::new(major::TTYAUX, minor)),
+            ..DeviceInfo::named(name)
         });
     }
+}
+
+/// The class device of a port's tty, below the port's device (Linux
+/// tty_port_register_device)
+pub fn tty_register_device(tty: &'static Tty, parent: &Arc<Device>) -> Option<Arc<Device>> {
+    device_create(DeviceInfo {
+        parent: Some(parent),
+        class: Some(&TTY_CLASS),
+        devt: Some(tty.dev),
+        ..DeviceInfo::named(tty.name())
+    })
+    .ok()
 }
 
 /// The tty class (Linux tty_class)

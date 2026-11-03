@@ -53,19 +53,29 @@ pub fn uevent_env(dev: &Device, action: Action, ext: &[Vec<u8>]) {
     let Some(subsystem) = dev.subsystem() else {
         return;
     };
-    let devpath = dev.devpath();
+    send(
+        &dev.devpath(),
+        subsystem.as_bytes(),
+        action,
+        ext,
+        dev.uevent_env(),
+    );
+}
+
+/// Build and broadcast one event of the object at `devpath`
+fn send(devpath: &[u8], subsystem: &[u8], action: Action, ext: &[Vec<u8>], own: Vec<Vec<u8>>) {
     let mut env: Vec<Vec<u8>> = Vec::new();
     env.push([b"ACTION=", action.name()].concat());
-    env.push([b"DEVPATH=", &devpath[..]].concat());
-    env.push([b"SUBSYSTEM=", subsystem.as_bytes()].concat());
+    env.push([b"DEVPATH=", devpath].concat());
+    env.push([b"SUBSYSTEM=", subsystem].concat());
     env.extend(ext.iter().cloned());
-    env.extend(dev.uevent_env());
+    env.extend(own);
     if action == Action::Unbind {
         env.retain(|v| !v.starts_with(b"MODALIAS="));
     }
     let seq = UEVENT_SEQNUM.fetch_add(1, Ordering::AcqRel) + 1;
     env.push(format!("SEQNUM={}", seq).into_bytes());
-    let mut msg = [action.name(), b"@", &devpath[..], b"\0"].concat();
+    let mut msg = [action.name(), b"@", devpath, b"\0"].concat();
     for v in &env {
         msg.extend_from_slice(v);
         msg.push(0);
@@ -118,9 +128,8 @@ fn synth_args(args: &[u8]) -> Option<Vec<Vec<u8>>> {
     Some(env)
 }
 
-/// Linux kobject_synth_uevent: "action[ UUID[ KEY=VALUE...]]", a
-/// trailing newline or NUL ignored; EINVAL if malformed
-pub fn synth_uevent(dev: &Device, buf: &[u8]) -> Result<(), KernelError> {
+/// Parse a synthetic event write: the action and SYNTH_* variables
+fn synth_parse(buf: &[u8]) -> Result<(Action, Vec<Vec<u8>>), KernelError> {
     let buf = buf
         .strip_suffix(b"\n")
         .or_else(|| buf.strip_suffix(b"\0"))
@@ -134,6 +143,21 @@ pub fn synth_uevent(dev: &Device, buf: &[u8]) -> Result<(), KernelError> {
         None => alloc::vec![b"SYNTH_UUID=0".to_vec()],
         Some(a) => synth_args(a).ok_or(KernelError::InvalidArgument)?,
     };
+    Ok((action, ext))
+}
+
+/// Linux kobject_synth_uevent: "action[ UUID[ KEY=VALUE...]]", a
+/// trailing newline or NUL ignored; EINVAL if malformed
+pub fn synth_uevent(dev: &Device, buf: &[u8]) -> Result<(), KernelError> {
+    let (action, ext) = synth_parse(buf)?;
     uevent_env(dev, action, &ext);
+    Ok(())
+}
+
+/// A synthetic event of a non-device object (a bus or driver
+/// directory) at `devpath`
+pub fn synth_kobj(devpath: &[u8], subsystem: &[u8], buf: &[u8]) -> Result<(), KernelError> {
+    let (action, ext) = synth_parse(buf)?;
+    send(devpath, subsystem, action, &ext, Vec::new());
     Ok(())
 }
