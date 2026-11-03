@@ -216,7 +216,12 @@ extern "C" fn handle_el0_sync(frame: &UserFrame, esr: u64) {
             if nr != super::NO_SYSCALL {
                 // Syscall number in x8, arguments in x0-x5, return value
                 // in x0
-                let [a0, a1, a2, a3, a4, a5] = frame.syscall_args();
+                // The live x0-x5, as Linux invoke_syscall passes them (a
+                // tracer may have changed x0 at the entry stop; orig_x0
+                // keeps the original for restarts and syscall_get_arguments)
+                // SAFETY: field loads
+                let [a0, a1, a2, a3, a4, a5] =
+                    unsafe { frame.with(|f| [f.x[0], f.x[1], f.x[2], f.x[3], f.x[4], f.x[5]]) };
                 let ret = super::syscall::aarch64_syscall_dispatch(nr, a0, a1, a2, a3, a4, a5);
                 frame.set_ret(ret);
             }

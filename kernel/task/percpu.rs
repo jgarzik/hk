@@ -1522,6 +1522,7 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<Tid, &'static str> {
         // The boot context becomes this task (Linux: init_task's
         // kernel_init thread execs /sbin/init); the run queue takes
         // its reference
+        task.started.store(true, Ordering::Release);
         rq.curr = Arc::into_raw(task.clone());
         CurrentArch::set_current_task_ptr(rq.curr as usize);
     }
@@ -2669,6 +2670,11 @@ pub fn exit_current(status: Option<i32>) -> ! {
 /// its creator before it first runs), and the run queue's reference
 /// keeps it alive until it has switched away for good.
 fn make_current(t: &KernelTask) -> (u64, *const crate::mm::Mm, (u64, u64)) {
+    // Running: its owner fields are its own from now on (owner_check;
+    // covers kernel threads and every other way a task first runs)
+    if !t.started.load(Ordering::Relaxed) {
+        t.started.store(true, Ordering::Release);
+    }
     let kstack = if matches!(t.kind, TaskKind::KernelThread) {
         0
     } else {
