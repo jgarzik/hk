@@ -25,6 +25,9 @@ pub struct Class {
     pub devnode: Option<fn(&Device) -> Option<DevNode>>,
     /// Devices are block devices (/sys/dev/block)
     pub blk: bool,
+    /// Class variables of a device's uevents (Linux class->dev_uevent
+    /// and device_type->uevent)
+    pub uevent: Option<super::bus::UeventFn>,
     dir: Once<Arc<KNode>>,
     /// Registered devices (Linux klist_devices)
     devices: Mutex<Vec<Arc<Device>>>,
@@ -36,6 +39,19 @@ impl Class {
             name,
             devnode,
             blk: false,
+            uevent: None,
+            dir: Once::new(),
+            devices: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// A class of block devices
+    pub const fn block(name: &'static str, uevent: Option<super::bus::UeventFn>) -> Self {
+        Self {
+            name,
+            devnode: None,
+            blk: true,
+            uevent,
             dir: Once::new(),
             devices: Mutex::new(Vec::new()),
         }

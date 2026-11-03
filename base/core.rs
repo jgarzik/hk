@@ -253,6 +253,9 @@ impl Device {
         if let Some(f) = self.bus.and_then(|b| b.uevent) {
             f(self, &mut env);
         }
+        if let Some(f) = self.class.and_then(|c| c.uevent) {
+            f(self, &mut env);
+        }
         env
     }
 

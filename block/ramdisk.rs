@@ -103,7 +103,12 @@ fn create(minor: u16, bytes: u64, data: &[u8]) -> Result<Arc<BlockDevice>, Kerne
         pages: Mutex::new(BTreeMap::new()),
     });
     rd.copy(true, 0, data.as_ptr() as *mut u8, data.len())?;
-    let q = RequestQueue::new_bio(rd, QueueLimits::default(), false);
+    // brd: no seek cost (Linux QUEUE_FLAG_NONROT)
+    let limits = QueueLimits {
+        rotational: false,
+        ..QueueLimits::default()
+    };
+    let q = RequestQueue::new_bio(rd, limits, false);
     let disk = Disk::new(
         major::RAMDISK,
         minor,
@@ -112,7 +117,7 @@ fn create(minor: u16, bytes: u64, data: &[u8]) -> Result<Arc<BlockDevice>, Kerne
         bytes >> SECTOR_SHIFT,
         q,
     );
-    add_disk(disk)
+    add_disk(disk, None)
 }
 
 /// Create an empty RAM disk of `capacity_mb` MiB

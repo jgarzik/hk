@@ -27,6 +27,7 @@ pub fn run_tests() {
     test_bus_platform();
     test_bus_pci();
     test_bus_virtio();
+    test_block();
 }
 
 fn fail(name: &[u8], why: &[u8], v: i64) {
@@ -622,6 +623,98 @@ fn test_bus_virtio() {
     }
     if bound == 0 && !host_mode() {
         return fail(N, b"no bound virtio device", 0);
+    }
+    ok(N);
+}
+
+/// "M:m\n" -> (M, m)
+fn majmin(b: &[u8]) -> Option<(u64, u64)> {
+    let b = b.strip_suffix(b"\n")?;
+    let c = b.iter().position(|&x| x == b':')?;
+    let (ma, mi) = (&b[..c], &b[c + 1..]);
+    if ma.is_empty() || mi.is_empty() || !ma.iter().chain(mi).all(u8::is_ascii_digit) {
+        return None;
+    }
+    Some((num(ma), num(mi)))
+}
+
+/// /proc/partitions has (major, minor) with `blocks` 1K blocks
+fn in_partitions(ma: u64, mi: u64, blocks: u64) -> bool {
+    let mut p = [0u8; 4096];
+    let n = read_file(b"/proc/partitions\0", &mut p).max(0) as usize;
+    p[..n].split(|&c| c == b'\n').skip(2).any(|l| {
+        let mut f = l.split(|&c| c == b' ').filter(|w| !w.is_empty());
+        let (Some(a), Some(b), Some(c)) = (f.next(), f.next(), f.next()) else {
+            return false;
+        };
+        num(a) == ma && num(b) == mi && num(c) == blocks
+    })
+}
+
+/// uevent of `dir` (NUL-terminated path prefix parts) has `want` lines
+fn uevent_has(parts: &[&[u8]], want: &[&[u8]]) -> bool {
+    let mut b = [0u8; 256];
+    let mut u = [0u8; 1024];
+    let mut v: [&[u8]; 8] = [b""; 8];
+    let k = parts.len();
+    v[..k].copy_from_slice(parts);
+    v[k] = b"/uevent\0";
+    let n = read_file(path(&mut b, &v[..=k]), &mut u).max(0) as usize;
+    want.iter()
+        .all(|w| u[..n].split(|&c| c == b'\n').any(|l| l == *w || (w.ends_with(b"=") && l.starts_with(w))))
+}
+
+/// /sys/block: each disk's dev and size agree with /proc/partitions,
+/// uevent DEVTYPE=disk and DISKSEQ; its partitions' partition attribute
+/// and uevent PARTN
+fn test_block() {
+    const N: &[u8] = b"SYSFS_BLOCK";
+    let disks = Names::of(b"/sys/block\0", DT_LNK);
+    if disks.n == 0 {
+        return fail(N, b"no disks", 0);
+    }
+    let base: &[u8] = b"/sys/block/";
+    for i in 0..disks.n {
+        let d = disks.get(i);
+        let rd = |parts: &[&[u8]], out: &mut [u8]| -> usize {
+            let mut b = [0u8; 256];
+            read_file(path(&mut b, parts), out).max(0) as usize
+        };
+        let mut v = [0u8; 64];
+        let n = rd(&[base, d, b"/dev\0"], &mut v);
+        let Some((ma, mi)) = majmin(&v[..n]) else {
+            return fail(N, b"dev format", i as i64);
+        };
+        let n = rd(&[base, d, b"/size\0"], &mut v);
+        let size = num(&v[..n]);
+        if size != 0 && !in_partitions(ma, mi, size / 2) {
+            return fail(N, b"size vs /proc/partitions", i as i64);
+        }
+        if !uevent_has(&[base, d], &[b"DEVTYPE=disk", b"DISKSEQ="]) {
+            return fail(N, b"disk uevent", i as i64);
+        }
+        let n = rd(&[base, d, b"/queue/logical_block_size\0"], &mut v);
+        if n < 2 || num(&v[..n]) < 512 {
+            return fail(N, b"logical_block_size", i as i64);
+        }
+        // Partitions: subdirectories named after the disk
+        let mut db = [0u8; 256];
+        let parts = Names::of(path(&mut db, &[base, d, b"\0"]), DT_DIR);
+        for j in 0..parts.n {
+            let p = parts.get(j);
+            if !p.starts_with(d) {
+                continue;
+            }
+            let n = rd(&[base, d, b"/", p, b"/partition\0"], &mut v);
+            let no = &v[..n.saturating_sub(1)];
+            let mut want = [0u8; 32];
+            want[..6].copy_from_slice(b"PARTN=");
+            want[6..6 + no.len()].copy_from_slice(no);
+            let w: &[u8] = &want[..6 + no.len()];
+            if no.is_empty() || !uevent_has(&[base, d, b"/", p], &[b"DEVTYPE=partition", w]) {
+                return fail(N, b"partition", j as i64);
+            }
+        }
     }
     ok(N);
 }

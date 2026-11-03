@@ -360,7 +360,7 @@ pub fn create_scsi_disk(
         scsi_disk.capacity_bytes() >> SECTOR_SHIFT,
         q,
     );
-    let bdev = add_disk(disk)?;
+    let bdev = add_disk(disk, None)?;
     crate::printkln!(
         "SCSI: {} ({} MB, {} byte sectors)",
         name,

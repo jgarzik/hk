@@ -1743,6 +1743,10 @@ alone; lists are snapshotted before probing walks them.
 each bound driver's shutdown callback after dropping it, so callbacks
 (which may poll hardware or take driver locks such as `USB_CONTROLLER`)
 never run under it. `PciDev.driver_override` is a spin leaf.
+Block devices: a disk's partitions are registered and removed (their
+sysfs entries, devtmpfs nodes, uevents) under the disk's `open_mutex`:
+`Disk.open_mutex` -> KERNFS_RWSEM -> devtmpfs root i_rwsem. Their
+attributes read the block device without it.
 
 uevents (base/uevent.rs) broadcast with `ns::net::NET_NAMESPACE_LIST`
 (spin Mutex, leaf; Linux net_namespace_list) taken only to snapshot

@@ -330,6 +330,7 @@ fn limits(vdev: &VirtioDevice, ring: u16) -> QueueLimits {
         max_sectors: 128,
         max_segments: seg_max.min(MAX_SEGS as u32).min(ring as u32 - 2),
         max_segment_size: size_max,
+        rotational: true,
     }
 }
 
@@ -407,7 +408,11 @@ impl VirtioDriver for VirtioBlkDriver {
         .fold(0, |f, b| f | (1 << b))
     }
 
-    fn probe(&self, vdev: Arc<VirtioDevice>) -> Result<Box<dyn crate::base::Bound>, KernelError> {
+    fn probe(
+        &self,
+        dev: &Arc<crate::base::Device>,
+        vdev: Arc<VirtioDevice>,
+    ) -> Result<Box<dyn crate::base::Bound>, KernelError> {
         let disk = new_disk(&vdev)?;
         let blk = Arc::new(VirtioBlk {
             vdev: vdev.clone(),
@@ -419,7 +424,7 @@ impl VirtioDriver for VirtioBlkDriver {
                 KernelError::NoDevice
             })?;
         vdev.ready();
-        add_disk(disk).map_err(|_| KernelError::Io)?;
+        add_disk(disk, Some(dev)).map_err(|_| KernelError::Io)?;
         Ok(Box::new(VirtioBlkDev(blk)))
     }
 }

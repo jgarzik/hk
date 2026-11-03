@@ -447,6 +447,7 @@ fn kmain() -> ! {
     // Device initcalls (Linux order: buses scanned, drivers registered,
     // each registration probing what it matches; a probe may register
     // child devices, probed in turn)
+    block::genhd::genhd_init();
     CurrentArch::platform_init();
     hw::pci::pci_scan();
     hw::usb::usb_init();

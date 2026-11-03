@@ -258,6 +258,8 @@ pub struct QueueLimits {
     pub max_sectors: u32,
     pub max_segments: u32,
     pub max_segment_size: u32,
+    /// Seeks cost (Linux !QUEUE_FLAG_NONROT)
+    pub rotational: bool,
 }
 
 impl Default for QueueLimits {
@@ -268,6 +270,7 @@ impl Default for QueueLimits {
             max_sectors: 128, // 64 KiB
             max_segments: 32,
             max_segment_size: PAGE as u32,
+            rotational: true,
         }
     }
 }
@@ -336,6 +339,10 @@ impl RequestQueue {
 // ============================================================================
 
 /// A disk (Linux struct gendisk)
+/// Next disk sequence number (Linux diskseq: an atomic64 counter; only
+/// uniqueness matters)
+static DISKSEQ: AtomicU64 = AtomicU64::new(1);
+
 pub struct Disk {
     pub major: DevMajor,
     pub first_minor: DevMinor,
@@ -350,6 +357,9 @@ pub struct Disk {
     pub(super) open_partitions: AtomicU32,
     /// Opens, releases and rescans (Linux open_mutex)
     pub(super) open_mutex: crate::sync::Mutex<()>,
+    /// Sequence number, unique for the boot, set at allocation (Linux
+    /// diskseq)
+    pub seq: u64,
 }
 
 impl Disk {
@@ -373,6 +383,7 @@ impl Disk {
             bdi,
             open_partitions: AtomicU32::new(0),
             open_mutex: crate::sync::Mutex::new(()),
+            seq: DISKSEQ.fetch_add(1, Ordering::Relaxed),
         })
     }
 
@@ -413,6 +424,8 @@ pub struct BlockDevice {
     /// The device's inode in the bdev pseudo filesystem: its page cache
     /// (Linux bd_mapping) serves device-node I/O and filesystem metadata
     pub bd_inode: Arc<crate::fs::Inode>,
+    /// Its device in the block class (Linux bd_device)
+    pub kdev: spin::Once<Arc<crate::base::Device>>,
 }
 
 impl BlockDevice {
@@ -429,6 +442,7 @@ impl BlockDevice {
             bsize: AtomicU32::new(512),
             dead: AtomicBool::new(false),
             bd_inode: crate::fs::blkdev_ops::bdev_inode(dev, nr_sects << SECTOR_SHIFT),
+            kdev: spin::Once::new(),
         }
     }
 

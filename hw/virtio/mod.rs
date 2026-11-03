@@ -84,7 +84,11 @@ pub trait VirtioDriver: Send + Sync {
     fn features(&self) -> u64;
     /// Bind to a device whose features are negotiated (FEATURES_OK set);
     /// the driver must call `ready()` before returning success
-    fn probe(&self, vdev: Arc<VirtioDevice>) -> Result<Box<dyn crate::base::Bound>, KernelError>;
+    fn probe(
+        &self,
+        dev: &Arc<Device>,
+        vdev: Arc<VirtioDevice>,
+    ) -> Result<Box<dyn crate::base::Bound>, KernelError>;
 }
 
 /// Matches any vendor (Linux VIRTIO_DEV_ANY_ID)
@@ -148,7 +152,7 @@ pub fn virtio_dev_probe(dev: &Arc<Device>) -> Result<Box<dyn crate::base::Bound>
         vdev.id(),
         vdev.features()
     );
-    ids.drv.probe(vdev.clone()).inspect_err(|_| {
+    ids.drv.probe(dev, vdev.clone()).inspect_err(|_| {
         vdev.add_status(status::FAILED);
     })
 }

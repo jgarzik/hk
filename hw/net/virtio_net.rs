@@ -428,7 +428,11 @@ impl VirtioDriver for VirtioNetDriver {
         (1 << feature::MAC) | (1 << feature::STATUS)
     }
 
-    fn probe(&self, vdev: Arc<VirtioDevice>) -> Result<Box<dyn crate::base::Bound>, KernelError> {
+    fn probe(
+        &self,
+        _dev: &Arc<crate::base::Device>,
+        vdev: Arc<VirtioDevice>,
+    ) -> Result<Box<dyn crate::base::Bound>, KernelError> {
         let mac = read_mac(&vdev);
         let (rx, tx) = setup_queues(&vdev)?;
         let rx_cb = rx.vq.cb();
