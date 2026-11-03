@@ -88,7 +88,13 @@ pub struct DeviceInfo<'a> {
     /// DEVTYPE (Linux device_type.name)
     pub devtype: Option<&'static str>,
     pub data: Option<DevData>,
+    /// Adds the device's attributes before it is announced (Linux
+    /// dev->groups and the bus's dev_groups)
+    pub attrs: Option<AttrsFn>,
 }
+
+/// Creates a device's attribute files
+pub type AttrsFn = fn(&Arc<Device>) -> Result<(), KernelError>;
 
 impl DeviceInfo<'_> {
     /// A device `name` with nothing else set
@@ -101,6 +107,7 @@ impl DeviceInfo<'_> {
             devt: None,
             devtype: None,
             data: None,
+            attrs: None,
         }
     }
 }
@@ -118,6 +125,7 @@ pub struct Device {
     pub devt: Option<DevId>,
     pub devtype: Option<&'static str>,
     data: Option<DevData>,
+    attrs: Option<AttrsFn>,
     kobj: Once<Arc<KNode>>,
     /// Linux device_lock
     pub lock: Mutex<()>,
@@ -190,6 +198,11 @@ impl Device {
     /// The bus-specific data, if it is a `T`
     pub fn data<T: 'static>(&self) -> Option<&T> {
         self.data.as_ref()?.downcast_ref::<T>()
+    }
+
+    /// The bus-specific data as a shared `T`
+    pub fn data_arc<T: Send + Sync + 'static>(&self) -> Option<Arc<T>> {
+        self.data.clone()?.downcast::<T>().ok()
     }
 
     pub fn driver(&self) -> Option<&'static Driver> {
@@ -300,6 +313,9 @@ impl Device {
             crate::fs::devtmpfs::device_add(&n.name, dt, self.is_blk(), mode);
         }
         let me = self.me.upgrade().expect("device alive");
+        if let Some(f) = self.attrs {
+            f(&me)?;
+        }
         if let Some(b) = self.bus {
             b.add_device(&me)?;
         }
@@ -351,6 +367,7 @@ pub fn device_create(info: DeviceInfo) -> Result<Arc<Device>, KernelError> {
         devt: info.devt,
         devtype: info.devtype,
         data: info.data,
+        attrs: info.attrs,
         kobj: Once::new(),
         lock: Mutex::new(()),
         driver: RwLock::new(None),

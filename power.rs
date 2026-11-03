@@ -72,7 +72,6 @@ pub fn sys_reboot(magic1: u32, magic2: u32, cmd: u32, _arg: u64) -> i64 {
     // running against quiesced hardware
     if matches!(cmd, cmd::POWER_OFF | cmd::RESTART | cmd::HALT) {
         crate::base::device_shutdown();
-        crate::bus::bus::device_shutdown();
         crate::smp::stop_other_cpus();
     }
 

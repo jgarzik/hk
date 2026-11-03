@@ -12,7 +12,6 @@ extern crate alloc;
 // Core modules (formerly in core/ subdir)
 pub mod base;
 pub mod block;
-pub mod bus;
 pub mod console;
 pub mod cpu;
 pub mod entry;
@@ -445,62 +444,19 @@ fn kmain() -> ! {
     ksysfs::init();
     chr_dev_init();
 
-    // ========================================================================
-    // Bus/Driver Model: Layered device discovery
-    // ========================================================================
-    //
-    // Instead of hardcoding nested loops (PCI → xHCI → USB → USB-Serial),
-    // we use a Linux-style bus/driver model:
-    //
-    // 1. Create BusManager and register buses
-    // 2. Register drivers for each bus type
-    // 3. BusManager enumerates root buses (PCI)
-    // 4. PCI drivers (xHCI) create child buses (USB) when probed
-    // 5. USB drivers (USB-Serial) are matched on the new USB bus
-    // 6. The cascade continues automatically
-    //
-    // This is modular and extensible - no hardcoded loops needed!
-    // ========================================================================
-
-    use crate::bus::BusManager;
-    use crate::hw::net::E1000PciDriver;
-    use crate::hw::pci::PciBus;
-    use crate::hw::usb::msc::{UsbMscBusDriver, UsbMscDeviceHandle};
-    use crate::hw::usb::{UsbSerialBusDriver, xhci::XhciPciDriver};
-    use alloc::boxed::Box;
-
-    // Create the bus manager
-    let mut bus_manager = BusManager::new();
-
-    // The platform devices and their drivers
+    // Device initcalls (Linux order: buses scanned, drivers registered,
+    // each registration probing what it matches; a probe may register
+    // child devices, probed in turn)
     CurrentArch::platform_init();
-
-    // Register PCI bus (root bus)
-    bus_manager.register_bus("pci", Box::new(PciBus::new()));
-
-    // Register PCI drivers
-    bus_manager.register_driver("pci", Box::new(XhciPciDriver));
-    bus_manager.register_driver("pci", Box::new(E1000PciDriver));
-    bus_manager.register_driver("pci", Box::new(crate::hw::virtio::VirtioPciDriver));
-    crate::hw::virtio::register_driver(&crate::hw::net::virtio_net::VIRTIO_NET);
-    crate::hw::virtio::register_driver(&crate::hw::virtio::blk::VIRTIO_BLK);
-
-    // Register USB drivers (queued until USB bus is created by xHCI)
-    bus_manager.register_driver("usb", Box::new(UsbSerialBusDriver));
-    bus_manager.register_driver("usb", Box::new(UsbMscBusDriver));
-
-    // Start the enumeration cascade:
-    // Platform enumerate → PIC/PIT/Serial matched
-    // PCI enumerate → xHCI matched → USB bus created → USB-Serial/USB-MSC matched
-    bus_manager.enumerate_all(&mut frame_alloc);
-
-    // SCSI disk (sda) from a USB MSC device, if present
-    if let Some(handle) = bus_manager.find_device::<UsbMscDeviceHandle>() {
-        let _ = crate::block::create_scsi_disk(handle.scsi_host(), 0, 0);
-    }
-
-    // Kept for device_shutdown at power-off/restart
-    crate::bus::bus::set_system_buses(bus_manager);
+    hw::pci::pci_scan();
+    hw::usb::usb_init();
+    hw::usb::USB_SERIAL_DRIVER.register();
+    hw::usb::msc::USB_STORAGE_DRIVER.register();
+    hw::usb::xhci::XHCI_PCI_DRIVER.register();
+    hw::net::E1000_DRIVER.register();
+    hw::virtio::register_driver(&hw::net::virtio_net::VIRTIO_NET);
+    hw::virtio::register_driver(&hw::virtio::blk::VIRTIO_BLK);
+    hw::virtio::VIRTIO_PCI_DRIVER.register();
 
     // RAM disk rd0 (Linux brd_init, a device initcall)
     let _ = crate::block::create_ramdisk(0, DEFAULT_RAMDISK_SIZE_MB);

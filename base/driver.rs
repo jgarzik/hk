@@ -27,6 +27,9 @@ pub trait Bound: Send + Sync {
 
     /// Quiesce the device before power-off (Linux ->shutdown)
     fn shutdown(&self) {}
+
+    /// Release the device: the driver is unbound (Linux ->remove)
+    fn remove(&self) {}
 }
 
 pub type ProbeFn = fn(&Arc<Device>) -> Result<Box<dyn Bound>, KernelError>;

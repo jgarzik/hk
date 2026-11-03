@@ -25,6 +25,7 @@ pub fn run_tests() {
     test_class_mem();
     test_uevent_synth();
     test_bus_platform();
+    test_bus_pci();
 }
 
 fn fail(name: &[u8], why: &[u8], v: i64) {
@@ -486,6 +487,87 @@ fn test_bus_platform() {
     // hk binds its console UART; the Linux reference may use other buses
     if bound == 0 && !host_mode() {
         return fail(N, b"no bound device", 0);
+    }
+    ok(N);
+}
+
+/// Parse "0x<hex>\n" of exactly `digits` hex digits
+fn hex_attr(b: &[u8], digits: usize) -> Option<u32> {
+    let v = b.strip_prefix(b"0x")?.strip_suffix(b"\n")?;
+    if v.len() != digits {
+        return None;
+    }
+    v.iter().try_fold(0u32, |a, &c| Some(a * 16 + (c as char).to_digit(16)?))
+}
+
+fn upper_hex(v: u32, digits: usize, out: &mut [u8]) {
+    for i in 0..digits {
+        let d = (v >> (4 * (digits - 1 - i))) & 0xf;
+        out[i] = b"0123456789ABCDEF"[d as usize];
+    }
+}
+
+/// Every PCI function: vendor/device/class formats, config space
+/// agreeing with them, modalias, uevent PCI_ID and PCI_SLOT_NAME
+fn test_bus_pci() {
+    const N: &[u8] = b"SYSFS_BUS_PCI";
+    let devs = Names::of(b"/sys/bus/pci/devices\0", DT_LNK);
+    if devs.n == 0 {
+        return fail(N, b"no PCI devices", 0);
+    }
+    let base: &[u8] = b"/sys/bus/pci/devices/";
+    for i in 0..devs.n {
+        let d = devs.get(i);
+        let attr = |name: &[u8], out: &mut [u8]| -> usize {
+            let mut b = [0u8; 256];
+            let n = read_file(path(&mut b, &[base, d, b"/", name, b"\0"]), out);
+            n.max(0) as usize
+        };
+        let mut v = [0u8; 64];
+        let n = attr(b"vendor", &mut v);
+        let Some(vendor) = hex_attr(&v[..n], 4) else {
+            return fail(N, b"vendor format", i as i64);
+        };
+        let n = attr(b"device", &mut v);
+        let Some(device) = hex_attr(&v[..n], 4) else {
+            return fail(N, b"device format", i as i64);
+        };
+        let n = attr(b"class", &mut v);
+        if hex_attr(&v[..n], 6).is_none() {
+            return fail(N, b"class format", i as i64);
+        }
+        let mut cfg = [0u8; 4];
+        if attr(b"config", &mut cfg) != 4
+            || u32::from_le_bytes(cfg) != vendor | device << 16
+        {
+            return fail(N, b"config id", i as i64);
+        }
+        let mut b = [0u8; 256];
+        let sz = stat(path(&mut b, &[base, d, b"/config\0"])).map_or(0, |st| st.st_size);
+        if sz != 256 && sz != 4096 {
+            return fail(N, b"config size", sz);
+        }
+        // MODALIAS=pci:v0000VVVVd0000DDDD...
+        let mut want = *b"pci:v0000XXXXd0000XXXX";
+        upper_hex(vendor, 4, &mut want[9..13]);
+        upper_hex(device, 4, &mut want[18..22]);
+        let n = attr(b"modalias", &mut v);
+        if !v[..n].starts_with(&want) {
+            return fail(N, b"modalias", i as i64);
+        }
+        let mut id = *b"PCI_ID=XXXX:XXXX";
+        upper_hex(vendor, 4, &mut id[7..11]);
+        upper_hex(device, 4, &mut id[12..16]);
+        let mut u = [0u8; 1024];
+        let n = attr(b"uevent", &mut u);
+        let (mut has_id, mut has_slot) = (false, false);
+        for line in u[..n].split(|&c| c == b'\n') {
+            has_id |= line == id;
+            has_slot |= line.strip_prefix(b"PCI_SLOT_NAME=") == Some(d);
+        }
+        if !has_id || !has_slot {
+            return fail(N, b"uevent PCI_ID/PCI_SLOT_NAME", i as i64);
+        }
     }
     ok(N);
 }

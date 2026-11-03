@@ -25,8 +25,6 @@ use spin::Once;
 use super::ring::{self, Layout, Vring};
 use super::{VirtioIrq, find_driver, status};
 use crate::arch::barrier::wmb;
-use crate::bus::bus::{BusContext, BusDevice, BusDriver};
-use crate::bus::driver::Device;
 use crate::hw::dma::{DmaCoherent, DmaConfig, DmaDevice};
 use crate::hw::mmio::IoMem;
 use crate::hw::pci::{PciDevice, cap_id};
@@ -453,9 +451,16 @@ impl DerefMut for Virtqueue {
     }
 }
 
-/// PCI driver for modern virtio devices; binds the virtio driver
-/// registered for the device ID (Linux virtio_pci_probe + virtio_dev_probe)
-pub struct VirtioPciDriver;
+/// The virtio PCI driver (Linux virtio-pci: every Red Hat/Qumranet
+/// function); binds the virtio driver registered for the device ID
+/// (virtio_pci_probe + virtio_dev_probe)
+pub static VIRTIO_PCI_DRIVER: crate::base::Driver = crate::base::Driver::new(
+    "virtio-pci",
+    &crate::hw::pci::driver::PCI_BUS,
+    Some("virtio_pci"),
+    &crate::hw::pci::driver::PciIds(&[crate::hw::pci::driver::PciDeviceId::vendor(VENDOR_VIRTIO)]),
+    virtio_pci_probe,
+);
 
 fn virtio_id(pci: &PciDevice) -> Option<u32> {
     let h = &pci.header;
@@ -484,39 +489,22 @@ fn vp_init(pci: &PciDevice, id: u32, driver: u64) -> Result<VirtioDevice, Kernel
     Ok(vdev)
 }
 
-impl BusDriver for VirtioPciDriver {
-    fn name(&self) -> &str {
-        "virtio-pci"
-    }
-
-    fn matches(&self, device: &dyn BusDevice) -> bool {
-        device
-            .as_any()
-            .downcast_ref::<PciDevice>()
-            .and_then(virtio_id)
-            .is_some_and(|id| find_driver(id).is_some())
-    }
-
-    fn probe(
-        &self,
-        device: &dyn BusDevice,
-        _ctx: &mut BusContext,
-    ) -> Result<Box<dyn Device>, KernelError> {
-        let pci = device
-            .as_any()
-            .downcast_ref::<PciDevice>()
-            .ok_or(KernelError::NoDevice)?;
-        let id = virtio_id(pci).ok_or(KernelError::NoDevice)?;
-        let drv = find_driver(id).ok_or(KernelError::NoDevice)?;
-        let vdev = Arc::new(vp_init(pci, id, drv.features())?);
-        printkln!(
-            "virtio-pci: {} device {} features {:#x}",
-            vdev.bus_id(),
-            id,
-            vdev.features
-        );
-        drv.probe(Arc::clone(&vdev)).inspect_err(|_| {
-            vdev.add_status(status::FAILED);
-        })
-    }
+/// Modern devices only (ENODEV for legacy ones, as without
+/// virtio_pci.force_legacy support)
+fn virtio_pci_probe(
+    dev: &Arc<crate::base::Device>,
+) -> Result<Box<dyn crate::base::Bound>, KernelError> {
+    let pci = crate::hw::pci::driver::pci_dev(dev).ok_or(KernelError::NoDevice)?;
+    let id = virtio_id(pci).ok_or(KernelError::NoDevice)?;
+    let drv = find_driver(id).ok_or(KernelError::NoDevice)?;
+    let vdev = Arc::new(vp_init(pci, id, drv.features())?);
+    printkln!(
+        "virtio-pci: {} device {} features {:#x}",
+        vdev.bus_id(),
+        id,
+        vdev.features
+    );
+    drv.probe(Arc::clone(&vdev)).inspect_err(|_| {
+        vdev.add_status(status::FAILED);
+    })
 }

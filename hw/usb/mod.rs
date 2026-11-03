@@ -40,7 +40,7 @@ pub fn usb_trace_enabled() -> bool {
 pub use xhci::{usb_bulk_in, usb_bulk_out, usb_configure_endpoints};
 
 // Re-export USB serial driver for registration
-pub use serial::{UsbSerial, UsbSerialBusDriver};
+pub use serial::{USB_SERIAL_DRIVER, UsbSerial};
 
 use alloc::vec::Vec;
 
@@ -378,7 +378,7 @@ pub enum UsbError {
 }
 
 /// USB host controller trait
-pub trait UsbController: crate::bus::driver::Device {
+pub trait UsbController: Send {
     /// Reset the controller
     fn reset(&mut self) -> Result<(), UsbError>;
 
@@ -414,179 +414,119 @@ pub trait UsbController: crate::bus::driver::Device {
 }
 
 // ============================================================================
-// USB Bus Implementation (Bus/Driver Model)
+// USB on the device core (Linux drivers/usb/core/usb.c, driver.c, hub.c)
 // ============================================================================
 
-use alloc::boxed::Box;
+use alloc::format;
 use alloc::string::String;
-use core::any::Any;
+use alloc::sync::Arc;
 
-use crate::bus::driver::Device;
-use crate::bus::{Bus, BusContext, BusDevice, BusDriver};
+use crate::base::bus::BusType;
+use crate::base::{Device, DeviceInfo, Driver, device_create};
+use crate::fs::kernfs;
+use crate::util::error::KernelError;
 
-/// Implement BusDevice for UsbDevice to participate in bus/driver model
-impl BusDevice for UsbDevice {
-    fn name(&self) -> &str {
-        "usb-device"
-    }
+pub static USB_BUS: BusType = BusType::new("usb", usb_match, Some(usb_uevent));
 
-    fn bus_id(&self) -> String {
-        use alloc::format;
-        format!("usb:{:x}:{}", self.slot_id, self.port)
-    }
+/// Linux usb_init: the bus
+pub fn usb_init() {
+    USB_BUS.register();
+}
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
+/// A USB driver's match (by the device's properties)
+pub struct UsbIds(pub fn(&UsbDevice) -> bool);
 
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
+/// A USB device's data: the device, its bus number and address
+pub struct UsbDevNode {
+    pub dev: UsbDevice,
+    pub busnum: u8,
+    pub devnum: u8,
+}
+
+/// The USB device behind `dev`
+pub fn usb_dev(dev: &Device) -> Option<&UsbDevice> {
+    dev.data::<UsbDevNode>().map(|n| &n.dev)
+}
+
+fn usb_match(dev: &Device, drv: &'static Driver) -> bool {
+    let (Some(u), Some(UsbIds(m))) = (usb_dev(dev), drv.ids.downcast_ref::<UsbIds>()) else {
+        return false;
+    };
+    m(u)
+}
+
+/// Linux usb_dev_uevent
+fn usb_uevent(dev: &Device, env: &mut Vec<Vec<u8>>) {
+    let Some(n) = dev.data::<UsbDevNode>() else {
+        return;
+    };
+    env.push(format!("BUSNUM={:03}", n.busnum).into_bytes());
+    env.push(format!("DEVNUM={:03}", n.devnum).into_bytes());
+}
+
+/// Linux speed_show: Mbit/s
+fn speed_mbps(s: UsbSpeed) -> &'static str {
+    match s {
+        UsbSpeed::Low => "1.5",
+        UsbSpeed::Full => "12",
+        UsbSpeed::High => "480",
+        UsbSpeed::Super => "5000",
+        UsbSpeed::SuperPlus => "10000",
     }
 }
 
-/// USB bus implementing the Bus trait for the bus/driver model
-///
-/// The USB bus is created by the xHCI driver when it detects a USB host controller
-/// on the PCI bus. It contains the list of detected USB devices and matches them
-/// against registered USB drivers (like USB-Serial).
-pub struct UsbBus {
-    /// Discovered USB devices
-    devices: Vec<UsbDevice>,
-    /// Registered USB drivers
-    drivers: Vec<Box<dyn BusDriver>>,
-    /// Probed devices (devices that have been matched to drivers)
-    probed_devices: Vec<Box<dyn Device>>,
+/// A USB device's attributes (Linux usb_dev_attrs subset)
+fn usb_attrs(dev: &Arc<Device>) -> Result<(), KernelError> {
+    let Some(n) = dev.data::<UsbDevNode>() else {
+        return Ok(());
+    };
+    let devpath = match dev.name().split_once('-') {
+        Some((_, p)) => String::from(p),
+        None => String::from("0"),
+    };
+    let text: [(&[u8], String); 4] = [
+        (b"busnum", format!("{}\n", n.busnum)),
+        (b"devnum", format!("{}\n", n.devnum)),
+        (b"speed", format!("{}\n", speed_mbps(n.dev.speed))),
+        (b"devpath", format!("{}\n", devpath)),
+    ];
+    for (name, v) in text {
+        dev.create_file(name, 0o444, kernfs::show(move |o| o.bytes(v.as_bytes())))?;
+    }
+    Ok(())
 }
 
-impl UsbBus {
-    /// Create a new USB bus with discovered devices
-    pub fn new(devices: Vec<UsbDevice>) -> Self {
-        Self {
-            devices,
-            drivers: Vec::new(),
-            probed_devices: Vec::new(),
-        }
-    }
-}
-
-impl Bus for UsbBus {
-    fn name(&self) -> &str {
-        "usb"
-    }
-
-    fn register_driver(&mut self, driver: Box<dyn BusDriver>) {
-        printkln!("USB: Registered driver '{}'", driver.name());
-        self.drivers.push(driver);
-    }
-
-    fn enumerate(&mut self, ctx: &mut BusContext) {
-        printkln!("USB: Enumerating {} device(s)...", self.devices.len());
-
-        // Match devices to drivers and probe
-        for device in &self.devices {
-            printkln!(
-                "USB: Device at {} - speed={:?}, class={:02x}:{:02x}:{:02x}",
-                BusDevice::bus_id(device),
-                device.speed,
-                device.device_class,
-                device.device_subclass,
-                device.device_protocol
-            );
-
-            for driver in &self.drivers {
-                if driver.matches(device) {
-                    printkln!(
-                        "USB: Driver '{}' matched device at {}",
-                        driver.name(),
-                        BusDevice::bus_id(device)
-                    );
-
-                    match driver.probe(device, ctx) {
-                        Ok(dev_instance) => {
-                            printkln!("USB: Successfully probed '{}'", dev_instance.name());
-                            self.probed_devices.push(dev_instance);
-                        }
-                        Err(e) => {
-                            printkln!("USB: Failed to probe: {:?}", e);
-                        }
-                    }
-
-                    // Only match first driver per device
-                    break;
-                }
-            }
-        }
-    }
-
-    fn is_root(&self) -> bool {
-        false // USB is not a root bus - it's created by xHCI
-    }
-
-    fn probed_devices(&self) -> &[Box<dyn Device>] {
-        &self.probed_devices
-    }
-
-    /// Remove a USB device from this bus (hotplug support)
-    ///
-    /// Following Linux kernel USB hotplug patterns:
-    /// 1. Find the device by bus_id
-    /// 2. Find and call driver.remove()
-    /// 3. Remove from probed_devices
-    /// 4. Remove from devices list
-    fn remove_device(&mut self, bus_id: &str) -> Result<(), crate::util::error::KernelError> {
-        use crate::util::error::KernelError;
-
-        printkln!("USB: Removing device {}", bus_id);
-
-        // Find the device index
-        let device_idx = self
-            .devices
-            .iter()
-            .position(|d| BusDevice::bus_id(d) == bus_id);
-
-        let device_idx = match device_idx {
-            Some(idx) => idx,
-            None => {
-                printkln!("USB: Device {} not found", bus_id);
-                return Err(KernelError::NoDevice);
-            }
-        };
-
-        // Get reference to device for driver matching
-        let device = &self.devices[device_idx];
-
-        // Find matching driver and call remove()
-        for driver in &self.drivers {
-            if driver.matches(device) {
-                printkln!(
-                    "USB: Calling driver '{}' remove for {}",
-                    driver.name(),
-                    bus_id
-                );
-
-                // Call driver's remove callback
-                if let Err(e) = driver.remove(device) {
-                    printkln!("USB: Driver remove failed: {:?}", e);
-                    return Err(e);
-                }
-
-                break;
-            }
-        }
-
-        // Remove from probed_devices list
-        self.probed_devices.retain(|dev| {
-            if let Some(dev_bus_id) = dev.bus_id() {
-                dev_bus_id != bus_id
-            } else {
-                true // Keep devices without bus_id tracking
-            }
+/// Register the root hub `usbN` below the host controller and each
+/// device on its ports as `N-<port>` (Linux usb_add_hcd, usb_new_device)
+pub fn usb_register_devices(hcd: &Arc<Device>, devs: Vec<UsbDevice>) -> Vec<Arc<Device>> {
+    let busnum = 1;
+    let mut out = Vec::new();
+    let Ok(root) = device_create(DeviceInfo {
+        parent: Some(hcd),
+        devtype: Some("usb_device"),
+        ..DeviceInfo::named(&format!("usb{}", busnum))
+    }) else {
+        return out;
+    };
+    for d in devs {
+        let name = format!("{}-{}", busnum, d.port);
+        let devnum = d.address;
+        let r = device_create(DeviceInfo {
+            parent: Some(&root),
+            bus: Some(&USB_BUS),
+            devtype: Some("usb_device"),
+            data: Some(Arc::new(UsbDevNode {
+                dev: d,
+                busnum,
+                devnum,
+            })),
+            attrs: Some(usb_attrs),
+            ..DeviceInfo::named(&name)
         });
-
-        // Remove from devices list
-        self.devices.remove(device_idx);
-
-        printkln!("USB: Device {} removed successfully", bus_id);
-        Ok(())
+        if let Ok(dev) = r {
+            out.push(dev);
+        }
     }
+    out.push(root);
+    out
 }

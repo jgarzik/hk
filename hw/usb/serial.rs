@@ -3,8 +3,7 @@
 //! Implements USB Communications Device Class - Abstract Control Model
 //! for USB serial devices.
 //!
-//! Implements `BusDriver` for the USB bus to be automatically matched
-//! against CDC-ACM devices.
+//! `USB_SERIAL_DRIVER` binds on the USB bus.
 //!
 //! ## Console Integration
 //!
@@ -15,85 +14,35 @@
 use alloc::boxed::Box;
 use core::any::Any;
 
-use crate::bus::bus::{BusContext, BusDevice, BusDriver};
-use crate::bus::driver::Device;
 use crate::console::{ConsoleDriver, ConsolePriority, register_console};
-use crate::downcast_bus_device;
 use crate::printkln;
 use crate::util::error::KernelError;
 
 use super::{SetupPacket, UsbDevice, UsbSpeed, cdc_subclass, class};
 
 // ============================================================================
-// USB Serial Bus Driver (Bus/Driver Model)
+// USB serial driver
 // ============================================================================
 
-/// USB Serial driver for the bus/driver model
-///
-/// This driver matches USB devices with CDC-ACM class (Communications Device
-/// Class - Abstract Control Model) and creates serial device instances.
-pub struct UsbSerialBusDriver;
+/// The USB serial driver: its port becomes a console
+pub static USB_SERIAL_DRIVER: crate::base::Driver = crate::base::Driver::new(
+    "usb-serial",
+    &super::USB_BUS,
+    Some("usbserial"),
+    &super::UsbIds(UsbSerial::is_cdc_acm_device),
+    usb_serial_probe,
+);
 
-impl BusDriver for UsbSerialBusDriver {
-    fn name(&self) -> &str {
-        "usb-serial"
-    }
-
-    fn matches(&self, device: &dyn BusDevice) -> bool {
-        if let Some(usb_dev) = downcast_bus_device!(device, UsbDevice) {
-            return UsbSerial::is_cdc_acm_device(usb_dev);
-        }
-        false
-    }
-
-    /// Remove a USB serial device (hotplug)
-    ///
-    /// Called when the USB device is disconnected. Clears the global
-    /// console registration to prevent writes to disconnected device.
-    fn remove(&self, device: &dyn BusDevice) -> Result<(), KernelError> {
-        let usb_dev = downcast_bus_device!(device, UsbDevice).ok_or(KernelError::NoDevice)?;
-
-        printkln!(
-            "UsbSerial: Removing device slot {} (bus_id: {})",
-            usb_dev.slot_id,
-            BusDevice::bus_id(usb_dev)
-        );
-
-        // Off the console list; a printk holding a snapshot of the list
-        // may still call it, so it stays allocated and just goes quiet
-        let gone = USB_SERIAL_CONSOLE.lock().take();
-        if let Some(c) = gone {
-            c.alive.store(false, core::sync::atomic::Ordering::Release);
-            crate::console::unregister_console(c.name);
-        }
-
-        printkln!("UsbSerial: Device slot {} removed", usb_dev.slot_id);
-        Ok(())
-    }
-
-    fn probe(
-        &self,
-        device: &dyn BusDevice,
-        _ctx: &mut BusContext,
-    ) -> Result<Box<dyn Device>, KernelError> {
-        let usb_dev = downcast_bus_device!(device, UsbDevice).ok_or(KernelError::NoDevice)?;
-
-        printkln!(
-            "UsbSerial: Probing USB device at {}",
-            BusDevice::bus_id(usb_dev)
-        );
-
-        // Create USB serial device
-        let serial = UsbSerial::new(usb_dev.clone()).ok_or(KernelError::Io)?;
-
-        // Register as console with Normal priority
-        // This allows USB serial to take precedence over legacy serial
-        register_usb_serial_console(&serial);
-
-        printkln!("USB_SERIAL_READY: {}", serial.name());
-
-        Ok(Box::new(serial))
-    }
+fn usb_serial_probe(
+    dev: &alloc::sync::Arc<crate::base::Device>,
+) -> Result<Box<dyn crate::base::Bound>, KernelError> {
+    let usb_dev = super::usb_dev(dev).ok_or(KernelError::NoDevice)?;
+    printkln!("UsbSerial: Probing USB device at {}", dev.name());
+    let serial = UsbSerial::new(usb_dev.clone()).ok_or(KernelError::Io)?;
+    // A console of Normal priority, ahead of the legacy serial port
+    register_usb_serial_console(&serial);
+    printkln!("USB_SERIAL_READY: {}", serial.name());
+    Ok(Box::new(serial))
 }
 
 /// CDC-ACM Line Coding structure
@@ -252,13 +201,25 @@ impl UsbSerial {
     }
 }
 
-impl Device for UsbSerial {
-    fn name(&self) -> &str {
+impl UsbSerial {
+    pub fn name(&self) -> &str {
         "usb-serial"
     }
+}
 
+impl crate::base::Bound for UsbSerial {
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    /// Off the console list; a printk holding a snapshot of the list
+    /// may still call it, so it stays allocated and just goes quiet
+    fn remove(&self) {
+        let gone = USB_SERIAL_CONSOLE.lock().take();
+        if let Some(c) = gone {
+            c.alive.store(false, core::sync::atomic::Ordering::Release);
+            crate::console::unregister_console(c.name);
+        }
     }
 }
 

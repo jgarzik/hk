@@ -2,8 +2,7 @@
 //!
 //! Implements the USB host controller interface for xHCI (eXtensible Host Controller Interface).
 //!
-//! Also implements `BusDriver` for the PCI bus, so xHCI controllers are discovered
-//! automatically during PCI enumeration.
+//! `XHCI_PCI_DRIVER` binds the controller on the PCI bus.
 #![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use alloc::boxed::Box;
@@ -16,10 +15,8 @@ use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering, fence};
 
 use crate::sync::spin::Mutex;
 
+use crate::arch::FrameAlloc;
 use crate::arch::{CurrentArch, IoremapOps, phys_to_virt};
-use crate::bus::bus::{BusContext, BusDevice, BusDriver};
-use crate::bus::driver::Device;
-use crate::downcast_bus_device;
 use crate::hw::pci::PciDevice;
 use crate::printkln;
 use crate::time::delay::{poll_timeout, udelay};
@@ -89,7 +86,7 @@ fn hcc_dma_mask(params1: u32) -> u64 {
 
 use super::context::{InputContext, OutputDeviceContext, endpoint_to_dci};
 use super::transfer::{CompletionCode, TransferRing, Trb as TransferTrb, TrbType};
-use super::{SetupPacket, UsbBus, UsbController, UsbDevice, UsbError, UsbSpeed};
+use super::{SetupPacket, UsbController, UsbDevice, UsbError, UsbSpeed};
 
 // ============================================================================
 // Global USB Host Access
@@ -285,121 +282,58 @@ fn store_usb_host(controller: XhciController) {
     *USB_CONTROLLER.lock() = Some(controller);
 }
 
-/// Clear the USB host controller (hotplug removal)
-fn clear_usb_host() {
-    let mut guard = acquire_usb_controller();
-    if let Some(ref mut controller) = *guard {
-        controller.shutdown();
-    }
-    *guard = None;
-}
-
 // ============================================================================
-// xHCI PCI Bus Driver (Bus/Driver Model)
+// xHCI PCI driver
 // ============================================================================
 
-/// xHCI PCI driver for the bus/driver model
-///
-/// This driver matches PCI devices with class 0C:03:30 (xHCI USB controller)
-/// and creates a USB bus instance when probed.
-pub struct XhciPciDriver;
+/// The xHCI PCI driver (Linux xhci-pci: class 0C:03:30)
+pub static XHCI_PCI_DRIVER: crate::base::Driver = crate::base::Driver::new(
+    "xhci_hcd",
+    &crate::hw::pci::driver::PCI_BUS,
+    Some("xhci_pci"),
+    &crate::hw::pci::driver::PciIds(&[crate::hw::pci::driver::PciDeviceId::class(
+        0x0c0330, 0xffffff,
+    )]),
+    xhci_probe,
+);
 
-impl BusDriver for XhciPciDriver {
-    fn name(&self) -> &str {
-        "xhci-pci"
+/// Bring the controller up, enumerate its ports and register the USB
+/// devices below it (Linux usb_add_hcd: root hub, then hub_event)
+fn xhci_probe(
+    dev: &alloc::sync::Arc<crate::base::Device>,
+) -> Result<Box<dyn crate::base::Bound>, KernelError> {
+    let pci_dev = crate::hw::pci::driver::pci_dev(dev).ok_or(KernelError::NoDevice)?;
+    let mmio_base = pci_dev.bar_address(0).ok_or(KernelError::NoDevice)?;
+    pci_dev.enable_memory_space();
+    pci_dev.enable_bus_master();
+    printkln!(
+        "xHCI: Probing PCI device at {}, BAR0=0x{:x}",
+        pci_dev.bus_id(),
+        mmio_base
+    );
+
+    let mut controller = XhciController::new(mmio_base, pci_dev.clone());
+    let mut fa = crate::mm::frame_alloc::FrameAllocRef(&crate::FRAME_ALLOCATOR);
+    if let Err(e) = controller.init_with_frame_alloc(&mut fa) {
+        printkln!("xHCI: Failed to initialize controller: {:?}", e);
+        return Err(KernelError::Io);
     }
-
-    fn matches(&self, device: &dyn BusDevice) -> bool {
-        // Downcast to PciDevice and check class code
-        if let Some(pci_dev) = downcast_bus_device!(device, PciDevice) {
-            return pci_dev.is_xhci();
-        }
-        false
-    }
-
-    /// Remove the xHCI controller (hotplug/driver unload)
-    ///
-    /// Called when the PCI device is being removed. Performs full cleanup:
-    /// 1. Shutdown all USB devices
-    /// 2. Halt controller
-    /// 3. Unregister IRQ
-    /// 4. Clear global state
-    fn remove(&self, device: &dyn BusDevice) -> Result<(), KernelError> {
-        let pci_dev = downcast_bus_device!(device, PciDevice).ok_or(KernelError::NoDevice)?;
-        printkln!(
-            "xHCI: Removing PCI device at {}",
-            BusDevice::bus_id(pci_dev)
-        );
-
-        // Clear the global USB controller (calls shutdown)
-        clear_usb_host();
-
-        printkln!("xHCI: PCI device removed");
-        Ok(())
-    }
-
-    fn probe(
-        &self,
-        device: &dyn BusDevice,
-        ctx: &mut BusContext,
-    ) -> Result<Box<dyn Device>, KernelError> {
-        let pci_dev = downcast_bus_device!(device, PciDevice).ok_or(KernelError::NoDevice)?;
-
-        // Get BAR0 for MMIO
-        let mmio_base = pci_dev.bar_address(0).ok_or(KernelError::NoDevice)?;
-
-        // Enable memory space and bus mastering
-        pci_dev.enable_memory_space();
-        pci_dev.enable_bus_master();
-
-        printkln!(
-            "xHCI: Probing PCI device at {}, BAR0=0x{:x}",
-            BusDevice::bus_id(pci_dev),
-            mmio_base
-        );
-
-        // Create and initialize controller
-        let mut controller = XhciController::new(mmio_base, pci_dev.clone());
-
-        // Initialize with frame allocator from context
-        if let Err(e) = controller.init_from_context(ctx) {
-            printkln!("xHCI: Failed to initialize controller: {:?}", e);
-            return Err(KernelError::Io);
-        }
-
-        // Enumerate USB devices
-        let usb_devices = match controller.enumerate_devices() {
-            Ok(devices) => devices,
-            Err(e) => {
-                printkln!("xHCI: Failed to enumerate devices: {:?}", e);
-                Vec::new()
-            }
-        };
-
-        // Store controller for global access (USB MSC driver needs this)
-        let num_devices = controller.devices.len();
-        store_usb_host(controller);
-
-        // Create USB bus with discovered devices
-        let usb_bus = UsbBus::new(usb_devices);
-
-        // Register the USB bus (will be added to BusManager)
-        ctx.new_buses.push(("usb", Box::new(usb_bus)));
-        printkln!("xHCI: Created USB bus with {} device(s)", num_devices);
-
-        // Return a wrapper device
-        Ok(Box::new(XhciDeviceHandle))
-    }
+    let usb_devices = controller.enumerate_devices().unwrap_or_else(|e| {
+        printkln!("xHCI: Failed to enumerate devices: {:?}", e);
+        Vec::new()
+    });
+    // Stored for global access (the USB drivers' transfers)
+    store_usb_host(controller);
+    let usb = super::usb_register_devices(dev, usb_devices);
+    Ok(Box::new(XhciDeviceHandle { _usb: usb }))
 }
 
-/// Device handle returned from xHCI probe
-struct XhciDeviceHandle;
+/// A bound xHCI: its USB devices
+struct XhciDeviceHandle {
+    _usb: Vec<alloc::sync::Arc<crate::base::Device>>,
+}
 
-impl Device for XhciDeviceHandle {
-    fn name(&self) -> &str {
-        "xhci"
-    }
-
+impl crate::base::Bound for XhciDeviceHandle {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -555,7 +489,9 @@ struct CommandRing {
 impl CommandRing {
     const SIZE: usize = 64;
 
-    fn new_with_wrapper(frame_alloc: &mut dyn crate::bus::bus::FrameAllocWrapper) -> Option<Self> {
+    fn new_with_wrapper(
+        frame_alloc: &mut crate::mm::frame_alloc::FrameAllocRef<'_>,
+    ) -> Option<Self> {
         let phys = frame_alloc.alloc_frame()?;
         Self::init_from_phys(phys)
     }
@@ -648,7 +584,9 @@ struct EventRing {
 impl EventRing {
     const SIZE: usize = 64;
 
-    fn new_with_wrapper(frame_alloc: &mut dyn crate::bus::bus::FrameAllocWrapper) -> Option<Self> {
+    fn new_with_wrapper(
+        frame_alloc: &mut crate::mm::frame_alloc::FrameAllocRef<'_>,
+    ) -> Option<Self> {
         let phys = frame_alloc.alloc_frame()?;
         let erst_phys = frame_alloc.alloc_frame()?;
         Self::init_from_phys(phys, erst_phys)
@@ -832,15 +770,10 @@ impl XhciController {
         }
     }
 
-    /// Initialize the controller from a BusContext
-    pub fn init_from_context(&mut self, ctx: &mut BusContext) -> Result<(), UsbError> {
-        self.init_with_frame_alloc(ctx.frame_alloc)
-    }
-
-    /// Initialize with a frame allocator wrapper (from BusContext)
+    /// Initialize, allocating rings and contexts from `frame_alloc`
     fn init_with_frame_alloc(
         &mut self,
-        frame_alloc: &mut dyn crate::bus::bus::FrameAllocWrapper,
+        frame_alloc: &mut crate::mm::frame_alloc::FrameAllocRef<'_>,
     ) -> Result<(), UsbError> {
         // Map MMIO region using ioremap (allocates virtual addresses from dedicated region)
         let bar_size = self.pci_dev.bar_size(0);
@@ -935,7 +868,7 @@ impl XhciController {
     /// address and use whatever that memory holds as page pointers.
     fn alloc_scratchpads(
         &mut self,
-        frame_alloc: &mut dyn crate::bus::bus::FrameAllocWrapper,
+        frame_alloc: &mut crate::mm::frame_alloc::FrameAllocRef<'_>,
     ) -> Result<(), UsbError> {
         let n = hcs_max_scratchpad(self.read_cap(0x08));
         if n == 0 {
@@ -951,7 +884,7 @@ impl XhciController {
             );
             return Err(UsbError::NoResources);
         }
-        let zeroed = |fa: &mut dyn crate::bus::bus::FrameAllocWrapper| {
+        let zeroed = |fa: &mut crate::mm::frame_alloc::FrameAllocRef<'_>| {
             let phys = fa.alloc_frame()?;
             // SAFETY: a fresh frame, in the direct map
             unsafe { core::ptr::write_bytes(phys_to_virt(phys), 0, 4096) };
@@ -1883,16 +1816,6 @@ impl XhciController {
 
         self.initialized = false;
         printkln!("xHCI: Controller shutdown complete");
-    }
-}
-
-impl Device for XhciController {
-    fn name(&self) -> &str {
-        "xhci"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 }
 

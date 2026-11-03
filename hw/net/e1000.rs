@@ -37,8 +37,6 @@ use crate::sync::spin::Mutex;
 use spin::Once;
 
 use crate::arch::barrier::{dma_rmb, dma_wmb, wmb};
-use crate::bus::bus::{BusContext, BusDevice, BusDriver};
-use crate::bus::driver::Device;
 use crate::hw::dma::DmaCoherent;
 use crate::hw::pci::PciDevice;
 use crate::net;
@@ -593,11 +591,7 @@ struct E1000DeviceWrapper {
     device: Arc<E1000>,
 }
 
-impl Device for E1000DeviceWrapper {
-    fn name(&self) -> &str {
-        "e1000"
-    }
-
+impl crate::base::Bound for E1000DeviceWrapper {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -614,8 +608,17 @@ impl Device for E1000DeviceWrapper {
     }
 }
 
-/// e1000 PCI driver
-pub struct E1000PciDriver;
+/// The e1000 PCI driver (Linux e1000: 82540EM, 82545EM copper)
+pub static E1000_DRIVER: crate::base::Driver = crate::base::Driver::new(
+    "e1000",
+    &crate::hw::pci::driver::PCI_BUS,
+    Some("e1000"),
+    &crate::hw::pci::driver::PciIds(&[
+        crate::hw::pci::driver::PciDeviceId::device(VENDOR_INTEL, DEVICE_82540EM),
+        crate::hw::pci::driver::PciDeviceId::device(VENDOR_INTEL, DEVICE_82545EM_COPPER),
+    ]),
+    e1000_probe,
+);
 
 fn alloc_bufs(pci: &PciDevice, n: usize) -> Result<Vec<DmaCoherent>, KernelError> {
     let mut v = Vec::with_capacity(n);
@@ -626,132 +629,111 @@ fn alloc_bufs(pci: &PciDevice, n: usize) -> Result<Vec<DmaCoherent>, KernelError
     Ok(v)
 }
 
-impl BusDriver for E1000PciDriver {
-    fn name(&self) -> &str {
-        "e1000"
+fn e1000_probe(
+    pdev: &Arc<crate::base::Device>,
+) -> Result<Box<dyn crate::base::Bound>, KernelError> {
+    let pci = crate::hw::pci::driver::pci_dev(pdev).ok_or(KernelError::NoDevice)?;
+
+    printkln!(
+        "e1000: probing {:04x}:{:04x} at {}",
+        pci.header.vendor_id,
+        pci.header.device_id,
+        pci.bus_id()
+    );
+
+    let bar0 = pci.header.bar[0];
+    if bar0 == 0 {
+        printkln!("e1000: BAR0 not configured");
+        return Err(KernelError::NoDevice);
     }
+    let mmio_phys = (bar0 & !0xF) as u64;
+    // SAFETY: BAR0 of this e1000, its 128KB register space
+    let Some(regs) = (unsafe { crate::hw::mmio::IoMem::ioremap(mmio_phys, 128 * 1024) }) else {
+        printkln!("e1000: Failed to ioremap MMIO region");
+        return Err(KernelError::NoDevice);
+    };
 
-    fn matches(&self, device: &dyn BusDevice) -> bool {
-        if let Some(pci) = device.as_any().downcast_ref::<PciDevice>() {
-            pci.header.vendor_id == VENDOR_INTEL
-                && (pci.header.device_id == DEVICE_82540EM
-                    || pci.header.device_id == DEVICE_82545EM_COPPER)
-        } else {
-            false
-        }
+    // The device DMAs descriptors and packets: it must master the bus
+    pci.enable_memory_space();
+    pci.enable_bus_master();
+
+    let rx_desc =
+        crate::hw::dma::dma_alloc_coherent(pci, RX_RING_SIZE * 16).ok_or(KernelError::NoDevice)?;
+    let tx_desc =
+        crate::hw::dma::dma_alloc_coherent(pci, TX_RING_SIZE * 16).ok_or(KernelError::NoDevice)?;
+    let rx_bufs = alloc_bufs(pci, RX_RING_SIZE)?;
+    let tx_bufs = alloc_bufs(pci, TX_RING_SIZE)?;
+
+    let mut dev = E1000 {
+        regs,
+        mac: [0; 6],
+        rx: Mutex::new(RxRing {
+            desc: rx_desc,
+            bufs: rx_bufs,
+            next: 0,
+        }),
+        tx: Mutex::new(TxRing {
+            desc: tx_desc,
+            bufs: tx_bufs,
+            tail: 0,
+            clean: 0,
+        }),
+        napi: Napi::new(NAPI_POLL_WEIGHT),
+        netdev: Once::new(),
+        pending_icr: AtomicU32::new(0),
+        irqs: AtomicU64::new(0),
+        irqs_not_ours: AtomicU64::new(0),
+    };
+
+    dev.reset();
+    dev.mac = dev.read_mac();
+    let mac = dev.mac;
+    printkln!(
+        "e1000: MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        mac[0],
+        mac[1],
+        mac[2],
+        mac[3],
+        mac[4],
+        mac[5]
+    );
+    dev.set_mac_filter();
+    dev.init_rx();
+    dev.init_tx();
+
+    let device = Arc::new(dev);
+    let poller: Weak<dyn NapiPoll> = Arc::downgrade(&device) as Weak<dyn NapiPoll>;
+    net::dev::netif_napi_add(&device.napi, poller);
+
+    let ops: &'static dyn NetDeviceOps = Box::leak(Box::new(E1000Ops {
+        device: Arc::clone(&device),
+    }));
+    // RTNL from naming to registration (Linux register_netdev)
+    let (rtnl, netdev) = net::alloc_netdev("eth%d", mac, LinkInfo::ETHER, ops);
+    device.netdev.call_once(|| Arc::downgrade(&netdev));
+
+    // Carrier from the PHY now; later changes arrive as LSC interrupts
+    if device.link_up() {
+        netdev.netif_carrier_on();
+    } else {
+        netdev.netif_carrier_off();
     }
+    printkln!(
+        "e1000: link {}",
+        if device.link_up() { "up" } else { "down" }
+    );
 
-    fn probe(
-        &self,
-        device: &dyn BusDevice,
-        _ctx: &mut BusContext,
-    ) -> Result<Box<dyn Device>, KernelError> {
-        let pci = device
-            .as_any()
-            .downcast_ref::<PciDevice>()
-            .ok_or(KernelError::NoDevice)?;
-
-        printkln!(
-            "e1000: probing {:04x}:{:04x} at {}",
-            pci.header.vendor_id,
-            pci.header.device_id,
-            pci.bus_id()
-        );
-
-        let bar0 = pci.header.bar[0];
-        if bar0 == 0 {
-            printkln!("e1000: BAR0 not configured");
+    // Shareable level-triggered INTx; the device's interrupts stay
+    // masked until userspace brings the interface up (open())
+    match pci.register_irq_handler(e1000_isr, Arc::as_ptr(&device) as *mut ()) {
+        Ok(irq) => printkln!("e1000: IRQ {}", irq),
+        Err(e) => {
+            printkln!("e1000: no IRQ ({}), RX disabled", e);
             return Err(KernelError::NoDevice);
         }
-        let mmio_phys = (bar0 & !0xF) as u64;
-        // SAFETY: BAR0 of this e1000, its 128KB register space
-        let Some(regs) = (unsafe { crate::hw::mmio::IoMem::ioremap(mmio_phys, 128 * 1024) }) else {
-            printkln!("e1000: Failed to ioremap MMIO region");
-            return Err(KernelError::NoDevice);
-        };
-
-        // The device DMAs descriptors and packets: it must master the bus
-        pci.enable_memory_space();
-        pci.enable_bus_master();
-
-        let rx_desc = crate::hw::dma::dma_alloc_coherent(pci, RX_RING_SIZE * 16)
-            .ok_or(KernelError::NoDevice)?;
-        let tx_desc = crate::hw::dma::dma_alloc_coherent(pci, TX_RING_SIZE * 16)
-            .ok_or(KernelError::NoDevice)?;
-        let rx_bufs = alloc_bufs(pci, RX_RING_SIZE)?;
-        let tx_bufs = alloc_bufs(pci, TX_RING_SIZE)?;
-
-        let mut dev = E1000 {
-            regs,
-            mac: [0; 6],
-            rx: Mutex::new(RxRing {
-                desc: rx_desc,
-                bufs: rx_bufs,
-                next: 0,
-            }),
-            tx: Mutex::new(TxRing {
-                desc: tx_desc,
-                bufs: tx_bufs,
-                tail: 0,
-                clean: 0,
-            }),
-            napi: Napi::new(NAPI_POLL_WEIGHT),
-            netdev: Once::new(),
-            pending_icr: AtomicU32::new(0),
-            irqs: AtomicU64::new(0),
-            irqs_not_ours: AtomicU64::new(0),
-        };
-
-        dev.reset();
-        dev.mac = dev.read_mac();
-        let mac = dev.mac;
-        printkln!(
-            "e1000: MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-            mac[0],
-            mac[1],
-            mac[2],
-            mac[3],
-            mac[4],
-            mac[5]
-        );
-        dev.set_mac_filter();
-        dev.init_rx();
-        dev.init_tx();
-
-        let device = Arc::new(dev);
-        let poller: Weak<dyn NapiPoll> = Arc::downgrade(&device) as Weak<dyn NapiPoll>;
-        net::dev::netif_napi_add(&device.napi, poller);
-
-        let ops: &'static dyn NetDeviceOps = Box::leak(Box::new(E1000Ops {
-            device: Arc::clone(&device),
-        }));
-        // RTNL from naming to registration (Linux register_netdev)
-        let (rtnl, netdev) = net::alloc_netdev("eth%d", mac, LinkInfo::ETHER, ops);
-        device.netdev.call_once(|| Arc::downgrade(&netdev));
-
-        // Carrier from the PHY now; later changes arrive as LSC interrupts
-        if device.link_up() {
-            netdev.netif_carrier_on();
-        } else {
-            netdev.netif_carrier_off();
-        }
-        printkln!(
-            "e1000: link {}",
-            if device.link_up() { "up" } else { "down" }
-        );
-
-        // Shareable level-triggered INTx; the device's interrupts stay
-        // masked until userspace brings the interface up (open())
-        match pci.register_irq_handler(e1000_isr, Arc::as_ptr(&device) as *mut ()) {
-            Ok(irq) => printkln!("e1000: IRQ {}", irq),
-            Err(e) => {
-                printkln!("e1000: no IRQ ({}), RX disabled", e);
-                return Err(KernelError::NoDevice);
-            }
-        }
-
-        net::register_netdev(rtnl, Arc::clone(&netdev));
-
-        Ok(Box::new(E1000DeviceWrapper { netdev, device }))
     }
+
+    net::register_netdev(rtnl, Arc::clone(&netdev));
+
+    Ok(Box::new(E1000DeviceWrapper { netdev, device }))
 }

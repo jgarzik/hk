@@ -73,8 +73,9 @@ pub fn driver_attach(drv: &'static Driver) {
 pub fn device_release_driver(dev: &Arc<Device>) {
     let g = dev.lock.lock();
     let Some(drv) = dev.driver() else { return };
-    let bound = dev.set_bound(None);
-    drop(bound);
+    if let Some(b) = dev.set_bound(None) {
+        b.remove();
+    }
     dev.set_driver(None);
     dev.kobj().remove_child(b"driver");
     drv.dir().remove_child(dev.name().as_bytes());

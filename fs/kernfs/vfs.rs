@@ -7,7 +7,8 @@
 //! a per-open buffer that continuing reads slice;
 //! one write() is one store() of at most `ATTR_MAX` bytes (E2BIG past
 //! it, Linux atomic_write_len). poll() reports POLLERR|POLLPRI once the
-//! node was notified since the file last read it.
+//! node was notified since the file last read it. Binary attributes
+//! read and write at the file offset, below their size.
 //!
 //! ## Locking
 //!
@@ -18,7 +19,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use super::{ATTR_MAX, AttrNode, KNode, Kind, SysBuf};
+use super::{ATTR_MAX, AttrNode, BinAttr, KNode, Kind, SysBuf};
 use crate::fs::KernelError;
 use crate::fs::file::{DirContext, DirEntry, File, FileOps, generic_llseek};
 use crate::fs::inode::{AsAny, FileType, Inode, InodeAttr, InodeData, InodeMode, InodeOps};
@@ -48,6 +49,7 @@ pub fn inode(sb: &Arc<SuperBlock>, kn: &Arc<KNode>) -> Arc<Inode> {
     let (mode, size) = match &kn.kind {
         Kind::Dir(_) => (InodeMode::directory(kn.mode), 0),
         Kind::Attr(_) => (InodeMode::regular(kn.mode), ATTR_MAX as u64),
+        Kind::Bin(b) => (InodeMode::regular(kn.mode), b.size()),
         Kind::Link(_) => (InodeMode::symlink(), 0),
     };
     let now = crate::time::TIMEKEEPER.current_time();
@@ -162,8 +164,39 @@ impl OpenAttr {
 
 pub struct KernfsFops;
 
+/// The node of an open binary attribute
+fn bin_of(file: &File) -> Option<(Arc<KNode>, Arc<dyn BinAttr>)> {
+    let kn = knode(&*file.get_inode()?)?;
+    match &kn.kind {
+        Kind::Bin(b) => {
+            let b = b.clone();
+            Some((kn, b))
+        }
+        _ => None,
+    }
+}
+
+/// Linux sysfs_kf_bin_read/write: clipped to the size, EOF past it
+fn bin_io(
+    kn: &KNode,
+    b: &dyn BinAttr,
+    off: u64,
+    len: usize,
+    io: impl FnOnce(usize) -> Result<usize, KernelError>,
+) -> Result<usize, KernelError> {
+    let _act = kn.get_active().ok_or(KernelError::NoDevice)?;
+    let size = b.size();
+    if off >= size {
+        return Ok(0);
+    }
+    io(len.min((size - off) as usize))
+}
+
 impl KernfsFops {
     fn read_at(&self, file: &File, buf: &mut [u8], off: u64) -> Result<usize, KernelError> {
+        if let Some((kn, b)) = bin_of(file) {
+            return bin_io(&kn, &*b, off, buf.len(), |n| b.read(off, &mut buf[..n]));
+        }
         let (kn, of) = attr_of(file)?;
         let a = attr_node(&kn);
         let mut b = of.buf.lock();
@@ -184,7 +217,10 @@ impl KernfsFops {
         Ok(n)
     }
 
-    fn write_any(&self, file: &File, data: &[u8]) -> Result<usize, KernelError> {
+    fn write_any(&self, file: &File, data: &[u8], off: u64) -> Result<usize, KernelError> {
+        if let Some((kn, b)) = bin_of(file) {
+            return bin_io(&kn, &*b, off, data.len(), |n| b.write(off, &data[..n]));
+        }
         let (kn, of) = attr_of(file)?;
         if data.len() > ATTR_MAX {
             return Err(KernelError::ArgListTooLong);
@@ -208,13 +244,16 @@ impl FileOps for KernfsFops {
     fn open(&self, file: &File) -> Result<(), KernelError> {
         let inode = file.get_inode().ok_or(KernelError::BadFd)?;
         let kn = knode(&inode).ok_or(KernelError::Io)?;
-        if !matches!(kn.kind, Kind::Attr(_)) {
+        if !matches!(kn.kind, Kind::Attr(_) | Kind::Bin(_)) {
             return Ok(());
         }
         if (file.is_writable() && kn.mode & 0o222 == 0)
             || (file.is_readable() && kn.mode & 0o444 == 0)
         {
             return Err(KernelError::PermissionDenied);
+        }
+        if matches!(kn.kind, Kind::Bin(_)) {
+            return Ok(());
         }
         let _act = kn.get_active().ok_or(KernelError::NoDevice)?;
         let of = OpenAttr {
@@ -237,13 +276,14 @@ impl FileOps for KernfsFops {
     }
 
     fn write(&self, file: &File, data: &[u8]) -> Result<usize, KernelError> {
-        let n = self.write_any(file, data)?;
-        file.set_pos(file.get_pos() + n as u64);
+        let pos = file.get_pos();
+        let n = self.write_any(file, data, pos)?;
+        file.set_pos(pos + n as u64);
         Ok(n)
     }
 
-    fn pwrite(&self, file: &File, data: &[u8], _off: u64) -> Result<usize, KernelError> {
-        self.write_any(file, data)
+    fn pwrite(&self, file: &File, data: &[u8], off: u64) -> Result<usize, KernelError> {
+        self.write_any(file, data, off)
     }
 
     /// Linux kernfs_fop_llseek: generic_file_llseek (SEEK_END is
@@ -280,7 +320,7 @@ impl FileOps for KernfsFops {
             }
             let file_type = match n.kind {
                 Kind::Dir(_) => FileType::Directory,
-                Kind::Attr(_) => FileType::Regular,
+                Kind::Attr(_) | Kind::Bin(_) => FileType::Regular,
                 Kind::Link(_) => FileType::Symlink,
             };
             let e = DirEntry {

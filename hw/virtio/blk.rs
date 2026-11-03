@@ -38,7 +38,6 @@ use crate::arch::phys_to_virt;
 use crate::block::blk_mq::{BlkMq, MqOps, Queued};
 use crate::block::blkdev::{Bio, BioList, BioOp, Disk, QueueLimits, RequestQueue, register_blkdev};
 use crate::block::genhd::{add_disk, disk_name};
-use crate::bus::driver::Device;
 use crate::hw::dma::{DmaAddr, DmaCoherent, DmaDirection, dma_map_single, dma_unmap_single};
 use crate::hw::virtio::ring::Sg;
 use crate::hw::virtio::{self, VirtioDevice, VirtioDriver, VirtioIrq, Virtqueue};
@@ -279,11 +278,7 @@ impl VirtioIrq for VirtioBlk {
 
 struct VirtioBlkDev(Arc<VirtioBlk>);
 
-impl Device for VirtioBlkDev {
-    fn name(&self) -> &str {
-        "virtio-blk"
-    }
-
+impl crate::base::Bound for VirtioBlkDev {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -420,7 +415,7 @@ impl VirtioDriver for VirtioBlkDriver {
         .fold(0, |f, b| f | (1 << b))
     }
 
-    fn probe(&self, vdev: Arc<VirtioDevice>) -> Result<Box<dyn Device>, KernelError> {
+    fn probe(&self, vdev: Arc<VirtioDevice>) -> Result<Box<dyn crate::base::Bound>, KernelError> {
         let disk = new_disk(&vdev)?;
         let blk = Arc::new(VirtioBlk {
             vdev: vdev.clone(),

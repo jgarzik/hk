@@ -43,7 +43,6 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use crate::sync::spin::Mutex;
 use spin::Once;
 
-use crate::bus::driver::Device;
 use crate::hw::dma::DmaCoherent;
 use crate::hw::virtio::ring::{Sg, VringCb};
 use crate::hw::virtio::{self, VirtioDevice, VirtioDriver, VirtioIrq, Virtqueue};
@@ -369,11 +368,7 @@ struct VirtioNetWrapper {
     device: Arc<VirtioNet>,
 }
 
-impl Device for VirtioNetWrapper {
-    fn name(&self) -> &str {
-        "virtio-net"
-    }
-
+impl crate::base::Bound for VirtioNetWrapper {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -441,7 +436,7 @@ impl VirtioDriver for VirtioNetDriver {
         (1 << feature::MAC) | (1 << feature::STATUS)
     }
 
-    fn probe(&self, vdev: Arc<VirtioDevice>) -> Result<Box<dyn Device>, KernelError> {
+    fn probe(&self, vdev: Arc<VirtioDevice>) -> Result<Box<dyn crate::base::Bound>, KernelError> {
         let mac = read_mac(&vdev);
         let (rx, tx) = setup_queues(&vdev)?;
         let rx_cb = rx.vq.cb();

@@ -19,10 +19,9 @@ use alloc::vec::Vec;
 
 use crate::sync::spin::Mutex;
 
-use crate::bus::driver::Device;
 use crate::util::error::KernelError;
 
-pub use pci::{VirtioDevice, VirtioPciDriver, Virtqueue};
+pub use pci::{VIRTIO_PCI_DRIVER, VirtioDevice, Virtqueue};
 
 /// Device status bits (virtio 1.2 section 2.1)
 pub mod status {
@@ -82,7 +81,7 @@ pub trait VirtioDriver: Send + Sync {
     fn features(&self) -> u64;
     /// Bind to a device whose features are negotiated (FEATURES_OK set);
     /// the driver must call `ready()` before returning success
-    fn probe(&self, vdev: Arc<VirtioDevice>) -> Result<Box<dyn Device>, KernelError>;
+    fn probe(&self, vdev: Arc<VirtioDevice>) -> Result<Box<dyn crate::base::Bound>, KernelError>;
 }
 
 /// Registered virtio drivers (written at boot before bus enumeration)

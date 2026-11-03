@@ -1,6 +1,6 @@
 //! kernfs: the in-memory tree behind sysfs (Linux fs/kernfs)
 //!
-//! A `KNode` is a directory, an attribute or a symlink. Nodes live
+//! A `KNode` is a directory, a text or binary attribute, or a symlink. Nodes live
 //! independently of any mount: subsystems build the tree from early
 //! boot on, and each sysfs mount shows it through `vfs.rs`, which makes
 //! inodes on lookup.
@@ -79,6 +79,20 @@ pub trait Attr: Send + Sync {
     }
 }
 
+/// A binary attribute (Linux bin_attribute): raw reads and writes at an
+/// offset below `size`, no show() buffering
+pub trait BinAttr: Send + Sync {
+    /// st_size
+    fn size(&self) -> u64;
+
+    fn read(&self, off: u64, buf: &mut [u8]) -> Result<usize, KernelError>;
+
+    fn write(&self, off: u64, data: &[u8]) -> Result<usize, KernelError> {
+        let _ = (off, data);
+        Err(KernelError::Io)
+    }
+}
+
 /// Read-only attribute from a closure
 pub struct ShowFn<F>(pub F);
 
@@ -109,6 +123,7 @@ pub type Children = RwLock<BTreeMap<(u32, Vec<u8>), Arc<KNode>>>;
 pub enum Kind {
     Dir(Children),
     Attr(AttrNode),
+    Bin(Arc<dyn BinAttr>),
     /// Symlink to a node (Linux holds a reference; a link outliving its
     /// target reads as ENOENT)
     Link(Weak<KNode>),
@@ -280,6 +295,16 @@ impl KNode {
             poll: WaitQueue::new(),
         };
         self.add(Self::new(name, mode, Kind::Attr(a)))
+    }
+
+    /// New binary attribute `name`
+    pub fn create_bin(
+        self: &Arc<Self>,
+        name: &[u8],
+        mode: u16,
+        ops: Arc<dyn BinAttr>,
+    ) -> Result<Arc<KNode>, KernelError> {
+        self.add(Self::new(name, mode, Kind::Bin(ops)))
     }
 
     /// New symlink `name` -> `target`
