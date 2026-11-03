@@ -10,8 +10,8 @@
 //!   - Multiple console= options can be specified; all receive output
 //!   - The last one specified is the primary console
 
+use crate::hw::usb;
 use crate::sync::spin::Mutex;
-use crate::usb;
 
 /// Maximum number of console specifications from command line
 const MAX_CONSOLE_SPECS: usize = 4;

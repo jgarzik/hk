@@ -10,7 +10,7 @@
 //! - OutputDeviceContext: Where xHCI writes device state
 #![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
-use crate::dma::{DmaCoherent, DmaDevice, dma_alloc_coherent};
+use crate::hw::dma::{DmaCoherent, DmaDevice, dma_alloc_coherent};
 
 /// Slot Context (32 bytes)
 ///

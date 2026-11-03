@@ -269,11 +269,15 @@ hk/                      # The kernel crate (no_std, no_main) is the repo root
 ├── task/                # Process/thread management, scheduler
 ├── fs/                  # VFS + filesystem implementations
 ├── signal/              # Signal handling
-├── bus/                 # Bus drivers (PCI, etc.)
-├── storage/             # Block layer (blk-mq, partitions, SCSI disk)
-├── virtio/              # virtio PCI transport, virtqueues, virtio-blk
-├── net/                 # Networking (sockets, IPv4, TCP/UDP, netlink, NIC drivers)
-├── usb/                 # USB stack (xHCI, hub, devices)
+├── bus/                 # Generic driver model (buses, drivers, platform)
+├── block/               # Block layer (blk-mq, partitions, ramdisk, SCSI disk)
+├── hw/                  # Hardware: code that touches a chip or device
+│   ├── pci/  usb/  virtio/  acpi/
+│   ├── net/             # NIC drivers (e1000, virtio-net)
+│   ├── gfx/             # Framebuffer driver and console
+│   └── mmio.rs dma.rs serial.rs
+├── net/                 # Networking (sockets, IPv4, TCP/UDP, netlink)
+├── gfx/                 # DRM-style graphics interface
 ├── tty/                 # TTY subsystem
 ├── ns/                  # Namespaces
 ├── dt/                  # Device tree parsing

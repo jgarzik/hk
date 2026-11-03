@@ -1,7 +1,7 @@
 //! x86-64 power management via ACPI
 //!
 //! Power-off enters ACPI S5 through the FADT's fixed hardware
-//! (`crate::acpi::hw`); reboot tries the FADT reset register, the
+//! (`crate::hw::acpi::hw`); reboot tries the FADT reset register, the
 //! keyboard controller and port 0xCF9. Works on real hardware and on
 //! QEMU.
 //!
@@ -13,10 +13,10 @@ use core::arch::asm;
 
 use super::io::{inb, inw, outb, outw};
 use super::ioremap::ioremap;
-use crate::acpi::aml::SleepType;
-use crate::acpi::hw::{self, PmRegs, PortIo, ResetReg, Space};
 use crate::arch::PowerInfo;
 use crate::delay::Monotonic;
+use crate::hw::acpi::aml::SleepType;
+use crate::hw::acpi::hw::{self, PmRegs, PortIo, ResetReg, Space};
 use crate::printkln;
 
 /// The FADT's registers, the S5 sleep type and the reset register,

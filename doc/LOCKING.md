@@ -2691,7 +2691,7 @@ Robust futexes are cleaned up during task exit via `exit_robust_list()`:
 
 ### 3.9 TTY and Console Subsystem
 
-**Location:** `tty/`, `gfx/console.rs`, `console.rs`, `printk.rs`
+**Location:** `tty/`, `hw/gfx/console.rs`, `console.rs`, `printk.rs`
 
 The TTY and console subsystem handles terminal I/O and kernel message output.
 Console framework locks are IRQ-safe (IrqSpinlock) to support printk from interrupt
@@ -2789,7 +2789,7 @@ nobody claims 100000 times in a row is masked (stuck level INTx).
 - aarch64: SPIs are configured by `gic::enable_spi` (level/edge in ICFGR,
   priority 0x80, Group 1, IROUTER -> CPU 0, ISENABLER); PCI INTx comes from
   the host bridge DT `interrupt-map`/`interrupt-map-mask` parsed at boot
-  (`arch/aarch64/pci_irq.rs`, matching in `bus/pci_intx.rs`), else the QEMU
+  (`arch/aarch64/pci_irq.rs`, matching in `hw/pci/intx.rs`), else the QEMU
   virt swizzle INTID 35 + (slot + pin - 1) % 4.
 - x86-64: legacy 8259 PIC with the firmware-assigned config-space Interrupt
   Line (QEMU `pc`). Real hardware in APIC mode (Dell OptiPlex 3020 target)
@@ -2798,7 +2798,7 @@ nobody claims 100000 times in a row is masked (stuck level INTx).
   the device, touch atomics/IrqSpinlocks and wake threads; they must not
   register/unregister IRQs.
 
-#### DMA API (dma.rs)
+#### DMA API (hw/dma.rs)
 
 The backend (`DMA_OPS`) is set once at boot (`spin::Once`) and read
 without a lock, so the streaming calls (`dma_map_single`/`unmap`, sync)
@@ -2807,15 +2807,15 @@ context. `dma_alloc_coherent` allocates frames (thread context only).
 
 #### USB Subsystem
 
-**Location:** `usb/`
+**Location:** `hw/usb/`
 
 | Lock | Type | Purpose |
 |------|------|---------|
 | `USB_CONTROLLER` | `Mutex<Option<XhciController>>` | Global xHCI controller access |
 | `XHCI_IRQ_STATE.*` | `AtomicU64`, `AtomicBool` | ISR state (lock-free) |
 | `USB_OUTPUT_ACTIVE` | `AtomicBool` | Console recursion guard |
-| `USB_SERIAL_CONSOLE` (usb/serial.rs) | `Mutex<Option<&'static UsbSerialConsole>>` | The registered console (leaked: printk may hold it): a leaf, released before `unregister_console` takes `CONSOLE_REGISTRY` |
-| `BOUNCE` (usb/serial.rs) | `Mutex<[u8; 256]>` | USB serial console DMA buffer: `try_lock` only (a busy buffer drops the output), held across the bulk transfer, so it orders before `USB_CONTROLLER` |
+| `USB_SERIAL_CONSOLE` (hw/usb/serial.rs) | `Mutex<Option<&'static UsbSerialConsole>>` | The registered console (leaked: printk may hold it): a leaf, released before `unregister_console` takes `CONSOLE_REGISTRY` |
+| `BOUNCE` (hw/usb/serial.rs) | `Mutex<[u8; 256]>` | USB serial console DMA buffer: `try_lock` only (a busy buffer drops the output), held across the bulk transfer, so it orders before `USB_CONTROLLER` |
 
 DMA buffers never live on a kernel stack (stacks are not in the linear
 map, `mm::vmstack`; `DirectDmaOps` panics on one): the mass-storage
@@ -2828,8 +2828,8 @@ IRQ-safe.
 
 #### Block Device Subsystem
 
-**Location:** `storage/` (`blkdev.rs`, `blk_mq.rs`, `genhd.rs`,
-`part/`), `virtio/blk.rs`, `fs/{blkdev_ops,devtmpfs}.rs`,
+**Location:** `block/` (`blkdev.rs`, `blk_mq.rs`, `genhd.rs`,
+`part/`), `hw/virtio/blk.rs`, `fs/{blkdev_ops,devtmpfs}.rs`,
 `completion.rs`
 
 Linux model (block/bio.c, blk-mq.c, genhd.c): a bio is submitted from
@@ -2957,13 +2957,13 @@ not rely on either.
 | e1000 `rx` ring | `spin::Mutex` | thread only (NAPI poll) | leaf; frames are delivered after it is dropped |
 | e1000 `tx` ring | `spin::Mutex` | thread only (xmit, poll reclaim) | leaf; ring full -> drop, `tx_dropped`, ENOBUFS |
 | e1000 `pending_icr`, irq counters | atomics | IRQ + thread | ISR ORs ICR causes in; poll swaps them out |
-| virtio-net `rx` queue (`net/driver/virtio_net.rs`) | `spin::Mutex` | thread only (NAPI poll, open) | leaf: virtqueue + bounce buffers; frames are delivered after it is dropped |
+| virtio-net `rx` queue (`hw/net/virtio_net.rs`) | `spin::Mutex` | thread only (NAPI poll, open) | leaf: virtqueue + bounce buffers; frames are delivered after it is dropped |
 | virtio-net `tx` queue | `spin::Mutex` | thread only (xmit, poll reclaim) | leaf; one descriptor per frame; ring full -> drop, `tx_dropped`, ENOBUFS |
 | virtio-net `config_pending`; `VringCb` (RX avail NO_INTERRUPT flag) | atomics / lock-free MMIO-style store | IRQ + thread | the ISR suppresses RX interrupts and flags config changes; the poll re-enables under `rx` only while `netif_running`, and `stop` suppresses under `rx` |
-| virtio-PCI transport (`virtio/pci.rs`) | none | probe (single-threaded enumeration), then IRQ (ISR byte) | common config written only during probe; device config reads are generation-checked and lock-free; queue notify writes happen under the caller's queue lock |
+| virtio-PCI transport (`hw/virtio/pci.rs`) | none | probe (single-threaded enumeration), then IRQ (ISR byte) | common config written only during probe; device config reads are generation-checked and lock-free; queue notify writes happen under the caller's queue lock |
 | `virtio::DRIVERS` | `spin::Mutex<Vec>` | thread only (boot) | leaf; registered before bus enumeration, read by the PCI match/probe |
 | `SYSTEM_TRANSITION` (`power.rs`) | sleeping `sync::Mutex<()>` | thread only (reboot(2)) | Linux system_transition_mutex: held from after the permission and magic checks through `device_shutdown` and the arch power-off/restart/halt, which do not return; outermost: taken before `SYSTEM_BUSES` and every driver lock the shutdown callbacks take |
-| x86 `power::POWER` (`arch/x86_64/power.rs`) | `spin::Once` | thread only (boot set; power-off/reboot read) | set once from the FADT before `reboot(2)` can run, read lock-free after; the ACPI register sequences (`acpi/hw.rs`) take no locks |
+| x86 `power::POWER` (`arch/x86_64/power.rs`) | `spin::Once` | thread only (boot set; power-off/reboot read) | set once from the FADT before `reboot(2)` can run, read lock-free after; the ACPI register sequences (`hw/acpi/hw.rs`) take no locks |
 | `bus::SYSTEM_BUSES` (`bus/bus.rs`) | sleeping `sync::Mutex<Option<BusManager>>` | thread only | set once after boot enumeration; `device_shutdown` (reboot(2), Linux device_shutdown) takes the manager out under it and runs the `Device::shutdown` callbacks after dropping it, so callbacks (which may poll hardware or take driver locks such as `USB_CONTROLLER`) never run under it |
 
 **Lock order (outermost first):**
@@ -3124,10 +3124,10 @@ else is taken under it) unless an order is given. "spin" is the
 | `NTtyLdisc.data` | tty/n_tty.rs | spin Mutex | line discipline buffer (input is polled, not IRQ-fed) |
 | `VgaCon.state` | arch/x86_64/vgacon.rs | IrqSpinlock | VGA text console state, under `CONSOLE_REGISTRY` (3.9) |
 | `SimpleGfxDevice.state`, `GFX_DEVICES`, `NEXT_MINOR` | gfx/ | spin | framebuffer device state and registry |
-| `UsbMscDevice.state` | usb/msc.rs | spin | USB mass-storage device state |
+| `UsbMscDevice.state` | hw/usb/msc.rs | spin | USB mass-storage device state |
 | `INTX_MAP` | arch/aarch64/pci_irq.rs | spin Mutex | PCI INTx routing from the device tree (boot) |
 | `PCI_LOCK` | arch/x86_64/pci_conf.rs (port I/O config access) | IrqSpinlock | Linux pci_lock: the CF8 address write and the CFC data access of one config read/write; leaf (port I/O only). ECAM accesses are single MMIO operations and take no lock |
-| PCI fixups (`bus/quirks.rs`) | none | thread only (boot) | run by bus enumeration (single-threaded) on each function before driver probe |
+| PCI fixups (`hw/pci/quirks.rs`) | none | thread only (boot) | run by bus enumeration (single-threaded) on each function before driver probe |
 | `CMDLINE_CONSOLE` | cmdline.rs | spin Mutex | console= choice |
 | `CPU_CRNG` (per CPU) -> `BASE` | random.rs | IrqSpinlock | ChaCha20 CRNG: this CPU's key, then the base key when the CPU key is refreshed or the base reseeded; both leaves otherwise (callers include softirq net code). `GENERATION`/`BIRTH_NS` are atomics read unlocked, rechecked under `BASE` |
 | `Inode.i_writecount`, `Inode.i_swapfile` | fs/inode.rs | atomics | writers (> 0) or executions denying them (< 0), Linux i_writecount, changed by CAS (`get_write_access` / `deny_write_access`, ETXTBSY on the wrong sign); an active swap area (S_SWAPFILE: set and cleared by swapon/swapoff
@@ -3421,10 +3421,10 @@ this is the interrupt-safety invariant:
 | All VFS locks | fs/*.rs | `RwLock` | Inodes, dentries, mounts |
 | Descriptor tables (`Files`) | task/fdtable.rs | `Mutex` | Per-task fd tables |
 | `RTNL` and every network `spin::Mutex`/`RwLock` | net/ | `sync::Mutex` / `Mutex` / `RwLock` | Configuration, sockets, tables, queues (3.10) |
-| Driver queue locks (e1000 / virtio-net `rx`, `tx`) | net/driver/ | `Mutex` | Rings: NAPI poll, xmit, open/stop |
+| Driver queue locks (e1000 / virtio-net `rx`, `tx`) | hw/net/ | `Mutex` | Rings: NAPI poll, xmit, open/stop |
 | `Softnet.backlog` | net/core/dev.rs | `Mutex` | `netif_rx` (lo), softnet |
-| `BLKDEV_REGISTRY`, `MAJORS`, `RamDisk.pages`, devtmpfs `PENDING` | storage/, fs/devtmpfs.rs | `RwLock` / `Mutex` | Block device lookup, majors, RAM disk pages, early device nodes (3.10) |
-| `Disk.open_mutex` | storage/blkdev.rs | sleeping `sync::Mutex` | Block device open/release, partition scans |
+| `BLKDEV_REGISTRY`, `MAJORS`, `RamDisk.pages`, devtmpfs `PENDING` | block/, fs/devtmpfs.rs | `RwLock` / `Mutex` | Block device lookup, majors, RAM disk pages, early device nodes (3.10) |
+| `Disk.open_mutex` | block/blkdev.rs | sleeping `sync::Mutex` | Block device open/release, partition scans |
 | Sleeping locks (`sync::Mutex`, `RwSem`) | sync/ | sleeping | Never in IRQ or atomic context (`might_sleep`) |
 
 With `make check LOCKDEP=1` (1.5) every tracked spin lock taken in an

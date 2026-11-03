@@ -4,14 +4,14 @@
 //! Locking: `PCI_LOCK` (Linux pci_lock), an `IrqSpinlock` leaf around
 //! each address/data pair.
 
-use crate::bus::pci::PciConfigAccess;
+use crate::hw::pci::PciConfigAccess;
 
 /// PCI configuration address port
 const PCI_CONFIG_ADDR: u16 = 0x0CF8;
 /// PCI configuration data port
 const PCI_CONFIG_DATA: u16 = 0x0CFC;
 
-/// The port I/O accessor (installed by `bus::pci::init_port_io`)
+/// The port I/O accessor (installed by `hw::pci::init_port_io`)
 pub static PORT_IO: PortIoConfigAccess = PortIoConfigAccess;
 
 /// Port I/O based PCI config access (x86 legacy)

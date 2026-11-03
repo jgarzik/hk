@@ -39,14 +39,15 @@ use spin::Once;
 use crate::arch::barrier::{dma_rmb, dma_wmb, wmb};
 use crate::bus::bus::{BusContext, BusDevice, BusDriver};
 use crate::bus::driver::{Device, DriverError};
-use crate::bus::pci::PciDevice;
-use crate::dma::DmaCoherent;
+use crate::error::KernelError;
+use crate::hw::dma::DmaCoherent;
+use crate::hw::pci::PciDevice;
+use crate::net;
 use crate::net::dev::{
     NAPI_POLL_WEIGHT, Napi, NapiPoll, napi_complete_done, napi_disable, napi_enable, napi_schedule,
 };
 use crate::net::device::{LinkInfo, NetDevice, NetDeviceOps};
 use crate::net::skb::{NET_SKB_PAD, SkBuff};
-use crate::net::{self, KernelError};
 use crate::printkln;
 
 // ============================================================================
@@ -234,7 +235,7 @@ impl TxRing {
 /// e1000 device state
 struct E1000 {
     /// Register window (BAR0, 128KB)
-    regs: crate::mmio::IoMem,
+    regs: crate::hw::mmio::IoMem,
     /// MAC address
     mac: [u8; 6],
     rx: Mutex<RxRing>,
@@ -619,8 +620,8 @@ pub struct E1000PciDriver;
 fn alloc_bufs(pci: &PciDevice, n: usize) -> Result<Vec<DmaCoherent>, DriverError> {
     let mut v = Vec::with_capacity(n);
     for _ in 0..n {
-        let b =
-            crate::dma::dma_alloc_coherent(pci, BUF_SIZE).ok_or(DriverError::MissingResource)?;
+        let b = crate::hw::dma::dma_alloc_coherent(pci, BUF_SIZE)
+            .ok_or(DriverError::MissingResource)?;
         v.push(b);
     }
     Ok(v)
@@ -665,7 +666,7 @@ impl BusDriver for E1000PciDriver {
         }
         let mmio_phys = (bar0 & !0xF) as u64;
         // SAFETY: BAR0 of this e1000, its 128KB register space
-        let Some(regs) = (unsafe { crate::mmio::IoMem::ioremap(mmio_phys, 128 * 1024) }) else {
+        let Some(regs) = (unsafe { crate::hw::mmio::IoMem::ioremap(mmio_phys, 128 * 1024) }) else {
             printkln!("e1000: Failed to ioremap MMIO region");
             return Err(DriverError::MissingResource);
         };
@@ -674,9 +675,9 @@ impl BusDriver for E1000PciDriver {
         pci.enable_memory_space();
         pci.enable_bus_master();
 
-        let rx_desc = crate::dma::dma_alloc_coherent(pci, RX_RING_SIZE * 16)
+        let rx_desc = crate::hw::dma::dma_alloc_coherent(pci, RX_RING_SIZE * 16)
             .ok_or(DriverError::MissingResource)?;
-        let tx_desc = crate::dma::dma_alloc_coherent(pci, TX_RING_SIZE * 16)
+        let tx_desc = crate::hw::dma::dma_alloc_coherent(pci, TX_RING_SIZE * 16)
             .ok_or(DriverError::MissingResource)?;
         let rx_bufs = alloc_bufs(pci, RX_RING_SIZE)?;
         let tx_bufs = alloc_bufs(pci, TX_RING_SIZE)?;

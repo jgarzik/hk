@@ -619,11 +619,11 @@ pub struct CpuInfo {
 #[allow(dead_code)]
 pub struct PowerInfo {
     /// The FADT's power management register blocks
-    pub pm: crate::acpi::hw::PmRegs,
+    pub pm: crate::hw::acpi::hw::PmRegs,
     /// SLP_TYP values for S5 (soft-off), from \_S5 in the DSDT/SSDTs
-    pub s5: crate::acpi::aml::SleepType,
+    pub s5: crate::hw::acpi::aml::SleepType,
     /// The FADT reset register, if the firmware offers one
-    pub reset: Option<crate::acpi::hw::ResetReg>,
+    pub reset: Option<crate::hw::acpi::hw::ResetReg>,
 }
 
 /// Platform hardware information from ACPI or device tree

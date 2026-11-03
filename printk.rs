@@ -249,11 +249,11 @@ fn direct_serial_write(bytes: &[u8]) {
         // Use serial TTY driver directly
         if let Ok(s) = core::str::from_utf8(bytes) {
             for c in s.chars() {
-                crate::tty::serial::write_byte_com1(c as u8);
+                crate::hw::serial::write_byte_com1(c as u8);
             }
         } else {
             for &b in bytes {
-                crate::tty::serial::write_byte_com1(b);
+                crate::hw::serial::write_byte_com1(b);
             }
         }
     }

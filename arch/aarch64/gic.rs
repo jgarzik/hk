@@ -10,7 +10,7 @@ use crate::printkln;
 use core::arch::asm;
 use core::ptr::NonNull;
 
-use crate::mmio::IoMem;
+use crate::hw::mmio::IoMem;
 
 // QEMU virt GICv3 base addresses
 const GICD_BASE: u64 = super::paging::io_va(0x0800_0000);

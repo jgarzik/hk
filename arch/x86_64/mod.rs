@@ -28,6 +28,7 @@ pub mod irq;
 pub mod kmap;
 pub mod lapic;
 pub mod msr;
+pub mod multiboot2;
 pub mod paging;
 pub mod pci_conf;
 pub mod percpu;
@@ -394,8 +395,8 @@ impl ArchBusOps for X86_64Arch {
 impl MemoryLayoutOps for X86_64Arch {
     fn memblock_init() {
         use crate::mm::memblock;
-        crate::multiboot2::for_each_region(|base, len, kind| {
-            if kind == crate::multiboot2::MEMORY_AVAILABLE {
+        crate::arch::x86_64::multiboot2::for_each_region(|base, len, kind| {
+            if kind == crate::arch::x86_64::multiboot2::MEMORY_AVAILABLE {
                 memblock::add(base, len);
             }
         });
@@ -409,7 +410,7 @@ impl MemoryLayoutOps for X86_64Arch {
         mb.reserve(0, 1 << 20);
         let (start, end) = kmap::image_range();
         mb.reserve(start, end - start);
-        crate::multiboot2::boot_ranges(|_, s, e| mb.reserve(s, e.saturating_sub(s)));
+        crate::arch::x86_64::multiboot2::boot_ranges(|_, s, e| mb.reserve(s, e.saturating_sub(s)));
     }
 
     unsafe fn map_kernel_page(va: u64, pa: u64, table: &mut dyn FnMut() -> u64) {
@@ -429,7 +430,7 @@ impl ExceptionOps for X86_64Arch {
 
 impl InitramfsOps for X86_64Arch {
     fn get_initramfs() -> &'static [u8] {
-        crate::multiboot2::find_module("initramfs")
+        crate::arch::x86_64::multiboot2::find_module("initramfs")
             .expect("initramfs module not loaded by bootloader")
     }
 }

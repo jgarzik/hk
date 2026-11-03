@@ -35,12 +35,10 @@
 
 extern crate alloc;
 
-pub mod console;
 pub mod dumb;
 pub mod font;
 pub mod ioctl;
 pub mod mode;
-pub mod simplegfx;
 
 use crate::sync::spin::{Mutex, RwLock};
 use alloc::string::String;

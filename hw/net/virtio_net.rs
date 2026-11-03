@@ -44,16 +44,17 @@ use crate::sync::spin::Mutex;
 use spin::Once;
 
 use crate::bus::driver::{Device, DriverError};
-use crate::dma::DmaCoherent;
+use crate::error::KernelError;
+use crate::hw::dma::DmaCoherent;
+use crate::hw::virtio::ring::{Sg, VringCb};
+use crate::hw::virtio::{self, VirtioDevice, VirtioDriver, VirtioIrq, Virtqueue};
+use crate::net;
 use crate::net::dev::{
     NAPI_POLL_WEIGHT, Napi, NapiPoll, napi_complete_done, napi_disable, napi_enable, napi_schedule,
 };
 use crate::net::device::{LinkInfo, NetDevice, NetDeviceOps};
 use crate::net::skb::{NET_SKB_PAD, SkBuff};
-use crate::net::{self, KernelError};
 use crate::printkln;
-use crate::virtio::ring::{Sg, VringCb};
-use crate::virtio::{self, VirtioDevice, VirtioDriver, VirtioIrq, Virtqueue};
 
 /// Device-specific feature bits
 mod feature {
@@ -89,7 +90,7 @@ struct Pool {
 
 impl Pool {
     fn new(vdev: &VirtioDevice, n: u16) -> Result<Self, DriverError> {
-        crate::dma::dma_alloc_coherent(vdev, n as usize * BUF_SIZE)
+        crate::hw::dma::dma_alloc_coherent(vdev, n as usize * BUF_SIZE)
             .map(|mem| Self { mem })
             .ok_or(DriverError::MissingResource)
     }

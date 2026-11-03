@@ -17,9 +17,10 @@
 //! Locking: runs during bus enumeration (single-threaded, boot).
 
 use crate::arch::{CurrentArch, IoremapOps};
-use crate::bus::pci::PciDevice;
-use crate::bus::{BusDevice, pci};
+use crate::bus::BusDevice;
 use crate::delay::{Clock, Monotonic, poll_on};
+use crate::hw::pci;
+use crate::hw::pci::PciDevice;
 use crate::printkln;
 
 use super::ext_caps::{self, Mmio};
@@ -32,9 +33,9 @@ const PROG_IF_XHCI: u8 = 0x30;
 /// The final fixup for every USB controller (Linux
 /// DECLARE_PCI_FIXUP_CLASS_FINAL(PCI_ANY_ID, PCI_ANY_ID,
 /// PCI_CLASS_SERIAL_USB, 8, quirk_usb_early_handoff))
-pub const EARLY_HANDOFF: crate::bus::quirks::PciFixup = crate::bus::quirks::PciFixup {
-    vendor: crate::bus::quirks::ANY_ID,
-    device: crate::bus::quirks::ANY_ID,
+pub const EARLY_HANDOFF: crate::hw::pci::quirks::PciFixup = crate::hw::pci::quirks::PciFixup {
+    vendor: crate::hw::pci::quirks::ANY_ID,
+    device: crate::hw::pci::quirks::ANY_ID,
     class: 0x0c03,
     class_shift: 8,
     hook: quirk_usb_early_handoff,
@@ -510,7 +511,7 @@ fn quirk_usb_disable_ehci(dev: &PciDevice, bar: &Bar) {
 mod tests {
     use super::*;
     use crate::delay::tests::FakeClock;
-    use crate::usb::ext_caps::tests::FakeRegs;
+    use crate::hw::usb::ext_caps::tests::FakeRegs;
     use core::cell::Cell;
 
     const LEG: u32 = 0x500;

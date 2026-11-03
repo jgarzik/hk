@@ -860,7 +860,7 @@ fn for_each_cache_inode(f: &mut dyn FnMut(&Inode) -> bool) {
         more
     });
     if more {
-        crate::storage::blkdev::for_each_bdev_inode(&mut |i| i.i_data.nrpages() == 0 || f(i));
+        crate::block::blkdev::for_each_bdev_inode(&mut |i| i.i_data.nrpages() == 0 || f(i));
     }
 }
 

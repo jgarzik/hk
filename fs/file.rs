@@ -442,7 +442,7 @@ impl File {
     /// f_mapping->host): a block device node's is the device's bdev
     /// inode, every other file's its own
     pub fn mapping_inode(&self) -> Option<Arc<Inode>> {
-        if let Some(b) = self.private_ref::<crate::storage::BlockDevice>() {
+        if let Some(b) = self.private_ref::<crate::block::BlockDevice>() {
             return Some(b.bd_inode.clone());
         }
         self.get_inode()

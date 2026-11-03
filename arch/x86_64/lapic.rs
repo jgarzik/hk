@@ -291,7 +291,7 @@ const APIC_BASE_EXTD: u64 = 1 << 10;
 const X2APIC_ICR: u32 = 0x830;
 
 use super::msr::rdmsr;
-use crate::mmio::IoMem;
+use crate::hw::mmio::IoMem;
 
 /// Send the fixed IPI `vector` to the CPU with APIC id `apic_id`
 /// (physical destination; Linux __default_send_IPI_dest_field,

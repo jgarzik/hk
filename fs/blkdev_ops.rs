@@ -11,15 +11,15 @@
 use alloc::sync::Arc;
 
 use crate::arch::Uaccess;
-use crate::error::KernelError;
-use crate::fs::inode::{Inode, InodeMode, Timespec};
-use crate::mm::filemap::{self, Aops, PAGE_SIZE};
-use crate::storage::DevId;
-use crate::storage::blkdev::{
+use crate::block::DevId;
+use crate::block::blkdev::{
     BioOp, BlockDevice, SECTOR_SHIFT, bdev_rw_bytes, bdev_rw_frame, blkdev_issue_flush, get_blkdev,
     sync_blockdev,
 };
-use crate::storage::genhd;
+use crate::block::genhd;
+use crate::error::KernelError;
+use crate::fs::inode::{Inode, InodeMode, Timespec};
+use crate::mm::filemap::{self, Aops, PAGE_SIZE};
 use crate::uaccess::{get_user, put_user};
 use core::sync::atomic::Ordering;
 

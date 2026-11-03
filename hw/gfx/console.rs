@@ -9,9 +9,9 @@ use core::ptr;
 
 use crate::sync::spin::Mutex;
 
-use super::font::{DEFAULT_FONT, Font};
-use super::{Color, FramebufferInfo, PixelFormat};
 use crate::console::{ConsoleDriver, ConsolePriority};
+use crate::gfx::font::{DEFAULT_FONT, Font};
+use crate::gfx::{Color, FramebufferInfo, PixelFormat};
 
 /// Scanout surface - abstraction over the framebuffer
 ///
@@ -390,9 +390,9 @@ static GRAPHICS_CONSOLE: spin::Once<GfxConsole> = spin::Once::new();
 /// Must be called after ioremap is initialized.
 /// The framebuffer must be properly reserved in the frame allocator.
 pub unsafe fn init_graphics_console() -> bool {
-    use super::BOOT_FRAMEBUFFER;
     use crate::arch::CurrentArch;
     use crate::arch::IoremapOps;
+    use crate::gfx::BOOT_FRAMEBUFFER;
 
     let Some(fb_info) = BOOT_FRAMEBUFFER.get() else {
         return false;

@@ -91,7 +91,7 @@ pub fn writeback_sb(sb: &SuperBlock) -> Result<(), KernelError> {
         }
     }
     if let Some(b) = sb.bdev()
-        && let Err(e) = crate::storage::blkdev::sync_blockdev(b)
+        && let Err(e) = crate::block::blkdev::sync_blockdev(b)
         && err.is_ok()
     {
         err = Err(e);
@@ -108,7 +108,7 @@ pub fn sync_all_sbs() {
 }
 
 /// The filesystems mounted from device `dev` (periodic writeback)
-pub fn writeback_dev(dev: crate::storage::DevId) {
+pub fn writeback_dev(dev: crate::block::DevId) {
     for sb in live_sbs() {
         if sb.bdev().is_some_and(|b| b.dev_id() == dev) {
             let _ = writeback_sb(&sb);

@@ -24,13 +24,13 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use crate::sync::spin::{Mutex, RwLock};
 
 use crate::arch::{IrqSpinlock, Uaccess};
+use crate::block::blkdev::{BioOp, bdev_rw, bdev_rw_frame};
 use crate::error::KernelError;
 use crate::fs::{Inode, lookup_path};
 use crate::mm::filemap::PAGE_SIZE;
 use crate::mm::page::frame_bytes;
 use crate::mm::swap_entry::{MAX_SWAPFILES, SwapEntry};
 use crate::mm::xarray::XArray;
-use crate::storage::blkdev::{BioOp, bdev_rw, bdev_rw_frame};
 use crate::task::{CAP_SYS_ADMIN, capable};
 use crate::uaccess::strncpy_from_user;
 
@@ -123,7 +123,7 @@ pub struct SwapInfo {
     /// Backing file (a swap file)
     pub inode: Option<Arc<Inode>>,
     /// Backing block device (a swap partition)
-    pub bdev: Option<crate::storage::blkdev::BdevHandle>,
+    pub bdev: Option<crate::block::blkdev::BdevHandle>,
     /// Path given to swapon
     pub path: Vec<u8>,
     /// Device state (SWP_WRITEOK)
@@ -157,10 +157,7 @@ impl SwapInfo {
     }
 
     fn new(
-        backing: (
-            Option<Arc<Inode>>,
-            Option<crate::storage::blkdev::BdevHandle>,
-        ),
+        backing: (Option<Arc<Inode>>, Option<crate::block::blkdev::BdevHandle>),
         path: Vec<u8>,
         swap_type: u8,
         max: u64,
@@ -497,7 +494,7 @@ fn swapon(path_ptr: u64, swap_flags: i32) -> Result<(), KernelError> {
     // A block device swaps through bios, a file through its inode
     let bdev = if inode.mode().is_blkdev() {
         // Opened for the swap's life (Linux swapon opens the device)
-        let b = crate::storage::get_blkdev(inode.rdev).ok_or(KernelError::NoDeviceOrAddress)?;
+        let b = crate::block::get_blkdev(inode.rdev).ok_or(KernelError::NoDeviceOrAddress)?;
         Some(b.open_handle()?)
     } else {
         None

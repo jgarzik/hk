@@ -10,11 +10,11 @@ use crate::sync::spin::Mutex;
 use core::any::Any;
 use core::sync::atomic::{AtomicBool, Ordering};
 
+use crate::block::{DataDirection, ScsiCommand, ScsiError, ScsiHost, ScsiResult};
 use crate::bus::bus::{BusContext, BusDevice, BusDriver};
 use crate::bus::driver::{Device, DriverError};
 use crate::downcast_bus_device;
 use crate::printkln;
-use crate::storage::{DataDirection, ScsiCommand, ScsiError, ScsiHost, ScsiResult};
 
 use super::{UsbDevice, UsbError, usb_bulk_in, usb_bulk_out, usb_configure_endpoints};
 
@@ -394,7 +394,7 @@ impl BusDriver for UsbMscBusDriver {
         // Currently we use a simple mapping: slot_id -> minor number
         // A more robust implementation would track this mapping explicitly
         let minor = usb_dev.slot_id as u16;
-        if let Err(e) = crate::storage::sd::unregister_scsi_disk(minor) {
+        if let Err(e) = crate::block::sd::unregister_scsi_disk(minor) {
             printkln!("USB-MSC: Failed to unregister SCSI disk: {:?}", e);
             // Continue with removal even if unregister fails
         }

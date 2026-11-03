@@ -1690,7 +1690,7 @@ fn gen_meminfo() -> Vec<u8> {
     let mut out = String::new();
     use crate::mm::filemap;
     let file = filemap::nr_file_pages() * 4;
-    let buffers: u64 = crate::storage::blkdev::all_bdev_inodes()
+    let buffers: u64 = crate::block::blkdev::all_bdev_inodes()
         .iter()
         .map(|i| i.i_data.nrpages() * 4)
         .sum();
@@ -2001,7 +2001,7 @@ fn procfs_mount(fs_type: &'static FileSystemType) -> Result<Arc<SuperBlock>, Ker
             let parts = mk_inode(
                 &sb,
                 InodeMode::regular(0o444),
-                ProcfsInodeData::new_file(crate::storage::genhd::proc_partitions),
+                ProcfsInodeData::new_file(crate::block::genhd::proc_partitions),
             );
             children.insert(String::from("partitions"), parts);
         }

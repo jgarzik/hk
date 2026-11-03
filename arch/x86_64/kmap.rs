@@ -26,7 +26,7 @@ use super::paging::{
     KERNEL_MAP, PAGE_HUGE, PAGE_NO_EXECUTE, PAGE_OFFSET, PAGE_PRESENT, PAGE_SIZE, PAGE_WRITABLE,
     RawPageTable, VMALLOC_START, VMEMMAP_START, phys_to_virt_table,
 };
-use crate::multiboot2;
+use crate::arch::x86_64::multiboot2;
 
 /// Page-table pages for the boot-built kernel half
 const POOL_PAGES: usize = 64;

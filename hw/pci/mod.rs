@@ -5,6 +5,9 @@
 //!
 //! Implements the Bus/Driver model for layered device enumeration.
 
+pub mod intx;
+pub mod quirks;
+
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -12,11 +15,11 @@ use core::any::Any;
 
 use spin::Once;
 
-use crate::dma::{DmaConfig, DmaDevice};
+use crate::hw::dma::{DmaConfig, DmaDevice};
 use crate::printkln;
 
-use super::bus::{Bus, BusContext, BusDevice, BusDriver};
-use super::driver::{Device, DriverError};
+use crate::bus::bus::{Bus, BusContext, BusDevice, BusDriver};
+use crate::bus::driver::{Device, DriverError};
 
 // ============================================================================
 // PCI BAR Allocator (for platforms without firmware BAR assignment)
@@ -253,12 +256,12 @@ pub trait PciConfigAccess: Send + Sync {
 /// Address formula: Base + (Bus << 20) | (Dev << 15) | (Func << 12) | Offset
 pub struct EcamConfigAccess {
     /// The mapped ECAM window (bus 0 only: 1 MB)
-    regs: crate::mmio::IoMem,
+    regs: crate::hw::mmio::IoMem,
 }
 
 impl EcamConfigAccess {
     /// ECAM accessor over a mapped window
-    pub const fn new(regs: crate::mmio::IoMem) -> Self {
+    pub const fn new(regs: crate::hw::mmio::IoMem) -> Self {
         Self { regs }
     }
 
@@ -333,7 +336,7 @@ pub fn init_port_io() {
 pub unsafe fn init_ecam(base_addr: *mut u8, len: usize) {
     let base = core::ptr::NonNull::new(base_addr).expect("ECAM base");
     // SAFETY: the caller's mapping, per this fn's contract
-    let regs = unsafe { crate::mmio::IoMem::new(base, len) };
+    let regs = unsafe { crate::hw::mmio::IoMem::new(base, len) };
     // Leak a box to get 'static lifetime
     let accessor = Box::leak(Box::new(EcamConfigAccess::new(regs)));
     PCI_CONFIG.call_once(|| accessor as &dyn PciConfigAccess);
@@ -1080,7 +1083,7 @@ impl Bus for PciBus {
 
         // Firmware hand-offs and chipset fixups, before any driver
         // touches a device (Linux FIXUP_FINAL, pci_bus_add_device)
-        super::quirks::fixup_final(&self.devices);
+        quirks::fixup_final(&self.devices);
 
         // Match devices to drivers and probe
         for device in &self.devices {

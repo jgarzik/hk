@@ -11,7 +11,7 @@ extern crate alloc;
 
 // Core modules (formerly in core/ subdir)
 pub mod acct;
-pub mod acpi;
+pub mod block;
 pub mod bus;
 pub mod chardev;
 pub mod completion;
@@ -20,7 +20,6 @@ pub mod cpu;
 pub mod cpu_timer;
 pub mod cpumask;
 pub mod delay;
-pub mod dma;
 pub mod elf;
 pub mod entry;
 pub mod epoll;
@@ -34,7 +33,6 @@ pub mod irq;
 pub mod kcmp;
 pub mod kmem;
 pub mod list;
-pub mod mmio;
 pub mod pidfd;
 pub mod pipe;
 pub mod pod;
@@ -44,7 +42,6 @@ pub mod printk;
 pub mod selftest;
 pub mod signalfd;
 pub mod smp;
-pub mod storage;
 pub mod sync;
 pub mod sysctl;
 mod time;
@@ -58,10 +55,9 @@ pub mod workqueue;
 // Device subsystems
 pub mod dt;
 pub mod gfx;
+pub mod hw;
 pub mod net;
 pub mod tty;
-pub mod usb;
-pub mod virtio;
 
 // printkln macro is re-exported at crate root via #[macro_export]
 
@@ -81,8 +77,6 @@ pub mod keys;
 mod kmsg;
 pub mod membarrier;
 pub mod mm;
-#[cfg(target_arch = "x86_64")]
-mod multiboot2;
 pub mod ns;
 pub mod numa;
 mod power;
@@ -114,7 +108,7 @@ use crate::arch::{
 // Page table type alias (used by ELF loading)
 type ArchPageTable = <CurrentArch as SchedArch>::SchedPageTable;
 
-use crate::dma::{DirectDmaOps, dma_init};
+use crate::hw::dma::{DirectDmaOps, dma_init};
 
 #[allow(unused_imports)]
 use fs::inode::AsAny; // Trait needed for .as_any() on dyn InodeData
@@ -143,7 +137,7 @@ pub static EMBEDDED_INITRAMFS: &[u8] = include_bytes!("user/initramfs-aarch64.cp
 pub extern "C" fn _start(multiboot_info: u64) -> ! {
     // SAFETY: the bootloader's info structure (RDI), in memory the boot
     // tables map; it and its modules are reserved (memblock_init)
-    unsafe { multiboot2::set_boot(multiboot_info) };
+    unsafe { arch::x86_64::multiboot2::set_boot(multiboot_info) };
     // Kernel page table first: the boot tables' identity map goes away
     // SAFETY: once, first thing on the BSP, before SMP or any user mm
     unsafe {
@@ -157,13 +151,13 @@ pub extern "C" fn _start(multiboot_info: u64) -> ! {
     arch::x86_64::vgacon::init_vgacon();
 
     // Initialize serial console (through TTY layer)
-    tty::serial::init_serial_console();
+    hw::serial::init_serial_console();
 
     // Flush buffered messages to console
     crate::printk::flush();
 
     // Print and parse kernel command line (if any)
-    if let Some(cmdline) = multiboot2::get_cmdline()
+    if let Some(cmdline) = arch::x86_64::multiboot2::get_cmdline()
         && !cmdline.is_empty()
     {
         printkln!("Cmdline: {}", cmdline);
@@ -295,7 +289,7 @@ fn discover_boot_framebuffer() {
     #[cfg(target_arch = "x86_64")]
     {
         // Parse multiboot2 framebuffer tag
-        fb_info = multiboot2::get_framebuffer();
+        fb_info = arch::x86_64::multiboot2::get_framebuffer();
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -500,10 +494,11 @@ fn kmain() -> ! {
     // This is modular and extensible - no hardcoded loops needed!
     // ========================================================================
 
-    use crate::bus::{BusManager, PciBus};
-    use crate::net::driver::E1000PciDriver;
-    use crate::usb::msc::{UsbMscBusDriver, UsbMscDeviceHandle};
-    use crate::usb::{UsbSerialBusDriver, xhci::XhciPciDriver};
+    use crate::bus::BusManager;
+    use crate::hw::net::E1000PciDriver;
+    use crate::hw::pci::PciBus;
+    use crate::hw::usb::msc::{UsbMscBusDriver, UsbMscDeviceHandle};
+    use crate::hw::usb::{UsbSerialBusDriver, xhci::XhciPciDriver};
     use alloc::boxed::Box;
 
     // Create the bus manager
@@ -518,9 +513,9 @@ fn kmain() -> ! {
     // Register PCI drivers
     bus_manager.register_driver("pci", Box::new(XhciPciDriver));
     bus_manager.register_driver("pci", Box::new(E1000PciDriver));
-    bus_manager.register_driver("pci", Box::new(crate::virtio::VirtioPciDriver));
-    crate::virtio::register_driver(&crate::net::driver::virtio_net::VIRTIO_NET);
-    crate::virtio::register_driver(&crate::virtio::blk::VIRTIO_BLK);
+    bus_manager.register_driver("pci", Box::new(crate::hw::virtio::VirtioPciDriver));
+    crate::hw::virtio::register_driver(&crate::hw::net::virtio_net::VIRTIO_NET);
+    crate::hw::virtio::register_driver(&crate::hw::virtio::blk::VIRTIO_BLK);
 
     // Register USB drivers (queued until USB bus is created by xHCI)
     bus_manager.register_driver("usb", Box::new(UsbSerialBusDriver));
@@ -533,7 +528,7 @@ fn kmain() -> ! {
 
     // SCSI disk (sda) from a USB MSC device, if present
     if let Some(handle) = bus_manager.find_device::<UsbMscDeviceHandle>() {
-        let _ = crate::storage::create_scsi_disk(handle.scsi_host(), 0, 0);
+        let _ = crate::block::create_scsi_disk(handle.scsi_host(), 0, 0);
     }
 
     // Kept for device_shutdown at power-off/restart
@@ -574,8 +569,8 @@ fn kmain() -> ! {
     // This happens after VFS init so we can create /dev/dri if needed later
     // SAFETY: once, at boot, after ioremap is up (its contract)
     unsafe {
-        if gfx::console::init_graphics_console() {
-            gfx::console::register_graphics_console();
+        if hw::gfx::console::init_graphics_console() {
+            hw::gfx::console::register_graphics_console();
         }
     }
 
@@ -584,7 +579,7 @@ fn kmain() -> ! {
     // ========================================================================
     // Initialize DRM subsystem and SimpleDRM driver for Linux ABI compatibility
     gfx::init();
-    if let Some(minor) = gfx::simplegfx::init_simplegfx() {
+    if let Some(minor) = hw::gfx::simplegfx::init_simplegfx() {
         printkln!("gfx: SimpleDRM device registered as card{}", minor);
     }
 
@@ -649,8 +644,8 @@ const DEFAULT_RAMDISK_SIZE_MB: u64 = 8;
 ///
 /// This is the unified VFS initialization shared between architectures.
 fn init_vfs_core() {
+    use crate::block::create_ramdisk;
     use crate::chardev::DevId;
-    use crate::storage::create_ramdisk;
     use fs::{PROCFS_TYPE, RAMFS_TYPE, do_mount, init_fs_registry, ramfs_create_dir};
 
     init_fs_registry();
@@ -730,11 +725,11 @@ pub fn init_vfat_ramdisk(
     root_dentry: &alloc::sync::Arc<fs::Dentry>,
     _dev_dentry: &alloc::sync::Arc<fs::Dentry>,
 ) {
-    use crate::storage::create_ramdisk_from_data;
+    use crate::block::create_ramdisk_from_data;
     use fs::ramfs_create_dir;
 
     // Look for vfat module loaded by bootloader
-    let vfat_data = match multiboot2::find_module("vfat") {
+    let vfat_data = match arch::x86_64::multiboot2::find_module("vfat") {
         Some(data) => data,
         None => return,
     };

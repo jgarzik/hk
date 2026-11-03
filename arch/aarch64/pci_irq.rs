@@ -20,8 +20,8 @@ use alloc::vec::Vec;
 
 use crate::sync::spin::Mutex;
 
-use crate::bus::pci_intx::{IntxMapEntry as MapEntry, match_interrupt_map, qemu_virt_swizzle};
 use crate::dt::DeviceTree;
+use crate::hw::pci::intx::{IntxMapEntry as MapEntry, match_interrupt_map, qemu_virt_swizzle};
 
 /// Parsed routing: (mask phys.hi, mask pin, entries)
 struct IntxMap {

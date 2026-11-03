@@ -18,11 +18,11 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
+use crate::block::BlockDevice;
+use crate::block::blkdev::{BioOp, bdev_rw_bytes};
 use crate::mm::filemap::{self, Aops, PAGE_SIZE};
 use crate::mm::page::frame_bytes;
 use crate::pod::{FromBytes, IntoBytes};
-use crate::storage::BlockDevice;
-use crate::storage::blkdev::{BioOp, bdev_rw_bytes};
 
 use super::dentry::Dentry;
 use super::file::{DirContext, DirEntry as VfsDirEntry, File, FileOps};
@@ -2051,8 +2051,8 @@ impl FileOps for VfatFileOps {
         let sb = inode.superblock().ok_or(KernelError::Io)?;
         let sb_data = get_sb_data(&sb)?;
         super::fs_writeback::writeback_inode(&inode)?;
-        crate::storage::blkdev::sync_blockdev(&sb_data.bdev)?;
-        crate::storage::blkdev::blkdev_issue_flush(&sb_data.bdev)
+        crate::block::blkdev::sync_blockdev(&sb_data.bdev)?;
+        crate::block::blkdev::blkdev_issue_flush(&sb_data.bdev)
     }
 
     // llseek: use default implementation from FileOps trait

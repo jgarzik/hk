@@ -57,7 +57,6 @@ pub mod dev;
 pub mod device;
 pub mod devioctl;
 pub mod dgram;
-pub mod driver;
 pub mod ethernet;
 #[path = "core/filter.rs"]
 pub mod filter;

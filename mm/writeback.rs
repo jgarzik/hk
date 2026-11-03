@@ -17,7 +17,7 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use crate::storage::blkdev::DevId;
+use crate::block::blkdev::DevId;
 use crate::sync::spin::{Mutex, RwLock};
 use crate::workqueue::{DelayedWork, Workqueue, wq_flags};
 
@@ -89,8 +89,8 @@ fn do_device_writeback(disk: DevId) {
     let devs = core::mem::take(&mut *bdi.dirty.lock());
     for dev in devs {
         crate::fs::fs_writeback::writeback_dev(dev);
-        if let Some(b) = crate::storage::get_blkdev(dev) {
-            let _ = crate::storage::blkdev::sync_blockdev(&b);
+        if let Some(b) = crate::block::get_blkdev(dev) {
+            let _ = crate::block::blkdev::sync_blockdev(&b);
         }
     }
 }
@@ -228,7 +228,7 @@ pub static WB_CTLS: &[crate::sysctl::Ctl] = &[
 /// filesystem's dirty inodes, then the devices' caches
 pub fn sync_all() {
     crate::fs::fs_writeback::sync_all_sbs();
-    crate::storage::blkdev::sync_bdevs();
+    crate::block::blkdev::sync_bdevs();
 }
 
 /// Register a disk's writeback state (Linux bdi_register)

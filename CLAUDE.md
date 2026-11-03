@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-hk: stable-Rust (no nightly) no_std SMP kernel, x86-64 + aarch64, Linux syscall ABI. No `src/` dirs.
+hk: stable-Rust (no nightly) no_std SMP kernel, x86-64 + aarch64, Linux syscall ABI. The kernel crate is the repo root (no `src/` dirs). Code that touches a chip or device goes in `arch/` or `hw/`; generic layers stay out of `hw/`. Directories spill: split past ~40 files, never a near-empty one.
 
 ## Mission
 - Linux-compatible kernel for many-core 64-bit machines, grown in chunks toward full compatibility. Modern hardware only; targets: QEMU/virtio, Dell OptiPlex 3020.

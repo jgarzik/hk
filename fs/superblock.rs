@@ -145,7 +145,7 @@ impl StatFs {
 
 use super::file::FileOps;
 
-use crate::storage::BlockDevice;
+use crate::block::BlockDevice;
 
 /// Mount function type for pseudo-filesystems (no backing device)
 pub type MountFn = fn(fs_type: &'static FileSystemType) -> Result<Arc<SuperBlock>, KernelError>;
@@ -246,7 +246,7 @@ pub struct SuperBlock {
 
     /// The block device a device filesystem is mounted from, held open
     /// while the superblock lives (Linux s_bdev_file)
-    s_bdev: spin::Once<crate::storage::blkdev::BdevHandle>,
+    s_bdev: spin::Once<crate::block::blkdev::BdevHandle>,
 
     /// Inodes with dirty pages, each held until written back (Linux
     /// wb->b_dirty; `fs_writeback`)
@@ -363,12 +363,12 @@ impl SuperBlock {
     }
 
     /// Hold the block device open for the superblock's life
-    pub fn set_bdev(&self, h: crate::storage::blkdev::BdevHandle) {
+    pub fn set_bdev(&self, h: crate::block::blkdev::BdevHandle) {
         self.s_bdev.call_once(|| h);
     }
 
     /// The block device the filesystem is mounted from
-    pub fn bdev(&self) -> Option<&Arc<crate::storage::BlockDevice>> {
+    pub fn bdev(&self) -> Option<&Arc<crate::block::BlockDevice>> {
         self.s_bdev.get().map(|h| h.bdev())
     }
 

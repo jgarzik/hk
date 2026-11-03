@@ -14,7 +14,7 @@ use super::dentry::Dentry;
 use super::inode::{FileType, Inode};
 use super::superblock::{FileSystemType, SuperBlock};
 
-use crate::storage::get_blkdev;
+use crate::block::get_blkdev;
 
 /// Ignore set-user/group-ID bits on exec (Linux MNT_NOSUID)
 pub const MNT_NOSUID: u32 = 0x1;

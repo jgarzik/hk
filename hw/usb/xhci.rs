@@ -19,9 +19,9 @@ use crate::sync::spin::Mutex;
 use crate::arch::{CurrentArch, IoremapOps, phys_to_virt};
 use crate::bus::bus::{BusContext, BusDevice, BusDriver};
 use crate::bus::driver::{Device, DriverError};
-use crate::bus::pci::PciDevice;
 use crate::delay::{poll_timeout, udelay};
 use crate::downcast_bus_device;
+use crate::hw::pci::PciDevice;
 use crate::printkln;
 
 /// Halt and start handshakes (Linux XHCI_MAX_HALT_USEC)
@@ -48,7 +48,7 @@ pub(super) const XHCI_IRQS: u32 = (1 << 2) | (1 << 3) | (1 << 10);
 /// Chipset quirks, set once from the PCI IDs (Linux xhci_pci_quirks)
 mod quirk {
     use super::PCI_VENDOR_INTEL;
-    use crate::bus::pci::PciDevice;
+    use crate::hw::pci::PciDevice;
 
     /// Intel host: 1 ms after HCRST before any register access
     pub const INTEL_HOST: u32 = 1 << 0;
@@ -1572,7 +1572,7 @@ impl XhciController {
         // caller's: a timeout leaves the TRB queued, and the controller
         // may still write it later (the buffer is then leaked, never
         // reused; BUGS.md, xHCI gaps)
-        let bounce = crate::dma::dma_alloc_coherent(&self.pci_dev, data.len().max(1))
+        let bounce = crate::hw::dma::dma_alloc_coherent(&self.pci_dev, data.len().max(1))
             .ok_or(UsbError::NoResources)?;
         let dma_addr = bounce.dma_addr();
         // SAFETY: a fresh allocation of at least data.len() bytes, not
@@ -1618,7 +1618,7 @@ impl XhciController {
         }
 
         // SAFETY: the transfer completed: the device is done with it
-        unsafe { crate::dma::dma_free_coherent(&self.pci_dev, bounce) };
+        unsafe { crate::hw::dma::dma_free_coherent(&self.pci_dev, bounce) };
 
         if cc != CompletionCode::SUCCESS && cc != CompletionCode::SHORT_PACKET {
             printkln!("xHCI: Bulk OUT failed with code {}", cc);
@@ -1668,7 +1668,7 @@ impl XhciController {
         // caller's: a timeout leaves the TRB queued, and the controller
         // may still write it later (the buffer is then leaked, never
         // reused; BUGS.md, xHCI gaps)
-        let bounce = crate::dma::dma_alloc_coherent(&self.pci_dev, data.len().max(1))
+        let bounce = crate::hw::dma::dma_alloc_coherent(&self.pci_dev, data.len().max(1))
             .ok_or(UsbError::NoResources)?;
         let dma_addr = bounce.dma_addr();
 
@@ -1720,7 +1720,7 @@ impl XhciController {
         // both buffers
         unsafe {
             core::ptr::copy_nonoverlapping(bounce.cpu_addr(), data.as_mut_ptr(), transferred);
-            crate::dma::dma_free_coherent(&self.pci_dev, bounce);
+            crate::hw::dma::dma_free_coherent(&self.pci_dev, bounce);
         }
 
         if cc != CompletionCode::SUCCESS && cc != CompletionCode::SHORT_PACKET {

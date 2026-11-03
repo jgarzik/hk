@@ -22,16 +22,16 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use super::dumb::DumbBuffer;
-use super::ioctl::{
+use crate::gfx::dumb::DumbBuffer;
+use crate::gfx::ioctl::{
     GFX_CAP_DUMB_BUFFER, GFX_CAP_PRIME, GFX_CAP_TIMESTAMP_MONOTONIC, GFX_MODE_CONNECTOR_VIRTUAL,
     GFX_MODE_ENCODER_VIRTUAL,
 };
-use super::mode::{
+use crate::gfx::mode::{
     GfxConnector, GfxCrtc, GfxEncoder, GfxFramebuffer, GfxModeInfo, GfxModeResources,
 };
-use super::{FramebufferInfo, PixelFormat};
-use super::{GfxDriver, GfxError};
+use crate::gfx::{FramebufferInfo, PixelFormat};
+use crate::gfx::{GfxDriver, GfxError};
 
 /// SimpleDRM device state
 struct SimpleGfxState {
@@ -351,7 +351,7 @@ impl GfxDriver for SimpleGfxDevice {
 ///
 /// Returns the minor number of the created device, or None if no framebuffer.
 pub fn init_simplegfx() -> Option<u32> {
-    use super::BOOT_FRAMEBUFFER;
+    use crate::gfx::BOOT_FRAMEBUFFER;
 
     let fb_info = *BOOT_FRAMEBUFFER.get()?;
 
@@ -363,7 +363,7 @@ pub fn init_simplegfx() -> Option<u32> {
     );
 
     let device = SimpleGfxDevice::new(fb_info);
-    let minor = super::register_gfx_device(device).ok()?;
+    let minor = crate::gfx::register_gfx_device(device).ok()?;
 
     Some(minor)
 }

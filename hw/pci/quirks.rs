@@ -9,7 +9,7 @@
 //!
 //! Locking: run during bus enumeration, which is single-threaded (boot).
 
-use super::pci::PciDevice;
+use super::PciDevice;
 
 /// Match any vendor or device ID (Linux PCI_ANY_ID)
 pub const ANY_ID: Option<u16> = None;
@@ -34,7 +34,7 @@ impl PciFixup {
 }
 
 /// The final fixups, in order
-static FIXUPS_FINAL: &[PciFixup] = &[crate::usb::pci_quirks::EARLY_HANDOFF];
+static FIXUPS_FINAL: &[PciFixup] = &[crate::hw::usb::pci_quirks::EARLY_HANDOFF];
 
 /// Run the final fixups on each function of a scanned bus (Linux
 /// pci_fixup_device(pci_fixup_final, ...) from pci_bus_add_device)

@@ -31,8 +31,6 @@
 pub mod console_dev;
 pub mod ioctl;
 pub mod n_tty;
-#[cfg(target_arch = "x86_64")]
-pub mod serial;
 pub mod termios;
 pub mod tty_dev;
 
@@ -446,10 +444,6 @@ impl ConsoleDriver for Tty {
     }
 }
 
-// Re-export SerialTty for convenience
-#[cfg(target_arch = "x86_64")]
-pub use serial::SerialTty;
-
 /// Initialize TTY character devices in the chardev registry
 ///
 /// This registers serial TTYs for each architecture plus special devices
@@ -461,7 +455,7 @@ pub fn init_tty_chardevs() {
 
     // Register platform-specific serial TTYs
     #[cfg(target_arch = "x86_64")]
-    serial::register_serial_chardevs();
+    crate::hw::serial::register_serial_chardevs();
 
     #[cfg(target_arch = "aarch64")]
     {

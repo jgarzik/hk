@@ -519,7 +519,7 @@ across net, fs, ipc) cannot be audited yet.
 
 ## xHCI driver gaps on real hardware
 
-**Location**: `usb/xhci.rs`, `usb/msc.rs`
+**Location**: `hw/usb/xhci.rs`, `hw/usb/msc.rs`
 
 Found while chasing the Dell OptiPlex 3020 freeze; QEMU's xHCI hides
 all of them.
@@ -550,8 +550,8 @@ all of them.
 
 ## No DMA for 32-bit devices with RAM above 4GB
 
-**Location**: `dma.rs`, `frame_alloc.rs`,
-`net/driver/e1000.rs`, `usb/xhci.rs`
+**Location**: `hw/dma.rs`, `frame_alloc.rs`,
+`hw/net/e1000.rs`, `hw/usb/xhci.rs`
 
 `DirectDmaOps` only checks the mask: a buffer or coherent frame above
 the device's mask fails (`None`) instead of being bounced (Linux
@@ -566,7 +566,7 @@ default to a 32-bit mask, so with RAM above 4GB:
 
 ## x86 has no IOAPIC or MSI
 
-**Location**: `arch/x86_64/irq.rs`, `bus/pci.rs`
+**Location**: `arch/x86_64/irq.rs`, `hw/pci/mod.rs`
 
 Device interrupts reach the CPUs only through the 8259 PIC, on the
 line firmware wrote into each function's Interrupt Line register (PIC
@@ -577,7 +577,7 @@ and r8169 all support.
 
 ## ACPI power management gaps
 
-**Location**: `acpi/`, `arch/x86_64/{acpi,power}.rs`
+**Location**: `hw/acpi/`, `arch/x86_64/{acpi,power}.rs`
 
 hk has no AML interpreter: `\_S5` is found by a byte scan of the DSDT
 and SSDTs for a plain `Name (_S5, Package ...)`: one returned by a
@@ -603,7 +603,7 @@ fat_get_cluster keeps a per-inode cache of chain positions
 
 ## Block layer gaps (P1)
 
-**Location**: `storage/`, `virtio/blk.rs`,
+**Location**: `block/`, `hw/virtio/blk.rs`,
 `fs/blkdev_ops.rs`, `fs/vfat.rs`
 
 - Partition tables are parsed in 512-byte sectors: on a disk with
@@ -667,7 +667,7 @@ sched pid 0, flock/POSIX release, signalfd reader, errno flattening.
   APIs. Split like Linux (sched/core, fork, exit, cred). Other giants:
   sys_prctl, do_semctl, sys_mmap, exec_file, sys_fcntl.
 - **Arch code in generic files** (J): 93 `cfg(target_arch)` outside
-  `arch/` (main.rs, dma.rs, percpu.rs, misc, pci, seccomp's audit
+  `arch/` (main.rs, hw/dma.rs, percpu.rs, misc, pci, seccomp's audit
   arch), 32 direct `arch::x86_64::`/`aarch64::` references, three
   `CurrentArch` redefinitions.
 - **Globals where per-CPU fits** (I/C/E): TCP timers in one map run on

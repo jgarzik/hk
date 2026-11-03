@@ -7,7 +7,7 @@
 //! - Features: SIZE_MAX, SEG_MAX, BLK_SIZE, TOPOLOGY (physical block
 //!   size), FLUSH (volatile write cache), RO, MQ (one virtqueue per
 //!   hardware queue, CPUs spread over them).
-//! - A blk-mq driver (`storage::blk_mq`): each virtqueue is one hardware
+//! - A blk-mq driver (`block::blk_mq`): each virtqueue is one hardware
 //!   queue. A request is `[header] [data...] [status]`; headers and
 //!   status bytes live in a per-queue coherent pool, one slot per tag.
 //!   Data segments are the bio's frames, DMA-mapped in `queue_rq` and
@@ -35,17 +35,15 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use spin::Once;
 
 use crate::arch::phys_to_virt;
+use crate::block::blk_mq::{BlkMq, MqOps, Queued};
+use crate::block::blkdev::{Bio, BioList, BioOp, Disk, QueueLimits, RequestQueue, register_blkdev};
+use crate::block::genhd::{add_disk, disk_name};
 use crate::bus::driver::{Device, DriverError};
-use crate::dma::{DmaAddr, DmaCoherent, DmaDirection, dma_map_single, dma_unmap_single};
 use crate::error::KernelError;
+use crate::hw::dma::{DmaAddr, DmaCoherent, DmaDirection, dma_map_single, dma_unmap_single};
+use crate::hw::virtio::ring::Sg;
+use crate::hw::virtio::{self, VirtioDevice, VirtioDriver, VirtioIrq, Virtqueue};
 use crate::printkln;
-use crate::storage::blk_mq::{BlkMq, MqOps, Queued};
-use crate::storage::blkdev::{
-    Bio, BioList, BioOp, Disk, QueueLimits, RequestQueue, register_blkdev,
-};
-use crate::storage::genhd::{add_disk, disk_name};
-use crate::virtio::ring::Sg;
-use crate::virtio::{self, VirtioDevice, VirtioDriver, VirtioIrq, Virtqueue};
 
 /// Device-specific feature bits
 mod feature {
@@ -115,7 +113,7 @@ fn dir(op: BioOp) -> DmaDirection {
 impl VbQueue {
     fn new(vdev: &Arc<VirtioDevice>, vq: Virtqueue) -> Result<Self, DriverError> {
         let tags = MAX_TAGS.min(vq.num());
-        let pool = crate::dma::dma_alloc_coherent(&**vdev, tags as usize * SLOT)
+        let pool = crate::hw::dma::dma_alloc_coherent(&**vdev, tags as usize * SLOT)
             .ok_or(DriverError::MissingResource)?;
         let slots = (0..tags)
             .map(|_| Slot {

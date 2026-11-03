@@ -27,9 +27,9 @@ use super::{VirtioIrq, find_driver, status};
 use crate::arch::barrier::wmb;
 use crate::bus::bus::{BusContext, BusDevice, BusDriver};
 use crate::bus::driver::{Device, DriverError};
-use crate::bus::pci::{PciDevice, cap_id};
-use crate::dma::{DmaCoherent, DmaConfig, DmaDevice};
-use crate::mmio::IoMem;
+use crate::hw::dma::{DmaCoherent, DmaConfig, DmaDevice};
+use crate::hw::mmio::IoMem;
+use crate::hw::pci::{PciDevice, cap_id};
 use crate::printkln;
 
 /// Red Hat / virtio vendor ID
@@ -346,8 +346,8 @@ impl VirtioDevice {
             .ok_or(DriverError::MissingResource)?;
         let lay = Layout::new(num);
         // Zeroed, page-aligned: satisfies every ring part's alignment
-        let mem =
-            crate::dma::dma_alloc_coherent(self, lay.size).ok_or(DriverError::MissingResource)?;
+        let mem = crate::hw::dma::dma_alloc_coherent(self, lay.size)
+            .ok_or(DriverError::MissingResource)?;
         let d = mem.dma_addr().0;
         self.w16(common::Q_SIZE, num);
         self.w64(common::Q_DESC, d);

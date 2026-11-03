@@ -8,7 +8,7 @@
 use crate::chardev::DeviceError;
 use crate::console::{ConsolePriority, register_console};
 
-use super::{RAW_LDISC, Tty, TtyDriver};
+use crate::tty::{RAW_LDISC, Tty, TtyDriver};
 
 /// NS16550A register offsets
 mod regs {
