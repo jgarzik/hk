@@ -1,5 +1,24 @@
 # Known Bugs
 
+## Seen on both hk and the Linux reference
+
+Failures that also occur when the boot tester runs on real Linux
+(`check-linux*`). The cause may be the test, the environment, or a
+real bug in Linux as well as hk: Linux is the reference, not
+infallible, so each one is investigated, not written off.
+
+- **BUSYBOX_NC_LO flaky, on hk and the Linux reference** (next
+  batch): `BUSYBOX_NC_LO:FAIL status=0` (nc over loopback) in 1 of 5
+  x86 `check-linux` runs, and in an hk x86 boot with one CPU
+  (`QEMU_SMP=1`). Cause unknown: the test waits for the listener
+  (`wait_listen`) and retries the client. Seen again 2026-11-03: one
+  uncached x86 `check-linux` run of three (passed on rerun).
+- **SWAPOUT_PAGEOUT flaky on the Linux reference** (J): one x86
+  `check-linux` run had free swap 364 kB off the expected value after
+  MADV_PAGEOUT of 16 MiB (beyond the test's tolerance), passing on the
+  rerun. Linux's swap accounting after pageout is not exact (swap
+  cache); the tolerance may need to grow on Linux.
+
 ## Safe kernel code that can cause UB (doc/UNSAFE.md)
 
 These are safe fns or patterns whose use leads to undefined behaviour.
@@ -735,11 +754,6 @@ Found during T0 (2026-10-19). Tag = when to fix.
    getpid/gettid/kill/wait//proc use the root number; a CLONE_NEWPID
    child is not pid 1 in its namespace. Use `Pid::nr_in(caller's ns)`
    at the syscall boundary.
-5. **BUSYBOX_NC_LO flaky, on hk and the Linux reference** (next
-   batch): `BUSYBOX_NC_LO:FAIL status=0` (nc over loopback) in 1 of 5
-   x86 `check-linux` runs, and in an hk x86 boot with one CPU
-   (`QEMU_SMP=1`). Cause unknown: the test waits for the listener
-   (`wait_listen`) and retries the client.
 6. **No ptrace exec stop** (P9): a traced task's execve does not stop
    with SIGTRAP / PTRACE_EVENT_EXEC (`kernel/task/exec.rs`), so a
    tracer cannot observe a non-leader exec's tid change.
@@ -755,8 +769,3 @@ Found during T0 (2026-10-19). Tag = when to fix.
    `check-stress` boots: poll reported POLLOUT for a nonblocking
    connect to a just-closed loopback port, but no ECONNREFUSED was
    pending).
-14. **SWAPOUT_PAGEOUT flaky on the Linux reference** (J): one x86
-   `check-linux` run had free swap 364 kB off the expected value after
-   MADV_PAGEOUT of 16 MiB (beyond the test's tolerance), passing on the
-   rerun. Linux's swap accounting after pageout is not exact (swap
-   cache); the tolerance may need to grow on Linux.
