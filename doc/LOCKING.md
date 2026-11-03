@@ -1703,7 +1703,7 @@ Each open `File` holds a reference to its mount via the `mnt` field:
 2. parent Mount.children (write for add/remove child)
 3. Mount.parent (write for set/clear)
 4. Mount.mountpoint (write for set/clear)
-5. Dentry.d_lock (DentryInner.flags: write for the mounted flag)
+5. Dentry.d_lock (DentryInner.flags: write for the mount count)
 ```
 
 **Lock Order for Path Traversal (follow_mount):**

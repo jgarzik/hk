@@ -11,7 +11,7 @@ use ::core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use super::KernelError;
 use super::dentry::Dentry;
-use super::inode::{FileType, Inode};
+use super::inode::FileType;
 use super::superblock::{FileSystemType, SuperBlock};
 
 use crate::block::get_blkdev;
@@ -127,7 +127,6 @@ impl Mount {
 
     /// Set the mount point
     pub fn set_mountpoint(&self, dentry: Arc<Dentry>) {
-        dentry.set_mountpoint(true);
         note_mp(&dentry, 1);
         *self.mountpoint.write() = Some(dentry);
     }
@@ -155,15 +154,8 @@ impl Mount {
         let children = self.children.read();
         for child in children.iter() {
             let mp: Option<Arc<Dentry>> = child.get_mountpoint();
-            if let Some(mp) = mp {
-                // Compare by checking if mountpoint's inode matches
-                let mp_ino: Option<Arc<Inode>> = mp.get_inode();
-                let d_ino: Option<Arc<Inode>> = dentry.get_inode();
-                if let (Some(mp_i), Some(d_i)) = (mp_ino, d_ino)
-                    && mp_i.ino == d_i.ino
-                {
-                    return Some(child.clone());
-                }
+            if mp.is_some_and(|mp| same_inode(&mp, dentry)) {
+                return Some(child.clone());
             }
         }
         None
@@ -401,11 +393,6 @@ pub fn do_umount(mount: Arc<Mount>, flags: i32) -> Result<(), KernelError> {
     // generic_shutdown_super -> sync_filesystem)
     let _ = super::fs_writeback::writeback_sb(&mount.sb);
 
-    // Clear the mountpoint flag on the dentry
-    if let Some(mp) = mount.get_mountpoint() {
-        mp.set_mountpoint(false);
-    }
-
     // Remove from parent's children list
     if let Some(parent) = mount.get_parent() {
         parent.remove_child(&mount);
@@ -422,8 +409,10 @@ pub fn do_umount(mount: Arc<Mount>, flags: i32) -> Result<(), KernelError> {
     Ok(())
 }
 
-/// Count a mount on (`+1`) or off (`-1`) the filesystem `mp` is in
+/// Count a mount on (`+1`) or off (`-1`) the dentry `mp` and the
+/// filesystem it is in
 fn note_mp(mp: &Dentry, delta: i32) {
+    mp.note_mounted(delta);
     if let Some(sb) = mp.superblock() {
         sb.note_mounted_on(delta);
     }
@@ -452,23 +441,7 @@ pub fn is_local_mountpoint(d: &Arc<Dentry>) -> bool {
     if inode.sb.upgrade().is_none_or(|sb| !sb.has_mounts_on()) {
         return false;
     }
-    let Some(root) = crate::ns::current_mnt_ns().get_root() else {
-        return false;
-    };
-    let same = |mp: Arc<Dentry>| {
-        mp.get_inode()
-            .is_some_and(|i| i.ino == inode.ino && i.sb.ptr_eq(&inode.sb))
-    };
-    let mut todo = alloc::vec![root];
-    while let Some(m) = todo.pop() {
-        for c in m.children.read().iter() {
-            if c.get_mountpoint().is_some_and(same) {
-                return true;
-            }
-            todo.push(c.clone());
-        }
-    }
-    false
+    lookup_mnt(d).is_some()
 }
 
 /// MNT_* flags of the mount `dentry` belongs to (0 if none)
@@ -478,30 +451,41 @@ pub fn mnt_flags_of(dentry: &Arc<Dentry>) -> u32 {
         .map_or(0, |m| m.flags())
 }
 
-/// Check if a dentry is a mount point and get the mounted filesystem's root
+/// The dentry a walk lands on at `dentry` (Linux traverse_mounts): the
+/// root of the topmost mount stacked there in the caller's namespace,
+/// else `dentry` itself
 pub fn follow_mount(dentry: &Arc<Dentry>) -> Arc<Dentry> {
-    if !dentry.is_mountpoint() {
-        return dentry.clone();
-    }
-
-    // Find the mount at this dentry using current namespace
-    let mnt_ns = crate::ns::current_mnt_ns();
-    if let Some(root_mount) = mnt_ns.get_root() {
-        // Check children for a mount at this dentry
-        let children = root_mount.children.read();
-        for child in children.iter() {
-            let mp: Option<Arc<Dentry>> = child.get_mountpoint();
-            if let Some(mp) = mp {
-                let mp_ino: Option<Arc<Inode>> = mp.get_inode();
-                let d_ino: Option<Arc<Inode>> = dentry.get_inode();
-                if let (Some(mp_i), Some(d_i)) = (mp_ino, d_ino)
-                    && mp_i.ino == d_i.ino
-                {
-                    return child.root.clone();
-                }
-            }
+    let mut d = dentry.clone();
+    while d.is_mountpoint() {
+        match lookup_mnt(&d) {
+            Some(m) => d = m.root.clone(),
+            None => break,
         }
     }
+    d
+}
 
-    dentry.clone()
+/// The mount on `d` in the caller's namespace (Linux lookup_mnt): its
+/// mountpoint is `d`'s inode, same superblock and number, so a dentry
+/// rebuilt after an ancestor rename still matches
+fn lookup_mnt(d: &Dentry) -> Option<Arc<Mount>> {
+    let root = crate::ns::current_mnt_ns().get_root()?;
+    let mut todo = alloc::vec![root];
+    while let Some(m) = todo.pop() {
+        for c in m.children.read().iter() {
+            if c.get_mountpoint().is_some_and(|mp| same_inode(&mp, d)) {
+                return Some(c.clone());
+            }
+            todo.push(c.clone());
+        }
+    }
+    None
+}
+
+/// `a` and `b` are one inode: same superblock and number
+fn same_inode(a: &Dentry, b: &Dentry) -> bool {
+    match (a.get_inode(), b.get_inode()) {
+        (Some(x), Some(y)) => x.ino == y.ino && x.sb.ptr_eq(&y.sb),
+        _ => false,
+    }
 }

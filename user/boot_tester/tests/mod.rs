@@ -70,6 +70,7 @@ pub mod mm_populate;
 pub mod mountflags;
 pub mod mprotect;
 pub mod namei;
+pub mod mounts;
 pub mod mqueue;
 pub mod mrange;
 pub mod namespace;
@@ -180,6 +181,7 @@ pub fn run_all_tests() {
     close_range::run_tests();
     append::run_tests();
     mountflags::run_tests();
+    mounts::run_tests();
     process::run_tests();
     file_io::run_tests();
     bigio::run_tests();

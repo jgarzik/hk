@@ -22,8 +22,10 @@ use super::superblock::SuperBlock;
 /// Dentry flags
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DentryFlags {
-    /// This is a mount point
-    pub mounted: bool,
+    /// Mounts sitting on this dentry, in every namespace (Linux
+    /// DCACHE_MOUNTED, held while a struct mountpoint exists): a hint
+    /// for the walk; which mount covers it is the namespace's business
+    pub mounted: u32,
     /// Negative dentry (cached failed lookup)
     pub negative: bool,
 }
@@ -153,14 +155,15 @@ impl Dentry {
         self.d_lock.write().children.remove(name)
     }
 
-    /// Check if this dentry is a mount point
+    /// Some mount, in some namespace, sits on this dentry
     pub fn is_mountpoint(&self) -> bool {
-        self.d_lock.read().flags.mounted
+        self.d_lock.read().flags.mounted != 0
     }
 
-    /// Mark this dentry as a mount point
-    pub fn set_mountpoint(&self, mounted: bool) {
-        self.d_lock.write().flags.mounted = mounted;
+    /// Count a mount on (`+1`) or off (`-1`) this dentry
+    pub fn note_mounted(&self, delta: i32) {
+        let f = &mut self.d_lock.write().flags;
+        f.mounted = f.mounted.saturating_add_signed(delta);
     }
 
     /// Get the superblock this dentry belongs to
