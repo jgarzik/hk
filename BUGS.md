@@ -253,14 +253,11 @@ Missing: fs.protected_hardlinks/symlinks/fifos/regular do not exist
 (behave as their kernel default 0); no
 immutable/append-only inodes (no IS_APPEND/IS_IMMUTABLE EPERM).
 
-## Spinlocks where Linux uses sleeping locks
+## Sleeping-lock gaps
 
-**Location**: `sync` (Mutex, RwSem), various
+**Location**: `sync` (RwSem)
 
-Linux rw_semaphores modeled as `spin` locks include the mount
-namespace/topology locks (namespace_sem, `Mount` RwLocks) and `s_umount`
-(absent): their holders must not sleep (`make check LOCKDEP=1` reports
-one that does). `RwSem` has no `_interruptible` variants.
+`RwSem` has no `_interruptible` variants.
 
 ## Mount flag gaps
 
@@ -277,6 +274,10 @@ has one mount per namespace). Unlike Linux (MNT_WRITE_HOLD), a
 `SuperBlock::want_write` racing a rw->ro remount that then fails with
 EBUSY can see a spurious EROFS. Mount data/options strings are
 ignored; mounts are not user-namespace aware (plain capable()).
+Crossing into a mount scans the current mount's children (Linux hashes
+(parent, mountpoint): mount_hashtable). After pivot_root other tasks
+keep their old fs root (no chroot_fs_refs) until pivot_root is redone
+(Phase G).
 
 ## Thread-group exit gaps
 

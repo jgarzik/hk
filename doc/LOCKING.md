@@ -247,20 +247,26 @@ SignalStruct.exec_update (sync::RwSem; Linux exec_update_lock; write:
 VFS locks (detailed order):
     File.f_pos_lock (sync::Mutex; read/write/lseek/getdents by position)
         ↓
-    MntNamespace.root
-        ↓
-    Mount.{children, parent, mountpoint}
-        ↓
     SuperBlock.s_vfs_rename_mutex (cross-directory rename only)
         ↓
     Inode.i_rwsem (sync::RwSem; exclusive: directory operations,
-                   lock_rename, regular file write and truncate; shared:
+                   lock_rename, regular file write and truncate, the
+                   mountpoint during attach (Linux lock_mount); shared:
                    path-walk lookup on a dcache miss, readdir;
                    parent directory -> the link/unlink/rename victim or
                    link source, two non-directories by address)
         ↓
+    mount::NAMESPACE_SEM (sync::RwSem; Linux namespace_sem: write for
+                   attach, umount, namespace copy; read for /proc mount
+                   lists)
+        ↓
+    SuperBlock.s_umount (sync::RwSem; write for remount)
+        ↓
     dentry::RENAME_LOCK (spin RwLock, Linux rename_lock: write in
                    d_move/d_exchange, read in is_subdir/d_path)
+        ↓
+    MntNamespace.root, Mount.{children, parent, mountpoint} (spin;
+                   d_path reads parent/mountpoint under RENAME_LOCK)
         ↓
     Dentry.d_lock (single d_lock like Linux; short, never held across
                    i_rwsem; parent before child)
@@ -1715,12 +1721,20 @@ Each open `File` holds a reference to its mount via the `mnt` field:
 
 **Lock Order for Mount Operations:**
 ```
-1. MntNamespace.root (read/write)
-2. parent Mount.children (write for add/remove child)
-3. Mount.parent (write for set/clear)
-4. Mount.mountpoint (write for set/clear)
-5. Dentry.d_lock (DentryInner.flags: write for the mount count)
+1. the mountpoint's Inode.i_rwsem (attach: a dead directory is refused)
+2. mount::NAMESPACE_SEM (write: attach, umount, namespace copy)
+3. SuperBlock.s_umount (write: remount)
+4. MntNamespace.root (read/write)
+5. parent Mount.children (write for add/remove child)
+6. Mount.parent (write for set/clear)
+7. Mount.mountpoint (write for set/clear)
+8. Dentry.d_lock (DentryInner.flags: write for the mount count)
 ```
+umount writes the filesystem back after releasing NAMESPACE_SEM
+(writeback takes inode locks; Linux syncs in deactivate_super after
+namespace_unlock). Mount ids come from `MNT_IDS` (spin Mutex leaf,
+Linux mnt_id_ida) and `MNT_ID_UNIQUE` (atomic). Deviation: no global
+(parent, mountpoint) hash; crossing scans the current mount's children.
 
 **Lock Order for Path Traversal (follow_mount, lookup_mnt):**
 ```

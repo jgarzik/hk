@@ -272,6 +272,8 @@ pub const STATX_BASIC_STATS: u32 = 0x07ff;
 pub const STATX_BTIME: u32 = 0x0800;
 /// Got stx_mnt_id
 pub const STATX_MNT_ID: u32 = 0x1000;
+/// Got the never-reused mount id in stx_mnt_id
+pub const STATX_MNT_ID_UNIQUE: u32 = 0x4000;
 
 // AT_* flags used by statx
 /// Sync as stat (default)
@@ -355,7 +357,7 @@ pub fn sys_fstatfs(fd: i32, buf: u64) -> i64 {
 // =============================================================================
 
 /// Fill a Statx structure from an inode
-fn fill_statx(inode: &Inode, _mask: u32) -> Statx {
+fn fill_statx(inode: &Inode, mask: u32, mnt: Option<&super::mount::Mount>) -> Statx {
     let attr = inode.i_op.getattr(inode);
     let st_dev = inode.superblock().map(|sb| sb.dev_id).unwrap_or(0);
 
@@ -366,7 +368,14 @@ fn fill_statx(inode: &Inode, _mask: u32) -> Statx {
     };
 
     Statx {
-        stx_mask: STATX_BASIC_STATS, // Always provide basic stats
+        // Basic stats, and the mount id: the unique one if asked for
+        // (Linux vfs_getattr: STATX_MNT_ID_UNIQUE), else the reused one
+        stx_mask: STATX_BASIC_STATS
+            | if mask & STATX_MNT_ID_UNIQUE != 0 {
+                STATX_MNT_ID_UNIQUE
+            } else {
+                STATX_MNT_ID
+            },
         stx_blksize: 4096,
         stx_attributes: 0,
         stx_nlink: attr.nlink,
@@ -402,7 +411,11 @@ fn fill_statx(inode: &Inode, _mask: u32) -> Statx {
         stx_rdev_minor: (st_rdev & 0xff) as u32 | ((st_rdev >> 12) & 0xfff00) as u32,
         stx_dev_major: ((st_dev >> 8) & 0xfff) as u32,
         stx_dev_minor: (st_dev & 0xff) as u32,
-        stx_mnt_id: 0, // Not implemented yet
+        stx_mnt_id: match mnt {
+            Some(m) if mask & STATX_MNT_ID_UNIQUE != 0 => m.mnt_id_unique,
+            Some(m) => m.mnt_id as u64,
+            None => 0,
+        },
         stx_dio_mem_align: 0,
         stx_dio_offset_align: 0,
         stx_subvol: 0,
@@ -429,9 +442,9 @@ pub fn sys_statx(dirfd: i32, path_ptr: u64, flags: i32, mask: u32, buf: u64) -> 
             return Err(KernelError::InvalidArgument);
         }
         let path = getname_maybe_null(path_ptr, flags)?;
-        let dentry = filename_lookup(dirfd, &path, LookupFlags::at(flags))?;
-        let inode = dentry.get_inode().ok_or(KernelError::NotFound)?;
-        put_user::<Uaccess, Statx>(buf, fill_statx(&inode, mask))
+        let p = filename_lookup(dirfd, &path, LookupFlags::at(flags))?;
+        let inode = p.dentry.get_inode().ok_or(KernelError::NotFound)?;
+        put_user::<Uaccess, Statx>(buf, fill_statx(&inode, mask, Some(&p.mnt)))
             .map_err(|_| KernelError::BadAddress)
     })();
     ret(r)

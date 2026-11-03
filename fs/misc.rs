@@ -96,6 +96,7 @@ fn mnt_flags(flags: u64) -> u32 {
 /// (EBUSY while files are open for writing or changes are in progress,
 /// with nothing changed); only then the per-mount flags are replaced.
 fn remount(m: &Arc<super::mount::Mount>, flags: u64) -> Result<(), KernelError> {
+    let _s = m.sb.s_umount.write();
     if flags & ms::RDONLY != 0 {
         m.sb.make_rdonly()?;
     } else {
@@ -201,7 +202,19 @@ fn new_mount(source: &[u8], fstype: &str, mp: super::Path, flags: u64) -> Result
         (fs_type.mount)(fs_type)
     };
     let r = sb.and_then(|sb| {
-        super::mount::attach(sb, Some(mp), mnt_flags(flags), flags & ms::RDONLY != 0)
+        // Linux: no source is "none"
+        let devname = if source.is_empty() {
+            b"none".as_slice()
+        } else {
+            source
+        };
+        super::mount::attach(
+            sb,
+            Some(mp),
+            mnt_flags(flags),
+            flags & ms::RDONLY != 0,
+            devname.into(),
+        )
     });
     match r {
         Ok(_) => Ok(()),

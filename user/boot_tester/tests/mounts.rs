@@ -4,7 +4,7 @@
 //! mounts are ramfs on both kernels.
 
 use super::helpers::{print, print_num, println};
-use hk_syscall::{CLONE_NEWNS, O_CREAT, O_WRONLY, Stat, sys_chdir, sys_close, sys_exit, sys_fork, sys_getcwd, sys_link, sys_mkdir, sys_mount, sys_open, sys_readlink, sys_rename, sys_rmdir, sys_stat, sys_symlink, sys_umount2, sys_unlink, sys_unshare, sys_wait4};
+use hk_syscall::{CLONE_NEWNS, O_CREAT, O_WRONLY, Stat, sys_chdir, sys_close, sys_exit, sys_fork, sys_getcwd, sys_link, sys_mkdir, sys_mount, sys_open, sys_readlink, sys_rename, sys_rmdir, sys_stat, sys_umount2, sys_unlink, sys_unshare, sys_wait4};
 
 const ENOENT: i64 = -2;
 const EBUSY: i64 = -16;

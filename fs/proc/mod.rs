@@ -15,6 +15,7 @@
 //! These files can be opened and passed to `setns(2)` to join namespaces.
 
 mod array;
+mod mounts;
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -185,6 +186,8 @@ pub enum ProcfsInodeData {
     FdSymlink { pid: Pid, fd: i32 },
     /// /proc/self: symlink to the reader's process directory
     SelfLink,
+    /// A symlink with a fixed target (/proc/mounts -> self/mounts)
+    FixedLink(&'static [u8]),
     /// Fdinfo file (/proc/<pid>/fdinfo/<n>)
     ///
     /// File containing information about an open file descriptor.
@@ -192,10 +195,7 @@ pub enum ProcfsInodeData {
     /// Generated per-process file (/proc/<pid>/cgroup, maps, ...)
     PidFile { pid: Pid, generator: PidGen },
     /// Per-process symlink (/proc/<pid>/exe)
-    PidLink {
-        pid: Pid,
-        target: fn(Pid) -> Result<Vec<u8>, KernelError>,
-    },
+    PidLink { pid: Pid, target: LinkFn },
     /// /proc/sys file (readable, maybe writable)
     Sysctl { ctl: &'static crate::sysctl::Ctl },
 }
@@ -361,6 +361,7 @@ impl InodeOps for ProcfsInodeOps {
             ProcfsInodeData::SelfLink => {
                 Ok(alloc::format!("{}", crate::task::percpu::current_pid()).into_bytes())
             }
+            ProcfsInodeData::FixedLink(t) => Ok(t.to_vec()),
             ProcfsInodeData::FdSymlink { pid, fd } => fd_link(*pid, *fd),
             _ => Err(KernelError::InvalidArgument),
         }
@@ -460,6 +461,7 @@ impl InodeOps for ProcfsInodeOps {
             | ProcfsInodeData::FdSymlink { .. }
             | ProcfsInodeData::PidLink { .. }
             | ProcfsInodeData::SelfLink
+            | ProcfsInodeData::FixedLink(_)
             | ProcfsInodeData::FdinfoFile { .. }
             | ProcfsInodeData::PidFile { .. }
             | ProcfsInodeData::Sysctl { .. } => Err(KernelError::NotDirectory),
@@ -585,10 +587,14 @@ fn lookup_pid_entry(dir: &Inode, pid: Pid, name: &str) -> Result<Arc<Inode>, Ker
             ))));
             Ok(inode)
         }
-        "exe" => {
+        name if PID_LINKS.iter().any(|(n, _, _)| *n == name) => {
+            let &(_, off, target) = PID_LINKS
+                .iter()
+                .find(|(n, _, _)| *n == name)
+                .ok_or(KernelError::NotFound)?;
             let sb = dir.superblock().ok_or(KernelError::Io)?;
             let inode = Arc::new(Inode::new(
-                pid_ino(pid, 104),
+                pid_ino(pid, off),
                 InodeMode::symlink(),
                 0,
                 0,
@@ -598,10 +604,7 @@ fn lookup_pid_entry(dir: &Inode, pid: Pid, name: &str) -> Result<Arc<Inode>, Ker
                 &PROCFS_INODE_OPS,
             ));
             inode.set_private(Arc::new(ProcfsInodeWrapper(RwLock::new(
-                ProcfsInodeData::PidLink {
-                    pid,
-                    target: exe_link,
-                },
+                ProcfsInodeData::PidLink { pid, target },
             ))));
             Ok(inode)
         }
@@ -798,47 +801,43 @@ fn lookup_pid_fdinfo_entry(dir: &Inode, pid: Pid, name: &str) -> Result<Arc<Inod
     Ok(inode)
 }
 
-/// Generate content for /proc/<pid>/fdinfo/<n> files
+/// /proc/<pid>/fdinfo/<n> (Linux seq_show): position, open flags
+/// (O_CLOEXEC added for a close-on-exec descriptor) in octal with a
+/// leading 0, the mount id, the inode number; then the file's own lines
 fn gen_fdinfo_content(pid: Pid, fd: i32) -> Vec<u8> {
     use alloc::fmt::Write;
-    let mut output = String::new();
-
-    // Get the task's TID
-    let tid = match get_tid_for_pid(pid) {
-        Some(t) => t,
-        None => {
-            return Vec::new();
+    let Some(tid) = get_tid_for_pid(pid) else {
+        return Vec::new();
+    };
+    let Some(table) = crate::task::fdtable::get_task_fd(tid) else {
+        return Vec::new();
+    };
+    let (file, cloexec) = {
+        let t = table.lock();
+        match t.get(fd) {
+            Some(f) => (f, t.get_fd_flags(fd) & crate::task::FD_CLOEXEC != 0),
+            None => return Vec::new(),
         }
     };
-
-    // Get file info from the FD table
-    let (flags, is_pidfd, pidfd_target_pid) = {
-        if let Some(table_arc) = crate::task::fdtable::get_task_fd(tid) {
-            let table = table_arc.lock();
-            if let Some(file) = table.get(fd) {
-                let flags = file.get_flags();
-                // Check if this is a pidfd
-                let target_pid = crate::task::pidfd::get_pidfd_pid(&file);
-                (flags, target_pid.is_some(), target_pid)
-            } else {
-                return Vec::new();
-            }
-        } else {
-            return Vec::new();
-        }
-    };
-
-    // Output in Linux fdinfo format
-    let _ = writeln!(output, "pos:\t0");
-    let _ = writeln!(output, "flags:\t{:o}", flags);
-    let _ = writeln!(output, "mnt_id:\t0");
-
-    // If this is a pidfd, add the Pid line (Linux-compatible)
-    if is_pidfd && let Some(target) = pidfd_target_pid {
-        let _ = writeln!(output, "Pid:\t{}", target);
+    let mut flags = file.get_flags();
+    if cloexec {
+        flags |= super::file::flags::O_CLOEXEC;
     }
-
-    Vec::from(output.as_bytes())
+    let mnt_id = file.f_path().map_or(0, |p| p.mnt.mnt_id);
+    let ino = file.get_inode().map_or(0, |i| i.ino);
+    let mut out = String::new();
+    let _ = write!(
+        out,
+        "pos:\t{}\nflags:\t0{:o}\nmnt_id:\t{}\nino:\t{}\n",
+        file.get_pos(),
+        flags,
+        mnt_id,
+        ino
+    );
+    if let Some(target) = crate::task::pidfd::get_pidfd_pid(&file) {
+        let _ = writeln!(out, "Pid:\t{}", target);
+    }
+    out.into_bytes()
 }
 
 /// Generate content for namespace files
@@ -973,6 +972,19 @@ const PID_FILES: &[(&str, u64, u16, PidGen)] = &[
     ("stat", 106, 0o444, PidGen::Pub(array::gen_stat)),
     ("cmdline", 107, 0o444, PidGen::Pub(array::gen_cmdline)),
     ("environ", 108, 0o400, PidGen::Mm(array::gen_environ)),
+    ("mounts", 109, 0o444, PidGen::Pub(mounts::show_mounts)),
+    ("mountinfo", 110, 0o444, PidGen::Pub(mounts::show_mountinfo)),
+];
+
+/// Per-process symlinks: name, inode offset, target (Linux
+/// proc_exe_link, proc_cwd_link, proc_root_link)
+/// The target of a per-process symlink
+type LinkFn = fn(Pid) -> Result<Vec<u8>, KernelError>;
+
+const PID_LINKS: &[(&str, u64, LinkFn)] = &[
+    ("exe", 104, exe_link),
+    ("cwd", 111, cwd_link),
+    ("root", 112, root_link),
 ];
 
 fn pid_file(name: &str) -> Option<(u64, u16, PidGen)> {
@@ -1010,6 +1022,27 @@ fn pid_file_pid(inode: &Inode) -> Option<Pid> {
         ProcfsInodeData::PidFile { pid, .. } => Some(*pid),
         _ => None,
     }
+}
+
+/// /proc/<pid>/cwd and root: the task's fs pwd or root as the reader
+/// names it, EACCES without ptrace-read access (Linux
+/// proc_fd_access_allowed), ENOENT for a task without one
+fn fs_link(pid: Pid, root: bool) -> Result<Vec<u8>, KernelError> {
+    let tid = get_tid_for_pid(pid).ok_or(KernelError::NotFound)?;
+    if !crate::task::ptrace::may_read_task(tid) {
+        return Err(KernelError::PermissionDenied);
+    }
+    let fs = crate::fs::get_task_fs(tid).ok_or(KernelError::NotFound)?;
+    let p = if root { fs.get_root() } else { fs.get_pwd() };
+    Ok(super::dentry::d_path_link(&p))
+}
+
+fn cwd_link(pid: Pid) -> Result<Vec<u8>, KernelError> {
+    fs_link(pid, false)
+}
+
+fn root_link(pid: Pid) -> Result<Vec<u8>, KernelError> {
+    fs_link(pid, true)
 }
 
 /// /proc/<pid>/exe: the executable's path (ENOENT for kernel threads,
@@ -1221,7 +1254,8 @@ impl FileOps for ProcfsFileOps {
             ProcfsInodeData::Sysctl { ctl } => crate::sysctl::read(ctl),
             ProcfsInodeData::FdSymlink { .. }
             | ProcfsInodeData::PidLink { .. }
-            | ProcfsInodeData::SelfLink => {
+            | ProcfsInodeData::SelfLink
+            | ProcfsInodeData::FixedLink(_) => {
                 return Err(KernelError::Io);
             }
             ProcfsInodeData::Directory { .. }
@@ -1264,7 +1298,8 @@ impl FileOps for ProcfsFileOps {
             ProcfsInodeData::Sysctl { ctl } => crate::sysctl::read(ctl),
             ProcfsInodeData::FdSymlink { .. }
             | ProcfsInodeData::PidLink { .. }
-            | ProcfsInodeData::SelfLink => {
+            | ProcfsInodeData::SelfLink
+            | ProcfsInodeData::FixedLink(_) => {
                 return Err(KernelError::Io);
             }
             ProcfsInodeData::Directory { .. }
@@ -1407,6 +1442,7 @@ impl FileOps for ProcfsFileOps {
             | ProcfsInodeData::FdSymlink { .. }
             | ProcfsInodeData::PidLink { .. }
             | ProcfsInodeData::SelfLink
+            | ProcfsInodeData::FixedLink(_)
             | ProcfsInodeData::FdinfoFile { .. }
             | ProcfsInodeData::PidFile { .. }
             | ProcfsInodeData::Sysctl { .. } => {
@@ -1496,12 +1532,15 @@ fn readdir_emit_pid_entries(pid: Pid, ctx: &mut DirContext) -> Result<(), Kernel
         return Ok(());
     }
 
-    if !ctx.emit(DirEntry {
-        ino: pid_ino(pid, 104),
-        file_type: FileType::Symlink,
-        name: Vec::from(&b"exe"[..]),
-    }) {
-        return Ok(());
+    for (name, off, _) in PID_LINKS {
+        let more = ctx.emit(DirEntry {
+            ino: pid_ino(pid, *off),
+            file_type: FileType::Symlink,
+            name: Vec::from(name.as_bytes()),
+        });
+        if !more {
+            return Ok(());
+        }
     }
     for (name, off, _, _) in PID_FILES {
         let more = ctx.emit(DirEntry {
@@ -1718,45 +1757,6 @@ fn gen_meminfo() -> Vec<u8> {
     out.into_bytes()
 }
 
-/// Generate /proc/mounts content
-///
-/// Format: device mountpoint fstype options dump pass
-/// Example: none / ramfs rw 0 0
-fn gen_mounts() -> Vec<u8> {
-    let mut output = Vec::new();
-    let (Some(root_mount), Ok(root)) = (
-        crate::ns::current_mnt_ns().get_root(),
-        super::namei::nd_root(),
-    ) else {
-        return output;
-    };
-    // Depth first, parents before children; a mount outside the
-    // reader's root is not shown (Linux show_vfsmnt: seq_path_root)
-    let mut todo = alloc::vec![root_mount];
-    while let Some(m) = todo.pop() {
-        let at = super::Path::new(m.clone(), m.root.clone());
-        if let (mp, true) = super::dentry::d_path(&at, &root) {
-            mounts_line(&mut output, &mp, &m);
-        }
-        let children = m.children.read();
-        todo.extend(children.iter().rev().cloned());
-    }
-    output
-}
-
-/// One /proc/mounts line (Linux show_vfsmnt): fields escaped so a name
-/// cannot split or forge a line
-fn mounts_line(out: &mut Vec<u8>, mountpoint: &[u8], m: &super::mount::Mount) {
-    const ESC: &[u8] = b" \t\n\\";
-    out.extend_from_slice(b"none ");
-    super::name::mangle(out, mountpoint, ESC);
-    out.push(b' ');
-    super::name::mangle(out, m.sb.fs_type.name.as_bytes(), b" \t\n\\#");
-    out.push(b' ');
-    out.extend_from_slice(m.opts().as_bytes());
-    out.extend_from_slice(b" 0 0\n");
-}
-
 /// The sysctl behind a /proc/sys inode
 fn sysctl_of(inode: &Inode) -> Option<&'static crate::sysctl::Ctl> {
     let private = inode.get_private()?;
@@ -1865,20 +1865,12 @@ fn procfs_mount(fs_type: &'static FileSystemType) -> Result<Arc<SuperBlock>, Ker
         ProcfsInodeData::new_file(gen_version),
     ))));
 
-    // Create /proc/mounts
-    let mounts_inode = Arc::new(Inode::new(
-        sb.alloc_ino(),
-        InodeMode::regular(0o444),
-        0, // uid: root
-        0, // gid: root
-        0, // Size will be determined on read
-        current_time(),
-        Arc::downgrade(&sb),
-        &PROCFS_INODE_OPS,
-    ));
-    mounts_inode.set_private(Arc::new(ProcfsInodeWrapper(RwLock::new(
-        ProcfsInodeData::new_file(gen_mounts),
-    ))));
+    // /proc/mounts -> self/mounts (Linux proc_symlink)
+    let mounts_inode = mk_inode(
+        &sb,
+        InodeMode::symlink(),
+        ProcfsInodeData::FixedLink(b"self/mounts"),
+    );
 
     let meminfo_inode = mk_inode(
         &sb,

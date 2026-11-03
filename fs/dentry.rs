@@ -225,6 +225,27 @@ pub fn d_path(p: &Path, root: &Path) -> (Vec<u8>, bool) {
     (out, reached)
 }
 
+/// The path of `d` from the root of its filesystem (Linux
+/// dentry_path_raw): a mount's root in mountinfo
+pub fn dentry_path(d: &Arc<Dentry>) -> Vec<u8> {
+    let _r = RENAME_LOCK.read();
+    let mut names = Vec::new();
+    let mut cur = d.clone();
+    while let Some(p) = cur.get_parent() {
+        names.push(cur.name());
+        cur = p;
+    }
+    if names.is_empty() {
+        return b"/".to_vec();
+    }
+    let mut out = Vec::new();
+    for n in names.iter().rev() {
+        out.push(b'/');
+        out.extend_from_slice(n);
+    }
+    out
+}
+
 /// A /proc link's name for `p` (Linux d_path): as `d_path` from the
 /// reader's root, " (deleted)" appended for a removed file
 pub fn d_path_link(p: &Path) -> Vec<u8> {

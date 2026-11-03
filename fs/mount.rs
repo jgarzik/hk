@@ -27,6 +27,39 @@ pub const MNT_NOEXEC: u32 = 0x4;
 /// Old mount -> its copy, from [`Mount::clone_tree`]
 pub type MountMap = Vec<(Arc<Mount>, Arc<Mount>)>;
 
+/// Mount topology changes: attach, umount, namespace copy, pivot_root;
+/// /proc mount lists read under it (Linux namespace_sem, a sleeping
+/// rw_semaphore). Outside it: the mountpoint's i_rwsem; inside it:
+/// s_umount, then the spinning Mount fields.
+pub static NAMESPACE_SEM: crate::sync::RwSem<()> = crate::sync::RwSem::new(());
+
+/// Mount ids (Linux mnt_id_ida): the lowest free one, from 1
+struct MntIds {
+    next: u32,
+    free: alloc::collections::BTreeSet<u32>,
+}
+
+static MNT_IDS: crate::sync::spin::Mutex<MntIds> = crate::sync::spin::Mutex::new(MntIds {
+    next: 0,
+    free: alloc::collections::BTreeSet::new(),
+});
+
+/// The next never-reused mount id (Linux mnt_id_ctr, from 2^32)
+static MNT_ID_UNIQUE: AtomicU64 = AtomicU64::new(1 << 32);
+
+fn mnt_alloc_id() -> u32 {
+    let mut ids = MNT_IDS.lock();
+    if let Some(id) = ids.free.pop_first() {
+        return id;
+    }
+    ids.next += 1;
+    ids.next
+}
+
+fn mnt_free_id(id: u32) {
+    MNT_IDS.lock().free.insert(id);
+}
+
 /// A mount point in the namespace
 ///
 /// This struct mirrors Linux's `struct vfsmount`. The reference count
@@ -53,6 +86,14 @@ pub struct Mount {
     /// MNT_NOEXEC
     mnt_flags: AtomicU32,
 
+    /// Id in /proc/<pid>/mountinfo and statx (Linux mnt_id): reused
+    pub mnt_id: u32,
+    /// Id never reused (Linux mnt_id_unique, STATX_MNT_ID_UNIQUE)
+    pub mnt_id_unique: u64,
+    /// What was mounted: the source argument, or the fs type for
+    /// mounts made by the kernel (Linux mnt_devname)
+    pub devname: super::name::FileName,
+
     /// Reference count for this mount (like Linux mnt_count)
     ///
     /// Tracks active users of this mount. Each open file holds a reference
@@ -63,7 +104,12 @@ pub struct Mount {
 
 impl Mount {
     /// Create a new mount
-    pub fn new(sb: Arc<SuperBlock>, root: Arc<Dentry>, flags: u32) -> Arc<Self> {
+    pub fn new(
+        sb: Arc<SuperBlock>,
+        root: Arc<Dentry>,
+        flags: u32,
+        devname: super::name::FileName,
+    ) -> Arc<Self> {
         Arc::new(Self {
             sb,
             root,
@@ -71,8 +117,22 @@ impl Mount {
             parent: RwLock::new(None),
             children: RwLock::new(Vec::new()),
             mnt_flags: AtomicU32::new(flags),
+            mnt_id: mnt_alloc_id(),
+            mnt_id_unique: MNT_ID_UNIQUE.fetch_add(1, Ordering::Relaxed),
+            devname,
             mnt_count: AtomicU64::new(0),
         })
+    }
+
+    /// A copy of `self` for a namespace copy: same filesystem, root,
+    /// flags and source, new ids, not attached
+    fn copy(&self) -> Arc<Self> {
+        Self::new(
+            self.sb.clone(),
+            self.root.clone(),
+            self.flags(),
+            self.devname.clone(),
+        )
     }
 
     /// MNT_* flags
@@ -191,16 +251,8 @@ impl Mount {
     /// This is used by CLONE_NEWNS to give a new mount namespace its
     /// own view of the mount hierarchy.
     pub fn clone_tree(root: &Arc<Mount>) -> Result<(Arc<Mount>, MountMap), i32> {
-        // Clone the root mount
-        let new_root = Arc::new(Mount {
-            sb: root.sb.clone(),
-            root: root.root.clone(),
-            mountpoint: RwLock::new(None), // Root has no mountpoint
-            parent: RwLock::new(None),     // Root has no parent
-            children: RwLock::new(Vec::new()),
-            mnt_flags: AtomicU32::new(root.flags()),
-            mnt_count: AtomicU64::new(0),
-        });
+        let _ns = NAMESPACE_SEM.write();
+        let new_root = root.copy();
 
         // Recursively clone children
         let mut map = alloc::vec![(root.clone(), new_root.clone())];
@@ -217,19 +269,11 @@ impl Mount {
         old_mount: &Arc<Mount>,
         map: &mut MountMap,
     ) -> Result<(), i32> {
-        // Clone this mount
-        let new_mount = Arc::new(Mount {
-            sb: old_mount.sb.clone(),
-            root: old_mount.root.clone(),
-            mountpoint: RwLock::new(old_mount.mountpoint.read().clone()),
-            parent: RwLock::new(Some(Arc::downgrade(new_parent))),
-            children: RwLock::new(Vec::new()),
-            mnt_flags: AtomicU32::new(old_mount.flags()),
-            mnt_count: AtomicU64::new(0),
-        });
-        if let Some(mp) = new_mount.get_mountpoint() {
-            note_mp(&mp, 1);
+        let new_mount = old_mount.copy();
+        if let Some(mp) = old_mount.get_mountpoint() {
+            new_mount.set_mountpoint(mp);
         }
+        new_mount.set_parent(new_parent);
 
         // Add to parent's children
         new_parent.children.write().push(new_mount.clone());
@@ -255,7 +299,7 @@ pub fn do_mount(
         Some(d) => Some(Path::from_dentry(d).ok_or(KernelError::NotFound)?),
         None => None,
     };
-    attach(sb, mp, 0, false)
+    attach(sb, mp, 0, false, fs_type.name.into())
 }
 
 /// Mount `sb` on `mountpoint` (None: as the namespace root) with MNT_*
@@ -267,12 +311,13 @@ pub fn attach(
     mountpoint: Option<Path>,
     mnt_flags: u32,
     ro: bool,
+    devname: super::name::FileName,
 ) -> Result<Arc<Mount>, KernelError> {
     let root = sb.get_root().ok_or(KernelError::InvalidArgument)?;
     if ro {
         sb.make_rdonly()?;
     }
-    let mount = Mount::new(sb, root, mnt_flags);
+    let mount = Mount::new(sb, root, mnt_flags, devname);
     let mnt_ns = crate::ns::current_mnt_ns();
     if let Some(mp) = mountpoint {
         // Under the mountpoint's i_rwsem (Linux lock_mount), which rmdir
@@ -283,6 +328,7 @@ pub fn attach(
         if dir.is_dead() {
             return Err(KernelError::NotFound);
         }
+        let _ns = NAMESPACE_SEM.write();
         mount.set_mountpoint(mp.dentry.clone());
         mount.set_parent(&mp.mnt);
         mp.mnt.add_child(mount.clone());
@@ -303,7 +349,7 @@ pub fn mount_at_path(
     }
     let mp = super::namei::path_lookupat(None, path, super::LookupFlags::open())?;
     let sb = (fs_type.mount)(fs_type)?;
-    attach(sb, Some(mp), 0, false)
+    attach(sb, Some(mp), 0, false, fs_type.name.into())
 }
 
 /// Superblock of a device-backed filesystem (vfat, ...) on the block
@@ -391,13 +437,10 @@ pub fn do_umount(mount: Arc<Mount>, flags: i32) -> Result<(), KernelError> {
     let force = (flags & umount_flags::MNT_FORCE) != 0;
     let detach = (flags & umount_flags::MNT_DETACH) != 0;
 
+    let ns = NAMESPACE_SEM.write();
     if !force && !detach && is_mount_busy(&mount) {
         return Err(KernelError::Busy);
     }
-
-    // Write the filesystem back before it goes (Linux
-    // generic_shutdown_super -> sync_filesystem)
-    let _ = super::fs_writeback::writeback_sb(&mount.sb);
 
     // Remove from parent's children list
     if let Some(parent) = mount.get_parent() {
@@ -411,7 +454,12 @@ pub fn do_umount(mount: Arc<Mount>, flags: i32) -> Result<(), KernelError> {
     if let Some(mp) = mount.mountpoint.write().take() {
         note_mp(&mp, -1);
     }
+    drop(ns);
 
+    // Write the filesystem back, outside namespace_sem: writeback takes
+    // inode locks, which nest outside it (Linux: deactivate_super ->
+    // sync_filesystem after namespace_unlock)
+    let _ = super::fs_writeback::writeback_sb(&mount.sb);
     Ok(())
 }
 
@@ -431,6 +479,7 @@ impl Drop for Mount {
         if let Some(mp) = self.mountpoint.get_mut().take() {
             note_mp(&mp, -1);
         }
+        mnt_free_id(self.mnt_id);
     }
 }
 

@@ -262,6 +262,9 @@ pub struct SuperBlock {
     /// prevent races during ancestor relationship checks. Same-directory
     /// renames don't need this mutex.
     pub s_vfs_rename_mutex: sync::Mutex<()>,
+    /// Remount and other changes of the superblock's state (Linux
+    /// s_umount, a sleeping rw_semaphore): inside namespace_sem
+    pub s_umount: sync::RwSem<()>,
 }
 
 use super::inode::AsAny;
@@ -305,6 +308,7 @@ impl SuperBlock {
             s_dirty: crate::sync::spin::Mutex::new(alloc::vec::Vec::new()),
             s_wb_lock: crate::sync::Mutex::new(()),
             s_vfs_rename_mutex: sync::Mutex::new(()),
+            s_umount: sync::RwSem::new(()),
         })
     }
 
