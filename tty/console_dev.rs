@@ -3,10 +3,9 @@
 //!
 //! Reads, writes (through its line discipline: OPOST, TOSTOP), ioctls
 //! and poll are that tty's; opening it never makes it a controlling tty
-//! (Linux noctty for the console). Writes are also copied to the other
-//! consoles (a screen), which Linux does not do.
+//! (Linux noctty for the console).
 
-use crate::console::{console_tty, console_write_except};
+use crate::console::console_tty;
 use crate::fs::File;
 use crate::fs::chardev::CharDevice;
 use crate::io::poll::PollTable;
@@ -33,10 +32,7 @@ impl CharDevice for ConsoleCharDevice {
     }
 
     fn write(&self, file: &File, buf: &[u8]) -> Result<usize, KernelError> {
-        let tty = Redirect::tty(file)?;
-        let n = CharDevice::write(tty, file, buf)?;
-        console_write_except(&buf[..n], tty);
-        Ok(n)
+        CharDevice::write(Redirect::tty(file)?, file, buf)
     }
 
     fn ioctl(&self, file: &File, cmd: u32, arg: u64) -> Result<i64, KernelError> {

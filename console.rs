@@ -458,18 +458,6 @@ pub fn console_write(data: &[u8]) {
     }
 }
 
-/// Write `data` to the enabled consoles not backed by `tty` (the
-/// /dev/console copy for screens; `tty` itself got it through its line
-/// discipline)
-pub fn console_write_except(data: &[u8], tty: &crate::tty::Tty) {
-    let snapshot = CONSOLE_REGISTRY.lock().enabled_consoles_snapshot();
-    for console in snapshot.into_iter().flatten() {
-        if !console.tty().is_some_and(|t| core::ptr::eq(t, tty)) {
-            console.write(data);
-        }
-    }
-}
-
 /// Flush all registered consoles
 pub fn console_flush() {
     CONSOLE_REGISTRY.lock().flush_all();

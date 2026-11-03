@@ -319,8 +319,12 @@ immutable/append-only inodes (no IS_APPEND/IS_IMMUTABLE EPERM).
   is written synchronously by polling (TIOCOUTQ 0, no write_wait).
 - **Serial ports:** ttyS1 is registered without probing COM2; only
   COM1 (and the PL011) take input.
-- **/dev/console** writes are also copied to the consoles without that
-  tty (the screen); Linux writes only to its tty.
+- **No virtual terminals:** the framebuffer and VGA consoles are not
+  ttys (Linux: fbcon/vgacon draw VTs, tty0..tty63, fed by the
+  keyboard), so /dev/console is always a serial tty. With a screen
+  console (console=tty0), Linux's /dev/console is the VT; on hk user
+  console I/O stays on the serial port and the screen shows only
+  printk.
 - **Pid namespaces:** TIOCGPGRP/TIOCGSID return global numbers (Linux
   pid_vnr: the caller's namespace).
 
