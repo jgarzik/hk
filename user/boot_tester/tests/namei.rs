@@ -33,6 +33,7 @@ pub fn run_tests() {
     report(b"PATH_TOOLONG", check_toolong());
     report(b"PATH_TRAILING_SLASH", trailing());
     report(b"DOTDOT_LAST_NAME", dots());
+    report(b"NEG_DENTRY_CREATE", negative());
 }
 
 type R = Result<(), (&'static [u8], i64)>;
@@ -185,4 +186,40 @@ fn dots_ops() -> R {
     want(b"rename .. dst", sys_rename(f, dotdot), EBUSY)?;
     let r = sys_renameat2(AT_FDCWD, f, AT_FDCWD, dotdot, RENAME_NOREPLACE);
     want(b"rename .. noreplace", r, EEXIST)
+}
+
+/// A failed lookup never hides what is made later: after ENOENT on a
+/// name, a create, mkdir, symlink or rename to it is found; after an
+/// unlink the name is ENOENT again (Linux negative dentries)
+fn negative() -> R {
+    let mut st = zst();
+    let p = b"/tmp/nd_x\0".as_ptr();
+    let r = (|| {
+        want(b"absent", sys_stat(p, &mut st), ENOENT)?;
+        want(b"absent again", sys_stat(p, &mut st), ENOENT)?;
+        let fd = sys_open(p, O_CREAT | O_WRONLY, 0o644);
+        if fd < 0 {
+            return Err((&b"create"[..], fd));
+        }
+        sys_close(fd as u64);
+        want(b"created", sys_stat(p, &mut st), 0)?;
+        want(b"unlink", sys_unlink(p), 0)?;
+        want(b"unlinked", sys_stat(p, &mut st), ENOENT)?;
+        want(b"mkdir", sys_mkdir(p, 0o755), 0)?;
+        want(b"dir found", sys_stat(b"/tmp/nd_x/.\0".as_ptr(), &mut st), 0)?;
+        want(b"miss inside", sys_stat(b"/tmp/nd_x/y\0".as_ptr(), &mut st), ENOENT)?;
+        want(b"rmdir", sys_rmdir(p), 0)?;
+        want(b"rmdir gone", sys_stat(p, &mut st), ENOENT)?;
+        want(b"symlink", sys_symlink(b"tgt\0".as_ptr(), p), 0)?;
+        want(b"link found", sys_lstat(p, &mut st), 0)?;
+        want(b"unlink link", sys_unlink(p), 0)?;
+        let fd = sys_open(b"/tmp/nd_y\0".as_ptr(), O_CREAT | O_WRONLY, 0o644);
+        sys_close(fd as u64);
+        want(b"rename in", sys_rename(b"/tmp/nd_y\0".as_ptr(), p), 0)?;
+        want(b"renamed found", sys_stat(p, &mut st), 0)?;
+        want(b"source gone", sys_stat(b"/tmp/nd_y\0".as_ptr(), &mut st), ENOENT)
+    })();
+    sys_unlink(p);
+    sys_unlink(b"/tmp/nd_y\0".as_ptr());
+    r
 }

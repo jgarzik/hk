@@ -27,8 +27,6 @@ pub struct DentryFlags {
     /// DCACHE_MOUNTED, held while a struct mountpoint exists): a hint
     /// for the walk; which mount covers it is the namespace's business
     pub mounted: u32,
-    /// Negative dentry (cached failed lookup)
-    pub negative: bool,
     /// Dropped from its parent's children: deleted, or replaced by a
     /// rename (Linux d_unhashed)
     pub unhashed: bool,
@@ -131,6 +129,15 @@ impl Dentry {
     /// Set the inode for this dentry
     pub fn set_inode(&self, inode: Arc<Inode>) {
         self.d_lock.write().inode = Some(inode);
+    }
+
+    /// The name was unlinked and no one holds this dentry: it stays as
+    /// a negative one (Linux dentry_unlink_inode); what was cached
+    /// under a removed directory goes
+    pub fn make_negative(&self) {
+        let mut d = self.d_lock.write();
+        d.inode = None;
+        d.children.clear();
     }
 
     /// Check if this is a negative (failed lookup) dentry

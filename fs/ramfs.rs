@@ -1278,12 +1278,10 @@ pub fn ramfs_mkpath_with_timestamp(
     let mut current = root.clone();
 
     for component in path.split(|&c| c == b'/').filter(|s| !s.is_empty()) {
-        // Check if this component already exists
-        if let Some(child) = current.lookup_child(component) {
-            // Verify it's a directory
-            if let Some(inode) = child.get_inode()
-                && !inode.mode().is_dir()
-            {
+        // An existing component, found by the file system (the dcache
+        // may hold a negative dentry or none): must be a directory
+        if let Ok(child) = super::namei::lookup_one(&current, component) {
+            if child.get_inode().is_some_and(|i| !i.mode().is_dir()) {
                 return Err(KernelError::NotDirectory);
             }
             current = child;

@@ -100,7 +100,11 @@ pub fn path_lookupat(
 }
 
 /// Child `name` of directory `parent`: the dcache, else the file system
-/// (the new dentry is cached). Permission is the caller's business.
+/// (the new dentry is cached). A cached negative dentry is ENOENT; a
+/// miss is cached as one (Linux d_add(dentry, NULL)) except on
+/// filesystems that compute their entries (FS_PSEUDO: procfs,
+/// cgroupfs), whose names come and go behind the dcache. Permission
+/// is the caller's business.
 pub fn lookup_one(parent: &Arc<Dentry>, name: &[u8]) -> Result<Arc<Dentry>, KernelError> {
     // No file system here has longer names (Linux simple_lookup and the
     // disk file systems' lookups: ENAMETOOLONG)
@@ -108,12 +112,26 @@ pub fn lookup_one(parent: &Arc<Dentry>, name: &[u8]) -> Result<Arc<Dentry>, Kern
         return Err(KernelError::NameTooLong);
     }
     if let Some(child) = parent.lookup_child(name) {
-        return Ok(child);
+        return if child.is_negative() {
+            Err(KernelError::NotFound)
+        } else {
+            Ok(child)
+        };
     }
     let dir = parent.get_inode().ok_or(KernelError::NotFound)?;
-    let inode = dir.i_op.lookup(&dir, name)?;
-    let child = Dentry::alloc(parent, name, Some(inode));
-    Ok(child)
+    match dir.i_op.lookup(&dir, name) {
+        Ok(inode) => Ok(Dentry::alloc(parent, name, Some(inode))),
+        Err(KernelError::NotFound) => {
+            let pseudo = dir
+                .superblock()
+                .is_some_and(|sb| sb.fs_type.fs_flags == super::superblock::fs_flags::FS_PSEUDO);
+            if !pseudo {
+                Dentry::alloc(parent, name, None);
+            }
+            Err(KernelError::NotFound)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Longest name of one path component (Linux NAME_MAX)
@@ -127,7 +145,11 @@ fn lookup_slow(parent: &Arc<Dentry>, name: &[u8]) -> Result<Arc<Dentry>, KernelE
         return Err(KernelError::NameTooLong);
     }
     if let Some(child) = parent.lookup_child(name) {
-        return Ok(child);
+        return if child.is_negative() {
+            Err(KernelError::NotFound)
+        } else {
+            Ok(child)
+        };
     }
     let dir = parent.get_inode().ok_or(KernelError::NotFound)?;
     let _lock = dir.lock_shared();
@@ -319,7 +341,13 @@ pub fn delete_entry(p: &Parent, isdir: bool) -> Result<(), KernelError> {
         };
         drop(victim_lock);
         r?;
-        parent.remove_child(name);
+        // Linux d_delete: a dentry no one else holds becomes negative in
+        // place; a held one (a cwd, an open file) leaves the tree
+        if Arc::strong_count(&victim) <= 2 {
+            victim.make_negative();
+        } else {
+            parent.remove_child(name);
+        }
         Ok(())
     })()
 }
