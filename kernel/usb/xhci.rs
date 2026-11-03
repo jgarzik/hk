@@ -1418,10 +1418,15 @@ impl XhciController {
     }
 
     /// Wait for a transfer completion event
-    fn wait_for_transfer(
+    ///
+    /// Only the completion of the TRB at DMA address `trb` ends the wait:
+    /// completions of other TRBs of the endpoint (a late one for a
+    /// timed-out transfer) are consumed and dropped
+    fn wait_for_trb(
         &mut self,
         slot_id: u8,
         ep_dci: u8,
+        trb: u64,
         timeout_us: u64,
     ) -> Result<(u32, u8), UsbError> {
         // Always poll the event ring - interrupt is just an optimization hint
@@ -1431,7 +1436,7 @@ impl XhciController {
             let _ = XHCI_IRQ_STATE
                 .interrupt_pending
                 .swap(false, Ordering::AcqRel);
-            result = self.try_dequeue_transfer_event(slot_id, ep_dci);
+            result = self.try_dequeue_transfer_event(slot_id, ep_dci, trb);
             result.is_some()
         });
         if let Some(result) = result {
@@ -1485,6 +1490,7 @@ impl XhciController {
         &mut self,
         slot_id: u8,
         ep_dci: u8,
+        want_trb: u64,
     ) -> Option<Result<(u32, u8), UsbError>> {
         // Process all available events until we find a matching transfer event
         loop {
@@ -1515,7 +1521,9 @@ impl XhciController {
                     );
                 }
 
-                if event_slot == slot_id && event_ep == ep_dci {
+                // The event's parameter is the address of the TRB it
+                // completes
+                if event_slot == slot_id && event_ep == ep_dci && trb.parameter == want_trb {
                     return Some(Ok((transferred, cc)));
                 }
                 // Transfer for different slot/ep - continue consuming events
@@ -1591,16 +1599,16 @@ impl XhciController {
         trb.set_transfer_length(data.len() as u32);
         trb.set_type(TrbType::NORMAL);
         trb.set_ioc(true); // Interrupt on completion
-        ring.enqueue(trb);
+        let trb_addr = ring.enqueue(trb);
 
         // Ring doorbell for this endpoint
         self.ring_doorbell(slot_id, ep_dci);
 
-        // Wait for completion
-        // On a timeout the TRB is still queued and the controller may
-        // write `bounce` later: the early return leaks it (DmaCoherent
-        // frees only explicitly), never reused
-        let (residue, cc) = self.wait_for_transfer(slot_id, ep_dci, timeout_us)?;
+        // Wait for this TRB's completion (others are dropped). On a
+        // timeout the TRB is still queued and the controller may write
+        // `bounce` later: the early return leaks it (DmaCoherent frees
+        // only explicitly), never reused
+        let (residue, cc) = self.wait_for_trb(slot_id, ep_dci, trb_addr, timeout_us)?;
 
         // Advance transfer ring dequeue pointer to track completion
         if let Some(state) = self.device_states.get_mut(&slot_id)
@@ -1684,16 +1692,16 @@ impl XhciController {
         trb.set_transfer_length(data.len() as u32);
         trb.set_type(TrbType::NORMAL);
         trb.set_ioc(true);
-        ring.enqueue(trb);
+        let trb_addr = ring.enqueue(trb);
 
         // Ring doorbell
         self.ring_doorbell(slot_id, ep_dci);
 
-        // Wait for completion
-        // On a timeout the TRB is still queued and the controller may
-        // write `bounce` later: the early return leaks it (DmaCoherent
-        // frees only explicitly), never reused
-        let (residue, cc) = self.wait_for_transfer(slot_id, ep_dci, timeout_us)?;
+        // Wait for this TRB's completion (others are dropped). On a
+        // timeout the TRB is still queued and the controller may write
+        // `bounce` later: the early return leaks it (DmaCoherent frees
+        // only explicitly), never reused
+        let (residue, cc) = self.wait_for_trb(slot_id, ep_dci, trb_addr, timeout_us)?;
 
         // Advance transfer ring dequeue pointer to track completion
         if let Some(state) = self.device_states.get_mut(&slot_id)
