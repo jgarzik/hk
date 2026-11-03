@@ -466,9 +466,174 @@ pub struct VfatSbData {
     pub root_cluster: u32,
     /// Cluster size in bytes
     pub cluster_size: u32,
+    /// Mount options
+    pub opts: VfatOpts,
 }
 
 impl SuperBlockData for VfatSbData {}
+
+/// How long names map to bytes (Linux iocharset and utf8)
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Charset {
+    /// UTF-8 (the utf8 option or iocharset=utf8)
+    Utf8,
+    /// iso8859-1: a byte is its code point (Ubuntu's default iocharset)
+    Latin1,
+    /// cp437 (Ubuntu's only built-in NLS table)
+    Cp437,
+}
+
+/// cp437's upper half (Linux nls_cp437)
+const CP437_HIGH: &str = "ÇüéâäàåçêëèïîìÄÅÉæÆôöòûùÿÖÜ¢£¥₧ƒáíóúñÑªº¿⌐¬½¼¡«»░▒▓│┤╡╢╖╕╣║╗╝╜╛┐\
+    └┴┬├─┼╞╟╚╔╩╦╠═╬╧╨╤╥╙╘╒╓╫╪┘┌█▄▌▐▀αßΓπΣσµτΦΘΩδ∞φε∩≡±≥≤⌠⌡÷≈°∙·√ⁿ²■\u{a0}";
+
+impl Charset {
+    /// A user's name as text; None if it does not decode (UTF-8)
+    fn to_text(self, b: &[u8]) -> Option<String> {
+        match self {
+            Self::Utf8 => core::str::from_utf8(b).ok().map(String::from),
+            Self::Latin1 => Some(b.iter().map(|&c| c as char).collect()),
+            Self::Cp437 => Some(
+                b.iter()
+                    .map(|&c| match c {
+                        0..0x80 => c as char,
+                        _ => CP437_HIGH.chars().nth((c - 0x80) as usize).unwrap_or('?'),
+                    })
+                    .collect(),
+            ),
+        }
+    }
+
+    /// A long name as the user sees it; '?' for what the charset lacks
+    fn to_bytes(self, s: &str) -> Vec<u8> {
+        match self {
+            Self::Utf8 => s.as_bytes().to_vec(),
+            Self::Latin1 => s.chars().map(|c| u8::try_from(c).unwrap_or(b'?')).collect(),
+            Self::Cp437 => s
+                .chars()
+                .map(|c| match c as u32 {
+                    0..0x80 => c as u8,
+                    _ => CP437_HIGH
+                        .chars()
+                        .position(|x| x == c)
+                        .map_or(b'?', |i| 0x80 + i as u8),
+                })
+                .collect(),
+        }
+    }
+}
+
+/// vfat mount options (Linux struct fat_mount_options)
+#[derive(Clone, Copy)]
+pub struct VfatOpts {
+    pub uid: u32,
+    pub gid: u32,
+    pub fmask: u16,
+    pub dmask: u16,
+    pub cs: Charset,
+}
+
+impl VfatOpts {
+    /// Files and directories are all-permissive minus their mask (Linux
+    /// fat_make_mode)
+    fn file_mode(&self) -> InodeMode {
+        InodeMode::regular(0o777 & !self.fmask)
+    }
+
+    fn dir_mode(&self) -> InodeMode {
+        InodeMode::directory(0o777 & !self.dmask)
+    }
+
+    /// Parse the mount data (Linux fat_parse_param): uid/gid default to
+    /// the mounter's fs ids, the masks to its umask, the charset to
+    /// iso8859-1 (Ubuntu's FAT_DEFAULT_IOCHARSET, FAT_DEFAULT_UTF8
+    /// off); options that only tune what hk does not do are accepted,
+    /// an unknown one is EINVAL
+    fn parse(opts: &[u8]) -> Result<Self, KernelError> {
+        let c = crate::fs::dac::cred();
+        let umask = crate::task::percpu::current_fs().map_or(0o022, |f| f.get_umask());
+        let mut o = Self {
+            uid: c.fsuid,
+            gid: c.fsgid,
+            fmask: umask,
+            dmask: umask,
+            cs: Charset::Latin1,
+        };
+        let bad = KernelError::InvalidArgument;
+        let num = |v: &[u8]| {
+            core::str::from_utf8(v)
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+        };
+        let oct = |v: &[u8]| super::ramfs::parse_octal(v).map(|m| m & 0o777);
+        let mut utf8 = false;
+        for kv in opts.split(|&b| b == b',').filter(|kv| !kv.is_empty()) {
+            let (k, v) = match kv.iter().position(|&b| b == b'=') {
+                Some(i) => (&kv[..i], &kv[i + 1..]),
+                None => (kv, &b""[..]),
+            };
+            match k {
+                b"uid" => o.uid = num(v).ok_or(bad)?,
+                b"gid" => o.gid = num(v).ok_or(bad)?,
+                b"umask" => (o.fmask, o.dmask) = (oct(v).ok_or(bad)?, oct(v).ok_or(bad)?),
+                b"fmask" => o.fmask = oct(v).ok_or(bad)?,
+                b"dmask" => o.dmask = oct(v).ok_or(bad)?,
+                b"iocharset" => {
+                    o.cs = match v {
+                        b"utf8" => Charset::Utf8,
+                        b"iso8859-1" => Charset::Latin1,
+                        b"cp437" => Charset::Cp437,
+                        _ => return Err(bad),
+                    }
+                }
+                b"utf8" => utf8 = matches!(v, b"" | b"1" | b"yes" | b"true"),
+                b"codepage" if v == b"437" => {}
+                b"shortname" if matches!(v, b"lower" | b"win95" | b"winnt" | b"mixed") => {}
+                b"quiet" | b"showexec" | b"debug" | b"sys_immutable" | b"flush" | b"usefree"
+                | b"nocase" | b"discard" | b"dos1xfloppy" | b"rodir" | b"nonumtail"
+                | b"uni_xlate" | b"allow_utime" | b"errors" | b"check" | b"tz" | b"time_offset"
+                | b"nfs" => {}
+                _ => return Err(bad),
+            }
+        }
+        if utf8 {
+            o.cs = Charset::Utf8;
+        }
+        Ok(o)
+    }
+}
+
+/// The mount's options for an inode of it
+fn opts_of(i: &Inode) -> Option<VfatOpts> {
+    i.superblock()
+        .and_then(|sb| get_sb_data(&sb).ok())
+        .map(|d| d.opts)
+}
+
+/// A name the user gave, read by the mount's charset (`err` if it does
+/// not decode), trailing dots dropped (Linux vfat_striptail_len)
+fn user_name(dir: &Inode, name: &[u8], err: KernelError) -> Result<String, KernelError> {
+    let cs = opts_of(dir).map_or(Charset::Utf8, |o| o.cs);
+    let s = cs.to_text(name).ok_or(err)?;
+    Ok(String::from(s.trim_end_matches('.')))
+}
+
+/// A name for a new entry (Linux vfat_create_shortname /
+/// vfat_valid_longname): EINVAL for nothing left or a character FAT
+/// forbids, ENAMETOOLONG past 255 UTF-16 units
+fn new_name(dir: &Inode, name: &[u8]) -> Result<String, KernelError> {
+    let s = user_name(dir, name, KernelError::InvalidArgument)?;
+    if s.is_empty()
+        || s.chars()
+            .any(|c| (c as u32) < 0x20 || "*?<>|\":/\\".contains(c))
+    {
+        return Err(KernelError::InvalidArgument);
+    }
+    if s.encode_utf16().count() > 255 {
+        return Err(KernelError::NameTooLong);
+    }
+    Ok(s)
+}
 
 impl AsAny for VfatSbData {
     fn as_any(&self) -> &dyn core::any::Any {
@@ -801,30 +966,25 @@ fn short_name_to_string(name: &[u8; 8], ext: &[u8; 3]) -> String {
     }
 }
 
-/// Extract characters from LFN entry
-fn lfn_entry_chars(entry: &VfatLfnEntry) -> Vec<char> {
-    let mut chars = Vec::with_capacity(13);
-
-    // UCS-2 to char (simplified - just handles ASCII and common chars)
-    let add_char = |chars: &mut Vec<char>, c: u16| {
-        if c != 0xFFFF && c != 0x0000 {
-            if c < 0x80 {
-                chars.push(c as u8 as char);
-            } else {
-                // Non-ASCII - just use replacement character for now
-                chars.push('?');
-            }
-        }
-    };
-
+/// The UTF-16 units of one LFN entry, up to its terminator or padding
+fn lfn_entry_chars(entry: &VfatLfnEntry) -> Vec<u16> {
     // name1: 5 chars, name2: 6 chars, name3: 2 chars (packed fields,
     // copied out by value)
     let (n1, n2, n3) = (entry.name1, entry.name2, entry.name3);
-    for c in n1.into_iter().chain(n2).chain(n3) {
-        add_char(&mut chars, c);
-    }
+    n1.into_iter()
+        .chain(n2)
+        .chain(n3)
+        .take_while(|&c| c != 0 && c != 0xFFFF)
+        .collect()
+}
 
-    chars
+/// A long name from its LFN entries' UTF-16 (a pair may span two
+/// entries); unpaired surrogates become U+FFFD
+fn lfn_name(parts: &mut [(u8, Vec<u16>)]) -> String {
+    parts.sort_by_key(|(order, _)| *order);
+    char::decode_utf16(parts.iter().flat_map(|(_, u)| u.iter().copied()))
+        .map(|r| r.unwrap_or('\u{FFFD}'))
+        .collect()
 }
 
 /// Read and parse directory entries from a cluster chain
@@ -834,7 +994,7 @@ fn read_directory_entries(
 ) -> Result<Vec<ParsedDirEntry>, KernelError> {
     let chain = read_cluster_chain(sb_data, start_cluster)?;
     let mut entries = Vec::new();
-    let mut lfn_parts: Vec<(u8, Vec<char>)> = Vec::new();
+    let mut lfn_parts: Vec<(u8, Vec<u16>)> = Vec::new();
     let mut lfn_checksum_expected: Option<u8> = None;
 
     for (ci, &cluster) in chain.iter().enumerate() {
@@ -893,12 +1053,7 @@ fn read_directory_entries(
 
                     if expected == actual {
                         // Sort LFN parts by order and concatenate
-                        lfn_parts.sort_by_key(|(order, _)| *order);
-                        let long_name: String = lfn_parts
-                            .iter()
-                            .flat_map(|(_, chars)| chars.iter())
-                            .collect();
-                        long_name
+                        lfn_name(&mut lfn_parts)
                     } else {
                         // Checksum mismatch, use short name
                         short_name_to_string(&dirent.name, &dirent.ext)
@@ -1051,18 +1206,8 @@ fn short_name_checksum(short_name: &[u8; 11]) -> u8 {
 fn create_lfn_entries(name: &str, short_name: &[u8; 11]) -> Vec<VfatLfnEntry> {
     let checksum = short_name_checksum(short_name);
 
-    // Convert name to UCS-2 (simplified: just use ASCII, pad rest with 0xFFFF)
-    let ucs2_chars: Vec<u16> = name
-        .chars()
-        .map(|c| {
-            if c.is_ascii() {
-                c as u16
-            } else {
-                '?' as u16 // Replace non-ASCII with ?
-            }
-        })
-        .chain(core::iter::once(0u16)) // Null terminator
-        .collect();
+    // UTF-16, NUL-terminated, then padded with 0xFFFF
+    let ucs2_chars: Vec<u16> = name.encode_utf16().chain(core::iter::once(0u16)).collect();
 
     // Pad to multiple of 13 with 0xFFFF
     let padded_len = ucs2_chars.len().div_ceil(13) * 13;
@@ -1210,9 +1355,11 @@ fn create_dir_entry_with_lfn(
 
     // Check if we need LFN entries
     let needs_lfn = {
-        // Check if name fits in 8.3 format and matches the short name we generated
-        let simple_short = generate_short_name(name, &[]);
-        simple_short != short_name || name.len() > 12 || name.contains(' ')
+        // Long-name entries unless the name is exactly its 8.3 form
+        let (base, ext) = short_name.split_at(8);
+        let base: &[u8; 8] = base.try_into().unwrap_or(&[b' '; 8]);
+        let ext: &[u8; 3] = ext.try_into().unwrap_or(&[b' '; 3]);
+        short_name_to_string(base, ext) != name
     };
 
     let lfn_entries = if needs_lfn {
@@ -1371,7 +1518,7 @@ fn delete_dir_entry(
     let entries_per_cluster = sb_data.cluster_size as usize / 32;
 
     let mut lfn_start: Option<(usize, usize)> = None; // (chain_idx, entry_in_cluster)
-    let mut lfn_parts: Vec<(u8, Vec<char>)> = Vec::new(); // LFN parts: (order, chars)
+    let mut lfn_parts: Vec<(u8, Vec<u16>)> = Vec::new(); // LFN parts: (order, chars)
     let mut lfn_checksum_expected: Option<u8> = None;
 
     // Search for the entry
@@ -1429,12 +1576,7 @@ fn delete_dir_entry(
                     buf[8..11].try_into().unwrap(),
                 );
                 if expected == actual {
-                    lfn_parts.sort_by_key(|(order, _)| *order);
-                    let ln: String = lfn_parts
-                        .iter()
-                        .flat_map(|(_, chars)| chars.iter())
-                        .collect();
-                    Some(ln)
+                    Some(lfn_name(&mut lfn_parts))
                 } else {
                     None
                 }
@@ -1502,8 +1644,7 @@ pub struct VfatInodeOps;
 
 impl InodeOps for VfatInodeOps {
     fn lookup(&self, dir: &Inode, name: &[u8]) -> Result<Arc<Inode>, KernelError> {
-        // Long names are UTF-8 here (boundary shim): other bytes are NotFound
-        let name = core::str::from_utf8(name).map_err(|_| KernelError::NotFound)?;
+        let name = &user_name(dir, name, KernelError::NotFound)?;
         let sb = dir.superblock().ok_or(KernelError::Io)?;
         let sb_data = get_sb_data(&sb)?;
         let inode_data = get_inode_data(dir)?;
@@ -1556,8 +1697,7 @@ impl InodeOps for VfatInodeOps {
     }
 
     fn create(&self, dir: &Inode, name: &[u8], mode: InodeMode) -> Result<Arc<Inode>, KernelError> {
-        // Long names are UTF-8 here (boundary shim): other bytes are InvalidArgument
-        let name = core::str::from_utf8(name).map_err(|_| KernelError::InvalidArgument)?;
+        let name = &new_name(dir, name)?;
         let _ = mode; // FAT doesn't support Unix permissions
         let sb = dir.superblock().ok_or(KernelError::Io)?;
         let sb_data = get_sb_data(&sb)?;
@@ -1594,9 +1734,9 @@ impl InodeOps for VfatInodeOps {
         let ino = sb.alloc_ino();
         let inode = Arc::new(Inode::new(
             ino,
-            InodeMode::regular(0o644),
-            0,
-            0,
+            sb_data.opts.file_mode(),
+            sb_data.opts.uid,
+            sb_data.opts.gid,
             0, // Empty file
             Timespec::ZERO,
             Arc::downgrade(&sb),
@@ -1617,8 +1757,7 @@ impl InodeOps for VfatInodeOps {
     }
 
     fn mkdir(&self, dir: &Inode, name: &[u8], mode: InodeMode) -> Result<Arc<Inode>, KernelError> {
-        // Long names are UTF-8 here (boundary shim): other bytes are InvalidArgument
-        let name = core::str::from_utf8(name).map_err(|_| KernelError::InvalidArgument)?;
+        let name = &new_name(dir, name)?;
         let _ = mode; // FAT doesn't support Unix permissions
         let sb = dir.superblock().ok_or(KernelError::Io)?;
         let sb_data = get_sb_data(&sb)?;
@@ -1680,9 +1819,9 @@ impl InodeOps for VfatInodeOps {
         let ino = sb.alloc_ino();
         let inode = Arc::new(Inode::new(
             ino,
-            InodeMode::directory(0o755),
-            0,
-            0,
+            sb_data.opts.dir_mode(),
+            sb_data.opts.uid,
+            sb_data.opts.gid,
             0,
             Timespec::ZERO,
             Arc::downgrade(&sb),
@@ -1703,8 +1842,7 @@ impl InodeOps for VfatInodeOps {
     }
 
     fn unlink(&self, dir: &Inode, name: &[u8]) -> Result<(), KernelError> {
-        // Long names are UTF-8 here (boundary shim): other bytes are NotFound
-        let name = core::str::from_utf8(name).map_err(|_| KernelError::NotFound)?;
+        let name = &user_name(dir, name, KernelError::NotFound)?;
         let sb = dir.superblock().ok_or(KernelError::Io)?;
         let sb_data = get_sb_data(&sb)?;
         let dir_inode_data = get_inode_data(dir)?;
@@ -1737,8 +1875,7 @@ impl InodeOps for VfatInodeOps {
     }
 
     fn rmdir(&self, dir: &Inode, name: &[u8]) -> Result<(), KernelError> {
-        // Long names are UTF-8 here (boundary shim): other bytes are NotFound
-        let name = core::str::from_utf8(name).map_err(|_| KernelError::NotFound)?;
+        let name = &user_name(dir, name, KernelError::NotFound)?;
         let sb = dir.superblock().ok_or(KernelError::Io)?;
         let sb_data = get_sb_data(&sb)?;
         let dir_inode_data = get_inode_data(dir)?;
@@ -1831,9 +1968,8 @@ impl InodeOps for VfatInodeOps {
         new_name: &[u8],
         flags: u32,
     ) -> Result<(), KernelError> {
-        // Long names are UTF-8 here (boundary shim)
-        let old_name = core::str::from_utf8(old_name).map_err(|_| KernelError::NotFound)?;
-        let new_name = core::str::from_utf8(new_name).map_err(|_| KernelError::InvalidArgument)?;
+        let old_name = &user_name(old_dir, old_name, KernelError::NotFound)?;
+        let new_name = &self::new_name(new_dir, new_name)?;
         // The VFS has checked RENAME_NOREPLACE; RENAME_EXCHANGE (Linux
         // vfat_rename_exchange) is not supported yet, whiteouts never
         if flags & !super::link::RENAME_NOREPLACE != 0 {
@@ -1984,18 +2120,19 @@ fn create_inode_for_entry(
     entry: &ParsedDirEntry,
     parent_cluster: u32,
 ) -> Result<Arc<Inode>, KernelError> {
+    let o = get_sb_data(sb)?.opts;
     let mode = if entry.is_dir() {
-        InodeMode::directory(0o755)
+        o.dir_mode()
     } else {
-        InodeMode::regular(0o644)
+        o.file_mode()
     };
 
     let ino = sb.alloc_ino();
     let inode = Arc::new(Inode::new(
         ino,
         mode,
-        0,
-        0,
+        o.uid,
+        o.gid,
         entry.file_size as u64,
         Timespec::ZERO,
         Arc::downgrade(sb),
@@ -2108,7 +2245,7 @@ impl FileOps for VfatFileOps {
             let e = VfsDirEntry {
                 ino,
                 file_type,
-                name: entry.name.as_bytes().to_vec(),
+                name: sb_data.opts.cs.to_bytes(&entry.name),
             };
             if !ctx.emit_at(entry.slot + 2, e) {
                 break;
@@ -2169,7 +2306,10 @@ pub static VFAT_SUPER_OPS: VfatSuperOps = VfatSuperOps;
 // ============================================================================
 
 /// Placeholder mount function for pseudo-fs style (shouldn't be called)
-fn vfat_mount_pseudo(_fs_type: &'static FileSystemType) -> Result<Arc<SuperBlock>, KernelError> {
+fn vfat_mount_pseudo(
+    _fs_type: &'static FileSystemType,
+    _opts: &[u8],
+) -> Result<Arc<SuperBlock>, KernelError> {
     Err(KernelError::OperationNotSupported) // FAT32 requires a device
 }
 
@@ -2177,7 +2317,10 @@ fn vfat_mount_pseudo(_fs_type: &'static FileSystemType) -> Result<Arc<SuperBlock
 fn vfat_mount_dev(
     fs_type: &'static FileSystemType,
     bdev: Arc<BlockDevice>,
+    opts: &[u8],
 ) -> Result<Arc<SuperBlock>, KernelError> {
+    // Options first: a bad one is EINVAL before any I/O
+    let opts = VfatOpts::parse(opts)?;
     // Read boot sector
     let mut boot_sector_buf = [0u8; 512];
     read_bytes(&bdev, 0, &mut boot_sector_buf)?;
@@ -2225,6 +2368,7 @@ fn vfat_mount_dev(
         data_start_sector,
         root_cluster: boot_sector.root_cluster,
         cluster_size,
+        opts,
     });
 
     // Create superblock
@@ -2235,9 +2379,9 @@ fn vfat_mount_dev(
     let root_ino = sb.alloc_ino();
     let root_inode = Arc::new(Inode::new(
         root_ino,
-        InodeMode::directory(0o755),
-        0,
-        0,
+        sb_data.opts.dir_mode(),
+        sb_data.opts.uid,
+        sb_data.opts.gid,
         0,
         Timespec::ZERO,
         Arc::downgrade(&sb),

@@ -41,6 +41,7 @@ pub fn run_tests() {
     report(b"MOVE_MOUNT", move_mount());
     report(b"LAZY_UMOUNT", lazy_umount());
     report(b"PIVOT_ROOT_REAL", pivot_real());
+    report(b"RAMFS_MOUNT_MODE", ramfs_mode());
 }
 
 type R = Result<(), (&'static [u8], i64)>;
@@ -604,4 +605,20 @@ fn pivot_child() -> i32 {
         return 8;
     }
     0
+}
+
+/// ramfs takes mode= for its root (Linux ramfs_parse_param) and
+/// ignores options it does not know
+fn ramfs_mode() -> R {
+    let d = b"/tmp/rm\0";
+    sys_mkdir(d.as_ptr(), 0o755);
+    let opts = b"mode=0710,whatever=1\0";
+    let r = sys_mount(b"none\0".as_ptr(), d.as_ptr(), b"ramfs\0".as_ptr(), 0, opts.as_ptr() as u64);
+    // SAFETY: Stat is plain integers
+    let mut st: Stat = unsafe { core::mem::zeroed() };
+    let s = sys_stat(d.as_ptr(), &mut st);
+    sys_umount2(d.as_ptr(), 0);
+    sys_rmdir(d.as_ptr());
+    check(b"mount", r == 0, r)?;
+    check(b"mode", s == 0 && st.st_mode == 0o40710, st.st_mode as i64)
 }

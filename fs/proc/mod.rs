@@ -1831,7 +1831,10 @@ fn build_sys(sb: &Arc<SuperBlock>, root: &Arc<Inode>) {
 }
 
 /// Mount function for procfs
-fn procfs_mount(fs_type: &'static FileSystemType) -> Result<Arc<SuperBlock>, KernelError> {
+fn procfs_mount(
+    fs_type: &'static FileSystemType,
+    _opts: &[u8],
+) -> Result<Arc<SuperBlock>, KernelError> {
     // Create superblock
     let sb = SuperBlock::new(fs_type, &PROCFS_SUPER_OPS, 0);
 

@@ -161,8 +161,8 @@ fn mount_at(target: &super::Path) -> Result<Arc<super::mount::Mount>, KernelErro
 /// MS_NOUSER (EINVAL) and CAP_SYS_ADMIN (EPERM), then path_mount's
 /// dispatch: MS_REMOUNT|MS_BIND, MS_REMOUNT, MS_BIND, the propagation
 /// types, MS_MOVE, else a new mount. Unsupported flags are EINVAL.
-pub fn sys_mount(source_ptr: u64, target_ptr: u64, fstype_ptr: u64, flags: u64, _data: u64) -> i64 {
-    match path_mount(source_ptr, target_ptr, fstype_ptr, flags) {
+pub fn sys_mount(source_ptr: u64, target_ptr: u64, fstype_ptr: u64, flags: u64, data: u64) -> i64 {
+    match path_mount(source_ptr, target_ptr, fstype_ptr, flags, data) {
         Ok(()) => 0,
         Err(e) => e.sysret(),
     }
@@ -173,6 +173,7 @@ fn path_mount(
     target_ptr: u64,
     fstype_ptr: u64,
     mut flags: u64,
+    data_ptr: u64,
 ) -> Result<(), KernelError> {
     use crate::uaccess::UaccessError;
     // Linux copy_mount_string (strndup_user): EFAULT, EINVAL if too long;
@@ -194,6 +195,12 @@ fn path_mount(
     };
     let source = if source_ptr != 0 {
         strncpy_from_user::<Uaccess>(source_ptr, PATH_MAX).map_err(too_long)?
+    } else {
+        Default::default()
+    };
+    // Linux copy_mount_options: the options string, within a page
+    let data = if data_ptr != 0 {
+        strncpy_from_user::<Uaccess>(data_ptr, 4096).map_err(too_long)?
     } else {
         Default::default()
     };
@@ -249,11 +256,17 @@ fn path_mount(
         }
         return super::mount::do_move(&old?, &mp);
     }
-    new_mount(&source, &fstype, mp, flags)
+    new_mount(&source, &fstype, mp, flags, &data)
 }
 
 /// Mount a new instance of `fstype` on `mp` (Linux do_new_mount)
-fn new_mount(source: &[u8], fstype: &str, mp: super::Path, flags: u64) -> Result<(), KernelError> {
+fn new_mount(
+    source: &[u8],
+    fstype: &str,
+    mp: super::Path,
+    flags: u64,
+    data: &[u8],
+) -> Result<(), KernelError> {
     let fs_type = super::superblock::find_filesystem(fstype).ok_or(KernelError::NoDevice)?;
     if !mp
         .dentry
@@ -266,9 +279,9 @@ fn new_mount(source: &[u8], fstype: &str, mp: super::Path, flags: u64) -> Result
     }
     // Flags are set before the mount becomes visible (Linux do_new_mount)
     let sb = if fs_type.mount_dev.is_some() && !source.is_empty() {
-        super::mount::dev_super(fs_type, source)
+        super::mount::dev_super(fs_type, source, data)
     } else {
-        (fs_type.mount)(fs_type)
+        (fs_type.mount)(fs_type, data)
     };
     let r = sb.and_then(|sb| {
         // Linux: no source is "none"

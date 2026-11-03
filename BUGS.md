@@ -280,8 +280,9 @@ copies of a namespace are always peers (no CL_SHARED_TO_SLAVE for a
 less privileged user namespace). umount2 MNT_EXPIRE's
 mark is not cleared by use (Linux mntput clears it).
 Unlike Linux (MNT_WRITE_HOLD), a write access racing a read-only remount
-that then fails with EBUSY can see a spurious EROFS. Mount data/options strings are
-ignored; mounts are not user-namespace aware (plain capable()).
+that then fails with EBUSY can see a spurious EROFS. Mount options are parsed by vfat (Linux's set; long names
+UTF-16 in UTF-8, iso8859-1 or cp437 only) and ramfs (mode=); procfs,
+devtmpfs and cgroupfs ignore theirs; mounts are not user-namespace aware (plain capable()).
 Crossing into a mount scans the current mount's children (Linux hashes
 (parent, mountpoint): mount_hashtable).
 

@@ -716,7 +716,10 @@ pub static CGROUPFS_SUPER_OPS: CgroupfsSuperOps = CgroupfsSuperOps;
 // ============================================================================
 
 /// Mount cgroupfs
-fn cgroupfs_mount(fs_type: &'static FileSystemType) -> Result<Arc<SuperBlock>, KernelError> {
+fn cgroupfs_mount(
+    fs_type: &'static FileSystemType,
+    _opts: &[u8],
+) -> Result<Arc<SuperBlock>, KernelError> {
     // Initialize cgroup subsystem if not done
     cgroup_init();
 

@@ -47,7 +47,7 @@ fn root() -> Option<Arc<Dentry>> {
     DEVTMPFS.get()?.get_root()
 }
 
-fn mount(_t: &'static FileSystemType) -> Result<Arc<SuperBlock>, KernelError> {
+fn mount(_t: &'static FileSystemType, _opts: &[u8]) -> Result<Arc<SuperBlock>, KernelError> {
     DEVTMPFS.get().cloned().ok_or(KernelError::NoDevice)
 }
 
@@ -106,7 +106,7 @@ pub fn device_del(name: &str) {
 
 /// Create the superblock and the nodes queued so far (VFS init)
 pub fn init() {
-    let sb = match super::ramfs::ramfs_mount(&DEVTMPFS_TYPE) {
+    let sb = match super::ramfs::ramfs_mount(&DEVTMPFS_TYPE, b"") {
         Ok(sb) => sb,
         Err(e) => {
             crate::printkln!("devtmpfs: {:?}", e);

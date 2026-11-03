@@ -148,12 +148,16 @@ use super::file::FileOps;
 use crate::block::BlockDevice;
 
 /// Mount function type for pseudo-filesystems (no backing device)
-pub type MountFn = fn(fs_type: &'static FileSystemType) -> Result<Arc<SuperBlock>, KernelError>;
+/// `opts`: the mount data string (comma-separated options, empty for
+/// none)
+pub type MountFn =
+    fn(fs_type: &'static FileSystemType, opts: &[u8]) -> Result<Arc<SuperBlock>, KernelError>;
 
 /// Mount function type for device-backed filesystems (ext4, vfat, etc.)
 pub type MountDevFn = fn(
     fs_type: &'static FileSystemType,
     bdev: Arc<BlockDevice>,
+    opts: &[u8],
 ) -> Result<Arc<SuperBlock>, KernelError>;
 
 /// Filesystem type descriptor

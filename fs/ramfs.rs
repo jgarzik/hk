@@ -1019,14 +1019,16 @@ pub static RAMFS_SUPER_OPS: RamfsSuperOps = RamfsSuperOps;
 /// Mount function for ramfs
 pub(crate) fn ramfs_mount(
     fs_type: &'static FileSystemType,
+    opts: &[u8],
 ) -> Result<Arc<SuperBlock>, KernelError> {
+    let mode = root_mode(opts)?;
     // Create superblock
     let sb = SuperBlock::new(fs_type, &RAMFS_SUPER_OPS, 0);
 
     // Create root inode (directory)
     let root_inode = Arc::new(Inode::new(
         sb.alloc_ino(),
-        InodeMode::directory(0o755),
+        InodeMode::directory(mode),
         0, // uid: root
         0, // gid: root
         0,
@@ -1103,6 +1105,30 @@ pub fn ramfs_create_dir_with_owner(
     let new_dentry = Dentry::alloc(parent, name, Some(new_inode));
 
     Ok(new_dentry)
+}
+
+/// The root's mode from ramfs options (Linux ramfs_parse_param):
+/// `mode=` in octal (default 0755, EINVAL if not octal); other options
+/// are ignored, as Linux ramfs does
+fn root_mode(opts: &[u8]) -> Result<u16, KernelError> {
+    let mut mode = 0o755;
+    for o in opts.split(|&c| c == b',') {
+        if let Some(v) = o.strip_prefix(b"mode=") {
+            mode = parse_octal(v).ok_or(KernelError::InvalidArgument)? & 0o7777;
+        }
+    }
+    Ok(mode)
+}
+
+/// An octal number (mount option values)
+pub(crate) fn parse_octal(v: &[u8]) -> Option<u16> {
+    if v.is_empty() {
+        return None;
+    }
+    v.iter().try_fold(0u16, |n, &c| match c {
+        b'0'..=b'7' => n.checked_mul(8)?.checked_add((c - b'0') as u16),
+        _ => None,
+    })
 }
 
 /// Create a directory in ramfs with default ownership (root:root, mode 0755)

@@ -355,7 +355,7 @@ pub fn do_mount(
     fs_type: &'static FileSystemType,
     mountpoint: Option<Arc<Dentry>>,
 ) -> Result<Arc<Mount>, KernelError> {
-    let sb = (fs_type.mount)(fs_type)?;
+    let sb = (fs_type.mount)(fs_type, b"")?;
     let mp = match mountpoint {
         Some(d) => Some(Path::from_dentry(d).ok_or(KernelError::NotFound)?),
         None => None,
@@ -472,7 +472,7 @@ pub fn mount_at_path(
         return do_mount(fs_type, None);
     }
     let mp = super::namei::path_lookupat(None, path, super::LookupFlags::open())?;
-    let sb = (fs_type.mount)(fs_type)?;
+    let sb = (fs_type.mount)(fs_type, b"")?;
     attach(sb, Some(mp), 0, false, fs_type.name.into())
 }
 
@@ -481,6 +481,7 @@ pub fn mount_at_path(
 pub fn dev_super(
     fs_type: &'static FileSystemType,
     source: &[u8],
+    opts: &[u8],
 ) -> Result<Arc<SuperBlock>, KernelError> {
     // The filesystem must support device mounting
     let mount_dev_fn = fs_type
@@ -502,7 +503,7 @@ pub fn dev_super(
     // Opened (under the disk's open_mutex, failing for a removed
     // device) for the superblock's life: a rescan sees it in use
     let h = bdev.open_handle()?;
-    let sb = mount_dev_fn(fs_type, bdev)?;
+    let sb = mount_dev_fn(fs_type, bdev, opts)?;
     sb.set_bdev(h);
     super::fs_writeback::register_sb(&sb);
     Ok(sb)
