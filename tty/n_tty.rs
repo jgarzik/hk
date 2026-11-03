@@ -23,8 +23,9 @@ use crate::util::error::KernelError;
 /// Read ring size (Linux N_TTY_BUF_SIZE)
 const READ_BUF_SIZE: usize = 4096;
 
-/// Longest line being edited (Linux MAX_CANON)
-const MAX_CANON: usize = 255;
+/// Longest line being edited: Linux n_tty takes N_TTY_BUF_SIZE - 1
+/// (LINE_MAX, 255, is only what pathconf reports)
+const LINE_MAX: usize = READ_BUF_SIZE - 1;
 
 /// The EOF character's place in the ring: a line end that is not copied
 /// out (Linux __DISABLED_CHAR); a real line end is never NUL
@@ -41,7 +42,7 @@ pub struct NTtyData {
     /// Line ends in the ring
     lines: usize,
     /// The line being edited in canonical mode
-    line: [u8; MAX_CANON],
+    line: [u8; LINE_MAX],
     line_len: usize,
 }
 
@@ -53,7 +54,7 @@ impl NTtyData {
             head: 0,
             tail: 0,
             lines: 0,
-            line: [0; MAX_CANON],
+            line: [0; LINE_MAX],
             line_len: 0,
         }
     }
@@ -103,6 +104,25 @@ impl NTtyData {
         self.line_len = 0;
     }
 
+    /// ICANON changed (Linux n_tty_set_termios): leaving canonical mode
+    /// makes the line being edited input; entering it makes the input
+    /// already queued readable as a line
+    pub fn set_canon(&mut self, was: bool, now: bool) {
+        if was && !now {
+            let len = core::mem::take(&mut self.line_len);
+            for i in 0..len {
+                self.push(self.line[i], false);
+            }
+        } else if !was && now && self.cnt() > 0 {
+            let last = self.head.wrapping_sub(1);
+            if !self.is_eol(last) {
+                let i = last % READ_BUF_SIZE;
+                self.eol[i / 64] |= 1 << (i % 64);
+                self.lines += 1;
+            }
+        }
+    }
+
     /// Readable input: a line in canonical mode, else `min` bytes
     fn available(&self, canon: bool, min: usize) -> bool {
         if canon {
@@ -134,13 +154,6 @@ impl NTtyData {
     /// Copy input out: canonical mode one line (None if there is none),
     /// else what there is (None if nothing)
     fn copy(&mut self, out: &mut [u8], canon: bool) -> Option<usize> {
-        if !canon && self.line_len > 0 {
-            // Canonical mode was left with a partial line: input now
-            let len = core::mem::take(&mut self.line_len);
-            for i in 0..len {
-                self.push(self.line[i], false);
-            }
-        }
         if !self.available(canon, 1) {
             return None;
         }
@@ -321,7 +334,7 @@ fn canon_char(ld: &mut NTtyData, t: &Termios, c: u8, echo: &mut Vec<u8>) {
             echo_char(c, t, echo);
         }
         ld.commit_line(c);
-    } else if ld.line_len < MAX_CANON {
+    } else if ld.line_len < LINE_MAX {
         ld.line[ld.line_len] = c;
         ld.line_len += 1;
         if t.c_lflag & ECHO != 0 {

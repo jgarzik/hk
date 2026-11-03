@@ -204,7 +204,12 @@ impl Tty {
 
     /// Set the termios structure
     pub fn set_termios(&self, termios: Termios) {
-        *self.termios.lock() = termios;
+        let old = core::mem::replace(&mut *self.termios.lock(), termios);
+        let canon = |t: &Termios| t.c_lflag & termios::ICANON != 0;
+        if canon(&old) != canon(&termios) {
+            self.ldata.lock().set_canon(canon(&old), canon(&termios));
+            self.read_wait.wake_all();
+        }
     }
 
     /// Get the window size
