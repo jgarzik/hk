@@ -101,10 +101,11 @@ pub fn path_lookupat(
 
 /// Child `name` of directory `parent`: the dcache, else the file system
 /// (the new dentry is cached). A cached negative dentry is ENOENT; a
-/// miss is cached as one (Linux d_add(dentry, NULL)) except on
-/// filesystems that compute their entries (FS_PSEUDO: procfs,
-/// cgroupfs), whose names come and go behind the dcache. Permission
-/// is the caller's business.
+/// miss is cached as one (Linux d_add(dentry, NULL)) only on in-memory
+/// filesystems (ramfs, devtmpfs), where a name is its exact bytes:
+/// procfs and cgroupfs compute their entries behind the dcache, and
+/// vfat matches other spellings (case, trailing dots), which Linux
+/// handles with d_revalidate. Permission is the caller's business.
 pub fn lookup_one(parent: &Arc<Dentry>, name: &[u8]) -> Result<Arc<Dentry>, KernelError> {
     // No file system here has longer names (Linux simple_lookup and the
     // disk file systems' lookups: ENAMETOOLONG)
@@ -122,10 +123,10 @@ pub fn lookup_one(parent: &Arc<Dentry>, name: &[u8]) -> Result<Arc<Dentry>, Kern
     match dir.i_op.lookup(&dir, name) {
         Ok(inode) => Ok(Dentry::alloc(parent, name, Some(inode))),
         Err(KernelError::NotFound) => {
-            let pseudo = dir
+            let in_memory = dir
                 .superblock()
-                .is_some_and(|sb| sb.fs_type.fs_flags == super::superblock::fs_flags::FS_PSEUDO);
-            if !pseudo {
+                .is_some_and(|sb| sb.fs_type.fs_flags == super::superblock::fs_flags::FS_IN_MEMORY);
+            if in_memory {
                 Dentry::alloc(parent, name, None);
             }
             Err(KernelError::NotFound)

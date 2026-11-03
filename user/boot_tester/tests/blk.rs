@@ -399,6 +399,7 @@ fn vfat(d: &Disk) {
     vfat_remount(p1);
     vfat_names(p1);
     vfat_opts(p1);
+    vfat_neg_case(p1);
 }
 
 /// What was written through the page cache (write() and a shared
@@ -763,4 +764,26 @@ fn swap(p2: &BlkDev) {
     let ok = on == 0 && again == EBUSY && off == 0;
     verdict(b"BLK_SWAPON", ok, on * 1000 + again);
     verdict(b"SWAP_ETXTBSY", on == 0 && fd >= 0 && w == -26, w);
+}
+
+/// A name vfat matches without regard to case or trailing dots is found
+/// after a failed lookup of another spelling (Linux vfat_revalidate_ci:
+/// no stale negative dentry)
+fn vfat_neg_case(p1: &BlkDev) {
+    let r = mount_vd1(p1, b"iocharset=cp437\0");
+    // SAFETY: Stat is plain integers
+    let mut st: Stat = unsafe { core::mem::zeroed() };
+    let miss = sys_stat(b"/mnt/vd1/NEGCASE.TXT\0".as_ptr(), &mut st);
+    let miss2 = sys_stat(b"/mnt/vd1/td.\0".as_ptr(), &mut st);
+    let fd = sys_open(b"/mnt/vd1/negcase.txt\0".as_ptr(), O_CREAT | O_WRONLY, 0o644);
+    sys_close(fd as u64);
+    let fd2 = sys_open(b"/mnt/vd1/td\0".as_ptr(), O_CREAT | O_WRONLY, 0o644);
+    sys_close(fd2 as u64);
+    let hit = sys_stat(b"/mnt/vd1/NEGCASE.TXT\0".as_ptr(), &mut st);
+    let hit2 = sys_stat(b"/mnt/vd1/td.\0".as_ptr(), &mut st);
+    sys_unlink(b"/mnt/vd1/negcase.txt\0".as_ptr());
+    sys_unlink(b"/mnt/vd1/td\0".as_ptr());
+    sys_umount2(b"/mnt/vd1\0".as_ptr(), 0);
+    let ok = r == 0 && miss == -2 && miss2 == -2 && fd >= 0 && fd2 >= 0 && hit == 0 && hit2 == 0;
+    verdict(b"VFAT_NEG_CASE", ok, hit * 100 + hit2);
 }
