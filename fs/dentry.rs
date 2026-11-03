@@ -104,11 +104,20 @@ impl Dentry {
         let mut p = parent.d_lock.write();
         if let Some(c) = p.children.get(name) {
             let mut ci = c.d_lock.write();
-            if ci.inode.is_none() {
-                ci.inode = inode;
+            if ci.inode.is_some() {
+                drop(ci);
+                return c.clone();
             }
-            drop(ci);
-            return c.clone();
+            // A negative one is filled only if no one else holds it
+            // (lookups take their reference under the parent's d_lock);
+            // a held one is replaced, so a holder never sees an inode
+            // it did not look up
+            if Arc::strong_count(c) == 1 {
+                ci.inode = inode;
+                drop(ci);
+                return c.clone();
+            }
+            ci.flags.unhashed = true;
         }
         let d = Arc::new(Self::with(name.into(), inode, parent.sb.clone()));
         d.d_lock.write().parent = Some(parent.clone());
@@ -131,13 +140,23 @@ impl Dentry {
         self.d_lock.write().inode = Some(inode);
     }
 
-    /// The name was unlinked and no one holds this dentry: it stays as
-    /// a negative one (Linux dentry_unlink_inode); what was cached
-    /// under a removed directory goes
-    pub fn make_negative(&self) {
-        let mut d = self.d_lock.write();
-        d.inode = None;
-        d.children.clear();
+    /// The child `name` was unlinked (Linux d_delete): one no one but
+    /// the caller (`held` references) holds becomes negative in place,
+    /// with what was cached under it dropped; a held one leaves the
+    /// tree. Decided under this parent's d_lock, where lookups take
+    /// their references.
+    pub fn d_delete(&self, name: &[u8], held: usize) {
+        let mut p = self.d_lock.write();
+        let Some(c) = p.children.get(name) else {
+            return;
+        };
+        if Arc::strong_count(c) <= held + 1 {
+            let mut ci = c.d_lock.write();
+            ci.inode = None;
+            ci.children.clear();
+        } else if let Some(c) = p.children.remove(name) {
+            c.d_lock.write().flags.unhashed = true;
+        }
     }
 
     /// Check if this is a negative (failed lookup) dentry

@@ -354,13 +354,9 @@ pub fn delete_entry(p: &Parent, isdir: bool) -> Result<(), KernelError> {
         };
         drop(victim_lock);
         r?;
-        // Linux d_delete: a dentry no one else holds becomes negative in
-        // place; a held one (a cwd, an open file) leaves the tree
-        if Arc::strong_count(&victim) <= 2 {
-            victim.make_negative();
-        } else {
-            parent.remove_child(name);
-        }
+        // A dentry no one else holds becomes negative in place; a held
+        // one (a cwd, an open file) leaves the tree
+        parent.d_delete(name, 1);
         Ok(())
     })()
 }
