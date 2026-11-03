@@ -533,8 +533,8 @@ impl Bus for UsbBus {
     /// 2. Find and call driver.remove()
     /// 3. Remove from probed_devices
     /// 4. Remove from devices list
-    fn remove_device(&mut self, bus_id: &str) -> Result<(), crate::bus::driver::DriverError> {
-        use crate::bus::driver::DriverError;
+    fn remove_device(&mut self, bus_id: &str) -> Result<(), crate::util::error::KernelError> {
+        use crate::util::error::KernelError;
 
         printkln!("USB: Removing device {}", bus_id);
 
@@ -548,7 +548,7 @@ impl Bus for UsbBus {
             Some(idx) => idx,
             None => {
                 printkln!("USB: Device {} not found", bus_id);
-                return Err(DriverError::MissingResource);
+                return Err(KernelError::NoDevice);
             }
         };
 

@@ -16,11 +16,9 @@ use crate::fs::KernelError;
 use crate::fs::kernfs::{Attr, KNode, SysBuf};
 use crate::fs::sysfs;
 
-/// What a driver matches (its bus's id table kind)
-pub enum Ids {
-    /// Device names or DT compatible strings (platform)
-    Names(&'static [&'static str]),
-}
+/// A driver's id table, of its bus's type (`platform::Names`,
+/// `pci::PciIds`, ...); the bus's match downcasts it
+pub type Ids = &'static (dyn Any + Send + Sync);
 
 /// A driver's per-device state, kept while bound (Linux drvdata plus
 /// the driver's remove/shutdown callbacks)

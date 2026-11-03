@@ -19,7 +19,8 @@ use crate::hw::dma::{DmaConfig, DmaDevice};
 use crate::printkln;
 
 use crate::bus::bus::{Bus, BusContext, BusDevice, BusDriver};
-use crate::bus::driver::{Device, DriverError};
+use crate::bus::driver::Device;
+use crate::util::error::KernelError;
 
 // ============================================================================
 // PCI BAR Allocator (for platforms without firmware BAR assignment)
@@ -1124,7 +1125,7 @@ impl Bus for PciBus {
     /// 3. Call driver.remove() for cleanup
     /// 4. Remove from probed_devices
     /// 5. Remove from devices list
-    fn remove_device(&mut self, bus_id: &str) -> Result<(), DriverError> {
+    fn remove_device(&mut self, bus_id: &str) -> Result<(), KernelError> {
         printkln!("PCI: Removing device at {}", bus_id);
 
         // Find the device index
@@ -1137,7 +1138,7 @@ impl Bus for PciBus {
             Some(idx) => idx,
             None => {
                 printkln!("PCI: Device {} not found", bus_id);
-                return Err(DriverError::MissingResource);
+                return Err(KernelError::NoDevice);
             }
         };
 

@@ -2,21 +2,6 @@
 
 use core::any::Any;
 
-/// Driver error
-#[derive(Debug)]
-pub enum DriverError {
-    /// Required resource missing from device tree
-    MissingResource,
-    /// Device initialization failed
-    InitFailed,
-    /// Unsupported device
-    Unsupported,
-    /// Device removal failed
-    RemovalFailed,
-    /// Device is in use (cannot be removed)
-    InUse,
-}
-
 /// A device instance
 pub trait Device: Send + Sync {
     /// Device name

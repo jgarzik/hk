@@ -336,7 +336,7 @@ pub static SERIAL8250_DRIVER: crate::base::Driver = crate::base::Driver::new(
     "serial8250",
     &crate::base::platform::PLATFORM_BUS,
     None,
-    crate::base::Ids::Names(&["serial8250"]),
+    &crate::base::platform::Names(&["serial8250"]),
     serial8250_probe,
 );
 

@@ -280,7 +280,7 @@ pub static PL011_DRIVER: crate::base::Driver = crate::base::Driver::new(
     "uart-pl011",
     &crate::base::platform::PLATFORM_BUS,
     None,
-    crate::base::Ids::Names(&["arm,pl011"]),
+    &crate::base::platform::Names(&["arm,pl011"]),
     pl011_probe,
 );
 

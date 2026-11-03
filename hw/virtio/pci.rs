@@ -26,11 +26,12 @@ use super::ring::{self, Layout, Vring};
 use super::{VirtioIrq, find_driver, status};
 use crate::arch::barrier::wmb;
 use crate::bus::bus::{BusContext, BusDevice, BusDriver};
-use crate::bus::driver::{Device, DriverError};
+use crate::bus::driver::Device;
 use crate::hw::dma::{DmaCoherent, DmaConfig, DmaDevice};
 use crate::hw::mmio::IoMem;
 use crate::hw::pci::{PciDevice, cap_id};
 use crate::printkln;
+use crate::util::error::KernelError;
 
 /// Red Hat / virtio vendor ID
 const VENDOR_VIRTIO: u16 = 0x1AF4;
@@ -127,17 +128,16 @@ fn find_caps(pci: &PciDevice) -> Caps {
 }
 
 /// ioremap the part of a BAR a capability describes (at most `max` bytes)
-fn map_cap(pci: &PciDevice, cap: Cap, max: u32) -> Result<IoMem, DriverError> {
+fn map_cap(pci: &PciDevice, cap: Cap, max: u32) -> Result<IoMem, KernelError> {
     let len = cap.len.min(max);
     let bar = cap.bar as usize;
     let base = match pci.bar_address(bar) {
         Some(b) if pci.bar_is_mmio(bar) && len > 0 => b,
-        _ => return Err(DriverError::MissingResource),
+        _ => return Err(KernelError::NoDevice),
     };
     // SAFETY: part of a memory BAR of this device, which the capability
     // places there: registers, not RAM
-    unsafe { IoMem::ioremap(base + cap.off as u64, len as usize) }
-        .ok_or(DriverError::MissingResource)
+    unsafe { IoMem::ioremap(base + cap.off as u64, len as usize) }.ok_or(KernelError::NoDevice)
 }
 
 /// A virtio device on the modern PCI transport (Linux virtio_pci_device)
@@ -161,15 +161,15 @@ pub struct VirtioDevice {
 
 impl VirtioDevice {
     /// Locate and map the transport structures
-    fn map(pci: PciDevice, id: u32) -> Result<Self, DriverError> {
+    fn map(pci: PciDevice, id: u32) -> Result<Self, KernelError> {
         let caps = find_caps(&pci);
         let (Some(c), Some(n), Some(i)) = (caps.common, caps.notify, caps.isr) else {
             printkln!("virtio-pci: {} lacks a required capability", pci.bus_id());
-            return Err(DriverError::MissingResource);
+            return Err(KernelError::NoDevice);
         };
         let common = map_cap(&pci, c, common::LEN)?;
         if common.len() < common::LEN as usize {
-            return Err(DriverError::MissingResource);
+            return Err(KernelError::NoDevice);
         }
         let notify = map_cap(&pci, n, u32::MAX)?;
         let isr = map_cap(&pci, i, 1)?;
@@ -242,7 +242,7 @@ impl VirtioDevice {
     }
 
     /// Reset the device and wait until it reports the reset done
-    fn reset(&self) -> Result<(), DriverError> {
+    fn reset(&self) -> Result<(), KernelError> {
         self.w8(common::STATUS, 0);
         for _ in 0..1_000_000 {
             if self.status() == 0 {
@@ -250,7 +250,7 @@ impl VirtioDevice {
             }
             core::hint::spin_loop();
         }
-        Err(DriverError::InitFailed)
+        Err(KernelError::Io)
     }
 
     fn device_features(&self) -> u64 {
@@ -262,7 +262,7 @@ impl VirtioDevice {
     }
 
     /// Negotiate features and set FEATURES_OK (spec 3.1.1 steps 4-6)
-    fn negotiate(&mut self, driver: u64) -> Result<(), DriverError> {
+    fn negotiate(&mut self, driver: u64) -> Result<(), KernelError> {
         let f = super::negotiate(self.device_features(), driver)?;
         self.w32(common::GFSELECT, 0);
         self.w32(common::GF, f as u32);
@@ -270,7 +270,7 @@ impl VirtioDevice {
         self.w32(common::GF, (f >> 32) as u32);
         self.add_status(status::FEATURES_OK);
         if self.status() & status::FEATURES_OK == 0 {
-            return Err(DriverError::Unsupported);
+            return Err(KernelError::NoDevice);
         }
         self.features = f;
         Ok(())
@@ -330,24 +330,21 @@ impl VirtioDevice {
     }
 
     /// Set up queue `index` (spec 4.1.5.1.3); before `ready()`
-    pub fn setup_vq(&self, index: u16) -> Result<Virtqueue, DriverError> {
+    pub fn setup_vq(&self, index: u16) -> Result<Virtqueue, KernelError> {
         if index >= self.num_queues() {
-            return Err(DriverError::MissingResource);
+            return Err(KernelError::NoDevice);
         }
         self.w16(common::Q_SELECT, index);
         if self.r16(common::Q_ENABLE) != 0 {
-            return Err(DriverError::InitFailed);
+            return Err(KernelError::Io);
         }
-        let num = ring::pick_size(self.r16(common::Q_SIZE)).ok_or(DriverError::MissingResource)?;
+        let num = ring::pick_size(self.r16(common::Q_SIZE)).ok_or(KernelError::NoDevice)?;
         let off = self.r16(common::Q_NOFF) as usize * self.notify_mul as usize;
-        let notify = self
-            .notify
-            .sub(off, 2)
-            .ok_or(DriverError::MissingResource)?;
+        let notify = self.notify.sub(off, 2).ok_or(KernelError::NoDevice)?;
         let lay = Layout::new(num);
         // Zeroed, page-aligned: satisfies every ring part's alignment
-        let mem = crate::hw::dma::dma_alloc_coherent(self, lay.size)
-            .ok_or(DriverError::MissingResource)?;
+        let mem =
+            crate::hw::dma::dma_alloc_coherent(self, lay.size).ok_or(KernelError::NoDevice)?;
         let d = mem.dma_addr().0;
         self.w16(common::Q_SIZE, num);
         self.w64(common::Q_DESC, d);
@@ -470,7 +467,7 @@ fn virtio_id(pci: &PciDevice) -> Option<u32> {
 }
 
 /// Reset, acknowledge and negotiate (spec 3.1.1 steps 1-6)
-fn vp_init(pci: &PciDevice, id: u32, driver: u64) -> Result<VirtioDevice, DriverError> {
+fn vp_init(pci: &PciDevice, id: u32, driver: u64) -> Result<VirtioDevice, KernelError> {
     let mut pci = pci.clone();
     // Virtio devices address all 64 bits (Linux virtio_pci_modern_probe)
     pci.set_dma_mask_and_coherent(u64::MAX);
@@ -504,13 +501,13 @@ impl BusDriver for VirtioPciDriver {
         &self,
         device: &dyn BusDevice,
         _ctx: &mut BusContext,
-    ) -> Result<Box<dyn Device>, DriverError> {
+    ) -> Result<Box<dyn Device>, KernelError> {
         let pci = device
             .as_any()
             .downcast_ref::<PciDevice>()
-            .ok_or(DriverError::Unsupported)?;
-        let id = virtio_id(pci).ok_or(DriverError::Unsupported)?;
-        let drv = find_driver(id).ok_or(DriverError::Unsupported)?;
+            .ok_or(KernelError::NoDevice)?;
+        let id = virtio_id(pci).ok_or(KernelError::NoDevice)?;
+        let drv = find_driver(id).ok_or(KernelError::NoDevice)?;
         let vdev = Arc::new(vp_init(pci, id, drv.features())?);
         printkln!(
             "virtio-pci: {} device {} features {:#x}",

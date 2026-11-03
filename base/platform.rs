@@ -11,7 +11,7 @@ use spin::Once;
 
 use super::bus::BusType;
 use super::core::{Device, DeviceInfo, device_create};
-use super::driver::{Driver, Ids};
+use super::driver::Driver;
 use crate::fs::KernelError;
 
 pub static PLATFORM_BUS: BusType = BusType::new("platform", platform_match, Some(platform_uevent));
@@ -37,6 +37,9 @@ pub struct PlatformDevice {
     pub irq: Option<u32>,
 }
 
+/// A platform driver's id table: device names or DT compatible strings
+pub struct Names(pub &'static [&'static str]);
+
 /// The platform resources of `dev`
 pub fn pdev(dev: &Device) -> Option<&PlatformDevice> {
     dev.data::<PlatformDevice>()
@@ -45,7 +48,9 @@ pub fn pdev(dev: &Device) -> Option<&PlatformDevice> {
 /// Linux platform_match: a DT compatible string, else the name
 fn platform_match(dev: &Device, drv: &'static Driver) -> bool {
     let Some(p) = pdev(dev) else { return false };
-    let Ids::Names(names) = drv.ids;
+    let Some(Names(names)) = drv.ids.downcast_ref::<Names>() else {
+        return false;
+    };
     if !p.compatible.is_empty() {
         return p.compatible.iter().any(|c| names.contains(c));
     }

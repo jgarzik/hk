@@ -43,7 +43,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use crate::sync::spin::Mutex;
 use spin::Once;
 
-use crate::bus::driver::{Device, DriverError};
+use crate::bus::driver::Device;
 use crate::hw::dma::DmaCoherent;
 use crate::hw::virtio::ring::{Sg, VringCb};
 use crate::hw::virtio::{self, VirtioDevice, VirtioDriver, VirtioIrq, Virtqueue};
@@ -89,10 +89,10 @@ struct Pool {
 }
 
 impl Pool {
-    fn new(vdev: &VirtioDevice, n: u16) -> Result<Self, DriverError> {
+    fn new(vdev: &VirtioDevice, n: u16) -> Result<Self, KernelError> {
         crate::hw::dma::dma_alloc_coherent(vdev, n as usize * BUF_SIZE)
             .map(|mem| Self { mem })
-            .ok_or(DriverError::MissingResource)
+            .ok_or(KernelError::NoDevice)
     }
 
     fn cpu(&self, i: usize) -> *mut u8 {
@@ -406,7 +406,7 @@ fn read_mac(vdev: &VirtioDevice) -> [u8; 6] {
     mac
 }
 
-fn setup_queues(vdev: &VirtioDevice) -> Result<(RxQueue, TxQueue), DriverError> {
+fn setup_queues(vdev: &VirtioDevice) -> Result<(RxQueue, TxQueue), KernelError> {
     let rvq = vdev.setup_vq(RXQ)?;
     let tvq = vdev.setup_vq(TXQ)?;
     let mut rx = RxQueue {
@@ -441,7 +441,7 @@ impl VirtioDriver for VirtioNetDriver {
         (1 << feature::MAC) | (1 << feature::STATUS)
     }
 
-    fn probe(&self, vdev: Arc<VirtioDevice>) -> Result<Box<dyn Device>, DriverError> {
+    fn probe(&self, vdev: Arc<VirtioDevice>) -> Result<Box<dyn Device>, KernelError> {
         let mac = read_mac(&vdev);
         let (rx, tx) = setup_queues(&vdev)?;
         let rx_cb = rx.vq.cb();
@@ -462,7 +462,7 @@ impl VirtioDriver for VirtioNetDriver {
             .request_irq(Arc::clone(&device) as Arc<dyn VirtioIrq>)
             .map_err(|e| {
                 printkln!("virtio-net: no IRQ ({})", e);
-                DriverError::MissingResource
+                KernelError::NoDevice
             })?;
         vdev.ready();
         // Buffers were posted before DRIVER_OK; notify only now (spec 3.1.1)

@@ -12,9 +12,10 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::block::{DataDirection, ScsiCommand, ScsiError, ScsiHost, ScsiResult};
 use crate::bus::bus::{BusContext, BusDevice, BusDriver};
-use crate::bus::driver::{Device, DriverError};
+use crate::bus::driver::Device;
 use crate::downcast_bus_device;
 use crate::printkln;
+use crate::util::error::KernelError;
 
 use super::{UsbDevice, UsbError, usb_bulk_in, usb_bulk_out, usb_configure_endpoints};
 
@@ -381,8 +382,8 @@ impl BusDriver for UsbMscBusDriver {
     /// Called when the USB device is disconnected. Performs cleanup:
     /// 1. Unregister associated SCSI disk from block device registry
     /// 2. Invalidate page cache entries
-    fn remove(&self, device: &dyn BusDevice) -> Result<(), DriverError> {
-        let usb_dev = downcast_bus_device!(device, UsbDevice).ok_or(DriverError::Unsupported)?;
+    fn remove(&self, device: &dyn BusDevice) -> Result<(), KernelError> {
+        let usb_dev = downcast_bus_device!(device, UsbDevice).ok_or(KernelError::NoDevice)?;
 
         printkln!(
             "USB-MSC: Removing device slot {} (bus_id: {})",
@@ -433,8 +434,8 @@ impl BusDriver for UsbMscBusDriver {
         &self,
         device: &dyn BusDevice,
         _ctx: &mut BusContext,
-    ) -> Result<Box<dyn Device>, DriverError> {
-        let usb_dev = downcast_bus_device!(device, UsbDevice).ok_or(DriverError::Unsupported)?;
+    ) -> Result<Box<dyn Device>, KernelError> {
+        let usb_dev = downcast_bus_device!(device, UsbDevice).ok_or(KernelError::NoDevice)?;
 
         printkln!(
             "USB-MSC: Probing device slot {} on port {}",

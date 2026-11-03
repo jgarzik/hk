@@ -61,7 +61,7 @@ pub static PL031_DRIVER: crate::base::Driver = crate::base::Driver::new(
     "rtc-pl031",
     &crate::base::platform::PLATFORM_BUS,
     None,
-    crate::base::Ids::Names(&["arm,pl031"]),
+    &crate::base::platform::Names(&["arm,pl031"]),
     pl031_probe,
 );
 

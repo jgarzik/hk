@@ -18,11 +18,12 @@ use crate::sync::spin::Mutex;
 
 use crate::arch::{CurrentArch, IoremapOps, phys_to_virt};
 use crate::bus::bus::{BusContext, BusDevice, BusDriver};
-use crate::bus::driver::{Device, DriverError};
+use crate::bus::driver::Device;
 use crate::downcast_bus_device;
 use crate::hw::pci::PciDevice;
 use crate::printkln;
 use crate::time::delay::{poll_timeout, udelay};
+use crate::util::error::KernelError;
 
 /// Halt and start handshakes (Linux XHCI_MAX_HALT_USEC)
 pub(super) const XHCI_MAX_HALT_US: u64 = 32_000;
@@ -323,8 +324,8 @@ impl BusDriver for XhciPciDriver {
     /// 2. Halt controller
     /// 3. Unregister IRQ
     /// 4. Clear global state
-    fn remove(&self, device: &dyn BusDevice) -> Result<(), DriverError> {
-        let pci_dev = downcast_bus_device!(device, PciDevice).ok_or(DriverError::Unsupported)?;
+    fn remove(&self, device: &dyn BusDevice) -> Result<(), KernelError> {
+        let pci_dev = downcast_bus_device!(device, PciDevice).ok_or(KernelError::NoDevice)?;
         printkln!(
             "xHCI: Removing PCI device at {}",
             BusDevice::bus_id(pci_dev)
@@ -341,11 +342,11 @@ impl BusDriver for XhciPciDriver {
         &self,
         device: &dyn BusDevice,
         ctx: &mut BusContext,
-    ) -> Result<Box<dyn Device>, DriverError> {
-        let pci_dev = downcast_bus_device!(device, PciDevice).ok_or(DriverError::Unsupported)?;
+    ) -> Result<Box<dyn Device>, KernelError> {
+        let pci_dev = downcast_bus_device!(device, PciDevice).ok_or(KernelError::NoDevice)?;
 
         // Get BAR0 for MMIO
-        let mmio_base = pci_dev.bar_address(0).ok_or(DriverError::MissingResource)?;
+        let mmio_base = pci_dev.bar_address(0).ok_or(KernelError::NoDevice)?;
 
         // Enable memory space and bus mastering
         pci_dev.enable_memory_space();
@@ -363,7 +364,7 @@ impl BusDriver for XhciPciDriver {
         // Initialize with frame allocator from context
         if let Err(e) = controller.init_from_context(ctx) {
             printkln!("xHCI: Failed to initialize controller: {:?}", e);
-            return Err(DriverError::InitFailed);
+            return Err(KernelError::Io);
         }
 
         // Enumerate USB devices

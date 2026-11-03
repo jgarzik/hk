@@ -16,10 +16,11 @@ use alloc::boxed::Box;
 use core::any::Any;
 
 use crate::bus::bus::{BusContext, BusDevice, BusDriver};
-use crate::bus::driver::{Device, DriverError};
+use crate::bus::driver::Device;
 use crate::console::{ConsoleDriver, ConsolePriority, register_console};
 use crate::downcast_bus_device;
 use crate::printkln;
+use crate::util::error::KernelError;
 
 use super::{SetupPacket, UsbDevice, UsbSpeed, cdc_subclass, class};
 
@@ -49,8 +50,8 @@ impl BusDriver for UsbSerialBusDriver {
     ///
     /// Called when the USB device is disconnected. Clears the global
     /// console registration to prevent writes to disconnected device.
-    fn remove(&self, device: &dyn BusDevice) -> Result<(), DriverError> {
-        let usb_dev = downcast_bus_device!(device, UsbDevice).ok_or(DriverError::Unsupported)?;
+    fn remove(&self, device: &dyn BusDevice) -> Result<(), KernelError> {
+        let usb_dev = downcast_bus_device!(device, UsbDevice).ok_or(KernelError::NoDevice)?;
 
         printkln!(
             "UsbSerial: Removing device slot {} (bus_id: {})",
@@ -74,8 +75,8 @@ impl BusDriver for UsbSerialBusDriver {
         &self,
         device: &dyn BusDevice,
         _ctx: &mut BusContext,
-    ) -> Result<Box<dyn Device>, DriverError> {
-        let usb_dev = downcast_bus_device!(device, UsbDevice).ok_or(DriverError::Unsupported)?;
+    ) -> Result<Box<dyn Device>, KernelError> {
+        let usb_dev = downcast_bus_device!(device, UsbDevice).ok_or(KernelError::NoDevice)?;
 
         printkln!(
             "UsbSerial: Probing USB device at {}",
@@ -83,7 +84,7 @@ impl BusDriver for UsbSerialBusDriver {
         );
 
         // Create USB serial device
-        let serial = UsbSerial::new(usb_dev.clone()).ok_or(DriverError::InitFailed)?;
+        let serial = UsbSerial::new(usb_dev.clone()).ok_or(KernelError::Io)?;
 
         // Register as console with Normal priority
         // This allows USB serial to take precedence over legacy serial

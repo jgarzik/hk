@@ -19,7 +19,8 @@ use alloc::vec::Vec;
 
 use crate::sync::spin::Mutex;
 
-use crate::bus::driver::{Device, DriverError};
+use crate::bus::driver::Device;
+use crate::util::error::KernelError;
 
 pub use pci::{VirtioDevice, VirtioPciDriver, Virtqueue};
 
@@ -56,10 +57,10 @@ pub fn transport_features() -> u64 {
 }
 
 /// Features to accept: what both sides support
-pub fn negotiate(device: u64, driver: u64) -> Result<u64, DriverError> {
+pub fn negotiate(device: u64, driver: u64) -> Result<u64, KernelError> {
     let f = device & (driver | transport_features());
     if f & (1 << feature::VERSION_1) == 0 {
-        return Err(DriverError::Unsupported);
+        return Err(KernelError::NoDevice);
     }
     Ok(f)
 }
@@ -81,7 +82,7 @@ pub trait VirtioDriver: Send + Sync {
     fn features(&self) -> u64;
     /// Bind to a device whose features are negotiated (FEATURES_OK set);
     /// the driver must call `ready()` before returning success
-    fn probe(&self, vdev: Arc<VirtioDevice>) -> Result<Box<dyn Device>, DriverError>;
+    fn probe(&self, vdev: Arc<VirtioDevice>) -> Result<Box<dyn Device>, KernelError>;
 }
 
 /// Registered virtio drivers (written at boot before bus enumeration)

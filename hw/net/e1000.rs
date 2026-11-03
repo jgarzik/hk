@@ -38,7 +38,7 @@ use spin::Once;
 
 use crate::arch::barrier::{dma_rmb, dma_wmb, wmb};
 use crate::bus::bus::{BusContext, BusDevice, BusDriver};
-use crate::bus::driver::{Device, DriverError};
+use crate::bus::driver::Device;
 use crate::hw::dma::DmaCoherent;
 use crate::hw::pci::PciDevice;
 use crate::net;
@@ -617,11 +617,10 @@ impl Device for E1000DeviceWrapper {
 /// e1000 PCI driver
 pub struct E1000PciDriver;
 
-fn alloc_bufs(pci: &PciDevice, n: usize) -> Result<Vec<DmaCoherent>, DriverError> {
+fn alloc_bufs(pci: &PciDevice, n: usize) -> Result<Vec<DmaCoherent>, KernelError> {
     let mut v = Vec::with_capacity(n);
     for _ in 0..n {
-        let b = crate::hw::dma::dma_alloc_coherent(pci, BUF_SIZE)
-            .ok_or(DriverError::MissingResource)?;
+        let b = crate::hw::dma::dma_alloc_coherent(pci, BUF_SIZE).ok_or(KernelError::NoDevice)?;
         v.push(b);
     }
     Ok(v)
@@ -646,11 +645,11 @@ impl BusDriver for E1000PciDriver {
         &self,
         device: &dyn BusDevice,
         _ctx: &mut BusContext,
-    ) -> Result<Box<dyn Device>, DriverError> {
+    ) -> Result<Box<dyn Device>, KernelError> {
         let pci = device
             .as_any()
             .downcast_ref::<PciDevice>()
-            .ok_or(DriverError::Unsupported)?;
+            .ok_or(KernelError::NoDevice)?;
 
         printkln!(
             "e1000: probing {:04x}:{:04x} at {}",
@@ -662,13 +661,13 @@ impl BusDriver for E1000PciDriver {
         let bar0 = pci.header.bar[0];
         if bar0 == 0 {
             printkln!("e1000: BAR0 not configured");
-            return Err(DriverError::MissingResource);
+            return Err(KernelError::NoDevice);
         }
         let mmio_phys = (bar0 & !0xF) as u64;
         // SAFETY: BAR0 of this e1000, its 128KB register space
         let Some(regs) = (unsafe { crate::hw::mmio::IoMem::ioremap(mmio_phys, 128 * 1024) }) else {
             printkln!("e1000: Failed to ioremap MMIO region");
-            return Err(DriverError::MissingResource);
+            return Err(KernelError::NoDevice);
         };
 
         // The device DMAs descriptors and packets: it must master the bus
@@ -676,9 +675,9 @@ impl BusDriver for E1000PciDriver {
         pci.enable_bus_master();
 
         let rx_desc = crate::hw::dma::dma_alloc_coherent(pci, RX_RING_SIZE * 16)
-            .ok_or(DriverError::MissingResource)?;
+            .ok_or(KernelError::NoDevice)?;
         let tx_desc = crate::hw::dma::dma_alloc_coherent(pci, TX_RING_SIZE * 16)
-            .ok_or(DriverError::MissingResource)?;
+            .ok_or(KernelError::NoDevice)?;
         let rx_bufs = alloc_bufs(pci, RX_RING_SIZE)?;
         let tx_bufs = alloc_bufs(pci, TX_RING_SIZE)?;
 
@@ -747,7 +746,7 @@ impl BusDriver for E1000PciDriver {
             Ok(irq) => printkln!("e1000: IRQ {}", irq),
             Err(e) => {
                 printkln!("e1000: no IRQ ({}), RX disabled", e);
-                return Err(DriverError::MissingResource);
+                return Err(KernelError::NoDevice);
             }
         }
 

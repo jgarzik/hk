@@ -7,4 +7,4 @@ pub mod bus;
 pub mod driver;
 
 pub use bus::{Bus, BusContext, BusDevice, BusDriver, BusManager, FrameAllocWrapper};
-pub use driver::{Device, DriverError};
+pub use driver::Device;

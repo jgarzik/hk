@@ -14,7 +14,8 @@ use core::any::Any;
 use crate::arch::FrameAlloc;
 use crate::printkln;
 
-use super::driver::{Device, DriverError};
+use super::driver::Device;
+use crate::util::error::KernelError;
 
 /// A device on a bus that can be matched against drivers
 pub trait BusDevice: Send + Sync + Any {
@@ -82,7 +83,7 @@ pub trait BusDriver: Send + Sync {
         &self,
         device: &dyn BusDevice,
         ctx: &mut BusContext,
-    ) -> Result<Box<dyn Device>, DriverError>;
+    ) -> Result<Box<dyn Device>, KernelError>;
 
     /// Remove/unbind a device from this driver (hotplug support)
     ///
@@ -94,7 +95,7 @@ pub trait BusDriver: Send + Sync {
     /// 4. Unmap MMIO regions
     ///
     /// Default implementation does nothing (for backward compatibility).
-    fn remove(&self, _device: &dyn BusDevice) -> Result<(), DriverError> {
+    fn remove(&self, _device: &dyn BusDevice) -> Result<(), KernelError> {
         Ok(())
     }
 }
@@ -134,8 +135,8 @@ pub trait Bus: Send + Sync {
     /// 3. Remove device from internal tracking structures
     ///
     /// Default: returns Unsupported (bus doesn't support hotplug)
-    fn remove_device(&mut self, _bus_id: &str) -> Result<(), DriverError> {
-        Err(DriverError::Unsupported)
+    fn remove_device(&mut self, _bus_id: &str) -> Result<(), KernelError> {
+        Err(KernelError::NoDevice)
     }
 }
 
@@ -294,11 +295,11 @@ impl BusManager {
     /// Remove a device from a specific bus (hotplug support)
     ///
     /// Delegates to the bus's `remove_device()` implementation.
-    pub fn remove_device(&mut self, bus_name: &str, bus_id: &str) -> Result<(), DriverError> {
+    pub fn remove_device(&mut self, bus_name: &str, bus_id: &str) -> Result<(), KernelError> {
         if let Some(bus) = self.buses.get_mut(bus_name) {
             bus.remove_device(bus_id)
         } else {
-            Err(DriverError::MissingResource)
+            Err(KernelError::NoDevice)
         }
     }
 }

@@ -38,7 +38,7 @@ use crate::arch::phys_to_virt;
 use crate::block::blk_mq::{BlkMq, MqOps, Queued};
 use crate::block::blkdev::{Bio, BioList, BioOp, Disk, QueueLimits, RequestQueue, register_blkdev};
 use crate::block::genhd::{add_disk, disk_name};
-use crate::bus::driver::{Device, DriverError};
+use crate::bus::driver::Device;
 use crate::hw::dma::{DmaAddr, DmaCoherent, DmaDirection, dma_map_single, dma_unmap_single};
 use crate::hw::virtio::ring::Sg;
 use crate::hw::virtio::{self, VirtioDevice, VirtioDriver, VirtioIrq, Virtqueue};
@@ -111,10 +111,10 @@ fn dir(op: BioOp) -> DmaDirection {
 }
 
 impl VbQueue {
-    fn new(vdev: &Arc<VirtioDevice>, vq: Virtqueue) -> Result<Self, DriverError> {
+    fn new(vdev: &Arc<VirtioDevice>, vq: Virtqueue) -> Result<Self, KernelError> {
         let tags = MAX_TAGS.min(vq.num());
         let pool = crate::hw::dma::dma_alloc_coherent(&**vdev, tags as usize * SLOT)
-            .ok_or(DriverError::MissingResource)?;
+            .ok_or(KernelError::NoDevice)?;
         let slots = (0..tags)
             .map(|_| Slot {
                 bio: None,
@@ -348,7 +348,7 @@ fn nr_queues(vdev: &VirtioDevice) -> u16 {
 }
 
 /// Virtqueues and their hardware queues; also the smallest ring
-fn setup_queues(vdev: &Arc<VirtioDevice>) -> Result<(BlkMq, u16), DriverError> {
+fn setup_queues(vdev: &Arc<VirtioDevice>) -> Result<(BlkMq, u16), KernelError> {
     let mut ops: Vec<Box<dyn MqOps>> = Vec::new();
     let mut ring = u16::MAX;
     for i in 0..nr_queues(vdev) {
@@ -357,18 +357,18 @@ fn setup_queues(vdev: &Arc<VirtioDevice>) -> Result<(BlkMq, u16), DriverError> {
         ops.push(Box::new(VbQueue::new(vdev, vq)?));
     }
     if ring < 3 {
-        return Err(DriverError::MissingResource);
+        return Err(KernelError::NoDevice);
     }
     Ok((BlkMq::new(ops), ring))
 }
 
-fn new_disk(vdev: &Arc<VirtioDevice>) -> Result<Arc<Disk>, DriverError> {
+fn new_disk(vdev: &Arc<VirtioDevice>) -> Result<Arc<Disk>, KernelError> {
     let major = *MAJOR
         .try_call_once(|| register_blkdev(0, "virtblk"))
-        .map_err(|_| DriverError::InitFailed)?;
+        .map_err(|_| KernelError::Io)?;
     let index = INDEX.fetch_add(1, Ordering::Relaxed);
     if index as usize * VD_MINORS as usize > u16::MAX as usize - VD_MINORS as usize {
-        return Err(DriverError::InitFailed);
+        return Err(KernelError::Io);
     }
     let (mq, ring) = setup_queues(vdev)?;
     let nq = mq.nr_hw_queues();
@@ -420,7 +420,7 @@ impl VirtioDriver for VirtioBlkDriver {
         .fold(0, |f, b| f | (1 << b))
     }
 
-    fn probe(&self, vdev: Arc<VirtioDevice>) -> Result<Box<dyn Device>, DriverError> {
+    fn probe(&self, vdev: Arc<VirtioDevice>) -> Result<Box<dyn Device>, KernelError> {
         let disk = new_disk(&vdev)?;
         let blk = Arc::new(VirtioBlk {
             vdev: vdev.clone(),
@@ -429,10 +429,10 @@ impl VirtioDriver for VirtioBlkDriver {
         vdev.request_irq(blk.clone() as Arc<dyn VirtioIrq>)
             .map_err(|e| {
                 printkln!("virtio-blk: no IRQ ({})", e);
-                DriverError::MissingResource
+                KernelError::NoDevice
             })?;
         vdev.ready();
-        add_disk(disk).map_err(|_| DriverError::InitFailed)?;
+        add_disk(disk).map_err(|_| KernelError::Io)?;
         Ok(Box::new(VirtioBlkDev(blk)))
     }
 }
