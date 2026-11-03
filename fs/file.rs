@@ -154,6 +154,44 @@ impl<'a> DirContext<'a> {
     }
 }
 
+/// Linux generic_file_llseek for a file of `size` bytes
+pub fn generic_llseek(
+    file: &File,
+    size: u64,
+    offset: i64,
+    whence: i32,
+) -> Result<u64, KernelError> {
+    let new_pos = match whence {
+        seek::SEEK_SET => {
+            if offset < 0 {
+                return Err(KernelError::InvalidArgument);
+            }
+            offset as u64
+        }
+        seek::SEEK_CUR => {
+            let cur = file.get_pos();
+            if offset < 0 {
+                cur.checked_sub((-offset) as u64)
+                    .ok_or(KernelError::InvalidArgument)?
+            } else {
+                cur.saturating_add(offset as u64)
+            }
+        }
+        seek::SEEK_END => {
+            if offset < 0 {
+                size.checked_sub((-offset) as u64)
+                    .ok_or(KernelError::InvalidArgument)?
+            } else {
+                size.saturating_add(offset as u64)
+            }
+        }
+        _ => return Err(KernelError::InvalidArgument),
+    };
+
+    file.set_pos(new_pos);
+    Ok(new_pos)
+}
+
 /// File operations trait - filesystem-specific behavior for open files
 pub trait FileOps: Send + Sync {
     /// Returns self as Any for downcasting to concrete types
@@ -196,37 +234,7 @@ pub trait FileOps: Send + Sync {
     /// Seek to a position
     fn llseek(&self, file: &File, offset: i64, whence: i32) -> Result<u64, KernelError> {
         let inode = file.get_inode().ok_or(KernelError::BadFd)?;
-        let size = inode.get_size();
-
-        let new_pos = match whence {
-            seek::SEEK_SET => {
-                if offset < 0 {
-                    return Err(KernelError::InvalidArgument);
-                }
-                offset as u64
-            }
-            seek::SEEK_CUR => {
-                let cur = file.get_pos();
-                if offset < 0 {
-                    cur.checked_sub((-offset) as u64)
-                        .ok_or(KernelError::InvalidArgument)?
-                } else {
-                    cur.saturating_add(offset as u64)
-                }
-            }
-            seek::SEEK_END => {
-                if offset < 0 {
-                    size.checked_sub((-offset) as u64)
-                        .ok_or(KernelError::InvalidArgument)?
-                } else {
-                    size.saturating_add(offset as u64)
-                }
-            }
-            _ => return Err(KernelError::InvalidArgument),
-        };
-
-        file.set_pos(new_pos);
-        Ok(new_pos)
+        generic_llseek(file, inode.get_size(), offset, whence)
     }
 
     /// Read directory entries from `ctx.pos` on (Linux iterate_shared)

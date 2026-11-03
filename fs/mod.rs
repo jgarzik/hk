@@ -46,8 +46,10 @@ pub mod sync;
 pub mod cgroupfs;
 pub mod cpio;
 pub mod devtmpfs;
+pub mod kernfs;
 pub mod proc;
 pub mod ramfs;
+pub mod sysfs;
 pub mod vfat;
 
 // Re-exports for convenience

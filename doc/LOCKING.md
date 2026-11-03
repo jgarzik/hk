@@ -273,7 +273,8 @@ VFS locks (detailed order):
         ↓
     Inode.private
         ↓
-Filesystem-internal locks (ramfs children/data, procfs data)
+Filesystem-internal locks (ramfs children/data, procfs data;
+    kernfs `KNode.{children,name,parent}` spin leaves, 3.3 kernfs)
     ↓
 Leaves taken with no task lock held (their Arc is cloned out of the
 Task first, under its alloc_lock or lock-free by the task itself):
@@ -1720,6 +1721,20 @@ under a d_lock or ALL_SBS cannot re-enter it.
 `dentry::d_drop_tree` (an unhashed dentry's cached subtree, a dying
 superblock's tree) takes the same parent-then-child d_locks one leaf
 at a time, with no RENAME_LOCK held (d_move drops it first).
+
+#### kernfs / sysfs (fs/kernfs/, fs/sysfs.rs; Linux fs/kernfs)
+
+| Lock | Type | Order / rule |
+|------|------|--------------|
+| `kernfs::KERNFS_RWSEM` | sync::RwSem (Linux kernfs_rwsem) | write: add, remove, rename a node; read: symlink target paths. Taken by subsystems registering objects (in thread context, under their own locks such as RTNL), never under a VFS lock, never across show()/store() |
+| `KNode.children`, `.name`, `.parent` | spin RwLock, leaves | alone (lookup, readdir under the walk's i_rwsem) or under KERNFS_RWSEM |
+| `OpenAttr.buf` | sync::Mutex (Linux kernfs_open_file.mutex), per open file | held across show()/store(), which take subsystem locks; under f_pos_lock for read/write |
+
+show()/store() run under an active reference (`KNode::get_active`),
+not a lock. `KNode::remove` deactivates the subtree and sleeps until
+active references drain (Linux kernfs_drain), with no lock held: a
+caller must not hold a lock that a show()/store() of the removed nodes
+takes (Linux lockdep's kernfs active "lock").
 
 #### Mount Namespace & Mount Objects
 

@@ -120,6 +120,7 @@ pub mod swap;
 pub mod swapout;
 pub mod sync;
 pub mod sysctl;
+pub mod sysfs;
 pub mod clock_ids;
 pub mod cpio_nodes;
 pub mod dev_mem;
@@ -187,6 +188,7 @@ pub fn run_all_tests() {
     mountflags::run_tests();
     mounts::run_tests();
     mountinfo::run_tests();
+    sysfs::run_tests();
     pnode::run_tests();
     proc_dcache::run_tests();
     process::run_tests();

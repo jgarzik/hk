@@ -29,6 +29,14 @@ pub fn fs_setup() {
         0,
         0,
     );
+    sys_mkdir(b"/sys\0".as_ptr(), 0o555);
+    sys_mount(
+        b"sysfs\0".as_ptr(),
+        b"/sys\0".as_ptr(),
+        b"sysfs\0".as_ptr(),
+        0,
+        0,
+    );
     sys_mkdir(b"/tmp\0".as_ptr(), 0o1777);
 }
 

@@ -16,6 +16,7 @@ pub mod console;
 pub mod cpu;
 pub mod entry;
 pub mod irq;
+mod ksysfs;
 pub mod printk;
 pub mod selftest;
 pub mod smp;
@@ -606,6 +607,8 @@ fn init_vfs_core() {
     use fs::{RAMFS_TYPE, do_mount, init_fs_registry, ramfs_create_dir};
 
     init_fs_registry();
+    fs::sysfs::init();
+    ksysfs::init();
 
     // Mount ramfs as root filesystem
     let root_mount = match do_mount(&RAMFS_TYPE, None) {
