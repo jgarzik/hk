@@ -385,8 +385,10 @@ Printk locks (ALL IRQ-safe - can be acquired from interrupt context):
     KmsgUser.rate (spin leaf)
 
 TTYs (3.9): jobctrl CTTY_LOCK (spin) → TASKLIST (read) → Tty.ctrl
-    (spin; never takes TASKLIST under it); Tty.termios,
-    Tty.ldata (spin leaves, thread context); Tty.flip (IrqSpinlock leaf,
+    (spin; never takes TASKLIST under it); Tty.ldata → Tty.termios
+    (spin, thread context; termios is read under ldata by input
+    processing and swapped under it by set_termios, as Linux's
+    termios_rwsem spans both); Tty.flip (IrqSpinlock leaf,
     also under IRQ_TABLE in the UART handler). No tty lock is held
     across a signal, a sleep or a driver write.
 ```
@@ -2792,7 +2794,9 @@ Each `Tty` struct contains:
 | `read_wait` | `WaitQueue` | Readers and pollers waiting for input |
 
 The `Mutex`es are spin locks taken in thread context only, briefly, one
-at a time (`termios` is copied out first), and never across a signal, a
+at a time except `ldata` → `termios` (input processing reads termios and
+set_termios swaps it under `ldata`, so an ICANON change is applied
+atomically, as Linux's `termios_rwsem`), and never across a signal, a
 sleep or a driver write: N_TTY collects echo and ISIG signals under
 `ldata` and writes/sends them after dropping it; the SIGWINCH of
 TIOCSWINSZ and the SIGHUP/SIGCONT of giving up a controlling tty are sent

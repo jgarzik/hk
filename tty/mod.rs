@@ -204,10 +204,14 @@ impl Tty {
 
     /// Set the termios structure
     pub fn set_termios(&self, termios: Termios) {
+        // Under ldata, so input is processed with the old termios or the
+        // new one, never the new one before the ICANON change is applied
+        let mut ld = self.ldata.lock();
         let old = core::mem::replace(&mut *self.termios.lock(), termios);
         let canon = |t: &Termios| t.c_lflag & termios::ICANON != 0;
         if canon(&old) != canon(&termios) {
-            self.ldata.lock().set_canon(canon(&old), canon(&termios));
+            ld.set_canon(canon(&old), canon(&termios));
+            drop(ld);
             self.read_wait.wake_all();
         }
     }

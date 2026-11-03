@@ -128,14 +128,14 @@ impl NTtyData {
         if canon {
             self.lines > 0
         } else {
-            self.cnt() + self.line_len >= min.max(1)
+            self.cnt() >= min.max(1)
         }
     }
 
     /// Bytes a read can return (TIOCINQ; Linux inq_canon)
     pub fn inq(&self, canon: bool) -> usize {
         if !canon {
-            return self.cnt() + self.line_len;
+            return self.cnt();
         }
         let (mut n, mut pending) = (0, 0);
         let mut p = self.tail;
@@ -203,10 +203,12 @@ struct Effects {
 /// Input bytes from the driver, in thread context (Linux
 /// n_tty_receive_buf); wakes readers
 pub fn receive_buf(tty: &Tty, bytes: &[u8]) {
-    let t = tty.get_termios();
     let mut fx = Effects::default();
     {
+        // termios under ldata: a set_termios ICANON change (which holds
+        // ldata) is never half seen (Linux termios_rwsem)
         let mut ld = tty.ldata.lock();
+        let t = tty.get_termios();
         for &c in bytes {
             receive_char(&mut ld, &t, c, &mut fx);
         }
