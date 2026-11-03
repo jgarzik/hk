@@ -44,6 +44,9 @@ pub struct NTtyData {
     /// The line being edited in canonical mode
     line: [u8; LINE_MAX],
     line_len: usize,
+    /// ICANON as last set (Linux ldata->icanon): input, reads and
+    /// polls use this, so a termios change is seen by all at once
+    icanon: bool,
 }
 
 impl NTtyData {
@@ -56,6 +59,7 @@ impl NTtyData {
             lines: 0,
             line: [0; LINE_MAX],
             line_len: 0,
+            icanon: true,
         }
     }
 
@@ -104,28 +108,42 @@ impl NTtyData {
         self.line_len = 0;
     }
 
-    /// ICANON changed (Linux n_tty_set_termios): leaving canonical mode
-    /// makes the line being edited input; entering it makes the input
-    /// already queued readable as a line
-    pub fn set_canon(&mut self, was: bool, now: bool) {
-        if was && !now {
-            let len = core::mem::take(&mut self.line_len);
-            for i in 0..len {
-                self.push(self.line[i], false);
-            }
-        } else if !was && now && self.cnt() > 0 {
-            let last = self.head.wrapping_sub(1);
-            if !self.is_eol(last) {
-                let i = last % READ_BUF_SIZE;
-                self.eol[i / 64] |= 1 << (i % 64);
-                self.lines += 1;
-            }
+    /// Apply ICANON (Linux n_tty_set_termios): on a change, the line
+    /// being edited becomes input, line ends are forgotten, and entering
+    /// canonical mode makes what is queued one readable line
+    pub fn set_icanon(&mut self, now: bool) {
+        if now == self.icanon {
+            return;
+        }
+        self.icanon = now;
+        let len = core::mem::take(&mut self.line_len);
+        for i in 0..len {
+            self.push(self.line[i], false);
+        }
+        self.eol = [0; READ_BUF_SIZE / 64];
+        self.lines = 0;
+        if now && self.cnt() > 0 {
+            let i = self.head.wrapping_sub(1) % READ_BUF_SIZE;
+            self.eol[i / 64] |= 1 << (i % 64);
+            self.lines = 1;
         }
     }
 
+    /// Room for another input byte (Linux n_tty_receive_buf_common):
+    /// canonical mode keeps space for the edited line and its end; a
+    /// line too long for the ring (no complete line queued) is still
+    /// taken, its excess dropped, so input never stalls with nothing
+    /// readable
+    fn room(&self) -> bool {
+        if !self.icanon {
+            return self.cnt() < READ_BUF_SIZE;
+        }
+        self.cnt() + self.line_len + 1 < READ_BUF_SIZE || self.lines == 0
+    }
+
     /// Readable input: a line in canonical mode, else `min` bytes
-    fn available(&self, canon: bool, min: usize) -> bool {
-        if canon {
+    fn available(&self, min: usize) -> bool {
+        if self.icanon {
             self.lines > 0
         } else {
             self.cnt() >= min.max(1)
@@ -133,8 +151,8 @@ impl NTtyData {
     }
 
     /// Bytes a read can return (TIOCINQ; Linux inq_canon)
-    pub fn inq(&self, canon: bool) -> usize {
-        if !canon {
+    pub fn inq(&self) -> usize {
+        if !self.icanon {
             return self.cnt();
         }
         let (mut n, mut pending) = (0, 0);
@@ -152,9 +170,10 @@ impl NTtyData {
     }
 
     /// Copy input out: canonical mode one line (None if there is none),
-    /// else what there is (None if nothing)
-    fn copy(&mut self, out: &mut [u8], canon: bool) -> Option<usize> {
-        if !self.available(canon, 1) {
+    /// else what there is (None if nothing); with the mode it used
+    fn copy(&mut self, out: &mut [u8]) -> Option<(usize, bool)> {
+        let canon = self.icanon;
+        if !self.available(1) {
             return None;
         }
         let mut n = 0;
@@ -183,7 +202,7 @@ impl NTtyData {
                 }
             }
         }
-        Some(n)
+        Some((n, canon))
     }
 }
 
@@ -201,16 +220,22 @@ struct Effects {
 }
 
 /// Input bytes from the driver, in thread context (Linux
-/// n_tty_receive_buf); wakes readers
-pub fn receive_buf(tty: &Tty, bytes: &[u8]) {
+/// n_tty_receive_buf); wakes readers. The bytes taken: the rest wait in
+/// the flip buffer until a read makes room
+pub fn receive_buf(tty: &Tty, bytes: &[u8]) -> usize {
     let mut fx = Effects::default();
+    let mut taken = 0;
     {
-        // termios under ldata: a set_termios ICANON change (which holds
-        // ldata) is never half seen (Linux termios_rwsem)
+        // termios under ldata: set_termios changes both under it (Linux
+        // termios_rwsem), so input never sees half a change
         let mut ld = tty.ldata.lock();
         let t = tty.get_termios();
         for &c in bytes {
+            if !ld.room() {
+                break;
+            }
             receive_char(&mut ld, &t, c, &mut fx);
+            taken += 1;
         }
     }
     if !fx.echo.is_empty() {
@@ -222,6 +247,7 @@ pub fn receive_buf(tty: &Tty, bytes: &[u8]) {
         }
     }
     tty.read_wait.wake_all();
+    taken
 }
 
 /// Input mapping (ISTRIP, IGNCR, ICRNL, INLCR); None drops the byte
@@ -367,11 +393,15 @@ pub fn read(tty: &Tty, file: &File, out: &mut [u8]) -> Result<usize, KernelError
         }
     }
     let nonblock = file.get_flags() & O_NONBLOCK != 0;
-    let ready = || tty.ldata.lock().available(canon, 1);
+    let ready = || tty.ldata.lock().available(1);
     let mut n = 0;
     loop {
-        if let Some(k) = tty.ldata.lock().copy(&mut out[n..], canon) {
+        let got = tty.ldata.lock().copy(&mut out[n..]);
+        if let Some((k, canon)) = got {
             n += k;
+            // Room was made: input held in the flip buffer may go on
+            // (Linux n_tty_kick_worker)
+            super::flip::kick(tty);
             if canon || n >= min || n == out.len() {
                 break;
             }
@@ -407,14 +437,14 @@ pub fn read(tty: &Tty, file: &File, out: &mut [u8]) -> Result<usize, KernelError
 /// Input a poll reports (Linux input_available_p for poll): a line, or
 /// VMIN bytes when VTIME is 0
 pub fn poll_in(tty: &Tty) -> bool {
+    let ld = tty.ldata.lock();
     let t = tty.get_termios();
-    let canon = t.c_lflag & ICANON != 0;
     let min = if t.c_cc[VTIME] == 0 {
         usize::from(t.c_cc[VMIN])
     } else {
         1
     };
-    tty.ldata.lock().available(canon, min)
+    ld.available(min)
 }
 
 /// Write (Linux n_tty_write): OPOST with ONLCR maps NL to CR-NL

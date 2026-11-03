@@ -204,16 +204,23 @@ impl Tty {
 
     /// Set the termios structure
     pub fn set_termios(&self, termios: Termios) {
-        // Under ldata, so input is processed with the old termios or the
-        // new one, never the new one before the ICANON change is applied
+        self.update_termios(|t| *t = termios);
+    }
+
+    /// Change termios in place (Linux: under termios_rwsem). Under
+    /// ldata, so input, reads and polls see the old settings or the new
+    /// ones with the ICANON change applied, never half; readers and
+    /// pollers are woken (VMIN, VTIME or ICANON may make input readable)
+    pub fn update_termios(&self, f: impl FnOnce(&mut Termios)) {
         let mut ld = self.ldata.lock();
-        let old = core::mem::replace(&mut *self.termios.lock(), termios);
-        let canon = |t: &Termios| t.c_lflag & termios::ICANON != 0;
-        if canon(&old) != canon(&termios) {
-            ld.set_canon(canon(&old), canon(&termios));
-            drop(ld);
-            self.read_wait.wake_all();
-        }
+        let canon = {
+            let mut t = self.termios.lock();
+            f(&mut t);
+            t.c_lflag & termios::ICANON != 0
+        };
+        ld.set_icanon(canon);
+        drop(ld);
+        self.read_wait.wake_all();
     }
 
     /// Get the window size
@@ -239,8 +246,7 @@ impl Tty {
 
     /// Bytes a read can return (TIOCINQ)
     pub fn bytes_available(&self) -> usize {
-        let canon = self.get_termios().c_lflag & ICANON != 0;
-        self.ldata.lock().inq(canon)
+        self.ldata.lock().inq()
     }
 
     /// The foreground process group

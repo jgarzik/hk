@@ -13,7 +13,8 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use super::{Tty, n_tty};
 use crate::sync::waitqueue::WaitQueue;
 
-/// Flip ring size; input beyond it before the thread runs is dropped
+/// Flip ring size; input beyond it (the line discipline full, or the
+/// thread not yet run) is dropped
 const FLIP_SIZE: usize = 1024;
 
 /// A tty's received bytes not yet given to the line discipline
@@ -42,14 +43,19 @@ impl Flip {
         }
     }
 
-    fn take(&mut self, out: &mut [u8]) -> usize {
+    /// Copy out the oldest bytes, leaving them queued
+    fn peek(&self, out: &mut [u8]) -> usize {
         let n = self.len.min(out.len());
-        for o in &mut out[..n] {
-            *o = self.buf[self.head];
-            self.head = (self.head + 1) % FLIP_SIZE;
+        for (i, o) in out[..n].iter_mut().enumerate() {
+            *o = self.buf[(self.head + i) % FLIP_SIZE];
         }
-        self.len -= n;
         n
+    }
+
+    /// Drop the oldest `n` bytes (the line discipline took them)
+    fn consume(&mut self, n: usize) {
+        self.head = (self.head + n) % FLIP_SIZE;
+        self.len -= n;
     }
 }
 
@@ -82,11 +88,25 @@ pub fn receive(tty: &Tty, bytes: &[u8]) {
 fn flush_to_ldisc(tty: &Tty) {
     let mut chunk = [0u8; 256];
     loop {
-        let n = tty.flip.lock().take(&mut chunk);
+        let n = tty.flip.lock().peek(&mut chunk);
         if n == 0 {
             return;
         }
-        n_tty::receive_buf(tty, &chunk[..n]);
+        let taken = n_tty::receive_buf(tty, &chunk[..n]);
+        tty.flip.lock().consume(taken);
+        if taken < n {
+            // The line discipline is full: a read kicks it on
+            return;
+        }
+    }
+}
+
+/// Room was made in `tty`'s line discipline: feed it what its flip
+/// buffer holds (Linux n_tty_kick_worker)
+pub fn kick(tty: &Tty) {
+    if tty.flip.lock().len != 0 {
+        PENDING.store(true, Ordering::Release);
+        FLIP_WAIT.wake_all();
     }
 }
 

@@ -200,13 +200,7 @@ pub fn tty_ioctl(tty: &Tty, file: &File, cmd: u32, arg: u64) -> Result<i64, Kern
         TIOCGSOFTCAR => put(arg, i32::from(tty.get_termios().c_cflag & CLOCAL != 0)),
         TIOCSSOFTCAR => {
             let on = get::<i32>(arg)? != 0;
-            let mut t = tty.get_termios();
-            t.c_cflag = if on {
-                t.c_cflag | CLOCAL
-            } else {
-                t.c_cflag & !CLOCAL
-            };
-            tty.set_termios(t);
+            tty.update_termios(|t| t.c_cflag = (t.c_cflag & !CLOCAL) | if on { CLOCAL } else { 0 });
             Ok(0)
         }
         _ => Err(KernelError::NotTty),
