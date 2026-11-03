@@ -319,9 +319,8 @@ immutable/append-only inodes (no IS_APPEND/IS_IMMUTABLE EPERM).
   is written synchronously by polling (TIOCOUTQ 0, no write_wait).
 - **Serial ports:** ttyS1 is registered without probing COM2; only
   COM1 (and the PL011) take input.
-- **/dev/console** writes go to every console (Linux: only its tty),
-  through the console driver, which always turns NL into CR-NL: the
-  tty's OPOST/ONLCR are ignored (Linux: n_tty_write).
+- **/dev/console** writes are also copied to the consoles without that
+  tty (the screen); Linux writes only to its tty.
 - **Pid namespaces:** TIOCGPGRP/TIOCGSID return global numbers (Linux
   pid_vnr: the caller's namespace).
 
