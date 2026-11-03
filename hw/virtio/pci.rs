@@ -150,7 +150,10 @@ pub struct VirtioDevice {
     device: Option<IoMem>,
     notify: IoMem,
     notify_mul: u32,
-    /// Negotiated features
+    /// Negotiated features: written by `negotiate` in the virtio bus
+    /// probe under the device lock, before the driver's probe runs;
+    /// read by the bound driver and the sysfs `features` file (Linux
+    /// vdev->features, a plain field under the same rule)
     features: AtomicU64,
     irq: Once<Arc<dyn VirtioIrq>>,
     /// Interrupts that were ours (stats)

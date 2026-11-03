@@ -320,9 +320,14 @@ impl NlSock {
         }
         let mask = (1u64 << self.proto.ngroups) - 1;
         let g = groups as u64 & mask;
-        let cur = self.groups.load(Ordering::Acquire);
-        self.groups
-            .store((cur & !0xFFFF_FFFF) | g, Ordering::Release);
+        // One update of the first 32 groups: a concurrent
+        // ADD/DROP_MEMBERSHIP of a higher group is not lost (Linux does
+        // both under netlink_table_grab)
+        let _ = self
+            .groups
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+                Some((cur & !0xFFFF_FFFF) | g)
+            });
         Ok(())
     }
 

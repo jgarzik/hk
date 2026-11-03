@@ -23,7 +23,10 @@
 //! - `KNode.children`, `KNode.name`, `KNode.parent` (spin `RwLock`,
 //!   leaves): taken alone, for lookups and listings, or under the rwsem
 //!   for changes.
-//! - Drain waits on `KNode.drain` with no lock held.
+//! - `KNode.active`: incremented lock-free by `get_active` (CAS, refused
+//!   once negative); the deactivation bias is added only under the
+//!   rwsem (write), once per node. Drain waits on `KNode.drain` with no
+//!   lock held, woken when the count reaches the bias.
 
 pub mod vfs;
 
@@ -316,27 +319,41 @@ impl KNode {
         self.add(Self::new(name, 0o777, Kind::Link(Arc::downgrade(target))))
     }
 
-    /// Deactivate the subtree and wait for its operations to finish
-    fn deactivate(&self) {
-        if let Some(c) = self.children() {
-            let kids: Vec<_> = c.read().values().cloned().collect();
-            for k in kids {
-                k.deactivate();
+    /// The subtree rooted here, parents first
+    fn subtree(self: &Arc<Self>) -> Vec<Arc<KNode>> {
+        let mut out = alloc::vec![self.clone()];
+        let mut i = 0;
+        while i < out.len() {
+            if let Some(c) = out[i].children() {
+                let kids: Vec<_> = c.read().values().cloned().collect();
+                out.extend(kids);
             }
+            i += 1;
         }
-        let prev = self.active.fetch_add(DEACTIVATED, Ordering::AcqRel);
-        if prev < 0 {
-            // Already deactivated: undo
-            self.active.fetch_sub(DEACTIVATED, Ordering::AcqRel);
-            return;
-        }
-        self.drain
-            .wait_event(|| self.active.load(Ordering::Acquire) == DEACTIVATED);
+        out
     }
 
-    /// Remove the node and everything below it (Linux kernfs_remove)
+    /// Remove the node and everything below it (Linux __kernfs_remove):
+    /// under the rwsem the subtree is deactivated (no node can be added
+    /// below a deactivated one, and a node another remover already
+    /// deactivated keeps its single bias); the rwsem is dropped to wait
+    /// until every node's active references drain, which every remover
+    /// waits for; then the node is unlinked
     pub fn remove(self: &Arc<Self>) {
-        self.deactivate();
+        let nodes = {
+            let _w = KERNFS_RWSEM.write();
+            let nodes = self.subtree();
+            for n in &nodes {
+                if n.active.load(Ordering::Acquire) >= 0 {
+                    n.active.fetch_add(DEACTIVATED, Ordering::AcqRel);
+                }
+            }
+            nodes
+        };
+        for n in &nodes {
+            n.drain
+                .wait_event(|| n.active.load(Ordering::Acquire) == DEACTIVATED);
+        }
         let _w = KERNFS_RWSEM.write();
         let Some(p) = self.parent() else { return };
         if let Some(c) = p.children() {
