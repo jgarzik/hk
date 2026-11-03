@@ -401,6 +401,8 @@ fn setlink(sk: &NlSock, h: &Hdr, p: &[u8], nl: NlInfo) -> Result<Done, KernelErr
     let ifm = ifinfo(p)?;
     let a = Attrs::parse(&p[IFINFOMSG_LEN..], IFLA_MAX)?;
     let net = sk.net();
+    // The lookup under RTNL too: an unregistered device is never found
+    let r = rtnl::lock();
     let found = match link_dev(net, &ifm, &a) {
         Err(KernelError::InvalidArgument) if h.ty == RTM_NEWLINK => None,
         r => r?,
@@ -427,7 +429,6 @@ fn setlink(sk: &NlSock, h: &Hdr, p: &[u8], nl: NlInfo) -> Result<Done, KernelErr
         // Renaming is not supported
         return Err(KernelError::OperationNotSupported);
     }
-    let r = rtnl::lock();
     if let Some(mtu) = a.u32(IFLA_MTU)? {
         rtnl::dev_set_mtu(&r, net, &dev, mtu, nl)?;
     }
@@ -512,6 +513,13 @@ fn stats32(dev: &NetDevice) -> Vec<u8> {
 /// Announce a link change to RTNLGRP_LINK
 pub fn notify_link(net: &NetNamespace, dev: &NetDevice, nl: NlInfo) {
     let data = fill_link(dev, RTM_NEWLINK, 0, nl.seq, nl.portid, 0);
+    notify(net, data, RTNLGRP_LINK);
+}
+
+/// RTM_DELLINK for an unregistered device (Linux
+/// unregister_netdevice_many_notify's rtmsg_ifinfo, change ~0)
+pub fn notify_dellink(net: &NetNamespace, dev: &NetDevice) {
+    let data = fill_link(dev, RTM_DELLINK, 0, 0, 0, !0);
     notify(net, data, RTNLGRP_LINK);
 }
 
@@ -962,14 +970,15 @@ fn nd_target(net: &NetNamespace, r: &NdReq) -> Result<(Arc<NetDevice>, neigh::Ke
 /// RTM_NEWNEIGH ("ip neigh add/replace/change"; Linux neigh_add)
 fn newneigh(sk: &NlSock, h: &Hdr, p: &[u8]) -> Result<Done, KernelError> {
     let r = ndmsg(p)?;
+    // Configuration change: under RTNL from the device lookup on (Linux
+    // neigh_add is a locked doit)
+    let _r = rtnl::lock();
     let (dev, key) = nd_target(sk.net(), &r)?;
     let ll = match r.attrs.get(NDA_LLADDR) {
         Some(a) if a.len() < 6 => return Err(KernelError::InvalidArgument),
         Some(a) => Some([a[0], a[1], a[2], a[3], a[4], a[5]]),
         None => None,
     };
-    // Configuration change: under RTNL (Linux neigh_add is a locked doit)
-    let _r = rtnl::lock();
     sk.net().arp.admin_add(&dev, &key, ll, r.state, h.flags)?;
     Ok(Done::Ok)
 }

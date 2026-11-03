@@ -218,6 +218,15 @@ impl NetNamespace {
         // Sleeping sysfs work, after the spin lock
         crate::net::sysfs::netdev_register_kobject(&dev);
     }
+
+    /// Take a device off this namespace's list (Linux
+    /// unlist_netdevice; RTNL held by `net::unregister_netdevice`): no
+    /// lookup finds it again; its ifindex is never reused
+    pub fn unlist_device(&self, dev: &NetDevice) {
+        self.devices
+            .write()
+            .retain(|d| !core::ptr::eq(Arc::as_ptr(d), dev));
+    }
 }
 
 // ============================================================================
@@ -253,9 +262,6 @@ impl NetDeviceOps for LoopbackOps {
     }
 }
 
-/// Static loopback operations
-static LOOPBACK_OPS: LoopbackOps = LoopbackOps;
-
 /// Create a loopback device (down, no addresses)
 fn create_loopback_device() -> Arc<NetDevice> {
     use alloc::string::String;
@@ -263,7 +269,7 @@ fn create_loopback_device() -> Arc<NetDevice> {
         String::from("lo"),
         [0; 6],
         LinkInfo::LOOPBACK,
-        &LOOPBACK_OPS,
+        Arc::new(LoopbackOps),
     ))
 }
 

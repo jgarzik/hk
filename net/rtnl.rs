@@ -54,13 +54,52 @@ pub fn dev_change_flags(
         dev.open()?;
         ifaddr::inetdev_up(rtnl, net, dev);
     } else if !want_up && dev.is_up() {
-        dev.close();
-        ifaddr::inetdev_down(rtnl, net, dev);
+        close(rtnl, net, dev);
     }
     if dev.admin_flags() != old {
         rtnetlink::notify_link(net, dev, nl);
     }
     Ok(())
+}
+
+/// Linux __dev_close + NETDEV_DOWN: the driver stops, the device's
+/// routes and ARP entries go, packet sockets on it get ENETDOWN
+fn close(rtnl: &RtnlGuard, net: &NetNamespace, dev: &Arc<NetDevice>) {
+    dev.close();
+    ifaddr::inetdev_down(rtnl, net, dev);
+    crate::net::packet::netdev_down(net, dev);
+}
+
+/// Close an open device and announce it (Linux dev_close)
+pub fn dev_close(rtnl: &RtnlGuard, net: &NetNamespace, dev: &Arc<NetDevice>) {
+    if dev.is_up() {
+        close(rtnl, net, dev);
+        rtnetlink::notify_link(net, dev, NlInfo::default());
+    }
+}
+
+/// Unregister `dev` (Linux unregister_netdevice_many_notify for one
+/// device, RTNL held): it closes; leaves the namespace's list (its
+/// ifindex is never reused); the driver is detached once no transmit
+/// runs in it (Linux synchronize_net), so no driver callback runs
+/// again; then NETDEV_UNREGISTER: its addresses (RTM_DELADDR), every
+/// route through it and its ARP entries go, packet sockets lose it;
+/// RTM_DELLINK; its sysfs device goes ("remove" uevent). The
+/// `NetDevice` may outlive this in queued packets: it stays down and
+/// driverless.
+pub fn unregister_netdevice(rtnl: &RtnlGuard, dev: &Arc<NetDevice>) {
+    let Some(net) = dev.net() else { return };
+    if dev.is_gone() {
+        return;
+    }
+    dev_close(rtnl, &net, dev);
+    net.unlist_device(dev);
+    dev.detach_ops(rtnl);
+    ifaddr::inetdev_destroy(rtnl, &net, dev);
+    net.arp.flush_dev(dev.ifindex());
+    crate::net::packet::netdev_unregister(rtnl, &net, dev);
+    rtnetlink::notify_dellink(&net, dev);
+    crate::net::sysfs::netdev_unregister_kobject(dev);
 }
 
 /// Change a device's MTU (Linux dev_set_mtu): EINVAL outside the

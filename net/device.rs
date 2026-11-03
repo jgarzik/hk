@@ -236,8 +236,16 @@ pub struct NetDevice {
     /// IFF_RUNNING / IFF_LOWER_UP (derived)
     flags: AtomicU32,
 
-    /// Device operations (provided by driver)
-    ops: &'static dyn NetDeviceOps,
+    /// Device operations (provided by driver): None once the device is
+    /// unregistered (Linux reg_state past NETREG_REGISTERED). Leaf
+    /// `RwLock`, thread context only; written only under RTNL
+    /// (`detach_ops`). Read-held across a driver's `xmit`, so detaching
+    /// waits for transmits in flight (Linux synchronize_net after
+    /// dev_deactivate): after it no driver callback runs.
+    ops: RwLock<Option<Arc<dyn NetDeviceOps>>>,
+
+    /// Largest MTU the driver supports (Linux max_mtu; 0 = no limit)
+    max_mtu: u32,
 
     /// Device statistics
     pub stats: NetDeviceStats,
@@ -276,8 +284,9 @@ pub struct NetDevice {
 
 impl NetDevice {
     /// Create a device named `name` (see `net::dev_alloc_name`)
-    pub fn new(name: String, mac: [u8; 6], link: LinkInfo, ops: &'static dyn NetDeviceOps) -> Self {
+    pub fn new(name: String, mac: [u8; 6], link: LinkInfo, ops: Arc<dyn NetDeviceOps>) -> Self {
         let mtu = ops.mtu();
+        let max_mtu = ops.max_mtu();
         let flags = link.flags;
         Self {
             name,
@@ -286,7 +295,8 @@ impl NetDevice {
             mac,
             mtu: AtomicU32::new(mtu),
             flags: AtomicU32::new(flags),
-            ops,
+            ops: RwLock::new(Some(ops)),
+            max_mtu,
             stats: NetDeviceStats::new(),
             addrs: RwLock::new(IfAddrs::default()),
             net: RwLock::new(Weak::new()),
@@ -373,7 +383,7 @@ impl NetDevice {
 
     /// MTU bounds (min, max; max 0 = unlimited)
     pub fn mtu_range(&self) -> (u32, u32) {
-        (self.link.min_mtu, self.ops.max_mtu())
+        (self.link.min_mtu, self.max_mtu)
     }
 
     /// Store a validated MTU (RTNL held; see `rtnl::dev_set_mtu`)
@@ -447,8 +457,9 @@ impl NetDevice {
     /// Linux __dev_open, running is set before the driver's open, so a
     /// poll scheduled by an interrupt it enables re-enables them.
     pub(crate) fn open(&self) -> Result<(), KernelError> {
+        let ops = self.ops().ok_or(KernelError::NoDevice)?;
         self.running.store(true, Ordering::SeqCst);
-        if let Err(e) = self.ops.open(self) {
+        if let Err(e) = ops.open(self) {
             self.running.store(false, Ordering::SeqCst);
             return Err(e);
         }
@@ -461,7 +472,29 @@ impl NetDevice {
     pub(crate) fn close(&self) {
         self.flags.fetch_and(!flags::IFF_UP, Ordering::AcqRel);
         self.running.store(false, Ordering::SeqCst);
-        let _ = self.ops.stop();
+        if let Some(ops) = self.ops() {
+            let _ = ops.stop();
+        }
+    }
+
+    /// The driver's operations while registered (cloned out: callers
+    /// under RTNL may sleep in them)
+    fn ops(&self) -> Option<Arc<dyn NetDeviceOps>> {
+        self.ops.read().clone()
+    }
+
+    /// Unregistered (Linux dev->reg_state past NETREG_REGISTERED): no
+    /// driver callback runs any more
+    pub fn is_gone(&self) -> bool {
+        self.ops.read().is_none()
+    }
+
+    /// Detach the driver (RTNL held; `net::unregister_netdevice`): waits
+    /// for a transmit in flight; no driver callback runs after it
+    pub(crate) fn detach_ops(&self, _rtnl: &crate::net::rtnl::RtnlGuard) {
+        let ops = self.ops.write().take();
+        // The driver's last reference may go with it: after the unlock
+        drop(ops);
     }
 
     /// Add or remove a promiscuity user (Linux dev_set_promiscuity, RTNL
@@ -471,8 +504,10 @@ impl NetDevice {
         let old = self.promiscuity.load(Ordering::Acquire);
         let new = old.saturating_add_signed(inc);
         self.promiscuity.store(new, Ordering::Release);
-        if (old == 0) != (new == 0) {
-            self.ops.set_promisc(new != 0);
+        if (old == 0) != (new == 0)
+            && let Some(ops) = self.ops()
+        {
+            ops.set_promisc(new != 0);
         }
     }
 
@@ -506,7 +541,13 @@ impl NetDevice {
         }
 
         let len = skb.len() as u64;
-        match self.ops.xmit(skb) {
+        // Held across the driver's transmit: `detach_ops` waits for it
+        let ops = self.ops.read();
+        let Some(ops) = ops.as_ref() else {
+            self.stats.inc_tx_dropped();
+            return Err(KernelError::NetworkDown);
+        };
+        match ops.xmit(skb) {
             Ok(()) => {
                 self.stats.inc_tx_packets();
                 self.stats.add_tx_bytes(len);

@@ -498,12 +498,16 @@ impl NeighTable {
                 dead: false,
             }),
         });
-        let n = self
-            .hash
-            .write()
-            .entry((dev.ifindex(), *key))
-            .or_insert(n)
-            .clone();
+        let n = {
+            let mut h = self.hash.write();
+            // An unregistered device's entries were flushed after it was
+            // marked gone (both under this lock's order): none is added
+            // again (Linux ___neigh_create: parms->dead)
+            if dev.is_gone() {
+                return Err(KernelError::NoDevice);
+            }
+            h.entry((dev.ifindex(), *key)).or_insert(n).clone()
+        };
         self.arm_gc(now);
         Ok(n)
     }

@@ -96,6 +96,10 @@ IP_TRANSPARENT. /proc/net/raw and
 /proc/net/icmp do not exist.
 UDP_CORK/MSG_MORE are not implemented (each send is one datagram) and
 SO_PEEK_OFF is EOPNOTSUPP.
+NIC removal: e1000 leaves the function's bus mastering and memory
+space on (no pci_disable_device) and its BAR mapped (no iounmap); an
+unregistered `NetDevice` lives on while queued skbs reference it
+(no netdev_wait_allrefs; it is down and driverless).
 
 ## Memory management gaps
 

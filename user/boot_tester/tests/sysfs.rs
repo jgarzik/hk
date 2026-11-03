@@ -32,6 +32,7 @@ pub fn run_tests() {
     test_cpu();
     test_bus_usb();
     test_unbind_blk();
+    test_unbind_net();
 }
 
 fn fail(name: &[u8], why: &[u8], v: i64) {
@@ -1164,4 +1165,176 @@ fn test_unbind_blk() {
         Ok(()) => ok(N),
         Err((why, v)) => fail(N, why, v),
     }
+}
+
+/// eth0's administrative flags (SIOCGIFFLAGS) or a negative errno
+fn eth0_flags(set: Option<u16>) -> i64 {
+    use hk_syscall::{sys_ioctl, sys_socket};
+    const SIOCGIFFLAGS: u64 = 0x8913;
+    const SIOCSIFFLAGS: u64 = 0x8914;
+    let fd = sys_socket(2, 2, 0);
+    if fd < 0 {
+        return fd;
+    }
+    let mut ifr = [0u8; 40];
+    ifr[..4].copy_from_slice(b"eth0");
+    let mut r = sys_ioctl(fd as i32, SIOCGIFFLAGS, ifr.as_mut_ptr() as u64);
+    if r == 0
+        && let Some(f) = set
+    {
+        ifr[16..18].copy_from_slice(&f.to_ne_bytes());
+        r = sys_ioctl(fd as i32, SIOCSIFFLAGS, ifr.as_mut_ptr() as u64);
+    }
+    sys_close(fd as u64);
+    if r < 0 { r } else { u16::from_ne_bytes([ifr[16], ifr[17]]) as i64 }
+}
+
+fn eth0_ifindex() -> u64 {
+    let mut b = [0u8; 32];
+    let n = read_file(b"/sys/class/net/eth0/ifindex\0", &mut b);
+    num(&b[..n.max(0) as usize])
+}
+
+/// /proc/net/dev has an eth0 line
+fn proc_has_eth0() -> bool {
+    let mut b = [0u8; 4096];
+    let n = read_file(b"/proc/net/dev\0", &mut b).max(0) as usize;
+    b[..n]
+        .split(|&c| c == b'\n')
+        .any(|l| l.trim_ascii_start().starts_with(b"eth0:"))
+}
+
+/// "<action>@<devpath>" in `buf`
+fn head<'a>(buf: &'a mut [u8; 256], action: &[u8], devpath: &[u8]) -> &'a [u8] {
+    let n = path(buf, &[action, b"@", devpath]).len() - 1;
+    &buf[..n]
+}
+
+/// The NIC behind eth0, unbound from its driver through sysfs and bound
+/// back (Linux unbind_store -> driver remove -> unregister_netdev):
+/// while unbound eth0 is gone from /sys/class/net and /proc/net/dev and
+/// the device has no driver link; "remove" (eth0) and "unbind" (the
+/// device) uevents arrive in that order, "add" and "bind" on rebind;
+/// eth0 comes back with a new ifindex and goes up with its link. Runs
+/// before the network tests configure eth0; its flags are restored
+fn test_unbind_net() {
+    const N: &[u8] = b"SYSFS_UNBIND_NET";
+    let mut lk = [0u8; 256];
+    let n = sys_readlink(b"/sys/class/net/eth0\0".as_ptr(), lk.as_mut_ptr(), 255);
+    if n < 0 {
+        return if host_mode() { skip(N, b"no eth0") } else { fail(N, b"no eth0", n) };
+    }
+    // ../../devices/<parent>/net/eth0
+    let Some(devpath) = lk[..n as usize].strip_prefix(b"../..") else {
+        return fail(N, b"class link", n);
+    };
+    let Some(parent) = devpath.strip_suffix(b"/net/eth0") else {
+        return fail(N, b"not below its device", n);
+    };
+    let name = parent.rsplit(|&c| c == b'/').next().unwrap_or(b"");
+    let mut dl = [0u8; 256];
+    let k = sys_readlink(
+        b"/sys/class/net/eth0/device/driver\0".as_ptr(),
+        dl.as_mut_ptr(),
+        255,
+    );
+    // .../bus/<bus>/drivers/<drv>
+    let drv = &dl[..k.max(0) as usize];
+    let Some(at) = drv.windows(5).position(|w| w == b"/bus/") else {
+        return fail(N, b"driver link", k);
+    };
+    let drv = &drv[at..];
+    let old = eth0_ifindex();
+    let flags = eth0_flags(None);
+    if flags < 0 {
+        return fail(N, b"SIOCGIFFLAGS", flags);
+    }
+    // Up, so unregistering closes it too
+    let r = eth0_flags(Some(flags as u16 | 1));
+    if r < 0 {
+        return fail(N, b"up", r);
+    }
+    let Some(fd) = uevent_sock() else {
+        return fail(N, b"uevent socket", 0);
+    };
+    let r = unbind_rebind(fd, devpath, parent, name, drv);
+    sys_close(fd as u64);
+    if let Err((why, v)) = r {
+        return fail(N, why, v);
+    }
+    let new = eth0_ifindex();
+    if new <= old {
+        return fail(N, b"ifindex not new", new as i64);
+    }
+    let r = eth0_flags(Some(flags as u16 | 1));
+    if r < 0 {
+        return fail(N, b"up again", r);
+    }
+    let ts = hk_syscall::Timespec {
+        tv_sec: 0,
+        tv_nsec: 10_000_000,
+    };
+    let mut up = false;
+    for _ in 0..300 {
+        up = file_is(b"/sys/class/net/eth0/operstate\0", b"up\n");
+        if up {
+            break;
+        }
+        hk_syscall::sys_nanosleep(&ts, core::ptr::null_mut());
+    }
+    let r = eth0_flags(Some(flags as u16));
+    if !up {
+        return fail(N, b"no link after rebind", 0);
+    }
+    if r < 0 {
+        return fail(N, b"restore flags", r);
+    }
+    ok(N);
+}
+
+fn unbind_rebind(
+    fd: i32,
+    devpath: &[u8],
+    parent: &[u8],
+    name: &[u8],
+    drv: &[u8],
+) -> Result<(), (&'static [u8], i64)> {
+    let mut p = [0u8; 256];
+    let mut h = [0u8; 256];
+    let mut buf = [0u8; 2048];
+    let unbind = path(&mut p, &[b"/sys", drv, b"/unbind\0"]);
+    let r = write_str(unbind, name);
+    if r != name.len() as i64 {
+        return Err((b"unbind", r));
+    }
+    if next_event(fd, head(&mut h, b"remove", devpath), &mut buf).is_none() {
+        return Err((b"no remove event", 0));
+    }
+    if next_event(fd, head(&mut h, b"unbind", parent), &mut buf).is_none() {
+        return Err((b"no unbind event", 0));
+    }
+    if stat(b"/sys/class/net/eth0\0").is_ok() {
+        return Err((b"eth0 still in sysfs", 0));
+    }
+    if proc_has_eth0() {
+        return Err((b"eth0 still in /proc/net/dev", 0));
+    }
+    if stat(path(&mut p, &[b"/sys", parent, b"/driver\0"])).is_ok() {
+        return Err((b"driver link stays", 0));
+    }
+    let bind = path(&mut p, &[b"/sys", drv, b"/bind\0"]);
+    let r = write_str(bind, name);
+    if r != name.len() as i64 {
+        return Err((b"bind", r));
+    }
+    if next_event(fd, head(&mut h, b"add", devpath), &mut buf).is_none() {
+        return Err((b"no add event", 0));
+    }
+    if next_event(fd, head(&mut h, b"bind", parent), &mut buf).is_none() {
+        return Err((b"no bind event", 0));
+    }
+    if !proc_has_eth0() {
+        return Err((b"eth0 not back", 0));
+    }
+    Ok(())
 }

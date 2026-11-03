@@ -17,13 +17,18 @@
 //!   stays latched in ICR and fires when IMS is rewritten.
 //! - TX ring full: the frame is dropped (`tx_dropped`, ENOBUFS to the
 //!   sender), like a qdisc drop.
+//! - Remove (Linux e1000_remove): `unregister_netdev` (closes it: NAPI
+//!   off), NAPI off if it never was, the chip reset (masked, DMA
+//!   stopped), the IRQ freed, then the rings and buffers freed.
 //!
 //! ## Locking (doc/LOCKING.md, Network)
 //!
 //! - ISR: touches only MMIO, atomics and `napi_schedule` (IrqSpinlock).
-//! - `rx`: `crate::sync::spin::Mutex`, thread context only (NAPI poll). Leaf.
+//! - `rx`: `crate::sync::spin::Mutex`, thread context only (NAPI poll,
+//!   open, stop, remove). Leaf. Empty once removed.
 //! - `tx`: `crate::sync::spin::Mutex`, thread context only (xmit, NAPI poll reclaim).
 //!   Taken under socket/ARP locks (end of the network lock order). Leaf.
+//!   Empty once removed.
 #![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use alloc::boxed::Box;
@@ -42,6 +47,7 @@ use crate::hw::pci::PciDevice;
 use crate::net;
 use crate::net::dev::{
     NAPI_POLL_WEIGHT, Napi, NapiPoll, napi_complete_done, napi_disable, napi_enable, napi_schedule,
+    netif_napi_del,
 };
 use crate::net::device::{LinkInfo, NetDevice, NetDeviceOps};
 use crate::net::skb::{NET_SKB_PAD, SkBuff};
@@ -192,6 +198,8 @@ struct RxRing {
     bufs: Vec<DmaCoherent>,
     /// Next descriptor to examine
     next: usize,
+    /// NAPI is disabled (by `stop`; enabled from probe and by `open`)
+    napi_off: bool,
 }
 
 /// TX ring: descriptors + bounce buffers
@@ -232,12 +240,15 @@ impl TxRing {
 
 /// e1000 device state
 struct E1000 {
+    /// The PCI function (IRQ, DMA)
+    pci: PciDevice,
     /// Register window (BAR0, 128KB)
     regs: crate::hw::mmio::IoMem,
     /// MAC address
     mac: [u8; 6],
-    rx: Mutex<RxRing>,
-    tx: Mutex<TxRing>,
+    /// None once removed
+    rx: Mutex<Option<RxRing>>,
+    tx: Mutex<Option<TxRing>>,
     napi: Arc<Napi>,
     /// Our net device (weak: the netdev's ops own us)
     netdev: Once<Weak<NetDevice>>,
@@ -298,6 +309,7 @@ impl E1000 {
 
     fn init_rx(&self) {
         let rx = self.rx.lock();
+        let Some(rx) = rx.as_ref() else { return };
         for i in 0..RX_RING_SIZE {
             unsafe {
                 write_volatile(
@@ -326,6 +338,7 @@ impl E1000 {
 
     fn init_tx(&self) {
         let tx = self.tx.lock();
+        let Some(tx) = tx.as_ref() else { return };
         for i in 0..TX_RING_SIZE {
             unsafe {
                 write_volatile(
@@ -366,6 +379,7 @@ impl E1000 {
             return Err(KernelError::MessageTooLong);
         }
         let mut tx = self.tx.lock();
+        let tx = tx.as_mut().ok_or(KernelError::NoDevice)?;
         tx.reclaim();
         let next = (tx.tail + 1) % TX_RING_SIZE;
         if next == tx.clean {
@@ -395,6 +409,7 @@ impl E1000 {
     #[allow(clippy::vec_box)] // skbs travel as Box<SkBuff> through the stack
     fn receive(&self, dev: &Arc<NetDevice>, budget: usize, out: &mut Vec<Box<SkBuff>>) {
         let mut rx = self.rx.lock();
+        let Some(rx) = rx.as_mut() else { return };
         let mut last = None;
         while out.len() < budget {
             let i = rx.next;
@@ -486,7 +501,9 @@ impl NapiPoll for E1000 {
         }
 
         // TX completions
-        self.tx.lock().reclaim();
+        if let Some(tx) = self.tx.lock().as_mut() {
+            tx.reclaim();
+        }
 
         // RX
         let mut frames = Vec::new();
@@ -530,10 +547,35 @@ impl E1000 {
         false
     }
 
-    /// Mask every cause (under `rx`, serialized with `rearm`)
+    /// Mask every cause (under `rx`, serialized with `rearm`); NAPI
+    /// was disabled
     fn mask(&self) {
-        let _rx = self.rx.lock();
+        let mut rx = self.rx.lock();
+        if let Some(rx) = rx.as_mut() {
+            rx.napi_off = true;
+        }
         self.write_reg(reg::IMC, 0xFFFF_FFFF);
+    }
+
+    /// Free the rings and buffers; the chip is reset (no more DMA)
+    fn free_rings(&self) {
+        let rx = self.rx.lock().take();
+        let tx = self.tx.lock().take();
+        let mut mem = Vec::new();
+        if let Some(r) = rx {
+            mem.push(r.desc);
+            mem.extend(r.bufs);
+        }
+        if let Some(t) = tx {
+            mem.push(t.desc);
+            mem.extend(t.bufs);
+        }
+        for m in mem {
+            // SAFETY: the caller reset the chip, so it no longer
+            // accesses the memory; the rings, its only CPU users, are
+            // gone
+            unsafe { crate::hw::dma::dma_free_coherent(&self.pci, m) };
+        }
     }
 }
 
@@ -573,6 +615,9 @@ impl NetDeviceOps for E1000Ops {
         self.device.write_reg(reg::CTRL, c | ctrl::SLU | ctrl::ASDE);
         self.device.write_reg(reg::ITR, 0);
         napi_enable(&self.device.napi);
+        if let Some(rx) = self.device.rx.lock().as_mut() {
+            rx.napi_off = false;
+        }
         self.device.write_reg(reg::IMS, int::ENABLE);
         Ok(())
     }
@@ -605,6 +650,25 @@ impl crate::base::Bound for E1000DeviceWrapper {
             self.device.napi.polls(),
         );
         self.device.write_reg(reg::IMC, 0xFFFF_FFFF);
+    }
+
+    /// Linux e1000_remove
+    fn remove(&self) {
+        let d = &self.device;
+        net::unregister_netdev(&self.netdev);
+        // Closed: NAPI is off; never opened: stop it now (a poll for
+        // causes latched while masked may run), waiting for a running one
+        let off = d.rx.lock().as_ref().is_none_or(|r| r.napi_off);
+        if !off {
+            napi_disable(&d.napi);
+        }
+        // Masks every cause and stops RX/TX DMA
+        d.reset();
+        if let Err(e) = d.pci.unregister_irq_handler() {
+            printkln!("e1000: {}: free IRQ: {}", self.netdev.name(), e);
+        }
+        netif_napi_del(&d.napi);
+        d.free_rings();
     }
 }
 
@@ -665,19 +729,21 @@ fn e1000_probe(
     let tx_bufs = alloc_bufs(pci, TX_RING_SIZE)?;
 
     let mut dev = E1000 {
+        pci: pci.clone(),
         regs,
         mac: [0; 6],
-        rx: Mutex::new(RxRing {
+        rx: Mutex::new(Some(RxRing {
             desc: rx_desc,
             bufs: rx_bufs,
             next: 0,
-        }),
-        tx: Mutex::new(TxRing {
+            napi_off: false,
+        })),
+        tx: Mutex::new(Some(TxRing {
             desc: tx_desc,
             bufs: tx_bufs,
             tail: 0,
             clean: 0,
-        }),
+        })),
         napi: Napi::new(NAPI_POLL_WEIGHT),
         netdev: Once::new(),
         pending_icr: AtomicU32::new(0),
@@ -705,9 +771,9 @@ fn e1000_probe(
     let poller: Weak<dyn NapiPoll> = Arc::downgrade(&device) as Weak<dyn NapiPoll>;
     net::dev::netif_napi_add(&device.napi, poller);
 
-    let ops: &'static dyn NetDeviceOps = Box::leak(Box::new(E1000Ops {
+    let ops: Arc<dyn NetDeviceOps> = Arc::new(E1000Ops {
         device: Arc::clone(&device),
-    }));
+    });
     // RTNL from naming to registration (Linux register_netdev)
     let (rtnl, netdev) = net::alloc_netdev("eth%d", mac, LinkInfo::ETHER, ops);
     device.netdev.call_once(|| Arc::downgrade(&netdev));
@@ -729,6 +795,9 @@ fn e1000_probe(
         Ok(irq) => printkln!("e1000: IRQ {}", irq),
         Err(e) => {
             printkln!("e1000: no IRQ ({}), RX disabled", e);
+            device.reset();
+            device.free_rings();
+            netif_napi_del(&device.napi);
             return Err(KernelError::NoDevice);
         }
     }

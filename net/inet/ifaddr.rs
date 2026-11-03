@@ -308,6 +308,16 @@ pub fn inetdev_down(rtnl: &RtnlGuard, net: &NetNamespace, dev: &Arc<NetDevice>) 
     net.arp.flush_dev(dev.ifindex());
 }
 
+/// Device unregistered (Linux inetdev_event NETDEV_UNREGISTER ->
+/// inetdev_destroy, then fib_netdev_event -> fib_disable_ip(force)):
+/// every address is deleted and announced, then every route through it
+pub fn inetdev_destroy(rtnl: &RtnlGuard, net: &NetNamespace, dev: &Arc<NetDevice>) {
+    while let Some(ifa) = dev.inet_addrs().into_iter().next() {
+        inet_del_ifa(rtnl, net, dev, &ifa, NlInfo::default());
+    }
+    fib::fib_disable_dev(rtnl, net, dev, true);
+}
+
 /// Type of `addr` in the namespace (Linux inet_addr_type)
 pub fn inet_addr_type(net: &NetNamespace, addr: Ipv4Addr) -> RouteType {
     net.fib.addr_type(addr)

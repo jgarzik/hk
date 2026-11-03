@@ -163,9 +163,14 @@ fn dev_ifreq(net: &NetNamespace, cmd: u32, ifr: &mut Ifreq) -> Result<(), Kernel
         ifr.set_name(dev.name());
         return Ok(());
     }
-    if cmd == SIOCSIFFLAGS || cmd == SIOCSIFMTU {
+    // Changes look the device up under RTNL (Linux dev_ifsioc runs
+    // under rtnl_lock): an unregistered device is never found
+    let r = if cmd == SIOCSIFFLAGS || cmd == SIOCSIFMTU {
         need_admin()?;
-    }
+        Some(rtnl::lock())
+    } else {
+        None
+    };
     let dev = dev_by_name(net, ifr.name())?;
     match cmd {
         SIOCGIFINDEX => ifr.set_i32(dev.ifindex() as i32),
@@ -177,16 +182,16 @@ fn dev_ifreq(net: &NetNamespace, cmd: u32, ifr: &mut Ifreq) -> Result<(), Kernel
             ifr.raw[18..24].copy_from_slice(&dev.mac());
         }
         SIOCSIFFLAGS => {
-            let r = rtnl::lock();
-            rtnl::dev_change_flags(&r, net, &dev, ifr.short() as u32, NlInfo::default())?;
+            let r = r.as_ref().ok_or(KernelError::InvalidArgument)?;
+            rtnl::dev_change_flags(r, net, &dev, ifr.short() as u32, NlInfo::default())?;
         }
         SIOCSIFMTU => {
             let mtu = ifr.i32();
             if mtu < 0 {
                 return Err(KernelError::InvalidArgument);
             }
-            let r = rtnl::lock();
-            rtnl::dev_set_mtu(&r, net, &dev, mtu as u32, NlInfo::default())?;
+            let r = r.as_ref().ok_or(KernelError::InvalidArgument)?;
+            rtnl::dev_set_mtu(r, net, &dev, mtu as u32, NlInfo::default())?;
         }
         _ => return Err(KernelError::NotTty),
     }

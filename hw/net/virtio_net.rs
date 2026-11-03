@@ -25,13 +25,18 @@
 //!   virtqueue_napi_complete).
 //! - Link: VIRTIO_NET_S_LINK_UP from the config status field (carrier
 //!   on/off); without STATUS the link is always up.
+//! - Remove (Linux virtnet_remove): `unregister_netdev` (closes it: NAPI
+//!   off), NAPI off if it never was, the IRQ freed, then the device is
+//!   reset and the rings and bounce buffers freed (`del_vqs`).
 //!
 //! ## Locking (doc/LOCKING.md, Network)
 //!
 //! - ISR callbacks: lock-free (VringCb, atomics, `napi_schedule`).
-//! - `rx`: `crate::sync::spin::Mutex`, thread context only (NAPI poll, open). Leaf.
+//! - `rx`: `crate::sync::spin::Mutex`, thread context only (NAPI poll,
+//!   open, stop, remove). Leaf. Empty once removed.
 //! - `tx`: `crate::sync::spin::Mutex`, thread context only (xmit, NAPI poll reclaim);
 //!   taken under socket/ARP locks (end of the network lock order). Leaf.
+//!   Empty once removed.
 #![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use alloc::boxed::Box;
@@ -49,6 +54,7 @@ use crate::hw::virtio::{self, VirtioDevice, VirtioDriver, VirtioIrq, Virtqueue};
 use crate::net;
 use crate::net::dev::{
     NAPI_POLL_WEIGHT, Napi, NapiPoll, napi_complete_done, napi_disable, napi_enable, napi_schedule,
+    netif_napi_del,
 };
 use crate::net::device::{LinkInfo, NetDevice, NetDeviceOps};
 use crate::net::skb::{NET_SKB_PAD, SkBuff};
@@ -106,6 +112,8 @@ impl Pool {
 struct RxQueue {
     vq: Virtqueue,
     pool: Pool,
+    /// NAPI is disabled (by `stop`; enabled from probe and by `open`)
+    napi_off: bool,
 }
 
 struct TxQueue {
@@ -140,8 +148,9 @@ impl TxQueue {
 struct VirtioNet {
     vdev: Arc<VirtioDevice>,
     mac: [u8; 6],
-    rx: Mutex<RxQueue>,
-    tx: Mutex<TxQueue>,
+    /// None once removed
+    rx: Mutex<Option<RxQueue>>,
+    tx: Mutex<Option<TxQueue>>,
     /// IRQ-side handle on the RX queue's interrupt suppression
     rx_cb: VringCb,
     napi: Arc<Napi>,
@@ -185,6 +194,7 @@ impl VirtioNet {
             return Err(KernelError::MessageTooLong);
         }
         let mut tx = self.tx.lock();
+        let tx = tx.as_mut().ok_or(KernelError::NoDevice)?;
         tx.reclaim();
         let Some(i) = tx.free.pop() else {
             return Err(KernelError::NoBufferSpace);
@@ -242,6 +252,7 @@ impl VirtioNet {
     /// Returns the buffers consumed (bad frames count against the budget)
     fn receive(&self, dev: &Arc<NetDevice>, budget: usize, out: &mut Vec<Box<SkBuff>>) -> usize {
         let mut rx = self.rx.lock();
+        let Some(rx) = rx.as_mut() else { return 0 };
         let mut n = 0;
         while n < budget {
             let Some((i, len)) = rx.vq.get() else { break };
@@ -265,11 +276,11 @@ impl VirtioNet {
     /// meanwhile and the poll must run again
     fn rearm(&self) -> bool {
         let rx = self.rx.lock();
+        let Some(rx) = rx.as_ref() else { return false };
         if !self.netdev().is_some_and(|d| d.netif_running()) {
             return false;
         }
         let pending = !rx.vq.enable_cb();
-        drop(rx);
         pending || self.config_pending.load(Ordering::SeqCst)
     }
 }
@@ -295,7 +306,9 @@ impl NapiPoll for VirtioNet {
             self.update_carrier(d);
         }
 
-        self.tx.lock().reclaim();
+        if let Some(tx) = self.tx.lock().as_mut() {
+            tx.reclaim();
+        }
 
         let mut frames = Vec::new();
         let work = match &dev {
@@ -347,6 +360,9 @@ impl NetDeviceOps for VirtioNetOps {
         let d = &self.device;
         d.update_carrier(dev);
         napi_enable(&d.napi);
+        if let Some(rx) = d.rx.lock().as_mut() {
+            rx.napi_off = false;
+        }
         if d.rearm() {
             d.rx_cb.disable();
             napi_schedule(&d.napi);
@@ -357,7 +373,10 @@ impl NetDeviceOps for VirtioNetOps {
     /// NAPI off (waits for a running poll), then suppress RX interrupts
     fn stop(&self) -> Result<(), KernelError> {
         napi_disable(&self.device.napi);
-        let _rx = self.device.rx.lock();
+        let mut rx = self.device.rx.lock();
+        if let Some(rx) = rx.as_mut() {
+            rx.napi_off = true;
+        }
         self.device.rx_cb.disable();
         Ok(())
     }
@@ -381,6 +400,37 @@ impl crate::base::Bound for VirtioNetWrapper {
             self.device.napi.polls(),
         );
         self.device.rx_cb.disable();
+    }
+
+    /// Linux virtnet_remove
+    fn remove(&self) {
+        let d = &self.device;
+        net::unregister_netdev(&self.netdev);
+        // Closed: NAPI is off; never opened (or closed and polled for a
+        // config change): stop it now, waiting for a running poll
+        let off = d.rx.lock().as_ref().is_none_or(|q| q.napi_off);
+        if !off {
+            napi_disable(&d.napi);
+        }
+        d.vdev.free_irq();
+        netif_napi_del(&d.napi);
+        let rx = d.rx.lock().take();
+        let tx = d.tx.lock().take();
+        let (Some(rx), Some(tx)) = (rx, tx) else {
+            return;
+        };
+        if d.vdev.reset().is_err() {
+            // The device may still use the memory: leak it
+            printkln!("virtio-net: {}: reset failed", self.netdev.name());
+            return;
+        }
+        // A failed reset leaks the rings rather than freeing them live
+        let _ = d.vdev.del_vqs([rx.vq, tx.vq]);
+        for p in [rx.pool, tx.pool] {
+            // SAFETY: the device is reset (no more DMA to the buffers)
+            // and the queues that used them are gone
+            unsafe { crate::hw::dma::dma_free_coherent(&*d.vdev, p.mem) };
+        }
     }
 }
 
@@ -407,6 +457,7 @@ fn setup_queues(vdev: &VirtioDevice) -> Result<(RxQueue, TxQueue), KernelError> 
     let mut rx = RxQueue {
         pool: Pool::new(vdev, rvq.num())?,
         vq: rvq,
+        napi_off: false,
     };
     let tx = TxQueue {
         pool: Pool::new(vdev, tvq.num())?,
@@ -439,8 +490,8 @@ impl VirtioDriver for VirtioNetDriver {
         let device = Arc::new(VirtioNet {
             vdev: Arc::clone(&vdev),
             mac,
-            rx: Mutex::new(rx),
-            tx: Mutex::new(tx),
+            rx: Mutex::new(Some(rx)),
+            tx: Mutex::new(Some(tx)),
             rx_cb,
             napi: Napi::new(NAPI_POLL_WEIGHT),
             netdev: Once::new(),
@@ -457,11 +508,13 @@ impl VirtioDriver for VirtioNetDriver {
             })?;
         vdev.ready();
         // Buffers were posted before DRIVER_OK; notify only now (spec 3.1.1)
-        device.rx.lock().vq.kick();
+        if let Some(rx) = device.rx.lock().as_ref() {
+            rx.vq.kick();
+        }
 
-        let ops: &'static dyn NetDeviceOps = Box::leak(Box::new(VirtioNetOps {
+        let ops: Arc<dyn NetDeviceOps> = Arc::new(VirtioNetOps {
             device: Arc::clone(&device),
-        }));
+        });
         // RTNL from naming to registration (Linux register_netdev)
         let (rtnl, netdev) = net::alloc_netdev("eth%d", mac, LinkInfo::ETHER, ops);
         device.netdev.call_once(|| Arc::downgrade(&netdev));
