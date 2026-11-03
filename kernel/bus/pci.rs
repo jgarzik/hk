@@ -252,63 +252,24 @@ pub trait PciConfigAccess: Send + Sync {
 /// Memory-mapped PCI config space access. Works on all architectures.
 /// Address formula: Base + (Bus << 20) | (Dev << 15) | (Func << 12) | Offset
 pub struct EcamConfigAccess {
-    /// Base virtual address of the mapped ECAM window
-    base: *mut u8,
-    /// Bytes mapped at `base` (bus 0 only: 1 MB)
-    len: usize,
+    /// The mapped ECAM window (bus 0 only: 1 MB)
+    regs: crate::mmio::IoMem,
 }
 
-// SAFETY: the window is device memory reached only by volatile access
-// at checked offsets; the device serializes config cycles
-unsafe impl Send for EcamConfigAccess {}
-// SAFETY: as above
-unsafe impl Sync for EcamConfigAccess {}
-
 impl EcamConfigAccess {
-    /// Create ECAM accessor
-    ///
-    /// # Safety
-    /// `len` bytes at `base_addr` are a mapped ECAM window that stays
-    /// mapped for the lifetime of this struct.
-    pub const unsafe fn new(base_addr: *mut u8, len: usize) -> Self {
-        Self {
-            base: base_addr,
-            len,
-        }
+    /// ECAM accessor over a mapped window
+    pub const fn new(regs: crate::mmio::IoMem) -> Self {
+        Self { regs }
     }
 
-    /// The register of `T` at `reg` of bus/dev/func, if inside the
-    /// window and aligned (else the device reads as absent)
-    #[inline]
-    fn reg<T>(&self, bus: u8, dev: u8, func: u8, reg: u8) -> Option<*mut T> {
-        let size = core::mem::size_of::<T>();
-        if dev > 31 || func > 7 || !(reg as usize).is_multiple_of(size) {
-            return None;
-        }
-        let off = ((bus as usize) << 20)
-            | ((dev as usize) << 15)
-            | ((func as usize) << 12)
-            | reg as usize;
-        if off + size > self.len {
-            return None;
-        }
-        // SAFETY: inside the window (checked above)
-        Some(unsafe { self.base.add(off) }.cast::<T>())
-    }
-
-    fn read<T: Copy>(&self, bus: u8, dev: u8, func: u8, reg: u8, absent: T) -> T {
-        match self.reg::<T>(bus, dev, func, reg) {
-            // SAFETY: an aligned register inside the mapped window
-            Some(p) => unsafe { core::ptr::read_volatile(p) },
-            None => absent,
-        }
-    }
-
-    fn write<T: Copy>(&self, bus: u8, dev: u8, func: u8, reg: u8, val: T) {
-        if let Some(p) = self.reg::<T>(bus, dev, func, reg) {
-            // SAFETY: an aligned register inside the mapped window
-            unsafe { core::ptr::write_volatile(p, val) }
-        }
+    /// The window offset of `reg` of bus/dev/func (None: no such device)
+    fn off(dev: u8, func: u8, bus: u8, reg: u8) -> Option<usize> {
+        (dev <= 31 && func <= 7).then_some(
+            ((bus as usize) << 20)
+                | ((dev as usize) << 15)
+                | ((func as usize) << 12)
+                | reg as usize,
+        )
     }
 }
 
@@ -316,27 +277,39 @@ impl EcamConfigAccess {
 /// a master abort reads) and writes are dropped
 impl PciConfigAccess for EcamConfigAccess {
     fn read32(&self, bus: u8, dev: u8, func: u8, offset: u8) -> u32 {
-        self.read(bus, dev, func, offset, u32::MAX)
+        Self::off(dev, func, bus, offset)
+            .and_then(|o| self.regs.try_read32(o))
+            .unwrap_or(u32::MAX)
     }
 
     fn write32(&self, bus: u8, dev: u8, func: u8, offset: u8, val: u32) {
-        self.write(bus, dev, func, offset, val)
+        if let Some(o) = Self::off(dev, func, bus, offset) {
+            self.regs.try_write32(o, val);
+        }
     }
 
     fn read16(&self, bus: u8, dev: u8, func: u8, offset: u8) -> u16 {
-        self.read(bus, dev, func, offset & 0xFE, u16::MAX)
+        Self::off(dev, func, bus, offset & 0xFE)
+            .and_then(|o| self.regs.try_read16(o))
+            .unwrap_or(u16::MAX)
     }
 
     fn read8(&self, bus: u8, dev: u8, func: u8, offset: u8) -> u8 {
-        self.read(bus, dev, func, offset, u8::MAX)
+        Self::off(dev, func, bus, offset)
+            .and_then(|o| self.regs.try_read8(o))
+            .unwrap_or(u8::MAX)
     }
 
     fn write16(&self, bus: u8, dev: u8, func: u8, offset: u8, val: u16) {
-        self.write(bus, dev, func, offset & 0xFE, val)
+        if let Some(o) = Self::off(dev, func, bus, offset & 0xFE) {
+            self.regs.try_write16(o, val);
+        }
     }
 
     fn write8(&self, bus: u8, dev: u8, func: u8, offset: u8, val: u8) {
-        self.write(bus, dev, func, offset, val)
+        if let Some(o) = Self::off(dev, func, bus, offset) {
+            self.regs.try_write8(o, val);
+        }
     }
 }
 
@@ -358,9 +331,11 @@ pub fn init_port_io() {
 /// # Safety
 /// `len` bytes at `base_addr` are a mapped ECAM window, never unmapped.
 pub unsafe fn init_ecam(base_addr: *mut u8, len: usize) {
-    // Leak a box to get 'static lifetime
+    let base = core::ptr::NonNull::new(base_addr).expect("ECAM base");
     // SAFETY: the caller's mapping, per this fn's contract
-    let accessor = Box::leak(Box::new(unsafe { EcamConfigAccess::new(base_addr, len) }));
+    let regs = unsafe { crate::mmio::IoMem::new(base, len) };
+    // Leak a box to get 'static lifetime
+    let accessor = Box::leak(Box::new(EcamConfigAccess::new(regs)));
     PCI_CONFIG.call_once(|| accessor as &dyn PciConfigAccess);
 }
 
@@ -1043,7 +1018,8 @@ impl Bus for PciBus {
                 // ECAM needs 1MB for bus 0 (32 devices × 8 functions × 4KB)
                 let ecam_phys = 0x40_1000_0000u64; // QEMU virt high ECAM
                 let ecam_size = 0x10_0000u64; // 1MB for bus 0
-                let ecam_virt = CurrentArch::ioremap(ecam_phys, ecam_size)
+                // SAFETY: QEMU virt's ECAM window, device memory
+                let ecam_virt = unsafe { CurrentArch::ioremap(ecam_phys, ecam_size) }
                     .expect("PCI: Failed to ioremap ECAM region");
                 // SAFETY: ecam_size bytes just mapped, never unmapped
                 unsafe {

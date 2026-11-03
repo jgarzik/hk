@@ -375,9 +375,10 @@ fn handle_exception(uframe: &UserFrame, vector: u64) {
     // SAFETY: a field load and store
     let orig = unsafe { uframe.with(|r| core::mem::replace(&mut r.orig_rax, u64::MAX)) };
     let error_code = if has_error_code(vector) { orig } else { 0 };
-    // The registers as the exception left them (handling may sleep, so
-    // never a borrow of the frame itself)
-    let frame = &uframe.get();
+    // The registers it needs, as the exception left them (handling may
+    // sleep, so never a borrow of the frame itself)
+    // SAFETY: field loads
+    let (rip, rflags, cs, rsp) = unsafe { uframe.with(|r| (r.rip, r.rflags, r.cs, r.rsp)) };
 
     // Read CR2 for page faults
     let cr2: u64;
@@ -390,7 +391,7 @@ fn handle_exception(uframe: &UserFrame, vector: u64) {
         // CR2 is read: interrupts back on if the faulting context had
         // them (Linux do_user_addr_fault), so a fault that sleeps (the
         // mmap_lock, file I/O) does not hold them off
-        if frame.rflags & 0x200 != 0 {
+        if rflags & 0x200 != 0 {
             enable();
         }
         let Err(err) = handle_page_fault(error_code, cr2) else {
@@ -421,7 +422,7 @@ fn handle_exception(uframe: &UserFrame, vector: u64) {
         // Kernel-mode fault inside a user-copy routine (out of memory
         // included, Linux kernelmode_fixup_or_oops): resume at its
         // fixup, which reports the uncopied bytes (-> EFAULT)
-        if let Some(fixup) = super::uaccess::uaccess_fixup(frame.rip) {
+        if let Some(fixup) = super::uaccess::uaccess_fixup(rip) {
             // SAFETY: a field store
             unsafe { uframe.with(|r| r.rip = fixup) };
             return;
@@ -438,10 +439,9 @@ fn handle_exception(uframe: &UserFrame, vector: u64) {
     // Any other exception raised by user code (#DE, #UD, #GP, ...) is the
     // task's fault, not the kernel's: signal it instead of halting. #DF
     // and #MC are never a task's: they halt below (paranoid, IST stack)
-    if frame.cs & 3 == 3 && !matches!(vector, 8 | 14 | 18) {
+    if cs & 3 == 3 && !matches!(vector, 8 | 14 | 18) {
         use crate::signal::{SIGBUS, SIGFPE, SIGILL, SIGSEGV, SIGTRAP};
         // Linux arch/x86/kernel/traps.c: signal, si_code, si_addr
-        let rip = frame.rip;
         let (sig, code, addr) = match vector {
             0 => (SIGFPE, si_code::FPE_INTDIV, rip),    // #DE
             1 => (SIGTRAP, si_code::TRAP_TRACE, rip),   // #DB
@@ -475,17 +475,17 @@ fn handle_exception(uframe: &UserFrame, vector: u64) {
     // either, so it became a double fault, running on its IST stack
     // (Linux exc_double_fault, handle_stack_overflow)
     let guard = |a| crate::mm::vmstack::in_guard(a);
-    if matches!(vector, 8 | 14) && (guard(cr2) || guard(frame.rsp)) {
+    if matches!(vector, 8 | 14) && (guard(cr2) || guard(rsp)) {
         panic!(
             "kernel stack overflow: RIP={:#x} RSP={:#x} CR2={:#x} (tid {})",
-            frame.rip,
-            frame.rsp,
+            rip,
+            rsp,
             cr2,
             crate::task::percpu::current_tid()
         );
     }
 
-    die(frame, vector as u8, error_code, cr2)
+    die(&uframe.get(), vector as u8, error_code, cr2)
 }
 
 /// A fatal kernel-mode exception (Linux die + "Fatal exception"

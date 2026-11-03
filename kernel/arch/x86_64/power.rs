@@ -69,7 +69,8 @@ pub fn init(info: &PowerInfo) {
 fn reset_map(r: ResetReg) -> Option<Reset> {
     match r.space {
         Space::Io => Some(Reset::Io(r.addr as u16, r.value)),
-        Space::Mem => ioremap(r.addr, 1)
+        // SAFETY: the FADT reset register, chipset MMIO
+        Space::Mem => unsafe { ioremap(r.addr, 1) }
             .ok()
             .map(|virt| Reset::Mem(virt as usize, r.value)),
     }

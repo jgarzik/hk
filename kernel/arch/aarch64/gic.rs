@@ -58,8 +58,9 @@ fn gicr_base() -> u64 {
 
 /// Distributor window: 64KB of registers
 const GICD_LEN: usize = 0x1_0000;
-/// Redistributor windows: one per CPU, back to back
-const GICR_LEN: usize = GICR_STRIDE as usize * crate::cpumask::NR_CPUS;
+/// Redistributor windows: one per CPU, back to back, in QEMU virt's
+/// redistributor region [0x080A0000, 0x09000000) (the UART follows it)
+const GICR_LEN: usize = 0x0900_0000 - 0x080A_0000;
 
 /// The distributor and redistributor register windows, in the device
 /// block the boot page tables map for good (`kmap::map_io`)
@@ -77,6 +78,7 @@ fn window(addr: u64) -> (&'static IoMem, usize) {
         a if (GICD_BASE..GICD_BASE + GICD_LEN as u64).contains(&a) => {
             (&GICD, (a - GICD_BASE) as usize)
         }
+        // Below GICR_BASE wraps to a huge offset: the window panics
         a => (&GICR, a.wrapping_sub(GICR_BASE) as usize),
     }
 }

@@ -849,7 +849,8 @@ impl XhciController {
         // Map MMIO region using ioremap (allocates virtual addresses from dedicated region)
         let bar_size = self.pci_dev.bar_size(0);
 
-        match CurrentArch::ioremap(self.mmio_base, bar_size) {
+        // SAFETY: BAR0 of this xHCI, its register space
+        match unsafe { CurrentArch::ioremap(self.mmio_base, bar_size) } {
             Ok(virt) => {
                 // Update all base addresses to virtual address
                 let virt_base = virt as u64;

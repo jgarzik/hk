@@ -259,8 +259,9 @@ impl IoremapOps for X86_64Arch {
         ioremap::init();
     }
 
-    fn ioremap(phys_addr: u64, size: u64) -> Result<*mut u8, Self::IoremapError> {
-        ioremap::ioremap(phys_addr, size)
+    unsafe fn ioremap(phys_addr: u64, size: u64) -> Result<*mut u8, Self::IoremapError> {
+        // SAFETY: the trait's contract
+        unsafe { ioremap::ioremap(phys_addr, size) }
     }
 
     fn iounmap(virt_addr: *mut u8, size: u64) {

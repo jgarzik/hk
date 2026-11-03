@@ -312,7 +312,10 @@ fn tlb_canary() -> Result<(), (&'static str, u64)> {
 #[cfg(feature = "lockdep")]
 fn canary_run(f1: u64, f2: u64, cpu: u32) -> Result<(u64, u64), (&'static str, u64)> {
     use crate::arch::{CurrentArch, IoremapOps};
-    let va = CurrentArch::ioremap(f1, 4096).map_err(|_| ("tlb_canary_ioremap", 0))? as u64;
+    // SAFETY: a frame this test owns and does not touch through the
+    // direct map while the uncached alias exists (lockdep self-test)
+    let va =
+        unsafe { CurrentArch::ioremap(f1, 4096) }.map_err(|_| ("tlb_canary_ioremap", 0))? as u64;
     CANARY_VA.store(va, Ordering::Release);
     CANARY_PHASE.store(0, Ordering::Release);
     let r = (|| {

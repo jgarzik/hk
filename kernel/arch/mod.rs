@@ -577,7 +577,12 @@ pub trait IoremapOps {
     ///
     /// # Returns
     /// Virtual address pointer to the mapped region, or error
-    fn ioremap(phys_addr: u64, size: u64) -> Result<*mut u8, Self::IoremapError>;
+    ///
+    /// # Safety
+    /// [phys_addr, phys_addr + size) is device memory or firmware-owned
+    /// memory (ACPI tables), not RAM the kernel uses: an uncached alias
+    /// of direct-mapped RAM corrupts it.
+    unsafe fn ioremap(phys_addr: u64, size: u64) -> Result<*mut u8, Self::IoremapError>;
 
     /// Unmap a previously mapped device memory region
     ///

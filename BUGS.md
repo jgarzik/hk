@@ -40,7 +40,9 @@ blocks belong in a missing wrapper:
 
 Linux path names are any bytes except '/' and NUL. hk's VFS holds names
 as `String`, so the path copy-in takes only valid UTF-8 and rejects
-anything else. Mapping the other bytes to chars would let two different
+anything else. The same copy-in serves the other string arguments
+(symlink targets, mq, key, inotify/fanotify, swapon and acct names),
+so those also refuse non-UTF-8 bytes. Mapping the other bytes to chars would let two different
 byte names alias one String.
 
 The callers turn every copy-in error into EFAULT, including the

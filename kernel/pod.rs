@@ -12,6 +12,8 @@
 //! them from [`pod!`], which checks at compile time that every field is
 //! itself plain data and that the fields fill the struct (no padding):
 //! a padded ABI struct needs explicit padding fields, as Linux's have.
+//! (A type that is only ever read in may implement [`FromBytes`] by hand,
+//! with a SAFETY comment, if it must keep implicit padding.)
 
 use core::mem::size_of;
 
@@ -108,12 +110,6 @@ pub const fn pod_field<S, F: Pod>(_f: fn(&S) -> F) -> usize {
     size_of::<F>()
 }
 
-/// As [`pod_field`], for [`from_bytes!`]
-#[doc(hidden)]
-pub const fn from_bytes_field<S, F: FromBytes>(_f: fn(&S) -> F) -> usize {
-    size_of::<F>()
-}
-
 /// `pod!(Type { field, ... })`: Type is [`FromBytes`] and [`IntoBytes`].
 /// Name every field once (checked); fails to compile if a field is not
 /// plain data or the struct has padding.
@@ -139,23 +135,6 @@ macro_rules! pod {
     )+};
 }
 
-/// `from_bytes!(Type { field, ... })`: Type is [`FromBytes`] only (it may
-/// have padding: never copied out). Name every field once (checked).
-#[macro_export]
-macro_rules! from_bytes {
-    ($($t:ident { $($f:ident),* $(,)? });+ $(;)?) => {$(
-        const _: () = {
-            let _ = |x: $t| {
-                let $t { $($f: _),* } = x;
-            };
-            let _ = 0 $(+ $crate::pod::from_bytes_field(|s: &$t| s.$f))*;
-        };
-        // SAFETY: every field is FromBytes (from_bytes_field's bound), so
-        // any bytes in them are valid; padding holds no value
-        unsafe impl $crate::pod::FromBytes for $t {}
-    )+};
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,14 +147,6 @@ mod tests {
     }
     crate::pod!(Pair { a, b });
 
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct Padded {
-        a: u8,
-        b: u32,
-    }
-    crate::from_bytes!(Padded { a, b });
-
     #[test]
     fn round_trip() {
         let p = Pair { a: 1, b: [2, 3] };
@@ -185,6 +156,5 @@ mod tests {
         let mut z = Pair::zeroed();
         z.as_bytes_mut()[0] = 9;
         assert_eq!(z.a, 9);
-        assert_eq!(Padded::read_from(&[1, 0, 0, 0, 2, 0, 0, 0]).unwrap().b, 2);
     }
 }

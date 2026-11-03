@@ -95,7 +95,8 @@ impl Bar {
         if len < 0x100 || !dev.bar_is_mmio(0) {
             return None;
         }
-        let virt = CurrentArch::ioremap(phys, len).ok()?;
+        // SAFETY: the controller's memory BAR (checked above)
+        let virt = unsafe { CurrentArch::ioremap(phys, len) }.ok()?;
         Some(Self {
             virt,
             len: len as u32,

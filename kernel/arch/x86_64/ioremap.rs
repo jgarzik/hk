@@ -211,9 +211,10 @@ pub fn init() {
 /// # Returns
 /// Virtual address pointer (with same offset as physical address had)
 ///
-/// The physical range should be MMIO, not RAM (an uncached alias of
-/// RAM would conflict with the direct map's attributes).
-pub fn ioremap(phys_addr: u64, size: u64) -> Result<*mut u8, IoremapError> {
+/// # Safety
+/// The range is MMIO or firmware memory, not RAM the kernel uses (an
+/// uncached alias of RAM conflicts with the direct map's attributes).
+pub unsafe fn ioremap(phys_addr: u64, size: u64) -> Result<*mut u8, IoremapError> {
     if size == 0 {
         return Err(IoremapError::InvalidSize);
     }

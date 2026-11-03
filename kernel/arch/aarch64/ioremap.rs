@@ -200,7 +200,9 @@ pub fn init() {
 /// For addresses in the boot identity-mapped device region (0-1GB),
 /// returns the physical address directly (already mapped with device attrs).
 /// For other addresses, allocates from the ioremap region.
-pub fn ioremap(phys_addr: u64, size: u64) -> Result<*mut u8, IoremapError> {
+/// # Safety
+/// The range is device or firmware memory, not RAM the kernel uses.
+pub unsafe fn ioremap(phys_addr: u64, size: u64) -> Result<*mut u8, IoremapError> {
     if size == 0 {
         return Err(IoremapError::InvalidSize);
     }

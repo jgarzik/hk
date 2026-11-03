@@ -353,7 +353,8 @@ fn for_each_table(
 /// The signature of the table at `phys` (maps just its header)
 fn table_signature(phys: u64) -> Option<[u8; 4]> {
     let size = core::mem::size_of::<SdtHeader>() as u64;
-    let ptr = ioremap(phys, size).ok()?;
+    // SAFETY: an ACPI table (firmware memory, reserved from RAM use)
+    let ptr = unsafe { ioremap(phys, size) }.ok()?;
     // SAFETY: the header is mapped; the signature is its first 4 bytes
     let sig = unsafe { core::ptr::read_unaligned(ptr as *const [u8; 4]) };
     iounmap(ptr, size);

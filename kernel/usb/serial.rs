@@ -60,7 +60,8 @@ impl BusDriver for UsbSerialBusDriver {
 
         // Off the console list; a printk holding a snapshot of the list
         // may still call it, so it stays allocated and just goes quiet
-        if let Some(c) = USB_SERIAL_CONSOLE.lock().take() {
+        let gone = USB_SERIAL_CONSOLE.lock().take();
+        if let Some(c) = gone {
             c.alive.store(false, core::sync::atomic::Ordering::Release);
             crate::console::unregister_console(c.name);
         }

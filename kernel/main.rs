@@ -381,7 +381,8 @@ fn kmain() -> ! {
         }
 
         // Map local interrupt controller MMIO region
-        match CurrentArch::ioremap(acpi_info.interrupt_controller_base, 4096) {
+        // SAFETY: the interrupt controller's registers from ACPI/DTB
+        match unsafe { CurrentArch::ioremap(acpi_info.interrupt_controller_base, 4096) } {
             Err(e) => {
                 printkln!("SMP: Failed to ioremap interrupt controller: {:?}", e);
             }

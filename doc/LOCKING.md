@@ -2814,6 +2814,7 @@ context. `dma_alloc_coherent` allocates frames (thread context only).
 | `USB_CONTROLLER` | `Mutex<Option<XhciController>>` | Global xHCI controller access |
 | `XHCI_IRQ_STATE.*` | `AtomicU64`, `AtomicBool` | ISR state (lock-free) |
 | `USB_OUTPUT_ACTIVE` | `AtomicBool` | Console recursion guard |
+| `USB_SERIAL_CONSOLE` (usb/serial.rs) | `Mutex<Option<&'static UsbSerialConsole>>` | The registered console (leaked: printk may hold it): a leaf, released before `unregister_console` takes `CONSOLE_REGISTRY` |
 | `BOUNCE` (usb/serial.rs) | `Mutex<[u8; 256]>` | USB serial console DMA buffer: `try_lock` only (a busy buffer drops the output), held across the bulk transfer, so it orders before `USB_CONTROLLER` |
 
 DMA buffers never live on a kernel stack (stacks are not in the linear

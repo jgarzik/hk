@@ -47,7 +47,8 @@ impl IoMem {
     /// register block), not RAM: writes through the window must not
     /// change memory the kernel uses.
     pub unsafe fn ioremap(phys: u64, len: usize) -> Option<Self> {
-        let p = CurrentArch::ioremap(phys, len as u64).ok()?;
+        // SAFETY: the caller's MMIO range (this fn's contract)
+        let p = unsafe { CurrentArch::ioremap(phys, len as u64) }.ok()?;
         // SAFETY: ioremap mapped `len` bytes of the caller's MMIO range,
         // and hk never unmaps it
         Some(unsafe { Self::new(NonNull::new(p)?, len) })
@@ -106,7 +107,7 @@ impl IoMem {
 }
 
 macro_rules! access {
-    ($($t:ty: $read:ident, $write:ident, $try_read:ident);* $(;)?) => {
+    ($($t:ty: $read:ident, $write:ident, $try_read:ident, $try_write:ident);* $(;)?) => {
         impl IoMem {$(
             /// Volatile read of the register at `off` (panics outside)
             #[inline]
@@ -128,13 +129,27 @@ macro_rules! access {
                 // SAFETY: as above (checked by try_reg)
                 self.try_reg::<$t>(off).map(|p| unsafe { read_volatile(p) })
             }
+
+            /// Write the register at `off`; false (nothing written)
+            /// outside the window
+            #[inline]
+            pub fn $try_write(&self, off: usize, v: $t) -> bool {
+                match self.try_reg::<$t>(off) {
+                    Some(p) => {
+                        // SAFETY: as above (checked by try_reg)
+                        unsafe { write_volatile(p, v) };
+                        true
+                    }
+                    None => false,
+                }
+            }
         )*}
     };
 }
 
 access! {
-    u8: read8, write8, try_read8;
-    u16: read16, write16, try_read16;
-    u32: read32, write32, try_read32;
-    u64: read64, write64, try_read64;
+    u8: read8, write8, try_read8, try_write8;
+    u16: read16, write16, try_read16, try_write16;
+    u32: read32, write32, try_read32, try_write32;
+    u64: read64, write64, try_read64, try_write64;
 }

@@ -50,10 +50,7 @@ impl ScanoutSurface {
         // INVARIANT: the size the firmware reports bounds the rows used,
         // and a row's pixels fit its pitch (a bad mode shrinks, never
         // writes past the mapping)
-        let bpp = match fb_info.format {
-            PixelFormat::Rgb565 => 2,
-            _ => 4,
-        };
+        let bpp = fb_info.format.bytes_per_pixel().max(1);
         let pitch = fb_info.pitch.max(1);
         let rows = (fb_info.size / pitch as u64).min(u32::MAX as u64) as u32;
         Self {
@@ -402,7 +399,9 @@ pub unsafe fn init_graphics_console() -> bool {
     };
 
     // Map the framebuffer
-    let fb_ptr = match CurrentArch::ioremap(fb_info.phys_addr, fb_info.size) {
+    // SAFETY: the firmware framebuffer, video memory outside the RAM
+    // memblock hands out
+    let fb_ptr = match unsafe { CurrentArch::ioremap(fb_info.phys_addr, fb_info.size) } {
         Ok(ptr) => ptr,
         Err(_) => {
             crate::printkln!("graphics: failed to map framebuffer");
