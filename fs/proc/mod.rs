@@ -14,6 +14,8 @@
 //!
 //! These files can be opened and passed to `setns(2)` to join namespaces.
 
+mod array;
+
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -967,25 +969,10 @@ fn pid_content(file: Option<&File>, pid: Pid, g: PidGen) -> Result<Vec<u8>, Kern
 const PID_FILES: &[(&str, u64, u16, PidGen)] = &[
     ("cgroup", 102, 0o444, PidGen::Pub(gen_cgroup_content)),
     ("maps", 103, 0o444, PidGen::Mm(gen_maps)),
-    (
-        "status",
-        105,
-        0o444,
-        PidGen::Pub(super::proc_array::gen_status),
-    ),
-    ("stat", 106, 0o444, PidGen::Pub(super::proc_array::gen_stat)),
-    (
-        "cmdline",
-        107,
-        0o444,
-        PidGen::Pub(super::proc_array::gen_cmdline),
-    ),
-    (
-        "environ",
-        108,
-        0o400,
-        PidGen::Mm(super::proc_array::gen_environ),
-    ),
+    ("status", 105, 0o444, PidGen::Pub(array::gen_status)),
+    ("stat", 106, 0o444, PidGen::Pub(array::gen_stat)),
+    ("cmdline", 107, 0o444, PidGen::Pub(array::gen_cmdline)),
+    ("environ", 108, 0o400, PidGen::Mm(array::gen_environ)),
 ];
 
 fn pid_file(name: &str) -> Option<(u64, u16, PidGen)> {

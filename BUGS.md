@@ -663,7 +663,7 @@ Found by the review of the P0 series; each confirmed against the code
 expected to fix it; "next batch" means the next fix batch.
 
 7. **/proc/<pid>/* owner not refreshed on stat** (fix in V2).
-   `fs/procfs.rs:370`: the owner (task_dump_owner) is updated
+   `fs/proc/mod.rs`: the owner (task_dump_owner) is updated
    at lookup and in permission() only; Linux pid_revalidate updates it
    on every walk. Scenario: stat environ of a uid-1000 child, child
    sets `PR_SET_DUMPABLE 0`, stat again: hk still says uid 1000

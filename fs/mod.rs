@@ -45,8 +45,7 @@ pub mod sync;
 pub mod cgroupfs;
 pub mod cpio;
 pub mod devtmpfs;
-mod proc_array;
-pub mod procfs;
+pub mod proc;
 pub mod ramfs;
 pub mod vfat;
 
@@ -63,9 +62,7 @@ pub use inode::{DevId, DeviceType, FileType, Gid, Inode, InodeAttr, InodeMode, I
 pub use mount::{Mount, do_mount, do_umount, follow_mount, mount_at_path, umount_flags};
 pub use namei::{LookupFlags, lookup_one, lookup_path, lookup_path_at, lookup_path_flags};
 pub use path_ref::Path;
-pub use procfs::{
-    NamespaceType, PROCFS_FILE_OPS, PROCFS_TYPE, ProcfsInodeData, ProcfsInodeWrapper,
-};
+pub use proc::{NamespaceType, PROCFS_FILE_OPS, PROCFS_TYPE, ProcfsInodeData, ProcfsInodeWrapper};
 pub use ramfs::{
     RAMFS_FILE_OPS, RAMFS_INODE_OPS, RAMFS_TYPE, RamfsInodeData, ramfs_create_blkdev,
     ramfs_create_chrdev, ramfs_create_dir, ramfs_create_dir_with_owner,

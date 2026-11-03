@@ -526,7 +526,7 @@ const ESRCH: i64 = 3;
 /// * -EINVAL if nstype doesn't match the namespace type
 /// * -EPERM if permission denied
 pub fn sys_setns(fd: i32, nstype: i32) -> i64 {
-    use crate::fs::procfs::{NamespaceType, ProcfsInodeData, ProcfsInodeWrapper};
+    use crate::fs::proc::{NamespaceType, ProcfsInodeData, ProcfsInodeWrapper};
     use crate::task::fdtable::get_task_fd;
     use crate::task::percpu::current_tid;
 
@@ -578,7 +578,7 @@ pub fn sys_setns(fd: i32, nstype: i32) -> i64 {
     }
 
     // Get the TID for the target PID
-    let target_tid = match crate::fs::procfs::get_tid_for_pid(target_pid) {
+    let target_tid = match crate::fs::proc::get_tid_for_pid(target_pid) {
         Some(tid) => tid,
         None => return -ESRCH,
     };
