@@ -163,6 +163,13 @@ pub trait InodeOps: Send + Sync {
     /// Look up a child entry in a directory inode
     fn lookup(&self, dir: &Inode, name: &[u8]) -> Result<Arc<Inode>, KernelError>;
 
+    /// A cached dentry of this inode is still good for the walk (Linux
+    /// d_revalidate): false drops it and the walk looks the name up
+    /// again. Default yes; procfs says no once its task or fd is gone.
+    fn revalidate(&self, _inode: &Inode) -> bool {
+        true
+    }
+
     /// Access check for `mask` (MAY_* bits) by `cred` (Linux
     /// ->permission). Default: generic_permission (mode bits plus
     /// capability overrides); /proc/sys overrides it with sysctl_perm.

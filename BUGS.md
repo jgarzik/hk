@@ -664,19 +664,6 @@ sched pid 0, flock/POSIX release, signalfd reader, errno flattening.
   contradict the code in `task/id.rs:87`, `ns/mod.rs:558`,
   `ns/uts.rs:224`, `task/rlimit.rs:264`, `task/misc.rs:1311`.
 
-## P0 review findings (open)
-
-Found by the review of the P0 series; each confirmed against the code
-(and Linux 6.8 where semantics matter). "Fix in" names the phase
-expected to fix it; "next batch" means the next fix batch.
-
-7. **/proc/<pid>/* owner not refreshed on stat** (fix in V2).
-   `fs/proc/mod.rs`: the owner (task_dump_owner) is updated
-   at lookup and in permission() only; Linux pid_revalidate updates it
-   on every walk. Scenario: stat environ of a uid-1000 child, child
-   sets `PR_SET_DUMPABLE 0`, stat again: hk still says uid 1000
-   (Linux 0).
-
 ## P2 review findings (open)
 From the P2 /code-review (unverified). Tag = when to fix.
 1. **pcp_free drains the hot end** (next batch).

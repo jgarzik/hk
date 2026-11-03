@@ -71,9 +71,16 @@ pub fn get_tid_for_pid(pid: Pid) -> Option<crate::task::Tid> {
 /// - offset 1: /proc/<pid>/ns
 /// - offset 2+: /proc/<pid>/ns/<type>
 fn pid_ino(pid: Pid, offset: u64) -> u64 {
-    // Use high range to avoid conflicts with static inodes
-    0x1000_0000 + pid * 1000 + offset
+    // Above every allocated inode: a marker bit, the pid, then a 32-bit
+    // offset (fixed entries below 2^24, fd links and fdinfo files at
+    // FD_INO / FDINFO_INO plus the fd)
+    (1 << 62) | (pid << 32) | offset
 }
+
+/// Offset base of /proc/<pid>/fd/<fd>
+const FD_INO: u64 = 1 << 24;
+/// Offset base of /proc/<pid>/fdinfo/<fd>
+const FDINFO_INO: u64 = 2 << 24;
 
 /// Content generator function type
 pub type ContentGenerator = fn() -> Vec<u8>;
@@ -393,6 +400,48 @@ impl InodeOps for ProcfsInodeOps {
         crate::sysctl::permission(ctl, cred, mask)
     }
 
+    /// Linux pid_revalidate / tid_fd_revalidate: an entry of a task that
+    /// is gone, or of an fd no longer open, is invalid; a live one takes
+    /// the task's current owner (pid_update_inode)
+    fn revalidate(&self, inode: &Inode) -> bool {
+        let Some(private) = inode.get_private() else {
+            return true;
+        };
+        let Some(w) = private
+            .as_ref()
+            .as_any()
+            .downcast_ref::<ProcfsInodeWrapper>()
+        else {
+            return true;
+        };
+        let data = w.0.read();
+        let Some(pid) = data.pid() else {
+            return true;
+        };
+        let fd = match &*data {
+            ProcfsInodeData::FdSymlink { fd, .. } | ProcfsInodeData::FdinfoFile { fd, .. } => {
+                Some(*fd)
+            }
+            _ => None,
+        };
+        drop(data);
+        if !task_exists(pid) {
+            return false;
+        }
+        if let Some(fd) = fd {
+            let open = get_tid_for_pid(pid)
+                .and_then(crate::task::fdtable::get_task_fd)
+                .is_some_and(|t| t.lock().get(fd).is_some());
+            if !open {
+                return false;
+            }
+        }
+        let (uid, gid) = dump_owner(pid);
+        inode.set_uid(uid);
+        inode.set_gid(gid);
+        true
+    }
+
     fn lookup(&self, dir: &Inode, name: &[u8]) -> Result<Arc<Inode>, KernelError> {
         // Every /proc name is text: anything else names nothing
         let name = core::str::from_utf8(name).map_err(|_| KernelError::NotFound)?;
@@ -566,7 +615,7 @@ fn lookup_pid_entry(dir: &Inode, pid: Pid, name: &str) -> Result<Arc<Inode>, Ker
         }
         "task" => Ok(create_dir_inode(
             dir,
-            pid_ino(pid, 105),
+            pid_ino(pid, 120),
             ProcfsInodeData::PidTaskDirectory { pid },
         )),
         "fdinfo" => {
@@ -741,8 +790,8 @@ fn lookup_pid_fd_entry(dir: &Inode, pid: Pid, name: &str) -> Result<Arc<Inode>, 
     // Create symlink inode for /proc/<pid>/fd/<n>
     let sb = dir.superblock().ok_or(KernelError::Io)?;
     let inode = Arc::new(Inode::new(
-        pid_ino(pid, 200 + fd as u64), // offset 200+ for fd symlinks
-        InodeMode::symlink(),          // lrwxrwxrwx
+        pid_ino(pid, FD_INO + fd as u64), // fd symlinks
+        InodeMode::symlink(),             // lrwxrwxrwx
         0,
         0,
         0,
@@ -786,8 +835,8 @@ fn lookup_pid_fdinfo_entry(dir: &Inode, pid: Pid, name: &str) -> Result<Arc<Inod
     // Create regular file inode for /proc/<pid>/fdinfo/<n>
     let sb = dir.superblock().ok_or(KernelError::Io)?;
     let inode = Arc::new(Inode::new(
-        pid_ino(pid, 500 + fd as u64), // offset 500+ for fdinfo files
-        InodeMode::regular(0o444),     // r--r--r--
+        pid_ino(pid, FDINFO_INO + fd as u64), // fdinfo files
+        InodeMode::regular(0o444),            // r--r--r--
         0,
         0,
         0,
@@ -1514,7 +1563,7 @@ fn readdir_emit_pid_entries(pid: Pid, ctx: &mut DirContext) -> Result<(), Kernel
     }
 
     if !ctx.emit(DirEntry {
-        ino: pid_ino(pid, 105),
+        ino: pid_ino(pid, 120),
         file_type: FileType::Directory,
         name: Vec::from(&b"task"[..]),
     }) {
@@ -1599,7 +1648,7 @@ fn readdir_emit_fd_entries(pid: Pid, ctx: &mut DirContext) -> Result<(), KernelE
         let should_continue = ctx.emit_at(
             fd as u64 + 2,
             DirEntry {
-                ino: pid_ino(pid, 200 + fd as u64),
+                ino: pid_ino(pid, FD_INO + fd as u64),
                 file_type: FileType::Symlink,
                 name: Vec::from(name.as_bytes()),
             },
@@ -1638,7 +1687,7 @@ fn readdir_emit_fdinfo_entries(pid: Pid, ctx: &mut DirContext) -> Result<(), Ker
         let should_continue = ctx.emit_at(
             fd as u64 + 2,
             DirEntry {
-                ino: pid_ino(pid, 500 + fd as u64),
+                ino: pid_ino(pid, FDINFO_INO + fd as u64),
                 file_type: FileType::Regular,
                 name: Vec::from(name.as_bytes()),
             },
@@ -1831,12 +1880,42 @@ fn build_sys(sb: &Arc<SuperBlock>, root: &Arc<Inode>) {
 }
 
 /// Mount function for procfs
+/// Every procfs superblock, for proc_flush_pid
+static PROC_SBS: crate::sync::spin::Mutex<Vec<alloc::sync::Weak<SuperBlock>>> =
+    crate::sync::spin::Mutex::new(Vec::new());
+
+/// A released task's /proc entries leave every procfs dcache (Linux
+/// proc_flush_pid): /proc/<tid>, and the process directory with it
+/// when the task was its leader, /proc/<pid>/task/<tid> otherwise
+pub fn proc_flush_pid(pid: Pid, tid: Pid) {
+    let sbs: Vec<Arc<SuperBlock>> = {
+        let mut v = PROC_SBS.lock();
+        v.retain(|w| w.strong_count() != 0);
+        v.iter().filter_map(alloc::sync::Weak::upgrade).collect()
+    };
+    let name = |n: Pid| alloc::format!("{}", n).into_bytes();
+    for sb in sbs {
+        let Some(root) = sb.get_root() else {
+            continue;
+        };
+        root.remove_child(&name(tid));
+        if pid != tid
+            && let Some(task) = root
+                .lookup_child(&name(pid))
+                .and_then(|d| d.lookup_child(b"task"))
+        {
+            task.remove_child(&name(tid));
+        }
+    }
+}
+
 fn procfs_mount(
     fs_type: &'static FileSystemType,
     _opts: &[u8],
 ) -> Result<Arc<SuperBlock>, KernelError> {
     // Create superblock
     let sb = SuperBlock::new(fs_type, &PROCFS_SUPER_OPS, 0);
+    PROC_SBS.lock().push(Arc::downgrade(&sb));
 
     // Create root inode (directory)
     let root_inode = Arc::new(Inode::new(

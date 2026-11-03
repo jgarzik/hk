@@ -1693,6 +1693,13 @@ Mount fields -> d_lock; nothing takes RENAME_LOCK under a Mount lock. `Dentry::a
 one dentry per name. Deviation: Linux readers retry a seqlock instead of
 taking a lock.
 
+A cached child is revalidated (`InodeOps::revalidate`, Linux
+d_revalidate) after its d_lock is released, inside whatever i_rwsem the
+walk holds: procfs's takes TASKLIST (read) and the task's fd table
+lock. `proc::proc_flush_pid` runs after a task leaves TASKLIST: it
+collects the procfs superblocks under `PROC_SBS` (spin Mutex, leaf),
+releases it, then drops dentries (d_lock).
+
 #### Mount Namespace & Mount Objects
 
 **Location:** `fs/mount.rs`

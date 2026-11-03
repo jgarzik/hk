@@ -111,7 +111,7 @@ pub fn lookup_one(parent: &Arc<Dentry>, name: &[u8]) -> Result<Arc<Dentry>, Kern
     if name.len() > NAME_MAX {
         return Err(KernelError::NameTooLong);
     }
-    if let Some(child) = parent.lookup_child(name) {
+    if let Some(child) = cached(parent, name) {
         return if child.is_negative() {
             Err(KernelError::NotFound)
         } else {
@@ -134,6 +134,19 @@ pub fn lookup_one(parent: &Arc<Dentry>, name: &[u8]) -> Result<Arc<Dentry>, Kern
     }
 }
 
+/// The dcache's child `name` of `parent` if it is still valid (Linux
+/// d_revalidate); an invalid one is dropped from the tree
+fn cached(parent: &Arc<Dentry>, name: &[u8]) -> Option<Arc<Dentry>> {
+    let child = parent.lookup_child(name)?;
+    match child.get_inode() {
+        Some(i) if !i.i_op.revalidate(&i) => {
+            parent.remove_child(name);
+            None
+        }
+        _ => Some(child),
+    }
+}
+
 /// Longest name of one path component (Linux NAME_MAX)
 pub const NAME_MAX: usize = 255;
 
@@ -144,7 +157,7 @@ fn lookup_slow(parent: &Arc<Dentry>, name: &[u8]) -> Result<Arc<Dentry>, KernelE
     if name.len() > NAME_MAX {
         return Err(KernelError::NameTooLong);
     }
-    if let Some(child) = parent.lookup_child(name) {
+    if let Some(child) = cached(parent, name) {
         return if child.is_negative() {
             Err(KernelError::NotFound)
         } else {

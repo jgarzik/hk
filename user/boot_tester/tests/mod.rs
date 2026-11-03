@@ -98,6 +98,7 @@ pub mod preempt;
 pub mod prctl;
 pub mod prctl_extra;
 pub mod proc_pid;
+pub mod proc_dcache;
 pub mod process;
 pub mod process_vm;
 pub mod procfs_access;
@@ -186,6 +187,7 @@ pub fn run_all_tests() {
     mounts::run_tests();
     mountinfo::run_tests();
     pnode::run_tests();
+    proc_dcache::run_tests();
     process::run_tests();
     file_io::run_tests();
     bigio::run_tests();
