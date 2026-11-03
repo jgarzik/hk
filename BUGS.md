@@ -749,10 +749,3 @@ Found during T0 (2026-10-19). Tag = when to fix.
    `check-stress` boots: poll reported POLLOUT for a nonblocking
    connect to a just-closed loopback port, but no ECONNREFUSED was
    pending).
-11. **xHCI transfer timeout on USB storage** (Dell xHCI work): one
-   x86 `make check` in a parallel gate (2026-11-03) logged
-   `xHCI: wait_for_transfer TIMEOUT slot=1 dci=3` twice; those bulk
-   transfers failed with EIO, so VFAT_GETDENTS (mkdir) and
-   VFAT_LSEEK_SET failed. The rerun passed. Either a completion is
-   missed (an event-ring/interrupt race in `hw/usb/xhci.rs`) or the
-   loaded host stalled QEMU's emulated xHCI past 5 s.
