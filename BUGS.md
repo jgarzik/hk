@@ -834,7 +834,7 @@ Linux's equivalent.
   wheel lock, PacketSock bind read-then-store, Zone watermarks stored
   apart from zone.lock, filemap mkclean load+store losing A/D bits,
   cgroup controllers' check-then-act counters, Disk open counters
-  outside open_mutex, ScsiDisk.state check-then-store.
+  outside open_mutex.
 - doc/LOCKING.md 5.4 cites Inode mode/uid/gid, MsgQueue and
   SemArray.pending as correct atomic use; they are among the above.
 

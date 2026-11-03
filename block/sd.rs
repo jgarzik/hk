@@ -20,7 +20,7 @@
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 
-use core::sync::atomic::{AtomicU8, Ordering};
+use crate::sync::spin::Mutex;
 
 use super::blkdev::{
     Bio, BioOp, BlockDevice, BlockDriver, Disk, QueueLimits, RequestQueue, SECTOR_SHIFT, bio_endio,
@@ -38,7 +38,6 @@ use super::scsi::{
 ///
 /// These states control device lifecycle and I/O acceptance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
 pub enum ScsiDeviceState {
     /// Device has been created but not yet running
     Created = 0,
@@ -70,20 +69,21 @@ impl ScsiDeviceState {
     }
 }
 
-impl From<u8> for ScsiDeviceState {
-    fn from(val: u8) -> Self {
-        match val {
-            0 => ScsiDeviceState::Created,
-            1 => ScsiDeviceState::Running,
-            2 => ScsiDeviceState::Cancel,
-            3 => ScsiDeviceState::Del,
-            4 => ScsiDeviceState::Quiesce,
-            5 => ScsiDeviceState::Offline,
-            6 => ScsiDeviceState::TransportOffline,
-            7 => ScsiDeviceState::Block,
-            _ => ScsiDeviceState::Offline, // Default to offline for invalid values
+/// A state change Linux scsi_device_set_state allows (a change to the
+/// same state is always fine)
+fn legal(from: ScsiDeviceState, to: ScsiDeviceState) -> bool {
+    use ScsiDeviceState::*;
+    from == to
+        || match to {
+            Running => matches!(from, Created | Offline | TransportOffline | Quiesce | Block),
+            Offline | TransportOffline => matches!(from, Created | Running | Quiesce | Block),
+            Cancel => matches!(
+                from,
+                Created | Running | Quiesce | Offline | TransportOffline
+            ),
+            Del => matches!(from, Created | Cancel | Offline | TransportOffline | Block),
+            _ => false,
         }
-    }
 }
 
 /// SCSI Disk device state
@@ -94,8 +94,10 @@ pub struct ScsiDisk {
     target: u8,
     /// Logical Unit Number
     lun: u8,
-    /// Device state (atomic for lock-free access)
-    state: AtomicU8,
+    /// Device state (Linux sdev_state under state_mutex): changed only
+    /// by `set_state`'s legal transitions, read by each command (spin
+    /// leaf, never held across I/O)
+    state: Mutex<ScsiDeviceState>,
     /// Disk capacity in sectors
     capacity_sectors: u64,
     /// Sector size in bytes (typically 512)
@@ -144,7 +146,7 @@ impl ScsiDisk {
             host,
             target,
             lun,
-            state: AtomicU8::new(ScsiDeviceState::Running as u8),
+            state: Mutex::new(ScsiDeviceState::Running),
             capacity_sectors,
             sector_size,
             vendor: inq.vendor,
@@ -154,36 +156,35 @@ impl ScsiDisk {
 
     /// Get current device state
     pub fn state(&self) -> ScsiDeviceState {
-        ScsiDeviceState::from(self.state.load(Ordering::Acquire))
+        *self.state.lock()
     }
 
-    /// Set device state (returns previous state)
-    pub fn set_state(&self, new_state: ScsiDeviceState) -> ScsiDeviceState {
-        let old = self.state.swap(new_state as u8, Ordering::AcqRel);
-        ScsiDeviceState::from(old)
-    }
-
-    /// Transition to Cancel state (beginning of removal)
-    ///
-    /// Returns true if transition was successful.
-    pub fn cancel(&self) -> bool {
-        let current = self.state();
-        if current == ScsiDeviceState::Running {
-            self.set_state(ScsiDeviceState::Cancel);
-            true
-        } else {
-            false
+    /// Change the state if Linux allows the transition
+    /// (scsi_device_set_state); EINVAL otherwise
+    pub fn set_state(&self, new: ScsiDeviceState) -> Result<(), KernelError> {
+        let mut st = self.state.lock();
+        let ok = legal(*st, new);
+        if !ok {
+            return Err(KernelError::InvalidArgument);
         }
+        *st = new;
+        Ok(())
     }
 
-    /// Transition to Del state (final removal)
+    /// Begin removal (Linux scsi_remove_device: SDEV_CANCEL); false if
+    /// it is already being removed
+    pub fn cancel(&self) -> bool {
+        let mut st = self.state.lock();
+        if st.is_removing() {
+            return false;
+        }
+        *st = ScsiDeviceState::Cancel;
+        true
+    }
+
+    /// Finish removal (SDEV_DEL)
     pub fn mark_deleted(&self) {
-        self.set_state(ScsiDeviceState::Del);
-    }
-
-    /// Mark device as offline (transport error)
-    pub fn mark_offline(&self) {
-        self.set_state(ScsiDeviceState::Offline);
+        let _ = self.set_state(ScsiDeviceState::Del);
     }
 
     /// Check if device accepts I/O
@@ -435,6 +436,18 @@ pub fn create_scsi_disk(
 
 #[cfg(test)]
 mod tests {
+    use super::{ScsiDeviceState as S, legal};
+
+    #[test]
+    fn state_transitions() {
+        assert!(legal(S::Running, S::Cancel));
+        assert!(legal(S::Cancel, S::Del));
+        assert!(!legal(S::Del, S::Running));
+        assert!(!legal(S::Cancel, S::Running));
+        assert!(!legal(S::Running, S::Del));
+        assert!(legal(S::Offline, S::Running));
+    }
+
     use super::*;
 
     #[test]
