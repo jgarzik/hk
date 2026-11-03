@@ -2969,7 +2969,6 @@ thread context, the driver completes it from its interrupt handler and
 | blk-mq hardware queue (`BlkMq.hctxs[i]`) | `IrqSpinlock` over the dispatch list and the driver queue (virtio-blk: one virtqueue and its tags; Linux virtio_blk_vq.lock) | thread (dispatch) and hardirq (completion, restart) | leaf: `queue_rq`/`complete` only touch the ring, MMIO and the lock-free DMA API (`DMA_OPS` is a `Once`), never allocate or sleep; taken under `IRQ_TABLE` in the ISR |
 | `Completion.done` | `IrqSpinlock<u32>` | any context | -> its wait queue head -> run-queue lock (the wakeup is issued under it, Linux complete()) |
 | `RamDisk.pages` | spin `Mutex` | thread only (bio-based driver) | leaf |
-| devtmpfs `PENDING` | spin `Mutex` (nodes queued before VFS init) | thread only | leaf (holds the devtmpfs root read under it) |
 
 Rules:
 
@@ -3546,7 +3545,7 @@ this is the interrupt-safety invariant:
 | `RTNL` and every network `spin::Mutex`/`RwLock` | net/ | `sync::Mutex` / `Mutex` / `RwLock` | Configuration, sockets, tables, queues (3.10) |
 | Driver queue locks (e1000 / virtio-net `rx`, `tx`) | hw/net/ | `Mutex` | Rings: NAPI poll, xmit, open/stop |
 | `Softnet.backlog` | net/core/dev.rs | `Mutex` | `netif_rx` (lo), softnet |
-| `BLKDEV_REGISTRY`, `MAJORS`, `RamDisk.pages`, devtmpfs `PENDING` | block/, fs/devtmpfs.rs | `RwLock` / `Mutex` | Block device lookup, majors, RAM disk pages, early device nodes (3.10) |
+| `BLKDEV_REGISTRY`, `MAJORS`, `RamDisk.pages` | block/ | `RwLock` / `Mutex` | Block device lookup, majors, RAM disk pages (3.10) |
 | `Disk.open_mutex` | block/blkdev.rs | sleeping `sync::Mutex` | Block device open/release, partition scans |
 | Sleeping locks (`sync::Mutex`, `RwSem`) | sync/ | sleeping | Never in IRQ or atomic context (`might_sleep`) |
 

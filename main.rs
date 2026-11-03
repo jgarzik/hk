@@ -435,6 +435,14 @@ fn kmain() -> ! {
     crate::net::start_threads();
     CurrentArch::enable_interrupts();
 
+    // Linux order: mnt_init (start_kernel), then do_basic_setup:
+    // driver_init (devtmpfs), core initcalls (ksysfs), fs initcalls
+    // (chr_dev_init), then device initcalls (bus probes below)
+    mnt_init();
+    fs::devtmpfs::init();
+    ksysfs::init();
+    chr_dev_init();
+
     // ========================================================================
     // Bus/Driver Model: Layered device discovery
     // ========================================================================
@@ -492,10 +500,8 @@ fn kmain() -> ! {
     // Kept for device_shutdown at power-off/restart
     crate::bus::bus::set_system_buses(bus_manager);
 
-    // ========================================================================
-    // Phase 5: VFS Initialization
-    // ========================================================================
-    init_vfs_core();
+    // RAM disk rd0 (Linux brd_init, a device initcall)
+    let _ = crate::block::create_ramdisk(0, DEFAULT_RAMDISK_SIZE_MB);
 
     // pid 1's root and working directory: the VFS exists now
     if let Some(fs) = crate::fs::FsStruct::new_root() {
@@ -598,19 +604,13 @@ fn try_init(path: &str, args: &cmdline::InitArgs) -> i32 {
 /// Default RAM disk size in MB
 const DEFAULT_RAMDISK_SIZE_MB: u64 = 8;
 
-/// Initialize the core VFS with ramfs as root
-///
-/// This is the unified VFS initialization shared between architectures.
-fn init_vfs_core() {
-    use crate::block::create_ramdisk;
-    use crate::fs::chardev::DevId;
+/// The VFS core (Linux mnt_init): filesystem types, kernfs/sysfs, the
+/// ramfs root with /dev
+fn mnt_init() {
     use fs::{RAMFS_TYPE, do_mount, init_fs_registry, ramfs_create_dir};
 
     init_fs_registry();
     fs::sysfs::init();
-    ksysfs::init();
-
-    // Mount ramfs as root filesystem
     let root_mount = match do_mount(&RAMFS_TYPE, None) {
         Ok(m) => m,
         Err(e) => {
@@ -618,27 +618,25 @@ fn init_vfs_core() {
             return;
         }
     };
-
     fs::DCACHE.set_root(root_mount.root.clone());
+    let _ = ramfs_create_dir(&root_mount.root, b"dev");
+}
 
-    let root_dentry = root_mount.root.clone();
+/// Memory and tty character devices (Linux chr_dev_init, fs_initcall)
+fn chr_dev_init() {
+    use crate::fs::chardev::DevId;
 
-    // Create /dev directory
-    let dev_dentry = match ramfs_create_dir(&root_dentry, b"dev") {
-        Ok(d) => d,
-        Err(_) => return,
-    };
-
-    // Register built-in character devices (null, zero)
     crate::fs::chardev::register_builtin_chardevs();
 
-    // Register TTY character devices (serial, etc.)
+    // Linux chr_dev_init ends in tty_init
     crate::tty::init_tty_chardevs();
 
     // Device nodes: in devtmpfs, and the console's in the root's /dev
     // (opened for init before anything mounts devtmpfs; Linux needs
     // /dev/console in the initramfs)
-    fs::devtmpfs::init();
+    let Ok(dev_dentry) = fs::lookup_path(b"/dev") else {
+        return;
+    };
     use crate::fs::chardev::major as chardev_major;
     let mut nodes = alloc::vec![
         ("null", DevId::new(chardev_major::MEM, 3), 0o666),
@@ -659,9 +657,6 @@ fn init_vfs_core() {
         let _ = fs::ramfs_create_chrdev(&dev_dentry, name.as_bytes(), dev, mode);
         fs::devtmpfs::device_add(name, dev, false, mode);
     }
-
-    // RAM disk rd0 (8MB)
-    let _ = create_ramdisk(0, DEFAULT_RAMDISK_SIZE_MB);
 
     printkln!("VFS: ok");
 }
