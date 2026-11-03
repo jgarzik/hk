@@ -171,15 +171,18 @@ impl ScsiDisk {
         Ok(())
     }
 
-    /// Begin removal (Linux scsi_remove_device: SDEV_CANCEL); false if
-    /// it is already being removed
+    /// Begin removal (Linux __scsi_remove_device: SDEV_CANCEL, else
+    /// straight to SDEV_DEL where CANCEL is not allowed, e.g. from
+    /// Block); false if neither is (it is already being removed)
     pub fn cancel(&self) -> bool {
         let mut st = self.state.lock();
-        if st.is_removing() {
-            return false;
+        for to in [ScsiDeviceState::Cancel, ScsiDeviceState::Del] {
+            if *st != to && legal(*st, to) {
+                *st = to;
+                return true;
+            }
         }
-        *st = ScsiDeviceState::Cancel;
-        true
+        false
     }
 
     /// Finish removal (SDEV_DEL)
@@ -374,7 +377,10 @@ impl SdDisk {
     /// (del_gendisk: sysfs, devtmpfs, cached pages; open files keep a
     /// dead device), then SDEV_DEL
     pub fn remove(&self) {
-        self.sdev.cancel();
+        // Already being removed: the other remover finishes it
+        if !self.sdev.cancel() {
+            return;
+        }
         let all = disk_bdevs(&self.bdev.disk);
         let pages: u64 = all.iter().map(|b| b.bd_inode.i_data.nrpages()).sum();
         del_gendisk(&self.bdev.disk);

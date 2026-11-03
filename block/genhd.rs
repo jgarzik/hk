@@ -312,8 +312,10 @@ pub fn del_gendisk(disk: &Arc<Disk>) {
         disk.queue.start_drain();
         drop_bdevs(disk, 0);
     }
-    disk_release(disk);
+    // Started requests complete before the bdi goes (Linux freezes the
+    // queue before tearing the disk down)
     disk.queue.drain();
+    disk_release(disk);
 }
 
 /// /proc/partitions (Linux show_partition): every block device with a

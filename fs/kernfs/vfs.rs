@@ -26,6 +26,7 @@ use crate::fs::inode::{AsAny, FileType, Inode, InodeAttr, InodeData, InodeMode, 
 use crate::fs::superblock::SuperBlock;
 use crate::io::poll::{DEFAULT_POLLMASK, POLLERR, POLLPRI, PollTable};
 use crate::sync::Mutex;
+use crate::sync::spin::Mutex as SpinMutex;
 
 /// Inode private data: the node
 pub struct KfInode(pub Arc<KNode>);
@@ -149,6 +150,12 @@ struct SeqBuf {
     read_pos: u64,
 }
 
+/// An open directory: the key of the last entry readdir returned
+/// (spin leaf)
+struct OpenDir {
+    last: SpinMutex<Option<(u32, u64, Vec<u8>)>>,
+}
+
 /// An open attribute (Linux kernfs_open_file)
 struct OpenAttr {
     buf: Mutex<Option<SeqBuf>>,
@@ -270,6 +277,14 @@ impl FileOps for KernfsFops {
     fn open(&self, file: &File) -> Result<(), KernelError> {
         let inode = file.get_inode().ok_or(KernelError::BadFd)?;
         let kn = knode(&inode).ok_or(KernelError::Io)?;
+        if kn.is_dir() {
+            file.private.call_once(|| {
+                Arc::new(OpenDir {
+                    last: SpinMutex::new(None),
+                })
+            });
+            return Ok(());
+        }
         if !matches!(kn.kind, Kind::Attr(_) | Kind::Bin(_)) {
             return Ok(());
         }
@@ -340,9 +355,27 @@ impl FileOps for KernfsFops {
             }
         }
         let from = ctx.pos.clamp(2, i32::MAX as u64) as u32;
-        for (h, n) in kn.list_from(from, sb_ns(&inode)) {
+        let od = file.private_arc::<OpenDir>();
+        // Continuing right after the last entry this file returned: the
+        // rest of its hash too (Linux kernfs_dir_pos with the node kept
+        // in private_data), so entries sharing a hash are not skipped
+        let last = od
+            .as_ref()
+            .and_then(|o| o.last.lock().clone())
+            .filter(|l| l.0 + 1 == from);
+        let start = last.as_ref().map_or(from, |l| l.0);
+        for (h, n) in kn.list_from(start, sb_ns(&inode)) {
             if n.removed() {
                 continue;
+            }
+            let name = n.name();
+            if let Some(l) = &last
+                && h == l.0
+            {
+                if (n.ns, &name) <= (l.1, &l.2) {
+                    continue;
+                }
+                ctx.pos = h as u64;
             }
             let file_type = match n.kind {
                 Kind::Dir(_) => FileType::Directory,
@@ -352,10 +385,13 @@ impl FileOps for KernfsFops {
             let e = DirEntry {
                 ino: n.ino,
                 file_type,
-                name: n.name(),
+                name: name.clone(),
             };
             if !ctx.emit_at(h as u64, e) {
                 return Ok(());
+            }
+            if let Some(o) = &od {
+                *o.last.lock() = Some((h, n.ns, name));
             }
         }
         // Past the last entry (Linux INT_MAX)
