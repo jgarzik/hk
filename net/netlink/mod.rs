@@ -1,7 +1,7 @@
 //! AF_NETLINK sockets (Linux net/netlink/af_netlink.c)
 //!
-//! Only NETLINK_ROUTE is implemented (`rtnetlink.rs`); other protocols are
-//! EPROTONOSUPPORT. A socket is identified by its port id (`nl_pid`):
+//! Protocols are described by `NlProto` (Linux netlink_kernel_cfg):
+//! NETLINK_ROUTE (`rtnetlink.rs`); others are EPROTONOSUPPORT. A socket is identified by its port id (`nl_pid`):
 //! bound explicitly, or autobound on first use to the process's tgid, then
 //! to unique negative values. Multicast groups are a bitmap; kernel
 //! notifications go to every subscribed socket of the namespace.
@@ -49,6 +49,7 @@ use crate::sync::spin::{Mutex, RwLock};
 use crate::net::NetNamespace;
 use crate::net::sock::Sock;
 use crate::net::socket::{ProtoOps, SOCK_DGRAM, SOCK_RAW};
+use crate::net::unix::scm::Creds;
 use crate::util::error::KernelError;
 
 pub const AF_NETLINK: i32 = 16;
@@ -117,6 +118,48 @@ pub struct NlSkb {
     pub portid: u32,
     /// Destination group (0 = unicast)
     pub group: u32,
+    /// Sender credentials (Linux NETLINK_CB.creds), for SCM_CREDENTIALS
+    pub creds: Creds,
+}
+
+impl NlSkb {
+    /// A message from the kernel: port 0, credentials pid/uid/gid 0
+    pub fn kernel(data: Vec<u8>, group: u32) -> Self {
+        Self {
+            data,
+            portid: 0,
+            group,
+            creds: Creds {
+                pid: 0,
+                uid: 0,
+                gid: 0,
+            },
+        }
+    }
+}
+
+/// Kernel receiver of messages sent to port 0 (`explicit`: the sender
+/// named the destination)
+pub type NlInput = fn(&Arc<NlSock>, &[u8], bool);
+
+/// A netlink protocol (Linux netlink_kernel_cfg)
+pub struct NlProto {
+    /// Multicast groups 1..=ngroups
+    pub ngroups: u32,
+    pub input: Option<NlInput>,
+}
+
+static ROUTE: NlProto = NlProto {
+    ngroups: RTNL_NGROUPS,
+    input: Some(rtnetlink::rcv),
+};
+
+/// The protocol of socket(AF_NETLINK, _, `protocol`)
+fn proto(protocol: i32) -> Option<&'static NlProto> {
+    match protocol {
+        NETLINK_ROUTE => Some(&ROUTE),
+        _ => None,
+    }
 }
 
 /// Option bits in `NlSock.flags`
@@ -134,6 +177,7 @@ pub mod sflags {
 pub struct NlSock {
     /// Common state (type SOCK_RAW or SOCK_DGRAM: same behavior)
     pub sk: Sock,
+    proto: &'static NlProto,
     portid: AtomicU32,
     bound: AtomicBool,
     /// Subscribed groups: bit g-1 for group g
@@ -179,10 +223,11 @@ static ROVER: AtomicI32 = AtomicI32::new(-4097);
 
 impl NlSock {
     /// New socket in the current task's namespace
-    pub fn new(protocol: i32, stype: i32) -> Arc<Self> {
+    fn new(proto: &'static NlProto, protocol: i32, stype: i32) -> Arc<Self> {
         let net = crate::net::current_net_ns();
         Arc::new_cyclic(|me| Self {
             sk: Sock::new(net, AF_NETLINK as u16, stype, protocol),
+            proto,
             portid: AtomicU32::new(0),
             bound: AtomicBool::new(false),
             groups: AtomicU64::new(0),
@@ -265,7 +310,7 @@ impl NlSock {
         } else {
             self.autobind()?;
         }
-        let mask = (1u64 << RTNL_NGROUPS) - 1;
+        let mask = (1u64 << self.proto.ngroups) - 1;
         let g = groups as u64 & mask;
         let cur = self.groups.load(Ordering::Acquire);
         self.groups
@@ -311,7 +356,7 @@ impl NlSock {
 
     /// Join (`on`) or leave a group (NETLINK_ADD/DROP_MEMBERSHIP)
     pub fn membership(self: &Arc<Self>, group: u32, on: bool) -> Result<(), KernelError> {
-        if group == 0 || group > RTNL_NGROUPS {
+        if group == 0 || group > self.proto.ngroups {
             return Err(KernelError::InvalidArgument);
         }
         self.autobind()?;
@@ -512,22 +557,20 @@ impl NlSock {
         // under the dump lock so parts stay in order; readers are woken
         // after it is dropped.
         self.rmem.fetch_add(truesize(buf.len()), Ordering::AcqRel);
-        self.enqueue(NlSkb {
-            data: buf,
-            portid: 0,
-            group: 0,
-        });
+        self.enqueue(NlSkb::kernel(buf, 0));
         drop(d);
         self.sk.wq.wake_all();
         true
     }
 
-    /// Send `data` to `dst` from this socket (Linux netlink_sendmsg
-    /// after address checks): portid 0 = the kernel
+    /// Send `data` to `dst` from this socket with the sender's `creds`
+    /// (Linux netlink_sendmsg after address checks): portid 0 = the
+    /// kernel
     pub fn send(
         self: &Arc<Self>,
         data: &[u8],
         dst: NlDst,
+        creds: Creds,
         nonblock: bool,
     ) -> Result<usize, KernelError> {
         let NlDst {
@@ -545,12 +588,15 @@ impl NlSock {
                 data: data.to_vec(),
                 portid: me,
                 group,
+                creds,
             };
             broadcast(&self.sk.net, self.sk.protocol, skb, me);
         }
         if portid == 0 {
-            if group == 0 {
-                rtnetlink::rcv(self, data, explicit);
+            if group == 0
+                && let Some(input) = self.proto.input
+            {
+                input(self, data, explicit);
             }
             return Ok(data.len());
         }
@@ -564,6 +610,7 @@ impl NlSock {
             data: data.to_vec(),
             portid: me,
             group: 0,
+            creds,
         };
         peer.deliver(skb, self.sk.snd_timeo(nonblock))?;
         Ok(data.len())
@@ -665,13 +712,11 @@ impl NlTable {
     }
 }
 
-/// socket(AF_NETLINK, type, protocol): NETLINK_ROUTE only
+/// socket(AF_NETLINK, type, protocol)
 pub fn create(stype: i32, protocol: i32) -> Result<Arc<dyn ProtoOps>, KernelError> {
     if stype != SOCK_RAW && stype != SOCK_DGRAM {
         return Err(KernelError::SocketTypeNotSupported);
     }
-    if protocol != NETLINK_ROUTE {
-        return Err(KernelError::ProtocolNotSupported);
-    }
-    Ok(NlSock::new(protocol, stype))
+    let p = proto(protocol).ok_or(KernelError::ProtocolNotSupported)?;
+    Ok(NlSock::new(p, protocol, stype))
 }

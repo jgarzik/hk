@@ -175,11 +175,7 @@ fn ack(sk: &NlSock, h: &Hdr, msg: &[u8], err: i32) {
 }
 
 fn reply(sk: &NlSock, data: Vec<u8>) {
-    sk.queue(NlSkb {
-        data,
-        portid: 0,
-        group: 0,
-    });
+    sk.queue(NlSkb::kernel(data, 0));
 }
 
 /// One request: permission, then dump or do
@@ -520,12 +516,7 @@ pub fn notify_link(net: &NetNamespace, dev: &NetDevice, nl: NlInfo) {
 }
 
 fn notify(net: &NetNamespace, data: Vec<u8>, group: u32) {
-    let skb = NlSkb {
-        data,
-        portid: 0,
-        group,
-    };
-    broadcast(net, NETLINK_ROUTE, skb, 0);
+    broadcast(net, NETLINK_ROUTE, NlSkb::kernel(data, group), 0);
 }
 
 // ============================================================================
