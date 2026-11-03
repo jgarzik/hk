@@ -696,6 +696,15 @@ pub fn do_pivot_root(new: &Path, put_old: &Path) -> Result<(), KernelError> {
         .get_root();
     let _l = lock_mountpoint(put_old)?;
     let ns = NAMESPACE_SEM.write();
+    // Nothing moves under a shared mount here without propagating
+    // (Linux: put_old's mount, new's parent, root's parent not shared)
+    let shared = |m: Option<Arc<Mount>>| m.is_some_and(|m| m.group.load(Ordering::SeqCst) != 0);
+    if shared(Some(put_old.mnt.clone()))
+        || shared(new.mnt.get_parent())
+        || shared(root.mnt.get_parent())
+    {
+        return Err(KernelError::InvalidArgument);
+    }
     if new.mnt.flags() & MNT_LOCKED != 0 {
         return Err(KernelError::InvalidArgument);
     }

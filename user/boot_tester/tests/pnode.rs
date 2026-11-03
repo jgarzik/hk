@@ -6,6 +6,7 @@
 
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
+    sys_chdir, sys_chroot, sys_pivot_root,
     CLONE_NEWNS, O_RDONLY, Stat, sys_close, sys_exit, sys_fork, sys_mkdir, sys_mount, sys_open,
     sys_read, sys_rmdir, sys_stat, sys_umount2, sys_unshare, sys_wait4,
 };
@@ -28,6 +29,8 @@ pub fn run_tests() {
     report(b"PROPAG_UNBINDABLE", unbindable());
     report(b"PROPAG_UNSHARE_PEER", unshare_peer());
     report(b"PROPAG_SLAVE_GROUPS", slave_groups());
+    report(b"PROPAG_UNBIND_THEN_SHARED", unbind_then_shared());
+    report(b"PIVOT_ROOT_SHARED", pivot_shared());
 }
 
 type R = Result<(), (&'static [u8], i64)>;
@@ -303,4 +306,55 @@ fn slave_groups() -> R {
     sys_umount2(b"/tmp/pg_t\0".as_ptr(), MNT_DETACH);
     rmdirs(&dirs);
     r
+}
+
+/// Making an unbindable mount shared ends unbindable (Linux
+/// set_mnt_shared clears T_UNBINDABLE): it can then be bound
+fn unbind_then_shared() -> R {
+    let dirs: [&[u8]; 2] = [b"/tmp/ub_s\0", b"/tmp/ub_t\0"];
+    mkdirs(&dirs);
+    let r = (|| {
+        check(b"mount", ramfs(b"/tmp/ub_s\0") == 0, -1)?;
+        check(b"unbindable", set(b"/tmp/ub_s\0", MS_UNBINDABLE) == 0, -1)?;
+        check(b"shared", set(b"/tmp/ub_s\0", MS_SHARED) == 0, -1)?;
+        let r = bind(b"/tmp/ub_s\0", b"/tmp/ub_t\0");
+        check(b"bind", r == 0, r)
+    })();
+    sys_umount2(b"/tmp/ub_t\0".as_ptr(), 0);
+    sys_umount2(b"/tmp/ub_s\0".as_ptr(), 0);
+    rmdirs(&dirs);
+    r
+}
+
+/// pivot_root with put_old on a shared mount is EINVAL (Linux: no
+/// mount may move under a shared one without propagating)
+fn pivot_shared() -> R {
+    let pid = sys_fork();
+    if pid == 0 {
+        let code = if sys_unshare(CLONE_NEWNS) != 0 {
+            1
+        } else {
+            sys_mkdir(b"/tmp/psh\0".as_ptr(), 0o755);
+            if ramfs(b"/tmp/psh\0") != 0 || sys_chdir(b"/tmp/psh\0".as_ptr()) != 0 {
+                2
+            } else if sys_mount(b".\0".as_ptr(), b"/\0".as_ptr(), core::ptr::null(), 8192, 0) != 0
+                || sys_chroot(b".\0".as_ptr()) != 0
+            {
+                3
+            } else {
+                sys_mkdir(b"/new\0".as_ptr(), 0o755);
+                if ramfs(b"/new\0") != 0 || set(b"/new\0", MS_SHARED) != 0 {
+                    4
+                } else {
+                    sys_mkdir(b"/new/old\0".as_ptr(), 0o755);
+                    let r = sys_pivot_root(b"/new\0".as_ptr(), b"/new/old\0".as_ptr());
+                    if r == EINVAL { 0 } else { 5 }
+                }
+            }
+        };
+        sys_exit(code);
+    }
+    let mut ws = 0i32;
+    sys_wait4(pid, &mut ws, 0, 0);
+    check(b"child", ws == 0, (ws >> 8) as i64)
 }

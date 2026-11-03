@@ -276,8 +276,11 @@ EINVAL instead of Linux behavior: MS_SYNCHRONOUS, MS_DIRSYNC and
 MS_NOSYMFOLLOW. Propagation (`fs/pnode.rs`): a propagated copy lands
 on top of what is already mounted at the target (Linux tucks it
 under); a slave's master is its master's peer group, not one mount;
-copies of a namespace are always peers (no CL_SHARED_TO_SLAVE for a
-less privileged user namespace). umount2 MNT_EXPIRE's
+copies of a namespace are always peers and not locked (Linux
+copy_mnt_ns for a less privileged user namespace makes shared mounts
+slaves, CL_SHARED_TO_SLAVE, and locks them, lock_mnt_tree): harmless
+while CLONE_NEWNS needs root and mounts ignore user namespaces, but
+required before mounts become user-namespace aware. umount2 MNT_EXPIRE's
 mark is not cleared by use (Linux mntput clears it).
 Unlike Linux (MNT_WRITE_HOLD), a write access racing a read-only remount
 that then fails with EBUSY can see a spurious EROFS. Mount options are parsed by vfat (Linux's set; long names

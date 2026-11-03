@@ -168,6 +168,8 @@ fn make_slave(m: &Arc<Mount>) {
 /// Linux change_mnt_propagation
 pub fn change_propagation(m: &Arc<Mount>, p: Prop) {
     if p == Prop::Shared {
+        // Shared ends unbindable (Linux set_mnt_shared: T_SHARED_MASK)
+        m.mark(MNT_UNBINDABLE, false);
         if m.group.load(Ordering::SeqCst) == 0 {
             join(m, alloc_group());
         }
@@ -238,23 +240,22 @@ fn to_slaves(g: u32, d: &Arc<Dentry>, src: &Arc<Mount>, up: &BTreeMap<usize, u32
             continue;
         }
         let set = if sg != 0 { peers(sg) } else { alloc::vec![s] };
-        // Copies among shared slaves are peers of one another
-        let new: BTreeMap<usize, u32> = if sg != 0 {
-            up.keys().map(|&k| (k, alloc_group())).collect()
-        } else {
-            BTreeMap::new()
-        };
+        // Copies among shared slaves are peers of one another: a group
+        // per source mount, made with its first copy
+        let new = core::cell::RefCell::new(BTreeMap::<usize, u32>::new());
         for m in set.iter().filter(|m| visible(m, d)) {
             let c = copy_prop(src, &|o, c| {
                 let k = o as *const Mount as usize;
                 set_master(c, up.get(&k).copied().unwrap_or(0));
-                if let Some(&ng) = new.get(&k) {
+                if sg != 0 {
+                    let ng = *new.borrow_mut().entry(k).or_insert_with(alloc_group);
                     join(c, ng);
                 }
             });
             attach_mnt(&c, &Path::new(m.clone(), d.clone()));
         }
-        if sg != 0 {
+        let new = new.into_inner();
+        if !new.is_empty() {
             to_slaves(sg, d, src, &new);
         }
     }
