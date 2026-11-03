@@ -260,7 +260,7 @@ VFS locks (detailed order):
                    link source, two non-directories by address)
         ↓
     dentry::RENAME_LOCK (spin RwLock, Linux rename_lock: write in
-                   d_move/d_exchange, read in is_subdir/full_path)
+                   d_move/d_exchange, read in is_subdir/d_path)
         ↓
     Dentry.d_lock (single d_lock like Linux; short, never held across
                    i_rwsem; parent before child)
@@ -1678,9 +1678,11 @@ struct DentryInner {
 A rename moves the dentry itself (`d_move`, `d_exchange`) under the
 global `RENAME_LOCK` (write; Linux rename_lock), with both parents'
 `i_rwsem` held by the caller; each step takes one `d_lock` at a time
-(parent, then the moved or replaced child). `is_subdir` and `full_path`
+(parent, then the moved or replaced child). `is_subdir` and `d_path`
 read parents and names under `RENAME_LOCK` (read), so they see one
-consistent tree. `Dentry::alloc` inserts a child under the parent's
+consistent tree. `d_path` also climbs mounts (`Mount.parent`, then
+`Mount.mountpoint`, each read and released) inside it: RENAME_LOCK ->
+Mount fields -> d_lock; nothing takes RENAME_LOCK under a Mount lock. `Dentry::alloc` inserts a child under the parent's
 `d_lock` unless one with that name is cached (Linux d_alloc + d_add):
 one dentry per name. Deviation: Linux readers retry a seqlock instead of
 taking a lock.
@@ -1720,13 +1722,15 @@ Each open `File` holds a reference to its mount via the `mnt` field:
 5. Dentry.d_lock (DentryInner.flags: write for the mount count)
 ```
 
-**Lock Order for Path Traversal (follow_mount):**
+**Lock Order for Path Traversal (follow_mount, lookup_mnt):**
 ```
-1. MntNamespace.root (read)
-2. Mount.children (read)
-3. child.mountpoint (read)
-4. Dentry.d_lock (DentryInner.inode: read)
+1. Mount.children (read) of the walk's current mount
+2. child.mountpoint (read)
+3. Dentry.d_lock (DentryInner.inode: read)
 ```
+The walk carries a Path{mnt, dentry}: crossing looks only at the
+current mount's children (Linux lookup_mnt); ".." at a mount root
+reads `Mount.parent` and `Mount.mountpoint` (follow_dotdot).
 
 `is_local_mountpoint` (rmdir, unlink, rename: EBUSY) takes the same
 locks in the same order, one mount's `children` at a time, inside the

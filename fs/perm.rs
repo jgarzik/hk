@@ -42,7 +42,7 @@ fn resolve(
     empty_ok: bool,
 ) -> Result<Arc<Dentry>, KernelError> {
     let empty_ok = empty_ok && flags & AT_EMPTY_PATH != 0;
-    user_path_at(dirfd, path_ptr, LookupFlags::at(flags), empty_ok)
+    user_path_at(dirfd, path_ptr, LookupFlags::at(flags), empty_ok).map(|p| p.dentry)
 }
 
 fn inode_of(d: &Dentry) -> Result<Arc<Inode>, KernelError> {

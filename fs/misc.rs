@@ -10,7 +10,7 @@ use alloc::sync::Arc;
 use alloc::vec;
 
 use crate::arch::Uaccess;
-use crate::fs::{KernelError, LookupFlags, Path, is_subdir, lookup_path_flags};
+use crate::fs::{KernelError, LookupFlags, is_subdir, lookup_path_flags};
 use crate::uaccess::{
     UaccessArch, copy_to_user, put_user, strncpy_from_user, strncpy_from_user_str,
 };
@@ -106,10 +106,12 @@ fn remount(m: &Arc<super::mount::Mount>, flags: u64) -> Result<(), KernelError> 
 }
 
 /// Mount whose root `target` is (Linux path_mounted), else EINVAL
-fn mount_at(target: &Arc<super::Dentry>) -> Result<Arc<super::mount::Mount>, KernelError> {
-    crate::ns::current_mnt_ns()
-        .find_mount_at(target)
-        .ok_or(KernelError::InvalidArgument)
+fn mount_at(target: &super::Path) -> Result<Arc<super::mount::Mount>, KernelError> {
+    if Arc::ptr_eq(&target.dentry, &target.mnt.root) {
+        Ok(target.mnt.clone())
+    } else {
+        Err(KernelError::InvalidArgument)
+    }
 }
 
 /// sys_mount - mount a filesystem (Linux do_mount + path_mount)
@@ -157,7 +159,7 @@ fn path_mount(
         Default::default()
     };
     let target = crate::fs::namei::getname(target_ptr, false)?;
-    let mp = lookup_path_flags(&target, LookupFlags::opendir())?;
+    let mp = crate::fs::namei::path_lookupat(None, &target, LookupFlags::opendir())?;
 
     if flags & ms::MGC_MSK == ms::MGC_VAL {
         flags &= !ms::MGC_MSK;
@@ -181,14 +183,15 @@ fn path_mount(
 }
 
 /// Mount a new instance of `fstype` on `mp` (Linux do_new_mount)
-fn new_mount(
-    source: &[u8],
-    fstype: &str,
-    mp: Arc<super::Dentry>,
-    flags: u64,
-) -> Result<(), KernelError> {
+fn new_mount(source: &[u8], fstype: &str, mp: super::Path, flags: u64) -> Result<(), KernelError> {
     let fs_type = super::superblock::find_filesystem(fstype).ok_or(KernelError::NoDevice)?;
-    if !mp.get_inode().ok_or(KernelError::NotFound)?.mode().is_dir() {
+    if !mp
+        .dentry
+        .get_inode()
+        .ok_or(KernelError::NotFound)?
+        .mode()
+        .is_dir()
+    {
         return Err(KernelError::NotDirectory);
     }
     // Flags are set before the mount becomes visible (Linux do_new_mount)
@@ -240,8 +243,8 @@ pub fn sys_umount2(target_ptr: u64, flags: i32) -> i64 {
     }
 
     // Look up the target path
-    let target_dentry = match lookup_path_flags(&target, lookup_flags) {
-        Ok(d) => d,
+    let target = match crate::fs::namei::path_lookupat(None, &target, lookup_flags) {
+        Ok(p) => p,
         Err(e) => return e.sysret(),
     };
 
@@ -250,10 +253,10 @@ pub fn sys_umount2(target_ptr: u64, flags: i32) -> i64 {
         return KernelError::NotPermitted.sysret();
     }
 
-    // Find the mount at this path
-    let mount = match crate::ns::current_mnt_ns().find_mount_at(&target_dentry) {
-        Some(m) => m,
-        None => return KernelError::InvalidArgument.sysret(), // Not a mount point
+    // The target must be the root of a mount (Linux path_mounted)
+    let mount = match mount_at(&target) {
+        Ok(m) => m,
+        Err(e) => return e.sysret(),
     };
 
     // Perform the unmount
@@ -299,16 +302,18 @@ pub fn sys_pivot_root(new_root_ptr: u64, put_old_ptr: u64) -> i64 {
     };
 
     // 3. Look up new_root path (must be directory)
-    let new_root_dentry = match lookup_path_flags(&new_root_str, LookupFlags::opendir()) {
-        Ok(d) => d,
-        Err(e) => return e.sysret(),
-    };
+    let new_root =
+        match crate::fs::namei::path_lookupat(None, &new_root_str, LookupFlags::opendir()) {
+            Ok(p) => p,
+            Err(e) => return e.sysret(),
+        };
+    let new_root_dentry = new_root.dentry.clone();
 
     // 4. Verify new_root is a mount point
     let mnt_ns = crate::ns::current_mnt_ns();
-    let new_mnt = match mnt_ns.find_mount_at(&new_root_dentry) {
-        Some(m) => m,
-        None => return KernelError::InvalidArgument.sysret(), // Not a mount point
+    let new_mnt = match mount_at(&new_root) {
+        Ok(m) => m,
+        Err(e) => return e.sysret(),
     };
 
     // 5. Look up put_old path (must be directory)
@@ -341,10 +346,8 @@ pub fn sys_pivot_root(new_root_ptr: u64, put_old_ptr: u64) -> i64 {
 
     // 10. Update task's fs root
     // The new root dentry becomes the task's root
-    if let Some(fs) = crate::task::percpu::current_fs()
-        && let Some(new_path) = Path::from_dentry(new_root_dentry)
-    {
-        fs.set_root(new_path);
+    if let Some(fs) = crate::task::percpu::current_fs() {
+        fs.set_root(new_root);
     }
 
     0

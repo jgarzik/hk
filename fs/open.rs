@@ -2,10 +2,9 @@
 
 use alloc::sync::Arc;
 
-use crate::fs::namei::{Last, filename_lookup, filename_parentat, getname};
+use crate::fs::namei::{Last, filename_lookup, filename_parentat, getname, path_lookupat};
 use crate::fs::{
     Dentry, File, InodeMode, KernelError, LookupFlags, Path, RAMFS_FILE_OPS, dac, lookup_one,
-    lookup_path_at,
 };
 
 use super::file::flags::AT_FDCWD;
@@ -62,7 +61,7 @@ fn open_target(
     path: &[u8],
     flags: u32,
     mode: u32,
-) -> Result<(Arc<Dentry>, bool), KernelError> {
+) -> Result<(Path, bool), KernelError> {
     let mut lf = LookupFlags::open();
     if flags & O_DIRECTORY != 0 {
         lf.directory = true;
@@ -81,9 +80,13 @@ fn open_target(
     if p.last != Last::Norm || p.slash {
         return Err(KernelError::IsDirectory);
     }
-    let (d, created) = match lookup_path_at(Path::from_dentry(p.dir.clone()), &p.name, lf) {
+    let dir = Path::new(p.mnt.clone(), p.dir.clone());
+    let (d, created) = match path_lookupat(Some(dir), &p.name, lf) {
         Ok(d) => (d, false),
-        Err(KernelError::NotFound) => create_in(&p.dir, &p.name, mode)?,
+        Err(KernelError::NotFound) => {
+            let (d, c) = create_in(&p.dir, &p.name, mode)?;
+            (Path::new(p.mnt.clone(), d), c)
+        }
         Err(e) => return Err(e),
     };
     if !created && flags & O_EXCL != 0 {
@@ -133,18 +136,13 @@ fn do_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> Result<i64, Ke
 /// Open `path` (relative to `start`) as a new file (Linux do_filp_open):
 /// resolve or create the target, may_open, O_TRUNC, then the file object
 fn filp_open(dirfd: i32, path: &[u8], flags: u32, mode: u32) -> Result<Arc<File>, KernelError> {
-    let (dentry, created) = open_target(dirfd, path, flags, mode)?;
+    let (path, created) = open_target(dirfd, path, flags, mode)?;
+    let dentry = path.dentry.clone();
     let inode = dentry.get_inode().ok_or(KernelError::NotFound)?;
 
-    // may_open_dev: device nodes on a nodev mount cannot be opened;
-    // one whose mount is not found in the caller's namespace neither
-    // (fails closed, like open_exec)
+    // may_open_dev: device nodes on a nodev mount cannot be opened
     let m = inode.mode();
-    if (m.is_chrdev() || m.is_blkdev())
-        && crate::ns::current_mnt_ns()
-            .find_mount_for_dentry(&dentry)
-            .is_none_or(|mnt| mnt.flags() & MNT_NODEV != 0)
-    {
+    if (m.is_chrdev() || m.is_blkdev()) && path.mnt.flags() & MNT_NODEV != 0 {
         return Err(KernelError::PermissionDenied);
     }
 
@@ -200,7 +198,7 @@ fn filp_open(dirfd: i32, path: &[u8], flags: u32, mode: u32) -> Result<Arc<File>
             .unwrap_or(&RAMFS_FILE_OPS)
     };
 
-    let mut file = File::new(dentry, flags, f_op);
+    let mut file = File::new(dentry, Some(path.mnt), flags, f_op);
     if flags & O_ACCMODE != O_RDONLY {
         file.write_access = w;
         file.i_write = iw;

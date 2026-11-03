@@ -15,7 +15,7 @@ use super::dac::{MAY_EXEC, cred, permission_as};
 use super::dentry::Dentry;
 use super::file::flags::{AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW};
 use super::inode::Inode;
-use super::mount::follow_mount;
+use super::mount::{Mount, follow_mount};
 use super::path_ref::Path;
 use crate::fs::syscall::PATH_MAX;
 use crate::ns::current_mnt_ns;
@@ -87,6 +87,15 @@ pub fn lookup_path_at(
     path: &[u8],
     flags: LookupFlags,
 ) -> Result<Arc<Dentry>, KernelError> {
+    path_lookupat(start, path, flags).map(|p| p.dentry)
+}
+
+/// As [`lookup_path_at`], the mount too (Linux path_lookupat)
+pub fn path_lookupat(
+    start: Option<Path>,
+    path: &[u8],
+    flags: LookupFlags,
+) -> Result<Path, KernelError> {
     walk(&cred(), start, path, flags, 0)
 }
 
@@ -140,7 +149,7 @@ fn walk(
     path: &[u8],
     mut flags: LookupFlags,
     depth: usize,
-) -> Result<Arc<Dentry>, KernelError> {
+) -> Result<Path, KernelError> {
     if depth > MAX_SYMLINK_DEPTH {
         return Err(KernelError::TooManySymlinks);
     }
@@ -150,37 +159,34 @@ fn walk(
         flags.follow = true;
         flags.directory = true;
     }
-    let mnt_ns = current_mnt_ns();
+    let root = nd_root()?;
     let mut cur = match start {
-        Some(p) if !path.starts_with(b"/") => p.dentry.clone(),
-        _ => mnt_ns.get_root_dentry().ok_or(KernelError::NotFound)?,
+        Some(p) if !path.starts_with(b"/") => p,
+        _ => root.clone(),
     };
     let comps: Vec<&[u8]> = path
         .split(|&c| c == b'/')
         .filter(|s| !s.is_empty())
         .collect();
     for (i, name) in comps.iter().enumerate() {
-        may_lookup(c, &cur)?;
+        may_lookup(c, &cur.dentry)?;
         match *name {
             b"." => continue,
             b".." => {
-                // At the root, ".." stays at the root
-                if let Some(parent) = cur.get_parent() {
-                    cur = parent;
-                }
+                cur = follow_dotdot(cur, &root);
                 continue;
             }
             _ => {}
         }
-        let child = lookup_slow(&cur, name)?;
+        let child = Path::new(cur.mnt.clone(), lookup_slow(&cur.dentry, name)?);
         let child = if flags.no_xdev {
             child
         } else {
-            follow_mount(&child)
+            follow_mount(child)
         };
         let last = i + 1 == comps.len();
         if (!last || flags.follow) && child.get_inode().is_some_and(|n| n.mode().is_symlink()) {
-            return follow_link(c, &cur, &child, &comps[i + 1..], flags, depth);
+            return follow_link(c, &cur, &child.dentry, &comps[i + 1..], flags, depth);
         }
         cur = child;
     }
@@ -190,16 +196,46 @@ fn walk(
     Ok(cur)
 }
 
+/// The root absolute paths start at and ".." stops at (Linux nd->root)
+pub fn nd_root() -> Result<Path, KernelError> {
+    let m = current_mnt_ns().get_root().ok_or(KernelError::NotFound)?;
+    Ok(Path::new(m.clone(), m.root.clone()))
+}
+
+/// ".." from `p` (Linux follow_dotdot): the root stays; at a mount's
+/// root, climb to its mountpoint (repeatedly, through stacked mounts)
+/// and take that one's parent; a detached or namespace root stays.
+/// Whatever is mounted on the result is crossed.
+fn follow_dotdot(p: Path, root: &Path) -> Path {
+    let mut p = p;
+    loop {
+        if p.same(root) {
+            return p;
+        }
+        if !Arc::ptr_eq(&p.dentry, &p.mnt.root) {
+            break;
+        }
+        match (p.mnt.get_parent(), p.mnt.get_mountpoint()) {
+            (Some(m), Some(mp)) => p = Path::new(m, mp),
+            _ => return p,
+        }
+    }
+    match p.dentry.get_parent() {
+        Some(parent) => follow_mount(Path::new(p.mnt, parent)),
+        None => p,
+    }
+}
+
 /// Continue a walk through symlink `link` found in `dir`, with the
 /// components `rest` still to resolve after it
 fn follow_link(
     c: &Cred,
-    dir: &Arc<Dentry>,
+    dir: &Path,
     link: &Dentry,
     rest: &[&[u8]],
     flags: LookupFlags,
     depth: usize,
-) -> Result<Arc<Dentry>, KernelError> {
+) -> Result<Path, KernelError> {
     let inode = link.get_inode().ok_or(KernelError::NotFound)?;
     let target = inode.i_op.readlink(&inode)?;
     let mut path = target;
@@ -207,7 +243,7 @@ fn follow_link(
         path.push(b'/');
         path.extend_from_slice(comp);
     }
-    walk(c, Path::from_dentry(dir.clone()), &path, flags, depth + 1)
+    walk(c, Some(dir.clone()), &path, flags, depth + 1)
 }
 
 /// Create the entry `p` names (Linux filename_create +
@@ -331,26 +367,20 @@ pub fn path_start(dirfd: i32, path: &[u8]) -> Result<Option<Path>, KernelError> 
     if !path.is_empty() && !file.is_dir() {
         return Err(KernelError::NotDirectory);
     }
-    Ok(Path::from_dentry(file.dentry.clone()))
+    Ok(file.f_path())
 }
 
 /// Resolve `path` relative to `dirfd` (Linux filename_lookup); an empty
 /// path (getname let it through: AT_EMPTY_PATH) names dirfd itself
-pub fn filename_lookup(
-    dirfd: i32,
-    path: &[u8],
-    flags: LookupFlags,
-) -> Result<Arc<Dentry>, KernelError> {
+pub fn filename_lookup(dirfd: i32, path: &[u8], flags: LookupFlags) -> Result<Path, KernelError> {
     let start = path_start(dirfd, path)?;
     if path.is_empty() {
         return match start {
-            Some(p) => Ok(p.dentry.clone()),
-            None => current_mnt_ns()
-                .get_root_dentry()
-                .ok_or(KernelError::NotFound),
+            Some(p) => Ok(p),
+            None => nd_root(),
         };
     }
-    lookup_path_at(start, path, flags)
+    path_lookupat(start, path, flags)
 }
 
 /// Copy in and resolve a path argument (Linux user_path_at)
@@ -359,7 +389,7 @@ pub fn user_path_at(
     ptr: u64,
     flags: LookupFlags,
     empty_ok: bool,
-) -> Result<Arc<Dentry>, KernelError> {
+) -> Result<Path, KernelError> {
     filename_lookup(dirfd, &getname(ptr, empty_ok)?, flags)
 }
 
@@ -377,6 +407,8 @@ pub enum Last {
 /// filename_parentat)
 pub struct Parent {
     pub dir: Arc<Dentry>,
+    /// The mount `dir` is in
+    pub mnt: Arc<Mount>,
     pub name: Vec<u8>,
     pub last: Last,
     /// The path ended in '/' after the last component
@@ -393,9 +425,10 @@ pub fn filename_parentat(dirfd: i32, path: &[u8]) -> Result<Parent, KernelError>
     let trimmed = &path[..end];
     if trimmed.is_empty() {
         // Only slashes: the root, no last component
-        let dir = lookup_path_at(None, b"/", LookupFlags::opendir())?;
+        let root = nd_root()?;
         return Ok(Parent {
-            dir,
+            dir: root.dentry,
+            mnt: root.mnt,
             name: Vec::new(),
             last: Last::Root,
             slash: false,
@@ -405,9 +438,9 @@ pub fn filename_parentat(dirfd: i32, path: &[u8]) -> Result<Parent, KernelError>
         Some(i) => (&path[..=i], &trimmed[i + 1..]),
         None => (b"", trimmed),
     };
-    let dir = match (dir_path.is_empty(), &start) {
-        (true, Some(p)) => p.dentry.clone(),
-        _ => lookup_path_at(start, dir_path, LookupFlags::opendir())?,
+    let Path { mnt, dentry: dir } = match (dir_path.is_empty(), start) {
+        (true, Some(p)) => p,
+        (_, start) => path_lookupat(start, dir_path, LookupFlags::opendir())?,
     };
     // link_path_walk: search permission before the last component too
     may_lookup(&cred(), &dir)?;
@@ -418,6 +451,7 @@ pub fn filename_parentat(dirfd: i32, path: &[u8]) -> Result<Parent, KernelError>
     };
     Ok(Parent {
         dir,
+        mnt,
         name: name.to_vec(),
         last,
         slash,

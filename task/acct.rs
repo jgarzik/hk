@@ -212,11 +212,15 @@ pub fn sys_acct(filename_ptr: u64) -> i64 {
 /// Open the accounting file
 fn open_acct_file(path: &[u8]) -> Result<Arc<File>, i64> {
     use crate::fs::file::flags;
-    use crate::fs::{LookupFlags, dac, lookup_path_flags};
+    use crate::fs::{LookupFlags, dac};
 
     // Lookup the file
-    let dentry = match lookup_path_flags(path, LookupFlags::open()) {
-        Ok(d) => d,
+    let crate::fs::Path { mnt, dentry } = match crate::fs::namei::path_lookupat(
+        crate::task::percpu::current_cwd(),
+        path,
+        LookupFlags::open(),
+    ) {
+        Ok(p) => p,
         // Any lookup error as is (Linux filp_open)
         Err(e) => return Err(e.sysret()),
     };
@@ -242,7 +246,7 @@ fn open_acct_file(path: &[u8]) -> Result<Arc<File>, i64> {
         .superblock()
         .map(|sb| sb.fs_type.file_ops)
         .unwrap_or(&crate::fs::ramfs::RAMFS_FILE_OPS);
-    let mut file = File::new(dentry, flags::O_WRONLY | flags::O_APPEND, f_op);
+    let mut file = File::new(dentry, Some(mnt), flags::O_WRONLY | flags::O_APPEND, f_op);
     file.write_access = w;
     Ok(Arc::new(file))
 }

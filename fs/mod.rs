@@ -86,26 +86,27 @@ use alloc::sync::Arc;
 ///
 /// Returns a read-only file, or a positive errno (ENOENT, EACCES, ...).
 pub fn kernel_open_exec(path: &[u8]) -> Result<Arc<File>, i32> {
-    let dentry = lookup_path_flags(path, LookupFlags::open()).map_err(|e| e as i32)?;
-    open_exec(dentry)
+    let p = namei::path_lookupat(
+        crate::task::percpu::current_cwd(),
+        path,
+        LookupFlags::open(),
+    )
+    .map_err(|e| e as i32)?;
+    open_exec(p)
 }
 
 /// The checks and open of kernel_open_exec on a dentry already looked up
 /// (execveat: relative to a dirfd, the dirfd's own file, or a final
 /// symlink not followed, which is ELOOP like Linux's may_open)
-pub fn open_exec(dentry: Arc<Dentry>) -> Result<Arc<File>, i32> {
+pub fn open_exec(path: Path) -> Result<Arc<File>, i32> {
+    let dentry = path.dentry.clone();
     let inode = dentry.get_inode().ok_or(KernelError::NotFound as i32)?;
     if inode.mode().is_symlink() {
         return Err(KernelError::TooManySymlinks as i32);
     }
-    // may_open: no exec from a noexec mount (path_noexec). A file
-    // keeps no mount, so it is looked up in the caller's namespace; one
-    // not found there (an fd from another namespace) fails closed
-    if inode.mode().is_file() {
-        let mnt = crate::ns::current_mnt_ns().find_mount_for_dentry(&dentry);
-        if mnt.is_none_or(|m| m.flags() & mount::MNT_NOEXEC != 0) {
-            return Err(KernelError::PermissionDenied as i32);
-        }
+    // may_open: no exec from a noexec mount (path_noexec)
+    if inode.mode().is_file() && path.mnt.flags() & mount::MNT_NOEXEC != 0 {
+        return Err(KernelError::PermissionDenied as i32);
     }
     dac::may_open(&dac::cred(), &inode, MAY_EXEC, flags::O_RDONLY).map_err(|e| e as i32)?;
     if !inode.mode().is_file() {
@@ -115,7 +116,12 @@ pub fn open_exec(dentry: Arc<Dentry>) -> Result<Arc<File>, i32> {
         .superblock()
         .map(|sb| sb.fs_type.file_ops)
         .unwrap_or(&ramfs::RAMFS_FILE_OPS);
-    Ok(Arc::new(File::new(dentry, flags::O_RDONLY, f_op)))
+    Ok(Arc::new(File::new(
+        dentry,
+        Some(path.mnt),
+        flags::O_RDONLY,
+        f_op,
+    )))
 }
 
 // ============================================================================

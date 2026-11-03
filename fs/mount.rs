@@ -12,6 +12,7 @@ use ::core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use super::KernelError;
 use super::dentry::Dentry;
 use super::inode::FileType;
+use super::path_ref::Path;
 use super::superblock::{FileSystemType, SuperBlock};
 
 use crate::block::get_blkdev;
@@ -22,6 +23,9 @@ pub const MNT_NOSUID: u32 = 0x1;
 pub const MNT_NODEV: u32 = 0x2;
 /// No program execution (Linux MNT_NOEXEC)
 pub const MNT_NOEXEC: u32 = 0x4;
+
+/// Old mount -> its copy, from [`Mount::clone_tree`]
+pub type MountMap = Vec<(Arc<Mount>, Arc<Mount>)>;
 
 /// A mount point in the namespace
 ///
@@ -186,7 +190,7 @@ impl Mount {
     ///
     /// This is used by CLONE_NEWNS to give a new mount namespace its
     /// own view of the mount hierarchy.
-    pub fn clone_tree(root: &Arc<Mount>) -> Result<Arc<Mount>, i32> {
+    pub fn clone_tree(root: &Arc<Mount>) -> Result<(Arc<Mount>, MountMap), i32> {
         // Clone the root mount
         let new_root = Arc::new(Mount {
             sb: root.sb.clone(),
@@ -199,15 +203,20 @@ impl Mount {
         });
 
         // Recursively clone children
+        let mut map = alloc::vec![(root.clone(), new_root.clone())];
         for child in root.children.read().iter() {
-            Self::clone_subtree(&new_root, child)?;
+            Self::clone_subtree(&new_root, child, &mut map)?;
         }
 
-        Ok(new_root)
+        Ok((new_root, map))
     }
 
     /// Clone a subtree and attach it to a parent
-    fn clone_subtree(new_parent: &Arc<Mount>, old_mount: &Arc<Mount>) -> Result<(), i32> {
+    fn clone_subtree(
+        new_parent: &Arc<Mount>,
+        old_mount: &Arc<Mount>,
+        map: &mut MountMap,
+    ) -> Result<(), i32> {
         // Clone this mount
         let new_mount = Arc::new(Mount {
             sb: old_mount.sb.clone(),
@@ -224,36 +233,38 @@ impl Mount {
 
         // Add to parent's children
         new_parent.children.write().push(new_mount.clone());
+        map.push((old_mount.clone(), new_mount.clone()));
 
         // Recursively clone this mount's children
         for child in old_mount.children.read().iter() {
-            Self::clone_subtree(&new_mount, child)?;
+            Self::clone_subtree(&new_mount, child, map)?;
         }
 
         Ok(())
     }
 }
 
-/// Mount a filesystem at a path
-///
-/// If path is None or "/", this becomes the root mount.
-///
-/// Uses the current task's mount namespace, or init namespace if no task context.
+/// Mount a fresh superblock of `fs_type` on `mountpoint`, a dentry of the
+/// namespace's root mount (boot-time mounts), or as the root
 pub fn do_mount(
     fs_type: &'static FileSystemType,
     mountpoint: Option<Arc<Dentry>>,
 ) -> Result<Arc<Mount>, KernelError> {
     let sb = (fs_type.mount)(fs_type)?;
-    attach(sb, mountpoint, 0, false)
+    let mp = match mountpoint {
+        Some(d) => Some(Path::from_dentry(d).ok_or(KernelError::NotFound)?),
+        None => None,
+    };
+    attach(sb, mp, 0, false)
 }
 
 /// Mount `sb` on `mountpoint` (None: as the namespace root) with MNT_*
 /// flags `mnt_flags` and read-only state `ro`, which are set before the
 /// mount becomes visible (Linux do_new_mount: no window with weaker
-/// flags)
+/// flags). The new mount is a child of the mount the mountpoint is in.
 pub fn attach(
     sb: Arc<SuperBlock>,
-    mountpoint: Option<Arc<Dentry>>,
+    mountpoint: Option<Path>,
     mnt_flags: u32,
     ro: bool,
 ) -> Result<Arc<Mount>, KernelError> {
@@ -267,17 +278,14 @@ pub fn attach(
         // Under the mountpoint's i_rwsem (Linux lock_mount), which rmdir
         // and a rename replacing it hold: a directory removed meanwhile
         // is refused, one being removed sees this mount (EBUSY)
-        let dir = mp.get_inode().ok_or(KernelError::NotFound)?;
+        let dir = mp.dentry.get_inode().ok_or(KernelError::NotFound)?;
         let _dir_lock = dir.lock();
         if dir.is_dead() {
             return Err(KernelError::NotFound);
         }
-        mount.set_mountpoint(mp.clone());
-        // For simplicity, add to the root mount's children
-        if let Some(root_mount) = mnt_ns.get_root() {
-            mount.set_parent(&root_mount);
-            root_mount.add_child(mount.clone());
-        }
+        mount.set_mountpoint(mp.dentry.clone());
+        mount.set_parent(&mp.mnt);
+        mp.mnt.add_child(mount.clone());
         drop(_dir_lock);
     } else {
         mnt_ns.set_root(mount.clone());
@@ -291,13 +299,11 @@ pub fn mount_at_path(
     path: &[u8],
 ) -> Result<Arc<Mount>, KernelError> {
     if path == b"/" || path.is_empty() {
-        // Root mount
-        do_mount(fs_type, None)
-    } else {
-        // Look up the mount point
-        let dentry = super::namei::lookup_path(path)?;
-        do_mount(fs_type, Some(dentry))
+        return do_mount(fs_type, None);
     }
+    let mp = super::namei::path_lookupat(None, path, super::LookupFlags::open())?;
+    let sb = (fs_type.mount)(fs_type)?;
+    attach(sb, Some(mp), 0, false)
 }
 
 /// Superblock of a device-backed filesystem (vfat, ...) on the block
@@ -441,45 +447,46 @@ pub fn is_local_mountpoint(d: &Arc<Dentry>) -> bool {
     if inode.sb.upgrade().is_none_or(|sb| !sb.has_mounts_on()) {
         return false;
     }
-    lookup_mnt(d).is_some()
-}
-
-/// MNT_* flags of the mount `dentry` belongs to (0 if none)
-pub fn mnt_flags_of(dentry: &Arc<Dentry>) -> u32 {
-    crate::ns::current_mnt_ns()
-        .find_mount_for_dentry(dentry)
-        .map_or(0, |m| m.flags())
-}
-
-/// The dentry a walk lands on at `dentry` (Linux traverse_mounts): the
-/// root of the topmost mount stacked there in the caller's namespace,
-/// else `dentry` itself
-pub fn follow_mount(dentry: &Arc<Dentry>) -> Arc<Dentry> {
-    let mut d = dentry.clone();
-    while d.is_mountpoint() {
-        match lookup_mnt(&d) {
-            Some(m) => d = m.root.clone(),
-            None => break,
-        }
-    }
-    d
-}
-
-/// The mount on `d` in the caller's namespace (Linux lookup_mnt): its
-/// mountpoint is `d`'s inode, same superblock and number, so a dentry
-/// rebuilt after an ancestor rename still matches
-fn lookup_mnt(d: &Dentry) -> Option<Arc<Mount>> {
-    let root = crate::ns::current_mnt_ns().get_root()?;
+    let Some(root) = crate::ns::current_mnt_ns().get_root() else {
+        return false;
+    };
     let mut todo = alloc::vec![root];
     while let Some(m) = todo.pop() {
         for c in m.children.read().iter() {
             if c.get_mountpoint().is_some_and(|mp| same_inode(&mp, d)) {
-                return Some(c.clone());
+                return true;
             }
             todo.push(c.clone());
         }
     }
-    None
+    false
+}
+
+/// Where a walk lands on `p` (Linux traverse_mounts): the root of the
+/// topmost mount stacked on it, else `p` itself
+pub fn follow_mount(p: Path) -> Path {
+    let mut p = p;
+    while p.dentry.is_mountpoint() {
+        match lookup_mnt(&p) {
+            Some(m) => p = Path::new(m.clone(), m.root.clone()),
+            None => break,
+        }
+    }
+    p
+}
+
+/// The mount on `p` (Linux lookup_mnt): a child of `p.mnt` whose
+/// mountpoint is `p.dentry`'s inode
+fn lookup_mnt(p: &Path) -> Option<Arc<Mount>> {
+    p.mnt
+        .children
+        .read()
+        .iter()
+        .find(|c| {
+            c.get_mountpoint()
+                .is_some_and(|mp| same_inode(&mp, &p.dentry))
+        })
+        .cloned()
 }
 
 /// `a` and `b` are one inode: same superblock and number

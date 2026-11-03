@@ -20,7 +20,6 @@ use super::mount::Mount;
 use crate::io::poll::{
     DEFAULT_POLLMASK, POLLERR, POLLHUP, POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM, PollTable,
 };
-use crate::ns::current_mnt_ns;
 
 /// Largest kernel bounce buffer one read/write call uses: transfers
 /// bigger than this go through it in steps
@@ -401,14 +400,24 @@ impl File {
             .is_some_and(|m| m.flags() & super::mount::MNT_NOEXEC != 0)
     }
 
-    /// Create a new file
-    ///
-    /// Finds the mount for the dentry and increments its reference count
-    /// via mntget(). This ensures the mount cannot be unmounted while
-    /// this file is open.
-    pub fn new(dentry: Arc<Dentry>, flags: u32, f_op: &'static dyn FileOps) -> Self {
-        // Find the mount for this dentry and call mntget
-        let mnt = current_mnt_ns().find_mount_for_dentry(&dentry);
+    /// The file's path (Linux f_path); a file with no mount (an internal
+    /// object) is placed in the namespace's root mount
+    pub fn f_path(&self) -> Option<super::Path> {
+        match &self.mnt {
+            Some(m) => Some(super::Path::new(m.clone(), self.dentry.clone())),
+            None => super::Path::from_dentry(self.dentry.clone()),
+        }
+    }
+
+    /// Create a new file on `dentry` in mount `mnt` (None: an internal
+    /// object), counted in the mount's mnt_count (mntget) so it cannot
+    /// be unmounted while this file is open
+    pub fn new(
+        dentry: Arc<Dentry>,
+        mnt: Option<Arc<Mount>>,
+        flags: u32,
+        f_op: &'static dyn FileOps,
+    ) -> Self {
         if let Some(ref m) = mnt {
             m.mntget();
         }
@@ -438,7 +447,7 @@ impl File {
         f_op: &'static dyn FileOps,
         private: Arc<dyn core::any::Any + Send + Sync>,
     ) -> Self {
-        let f = Self::new(dentry, flags, f_op);
+        let f = Self::new(dentry, None, flags, f_op);
         f.private.call_once(|| private);
         f
     }

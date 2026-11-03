@@ -700,7 +700,10 @@ fn fd_link(pid: Pid, fd: i32) -> Result<Vec<u8>, KernelError> {
         }
         return Ok([b"anon_inode:".as_slice(), &file.dentry.name()].concat());
     }
-    Ok(file.dentry.full_path())
+    Ok(file
+        .f_path()
+        .map(|p| super::dentry::d_path_link(&p))
+        .unwrap_or_default())
 }
 
 /// Look up entries in /proc/<pid>/fd/
@@ -1051,7 +1054,8 @@ fn gen_maps(_: &crate::mm::Mm, mm: &crate::mm::MmStruct) -> Vec<u8> {
                 // seq_file_path(m, file, "\n"): a newline in a name
                 // cannot start a forged line
                 let mut p = Vec::new();
-                super::name::mangle(&mut p, &f.dentry.full_path(), b"\n");
+                let name = f.f_path().map(|fp| super::dentry::d_path_link(&fp));
+                super::name::mangle(&mut p, &name.unwrap_or_default(), b"\n");
                 (ino, "00:00", p)
             }
             None if v.flags & VM_GROWSDOWN != 0 => (0, "00:00", b"[stack]".to_vec()),
@@ -1732,14 +1736,23 @@ fn gen_meminfo() -> Vec<u8> {
 /// Format: device mountpoint fstype options dump pass
 /// Example: none / ramfs rw 0 0
 fn gen_mounts() -> Vec<u8> {
-    use crate::ns::current_mnt_ns;
-
     let mut output = Vec::new();
-
-    // Get root mount from current task's mount namespace
-    if let Some(root_mount) = current_mnt_ns().get_root() {
-        mounts_line(&mut output, b"/", &root_mount);
-        gen_mounts_recursive(&root_mount, &mut output);
+    let (Some(root_mount), Ok(root)) = (
+        crate::ns::current_mnt_ns().get_root(),
+        super::namei::nd_root(),
+    ) else {
+        return output;
+    };
+    // Depth first, parents before children; a mount outside the
+    // reader's root is not shown (Linux show_vfsmnt: seq_path_root)
+    let mut todo = alloc::vec![root_mount];
+    while let Some(m) = todo.pop() {
+        let at = super::Path::new(m.clone(), m.root.clone());
+        if let (mp, true) = super::dentry::d_path(&at, &root) {
+            mounts_line(&mut output, &mp, &m);
+        }
+        let children = m.children.read();
+        todo.extend(children.iter().rev().cloned());
     }
     output
 }
@@ -1755,20 +1768,6 @@ fn mounts_line(out: &mut Vec<u8>, mountpoint: &[u8], m: &super::mount::Mount) {
     out.push(b' ');
     out.extend_from_slice(m.opts().as_bytes());
     out.extend_from_slice(b" 0 0\n");
-}
-
-/// Recursively generate mount entries for child mounts
-fn gen_mounts_recursive(mount: &super::mount::Mount, output: &mut Vec<u8>) {
-    for child in mount.children.read().iter() {
-        let mountpoint = match child.get_mountpoint() {
-            Some(mp) => mp.full_path(),
-            None => b"unknown".to_vec(),
-        };
-        mounts_line(output, &mountpoint, child);
-
-        // Recurse into children
-        gen_mounts_recursive(child, output);
-    }
 }
 
 /// The sysctl behind a /proc/sys inode

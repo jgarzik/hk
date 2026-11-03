@@ -17,6 +17,7 @@ use crate::sync::spin::RwLock;
 
 use super::inode::Inode;
 use super::name::FileName;
+use super::path_ref::Path;
 use super::superblock::SuperBlock;
 
 /// Dentry flags
@@ -178,38 +179,63 @@ impl Dentry {
         self.sb.upgrade()
     }
 
-    /// Get the full path from root to this dentry, one consistent
-    /// picture under RENAME_LOCK
-    pub fn full_path(&self) -> Vec<u8> {
-        let _r = RENAME_LOCK.read();
-        let mut components = Vec::new();
-        let name = self.name();
-        if !name.is_empty() {
-            components.push(name);
-        }
-        let mut cur = self.get_parent();
-        while let Some(d) = cur {
-            let name = d.name();
-            if !name.is_empty() {
-                components.push(name);
-            }
-            cur = d.get_parent();
-        }
-        if components.is_empty() {
-            return b"/".to_vec();
-        }
-        let mut path = Vec::new();
-        for comp in components.iter().rev() {
-            path.push(b'/');
-            path.extend_from_slice(comp);
-        }
-        path
-    }
-
     /// Get number of children
     pub fn num_children(&self) -> usize {
         self.d_lock.read().children.len()
     }
+}
+
+/// The name of `p` as seen from `root` (Linux prepend_path): climbs
+/// dentry parents and, at a mount's root, to its mountpoint in the
+/// parent mount; one consistent picture under RENAME_LOCK. The bool is
+/// false when the walk ended without meeting `root` (a path outside
+/// the caller's root, or on a detached mount): the name then starts at
+/// whatever root it reached.
+pub fn d_path(p: &Path, root: &Path) -> (Vec<u8>, bool) {
+    let _r = RENAME_LOCK.read();
+    let (mut mnt, mut d) = (p.mnt.clone(), p.dentry.clone());
+    let mut names = Vec::new();
+    let reached = loop {
+        if Arc::ptr_eq(&mnt, &root.mnt) && Arc::ptr_eq(&d, &root.dentry) {
+            break true;
+        }
+        if Arc::ptr_eq(&d, &mnt.root) {
+            match (mnt.get_parent(), mnt.get_mountpoint()) {
+                (Some(m), Some(mp)) => {
+                    (mnt, d) = (m, mp);
+                    continue;
+                }
+                _ => break false,
+            }
+        }
+        let Some(parent) = d.get_parent() else {
+            break false;
+        };
+        names.push(d.name());
+        d = parent;
+    };
+    if names.is_empty() {
+        return (b"/".to_vec(), reached);
+    }
+    let mut out = Vec::new();
+    for n in names.iter().rev() {
+        out.push(b'/');
+        out.extend_from_slice(n);
+    }
+    (out, reached)
+}
+
+/// A /proc link's name for `p` (Linux d_path): as `d_path` from the
+/// reader's root, " (deleted)" appended for a removed file
+pub fn d_path_link(p: &Path) -> Vec<u8> {
+    let mut out = match super::namei::nd_root() {
+        Ok(root) => d_path(p, &root).0,
+        Err(_) => Vec::new(),
+    };
+    if p.dentry.is_unhashed() {
+        out.extend_from_slice(b" (deleted)");
+    }
+    out
 }
 
 /// Unhook `d` from its parent's children if it is still there

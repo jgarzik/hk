@@ -749,7 +749,7 @@ pub fn sys_fanotify_mark(fd: i32, mark_flags: u32, mask: u64, dirfd: i32, pathna
         } else {
             // Get dentry from dirfd
             match fd_table.lock().get(dirfd) {
-                Some(f) => Path::from_dentry(f.dentry.clone()),
+                Some(f) => f.f_path(),
                 None => return -9, // EBADF
             }
         };

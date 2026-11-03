@@ -107,15 +107,18 @@ impl MntNamespace {
     ///
     /// Deep-copies the entire mount tree so the new namespace has
     /// an independent view of the filesystem hierarchy.
-    pub fn clone_ns(&self) -> Result<Arc<Self>, i32> {
+    /// `fs` (the new task's, or the unsharer's own) moves its root and
+    /// pwd to the copies of their mounts (Linux copy_mnt_ns)
+    pub fn clone_ns(&self, fs: Option<&crate::fs::FsStruct>) -> Result<Arc<Self>, i32> {
         let new_ns = Self::new();
-
-        // Clone the mount tree if we have a root
-        if let Some(old_root) = self.root.read().as_ref() {
-            let new_root = Mount::clone_tree(old_root)?;
+        let old_root = self.root.read().clone();
+        if let Some(old_root) = old_root {
+            let (new_root, map) = Mount::clone_tree(&old_root)?;
             *new_ns.root.write() = Some(new_root);
+            if let Some(fs) = fs {
+                fs.repoint(&map);
+            }
         }
-
         Ok(new_ns)
     }
 
@@ -132,105 +135,6 @@ impl MntNamespace {
     /// Get the root dentry
     pub fn get_root_dentry(&self) -> Option<Arc<crate::fs::dentry::Dentry>> {
         self.get_root().map(|m| m.root.clone())
-    }
-
-    /// Find which mount a dentry belongs to by device ID
-    pub fn find_mount_for_dev(&self, dev_id: u64) -> Option<Arc<Mount>> {
-        let root = self.get_root()?;
-
-        // Check if dentry belongs to root mount's filesystem
-        if root.sb.dev_id == dev_id {
-            return Some(root.clone());
-        }
-
-        // Check children recursively
-        self.find_mount_for_dev_recursive(&root, dev_id)
-    }
-
-    fn find_mount_for_dev_recursive(&self, mount: &Arc<Mount>, dev_id: u64) -> Option<Arc<Mount>> {
-        for child in mount.children.read().iter() {
-            if child.sb.dev_id == dev_id {
-                return Some(child.clone());
-            }
-            if let Some(found) = self.find_mount_for_dev_recursive(child, dev_id) {
-                return Some(found);
-            }
-        }
-        None
-    }
-
-    /// Find mount whose root dentry matches the given dentry
-    pub fn find_mount_at(&self, dentry: &Arc<crate::fs::dentry::Dentry>) -> Option<Arc<Mount>> {
-        let root = self.get_root()?;
-
-        // Check if this is the root mount
-        if Arc::ptr_eq(&root.root, dentry) {
-            return Some(root);
-        }
-
-        // Check if dentry matches root mount's root by inode
-        if let (Some(root_ino), Some(d_ino)) = (root.root.get_inode(), dentry.get_inode())
-            && root_ino.ino == d_ino.ino
-            && root.root.superblock().map(|s| s.dev_id) == dentry.superblock().map(|s| s.dev_id)
-        {
-            return Some(root);
-        }
-
-        // Search children recursively
-        self.find_mount_recursive(&root, dentry)
-    }
-
-    fn find_mount_recursive(
-        &self,
-        mount: &Arc<Mount>,
-        dentry: &Arc<crate::fs::dentry::Dentry>,
-    ) -> Option<Arc<Mount>> {
-        for child in mount.children.read().iter() {
-            // Check if child's root dentry matches the target
-            if Arc::ptr_eq(&child.root, dentry) {
-                return Some(child.clone());
-            }
-
-            // Also check by inode number + device ID
-            if let (Some(child_ino), Some(d_ino)) = (child.root.get_inode(), dentry.get_inode())
-                && child_ino.ino == d_ino.ino
-                && child.root.superblock().map(|s| s.dev_id)
-                    == dentry.superblock().map(|s| s.dev_id)
-            {
-                return Some(child.clone());
-            }
-
-            // Recurse into child's children
-            if let Some(found) = self.find_mount_recursive(child, dentry) {
-                return Some(found);
-            }
-        }
-        None
-    }
-
-    /// Find which mount a dentry belongs to
-    ///
-    /// Given a dentry, returns the mount whose filesystem contains it.
-    /// This walks up the mount tree to find the appropriate mount.
-    pub fn find_mount_for_dentry(
-        &self,
-        dentry: &Arc<crate::fs::dentry::Dentry>,
-    ) -> Option<Arc<Mount>> {
-        let root = self.get_root()?;
-
-        // Check if dentry belongs to root mount's filesystem
-        if let Some(dentry_sb) = dentry.superblock() {
-            // First check root mount
-            if dentry_sb.dev_id == root.sb.dev_id {
-                return Some(root.clone());
-            }
-
-            // Check children recursively by device ID
-            self.find_mount_for_dev_recursive(&root, dentry_sb.dev_id)
-        } else {
-            // Fall back to root mount
-            Some(root)
-        }
     }
 }
 
@@ -314,7 +218,7 @@ impl NsProxy {
     /// # Returns
     /// * `Ok(Arc<NsProxy>)` - New nsproxy (may share namespaces with self)
     /// * `Err(errno)` - On allocation failure
-    pub fn copy(&self, flags: u64) -> Result<Arc<Self>, i32> {
+    pub fn copy(&self, flags: u64, fs: Option<&crate::fs::FsStruct>) -> Result<Arc<Self>, i32> {
         let uts_ns = if flags & CLONE_NEWUTS != 0 {
             self.uts_ns.clone_ns()?
         } else {
@@ -322,7 +226,7 @@ impl NsProxy {
         };
 
         let mnt_ns = if flags & CLONE_NEWNS != 0 {
-            self.mnt_ns.clone_ns()?
+            self.mnt_ns.clone_ns(fs)?
         } else {
             self.mnt_ns.clone()
         };
@@ -437,7 +341,13 @@ pub fn copy_namespaces(parent_tid: Tid, child_tid: Tid, flags: u64) -> Result<()
     let child_ns = if ns_flags != 0 {
         // Some namespace flags set - copy with potential new namespaces
         let parent_ns = get_task_ns(parent_tid).unwrap_or_else(|| INIT_NSPROXY.clone());
-        parent_ns.copy(ns_flags)?
+        // CLONE_NEWNS with a shared fs struct is EINVAL (Linux
+        // copy_process); the child's own copy follows its new mounts
+        if ns_flags & CLONE_NEWNS != 0 && flags & crate::task::clone_flags::CLONE_FS != 0 {
+            return Err(22);
+        }
+        let fs = crate::fs::get_task_fs(child_tid);
+        parent_ns.copy(ns_flags, fs.as_deref())?
     } else {
         // No namespace flags - share parent's nsproxy
         get_task_ns(parent_tid).unwrap_or_else(|| INIT_NSPROXY.clone())
@@ -563,7 +473,18 @@ pub fn sys_unshare(unshare_flags: u64) -> i64 {
     let current_ns = get_task_ns(tid).unwrap_or_else(|| INIT_NSPROXY.clone());
 
     // Create new nsproxy with new namespace(s)
-    let new_ns = match current_ns.copy(ns_flags) {
+    // CLONE_NEWNS implies CLONE_FS (Linux unshare): a private fs
+    // struct, moved to the copies of its mounts
+    let fs = if ns_flags & CLONE_NEWNS != 0 {
+        let fs = crate::task::percpu::current_fs().map(|f| f.copy());
+        if let Some(f) = &fs {
+            crate::fs::init_task_fs(tid, f.clone());
+        }
+        fs
+    } else {
+        None
+    };
+    let new_ns = match current_ns.copy(ns_flags, fs.as_deref()) {
         Ok(ns) => ns,
         Err(_) => return -EINVAL,
     };
@@ -734,6 +655,16 @@ pub fn sys_setns(fd: i32, nstype: i32) -> i64 {
         }),
     };
 
+    let mnt_root = matches!(ns_type, NamespaceType::Mnt)
+        .then(|| new_ns.mnt_ns.get_root())
+        .flatten();
     switch_task_namespaces(tid, new_ns);
+    // Joining a mount namespace puts root and cwd at its root (Linux
+    // mntns_install)
+    if let (Some(m), Some(fs)) = (mnt_root, crate::task::percpu::current_fs()) {
+        let root = crate::fs::Path::new(m.clone(), m.root.clone());
+        fs.set_root(root.clone());
+        fs.set_pwd(root);
+    }
     0
 }

@@ -289,13 +289,6 @@ has one mount per namespace). Unlike Linux (MNT_WRITE_HOLD), a
 EBUSY can see a spurious EROFS. Mount data/options strings are
 ignored; mounts are not user-namespace aware (plain capable()).
 
-A mount is found from a dentry by superblock dev_id in the caller's
-namespace (`MntNamespace::find_mount_for_dentry`), not carried by the
-path walk: `File.mnt` is picked that way at open, open's NODEV check
-and statfs flags at the call. Two mounts of one superblock (bind
-mounts, once they exist) would be told apart wrongly. Phase G
-(Path{mnt, dentry} from the walk) fixes the lookup.
-
 ## Thread-group exit gaps
 
 **Location**: `signal/mod.rs` (group exit), `task/exec.rs`
@@ -686,10 +679,6 @@ expected to fix it; "next batch" means the next fix batch.
    on every walk. Scenario: stat environ of a uid-1000 child, child
    sets `PR_SET_DUMPABLE 0`, stat again: hk still says uid 1000
    (Linux 0).
-8. **EXDEV compares superblocks, not mounts** (fix in V1)
-   (`fs/link.rs:298`, `:484`): a link or rename across two
-   mounts of one superblock (bind mounts) is EXDEV on Linux. Needs
-   Path{mnt,dentry}; TODO in place for linkat.
 
 ## P2 review findings (open)
 From the P2 /code-review (unverified). Tag = when to fix.

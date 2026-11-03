@@ -1035,7 +1035,11 @@ where
     {
         let mut m = mm.mmap_write();
         m.set_brk(start_brk);
-        m.set_exe(file.dentry.full_path().into(), deny);
+        let exe = match (file.f_path(), crate::fs::namei::nd_root()) {
+            (Some(p), Ok(root)) => crate::fs::dentry::d_path(&p, &root).0,
+            _ => alloc::vec::Vec::new(),
+        };
+        m.set_exe(exe.into(), deny);
         let code = image_layout(&elf, base_addr);
         m.set_args(MmLayout {
             start_code: code.start_code,
@@ -1181,7 +1185,7 @@ fn exec_name(dirfd: i32, path: &[u8]) -> Vec<u8> {
 /// The dentry execveat runs: `path` from dirfd (or the current
 /// directory, or the root if absolute), or with AT_EMPTY_PATH and an
 /// empty path dirfd's own file
-fn exec_lookup(dirfd: i32, path: &[u8], flags: i32) -> Result<Arc<crate::fs::Dentry>, i32> {
+fn exec_lookup(dirfd: i32, path: &[u8], flags: i32) -> Result<crate::fs::Path, i32> {
     use crate::fs::namei::{LookupFlags, filename_lookup};
     filename_lookup(dirfd, path, LookupFlags::at(flags)).map_err(|e| e as i32)
 }

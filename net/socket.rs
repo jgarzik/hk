@@ -202,7 +202,7 @@ pub fn sock_alloc_file(sock: Arc<dyn ProtoOps>, nonblock: bool) -> Arc<File> {
     if nonblock {
         flags |= fflags::O_NONBLOCK;
     }
-    Arc::new(File::new(dentry, flags, &SOCK_FOPS))
+    Arc::new(File::new(dentry, None, flags, &SOCK_FOPS))
 }
 
 /// Create a protocol socket (Linux __sock_create)

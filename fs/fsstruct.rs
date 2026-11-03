@@ -103,6 +103,25 @@ impl FsStruct {
         drop(old);
     }
 
+    /// After a mount namespace copy: root and pwd move to the copies of
+    /// their mounts (Linux copy_mnt_ns, for the new task's fs)
+    pub fn repoint(&self, map: &crate::fs::mount::MountMap) {
+        let swap = |p: &Path| {
+            map.iter()
+                .find(|(old, _)| Arc::ptr_eq(old, &p.mnt))
+                .map(|(_, new)| Path::new(new.clone(), p.dentry.clone()))
+        };
+        let old = {
+            let mut inner = self.inner.lock();
+            let (root, pwd) = (swap(&inner.root), swap(&inner.pwd));
+            (
+                root.map(|r| core::mem::replace(&mut inner.root, r)),
+                pwd.map(|p| core::mem::replace(&mut inner.pwd, p)),
+            )
+        };
+        drop(old);
+    }
+
     /// Set umask, returns old umask
     pub fn set_umask(&self, new_umask: u16) -> u16 {
         let mut inner = self.inner.lock();

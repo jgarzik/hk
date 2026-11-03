@@ -289,9 +289,12 @@ const AT_STATX_SYNC_TYPE: i32 = AT_STATX_FORCE_SYNC | AT_STATX_DONT_SYNC;
 
 /// sys_statfs - get filesystem statistics by path
 pub fn sys_statfs(path_ptr: u64, buf: u64) -> i64 {
-    let r = user_path_at(AT_FDCWD, path_ptr, LookupFlags::open(), false).and_then(|dentry| {
-        let sb = dentry.superblock().ok_or(KernelError::NotFound)?;
-        let st = sb.s_op.statfs().to_linux(sb.dev_id, st_flags(&dentry, &sb));
+    let r = user_path_at(AT_FDCWD, path_ptr, LookupFlags::open(), false).and_then(|path| {
+        let sb = path.dentry.superblock().ok_or(KernelError::NotFound)?;
+        let st = sb
+            .s_op
+            .statfs()
+            .to_linux(sb.dev_id, st_flags(path.mnt.flags(), &sb));
         put_user::<Uaccess, LinuxStatFs>(buf, st).map_err(|_| KernelError::BadAddress)
     });
     ret(r)
@@ -299,10 +302,10 @@ pub fn sys_statfs(path_ptr: u64, buf: u64) -> i64 {
 
 /// statfs f_flags (Linux calculate_f_flags): ST_VALID, ST_RDONLY from
 /// the superblock, ST_NOSUID/NODEV/NOEXEC from the mount
-fn st_flags(dentry: &alloc::sync::Arc<super::Dentry>, sb: &super::SuperBlock) -> u64 {
+fn st_flags(mnt_flags: u32, sb: &super::SuperBlock) -> u64 {
     const ST_VALID: u64 = 0x20;
     // MNT_NOSUID/NODEV/NOEXEC (1, 2, 4) map to ST_NOSUID/NODEV/NOEXEC (2, 4, 8)
-    let mnt = super::mount::mnt_flags_of(dentry) as u64;
+    let mnt = mnt_flags as u64;
     ST_VALID | sb.rdonly() as u64 | (mnt & 7) << 1
 }
 
@@ -334,7 +337,10 @@ pub fn sys_fstatfs(fd: i32, buf: u64) -> i64 {
 
     // Get stats
     let statfs = sb.s_op.statfs();
-    let linux_statfs = statfs.to_linux(sb.dev_id, st_flags(&file.dentry, &sb));
+    let linux_statfs = statfs.to_linux(
+        sb.dev_id,
+        st_flags(file.f_path().map_or(0, |p| p.mnt.flags()), &sb),
+    );
 
     // Copy to user
     if put_user::<Uaccess, LinuxStatFs>(buf, linux_statfs).is_err() {

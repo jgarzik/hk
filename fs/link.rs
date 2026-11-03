@@ -12,7 +12,7 @@ use crate::fs::namei::{
     getname,
 };
 use crate::fs::{
-    Dentry, Inode, KernelError, LookupFlags, MAY_WRITE, dac, is_subdir, lock_rename,
+    Inode, KernelError, LookupFlags, MAY_WRITE, Path, dac, is_subdir, lock_rename,
     lock_two_nondirs, lookup_one,
 };
 use crate::uaccess::copy_to_user;
@@ -167,7 +167,7 @@ fn link_locked(dir: &Arc<Inode>, name: &[u8], inode: &Arc<Inode>) -> Result<(), 
 /// a descriptor passed to an unprivileged process cannot be linked back
 /// into the tree; an empty path with it names `dirfd` itself; the final
 /// symlink is followed only with AT_SYMLINK_FOLLOW
-fn link_source(dirfd: i32, path_ptr: u64, flags: i32) -> Result<Arc<Dentry>, KernelError> {
+fn link_source(dirfd: i32, path_ptr: u64, flags: i32) -> Result<Path, KernelError> {
     let path = getname(path_ptr, flags & AT_EMPTY_PATH != 0);
     if flags & AT_EMPTY_PATH != 0 && !crate::task::capable(crate::task::CAP_DAC_READ_SEARCH) {
         return Err(KernelError::NotFound);
@@ -201,21 +201,19 @@ pub fn sys_linkat(
     if flags & !(AT_SYMLINK_FOLLOW | AT_EMPTY_PATH) != 0 {
         return KernelError::InvalidArgument.sysret();
     }
-    let old_dentry = match link_source(olddirfd, oldpath_ptr, flags) {
+    let old = match link_source(olddirfd, oldpath_ptr, flags) {
         Ok(d) => d,
         Err(e) => return e.sysret(),
     };
-    let Some(old_inode) = old_dentry.get_inode() else {
+    let Some(old_inode) = old.dentry.get_inode() else {
         return KernelError::NotFound.sysret();
     };
     let p = match getname(newpath_ptr, false).and_then(|n| filename_create(newdirfd, &n, false)) {
         Ok(p) => p,
         Err(e) => return e.sysret(),
     };
-    // TODO(V1 path + mounts): Linux is EXDEV when the two paths are on
-    // different vfsmounts, even of one superblock; comparing superblocks
-    // is the same until bind mounts exist
-    if old_dentry.superblock().map(|s| s.dev_id) != p.dir.superblock().map(|s| s.dev_id) {
+    // EXDEV across mounts, even of one superblock
+    if !Arc::ptr_eq(&old.mnt, &p.mnt) {
         return KernelError::CrossDevice.sysret();
     }
 
@@ -374,8 +372,7 @@ fn do_renameat2(
     let newpath = getname(newpath_ptr, false);
     let old = filename_parentat(olddirfd, &getname(oldpath_ptr, false)?)?;
     let new = filename_parentat(newdirfd, &newpath?)?;
-    // TODO(V1 path + mounts): EXDEV compares mounts in Linux
-    if old.dir.superblock().map(|s| s.dev_id) != new.dir.superblock().map(|s| s.dev_id) {
+    if !Arc::ptr_eq(&old.mnt, &new.mnt) {
         return Err(KernelError::CrossDevice);
     }
     if old.last != Last::Norm {
