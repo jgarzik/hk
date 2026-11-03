@@ -190,6 +190,7 @@ pub fn init_bsp(apic_id: u8) {
     // Mark BSP as online
     percpu.set_online();
     CPU_COUNT.store(1, Ordering::SeqCst);
+    crate::mm::numa::cpu_up(0, apic_id as u64);
 }
 
 /// Initialize per-CPU data for an AP
@@ -210,6 +211,7 @@ pub fn init_ap(apic_id: u8) -> u32 {
 
     // Mark as online
     percpu.set_online();
+    crate::mm::numa::cpu_up(cpu_id, apic_id as u64);
 
     cpu_id
 }

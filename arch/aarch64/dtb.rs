@@ -433,30 +433,28 @@ pub fn init_numa_topology() -> Result<bool, &'static str> {
                 continue;
             }
 
-            // Get CPU ID from reg property
-            let cpu_id = match cpu_child.property("reg") {
-                Some(reg) => reg.as_u32().unwrap_or(0),
+            // Its MPIDR affinity, from reg (one or two cells)
+            let hwid = match cpu_child.property("reg") {
+                Some(reg) if reg.data().len() >= 8 => reg.as_u64().unwrap_or(0),
+                Some(reg) => reg.as_u32().unwrap_or(0) as u64,
                 None => continue,
             };
+            let hwid = hwid & super::cpu::MPIDR_HWID_BITMASK;
 
             // Get numa-node-id if present
             if let Some(numa_prop) = cpu_child.property("numa-node-id")
                 && let Some(node_id) = numa_prop.as_u32()
             {
                 let node_id = node_id as usize;
-                if node_id < MAX_NUMA_NODES && (cpu_id as usize) < crate::util::cpumask::NR_CPUS {
+                if node_id < MAX_NUMA_NODES {
                     found_numa = true;
-                    topology.cpu_to_node[cpu_id as usize] = node_id as u8;
+                    // By MPIDR affinity: the logical CPU joins at bring-up
+                    topology.set_hwid_node(hwid, node_id as u32);
 
                     // Ensure node exists
                     if topology.nodes[node_id].is_none() {
                         topology.nodes[node_id] = Some(NumaNode::new(node_id as u32));
                         topology.node_online_mask |= 1u64 << node_id;
-                    }
-
-                    // Add the CPU to the node's CPUs
-                    if let Some(ref mut node) = topology.nodes[node_id] {
-                        node.add_cpu(cpu_id);
                     }
                 }
             }

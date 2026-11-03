@@ -203,7 +203,6 @@ use crate::mm::STACK_TOP as USER_STACK_TOP;
 /// Falls back to single-node topology if no NUMA info is available.
 fn init_numa_topology() {
     let total_pages = mm::memblock::MEMBLOCK.lock().memory.total() / 4096;
-    let nr_cpus = 1; // Will be updated when SMP is initialized
 
     #[cfg(target_arch = "x86_64")]
     {
@@ -238,7 +237,7 @@ fn init_numa_topology() {
     }
 
     // Fallback to single-node topology
-    mm::numa::init_single_node_fallback(total_pages, nr_cpus);
+    mm::numa::init_single_node_fallback(total_pages);
 }
 
 /// Discover boot framebuffer from firmware

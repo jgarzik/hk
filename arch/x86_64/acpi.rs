@@ -725,7 +725,6 @@ pub fn init_numa_topology() -> Result<bool, &'static str> {
 /// Parse SRAT table and populate NUMA topology
 fn parse_srat_mapped(srat_phys: u64) -> Result<(), &'static str> {
     use crate::mm::numa::{MAX_NUMA_NODES, NUMA_TOPOLOGY, NumaNode};
-    use crate::util::cpumask::NR_CPUS as MAX_CPUS;
 
     unsafe {
         // Map the SRAT
@@ -835,13 +834,9 @@ fn parse_srat_mapped(srat_phys: u64) -> Result<(), &'static str> {
 
                     if enabled {
                         let node_id = (prox_domain_lo | (prox_domain_hi << 8)) as usize;
-                        if node_id < MAX_NUMA_NODES && (apic_id as usize) < MAX_CPUS {
-                            topology.cpu_to_node[apic_id as usize] = node_id as u8;
-
-                            // Also add the CPU to the node's CPUs
-                            if let Some(ref mut node) = topology.nodes[node_id] {
-                                node.add_cpu(apic_id);
-                            }
+                        // By APIC id: the logical CPU joins at bring-up
+                        if node_id < MAX_NUMA_NODES {
+                            topology.set_hwid_node(apic_id as u64, node_id as u32);
                         }
                     }
                 }
@@ -859,14 +854,9 @@ fn parse_srat_mapped(srat_phys: u64) -> Result<(), &'static str> {
 
                     if enabled {
                         let node_id = prox_domain as usize;
-                        // x2APIC IDs can be > 255, but we only support up to MAX_CPUS
-                        if node_id < MAX_NUMA_NODES && (x2apic_id as usize) < MAX_CPUS {
-                            topology.cpu_to_node[x2apic_id as usize] = node_id as u8;
-
-                            // Also add the CPU to the node's CPUs
-                            if let Some(ref mut node) = topology.nodes[node_id] {
-                                node.add_cpu(x2apic_id);
-                            }
+                        // By x2APIC id: the logical CPU joins at bring-up
+                        if node_id < MAX_NUMA_NODES {
+                            topology.set_hwid_node(x2apic_id as u64, node_id as u32);
                         }
                     }
                 }

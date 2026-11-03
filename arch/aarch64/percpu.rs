@@ -221,6 +221,7 @@ pub fn init_bsp(mpidr: u64, kernel_stack_top: u64) {
     // Mark BSP as online
     percpu.set_online();
     CPU_COUNT.store(1, Ordering::SeqCst);
+    crate::mm::numa::cpu_up(0, mpidr & super::cpu::MPIDR_HWID_BITMASK);
 }
 
 /// Initialize per-CPU data for an AP
@@ -240,6 +241,7 @@ pub fn init_ap(mpidr: u64, kernel_stack_top: u64) -> u32 {
 
     // Mark as online
     percpu.set_online();
+    crate::mm::numa::cpu_up(cpu_id, mpidr & super::cpu::MPIDR_HWID_BITMASK);
 
     cpu_id
 }

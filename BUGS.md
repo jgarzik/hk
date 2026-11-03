@@ -162,12 +162,6 @@ Topology is discovered (ACPI SRAT/SLIT, DT `numa-node-id`) and
 getcpu reports it; nothing else uses it. Missing (Linux
 `mm/mempolicy.c`, `mm/migrate.c`):
 
-- `cpu_to_node` and the node CPU sets are indexed by the firmware's
-  CPU id (x86 SRAT APIC/x2APIC id, arm64 DT `reg` = MPIDR), but
-  getcpu looks them up by logical CPU number: wrong nodes when the ids
-  are sparse (Linux maps hardware id to node at parse time, then
-  logical CPU to node at bring-up). The single-node fallback only
-  lists CPU 0.
 - Policies are not stored: set_mempolicy and mbind validate and
   return 0 (the `TaskMempolicy`/`Vma.mempolicy` fields stay default);
   get_mempolicy always reports MPOL_LOCAL (Linux: the stored mode,

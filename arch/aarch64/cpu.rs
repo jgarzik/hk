@@ -30,6 +30,10 @@ pub fn current_el() -> ExceptionLevel {
     }
 }
 
+/// The affinity fields of MPIDR_EL1 (Aff3, Aff2..Aff0), as DT cpu `reg`
+/// holds them (Linux MPIDR_HWID_BITMASK)
+pub const MPIDR_HWID_BITMASK: u64 = 0xff_00ff_ffff;
+
 /// Read MPIDR_EL1 (Multiprocessor Affinity Register)
 ///
 /// Returns the CPU's affinity values used to identify it in SMP systems.

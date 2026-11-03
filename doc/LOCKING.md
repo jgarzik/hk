@@ -3191,7 +3191,7 @@ writes and truncates). The address space holds the executable's denial (`MmStruc
 | `SuperBlock.s_wb_lock` | fs/superblock.rs | sleeping `sync::Mutex` | serializes whole-filesystem writeback passes (`writeback_sb`: sync, syncfs, umount, the periodic writeback), held across their I/O: s_wb_lock -> page lock -> i_mmap -> PTE lock. fsync writes its inode without it; a page another pass is writing carries the WRITEBACK mark and its writer holds its page lock, so fsync waits on that lock |
 | `SuperBlock.s_dirty`, `SUPER_BLOCKS` | fs/superblock.rs, fs/fs_writeback.rs | spin Mutex leaves | inodes with dirty pages, each held (an `Arc`) until written back (Linux wb->b_dirty), and the device filesystems for sync(2) (Linux super_blocks). `mark_inode_dirty` takes `s_dirty` under a page lock at most (the fault path), then the BDI's spin locks to arm its periodic writeback; writeback takes the list and writes with no spin lock held |
 | `LAST_INO` (per CPU) | fs/anon_inodes.rs | IrqSpinlock leaf | this CPU's batch of pseudo-filesystem inode numbers (Linux get_next_ino, preempt-off per-CPU counter); refilled from the atomic `SHARED_LAST_INO` under it |
-| `NUMA_TOPOLOGY` | mm/numa.rs | IrqSpinlock | NUMA node table |
+| `NUMA_TOPOLOGY` | mm/numa.rs | IrqSpinlock leaf | NUMA node table: written by the boot parsers and by each CPU at bring-up (`numa::cpu_up`, end of arch per-CPU init), read by getcpu and the mempolicy syscalls |
 | `BpfHashMap.data`, `BpfArrayMap.data` | bpf/map.rs | IrqSpinlock | BPF map contents |
 
 ---
