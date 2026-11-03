@@ -944,66 +944,57 @@ pub fn exit_robust_list(tid: Tid) {
         Err(_) => return,
     };
 
-    // Handle pending lock (lock being acquired at exit)
-    if pending_ptr != 0 {
-        handle_futex_death(pending_ptr, futex_offset, tid);
-    }
-
-    // Walk the list
-    let mut entry = list_ptr;
+    // Linux exit_robust_list: bit 0 of an entry marks a PI futex; the
+    // pending op (a lock being taken or released) is handled last
+    let (pending, pending_pi) = (pending_ptr & !1, pending_ptr & 1 != 0);
+    let mut uentry = list_ptr;
     let mut count = 0;
-
-    while entry != head_addr && count < ROBUST_LIST_LIMIT {
-        // Get next pointer before potentially modifying entry
-        let next = match read_user_u64(entry) {
-            Ok(v) => v,
-            Err(_) => break,
+    while uentry & !1 != head_addr && count < ROBUST_LIST_LIMIT {
+        let entry = uentry & !1;
+        let Ok(next) = read_user_u64(entry) else {
+            break;
         };
-
-        // Skip the pending entry (already handled)
-        if entry != pending_ptr {
-            handle_futex_death(entry, futex_offset, tid);
+        if entry != pending {
+            handle_futex_death(entry, futex_offset, tid, uentry & 1 != 0, false);
         }
-
-        entry = next;
+        uentry = next;
         count += 1;
+    }
+    if pending != 0 {
+        handle_futex_death(pending, futex_offset, tid, pending_pi, true);
     }
 }
 
-/// Handle a single futex on task death
-///
-/// If the task owns the futex (TID matches), set FUTEX_OWNER_DIED
-/// and wake one waiter.
-fn handle_futex_death(entry: u64, futex_offset: i64, tid: Tid) {
-    // Calculate futex address from entry + offset
-    let futex_addr = if futex_offset >= 0 {
-        entry.wrapping_add(futex_offset as u64)
-    } else {
-        entry.wrapping_sub((-futex_offset) as u64)
-    };
-
-    // Read current futex value
-    let current_val = match read_user_u32(futex_addr) {
-        Ok(v) => v,
-        Err(_) => return,
-    };
-
-    // Check if we own this futex
-    let owner_tid = current_val & futex_op::FUTEX_TID_MASK;
-    if owner_tid != tid as u32 {
-        return; // Not our futex
-    }
-
-    // Owner died, waiters kept, the dead TID cleared (Linux
-    // handle_futex_death: a reused TID must not look like the owner)
-    let new_val = (current_val & futex_op::FUTEX_WAITERS) | futex_op::FUTEX_OWNER_DIED;
-    if write_user_u32(futex_addr, new_val).is_err() {
+/// A robust futex of an exiting task (Linux handle_futex_death): if it
+/// holds the lock, mark the owner dead (waiters kept, its TID cleared so
+/// a reused TID is not taken for the owner) and wake a waiter of a
+/// non-PI futex (PI futexes are not implemented). A pending non-PI op
+/// on a free word wakes a waiter: the task may have died between being
+/// woken and taking the lock
+fn handle_futex_death(entry: u64, futex_offset: i64, tid: Tid, pi: bool, pending_op: bool) {
+    let futex_addr = entry.wrapping_add_signed(futex_offset);
+    if !futex_addr.is_multiple_of(4) {
         return;
     }
-
-    // Wake one waiter, shared (Linux handle_futex_death: a robust
-    // futex may be in shared memory)
-    futex_wake(futex_addr, 1, futex_op::FUTEX_BITSET_MATCH_ANY, false);
+    let Ok(uval) = read_user_u32(futex_addr) else {
+        return;
+    };
+    let any = futex_op::FUTEX_BITSET_MATCH_ANY;
+    if pending_op && !pi && uval == 0 {
+        futex_wake(futex_addr, 1, any, false);
+        return;
+    }
+    if uval & futex_op::FUTEX_TID_MASK != tid as u32 {
+        return;
+    }
+    let mval = (uval & futex_op::FUTEX_WAITERS) | futex_op::FUTEX_OWNER_DIED;
+    if write_user_u32(futex_addr, mval).is_err() {
+        return;
+    }
+    // Shared: a robust futex may be in shared memory
+    if !pi && uval & futex_op::FUTEX_WAITERS != 0 {
+        futex_wake(futex_addr, 1, any, false);
+    }
 }
 
 // =============================================================================

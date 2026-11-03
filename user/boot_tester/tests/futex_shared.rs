@@ -9,13 +9,15 @@
 //!   is a different futex in each process.
 //! - FUTEX_CTID_SHARED: clear_child_tid wakes a shared (non-PRIVATE)
 //!   waiter on the tid word.
+//! - FUTEX_ROBUST_PENDING: a thread exiting with a robust pending op on
+//!   a free futex word wakes a waiter there (Linux handle_futex_death).
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use super::fork_mm::spawn_thread;
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
-    FUTEX_WAIT, FUTEX_WAKE, MAP_ANONYMOUS, MAP_PRIVATE, MAP_SHARED, MREMAP_FIXED, MREMAP_MAYMOVE,
+    FUTEX_WAIT, FUTEX_WAKE, MAP_ANONYMOUS, RobustListHead, sys_set_robust_list, MAP_PRIVATE, MAP_SHARED, MREMAP_FIXED, MREMAP_MAYMOVE,
     O_CREAT, O_RDWR, PROT_READ, PROT_WRITE, Timespec, sys_close, sys_exit, sys_fork, sys_ftruncate,
     sys_futex, sys_mmap, sys_mremap, sys_munmap, sys_nanosleep, sys_open, sys_unlink, sys_wait4,
 };
@@ -29,6 +31,7 @@ pub fn run_tests() {
     shared_moved();
     private_split();
     ctid_shared();
+    robust_pending();
 }
 
 fn report(name: &[u8], ok: bool, got: i64) {
@@ -238,4 +241,40 @@ fn ctid_shared() {
     }
     let cleared = unsafe { core::ptr::read_volatile(&raw const CTID) } == 0;
     report(NAME, r != ETIMEDOUT && cleared, r);
+}
+
+/// A robust list entry: the link, then the futex word
+#[repr(C)]
+struct Robust {
+    next: u64,
+    word: u32,
+}
+
+static mut ROBUST_HEAD: RobustListHead = RobustListHead {
+    list: 0,
+    futex_offset: 8,
+    list_op_pending: 0,
+};
+static mut ROBUST_ENTRY: Robust = Robust { next: 0, word: 0 };
+
+extern "C" fn robust_dier(_: u64) -> ! {
+    unsafe {
+        let head = &raw mut ROBUST_HEAD;
+        (*head).list = head as u64;
+        (*head).list_op_pending = &raw mut ROBUST_ENTRY as u64;
+        sys_set_robust_list(head, core::mem::size_of::<RobustListHead>());
+    }
+    sleep_ms(100);
+    sys_exit(0)
+}
+
+fn robust_pending() {
+    const NAME: &[u8] = b"FUTEX_ROBUST_PENDING";
+    unsafe { core::ptr::write_volatile(&raw mut ROBUST_ENTRY.word, 0) };
+    if !spawn(robust_dier, 0) {
+        return report(NAME, false, -1);
+    }
+    let r = wait_shared(unsafe { &raw mut ROBUST_ENTRY.word }, 3000);
+    let joined = join();
+    report(NAME, r == 0 && joined, r);
 }
