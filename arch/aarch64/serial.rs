@@ -32,8 +32,6 @@ mod regs {
     pub const IMSC: usize = 0x038;
     /// Masked Interrupt Status Register
     pub const MIS: usize = 0x040;
-    /// Interrupt Clear Register
-    pub const ICR: usize = 0x044;
 }
 
 /// Flag Register bits
@@ -46,7 +44,7 @@ mod fr {
     pub const BUSY: u32 = 1 << 3;
 }
 
-/// Interrupt bits (IMSC, MIS, ICR)
+/// Interrupt bits (IMSC, MIS)
 mod int {
     /// Receive (FIFO level reached)
     pub const RX: u32 = 1 << 4;
@@ -159,7 +157,9 @@ impl Pl011 {
                 break;
             }
         }
-        self.write_reg(regs::ICR, int::RX | int::RT);
+        // RX/RT are not written to ICR (Linux pl011_int): draining the
+        // FIFO clears them, and a byte arriving after the last RXFE check
+        // keeps its interrupt
         true
     }
 
