@@ -783,8 +783,8 @@ impl Drop for Mount {
 /// is_local_mountpoint): a walk of the namespace's mounts for one whose
 /// mountpoint is the dentry `d`
 pub fn is_local_mountpoint(d: &Arc<Dentry>) -> bool {
-    // Nothing is mounted on this dentry in any namespace: no walk
-    if !d.is_mountpoint() {
+    // Nothing is mounted on this dentry (or an alias) anywhere: no walk
+    if !may_be_mountpoint(d) {
         return false;
     }
     let Some(root) = crate::ns::current_mnt_ns().get_root() else {
@@ -793,7 +793,7 @@ pub fn is_local_mountpoint(d: &Arc<Dentry>) -> bool {
     let mut todo = alloc::vec![root];
     while let Some(m) = todo.pop() {
         for c in m.children.read().iter() {
-            if c.get_mountpoint().is_some_and(|mp| Arc::ptr_eq(&mp, d)) {
+            if c.get_mountpoint().is_some_and(|mp| same_place(&mp, d)) {
                 return true;
             }
             todo.push(c.clone());
@@ -806,7 +806,7 @@ pub fn is_local_mountpoint(d: &Arc<Dentry>) -> bool {
 /// topmost mount stacked on it, else `p` itself
 pub fn follow_mount(p: Path) -> Path {
     let mut p = p;
-    while p.dentry.is_mountpoint() {
+    while may_be_mountpoint(&p.dentry) {
         match lookup_mnt(&p) {
             Some(m) => p = Path::new(m.clone(), m.root.clone()),
             None => break,
@@ -816,8 +816,7 @@ pub fn follow_mount(p: Path) -> Path {
 }
 
 /// The mount on `p` (Linux lookup_mnt): a child of `p.mnt` whose
-/// mountpoint is the dentry `p.dentry` (renames move dentries, so it
-/// stays the same object; hard links are other dentries)
+/// mountpoint is the place `p.dentry` names
 fn lookup_mnt(p: &Path) -> Option<Arc<Mount>> {
     p.mnt
         .children
@@ -825,7 +824,39 @@ fn lookup_mnt(p: &Path) -> Option<Arc<Mount>> {
         .iter()
         .find(|c| {
             c.get_mountpoint()
-                .is_some_and(|mp| Arc::ptr_eq(&mp, &p.dentry))
+                .is_some_and(|mp| same_place(&mp, &p.dentry))
         })
         .cloned()
+}
+
+/// Names on this inode's filesystem are their exact bytes (in-memory
+/// ones): otherwise another spelling (vfat: case, trailing dots) is
+/// another dentry for the same object
+fn exact_names(i: &super::inode::Inode) -> bool {
+    i.superblock()
+        .is_some_and(|sb| sb.fs_type.fs_flags == super::superblock::fs_flags::FS_IN_MEMORY)
+}
+
+/// The mountpoint `mp` and the dentry `d` are one place: the same
+/// dentry (renames move dentries), or the same inode where that cannot
+/// be another object: a directory (no hard links), or a filesystem
+/// without exact names (FAT has no hard links either; Linux gets one
+/// dentry there through vfat's d_hash/d_compare)
+fn same_place(mp: &Arc<Dentry>, d: &Arc<Dentry>) -> bool {
+    if Arc::ptr_eq(mp, d) {
+        return true;
+    }
+    let (Some(a), Some(b)) = (mp.get_inode(), d.get_inode()) else {
+        return false;
+    };
+    a.ino == b.ino && a.sb.ptr_eq(&b.sb) && (a.mode().is_dir() || !exact_names(&b))
+}
+
+/// The walk must look for a mount on `d`: it is marked, or (no exact
+/// names, something mounted on its filesystem) an alias of it may be
+fn may_be_mountpoint(d: &Dentry) -> bool {
+    d.is_mountpoint()
+        || d.get_inode().is_some_and(|i| {
+            !exact_names(&i) && i.sb.upgrade().is_some_and(|sb| sb.has_mounts_on())
+        })
 }

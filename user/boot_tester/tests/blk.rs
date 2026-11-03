@@ -400,6 +400,7 @@ fn vfat(d: &Disk) {
     vfat_names(p1);
     vfat_opts(p1);
     vfat_neg_case(p1);
+    vfat_mount_alias(p1);
 }
 
 /// What was written through the page cache (write() and a shared
@@ -786,4 +787,25 @@ fn vfat_neg_case(p1: &BlkDev) {
     sys_umount2(b"/mnt/vd1\0".as_ptr(), 0);
     let ok = r == 0 && miss == -2 && miss2 == -2 && fd >= 0 && fd2 >= 0 && hit == 0 && hit2 == 0;
     verdict(b"VFAT_NEG_CASE", ok, hit * 100 + hit2);
+}
+
+/// A mount on a vfat directory covers every spelling of it: "AL" and
+/// "al" are one directory, and what is under the mount stays hidden
+/// (Linux: one dentry through vfat's d_hash/d_compare)
+fn vfat_mount_alias(p1: &BlkDev) {
+    let r = mount_vd1(p1, b"iocharset=cp437\0");
+    sys_mkdir(b"/mnt/vd1/al\0".as_ptr(), 0o755);
+    let fd = sys_open(b"/mnt/vd1/al/under\0".as_ptr(), O_CREAT | O_WRONLY, 0o644);
+    sys_close(fd as u64);
+    let m = sys_mount(b"none\0".as_ptr(), b"/mnt/vd1/al\0".as_ptr(), b"ramfs\0".as_ptr(), 0, 0);
+    // SAFETY: Stat is plain integers
+    let mut st: Stat = unsafe { core::mem::zeroed() };
+    let lower = sys_stat(b"/mnt/vd1/al/under\0".as_ptr(), &mut st);
+    let upper = sys_stat(b"/mnt/vd1/AL/under\0".as_ptr(), &mut st);
+    sys_umount2(b"/mnt/vd1/al\0".as_ptr(), 0);
+    sys_unlink(b"/mnt/vd1/al/under\0".as_ptr());
+    hk_syscall::sys_rmdir(b"/mnt/vd1/al\0".as_ptr());
+    sys_umount2(b"/mnt/vd1\0".as_ptr(), 0);
+    let ok = r == 0 && fd >= 0 && m == 0 && lower == -2 && upper == -2;
+    verdict(b"VFAT_MOUNT_ALIAS", ok, lower * 100 + upper);
 }
