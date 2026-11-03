@@ -30,6 +30,7 @@ pub fn run_tests() {
     test_block();
     test_net();
     test_cpu();
+    test_console();
     test_bus_usb();
     test_unbind_usb();
     test_unbind_blk();
@@ -1475,4 +1476,24 @@ fn test_unbind_usb() {
         Ok(()) => ok(N),
         Err((why, v)) => fail(N, why, v),
     }
+}
+
+/// /sys/class/tty/console/active: the console ttys, each a tty class
+/// device
+fn test_console() {
+    const N: &[u8] = b"SYSFS_CONSOLE";
+    let mut b = [0u8; 256];
+    let n = read_file(b"/sys/class/tty/console/active\0", &mut b);
+    if n < 2 || b[n as usize - 1] != b'\n' {
+        return fail(N, b"active format", n);
+    }
+    let mut count = 0;
+    for name in b[..n as usize - 1].split(|&c| c == b' ') {
+        let mut p = [0u8; 256];
+        if name.is_empty() || stat(path(&mut p, &[b"/sys/class/tty/", name, b"/dev\0"])).is_err() {
+            return fail(N, b"console tty", count);
+        }
+        count += 1;
+    }
+    ok(N);
 }

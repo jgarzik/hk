@@ -301,6 +301,35 @@ Missing: fs.protected_hardlinks/symlinks/fifos/regular do not exist
 (behave as their kernel default 0); no
 immutable/append-only inodes (no IS_APPEND/IS_IMMUTABLE EPERM).
 
+## sysfs gaps
+
+**Location**: `fs/kernfs/`, `fs/sysfs.rs`, `base/`, `block/genhd.rs`,
+`net/sysfs.rs`, `hw/pci/driver.rs`
+
+- No power/ directories (Linux dpm_sysfs_add: control, runtime_status,
+  wakeup ...), no /sys/power, /sys/firmware/{acpi,dmi,efi} or
+  /sys/class/dmi/id: the directories exist empty.
+- Missing classes: rtc (PL031 has no /dev/rtc0), input (Phase V),
+  misc, graphics/drm, pci_bus; no /sys/kernel/{security,debug,tracing,
+  config} mount points (hk has none of those filesystems).
+- Topology: places differ from Linux on QEMU: COM1's ttyS0 sits below
+  /sys/devices/platform/serial8250 (Linux binds 8250_pnp to the ACPI
+  PNP0501 device), PL011/PL031 are platform devices (Linux: amba bus),
+  SCSI disks of USB storage are virtual (Linux: host/target/device
+  below the interface), RAM disks are rdN (Linux brd: ramN).
+- PCI: no resource/resourceN/rom/enable/numa_node/local_cpus files;
+  config is 256 bytes even for PCIe functions (no extended space).
+  Drivers have no new_id/remove_id (dynamic ids).
+- cpu: no cpuN/topology, cache/ or online files and no MODALIAS
+  (CONFIG_GENERIC_CPU_AUTOPROBE); node: no meminfo/numastat/vmstat.
+- net: no queues/, phys_port_*, speed/duplex, ifalias or gro files;
+  interfaces cannot be renamed or moved between namespaces, so no
+  "move" uevents.
+- chmod/chown on sysfs files change the inode only: a later lookup of a
+  dropped dentry shows the original mode (Linux keeps kernfs iattrs).
+- /sys/module lists built-in modules with drivers only; no parameters
+  or version files (hk has no module parameters).
+
 ## uevent gaps
 
 - `/sys/kernel/uevent_helper` stores a path, but no helper is run per
@@ -770,12 +799,48 @@ fat_get_cluster keeps a per-inode cache of chain positions
 - A removed kernfs binary attribute (`Kind::Bin`, e.g. PCI `config`)
   keeps its operations, and so the object behind them, while a stale
   dentry or open file holds the node (text attributes drop theirs).
-- No /proc/devices block section, no /sys/block; the first disk
+- No /proc/devices block section; the first disk
   registered decides the dynamic major (254 down, like Linux, but Linux
   usually has other dynamic majors registered first).
 - A mounted filesystem or active swap opens its block device, but not
   exclusively: opening it O_EXCL and BLKBSZSET on a mounted partition
   are not refused.
+
+## Atomics audit findings (2026-11-03)
+
+Shared state kept in Atomic* fields instead of under the object's
+documented lock; ranked. Each needs a design from doc/LOCKING.md and
+Linux's equivalent.
+
+- ipc/sem.rs `Sem.semval`: semop checks and applies without a lock:
+  semval can go negative, multi-sop operations are not atomic, wakeups
+  can be lost, a semop can queue on a removed array (Linux sem_lock).
+- fs/dac.rs chmod/chown run without i_rwsem: chmod 4755 racing chown
+  root can leave a setuid-root file with user-chosen contents (Linux
+  notify_change under inode_lock).
+- cgroup pids.max is checked at fork and charged later: concurrent
+  forks overshoot it (Linux pids_can_fork charge-then-rollback). IPC
+  shm_tot / used_sems are check-then-add without the ids lock and leak
+  when alloc_id fails.
+- hw/usb `USB_OUTPUT_ACTIVE` is one global flag: another CPU can clear
+  it while this one holds USB_CONTROLLER, so a printk there spins on
+  its own lock.
+- Inode i_size uses Relaxed loads/stores (Linux release/acquire with
+  i_size_write/read): an arm64 reader can see stale data past a
+  racing extend; fallocate updates i_size without i_rwsem.
+- Medium: mnt_flags lost update (remount vs propagation), lazy kcmp
+  cookies, a revoked key can be revived, cgroup rmdir races attach (no
+  cgroup_mutex), MsgQueue lspid/stime set outside the queue lock and
+  torn IPC_STAT snapshots, adjtimex ADJ_SETOFFSET lost offsets, TCP
+  shutdown bits outside `cb`, `TcpSock.connecting` beside the state.
+- Low: remount RDONLY set before the writer check (spurious EROFS),
+  GroupCputimer started by gettime, TimerList.not_before outside the
+  wheel lock, PacketSock bind read-then-store, Zone watermarks stored
+  apart from zone.lock, filemap mkclean load+store losing A/D bits,
+  cgroup controllers' check-then-act counters, Disk open counters
+  outside open_mutex, ScsiDisk.state check-then-store.
+- doc/LOCKING.md 5.4 cites Inode mode/uid/gid, MsgQueue and
+  SemArray.pending as correct atomic use; they are among the above.
 
 ## Code-quality audit findings (2026-11-01), by phase
 

@@ -421,13 +421,16 @@ pub fn register_console(
     for name in boot_names.into_iter().flatten() {
         unregister_console(name);
     }
+    crate::tty::console_active_changed();
 
     became_primary
 }
 
 /// Unregister a console driver by name
 pub fn unregister_console(name: &str) -> bool {
-    CONSOLE_REGISTRY.lock().unregister(name)
+    let r = CONSOLE_REGISTRY.lock().unregister(name);
+    crate::tty::console_active_changed();
+    r
 }
 
 /// Write to all registered consoles
@@ -471,6 +474,17 @@ pub fn console_write(data: &[u8]) {
 /// Flush all registered consoles
 pub fn console_flush() {
     CONSOLE_REGISTRY.lock().flush_all();
+}
+
+/// The ttys of the enabled consoles, in list order (Linux
+/// show_cons_active's walk)
+pub fn console_ttys() -> [Option<&'static crate::tty::Tty>; MAX_CONSOLES] {
+    let snapshot = CONSOLE_REGISTRY.lock().enabled_consoles_snapshot();
+    let mut out = [None; MAX_CONSOLES];
+    for (o, c) in out.iter_mut().zip(snapshot.into_iter().flatten()) {
+        *o = c.tty();
+    }
+    out
 }
 
 /// The tty of the first enabled console that has one: /dev/console's

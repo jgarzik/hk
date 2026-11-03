@@ -436,11 +436,44 @@ pub fn init_tty_chardevs() {
 
     TTY_CLASS.register();
     for (name, minor) in [("tty", 0), ("console", 1)] {
-        let _ = device_create(DeviceInfo {
+        let d = device_create(DeviceInfo {
             class: Some(&TTY_CLASS),
             devt: Some(DevId::new(major::TTYAUX, minor)),
             ..DeviceInfo::named(name)
         });
+        if minor == 1
+            && let Ok(d) = d
+            && let Ok(a) =
+                d.create_file(b"active", 0o444, crate::fs::kernfs::show(show_cons_active))
+        {
+            CONS_ACTIVE.call_once(|| a);
+        }
+    }
+}
+
+/// /sys/class/tty/console/active (spin::Once, set at boot)
+static CONS_ACTIVE: spin::Once<Arc<crate::fs::kernfs::KNode>> = spin::Once::new();
+
+/// Linux show_cons_active: the enabled consoles' ttys, last registered
+/// first
+fn show_cons_active(out: &mut crate::fs::kernfs::SysBuf) {
+    let ttys = crate::console::console_ttys();
+    let mut first = true;
+    for t in ttys.iter().rev().flatten() {
+        if !first {
+            out.bytes(b" ");
+        }
+        out.bytes(t.name().as_bytes());
+        first = false;
+    }
+    out.bytes(b"\n");
+}
+
+/// The console list changed: wake pollers of console/active (Linux
+/// sysfs_notify in register_console/unregister_console)
+pub fn console_active_changed() {
+    if let Some(a) = CONS_ACTIVE.get() {
+        a.notify();
     }
 }
 
