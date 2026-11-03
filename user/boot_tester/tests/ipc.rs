@@ -61,6 +61,8 @@ pub fn run_tests() {
     test_msgget_create();
     test_msgsnd_msgrcv();
     test_msgctl_rmid();
+    test_msgrcv_long_min();
+    test_msgrcv_e2big_order();
 }
 
 /// Test basic pipe creation
@@ -1130,6 +1132,69 @@ fn test_select_empty_timeout() {
         print_num(ret);
         print(b" elapsed_ms=");
         print_num(dt);
+        println(b"");
+    }
+}
+
+/// Send a `len`-byte message of type `mtype`
+fn msg_send(msqid: i32, mtype: i64, len: usize) -> i64 {
+    let m = TestMsg {
+        mtype,
+        mtext: [b'x'; 32],
+    };
+    sys_msgsnd(msqid, &m as *const TestMsg as *const u8, len, hk_syscall::IPC_NOWAIT)
+}
+
+/// msgrcv into a `size`-byte buffer; (result, type received)
+fn msg_recv(msqid: i32, size: usize, msgtyp: i64) -> (i64, i64) {
+    let mut m = TestMsg {
+        mtype: 0,
+        mtext: [0; 32],
+    };
+    let r = sys_msgrcv(
+        msqid,
+        &mut m as *mut TestMsg as *mut u8,
+        size,
+        msgtyp,
+        hk_syscall::IPC_NOWAIT,
+    );
+    (r, m.mtype)
+}
+
+/// msgtyp = LONG_MIN takes the lowest type (Linux: as LONG_MAX)
+fn test_msgrcv_long_min() {
+    let msqid = sys_msgget(IPC_PRIVATE, IPC_CREAT | 0o666) as i32;
+    let sent = msqid >= 0 && msg_send(msqid, 7, 4) == 0 && msg_send(msqid, 5, 4) == 0;
+    let (r, t) = msg_recv(msqid, 32, i64::MIN);
+    sys_msgctl(msqid, IPC_RMID, 0);
+    if sent && r == 4 && t == 5 {
+        println(b"MSGRCV_LONG_MIN:OK");
+    } else {
+        print(b"MSGRCV_LONG_MIN:FAIL: r=");
+        print_num(r);
+        print(b" type=");
+        print_num(t);
+        println(b"");
+    }
+}
+
+/// E2BIG leaves the message where it was in the queue
+fn test_msgrcv_e2big_order() {
+    let msqid = sys_msgget(IPC_PRIVATE, IPC_CREAT | 0o666) as i32;
+    let sent = msqid >= 0
+        && msg_send(msqid, 2, 4) == 0
+        && msg_send(msqid, 1, 16) == 0
+        && msg_send(msqid, 1, 4) == 0;
+    let (big, _) = msg_recv(msqid, 8, 1);
+    let (r, t) = msg_recv(msqid, 32, 0);
+    sys_msgctl(msqid, IPC_RMID, 0);
+    if sent && big == -7 && r == 4 && t == 2 {
+        println(b"MSGRCV_E2BIG_ORDER:OK");
+    } else {
+        print(b"MSGRCV_E2BIG_ORDER:FAIL: e2big=");
+        print_num(big);
+        print(b" next type=");
+        print_num(t);
         println(b"");
     }
 }
