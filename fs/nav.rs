@@ -2,10 +2,11 @@
 
 use crate::arch::Uaccess;
 use crate::fs::dac::{self, MAY_CHDIR, MAY_EXEC};
-use crate::fs::{Dentry, KernelError, LookupFlags, Path, lookup_path_at};
-use crate::uaccess::{UaccessArch, copy_to_user, strncpy_from_user};
+use crate::fs::namei::path_lookupat;
+use crate::fs::{Dentry, KernelError, LookupFlags};
+use crate::uaccess::{UaccessArch, copy_to_user};
 
-use super::syscall::{PATH_MAX, current_fd_table};
+use super::syscall::current_fd_table;
 
 /// chdir/fchdir/chroot target: a directory with search permission
 /// (MAY_EXEC | MAY_CHDIR)
@@ -26,28 +27,26 @@ fn may_chdir(d: &Dentry) -> Result<(), KernelError> {
 /// 0 on success, negative errno on error.
 pub fn sys_chdir(path_ptr: u64) -> i64 {
     // Read path from user space
-    let path_str = match strncpy_from_user::<Uaccess>(path_ptr, PATH_MAX) {
+    let path_str = match crate::fs::namei::getname(path_ptr, false) {
         Ok(p) => p,
-        Err(_) => return KernelError::BadAddress.sysret(),
+        Err(e) => return e.sysret(),
     };
 
     // Get current task's cwd as starting point for relative paths
     let start = crate::task::percpu::current_cwd();
 
     // Look up the path (must be a directory), then search permission
-    let dentry = match lookup_path_at(start, &path_str, LookupFlags::opendir()) {
-        Ok(d) => d,
+    let path = match path_lookupat(start, &path_str, LookupFlags::opendir()) {
+        Ok(p) => p,
         Err(e) => return e.sysret(),
     };
-    if let Err(e) = may_chdir(&dentry) {
+    if let Err(e) = may_chdir(&path.dentry) {
         return e.sysret();
     }
 
     // Create new Path and update FsStruct
-    if let Some(fs) = crate::task::percpu::current_fs()
-        && let Some(new_pwd) = Path::from_dentry(dentry)
-    {
-        fs.set_pwd(new_pwd);
+    if let Some(fs) = crate::task::percpu::current_fs() {
+        fs.set_pwd(path);
     }
 
     0
@@ -74,7 +73,7 @@ pub fn sys_fchdir(fd: i32) -> i64 {
 
     // Create new Path and update FsStruct
     if let Some(fs) = crate::task::percpu::current_fs()
-        && let Some(new_pwd) = Path::from_dentry(file.dentry.clone())
+        && let Some(new_pwd) = file.f_path()
     {
         fs.set_pwd(new_pwd);
     }
@@ -101,20 +100,20 @@ pub fn sys_fchdir(fd: i32) -> i64 {
 /// * EPERM - Caller lacks CAP_SYS_CHROOT capability
 pub fn sys_chroot(path_ptr: u64) -> i64 {
     // Copy path from user space
-    let path_str = match strncpy_from_user::<Uaccess>(path_ptr, PATH_MAX) {
+    let path_str = match crate::fs::namei::getname(path_ptr, false) {
         Ok(p) => p,
-        Err(_) => return KernelError::BadAddress.sysret(),
+        Err(e) => return e.sysret(),
     };
 
     // Start from current working directory for relative paths
     let start = crate::task::percpu::current_cwd();
 
     // Look up the path: a searchable directory
-    let dentry = match lookup_path_at(start, &path_str, LookupFlags::opendir()) {
-        Ok(d) => d,
+    let path = match path_lookupat(start, &path_str, LookupFlags::opendir()) {
+        Ok(p) => p,
         Err(e) => return e.sysret(),
     };
-    if let Err(e) = may_chdir(&dentry) {
+    if let Err(e) = may_chdir(&path.dentry) {
         return e.sysret();
     }
     // CAP_SYS_CHROOT is checked after the lookup, like Linux
@@ -123,10 +122,8 @@ pub fn sys_chroot(path_ptr: u64) -> i64 {
     }
 
     // Update the root directory
-    if let Some(fs) = crate::task::percpu::current_fs()
-        && let Some(new_root) = Path::from_dentry(dentry)
-    {
-        fs.set_root(new_root);
+    if let Some(fs) = crate::task::percpu::current_fs() {
+        fs.set_root(path);
     } else {
         return KernelError::InvalidArgument.sysret();
     }
@@ -155,9 +152,20 @@ pub fn sys_getcwd(buf: u64, size: u64) -> i64 {
         None => return KernelError::NotFound.sysret(),
     };
 
-    // Get pwd and build path string
+    // Linux getcwd: ENOENT for a removed directory; one outside the
+    // root (a chroot escape, a detached mount) is "(unreachable)..."
     let pwd = fs.get_pwd();
-    let path_str = pwd.dentry.full_path();
+    if pwd.dentry.is_unhashed() {
+        return KernelError::NotFound.sysret();
+    }
+    let root = match crate::fs::namei::nd_root() {
+        Ok(r) => r,
+        Err(e) => return e.sysret(),
+    };
+    let (mut path_str, reached) = crate::fs::dentry::d_path(&pwd, &root);
+    if !reached {
+        path_str.splice(0..0, b"(unreachable)".iter().copied());
+    }
 
     // Need space for path + null terminator
     let path_len = path_str.len() + 1;
@@ -173,7 +181,7 @@ pub fn sys_getcwd(buf: u64, size: u64) -> i64 {
     }
 
     // Copy path to user buffer (with null terminator)
-    let mut path_bytes = path_str.into_bytes();
+    let mut path_bytes = path_str;
     path_bytes.push(0); // null terminator
 
     if copy_to_user::<Uaccess>(buf, &path_bytes).is_err() {

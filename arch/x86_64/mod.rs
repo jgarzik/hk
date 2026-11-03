@@ -439,11 +439,11 @@ impl VfsInitOps for X86_64Arch {
     fn init_vfs_extras() {
         // Initialize VFAT ramdisk from multiboot2 module
         // Look up the needed dentries via VFS
-        let root_dentry = match crate::fs::lookup_path("/") {
+        let root_dentry = match crate::fs::lookup_path(b"/") {
             Ok(d) => d,
             Err(_) => return,
         };
-        let dev_dentry = match crate::fs::lookup_path("/dev") {
+        let dev_dentry = match crate::fs::lookup_path(b"/dev") {
             Ok(d) => d,
             Err(_) => return,
         };

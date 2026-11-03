@@ -11,8 +11,9 @@ infallible, so each one is investigated, not written off.
   batch): `BUSYBOX_NC_LO:FAIL status=0` (nc over loopback) in 1 of 5
   x86 `check-linux` runs, and in an hk x86 boot with one CPU
   (`QEMU_SMP=1`). Cause unknown: the test waits for the listener
-  (`wait_listen`) and retries the client. Seen again twice on 2026-11-03:
-  two uncached x86 `check-linux` runs of four (each passed on rerun).
+  (`wait_listen`) and retries the client. Seen again on 2026-11-03:
+  three uncached x86 `check-linux` runs and one hk x86 boot (each
+  passed on rerun).
 - **SWAPOUT_PAGEOUT flaky on the Linux reference** (J): one x86
   `check-linux` run had free swap 364 kB off the expected value after
   MADV_PAGEOUT of 16 MiB (beyond the test's tolerance), passing on the
@@ -53,21 +54,12 @@ blocks belong in a missing wrapper:
   timer container_of, `smp_call<T: Sync>`) in place of `*mut ()` data
   casts.
 
-## Path names must be valid UTF-8
+## cgroup names must be UTF-8
 
-**Location:** `uaccess.rs` (`strncpy_from_user`).
+**Location:** `fs/cgroupfs.rs`.
 
-Linux path names are any bytes except '/' and NUL. hk's VFS holds names
-as `String`, so the path copy-in takes only valid UTF-8 and rejects
-anything else. The same copy-in serves the other string arguments
-(symlink targets, mq, key, inotify/fanotify, swapon and acct names),
-so those also refuse non-UTF-8 bytes. Mapping the other bytes to chars would let two different
-byte names alias one String.
-
-The callers turn every copy-in error into EFAULT, including the
-rejection here and an overlong path, which Linux reports as
-ENAMETOOLONG. The fix is byte-string names through the VFS, with one
-`user_path_at` that maps errors (Phase G).
+mkdir of a name that is not valid UTF-8 is EINVAL; Linux kernfs takes
+any bytes.
 
 ## user/ does not follow doc/UNSAFE.md
 
@@ -84,17 +76,6 @@ Planned fix:
   futex);
 - an `Mmap` RAII type for mmap'd memory;
 - atomics in place of `static mut`.
-
-## chroot() does not affect path resolution (security)
-
-**Location**: `fs/path.rs` ~131-135 (`walk`, absolute-path lookup)
-
-`sys_chroot` records the new root (`fs.set_root`), but path walking
-always starts absolute paths at the mount namespace root
-(`mnt_ns.get_root_dentry()`) and never consults the task's fs root, so a
-chrooted process can still reach everything. `..` at the chroot root is
-not clamped either. Boot test `CHROOT` only verifies confinement on a
-Linux host (`user/boot_tester/tests/permissions.rs`).
 
 ## Network stack gaps (later phases of the network chunk)
 
@@ -258,7 +239,7 @@ too_many_unix_fds rule), so a user can pin at most about RLIMIT_NOFILE
 files (plus the queues of those sockets, each bounded by SO_SNDBUF and
 max_dgram_qlen). Unlike Linux the count is also capped at 2024 (Linux's
 UNIX_INFLIGHT_SANE_USER), so raising RLIMIT_NOFILE does not raise what
-can be pinned. Socket paths must be UTF-8 (other bytes are EINVAL).
+can be pinned.
 
 Not implemented: MSG_OOB on streams (EOPNOTSUPP; Linux supports one
 out-of-band byte), SO_PEEK_OFF, SO_PASSPIDFD / SCM_PIDFD /
@@ -273,37 +254,41 @@ Missing: fs.protected_hardlinks/symlinks/fifos/regular do not exist
 (behave as their kernel default 0); no
 immutable/append-only inodes (no IS_APPEND/IS_IMMUTABLE EPERM).
 
-## Spinlocks where Linux uses sleeping locks
+## Unaligned user pointers are EFAULT
 
-**Location**: `sync` (Mutex, RwSem), various
+**Location**: `uaccess.rs` (`put_user`/`get_user`)
 
-Linux rw_semaphores modeled as `spin` locks include the mount
-namespace/topology locks (namespace_sem, `Mount` RwLocks) and `s_umount`
-(absent): their holders must not sleep (`make check LOCKDEP=1` reports
-one that does). `RwSem` has no `_interruptible` variants.
+A misaligned user address is rejected with EFAULT; Linux on x86-64 and
+arm64 accepts it. Needs a boot test (both kernels) before the fix.
+
+## Sleeping-lock gaps
+
+**Location**: `sync` (RwSem)
+
+`RwSem` has no `_interruptible` variants.
 
 ## Mount flag gaps
 
 **Location**: `fs/misc.rs` sys_mount/sys_umount2, `fs/mount.rs`
 
 Accepted without effect: atime flags (no atime updates), MS_SILENT,
-MS_MANDLOCK, MS_POSIXACL, MS_I_VERSION, MS_LAZYTIME, and
-MS_PRIVATE/MS_UNBINDABLE (mounts never propagate, no bind mounts).
-EINVAL instead of Linux behavior: MS_BIND (also MS_REMOUNT|MS_BIND),
-MS_MOVE, MS_SHARED, MS_SLAVE, MS_SYNCHRONOUS, MS_DIRSYNC, MS_NOSYMFOLLOW
-and umount2 MNT_EXPIRE. Read-only state is one flag, SB_RDONLY on the
-superblock (no separate MNT_READONLY: without bind mounts a superblock
-has one mount per namespace). Unlike Linux (MNT_WRITE_HOLD), a
-`SuperBlock::want_write` racing a rw->ro remount that then fails with
-EBUSY can see a spurious EROFS. Mount data/options strings are
-ignored; mounts are not user-namespace aware (plain capable()).
-
-A mount is found from a dentry by superblock dev_id in the caller's
-namespace (`MntNamespace::find_mount_for_dentry`), not carried by the
-path walk: `File.mnt` is picked that way at open, open's NODEV check
-and statfs flags at the call. Two mounts of one superblock (bind
-mounts, once they exist) would be told apart wrongly. Phase G
-(Path{mnt, dentry} from the walk) fixes the lookup.
+MS_MANDLOCK, MS_POSIXACL, MS_I_VERSION, MS_LAZYTIME.
+EINVAL instead of Linux behavior: MS_SYNCHRONOUS, MS_DIRSYNC and
+MS_NOSYMFOLLOW. Propagation (`fs/pnode.rs`): a propagated copy lands
+on top of what is already mounted at the target (Linux tucks it
+under); a slave's master is its master's peer group, not one mount;
+copies of a namespace are always peers and not locked (Linux
+copy_mnt_ns for a less privileged user namespace makes shared mounts
+slaves, CL_SHARED_TO_SLAVE, and locks them, lock_mnt_tree): harmless
+while CLONE_NEWNS needs root and mounts ignore user namespaces, but
+required before mounts become user-namespace aware. umount2 MNT_EXPIRE's
+mark is not cleared by use (Linux mntput clears it).
+Unlike Linux (MNT_WRITE_HOLD), a write access racing a read-only remount
+that then fails with EBUSY can see a spurious EROFS. Mount options are parsed by vfat (Linux's set; long names
+UTF-16 in UTF-8, iso8859-1 or cp437 only) and ramfs (mode=); procfs,
+devtmpfs and cgroupfs ignore theirs; mounts are not user-namespace aware (plain capable()).
+Crossing into a mount scans the current mount's children (Linux hashes
+(parent, mountpoint): mount_hashtable).
 
 ## Thread-group exit gaps
 
@@ -456,8 +441,8 @@ with no interpreter (hk relocates it in the kernel, so its pages are
 private copies; Linux applies no relocations at all) and the partial
 last page and bss of each segment (copied). Kernel object leaks cost free
 memory: each fork+exec keeps two dentries and two inodes plus ~900
-bytes of kmalloc (~1.3KB; suspected: procfs entries of dead pids, for
-the dcache work). The MM_LIFE tests count MemFree + Slab so they check user memory only; these leaks
+bytes of kmalloc (~1.3KB, measured before procfs entries of released
+tasks were flushed and the dcache got a shrinker; not measured since). The MM_LIFE tests count MemFree + Slab so they check user memory only; these leaks
 are listed here instead.
 
 ## The memory cgroup's memory.max is not enforced
@@ -654,8 +639,7 @@ sched pid 0, flock/POSIX release, signalfd reader, errno flattening.
   places; `find_task_by_pid` in four (all root-namespace pids); four
   `current_time`s; about ten user-timespec readers each validating
   (Linux get_timespec64); three iovec structs and five
-  importers; five SigInfo, three Timeval, two Timespec types; two path
-  splitters that disagree on `.`/`..` (G).
+  importers; five SigInfo, three Timeval, two Timespec types.
 - **Error conventions** (as touched): Result<_, KernelError> about 618
   times, Result<_, i32> 91 (both signs used), Result<_, i64> 36; about
   187 raw errno numbers and 62 local errno constants.
@@ -683,33 +667,6 @@ sched pid 0, flock/POSIX release, signalfd reader, errno flattening.
   `#[allow(dead_code)]`, 90 "for now"/TODO markers; comments that
   contradict the code in `task/id.rs:87`, `ns/mod.rs:558`,
   `ns/uts.rs:224`, `task/rlimit.rs:264`, `task/misc.rs:1311`.
-
-## P0 review findings (open)
-
-Found by the review of the P0 series; each confirmed against the code
-(and Linux 6.8 where semantics matter). "Fix in" names the phase
-expected to fix it; "next batch" means the next fix batch.
-
-1. **Rename leaves stale dentries; the trap is bypassed** (fix in
-   V1/V2, d_move). `fs/link.rs:593`: after a rename both
-   dentries are only `remove_child`'d, so a dentry pinned by a cwd or
-   fd keeps its old parent chain; `is_subdir` (`fs/dentry.rs:287`)
-   / `lock_rename` (`fs/mod.rs:129`) compare with `Arc::ptr_eq`.
-   Scenario: `mkdir -p /t/a/b; cd /t/a/b; mv /t/a /t/c; rename("/t/c",
-   "z")` moves c under its own child (Linux: EINVAL). Fix: Linux d_move /
-   d_exchange (dentry name under `d_lock`); vfat must then update the
-   moved inode's `parent_cluster`/`short_name` (fs rename needs the
-   source inode).
-7. **/proc/<pid>/* owner not refreshed on stat** (fix in V2).
-   `fs/procfs.rs:370`: the owner (task_dump_owner) is updated
-   at lookup and in permission() only; Linux pid_revalidate updates it
-   on every walk. Scenario: stat environ of a uid-1000 child, child
-   sets `PR_SET_DUMPABLE 0`, stat again: hk still says uid 1000
-   (Linux 0).
-8. **EXDEV compares superblocks, not mounts** (fix in V1)
-   (`fs/link.rs:298`, `:484`): a link or rename across two
-   mounts of one superblock (bind mounts) is EXDEV on Linux. Needs
-   Path{mnt,dentry}; TODO in place for linkat.
 
 ## P2 review findings (open)
 From the P2 /code-review (unverified). Tag = when to fix.

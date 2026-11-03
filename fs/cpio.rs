@@ -58,7 +58,7 @@ struct Entry<'a> {
     mtime: Timespec,
     dev: (u32, u32),
     rdev: (u32, u32),
-    name: &'a str,
+    name: &'a [u8],
     body: &'a [u8],
     /// Offset of the next entry
     next: usize,
@@ -80,7 +80,7 @@ fn parse(data: &[u8], off: usize) -> Result<Entry<'_>, CpioError> {
     let name_bytes = data
         .get(name_start..name_start + namesize - 1)
         .ok_or(CpioError::BufferTooSmall)?;
-    let name = core::str::from_utf8(name_bytes).map_err(|_| CpioError::InvalidHeader)?;
+    let name = name_bytes;
     let body_start = align_up(name_start + namesize, 4);
     let body = data
         .get(body_start..body_start + filesize)
@@ -118,18 +118,22 @@ pub fn unpack_cpio(data: &[u8], root: &Arc<Dentry>) -> Result<usize, CpioError> 
         }
         let e = parse(data, off)?;
         off = e.next;
-        if e.name == "TRAILER!!!" {
+        if e.name == b"TRAILER!!!" {
             links.clear();
             continue;
         }
-        if e.name == "." || e.name.is_empty() {
+        if e.name == b"." || e.name.is_empty() {
             continue;
         }
         // One bad entry does not stop the rest (Linux logs and goes on)
         match do_entry(root, &e, &mut links) {
             Ok(true) => count += 1,
             Ok(false) => {}
-            Err(err) => crate::printkln!("initramfs: {}: not unpacked ({:?})", e.name, err),
+            Err(err) => crate::printkln!(
+                "initramfs: {}: not unpacked ({:?})",
+                crate::fs::name::Escaped(e.name),
+                err
+            ),
         }
     }
     Ok(count)
@@ -143,9 +147,9 @@ fn do_entry(root: &Arc<Dentry>, e: &Entry<'_>, links: &mut Links) -> Result<bool
         ramfs_mkpath_with_timestamp(root, e.name, e.uid, e.gid, e.mtime).map_err(fs_err)?;
         return Ok(false);
     }
-    let (parent_path, name) = match e.name.rfind('/') {
+    let (parent_path, name): (&[u8], &[u8]) = match e.name.iter().rposition(|&c| c == b'/') {
         Some(pos) => (&e.name[..pos], &e.name[pos + 1..]),
-        None => ("", e.name),
+        None => (b"", e.name),
     };
     let parent = if parent_path.is_empty() {
         root.clone()
@@ -201,8 +205,7 @@ fn do_entry(root: &Arc<Dentry>, e: &Entry<'_>, links: &mut Links) -> Result<bool
             }
         }
         S_IFLNK => {
-            let target = core::str::from_utf8(e.body).map_err(|_| CpioError::InvalidHeader)?;
-            ramfs_create_symlink_with_timestamp(&parent, name, target, e.uid, e.gid, e.mtime)
+            ramfs_create_symlink_with_timestamp(&parent, name, e.body, e.uid, e.gid, e.mtime)
                 .map_err(fs_err)?;
         }
         S_IFCHR | S_IFBLK | S_IFIFO | S_IFSOCK => {
@@ -226,7 +229,7 @@ fn do_entry(root: &Arc<Dentry>, e: &Entry<'_>, links: &mut Links) -> Result<bool
 
 /// Linux clean_path: an existing entry of another type is removed
 /// (rmdir for a directory); one of the same type is returned
-fn clean_path(parent: &Arc<Dentry>, dir: &Inode, name: &str, ty: u32) -> Option<Arc<Inode>> {
+fn clean_path(parent: &Arc<Dentry>, dir: &Inode, name: &[u8], ty: u32) -> Option<Arc<Inode>> {
     let old = dir.i_op.lookup(dir, name).ok()?;
     if old.mode().0 as u32 & S_IFMT == ty {
         return Some(old);

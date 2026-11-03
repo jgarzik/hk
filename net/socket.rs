@@ -14,7 +14,6 @@
 //! take effect immediately) plus MSG_DONTWAIT; timeouts and signal
 //! rules are in `Sock::wait`.
 
-use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
@@ -198,15 +197,12 @@ pub fn sock_alloc_file(sock: Arc<dyn ProtoOps>, nonblock: bool) -> Arc<File> {
     ));
     inode.set_private(Arc::new(SockInode(sock)));
     let name = alloc::format!("socket:[{}]", ino);
-    let dentry = Arc::new(Dentry::new_anonymous(
-        String::from(name.as_str()),
-        Some(inode),
-    ));
+    let dentry = Arc::new(Dentry::new_anonymous(name.as_str().into(), Some(inode)));
     let mut flags = fflags::O_RDWR;
     if nonblock {
         flags |= fflags::O_NONBLOCK;
     }
-    Arc::new(File::new(dentry, flags, &SOCK_FOPS))
+    Arc::new(File::new(dentry, None, flags, &SOCK_FOPS))
 }
 
 /// Create a protocol socket (Linux __sock_create)

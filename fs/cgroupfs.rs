@@ -168,7 +168,9 @@ impl InodeData for CgroupfsInodeWrapper {}
 pub struct CgroupfsInodeOps;
 
 impl InodeOps for CgroupfsInodeOps {
-    fn lookup(&self, dir: &Inode, name: &str) -> Result<Arc<Inode>, KernelError> {
+    fn lookup(&self, dir: &Inode, name: &[u8]) -> Result<Arc<Inode>, KernelError> {
+        // cgroup names are text (Linux: any bytes); others name nothing
+        let name = core::str::from_utf8(name).map_err(|_| KernelError::NotFound)?;
         let private = dir.get_private().ok_or(KernelError::Io)?;
         let wrapper = private
             .as_ref()
@@ -208,7 +210,9 @@ impl InodeOps for CgroupfsInodeOps {
         }
     }
 
-    fn mkdir(&self, dir: &Inode, name: &str, _mode: InodeMode) -> Result<Arc<Inode>, KernelError> {
+    fn mkdir(&self, dir: &Inode, name: &[u8], _mode: InodeMode) -> Result<Arc<Inode>, KernelError> {
+        // hk keeps cgroup names as text (deviation: Linux takes any bytes)
+        let name = core::str::from_utf8(name).map_err(|_| KernelError::InvalidArgument)?;
         let private = dir.get_private().ok_or(KernelError::Io)?;
         let wrapper = private
             .as_ref()
@@ -230,7 +234,8 @@ impl InodeOps for CgroupfsInodeOps {
         }
     }
 
-    fn rmdir(&self, dir: &Inode, name: &str) -> Result<(), KernelError> {
+    fn rmdir(&self, dir: &Inode, name: &[u8]) -> Result<(), KernelError> {
+        let name = core::str::from_utf8(name).map_err(|_| KernelError::NotFound)?;
         let private = dir.get_private().ok_or(KernelError::Io)?;
         let wrapper = private
             .as_ref()
@@ -711,7 +716,10 @@ pub static CGROUPFS_SUPER_OPS: CgroupfsSuperOps = CgroupfsSuperOps;
 // ============================================================================
 
 /// Mount cgroupfs
-fn cgroupfs_mount(fs_type: &'static FileSystemType) -> Result<Arc<SuperBlock>, KernelError> {
+fn cgroupfs_mount(
+    fs_type: &'static FileSystemType,
+    _opts: &[u8],
+) -> Result<Arc<SuperBlock>, KernelError> {
     // Initialize cgroup subsystem if not done
     cgroup_init();
 

@@ -636,13 +636,13 @@ fn validate(a: &[u8]) -> Result<(), KernelError> {
 
 /// Linux unix_mkname_bsd: the path ends at the first NUL (or the
 /// address end); the stored name is family + path + NUL
-fn bsd_name(a: &[u8]) -> Result<(String, Vec<u8>), KernelError> {
+fn bsd_name(a: &[u8]) -> Result<(Vec<u8>, Vec<u8>), KernelError> {
     let p = &a[SUN_PATH..];
     let n = p.iter().position(|&c| c == 0).unwrap_or(p.len());
-    let path = core::str::from_utf8(&p[..n]).map_err(|_| KernelError::InvalidArgument)?;
+    let path = p[..n].to_vec();
     let mut name = a[..SUN_PATH + n].to_vec();
     name.push(0);
-    Ok((String::from(path), name))
+    Ok((path, name))
 }
 
 /// Find the socket an address names (Linux unix_find_other): a path
@@ -656,7 +656,7 @@ fn find_other(net: &NetNamespace, a: &[u8], stype: i32) -> Result<Arc<UnixSock>,
             .ok_or(KernelError::ConnectionRefused);
     }
     let (path, _) = bsd_name(a)?;
-    let d = crate::fs::path::lookup_path(&path)?;
+    let d = crate::fs::namei::lookup_path(&path)?;
     let inode = d.get_inode().ok_or(KernelError::NotFound)?;
     crate::fs::dac::permission_as(&crate::task::current_cred(), &inode, crate::fs::MAY_WRITE)?;
     if !inode.mode().is_socket() {

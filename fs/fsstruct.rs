@@ -33,13 +33,33 @@ use crate::task::Tid;
 pub struct FsStruct {
     /// Lock protecting pwd, root, umask modifications
     inner: Mutex<FsStructInner>,
+    /// Tasks using it (Linux fs->users): setns into a mount namespace
+    /// needs it unshared
+    pub users: core::sync::atomic::AtomicUsize,
+}
+
+/// A path the fs struct holds: its mount is busy while it does (Linux
+/// path_get: an umount of a mount someone stands in is EBUSY)
+struct Pinned(Path);
+
+impl Pinned {
+    fn new(p: Path) -> Self {
+        p.mnt.mntget();
+        Self(p)
+    }
+}
+
+impl Drop for Pinned {
+    fn drop(&mut self) {
+        self.0.mnt.mntput();
+    }
 }
 
 struct FsStructInner {
     /// Current working directory
-    pwd: Path,
+    pwd: Pinned,
     /// Root directory (for chroot support, usually same as global root)
-    root: Path,
+    root: Pinned,
     /// File creation mask
     umask: u16,
 }
@@ -49,10 +69,11 @@ impl FsStruct {
     pub fn new(root: Path, pwd: Path) -> Arc<Self> {
         Arc::new(Self {
             inner: Mutex::new(FsStructInner {
-                pwd,
-                root,
+                pwd: Pinned::new(pwd),
+                root: Pinned::new(root),
                 umask: 0o022,
             }),
+            users: core::sync::atomic::AtomicUsize::new(1),
         })
     }
 
@@ -68,12 +89,12 @@ impl FsStruct {
 
     /// Get current working directory (returns cloned Path with bumped refs)
     pub fn get_pwd(&self) -> Path {
-        self.inner.lock().pwd.clone()
+        self.inner.lock().pwd.0.clone()
     }
 
     /// Get root directory (returns cloned Path with bumped refs)
     pub fn get_root(&self) -> Path {
-        self.inner.lock().root.clone()
+        self.inner.lock().root.0.clone()
     }
 
     /// Get umask
@@ -88,7 +109,7 @@ impl FsStruct {
     pub fn set_pwd(&self, new_pwd: Path) {
         let old = {
             let mut inner = self.inner.lock();
-            core::mem::replace(&mut inner.pwd, new_pwd)
+            core::mem::replace(&mut inner.pwd, Pinned::new(new_pwd))
         };
         // old Path dropped here, decrementing refcounts
         drop(old);
@@ -98,7 +119,26 @@ impl FsStruct {
     pub fn set_root(&self, new_root: Path) {
         let old = {
             let mut inner = self.inner.lock();
-            core::mem::replace(&mut inner.root, new_root)
+            core::mem::replace(&mut inner.root, Pinned::new(new_root))
+        };
+        drop(old);
+    }
+
+    /// After a mount namespace copy: root and pwd move to the copies of
+    /// their mounts (Linux copy_mnt_ns, for the new task's fs)
+    pub fn repoint(&self, map: &crate::fs::mount::MountMap) {
+        let swap = |p: &Path| {
+            map.iter()
+                .find(|(old, _)| Arc::ptr_eq(old, &p.mnt))
+                .map(|(_, new)| Path::new(new.clone(), p.dentry.clone()))
+        };
+        let old = {
+            let mut inner = self.inner.lock();
+            let (root, pwd) = (swap(&inner.root.0), swap(&inner.pwd.0));
+            (
+                root.map(|r| core::mem::replace(&mut inner.root, Pinned::new(r))),
+                pwd.map(|p| core::mem::replace(&mut inner.pwd, Pinned::new(p))),
+            )
         };
         drop(old);
     }
@@ -120,10 +160,11 @@ impl FsStruct {
         let inner = self.inner.lock();
         Arc::new(Self {
             inner: Mutex::new(FsStructInner {
-                pwd: inner.pwd.clone(),   // bumps refcounts on mount/dentry
-                root: inner.root.clone(), // bumps refcounts on mount/dentry
+                pwd: Pinned::new(inner.pwd.0.clone()),
+                root: Pinned::new(inner.root.0.clone()),
                 umask: inner.umask,
             }),
+            users: core::sync::atomic::AtomicUsize::new(1),
         })
     }
 }
@@ -141,7 +182,10 @@ use crate::task::percpu::{current, with_task_lock};
 /// Initialize filesystem context for a new task (the task itself, or
 /// its creator before it runs); the old one is dropped after the lock
 pub fn init_task_fs(tid: Tid, fs: Arc<FsStruct>) {
-    let old = with_task_lock(tid, |a| a.set_fs(Some(fs)));
+    let old = with_task_lock(tid, |a| a.set_fs(Some(fs))).flatten();
+    if let Some(o) = &old {
+        o.users.fetch_sub(1, core::sync::atomic::Ordering::SeqCst);
+    }
     drop(old);
 }
 
@@ -163,6 +207,9 @@ pub fn get_task_fs(tid: Tid) -> Option<Arc<FsStruct>> {
 /// the task's alloc_lock is released: nothing is released under it).
 pub fn exit_task_fs(tid: Tid) {
     let fs = with_task_lock(tid, |a| a.set_fs(None)).flatten();
+    if let Some(o) = &fs {
+        o.users.fetch_sub(1, core::sync::atomic::Ordering::SeqCst);
+    }
     drop(fs);
 }
 
@@ -173,7 +220,9 @@ pub fn exit_task_fs(tid: Tid) {
 pub fn clone_task_fs(parent_tid: Tid, child_tid: Tid, share: bool) {
     let child_fs = if share {
         // CLONE_FS: share the same Arc<FsStruct>
-        get_task_fs(parent_tid)
+        get_task_fs(parent_tid).inspect(|fs| {
+            fs.users.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+        })
     } else {
         // Normal fork: copy the FsStruct
         get_task_fs(parent_tid).map(|fs| fs.copy())

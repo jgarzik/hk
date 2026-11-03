@@ -23,7 +23,7 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::sync::spin::{Mutex, RwLock};
 
-use crate::arch::{IrqSpinlock, Uaccess};
+use crate::arch::IrqSpinlock;
 use crate::block::blkdev::{BioOp, bdev_rw, bdev_rw_frame};
 use crate::fs::{Inode, lookup_path};
 use crate::mm::filemap::PAGE_SIZE;
@@ -31,7 +31,6 @@ use crate::mm::page::frame_bytes;
 use crate::mm::swap_entry::{MAX_SWAPFILES, SwapEntry};
 use crate::mm::xarray::XArray;
 use crate::task::{CAP_SYS_ADMIN, capable};
-use crate::uaccess::strncpy_from_user;
 use crate::util::error::KernelError;
 
 /// 512-byte sectors per page
@@ -442,8 +441,8 @@ fn write_page(entry: SwapEntry, frame_phys: u64) -> Result<(), i64> {
 // ============================================================================
 
 /// The path argument of swapon/swapoff
-fn user_path(ptr: u64) -> Result<alloc::string::String, KernelError> {
-    strncpy_from_user::<Uaccess>(ptr, 4096).map_err(|_| KernelError::BadAddress)
+fn user_path(ptr: u64) -> Result<alloc::vec::Vec<u8>, KernelError> {
+    crate::fs::namei::getname(ptr, false)
 }
 
 /// The slots of the area whose header page is `hdr` on a file or
@@ -483,7 +482,7 @@ fn swapon(path_ptr: u64, swap_flags: i32) -> Result<(), KernelError> {
         .get_inode()
         .ok_or(KernelError::NotFound)?;
     let _g = SWAPON.lock();
-    if find_swap_by_path(path.as_bytes()).is_some() {
+    if find_swap_by_path(&path).is_some() {
         return Err(KernelError::Busy);
     }
     let swap_type = SWAP_INFO
@@ -535,7 +534,7 @@ fn swapon(path_ptr: u64, swap_flags: i32) -> Result<(), KernelError> {
         Some(b) => (None, Some(b)),
         None => (Some(inode), None),
     };
-    let si = SwapInfo::new(backing, path.into_bytes(), swap_type, max, priority)?;
+    let si = SwapInfo::new(backing, path, swap_type, max, priority)?;
     // S_SWAPFILE under i_rwsem (Linux claim_swapfile under inode_lock):
     // a write or truncate in flight finishes first, later ones see it
     let si_inode = si.swapfile_inode();
@@ -565,7 +564,7 @@ fn swapoff(path_ptr: u64) -> Result<(), KernelError> {
     // (Linux swapoff: file_open_name first)
     lookup_path(&path)?;
     let _g = SWAPON.lock();
-    let t = find_swap_by_path(path.as_bytes()).ok_or(KernelError::InvalidArgument)?;
+    let t = find_swap_by_path(&path).ok_or(KernelError::InvalidArgument)?;
     let si = get_swap_info(t).ok_or(KernelError::InvalidArgument)?;
     // No new slots from it (Linux del_from_avail_list, under si->lock:
     // an allocator past get_swap_page's filter rechecks under `map`)

@@ -10,8 +10,10 @@ use alloc::sync::Arc;
 use alloc::vec;
 
 use crate::arch::Uaccess;
-use crate::fs::{KernelError, LookupFlags, Path, is_subdir, lookup_path_flags};
-use crate::uaccess::{UaccessArch, copy_to_user, put_user, strncpy_from_user};
+use crate::fs::{KernelError, LookupFlags, lookup_path_flags};
+use crate::uaccess::{
+    UaccessArch, copy_to_user, put_user, strncpy_from_user, strncpy_from_user_str,
+};
 
 use super::syscall::{PATH_MAX, current_fd_table};
 
@@ -33,6 +35,8 @@ mod ms {
     pub const NODEV: u64 = 4;
     pub const NOEXEC: u64 = 8;
     pub const REMOUNT: u64 = 32;
+    pub const BIND: u64 = 4096;
+    pub const MOVE: u64 = 8192;
     pub const MANDLOCK: u64 = 64;
     pub const NOATIME: u64 = 1 << 10;
     pub const NODIRATIME: u64 = 1 << 11;
@@ -41,6 +45,8 @@ mod ms {
     pub const POSIXACL: u64 = 1 << 16;
     pub const UNBINDABLE: u64 = 1 << 17;
     pub const PRIVATE: u64 = 1 << 18;
+    pub const SLAVE: u64 = 1 << 19;
+    pub const SHARED: u64 = 1 << 20;
     pub const RELATIME: u64 = 1 << 21;
     pub const I_VERSION: u64 = 1 << 23;
     pub const STRICTATIME: u64 = 1 << 24;
@@ -50,11 +56,12 @@ mod ms {
     pub const MGC_MSK: u64 = 0xffff_0000;
 
     /// Flags hk honors, or may accept without effect because hk
-    /// already behaves that way (no atime updates, every mount private
-    /// and unbindable, no mandatory locks); everything else (MS_BIND,
-    /// MS_MOVE, MS_SHARED, MS_SLAVE, MS_SYNCHRONOUS, MS_DIRSYNC,
-    /// MS_NOSYMFOLLOW, ...) is EINVAL instead of being ignored
+    /// already behaves that way (no atime updates, no mandatory locks);
+    /// everything else (MS_SYNCHRONOUS, MS_DIRSYNC, MS_NOSYMFOLLOW, ...)
+    /// is EINVAL instead of being ignored
     pub const KNOWN: u64 = RDONLY
+        | BIND
+        | MOVE
         | NOSUID
         | NODEV
         | NOEXEC
@@ -67,6 +74,8 @@ mod ms {
         | POSIXACL
         | UNBINDABLE
         | PRIVATE
+        | SLAVE
+        | SHARED
         | RELATIME
         | I_VERSION
         | STRICTATIME
@@ -75,8 +84,11 @@ mod ms {
 
 /// Per-mount MNT_* flags of mount(2) flags
 fn mnt_flags(flags: u64) -> u32 {
-    use super::mount::{MNT_NODEV, MNT_NOEXEC, MNT_NOSUID};
+    use super::mount::{MNT_NODEV, MNT_NOEXEC, MNT_NOSUID, MNT_READONLY};
     let mut f = 0;
+    if flags & ms::RDONLY != 0 {
+        f |= MNT_READONLY;
+    }
     if flags & ms::NOSUID != 0 {
         f |= MNT_NOSUID;
     }
@@ -94,32 +106,63 @@ fn mnt_flags(flags: u64) -> u32 {
 /// (EBUSY while files are open for writing or changes are in progress,
 /// with nothing changed); only then the per-mount flags are replaced.
 fn remount(m: &Arc<super::mount::Mount>, flags: u64) -> Result<(), KernelError> {
+    let _s = m.sb.s_umount.write();
     if flags & ms::RDONLY != 0 {
         m.sb.make_rdonly()?;
     } else {
         m.sb.make_rdwr();
     }
-    m.set_flags(mnt_flags(flags));
+    m.set_flags(mnt_flags(flags))
+}
+
+/// MS_REMOUNT|MS_BIND (Linux do_reconfigure_mnt): this mount's flags
+/// only, read-only included; the superblock is untouched
+fn reconfigure_mnt(m: &Arc<super::mount::Mount>, flags: u64) -> Result<(), KernelError> {
+    let _s = m.sb.s_umount.write();
+    m.set_flags(mnt_flags(flags))
+}
+
+/// MS_SHARED / MS_SLAVE / MS_PRIVATE / MS_UNBINDABLE (Linux
+/// do_change_type): exactly one type (else EINVAL), for the subtree
+/// with MS_REC
+fn change_type(m: &Arc<super::mount::Mount>, flags: u64) -> Result<(), KernelError> {
+    use super::pnode::{Prop, change_propagation, subtree};
+    let p = match flags & !(ms::REC | ms::SILENT) {
+        ms::SHARED => Prop::Shared,
+        ms::SLAVE => Prop::Slave,
+        ms::PRIVATE => Prop::Private,
+        ms::UNBINDABLE => Prop::Unbindable,
+        _ => return Err(KernelError::InvalidArgument),
+    };
+    let _ns = super::mount::NAMESPACE_SEM.write();
+    let targets = if flags & ms::REC != 0 {
+        subtree(m)
+    } else {
+        alloc::vec![m.clone()]
+    };
+    for t in targets {
+        change_propagation(&t, p);
+    }
     Ok(())
 }
 
 /// Mount whose root `target` is (Linux path_mounted), else EINVAL
-fn mount_at(target: &Arc<super::Dentry>) -> Result<Arc<super::mount::Mount>, KernelError> {
-    crate::ns::current_mnt_ns()
-        .find_mount_at(target)
-        .ok_or(KernelError::InvalidArgument)
+fn mount_at(target: &super::Path) -> Result<Arc<super::mount::Mount>, KernelError> {
+    if Arc::ptr_eq(&target.dentry, &target.mnt.root) {
+        Ok(target.mnt.clone())
+    } else {
+        Err(KernelError::InvalidArgument)
+    }
 }
 
 /// sys_mount - mount a filesystem (Linux do_mount + path_mount)
 ///
 /// Order as in Linux: strings and the target are looked up first, then
-/// MS_NOUSER (EINVAL) and CAP_SYS_ADMIN (EPERM). MS_REMOUNT changes the
-/// flags of the mount at `target` (its root): read-only on the
-/// superblock, nosuid/nodev/noexec on the mount. MS_PRIVATE /
-/// MS_UNBINDABLE succeed on a mount root (hk mounts never propagate and
-/// cannot be bind-mounted). Unsupported flags are EINVAL.
-pub fn sys_mount(source_ptr: u64, target_ptr: u64, fstype_ptr: u64, flags: u64, _data: u64) -> i64 {
-    match path_mount(source_ptr, target_ptr, fstype_ptr, flags) {
+/// MS_NOUSER (EINVAL) and CAP_SYS_ADMIN (EPERM), then path_mount's
+/// dispatch: MS_REMOUNT|MS_BIND, MS_REMOUNT, MS_BIND, the propagation
+/// types, MS_MOVE, else a new mount. Unsupported flags are EINVAL.
+pub fn sys_mount(source_ptr: u64, target_ptr: u64, fstype_ptr: u64, flags: u64, data: u64) -> i64 {
+    match path_mount(source_ptr, target_ptr, fstype_ptr, flags, data) {
         Ok(()) => 0,
         Err(e) => e.sysret(),
     }
@@ -130,21 +173,44 @@ fn path_mount(
     target_ptr: u64,
     fstype_ptr: u64,
     mut flags: u64,
+    data_ptr: u64,
 ) -> Result<(), KernelError> {
-    let copy = |p| strncpy_from_user::<Uaccess>(p, PATH_MAX).map_err(|_| KernelError::BadAddress);
-    // Source and type may be absent for remount / propagation changes
-    let source = if source_ptr != 0 {
-        copy(source_ptr)?
-    } else {
-        Default::default()
+    use crate::uaccess::UaccessError;
+    // Linux copy_mount_string (strndup_user): EFAULT, EINVAL if too long;
+    // type, then source, then the target as a path name. Source and type
+    // may be absent for remount / propagation changes; a type is a name
+    // of a registered filesystem: not text, no such one
+    let too_long = |e| match e {
+        UaccessError::TooLong => KernelError::InvalidArgument,
+        _ => KernelError::BadAddress,
     };
     let fstype = if fstype_ptr != 0 {
-        copy(fstype_ptr)?
+        match strncpy_from_user_str::<Uaccess>(fstype_ptr, PATH_MAX) {
+            Ok(s) => s,
+            Err(UaccessError::Encoding) => return Err(KernelError::NoDevice),
+            Err(e) => return Err(too_long(e)),
+        }
     } else {
         Default::default()
     };
-    let target = copy(target_ptr)?;
-    let mp = lookup_path_flags(&target, LookupFlags::opendir())?;
+    let source = if source_ptr != 0 {
+        strncpy_from_user::<Uaccess>(source_ptr, PATH_MAX).map_err(too_long)?
+    } else {
+        Default::default()
+    };
+    // Linux copy_mount_options: the options string, within a page
+    let data = if data_ptr != 0 {
+        strncpy_from_user::<Uaccess>(data_ptr, 4096).map_err(too_long)?
+    } else {
+        Default::default()
+    };
+    let target = crate::fs::namei::getname(target_ptr, false)?;
+    // A mount may cover a file (bind): the target is only followed
+    let mp = crate::fs::namei::path_lookupat(
+        crate::task::percpu::current_cwd(),
+        &target,
+        LookupFlags::open(),
+    )?;
 
     if flags & ms::MGC_MSK == ms::MGC_VAL {
         flags &= !ms::MGC_MSK;
@@ -158,34 +224,79 @@ fn path_mount(
     if flags & !ms::KNOWN != 0 {
         return Err(KernelError::InvalidArgument);
     }
+    // Linux path_mount's order
+    if flags & (ms::REMOUNT | ms::BIND) == ms::REMOUNT | ms::BIND {
+        return reconfigure_mnt(&mount_at(&mp)?, flags);
+    }
     if flags & ms::REMOUNT != 0 {
         return remount(&mount_at(&mp)?, flags);
     }
-    if flags & (ms::PRIVATE | ms::UNBINDABLE) != 0 {
-        return mount_at(&mp).map(|_| ());
+    if flags & ms::BIND != 0 {
+        let old = crate::fs::namei::path_lookupat(
+            crate::task::percpu::current_cwd(),
+            &source,
+            LookupFlags::open(),
+        );
+        if source.is_empty() {
+            return Err(KernelError::NotFound);
+        }
+        return super::mount::do_loopback(&old?, &mp, flags & ms::REC != 0);
     }
-    new_mount(&source, &fstype, mp, flags)
+    if flags & (ms::SHARED | ms::SLAVE | ms::PRIVATE | ms::UNBINDABLE) != 0 {
+        return change_type(&mount_at(&mp)?, flags);
+    }
+    if flags & ms::MOVE != 0 {
+        let old = crate::fs::namei::path_lookupat(
+            crate::task::percpu::current_cwd(),
+            &source,
+            LookupFlags::open(),
+        );
+        if source.is_empty() {
+            return Err(KernelError::NotFound);
+        }
+        return super::mount::do_move(&old?, &mp);
+    }
+    new_mount(&source, &fstype, mp, flags, &data)
 }
 
 /// Mount a new instance of `fstype` on `mp` (Linux do_new_mount)
 fn new_mount(
-    source: &str,
+    source: &[u8],
     fstype: &str,
-    mp: Arc<super::Dentry>,
+    mp: super::Path,
     flags: u64,
+    data: &[u8],
 ) -> Result<(), KernelError> {
     let fs_type = super::superblock::find_filesystem(fstype).ok_or(KernelError::NoDevice)?;
-    if !mp.get_inode().ok_or(KernelError::NotFound)?.mode().is_dir() {
+    if !mp
+        .dentry
+        .get_inode()
+        .ok_or(KernelError::NotFound)?
+        .mode()
+        .is_dir()
+    {
         return Err(KernelError::NotDirectory);
     }
     // Flags are set before the mount becomes visible (Linux do_new_mount)
     let sb = if fs_type.mount_dev.is_some() && !source.is_empty() {
-        super::mount::dev_super(fs_type, source)
+        super::mount::dev_super(fs_type, source, data)
     } else {
-        (fs_type.mount)(fs_type)
+        (fs_type.mount)(fs_type, data)
     };
     let r = sb.and_then(|sb| {
-        super::mount::attach(sb, Some(mp), mnt_flags(flags), flags & ms::RDONLY != 0)
+        // Linux: no source is "none"
+        let devname = if source.is_empty() {
+            b"none".as_slice()
+        } else {
+            source
+        };
+        super::mount::attach(
+            sb,
+            Some(mp),
+            mnt_flags(flags),
+            flags & ms::RDONLY != 0,
+            devname.into(),
+        )
     });
     match r {
         Ok(_) => Ok(()),
@@ -199,142 +310,51 @@ fn new_mount(
     }
 }
 
-/// sys_umount2 - unmount a filesystem
-///
-/// # Arguments
-/// * `target_ptr` - User pointer to mount point path
-/// * `flags` - Umount flags (MNT_FORCE, MNT_DETACH, etc.)
-///
-/// # Returns
-/// 0 on success, negative errno on error
+/// sys_umount2 (Linux ksys_umount): flags, the target (a mount's root,
+/// followed unless UMOUNT_NOFOLLOW), CAP_SYS_ADMIN after the lookup,
+/// then do_umount
 pub fn sys_umount2(target_ptr: u64, flags: i32) -> i64 {
-    // MNT_EXPIRE is not supported: EINVAL like any unknown flag
-    use super::mount::umount_flags::{MNT_DETACH, MNT_FORCE, UMOUNT_NOFOLLOW};
-    if flags & !(MNT_FORCE | MNT_DETACH | UMOUNT_NOFOLLOW) != 0 {
-        return KernelError::InvalidArgument.sysret();
-    }
-
-    // Read target path from user space
-    let target = match strncpy_from_user::<Uaccess>(target_ptr, PATH_MAX) {
-        Ok(s) => s,
-        Err(_) => return KernelError::BadAddress.sysret(),
-    };
-
-    // Set up lookup flags - respect UMOUNT_NOFOLLOW
-    let mut lookup_flags = LookupFlags::open();
-    if flags & super::mount::umount_flags::UMOUNT_NOFOLLOW != 0 {
-        lookup_flags.follow = false;
-    }
-
-    // Look up the target path
-    let target_dentry = match lookup_path_flags(&target, lookup_flags) {
-        Ok(d) => d,
-        Err(e) => return e.sysret(),
-    };
-
-    // Linux can_umount: CAP_SYS_ADMIN after the lookup
-    if !crate::task::capable(crate::task::CAP_SYS_ADMIN) {
-        return KernelError::NotPermitted.sysret();
-    }
-
-    // Find the mount at this path
-    let mount = match crate::ns::current_mnt_ns().find_mount_at(&target_dentry) {
-        Some(m) => m,
-        None => return KernelError::InvalidArgument.sysret(), // Not a mount point
-    };
-
-    // Perform the unmount
-    match super::mount::do_umount(mount, flags) {
+    use super::mount::umount_flags::{MNT_DETACH, MNT_EXPIRE, MNT_FORCE, UMOUNT_NOFOLLOW};
+    let r = (|| {
+        if flags & !(MNT_FORCE | MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW) != 0 {
+            return Err(KernelError::InvalidArgument);
+        }
+        let target = crate::fs::namei::getname(target_ptr, false)?;
+        let lf = LookupFlags {
+            follow: flags & UMOUNT_NOFOLLOW == 0,
+            ..LookupFlags::open()
+        };
+        let target =
+            crate::fs::namei::path_lookupat(crate::task::percpu::current_cwd(), &target, lf)?;
+        if !crate::task::capable(crate::task::CAP_SYS_ADMIN) {
+            return Err(KernelError::NotPermitted);
+        }
+        super::mount::do_umount(mount_at(&target)?, flags)
+    })();
+    match r {
         Ok(()) => 0,
-        Err(KernelError::Busy) => EBUSY,
-        Err(KernelError::InvalidArgument) => KernelError::InvalidArgument.sysret(), // Can't unmount root
-        Err(_) => KernelError::InvalidArgument.sysret(),
+        Err(e) => e.sysret(),
     }
 }
 
-/// pivot_root - change the root filesystem
-///
-/// Moves the root filesystem of the calling process's mount namespace
-/// to the directory `put_old` and makes `new_root` the new root filesystem.
-///
-/// # Arguments
-/// * `new_root_ptr` - User pointer to path that will become the new root
-/// * `put_old_ptr` - User pointer to path where old root will be moved
-///
-/// # Returns
-/// 0 on success, negative errno on error
-///
-/// # Errors
-/// * EPERM - Caller lacks CAP_SYS_ADMIN
-/// * EINVAL - Various invalid configuration (not mountpoints, put_old not under new_root)
-/// * ENOTDIR - new_root or put_old is not a directory
-/// * ENOENT - Path not found
+/// pivot_root(new_root, put_old) (Linux: may_mount, both paths as
+/// directories, then the mount rules of do_pivot_root)
 pub fn sys_pivot_root(new_root_ptr: u64, put_old_ptr: u64) -> i64 {
-    // 1. Permission check: requires CAP_SYS_ADMIN
-    if !crate::task::capable(crate::task::CAP_SYS_ADMIN) {
-        return KernelError::NotPermitted.sysret();
+    let r = (|| {
+        if !crate::task::capable(crate::task::CAP_SYS_ADMIN) {
+            return Err(KernelError::NotPermitted);
+        }
+        let cwd = crate::task::percpu::current_cwd;
+        let new = crate::fs::namei::getname(new_root_ptr, false)?;
+        let new = crate::fs::namei::path_lookupat(cwd(), &new, LookupFlags::opendir())?;
+        let old = crate::fs::namei::getname(put_old_ptr, false)?;
+        let old = crate::fs::namei::path_lookupat(cwd(), &old, LookupFlags::opendir())?;
+        super::mount::do_pivot_root(&new, &old)
+    })();
+    match r {
+        Ok(()) => 0,
+        Err(e) => e.sysret(),
     }
-
-    // 2. Copy paths from user space
-    let new_root_str = match strncpy_from_user::<Uaccess>(new_root_ptr, PATH_MAX) {
-        Ok(s) => s,
-        Err(_) => return KernelError::BadAddress.sysret(),
-    };
-    let put_old_str = match strncpy_from_user::<Uaccess>(put_old_ptr, PATH_MAX) {
-        Ok(s) => s,
-        Err(_) => return KernelError::BadAddress.sysret(),
-    };
-
-    // 3. Look up new_root path (must be directory)
-    let new_root_dentry = match lookup_path_flags(&new_root_str, LookupFlags::opendir()) {
-        Ok(d) => d,
-        Err(e) => return e.sysret(),
-    };
-
-    // 4. Verify new_root is a mount point
-    let mnt_ns = crate::ns::current_mnt_ns();
-    let new_mnt = match mnt_ns.find_mount_at(&new_root_dentry) {
-        Some(m) => m,
-        None => return KernelError::InvalidArgument.sysret(), // Not a mount point
-    };
-
-    // 5. Look up put_old path (must be directory)
-    let put_old_dentry = match lookup_path_flags(&put_old_str, LookupFlags::opendir()) {
-        Ok(d) => d,
-        Err(e) => return e.sysret(),
-    };
-
-    // 6. Verify put_old is at or under new_root
-    if !is_subdir(&put_old_dentry, &new_root_dentry) {
-        return KernelError::InvalidArgument.sysret();
-    }
-
-    // 7. Get old root mount - must exist
-    let _old_root_mnt = match mnt_ns.get_root() {
-        Some(m) => m,
-        None => return KernelError::InvalidArgument.sysret(),
-    };
-
-    // 8. Verify new_root is not the same as current root
-    // (pivoting to the same root is a no-op but Linux returns EBUSY)
-    if let Some(root_dentry) = mnt_ns.get_root_dentry()
-        && Arc::ptr_eq(&root_dentry, &new_root_dentry)
-    {
-        return EBUSY;
-    }
-
-    // 9. Set new root as namespace root
-    mnt_ns.set_root(new_mnt.clone());
-
-    // 10. Update task's fs root
-    // The new root dentry becomes the task's root
-    if let Some(fs) = crate::task::percpu::current_fs()
-        && let Some(new_path) = Path::from_dentry(new_root_dentry)
-    {
-        fs.set_root(new_path);
-    }
-
-    0
 }
 
 /// sys_ioctl - device control
@@ -565,13 +585,13 @@ fn do_setxattr(
     }
 
     // Copy path from user
-    let path = match strncpy_from_user::<Uaccess>(path_ptr, PATH_MAX) {
+    let path = match crate::fs::namei::getname(path_ptr, false) {
         Ok(p) => p,
-        Err(_) => return KernelError::BadAddress.sysret(),
+        Err(e) => return e.sysret(),
     };
 
     // Copy attribute name from user
-    let name = match strncpy_from_user::<Uaccess>(name_ptr, XATTR_NAME_MAX + 1) {
+    let name = match strncpy_from_user_str::<Uaccess>(name_ptr, XATTR_NAME_MAX + 1) {
         Ok(n) => n,
         Err(_) => return KernelError::BadAddress.sysret(),
     };
@@ -597,10 +617,15 @@ fn do_setxattr(
         }
     };
 
-    let dentry = match lookup_path_flags(&path, lookup_flags) {
-        Ok(d) => d,
+    let fpath = match crate::fs::namei::path_lookupat(
+        crate::task::percpu::current_cwd(),
+        &path,
+        lookup_flags,
+    ) {
+        Ok(p) => p,
         Err(e) => return e.sysret(),
     };
+    let dentry = fpath.dentry.clone();
 
     let inode = match dentry.get_inode() {
         Some(i) => i,
@@ -608,7 +633,7 @@ fn do_setxattr(
     };
 
     // setxattr/removexattr: write access first (EROFS), held across
-    let _w = match super::dac::want_write(&inode) {
+    let _w = match fpath.mnt.want_write() {
         Ok(w) => w,
         Err(e) => return e.sysret(),
     };
@@ -637,7 +662,7 @@ pub fn sys_fsetxattr(fd: i32, name_ptr: u64, value_ptr: u64, size: u64, flags: i
     };
 
     // Copy attribute name from user
-    let name = match strncpy_from_user::<Uaccess>(name_ptr, XATTR_NAME_MAX + 1) {
+    let name = match strncpy_from_user_str::<Uaccess>(name_ptr, XATTR_NAME_MAX + 1) {
         Ok(n) => n,
         Err(_) => return KernelError::BadAddress.sysret(),
     };
@@ -659,7 +684,7 @@ pub fn sys_fsetxattr(fd: i32, name_ptr: u64, value_ptr: u64, size: u64, flags: i
     };
 
     // setxattr/removexattr: write access first (EROFS), held across
-    let _w = match super::dac::want_write(&inode) {
+    let _w = match file.want_write() {
         Ok(w) => w,
         Err(e) => return e.sysret(),
     };
@@ -702,13 +727,13 @@ fn do_getxattr(
     follow_symlinks: bool,
 ) -> i64 {
     // Copy path from user
-    let path = match strncpy_from_user::<Uaccess>(path_ptr, PATH_MAX) {
+    let path = match crate::fs::namei::getname(path_ptr, false) {
         Ok(p) => p,
-        Err(_) => return KernelError::BadAddress.sysret(),
+        Err(e) => return e.sysret(),
     };
 
     // Copy attribute name from user
-    let name = match strncpy_from_user::<Uaccess>(name_ptr, XATTR_NAME_MAX + 1) {
+    let name = match strncpy_from_user_str::<Uaccess>(name_ptr, XATTR_NAME_MAX + 1) {
         Ok(n) => n,
         Err(_) => return KernelError::BadAddress.sysret(),
     };
@@ -786,7 +811,7 @@ pub fn sys_fgetxattr(fd: i32, name_ptr: u64, value_ptr: u64, size: u64) -> i64 {
     };
 
     // Copy attribute name from user
-    let name = match strncpy_from_user::<Uaccess>(name_ptr, XATTR_NAME_MAX + 1) {
+    let name = match strncpy_from_user_str::<Uaccess>(name_ptr, XATTR_NAME_MAX + 1) {
         Ok(n) => n,
         Err(_) => return KernelError::BadAddress.sysret(),
     };
@@ -861,9 +886,9 @@ pub fn sys_llistxattr(path_ptr: u64, list_ptr: u64, size: u64) -> i64 {
 /// Internal helper for listxattr/llistxattr
 fn do_listxattr(path_ptr: u64, list_ptr: u64, size: u64, follow_symlinks: bool) -> i64 {
     // Copy path from user
-    let path = match strncpy_from_user::<Uaccess>(path_ptr, PATH_MAX) {
+    let path = match crate::fs::namei::getname(path_ptr, false) {
         Ok(p) => p,
-        Err(_) => return KernelError::BadAddress.sysret(),
+        Err(e) => return e.sysret(),
     };
 
     // Lookup path
@@ -985,13 +1010,13 @@ pub fn sys_lremovexattr(path_ptr: u64, name_ptr: u64) -> i64 {
 /// Internal helper for removexattr/lremovexattr
 fn do_removexattr(path_ptr: u64, name_ptr: u64, follow_symlinks: bool) -> i64 {
     // Copy path from user
-    let path = match strncpy_from_user::<Uaccess>(path_ptr, PATH_MAX) {
+    let path = match crate::fs::namei::getname(path_ptr, false) {
         Ok(p) => p,
-        Err(_) => return KernelError::BadAddress.sysret(),
+        Err(e) => return e.sysret(),
     };
 
     // Copy attribute name from user
-    let name = match strncpy_from_user::<Uaccess>(name_ptr, XATTR_NAME_MAX + 1) {
+    let name = match strncpy_from_user_str::<Uaccess>(name_ptr, XATTR_NAME_MAX + 1) {
         Ok(n) => n,
         Err(_) => return KernelError::BadAddress.sysret(),
     };
@@ -1011,10 +1036,15 @@ fn do_removexattr(path_ptr: u64, name_ptr: u64, follow_symlinks: bool) -> i64 {
         }
     };
 
-    let dentry = match lookup_path_flags(&path, lookup_flags) {
-        Ok(d) => d,
+    let fpath = match crate::fs::namei::path_lookupat(
+        crate::task::percpu::current_cwd(),
+        &path,
+        lookup_flags,
+    ) {
+        Ok(p) => p,
         Err(e) => return e.sysret(),
     };
+    let dentry = fpath.dentry.clone();
 
     let inode = match dentry.get_inode() {
         Some(i) => i,
@@ -1022,7 +1052,7 @@ fn do_removexattr(path_ptr: u64, name_ptr: u64, follow_symlinks: bool) -> i64 {
     };
 
     // setxattr/removexattr: write access first (EROFS), held across
-    let _w = match super::dac::want_write(&inode) {
+    let _w = match fpath.mnt.want_write() {
         Ok(w) => w,
         Err(e) => return e.sysret(),
     };
@@ -1046,7 +1076,7 @@ pub fn sys_fremovexattr(fd: i32, name_ptr: u64) -> i64 {
     };
 
     // Copy attribute name from user
-    let name = match strncpy_from_user::<Uaccess>(name_ptr, XATTR_NAME_MAX + 1) {
+    let name = match strncpy_from_user_str::<Uaccess>(name_ptr, XATTR_NAME_MAX + 1) {
         Ok(n) => n,
         Err(_) => return KernelError::BadAddress.sysret(),
     };
@@ -1062,7 +1092,7 @@ pub fn sys_fremovexattr(fd: i32, name_ptr: u64) -> i64 {
     };
 
     // setxattr/removexattr: write access first (EROFS), held across
-    let _w = match super::dac::want_write(&inode) {
+    let _w = match file.want_write() {
         Ok(w) => w,
         Err(e) => return e.sysret(),
     };

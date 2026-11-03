@@ -3,6 +3,7 @@
 //! Replaces the current process image with a new program.
 #![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
+use crate::fs::file::flags::{AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
@@ -58,7 +59,7 @@ const PATH_MAX: usize = 4096;
 fn copy_string_from_user(ptr: u64, max_len: usize) -> Result<Vec<u8>, i32> {
     use crate::uaccess::UaccessError;
     crate::uaccess::strndup_user_bytes::<crate::arch::Uaccess>(ptr, max_len).map_err(|e| match e {
-        UaccessError::Overflow => E2BIG,
+        UaccessError::TooLong => E2BIG,
         _ => EFAULT,
     })
 }
@@ -663,8 +664,7 @@ fn resolve_scripts(
         }
         argv = rewrite_argv(&argv, interp, arg, &name);
         name = interp.to_vec();
-        let p = core::str::from_utf8(interp).map_err(|_| ENOENT)?;
-        file = kernel_open_exec(p)?;
+        file = kernel_open_exec(interp)?;
     }
     Ok((file, argv))
 }
@@ -812,11 +812,7 @@ pub fn do_execve<FA: FrameAlloc<PhysAddr = u64>>(
     envp: Vec<Vec<u8>>,
     frame_alloc: &mut FA,
 ) -> i32 {
-    let open = |p: &[u8]| match core::str::from_utf8(p) {
-        Ok(s) => kernel_open_exec(s),
-        Err(_) => Err(ENOENT),
-    };
-    exec_file(path, open, false, argv, envp, frame_alloc)
+    exec_file(path, kernel_open_exec, false, argv, envp, frame_alloc)
 }
 
 /// do_execve with the file opened by `open` from the name (Linux
@@ -879,10 +875,7 @@ where
     // load_elf_binary): ENOENT if missing (open_exec), ELIBBAD if it is
     // not an ELF file for this machine
     let interp_file = match &elf.interp {
-        Some(i) => match core::str::from_utf8(i)
-            .map_err(|_| ENOENT)
-            .and_then(kernel_open_exec)
-        {
+        Some(i) => match kernel_open_exec(i) {
             Ok(f) => Some(f),
             Err(e) => return -e,
         },
@@ -1042,7 +1035,11 @@ where
     {
         let mut m = mm.mmap_write();
         m.set_brk(start_brk);
-        m.set_exe(file.dentry.full_path(), deny);
+        let exe = match (file.f_path(), crate::fs::namei::nd_root()) {
+            (Some(p), Ok(root)) => crate::fs::dentry::d_path(&p, &root).0,
+            _ => alloc::vec::Vec::new(),
+        };
+        m.set_exe(exe.into(), deny);
         let code = image_layout(&elf, base_addr);
         m.set_args(MmLayout {
             start_code: code.start_code,
@@ -1089,10 +1086,9 @@ pub fn sys_execve(pathname: u64, argv_ptr: u64, envp_ptr: u64) -> i64 {
     use crate::FRAME_ALLOCATOR;
     use crate::mm::frame_alloc::FrameAllocRef;
 
-    // Copy pathname from user space
-    let path = match copy_string_from_user(pathname, PATH_MAX) {
+    let path = match crate::fs::namei::getname(pathname, false) {
         Ok(p) => p,
-        Err(e) => return -(e as i64),
+        Err(e) => return e.sysret(),
     };
 
     // Copy argv from user space
@@ -1122,15 +1118,6 @@ pub fn sys_execve(pathname: u64, argv_ptr: u64, envp_ptr: u64) -> i64 {
     result as i64
 }
 
-/// AT_FDCWD - special value meaning current working directory
-pub const AT_FDCWD: i32 = -100;
-
-/// AT_EMPTY_PATH - path is empty, use the fd directly
-pub const AT_EMPTY_PATH: i32 = 0x1000;
-
-/// AT_SYMLINK_NOFOLLOW - a final symlink is not followed (ELOOP)
-pub const AT_SYMLINK_NOFOLLOW: i32 = 0x100;
-
 /// sys_execveat - execute a program relative to a directory file descriptor
 /// (Linux do_execveat_common)
 ///
@@ -1150,9 +1137,9 @@ pub fn sys_execveat(dirfd: i32, pathname: u64, argv_ptr: u64, envp_ptr: u64, fla
     if flags & !(AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW) != 0 {
         return -(EINVAL as i64);
     }
-    let path = match copy_string_from_user(pathname, PATH_MAX) {
+    let path = match crate::fs::namei::getname(pathname, flags & AT_EMPTY_PATH != 0) {
         Ok(p) => p,
-        Err(e) => return -(e as i64),
+        Err(e) => return e.sysret(),
     };
     let argv = match copy_string_array_from_user(argv_ptr, 1024) {
         Ok(a) => a,
@@ -1198,40 +1185,7 @@ fn exec_name(dirfd: i32, path: &[u8]) -> Vec<u8> {
 /// The dentry execveat runs: `path` from dirfd (or the current
 /// directory, or the root if absolute), or with AT_EMPTY_PATH and an
 /// empty path dirfd's own file
-fn exec_lookup(dirfd: i32, path: &[u8], flags: i32) -> Result<Arc<crate::fs::Dentry>, i32> {
-    use crate::fs::path::{LookupFlags, lookup_path_at};
-    use crate::fs::path_ref::Path;
-    use crate::fs::syscall::current_fd_table;
-    let fd_file = || {
-        current_fd_table()
-            .lock()
-            .get(dirfd)
-            .ok_or(crate::util::error::KernelError::BadFd as i32)
-    };
-    if path.is_empty() {
-        if flags & AT_EMPTY_PATH == 0 {
-            return Err(ENOENT);
-        }
-        if dirfd == AT_FDCWD {
-            return percpu::current_cwd()
-                .map(|p| p.dentry.clone())
-                .ok_or(ENOENT);
-        }
-        return Ok(fd_file()?.dentry.clone());
-    }
-    let path = core::str::from_utf8(path).map_err(|_| ENOENT)?;
-    let start = if path.starts_with('/') {
-        None
-    } else if dirfd == AT_FDCWD {
-        percpu::current_cwd()
-    } else {
-        let file = fd_file()?;
-        if !file.is_dir() {
-            return Err(crate::util::error::KernelError::NotDirectory as i32);
-        }
-        Path::from_dentry(file.dentry.clone())
-    };
-    let mut lf = LookupFlags::open();
-    lf.follow = flags & AT_SYMLINK_NOFOLLOW == 0;
-    lookup_path_at(start, path, lf).map_err(|e| e as i32)
+fn exec_lookup(dirfd: i32, path: &[u8], flags: i32) -> Result<crate::fs::Path, i32> {
+    use crate::fs::namei::{LookupFlags, filename_lookup};
+    filename_lookup(dirfd, path, LookupFlags::at(flags)).map_err(|e| e as i32)
 }

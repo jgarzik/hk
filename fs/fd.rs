@@ -10,13 +10,13 @@
 use alloc::sync::Arc;
 
 use crate::arch::Uaccess;
-use crate::fs::{KernelError, LookupFlags, lookup_path_flags};
+use crate::fs::{KernelError, LookupFlags};
 use crate::task::percpu::current_tid;
-use crate::uaccess::{copy_from_user, copy_to_user, strncpy_from_user};
+use crate::uaccess::{copy_from_user, copy_to_user};
 
 use super::file::File;
 use super::posix_lock::{Flock, posix_getlk, posix_setlk, posix_setlkw};
-use super::syscall::{PATH_MAX, current_fd_table, get_nofile_limit};
+use super::syscall::{current_fd_table, get_nofile_limit};
 
 // =============================================================================
 // truncate, ftruncate syscalls
@@ -113,9 +113,9 @@ pub fn sys_truncate(path_ptr: u64, length: i64) -> i64 {
     }
 
     // Read path from user space
-    let path = match strncpy_from_user::<Uaccess>(path_ptr, PATH_MAX) {
+    let path = match crate::fs::namei::getname(path_ptr, false) {
         Ok(p) => p,
-        Err(_) => return KernelError::BadAddress.sysret(),
+        Err(e) => return e.sysret(),
     };
 
     if path.is_empty() {
@@ -123,10 +123,15 @@ pub fn sys_truncate(path_ptr: u64, length: i64) -> i64 {
     }
 
     // Look up the file (follow symlinks for truncate)
-    let dentry = match lookup_path_flags(&path, LookupFlags::open()) {
-        Ok(d) => d,
+    let fpath = match crate::fs::namei::path_lookupat(
+        crate::task::percpu::current_cwd(),
+        &path,
+        LookupFlags::open(),
+    ) {
+        Ok(p) => p,
         Err(e) => return e.sysret(),
     };
+    let dentry = fpath.dentry.clone();
 
     // Get the inode
     let inode = match dentry.get_inode() {
@@ -143,7 +148,7 @@ pub fn sys_truncate(path_ptr: u64, length: i64) -> i64 {
     if !m.is_file() {
         return KernelError::InvalidArgument.sysret();
     }
-    let _w = match super::dac::want_write(&inode) {
+    let _w = match fpath.mnt.want_write() {
         Ok(w) => w,
         Err(e) => return e.sysret(),
     };

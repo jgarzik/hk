@@ -23,7 +23,6 @@ const MS_RDONLY: u64 = 1;
 const MS_NODEV: u64 = 4;
 const MS_NOEXEC: u64 = 8;
 const MS_REMOUNT: u64 = 32;
-const MS_MOVE: u64 = 8192;
 const ST_RDONLY: i64 = 1;
 const ST_NODEV: i64 = 4;
 const ST_NOEXEC: i64 = 8;
@@ -165,8 +164,9 @@ fn test_mountpoint_busy() {
     f += chk(n, b"mount in parent", ramfs(b"/tmp/mnt_pa/m\0", 0), 0);
     f += chk(n, b"rename parent", sys_rename(pa.as_ptr(), pb.as_ptr()), 0);
     f += chk(n, b"rmdir after parent rename", sys_rmdir(m.as_ptr()), EBUSY);
-    sys_umount2(m.as_ptr(), 0);
-    sys_rmdir(m.as_ptr());
+    // The mount moved with its parent: unmounted at the new path
+    f += chk(n, b"umount after parent rename", sys_umount2(m.as_ptr(), 0), 0);
+    f += chk(n, b"rmdir after umount", sys_rmdir(m.as_ptr()), 0);
     sys_rmdir(pb.as_ptr());
     done(n, f);
 }
@@ -513,18 +513,20 @@ fn test_nodev() {
 }
 
 /// hk rejects flags it cannot honor instead of ignoring them (Linux
-/// implements MS_MOVE, so this is hk-only)
+/// implements them, so this is hk-only); a rejected remount changes
+/// nothing
 fn test_unsupported() {
     if host_mode() {
         return;
     }
+    const MS_SYNCHRONOUS: u64 = 16;
+    const MS_NOSYMFOLLOW: u64 = 256;
     let n = b"MOUNT_UNSUPPORTED";
-    let mut f = chk(n, b"MS_MOVE", ramfs(b"/tmp\0", MS_MOVE), EINVAL);
-    // A rejected remount changes nothing
     let mp = b"/tmp/mnt_uns\0";
     sys_mkdir(mp.as_ptr(), 0o755);
+    let mut f = chk(n, b"MS_SYNCHRONOUS", ramfs(mp, MS_SYNCHRONOUS), EINVAL);
     f += chk(n, b"mount", ramfs(mp, MS_RDONLY | MS_NOEXEC), 0);
-    f += chk(n, b"remount move", remount(mp, MS_MOVE), EINVAL);
+    f += chk(n, b"remount nosymfollow", remount(mp, MS_NOSYMFOLLOW), EINVAL);
     f += chk(
         n,
         b"flags kept",

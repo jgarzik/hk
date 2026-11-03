@@ -47,7 +47,7 @@ fn root() -> Option<Arc<Dentry>> {
     DEVTMPFS.get()?.get_root()
 }
 
-fn mount(_t: &'static FileSystemType) -> Result<Arc<SuperBlock>, KernelError> {
+fn mount(_t: &'static FileSystemType, _opts: &[u8]) -> Result<Arc<SuperBlock>, KernelError> {
     DEVTMPFS.get().cloned().ok_or(KernelError::NoDevice)
 }
 
@@ -64,9 +64,9 @@ fn create(root: &Arc<Dentry>, n: &Node) {
     let Some(dir) = root.get_inode() else { return };
     let lock = dir.lock();
     let r = if n.blk {
-        super::ramfs::ramfs_create_blkdev(root, &n.name, n.dev, n.mode)
+        super::ramfs::ramfs_create_blkdev(root, n.name.as_bytes(), n.dev, n.mode)
     } else {
-        super::ramfs::ramfs_create_chrdev(root, &n.name, n.dev, n.mode)
+        super::ramfs::ramfs_create_chrdev(root, n.name.as_bytes(), n.dev, n.mode)
     };
     drop(lock);
     if let Err(e) = r {
@@ -99,14 +99,14 @@ pub fn device_del(name: &str) {
     let Some(r) = root() else { return };
     let Some(dir) = r.get_inode() else { return };
     let _lock = dir.lock();
-    if dir.i_op.unlink(&dir, name).is_ok() {
-        r.remove_child(name);
+    if dir.i_op.unlink(&dir, name.as_bytes()).is_ok() {
+        r.remove_child(name.as_bytes());
     }
 }
 
 /// Create the superblock and the nodes queued so far (VFS init)
 pub fn init() {
-    let sb = match super::ramfs::ramfs_mount(&DEVTMPFS_TYPE) {
+    let sb = match super::ramfs::ramfs_mount(&DEVTMPFS_TYPE, b"") {
         Ok(sb) => sb,
         Err(e) => {
             crate::printkln!("devtmpfs: {:?}", e);

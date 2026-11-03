@@ -2,12 +2,12 @@
 
 use crate::arch::Uaccess;
 use crate::arch::uapi::Stat;
-use crate::fs::{
-    Inode, KernelError, LinuxStatFs, LookupFlags, Path, lookup_path_at, lookup_path_flags,
-};
-use crate::uaccess::{UaccessArch, put_user, strncpy_from_user};
+use crate::fs::namei::{filename_lookup, getname_maybe_null, user_path_at};
+use crate::fs::{Inode, KernelError, LinuxStatFs, LookupFlags};
+use crate::uaccess::{UaccessArch, put_user};
 
-use super::syscall::{AT_FDCWD, PATH_MAX, current_fd_table};
+use super::file::flags::{AT_EMPTY_PATH, AT_FDCWD, AT_NO_AUTOMOUNT, AT_SYMLINK_NOFOLLOW};
+use super::syscall::current_fd_table;
 
 // =============================================================================
 // Stat structure and helpers
@@ -54,41 +54,27 @@ fn fill_stat(inode: &Inode) -> Stat {
 // =============================================================================
 
 /// sys_stat - get file status by path
-///
-/// Returns 0 on success, negative errno on error.
 pub fn sys_stat(path_ptr: u64, statbuf: u64) -> i64 {
-    // Read path from user space with proper validation
-    let path = match strncpy_from_user::<Uaccess>(path_ptr, PATH_MAX) {
-        Ok(p) => p,
-        Err(_) => return KernelError::BadAddress.sysret(),
-    };
+    ret(stat_path(AT_FDCWD, path_ptr, 0, statbuf))
+}
 
-    // Validate stat buffer address
-    if !Uaccess::access_ok(statbuf, core::mem::size_of::<Stat>()) {
-        return KernelError::BadAddress.sysret();
+/// stat/lstat/fstatat (Linux vfs_fstatat): flags of statx's set, the
+/// stat copied out after the lookup
+fn stat_path(dirfd: i32, path_ptr: u64, flags: i32, statbuf: u64) -> Result<(), KernelError> {
+    if flags & !(AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT | AT_EMPTY_PATH | AT_STATX_SYNC_TYPE) != 0 {
+        return Err(KernelError::InvalidArgument);
     }
+    let path = getname_maybe_null(path_ptr, flags)?;
+    let p = filename_lookup(dirfd, &path, LookupFlags::at(flags))?;
+    let inode = p.get_inode().ok_or(KernelError::NotFound)?;
+    put_user::<Uaccess, Stat>(statbuf, fill_stat(&inode)).map_err(|_| KernelError::BadAddress)
+}
 
-    // Look up the path (follow symlinks)
-    let dentry = match lookup_path_flags(&path, LookupFlags::open()) {
-        Ok(d) => d,
-        Err(e) => return e.sysret(),
-    };
-
-    // Get the inode
-    let inode = match dentry.get_inode() {
-        Some(i) => i,
-        None => return KernelError::NotFound.sysret(),
-    };
-
-    // Fill the stat structure
-    let stat = fill_stat(&inode);
-
-    // Copy to user space using put_user for the entire structure
-    if put_user::<Uaccess, Stat>(statbuf, stat).is_err() {
-        return KernelError::BadAddress.sysret();
+fn ret(r: Result<(), KernelError>) -> i64 {
+    match r {
+        Ok(()) => 0,
+        Err(e) => e.sysret(),
     }
-
-    0
 }
 
 /// sys_fstat - get file status by file descriptor
@@ -123,147 +109,14 @@ pub fn sys_fstat(fd: i32, statbuf: u64) -> i64 {
     0
 }
 
-/// sys_fstatat - get file status by path relative to directory fd
-///
-/// This is the *at variant of stat/lstat, supporting both absolute paths
-/// and paths relative to a directory file descriptor.
-///
-/// # Arguments
-/// * `dirfd` - Directory fd for relative paths, or AT_FDCWD for cwd
-/// * `path_ptr` - User pointer to path string
-/// * `statbuf` - User pointer to stat structure
-/// * `flags` - AT_SYMLINK_NOFOLLOW to not follow final symlink, AT_EMPTY_PATH to stat dirfd
-///
-/// # Returns
-/// 0 on success, negative errno on error
+/// sys_fstatat - stat/lstat relative to a directory fd (newfstatat)
 pub fn sys_fstatat(dirfd: i32, path_ptr: u64, statbuf: u64, flags: i32) -> i64 {
-    // AT_SYMLINK_NOFOLLOW and AT_EMPTY_PATH are the valid flags
-    const AT_SYMLINK_NOFOLLOW_FLAG: i32 = 0x100;
-    const AT_EMPTY_PATH_FLAG: i32 = 0x1000;
-    let valid_flags = AT_SYMLINK_NOFOLLOW_FLAG | AT_EMPTY_PATH_FLAG;
-    if flags & !valid_flags != 0 {
-        return KernelError::InvalidArgument.sysret();
-    }
-
-    // Validate stat buffer address
-    if !Uaccess::access_ok(statbuf, core::mem::size_of::<Stat>()) {
-        return KernelError::BadAddress.sysret();
-    }
-
-    // Read path from user space
-    let path_str = match strncpy_from_user::<Uaccess>(path_ptr, PATH_MAX) {
-        Ok(p) => p,
-        Err(_) => return KernelError::BadAddress.sysret(),
-    };
-
-    // Handle AT_EMPTY_PATH - stat the dirfd itself
-    if (flags & AT_EMPTY_PATH_FLAG) != 0 && path_str.is_empty() {
-        if dirfd == AT_FDCWD {
-            return KernelError::InvalidArgument.sysret();
-        }
-        // Stat the directory fd itself
-        return sys_fstat(dirfd, statbuf);
-    }
-
-    // Determine starting path for relative paths
-    let start: Option<Path> = if path_str.starts_with('/') {
-        // Absolute path - lookup_path_at will use root
-        None
-    } else if dirfd == AT_FDCWD {
-        // Use current working directory
-        crate::task::percpu::current_cwd()
-    } else {
-        // Use directory from file descriptor
-        let file = match current_fd_table().lock().get(dirfd) {
-            Some(f) => f,
-            None => return KernelError::BadFd.sysret(),
-        };
-        if !file.is_dir() {
-            return KernelError::NotDirectory.sysret();
-        }
-        // Create Path from the file's dentry
-        Path::from_dentry(file.dentry.clone())
-    };
-
-    // Set up lookup flags
-    let lookup_flags = if (flags & AT_SYMLINK_NOFOLLOW_FLAG) != 0 {
-        LookupFlags {
-            follow: false,
-            ..LookupFlags::open()
-        }
-    } else {
-        LookupFlags::open()
-    };
-
-    // Look up the path
-    let dentry = match lookup_path_at(start, &path_str, lookup_flags) {
-        Ok(d) => d,
-        Err(e) => return e.sysret(),
-    };
-
-    // Get the inode
-    let inode = match dentry.get_inode() {
-        Some(i) => i,
-        None => return KernelError::NotFound.sysret(),
-    };
-
-    // Fill the stat structure
-    let stat = fill_stat(&inode);
-
-    // Copy to user space
-    if put_user::<Uaccess, Stat>(statbuf, stat).is_err() {
-        return KernelError::BadAddress.sysret();
-    }
-
-    0
+    ret(stat_path(dirfd, path_ptr, flags, statbuf))
 }
 
-/// sys_lstat - get file status without following symlinks
-///
-/// Like stat(), but does not follow symbolic links.
-///
-/// # Arguments
-/// * `path_ptr` - User pointer to path string
-/// * `statbuf` - User pointer to stat structure
-///
-/// # Returns
-/// 0 on success, negative errno on error
+/// sys_lstat - get file status without following a final symlink
 pub fn sys_lstat(path_ptr: u64, statbuf: u64) -> i64 {
-    // Read path from user space with proper validation
-    let path = match strncpy_from_user::<Uaccess>(path_ptr, PATH_MAX) {
-        Ok(p) => p,
-        Err(_) => return KernelError::BadAddress.sysret(),
-    };
-
-    // Validate stat buffer address
-    if !Uaccess::access_ok(statbuf, core::mem::size_of::<Stat>()) {
-        return KernelError::BadAddress.sysret();
-    }
-
-    // Look up the path without following symlinks
-    let mut flags = LookupFlags::open();
-    flags.follow = false;
-
-    let dentry = match lookup_path_flags(&path, flags) {
-        Ok(d) => d,
-        Err(e) => return e.sysret(),
-    };
-
-    // Get the inode
-    let inode = match dentry.get_inode() {
-        Some(i) => i,
-        None => return KernelError::NotFound.sysret(),
-    };
-
-    // Fill the stat structure
-    let stat = fill_stat(&inode);
-
-    // Copy to user space using put_user for the entire structure
-    if put_user::<Uaccess, Stat>(statbuf, stat).is_err() {
-        return KernelError::BadAddress.sysret();
-    }
-
-    0
+    ret(stat_path(AT_FDCWD, path_ptr, AT_SYMLINK_NOFOLLOW, statbuf))
 }
 
 // =============================================================================
@@ -419,6 +272,8 @@ pub const STATX_BASIC_STATS: u32 = 0x07ff;
 pub const STATX_BTIME: u32 = 0x0800;
 /// Got stx_mnt_id
 pub const STATX_MNT_ID: u32 = 0x1000;
+/// Got the never-reused mount id in stx_mnt_id
+pub const STATX_MNT_ID_UNIQUE: u32 = 0x4000;
 
 // AT_* flags used by statx
 /// Sync as stat (default)
@@ -427,66 +282,32 @@ pub const AT_STATX_SYNC_AS_STAT: i32 = 0x0000;
 pub const AT_STATX_FORCE_SYNC: i32 = 0x2000;
 /// Don't sync
 pub const AT_STATX_DONT_SYNC: i32 = 0x4000;
-
-/// Don't follow symbolic links
-const AT_SYMLINK_NOFOLLOW: i32 = 0x100;
-/// If pathname is empty, check dirfd itself
-const AT_EMPTY_PATH: i32 = 0x1000;
+/// The sync type bits
+const AT_STATX_SYNC_TYPE: i32 = AT_STATX_FORCE_SYNC | AT_STATX_DONT_SYNC;
 
 // =============================================================================
 // statfs/fstatfs syscalls
 // =============================================================================
 
 /// sys_statfs - get filesystem statistics by path
-///
-/// # Arguments
-/// * `path_ptr` - User pointer to null-terminated path string
-/// * `buf` - User pointer to statfs structure to fill
-///
-/// # Returns
-/// 0 on success, negative errno on error.
 pub fn sys_statfs(path_ptr: u64, buf: u64) -> i64 {
-    // Read path from user space
-    let path = match strncpy_from_user::<Uaccess>(path_ptr, PATH_MAX) {
-        Ok(p) => p,
-        Err(_) => return KernelError::BadAddress.sysret(),
-    };
-
-    // Validate buffer
-    if !Uaccess::access_ok(buf, core::mem::size_of::<LinuxStatFs>()) {
-        return KernelError::BadAddress.sysret();
-    }
-
-    // Look up path to get dentry/superblock
-    let dentry = match lookup_path_flags(&path, LookupFlags::open()) {
-        Ok(d) => d,
-        Err(e) => return e.sysret(),
-    };
-
-    // Get superblock
-    let sb = match dentry.superblock() {
-        Some(sb) => sb,
-        None => return KernelError::NotFound.sysret(),
-    };
-
-    // Get stats from filesystem
-    let statfs = sb.s_op.statfs();
-    let linux_statfs = statfs.to_linux(sb.dev_id, st_flags(&dentry, &sb));
-
-    // Copy to user
-    if put_user::<Uaccess, LinuxStatFs>(buf, linux_statfs).is_err() {
-        return KernelError::BadAddress.sysret();
-    }
-
-    0
+    let r = user_path_at(AT_FDCWD, path_ptr, LookupFlags::open(), false).and_then(|path| {
+        let sb = path.dentry.superblock().ok_or(KernelError::NotFound)?;
+        let st = sb
+            .s_op
+            .statfs()
+            .to_linux(sb.dev_id, st_flags(path.mnt.flags(), &sb));
+        put_user::<Uaccess, LinuxStatFs>(buf, st).map_err(|_| KernelError::BadAddress)
+    });
+    ret(r)
 }
 
 /// statfs f_flags (Linux calculate_f_flags): ST_VALID, ST_RDONLY from
 /// the superblock, ST_NOSUID/NODEV/NOEXEC from the mount
-fn st_flags(dentry: &alloc::sync::Arc<super::Dentry>, sb: &super::SuperBlock) -> u64 {
+fn st_flags(mnt_flags: u32, sb: &super::SuperBlock) -> u64 {
     const ST_VALID: u64 = 0x20;
     // MNT_NOSUID/NODEV/NOEXEC (1, 2, 4) map to ST_NOSUID/NODEV/NOEXEC (2, 4, 8)
-    let mnt = super::mount::mnt_flags_of(dentry) as u64;
+    let mnt = mnt_flags as u64;
     ST_VALID | sb.rdonly() as u64 | (mnt & 7) << 1
 }
 
@@ -518,7 +339,10 @@ pub fn sys_fstatfs(fd: i32, buf: u64) -> i64 {
 
     // Get stats
     let statfs = sb.s_op.statfs();
-    let linux_statfs = statfs.to_linux(sb.dev_id, st_flags(&file.dentry, &sb));
+    let linux_statfs = statfs.to_linux(
+        sb.dev_id,
+        st_flags(file.f_path().map_or(0, |p| p.mnt.flags()), &sb),
+    );
 
     // Copy to user
     if put_user::<Uaccess, LinuxStatFs>(buf, linux_statfs).is_err() {
@@ -533,7 +357,7 @@ pub fn sys_fstatfs(fd: i32, buf: u64) -> i64 {
 // =============================================================================
 
 /// Fill a Statx structure from an inode
-fn fill_statx(inode: &Inode, _mask: u32) -> Statx {
+fn fill_statx(inode: &Inode, mask: u32, mnt: Option<&super::mount::Mount>) -> Statx {
     let attr = inode.i_op.getattr(inode);
     let st_dev = inode.superblock().map(|sb| sb.dev_id).unwrap_or(0);
 
@@ -544,7 +368,14 @@ fn fill_statx(inode: &Inode, _mask: u32) -> Statx {
     };
 
     Statx {
-        stx_mask: STATX_BASIC_STATS, // Always provide basic stats
+        // Basic stats, and the mount id: the unique one if asked for
+        // (Linux vfs_getattr: STATX_MNT_ID_UNIQUE), else the reused one
+        stx_mask: STATX_BASIC_STATS
+            | if mask & STATX_MNT_ID_UNIQUE != 0 {
+                STATX_MNT_ID_UNIQUE
+            } else {
+                STATX_MNT_ID
+            },
         stx_blksize: 4096,
         stx_attributes: 0,
         stx_nlink: attr.nlink,
@@ -580,7 +411,11 @@ fn fill_statx(inode: &Inode, _mask: u32) -> Statx {
         stx_rdev_minor: (st_rdev & 0xff) as u32 | ((st_rdev >> 12) & 0xfff00) as u32,
         stx_dev_major: ((st_dev >> 8) & 0xfff) as u32,
         stx_dev_minor: (st_dev & 0xff) as u32,
-        stx_mnt_id: 0, // Not implemented yet
+        stx_mnt_id: match mnt {
+            Some(m) if mask & STATX_MNT_ID_UNIQUE != 0 => m.mnt_id_unique,
+            Some(m) => m.mnt_id as u64,
+            None => 0,
+        },
         stx_dio_mem_align: 0,
         stx_dio_offset_align: 0,
         stx_subvol: 0,
@@ -594,84 +429,23 @@ fn fill_statx(inode: &Inode, _mask: u32) -> Statx {
     }
 }
 
-/// sys_statx - get extended file status
-///
-/// # Arguments
-/// * `dirfd` - Directory fd for relative paths, or AT_FDCWD
-/// * `path_ptr` - User pointer to path string
-/// * `flags` - AT_SYMLINK_NOFOLLOW, AT_EMPTY_PATH, etc.
-/// * `mask` - STATX_* mask of what to return
-/// * `buf` - User pointer to statx structure to fill
-///
-/// # Returns
-/// 0 on success, negative errno on error.
+/// sys_statx - get extended file status (Linux do_statx + vfs_statx)
 pub fn sys_statx(dirfd: i32, path_ptr: u64, flags: i32, mask: u32, buf: u64) -> i64 {
-    // Validate buffer
-    if !Uaccess::access_ok(buf, core::mem::size_of::<Statx>()) {
-        return KernelError::BadAddress.sysret();
-    }
-
-    // Read path from user space
-    let path = match strncpy_from_user::<Uaccess>(path_ptr, PATH_MAX) {
-        Ok(p) => p,
-        Err(_) => return KernelError::BadAddress.sysret(),
-    };
-
-    // Handle AT_EMPTY_PATH (statx on fd itself)
-    let dentry = if path.is_empty() && (flags & AT_EMPTY_PATH) != 0 {
-        if dirfd < 0 {
-            return KernelError::BadFd.sysret();
+    const STATX_RESERVED: u32 = 0x8000_0000;
+    let r = (|| {
+        if mask & STATX_RESERVED != 0 || flags & AT_STATX_SYNC_TYPE == AT_STATX_SYNC_TYPE {
+            return Err(KernelError::InvalidArgument);
         }
-        match current_fd_table().lock().get(dirfd) {
-            Some(f) => f.dentry.clone(),
-            None => return KernelError::BadFd.sysret(),
+        if flags & !(AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT | AT_EMPTY_PATH | AT_STATX_SYNC_TYPE)
+            != 0
+        {
+            return Err(KernelError::InvalidArgument);
         }
-    } else {
-        // Determine starting path for relative paths
-        let start: Option<Path> = if path.starts_with('/') {
-            None
-        } else if dirfd == AT_FDCWD {
-            crate::task::percpu::current_cwd()
-        } else {
-            let file = match current_fd_table().lock().get(dirfd) {
-                Some(f) => f,
-                None => return KernelError::BadFd.sysret(),
-            };
-            if !file.is_dir() {
-                return KernelError::NotDirectory.sysret();
-            }
-            Path::from_dentry(file.dentry.clone())
-        };
-
-        // Determine lookup flags
-        let lookup_flags = if (flags & AT_SYMLINK_NOFOLLOW) != 0 {
-            LookupFlags {
-                follow: false,
-                ..LookupFlags::open()
-            }
-        } else {
-            LookupFlags::open()
-        };
-
-        match lookup_path_at(start, &path, lookup_flags) {
-            Ok(d) => d,
-            Err(e) => return e.sysret(),
-        }
-    };
-
-    // Get inode
-    let inode = match dentry.get_inode() {
-        Some(i) => i,
-        None => return KernelError::NotFound.sysret(),
-    };
-
-    // Fill statx structure
-    let statx = fill_statx(&inode, mask);
-
-    // Copy to user
-    if put_user::<Uaccess, Statx>(buf, statx).is_err() {
-        return KernelError::BadAddress.sysret();
-    }
-
-    0
+        let path = getname_maybe_null(path_ptr, flags)?;
+        let p = filename_lookup(dirfd, &path, LookupFlags::at(flags))?;
+        let inode = p.dentry.get_inode().ok_or(KernelError::NotFound)?;
+        put_user::<Uaccess, Statx>(buf, fill_statx(&inode, mask, Some(&p.mnt)))
+            .map_err(|_| KernelError::BadAddress)
+    })();
+    ret(r)
 }

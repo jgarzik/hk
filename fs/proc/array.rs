@@ -62,7 +62,7 @@ struct Snap {
     shared: Option<crate::signal::SharedPending>,
     sighand: Option<Arc<crate::signal::SigHand>>,
     signal: Option<Arc<crate::signal::SignalStruct>>,
-    fs: Option<Arc<super::FsStruct>>,
+    fs: Option<Arc<crate::fs::FsStruct>>,
     files: Option<Arc<crate::task::fdtable::Files>>,
 }
 
@@ -465,7 +465,7 @@ fn read_remote(mm: &Mm, m: &MmStruct, start: u64, end: u64) -> Vec<u8> {
 /// if the program overwrote the final NUL of its arguments
 /// (setproctitle), the area through the environment up to the first NUL
 pub fn gen_cmdline(pid: Pid) -> Vec<u8> {
-    let Some(tid) = super::procfs::get_tid_for_pid(pid) else {
+    let Some(tid) = super::get_tid_for_pid(pid) else {
         return Vec::new();
     };
     let Some(mm) = crate::mm::get_task_mm_users(tid) else {

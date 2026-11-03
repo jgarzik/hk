@@ -1,14 +1,17 @@
 //! Directory syscalls (getdents, getdents64, mkdir, mkdirat, rmdir, mknod, mknodat)
 
 use crate::arch::Uaccess;
-use crate::fs::path::{create_entry, delete_entry};
+use crate::fs::namei::{
+    Last, create_entry, delete_entry, filename_create, filename_parentat, getname,
+};
 use alloc::vec::Vec;
 
 use crate::fs::{DevId, DirContext, DirEntry, FileType, InodeMode, KernelError, dac};
 use crate::task::CAP_MKNOD;
-use crate::uaccess::{UaccessArch, copy_to_user, strncpy_from_user};
+use crate::uaccess::{UaccessArch, copy_to_user};
 
-use super::syscall::{AT_FDCWD, MAX_RW_COUNT, PATH_MAX, current_fd_table, lookup_parent_at};
+use super::file::flags::AT_FDCWD;
+use super::syscall::{MAX_RW_COUNT, current_fd_table};
 
 /// Linux dirent64 structure for getdents64
 #[repr(C, packed)]
@@ -173,57 +176,42 @@ pub fn sys_mkdir(pathname_ptr: u64, mode: u32) -> i64 {
 /// # Returns
 /// 0 on success, negative errno on error
 pub fn sys_mkdirat(dirfd: i32, pathname_ptr: u64, mode: u32) -> i64 {
-    let path = match strncpy_from_user::<Uaccess>(pathname_ptr, PATH_MAX) {
-        Ok(p) => p,
-        Err(_) => return KernelError::BadAddress.sysret(),
-    };
-    if path.is_empty() {
-        return KernelError::NotFound.sysret();
-    }
-    let (parent, name) = match lookup_parent_at(dirfd, &path) {
-        Ok(p) => p,
-        Err(e) => return e,
-    };
-    // vfs_mkdir: permission and sticky bits only, then umask; init_owner
-    // adds S_ISGID under a SGID parent
-    let r = create_entry(&parent, &name, |dir, c| {
-        let perm = dac::create_mode(c, dir, (mode & 0o1777) as u16);
-        dir.i_op.mkdir(dir, &name, InodeMode::directory(perm))
-    });
-    match r {
-        Ok(_) => 0,
+    match do_mkdirat(dirfd, pathname_ptr, mode) {
+        Ok(()) => 0,
         Err(KernelError::OperationNotSupported) => KernelError::NotPermitted.sysret(),
         Err(e) => e.sysret(),
     }
 }
 
-/// sys_rmdir - remove an empty directory
-pub fn sys_rmdir(pathname_ptr: u64) -> i64 {
-    let path = match strncpy_from_user::<Uaccess>(pathname_ptr, PATH_MAX) {
-        Ok(p) => p,
-        Err(_) => return KernelError::BadAddress.sysret(),
-    };
-    do_rmdir(AT_FDCWD, &path)
+fn do_mkdirat(dirfd: i32, pathname_ptr: u64, mode: u32) -> Result<(), KernelError> {
+    let p = filename_create(dirfd, &getname(pathname_ptr, false)?, true)?;
+    // vfs_mkdir: permission and sticky bits only, then umask; init_owner
+    // adds S_ISGID under a SGID parent
+    create_entry(&p, |dir, c| {
+        let perm = dac::create_mode(c, dir, (mode & 0o1777) as u16);
+        dir.i_op.mkdir(dir, &p.name, InodeMode::directory(perm))
+    })?;
+    Ok(())
 }
 
-/// rmdir / unlinkat(AT_REMOVEDIR) (Linux do_rmdir): "." is EINVAL,
-/// ".." ENOTEMPTY, then may_delete and the file system's rmdir
-pub fn do_rmdir(dirfd: i32, path: &str) -> i64 {
-    if path.is_empty() {
-        return KernelError::NotFound.sysret();
-    }
-    let (parent, name) = match lookup_parent_at(dirfd, path) {
-        Ok(p) => p,
-        Err(e) => return e,
-    };
-    match name.as_str() {
-        "." => return KernelError::InvalidArgument.sysret(),
-        ".." => return KernelError::DirectoryNotEmpty.sysret(),
-        _ => {}
-    }
-    match delete_entry(&parent, &name, true) {
+/// sys_rmdir - remove an empty directory
+pub fn sys_rmdir(pathname_ptr: u64) -> i64 {
+    match getname(pathname_ptr, false).and_then(|path| do_rmdir(AT_FDCWD, &path)) {
         Ok(()) => 0,
         Err(e) => e.sysret(),
+    }
+}
+
+/// rmdir / unlinkat(AT_REMOVEDIR) (Linux do_rmdir): a last name of ".."
+/// is ENOTEMPTY, "." EINVAL, "/" EBUSY, then may_delete and the file
+/// system's rmdir
+pub fn do_rmdir(dirfd: i32, path: &[u8]) -> Result<(), KernelError> {
+    let p = filename_parentat(dirfd, path)?;
+    match p.last {
+        Last::Norm => delete_entry(&p, true),
+        Last::DotDot => Err(KernelError::DirectoryNotEmpty),
+        Last::Dot => Err(KernelError::InvalidArgument),
+        Last::Root => Err(KernelError::Busy),
     }
 }
 
@@ -247,15 +235,7 @@ pub fn sys_mknodat(dirfd: i32, pathname_ptr: u64, mode: u32, dev: u64) -> i64 {
     const S_IFDIR: u32 = 0o040000;
     const S_IFMT: u32 = 0o170000;
 
-    let path = match strncpy_from_user::<Uaccess>(pathname_ptr, PATH_MAX) {
-        Ok(p) => p,
-        Err(_) => return KernelError::BadAddress.sysret(),
-    };
-    if path.is_empty() {
-        return KernelError::NotFound.sysret();
-    }
-
-    // may_mknod: file type validity
+    // may_mknod: file type validity, before the name
     let ty = mode & S_IFMT;
     let is_dev = match ty {
         S_IFREG | 0 | S_IFIFO | S_IFSOCK => false,
@@ -264,11 +244,13 @@ pub fn sys_mknodat(dirfd: i32, pathname_ptr: u64, mode: u32, dev: u64) -> i64 {
         _ => return KernelError::InvalidArgument.sysret(),
     };
 
-    let (parent, name) = match lookup_parent_at(dirfd, &path) {
+    let p = match getname(pathname_ptr, false).and_then(|path| filename_create(dirfd, &path, false))
+    {
         Ok(p) => p,
-        Err(e) => return e,
+        Err(e) => return e.sysret(),
     };
-    let r = create_entry(&parent, &name, |dir, c| {
+    let name = p.name.as_slice();
+    let r = create_entry(&p, |dir, c| {
         if is_dev && !dac::capable(c, CAP_MKNOD) {
             return Err(KernelError::NotPermitted);
         }
@@ -276,17 +258,17 @@ pub fn sys_mknodat(dirfd: i32, pathname_ptr: u64, mode: u32, dev: u64) -> i64 {
         match ty {
             S_IFCHR => dir
                 .i_op
-                .mknod(dir, &name, InodeMode::chardev(perm), DevId::from_user(dev)),
+                .mknod(dir, name, InodeMode::chardev(perm), DevId::from_user(dev)),
             S_IFBLK => dir
                 .i_op
-                .mknod(dir, &name, InodeMode::blockdev(perm), DevId::from_user(dev)),
+                .mknod(dir, name, InodeMode::blockdev(perm), DevId::from_user(dev)),
             S_IFSOCK => dir
                 .i_op
-                .mknod(dir, &name, InodeMode::socket(perm), DevId::from_user(0)),
+                .mknod(dir, name, InodeMode::socket(perm), DevId::from_user(0)),
             S_IFIFO => dir
                 .i_op
-                .mknod(dir, &name, InodeMode::fifo(perm), DevId::from_user(0)),
-            _ => dir.i_op.create(dir, &name, InodeMode::regular(perm)),
+                .mknod(dir, name, InodeMode::fifo(perm), DevId::from_user(0)),
+            _ => dir.i_op.create(dir, name, InodeMode::regular(perm)),
         }
     });
     match r {
@@ -300,13 +282,12 @@ pub fn sys_mknodat(dirfd: i32, pathname_ptr: u64, mode: u32, dev: u64) -> i64 {
 /// filename_create at AT_FDCWD + vfs_mknod(S_IFSOCK)): `perm` is
 /// reduced by the umask, DAC on the parent applies, an existing name is
 /// EEXIST; returns the new dentry
-pub fn mknod_sock(path: &str, perm: u16) -> Result<alloc::sync::Arc<super::Dentry>, KernelError> {
-    let (parent, name) = lookup_parent_at(AT_FDCWD, path)
-        .map_err(|e| KernelError::from_errno(-e as i32).unwrap_or(KernelError::Io))?;
-    let r = create_entry(&parent, &name, |dir, c| {
+pub fn mknod_sock(path: &[u8], perm: u16) -> Result<alloc::sync::Arc<super::Dentry>, KernelError> {
+    let p = filename_create(AT_FDCWD, path, false)?;
+    let r = create_entry(&p, |dir, c| {
         let perm = dac::create_mode(c, dir, perm);
         dir.i_op
-            .mknod(dir, &name, InodeMode::socket(perm), DevId::from_user(0))
+            .mknod(dir, &p.name, InodeMode::socket(perm), DevId::from_user(0))
     });
     match r {
         Err(KernelError::OperationNotSupported) => Err(KernelError::NotPermitted),
@@ -316,8 +297,8 @@ pub fn mknod_sock(path: &str, perm: u16) -> Result<alloc::sync::Arc<super::Dentr
 
 /// Remove the entry `mknod_sock` created when the bind then failed
 /// (Linux unix_bind_bsd out_unlink)
-pub fn unlink_sock(path: &str) {
-    if let Ok((parent, name)) = lookup_parent_at(AT_FDCWD, path) {
-        let _ = delete_entry(&parent, &name, false);
+pub fn unlink_sock(path: &[u8]) {
+    if let Ok(p) = filename_parentat(AT_FDCWD, path) {
+        let _ = delete_entry(&p, false);
     }
 }

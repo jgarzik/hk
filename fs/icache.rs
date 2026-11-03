@@ -16,7 +16,8 @@
 //! iput_final -> evict -> ->evict_inode). Deviation from Linux: no LRU
 //! of unused inodes (Linux keeps an inode with i_count 0 cached until
 //! its superblock's shrinker evicts it); here the dentry that references
-//! it is the cache, and the dcache LRU (Phase G) will age both.
+//! it is the cache, and the dcache shrinker (`dentry::shrink_dcache`,
+//! no LRU order) frees both.
 //!
 //! An inode is built completely before it is hashed: [`iget5`] looks up,
 //! builds outside the lock (which may do I/O) and inserts unless another

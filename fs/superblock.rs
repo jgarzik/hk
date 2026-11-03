@@ -148,12 +148,16 @@ use super::file::FileOps;
 use crate::block::BlockDevice;
 
 /// Mount function type for pseudo-filesystems (no backing device)
-pub type MountFn = fn(fs_type: &'static FileSystemType) -> Result<Arc<SuperBlock>, KernelError>;
+/// `opts`: the mount data string (comma-separated options, empty for
+/// none)
+pub type MountFn =
+    fn(fs_type: &'static FileSystemType, opts: &[u8]) -> Result<Arc<SuperBlock>, KernelError>;
 
 /// Mount function type for device-backed filesystems (ext4, vfat, etc.)
 pub type MountDevFn = fn(
     fs_type: &'static FileSystemType,
     bdev: Arc<BlockDevice>,
+    opts: &[u8],
 ) -> Result<Arc<SuperBlock>, KernelError>;
 
 /// Filesystem type descriptor
@@ -195,21 +199,58 @@ pub const SB_RDONLY: u32 = 1;
 /// Write access to a file system (from `SuperBlock::want_write`),
 /// released on drop (Linux mnt_drop_write); `none()` for objects without
 /// a superblock
-pub struct WriteAccess(Option<Arc<SuperBlock>>);
+pub struct WriteAccess {
+    sb: Option<Arc<SuperBlock>>,
+    /// The mount's write access too (Linux mnt_want_write on a path)
+    mnt: Option<Arc<super::mount::Mount>>,
+}
 
 impl WriteAccess {
     /// No file system to hold
     pub const fn none() -> Self {
-        Self(None)
+        Self {
+            sb: None,
+            mnt: None,
+        }
+    }
+
+    /// Also hold `mnt`'s write count (taken by the caller)
+    pub(super) fn with_mnt(mut self, mnt: Arc<super::mount::Mount>) -> Self {
+        self.mnt = Some(mnt);
+        self
     }
 }
 
 impl Drop for WriteAccess {
     fn drop(&mut self) {
-        if let Some(sb) = &self.0 {
+        if let Some(sb) = &self.sb {
             sb.s_writers.fetch_sub(1, Ordering::SeqCst);
         }
+        if let Some(m) = &self.mnt {
+            m.put_write();
+        }
     }
+}
+
+/// Every superblock (the dcache shrinker walks their trees); dead ones
+/// are dropped when one is added
+static ALL_SBS: crate::sync::spin::Mutex<alloc::vec::Vec<alloc::sync::Weak<SuperBlock>>> =
+    crate::sync::spin::Mutex::new(alloc::vec::Vec::new());
+
+impl Drop for SuperBlock {
+    /// What the filesystem had cached goes with it (Linux
+    /// shrink_dcache_for_umount)
+    fn drop(&mut self) {
+        if let Some(root) = self.root.get_mut().take() {
+            super::dentry::d_drop_tree(&root);
+        }
+    }
+}
+
+/// The `i`th live superblock, or None past the end (no allocation: the
+/// shrinker runs when memory is short)
+pub fn nth_sb(i: usize) -> Option<Option<Arc<SuperBlock>>> {
+    ALL_SBS.lock().get(i).map(alloc::sync::Weak::upgrade)
 }
 
 pub struct SuperBlock {
@@ -262,6 +303,9 @@ pub struct SuperBlock {
     /// prevent races during ancestor relationship checks. Same-directory
     /// renames don't need this mutex.
     pub s_vfs_rename_mutex: sync::Mutex<()>,
+    /// Remount and other changes of the superblock's state (Linux
+    /// s_umount, a sleeping rw_semaphore): inside namespace_sem
+    pub s_umount: sync::RwSem<()>,
 }
 
 use super::inode::AsAny;
@@ -291,7 +335,7 @@ impl SuperBlock {
         s_op: &'static dyn SuperOps,
         flags: u32,
     ) -> Arc<Self> {
-        Arc::new(Self {
+        let sb = Arc::new(Self {
             fs_type,
             root: RwLock::new(None),
             s_op,
@@ -305,7 +349,13 @@ impl SuperBlock {
             s_dirty: crate::sync::spin::Mutex::new(alloc::vec::Vec::new()),
             s_wb_lock: crate::sync::Mutex::new(()),
             s_vfs_rename_mutex: sync::Mutex::new(()),
-        })
+            s_umount: sync::RwSem::new(()),
+        });
+        let mut all = ALL_SBS.lock();
+        all.retain(|w| w.strong_count() != 0);
+        all.push(Arc::downgrade(&sb));
+        drop(all);
+        sb
     }
 
     /// True if mounted read-only (Linux sb_rdonly)
@@ -325,7 +375,10 @@ impl SuperBlock {
             self.s_writers.fetch_sub(1, Ordering::SeqCst);
             return Err(KernelError::ReadOnlyFs);
         }
-        Ok(WriteAccess(Some(self.clone())))
+        Ok(WriteAccess {
+            sb: Some(self.clone()),
+            mnt: None,
+        })
     }
 
     /// Make the file system read-only (Linux sb_prepare_remount_readonly
@@ -430,7 +483,7 @@ pub fn find_filesystem(name: &str) -> Option<&'static FileSystemType> {
 /// Should be called during VFS initialization before any mounts.
 pub fn init_fs_registry() {
     register_filesystem(&super::ramfs::RAMFS_TYPE);
-    register_filesystem(&super::procfs::PROCFS_TYPE);
+    register_filesystem(&super::proc::PROCFS_TYPE);
     register_filesystem(&super::vfat::VFAT_TYPE);
     register_filesystem(&super::cgroupfs::CGROUPFS_TYPE);
 }

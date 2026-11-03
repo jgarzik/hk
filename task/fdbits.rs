@@ -23,17 +23,26 @@ pub fn nr_open() -> u64 {
 }
 
 /// /proc/sys/fs files of the descriptor table
-pub static FS_CTLS: &[crate::sysctl::Ctl] = &[crate::sysctl::Ctl {
-    path: "fs/nr_open",
-    mode: 0o644,
-    show: || alloc::vec![nr_open() as i64],
-    store: |v| {
-        crate::sysctl::range(v[0], NR_OPEN_MIN, NR_OPEN_MAX)?;
-        NR_OPEN.store(v[0] as u32, Ordering::Relaxed);
-        Ok(())
+pub static FS_CTLS: &[crate::sysctl::Ctl] = &[
+    crate::sysctl::Ctl {
+        path: "fs/dentry-state",
+        mode: 0o444,
+        show: crate::fs::dentry::dentry_state,
+        store: |_| Err(crate::fs::KernelError::PermissionDenied),
+        text: None,
     },
-    text: None,
-}];
+    crate::sysctl::Ctl {
+        path: "fs/nr_open",
+        mode: 0o644,
+        show: || alloc::vec![nr_open() as i64],
+        store: |v| {
+            crate::sysctl::range(v[0], NR_OPEN_MIN, NR_OPEN_MAX)?;
+            NR_OPEN.store(v[0] as u32, Ordering::Relaxed);
+            Ok(())
+        },
+        text: None,
+    },
+];
 
 /// Two-level bitmap of open descriptors; both levels grow on demand
 #[derive(Clone)]

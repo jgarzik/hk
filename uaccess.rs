@@ -71,9 +71,11 @@ pub enum UaccessError {
     Overflow,
     /// Page fault during access (would block or fail)
     Fault,
-    /// A name that is not valid UTF-8 (hk's VFS names are UTF-8 until
-    /// they become byte strings)
+    /// A string that must be text is not valid UTF-8
+    /// ([`strncpy_from_user_str`])
     Encoding,
+    /// No NUL within the string's maximum length
+    TooLong,
 }
 
 /// Result type for user access operations
@@ -360,19 +362,28 @@ pub fn copy_val_to_user<A: UaccessArch, T: IntoBytes>(to: u64, value: &T) -> Uac
 /// * `max_len` - Maximum number of bytes to read (including null terminator)
 ///
 /// # Returns
-/// * `Ok(String)` containing the string (without null terminator) on success
+/// * `Ok(bytes)` without the terminator
 /// * `Err(UaccessError::BadAddress)` if user address is invalid
-/// * `Err(UaccessError::Overflow)` if string exceeds max_len
+/// * `Err(UaccessError::TooLong)` if no NUL is found within `max_len` bytes
 #[track_caller]
 pub fn strncpy_from_user<A: UaccessArch>(
     from: u64,
     max_len: usize,
-) -> UaccessResult<alloc::string::String> {
+) -> UaccessResult<alloc::vec::Vec<u8>> {
     might_fault();
-    let bytes = strndup_user_bytes::<A>(from, max_len)?;
-    // Names are bytes on Linux; hk's VFS still holds Strings, so only
-    // valid UTF-8 is taken, as is. Mapping other bytes to chars would let
-    // two different byte names alias one String (BUGS.md)
+    // Names are bytes (Linux getname): any but NUL
+    strndup_user_bytes::<A>(from, max_len)
+}
+
+/// As [`strncpy_from_user`], for strings that are text by definition (key
+/// types, xattr names, filesystem type names): not valid UTF-8 is
+/// `UaccessError::Encoding`
+#[track_caller]
+pub fn strncpy_from_user_str<A: UaccessArch>(
+    from: u64,
+    max_len: usize,
+) -> UaccessResult<alloc::string::String> {
+    let bytes = strncpy_from_user::<A>(from, max_len)?;
     alloc::string::String::from_utf8(bytes).map_err(|_| UaccessError::Encoding)
 }
 
@@ -385,7 +396,7 @@ pub fn strncpy_from_user<A: UaccessArch>(
 /// # Returns
 /// * `Ok(bytes)` without the terminator
 /// * `Err(BadAddress)` / `Err(Fault)` for an invalid or unmapped address
-/// * `Err(Overflow)` if no NUL is found within `max_len` bytes
+/// * `Err(TooLong)` if no NUL is found within `max_len` bytes
 pub fn strndup_user_bytes<A: UaccessArch>(
     from: u64,
     max_len: usize,
@@ -405,5 +416,5 @@ pub fn strndup_user_bytes<A: UaccessArch>(
         out.extend_from_slice(&chunk[..n]);
         ptr = ptr.checked_add(n as u64).ok_or(UaccessError::Overflow)?;
     }
-    Err(UaccessError::Overflow)
+    Err(UaccessError::TooLong)
 }

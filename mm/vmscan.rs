@@ -134,6 +134,9 @@ pub fn try_to_free_pages(nr: usize) -> usize {
     if cached >= nr {
         return cached;
     }
+    // Then the dcache (Linux shrink_slab): unused dentries and the
+    // inodes only they hold; their memory is slab, not counted here
+    crate::fs::dentry::shrink_dcache(nr.saturating_mul(16));
     let nr = nr - cached;
     let (total, free) = super::swap::swap_totals();
     if total == 0 || free == 0 || !super::swap::bdev_swap_active() {

@@ -9,7 +9,7 @@ use alloc::vec;
 
 use crate::arch::Uaccess;
 use crate::task::percpu;
-use crate::uaccess::{copy_from_user, strncpy_from_user};
+use crate::uaccess::{copy_from_user, strncpy_from_user_str};
 use crate::util::error::KernelError;
 
 use super::key::{KEY_DEFAULT_PERM, Key};
@@ -46,13 +46,13 @@ pub fn sys_add_key(type_ptr: u64, desc_ptr: u64, payload_ptr: u64, plen: u64, ke
     }
 
     // Copy type string from userspace
-    let type_name = match strncpy_from_user::<Uaccess>(type_ptr, MAX_TYPE_LEN) {
+    let type_name = match strncpy_from_user_str::<Uaccess>(type_ptr, MAX_TYPE_LEN) {
         Ok(s) => s,
         Err(_) => return KernelError::BadAddress.sysret(),
     };
 
     // Copy description from userspace
-    let description = match strncpy_from_user::<Uaccess>(desc_ptr, MAX_DESC_LEN) {
+    let description = match strncpy_from_user_str::<Uaccess>(desc_ptr, MAX_DESC_LEN) {
         Ok(s) => s,
         Err(_) => return KernelError::BadAddress.sysret(),
     };
@@ -142,13 +142,13 @@ pub fn sys_request_key(
     dest_keyring: i32,
 ) -> i64 {
     // Copy type string from userspace
-    let type_name = match strncpy_from_user::<Uaccess>(type_ptr, MAX_TYPE_LEN) {
+    let type_name = match strncpy_from_user_str::<Uaccess>(type_ptr, MAX_TYPE_LEN) {
         Ok(s) => s,
         Err(_) => return KernelError::BadAddress.sysret(),
     };
 
     // Copy description from userspace
-    let description = match strncpy_from_user::<Uaccess>(desc_ptr, MAX_DESC_LEN) {
+    let description = match strncpy_from_user_str::<Uaccess>(desc_ptr, MAX_DESC_LEN) {
         Ok(s) => s,
         Err(_) => return KernelError::BadAddress.sysret(),
     };

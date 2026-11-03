@@ -179,7 +179,7 @@ pub struct MmStruct {
     /// Contains VM_LOCKED and/or VM_LOCKONFAULT when MCL_FUTURE is active
     def_flags: u32,
     /// Path of the executable (Linux mm->exe_file), for /proc/<pid>/exe
-    exe: Option<alloc::string::String>,
+    exe: Option<crate::fs::name::FileName>,
     /// Writes to the executable denied while this image runs (Linux
     /// mm->exe_file's deny_write_access)
     exe_deny: Option<crate::fs::inode::DenyWrite>,
@@ -320,14 +320,14 @@ impl MmStruct {
     }
 
     /// Executable path (/proc/<pid>/exe)
-    pub fn exe(&self) -> Option<alloc::string::String> {
+    pub fn exe(&self) -> Option<crate::fs::name::FileName> {
         self.exe.clone()
     }
 
     /// Record the executable at exec
     pub fn set_exe(
         &mut self,
-        path: alloc::string::String,
+        path: crate::fs::name::FileName,
         deny: Option<crate::fs::inode::DenyWrite>,
     ) {
         self.exe = Some(path);

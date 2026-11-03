@@ -498,10 +498,6 @@ impl Trb {
             self.control &= !1;
         }
     }
-
-    fn get_cycle(&self) -> bool {
-        (self.control & 1) != 0
-    }
 }
 
 /// TRB types
@@ -685,16 +681,16 @@ impl EventRing {
 
     fn dequeue(&mut self) -> Option<Trb> {
         let trb_ptr = unsafe { self.trbs.0.add(self.dequeue) };
-        let trb = unsafe { read_volatile(trb_ptr) };
-
-        // Check if this TRB is valid (cycle bit matches expected)
-        if trb.get_cycle() != self.cycle {
+        // The cycle bit first, then the rest (Linux xhci_handle_event:
+        // flags, rmb, fields): read in one go, the parameter could predate
+        // the controller's write of the control word that made it valid,
+        // and a completion would not match its TRB
+        let control = unsafe { read_volatile(core::ptr::addr_of!((*trb_ptr).control)) };
+        if (control & 1 != 0) != self.cycle {
             return None;
         }
-
-        // Read barrier: ensure we see all fields of the event TRB
-        // that were written by the xHC before we process them
         fence(Ordering::Acquire);
+        let trb = unsafe { read_volatile(trb_ptr) };
 
         // Advance dequeue pointer
         self.dequeue += 1;

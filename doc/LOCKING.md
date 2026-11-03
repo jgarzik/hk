@@ -247,19 +247,29 @@ SignalStruct.exec_update (sync::RwSem; Linux exec_update_lock; write:
 VFS locks (detailed order):
     File.f_pos_lock (sync::Mutex; read/write/lseek/getdents by position)
         ↓
-    MntNamespace.root
-        ↓
-    Mount.{children, parent, mountpoint}
-        ↓
     SuperBlock.s_vfs_rename_mutex (cross-directory rename only)
         ↓
     Inode.i_rwsem (sync::RwSem; exclusive: directory operations,
-                   lock_rename, regular file write and truncate; shared:
+                   lock_rename, regular file write and truncate, the
+                   mountpoint during attach (Linux lock_mount); shared:
                    path-walk lookup on a dcache miss, readdir;
                    parent directory -> the link/unlink/rename victim or
                    link source, two non-directories by address)
         ↓
-    Dentry.d_lock (single d_lock like Linux; short, never held across i_rwsem)
+    mount::NAMESPACE_SEM (sync::RwSem; Linux namespace_sem: write for
+                   attach, umount, namespace copy; read for /proc mount
+                   lists)
+        ↓
+    SuperBlock.s_umount (sync::RwSem; write for remount)
+        ↓
+    dentry::RENAME_LOCK (spin RwLock, Linux rename_lock: write in
+                   d_move/d_exchange, read in is_subdir/d_path)
+        ↓
+    MntNamespace.root, Mount.{children, parent, mountpoint} (spin;
+                   d_path reads parent/mountpoint under RENAME_LOCK)
+        ↓
+    Dentry.d_lock (single d_lock like Linux; short, never held across
+                   i_rwsem; parent before child)
         ↓
     Inode.private
         ↓
@@ -1654,22 +1664,51 @@ hashed; the losing builder's inode is dropped unhashed).
 **Dentry** (`fs/dentry.rs`):
 
 Following Linux's `d_lock` pattern, each dentry has a single RwLock protecting
-all mutable state:
+all mutable state, its name and parent included:
 
 ```rust
 pub struct Dentry {
-    pub name: String,           // Immutable after creation
     pub sb: Weak<SuperBlock>,   // Immutable after creation
     d_lock: RwLock<DentryInner>, // Single lock (like Linux d_lock)
 }
 
 struct DentryInner {
+    name: FileName,             // Changed by d_move/d_exchange
     inode: Option<Arc<Inode>>,
-    parent: Option<Weak<Dentry>>,
-    children: BTreeMap<String, Arc<Dentry>>,
+    parent: Option<Arc<Dentry>>, // Pinned by the child (Linux d_parent)
+    children: BTreeMap<FileName, Arc<Dentry>>,
     flags: DentryFlags,
 }
 ```
+
+A rename moves the dentry itself (`d_move`, `d_exchange`) under the
+global `RENAME_LOCK` (write; Linux rename_lock), with both parents'
+`i_rwsem` held by the caller; each step takes one `d_lock` at a time
+(parent, then the moved or replaced child). `is_subdir` and `d_path`
+read parents and names under `RENAME_LOCK` (read), so they see one
+consistent tree. `d_path` also climbs mounts (`Mount.parent`, then
+`Mount.mountpoint`, each read and released) inside it: RENAME_LOCK ->
+Mount fields -> d_lock; nothing takes RENAME_LOCK under a Mount lock. `Dentry::alloc` inserts a child under the parent's
+`d_lock` unless one with that name is cached (Linux d_alloc + d_add):
+one dentry per name. Deviation: Linux readers retry a seqlock instead of
+taking a lock.
+
+A cached child is revalidated (`InodeOps::revalidate`, Linux
+d_revalidate) after its d_lock is released, inside whatever i_rwsem the
+walk holds: procfs's takes TASKLIST (read) and the task's fd table
+lock. `proc::proc_flush_pid` runs after a task leaves TASKLIST: it
+collects the procfs superblocks under `PROC_SBS` (spin Mutex, leaf),
+releases it, then drops dentries (d_lock).
+
+The dcache shrinker (`dentry::shrink_dcache`: drop_caches 2, direct
+reclaim) takes `superblock::ALL_SBS` (spin Mutex, leaf) only to pick the
+next superblock, then per dentry the parent's d_lock (write) and the
+child's (read): spin locks only, allocating nothing. Direct reclaim
+never runs in atomic context (`may_direct_reclaim`), so an allocation
+under a d_lock or ALL_SBS cannot re-enter it.
+`dentry::d_drop_tree` (an unhashed dentry's cached subtree, a dying
+superblock's tree) takes the same parent-then-child d_locks one leaf
+at a time, with no RENAME_LOCK held (d_move drops it first).
 
 #### Mount Namespace & Mount Objects
 
@@ -1699,20 +1738,36 @@ Each open `File` holds a reference to its mount via the `mnt` field:
 
 **Lock Order for Mount Operations:**
 ```
-1. MntNamespace.root (read/write)
-2. parent Mount.children (write for add/remove child)
-3. Mount.parent (write for set/clear)
-4. Mount.mountpoint (write for set/clear)
-5. Dentry.d_lock (DentryInner.flags: write for the mounted flag)
+1. the mountpoint's Inode.i_rwsem (attach: a dead directory is refused)
+2. mount::NAMESPACE_SEM (write: attach, umount, namespace copy)
+3. SuperBlock.s_umount (write: remount)
+4. MntNamespace.root (read/write)
+5. parent Mount.children (write for add/remove child)
+6. Mount.parent (write for set/clear)
+7. Mount.mountpoint (write for set/clear)
+8. Dentry.d_lock (DentryInner.flags: write for the mount count)
 ```
+MS_MOVE and pivot_root take the target's (put_old's) i_rwsem, then
+NAMESPACE_SEM; pivot_root's chroot_fs_refs runs after both are
+released (TASKLIST read to collect the tids, then each FsStruct.inner).
+umount writes the filesystem back after releasing NAMESPACE_SEM
+(writeback takes inode locks; Linux syncs in deactivate_super after
+namespace_unlock). Mount ids come from `MNT_IDS` (spin Mutex leaf,
+Linux mnt_id_ida) and `MNT_ID_UNIQUE` (atomic). Deviation: no global
+(parent, mountpoint) hash; crossing scans the current mount's children.
+Propagation (`fs/pnode.rs`) runs entirely under NAMESPACE_SEM (write):
+peer groups live in `pnode::GROUPS` (spin Mutex, leaf: never held
+across a call into the mount tree or a d_lock).
 
-**Lock Order for Path Traversal (follow_mount):**
+**Lock Order for Path Traversal (follow_mount, lookup_mnt):**
 ```
-1. MntNamespace.root (read)
-2. Mount.children (read)
-3. child.mountpoint (read)
-4. Dentry.d_lock (DentryInner.inode: read)
+1. Mount.children (read) of the walk's current mount
+2. child.mountpoint (read)
+3. Dentry.d_lock (DentryInner.inode: read)
 ```
+The walk carries a Path{mnt, dentry}: crossing looks only at the
+current mount's children (Linux lookup_mnt); ".." at a mount root
+reads `Mount.parent` and `Mount.mountpoint` (follow_dotdot).
 
 `is_local_mountpoint` (rmdir, unlink, rename: EBUSY) takes the same
 locks in the same order, one mount's `children` at a time, inside the
@@ -1779,8 +1834,8 @@ fn sys_mkdir(...) {
 ```
 
 **Lookup and permission under the lock (Linux lookup_open /
-filename_create):** `open.rs::create_in` (O_CREAT), `path.rs::create_entry`
-(mkdir, mknod, symlink, link) and `path.rs::delete_entry` (unlink, rmdir)
+filename_create):** `open.rs::create_in` (O_CREAT), `namei.rs::create_entry`
+(mkdir, mknod, symlink, link) and `namei.rs::delete_entry` (unlink, rmdir)
 take the parent's `Inode::lock()` first and, while holding it, look the name
 up (`lookup_one`: dentry `d_lock`, then the file system's `lookup`), decide
 EEXIST / "created by this call", run the DAC checks (`dac::may_create`,
@@ -1976,7 +2031,7 @@ to stay locked between calls. The call holds the file's `f_pos_lock`
 - Both are sleeping locks (`sync`): the vfat write path may wait
   for page locks and block I/O while holding `i_rwsem`, which a spinlock
   would forbid.
-- Path walk (`path.rs::lookup_slow`) takes a directory's `i_rwsem`
+- Path walk (`namei.rs::lookup_slow`) takes a directory's `i_rwsem`
   shared on a dcache miss (Linux lookup_slow); callers already holding
   that directory exclusively (create, unlink, rename) use `lookup_one`
   directly.

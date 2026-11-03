@@ -350,7 +350,7 @@ fn vfat(d: &Disk) {
     sys_mkdir(b"/mnt\0".as_ptr(), 0o755);
     sys_mkdir(b"/mnt/vd1\0".as_ptr(), 0o755);
     // Ubuntu's kernel has only cp437 built in (iocharset defaults to
-    // iso8859-1, a module); hk ignores mount data
+    // iso8859-1, a module)
     let r = sys_mount(
         p1.path(&mut p).as_ptr(),
         b"/mnt/vd1\0".as_ptr(),
@@ -397,6 +397,10 @@ fn vfat(d: &Disk) {
     let u = sys_umount2(b"/mnt/vd1\0".as_ptr(), 0);
     verdict(b"BLK_VFAT_UMOUNT", u == 0, u);
     vfat_remount(p1);
+    vfat_names(p1);
+    vfat_opts(p1);
+    vfat_neg_case(p1);
+    vfat_mount_alias(p1);
 }
 
 /// What was written through the page cache (write() and a shared
@@ -441,6 +445,110 @@ fn vfat_remount(p1: &BlkDev) {
         println(b"");
     }
     verdict(b"VFAT_REMOUNT_DATA", ok && u == 0, n);
+}
+
+/// Mount vda1 on /mnt/vd1 with mount data `opts` (NUL-terminated)
+fn mount_vd1(p1: &BlkDev, opts: &[u8]) -> i64 {
+    let mut p = [0u8; 48];
+    let path = p1.path(&mut p).as_ptr();
+    sys_mount(path, b"/mnt/vd1\0".as_ptr(), b"vfat\0".as_ptr(), 0, opts.as_ptr() as u64)
+}
+
+/// `name` is an entry of /mnt/vd1, byte for byte
+fn vd1_lists(name: &[u8]) -> bool {
+    let fd = sys_open(b"/mnt/vd1\0".as_ptr(), O_RDONLY, 0);
+    let mut buf = [0u8; 2048];
+    let mut found = false;
+    loop {
+        let n = hk_syscall::sys_getdents64(fd as u64, buf.as_mut_ptr(), buf.len() as u64);
+        if n <= 0 {
+            break;
+        }
+        let mut off = 0usize;
+        while off < n as usize {
+            let reclen = u16::from_ne_bytes([buf[off + 16], buf[off + 17]]) as usize;
+            let nm = &buf[off + 19..off + reclen];
+            let len = nm.iter().position(|&b| b == 0).unwrap_or(nm.len());
+            found |= &nm[..len] == name;
+            off += reclen;
+        }
+    }
+    sys_close(fd as u64);
+    found
+}
+
+/// Long names are UTF-16 on disk, read by the mount's charset (Linux
+/// vfat with the utf8 option, then cp437): a UTF-8 name round-trips,
+/// shows as cp437 bytes on a cp437 mount; FAT's forbidden characters
+/// and undecodable names are EINVAL; trailing dots are dropped
+fn vfat_names(p1: &BlkDev) {
+    let n = b"VFAT_UTF8_NAME";
+    let r = mount_vd1(p1, b"iocharset=cp437,utf8\0");
+    if r != 0 {
+        return verdict(n, false, r);
+    }
+    let utf: &[u8] = b"/mnt/vd1/\xc3\xa9t\xc3\xa9.txt\0";
+    let fd = sys_open(utf.as_ptr(), O_CREAT | O_WRONLY, 0o644);
+    sys_close(fd as u64);
+    let listed = vd1_lists(b"\xc3\xa9t\xc3\xa9.txt");
+    let bad = sys_open(b"/mnt/vd1/a:b\0".as_ptr(), O_CREAT | O_WRONLY, 0o644);
+    let undec = sys_open(b"/mnt/vd1/q\xff\0".as_ptr(), O_CREAT | O_WRONLY, 0o644);
+    let dot = sys_open(b"/mnt/vd1/dot.\0".as_ptr(), O_CREAT | O_WRONLY, 0o644);
+    sys_close(dot as u64);
+    // SAFETY: Stat is plain integers
+    let mut st: Stat = unsafe { core::mem::zeroed() };
+    let undotted = sys_stat(b"/mnt/vd1/dot\0".as_ptr(), &mut st);
+    sys_unlink(b"/mnt/vd1/dot\0".as_ptr());
+    sys_umount2(b"/mnt/vd1\0".as_ptr(), 0);
+    // The same name through cp437: \x82 is e-acute there
+    let r2 = mount_vd1(p1, b"iocharset=cp437\0");
+    let cp = vd1_lists(b"\x82t\x82.txt");
+    sys_unlink(b"/mnt/vd1/\x82t\x82.txt\0".as_ptr());
+    sys_umount2(b"/mnt/vd1\0".as_ptr(), 0);
+    let ok = fd >= 0 && listed && bad == -22 && undec == -22 && dot >= 0 && undotted == 0;
+    if !ok || r2 != 0 || !cp {
+        print(b"VFAT_UTF8_NAME: fd/listed/bad/undec/dot/undotted/cp ");
+        for v in [fd, listed as i64, bad, undec, dot, undotted, r2, cp as i64] {
+            print_num(v);
+            print(b" ");
+        }
+        println(b"");
+    }
+    verdict(n, ok && r2 == 0 && cp, fd);
+}
+
+/// uid/gid/fmask/dmask set every inode's owner and mode (Linux
+/// fat_make_mode: 0777 minus the mask); an unknown option or a bad
+/// value is EINVAL (MOUNT_BAD_OPT)
+fn vfat_opts(p1: &BlkDev) {
+    let r = mount_vd1(p1, b"iocharset=cp437,uid=1000,gid=1001,fmask=0133,dmask=0022\0");
+    // SAFETY: Stat is plain integers
+    let mut f: Stat = unsafe { core::mem::zeroed() };
+    // SAFETY: as above
+    let mut d: Stat = unsafe { core::mem::zeroed() };
+    let rf = sys_stat(b"/mnt/vd1/HKDISK.TXT\0".as_ptr(), &mut f);
+    let rd = sys_stat(b"/mnt/vd1\0".as_ptr(), &mut d);
+    sys_umount2(b"/mnt/vd1\0".as_ptr(), 0);
+    let ok = r == 0
+        && rf == 0
+        && rd == 0
+        && (f.st_uid, f.st_gid, f.st_mode) == (1000, 1001, 0o100644)
+        && (d.st_uid, d.st_mode) == (1000, 0o40755);
+    if !ok {
+        print(b"VFAT_MOUNT_OPTS: r/uid/gid/fmode/dmode ");
+        for v in [r, f.st_uid as i64, f.st_gid as i64, f.st_mode as i64, d.st_mode as i64] {
+            print_num(v);
+            print(b" ");
+        }
+        println(b"");
+    }
+    verdict(b"VFAT_MOUNT_OPTS", ok, r);
+    let bogus = mount_vd1(p1, b"iocharset=cp437,bogus\0");
+    let badval = mount_vd1(p1, b"iocharset=cp437,uid=abc\0");
+    if bogus == 0 || badval == 0 {
+        sys_umount2(b"/mnt/vd1\0".as_ptr(), 0);
+    }
+    verdict(b"MOUNT_BAD_OPT", bogus == -22 && badval == -22, bogus * 100 + badval);
 }
 
 /// Write `v` to /proc/sys/vm/drop_caches
@@ -657,4 +765,47 @@ fn swap(p2: &BlkDev) {
     let ok = on == 0 && again == EBUSY && off == 0;
     verdict(b"BLK_SWAPON", ok, on * 1000 + again);
     verdict(b"SWAP_ETXTBSY", on == 0 && fd >= 0 && w == -26, w);
+}
+
+/// A name vfat matches without regard to case or trailing dots is found
+/// after a failed lookup of another spelling (Linux vfat_revalidate_ci:
+/// no stale negative dentry)
+fn vfat_neg_case(p1: &BlkDev) {
+    let r = mount_vd1(p1, b"iocharset=cp437\0");
+    // SAFETY: Stat is plain integers
+    let mut st: Stat = unsafe { core::mem::zeroed() };
+    let miss = sys_stat(b"/mnt/vd1/NEGCASE.TXT\0".as_ptr(), &mut st);
+    let miss2 = sys_stat(b"/mnt/vd1/td.\0".as_ptr(), &mut st);
+    let fd = sys_open(b"/mnt/vd1/negcase.txt\0".as_ptr(), O_CREAT | O_WRONLY, 0o644);
+    sys_close(fd as u64);
+    let fd2 = sys_open(b"/mnt/vd1/td\0".as_ptr(), O_CREAT | O_WRONLY, 0o644);
+    sys_close(fd2 as u64);
+    let hit = sys_stat(b"/mnt/vd1/NEGCASE.TXT\0".as_ptr(), &mut st);
+    let hit2 = sys_stat(b"/mnt/vd1/td.\0".as_ptr(), &mut st);
+    sys_unlink(b"/mnt/vd1/negcase.txt\0".as_ptr());
+    sys_unlink(b"/mnt/vd1/td\0".as_ptr());
+    sys_umount2(b"/mnt/vd1\0".as_ptr(), 0);
+    let ok = r == 0 && miss == -2 && miss2 == -2 && fd >= 0 && fd2 >= 0 && hit == 0 && hit2 == 0;
+    verdict(b"VFAT_NEG_CASE", ok, hit * 100 + hit2);
+}
+
+/// A mount on a vfat directory covers every spelling of it: "AL" and
+/// "al" are one directory, and what is under the mount stays hidden
+/// (Linux: one dentry through vfat's d_hash/d_compare)
+fn vfat_mount_alias(p1: &BlkDev) {
+    let r = mount_vd1(p1, b"iocharset=cp437\0");
+    sys_mkdir(b"/mnt/vd1/al\0".as_ptr(), 0o755);
+    let fd = sys_open(b"/mnt/vd1/al/under\0".as_ptr(), O_CREAT | O_WRONLY, 0o644);
+    sys_close(fd as u64);
+    let m = sys_mount(b"none\0".as_ptr(), b"/mnt/vd1/al\0".as_ptr(), b"ramfs\0".as_ptr(), 0, 0);
+    // SAFETY: Stat is plain integers
+    let mut st: Stat = unsafe { core::mem::zeroed() };
+    let lower = sys_stat(b"/mnt/vd1/al/under\0".as_ptr(), &mut st);
+    let upper = sys_stat(b"/mnt/vd1/AL/under\0".as_ptr(), &mut st);
+    sys_umount2(b"/mnt/vd1/al\0".as_ptr(), 0);
+    sys_unlink(b"/mnt/vd1/al/under\0".as_ptr());
+    hk_syscall::sys_rmdir(b"/mnt/vd1/al\0".as_ptr());
+    sys_umount2(b"/mnt/vd1\0".as_ptr(), 0);
+    let ok = r == 0 && fd >= 0 && m == 0 && lower == -2 && upper == -2;
+    verdict(b"VFAT_MOUNT_ALIAS", ok, lower * 100 + upper);
 }

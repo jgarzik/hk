@@ -186,7 +186,9 @@ timeout "$TIMEOUT" "$QEMU_BIN" "${KVM[@]}" "${QEMU_MACHINE[@]}" \
     -append "console=$CONSOLE rdinit=/bin/init panic=-1 quiet" \
     -serial file:"$SERIAL_LOG" </dev/null || true
 
-if ! grep -aq "^Host mode: " "$SERIAL_LOG"; then
+# BOOT_COMPLETE, not the "Host mode:" line after it: the kernel's
+# "reboot: Power down" can land in the middle of that one
+if ! grep -aq "^BOOT_COMPLETE" "$SERIAL_LOG"; then
     echo "Linux boot test FAILED - boot_tester did not finish:"
     tail -20 "$SERIAL_LOG"
     exit 1

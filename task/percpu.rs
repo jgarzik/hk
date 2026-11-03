@@ -1661,6 +1661,7 @@ pub fn reap_zombie_child_times(
     // The Task is released after TASKLIST (nothing is released under it)
     drop(table);
     drop(task);
+    crate::fs::proc::proc_flush_pid(pid, tid);
     // Released: drop the RLIMIT_NPROC charge (threads drop it at exit)
     if tid == pid {
         crate::task::nproc_uncharge(uid);
@@ -2480,6 +2481,9 @@ fn release_thread(tid: Tid) {
             _ => None,
         }
     };
+    if let Some(t) = &gone {
+        crate::fs::proc::proc_flush_pid(t.pid, tid);
+    }
     drop(gone);
 }
 

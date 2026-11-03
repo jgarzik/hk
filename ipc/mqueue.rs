@@ -23,9 +23,9 @@
 //! - Linux kernel ipc/mqueue.c
 //! - POSIX.1-2017 mq_overview(7)
 
+use crate::fs::name::FileName;
 use crate::time::hrtimer::HrClock;
 use alloc::collections::BTreeMap;
-use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
@@ -168,7 +168,7 @@ struct MqNotify {
 /// Message queue
 pub struct MqQueue {
     #[allow(dead_code)] // Used for debugging and future /dev/mqueue filesystem
-    name: String,
+    name: FileName,
     maxmsg: i64,
     msgsize: i64,
     messages: Mutex<Vec<MqMessage>>,
@@ -182,7 +182,7 @@ pub struct MqQueue {
 }
 
 impl MqQueue {
-    fn new(name: String, mode: u32, maxmsg: i64, msgsize: i64) -> Self {
+    fn new(name: FileName, mode: u32, maxmsg: i64, msgsize: i64) -> Self {
         // Get current task's effective uid/gid as owner
         let cred = crate::task::percpu::current_cred();
         Self {
@@ -243,7 +243,7 @@ impl MqQueue {
 
     /// Get the queue name (for debugging and future /dev/mqueue filesystem)
     #[allow(dead_code)]
-    fn name(&self) -> &str {
+    fn name(&self) -> &[u8] {
         &self.name
     }
 
@@ -483,7 +483,7 @@ impl FileOps for MqFileOps {
 // Global Registry
 // ============================================================================
 
-static MQ_REGISTRY: Lazy<RwLock<BTreeMap<String, Arc<MqQueue>>>> =
+static MQ_REGISTRY: Lazy<RwLock<BTreeMap<FileName, Arc<MqQueue>>>> =
     Lazy::new(|| RwLock::new(BTreeMap::new()));
 
 static MQ_NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -515,7 +515,7 @@ fn create_mq_file(queue: Arc<MqQueue>, access_mode: i32, oflag: i32) -> Result<A
         &NULL_INODE_OPS,
     ));
 
-    let dentry = Arc::new(Dentry::new_anonymous(String::from("mqueue"), Some(inode)));
+    let dentry = Arc::new(Dentry::new_anonymous("mqueue".into(), Some(inode)));
 
     let mut file_flags = match access_mode {
         O_RDONLY => flags::O_RDONLY,
@@ -543,14 +543,14 @@ fn create_mq_file(queue: Arc<MqQueue>, access_mode: i32, oflag: i32) -> Result<A
 /// name up as a single component in the mqueue fs root
 /// (ipc/mqueue.c -> lookup_noperm_common() in fs/namei.c): an empty name is
 /// ENOENT (getname), "." / ".." or any '/' is EACCES.
-fn validate_mq_name(name: &str) -> Result<(), KernelError> {
+fn validate_mq_name(name: &[u8]) -> Result<(), KernelError> {
     if name.is_empty() {
         return Err(KernelError::NotFound);
     }
     if name.len() > NAME_MAX {
         return Err(KernelError::NameTooLong);
     }
-    if name == "." || name == ".." || name.contains('/') {
+    if crate::fs::name::is_dot_or_dotdot(name) || name.contains(&b'/') {
         return Err(KernelError::PermissionDenied);
     }
     Ok(())
@@ -559,8 +559,11 @@ fn validate_mq_name(name: &str) -> Result<(), KernelError> {
 /// mq_open - open a message queue
 pub fn sys_mq_open(name_ptr: u64, oflag: i32, mode: u32, attr_ptr: u64) -> i64 {
     // Read name from user space
+    // Longer than NAME_MAX: ENAMETOOLONG (Linux: the lookup of the
+    // name in the mqueue root)
     let name = match strncpy_from_user::<Uaccess>(name_ptr, NAME_MAX + 1) {
         Ok(s) => s,
+        Err(crate::uaccess::UaccessError::TooLong) => return KernelError::NameTooLong.sysret(),
         Err(_) => return KernelError::BadAddress.sysret(),
     };
 
@@ -589,7 +592,7 @@ pub fn sys_mq_open(name_ptr: u64, oflag: i32, mode: u32, attr_ptr: u64) -> i64 {
     let queue = {
         let mut registry = MQ_REGISTRY.write();
 
-        if let Some(q) = registry.get(&queue_name) {
+        if let Some(q) = registry.get(queue_name.as_slice()) {
             if creating && exclusive {
                 return KernelError::AlreadyExists.sysret();
             }
@@ -617,14 +620,19 @@ pub fn sys_mq_open(name_ptr: u64, oflag: i32, mode: u32, attr_ptr: u64) -> i64 {
                 (DFLT_MSGMAX, DFLT_MSGSIZEMAX)
             };
 
-            let queue = Arc::new(MqQueue::new(queue_name.clone(), mode, maxmsg, msgsize));
+            let queue = Arc::new(MqQueue::new(
+                queue_name.clone().into(),
+                mode,
+                maxmsg,
+                msgsize,
+            ));
 
             // Set initial flags
             if oflag & O_NONBLOCK != 0 {
                 queue.set_flags(O_NONBLOCK as i64);
             }
 
-            registry.insert(queue_name, queue.clone());
+            registry.insert(queue_name.into(), queue.clone());
             queue
         }
     };
@@ -658,8 +666,11 @@ pub fn sys_mq_open(name_ptr: u64, oflag: i32, mode: u32, attr_ptr: u64) -> i64 {
 /// mq_unlink - remove a message queue
 pub fn sys_mq_unlink(name_ptr: u64) -> i64 {
     // Read name from user space
+    // Longer than NAME_MAX: ENAMETOOLONG (Linux: the lookup of the
+    // name in the mqueue root)
     let name = match strncpy_from_user::<Uaccess>(name_ptr, NAME_MAX + 1) {
         Ok(s) => s,
+        Err(crate::uaccess::UaccessError::TooLong) => return KernelError::NameTooLong.sysret(),
         Err(_) => return KernelError::BadAddress.sysret(),
     };
 
@@ -669,12 +680,12 @@ pub fn sys_mq_unlink(name_ptr: u64) -> i64 {
     let queue_name = name;
 
     let mut registry = MQ_REGISTRY.write();
-    if let Some(q) = registry.get(&queue_name) {
+    if let Some(q) = registry.get(queue_name.as_slice()) {
         // Check write permission (needed for unlink)
         if !q.check_access(O_WRONLY) {
             return KernelError::PermissionDenied.sysret();
         }
-        registry.remove(&queue_name);
+        registry.remove(queue_name.as_slice());
         0
     } else {
         KernelError::NotFound.sysret()

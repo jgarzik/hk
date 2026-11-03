@@ -249,7 +249,7 @@ pub fn bdev_inode(dev: DevId, size: u64) -> Arc<Inode> {
 struct BdevInodeOps;
 
 impl crate::fs::inode::InodeOps for BdevInodeOps {
-    fn lookup(&self, _dir: &Inode, _name: &str) -> Result<Arc<Inode>, KernelError> {
+    fn lookup(&self, _dir: &Inode, _name: &[u8]) -> Result<Arc<Inode>, KernelError> {
         Err(KernelError::NotDirectory)
     }
 

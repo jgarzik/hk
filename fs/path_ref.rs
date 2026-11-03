@@ -40,12 +40,16 @@ impl Path {
         Self { mnt, dentry }
     }
 
-    /// Create a Path from a dentry, using the root mount
-    ///
-    /// Falls back to root mount since we don't track per-dentry mounts yet.
+    /// A dentry of the namespace's root mount as a Path (boot-time
+    /// objects, internal files)
     pub fn from_dentry(dentry: Arc<Dentry>) -> Option<Self> {
         let mnt = crate::ns::current_mnt_ns().get_root()?;
         Some(Self { mnt, dentry })
+    }
+
+    /// The same mount and dentry (Linux path_equal)
+    pub fn same(&self, o: &Path) -> bool {
+        Arc::ptr_eq(&self.mnt, &o.mnt) && Arc::ptr_eq(&self.dentry, &o.dentry)
     }
 
     /// Check if this path points to a directory

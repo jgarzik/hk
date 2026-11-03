@@ -298,7 +298,7 @@ fn check_creds(data: &[u8]) -> Result<Creds, KernelError> {
     if !(pid_ok && uid_ok && gid_ok) {
         return Err(KernelError::NotPermitted);
     }
-    if pid != me && (pid <= 0 || crate::fs::procfs::get_tid_for_pid(pid as u64).is_none()) {
+    if pid != me && (pid <= 0 || crate::fs::proc::get_tid_for_pid(pid as u64).is_none()) {
         return Err(KernelError::NoProcess);
     }
     Ok(Creds { pid, uid, gid })

@@ -193,11 +193,10 @@ pub fn sys_acct(filename_ptr: u64) -> i64 {
     }
 
     // Copy filename from user
-    let filename =
-        match crate::uaccess::strncpy_from_user::<crate::arch::Uaccess>(filename_ptr, 4096) {
-            Ok(f) => f,
-            Err(_) => return -14, // EFAULT
-        };
+    let filename = match crate::fs::namei::getname(filename_ptr, false) {
+        Ok(f) => f,
+        Err(e) => return e.sysret(),
+    };
 
     // Open the file for appending
     let file = match open_acct_file(&filename) {
@@ -211,13 +210,17 @@ pub fn sys_acct(filename_ptr: u64) -> i64 {
 }
 
 /// Open the accounting file
-fn open_acct_file(path: &str) -> Result<Arc<File>, i64> {
+fn open_acct_file(path: &[u8]) -> Result<Arc<File>, i64> {
     use crate::fs::file::flags;
-    use crate::fs::{LookupFlags, dac, lookup_path_flags};
+    use crate::fs::{LookupFlags, dac};
 
     // Lookup the file
-    let dentry = match lookup_path_flags(path, LookupFlags::open()) {
-        Ok(d) => d,
+    let crate::fs::Path { mnt, dentry } = match crate::fs::namei::path_lookupat(
+        crate::task::percpu::current_cwd(),
+        path,
+        LookupFlags::open(),
+    ) {
+        Ok(p) => p,
         // Any lookup error as is (Linux filp_open)
         Err(e) => return Err(e.sysret()),
     };
@@ -234,7 +237,7 @@ fn open_acct_file(path: &str) -> Result<Arc<File>, i64> {
 
     // Open for writing: hold write access (EROFS on a read-only fs)
     let w = match dentry.get_inode() {
-        Some(i) => Some(dac::want_write(&i).map_err(|e| e.sysret())?),
+        Some(_) => Some(mnt.want_write().map_err(|e| e.sysret())?),
         None => None,
     };
     // The filesystem's file operations, as an open(2) of it gets
@@ -243,7 +246,7 @@ fn open_acct_file(path: &str) -> Result<Arc<File>, i64> {
         .superblock()
         .map(|sb| sb.fs_type.file_ops)
         .unwrap_or(&crate::fs::ramfs::RAMFS_FILE_OPS);
-    let mut file = File::new(dentry, flags::O_WRONLY | flags::O_APPEND, f_op);
+    let mut file = File::new(dentry, Some(mnt), flags::O_WRONLY | flags::O_APPEND, f_op);
     file.write_access = w;
     Ok(Arc::new(file))
 }
