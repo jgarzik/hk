@@ -92,6 +92,11 @@ pub struct Mount {
     /// MNT_NOEXEC
     mnt_flags: AtomicU32,
 
+    /// Peer group, 0 if not shared (Linux mnt_group_id; fs/pnode.rs)
+    pub(super) group: AtomicU32,
+    /// Group this mount is a slave of, 0 if none (Linux mnt_master)
+    pub(super) master: AtomicU32,
+
     /// Marked by a first umount2(MNT_EXPIRE) (Linux mnt_expiry_mark)
     expiry: core::sync::atomic::AtomicBool,
 
@@ -132,6 +137,8 @@ impl Mount {
             mnt_flags: AtomicU32::new(flags),
             writers: AtomicU64::new(0),
             expiry: core::sync::atomic::AtomicBool::new(false),
+            group: AtomicU32::new(0),
+            master: AtomicU32::new(0),
             mnt_id: mnt_alloc_id(),
             mnt_id_unique: MNT_ID_UNIQUE.fetch_add(1, Ordering::Relaxed),
             devname,
@@ -142,12 +149,15 @@ impl Mount {
     /// A copy of `self` for a namespace copy: same filesystem, root,
     /// flags and source, new ids, not attached
     fn copy(&self) -> Arc<Self> {
-        Self::new(
+        let c = Self::new(
             self.sb.clone(),
             self.root.clone(),
             self.flags(),
             self.devname.clone(),
-        )
+        );
+        // A namespace copy keeps peerage (Linux copy_mnt_ns: CL_COPY_ALL)
+        super::pnode::clone_prop(self, &c);
+        c
     }
 
     /// MNT_* flags
@@ -380,9 +390,7 @@ pub fn attach(
             return Err(KernelError::NotFound);
         }
         let _ns = NAMESPACE_SEM.write();
-        mount.set_mountpoint(mp.dentry.clone());
-        mount.set_parent(&mp.mnt);
-        mp.mnt.add_child(mount.clone());
+        graft(&mount, &mp);
         drop(_dir_lock);
     } else {
         mount.mark(MNT_LOCKED, true);
@@ -406,6 +414,7 @@ pub fn clone_mnt(m: &Mount, root: Arc<Dentry>) -> Arc<Mount> {
 /// an unbindable submount is left out with whatever is under it
 pub fn copy_tree(m: &Arc<Mount>, root: &Arc<Dentry>) -> Arc<Mount> {
     let top = clone_mnt(m, root.clone());
+    super::pnode::clone_prop(m, &top);
     let mut todo = alloc::vec![(m.clone(), top.clone())];
     while let Some((src, dst)) = todo.pop() {
         let children: Vec<Arc<Mount>> = src.children.read().clone();
@@ -418,9 +427,8 @@ pub fn copy_tree(m: &Arc<Mount>, root: &Arc<Dentry>) -> Arc<Mount> {
                 continue;
             }
             let n = clone_mnt(&c, c.root.clone());
-            n.set_mountpoint(mp);
-            n.set_parent(&dst);
-            dst.add_child(n.clone());
+            super::pnode::clone_prop(&c, &n);
+            attach_mnt(&n, &Path::new(dst.clone(), mp));
             todo.push((c, n));
         }
     }
@@ -447,11 +455,11 @@ pub fn do_loopback(old: &Path, mp: &Path, rec: bool) -> Result<(), KernelError> 
     let m = if rec {
         copy_tree(&old.mnt, &old.dentry)
     } else {
-        clone_mnt(&old.mnt, old.dentry.clone())
+        let m = clone_mnt(&old.mnt, old.dentry.clone());
+        super::pnode::clone_prop(&old.mnt, &m);
+        m
     };
-    m.set_mountpoint(mp.dentry.clone());
-    m.set_parent(&mp.mnt);
-    mp.mnt.add_child(m);
+    graft(&m, mp);
     Ok(())
 }
 
@@ -569,10 +577,19 @@ pub fn do_umount(mount: Arc<Mount>, flags: i32) -> Result<(), KernelError> {
         return Err(KernelError::InvalidArgument);
     }
     let ns = NAMESPACE_SEM.write();
-    if !detach && is_mount_busy(&mount) {
+    // The propagated copies go too (Linux propagate_mount_busy,
+    // propagate_umount); a busy one makes it all EBUSY
+    let copies = super::pnode::propagate_umount(&mount);
+    if !detach && (is_mount_busy(&mount) || copies.iter().any(|c| c.mnt_get_count() > 0)) {
         return Err(KernelError::Busy);
     }
-    detach_mnt(&mount);
+    for m in core::iter::once(&mount).chain(copies.iter()) {
+        detach_mnt(m);
+        // Unmounted mounts leave propagation (Linux umount_tree)
+        for t in super::pnode::subtree(m) {
+            super::pnode::change_propagation(&t, super::pnode::Prop::Private);
+        }
+    }
     drop(ns);
 
     // Write the filesystem back, outside namespace_sem: writeback takes
@@ -595,10 +612,24 @@ fn detach_mnt(m: &Arc<Mount>) {
 }
 
 /// Hang `m` on `mp` (Linux attach_mnt); under NAMESPACE_SEM
-fn attach_mnt(m: &Arc<Mount>, mp: &Path) {
+pub(super) fn attach_mnt(m: &Arc<Mount>, mp: &Path) {
     m.set_mountpoint(mp.dentry.clone());
     m.set_parent(&mp.mnt);
     mp.mnt.add_child(m.clone());
+}
+
+/// Hang the tree at `m` on `mp` and, under a shared mount, propagate
+/// it (Linux attach_recursive_mnt: the tree is made shared first);
+/// under NAMESPACE_SEM
+fn graft(m: &Arc<Mount>, mp: &Path) {
+    let shared = mp.mnt.group.load(Ordering::SeqCst) != 0;
+    if shared {
+        super::pnode::invent_groups(m);
+    }
+    attach_mnt(m, mp);
+    if shared {
+        super::pnode::propagate_mnt(&mp.mnt, &mp.dentry, m);
+    }
 }
 
 /// `p` is at or below `root`, across mounts (Linux is_path_reachable)
@@ -640,11 +671,22 @@ pub fn do_move(old: &Path, mp: &Path) -> Result<(), KernelError> {
     }
     let _l = lock_mountpoint(mp)?;
     let _ns = NAMESPACE_SEM.write();
+    // Out of a shared parent (Linux: EINVAL); an unbindable tree not
+    // under a shared mount
+    let shared = |m: &Mount| m.group.load(Ordering::SeqCst) != 0;
+    if old.mnt.get_parent().is_some_and(|p| shared(&p))
+        || (shared(&mp.mnt)
+            && super::pnode::subtree(&old.mnt)
+                .iter()
+                .any(|m| m.flags() & MNT_UNBINDABLE != 0))
+    {
+        return Err(KernelError::InvalidArgument);
+    }
     if is_path_reachable(mp, old) {
         return Err(KernelError::TooManySymlinks);
     }
     detach_mnt(&old.mnt);
-    attach_mnt(&old.mnt, mp);
+    graft(&old.mnt, mp);
     Ok(())
 }
 

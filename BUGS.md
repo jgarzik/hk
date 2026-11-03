@@ -253,6 +253,13 @@ Missing: fs.protected_hardlinks/symlinks/fifos/regular do not exist
 (behave as their kernel default 0); no
 immutable/append-only inodes (no IS_APPEND/IS_IMMUTABLE EPERM).
 
+## Unaligned user pointers are EFAULT
+
+**Location**: `uaccess.rs` (`put_user`/`get_user`)
+
+A misaligned user address is rejected with EFAULT; Linux on x86-64 and
+arm64 accepts it. Needs a boot test (both kernels) before the fix.
+
 ## Sleeping-lock gaps
 
 **Location**: `sync` (RwSem)
@@ -264,10 +271,13 @@ immutable/append-only inodes (no IS_APPEND/IS_IMMUTABLE EPERM).
 **Location**: `fs/misc.rs` sys_mount/sys_umount2, `fs/mount.rs`
 
 Accepted without effect: atime flags (no atime updates), MS_SILENT,
-MS_MANDLOCK, MS_POSIXACL, MS_I_VERSION, MS_LAZYTIME, and MS_PRIVATE
-beyond clearing unbindable (mounts never propagate).
-EINVAL instead of Linux behavior: MS_SHARED, MS_SLAVE,
-MS_SYNCHRONOUS, MS_DIRSYNC and MS_NOSYMFOLLOW. umount2 MNT_EXPIRE's
+MS_MANDLOCK, MS_POSIXACL, MS_I_VERSION, MS_LAZYTIME.
+EINVAL instead of Linux behavior: MS_SYNCHRONOUS, MS_DIRSYNC and
+MS_NOSYMFOLLOW. Propagation (`fs/pnode.rs`): a propagated copy lands
+on top of what is already mounted at the target (Linux tucks it
+under); a slave's master is its master's peer group, not one mount;
+copies of a namespace are always peers (no CL_SHARED_TO_SLAVE for a
+less privileged user namespace). umount2 MNT_EXPIRE's
 mark is not cleared by use (Linux mntput clears it).
 Unlike Linux (MNT_WRITE_HOLD), a write access racing a read-only remount
 that then fails with EBUSY can see a spurious EROFS. Mount data/options strings are

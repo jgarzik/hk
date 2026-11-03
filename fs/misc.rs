@@ -45,6 +45,8 @@ mod ms {
     pub const POSIXACL: u64 = 1 << 16;
     pub const UNBINDABLE: u64 = 1 << 17;
     pub const PRIVATE: u64 = 1 << 18;
+    pub const SLAVE: u64 = 1 << 19;
+    pub const SHARED: u64 = 1 << 20;
     pub const RELATIME: u64 = 1 << 21;
     pub const I_VERSION: u64 = 1 << 23;
     pub const STRICTATIME: u64 = 1 << 24;
@@ -54,10 +56,9 @@ mod ms {
     pub const MGC_MSK: u64 = 0xffff_0000;
 
     /// Flags hk honors, or may accept without effect because hk
-    /// already behaves that way (no atime updates, every mount private,
-    /// no mandatory locks); everything else (MS_SHARED, MS_SLAVE,
-    /// MS_SYNCHRONOUS, MS_DIRSYNC, MS_NOSYMFOLLOW, ...) is EINVAL
-    /// instead of being ignored
+    /// already behaves that way (no atime updates, no mandatory locks);
+    /// everything else (MS_SYNCHRONOUS, MS_DIRSYNC, MS_NOSYMFOLLOW, ...)
+    /// is EINVAL instead of being ignored
     pub const KNOWN: u64 = RDONLY
         | BIND
         | MOVE
@@ -73,6 +74,8 @@ mod ms {
         | POSIXACL
         | UNBINDABLE
         | PRIVATE
+        | SLAVE
+        | SHARED
         | RELATIME
         | I_VERSION
         | STRICTATIME
@@ -119,18 +122,26 @@ fn reconfigure_mnt(m: &Arc<super::mount::Mount>, flags: u64) -> Result<(), Kerne
     m.set_flags(mnt_flags(flags))
 }
 
-/// MS_UNBINDABLE / MS_PRIVATE (Linux do_change_type): unbindable or
-/// not, for the subtree with MS_REC
+/// MS_SHARED / MS_SLAVE / MS_PRIVATE / MS_UNBINDABLE (Linux
+/// do_change_type): exactly one type (else EINVAL), for the subtree
+/// with MS_REC
 fn change_type(m: &Arc<super::mount::Mount>, flags: u64) -> Result<(), KernelError> {
-    use super::mount::{MNT_UNBINDABLE, NAMESPACE_SEM};
-    let _ns = NAMESPACE_SEM.write();
-    let on = flags & ms::UNBINDABLE != 0;
-    let mut todo = alloc::vec![m.clone()];
-    while let Some(c) = todo.pop() {
-        c.mark(MNT_UNBINDABLE, on);
-        if flags & ms::REC != 0 {
-            todo.extend(c.children.read().iter().cloned());
-        }
+    use super::pnode::{Prop, change_propagation, subtree};
+    let p = match flags & !(ms::REC | ms::SILENT) {
+        ms::SHARED => Prop::Shared,
+        ms::SLAVE => Prop::Slave,
+        ms::PRIVATE => Prop::Private,
+        ms::UNBINDABLE => Prop::Unbindable,
+        _ => return Err(KernelError::InvalidArgument),
+    };
+    let _ns = super::mount::NAMESPACE_SEM.write();
+    let targets = if flags & ms::REC != 0 {
+        subtree(m)
+    } else {
+        alloc::vec![m.clone()]
+    };
+    for t in targets {
+        change_propagation(&t, p);
     }
     Ok(())
 }
@@ -224,7 +235,7 @@ fn path_mount(
         }
         return super::mount::do_loopback(&old?, &mp, flags & ms::REC != 0);
     }
-    if flags & (ms::PRIVATE | ms::UNBINDABLE) != 0 {
+    if flags & (ms::SHARED | ms::SLAVE | ms::PRIVATE | ms::UNBINDABLE) != 0 {
         return change_type(&mount_at(&mp)?, flags);
     }
     if flags & ms::MOVE != 0 {

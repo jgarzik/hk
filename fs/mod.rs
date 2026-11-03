@@ -16,6 +16,7 @@ pub mod mount;
 pub mod name;
 pub mod namei;
 pub mod path_ref;
+pub mod pnode;
 pub mod splice;
 pub mod superblock;
 pub mod syscall;

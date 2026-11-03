@@ -8,9 +8,7 @@ use alloc::vec::Vec;
 
 use super::super::Path;
 use super::super::dentry::{d_path, dentry_path};
-use super::super::mount::{
-    MNT_NODEV, MNT_NOEXEC, MNT_NOSUID, MNT_READONLY, MNT_UNBINDABLE, Mount, NAMESPACE_SEM,
-};
+use super::super::mount::{MNT_NODEV, MNT_NOEXEC, MNT_NOSUID, MNT_READONLY, Mount, NAMESPACE_SEM};
 use super::super::name::mangle;
 use super::get_tid_for_pid;
 use crate::task::Pid;
@@ -86,7 +84,8 @@ pub fn show_mounts(pid: Pid) -> Vec<u8> {
 pub fn show_mountinfo(pid: Pid) -> Vec<u8> {
     use alloc::fmt::Write;
     let mut out = Vec::new();
-    for (m, mp) in visible(pid) {
+    let vis = visible(pid);
+    for (m, mp) in vis.iter().cloned() {
         // The namespace root's parent is itself (Linux: its mnt_parent)
         let parent = m.get_parent().map_or(m.mnt_id, |p| p.mnt_id);
         let dev = m.sb.dev_id;
@@ -106,9 +105,13 @@ pub fn show_mountinfo(pid: Pid) -> Vec<u8> {
         out.push(b' ');
         // The mount's own read-only flag (Linux show_mountinfo)
         mnt_opts(&mut out, &m, m.flags() & MNT_READONLY != 0);
-        if m.flags() & MNT_UNBINDABLE != 0 {
-            out.extend_from_slice(b" unbindable");
-        }
+        // A group has a member the reader sees (propagate_from)
+        let sees = |g: u32| {
+            super::super::pnode::peers(g)
+                .iter()
+                .any(|p| vis.iter().any(|(v, _)| Arc::ptr_eq(v, p)))
+        };
+        out.extend_from_slice(&super::super::pnode::optional_fields(&m, &sees));
         out.extend_from_slice(b" - ");
         mangle(&mut out, m.sb.fs_type.name.as_bytes(), ESC_HASH);
         out.push(b' ');

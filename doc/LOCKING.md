@@ -1738,6 +1738,9 @@ umount writes the filesystem back after releasing NAMESPACE_SEM
 namespace_unlock). Mount ids come from `MNT_IDS` (spin Mutex leaf,
 Linux mnt_id_ida) and `MNT_ID_UNIQUE` (atomic). Deviation: no global
 (parent, mountpoint) hash; crossing scans the current mount's children.
+Propagation (`fs/pnode.rs`) runs entirely under NAMESPACE_SEM (write):
+peer groups live in `pnode::GROUPS` (spin Mutex, leaf: never held
+across a call into the mount tree or a d_lock).
 
 **Lock Order for Path Traversal (follow_mount, lookup_mnt):**
 ```
