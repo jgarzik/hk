@@ -108,7 +108,7 @@ pub struct Termios2 {
 
 /// Window size structure (Linux ABI-compatible)
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Winsize {
     /// Number of rows
     pub ws_row: u16,

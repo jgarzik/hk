@@ -38,6 +38,8 @@ pub mod flags {
     pub const O_CREAT: u32 = 0o100;
     /// Fail if file exists (with O_CREAT)
     pub const O_EXCL: u32 = 0o200;
+    /// Don't make a tty the controlling terminal
+    pub const O_NOCTTY: u32 = 0o400;
     /// Truncate file to zero length
     pub const O_TRUNC: u32 = 0o1000;
     /// Append mode

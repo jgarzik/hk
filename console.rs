@@ -65,6 +65,11 @@ pub trait ConsoleDriver: Send + Sync {
 
     /// Flush any buffered output
     fn flush(&self) {}
+
+    /// The tty behind the console, if it is one (Linux console->device)
+    fn tty(&'static self) -> Option<&'static crate::tty::Tty> {
+        None
+    }
 }
 
 /// Console priority - higher priority consoles are preferred
@@ -456,6 +461,13 @@ pub fn console_write(data: &[u8]) {
 /// Flush all registered consoles
 pub fn console_flush() {
     CONSOLE_REGISTRY.lock().flush_all();
+}
+
+/// The tty of the first enabled console that has one: /dev/console's
+/// (Linux console_device)
+pub fn console_tty() -> Option<&'static crate::tty::Tty> {
+    let snapshot = CONSOLE_REGISTRY.lock().enabled_consoles_snapshot();
+    snapshot.into_iter().flatten().find_map(|c| c.tty())
 }
 
 /// Check if any consoles are registered

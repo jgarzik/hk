@@ -30,16 +30,21 @@
 
 pub mod console_dev;
 pub mod ioctl;
+pub mod jobctrl;
 pub mod n_tty;
 pub mod termios;
 pub mod tty_dev;
+
+use alloc::sync::Arc;
 
 use crate::sync::spin::Mutex;
 
 use crate::console::ConsoleDriver;
 use crate::fs::File;
 use crate::fs::chardev::{CharDevice, DevId};
+use crate::fs::flags::O_NOCTTY;
 use crate::io::poll::{POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM, PollTable};
+use crate::task::Pid;
 use crate::util::error::KernelError;
 
 // Re-export commonly used types
@@ -235,22 +240,22 @@ impl InputBuffer {
     }
 }
 
-/// TTY internal state (protected by mutex)
-struct TtyState {
+/// Job control state (Linux tty->ctrl and winsize)
+struct TtyCtrl {
     /// Window size
     winsize: Winsize,
-    /// Session ID that owns this TTY
-    session: Option<u32>,
-    /// Foreground process group ID
-    foreground_pgrp: Option<u32>,
+    /// The session whose controlling tty this is
+    session: Option<Pid>,
+    /// Foreground process group
+    pgrp: Option<Pid>,
 }
 
-impl TtyState {
+impl TtyCtrl {
     const fn new() -> Self {
         Self {
             winsize: Winsize::default_console(),
             session: None,
-            foreground_pgrp: None,
+            pgrp: None,
         }
     }
 }
@@ -272,8 +277,8 @@ pub struct Tty {
     driver: &'static dyn TtyDriver,
     /// Input buffer (from hardware)
     input: Mutex<InputBuffer>,
-    /// TTY state (winsize, session info)
-    state: Mutex<TtyState>,
+    /// Session, foreground group, window size
+    ctrl: Mutex<TtyCtrl>,
 }
 
 impl Tty {
@@ -291,7 +296,7 @@ impl Tty {
             ldisc,
             driver,
             input: Mutex::new(InputBuffer::new()),
-            state: Mutex::new(TtyState::new()),
+            ctrl: Mutex::new(TtyCtrl::new()),
         }
     }
 
@@ -336,12 +341,23 @@ impl Tty {
 
     /// Get the window size
     pub fn get_winsize(&self) -> Winsize {
-        self.state.lock().winsize
+        self.ctrl.lock().winsize
     }
 
-    /// Set the window size
-    pub fn set_winsize(&self, winsize: Winsize) {
-        self.state.lock().winsize = winsize;
+    /// Set the window size; a new one signals the foreground process
+    /// group with SIGWINCH (Linux tty_do_resize)
+    pub fn resize(&self, ws: Winsize) {
+        let pgrp = {
+            let mut c = self.ctrl.lock();
+            if c.winsize == ws {
+                return;
+            }
+            c.winsize = ws;
+            c.pgrp
+        };
+        if let Some(pg) = pgrp {
+            crate::signal::send_signal_to_pgrp(pg, crate::signal::SIGWINCH);
+        }
     }
 
     /// Get the number of bytes available to read
@@ -349,31 +365,14 @@ impl Tty {
         self.input.lock().available()
     }
 
-    /// Get the foreground process group
-    pub fn get_foreground_pgrp(&self) -> Option<u32> {
-        self.state.lock().foreground_pgrp
+    /// The foreground process group
+    pub fn pgrp(&self) -> Option<Pid> {
+        self.ctrl.lock().pgrp
     }
 
-    /// Set the foreground process group
-    pub fn set_foreground_pgrp(&self, pgrp: u32) {
-        self.state.lock().foreground_pgrp = Some(pgrp);
-    }
-
-    /// Get the session ID
-    pub fn get_session(&self) -> Option<u32> {
-        self.state.lock().session
-    }
-
-    /// Set the session ID
-    pub fn set_session(&self, sid: u32) {
-        self.state.lock().session = Some(sid);
-    }
-
-    /// Clear the session ID (give up controlling terminal)
-    pub fn clear_session(&self) {
-        let mut state = self.state.lock();
-        state.session = None;
-        state.foreground_pgrp = None;
+    /// The session whose controlling tty this is
+    pub fn session(&self) -> Option<Pid> {
+        self.ctrl.lock().session
     }
 
     /// Get the line discipline number
@@ -404,6 +403,13 @@ impl CharDevice for Tty {
         self.name
     }
 
+    fn open(&self, file: &File) -> Result<(), KernelError> {
+        if file.get_flags() & O_NOCTTY == 0 {
+            jobctrl::open_set_tty(self, file);
+        }
+        Ok(())
+    }
+
     fn read(&self, _file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {
         let mut input = self.input.lock();
         let mut count = 0;
@@ -429,8 +435,8 @@ impl CharDevice for Tty {
         self.ldisc.write(self, buf)
     }
 
-    fn ioctl(&self, _file: &File, cmd: u32, arg: u64) -> Result<i64, KernelError> {
-        ioctl::tty_ioctl(self, cmd, arg)
+    fn ioctl(&self, file: &File, cmd: u32, arg: u64) -> Result<i64, KernelError> {
+        ioctl::tty_ioctl(self, file, cmd, arg)
     }
 
     fn poll(&self, _file: &File, _pt: Option<&mut PollTable>) -> u16 {
@@ -462,6 +468,33 @@ impl ConsoleDriver for Tty {
 
     fn flush(&self) {
         self.driver.flush();
+    }
+
+    fn tty(&'static self) -> Option<&'static Tty> {
+        Some(self)
+    }
+}
+
+/// Every tty (the serial ports')
+pub fn all() -> &'static [&'static Tty] {
+    crate::arch::serial_ttys()
+}
+
+/// The tty a /dev/tty or /dev/console file works on (its private
+/// data; Linux points such a file at the tty itself)
+struct Redirect(&'static Tty);
+
+impl Redirect {
+    /// Point `file` at `tty` (at open)
+    fn set(file: &File, tty: &'static Tty) {
+        file.private.call_once(|| Arc::new(Redirect(tty)));
+    }
+
+    /// The tty `file` was pointed at
+    fn tty(file: &File) -> Result<&'static Tty, KernelError> {
+        file.private_ref::<Redirect>()
+            .map(|r| r.0)
+            .ok_or(KernelError::Io)
     }
 }
 
@@ -501,7 +534,6 @@ impl CharDevice for TtyChar {
 /// Called from init_vfs() after heap is available.
 pub fn init_tty_chardevs() {
     use crate::fs::chardev::{major, register_chardev};
-    use alloc::sync::Arc;
 
     // The serial ports (Linux uart_register_driver)
     for &tty in crate::arch::serial_ttys() {
@@ -509,11 +541,11 @@ pub fn init_tty_chardevs() {
     }
 
     // Register /dev/tty (major 5, minor 0) - controlling terminal
-    let tty_dev = Arc::new(tty_dev::TtyCharDevice::new());
+    let tty_dev = Arc::new(tty_dev::TtyCharDevice);
     let _ = register_chardev(DevId::new(major::TTYAUX, 0), tty_dev);
 
     // Register /dev/console (major 5, minor 1) - kernel console
-    let console_dev = Arc::new(console_dev::ConsoleCharDevice::new());
+    let console_dev = Arc::new(console_dev::ConsoleCharDevice);
     let _ = register_chardev(DevId::new(major::TTYAUX, 1), console_dev);
 }
 

@@ -367,8 +367,8 @@ impl LineDiscipline for NTtyLdisc {
                 self.echo_char(tty, processed, &termios);
             }
             // Send signal to foreground process group
-            if let Some(pgrp) = tty.get_foreground_pgrp() {
-                crate::signal::send_signal_to_pgrp(pgrp as u64, sig);
+            if let Some(pgrp) = tty.pgrp() {
+                crate::signal::send_signal_to_pgrp(pgrp, sig);
             }
             // Don't queue the character when it generates a signal
             return;

@@ -2553,6 +2553,9 @@ pub fn exit_current(status: Option<i32>) -> ! {
         // go (Linux close_files -> filp_flush -> locks_remove_posix)
         if group_dead {
             crate::fs::posix_lock::release_all_posix_locks_for_pid(current_pid());
+            // A session leader's session loses its controlling tty
+            // (Linux do_exit -> disassociate_ctty(1))
+            crate::tty::jobctrl::disassociate_ctty();
         }
 
         // Clean up SysV semaphore undo list for exiting task

@@ -2781,7 +2781,19 @@ Each `Tty` struct contains:
 |------|------|---------|
 | `termios` | `Mutex<Termios>` | Terminal I/O settings (baud, echo, etc.) |
 | `input` | `Mutex<InputBuffer>` | Hardware input ring buffer |
-| `state` | `Mutex<TtyState>` | Session ID, foreground group |
+| `ctrl` | `Mutex<TtyCtrl>` | Session, foreground group, window size (Linux `ctrl.lock` + `winsize_mutex`) |
+
+All are spin `Mutex`es taken in thread context only, briefly, one at a
+time, and never across a signal, a sleep or a driver write: the
+SIGWINCH of TIOCSWINSZ and the SIGHUP/SIGCONT of giving up a
+controlling tty are sent after `ctrl` is dropped.
+
+`tty::jobctrl::CTTY_LOCK` (spin `Mutex`, thread context; Linux tty_lock
++ siglock in `__proc_set_tty`/`session_clear_tty`) serializes giving and
+taking controlling ttys (open without O_NOCTTY, TIOCSCTTY, TIOCNOTTY, a
+session leader's exit), so a session never gets two. Order: `CTTY_LOCK`
+→ `Tty.ctrl`. TIOCSPGRP looks the group up (TASKLIST) before taking
+`ctrl`.
 
 #### Graphics Console Lock
 
@@ -2801,7 +2813,7 @@ PRINTK (IrqSpinlock, ring buffer, brief hold during write)
     ↓
 CONSOLE_REGISTRY (IrqSpinlock, console dispatch to drivers)
     ↓
-Per-TTY locks (Mutex: termios, input, state) - independent between TTYs
+Per-TTY locks (Mutex: termios, input, ctrl) - independent between TTYs
     ↓
 GfxConsole.state (Mutex, if graphics console receives output)
 ```
