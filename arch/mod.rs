@@ -269,8 +269,6 @@ pub enum MapError {
     InvalidArgument,
     /// Address is not properly aligned (e.g., for huge pages)
     InvalidAddress,
-    /// Address is not mapped (for unmap/split operations)
-    NotMapped,
 }
 
 /// A user mapping met while tearing down an address space
@@ -294,15 +292,6 @@ pub enum Leaf {
 pub trait PageTable: Sized {
     type VirtAddr: Copy;
     type PhysAddr: Copy;
-
-    /// Map a virtual address to a physical address with given flags
-    ///
-    /// Note: This assumes intermediate page tables already exist.
-    /// For general use, prefer `map_with_alloc`.
-    fn map(&mut self, va: Self::VirtAddr, pa: Self::PhysAddr, flags: PageFlags);
-
-    /// Unmap a virtual address
-    fn unmap(&mut self, va: Self::VirtAddr);
 
     /// Translate a virtual address to a physical address
     fn translate(&self, va: Self::VirtAddr) -> Option<Self::PhysAddr>;
