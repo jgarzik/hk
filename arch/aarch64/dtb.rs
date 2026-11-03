@@ -454,10 +454,8 @@ pub fn init_numa_topology() -> Result<bool, &'static str> {
                         topology.node_online_mask |= 1u64 << node_id;
                     }
 
-                    // Add CPU to node's cpu_mask
-                    if cpu_id < 64
-                        && let Some(ref mut node) = topology.nodes[node_id]
-                    {
+                    // Add the CPU to the node's CPUs
+                    if let Some(ref mut node) = topology.nodes[node_id] {
                         node.add_cpu(cpu_id);
                     }
                 }

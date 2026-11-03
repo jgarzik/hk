@@ -81,6 +81,11 @@ impl Default for CpuMask {
 }
 
 impl CpuSet {
+    /// No CPUs
+    pub const fn new() -> Self {
+        CpuSet([0; WORDS])
+    }
+
     /// Every possible CPU (Linux CPU_MASK_ALL)
     pub fn all() -> Self {
         Self::first(NR_CPUS as u32)

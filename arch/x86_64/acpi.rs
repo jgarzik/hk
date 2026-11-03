@@ -838,7 +838,7 @@ fn parse_srat_mapped(srat_phys: u64) -> Result<(), &'static str> {
                         if node_id < MAX_NUMA_NODES && (apic_id as usize) < MAX_CPUS {
                             topology.cpu_to_node[apic_id as usize] = node_id as u8;
 
-                            // Also add CPU to node's cpu_mask
+                            // Also add the CPU to the node's CPUs
                             if let Some(ref mut node) = topology.nodes[node_id] {
                                 node.add_cpu(apic_id);
                             }
@@ -863,10 +863,8 @@ fn parse_srat_mapped(srat_phys: u64) -> Result<(), &'static str> {
                         if node_id < MAX_NUMA_NODES && (x2apic_id as usize) < MAX_CPUS {
                             topology.cpu_to_node[x2apic_id as usize] = node_id as u8;
 
-                            // Also add CPU to node's cpu_mask (only if < 64)
-                            if x2apic_id < 64
-                                && let Some(ref mut node) = topology.nodes[node_id]
-                            {
+                            // Also add the CPU to the node's CPUs
+                            if let Some(ref mut node) = topology.nodes[node_id] {
                                 node.add_cpu(x2apic_id);
                             }
                         }

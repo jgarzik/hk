@@ -9,7 +9,7 @@
 //! as having a single NUMA node (node 0) containing all CPUs and memory.
 
 use crate::arch::IrqSpinlock;
-use crate::util::cpumask::NR_CPUS;
+use crate::util::cpumask::{CpuSet, NR_CPUS};
 
 /// Maximum number of NUMA nodes supported
 pub const MAX_NUMA_NODES: usize = 64;
@@ -34,8 +34,8 @@ pub struct NumaNode {
     pub end_pfn: u64,
     /// Total number of present pages on this node
     pub present_pages: u64,
-    /// Bitmask of CPUs belonging to this node (supports up to 64 CPUs per node)
-    pub cpu_mask: u64,
+    /// CPUs belonging to this node
+    pub cpus: CpuSet,
 }
 
 impl NumaNode {
@@ -46,22 +46,19 @@ impl NumaNode {
             start_pfn: 0,
             end_pfn: 0,
             present_pages: 0,
-            cpu_mask: 0,
+            cpus: CpuSet::new(),
         }
     }
 
     /// Check if a CPU belongs to this node
     pub fn has_cpu(&self, cpu_id: u32) -> bool {
-        if cpu_id >= 64 {
-            return false;
-        }
-        (self.cpu_mask & (1u64 << cpu_id)) != 0
+        (cpu_id as usize) < NR_CPUS && self.cpus.test(cpu_id)
     }
 
     /// Add a CPU to this node
     pub fn add_cpu(&mut self, cpu_id: u32) {
-        if cpu_id < 64 {
-            self.cpu_mask |= 1u64 << cpu_id;
+        if (cpu_id as usize) < NR_CPUS {
+            self.cpus.set(cpu_id);
         }
     }
 
@@ -117,7 +114,10 @@ impl NumaTopology {
         node.present_pages = total_pages;
 
         // Assign all CPUs to node 0
-        for (cpu, slot) in self.cpu_to_node[..nr_cpus.min(64)].iter_mut().enumerate() {
+        for (cpu, slot) in self.cpu_to_node[..nr_cpus.min(NR_CPUS)]
+            .iter_mut()
+            .enumerate()
+        {
             node.add_cpu(cpu as u32);
             *slot = 0;
         }
@@ -139,11 +139,9 @@ impl NumaTopology {
             return;
         }
 
-        // Update CPU-to-node mapping based on node's cpu_mask
-        for cpu in 0..64u32 {
-            if node.has_cpu(cpu) && (cpu as usize) < NR_CPUS {
-                self.cpu_to_node[cpu as usize] = node_id as u8;
-            }
+        // Update CPU-to-node mapping from the node's CPUs
+        for cpu in node.cpus.iter() {
+            self.cpu_to_node[cpu as usize] = node_id as u8;
         }
 
         self.nodes[node_id] = Some(node);
@@ -235,7 +233,7 @@ impl NumaTopology {
         if (cpu as usize) < NR_CPUS && (node as usize) < MAX_NUMA_NODES {
             self.cpu_to_node[cpu as usize] = node as u8;
 
-            // Also update the node's cpu_mask if node exists
+            // Also add it to the node's CPUs if the node exists
             if let Some(ref mut numa_node) = self.nodes[node as usize] {
                 numa_node.add_cpu(cpu);
             }
@@ -288,13 +286,12 @@ pub fn print_topology() {
     for (node_id, node) in topology.nodes.iter().enumerate() {
         if let Some(node) = node {
             let mb = node.memory_size() / (1024 * 1024);
-            let cpus = node.cpu_mask.count_ones();
             crate::printkln!(
-                "  node {}: {} MB, {} CPUs (mask: {:#x})",
+                "  node {}: {} MB, {} CPUs ({})",
                 node_id,
                 mb,
-                cpus,
-                node.cpu_mask
+                node.cpus.count(),
+                node.cpus.fmt_list()
             );
         }
     }
@@ -350,5 +347,26 @@ mod tests {
         assert_eq!(topology.cpu_to_node(3), 1);
         assert_eq!(topology.node_distance(0, 1), REMOTE_DISTANCE);
         assert_eq!(topology.node_distance(1, 0), REMOTE_DISTANCE);
+    }
+
+    #[test]
+    fn test_cpus_past_64() {
+        let mut topology = NumaTopology::new();
+        let mut node1 = NumaNode::new(1);
+        node1.add_cpu(64);
+        node1.add_cpu(255);
+        node1.add_cpu(256); // past NR_CPUS: ignored
+        assert!(node1.has_cpu(64) && node1.has_cpu(255));
+        assert!(!node1.has_cpu(256));
+        topology.add_node(node1);
+        assert_eq!(topology.cpu_to_node(64), 1);
+        assert_eq!(topology.cpu_to_node(255), 1);
+
+        topology.assign_cpu_to_node(100, 1);
+        assert!(topology.get_node(1).is_some_and(|n| n.has_cpu(100)));
+
+        let mut single = NumaTopology::new();
+        single.init_single_node(1024, 128);
+        assert!(single.get_node(0).is_some_and(|n| n.has_cpu(127)));
     }
 }
