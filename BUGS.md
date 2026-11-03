@@ -154,6 +154,29 @@ Missing:
   (Linux mlock_fixup fails with ENOMEM there). A locked mapping grown
   by mremap is not faulted in (Linux populates it).
 
+## NUMA gaps
+
+**Location**: `mm/numa.rs`, `mm/mempolicy.rs`, `mm/page_alloc.rs`
+
+Topology is discovered (ACPI SRAT/SLIT, DT `numa-node-id`) and
+getcpu reports it; nothing else uses it. Missing (Linux
+`mm/mempolicy.c`, `mm/migrate.c`):
+
+- `NumaNode.cpu_mask` is a `u64` but NR_CPUS is 256: CPUs 64 and up
+  are left out of it (`has_cpu`/`add_cpu`, `add_node`'s rebuild of
+  `cpu_to_node`, the boot dump) though `assign_cpu_to_node` maps them.
+  It should be a `cpumask`.
+- Policies are not stored: set_mempolicy and mbind validate and
+  return 0 (the `TaskMempolicy`/`Vma.mempolicy` fields stay default);
+  get_mempolicy always reports MPOL_LOCAL (Linux: the stored mode,
+  MPOL_DEFAULT when none) and ignores MPOL_F_NODE/MPOL_F_ADDR.
+- One buddy zone for all RAM: no per-node zones (pg_data_t) or
+  node-aware allocation, so no policy (BIND, PREFERRED, INTERLEAVE,
+  local) affects where pages come from.
+- No page migration: migrate_pages and move_pages validate and move
+  nothing; move_pages query mode reports node 0 for every page.
+- Nodemasks are one `u64` (64 nodes); no multi-node QEMU test config.
+
 ## exec ignores set-user-ID / set-group-ID bits and file capabilities
 
 **Location**: `task/exec.rs` (`do_execve`)
