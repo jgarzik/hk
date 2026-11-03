@@ -75,6 +75,23 @@ pub struct DevNode {
     pub mode: u16,
 }
 
+/// Serializes glue directories' creation and removal (Linux gdp_mutex;
+/// sleeping, before KERNFS_RWSEM)
+static GLUE: Mutex<()> = Mutex::new(());
+
+/// The parts of a device `add` registered
+#[derive(Clone, Copy, Default)]
+struct Added {
+    dir: bool,
+    class_link: bool,
+    class_list: bool,
+    sys_dev: bool,
+    devnode: bool,
+    bus: bool,
+    listed: bool,
+    announced: bool,
+}
+
 /// Bus-specific data of a device (Linux: the structure embedding it)
 pub type DevData = Arc<dyn Any + Send + Sync>;
 
@@ -140,8 +157,11 @@ pub struct Device {
     /// Explicit directory to go in (no parent device)
     dir: Option<Arc<KNode>>,
     kobj: Once<Arc<KNode>>,
-    /// Linux device_lock
-    pub lock: Mutex<()>,
+    /// Linux device_lock, guarding "deleted" (Linux p->dead): a dead
+    /// device is not bound again
+    pub lock: Mutex<bool>,
+    /// What `add` registered so far, for `del` and failure unwinding
+    added: SpinMutex<Added>,
     driver: RwLock<Option<&'static Driver>>,
     /// The bound driver's state (Linux drvdata)
     bound: SpinMutex<Option<Arc<dyn Bound>>>,
@@ -303,21 +323,30 @@ impl Device {
         }
     }
 
-    /// Linux device_add (sysfs and devtmpfs parts)
+    /// Linux device_add: each step it completes is recorded, so a
+    /// failure undoes exactly those (Linux's error unwinding)
     fn add(&self) -> Result<(), KernelError> {
-        let dir = self
-            .parent_dir()?
-            .create_dir_ns(self.name.as_bytes(), 0o755, self.ns)?;
+        let dir = {
+            // Glue directories are found or made, and the device's made
+            // in one, under GLUE (Linux gdp_mutex)
+            let _g = GLUE.lock();
+            self.parent_dir()?
+                .create_dir_ns(self.name.as_bytes(), 0o755, self.ns)?
+        };
         self.kobj.call_once(|| dir.clone());
+        self.added.lock().dir = true;
         dir.create_file(b"uevent", 0o644, Arc::new(UeventAttr(self.me.clone())))?;
+        let me = self.me.upgrade().expect("device alive");
         if let Some(c) = self.class {
             let cdir = c.dir();
             dir.create_link(b"subsystem", cdir)?;
             cdir.create_link_ns(self.name.as_bytes(), &dir, self.ns)?;
+            self.added.lock().class_link = true;
             if let Some(p) = &self.parent {
                 dir.create_link(b"device", p.kobj())?;
             }
-            c.add_device(self.me.upgrade().expect("device alive"));
+            c.add_device(me.clone());
+            self.added.lock().class_list = true;
         }
         if let Some(dt) = self.devt {
             dir.create_file(
@@ -329,43 +358,80 @@ impl Device {
             )?;
             let mm = alloc::format!("{}:{}", dt.major, dt.minor);
             self.sys_dev_dir().create_link(mm.as_bytes(), &dir)?;
+            self.added.lock().sys_dev = true;
             let n = self.devnode();
             let mode = if n.mode != 0 { n.mode } else { 0o600 };
             crate::fs::devtmpfs::device_add(&n.name, dt, self.is_blk(), mode);
+            self.added.lock().devnode = true;
         }
-        let me = self.me.upgrade().expect("device alive");
         if let Some(f) = self.attrs {
             f(&me)?;
         }
         if let Some(b) = self.bus {
             b.add_device(&me)?;
+            self.added.lock().bus = true;
         }
         DEVICES_LIST.lock().push(me.clone());
+        self.added.lock().listed = true;
         super::uevent::uevent(self, super::uevent::Action::Add);
+        self.added.lock().announced = true;
         if self.bus.is_some_and(|b| b.autoprobe()) {
             super::dd::device_attach(&me);
         }
         Ok(())
     }
 
-    /// Linux device_del: unbind, then undo `device_add`
+    /// Linux device_del: marked dead (no new binding), off its bus's
+    /// list, unbound, announced gone, then its entries removed
     pub fn del(self: &Arc<Self>) {
-        let Some(dir) = self.kobj.get() else { return };
-        if let Some(b) = self.bus {
+        *self.lock.lock() = true;
+        let added = *self.added.lock();
+        if added.bus
+            && let Some(b) = self.bus
+        {
+            b.remove_device(self);
+            self.added.lock().bus = false;
             super::dd::device_release_driver(self);
+        }
+        if added.announced {
+            super::uevent::uevent(self, super::uevent::Action::Remove);
+        }
+        self.undo();
+    }
+
+    /// Remove what `add` made (per `added`), the directory last
+    fn undo(self: &Arc<Self>) {
+        let a = core::mem::take(&mut *self.added.lock());
+        if a.listed {
+            DEVICES_LIST.lock().retain(|d| !Arc::ptr_eq(d, self));
+        }
+        if a.bus
+            && let Some(b) = self.bus
+        {
             b.remove_device(self);
         }
-        DEVICES_LIST.lock().retain(|d| !Arc::ptr_eq(d, self));
-        super::uevent::uevent(self, super::uevent::Action::Remove);
         if let Some(dt) = self.devt {
-            crate::fs::devtmpfs::device_del(&self.devnode().name);
-            let mm = alloc::format!("{}:{}", dt.major, dt.minor);
-            self.sys_dev_dir().remove_child(mm.as_bytes());
+            if a.devnode {
+                crate::fs::devtmpfs::device_del(&self.devnode().name);
+            }
+            if a.sys_dev {
+                let mm = alloc::format!("{}:{}", dt.major, dt.minor);
+                self.sys_dev_dir().remove_child(mm.as_bytes());
+            }
         }
         if let Some(c) = self.class {
-            c.dir().remove_child_ns(self.name.as_bytes(), self.ns);
-            c.remove_device(self);
+            if a.class_link {
+                c.dir().remove_child_ns(self.name.as_bytes(), self.ns);
+            }
+            if a.class_list {
+                c.remove_device(self);
+            }
         }
+        if !a.dir {
+            return;
+        }
+        let Some(dir) = self.kobj.get() else { return };
+        let _g = GLUE.lock();
         let glue = dir.parent();
         dir.remove();
         // An emptied class glue directory goes too (cleanup_glue_dir)
@@ -392,13 +458,14 @@ pub fn device_create(info: DeviceInfo) -> Result<Arc<Device>, KernelError> {
         ns: info.ns,
         dir: info.dir,
         kobj: Once::new(),
-        lock: Mutex::new(()),
+        lock: Mutex::new(false),
+        added: SpinMutex::new(Added::default()),
         driver: RwLock::new(None),
         bound: SpinMutex::new(None),
         me: me.clone(),
     });
     if let Err(e) = d.add() {
-        d.del();
+        d.undo();
         return Err(e);
     }
     Ok(d)

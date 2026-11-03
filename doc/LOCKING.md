@@ -1733,7 +1733,14 @@ at a time, with no RENAME_LOCK held (d_move drops it first).
 | `sysfs::SBS` | spin Mutex, leaf | per-network-namespace superblocks, taken only in mount |
 
 Device model (base/): `Device.lock` (sync::Mutex, Linux device_lock)
-is held across a driver's probe and the release of its binding; a
+guards the device's "dead" flag, set first by `del` (a dead device is
+never bound again), and is held across a driver's probe and the
+release of its binding; `del` takes the device off its bus's list
+before unbinding it, so no new probe finds it. `core::GLUE`
+(sync::Mutex, Linux gdp_mutex) serializes finding or making a class
+glue directory with making the device's directory in it, and the
+emptied-glue removal: Device.lock -> GLUE -> KERNFS_RWSEM. `Device.added`
+(spin Mutex, leaf) records what registration completed. A
 probe may register child devices (their sysfs entries, uevents and
 probes), so a parent's lock is taken before its children's, never the
 reverse. `Device.driver` (spin RwLock) and `Device.bound` (spin Mutex)

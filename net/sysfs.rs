@@ -223,6 +223,22 @@ pub fn netdev_unregister_kobject(n: &NetDevice) {
     }
 }
 
+/// Remove a dropped namespace's devices from sysfs, from the system
+/// workqueue (Linux cleanup_net -> default_device_exit_batch)
+pub fn netns_exit(kdevs: Vec<Arc<Device>>) {
+    if kdevs.is_empty() {
+        return;
+    }
+    let mut pending = Some(kdevs);
+    let work = crate::task::workqueue::Work::new(move || {
+        for d in pending.take().unwrap_or_default() {
+            d.del();
+        }
+    });
+    let work = Arc::new(crate::sync::spin::Mutex::new(work));
+    crate::task::workqueue::SYSTEM_WQ.queue_work(work);
+}
+
 /// Linux netdev_kobject_init: the class, then the devices already
 /// registered in every namespace
 pub fn net_sysfs_init() {

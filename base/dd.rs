@@ -16,6 +16,9 @@ use crate::fs::KernelError;
 /// EBUSY if bound already; the probe's error otherwise
 pub fn driver_probe_device(drv: &'static Driver, dev: &Arc<Device>) -> Result<(), KernelError> {
     let _g = dev.lock.lock();
+    if *_g {
+        return Err(KernelError::NoDevice);
+    }
     if dev.driver().is_some() {
         return Err(KernelError::Busy);
     }

@@ -289,9 +289,15 @@ static NET_NAMESPACE_LIST: Mutex<Vec<Weak<NetNamespace>>> = Mutex::new(Vec::new(
 /// default_device_exit_batch unregistering them)
 impl Drop for NetNamespace {
     fn drop(&mut self) {
-        for d in self.devices.get_mut().iter() {
-            crate::net::sysfs::netdev_unregister_kobject(d);
-        }
+        let kdevs = self
+            .devices
+            .get_mut()
+            .iter()
+            .filter_map(|d| d.kdev.get().cloned())
+            .collect();
+        // Sleeping sysfs work: deferred (Linux cleanup_net runs from a
+        // workqueue); the last reference may drop in any context
+        crate::net::sysfs::netns_exit(kdevs);
     }
 }
 
