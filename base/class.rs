@@ -45,6 +45,18 @@ impl Class {
         }
     }
 
+    /// A class whose devices' uevents get `uevent`'s variables
+    pub const fn with_uevent(name: &'static str, uevent: super::bus::UeventFn) -> Self {
+        Self {
+            name,
+            devnode: None,
+            blk: false,
+            uevent: Some(uevent),
+            dir: Once::new(),
+            devices: Mutex::new(Vec::new()),
+        }
+    }
+
     /// A class of block devices
     pub const fn block(name: &'static str, uevent: Option<super::bus::UeventFn>) -> Self {
         Self {

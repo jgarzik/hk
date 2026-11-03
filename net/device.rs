@@ -266,6 +266,12 @@ pub struct NetDevice {
     /// dev->promiscuity / allmulti); changed under RTNL
     promiscuity: AtomicU32,
     allmulti: AtomicU32,
+
+    /// The hardware device it belongs to, set by the driver before
+    /// registration (Linux SET_NETDEV_DEV)
+    pub parent: spin::Once<Arc<crate::base::Device>>,
+    /// Its sysfs device (net/sysfs.rs)
+    pub kdev: spin::Once<Arc<crate::base::Device>>,
 }
 
 impl NetDevice {
@@ -289,6 +295,8 @@ impl NetDevice {
             carrier_changes: AtomicU32::new(0),
             promiscuity: AtomicU32::new(0),
             allmulti: AtomicU32::new(0),
+            parent: spin::Once::new(),
+            kdev: spin::Once::new(),
         }
     }
 

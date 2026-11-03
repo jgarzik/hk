@@ -1729,6 +1729,7 @@ at a time, with no RENAME_LOCK held (d_move drops it first).
 | `kernfs::KERNFS_RWSEM` | sync::RwSem (Linux kernfs_rwsem) | write: add, remove, rename a node; read: symlink target paths. Taken by subsystems registering objects (in thread context, under their own locks such as RTNL), never under a VFS lock, never across show()/store() |
 | `KNode.children`, `.name`, `.parent` | spin RwLock, leaves | alone (lookup, readdir under the walk's i_rwsem) or under KERNFS_RWSEM |
 | `OpenAttr.buf` | sync::Mutex (Linux kernfs_open_file.mutex), per open file | held across show()/store(), which take subsystem locks; under f_pos_lock for read/write |
+| `sysfs::SBS` | spin Mutex, leaf | per-network-namespace superblocks, taken only in mount |
 
 Device model (base/): `Device.lock` (sync::Mutex, Linux device_lock)
 is held across a driver's probe and the release of its binding; a
@@ -1743,6 +1744,10 @@ alone; lists are snapshotted before probing walks them.
 each bound driver's shutdown callback after dropping it, so callbacks
 (which may poll hardware or take driver locks such as `USB_CONTROLLER`)
 never run under it. `PciDev.driver_override` is a spin leaf.
+Net devices: `NetNamespace::register_device` drops the namespace's
+`devices` spin lock before creating the device's sysfs entries (under
+RTNL for driver registrations: RTNL -> KERNFS_RWSEM); a namespace's
+devices leave sysfs when it is dropped, in thread context.
 Block devices: a disk's partitions are registered and removed (their
 sysfs entries, devtmpfs nodes, uevents) under the disk's `open_mutex`:
 `Disk.open_mutex` -> KERNFS_RWSEM -> devtmpfs root i_rwsem. Their

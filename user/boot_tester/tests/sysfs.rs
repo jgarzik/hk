@@ -28,6 +28,7 @@ pub fn run_tests() {
     test_bus_pci();
     test_bus_virtio();
     test_block();
+    test_net();
     test_bus_usb();
 }
 
@@ -838,6 +839,75 @@ fn test_bus_usb() {
     }
     if !host_mode() && !(root_hub && storage) {
         return fail(N, b"hk: root hub or usb-storage interface", 0);
+    }
+    ok(N);
+}
+
+/// /sys/class/net/lo: its virtual device link, attributes and uevent;
+/// a new network namespace's sysfs mount shows only its own lo, while
+/// the mount made before keeps the old namespace's devices
+fn test_net() {
+    const N: &[u8] = b"SYSFS_NET";
+    use hk_syscall::{CLONE_NEWNET, sys_exit, sys_fork, sys_mkdir, sys_mount, sys_rmdir, sys_umount2, sys_unshare, sys_wait4};
+    if !link_is(b"/sys/class/net/lo\0", b"../../devices/virtual/net/lo") {
+        return fail(N, b"lo link", 0);
+    }
+    let checks: [(&[u8], &[u8]); 5] = [
+        (b"/sys/class/net/lo/ifindex\0", b"1\n"),
+        (b"/sys/class/net/lo/type\0", b"772\n"),
+        (b"/sys/class/net/lo/address\0", b"00:00:00:00:00:00\n"),
+        (b"/sys/class/net/lo/addr_len\0", b"6\n"),
+        (b"/sys/class/net/lo/uevent\0", b"INTERFACE=lo\nIFINDEX=1\n"),
+    ];
+    for (i, (p, want)) in checks.iter().enumerate() {
+        if !file_is(p, want) {
+            return fail(N, b"lo attribute", i as i64);
+        }
+    }
+    let mut f = [0u8; 32];
+    let n = read_file(b"/sys/class/net/lo/flags\0", &mut f).max(0) as usize;
+    let flags = f[..n]
+        .strip_prefix(b"0x")
+        .and_then(|v| v.strip_suffix(b"\n"))
+        .map(|v| v.iter().fold(0u32, |a, &c| a * 16 + (c as char).to_digit(16).unwrap_or(0)));
+    // IFF_UP | IFF_LOOPBACK (boot_tester brought lo up)
+    if flags.is_none_or(|fl| fl & 0x9 != 0x9) {
+        return fail(N, b"lo flags", n as i64);
+    }
+    let before = Names::of(b"/sys/class/net\0", DT_LNK).n;
+    let pid = sys_fork();
+    if pid == 0 {
+        if sys_unshare(CLONE_NEWNET) != 0 {
+            sys_exit(2);
+        }
+        let dir = b"/tmp/sysfs_netns\0";
+        sys_mkdir(dir.as_ptr(), 0o755);
+        let r = sys_mount(b"sysfs\0".as_ptr(), dir.as_ptr(), b"sysfs\0".as_ptr(), 0, 0);
+        if r != 0 {
+            sys_exit(3);
+        }
+        let new = Names::of(b"/tmp/sysfs_netns/class/net\0", DT_LNK);
+        let only_lo = new.n == 1 && new.get(0) == b"lo";
+        let lo1 = file_is(b"/tmp/sysfs_netns/class/net/lo/ifindex\0", b"1\n");
+        let old = Names::of(b"/sys/class/net\0", DT_LNK).n;
+        sys_umount2(dir.as_ptr(), 0);
+        sys_rmdir(dir.as_ptr());
+        let code = if !only_lo {
+            4
+        } else if !lo1 {
+            5
+        } else if old != before {
+            6
+        } else {
+            0
+        };
+        sys_exit(code);
+    }
+    let mut st: i32 = 0;
+    sys_wait4(pid, &mut st, 0, 0);
+    let code = (st >> 8) & 0xff;
+    if st & 0x7f != 0 || code != 0 {
+        return fail(N, b"netns child", code as i64);
     }
     ok(N);
 }

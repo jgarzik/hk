@@ -430,7 +430,7 @@ impl VirtioDriver for VirtioNetDriver {
 
     fn probe(
         &self,
-        _dev: &Arc<crate::base::Device>,
+        dev: &Arc<crate::base::Device>,
         vdev: Arc<VirtioDevice>,
     ) -> Result<Box<dyn crate::base::Bound>, KernelError> {
         let mac = read_mac(&vdev);
@@ -483,6 +483,7 @@ impl VirtioDriver for VirtioNetDriver {
             irq,
             if device.link_up() { "up" } else { "down" }
         );
+        netdev.parent.call_once(|| dev.clone());
         net::register_netdev(rtnl, Arc::clone(&netdev));
         Ok(Box::new(VirtioNetWrapper { netdev, device }))
     }

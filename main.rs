@@ -442,6 +442,7 @@ fn kmain() -> ! {
     fs::devtmpfs::init();
     base::driver_init();
     ksysfs::init();
+    net::sysfs::net_sysfs_init();
     chr_dev_init();
 
     // Device initcalls (Linux order: buses scanned, drivers registered,

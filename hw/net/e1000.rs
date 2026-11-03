@@ -733,6 +733,7 @@ fn e1000_probe(
         }
     }
 
+    netdev.parent.call_once(|| pdev.clone());
     net::register_netdev(rtnl, Arc::clone(&netdev));
 
     Ok(Box::new(E1000DeviceWrapper { netdev, device }))

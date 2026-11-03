@@ -5,9 +5,12 @@
 //! boot on, and each sysfs mount shows it through `vfs.rs`, which makes
 //! inodes on lookup.
 //!
-//! Children are kept in (hash, name) order (Linux kernfs_name_hash): the
-//! hash is the readdir position, so a directory listing resumes
-//! correctly while entries come and go.
+//! Children are kept in (hash, namespace, name) order (Linux
+//! kernfs_name_hash): the hash is the readdir position, so a directory
+//! listing resumes correctly while entries come and go. A node tagged
+//! with a network namespace (nonzero `ns`: net devices and their class
+//! links) is seen only through mounts of that namespace; one name may
+//! exist once per namespace (Linux KERNFS_NS).
 //!
 //! Attribute show/store run under an active reference (Linux
 //! kernfs_get_active), never under a tree lock. Removal deactivates the
@@ -120,8 +123,11 @@ pub struct AttrNode {
     poll: WaitQueue,
 }
 
-/// A directory's entries by (name hash, name)
-pub type Children = RwLock<BTreeMap<(u32, Vec<u8>), Arc<KNode>>>;
+/// A child's key: (name hash, namespace tag, name)
+type Key = (u32, u64, Vec<u8>);
+
+/// A directory's entries by key
+pub type Children = RwLock<BTreeMap<Key, Arc<KNode>>>;
 
 pub enum Kind {
     Dir(Children),
@@ -139,6 +145,8 @@ pub struct KNode {
     /// Permission bits
     pub mode: u16,
     pub ino: u64,
+    /// Namespace tag (0: untagged, visible in every mount)
+    pub ns: u64,
     pub kind: Kind,
     /// In-flight operations, plus `DEACTIVATED` once removal starts
     active: AtomicI32,
@@ -162,8 +170,8 @@ fn name_hash(name: &[u8]) -> u32 {
     }
 }
 
-fn key(name: &[u8]) -> (u32, Vec<u8>) {
-    (name_hash(name), name.to_vec())
+fn key(name: &[u8], ns: u64) -> Key {
+    (name_hash(name), ns, name.to_vec())
 }
 
 /// An active reference: the node is not removed while it is held
@@ -180,11 +188,16 @@ impl Drop for Active<'_> {
 
 impl KNode {
     fn new(name: &[u8], mode: u16, kind: Kind) -> Arc<Self> {
+        Self::new_ns(name, mode, kind, 0)
+    }
+
+    fn new_ns(name: &[u8], mode: u16, kind: Kind, ns: u64) -> Arc<Self> {
         Arc::new(Self {
             name: RwLock::new(name.to_vec()),
             parent: RwLock::new(Weak::new()),
             mode,
             ino: NEXT_INO.fetch_add(1, Ordering::Relaxed),
+            ns,
             kind,
             active: AtomicI32::new(0),
             drain: WaitQueue::new(),
@@ -239,24 +252,46 @@ impl KNode {
 
     /// Child `name`
     pub fn find(&self, name: &[u8]) -> Option<Arc<KNode>> {
-        self.children()?.read().get(&key(name)).cloned()
+        self.find_ns(name, 0)
     }
 
-    /// Children from readdir position `pos` on, as (position, node)
-    pub fn list_from(&self, pos: u32) -> Vec<(u32, Arc<KNode>)> {
+    /// Child `name` as a mount of namespace `ns` sees it: tagged with
+    /// `ns`, else untagged
+    pub fn find_ns(&self, name: &[u8], ns: u64) -> Option<Arc<KNode>> {
+        let c = self.children()?.read();
+        if ns != 0
+            && let Some(n) = c.get(&key(name, ns))
+        {
+            return Some(n.clone());
+        }
+        c.get(&key(name, 0)).cloned()
+    }
+
+    /// Children a mount of namespace `ns` sees, from readdir position
+    /// `pos` on, as (position, node)
+    pub fn list_from(&self, pos: u32, ns: u64) -> Vec<(u32, Arc<KNode>)> {
         let Some(c) = self.children() else {
             return Vec::new();
         };
         c.read()
-            .range((pos, Vec::new())..)
-            .map(|((h, _), n)| (*h, n.clone()))
+            .range((pos, 0, Vec::new())..)
+            .filter(|(_, n)| n.ns == 0 || n.ns == ns)
+            .map(|((h, _, _), n)| (*h, n.clone()))
             .collect()
     }
 
-    /// Number of child directories (st_nlink = this + 2)
-    pub fn subdirs(&self) -> u32 {
+    /// No children at all, of any namespace
+    pub fn is_empty(&self) -> bool {
+        self.children().is_none_or(|c| c.read().is_empty())
+    }
+
+    /// Child directories a mount of `ns` sees (st_nlink = this + 2)
+    pub fn subdirs(&self, ns: u64) -> u32 {
         self.children().map_or(0, |c| {
-            c.read().values().filter(|n| n.is_dir()).count() as u32
+            c.read()
+                .values()
+                .filter(|n| n.is_dir() && (n.ns == 0 || n.ns == ns))
+                .count() as u32
         })
     }
 
@@ -266,7 +301,7 @@ impl KNode {
             return Err(KernelError::NotFound);
         }
         let c = self.children().ok_or(KernelError::NotDirectory)?;
-        let k = key(&child.name.read());
+        let k = key(&child.name.read(), child.ns);
         let mut map = c.write();
         if map.contains_key(&k) {
             return Err(KernelError::AlreadyExists);
@@ -278,11 +313,18 @@ impl KNode {
 
     /// New directory `name` (EEXIST if taken)
     pub fn create_dir(self: &Arc<Self>, name: &[u8], mode: u16) -> Result<Arc<KNode>, KernelError> {
-        self.add(Self::new(
-            name,
-            mode,
-            Kind::Dir(RwLock::new(BTreeMap::new())),
-        ))
+        self.create_dir_ns(name, mode, 0)
+    }
+
+    /// New directory `name` tagged with namespace `ns`
+    pub fn create_dir_ns(
+        self: &Arc<Self>,
+        name: &[u8],
+        mode: u16,
+        ns: u64,
+    ) -> Result<Arc<KNode>, KernelError> {
+        let kind = Kind::Dir(RwLock::new(BTreeMap::new()));
+        self.add(Self::new_ns(name, mode, kind, ns))
     }
 
     /// New attribute `name` with permission bits `mode`
@@ -316,7 +358,18 @@ impl KNode {
         name: &[u8],
         target: &Arc<KNode>,
     ) -> Result<Arc<KNode>, KernelError> {
-        self.add(Self::new(name, 0o777, Kind::Link(Arc::downgrade(target))))
+        self.create_link_ns(name, target, 0)
+    }
+
+    /// New symlink `name` -> `target` tagged with namespace `ns`
+    pub fn create_link_ns(
+        self: &Arc<Self>,
+        name: &[u8],
+        target: &Arc<KNode>,
+        ns: u64,
+    ) -> Result<Arc<KNode>, KernelError> {
+        let kind = Kind::Link(Arc::downgrade(target));
+        self.add(Self::new_ns(name, 0o777, kind, ns))
     }
 
     /// The subtree rooted here, parents first
@@ -357,7 +410,7 @@ impl KNode {
         let _w = KERNFS_RWSEM.write();
         let Some(p) = self.parent() else { return };
         if let Some(c) = p.children() {
-            let k = key(&self.name.read());
+            let k = key(&self.name.read(), self.ns);
             let mut map = c.write();
             if map.get(&k).is_some_and(|n| Arc::ptr_eq(n, self)) {
                 map.remove(&k);
@@ -368,7 +421,15 @@ impl KNode {
 
     /// Remove child `name` if present (Linux kernfs_remove_by_name)
     pub fn remove_child(&self, name: &[u8]) {
-        if let Some(n) = self.find(name) {
+        self.remove_child_ns(name, 0);
+    }
+
+    /// Remove child `name` tagged with `ns`
+    pub fn remove_child_ns(&self, name: &[u8], ns: u64) {
+        let n = self
+            .children()
+            .and_then(|c| c.read().get(&key(name, ns)).cloned());
+        if let Some(n) = n {
             n.remove();
         }
     }

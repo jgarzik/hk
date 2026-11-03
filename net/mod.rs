@@ -77,6 +77,7 @@ pub mod sock;
 pub mod socket;
 pub mod syscall;
 pub mod sysctl;
+pub mod sysfs;
 pub mod tcp;
 pub mod udp;
 pub mod unix;

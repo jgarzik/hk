@@ -38,6 +38,29 @@ impl AsAny for KfInode {
 
 impl InodeData for KfInode {}
 
+/// A kernfs superblock's namespace: the network namespace whose tagged
+/// nodes its mount shows (Linux kernfs_super_info.ns)
+pub struct KfSuper {
+    pub ns: u64,
+}
+
+impl AsAny for KfSuper {
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+}
+
+impl crate::fs::superblock::SuperBlockData for KfSuper {}
+
+/// The namespace of `inode`'s mount
+fn sb_ns(inode: &Inode) -> u64 {
+    let Some(sb) = inode.superblock() else {
+        return 0;
+    };
+    let Some(p) = sb.get_private() else { return 0 };
+    p.as_any().downcast_ref::<KfSuper>().map_or(0, |k| k.ns)
+}
+
 /// The node behind `inode`
 pub fn knode(inode: &Inode) -> Option<Arc<KNode>> {
     let p = inode.get_private()?;
@@ -72,7 +95,7 @@ pub struct KernfsIops;
 impl InodeOps for KernfsIops {
     fn lookup(&self, dir: &Inode, name: &[u8]) -> Result<Arc<Inode>, KernelError> {
         let d = knode(dir).ok_or(KernelError::Io)?;
-        let kn = d.find(name).ok_or(KernelError::NotFound)?;
+        let kn = d.find_ns(name, sb_ns(dir)).ok_or(KernelError::NotFound)?;
         if kn.removed() {
             return Err(KernelError::NotFound);
         }
@@ -99,7 +122,7 @@ impl InodeOps for KernfsIops {
     /// st_nlink of a directory: subdirectories + 2
     fn getattr(&self, inode: &Inode) -> InodeAttr {
         let nlink = match knode(inode) {
-            Some(kn) if kn.is_dir() => kn.subdirs() + 2,
+            Some(kn) if kn.is_dir() => kn.subdirs(sb_ns(inode)) + 2,
             _ => 1,
         };
         InodeAttr {
@@ -314,7 +337,7 @@ impl FileOps for KernfsFops {
             }
         }
         let from = ctx.pos.clamp(2, i32::MAX as u64) as u32;
-        for (h, n) in kn.list_from(from) {
+        for (h, n) in kn.list_from(from, sb_ns(&inode)) {
             if n.removed() {
                 continue;
             }

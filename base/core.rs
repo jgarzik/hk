@@ -91,6 +91,9 @@ pub struct DeviceInfo<'a> {
     /// Adds the device's attributes before it is announced (Linux
     /// dev->groups and the bus's dev_groups)
     pub attrs: Option<AttrsFn>,
+    /// Network namespace tag of its directory and class link (0: none;
+    /// Linux kobject namespace of net devices)
+    pub ns: u64,
 }
 
 /// Creates a device's attribute files
@@ -108,6 +111,7 @@ impl DeviceInfo<'_> {
             devtype: None,
             data: None,
             attrs: None,
+            ns: 0,
         }
     }
 }
@@ -126,6 +130,8 @@ pub struct Device {
     pub devtype: Option<&'static str>,
     data: Option<DevData>,
     attrs: Option<AttrsFn>,
+    /// Network namespace tag (0: none)
+    pub ns: u64,
     kobj: Once<Arc<KNode>>,
     /// Linux device_lock
     pub lock: Mutex<()>,
@@ -289,13 +295,15 @@ impl Device {
 
     /// Linux device_add (sysfs and devtmpfs parts)
     fn add(&self) -> Result<(), KernelError> {
-        let dir = self.parent_dir()?.create_dir(self.name.as_bytes(), 0o755)?;
+        let dir = self
+            .parent_dir()?
+            .create_dir_ns(self.name.as_bytes(), 0o755, self.ns)?;
         self.kobj.call_once(|| dir.clone());
         dir.create_file(b"uevent", 0o644, Arc::new(UeventAttr(self.me.clone())))?;
         if let Some(c) = self.class {
             let cdir = c.dir();
             dir.create_link(b"subsystem", cdir)?;
-            cdir.create_link(self.name.as_bytes(), &dir)?;
+            cdir.create_link_ns(self.name.as_bytes(), &dir, self.ns)?;
             if let Some(p) = &self.parent {
                 dir.create_link(b"device", p.kobj())?;
             }
@@ -345,7 +353,7 @@ impl Device {
             self.sys_dev_dir().remove_child(mm.as_bytes());
         }
         if let Some(c) = self.class {
-            c.dir().remove_child(self.name.as_bytes());
+            c.dir().remove_child_ns(self.name.as_bytes(), self.ns);
             c.remove_device(self);
         }
         let glue = dir.parent();
@@ -353,7 +361,7 @@ impl Device {
         // An emptied class glue directory goes too (cleanup_glue_dir)
         if let (Some(g), Some(c)) = (glue, self.class)
             && g.name() == c.name.as_bytes()
-            && g.list_from(0).is_empty()
+            && g.is_empty()
         {
             g.remove();
         }
@@ -371,6 +379,7 @@ pub fn device_create(info: DeviceInfo) -> Result<Arc<Device>, KernelError> {
         devtype: info.devtype,
         data: info.data,
         attrs: info.attrs,
+        ns: info.ns,
         kobj: Once::new(),
         lock: Mutex::new(()),
         driver: RwLock::new(None),

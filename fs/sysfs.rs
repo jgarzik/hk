@@ -1,10 +1,12 @@
 //! sysfs: the kernfs tree mounted at /sys (Linux fs/sysfs)
 //!
-//! One tree; every mount shows the same superblock (Linux mounts of one
-//! network namespace share theirs). Subsystems hang their directories
-//! off `root()` as they initialize.
+//! One tree; each network namespace's mounts share one superblock, which
+//! shows the nodes tagged with that namespace (net devices) besides the
+//! untagged ones (Linux sysfs_get_tree: kobj_ns_grab_current(NET)).
+//! Subsystems hang their directories off `root()` as they initialize.
 
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
+use alloc::vec::Vec;
 
 use spin::Once;
 
@@ -13,12 +15,15 @@ use super::dentry::Dentry;
 use super::inode::{Inode, InodeMode, InodeOps};
 use super::kernfs::{self, KNode};
 use super::superblock::{FileSystemType, StatFs, SuperBlock, SuperOps, fs_flags};
+use crate::sync::spin::Mutex;
 
 /// Linux SYSFS_MAGIC
 pub const SYSFS_MAGIC: u64 = 0x6265_6572;
 
 static ROOT: Once<Arc<KNode>> = Once::new();
-static SB: Once<Arc<SuperBlock>> = Once::new();
+/// Superblock of each network namespace's mounts, by namespace id
+/// (spin leaf)
+static SBS: Mutex<Vec<(u64, Weak<SuperBlock>)>> = Mutex::new(Vec::new());
 
 /// The root of /sys
 pub fn root() -> &'static Arc<KNode> {
@@ -60,14 +65,22 @@ impl SuperOps for SysfsSops {
 static SYSFS_SOPS: SysfsSops = SysfsSops;
 
 fn mount(t: &'static FileSystemType, _opts: &[u8]) -> Result<Arc<SuperBlock>, KernelError> {
-    Ok(SB
-        .call_once(|| {
-            let sb = SuperBlock::new(t, &SYSFS_SOPS, 0);
-            let ri = kernfs::vfs::inode(&sb, root());
-            sb.set_root(Arc::new(Dentry::new_root(ri, Arc::downgrade(&sb))));
-            sb
-        })
-        .clone())
+    let ns = crate::net::current_net_ns().id;
+    let mut sbs = SBS.lock();
+    sbs.retain(|(_, w)| w.strong_count() > 0);
+    if let Some(sb) = sbs
+        .iter()
+        .find(|(n, _)| *n == ns)
+        .and_then(|(_, w)| w.upgrade())
+    {
+        return Ok(sb);
+    }
+    let sb = SuperBlock::new(t, &SYSFS_SOPS, 0);
+    sb.set_private(Arc::new(kernfs::vfs::KfSuper { ns }));
+    let ri = kernfs::vfs::inode(&sb, root());
+    sb.set_root(Arc::new(Dentry::new_root(ri, Arc::downgrade(&sb))));
+    sbs.push((ns, Arc::downgrade(&sb)));
+    Ok(sb)
 }
 
 pub static SYSFS_TYPE: FileSystemType = FileSystemType {

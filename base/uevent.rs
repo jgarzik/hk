@@ -59,11 +59,21 @@ pub fn uevent_env(dev: &Device, action: Action, ext: &[Vec<u8>]) {
         action,
         ext,
         dev.uevent_env(),
+        dev.ns,
     );
 }
 
-/// Build and broadcast one event of the object at `devpath`
-fn send(devpath: &[u8], subsystem: &[u8], action: Action, ext: &[Vec<u8>], own: Vec<Vec<u8>>) {
+/// Build and broadcast one event of the object at `devpath`: into
+/// namespace `ns` only if tagged, else into every one (Linux
+/// kobject_uevent_net_broadcast)
+fn send(
+    devpath: &[u8],
+    subsystem: &[u8],
+    action: Action,
+    ext: &[Vec<u8>],
+    own: Vec<Vec<u8>>,
+    ns: u64,
+) {
     let mut env: Vec<Vec<u8>> = Vec::new();
     env.push([b"ACTION=", action.name()].concat());
     env.push([b"DEVPATH=", devpath].concat());
@@ -81,6 +91,9 @@ fn send(devpath: &[u8], subsystem: &[u8], action: Action, ext: &[Vec<u8>], own: 
         msg.push(0);
     }
     for net in crate::ns::net::all_net_ns() {
+        if ns != 0 && net.id != ns {
+            continue;
+        }
         netlink::broadcast(
             &net,
             NETLINK_KOBJECT_UEVENT,
@@ -158,6 +171,6 @@ pub fn synth_uevent(dev: &Device, buf: &[u8]) -> Result<(), KernelError> {
 /// directory) at `devpath`
 pub fn synth_kobj(devpath: &[u8], subsystem: &[u8], buf: &[u8]) -> Result<(), KernelError> {
     let (action, ext) = synth_parse(buf)?;
-    send(devpath, subsystem, action, &ext, Vec::new());
+    send(devpath, subsystem, action, &ext, Vec::new(), 0);
     Ok(())
 }
