@@ -1,0 +1,286 @@
+//! Cross-CPU function calls and the reschedule IPI (Linux kernel/smp.c)
+//!
+//! [`smp_call_function_many`] runs `func(info)` on other CPUs from their
+//! call-function IPI and, with `wait`, returns once every one has
+//! finished. Each target has a lock-free queue of pending calls
+//! (`QUEUE`, Linux call_single_queue: an llist); each sender has one
+//! call slot per target (`CFD`, Linux cfd_data). The queue is a LIFO
+//! that many CPUs push onto (compare-and-swap) and only its owner
+//! empties (one swap), so there is no ABA problem, no lock to order
+//! against others and no interrupt masking on the sending side. Only
+//! the first push onto an empty queue sends the IPI: whoever finds the
+//! queue non-empty knows an IPI is on its way or the owner has not
+//! emptied it yet.
+//!
+//! Waiting (for a call to finish, or for a slot reused before its last
+//! call finished) never blocks this CPU's own queue: the wait loop runs
+//! the calls queued here (`poll`), so two CPUs calling each other, or
+//! a sender whose interrupts are off, make progress. Calls
+//! must not be made from interrupt context or with an IrqSpinlock held
+//! (a target spinning on that lock with interrupts off would never
+//! answer: doc/LOCKING.md, Cross-CPU Calls).
+
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering, fence};
+
+use crate::arch::{CurrentArch, HaltOps, PerCpuOps, local_irq_restore, local_irq_save};
+use alloc::boxed::Box;
+use spin::Once;
+
+use crate::cpu::{PerCpu, nr_cpu_ids, this_id};
+use crate::util::cpumask::{CpuMask, CpuSet};
+
+/// One call (Linux call_single_data)
+struct Csd {
+    /// Next queued call (the queue is a singly linked list)
+    next: AtomicPtr<Csd>,
+    /// `fn(usize)` to run
+    func: AtomicUsize,
+    info: AtomicUsize,
+    /// Queued or running (Linux CSD_FLAG_LOCK): set by the sender,
+    /// cleared by the target once `func` returned
+    locked: AtomicBool,
+}
+
+impl Csd {
+    const fn new() -> Self {
+        Self {
+            next: AtomicPtr::new(core::ptr::null_mut()),
+            func: AtomicUsize::new(0),
+            info: AtomicUsize::new(0),
+            locked: AtomicBool::new(false),
+        }
+    }
+}
+
+/// Per sender CPU, one call slot per target CPU (Linux per-CPU cfd_data),
+/// `nr_cpu_ids` of them, allocated at bring-up (`init`). A CPU sends from
+/// thread context only and the kernel is not preemptive, so its row is
+/// used by one call at a time.
+static CFD: PerCpu<Once<Box<[Csd]>>> = crate::percpu![Once::new()];
+
+/// Per-CPU queue of calls to run there (Linux call_single_queue)
+static QUEUE: PerCpu<AtomicPtr<Csd>> = crate::percpu![AtomicPtr::new(core::ptr::null_mut())];
+
+/// CPUs that take call-function IPIs (Linux cpu_active_mask): set by
+/// each CPU once it services interrupts. One global mask: every sender
+/// needs every CPU's state, and it changes once per CPU at boot.
+static ACTIVE: CpuMask = CpuMask::new();
+
+/// Stop every other CPU for good (Linux smp_send_stop, x86
+/// native_stop_other_cpus): each leaves the active mask, so no cross-CPU
+/// call or TLB flush waits for it, and halts with interrupts off. Waits
+/// up to 1 s for them (Linux's wait before its NMI fallback, which hk
+/// lacks: a CPU spinning with interrupts off is reported and left
+/// running). For the end of halt, power-off and restart, after
+/// device_shutdown.
+pub fn stop_other_cpus() {
+    let mut others = ACTIVE.snapshot();
+    others.clear(this_id());
+    if others.is_empty() {
+        return;
+    }
+    smp_call_function_many(&others, stop_this_cpu, 0, false);
+    let gone = || ACTIVE.snapshot().and(&others).is_empty();
+    if crate::time::delay::poll_timeout(1_000_000, 10, gone).is_err() {
+        let left = ACTIVE.snapshot().and(&others);
+        crate::printkln!("smp: CPUs {} did not stop", left.fmt_list());
+    }
+}
+
+/// Leave the active mask and halt (Linux stop_this_cpu), from the
+/// call-function IPI
+fn stop_this_cpu(_: usize) {
+    ACTIVE.clear(this_id());
+    CurrentArch::halt_loop();
+}
+
+/// SMP bring-up found `n` CPUs (ids 0..n): record them (nr_cpu_ids) and
+/// give each its call slots, before any of them is active
+pub fn init(n: u32) {
+    crate::cpu::set_nr_cpu_ids(n);
+    let n = nr_cpu_ids();
+    for cpu in 0..n {
+        CFD.get(cpu)
+            .call_once(|| (0..n).map(|_| Csd::new()).collect());
+    }
+}
+
+/// This CPU now services call-function IPIs (its interrupt controller
+/// is up and interrupts are enabled)
+pub fn set_active(cpu: u32) {
+    ACTIVE.set(cpu);
+    // Before the local flush: a kernel-range flush that missed this
+    // CPU changed its page tables before reading the mask
+    fence(Ordering::SeqCst);
+    crate::mm::tlb::cpu_active();
+    crate::task::percpu::sched_cpu_update(cpu);
+}
+
+/// The CPUs that take call-function IPIs
+pub fn active_cpus() -> CpuSet {
+    ACTIVE.snapshot()
+}
+
+/// Run `func(info)` on each active CPU of `mask` other than this one
+/// (Linux smp_call_function_many); with `wait`, return once all of them
+/// finished it. Thread context only; interrupts may be off.
+pub fn smp_call_function_many(mask: &CpuSet, func: fn(usize), info: usize, wait: bool) {
+    check_context();
+    let me = this_id();
+    let mut targets = mask.and(&ACTIVE.snapshot());
+    targets.clear(me);
+    if targets.is_empty() {
+        return;
+    }
+    // Every active CPU was brought up by `init`
+    let row = CFD.get(me).get().expect("smp: no call slots");
+    for cpu in targets.iter() {
+        let csd = &row[cpu as usize];
+        // The slot's last (async) call must be done before reuse
+        csd_wait(csd, me, cpu);
+        csd.func.store(func as usize, Ordering::Relaxed);
+        csd.info.store(info, Ordering::Relaxed);
+        csd.locked.store(true, Ordering::Relaxed);
+        if enqueue(QUEUE.get(cpu), csd) {
+            crate::arch::ipi::send_call_function(cpu);
+        }
+    }
+    if wait {
+        for cpu in targets.iter() {
+            csd_wait(&row[cpu as usize], me, cpu);
+        }
+    }
+}
+
+/// Run `func(info)` on every active CPU, this one included (with
+/// interrupts off, as on the others), and wait for all (Linux
+/// on_each_cpu)
+pub fn on_each_cpu(func: fn(usize), info: usize) {
+    smp_call_function_many(&ACTIVE.snapshot(), func, info, true);
+    let irq = local_irq_save();
+    func(info);
+    local_irq_restore(irq);
+}
+
+/// Ask `cpu` to reschedule (Linux smp_send_reschedule): wakes it from
+/// idle to pick up a remote wakeup. Any context.
+pub fn smp_send_reschedule(cpu: u32) {
+    if cpu != this_id() && ACTIVE.test(cpu) {
+        crate::arch::ipi::send_reschedule(cpu);
+    }
+}
+
+/// Push `csd` onto `head`; true if the queue was empty (the IPI is ours
+/// to send)
+fn enqueue(head: &AtomicPtr<Csd>, csd: &Csd) -> bool {
+    let new = csd as *const Csd as *mut Csd;
+    let mut old = head.load(Ordering::Relaxed);
+    loop {
+        csd.next.store(old, Ordering::Relaxed);
+        // Release: the slot's fields are visible to the owner's swap
+        match head.compare_exchange_weak(old, new, Ordering::Release, Ordering::Relaxed) {
+            Ok(_) => return old.is_null(),
+            Err(cur) => old = cur,
+        }
+    }
+}
+
+/// Spin until `csd` is free, running this CPU's queued calls meanwhile
+fn csd_wait(csd: &Csd, me: u32, cpu: u32) {
+    let mut start = 0;
+    let mut reported = false;
+    while csd.locked.load(Ordering::Acquire) {
+        poll(me);
+        core::hint::spin_loop();
+        // A target that does not answer for a second is reported once
+        // per wait (Linux CSD_LOCK_WAIT_DEBUG csd_lock_wait_toolong)
+        if !reported && crate::time::TIMEKEEPER.is_initialized() {
+            let now = crate::time::monotonic_ns();
+            if start == 0 {
+                start = now;
+            } else if now - start > 1_000_000_000 {
+                reported = true;
+                crate::printkln!(
+                    "csd: CPU#{} waiting {} ms for CPU#{} to run a cross-CPU call",
+                    me,
+                    (now - start) / 1_000_000,
+                    cpu
+                );
+            }
+        }
+    }
+}
+
+/// Run the calls queued for this CPU now, with interrupts off (the IPI
+/// handler may otherwise run calls concurrently on this CPU)
+fn poll(me: u32) {
+    if !QUEUE.get(me).load(Ordering::Relaxed).is_null() {
+        let irq = local_irq_save();
+        run_queue(me);
+        local_irq_restore(irq);
+    }
+}
+
+/// Call-function IPI handler (interrupts off, arch IPI entry): run the
+/// calls queued for this CPU (Linux generic_smp_call_function_interrupt)
+pub fn call_function_interrupt() {
+    run_queue(this_id());
+}
+
+/// Reschedule IPI handler (Linux scheduler_ipi): another CPU queued a
+/// task here that should run now (`resched_curr`) or wants the running
+/// task to notice new work (`kick_process`); it switches at this CPU's
+/// next scheduling point (the idle loop's, right after this interrupt),
+/// or the running task's return to user mode (TIF_NEED_RESCHED)
+pub fn reschedule_interrupt() {
+    crate::task::percpu::current().set_tif(crate::task::tif::NEED_RESCHED);
+}
+
+/// Take every call queued for `me` and run them in queue order
+fn run_queue(me: u32) {
+    // Acquire: pairs with the senders' Release pushes
+    let mut list = QUEUE.get(me).swap(core::ptr::null_mut(), Ordering::Acquire);
+    // LIFO to FIFO (Linux llist_reverse_order)
+    let mut fifo: *mut Csd = core::ptr::null_mut();
+    while !list.is_null() {
+        // SAFETY: a slot in CFD (never freed), queued and owned by us until
+        // `locked` is cleared
+        let csd = unsafe { &*list };
+        list = csd.next.load(Ordering::Relaxed);
+        csd.next.store(fifo, Ordering::Relaxed);
+        fifo = csd as *const Csd as *mut Csd;
+    }
+    while !fifo.is_null() {
+        // SAFETY: as above
+        let csd = unsafe { &*fifo };
+        fifo = csd.next.load(Ordering::Relaxed);
+        let func = csd.func.load(Ordering::Relaxed);
+        let info = csd.info.load(Ordering::Relaxed);
+        // SAFETY: stored from a `fn(usize)` by the sender
+        let func: fn(usize) = unsafe { core::mem::transmute::<usize, fn(usize)>(func) };
+        func(info);
+        // Release: the function's effects before the sender's return;
+        // the slot is the sender's again
+        csd.locked.store(false, Ordering::Release);
+    }
+}
+
+/// A cross-CPU call from interrupt context, or with this CPU's interrupt
+/// state owned by an IrqSpinlock, could deadlock (reported once)
+fn check_context() {
+    // An IrqSpinlock raises the preempt count with interrupts off; a
+    // spin Mutex raises it too, but its waiters spin with interrupts on
+    // and so answer the call (Linux flushes TLBs under spinlocks too)
+    if CurrentArch::interrupt_depth() > 0
+        || (crate::arch::preempt_count() > 0 && crate::arch::irqs_disabled())
+    {
+        static WARNED: AtomicBool = AtomicBool::new(false);
+        if !WARNED.swap(true, Ordering::Relaxed) {
+            crate::printkln!(
+                "\nLOCKDEP:FAIL smp_call_function_many in atomic context (irq depth {}, preempt {})",
+                CurrentArch::interrupt_depth(),
+                crate::arch::preempt_count()
+            );
+        }
+    }
+}

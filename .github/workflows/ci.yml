@@ -89,7 +89,7 @@ jobs:
       - uses: actions/checkout@v4
 
       # Native arm64: the host gcc/binutils provide the aarch64-linux-gnu-*
-      # names used by kernel/build.rs and user/.cargo/config.toml
+      # names used by build.rs and user/.cargo/config.toml
       - name: Install packages
         run: |
           sudo apt-get update

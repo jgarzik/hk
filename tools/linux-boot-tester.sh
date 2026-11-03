@@ -144,7 +144,7 @@ fi
 . tools/qemu-net.sh
 qemu_net_args virtio
 
-# Hash of everything that decides the result, hk's kernel/ excluded:
+# Hash of everything that decides the result, hk's kernel sources excluded:
 # the sources (user/ workspace, these scripts, Makefile, toolchain pin),
 # what gets booted (kernel, its config, initramfs tree; the disk image by
 # mkdisk.sh and its tools, as its FAT timestamps differ per build) and

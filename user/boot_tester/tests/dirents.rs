@@ -7,7 +7,7 @@
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
     O_CREAT, O_DIRECTORY, O_RDONLY, O_WRONLY, SEEK_SET, sys_close, sys_getdents64, sys_lseek,
-    sys_mkdir, sys_open, sys_rmdir, sys_unlink,
+    sys_mkdir, sys_open, sys_readlink, sys_rmdir, sys_symlink, sys_unlink,
 };
 
 const EINVAL: i64 = -22;
@@ -17,6 +17,7 @@ const MAX_ENTRIES: usize = 4000;
 pub fn run_tests() {
     sys_mkdir(b"/tmp\0".as_ptr(), 0o1777); // hk boots without /tmp
     check_dir(b"/tmp", b"GETDENTS_RAMFS", 300);
+    check_utf8();
     check_proc();
     #[cfg(target_arch = "x86_64")]
     check_legacy();
@@ -99,6 +100,51 @@ fn legacy_walk(dir: &[u8], n: usize) -> Result<(), (&'static [u8], i64)> {
         return Err((b"dots/bad", dots * 1000 + bad));
     }
     Ok(())
+}
+
+/// Names are bytes: a UTF-8 file name and symlink target come back
+/// byte for byte (open, getdents64, readlink)
+fn check_utf8() {
+    const NAME: &[u8] = b"PATH_UTF8";
+    // "été" and "ü→" in UTF-8
+    let file: &[u8] = b"/tmp/\xc3\xa9t\xc3\xa9\0";
+    let link: &[u8] = b"/tmp/u8link\0";
+    let target: &[u8] = b"\xc3\xbc\xe2\x86\x92";
+    let fd = sys_open(file.as_ptr(), O_CREAT | O_WRONLY, 0o644);
+    if fd < 0 {
+        return verdict(NAME, b"open", fd);
+    }
+    sys_close(fd as u64);
+    let mut t = [0u8; 16];
+    t[..target.len()].copy_from_slice(target);
+    let why: &[u8] = if sys_symlink(t.as_ptr(), link.as_ptr()) != 0 {
+        b"symlink"
+    } else {
+        let mut buf = [0u8; 32];
+        let n = sys_readlink(link.as_ptr(), buf.as_mut_ptr(), buf.len() as u64);
+        if n != target.len() as i64 || buf[..target.len()] != *target {
+            b"readlink bytes" as &[u8]
+        } else if !utf8_listed(&file[5..file.len() - 1]) {
+            b"getdents name"
+        } else {
+            b""
+        }
+    };
+    sys_unlink(link.as_ptr());
+    sys_unlink(file.as_ptr());
+    verdict(NAME, why, 0);
+}
+
+/// `name` is an entry of /tmp, byte for byte
+fn utf8_listed(name: &[u8]) -> bool {
+    let fd = sys_open(b"/tmp\0".as_ptr(), O_RDONLY | O_DIRECTORY, 0);
+    if fd < 0 {
+        return false;
+    }
+    let mut found = false;
+    let _ = walk(fd, 512, &mut |n, _| found |= n == name);
+    sys_close(fd as u64);
+    found
 }
 
 fn verdict(name: &[u8], why: &[u8], got: i64) {

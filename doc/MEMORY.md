@@ -180,7 +180,7 @@ Linux: `Documentation/arch/arm64/memory.rst`.
 
 ## Address space lifetime (both arches)
 
-An address space is an `Mm` (Linux mm_struct, `kernel/mm/mod.rs`): its
+An address space is an `Mm` (Linux mm_struct, `mm/mod.rs`): its
 top-level table (x86 PML4, arm64 TTBR0 L0) and its VMAs. Locking and the
 reference rules are in `doc/LOCKING.md` (Address Spaces).
 

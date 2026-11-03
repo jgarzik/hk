@@ -1,0 +1,306 @@
+//! Per-CPU data structures for AArch64
+//!
+//! This module provides per-CPU data storage accessed via the TPIDR_EL1 register.
+//! Each CPU has its own `PerCpu` structure containing CPU-local state.
+#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+
+use core::arch::asm;
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+
+/// Per-CPU data slots (logical CPU ids are below this)
+pub const MAX_CPUS: usize = crate::util::cpumask::NR_CPUS;
+
+/// Per-CPU data structure
+///
+/// Accessed via the TPIDR_EL1 system register. The first field must be
+/// a self-pointer so that reading TPIDR_EL1 gives us the PerCpu address.
+/// Every field is an atomic or set once at `init` before the CPU is
+/// published, so other CPUs, IRQs and the vectors only ever need
+/// `&PerCpu` (no `&mut` exists after boot).
+#[repr(C, align(64))]
+pub struct PerCpu {
+    /// Self-pointer for TPIDR_EL1 access
+    pub self_ptr: AtomicPtr<PerCpu>,
+
+    /// Top of this CPU's overflow stack (vectors.S `el1_stack_overflow`
+    /// loads it at offset 8), 0 until `smp::init`
+    pub overflow_stack: AtomicU64,
+
+    /// Logical CPU ID (0 = BSP, 1+ = APs)
+    pub cpu_id: AtomicU32,
+
+    /// Hardware MPIDR value (affinity identifier)
+    pub mpidr: AtomicU64,
+
+    /// Is this the bootstrap processor?
+    pub is_bsp: AtomicBool,
+
+    /// Has this CPU completed initialization?
+    pub is_online: AtomicBool,
+
+    /// Kernel stack top for this CPU
+    pub kernel_stack_top: AtomicU64,
+
+    /// Timer tick count for this CPU
+    pub ticks: AtomicU64,
+
+    /// The running task (`*const KernelTask`; 0: the boot task,
+    /// `task::percpu::INIT_TASK`), set by the scheduler at each switch
+    pub curr: AtomicUsize,
+
+    /// Nesting depth of interrupt handlers
+    pub interrupt_depth: AtomicU32,
+
+    /// Preemption count - tracks nested critical sections
+    pub preempt_count: AtomicU32,
+}
+
+const _: () = assert!(core::mem::offset_of!(PerCpu, overflow_stack) == 8);
+
+impl PerCpu {
+    /// Create an uninitialized PerCpu
+    pub const fn uninit() -> Self {
+        Self {
+            self_ptr: AtomicPtr::new(core::ptr::null_mut()),
+            overflow_stack: AtomicU64::new(0),
+            cpu_id: AtomicU32::new(0),
+            mpidr: AtomicU64::new(0),
+            is_bsp: AtomicBool::new(false),
+            is_online: AtomicBool::new(false),
+            kernel_stack_top: AtomicU64::new(0),
+            ticks: AtomicU64::new(0),
+            curr: AtomicUsize::new(0),
+            interrupt_depth: AtomicU32::new(0),
+            preempt_count: AtomicU32::new(0),
+        }
+    }
+
+    /// Initialize the PerCpu structure
+    pub fn init(&self, cpu_id: u32, mpidr: u64, is_bsp: bool, kernel_stack_top: u64) {
+        self.self_ptr.store(self.as_ptr(), Ordering::Relaxed);
+        self.cpu_id.store(cpu_id, Ordering::Relaxed);
+        self.mpidr.store(mpidr, Ordering::Relaxed);
+        self.is_bsp.store(is_bsp, Ordering::Relaxed);
+        self.kernel_stack_top
+            .store(kernel_stack_top, Ordering::Relaxed);
+        self.ticks.store(0, Ordering::Relaxed);
+        self.curr.store(0, Ordering::Relaxed);
+        self.interrupt_depth.store(0, Ordering::Relaxed);
+        self.preempt_count.store(0, Ordering::Relaxed);
+    }
+
+    /// This CPU's address, for TPIDR_EL1 (only ever read through as
+    /// `&PerCpu`, whose mutable fields are atomics)
+    fn as_ptr(&self) -> *mut PerCpu {
+        (&raw const *self).cast_mut()
+    }
+
+    /// Logical CPU id
+    pub fn id(&self) -> u32 {
+        self.cpu_id.load(Ordering::Relaxed)
+    }
+
+    /// Hardware MPIDR
+    pub fn mpidr(&self) -> u64 {
+        self.mpidr.load(Ordering::Relaxed)
+    }
+
+    /// Mark this CPU as online
+    pub fn set_online(&self) {
+        self.is_online.store(true, Ordering::Release);
+    }
+}
+
+/// Global array of per-CPU data
+///
+/// This is statically allocated to avoid heap allocation during early boot.
+static PERCPU_ARRAY: [PerCpu; MAX_CPUS] = [const { PerCpu::uninit() }; MAX_CPUS];
+
+/// Number of CPUs that have come online
+pub static CPU_COUNT: AtomicU32 = AtomicU32::new(0);
+
+/// Set the TPIDR_EL1 register to point to per-CPU data
+///
+/// # Safety
+/// `addr` is 0 or this CPU's element of `PERCPU_ARRAY`:
+/// `try_current_cpu` turns it into `&PerCpu`.
+#[inline]
+unsafe fn set_tpidr_el1(addr: u64) {
+    // SAFETY: a system register write; no memory access (the caller
+    // vouches for the value)
+    unsafe {
+        asm!(
+            "msr tpidr_el1, {}",
+            in(reg) addr,
+            options(nostack, preserves_flags)
+        );
+    }
+}
+
+/// Read the TPIDR_EL1 register
+#[inline]
+pub fn read_tpidr_el1() -> u64 {
+    let val: u64;
+    unsafe {
+        asm!(
+            "mrs {}, tpidr_el1",
+            out(reg) val,
+            options(nostack, preserves_flags, nomem)
+        );
+    }
+    val
+}
+
+/// Set the TPIDR_EL0 register (user TLS pointer)
+#[inline]
+pub fn write_tpidr_el0(value: u64) {
+    unsafe {
+        asm!(
+            "msr tpidr_el0, {}",
+            in(reg) value,
+            options(nostack, preserves_flags)
+        );
+    }
+}
+
+/// TPIDR_EL0 takes any value (Linux copy_thread, tls_set)
+pub fn tpidr_ok(_val: u64) -> bool {
+    true
+}
+
+/// No user GS base on arm64 (x86-64 `read_user_gsbase`)
+pub fn read_user_gsbase() -> u64 {
+    0
+}
+
+/// No user GS base on arm64 (x86-64 `write_user_gsbase`)
+pub fn write_user_gsbase(_addr: u64) {}
+
+/// Read the TPIDR_EL0 register (user TLS pointer)
+#[inline]
+pub fn read_tpidr_el0() -> u64 {
+    let val: u64;
+    unsafe {
+        asm!(
+            "mrs {}, tpidr_el0",
+            out(reg) val,
+            options(nostack, preserves_flags, nomem)
+        );
+    }
+    val
+}
+
+/// A CPU's per-CPU data by CPU id (panics past MAX_CPUS)
+pub fn get_percpu(cpu_id: u32) -> &'static PerCpu {
+    &PERCPU_ARRAY[cpu_id as usize]
+}
+
+/// Try to get current CPU data (returns None if TPIDR_EL1 not set up)
+#[inline]
+pub fn try_current_cpu() -> Option<&'static PerCpu> {
+    let tpidr = read_tpidr_el1();
+    if tpidr == 0 {
+        return None;
+    }
+    // SAFETY: TPIDR_EL1 is 0 or this CPU's element of the static
+    // PERCPU_ARRAY (`set_tpidr_el1`), only ever shared
+    unsafe { Some(&*(tpidr as *const PerCpu)) }
+}
+
+/// Initialize per-CPU data for the BSP (CPU 0)
+///
+/// This must be called early in boot, before any per-CPU access.
+pub fn init_bsp(mpidr: u64, kernel_stack_top: u64) {
+    let percpu = get_percpu(0);
+    percpu.init(0, mpidr, true, kernel_stack_top);
+
+    // SAFETY: CPU 0's element, and this is CPU 0
+    unsafe { set_tpidr_el1(percpu.as_ptr() as u64) };
+    crate::task::percpu::PERCPU_UP.store(true, Ordering::Release);
+
+    // Mark BSP as online
+    percpu.set_online();
+    CPU_COUNT.store(1, Ordering::SeqCst);
+}
+
+/// Initialize per-CPU data for an AP
+///
+/// Called by the AP after it has set up its stack.
+/// Returns the CPU ID assigned to this AP.
+pub fn init_ap(mpidr: u64, kernel_stack_top: u64) -> u32 {
+    // Atomically claim the next CPU ID
+    let cpu_id = CPU_COUNT.fetch_add(1, Ordering::SeqCst);
+    assert!((cpu_id as usize) < MAX_CPUS, "Too many CPUs");
+
+    let percpu = get_percpu(cpu_id);
+    percpu.init(cpu_id, mpidr, false, kernel_stack_top);
+
+    // SAFETY: the element this AP just claimed
+    unsafe { set_tpidr_el1(percpu.as_ptr() as u64) };
+
+    // Mark as online
+    percpu.set_online();
+
+    cpu_id
+}
+
+/// Get the number of online CPUs
+pub fn online_cpu_count() -> u32 {
+    CPU_COUNT.load(Ordering::Acquire)
+}
+
+// ============================================================================
+// Preemption control
+// ============================================================================
+
+/// Disable preemption on the current CPU
+///
+/// Increments the preempt_count. While preempt_count > 0, the scheduler
+/// will not preempt this CPU even if a higher-priority task becomes runnable.
+///
+/// This is used by spinlocks and other critical sections that cannot be
+/// interrupted by a context switch.
+///
+/// Must be paired with `preempt_enable()`.
+#[inline]
+pub fn preempt_disable() {
+    if let Some(percpu) = try_current_cpu() {
+        percpu.preempt_count.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Enable preemption on the current CPU
+///
+/// Decrements the preempt_count. If it reaches 0 and need_resched is set,
+/// this may trigger a reschedule (depending on implementation).
+///
+/// Must be paired with `preempt_disable()`.
+#[inline]
+pub fn preempt_enable() {
+    if let Some(percpu) = try_current_cpu() {
+        let prev = percpu.preempt_count.fetch_sub(1, Ordering::Relaxed);
+        debug_assert!(prev > 0, "preempt_enable called with preempt_count == 0");
+
+        // If preempt_count is now 0 and reschedule is needed, we could
+        // trigger a reschedule here. For now, we defer to the existing
+        // reschedule check points (timer interrupt exit, yield, etc.)
+    }
+}
+
+/// Check if preemption is currently disabled
+#[inline]
+#[allow(dead_code)] // Utility function for future use and debugging
+pub fn preempt_disabled() -> bool {
+    try_current_cpu()
+        .map(|percpu| percpu.preempt_count.load(Ordering::Relaxed) > 0)
+        .unwrap_or(true) // Conservative: assume disabled if no per-CPU data
+}
+
+/// Get the current preempt_count value (for debugging)
+#[inline]
+#[allow(dead_code)] // Utility function for future use and debugging
+pub fn preempt_count() -> u32 {
+    try_current_cpu()
+        .map(|percpu| percpu.preempt_count.load(Ordering::Relaxed))
+        .unwrap_or(0)
+}

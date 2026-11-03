@@ -25,7 +25,7 @@ KERNEL_FEATURES = $(if $(LOCKDEP),--features lockdep)
 MACHINE ?=
 
 .PHONY: all build debug user iso iso-debug run run-debug test check clean info help vfat-image disk-image
-.PHONY: build-arm run-arm check-arm check-linux check-linux-arm user-arm clippy clippy-arm fmt list-machines gate check-stress check-bigmem
+.PHONY: build-arm run-arm check-arm check-linux check-linux-arm user-arm clippy clippy-arm fmt list-machines gate check-stress unsafe-stats check-bigmem
 
 # Default: build everything (kernel, user binaries, ISO)
 all: iso
@@ -63,6 +63,7 @@ help:
 	@echo "  make clippy   - Run clippy linter (x86-64)"
 	@echo "  make clippy-arm - Run clippy linter (aarch64)"
 	@echo "  make fmt      - Format code"
+	@echo "  make unsafe-stats - unsafe use and SAFETY coverage per directory"
 	@echo ""
 	@echo "  make clean    - Remove all build artifacts"
 	@echo "  make info     - Show kernel binary info"
@@ -301,3 +302,7 @@ gate:
 # (STRESS_ARCHS), STRESS_JOBS at a time
 check-stress:
 	@tools/stress.sh
+
+# unsafe use per kernel directory (doc/UNSAFE.md)
+unsafe-stats:
+	@tools/unsafe-stats.sh

@@ -154,7 +154,7 @@ a log: `serial.log` (x86-64), `serial_arm.log` (aarch64),
 (`check-linux*`). `NO_KVM=1` (e.g. `NO_KVM=1 make check`) runs x86
 under TCG, as CI does.
 
-`check-linux*` results do not depend on `kernel/`, so a PASS is cached
+`check-linux*` results do not depend on the kernel sources, so a PASS is cached
 in `~/.cache/hk-linux-check/<arch>/<hash>` (`LINUX_CACHE_DIR`), shared by
 all worktrees; a rerun with the same hash prints `check-linux: cached
 PASS (<arch> <hash>)` and skips the boot. The hash covers the tracked
@@ -202,7 +202,7 @@ The default QEMU setup:
   `NO_KVM=1` forces TCG, as on CI);
   aarch64 `-cpu neoverse-n1` (PAN) under TCG, `-cpu host` under KVM on
   arm64 hosts. SMAP/PAN make any kernel access to
-  user memory outside `kernel/uaccess.rs` fault, so the boot tests catch
+  user memory outside `uaccess.rs` fault, so the boot tests catch
   it. Override with `QEMU_CPU`, e.g. `make check QEMU_CPU=qemu64` or
   `make check-arm QEMU_CPU=cortex-a72` (no SMAP/PAN).
 
@@ -258,25 +258,34 @@ Always use the Makefile targets which specify the correct `--target` flags.
 ## Project Structure
 
 ```
-hk/
-├── kernel/              # Main kernel crate (no_std, no_main)
-│   ├── main.rs          # Entry point and kernel init
-│   ├── arch/            # Architecture-specific code
-│   │   ├── x86_64/      # x86-64: boot, interrupts, paging, syscalls
-│   │   └── aarch64/     # aarch64: boot, exceptions, paging, syscalls
-│   ├── mm/              # Memory management (mmap, vma, page tables)
-│   ├── task/            # Process/thread management, scheduler
-│   ├── fs/              # VFS + filesystem implementations
-│   ├── signal/          # Signal handling
-│   ├── bus/             # Bus drivers (PCI, etc.)
-│   ├── storage/         # Block layer (blk-mq, partitions, SCSI disk)
-│   ├── virtio/          # virtio PCI transport, virtqueues, virtio-blk
-│   ├── net/             # Networking (sockets, IPv4, TCP/UDP, netlink, NIC drivers)
-│   ├── usb/             # USB stack (xHCI, hub, devices)
-│   ├── tty/             # TTY subsystem
-│   ├── ns/              # Namespaces
-│   ├── dt/              # Device tree parsing
-│   └── *.rs             # Core kernel modules (console, heap, frame_alloc, etc.)
+hk/                      # The kernel crate (no_std, no_main) is the repo root
+├── Cargo.toml           # hk-kernel package + workspace
+├── main.rs              # Entry point and kernel init
+├── build.rs             # Assembles arch/*/ .S files, links kernel.ld
+├── arch/                # Architecture-specific code
+│   ├── x86_64/          # x86-64: boot, interrupts, paging, syscalls
+│   └── aarch64/         # aarch64: boot, exceptions, paging, syscalls
+├── mm/                  # Memory management (mmap, vma, page tables, heap, frames)
+├── task/                # Processes/threads, scheduler, futex, workqueues, exec
+├── fs/                  # VFS + filesystem implementations, char devices
+├── io/                  # fd-backed I/O and events (poll, epoll, pipes, inotify, io_uring)
+├── time/                # Timekeeping, timers, hrtimers, POSIX/CPU timers, timerfd
+├── sync/                # Locks, wait queues, completions
+├── util/                # Lists, cpumasks, Pod, errors, ELF parsing
+├── signal/              # Signal handling
+├── bus/                 # Generic driver model (buses, drivers, platform)
+├── block/               # Block layer (blk-mq, partitions, ramdisk, SCSI disk)
+├── hw/                  # Hardware: code that touches a chip or device
+│   ├── pci/  usb/  virtio/  acpi/
+│   ├── net/             # NIC drivers (e1000, virtio-net)
+│   ├── gfx/             # Framebuffer driver and console
+│   └── mmio.rs dma.rs serial.rs
+├── net/                 # Networking (sockets, IPv4, TCP/UDP, netlink)
+├── gfx/                 # DRM-style graphics interface
+├── tty/                 # TTY subsystem
+├── ns/                  # Namespaces
+├── dt/                  # Device tree parsing
+├── *.rs                 # Core: entry, cpu/smp, irq, printk/kmsg, console, uaccess, ...
 ├── user/                # Userspace test binaries (separate workspace)
 │   ├── boot_tester/     # Test harness (main.rs, boot_tester2.rs)
 │   │   └── tests/       # Test modules (mmap.rs, process.rs, etc.)

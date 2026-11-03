@@ -1,0 +1,618 @@
+//! epoll - scalable I/O event notification
+//!
+//! Provides Linux-compatible epoll API for efficient I/O multiplexing.
+//!
+//! ## Architecture
+//!
+//! ```text
+//! User Process
+//!     |
+//!     v
+//! epoll_create1(flags) -> epfd
+//!     |
+//!     v
+//! epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &event)  -> Add fd to interest list
+//! epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &event)  -> Modify event mask
+//! epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL)    -> Remove fd from list
+//!     |
+//!     v
+//! epoll_wait(epfd, events, maxevents, timeout) -> Wait for events
+//! ```
+//!
+//! ## Key Features
+//!
+//! - O(1) event notification (vs O(n) for poll/select)
+//! - Level-triggered (default) and edge-triggered (EPOLLET) modes
+//! - One-shot mode (EPOLLONESHOT) for single notification
+//! - Can monitor pipes, sockets, eventfd, timerfd, and other pollable fds
+
+use alloc::collections::BTreeMap;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+
+use crate::arch::{IrqSpinlock, Uaccess};
+use crate::fs::KernelError;
+use crate::fs::file::{File, FileOps, flags};
+use crate::io::pipe::FD_CLOEXEC;
+use crate::io::poll::{POLLIN, POLLRDNORM, PollTable};
+use crate::sync::waitqueue::WaitQueue;
+use crate::task::Fd;
+use crate::task::fdtable::get_task_fd;
+use crate::task::percpu::current_tid;
+use crate::time::Deadline;
+use crate::uaccess::{get_user, put_user};
+
+/// epoll_ctl operations
+pub const EPOLL_CTL_ADD: i32 = 1;
+pub const EPOLL_CTL_DEL: i32 = 2;
+pub const EPOLL_CTL_MOD: i32 = 3;
+
+/// epoll event masks (input)
+pub const EPOLLIN: u32 = 0x001;
+pub const EPOLLPRI: u32 = 0x002;
+pub const EPOLLOUT: u32 = 0x004;
+pub const EPOLLRDNORM: u32 = 0x040;
+pub const EPOLLRDBAND: u32 = 0x080;
+pub const EPOLLWRNORM: u32 = 0x100;
+pub const EPOLLWRBAND: u32 = 0x200;
+pub const EPOLLMSG: u32 = 0x400;
+pub const EPOLLRDHUP: u32 = 0x2000;
+
+/// epoll event masks (output only)
+pub const EPOLLERR: u32 = 0x008;
+pub const EPOLLHUP: u32 = 0x010;
+
+/// epoll behavior modifiers
+pub const EPOLLET: u32 = 1 << 31; // Edge-triggered
+pub const EPOLLONESHOT: u32 = 1 << 30; // One-shot
+pub const EPOLLWAKEUP: u32 = 1 << 29; // Wake system
+pub const EPOLLEXCLUSIVE: u32 = 1 << 28; // Exclusive wakeup
+
+/// epoll_create1 flags
+pub const EPOLL_CLOEXEC: i32 = 0o2000000;
+
+/// Maximum events that can be returned in a single epoll_wait call
+const EP_MAX_EVENTS: i32 = 4096;
+
+/// User-space epoll_event (layout differs per arch: packed only on x86_64)
+pub use crate::arch::uapi::EpollEvent;
+
+/// Per-monitored-fd entry (like Linux's struct epitem)
+struct EpItem {
+    /// The file descriptor being monitored
+    #[allow(dead_code)]
+    fd: Fd,
+    /// The file object (Arc reference)
+    file: Arc<File>,
+    /// User-provided event mask and data
+    event: EpollEvent,
+    /// Whether this item has been disabled (EPOLLONESHOT fired)
+    disabled: bool,
+    /// Last reported events (for edge-triggered mode)
+    last_events: u32,
+}
+
+impl EpItem {
+    fn new(fd: Fd, file: Arc<File>, event: EpollEvent) -> Self {
+        Self {
+            fd,
+            file,
+            event,
+            disabled: false,
+            last_events: 0,
+        }
+    }
+}
+
+/// Inner state protected by spinlock
+struct EventpollInner {
+    /// All monitored fds: fd -> EpItem
+    items: BTreeMap<Fd, EpItem>,
+}
+
+impl EventpollInner {
+    fn new() -> Self {
+        Self {
+            items: BTreeMap::new(),
+        }
+    }
+}
+
+/// Main epoll instance (like Linux's struct eventpoll)
+pub struct Eventpoll {
+    /// Inner state protected by IRQ spinlock
+    inner: IrqSpinlock<EventpollInner>,
+    /// Wait queue for epoll_wait() callers
+    wq: WaitQueue,
+}
+
+impl Eventpoll {
+    /// Create a new epoll instance
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: IrqSpinlock::new(EventpollInner::new()),
+            wq: WaitQueue::new(),
+        })
+    }
+
+    /// Add a file descriptor to this epoll (EPOLL_CTL_ADD)
+    pub fn add(&self, fd: Fd, file: Arc<File>, event: &EpollEvent) -> Result<(), i64> {
+        let mut inner = self.inner.lock();
+
+        // Check if fd already exists
+        if inner.items.contains_key(&fd) {
+            return Err(KernelError::AlreadyExists.sysret());
+        }
+
+        // Create new item
+        let item = EpItem::new(fd, file, *event);
+        inner.items.insert(fd, item);
+
+        Ok(())
+    }
+
+    /// Modify an existing fd's events (EPOLL_CTL_MOD)
+    pub fn modify(&self, fd: Fd, event: &EpollEvent) -> Result<(), i64> {
+        let mut inner = self.inner.lock();
+
+        // Find existing item
+        let item = inner
+            .items
+            .get_mut(&fd)
+            .ok_or(KernelError::NotFound.sysret())?;
+
+        // Update event mask and data
+        item.event = *event;
+        // Re-enable if it was disabled by EPOLLONESHOT
+        item.disabled = false;
+
+        Ok(())
+    }
+
+    /// Remove a file descriptor from this epoll (EPOLL_CTL_DEL)
+    pub fn delete(&self, fd: Fd) -> Result<(), i64> {
+        let mut inner = self.inner.lock();
+
+        // Remove the item
+        if inner.items.remove(&fd).is_none() {
+            return Err(KernelError::NotFound.sysret());
+        }
+
+        Ok(())
+    }
+
+    /// Wait for events (epoll_wait/epoll_pwait core logic)
+    ///
+    /// Like poll(): the task state is set before each scan and the first
+    /// scan registers on every watched file's wait queues, so a wakeup
+    /// between scan and sleep is never lost. Returns the number of ready
+    /// events; 0 on timeout; -EINTR on a signal (epoll_wait is never
+    /// restarted).
+    pub fn wait(&self, events: &mut [EpollEvent], deadline: Deadline) -> Result<usize, i64> {
+        use crate::io::poll::PollContext;
+        use crate::task::percpu::{SleepState, set_current_state};
+        use crate::time::hrtimer::{HrClock, schedule_hrtimeout};
+        if events.is_empty() {
+            return Ok(0);
+        }
+        let nonblock = deadline == Some(0);
+        let mut ctx = PollContext::new(current_tid());
+        let mut first = true;
+        let r = loop {
+            set_current_state(SleepState::Interruptible);
+            let n = self.scan(events, &mut ctx, first && !nonblock);
+            first = false;
+            if n > 0 || nonblock {
+                break Ok(n);
+            }
+            if crate::sync::waitqueue::signal_pending() {
+                break Err(KernelError::Interrupted.sysret());
+            }
+            if deadline.is_some_and(|d| crate::time::monotonic_ns() >= d) {
+                break Ok(0);
+            }
+            schedule_hrtimeout(deadline, HrClock::Monotonic);
+        };
+        set_current_state(SleepState::Running);
+        r
+    }
+
+    /// One pass over the interest list: poll each file outside the item
+    /// lock (registering on its wait queues if `register`), then record
+    /// ready events (EPOLLET / EPOLLONESHOT bookkeeping under the lock)
+    fn scan(
+        &self,
+        events: &mut [EpollEvent],
+        ctx: &mut crate::io::poll::PollContext,
+        register: bool,
+    ) -> usize {
+        let items: Vec<(Fd, Arc<File>)> = {
+            let inner = self.inner.lock();
+            inner
+                .items
+                .iter()
+                .filter(|(_, it)| !it.disabled)
+                .map(|(fd, it)| (*fd, it.file.clone()))
+                .collect()
+        };
+        let mut ready = Vec::new();
+        for (fd, file) in items {
+            let mut pt = PollTable::new(ctx);
+            if !register {
+                pt.disable();
+            }
+            pt.hold_file(&file);
+            // epoll event bits equal the poll bits in the low 16 bits
+            ready.push((fd, file.f_op.poll(&file, Some(&mut pt)) as u32));
+        }
+        let mut inner = self.inner.lock();
+        let mut n = 0;
+        for (fd, revents) in ready {
+            if n == events.len() {
+                break;
+            }
+            let Some(item) = inner.items.get_mut(&fd) else {
+                continue;
+            };
+            if item.disabled {
+                continue;
+            }
+            let masked = revents & (item.event.events | EPOLLERR | EPOLLHUP);
+            if masked == 0 {
+                item.last_events = 0;
+                continue;
+            }
+            if item.event.events & EPOLLET != 0 {
+                if masked == item.last_events {
+                    continue;
+                }
+                item.last_events = masked;
+            }
+            events[n] = EpollEvent::new(masked, item.event.data);
+            n += 1;
+            if item.event.events & EPOLLONESHOT != 0 {
+                item.disabled = true;
+            }
+        }
+        n
+    }
+
+    /// Poll for readiness (for nested epoll)
+    pub fn poll(&self, pt: Option<&mut PollTable>) -> u16 {
+        if let Some(poll_table) = pt {
+            poll_table.poll_wait(&self.wq);
+        }
+
+        // Check if any monitored fds are ready
+        let inner = self.inner.lock();
+        for item in inner.items.values() {
+            if item.disabled {
+                continue;
+            }
+            let revents = item.file.f_op.poll(&item.file, None);
+            let masked = (revents as u32) & item.event.events;
+            if masked != 0 {
+                return POLLIN | POLLRDNORM; // epoll fd is readable
+            }
+        }
+
+        0
+    }
+}
+
+/// File operations for epoll fd
+pub struct EpollFileOps;
+
+static EPOLL_FOPS: EpollFileOps = EpollFileOps;
+
+impl FileOps for EpollFileOps {
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+
+    fn read(&self, _file: &File, _buf: &mut [u8]) -> Result<usize, KernelError> {
+        // epoll fds are not directly readable
+        Err(KernelError::InvalidArgument)
+    }
+
+    fn write(&self, _file: &File, _buf: &[u8]) -> Result<usize, KernelError> {
+        // epoll fds are not writable
+        Err(KernelError::InvalidArgument)
+    }
+
+    fn poll(&self, file: &File, pt: Option<&mut PollTable>) -> u16 {
+        let Some(ep) = file.private_ref::<Eventpoll>() else {
+            return crate::io::poll::POLLERR;
+        };
+        ep.poll(pt)
+    }
+}
+
+/// Create an epoll file descriptor
+///
+/// # Arguments
+/// * `eflags` - EPOLL_CLOEXEC or 0
+///
+/// # Returns
+/// Arc<File> for the new epoll fd
+pub fn create_epoll_file(eflags: i32) -> Result<Arc<File>, KernelError> {
+    let ep = Eventpoll::new();
+
+    // Create dummy dentry for epoll
+
+    // Determine file flags
+    let mut file_flags = flags::O_RDWR;
+    if eflags & EPOLL_CLOEXEC != 0 {
+        file_flags |= flags::O_CLOEXEC;
+    }
+
+    let file =
+        crate::fs::anon_inodes::anon_inode_getfile("[eventpoll]", &EPOLL_FOPS, ep, file_flags);
+    Ok(file)
+}
+
+/// Get the Eventpoll from a File (for syscall implementations)
+pub fn get_eventpoll(file: &File) -> Option<Arc<Eventpoll>> {
+    file.private_arc::<Eventpoll>()
+}
+
+// ============================================================================
+// Syscall implementations
+// ============================================================================
+
+/// sys_epoll_create(size) - Create an epoll instance
+///
+/// The size argument is ignored but must be greater than zero for compatibility.
+pub fn sys_epoll_create(size: i32) -> i64 {
+    if size <= 0 {
+        return KernelError::InvalidArgument.sysret();
+    }
+    sys_epoll_create1(0)
+}
+
+/// Get the RLIMIT_NOFILE limit for the current task
+fn get_nofile_limit() -> u64 {
+    let limit = crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_NOFILE);
+    if limit == crate::task::rlimit::RLIM_INFINITY {
+        u64::MAX
+    } else {
+        limit
+    }
+}
+
+/// sys_epoll_create1(flags) - Create an epoll instance with flags
+///
+/// flags: EPOLL_CLOEXEC or 0
+pub fn sys_epoll_create1(eflags: i32) -> i64 {
+    // Validate flags
+    if eflags & !EPOLL_CLOEXEC != 0 {
+        return KernelError::InvalidArgument.sysret();
+    }
+
+    // Create epoll file
+    let file = match create_epoll_file(eflags) {
+        Ok(f) => f,
+        Err(_) => return KernelError::OutOfMemory.sysret(),
+    };
+
+    // Get the FD table and allocate a file descriptor
+    let fd_table = match get_task_fd(current_tid()) {
+        Some(t) => t,
+        None => return KernelError::OutOfMemory.sysret(),
+    };
+    let mut table = fd_table.lock();
+    let fd_flags = if eflags & EPOLL_CLOEXEC != 0 {
+        FD_CLOEXEC
+    } else {
+        0
+    };
+
+    match table.alloc_with_flags(file, fd_flags, get_nofile_limit()) {
+        Ok(fd) => fd as i64,
+        Err(e) => -(e as i64),
+    }
+}
+
+/// sys_epoll_ctl(epfd, op, fd, event) - Control an epoll instance
+pub fn sys_epoll_ctl(epfd: i32, op: i32, fd: i32, event_ptr: u64) -> i64 {
+    // Get FD table
+    let fd_table = match get_task_fd(current_tid()) {
+        Some(t) => t,
+        None => return KernelError::BadFd.sysret(),
+    };
+    let table = fd_table.lock();
+
+    // Get epoll file
+    let ep_file = match table.get(epfd) {
+        Some(f) => f,
+        None => return KernelError::BadFd.sysret(),
+    };
+
+    // Verify it's an epoll fd
+    let ep = match get_eventpoll(&ep_file) {
+        Some(e) => e,
+        None => return KernelError::InvalidArgument.sysret(),
+    };
+
+    // Get target file (for ADD and MOD)
+    let target_file = if op != EPOLL_CTL_DEL {
+        match table.get(fd) {
+            Some(f) => Some(f),
+            None => return KernelError::BadFd.sysret(),
+        }
+    } else {
+        None
+    };
+
+    // Check not adding epoll to itself
+    if let Some(ref tf) = target_file
+        && Arc::ptr_eq(&ep_file, tf)
+    {
+        return KernelError::InvalidArgument.sysret();
+    }
+
+    // Release lock before user memory access
+    drop(table);
+
+    // Read event from user space (for ADD and MOD)
+    let event = if op != EPOLL_CTL_DEL {
+        if event_ptr == 0 {
+            return KernelError::BadAddress.sysret();
+        }
+        match get_user::<Uaccess, EpollEvent>(event_ptr) {
+            Ok(e) => e,
+            Err(_) => return KernelError::BadAddress.sysret(),
+        }
+    } else {
+        EpollEvent::default()
+    };
+
+    // Perform operation
+    match op {
+        EPOLL_CTL_ADD => {
+            let tf = target_file.unwrap();
+            match ep.add(fd as Fd, tf, &event) {
+                Ok(()) => 0,
+                Err(e) => e,
+            }
+        }
+        EPOLL_CTL_MOD => match ep.modify(fd as Fd, &event) {
+            Ok(()) => 0,
+            Err(e) => e,
+        },
+        EPOLL_CTL_DEL => match ep.delete(fd as Fd) {
+            Ok(()) => 0,
+            Err(e) => e,
+        },
+        _ => KernelError::InvalidArgument.sysret(),
+    }
+}
+
+/// sys_epoll_wait(epfd, events, maxevents, timeout) - Wait for events
+pub fn sys_epoll_wait(epfd: i32, events_ptr: u64, maxevents: i32, timeout: i32) -> i64 {
+    sys_epoll_pwait(epfd, events_ptr, maxevents, timeout, 0, 0)
+}
+
+/// sys_epoll_pwait(epfd, events, maxevents, timeout, sigmask, sigsetsize) - Wait with signal mask
+///
+/// `sigmask` (if not null) is the blocked mask during the wait, as with
+/// ppoll; it stays for the delivery of a signal that ends the wait with
+/// EINTR (Linux do_epoll_pwait)
+pub fn sys_epoll_pwait(
+    epfd: i32,
+    events_ptr: u64,
+    maxevents: i32,
+    timeout: i32,
+    sigmask: u64,
+    sigsetsize: u64,
+) -> i64 {
+    let deadline = crate::time::deadline_ms(timeout);
+    do_epoll_pwait(epfd, events_ptr, maxevents, deadline, sigmask, sigsetsize)
+}
+
+/// epoll_pwait and epoll_pwait2: the timeout as a [`Deadline`], the
+/// signal mask in place while waiting (kept only on EINTR)
+fn do_epoll_pwait(
+    epfd: i32,
+    events_ptr: u64,
+    maxevents: i32,
+    deadline: Deadline,
+    sigmask: u64,
+    sigsetsize: u64,
+) -> i64 {
+    if let Err(e) = crate::signal::set_user_sigmask(sigmask, sigsetsize) {
+        return e.sysret();
+    }
+    let r = do_epoll_wait(epfd, events_ptr, maxevents, deadline);
+    crate::signal::restore_saved_sigmask_unless(r == KernelError::Interrupted.sysret());
+    r
+}
+
+/// Wait on `epfd` and copy the ready events out (Linux do_epoll_wait)
+fn do_epoll_wait(epfd: i32, events_ptr: u64, maxevents: i32, deadline: Deadline) -> i64 {
+    // Validate maxevents
+    if maxevents <= 0 || maxevents > EP_MAX_EVENTS {
+        return KernelError::InvalidArgument.sysret();
+    }
+
+    // Validate events pointer
+    if events_ptr == 0 {
+        return KernelError::BadAddress.sysret();
+    }
+
+    // Get epoll instance
+    let fd_table = match get_task_fd(current_tid()) {
+        Some(t) => t,
+        None => return KernelError::BadFd.sysret(),
+    };
+
+    let ep_file = match fd_table.lock().get(epfd) {
+        Some(f) => f,
+        None => return KernelError::BadFd.sysret(),
+    };
+
+    let ep = match get_eventpoll(&ep_file) {
+        Some(e) => e,
+        None => return KernelError::InvalidArgument.sysret(),
+    };
+
+    // Allocate buffer for events
+    let mut events = alloc::vec![EpollEvent::default(); maxevents as usize];
+
+    // Wait for events
+    let count = match ep.wait(&mut events, deadline) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+
+    // Copy events to user space
+    let event_size = core::mem::size_of::<EpollEvent>();
+    for (i, event) in events.iter().enumerate().take(count) {
+        let addr = events_ptr + (i * event_size) as u64;
+        if put_user::<Uaccess, EpollEvent>(addr, *event).is_err() {
+            return KernelError::BadAddress.sysret();
+        }
+    }
+
+    count as i64
+}
+
+/// sys_epoll_pwait2 - Wait for events with high-precision timeout
+///
+/// Like sys_epoll_pwait but uses a struct timespec pointer for nanosecond-precision
+/// timeout instead of an integer milliseconds value.
+///
+/// # Arguments
+/// * `epfd` - epoll file descriptor
+/// * `events_ptr` - User space buffer for returned events
+/// * `maxevents` - Maximum number of events to return
+/// * `timeout_ptr` - Pointer to struct timespec timeout (NULL = wait indefinitely)
+/// * `sigmask` - Blocked mask during the wait (NULL = unchanged)
+/// * `sigsetsize` - Size of signal mask
+///
+/// Returns number of ready descriptors, 0 on timeout, or negative errno on error.
+pub fn sys_epoll_pwait2(
+    epfd: i32,
+    events_ptr: u64,
+    maxevents: i32,
+    timeout_ptr: u64,
+    sigmask: u64,
+    sigsetsize: u64,
+) -> i64 {
+    use crate::time::time_syscall::LinuxTimespec;
+
+    // NULL waits forever; the timeout is ns-precise (Linux ep_timeout_to_timespec)
+    let deadline = if timeout_ptr == 0 {
+        None
+    } else {
+        let ts: LinuxTimespec = match get_user::<Uaccess, LinuxTimespec>(timeout_ptr) {
+            Ok(ts) => ts,
+            Err(_) => return KernelError::BadAddress.sysret(),
+        };
+        match crate::time::deadline_ts(ts.tv_sec, ts.tv_nsec) {
+            Ok(d) => d,
+            Err(e) => return e.sysret(),
+        }
+    };
+    do_epoll_pwait(epfd, events_ptr, maxevents, deadline, sigmask, sigsetsize)
+}

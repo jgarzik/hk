@@ -1,0 +1,175 @@
+//! x86_64 user memory access primitives
+//!
+//! Implements the UaccessArch trait for x86_64, including:
+//! - SMAP (Supervisor Mode Access Prevention) support
+//! - Canonical address validation
+//!
+//! # SMAP Overview
+//!
+//! SMAP is a hardware security feature (Intel Haswell+, AMD Zen+) that prevents
+//! the kernel from accidentally accessing user-space memory. When SMAP is enabled:
+//! - Any supervisor-mode access to user pages causes a page fault
+//! - The AC (Alignment Check) flag in RFLAGS can temporarily disable this protection
+//! - `stac` instruction sets AC flag (enables user access)
+//! - `clac` instruction clears AC flag (disables user access)
+//!
+//! # Canonical Addresses
+//!
+//! On x86_64, valid user addresses are in the range [0, 0x0000_7FFF_FFFF_FFFF].
+//! The "canonical hole" (0x0000_8000_0000_0000 to 0xFFFF_7FFF_FFFF_FFFF) is invalid.
+//! Kernel addresses are in [0xFFFF_8000_0000_0000, 0xFFFF_FFFF_FFFF_FFFF].
+#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+
+use crate::uaccess::UaccessArch;
+
+/// CR4 bit for SMAP enable
+const CR4_SMAP: u64 = 1 << 21;
+
+/// CR4 bit for SMEP enable
+const CR4_SMEP: u64 = 1 << 20;
+
+/// CPUID feature bit for SMAP (leaf 7, ebx bit 20)
+const CPUID_SMAP: u32 = 1 << 20;
+
+/// CPUID feature bit for SMEP (leaf 7, ebx bit 7)
+const CPUID_SMEP: u32 = 1 << 7;
+
+/// x86_64 user memory access implementation
+pub struct X86_64Uaccess;
+
+impl UaccessArch for X86_64Uaccess {
+    const TASK_SIZE: u64 = super::paging::TASK_SIZE;
+
+    /// Enable user memory access by setting AC flag (SMAP bypass)
+    ///
+    /// Executes `stac` if SMAP is available, otherwise no-op.
+    #[inline(always)]
+    unsafe fn user_access_begin() {
+        // Always execute stac if we have SMAP - it's a no-op on CPUs without SMAP
+        // when the instruction is available, and the kernel checks for SMAP support
+        // at boot time.
+        if smap_enabled() {
+            unsafe {
+                ::core::arch::asm!("stac", options(nostack, preserves_flags));
+            }
+        }
+    }
+
+    /// Fault-tolerant copy; returns the number of bytes NOT copied
+    #[inline(always)]
+    unsafe fn copy_user_raw(dst: *mut u8, src: *const u8, len: usize) -> usize {
+        unsafe { hk_copy_user(dst, src, len) }
+    }
+
+    /// Disable user memory access by clearing AC flag
+    ///
+    /// Executes `clac` if SMAP is available, otherwise no-op.
+    #[inline(always)]
+    unsafe fn user_access_end() {
+        if smap_enabled() {
+            unsafe {
+                ::core::arch::asm!("clac", options(nostack, preserves_flags));
+            }
+        }
+    }
+}
+
+// Fault-tolerant user copy (Linux: copy_user_generic + _ASM_EXTABLE_UA).
+// A fault on `rep movsb` that the page-fault handler cannot resolve resumes
+// at the fixup, which returns the remaining byte count left in RCX.
+core::arch::global_asm!(
+    ".pushsection .text.hk_copy_user, \"ax\"",
+    ".global hk_copy_user",
+    "hk_copy_user:",
+    "    mov rcx, rdx",
+    ".global hk_copy_user_insn",
+    "hk_copy_user_insn:",
+    "    rep movsb",
+    "    xor eax, eax",
+    "    ret",
+    ".global hk_copy_user_fixup",
+    "hk_copy_user_fixup:",
+    "    mov rax, rcx",
+    "    ret",
+    ".popsection",
+);
+
+unsafe extern "C" {
+    fn hk_copy_user(dst: *mut u8, src: *const u8, len: usize) -> usize;
+    static hk_copy_user_insn: u8;
+    static hk_copy_user_fixup: u8;
+}
+
+/// Exception-table lookup: if a kernel-mode fault at `rip` is inside the
+/// user-copy routine, return the address to resume at (Linux: fixup_exception)
+pub fn uaccess_fixup(rip: u64) -> Option<u64> {
+    let insn = &raw const hk_copy_user_insn as u64;
+    if rip == insn {
+        Some(&raw const hk_copy_user_fixup as u64)
+    } else {
+        None
+    }
+}
+
+/// Check if SMAP is currently enabled
+///
+/// Returns true if SMAP is both supported by the CPU and enabled in CR4.
+#[inline]
+fn smap_enabled() -> bool {
+    // Read CR4 and check SMAP bit
+    let cr4: u64;
+    unsafe {
+        ::core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags));
+    }
+    cr4 & CR4_SMAP != 0
+}
+
+/// Check if CPU supports SMAP
+pub fn cpu_has_smap() -> bool {
+    let (_, ebx, _, _) = cpuid(7, 0);
+    ebx & CPUID_SMAP != 0
+}
+
+/// Check if CPU supports SMEP
+pub fn cpu_has_smep() -> bool {
+    let (_, ebx, _, _) = cpuid(7, 0);
+    ebx & CPUID_SMEP != 0
+}
+
+/// SMAP is on: `clac` exists, and the IDT entries clear AC with it
+/// (entry.rs)
+pub static SMAP_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Enable SMAP if supported
+///
+/// Should be called during early kernel initialization.
+/// Once enabled, any kernel access to user pages without explicit
+/// `user_access_begin()`/`user_access_end()` will cause a page fault.
+pub fn enable_smap() {
+    if cpu_has_smap() {
+        SMAP_ON.store(true, core::sync::atomic::Ordering::Relaxed);
+        let mut cr4: u64;
+        unsafe {
+            ::core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags));
+            cr4 |= CR4_SMAP;
+            ::core::arch::asm!("mov cr4, {}", in(reg) cr4, options(nostack, preserves_flags));
+        }
+    }
+}
+
+/// Enable SMEP if supported
+///
+/// Should be called during early kernel initialization.
+/// Once enabled, any kernel execution of user pages will cause a page fault.
+pub fn enable_smep() {
+    if cpu_has_smep() {
+        let mut cr4: u64;
+        unsafe {
+            ::core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags));
+            cr4 |= CR4_SMEP;
+            ::core::arch::asm!("mov cr4, {}", in(reg) cr4, options(nostack, preserves_flags));
+        }
+    }
+}
+
+use super::msr::cpuid;
