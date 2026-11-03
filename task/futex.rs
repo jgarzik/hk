@@ -994,8 +994,9 @@ fn handle_futex_death(entry: u64, futex_offset: i64, tid: Tid) {
         return; // Not our futex
     }
 
-    // Set FUTEX_OWNER_DIED bit
-    let new_val = current_val | futex_op::FUTEX_OWNER_DIED;
+    // Owner died, waiters kept, the dead TID cleared (Linux
+    // handle_futex_death: a reused TID must not look like the owner)
+    let new_val = (current_val & futex_op::FUTEX_WAITERS) | futex_op::FUTEX_OWNER_DIED;
     if write_user_u32(futex_addr, new_val).is_err() {
         return;
     }
