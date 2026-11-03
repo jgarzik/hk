@@ -1,5 +1,14 @@
 //! Task management
 
+pub mod acct;
+pub(crate) mod binfmt_script;
+pub mod futex;
+pub mod kcmp;
+pub mod membarrier;
+pub mod pidfd;
+pub(crate) mod rlimit;
+pub mod workqueue;
+
 pub mod exec;
 pub mod fair;
 pub mod fdbits;
@@ -957,7 +966,7 @@ pub struct Task<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::Phy
     pub wake_cpu: AtomicU32,
     /// CPUs it may run on (Linux p->cpus_mask, sched_setaffinity):
     /// written under its pi_lock and rq lock, read under either
-    pub cpus_mask: crate::cpumask::CpuMask,
+    pub cpus_mask: crate::util::cpumask::CpuMask,
     /// Page-fault-disable depth (Linux p->pagefault_disabled), written
     /// by the task itself (`uaccess::pagefault_disable`)
     pub pagefault_disabled: AtomicU32,
@@ -1010,7 +1019,7 @@ pub struct Task<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::Phy
     /// The vforking parent's completion until this task execs or exits
     /// (Linux vfork_done): set by the parent before the task runs, taken
     /// once by the task
-    pub vfork_done: AtomicPtr<crate::completion::Completion>,
+    pub vfork_done: AtomicPtr<crate::sync::completion::Completion>,
     /// Credentials (Linux task->cred): read lock-free by the task, under
     /// TASKLIST by others; replaced only by the task (commit_creds)
     /// under TASKLIST
@@ -1072,19 +1081,19 @@ pub struct Task<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::Phy
     pub maj_flt: AtomicU64,
 
     /// Its place in the task list (Linux task->tasks; under TASKLIST)
-    pub tasks_link: crate::list::Link,
+    pub tasks_link: crate::util::list::Link,
     /// Its place in its real parent's `children` (Linux sibling; under
     /// TASKLIST)
-    pub sibling: crate::list::Link,
+    pub sibling: crate::util::list::Link,
     /// Its place in its group leader's `threads` (Linux thread_node;
     /// under TASKLIST)
-    pub thread_node: crate::list::Link,
+    pub thread_node: crate::util::list::Link,
     /// A group leader's place on its process group's `Pid.pgrp` (Linux
     /// pid_links[PIDTYPE_PGID]; under TASKLIST)
-    pub pgrp_link: crate::list::Link,
+    pub pgrp_link: crate::util::list::Link,
     /// A group leader's place on its session's `Pid.session` (Linux
     /// pid_links[PIDTYPE_SID]; under TASKLIST)
-    pub session_link: crate::list::Link,
+    pub session_link: crate::util::list::Link,
     /// The rest, under TASKLIST (None only for the boot task, which
     /// is never in the table)
     inner: TableCell<Option<TaskInner<A, PT>>>,
@@ -1206,7 +1215,7 @@ pub struct TaskInner<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A
     /// Its children (Linux children; their `sibling` links): the thread
     /// group leaders it created, one strong reference each, until reaped
     /// or reparented (under TASKLIST)
-    pub children: crate::list::ArcList<Sibling<A, PT>>,
+    pub children: crate::util::list::ArcList<Sibling<A, PT>>,
 
     /// On its real parent's `children` (a group leader; Linux: only
     /// leaders are)
@@ -1215,7 +1224,7 @@ pub struct TaskInner<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A
     /// A leader's thread group, itself included (Linux
     /// signal->thread_head; links `thread_node`), one strong reference
     /// each, until a thread leaves the task list (under TASKLIST)
-    pub threads: crate::list::ArcList<ThreadNode<A, PT>>,
+    pub threads: crate::util::list::ArcList<ThreadNode<A, PT>>,
 
     /// Message for PTRACE_GETEVENTMSG (child PID, exec old TID, exit code, etc.)
     pub ptrace_message: u64,
@@ -1262,13 +1271,13 @@ pub struct Sibling<A, PT>(core::marker::PhantomData<(A, PT)>);
 
 // SAFETY: offset_of! gives `sibling`'s place in the task
 unsafe impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>>
-    crate::list::Adapter for Sibling<A, PT>
+    crate::util::list::Adapter for Sibling<A, PT>
 {
     type Item = Task<A, PT>;
-    fn link(t: &Task<A, PT>) -> &crate::list::Link {
+    fn link(t: &Task<A, PT>) -> &crate::util::list::Link {
         &t.sibling
     }
-    unsafe fn item(l: *const crate::list::Link) -> *const Task<A, PT> {
+    unsafe fn item(l: *const crate::util::list::Link) -> *const Task<A, PT> {
         // SAFETY: `l` is the `sibling` of a live task
         unsafe {
             (l as *const u8).sub(core::mem::offset_of!(Task<A, PT>, sibling)) as *const Task<A, PT>
@@ -1281,13 +1290,13 @@ pub struct ThreadNode<A, PT>(core::marker::PhantomData<(A, PT)>);
 
 // SAFETY: offset_of! gives `thread_node`'s place in the task
 unsafe impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>>
-    crate::list::Adapter for ThreadNode<A, PT>
+    crate::util::list::Adapter for ThreadNode<A, PT>
 {
     type Item = Task<A, PT>;
-    fn link(t: &Task<A, PT>) -> &crate::list::Link {
+    fn link(t: &Task<A, PT>) -> &crate::util::list::Link {
         &t.thread_node
     }
-    unsafe fn item(l: *const crate::list::Link) -> *const Task<A, PT> {
+    unsafe fn item(l: *const crate::util::list::Link) -> *const Task<A, PT> {
         // SAFETY: `l` is the `thread_node` of a live task
         unsafe {
             (l as *const u8).sub(core::mem::offset_of!(Task<A, PT>, thread_node))
@@ -1547,7 +1556,7 @@ impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Tas
         kind: TaskKind,
         kstack_top: A::VirtAddr,
         cpu: u32,
-        cpus: &crate::cpumask::CpuSet,
+        cpus: &crate::util::cpumask::CpuSet,
         cred: Arc<Cred>,
         mm: Option<crate::mm::MmRef>,
         alloc: TaskAlloc,
@@ -1568,7 +1577,7 @@ impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Tas
             thread_flags: AtomicU32::new(0),
             cpu: AtomicU32::new(cpu),
             wake_cpu: AtomicU32::new(cpu),
-            cpus_mask: crate::cpumask::CpuMask::from_set(cpus),
+            cpus_mask: crate::util::cpumask::CpuMask::from_set(cpus),
             pagefault_disabled: AtomicU32::new(0),
             rx_cpu: AtomicU32::new(u32::MAX),
             se: sched::SchedEntity::new(0),
@@ -1601,19 +1610,19 @@ impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Tas
             acct_seq: AtomicU32::new(0),
             acct_running: AtomicBool::new(false),
             cpu_next: [
-                AtomicU64::new(crate::cpu_timer::NONE),
-                AtomicU64::new(crate::cpu_timer::NONE),
+                AtomicU64::new(crate::time::cpu_timer::NONE),
+                AtomicU64::new(crate::time::cpu_timer::NONE),
             ],
             cpu_group: spin::Once::new(),
             nvcsw: AtomicU64::new(0),
             nivcsw: AtomicU64::new(0),
             min_flt: AtomicU64::new(0),
             maj_flt: AtomicU64::new(0),
-            tasks_link: crate::list::Link::new(),
-            sibling: crate::list::Link::new(),
-            thread_node: crate::list::Link::new(),
-            pgrp_link: crate::list::Link::new(),
-            session_link: crate::list::Link::new(),
+            tasks_link: crate::util::list::Link::new(),
+            sibling: crate::util::list::Link::new(),
+            thread_node: crate::util::list::Link::new(),
+            pgrp_link: crate::util::list::Link::new(),
+            session_link: crate::util::list::Link::new(),
             inner: TableCell::new(Some(inner)),
         }
     }
@@ -1631,7 +1640,7 @@ impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Tas
             thread_flags: AtomicU32::new(0),
             cpu: AtomicU32::new(0),
             wake_cpu: AtomicU32::new(0),
-            cpus_mask: crate::cpumask::CpuMask::new(),
+            cpus_mask: crate::util::cpumask::CpuMask::new(),
             pagefault_disabled: AtomicU32::new(0),
             rx_cpu: AtomicU32::new(u32::MAX),
             se: sched::SchedEntity::new(0),
@@ -1664,19 +1673,19 @@ impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Tas
             acct_seq: AtomicU32::new(0),
             acct_running: AtomicBool::new(false),
             cpu_next: [
-                AtomicU64::new(crate::cpu_timer::NONE),
-                AtomicU64::new(crate::cpu_timer::NONE),
+                AtomicU64::new(crate::time::cpu_timer::NONE),
+                AtomicU64::new(crate::time::cpu_timer::NONE),
             ],
             cpu_group: spin::Once::new(),
             nvcsw: AtomicU64::new(0),
             nivcsw: AtomicU64::new(0),
             min_flt: AtomicU64::new(0),
             maj_flt: AtomicU64::new(0),
-            tasks_link: crate::list::Link::new(),
-            sibling: crate::list::Link::new(),
-            thread_node: crate::list::Link::new(),
-            pgrp_link: crate::list::Link::new(),
-            session_link: crate::list::Link::new(),
+            tasks_link: crate::util::list::Link::new(),
+            sibling: crate::util::list::Link::new(),
+            thread_node: crate::util::list::Link::new(),
+            pgrp_link: crate::util::list::Link::new(),
+            session_link: crate::util::list::Link::new(),
             inner: TableCell::new(None),
         }
     }
@@ -2290,8 +2299,8 @@ pub fn nproc_count(uid: Uid) -> u64 {
 /// `count` tasks exceed the caller's RLIMIT_NPROC (Linux
 /// is_rlimit_overlimit)
 pub fn nproc_overlimit(count: u64) -> bool {
-    let limit = crate::rlimit::rlimit(crate::rlimit::RLIMIT_NPROC);
-    limit != crate::rlimit::RLIM_INFINITY && count > limit
+    let limit = crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_NPROC);
+    limit != crate::task::rlimit::RLIM_INFINITY && count > limit
 }
 
 /// clone's check (Linux copy_process): over the limit fails unless the

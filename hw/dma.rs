@@ -18,7 +18,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{Ordering, fence};
 
 use crate::arch::{phys_to_virt, virt_to_phys};
-use crate::frame_alloc::{FRAME_SIZE, FrameAllocator};
+use crate::mm::frame_alloc::{FRAME_SIZE, FrameAllocator};
 
 /// DMA address type - what devices see
 ///

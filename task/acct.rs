@@ -323,7 +323,7 @@ fn write_record(file: &File, tid: Tid, pid: Pid, exit_status: i32) {
     // The record is not subject to the process's RLIMIT_FSIZE (no
     // SIGXFSZ, no lost record): unlimited across the write (Linux
     // do_acct_process)
-    use crate::rlimit::{RLIM_INFINITY, RLIMIT_FSIZE};
+    use crate::task::rlimit::{RLIM_INFINITY, RLIMIT_FSIZE};
     let sig = crate::signal::get_task_signal_struct(tid);
     let old = sig
         .as_ref()

@@ -8,9 +8,9 @@
 use alloc::vec;
 
 use crate::arch::Uaccess;
-use crate::error::KernelError;
 use crate::task::percpu;
 use crate::uaccess::{copy_from_user, strncpy_from_user};
+use crate::util::error::KernelError;
 
 use super::key::{KEY_DEFAULT_PERM, Key};
 use super::keyring::{keyring_link, resolve_special_keyring, search_process_keyrings};

@@ -8,6 +8,9 @@
 //! lock raises); sleeping locks order above every spinlock. Before
 //! scheduling is enabled (early boot) a contended lock spins.
 
+pub mod completion;
+pub mod waitqueue;
+
 pub mod lockdep;
 mod mutex;
 mod racy;

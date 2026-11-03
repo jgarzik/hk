@@ -23,7 +23,6 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use crate::error::KernelError;
 use crate::net::NetNamespace;
 use crate::net::device::NetDevice;
 use crate::net::inet::fib::{self, RouteType};
@@ -31,6 +30,7 @@ use crate::net::ipv4::Ipv4Addr;
 use crate::net::netlink::NlInfo;
 use crate::net::netlink::rtnetlink;
 use crate::net::rtnl::RtnlGuard;
+use crate::util::error::KernelError;
 
 /// Address flags (Linux IFA_F_*)
 pub const IFA_F_SECONDARY: u32 = 0x01;

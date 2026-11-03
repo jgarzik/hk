@@ -49,7 +49,7 @@ struct Snap {
     nice: i32,
     policy: i32,
     rt_priority: i32,
-    cpus: crate::cpumask::CpuSet,
+    cpus: crate::util::cpumask::CpuSet,
     cpu: u32,
     exit_signal: i32,
     exit_code: i32,
@@ -207,8 +207,8 @@ fn fd_size(s: &Snap) -> u64 {
 fn rss_lim(s: &Snap) -> u64 {
     s.signal
         .as_ref()
-        .and_then(|sig| sig.get_rlimit(crate::rlimit::RLIMIT_RSS))
-        .map_or(crate::rlimit::RLIM_INFINITY, |r| r.rlim_cur)
+        .and_then(|sig| sig.get_rlimit(crate::task::rlimit::RLIMIT_RSS))
+        .map_or(crate::task::rlimit::RLIM_INFINITY, |r| r.rlim_cur)
 }
 
 /// Memory figures of an address space, in pages (Linux task_mem)
@@ -314,7 +314,7 @@ pub fn gen_status(pid: Pid) -> Vec<u8> {
     let _ = writeln!(o, "Speculation_Store_Bypass:\tunknown");
     let _ = writeln!(o, "SpeculationIndirectBranch:\tunknown");
     let n = crate::cpu::nr_cpu_ids();
-    let cpus = s.cpus.and(&crate::cpumask::CpuSet::first(n));
+    let cpus = s.cpus.and(&crate::util::cpumask::CpuSet::first(n));
     let _ = writeln!(o, "Cpus_allowed:\t{}", cpus.fmt_hex(n));
     let _ = writeln!(o, "Cpus_allowed_list:\t{}", cpus.fmt_list());
     let _ = writeln!(o, "Mems_allowed:\t1\nMems_allowed_list:\t0");
@@ -356,7 +356,7 @@ fn status_sig(o: &mut Out, s: &Snap) {
     let qlim = s
         .signal
         .as_ref()
-        .and_then(|sig| sig.get_rlimit(crate::rlimit::RLIMIT_SIGPENDING))
+        .and_then(|sig| sig.get_rlimit(crate::task::rlimit::RLIMIT_SIGPENDING))
         .map_or(0, |r| r.rlim_cur);
     let (ign, cgt) = ign_cgt(s);
     let _ = writeln!(o, "Threads:\t{}\nSigQ:\t0/{}", s.threads, qlim);

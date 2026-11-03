@@ -354,7 +354,9 @@ pub fn extract_simple_framebuffer() -> Option<crate::gfx::FramebufferInfo> {
 /// Returns Ok(true) if NUMA topology was found, Ok(false) if no NUMA info
 /// (caller should use single-node fallback).
 pub fn init_numa_topology() -> Result<bool, &'static str> {
-    use crate::numa::{LOCAL_DISTANCE, MAX_NUMA_NODES, NUMA_TOPOLOGY, NumaNode, REMOTE_DISTANCE};
+    use crate::mm::numa::{
+        LOCAL_DISTANCE, MAX_NUMA_NODES, NUMA_TOPOLOGY, NumaNode, REMOTE_DISTANCE,
+    };
 
     let Some(dtb_data) = blob() else {
         return Ok(false);
@@ -442,7 +444,7 @@ pub fn init_numa_topology() -> Result<bool, &'static str> {
                 && let Some(node_id) = numa_prop.as_u32()
             {
                 let node_id = node_id as usize;
-                if node_id < MAX_NUMA_NODES && (cpu_id as usize) < crate::cpumask::NR_CPUS {
+                if node_id < MAX_NUMA_NODES && (cpu_id as usize) < crate::util::cpumask::NR_CPUS {
                     found_numa = true;
                     topology.cpu_to_node[cpu_id as usize] = node_id as u8;
 

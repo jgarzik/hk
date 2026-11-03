@@ -18,13 +18,13 @@
 use alloc::sync::Arc;
 use core::sync::atomic::Ordering;
 
-use crate::error::KernelError;
+use crate::io::poll::{
+    POLLERR, POLLHUP, POLLIN, POLLOUT, POLLRDHUP, POLLRDNORM, POLLWRBAND, POLLWRNORM,
+};
 use crate::net::msg::{MSG_DONTWAIT, MSG_OOB, MSG_PEEK, MSG_TRUNC, RecvMsg, SendMsg};
 use crate::net::sock::SHUTDOWN_MASK;
 use crate::net::socket::{AF_UNSPEC, SOCK_SEQPACKET};
-use crate::poll::{
-    POLLERR, POLLHUP, POLLIN, POLLOUT, POLLRDHUP, POLLRDNORM, POLLWRBAND, POLLWRNORM,
-};
+use crate::util::error::KernelError;
 
 use super::scm::{Creds, FpList, Scm, too_many_fds};
 use super::{

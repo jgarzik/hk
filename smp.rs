@@ -27,7 +27,7 @@ use alloc::boxed::Box;
 use spin::Once;
 
 use crate::cpu::{PerCpu, nr_cpu_ids, this_id};
-use crate::cpumask::{CpuMask, CpuSet};
+use crate::util::cpumask::{CpuMask, CpuSet};
 
 /// One call (Linux call_single_data)
 struct Csd {
@@ -81,7 +81,7 @@ pub fn stop_other_cpus() {
     }
     smp_call_function_many(&others, stop_this_cpu, 0, false);
     let gone = || ACTIVE.snapshot().and(&others).is_empty();
-    if crate::delay::poll_timeout(1_000_000, 10, gone).is_err() {
+    if crate::time::delay::poll_timeout(1_000_000, 10, gone).is_err() {
         let left = ACTIVE.snapshot().and(&others);
         crate::printkln!("smp: CPUs {} did not stop", left.fmt_list());
     }

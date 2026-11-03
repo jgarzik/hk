@@ -33,7 +33,7 @@ use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering, fence};
 use super::Mm;
 use crate::arch::{CurrentArch, local_irq_restore, local_irq_save, paging};
 use crate::cpu::{PerCpu, this_id};
-use crate::cpumask::CpuMask;
+use crate::util::cpumask::CpuMask;
 
 use crate::arch::tlb as arch;
 pub use crate::arch::tlb::ArchCtx;

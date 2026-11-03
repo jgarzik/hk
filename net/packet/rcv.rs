@@ -12,14 +12,14 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use crate::sync::spin::{Mutex, RwLock};
 
 use super::{ETH_P_802_2, ETH_P_802_3, ETH_P_ALL, PacketSock, SLL_LEN, Sll, pf};
-use crate::error::KernelError;
+use crate::io::poll::{POLLERR, POLLIN, POLLOUT, POLLRDNORM, POLLWRBAND, POLLWRNORM};
 use crate::net::dev::Tap;
 use crate::net::ethernet::{ETH_ALEN, ETH_HLEN, PktType};
 use crate::net::filter::Ctx;
 use crate::net::msg::{MSG_DONTWAIT, MSG_PEEK, MSG_TRUNC, RecvMsg};
 use crate::net::sock::Sock;
 use crate::net::socket::SOCK_RAW;
-use crate::poll::{POLLERR, POLLIN, POLLOUT, POLLRDNORM, POLLWRBAND, POLLWRNORM};
+use crate::util::error::KernelError;
 
 /// Socket level of packet options and control messages
 pub const SOL_PACKET: i32 = 263;

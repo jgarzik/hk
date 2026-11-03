@@ -31,8 +31,8 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::arch::IrqSpinlock;
-use crate::error::KernelError;
-use crate::waitqueue::WaitQueue;
+use crate::sync::waitqueue::WaitQueue;
+use crate::util::error::KernelError;
 
 /// Ring size in bytes
 pub const LOG_BUF_LEN: usize = 1 << 17;
@@ -674,8 +674,8 @@ impl crate::fs::FileOps for KmsgFileOps {
         Ok(0)
     }
 
-    fn poll(&self, file: &crate::fs::File, pt: Option<&mut crate::poll::PollTable>) -> u16 {
-        use crate::poll::{POLLERR, POLLIN, POLLPRI, POLLRDNORM};
+    fn poll(&self, file: &crate::fs::File, pt: Option<&mut crate::io::poll::PollTable>) -> u16 {
+        use crate::io::poll::{POLLERR, POLLIN, POLLPRI, POLLRDNORM};
         if let Some(pt) = pt {
             pt.poll_wait(&WAITERS);
         }
@@ -697,17 +697,17 @@ impl crate::fs::FileOps for KmsgFileOps {
 /// /dev/kmsg as a character device: its own file operations
 pub struct KmsgCharDevice;
 
-impl crate::chardev::CharDevice for KmsgCharDevice {
+impl crate::fs::chardev::CharDevice for KmsgCharDevice {
     fn name(&self) -> &str {
         "kmsg"
     }
 
-    fn read(&self, _buf: &mut [u8]) -> Result<usize, crate::chardev::DeviceError> {
-        Err(crate::chardev::DeviceError::NotSupported)
+    fn read(&self, _buf: &mut [u8]) -> Result<usize, crate::fs::chardev::DeviceError> {
+        Err(crate::fs::chardev::DeviceError::NotSupported)
     }
 
-    fn write(&self, _buf: &[u8]) -> Result<usize, crate::chardev::DeviceError> {
-        Err(crate::chardev::DeviceError::NotSupported)
+    fn write(&self, _buf: &[u8]) -> Result<usize, crate::fs::chardev::DeviceError> {
+        Err(crate::fs::chardev::DeviceError::NotSupported)
     }
 
     fn fops(&self) -> Option<&'static dyn crate::fs::FileOps> {

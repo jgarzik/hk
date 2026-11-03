@@ -32,8 +32,8 @@ use super::map::{BPF_MAP_TYPE_ARRAY, BPF_MAP_TYPE_HASH, BpfMapOps, create_map};
 use super::prog::BpfProg;
 use super::verifier::verify_bpf_prog;
 use crate::arch::Uaccess;
-use crate::error::KernelError;
 use crate::uaccess::{copy_from_user, copy_to_user};
+use crate::util::error::KernelError;
 
 // =============================================================================
 // BPF Commands (Linux ABI)

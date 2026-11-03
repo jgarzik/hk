@@ -13,8 +13,8 @@ use alloc::vec::Vec;
 use core::fmt::Write;
 use core::sync::atomic::Ordering;
 
-use crate::error::KernelError;
 use crate::fs::devtmpfs;
+use crate::util::error::KernelError;
 
 use super::blkdev::{
     BLKDEV_REGISTRY, BioOp, BlockDevice, Disk, bdev_rw_bytes, disk_bdevs, disk_release,

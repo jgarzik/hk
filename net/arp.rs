@@ -168,7 +168,7 @@ pub fn arp_rcv(skb: SkBuff) {
     if skb.len() < ARP_HLEN {
         return;
     }
-    let Some(hdr) = <ArpHdr as crate::pod::FromBytes>::read_from(skb.data()) else {
+    let Some(hdr) = <ArpHdr as crate::util::pod::FromBytes>::read_from(skb.data()) else {
         return;
     };
     if hdr.hardware_type() != ARPHRD_ETHER || hdr.protocol_type() != 0x0800 {
@@ -352,7 +352,7 @@ pub fn output(
     dev: &alloc::sync::Arc<NetDevice>,
     nexthop: Ipv4Addr,
     skb: Box<SkBuff>,
-) -> Result<(), crate::error::KernelError> {
+) -> Result<(), crate::util::error::KernelError> {
     let n = net.arp.create(dev, &neigh::key4(nexthop))?;
     net.arp.output(&n, skb)
 }

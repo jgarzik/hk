@@ -14,7 +14,7 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
 
-use crate::error::KernelError;
+use crate::util::error::KernelError;
 
 use super::key::{KEYRING_DEFAULT_PERM, Key, KeySerial};
 use super::types::keyring_key_type;

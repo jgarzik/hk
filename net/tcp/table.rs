@@ -31,9 +31,9 @@ use crate::sync::spin::RwLock;
 use super::TcpSock;
 use super::output::Tuple;
 use super::timewait::TimeWait;
-use crate::error::KernelError;
 use crate::net::inet::port::{self, BindInfo, Flow, Parity};
 use crate::net::ipv4::{IPPROTO_TCP, Ipv4Addr};
+use crate::util::error::KernelError;
 
 /// An ehash entry
 #[derive(Clone)]

@@ -29,9 +29,9 @@ use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering
 
 use crate::arch::IrqSpinlock;
 use crate::cpu::PerCpu;
-use crate::list::{Link, List};
+use crate::sync::waitqueue::WaitQueue;
 use crate::task::percpu::{TICK_NS, get_ticks};
-use crate::waitqueue::WaitQueue;
+use crate::util::list::{Link, List};
 
 /// A timer callback (Linux timer_list.function); the owner is reached
 /// through `data` (or the timer's place in it)
@@ -370,10 +370,11 @@ fn ktimers(cpu: usize) {
     let cpu = cpu as u32;
     let soft = &BASES.get(cpu)[1];
     loop {
-        soft.wq
-            .wait_event(|| soft.wheel.lock().any_due(get_ticks()) || crate::hrtimer::soft_due(cpu));
+        soft.wq.wait_event(|| {
+            soft.wheel.lock().any_due(get_ticks()) || crate::time::hrtimer::soft_due(cpu)
+        });
         soft.run(get_ticks());
-        crate::hrtimer::run_soft(cpu);
+        crate::time::hrtimer::run_soft(cpu);
         // `del_timer_sync` / `cancel_sync` waiters look again
         soft.wq.wake_all();
         // A scheduling point between passes: callbacks due again at

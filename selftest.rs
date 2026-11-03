@@ -11,13 +11,13 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crate::sync::spin::Mutex;
 
 use crate::printkln;
+use crate::sync::waitqueue::WaitQueue;
 use crate::task::kthread::{
     kthread_park, kthread_parkme, kthread_run, kthread_should_park, kthread_should_stop,
     kthread_stop, kthread_unpark,
 };
 use crate::task::percpu::{TICK_MS, cpu_has_scheduler, get_ticks, sleep_until_ns};
-use crate::waitqueue::WaitQueue;
-use crate::workqueue::{DelayedWork, SYSTEM_WQ, Work};
+use crate::task::workqueue::{DelayedWork, SYSTEM_WQ, Work};
 
 /// Selftest events land here
 static EVENT_WQ: WaitQueue = WaitQueue::new();

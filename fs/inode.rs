@@ -14,7 +14,7 @@ use super::KernelError;
 use super::superblock::SuperBlock;
 
 // Re-export device types from chardev module
-pub use crate::chardev::{DevId, DeviceType};
+pub use crate::fs::chardev::{DevId, DeviceType};
 
 use crate::task::Cred;
 /// Re-export credential types from task module
@@ -472,7 +472,7 @@ pub struct Inode {
 
     /// A FIFO's pipe while it is open, and how many files have it open
     /// (Linux inode->i_pipe and pipe->files)
-    pub i_pipe: crate::sync::spin::Mutex<Option<(Arc<crate::pipe::Pipe>, usize)>>,
+    pub i_pipe: crate::sync::spin::Mutex<Option<(Arc<crate::io::pipe::Pipe>, usize)>>,
 
     /// The file's page cache (Linux i_data)
     pub i_data: crate::mm::filemap::AddressSpace,

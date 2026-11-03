@@ -19,10 +19,10 @@ use crate::sync::spin::Mutex;
 use crate::arch::{CurrentArch, IoremapOps, phys_to_virt};
 use crate::bus::bus::{BusContext, BusDevice, BusDriver};
 use crate::bus::driver::{Device, DriverError};
-use crate::delay::{poll_timeout, udelay};
 use crate::downcast_bus_device;
 use crate::hw::pci::PciDevice;
 use crate::printkln;
+use crate::time::delay::{poll_timeout, udelay};
 
 /// Halt and start handshakes (Linux XHCI_MAX_HALT_USEC)
 pub(super) const XHCI_MAX_HALT_US: u64 = 32_000;

@@ -9,7 +9,7 @@ use super::cb::{
     Cfg, MSS_DEFAULT, Open, Out, RCV_SHUTDOWN, RTO_MAX, Seg, SegIn, TIMEWAIT_LEN, TcpCb, TcpState,
     flags,
 };
-use crate::error::KernelError;
+use crate::util::error::KernelError;
 
 fn seg_in(s: &Seg) -> SegIn<'_> {
     SegIn {

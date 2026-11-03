@@ -22,8 +22,8 @@ use super::blkdev::{
 };
 use super::genhd::add_disk;
 use crate::arch::phys_to_virt;
-use crate::error::KernelError;
 use crate::sync::spin::Mutex;
+use crate::util::error::KernelError;
 
 const PAGE: u64 = 4096;
 

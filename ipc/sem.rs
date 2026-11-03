@@ -13,7 +13,6 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, Ordering};
 
 use crate::arch::Uaccess;
-use crate::error::KernelError;
 use crate::ipc::util::{
     IPC_PERM_READ, IPC_PERM_WRITE, IpcObject, KernIpcPerm, ipc_checkperm, ipcget,
 };
@@ -22,10 +21,11 @@ use crate::ipc::{
     current_ipc_ns,
 };
 use crate::sync::spin::Mutex;
+use crate::sync::waitqueue::WaitQueue;
 use crate::task::percpu::{current_pid, current_tid};
 use crate::time::TIMEKEEPER;
 use crate::uaccess::{get_user, put_user};
-use crate::waitqueue::WaitQueue;
+use crate::util::error::KernelError;
 
 /// Get current time in seconds
 fn current_time_secs() -> i64 {
@@ -420,7 +420,7 @@ fn do_semtimedop(semid: i32, sops_ptr: u64, nsops: usize, timeout_ptr: u64) -> R
                 let r = sem_array.waitq.wait_event_interruptible_deadline(
                     || queue.woken.load(Ordering::Acquire),
                     deadline_ns,
-                    crate::hrtimer::HrClock::Monotonic,
+                    crate::time::hrtimer::HrClock::Monotonic,
                 );
                 if r.is_err() && !queue.woken.load(Ordering::Acquire) {
                     sem_array.pending.lock().retain(|q| !Arc::ptr_eq(q, &queue));

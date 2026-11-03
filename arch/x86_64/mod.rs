@@ -170,7 +170,7 @@ impl crate::arch::UserRegs for PtRegs {
                 self.rip = ip;
                 self.rax = self.orig_rax;
             }
-            _ => self.rax = crate::error::KernelError::Interrupted.sysret() as u64,
+            _ => self.rax = crate::util::error::KernelError::Interrupted.sysret() as u64,
         }
     }
 }

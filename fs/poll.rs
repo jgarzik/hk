@@ -97,7 +97,7 @@ fn read_ts(uptr: u64, kind: PollTs) -> Result<Deadline, i64> {
 /// the deadline. Returns `Some(retval)` when the poll must stop.
 fn poll_sleep(deadline: Deadline) -> Option<i64> {
     use crate::task::percpu::{SleepState, set_current_state};
-    if crate::waitqueue::signal_pending() {
+    if crate::sync::waitqueue::signal_pending() {
         set_current_state(SleepState::Running);
         return Some(KernelError::RestartNoHand.sysret());
     }
@@ -107,7 +107,7 @@ fn poll_sleep(deadline: Deadline) -> Option<i64> {
         set_current_state(SleepState::Running);
         return Some(0);
     }
-    crate::hrtimer::schedule_hrtimeout(deadline, crate::hrtimer::HrClock::Monotonic);
+    crate::time::hrtimer::schedule_hrtimeout(deadline, crate::time::hrtimer::HrClock::Monotonic);
     None
 }
 
@@ -155,7 +155,7 @@ pub fn sys_poll(fds: u64, nfds: u32, timeout_ms: i32) -> i64 {
 /// Sleeps on the polled files' wait queues; a deliverable signal ends the
 /// wait with -ERESTARTNOHAND (EINTR once a handler runs).
 fn do_poll_internal(fds: u64, nfds: u32, deadline: Deadline) -> i64 {
-    use crate::poll::{POLLNVAL, PollContext, PollFd, PollTable};
+    use crate::io::poll::{POLLNVAL, PollContext, PollFd, PollTable};
     use crate::task::percpu::{SleepState, set_current_state};
     use crate::uaccess::{copy_from_user, copy_to_user};
 
@@ -237,7 +237,7 @@ fn do_poll_internal(fds: u64, nfds: u32, deadline: Deadline) -> i64 {
 
             // Check if any requested events are ready
             let revents =
-                mask & (pollfd.events as u16 | crate::poll::POLLERR | crate::poll::POLLHUP);
+                mask & (pollfd.events as u16 | crate::io::poll::POLLERR | crate::io::poll::POLLHUP);
             if revents != 0 {
                 pollfd.revents = revents as i16;
                 ready_count += 1;
@@ -453,7 +453,9 @@ fn do_select_internal(
     exceptfds: u64,
     deadline: Deadline,
 ) -> i64 {
-    use crate::poll::{FdSet, POLLERR, POLLHUP, POLLIN, POLLOUT, POLLPRI, PollContext, PollTable};
+    use crate::io::poll::{
+        FdSet, POLLERR, POLLHUP, POLLIN, POLLOUT, POLLPRI, PollContext, PollTable,
+    };
     use crate::task::percpu::{SleepState, set_current_state};
     use crate::uaccess::{copy_from_user, copy_to_user};
 

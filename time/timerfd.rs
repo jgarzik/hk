@@ -30,10 +30,10 @@ use core::pin::Pin;
 use crate::arch::IrqSpinlock;
 use crate::fs::KernelError;
 use crate::fs::file::{File, FileOps, flags};
-use crate::hrtimer::{HRTIMER_HARD, HrClock, HrTimer};
-use crate::poll::{POLLIN, POLLRDNORM, PollTable};
-use crate::time_syscall::LinuxTimespec;
-use crate::waitqueue::WaitQueue;
+use crate::io::poll::{POLLIN, POLLRDNORM, PollTable};
+use crate::sync::waitqueue::WaitQueue;
+use crate::time::hrtimer::{HRTIMER_HARD, HrClock, HrTimer};
+use crate::time::time_syscall::LinuxTimespec;
 
 /// Timerfd create flags
 pub mod tfd_flags {
@@ -325,7 +325,7 @@ impl Timerfd {
         }
         inner.expired = false;
         let now = inner.clock.now();
-        let (missed, next) = crate::timer::forward(inner.expires_ns, inner.interval_ns, now);
+        let (missed, next) = crate::time::timer::forward(inner.expires_ns, inner.interval_ns, now);
         match next {
             Some(n) => {
                 inner.expires_ns = n;
@@ -379,7 +379,7 @@ impl Timerfd {
 
 /// The timer clock of a timerfd clock id
 fn clock_of(clockid: i32) -> HrClock {
-    crate::time_syscall::PosixClock::decode(clockid)
+    crate::time::time_syscall::PosixClock::decode(clockid)
         .and_then(|c| c.timer_base())
         .unwrap_or(HrClock::Monotonic)
 }
@@ -440,7 +440,7 @@ impl FileOps for TimerfdFileOps {
 
     fn poll(&self, file: &File, pt: Option<&mut PollTable>) -> u16 {
         let Some(timerfd) = file.private_ref::<Timerfd>() else {
-            return crate::poll::POLLERR;
+            return crate::io::poll::POLLERR;
         };
         timerfd.poll(pt)
     }

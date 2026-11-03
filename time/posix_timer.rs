@@ -11,7 +11,7 @@
 //! timer_create(clockid, sigevent, &timer_id) -> Allocates per-process timer
 //!     |
 //!     v
-//! timer_settime(timer_id, ...) -> Arms timer via timer.rs
+//! timer_settime(timer_id, ...) -> Arms timer via time/timer.rs
 //!     |
 //!     v
 //! Timer expires -> Callback sends signal (or no-op for SIGEV_NONE)
@@ -30,12 +30,12 @@ use core::pin::Pin;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::arch::IrqSpinlock;
-use crate::hrtimer::{HrClock, HrTimer};
 use crate::signal::{SIGALRM, send_signal};
 use crate::task::Tid;
 use crate::task::percpu::TICK_NS;
-use crate::time_syscall::CLOCK_REALTIME;
-use crate::timerfd::ITimerSpec;
+use crate::time::hrtimer::{HrClock, HrTimer};
+use crate::time::time_syscall::CLOCK_REALTIME;
+use crate::time::timerfd::ITimerSpec;
 
 /// POSIX timer notification types (matches Linux)
 pub mod sigev_notify {
@@ -144,11 +144,11 @@ pub struct PosixTimer {
     timer: HrTimer,
     /// A CPU-time timer's clock (`cpu_timer`): its expiry is checked
     /// by the tick and run on the way back to user mode, not an hrtimer
-    cpu: Option<crate::cpu_timer::CpuClock>,
+    cpu: Option<crate::time::cpu_timer::CpuClock>,
     /// A clock_nanosleep's timer: its expiry wakes the sleeper on `wq`
     /// instead of signalling; never seen by timer_* syscalls
     sleeper: bool,
-    wq: crate::waitqueue::WaitQueue,
+    wq: crate::sync::waitqueue::WaitQueue,
 }
 
 impl PosixTimer {
@@ -163,7 +163,7 @@ impl PosixTimer {
         clockid: i32,
         owner_tid: Tid,
         sigevent: SigEvent,
-        cpu: Option<crate::cpu_timer::CpuClock>,
+        cpu: Option<crate::time::cpu_timer::CpuClock>,
         sleeper: bool,
     ) -> Arc<Self> {
         let timer = Arc::new(Self {
@@ -175,7 +175,7 @@ impl PosixTimer {
             timer: HrTimer::new(posix_timer_fire, 0),
             cpu,
             sleeper,
-            wq: crate::waitqueue::WaitQueue::new(),
+            wq: crate::sync::waitqueue::WaitQueue::new(),
         });
         timer.timer.set_data(Arc::as_ptr(&timer) as usize);
         timer
@@ -226,12 +226,12 @@ impl PosixTimer {
             // Absolute, kept on its clock: a realtime one follows
             // clock_settime. A TAI deadline is the realtime one TAI - UTC
             // earlier (as clock_nanosleep's)
-            let pclock = crate::time_syscall::PosixClock::decode(self.clockid);
+            let pclock = crate::time::time_syscall::PosixClock::decode(self.clockid);
             let clock = pclock
                 .and_then(|c| c.timer_base())
                 .unwrap_or(HrClock::Monotonic);
-            let value_ns = if pclock == Some(crate::time_syscall::PosixClock::Tai) {
-                (value_ns as i128 - crate::time_syscall::tai_offset_ns()).max(0) as u64
+            let value_ns = if pclock == Some(crate::time::time_syscall::PosixClock::Tai) {
+                (value_ns as i128 - crate::time::time_syscall::tai_offset_ns()).max(0) as u64
             } else {
                 value_ns
             };
@@ -256,7 +256,7 @@ impl PosixTimer {
     /// Get current timer value
     pub fn gettime(&self) -> ITimerSpec {
         if let Some(c) = self.cpu {
-            let now = crate::cpu_timer::sample_now(c, crate::task::percpu::current_pid());
+            let now = crate::time::cpu_timer::sample_now(c, crate::task::percpu::current_pid());
             let inner = self.inner.lock();
             return cpu_value(&inner, now.unwrap_or(0));
         }
@@ -269,12 +269,13 @@ impl PosixTimer {
     /// tick checks (Linux posix_cpu_timer_set)
     fn cpu_settime(
         &self,
-        c: crate::cpu_timer::CpuClock,
+        c: crate::time::cpu_timer::CpuClock,
         new_value: &ITimerSpec,
         flags: i32,
     ) -> ITimerSpec {
         // The clock's value, before `inner` (it may take TASKLIST)
-        let now = crate::cpu_timer::sample_now(c, crate::task::percpu::current_pid()).unwrap_or(0);
+        let now =
+            crate::time::cpu_timer::sample_now(c, crate::task::percpu::current_pid()).unwrap_or(0);
         let mut inner = self.inner.lock();
         let old_value = cpu_value(&inner, now);
         inner.overrun = 0;
@@ -294,12 +295,12 @@ impl PosixTimer {
         inner.expires_ns = at;
         inner.armed = true;
         drop(inner);
-        crate::cpu_timer::arm(c, at);
+        crate::time::cpu_timer::arm(c, at);
         old_value
     }
 
     /// A CPU-time timer's clock
-    pub fn cpu_clock(&self) -> Option<crate::cpu_timer::CpuClock> {
+    pub fn cpu_clock(&self) -> Option<crate::time::cpu_timer::CpuClock> {
         self.cpu
     }
 
@@ -317,7 +318,7 @@ impl PosixTimer {
     /// The CPU timer at clock value `now`: if due, rearm it a whole
     /// number of periods on (overruns counted) or disarm it, and say
     /// what it does (Linux cpu_timer_fire, bump_cpu_timer)
-    pub fn cpu_expire(&self, now: u64) -> Option<crate::cpu_timer::Expired> {
+    pub fn cpu_expire(&self, now: u64) -> Option<crate::time::cpu_timer::Expired> {
         let mut i = self.inner.lock();
         if !i.armed || now < i.expires_ns {
             return None;
@@ -335,7 +336,7 @@ impl PosixTimer {
         }
         drop(i);
         if self.sleeper {
-            return Some(crate::cpu_timer::Expired::Wake);
+            return Some(crate::time::cpu_timer::Expired::Wake);
         }
         if self.sigevent.sigev_notify != sigev_notify::SIGEV_SIGNAL {
             return None;
@@ -347,7 +348,7 @@ impl PosixTimer {
         // ITIMER_VIRTUAL/PROF signal the process; timer_create timers
         // their owner, like the other clocks' here
         let thread = (self.timer_id >= 0).then(|| self.owner_tid.load(Ordering::Relaxed));
-        Some(crate::cpu_timer::Expired::Signal { sig, thread })
+        Some(crate::time::cpu_timer::Expired::Signal { sig, thread })
     }
 
     /// clock_nanosleep's timer expired: wake its sleeper
@@ -389,7 +390,7 @@ impl PosixTimer {
             } else {
                 let now = inner.clock.now();
                 let (missed, next) =
-                    crate::timer::forward(inner.expires_ns, inner.interval_ns, now);
+                    crate::time::timer::forward(inner.expires_ns, inner.interval_ns, now);
                 // Periods missed beyond the one this expiry delivers
                 // (Linux: hrtimer_forward's count, into it_overrun)
                 let extra = i32::try_from(missed - 1).unwrap_or(i32::MAX);
@@ -545,7 +546,7 @@ pub fn create_posix_timer(
     // Realtime, monotonic, boottime and TAI; the alarm clocks need
     // CAP_WAKE_ALARM (EPERM); CPU clocks of the caller's own process or
     // its threads (Linux also takes other processes': BUGS.md)
-    use crate::time_syscall::{
+    use crate::time::time_syscall::{
         CLOCK_BOOTTIME, CLOCK_BOOTTIME_ALARM, CLOCK_MONOTONIC, CLOCK_REALTIME_ALARM, CLOCK_TAI,
     };
     let mut cpu = None;
@@ -589,27 +590,27 @@ pub fn create_posix_timer(
 /// CPU clock `clockid` if it is the caller's own process or one of its
 /// threads (pid 0, its own pid or tid; a thread clock any thread of its
 /// group)
-fn own_cpu_clock(clockid: i32) -> Option<crate::cpu_timer::CpuClock> {
+fn own_cpu_clock(clockid: i32) -> Option<crate::time::cpu_timer::CpuClock> {
     use crate::task::percpu::{current_pid, current_tid};
-    let crate::time_syscall::PosixClock::Cpu { pid, thread, which } =
-        crate::time_syscall::PosixClock::decode(clockid)?
+    let crate::time::time_syscall::PosixClock::Cpu { pid, thread, which } =
+        crate::time::time_syscall::PosixClock::decode(clockid)?
     else {
         return None;
     };
-    let sample = crate::cpu_timer::Sample::of(which);
+    let sample = crate::time::cpu_timer::Sample::of(which);
     if thread {
         let tid = if pid == 0 { current_tid() } else { pid };
         let same = crate::task::percpu::TASKLIST
             .read()
             .get(tid)
             .is_some_and(|t| t.task.pid == current_pid());
-        return same.then_some(crate::cpu_timer::CpuClock {
+        return same.then_some(crate::time::cpu_timer::CpuClock {
             thread: Some(tid),
             sample,
         });
     }
     (pid == 0 || pid == current_pid() || pid == current_tid()).then_some(
-        crate::cpu_timer::CpuClock {
+        crate::time::cpu_timer::CpuClock {
             thread: None,
             sample,
         },
@@ -623,7 +624,7 @@ fn own_cpu_clock(clockid: i32) -> Option<crate::cpu_timer::CpuClock> {
 pub fn cpu_nanosleep(clockid: i32, abs: bool, value_ns: u64) -> Result<(), (KernelErrorT, u64)> {
     use crate::task::percpu::{current_pid, current_tid};
     let Some(c) = own_cpu_clock(clockid).filter(|c| c.thread.is_none()) else {
-        return Err((crate::error::KernelError::InvalidArgument, 0));
+        return Err((crate::util::error::KernelError::InvalidArgument, 0));
     };
     let tid = current_tid();
     let sev = SigEvent {
@@ -636,7 +637,7 @@ pub fn cpu_nanosleep(clockid: i32, abs: bool, value_ns: u64) -> Result<(), (Kern
         reg.add(t.clone());
         t
     }) else {
-        return Err((crate::error::KernelError::InvalidArgument, 0));
+        return Err((crate::util::error::KernelError::InvalidArgument, 0));
     };
     let spec = ITimerSpec::from_ns(value_ns, 0);
     let r = if value_ns == 0 && !abs {
@@ -645,7 +646,7 @@ pub fn cpu_nanosleep(clockid: i32, abs: bool, value_ns: u64) -> Result<(), (Kern
         t.settime(&spec, if abs { timer_flags::TIMER_ABSTIME } else { 0 });
         t.wq.wait_event_interruptible(|| !t.armed())
     };
-    let left = match crate::cpu_timer::sample_now(c, current_pid()) {
+    let left = match crate::time::cpu_timer::sample_now(c, current_pid()) {
         Some(now) => t.cpu_expiry().map_or(0, |at| at.saturating_sub(now)),
         None => 0,
     };
@@ -654,7 +655,7 @@ pub fn cpu_nanosleep(clockid: i32, abs: bool, value_ns: u64) -> Result<(), (Kern
     r.map_err(|e| (e, left))
 }
 
-type KernelErrorT = crate::error::KernelError;
+type KernelErrorT = crate::util::error::KernelError;
 
 /// Get a POSIX timer by ID
 pub fn get_posix_timer(tid: Tid, timer_id: TimerT) -> Option<Arc<PosixTimer>> {
@@ -789,10 +790,10 @@ pub fn sys_timer_settime(timerid: TimerT, flags: i32, new_value: u64, old_value:
 
     // A thread CPU clock whose thread is gone: ESRCH (Linux
     // posix_cpu_timer_set finds no task)
-    if let Some(crate::cpu_timer::CpuClock {
+    if let Some(crate::time::cpu_timer::CpuClock {
         thread: Some(t), ..
     }) = timer.cpu
-        && crate::cpu_timer::thread_sample(t).is_none()
+        && crate::time::cpu_timer::thread_sample(t).is_none()
     {
         return -3;
     }
@@ -902,8 +903,8 @@ const ITIMER_PROF: i32 = 2;
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 struct ITimerVal {
-    it_interval: crate::time_syscall::Timeval,
-    it_value: crate::time_syscall::Timeval,
+    it_interval: crate::time::time_syscall::Timeval,
+    it_value: crate::time::time_syscall::Timeval,
 }
 crate::pod!(ITimerVal {
     it_interval,
@@ -926,7 +927,7 @@ fn itimer_real() -> Arc<PosixTimer> {
 
 /// The current process's itimer `which`, created on first use
 fn itimer(which: i32) -> Arc<PosixTimer> {
-    use crate::cpu_timer::{CpuClock, Sample};
+    use crate::time::cpu_timer::{CpuClock, Sample};
     let (id, sample, sig) = match which {
         ITIMER_VIRTUAL => (ITIMER_VIRTUAL_ID, Sample::Virt, crate::signal::SIGVTALRM),
         ITIMER_PROF => (ITIMER_PROF_ID, Sample::Prof, crate::signal::SIGPROF),
@@ -958,9 +959,11 @@ fn itimer(which: i32) -> Arc<PosixTimer> {
 }
 
 /// timeval -> timespec; None if invalid (negative, usec >= 1e6)
-fn tv_to_ts(tv: crate::time_syscall::Timeval) -> Option<crate::time_syscall::LinuxTimespec> {
+fn tv_to_ts(
+    tv: crate::time::time_syscall::Timeval,
+) -> Option<crate::time::time_syscall::LinuxTimespec> {
     (tv.tv_sec >= 0 && (0..1_000_000).contains(&tv.tv_usec)).then(|| {
-        crate::time_syscall::LinuxTimespec {
+        crate::time::time_syscall::LinuxTimespec {
             tv_sec: tv.tv_sec,
             tv_nsec: tv.tv_usec * 1000,
         }
@@ -969,8 +972,8 @@ fn tv_to_ts(tv: crate::time_syscall::Timeval) -> Option<crate::time_syscall::Lin
 
 /// timespec -> timeval, rounding up a partial microsecond (Linux
 /// rounds remaining time so a live timer never reads as 0)
-fn ts_to_tv(ts: crate::time_syscall::LinuxTimespec) -> crate::time_syscall::Timeval {
-    let mut tv = crate::time_syscall::Timeval {
+fn ts_to_tv(ts: crate::time::time_syscall::LinuxTimespec) -> crate::time::time_syscall::Timeval {
+    let mut tv = crate::time::time_syscall::Timeval {
         tv_sec: ts.tv_sec,
         tv_usec: (ts.tv_nsec + 999) / 1000,
     };
@@ -1044,8 +1047,8 @@ pub fn sys_setitimer(which: i32, new: u64, old: u64) -> i64 {
 /// one was pending (Linux alarm_setitimer)
 pub fn sys_alarm(seconds: u32) -> i64 {
     let spec = ITimerSpec {
-        it_interval: crate::time_syscall::LinuxTimespec::default(),
-        it_value: crate::time_syscall::LinuxTimespec {
+        it_interval: crate::time::time_syscall::LinuxTimespec::default(),
+        it_value: crate::time::time_syscall::LinuxTimespec {
             tv_sec: seconds as i64,
             tv_nsec: 0,
         },

@@ -24,7 +24,6 @@ use core::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 
 use crate::sync::spin::{Mutex, RwLock};
 
-use crate::error::KernelError;
 use crate::net::af_inet::{self, Inet, RxInfo, SOL_IP};
 use crate::net::dgram::{self, Dgram, RxQueue};
 use crate::net::icmp::{IcmpErr, icmp_type};
@@ -38,6 +37,7 @@ use crate::net::socket::{
     AF_INET, AF_UNSPEC, OptIn, OptOut, ProtoOps, SOCK_DGRAM, SOL_SOCKET, shut_bits,
 };
 use crate::net::{NetNamespace, udp};
+use crate::util::error::KernelError;
 
 /// ICMP header length (struct icmphdr)
 const HDR: usize = 8;

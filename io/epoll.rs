@@ -33,14 +33,14 @@ use alloc::vec::Vec;
 use crate::arch::{IrqSpinlock, Uaccess};
 use crate::fs::KernelError;
 use crate::fs::file::{File, FileOps, flags};
-use crate::pipe::FD_CLOEXEC;
-use crate::poll::{POLLIN, POLLRDNORM, PollTable};
+use crate::io::pipe::FD_CLOEXEC;
+use crate::io::poll::{POLLIN, POLLRDNORM, PollTable};
+use crate::sync::waitqueue::WaitQueue;
 use crate::task::Fd;
 use crate::task::fdtable::get_task_fd;
 use crate::task::percpu::current_tid;
 use crate::time::Deadline;
 use crate::uaccess::{get_user, put_user};
-use crate::waitqueue::WaitQueue;
 
 /// epoll_ctl operations
 pub const EPOLL_CTL_ADD: i32 = 1;
@@ -189,9 +189,9 @@ impl Eventpoll {
     /// events; 0 on timeout; -EINTR on a signal (epoll_wait is never
     /// restarted).
     pub fn wait(&self, events: &mut [EpollEvent], deadline: Deadline) -> Result<usize, i64> {
-        use crate::hrtimer::{HrClock, schedule_hrtimeout};
-        use crate::poll::PollContext;
+        use crate::io::poll::PollContext;
         use crate::task::percpu::{SleepState, set_current_state};
+        use crate::time::hrtimer::{HrClock, schedule_hrtimeout};
         if events.is_empty() {
             return Ok(0);
         }
@@ -205,7 +205,7 @@ impl Eventpoll {
             if n > 0 || nonblock {
                 break Ok(n);
             }
-            if crate::waitqueue::signal_pending() {
+            if crate::sync::waitqueue::signal_pending() {
                 break Err(KernelError::Interrupted.sysret());
             }
             if deadline.is_some_and(|d| crate::time::monotonic_ns() >= d) {
@@ -223,7 +223,7 @@ impl Eventpoll {
     fn scan(
         &self,
         events: &mut [EpollEvent],
-        ctx: &mut crate::poll::PollContext,
+        ctx: &mut crate::io::poll::PollContext,
         register: bool,
     ) -> usize {
         let items: Vec<(Fd, Arc<File>)> = {
@@ -322,7 +322,7 @@ impl FileOps for EpollFileOps {
 
     fn poll(&self, file: &File, pt: Option<&mut PollTable>) -> u16 {
         let Some(ep) = file.private_ref::<Eventpoll>() else {
-            return crate::poll::POLLERR;
+            return crate::io::poll::POLLERR;
         };
         ep.poll(pt)
     }
@@ -372,8 +372,8 @@ pub fn sys_epoll_create(size: i32) -> i64 {
 
 /// Get the RLIMIT_NOFILE limit for the current task
 fn get_nofile_limit() -> u64 {
-    let limit = crate::rlimit::rlimit(crate::rlimit::RLIMIT_NOFILE);
-    if limit == crate::rlimit::RLIM_INFINITY {
+    let limit = crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_NOFILE);
+    if limit == crate::task::rlimit::RLIM_INFINITY {
         u64::MAX
     } else {
         limit
@@ -599,7 +599,7 @@ pub fn sys_epoll_pwait2(
     sigmask: u64,
     sigsetsize: u64,
 ) -> i64 {
-    use crate::time_syscall::LinuxTimespec;
+    use crate::time::time_syscall::LinuxTimespec;
 
     // NULL waits forever; the timeout is ns-precise (Linux ep_timeout_to_timespec)
     let deadline = if timeout_ptr == 0 {

@@ -114,9 +114,9 @@ pub const NSIG: u32 = 64;
 pub struct SigSet(pub u64);
 
 // SAFETY: repr(transparent) over a u64: any bits valid, no padding
-unsafe impl crate::pod::FromBytes for SigSet {}
+unsafe impl crate::util::pod::FromBytes for SigSet {}
 // SAFETY: as above
-unsafe impl crate::pod::IntoBytes for SigSet {}
+unsafe impl crate::util::pod::IntoBytes for SigSet {}
 
 impl SigSet {
     /// Empty signal set (no signals)
@@ -460,7 +460,7 @@ pub struct SigHand {
     /// Readers and pollers of a signalfd among the tasks sharing this
     /// table (Linux sighand->signalfd_wqh): woken by every signal sent
     /// to one of them
-    pub signalfd_wq: crate::waitqueue::WaitQueue,
+    pub signalfd_wq: crate::sync::waitqueue::WaitQueue,
 }
 
 /// A handler table with every action at its default
@@ -473,7 +473,7 @@ impl SigHand {
     pub fn new() -> Self {
         Self {
             action: IrqSpinlock::new(default_actions()),
-            signalfd_wq: crate::waitqueue::WaitQueue::new(),
+            signalfd_wq: crate::sync::waitqueue::WaitQueue::new(),
         }
     }
 
@@ -513,7 +513,7 @@ impl SigHand {
         actions.clone_from_slice(&self.action.lock());
         Arc::new(Self {
             action: IrqSpinlock::new(actions),
-            signalfd_wq: crate::waitqueue::WaitQueue::new(),
+            signalfd_wq: crate::sync::waitqueue::WaitQueue::new(),
         })
     }
 
@@ -1329,7 +1329,7 @@ const SIGPOLL: u32 = SIGIO;
 // SignalStruct - Per-Process Structure (mirrors Linux signal_struct)
 // =============================================================================
 
-use crate::rlimit::{RLIM_NLIMITS, RLimit, default_rlimits};
+use crate::task::rlimit::{RLIM_NLIMITS, RLimit, default_rlimits};
 
 /// Per-process signal structure (mirrors Linux signal_struct)
 ///
@@ -1366,7 +1366,7 @@ pub struct SignalStruct {
     group_exit: AtomicU64,
     /// POSIX timers and ITIMER_REAL (Linux signal->posix_timers,
     /// real_timer): spin leaf, thread context only
-    pub posix_timers: Mutex<crate::posix_timer::PosixTimerRegistry>,
+    pub posix_timers: Mutex<crate::time::posix_timer::PosixTimerRegistry>,
     /// Threads not yet exiting (Linux signal->live): +1 at each
     /// CLONE_THREAD, -1 when a thread starts its exit; the thread that
     /// takes it to 0 is the group's last (group_dead)
@@ -1378,7 +1378,7 @@ pub struct SignalStruct {
     /// signal->cutime/cstime)
     child_times: [AtomicU64; 2],
     /// Process CPU timers' state (Linux signal->cputimer)
-    pub cputimer: crate::cpu_timer::GroupCputimer,
+    pub cputimer: crate::time::cpu_timer::GroupCputimer,
 }
 
 const GROUP_EXIT: u64 = 1 << 63;
@@ -1442,12 +1442,12 @@ impl CredGuard {
     /// a thread waiting here while its group's exec waits in de_thread
     /// for it to die must see the SIGKILL. A signal gives
     /// ERESTARTNOINTR (the syscall restarts once the signal is handled).
-    pub fn lock(tid: Tid) -> Result<Self, crate::error::KernelError> {
+    pub fn lock(tid: Tid) -> Result<Self, crate::util::error::KernelError> {
         let s = get_task_signal_struct(tid);
         if let Some(s) = &s {
             s.cred_guard
                 .lock_raw_interruptible()
-                .map_err(|_| crate::error::KernelError::RestartNoIntr)?;
+                .map_err(|_| crate::util::error::KernelError::RestartNoIntr)?;
         }
         Ok(Self(s))
     }
@@ -1470,11 +1470,11 @@ impl SignalStruct {
             cred_guard: crate::sync::Mutex::new(()),
             exec_update: crate::sync::RwSem::new(()),
             group_exit: AtomicU64::new(0),
-            posix_timers: Mutex::new(crate::posix_timer::PosixTimerRegistry::new()),
+            posix_timers: Mutex::new(crate::time::posix_timer::PosixTimerRegistry::new()),
             live: AtomicU32::new(1),
             dead_times: [AtomicU64::new(0), AtomicU64::new(0)],
             child_times: [AtomicU64::new(0), AtomicU64::new(0)],
-            cputimer: crate::cpu_timer::GroupCputimer::new(),
+            cputimer: crate::time::cpu_timer::GroupCputimer::new(),
         }
     }
 
@@ -1643,11 +1643,11 @@ impl SignalStruct {
             exec_update: crate::sync::RwSem::new(()),
             group_exit: AtomicU64::new(0),
             // Timers are not inherited (Linux copy_signal)
-            posix_timers: Mutex::new(crate::posix_timer::PosixTimerRegistry::new()),
+            posix_timers: Mutex::new(crate::time::posix_timer::PosixTimerRegistry::new()),
             live: AtomicU32::new(1),
             dead_times: [AtomicU64::new(0), AtomicU64::new(0)],
             child_times: [AtomicU64::new(0), AtomicU64::new(0)],
-            cputimer: crate::cpu_timer::GroupCputimer::new(),
+            cputimer: crate::time::cpu_timer::GroupCputimer::new(),
         })
     }
 }
@@ -1697,7 +1697,7 @@ fn clone_task_signal_struct(parent_tid: Tid, child_tid: Tid, share_signal: bool)
     // An inherited finite RLIMIT_CPU is watched from the start (Linux
     // posix_cpu_timers_init_group)
     if !share_signal {
-        crate::cpu_timer::rlimit_cpu_changed(&child_signal, child_tid);
+        crate::time::cpu_timer::rlimit_cpu_changed(&child_signal, child_tid);
     }
     let mut table = TASKLIST.write();
     if let Some(mut child) = table.get_mut(child_tid) {
@@ -1755,7 +1755,7 @@ fn traced_signal(tid: Tid, sig: u32, action: SigAction) -> Option<(u32, SigActio
 /// e.g. rt_sigsuspend), signals are dequeued under it and the saved mask
 /// goes into the signal frame; with no frame it is restored here.
 pub fn do_signal(regs: &UserFrame) {
-    use crate::error::KernelError;
+    use crate::util::error::KernelError;
 
     const ERESTARTSYS: i64 = KernelError::RestartSys.sysret();
     const ERESTARTNOINTR: i64 = KernelError::RestartNoIntr.sysret();
@@ -1827,7 +1827,7 @@ pub fn do_signal(regs: &UserFrame) {
 /// -ERESTARTNOINTR, -ERESTARTNOHAND): only `do_signal` may turn that
 /// into a result. A plain register test, no lock.
 pub fn syscall_restarting(regs: &UserFrame) -> bool {
-    use crate::error::KernelError;
+    use crate::util::error::KernelError;
     const FIRST: i64 = KernelError::RestartSys.sysret();
     const LAST: i64 = KernelError::RestartNoHand.sysret();
     regs.in_syscall() && (LAST..=FIRST).contains(&(regs.ret() as i64))
@@ -1851,8 +1851,11 @@ pub fn set_temp_sigmask(new: SigSet) -> Option<SigSet> {
 /// Read a sigset_t from user memory and install it as the syscall's
 /// temporary mask (Linux set_user_sigmask); a null `umask` changes
 /// nothing. Errors: EINVAL (size), EFAULT.
-pub fn set_user_sigmask(umask: u64, sigsetsize: u64) -> Result<(), crate::error::KernelError> {
-    use crate::error::KernelError;
+pub fn set_user_sigmask(
+    umask: u64,
+    sigsetsize: u64,
+) -> Result<(), crate::util::error::KernelError> {
+    use crate::util::error::KernelError;
     if umask == 0 {
         return Ok(());
     }

@@ -16,10 +16,10 @@
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::arch::IrqSpinlock;
-use crate::completion::Completion;
 use crate::cpu::PerCpu;
 use crate::sync::Mutex;
-use crate::waitqueue::WaitQueue;
+use crate::sync::completion::Completion;
+use crate::sync::waitqueue::WaitQueue;
 
 /// One queued call (Linux cpu_stop_work)
 #[derive(Clone, Copy)]

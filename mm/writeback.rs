@@ -19,7 +19,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::block::blkdev::DevId;
 use crate::sync::spin::{Mutex, RwLock};
-use crate::workqueue::{DelayedWork, Workqueue, wq_flags};
+use crate::task::workqueue::{DelayedWork, Workqueue, wq_flags};
 
 /// The periodic writeback's interval in scheduler ticks
 /// (vm.dirty_writeback_centisecs)
@@ -143,7 +143,7 @@ fn set_pair(
     v: i64,
     lo: i64,
     hi: i64,
-) -> Result<(), crate::error::KernelError> {
+) -> Result<(), crate::util::error::KernelError> {
     crate::sysctl::range(v, lo, hi)?;
     on.store(v as u64, Ordering::Relaxed);
     off.store(0, Ordering::Relaxed);

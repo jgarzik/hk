@@ -224,7 +224,7 @@ impl Default for FragTable {
 
 /// Registered tables, for the expiry timer
 static TABLES: Mutex<Vec<Weak<crate::net::NetNamespace>>> = Mutex::new(Vec::new());
-static ALARM: crate::timer::Alarm = crate::timer::Alarm::new(frag_timer);
+static ALARM: crate::time::timer::Alarm = crate::time::timer::Alarm::new(frag_timer);
 
 impl FragTable {
     /// Add a fragment (`pkt` = whole IP packet, header validated) of a

@@ -18,9 +18,9 @@ type CurrentArch = crate::arch::aarch64::Aarch64Arch;
 
 type ArchPageTable = <CurrentArch as SchedArch>::SchedPageTable;
 use super::percpu;
-use crate::elf::ElfExecutable;
 use crate::fs::{File, kernel_open_exec};
 use crate::mm::{ELF_ET_DYN_BASE, MmLayout, STACK_TOP};
+use crate::util::elf::ElfExecutable;
 
 /// Page size constant
 const PAGE_SIZE: u64 = 4096;
@@ -201,8 +201,8 @@ fn setup_user_stack<FA: FrameAlloc<PhysAddr = u64>>(
     info: &ExecInfo,
 ) -> Result<(MmLayout, u64), i32> {
     // Calculate stack pages based on RLIMIT_STACK
-    let stack_limit = crate::rlimit::rlimit(crate::rlimit::RLIMIT_STACK);
-    let stack_pages = if stack_limit == crate::rlimit::RLIM_INFINITY {
+    let stack_limit = crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_STACK);
+    let stack_pages = if stack_limit == crate::task::rlimit::RLIM_INFINITY {
         USER_STACK_PAGES
     } else {
         ((stack_limit / PAGE_SIZE) as usize).clamp(USER_STACK_PAGES, MAX_STACK_PAGES)
@@ -643,13 +643,13 @@ fn resolve_scripts(
     path: &[u8],
     path_inaccessible: bool,
 ) -> Result<(Arc<File>, Vec<Vec<u8>>), i32> {
-    use crate::binfmt_script::{BINPRM_BUF_SIZE, MAX_DEPTH, parse, rewrite_argv};
+    use crate::task::binfmt_script::{BINPRM_BUF_SIZE, MAX_DEPTH, parse, rewrite_argv};
     let mut name = path.to_vec();
     for depth in 0.. {
         let head = {
             let image = FileImage::new(&file)?;
             let n = (image.size as usize).min(BINPRM_BUF_SIZE);
-            crate::elf::ElfSource::read_at(&image, 0, n).ok_or(EIO)?
+            crate::util::elf::ElfSource::read_at(&image, 0, n).ok_or(EIO)?
         };
         let (interp, arg) = match parse(&head) {
             None => break,
@@ -702,7 +702,7 @@ impl FileImage<'_> {
     }
 }
 
-impl crate::elf::ElfSource for FileImage<'_> {
+impl crate::util::elf::ElfSource for FileImage<'_> {
     fn read_at(&self, off: u64, len: usize) -> Option<Vec<u8>> {
         let mut v = alloc::vec![0u8; len];
         (self.read_into(&mut v, off).ok()? == len).then_some(v)
@@ -761,8 +761,8 @@ fn exec_identity(path: &[u8], file: &File) -> ExecIdentity {
 /// running user code end at their next syscall or fault (P7: IRQ
 /// return).
 fn de_thread(tid: crate::task::Tid) -> Result<(), i32> {
+    use crate::sync::waitqueue::WaitEntry;
     use crate::task::percpu::{SleepState, schedule};
-    use crate::waitqueue::WaitEntry;
 
     let tgid = percpu::current_pid();
     let Some(sig) = crate::signal::get_task_signal_struct(tid) else {
@@ -1087,7 +1087,7 @@ where
 /// On error, returns negative error code.
 pub fn sys_execve(pathname: u64, argv_ptr: u64, envp_ptr: u64) -> i64 {
     use crate::FRAME_ALLOCATOR;
-    use crate::frame_alloc::FrameAllocRef;
+    use crate::mm::frame_alloc::FrameAllocRef;
 
     // Copy pathname from user space
     let path = match copy_string_from_user(pathname, PATH_MAX) {
@@ -1145,7 +1145,7 @@ pub const AT_SYMLINK_NOFOLLOW: i32 = 0x100;
 /// On error, returns negative error code.
 pub fn sys_execveat(dirfd: i32, pathname: u64, argv_ptr: u64, envp_ptr: u64, flags: i32) -> i64 {
     use crate::FRAME_ALLOCATOR;
-    use crate::frame_alloc::FrameAllocRef;
+    use crate::mm::frame_alloc::FrameAllocRef;
 
     if flags & !(AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW) != 0 {
         return -(EINVAL as i64);
@@ -1174,7 +1174,7 @@ pub fn sys_execveat(dirfd: i32, pathname: u64, argv_ptr: u64, envp_ptr: u64, fla
         && crate::fs::syscall::current_fd_table()
             .lock()
             .get_fd_flags(dirfd)
-            & crate::pipe::FD_CLOEXEC
+            & crate::io::pipe::FD_CLOEXEC
             != 0;
     let open = |_: &[u8]| exec_lookup(dirfd, &path, flags).and_then(crate::fs::open_exec);
     let mut frame_alloc = FrameAllocRef(&FRAME_ALLOCATOR);
@@ -1206,7 +1206,7 @@ fn exec_lookup(dirfd: i32, path: &[u8], flags: i32) -> Result<Arc<crate::fs::Den
         current_fd_table()
             .lock()
             .get(dirfd)
-            .ok_or(crate::error::KernelError::BadFd as i32)
+            .ok_or(crate::util::error::KernelError::BadFd as i32)
     };
     if path.is_empty() {
         if flags & AT_EMPTY_PATH == 0 {
@@ -1227,7 +1227,7 @@ fn exec_lookup(dirfd: i32, path: &[u8], flags: i32) -> Result<Arc<crate::fs::Den
     } else {
         let file = fd_file()?;
         if !file.is_dir() {
-            return Err(crate::error::KernelError::NotDirectory as i32);
+            return Err(crate::util::error::KernelError::NotDirectory as i32);
         }
         Path::from_dentry(file.dentry.clone())
     };

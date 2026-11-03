@@ -4,7 +4,7 @@
 //! and fires at an absolute ns time on CLOCK_MONOTONIC or
 //! CLOCK_REALTIME. Each CPU keeps its pending timers in sorted intrusive
 //! lists (one per clock, O(n) insert: no rbtree yet), in a HARD and a
-//! SOFT base like the timer wheel (`timer.rs`): HARD callbacks run in
+//! SOFT base like the timer wheel (`time/timer.rs`): HARD callbacks run in
 //! the timer interrupt and only wake tasks; SOFT ones run in
 //! `ktimers/N`.
 //!
@@ -37,8 +37,8 @@ use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU64, AtomicUsize
 
 use crate::arch::{IrqSpinlock, IrqSpinlockGuard};
 use crate::cpu::PerCpu;
-use crate::list::{Link, List};
 use crate::task::percpu::TICK_NS;
+use crate::util::list::{Link, List};
 
 /// A timer callback; the owner is reached through `data`
 pub type HrFn = fn(&HrTimer);
@@ -212,7 +212,7 @@ impl HrTimer {
             if self.flags & HRTIMER_HARD != 0 {
                 core::hint::spin_loop();
             } else {
-                crate::timer::wait_soft(base_cpu(base), || {
+                crate::time::timer::wait_soft(base_cpu(base), || {
                     base.running.load(Ordering::Acquire) != me
                 });
             }
@@ -437,7 +437,7 @@ pub fn interrupt() {
     let due = soft.due();
     SOFT_ACTIVATED.get(cpu).store(due, Ordering::Relaxed);
     if due {
-        crate::timer::wake_ktimers(cpu);
+        crate::time::timer::wake_ktimers(cpu);
     }
     reprogram(cpu);
     crate::sync::lockdep::irq_exit();

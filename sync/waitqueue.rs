@@ -64,13 +64,13 @@ use core::pin::Pin;
 use core::sync::atomic::{AtomicPtr, AtomicU8, Ordering};
 
 use crate::arch::IrqSpinlock;
-use crate::error::KernelError;
-use crate::hrtimer::HrClock;
-use crate::list::{Link, List};
 use crate::task::percpu::{
     KernelTask, MAX_SCHEDULE_TIMEOUT, SleepState, WakeMode, current, current_tid, schedule_timeout,
     set_current_state, try_to_wake_up,
 };
+use crate::time::hrtimer::HrClock;
+use crate::util::error::KernelError;
+use crate::util::list::{Link, List};
 
 /// Woken one at a time (Linux WQ_FLAG_EXCLUSIVE): appended, and a
 /// `wake_one` stops after waking one
@@ -388,7 +388,7 @@ impl WaitQueue {
                     _ => KernelError::RestartSys,
                 });
             }
-            if crate::hrtimer::schedule_hrtimeout(deadline, clock) {
+            if crate::time::hrtimer::schedule_hrtimeout(deadline, clock) {
                 // Timed out: one last look
                 self.prepare_to_wait(w.as_ref(), state);
                 break Ok(cond());

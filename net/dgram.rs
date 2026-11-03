@@ -13,15 +13,15 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::sync::spin::Mutex;
 
-use crate::error::KernelError;
+use crate::io::poll::{
+    POLLERR, POLLHUP, POLLIN, POLLOUT, POLLRDHUP, POLLRDNORM, POLLWRBAND, POLLWRNORM,
+};
 use crate::net::af_inet::{self, Inet, RxInfo};
 use crate::net::ipv4::Ipv4Addr;
 use crate::net::msg::{MSG_DONTWAIT, MSG_PEEK, MSG_TRUNC, RecvMsg};
 use crate::net::sock::{RCV_SHUTDOWN, SHUTDOWN_MASK, Sock, sf};
 use crate::net::socket::SOL_SOCKET;
-use crate::poll::{
-    POLLERR, POLLHUP, POLLIN, POLLOUT, POLLRDHUP, POLLRDNORM, POLLWRBAND, POLLWRNORM,
-};
+use crate::util::error::KernelError;
 
 /// SCM_TIMESTAMP / SCM_TIMESTAMPNS (= SO_TIMESTAMP*_OLD), SO_RXQ_OVFL
 const SCM_TIMESTAMP: i32 = 29;

@@ -33,9 +33,9 @@ use super::page::{
 };
 use super::xarray::{MARK_DIRTY, MARK_WRITEBACK, Preload, XArray, node_alloc};
 use crate::FRAME_ALLOCATOR;
-use crate::error::KernelError;
 use crate::fs::inode::Inode;
 use crate::sync::spin::Mutex;
+use crate::util::error::KernelError;
 
 /// Page size
 pub const PAGE_SIZE: usize = 4096;

@@ -8,11 +8,11 @@ use alloc::sync::Arc;
 
 use super::map::BpfMap;
 use super::prog::BpfProg;
-use crate::error::KernelError;
 use crate::fs::anon_inodes::anon_inode_getfile;
 use crate::fs::file::{File, FileOps, flags};
 use crate::fs::syscall::{current_fd_table, get_nofile_limit};
-use crate::poll::PollTable;
+use crate::io::poll::PollTable;
+use crate::util::error::KernelError;
 
 // =============================================================================
 // BPF Map File Operations

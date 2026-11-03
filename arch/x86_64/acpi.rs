@@ -663,7 +663,7 @@ fn table_s5(phys: u64, sig: &[u8; 4]) -> Option<SleepType> {
 /// Called early in boot to discover NUMA topology. If SRAT is not found,
 /// returns Ok(false) and caller should use single-node fallback.
 pub fn init_numa_topology() -> Result<bool, &'static str> {
-    use crate::numa::{LOCAL_DISTANCE, MAX_NUMA_NODES, NUMA_TOPOLOGY, REMOTE_DISTANCE};
+    use crate::mm::numa::{LOCAL_DISTANCE, MAX_NUMA_NODES, NUMA_TOPOLOGY, REMOTE_DISTANCE};
 
     // Find RSDP
     let rsdp = find_rsdp()?;
@@ -724,8 +724,8 @@ pub fn init_numa_topology() -> Result<bool, &'static str> {
 
 /// Parse SRAT table and populate NUMA topology
 fn parse_srat_mapped(srat_phys: u64) -> Result<(), &'static str> {
-    use crate::cpumask::NR_CPUS as MAX_CPUS;
-    use crate::numa::{MAX_NUMA_NODES, NUMA_TOPOLOGY, NumaNode};
+    use crate::mm::numa::{MAX_NUMA_NODES, NUMA_TOPOLOGY, NumaNode};
+    use crate::util::cpumask::NR_CPUS as MAX_CPUS;
 
     unsafe {
         // Map the SRAT
@@ -895,7 +895,7 @@ fn parse_srat_mapped(srat_phys: u64) -> Result<(), &'static str> {
 
 /// Parse SLIT table for inter-node distance matrix
 fn parse_slit_mapped(slit_phys: u64) -> Result<(), &'static str> {
-    use crate::numa::{MAX_NUMA_NODES, NUMA_TOPOLOGY};
+    use crate::mm::numa::{MAX_NUMA_NODES, NUMA_TOPOLOGY};
 
     unsafe {
         // Map the SLIT

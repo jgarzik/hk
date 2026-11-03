@@ -31,8 +31,8 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use spin::Lazy;
 
-use crate::error::KernelError;
 use crate::task::Pid;
+use crate::util::error::KernelError;
 
 pub mod subsys;
 

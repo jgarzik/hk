@@ -17,10 +17,10 @@ use super::KernelError;
 use super::dentry::Dentry;
 use super::inode::{FileType, Inode, InodeId};
 use super::mount::Mount;
-use crate::ns::current_mnt_ns;
-use crate::poll::{
+use crate::io::poll::{
     DEFAULT_POLLMASK, POLLERR, POLLHUP, POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM, PollTable,
 };
+use crate::ns::current_mnt_ns;
 
 /// Largest kernel bounce buffer one read/write call uses: transfers
 /// bigger than this go through it in steps
@@ -753,7 +753,7 @@ pub static NULL_FILE_OPS: NullFileOps = NullFileOps;
 // Character Device File Operations
 // ============================================================================
 
-use crate::chardev::{DeviceError, get_chardev};
+use crate::fs::chardev::{DeviceError, get_chardev};
 
 /// Character device file operations.
 ///

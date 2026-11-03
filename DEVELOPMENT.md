@@ -265,9 +265,13 @@ hk/                      # The kernel crate (no_std, no_main) is the repo root
 ├── arch/                # Architecture-specific code
 │   ├── x86_64/          # x86-64: boot, interrupts, paging, syscalls
 │   └── aarch64/         # aarch64: boot, exceptions, paging, syscalls
-├── mm/                  # Memory management (mmap, vma, page tables)
-├── task/                # Process/thread management, scheduler
-├── fs/                  # VFS + filesystem implementations
+├── mm/                  # Memory management (mmap, vma, page tables, heap, frames)
+├── task/                # Processes/threads, scheduler, futex, workqueues, exec
+├── fs/                  # VFS + filesystem implementations, char devices
+├── io/                  # fd-backed I/O and events (poll, epoll, pipes, inotify, io_uring)
+├── time/                # Timekeeping, timers, hrtimers, POSIX/CPU timers, timerfd
+├── sync/                # Locks, wait queues, completions
+├── util/                # Lists, cpumasks, Pod, errors, ELF parsing
 ├── signal/              # Signal handling
 ├── bus/                 # Generic driver model (buses, drivers, platform)
 ├── block/               # Block layer (blk-mq, partitions, ramdisk, SCSI disk)
@@ -281,7 +285,7 @@ hk/                      # The kernel crate (no_std, no_main) is the repo root
 ├── tty/                 # TTY subsystem
 ├── ns/                  # Namespaces
 ├── dt/                  # Device tree parsing
-├── *.rs                 # Core kernel modules (console, heap, frame_alloc, etc.)
+├── *.rs                 # Core: entry, cpu/smp, irq, printk/kmsg, console, uaccess, ...
 ├── user/                # Userspace test binaries (separate workspace)
 │   ├── boot_tester/     # Test harness (main.rs, boot_tester2.rs)
 │   │   └── tests/       # Test modules (mmap.rs, process.rs, etc.)

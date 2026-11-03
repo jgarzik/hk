@@ -21,9 +21,9 @@
 use alloc::collections::BTreeSet;
 use alloc::sync::Arc;
 
-use crate::error::KernelError;
 use crate::fs::File;
 use crate::fs::syscall::current_fd_table;
+use crate::util::error::KernelError;
 
 // =============================================================================
 // flock operation constants (Linux ABI)

@@ -10,7 +10,7 @@
 //! - getcpu
 
 use super::percpu::current_tid;
-use crate::error::KernelError;
+use crate::util::error::KernelError;
 
 use super::Pid;
 
@@ -29,7 +29,7 @@ use super::Pid;
 /// None required - reads per-CPU data which is stable during syscall execution.
 /// This matches Linux's implementation which uses raw_smp_processor_id().
 pub fn sys_getcpu<A: crate::uaccess::UaccessArch>(cpu: u32, cpup: u64, nodep: u64) -> i64 {
-    use crate::numa::NUMA_TOPOLOGY;
+    use crate::mm::numa::NUMA_TOPOLOGY;
     use crate::uaccess::put_user;
 
     // Write CPU number if pointer provided
@@ -145,8 +145,8 @@ fn set_one_prio(tid: Pid, niceval: i32, caller_euid: super::Uid, error: i64) -> 
         return KernelError::NotPermitted.sysret();
     }
     // Linux can_nice: 20 - nice within the target's RLIMIT_NICE
-    let rlim = crate::rlimit::get_task_rlimit(tid, crate::rlimit::RLIMIT_NICE)
-        .map_or(crate::rlimit::RLIM_INFINITY, |r| r.rlim_cur);
+    let rlim = crate::task::rlimit::get_task_rlimit(tid, crate::task::rlimit::RLIMIT_NICE)
+        .map_or(crate::task::rlimit::RLIM_INFINITY, |r| r.rlim_cur);
     let lower = niceval < cur_nice;
     if lower && (20 - niceval) as u64 > rlim && !capable(CAP_SYS_NICE) {
         return KernelError::PermissionDenied.sysret();
@@ -353,10 +353,12 @@ fn check_setscheduler(
     if cur_reset && !reset {
         return Err(KernelError::NotPermitted);
     }
-    let limit =
-        |r| crate::rlimit::get_task_rlimit(tid, r).map_or(0, |l: crate::rlimit::RLimit| l.rlim_cur);
+    let limit = |r| {
+        crate::task::rlimit::get_task_rlimit(tid, r)
+            .map_or(0, |l: crate::task::rlimit::RLimit| l.rlim_cur)
+    };
     if is_rt_policy(policy) {
-        let rtprio = limit(crate::rlimit::RLIMIT_RTPRIO);
+        let rtprio = limit(crate::task::rlimit::RLIMIT_RTPRIO);
         if policy != cur && rtprio == 0 {
             return Err(KernelError::NotPermitted);
         }
@@ -366,7 +368,7 @@ fn check_setscheduler(
     }
     if cur == SCHED_IDLE
         && policy != SCHED_IDLE
-        && (20 - nice) as u64 > limit(crate::rlimit::RLIMIT_NICE)
+        && (20 - nice) as u64 > limit(crate::task::rlimit::RLIMIT_NICE)
     {
         return Err(KernelError::NotPermitted);
     }
@@ -598,7 +600,7 @@ pub fn sys_sched_setaffinity<A: crate::uaccess::UaccessArch>(
         .iter()
         .map(|c| u64::from_ne_bytes(*c))
         .collect();
-    let mask = crate::cpumask::CpuSet::from_words(&words);
+    let mask = crate::util::cpumask::CpuSet::from_words(&words);
 
     let target_pid = if pid == 0 { current_tid() } else { pid as u64 };
 

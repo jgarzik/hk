@@ -4,7 +4,7 @@
 //! implementation. Architecture-specific power operations are implemented in
 //! arch/<arch>/power.rs modules.
 
-use crate::error::KernelError;
+use crate::util::error::KernelError;
 
 /// Linux reboot syscall command constants
 pub mod cmd {

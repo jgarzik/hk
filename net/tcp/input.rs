@@ -19,7 +19,7 @@ use super::cb::{
     OOW_RATELIMIT, Out, PAWS_WRAP, RCV_SHUTDOWN, Seg, SegIn, TIMEWAIT_LEN, TcpCb, TcpState, Tmr,
     after, before, between, flags,
 };
-use crate::error::KernelError;
+use crate::util::error::KernelError;
 
 impl TcpCb {
     /// Process a segment for this connection

@@ -37,12 +37,12 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
-use crate::completion::Completion;
+use crate::sync::completion::Completion;
 use crate::sync::spin::{Mutex, RwLock};
 
-pub use crate::chardev::{DevId, DevMajor, DevMinor};
-use crate::error::KernelError;
+pub use crate::fs::chardev::{DevId, DevMajor, DevMinor};
 use crate::mm::writeback::{BdiWriteback, bdi_register, bdi_unregister};
+use crate::util::error::KernelError;
 
 use super::blk_mq::BlkMq;
 

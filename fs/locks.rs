@@ -29,9 +29,9 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use super::flock::FileLock;
 use super::inode::Inode;
 use super::posix_lock::InodeLocks;
-use crate::error::KernelError;
 use crate::sync::spin::Mutex;
-use crate::waitqueue::WaitQueue;
+use crate::sync::waitqueue::WaitQueue;
+use crate::util::error::KernelError;
 
 /// The locks of one inode
 #[derive(Default)]

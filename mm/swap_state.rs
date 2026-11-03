@@ -27,7 +27,7 @@ use super::swap::{
 };
 use super::swap_entry::SwapEntry;
 use crate::FRAME_ALLOCATOR;
-use crate::error::KernelError;
+use crate::util::error::KernelError;
 
 /// The swap-cache page of `e`, with a reference (Linux
 /// swap_cache_get_folio)

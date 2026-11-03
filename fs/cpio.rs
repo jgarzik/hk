@@ -21,7 +21,7 @@ use super::ramfs::{
     ramfs_create_file_with_timestamp, ramfs_create_symlink_with_timestamp, ramfs_fill_file,
     ramfs_mkpath_with_timestamp,
 };
-use crate::chardev::DevId;
+use crate::fs::chardev::DevId;
 
 /// newc header length
 const HDR: usize = 110;

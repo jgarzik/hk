@@ -6,10 +6,10 @@
 use core::sync::atomic::Ordering;
 
 use crate::arch::paging;
-use crate::error::KernelError;
 use crate::mm::ptl::{pt_lock, pte_lock};
 use crate::mm::vma::{PROT_READ, PROT_WRITE};
 use crate::mm::{Mm, MmStruct, Vma};
+use crate::util::error::KernelError;
 
 #[cfg(target_arch = "x86_64")]
 use crate::arch::x86_64::paging::{X86_64PageTable, phys_to_virt};

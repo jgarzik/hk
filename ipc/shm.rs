@@ -16,7 +16,6 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, Ordering};
 
 use crate::arch::Uaccess;
-use crate::error::KernelError;
 use crate::ipc::util::{
     IPC_PERM_READ, IPC_PERM_WRITE, IpcObject, KernIpcPerm, ipc_checkperm, ipcget,
 };
@@ -29,6 +28,7 @@ use crate::mm::{Vma, get_task_mm};
 use crate::task::percpu::{current_pid, current_tid};
 use crate::time::TIMEKEEPER;
 use crate::uaccess::{get_user, put_user};
+use crate::util::error::KernelError;
 
 const PAGE_SIZE: usize = 4096;
 
@@ -318,8 +318,8 @@ fn do_shmat(shmid: i32, shmaddr: u64, shmflg: i32) -> Result<u64, i32> {
         .mmap_write_killable()
         .map_err(|_| KernelError::Interrupted.errno())?;
     // RLIMIT_AS, as for any mapping (Linux may_expand_vm)
-    let limit = crate::rlimit::rlimit(crate::rlimit::RLIMIT_AS);
-    if limit != crate::rlimit::RLIM_INFINITY
+    let limit = crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_AS);
+    if limit != crate::task::rlimit::RLIM_INFINITY
         && (mm_guard.total_vm() * PAGE_SIZE as u64).saturating_add(size) > limit
     {
         return Err(KernelError::OutOfMemory.errno());

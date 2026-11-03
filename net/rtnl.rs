@@ -21,11 +21,11 @@ use alloc::sync::Arc;
 
 use crate::sync::{Mutex, MutexGuard};
 
-use crate::error::KernelError;
 use crate::net::NetNamespace;
 use crate::net::device::{NetDevice, flags};
 use crate::net::inet::ifaddr;
 use crate::net::netlink::{NlInfo, rtnetlink};
+use crate::util::error::KernelError;
 
 static RTNL: Mutex<()> = Mutex::new(());
 

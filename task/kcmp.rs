@@ -14,8 +14,8 @@ use alloc::sync::Arc;
 use core::cmp::Ordering;
 use core::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
-use crate::error::KernelError;
 use crate::task::percpu::{KernelTask, TASKLIST, task_ref};
+use crate::util::error::KernelError;
 
 // KCMP comparison types
 /// Compare file descriptors

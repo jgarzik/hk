@@ -9,7 +9,7 @@
 //! as having a single NUMA node (node 0) containing all CPUs and memory.
 
 use crate::arch::IrqSpinlock;
-use crate::cpumask::NR_CPUS;
+use crate::util::cpumask::NR_CPUS;
 
 /// Maximum number of NUMA nodes supported
 pub const MAX_NUMA_NODES: usize = 64;

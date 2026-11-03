@@ -31,7 +31,7 @@ use crate::sync::spin::Mutex;
 
 use super::cb::{ORPHAN_RETRIES, Out, RTO_FALLBACK, RTO_MAX, RTO_MIN, TcpCb, TcpState, Tmr};
 use super::output::Push;
-use crate::error::KernelError;
+use crate::util::error::KernelError;
 
 impl TcpCb {
     /// Current timeout: the base RTO backed off, at most RTO_MAX
@@ -304,7 +304,7 @@ static TIMERS: Mutex<BTreeMap<(u64, u64), Weak<dyn Expire>>> = Mutex::new(BTreeM
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Wakes softnet/0 to run [`run`]
-static ALARM: crate::timer::Alarm = crate::timer::Alarm::new(alarm_fired);
+static ALARM: crate::time::timer::Alarm = crate::time::timer::Alarm::new(alarm_fired);
 
 fn alarm_fired(_: u64) {
     crate::net::dev::raise_timer();

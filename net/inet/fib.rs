@@ -27,7 +27,6 @@ use alloc::vec::Vec;
 
 use crate::sync::spin::RwLock;
 
-use crate::error::KernelError;
 use crate::net::NetNamespace;
 use crate::net::device::NetDevice;
 use crate::net::inet::ifaddr::{
@@ -37,6 +36,7 @@ use crate::net::ipv4::Ipv4Addr;
 use crate::net::netlink::NlInfo;
 use crate::net::netlink::rtnetlink;
 use crate::net::rtnl::RtnlGuard;
+use crate::util::error::KernelError;
 
 /// Routing table ids (Linux RT_TABLE_*)
 pub const RT_TABLE_UNSPEC: u32 = 0;

@@ -11,8 +11,8 @@ use alloc::sync::Arc;
 use super::file::File;
 use super::inode::Inode;
 use super::syscall::current_fd_table;
-use crate::error::KernelError;
 use crate::mm::filemap::{self, PAGE_SIZE};
+use crate::util::error::KernelError;
 
 /// The open file `fd`, or EBADF
 fn fd_file(fd: i32) -> Result<Arc<File>, KernelError> {

@@ -17,8 +17,8 @@ use alloc::vec::Vec;
 use core::any::Any;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use crate::error::KernelError;
 use crate::task::Pid;
+use crate::util::error::KernelError;
 
 use super::CgroupSubsysState;
 use super::subsys::{CgroupSubsysOps, ControlFile, ControllerType, CssPrivate};

@@ -17,10 +17,10 @@ use crate::block::blkdev::{
     sync_blockdev,
 };
 use crate::block::genhd;
-use crate::error::KernelError;
 use crate::fs::inode::{Inode, InodeMode, Timespec};
 use crate::mm::filemap::{self, Aops, PAGE_SIZE};
 use crate::uaccess::{get_user, put_user};
+use crate::util::error::KernelError;
 use core::sync::atomic::Ordering;
 
 use super::file::{File, FileOps, seek};

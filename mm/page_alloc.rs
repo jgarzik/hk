@@ -32,8 +32,8 @@
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use crate::arch::IrqSpinlock;
-use crate::cpumask::NR_CPUS;
 use crate::mm::page::{PG_BUDDY, PG_HEAD, PG_RESERVED, PG_TAIL, Page, put_mapping};
+use crate::util::cpumask::NR_CPUS;
 
 /// Largest block order (2^10 pages = 4MB, Linux MAX_PAGE_ORDER)
 pub const MAX_ORDER: u32 = 10;

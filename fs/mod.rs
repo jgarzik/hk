@@ -3,6 +3,8 @@
 //! This module provides the VFS layer and filesystem implementations
 //! including CPIO (initramfs), ramfs, and procfs.
 
+pub mod chardev;
+
 // Core VFS modules
 pub mod blkdev_ops;
 pub mod dac;
@@ -48,7 +50,7 @@ pub mod ramfs;
 pub mod vfat;
 
 // Re-exports for convenience
-pub use crate::error::KernelError;
+pub use crate::util::error::KernelError;
 pub use blkdev_ops::BLOCK_FILE_OPS;
 pub use cgroupfs::{CGROUPFS_FILE_OPS, CGROUPFS_TYPE};
 pub use cpio::unpack_cpio;

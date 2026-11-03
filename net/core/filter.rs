@@ -18,7 +18,7 @@
 
 use alloc::vec::Vec;
 
-use crate::error::KernelError;
+use crate::util::error::KernelError;
 
 /// Most instructions in a program (Linux BPF_MAXINSNS)
 pub const BPF_MAXINSNS: usize = 4096;

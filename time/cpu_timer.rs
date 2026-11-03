@@ -257,7 +257,7 @@ enum Fire {
     /// Signal `sig` to the process
     Process(u32),
     /// Wake a clock_nanosleep
-    Wake(Arc<crate::posix_timer::PosixTimer>),
+    Wake(Arc<crate::time::posix_timer::PosixTimer>),
 }
 
 /// Run the calling task's due CPU timers and its group's (task context,
@@ -340,8 +340,8 @@ pub fn run() {
 
 /// RLIMIT_CPU is finite
 fn rlimit_finite(sig: &crate::signal::SignalStruct) -> bool {
-    sig.get_rlimit(crate::rlimit::RLIMIT_CPU)
-        .is_some_and(|r| r.rlim_cur != crate::rlimit::RLIM_INFINITY)
+    sig.get_rlimit(crate::task::rlimit::RLIMIT_CPU)
+        .is_some_and(|r| r.rlim_cur != crate::task::rlimit::RLIM_INFINITY)
 }
 
 /// The RLIMIT_CPU part of `run` at process CPU time `prof`; true if the
@@ -352,7 +352,7 @@ fn rlimit_cpu(
     fire: &mut Vec<Fire>,
     next: &mut u64,
 ) -> bool {
-    use crate::rlimit::{RLIM_INFINITY, RLIMIT_CPU};
+    use crate::task::rlimit::{RLIM_INFINITY, RLIMIT_CPU};
     const SEC: u64 = 1_000_000_000;
     let Some(r) = sig.get_rlimit(RLIMIT_CPU) else {
         return false;
@@ -398,7 +398,7 @@ pub enum Expired {
 }
 
 impl Expired {
-    fn into_fire(self, t: &Arc<crate::posix_timer::PosixTimer>) -> Fire {
+    fn into_fire(self, t: &Arc<crate::time::posix_timer::PosixTimer>) -> Fire {
         match self {
             Expired::Signal {
                 sig,

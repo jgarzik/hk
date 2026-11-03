@@ -7,12 +7,12 @@
 
 use alloc::sync::Arc;
 
-use crate::error::KernelError;
 use crate::net::NetNamespace;
 use crate::net::device::NetDevice;
 use crate::net::inet::fib::{FlowKey, RouteType};
 use crate::net::inet::ifaddr::{RT_SCOPE_LINK, inet_select_addr, ip_dev_find};
 use crate::net::ipv4::Ipv4Addr;
+use crate::util::error::KernelError;
 
 /// An output route (Linux struct rtable)
 #[derive(Clone)]

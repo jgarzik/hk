@@ -11,8 +11,8 @@ use alloc::sync::Arc;
 use core::ops::Deref;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-use crate::error::KernelError;
 use crate::ipc::{IPC_CREAT, IPC_EXCL, IPC_PRIVATE};
+use crate::util::error::KernelError;
 
 // ============================================================================
 // ID Allocation Constants

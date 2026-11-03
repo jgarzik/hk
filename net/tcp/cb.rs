@@ -22,7 +22,7 @@
 //! per-connection keyed offset (`Open.ts_off`, Linux
 //! secure_tcp_seq_and_ts_off over the four-tuple). SACK is not implemented and never advertised.
 //! Delayed ACKs live in `ack.rs`, Nagle/cork in `output.rs`, keepalive
-//! and the user timeout in `timer.rs`.
+//! and the user timeout in `time/timer.rs`.
 
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::vec::Vec;
@@ -30,7 +30,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use super::ack::Dack;
 use super::cong::Cong;
-use crate::error::KernelError;
+use crate::util::error::KernelError;
 
 /// TCP header flags
 pub mod flags {

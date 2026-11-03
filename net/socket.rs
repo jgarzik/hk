@@ -21,14 +21,14 @@ use core::any::Any;
 use core::sync::atomic::Ordering;
 
 use crate::arch::Uaccess;
-use crate::error::KernelError;
 use crate::fs::dentry::Dentry;
 use crate::fs::file::{File, FileOps, flags as fflags};
 use crate::fs::inode::{AsAny, Inode, InodeData, InodeMode, NULL_INODE_OPS};
+use crate::io::poll::PollTable;
 use crate::net::msg::{Dst, MSG_DONTWAIT, MSG_NOSIGNAL, RecvMsg, SendMsg, Src};
 use crate::net::sock::{Sock, TIMEO_FOREVER, sf};
-use crate::poll::PollTable;
 use crate::uaccess::{copy_from_user, copy_to_user, get_user, put_user};
+use crate::util::error::KernelError;
 
 /// Address families
 pub const AF_UNSPEC: u16 = 0;
@@ -293,7 +293,7 @@ impl FileOps for SockFile {
 
     fn poll(&self, file: &File, pt: Option<&mut PollTable>) -> u16 {
         let Some(s) = sock_of(file) else {
-            return crate::poll::POLLNVAL;
+            return crate::io::poll::POLLNVAL;
         };
         if let Some(pt) = pt {
             pt.poll_wait(&s.sk().wq);

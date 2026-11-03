@@ -7,7 +7,7 @@
 
 use alloc::vec::Vec;
 
-use crate::error::KernelError;
+use crate::util::error::KernelError;
 
 /// Largest heap allocation (MAX_ORDER pages: no vmalloc)
 pub const MAX_KMALLOC: usize = 4 << 20;

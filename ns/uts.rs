@@ -19,8 +19,8 @@ use alloc::sync::Arc;
 use spin::Lazy;
 
 use crate::arch::Uaccess;
-use crate::error::KernelError;
 use crate::uaccess::{UaccessArch, copy_from_user, copy_to_user};
+use crate::util::error::KernelError;
 
 /// Maximum string length for UTS fields (not including NUL terminator)
 ///

@@ -31,7 +31,7 @@ use crate::net::inet::fib::RouteType;
 use crate::net::inet::route;
 use crate::net::ipv4::{self, IP_HLEN_MIN, IPPROTO_ICMP, IpParams, Ipv4Addr, ip_checksum, pmtu};
 use crate::net::skb::SkBuff;
-use crate::waitqueue::WaitQueue;
+use crate::sync::waitqueue::WaitQueue;
 
 /// ICMP header length
 pub const ICMP_HLEN: usize = 8;
@@ -101,8 +101,8 @@ pub fn is_error(ty: u8) -> bool {
 }
 
 /// Linux icmp_err_convert: (errno, fatal) of an unreachable code
-pub fn unreach_err(code: u8) -> (crate::error::KernelError, bool) {
-    use crate::error::KernelError as E;
+pub fn unreach_err(code: u8) -> (crate::util::error::KernelError, bool) {
+    use crate::util::error::KernelError as E;
     match code {
         0 => (E::NetworkUnreachable, false),
         1 => (E::HostUnreachable, false),
@@ -369,8 +369,8 @@ impl IcmpErr<'_> {
     /// errno and hard/soft classification shared by the datagram
     /// protocols (Linux udp_err / ping_err switch; frag needed is hard
     /// unless the socket does IP_PMTUDISC_DONT, which ignores it: None)
-    pub fn errno(&self, pmtudisc: u8) -> Option<(crate::error::KernelError, bool)> {
-        use crate::error::KernelError as E;
+    pub fn errno(&self, pmtudisc: u8) -> Option<(crate::util::error::KernelError, bool)> {
+        use crate::util::error::KernelError as E;
         match self.ty {
             icmp_type::SOURCE_QUENCH => None,
             icmp_type::PARAMETERPROB => Some((E::ProtocolError, true)),
@@ -638,8 +638,8 @@ pub fn icmp_send_echo(
     id: u16,
     seq: u16,
     payload: &[u8],
-) -> Result<(), crate::error::KernelError> {
-    use crate::error::KernelError;
+) -> Result<(), crate::util::error::KernelError> {
+    use crate::util::error::KernelError;
     let mut skb = SkBuff::alloc_tx(ICMP_HLEN + payload.len()).ok_or(KernelError::NoBufferSpace)?;
     skb.put_slice(&[icmp_type::ECHO, 0, 0, 0])
         .ok_or(KernelError::NoBufferSpace)?;
@@ -694,11 +694,11 @@ mod tests {
         assert!(!is_error(icmp_type::ECHO_REPLY));
         assert_eq!(
             unreach_err(3),
-            (crate::error::KernelError::ConnectionRefused, true)
+            (crate::util::error::KernelError::ConnectionRefused, true)
         );
         assert_eq!(
             unreach_err(1),
-            (crate::error::KernelError::HostUnreachable, false)
+            (crate::util::error::KernelError::HostUnreachable, false)
         );
     }
 }

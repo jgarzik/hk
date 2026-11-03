@@ -87,8 +87,8 @@ pub const IOV_MAX: usize = 1024;
 /// functions (alloc, alloc_with_flags, etc.), not as separate pre-checks.
 #[inline]
 pub fn get_nofile_limit() -> u64 {
-    let limit = crate::rlimit::rlimit(crate::rlimit::RLIMIT_NOFILE);
-    if limit == crate::rlimit::RLIM_INFINITY {
+    let limit = crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_NOFILE);
+    if limit == crate::task::rlimit::RLIM_INFINITY {
         u64::MAX
     } else {
         limit
@@ -109,8 +109,8 @@ pub fn get_nofile_limit() -> u64 {
 /// * `count` - Number of bytes to write
 #[inline]
 pub fn check_fsize_limit(offset: u64, count: usize) -> Result<(), i64> {
-    let limit = crate::rlimit::rlimit(crate::rlimit::RLIMIT_FSIZE);
-    if limit == crate::rlimit::RLIM_INFINITY {
+    let limit = crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_FSIZE);
+    if limit == crate::task::rlimit::RLIM_INFINITY {
         return Ok(());
     }
 

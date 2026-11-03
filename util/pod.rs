@@ -122,16 +122,16 @@ macro_rules! pod {
                 let $t { $($f: _),* } = x;
             };
             assert!(
-                core::mem::size_of::<$t>() == 0 $(+ $crate::pod::pod_field(|s: &$t| s.$f))*,
+                core::mem::size_of::<$t>() == 0 $(+ $crate::util::pod::pod_field(|s: &$t| s.$f))*,
                 concat!(stringify!($t), " has padding")
             );
         };
         // SAFETY: every field is FromBytes (pod_field's bound), and they
         // cover the struct (no padding to hold a bad value)
-        unsafe impl $crate::pod::FromBytes for $t {}
+        unsafe impl $crate::util::pod::FromBytes for $t {}
         // SAFETY: every field is IntoBytes and they fill the struct
         // (checked above): no padding
-        unsafe impl $crate::pod::IntoBytes for $t {}
+        unsafe impl $crate::util::pod::IntoBytes for $t {}
     )+};
 }
 

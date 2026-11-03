@@ -22,7 +22,7 @@ use crate::block::BlockDevice;
 use crate::block::blkdev::{BioOp, bdev_rw_bytes};
 use crate::mm::filemap::{self, Aops, PAGE_SIZE};
 use crate::mm::page::frame_bytes;
-use crate::pod::{FromBytes, IntoBytes};
+use crate::util::pod::{FromBytes, IntoBytes};
 
 use super::dentry::Dentry;
 use super::file::{DirContext, DirEntry as VfsDirEntry, File, FileOps};
@@ -31,7 +31,7 @@ use super::inode::{AsAny, FileType, Inode, InodeData, InodeMode, InodeOps, Times
 use super::superblock::{
     FileSystemType, MSDOS_SUPER_MAGIC, StatFs, SuperBlock, SuperBlockData, SuperOps, fs_flags,
 };
-use crate::error::KernelError;
+use crate::util::error::KernelError;
 
 // ============================================================================
 // VFAT file pages (Linux fat_aops: fat_read_folio, fat_writepages)
@@ -1545,12 +1545,12 @@ impl InodeOps for VfatInodeOps {
             return;
         }
         let mut job = Some((sb_data, d.start_cluster));
-        let work = crate::workqueue::Work::new(move || {
+        let work = crate::task::workqueue::Work::new(move || {
             if let Some((sb_data, start)) = job.take() {
                 let _ = free_cluster_chain(&sb_data, start);
             }
         });
-        crate::workqueue::SYSTEM_WQ.queue_work(Arc::new(crate::sync::spin::Mutex::new(work)));
+        crate::task::workqueue::SYSTEM_WQ.queue_work(Arc::new(crate::sync::spin::Mutex::new(work)));
     }
 
     fn create(&self, dir: &Inode, name: &str, mode: InodeMode) -> Result<Arc<Inode>, KernelError> {

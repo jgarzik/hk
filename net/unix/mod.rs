@@ -62,7 +62,6 @@ use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering}
 use crate::sync::spin::{Mutex, MutexGuard, RwLock};
 
 use crate::arch::Uaccess;
-use crate::error::KernelError;
 use crate::fs::Dentry;
 use crate::net::NetNamespace;
 use crate::net::msg::{RecvMsg, SendMsg};
@@ -72,7 +71,8 @@ use crate::net::socket::{
     SOCK_SEQPACKET, SOCK_STREAM, SOL_SOCKET,
 };
 use crate::sync::Mutex as SMutex;
-use crate::waitqueue::WaitQueue;
+use crate::sync::waitqueue::WaitQueue;
+use crate::util::error::KernelError;
 
 use scm::{Creds, FpList};
 

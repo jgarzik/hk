@@ -20,10 +20,10 @@ use core::sync::atomic::{AtomicI32, AtomicU8, AtomicU32, AtomicU64, AtomicUsize,
 
 use crate::sync::spin::Mutex;
 
-use crate::error::KernelError;
 use crate::net::NetNamespace;
+use crate::sync::waitqueue::WaitQueue;
 use crate::task::Cred;
-use crate::waitqueue::WaitQueue;
+use crate::util::error::KernelError;
 
 /// Linux rmem_default / wmem_default and rmem_max / wmem_max
 pub const BUF_DEFAULT: u32 = 212_992;
@@ -432,7 +432,7 @@ pub fn wait_on<F: FnMut() -> bool>(
         };
     }
     let deadline = crate::time::monotonic_ns().saturating_add(timeo);
-    let mono = crate::hrtimer::HrClock::Monotonic;
+    let mono = crate::time::hrtimer::HrClock::Monotonic;
     match wq.wait_event_interruptible_deadline(&mut cond, Some(deadline), mono) {
         Ok(true) => Ok(deadline.saturating_sub(crate::time::monotonic_ns()).max(1)),
         Ok(false) => Err(KernelError::WouldBlock),

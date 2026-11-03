@@ -9,14 +9,14 @@ NUMA (Non-Uniform Memory Access) support for modern x86-64 and aarch64 hardware.
 ### Phase 1: NUMA Topology Discovery
 
 **Files:**
-- `numa.rs` - Core NUMA data structures
+- `mm/numa.rs` - Core NUMA data structures
 - `arch/x86_64/acpi.rs` - SRAT/SLIT parsing
 - `arch/aarch64/dtb.rs` - Device tree numa-node-id extraction
 - `main.rs` - NUMA initialization during boot
 
 **Structures:**
 ```rust
-// numa.rs
+// mm/numa.rs
 pub struct NumaNode {
     pub node_id: u32,
     pub start_pfn: u64,
@@ -98,7 +98,7 @@ pub mempolicy: Option<TaskMempolicy>,  // Per-VMA policy from mbind
 
 1. **`mm/page_alloc.rs`** - Per-node zones. Today one buddy
    zone (with per-CPU page lists) covers all RAM, behind the
-   `FrameAllocator` API in `frame_alloc.rs` (`alloc_gfp`,
+   `FrameAllocator` API in `mm/frame_alloc.rs` (`alloc_gfp`,
    `alloc_pages`, ...). Split it into one zone per node (Linux
    pg_data_t), with per-CPU lists per zone, and add node-aware entry
    points:
@@ -203,7 +203,7 @@ For Phase 4-5 testing:
 ## Key Constants
 
 ```rust
-// numa.rs
+// mm/numa.rs
 pub const MAX_NUMA_NODES: usize = 64;
 pub const NR_CPUS: usize = 256; // crate::cpumask::NR_CPUS
 pub const LOCAL_DISTANCE: u8 = 10;

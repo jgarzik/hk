@@ -232,9 +232,9 @@ fn filp_open(
     let f_op: &'static dyn super::FileOps = if inode.mode().is_blkdev() {
         &super::BLOCK_FILE_OPS
     } else if inode.mode().is_fifo() {
-        &crate::pipe::FIFO_FOPS
+        &crate::io::pipe::FIFO_FOPS
     } else if inode.mode().is_chrdev() {
-        crate::chardev::get_chardev(inode.rdev)
+        crate::fs::chardev::get_chardev(inode.rdev)
             .and_then(|d| d.fops())
             .unwrap_or(&super::CHAR_FILE_OPS)
     } else {

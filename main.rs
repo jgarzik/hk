@@ -10,82 +10,48 @@
 extern crate alloc;
 
 // Core modules (formerly in core/ subdir)
-pub mod acct;
 pub mod block;
 pub mod bus;
-pub mod chardev;
-pub mod completion;
 pub mod console;
 pub mod cpu;
-pub mod cpu_timer;
-pub mod cpumask;
-pub mod delay;
-pub mod elf;
 pub mod entry;
-pub mod epoll;
-pub mod eventfd;
-pub mod fanotify;
-pub mod futex;
-pub mod hrtimer;
-pub mod inotify;
-pub mod io_uring;
 pub mod irq;
-pub mod kcmp;
-pub mod kmem;
-pub mod list;
-pub mod pidfd;
-pub mod pipe;
-pub mod pod;
-pub mod poll;
-pub mod posix_timer;
 pub mod printk;
 pub mod selftest;
-pub mod signalfd;
 pub mod smp;
 pub mod sync;
 pub mod sysctl;
-mod time;
-pub mod timer;
-pub mod timerfd;
+pub mod time;
 pub mod uaccess;
-pub mod waitqueue;
-pub mod watchdog;
-pub mod workqueue;
 
 // Device subsystems
 pub mod dt;
 pub mod gfx;
 pub mod hw;
+pub mod io;
 pub mod net;
 pub mod tty;
+pub mod util;
 
 // printkln macro is re-exported at crate root via #[macro_export]
 
 // Multiboot2 header is in boot.S
 
 mod arch;
-mod binfmt_script;
 pub mod bpf;
 pub mod cgroup;
 mod cmdline;
-pub mod error;
-mod frame_alloc;
 pub mod fs;
-mod heap;
 pub mod ipc;
 pub mod keys;
 mod kmsg;
-pub mod membarrier;
 pub mod mm;
 pub mod ns;
-pub mod numa;
 mod power;
 mod random;
-mod rlimit;
 pub mod seccomp;
 pub mod signal;
 pub mod task;
-mod time_syscall;
 
 #[cfg(not(test))]
 use ::core::panic::PanicInfo;
@@ -116,10 +82,10 @@ use fs::inode::AsAny; // Trait needed for .as_any() on dyn InodeData
 /// Kernel heap: boot arena, then slab (host unit tests use the std
 /// allocator)
 #[cfg_attr(not(test), global_allocator)]
-static ALLOCATOR: heap::KernelAlloc = heap::KernelAlloc::new();
+static ALLOCATOR: mm::heap::KernelAlloc = mm::heap::KernelAlloc::new();
 
 /// Global frame allocator
-static FRAME_ALLOCATOR: frame_alloc::FrameAllocator = frame_alloc::FrameAllocator::new();
+static FRAME_ALLOCATOR: mm::frame_alloc::FrameAllocator = mm::frame_alloc::FrameAllocator::new();
 
 /// Global DMA operations (direct mapping backend)
 static DIRECT_DMA_OPS: DirectDmaOps = DirectDmaOps::new(&FRAME_ALLOCATOR);
@@ -243,7 +209,7 @@ fn init_numa_topology() {
     {
         match arch::x86_64::acpi::init_numa_topology() {
             Ok(true) => {
-                numa::print_topology();
+                mm::numa::print_topology();
                 return;
             }
             Ok(false) => {
@@ -259,7 +225,7 @@ fn init_numa_topology() {
     {
         match arch::aarch64::dtb::init_numa_topology() {
             Ok(true) => {
-                numa::print_topology();
+                mm::numa::print_topology();
                 return;
             }
             Ok(false) => {
@@ -272,7 +238,7 @@ fn init_numa_topology() {
     }
 
     // Fallback to single-node topology
-    numa::init_single_node_fallback(total_pages, nr_cpus);
+    mm::numa::init_single_node_fallback(total_pages, nr_cpus);
 }
 
 /// Discover boot framebuffer from firmware
@@ -361,7 +327,7 @@ fn kmain() -> ! {
     CurrentArch::init_exceptions();
 
     // Create a reference wrapper for use with APIs requiring &mut FrameAlloc
-    let mut frame_alloc = frame_alloc::FrameAllocRef(&FRAME_ALLOCATOR);
+    let mut frame_alloc = mm::frame_alloc::FrameAllocRef(&FRAME_ALLOCATOR);
 
     // ========================================================================
     // Phase 3: Platform Discovery and SMP
@@ -471,9 +437,9 @@ fn kmain() -> ! {
     // (ktimers/N), the system workqueue worker, the per-CPU network
     // softnet threads. Then interrupts on: pid 1 may sleep from here.
     task::percpu::init_ap_schedulers();
-    crate::timer::start_ktimers();
+    crate::time::timer::start_ktimers();
     crate::task::stop_machine::start();
-    crate::workqueue::init();
+    crate::task::workqueue::init();
     crate::net::start_threads();
     CurrentArch::enable_interrupts();
 
@@ -586,7 +552,7 @@ fn kmain() -> ! {
     printkln!("KERNEL_READY");
 
     // Run locking infrastructure self-tests
-    crate::waitqueue::run_locking_tests();
+    crate::sync::waitqueue::run_locking_tests();
 
     // The boot self-test
     crate::selftest::start();
@@ -633,7 +599,7 @@ fn try_init(path: &str, args: &cmdline::InitArgs) -> i32 {
     argv.extend(args.argv.iter().map(|a| a.as_bytes().to_vec()));
     let mut envp: Vec<Vec<u8>> = alloc::vec![b"HOME=/".to_vec(), b"TERM=linux".to_vec()];
     envp.extend(args.envp.iter().map(|e| e.as_bytes().to_vec()));
-    let mut frame_alloc = frame_alloc::FrameAllocRef(&FRAME_ALLOCATOR);
+    let mut frame_alloc = mm::frame_alloc::FrameAllocRef(&FRAME_ALLOCATOR);
     task::exec::do_execve(path.as_bytes().to_vec(), argv, envp, &mut frame_alloc)
 }
 
@@ -645,7 +611,7 @@ const DEFAULT_RAMDISK_SIZE_MB: u64 = 8;
 /// This is the unified VFS initialization shared between architectures.
 fn init_vfs_core() {
     use crate::block::create_ramdisk;
-    use crate::chardev::DevId;
+    use crate::fs::chardev::DevId;
     use fs::{PROCFS_TYPE, RAMFS_TYPE, do_mount, init_fs_registry, ramfs_create_dir};
 
     init_fs_registry();
@@ -676,7 +642,7 @@ fn init_vfs_core() {
     };
 
     // Register built-in character devices (null, zero)
-    crate::chardev::register_builtin_chardevs();
+    crate::fs::chardev::register_builtin_chardevs();
 
     // Register TTY character devices (serial, etc.)
     crate::tty::init_tty_chardevs();
@@ -685,7 +651,7 @@ fn init_vfs_core() {
     // (opened for init before anything mounts devtmpfs; Linux needs
     // /dev/console in the initramfs)
     fs::devtmpfs::init();
-    use crate::chardev::major as chardev_major;
+    use crate::fs::chardev::major as chardev_major;
     let mut nodes = alloc::vec![
         ("null", DevId::new(chardev_major::MEM, 3), 0o666),
         ("zero", DevId::new(chardev_major::MEM, 5), 0o666),
@@ -696,7 +662,7 @@ fn init_vfs_core() {
         ("tty", DevId::new(chardev_major::TTYAUX, 0), 0o666),
         ("console", DevId::new(chardev_major::TTYAUX, 1), 0o666),
     ];
-    if crate::chardev::get_chardev(DevId::new(chardev_major::TTYS, 64)).is_some() {
+    if crate::fs::chardev::get_chardev(DevId::new(chardev_major::TTYS, 64)).is_some() {
         nodes.push(("ttyS0", DevId::new(chardev_major::TTYS, 64), 0o666));
     }
     for (name, dev, mode) in nodes {

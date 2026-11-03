@@ -7,7 +7,7 @@
 //! - capget, capset (capabilities)
 //! - pidfd_open, pidfd_send_signal, pidfd_getfd (pidfd operations)
 
-use crate::error::KernelError;
+use crate::util::error::KernelError;
 
 use super::Pid;
 
@@ -1243,7 +1243,7 @@ pub fn sys_pidfd_open(pid: i64, flags: u32) -> i64 {
     }
 
     // Create pidfd
-    let pidfd_file = match crate::pidfd::create_pidfd(target_pid, flags) {
+    let pidfd_file = match crate::task::pidfd::create_pidfd(target_pid, flags) {
         Ok(file) => file,
         Err(_) => return KernelError::OutOfMemory.sysret(),
     };
@@ -1259,8 +1259,8 @@ pub fn sys_pidfd_open(pid: i64, flags: u32) -> i64 {
 
     // Get NOFILE limit
     let nofile = {
-        let limit = crate::rlimit::rlimit(crate::rlimit::RLIMIT_NOFILE);
-        if limit == crate::rlimit::RLIM_INFINITY {
+        let limit = crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_NOFILE);
+        if limit == crate::task::rlimit::RLIM_INFINITY {
             u64::MAX
         } else {
             limit
@@ -1320,7 +1320,7 @@ pub fn sys_pidfd_send_signal(pidfd: i32, sig: i32, _info: u64, flags: u32) -> i6
     };
 
     // A pidfd whose process is still there
-    let target_pid = match crate::pidfd::pidfd_live_pid(&file) {
+    let target_pid = match crate::task::pidfd::pidfd_live_pid(&file) {
         Ok(pid) => pid,
         Err(e) => return e.sysret(),
     };
@@ -1376,7 +1376,7 @@ pub fn sys_pidfd_getfd(pidfd: i32, targetfd: i32, flags: u32) -> i64 {
     };
 
     // A pidfd whose process is still there
-    let target_pid = match crate::pidfd::pidfd_live_pid(&pidfd_file) {
+    let target_pid = match crate::task::pidfd::pidfd_live_pid(&pidfd_file) {
         Ok(pid) => pid,
         Err(e) => return e.sysret(),
     };
@@ -1410,7 +1410,7 @@ pub fn sys_pidfd_getfd(pidfd: i32, targetfd: i32, flags: u32) -> i64 {
     };
 
     // Allocate new fd in caller's fd table with FD_CLOEXEC
-    let nofile = crate::rlimit::rlimit(crate::rlimit::RLIMIT_NOFILE);
+    let nofile = crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_NOFILE);
     let new_fd = {
         let mut table = caller_fd_table.lock();
         match table.alloc_with_flags(target_file, super::FD_CLOEXEC, nofile) {

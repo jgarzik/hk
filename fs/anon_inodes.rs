@@ -25,10 +25,10 @@ use spin::Once;
 
 use crate::arch::IrqSpinlock;
 use crate::cpu::PerCpu;
-use crate::error::KernelError;
 use crate::fs::dentry::Dentry;
 use crate::fs::file::{File, FileOps};
 use crate::fs::inode::{Inode, InodeMode, InodeOps, Timespec};
+use crate::util::error::KernelError;
 
 /// Numbers one CPU takes from the shared counter at a time
 const LAST_INO_BATCH: u64 = 1024;

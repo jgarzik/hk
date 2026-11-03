@@ -35,7 +35,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use crate::arch::IrqSpinlock;
 
 use super::blkdev::{Bio, BioList, bio_endio};
-use crate::error::KernelError;
+use crate::util::error::KernelError;
 
 /// Result of `MqOps::queue_rq` (Linux blk_status_t of queue_rq)
 pub enum Queued {

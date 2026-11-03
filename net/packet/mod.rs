@@ -37,7 +37,6 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::sync::spin::{Mutex, RwLock};
 
-use crate::error::KernelError;
 use crate::net::device::NetDevice;
 use crate::net::ethernet::{ETH_ALEN, ETH_HLEN};
 use crate::net::filter::Filter;
@@ -48,6 +47,7 @@ use crate::net::sock::Sock;
 use crate::net::socket::{
     AF_PACKET, OptIn, OptOut, ProtoOps, SIOCINQ, SIOCOUTQ, SOCK_DGRAM, SOCK_RAW,
 };
+use crate::util::error::KernelError;
 
 pub use rcv::{PacketTable, proc_net_packet, tap};
 

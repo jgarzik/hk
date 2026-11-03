@@ -29,7 +29,7 @@ use alloc::sync::Arc;
 
 use crate::fs::KernelError;
 use crate::fs::file::{File, FileOps, flags};
-use crate::poll::{POLLHUP, POLLIN, POLLRDNORM, PollTable};
+use crate::io::poll::{POLLHUP, POLLIN, POLLRDNORM, PollTable};
 use crate::task::Pid;
 
 /// Pidfd flags (from Linux uapi)
@@ -94,7 +94,7 @@ impl FileOps for PidfdFileOps {
 
     fn poll(&self, file: &File, pt: Option<&mut PollTable>) -> u16 {
         let Some(pidfd) = file.private_ref::<Pidfd>() else {
-            return crate::poll::POLLERR;
+            return crate::io::poll::POLLERR;
         };
         pidfd.poll(pt)
     }

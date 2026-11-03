@@ -21,11 +21,11 @@ use alloc::boxed::Box;
 use alloc::sync::{Arc, Weak};
 use core::sync::atomic::{AtomicI64, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
-use crate::list::List;
 use crate::ns::PidNamespace;
 use crate::sync::spin::Mutex;
 use crate::task::TableCell;
 use crate::task::percpu::{PgrpLink, SessionLink};
+use crate::util::list::List;
 
 /// Ids per bitmap page (Linux BITS_PER_PAGE)
 const PER_PAGE: u32 = 4096 * 8;
@@ -69,7 +69,7 @@ pub struct Pid {
     /// pid->tasks[PIDTYPE_SID]; links `Task.session_link`)
     pub(crate) session: TableCell<List<SessionLink>>,
     /// pidfd pollers of the process this pid leads (Linux wait_pidfd)
-    pub wait_pidfd: crate::waitqueue::WaitQueue,
+    pub wait_pidfd: crate::sync::waitqueue::WaitQueue,
     /// The process's wait status once all its threads have exited;
     /// ALIVE before
     exit: AtomicI64,
@@ -284,7 +284,7 @@ pub fn alloc_pid_nr(ns: &Arc<PidNamespace>, root_nr: Option<u32>) -> Option<Arc<
         task: AtomicPtr::new(core::ptr::null_mut()),
         pgrp: TableCell::new(List::new()),
         session: TableCell::new(List::new()),
-        wait_pidfd: crate::waitqueue::WaitQueue::new(),
+        wait_pidfd: crate::sync::waitqueue::WaitQueue::new(),
         exit: AtomicI64::new(ALIVE),
     });
     let _g = PIDMAP_LOCK.lock();
@@ -312,7 +312,7 @@ pub static INIT_STRUCT_PID: spin::Lazy<Arc<Pid>> = spin::Lazy::new(|| {
         task: AtomicPtr::new(core::ptr::null_mut()),
         pgrp: TableCell::new(List::new()),
         session: TableCell::new(List::new()),
-        wait_pidfd: crate::waitqueue::WaitQueue::new(),
+        wait_pidfd: crate::sync::waitqueue::WaitQueue::new(),
         exit: AtomicI64::new(ALIVE),
     })
 });

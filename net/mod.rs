@@ -88,7 +88,7 @@ pub use ipv4::Ipv4Addr;
 pub use skb::SkBuff;
 
 // Import unified error type
-use crate::error::KernelError;
+use crate::util::error::KernelError;
 
 /// Start the per-CPU softnet threads (after scheduling is enabled)
 pub fn start_threads() {

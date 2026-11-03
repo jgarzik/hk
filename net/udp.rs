@@ -27,7 +27,6 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::sync::spin::{Mutex, RwLock};
 
-use crate::error::KernelError;
 use crate::net::af_inet::{
     self, IP_PKTINFO, IP_TOS, IP_TTL, IPPROTO_UDP, Inet, InetAddr, RxInfo, SOL_IP,
 };
@@ -43,6 +42,7 @@ use crate::net::socket::{
     AF_INET, AF_UNSPEC, OptIn, OptOut, ProtoOps, SIOCINQ, SIOCOUTQ, SOCK_DGRAM, SOL_SOCKET,
     shut_bits,
 };
+use crate::util::error::KernelError;
 
 /// UDP header length
 pub const UDP_HLEN: usize = 8;

@@ -28,7 +28,7 @@ use alloc::sync::Arc;
 use crate::arch::IrqSpinlock;
 use crate::fs::KernelError;
 use crate::fs::file::{File, FileOps, flags};
-use crate::poll::{POLLIN, POLLRDNORM, PollTable};
+use crate::io::poll::{POLLIN, POLLRDNORM, PollTable};
 use crate::signal::{SigSet, UNMASKABLE_SIGNALS, with_task_signal_state};
 use crate::task::percpu::current_tid;
 
@@ -270,7 +270,7 @@ impl FileOps for SignalfdFileOps {
 
     fn poll(&self, file: &File, pt: Option<&mut PollTable>) -> u16 {
         let Some(signalfd) = file.private_ref::<Signalfd>() else {
-            return crate::poll::POLLERR;
+            return crate::io::poll::POLLERR;
         };
         signalfd.poll(pt)
     }

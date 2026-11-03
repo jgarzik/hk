@@ -610,7 +610,7 @@ pub fn aarch64_syscall_dispatch(
         sys_getppid, sys_getsid, sys_gettid, sys_getuid, sys_setpgid, sys_setsid, sys_wait4,
         sys_waitid,
     };
-    use crate::time_syscall::{
+    use crate::time::time_syscall::{
         sys_adjtimex, sys_clock_getres, sys_clock_gettime, sys_clock_nanosleep, sys_clock_settime,
         sys_eventfd2, sys_gettimeofday, sys_nanosleep, sys_settimeofday, sys_timerfd_create,
         sys_timerfd_gettime, sys_timerfd_settime,
@@ -851,37 +851,47 @@ pub fn aarch64_syscall_dispatch(
         }
 
         // inotify syscalls (Section 9.2)
-        SYS_INOTIFY_INIT1 => crate::inotify::sys_inotify_init1(arg0 as i32) as u64,
+        SYS_INOTIFY_INIT1 => crate::io::inotify::sys_inotify_init1(arg0 as i32) as u64,
         SYS_INOTIFY_ADD_WATCH => {
-            crate::inotify::sys_inotify_add_watch(arg0 as i32, arg1, arg2 as u32) as u64
+            crate::io::inotify::sys_inotify_add_watch(arg0 as i32, arg1, arg2 as u32) as u64
         }
         SYS_INOTIFY_RM_WATCH => {
-            crate::inotify::sys_inotify_rm_watch(arg0 as i32, arg1 as i32) as u64
+            crate::io::inotify::sys_inotify_rm_watch(arg0 as i32, arg1 as i32) as u64
         }
 
         // fanotify syscalls (Section 9.2)
-        SYS_FANOTIFY_INIT => crate::fanotify::sys_fanotify_init(arg0 as u32, arg1 as u32) as u64,
-        SYS_FANOTIFY_MARK => {
-            crate::fanotify::sys_fanotify_mark(arg0 as i32, arg1 as u32, arg2, arg3 as i32, arg4)
-                as u64
+        SYS_FANOTIFY_INIT => {
+            crate::io::fanotify::sys_fanotify_init(arg0 as u32, arg1 as u32) as u64
         }
+        SYS_FANOTIFY_MARK => crate::io::fanotify::sys_fanotify_mark(
+            arg0 as i32,
+            arg1 as u32,
+            arg2,
+            arg3 as i32,
+            arg4,
+        ) as u64,
 
         // epoll syscalls (Section 9.1)
-        SYS_EPOLL_CREATE1 => crate::epoll::sys_epoll_create1(arg0 as i32) as u64,
+        SYS_EPOLL_CREATE1 => crate::io::epoll::sys_epoll_create1(arg0 as i32) as u64,
         SYS_EPOLL_CTL => {
-            crate::epoll::sys_epoll_ctl(arg0 as i32, arg1 as i32, arg2 as i32, arg3) as u64
+            crate::io::epoll::sys_epoll_ctl(arg0 as i32, arg1 as i32, arg2 as i32, arg3) as u64
         }
-        SYS_EPOLL_PWAIT => {
-            crate::epoll::sys_epoll_pwait(arg0 as i32, arg1, arg2 as i32, arg3 as i32, arg4, arg5)
-                as u64
-        }
+        SYS_EPOLL_PWAIT => crate::io::epoll::sys_epoll_pwait(
+            arg0 as i32,
+            arg1,
+            arg2 as i32,
+            arg3 as i32,
+            arg4,
+            arg5,
+        ) as u64,
         SYS_EPOLL_PWAIT2 => {
-            crate::epoll::sys_epoll_pwait2(arg0 as i32, arg1, arg2 as i32, arg3, arg4, arg5) as u64
+            crate::io::epoll::sys_epoll_pwait2(arg0 as i32, arg1, arg2 as i32, arg3, arg4, arg5)
+                as u64
         }
 
         // io_uring syscalls (Section 9.3)
-        SYS_IO_URING_SETUP => crate::io_uring::sys_io_uring_setup(arg0 as u32, arg1) as u64,
-        SYS_IO_URING_ENTER => crate::io_uring::sys_io_uring_enter(
+        SYS_IO_URING_SETUP => crate::io::io_uring::sys_io_uring_setup(arg0 as u32, arg1) as u64,
+        SYS_IO_URING_ENTER => crate::io::io_uring::sys_io_uring_enter(
             arg0 as u32,
             arg1 as u32,
             arg2 as u32,
@@ -890,20 +900,22 @@ pub fn aarch64_syscall_dispatch(
             arg5 as usize,
         ) as u64,
         SYS_IO_URING_REGISTER => {
-            crate::io_uring::sys_io_uring_register(arg0 as u32, arg1 as u32, arg2, arg3 as u32)
+            crate::io::io_uring::sys_io_uring_register(arg0 as u32, arg1 as u32, arg2, arg3 as u32)
                 as u64
         }
 
         // POSIX timer syscalls (Section 6.2)
-        SYS_GETITIMER => crate::posix_timer::sys_getitimer(arg0 as i32, arg1) as u64,
-        SYS_SETITIMER => crate::posix_timer::sys_setitimer(arg0 as i32, arg1, arg2) as u64,
-        SYS_TIMER_CREATE => crate::posix_timer::sys_timer_create(arg0 as i32, arg1, arg2) as u64,
-        SYS_TIMER_SETTIME => {
-            crate::posix_timer::sys_timer_settime(arg0 as i32, arg1 as i32, arg2, arg3) as u64
+        SYS_GETITIMER => crate::time::posix_timer::sys_getitimer(arg0 as i32, arg1) as u64,
+        SYS_SETITIMER => crate::time::posix_timer::sys_setitimer(arg0 as i32, arg1, arg2) as u64,
+        SYS_TIMER_CREATE => {
+            crate::time::posix_timer::sys_timer_create(arg0 as i32, arg1, arg2) as u64
         }
-        SYS_TIMER_GETTIME => crate::posix_timer::sys_timer_gettime(arg0 as i32, arg1) as u64,
-        SYS_TIMER_GETOVERRUN => crate::posix_timer::sys_timer_getoverrun(arg0 as i32) as u64,
-        SYS_TIMER_DELETE => crate::posix_timer::sys_timer_delete(arg0 as i32) as u64,
+        SYS_TIMER_SETTIME => {
+            crate::time::posix_timer::sys_timer_settime(arg0 as i32, arg1 as i32, arg2, arg3) as u64
+        }
+        SYS_TIMER_GETTIME => crate::time::posix_timer::sys_timer_gettime(arg0 as i32, arg1) as u64,
+        SYS_TIMER_GETOVERRUN => crate::time::posix_timer::sys_timer_getoverrun(arg0 as i32) as u64,
+        SYS_TIMER_DELETE => crate::time::posix_timer::sys_timer_delete(arg0 as i32) as u64,
 
         // POSIX message queue syscalls (Section 7.4)
         SYS_MQ_OPEN => crate::ipc::sys_mq_open(arg0, arg1 as i32, arg2 as u32, arg3) as u64,
@@ -1012,7 +1024,7 @@ pub fn aarch64_syscall_dispatch(
 
         // membarrier syscall
         SYS_MEMBARRIER => {
-            crate::membarrier::sys_membarrier(arg0 as i32, arg1 as u32, arg2 as i32) as u64
+            crate::task::membarrier::sys_membarrier(arg0 as i32, arg1 as u32, arg2 as i32) as u64
         }
 
         SYS_FADVISE64 => {
@@ -1161,12 +1173,14 @@ pub fn aarch64_syscall_dispatch(
             use crate::task::syscall::sys_getrandom;
             sys_getrandom::<Uaccess>(arg0, arg1 as usize, arg2 as u32) as u64
         }
-        SYS_ACCT => crate::acct::sys_acct(arg0) as u64,
+        SYS_ACCT => crate::task::acct::sys_acct(arg0) as u64,
 
         // Resource limits
-        SYS_GETRLIMIT => crate::rlimit::sys_getrlimit(arg0 as u32, arg1) as u64,
-        SYS_SETRLIMIT => crate::rlimit::sys_setrlimit(arg0 as u32, arg1) as u64,
-        SYS_PRLIMIT64 => crate::rlimit::sys_prlimit64(arg0 as i32, arg1 as u32, arg2, arg3) as u64,
+        SYS_GETRLIMIT => crate::task::rlimit::sys_getrlimit(arg0 as u32, arg1) as u64,
+        SYS_SETRLIMIT => crate::task::rlimit::sys_setrlimit(arg0 as u32, arg1) as u64,
+        SYS_PRLIMIT64 => {
+            crate::task::rlimit::sys_prlimit64(arg0 as i32, arg1 as u32, arg2, arg3) as u64
+        }
 
         // Socket syscalls
         SYS_SOCKET => {
@@ -1244,12 +1258,16 @@ pub fn aarch64_syscall_dispatch(
 
         // Futex syscalls
         SYS_FUTEX => {
-            crate::futex::sys_futex(arg0, arg1 as u32, arg2 as u32, arg3, arg4, arg5 as u32) as u64
+            crate::task::futex::sys_futex(arg0, arg1 as u32, arg2 as u32, arg3, arg4, arg5 as u32)
+                as u64
         }
-        SYS_SET_ROBUST_LIST => crate::futex::sys_set_robust_list(arg0, arg1) as u64,
-        SYS_GET_ROBUST_LIST => crate::futex::sys_get_robust_list(arg0 as i32, arg1, arg2) as u64,
+        SYS_SET_ROBUST_LIST => crate::task::futex::sys_set_robust_list(arg0, arg1) as u64,
+        SYS_GET_ROBUST_LIST => {
+            crate::task::futex::sys_get_robust_list(arg0 as i32, arg1, arg2) as u64
+        }
         SYS_FUTEX_WAITV => {
-            crate::futex::sys_futex_waitv(arg0, arg1 as u32, arg2 as u32, arg3, arg4 as i32) as u64
+            crate::task::futex::sys_futex_waitv(arg0, arg1 as u32, arg2 as u32, arg3, arg4 as i32)
+                as u64
         }
 
         // SysV IPC syscalls
@@ -1289,7 +1307,9 @@ pub fn aarch64_syscall_dispatch(
         ) as u64,
 
         // Process inspection (Section 13)
-        SYS_KCMP => crate::kcmp::sys_kcmp(arg0 as i32, arg1 as i32, arg2 as i32, arg3, arg4) as u64,
+        SYS_KCMP => {
+            crate::task::kcmp::sys_kcmp(arg0 as i32, arg1 as i32, arg2 as i32, arg3, arg4) as u64
+        }
 
         // Syscall stubs (not fully implemented)
         SYS_RSEQ => {

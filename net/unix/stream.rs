@@ -14,13 +14,13 @@
 
 use alloc::sync::Arc;
 
-use crate::error::KernelError;
+use crate::io::poll::{
+    POLLERR, POLLHUP, POLLIN, POLLOUT, POLLRDHUP, POLLRDNORM, POLLWRBAND, POLLWRNORM,
+};
 use crate::net::msg::{MSG_DONTWAIT, MSG_OOB, MSG_PEEK, MSG_WAITALL, RecvMsg, SendMsg};
 use crate::net::sock::{RCV_SHUTDOWN, SEND_SHUTDOWN, SHUTDOWN_MASK, sf};
 use crate::net::socket::{SOCK_SEQPACKET, SOCK_STREAM};
-use crate::poll::{
-    POLLERR, POLLHUP, POLLIN, POLLOUT, POLLRDHUP, POLLRDNORM, POLLWRBAND, POLLWRNORM,
-};
+use crate::util::error::KernelError;
 
 use super::scm::{Creds, FpList, Scm, too_many_fds};
 use super::{CLOSE, ESTABLISHED, LISTEN, PeerCred, Skb, UnixSock, find_other, queue, validate};

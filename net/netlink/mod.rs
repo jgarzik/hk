@@ -46,10 +46,10 @@ use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsiz
 
 use crate::sync::spin::{Mutex, RwLock};
 
-use crate::error::KernelError;
 use crate::net::NetNamespace;
 use crate::net::sock::Sock;
 use crate::net::socket::{ProtoOps, SOCK_DGRAM, SOCK_RAW};
+use crate::util::error::KernelError;
 
 pub const AF_NETLINK: i32 = 16;
 pub const NETLINK_ROUTE: i32 = 0;

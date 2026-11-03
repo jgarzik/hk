@@ -449,7 +449,7 @@ pub fn sys_ioctl(fd: i32, cmd: u32, arg: u64) -> i64 {
         }
     } else if inode.mode().is_chrdev() {
         // Character device ioctls - route to CharDevice::ioctl()
-        use crate::chardev::get_chardev;
+        use crate::fs::chardev::get_chardev;
 
         let device = match get_chardev(inode.rdev) {
             Some(d) => d,
@@ -458,10 +458,12 @@ pub fn sys_ioctl(fd: i32, cmd: u32, arg: u64) -> i64 {
 
         match device.ioctl(cmd, arg) {
             Ok(result) => result,
-            Err(crate::chardev::DeviceError::NotTty) => KernelError::NotTty.sysret(),
-            Err(crate::chardev::DeviceError::InvalidArg) => KernelError::InvalidArgument.sysret(),
-            Err(crate::chardev::DeviceError::NotSupported) => KernelError::NotTty.sysret(),
-            Err(crate::chardev::DeviceError::Fault) => KernelError::BadAddress.sysret(),
+            Err(crate::fs::chardev::DeviceError::NotTty) => KernelError::NotTty.sysret(),
+            Err(crate::fs::chardev::DeviceError::InvalidArg) => {
+                KernelError::InvalidArgument.sysret()
+            }
+            Err(crate::fs::chardev::DeviceError::NotSupported) => KernelError::NotTty.sysret(),
+            Err(crate::fs::chardev::DeviceError::Fault) => KernelError::BadAddress.sysret(),
             Err(_) => KernelError::Io.sysret(),
         }
     } else {
@@ -899,7 +901,7 @@ fn do_listxattr(path_ptr: u64, list_ptr: u64, size: u64, follow_symlinks: bool) 
     }
 
     // At most XATTR_LIST_MAX (Linux listxattr), a fallible buffer
-    let mut list = match crate::kmem::try_vec(size.min(XATTR_LIST_MAX as u64) as usize, 0u8) {
+    let mut list = match crate::util::kmem::try_vec(size.min(XATTR_LIST_MAX as u64) as usize, 0u8) {
         Ok(l) => l,
         Err(e) => return e.sysret(),
     };
@@ -945,7 +947,7 @@ pub fn sys_flistxattr(fd: i32, list_ptr: u64, size: u64) -> i64 {
     }
 
     // At most XATTR_LIST_MAX (Linux listxattr), a fallible buffer
-    let mut list = match crate::kmem::try_vec(size.min(XATTR_LIST_MAX as u64) as usize, 0u8) {
+    let mut list = match crate::util::kmem::try_vec(size.min(XATTR_LIST_MAX as u64) as usize, 0u8) {
         Ok(l) => l,
         Err(e) => return e.sysret(),
     };

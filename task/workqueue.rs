@@ -47,9 +47,9 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use crate::sync::spin::Mutex;
 
 use crate::arch::IrqSpinlock;
+use crate::sync::waitqueue::WaitQueue;
 use crate::task::Tid;
 use crate::task::percpu::get_ticks;
-use crate::waitqueue::WaitQueue;
 
 // ============================================================================
 // Work Flags
@@ -447,7 +447,7 @@ impl Workqueue {
     /// Start this workqueue's worker kernel thread
     ///
     /// `cpu`: bind the worker to a CPU, or `None` for any (WQ_UNBOUND-like).
-    pub fn start(&'static self, cpu: Option<u32>) -> Result<(), crate::error::KernelError> {
+    pub fn start(&'static self, cpu: Option<u32>) -> Result<(), crate::util::error::KernelError> {
         let k = crate::task::kthread::kthread_run(
             self.name,
             worker_thread_fn,

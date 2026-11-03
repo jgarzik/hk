@@ -17,6 +17,15 @@
 //!
 //! The seqlock ensures readers get consistent snapshots without blocking.
 
+pub mod cpu_timer;
+pub mod delay;
+pub mod hrtimer;
+pub mod posix_timer;
+pub(crate) mod time_syscall;
+pub mod timer;
+pub mod timerfd;
+pub mod watchdog;
+
 use ::core::sync::atomic::{AtomicI32, AtomicI64, AtomicU32, AtomicU64, Ordering};
 
 use crate::arch::IrqSpinlock;
@@ -119,7 +128,7 @@ pub struct NtpState {
 
 impl NtpState {
     /// Create a new NtpState with default values
-    pub const fn new() -> Self {
+    const fn new() -> Self {
         Self {
             maxerror: AtomicI64::new(500_000),  // 0.5 sec default
             esterror: AtomicI64::new(500_000),  // 0.5 sec default
@@ -429,7 +438,7 @@ pub fn settod_valid(t: &Timespec) -> bool {
 /// next clock event (at most a tick away); cancel-on-set timerfds fail
 /// their next read
 fn clock_was_set() {
-    crate::timerfd::clock_was_set();
+    crate::time::timerfd::clock_was_set();
 }
 
 /// CLOCK_REALTIME - CLOCK_MONOTONIC now, ns
@@ -482,9 +491,9 @@ pub fn deadline_ms(ms: i32) -> Deadline {
 
 /// The deadline of a relative (sec, nsec) timeout; EINVAL if invalid
 /// (Linux poll_select_set_timeout)
-pub fn deadline_ts(sec: i64, nsec: i64) -> Result<Deadline, crate::error::KernelError> {
+pub fn deadline_ts(sec: i64, nsec: i64) -> Result<Deadline, crate::util::error::KernelError> {
     if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
-        return Err(crate::error::KernelError::InvalidArgument);
+        return Err(crate::util::error::KernelError::InvalidArgument);
     }
     if sec == 0 && nsec == 0 {
         return Ok(Some(0));

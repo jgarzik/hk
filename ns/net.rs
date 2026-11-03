@@ -21,12 +21,12 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use crate::sync::spin::RwLock;
 use spin::Lazy;
 
-use crate::error::KernelError;
 use crate::net::device::{LinkInfo, NetDevice, NetDeviceOps};
 use crate::net::inet::fib::Fib;
 use crate::net::inet::port::PortRange;
 use crate::net::netlink::NlTable;
 use crate::net::udp::UdpTable;
+use crate::util::error::KernelError;
 
 /// Network namespace - isolates network stack per-namespace
 ///

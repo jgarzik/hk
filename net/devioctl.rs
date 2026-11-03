@@ -9,7 +9,6 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use crate::error::KernelError;
 use crate::net::NetNamespace;
 use crate::net::device::NetDevice;
 use crate::net::inet::fib::{self, FibConfig, NLM_F_CREATE, RT_TABLE_MAIN, RTPROT_BOOT, RouteType};
@@ -21,6 +20,7 @@ use crate::net::ipv4::Ipv4Addr;
 use crate::net::netlink::NlInfo;
 use crate::net::rtnl;
 use crate::uaccess::{copy_from_user, copy_to_user};
+use crate::util::error::KernelError;
 
 #[cfg(target_arch = "aarch64")]
 use crate::arch::aarch64::uaccess::Aarch64Uaccess as Uaccess;

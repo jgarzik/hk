@@ -7,7 +7,7 @@
 //! - setresuid, setresgid, getresuid, getresgid (real/effective/saved IDs)
 //! - setfsuid, setfsgid (filesystem user/group IDs)
 
-use crate::error::KernelError;
+use crate::util::error::KernelError;
 
 use super::{Pid, Tid};
 

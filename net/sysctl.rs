@@ -10,9 +10,9 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicI32, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
-use crate::error::KernelError;
 use crate::net::current_net_ns;
 use crate::sysctl::{Ctl, Text, range};
+use crate::util::error::KernelError;
 
 /// GID_T_MAX: largest gid in ping_group_range
 const GID_MAX: i64 = 0x7fff_ffff;

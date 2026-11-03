@@ -25,9 +25,9 @@
 #![allow(dead_code)]
 
 use crate::arch::Uaccess;
-use crate::pod::{FromBytes, IntoBytes};
 use crate::signal::{KSigInfo, SigAction, SigHandler, SigSet, sa_flags};
 use crate::uaccess::{UaccessArch, copy_to_user};
+use crate::util::pod::{FromBytes, IntoBytes};
 
 // =============================================================================
 // Signal Context (sigcontext)

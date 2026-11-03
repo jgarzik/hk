@@ -7,7 +7,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::bpf::{BpfInsn, BpfProg, SockFilter, bpf_run, cbpf_to_ebpf};
-use crate::error::KernelError;
+use crate::util::error::KernelError;
 
 use super::{SECCOMP_RET_ACTION, SeccompData};
 
@@ -82,7 +82,10 @@ impl SeccompFilter {
     /// Lower action values are more restrictive.
     pub fn run(&self, data: &SeccompData) -> u32 {
         // Run this filter
-        let result = bpf_run(self.prog.insns(), crate::pod::IntoBytes::as_bytes(data)) as u32;
+        let result = bpf_run(
+            self.prog.insns(),
+            crate::util::pod::IntoBytes::as_bytes(data),
+        ) as u32;
 
         // If we have a previous filter, run it too
         if let Some(ref prev) = self.prev {

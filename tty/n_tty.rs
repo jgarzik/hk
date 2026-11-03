@@ -10,7 +10,7 @@
 
 use super::termios::*;
 use super::{LineDiscipline, Tty};
-use crate::chardev::DeviceError;
+use crate::fs::chardev::DeviceError;
 
 /// Maximum size of the read buffer
 const READ_BUF_SIZE: usize = 4096;

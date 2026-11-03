@@ -10,10 +10,10 @@
 use alloc::sync::Arc;
 use core::sync::atomic::{Ordering, fence};
 
-use crate::cpumask::CpuSet;
 use crate::mm::Mm;
 use crate::sync::Mutex;
 use crate::task::percpu::PerCpuScheduler;
+use crate::util::cpumask::CpuSet;
 
 // =============================================================================
 // membarrier commands (Linux ABI)

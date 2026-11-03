@@ -12,7 +12,7 @@ use core::sync::atomic::{
 };
 
 use super::Priority;
-use crate::list::{Adapter, Link, List};
+use crate::util::list::{Adapter, Link, List};
 
 /// Scheduling class, highest first (Linux stop/rt/fair/idle_sched_class)
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -407,7 +407,7 @@ impl<A: Adapter> ClassQueues<A> {
     }
 
     /// The queued fair tasks
-    pub fn fair_iter(&self) -> crate::list::Iter<'_, A> {
+    pub fn fair_iter(&self) -> crate::util::list::Iter<'_, A> {
         self.fair.iter()
     }
 

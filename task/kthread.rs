@@ -30,13 +30,13 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use crate::sync::spin::Mutex;
 
-use crate::error::KernelError;
+use crate::sync::waitqueue::WaitQueue;
 use crate::task::percpu::{
     SleepState, TaskRef, WakeMode, cpu_has_scheduler, create_kthread_task, current_tid, schedule,
     set_current_state, try_to_wake_up,
 };
 use crate::task::{PRIORITY_NORMAL, Priority, Tid};
-use crate::waitqueue::WaitQueue;
+use crate::util::error::KernelError;
 
 /// Kernel thread control block (Linux struct kthread)
 pub struct KThread {

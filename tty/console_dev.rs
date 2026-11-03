@@ -14,8 +14,8 @@
 //!
 //! /dev/console = major 5, minor 1
 
-use crate::chardev::{CharDevice, DeviceError};
 use crate::console::{console_flush, console_write};
+use crate::fs::chardev::{CharDevice, DeviceError};
 
 /// /dev/console character device
 ///

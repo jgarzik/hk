@@ -18,10 +18,10 @@
 
 use crate::arch::{CurrentArch, IoremapOps};
 use crate::bus::BusDevice;
-use crate::delay::{Clock, Monotonic, poll_on};
 use crate::hw::pci;
 use crate::hw::pci::PciDevice;
 use crate::printkln;
+use crate::time::delay::{Clock, Monotonic, poll_on};
 
 use super::ext_caps::{self, Mmio};
 use super::xhci::{PCI_VENDOR_INTEL, XHCI_IRQS, XHCI_MAX_HALT_US};
@@ -510,8 +510,8 @@ fn quirk_usb_disable_ehci(dev: &PciDevice, bar: &Bar) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::delay::tests::FakeClock;
     use crate::hw::usb::ext_caps::tests::FakeRegs;
+    use crate::time::delay::tests::FakeClock;
     use core::cell::Cell;
 
     const LEG: u32 = 0x500;

@@ -24,8 +24,8 @@ use core::sync::atomic::Ordering;
 
 use super::inode::Inode;
 use super::superblock::SuperBlock;
-use crate::error::KernelError;
 use crate::sync::spin::Mutex;
+use crate::util::error::KernelError;
 
 /// Device-backed superblocks (Linux super_blocks)
 static SUPER_BLOCKS: Mutex<Vec<Weak<SuperBlock>>> = Mutex::new(Vec::new());

@@ -17,7 +17,6 @@ use core::sync::atomic::{AtomicI32, AtomicU8, AtomicU16, AtomicU32, Ordering};
 
 use crate::sync::spin::Mutex;
 
-use crate::error::KernelError;
 use crate::net::inet::fib::RouteType;
 use crate::net::ipv4::{IP_DEFAULT_TTL, IpParams, Ipv4Addr};
 use crate::net::msg::Cmsg;
@@ -25,6 +24,7 @@ use crate::net::sock::Sock;
 use crate::net::socket::{
     AF_INET, AF_UNSPEC, OptIn, OptOut, ProtoOps, SOCK_DGRAM, SOCK_RAW, SOCK_STREAM,
 };
+use crate::util::error::KernelError;
 
 pub const IPPROTO_IP: i32 = 0;
 pub const IPPROTO_ICMP: i32 = 1;

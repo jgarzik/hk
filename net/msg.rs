@@ -9,8 +9,8 @@
 use alloc::vec::Vec;
 
 use crate::arch::Uaccess;
-use crate::error::KernelError;
 use crate::uaccess::{UaccessArch, copy_from_user, copy_to_user, get_user, put_user};
+use crate::util::error::KernelError;
 
 /// Most segments in one iovec array (Linux UIO_MAXIOV)
 pub const UIO_MAXIOV: usize = 1024;

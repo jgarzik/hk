@@ -14,10 +14,10 @@ use core::arch::asm;
 use super::io::{inb, inw, outb, outw};
 use super::ioremap::ioremap;
 use crate::arch::PowerInfo;
-use crate::delay::Monotonic;
 use crate::hw::acpi::aml::SleepType;
 use crate::hw::acpi::hw::{self, PmRegs, PortIo, ResetReg, Space};
 use crate::printkln;
+use crate::time::delay::Monotonic;
 
 /// The FADT's registers, the S5 sleep type and the reset register,
 /// once parsed
@@ -105,10 +105,10 @@ pub fn shutdown() -> ! {
         hw::enter_s5(&mut Ports, &p.pm, p.s5);
         // Linux acpi_hw_legacy_sleep: wait ten seconds for chipsets that
         // poll PM1 control slowly, then set SLP_EN again
-        crate::delay::mdelay(10_000);
+        crate::time::delay::mdelay(10_000);
         printkln!("ACPI: still on 10 s after S5, retrying");
         hw::sleep_retry(&mut Ports, &p.pm, p.s5);
-        crate::delay::mdelay(1000);
+        crate::time::delay::mdelay(1000);
         printkln!("ACPI: power-off failed, halting");
     }
     halt()
@@ -139,7 +139,7 @@ fn acpi_reset() {
         // SAFETY: mapped by init for this register
         Reset::Mem(virt, val) => unsafe { core::ptr::write_volatile(virt as *mut u8, val) },
     }
-    crate::delay::mdelay(15);
+    crate::time::delay::mdelay(15);
 }
 
 /// 8042 status and command port
@@ -154,9 +154,9 @@ const KBD_RESET: u8 = 0xfe;
 fn kbd_reset() {
     for _ in 0..10 {
         kb_wait();
-        crate::delay::udelay(50);
+        crate::time::delay::udelay(50);
         outb(KBD_PORT, KBD_RESET);
-        crate::delay::udelay(50);
+        crate::time::delay::udelay(50);
     }
 }
 
@@ -166,7 +166,7 @@ fn kb_wait() {
         if inb(KBD_PORT) & KBD_IBF == 0 {
             break;
         }
-        crate::delay::udelay(2);
+        crate::time::delay::udelay(2);
     }
 }
 
@@ -184,9 +184,9 @@ fn cf9_reset() {
     let code = RST_SYS | RST_CPU | RST_FULL;
     let cf9 = inb(RST_CNT) & !code;
     outb(RST_CNT, cf9 | RST_SYS);
-    crate::delay::udelay(50);
+    crate::time::delay::udelay(50);
     outb(RST_CNT, cf9 | code);
-    crate::delay::udelay(50);
+    crate::time::delay::udelay(50);
 }
 
 /// Halt the system

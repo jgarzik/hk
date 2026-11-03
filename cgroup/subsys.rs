@@ -6,8 +6,8 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
 
-use crate::error::KernelError;
 use crate::task::Pid;
+use crate::util::error::KernelError;
 
 use super::CgroupSubsysState;
 

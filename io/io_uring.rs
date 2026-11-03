@@ -47,13 +47,13 @@ use crate::arch::{IrqSpinlock, Uaccess};
 use crate::fs::KernelError;
 use crate::fs::file::{File, FileOps, flags};
 use crate::fs::iov::IoVec;
+use crate::io::pipe::FD_CLOEXEC;
+use crate::io::poll::PollTable;
 use crate::mm::PAGE_SIZE;
-use crate::pipe::FD_CLOEXEC;
-use crate::poll::PollTable;
+use crate::sync::waitqueue::WaitQueue;
 use crate::task::fdtable::get_task_fd;
 use crate::task::percpu::current_tid;
 use crate::uaccess::{UaccessArch, copy_from_user, copy_val_from_user, get_user, put_user};
-use crate::waitqueue::WaitQueue;
 
 // ============================================================================
 // io_uring constants
@@ -1271,7 +1271,7 @@ impl FileOps for IoUringFileOps {
 
     fn poll(&self, file: &File, pt: Option<&mut PollTable>) -> u16 {
         let Some(ring) = file.private_ref::<IoUring>() else {
-            return crate::poll::POLLERR;
+            return crate::io::poll::POLLERR;
         };
         if let Some(poll_table) = pt {
             poll_table.poll_wait(&ring.wq);
@@ -1280,7 +1280,7 @@ impl FileOps for IoUringFileOps {
         // Check if CQEs are available
         let inner = ring.inner.lock();
         if inner.cq_tail > 0 {
-            crate::poll::POLLIN | crate::poll::POLLRDNORM
+            crate::io::poll::POLLIN | crate::io::poll::POLLRDNORM
         } else {
             0
         }
@@ -1358,7 +1358,7 @@ fn read_user_fds(arg: u64, n: usize) -> Result<Vec<i32>, KernelError> {
     if n > IORING_MAX_FIXED_FILES {
         return Err(KernelError::ProcessFileLimit);
     }
-    let mut fds = crate::kmem::try_vec(n, 0i32)?;
+    let mut fds = crate::util::kmem::try_vec(n, 0i32)?;
     // SAFETY: byte view of the `n` initialized i32 elements of `fds`
     let bytes = unsafe { core::slice::from_raw_parts_mut(fds.as_mut_ptr() as *mut u8, n * 4) };
     copy_from_user::<Uaccess>(bytes, arg, n * 4).map_err(|_| KernelError::BadAddress)?;
@@ -1382,8 +1382,8 @@ fn fs_error_to_errno(e: KernelError) -> i64 {
 
 /// Get RLIMIT_NOFILE for fd allocation
 fn get_nofile_limit() -> u64 {
-    let limit = crate::rlimit::rlimit(crate::rlimit::RLIMIT_NOFILE);
-    if limit == crate::rlimit::RLIM_INFINITY {
+    let limit = crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_NOFILE);
+    if limit == crate::task::rlimit::RLIM_INFINITY {
         u64::MAX
     } else {
         limit

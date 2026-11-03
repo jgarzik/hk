@@ -28,7 +28,7 @@ use super::blkdev::{
 };
 use super::genhd::{add_disk, del_gendisk, disk_name};
 
-use crate::error::KernelError;
+use crate::util::error::KernelError;
 
 use super::scsi::{
     Cdb, ScsiCommand, ScsiError, ScsiHost, ScsiResult, inquiry, read_capacity, test_unit_ready,

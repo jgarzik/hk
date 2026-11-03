@@ -18,9 +18,9 @@ use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::{can_sleep, might_sleep};
-use crate::error::KernelError;
+use crate::sync::waitqueue::WaitQueue;
 use crate::task::percpu::{SleepState, current_tid};
-use crate::waitqueue::WaitQueue;
+use crate::util::error::KernelError;
 
 /// Owner value of an unlocked mutex
 const UNLOCKED: u64 = 0;

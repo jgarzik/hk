@@ -5,8 +5,8 @@
 //! This provides the hardware interface for serial ports like /dev/ttyS0.
 #![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
-use crate::chardev::DeviceError;
 use crate::console::{ConsolePriority, register_console};
+use crate::fs::chardev::DeviceError;
 
 use crate::tty::{RAW_LDISC, Tty, TtyDriver};
 
@@ -292,7 +292,7 @@ pub fn write_byte_com1(byte: u8) {
     SERIAL_DRIVER_S0.write_byte(byte);
 }
 
-use crate::chardev::{CharDevice, DevId, major, register_chardev};
+use crate::fs::chardev::{CharDevice, DevId, major, register_chardev};
 use alloc::sync::Arc;
 
 /// Wrapper to allow static TTY to be registered as Arc<dyn CharDevice>

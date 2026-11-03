@@ -27,8 +27,8 @@ fn do_truncate(inode: &Arc<super::Inode>, length: u64) -> i64 {
     // Check RLIMIT_FSIZE when extending the file
     let current_size = inode.get_size();
     if length > current_size {
-        let limit = crate::rlimit::rlimit(crate::rlimit::RLIMIT_FSIZE);
-        if limit != crate::rlimit::RLIM_INFINITY && length > limit {
+        let limit = crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_FSIZE);
+        if limit != crate::task::rlimit::RLIM_INFINITY && length > limit {
             let tid = current_tid();
             crate::signal::send_signal(tid, crate::signal::SIGXFSZ);
             return KernelError::FileTooLarge.sysret();
@@ -300,7 +300,7 @@ pub fn sys_pipe(pipefd: u64) -> i64 {
 /// * -EMFILE if too many file descriptors
 pub fn sys_pipe2(pipefd: u64, flags: u32) -> i64 {
     use crate::fs::file::flags::{O_CLOEXEC, O_NONBLOCK};
-    use crate::pipe::{FD_CLOEXEC, create_pipe};
+    use crate::io::pipe::{FD_CLOEXEC, create_pipe};
     use crate::uaccess::copy_to_user;
 
     // Validate flags - only O_CLOEXEC and O_NONBLOCK are allowed

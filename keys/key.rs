@@ -9,7 +9,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use crate::error::KernelError;
+use crate::util::error::KernelError;
 
 use super::types::KeyType;
 

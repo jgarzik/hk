@@ -50,7 +50,7 @@ pub fn exit_to_user_mode(regs: &UserFrame) {
         if work & tif::NOTIFY_RESUME != 0 {
             crate::task::percpu::current().clear_tif(tif::NOTIFY_RESUME);
             // CPU-time timers the tick found due (cpu_timer)
-            crate::cpu_timer::run();
+            crate::time::cpu_timer::run();
         }
         CurrentArch::disable_interrupts();
     }

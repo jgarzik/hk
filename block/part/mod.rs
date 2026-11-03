@@ -10,7 +10,7 @@ pub mod msdos;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use crate::error::KernelError;
+use crate::util::error::KernelError;
 
 /// A partition: sectors on the disk (512-byte units)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

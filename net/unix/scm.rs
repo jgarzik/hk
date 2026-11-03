@@ -33,11 +33,11 @@ use alloc::vec::Vec;
 
 use crate::sync::spin::Mutex;
 
-use crate::error::KernelError;
 use crate::fs::file::File;
 use crate::net::msg::{MSG_CMSG_CLOEXEC, RecvMsg, cmsgs};
 use crate::net::socket::SOL_SOCKET;
 use crate::task::Uid;
+use crate::util::error::KernelError;
 
 pub const SCM_RIGHTS: i32 = 1;
 pub const SCM_CREDENTIALS: i32 = 2;
@@ -120,7 +120,7 @@ const INFLIGHT_MAX: u64 = (SCM_MAX_FD * 8) as u64;
 pub fn too_many_fds() -> bool {
     let uid = crate::task::current_cred().uid;
     let n = INFLIGHT.lock().get(&uid).copied().unwrap_or(0) as u64;
-    let lim = crate::rlimit::rlimit(crate::rlimit::RLIMIT_NOFILE).min(INFLIGHT_MAX);
+    let lim = crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_NOFILE).min(INFLIGHT_MAX);
     n > lim
         && !crate::task::capable(crate::task::CAP_SYS_RESOURCE)
         && !crate::task::capable(crate::task::CAP_SYS_ADMIN)
@@ -267,7 +267,7 @@ impl Scm {
         for c in data[..n * 4].as_chunks::<4>().0 {
             let fd = i32::from_ne_bytes(*c);
             let f = table.lock().get(fd).ok_or(KernelError::BadFd)?;
-            if f.f_op.as_any().is::<crate::io_uring::IoUringFileOps>() {
+            if f.f_op.as_any().is::<crate::io::io_uring::IoUringFileOps>() {
                 return Err(KernelError::InvalidArgument);
             }
             fpl.files.push(f);

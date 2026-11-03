@@ -50,9 +50,9 @@ use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use crate::fs::KernelError;
 use crate::fs::file::{File, FileOps, RwFlags, flags};
+use crate::io::poll::{POLLERR, POLLHUP, POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM, PollTable};
 use crate::mm::filemap::PAGE_SIZE;
-use crate::poll::{POLLERR, POLLHUP, POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM, PollTable};
-use crate::waitqueue::WaitQueue;
+use crate::sync::waitqueue::WaitQueue;
 
 /// Pipe buffer size (matches Linux PIPE_BUF for atomic writes)
 pub const PIPE_BUF: usize = 4096;

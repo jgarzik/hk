@@ -163,7 +163,7 @@ pub fn parse_cmdline(cmdline: &str) {
         } else if let Some(s) = option.strip_prefix("watchdog_thresh=")
             && let Ok(s) = s.parse()
         {
-            crate::watchdog::set_thresh(s);
+            crate::time::watchdog::set_thresh(s);
         }
         // Unknown options are ignored
     }

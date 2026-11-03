@@ -7,7 +7,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 
-use crate::error::KernelError;
+use crate::util::error::KernelError;
 
 use super::key::Key;
 

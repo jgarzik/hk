@@ -14,7 +14,7 @@
 //! Order: `done` -> wait queue head -> run-queue lock (the wake path).
 
 use crate::arch::IrqSpinlock;
-use crate::waitqueue::WaitQueue;
+use crate::sync::waitqueue::WaitQueue;
 
 /// `complete_all` marks the completion done for every present and
 /// future waiter (Linux UINT_MAX)

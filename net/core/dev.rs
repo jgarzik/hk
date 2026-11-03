@@ -48,9 +48,9 @@ use crate::cpu::PerCpu;
 use crate::net::device::NetDevice;
 use crate::net::ethernet::{self, PktType};
 use crate::net::skb::SkBuff;
+use crate::sync::waitqueue::WaitQueue;
 use crate::task::kthread::KThread;
 use crate::task::percpu::cpu_has_scheduler;
-use crate::waitqueue::WaitQueue;
 
 /// Default NAPI weight (Linux NAPI_POLL_WEIGHT)
 pub const NAPI_POLL_WEIGHT: usize = 64;
@@ -515,8 +515,11 @@ pub fn netif_receive_skb(mut skb: Box<SkBuff>) {
 /// Transmit a frame on `skb.dev` (Linux `dev_queue_xmit`; no qdisc).
 /// `skb.data()` starts at the link-layer header. The taps see it as
 /// PACKET_OUTGOING first (Linux dev_queue_xmit_nit), if the device is up.
-pub fn dev_queue_xmit(skb: Box<SkBuff>) -> Result<(), crate::error::KernelError> {
-    let dev: Arc<NetDevice> = skb.dev.clone().ok_or(crate::error::KernelError::NoDevice)?;
+pub fn dev_queue_xmit(skb: Box<SkBuff>) -> Result<(), crate::util::error::KernelError> {
+    let dev: Arc<NetDevice> = skb
+        .dev
+        .clone()
+        .ok_or(crate::util::error::KernelError::NoDevice)?;
     if dev.is_up() {
         deliver_taps(&Tap {
             dev: &dev,

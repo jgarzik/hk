@@ -15,7 +15,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::arch::IrqSpinlock;
-use crate::error::KernelError;
+use crate::util::error::KernelError;
 
 // =============================================================================
 // Map Type Constants (Linux ABI)
@@ -288,7 +288,7 @@ impl BpfArrayMap {
         data.try_reserve_exact(max_entries as usize)
             .map_err(|_| KernelError::OutOfMemory)?;
         for _ in 0..max_entries {
-            data.push(IrqSpinlock::new(crate::kmem::try_vec(
+            data.push(IrqSpinlock::new(crate::util::kmem::try_vec(
                 value_size as usize,
                 0u8,
             )?));

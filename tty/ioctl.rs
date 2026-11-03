@@ -8,7 +8,7 @@
 use super::Tty;
 use super::termios::{Termios, Winsize};
 use crate::arch::Uaccess;
-use crate::chardev::DeviceError;
+use crate::fs::chardev::DeviceError;
 use crate::uaccess::{get_user, put_user};
 
 // =============================================================================

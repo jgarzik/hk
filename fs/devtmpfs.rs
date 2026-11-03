@@ -23,7 +23,7 @@ use alloc::vec::Vec;
 
 use spin::Once;
 
-use crate::chardev::DevId;
+use crate::fs::chardev::DevId;
 use crate::sync::spin::Mutex;
 
 use super::KernelError;

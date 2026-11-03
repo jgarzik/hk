@@ -6,10 +6,10 @@
 //! crate::uaccess to ensure proper validation and SMAP protection.
 
 use crate::arch::Uaccess;
-use crate::error::KernelError;
-use crate::hrtimer::HrClock;
+use crate::time::hrtimer::HrClock;
 use crate::time::{ClockId, NTP_STATE, STA_NANO, STA_UNSYNC, TIMEKEEPER};
 use crate::uaccess::{UaccessArch, get_user, put_user};
+use crate::util::error::KernelError;
 use core::sync::atomic::Ordering;
 
 /// Linux clock IDs
@@ -199,7 +199,7 @@ fn cpu_nanosleep(clockid: i32, flags: i32, req: u64, rem: u64) -> i64 {
     }
     let ns = crate::time::timespec_to_ns(request.tv_sec, request.tv_nsec);
     let abs = flags & TIMER_ABSTIME != 0;
-    match crate::posix_timer::cpu_nanosleep(clockid, abs, ns) {
+    match crate::time::posix_timer::cpu_nanosleep(clockid, abs, ns) {
         Ok(()) => 0,
         Err((KernelError::Interrupted, left)) => {
             if !abs && rem != 0 {
@@ -630,16 +630,16 @@ pub fn sys_settimeofday(tv: u64, tz: u64) -> i64 {
 // Timerfd syscalls
 // =============================================================================
 
-use crate::eventfd::{create_eventfd, efd_flags};
-use crate::pipe::FD_CLOEXEC;
+use crate::io::eventfd::{create_eventfd, efd_flags};
+use crate::io::pipe::FD_CLOEXEC;
 use crate::task::fdtable::get_task_fd;
 use crate::task::percpu::current_tid;
-use crate::timerfd::{ITimerSpec, create_timerfd, get_timerfd, tfd_flags, tfd_timer_flags};
+use crate::time::timerfd::{ITimerSpec, create_timerfd, get_timerfd, tfd_flags, tfd_timer_flags};
 
 /// Get the RLIMIT_NOFILE limit for the current task
 fn get_nofile_limit() -> u64 {
-    let limit = crate::rlimit::rlimit(crate::rlimit::RLIMIT_NOFILE);
-    if limit == crate::rlimit::RLIM_INFINITY {
+    let limit = crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_NOFILE);
+    if limit == crate::task::rlimit::RLIM_INFINITY {
         u64::MAX
     } else {
         limit
@@ -945,7 +945,7 @@ crate::pod!(Timex {
 
 impl Default for Timex {
     fn default() -> Self {
-        <Self as crate::pod::FromBytes>::zeroed()
+        <Self as crate::util::pod::FromBytes>::zeroed()
     }
 }
 

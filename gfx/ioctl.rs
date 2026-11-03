@@ -445,12 +445,12 @@ pub fn dispatch_ioctl(driver: &dyn GfxDriver, cmd: u32, arg: u64) -> Result<i64,
 }
 
 /// Copy an ioctl argument struct in from user space
-fn read_arg<T: crate::pod::FromBytes>(addr: u64) -> Result<T, GfxError> {
+fn read_arg<T: crate::util::pod::FromBytes>(addr: u64) -> Result<T, GfxError> {
     copy_val_from_user::<Uaccess, T>(addr).map_err(|_| GfxError::Fault)
 }
 
 /// Copy an ioctl argument struct back out to user space
-fn write_arg<T: crate::pod::IntoBytes>(addr: u64, val: &T) -> Result<(), GfxError> {
+fn write_arg<T: crate::util::pod::IntoBytes>(addr: u64, val: &T) -> Result<(), GfxError> {
     copy_val_to_user::<Uaccess, T>(addr, val).map_err(|_| GfxError::Fault)
 }
 

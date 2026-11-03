@@ -21,8 +21,8 @@ use core::ops::{Deref, DerefMut};
 use crate::sync::spin::Mutex as SpinMutex;
 
 use super::{can_sleep, might_sleep};
-use crate::error::KernelError;
-use crate::waitqueue::WaitQueue;
+use crate::sync::waitqueue::WaitQueue;
+use crate::util::error::KernelError;
 
 #[derive(Default)]
 struct Count {

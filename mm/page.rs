@@ -310,7 +310,7 @@ pub fn lock_page(phys: u64) {
         return;
     };
     while !pg.try_lock() {
-        crate::waitqueue::page_wait_queue(phys).wait_event(|| !pg.is_locked());
+        crate::sync::waitqueue::page_wait_queue(phys).wait_event(|| !pg.is_locked());
     }
 }
 
@@ -318,7 +318,7 @@ pub fn lock_page(phys: u64) {
 pub fn unlock_page(phys: u64) {
     if let Some(pg) = phys_to_page(phys) {
         pg.unlock();
-        crate::waitqueue::page_wait_queue(phys).wake_all();
+        crate::sync::waitqueue::page_wait_queue(phys).wake_all();
     }
 }
 

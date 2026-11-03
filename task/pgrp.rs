@@ -4,7 +4,7 @@
 //! - getpgid, setpgid (process group ID)
 //! - getsid, setsid (session ID)
 
-use crate::error::KernelError;
+use crate::util::error::KernelError;
 
 use super::Pid;
 

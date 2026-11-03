@@ -3,15 +3,19 @@
 //! Handles virtual memory areas (VMAs), mmap/munmap syscalls, and
 //! demand paging for user processes.
 
+pub(crate) mod frame_alloc;
+pub(crate) mod heap;
+pub mod numa;
+
 extern crate alloc;
 
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU8, AtomicU32, AtomicUsize, Ordering};
 
-use crate::error::KernelError;
 use crate::sync::spin::Mutex;
 use crate::sync::{RwSem, RwSemReadGuard, RwSemWriteGuard};
+use crate::util::error::KernelError;
 
 use crate::task::Tid;
 
@@ -93,8 +97,8 @@ pub fn memalloc_scope<R>(flag: u32, f: impl FnOnce() -> R) -> R {
 /// A fixed mapping at [addr, addr + len): below MMAP_MIN_ADDR is EPERM
 /// without CAP_SYS_RAWIO (Linux security_mmap_addr / cap_mmap_addr),
 /// past TASK_SIZE is ENOMEM
-pub fn check_fixed(addr: u64, len: u64) -> Result<(), crate::error::KernelError> {
-    use crate::error::KernelError;
+pub fn check_fixed(addr: u64, len: u64) -> Result<(), crate::util::error::KernelError> {
+    use crate::util::error::KernelError;
     if addr < MMAP_MIN_ADDR && !crate::task::capable(crate::task::CAP_SYS_RAWIO) {
         return Err(KernelError::NotPermitted);
     }
@@ -116,8 +120,8 @@ pub fn hint_ok(addr: u64, len: u64) -> bool {
 pub fn mmap_base() -> u64 {
     const MIN_GAP: u64 = 128 << 20;
     const MAX_GAP: u64 = STACK_TOP / 6 * 5;
-    let rlim = crate::rlimit::rlimit(crate::rlimit::RLIMIT_STACK);
-    let rlim = if rlim == crate::rlimit::RLIM_INFINITY {
+    let rlim = crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_STACK);
+    let rlim = if rlim == crate::task::rlimit::RLIM_INFINITY {
         0
     } else {
         rlim
@@ -614,7 +618,7 @@ impl MmStruct {
         }
 
         // The stack may not grow past RLIMIT_STACK (Linux acct_stack_growth)
-        let limit = crate::rlimit::rlimit(crate::rlimit::RLIMIT_STACK);
+        let limit = crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_STACK);
         if vma.end - address > limit {
             return Err(EFAULT);
         }

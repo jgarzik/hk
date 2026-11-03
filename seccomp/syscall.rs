@@ -2,8 +2,8 @@
 //!
 //! This module implements the seccomp(2) syscall and prctl(2) integration.
 
-use crate::error::KernelError;
 use crate::task::percpu::TASKLIST;
+use crate::util::error::KernelError;
 
 use super::filter::{SeccompFilter, create_filter_from_user};
 use super::{

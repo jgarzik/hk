@@ -8,7 +8,7 @@
 //! - set_tid_address (thread exit notification)
 #![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
-use crate::error::KernelError;
+use crate::util::error::KernelError;
 
 /// sys_sched_yield - yield the processor
 ///
@@ -21,7 +21,8 @@ pub fn sys_sched_yield() {
 /// Wait queue for parents in wait4/waitid: woken whenever a task exits
 /// (Linux signal->wait_chldexit, simplified to one global queue; waiters
 /// re-check for their own zombies)
-pub static CHILD_EXIT_WQ: crate::waitqueue::WaitQueue = crate::waitqueue::WaitQueue::new();
+pub static CHILD_EXIT_WQ: crate::sync::waitqueue::WaitQueue =
+    crate::sync::waitqueue::WaitQueue::new();
 
 /// sys_exit - terminate the calling process
 ///
@@ -95,7 +96,7 @@ pub fn sys_clone(
 /// Create the task described by `config` (do_clone with the global
 /// frame allocator): the child's tid, or -errno
 fn clone(config: super::percpu::CloneConfig) -> i64 {
-    let mut frame_alloc = crate::frame_alloc::FrameAllocRef(&crate::FRAME_ALLOCATOR);
+    let mut frame_alloc = crate::mm::frame_alloc::FrameAllocRef(&crate::FRAME_ALLOCATOR);
     match super::percpu::do_clone(config, &mut frame_alloc) {
         Ok(child_tid) => child_tid as i64,
         Err(errno) => -(errno as i64),
@@ -195,7 +196,7 @@ pub fn sys_wait4(pid: i64, wstatus: u64, options: i32, rusage: u64) -> i64 {
     let current_pid = super::percpu::current_pid();
 
     use super::percpu::{SleepState, schedule};
-    use crate::waitqueue::{WaitEntry, signal_pending};
+    use crate::sync::waitqueue::{WaitEntry, signal_pending};
 
     // Sleep on CHILD_EXIT_WQ until a matching child is a zombie
     let w = core::pin::pin!(WaitEntry::new());
@@ -371,7 +372,7 @@ pub fn sys_waitid(idtype: i32, id: u64, infop: u64, options: i32, rusage: u64) -
                     None => return KernelError::BadFd.sysret(),
                 }
             };
-            match crate::pidfd::get_pidfd_pid(&file) {
+            match crate::task::pidfd::get_pidfd_pid(&file) {
                 Some(pid) => pid as i64,
                 None => return KernelError::BadFd.sysret(), // not a pidfd
             }
@@ -380,7 +381,7 @@ pub fn sys_waitid(idtype: i32, id: u64, infop: u64, options: i32, rusage: u64) -
     };
 
     use super::percpu::{SleepState, schedule};
-    use crate::waitqueue::{WaitEntry, signal_pending};
+    use crate::sync::waitqueue::{WaitEntry, signal_pending};
 
     // Sleep on CHILD_EXIT_WQ until a matching child is a zombie
     let w = core::pin::pin!(WaitEntry::new());

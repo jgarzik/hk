@@ -8,7 +8,6 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::arch::Uaccess;
-use crate::error::KernelError;
 use crate::fs::file::File;
 use crate::net::msg::{
     self, Dst, Iov, MSG_CMSG_CLOEXEC, MSG_CTRUNC, MSG_DONTWAIT, MSG_WAITFORONE, MsgHdr, RecvMsg,
@@ -19,6 +18,7 @@ use crate::net::socket::{
     sock_alloc_file, sock_create, sock_getsockopt, sock_of, sock_sendmsg, sock_setsockopt,
 };
 use crate::uaccess::{copy_to_user, get_user, put_user};
+use crate::util::error::KernelError;
 
 fn ret(r: Result<i64, KernelError>) -> i64 {
     r.unwrap_or_else(|e| e.sysret())
@@ -34,8 +34,8 @@ fn sockfd(fd: i32) -> Result<(Arc<File>, Arc<dyn ProtoOps>), KernelError> {
 }
 
 fn nofile() -> u64 {
-    let l = crate::rlimit::rlimit(crate::rlimit::RLIMIT_NOFILE);
-    if l == crate::rlimit::RLIM_INFINITY {
+    let l = crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_NOFILE);
+    if l == crate::task::rlimit::RLIM_INFINITY {
         u64::MAX
     } else {
         l

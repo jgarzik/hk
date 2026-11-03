@@ -12,7 +12,7 @@
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::arch::{CurrentArch, PerCpuOps};
-use crate::cpumask::NR_CPUS;
+use crate::util::cpumask::NR_CPUS;
 
 /// CPUs found at boot (Linux nr_cpu_ids): logical ids are below it
 static NR_CPU_IDS: AtomicU32 = AtomicU32::new(1);
@@ -82,7 +82,7 @@ impl<T> PerCpu<T> {
 #[macro_export]
 macro_rules! percpu {
     ($init:expr) => {
-        $crate::cpu::PerCpu::new([const { $init }; $crate::cpumask::NR_CPUS])
+        $crate::cpu::PerCpu::new([const { $init }; $crate::util::cpumask::NR_CPUS])
     };
 }
 

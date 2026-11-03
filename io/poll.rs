@@ -35,8 +35,8 @@ use alloc::vec::Vec;
 use core::pin::Pin;
 
 use crate::fs::File;
+use crate::sync::waitqueue::{WaitEntry, WaitQueue};
 use crate::task::Tid;
-use crate::waitqueue::{WaitEntry, WaitQueue};
 
 // =============================================================================
 // Poll Event Masks (from include/uapi/asm-generic/poll.h)

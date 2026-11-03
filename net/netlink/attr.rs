@@ -8,7 +8,7 @@
 
 use alloc::vec::Vec;
 
-use crate::error::KernelError;
+use crate::util::error::KernelError;
 
 /// struct nlmsghdr size
 pub const NLMSG_HDRLEN: usize = 16;

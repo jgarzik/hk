@@ -36,8 +36,8 @@ use alloc::vec::Vec;
 use crate::arch::IrqSpinlock;
 use crate::fs::KernelError;
 use crate::fs::file::{File, FileOps, flags};
-use crate::poll::{POLLIN, POLLRDNORM, PollTable};
-use crate::waitqueue::WaitQueue;
+use crate::io::poll::{POLLIN, POLLRDNORM, PollTable};
+use crate::sync::waitqueue::WaitQueue;
 
 // =============================================================================
 // Fanotify Init Flags (Linux ABI)
@@ -546,7 +546,7 @@ impl FileOps for FanotifyFileOps {
 
     fn poll(&self, file: &File, pt: Option<&mut PollTable>) -> u16 {
         let Some(fanotify) = file.private_ref::<Fanotify>() else {
-            return crate::poll::POLLERR;
+            return crate::io::poll::POLLERR;
         };
         fanotify.poll(pt)
     }
@@ -588,7 +588,7 @@ pub fn get_fanotify(file: &File) -> Option<Arc<Fanotify>> {
 
 /// sys_fanotify_init(flags, event_f_flags) - create fanotify instance
 pub fn sys_fanotify_init(init_flags: u32, event_f_flags: u32) -> i64 {
-    use crate::pipe::FD_CLOEXEC;
+    use crate::io::pipe::FD_CLOEXEC;
     use crate::task::fdtable::get_task_fd;
     use crate::task::percpu::current_tid;
 
@@ -653,8 +653,8 @@ pub fn sys_fanotify_init(init_flags: u32, event_f_flags: u32) -> i64 {
 
     // Get RLIMIT_NOFILE
     let nofile_limit = {
-        let limit = crate::rlimit::rlimit(crate::rlimit::RLIMIT_NOFILE);
-        if limit == crate::rlimit::RLIM_INFINITY {
+        let limit = crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_NOFILE);
+        if limit == crate::task::rlimit::RLIM_INFINITY {
             u64::MAX
         } else {
             limit

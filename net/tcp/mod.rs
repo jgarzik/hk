@@ -56,6 +56,9 @@ use self::output::Tuple;
 use self::table::Ent;
 use self::timer::{Expire, Slot, now_ms};
 use self::timewait::TimeWait;
+use crate::io::poll::{
+    POLLERR, POLLHUP, POLLIN, POLLOUT, POLLRDHUP, POLLRDNORM, POLLWRBAND, POLLWRNORM,
+};
 use crate::net::KernelError;
 use crate::net::af_inet::{self, IPPROTO_TCP as PROTO_TCP, Inet, SOL_IP, ipf};
 use crate::net::icmp::IcmpErr;
@@ -74,9 +77,6 @@ use crate::net::socket::{
     SOL_SOCKET, shut_bits,
 };
 use crate::net::{NetNamespace, dev};
-use crate::poll::{
-    POLLERR, POLLHUP, POLLIN, POLLOUT, POLLRDHUP, POLLRDNORM, POLLWRBAND, POLLWRNORM,
-};
 
 pub use self::cb::TcpState;
 

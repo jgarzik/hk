@@ -14,7 +14,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::error::KernelError;
+use crate::util::error::KernelError;
 
 /// One /proc/sys entry
 pub struct Ctl {
@@ -54,7 +54,7 @@ pub fn read(ctl: &Ctl) -> Vec<u8> {
 pub fn tables() -> &'static [&'static [Ctl]] {
     static TABLES: &[&[Ctl]] = &[
         crate::net::sysctl::CTLS,
-        crate::frame_alloc::VM_CTLS,
+        crate::mm::frame_alloc::VM_CTLS,
         crate::mm::writeback::WB_CTLS,
         crate::mm::MM_CTLS,
         crate::task::fdbits::FS_CTLS,

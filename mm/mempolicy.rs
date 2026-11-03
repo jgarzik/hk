@@ -4,9 +4,9 @@
 //! Uses the NUMA topology discovered from ACPI SRAT (x86-64) or device tree (aarch64).
 
 use crate::arch::Uaccess;
-use crate::error::KernelError;
-use crate::numa::NUMA_TOPOLOGY;
+use crate::mm::numa::NUMA_TOPOLOGY;
 use crate::uaccess::{UaccessArch, copy_to_user, get_user, put_user};
+use crate::util::error::KernelError;
 
 // ============================================================================
 // Policy modes (MPOL_*)
@@ -567,7 +567,7 @@ const MOVE_PAGES_CHUNK: u64 = 1024;
 fn move_pages_resched(i: u64) -> Result<(), i64> {
     if i > 0 && i.is_multiple_of(MOVE_PAGES_CHUNK) {
         crate::task::percpu::cond_resched();
-        if crate::waitqueue::signal_pending() {
+        if crate::sync::waitqueue::signal_pending() {
             return Err(KernelError::RestartSys.sysret());
         }
     }

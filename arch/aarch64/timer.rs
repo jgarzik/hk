@@ -151,5 +151,5 @@ pub fn handle_timer_irq() {
     }
 
     // Due timers (the scheduler tick among them), the next event
-    crate::hrtimer::interrupt();
+    crate::time::hrtimer::interrupt();
 }

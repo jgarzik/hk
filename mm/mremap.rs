@@ -18,7 +18,7 @@ use super::ptl::{self, PteLock};
 use super::{Mm, PAGE_SIZE, tlb};
 use crate::FRAME_ALLOCATOR;
 use crate::arch::paging;
-use crate::error::KernelError;
+use crate::util::error::KernelError;
 
 /// The 4KB entry for `addr` holds something (a page or a swap entry)
 fn mapped(pgd: u64, addr: u64) -> bool {

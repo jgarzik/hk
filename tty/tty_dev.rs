@@ -16,7 +16,7 @@
 
 use alloc::sync::Arc;
 
-use crate::chardev::{CHARDEV_REGISTRY, CharDevice, DevId, DeviceError, major};
+use crate::fs::chardev::{CHARDEV_REGISTRY, CharDevice, DevId, DeviceError, major};
 use crate::task::percpu::current_sid;
 
 /// /dev/tty character device

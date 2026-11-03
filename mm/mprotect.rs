@@ -15,7 +15,7 @@ use super::pagewalk::{PteWalk, walk_pte_range};
 use super::{Mm, PROT_EXEC, PROT_READ, PROT_WRITE};
 use crate::FRAME_ALLOCATOR;
 use crate::arch::{CurrentArch, SchedArch, paging};
-use crate::error::KernelError;
+use crate::util::error::KernelError;
 
 type ArchPageTable = <CurrentArch as SchedArch>::SchedPageTable;
 

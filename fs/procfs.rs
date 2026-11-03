@@ -811,7 +811,7 @@ fn gen_fdinfo_content(pid: Pid, fd: i32) -> Vec<u8> {
             if let Some(file) = table.get(fd) {
                 let flags = file.get_flags();
                 // Check if this is a pidfd
-                let target_pid = crate::pidfd::get_pidfd_pid(&file);
+                let target_pid = crate::task::pidfd::get_pidfd_pid(&file);
                 (flags, target_pid.is_some(), target_pid)
             } else {
                 return Vec::new();

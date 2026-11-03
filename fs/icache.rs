@@ -40,7 +40,7 @@ use spin::Once;
 use super::inode::Inode;
 use super::superblock::SuperBlock;
 use crate::arch::IrqSpinlock;
-use crate::error::KernelError;
+use crate::util::error::KernelError;
 
 /// One bucket: (superblock address, hash value, inode)
 type Bucket = IrqSpinlock<Vec<(usize, u64, Weak<Inode>)>>;

@@ -26,7 +26,7 @@
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::arch::IrqSpinlock;
-use crate::cpumask::NR_CPUS;
+use crate::util::cpumask::NR_CPUS;
 
 /// Largest supported ASID space (16-bit ASIDs)
 const MAX_ASIDS: usize = 1 << 16;

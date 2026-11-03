@@ -800,7 +800,7 @@ impl PciDevice {
         };
         let csr = self.cfg_read16(pm + PMCSR);
         self.cfg_write16(pm + PMCSR, (csr & !(PME_STATUS | 3)) | 3);
-        crate::delay::mdelay(10);
+        crate::time::delay::mdelay(10);
     }
 
     /// The capability list: (offset, ID) pairs (Linux pci_find_capability)

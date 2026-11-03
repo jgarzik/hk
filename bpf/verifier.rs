@@ -18,7 +18,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use super::insn::*;
-use crate::error::KernelError;
+use crate::util::error::KernelError;
 
 // =============================================================================
 // Register State

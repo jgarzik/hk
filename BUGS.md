@@ -186,7 +186,7 @@ credentials unchanged, so set-id programs run unprivileged.
 
 ## CPU-time timer gaps
 
-**Location**: `cpu_timer.rs`, `posix_timer.rs`
+**Location**: `time/cpu_timer.rs`, `time/posix_timer.rs`
 
 timer_create and clock_nanosleep take only the caller's own process
 CPU clock (and its threads' for timer_create): another process's is
@@ -343,7 +343,7 @@ always infinite, promote_secondaries is off.
 
 ## io_uring has no shared rings
 
-**Location**: `io_uring.rs`
+**Location**: `io/io_uring.rs`
 
 io_uring_setup returns ring offsets, but nothing maps the SQ ring, the
 CQ ring or the SQE array (IORING_OFF_SQ_RING/CQ_RING/SQES), so user
@@ -418,7 +418,7 @@ parallel). Next occurrence: capture the Message line.
 ## ramfs has no size limit
 
 **Location**: `fs/ramfs.rs`, `mm/filemap.rs`,
-`frame_alloc.rs`
+`mm/frame_alloc.rs`
 
 ramfs (the root filesystem and every ramfs mount) is bounded only by
 memory, for every user: writes fail with ENOSPC once free frames reach
@@ -431,7 +431,7 @@ memory is at the low watermark (Linux maps the shared zero page).
 
 ## Kernel heap (slab) gaps
 
-**Location**: `mm/slab.rs`, `heap.rs`
+**Location**: `mm/slab.rs`, `mm/heap.rs`
 
 The heap is the slab allocator over the page allocator, so it grows
 with RAM; what is missing: no shrinker (caches give back empty slabs
@@ -550,7 +550,7 @@ all of them.
 
 ## No DMA for 32-bit devices with RAM above 4GB
 
-**Location**: `hw/dma.rs`, `frame_alloc.rs`,
+**Location**: `hw/dma.rs`, `mm/frame_alloc.rs`,
 `hw/net/e1000.rs`, `hw/usb/xhci.rs`
 
 `DirectDmaOps` only checks the mask: a buffer or coherent frame above
@@ -639,9 +639,9 @@ sched pid 0, flock/POSIX release, signalfd reader, errno flattening.
 - **Privilege by uid instead of capable()** (L): about 29 `euid == 0`
   style checks remain where Linux tests a capability (`task/id.rs` x6
   CAP_SETUID/SETGID, `ns/uts.rs` and `ns/mod.rs` CAP_SYS_ADMIN,
-  `rlimit.rs` CAP_SYS_RESOURCE, `ipc/msg.rs` CAP_SYS_RESOURCE,
+  `task/rlimit.rs` CAP_SYS_RESOURCE, `ipc/msg.rs` CAP_SYS_RESOURCE,
   `ipc/mqueue.rs` DAC_OVERRIDE, `ipc/util.rs` CAP_IPC_OWNER missing,
-  `keys/key.rs` (fsuid, no root bypass), `acct.rs` ASU flag). Linux's
+  `keys/key.rs` (fsuid, no root bypass), `task/acct.rs` ASU flag). Linux's
   own uid-0 rules (`sysctl.rs`, `fs/dac.rs`) are right as they are.
   `task::capable` should be the only privilege test.
 - **Syscalls that do not deliver** (H/C): inotify and fanotify never
@@ -682,7 +682,7 @@ sched pid 0, flock/POSIX release, signalfd reader, errno flattening.
 - **Stale comments and dead code** (as touched): about 155
   `#[allow(dead_code)]`, 90 "for now"/TODO markers; comments that
   contradict the code in `task/id.rs:87`, `ns/mod.rs:558`,
-  `ns/uts.rs:224`, `rlimit.rs:264`, `task/misc.rs:1311`.
+  `ns/uts.rs:224`, `task/rlimit.rs:264`, `task/misc.rs:1311`.
 
 ## P0 review findings (open)
 

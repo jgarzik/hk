@@ -10,8 +10,8 @@
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{Ordering, fence};
 
-use crate::frame_alloc::FRAME_SIZE;
 use crate::hw::dma::{DmaCoherent, DmaDevice, dma_alloc_coherent};
+use crate::mm::frame_alloc::FRAME_SIZE;
 
 /// Transfer Request Block (TRB) - same structure as in xhci.rs
 /// but with additional types for data transfers

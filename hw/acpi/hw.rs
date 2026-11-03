@@ -97,7 +97,7 @@ pub fn acpi_mode(io: &mut impl PortIo, regs: &PmRegs) -> bool {
 pub fn acpi_enable(
     io: &mut impl PortIo,
     regs: &PmRegs,
-    clock: &mut impl crate::delay::Clock,
+    clock: &mut impl crate::time::delay::Clock,
 ) -> Result<(), EnableTimeout> {
     if acpi_mode(io, regs) {
         return Ok(());
@@ -106,7 +106,8 @@ pub fn acpi_enable(
         return Err(EnableTimeout);
     }
     io.outb(regs.smi_cmd, regs.acpi_enable);
-    crate::delay::poll_on(clock, 3_000_000, 100, || acpi_mode(io, regs)).map_err(|_| EnableTimeout)
+    crate::time::delay::poll_on(clock, 3_000_000, 100, || acpi_mode(io, regs))
+        .map_err(|_| EnableTimeout)
 }
 
 /// Disable every fixed event and GPE and clear their status, so no SCI
@@ -219,7 +220,7 @@ fn pm1_evt_write(io: &mut impl PortIo, regs: &PmRegs, off: u16, val: u16) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::delay::tests::FakeClock;
+    use crate::time::delay::tests::FakeClock;
     use alloc::vec::Vec;
 
     /// A PCH-like chipset: a port space, a log of writes, and SMI_CMD

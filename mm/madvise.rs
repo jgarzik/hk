@@ -21,9 +21,9 @@ use super::{
     VM_DONTCOPY, VM_DONTDUMP, VM_HUGEPAGE, VM_NOHUGEPAGE, VM_RAND_READ, VM_SEQ_READ, VM_WIPEONFORK,
     Vma, get_task_mm,
 };
-use crate::error::KernelError;
 use crate::sync::{RwSemReadGuard, RwSemWriteGuard};
 use crate::task::percpu::current_tid;
+use crate::util::error::KernelError;
 
 /// A hole to punch in a shared object once the mm lock is dropped
 /// (MADV_REMOVE): the object and its page range [from, to)

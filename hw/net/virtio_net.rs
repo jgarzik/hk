@@ -44,7 +44,6 @@ use crate::sync::spin::Mutex;
 use spin::Once;
 
 use crate::bus::driver::{Device, DriverError};
-use crate::error::KernelError;
 use crate::hw::dma::DmaCoherent;
 use crate::hw::virtio::ring::{Sg, VringCb};
 use crate::hw::virtio::{self, VirtioDevice, VirtioDriver, VirtioIrq, Virtqueue};
@@ -55,6 +54,7 @@ use crate::net::dev::{
 use crate::net::device::{LinkInfo, NetDevice, NetDeviceOps};
 use crate::net::skb::{NET_SKB_PAD, SkBuff};
 use crate::printkln;
+use crate::util::error::KernelError;
 
 /// Device-specific feature bits
 mod feature {

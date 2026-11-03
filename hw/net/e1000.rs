@@ -39,7 +39,6 @@ use spin::Once;
 use crate::arch::barrier::{dma_rmb, dma_wmb, wmb};
 use crate::bus::bus::{BusContext, BusDevice, BusDriver};
 use crate::bus::driver::{Device, DriverError};
-use crate::error::KernelError;
 use crate::hw::dma::DmaCoherent;
 use crate::hw::pci::PciDevice;
 use crate::net;
@@ -49,6 +48,7 @@ use crate::net::dev::{
 use crate::net::device::{LinkInfo, NetDevice, NetDeviceOps};
 use crate::net::skb::{NET_SKB_PAD, SkBuff};
 use crate::printkln;
+use crate::util::error::KernelError;
 
 // ============================================================================
 // Hardware Constants

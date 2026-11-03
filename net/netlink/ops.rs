@@ -6,9 +6,9 @@ use alloc::vec::Vec;
 use core::any::Any;
 
 use super::*;
+use crate::io::poll::{POLLERR, POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM};
 use crate::net::msg::{MSG_DONTWAIT, MSG_PEEK, MSG_TRUNC, RecvMsg, SendMsg};
 use crate::net::socket::{AF_UNSPEC, OptIn, OptOut, SOL_SOCKET};
-use crate::poll::{POLLERR, POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM};
 
 /// Parse a struct sockaddr_nl: (pid, groups); EINVAL if short or not
 /// AF_NETLINK

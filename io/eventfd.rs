@@ -28,8 +28,8 @@ use alloc::sync::Arc;
 use crate::arch::IrqSpinlock;
 use crate::fs::KernelError;
 use crate::fs::file::{File, FileOps, flags};
-use crate::poll::{POLLERR, POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM, PollTable};
-use crate::waitqueue::WaitQueue;
+use crate::io::poll::{POLLERR, POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM, PollTable};
+use crate::sync::waitqueue::WaitQueue;
 
 /// Eventfd flags
 pub mod efd_flags {

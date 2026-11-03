@@ -17,7 +17,7 @@
 use ::core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 /// Per-CPU data slots (logical CPU ids are below this)
-pub const MAX_CPUS: usize = crate::cpumask::NR_CPUS;
+pub const MAX_CPUS: usize = crate::util::cpumask::NR_CPUS;
 
 /// Per-CPU data structure
 ///

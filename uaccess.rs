@@ -24,7 +24,7 @@ extern crate alloc;
 use core::mem::MaybeUninit;
 use core::sync::atomic::Ordering;
 
-use crate::pod::{FromBytes, IntoBytes};
+use crate::util::pod::{FromBytes, IntoBytes};
 
 /// Linux pagefault_disable: until `pagefault_enable`, a user access that
 /// faults is not resolved (no sleeping fault-in) but fails at once

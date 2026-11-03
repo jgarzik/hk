@@ -12,13 +12,13 @@
 //! Note: rt_sigreturn (15) is implemented in arch-specific signal.rs files
 
 use crate::arch::Uaccess;
-use crate::error::KernelError;
 use crate::signal::{
     SIGKILL, SIGSTOP, SigAction, SigSet, UNMASKABLE_SIGNALS, get_task_sighand, kill_pgrp,
     send_signal, send_signal_to_process, with_task_signal_state,
 };
 use crate::task::percpu::{current_pgid, current_tid, get_all_pids};
 use crate::uaccess::{get_user, put_user};
+use crate::util::error::KernelError;
 
 /// SIG_BLOCK - Add signals to blocked mask
 pub const SIG_BLOCK: i32 = 0;
@@ -557,7 +557,7 @@ fn wait_for_signal() {
     use crate::task::percpu::{SleepState, schedule, set_current_state};
     loop {
         set_current_state(SleepState::Interruptible);
-        if crate::waitqueue::signal_pending() {
+        if crate::sync::waitqueue::signal_pending() {
             break;
         }
         schedule();
@@ -875,11 +875,11 @@ fn dequeue_in(tid: crate::task::Tid, mask: &SigSet) -> Option<u32> {
 /// Sleep interruptibly until a signal is deliverable or the
 /// CLOCK_MONOTONIC `deadline` (ns) passes
 fn sleep_until_signal(deadline: Option<u64>) {
-    use crate::hrtimer::{HrClock, schedule_hrtimeout};
     use crate::task::percpu::{SleepState, set_current_state};
+    use crate::time::hrtimer::{HrClock, schedule_hrtimeout};
     loop {
         set_current_state(SleepState::Interruptible);
-        if crate::waitqueue::signal_pending() {
+        if crate::sync::waitqueue::signal_pending() {
             break;
         }
         if deadline.is_some_and(|d| crate::time::monotonic_ns() >= d) {
@@ -1005,8 +1005,8 @@ pub fn sys_sigaltstack(ss_ptr: u64, oss_ptr: u64) -> i64 {
 /// # Returns
 /// fd on success, negative errno on error
 pub fn sys_signalfd4(fd: i32, mask_ptr: u64, sizemask: u64, flags: i32) -> i64 {
-    use crate::pipe::FD_CLOEXEC;
-    use crate::signalfd::{create_signalfd, get_signalfd, sfd_flags};
+    use crate::io::pipe::FD_CLOEXEC;
+    use crate::io::signalfd::{create_signalfd, get_signalfd, sfd_flags};
     use crate::task::fdtable::get_task_fd;
 
     // Validate sizemask
@@ -1048,8 +1048,8 @@ pub fn sys_signalfd4(fd: i32, mask_ptr: u64, sizemask: u64, flags: i32) -> i64 {
 
         // Get RLIMIT_NOFILE
         let nofile_limit = {
-            let limit = crate::rlimit::rlimit(crate::rlimit::RLIMIT_NOFILE);
-            if limit == crate::rlimit::RLIM_INFINITY {
+            let limit = crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_NOFILE);
+            if limit == crate::task::rlimit::RLIM_INFINITY {
                 u64::MAX
             } else {
                 limit

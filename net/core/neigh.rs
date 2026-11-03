@@ -34,9 +34,9 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::sync::spin::{Mutex, RwLock};
 
-use crate::error::KernelError;
 use crate::net::device::NetDevice;
 use crate::net::skb::SkBuff;
+use crate::util::error::KernelError;
 
 /// NUD states (Linux include/uapi/linux/neighbour.h)
 pub mod nud {
@@ -792,7 +792,7 @@ fn skb_truesize(skb: &SkBuff) -> usize {
 /// Registered tables (pruned when their namespace goes away)
 static TABLES: Mutex<Vec<Weak<NeighTable>>> = Mutex::new(Vec::new());
 
-static ALARM: crate::timer::Alarm = crate::timer::Alarm::new(neigh_timer);
+static ALARM: crate::time::timer::Alarm = crate::time::timer::Alarm::new(neigh_timer);
 
 /// Make sure the neighbour timer fires no later than `at` (ms)
 fn arm(at: u64) {

@@ -24,7 +24,6 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use crate::sync::spin::RwLock;
 
-use crate::error::KernelError;
 use crate::net::af_inet::{self, Inet, RxInfo, SOL_IP, ipf};
 use crate::net::dgram::{self, Dgram, RxQueue};
 use crate::net::icmp::{self, IcmpErr, icmp_type};
@@ -38,6 +37,7 @@ use crate::net::socket::{
     AF_INET, AF_UNSPEC, OptIn, OptOut, ProtoOps, SIOCINQ, SIOCOUTQ, SOCK_RAW, SOL_SOCKET, shut_bits,
 };
 use crate::net::{NetNamespace, udp};
+use crate::util::error::KernelError;
 
 /// Socket level of raw options and ICMP_FILTER
 pub const SOL_RAW: i32 = 255;

@@ -39,8 +39,8 @@ use core::sync::atomic::{AtomicI32, Ordering};
 use crate::arch::IrqSpinlock;
 use crate::fs::KernelError;
 use crate::fs::file::{File, FileOps, flags};
-use crate::poll::{POLLIN, POLLRDNORM, PollTable};
-use crate::waitqueue::WaitQueue;
+use crate::io::poll::{POLLIN, POLLRDNORM, PollTable};
+use crate::sync::waitqueue::WaitQueue;
 
 // =============================================================================
 // Inotify Constants (Linux ABI)
@@ -472,7 +472,7 @@ impl FileOps for InotifyFileOps {
 
     fn poll(&self, file: &File, pt: Option<&mut PollTable>) -> u16 {
         let Some(inotify) = file.private_ref::<Inotify>() else {
-            return crate::poll::POLLERR;
+            return crate::io::poll::POLLERR;
         };
         inotify.poll(pt)
     }
@@ -527,7 +527,7 @@ pub fn sys_inotify_init() -> i64 {
 
 /// sys_inotify_init1(flags) - create inotify instance
 pub fn sys_inotify_init1(in_flags: i32) -> i64 {
-    use crate::pipe::FD_CLOEXEC;
+    use crate::io::pipe::FD_CLOEXEC;
     use crate::task::fdtable::get_task_fd;
     use crate::task::percpu::current_tid;
 
@@ -558,8 +558,8 @@ pub fn sys_inotify_init1(in_flags: i32) -> i64 {
 
     // Get RLIMIT_NOFILE
     let nofile_limit = {
-        let limit = crate::rlimit::rlimit(crate::rlimit::RLIMIT_NOFILE);
-        if limit == crate::rlimit::RLIM_INFINITY {
+        let limit = crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_NOFILE);
+        if limit == crate::task::rlimit::RLIM_INFINITY {
             u64::MAX
         } else {
             limit

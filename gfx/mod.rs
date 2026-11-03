@@ -45,7 +45,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use crate::chardev::{CharDevice, DevId, DeviceError};
+use crate::fs::chardev::{CharDevice, DevId, DeviceError};
 
 /// DRM major device number (Linux convention)
 pub const GFX_MAJOR: u16 = 226;
@@ -244,7 +244,8 @@ pub fn register_gfx_device(driver: Arc<dyn GfxDriver>) -> Result<u32, GfxError> 
     let dev_id = DevId::new(GFX_MAJOR, minor as u16);
 
     // Register with character device subsystem
-    crate::chardev::register_chardev(dev_id, chardev.clone()).map_err(|_| GfxError::NoMemory)?;
+    crate::fs::chardev::register_chardev(dev_id, chardev.clone())
+        .map_err(|_| GfxError::NoMemory)?;
 
     // Add to our registry
     GFX_DEVICES.write().push(chardev);

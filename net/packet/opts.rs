@@ -8,10 +8,10 @@ use core::sync::atomic::Ordering;
 
 use super::rcv::{PACKET_AUXDATA, SOL_PACKET};
 use super::{PacketSock, pf};
-use crate::error::KernelError;
 use crate::net::filter::{BPF_MAXINSNS, Filter, Insn};
 use crate::net::rtnl;
 use crate::net::socket::{OptIn, OptOut, SOL_SOCKET};
+use crate::util::error::KernelError;
 
 const PACKET_ADD_MEMBERSHIP: i32 = 1;
 const PACKET_DROP_MEMBERSHIP: i32 = 2;

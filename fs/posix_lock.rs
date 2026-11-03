@@ -16,10 +16,10 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use crate::error::KernelError;
 use crate::fs::file::seek;
 use crate::fs::{File, Inode};
 use crate::task::percpu::current_pid;
+use crate::util::error::KernelError;
 
 // =============================================================================
 // Lock type constants (Linux ABI)

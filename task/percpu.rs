@@ -50,10 +50,10 @@ fn do_clear_child_tid(tid: Tid) {
         // Write 0 to the address
         if put_user::<Uaccess, i32>(addr, 0).is_ok() {
             // Wake up to 1 waiter on this futex address
-            crate::futex::futex_wake(
+            crate::task::futex::futex_wake(
                 addr,
                 1,
-                crate::futex::futex_op::FUTEX_BITSET_MATCH_ANY,
+                crate::task::futex::futex_op::FUTEX_BITSET_MATCH_ANY,
                 true, // private futex
             );
         }
@@ -589,7 +589,7 @@ pub type KernelTaskInner = crate::task::TaskInner<CurrentArch, ArchPageTable>;
 /// (shared lock), `get_mut`/`iter_mut` write them (exclusive lock).
 pub struct GlobalTaskTable {
     /// Every task in the table, holding a reference each
-    tasks: crate::list::ArcList<TasksAdapter>,
+    tasks: crate::util::list::ArcList<TasksAdapter>,
 }
 
 crate::adapter!(TasksAdapter, KernelTask, tasks_link);
@@ -722,7 +722,7 @@ impl TaskViewMut<'_> {
 impl GlobalTaskTable {
     const fn new() -> Self {
         Self {
-            tasks: crate::list::ArcList::new(),
+            tasks: crate::util::list::ArcList::new(),
         }
     }
 
@@ -1268,9 +1268,9 @@ fn create_kernel_task(
         ptrace: 0,
         ptracer: None,
         real_parent: None,
-        children: crate::list::ArcList::new(),
+        children: crate::util::list::ArcList::new(),
         in_children: false,
-        threads: crate::list::ArcList::new(),
+        threads: crate::util::list::ArcList::new(),
         ptrace_message: 0,
         ptrace_options: 0,
         ptrace_code: 0,
@@ -1287,7 +1287,7 @@ fn create_kernel_task(
         TaskKind::KernelThread,
         stack_top,
         cpu_id,
-        &crate::cpumask::CpuSet::one(cpu_id),
+        &crate::util::cpumask::CpuSet::one(cpu_id),
         alloc::sync::Arc::new(Cred::ROOT),
         None,
         crate::task::TaskAlloc::named(name.as_bytes()),
@@ -1348,7 +1348,7 @@ fn wake_up_new_task(p: &TaskRef) {
 /// The idle task is always runnable at PRIORITY_IDLE (0). The CPU may enter
 /// the scheduler only once this is done, so `initialized` is set last.
 fn create_idle_task(cpu_id: u32) -> Result<(), &'static str> {
-    crate::timer::init_cpu(cpu_id);
+    crate::time::timer::init_cpu(cpu_id);
     create_kernel_task(
         cpu_id,
         "swapper",
@@ -1473,9 +1473,9 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<Tid, &'static str> {
         ptrace: 0,
         ptracer: None,
         real_parent: None,
-        children: crate::list::ArcList::new(),
+        children: crate::util::list::ArcList::new(),
         in_children: false,
-        threads: crate::list::ArcList::new(),
+        threads: crate::util::list::ArcList::new(),
         ptrace_message: 0,
         ptrace_options: 0,
         ptrace_code: 0,
@@ -1492,7 +1492,7 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<Tid, &'static str> {
         TaskKind::UserProcess,
         config.kstack_top,
         cpu_id,
-        &crate::cpumask::CpuSet::all(),
+        &crate::util::cpumask::CpuSet::all(),
         alloc::sync::Arc::new(Cred::ROOT),
         Some(mm),
         // comm after the init binary, /bin/init (Linux names init after
@@ -1568,7 +1568,7 @@ pub fn mark_zombie(tid: Tid, status: i32, group_dead: bool) {
     if let Some(p) = pid
         && group_dead
     {
-        crate::pidfd::notify_process_exit(p, status);
+        crate::task::pidfd::notify_process_exit(p, status);
     }
 }
 
@@ -1701,7 +1701,7 @@ pub fn take_leadership(tgid: Pid, tid: Tid) -> Vec<TaskRef> {
     // The thread group moves to the caller: it is the only live thread
     // (Linux de_thread leaves only the exec'ing thread); the old list's
     // references go after TASKLIST
-    let mut old_threads = crate::list::ArcList::new();
+    let mut old_threads = crate::util::list::ArcList::new();
     if let Some(l) = table.task(ltid) {
         // SAFETY: in the list; no view is live
         let li = unsafe { table.inner_mut_of(&l) };
@@ -1769,7 +1769,7 @@ pub fn take_leadership(tgid: Pid, tid: Tid) -> Vec<TaskRef> {
     // The group's timers owned by the caller follow (after TASKLIST:
     // their locks are leaves taken under nothing)
     if let Some(sig) = sig {
-        crate::posix_timer::retarget(&sig, tid, ltid);
+        crate::time::posix_timer::retarget(&sig, tid, ltid);
     }
     gone
 }
@@ -2174,9 +2174,9 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         } else {
             Some(Arc::downgrade(&task_ref(&current())))
         },
-        children: crate::list::ArcList::new(),
+        children: crate::util::list::ArcList::new(),
         in_children: false,
-        threads: crate::list::ArcList::new(),
+        threads: crate::util::list::ArcList::new(),
         ptrace_message: 0,
         ptrace_options: 0,
         ptrace_code: 0,
@@ -2345,10 +2345,10 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     // CLONE_VFORK: the completion must be in place before the child can
     // run (it may exec or exit at once on another CPU; Linux
     // p->vfork_done)
-    let vfork = crate::completion::Completion::new();
+    let vfork = crate::sync::completion::Completion::new();
     if config.flags & CLONE_VFORK != 0 {
         child_task.vfork_done.store(
-            &vfork as *const crate::completion::Completion as *mut _,
+            &vfork as *const crate::sync::completion::Completion as *mut _,
             Ordering::Release,
         );
     }
@@ -2380,7 +2380,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         use crate::uaccess::put_user;
 
         // Create pidfd for the child
-        let pidfd_file = match crate::pidfd::create_pidfd(child_pid, 0) {
+        let pidfd_file = match crate::task::pidfd::create_pidfd(child_pid, 0) {
             Ok(file) => file,
             Err(_) => {
                 // Pidfd creation failed - this is not critical, just don't set it
@@ -2397,8 +2397,8 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
 
         // Get NOFILE limit
         let nofile = {
-            let limit = crate::rlimit::rlimit(crate::rlimit::RLIMIT_NOFILE);
-            if limit == crate::rlimit::RLIM_INFINITY {
+            let limit = crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_NOFILE);
+            if limit == crate::task::rlimit::RLIM_INFINITY {
                 u64::MAX
             } else {
                 limit
@@ -2526,7 +2526,7 @@ pub fn exit_current(status: Option<i32>) -> ! {
         if let Some(st) = status
             && group_dead
         {
-            crate::acct::write_acct_record(tid, current_pid(), st);
+            crate::task::acct::write_acct_record(tid, current_pid(), st);
         }
 
         // A non-leader thread is released at exit (Linux autoreaps it):
@@ -2568,7 +2568,7 @@ pub fn exit_current(status: Option<i32>) -> ! {
         // The group's last thread deletes its timers (Linux exit_itimers
         // when group_dead)
         if group_dead && let Some(sig) = crate::signal::get_task_signal_struct(tid) {
-            crate::posix_timer::exit_itimers(&sig);
+            crate::time::posix_timer::exit_itimers(&sig);
         }
 
         // Clean up signal state for exiting task
@@ -2580,7 +2580,7 @@ pub fn exit_current(status: Option<i32>) -> ! {
             let table = TASKLIST.read();
             table.get(tid).map(|t| t.task.pid).unwrap_or(0)
         };
-        crate::futex::exit_robust_list(tid, pid);
+        crate::task::futex::exit_robust_list(tid, pid);
 
         // Handle CLONE_CHILD_CLEARTID: write 0 and wake futex waiters
         // This must be done before switching away since we need to be in
@@ -2880,9 +2880,9 @@ pub fn schedule_timeout(timeout: u64) -> u64 {
         return 0;
     }
     let expire = get_ticks().saturating_add(timeout);
-    let t = core::pin::pin!(crate::timer::TimerList::new(
+    let t = core::pin::pin!(crate::time::timer::TimerList::new(
         process_timeout,
-        crate::timer::TIMER_HARD
+        crate::time::timer::TIMER_HARD
     ));
     t.set_data(&*me as *const KernelTask as usize);
     t.as_ref().mod_timer(expire);
@@ -2892,7 +2892,7 @@ pub fn schedule_timeout(timeout: u64) -> u64 {
 }
 
 /// A `schedule_timeout` sleep timed out (tick interrupt): wake its task
-fn process_timeout(t: &crate::timer::TimerList) {
+fn process_timeout(t: &crate::time::timer::TimerList) {
     // SAFETY: the sleeper, which deletes the timer before it returns
     try_to_wake_up(unsafe { &*(t.data() as *const KernelTask) }, WakeMode::Any);
 }
@@ -2951,9 +2951,9 @@ enum Placement {
 /// CPUs that run a scheduler and take IPIs (Linux cpu_active_mask):
 /// kept as each becomes active and gets its scheduler, read by every
 /// wakeup and balancing pass
-static SCHED_CPUS: crate::cpumask::CpuMask = crate::cpumask::CpuMask::new();
+static SCHED_CPUS: crate::util::cpumask::CpuMask = crate::util::cpumask::CpuMask::new();
 
-fn sched_cpus() -> crate::cpumask::CpuSet {
+fn sched_cpus() -> crate::util::cpumask::CpuSet {
     let s = SCHED_CPUS.snapshot();
     // Pairs with `sched_cpu_update`: a CPU found here has its run queue
     core::sync::atomic::fence(Ordering::Acquire);
@@ -2992,7 +2992,7 @@ fn rank(p: &KernelTask) -> u32 {
 /// previous one if it would preempt what runs there, else the allowed
 /// CPU running the least important task if `p` would preempt that,
 /// else its previous one
-fn select_task_rq_rt(p: &KernelTask, allowed: &crate::cpumask::CpuSet, prev: u32) -> u32 {
+fn select_task_rq_rt(p: &KernelTask, allowed: &crate::util::cpumask::CpuSet, prev: u32) -> u32 {
     let r = rank(p);
     let at = |c: u32| PERCPU_SCHEDS.get(c).curr_rank.load(Ordering::Relaxed);
     if allowed.test(prev) && at(prev) < r {
@@ -3032,7 +3032,7 @@ fn select_task_rq(p: &KernelTask, why: Placement) -> u32 {
 
 /// The allowed CPU with the fewest tasks, the first found from `from`
 /// on (Linux sched_balance_find_dst_cpu, without groups or idle states)
-fn find_idlest_cpu(allowed: &crate::cpumask::CpuSet, from: u32) -> u32 {
+fn find_idlest_cpu(allowed: &crate::util::cpumask::CpuSet, from: u32) -> u32 {
     let n = crate::cpu::nr_cpu_ids();
     let mut best = (u32::MAX, from);
     for i in 0..n {
@@ -3050,7 +3050,7 @@ fn find_idlest_cpu(allowed: &crate::cpumask::CpuSet, from: u32) -> u32 {
 /// A waking task's CPU (Linux select_idle_sibling, wake_affine left
 /// out): its previous one if idle (warm cache), else an idle one, else
 /// its previous one, else the least loaded
-fn select_idle_sibling(allowed: &crate::cpumask::CpuSet, prev: u32) -> u32 {
+fn select_idle_sibling(allowed: &crate::util::cpumask::CpuSet, prev: u32) -> u32 {
     if allowed.test(prev) && idle_cpu(prev) {
         return prev;
     }
@@ -3309,7 +3309,10 @@ fn move_queued_task(
 /// it (the caller sleeps meanwhile, which for a task restricting itself
 /// is what lets the stopper find it off the CPU). EINVAL if no active
 /// CPU is in `mask`.
-pub fn set_cpus_allowed_ptr(p: &KernelTask, mask: &crate::cpumask::CpuSet) -> Result<(), i32> {
+pub fn set_cpus_allowed_ptr(
+    p: &KernelTask,
+    mask: &crate::util::cpumask::CpuSet,
+) -> Result<(), i32> {
     let allowed = mask.and(&sched_cpus());
     if mask.and(&crate::smp::active_cpus()).is_empty() {
         return Err(22); // EINVAL
@@ -3491,8 +3494,8 @@ pub fn scheduler_tick() {
         let t = TICK_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
         crate::task::loadavg::tick(t);
     }
-    crate::timer::run_local();
-    crate::watchdog::tick();
+    crate::time::timer::run_local();
+    crate::time::watchdog::tick();
     crate::kmsg::tick();
     if let Some(cpu) = crate::cpu::try_this_id() {
         balance_tick(cpu);
@@ -3508,7 +3511,7 @@ pub fn scheduler_tick() {
     // switches is charged too (Linux account_process_tick)
     if me.tid() != 0 {
         me.account_now(now);
-        crate::cpu_timer::tick(&me);
+        crate::time::cpu_timer::tick(&me);
     }
     let resched = match me.se.class() {
         Class::Stop => false,
@@ -3538,7 +3541,7 @@ pub fn get_ticks() -> u64 {
 pub fn sleep_until_ns(deadline_ns: u64, interruptible: bool) -> Result<(), u64> {
     sleep_until(
         deadline_ns,
-        crate::hrtimer::HrClock::Monotonic,
+        crate::time::hrtimer::HrClock::Monotonic,
         interruptible,
     )
 }
@@ -3550,7 +3553,7 @@ pub fn sleep_until_ns(deadline_ns: u64, interruptible: bool) -> Result<(), u64> 
 /// an absolute CLOCK_REALTIME deadline follows clock steps.
 pub fn sleep_until(
     deadline: u64,
-    clock: crate::hrtimer::HrClock,
+    clock: crate::time::hrtimer::HrClock,
     interruptible: bool,
 ) -> Result<(), u64> {
     let state = if interruptible {
@@ -3565,7 +3568,7 @@ pub fn sleep_until(
             set_current_state(SleepState::Running);
             return Ok(());
         }
-        if interruptible && crate::waitqueue::signal_pending() {
+        if interruptible && crate::sync::waitqueue::signal_pending() {
             set_current_state(SleepState::Running);
             return Err(deadline - now);
         }
@@ -3574,7 +3577,7 @@ pub fn sleep_until(
             core::hint::spin_loop();
             continue;
         }
-        crate::hrtimer::schedule_hrtimeout(Some(deadline), clock);
+        crate::time::hrtimer::schedule_hrtimeout(Some(deadline), clock);
     }
 }
 
@@ -3935,7 +3938,7 @@ fn account_current(kernel: bool) {
 /// Look up a task's CPU affinity mask by PID
 ///
 /// Returns None if the process is not found.
-pub fn lookup_task_cpus_allowed(pid: Pid) -> Option<crate::cpumask::CpuSet> {
+pub fn lookup_task_cpus_allowed(pid: Pid) -> Option<crate::util::cpumask::CpuSet> {
     let table = TASKLIST.read();
     table.get(pid).map(|t| t.task.cpus_mask.snapshot())
 }
@@ -4024,7 +4027,7 @@ pub fn set_task_scheduler(pid: Pid, policy: i32, rt_priority: i32) -> Result<(),
 /// # Locking
 /// See [`set_cpus_allowed_ptr`]: a task on a CPU it may no longer use
 /// is moved before this returns.
-pub fn set_task_cpus_allowed(pid: Pid, mask: crate::cpumask::CpuSet) -> Result<(), i32> {
+pub fn set_task_cpus_allowed(pid: Pid, mask: crate::util::cpumask::CpuSet) -> Result<(), i32> {
     let task = TASKLIST.read().task(pid).ok_or(3)?; // ESRCH
     // Bound kernel threads (Linux sched_setaffinity: EINVAL)
     if task.has_flag(crate::task::pf::NO_SETAFFINITY) {

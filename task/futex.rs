@@ -40,12 +40,12 @@ use core::marker::PhantomPinned;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 
-use crate::error::KernelError;
-use crate::list::{Link, List};
 use crate::sync::spin::Mutex as SpinMutex;
 use crate::task::Tid;
 use crate::task::percpu::{KernelTask, WakeQ};
 use crate::uaccess::{get_user, put_user};
+use crate::util::error::KernelError;
+use crate::util::list::{Link, List};
 
 // Architecture-specific uaccess implementation
 #[cfg(target_arch = "aarch64")]
@@ -265,8 +265,8 @@ fn futex_clock_ns(realtime: bool) -> u64 {
 /// Sleep interruptibly until `queued()` turns false (a waker dequeued us),
 /// a signal arrives, or `deadline_ns` (on the given clock) passes
 fn futex_sleep<F: Fn() -> bool>(queued: F, deadline_ns: Option<u64>, realtime: bool) -> FutexSleep {
-    use crate::hrtimer::{HrClock, schedule_hrtimeout};
     use crate::task::percpu::{SleepState, set_current_state};
+    use crate::time::hrtimer::{HrClock, schedule_hrtimeout};
     let clock = if realtime {
         HrClock::Realtime
     } else {
@@ -277,7 +277,7 @@ fn futex_sleep<F: Fn() -> bool>(queued: F, deadline_ns: Option<u64>, realtime: b
         if !queued() {
             break FutexSleep::Woken;
         }
-        if crate::waitqueue::signal_pending() {
+        if crate::sync::waitqueue::signal_pending() {
             break FutexSleep::Signal;
         }
         if deadline_ns.is_some_and(|d| clock.now() >= d) {

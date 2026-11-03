@@ -5,9 +5,9 @@
 use alloc::vec;
 
 use crate::arch::Uaccess;
-use crate::error::KernelError;
 use crate::task::percpu;
 use crate::uaccess::{copy_from_user, copy_to_user, strncpy_from_user};
+use crate::util::error::KernelError;
 
 use super::key::{
     KEY_NEED_READ, KEY_NEED_SETATTR, KEY_NEED_VIEW, KEY_NEED_WRITE, check_key_permission,
@@ -453,7 +453,7 @@ pub fn keyctl_read(key_serial: i32, buffer_ptr: u64, buflen: usize) -> i64 {
         Ok(n) => n,
         Err(e) => return e,
     };
-    let mut buffer = match crate::kmem::try_vec(buflen.min(need), 0u8) {
+    let mut buffer = match crate::util::kmem::try_vec(buflen.min(need), 0u8) {
         Ok(b) => b,
         Err(e) => return e.sysret(),
     };

@@ -36,8 +36,8 @@ pub mod tty_dev;
 
 use crate::sync::spin::Mutex;
 
-use crate::chardev::{CharDevice, DeviceError};
 use crate::console::ConsoleDriver;
+use crate::fs::chardev::{CharDevice, DeviceError};
 
 // Re-export commonly used types
 pub use termios::{
@@ -450,7 +450,7 @@ impl ConsoleDriver for Tty {
 /// like /dev/console and /dev/tty.
 /// Called from init_vfs() after heap is available.
 pub fn init_tty_chardevs() {
-    use crate::chardev::{DevId, major, register_chardev};
+    use crate::fs::chardev::{DevId, major, register_chardev};
     use alloc::sync::Arc;
 
     // Register platform-specific serial TTYs

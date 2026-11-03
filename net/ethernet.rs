@@ -203,7 +203,7 @@ pub fn eth_hdr(skb: &SkBuff) -> Option<&EthHdr> {
     }
 
     // Packed (alignment 1): always in place
-    crate::pod::FromBytes::ref_from(skb.data())
+    crate::util::pod::FromBytes::ref_from(skb.data())
 }
 
 /// Format a MAC address as string

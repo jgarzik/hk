@@ -25,7 +25,6 @@ use crate::sync::spin::{Mutex, RwLock};
 
 use crate::arch::{IrqSpinlock, Uaccess};
 use crate::block::blkdev::{BioOp, bdev_rw, bdev_rw_frame};
-use crate::error::KernelError;
 use crate::fs::{Inode, lookup_path};
 use crate::mm::filemap::PAGE_SIZE;
 use crate::mm::page::frame_bytes;
@@ -33,6 +32,7 @@ use crate::mm::swap_entry::{MAX_SWAPFILES, SwapEntry};
 use crate::mm::xarray::XArray;
 use crate::task::{CAP_SYS_ADMIN, capable};
 use crate::uaccess::strncpy_from_user;
+use crate::util::error::KernelError;
 
 /// 512-byte sectors per page
 const SECTORS_PER_PAGE: u64 = (PAGE_SIZE / 512) as u64;
@@ -356,9 +356,9 @@ pub fn swapcache_clear(e: SwapEntry) {
 
 /// Another task claimed `e` for the swap cache (SWAP_HAS_CACHE) and
 /// has not put its page there yet: `read_swap_page` waits on this
-pub fn swap_wait(e: SwapEntry) -> &'static crate::waitqueue::WaitQueue {
+pub fn swap_wait(e: SwapEntry) -> &'static crate::sync::waitqueue::WaitQueue {
     // Hashed like the page wait table (Linux folio_waitqueue)
-    crate::waitqueue::page_wait_queue(e.raw() << 12)
+    crate::sync::waitqueue::page_wait_queue(e.raw() << 12)
 }
 
 /// SWAP_HAS_CACHE is set on `e`

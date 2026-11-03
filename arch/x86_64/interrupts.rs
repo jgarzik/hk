@@ -744,7 +744,7 @@ fn handle_lapic_timer() {
     }
 
     // Due timers (the scheduler tick among them), the next event
-    crate::hrtimer::interrupt();
+    crate::time::hrtimer::interrupt();
 
     // Send EOI to LAPIC (must be done before any potential context switch)
     lapic::eoi();

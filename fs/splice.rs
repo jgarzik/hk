@@ -30,9 +30,11 @@ use alloc::sync::Arc;
 use crate::arch::Uaccess;
 use crate::fs::KernelError;
 use crate::fs::file::File;
+use crate::io::pipe::PipePage;
+use crate::io::pipe::{
+    PIPE_RING, Pipe, PipeBuffer, PipeReadFileOps, PipeWriteFileOps, pipe_buf_flags,
+};
 use crate::mm::filemap::PAGE_SIZE;
-use crate::pipe::PipePage;
-use crate::pipe::{PIPE_RING, Pipe, PipeBuffer, PipeReadFileOps, PipeWriteFileOps, pipe_buf_flags};
 use crate::task::fdtable::get_task_fd;
 use crate::task::percpu::current_tid;
 use crate::uaccess::{copy_from_user, get_user, put_user};
@@ -245,9 +247,9 @@ pub fn link_pipe(src: &Pipe, dst: &Pipe, len: usize, _flags: u32) -> Result<usiz
 fn pipe_of_file(file: &File) -> Option<Arc<Pipe>> {
     let ops = file.f_op.as_any();
     // A FIFO is a pipe too (Linux get_pipe_info)
-    if ops.is::<crate::pipe::FifoFileOps>() {
+    if ops.is::<crate::io::pipe::FifoFileOps>() {
         return file
-            .private_arc::<crate::pipe::FifoFile>()
+            .private_arc::<crate::io::pipe::FifoFile>()
             .map(|f| f.pipe());
     }
     if !ops.is::<PipeReadFileOps>() && !ops.is::<PipeWriteFileOps>() {

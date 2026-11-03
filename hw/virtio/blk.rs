@@ -39,11 +39,11 @@ use crate::block::blk_mq::{BlkMq, MqOps, Queued};
 use crate::block::blkdev::{Bio, BioList, BioOp, Disk, QueueLimits, RequestQueue, register_blkdev};
 use crate::block::genhd::{add_disk, disk_name};
 use crate::bus::driver::{Device, DriverError};
-use crate::error::KernelError;
 use crate::hw::dma::{DmaAddr, DmaCoherent, DmaDirection, dma_map_single, dma_unmap_single};
 use crate::hw::virtio::ring::Sg;
 use crate::hw::virtio::{self, VirtioDevice, VirtioDriver, VirtioIrq, Virtqueue};
 use crate::printkln;
+use crate::util::error::KernelError;
 
 /// Device-specific feature bits
 mod feature {

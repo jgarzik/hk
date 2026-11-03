@@ -174,7 +174,7 @@ pub fn set_task_rlimit(
             .get(tid)
             .map(|t| t.task.pid);
         if let Some(pid) = pid {
-            crate::cpu_timer::rlimit_cpu_changed(&signal, pid);
+            crate::time::cpu_timer::rlimit_cpu_changed(&signal, pid);
         }
     }
     Ok(())

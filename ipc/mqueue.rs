@@ -23,7 +23,7 @@
 //! - Linux kernel ipc/mqueue.c
 //! - POSIX.1-2017 mq_overview(7)
 
-use crate::hrtimer::HrClock;
+use crate::time::hrtimer::HrClock;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
@@ -37,19 +37,19 @@ use crate::sync::spin::{Mutex, RwLock};
 use spin::Lazy;
 
 use crate::arch::Uaccess;
-use crate::error::KernelError;
 use crate::fs::dentry::Dentry;
 use crate::fs::file::{File, FileOps, flags};
 use crate::fs::inode::{Inode, InodeMode, NULL_INODE_OPS, Timespec as InodeTimespec};
-use crate::pipe::FD_CLOEXEC;
-use crate::poll::{POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM, PollTable};
-use crate::rlimit;
+use crate::io::pipe::FD_CLOEXEC;
+use crate::io::poll::{POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM, PollTable};
+use crate::sync::waitqueue::WaitQueue;
 use crate::task::fdtable::get_task_fd;
 use crate::task::percpu::current_tid;
+use crate::task::rlimit;
 use crate::uaccess::{
     UaccessArch, copy_from_user, copy_to_user, get_user, put_user, strncpy_from_user,
 };
-use crate::waitqueue::WaitQueue;
+use crate::util::error::KernelError;
 
 // ============================================================================
 // Constants (Linux ABI compatible)
@@ -446,7 +446,7 @@ impl FileOps for MqFileOps {
 
     fn poll(&self, file: &File, table: Option<&mut PollTable>) -> u16 {
         let Some(mq) = mq_of(file) else {
-            return crate::poll::POLLERR;
+            return crate::io::poll::POLLERR;
         };
         if let Some(pt) = table {
             pt.poll_wait(&mq.queue.waitq_recv);

@@ -16,7 +16,7 @@ use super::{
     PROT_WRITE, TASK_SIZE, VM_GROWSDOWN, VM_LOCKED, VM_LOCKED_MASK, VM_LOCKONFAULT, VM_NORESERVE,
     VM_SHARED, Vma, anon_vma::AnonVma, get_task_mm,
 };
-use crate::error::KernelError;
+use crate::util::error::KernelError;
 
 // ============================================================================
 // mlock flags (user-visible)
@@ -192,8 +192,8 @@ pub fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: 
     };
 
     // Check RLIMIT_AS (address space limit) before creating VMA
-    let limit = crate::rlimit::rlimit(crate::rlimit::RLIMIT_AS);
-    if limit != crate::rlimit::RLIM_INFINITY {
+    let limit = crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_AS);
+    if limit != crate::task::rlimit::RLIM_INFINITY {
         let current_bytes = mm_guard.total_vm() * PAGE_SIZE;
         if current_bytes.saturating_add(length) > limit {
             return KernelError::OutOfMemory.sysret();
@@ -249,8 +249,8 @@ pub fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: 
         // Check RLIMIT_MEMLOCK (CAP_IPC_LOCK bypasses limit)
         let pages = length / PAGE_SIZE;
         if !crate::task::capable(crate::task::CAP_IPC_LOCK) {
-            let limit = crate::rlimit::rlimit(crate::rlimit::RLIMIT_MEMLOCK);
-            if limit != crate::rlimit::RLIM_INFINITY {
+            let limit = crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_MEMLOCK);
+            if limit != crate::task::rlimit::RLIM_INFINITY {
                 let current_bytes = mm_guard.locked_vm() * PAGE_SIZE;
                 let requested_bytes = pages * PAGE_SIZE;
                 if current_bytes.saturating_add(requested_bytes) > limit {
@@ -273,8 +273,8 @@ pub fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: 
         // Check RLIMIT_MEMLOCK for MCL_FUTURE locking (CAP_IPC_LOCK bypasses limit)
         let pages = length / PAGE_SIZE;
         if !crate::task::capable(crate::task::CAP_IPC_LOCK) {
-            let limit = crate::rlimit::rlimit(crate::rlimit::RLIMIT_MEMLOCK);
-            if limit != crate::rlimit::RLIM_INFINITY {
+            let limit = crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_MEMLOCK);
+            if limit != crate::task::rlimit::RLIM_INFINITY {
                 let current_bytes = mm_guard.locked_vm() * PAGE_SIZE;
                 let requested_bytes = pages * PAGE_SIZE;
                 if current_bytes.saturating_add(requested_bytes) > limit {
@@ -436,8 +436,8 @@ pub fn sys_brk(brk: u64) -> i64 {
 /// A break at `brk` fits RLIMIT_DATA (Linux check_data_rlimit; hk does
 /// not count the data segment, only the heap)
 fn data_ok(mm: &super::MmStruct, brk: u64) -> bool {
-    let limit = crate::rlimit::rlimit(crate::rlimit::RLIMIT_DATA);
-    limit == crate::rlimit::RLIM_INFINITY || brk - mm.get_start_brk() <= limit
+    let limit = crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_DATA);
+    limit == crate::task::rlimit::RLIM_INFINITY || brk - mm.get_start_brk() <= limit
 }
 
 /// The heap may grow from `old` to `new` (both page-aligned; Linux
@@ -458,8 +458,8 @@ fn brk_fits(mm: &super::MmStruct, old: u64, new: u64) -> bool {
             return false;
         }
     }
-    let as_limit = crate::rlimit::rlimit(crate::rlimit::RLIMIT_AS);
-    as_limit == crate::rlimit::RLIM_INFINITY
+    let as_limit = crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_AS);
+    as_limit == crate::task::rlimit::RLIM_INFINITY
         || (mm.total_vm() * PAGE_SIZE).saturating_add(new - old) <= as_limit
 }
 
@@ -511,7 +511,7 @@ fn can_do_mlock() -> bool {
         return true;
     }
     // Non-privileged users can mlock if RLIMIT_MEMLOCK > 0
-    crate::rlimit::rlimit(crate::rlimit::RLIMIT_MEMLOCK) > 0
+    crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_MEMLOCK) > 0
 }
 
 /// Fault in the pages of [start, start + len) (Linux __mm_populate /
@@ -690,7 +690,7 @@ fn lock_range(start: u64, len: u64) -> (u64, u64) {
 /// do_mlock): the whole length counts, less the pages of the range
 /// already locked; CAP_IPC_LOCK has no limit
 fn memlock_room(mm: &super::MmStruct, start: u64, len: u64) -> bool {
-    let limit = crate::rlimit::rlimit(crate::rlimit::RLIMIT_MEMLOCK) / PAGE_SIZE;
+    let limit = crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_MEMLOCK) / PAGE_SIZE;
     let locked = len / PAGE_SIZE + mm.locked_vm();
     if locked <= limit || crate::task::capable(crate::task::CAP_IPC_LOCK) {
         return true;
@@ -857,8 +857,8 @@ pub fn sys_mlockall(flags: i32) -> i64 {
 
         // Check RLIMIT_MEMLOCK before committing (CAP_IPC_LOCK bypasses limit)
         if !crate::task::capable(crate::task::CAP_IPC_LOCK) {
-            let limit = crate::rlimit::rlimit(crate::rlimit::RLIMIT_MEMLOCK);
-            if limit != crate::rlimit::RLIM_INFINITY {
+            let limit = crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_MEMLOCK);
+            if limit != crate::task::rlimit::RLIM_INFINITY {
                 let current_bytes = mm_guard.locked_vm() * PAGE_SIZE;
                 let requested_bytes = pages_to_add * PAGE_SIZE;
                 if current_bytes.saturating_add(requested_bytes) > limit {
@@ -1352,9 +1352,9 @@ pub fn sys_mremap(old_addr: u64, old_len: u64, new_len: u64, flags: u32, new_add
     } else {
         new_len_aligned.saturating_sub(old_len)
     };
-    let limit = crate::rlimit::rlimit(crate::rlimit::RLIMIT_AS);
+    let limit = crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_AS);
     let total = (mm_guard.total_vm() * PAGE_SIZE).saturating_add(charge);
-    if charge > 0 && limit != crate::rlimit::RLIM_INFINITY && total > limit {
+    if charge > 0 && limit != crate::task::rlimit::RLIM_INFINITY && total > limit {
         return KernelError::OutOfMemory.sysret();
     }
     let locked = mm_guard.get_vma(vma_idx).is_some_and(|v| v.is_locked());
@@ -1419,9 +1419,9 @@ pub fn sys_mremap(old_addr: u64, old_len: u64, new_len: u64, flags: u32, new_add
 /// `bytes` more of locked memory fit RLIMIT_MEMLOCK (or the task has
 /// CAP_IPC_LOCK)
 fn memlock_ok(mm: &super::MmStruct, bytes: u64) -> bool {
-    let limit = crate::rlimit::rlimit(crate::rlimit::RLIMIT_MEMLOCK);
+    let limit = crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_MEMLOCK);
     crate::task::capable(crate::task::CAP_IPC_LOCK)
-        || limit == crate::rlimit::RLIM_INFINITY
+        || limit == crate::task::rlimit::RLIM_INFINITY
         || (mm.locked_vm() * PAGE_SIZE).saturating_add(bytes) <= limit
 }
 

@@ -191,7 +191,7 @@ pub fn stream(len: usize, mut out: impl FnMut(usize, &[u8]) -> bool) -> usize {
     let mut ctr = 1u32;
     while done < len {
         if done > 0 && done % 4096 == 0 {
-            if crate::waitqueue::signal_pending() {
+            if crate::sync::waitqueue::signal_pending() {
                 break;
             }
             crate::task::percpu::cond_resched();

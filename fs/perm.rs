@@ -316,7 +316,7 @@ fn do_utimes(dirfd: i32, pathname: u64, times: Option<[UserTimespec; 2]>, flags:
 }
 
 /// Copy a user array of two `T`
-fn copy_pair<T: crate::pod::FromBytes>(ptr: u64) -> Result<[T; 2], KernelError> {
+fn copy_pair<T: crate::util::pod::FromBytes>(ptr: u64) -> Result<[T; 2], KernelError> {
     if !Uaccess::access_ok(ptr, core::mem::size_of::<[T; 2]>()) {
         return Err(KernelError::BadAddress);
     }
