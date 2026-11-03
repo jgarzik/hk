@@ -1,8 +1,34 @@
+# The hk kernel crate (its sources are the repo root's .rs files and
+# module directories) and the workspace it heads
+[package]
+name = "hk-kernel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "hk kernel - main kernel crate"
+
+[[bin]]
+name = "kernel"
+path = "main.rs"
+
+[dependencies]
+spin.workspace = true
+bitflags.workspace = true
+
+[features]
+default = []
+# Lockdep-lite: spin-lock tracking, lock order and sleep-in-atomic checks
+# (debug aid; `make check LOCKDEP=1`); includes mmcheck
+lockdep = ["mmcheck"]
+# VMA/PTE agreement check after each address-range operation
+# (`mm::check`, MMCHECK:FAIL reports; debug aid)
+mmcheck = []
+
+[lints]
+workspace = true
+
 [workspace]
 resolver = "2"
-members = [
-    "kernel",
-]
 exclude = [
     "user",   # Separate target (Linux userspace, not bare metal)
     "tools",  # Host-side tools, built separately

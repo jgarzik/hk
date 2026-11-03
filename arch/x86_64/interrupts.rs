@@ -386,7 +386,7 @@ fn handle_exception(uframe: &UserFrame, vector: u64) {
         ::core::arch::asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack, preserves_flags));
     }
 
-    // Page faults: demand paging, copy-on-write, swap-in (kernel/mm/fault.rs)
+    // Page faults: demand paging, copy-on-write, swap-in (mm/fault.rs)
     if vector == 14 {
         // CR2 is read: interrupts back on if the faulting context had
         // them (Linux do_user_addr_fault), so a fault that sleeps (the

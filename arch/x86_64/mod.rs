@@ -461,7 +461,7 @@ pub fn early_init() {
     // Enable NX bit support in page tables (requires EFER.NXE)
     cpu::enable_nx();
 
-    // Enable SMEP/SMAP for kernel/user memory separation security
+    // Enable SMEP/SMAP for user memory separation security
     // SMEP: prevents kernel from executing user pages
     // SMAP: prevents kernel from accessing user pages without explicit stac/clac
     uaccess::enable_smep();

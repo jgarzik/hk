@@ -133,7 +133,7 @@ static DIRECT_DMA_OPS: DirectDmaOps = DirectDmaOps::new(&FRAME_ALLOCATOR);
 /// Embedded initramfs for aarch64 (fallback when DTB doesn't provide initramfs)
 /// This embeds the initramfs directly into the kernel binary.
 #[cfg(target_arch = "aarch64")]
-pub static EMBEDDED_INITRAMFS: &[u8] = include_bytes!("../user/initramfs-aarch64.cpio");
+pub static EMBEDDED_INITRAMFS: &[u8] = include_bytes!("user/initramfs-aarch64.cpio");
 
 /// x86_64 Kernel entry point called by bootloader
 ///

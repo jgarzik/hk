@@ -132,7 +132,7 @@ fn read(&self) -> RwLockReadGuard<'_, T>
 fn write(&self) -> RwLockWriteGuard<'_, T>
 ```
 
-### 1.4 Sleeping locks: sync::Mutex<T>, sync::RwSem (kernel/sync/)
+### 1.4 Sleeping locks: sync::Mutex<T>, sync::RwSem (sync/)
 
 Linux `struct mutex` and `struct rw_semaphore`: a contended lock sleeps
 on the lock's `WaitQueue` instead of spinning (only a tid-0 caller, the
@@ -440,7 +440,7 @@ Other CPUs cannot cause deadlock because:
 
 ### 3.1 Scheduler
 
-**Location:** `kernel/task/percpu.rs`
+**Location:** `task/percpu.rs`
 
 Each CPU has its own run queue and lock (Linux struct rq); a wakeup
 takes the lock of the run queue it queues on, whichever CPU that is.
@@ -680,7 +680,7 @@ return to user mode delivers the signal.
 since kernel code cannot be preempted, a change in a CPU's counter (or the
 CPU being idle) is a quiescent state for a future QSBR RCU.
 
-#### Kernel Threads (kernel/task/kthread.rs)
+#### Kernel Threads (task/kthread.rs)
 
 `kthread_run(name, fn, arg, cpu)` creates a pid-0 task bound to one CPU
 (created asleep in that CPU's rq, then woken). `KTHREADS`
@@ -694,7 +694,7 @@ kthread_bind). Standing threads: `ktimers/N` (one per CPU, runs its SOFT
 timer callbacks), the system workqueue worker, `softnet/N` (one per CPU,
 network receive; see 3.10), `kselftest` (boot only).
 
-**Stoppers (kernel/task/stop_machine.rs, Linux stop_machine.c):**
+**Stoppers (task/stop_machine.rs, Linux stop_machine.c):**
 `migration/N`, one per CPU at the highest priority, runs calls queued
 with `stop_one_cpu` (thread context; the caller sleeps until done). Per
 CPU: `Stopper.lock` (sleeping `sync::Mutex`, one caller at a time, held
@@ -730,7 +730,7 @@ syscall entry stack top, set at each switch to a user task.
 
 ### 3.1.1 Task Struct and Credentials
 
-**Location:** `kernel/task/mod.rs`, `kernel/task/percpu.rs`
+**Location:** `task/mod.rs`, `task/percpu.rs`
 
 A global `TASKLIST: RwLock<GlobalTaskTable>` (Linux tasklist_lock: read
 for lookups and walks, write for any change) protects the task list and
@@ -748,7 +748,7 @@ serializes wakers (3.1), `Task.sig` holds the per-task signal state
 | Per-CPU `curr` | `*const Task` in PerCpu | The running task (no lock) |
 | `Task.cred` | `Arc<Cred>` (raw) | Reference-counted credentials |
 
-**Pids** (`kernel/task/pid.rs`, Linux 4.14 pidmap): a `Pid` holds one
+**Pids** (`task/pid.rs`, Linux 4.14 pidmap): a `Pid` holds one
 number per pid-namespace level. Numbers come from a lock-free bitmap
 per namespace (pages allocated outside any lock, installed by
 compare-and-swap; bits set and cleared atomically). `PIDMAP_LOCK`
@@ -995,8 +995,8 @@ wait status word (`code << 8` or the killing signal).
 
 #### Frame Allocator (buddy + per-CPU lists)
 
-**Location:** `kernel/mm/page_alloc.rs` (Linux mm/page_alloc.c), API in
-`kernel/frame_alloc.rs`
+**Location:** `mm/page_alloc.rs` (Linux mm/page_alloc.c), API in
+`frame_alloc.rs`
 
 ```rust
 pub struct Zone {
@@ -1048,7 +1048,7 @@ pub struct Zone {
 
 #### Boot Memory (memblock)
 
-**Location:** `kernel/mm/memblock.rs`
+**Location:** `mm/memblock.rs`
 
 - `MEMBLOCK` (`spin::Mutex`, leaf): RAM and reserved ranges, used only
   on the boot CPU before SMP, in thread context (the arch fills it,
@@ -1058,7 +1058,7 @@ pub struct Zone {
 
 #### struct page (vmemmap)
 
-**Location:** `kernel/mm/page.rs`
+**Location:** `mm/page.rs`
 
 - The memory map is built on the boot CPU before SMP and never changes
   afterwards: `pfn_valid` / `phys_to_page` read the section bitmap
@@ -1075,8 +1075,8 @@ pub struct Zone {
 
 #### Address Spaces (Mm: mm_users / mm_count, mmap_lock)
 
-**Location:** `kernel/mm/mod.rs` (`Mm`, `MmRef`), `kernel/mm/memory.rs`
-(`exit_mmap`), `kernel/task/percpu.rs` (`exit_current`, `exec_replace_image`,
+**Location:** `mm/mod.rs` (`Mm`, `MmRef`), `mm/memory.rs`
+(`exit_mmap`), `task/percpu.rs` (`exit_current`, `exec_replace_image`,
 `do_clone`)
 
 - `Mm.users` (`AtomicUsize`, Linux mm_users) counts the tasks running in
@@ -1146,7 +1146,7 @@ pub struct Zone {
   check the mark) order with SeqCst fences, so a racing shmat backs out
   (EINVAL) or IPC_RMID sees it; destroy is idempotent, so namespace
   totals are given back exactly once.
-- The page-fault path (`kernel/mm/fault.rs`, `handle_mm_fault`, shared by
+- The page-fault path (`mm/fault.rs`, `handle_mm_fault`, shared by
   both arches) holds the mm lock for reading from the VMA lookup through
   the PTE update (Linux lock_mm_and_find_vma: a stack that must grow
   first takes it for writing, grows, and the fault starts over), so a
@@ -1176,7 +1176,7 @@ pub struct Zone {
   around each writeback (`fsync` sleeps; it holds a reference on the
   file) and looks the next VMA up again after it (Linux msync); mincore
   copies each chunk of its vector out with the mm lock dropped.
-- Page-table locks (`kernel/mm/ptl.rs`; Linux page_table_lock and split
+- Page-table locks (`mm/ptl.rs`; Linux page_table_lock and split
   PTE locks): `Mm.page_table_lock` (`spin::Mutex<()>`, not IRQ-safe)
   covers table-structure changes: a missing table installed
   (`ptl::pte_alloc`), a 2MB entry mapped (`do_huge_anon`), split
@@ -1259,7 +1259,7 @@ pub struct Zone {
   switches away, so the flush reaches it (arm64 broadcast; x86 see TLB
   Flushing).
 
-#### Swap (kernel/mm/swap.rs, swap_state.rs; Linux mm/swapfile.c, swap_state.c)
+#### Swap (mm/swap.rs, swap_state.rs; Linux mm/swapfile.c, swap_state.c)
 
 - `SwapInfo.map` (`spin::Mutex`, Linux si->lock): a device's slot
   counts (swap PTEs + SWAP_HAS_CACHE) and allocation hint; swapoff
@@ -1288,7 +1288,7 @@ pub struct Zone {
   are dropped before any mm lock) with its mmap_lock held for reading, faulting the device's swap
   PTEs in.
 
-#### LRU (kernel/mm/lru.rs; Linux mm/swap.c lruvec)
+#### LRU (mm/lru.rs; Linux mm/swap.c lruvec)
 
 - `Lruvec.lock` (`IrqSpinlock`, Linux lruvec->lru_lock): the LRU lists,
   linked through struct page (`next`/`prev`, owned by the list while
@@ -1309,7 +1309,7 @@ pub struct Zone {
   reached 0 is left for `page_freed`, which takes the lock and unlinks
   it. Reclaim never takes an mmap_lock while holding it.
 
-#### Reclaim (kernel/mm/vmscan.rs; Linux mm/vmscan.c)
+#### Reclaim (mm/vmscan.rs; Linux mm/vmscan.c)
 
 - `shrink_folio_list` works on pages it isolated (each with a
   reference) and holds no lock between pages. Per page: page lock by
@@ -1321,7 +1321,7 @@ pub struct Zone {
   reading: MADV_PAGEOUT, a fault's direct reclaim), and holds no
   spinlock across I/O or a sleeping lock.
 
-#### TLB Flushing (kernel/mm/tlb.rs; arch/{x86_64,aarch64}/tlb.rs)
+#### TLB Flushing (mm/tlb.rs; arch/{x86_64,aarch64}/tlb.rs)
 
 No lock: the state is atomics and per-CPU data (Linux arch/x86/mm/tlb.c).
 
@@ -1385,7 +1385,7 @@ No lock: the state is atomics and per-CPU data (Linux arch/x86/mm/tlb.c).
   before it, none of which is spun on with interrupts off). arm64
   flushes never wait on another CPU's software.
 
-#### Cross-CPU Calls (kernel/smp.rs; arch/{x86_64,aarch64}/ipi.rs)
+#### Cross-CPU Calls (smp.rs; arch/{x86_64,aarch64}/ipi.rs)
 
 No lock (Linux kernel/smp.c): `smp_call_function_many(mask, func,
 info, wait)` runs `func(info)` on other CPUs from their call-function
@@ -1444,8 +1444,8 @@ reschedule (`resched_curr` after queueing a task on its run queue,
 
 #### Kernel Page Tables (kernel half)
 
-**Location:** `kernel/arch/x86_64/kmap.rs`, `kernel/arch/x86_64/ioremap.rs`,
-`kernel/arch/aarch64/kmap.rs`, `kernel/arch/aarch64/ioremap.rs`;
+**Location:** `arch/x86_64/kmap.rs`, `arch/x86_64/ioremap.rs`,
+`arch/aarch64/kmap.rs`, `arch/aarch64/ioremap.rs`;
 layout in `doc/MEMORY.md`
 
 - The kernel half (direct map of RAM, kernel image, vmalloc/ioremap
@@ -1486,8 +1486,8 @@ layout in `doc/MEMORY.md`
 
 #### Heap Allocator (boot arena, slab)
 
-**Location:** `kernel/heap.rs` (global allocator, boot arena),
-`kernel/mm/slab.rs` (Linux mm/slab.c array caches, SLUB-style lists)
+**Location:** `heap.rs` (global allocator, boot arena),
+`mm/slab.rs` (Linux mm/slab.c array caches, SLUB-style lists)
 
 - Before the page allocator is up, allocations come from a static boot
   arena (first-fit list under an `IrqSpinlock` leaf); afterwards from
@@ -1533,7 +1533,7 @@ layout in `doc/MEMORY.md`
 
 #### Per-inode page cache (Linux i_pages)
 
-**Location:** `kernel/mm/filemap.rs` (`AddressSpace`, the inode's
+**Location:** `mm/filemap.rs` (`AddressSpace`, the inode's
 `i_data`); users: ramfs, vfat files, block devices
 (`BlockDevice.bd_inode`). vfat writes its FAT and directory blocks
 into the device cache marking only the 512-byte sectors it changes
@@ -1595,7 +1595,7 @@ dropped before and after it is zeroed on the disk.)
 
 ### 3.3 Virtual File System (VFS)
 
-**Location:** `kernel/fs/`
+**Location:** `fs/`
 
 The VFS uses fine-grained locking with `RwLock` for concurrent read access.
 **All VFS locks are NOT IRQ-safe** and must only be accessed from thread context.
@@ -1973,7 +1973,7 @@ to stay locked between calls. The call holds the file's `f_pos_lock`
   only by link, unlink and rename (above), never the reverse: no
   directory lock is taken while a file's `i_rwsem` is held (O_CREAT
   drops the parent's lock before O_TRUNC).
-- Both are sleeping locks (`kernel/sync`): the vfat write path may wait
+- Both are sleeping locks (`sync`): the vfat write path may wait
   for page locks and block I/O while holding `i_rwsem`, which a spinlock
   would forbid.
 - Path walk (`path.rs::lookup_slow`) takes a directory's `i_rwsem`
@@ -1995,7 +1995,7 @@ nanoseconds), like Linux's `i_*time_sec` / `i_*time_nsec` fields:
   `inode_lock`): utimensat/utimes/utime take it after `want_write` and the
   permission check, then set atime, mtime and ctime.
 
-#### Timers (kernel/timer.rs; Linux kernel/time/timer.c)
+#### Timers (timer.rs; Linux kernel/time/timer.c)
 
 A `TimerList` is embedded in its pinned owner and armed in jiffies
 (`mod_timer`) or not before a CLOCK_MONOTONIC instant (`mod_timer_ns`,
@@ -2017,7 +2017,7 @@ queue); a timer stays on the base of the CPU that first armed it.
   where sleeping is not allowed.
 - Order: `Alarm.st` -> `TimerBase.wheel` (leaf).
 
-#### High-resolution timers (kernel/hrtimer.rs; Linux kernel/time/hrtimer.c)
+#### High-resolution timers (hrtimer.rs; Linux kernel/time/hrtimer.c)
 
 An `HrTimer` is embedded in its pinned owner and fires at an absolute
 CLOCK_MONOTONIC or CLOCK_REALTIME ns time. Each CPU has a HARD and a
@@ -2050,7 +2050,7 @@ a HARD hrtimer re-armed every TICK_NS.
 - `HrBase.q` is a leaf: callbacks run with it dropped, and
   `reprogram` takes the two bases' locks one at a time.
 
-#### Wait Queues (kernel/waitqueue.rs)
+#### Wait Queues (waitqueue.rs)
 
 Linux-style wait queues (`include/linux/wait.h`, `kernel/sched/wait.c`).
 
@@ -2127,7 +2127,7 @@ Fallback:** if scheduling is not yet enabled, page locking spins.
 
 ### 3.4 Namespaces
 
-**Location:** `kernel/ns/mod.rs`, `kernel/ns/uts.rs`
+**Location:** `ns/mod.rs`, `ns/uts.rs`
 
 The namespace subsystem follows Linux's `nsproxy` pattern, where each task has
 a reference to an `NsProxy` that holds pointers to its namespaces. Multiple
@@ -2200,7 +2200,7 @@ let uts_ns = current_uts_ns();  // cloned out lock-free (current)
 
 ### 3.5 Timekeeping
 
-**Location:** `kernel/time.rs`
+**Location:** `time.rs`
 
 The timekeeper uses a **seqlock** pattern for lock-free reads with consistent
 snapshots. Writers (`update` from the CPU 0 timer tick, `set_realtime` from
@@ -2252,7 +2252,7 @@ then `fence(Release)` (smp_wmb) before the field stores, and
 
 ### 3.6 Kernel Logging (printk)
 
-**Location:** `kernel/printk.rs`, `kernel/console.rs`
+**Location:** `printk.rs`, `console.rs`
 
 The printk subsystem uses IRQ-safe locks to ensure SMP-safe message output
 while avoiding deadlocks in interrupt context:
@@ -2277,7 +2277,7 @@ static CONSOLE_REGISTRY: IrqSpinlock<ConsoleRegistry> = IrqSpinlock::new(...);
 3. CONSOLE_REGISTRY (held during console_write) - IrqSpinlock
 ```
 
-**The record log** (`kernel/kmsg.rs`): `LOG` (IrqSpinlock) holds the
+**The record log** (`kmsg.rs`): `LOG` (IrqSpinlock) holds the
 records that /dev/kmsg and syslog(2) read. printk adds each complete
 line under OUTPUT_LOCK (try_lock while panicking); a /dev/kmsg write
 adds its record under `LOG` alone, then writes the console under
@@ -2416,7 +2416,7 @@ bitflags! {
 
 ### 3.7 Signal Infrastructure
 
-**Location:** `kernel/signal/mod.rs`, `kernel/signal/syscall.rs`
+**Location:** `signal/mod.rs`, `signal/syscall.rs`
 
 The signal subsystem manages signal handlers (SigHand) and per-task signal state
 (blocked masks, pending signals). It follows Linux's `sighand_struct` and signal
@@ -2593,7 +2593,7 @@ de_thread, exit_group does not.
 
 ### 3.8 Futex Subsystem
 
-**Location:** `kernel/futex.rs`
+**Location:** `futex.rs`
 
 The futex (fast userspace mutex) subsystem provides efficient userspace synchronization
 primitives. It uses a hash bucket design similar to Linux's `futex_queues`.
@@ -2668,7 +2668,7 @@ For `futex_requeue()` with two different buckets:
 #### Robust Futex Cleanup
 
 Robust futexes are cleaned up during task exit via `exit_robust_list()`:
-1. Called from task exit path in `kernel/task/percpu.rs`
+1. Called from task exit path in `task/percpu.rs`
 2. Walks the userspace robust list with a 2048 entry limit
 3. For each entry, sets `FUTEX_OWNER_DIED` bit and wakes one waiter
 4. Uses shared bucket lock only briefly per entry
@@ -2691,7 +2691,7 @@ Robust futexes are cleaned up during task exit via `exit_robust_list()`:
 
 ### 3.9 TTY and Console Subsystem
 
-**Location:** `kernel/tty/`, `kernel/gfx/console.rs`, `kernel/console.rs`, `kernel/printk.rs`
+**Location:** `tty/`, `gfx/console.rs`, `console.rs`, `printk.rs`
 
 The TTY and console subsystem handles terminal I/O and kernel message output.
 Console framework locks are IRQ-safe (IrqSpinlock) to support printk from interrupt
@@ -2773,7 +2773,7 @@ Device drivers use thread-context locks (Mutex, RwLock) for their state.
 ISRs only ack the device, set atomics and use IRQ-safe deferral
 (`napi_schedule`, `WaitQueue::wake_*`), deferring work to thread context.
 
-#### Device IRQ Registration (kernel/arch/{x86_64,aarch64}/irq.rs)
+#### Device IRQ Registration (arch/{x86_64,aarch64}/irq.rs)
 
 | Lock | Type | IRQ class | Order |
 |------|------|-----------|-------|
@@ -2798,7 +2798,7 @@ nobody claims 100000 times in a row is masked (stuck level INTx).
   the device, touch atomics/IrqSpinlocks and wake threads; they must not
   register/unregister IRQs.
 
-#### DMA API (kernel/dma.rs)
+#### DMA API (dma.rs)
 
 The backend (`DMA_OPS`) is set once at boot (`spin::Once`) and read
 without a lock, so the streaming calls (`dma_map_single`/`unmap`, sync)
@@ -2807,7 +2807,7 @@ context. `dma_alloc_coherent` allocates frames (thread context only).
 
 #### USB Subsystem
 
-**Location:** `kernel/usb/`
+**Location:** `usb/`
 
 | Lock | Type | Purpose |
 |------|------|---------|
@@ -2828,9 +2828,9 @@ IRQ-safe.
 
 #### Block Device Subsystem
 
-**Location:** `kernel/storage/` (`blkdev.rs`, `blk_mq.rs`, `genhd.rs`,
-`part/`), `kernel/virtio/blk.rs`, `kernel/fs/{blkdev_ops,devtmpfs}.rs`,
-`kernel/completion.rs`
+**Location:** `storage/` (`blkdev.rs`, `blk_mq.rs`, `genhd.rs`,
+`part/`), `virtio/blk.rs`, `fs/{blkdev_ops,devtmpfs}.rs`,
+`completion.rs`
 
 Linux model (block/bio.c, blk-mq.c, genhd.c): a bio is submitted from
 thread context, the driver completes it from its interrupt handler and
@@ -2875,7 +2875,7 @@ Rules:
 
 #### Network Subsystem
 
-**Location:** `kernel/net/`, `kernel/net/core/dev.rs`, `kernel/ns/net.rs`
+**Location:** `net/`, `net/core/dev.rs`, `ns/net.rs`
 
 **Execution model (NAPI-like, no softirqs).** No protocol code runs in
 interrupt context. A NIC ISR only reads/acks its interrupt cause, masks the
@@ -2952,7 +2952,7 @@ not rely on either.
 | driver `netdev` / `Napi.poller` (`spin::Once<Weak<..>>`) | set once at probe, before the IRQ is registered and the NAPI added | read lock-free by polls (thread) | ISRs never read them (they use the driver struct passed as IRQ data) |
 | `icmp::ICMP_ECHO_REPLY_WQ` | `WaitQueue` | woken by ICMP input (softnet) | kernel self-test waiter only (`selftest.rs`), woken after the reply is recorded |
 | `UnixSock.peer_wait` | `WaitQueue` | thread only | Linux peer_wait: dgram senders blocked on a full peer wait here (no lock held); woken by the peer's reads and release, relays to pollers via `UnixSock.relay` |
-| `NetNamespace.sysctl`, `port_range` (`/proc/sys/net`, `kernel/sysctl.rs`) | atomics | thread only | no locks; a multi-value sysctl (ping_group_range, ip_local_port_range) is one packed atomic word, so readers never see half an update; the boot port/ISN secret is a `spin::Once` |
+| `NetNamespace.sysctl`, `port_range` (`/proc/sys/net`, `sysctl.rs`) | atomics | thread only | no locks; a multi-value sysctl (ping_group_range, ip_local_port_range) is one packed atomic word, so readers never see half an update; the boot port/ISN secret is a `spin::Once` |
 | `NetDevice.stats`, `flags`, `mtu`, `ifindex`, `carrier`, `promiscuity`, `allmulti` | atomics | any (`promiscuity`/`allmulti` written only under RTNL) | `flags` holds administrative state only; IFF_RUNNING/IFF_LOWER_UP/operstate are derived on read |
 | e1000 `rx` ring | `spin::Mutex` | thread only (NAPI poll) | leaf; frames are delivered after it is dropped |
 | e1000 `tx` ring | `spin::Mutex` | thread only (xmit, poll reclaim) | leaf; ring full -> drop, `tx_dropped`, ENOBUFS |
@@ -3411,21 +3411,21 @@ this is the interrupt-safety invariant:
 
 | Lock | Location | Type | Reason |
 |------|----------|------|--------|
-| `TASKLIST` | kernel/task/percpu.rs | `RwLock` | every task (Linux tasklist_lock) |
-| `TaskSignalState.shared_pending` | kernel/signal/mod.rs | `Mutex` | Thread-group pending signals (under TASKLIST) |
-| `Task.alloc_lock` | kernel/task/mod.rs | `Mutex` | A task's mm, files, fs, nsproxy, comm, mempolicy, io_context (Linux task_lock; under TASKLIST, over `Task.sig`) |
-| `FsStruct.inner` | kernel/fs/fsstruct.rs | `Mutex` | Root, cwd, umask (leaf) |
-| `NPROC` | kernel/task/mod.rs | `Mutex` | RLIMIT_NPROC tasks per real uid (leaf: may be taken under TASKLIST, takes no lock) |
-| `MEMBLOCK` | kernel/mm/memblock.rs | `Mutex` | Boot memory map (boot CPU, before SMP) |
-| `ACCT_FILE` | kernel/acct.rs | `Mutex` | Process accounting file (leaf: cloned out, the record written and an old file released with no lock held) |
-| All VFS locks | kernel/fs/*.rs | `RwLock` | Inodes, dentries, mounts |
-| Descriptor tables (`Files`) | kernel/task/fdtable.rs | `Mutex` | Per-task fd tables |
-| `RTNL` and every network `spin::Mutex`/`RwLock` | kernel/net/ | `sync::Mutex` / `Mutex` / `RwLock` | Configuration, sockets, tables, queues (3.10) |
-| Driver queue locks (e1000 / virtio-net `rx`, `tx`) | kernel/net/driver/ | `Mutex` | Rings: NAPI poll, xmit, open/stop |
-| `Softnet.backlog` | kernel/net/core/dev.rs | `Mutex` | `netif_rx` (lo), softnet |
-| `BLKDEV_REGISTRY`, `MAJORS`, `RamDisk.pages`, devtmpfs `PENDING` | kernel/storage/, kernel/fs/devtmpfs.rs | `RwLock` / `Mutex` | Block device lookup, majors, RAM disk pages, early device nodes (3.10) |
-| `Disk.open_mutex` | kernel/storage/blkdev.rs | sleeping `sync::Mutex` | Block device open/release, partition scans |
-| Sleeping locks (`sync::Mutex`, `RwSem`) | kernel/sync/ | sleeping | Never in IRQ or atomic context (`might_sleep`) |
+| `TASKLIST` | task/percpu.rs | `RwLock` | every task (Linux tasklist_lock) |
+| `TaskSignalState.shared_pending` | signal/mod.rs | `Mutex` | Thread-group pending signals (under TASKLIST) |
+| `Task.alloc_lock` | task/mod.rs | `Mutex` | A task's mm, files, fs, nsproxy, comm, mempolicy, io_context (Linux task_lock; under TASKLIST, over `Task.sig`) |
+| `FsStruct.inner` | fs/fsstruct.rs | `Mutex` | Root, cwd, umask (leaf) |
+| `NPROC` | task/mod.rs | `Mutex` | RLIMIT_NPROC tasks per real uid (leaf: may be taken under TASKLIST, takes no lock) |
+| `MEMBLOCK` | mm/memblock.rs | `Mutex` | Boot memory map (boot CPU, before SMP) |
+| `ACCT_FILE` | acct.rs | `Mutex` | Process accounting file (leaf: cloned out, the record written and an old file released with no lock held) |
+| All VFS locks | fs/*.rs | `RwLock` | Inodes, dentries, mounts |
+| Descriptor tables (`Files`) | task/fdtable.rs | `Mutex` | Per-task fd tables |
+| `RTNL` and every network `spin::Mutex`/`RwLock` | net/ | `sync::Mutex` / `Mutex` / `RwLock` | Configuration, sockets, tables, queues (3.10) |
+| Driver queue locks (e1000 / virtio-net `rx`, `tx`) | net/driver/ | `Mutex` | Rings: NAPI poll, xmit, open/stop |
+| `Softnet.backlog` | net/core/dev.rs | `Mutex` | `netif_rx` (lo), softnet |
+| `BLKDEV_REGISTRY`, `MAJORS`, `RamDisk.pages`, devtmpfs `PENDING` | storage/, fs/devtmpfs.rs | `RwLock` / `Mutex` | Block device lookup, majors, RAM disk pages, early device nodes (3.10) |
+| `Disk.open_mutex` | storage/blkdev.rs | sleeping `sync::Mutex` | Block device open/release, partition scans |
+| Sleeping locks (`sync::Mutex`, `RwSem`) | sync/ | sleeping | Never in IRQ or atomic context (`might_sleep`) |
 
 With `make check LOCKDEP=1` (1.5) every tracked spin lock taken in an
 interrupt handler is reported (`LOCKDEP:FAIL ... in interrupt context`).

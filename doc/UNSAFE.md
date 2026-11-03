@@ -4,7 +4,8 @@ A kernel needs `unsafe`, but most of it can live in a few small, well-checked
 wrappers. Everything else should then be safe Rust. This policy follows the
 Rust-for-Linux safety standard (`Documentation/rust/coding-guidelines.rst`),
 Asterinas's rule of confining `unsafe` to a small core, and the safe-mmio
-model of device memory. The rules apply to `kernel/` and `tools/`; `user/`
+model of device memory. The rules apply to the kernel crate (the repo root's .rs tree) and
+`tools/`; `user/`
 is a temporary exception (see the end).
 
 `make unsafe-stats` prints the `unsafe` count and `// SAFETY:` coverage per
@@ -141,7 +142,7 @@ saying why.
 this policy carry `#![allow(clippy::undocumented_unsafe_blocks)] //
 TODO(unsafe)` until their blocks are documented or wrapped. Remove the
 line when the file is clean, and never add it to a new file
-(`grep -rl 'TODO(unsafe)' kernel` lists what is left).
+(`git grep -l 'TODO(unsafe)' -- '*.rs' ':!user'` lists what is left).
 
 ## Review checklist (for each new `unsafe`)
 

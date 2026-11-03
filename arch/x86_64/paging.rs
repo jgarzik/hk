@@ -151,7 +151,7 @@ pub fn pte_modify(pte: u64, prot: u32) -> u64 {
 }
 
 // ============================================================================
-// User PTE helpers for the generic fault and fork paths (kernel/mm)
+// User PTE helpers for the generic fault and fork paths (mm)
 // ============================================================================
 
 /// Intermediate entries of user tables

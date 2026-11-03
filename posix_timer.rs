@@ -11,7 +11,7 @@
 //! timer_create(clockid, sigevent, &timer_id) -> Allocates per-process timer
 //!     |
 //!     v
-//! timer_settime(timer_id, ...) -> Arms timer via kernel/timer.rs
+//! timer_settime(timer_id, ...) -> Arms timer via timer.rs
 //!     |
 //!     v
 //! Timer expires -> Callback sends signal (or no-op for SIGEV_NONE)

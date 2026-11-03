@@ -49,6 +49,6 @@ The rules for `unsafe` are in `doc/UNSAFE.md` and the locking rules in
 
 ## Arch split
 
-Generic code calls arch callbacks in `kernel/arch/{x86_64,aarch64}/`; don't
+Generic code calls arch callbacks in `arch/{x86_64,aarch64}/`; don't
 scatter `#[cfg(target_arch)]`. Syscall numbers are per-arch; aarch64
 supports only the modern syscalls.

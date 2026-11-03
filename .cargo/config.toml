@@ -13,6 +13,6 @@ rustflags = [
     "-C", "relocation-model=static",
 ]
 
-# The linker script comes from kernel/build.rs
+# The linker script comes from build.rs
 [target.aarch64-unknown-none]
 linker = "rust-lld"

@@ -11,8 +11,8 @@ infallible, so each one is investigated, not written off.
   batch): `BUSYBOX_NC_LO:FAIL status=0` (nc over loopback) in 1 of 5
   x86 `check-linux` runs, and in an hk x86 boot with one CPU
   (`QEMU_SMP=1`). Cause unknown: the test waits for the listener
-  (`wait_listen`) and retries the client. Seen again 2026-11-03: one
-  uncached x86 `check-linux` run of three (passed on rerun).
+  (`wait_listen`) and retries the client. Seen again twice on 2026-11-03:
+  two uncached x86 `check-linux` runs of four (each passed on rerun).
 - **SWAPOUT_PAGEOUT flaky on the Linux reference** (J): one x86
   `check-linux` run had free swap 364 kB off the expected value after
   MADV_PAGEOUT of 16 MiB (beyond the test's tolerance), passing on the
@@ -31,7 +31,7 @@ None is known to fail today, but each is a soundness bug:
 ## unsafe not yet wrapped or documented (doc/UNSAFE.md)
 
 There are 71 files with `#![allow(clippy::undocumented_unsafe_blocks)]
-// TODO(unsafe)` (`grep -rl 'TODO(unsafe)' kernel`). Most of their
+// TODO(unsafe)` (`git grep -l 'TODO(unsafe)' -- '*.rs' ':!user'`). Most of their
 blocks belong in a missing wrapper:
 
 - **Frames:** an owned / page-locked / PTL-held frame borrow type in
@@ -55,7 +55,7 @@ blocks belong in a missing wrapper:
 
 ## Path names must be valid UTF-8
 
-**Location:** `kernel/uaccess.rs` (`strncpy_from_user`).
+**Location:** `uaccess.rs` (`strncpy_from_user`).
 
 Linux path names are any bytes except '/' and NUL. hk's VFS holds names
 as `String`, so the path copy-in takes only valid UTF-8 and rejects
@@ -87,7 +87,7 @@ Planned fix:
 
 ## chroot() does not affect path resolution (security)
 
-**Location**: `kernel/fs/path.rs` ~131-135 (`walk`, absolute-path lookup)
+**Location**: `fs/path.rs` ~131-135 (`walk`, absolute-path lookup)
 
 `sys_chroot` records the new root (`fs.set_root`), but path walking
 always starts absolute paths at the mount namespace root
@@ -98,7 +98,7 @@ Linux host (`user/boot_tester/tests/permissions.rs`).
 
 ## Network stack gaps (later phases of the network chunk)
 
-**Location**: `kernel/net/`
+**Location**: `net/`
 
 Listed because real traffic reaches them: TCP has no SACK (never
 advertised), no CUBIC (only "reno"; Linux defaults to cubic), no
@@ -118,7 +118,7 @@ SO_PEEK_OFF is EOPNOTSUPP.
 
 ## Memory management gaps
 
-**Location**: `kernel/mm/`, `kernel/arch/*/paging.rs`, `kernel/ipc/shm.rs`
+**Location**: `mm/`, `arch/*/paging.rs`, `ipc/shm.rs`
 
 Missing:
 
@@ -175,7 +175,7 @@ Missing:
 
 ## exec ignores set-user-ID / set-group-ID bits and file capabilities
 
-**Location**: `kernel/task/exec.rs` (`do_execve`)
+**Location**: `task/exec.rs` (`do_execve`)
 
 Linux execve of a file with S_ISUID / S_ISGID (on a mount without
 nosuid, without no_new_privs or a ptracer in the way) sets the
@@ -186,7 +186,7 @@ credentials unchanged, so set-id programs run unprivileged.
 
 ## CPU-time timer gaps
 
-**Location**: `kernel/cpu_timer.rs`, `kernel/posix_timer.rs`
+**Location**: `cpu_timer.rs`, `posix_timer.rs`
 
 timer_create and clock_nanosleep take only the caller's own process
 CPU clock (and its threads' for timer_create): another process's is
@@ -197,7 +197,7 @@ ENOSYS (glibc runs without it).
 
 ## AF_PACKET gaps
 
-**Location**: `kernel/net/packet/`
+**Location**: `net/packet/`
 
 Not implemented: SOCK_PACKET (ESOCKTNOSUPPORT), the mmap rings
 (PACKET_RX_RING/TX_RING, PACKET_VERSION), PACKET_FANOUT,
@@ -214,7 +214,7 @@ lo (hk has no checksum offload states).
 
 ## File lock gaps
 
-**Location**: `kernel/fs/locks.rs`, `kernel/fs/posix_lock.rs`
+**Location**: `fs/locks.rs`, `fs/posix_lock.rs`
 
 POSIX lock owners are pids, not the files_struct (Linux fl_owner):
 threads of one process share them, but a CLONE_FILES child that is
@@ -225,7 +225,7 @@ leases (F_SETLEASE) and no OFD locks (F_OFD_*).
 
 ## seccomp gaps
 
-**Location**: `kernel/seccomp/`
+**Location**: `seccomp/`
 
 SIGSYS from SECCOMP_RET_TRAP carries no siginfo (si_code SYS_SECCOMP,
 si_syscall, si_arch, si_errno, si_call_addr): hk has no siginfo queue
@@ -237,7 +237,7 @@ FLAG_LOG.
 
 ## vmsplice from a pipe is not done
 
-**Location**: `kernel/fs/splice.rs` (`sys_vmsplice`)
+**Location**: `fs/splice.rs` (`sys_vmsplice`)
 
 vmsplice on a pipe or FIFO open for writing copies user memory into it
 (Linux vmsplice_to_pipe). On one open only for reading Linux copies the
@@ -245,7 +245,7 @@ pipe's data into the user iovecs (vmsplice_to_user); hk returns EBADF.
 
 ## AF_UNIX gaps
 
-**Location**: `kernel/net/unix/`
+**Location**: `net/unix/`
 
 No garbage collector for in-flight sockets: a socket whose only
 references are messages queued on sockets that are themselves only
@@ -267,7 +267,7 @@ SIOCUNIXFILE, SO_PEERSEC (ENOPROTOOPT, as on Linux without an LSM).
 
 ## File permission (DAC) gaps
 
-**Location**: `kernel/fs/dac.rs`, `kernel/task/exec.rs`
+**Location**: `fs/dac.rs`, `task/exec.rs`
 
 Missing: fs.protected_hardlinks/symlinks/fifos/regular do not exist
 (behave as their kernel default 0); no
@@ -275,7 +275,7 @@ immutable/append-only inodes (no IS_APPEND/IS_IMMUTABLE EPERM).
 
 ## Spinlocks where Linux uses sleeping locks
 
-**Location**: `kernel/sync` (Mutex, RwSem), various
+**Location**: `sync` (Mutex, RwSem), various
 
 Linux rw_semaphores modeled as `spin` locks include the mount
 namespace/topology locks (namespace_sem, `Mount` RwLocks) and `s_umount`
@@ -284,7 +284,7 @@ one that does). `RwSem` has no `_interruptible` variants.
 
 ## Mount flag gaps
 
-**Location**: `kernel/fs/misc.rs` sys_mount/sys_umount2, `kernel/fs/mount.rs`
+**Location**: `fs/misc.rs` sys_mount/sys_umount2, `fs/mount.rs`
 
 Accepted without effect: atime flags (no atime updates), MS_SILENT,
 MS_MANDLOCK, MS_POSIXACL, MS_I_VERSION, MS_LAZYTIME, and
@@ -307,7 +307,7 @@ mounts, once they exist) would be told apart wrongly. Phase G
 
 ## Thread-group exit gaps
 
-**Location**: `kernel/signal/mod.rs` (group exit), `kernel/task/exec.rs`
+**Location**: `signal/mod.rs` (group exit), `task/exec.rs`
 de_thread
 
 - Process-directed signals go to one thread's private queue (the
@@ -317,8 +317,8 @@ de_thread
 
 ## ptrace stop gaps
 
-**Location**: `kernel/task/ptrace.rs`, `kernel/task/exec.rs`,
-`kernel/signal/mod.rs`
+**Location**: `task/ptrace.rs`, `task/exec.rs`,
+`signal/mod.rs`
 
 Signal-delivery and PTRACE_SYSCALL stops work. Missing: exec, fork,
 clone and exit event stops (PTRACE_O_TRACEEXEC and friends,
@@ -329,7 +329,7 @@ reported to a tracer that is not its parent.
 
 ## NETLINK_ROUTE / SIOC* subset gaps (P3)
 
-**Location**: `kernel/net/netlink/rtnetlink.rs`, `kernel/net/devioctl.rs`
+**Location**: `net/netlink/rtnetlink.rs`, `net/devioctl.rs`
 
 No notifications for neighbour state changes (no RTNLGRP_NEIGH); no
 proxy ARP entries, NTF_USE or NDA_PROTOCOL.
@@ -343,7 +343,7 @@ always infinite, promote_secondaries is off.
 
 ## io_uring has no shared rings
 
-**Location**: `kernel/io_uring.rs`
+**Location**: `io_uring.rs`
 
 io_uring_setup returns ring offsets, but nothing maps the SQ ring, the
 CQ ring or the SQE array (IORING_OFF_SQ_RING/CQ_RING/SQES), so user
@@ -393,7 +393,7 @@ or keep gate QEMUs off them (taskset) and see whether the crash stops.
 
 ## Interrupts run on the task stack (no IRQ stacks)
 
-**Location**: `kernel/arch/aarch64/vectors.S`, `kernel/arch/x86_64/`
+**Location**: `arch/aarch64/vectors.S`, `arch/x86_64/`
 (IRQ entry)
 
 An interrupt pushes its trap frame (0x320 bytes on arm64, with the
@@ -417,8 +417,8 @@ parallel). Next occurrence: capture the Message line.
 
 ## ramfs has no size limit
 
-**Location**: `kernel/fs/ramfs.rs`, `kernel/mm/filemap.rs`,
-`kernel/frame_alloc.rs`
+**Location**: `fs/ramfs.rs`, `mm/filemap.rs`,
+`frame_alloc.rs`
 
 ramfs (the root filesystem and every ramfs mount) is bounded only by
 memory, for every user: writes fail with ENOSPC once free frames reach
@@ -431,7 +431,7 @@ memory is at the low watermark (Linux maps the shared zero page).
 
 ## Kernel heap (slab) gaps
 
-**Location**: `kernel/mm/slab.rs`, `kernel/heap.rs`
+**Location**: `mm/slab.rs`, `heap.rs`
 
 The heap is the slab allocator over the page allocator, so it grows
 with RAM; what is missing: no shrinker (caches give back empty slabs
@@ -462,7 +462,7 @@ are listed here instead.
 
 ## The memory cgroup's memory.max is not enforced
 
-**Location**: `kernel/cgroup/memory.rs`, `kernel/mm/fault.rs`, `kernel/mm/shmem.rs`
+**Location**: `cgroup/memory.rs`, `mm/fault.rs`, `mm/shmem.rs`
 
 memory.max, memory.current and memory.events exist, but nothing calls
 `try_charge_memory`/`uncharge_memory`: page faults (anonymous and
@@ -479,7 +479,7 @@ instead of filling all of RAM and being skipped above 4GB
 
 ## BPF map memory is not charged
 
-**Location**: `kernel/bpf/map.rs`
+**Location**: `bpf/map.rs`
 
 An array map refuses a preallocation over half of free memory, but
 nothing adds maps up: no RLIMIT_MEMLOCK or memcg charge (Linux
@@ -488,7 +488,7 @@ up memory.
 
 ## Heap allocations in atomic context are not reported
 
-**Location**: `kernel/mm/slab.rs` (`heap_gfp`), `kernel/sync/lockdep.rs`
+**Location**: `mm/slab.rs` (`heap_gfp`), `sync/lockdep.rs`
 
 The heap picks GFP_ATOMIC by itself under a spin lock or with
 interrupts off, so an allocation there takes the atomic reserve
@@ -500,7 +500,7 @@ across net, fs, ipc) cannot be audited yet.
 
 ## Scheduler gaps (deviations from Linux)
 
-**Location**: `kernel/task/fair.rs`, `kernel/task/percpu.rs`
+**Location**: `task/fair.rs`, `task/percpu.rs`
 
 - EEVDF scans a list per pick and computes the average vruntime per use
   (Linux: an rbtree augmented with min_vruntime and incremental sums,
@@ -519,7 +519,7 @@ across net, fs, ipc) cannot be audited yet.
 
 ## xHCI driver gaps on real hardware
 
-**Location**: `kernel/usb/xhci.rs`, `kernel/usb/msc.rs`
+**Location**: `usb/xhci.rs`, `usb/msc.rs`
 
 Found while chasing the Dell OptiPlex 3020 freeze; QEMU's xHCI hides
 all of them.
@@ -550,8 +550,8 @@ all of them.
 
 ## No DMA for 32-bit devices with RAM above 4GB
 
-**Location**: `kernel/dma.rs`, `kernel/frame_alloc.rs`,
-`kernel/net/driver/e1000.rs`, `kernel/usb/xhci.rs`
+**Location**: `dma.rs`, `frame_alloc.rs`,
+`net/driver/e1000.rs`, `usb/xhci.rs`
 
 `DirectDmaOps` only checks the mask: a buffer or coherent frame above
 the device's mask fails (`None`) instead of being bounced (Linux
@@ -566,7 +566,7 @@ default to a 32-bit mask, so with RAM above 4GB:
 
 ## x86 has no IOAPIC or MSI
 
-**Location**: `kernel/arch/x86_64/irq.rs`, `kernel/bus/pci.rs`
+**Location**: `arch/x86_64/irq.rs`, `bus/pci.rs`
 
 Device interrupts reach the CPUs only through the 8259 PIC, on the
 line firmware wrote into each function's Interrupt Line register (PIC
@@ -577,7 +577,7 @@ and r8169 all support.
 
 ## ACPI power management gaps
 
-**Location**: `kernel/acpi/`, `kernel/arch/x86_64/{acpi,power}.rs`
+**Location**: `acpi/`, `arch/x86_64/{acpi,power}.rs`
 
 hk has no AML interpreter: `\_S5` is found by a byte scan of the DSDT
 and SSDTs for a plain `Name (_S5, Package ...)`: one returned by a
@@ -592,7 +592,7 @@ a reset register in PCI configuration space is ignored.
 
 ## vfat file I/O walks the whole cluster chain per page
 
-**Location**: `kernel/fs/vfat.rs` (`page_runs`)
+**Location**: `fs/vfat.rs` (`page_runs`)
 
 Every read_folio, writepage and swap_rw of a vfat file rebuilds its
 whole cluster chain from the FAT (through the device cache) to find a
@@ -603,8 +603,8 @@ fat_get_cluster keeps a per-inode cache of chain positions
 
 ## Block layer gaps (P1)
 
-**Location**: `kernel/storage/`, `kernel/virtio/blk.rs`,
-`kernel/fs/blkdev_ops.rs`, `kernel/fs/vfat.rs`
+**Location**: `storage/`, `virtio/blk.rs`,
+`fs/blkdev_ops.rs`, `fs/vfat.rs`
 
 - Partition tables are parsed in 512-byte sectors: on a disk with
   larger logical blocks, GPT LBAs and MBR sector counts are misread
@@ -691,45 +691,45 @@ Found by the review of the P0 series; each confirmed against the code
 expected to fix it; "next batch" means the next fix batch.
 
 1. **Rename leaves stale dentries; the trap is bypassed** (fix in
-   V1/V2, d_move). `kernel/fs/link.rs:593`: after a rename both
+   V1/V2, d_move). `fs/link.rs:593`: after a rename both
    dentries are only `remove_child`'d, so a dentry pinned by a cwd or
-   fd keeps its old parent chain; `is_subdir` (`kernel/fs/dentry.rs:287`)
-   / `lock_rename` (`kernel/fs/mod.rs:129`) compare with `Arc::ptr_eq`.
+   fd keeps its old parent chain; `is_subdir` (`fs/dentry.rs:287`)
+   / `lock_rename` (`fs/mod.rs:129`) compare with `Arc::ptr_eq`.
    Scenario: `mkdir -p /t/a/b; cd /t/a/b; mv /t/a /t/c; rename("/t/c",
    "z")` moves c under its own child (Linux: EINVAL). Fix: Linux d_move /
    d_exchange (dentry name under `d_lock`); vfat must then update the
    moved inode's `parent_cluster`/`short_name` (fs rename needs the
    source inode).
 7. **/proc/<pid>/* owner not refreshed on stat** (fix in V2).
-   `kernel/fs/procfs.rs:370`: the owner (task_dump_owner) is updated
+   `fs/procfs.rs:370`: the owner (task_dump_owner) is updated
    at lookup and in permission() only; Linux pid_revalidate updates it
    on every walk. Scenario: stat environ of a uid-1000 child, child
    sets `PR_SET_DUMPABLE 0`, stat again: hk still says uid 1000
    (Linux 0).
 8. **EXDEV compares superblocks, not mounts** (fix in V1)
-   (`kernel/fs/link.rs:298`, `:484`): a link or rename across two
+   (`fs/link.rs:298`, `:484`): a link or rename across two
    mounts of one superblock (bind mounts) is EXDEV on Linux. Needs
    Path{mnt,dentry}; TODO in place for linkat.
 
 ## P2 review findings (open)
 From the P2 /code-review (unverified). Tag = when to fix.
 1. **pcp_free drains the hot end** (next batch).
-   `kernel/mm/page_alloc.rs:458`: freed page pushed at head, drain
+   `mm/page_alloc.rs:458`: freed page pushed at head, drain
    pops from head; Linux returns the cold tail.
 2. **arm64 /reserved-memory no-map regions are linear-mapped**
-   (next batch; real HW). `kernel/arch/aarch64/dtb.rs:175`: Linux
+   (next batch; real HW). `arch/aarch64/dtb.rs:175`: Linux
    memblock_mark_nomap removes them (speculative access to secure
    carve-outs).
 
 ## P3 review findings (open)
 From the P3 /code-review (unverified). Tag = when to fix.
 1. **Remote write gives up after 16 COW tries** (next batch).
-   `kernel/mm/remote.rs:176`: spurious EFAULT; break COW and write
+   `mm/remote.rs:176`: spurious EFAULT; break COW and write
    under one PTE-lock hold, or loop until fatal_signal_pending.
 
 ## Fix batch 1 review findings (open)
 From the fix-batch-1 /code-review (unverified). Tag = when to fix.
-3. **memblock holds at most 128 ranges** (J). `kernel/mm/memblock.rs:18`:
+3. **memblock holds at most 128 ranges** (J). `mm/memblock.rs:18`:
    a firmware map with more RAM or reserved ranges panics at boot
    (asserts in add/remove/reserve); Linux grows the array
    (memblock_double_array).
@@ -738,24 +738,24 @@ From the fix-batch-1 /code-review (unverified). Tag = when to fix.
 From the P4 /code-review (unverified unless noted). Tag = when to fix.
 
 4. **LRU batch refs defeat exclusivity checks** (next batch).
-   `kernel/mm/fault.rs:477` / `:545`: refcount==1 tests fail while a
+   `mm/fault.rs:477` / `:545`: refcount==1 tests fail while a
    page sits in the per-CPU add batch → needless COW copies after
    swap-in. Linux drains and rechecks (wp_can_reuse_anon_folio).
 5. **alloc_slot linear scan under SwapInfo.map; two Vecs + sort per
-   reclaimed page** (P6). `kernel/mm/swap.rs:184`: cluster/free-hint
+   reclaimed page** (P6). `mm/swap.rs:184`: cluster/free-hint
    allocator, cached sorted device list.
 7. **One AnonVma per fork family, Vec chain** (J).
-   `kernel/mm/anon_vma.rs:85`: O(N×VMAs) under one family write lock.
+   `mm/anon_vma.rs:85`: O(N×VMAs) under one family write lock.
 
 ## T0 findings (open)
 Found during T0 (2026-10-19). Tag = when to fix.
 1. **Syscalls report root-namespace pids** (P9). Tasks get a number in
-   every level of their pid namespace chain (`kernel/task/pid.rs`), but
+   every level of their pid namespace chain (`task/pid.rs`), but
    getpid/gettid/kill/wait//proc use the root number; a CLONE_NEWPID
    child is not pid 1 in its namespace. Use `Pid::nr_in(caller's ns)`
    at the syscall boundary.
 6. **No ptrace exec stop** (P9): a traced task's execve does not stop
-   with SIGTRAP / PTRACE_EVENT_EXEC (`kernel/task/exec.rs`), so a
+   with SIGTRAP / PTRACE_EVENT_EXEC (`task/exec.rs`), so a
    tracer cannot observe a non-leader exec's tid change.
 8. **MM_LIFE_EXEC_CHAIN intermittent on arm64 CI** (next batch). One
    GitHub `check-arm` run (TCG, NIC=e1000) reported

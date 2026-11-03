@@ -249,7 +249,7 @@ fn leaf_attrs(flags: PageFlags) -> u64 {
 }
 
 // ============================================================================
-// User PTE helpers for the generic fault and fork paths (kernel/mm)
+// User PTE helpers for the generic fault and fork paths (mm)
 // ============================================================================
 
 /// AP[2]: read-only at every level

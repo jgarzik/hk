@@ -9,14 +9,14 @@ NUMA (Non-Uniform Memory Access) support for modern x86-64 and aarch64 hardware.
 ### Phase 1: NUMA Topology Discovery
 
 **Files:**
-- `kernel/numa.rs` - Core NUMA data structures
-- `kernel/arch/x86_64/acpi.rs` - SRAT/SLIT parsing
-- `kernel/arch/aarch64/dtb.rs` - Device tree numa-node-id extraction
-- `kernel/main.rs` - NUMA initialization during boot
+- `numa.rs` - Core NUMA data structures
+- `arch/x86_64/acpi.rs` - SRAT/SLIT parsing
+- `arch/aarch64/dtb.rs` - Device tree numa-node-id extraction
+- `main.rs` - NUMA initialization during boot
 
 **Structures:**
 ```rust
-// kernel/numa.rs
+// numa.rs
 pub struct NumaNode {
     pub node_id: u32,
     pub start_pfn: u64,
@@ -50,8 +50,8 @@ pub static NUMA_TOPOLOGY: IrqSpinlock<NumaTopology>;
 ### Phase 2: Syscalls Use Real Topology
 
 **Files:**
-- `kernel/task/schedsys.rs` - sys_getcpu
-- `kernel/mm/mempolicy.rs` - All mempolicy syscalls
+- `task/schedsys.rs` - sys_getcpu
+- `mm/mempolicy.rs` - All mempolicy syscalls
 
 **Changes:**
 - `sys_getcpu` returns real NUMA node from `NUMA_TOPOLOGY.lock().cpu_to_node(cpu)`
@@ -64,14 +64,14 @@ pub static NUMA_TOPOLOGY: IrqSpinlock<NumaTopology>;
 ### Phase 3: Per-Task and Per-VMA Policy Structures
 
 **Files:**
-- `kernel/mm/mempolicy.rs` - TaskMempolicy struct
-- `kernel/task/mod.rs` - mempolicy field in Task
-- `kernel/task/percpu.rs` - mempolicy inheritance on fork
-- `kernel/mm/vma.rs` - mempolicy field in Vma
+- `mm/mempolicy.rs` - TaskMempolicy struct
+- `task/mod.rs` - mempolicy field in Task
+- `task/percpu.rs` - mempolicy inheritance on fork
+- `mm/vma.rs` - mempolicy field in Vma
 
 **Structures:**
 ```rust
-// kernel/mm/mempolicy.rs
+// mm/mempolicy.rs
 pub struct TaskMempolicy {
     pub mode: i32,           // MPOL_DEFAULT, MPOL_BIND, etc.
     pub nodemask: u64,       // Allowed nodes bitmask
@@ -96,9 +96,9 @@ pub mempolicy: Option<TaskMempolicy>,  // Per-VMA policy from mbind
 
 **Required Changes:**
 
-1. **`kernel/mm/page_alloc.rs`** - Per-node zones. Today one buddy
+1. **`mm/page_alloc.rs`** - Per-node zones. Today one buddy
    zone (with per-CPU page lists) covers all RAM, behind the
-   `FrameAllocator` API in `kernel/frame_alloc.rs` (`alloc_gfp`,
+   `FrameAllocator` API in `frame_alloc.rs` (`alloc_gfp`,
    `alloc_pages`, ...). Split it into one zone per node (Linux
    pg_data_t), with per-CPU lists per zone, and add node-aware entry
    points:
@@ -119,16 +119,16 @@ pub mempolicy: Option<TaskMempolicy>,  // Per-VMA policy from mbind
    - `MPOL_BIND`: Only allocate from specified nodes (fail if exhausted)
    - `MPOL_INTERLEAVE`: Round-robin across specified nodes
 
-3. **`kernel/mm/fault.rs`** - Page fault handler integration
+3. **`mm/fault.rs`** - Page fault handler integration
    - Get current task's mempolicy or VMA policy
    - Pass policy to frame allocator
    - Use `NUMA_TOPOLOGY.lock().cpu_to_node(current_cpu)` for local allocation
 
-4. **`kernel/mm/syscall.rs`** - Policy-aware mmap/brk
+4. **`mm/syscall.rs`** - Policy-aware mmap/brk
    - Consider mempolicy when pre-allocating pages
 
 5. **Initialization:**
-   - `kernel/arch/*/mod.rs` - Initialize per-node regions from topology
+   - `arch/*/mod.rs` - Initialize per-node regions from topology
    - Use `NumaNode.start_pfn` / `end_pfn` to partition the memblock
      free ranges among the node zones
 
@@ -138,7 +138,7 @@ pub mempolicy: Option<TaskMempolicy>,  // Per-VMA policy from mbind
 
 **Required Changes:**
 
-1. **`kernel/mm/migrate.rs`** (NEW) - Page migration infrastructure
+1. **`mm/migrate.rs`** (NEW) - Page migration infrastructure
    ```rust
    pub fn migrate_page(
        mm: &MmStruct,
@@ -159,7 +159,7 @@ pub mempolicy: Option<TaskMempolicy>,  // Per-VMA policy from mbind
    ) -> Result<usize, KernelError>;
    ```
 
-2. **`kernel/mm/mempolicy.rs`** - Real implementation of:
+2. **`mm/mempolicy.rs`** - Real implementation of:
    - `sys_migrate_pages` - Find all pages for process, migrate between node sets
    - `sys_move_pages` - Migrate individual pages to specified nodes
    - Query mode (nodes=NULL) should return actual current node for each page
@@ -167,7 +167,7 @@ pub mempolicy: Option<TaskMempolicy>,  // Per-VMA policy from mbind
 3. **Page-to-Node Tracking:**
    - Need way to determine which NUMA node a physical page belongs to
    - Could use per-node zone pfn ranges for lookup
-   - Or record the node in struct page (`kernel/mm/page.rs`, e.g. in
+   - Or record the node in struct page (`mm/page.rs`, e.g. in
      `flags`, as Linux does)
 
 4. **Locking Considerations:**
@@ -203,14 +203,14 @@ For Phase 4-5 testing:
 ## Key Constants
 
 ```rust
-// kernel/numa.rs
+// numa.rs
 pub const MAX_NUMA_NODES: usize = 64;
 pub const NR_CPUS: usize = 256; // crate::cpumask::NR_CPUS
 pub const LOCAL_DISTANCE: u8 = 10;
 pub const REMOTE_DISTANCE: u8 = 20;
 pub const MAX_DISTANCE: u8 = 255;
 
-// kernel/mm/mempolicy.rs
+// mm/mempolicy.rs
 pub const MPOL_DEFAULT: i32 = 0;
 pub const MPOL_PREFERRED: i32 = 1;
 pub const MPOL_BIND: i32 = 2;

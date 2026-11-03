@@ -7,7 +7,7 @@
 //!
 //! Linux stores rlimits in `signal_struct`, which is per-process and shared by
 //! all threads in a thread group. We mirror this architecture by storing rlimits
-//! in `SignalStruct` (see kernel/signal/mod.rs), which is:
+//! in `SignalStruct` (see signal/mod.rs), which is:
 //! - Per-process (one per thread group)
 //! - Shared via `Arc` when CLONE_THREAD is used
 //! - Deep-cloned on fork (without CLONE_THREAD)

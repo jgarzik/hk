@@ -1,6 +1,7 @@
 #!/bin/bash
 #
-# unsafe use per kernel directory (doc/UNSAFE.md): unsafe blocks, unsafe
+# unsafe use per kernel source directory (the repo root's .rs tree;
+# doc/UNSAFE.md): unsafe blocks, unsafe
 # fns, unsafe impls, and how many blocks and impls have a `// SAFETY:`
 # comment within the three lines above them.
 #
@@ -8,11 +9,12 @@
 
 cd "$(dirname "$0")/.." || exit 1
 
-out=$(find kernel -name '*.rs' | sort | xargs awk '
+out=$(find . -name '*.rs' -not -path './user/*' -not -path './tools/*' -not -path './target/*' |
+    sort | xargs awk '
     FNR == 1 { p1 = p2 = p3 = "" }
     {
         d = FILENAME
-        sub(/^kernel\//, "", d)
+        sub(/^\.\//, "", d)
         if (d ~ /\//) {
             split(d, a, "/")
             d = a[1]
@@ -47,4 +49,5 @@ out=$(find kernel -name '*.rs' | sort | xargs awk '
 printf "%-16s %7s %7s %7s %9s\n" dir blocks fns impls SAFETY%
 grep -v '^TOTAL' <<< "$out" | sort -k2 -rn
 grep '^TOTAL' <<< "$out"
-printf "static mut: %d\n" "$(grep -rn --include=*.rs -E '^[^/]*\bstatic mut\b' kernel | wc -l)"
+printf "static mut: %d\n" "$(grep -rn --include=*.rs --exclude-dir=user --exclude-dir=tools \
+    --exclude-dir=target -E '^[^/]*\bstatic mut\b' . | wc -l)"
