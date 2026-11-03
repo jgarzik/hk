@@ -21,7 +21,6 @@ use crate::bus::bus::{BusContext, BusDevice, BusDriver};
 use crate::bus::driver::{Device, DriverError};
 use crate::bus::pci::PciDevice;
 use crate::delay::{poll_timeout, udelay};
-use crate::dma::{DmaDirection, dma_map_single, dma_unmap_single};
 use crate::downcast_bus_device;
 use crate::printkln;
 
@@ -1550,19 +1549,27 @@ impl XhciController {
             );
         }
 
-        // Map data buffer for DMA
-        // SAFETY: `data` is borrowed for this whole call, which waits for
-        // the transfer and unmaps below; except on a timeout, which
-        // leaves the TRB queued (BUGS.md, xHCI gaps)
-        let dma_addr = unsafe {
-            dma_map_single(
-                &self.pci_dev,
-                data.as_ptr(),
-                data.len(),
-                DmaDirection::ToDevice,
-            )
+        // The endpoint must exist before the device gets a buffer
+        let ring_ok = self
+            .device_states
+            .get(&slot_id)
+            .map(|s| s.transfer_rings.contains_key(&ep_dci));
+        match ring_ok {
+            None => return Err(UsbError::NoDevice),
+            Some(false) => return Err(UsbError::NoResources),
+            Some(true) => {}
         }
-        .ok_or(UsbError::NoResources)?;
+
+        // The transfer goes through a driver-owned DMA buffer, not the
+        // caller's: a timeout leaves the TRB queued, and the controller
+        // may still write it later (the buffer is then leaked, never
+        // reused; BUGS.md, xHCI gaps)
+        let bounce = crate::dma::dma_alloc_coherent(&self.pci_dev, data.len().max(1))
+            .ok_or(UsbError::NoResources)?;
+        let dma_addr = bounce.dma_addr();
+        // SAFETY: a fresh allocation of at least data.len() bytes, not
+        // yet given to the device
+        unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), bounce.cpu_addr(), data.len()) };
 
         if usb_trace() {
             printkln!("xHCI TRACE: bulk_out DMA addr=0x{:x}", dma_addr.as_u64());
@@ -1590,6 +1597,9 @@ impl XhciController {
         self.ring_doorbell(slot_id, ep_dci);
 
         // Wait for completion
+        // On a timeout the TRB is still queued and the controller may
+        // write `bounce` later: the early return leaks it (DmaCoherent
+        // frees only explicitly), never reused
         let (residue, cc) = self.wait_for_transfer(slot_id, ep_dci, timeout_us)?;
 
         // Advance transfer ring dequeue pointer to track completion
@@ -1599,8 +1609,8 @@ impl XhciController {
             ring.advance_dequeue();
         }
 
-        // Unmap DMA buffer
-        dma_unmap_single(&self.pci_dev, dma_addr, data.len(), DmaDirection::ToDevice);
+        // SAFETY: the transfer completed: the device is done with it
+        unsafe { crate::dma::dma_free_coherent(&self.pci_dev, bounce) };
 
         if cc != CompletionCode::SUCCESS && cc != CompletionCode::SHORT_PACKET {
             printkln!("xHCI: Bulk OUT failed with code {}", cc);
@@ -1635,19 +1645,24 @@ impl XhciController {
             );
         }
 
-        // Map data buffer for DMA
-        // SAFETY: `data` is borrowed for this whole call, which waits for
-        // the transfer and unmaps below; except on a timeout, which
-        // leaves the TRB queued (BUGS.md, xHCI gaps)
-        let dma_addr = unsafe {
-            dma_map_single(
-                &self.pci_dev,
-                data.as_ptr(),
-                data.len(),
-                DmaDirection::FromDevice,
-            )
+        // The endpoint must exist before the device gets a buffer
+        let ring_ok = self
+            .device_states
+            .get(&slot_id)
+            .map(|s| s.transfer_rings.contains_key(&ep_dci));
+        match ring_ok {
+            None => return Err(UsbError::NoDevice),
+            Some(false) => return Err(UsbError::NoResources),
+            Some(true) => {}
         }
-        .ok_or(UsbError::NoResources)?;
+
+        // The transfer goes through a driver-owned DMA buffer, not the
+        // caller's: a timeout leaves the TRB queued, and the controller
+        // may still write it later (the buffer is then leaked, never
+        // reused; BUGS.md, xHCI gaps)
+        let bounce = crate::dma::dma_alloc_coherent(&self.pci_dev, data.len().max(1))
+            .ok_or(UsbError::NoResources)?;
+        let dma_addr = bounce.dma_addr();
 
         if usb_trace() {
             printkln!("xHCI TRACE: bulk_in DMA addr=0x{:x}", dma_addr.as_u64());
@@ -1675,6 +1690,9 @@ impl XhciController {
         self.ring_doorbell(slot_id, ep_dci);
 
         // Wait for completion
+        // On a timeout the TRB is still queued and the controller may
+        // write `bounce` later: the early return leaks it (DmaCoherent
+        // frees only explicitly), never reused
         let (residue, cc) = self.wait_for_transfer(slot_id, ep_dci, timeout_us)?;
 
         // Advance transfer ring dequeue pointer to track completion
@@ -1688,20 +1706,20 @@ impl XhciController {
         // before CPU accesses the data
         fence(Ordering::Acquire);
 
-        // Unmap DMA buffer
-        dma_unmap_single(
-            &self.pci_dev,
-            dma_addr,
-            data.len(),
-            DmaDirection::FromDevice,
-        );
+        let transferred = data.len().saturating_sub(residue as usize);
+        // SAFETY: the transfer completed (the device is done writing the
+        // bounce buffer, ordered by the fence above); `transferred` fits
+        // both buffers
+        unsafe {
+            core::ptr::copy_nonoverlapping(bounce.cpu_addr(), data.as_mut_ptr(), transferred);
+            crate::dma::dma_free_coherent(&self.pci_dev, bounce);
+        }
 
         if cc != CompletionCode::SUCCESS && cc != CompletionCode::SHORT_PACKET {
             printkln!("xHCI: Bulk IN failed with code {}", cc);
             return Err(UsbError::TransferError(cc));
         }
 
-        let transferred = data.len() - residue as usize;
         Ok(transferred)
     }
 

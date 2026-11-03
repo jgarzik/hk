@@ -45,6 +45,14 @@ impl Link {
     pub fn is_linked(&self) -> bool {
         self.next.load(Relaxed) != UNLINKED
     }
+
+    /// Claim an unlinked link for an insert: false if it is on a list or
+    /// being inserted (two lists under different locks cannot both win)
+    fn claim(&self) -> bool {
+        self.next
+            .compare_exchange(UNLINKED, null_mut(), Relaxed, Relaxed)
+            .is_ok()
+    }
 }
 
 impl Default for Link {
@@ -304,15 +312,15 @@ impl<A: Adapter> ArcList<A> {
 
     /// Append `item`; panics if it is on a list through this link
     pub fn push_back(&mut self, item: Arc<A::Item>) {
-        assert!(!A::link(&item).is_linked(), "ArcList: item already linked");
-        // SAFETY: unlinked (checked), and live while the list owns this
-        // reference
+        assert!(A::link(&item).claim(), "ArcList: item already linked");
+        // SAFETY: unlinked and claimed for this insert (the CAS), and live
+        // while the list owns this reference
         unsafe { self.list.push_back(Arc::into_raw(item)) };
     }
 
     /// Prepend `item` (as `push_back`)
     pub fn push_front(&mut self, item: Arc<A::Item>) {
-        assert!(!A::link(&item).is_linked(), "ArcList: item already linked");
+        assert!(A::link(&item).claim(), "ArcList: item already linked");
         // SAFETY: as above
         unsafe { self.list.push_front(Arc::into_raw(item)) };
     }

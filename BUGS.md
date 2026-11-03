@@ -510,9 +510,9 @@ all of them.
   the next one (most likely on the USB serial console, whose transfers
   time out after 100 ms). A timeout should stop the endpoint and move
   its dequeue pointer past the TRB (Linux xhci_handle_cmd_stop_ep).
-  Until then a timed-out bulk transfer leaves its TRB queued with the
-  caller's buffer DMA-mapped: the controller may still write into
-  memory the caller has reused (`bulk_in`/`bulk_out`).
+  Until then a timed-out bulk transfer leaves its TRB queued; its
+  driver-owned bounce buffer is leaked so a late write lands nowhere
+  in use (`do_bulk_in`/`do_bulk_out`).
 - One controller only: the driver keeps a single global
   `USB_CONTROLLER`; a second xHCI's probe replaces the first, which is
   left running, and both device handles act on the survivor at
