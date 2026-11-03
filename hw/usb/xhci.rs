@@ -96,26 +96,10 @@ use super::{
 // Global USB Host Access
 // ============================================================================
 
-/// Recursion guard for USB output
-///
-/// When set, USB serial console will not attempt USB writes.
-/// This prevents deadlock when printkln! is called while holding USB_CONTROLLER lock,
-/// since USB serial console output would try to re-acquire the same lock.
-///
-/// This is the same pattern Linux uses - console drivers must be careful about
-/// what locks they acquire, and USB console uses deferred output to avoid
-/// holding USB locks during console writes.
-static USB_OUTPUT_ACTIVE: AtomicBool = AtomicBool::new(false);
-
 /// Check if USB tracing is enabled (uses generic USB stack flag)
 #[inline]
 fn usb_trace() -> bool {
     super::usb_trace_enabled()
-}
-
-/// Check if we're in a USB output operation (for console recursion prevention)
-pub fn is_usb_output_active() -> bool {
-    USB_OUTPUT_ACTIVE.load(Ordering::Acquire)
 }
 
 /// Global USB host controller for access from USB drivers (like MSC)
@@ -204,42 +188,10 @@ fn xhci_irq_handler_common() -> bool {
     true // We handled the interrupt
 }
 
-/// RAII guard that manages USB_OUTPUT_ACTIVE flag alongside the mutex guard
-struct UsbControllerGuard {
-    guard: crate::sync::spin::MutexGuard<'static, Option<XhciController>>,
-}
-
-impl core::ops::Deref for UsbControllerGuard {
-    type Target = Option<XhciController>;
-    fn deref(&self) -> &Self::Target {
-        &self.guard
-    }
-}
-
-impl core::ops::DerefMut for UsbControllerGuard {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.guard
-    }
-}
-
-impl Drop for UsbControllerGuard {
-    fn drop(&mut self) {
-        // Clear recursion guard when releasing the lock
-        USB_OUTPUT_ACTIVE.store(false, Ordering::Release);
-    }
-}
-
-/// Acquire the USB_CONTROLLER lock with recursion guard
-///
-/// Sets USB_OUTPUT_ACTIVE before acquiring the lock to prevent USB serial
-/// console from attempting USB writes while we hold the lock (which would deadlock).
-fn acquire_usb_controller() -> UsbControllerGuard {
-    // Set recursion guard BEFORE acquiring lock
-    // This ensures any printkln! during lock acquisition won't try USB output
-    USB_OUTPUT_ACTIVE.store(true, Ordering::Release);
-
-    let guard = USB_CONTROLLER.lock();
-    UsbControllerGuard { guard }
+/// The controller lock (a printk under it never reaches the USB console:
+/// that path only `try_lock`s, see `usb_console_out`)
+fn acquire_usb_controller() -> crate::sync::spin::MutexGuard<'static, Option<XhciController>> {
+    USB_CONTROLLER.lock()
 }
 
 /// Perform a bulk OUT transfer (host to device)
@@ -250,10 +202,12 @@ pub fn usb_bulk_out(slot_id: u8, endpoint: u8, data: &[u8]) -> Result<usize, Usb
 }
 
 /// A bulk OUT transfer for the USB serial console: a short timeout, so
-/// a stalled console device costs each printk little (the controller
-/// lock, a spin lock, is held throughout)
+/// a stalled console device costs each printk little. The controller
+/// lock is only tried: held (by this CPU, whose printk would otherwise
+/// deadlock, or another), the output is dropped (best effort, like the
+/// transfer itself)
 pub fn usb_console_out(slot_id: u8, endpoint: u8, data: &[u8]) -> Result<usize, UsbError> {
-    let mut guard = acquire_usb_controller();
+    let mut guard = USB_CONTROLLER.try_lock().ok_or(UsbError::NoResources)?;
     let controller = guard.as_mut().ok_or(UsbError::NoDevice)?;
     controller.do_bulk_out(slot_id, endpoint, data, XHCI_CONSOLE_US)
 }

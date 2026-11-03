@@ -2967,9 +2967,8 @@ context. `dma_alloc_coherent` allocates frames (thread context only).
 
 | Lock | Type | Purpose |
 |------|------|---------|
-| `USB_CONTROLLER` | `Mutex<Option<XhciController>>` | Global xHCI controller access |
+| `USB_CONTROLLER` | `Mutex<Option<XhciController>>` | Global xHCI controller access; the USB console's transfer only `try_lock`s it (busy, by this CPU's printk or another's: the output is dropped), so a printk under it never deadlocks |
 | `XHCI_IRQ_STATE.*` | `AtomicU64`, `AtomicBool` | ISR state (lock-free) |
-| `USB_OUTPUT_ACTIVE` | `AtomicBool` | Console recursion guard |
 | `PORT` (hw/usb/serial.rs) | spin `Mutex<Port>` | The USB serial console's device (slot, bulk OUT endpoint; none while no FTDI port is the console) and DMA buffer: the console write `try_lock`s it (busy: the output is dropped) and holds it across the bulk transfer, so it orders before `USB_CONTROLLER`; probe and remove take it alone (remove after `unregister_console` released `CONSOLE_REGISTRY`), and remove's clearing waits out a write in progress |
 
 DMA buffers never live on a kernel stack (stacks are not in the linear
@@ -3148,7 +3147,7 @@ not rely on either.
 | virtio-net `config_pending`; `VringCb` (RX avail NO_INTERRUPT flag) | atomics / lock-free MMIO-style store | IRQ + thread | the ISR suppresses RX interrupts and flags config changes; the poll re-enables under `rx` only while `netif_running`, and `stop` suppresses under `rx` |
 | virtio-PCI transport (`hw/virtio/pci.rs`) | none | probe and remove (under the virtio device's or the PCI function's `Device.lock`), then IRQ (ISR byte) | common config (status, features, queues, reset) written only under those device locks; device config reads are generation-checked and lock-free; queue notify writes happen under the caller's queue lock |
 | `VirtioDevice.irq` (driver interrupt callbacks) | `IrqSpinlock<Option<Arc<dyn VirtioIrq>>>` | thread (`request_irq`, `free_irq`) and hardirq (`vp_interrupt`, under `IRQ_TABLE`) | leaf: the ISR clones the callbacks out and calls them after unlocking; `free_irq` unregisters the handler (`IRQ_TABLE`) before clearing it, so the ISR never drops the last reference |
-| virtio and virtio-blk indexes (`util::ida::Ida`, Linux virtio_index_ida / vd_index_ida) | spin Mutex | thread only | leaf; the disk index is freed when the disk is (its last reference) |
+| `util::ida::Ida` allocators: virtio, virtio-blk and sd indexes (Linux virtio_index_ida, vd_index_ida, sd_index_ida) | `IrqSpinlock` | alloc thread only; free any context | leaf; nothing allocates under it (alloc grows the bitmap with it dropped); a disk index is freed when the disk's last reference drops |
 | `SYSTEM_TRANSITION` (`power.rs`) | sleeping `sync::Mutex<()>` | thread only (reboot(2)) | Linux system_transition_mutex: held from after the permission and magic checks through `device_shutdown` and the arch power-off/restart/halt, which do not return; outermost: taken before `core::DEVICES_LIST` and every driver lock the shutdown callbacks take |
 | x86 `power::POWER` (`arch/x86_64/power.rs`) | `spin::Once` | thread only (boot set; power-off/reboot read) | set once from the FADT before `reboot(2)` can run, read lock-free after; the ACPI register sequences (`hw/acpi/hw.rs`) take no locks |
 
@@ -3330,7 +3329,6 @@ else is taken under it) unless an order is given. "spin" is the
 | `VgaCon.state` | arch/x86_64/vgacon.rs | IrqSpinlock | VGA text console state, under `CONSOLE_REGISTRY` (3.9) |
 | `SimpleGfxDevice.state`, `GFX_DEVICES`, `NEXT_MINOR` | gfx/ | spin | framebuffer device state and registry |
 | `UsbMscDevice.state` | hw/usb/msc.rs | sleeping `sync::Mutex` (Linux us->dev_mutex), thread only | a mass-storage interface's CBW tag and disconnected flag, held across each BOT transaction (CBW, data, CSW: the transfers take `USB_CONTROLLER` under it); its unbind sets the flag under it, after the disk is gone and the command in progress is done |
-| `sd::SD_INDEX` | block/sd.rs | IrqSpinlock leaf (Linux sd_index_ida) | sdX indexes in use: allocated at a disk's scan, freed when the disk's last reference drops (any context) |
 | `INTX_MAP` | arch/aarch64/pci_irq.rs | spin Mutex | PCI INTx routing from the device tree (boot) |
 | `PCI_LOCK` | arch/x86_64/pci_conf.rs (port I/O config access) | IrqSpinlock | Linux pci_lock: the CF8 address write and the CFC data access of one config read/write; leaf (port I/O only). ECAM accesses are single MMIO operations and take no lock |
 | PCI fixups (`hw/pci/quirks.rs`) | none | thread only (boot) | run by bus enumeration (single-threaded) on each function before driver probe |

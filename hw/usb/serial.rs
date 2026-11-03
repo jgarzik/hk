@@ -114,13 +114,7 @@ impl ConsoleDriver for UsbSerialConsole {
     }
 
     fn write(&self, data: &[u8]) {
-        use crate::hw::usb::xhci::{is_usb_output_active, usb_console_out};
-
-        // Check recursion guard - if USB output is already active, skip to prevent deadlock
-        // This can happen when a printkln! inside USB code tries to write to USB serial
-        if is_usb_output_active() {
-            return;
-        }
+        use crate::hw::usb::xhci::usb_console_out;
 
         // Busy (another CPU, or a printk nested in this one): dropped,
         // the console is best-effort like the transfer itself

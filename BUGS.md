@@ -678,10 +678,9 @@ all of them.
   endpoints are skipped. A control data stage is one TRB of at most a
   page: a configuration descriptor longer than 4 KiB is cut short.
 - Only 4 KiB controller pages and up to 512 scratchpad buffers.
-- The console recursion guard `USB_OUTPUT_ACTIVE` is one global flag:
-  a CPU dropping `USB_CONTROLLER` clears it while another CPU, now
-  the holder, may printk under the lock (an xHCI error message); the
-  live FTDI console then spins on the lock its own CPU holds.
+- The USB serial console drops output while `USB_CONTROLLER` is held
+  (by any CPU): it only try-locks it; Linux queues console output in a
+  write FIFO sent asynchronously.
 
 ## USB core gaps
 
@@ -822,9 +821,6 @@ Linux's equivalent.
   forks overshoot it (Linux pids_can_fork charge-then-rollback). IPC
   shm_tot / used_sems are check-then-add without the ids lock and leak
   when alloc_id fails.
-- hw/usb `USB_OUTPUT_ACTIVE` is one global flag: another CPU can clear
-  it while this one holds USB_CONTROLLER, so a printk there spins on
-  its own lock.
 - Inode i_size uses Relaxed loads/stores (Linux release/acquire with
   i_size_write/read): an arm64 reader can see stale data past a
   racing extend; fallocate updates i_size without i_rwsem.

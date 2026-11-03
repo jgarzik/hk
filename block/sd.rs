@@ -22,8 +22,6 @@ use alloc::sync::Arc;
 
 use core::sync::atomic::{AtomicU8, Ordering};
 
-use crate::arch::IrqSpinlock;
-
 use super::blkdev::{
     Bio, BioOp, BlockDevice, BlockDriver, Disk, QueueLimits, RequestQueue, SECTOR_SHIFT, bio_endio,
     disk_bdevs, major, register_blkdev,
@@ -329,10 +327,9 @@ const SD_MINORS: u16 = 16;
 /// Disks on major 8 (its 256 minors)
 const SD_MAX: u32 = 16;
 
-/// Disk indexes in use, bit n for sd<n> (Linux sd_index_ida): an
-/// IrqSpinlock leaf, as the last reference to a disk, which frees its
-/// index, may drop in any context
-static SD_INDEX: IrqSpinlock<u32> = IrqSpinlock::new(0);
+/// Disk indexes in use (Linux sd_index_ida); an index is freed when the
+/// disk's last reference drops, in any context
+static SD_INDEX: crate::util::ida::Ida = crate::util::ida::Ida::new();
 
 /// A disk index (sda = 0), free again when dropped (Linux
 /// scsi_disk_release's ida_free): a removed disk's name is reused once
@@ -340,21 +337,21 @@ static SD_INDEX: IrqSpinlock<u32> = IrqSpinlock::new(0);
 struct SdIndex(u32);
 
 impl SdIndex {
-    /// The lowest free index (Linux ida_alloc)
+    /// The lowest free index (Linux ida_alloc); ENOSPC past major 8's
+    /// disks
     fn alloc() -> Result<Self, KernelError> {
-        let mut used = SD_INDEX.lock();
-        let i = (!*used).trailing_zeros();
+        let i = SD_INDEX.alloc();
         if i >= SD_MAX {
+            SD_INDEX.free(i);
             return Err(KernelError::NoSpace);
         }
-        *used |= 1 << i;
         Ok(Self(i))
     }
 }
 
 impl Drop for SdIndex {
     fn drop(&mut self) {
-        *SD_INDEX.lock() &= !(1 << self.0);
+        SD_INDEX.free(self.0);
     }
 }
 
