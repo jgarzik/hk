@@ -441,6 +441,26 @@ impl ArchBusOps for Aarch64Arch {
         serial::PL011_DRIVER.register();
         rtc::PL031_DRIVER.register();
     }
+
+    /// QEMU virt's high ECAM window (DT reg <0x40 0x10000000 ...>), 1 MB
+    /// for bus 0 (32 devices x 8 functions x 4 KB)
+    fn pci_config_init() {
+        use crate::arch::IoremapOps;
+        let ecam_phys = 0x40_1000_0000u64;
+        let ecam_size = 0x10_0000u64;
+        // SAFETY: QEMU virt's ECAM window, device memory
+        let ecam_virt = unsafe { Aarch64Arch::ioremap(ecam_phys, ecam_size) }
+            .expect("PCI: Failed to ioremap ECAM region");
+        // SAFETY: ecam_size bytes just mapped, never unmapped
+        unsafe {
+            crate::hw::pci::init_ecam(ecam_virt, ecam_size as usize);
+        }
+        crate::printkln!(
+            "PCI: Using ECAM config access at phys {:#x} -> virt {:p}",
+            ecam_phys,
+            ecam_virt
+        );
+    }
 }
 
 // ============================================================================

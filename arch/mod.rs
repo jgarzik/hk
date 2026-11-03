@@ -779,6 +779,10 @@ pub trait ArchBusOps {
     /// Register the platform devices and drivers (Linux: board files,
     /// DT platform population and the drivers' initcalls)
     fn platform_init();
+
+    /// Set up PCI configuration space access (Linux raw_pci_ops on x86,
+    /// the host bridge's ECAM window on arm64)
+    fn pci_config_init();
 }
 
 // ============================================================================

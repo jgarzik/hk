@@ -56,8 +56,8 @@ impl crate::fs::kernfs::Attr for NewId {
     }
 }
 
-/// remove_id (Linux usb_remove_id): every dynamic id of "idVendor
-/// idProduct" goes
+/// remove_id (Linux usb_remove_newid_store): the first dynamic id of
+/// "idVendor idProduct" goes
 struct RemoveId(&'static Driver);
 
 impl crate::fs::kernfs::Attr for RemoveId {
@@ -70,10 +70,15 @@ impl crate::fs::kernfs::Attr for RemoveId {
         if f.len() < 2 {
             return Err(KernelError::InvalidArgument);
         }
+        // The first such id (Linux usb_remove_newid_store)
         let (v, p) = (f[0] as u16, f[1] as u16);
-        DYNIDS
-            .lock()
-            .retain(|(n, id)| !(*n == self.0.name && id.id_vendor == v && id.id_product == p));
+        let mut ids = DYNIDS.lock();
+        if let Some(i) = ids
+            .iter()
+            .position(|(n, id)| *n == self.0.name && id.id_vendor == v && id.id_product == p)
+        {
+            ids.remove(i);
+        }
         Ok(data.len())
     }
 }

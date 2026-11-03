@@ -394,6 +394,12 @@ impl ArchBusOps for X86_64Arch {
         });
         crate::hw::serial::SERIAL8250_DRIVER.register();
     }
+
+    /// Configuration mechanism #1 (ports 0xCF8/0xCFC)
+    fn pci_config_init() {
+        crate::hw::pci::init_port_io();
+        crate::printkln!("PCI: Using port I/O config access");
+    }
 }
 
 // ============================================================================

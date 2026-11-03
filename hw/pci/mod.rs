@@ -919,37 +919,12 @@ impl PciDevice {
     }
 }
 
-/// Set up configuration access (port I/O on x86, QEMU virt's ECAM on
-/// arm64)
+/// Set up configuration access once (the arch's mechanism: port I/O on
+/// x86, ECAM on arm64)
 fn config_init() {
-    if is_initialized() {
-        return;
-    }
-    #[cfg(target_arch = "x86_64")]
-    {
-        init_port_io();
-        printkln!("PCI: Using port I/O config access");
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    {
-        use crate::arch::{CurrentArch, IoremapOps};
-        // ARM: Use ECAM with QEMU virt address (from DTB: reg = <0x40 0x10000000 ...>)
-        // ECAM needs 1MB for bus 0 (32 devices × 8 functions × 4KB)
-        let ecam_phys = 0x40_1000_0000u64; // QEMU virt high ECAM
-        let ecam_size = 0x10_0000u64; // 1MB for bus 0
-        // SAFETY: QEMU virt's ECAM window, device memory
-        let ecam_virt = unsafe { CurrentArch::ioremap(ecam_phys, ecam_size) }
-            .expect("PCI: Failed to ioremap ECAM region");
-        // SAFETY: ecam_size bytes just mapped, never unmapped
-        unsafe {
-            init_ecam(ecam_virt, ecam_size as usize);
-        }
-        printkln!(
-            "PCI: Using ECAM config access at phys {:#x} -> virt {:p}",
-            ecam_phys,
-            ecam_virt
-        );
+    if !is_initialized() {
+        use crate::arch::ArchBusOps;
+        crate::arch::CurrentArch::pci_config_init();
     }
 }
 
