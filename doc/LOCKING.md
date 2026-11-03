@@ -2970,14 +2970,13 @@ context. `dma_alloc_coherent` allocates frames (thread context only).
 | `USB_CONTROLLER` | `Mutex<Option<XhciController>>` | Global xHCI controller access |
 | `XHCI_IRQ_STATE.*` | `AtomicU64`, `AtomicBool` | ISR state (lock-free) |
 | `USB_OUTPUT_ACTIVE` | `AtomicBool` | Console recursion guard |
-| `USB_SERIAL_CONSOLE` (hw/usb/serial.rs) | `Mutex<Option<&'static UsbSerialConsole>>` | The registered console (leaked: printk may hold it): a leaf, released before `unregister_console` takes `CONSOLE_REGISTRY` |
-| `BOUNCE` (hw/usb/serial.rs) | `Mutex<[u8; 256]>` | USB serial console DMA buffer: `try_lock` only (a busy buffer drops the output), held across the bulk transfer, so it orders before `USB_CONTROLLER` |
+| `PORT` (hw/usb/serial.rs) | spin `Mutex<Port>` | The USB serial console's device (slot, bulk OUT endpoint; none while no FTDI port is the console) and DMA buffer: the console write `try_lock`s it (busy: the output is dropped) and holds it across the bulk transfer, so it orders before `USB_CONTROLLER`; probe and remove take it alone (remove after `unregister_console` released `CONSOLE_REGISTRY`), and remove's clearing waits out a write in progress |
 
 DMA buffers never live on a kernel stack (stacks are not in the linear
 map, `mm::vmstack`; `DirectDmaOps` panics on one): the mass-storage
 CBW/CSW and the INQUIRY/READ CAPACITY data are heap buffers, the
-console's output goes through `BOUNCE`; control transfers bounce
-through a coherent buffer of their own.
+console's output goes through `PORT`'s buffer; control transfers
+bounce through a coherent buffer of their own.
 
 Enumeration (descriptor reads, Evaluate Context, Configure Endpoint,
 SET_CONFIGURATION) runs in the xHCI probe on the controller it owns,
@@ -2988,6 +2987,18 @@ lock, then each port's device the same way, so device locks nest PCI
 function -> usb_device -> interface (parent before child, as Linux);
 interface drivers' probes (usb-storage's SCSI scan) take
 `USB_CONTROLLER` per transfer under them.
+
+Unbinding the xHCI runs the same nesting top-down (Linux
+usb_remove_hcd): under the PCI device's lock each USB device is
+deleted, the root hub last; its generic driver's release, under its
+lock, deletes the interfaces, whose drivers' removes run under the
+interface's lock (usb-storage: the disk's `open_mutex` for
+del_gendisk, then `UsbMscDevice.state`; ftdi_sio: `CONSOLE_REGISTRY`,
+then `PORT`). The controller is then taken out of `USB_CONTROLLER`
+(drivers' transfers fail with no device from there on) and stopped
+with no lock held: slots disabled, halted, reset, the IRQ handler
+unregistered (`IRQ_TABLE`, which waits out a running handler), memory
+freed.
 
 **ISR Pattern:** The xHCI ISR sets `interrupt_pending` atomic but does NOT acquire
 `USB_CONTROLLER` mutex. This avoids IRQ-context deadlock since the mutex is not
@@ -3318,7 +3329,8 @@ else is taken under it) unless an order is given. "spin" is the
 | `NTtyLdisc.data` | tty/n_tty.rs | spin Mutex | line discipline buffer (input is polled, not IRQ-fed) |
 | `VgaCon.state` | arch/x86_64/vgacon.rs | IrqSpinlock | VGA text console state, under `CONSOLE_REGISTRY` (3.9) |
 | `SimpleGfxDevice.state`, `GFX_DEVICES`, `NEXT_MINOR` | gfx/ | spin | framebuffer device state and registry |
-| `UsbMscDevice.state` | hw/usb/msc.rs | spin | USB mass-storage device state |
+| `UsbMscDevice.state` | hw/usb/msc.rs | sleeping `sync::Mutex` (Linux us->dev_mutex), thread only | a mass-storage interface's CBW tag and disconnected flag, held across each BOT transaction (CBW, data, CSW: the transfers take `USB_CONTROLLER` under it); its unbind sets the flag under it, after the disk is gone and the command in progress is done |
+| `sd::SD_INDEX` | block/sd.rs | IrqSpinlock leaf (Linux sd_index_ida) | sdX indexes in use: allocated at a disk's scan, freed when the disk's last reference drops (any context) |
 | `INTX_MAP` | arch/aarch64/pci_irq.rs | spin Mutex | PCI INTx routing from the device tree (boot) |
 | `PCI_LOCK` | arch/x86_64/pci_conf.rs (port I/O config access) | IrqSpinlock | Linux pci_lock: the CF8 address write and the CFC data access of one config read/write; leaf (port I/O only). ECAM accesses are single MMIO operations and take no lock |
 | PCI fixups (`hw/pci/quirks.rs`) | none | thread only (boot) | run by bus enumeration (single-threaded) on each function before driver probe |

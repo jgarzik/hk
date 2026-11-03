@@ -274,6 +274,16 @@ pub fn usb_register_devices(hcd: &Arc<Device>, devs: Vec<UsbDevice>) -> Vec<Arc<
     out
 }
 
+/// Unregister what `usb_register_devices` registered, the root hub's
+/// devices before it (Linux usb_disconnect, depth first: each device's
+/// interfaces go when its generic driver unbinds, Linux
+/// usb_disable_device, then the device)
+pub fn usb_unregister_devices(devs: &[Arc<Device>]) {
+    for d in devs {
+        d.del();
+    }
+}
+
 /// Each interface's current setting: alternate setting 0, else its
 /// first (Linux usb_set_configuration)
 pub(super) fn cur_altsettings(intfs: &[UsbInterface]) -> Vec<&UsbInterface> {

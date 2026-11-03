@@ -31,6 +31,7 @@ pub fn run_tests() {
     test_net();
     test_cpu();
     test_bus_usb();
+    test_unbind_usb();
     test_unbind_blk();
     test_unbind_net();
 }
@@ -1337,4 +1338,141 @@ fn unbind_rebind(
         return Err((b"eth0 not back", 0));
     }
     Ok(())
+}
+
+/// The first bound device of driver directory `drv` (a link, not
+/// `module`)
+fn bound_dev(drv: &[u8]) -> Option<([u8; 63], usize)> {
+    let devs = Names::of(drv, DT_LNK);
+    let d = (0..devs.n).map(|i| devs.get(i)).find(|d| *d != b"module")?;
+    let mut out = [0u8; 63];
+    out[..d.len()].copy_from_slice(d);
+    Some((out, d.len()))
+}
+
+/// Receive until an event whose header is `action` and ends in `tail`
+fn wait_event(fd: i32, action: &[u8], tail: &[u8]) -> bool {
+    let mut buf = [0u8; 2048];
+    for _ in 0..64 {
+        let (n, _) = recv_creds(fd, &mut buf);
+        if n <= 0 {
+            return false;
+        }
+        let head = vars(&buf[..n as usize]).next().unwrap_or(b"");
+        if head.starts_with(action) && head.ends_with(tail) {
+            return true;
+        }
+    }
+    false
+}
+
+/// The first sector of /dev/sda
+fn sda_sector() -> Option<[u8; 512]> {
+    let fd = sys_open(b"/dev/sda\0".as_ptr(), O_RDONLY, 0);
+    if fd < 0 {
+        return None;
+    }
+    let mut b = [0u8; 512];
+    let n = sys_read(fd as u64, b.as_mut_ptr(), 512);
+    sys_close(fd as u64);
+    (n == 512).then_some(b)
+}
+
+/// An event's action and the end of its path
+type Event = (&'static [u8], &'static [u8]);
+
+/// Unbind `dev` from driver directory `drv` (with its trailing /) and
+/// bind it back: sda must be gone after the `down` events, back after
+/// the `up` ones (`dev` stands for an empty tail: the device's own
+/// event), its first sector `sector` again
+fn usb_unbind_rebind(
+    fd: i32,
+    drv: &[u8],
+    dev: &[u8],
+    down: &[Event],
+    up: &[Event],
+    sector: &[u8; 512],
+) -> Result<(), (&'static [u8], i64)> {
+    let tail = |t: &'static [u8]| if t.is_empty() { dev } else { t };
+    let mut b = [0u8; 256];
+    if write_str(path(&mut b, &[drv, b"unbind"]), dev) != dev.len() as i64 {
+        return Err((b"unbind write", 0));
+    }
+    for (i, (a, t)) in down.iter().enumerate() {
+        if !wait_event(fd, a, tail(*t)) {
+            return Err((b"unbind event", i as i64));
+        }
+    }
+    let gone: [&[u8]; 3] = [b"/sys/block/sda\0", b"/sys/class/block/sda\0", b"/dev/sda\0"];
+    for (i, p) in gone.iter().enumerate() {
+        if stat(p).is_ok() {
+            return Err((b"disk still there", i as i64));
+        }
+    }
+    if stat(path(&mut b, &[drv, dev])).is_ok() {
+        return Err((b"driver link left", 0));
+    }
+    if write_str(path(&mut b, &[drv, b"bind"]), dev) != dev.len() as i64 {
+        return Err((b"bind write", 0));
+    }
+    for (i, (a, t)) in up.iter().enumerate() {
+        if !wait_event(fd, a, tail(*t)) {
+            return Err((b"bind event", i as i64));
+        }
+    }
+    if sda_sector().as_ref() != Some(sector) {
+        return Err((b"sda after bind", 0));
+    }
+    Ok(())
+}
+
+/// Driver unbind and rebind (hk): the usb-storage interface (its disk,
+/// sda, goes with del_gendisk semantics and comes back the same), then
+/// the xHCI (the whole USB tree goes and is enumerated again). The
+/// reference VM has no USB
+fn test_unbind_usb() {
+    const N: &[u8] = b"SYSFS_UNBIND_USB";
+    let Some((ib, il)) = bound_dev(b"/sys/bus/usb/drivers/usb-storage\0") else {
+        if host_mode() {
+            return skip(N, b"no USB storage on the reference VM");
+        }
+        return fail(N, b"no usb-storage interface", 0);
+    };
+    let Some((pb, pl)) = bound_dev(b"/sys/bus/pci/drivers/xhci_hcd\0") else {
+        return fail(N, b"no xhci_hcd device", 0);
+    };
+    let Some(sector) = sda_sector() else {
+        return fail(N, b"read sda", 0);
+    };
+    let Some(fd) = uevent_sock() else {
+        return fail(N, b"socket", 0);
+    };
+    let r = usb_unbind_rebind(
+        fd,
+        b"/sys/bus/usb/drivers/usb-storage/",
+        &ib[..il],
+        &[(b"remove@", b"/block/sda"), (b"unbind@", b"")],
+        &[(b"add@", b"/block/sda"), (b"bind@", b"")],
+        &sector,
+    )
+    .and_then(|()| {
+        usb_unbind_rebind(
+            fd,
+            b"/sys/bus/pci/drivers/xhci_hcd/",
+            &pb[..pl],
+            &[(b"remove@", b"/block/sda"), (b"remove@", b"/usb1"), (b"unbind@", b"")],
+            &[(b"add@", b"/usb1"), (b"add@", b"/block/sda"), (b"bind@", b"")],
+            &sector,
+        )
+        .map_err(|(why, v)| (why, v + 100))
+    })
+    .and_then(|()| match stat(b"/sys/bus/usb/devices/usb1\0") {
+        Ok(_) => Ok(()),
+        Err(e) => Err((&b"usb1 after bind"[..], e)),
+    });
+    sys_close(fd as u64);
+    match r {
+        Ok(()) => ok(N),
+        Err((why, v)) => fail(N, why, v),
+    }
 }

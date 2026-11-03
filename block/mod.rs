@@ -20,4 +20,4 @@ pub use blkdev::{
 };
 pub use ramdisk::{create_ramdisk, create_ramdisk_from_data};
 pub use scsi::{Cdb, DataDirection, ScsiCommand, ScsiError, ScsiHost, ScsiResult};
-pub use sd::{ScsiDisk, create_scsi_disk};
+pub use sd::{ScsiDisk, SdDisk, create_scsi_disk};

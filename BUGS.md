@@ -320,7 +320,11 @@ immutable/append-only inodes (no IS_APPEND/IS_IMMUTABLE EPERM).
   a session leader's exit, carrier loss), so open files stay usable.
   A leader's exit and TIOCNOTTY only send SIGHUP/SIGCONT to the
   foreground group and clear the session; vhangup(2) only checks
-  CAP_SYS_TTY_CONFIG.
+  CAP_SYS_TTY_CONFIG. Unbinding a serial port (serial8250, PL011)
+  removes its tty devices, console and interrupt but hangs up no open
+  file (Linux uart_remove_one_port: tty_port_tty_vhangup): writes to
+  an open ttyS0/ttyAMA0 or /dev/console still reach the UART. No boot
+  test unbinds the console UART (the test output goes there).
 - **Per-process controlling tty:** it is the session's tty, so TIOCNOTTY
   by a non-leader changes nothing (Linux clears that process's
   signal->tty only).
@@ -633,7 +637,7 @@ all of them.
 - One controller only: the driver keeps a single global
   `USB_CONTROLLER`; a second xHCI's probe replaces the first, which is
   left running, and both device handles act on the survivor at
-  shutdown.
+  shutdown (unbinding the first stops neither).
 - A timed-out bulk transfer returns early (`do_bulk_out`/`do_bulk_in`
   via `?`) without `dma_unmap` and with its TRB still queued; the
   buffer (heap, freed by the caller) can still be written by the

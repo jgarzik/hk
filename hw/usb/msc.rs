@@ -6,10 +6,10 @@
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 
-use crate::sync::spin::Mutex;
+use crate::sync::Mutex;
 use core::any::Any;
 
-use crate::block::{DataDirection, ScsiCommand, ScsiError, ScsiHost, ScsiResult};
+use crate::block::{DataDirection, ScsiCommand, ScsiError, ScsiHost, ScsiResult, SdDisk};
 use crate::printkln;
 use crate::util::error::KernelError;
 
@@ -123,10 +123,14 @@ mod csw_status {
     pub const PHASE_ERROR: u8 = 2;
 }
 
-/// USB Mass Storage device state (protected by Mutex)
+/// USB Mass Storage device state, held across each BOT transaction
+/// (Linux us->dev_mutex)
 struct UsbMscState {
     /// Current CBW tag (incremented for each command)
     tag: u32,
+    /// The driver was unbound: no more commands (Linux
+    /// US_FLIDX_DISCONNECTING)
+    gone: bool,
 }
 
 /// USB Mass Storage Device
@@ -135,7 +139,7 @@ struct UsbMscState {
 /// bulk endpoints were added to the controller when the configuration
 /// was set.
 pub struct UsbMscDevice {
-    /// Mutable state under lock
+    /// Serializes the transactions (a BOT command is CBW, data, CSW)
     state: Mutex<UsbMscState>,
     /// USB device slot ID
     slot_id: u8,
@@ -148,11 +152,20 @@ pub struct UsbMscDevice {
 impl UsbMscDevice {
     fn new(slot_id: u8, bulk_in_ep: u8, bulk_out_ep: u8) -> Self {
         Self {
-            state: Mutex::new(UsbMscState { tag: 1 }),
+            state: Mutex::new(UsbMscState {
+                tag: 1,
+                gone: false,
+            }),
             slot_id,
             bulk_in_ep,
             bulk_out_ep,
         }
+    }
+
+    /// No commands from now on; waits for the one in progress (Linux
+    /// quiesce_and_remove_host's US_FLIDX_DISCONNECTING under dev_mutex)
+    fn disconnect(&self) {
+        self.state.lock().gone = true;
     }
 
     /// Execute a BOT transaction
@@ -166,13 +179,14 @@ impl UsbMscDevice {
         // Get transfer parameters
         let data_len = data.as_ref().map(|d| d.len()).unwrap_or(0) as u32;
 
-        // Get next tag and increment
-        let tag = {
-            let mut state = self.state.lock();
-            let t = state.tag;
-            state.tag = state.tag.wrapping_add(1);
-            t
-        };
+        // The whole transaction under the lock: another command's CBW
+        // must not come between this one's phases
+        let mut state = self.state.lock();
+        if state.gone {
+            return Err(ScsiError::NoDevice);
+        }
+        let tag = state.tag;
+        state.tag = state.tag.wrapping_add(1);
 
         let slot_id = self.slot_id;
         let bulk_out = self.bulk_out_ep & 0x0F;
@@ -323,37 +337,31 @@ fn usb_storage_probe(
         bulk_out_ep
     );
     let msc_dev = Arc::new(UsbMscDevice::new(usb_dev.slot_id, bulk_in_ep, bulk_out_ep));
-    let _ = crate::block::create_scsi_disk(msc_dev.clone(), 0, 0);
-    Ok(Box::new(UsbMscDeviceHandle {
+    let disk = crate::block::create_scsi_disk(msc_dev.clone(), 0, 0).inspect_err(|e| {
+        printkln!("usb-storage {}: no disk: {:?}", dev.name(), e);
+    })?;
+    Ok(Box::new(UsbStorage {
         device: msc_dev,
-        slot: usb_dev.slot_id,
+        disk,
     }))
 }
 
-/// Device handle returned from probe
-///
-/// This wraps the UsbMscDevice and provides access to the ScsiHost implementation.
-pub struct UsbMscDeviceHandle {
+/// A bound mass-storage interface (Linux struct us_data): its
+/// transport and the disk scanned on it
+struct UsbStorage {
     device: Arc<UsbMscDevice>,
-    slot: u8,
+    disk: SdDisk,
 }
 
-impl UsbMscDeviceHandle {
-    /// Get the SCSI host interface for this device
-    pub fn scsi_host(&self) -> Arc<dyn ScsiHost> {
-        self.device.clone()
-    }
-}
-
-impl crate::base::Bound for UsbMscDeviceHandle {
+impl crate::base::Bound for UsbStorage {
     fn as_any(&self) -> &dyn Any {
         self
     }
 
-    /// Unregister its SCSI disk (minor = slot id)
+    /// Linux usb_stor_disconnect: the disk goes (scsi_remove_host),
+    /// then the transport stops, after the command in progress
     fn remove(&self) {
-        if let Err(e) = crate::block::sd::unregister_scsi_disk(self.slot as u16) {
-            printkln!("USB-MSC: Failed to unregister SCSI disk: {:?}", e);
-        }
+        self.disk.remove();
+        self.device.disconnect();
     }
 }

@@ -20,11 +20,13 @@
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 
-use core::sync::atomic::{AtomicU8, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU8, Ordering};
+
+use crate::arch::IrqSpinlock;
 
 use super::blkdev::{
-    Bio, BioOp, BlockDevice, BlockDriver, DevId, Disk, QueueLimits, RequestQueue, SECTOR_SHIFT,
-    bio_endio, disk_bdevs, get_blkdev, major, register_blkdev,
+    Bio, BioOp, BlockDevice, BlockDriver, Disk, QueueLimits, RequestQueue, SECTOR_SHIFT, bio_endio,
+    disk_bdevs, major, register_blkdev,
 };
 use super::genhd::{add_disk, del_gendisk, disk_name};
 
@@ -282,6 +284,8 @@ impl ScsiDisk {
 /// SCSI disk driver: the bio-based side of a [`ScsiDisk`]
 pub struct ScsiDiskDriver {
     disk: Arc<ScsiDisk>,
+    /// Its disk index, free again with the driver's last reference
+    _index: SdIndex,
 }
 
 impl ScsiDiskDriver {
@@ -322,21 +326,79 @@ impl BlockDriver for ScsiDiskDriver {
 /// Minors per disk: the disk and 15 partitions (Linux SD_MINORS)
 const SD_MINORS: u16 = 16;
 
-/// Next disk index (sda = 0)
-static SD_INDEX: AtomicU32 = AtomicU32::new(0);
+/// Disks on major 8 (its 256 minors)
+const SD_MAX: u32 = 16;
 
-/// Probe a SCSI target and add it as the next sdX disk
+/// Disk indexes in use, bit n for sd<n> (Linux sd_index_ida): an
+/// IrqSpinlock leaf, as the last reference to a disk, which frees its
+/// index, may drop in any context
+static SD_INDEX: IrqSpinlock<u32> = IrqSpinlock::new(0);
+
+/// A disk index (sda = 0), free again when dropped (Linux
+/// scsi_disk_release's ida_free): a removed disk's name is reused once
+/// nothing holds it open
+struct SdIndex(u32);
+
+impl SdIndex {
+    /// The lowest free index (Linux ida_alloc)
+    fn alloc() -> Result<Self, KernelError> {
+        let mut used = SD_INDEX.lock();
+        let i = (!*used).trailing_zeros();
+        if i >= SD_MAX {
+            return Err(KernelError::NoSpace);
+        }
+        *used |= 1 << i;
+        Ok(Self(i))
+    }
+}
+
+impl Drop for SdIndex {
+    fn drop(&mut self) {
+        *SD_INDEX.lock() &= !(1 << self.0);
+    }
+}
+
+/// A disk `create_scsi_disk` added (Linux struct scsi_disk): its whole
+/// block device and the SCSI device behind it
+pub struct SdDisk {
+    bdev: Arc<BlockDevice>,
+    sdev: Arc<ScsiDisk>,
+}
+
+impl SdDisk {
+    /// The whole-disk block device
+    pub fn bdev(&self) -> &Arc<BlockDevice> {
+        &self.bdev
+    }
+
+    /// Remove the disk (Linux __scsi_remove_device, sd_remove): no new
+    /// commands (SDEV_CANCEL), then the disk and its partitions go
+    /// (del_gendisk: sysfs, devtmpfs, cached pages; open files keep a
+    /// dead device), then SDEV_DEL
+    pub fn remove(&self) {
+        self.sdev.cancel();
+        let all = disk_bdevs(&self.bdev.disk);
+        let pages: u64 = all.iter().map(|b| b.bd_inode.i_data.nrpages()).sum();
+        del_gendisk(&self.bdev.disk);
+        self.sdev.mark_deleted();
+        crate::printkln!(
+            "SCSI: {} removed ({} cached pages freed)",
+            self.bdev.name,
+            pages
+        );
+    }
+}
+
+/// Probe a SCSI target and add it as the lowest free sdX disk
 pub fn create_scsi_disk(
     host: Arc<dyn ScsiHost>,
     target: u8,
     lun: u8,
-) -> Result<Arc<BlockDevice>, KernelError> {
+) -> Result<SdDisk, KernelError> {
     let scsi_disk =
         Arc::new(ScsiDisk::probe(host, target, lun).map_err(|_| KernelError::NotFound)?);
-    let index = SD_INDEX.fetch_add(1, Ordering::Relaxed);
-    if index >= 16 {
-        return Err(KernelError::NoSpace);
-    }
+    let index = SdIndex::alloc()?;
+    let i = index.0;
     register_blkdev(major::SCSI_DISK, "sd")?;
     let ss = scsi_disk.sector_size();
     let limits = QueueLimits {
@@ -347,14 +409,15 @@ pub fn create_scsi_disk(
     let q = RequestQueue::new_bio(
         Arc::new(ScsiDiskDriver {
             disk: scsi_disk.clone(),
+            _index: index,
         }),
         limits,
         true,
     );
-    let name = disk_name("sd", index);
+    let name = disk_name("sd", i);
     let disk = Disk::new(
         major::SCSI_DISK,
-        index as u16 * SD_MINORS,
+        i as u16 * SD_MINORS,
         SD_MINORS,
         name.clone(),
         scsi_disk.capacity_bytes() >> SECTOR_SHIFT,
@@ -367,20 +430,27 @@ pub fn create_scsi_disk(
         scsi_disk.capacity_bytes() / (1024 * 1024),
         ss
     );
-    Ok(bdev)
+    Ok(SdDisk {
+        bdev,
+        sdev: scsi_disk,
+    })
 }
 
-/// Remove SCSI disk `index` (sda = 0) on hot unplug: its block devices
-/// fail I/O from now on and its cached pages are dropped
-pub fn unregister_scsi_disk(index: u16) -> Result<(), KernelError> {
-    let dev = DevId::new(major::SCSI_DISK, index * SD_MINORS);
-    let bdev = get_blkdev(dev).ok_or(KernelError::NotFound)?;
-    // The disk and each partition: unregistered (open files see a dead
-    // device, never a new one: indexes and minors are not reused) and
-    // their cached pages dropped
-    let all = disk_bdevs(&bdev.disk);
-    let pages: u64 = all.iter().map(|b| b.bd_inode.i_data.nrpages()).sum();
-    del_gendisk(&bdev.disk);
-    crate::printkln!("SCSI: {} removed ({} cached pages freed)", bdev.name, pages);
-    Ok(())
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn index_reuse() {
+        let a = SdIndex::alloc().unwrap();
+        let b = SdIndex::alloc().unwrap();
+        assert_eq!((a.0, b.0), (0, 1));
+        drop(a);
+        let c = SdIndex::alloc().unwrap();
+        assert_eq!(c.0, 0);
+        let rest: alloc::vec::Vec<_> = (2..SD_MAX).map(|_| SdIndex::alloc().unwrap()).collect();
+        assert!(SdIndex::alloc().is_err());
+        drop(rest);
+        assert_eq!(SdIndex::alloc().unwrap().0, 2);
+    }
 }

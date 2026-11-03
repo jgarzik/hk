@@ -81,7 +81,9 @@ fn block_uevent(dev: &Device, env: &mut Vec<Vec<u8>>) {
     }
 }
 
-/// A text attribute of `dev` showing `f(bdev)`
+/// A text attribute of `dev` showing `f(bdev)`; it refers to the block
+/// device weakly (a removed one's node may outlive it in the dcache,
+/// as Linux's kernfs_node does its kobject)
 fn battr(
     dev: &Arc<Device>,
     dir: &Arc<KNode>,
@@ -89,10 +91,15 @@ fn battr(
     f: fn(&BlockDevice) -> String,
 ) -> Result<(), KernelError> {
     let b = dev.data_arc::<BlockDevice>().ok_or(KernelError::NoDevice)?;
+    let b = Arc::downgrade(&b);
     dir.create_file(
         name,
         0o444,
-        kernfs::show(move |o| o.bytes(f(&b).as_bytes())),
+        kernfs::show(move |o| {
+            if let Some(b) = b.upgrade() {
+                o.bytes(f(&b).as_bytes());
+            }
+        }),
     )?;
     Ok(())
 }

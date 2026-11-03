@@ -134,6 +134,8 @@ pub struct ConsoleRegistry {
     count: usize,
     /// Whether a flush is needed (new console registered)
     needs_flush: bool,
+    /// A console was ever registered (the early output path is over)
+    registered: bool,
 }
 
 impl ConsoleRegistry {
@@ -152,6 +154,7 @@ impl ConsoleRegistry {
             ],
             count: 0,
             needs_flush: false,
+            registered: false,
         }
     }
 
@@ -187,6 +190,7 @@ impl ConsoleRegistry {
             flags: flags | ConsoleFlags::ENABLED,
         };
         self.count += 1;
+        self.registered = true;
         self.needs_flush = true;
 
         // Sort by priority (highest first) - simple insertion sort
@@ -278,6 +282,11 @@ impl ConsoleRegistry {
                 console.flush();
             }
         }
+    }
+
+    /// No console was registered yet: output goes the early way
+    pub fn is_early(&self) -> bool {
+        !self.registered
     }
 
     /// Check if any consoles are registered
@@ -436,9 +445,10 @@ pub fn console_write(data: &[u8]) {
     let snapshot = {
         let registry = CONSOLE_REGISTRY.lock();
         if !registry.has_console() {
-            // No consoles - use fallback
+            // No console yet: the early UART (an earlycon, over once a
+            // console registers; with the last one removed, nothing)
             #[cfg(target_arch = "aarch64")]
-            {
+            if registry.is_early() {
                 if let Ok(s) = core::str::from_utf8(data) {
                     crate::arch::aarch64::serial::write_str(s);
                 } else {

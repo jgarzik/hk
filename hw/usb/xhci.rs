@@ -305,6 +305,7 @@ fn xhci_probe(
     let mut fa = crate::mm::frame_alloc::FrameAllocRef(&crate::FRAME_ALLOCATOR);
     if let Err(e) = controller.init_with_frame_alloc(&mut fa) {
         printkln!("xHCI: Failed to initialize controller: {:?}", e);
+        controller.stop();
         return Err(KernelError::Io);
     }
     let usb_devices = controller.enumerate_devices().unwrap_or_else(|e| {
@@ -314,17 +315,42 @@ fn xhci_probe(
     // Stored for global access (the USB drivers' transfers)
     store_usb_host(controller);
     let usb = super::usb_register_devices(dev, usb_devices);
-    Ok(Box::new(XhciDeviceHandle { _usb: usb }))
+    Ok(Box::new(XhciDeviceHandle {
+        usb,
+        bus_id: pci_dev.bus_id(),
+    }))
 }
 
-/// A bound xHCI: its USB devices
+/// A bound xHCI: its USB devices (the root hub last)
 struct XhciDeviceHandle {
-    _usb: Vec<alloc::sync::Arc<crate::base::Device>>,
+    usb: Vec<alloc::sync::Arc<crate::base::Device>>,
+    /// Its PCI function
+    bus_id: alloc::string::String,
 }
 
 impl crate::base::Bound for XhciDeviceHandle {
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    /// Linux xhci_pci_remove, usb_remove_hcd: the root hub disconnects
+    /// (its devices and their interfaces unbind and go, bottom-up),
+    /// then the controller is taken from the drivers' reach and
+    /// stopped: slots disabled, halted and reset, its IRQ freed, its
+    /// memory released
+    fn remove(&self) {
+        super::usbcore::usb_unregister_devices(&self.usb);
+        let hc = {
+            let mut g = acquire_usb_controller();
+            // Not a second xHCI's, which replaced this one (BUGS.md)
+            match g.as_ref() {
+                Some(c) if c.pci_dev.bus_id() == self.bus_id => g.take(),
+                _ => None,
+            }
+        };
+        if let Some(mut hc) = hc {
+            hc.stop();
+        }
     }
 
     /// Power-off/restart (Linux xhci_pci_shutdown)
@@ -581,7 +607,10 @@ impl EventRing {
         frame_alloc: &mut crate::mm::frame_alloc::FrameAllocRef<'_>,
     ) -> Option<Self> {
         let phys = frame_alloc.alloc_frame()?;
-        let erst_phys = frame_alloc.alloc_frame()?;
+        let Some(erst_phys) = frame_alloc.alloc_frame() else {
+            frame_alloc.free_frame(phys);
+            return None;
+        };
         Self::init_from_phys(phys, erst_phys)
     }
 
@@ -679,6 +708,10 @@ pub struct XhciController {
     device_states: BTreeMap<u8, DeviceState>,
     /// Assigned IRQ (if interrupt mode enabled)
     irq: Option<u32>,
+    /// Size of the register mapping at `mmio_base` (0: not mapped)
+    mmio_len: u64,
+    /// Scratchpad frames: the array, then its buffers
+    scratch: Vec<u64>,
 }
 
 impl XhciController {
@@ -704,6 +737,8 @@ impl XhciController {
             devices: Vec::new(),
             device_states: BTreeMap::new(),
             irq: None,
+            mmio_len: 0,
+            scratch: Vec::new(),
         }
     }
 
@@ -781,6 +816,7 @@ impl XhciController {
                 let virt_base = virt as u64;
                 self.mmio_base = virt_base;
                 self.cap_regs = virt_base;
+                self.mmio_len = bar_size;
             }
             Err(e) => {
                 printkln!("xHCI: Failed to ioremap MMIO region: {:?}", e);
@@ -888,9 +924,11 @@ impl XhciController {
             Some(phys)
         };
         let array = zeroed(frame_alloc).ok_or(UsbError::NoResources)?;
+        self.scratch.push(array);
         let entries = phys_to_virt(array) as *mut u64;
         for i in 0..n {
             let buf = zeroed(frame_alloc).ok_or(UsbError::NoResources)?;
+            self.scratch.push(buf);
             // SAFETY: entry i of the array frame (n <= 512)
             unsafe { write_volatile(entries.add(i as usize), buf) };
         }
@@ -2007,42 +2045,66 @@ impl XhciController {
         }
     }
 
-    /// Shutdown the entire xHCI controller (driver unload/hotplug)
-    ///
-    /// Stops all devices, halts the controller, and unregisters IRQ.
-    pub fn shutdown(&mut self) {
-        printkln!("xHCI: Shutting down controller");
-
-        // Stop all devices
-        let slot_ids: Vec<u8> = self.device_states.keys().copied().collect();
-        for slot_id in slot_ids {
-            let _ = self.remove_device(slot_id);
-        }
-
-        // Halt the controller
-        let _ = self.halt();
-
-        // Disable interrupts
-        if self.irq.is_some() {
-            // Disable USBCMD.INTE
-            let cmd = self.read_op(0x00);
-            self.write_op(0x00, cmd & !(1 << 2));
-
-            // Unregister IRQ handler
-            if let Err(e) = self.pci_dev.unregister_irq_handler() {
-                printkln!("xHCI: Failed to unregister IRQ: {}", e);
+    /// Release the controller, running or partly set up (Linux
+    /// usb_remove_hcd's xhci_stop, free_irq, then xhci_mem_cleanup,
+    /// iounmap and pci_disable_device): the devices' slots disabled
+    /// (Linux xhci_free_dev at each disconnect), halted with interrupts
+    /// off and reset, so it neither DMAs nor interrupts, its handler
+    /// unregistered (which waits out one running), then its memory freed
+    /// and bus mastering turned off
+    fn stop(&mut self) {
+        if self.initialized {
+            let slots: Vec<u8> = self.device_states.keys().copied().collect();
+            for slot in slots {
+                let _ = self.remove_device(slot);
             }
-
-            self.irq = None;
         }
-
-        // Clear global IRQ state
+        self.initialized = false;
+        if self.mmio_len != 0 {
+            let _ = self.halt();
+            let _ = self.reset_controller(XHCI_RESET_SHORT_US);
+        }
         XHCI_IRQ_STATE.enabled.store(false, Ordering::Release);
+        if self.irq.take().is_some()
+            && let Err(e) = self.pci_dev.unregister_irq_handler()
+        {
+            printkln!("xHCI: Failed to unregister IRQ: {}", e);
+        }
         XHCI_IRQ_STATE.op_regs.store(0, Ordering::Release);
         XHCI_IRQ_STATE.rt_regs.store(0, Ordering::Release);
+        self.mem_cleanup();
+        // PCI_COMMAND: bus mastering off (pci_disable_device)
+        let cmd = self.pci_dev.cfg_read16(0x04);
+        self.pci_dev
+            .cfg_write16(0x04, cmd & !crate::hw::pci::command::BUS_MASTER);
+        printkln!("xHCI: {} stopped", self.pci_dev.bus_id());
+    }
 
-        self.initialized = false;
-        printkln!("xHCI: Controller shutdown complete");
+    /// Free what the controller was given (Linux xhci_mem_cleanup): the
+    /// devices' contexts and rings (coherent DMA, freed on drop), the
+    /// command and event rings, scratchpads, DCBAA, register mapping
+    fn mem_cleanup(&mut self) {
+        self.devices.clear();
+        self.device_states.clear();
+        let mut fa = crate::mm::frame_alloc::FrameAllocRef(&crate::FRAME_ALLOCATOR);
+        if let Some(r) = self.cmd_ring.take() {
+            fa.free_frame(r.phys);
+        }
+        if let Some(r) = self.event_ring.take() {
+            fa.free_frame(r.phys);
+            fa.free_frame(r.erst_phys);
+        }
+        for f in self.scratch.drain(..) {
+            fa.free_frame(f);
+        }
+        if self.dcbaa_phys != 0 {
+            fa.free_frame(self.dcbaa_phys);
+            self.dcbaa_phys = 0;
+        }
+        if self.mmio_len != 0 {
+            CurrentArch::iounmap(self.mmio_base as *mut u8, self.mmio_len);
+            self.mmio_len = 0;
+        }
     }
 }
 
