@@ -2703,6 +2703,17 @@ reference to each task, Linux wake_q_add), drop it, then wake them
 (`WakeQ::wake_up` -> try_to_wake_up; no TASKLIST).
 ```
 
+Keys (`make_key`, Linux get_futex_key) are made before any bucket
+lock: a private futex is (mm, address), with no lock; a shared one
+takes the mmap_lock for reading to find its VMA (and, under it, the
+file's dentry `d_lock` for its inode) and drops it before locking a
+bucket: mmap_lock and bucket locks are never nested. A shared key in a
+shared mapping is the backing `Shmem` or inode, named by its `KeySeq`
+(Linux i_sequence: unique for the boot, assigned on first use from a
+global atomic counter, no lock), and its byte offset; in private
+memory it is (mm, address), apart from the private key. The exit path
+(robust list, CLEARTID) wakes with shared keys, before `exit_mm`.
+
 A `FutexQ` (Linux futex_q) is pinned on the waiter's stack and linked
 into its bucket. Its `lock_ptr` names the bucket it is on: set under
 that bucket's lock, moved by a requeue under both buckets' locks,

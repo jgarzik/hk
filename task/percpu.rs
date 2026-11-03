@@ -49,12 +49,12 @@ fn do_clear_child_tid(tid: Tid) {
 
         // Write 0 to the address
         if put_user::<Uaccess, i32>(addr, 0).is_ok() {
-            // Wake up to 1 waiter on this futex address
+            // Wake one waiter, shared (Linux mm_release)
             crate::task::futex::futex_wake(
                 addr,
                 1,
                 crate::task::futex::futex_op::FUTEX_BITSET_MATCH_ANY,
-                true, // private futex
+                false,
             );
         }
     }
@@ -2579,12 +2579,7 @@ pub fn exit_current(status: Option<i32>) -> ! {
         crate::signal::exit_task_signal(tid);
 
         // Clean up robust futex list for exiting task
-        // Get pid for futex key creation
-        let pid = {
-            let table = TASKLIST.read();
-            table.get(tid).map(|t| t.task.pid).unwrap_or(0)
-        };
-        crate::task::futex::exit_robust_list(tid, pid);
+        crate::task::futex::exit_robust_list(tid);
 
         // Handle CLONE_CHILD_CLEARTID: write 0 and wake futex waiters
         // This must be done before switching away since we need to be in

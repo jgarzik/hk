@@ -32,6 +32,8 @@ pub struct Shmem {
     size: u64,
     /// The pages by index
     root: Mutex<XArray>,
+    /// Identity for shared futex keys (Linux i_sequence)
+    pub(crate) seq: crate::task::futex::KeySeq,
 }
 
 /// A zeroed frame of user memory
@@ -48,6 +50,7 @@ impl Shmem {
         Arc::new(Self {
             size,
             root: Mutex::new(XArray::new()),
+            seq: crate::task::futex::KeySeq::new(),
         })
     }
 

@@ -1,0 +1,241 @@
+//! Futex keys (Linux get_futex_key): a shared futex is the backing
+//! object and offset, a private one the mm and address.
+//!
+//! - FUTEX_SHARED_ALIAS: one file page mapped at two addresses; a waiter
+//!   on the first is woken through the second.
+//! - FUTEX_SHARED_MOVED: a shared anonymous page mremap'd to another
+//!   address in a child; a wake at the parent's address finds it.
+//! - FUTEX_PRIVATE_SPLIT: after fork, the same address in private memory
+//!   is a different futex in each process.
+//! - FUTEX_CTID_SHARED: clear_child_tid wakes a shared (non-PRIVATE)
+//!   waiter on the tid word.
+
+use core::sync::atomic::{AtomicU32, Ordering};
+
+use super::fork_mm::spawn_thread;
+use super::helpers::{print, print_num, println};
+use hk_syscall::{
+    FUTEX_WAIT, FUTEX_WAKE, MAP_ANONYMOUS, MAP_PRIVATE, MAP_SHARED, MREMAP_FIXED, MREMAP_MAYMOVE,
+    O_CREAT, O_RDWR, PROT_READ, PROT_WRITE, Timespec, sys_close, sys_exit, sys_fork, sys_ftruncate,
+    sys_futex, sys_mmap, sys_mremap, sys_munmap, sys_nanosleep, sys_open, sys_unlink, sys_wait4,
+};
+
+const PAGE: u64 = 4096;
+const EAGAIN: i64 = -11;
+const ETIMEDOUT: i64 = -110;
+
+pub fn run_tests() {
+    shared_alias();
+    shared_moved();
+    private_split();
+    ctid_shared();
+}
+
+fn report(name: &[u8], ok: bool, got: i64) {
+    print(name);
+    if ok {
+        println(b":OK");
+    } else {
+        print(b":FAIL: got ");
+        print_num(got);
+        println(b"");
+    }
+}
+
+fn sleep_ms(ms: i64) {
+    let ts = Timespec {
+        tv_sec: ms / 1000,
+        tv_nsec: (ms % 1000) * 1_000_000,
+    };
+    sys_nanosleep(&ts, core::ptr::null_mut());
+}
+
+/// Shared FUTEX_WAIT on `w` while it is 0, for at most `ms`
+fn wait_shared(w: *mut u32, ms: i64) -> i64 {
+    let ts = Timespec {
+        tv_sec: ms / 1000,
+        tv_nsec: (ms % 1000) * 1_000_000,
+    };
+    sys_futex(w, FUTEX_WAIT, 0, &ts, core::ptr::null_mut(), 0)
+}
+
+/// Shared FUTEX_WAKE of one waiter on `w`, retried for up to 2 s while
+/// the waiter may not be asleep yet; the last result
+fn wake_shared(w: *mut u32) -> i64 {
+    let mut r = 0;
+    for _ in 0..200 {
+        r = sys_futex(w, FUTEX_WAKE, 1, core::ptr::null(), core::ptr::null_mut(), 0);
+        if r != 0 {
+            break;
+        }
+        sleep_ms(10);
+    }
+    r
+}
+
+fn map(len: u64, flags: u32, fd: i32) -> i64 {
+    sys_mmap(0, len, PROT_READ | PROT_WRITE, flags, fd, 0)
+}
+
+static ALIAS_RES: AtomicU32 = AtomicU32::new(u32::MAX);
+
+#[repr(C, align(16))]
+struct Stack([u8; 16384]);
+static mut STACK: Stack = Stack([0; 16384]);
+static mut CTID: u32 = 0;
+
+extern "C" fn alias_waiter(addr: u64) -> ! {
+    let r = wait_shared(addr as *mut u32, 3000);
+    ALIAS_RES.store(r as u32, Ordering::SeqCst);
+    sys_exit(0)
+}
+
+/// Wait (up to 3 s) for the helper thread to have exited
+fn join() -> bool {
+    for _ in 0..300 {
+        if unsafe { core::ptr::read_volatile(&raw const CTID) } == 0 {
+            return true;
+        }
+        sleep_ms(10);
+    }
+    false
+}
+
+fn spawn(f: extern "C" fn(u64) -> !, arg: u64) -> bool {
+    unsafe {
+        core::ptr::write_volatile(&raw mut CTID, 1);
+        let top = (&raw mut STACK as *mut u8).add(16384) as u64;
+        spawn_thread(top, f, arg, &raw mut CTID) > 0
+    }
+}
+
+fn shared_alias() {
+    const NAME: &[u8] = b"FUTEX_SHARED_ALIAS";
+    let path = b"/tmp/futex_alias\0";
+    let fd = sys_open(path.as_ptr(), O_CREAT | O_RDWR, 0o600);
+    if fd < 0 || sys_ftruncate(fd as i32, PAGE as i64) != 0 {
+        return report(NAME, false, fd);
+    }
+    let a = map(PAGE, MAP_SHARED, fd as i32);
+    let b = map(PAGE, MAP_SHARED, fd as i32);
+    sys_close(fd as u64);
+    sys_unlink(path.as_ptr());
+    if a < 0 || b < 0 || a == b {
+        return report(NAME, false, if a < 0 { a } else { b });
+    }
+    ALIAS_RES.store(u32::MAX, Ordering::SeqCst);
+    if !spawn(alias_waiter, a as u64) {
+        return report(NAME, false, -1);
+    }
+    let woke = wake_shared(b as *mut u32);
+    let joined = join();
+    let res = ALIAS_RES.load(Ordering::SeqCst) as i32 as i64;
+    sys_munmap(a as u64, PAGE);
+    sys_munmap(b as u64, PAGE);
+    report(NAME, woke == 1 && joined && res == 0, if woke != 1 { woke } else { res });
+}
+
+fn shared_moved() {
+    const NAME: &[u8] = b"FUTEX_SHARED_MOVED";
+    let w = map(PAGE, MAP_SHARED | MAP_ANONYMOUS, -1);
+    // Destination for the child's move, unmapped again (free range)
+    let dst = map(PAGE, MAP_PRIVATE | MAP_ANONYMOUS, -1);
+    if w < 0 || dst < 0 {
+        return report(NAME, false, if w < 0 { w } else { dst });
+    }
+    sys_munmap(dst as u64, PAGE);
+    let pid = sys_fork();
+    if pid == 0 {
+        let moved = sys_mremap(
+            w as u64,
+            PAGE,
+            PAGE,
+            MREMAP_MAYMOVE | MREMAP_FIXED,
+            dst as u64,
+        );
+        if moved != dst {
+            sys_exit(2)
+        }
+        let r = wait_shared(dst as *mut u32, 3000);
+        sys_exit(if r == 0 { 0 } else { 1 })
+    }
+    if pid < 0 {
+        return report(NAME, false, pid);
+    }
+    let woke = wake_shared(w as *mut u32);
+    let mut st = 0i32;
+    let waited = sys_wait4(pid, &mut st, 0, 0);
+    sys_munmap(w as u64, PAGE);
+    let code = (st >> 8) & 0xff;
+    report(
+        NAME,
+        woke == 1 && waited == pid && st & 0x7f == 0 && code == 0,
+        if woke != 1 { woke } else { code as i64 },
+    );
+}
+
+fn private_split() {
+    const NAME: &[u8] = b"FUTEX_PRIVATE_SPLIT";
+    let w = map(PAGE, MAP_PRIVATE | MAP_ANONYMOUS, -1);
+    if w < 0 {
+        return report(NAME, false, w);
+    }
+    let word = w as *mut u32;
+    // The child waits on its copy; a wake at the same address in the
+    // parent must not reach it (it times out)
+    let pid = sys_fork();
+    if pid == 0 {
+        let r = wait_shared(word, 500);
+        sys_exit(if r == ETIMEDOUT { 0 } else { 1 })
+    }
+    if pid < 0 {
+        return report(NAME, false, pid);
+    }
+    let mut woke = 0;
+    for _ in 0..20 {
+        woke = sys_futex(word, FUTEX_WAKE, 1, core::ptr::null(), core::ptr::null_mut(), 0);
+        if woke != 0 {
+            break;
+        }
+        sleep_ms(10);
+    }
+    let mut st = 0i32;
+    let waited = sys_wait4(pid, &mut st, 0, 0);
+    sys_munmap(w as u64, PAGE);
+    let code = (st >> 8) & 0xff;
+    report(
+        NAME,
+        woke == 0 && waited == pid && st & 0x7f == 0 && code == 0,
+        if woke != 0 { woke } else { code as i64 },
+    );
+}
+
+extern "C" fn ctid_sleeper(_: u64) -> ! {
+    sleep_ms(100);
+    sys_exit(0)
+}
+
+fn ctid_shared() {
+    const NAME: &[u8] = b"FUTEX_CTID_SHARED";
+    if !spawn(ctid_sleeper, 0) {
+        return report(NAME, false, -1);
+    }
+    // The tid word is non-zero until the thread exits; wait on it shared
+    let mut r = 0;
+    for _ in 0..10 {
+        let tid = unsafe { core::ptr::read_volatile(&raw const CTID) };
+        if tid == 0 {
+            break;
+        }
+        let ts = Timespec {
+            tv_sec: 2,
+            tv_nsec: 0,
+        };
+        r = sys_futex(&raw mut CTID, FUTEX_WAIT, tid, &ts, core::ptr::null_mut(), 0);
+        if r != EAGAIN {
+            break;
+        }
+    }
+    let cleared = unsafe { core::ptr::read_volatile(&raw const CTID) } == 0;
+    report(NAME, r != ETIMEDOUT && cleared, r);
+}
