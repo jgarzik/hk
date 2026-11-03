@@ -319,9 +319,34 @@ immutable/append-only inodes (no IS_APPEND/IS_IMMUTABLE EPERM).
   is written synchronously by polling (TIOCOUTQ 0, no write_wait).
 - **Serial ports:** ttyS1 is registered without probing COM2; only
   COM1 (and the PL011) take input.
-- **/dev/console** writes go to every console (Linux: only its tty).
+- **/dev/console** writes go to every console (Linux: only its tty),
+  through the console driver, which always turns NL into CR-NL: the
+  tty's OPOST/ONLCR are ignored (Linux: n_tty_write).
 - **Pid namespaces:** TIOCGPGRP/TIOCGSID return global numbers (Linux
   pid_vnr: the caller's namespace).
+
+## Futex gaps
+
+**Location:** `task/futex.rs`
+
+- **Robust owner death** updates the futex word with a plain read and
+  write: a FUTEX_WAITERS set by a waiter in between is lost. Linux
+  uses an atomic user-space cmpxchg (futex_atomic_cmpxchg_inatomic);
+  hk has no such uaccess primitive yet (it would also serve
+  FUTEX_WAKE_OP and PI futexes, both missing).
+- **MAP_PRIVATE file mappings:** a shared futex there is keyed by
+  (mm, address) from the VMA; Linux keys a page still in the page
+  cache (not yet COW'd) by inode and offset, so a MAP_SHARED mapping
+  of the same file wakes it.
+
+## FIONREAD on pipes is 0
+
+**Location:** `fs/misc.rs` (sys_ioctl)
+
+The generic FIONREAD arm answers every file except chardevs with 0,
+so a pipe or FIFO with data reports 0. Linux do_vfs_ioctl handles
+FIONREAD only for regular files and passes the rest to f_op->ioctl
+(pipe_ioctl returns the buffered bytes).
 
 ## Unaligned user pointers are EFAULT
 
