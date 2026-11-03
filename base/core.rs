@@ -94,6 +94,10 @@ pub struct DeviceInfo<'a> {
     /// Network namespace tag of its directory and class link (0: none;
     /// Linux kobject namespace of net devices)
     pub ns: u64,
+    /// The directory it goes in when it has no parent device (Linux
+    /// dev->kobj.parent set directly: a system subsystem's root below
+    /// /sys/devices/system)
+    pub dir: Option<Arc<KNode>>,
 }
 
 /// Creates a device's attribute files
@@ -112,6 +116,7 @@ impl DeviceInfo<'_> {
             data: None,
             attrs: None,
             ns: 0,
+            dir: None,
         }
     }
 }
@@ -132,6 +137,8 @@ pub struct Device {
     attrs: Option<AttrsFn>,
     /// Network namespace tag (0: none)
     pub ns: u64,
+    /// Explicit directory to go in (no parent device)
+    dir: Option<Arc<KNode>>,
     kobj: Once<Arc<KNode>>,
     /// Linux device_lock
     pub lock: Mutex<()>,
@@ -277,6 +284,9 @@ impl Device {
 
     /// Where the device's directory goes (Linux get_device_parent)
     fn parent_dir(&self) -> Result<Arc<KNode>, KernelError> {
+        if let Some(d) = &self.dir {
+            return Ok(d.clone());
+        }
         match (self.class, &self.parent) {
             (Some(c), None) => dir_in(virtual_dir(), c.name.as_bytes()),
             (Some(c), Some(p)) if p.class.is_none() => dir_in(p.kobj(), c.name.as_bytes()),
@@ -380,6 +390,7 @@ pub fn device_create(info: DeviceInfo) -> Result<Arc<Device>, KernelError> {
         data: info.data,
         attrs: info.attrs,
         ns: info.ns,
+        dir: info.dir,
         kobj: Once::new(),
         lock: Mutex::new(()),
         driver: RwLock::new(None),

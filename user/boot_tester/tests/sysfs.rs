@@ -29,6 +29,7 @@ pub fn run_tests() {
     test_bus_virtio();
     test_block();
     test_net();
+    test_cpu();
     test_bus_usb();
 }
 
@@ -908,6 +909,83 @@ fn test_net() {
     let code = (st >> 8) & 0xff;
     if st & 0x7f != 0 || code != 0 {
         return fail(N, b"netns child", code as i64);
+    }
+    ok(N);
+}
+
+/// Parse a range list ("0-3,5\n") into a 256-bit mask; None if malformed
+fn parse_list(b: &[u8]) -> Option<[u64; 4]> {
+    let b = b.strip_suffix(b"\n")?;
+    let mut m = [0u64; 4];
+    if b.is_empty() {
+        return Some(m);
+    }
+    for part in b.split(|&c| c == b',') {
+        let (lo, hi) = match part.iter().position(|&c| c == b'-') {
+            Some(i) => (&part[..i], &part[i + 1..]),
+            None => (part, part),
+        };
+        if lo.is_empty() || hi.is_empty() || !lo.iter().chain(hi).all(u8::is_ascii_digit) {
+            return None;
+        }
+        for c in num(lo)..=num(hi) {
+            if c >= 256 {
+                return None;
+            }
+            m[(c / 64) as usize] |= 1 << (c % 64);
+        }
+    }
+    Some(m)
+}
+
+fn list_of(p: &[u8]) -> Option<[u64; 4]> {
+    let mut b = [0u8; 512];
+    let n = read_file(p, &mut b);
+    if n < 0 {
+        return None;
+    }
+    parse_list(&b[..n as usize])
+}
+
+/// /sys/devices/system/cpu: online is the affinity set boot_tester runs
+/// with, inside possible; cpu0 is a cpu-bus device; node0 lists CPUs
+/// and links them
+fn test_cpu() {
+    const N: &[u8] = b"SYSFS_CPU";
+    let (Some(online), Some(possible)) = (
+        list_of(b"/sys/devices/system/cpu/online\0"),
+        list_of(b"/sys/devices/system/cpu/possible\0"),
+    ) else {
+        return fail(N, b"online/possible format", 0);
+    };
+    let mut aff = [0u64; 16];
+    let r = hk_syscall::sys_sched_getaffinity(0, 128, aff.as_mut_ptr());
+    if r <= 0 {
+        return fail(N, b"sched_getaffinity", r);
+    }
+    let aff_n: u32 = aff.iter().map(|w| w.count_ones()).sum();
+    let on_n: u32 = online.iter().map(|w| w.count_ones()).sum();
+    if on_n != aff_n || (0..4).any(|i| online[i] & !possible[i] != 0) {
+        return fail(N, b"online vs affinity/possible", on_n as i64);
+    }
+    match stat(b"/sys/devices/system/cpu/cpu0\0") {
+        Ok(st) if st.st_mode & S_IFMT == S_IFDIR => {}
+        _ => return fail(N, b"cpu0", 0),
+    }
+    if !link_is(b"/sys/bus/cpu/devices/cpu0\0", b"../../../devices/system/cpu/cpu0") {
+        return fail(N, b"bus link", 0);
+    }
+    let Some(nodes) = list_of(b"/sys/devices/system/node/online\0") else {
+        return fail(N, b"node online", 0);
+    };
+    if nodes[0] & 1 == 0 {
+        return fail(N, b"node0 offline", 0);
+    }
+    let Some(n0) = list_of(b"/sys/devices/system/node/node0/cpulist\0") else {
+        return fail(N, b"node0 cpulist", 0);
+    };
+    if n0[0] & 1 != 0 && stat(b"/sys/devices/system/node/node0/cpu0\0").is_err() {
+        return fail(N, b"node0/cpu0 link", 0);
     }
     ok(N);
 }

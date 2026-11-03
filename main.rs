@@ -442,6 +442,7 @@ fn kmain() -> ! {
     fs::devtmpfs::init();
     base::driver_init();
     ksysfs::init();
+    base::topology_init();
     net::sysfs::net_sysfs_init();
     chr_dev_init();
 
