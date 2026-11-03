@@ -45,7 +45,9 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use crate::fs::chardev::{CharDevice, DevId, DeviceError};
+use crate::fs::File;
+use crate::fs::chardev::{CharDevice, DevId};
+use crate::util::error::KernelError;
 
 /// DRM major device number (Linux convention)
 pub const GFX_MAJOR: u16 = 226;
@@ -79,18 +81,18 @@ pub enum GfxError {
     Fault,
 }
 
-impl From<GfxError> for DeviceError {
+/// The errno of each (Linux drm_ioctl and the mode-object lookups)
+impl From<GfxError> for KernelError {
     fn from(e: GfxError) -> Self {
         match e {
-            GfxError::InvalidArg => DeviceError::InvalidArg,
-            GfxError::NotFound => DeviceError::NotFound,
-            GfxError::NoMemory => DeviceError::IoError,
-            GfxError::NotSupported => DeviceError::NotSupported,
-            GfxError::Busy => DeviceError::IoError,
-            GfxError::PermissionDenied => DeviceError::IoError,
-            GfxError::InvalidIoctl => DeviceError::NotSupported,
-            GfxError::NoSuchObject => DeviceError::NotFound,
-            GfxError::Fault => DeviceError::Fault,
+            GfxError::InvalidArg => KernelError::InvalidArgument,
+            GfxError::NotFound | GfxError::NoSuchObject => KernelError::NotFound,
+            GfxError::NoMemory => KernelError::OutOfMemory,
+            GfxError::NotSupported => KernelError::OperationNotSupported,
+            GfxError::Busy => KernelError::Busy,
+            GfxError::PermissionDenied => KernelError::PermissionDenied,
+            GfxError::InvalidIoctl => KernelError::NotTty,
+            GfxError::Fault => KernelError::BadAddress,
         }
     }
 }
@@ -208,17 +210,17 @@ impl CharDevice for GfxCharDevice {
         true
     }
 
-    fn read(&self, _buf: &mut [u8]) -> Result<usize, DeviceError> {
+    fn read(&self, _file: &File, _buf: &mut [u8]) -> Result<usize, KernelError> {
         // DRM devices don't support read
-        Err(DeviceError::NotSupported)
+        Err(KernelError::OperationNotSupported)
     }
 
-    fn write(&self, _buf: &[u8]) -> Result<usize, DeviceError> {
+    fn write(&self, _file: &File, _buf: &[u8]) -> Result<usize, KernelError> {
         // DRM devices don't support write
-        Err(DeviceError::NotSupported)
+        Err(KernelError::OperationNotSupported)
     }
 
-    fn ioctl(&self, cmd: u32, arg: u64) -> Result<i64, DeviceError> {
+    fn ioctl(&self, _file: &File, cmd: u32, arg: u64) -> Result<i64, KernelError> {
         self.handle_ioctl(cmd, arg).map_err(|e| e.into())
     }
 }

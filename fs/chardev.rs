@@ -11,7 +11,10 @@
 //! Top:          console framework (kernel log + active console(s)).
 //! ```
 
+use crate::fs::File;
+use crate::io::poll::{POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM, PollTable};
 use crate::sync::spin::RwLock;
+use crate::util::error::KernelError;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 
@@ -114,50 +117,30 @@ impl DeviceType {
     }
 }
 
-/// Error type for device operations
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DeviceError {
-    /// Device not ready
-    NotReady,
-    /// Operation would block
-    WouldBlock,
-    /// Operation not supported
-    NotSupported,
-    /// I/O error
-    IoError,
-    /// Invalid argument
-    InvalidArg,
-    /// Device not found
-    NotFound,
-    /// No such ioctl
-    NotTty,
-    /// Bad user pointer (EFAULT)
-    Fault,
-    /// No space left (ENOSPC)
-    NoSpace,
-}
-
-/// Character device trait
+/// Character device trait (Linux file_operations of a cdev)
 ///
-/// Implementations provide read/write/ioctl operations for character devices.
-/// This is the lowest layer of the device model.
+/// Implementations provide the file operations of a character device;
+/// `CharDevFileOps` routes the VFS ones here. Errors are the errno the
+/// syscall returns.
 pub trait CharDevice: Send + Sync {
     /// Device name for identification
     fn name(&self) -> &str;
 
-    /// Open the device
-    fn open(&self, _flags: u32) -> Result<(), DeviceError> {
+    /// Open (Linux f_op->open): `file` carries the open flags and may
+    /// take per-open state in `file.private`
+    fn open(&self, _file: &File) -> Result<(), KernelError> {
         Ok(())
     }
 
-    /// Close the device
-    fn close(&self) {}
+    /// Last close of `file` (Linux f_op->release)
+    fn release(&self, _file: &File) {}
 
-    /// Read bytes from the device
-    fn read(&self, buf: &mut [u8]) -> Result<usize, DeviceError>;
+    /// Read bytes from the device (`file`'s O_NONBLOCK says whether it
+    /// may sleep)
+    fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, KernelError>;
 
     /// Write bytes to the device
-    fn write(&self, buf: &[u8]) -> Result<usize, DeviceError>;
+    fn write(&self, file: &File, buf: &[u8]) -> Result<usize, KernelError>;
 
     /// The device can be mapped (Linux: its fops have mmap)
     fn mmap_ok(&self) -> bool {
@@ -165,24 +148,20 @@ pub trait CharDevice: Send + Sync {
     }
 
     /// Device-specific control operations
-    fn ioctl(&self, _cmd: u32, _arg: u64) -> Result<i64, DeviceError> {
-        Err(DeviceError::NotTty)
+    fn ioctl(&self, _file: &File, _cmd: u32, _arg: u64) -> Result<i64, KernelError> {
+        Err(KernelError::NotTty)
     }
 
     /// File operations of its own (Linux chrdev_open installs the
-    /// cdev's fops): None uses the generic ones over read/write above
+    /// cdev's fops): None uses the generic ones over the methods here
     fn fops(&self) -> Option<&'static dyn crate::fs::FileOps> {
         None
     }
 
-    /// Check if data is available for reading (non-blocking)
-    fn poll_read(&self) -> bool {
-        true // Default: always ready
-    }
-
-    /// Check if device is ready for writing (non-blocking)
-    fn poll_write(&self) -> bool {
-        true // Default: always ready
+    /// Ready events (Linux f_op->poll): register on the device's wait
+    /// queues through `pt`, then return the mask. Default: always ready
+    fn poll(&self, _file: &File, _pt: Option<&mut PollTable>) -> u16 {
+        POLLIN | POLLRDNORM | POLLOUT | POLLWRNORM
     }
 }
 
@@ -202,9 +181,9 @@ impl CharDeviceRegistry {
     }
 
     /// Register a character device
-    pub fn register(&mut self, id: DevId, device: Arc<dyn CharDevice>) -> Result<(), DeviceError> {
+    pub fn register(&mut self, id: DevId, device: Arc<dyn CharDevice>) -> Result<(), KernelError> {
         if self.devices.contains_key(&id) {
-            return Err(DeviceError::InvalidArg);
+            return Err(KernelError::InvalidArgument);
         }
         self.devices.insert(id, device);
         Ok(())
@@ -246,7 +225,7 @@ impl Default for CharDeviceRegistry {
 pub static CHARDEV_REGISTRY: RwLock<CharDeviceRegistry> = RwLock::new(CharDeviceRegistry::new());
 
 /// Register a character device globally
-pub fn register_chardev(id: DevId, device: Arc<dyn CharDevice>) -> Result<(), DeviceError> {
+pub fn register_chardev(id: DevId, device: Arc<dyn CharDevice>) -> Result<(), KernelError> {
     CHARDEV_REGISTRY.write().register(id, device)
 }
 
@@ -268,11 +247,11 @@ impl CharDevice for NullCharDevice {
         "null"
     }
 
-    fn read(&self, _buf: &mut [u8]) -> Result<usize, DeviceError> {
+    fn read(&self, _file: &File, _buf: &mut [u8]) -> Result<usize, KernelError> {
         Ok(0) // EOF
     }
 
-    fn write(&self, buf: &[u8]) -> Result<usize, DeviceError> {
+    fn write(&self, _file: &File, buf: &[u8]) -> Result<usize, KernelError> {
         Ok(buf.len()) // Discard
     }
 }
@@ -290,12 +269,12 @@ impl CharDevice for ZeroCharDevice {
         true
     }
 
-    fn read(&self, buf: &mut [u8]) -> Result<usize, DeviceError> {
+    fn read(&self, _file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {
         buf.fill(0);
         Ok(buf.len())
     }
 
-    fn write(&self, buf: &[u8]) -> Result<usize, DeviceError> {
+    fn write(&self, _file: &File, buf: &[u8]) -> Result<usize, KernelError> {
         Ok(buf.len()) // Discard
     }
 }
@@ -309,13 +288,13 @@ impl CharDevice for FullCharDevice {
         "full"
     }
 
-    fn read(&self, buf: &mut [u8]) -> Result<usize, DeviceError> {
+    fn read(&self, _file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {
         buf.fill(0);
         Ok(buf.len())
     }
 
-    fn write(&self, _buf: &[u8]) -> Result<usize, DeviceError> {
-        Err(DeviceError::NoSpace)
+    fn write(&self, _file: &File, _buf: &[u8]) -> Result<usize, KernelError> {
+        Err(KernelError::NoSpace)
     }
 }
 
@@ -329,7 +308,7 @@ impl CharDevice for RandomCharDevice {
         self.0
     }
 
-    fn read(&self, buf: &mut [u8]) -> Result<usize, DeviceError> {
+    fn read(&self, _file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {
         let n = crate::random::stream(buf.len(), |off, b| {
             buf[off..off + b.len()].copy_from_slice(b);
             true
@@ -337,7 +316,7 @@ impl CharDevice for RandomCharDevice {
         Ok(n)
     }
 
-    fn write(&self, buf: &[u8]) -> Result<usize, DeviceError> {
+    fn write(&self, _file: &File, buf: &[u8]) -> Result<usize, KernelError> {
         crate::random::add_device_randomness(buf);
         Ok(buf.len())
     }

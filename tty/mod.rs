@@ -37,7 +37,10 @@ pub mod tty_dev;
 use crate::sync::spin::Mutex;
 
 use crate::console::ConsoleDriver;
-use crate::fs::chardev::{CharDevice, DeviceError};
+use crate::fs::File;
+use crate::fs::chardev::CharDevice;
+use crate::io::poll::{POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM, PollTable};
+use crate::util::error::KernelError;
 
 // Re-export commonly used types
 pub use termios::{
@@ -106,10 +109,10 @@ pub trait TtyDriver: Send + Sync {
     fn name(&self) -> &str;
 
     /// Write bytes to hardware
-    fn write(&self, data: &[u8]) -> Result<usize, DeviceError>;
+    fn write(&self, data: &[u8]) -> Result<usize, KernelError>;
 
     /// Read bytes from hardware (non-blocking)
-    fn read(&self, buf: &mut [u8]) -> Result<usize, DeviceError>;
+    fn read(&self, buf: &mut [u8]) -> Result<usize, KernelError>;
 
     /// Check if data is available to read
     fn poll_read(&self) -> bool {
@@ -117,7 +120,7 @@ pub trait TtyDriver: Send + Sync {
     }
 
     /// Initialize the hardware
-    fn init(&self) -> Result<(), DeviceError> {
+    fn init(&self) -> Result<(), KernelError> {
         Ok(())
     }
 
@@ -133,7 +136,7 @@ pub trait LineDiscipline: Send + Sync {
     fn receive_char(&self, tty: &Tty, ch: u8);
 
     /// Process output from user write
-    fn write(&self, tty: &Tty, buf: &[u8]) -> Result<usize, DeviceError>;
+    fn write(&self, tty: &Tty, buf: &[u8]) -> Result<usize, KernelError>;
 }
 
 /// Raw line discipline - minimal processing
@@ -154,7 +157,7 @@ impl LineDiscipline for RawLineDiscipline {
         }
     }
 
-    fn write(&self, tty: &Tty, buf: &[u8]) -> Result<usize, DeviceError> {
+    fn write(&self, tty: &Tty, buf: &[u8]) -> Result<usize, KernelError> {
         let termios = tty.termios.lock();
         let opost = termios.c_oflag & OPOST != 0;
         let onlcr = termios.c_oflag & ONLCR != 0;
@@ -299,7 +302,7 @@ impl Tty {
     }
 
     /// Write directly to driver (bypassing line discipline)
-    pub fn driver_write(&self, data: &[u8]) -> Result<usize, DeviceError> {
+    pub fn driver_write(&self, data: &[u8]) -> Result<usize, KernelError> {
         self.driver.write(data)
     }
 
@@ -387,7 +390,7 @@ impl CharDevice for Tty {
         self.name
     }
 
-    fn read(&self, buf: &mut [u8]) -> Result<usize, DeviceError> {
+    fn read(&self, _file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {
         let mut input = self.input.lock();
         let mut count = 0;
 
@@ -402,22 +405,26 @@ impl CharDevice for Tty {
 
         if count == 0 && !self.driver.poll_read() {
             // No data available
-            return Err(DeviceError::WouldBlock);
+            return Err(KernelError::WouldBlock);
         }
 
         Ok(count)
     }
 
-    fn write(&self, buf: &[u8]) -> Result<usize, DeviceError> {
+    fn write(&self, _file: &File, buf: &[u8]) -> Result<usize, KernelError> {
         self.ldisc.write(self, buf)
     }
 
-    fn ioctl(&self, cmd: u32, arg: u64) -> Result<i64, DeviceError> {
+    fn ioctl(&self, _file: &File, cmd: u32, arg: u64) -> Result<i64, KernelError> {
         ioctl::tty_ioctl(self, cmd, arg)
     }
 
-    fn poll_read(&self) -> bool {
-        !self.input.lock().is_empty() || self.driver.poll_read()
+    fn poll(&self, _file: &File, _pt: Option<&mut PollTable>) -> u16 {
+        let mut mask = POLLOUT | POLLWRNORM;
+        if !self.input.lock().is_empty() || self.driver.poll_read() {
+            mask |= POLLIN | POLLRDNORM;
+        }
+        mask
     }
 }
 

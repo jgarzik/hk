@@ -432,8 +432,14 @@ pub fn sys_ioctl(fd: i32, cmd: u32, arg: u64) -> i64 {
             current_fd_table().lock().set_fd_flags(fd, 0);
             return 0;
         }
-        FIONREAD if file.get_inode().is_some_and(|i| i.mode().is_socket()) => {
-            // Sockets answer FIONREAD/SIOCINQ themselves
+        FIONREAD
+            if file
+                .get_inode()
+                .is_some_and(|i| i.mode().is_socket() || i.mode().is_chrdev()) =>
+        {
+            // Sockets (FIONREAD/SIOCINQ) and devices (ttys: TIOCINQ)
+            // answer it themselves (Linux: only regular files are
+            // do_vfs_ioctl's)
             return match file.f_op.ioctl(&file, cmd, arg) {
                 Ok(v) => v,
                 Err(e) => e.sysret(),
@@ -455,43 +461,11 @@ pub fn sys_ioctl(fd: i32, cmd: u32, arg: u64) -> i64 {
         _ => {} // Fall through to device-specific handling
     }
 
-    // Get the inode to check file type
-    let inode = match file.get_inode() {
-        Some(i) => i,
-        None => return KernelError::BadFd.sysret(),
-    };
-
-    // Block devices answer through their file (Linux blkdev_ioctl)
-    if inode.mode().is_blkdev() {
-        match file.ops().ioctl(&file, cmd, arg) {
-            Ok(v) => v,
-            Err(e) => e.sysret(),
-        }
-    } else if inode.mode().is_chrdev() {
-        // Character device ioctls - route to CharDevice::ioctl()
-        use crate::fs::chardev::get_chardev;
-
-        let device = match get_chardev(inode.rdev) {
-            Some(d) => d,
-            None => return KernelError::NoDeviceOrAddress.sysret(),
-        };
-
-        match device.ioctl(cmd, arg) {
-            Ok(result) => result,
-            Err(crate::fs::chardev::DeviceError::NotTty) => KernelError::NotTty.sysret(),
-            Err(crate::fs::chardev::DeviceError::InvalidArg) => {
-                KernelError::InvalidArgument.sysret()
-            }
-            Err(crate::fs::chardev::DeviceError::NotSupported) => KernelError::NotTty.sysret(),
-            Err(crate::fs::chardev::DeviceError::Fault) => KernelError::BadAddress.sysret(),
-            Err(_) => KernelError::Io.sysret(),
-        }
-    } else {
-        // Other files (sockets, ...): the file's own ioctl
-        match file.ops().ioctl(&file, cmd, arg) {
-            Ok(v) => v,
-            Err(e) => e.sysret(),
-        }
+    // Everything else is the file's own (Linux vfs_ioctl ->
+    // f_op->unlocked_ioctl): devices, sockets, ...
+    match file.ops().ioctl(&file, cmd, arg) {
+        Ok(v) => v,
+        Err(e) => e.sysret(),
     }
 }
 

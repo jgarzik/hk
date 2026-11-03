@@ -16,8 +16,11 @@
 
 use alloc::sync::Arc;
 
-use crate::fs::chardev::{CHARDEV_REGISTRY, CharDevice, DevId, DeviceError, major};
+use crate::fs::File;
+use crate::fs::chardev::{CHARDEV_REGISTRY, CharDevice, DevId, major};
+use crate::io::poll::PollTable;
 use crate::task::percpu::current_sid;
+use crate::util::error::KernelError;
 
 /// /dev/tty character device
 ///
@@ -69,46 +72,39 @@ impl CharDevice for TtyCharDevice {
         "tty"
     }
 
-    fn open(&self, _flags: u32) -> Result<(), DeviceError> {
+    fn open(&self, _file: &File) -> Result<(), KernelError> {
         // /dev/tty open fails with ENXIO if no controlling terminal
         if self.find_controlling_tty().is_none() {
-            return Err(DeviceError::NotFound);
+            return Err(KernelError::NoDeviceOrAddress);
         }
         Ok(())
     }
 
-    fn read(&self, buf: &mut [u8]) -> Result<usize, DeviceError> {
+    fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {
         match self.find_controlling_tty() {
-            Some(tty) => tty.read(buf),
-            None => Err(DeviceError::NotFound), // ENXIO
+            Some(tty) => tty.read(file, buf),
+            None => Err(KernelError::NoDeviceOrAddress), // ENXIO
         }
     }
 
-    fn write(&self, buf: &[u8]) -> Result<usize, DeviceError> {
+    fn write(&self, file: &File, buf: &[u8]) -> Result<usize, KernelError> {
         match self.find_controlling_tty() {
-            Some(tty) => tty.write(buf),
-            None => Err(DeviceError::NotFound), // ENXIO
+            Some(tty) => tty.write(file, buf),
+            None => Err(KernelError::NoDeviceOrAddress), // ENXIO
         }
     }
 
-    fn ioctl(&self, cmd: u32, arg: u64) -> Result<i64, DeviceError> {
+    fn ioctl(&self, file: &File, cmd: u32, arg: u64) -> Result<i64, KernelError> {
         match self.find_controlling_tty() {
-            Some(tty) => tty.ioctl(cmd, arg),
-            None => Err(DeviceError::NotFound), // ENXIO
+            Some(tty) => tty.ioctl(file, cmd, arg),
+            None => Err(KernelError::NoDeviceOrAddress), // ENXIO
         }
     }
 
-    fn poll_read(&self) -> bool {
+    fn poll(&self, file: &File, pt: Option<&mut PollTable>) -> u16 {
         match self.find_controlling_tty() {
-            Some(tty) => tty.poll_read(),
-            None => false,
-        }
-    }
-
-    fn poll_write(&self) -> bool {
-        match self.find_controlling_tty() {
-            Some(tty) => tty.poll_write(),
-            None => false,
+            Some(tty) => tty.poll(file, pt),
+            None => 0,
         }
     }
 }

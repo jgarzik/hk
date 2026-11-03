@@ -8,8 +8,8 @@
 use super::Tty;
 use super::termios::{Termios, Winsize};
 use crate::arch::Uaccess;
-use crate::fs::chardev::DeviceError;
 use crate::uaccess::{get_user, put_user};
+use crate::util::error::KernelError;
 
 // =============================================================================
 // TTY ioctl numbers (from include/uapi/asm-generic/ioctls.h)
@@ -97,16 +97,16 @@ pub const TIOCCBRK: u32 = 0x5428;
 ///
 /// # Returns
 /// * `Ok(result)` - Success with return value
-/// * `Err(DeviceError)` - Error
-pub fn tty_ioctl(tty: &Tty, cmd: u32, arg: u64) -> Result<i64, DeviceError> {
+/// * `Err(KernelError)` - Error
+pub fn tty_ioctl(tty: &Tty, cmd: u32, arg: u64) -> Result<i64, KernelError> {
     match cmd {
         TCGETS => {
             // Get termios structure
             let termios = tty.get_termios();
             if arg == 0 {
-                return Err(DeviceError::InvalidArg);
+                return Err(KernelError::InvalidArgument);
             }
-            put_user::<Uaccess, Termios>(arg, termios).map_err(|_| DeviceError::InvalidArg)?;
+            put_user::<Uaccess, Termios>(arg, termios).map_err(|_| KernelError::InvalidArgument)?;
             Ok(0)
         }
 
@@ -116,10 +116,10 @@ pub fn tty_ioctl(tty: &Tty, cmd: u32, arg: u64) -> Result<i64, DeviceError> {
             // TCSETSW: after drain
             // TCSETSF: after flush
             if arg == 0 {
-                return Err(DeviceError::InvalidArg);
+                return Err(KernelError::InvalidArgument);
             }
             let termios: Termios =
-                get_user::<Uaccess, Termios>(arg).map_err(|_| DeviceError::InvalidArg)?;
+                get_user::<Uaccess, Termios>(arg).map_err(|_| KernelError::InvalidArgument)?;
 
             // For TCSETSW, we should wait for output to drain
             if cmd == TCSETSW || cmd == TCSETSF {
@@ -139,19 +139,19 @@ pub fn tty_ioctl(tty: &Tty, cmd: u32, arg: u64) -> Result<i64, DeviceError> {
             // Get window size
             let winsize = tty.get_winsize();
             if arg == 0 {
-                return Err(DeviceError::InvalidArg);
+                return Err(KernelError::InvalidArgument);
             }
-            put_user::<Uaccess, Winsize>(arg, winsize).map_err(|_| DeviceError::InvalidArg)?;
+            put_user::<Uaccess, Winsize>(arg, winsize).map_err(|_| KernelError::InvalidArgument)?;
             Ok(0)
         }
 
         TIOCSWINSZ => {
             // Set window size
             if arg == 0 {
-                return Err(DeviceError::InvalidArg);
+                return Err(KernelError::InvalidArgument);
             }
             let winsize: Winsize =
-                get_user::<Uaccess, Winsize>(arg).map_err(|_| DeviceError::InvalidArg)?;
+                get_user::<Uaccess, Winsize>(arg).map_err(|_| KernelError::InvalidArgument)?;
             tty.set_winsize(winsize);
             // TODO: Send SIGWINCH to foreground process group
             Ok(0)
@@ -161,9 +161,9 @@ pub fn tty_ioctl(tty: &Tty, cmd: u32, arg: u64) -> Result<i64, DeviceError> {
             // Get number of bytes available to read
             let count = tty.bytes_available() as i32;
             if arg == 0 {
-                return Err(DeviceError::InvalidArg);
+                return Err(KernelError::InvalidArgument);
             }
-            put_user::<Uaccess, i32>(arg, count).map_err(|_| DeviceError::InvalidArg)?;
+            put_user::<Uaccess, i32>(arg, count).map_err(|_| KernelError::InvalidArgument)?;
             Ok(0)
         }
 
@@ -171,20 +171,21 @@ pub fn tty_ioctl(tty: &Tty, cmd: u32, arg: u64) -> Result<i64, DeviceError> {
             // Get foreground process group
             let pgrp = tty.get_foreground_pgrp().unwrap_or(0) as i32;
             if arg == 0 {
-                return Err(DeviceError::InvalidArg);
+                return Err(KernelError::InvalidArgument);
             }
-            put_user::<Uaccess, i32>(arg, pgrp).map_err(|_| DeviceError::InvalidArg)?;
+            put_user::<Uaccess, i32>(arg, pgrp).map_err(|_| KernelError::InvalidArgument)?;
             Ok(0)
         }
 
         TIOCSPGRP => {
             // Set foreground process group
             if arg == 0 {
-                return Err(DeviceError::InvalidArg);
+                return Err(KernelError::InvalidArgument);
             }
-            let pgrp: i32 = get_user::<Uaccess, i32>(arg).map_err(|_| DeviceError::InvalidArg)?;
+            let pgrp: i32 =
+                get_user::<Uaccess, i32>(arg).map_err(|_| KernelError::InvalidArgument)?;
             if pgrp <= 0 {
-                return Err(DeviceError::InvalidArg);
+                return Err(KernelError::InvalidArgument);
             }
             tty.set_foreground_pgrp(pgrp as u32);
             Ok(0)
@@ -194,9 +195,9 @@ pub fn tty_ioctl(tty: &Tty, cmd: u32, arg: u64) -> Result<i64, DeviceError> {
             // Get session ID
             let sid = tty.get_session().unwrap_or(0) as i32;
             if arg == 0 {
-                return Err(DeviceError::InvalidArg);
+                return Err(KernelError::InvalidArgument);
             }
-            put_user::<Uaccess, i32>(arg, sid).map_err(|_| DeviceError::InvalidArg)?;
+            put_user::<Uaccess, i32>(arg, sid).map_err(|_| KernelError::InvalidArgument)?;
             Ok(0)
         }
 
@@ -213,7 +214,7 @@ pub fn tty_ioctl(tty: &Tty, cmd: u32, arg: u64) -> Result<i64, DeviceError> {
 
             // Check if caller is a session leader (pid == sid)
             if caller_pid != caller_sid {
-                return Err(DeviceError::InvalidArg); // EPERM - not session leader
+                return Err(KernelError::InvalidArgument); // EPERM - not session leader
             }
 
             // Check if TTY already has a controlling session
@@ -221,7 +222,7 @@ pub fn tty_ioctl(tty: &Tty, cmd: u32, arg: u64) -> Result<i64, DeviceError> {
                 && existing_sid != 0
                 && !steal
             {
-                return Err(DeviceError::InvalidArg); // EPERM - already has controlling session
+                return Err(KernelError::InvalidArgument); // EPERM - already has controlling session
             }
 
             // Set this process's session as the controlling session
@@ -241,14 +242,14 @@ pub fn tty_ioctl(tty: &Tty, cmd: u32, arg: u64) -> Result<i64, DeviceError> {
 
             // Check if caller is a session leader
             if caller_pid != caller_sid {
-                return Err(DeviceError::InvalidArg); // EPERM - not session leader
+                return Err(KernelError::InvalidArgument); // EPERM - not session leader
             }
 
             // Check if this is actually our controlling terminal
             if let Some(tty_sid) = tty.get_session()
                 && tty_sid as u64 != caller_sid
             {
-                return Err(DeviceError::InvalidArg); // Not our controlling terminal
+                return Err(KernelError::InvalidArgument); // Not our controlling terminal
             }
 
             // Clear the controlling session
@@ -260,9 +261,9 @@ pub fn tty_ioctl(tty: &Tty, cmd: u32, arg: u64) -> Result<i64, DeviceError> {
             // Get line discipline number
             let ldisc = tty.get_line_discipline() as i32;
             if arg == 0 {
-                return Err(DeviceError::InvalidArg);
+                return Err(KernelError::InvalidArgument);
             }
-            put_user::<Uaccess, i32>(arg, ldisc).map_err(|_| DeviceError::InvalidArg)?;
+            put_user::<Uaccess, i32>(arg, ldisc).map_err(|_| KernelError::InvalidArgument)?;
             Ok(0)
         }
 
@@ -270,12 +271,13 @@ pub fn tty_ioctl(tty: &Tty, cmd: u32, arg: u64) -> Result<i64, DeviceError> {
             // Set line discipline
             // For now, we only support N_TTY (0)
             if arg == 0 {
-                return Err(DeviceError::InvalidArg);
+                return Err(KernelError::InvalidArgument);
             }
-            let ldisc: i32 = get_user::<Uaccess, i32>(arg).map_err(|_| DeviceError::InvalidArg)?;
+            let ldisc: i32 =
+                get_user::<Uaccess, i32>(arg).map_err(|_| KernelError::InvalidArgument)?;
             if ldisc != 0 {
                 // Only N_TTY supported
-                return Err(DeviceError::InvalidArg);
+                return Err(KernelError::InvalidArgument);
             }
             Ok(0)
         }
@@ -291,7 +293,7 @@ pub fn tty_ioctl(tty: &Tty, cmd: u32, arg: u64) -> Result<i64, DeviceError> {
                     tty.flush_input();
                     tty.flush_output();
                 }
-                _ => return Err(DeviceError::InvalidArg),
+                _ => return Err(KernelError::InvalidArgument),
             }
             Ok(0)
         }
@@ -306,7 +308,7 @@ pub fn tty_ioctl(tty: &Tty, cmd: u32, arg: u64) -> Result<i64, DeviceError> {
         // Unimplemented but return 0 to avoid breaking programs
         TCGETA | TCSETA | TCSETAW | TCSETAF => {
             // Old termio interface - not implemented
-            Err(DeviceError::NotSupported)
+            Err(KernelError::NotTty)
         }
 
         TCSBRK | TCSBRKP | TIOCSBRK | TIOCCBRK => {
@@ -344,7 +346,7 @@ pub fn tty_ioctl(tty: &Tty, cmd: u32, arg: u64) -> Result<i64, DeviceError> {
 
         _ => {
             // Unknown ioctl
-            Err(DeviceError::NotTty)
+            Err(KernelError::NotTty)
         }
     }
 }

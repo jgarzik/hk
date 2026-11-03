@@ -702,12 +702,20 @@ impl crate::fs::chardev::CharDevice for KmsgCharDevice {
         "kmsg"
     }
 
-    fn read(&self, _buf: &mut [u8]) -> Result<usize, crate::fs::chardev::DeviceError> {
-        Err(crate::fs::chardev::DeviceError::NotSupported)
+    fn read(
+        &self,
+        _file: &crate::fs::File,
+        _buf: &mut [u8],
+    ) -> Result<usize, crate::util::error::KernelError> {
+        Err(crate::util::error::KernelError::OperationNotSupported)
     }
 
-    fn write(&self, _buf: &[u8]) -> Result<usize, crate::fs::chardev::DeviceError> {
-        Err(crate::fs::chardev::DeviceError::NotSupported)
+    fn write(
+        &self,
+        _file: &crate::fs::File,
+        _buf: &[u8],
+    ) -> Result<usize, crate::util::error::KernelError> {
+        Err(crate::util::error::KernelError::OperationNotSupported)
     }
 
     fn fops(&self) -> Option<&'static dyn crate::fs::FileOps> {

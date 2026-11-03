@@ -15,7 +15,10 @@
 //! /dev/console = major 5, minor 1
 
 use crate::console::{console_flush, console_write};
-use crate::fs::chardev::{CharDevice, DeviceError};
+use crate::fs::File;
+use crate::fs::chardev::CharDevice;
+use crate::io::poll::{POLLOUT, POLLWRNORM, PollTable};
+use crate::util::error::KernelError;
 
 /// /dev/console character device
 ///
@@ -29,33 +32,28 @@ impl CharDevice for ConsoleCharDevice {
         "console"
     }
 
-    fn read(&self, _buf: &mut [u8]) -> Result<usize, DeviceError> {
+    fn read(&self, _file: &File, _buf: &mut [u8]) -> Result<usize, KernelError> {
         // /dev/console is typically output-only on most systems.
         // Linux returns ENXIO for reads on /dev/console when there's
         // no backing input device configured.
-        Err(DeviceError::NotSupported)
+        Err(KernelError::OperationNotSupported)
     }
 
-    fn write(&self, buf: &[u8]) -> Result<usize, DeviceError> {
+    fn write(&self, _file: &File, buf: &[u8]) -> Result<usize, KernelError> {
         // Write to the primary console (all registered consoles receive output)
         console_write(buf);
         Ok(buf.len())
     }
 
-    fn ioctl(&self, _cmd: u32, _arg: u64) -> Result<i64, DeviceError> {
+    fn ioctl(&self, _file: &File, _cmd: u32, _arg: u64) -> Result<i64, KernelError> {
         // Console ioctls could forward to the underlying TTY
         // For now, return ENOTTY for most ioctls
-        Err(DeviceError::NotTty)
+        Err(KernelError::NotTty)
     }
 
-    fn poll_read(&self) -> bool {
-        // No input available on console
-        false
-    }
-
-    fn poll_write(&self) -> bool {
-        // Console is always ready for writing
-        true
+    fn poll(&self, _file: &File, _pt: Option<&mut PollTable>) -> u16 {
+        // No input available on console; always ready for writing
+        POLLOUT | POLLWRNORM
     }
 }
 

@@ -6,7 +6,7 @@
 #![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use crate::console::{ConsolePriority, register_console};
-use crate::fs::chardev::DeviceError;
+use crate::util::error::KernelError;
 
 use crate::tty::{RAW_LDISC, Tty, TtyDriver};
 
@@ -203,14 +203,14 @@ impl TtyDriver for SerialTty {
         self.name
     }
 
-    fn write(&self, data: &[u8]) -> Result<usize, DeviceError> {
+    fn write(&self, data: &[u8]) -> Result<usize, KernelError> {
         for &byte in data {
             self.write_byte(byte);
         }
         Ok(data.len())
     }
 
-    fn read(&self, buf: &mut [u8]) -> Result<usize, DeviceError> {
+    fn read(&self, buf: &mut [u8]) -> Result<usize, KernelError> {
         let mut count = 0;
         while count < buf.len() {
             if let Some(byte) = self.read_byte() {
@@ -227,7 +227,7 @@ impl TtyDriver for SerialTty {
         self.data_available()
     }
 
-    fn init(&self) -> Result<(), DeviceError> {
+    fn init(&self) -> Result<(), KernelError> {
         self.init_hardware(115200);
         Ok(())
     }
@@ -292,7 +292,9 @@ pub fn write_byte_com1(byte: u8) {
     SERIAL_DRIVER_S0.write_byte(byte);
 }
 
+use crate::fs::File;
 use crate::fs::chardev::{CharDevice, DevId, major, register_chardev};
+use crate::io::poll::PollTable;
 use alloc::sync::Arc;
 
 /// Wrapper to allow static TTY to be registered as Arc<dyn CharDevice>
@@ -303,24 +305,20 @@ impl CharDevice for StaticTtyWrapper {
         self.0.name()
     }
 
-    fn read(&self, buf: &mut [u8]) -> Result<usize, DeviceError> {
-        self.0.read(buf)
+    fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {
+        self.0.read(file, buf)
     }
 
-    fn write(&self, buf: &[u8]) -> Result<usize, DeviceError> {
-        self.0.write(buf)
+    fn write(&self, file: &File, buf: &[u8]) -> Result<usize, KernelError> {
+        self.0.write(file, buf)
     }
 
-    fn ioctl(&self, cmd: u32, arg: u64) -> Result<i64, DeviceError> {
-        self.0.ioctl(cmd, arg)
+    fn ioctl(&self, file: &File, cmd: u32, arg: u64) -> Result<i64, KernelError> {
+        self.0.ioctl(file, cmd, arg)
     }
 
-    fn poll_read(&self) -> bool {
-        self.0.poll_read()
-    }
-
-    fn poll_write(&self) -> bool {
-        self.0.poll_write()
+    fn poll(&self, file: &File, pt: Option<&mut PollTable>) -> u16 {
+        self.0.poll(file, pt)
     }
 }
 

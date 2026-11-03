@@ -10,7 +10,7 @@
 
 use super::termios::*;
 use super::{LineDiscipline, Tty};
-use crate::fs::chardev::DeviceError;
+use crate::util::error::KernelError;
 
 /// Maximum size of the read buffer
 const READ_BUF_SIZE: usize = 4096;
@@ -382,7 +382,7 @@ impl LineDiscipline for NTtyLdisc {
         }
     }
 
-    fn write(&self, tty: &Tty, buf: &[u8]) -> Result<usize, DeviceError> {
+    fn write(&self, tty: &Tty, buf: &[u8]) -> Result<usize, KernelError> {
         let termios = tty.get_termios();
         let opost = termios.c_oflag & OPOST != 0;
         let onlcr = termios.c_oflag & ONLCR != 0;
@@ -417,14 +417,14 @@ pub fn n_tty_chars_available() -> usize {
 ///
 /// For canonical mode, only returns data when a complete line is available.
 /// For raw mode, returns any available data.
-pub fn n_tty_read(tty: &Tty, buf: &mut [u8]) -> Result<usize, DeviceError> {
+pub fn n_tty_read(tty: &Tty, buf: &mut [u8]) -> Result<usize, KernelError> {
     let termios = tty.get_termios();
     let is_canon = termios.c_lflag & ICANON != 0;
     let mut data = N_TTY_LDISC.data.lock();
 
     // In canonical mode, only return data if we have a complete line
     if is_canon && data.canon_count == 0 {
-        return Err(DeviceError::WouldBlock);
+        return Err(KernelError::WouldBlock);
     }
 
     let mut count = 0;
@@ -444,7 +444,7 @@ pub fn n_tty_read(tty: &Tty, buf: &mut [u8]) -> Result<usize, DeviceError> {
     }
 
     if count == 0 {
-        return Err(DeviceError::WouldBlock);
+        return Err(KernelError::WouldBlock);
     }
 
     Ok(count)

@@ -17,9 +17,7 @@ use super::KernelError;
 use super::dentry::Dentry;
 use super::inode::{FileType, Inode, InodeId};
 use super::mount::Mount;
-use crate::io::poll::{
-    DEFAULT_POLLMASK, POLLERR, POLLHUP, POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM, PollTable,
-};
+use crate::io::poll::{DEFAULT_POLLMASK, POLLERR, POLLHUP, PollTable};
 
 /// Largest kernel bounce buffer one read/write call uses: transfers
 /// bigger than this go through it in steps
@@ -787,7 +785,7 @@ pub static NULL_FILE_OPS: NullFileOps = NullFileOps;
 // Character Device File Operations
 // ============================================================================
 
-use crate::fs::chardev::{DeviceError, get_chardev};
+use crate::fs::chardev::{CharDevice, get_chardev};
 
 /// Character device file operations.
 ///
@@ -796,19 +794,10 @@ use crate::fs::chardev::{DeviceError, get_chardev};
 pub struct CharDevFileOps;
 
 impl CharDevFileOps {
-    /// Convert DeviceError to KernelError
-    fn to_fs_error(e: DeviceError) -> KernelError {
-        match e {
-            DeviceError::NotReady => KernelError::Io,
-            DeviceError::WouldBlock => KernelError::WouldBlock,
-            DeviceError::NotSupported => KernelError::OperationNotSupported,
-            DeviceError::IoError => KernelError::Io,
-            DeviceError::InvalidArg => KernelError::InvalidArgument,
-            DeviceError::NotFound => KernelError::NotFound,
-            DeviceError::NotTty => KernelError::NotTty,
-            DeviceError::Fault => KernelError::BadAddress,
-            DeviceError::NoSpace => KernelError::NoSpace,
-        }
+    /// The device `file` was opened on (ENXIO once it is unregistered)
+    fn dev(file: &File) -> Result<Arc<dyn CharDevice>, KernelError> {
+        let inode = file.get_inode().ok_or(KernelError::BadFd)?;
+        get_chardev(inode.rdev).ok_or(KernelError::NoDeviceOrAddress)
     }
 }
 
@@ -817,28 +806,30 @@ impl FileOps for CharDevFileOps {
         self
     }
 
+    fn open(&self, file: &File) -> Result<(), KernelError> {
+        Self::dev(file)?.open(file)
+    }
+
+    fn release(&self, file: &File) -> Result<(), KernelError> {
+        if let Ok(d) = Self::dev(file) {
+            d.release(file);
+        }
+        Ok(())
+    }
+
     fn mmap(&self, file: &File, _shared: bool) -> Result<(), KernelError> {
-        let inode = file.get_inode().ok_or(KernelError::BadFd)?;
-        match get_chardev(inode.rdev) {
-            Some(d) if d.mmap_ok() => Ok(()),
+        match Self::dev(file) {
+            Ok(d) if d.mmap_ok() => Ok(()),
             _ => Err(KernelError::NoDevice),
         }
     }
 
     fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {
-        let inode = file.get_inode().ok_or(KernelError::BadFd)?;
-        let rdev = inode.rdev;
-
-        let device = get_chardev(rdev).ok_or(KernelError::NotFound)?;
-        device.read(buf).map_err(Self::to_fs_error)
+        Self::dev(file)?.read(file, buf)
     }
 
     fn write(&self, file: &File, buf: &[u8]) -> Result<usize, KernelError> {
-        let inode = file.get_inode().ok_or(KernelError::BadFd)?;
-        let rdev = inode.rdev;
-
-        let device = get_chardev(rdev).ok_or(KernelError::NotFound)?;
-        device.write(buf).map_err(Self::to_fs_error)
+        Self::dev(file)?.write(file, buf)
     }
 
     fn llseek(&self, _file: &File, _offset: i64, _whence: i32) -> Result<u64, KernelError> {
@@ -846,30 +837,15 @@ impl FileOps for CharDevFileOps {
         Err(KernelError::InvalidArgument)
     }
 
-    fn poll(&self, file: &File, _pt: Option<&mut PollTable>) -> u16 {
-        let inode = match file.get_inode() {
-            Some(i) => i,
-            None => return POLLERR,
-        };
+    fn ioctl(&self, file: &File, cmd: u32, arg: u64) -> Result<i64, KernelError> {
+        Self::dev(file)?.ioctl(file, cmd, arg)
+    }
 
-        let device = match get_chardev(inode.rdev) {
-            Some(d) => d,
-            None => return POLLHUP | POLLERR,
-        };
-
-        let mut mask = 0u16;
-
-        // Check if readable
-        if device.poll_read() {
-            mask |= POLLIN | POLLRDNORM;
+    fn poll(&self, file: &File, pt: Option<&mut PollTable>) -> u16 {
+        match Self::dev(file) {
+            Ok(d) => d.poll(file, pt),
+            Err(_) => POLLHUP | POLLERR,
         }
-
-        // Check if writable
-        if device.poll_write() {
-            mask |= POLLOUT | POLLWRNORM;
-        }
-
-        mask
     }
 }
 
