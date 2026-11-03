@@ -162,7 +162,46 @@ impl MsgQueue {
         if messages[i].mtext.len() > msgsz && !noerror {
             return Err(KernelError::ArgListTooLong.errno());
         }
-        Ok(messages.remove(i))
+        let msg = messages.remove(i);
+        if let Some(m) = &msg {
+            self.account(-(m.mtext.len() as i64));
+        }
+        Ok(msg)
+    }
+
+    /// Queue `msg` if it fits (Linux do_msgsnd under the queue lock): the
+    /// limit and removal are checked, and the counters kept, with the
+    /// queue locked, so concurrent senders never pass qbytes and a removed
+    /// queue takes nothing. A message that does not fit comes back
+    fn try_send(&self, msg: MsgMsg) -> Result<Option<MsgMsg>, i32> {
+        let mut messages = self.messages.lock();
+        if self.perm.is_deleted() {
+            return Err(KernelError::IdentifierRemoved.errno());
+        }
+        let len = msg.mtext.len() as u64;
+        if self.cbytes.load(Ordering::Relaxed) + len > self.qbytes.load(Ordering::Relaxed) {
+            return Ok(Some(msg));
+        }
+        messages.push_back(msg);
+        self.account(len as i64);
+        Ok(None)
+    }
+
+    /// One message of `bytes` added (> 0) or removed (< 0), under the
+    /// `messages` lock: queue and namespace counters
+    fn account(&self, bytes: i64) {
+        let n = bytes.unsigned_abs();
+        if bytes >= 0 {
+            self.cbytes.fetch_add(n, Ordering::Relaxed);
+            self.qnum.fetch_add(1, Ordering::Relaxed);
+            self.ns.msg_bytes.fetch_add(n, Ordering::Relaxed);
+            self.ns.msg_hdrs.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.cbytes.fetch_sub(n, Ordering::Relaxed);
+            self.qnum.fetch_sub(1, Ordering::Relaxed);
+            self.ns.msg_bytes.fetch_sub(n, Ordering::Relaxed);
+            self.ns.msg_hdrs.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 
     /// Fill msqid64_ds structure for IPC_STAT
@@ -187,13 +226,14 @@ impl IpcObject for MsgQueue {
     }
 
     fn destroy(&self) {
+        // Marked deleted before this: after the lock no sender adds more
+        {
+            let mut messages = self.messages.lock();
+            while let Some(m) = messages.pop_front() {
+                self.account(-(m.mtext.len() as i64));
+            }
+        }
         self.waitq.wake_all();
-
-        // Update namespace counters
-        let bytes = self.cbytes.load(Ordering::Relaxed);
-        let hdrs = self.qnum.load(Ordering::Relaxed) as u64;
-        self.ns.msg_bytes.fetch_sub(bytes, Ordering::Relaxed);
-        self.ns.msg_hdrs.fetch_sub(hdrs, Ordering::Relaxed);
     }
 }
 
@@ -275,47 +315,29 @@ fn do_msgsnd(msqid: i32, msgp: u64, msgsz: usize, msgflg: i32) -> Result<i32, i3
     let nowait = msgflg & IPC_NOWAIT != 0;
     let pid = current_pid() as i32;
 
-    loop {
-        // Check queue limits
-        let current_bytes = queue.cbytes.load(Ordering::Acquire);
-        if current_bytes + msgsz as u64 > queue.qbytes.load(Ordering::Relaxed) {
-            if nowait {
-                return Err(KernelError::WouldBlock.errno());
-            }
-
-            // Sleep until space or removal; a signal ends the call
-            // (System V IPC is never restarted after a handler)
-            let room = || {
-                queue.cbytes.load(Ordering::Acquire) + msgsz as u64
-                    <= queue.qbytes.load(Ordering::Relaxed)
-                    || queue.perm.is_deleted()
-            };
-            queue
-                .waitq
-                .wait_event_interruptible(room)
-                .map_err(|_| KernelError::RestartNoHand.errno())?;
-            if queue.perm.is_deleted() {
-                return Err(KernelError::IdentifierRemoved.errno());
-            }
-            continue;
+    let mut msg = msg;
+    while let Some(back) = queue.try_send(msg)? {
+        msg = back;
+        if nowait {
+            return Err(KernelError::WouldBlock.errno());
         }
-
-        queue.messages.lock().push_back(msg);
-
-        queue.cbytes.fetch_add(msgsz as u64, Ordering::AcqRel);
-        queue.qnum.fetch_add(1, Ordering::AcqRel);
-        queue.stime.store(current_time_secs(), Ordering::Release);
-        queue.lspid.store(pid, Ordering::Release);
-
-        // Update namespace counters
-        ns.msg_bytes.fetch_add(msgsz as u64, Ordering::Relaxed);
-        ns.msg_hdrs.fetch_add(1, Ordering::Relaxed);
-
-        // Wake any waiting receivers
-        queue.waitq.wake_all();
-
-        return Ok(0);
+        // Sleep until space or removal; a signal ends the call
+        // (System V IPC is never restarted after a handler)
+        let room = || {
+            queue.cbytes.load(Ordering::Acquire) + msgsz as u64
+                <= queue.qbytes.load(Ordering::Relaxed)
+                || queue.perm.is_deleted()
+        };
+        queue
+            .waitq
+            .wait_event_interruptible(room)
+            .map_err(|_| KernelError::RestartNoHand.errno())?;
     }
+    queue.stime.store(current_time_secs(), Ordering::Release);
+    queue.lspid.store(pid, Ordering::Release);
+    // Wake any waiting receivers
+    queue.waitq.wake_all();
+    Ok(0)
 }
 
 /// msgrcv - receive message
@@ -349,18 +371,8 @@ fn do_msgrcv(msqid: i32, msgp: u64, msgsz: usize, msgtyp: i64, msgflg: i32) -> R
     let search = Search::new(msgtyp, msgflg);
     loop {
         if let Some(msg) = queue.take_msg(search, msgsz, noerror)? {
-            // Update queue stats
-            queue
-                .cbytes
-                .fetch_sub(msg.mtext.len() as u64, Ordering::AcqRel);
-            queue.qnum.fetch_sub(1, Ordering::AcqRel);
             queue.rtime.store(current_time_secs(), Ordering::Release);
             queue.lrpid.store(pid, Ordering::Release);
-
-            // Update namespace counters
-            ns.msg_bytes
-                .fetch_sub(msg.mtext.len() as u64, Ordering::Relaxed);
-            ns.msg_hdrs.fetch_sub(1, Ordering::Relaxed);
 
             // Copy to user
             put_user::<Uaccess, i64>(msgp, msg.mtype)
