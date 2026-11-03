@@ -4,24 +4,40 @@
 //! session: `Tty.ctrl.session`. A process's controlling tty is the tty
 //! of its session (Linux `signal->tty`, which every member of the
 //! session shares). Unlike Linux, a non-leader cannot drop it alone
-//! (TIOCNOTTY by a non-leader changes nothing).
+//! (TIOCNOTTY by a non-leader changes nothing). The tty holds its
+//! session and foreground group as pid references (Linux get_pid), so
+//! neither can come to name another one.
 //!
-//! Locking: `CTTY_LOCK` serializes giving and taking controlling ttys
-//! (Linux tty_lock + siglock in __proc_set_tty / session_clear_tty), so
-//! a session never gets two; `Tty.ctrl` nests inside it. Signals go out
-//! with neither held.
+//! Locking (Linux tty_lock → tasklist_lock → ctrl.lock): `CTTY_LOCK`
+//! serializes giving and taking controlling ttys, so a session never
+//! gets two; process groups are looked at under TASKLIST (read), and
+//! `Tty.ctrl` nests inside both. Signals go out with none held.
+
+use alloc::sync::Arc;
 
 use super::Tty;
 use crate::fs::File;
 use crate::fs::flags::{O_ACCMODE, O_WRONLY};
-use crate::signal::{SIGCONT, SIGHUP, send_signal_to_pgrp};
+use crate::signal::{SIGCONT, SIGHUP, kill_pgrp_pid};
 use crate::sync::spin::Mutex;
-use crate::task::Pid;
-use crate::task::percpu::{current_pgid, current_pid, current_sid};
+use crate::task::percpu::{GlobalTaskTable, TASKLIST, current_pid, current_sid, current_tid};
+use crate::task::pid::Pid;
 use crate::util::error::KernelError;
 
 /// Serializes controlling-tty changes
 static CTTY_LOCK: Mutex<()> = Mutex::new(());
+
+/// The caller's process group and session (Linux task_pgrp,
+/// task_session); None for a kernel thread
+fn pids(table: &GlobalTaskTable) -> Option<(Arc<Pid>, Arc<Pid>)> {
+    let t = table.get(current_tid())?;
+    Some((t.pgrp.clone()?, t.session.clone()?))
+}
+
+/// The caller's session
+fn session() -> Option<Arc<Pid>> {
+    pids(&TASKLIST.read()).map(|(_, s)| s)
+}
 
 /// The caller leads its session (Linux signal->leader)
 fn is_leader() -> bool {
@@ -29,34 +45,40 @@ fn is_leader() -> bool {
     sid != 0 && sid == current_pid()
 }
 
-/// The controlling tty of session `sid`
-fn session_tty(sid: Pid) -> Option<&'static Tty> {
-    if sid == 0 {
-        return None;
-    }
-    super::all()
-        .iter()
-        .copied()
-        .find(|t| t.session() == Some(sid))
+/// Is `s` the session of `tty`?
+fn owns(tty: &Tty, s: &Pid) -> bool {
+    tty.ctrl
+        .lock()
+        .session
+        .as_deref()
+        .is_some_and(|t| core::ptr::eq(t, s))
+}
+
+/// The controlling tty of session `s`
+fn session_tty(s: &Pid) -> Option<&'static Tty> {
+    super::all().iter().copied().find(|t| owns(t, s))
 }
 
 /// The caller's controlling tty (Linux get_current_tty)
 pub fn current_tty() -> Option<&'static Tty> {
-    session_tty(current_sid())
+    session_tty(&*session()?)
 }
 
 /// Is `tty` the caller's controlling tty?
 fn is_current(tty: &Tty) -> bool {
-    current_tty().is_some_and(|t| core::ptr::eq(t, tty))
+    session().is_some_and(|s| owns(tty, &s))
 }
 
 /// Make `tty` the controlling tty of the caller's session, with the
 /// caller's group in the foreground (Linux __proc_set_tty); CTTY_LOCK
 /// held
 fn set_tty(tty: &Tty) {
-    let mut c = tty.ctrl.lock();
-    c.session = Some(current_sid());
-    c.pgrp = Some(current_pgid());
+    let table = TASKLIST.read();
+    if let Some((pg, s)) = pids(&table) {
+        let mut c = tty.ctrl.lock();
+        c.session = Some(s);
+        c.pgrp = Some(pg);
+    }
 }
 
 /// A tty opened without O_NOCTTY becomes the controlling tty of a
@@ -68,7 +90,7 @@ pub fn open_set_tty(tty: &Tty, file: &File) {
         return;
     }
     let _g = CTTY_LOCK.lock();
-    if current_tty().is_none() && tty.session().is_none() {
+    if current_tty().is_none() && tty.ctrl.lock().session.is_none() {
         set_tty(tty);
     }
 }
@@ -78,14 +100,13 @@ pub fn open_set_tty(tty: &Tty, file: &File) {
 pub fn tiocsctty(tty: &Tty, file: &File, steal: bool) -> Result<(), KernelError> {
     use crate::task::{CAP_SYS_ADMIN, capable};
     let _g = CTTY_LOCK.lock();
-    let sid = current_sid();
-    if is_leader() && tty.session() == Some(sid) {
+    if is_leader() && is_current(tty) {
         return Ok(());
     }
     if !is_leader() || current_tty().is_some() {
         return Err(KernelError::NotPermitted);
     }
-    if tty.session().is_some() && !(steal && capable(CAP_SYS_ADMIN)) {
+    if tty.ctrl.lock().session.is_some() && !(steal && capable(CAP_SYS_ADMIN)) {
         return Err(KernelError::NotPermitted);
     }
     if file.get_flags() & O_ACCMODE == O_WRONLY && !capable(CAP_SYS_ADMIN) {
@@ -124,49 +145,60 @@ pub fn disassociate_ctty() {
         c.pgrp.take()
     };
     if let Some(pg) = pgrp {
-        send_signal_to_pgrp(pg, SIGHUP);
-        send_signal_to_pgrp(pg, SIGCONT);
+        kill_pgrp_pid(&pg, SIGHUP);
+        kill_pgrp_pid(&pg, SIGCONT);
     }
 }
 
 /// TIOCGPGRP (Linux tiocgpgrp): the foreground group of the caller's
 /// controlling tty, 0 if none
-pub fn tiocgpgrp(tty: &Tty) -> Result<Pid, KernelError> {
+pub fn tiocgpgrp(tty: &Tty) -> Result<u32, KernelError> {
     if !is_current(tty) {
         return Err(KernelError::NotTty);
     }
-    Ok(tty.pgrp().unwrap_or(0))
+    Ok(tty.ctrl.lock().pgrp.as_ref().map_or(0, |p| p.nr()))
 }
 
 /// TIOCSPGRP (Linux tiocspgrp): a group of the caller's session becomes
-/// the foreground group of its controlling tty
+/// the foreground group of its controlling tty. The group is checked
+/// and stored under TASKLIST, so it cannot change in between
 pub fn tiocspgrp(tty: &Tty, pgrp: i32) -> Result<(), KernelError> {
-    let pgrp = Pid::try_from(pgrp).map_err(|_| KernelError::InvalidArgument)?;
-    let sid = current_sid();
-    if !is_current(tty) {
+    let nr = u64::try_from(pgrp).map_err(|_| KernelError::InvalidArgument)?;
+    // A group id names a live pid (Linux find_vpid); 0 never does
+    let pg = match nr {
+        0 => None,
+        n => crate::task::pid::find_pgrp(n),
+    };
+    let table = TASKLIST.read();
+    let (_, s) = pids(&table).ok_or(KernelError::NotTty)?;
+    let mut c = tty.ctrl.lock();
+    if !c.session.as_deref().is_some_and(|t| core::ptr::eq(t, &*s)) {
         return Err(KernelError::NotTty);
     }
-    // The group's session, from any of its processes
-    let members = crate::task::percpu::pgrp_pids(pgrp);
-    let Some(&p) = members.first() else {
-        return Err(KernelError::NoProcess);
-    };
-    if crate::task::percpu::lookup_task_sid(p) != Some(sid) {
+    let pg = pg.ok_or(KernelError::NoProcess)?;
+    // Its session, from any member (Linux session_of_pgrp)
+    let in_session = table
+        .pgrp(&pg)
+        .next()
+        .and_then(|m| m.session.clone())
+        .is_some_and(|ms| Arc::ptr_eq(&ms, &s));
+    if !in_session {
         return Err(KernelError::NotPermitted);
     }
-    let mut c = tty.ctrl.lock();
-    if c.session != Some(sid) {
-        return Err(KernelError::NotTty);
-    }
-    c.pgrp = Some(pgrp);
+    c.pgrp = Some(pg);
     Ok(())
 }
 
 /// TIOCGSID (Linux tiocgsid): the session of the caller's controlling
 /// tty
-pub fn tiocgsid(tty: &Tty) -> Result<Pid, KernelError> {
+pub fn tiocgsid(tty: &Tty) -> Result<u32, KernelError> {
     if !is_current(tty) {
         return Err(KernelError::NotTty);
     }
-    tty.session().ok_or(KernelError::NotTty)
+    tty.ctrl
+        .lock()
+        .session
+        .as_ref()
+        .map(|s| s.nr())
+        .ok_or(KernelError::NotTty)
 }

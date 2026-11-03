@@ -46,7 +46,7 @@ use crate::fs::File;
 use crate::fs::chardev::{CharDevice, DevId};
 use crate::fs::flags::O_NOCTTY;
 use crate::io::poll::{POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM, PollTable};
-use crate::task::Pid;
+use crate::task::pid::Pid;
 use crate::util::error::KernelError;
 
 // Re-export commonly used types
@@ -125,9 +125,9 @@ struct TtyCtrl {
     /// Window size
     winsize: Winsize,
     /// The session whose controlling tty this is
-    session: Option<Pid>,
+    session: Option<Arc<Pid>>,
     /// Foreground process group
-    pgrp: Option<Pid>,
+    pgrp: Option<Arc<Pid>>,
 }
 
 impl TtyCtrl {
@@ -221,10 +221,10 @@ impl Tty {
                 return;
             }
             c.winsize = ws;
-            c.pgrp
+            c.pgrp.clone()
         };
         if let Some(pg) = pgrp {
-            crate::signal::send_signal_to_pgrp(pg, crate::signal::SIGWINCH);
+            crate::signal::kill_pgrp_pid(&pg, crate::signal::SIGWINCH);
         }
     }
 
@@ -235,13 +235,8 @@ impl Tty {
     }
 
     /// The foreground process group
-    pub fn pgrp(&self) -> Option<Pid> {
-        self.ctrl.lock().pgrp
-    }
-
-    /// The session whose controlling tty this is
-    pub fn session(&self) -> Option<Pid> {
-        self.ctrl.lock().session
+    pub fn pgrp(&self) -> Option<Arc<Pid>> {
+        self.ctrl.lock().pgrp.clone()
     }
 
     /// Get the line discipline number

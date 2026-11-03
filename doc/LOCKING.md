@@ -384,7 +384,8 @@ Printk locks (ALL IRQ-safe - can be acquired from interrupt context):
     KmsgUser.cur (spin, per open; never held across a wait) → LOG
     KmsgUser.rate (spin leaf)
 
-TTYs (3.9): jobctrl CTTY_LOCK (spin) → Tty.ctrl (spin); Tty.termios,
+TTYs (3.9): jobctrl CTTY_LOCK (spin) → TASKLIST (read) → Tty.ctrl
+    (spin; never takes TASKLIST under it); Tty.termios,
     Tty.ldata (spin leaves, thread context); Tty.flip (IrqSpinlock leaf,
     also under IRQ_TABLE in the UART handler). No tty lock is held
     across a signal, a sleep or a driver write.
@@ -2808,9 +2809,13 @@ consumer, so input stays in order. Order: `IRQ_TABLE` → `Tty.flip`;
 `tty::jobctrl::CTTY_LOCK` (spin `Mutex`, thread context; Linux tty_lock
 + siglock in `__proc_set_tty`/`session_clear_tty`) serializes giving and
 taking controlling ttys (open without O_NOCTTY, TIOCSCTTY, TIOCNOTTY, a
-session leader's exit), so a session never gets two. Order: `CTTY_LOCK`
-→ `Tty.ctrl`. TIOCSPGRP looks the group up (TASKLIST) before taking
-`ctrl`.
+session leader's exit), so a session never gets two. `Tty.ctrl` holds
+the session and foreground group as `Arc<pid::Pid>` references (Linux
+get_pid), read from the caller's task under TASKLIST. Order (Linux
+tty_lock → tasklist_lock → ctrl.lock): `CTTY_LOCK` → TASKLIST (read) →
+`Tty.ctrl`. TIOCSPGRP checks that the group is in the caller's session
+and stores it with TASKLIST read-held across both, so the group cannot
+change in between; the pid lookup (PIDMAP_LOCK) comes before TASKLIST.
 
 #### Graphics Console Lock
 

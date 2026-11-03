@@ -1097,6 +1097,15 @@ pub fn send_signal_to_pgrp(pgid: Pid, sig: u32) -> i32 {
     kill_pgrp(pgid, sig, |_| 0)
 }
 
+/// `sig` from the kernel to each process of the group `pg` names (Linux
+/// kill_pgrp(struct pid *)): unlike a number, the reference cannot come
+/// to name another group
+pub fn kill_pgrp_pid(pg: &crate::task::pid::Pid, sig: u32) {
+    for pid in crate::task::percpu::pgrp_members(pg) {
+        send_signal_to_process(pid, sig);
+    }
+}
+
 /// `sig` once to each process of group `pgid` (Linux __kill_pgrp_info:
 /// its leader on the group's list, the signal process-directed), after
 /// `check(pid)` allows it; signal 0 only checks. 0 if any process got

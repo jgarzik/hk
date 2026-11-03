@@ -3761,11 +3761,16 @@ pub fn get_tids_by_pgid(pgid: Pid) -> alloc::vec::Vec<Tid> {
 /// The processes of group `pgid`, by pid (their leaders on its list;
 /// Linux do_each_pid_task PIDTYPE_PGID)
 pub fn pgrp_pids(pgid: Pid) -> alloc::vec::Vec<Pid> {
-    let Some(pg) = crate::task::pid::find_pgrp(pgid) else {
-        return alloc::vec::Vec::new();
-    };
+    match crate::task::pid::find_pgrp(pgid) {
+        Some(pg) => pgrp_members(&pg),
+        None => alloc::vec::Vec::new(),
+    }
+}
+
+/// The processes of group `pg`, by pid
+pub fn pgrp_members(pg: &crate::task::pid::Pid) -> alloc::vec::Vec<Pid> {
     let table = TASKLIST.read();
-    table.pgrp(&pg).map(|t| t.task.pid).collect()
+    table.pgrp(pg).map(|t| t.task.pid).collect()
 }
 
 /// Get all unique PIDs in the system

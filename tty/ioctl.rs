@@ -182,6 +182,6 @@ pub fn tty_ioctl(tty: &Tty, file: &File, cmd: u32, arg: u64) -> Result<i64, Kern
 }
 
 /// A pid as the user's pid_t
-fn pid_i32(p: crate::task::Pid) -> i32 {
+fn pid_i32(p: u32) -> i32 {
     i32::try_from(p).unwrap_or(0)
 }

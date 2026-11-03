@@ -203,7 +203,7 @@ pub fn receive_buf(tty: &Tty, bytes: &[u8]) {
     }
     if let Some(pg) = tty.pgrp() {
         for &sig in &fx.sigs {
-            crate::signal::send_signal_to_pgrp(pg, sig);
+            crate::signal::kill_pgrp_pid(&pg, sig);
         }
     }
     tty.read_wait.wake_all();
