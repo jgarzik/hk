@@ -3767,6 +3767,34 @@ pub fn pgrp_pids(pgid: Pid) -> alloc::vec::Vec<Pid> {
     }
 }
 
+/// Is group `pg` orphaned: no member has a parent in another group of
+/// its session (Linux will_become_orphaned_pgrp(pg, NULL); members that
+/// exited and children of the global init do not count)
+pub fn pgrp_orphaned(pg: &crate::task::pid::Pid) -> bool {
+    let table = TASKLIST.read();
+    let same = |a: &Option<Arc<crate::task::pid::Pid>>, b: &crate::task::pid::Pid| {
+        a.as_deref().is_some_and(|a| core::ptr::eq(a, b))
+    };
+    !table.pgrp(pg).any(|m| {
+        if matches!(m.state, crate::task::TaskState::Zombie(_)) {
+            return false;
+        }
+        let Some(parent) = m.real_parent.as_ref().and_then(|w| w.upgrade()) else {
+            return false;
+        };
+        if parent.pid == 1 {
+            return false;
+        }
+        let Some(p) = table.get(parent.tid()) else {
+            return false;
+        };
+        let Some(ms) = m.session.as_deref() else {
+            return false;
+        };
+        !same(&p.pgrp, pg) && same(&p.session, ms)
+    })
+}
+
 /// The processes of group `pg`, by pid
 pub fn pgrp_members(pg: &crate::task::pid::Pid) -> alloc::vec::Vec<Pid> {
     let table = TASKLIST.read();

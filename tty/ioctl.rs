@@ -114,6 +114,14 @@ fn drain(tty: &Tty) -> Result<(), KernelError> {
 /// A tty's ioctl (Linux tty_ioctl, tty_jobctrl_ioctl and
 /// n_tty_ioctl_helper); `arg` is a user pointer for most commands
 pub fn tty_ioctl(tty: &Tty, file: &File, cmd: u32, arg: u64) -> Result<i64, KernelError> {
+    // A background process may not change the tty (Linux
+    // tty_check_change in set_termios, n_tty_ioctl_helper, tty_ioctl)
+    if matches!(
+        cmd,
+        TCSETS | TCSETSW | TCSETSF | TCFLSH | TCXONC | TCSBRK | TCSBRKP | TIOCSBRK | TIOCCBRK
+    ) {
+        jobctrl::check_change(tty, crate::signal::SIGTTOU)?;
+    }
     match cmd {
         TCGETS => put(arg, tty.get_termios()),
         TCSETS | TCSETSW | TCSETSF => {

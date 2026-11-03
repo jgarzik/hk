@@ -297,6 +297,32 @@ Missing: fs.protected_hardlinks/symlinks/fifos/regular do not exist
 (behave as their kernel default 0); no
 immutable/append-only inodes (no IS_APPEND/IS_IMMUTABLE EPERM).
 
+## TTY gaps
+
+**Location:** `tty/`, `hw/serial.rs`, `arch/aarch64/serial.rs`.
+
+- **No hangup:** nothing hangs a tty up (Linux __tty_hangup: vhangup,
+  a session leader's exit, carrier loss), so open files stay usable.
+  A leader's exit and TIOCNOTTY only send SIGHUP/SIGCONT to the
+  foreground group and clear the session; vhangup(2) only checks
+  CAP_SYS_TTY_CONFIG.
+- **Per-process controlling tty:** it is the session's tty, so TIOCNOTTY
+  by a non-leader changes nothing (Linux clears that process's
+  signal->tty only).
+- **No group stop:** a background process that gets SIGTTOU/SIGTTIN
+  with SIG_DFL (tty_check_change) fails with EIO instead of stopping
+  (see the ptrace stop gaps: stop/continue are not implemented).
+- **Missing:** termio ioctls (TCGETA, TCSETA*), termios2, TIOCSTI,
+  TIOCEXCL exclusivity, sending a break (TCSBRK 0), IXON/IXOFF flow
+  control, packet mode, ptys, VLNEXT/VREPRINT/VDISCARD, ECHOPRT,
+  IUCLC/OLCUC, IMAXBEL, PARMRK and parity/break input handling. Output
+  is written synchronously by polling (TIOCOUTQ 0, no write_wait).
+- **Serial ports:** ttyS1 is registered without probing COM2; only
+  COM1 (and the PL011) take input.
+- **/dev/console** writes go to every console (Linux: only its tty).
+- **Pid namespaces:** TIOCGPGRP/TIOCGSID return global numbers (Linux
+  pid_vnr: the caller's namespace).
+
 ## Unaligned user pointers are EFAULT
 
 **Location**: `uaccess.rs` (`put_user`/`get_user`)

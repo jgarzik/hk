@@ -274,11 +274,17 @@ impl CharDevice for Tty {
         Ok(())
     }
 
+    /// A background reader gets SIGTTIN (Linux job_control)
     fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {
+        jobctrl::check_change(self, crate::signal::SIGTTIN)?;
         n_tty::read(self, file, buf)
     }
 
+    /// With TOSTOP a background writer gets SIGTTOU (Linux n_tty_write)
     fn write(&self, _file: &File, buf: &[u8]) -> Result<usize, KernelError> {
+        if self.get_termios().c_lflag & TOSTOP != 0 {
+            jobctrl::check_change(self, crate::signal::SIGTTOU)?;
+        }
         n_tty::write(self, buf)
     }
 

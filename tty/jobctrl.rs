@@ -150,6 +150,47 @@ pub fn disassociate_ctty() {
     }
 }
 
+/// A background process of the session changing `tty` (`sig` SIGTTOU)
+/// or reading it (SIGTTIN) (Linux __tty_check_change): its group gets
+/// `sig` and the call restarts once it is handled; ignored or blocked,
+/// a change goes ahead and a read is EIO; an orphaned group gets EIO.
+/// hk has no group stop, so where Linux would stop the group (SIG_DFL)
+/// the signal is sent and the call fails with EIO instead of
+/// restarting forever
+pub fn check_change(tty: &Tty, sig: u32) -> Result<(), KernelError> {
+    use crate::signal::{Disposition, SIGTTIN, disposition};
+    let Some((pg, s)) = pids(&TASKLIST.read()) else {
+        return Ok(());
+    };
+    let fg = {
+        let c = tty.ctrl.lock();
+        if !c.session.as_deref().is_some_and(|t| core::ptr::eq(t, &*s)) {
+            return Ok(());
+        }
+        c.pgrp.clone()
+    };
+    match fg {
+        Some(fg) if !Arc::ptr_eq(&fg, &pg) => {}
+        _ => return Ok(()),
+    }
+    let d = disposition(sig);
+    if d == Disposition::Ignored {
+        return if sig == SIGTTIN {
+            Err(KernelError::Io)
+        } else {
+            Ok(())
+        };
+    }
+    if crate::task::percpu::pgrp_orphaned(&pg) {
+        return Err(KernelError::Io);
+    }
+    kill_pgrp_pid(&pg, sig);
+    match d {
+        Disposition::Caught => Err(KernelError::RestartSys),
+        _ => Err(KernelError::Io),
+    }
+}
+
 /// TIOCGPGRP (Linux tiocgpgrp): the foreground group of the caller's
 /// controlling tty, 0 if none
 pub fn tiocgpgrp(tty: &Tty) -> Result<u32, KernelError> {
@@ -163,6 +204,10 @@ pub fn tiocgpgrp(tty: &Tty) -> Result<u32, KernelError> {
 /// the foreground group of its controlling tty. The group is checked
 /// and stored under TASKLIST, so it cannot change in between
 pub fn tiocspgrp(tty: &Tty, pgrp: i32) -> Result<(), KernelError> {
+    match check_change(tty, crate::signal::SIGTTOU) {
+        Err(KernelError::Io) => return Err(KernelError::NotTty),
+        r => r?,
+    }
     let nr = u64::try_from(pgrp).map_err(|_| KernelError::InvalidArgument)?;
     // A group id names a live pid (Linux find_vpid); 0 never does
     let pg = match nr {
