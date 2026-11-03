@@ -178,13 +178,21 @@ impl MsgQueue {
         if self.perm.is_deleted() {
             return Err(KernelError::IdentifierRemoved.errno());
         }
-        let len = msg.mtext.len() as u64;
-        if self.cbytes.load(Ordering::Relaxed) + len > self.qbytes.load(Ordering::Relaxed) {
+        if !self.fits(msg.mtext.len()) {
             return Ok(Some(msg));
         }
+        let len = msg.mtext.len() as u64;
         messages.push_back(msg);
         self.account(len as i64);
         Ok(None)
+    }
+
+    /// A message of `len` bytes fits (Linux msg_fits_inqueue): qbytes
+    /// bounds the bytes and also the number of messages
+    fn fits(&self, len: usize) -> bool {
+        let qbytes = self.qbytes.load(Ordering::Relaxed);
+        self.cbytes.load(Ordering::Relaxed) + len as u64 <= qbytes
+            && u64::from(self.qnum.load(Ordering::Relaxed)) < qbytes
     }
 
     /// One message of `bytes` added (> 0) or removed (< 0), under the
@@ -323,11 +331,7 @@ fn do_msgsnd(msqid: i32, msgp: u64, msgsz: usize, msgflg: i32) -> Result<i32, i3
         }
         // Sleep until space or removal; a signal ends the call
         // (System V IPC is never restarted after a handler)
-        let room = || {
-            queue.cbytes.load(Ordering::Acquire) + msgsz as u64
-                <= queue.qbytes.load(Ordering::Relaxed)
-                || queue.perm.is_deleted()
-        };
+        let room = || queue.fits(msgsz) || queue.perm.is_deleted();
         queue
             .waitq
             .wait_event_interruptible(room)
