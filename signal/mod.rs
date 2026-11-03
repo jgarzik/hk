@@ -730,6 +730,33 @@ pub fn get_task_sighand(tid: Tid) -> Option<Arc<SigHand>> {
     table.get(tid).and_then(|t| t.sighand.clone())
 }
 
+/// How the current task takes `sig` (for tty job control)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Disposition {
+    /// Blocked or SIG_IGN (Linux is_ignored in tty_jobctrl.c)
+    Ignored,
+    /// A handler runs
+    Caught,
+    /// SIG_DFL
+    Default,
+}
+
+/// The current task's disposition of `sig`
+pub fn disposition(sig: u32) -> Disposition {
+    let tid = crate::task::percpu::current_tid();
+    if with_task_signal_state(tid, |st| st.blocked.contains(sig)).unwrap_or(false) {
+        return Disposition::Ignored;
+    }
+    match get_task_sighand(tid)
+        .and_then(|h| h.get_action(sig))
+        .map(|a| a.handler)
+    {
+        Some(SigHandler::Ignore) => Disposition::Ignored,
+        Some(SigHandler::Handler(_)) => Disposition::Caught,
+        _ => Disposition::Default,
+    }
+}
+
 /// Access a task's signal state for modification
 ///
 /// Afterwards the task's TIF_SIGPENDING flag is recomputed, so it always
@@ -1095,6 +1122,15 @@ pub fn send_signal_to_pgrp(pgid: Pid, sig: u32) -> i32 {
         return -22; // EINVAL
     }
     kill_pgrp(pgid, sig, |_| 0)
+}
+
+/// `sig` from the kernel to each process of the group `pg` names (Linux
+/// kill_pgrp(struct pid *)): unlike a number, the reference cannot come
+/// to name another group
+pub fn kill_pgrp_pid(pg: &crate::task::pid::Pid, sig: u32) {
+    for pid in crate::task::percpu::pgrp_members(pg) {
+        send_signal_to_process(pid, sig);
+    }
 }
 
 /// `sig` once to each process of group `pgid` (Linux __kill_pgrp_info:

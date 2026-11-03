@@ -502,6 +502,8 @@ pub struct Inode {
     pub(super) i_hash: AtomicU64,
     /// Hashed in the inode cache (Linux !inode_unhashed)
     pub(super) i_hashed: core::sync::atomic::AtomicBool,
+    /// Identity for shared futex keys (Linux i_sequence)
+    pub(crate) i_sequence: crate::task::futex::KeySeq,
 }
 
 impl Inode {
@@ -544,6 +546,7 @@ impl Inode {
             i_writecount: core::sync::atomic::AtomicI32::new(0),
             i_swapfile: core::sync::atomic::AtomicBool::new(false),
             i_flctx: super::locks::FileLockCtx::new(),
+            i_sequence: crate::task::futex::KeySeq::new(),
         }
     }
 
@@ -587,6 +590,7 @@ impl Inode {
             i_writecount: core::sync::atomic::AtomicI32::new(0),
             i_swapfile: core::sync::atomic::AtomicBool::new(false),
             i_flctx: super::locks::FileLockCtx::new(),
+            i_sequence: crate::task::futex::KeySeq::new(),
         }
     }
 

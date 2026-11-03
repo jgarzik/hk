@@ -38,11 +38,12 @@ use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::marker::PhantomPinned;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
 use crate::sync::spin::Mutex as SpinMutex;
+use crate::task::Task;
 use crate::task::Tid;
-use crate::task::percpu::{KernelTask, WakeQ};
+use crate::task::percpu::WakeQ;
 use crate::uaccess::{get_user, put_user};
 use crate::util::error::KernelError;
 use crate::util::list::{Link, List};
@@ -98,28 +99,65 @@ const ROBUST_LIST_LIMIT: usize = 2048;
 // Futex Key
 // =============================================================================
 
-/// Futex key uniquely identifying a futex location
-///
-/// For private futexes (most common), the key is (virtual_address, pid).
-/// For shared futexes, the key would use physical address (not yet implemented).
+/// What a futex key names (Linux futex_key's union and offset flags)
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct FutexKey {
-    /// Virtual address of the futex
-    pub ptr: u64,
-    /// Process ID (0 for shared futexes)
-    pub pid: u64,
+enum KeyKind {
+    /// A FUTEX_PRIVATE_FLAG futex: (mm, address)
+    Private,
+    /// A shared futex in private memory: (mm, address) (Linux
+    /// FUT_OFF_MMSHARED), never equal to a private key
+    Mm,
+    /// A shared futex in a shared mapping: (object, byte offset), the
+    /// same in every mapping of the object
+    Object,
 }
 
-impl FutexKey {
-    /// Create a private futex key
-    pub fn private(uaddr: u64, pid: u64) -> Self {
-        Self { ptr: uaddr, pid }
+/// Futex key uniquely identifying a futex location (Linux futex_key)
+///
+/// `id` is the mm's address (alive while a task waits in it) or the
+/// object's [`KeySeq`]; `off` is the user address or the byte offset.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct FutexKey {
+    kind: KeyKind,
+    id: u64,
+    off: u64,
+}
+
+/// Identity of a futex-backing object (Linux inode i_sequence): unique
+/// for the boot, unlike an address an object may reuse once freed.
+/// Assigned on first use.
+pub struct KeySeq(AtomicU64);
+
+/// The last `KeySeq` handed out (global: taken once per object)
+static KEY_SEQ: AtomicU64 = AtomicU64::new(0);
+
+impl KeySeq {
+    /// Not yet assigned
+    pub const fn new() -> Self {
+        Self(AtomicU64::new(0))
     }
 
-    /// Create a shared futex key (uses pid=0)
-    #[allow(dead_code)]
-    pub fn shared(uaddr: u64) -> Self {
-        Self { ptr: uaddr, pid: 0 }
+    /// The object's number, assigned now if it has none (Linux
+    /// get_inode_sequence_number)
+    fn get(&self) -> u64 {
+        let s = self.0.load(Ordering::Relaxed);
+        if s != 0 {
+            return s;
+        }
+        let new = KEY_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
+        match self
+            .0
+            .compare_exchange(0, new, Ordering::Relaxed, Ordering::Relaxed)
+        {
+            Ok(_) => new,
+            Err(cur) => cur,
+        }
+    }
+}
+
+impl Default for KeySeq {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -143,7 +181,7 @@ pub struct FutexQ {
     /// bucket locks; read under the lock of the bucket it is on)
     key: UnsafeCell<FutexKey>,
     /// The waiting task (alive while the entry is queued)
-    task: *const KernelTask,
+    task: *const Task,
     /// Bitset for selective wake (FUTEX_WAIT_BITSET/FUTEX_WAKE_BITSET)
     bitset: u32,
     /// The bucket it is on; null once dequeued
@@ -164,7 +202,7 @@ impl FutexQ {
         Self {
             link: Link::new(),
             key: UnsafeCell::new(key),
-            task: &*crate::task::percpu::current() as *const KernelTask,
+            task: &*crate::task::percpu::current() as *const Task,
             bitset,
             lock_ptr: AtomicPtr::new(core::ptr::null_mut()),
             _pin: PhantomPinned,
@@ -353,10 +391,10 @@ static FUTEX_HASH_TABLE: [FutexHashBucket; FUTEX_HASH_SIZE] =
 /// Uses FNV-1a style hash for good distribution across buckets.
 fn futex_hash(key: &FutexKey) -> usize {
     let mut hash: u64 = 0xcbf29ce484222325; // FNV offset basis
-    hash ^= key.ptr;
-    hash = hash.wrapping_mul(0x100000001b3); // FNV prime
-    hash ^= key.pid;
-    hash = hash.wrapping_mul(0x100000001b3);
+    for w in [key.kind as u64, key.id, key.off] {
+        hash ^= w;
+        hash = hash.wrapping_mul(0x100000001b3); // FNV prime
+    }
     (hash as usize) % FUTEX_HASH_SIZE
 }
 
@@ -458,15 +496,43 @@ fn read_user_timeout(timeout_ptr: u64) -> Result<Option<u64>, i32> {
 // Core Futex Operations
 // =============================================================================
 
-/// The futex key of `uaddr` for the current process
-fn make_key(uaddr: u64, is_private: bool) -> FutexKey {
-    if is_private {
-        FutexKey::private(uaddr, crate::task::percpu::current_pid())
-    } else {
-        // For shared futexes, we'd need physical address lookup
-        // For now, treat as private with pid=0
-        FutexKey::shared(uaddr)
+/// The futex key of `uaddr` in the current address space (Linux
+/// get_futex_key): a private futex is (mm, address); a shared one is
+/// the backing object and offset in a shared mapping, else (mm,
+/// address) apart from private keys. EFAULT without a mapping.
+/// Takes the mmap_lock (read) for a shared key, before any bucket lock.
+fn make_key(uaddr: u64, private: bool) -> Result<FutexKey, i32> {
+    let efault = KernelError::BadAddress.to_errno_neg();
+    let mm = crate::task::percpu::current().mm().ok_or(efault)?;
+    let id = alloc::sync::Arc::as_ptr(&mm) as u64;
+    let mm_key = |kind| FutexKey {
+        kind,
+        id,
+        off: uaddr,
+    };
+    if private {
+        return Ok(mm_key(KeyKind::Private));
     }
+    let map = mm.mmap_read();
+    let vma = map.find_vma(uaddr).ok_or(efault)?;
+    Ok(object_key(vma, uaddr).unwrap_or_else(|| mm_key(KeyKind::Mm)))
+}
+
+/// The object key of `uaddr` in `vma`, if it is a shared mapping of a
+/// shared memory object or a file (both indexed from `vma.offset`)
+fn object_key(vma: &crate::mm::vma::Vma, uaddr: u64) -> Option<FutexKey> {
+    if !vma.is_shared() {
+        return None;
+    }
+    let id = match &vma.shmem {
+        Some(s) => s.seq.get(),
+        None => vma.file.as_ref()?.mapping_inode()?.i_sequence.get(),
+    };
+    Some(FutexKey {
+        kind: KeyKind::Object,
+        id,
+        off: vma.offset + (uaddr - vma.start),
+    })
 }
 
 /// Wait on a futex
@@ -500,7 +566,10 @@ pub fn futex_wait(
         return KernelError::InvalidArgument.to_errno_neg();
     }
 
-    let key = make_key(uaddr, is_private);
+    let key = match make_key(uaddr, is_private) {
+        Ok(k) => k,
+        Err(e) => return e,
+    };
     let bucket = futex_bucket(&key);
 
     // Fault the word in (a real EFAULT is reported here); it is read
@@ -575,7 +644,10 @@ pub fn futex_wake(uaddr: u64, num_wake: i32, bitset: u32, is_private: bool) -> i
         return KernelError::InvalidArgument.to_errno_neg();
     }
 
-    let key = make_key(uaddr, is_private);
+    let key = match make_key(uaddr, is_private) {
+        Ok(k) => k,
+        Err(e) => return e,
+    };
     let bucket = futex_bucket(&key);
 
     // Memory barrier paired with futex_wait's barrier
@@ -639,8 +711,10 @@ pub fn futex_requeue(
         return KernelError::InvalidArgument.to_errno_neg();
     }
 
-    let key1 = make_key(uaddr, is_private);
-    let key2 = make_key(uaddr2, is_private);
+    let (key1, key2) = match (make_key(uaddr, is_private), make_key(uaddr2, is_private)) {
+        (Ok(k1), Ok(k2)) => (k1, k2),
+        (Err(e), _) | (_, Err(e)) => return e,
+    };
     let b1 = futex_bucket(&key1);
     let b2 = futex_bucket(&key2);
 
@@ -836,8 +910,7 @@ pub fn sys_get_robust_list(pid: i32, head_ptr: u64, len_ptr: u64) -> i32 {
 ///
 /// # Arguments
 /// * `tid` - Thread ID of exiting task
-/// * `pid` - Process ID of exiting task (for futex key)
-pub fn exit_robust_list(tid: Tid, pid: u64) {
+pub fn exit_robust_list(tid: Tid) {
     // Get and remove robust list for this task
     let head_addr = {
         let mut table = TASKLIST.write();
@@ -871,68 +944,56 @@ pub fn exit_robust_list(tid: Tid, pid: u64) {
         Err(_) => return,
     };
 
-    // Handle pending lock (lock being acquired at exit)
-    if pending_ptr != 0 {
-        handle_futex_death(pending_ptr, futex_offset, tid, pid);
-    }
-
-    // Walk the list
-    let mut entry = list_ptr;
+    // Linux exit_robust_list: bit 0 of an entry marks a PI futex; the
+    // pending op (a lock being taken or released) is handled last
+    let (pending, pending_pi) = (pending_ptr & !1, pending_ptr & 1 != 0);
+    let mut uentry = list_ptr;
     let mut count = 0;
-
-    while entry != head_addr && count < ROBUST_LIST_LIMIT {
-        // Get next pointer before potentially modifying entry
-        let next = match read_user_u64(entry) {
-            Ok(v) => v,
-            Err(_) => break,
+    while uentry & !1 != head_addr && count < ROBUST_LIST_LIMIT {
+        let entry = uentry & !1;
+        let Ok(next) = read_user_u64(entry) else {
+            break;
         };
-
-        // Skip the pending entry (already handled)
-        if entry != pending_ptr {
-            handle_futex_death(entry, futex_offset, tid, pid);
+        if entry != pending {
+            handle_futex_death(entry, futex_offset, tid, uentry & 1 != 0, false);
         }
-
-        entry = next;
+        uentry = next;
         count += 1;
+    }
+    if pending != 0 {
+        handle_futex_death(pending, futex_offset, tid, pending_pi, true);
     }
 }
 
-/// Handle a single futex on task death
-///
-/// If the task owns the futex (TID matches), set FUTEX_OWNER_DIED
-/// and wake one waiter.
-fn handle_futex_death(entry: u64, futex_offset: i64, tid: Tid, pid: u64) {
-    // Calculate futex address from entry + offset
-    let futex_addr = if futex_offset >= 0 {
-        entry.wrapping_add(futex_offset as u64)
-    } else {
-        entry.wrapping_sub((-futex_offset) as u64)
-    };
-
-    // Read current futex value
-    let current_val = match read_user_u32(futex_addr) {
-        Ok(v) => v,
-        Err(_) => return,
-    };
-
-    // Check if we own this futex
-    let owner_tid = current_val & futex_op::FUTEX_TID_MASK;
-    if owner_tid != tid as u32 {
-        return; // Not our futex
-    }
-
-    // Set FUTEX_OWNER_DIED bit
-    let new_val = current_val | futex_op::FUTEX_OWNER_DIED;
-    if write_user_u32(futex_addr, new_val).is_err() {
+/// A robust futex of an exiting task (Linux handle_futex_death): if it
+/// holds the lock, mark the owner dead (waiters kept, its TID cleared so
+/// a reused TID is not taken for the owner) and wake a waiter of a
+/// non-PI futex (PI futexes are not implemented). A pending non-PI op
+/// on a free word wakes a waiter: the task may have died between being
+/// woken and taking the lock
+fn handle_futex_death(entry: u64, futex_offset: i64, tid: Tid, pi: bool, pending_op: bool) {
+    let futex_addr = entry.wrapping_add_signed(futex_offset);
+    if !futex_addr.is_multiple_of(4) {
         return;
     }
-
-    // Wake one waiter (use private=true since we have pid)
-    let key = FutexKey::private(futex_addr, pid);
-    let bucket = futex_bucket(&key);
-
-    if bucket.has_waiters() {
-        futex_wake(futex_addr, 1, futex_op::FUTEX_BITSET_MATCH_ANY, true);
+    let Ok(uval) = read_user_u32(futex_addr) else {
+        return;
+    };
+    let any = futex_op::FUTEX_BITSET_MATCH_ANY;
+    if pending_op && !pi && uval == 0 {
+        futex_wake(futex_addr, 1, any, false);
+        return;
+    }
+    if uval & futex_op::FUTEX_TID_MASK != tid as u32 {
+        return;
+    }
+    let mval = (uval & futex_op::FUTEX_WAITERS) | futex_op::FUTEX_OWNER_DIED;
+    if write_user_u32(futex_addr, mval).is_err() {
+        return;
+    }
+    // Shared: a robust futex may be in shared memory
+    if !pi && uval & futex_op::FUTEX_WAITERS != 0 {
+        futex_wake(futex_addr, 1, any, false);
     }
 }
 
@@ -1206,16 +1267,19 @@ fn futex_wait_multiple(
             return e;
         }
     }
+    let keys: Result<Vec<FutexKey>, i32> = entries
+        .iter()
+        .map(|e| make_key(e.uaddr, e.is_private))
+        .collect();
+    let keys = match keys {
+        Ok(k) => k,
+        Err(e) => return e,
+    };
 
     loop {
-        let qs: alloc::boxed::Box<[FutexQ]> = entries
+        let qs: alloc::boxed::Box<[FutexQ]> = keys
             .iter()
-            .map(|e| {
-                FutexQ::new(
-                    make_key(e.uaddr, e.is_private),
-                    futex_op::FUTEX_BITSET_MATCH_ANY,
-                )
-            })
+            .map(|&k| FutexQ::new(k, futex_op::FUTEX_BITSET_MATCH_ANY))
             .collect();
         // SAFETY: the slice is not moved until dropped (Drop dequeues)
         let pinned = |i: usize| unsafe { Pin::new_unchecked(&qs[i]) };

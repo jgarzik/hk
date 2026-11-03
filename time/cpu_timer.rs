@@ -232,7 +232,7 @@ pub fn arm(clock: CpuClock, at: u64) {
 /// The tick, on task `t` (interrupt context): past an expiry of the
 /// thread's own or of its group's, run the timers on the way back to
 /// user mode (Linux run_posix_cpu_timers' fastpath + task_work)
-pub fn tick(t: &crate::task::percpu::KernelTask) {
+pub fn tick(t: &crate::task::Task) {
     let mine = [
         t.cpu_next[0].load(Ordering::Relaxed),
         t.cpu_next[1].load(Ordering::Relaxed),

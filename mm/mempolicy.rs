@@ -214,8 +214,8 @@ pub fn sys_get_mempolicy(
 /// # Returns
 /// 0 on success, negative errno on error
 ///
-/// Validates nodemask against real online NUMA nodes.
-/// Policy storage in task struct is handled in Phase 3.
+/// Validates nodemask against real online NUMA nodes; the policy is
+/// not stored yet (BUGS.md).
 pub fn sys_set_mempolicy(mode: i32, nmask_ptr: u64, maxnode: u64) -> i64 {
     // Extract mode and flags
     let policy_mode = mode & 0x7fff; // Lower 15 bits are mode
@@ -275,9 +275,7 @@ pub fn sys_set_mempolicy(mode: i32, nmask_ptr: u64, maxnode: u64) -> i64 {
         return KernelError::InvalidArgument.sysret();
     }
 
-    // Policy validated - actual storage in task struct is Phase 3
-    // For now, accept valid policies (they have no effect until Phase 4)
-
+    // Valid, but not stored and not used by the allocator (BUGS.md)
     0
 }
 
@@ -294,8 +292,8 @@ pub fn sys_set_mempolicy(mode: i32, nmask_ptr: u64, maxnode: u64) -> i64 {
 /// # Returns
 /// 0 on success, negative errno on error
 ///
-/// Validates nodemask against real online NUMA nodes.
-/// VMA policy storage is handled in Phase 3.
+/// Validates nodemask against real online NUMA nodes; the policy is
+/// not stored yet (BUGS.md).
 pub fn sys_mbind(start: u64, len: u64, mode: u64, nmask_ptr: u64, maxnode: u64, flags: u32) -> i64 {
     use super::PAGE_SIZE;
 
@@ -357,9 +355,7 @@ pub fn sys_mbind(start: u64, len: u64, mode: u64, nmask_ptr: u64, maxnode: u64, 
         return KernelError::NotPermitted.sysret();
     }
 
-    // Policy validated - VMA policy storage is Phase 3
-    // Page migration is Phase 5
-
+    // Valid, but not stored and nothing is migrated (BUGS.md)
     0
 }
 
@@ -374,8 +370,8 @@ pub fn sys_mbind(start: u64, len: u64, mode: u64, nmask_ptr: u64, maxnode: u64, 
 /// # Returns
 /// Number of pages that could not be moved, or negative errno
 ///
-/// Validates node masks against real online NUMA nodes.
-/// Actual page migration is implemented in Phase 5.
+/// Validates node masks against real online NUMA nodes; no page is
+/// migrated yet (BUGS.md).
 ///
 /// # Permission Requirements
 /// - Operating on own process: always allowed
@@ -441,8 +437,7 @@ pub fn sys_migrate_pages(pid: i64, maxnode: u64, old_nodes_ptr: u64, new_nodes_p
         return KernelError::InvalidArgument.sysret();
     }
 
-    // Node masks validated - actual page migration is Phase 5
-    // For now, return 0 (no pages failed to migrate)
+    // Nothing is migrated yet (BUGS.md): no page failed
     0
 }
 
@@ -459,8 +454,8 @@ pub fn sys_migrate_pages(pid: i64, maxnode: u64, old_nodes_ptr: u64, new_nodes_p
 /// # Returns
 /// 0 on success, negative errno on error
 ///
-/// Validates nodes against real online NUMA nodes.
-/// Actual page migration is implemented in Phase 5.
+/// Validates nodes against real online NUMA nodes; no page is moved
+/// yet (BUGS.md).
 ///
 /// # Permission Requirements
 /// - MPOL_MF_MOVE_ALL requires CAP_SYS_NICE
@@ -541,11 +536,10 @@ pub fn sys_move_pages(
             return e;
         }
         let status: i32 = if nodes_ptr == 0 {
-            // Query mode: return current node (node 0 for now)
-            // Real implementation in Phase 5 will look up actual page node
+            // Query mode: node 0, not the page's node (BUGS.md)
             0
         } else {
-            // Move mode: nodes validated above (actual migration in Phase 5)
+            // Move mode: nodes validated above, nothing moved (BUGS.md)
             0
         };
         if put_user::<Uaccess, i32>(status_ptr + i * 4, status).is_err() {

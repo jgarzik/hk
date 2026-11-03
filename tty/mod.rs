@@ -21,23 +21,33 @@
 //!
 //! ## Current Implementation
 //!
-//! For MVP, we implement:
-//! - Raw line discipline (no editing, minimal echo)
-//! - Linux-compatible termios structure
-//! - SerialTty driver for NS16550A-compatible UARTs
-//! - Tty as both CharDevice and ConsoleDriver
-//! - Basic TTY ioctls (TCGETS, TCSETS, TIOCGWINSZ, etc.)
+//! - N_TTY, the only line discipline (`n_tty`), cooked by default
+//! - Input from the UART interrupt through flip buffers (`flip`)
+//! - Controlling ttys and job control (`jobctrl`), ioctls (`ioctl`)
+//! - Serial ttys: 16550 ttyS* on x86, PL011 ttyAMA0 on arm64
+//! - /dev/tty, /dev/console, and a Tty as a kernel console
 
 pub mod console_dev;
+pub mod flip;
 pub mod ioctl;
+pub mod jobctrl;
 pub mod n_tty;
 pub mod termios;
 pub mod tty_dev;
 
+use alloc::sync::Arc;
+
+use crate::arch::IrqSpinlock;
 use crate::sync::spin::Mutex;
+use crate::sync::waitqueue::WaitQueue;
 
 use crate::console::ConsoleDriver;
-use crate::fs::chardev::{CharDevice, DeviceError};
+use crate::fs::File;
+use crate::fs::chardev::{CharDevice, DevId};
+use crate::fs::flags::O_NOCTTY;
+use crate::io::poll::{POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM, PollTable};
+use crate::task::pid::Pid;
+use crate::util::error::KernelError;
 
 // Re-export commonly used types
 pub use termios::{
@@ -98,156 +108,34 @@ pub use termios::{
 };
 pub use termios::{Termios, Winsize};
 
-/// TTY driver trait - hardware interface
+/// TTY driver trait - hardware interface (Linux tty_operations)
 ///
-/// Implementations handle the actual hardware (UART, USB, etc.)
+/// Received bytes come from the driver's interrupt handler through
+/// `flip::receive`.
 pub trait TtyDriver: Send + Sync {
-    /// Driver name for identification
-    fn name(&self) -> &str;
-
     /// Write bytes to hardware
-    fn write(&self, data: &[u8]) -> Result<usize, DeviceError>;
+    fn write(&self, data: &[u8]) -> Result<usize, KernelError>;
 
-    /// Read bytes from hardware (non-blocking)
-    fn read(&self, buf: &mut [u8]) -> Result<usize, DeviceError>;
-
-    /// Check if data is available to read
-    fn poll_read(&self) -> bool {
-        false
-    }
-
-    /// Initialize the hardware
-    fn init(&self) -> Result<(), DeviceError> {
-        Ok(())
-    }
-
-    /// Flush transmit buffer - wait for all data to be sent
+    /// Wait until the transmitter is empty
     fn flush(&self) {}
 }
 
-/// Line discipline trait - byte stream processing
-///
-/// Sits between user I/O and the TTY driver.
-pub trait LineDiscipline: Send + Sync {
-    /// Process input character from hardware
-    fn receive_char(&self, tty: &Tty, ch: u8);
-
-    /// Process output from user write
-    fn write(&self, tty: &Tty, buf: &[u8]) -> Result<usize, DeviceError>;
-}
-
-/// Raw line discipline - minimal processing
-///
-/// This is the simplest line discipline:
-/// - Input: push directly to read buffer, optional echo
-/// - Output: direct to hardware, optional CR-NL translation
-pub struct RawLineDiscipline;
-
-impl LineDiscipline for RawLineDiscipline {
-    fn receive_char(&self, tty: &Tty, ch: u8) {
-        // Push to read buffer
-        tty.push_input(ch);
-
-        // Echo if enabled
-        if tty.echo_enabled() {
-            let _ = tty.driver_write(&[ch]);
-        }
-    }
-
-    fn write(&self, tty: &Tty, buf: &[u8]) -> Result<usize, DeviceError> {
-        let termios = tty.termios.lock();
-        let opost = termios.c_oflag & OPOST != 0;
-        let onlcr = termios.c_oflag & ONLCR != 0;
-        drop(termios);
-
-        if opost && onlcr {
-            // CR-NL translation
-            for &byte in buf {
-                if byte == b'\n' {
-                    tty.driver_write(b"\r")?;
-                }
-                tty.driver_write(&[byte])?;
-            }
-            Ok(buf.len())
-        } else {
-            // Direct output
-            tty.driver_write(buf)
-        }
-    }
-}
-
-/// Static raw line discipline instance
-pub static RAW_LDISC: RawLineDiscipline = RawLineDiscipline;
-
-/// Ring buffer for TTY input
-struct InputBuffer {
-    data: [u8; 4096],
-    head: usize,
-    tail: usize,
-}
-
-impl InputBuffer {
-    const fn new() -> Self {
-        Self {
-            data: [0; 4096],
-            head: 0,
-            tail: 0,
-        }
-    }
-
-    fn push(&mut self, byte: u8) {
-        let next = (self.head + 1) % self.data.len();
-        if next != self.tail {
-            self.data[self.head] = byte;
-            self.head = next;
-        }
-        // If full, drop the byte
-    }
-
-    fn pop(&mut self) -> Option<u8> {
-        if self.head == self.tail {
-            None
-        } else {
-            let byte = self.data[self.tail];
-            self.tail = (self.tail + 1) % self.data.len();
-            Some(byte)
-        }
-    }
-
-    fn is_empty(&self) -> bool {
-        self.head == self.tail
-    }
-
-    fn available(&self) -> usize {
-        if self.head >= self.tail {
-            self.head - self.tail
-        } else {
-            self.data.len() - self.tail + self.head
-        }
-    }
-
-    fn clear(&mut self) {
-        self.head = 0;
-        self.tail = 0;
-    }
-}
-
-/// TTY internal state (protected by mutex)
-struct TtyState {
+/// Job control state (Linux tty->ctrl and winsize)
+struct TtyCtrl {
     /// Window size
     winsize: Winsize,
-    /// Session ID that owns this TTY
-    session: Option<u32>,
-    /// Foreground process group ID
-    foreground_pgrp: Option<u32>,
+    /// The session whose controlling tty this is
+    session: Option<Arc<Pid>>,
+    /// Foreground process group
+    pgrp: Option<Arc<Pid>>,
 }
 
-impl TtyState {
+impl TtyCtrl {
     const fn new() -> Self {
         Self {
             winsize: Winsize::default_console(),
             session: None,
-            foreground_pgrp: None,
+            pgrp: None,
         }
     }
 }
@@ -259,47 +147,53 @@ impl TtyState {
 pub struct Tty {
     /// Device name (e.g., "ttyS0", "ttyUSB0")
     name: &'static str,
+    /// Device number (/dev node)
+    dev: DevId,
     /// Terminal settings
     pub termios: Mutex<Termios>,
-    /// Line discipline
-    ldisc: &'static dyn LineDiscipline,
     /// Hardware driver
     driver: &'static dyn TtyDriver,
-    /// Input buffer (from hardware)
-    input: Mutex<InputBuffer>,
-    /// TTY state (winsize, session info)
-    state: Mutex<TtyState>,
+    /// N_TTY input state
+    ldata: Mutex<n_tty::NTtyData>,
+    /// Bytes from the driver's interrupt handler
+    flip: IrqSpinlock<flip::Flip>,
+    /// Serializes feeding the flip buffer to the line discipline with
+    /// input flushes (Linux tty_bufhead.lock, a mutex)
+    buf_lock: crate::sync::Mutex<()>,
+    /// Readers and pollers wait here for input (Linux read_wait)
+    read_wait: WaitQueue,
+    /// Session, foreground group, window size
+    ctrl: Mutex<TtyCtrl>,
 }
 
 impl Tty {
     /// Create a new TTY with the given driver (const fn for static init)
-    pub const fn new(
-        name: &'static str,
-        driver: &'static dyn TtyDriver,
-        ldisc: &'static dyn LineDiscipline,
-    ) -> Self {
+    pub const fn new(name: &'static str, dev: DevId, driver: &'static dyn TtyDriver) -> Self {
         Self {
             name,
-            termios: Mutex::new(Termios::new()),
-            ldisc,
+            dev,
+            termios: Mutex::new(Termios::cooked()),
             driver,
-            input: Mutex::new(InputBuffer::new()),
-            state: Mutex::new(TtyState::new()),
+            ldata: Mutex::new(n_tty::NTtyData::new()),
+            flip: IrqSpinlock::new(flip::Flip::new()),
+            buf_lock: crate::sync::Mutex::new(()),
+            read_wait: WaitQueue::new(),
+            ctrl: Mutex::new(TtyCtrl::new()),
         }
     }
 
-    /// Check if echo is enabled
-    pub fn echo_enabled(&self) -> bool {
-        self.termios.lock().c_lflag & ECHO != 0
+    /// Device name (/dev node)
+    pub fn name(&self) -> &'static str {
+        self.name
     }
 
-    /// Push a byte to the input buffer (called by driver/ldisc)
-    pub fn push_input(&self, byte: u8) {
-        self.input.lock().push(byte);
+    /// Device number
+    pub fn dev(&self) -> DevId {
+        self.dev
     }
 
     /// Write directly to driver (bypassing line discipline)
-    pub fn driver_write(&self, data: &[u8]) -> Result<usize, DeviceError> {
+    pub fn driver_write(&self, data: &[u8]) -> Result<usize, KernelError> {
         self.driver.write(data)
     }
 
@@ -314,49 +208,54 @@ impl Tty {
 
     /// Set the termios structure
     pub fn set_termios(&self, termios: Termios) {
-        *self.termios.lock() = termios;
+        self.update_termios(|t| *t = termios);
+    }
+
+    /// Change termios in place (Linux: under termios_rwsem). Under
+    /// ldata, so input, reads and polls see the old settings or the new
+    /// ones with the ICANON change applied, never half; readers and
+    /// pollers are woken (VMIN, VTIME or ICANON may make input readable)
+    pub fn update_termios(&self, f: impl FnOnce(&mut Termios)) {
+        let mut ld = self.ldata.lock();
+        let canon = {
+            let mut t = self.termios.lock();
+            f(&mut t);
+            t.c_lflag & termios::ICANON != 0
+        };
+        ld.set_icanon(canon);
+        drop(ld);
+        self.read_wait.wake_all();
     }
 
     /// Get the window size
     pub fn get_winsize(&self) -> Winsize {
-        self.state.lock().winsize
+        self.ctrl.lock().winsize
     }
 
-    /// Set the window size
-    pub fn set_winsize(&self, winsize: Winsize) {
-        self.state.lock().winsize = winsize;
+    /// Set the window size; a new one signals the foreground process
+    /// group with SIGWINCH (Linux tty_do_resize)
+    pub fn resize(&self, ws: Winsize) {
+        let pgrp = {
+            let mut c = self.ctrl.lock();
+            if c.winsize == ws {
+                return;
+            }
+            c.winsize = ws;
+            c.pgrp.clone()
+        };
+        if let Some(pg) = pgrp {
+            crate::signal::kill_pgrp_pid(&pg, crate::signal::SIGWINCH);
+        }
     }
 
-    /// Get the number of bytes available to read
+    /// Bytes a read can return (TIOCINQ)
     pub fn bytes_available(&self) -> usize {
-        self.input.lock().available()
+        self.ldata.lock().inq()
     }
 
-    /// Get the foreground process group
-    pub fn get_foreground_pgrp(&self) -> Option<u32> {
-        self.state.lock().foreground_pgrp
-    }
-
-    /// Set the foreground process group
-    pub fn set_foreground_pgrp(&self, pgrp: u32) {
-        self.state.lock().foreground_pgrp = Some(pgrp);
-    }
-
-    /// Get the session ID
-    pub fn get_session(&self) -> Option<u32> {
-        self.state.lock().session
-    }
-
-    /// Set the session ID
-    pub fn set_session(&self, sid: u32) {
-        self.state.lock().session = Some(sid);
-    }
-
-    /// Clear the session ID (give up controlling terminal)
-    pub fn clear_session(&self) {
-        let mut state = self.state.lock();
-        state.session = None;
-        state.foreground_pgrp = None;
+    /// The foreground process group
+    pub fn pgrp(&self) -> Option<Arc<Pid>> {
+        self.ctrl.lock().pgrp.clone()
     }
 
     /// Get the line discipline number
@@ -371,8 +270,13 @@ impl Tty {
     }
 
     /// Flush the input buffer
+    /// Drop all received input, the flip buffer's too (Linux
+    /// tty_buffer_flush): under buf_lock, so bytes being fed to the line
+    /// discipline are not added after the flush
     pub fn flush_input(&self) {
-        self.input.lock().clear();
+        let _b = self.buf_lock.lock();
+        self.flip.lock().clear();
+        self.ldata.lock().reset();
     }
 
     /// Flush the output buffer (no-op for polled driver)
@@ -387,37 +291,42 @@ impl CharDevice for Tty {
         self.name
     }
 
-    fn read(&self, buf: &mut [u8]) -> Result<usize, DeviceError> {
-        let mut input = self.input.lock();
-        let mut count = 0;
-
-        while count < buf.len() {
-            if let Some(byte) = input.pop() {
-                buf[count] = byte;
-                count += 1;
-            } else {
-                break;
-            }
+    fn open(&self, file: &File) -> Result<(), KernelError> {
+        if file.get_flags() & O_NOCTTY == 0 {
+            jobctrl::open_set_tty(self, file);
         }
+        Ok(())
+    }
 
-        if count == 0 && !self.driver.poll_read() {
-            // No data available
-            return Err(DeviceError::WouldBlock);
+    /// A background reader gets SIGTTIN (Linux job_control)
+    fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {
+        jobctrl::check_change(self, crate::signal::SIGTTIN)?;
+        n_tty::read(self, file, buf)
+    }
+
+    /// With TOSTOP a background writer gets SIGTTOU (Linux n_tty_write)
+    fn write(&self, _file: &File, buf: &[u8]) -> Result<usize, KernelError> {
+        if self.get_termios().c_lflag & TOSTOP != 0 {
+            jobctrl::check_change(self, crate::signal::SIGTTOU)?;
         }
-
-        Ok(count)
+        n_tty::write(self, buf)
     }
 
-    fn write(&self, buf: &[u8]) -> Result<usize, DeviceError> {
-        self.ldisc.write(self, buf)
+    fn ioctl(&self, file: &File, cmd: u32, arg: u64) -> Result<i64, KernelError> {
+        ioctl::tty_ioctl(self, file, cmd, arg)
     }
 
-    fn ioctl(&self, cmd: u32, arg: u64) -> Result<i64, DeviceError> {
-        ioctl::tty_ioctl(self, cmd, arg)
-    }
-
-    fn poll_read(&self) -> bool {
-        !self.input.lock().is_empty() || self.driver.poll_read()
+    /// Output is written synchronously: always writable (Linux
+    /// n_tty_poll)
+    fn poll(&self, _file: &File, pt: Option<&mut PollTable>) -> u16 {
+        if let Some(pt) = pt {
+            pt.poll_wait(&self.read_wait);
+        }
+        let mut mask = POLLOUT | POLLWRNORM;
+        if n_tty::poll_in(self) {
+            mask |= POLLIN | POLLRDNORM;
+        }
+        mask
     }
 }
 
@@ -442,6 +351,62 @@ impl ConsoleDriver for Tty {
     fn flush(&self) {
         self.driver.flush();
     }
+
+    fn tty(&'static self) -> Option<&'static Tty> {
+        Some(self)
+    }
+}
+
+/// Every tty (the serial ports')
+pub fn all() -> &'static [&'static Tty] {
+    crate::arch::serial_ttys()
+}
+
+/// The tty a /dev/tty or /dev/console file works on (its private
+/// data; Linux points such a file at the tty itself)
+struct Redirect(&'static Tty);
+
+impl Redirect {
+    /// Point `file` at `tty` (at open)
+    fn set(file: &File, tty: &'static Tty) {
+        file.private.call_once(|| Arc::new(Redirect(tty)));
+    }
+
+    /// The tty `file` was pointed at
+    fn tty(file: &File) -> Result<&'static Tty, KernelError> {
+        file.private_ref::<Redirect>()
+            .map(|r| r.0)
+            .ok_or(KernelError::Io)
+    }
+}
+
+/// A static tty as a registered character device
+struct TtyChar(&'static Tty);
+
+impl CharDevice for TtyChar {
+    fn name(&self) -> &str {
+        self.0.name
+    }
+
+    fn open(&self, file: &File) -> Result<(), KernelError> {
+        CharDevice::open(self.0, file)
+    }
+
+    fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {
+        CharDevice::read(self.0, file, buf)
+    }
+
+    fn write(&self, file: &File, buf: &[u8]) -> Result<usize, KernelError> {
+        CharDevice::write(self.0, file, buf)
+    }
+
+    fn ioctl(&self, file: &File, cmd: u32, arg: u64) -> Result<i64, KernelError> {
+        CharDevice::ioctl(self.0, file, cmd, arg)
+    }
+
+    fn poll(&self, file: &File, pt: Option<&mut PollTable>) -> u16 {
+        CharDevice::poll(self.0, file, pt)
+    }
 }
 
 /// Initialize TTY character devices in the chardev registry
@@ -450,25 +415,21 @@ impl ConsoleDriver for Tty {
 /// like /dev/console and /dev/tty.
 /// Called from init_vfs() after heap is available.
 pub fn init_tty_chardevs() {
-    use crate::fs::chardev::{DevId, major, register_chardev};
-    use alloc::sync::Arc;
+    use crate::fs::chardev::{major, register_chardev};
 
-    // Register platform-specific serial TTYs
-    #[cfg(target_arch = "x86_64")]
-    crate::hw::serial::register_serial_chardevs();
-
-    #[cfg(target_arch = "aarch64")]
-    {
-        // aarch64 serial registration will go here when implemented
-        // For now, no serial chardev on aarch64
+    // The serial ports (Linux uart_register_driver), fed by the flip
+    // thread
+    flip::init();
+    for &tty in crate::arch::serial_ttys() {
+        let _ = register_chardev(tty.dev, Arc::new(TtyChar(tty)));
     }
 
     // Register /dev/tty (major 5, minor 0) - controlling terminal
-    let tty_dev = Arc::new(tty_dev::TtyCharDevice::new());
+    let tty_dev = Arc::new(tty_dev::TtyCharDevice);
     let _ = register_chardev(DevId::new(major::TTYAUX, 0), tty_dev);
 
     // Register /dev/console (major 5, minor 1) - kernel console
-    let console_dev = Arc::new(console_dev::ConsoleCharDevice::new());
+    let console_dev = Arc::new(console_dev::ConsoleCharDevice);
     let _ = register_chardev(DevId::new(major::TTYAUX, 1), console_dev);
 }
 

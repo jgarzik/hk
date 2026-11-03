@@ -49,11 +49,23 @@ pub use aarch64::uaccess::Aarch64Uaccess as Uaccess;
 #[cfg(target_arch = "aarch64")]
 pub type CurrentArch = aarch64::Aarch64Arch;
 
+/// clone(2) takes tls before child_tid (Linux CONFIG_CLONE_BACKWARDS)
+pub const CLONE_BACKWARDS: bool = cfg!(target_arch = "aarch64");
+
+/// The current architecture's page table
+pub type ArchPageTable = <CurrentArch as SchedArch>::SchedPageTable;
+
 // I/O port access - x86-64 specific
 // Re-exported for platform drivers (PIC, PIT, serial, PCI)
 #[cfg(target_arch = "x86_64")]
 #[allow(unused_imports)]
 pub use x86_64::io::{inb, inl, inw, io_wait, outb, outl, outw};
+
+// The serial ports' ttys (16550 on x86, PL011 on arm64)
+#[cfg(target_arch = "x86_64")]
+pub use crate::hw::serial::serial_ttys;
+#[cfg(target_arch = "aarch64")]
+pub use aarch64::serial::serial_ttys;
 
 // Power management
 #[cfg(target_arch = "x86_64")]
@@ -269,8 +281,6 @@ pub enum MapError {
     InvalidArgument,
     /// Address is not properly aligned (e.g., for huge pages)
     InvalidAddress,
-    /// Address is not mapped (for unmap/split operations)
-    NotMapped,
 }
 
 /// A user mapping met while tearing down an address space
@@ -294,15 +304,6 @@ pub enum Leaf {
 pub trait PageTable: Sized {
     type VirtAddr: Copy;
     type PhysAddr: Copy;
-
-    /// Map a virtual address to a physical address with given flags
-    ///
-    /// Note: This assumes intermediate page tables already exist.
-    /// For general use, prefer `map_with_alloc`.
-    fn map(&mut self, va: Self::VirtAddr, pa: Self::PhysAddr, flags: PageFlags);
-
-    /// Unmap a virtual address
-    fn unmap(&mut self, va: Self::VirtAddr);
 
     /// Translate a virtual address to a physical address
     fn translate(&self, va: Self::VirtAddr) -> Option<Self::PhysAddr>;
@@ -390,7 +391,7 @@ pub trait PerCpuOps {
     /// Returns None if per-CPU data is not yet initialized (early boot).
     fn try_current_cpu_id() -> Option<u32>;
 
-    /// The running task (`*const KernelTask`), 0 for the boot task
+    /// The running task (`*const Task`), 0 for the boot task
     /// (before the first switch, or before per-CPU data exists)
     fn current_task_ptr() -> usize;
 
@@ -398,7 +399,7 @@ pub trait PerCpuOps {
     /// run-queue lock held; the run queue keeps it alive)
     fn set_current_task_ptr(p: usize);
 
-    /// The task running on CPU `cpu` (`*const KernelTask`, 0 for its
+    /// The task running on CPU `cpu` (`*const Task`, 0 for its
     /// boot task): a racy snapshot (Linux task_curr)
     fn current_task_ptr_of(cpu: u32) -> usize;
 

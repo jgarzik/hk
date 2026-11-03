@@ -950,69 +950,6 @@ impl PageTable for Aarch64PageTable {
     type VirtAddr = u64;
     type PhysAddr = u64;
 
-    fn map(&mut self, va: Self::VirtAddr, pa: Self::PhysAddr, flags: PageFlags) {
-        let attrs = leaf_attrs(flags);
-
-        let (l0_idx, l1_idx, l2_idx, l3_idx) = page_indices(va);
-
-        unsafe {
-            let l0 = phys_to_virt_table(self.root_phys);
-
-            // Walk page tables (assumes they exist)
-            let l0_entry = (*l0).entry(l0_idx);
-            if !l0_entry.is_valid() || !l0_entry.is_table() {
-                return;
-            }
-            let l1 = phys_to_virt_table(l0_entry.addr());
-
-            let l1_entry = (*l1).entry(l1_idx);
-            if !l1_entry.is_valid() || l1_entry.is_block() {
-                return;
-            }
-            let l2 = phys_to_virt_table(l1_entry.addr());
-
-            let l2_entry = (*l2).entry(l2_idx);
-            if !l2_entry.is_valid() || l2_entry.is_block() {
-                return;
-            }
-            let l3 = phys_to_virt_table(l2_entry.addr());
-
-            // Set the page entry (callers flush: mm::tlb)
-            let l3_entry = (*l3).entry_mut(l3_idx);
-            l3_entry.set_page(pa, attrs);
-        }
-    }
-
-    fn unmap(&mut self, va: Self::VirtAddr) {
-        let (l0_idx, l1_idx, l2_idx, l3_idx) = page_indices(va);
-
-        unsafe {
-            let l0 = phys_to_virt_table(self.root_phys);
-
-            let l0_entry = (*l0).entry(l0_idx);
-            if !l0_entry.is_valid() || !l0_entry.is_table() {
-                return;
-            }
-            let l1 = phys_to_virt_table(l0_entry.addr());
-
-            let l1_entry = (*l1).entry(l1_idx);
-            if !l1_entry.is_valid() || l1_entry.is_block() {
-                return;
-            }
-            let l2 = phys_to_virt_table(l1_entry.addr());
-
-            let l2_entry = (*l2).entry(l2_idx);
-            if !l2_entry.is_valid() || l2_entry.is_block() {
-                return;
-            }
-            let l3 = phys_to_virt_table(l2_entry.addr());
-
-            // Callers flush (mm::tlb)
-            let l3_entry = (*l3).entry_mut(l3_idx);
-            l3_entry.clear();
-        }
-    }
-
     fn translate(&self, va: Self::VirtAddr) -> Option<Self::PhysAddr> {
         Aarch64PageTable::translate(self, va)
     }

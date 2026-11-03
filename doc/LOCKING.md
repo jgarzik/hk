@@ -383,6 +383,17 @@ Printk locks (ALL IRQ-safe - can be acquired from interrupt context):
 /dev/kmsg (kmsg.rs):
     KmsgUser.cur (spin, per open; never held across a wait) → LOG
     KmsgUser.rate (spin leaf)
+
+TTYs (3.9): jobctrl CTTY_LOCK (spin) → TASKLIST (read) → Tty.ctrl
+    (spin; never takes TASKLIST under it); Tty.ldata → Tty.termios
+    (spin, thread context; termios is read under ldata by input
+    processing and swapped under it by set_termios, as Linux's
+    termios_rwsem spans both); Tty.buf_lock (sleeping Mutex, Linux
+    tty_bufhead.lock) → Tty.ldata: held by the flip thread across
+    feeding input (including the echo's driver write) and by
+    flush_input; Tty.flip (IrqSpinlock leaf,
+    also under IRQ_TABLE in the UART handler). No tty lock is held
+    across a signal, a sleep or a driver write.
 ```
 
 ### Key Rules
@@ -2703,6 +2714,17 @@ reference to each task, Linux wake_q_add), drop it, then wake them
 (`WakeQ::wake_up` -> try_to_wake_up; no TASKLIST).
 ```
 
+Keys (`make_key`, Linux get_futex_key) are made before any bucket
+lock: a private futex is (mm, address), with no lock; a shared one
+takes the mmap_lock for reading to find its VMA (and, under it, the
+file's dentry `d_lock` for its inode) and drops it before locking a
+bucket: mmap_lock and bucket locks are never nested. A shared key in a
+shared mapping is the backing `Shmem` or inode, named by its `KeySeq`
+(Linux i_sequence: unique for the boot, assigned on first use from a
+global atomic counter, no lock), and its byte offset; in private
+memory it is (mm, address), apart from the private key. The exit path
+(robust list, CLEARTID) wakes with shared keys, before `exit_mm`.
+
 A `FutexQ` (Linux futex_q) is pinned on the waiter's stack and linked
 into its bucket. Its `lock_ptr` names the bucket it is on: set under
 that bucket's lock, moved by a requeue under both buckets' locks,
@@ -2769,8 +2791,39 @@ Each `Tty` struct contains:
 | Lock | Type | Purpose |
 |------|------|---------|
 | `termios` | `Mutex<Termios>` | Terminal I/O settings (baud, echo, etc.) |
-| `input` | `Mutex<InputBuffer>` | Hardware input ring buffer |
-| `state` | `Mutex<TtyState>` | Session ID, foreground group |
+| `ldata` | `Mutex<NTtyData>` | N_TTY read ring and edited line (Linux `n_tty_data`) |
+| `ctrl` | `Mutex<TtyCtrl>` | Session, foreground group, window size (Linux `ctrl.lock` + `winsize_mutex`) |
+| `flip` | `IrqSpinlock<Flip>` | Bytes from the UART interrupt handler (Linux `tty_bufhead`) |
+| `buf_lock` | `sync::Mutex<()>` (sleeping) | Feeding `flip` to N_TTY vs input flushes (Linux `tty_bufhead.lock`); outside `ldata` |
+| `read_wait` | `WaitQueue` | Readers and pollers waiting for input |
+
+The `Mutex`es are spin locks taken in thread context only, briefly, one
+at a time except `ldata` → `termios` (input processing reads termios and
+set_termios swaps it under `ldata`, so an ICANON change is applied
+atomically, as Linux's `termios_rwsem`), and never across a signal, a
+sleep or a driver write: N_TTY collects echo and ISIG signals under
+`ldata` and writes/sends them after dropping it; the SIGWINCH of
+TIOCSWINSZ and the SIGHUP/SIGCONT of giving up a controlling tty are sent
+after `ctrl` is dropped. A reader's wait condition takes `ldata`.
+
+Input (`tty/flip.rs`, Linux tty_buffer.c): the UART handler (IRQ
+context, under `IRQ_TABLE`) drains its FIFO into `Tty.flip` (leaf), sets
+`flip::PENDING` and wakes `flip::FLIP_WAIT`; the `ttyflip` kernel thread
+takes the bytes out (`flip`, released before the line discipline runs)
+and feeds them to N_TTY (`ldata`), then wakes `read_wait`. It is the only
+consumer, so input stays in order. Order: `IRQ_TABLE` → `Tty.flip`;
+`IRQ_TABLE` → wait queue head (the wakeup).
+
+`tty::jobctrl::CTTY_LOCK` (spin `Mutex`, thread context; Linux tty_lock
++ siglock in `__proc_set_tty`/`session_clear_tty`) serializes giving and
+taking controlling ttys (open without O_NOCTTY, TIOCSCTTY, TIOCNOTTY, a
+session leader's exit), so a session never gets two. `Tty.ctrl` holds
+the session and foreground group as `Arc<pid::Pid>` references (Linux
+get_pid), read from the caller's task under TASKLIST. Order (Linux
+tty_lock → tasklist_lock → ctrl.lock): `CTTY_LOCK` → TASKLIST (read) →
+`Tty.ctrl`. TIOCSPGRP checks that the group is in the caller's session
+and stores it with TASKLIST read-held across both, so the group cannot
+change in between; the pid lookup (PIDMAP_LOCK) comes before TASKLIST.
 
 #### Graphics Console Lock
 
@@ -2790,7 +2843,7 @@ PRINTK (IrqSpinlock, ring buffer, brief hold during write)
     ↓
 CONSOLE_REGISTRY (IrqSpinlock, console dispatch to drivers)
     ↓
-Per-TTY locks (Mutex: termios, input, state) - independent between TTYs
+Per-TTY locks (Mutex: termios, ldata, ctrl) - independent between TTYs
     ↓
 GfxConsole.state (Mutex, if graphics console receives output)
 ```
@@ -3164,7 +3217,7 @@ else is taken under it) unless an order is given. "spin" is the
 | `Workqueue.inner` | task/workqueue.rs | IrqSpinlock | pending and delayed work lists (`SYSTEM_WQ`, `BDI_WORKQUEUE`); a work item's own `spin::Mutex<Work>` is taken and dropped before it |
 | `BDI_REGISTRY`, `BdiWriteback.dirty`, `BdiWriteback.dwork` | mm/writeback.rs | spin | per-disk writeback state: the devices with dirty data, the periodic work; leaves, writeback runs with none held |
 | `Task.cgroup`, `CSS_SET_CACHE`, `CgroupRoot.{root_cgrp, controllers}`, `Cgroup.{parent, children, ancestors, subsys, tasks}`, `CssSet.subsys`, `CgroupSubsysState.private`, `IoState.devices` | cgroup/ | spin (RwLock; `CSS_SET_CACHE`, `Task.cgroup` Mutex) | cgroup hierarchy and membership (`Task.cgroup`: the task's cgroup, a leaf reached through a `TaskRef` cloned out of TASKLIST, Linux task->cgroups); parent before child; never under TASKLIST |
-| `IpcIds.inner`, `KernIpcPerm.lock`, `MsgQueue.{messages, receivers, senders}`, `MsgReceiver.result`, `SemArray.pending`, `SemUndoList.undos`, `MQ_REGISTRY`, `MqQueue.{messages, flags, notify}` | ipc/ | spin | SysV and POSIX IPC objects; `IpcIds.inner` -> the object's lock |
+| `IpcIds.inner`, `KernIpcPerm.lock`, `MsgQueue.messages`, `SemArray.pending`, `SemUndoList.undos`, `MQ_REGISTRY`, `MqQueue.{messages, flags, notify}` | ipc/ | spin | SysV and POSIX IPC objects; `IpcIds.inner` -> the object's lock. `MsgQueue.messages` also guards the queue's and namespace's message counters and is taken by msgsnd's limit/removal check (Linux: the msq lock) |
 | `Task.keyrings` → `KEY_DATABASE`, `USER_KEYRINGS`, `Key.payload`, `Key.keyring_keys` | keys/ | spin (RwLock; `Task.keyrings` Mutex) | a task's thread/process/session keyring references (`Task.keyrings`, reached through a `TaskRef` cloned out of TASKLIST; creating a keyring registers it under it), key registry and keyrings (lookups clone the `Arc<Key>` out) |
 | `FileLockCtx.flc_lock` (per inode), `locks::BLOCKED`, `locks::POSIX_INODES` | fs/locks.rs | spin Mutex | an inode's flock and POSIX locks (Linux i_flctx flc_lock), leaf but for BLOCKED (flc_lock -> BLOCKED, Linux blocked_lock_lock: each waiting POSIX owner and the owner it waits on, for EDEADLK); POSIX_INODES (inodes with POSIX locks, for the release at exit) a leaf. A blocked locker sleeps on the inode's wait queue with neither held, interruptibly, until the change count moves |
 | `cmdline::SAVED` | cmdline.rs | spin Mutex | the saved kernel command line (Linux saved_command_line): written once while parsing, before SMP; read in thread context (init's arguments); a leaf |
@@ -3191,7 +3244,7 @@ writes and truncates). The address space holds the executable's denial (`MmStruc
 | `SuperBlock.s_wb_lock` | fs/superblock.rs | sleeping `sync::Mutex` | serializes whole-filesystem writeback passes (`writeback_sb`: sync, syncfs, umount, the periodic writeback), held across their I/O: s_wb_lock -> page lock -> i_mmap -> PTE lock. fsync writes its inode without it; a page another pass is writing carries the WRITEBACK mark and its writer holds its page lock, so fsync waits on that lock |
 | `SuperBlock.s_dirty`, `SUPER_BLOCKS` | fs/superblock.rs, fs/fs_writeback.rs | spin Mutex leaves | inodes with dirty pages, each held (an `Arc`) until written back (Linux wb->b_dirty), and the device filesystems for sync(2) (Linux super_blocks). `mark_inode_dirty` takes `s_dirty` under a page lock at most (the fault path), then the BDI's spin locks to arm its periodic writeback; writeback takes the list and writes with no spin lock held |
 | `LAST_INO` (per CPU) | fs/anon_inodes.rs | IrqSpinlock leaf | this CPU's batch of pseudo-filesystem inode numbers (Linux get_next_ino, preempt-off per-CPU counter); refilled from the atomic `SHARED_LAST_INO` under it |
-| `NUMA_TOPOLOGY` | mm/numa.rs | IrqSpinlock | NUMA node table |
+| `NUMA_TOPOLOGY` | mm/numa.rs | IrqSpinlock leaf | NUMA node table: written by the boot parsers and by each CPU at bring-up (`numa::cpu_up`, end of arch per-CPU init), read by getcpu and the mempolicy syscalls |
 | `BpfHashMap.data`, `BpfArrayMap.data` | bpf/map.rs | IrqSpinlock | BPF map contents |
 
 ---

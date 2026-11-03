@@ -562,6 +562,9 @@ impl X86_64PageTable {
                     .ok_or(MapError::FrameAllocationFailed)?;
                 core::ptr::write_bytes(phys_to_virt(pd_phys), 0, PAGE_SIZE as usize);
                 pdpt_entry.set(pd_phys, intermediate_flags);
+            } else if pdpt_entry.flags() & PAGE_HUGE != 0 {
+                // A 1GB leaf covers it
+                return Err(MapError::AlreadyMapped);
             } else {
                 // Entry exists - ensure USER flag is set for user-accessible mappings
                 if flags.contains(PageFlags::USER) {
@@ -591,9 +594,8 @@ impl X86_64PageTable {
                     }
                 }
             } else {
-                // This is a 2MB huge page - we need to split it to map 4KB pages
-                // For now, return error - this case would need more complex handling
-                return Err(MapError::FrameAllocationFailed);
+                // A 2MB leaf covers it (as aarch64 reports a block)
+                return Err(MapError::AlreadyMapped);
             }
             let pt = phys_to_virt_table(pd_entry.addr());
 
@@ -692,87 +694,6 @@ fn page_indices(vaddr: u64) -> (usize, usize, usize, usize) {
 impl PageTable for X86_64PageTable {
     type VirtAddr = u64;
     type PhysAddr = u64;
-
-    fn map(&mut self, va: Self::VirtAddr, pa: Self::PhysAddr, flags: PageFlags) {
-        // Convert flags
-        let mut entry_flags = PAGE_PRESENT;
-        if flags.contains(PageFlags::WRITE) {
-            entry_flags |= PAGE_WRITABLE;
-        }
-        if flags.contains(PageFlags::USER) {
-            entry_flags |= PAGE_USER;
-        }
-        if !flags.contains(PageFlags::EXECUTE) {
-            entry_flags |= PAGE_NO_EXECUTE;
-        }
-
-        let (pml4_idx, pdpt_idx, pd_idx, pt_idx) = page_indices(va);
-
-        // Walk the page tables, creating entries as needed
-        // For now, this is a simplified version that assumes tables exist
-        // In a real implementation, we'd allocate missing tables
-
-        unsafe {
-            let pml4 = phys_to_virt_table(self.pml4_phys);
-
-            // Get or create PDPT
-            let pml4_entry = (*pml4).entry_mut(pml4_idx);
-            if !pml4_entry.is_present() {
-                // Would need to allocate a new PDPT here
-                // For now, panic
-                return;
-            }
-            let pdpt = phys_to_virt_table(pml4_entry.addr());
-
-            // Get or create PD
-            let pdpt_entry = (*pdpt).entry_mut(pdpt_idx);
-            if !pdpt_entry.is_present() {
-                return;
-            }
-            let pd = phys_to_virt_table(pdpt_entry.addr());
-
-            // Get or create PT
-            let pd_entry = (*pd).entry_mut(pd_idx);
-            if !pd_entry.is_present() {
-                return;
-            }
-            let pt = phys_to_virt_table(pd_entry.addr());
-
-            // Set the final page table entry (callers flush: mm::tlb)
-            let pt_entry = (*pt).entry_mut(pt_idx);
-            pt_entry.set(pa, entry_flags);
-        }
-    }
-
-    fn unmap(&mut self, va: Self::VirtAddr) {
-        let (pml4_idx, pdpt_idx, pd_idx, pt_idx) = page_indices(va);
-
-        unsafe {
-            let pml4 = phys_to_virt_table(self.pml4_phys);
-
-            let pml4_entry = (*pml4).entry(pml4_idx);
-            if !pml4_entry.is_present() {
-                return;
-            }
-            let pdpt = phys_to_virt_table(pml4_entry.addr());
-
-            let pdpt_entry = (*pdpt).entry(pdpt_idx);
-            if !pdpt_entry.is_present() {
-                return;
-            }
-            let pd = phys_to_virt_table(pdpt_entry.addr());
-
-            let pd_entry = (*pd).entry(pd_idx);
-            if !pd_entry.is_present() {
-                return;
-            }
-            let pt = phys_to_virt_table(pd_entry.addr());
-
-            // Callers flush (mm::tlb)
-            let pt_entry = (*pt).entry_mut(pt_idx);
-            pt_entry.clear();
-        }
-    }
 
     fn translate(&self, va: Self::VirtAddr) -> Option<Self::PhysAddr> {
         let (pml4_idx, pdpt_idx, pd_idx, pt_idx) = page_indices(va);

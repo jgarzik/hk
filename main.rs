@@ -20,6 +20,7 @@ pub mod printk;
 pub mod selftest;
 pub mod smp;
 pub mod sync;
+pub mod syscall;
 pub mod sysctl;
 pub mod time;
 pub mod uaccess;
@@ -56,23 +57,14 @@ pub mod task;
 #[cfg(not(test))]
 use ::core::panic::PanicInfo;
 
-// Architecture type alias for generic kernel code
-#[cfg(target_arch = "x86_64")]
-type CurrentArch = crate::arch::x86_64::X86_64Arch;
-
-#[cfg(target_arch = "aarch64")]
-type CurrentArch = crate::arch::aarch64::Aarch64Arch;
-
 // Import architecture traits for trait method calls
 use crate::arch::ArchBusOps;
-use crate::arch::SchedArch;
+use crate::arch::ArchPageTable;
+use crate::arch::CurrentArch;
 use crate::arch::{
     AcpiOps, CpuOps, EarlyArchInit, ExceptionOps, HaltOps, InitramfsOps, IoremapOps, LocalTimerOps,
     MemoryLayoutOps, PowerOps, SmpOps, TimekeeperOps, VfsInitOps,
 };
-
-// Page table type alias (used by ELF loading)
-type ArchPageTable = <CurrentArch as SchedArch>::SchedPageTable;
 
 use crate::hw::dma::{DirectDmaOps, dma_init};
 
@@ -203,7 +195,6 @@ use crate::mm::STACK_TOP as USER_STACK_TOP;
 /// Falls back to single-node topology if no NUMA info is available.
 fn init_numa_topology() {
     let total_pages = mm::memblock::MEMBLOCK.lock().memory.total() / 4096;
-    let nr_cpus = 1; // Will be updated when SMP is initialized
 
     #[cfg(target_arch = "x86_64")]
     {
@@ -238,7 +229,7 @@ fn init_numa_topology() {
     }
 
     // Fallback to single-node topology
-    mm::numa::init_single_node_fallback(total_pages, nr_cpus);
+    mm::numa::init_single_node_fallback(total_pages);
 }
 
 /// Discover boot framebuffer from firmware
@@ -659,11 +650,13 @@ fn init_vfs_core() {
         ("random", DevId::new(chardev_major::MEM, 8), 0o666),
         ("urandom", DevId::new(chardev_major::MEM, 9), 0o666),
         ("kmsg", DevId::new(chardev_major::MEM, 11), 0o644),
+        // Ttys: only /dev/tty is 0666, the rest get the devtmpfs
+        // default 0600 (Linux tty_devnode)
         ("tty", DevId::new(chardev_major::TTYAUX, 0), 0o666),
-        ("console", DevId::new(chardev_major::TTYAUX, 1), 0o666),
+        ("console", DevId::new(chardev_major::TTYAUX, 1), 0o600),
     ];
-    if crate::fs::chardev::get_chardev(DevId::new(chardev_major::TTYS, 64)).is_some() {
-        nodes.push(("ttyS0", DevId::new(chardev_major::TTYS, 64), 0o666));
+    for tty in crate::arch::serial_ttys() {
+        nodes.push((tty.name(), tty.dev(), 0o600));
     }
     for (name, dev, mode) in nodes {
         let _ = fs::ramfs_create_chrdev(&dev_dentry, name.as_bytes(), dev, mode);

@@ -10,10 +10,14 @@
 //! - Context switch happens with the run queue lock held
 #![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
+use crate::task::TaskInner;
+use crate::task::TaskLock;
 use ::core::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
+use crate::arch::ArchPageTable;
+use crate::arch::CurrentArch;
 use crate::arch::{
     ContextOps, CpuOps, FrameAlloc, IrqSpinlock, PerCpuOps, SchedArch, UserModeOps, UserRegs,
 };
@@ -49,12 +53,12 @@ fn do_clear_child_tid(tid: Tid) {
 
         // Write 0 to the address
         if put_user::<Uaccess, i32>(addr, 0).is_ok() {
-            // Wake up to 1 waiter on this futex address
+            // Wake one waiter, shared (Linux mm_release)
             crate::task::futex::futex_wake(
                 addr,
                 1,
                 crate::task::futex::futex_op::FUTEX_BITSET_MATCH_ANY,
-                true, // private futex
+                false,
             );
         }
     }
@@ -76,22 +80,11 @@ pub fn signal_vfork_done() {
     }
 }
 
-// Architecture-specific type alias
-// This allows the scheduler to be generic while still having a concrete type for statics
-#[cfg(target_arch = "x86_64")]
-type CurrentArch = crate::arch::x86_64::X86_64Arch;
-#[cfg(target_arch = "aarch64")]
-type CurrentArch = crate::arch::aarch64::Aarch64Arch;
-
-// Re-export the architecture's TaskContext type for convenience
-type TaskContext = <CurrentArch as ContextOps>::TaskContext;
+use crate::task::sched::TaskContext;
 
 /// Size of kernel stack per thread (16KB, with a guard gap below it:
 /// `mm::vmstack`)
 pub const KERNEL_STACK_SIZE: usize = crate::mm::vmstack::THREAD_SIZE;
-
-// Re-export the architecture's page table type for convenience
-type ArchPageTable = <CurrentArch as SchedArch>::SchedPageTable;
 
 /// Configuration for creating a user task
 ///
@@ -161,7 +154,7 @@ impl WakeMode {
 const RUNNING: u8 = SleepState::Running as u8;
 const DEAD: u8 = SleepState::Dead as u8;
 
-crate::adapter!(RunAdapter, KernelTask, se.link);
+crate::adapter!(RunAdapter, Task, se.link);
 
 /// Per-CPU run queue (Linux struct rq), under `PerCpuScheduler.lock`
 ///
@@ -175,10 +168,10 @@ pub struct CpuRunQueue {
     /// with the idle task)
     queue: Option<alloc::boxed::Box<ClassQueues<RunAdapter>>>,
     /// The running task (null until this CPU's first switch)
-    curr: *const KernelTask,
+    curr: *const Task,
     /// This CPU's idle task (Linux rq->idle): runs when nothing is
     /// queued; never queued, never asleep
-    idle: *const KernelTask,
+    idle: *const Task,
     /// The task that exited on this CPU, released once it has switched
     /// away from it (Linux finish_task_switch for TASK_DEAD); one at a
     /// time: the next task takes it before anything else runs
@@ -187,7 +180,7 @@ pub struct CpuRunQueue {
     /// `last`): the task switched to clears its `on_cpu` once off its
     /// stack (`finish_task_switch`). Kept alive by the scheduler's
     /// reference, or by `dead`.
-    prev: *const KernelTask,
+    prev: *const Task,
     /// The CPU this run queue belongs to (Linux rq->cpu)
     cpu: u32,
     /// Fair: a vruntime no fair task here is behind (Linux
@@ -272,12 +265,12 @@ impl CpuRunQueue {
 
     /// Put `p` (runnable, neither running nor queued) on its class's
     /// list (Linux enqueue_task)
-    fn enqueue(&mut self, p: &KernelTask) {
+    fn enqueue(&mut self, p: &Task) {
         self.enqueue_at(p, false);
     }
 
     /// `enqueue` at the head of its level (`head`) or the tail
-    fn enqueue_at(&mut self, p: &KernelTask, head: bool) {
+    fn enqueue_at(&mut self, p: &Task, head: bool) {
         // SAFETY: the rq owns a reference to `p`; it is on no list
         unsafe { self.queue().push(p, p.se.class(), p.se.rt_priority(), head) };
     }
@@ -285,13 +278,13 @@ impl CpuRunQueue {
     /// Put the task switched away from back: an rt task preempted
     /// before its slice ran out keeps the head of its level (Linux
     /// put_prev_task_rt), anything else goes to the tail
-    fn enqueue_prev(&mut self, p: &KernelTask, preempted: bool) {
+    fn enqueue_prev(&mut self, p: &Task, preempted: bool) {
         let expired = p.se.take_requeue_tail();
         self.enqueue_at(p, preempted && p.se.class() == Class::Rt && !expired);
     }
 
     /// Take queued `p` off its list (Linux dequeue_task)
-    fn dequeue(&mut self, p: &KernelTask) {
+    fn dequeue(&mut self, p: &Task) {
         // SAFETY: queued, so on its class's list of this run queue
         unsafe { self.queue().remove(p, p.se.class(), p.se.rt_priority()) };
     }
@@ -299,7 +292,7 @@ impl CpuRunQueue {
     /// Make `p` runnable (Linux ttwu_do_activate): Running, and queued
     /// unless it still is on the run queue (running, or not yet switched
     /// out)
-    fn activate(&mut self, p: &KernelTask) {
+    fn activate(&mut self, p: &Task) {
         p.se.set_state(RUNNING);
         if p.se.contrib_load.swap(false, Ordering::Relaxed) {
             PERCPU_SCHEDS
@@ -321,7 +314,7 @@ impl CpuRunQueue {
     /// a higher class always wins; within rt, the higher priority;
     /// once this CPU's rt runtime is used up, fair wins over rt,
     /// `rt_throttled`); a fair task waits for the tick
-    fn check_preempt(&self, p: &KernelTask) {
+    fn check_preempt(&self, p: &Task) {
         // SAFETY: the running task, kept alive by this run queue
         let Some(curr) = (unsafe { self.curr.as_ref() }) else {
             return;
@@ -341,7 +334,7 @@ impl CpuRunQueue {
     /// A woken fair task preempts the running fair one if EEVDF would
     /// pick it now (Linux check_preempt_wakeup_fair): never a SCHED_BATCH
     /// or SCHED_IDLE one, always over a SCHED_IDLE one
-    fn fair_wakeup_preempts(&self, p: &KernelTask, curr: &KernelTask) -> bool {
+    fn fair_wakeup_preempts(&self, p: &Task, curr: &Task) -> bool {
         use crate::task::{SCHED_BATCH, SCHED_IDLE};
         let (pp, cp) = (p.se.policy(), curr.se.policy());
         if pp == SCHED_BATCH || pp == SCHED_IDLE {
@@ -354,8 +347,8 @@ impl CpuRunQueue {
         let q = self.queue.as_ref().expect("run queue not initialized");
         let ents = q
             .fair_iter()
-            .map(|t| (t as *const KernelTask, &t.se))
-            .chain(self.curr_fair().map(|c| (c as *const KernelTask, &c.se)));
+            .map(|t| (t as *const Task, &t.se))
+            .chain(self.curr_fair().map(|c| (c as *const Task, &c.se)));
         crate::task::fair::pick(ents).is_some_and(|t| core::ptr::eq(t, p))
     }
 
@@ -388,7 +381,7 @@ impl CpuRunQueue {
     /// The next task to run: a stopper, else the highest rt task
     /// (unless throttled), else EEVDF's fair pick, else an rt task,
     /// else the idle task (Linux pick_next_task)
-    fn pick_next(&mut self) -> *const KernelTask {
+    fn pick_next(&mut self) -> *const Task {
         let rt = !self.rt_throttled();
         if let Some(t) = self.queue().pop_stop_rt(rt) {
             return t;
@@ -400,10 +393,10 @@ impl CpuRunQueue {
     }
 
     /// EEVDF's pick among the queued fair tasks, taken off their list
-    fn pick_fair(&mut self) -> Option<*const KernelTask> {
+    fn pick_fair(&mut self) -> Option<*const Task> {
         let t = {
             let q = self.queue.as_ref().expect("run queue not initialized");
-            crate::task::fair::pick(q.fair_iter().map(|t| (t as *const KernelTask, &t.se)))?
+            crate::task::fair::pick(q.fair_iter().map(|t| (t as *const Task, &t.se)))?
         };
         // SAFETY: on the fair list (just found there)
         unsafe { self.queue().remove(t, Class::Fair, 0) };
@@ -457,7 +450,7 @@ impl CpuRunQueue {
 
     /// The running task if it is a fair task still on this run queue
     /// and not on its list (Linux cfs_rq->curr)
-    fn curr_fair(&self) -> Option<&KernelTask> {
+    fn curr_fair(&self) -> Option<&Task> {
         // SAFETY: the running task, kept alive by this run queue
         unsafe { self.curr.as_ref() }
             .filter(|c| !self.curr_is_idle() && c.se.class() == Class::Fair && c.se.on_rq())
@@ -485,7 +478,7 @@ impl CpuRunQueue {
 
     /// Place fair `p`, joining this run queue, by its lag (Linux
     /// place_entity; `initial`: a new task)
-    fn place_fair(&self, p: &KernelTask, initial: bool) {
+    fn place_fair(&self, p: &Task, initial: bool) {
         if p.se.class() == Class::Fair {
             crate::task::fair::place(&p.se, self.fair_avg(true), self.fair_load(true), initial);
         }
@@ -493,7 +486,7 @@ impl CpuRunQueue {
 
     /// Fair `p` (queued here, or running) leaves: keep its lag (Linux
     /// update_entity_lag)
-    fn save_lag(&self, p: &KernelTask) {
+    fn save_lag(&self, p: &Task) {
         if p.se.class() == Class::Fair {
             crate::task::fair::save_lag(&p.se, self.fair_avg(true));
         }
@@ -570,15 +563,9 @@ impl Default for PerCpuScheduler {
 /// Each CPU accesses its own entry by CPU ID.
 static PERCPU_SCHEDS: PerCpu<PerCpuScheduler> = crate::percpu![PerCpuScheduler::new()];
 
-/// A task of this kernel's architecture
-pub type KernelTask = Task<CurrentArch, ArchPageTable>;
-
 /// A reference to a task (Linux struct task_struct *, pinned by a
 /// reference count)
-pub type TaskRef = Arc<KernelTask>;
-
-/// Locked fields of a [`KernelTask`]
-pub type KernelTaskInner = crate::task::TaskInner<CurrentArch, ArchPageTable>;
+pub type TaskRef = Arc<Task>;
 
 /// Every task (Linux tasklist: the list of all tasks, init_task.tasks,
 /// plus the pid hash for lookups), under TASKLIST
@@ -592,18 +579,18 @@ pub struct GlobalTaskTable {
     tasks: crate::util::list::ArcList<TasksAdapter>,
 }
 
-crate::adapter!(TasksAdapter, KernelTask, tasks_link);
-crate::adapter!(pub PgrpLink, KernelTask, pgrp_link);
-crate::adapter!(pub SessionLink, KernelTask, session_link);
+crate::adapter!(TasksAdapter, Task, tasks_link);
+crate::adapter!(pub PgrpLink, Task, pgrp_link);
+crate::adapter!(pub SessionLink, Task, session_link);
 
 /// A new reference to a task that lives in an `Arc` (every task but the
 /// boot task does: the table and run queues hold `TaskRef`s)
-pub fn task_ref(t: &KernelTask) -> TaskRef {
-    let p = t as *const KernelTask;
+pub fn task_ref(t: &Task) -> TaskRef {
+    let p = t as *const Task;
     // The static boot task is in no Arc: one pointer compare keeps this
     // safe fn from corrupting the memory before it
     assert!(!core::ptr::eq(p, &INIT_TASK), "task_ref of the boot task");
-    // SAFETY: `t` is the data of a live `Arc<KernelTask>` (see above)
+    // SAFETY: `t` is the data of a live `Arc<Task>` (see above)
     unsafe {
         Arc::increment_strong_count(p);
         Arc::from_raw(p)
@@ -613,20 +600,20 @@ pub fn task_ref(t: &KernelTask) -> TaskRef {
 /// A task with its locked fields readable (the table is locked)
 #[derive(Clone, Copy)]
 pub struct TaskView<'a> {
-    pub task: &'a KernelTask,
-    inner: &'a KernelTaskInner,
+    pub task: &'a Task,
+    inner: &'a TaskInner,
 }
 
 impl<'a> TaskView<'a> {
     /// The locked fields, for the whole borrow of the table
-    pub fn fields(&self) -> &'a KernelTaskInner {
+    pub fn fields(&self) -> &'a TaskInner {
         self.inner
     }
 }
 
 impl core::ops::Deref for TaskView<'_> {
-    type Target = KernelTaskInner;
-    fn deref(&self) -> &KernelTaskInner {
+    type Target = TaskInner;
+    fn deref(&self) -> &TaskInner {
         self.inner
     }
 }
@@ -634,24 +621,24 @@ impl core::ops::Deref for TaskView<'_> {
 /// A task with its locked fields writable (the table is locked and
 /// borrowed mutably)
 pub struct TaskViewMut<'a> {
-    pub task: &'a KernelTask,
-    inner: &'a mut KernelTaskInner,
+    pub task: &'a Task,
+    inner: &'a mut TaskInner,
 }
 
 impl core::ops::Deref for TaskViewMut<'_> {
-    type Target = KernelTaskInner;
-    fn deref(&self) -> &KernelTaskInner {
+    type Target = TaskInner;
+    fn deref(&self) -> &TaskInner {
         self.inner
     }
 }
 
 impl core::ops::DerefMut for TaskViewMut<'_> {
-    fn deref_mut(&mut self) -> &mut KernelTaskInner {
+    fn deref_mut(&mut self) -> &mut TaskInner {
         self.inner
     }
 }
 
-fn view(task: &KernelTask) -> TaskView<'_> {
+fn view(task: &Task) -> TaskView<'_> {
     // SAFETY: the caller borrows the locked table, so no `&mut` view
     // exists meanwhile
     let inner = unsafe { task.inner().get() };
@@ -659,7 +646,7 @@ fn view(task: &KernelTask) -> TaskView<'_> {
     TaskView { task, inner }
 }
 
-fn view_mut(task: &KernelTask) -> TaskViewMut<'_> {
+fn view_mut(task: &Task) -> TaskViewMut<'_> {
     // SAFETY: the caller borrows the locked table mutably, and each
     // task's view is handed out once
     let inner = unsafe { task.inner().get_mut() };
@@ -698,7 +685,7 @@ macro_rules! tracer_reads {
             }
 
             /// Traced by `t` (pointer identity: never a recycled number)
-            pub fn traced_by(&self, t: &KernelTask) -> bool {
+            pub fn traced_by(&self, t: &Task) -> bool {
                 self.ptracer
                     .as_ref()
                     .is_some_and(|w| core::ptr::eq(w.as_ptr(), t))
@@ -727,9 +714,9 @@ impl GlobalTaskTable {
     }
 
     /// Task `tid`, found through the pid hash (root namespace)
-    fn lookup(&self, tid: Tid) -> Option<&KernelTask> {
+    fn lookup(&self, tid: Tid) -> Option<&Task> {
         let pid = crate::task::pid::find_pid(&crate::ns::INIT_PID_NS, u32::try_from(tid).ok()?)?;
-        let t = pid.task() as *const KernelTask;
+        let t = pid.task() as *const Task;
         // SAFETY: a nonzero `task` is in this list (set by `insert`,
         // cleared by `remove` under the write lock), which holds a
         // reference; the caller borrows the locked list
@@ -775,7 +762,7 @@ impl GlobalTaskTable {
     ///
     /// # Safety
     /// `t` is in this list, and no view of it is live.
-    unsafe fn inner_mut_of<'a>(&'a mut self, t: &'a KernelTask) -> &'a mut KernelTaskInner {
+    unsafe fn inner_mut_of<'a>(&'a mut self, t: &'a Task) -> &'a mut TaskInner {
         // SAFETY: see above; the list is locked for writing
         unsafe { t.inner().get_mut() }
             .as_mut()
@@ -801,7 +788,7 @@ impl GlobalTaskTable {
     }
 
     /// Take `child` off its real parent's `children`
-    fn unlink_child(&mut self, child: &KernelTask) {
+    fn unlink_child(&mut self, child: &Task) {
         // SAFETY: in this list; no view is live
         let ci = unsafe { self.inner_mut_of(child) };
         if !core::mem::take(&mut ci.in_children) {
@@ -817,7 +804,7 @@ impl GlobalTaskTable {
 
     /// Move every child of `task` to `reaper` (Linux forget_original_parent
     /// + reparent_leader); true if one was a zombie
-    pub fn reparent(&mut self, task: &KernelTask, reaper: &TaskRef) -> bool {
+    pub fn reparent(&mut self, task: &Task, reaper: &TaskRef) -> bool {
         let mut zombie = false;
         loop {
             // SAFETY: in this list; no view is live
@@ -866,7 +853,7 @@ impl GlobalTaskTable {
     }
 
     /// Take `t` off its leader's thread group
-    fn unlink_thread(&mut self, t: &KernelTask) {
+    fn unlink_thread(&mut self, t: &Task) {
         let Some(l) = self.task(t.pid) else { return };
         // SAFETY: in this list; no view is live; `t` is in its leader's
         // group (every task in the list is)
@@ -918,7 +905,7 @@ impl GlobalTaskTable {
     /// copy_process: under the write lock, so the creator's concurrent
     /// setpgid or setsid is not missed); the creator is in this list,
     /// the child not yet
-    pub fn inherit_pids(&mut self, child: &KernelTask, parent: &KernelTask) {
+    pub fn inherit_pids(&mut self, child: &Task, parent: &Task) {
         // SAFETY: the parent is in this list, locked for writing; no
         // `&mut` view of it is live
         let Some(pi) = (unsafe { parent.inner().get() }).as_ref() else {
@@ -937,7 +924,7 @@ impl GlobalTaskTable {
 
     /// Put group leader `t` on its process group's and session's lists
     /// (Linux attach_pid PIDTYPE_PGID, PIDTYPE_SID)
-    fn attach_pids(&mut self, t: &KernelTask) {
+    fn attach_pids(&mut self, t: &Task) {
         // SAFETY: in this list; no view is live
         let ti = unsafe { self.inner_mut_of(t) };
         if ti.pids_linked || !ti.leader {
@@ -957,7 +944,7 @@ impl GlobalTaskTable {
 
     /// Take `t` off its process group's and session's lists (Linux
     /// detach_pid)
-    fn detach_pids(&mut self, t: &KernelTask) {
+    fn detach_pids(&mut self, t: &Task) {
         // SAFETY: in this list; no view is live
         let ti = unsafe { self.inner_mut_of(t) };
         if !core::mem::take(&mut ti.pids_linked) {
@@ -1014,9 +1001,6 @@ impl GlobalTaskTable {
 /// interrupt handler, so interrupts stay on)
 pub static TASKLIST: RwLock<GlobalTaskTable> = RwLock::new(GlobalTaskTable::new());
 
-/// A task's `alloc_lock` held
-pub type KernelTaskLock<'a> = crate::task::TaskLock<'a, CurrentArch, ArchPageTable>;
-
 /// A reference to task `tid` (TASKLIST only for the lookup)
 pub fn find_task(tid: Tid) -> Option<TaskRef> {
     TASKLIST.read().task(tid)
@@ -1025,7 +1009,7 @@ pub fn find_task(tid: Tid) -> Option<TaskRef> {
 /// Run `f` with task `tid`'s `alloc_lock` held (Linux task_lock(p));
 /// TASKLIST is taken only to find it. Whatever `f` takes out of the
 /// task is returned, to be dropped after the lock (3.1.1 rule 4).
-pub fn with_task_lock<R>(tid: Tid, f: impl FnOnce(&mut KernelTaskLock<'_>) -> R) -> Option<R> {
+pub fn with_task_lock<R>(tid: Tid, f: impl FnOnce(&mut TaskLock<'_>) -> R) -> Option<R> {
     let t = find_task(tid)?;
     let r = f(&mut t.task_lock());
     Some(r)
@@ -1048,18 +1032,18 @@ pub fn no_percpu_task() -> usize {
 
 /// The boot task (Linux init_task): current on each CPU until it first
 /// switches (per-CPU `curr` 0). Root, tid 0, never in TASKLIST.
-pub static INIT_TASK: KernelTask = Task::boot(0);
+pub static INIT_TASK: Task = Task::boot(0);
 
 /// The running task (Linux `current`): a `!Send` handle valid while
 /// the task runs (the run queue holds its reference)
 pub struct Cur {
-    task: &'static KernelTask,
+    task: &'static Task,
     _not_send: core::marker::PhantomData<*const ()>,
 }
 
 impl core::ops::Deref for Cur {
-    type Target = KernelTask;
-    fn deref(&self) -> &KernelTask {
+    type Target = Task;
+    fn deref(&self) -> &Task {
         self.task
     }
 }
@@ -1122,7 +1106,7 @@ impl Cur {
 /// The running task of this CPU (Linux `current`)
 #[inline]
 pub fn current() -> Cur {
-    let p = CurrentArch::current_task_ptr() as *const KernelTask;
+    let p = CurrentArch::current_task_ptr() as *const Task;
     let task = if p.is_null() {
         &INIT_TASK
     } else {
@@ -1138,7 +1122,7 @@ pub fn current() -> Cur {
 
 /// The user registers of task `t` while it is in the kernel (Linux
 /// task_pt_regs): the entry frame at the top of its kernel stack
-pub fn task_pt_regs(t: &KernelTask) -> *mut <CurrentArch as crate::arch::Arch>::TrapFrame {
+pub fn task_pt_regs(t: &Task) -> *mut <CurrentArch as crate::arch::Arch>::TrapFrame {
     let size = core::mem::size_of::<<CurrentArch as crate::arch::Arch>::TrapFrame>() as u64;
     (t.kstack_top - size) as *mut _
 }
@@ -1785,7 +1769,7 @@ fn group_alive(table: &GlobalTaskTable, tgid: Pid, tid: Tid) -> bool {
 
 /// The wait status a zombie leader reports (Linux wait_task_zombie):
 /// the group's exit status after a group exit, else its own
-fn group_status(t: &KernelTaskInner, own: i32) -> i32 {
+fn group_status(t: &TaskInner, own: i32) -> i32 {
     match t.signal.as_ref().map(|s| s.group_exit()) {
         Some(crate::signal::GroupExit::Exit(code)) => code,
         _ => own,
@@ -2553,6 +2537,9 @@ pub fn exit_current(status: Option<i32>) -> ! {
         // go (Linux close_files -> filp_flush -> locks_remove_posix)
         if group_dead {
             crate::fs::posix_lock::release_all_posix_locks_for_pid(current_pid());
+            // A session leader's session loses its controlling tty
+            // (Linux do_exit -> disassociate_ctty(1))
+            crate::tty::jobctrl::disassociate_ctty();
         }
 
         // Clean up SysV semaphore undo list for exiting task
@@ -2579,12 +2566,7 @@ pub fn exit_current(status: Option<i32>) -> ! {
         crate::signal::exit_task_signal(tid);
 
         // Clean up robust futex list for exiting task
-        // Get pid for futex key creation
-        let pid = {
-            let table = TASKLIST.read();
-            table.get(tid).map(|t| t.task.pid).unwrap_or(0)
-        };
-        crate::task::futex::exit_robust_list(tid, pid);
+        crate::task::futex::exit_robust_list(tid);
 
         // Handle CLONE_CHILD_CLEARTID: write 0 and wake futex waiters
         // This must be done before switching away since we need to be in
@@ -2673,7 +2655,7 @@ pub fn exit_current(status: Option<i32>) -> ! {
 /// changes its address space meanwhile (only the task itself does, or
 /// its creator before it first runs), and the run queue's reference
 /// keeps it alive until it has switched away for good.
-fn make_current(t: &KernelTask) -> (u64, *const crate::mm::Mm, (u64, u64)) {
+fn make_current(t: &Task) -> (u64, *const crate::mm::Mm, (u64, u64)) {
     // Running: its owner fields are its own from now on (owner_check;
     // covers kernel threads and every other way a task first runs)
     if !t.started.load(Ordering::Relaxed) {
@@ -2702,7 +2684,7 @@ fn make_current(t: &KernelTask) -> (u64, *const crate::mm::Mm, (u64, u64)) {
         s.membarrier_state.store(st, Ordering::Relaxed);
         s.curr_rank.store(rank(t), Ordering::Relaxed);
     }
-    CurrentArch::set_current_task_ptr(t as *const KernelTask as usize);
+    CurrentArch::set_current_task_ptr(t as *const Task as usize);
     // Linux prepare_task
     t.se.set_on_cpu(true);
     // A fair task's runtime counts from now (Linux set_next_entity)
@@ -2734,8 +2716,8 @@ unsafe fn switch_mm(mm: *const crate::mm::Mm) {
 fn context_switch_locked(
     sched: &PerCpuScheduler,
     mut rq: crate::arch::IrqSpinlockGuard<'_, CpuRunQueue>,
-    prev: &KernelTask,
-    next: *const KernelTask,
+    prev: &Task,
+    next: *const Task,
 ) {
     check_switch_atomic();
     // Save the outgoing task's user TLS register and GS base (user code
@@ -2888,7 +2870,7 @@ pub fn schedule_timeout(timeout: u64) -> u64 {
         process_timeout,
         crate::time::timer::TIMER_HARD
     ));
-    t.set_data(&*me as *const KernelTask as usize);
+    t.set_data(&*me as *const Task as usize);
     t.as_ref().mod_timer(expire);
     schedule();
     t.del_timer_sync();
@@ -2898,12 +2880,12 @@ pub fn schedule_timeout(timeout: u64) -> u64 {
 /// A `schedule_timeout` sleep timed out (tick interrupt): wake its task
 fn process_timeout(t: &crate::time::timer::TimerList) {
     // SAFETY: the sleeper, which deletes the timer before it returns
-    try_to_wake_up(unsafe { &*(t.data() as *const KernelTask) }, WakeMode::Any);
+    try_to_wake_up(unsafe { &*(t.data() as *const Task) }, WakeMode::Any);
 }
 
 /// Lock the run queue `p` is on (Linux task_rq_lock): the CPU it names
 /// once the lock is held
-fn task_rq_lock(p: &KernelTask) -> crate::arch::IrqSpinlockGuard<'static, CpuRunQueue> {
+fn task_rq_lock(p: &Task) -> crate::arch::IrqSpinlockGuard<'static, CpuRunQueue> {
     loop {
         let cpu = p.cpu();
         let rq = get_percpu_sched(cpu).lock.lock();
@@ -2916,7 +2898,7 @@ fn task_rq_lock(p: &KernelTask) -> crate::arch::IrqSpinlockGuard<'static, CpuRun
 /// Move `p` to `cpu`'s run queue's ownership (Linux set_task_cpu):
 /// under its pi_lock while it is off every run queue (a wakeup, a new
 /// task), or under its old rq lock while queued (a migration)
-fn set_task_cpu(p: &KernelTask, cpu: u32) {
+fn set_task_cpu(p: &Task, cpu: u32) {
     p.wake_cpu.store(cpu, Ordering::Relaxed);
     p.cpu.store(cpu, Ordering::Release);
 }
@@ -2983,7 +2965,7 @@ fn prio(se: &sched::SchedEntity) -> i32 {
 
 /// How important `p` is to keep running, for rt placement (Linux
 /// cpupri): idle 0, fair 1, rt 2 + its priority, stop above all
-fn rank(p: &KernelTask) -> u32 {
+fn rank(p: &Task) -> u32 {
     match p.se.class() {
         Class::Idle => 0,
         Class::Fair => 1,
@@ -2996,7 +2978,7 @@ fn rank(p: &KernelTask) -> u32 {
 /// previous one if it would preempt what runs there, else the allowed
 /// CPU running the least important task if `p` would preempt that,
 /// else its previous one
-fn select_task_rq_rt(p: &KernelTask, allowed: &crate::util::cpumask::CpuSet, prev: u32) -> u32 {
+fn select_task_rq_rt(p: &Task, allowed: &crate::util::cpumask::CpuSet, prev: u32) -> u32 {
     let r = rank(p);
     let at = |c: u32| PERCPU_SCHEDS.get(c).curr_rank.load(Ordering::Relaxed);
     if allowed.test(prev) && at(prev) < r {
@@ -3019,7 +3001,7 @@ fn idle_cpu(cpu: u32) -> bool {
 /// idle as possible. All CPUs form one domain (one LLC), so Linux's
 /// domain walk reduces to a scan; a task that may run nowhere active
 /// stays where it is.
-fn select_task_rq(p: &KernelTask, why: Placement) -> u32 {
+fn select_task_rq(p: &Task, why: Placement) -> u32 {
     let prev = p.wake_cpu.load(Ordering::Relaxed);
     let allowed = p.cpus_mask.snapshot().and(&sched_cpus());
     if allowed.is_empty() {
@@ -3088,7 +3070,7 @@ fn select_idle_sibling(allowed: &crate::util::cpumask::CpuSet, prev: u32) -> u32
 /// makes the condition true, then reads the state: each side's store
 /// comes before its load (full barriers), so one of them sees the
 /// other's (no lost wakeup).
-pub fn try_to_wake_up(p: &KernelTask, mode: WakeMode) -> bool {
+pub fn try_to_wake_up(p: &Task, mode: WakeMode) -> bool {
     let _pi = p.pi_lock.lock();
     // Order the caller's condition store before the state load (Linux
     // smp_mb__after_spinlock)
@@ -3211,7 +3193,7 @@ fn sched_balance_rq(this: u32) {
     if sn <= dn + 1 {
         return;
     }
-    let mut moved = [core::ptr::null::<KernelTask>(); NR_MIGRATE];
+    let mut moved = [core::ptr::null::<Task>(); NR_MIGRATE];
     let want = (((sn - dn) / 2) as usize).clamp(1, NR_MIGRATE);
     // Queued rt tasks, then fair ones: the running one and idle are on
     // no list
@@ -3258,7 +3240,7 @@ fn balance_tick(cpu: u32) {
 
 /// A task to move and where (`migration_cpu_stop`'s argument)
 struct Migration {
-    task: *const KernelTask,
+    task: *const Task,
     dest: u32,
 }
 
@@ -3290,11 +3272,7 @@ fn migration_cpu_stop(arg: usize) {
 /// on the other, the two locks one after the other. In between it is on
 /// no list while `on_rq`: everything that touches a queued task on its
 /// run queue holds its pi_lock or found it on that list.
-fn move_queued_task(
-    mut rq: crate::arch::IrqSpinlockGuard<'_, CpuRunQueue>,
-    p: &KernelTask,
-    dest: u32,
-) {
+fn move_queued_task(mut rq: crate::arch::IrqSpinlockGuard<'_, CpuRunQueue>, p: &Task, dest: u32) {
     rq.save_lag(p);
     rq.dequeue(p);
     rq.add_nr(-1);
@@ -3313,10 +3291,7 @@ fn move_queued_task(
 /// it (the caller sleeps meanwhile, which for a task restricting itself
 /// is what lets the stopper find it off the CPU). EINVAL if no active
 /// CPU is in `mask`.
-pub fn set_cpus_allowed_ptr(
-    p: &KernelTask,
-    mask: &crate::util::cpumask::CpuSet,
-) -> Result<(), i32> {
+pub fn set_cpus_allowed_ptr(p: &Task, mask: &crate::util::cpumask::CpuSet) -> Result<(), i32> {
     let allowed = mask.and(&sched_cpus());
     if mask.and(&crate::smp::active_cpus()).is_empty() {
         return Err(22); // EINVAL
@@ -3372,7 +3347,7 @@ pub fn sched_exec() {
 /// what its switch-out saves (user TLS, GS base, FP state) is complete
 /// once its CPU has cleared `on_cpu`, which takes no longer than the
 /// rest of a context switch. False if it woke meanwhile.
-pub fn wait_task_inactive(p: &KernelTask) -> bool {
+pub fn wait_task_inactive(p: &Task) -> bool {
     while p.se.on_cpu() {
         if p.se.state() == RUNNING {
             return false;
@@ -3389,7 +3364,7 @@ pub fn wait_task_inactive(p: &KernelTask) -> bool {
 /// queue's wakeup stands for this one (Linux wake_q_add).
 pub struct WakeQ {
     first: *mut (),
-    last: *const KernelTask,
+    last: *const Task,
 }
 
 /// `se.wake_q` of the last task on a WakeQ (Linux WAKE_Q_TAIL)
@@ -3405,7 +3380,7 @@ impl WakeQ {
 
     /// Queue `p` for a wakeup (its waiter may return once it sees
     /// itself dequeued: the reference keeps `p` alive)
-    pub fn add(&mut self, p: &KernelTask) {
+    pub fn add(&mut self, p: &Task) {
         if p.se
             .wake_q
             .compare_exchange(
@@ -3424,7 +3399,7 @@ impl WakeQ {
             Some(l) => l.se.wake_q.store(raw, Ordering::Relaxed),
             None => self.first = raw,
         }
-        self.last = raw as *const KernelTask;
+        self.last = raw as *const Task;
     }
 
     /// Wake every queued task and drop the queue's references (thread
@@ -3434,7 +3409,7 @@ impl WakeQ {
         self.last = core::ptr::null();
         while p != WAKE_Q_TAIL {
             // SAFETY: added with Arc::into_raw
-            let t = unsafe { Arc::from_raw(p as *const KernelTask) };
+            let t = unsafe { Arc::from_raw(p as *const Task) };
             p = t.se.wake_q.load(Ordering::Relaxed);
             // Off the queue before the wakeup, so a later waker can
             // queue it again (Linux wake_up_q)
@@ -3460,9 +3435,9 @@ impl Drop for WakeQ {
 /// soon: a reschedule IPI interrupts it, and its return to user mode
 /// runs the work (Linux kick_process). Nothing to do for a task on this
 /// CPU (it is the caller, or not running) or not running at all.
-pub fn kick_process(t: &KernelTask) {
+pub fn kick_process(t: &Task) {
     let cpu = t.cpu();
-    let running = CurrentArch::current_task_ptr_of(cpu) == t as *const KernelTask as usize;
+    let running = CurrentArch::current_task_ptr_of(cpu) == t as *const Task as usize;
     if running && crate::cpu::try_this_id() != Some(cpu) {
         crate::smp::smp_send_reschedule(cpu);
     }
@@ -3763,11 +3738,44 @@ pub fn get_tids_by_pgid(pgid: Pid) -> alloc::vec::Vec<Tid> {
 /// The processes of group `pgid`, by pid (their leaders on its list;
 /// Linux do_each_pid_task PIDTYPE_PGID)
 pub fn pgrp_pids(pgid: Pid) -> alloc::vec::Vec<Pid> {
-    let Some(pg) = crate::task::pid::find_pgrp(pgid) else {
-        return alloc::vec::Vec::new();
-    };
+    match crate::task::pid::find_pgrp(pgid) {
+        Some(pg) => pgrp_members(&pg),
+        None => alloc::vec::Vec::new(),
+    }
+}
+
+/// Is group `pg` orphaned: no member has a parent in another group of
+/// its session (Linux will_become_orphaned_pgrp(pg, NULL); members that
+/// exited and children of the global init do not count)
+pub fn pgrp_orphaned(pg: &crate::task::pid::Pid) -> bool {
     let table = TASKLIST.read();
-    table.pgrp(&pg).map(|t| t.task.pid).collect()
+    let same = |a: &Option<Arc<crate::task::pid::Pid>>, b: &crate::task::pid::Pid| {
+        a.as_deref().is_some_and(|a| core::ptr::eq(a, b))
+    };
+    !table.pgrp(pg).any(|m| {
+        if matches!(m.state, crate::task::TaskState::Zombie(_)) {
+            return false;
+        }
+        let Some(parent) = m.real_parent.as_ref().and_then(|w| w.upgrade()) else {
+            return false;
+        };
+        if parent.pid == 1 {
+            return false;
+        }
+        let Some(p) = table.get(parent.tid()) else {
+            return false;
+        };
+        let Some(ms) = m.session.as_deref() else {
+            return false;
+        };
+        !same(&p.pgrp, pg) && same(&p.session, ms)
+    })
+}
+
+/// The processes of group `pg`, by pid
+pub fn pgrp_members(pg: &crate::task::pid::Pid) -> alloc::vec::Vec<Pid> {
+    let table = TASKLIST.read();
+    table.pgrp(pg).map(|t| t.task.pid).collect()
 }
 
 /// Get all unique PIDs in the system
@@ -4068,14 +4076,14 @@ pub fn set_task_nice(pid: Pid, nice: i32) -> Result<(), i32> {
 /// its pi_lock and rq lock): a queued task moves to its new list and
 /// may preempt; the running one reschedules, so the next pick sees the
 /// change
-fn change_class(p: &KernelTask, f: impl FnOnce(&sched::SchedEntity)) {
+fn change_class(p: &Task, f: impl FnOnce(&sched::SchedEntity)) {
     let _pi = p.pi_lock.lock();
     if !cpu_has_scheduler(p.cpu()) {
         f(&p.se);
         return;
     }
     let mut rq = task_rq_lock(p);
-    let pp = p as *const KernelTask;
+    let pp = p as *const Task;
     let running = core::ptr::eq(rq.curr, pp);
     let queued = p.se.on_rq() && !running && !core::ptr::eq(rq.idle, pp);
     let (old, old_rt, old_prio) = (p.se.class(), p.se.rt_priority(), prio(&p.se));

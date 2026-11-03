@@ -28,6 +28,12 @@ impl PlatformBusDriver for SerialPlatformDriver {
         _ctx: &mut BusContext,
     ) -> Result<Box<dyn Device>, DriverError> {
         let base = device.base_addr().ok_or(DriverError::MissingResource)?;
+        // COM1 input by interrupt (its output is polled)
+        if base == u64::from(crate::hw::serial::ports::COM1)
+            && let Some(irq) = device.irq()
+        {
+            crate::hw::serial::rx_irq_init(u32::from(irq));
+        }
         Ok(Box::new(SerialConsole::new(base as u16)))
     }
 }

@@ -9,7 +9,7 @@
 //! as having a single NUMA node (node 0) containing all CPUs and memory.
 
 use crate::arch::IrqSpinlock;
-use crate::util::cpumask::NR_CPUS;
+use crate::util::cpumask::{CpuSet, NR_CPUS};
 
 /// Maximum number of NUMA nodes supported
 pub const MAX_NUMA_NODES: usize = 64;
@@ -34,8 +34,8 @@ pub struct NumaNode {
     pub end_pfn: u64,
     /// Total number of present pages on this node
     pub present_pages: u64,
-    /// Bitmask of CPUs belonging to this node (supports up to 64 CPUs per node)
-    pub cpu_mask: u64,
+    /// CPUs belonging to this node
+    pub cpus: CpuSet,
 }
 
 impl NumaNode {
@@ -46,22 +46,19 @@ impl NumaNode {
             start_pfn: 0,
             end_pfn: 0,
             present_pages: 0,
-            cpu_mask: 0,
+            cpus: CpuSet::new(),
         }
     }
 
     /// Check if a CPU belongs to this node
     pub fn has_cpu(&self, cpu_id: u32) -> bool {
-        if cpu_id >= 64 {
-            return false;
-        }
-        (self.cpu_mask & (1u64 << cpu_id)) != 0
+        (cpu_id as usize) < NR_CPUS && self.cpus.test(cpu_id)
     }
 
     /// Add a CPU to this node
     pub fn add_cpu(&mut self, cpu_id: u32) {
-        if cpu_id < 64 {
-            self.cpu_mask |= 1u64 << cpu_id;
+        if (cpu_id as usize) < NR_CPUS {
+            self.cpus.set(cpu_id);
         }
     }
 
@@ -77,8 +74,12 @@ pub struct NumaTopology {
     pub nr_nodes: usize,
     /// Per-node information (None if node not present)
     pub nodes: [Option<NumaNode>; MAX_NUMA_NODES],
-    /// CPU to node mapping
+    /// CPU to node mapping, by logical CPU number (set at bring-up)
     pub cpu_to_node: [u8; NR_CPUS],
+    /// Firmware CPU id to node, from SRAT / DT (Linux __apicid_to_node)
+    hwid_node: [(u64, u8); NR_CPUS],
+    /// Entries used in `hwid_node`
+    nr_hwid: usize,
     /// Distance matrix between nodes (node_distance[from][to])
     pub distance: [[u8; MAX_NUMA_NODES]; MAX_NUMA_NODES],
     /// Bitmask of online nodes
@@ -100,6 +101,8 @@ impl NumaTopology {
             nr_nodes: 0,
             nodes: [None; MAX_NUMA_NODES],
             cpu_to_node: [0; NR_CPUS],
+            hwid_node: [(0, 0); NR_CPUS],
+            nr_hwid: 0,
             distance: [[0; MAX_NUMA_NODES]; MAX_NUMA_NODES],
             node_online_mask: 0,
             initialized: false,
@@ -109,18 +112,13 @@ impl NumaTopology {
     /// Initialize with a single-node fallback topology
     ///
     /// Used when no NUMA information is available (single-socket systems
-    /// or systems without SRAT/device-tree NUMA properties).
-    pub fn init_single_node(&mut self, total_pages: u64, nr_cpus: usize) {
+    /// or systems without SRAT/device-tree NUMA properties). Each CPU
+    /// joins node 0 as it comes up (`cpu_up`).
+    pub fn init_single_node(&mut self, total_pages: u64) {
         let mut node = NumaNode::new(0);
         node.start_pfn = 0;
         node.end_pfn = total_pages;
         node.present_pages = total_pages;
-
-        // Assign all CPUs to node 0
-        for (cpu, slot) in self.cpu_to_node[..nr_cpus.min(64)].iter_mut().enumerate() {
-            node.add_cpu(cpu as u32);
-            *slot = 0;
-        }
 
         self.nodes[0] = Some(node);
         self.nr_nodes = 1;
@@ -139,11 +137,9 @@ impl NumaTopology {
             return;
         }
 
-        // Update CPU-to-node mapping based on node's cpu_mask
-        for cpu in 0..64u32 {
-            if node.has_cpu(cpu) && (cpu as usize) < NR_CPUS {
-                self.cpu_to_node[cpu as usize] = node_id as u8;
-            }
+        // Update CPU-to-node mapping from the node's CPUs
+        for cpu in node.cpus.iter() {
+            self.cpu_to_node[cpu as usize] = node_id as u8;
         }
 
         self.nodes[node_id] = Some(node);
@@ -235,11 +231,45 @@ impl NumaTopology {
         if (cpu as usize) < NR_CPUS && (node as usize) < MAX_NUMA_NODES {
             self.cpu_to_node[cpu as usize] = node as u8;
 
-            // Also update the node's cpu_mask if node exists
+            // Also add it to the node's CPUs if the node exists
             if let Some(ref mut numa_node) = self.nodes[node as usize] {
                 numa_node.add_cpu(cpu);
             }
         }
+    }
+
+    /// Record the node of the CPU firmware calls `hwid` (x86 APIC id,
+    /// arm64 MPIDR affinity); its logical number is not known yet
+    pub fn set_hwid_node(&mut self, hwid: u64, node: u32) {
+        if node as usize >= MAX_NUMA_NODES {
+            return;
+        }
+        let n = self.nr_hwid;
+        if let Some(e) = self.hwid_node[..n].iter_mut().find(|e| e.0 == hwid) {
+            e.1 = node as u8;
+        } else if n < NR_CPUS {
+            self.hwid_node[n] = (hwid, node as u8);
+            self.nr_hwid = n + 1;
+        }
+    }
+
+    /// The node of firmware CPU `hwid`: the first online node if it is
+    /// unlisted or its node is offline (Linux puts such CPUs on a node
+    /// with memory)
+    fn hwid_to_node(&self, hwid: u64) -> u32 {
+        self.hwid_node[..self.nr_hwid]
+            .iter()
+            .find(|e| e.0 == hwid)
+            .map(|e| e.1 as u32)
+            .filter(|&n| self.node_online(n))
+            .unwrap_or(self.node_online_mask.trailing_zeros() % 64)
+    }
+
+    /// Logical CPU `cpu`, firmware id `hwid`, is coming up: map it to its
+    /// node (Linux numa_set_node at bring-up)
+    pub fn cpu_up(&mut self, cpu: u32, hwid: u64) {
+        let node = self.hwid_to_node(hwid);
+        self.assign_cpu_to_node(cpu, node);
     }
 
     /// Mark topology as initialized
@@ -263,17 +293,19 @@ pub static NUMA_TOPOLOGY: IrqSpinlock<NumaTopology> = IrqSpinlock::new(NumaTopol
 ///
 /// Called when no SRAT table (x86-64) or numa-node-id properties (aarch64)
 /// are found. Creates a synthetic node 0 containing all memory and CPUs.
-pub fn init_single_node_fallback(total_pages: u64, nr_cpus: usize) {
+pub fn init_single_node_fallback(total_pages: u64) {
     let mut topology = NUMA_TOPOLOGY.lock();
     if !topology.is_initialized() {
         topology.init_default_distances();
-        topology.init_single_node(total_pages, nr_cpus);
-        crate::printkln!(
-            "NUMA: 1 node (fallback), {} MB, {} CPUs",
-            total_pages * 4 / 1024,
-            nr_cpus
-        );
+        topology.init_single_node(total_pages);
+        crate::printkln!("NUMA: 1 node (fallback), {} MB", total_pages * 4 / 1024);
     }
+}
+
+/// Logical CPU `cpu`, firmware id `hwid`, is coming up (arch per-CPU
+/// init, after the topology is parsed): record its node
+pub fn cpu_up(cpu: u32, hwid: u64) {
+    NUMA_TOPOLOGY.lock().cpu_up(cpu, hwid);
 }
 
 /// Print NUMA topology summary to console
@@ -288,13 +320,12 @@ pub fn print_topology() {
     for (node_id, node) in topology.nodes.iter().enumerate() {
         if let Some(node) = node {
             let mb = node.memory_size() / (1024 * 1024);
-            let cpus = node.cpu_mask.count_ones();
             crate::printkln!(
-                "  node {}: {} MB, {} CPUs (mask: {:#x})",
+                "  node {}: {} MB, {} CPUs ({})",
                 node_id,
                 mb,
-                cpus,
-                node.cpu_mask
+                node.cpus.count(),
+                node.cpus.fmt_list()
             );
         }
     }
@@ -308,13 +339,16 @@ mod tests {
     fn test_single_node_init() {
         let mut topology = NumaTopology::new();
         topology.init_default_distances();
-        topology.init_single_node(1024, 4); // 4MB, 4 CPUs
+        topology.init_single_node(1024); // 4MB
+        topology.cpu_up(0, 0);
+        topology.cpu_up(3, 7);
 
         assert_eq!(topology.nr_nodes, 1);
         assert!(topology.node_online(0));
         assert!(!topology.node_online(1));
         assert_eq!(topology.cpu_to_node(0), 0);
         assert_eq!(topology.cpu_to_node(3), 0);
+        assert!(topology.get_node(0).is_some_and(|n| n.has_cpu(3)));
         assert_eq!(topology.node_distance(0, 0), LOCAL_DISTANCE);
     }
 
@@ -350,5 +384,59 @@ mod tests {
         assert_eq!(topology.cpu_to_node(3), 1);
         assert_eq!(topology.node_distance(0, 1), REMOTE_DISTANCE);
         assert_eq!(topology.node_distance(1, 0), REMOTE_DISTANCE);
+    }
+
+    #[test]
+    fn test_cpus_past_64() {
+        let mut topology = NumaTopology::new();
+        let mut node1 = NumaNode::new(1);
+        node1.add_cpu(64);
+        node1.add_cpu(255);
+        node1.add_cpu(256); // past NR_CPUS: ignored
+        assert!(node1.has_cpu(64) && node1.has_cpu(255));
+        assert!(!node1.has_cpu(256));
+        topology.add_node(node1);
+        assert_eq!(topology.cpu_to_node(64), 1);
+        assert_eq!(topology.cpu_to_node(255), 1);
+
+        topology.assign_cpu_to_node(100, 1);
+        assert!(topology.get_node(1).is_some_and(|n| n.has_cpu(100)));
+
+        let mut single = NumaTopology::new();
+        single.init_single_node(1024);
+        single.cpu_up(127, 127);
+        assert!(single.get_node(0).is_some_and(|n| n.has_cpu(127)));
+    }
+
+    #[test]
+    fn test_sparse_hwids() {
+        // Firmware ids 0, 2 on node 0; 0x100, 0x102 on node 1 (one node
+        // per cluster, sparse ids): logical CPUs 0..3 in bring-up order
+        let mut topology = NumaTopology::new();
+        topology.add_node(NumaNode::new(0));
+        topology.add_node(NumaNode::new(1));
+        for (hwid, node) in [(0, 0), (2, 0), (0x100, 1), (0x102, 1)] {
+            topology.set_hwid_node(hwid, node);
+        }
+        for (cpu, hwid) in [(0, 0), (1, 0x100), (2, 2), (3, 0x102)] {
+            topology.cpu_up(cpu, hwid);
+        }
+        assert_eq!(topology.cpu_to_node(0), 0);
+        assert_eq!(topology.cpu_to_node(1), 1);
+        assert_eq!(topology.cpu_to_node(2), 0);
+        assert_eq!(topology.cpu_to_node(3), 1);
+        assert!(
+            topology
+                .get_node(1)
+                .is_some_and(|n| n.has_cpu(3) && !n.has_cpu(2))
+        );
+
+        // Unlisted id, and a listed one whose node is offline: first
+        // online node
+        topology.set_hwid_node(9, 5);
+        topology.cpu_up(4, 9);
+        topology.cpu_up(5, 0x999);
+        assert_eq!(topology.cpu_to_node(4), 0);
+        assert_eq!(topology.cpu_to_node(5), 0);
     }
 }

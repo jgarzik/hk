@@ -3,21 +3,15 @@
 //! Replaces the current process image with a new program.
 #![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
+use crate::arch::ArchPageTable;
 use crate::fs::file::flags::{AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 #[cfg(target_arch = "x86_64")]
 use crate::arch::PageTable;
-use crate::arch::{FrameAlloc, PageFlags, SchedArch, phys_to_virt};
+use crate::arch::{FrameAlloc, PageFlags, phys_to_virt};
 
-// Architecture-specific type alias for page tables
-#[cfg(target_arch = "x86_64")]
-type CurrentArch = crate::arch::x86_64::X86_64Arch;
-#[cfg(target_arch = "aarch64")]
-type CurrentArch = crate::arch::aarch64::Aarch64Arch;
-
-type ArchPageTable = <CurrentArch as SchedArch>::SchedPageTable;
 use super::percpu;
 use crate::fs::{File, kernel_open_exec};
 use crate::mm::{ELF_ET_DYN_BASE, MmLayout, STACK_TOP};

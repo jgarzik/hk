@@ -9,7 +9,7 @@ use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicI64, AtomicU32, AtomicU64, Ordering};
 
 use crate::arch::Uaccess;
 use crate::ipc::util::{
@@ -57,24 +57,34 @@ pub struct MsgMsg {
     pub mtext: Vec<u8>,
 }
 
-/// Waiting receiver
-#[allow(dead_code)]
-struct MsgReceiver {
-    tid: u64,
-    msgtype: i64,
-    maxsize: usize,
-    mode: i32,
-    result: Mutex<Option<Result<MsgMsg, i32>>>,
-    woken: AtomicBool,
+/// Which messages msgrcv takes (Linux convert_mode / testmsg)
+#[derive(Clone, Copy)]
+enum Search {
+    Any,
+    Equal(i64),
+    NotEqual(i64),
+    LessEqual(i64),
 }
 
-/// Waiting sender
-#[allow(dead_code)]
-struct MsgSender {
-    tid: u64,
-    msg: MsgMsg,
-    woken: AtomicBool,
-    result: AtomicI32,
+impl Search {
+    fn new(msgtyp: i64, msgflg: i32) -> Self {
+        match msgtyp {
+            0 => Search::Any,
+            // LONG_MIN has no negation: Linux takes LONG_MAX
+            t if t < 0 => Search::LessEqual(t.checked_neg().unwrap_or(i64::MAX)),
+            t if msgflg & MSG_EXCEPT != 0 => Search::NotEqual(t),
+            t => Search::Equal(t),
+        }
+    }
+
+    fn test(self, mtype: i64) -> bool {
+        match self {
+            Search::Any => true,
+            Search::Equal(t) => mtype == t,
+            Search::NotEqual(t) => mtype != t,
+            Search::LessEqual(t) => mtype <= t,
+        }
+    }
 }
 
 /// Message queue
@@ -100,10 +110,6 @@ pub struct MsgQueue {
     pub lrpid: AtomicI32,
     /// Message list
     pub messages: Mutex<VecDeque<MsgMsg>>,
-    /// Waiting receivers
-    receivers: Mutex<VecDeque<Arc<MsgReceiver>>>,
-    /// Waiting senders
-    senders: Mutex<VecDeque<Arc<MsgSender>>>,
     /// Wait queue for blocked operations
     pub waitq: WaitQueue,
     /// Namespace reference
@@ -126,123 +132,84 @@ impl MsgQueue {
             lspid: AtomicI32::new(0),
             lrpid: AtomicI32::new(0),
             messages: Mutex::new(VecDeque::new()),
-            receivers: Mutex::new(VecDeque::new()),
-            senders: Mutex::new(VecDeque::new()),
             waitq: WaitQueue::new(),
             ns,
         }))
     }
 
-    /// Find a message matching the type criteria
-    /// A message matching (`msgtyp`, `msgflg`) is queued
-    fn has_msg(&self, msgtyp: i64, msgflg: i32) -> bool {
-        let messages = self.messages.lock();
-        if msgtyp == 0 {
-            return !messages.is_empty();
-        }
-        let except = msgflg & MSG_EXCEPT != 0;
-        messages.iter().any(|m| {
-            if msgtyp > 0 {
-                (m.mtype == msgtyp) != except
-            } else {
-                m.mtype <= -msgtyp
-            }
-        })
+    /// A message matching `search` is queued
+    fn has_msg(&self, search: Search) -> bool {
+        self.messages.lock().iter().any(|m| search.test(m.mtype))
     }
 
-    fn find_msg(&self, msgtyp: i64, msgflg: i32) -> Option<MsgMsg> {
+    /// Dequeue the message matching `search` (the first, or for
+    /// LessEqual the first of the lowest type) if it fits in `msgsz`
+    /// bytes or may be truncated (Linux find_msg); E2BIG leaves it queued
+    fn take_msg(&self, search: Search, msgsz: usize, noerror: bool) -> Result<Option<MsgMsg>, i32> {
         let mut messages = self.messages.lock();
-
-        if msgtyp == 0 {
-            // Return first message
-            return messages.pop_front();
+        let mut found = messages
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| search.test(m.mtype));
+        let idx = match search {
+            Search::LessEqual(_) => found.min_by_key(|(i, m)| (m.mtype, *i)),
+            _ => found.next(),
         }
-
-        let except = msgflg & MSG_EXCEPT != 0;
-
-        if msgtyp > 0 {
-            // Find message of exact type (or not that type if MSG_EXCEPT)
-            for i in 0..messages.len() {
-                let matches = if except {
-                    messages[i].mtype != msgtyp
-                } else {
-                    messages[i].mtype == msgtyp
-                };
-
-                if matches {
-                    return messages.remove(i);
-                }
-            }
-        } else {
-            // msgtyp < 0: find lowest type <= |msgtyp|
-            let max_type = -msgtyp;
-            let mut best_idx = None;
-            let mut best_type = i64::MAX;
-
-            for i in 0..messages.len() {
-                if messages[i].mtype <= max_type && messages[i].mtype < best_type {
-                    best_type = messages[i].mtype;
-                    best_idx = Some(i);
-                }
-            }
-
-            if let Some(idx) = best_idx {
-                return messages.remove(idx);
-            }
+        .map(|(i, _)| i);
+        let Some(i) = idx else {
+            return Ok(None);
+        };
+        if messages[i].mtext.len() > msgsz && !noerror {
+            return Err(KernelError::ArgListTooLong.errno());
         }
-
-        None
+        let msg = messages.remove(i);
+        if let Some(m) = &msg {
+            self.account(-(m.mtext.len() as i64));
+        }
+        Ok(msg)
     }
 
-    /// Try to deliver message to a waiting receiver
-    fn try_deliver_to_receiver(&self, msg: &MsgMsg) -> bool {
-        let mut receivers = self.receivers.lock();
-
-        for i in 0..receivers.len() {
-            let receiver = &receivers[i];
-
-            // Check type match
-            let matches = if receiver.msgtype == 0 {
-                true
-            } else if receiver.msgtype > 0 {
-                if receiver.mode & MSG_EXCEPT != 0 {
-                    msg.mtype != receiver.msgtype
-                } else {
-                    msg.mtype == receiver.msgtype
-                }
-            } else {
-                msg.mtype <= -receiver.msgtype
-            };
-
-            if matches {
-                // Check size
-                if msg.mtext.len() > receiver.maxsize && receiver.mode & MSG_NOERROR == 0 {
-                    // Message too big and no truncation allowed
-                    continue;
-                }
-
-                // Deliver message
-                let truncated_msg = MsgMsg {
-                    mtype: msg.mtype,
-                    mtext: if msg.mtext.len() > receiver.maxsize {
-                        msg.mtext[..receiver.maxsize].to_vec()
-                    } else {
-                        msg.mtext.clone()
-                    },
-                };
-
-                {
-                    let mut result = receiver.result.lock();
-                    *result = Some(Ok(truncated_msg));
-                }
-                receiver.woken.store(true, Ordering::Release);
-                receivers.remove(i);
-                self.waitq.wake_all();
-                return true;
-            }
+    /// Queue `msg` if it fits (Linux do_msgsnd under the queue lock): the
+    /// limit and removal are checked, and the counters kept, with the
+    /// queue locked, so concurrent senders never pass qbytes and a removed
+    /// queue takes nothing. A message that does not fit comes back
+    fn try_send(&self, msg: MsgMsg) -> Result<Option<MsgMsg>, i32> {
+        let mut messages = self.messages.lock();
+        if self.perm.is_deleted() {
+            return Err(KernelError::IdentifierRemoved.errno());
         }
+        if !self.fits(msg.mtext.len()) {
+            return Ok(Some(msg));
+        }
+        let len = msg.mtext.len() as u64;
+        messages.push_back(msg);
+        self.account(len as i64);
+        Ok(None)
+    }
 
-        false
+    /// A message of `len` bytes fits (Linux msg_fits_inqueue): qbytes
+    /// bounds the bytes and also the number of messages
+    fn fits(&self, len: usize) -> bool {
+        let qbytes = self.qbytes.load(Ordering::Relaxed);
+        self.cbytes.load(Ordering::Relaxed) + len as u64 <= qbytes
+            && u64::from(self.qnum.load(Ordering::Relaxed)) < qbytes
+    }
+
+    /// One message of `bytes` added (> 0) or removed (< 0), under the
+    /// `messages` lock: queue and namespace counters
+    fn account(&self, bytes: i64) {
+        let n = bytes.unsigned_abs();
+        if bytes >= 0 {
+            self.cbytes.fetch_add(n, Ordering::Relaxed);
+            self.qnum.fetch_add(1, Ordering::Relaxed);
+            self.ns.msg_bytes.fetch_add(n, Ordering::Relaxed);
+            self.ns.msg_hdrs.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.cbytes.fetch_sub(n, Ordering::Relaxed);
+            self.qnum.fetch_sub(1, Ordering::Relaxed);
+            self.ns.msg_bytes.fetch_sub(n, Ordering::Relaxed);
+            self.ns.msg_hdrs.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 
     /// Fill msqid64_ds structure for IPC_STAT
@@ -267,37 +234,14 @@ impl IpcObject for MsgQueue {
     }
 
     fn destroy(&self) {
-        // Wake all waiting receivers with EIDRM
+        // Marked deleted before this: after the lock no sender adds more
         {
-            let mut receivers = self.receivers.lock();
-            for receiver in receivers.drain(..) {
-                {
-                    let mut result = receiver.result.lock();
-                    *result = Some(Err(KernelError::IdentifierRemoved.errno()));
-                }
-                receiver.woken.store(true, Ordering::Release);
+            let mut messages = self.messages.lock();
+            while let Some(m) = messages.pop_front() {
+                self.account(-(m.mtext.len() as i64));
             }
         }
-
-        // Wake all waiting senders with EIDRM
-        {
-            let mut senders = self.senders.lock();
-            for sender in senders.drain(..) {
-                sender.result.store(
-                    KernelError::IdentifierRemoved.to_errno_neg(),
-                    Ordering::Release,
-                );
-                sender.woken.store(true, Ordering::Release);
-            }
-        }
-
         self.waitq.wake_all();
-
-        // Update namespace counters
-        let bytes = self.cbytes.load(Ordering::Relaxed);
-        let hdrs = self.qnum.load(Ordering::Relaxed) as u64;
-        self.ns.msg_bytes.fetch_sub(bytes, Ordering::Relaxed);
-        self.ns.msg_hdrs.fetch_sub(hdrs, Ordering::Relaxed);
     }
 }
 
@@ -379,61 +323,25 @@ fn do_msgsnd(msqid: i32, msgp: u64, msgsz: usize, msgflg: i32) -> Result<i32, i3
     let nowait = msgflg & IPC_NOWAIT != 0;
     let pid = current_pid() as i32;
 
-    loop {
-        // Try to deliver directly to a waiting receiver
-        if queue.try_deliver_to_receiver(&msg) {
-            queue.stime.store(current_time_secs(), Ordering::Release);
-            queue.lspid.store(pid, Ordering::Release);
-            return Ok(0);
+    let mut msg = msg;
+    while let Some(back) = queue.try_send(msg)? {
+        msg = back;
+        if nowait {
+            return Err(KernelError::WouldBlock.errno());
         }
-
-        // Check queue limits
-        let current_bytes = queue.cbytes.load(Ordering::Acquire);
-        if current_bytes + msgsz as u64 > queue.qbytes.load(Ordering::Relaxed) {
-            if nowait {
-                return Err(KernelError::WouldBlock.errno());
-            }
-
-            // Sleep until space or removal; a signal ends the call
-            // (System V IPC is never restarted after a handler)
-            let room = || {
-                queue.cbytes.load(Ordering::Acquire) + msgsz as u64
-                    <= queue.qbytes.load(Ordering::Relaxed)
-                    || queue.perm.is_deleted()
-            };
-            queue
-                .waitq
-                .wait_event_interruptible(room)
-                .map_err(|_| KernelError::RestartNoHand.errno())?;
-            if queue.perm.is_deleted() {
-                return Err(KernelError::IdentifierRemoved.errno());
-            }
-            continue;
-        }
-
-        // Add message to queue
-        {
-            let mut messages = queue.messages.lock();
-            messages.push_back(MsgMsg {
-                mtype: msg.mtype,
-                mtext: msg.mtext.clone(),
-            });
-        }
-
-        queue.cbytes.fetch_add(msgsz as u64, Ordering::AcqRel);
-        queue.qnum.fetch_add(1, Ordering::AcqRel);
-        queue.stime.store(current_time_secs(), Ordering::Release);
-        queue.lspid.store(pid, Ordering::Release);
-
-        // Update namespace counters
-        ns.msg_bytes.fetch_add(msgsz as u64, Ordering::Relaxed);
-        ns.msg_hdrs.fetch_add(1, Ordering::Relaxed);
-
-        // Wake any waiting receivers
-        queue.waitq.wake_all();
-
-        return Ok(0);
+        // Sleep until space or removal; a signal ends the call
+        // (System V IPC is never restarted after a handler)
+        let room = || queue.fits(msgsz) || queue.perm.is_deleted();
+        queue
+            .waitq
+            .wait_event_interruptible(room)
+            .map_err(|_| KernelError::RestartNoHand.errno())?;
     }
+    queue.stime.store(current_time_secs(), Ordering::Release);
+    queue.lspid.store(pid, Ordering::Release);
+    // Wake any waiting receivers
+    queue.waitq.wake_all();
+    Ok(0)
 }
 
 /// msgrcv - receive message
@@ -464,29 +372,11 @@ fn do_msgrcv(msqid: i32, msgp: u64, msgsz: usize, msgtyp: i64, msgflg: i32) -> R
     let noerror = msgflg & MSG_NOERROR != 0;
     let pid = current_pid() as i32;
 
+    let search = Search::new(msgtyp, msgflg);
     loop {
-        // Try to find a matching message
-        if let Some(msg) = queue.find_msg(msgtyp, msgflg) {
-            // Check size
-            if msg.mtext.len() > msgsz && !noerror {
-                // Put message back
-                let mut messages = queue.messages.lock();
-                messages.push_front(msg);
-                return Err(KernelError::ArgListTooLong.errno());
-            }
-
-            // Update queue stats
-            queue
-                .cbytes
-                .fetch_sub(msg.mtext.len() as u64, Ordering::AcqRel);
-            queue.qnum.fetch_sub(1, Ordering::AcqRel);
+        if let Some(msg) = queue.take_msg(search, msgsz, noerror)? {
             queue.rtime.store(current_time_secs(), Ordering::Release);
             queue.lrpid.store(pid, Ordering::Release);
-
-            // Update namespace counters
-            ns.msg_bytes
-                .fetch_sub(msg.mtext.len() as u64, Ordering::Relaxed);
-            ns.msg_hdrs.fetch_sub(1, Ordering::Relaxed);
 
             // Copy to user
             put_user::<Uaccess, i64>(msgp, msg.mtype)
@@ -513,7 +403,7 @@ fn do_msgrcv(msqid: i32, msgp: u64, msgsz: usize, msgtyp: i64, msgflg: i32) -> R
         // Sleep until a matching message arrives or the queue is removed
         queue
             .waitq
-            .wait_event_interruptible(|| queue.has_msg(msgtyp, msgflg) || queue.perm.is_deleted())
+            .wait_event_interruptible(|| queue.has_msg(search) || queue.perm.is_deleted())
             .map_err(|_| KernelError::RestartNoHand.errno())?;
 
         // Check if queue was removed

@@ -117,7 +117,7 @@ use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, Ordering};
 
-use crate::arch::{Arch, PageTable};
+use crate::arch::ArchPageTable;
 use crate::fs::FsStruct;
 use crate::ipc::sem::SemUndoList;
 use crate::ns::NsProxy;
@@ -939,7 +939,7 @@ pub mod tif {
 ///   task (or its creator before it runs; `io_context` by anyone);
 /// - everything else ([`TaskInner`]), read and written only under
 ///   TASKLIST, through the table's views (`GlobalTaskTable::get` etc.).
-pub struct Task<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> {
+pub struct Task {
     /// Thread ID: the root number of its `thread_pid`; changes only when
     /// a non-leader execs and takes its leader's (exchange_tids)
     tid: AtomicU64,
@@ -948,7 +948,7 @@ pub struct Task<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::Phy
     /// Kind of task
     pub kind: TaskKind,
     /// Kernel stack top
-    pub kstack_top: A::VirtAddr,
+    pub kstack_top: u64,
     /// Task start time (monotonic clock, nanoseconds since boot; a
     /// de_thread successor takes its leader's)
     pub start_time: AtomicU64,
@@ -1096,11 +1096,11 @@ pub struct Task<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::Phy
     pub session_link: crate::util::list::Link,
     /// The rest, under TASKLIST (None only for the boot task, which
     /// is never in the table)
-    inner: TableCell<Option<TaskInner<A, PT>>>,
+    inner: TableCell<Option<TaskInner>>,
 }
 
 /// The fields of a [`Task`] read and written under TASKLIST
-pub struct TaskInner<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> {
+pub struct TaskInner {
     /// Its process identifier (Linux thread_pid; None for the idle
     /// tasks, tid 0)
     pub thread_pid: Option<Arc<pid::Pid>>,
@@ -1128,7 +1128,7 @@ pub struct TaskInner<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A
     pub state: TaskState,
     /// CPU affinity mask (bit N = CPU N is allowed)
     /// Page table for this task
-    pub page_table: PT,
+    pub page_table: ArchPageTable,
 
     // =========================================================================
     // TLS and thread-exit fields (Linux: embedded in task_struct/thread_struct)
@@ -1205,17 +1205,17 @@ pub struct TaskInner<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A
 
     /// The tracer (Linux task->parent while traced): a task reference,
     /// so a recycled number never names it (under TASKLIST)
-    pub ptracer: Option<alloc::sync::Weak<Task<A, PT>>>,
+    pub ptracer: Option<alloc::sync::Weak<Task>>,
 
     /// The real parent (Linux real_parent): the task whose `children`
     /// list holds this one; None for init and kernel threads. Weak:
     /// exit reparents children first (under TASKLIST)
-    pub real_parent: Option<alloc::sync::Weak<Task<A, PT>>>,
+    pub real_parent: Option<alloc::sync::Weak<Task>>,
 
     /// Its children (Linux children; their `sibling` links): the thread
     /// group leaders it created, one strong reference each, until reaped
     /// or reparented (under TASKLIST)
-    pub children: crate::util::list::ArcList<Sibling<A, PT>>,
+    pub children: crate::util::list::ArcList<Sibling>,
 
     /// On its real parent's `children` (a group leader; Linux: only
     /// leaders are)
@@ -1224,7 +1224,7 @@ pub struct TaskInner<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A
     /// A leader's thread group, itself included (Linux
     /// signal->thread_head; links `thread_node`), one strong reference
     /// each, until a thread leaves the task list (under TASKLIST)
-    pub threads: crate::util::list::ArcList<ThreadNode<A, PT>>,
+    pub threads: crate::util::list::ArcList<ThreadNode>,
 
     /// Message for PTRACE_GETEVENTMSG (child PID, exec old TID, exit code, etc.)
     pub ptrace_message: u64,
@@ -1267,41 +1267,32 @@ impl<T> TableCell<T> {
 }
 
 /// The adapter of `Task.sibling` (children lists)
-pub struct Sibling<A, PT>(core::marker::PhantomData<(A, PT)>);
+pub struct Sibling;
 
 // SAFETY: offset_of! gives `sibling`'s place in the task
-unsafe impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>>
-    crate::util::list::Adapter for Sibling<A, PT>
-{
-    type Item = Task<A, PT>;
-    fn link(t: &Task<A, PT>) -> &crate::util::list::Link {
+unsafe impl crate::util::list::Adapter for Sibling {
+    type Item = Task;
+    fn link(t: &Task) -> &crate::util::list::Link {
         &t.sibling
     }
-    unsafe fn item(l: *const crate::util::list::Link) -> *const Task<A, PT> {
+    unsafe fn item(l: *const crate::util::list::Link) -> *const Task {
         // SAFETY: `l` is the `sibling` of a live task
-        unsafe {
-            (l as *const u8).sub(core::mem::offset_of!(Task<A, PT>, sibling)) as *const Task<A, PT>
-        }
+        unsafe { (l as *const u8).sub(core::mem::offset_of!(Task, sibling)) as *const Task }
     }
 }
 
 /// The adapter of `Task.thread_node` (thread groups)
-pub struct ThreadNode<A, PT>(core::marker::PhantomData<(A, PT)>);
+pub struct ThreadNode;
 
 // SAFETY: offset_of! gives `thread_node`'s place in the task
-unsafe impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>>
-    crate::util::list::Adapter for ThreadNode<A, PT>
-{
-    type Item = Task<A, PT>;
-    fn link(t: &Task<A, PT>) -> &crate::util::list::Link {
+unsafe impl crate::util::list::Adapter for ThreadNode {
+    type Item = Task;
+    fn link(t: &Task) -> &crate::util::list::Link {
         &t.thread_node
     }
-    unsafe fn item(l: *const crate::util::list::Link) -> *const Task<A, PT> {
+    unsafe fn item(l: *const crate::util::list::Link) -> *const Task {
         // SAFETY: `l` is the `thread_node` of a live task
-        unsafe {
-            (l as *const u8).sub(core::mem::offset_of!(Task<A, PT>, thread_node))
-                as *const Task<A, PT>
-        }
+        unsafe { (l as *const u8).sub(core::mem::offset_of!(Task, thread_node)) as *const Task }
     }
 }
 
@@ -1431,12 +1422,12 @@ impl TaskAlloc {
 
 /// A task's `alloc_lock` held (Linux task_lock(p)): its `alloc_lock`
 /// fields readable, and writable under the owner rule ([`OwnCell`])
-pub struct TaskLock<'a, A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> {
-    task: &'a Task<A, PT>,
+pub struct TaskLock<'a> {
+    task: &'a Task,
     _g: crate::sync::spin::MutexGuard<'a, ()>,
 }
 
-impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> TaskLock<'_, A, PT> {
+impl TaskLock<'_> {
     /// The owner rule ([`OwnCell`]): only the task itself, or its creator
     /// before it first runs, replaces an owner field (one load and
     /// compare: a violation would free what the task is using)
@@ -1547,20 +1538,20 @@ impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Tas
     }
 }
 
-impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Task<A, PT> {
+impl Task {
     /// A task with its locked fields (not yet in the table)
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         tid: Tid,
         ids: TaskIds,
         kind: TaskKind,
-        kstack_top: A::VirtAddr,
+        kstack_top: u64,
         cpu: u32,
         cpus: &crate::util::cpumask::CpuSet,
         cred: Arc<Cred>,
         mm: Option<crate::mm::MmRef>,
         alloc: TaskAlloc,
-        inner: TaskInner<A, PT>,
+        inner: TaskInner,
     ) -> Self {
         let now = crate::time::monotonic_ns();
         let flags = match kind {
@@ -1629,7 +1620,7 @@ impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Tas
 
     /// The boot task (Linux init_task): current on every CPU until its
     /// first switch, root, never in the task table
-    pub const fn boot(kstack_top: A::VirtAddr) -> Self {
+    pub const fn boot(kstack_top: u64) -> Self {
         Self {
             tid: AtomicU64::new(0),
             pid: 0,
@@ -1703,7 +1694,7 @@ impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Tas
     }
 
     /// The locked fields (see [`TableCell`]); None for the boot task
-    pub fn inner(&self) -> &TableCell<Option<TaskInner<A, PT>>> {
+    pub fn inner(&self) -> &TableCell<Option<TaskInner>> {
         &self.inner
     }
 
@@ -1743,7 +1734,7 @@ impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Tas
     }
 
     /// Take its `alloc_lock` (Linux task_lock(p))
-    pub fn task_lock(&self) -> TaskLock<'_, A, PT> {
+    pub fn task_lock(&self) -> TaskLock<'_> {
         TaskLock {
             task: self,
             _g: self.alloc_lock.lock(),

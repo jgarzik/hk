@@ -5,11 +5,13 @@
 //!
 //! Reference: include/uapi/asm-generic/ioctls.h
 
-use super::Tty;
-use super::termios::{Termios, Winsize};
+use super::termios::{CLOCAL, N_TTY, Termios, Winsize};
+use super::{Tty, jobctrl};
 use crate::arch::Uaccess;
-use crate::fs::chardev::DeviceError;
+use crate::fs::File;
 use crate::uaccess::{get_user, put_user};
+use crate::util::error::KernelError;
+use crate::util::pod::{FromBytes, IntoBytes};
 
 // =============================================================================
 // TTY ioctl numbers (from include/uapi/asm-generic/ioctls.h)
@@ -57,6 +59,12 @@ pub const TIOCGWINSZ: u32 = 0x5413;
 pub const TIOCSWINSZ: u32 = 0x5414;
 /// Get modem bits
 pub const TIOCMGET: u32 = 0x5415;
+/// Modem lines (TIOCMGET bits)
+const TIOCM_DTR: i32 = 0x002;
+const TIOCM_RTS: i32 = 0x004;
+const TIOCM_CTS: i32 = 0x020;
+const TIOCM_CAR: i32 = 0x040;
+const TIOCM_DSR: i32 = 0x100;
 /// Set modem bits
 pub const TIOCMBIS: u32 = 0x5416;
 /// Clear modem bits
@@ -88,202 +96,82 @@ pub const TIOCSBRK: u32 = 0x5427;
 /// Clear break
 pub const TIOCCBRK: u32 = 0x5428;
 
-/// Handle TTY ioctl for a given TTY device
-///
-/// # Arguments
-/// * `tty` - The TTY device
-/// * `cmd` - The ioctl command number
-/// * `arg` - The ioctl argument (user pointer)
-///
-/// # Returns
-/// * `Ok(result)` - Success with return value
-/// * `Err(DeviceError)` - Error
-pub fn tty_ioctl(tty: &Tty, cmd: u32, arg: u64) -> Result<i64, DeviceError> {
+/// Copy `v` out to the user pointer `arg` (EFAULT if bad)
+fn put<T: IntoBytes>(arg: u64, v: T) -> Result<i64, KernelError> {
+    put_user::<Uaccess, T>(arg, v).map_err(|_| KernelError::BadAddress)?;
+    Ok(0)
+}
+
+/// Copy a `T` in from the user pointer `arg` (EFAULT if bad)
+fn get<T: FromBytes>(arg: u64) -> Result<T, KernelError> {
+    get_user::<Uaccess, T>(arg).map_err(|_| KernelError::BadAddress)
+}
+
+/// Wait until the output is sent (Linux tty_wait_until_sent); a
+/// pending signal ends the call with EINTR
+fn drain(tty: &Tty) -> Result<(), KernelError> {
+    tty.wait_until_sent();
+    if crate::sync::waitqueue::signal_pending() {
+        return Err(KernelError::Interrupted);
+    }
+    Ok(())
+}
+
+/// A tty's ioctl (Linux tty_ioctl, tty_jobctrl_ioctl and
+/// n_tty_ioctl_helper); `arg` is a user pointer for most commands
+pub fn tty_ioctl(tty: &Tty, file: &File, cmd: u32, arg: u64) -> Result<i64, KernelError> {
+    // A background process may not change the tty (Linux
+    // tty_check_change in set_termios, n_tty_ioctl_helper, tty_ioctl)
+    if matches!(
+        cmd,
+        TCSETS | TCSETSW | TCSETSF | TCFLSH | TCXONC | TCSBRK | TCSBRKP | TIOCSBRK | TIOCCBRK
+    ) {
+        jobctrl::check_change(tty, crate::signal::SIGTTOU)?;
+    }
     match cmd {
-        TCGETS => {
-            // Get termios structure
-            let termios = tty.get_termios();
-            if arg == 0 {
-                return Err(DeviceError::InvalidArg);
-            }
-            put_user::<Uaccess, Termios>(arg, termios).map_err(|_| DeviceError::InvalidArg)?;
-            Ok(0)
-        }
-
+        TCGETS => put(arg, tty.get_termios()),
         TCSETS | TCSETSW | TCSETSF => {
-            // Set termios structure
-            // TCSETS: immediate
-            // TCSETSW: after drain
-            // TCSETSF: after flush
-            if arg == 0 {
-                return Err(DeviceError::InvalidArg);
+            let t: Termios = get(arg)?;
+            if cmd != TCSETS {
+                drain(tty)?;
             }
-            let termios: Termios =
-                get_user::<Uaccess, Termios>(arg).map_err(|_| DeviceError::InvalidArg)?;
-
-            // For TCSETSW, we should wait for output to drain
-            if cmd == TCSETSW || cmd == TCSETSF {
-                tty.wait_until_sent();
-            }
-
-            // For TCSETSF, we should also flush input
             if cmd == TCSETSF {
                 tty.flush_input();
             }
-
-            tty.set_termios(termios);
+            tty.set_termios(t);
             Ok(0)
         }
-
-        TIOCGWINSZ => {
-            // Get window size
-            let winsize = tty.get_winsize();
-            if arg == 0 {
-                return Err(DeviceError::InvalidArg);
-            }
-            put_user::<Uaccess, Winsize>(arg, winsize).map_err(|_| DeviceError::InvalidArg)?;
-            Ok(0)
-        }
-
+        TIOCGWINSZ => put(arg, tty.get_winsize()),
         TIOCSWINSZ => {
-            // Set window size
-            if arg == 0 {
-                return Err(DeviceError::InvalidArg);
-            }
-            let winsize: Winsize =
-                get_user::<Uaccess, Winsize>(arg).map_err(|_| DeviceError::InvalidArg)?;
-            tty.set_winsize(winsize);
-            // TODO: Send SIGWINCH to foreground process group
+            tty.resize(get::<Winsize>(arg)?);
             Ok(0)
         }
-
-        FIONREAD => {
-            // Get number of bytes available to read
-            let count = tty.bytes_available() as i32;
-            if arg == 0 {
-                return Err(DeviceError::InvalidArg);
-            }
-            put_user::<Uaccess, i32>(arg, count).map_err(|_| DeviceError::InvalidArg)?;
-            Ok(0)
-        }
-
-        TIOCGPGRP => {
-            // Get foreground process group
-            let pgrp = tty.get_foreground_pgrp().unwrap_or(0) as i32;
-            if arg == 0 {
-                return Err(DeviceError::InvalidArg);
-            }
-            put_user::<Uaccess, i32>(arg, pgrp).map_err(|_| DeviceError::InvalidArg)?;
-            Ok(0)
-        }
-
+        FIONREAD => put(
+            arg,
+            i32::try_from(tty.bytes_available()).unwrap_or(i32::MAX),
+        ),
+        TIOCOUTQ => put(arg, 0i32), // output is written synchronously
+        TIOCGPGRP => put(arg, pid_i32(jobctrl::tiocgpgrp(tty)?)),
         TIOCSPGRP => {
-            // Set foreground process group
-            if arg == 0 {
-                return Err(DeviceError::InvalidArg);
-            }
-            let pgrp: i32 = get_user::<Uaccess, i32>(arg).map_err(|_| DeviceError::InvalidArg)?;
-            if pgrp <= 0 {
-                return Err(DeviceError::InvalidArg);
-            }
-            tty.set_foreground_pgrp(pgrp as u32);
+            jobctrl::tiocspgrp(tty, get::<i32>(arg)?)?;
             Ok(0)
         }
-
-        TIOCGSID => {
-            // Get session ID
-            let sid = tty.get_session().unwrap_or(0) as i32;
-            if arg == 0 {
-                return Err(DeviceError::InvalidArg);
-            }
-            put_user::<Uaccess, i32>(arg, sid).map_err(|_| DeviceError::InvalidArg)?;
-            Ok(0)
-        }
-
+        TIOCGSID => put(arg, pid_i32(jobctrl::tiocgsid(tty)?)),
         TIOCSCTTY => {
-            // Acquire controlling terminal
-            // arg is the "steal" flag (0 = normal, 1 = steal from another session)
-            // This requires the process to be a session leader
-            use crate::task::percpu::{current_pgid, current_pid, current_sid};
-
-            let caller_pid = current_pid();
-            let caller_sid = current_sid();
-            let caller_pgid = current_pgid();
-            let steal = arg != 0;
-
-            // Check if caller is a session leader (pid == sid)
-            if caller_pid != caller_sid {
-                return Err(DeviceError::InvalidArg); // EPERM - not session leader
-            }
-
-            // Check if TTY already has a controlling session
-            if let Some(existing_sid) = tty.get_session()
-                && existing_sid != 0
-                && !steal
-            {
-                return Err(DeviceError::InvalidArg); // EPERM - already has controlling session
-            }
-
-            // Set this process's session as the controlling session
-            tty.set_session(caller_sid as u32);
-            // Also set the foreground process group to the caller's pgid
-            tty.set_foreground_pgrp(caller_pgid as u32);
+            jobctrl::tiocsctty(tty, file, arg == 1)?;
             Ok(0)
         }
-
         TIOCNOTTY => {
-            // Give up controlling terminal
-            // Only the session leader can give up the controlling terminal
-            use crate::task::percpu::{current_pid, current_sid};
-
-            let caller_pid = current_pid();
-            let caller_sid = current_sid();
-
-            // Check if caller is a session leader
-            if caller_pid != caller_sid {
-                return Err(DeviceError::InvalidArg); // EPERM - not session leader
-            }
-
-            // Check if this is actually our controlling terminal
-            if let Some(tty_sid) = tty.get_session()
-                && tty_sid as u64 != caller_sid
-            {
-                return Err(DeviceError::InvalidArg); // Not our controlling terminal
-            }
-
-            // Clear the controlling session
-            tty.clear_session();
+            jobctrl::tiocnotty(tty)?;
             Ok(0)
         }
-
-        TIOCGETD => {
-            // Get line discipline number
-            let ldisc = tty.get_line_discipline() as i32;
-            if arg == 0 {
-                return Err(DeviceError::InvalidArg);
-            }
-            put_user::<Uaccess, i32>(arg, ldisc).map_err(|_| DeviceError::InvalidArg)?;
-            Ok(0)
-        }
-
-        TIOCSETD => {
-            // Set line discipline
-            // For now, we only support N_TTY (0)
-            if arg == 0 {
-                return Err(DeviceError::InvalidArg);
-            }
-            let ldisc: i32 = get_user::<Uaccess, i32>(arg).map_err(|_| DeviceError::InvalidArg)?;
-            if ldisc != 0 {
-                // Only N_TTY supported
-                return Err(DeviceError::InvalidArg);
-            }
-            Ok(0)
-        }
-
+        TIOCGETD => put(arg, i32::from(N_TTY)),
+        TIOCSETD => match get::<i32>(arg)? {
+            0 => Ok(0), // N_TTY, the only one
+            _ => Err(KernelError::InvalidArgument),
+        },
         TCFLSH => {
-            // Flush queues
-            // arg: TCIFLUSH (0), TCOFLUSH (1), TCIOFLUSH (2)
-            match arg as u32 {
+            match arg {
                 0 => tty.flush_input(),  // TCIFLUSH
                 1 => tty.flush_output(), // TCOFLUSH
                 2 => {
@@ -291,60 +179,35 @@ pub fn tty_ioctl(tty: &Tty, cmd: u32, arg: u64) -> Result<i64, DeviceError> {
                     tty.flush_input();
                     tty.flush_output();
                 }
-                _ => return Err(DeviceError::InvalidArg),
+                _ => return Err(KernelError::InvalidArgument),
             }
             Ok(0)
         }
-
-        FIONBIO => {
-            // Set/clear non-blocking I/O
-            // This is typically handled at the file descriptor level, not TTY
-            // We accept it but don't do anything special
+        // A break (TCSBRK 0, TCSBRKP) is not sent: drain only (tcdrain
+        // is TCSBRK 1)
+        TCSBRK | TCSBRKP => {
+            drain(tty)?;
             Ok(0)
         }
-
-        // Unimplemented but return 0 to avoid breaking programs
-        TCGETA | TCSETA | TCSETAW | TCSETAF => {
-            // Old termio interface - not implemented
-            Err(DeviceError::NotSupported)
-        }
-
-        TCSBRK | TCSBRKP | TIOCSBRK | TIOCCBRK => {
-            // Break handling - not implemented for virtual terminals
+        TIOCSBRK | TIOCCBRK | TCXONC | TIOCEXCL | TIOCNXCL => Ok(0),
+        // No modem control: the lines read as asserted, sets are ignored
+        TIOCMGET => put(
+            arg,
+            TIOCM_DTR | TIOCM_RTS | TIOCM_CTS | TIOCM_CAR | TIOCM_DSR,
+        ),
+        TIOCMBIS | TIOCMBIC | TIOCMSET => get::<i32>(arg).map(|_| 0),
+        // Soft carrier is CLOCAL (Linux tty_change_softcar)
+        TIOCGSOFTCAR => put(arg, i32::from(tty.get_termios().c_cflag & CLOCAL != 0)),
+        TIOCSSOFTCAR => {
+            let on = get::<i32>(arg)? != 0;
+            tty.update_termios(|t| t.c_cflag = (t.c_cflag & !CLOCAL) | if on { CLOCAL } else { 0 });
             Ok(0)
         }
-
-        TCXONC => {
-            // Software flow control - not implemented
-            Ok(0)
-        }
-
-        TIOCEXCL | TIOCNXCL => {
-            // Exclusive mode - not implemented
-            Ok(0)
-        }
-
-        TIOCOUTQ => {
-            // Output queue size - return 0 for now
-            if arg != 0 {
-                let _ = put_user::<Uaccess, i32>(arg, 0);
-            }
-            Ok(0)
-        }
-
-        TIOCMGET | TIOCMBIS | TIOCMBIC | TIOCMSET => {
-            // Modem control lines - not implemented for most TTYs
-            Ok(0)
-        }
-
-        TIOCGSOFTCAR | TIOCSSOFTCAR => {
-            // Software carrier - not implemented
-            Ok(0)
-        }
-
-        _ => {
-            // Unknown ioctl
-            Err(DeviceError::NotTty)
-        }
+        _ => Err(KernelError::NotTty),
     }
+}
+
+/// A pid as the user's pid_t
+fn pid_i32(p: u32) -> i32 {
+    i32::try_from(p).unwrap_or(0)
 }

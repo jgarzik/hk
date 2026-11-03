@@ -154,6 +154,49 @@ Missing:
   (Linux mlock_fixup fails with ENOMEM there). A locked mapping grown
   by mremap is not faulted in (Linux populates it).
 
+## NUMA gaps
+
+**Location**: `mm/numa.rs`, `mm/mempolicy.rs`, `mm/page_alloc.rs`
+
+Topology is discovered (ACPI SRAT/SLIT, DT `numa-node-id`) and
+getcpu reports it; nothing else uses it. Missing (Linux
+`mm/mempolicy.c`, `mm/migrate.c`):
+
+- Policies are not stored: set_mempolicy and mbind validate and
+  return 0 (the `TaskMempolicy`/`Vma.mempolicy` fields stay default);
+  get_mempolicy always reports MPOL_LOCAL (Linux: the stored mode,
+  MPOL_DEFAULT when none) and ignores MPOL_F_NODE/MPOL_F_ADDR.
+- One buddy zone for all RAM: no per-node zones (pg_data_t) or
+  node-aware allocation, so no policy (BIND, PREFERRED, INTERLEAVE,
+  local) affects where pages come from.
+- No page migration: migrate_pages and move_pages validate and move
+  nothing; move_pages query mode reports node 0 for every page.
+- Nodemasks are one `u64` (64 nodes); no multi-node QEMU test config.
+- Node numbers are the firmware's (SRAT proximity domain, DT
+  `numa-node-id`) used as is: sparse or large domains leave holes or
+  are dropped (>= 64), and node 0 may not exist (Linux pxm_to_node
+  numbers the domains from 0).
+- The boot topology dump (`print_topology`) runs before any CPU has
+  come up (`cpu_up`), so with real NUMA tables every node shows 0 CPUs.
+
+## arm64 SMP assumes one-cell, Aff0-only CPU ids
+
+**Location**: `arch/aarch64/dtb.rs` (`parse_dtb`), `arch/aarch64/smp.rs`
+(`init`), `arch/aarch64/mod.rs` (`fallback_acpi_info`)
+
+Fine on QEMU virt (one `reg` cell, Aff0 only); wrong on multi-cluster
+hardware (Linux arm64 smp_init_cpus / of_get_cpu_hwid):
+
+- The DT CPU list reads `reg` as one u32: with `#address-cells = 2`
+  every CPU gets the Aff3 cell (0). `CpuInfo.hw_cpu_id` is a u32, so
+  Aff3 is lost anyway, and it is passed as is to PSCI CPU_ON.
+- The boot CPU is taken to be `reg == 0` in the DT list, and smp::init
+  skips the CPU whose id equals MPIDR Aff0 (`mpidr & 0xff`): with
+  clusters (0x100, ...) it can skip the wrong CPU or try to start
+  itself. Linux matches the full MPIDR_HWID_BITMASK affinity.
+- Without a usable DT, a hardcoded table of 4 CPUs (ids 0-3) is used
+  instead of booting just the boot CPU.
+
 ## exec ignores set-user-ID / set-group-ID bits and file capabilities
 
 **Location**: `task/exec.rs` (`do_execve`)
@@ -253,6 +296,60 @@ SIOCUNIXFILE, SO_PEERSEC (ENOPROTOOPT, as on Linux without an LSM).
 Missing: fs.protected_hardlinks/symlinks/fifos/regular do not exist
 (behave as their kernel default 0); no
 immutable/append-only inodes (no IS_APPEND/IS_IMMUTABLE EPERM).
+
+## TTY gaps
+
+**Location:** `tty/`, `hw/serial.rs`, `arch/aarch64/serial.rs`.
+
+- **No hangup:** nothing hangs a tty up (Linux __tty_hangup: vhangup,
+  a session leader's exit, carrier loss), so open files stay usable.
+  A leader's exit and TIOCNOTTY only send SIGHUP/SIGCONT to the
+  foreground group and clear the session; vhangup(2) only checks
+  CAP_SYS_TTY_CONFIG.
+- **Per-process controlling tty:** it is the session's tty, so TIOCNOTTY
+  by a non-leader changes nothing (Linux clears that process's
+  signal->tty only).
+- **No group stop:** a background process that gets SIGTTOU/SIGTTIN
+  with SIG_DFL (tty_check_change) fails with EIO instead of stopping
+  (see the ptrace stop gaps: stop/continue are not implemented).
+- **Missing:** termio ioctls (TCGETA, TCSETA*), termios2, TIOCSTI,
+  TIOCEXCL exclusivity, sending a break (TCSBRK 0), IXON/IXOFF flow
+  control, packet mode, ptys, VLNEXT/VREPRINT/VDISCARD, ECHOPRT,
+  IUCLC/OLCUC, IMAXBEL, PARMRK and parity/break input handling. Output
+  is written synchronously by polling (TIOCOUTQ 0, no write_wait).
+- **Serial ports:** ttyS1 is registered without probing COM2; only
+  COM1 (and the PL011) take input.
+- **No virtual terminals:** the framebuffer and VGA consoles are not
+  ttys (Linux: fbcon/vgacon draw VTs, tty0..tty63, fed by the
+  keyboard), so /dev/console is always a serial tty. With a screen
+  console (console=tty0), Linux's /dev/console is the VT; on hk user
+  console I/O stays on the serial port and the screen shows only
+  printk.
+- **Pid namespaces:** TIOCGPGRP/TIOCGSID return global numbers (Linux
+  pid_vnr: the caller's namespace).
+
+## Futex gaps
+
+**Location:** `task/futex.rs`
+
+- **Robust owner death** updates the futex word with a plain read and
+  write: a FUTEX_WAITERS set by a waiter in between is lost. Linux
+  uses an atomic user-space cmpxchg (futex_atomic_cmpxchg_inatomic);
+  hk has no such uaccess primitive yet (it would also serve
+  FUTEX_WAKE_OP and PI futexes, both missing).
+- **MAP_PRIVATE file mappings:** a shared futex there is keyed by
+  (mm, address) from the VMA; Linux keys a page still in the page
+  cache (not yet COW'd) by inode and offset, so a MAP_SHARED mapping
+  of the same file wakes it.
+
+## FIONREAD on pipes is 0
+
+**Location:** `fs/misc.rs` (sys_ioctl)
+
+The generic FIONREAD arm answers every file except chardevs with 0,
+so a pipe or FIFO with data reports 0. Linux do_vfs_ioctl handles
+FIONREAD only for regular files and passes the rest to f_op->ioctl
+(pipe_ioctl returns the buffered bytes).
 
 ## Unaligned user pointers are EFAULT
 
