@@ -27,6 +27,7 @@ pub fn run_tests() {
     report(b"PROPAG_PRIVATE", private());
     report(b"PROPAG_UNBINDABLE", unbindable());
     report(b"PROPAG_UNSHARE_PEER", unshare_peer());
+    report(b"PROPAG_SLAVE_GROUPS", slave_groups());
 }
 
 type R = Result<(), (&'static [u8], i64)>;
@@ -256,5 +257,50 @@ fn unshare_peer() -> R {
     sys_rmdir(b"/tmp/pn/c\0".as_ptr());
     sys_umount2(d.as_ptr(), 0);
     sys_rmdir(d.as_ptr());
+    r
+}
+
+/// An rbind of a two-mount tree under a shared master reaches a group
+/// of shared slaves as slaves that are peers of one another: each
+/// source mount's copies form their own peer group
+fn slave_groups() -> R {
+    let dirs: [&[u8]; 4] = [b"/tmp/pg_a\0", b"/tmp/pg_b\0", b"/tmp/pg_c\0", b"/tmp/pg_t\0"];
+    mkdirs(&dirs);
+    let r = (|| {
+        check(b"mount a", ramfs(b"/tmp/pg_a\0") == 0, -1)?;
+        check(b"a shared", set(b"/tmp/pg_a\0", MS_SHARED) == 0, -1)?;
+        check(b"bind b", bind(b"/tmp/pg_a\0", b"/tmp/pg_b\0") == 0, -1)?;
+        check(b"b slave", set(b"/tmp/pg_b\0", MS_SLAVE) == 0, -1)?;
+        check(b"b shared", set(b"/tmp/pg_b\0", MS_SHARED) == 0, -1)?;
+        check(b"bind c", bind(b"/tmp/pg_b\0", b"/tmp/pg_c\0") == 0, -1)?;
+        check(b"mount t", ramfs(b"/tmp/pg_t\0") == 0, -1)?;
+        sys_mkdir(b"/tmp/pg_t/s\0".as_ptr(), 0o755);
+        check(b"mount t/s", ramfs(b"/tmp/pg_t/s\0") == 0, -1)?;
+        sys_mkdir(b"/tmp/pg_a/x\0".as_ptr(), 0o755);
+        let r = sys_mount(b"/tmp/pg_t\0".as_ptr(), b"/tmp/pg_a/x\0".as_ptr(), core::ptr::null(), MS_BIND | MS_REC, 0);
+        check(b"rbind", r == 0, r)?;
+        let (p, q) = (opt(b"/tmp/pg_b/x", b"shared"), opt(b"/tmp/pg_b/x/s", b"shared"));
+        check(b"two groups", p != 0 && q != 0 && p != q, (p * 1000 + q) as i64)?;
+        check(b"peers in c", opt(b"/tmp/pg_c/x", b"shared") == p, -1)?;
+        check(b"slaves", opt(b"/tmp/pg_b/x", b"master") == opt(b"/tmp/pg_a/x", b"shared"), -1)
+    })();
+    for p in [
+        &b"/tmp/pg_c/x/s\0"[..],
+        b"/tmp/pg_c/x\0",
+        b"/tmp/pg_b/x/s\0",
+        b"/tmp/pg_b/x\0",
+        b"/tmp/pg_a/x/s\0",
+        b"/tmp/pg_a/x\0",
+        b"/tmp/pg_c\0",
+        b"/tmp/pg_b\0",
+        b"/tmp/pg_t/s\0",
+    ] {
+        sys_umount2(p.as_ptr(), MNT_DETACH);
+    }
+    sys_rmdir(b"/tmp/pg_a/x\0".as_ptr());
+    sys_umount2(b"/tmp/pg_a\0".as_ptr(), MNT_DETACH);
+    sys_rmdir(b"/tmp/pg_t/s\0".as_ptr());
+    sys_umount2(b"/tmp/pg_t\0".as_ptr(), MNT_DETACH);
+    rmdirs(&dirs);
     r
 }

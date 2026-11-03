@@ -24,6 +24,9 @@ use super::path_ref::Path;
 struct Group {
     members: Vec<Weak<Mount>>,
     slaves: Vec<Weak<Mount>>,
+    /// Has had a member or slave: only such a group, now without any,
+    /// is free again (a fresh one waits for the copies it was made for)
+    used: bool,
 }
 
 /// Peer groups by id (Linux mnt_group_ida plus the mnt_share rings)
@@ -44,14 +47,14 @@ fn live(v: &mut Vec<Weak<Mount>>) -> Vec<Arc<Mount>> {
     v.iter().filter_map(Weak::upgrade).collect()
 }
 
-/// The lowest free group id: one with no live member and no live slave
-/// is free again
+/// The lowest free group id: a used one with no live member and no
+/// live slave is free again
 fn alloc_group() -> u32 {
     let mut g = GROUPS.lock();
     g.retain(|_, grp| {
         live(&mut grp.members);
         live(&mut grp.slaves);
-        !grp.members.is_empty() || !grp.slaves.is_empty()
+        !grp.used || !grp.members.is_empty() || !grp.slaves.is_empty()
     });
     let id = (1..).find(|i| !g.contains_key(i)).unwrap_or(u32::MAX);
     g.insert(id, Group::default());
@@ -83,7 +86,9 @@ fn join(m: &Arc<Mount>, gid: u32) {
             .retain(|w| !core::ptr::eq(w.as_ptr(), Arc::as_ptr(m)));
     }
     if gid != 0 {
-        g.entry(gid).or_default().members.push(Arc::downgrade(m));
+        let grp = g.entry(gid).or_default();
+        grp.members.push(Arc::downgrade(m));
+        grp.used = true;
     }
 }
 
@@ -96,7 +101,9 @@ fn set_master(m: &Arc<Mount>, gid: u32) {
             .retain(|w| !core::ptr::eq(w.as_ptr(), Arc::as_ptr(m)));
     }
     if gid != 0 {
-        g.entry(gid).or_default().slaves.push(Arc::downgrade(m));
+        let grp = g.entry(gid).or_default();
+        grp.slaves.push(Arc::downgrade(m));
+        grp.used = true;
     }
 }
 
