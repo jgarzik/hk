@@ -10,7 +10,7 @@ use alloc::sync::Arc;
 use alloc::vec;
 
 use crate::arch::Uaccess;
-use crate::fs::{KernelError, LookupFlags, is_subdir, lookup_path_flags};
+use crate::fs::{KernelError, LookupFlags, lookup_path_flags};
 use crate::uaccess::{
     UaccessArch, copy_to_user, put_user, strncpy_from_user, strncpy_from_user_str,
 };
@@ -36,6 +36,7 @@ mod ms {
     pub const NOEXEC: u64 = 8;
     pub const REMOUNT: u64 = 32;
     pub const BIND: u64 = 4096;
+    pub const MOVE: u64 = 8192;
     pub const MANDLOCK: u64 = 64;
     pub const NOATIME: u64 = 1 << 10;
     pub const NODIRATIME: u64 = 1 << 11;
@@ -54,11 +55,12 @@ mod ms {
 
     /// Flags hk honors, or may accept without effect because hk
     /// already behaves that way (no atime updates, every mount private,
-    /// no mandatory locks); everything else (MS_MOVE, MS_SHARED,
-    /// MS_SLAVE, MS_SYNCHRONOUS, MS_DIRSYNC, MS_NOSYMFOLLOW, ...) is
-    /// EINVAL instead of being ignored
+    /// no mandatory locks); everything else (MS_SHARED, MS_SLAVE,
+    /// MS_SYNCHRONOUS, MS_DIRSYNC, MS_NOSYMFOLLOW, ...) is EINVAL
+    /// instead of being ignored
     pub const KNOWN: u64 = RDONLY
         | BIND
+        | MOVE
         | NOSUID
         | NODEV
         | NOEXEC
@@ -145,11 +147,9 @@ fn mount_at(target: &super::Path) -> Result<Arc<super::mount::Mount>, KernelErro
 /// sys_mount - mount a filesystem (Linux do_mount + path_mount)
 ///
 /// Order as in Linux: strings and the target are looked up first, then
-/// MS_NOUSER (EINVAL) and CAP_SYS_ADMIN (EPERM). MS_REMOUNT changes the
-/// flags of the mount at `target` (its root): read-only on the
-/// superblock, nosuid/nodev/noexec on the mount. MS_PRIVATE /
-/// MS_UNBINDABLE succeed on a mount root (hk mounts never propagate and
-/// cannot be bind-mounted). Unsupported flags are EINVAL.
+/// MS_NOUSER (EINVAL) and CAP_SYS_ADMIN (EPERM), then path_mount's
+/// dispatch: MS_REMOUNT|MS_BIND, MS_REMOUNT, MS_BIND, the propagation
+/// types, MS_MOVE, else a new mount. Unsupported flags are EINVAL.
 pub fn sys_mount(source_ptr: u64, target_ptr: u64, fstype_ptr: u64, flags: u64, _data: u64) -> i64 {
     match path_mount(source_ptr, target_ptr, fstype_ptr, flags) {
         Ok(()) => 0,
@@ -227,6 +227,17 @@ fn path_mount(
     if flags & (ms::PRIVATE | ms::UNBINDABLE) != 0 {
         return change_type(&mount_at(&mp)?, flags);
     }
+    if flags & ms::MOVE != 0 {
+        let old = crate::fs::namei::path_lookupat(
+            crate::task::percpu::current_cwd(),
+            &source,
+            LookupFlags::open(),
+        );
+        if source.is_empty() {
+            return Err(KernelError::NotFound);
+        }
+        return super::mount::do_move(&old?, &mp);
+    }
     new_mount(&source, &fstype, mp, flags)
 }
 
@@ -275,142 +286,51 @@ fn new_mount(source: &[u8], fstype: &str, mp: super::Path, flags: u64) -> Result
     }
 }
 
-/// sys_umount2 - unmount a filesystem
-///
-/// # Arguments
-/// * `target_ptr` - User pointer to mount point path
-/// * `flags` - Umount flags (MNT_FORCE, MNT_DETACH, etc.)
-///
-/// # Returns
-/// 0 on success, negative errno on error
+/// sys_umount2 (Linux ksys_umount): flags, the target (a mount's root,
+/// followed unless UMOUNT_NOFOLLOW), CAP_SYS_ADMIN after the lookup,
+/// then do_umount
 pub fn sys_umount2(target_ptr: u64, flags: i32) -> i64 {
-    // MNT_EXPIRE is not supported: EINVAL like any unknown flag
-    use super::mount::umount_flags::{MNT_DETACH, MNT_FORCE, UMOUNT_NOFOLLOW};
-    if flags & !(MNT_FORCE | MNT_DETACH | UMOUNT_NOFOLLOW) != 0 {
-        return KernelError::InvalidArgument.sysret();
-    }
-
-    // Read target path from user space
-    let target = match crate::fs::namei::getname(target_ptr, false) {
-        Ok(s) => s,
-        Err(e) => return e.sysret(),
-    };
-
-    // Set up lookup flags - respect UMOUNT_NOFOLLOW
-    let mut lookup_flags = LookupFlags::open();
-    if flags & super::mount::umount_flags::UMOUNT_NOFOLLOW != 0 {
-        lookup_flags.follow = false;
-    }
-
-    // Look up the target path
-    let target = match crate::fs::namei::path_lookupat(None, &target, lookup_flags) {
-        Ok(p) => p,
-        Err(e) => return e.sysret(),
-    };
-
-    // Linux can_umount: CAP_SYS_ADMIN after the lookup
-    if !crate::task::capable(crate::task::CAP_SYS_ADMIN) {
-        return KernelError::NotPermitted.sysret();
-    }
-
-    // The target must be the root of a mount (Linux path_mounted)
-    let mount = match mount_at(&target) {
-        Ok(m) => m,
-        Err(e) => return e.sysret(),
-    };
-
-    // Perform the unmount
-    match super::mount::do_umount(mount, flags) {
+    use super::mount::umount_flags::{MNT_DETACH, MNT_EXPIRE, MNT_FORCE, UMOUNT_NOFOLLOW};
+    let r = (|| {
+        if flags & !(MNT_FORCE | MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW) != 0 {
+            return Err(KernelError::InvalidArgument);
+        }
+        let target = crate::fs::namei::getname(target_ptr, false)?;
+        let lf = LookupFlags {
+            follow: flags & UMOUNT_NOFOLLOW == 0,
+            ..LookupFlags::open()
+        };
+        let target =
+            crate::fs::namei::path_lookupat(crate::task::percpu::current_cwd(), &target, lf)?;
+        if !crate::task::capable(crate::task::CAP_SYS_ADMIN) {
+            return Err(KernelError::NotPermitted);
+        }
+        super::mount::do_umount(mount_at(&target)?, flags)
+    })();
+    match r {
         Ok(()) => 0,
-        Err(KernelError::Busy) => EBUSY,
-        Err(KernelError::InvalidArgument) => KernelError::InvalidArgument.sysret(), // Can't unmount root
-        Err(_) => KernelError::InvalidArgument.sysret(),
+        Err(e) => e.sysret(),
     }
 }
 
-/// pivot_root - change the root filesystem
-///
-/// Moves the root filesystem of the calling process's mount namespace
-/// to the directory `put_old` and makes `new_root` the new root filesystem.
-///
-/// # Arguments
-/// * `new_root_ptr` - User pointer to path that will become the new root
-/// * `put_old_ptr` - User pointer to path where old root will be moved
-///
-/// # Returns
-/// 0 on success, negative errno on error
-///
-/// # Errors
-/// * EPERM - Caller lacks CAP_SYS_ADMIN
-/// * EINVAL - Various invalid configuration (not mountpoints, put_old not under new_root)
-/// * ENOTDIR - new_root or put_old is not a directory
-/// * ENOENT - Path not found
+/// pivot_root(new_root, put_old) (Linux: may_mount, both paths as
+/// directories, then the mount rules of do_pivot_root)
 pub fn sys_pivot_root(new_root_ptr: u64, put_old_ptr: u64) -> i64 {
-    // 1. Permission check: requires CAP_SYS_ADMIN
-    if !crate::task::capable(crate::task::CAP_SYS_ADMIN) {
-        return KernelError::NotPermitted.sysret();
+    let r = (|| {
+        if !crate::task::capable(crate::task::CAP_SYS_ADMIN) {
+            return Err(KernelError::NotPermitted);
+        }
+        let cwd = crate::task::percpu::current_cwd;
+        let new = crate::fs::namei::getname(new_root_ptr, false)?;
+        let new = crate::fs::namei::path_lookupat(cwd(), &new, LookupFlags::opendir())?;
+        let old = crate::fs::namei::getname(put_old_ptr, false)?;
+        let old = crate::fs::namei::path_lookupat(cwd(), &old, LookupFlags::opendir())?;
+        super::mount::do_pivot_root(&new, &old)
+    })();
+    match r {
+        Ok(()) => 0,
+        Err(e) => e.sysret(),
     }
-
-    // 2. Copy paths from user space
-    let new_root_str = match crate::fs::namei::getname(new_root_ptr, false) {
-        Ok(s) => s,
-        Err(e) => return e.sysret(),
-    };
-    let put_old_str = match crate::fs::namei::getname(put_old_ptr, false) {
-        Ok(s) => s,
-        Err(e) => return e.sysret(),
-    };
-
-    // 3. Look up new_root path (must be directory)
-    let new_root =
-        match crate::fs::namei::path_lookupat(None, &new_root_str, LookupFlags::opendir()) {
-            Ok(p) => p,
-            Err(e) => return e.sysret(),
-        };
-    let new_root_dentry = new_root.dentry.clone();
-
-    // 4. Verify new_root is a mount point
-    let mnt_ns = crate::ns::current_mnt_ns();
-    let new_mnt = match mount_at(&new_root) {
-        Ok(m) => m,
-        Err(e) => return e.sysret(),
-    };
-
-    // 5. Look up put_old path (must be directory)
-    let put_old_dentry = match lookup_path_flags(&put_old_str, LookupFlags::opendir()) {
-        Ok(d) => d,
-        Err(e) => return e.sysret(),
-    };
-
-    // 6. Verify put_old is at or under new_root
-    if !is_subdir(&put_old_dentry, &new_root_dentry) {
-        return KernelError::InvalidArgument.sysret();
-    }
-
-    // 7. Get old root mount - must exist
-    let _old_root_mnt = match mnt_ns.get_root() {
-        Some(m) => m,
-        None => return KernelError::InvalidArgument.sysret(),
-    };
-
-    // 8. Verify new_root is not the same as current root
-    // (pivoting to the same root is a no-op but Linux returns EBUSY)
-    if let Some(root_dentry) = mnt_ns.get_root_dentry()
-        && Arc::ptr_eq(&root_dentry, &new_root_dentry)
-    {
-        return EBUSY;
-    }
-
-    // 9. Set new root as namespace root
-    mnt_ns.set_root(new_mnt.clone());
-
-    // 10. Update task's fs root
-    // The new root dentry becomes the task's root
-    if let Some(fs) = crate::task::percpu::current_fs() {
-        fs.set_root(new_root);
-    }
-
-    0
 }
 
 /// sys_ioctl - device control

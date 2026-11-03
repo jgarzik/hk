@@ -1730,6 +1730,9 @@ Each open `File` holds a reference to its mount via the `mnt` field:
 7. Mount.mountpoint (write for set/clear)
 8. Dentry.d_lock (DentryInner.flags: write for the mount count)
 ```
+MS_MOVE and pivot_root take the target's (put_old's) i_rwsem, then
+NAMESPACE_SEM; pivot_root's chroot_fs_refs runs after both are
+released (TASKLIST read to collect the tids, then each FsStruct.inner).
 umount writes the filesystem back after releasing NAMESPACE_SEM
 (writeback takes inode locks; Linux syncs in deactivate_super after
 namespace_unlock). Mount ids come from `MNT_IDS` (spin Mutex leaf,

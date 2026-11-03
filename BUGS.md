@@ -266,15 +266,14 @@ immutable/append-only inodes (no IS_APPEND/IS_IMMUTABLE EPERM).
 Accepted without effect: atime flags (no atime updates), MS_SILENT,
 MS_MANDLOCK, MS_POSIXACL, MS_I_VERSION, MS_LAZYTIME, and MS_PRIVATE
 beyond clearing unbindable (mounts never propagate).
-EINVAL instead of Linux behavior: MS_MOVE, MS_SHARED, MS_SLAVE,
-MS_SYNCHRONOUS, MS_DIRSYNC, MS_NOSYMFOLLOW and umount2 MNT_EXPIRE.
+EINVAL instead of Linux behavior: MS_SHARED, MS_SLAVE,
+MS_SYNCHRONOUS, MS_DIRSYNC and MS_NOSYMFOLLOW. umount2 MNT_EXPIRE's
+mark is not cleared by use (Linux mntput clears it).
 Unlike Linux (MNT_WRITE_HOLD), a write access racing a read-only remount
 that then fails with EBUSY can see a spurious EROFS. Mount data/options strings are
 ignored; mounts are not user-namespace aware (plain capable()).
 Crossing into a mount scans the current mount's children (Linux hashes
-(parent, mountpoint): mount_hashtable). After pivot_root other tasks
-keep their old fs root (no chroot_fs_refs) until pivot_root is redone
-(Phase G).
+(parent, mountpoint): mount_hashtable).
 
 ## Thread-group exit gaps
 

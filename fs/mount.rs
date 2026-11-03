@@ -26,6 +26,9 @@ pub const MNT_NOEXEC: u32 = 0x4;
 pub const MNT_READONLY: u32 = 0x40;
 /// Cannot be bind-mounted (Linux MNT_UNBINDABLE)
 pub const MNT_UNBINDABLE: u32 = 0x2000;
+/// Cannot be unmounted, moved or pivoted away: the initial root (Linux
+/// MNT_LOCKED, set by init_mount_tree)
+pub const MNT_LOCKED: u32 = 0x80_0000;
 
 /// Old mount -> its copy, from [`Mount::clone_tree`]
 pub type MountMap = Vec<(Arc<Mount>, Arc<Mount>)>;
@@ -89,6 +92,9 @@ pub struct Mount {
     /// MNT_NOEXEC
     mnt_flags: AtomicU32,
 
+    /// Marked by a first umount2(MNT_EXPIRE) (Linux mnt_expiry_mark)
+    expiry: core::sync::atomic::AtomicBool,
+
     /// Holders of write access through this mount (Linux mnt_writers):
     /// against making it read-only, the protocol of SuperBlock::s_writers
     writers: AtomicU64,
@@ -125,6 +131,7 @@ impl Mount {
             children: RwLock::new(Vec::new()),
             mnt_flags: AtomicU32::new(flags),
             writers: AtomicU64::new(0),
+            expiry: core::sync::atomic::AtomicBool::new(false),
             mnt_id: mnt_alloc_id(),
             mnt_id_unique: MNT_ID_UNIQUE.fetch_add(1, Ordering::Relaxed),
             devname,
@@ -152,8 +159,9 @@ impl Mount {
     /// is EBUSY, nothing changed, while anyone holds write access
     /// through the mount (Linux mnt_make_readonly)
     pub fn set_flags(&self, f: u32) -> Result<(), KernelError> {
-        // Propagation state is not the caller's to set here
-        let f = (f & !MNT_UNBINDABLE) | (self.flags() & MNT_UNBINDABLE);
+        // Propagation and lock state are not the caller's to set here
+        const KEEP: u32 = MNT_UNBINDABLE | MNT_LOCKED;
+        let f = (f & !KEEP) | (self.flags() & KEEP);
         let old = self.mnt_flags.fetch_or(f & MNT_READONLY, Ordering::SeqCst);
         if f & MNT_READONLY != 0
             && old & MNT_READONLY == 0
@@ -377,6 +385,7 @@ pub fn attach(
         mp.mnt.add_child(mount.clone());
         drop(_dir_lock);
     } else {
+        mount.mark(MNT_LOCKED, true);
         mnt_ns.set_root(mount.clone());
     }
     Ok(mount)
@@ -388,7 +397,7 @@ pub fn clone_mnt(m: &Mount, root: Arc<Dentry>) -> Arc<Mount> {
     Mount::new(
         m.sb.clone(),
         root,
-        m.flags() & !MNT_UNBINDABLE,
+        m.flags() & !(MNT_UNBINDABLE | MNT_LOCKED),
         m.devname.clone(),
     )
 }
@@ -501,6 +510,8 @@ pub mod umount_flags {
     pub const MNT_FORCE: i32 = 1;
     /// Lazy unmount - detach now, cleanup later
     pub const MNT_DETACH: i32 = 2;
+    /// Unmount only an unused mount marked by an earlier call
+    pub const MNT_EXPIRE: i32 = 4;
     /// Don't follow symlinks in path
     pub const UMOUNT_NOFOLLOW: i32 = 8;
 }
@@ -525,42 +536,43 @@ fn is_mount_busy(mount: &Arc<Mount>) -> bool {
     false
 }
 
-/// Unmount a filesystem
-///
-/// # Arguments
-/// * `mount` - The mount to unmount
-/// * `flags` - Umount flags (MNT_FORCE, MNT_DETACH, etc.)
-///
-/// # Errors
-/// * `KernelError::Busy` - Mount is busy and MNT_FORCE/MNT_DETACH not specified
-/// * `KernelError::InvalidArgument` - Trying to unmount root filesystem
+/// Unmount `mount` (Linux do_umount): EINVAL for an unattached mount
+/// (the namespace root); the caller's own root is instead remounted
+/// read-only (do_umount_root). MNT_DETACH takes the whole subtree out of
+/// the namespace at once, busy or not: open files keep working, the
+/// filesystem goes with its last user. Otherwise a mount with
+/// submounts or users is EBUSY, MNT_FORCE too. MNT_EXPIRE (not with
+/// MNT_FORCE or MNT_DETACH, not the root) only marks an unmarked mount
+/// (EAGAIN).
 pub fn do_umount(mount: Arc<Mount>, flags: i32) -> Result<(), KernelError> {
-    // Cannot unmount the root filesystem
+    use umount_flags::{MNT_DETACH, MNT_EXPIRE, MNT_FORCE};
+    // Linux can_umount
+    if mount.flags() & MNT_LOCKED != 0 {
+        return Err(KernelError::InvalidArgument);
+    }
+    let detach = flags & MNT_DETACH != 0;
+    let is_root =
+        crate::task::percpu::current_fs().is_some_and(|fs| Arc::ptr_eq(&fs.get_root().mnt, &mount));
+    if flags & MNT_EXPIRE != 0 {
+        if is_root || flags & (MNT_FORCE | MNT_DETACH) != 0 {
+            return Err(KernelError::InvalidArgument);
+        }
+        if !mount.expiry.swap(true, Ordering::SeqCst) {
+            return Err(KernelError::WouldBlock);
+        }
+    }
+    if is_root && !detach {
+        let _s = mount.sb.s_umount.write();
+        return mount.sb.make_rdonly();
+    }
     if mount.get_mountpoint().is_none() {
         return Err(KernelError::InvalidArgument);
     }
-
-    // Check if busy (unless force or detach)
-    let force = (flags & umount_flags::MNT_FORCE) != 0;
-    let detach = (flags & umount_flags::MNT_DETACH) != 0;
-
     let ns = NAMESPACE_SEM.write();
-    if !force && !detach && is_mount_busy(&mount) {
+    if !detach && is_mount_busy(&mount) {
         return Err(KernelError::Busy);
     }
-
-    // Remove from parent's children list
-    if let Some(parent) = mount.get_parent() {
-        parent.remove_child(&mount);
-    }
-
-    // Clear parent reference
-    *mount.parent.write() = None;
-
-    // Clear mountpoint reference
-    if let Some(mp) = mount.mountpoint.write().take() {
-        note_mp(&mp, -1);
-    }
+    detach_mnt(&mount);
     drop(ns);
 
     // Write the filesystem back, outside namespace_sem: writeback takes
@@ -568,6 +580,137 @@ pub fn do_umount(mount: Arc<Mount>, flags: i32) -> Result<(), KernelError> {
     // sync_filesystem after namespace_unlock)
     let _ = super::fs_writeback::writeback_sb(&mount.sb);
     Ok(())
+}
+
+/// Take `m` (and what is mounted below it) off its parent; under
+/// NAMESPACE_SEM
+fn detach_mnt(m: &Arc<Mount>) {
+    if let Some(parent) = m.get_parent() {
+        parent.remove_child(m);
+    }
+    *m.parent.write() = None;
+    if let Some(mp) = m.mountpoint.write().take() {
+        note_mp(&mp, -1);
+    }
+}
+
+/// Hang `m` on `mp` (Linux attach_mnt); under NAMESPACE_SEM
+fn attach_mnt(m: &Arc<Mount>, mp: &Path) {
+    m.set_mountpoint(mp.dentry.clone());
+    m.set_parent(&mp.mnt);
+    mp.mnt.add_child(m.clone());
+}
+
+/// `p` is at or below `root`, across mounts (Linux is_path_reachable)
+fn is_path_reachable(p: &Path, root: &Path) -> bool {
+    let (mut mnt, mut d) = (p.mnt.clone(), p.dentry.clone());
+    while !Arc::ptr_eq(&mnt, &root.mnt) {
+        match (mnt.get_parent(), mnt.get_mountpoint()) {
+            (Some(m), Some(mp)) => (mnt, d) = (m, mp),
+            _ => return false,
+        }
+    }
+    super::is_subdir(&d, &root.dentry)
+}
+
+/// The mountpoint's i_rwsem (Linux lock_mount): a directory removed
+/// meanwhile is ENOENT
+fn lock_mountpoint(mp: &Path) -> Result<super::inode::InodeLockArc, KernelError> {
+    let dir = mp.dentry.get_inode().ok_or(KernelError::NotFound)?;
+    let lock = dir.lock_arc();
+    if dir.is_dead() {
+        return Err(KernelError::NotFound);
+    }
+    Ok(lock)
+}
+
+/// MS_MOVE (Linux do_move_mount): `old` must be the root of an attached
+/// mount (EINVAL), a directory goes only on a directory (ENOTDIR), and
+/// not into its own subtree (ELOOP)
+pub fn do_move(old: &Path, mp: &Path) -> Result<(), KernelError> {
+    if !Arc::ptr_eq(&old.dentry, &old.mnt.root)
+        || old.mnt.get_parent().is_none()
+        || old.mnt.flags() & MNT_LOCKED != 0
+    {
+        return Err(KernelError::InvalidArgument);
+    }
+    let is_dir = |d: &Dentry| d.get_inode().is_some_and(|i| i.mode().is_dir());
+    if is_dir(&mp.dentry) != is_dir(&old.dentry) {
+        return Err(KernelError::NotDirectory);
+    }
+    let _l = lock_mountpoint(mp)?;
+    let _ns = NAMESPACE_SEM.write();
+    if is_path_reachable(mp, old) {
+        return Err(KernelError::TooManySymlinks);
+    }
+    detach_mnt(&old.mnt);
+    attach_mnt(&old.mnt, mp);
+    Ok(())
+}
+
+/// pivot_root (Linux 6.8 SYSCALL pivot_root): `new` becomes the root of
+/// the caller's namespace view and the old root (the caller's root,
+/// which must be a mount root on a parent, like `new`) moves to
+/// `put_old`, reachable from `new`. Every task rooted or standing at
+/// the old root follows (chroot_fs_refs).
+pub fn do_pivot_root(new: &Path, put_old: &Path) -> Result<(), KernelError> {
+    let root = crate::task::percpu::current_fs()
+        .ok_or(KernelError::InvalidArgument)?
+        .get_root();
+    let _l = lock_mountpoint(put_old)?;
+    let ns = NAMESPACE_SEM.write();
+    if new.mnt.flags() & MNT_LOCKED != 0 {
+        return Err(KernelError::InvalidArgument);
+    }
+    if new.dentry.is_unhashed() {
+        return Err(KernelError::NotFound);
+    }
+    if Arc::ptr_eq(&new.mnt, &root.mnt) || Arc::ptr_eq(&put_old.mnt, &root.mnt) {
+        return Err(KernelError::Busy);
+    }
+    let mounted = |p: &Path| Arc::ptr_eq(&p.dentry, &p.mnt.root) && p.mnt.get_parent().is_some();
+    if !mounted(&root) || !mounted(new) {
+        return Err(KernelError::InvalidArgument);
+    }
+    if !is_path_reachable(put_old, new) || !is_path_reachable(new, &root) {
+        return Err(KernelError::InvalidArgument);
+    }
+    let (Some(root_parent), Some(root_mp)) = (root.mnt.get_parent(), root.mnt.get_mountpoint())
+    else {
+        return Err(KernelError::InvalidArgument);
+    };
+    detach_mnt(&new.mnt);
+    detach_mnt(&root.mnt);
+    if root.mnt.flags() & MNT_LOCKED != 0 {
+        new.mnt.mark(MNT_LOCKED, true);
+        root.mnt.mark(MNT_LOCKED, false);
+    }
+    attach_mnt(&root.mnt, put_old);
+    attach_mnt(&new.mnt, &Path::new(root_parent, root_mp));
+    drop(ns);
+    chroot_fs_refs(&root, &Path::new(new.mnt.clone(), new.mnt.root.clone()));
+    Ok(())
+}
+
+/// Every task whose root or cwd is `old` moves to `new` (Linux
+/// chroot_fs_refs)
+fn chroot_fs_refs(old: &Path, new: &Path) {
+    let tids: Vec<crate::task::Tid> = crate::task::percpu::TASKLIST
+        .read()
+        .iter()
+        .map(|t| t.task.tid())
+        .collect();
+    for tid in tids {
+        let Some(fs) = super::get_task_fs(tid) else {
+            continue;
+        };
+        if fs.get_root().same(old) {
+            fs.set_root(new.clone());
+        }
+        if fs.get_pwd().same(old) {
+            fs.set_pwd(new.clone());
+        }
+    }
 }
 
 /// Count a mount on (`+1`) or off (`-1`) the dentry `mp` and the

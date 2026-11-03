@@ -4,7 +4,7 @@
 //! mounts are ramfs on both kernels.
 
 use super::helpers::{print, print_num, println};
-use hk_syscall::{CLONE_NEWNS, O_CREAT, O_WRONLY, Stat, sys_faccessat, sys_chdir, sys_close, sys_exit, sys_fork, sys_getcwd, sys_link, sys_mkdir, sys_mount, sys_open, sys_readlink, sys_rename, sys_rmdir, sys_stat, sys_umount2, sys_unlink, sys_unshare, sys_wait4};
+use hk_syscall::{CLONE_NEWNS, O_CREAT, O_RDWR, O_WRONLY, Stat, sys_chdir, sys_chroot, sys_close, sys_exit, sys_faccessat, sys_fork, sys_getcwd, sys_link, sys_mkdir, sys_mount, sys_open, sys_pivot_root, sys_readlink, sys_rename, sys_rmdir, sys_stat, sys_umount2, sys_unlink, sys_unshare, sys_wait4, sys_write};
 
 const ENOENT: i64 = -2;
 const EBUSY: i64 = -16;
@@ -15,6 +15,12 @@ const EROFS: i64 = -30;
 const MS_RDONLY: u64 = 1;
 const MS_REMOUNT: u64 = 32;
 const MS_BIND: u64 = 4096;
+const MS_MOVE: u64 = 8192;
+const MNT_FORCE: u64 = 1;
+const MNT_DETACH: u64 = 2;
+const MNT_EXPIRE: u64 = 4;
+const EAGAIN: i64 = -11;
+const ELOOP: i64 = -40;
 const MS_REC: u64 = 1 << 14;
 const MS_UNBINDABLE: u64 = 1 << 17;
 
@@ -32,6 +38,9 @@ pub fn run_tests() {
     report(b"RBIND", rbind());
     report(b"BIND_RO_REMOUNT", bind_ro());
     report(b"BIND_UNBINDABLE", bind_unbindable());
+    report(b"MOVE_MOUNT", move_mount());
+    report(b"LAZY_UMOUNT", lazy_umount());
+    report(b"PIVOT_ROOT_REAL", pivot_real());
 }
 
 type R = Result<(), (&'static [u8], i64)>;
@@ -473,4 +482,126 @@ fn bind_unbindable() -> R {
         sys_rmdir(p.as_ptr());
     }
     r
+}
+
+fn mv(src: &[u8], dst: &[u8]) -> i64 {
+    sys_mount(src.as_ptr(), dst.as_ptr(), core::ptr::null(), MS_MOVE, 0)
+}
+
+/// MS_MOVE takes a mount (with what is in it) to a new place; not into
+/// its own subtree (ELOOP), and only a mount's root moves (EINVAL)
+fn move_mount() -> R {
+    for p in [&b"/tmp/mv_a\0"[..], b"/tmp/mv_b\0"] {
+        sys_mkdir(p.as_ptr(), 0o755);
+    }
+    let r = (|| {
+        check(b"mount", ramfs(b"/tmp/mv_a\0") == 0, -1)?;
+        check(b"touch", touch(b"/tmp/mv_a/f\0") >= 0, -1)?;
+        let r = mv(b"/tmp/mv_a\0", b"/tmp/mv_b\0");
+        check(b"move", r == 0, r)?;
+        check(b"there", dev(b"/tmp/mv_b/f\0").is_ok(), -1)?;
+        check(b"gone here", dev(b"/tmp/mv_a/f\0") == Err(ENOENT), -1)?;
+        sys_mkdir(b"/tmp/mv_b/in\0".as_ptr(), 0o755);
+        let r = mv(b"/tmp/mv_b\0", b"/tmp/mv_b/in\0");
+        check(b"into itself", r == ELOOP, r)?;
+        let r = mv(b"/tmp/mv_b/in\0", b"/tmp/mv_a\0");
+        check(b"not a mount root", r == EINVAL, r)
+    })();
+    sys_unlink(b"/tmp/mv_b/f\0".as_ptr());
+    sys_rmdir(b"/tmp/mv_b/in\0".as_ptr());
+    sys_umount2(b"/tmp/mv_b\0".as_ptr(), 0);
+    sys_umount2(b"/tmp/mv_a\0".as_ptr(), 0);
+    for p in [&b"/tmp/mv_a\0"[..], b"/tmp/mv_b\0"] {
+        sys_rmdir(p.as_ptr());
+    }
+    r
+}
+
+/// umount2: a busy tree is EBUSY, with MNT_FORCE too; MNT_DETACH takes
+/// it all away at once while an open file keeps working; MNT_EXPIRE
+/// marks first (EAGAIN), then unmounts, and is EINVAL with MNT_DETACH
+fn lazy_umount() -> R {
+    sys_mkdir(b"/tmp/lz\0".as_ptr(), 0o755);
+    sys_mkdir(b"/tmp/ex\0".as_ptr(), 0o755);
+    let r = (|| {
+        check(b"mount", ramfs(b"/tmp/lz\0") == 0, -1)?;
+        sys_mkdir(b"/tmp/lz/sub\0".as_ptr(), 0o755);
+        check(b"mount sub", ramfs(b"/tmp/lz/sub\0") == 0, -1)?;
+        let fd = sys_open(b"/tmp/lz/sub/f\0".as_ptr(), O_CREAT | O_RDWR, 0o644);
+        check(b"open", fd >= 0, fd)?;
+        let r = sys_umount2(b"/tmp/lz\0".as_ptr(), 0);
+        check(b"busy", r == EBUSY, r)?;
+        let r = sys_umount2(b"/tmp/lz\0".as_ptr(), MNT_FORCE);
+        check(b"force busy", r == EBUSY, r)?;
+        let r = sys_umount2(b"/tmp/lz\0".as_ptr(), MNT_DETACH);
+        check(b"detach", r == 0, r)?;
+        check(b"tree gone", dev(b"/tmp/lz/sub\0") == Err(ENOENT), -1)?;
+        let w = sys_write(fd as u64, b"x".as_ptr(), 1);
+        sys_close(fd as u64);
+        check(b"fd still works", w == 1, w)?;
+        check(b"mount ex", ramfs(b"/tmp/ex\0") == 0, -1)?;
+        let ex = b"/tmp/ex\0".as_ptr();
+        let r = sys_umount2(ex, MNT_EXPIRE | MNT_DETACH);
+        check(b"expire+detach", r == EINVAL, r)?;
+        let r = sys_umount2(ex, MNT_EXPIRE);
+        check(b"expire mark", r == EAGAIN, r)?;
+        let r = sys_umount2(ex, MNT_EXPIRE);
+        check(b"expire", r == 0, r)
+    })();
+    sys_umount2(b"/tmp/lz/sub\0".as_ptr(), MNT_DETACH);
+    sys_umount2(b"/tmp/lz\0".as_ptr(), MNT_DETACH);
+    sys_umount2(b"/tmp/ex\0".as_ptr(), 0);
+    sys_rmdir(b"/tmp/lz\0".as_ptr());
+    sys_rmdir(b"/tmp/ex\0".as_ptr());
+    r
+}
+
+/// pivot_root in a fresh namespace (Linux 6.8 refuses a root mount with
+/// no parent, so the root is first a mount moved onto "/" and chrooted
+/// into): the new root's mount becomes "/", the old one appears at
+/// put_old, and the caller's root and cwd follow
+fn pivot_real() -> R {
+    let pid = sys_fork();
+    if pid == 0 {
+        sys_exit(pivot_child() as u64);
+    }
+    let mut ws = 0i32;
+    sys_wait4(pid, &mut ws, 0, 0);
+    check(b"child", ws == 0, (ws >> 8) as i64)
+}
+
+/// 0, or the step that failed
+fn pivot_child() -> i32 {
+    if sys_unshare(CLONE_NEWNS) != 0 {
+        return 1;
+    }
+    sys_mkdir(b"/tmp/pr\0".as_ptr(), 0o755);
+    if ramfs(b"/tmp/pr\0") != 0 || sys_chdir(b"/tmp/pr\0".as_ptr()) != 0 {
+        return 2;
+    }
+    if mv(b".\0", b"/\0") != 0 || sys_chroot(b".\0".as_ptr()) != 0 {
+        return 3;
+    }
+    sys_mkdir(b"/new\0".as_ptr(), 0o755);
+    if ramfs(b"/new\0") != 0 {
+        return 4;
+    }
+    sys_mkdir(b"/new/old\0".as_ptr(), 0o755);
+    touch(b"/new/marker\0");
+    let old_dev = dev(b"/\0");
+    if sys_pivot_root(b"/new\0".as_ptr(), b"/new/old\0".as_ptr()) != 0 {
+        return 5;
+    }
+    if dev(b"/marker\0").is_err() {
+        return 6;
+    }
+    // The old root, with its "new" directory now uncovered
+    if dev(b"/old\0") != old_dev || dev(b"/old/new/marker\0") != Err(ENOENT) {
+        return 7;
+    }
+    let mut buf = [0u8; 8];
+    if sys_getcwd(buf.as_mut_ptr(), buf.len()) != 2 || buf[0] != b'/' {
+        return 8;
+    }
+    0
 }
