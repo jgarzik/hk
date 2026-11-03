@@ -14,10 +14,8 @@ use super::huge_page::{HUGE_PAGE_SIZE, split_huge_pmd};
 use super::pagewalk::{PteWalk, walk_pte_range};
 use super::{Mm, PROT_EXEC, PROT_READ, PROT_WRITE};
 use crate::FRAME_ALLOCATOR;
-use crate::arch::{CurrentArch, SchedArch, paging};
+use crate::arch::{ArchPageTable, paging};
 use crate::util::error::KernelError;
-
-type ArchPageTable = <CurrentArch as SchedArch>::SchedPageTable;
 
 /// `prot` grants no access at all
 fn prot_none(prot: u32) -> bool {

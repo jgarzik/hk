@@ -64,8 +64,9 @@ use core::pin::Pin;
 use core::sync::atomic::{AtomicPtr, AtomicU8, Ordering};
 
 use crate::arch::IrqSpinlock;
+use crate::task::Task;
 use crate::task::percpu::{
-    KernelTask, MAX_SCHEDULE_TIMEOUT, SleepState, WakeMode, current, current_tid, schedule_timeout,
+    MAX_SCHEDULE_TIMEOUT, SleepState, WakeMode, current, current_tid, schedule_timeout,
     set_current_state, try_to_wake_up,
 };
 use crate::time::hrtimer::HrClock;
@@ -88,7 +89,7 @@ pub type WakeFn = fn(&WaitEntry, WakeMode, usize) -> bool;
 pub struct WaitEntry {
     link: Link,
     /// The waiting task (the entry is unlinked before it can go away)
-    task: *const KernelTask,
+    task: *const Task,
     /// WQ_EXCLUSIVE | WQ_AUTOREMOVE
     flags: AtomicU8,
     /// Called by wakers instead of waking `task`
@@ -117,7 +118,7 @@ impl WaitEntry {
     pub fn with_func(func: Option<WakeFn>, private: usize) -> Self {
         Self {
             link: Link::new(),
-            task: &*current() as *const KernelTask,
+            task: &*current() as *const Task,
             flags: AtomicU8::new(0),
             func,
             private,
@@ -127,7 +128,7 @@ impl WaitEntry {
     }
 
     /// The waiting task
-    pub fn task(&self) -> &KernelTask {
+    pub fn task(&self) -> &Task {
         // SAFETY: the task outlives its entries (they are unlinked first)
         unsafe { &*self.task }
     }

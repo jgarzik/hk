@@ -482,7 +482,7 @@ pub fn schedule_hrtimeout(deadline: Option<u64>, clock: HrClock) -> bool {
 /// A sleep's deadline passed: wake its task
 fn wakeup_fire(t: &HrTimer) {
     // SAFETY: the sleeper, which cancels the timer before it returns
-    let task = unsafe { &*(t.data() as *const crate::task::percpu::KernelTask) };
+    let task = unsafe { &*(t.data() as *const crate::task::Task) };
     crate::task::percpu::try_to_wake_up(task, crate::task::percpu::WakeMode::Any);
 }
 

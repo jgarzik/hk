@@ -23,12 +23,10 @@ use super::shmem::Shmem;
 use super::tlb::flush_tlb_page;
 use super::{Mm, MmStruct, PAGE_SIZE, PROT_EXEC, PROT_READ, PROT_WRITE, SwapEntry};
 use crate::FRAME_ALLOCATOR;
-use crate::arch::{CurrentArch, PageFlags, SchedArch, paging, phys_to_virt};
+use crate::arch::{ArchPageTable, PageFlags, paging, phys_to_virt};
 use crate::fs::File;
 use crate::mm::page_alloc::Gfp;
 use crate::task::percpu::{increment_maj_flt, increment_min_flt};
-
-type ArchPageTable = <CurrentArch as SchedArch>::SchedPageTable;
 
 /// The access that faulted
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

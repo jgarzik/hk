@@ -55,7 +55,7 @@ pub struct PerCpu {
     /// Timer tick count for this CPU
     pub ticks: AtomicU64,
 
-    /// The running task (`*const KernelTask`; 0: the boot task,
+    /// The running task (`*const Task`; 0: the boot task,
     /// `task::percpu::INIT_TASK`), set by the scheduler at each switch
     pub curr: AtomicUsize,
 

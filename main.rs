@@ -56,23 +56,14 @@ pub mod task;
 #[cfg(not(test))]
 use ::core::panic::PanicInfo;
 
-// Architecture type alias for generic kernel code
-#[cfg(target_arch = "x86_64")]
-type CurrentArch = crate::arch::x86_64::X86_64Arch;
-
-#[cfg(target_arch = "aarch64")]
-type CurrentArch = crate::arch::aarch64::Aarch64Arch;
-
 // Import architecture traits for trait method calls
 use crate::arch::ArchBusOps;
-use crate::arch::SchedArch;
+use crate::arch::ArchPageTable;
+use crate::arch::CurrentArch;
 use crate::arch::{
     AcpiOps, CpuOps, EarlyArchInit, ExceptionOps, HaltOps, InitramfsOps, IoremapOps, LocalTimerOps,
     MemoryLayoutOps, PowerOps, SmpOps, TimekeeperOps, VfsInitOps,
 };
-
-// Page table type alias (used by ELF loading)
-type ArchPageTable = <CurrentArch as SchedArch>::SchedPageTable;
 
 use crate::hw::dma::{DirectDmaOps, dma_init};
 

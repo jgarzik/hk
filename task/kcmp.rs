@@ -14,7 +14,8 @@ use alloc::sync::Arc;
 use core::cmp::Ordering;
 use core::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
-use crate::task::percpu::{KernelTask, TASKLIST, task_ref};
+use crate::task::Task;
+use crate::task::percpu::{TASKLIST, task_ref};
 use crate::util::error::KernelError;
 
 // KCMP comparison types
@@ -124,7 +125,7 @@ fn compare_key(k1: Option<u64>, k2: Option<u64>, kcmp_type: i32) -> i64 {
 }
 
 /// The address of `t`'s task_lock resource of kind `kcmp_type`
-fn lock_key(t: &KernelTask, kcmp_type: i32) -> Option<u64> {
+fn lock_key(t: &Task, kcmp_type: i32) -> Option<u64> {
     let a = t.task_lock();
     match kcmp_type {
         KCMP_VM => ptr_key(a.mm().map(|m| m.arc())),
@@ -135,7 +136,7 @@ fn lock_key(t: &KernelTask, kcmp_type: i32) -> Option<u64> {
 }
 
 /// The address of the file at descriptor `idx` of `t`
-fn fd_key(t: &KernelTask, idx: u64) -> Option<u64> {
+fn fd_key(t: &Task, idx: u64) -> Option<u64> {
     let files = t.task_lock().files().cloned()?;
     let f = files.lock().get(idx as i32)?;
     Some(Arc::as_ptr(&f) as u64)

@@ -49,6 +49,9 @@ pub use aarch64::uaccess::Aarch64Uaccess as Uaccess;
 #[cfg(target_arch = "aarch64")]
 pub type CurrentArch = aarch64::Aarch64Arch;
 
+/// The current architecture's page table
+pub type ArchPageTable = <CurrentArch as SchedArch>::SchedPageTable;
+
 // I/O port access - x86-64 specific
 // Re-exported for platform drivers (PIC, PIT, serial, PCI)
 #[cfg(target_arch = "x86_64")]
@@ -385,7 +388,7 @@ pub trait PerCpuOps {
     /// Returns None if per-CPU data is not yet initialized (early boot).
     fn try_current_cpu_id() -> Option<u32>;
 
-    /// The running task (`*const KernelTask`), 0 for the boot task
+    /// The running task (`*const Task`), 0 for the boot task
     /// (before the first switch, or before per-CPU data exists)
     fn current_task_ptr() -> usize;
 
@@ -393,7 +396,7 @@ pub trait PerCpuOps {
     /// run-queue lock held; the run queue keeps it alive)
     fn set_current_task_ptr(p: usize);
 
-    /// The task running on CPU `cpu` (`*const KernelTask`, 0 for its
+    /// The task running on CPU `cpu` (`*const Task`, 0 for its
     /// boot task): a racy snapshot (Linux task_curr)
     fn current_task_ptr_of(cpu: u32) -> usize;
 

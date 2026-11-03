@@ -55,7 +55,7 @@ pub struct Pid {
     /// Its number at each level, root first
     numbers: Box<[UPid]>,
     /// The task it names (Linux pid->tasks[PIDTYPE_PID]): a
-    /// `*const KernelTask` set and cleared under TASKLIST's write lock
+    /// `*const Task` set and cleared under TASKLIST's write lock
     /// while the task is in the task list
     task: AtomicPtr<()>,
     /// The process group whose id this is: its member processes'

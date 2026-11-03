@@ -41,8 +41,9 @@ use core::pin::Pin;
 use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
 use crate::sync::spin::Mutex as SpinMutex;
+use crate::task::Task;
 use crate::task::Tid;
-use crate::task::percpu::{KernelTask, WakeQ};
+use crate::task::percpu::WakeQ;
 use crate::uaccess::{get_user, put_user};
 use crate::util::error::KernelError;
 use crate::util::list::{Link, List};
@@ -180,7 +181,7 @@ pub struct FutexQ {
     /// bucket locks; read under the lock of the bucket it is on)
     key: UnsafeCell<FutexKey>,
     /// The waiting task (alive while the entry is queued)
-    task: *const KernelTask,
+    task: *const Task,
     /// Bitset for selective wake (FUTEX_WAIT_BITSET/FUTEX_WAKE_BITSET)
     bitset: u32,
     /// The bucket it is on; null once dequeued
@@ -201,7 +202,7 @@ impl FutexQ {
         Self {
             link: Link::new(),
             key: UnsafeCell::new(key),
-            task: &*crate::task::percpu::current() as *const KernelTask,
+            task: &*crate::task::percpu::current() as *const Task,
             bitset,
             lock_ptr: AtomicPtr::new(core::ptr::null_mut()),
             _pin: PhantomPinned,
