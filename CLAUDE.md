@@ -23,5 +23,5 @@ hk: stable-Rust (no nightly) no_std SMP kernel, x86-64 + aarch64, Linux syscall 
 - `user/boot_tester` is no_std, provides its own `mem*`/`bcmp`.
 - Bisectable: EVERY commit on `updates` passes the full gate alone (user may push any time). Develop privately, publish a curated series, gating each commit before the next. A repro test lands with or after its fix.
 
-## Known issues
-`BUGS.md`.
+## Known issues, plan
+`BUGS.md`; phase order and scope: `doc/ROADMAP.md`.
