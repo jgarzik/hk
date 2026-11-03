@@ -259,7 +259,11 @@ VFS locks (detailed order):
                    parent directory -> the link/unlink/rename victim or
                    link source, two non-directories by address)
         ↓
-    Dentry.d_lock (single d_lock like Linux; short, never held across i_rwsem)
+    dentry::RENAME_LOCK (spin RwLock, Linux rename_lock: write in
+                   d_move/d_exchange, read in is_subdir/full_path)
+        ↓
+    Dentry.d_lock (single d_lock like Linux; short, never held across
+                   i_rwsem; parent before child)
         ↓
     Inode.private
         ↓
@@ -1654,22 +1658,32 @@ hashed; the losing builder's inode is dropped unhashed).
 **Dentry** (`fs/dentry.rs`):
 
 Following Linux's `d_lock` pattern, each dentry has a single RwLock protecting
-all mutable state:
+all mutable state, its name and parent included:
 
 ```rust
 pub struct Dentry {
-    pub name: FileName,         // Immutable after creation (bytes)
     pub sb: Weak<SuperBlock>,   // Immutable after creation
     d_lock: RwLock<DentryInner>, // Single lock (like Linux d_lock)
 }
 
 struct DentryInner {
+    name: FileName,             // Changed by d_move/d_exchange
     inode: Option<Arc<Inode>>,
-    parent: Option<Weak<Dentry>>,
+    parent: Option<Arc<Dentry>>, // Pinned by the child (Linux d_parent)
     children: BTreeMap<FileName, Arc<Dentry>>,
     flags: DentryFlags,
 }
 ```
+
+A rename moves the dentry itself (`d_move`, `d_exchange`) under the
+global `RENAME_LOCK` (write; Linux rename_lock), with both parents'
+`i_rwsem` held by the caller; each step takes one `d_lock` at a time
+(parent, then the moved or replaced child). `is_subdir` and `full_path`
+read parents and names under `RENAME_LOCK` (read), so they see one
+consistent tree. `Dentry::alloc` inserts a child under the parent's
+`d_lock` unless one with that name is cached (Linux d_alloc + d_add):
+one dentry per name. Deviation: Linux readers retry a seqlock instead of
+taking a lock.
 
 #### Mount Namespace & Mount Objects
 

@@ -28,17 +28,28 @@ pub struct DentryFlags {
     pub mounted: u32,
     /// Negative dentry (cached failed lookup)
     pub negative: bool,
+    /// Dropped from its parent's children: deleted, or replaced by a
+    /// rename (Linux d_unhashed)
+    pub unhashed: bool,
 }
 
+/// The dcache's tree shape: held for writing by d_move / d_exchange,
+/// for reading by whoever walks parents and names and needs one
+/// consistent picture (is_subdir, full_path) (Linux rename_lock, a
+/// seqlock there). Spinning, never taken in IRQ context; taken before
+/// any d_lock.
+static RENAME_LOCK: RwLock<()> = RwLock::new(());
+
 /// Inner mutable state protected by d_lock
-///
-/// All fields here are protected by the parent Dentry's single RwLock,
-/// following Linux's d_lock pattern.
 struct DentryInner {
+    /// Name in the parent (empty for a root); changed by d_move
+    name: FileName,
     /// The inode this dentry points to (None for negative dentry)
     inode: Option<Arc<Inode>>,
-    /// Parent dentry (None for root)
-    parent: Option<Weak<Dentry>>,
+    /// Parent dentry (None for a root), pinned by the child (Linux
+    /// d_parent holds a reference): a cwd or open directory keeps its
+    /// whole chain valid
+    parent: Option<Arc<Dentry>>,
     /// Children dentries (for directories)
     children: BTreeMap<FileName, Arc<Dentry>>,
     /// Dentry flags
@@ -49,14 +60,10 @@ struct DentryInner {
 ///
 /// ## Locking
 ///
-/// Uses a single `d_lock` RwLock protecting all mutable state, following
-/// the Linux kernel's dentry locking model. The `name` and `sb` fields
-/// are immutable after creation and don't need locking.
-///
+/// `d_lock` protects all mutable state, the name and parent included
+/// (Linux d_lock); a parent's d_lock is taken before a child's. `sb` is
+/// immutable.
 pub struct Dentry {
-    /// Name of this entry (empty for root) - immutable after creation
-    pub name: FileName,
-
     /// Back pointer to superblock - immutable after creation
     pub sb: Weak<SuperBlock>,
 
@@ -65,12 +72,11 @@ pub struct Dentry {
 }
 
 impl Dentry {
-    /// Create a new dentry
-    pub fn new(name: FileName, inode: Option<Arc<Inode>>, sb: Weak<SuperBlock>) -> Self {
+    fn with(name: FileName, inode: Option<Arc<Inode>>, sb: Weak<SuperBlock>) -> Self {
         Self {
-            name,
             sb,
             d_lock: RwLock::new(DentryInner {
+                name,
                 inode,
                 parent: None,
                 children: BTreeMap::new(),
@@ -81,16 +87,7 @@ impl Dentry {
 
     /// Create root dentry for a filesystem
     pub fn new_root(inode: Arc<Inode>, sb: Weak<SuperBlock>) -> Self {
-        Self {
-            name: FileName::default(),
-            sb,
-            d_lock: RwLock::new(DentryInner {
-                inode: Some(inode),
-                parent: None,
-                children: BTreeMap::new(),
-                flags: DentryFlags::default(),
-            }),
-        }
+        Self::with(FileName::default(), Some(inode), sb)
     }
 
     /// Create an anonymous dentry (for pipes, sockets, etc.)
@@ -98,16 +95,31 @@ impl Dentry {
     /// Anonymous dentries have no superblock and are not part of any filesystem.
     /// They exist solely to provide a File's required dentry reference.
     pub fn new_anonymous(name: FileName, inode: Option<Arc<Inode>>) -> Self {
-        Self {
-            name,
-            sb: Weak::new(), // No superblock for anonymous dentries
-            d_lock: RwLock::new(DentryInner {
-                inode,
-                parent: None,
-                children: BTreeMap::new(),
-                flags: DentryFlags::default(),
-            }),
+        Self::with(name, inode, Weak::new())
+    }
+
+    /// The child `name` of `parent` with `inode` (Linux d_alloc +
+    /// d_add): the cached one if there is one (a negative one gets
+    /// `inode`), so a name never has two dentries
+    pub fn alloc(parent: &Arc<Dentry>, name: &[u8], inode: Option<Arc<Inode>>) -> Arc<Dentry> {
+        let mut p = parent.d_lock.write();
+        if let Some(c) = p.children.get(name) {
+            let mut ci = c.d_lock.write();
+            if ci.inode.is_none() {
+                ci.inode = inode;
+            }
+            drop(ci);
+            return c.clone();
         }
+        let d = Arc::new(Self::with(name.into(), inode, parent.sb.clone()));
+        d.d_lock.write().parent = Some(parent.clone());
+        p.children.insert(name.into(), d.clone());
+        d
+    }
+
+    /// Name in the parent (a copy: d_move may change it)
+    pub fn name(&self) -> FileName {
+        self.d_lock.read().name.clone()
     }
 
     /// Get the inode this dentry points to
@@ -125,18 +137,14 @@ impl Dentry {
         self.d_lock.read().inode.is_none()
     }
 
-    /// Get parent dentry
-    pub fn get_parent(&self) -> Option<Arc<Dentry>> {
-        self.d_lock
-            .read()
-            .parent
-            .as_ref()
-            .and_then(|w: &Weak<Dentry>| w.upgrade())
+    /// Dropped from the tree: deleted or renamed over
+    pub fn is_unhashed(&self) -> bool {
+        self.d_lock.read().flags.unhashed
     }
 
-    /// Set parent dentry
-    pub fn set_parent(&self, parent: &Arc<Dentry>) {
-        self.d_lock.write().parent = Some(Arc::downgrade(parent));
+    /// Get parent dentry
+    pub fn get_parent(&self) -> Option<Arc<Dentry>> {
+        self.d_lock.read().parent.clone()
     }
 
     /// Look up a child dentry by name
@@ -144,15 +152,14 @@ impl Dentry {
         self.d_lock.read().children.get(name).cloned()
     }
 
-    /// Add a child dentry
-    pub fn add_child(&self, child: Arc<Dentry>) {
-        let name = child.name.clone();
-        self.d_lock.write().children.insert(name, child);
-    }
-
-    /// Remove a child dentry by name
+    /// Drop the child `name` from the tree (Linux d_delete / d_drop):
+    /// later lookups ask the file system; a holder keeps an unhashed
+    /// dentry
     pub fn remove_child(&self, name: &[u8]) -> Option<Arc<Dentry>> {
-        self.d_lock.write().children.remove(name)
+        let mut p = self.d_lock.write();
+        let c = p.children.remove(name)?;
+        c.d_lock.write().flags.unhashed = true;
+        Some(c)
     }
 
     /// Some mount, in some namespace, sits on this dentry
@@ -171,21 +178,20 @@ impl Dentry {
         self.sb.upgrade()
     }
 
-    // ========================================================================
-    // Rename locking (Linux lock_rename pattern)
-    // ========================================================================
-    /// Get the full path from root to this dentry
-    ///
-    /// Each parent is held by its Arc while its name is read.
+    /// Get the full path from root to this dentry, one consistent
+    /// picture under RENAME_LOCK
     pub fn full_path(&self) -> Vec<u8> {
+        let _r = RENAME_LOCK.read();
         let mut components = Vec::new();
-        if !self.name.is_empty() {
-            components.push(self.name.clone());
+        let name = self.name();
+        if !name.is_empty() {
+            components.push(name);
         }
         let mut cur = self.get_parent();
         while let Some(d) = cur {
-            if !d.name.is_empty() {
-                components.push(d.name.clone());
+            let name = d.name();
+            if !name.is_empty() {
+                components.push(name);
             }
             cur = d.get_parent();
         }
@@ -204,6 +210,52 @@ impl Dentry {
     pub fn num_children(&self) -> usize {
         self.d_lock.read().children.len()
     }
+}
+
+/// Unhook `d` from its parent's children if it is still there
+fn unhook(d: &Arc<Dentry>) -> Option<(Arc<Dentry>, FileName)> {
+    let parent = d.get_parent()?;
+    let name = d.name();
+    let mut p = parent.d_lock.write();
+    if p.children.get(&name).is_some_and(|c| Arc::ptr_eq(c, d)) {
+        p.children.remove(&name);
+    }
+    drop(p);
+    Some((parent, name))
+}
+
+/// Re-hang `d` as `name` under `parent`
+fn rehook(d: &Arc<Dentry>, parent: &Arc<Dentry>, name: FileName) {
+    let mut di = d.d_lock.write();
+    di.name = name.clone();
+    di.parent = Some(parent.clone());
+    di.flags.unhashed = false;
+    drop(di);
+    parent.d_lock.write().children.insert(name, d.clone());
+}
+
+/// A rename moved `d` to `name` in `parent` (Linux d_move): a dentry
+/// cached there (the replaced target) is unhashed; `d` keeps its
+/// identity, so whoever holds it (a cwd, an fd, a mountpoint) follows
+/// it. Callers hold both parents' i_rwsem.
+pub fn d_move(d: &Arc<Dentry>, parent: &Arc<Dentry>, name: &[u8]) {
+    let _w = RENAME_LOCK.write();
+    unhook(d);
+    if let Some(t) = parent.d_lock.write().children.remove(name) {
+        t.d_lock.write().flags.unhashed = true;
+    }
+    rehook(d, parent, name.into());
+}
+
+/// RENAME_EXCHANGE swapped `a` and `b` (Linux d_exchange): each takes
+/// the other's name and parent
+pub fn d_exchange(a: &Arc<Dentry>, b: &Arc<Dentry>) {
+    let _w = RENAME_LOCK.write();
+    let (Some((pa, na)), Some((pb, nb))) = (unhook(a), unhook(b)) else {
+        return;
+    };
+    rehook(a, &pb, nb);
+    rehook(b, &pa, na);
 }
 
 /// Global dentry cache
@@ -262,7 +314,8 @@ pub fn is_subdir(child: &Arc<Dentry>, ancestor: &Arc<Dentry>) -> bool {
         return true;
     }
 
-    // Walk up the parent chain from child
+    // Walk up the parent chain from child, one picture of the tree
+    let _r = RENAME_LOCK.read();
     let mut current = child.get_parent();
     while let Some(parent) = current {
         if Arc::ptr_eq(&parent, ancestor) {

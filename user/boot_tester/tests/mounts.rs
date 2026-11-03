@@ -5,16 +5,20 @@
 
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
-    CLONE_NEWNS, O_CREAT, O_WRONLY, Stat, sys_close, sys_exit, sys_fork, sys_mkdir, sys_mount,
-    sys_open, sys_rmdir, sys_stat, sys_umount2, sys_unshare, sys_wait4,
+    CLONE_NEWNS, O_CREAT, O_WRONLY, Stat, sys_chdir, sys_close, sys_exit, sys_fork, sys_getcwd,
+    sys_mkdir, sys_mount, sys_open, sys_rename, sys_rmdir, sys_stat, sys_umount2, sys_unlink,
+    sys_unshare, sys_wait4,
 };
 
 const ENOENT: i64 = -2;
+const EINVAL: i64 = -22;
 
 pub fn run_tests() {
     sys_mkdir(b"/tmp\0".as_ptr(), 0o1777); // hk boots without /tmp
     report(b"MOUNT_NESTED", nested());
     report(b"UNSHARE_UMOUNT_ISOLATED", unshare_umount());
+    report(b"RENAME_PINNED_TRAP", pinned_trap());
+    report(b"RENAME_ANCESTOR_MOUNT", ancestor_mount());
 }
 
 type R = Result<(), (&'static [u8], i64)>;
@@ -134,4 +138,61 @@ fn unshare_umount_ops(ui: &[u8]) -> R {
     sys_wait4(pid, &mut ws, 0, 0);
     check(b"child", ws == 0, (ws >> 8) as i64)?;
     check(b"still mounted here", dev(b"/tmp/ui/f\0").is_ok(), -1)
+}
+
+/// A rename moves the dentry a cwd holds (Linux d_move): from inside
+/// t/a/b, after a -> c, moving c into "z" (its own subtree) is EINVAL,
+/// and getcwd shows the new path
+fn pinned_trap() -> R {
+    for p in [&b"/tmp/t\0"[..], b"/tmp/t/a\0", b"/tmp/t/a/b\0"] {
+        sys_mkdir(p.as_ptr(), 0o755);
+    }
+    let r = pinned_trap_ops();
+    sys_chdir(b"/\0".as_ptr());
+    for p in [&b"/tmp/t/c/b/z\0"[..], b"/tmp/t/c/b\0", b"/tmp/t/c\0", b"/tmp/t/a/b\0"] {
+        sys_rmdir(p.as_ptr());
+    }
+    sys_rmdir(b"/tmp/t/a\0".as_ptr());
+    sys_rmdir(b"/tmp/t\0".as_ptr());
+    r
+}
+
+fn pinned_trap_ops() -> R {
+    let r = sys_chdir(b"/tmp/t/a/b\0".as_ptr());
+    check(b"chdir", r == 0, r)?;
+    let r = sys_rename(b"/tmp/t/a\0".as_ptr(), b"/tmp/t/c\0".as_ptr());
+    check(b"rename a c", r == 0, r)?;
+    let r = sys_rename(b"/tmp/t/c\0".as_ptr(), b"z\0".as_ptr());
+    check(b"rename into own subtree", r == EINVAL, r)?;
+    let mut buf = [0u8; 64];
+    let n = sys_getcwd(buf.as_mut_ptr(), buf.len());
+    let want = b"/tmp/t/c/b\0";
+    check(b"getcwd", n == want.len() as i64 && buf[..want.len()] == *want, n)
+}
+
+/// A mount below a renamed directory stays reachable at the new path
+fn ancestor_mount() -> R {
+    for p in [&b"/tmp/ra\0"[..], b"/tmp/ra/x\0", b"/tmp/ra/x/m\0"] {
+        sys_mkdir(p.as_ptr(), 0o755);
+    }
+    let r = ancestor_mount_ops();
+    for p in [&b"/tmp/ra/y/m\0"[..], b"/tmp/ra/x/m\0"] {
+        sys_unlink(b"/tmp/ra/y/m/f\0".as_ptr());
+        sys_umount2(p.as_ptr(), 0);
+        sys_rmdir(p.as_ptr());
+    }
+    for p in [&b"/tmp/ra/y\0"[..], b"/tmp/ra/x\0", b"/tmp/ra\0"] {
+        sys_rmdir(p.as_ptr());
+    }
+    r
+}
+
+fn ancestor_mount_ops() -> R {
+    check(b"mount", ramfs(b"/tmp/ra/x/m\0") == 0, -1)?;
+    let dm = dev(b"/tmp/ra/x/m\0").map_err(|e| (&b"stat m"[..], e))?;
+    check(b"touch", touch(b"/tmp/ra/x/m/f\0") >= 0, -1)?;
+    let r = sys_rename(b"/tmp/ra/x\0".as_ptr(), b"/tmp/ra/y\0".as_ptr());
+    check(b"rename x y", r == 0, r)?;
+    check(b"m still mounted", dev(b"/tmp/ra/y/m\0") == Ok(dm), -1)?;
+    check(b"file reachable", dev(b"/tmp/ra/y/m/f\0") == Ok(dm), -1)
 }

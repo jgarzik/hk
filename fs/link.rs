@@ -6,6 +6,7 @@
 use alloc::sync::Arc;
 
 use crate::arch::Uaccess;
+use crate::fs::dentry::{d_exchange, d_move};
 use crate::fs::namei::{
     Last, Parent, create_entry, delete_entry, filename_create, filename_lookup, filename_parentat,
     getname,
@@ -493,8 +494,11 @@ fn rename_locked(old: Side, new: Side, flags: u32) -> Result<(), KernelError> {
     drop(dead_lock);
     drop(nondirs);
     r?;
-    // New lookups re-create both dentries
-    op.remove_child(oname);
-    np.remove_child(nname);
+    // The dentries follow the rename: whoever holds one (a cwd, an fd,
+    // a mountpoint) sees the new place
+    match &dst {
+        Some(d) if exchange => d_exchange(&src, d),
+        _ => d_move(&src, np, nname),
+    }
     Ok(())
 }

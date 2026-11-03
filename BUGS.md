@@ -680,16 +680,6 @@ Found by the review of the P0 series; each confirmed against the code
 (and Linux 6.8 where semantics matter). "Fix in" names the phase
 expected to fix it; "next batch" means the next fix batch.
 
-1. **Rename leaves stale dentries; the trap is bypassed** (fix in
-   V1/V2, d_move). `fs/link.rs:593`: after a rename both
-   dentries are only `remove_child`'d, so a dentry pinned by a cwd or
-   fd keeps its old parent chain; `is_subdir` (`fs/dentry.rs:287`)
-   / `lock_rename` (`fs/mod.rs:129`) compare with `Arc::ptr_eq`.
-   Scenario: `mkdir -p /t/a/b; cd /t/a/b; mv /t/a /t/c; rename("/t/c",
-   "z")` moves c under its own child (Linux: EINVAL). Fix: Linux d_move /
-   d_exchange (dentry name under `d_lock`); vfat must then update the
-   moved inode's `parent_cluster`/`short_name` (fs rename needs the
-   source inode).
 7. **/proc/<pid>/* owner not refreshed on stat** (fix in V2).
    `fs/procfs.rs:370`: the owner (task_dump_owner) is updated
    at lookup and in permission() only; Linux pid_revalidate updates it

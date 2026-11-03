@@ -1100,13 +1100,7 @@ pub fn ramfs_create_dir_with_owner(
         .insert(FileName::from(name), new_inode.clone());
 
     // Create dentry
-    let new_dentry = Arc::new(Dentry::new(
-        FileName::from(name),
-        Some(new_inode),
-        Arc::downgrade(&sb),
-    ));
-    new_dentry.set_parent(parent);
-    parent.add_child(new_dentry.clone());
+    let new_dentry = Dentry::alloc(parent, name, Some(new_inode));
 
     Ok(new_dentry)
 }
@@ -1166,13 +1160,7 @@ pub fn ramfs_create_file_with_timestamp(
         .insert(FileName::from(name), new_inode.clone());
 
     // Create dentry
-    let new_dentry = Arc::new(Dentry::new(
-        FileName::from(name),
-        Some(new_inode),
-        Arc::downgrade(&sb),
-    ));
-    new_dentry.set_parent(parent);
-    parent.add_child(new_dentry.clone());
+    let new_dentry = Dentry::alloc(parent, name, Some(new_inode));
 
     Ok(new_dentry)
 }
@@ -1248,13 +1236,7 @@ pub fn ramfs_create_dir_with_timestamp(
         .insert(FileName::from(name), new_inode.clone());
 
     // Create dentry
-    let new_dentry = Arc::new(Dentry::new(
-        FileName::from(name),
-        Some(new_inode),
-        Arc::downgrade(&sb),
-    ));
-    new_dentry.set_parent(parent);
-    parent.add_child(new_dentry.clone());
+    let new_dentry = Dentry::alloc(parent, name, Some(new_inode));
 
     Ok(new_dentry)
 }
@@ -1344,13 +1326,7 @@ pub fn ramfs_create_symlink_with_timestamp(
         .insert(FileName::from(name), new_inode.clone());
 
     // Create dentry
-    let new_dentry = Arc::new(Dentry::new(
-        FileName::from(name),
-        Some(new_inode),
-        Arc::downgrade(&sb),
-    ));
-    new_dentry.set_parent(parent);
-    parent.add_child(new_dentry.clone());
+    let new_dentry = Dentry::alloc(parent, name, Some(new_inode));
 
     Ok(new_dentry)
 }
@@ -1409,13 +1385,7 @@ pub fn ramfs_create_blkdev(
         .insert(FileName::from(name), new_inode.clone());
 
     // Create dentry
-    let new_dentry = Arc::new(Dentry::new(
-        FileName::from(name),
-        Some(new_inode),
-        Arc::downgrade(&sb),
-    ));
-    new_dentry.set_parent(parent);
-    parent.add_child(new_dentry.clone());
+    let new_dentry = Dentry::alloc(parent, name, Some(new_inode));
 
     Ok(new_dentry)
 }
@@ -1474,13 +1444,7 @@ pub fn ramfs_create_chrdev(
         .insert(FileName::from(name), new_inode.clone());
 
     // Create dentry
-    let new_dentry = Arc::new(Dentry::new(
-        FileName::from(name),
-        Some(new_inode),
-        Arc::downgrade(&sb),
-    ));
-    new_dentry.set_parent(parent);
-    parent.add_child(new_dentry.clone());
+    let new_dentry = Dentry::alloc(parent, name, Some(new_inode));
 
     Ok(new_dentry)
 }

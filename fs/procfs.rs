@@ -698,7 +698,7 @@ fn fd_link(pid: Pid, fd: i32) -> Result<Vec<u8>, KernelError> {
         if mode.file_type() == Some(crate::fs::inode::FileType::Fifo) {
             return Ok(alloc::format!("pipe:[{}]", inode.ino).into_bytes());
         }
-        return Ok([b"anon_inode:".as_slice(), &file.dentry.name].concat());
+        return Ok([b"anon_inode:".as_slice(), &file.dentry.name()].concat());
     }
     Ok(file.dentry.full_path())
 }

@@ -165,8 +165,9 @@ fn test_mountpoint_busy() {
     f += chk(n, b"mount in parent", ramfs(b"/tmp/mnt_pa/m\0", 0), 0);
     f += chk(n, b"rename parent", sys_rename(pa.as_ptr(), pb.as_ptr()), 0);
     f += chk(n, b"rmdir after parent rename", sys_rmdir(m.as_ptr()), EBUSY);
-    sys_umount2(m.as_ptr(), 0);
-    sys_rmdir(m.as_ptr());
+    // The mount moved with its parent: unmounted at the new path
+    f += chk(n, b"umount after parent rename", sys_umount2(m.as_ptr(), 0), 0);
+    f += chk(n, b"rmdir after umount", sys_rmdir(m.as_ptr()), 0);
     sys_rmdir(pb.as_ptr());
     done(n, f);
 }

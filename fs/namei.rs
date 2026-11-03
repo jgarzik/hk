@@ -103,9 +103,7 @@ pub fn lookup_one(parent: &Arc<Dentry>, name: &[u8]) -> Result<Arc<Dentry>, Kern
     }
     let dir = parent.get_inode().ok_or(KernelError::NotFound)?;
     let inode = dir.i_op.lookup(&dir, name)?;
-    let child = Arc::new(Dentry::new(name.into(), Some(inode), parent.sb.clone()));
-    child.set_parent(parent);
-    parent.add_child(child.clone());
+    let child = Dentry::alloc(parent, name, Some(inode));
     Ok(child)
 }
 
@@ -240,9 +238,7 @@ pub fn create_entry(
         let _w = w?;
         super::dac::may_create(&c, &dir)?;
         let inode = make(&dir, &c)?;
-        let d = Arc::new(Dentry::new(name.into(), Some(inode), parent.sb.clone()));
-        d.set_parent(parent);
-        parent.add_child(d.clone());
+        let d = Dentry::alloc(parent, name, Some(inode));
         Ok(d)
     })()
 }
