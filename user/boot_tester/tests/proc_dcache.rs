@@ -19,6 +19,7 @@ pub fn run_tests() {
     report(b"PROC_FD_CLOSED", fd_closed());
     report(b"PROC_OWNER_REFRESH", owner_refresh());
     report(b"PROC_INO_UNIQUE", ino_unique());
+    report(b"DROP_CACHES_DENTRIES", drop_dentries());
 }
 
 type R = Result<(), (&'static [u8], i64)>;
@@ -186,4 +187,80 @@ fn ino_unique() -> R {
     let init = ino(b"/proc/1\0");
     let me = ino(b"/proc/self/\0");
     check(b"pid dirs", init != 0 && (init != me || hk_syscall::sys_getpid() == 1), init as i64)
+}
+
+/// nr_dentry of /proc/sys/fs/dentry-state
+fn nr_dentry() -> i64 {
+    let fd = sys_open(b"/proc/sys/fs/dentry-state\0".as_ptr(), O_RDONLY, 0);
+    let mut b = [0u8; 128];
+    let n = sys_read(fd as u64, b.as_mut_ptr(), b.len() as u64);
+    sys_close(fd as u64);
+    let mut v = 0i64;
+    for &c in b[..n.max(0) as usize].iter().take_while(|c| c.is_ascii_digit()) {
+        v = v * 10 + (c - b'0') as i64;
+    }
+    v
+}
+
+/// vm.drop_caches 2 frees unused dentries (procfs ones are cache on
+/// both kernels, ramfs ones are pinned on Linux: 120 /proc/self/fd/N
+/// looked up), while a mount's place and what is open stay
+fn drop_dentries() -> R {
+    let mp = b"/tmp/dcm\0";
+    hk_syscall::sys_mkdir(b"/tmp\0".as_ptr(), 0o1777);
+    hk_syscall::sys_mkdir(mp.as_ptr(), 0o755);
+    let mounted = hk_syscall::sys_mount(b"none\0".as_ptr(), mp.as_ptr(), b"ramfs\0".as_ptr(), 0, 0);
+    let me = hk_syscall::sys_getpid();
+    let mut fds = [0i64; 120];
+    for f in fds.iter_mut() {
+        *f = sys_open(b"/proc/self/status\0".as_ptr(), O_RDONLY, 0);
+    }
+    for &f in &fds {
+        let mut b = [0u8; 64];
+        let mut rest = *b"/fd/\0\0\0\0";
+        let (mut v, mut d, mut k) = (f as u32, [0u8; 4], 0);
+        loop {
+            d[k] = b'0' + (v % 10) as u8;
+            k += 1;
+            v /= 10;
+            if v == 0 {
+                break;
+            }
+        }
+        for i in 0..k {
+            rest[4 + i] = d[k - 1 - i];
+        }
+        let _ = stat(proc_path(&mut b, me, &rest[..4 + k]));
+    }
+    let before = nr_dentry();
+    // Twice: Linux's first pass may only clear each dentry's
+    // referenced bit (dentry_lru_isolate: LRU_ROTATE), and drop_slab
+    // goes round again only when a round freed more than 10
+    let mut w = 0;
+    for _ in 0..2 {
+        let fd = sys_open(b"/proc/sys/vm/drop_caches\0".as_ptr(), 1, 0);
+        w = sys_write(fd as u64, b"2\n".as_ptr(), 2);
+        sys_close(fd as u64);
+    }
+    let after = nr_dentry();
+    let still = match (stat(mp), stat(b"/tmp\0")) {
+        (Ok(a), Ok(b)) => a.st_dev != b.st_dev,
+        _ => false,
+    };
+    for &f in &fds {
+        sys_close(f as u64);
+    }
+    hk_syscall::sys_umount2(mp.as_ptr(), 0);
+    hk_syscall::sys_rmdir(mp.as_ptr());
+    check(b"mount", mounted == 0, mounted)?;
+    check(b"write", w == 2, w)?;
+    if before - after < 100 {
+        print(b"DROP_CACHES_DENTRIES: before ");
+        print_num(before);
+        print(b" after ");
+        print_num(after);
+        println(b"");
+    }
+    check(b"freed", before - after >= 100, before - after)?;
+    check(b"mount kept", still, -1)
 }

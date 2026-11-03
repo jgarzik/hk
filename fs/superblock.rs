@@ -232,6 +232,17 @@ impl Drop for WriteAccess {
     }
 }
 
+/// Every superblock (the dcache shrinker walks their trees); dead ones
+/// are dropped on the way
+static ALL_SBS: crate::sync::spin::Mutex<alloc::vec::Vec<alloc::sync::Weak<SuperBlock>>> =
+    crate::sync::spin::Mutex::new(alloc::vec::Vec::new());
+
+/// The `i`th live superblock, or None past the end (no allocation: the
+/// shrinker runs when memory is short)
+pub fn nth_sb(i: usize) -> Option<Option<Arc<SuperBlock>>> {
+    ALL_SBS.lock().get(i).map(alloc::sync::Weak::upgrade)
+}
+
 pub struct SuperBlock {
     /// Filesystem type
     pub fs_type: &'static FileSystemType,
@@ -314,7 +325,7 @@ impl SuperBlock {
         s_op: &'static dyn SuperOps,
         flags: u32,
     ) -> Arc<Self> {
-        Arc::new(Self {
+        let sb = Arc::new(Self {
             fs_type,
             root: RwLock::new(None),
             s_op,
@@ -329,7 +340,9 @@ impl SuperBlock {
             s_wb_lock: crate::sync::Mutex::new(()),
             s_vfs_rename_mutex: sync::Mutex::new(()),
             s_umount: sync::RwSem::new(()),
-        })
+        });
+        ALL_SBS.lock().push(Arc::downgrade(&sb));
+        sb
     }
 
     /// True if mounted read-only (Linux sb_rdonly)

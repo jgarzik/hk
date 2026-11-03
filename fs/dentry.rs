@@ -39,6 +39,9 @@ pub struct DentryFlags {
 /// any d_lock.
 static RENAME_LOCK: RwLock<()> = RwLock::new(());
 
+/// Dentries alive (/proc/sys/fs/dentry-state nr_dentry)
+static NR_DENTRY: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
+
 /// Inner mutable state protected by d_lock
 struct DentryInner {
     /// Name in the parent (empty for a root); changed by d_move
@@ -72,6 +75,7 @@ pub struct Dentry {
 
 impl Dentry {
     fn with(name: FileName, inode: Option<Arc<Inode>>, sb: Weak<SuperBlock>) -> Self {
+        NR_DENTRY.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         Self {
             sb,
             d_lock: RwLock::new(DentryInner {
@@ -283,6 +287,105 @@ pub fn d_path_link(p: &Path) -> Vec<u8> {
         out.extend_from_slice(b" (deleted)");
     }
     out
+}
+
+impl Drop for Dentry {
+    fn drop(&mut self) {
+        NR_DENTRY.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// /proc/sys/fs/dentry-state (Linux: nr_dentry, nr_unused, age_limit,
+/// want_pages, nr_negative, dummy); hk counts only nr_dentry
+pub fn dentry_state() -> Vec<i64> {
+    let n = NR_DENTRY.load(core::sync::atomic::Ordering::Relaxed);
+    alloc::vec![n, 0, 45, 0, 0, 0]
+}
+
+/// Drop `d` from `parent` if it is an unused leaf: in the tree and held
+/// by nothing but the tree and the caller, nothing cached below, nothing
+/// mounted on it; decided under the parent's d_lock, where lookups take
+/// their references (Linux dentry_kill from the LRU)
+fn prune_one(parent: &Arc<Dentry>, d: &Arc<Dentry>) -> bool {
+    let mut p = parent.d_lock.write();
+    let di = d.d_lock.read();
+    let unused = Arc::strong_count(d) == 2 && di.children.is_empty() && di.flags.mounted == 0;
+    let ours = p.children.get(&di.name).is_some_and(|c| Arc::ptr_eq(c, d));
+    if !unused || !ours {
+        return false;
+    }
+    let name = di.name.clone();
+    drop(di);
+    p.children.remove(&name);
+    d.d_lock.write().flags.unhashed = true;
+    true
+}
+
+/// The child after `d` in `parent`, by name
+fn next_sibling(parent: &Dentry, d: &Dentry) -> Option<Arc<Dentry>> {
+    use core::ops::Bound::{Excluded, Unbounded};
+    let p = parent.d_lock.read();
+    let di = d.d_lock.read();
+    let key: &[u8] = &di.name;
+    p.children
+        .range::<[u8], _>((Excluded(key), Unbounded))
+        .next()
+        .map(|(_, c)| c.clone())
+}
+
+fn first_child(d: &Dentry) -> Option<Arc<Dentry>> {
+    d.d_lock.read().children.values().next().cloned()
+}
+
+/// Prune up to `budget` unused leaves of the tree under `root`, post
+/// order, so a directory left empty goes too
+fn prune_tree(root: &Arc<Dentry>, budget: usize) -> usize {
+    let mut freed = 0;
+    let mut cur = root.clone();
+    loop {
+        while let Some(c) = first_child(&cur) {
+            cur = c;
+        }
+        loop {
+            if Arc::ptr_eq(&cur, root) || freed >= budget {
+                return freed;
+            }
+            let Some(parent) = cur.get_parent() else {
+                return freed;
+            };
+            let next = next_sibling(&parent, &cur);
+            if prune_one(&parent, &cur) {
+                freed += 1;
+            }
+            match next {
+                Some(n) => {
+                    cur = n;
+                    break;
+                }
+                None => cur = parent,
+            }
+        }
+    }
+}
+
+/// The dcache shrinker (Linux prune_dcache_sb over every superblock):
+/// up to `budget` unused dentries, negative ones included, leave the
+/// tree; what they held (inodes not otherwise cached) goes with them.
+/// Allocates nothing. Deviation: no LRU, so not oldest first. The
+/// number dropped.
+pub fn shrink_dcache(budget: usize) -> usize {
+    let mut freed = 0;
+    let mut i = 0;
+    while let Some(sb) = super::superblock::nth_sb(i) {
+        i += 1;
+        if let Some(root) = sb.and_then(|sb| sb.get_root()) {
+            freed += prune_tree(&root, budget - freed);
+        }
+        if freed >= budget {
+            break;
+        }
+    }
+    freed
 }
 
 /// Unhook `d` from its parent's children if it is still there

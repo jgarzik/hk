@@ -437,8 +437,8 @@ with no interpreter (hk relocates it in the kernel, so its pages are
 private copies; Linux applies no relocations at all) and the partial
 last page and bss of each segment (copied). Kernel object leaks cost free
 memory: each fork+exec keeps two dentries and two inodes plus ~900
-bytes of kmalloc (~1.3KB; suspected: procfs entries of dead pids, for
-the dcache work). The MM_LIFE tests count MemFree + Slab so they check user memory only; these leaks
+bytes of kmalloc (~1.3KB, measured before procfs entries of released
+tasks were flushed and the dcache got a shrinker; not measured since). The MM_LIFE tests count MemFree + Slab so they check user memory only; these leaks
 are listed here instead.
 
 ## The memory cgroup's memory.max is not enforced

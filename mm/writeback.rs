@@ -156,8 +156,8 @@ static DROP_CACHES: AtomicU64 = AtomicU64::new(0);
 /// /proc/sys/vm dirty limits and drop_caches (Linux vm_table)
 pub static WB_CTLS: &[crate::sysctl::Ctl] = &[
     // Linux drop_caches_sysctl_handler: 1 drops clean page cache, 2
-    // the reclaimable slab (hk: dentries and inodes have no LRU yet, so
-    // nothing), 3 both; 4 only silences the log
+    // the reclaimable slab (unused dentries, and the inodes only they
+    // held), 3 both; 4 only silences the log
     crate::sysctl::Ctl {
         path: "vm/drop_caches",
         mode: 0o200,
@@ -167,6 +167,9 @@ pub static WB_CTLS: &[crate::sysctl::Ctl] = &[
             DROP_CACHES.store(v[0] as u64, Ordering::Relaxed);
             if v[0] & 1 != 0 {
                 crate::mm::filemap::drop_pagecache();
+            }
+            if v[0] & 2 != 0 {
+                crate::fs::dentry::shrink_dcache(usize::MAX);
             }
             Ok(())
         },

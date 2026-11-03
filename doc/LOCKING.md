@@ -1700,6 +1700,13 @@ lock. `proc::proc_flush_pid` runs after a task leaves TASKLIST: it
 collects the procfs superblocks under `PROC_SBS` (spin Mutex, leaf),
 releases it, then drops dentries (d_lock).
 
+The dcache shrinker (`dentry::shrink_dcache`: drop_caches 2, direct
+reclaim) takes `superblock::ALL_SBS` (spin Mutex, leaf) only to pick the
+next superblock, then per dentry the parent's d_lock (write) and the
+child's (read): spin locks only, allocating nothing. Direct reclaim
+never runs in atomic context (`may_direct_reclaim`), so an allocation
+under a d_lock or ALL_SBS cannot re-enter it.
+
 #### Mount Namespace & Mount Objects
 
 **Location:** `fs/mount.rs`
