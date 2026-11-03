@@ -119,7 +119,7 @@ pub fn sys_readlinkat(dirfd: i32, path_ptr: u64, buf_ptr: u64, bufsiz: u64) -> i
     }
 
     // Determine starting path for relative paths
-    let start: Option<Path> = if path.starts_with('/') {
+    let start: Option<Path> = if path.starts_with(b"/") {
         None
     } else if dirfd == AT_FDCWD {
         crate::task::percpu::current_cwd()
@@ -165,7 +165,7 @@ pub fn sys_readlinkat(dirfd: i32, path_ptr: u64, buf_ptr: u64, bufsiz: u64) -> i
 
     // Copy to user buffer (without null terminator)
     let copy_len = core::cmp::min(target.len(), bufsiz);
-    if copy_to_user::<Uaccess>(buf_ptr, &target.as_bytes()[..copy_len]).is_err() {
+    if copy_to_user::<Uaccess>(buf_ptr, &target[..copy_len]).is_err() {
         return KernelError::BadAddress.sysret();
     }
 
@@ -194,7 +194,7 @@ pub fn sys_link(oldpath_ptr: u64, newpath_ptr: u64) -> i64 {
 /// parent's: an inode with no links left is not linked again (ENOENT),
 /// and no unlink can drop its last link between that check and the link
 /// (Linux vfs_link: inode_lock(inode), i_nlink == 0 -> ENOENT)
-fn link_locked(dir: &Arc<Inode>, name: &str, inode: &Arc<Inode>) -> Result<(), KernelError> {
+fn link_locked(dir: &Arc<Inode>, name: &[u8], inode: &Arc<Inode>) -> Result<(), KernelError> {
     let _lock = inode.lock();
     if inode.get_nlink() == 0 {
         Err(KernelError::NotFound)
@@ -233,7 +233,7 @@ fn link_source(dirfd: i32, path_ptr: u64, flags: i32) -> Result<Arc<Dentry>, Ker
             .ok_or(KernelError::BadFd)?;
         return Ok(file.dentry.clone());
     }
-    let start: Option<Path> = if path.starts_with('/') {
+    let start: Option<Path> = if path.starts_with(b"/") {
         None
     } else if dirfd == AT_FDCWD {
         crate::task::percpu::current_cwd()
@@ -455,15 +455,15 @@ pub fn sys_renameat2(
     }
 
     // Extract final components for validation
-    let old_basename = oldpath.rsplit('/').next().unwrap_or(&oldpath);
-    let new_basename = newpath.rsplit('/').next().unwrap_or(&newpath);
+    let old_basename = oldpath.rsplit(|&c| c == b'/').next().unwrap_or(&oldpath);
+    let new_basename = newpath.rsplit(|&c| c == b'/').next().unwrap_or(&newpath);
 
     // Cannot rename "." or ".." - these are special directory entries
-    if old_basename == "." || old_basename == ".." {
+    if super::name::is_dot_or_dotdot(old_basename) {
         return KernelError::InvalidArgument.sysret();
     }
     // Cannot rename TO "." or ".." either
-    if new_basename == "." || new_basename == ".." {
+    if super::name::is_dot_or_dotdot(new_basename) {
         return KernelError::InvalidArgument.sysret();
     }
 
@@ -517,7 +517,7 @@ pub fn sys_renameat2(
 }
 
 /// Parent dentry, parent inode and name of one side of a rename
-type Side<'a> = (&'a Arc<Dentry>, &'a Arc<Inode>, &'a str);
+type Side<'a> = (&'a Arc<Dentry>, &'a Arc<Inode>, &'a [u8]);
 
 /// The rename itself with both parents locked (Linux do_renameat2 trap
 /// check + vfs_rename): may_delete of the source, may_create or

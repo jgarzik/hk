@@ -296,9 +296,9 @@ pub fn attach(
 /// Mount a filesystem at a path string
 pub fn mount_at_path(
     fs_type: &'static FileSystemType,
-    path: &str,
+    path: &[u8],
 ) -> Result<Arc<Mount>, KernelError> {
-    if path == "/" || path.is_empty() {
+    if path == b"/" || path.is_empty() {
         // Root mount
         do_mount(fs_type, None)
     } else {
@@ -312,7 +312,7 @@ pub fn mount_at_path(
 /// device at `source` (e.g. "/dev/rd1"); mount it with `attach`
 pub fn dev_super(
     fs_type: &'static FileSystemType,
-    source: &str,
+    source: &[u8],
 ) -> Result<Arc<SuperBlock>, KernelError> {
     // The filesystem must support device mounting
     let mount_dev_fn = fs_type

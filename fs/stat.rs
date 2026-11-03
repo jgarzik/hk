@@ -166,7 +166,7 @@ pub fn sys_fstatat(dirfd: i32, path_ptr: u64, statbuf: u64, flags: i32) -> i64 {
     }
 
     // Determine starting path for relative paths
-    let start: Option<Path> = if path_str.starts_with('/') {
+    let start: Option<Path> = if path_str.starts_with(b"/") {
         // Absolute path - lookup_path_at will use root
         None
     } else if dirfd == AT_FDCWD {
@@ -628,7 +628,7 @@ pub fn sys_statx(dirfd: i32, path_ptr: u64, flags: i32, mask: u32, buf: u64) -> 
         }
     } else {
         // Determine starting path for relative paths
-        let start: Option<Path> = if path.starts_with('/') {
+        let start: Option<Path> = if path.starts_with(b"/") {
             None
         } else if dirfd == AT_FDCWD {
             crate::task::percpu::current_cwd()

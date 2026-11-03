@@ -13,6 +13,7 @@ pub mod file;
 pub mod fsstruct;
 pub mod inode;
 pub mod mount;
+pub mod name;
 pub mod path;
 pub mod path_ref;
 pub mod splice;
@@ -84,7 +85,7 @@ use alloc::sync::Arc;
 /// regular file. Kernel-internal callers (init) have root credentials.
 ///
 /// Returns a read-only file, or a positive errno (ENOENT, EACCES, ...).
-pub fn kernel_open_exec(path: &str) -> Result<Arc<File>, i32> {
+pub fn kernel_open_exec(path: &[u8]) -> Result<Arc<File>, i32> {
     let dentry = lookup_path_flags(path, LookupFlags::open()).map_err(|e| e as i32)?;
     open_exec(dentry)
 }

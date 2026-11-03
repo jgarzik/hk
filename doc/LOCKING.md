@@ -1658,7 +1658,7 @@ all mutable state:
 
 ```rust
 pub struct Dentry {
-    pub name: String,           // Immutable after creation
+    pub name: FileName,         // Immutable after creation (bytes)
     pub sb: Weak<SuperBlock>,   // Immutable after creation
     d_lock: RwLock<DentryInner>, // Single lock (like Linux d_lock)
 }
@@ -1666,7 +1666,7 @@ pub struct Dentry {
 struct DentryInner {
     inode: Option<Arc<Inode>>,
     parent: Option<Weak<Dentry>>,
-    children: BTreeMap<String, Arc<Dentry>>,
+    children: BTreeMap<FileName, Arc<Dentry>>,
     flags: DentryFlags,
 }
 ```

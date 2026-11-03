@@ -571,7 +571,7 @@ fn kmain() -> ! {
 fn run_init() -> ! {
     let args = cmdline::init_args(&cmdline::saved());
     let rdinit = args.rdinit.as_deref().unwrap_or("/init");
-    if fs::lookup_path(rdinit).is_ok() {
+    if fs::lookup_path(rdinit.as_bytes()).is_ok() {
         let e = try_init(rdinit, &args);
         printkln!("Failed to execute {} (error {})", rdinit, e);
     }
@@ -629,14 +629,14 @@ fn init_vfs_core() {
 
     // Create /proc and mount procfs
     let root_dentry = root_mount.root.clone();
-    let proc_dentry = match ramfs_create_dir(&root_dentry, "proc") {
+    let proc_dentry = match ramfs_create_dir(&root_dentry, b"proc") {
         Ok(d) => d,
         Err(_) => return,
     };
     let _ = do_mount(&PROCFS_TYPE, Some(proc_dentry));
 
     // Create /dev directory
-    let dev_dentry = match ramfs_create_dir(&root_dentry, "dev") {
+    let dev_dentry = match ramfs_create_dir(&root_dentry, b"dev") {
         Ok(d) => d,
         Err(_) => return,
     };
@@ -666,7 +666,7 @@ fn init_vfs_core() {
         nodes.push(("ttyS0", DevId::new(chardev_major::TTYS, 64), 0o666));
     }
     for (name, dev, mode) in nodes {
-        let _ = fs::ramfs_create_chrdev(&dev_dentry, name, dev, mode);
+        let _ = fs::ramfs_create_chrdev(&dev_dentry, name.as_bytes(), dev, mode);
         fs::devtmpfs::device_add(name, dev, false, mode);
     }
 
@@ -704,7 +704,7 @@ pub fn init_vfat_ramdisk(
     let _ = create_ramdisk_from_data(1, vfat_data);
 
     // Create /vfat_test mount point (userspace init will mount here)
-    let _ = ramfs_create_dir(root_dentry, "vfat_test");
+    let _ = ramfs_create_dir(root_dentry, b"vfat_test");
 }
 
 /// Panic handler (only for bare metal)

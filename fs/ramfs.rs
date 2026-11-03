@@ -19,6 +19,8 @@
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
+
+use super::name::FileName;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 
@@ -95,7 +97,7 @@ pub struct RamfsInodeData {
 
     /// Symlink target (symlinks only - stored inline, not in page cache)
     /// Symlinks are typically small, so inline storage is more efficient.
-    pub symlink_target: Option<String>,
+    pub symlink_target: Option<FileName>,
 
     /// Extended attributes (name -> value)
     pub xattrs: RwLock<BTreeMap<String, Vec<u8>>>,
@@ -107,8 +109,8 @@ pub struct RamfsInodeData {
 /// other entries come and go (an `rm -r` that unlinks as it reads sees
 /// every entry once). Positions 0 and 1 are "." and "..".
 pub struct Children {
-    by_name: BTreeMap<String, (u64, Arc<Inode>)>,
-    by_pos: BTreeMap<u64, String>,
+    by_name: BTreeMap<FileName, (u64, Arc<Inode>)>,
+    by_pos: BTreeMap<u64, FileName>,
     next: u64,
 }
 
@@ -123,12 +125,12 @@ impl Children {
     }
 
     /// Inode of entry `name`
-    pub fn get(&self, name: &str) -> Option<&Arc<Inode>> {
+    pub fn get(&self, name: &[u8]) -> Option<&Arc<Inode>> {
         self.by_name.get(name).map(|(_, i)| i)
     }
 
     /// True if entry `name` exists
-    pub fn contains_key(&self, name: &str) -> bool {
+    pub fn contains_key(&self, name: &[u8]) -> bool {
         self.by_name.contains_key(name)
     }
 
@@ -138,7 +140,7 @@ impl Children {
     }
 
     /// Add (or replace) entry `name` at the next position
-    pub fn insert(&mut self, name: String, inode: Arc<Inode>) -> Option<Arc<Inode>> {
+    pub fn insert(&mut self, name: FileName, inode: Arc<Inode>) -> Option<Arc<Inode>> {
         let old = self.remove(&name);
         let pos = self.next;
         self.next += 1;
@@ -148,18 +150,18 @@ impl Children {
     }
 
     /// Remove entry `name`
-    pub fn remove(&mut self, name: &str) -> Option<Arc<Inode>> {
+    pub fn remove(&mut self, name: &[u8]) -> Option<Arc<Inode>> {
         let (pos, inode) = self.by_name.remove(name)?;
         self.by_pos.remove(&pos);
         Some(inode)
     }
 
     /// Entries at position `pos` or later, in position order
-    pub fn from_pos(&self, pos: u64) -> impl Iterator<Item = (u64, &str, &Arc<Inode>)> {
+    pub fn from_pos(&self, pos: u64) -> impl Iterator<Item = (u64, &[u8], &Arc<Inode>)> {
         self.by_pos.range(pos..).filter_map(|(&p, name)| {
             self.by_name
                 .get(name)
-                .map(|(_, inode)| (p, name.as_str(), inode))
+                .map(|(_, inode)| (p, name.as_bytes(), inode))
         })
     }
 }
@@ -190,7 +192,7 @@ impl RamfsInodeData {
     }
 
     /// Create symlink data (target stored inline)
-    pub fn new_symlink(target: String) -> Self {
+    pub fn new_symlink(target: FileName) -> Self {
         Self {
             children: RwLock::new(Children::new()),
             symlink_target: Some(target),
@@ -228,9 +230,9 @@ impl RamfsInodeOps {
     /// Helper for cross-directory rename operations
     fn do_cross_dir_rename(
         old_children: &mut Children,
-        old_name: &str,
+        old_name: &[u8],
         new_children: &mut Children,
-        new_name: &str,
+        new_name: &[u8],
         flags: u32,
     ) -> Result<(), KernelError> {
         const RENAME_NOREPLACE: u32 = 1;
@@ -255,8 +257,8 @@ impl RamfsInodeOps {
             // Move source to new location, target to old location
             old_children.remove(old_name);
             new_children.remove(new_name);
-            old_children.insert(String::from(old_name), target_inode);
-            new_children.insert(String::from(new_name), source_inode);
+            old_children.insert(FileName::from(old_name), target_inode);
+            new_children.insert(FileName::from(new_name), source_inode);
         } else {
             // Check if target exists
             let target_exists = new_children.contains_key(new_name);
@@ -280,8 +282,8 @@ impl RamfsInodeOps {
                         .ok_or(KernelError::Io)?;
                     if !target_data.children.read().is_empty() {
                         // Restore source and target
-                        old_children.insert(String::from(old_name), source_inode);
-                        new_children.insert(String::from(new_name), old_target);
+                        old_children.insert(FileName::from(old_name), source_inode);
+                        new_children.insert(FileName::from(new_name), old_target);
                         return Err(KernelError::DirectoryNotEmpty);
                     }
                 }
@@ -289,7 +291,7 @@ impl RamfsInodeOps {
             }
 
             // Insert at new location
-            new_children.insert(String::from(new_name), source_inode);
+            new_children.insert(FileName::from(new_name), source_inode);
         }
 
         Ok(())
@@ -297,7 +299,7 @@ impl RamfsInodeOps {
 }
 
 impl InodeOps for RamfsInodeOps {
-    fn lookup(&self, dir: &Inode, name: &str) -> Result<Arc<Inode>, KernelError> {
+    fn lookup(&self, dir: &Inode, name: &[u8]) -> Result<Arc<Inode>, KernelError> {
         let private = dir.get_private().ok_or(KernelError::Io)?;
         let ramfs_data = private
             .as_ref()
@@ -313,7 +315,7 @@ impl InodeOps for RamfsInodeOps {
             .ok_or(KernelError::NotFound)
     }
 
-    fn create(&self, dir: &Inode, name: &str, mode: InodeMode) -> Result<Arc<Inode>, KernelError> {
+    fn create(&self, dir: &Inode, name: &[u8], mode: InodeMode) -> Result<Arc<Inode>, KernelError> {
         let sb = dir.superblock().ok_or(KernelError::Io)?;
         let private = dir.get_private().ok_or(KernelError::Io)?;
         let dir_data = private
@@ -348,7 +350,7 @@ impl InodeOps for RamfsInodeOps {
         dir_data
             .children
             .write()
-            .insert(String::from(name), new_inode.clone());
+            .insert(FileName::from(name), new_inode.clone());
 
         Ok(new_inode)
     }
@@ -356,7 +358,7 @@ impl InodeOps for RamfsInodeOps {
     fn mknod(
         &self,
         dir: &Inode,
-        name: &str,
+        name: &[u8],
         mode: InodeMode,
         rdev: DevId,
     ) -> Result<Arc<Inode>, KernelError> {
@@ -384,11 +386,11 @@ impl InodeOps for RamfsInodeOps {
         dir_data
             .children
             .write()
-            .insert(String::from(name), inode.clone());
+            .insert(FileName::from(name), inode.clone());
         Ok(inode)
     }
 
-    fn mkdir(&self, dir: &Inode, name: &str, mode: InodeMode) -> Result<Arc<Inode>, KernelError> {
+    fn mkdir(&self, dir: &Inode, name: &[u8], mode: InodeMode) -> Result<Arc<Inode>, KernelError> {
         let sb = dir.superblock().ok_or(KernelError::Io)?;
         let private = dir.get_private().ok_or(KernelError::Io)?;
         let dir_data = private
@@ -420,7 +422,7 @@ impl InodeOps for RamfsInodeOps {
         dir_data
             .children
             .write()
-            .insert(String::from(name), new_inode.clone());
+            .insert(FileName::from(name), new_inode.clone());
 
         Ok(new_inode)
     }
@@ -429,7 +431,7 @@ impl InodeOps for RamfsInodeOps {
         true
     }
 
-    fn readlink(&self, inode: &Inode) -> Result<String, KernelError> {
+    fn readlink(&self, inode: &Inode) -> Result<Vec<u8>, KernelError> {
         // Must be a symlink
         if !inode.mode().is_symlink() {
             return Err(KernelError::InvalidArgument);
@@ -446,10 +448,11 @@ impl InodeOps for RamfsInodeOps {
         ramfs_data
             .symlink_target
             .clone()
+            .map(FileName::into_vec)
             .ok_or(KernelError::InvalidArgument)
     }
 
-    fn symlink(&self, dir: &Inode, name: &str, target: &str) -> Result<Arc<Inode>, KernelError> {
+    fn symlink(&self, dir: &Inode, name: &[u8], target: &[u8]) -> Result<Arc<Inode>, KernelError> {
         let sb = dir.superblock().ok_or(KernelError::Io)?;
         let private = dir.get_private().ok_or(KernelError::Io)?;
         let dir_data = private
@@ -477,18 +480,20 @@ impl InodeOps for RamfsInodeOps {
         ));
 
         // Store target inline (not in page cache)
-        new_inode.set_private(Arc::new(RamfsInodeData::new_symlink(String::from(target))));
+        new_inode.set_private(Arc::new(RamfsInodeData::new_symlink(FileName::from(
+            target,
+        ))));
 
         // Add to directory
         dir_data
             .children
             .write()
-            .insert(String::from(name), new_inode.clone());
+            .insert(FileName::from(name), new_inode.clone());
 
         Ok(new_inode)
     }
 
-    fn link(&self, dir: &Inode, name: &str, target_inode: &Arc<Inode>) -> Result<(), KernelError> {
+    fn link(&self, dir: &Inode, name: &[u8], target_inode: &Arc<Inode>) -> Result<(), KernelError> {
         // Cannot hard link directories
         if target_inode.mode().is_dir() {
             return Err(KernelError::PermissionDenied); // EPERM
@@ -513,7 +518,7 @@ impl InodeOps for RamfsInodeOps {
         dir_data
             .children
             .write()
-            .insert(String::from(name), target_inode.clone());
+            .insert(FileName::from(name), target_inode.clone());
 
         Ok(())
     }
@@ -526,7 +531,7 @@ impl InodeOps for RamfsInodeOps {
         Ok(())
     }
 
-    fn unlink(&self, dir: &Inode, name: &str) -> Result<(), KernelError> {
+    fn unlink(&self, dir: &Inode, name: &[u8]) -> Result<(), KernelError> {
         let private = dir.get_private().ok_or(KernelError::Io)?;
         let dir_data = private
             .as_ref()
@@ -551,9 +556,9 @@ impl InodeOps for RamfsInodeOps {
     fn rename(
         &self,
         old_dir: &Inode,
-        old_name: &str,
+        old_name: &[u8],
         new_dir: &Arc<Inode>,
-        new_name: &str,
+        new_name: &[u8],
         flags: u32,
     ) -> Result<(), KernelError> {
         // RENAME_NOREPLACE = 1, RENAME_EXCHANGE = 2
@@ -612,8 +617,8 @@ impl InodeOps for RamfsInodeOps {
                     .ok_or(KernelError::NotFound)?;
 
                 // Swap the entries
-                children.insert(String::from(old_name), target_inode);
-                children.insert(String::from(new_name), source_inode);
+                children.insert(FileName::from(old_name), target_inode);
+                children.insert(FileName::from(new_name), source_inode);
             } else if noreplace && target_exists {
                 return Err(KernelError::AlreadyExists);
             } else {
@@ -632,7 +637,7 @@ impl InodeOps for RamfsInodeOps {
                             .ok_or(KernelError::Io)?;
                         if !target_data.children.read().is_empty() {
                             // Restore the source
-                            children.insert(String::from(old_name), source_inode);
+                            children.insert(FileName::from(old_name), source_inode);
                             return Err(KernelError::DirectoryNotEmpty);
                         }
                     }
@@ -640,7 +645,7 @@ impl InodeOps for RamfsInodeOps {
                 }
 
                 // Insert at new name
-                children.insert(String::from(new_name), source_inode);
+                children.insert(FileName::from(new_name), source_inode);
             }
         } else {
             // Different directories: VFS layer has already acquired inode locks
@@ -662,7 +667,7 @@ impl InodeOps for RamfsInodeOps {
         Ok(())
     }
 
-    fn rmdir(&self, dir: &Inode, name: &str) -> Result<(), KernelError> {
+    fn rmdir(&self, dir: &Inode, name: &[u8]) -> Result<(), KernelError> {
         let private = dir.get_private().ok_or(KernelError::Io)?;
         let dir_data = private
             .as_ref()
@@ -932,7 +937,7 @@ impl FileOps for RamfsFileOps {
             let e = DirEntry {
                 ino: child.ino,
                 file_type,
-                name: name.as_bytes().to_vec(),
+                name: name.to_vec(),
             };
             if !ctx.emit_at(pos, e) {
                 break;
@@ -998,7 +1003,7 @@ impl SuperOps for RamfsSuperOps {
             inode.set_private(Arc::new(RamfsInodeData::new_dir()));
         } else if mode.is_symlink() {
             // Symlinks need to be set up with a target later
-            inode.set_private(Arc::new(RamfsInodeData::new_symlink(String::new())));
+            inode.set_private(Arc::new(RamfsInodeData::new_symlink(FileName::default())));
         } else {
             inode.set_private(Arc::new(RamfsInodeData::new_file()));
             file_mapping(&inode);
@@ -1054,7 +1059,7 @@ use super::inode::{Gid, Uid};
 /// Create a directory in ramfs with ownership
 pub fn ramfs_create_dir_with_owner(
     parent: &Arc<Dentry>,
-    name: &str,
+    name: &[u8],
     mode: InodeMode,
     uid: Uid,
     gid: Gid,
@@ -1092,11 +1097,11 @@ pub fn ramfs_create_dir_with_owner(
     parent_data
         .children
         .write()
-        .insert(String::from(name), new_inode.clone());
+        .insert(FileName::from(name), new_inode.clone());
 
     // Create dentry
     let new_dentry = Arc::new(Dentry::new(
-        String::from(name),
+        FileName::from(name),
         Some(new_inode),
         Arc::downgrade(&sb),
     ));
@@ -1107,14 +1112,14 @@ pub fn ramfs_create_dir_with_owner(
 }
 
 /// Create a directory in ramfs with default ownership (root:root, mode 0755)
-pub fn ramfs_create_dir(parent: &Arc<Dentry>, name: &str) -> Result<Arc<Dentry>, KernelError> {
+pub fn ramfs_create_dir(parent: &Arc<Dentry>, name: &[u8]) -> Result<Arc<Dentry>, KernelError> {
     ramfs_create_dir_with_owner(parent, name, InodeMode::directory(0o755), 0, 0)
 }
 
 /// Create a file in ramfs with initial content, ownership, and explicit timestamp
 pub fn ramfs_create_file_with_timestamp(
     parent: &Arc<Dentry>,
-    name: &str,
+    name: &[u8],
     content: &[u8],
     mode: InodeMode,
     uid: Uid,
@@ -1158,11 +1163,11 @@ pub fn ramfs_create_file_with_timestamp(
     parent_data
         .children
         .write()
-        .insert(String::from(name), new_inode.clone());
+        .insert(FileName::from(name), new_inode.clone());
 
     // Create dentry
     let new_dentry = Arc::new(Dentry::new(
-        String::from(name),
+        FileName::from(name),
         Some(new_inode),
         Arc::downgrade(&sb),
     ));
@@ -1201,7 +1206,7 @@ pub fn ramfs_fill_file(inode: &Inode, content: &[u8]) -> Result<(), KernelError>
 /// Create a directory in ramfs with ownership and explicit timestamp
 pub fn ramfs_create_dir_with_timestamp(
     parent: &Arc<Dentry>,
-    name: &str,
+    name: &[u8],
     mode: InodeMode,
     uid: Uid,
     gid: Gid,
@@ -1240,11 +1245,11 @@ pub fn ramfs_create_dir_with_timestamp(
     parent_data
         .children
         .write()
-        .insert(String::from(name), new_inode.clone());
+        .insert(FileName::from(name), new_inode.clone());
 
     // Create dentry
     let new_dentry = Arc::new(Dentry::new(
-        String::from(name),
+        FileName::from(name),
         Some(new_inode),
         Arc::downgrade(&sb),
     ));
@@ -1257,14 +1262,14 @@ pub fn ramfs_create_dir_with_timestamp(
 /// Create nested directory path in ramfs with specified ownership and timestamp.
 pub fn ramfs_mkpath_with_timestamp(
     root: &Arc<Dentry>,
-    path: &str,
+    path: &[u8],
     uid: Uid,
     gid: Gid,
     mtime: Timespec,
 ) -> Result<Arc<Dentry>, KernelError> {
     let mut current = root.clone();
 
-    for component in path.split('/').filter(|s| !s.is_empty()) {
+    for component in path.split(|&c| c == b'/').filter(|s| !s.is_empty()) {
         // Check if this component already exists
         if let Some(child) = current.lookup_child(component) {
             // Verify it's a directory
@@ -1293,8 +1298,8 @@ pub fn ramfs_mkpath_with_timestamp(
 /// Create a symlink in ramfs with ownership and explicit timestamp
 pub fn ramfs_create_symlink_with_timestamp(
     parent: &Arc<Dentry>,
-    name: &str,
-    target: &str,
+    name: &[u8],
+    target: &[u8],
     uid: Uid,
     gid: Gid,
     mtime: Timespec,
@@ -1328,17 +1333,19 @@ pub fn ramfs_create_symlink_with_timestamp(
     ));
 
     // Store target inline (not in page cache)
-    new_inode.set_private(Arc::new(RamfsInodeData::new_symlink(String::from(target))));
+    new_inode.set_private(Arc::new(RamfsInodeData::new_symlink(FileName::from(
+        target,
+    ))));
 
     // Add to parent directory
     parent_data
         .children
         .write()
-        .insert(String::from(name), new_inode.clone());
+        .insert(FileName::from(name), new_inode.clone());
 
     // Create dentry
     let new_dentry = Arc::new(Dentry::new(
-        String::from(name),
+        FileName::from(name),
         Some(new_inode),
         Arc::downgrade(&sb),
     ));
@@ -1362,7 +1369,7 @@ pub fn ramfs_create_symlink_with_timestamp(
 /// The dentry of the created block device node on success.
 pub fn ramfs_create_blkdev(
     parent: &Arc<Dentry>,
-    name: &str,
+    name: &[u8],
     rdev: DevId,
     mode: u16,
 ) -> Result<Arc<Dentry>, KernelError> {
@@ -1399,11 +1406,11 @@ pub fn ramfs_create_blkdev(
     parent_data
         .children
         .write()
-        .insert(String::from(name), new_inode.clone());
+        .insert(FileName::from(name), new_inode.clone());
 
     // Create dentry
     let new_dentry = Arc::new(Dentry::new(
-        String::from(name),
+        FileName::from(name),
         Some(new_inode),
         Arc::downgrade(&sb),
     ));
@@ -1427,7 +1434,7 @@ pub fn ramfs_create_blkdev(
 /// The dentry of the created character device node on success.
 pub fn ramfs_create_chrdev(
     parent: &Arc<Dentry>,
-    name: &str,
+    name: &[u8],
     rdev: DevId,
     mode: u16,
 ) -> Result<Arc<Dentry>, KernelError> {
@@ -1464,11 +1471,11 @@ pub fn ramfs_create_chrdev(
     parent_data
         .children
         .write()
-        .insert(String::from(name), new_inode.clone());
+        .insert(FileName::from(name), new_inode.clone());
 
     // Create dentry
     let new_dentry = Arc::new(Dentry::new(
-        String::from(name),
+        FileName::from(name),
         Some(new_inode),
         Arc::downgrade(&sb),
     ));

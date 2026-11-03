@@ -16,7 +16,6 @@
 //! sockets): each CPU takes a batch of numbers from a shared counter
 //! and hands them out without touching it (Linux LAST_INO_BATCH).
 
-use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use core::any::Any;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -59,7 +58,7 @@ pub fn get_next_ino() -> u64 {
 struct AnonInodeOps;
 
 impl InodeOps for AnonInodeOps {
-    fn lookup(&self, _dir: &Inode, _name: &str) -> Result<Arc<Inode>, KernelError> {
+    fn lookup(&self, _dir: &Inode, _name: &[u8]) -> Result<Arc<Inode>, KernelError> {
         Err(KernelError::OperationNotSupported)
     }
 
@@ -98,9 +97,6 @@ pub fn anon_inode_getfile(
     private: Arc<dyn Any + Send + Sync>,
     flags: u32,
 ) -> Arc<File> {
-    let dentry = Arc::new(Dentry::new_anonymous(
-        String::from(name),
-        Some(anon_inode()),
-    ));
+    let dentry = Arc::new(Dentry::new_anonymous(name.into(), Some(anon_inode())));
     Arc::new(File::new_anon(dentry, flags, f_op, private))
 }

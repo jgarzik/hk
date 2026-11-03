@@ -11,7 +11,9 @@ use alloc::vec;
 
 use crate::arch::Uaccess;
 use crate::fs::{KernelError, LookupFlags, Path, is_subdir, lookup_path_flags};
-use crate::uaccess::{UaccessArch, copy_to_user, put_user, strncpy_from_user};
+use crate::uaccess::{
+    UaccessArch, copy_to_user, put_user, strncpy_from_user, strncpy_from_user_str,
+};
 
 use super::syscall::{PATH_MAX, current_fd_table};
 
@@ -132,14 +134,19 @@ fn path_mount(
     mut flags: u64,
 ) -> Result<(), KernelError> {
     let copy = |p| strncpy_from_user::<Uaccess>(p, PATH_MAX).map_err(|_| KernelError::BadAddress);
-    // Source and type may be absent for remount / propagation changes
+    // Source and type may be absent for remount / propagation changes;
+    // a type is a name of a registered filesystem: not text, no such one
     let source = if source_ptr != 0 {
         copy(source_ptr)?
     } else {
         Default::default()
     };
     let fstype = if fstype_ptr != 0 {
-        copy(fstype_ptr)?
+        match strncpy_from_user_str::<Uaccess>(fstype_ptr, PATH_MAX) {
+            Ok(s) => s,
+            Err(crate::uaccess::UaccessError::Encoding) => return Err(KernelError::NoDevice),
+            Err(_) => return Err(KernelError::BadAddress),
+        }
     } else {
         Default::default()
     };
@@ -169,7 +176,7 @@ fn path_mount(
 
 /// Mount a new instance of `fstype` on `mp` (Linux do_new_mount)
 fn new_mount(
-    source: &str,
+    source: &[u8],
     fstype: &str,
     mp: Arc<super::Dentry>,
     flags: u64,
@@ -571,7 +578,7 @@ fn do_setxattr(
     };
 
     // Copy attribute name from user
-    let name = match strncpy_from_user::<Uaccess>(name_ptr, XATTR_NAME_MAX + 1) {
+    let name = match strncpy_from_user_str::<Uaccess>(name_ptr, XATTR_NAME_MAX + 1) {
         Ok(n) => n,
         Err(_) => return KernelError::BadAddress.sysret(),
     };
@@ -637,7 +644,7 @@ pub fn sys_fsetxattr(fd: i32, name_ptr: u64, value_ptr: u64, size: u64, flags: i
     };
 
     // Copy attribute name from user
-    let name = match strncpy_from_user::<Uaccess>(name_ptr, XATTR_NAME_MAX + 1) {
+    let name = match strncpy_from_user_str::<Uaccess>(name_ptr, XATTR_NAME_MAX + 1) {
         Ok(n) => n,
         Err(_) => return KernelError::BadAddress.sysret(),
     };
@@ -708,7 +715,7 @@ fn do_getxattr(
     };
 
     // Copy attribute name from user
-    let name = match strncpy_from_user::<Uaccess>(name_ptr, XATTR_NAME_MAX + 1) {
+    let name = match strncpy_from_user_str::<Uaccess>(name_ptr, XATTR_NAME_MAX + 1) {
         Ok(n) => n,
         Err(_) => return KernelError::BadAddress.sysret(),
     };
@@ -786,7 +793,7 @@ pub fn sys_fgetxattr(fd: i32, name_ptr: u64, value_ptr: u64, size: u64) -> i64 {
     };
 
     // Copy attribute name from user
-    let name = match strncpy_from_user::<Uaccess>(name_ptr, XATTR_NAME_MAX + 1) {
+    let name = match strncpy_from_user_str::<Uaccess>(name_ptr, XATTR_NAME_MAX + 1) {
         Ok(n) => n,
         Err(_) => return KernelError::BadAddress.sysret(),
     };
@@ -991,7 +998,7 @@ fn do_removexattr(path_ptr: u64, name_ptr: u64, follow_symlinks: bool) -> i64 {
     };
 
     // Copy attribute name from user
-    let name = match strncpy_from_user::<Uaccess>(name_ptr, XATTR_NAME_MAX + 1) {
+    let name = match strncpy_from_user_str::<Uaccess>(name_ptr, XATTR_NAME_MAX + 1) {
         Ok(n) => n,
         Err(_) => return KernelError::BadAddress.sysret(),
     };
@@ -1046,7 +1053,7 @@ pub fn sys_fremovexattr(fd: i32, name_ptr: u64) -> i64 {
     };
 
     // Copy attribute name from user
-    let name = match strncpy_from_user::<Uaccess>(name_ptr, XATTR_NAME_MAX + 1) {
+    let name = match strncpy_from_user_str::<Uaccess>(name_ptr, XATTR_NAME_MAX + 1) {
         Ok(n) => n,
         Err(_) => return KernelError::BadAddress.sysret(),
     };

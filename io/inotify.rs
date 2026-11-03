@@ -158,7 +158,7 @@ struct InotifyWatch {
     mask: u32,
     /// Path being watched (for reference)
     #[allow(dead_code)]
-    path: String,
+    path: crate::fs::name::FileName,
     /// Inode number of watched file/dir
     ino: u64,
 }
@@ -238,7 +238,7 @@ impl Inotify {
     /// Add a watch on a path
     ///
     /// Returns the watch descriptor on success, or negative errno on error.
-    pub fn add_watch(&self, path: &str, mask: u32, ino: u64) -> Result<i32, i32> {
+    pub fn add_watch(&self, path: &[u8], mask: u32, ino: u64) -> Result<i32, i32> {
         let mut inner = self.inner.lock();
 
         // Check if IN_MASK_ADD or IN_MASK_CREATE
@@ -268,7 +268,7 @@ impl Inotify {
         let watch = InotifyWatch {
             wd,
             mask: mask & IN_ALL_EVENTS,
-            path: String::from(path),
+            path: path.into(),
             ino,
         };
         inner.watches.insert(wd, watch);
@@ -667,12 +667,12 @@ pub fn sys_inotify_rm_watch(fd: i32, wd: i32) -> i64 {
 /// Resolve a path to its inode number
 ///
 /// Returns (ino, is_dir) on success, negative errno on error.
-fn resolve_path_to_ino(pathname: &str, mask: u32) -> Result<(u64, bool), i64> {
+fn resolve_path_to_ino(pathname: &[u8], mask: u32) -> Result<(u64, bool), i64> {
     use crate::fs::path_ref::Path;
     use crate::fs::{LookupFlags, lookup_path_at};
 
     // Get current working directory
-    let start: Option<Path> = if pathname.starts_with('/') {
+    let start: Option<Path> = if pathname.starts_with(b"/") {
         // Absolute path
         None
     } else {

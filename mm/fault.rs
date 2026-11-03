@@ -648,13 +648,14 @@ pub fn pagefault_out_of_memory() -> ! {
     let (pid, name) = (me.pid, me.comm());
     let len = name.iter().position(|&b| b == 0).unwrap_or(name.len());
     let exe = super::get_task_mm(tid).and_then(|mm| mm.mmap_read().exe());
-    let comm = match core::str::from_utf8(&name[..len]) {
-        Ok(n) if !n.is_empty() => n,
+    let comm: &[u8] = match &name[..len] {
+        n if !n.is_empty() => n,
         _ => exe
             .as_deref()
-            .and_then(|p| p.rsplit('/').next())
-            .unwrap_or("?"),
+            .and_then(|p| p.rsplit(|&c| c == b'/').next())
+            .unwrap_or(b"?"),
     };
+    let comm = crate::fs::name::Escaped(comm);
     crate::printkln!("Out of memory: Killed process {} ({})", pid, comm);
     crate::signal::do_group_exit(SIGKILL as i32)
 }

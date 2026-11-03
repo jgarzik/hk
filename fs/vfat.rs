@@ -1501,7 +1501,9 @@ fn delete_dir_entry(
 pub struct VfatInodeOps;
 
 impl InodeOps for VfatInodeOps {
-    fn lookup(&self, dir: &Inode, name: &str) -> Result<Arc<Inode>, KernelError> {
+    fn lookup(&self, dir: &Inode, name: &[u8]) -> Result<Arc<Inode>, KernelError> {
+        // Long names are UTF-8 here (boundary shim): other bytes are NotFound
+        let name = core::str::from_utf8(name).map_err(|_| KernelError::NotFound)?;
         let sb = dir.superblock().ok_or(KernelError::Io)?;
         let sb_data = get_sb_data(&sb)?;
         let inode_data = get_inode_data(dir)?;
@@ -1553,7 +1555,9 @@ impl InodeOps for VfatInodeOps {
         crate::task::workqueue::SYSTEM_WQ.queue_work(Arc::new(crate::sync::spin::Mutex::new(work)));
     }
 
-    fn create(&self, dir: &Inode, name: &str, mode: InodeMode) -> Result<Arc<Inode>, KernelError> {
+    fn create(&self, dir: &Inode, name: &[u8], mode: InodeMode) -> Result<Arc<Inode>, KernelError> {
+        // Long names are UTF-8 here (boundary shim): other bytes are InvalidArgument
+        let name = core::str::from_utf8(name).map_err(|_| KernelError::InvalidArgument)?;
         let _ = mode; // FAT doesn't support Unix permissions
         let sb = dir.superblock().ok_or(KernelError::Io)?;
         let sb_data = get_sb_data(&sb)?;
@@ -1612,7 +1616,9 @@ impl InodeOps for VfatInodeOps {
         Ok(inode)
     }
 
-    fn mkdir(&self, dir: &Inode, name: &str, mode: InodeMode) -> Result<Arc<Inode>, KernelError> {
+    fn mkdir(&self, dir: &Inode, name: &[u8], mode: InodeMode) -> Result<Arc<Inode>, KernelError> {
+        // Long names are UTF-8 here (boundary shim): other bytes are InvalidArgument
+        let name = core::str::from_utf8(name).map_err(|_| KernelError::InvalidArgument)?;
         let _ = mode; // FAT doesn't support Unix permissions
         let sb = dir.superblock().ok_or(KernelError::Io)?;
         let sb_data = get_sb_data(&sb)?;
@@ -1696,7 +1702,9 @@ impl InodeOps for VfatInodeOps {
         Ok(inode)
     }
 
-    fn unlink(&self, dir: &Inode, name: &str) -> Result<(), KernelError> {
+    fn unlink(&self, dir: &Inode, name: &[u8]) -> Result<(), KernelError> {
+        // Long names are UTF-8 here (boundary shim): other bytes are NotFound
+        let name = core::str::from_utf8(name).map_err(|_| KernelError::NotFound)?;
         let sb = dir.superblock().ok_or(KernelError::Io)?;
         let sb_data = get_sb_data(&sb)?;
         let dir_inode_data = get_inode_data(dir)?;
@@ -1728,7 +1736,9 @@ impl InodeOps for VfatInodeOps {
         )
     }
 
-    fn rmdir(&self, dir: &Inode, name: &str) -> Result<(), KernelError> {
+    fn rmdir(&self, dir: &Inode, name: &[u8]) -> Result<(), KernelError> {
+        // Long names are UTF-8 here (boundary shim): other bytes are NotFound
+        let name = core::str::from_utf8(name).map_err(|_| KernelError::NotFound)?;
         let sb = dir.superblock().ok_or(KernelError::Io)?;
         let sb_data = get_sb_data(&sb)?;
         let dir_inode_data = get_inode_data(dir)?;
@@ -1816,11 +1826,14 @@ impl InodeOps for VfatInodeOps {
     fn rename(
         &self,
         old_dir: &Inode,
-        old_name: &str,
+        old_name: &[u8],
         new_dir: &Arc<Inode>,
-        new_name: &str,
+        new_name: &[u8],
         flags: u32,
     ) -> Result<(), KernelError> {
+        // Long names are UTF-8 here (boundary shim)
+        let old_name = core::str::from_utf8(old_name).map_err(|_| KernelError::NotFound)?;
+        let new_name = core::str::from_utf8(new_name).map_err(|_| KernelError::InvalidArgument)?;
         // The VFS has checked RENAME_NOREPLACE; RENAME_EXCHANGE (Linux
         // vfat_rename_exchange) is not supported yet, whiteouts never
         if flags & !super::link::RENAME_NOREPLACE != 0 {

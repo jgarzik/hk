@@ -208,7 +208,7 @@ pub fn sys_rmdir(pathname_ptr: u64) -> i64 {
 
 /// rmdir / unlinkat(AT_REMOVEDIR) (Linux do_rmdir): "." is EINVAL,
 /// ".." ENOTEMPTY, then may_delete and the file system's rmdir
-pub fn do_rmdir(dirfd: i32, path: &str) -> i64 {
+pub fn do_rmdir(dirfd: i32, path: &[u8]) -> i64 {
     if path.is_empty() {
         return KernelError::NotFound.sysret();
     }
@@ -216,9 +216,9 @@ pub fn do_rmdir(dirfd: i32, path: &str) -> i64 {
         Ok(p) => p,
         Err(e) => return e,
     };
-    match name.as_str() {
-        "." => return KernelError::InvalidArgument.sysret(),
-        ".." => return KernelError::DirectoryNotEmpty.sysret(),
+    match name.as_slice() {
+        b"." => return KernelError::InvalidArgument.sysret(),
+        b".." => return KernelError::DirectoryNotEmpty.sysret(),
         _ => {}
     }
     match delete_entry(&parent, &name, true) {
@@ -300,7 +300,7 @@ pub fn sys_mknodat(dirfd: i32, pathname_ptr: u64, mode: u32, dev: u64) -> i64 {
 /// filename_create at AT_FDCWD + vfs_mknod(S_IFSOCK)): `perm` is
 /// reduced by the umask, DAC on the parent applies, an existing name is
 /// EEXIST; returns the new dentry
-pub fn mknod_sock(path: &str, perm: u16) -> Result<alloc::sync::Arc<super::Dentry>, KernelError> {
+pub fn mknod_sock(path: &[u8], perm: u16) -> Result<alloc::sync::Arc<super::Dentry>, KernelError> {
     let (parent, name) = lookup_parent_at(AT_FDCWD, path)
         .map_err(|e| KernelError::from_errno(-e as i32).unwrap_or(KernelError::Io))?;
     let r = create_entry(&parent, &name, |dir, c| {
@@ -316,7 +316,7 @@ pub fn mknod_sock(path: &str, perm: u16) -> Result<alloc::sync::Arc<super::Dentr
 
 /// Remove the entry `mknod_sock` created when the bind then failed
 /// (Linux unix_bind_bsd out_unlink)
-pub fn unlink_sock(path: &str) {
+pub fn unlink_sock(path: &[u8]) {
     if let Ok((parent, name)) = lookup_parent_at(AT_FDCWD, path) {
         let _ = delete_entry(&parent, &name, false);
     }

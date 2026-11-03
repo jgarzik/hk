@@ -136,24 +136,25 @@ pub fn current_fd_table() -> alloc::sync::Arc<crate::task::fdtable::Files> {
 /// Returns the parent dentry and the final component name.
 pub fn lookup_parent_at(
     dirfd: i32,
-    path: &str,
-) -> Result<(alloc::sync::Arc<super::Dentry>, alloc::string::String), i64> {
+    path: &[u8],
+) -> Result<(alloc::sync::Arc<super::Dentry>, alloc::vec::Vec<u8>), i64> {
     // Find the last path component
-    let path = path.trim_end_matches('/');
+    let mut end = path.len();
+    while end > 0 && path[end - 1] == b'/' {
+        end -= 1;
+    }
+    let path = &path[..end];
     if path.is_empty() {
         return Err(KernelError::InvalidArgument.sysret());
     }
 
-    let (parent_path, name) = match path.rfind('/') {
+    let (parent_path, name): (&[u8], &[u8]) = match path.iter().rposition(|&c| c == b'/') {
         Some(pos) => {
-            let parent = if pos == 0 { "/" } else { &path[..pos] };
-            let name = &path[pos + 1..];
-            (parent, name)
+            let parent: &[u8] = if pos == 0 { b"/" } else { &path[..pos] };
+            (parent, &path[pos + 1..])
         }
-        None => {
-            // No slash - parent is current directory (or dirfd)
-            (".", path)
-        }
+        // No slash - parent is current directory (or dirfd)
+        None => (b".", path),
     };
 
     if name.is_empty() {
@@ -161,7 +162,7 @@ pub fn lookup_parent_at(
     }
 
     // Determine starting path
-    let start: Option<Path> = if parent_path.starts_with('/') {
+    let start: Option<Path> = if parent_path.starts_with(b"/") {
         None
     } else if dirfd == AT_FDCWD {
         crate::task::percpu::current_cwd()
@@ -182,5 +183,5 @@ pub fn lookup_parent_at(
         Err(e) => return Err(e.sysret()),
     };
 
-    Ok((parent_dentry, alloc::string::String::from(name)))
+    Ok((parent_dentry, name.to_vec()))
 }

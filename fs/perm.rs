@@ -64,7 +64,7 @@ fn resolve(
             .ok_or(KernelError::BadFd)?;
         return Ok(file.dentry.clone());
     }
-    let start: Option<Path> = if path.starts_with('/') {
+    let start: Option<Path> = if path.starts_with(b"/") {
         None
     } else if dirfd == AT_FDCWD {
         crate::task::percpu::current_cwd()

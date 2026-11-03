@@ -211,7 +211,7 @@ pub fn sys_acct(filename_ptr: u64) -> i64 {
 }
 
 /// Open the accounting file
-fn open_acct_file(path: &str) -> Result<Arc<File>, i64> {
+fn open_acct_file(path: &[u8]) -> Result<Arc<File>, i64> {
     use crate::fs::file::flags;
     use crate::fs::{LookupFlags, dac, lookup_path_flags};
 

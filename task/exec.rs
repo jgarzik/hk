@@ -663,8 +663,7 @@ fn resolve_scripts(
         }
         argv = rewrite_argv(&argv, interp, arg, &name);
         name = interp.to_vec();
-        let p = core::str::from_utf8(interp).map_err(|_| ENOENT)?;
-        file = kernel_open_exec(p)?;
+        file = kernel_open_exec(interp)?;
     }
     Ok((file, argv))
 }
@@ -812,11 +811,7 @@ pub fn do_execve<FA: FrameAlloc<PhysAddr = u64>>(
     envp: Vec<Vec<u8>>,
     frame_alloc: &mut FA,
 ) -> i32 {
-    let open = |p: &[u8]| match core::str::from_utf8(p) {
-        Ok(s) => kernel_open_exec(s),
-        Err(_) => Err(ENOENT),
-    };
-    exec_file(path, open, false, argv, envp, frame_alloc)
+    exec_file(path, kernel_open_exec, false, argv, envp, frame_alloc)
 }
 
 /// do_execve with the file opened by `open` from the name (Linux
@@ -879,10 +874,7 @@ where
     // load_elf_binary): ENOENT if missing (open_exec), ELIBBAD if it is
     // not an ELF file for this machine
     let interp_file = match &elf.interp {
-        Some(i) => match core::str::from_utf8(i)
-            .map_err(|_| ENOENT)
-            .and_then(kernel_open_exec)
-        {
+        Some(i) => match kernel_open_exec(i) {
             Ok(f) => Some(f),
             Err(e) => return -e,
         },
@@ -1042,7 +1034,7 @@ where
     {
         let mut m = mm.mmap_write();
         m.set_brk(start_brk);
-        m.set_exe(file.dentry.full_path(), deny);
+        m.set_exe(file.dentry.full_path().into(), deny);
         let code = image_layout(&elf, base_addr);
         m.set_args(MmLayout {
             start_code: code.start_code,
@@ -1219,8 +1211,7 @@ fn exec_lookup(dirfd: i32, path: &[u8], flags: i32) -> Result<Arc<crate::fs::Den
         }
         return Ok(fd_file()?.dentry.clone());
     }
-    let path = core::str::from_utf8(path).map_err(|_| ENOENT)?;
-    let start = if path.starts_with('/') {
+    let start = if path.starts_with(b"/") {
         None
     } else if dirfd == AT_FDCWD {
         percpu::current_cwd()

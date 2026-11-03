@@ -173,7 +173,7 @@ pub fn sys_getcwd(buf: u64, size: u64) -> i64 {
     }
 
     // Copy path to user buffer (with null terminator)
-    let mut path_bytes = path_str.into_bytes();
+    let mut path_bytes = path_str;
     path_bytes.push(0); // null terminator
 
     if copy_to_user::<Uaccess>(buf, &path_bytes).is_err() {

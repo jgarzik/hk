@@ -1147,7 +1147,6 @@ pub fn create_pipe(pipe_flags: u32) -> Result<(Arc<File>, Arc<File>), KernelErro
 fn create_pipe_dentry() -> Result<Arc<Dentry>, KernelError> {
     use crate::fs::dentry::Dentry;
     use crate::fs::inode::{Inode, InodeMode, NULL_INODE_OPS};
-    use alloc::string::String;
     use alloc::sync::Weak;
 
     // A pipefs inode (Linux get_pipe_inode): its own number, the
@@ -1165,7 +1164,7 @@ fn create_pipe_dentry() -> Result<Arc<Dentry>, KernelError> {
     ));
 
     // Create anonymous dentry
-    let dentry = Arc::new(Dentry::new_anonymous(String::from("pipe"), Some(inode)));
+    let dentry = Arc::new(Dentry::new_anonymous("pipe".into(), Some(inode)));
 
     Ok(dentry)
 }

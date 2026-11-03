@@ -6,8 +6,9 @@
 
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
-    O_CREAT, O_DIRECTORY, O_RDONLY, O_WRONLY, SEEK_SET, sys_close, sys_getdents64, sys_lseek,
-    sys_mkdir, sys_open, sys_readlink, sys_rmdir, sys_symlink, sys_unlink,
+    O_CREAT, O_DIRECTORY, O_RDONLY, O_WRONLY, SEEK_SET, Stat, sys_chdir, sys_close,
+    sys_getcwd, sys_getdents64, sys_lseek, sys_mkdir, sys_open, sys_readlink, sys_rename,
+    sys_rmdir, sys_stat, sys_symlink, sys_unlink,
 };
 
 const EINVAL: i64 = -22;
@@ -18,6 +19,7 @@ pub fn run_tests() {
     sys_mkdir(b"/tmp\0".as_ptr(), 0o1777); // hk boots without /tmp
     check_dir(b"/tmp", b"GETDENTS_RAMFS", 300);
     check_utf8();
+    check_nonutf8();
     check_proc();
     #[cfg(target_arch = "x86_64")]
     check_legacy();
@@ -124,7 +126,7 @@ fn check_utf8() {
         let n = sys_readlink(link.as_ptr(), buf.as_mut_ptr(), buf.len() as u64);
         if n != target.len() as i64 || buf[..target.len()] != *target {
             b"readlink bytes" as &[u8]
-        } else if !utf8_listed(&file[5..file.len() - 1]) {
+        } else if !listed(b"/tmp\0", &file[5..file.len() - 1]) {
             b"getdents name"
         } else {
             b""
@@ -135,9 +137,77 @@ fn check_utf8() {
     verdict(NAME, why, 0);
 }
 
-/// `name` is an entry of /tmp, byte for byte
-fn utf8_listed(name: &[u8]) -> bool {
-    let fd = sys_open(b"/tmp\0".as_ptr(), O_RDONLY | O_DIRECTORY, 0);
+/// Names are any bytes but '/' and NUL, valid UTF-8 or not (Linux
+/// getname): a directory, a file renamed in it, a symlink target and
+/// the cwd, all with invalid UTF-8, come back byte for byte
+fn check_nonutf8() {
+    const NAME: &[u8] = b"PATH_NONUTF8";
+    let dir: &[u8] = b"/tmp/n\xff\0";
+    if sys_mkdir(dir.as_ptr(), 0o755) != 0 {
+        return verdict(NAME, b"mkdir", -1);
+    }
+    let why = nonutf8_ops();
+    sys_chdir(b"/\0".as_ptr());
+    sys_unlink(b"/tmp/n\xff/f\xfe\0".as_ptr());
+    sys_unlink(b"/tmp/n\xff/g\x80\0".as_ptr());
+    sys_unlink(b"/tmp/n\xff/l\0".as_ptr());
+    sys_rmdir(dir.as_ptr());
+    match why {
+        Ok(()) => verdict(NAME, b"", 0),
+        Err((w, got)) => verdict(NAME, w, got),
+    }
+}
+
+fn nonutf8_ops() -> Result<(), (&'static [u8], i64)> {
+    let f: &[u8] = b"/tmp/n\xff/f\xfe\0";
+    let g: &[u8] = b"/tmp/n\xff/g\x80\0";
+    let fd = sys_open(f.as_ptr(), O_CREAT | O_WRONLY, 0o644);
+    if fd < 0 {
+        return Err((b"create", fd));
+    }
+    sys_close(fd as u64);
+    // SAFETY: Stat is plain integers
+    let mut st: Stat = unsafe { core::mem::zeroed() };
+    let r = sys_stat(f.as_ptr(), &mut st);
+    if r != 0 {
+        return Err((b"stat", r));
+    }
+    let r = sys_rename(f.as_ptr(), g.as_ptr());
+    if r != 0 {
+        return Err((b"rename", r));
+    }
+    if !listed(b"/tmp/n\xff\0", b"g\x80") || listed(b"/tmp/n\xff\0", b"f\xfe") {
+        return Err((b"getdents after rename", 0));
+    }
+    let target: &[u8] = b"\xff\xfe/x";
+    let r = sys_symlink(b"\xff\xfe/x\0".as_ptr(), b"/tmp/n\xff/l\0".as_ptr());
+    if r != 0 {
+        return Err((b"symlink", r));
+    }
+    let mut buf = [0u8; 32];
+    let n = sys_readlink(b"/tmp/n\xff/l\0".as_ptr(), buf.as_mut_ptr(), buf.len() as u64);
+    if n != target.len() as i64 || buf[..target.len()] != *target {
+        return Err((b"readlink bytes", n));
+    }
+    let r = sys_chdir(b"/tmp/n\xff\0".as_ptr());
+    if r != 0 {
+        return Err((b"chdir", r));
+    }
+    let n = sys_getcwd(buf.as_mut_ptr(), buf.len());
+    if n != 8 || buf[..8] != *b"/tmp/n\xff\0" {
+        return Err((b"getcwd bytes", n));
+    }
+    // Relative to the cwd, the renamed file again
+    let r = sys_stat(b"g\x80\0".as_ptr(), &mut st);
+    if r != 0 {
+        return Err((b"relative stat", r));
+    }
+    Ok(())
+}
+
+/// `name` is an entry of directory `dir` (NUL-terminated), byte for byte
+fn listed(dir: &[u8], name: &[u8]) -> bool {
+    let fd = sys_open(dir.as_ptr(), O_RDONLY | O_DIRECTORY, 0);
     if fd < 0 {
         return false;
     }

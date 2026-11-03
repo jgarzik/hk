@@ -657,8 +657,8 @@ impl VfsInitOps for Aarch64Arch {
     fn init_vfs_extras() {
         // Create /vfat_test mount point for USB disk VFAT testing
         // (Similar to x86's init_vfat_ramdisk which creates this directory)
-        if let Ok(root_dentry) = crate::fs::lookup_path("/") {
-            let _ = crate::fs::ramfs::ramfs_create_dir(&root_dentry, "vfat_test");
+        if let Ok(root_dentry) = crate::fs::lookup_path(b"/") {
+            let _ = crate::fs::ramfs::ramfs_create_dir(&root_dentry, b"vfat_test");
         }
     }
 }

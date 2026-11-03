@@ -442,7 +442,7 @@ fn write_page(entry: SwapEntry, frame_phys: u64) -> Result<(), i64> {
 // ============================================================================
 
 /// The path argument of swapon/swapoff
-fn user_path(ptr: u64) -> Result<alloc::string::String, KernelError> {
+fn user_path(ptr: u64) -> Result<alloc::vec::Vec<u8>, KernelError> {
     strncpy_from_user::<Uaccess>(ptr, 4096).map_err(|_| KernelError::BadAddress)
 }
 
@@ -483,7 +483,7 @@ fn swapon(path_ptr: u64, swap_flags: i32) -> Result<(), KernelError> {
         .get_inode()
         .ok_or(KernelError::NotFound)?;
     let _g = SWAPON.lock();
-    if find_swap_by_path(path.as_bytes()).is_some() {
+    if find_swap_by_path(&path).is_some() {
         return Err(KernelError::Busy);
     }
     let swap_type = SWAP_INFO
@@ -535,7 +535,7 @@ fn swapon(path_ptr: u64, swap_flags: i32) -> Result<(), KernelError> {
         Some(b) => (None, Some(b)),
         None => (Some(inode), None),
     };
-    let si = SwapInfo::new(backing, path.into_bytes(), swap_type, max, priority)?;
+    let si = SwapInfo::new(backing, path, swap_type, max, priority)?;
     // S_SWAPFILE under i_rwsem (Linux claim_swapfile under inode_lock):
     // a write or truncate in flight finishes first, later ones see it
     let si_inode = si.swapfile_inode();
@@ -565,7 +565,7 @@ fn swapoff(path_ptr: u64) -> Result<(), KernelError> {
     // (Linux swapoff: file_open_name first)
     lookup_path(&path)?;
     let _g = SWAPON.lock();
-    let t = find_swap_by_path(path.as_bytes()).ok_or(KernelError::InvalidArgument)?;
+    let t = find_swap_by_path(&path).ok_or(KernelError::InvalidArgument)?;
     let si = get_swap_info(t).ok_or(KernelError::InvalidArgument)?;
     // No new slots from it (Linux del_from_avail_list, under si->lock:
     // an allocator past get_swap_page's filter rechecks under `map`)

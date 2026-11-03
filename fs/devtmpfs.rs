@@ -64,9 +64,9 @@ fn create(root: &Arc<Dentry>, n: &Node) {
     let Some(dir) = root.get_inode() else { return };
     let lock = dir.lock();
     let r = if n.blk {
-        super::ramfs::ramfs_create_blkdev(root, &n.name, n.dev, n.mode)
+        super::ramfs::ramfs_create_blkdev(root, n.name.as_bytes(), n.dev, n.mode)
     } else {
-        super::ramfs::ramfs_create_chrdev(root, &n.name, n.dev, n.mode)
+        super::ramfs::ramfs_create_chrdev(root, n.name.as_bytes(), n.dev, n.mode)
     };
     drop(lock);
     if let Err(e) = r {
@@ -99,8 +99,8 @@ pub fn device_del(name: &str) {
     let Some(r) = root() else { return };
     let Some(dir) = r.get_inode() else { return };
     let _lock = dir.lock();
-    if dir.i_op.unlink(&dir, name).is_ok() {
-        r.remove_child(name);
+    if dir.i_op.unlink(&dir, name.as_bytes()).is_ok() {
+        r.remove_child(name.as_bytes());
     }
 }
 

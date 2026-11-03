@@ -161,7 +161,7 @@ impl InodeMode {
 /// Inode operations trait - filesystem-specific behavior
 pub trait InodeOps: Send + Sync {
     /// Look up a child entry in a directory inode
-    fn lookup(&self, dir: &Inode, name: &str) -> Result<Arc<Inode>, KernelError>;
+    fn lookup(&self, dir: &Inode, name: &[u8]) -> Result<Arc<Inode>, KernelError>;
 
     /// Access check for `mask` (MAY_* bits) by `cred` (Linux
     /// ->permission). Default: generic_permission (mode bits plus
@@ -179,13 +179,13 @@ pub trait InodeOps: Send + Sync {
     }
 
     /// Create a new file in a directory
-    fn create(&self, dir: &Inode, name: &str, mode: InodeMode) -> Result<Arc<Inode>, KernelError> {
+    fn create(&self, dir: &Inode, name: &[u8], mode: InodeMode) -> Result<Arc<Inode>, KernelError> {
         let _ = (dir, name, mode);
         Err(KernelError::OperationNotSupported)
     }
 
     /// Create a new directory
-    fn mkdir(&self, dir: &Inode, name: &str, mode: InodeMode) -> Result<Arc<Inode>, KernelError> {
+    fn mkdir(&self, dir: &Inode, name: &[u8], mode: InodeMode) -> Result<Arc<Inode>, KernelError> {
         let _ = (dir, name, mode);
         Err(KernelError::OperationNotSupported)
     }
@@ -194,7 +194,7 @@ pub trait InodeOps: Send + Sync {
     fn mknod(
         &self,
         dir: &Inode,
-        name: &str,
+        name: &[u8],
         mode: InodeMode,
         rdev: DevId,
     ) -> Result<Arc<Inode>, KernelError> {
@@ -203,31 +203,31 @@ pub trait InodeOps: Send + Sync {
     }
 
     /// Remove a file
-    fn unlink(&self, dir: &Inode, name: &str) -> Result<(), KernelError> {
+    fn unlink(&self, dir: &Inode, name: &[u8]) -> Result<(), KernelError> {
         let _ = (dir, name);
         Err(KernelError::OperationNotSupported)
     }
 
     /// Remove a directory
-    fn rmdir(&self, dir: &Inode, name: &str) -> Result<(), KernelError> {
+    fn rmdir(&self, dir: &Inode, name: &[u8]) -> Result<(), KernelError> {
         let _ = (dir, name);
         Err(KernelError::OperationNotSupported)
     }
 
     /// Read the target of a symbolic link
-    fn readlink(&self, inode: &Inode) -> Result<alloc::string::String, KernelError> {
+    fn readlink(&self, inode: &Inode) -> Result<alloc::vec::Vec<u8>, KernelError> {
         let _ = inode;
         Err(KernelError::OperationNotSupported)
     }
 
     /// Create a symbolic link
-    fn symlink(&self, dir: &Inode, name: &str, target: &str) -> Result<Arc<Inode>, KernelError> {
+    fn symlink(&self, dir: &Inode, name: &[u8], target: &[u8]) -> Result<Arc<Inode>, KernelError> {
         let _ = (dir, name, target);
         Err(KernelError::OperationNotSupported)
     }
 
     /// Create a hard link (new directory entry pointing to existing inode)
-    fn link(&self, dir: &Inode, name: &str, inode: &Arc<Inode>) -> Result<(), KernelError> {
+    fn link(&self, dir: &Inode, name: &[u8], inode: &Arc<Inode>) -> Result<(), KernelError> {
         let _ = (dir, name, inode);
         Err(KernelError::OperationNotSupported)
     }
@@ -246,9 +246,9 @@ pub trait InodeOps: Send + Sync {
     fn rename(
         &self,
         old_dir: &Inode,
-        old_name: &str,
+        old_name: &[u8],
         new_dir: &Arc<Inode>,
-        new_name: &str,
+        new_name: &[u8],
         flags: u32,
     ) -> Result<(), KernelError> {
         let _ = (old_dir, old_name, new_dir, new_name, flags);
@@ -792,7 +792,7 @@ impl Drop for InodeLockShared<'_> {
 pub struct NullInodeOps;
 
 impl InodeOps for NullInodeOps {
-    fn lookup(&self, _dir: &Inode, _name: &str) -> Result<Arc<Inode>, KernelError> {
+    fn lookup(&self, _dir: &Inode, _name: &[u8]) -> Result<Arc<Inode>, KernelError> {
         Err(KernelError::OperationNotSupported)
     }
 }

@@ -4,7 +4,6 @@
 //! directory a name is looked up in needs search (MAY_EXEC) permission
 //! for the caller (Linux may_lookup), including for "." and "..".
 
-use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
@@ -56,12 +55,12 @@ impl LookupFlags {
 }
 
 /// Look up an absolute path, or a path relative to the current directory
-pub fn lookup_path(path: &str) -> Result<Arc<Dentry>, KernelError> {
+pub fn lookup_path(path: &[u8]) -> Result<Arc<Dentry>, KernelError> {
     lookup_path_flags(path, LookupFlags::open())
 }
 
 /// Look up a path relative to the current directory with specific flags
-pub fn lookup_path_flags(path: &str, flags: LookupFlags) -> Result<Arc<Dentry>, KernelError> {
+pub fn lookup_path_flags(path: &[u8], flags: LookupFlags) -> Result<Arc<Dentry>, KernelError> {
     lookup_path_at(crate::task::percpu::current_cwd(), path, flags)
 }
 
@@ -71,7 +70,7 @@ pub fn lookup_path_flags(path: &str, flags: LookupFlags) -> Result<Arc<Dentry>, 
 /// `start` (root when None), absolute paths at the namespace root.
 pub fn lookup_path_at(
     start: Option<Path>,
-    path: &str,
+    path: &[u8],
     flags: LookupFlags,
 ) -> Result<Arc<Dentry>, KernelError> {
     walk(&cred(), start, path, flags, 0)
@@ -79,7 +78,7 @@ pub fn lookup_path_at(
 
 /// Child `name` of directory `parent`: the dcache, else the file system
 /// (the new dentry is cached). Permission is the caller's business.
-pub fn lookup_one(parent: &Arc<Dentry>, name: &str) -> Result<Arc<Dentry>, KernelError> {
+pub fn lookup_one(parent: &Arc<Dentry>, name: &[u8]) -> Result<Arc<Dentry>, KernelError> {
     // No file system here has longer names (Linux simple_lookup and the
     // disk file systems' lookups: ENAMETOOLONG)
     if name.len() > NAME_MAX {
@@ -90,11 +89,7 @@ pub fn lookup_one(parent: &Arc<Dentry>, name: &str) -> Result<Arc<Dentry>, Kerne
     }
     let dir = parent.get_inode().ok_or(KernelError::NotFound)?;
     let inode = dir.i_op.lookup(&dir, name)?;
-    let child = Arc::new(Dentry::new(
-        String::from(name),
-        Some(inode),
-        parent.sb.clone(),
-    ));
+    let child = Arc::new(Dentry::new(name.into(), Some(inode), parent.sb.clone()));
     child.set_parent(parent);
     parent.add_child(child.clone());
     Ok(child)
@@ -106,7 +101,7 @@ pub fn lookup_one(parent: &Arc<Dentry>, name: &str) -> Result<Arc<Dentry>, Kerne
 /// Longest name of one path component (Linux NAME_MAX)
 pub const NAME_MAX: usize = 255;
 
-fn lookup_slow(parent: &Arc<Dentry>, name: &str) -> Result<Arc<Dentry>, KernelError> {
+fn lookup_slow(parent: &Arc<Dentry>, name: &[u8]) -> Result<Arc<Dentry>, KernelError> {
     if name.len() > NAME_MAX {
         return Err(KernelError::NameTooLong);
     }
@@ -130,7 +125,7 @@ fn may_lookup(c: &Cred, dir: &Dentry) -> Result<(), KernelError> {
 fn walk(
     c: &Cred,
     start: Option<Path>,
-    path: &str,
+    path: &[u8],
     flags: LookupFlags,
     depth: usize,
 ) -> Result<Arc<Dentry>, KernelError> {
@@ -139,15 +134,18 @@ fn walk(
     }
     let mnt_ns = current_mnt_ns();
     let mut cur = match start {
-        Some(p) if !path.starts_with('/') => p.dentry.clone(),
+        Some(p) if !path.starts_with(b"/") => p.dentry.clone(),
         _ => mnt_ns.get_root_dentry().ok_or(KernelError::NotFound)?,
     };
-    let comps: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let comps: Vec<&[u8]> = path
+        .split(|&c| c == b'/')
+        .filter(|s| !s.is_empty())
+        .collect();
     for (i, name) in comps.iter().enumerate() {
         may_lookup(c, &cur)?;
         match *name {
-            "." => continue,
-            ".." => {
+            b"." => continue,
+            b".." => {
                 // At the root, ".." stays at the root
                 if let Some(parent) = cur.get_parent() {
                     cur = parent;
@@ -180,17 +178,17 @@ fn follow_link(
     c: &Cred,
     dir: &Arc<Dentry>,
     link: &Dentry,
-    rest: &[&str],
+    rest: &[&[u8]],
     flags: LookupFlags,
     depth: usize,
 ) -> Result<Arc<Dentry>, KernelError> {
     let inode = link.get_inode().ok_or(KernelError::NotFound)?;
     let target = inode.i_op.readlink(&inode)?;
-    let path = if rest.is_empty() {
-        target
-    } else {
-        alloc::format!("{}/{}", target, rest.join("/"))
-    };
+    let mut path = target;
+    for comp in rest {
+        path.push(b'/');
+        path.extend_from_slice(comp);
+    }
     walk(c, Path::from_dentry(dir.clone()), &path, flags, depth + 1)
 }
 
@@ -200,7 +198,7 @@ fn follow_link(
 /// caller's credentials; the new dentry is cached
 pub fn create_entry(
     parent: &Arc<Dentry>,
-    name: &str,
+    name: &[u8],
     make: impl FnOnce(&Arc<Inode>, &Cred) -> Result<Arc<Inode>, KernelError>,
 ) -> Result<Arc<Dentry>, KernelError> {
     let dir = parent.get_inode().ok_or(KernelError::NotFound)?;
@@ -218,11 +216,7 @@ pub fn create_entry(
         let _w = w?;
         super::dac::may_create(&c, &dir)?;
         let inode = make(&dir, &c)?;
-        let d = Arc::new(Dentry::new(
-            String::from(name),
-            Some(inode),
-            parent.sb.clone(),
-        ));
+        let d = Arc::new(Dentry::new(name.into(), Some(inode), parent.sb.clone()));
         d.set_parent(parent);
         parent.add_child(d.clone());
         Ok(d)
@@ -233,7 +227,7 @@ pub fn create_entry(
 /// vfs_rmdir) under the parent's lock: may_delete (write+search, sticky
 /// rule, type vs `isdir`), then the file system's unlink or rmdir with
 /// the victim's lock held too
-pub fn delete_entry(parent: &Arc<Dentry>, name: &str, isdir: bool) -> Result<(), KernelError> {
+pub fn delete_entry(parent: &Arc<Dentry>, name: &[u8], isdir: bool) -> Result<(), KernelError> {
     let dir = parent.get_inode().ok_or(KernelError::NotFound)?;
     let _w = super::dac::want_write(&dir)?;
     let c = cred();

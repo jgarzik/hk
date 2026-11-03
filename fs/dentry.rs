@@ -10,13 +10,13 @@
 //! the proven Linux design.
 
 use alloc::collections::BTreeMap;
-use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 
 use crate::sync::spin::RwLock;
 
 use super::inode::Inode;
+use super::name::FileName;
 use super::superblock::SuperBlock;
 
 /// Dentry flags
@@ -38,7 +38,7 @@ struct DentryInner {
     /// Parent dentry (None for root)
     parent: Option<Weak<Dentry>>,
     /// Children dentries (for directories)
-    children: BTreeMap<String, Arc<Dentry>>,
+    children: BTreeMap<FileName, Arc<Dentry>>,
     /// Dentry flags
     flags: DentryFlags,
 }
@@ -52,8 +52,8 @@ struct DentryInner {
 /// are immutable after creation and don't need locking.
 ///
 pub struct Dentry {
-    /// Name of this entry (empty string for root) - immutable after creation
-    pub name: String,
+    /// Name of this entry (empty for root) - immutable after creation
+    pub name: FileName,
 
     /// Back pointer to superblock - immutable after creation
     pub sb: Weak<SuperBlock>,
@@ -64,7 +64,7 @@ pub struct Dentry {
 
 impl Dentry {
     /// Create a new dentry
-    pub fn new(name: String, inode: Option<Arc<Inode>>, sb: Weak<SuperBlock>) -> Self {
+    pub fn new(name: FileName, inode: Option<Arc<Inode>>, sb: Weak<SuperBlock>) -> Self {
         Self {
             name,
             sb,
@@ -80,7 +80,7 @@ impl Dentry {
     /// Create root dentry for a filesystem
     pub fn new_root(inode: Arc<Inode>, sb: Weak<SuperBlock>) -> Self {
         Self {
-            name: String::new(),
+            name: FileName::default(),
             sb,
             d_lock: RwLock::new(DentryInner {
                 inode: Some(inode),
@@ -95,7 +95,7 @@ impl Dentry {
     ///
     /// Anonymous dentries have no superblock and are not part of any filesystem.
     /// They exist solely to provide a File's required dentry reference.
-    pub fn new_anonymous(name: String, inode: Option<Arc<Inode>>) -> Self {
+    pub fn new_anonymous(name: FileName, inode: Option<Arc<Inode>>) -> Self {
         Self {
             name,
             sb: Weak::new(), // No superblock for anonymous dentries
@@ -138,7 +138,7 @@ impl Dentry {
     }
 
     /// Look up a child dentry by name
-    pub fn lookup_child(&self, name: &str) -> Option<Arc<Dentry>> {
+    pub fn lookup_child(&self, name: &[u8]) -> Option<Arc<Dentry>> {
         self.d_lock.read().children.get(name).cloned()
     }
 
@@ -149,7 +149,7 @@ impl Dentry {
     }
 
     /// Remove a child dentry by name
-    pub fn remove_child(&self, name: &str) -> Option<Arc<Dentry>> {
+    pub fn remove_child(&self, name: &[u8]) -> Option<Arc<Dentry>> {
         self.d_lock.write().children.remove(name)
     }
 
@@ -174,7 +174,7 @@ impl Dentry {
     /// Get the full path from root to this dentry
     ///
     /// Each parent is held by its Arc while its name is read.
-    pub fn full_path(&self) -> String {
+    pub fn full_path(&self) -> Vec<u8> {
         let mut components = Vec::new();
         if !self.name.is_empty() {
             components.push(self.name.clone());
@@ -187,25 +187,14 @@ impl Dentry {
             cur = d.get_parent();
         }
         if components.is_empty() {
-            return String::from("/");
+            return b"/".to_vec();
         }
-        let mut path = String::new();
+        let mut path = Vec::new();
         for comp in components.iter().rev() {
-            path.push('/');
-            path.push_str(comp);
+            path.push(b'/');
+            path.extend_from_slice(comp);
         }
         path
-    }
-
-    /// Iterate over children (for readdir)
-    pub fn for_each_child<F>(&self, mut f: F)
-    where
-        F: FnMut(&str, &Arc<Dentry>),
-    {
-        let inner = self.d_lock.read();
-        for (name, dentry) in inner.children.iter() {
-            f(name, dentry);
-        }
     }
 
     /// Get number of children

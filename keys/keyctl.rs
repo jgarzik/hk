@@ -6,7 +6,7 @@ use alloc::vec;
 
 use crate::arch::Uaccess;
 use crate::task::percpu;
-use crate::uaccess::{copy_from_user, copy_to_user, strncpy_from_user};
+use crate::uaccess::{copy_from_user, copy_to_user, strncpy_from_user_str};
 use crate::util::error::KernelError;
 
 use super::key::{
@@ -363,12 +363,12 @@ pub fn keyctl_search(keyring_serial: i32, type_ptr: u64, desc_ptr: u64, dest_key
     let (tid, uid, gid, _is_root) = current_cred();
 
     // Copy type and description from userspace
-    let type_name = match strncpy_from_user::<Uaccess>(type_ptr, MAX_TYPE_LEN) {
+    let type_name = match strncpy_from_user_str::<Uaccess>(type_ptr, MAX_TYPE_LEN) {
         Ok(s) => s,
         Err(_) => return KernelError::BadAddress.sysret(),
     };
 
-    let description = match strncpy_from_user::<Uaccess>(desc_ptr, MAX_DESC_LEN) {
+    let description = match strncpy_from_user_str::<Uaccess>(desc_ptr, MAX_DESC_LEN) {
         Ok(s) => s,
         Err(_) => return KernelError::BadAddress.sysret(),
     };

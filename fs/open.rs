@@ -1,6 +1,5 @@
 //! File open/close syscalls
 
-use alloc::string::String;
 use alloc::sync::Arc;
 
 use crate::arch::Uaccess;
@@ -24,7 +23,7 @@ use crate::task::FD_CLOEXEC;
 /// stripping, the owner comes from init_owner
 fn create_in(
     parent: &Arc<Dentry>,
-    name: &str,
+    name: &[u8],
     mode: u32,
 ) -> Result<(Arc<Dentry>, bool), KernelError> {
     let dir = parent.get_inode().ok_or(KernelError::NotFound)?;
@@ -43,11 +42,7 @@ fn create_in(
         dac::may_create(&c, &dir)?;
         let perm = dac::create_mode(&c, &dir, (mode & 0o7777) as u16);
         let inode = dir.i_op.create(&dir, name, InodeMode::regular(perm))?;
-        let d = Arc::new(Dentry::new(
-            String::from(name),
-            Some(inode),
-            parent.sb.clone(),
-        ));
+        let d = Arc::new(Dentry::new(name.into(), Some(inode), parent.sb.clone()));
         d.set_parent(parent);
         parent.add_child(d.clone());
         Ok((d, true))
@@ -56,14 +51,18 @@ fn create_in(
 
 /// Split `path` into its parent and final component (Linux
 /// filename_parentat); the parent is walked with search checks
-fn parent_of(start: Option<Path>, path: &str) -> Result<(Arc<Dentry>, &str), KernelError> {
-    let path = path.trim_end_matches('/');
-    let (dir, name) = match path.rfind('/') {
-        Some(0) => ("/", &path[1..]),
+fn parent_of(start: Option<Path>, path: &[u8]) -> Result<(Arc<Dentry>, &[u8]), KernelError> {
+    let mut end = path.len();
+    while end > 0 && path[end - 1] == b'/' {
+        end -= 1;
+    }
+    let path = &path[..end];
+    let (dir, name): (&[u8], &[u8]) = match path.iter().rposition(|&c| c == b'/') {
+        Some(0) => (b"/", &path[1..]),
         Some(pos) => (&path[..pos], &path[pos + 1..]),
-        None => (".", path),
+        None => (b".", path),
     };
-    if name.is_empty() || name == "." || name == ".." {
+    if name.is_empty() || super::name::is_dot_or_dotdot(name) {
         return Err(KernelError::IsDirectory);
     }
     Ok((lookup_path_at(start, dir, LookupFlags::opendir())?, name))
@@ -81,7 +80,7 @@ pub fn sys_open(path_ptr: u64, flags: u32, mode: u32) -> i64 {
 /// created one; the bool says it was created by this call
 fn open_target(
     start: Option<Path>,
-    path: &str,
+    path: &[u8],
     flags: u32,
     mode: u32,
 ) -> Result<(Arc<Dentry>, bool), KernelError> {
@@ -138,7 +137,7 @@ fn do_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> Result<i64, Ke
     }
 
     // Starting point for relative paths
-    let start: Option<Path> = if path.starts_with('/') {
+    let start: Option<Path> = if path.starts_with(b"/") {
         None
     } else if dirfd == AT_FDCWD {
         crate::task::percpu::current_cwd()
@@ -173,7 +172,7 @@ fn do_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> Result<i64, Ke
 /// resolve or create the target, may_open, O_TRUNC, then the file object
 fn filp_open(
     start: Option<Path>,
-    path: &str,
+    path: &[u8],
     flags: u32,
     mode: u32,
 ) -> Result<Arc<File>, KernelError> {
@@ -256,7 +255,7 @@ fn filp_open(
 /// Give init /dev/console as stdin, stdout and stderr (Linux
 /// console_on_rootfs); call in init's context before it runs
 pub fn console_on_rootfs() {
-    let file = match filp_open(None, "/dev/console", O_RDWR, 0) {
+    let file = match filp_open(None, b"/dev/console", O_RDWR, 0) {
         Ok(f) => f,
         Err(_) => {
             crate::printkln!("Warning: unable to open an initial console.");

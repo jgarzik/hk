@@ -192,7 +192,7 @@ pub enum ProcfsInodeData {
     /// Per-process symlink (/proc/<pid>/exe)
     PidLink {
         pid: Pid,
-        target: fn(Pid) -> Result<String, KernelError>,
+        target: fn(Pid) -> Result<Vec<u8>, KernelError>,
     },
     /// /proc/sys file (readable, maybe writable)
     Sysctl { ctl: &'static crate::sysctl::Ctl },
@@ -340,7 +340,7 @@ pub struct ProcfsInodeOps;
 impl InodeOps for ProcfsInodeOps {
     /// Targets of /proc/self and /proc/<pid>/fd/<n> (Linux
     /// proc_self_get_link, proc_fd_link + d_path/d_dname)
-    fn readlink(&self, inode: &Inode) -> Result<String, KernelError> {
+    fn readlink(&self, inode: &Inode) -> Result<Vec<u8>, KernelError> {
         let private = inode.get_private().ok_or(KernelError::Io)?;
         let wrapper = private
             .as_ref()
@@ -357,7 +357,7 @@ impl InodeOps for ProcfsInodeOps {
         }
         match &*data {
             ProcfsInodeData::SelfLink => {
-                Ok(alloc::format!("{}", crate::task::percpu::current_pid()))
+                Ok(alloc::format!("{}", crate::task::percpu::current_pid()).into_bytes())
             }
             ProcfsInodeData::FdSymlink { pid, fd } => fd_link(*pid, *fd),
             _ => Err(KernelError::InvalidArgument),
@@ -390,7 +390,9 @@ impl InodeOps for ProcfsInodeOps {
         crate::sysctl::permission(ctl, cred, mask)
     }
 
-    fn lookup(&self, dir: &Inode, name: &str) -> Result<Arc<Inode>, KernelError> {
+    fn lookup(&self, dir: &Inode, name: &[u8]) -> Result<Arc<Inode>, KernelError> {
+        // Every /proc name is text: anything else names nothing
+        let name = core::str::from_utf8(name).map_err(|_| KernelError::NotFound)?;
         let private = dir.get_private().ok_or(KernelError::Io)?;
         let wrapper = private
             .as_ref()
@@ -683,20 +685,20 @@ fn create_self_link(parent: &Inode) -> Arc<Inode> {
 /// Target of /proc/<pid>/fd/<fd>: `socket:[ino]` / `pipe:[ino]` for
 /// sockets and pipes, `anon_inode:<name>` for other files without a
 /// filesystem, else the path
-fn fd_link(pid: Pid, fd: i32) -> Result<String, KernelError> {
+fn fd_link(pid: Pid, fd: i32) -> Result<Vec<u8>, KernelError> {
     let tid = get_tid_for_pid(pid).ok_or(KernelError::NotFound)?;
     let table = crate::task::fdtable::get_task_fd(tid).ok_or(KernelError::NotFound)?;
     let file = table.lock().get(fd).ok_or(KernelError::NotFound)?;
     let inode = file.get_inode().ok_or(KernelError::NotFound)?;
     let mode = inode.mode();
     if mode.is_socket() {
-        return Ok(alloc::format!("socket:[{}]", inode.ino));
+        return Ok(alloc::format!("socket:[{}]", inode.ino).into_bytes());
     }
     if inode.superblock().is_none() {
         if mode.file_type() == Some(crate::fs::inode::FileType::Fifo) {
-            return Ok(alloc::format!("pipe:[{}]", inode.ino));
+            return Ok(alloc::format!("pipe:[{}]", inode.ino).into_bytes());
         }
-        return Ok(alloc::format!("anon_inode:{}", file.dentry.name));
+        return Ok([b"anon_inode:".as_slice(), &file.dentry.name].concat());
     }
     Ok(file.dentry.full_path())
 }
@@ -1022,7 +1024,7 @@ fn pid_file_pid(inode: &Inode) -> Option<Pid> {
 
 /// /proc/<pid>/exe: the executable's path (ENOENT for kernel threads,
 /// EACCES without ptrace-read access, Linux proc_fd_access_allowed)
-fn exe_link(pid: Pid) -> Result<String, KernelError> {
+fn exe_link(pid: Pid) -> Result<Vec<u8>, KernelError> {
     // Through mm_access, so the check and the image it reveals are one
     // (exec_update_lock read). An exec resolving /proc/self/exe (busybox
     // re-execs itself) holds only cred_guard while it walks paths: it
@@ -1032,30 +1034,34 @@ fn exe_link(pid: Pid) -> Result<String, KernelError> {
         .mmap_read_killable()?
         .exe()
         .ok_or(KernelError::NotFound)?;
-    Ok(exe)
+    Ok(exe.into_vec())
 }
 
 /// /proc/<pid>/maps: one line per VMA (Linux show_map_vma)
 fn gen_maps(_: &crate::mm::Mm, mm: &crate::mm::MmStruct) -> Vec<u8> {
     use crate::mm::{PROT_EXEC, PROT_READ, PROT_WRITE, VM_GROWSDOWN, VM_SHARED};
     use alloc::fmt::Write;
-    let mut out = String::new();
+    let mut out = Vec::new();
     let (start_brk, brk) = (mm.get_start_brk(), mm.get_brk());
     for v in mm.iter() {
         let bit = |b: bool, c: char| if b { c } else { '-' };
         let (ino, dev, name) = match &v.file {
             Some(f) => {
                 let ino = f.get_inode().map(|i| i.ino).unwrap_or(0);
-                (ino, "00:00", f.dentry.full_path())
+                // seq_file_path(m, file, "\n"): a newline in a name
+                // cannot start a forged line
+                let mut p = Vec::new();
+                super::name::mangle(&mut p, &f.dentry.full_path(), b"\n");
+                (ino, "00:00", p)
             }
-            None if v.flags & VM_GROWSDOWN != 0 => (0, "00:00", String::from("[stack]")),
+            None if v.flags & VM_GROWSDOWN != 0 => (0, "00:00", b"[stack]".to_vec()),
             None if v.start >= start_brk
                 && v.end <= brk.next_multiple_of(4096)
                 && brk > start_brk =>
             {
-                (0, "00:00", String::from("[heap]"))
+                (0, "00:00", b"[heap]".to_vec())
             }
-            None => (0, "00:00", String::new()),
+            None => (0, "00:00", Vec::new()),
         };
         let mut line = String::new();
         let _ = write!(
@@ -1071,15 +1077,18 @@ fn gen_maps(_: &crate::mm::Mm, mm: &crate::mm::MmStruct) -> Vec<u8> {
             dev,
             ino
         );
+        let mut line = line.into_bytes();
         if !name.is_empty() {
-            while line.len() < 73 {
-                line.push(' ');
-            }
-            line.push_str(&name);
+            line.resize(line.len().max(73), b' ');
+            line.extend_from_slice(&name);
         }
-        let _ = writeln!(out, "{}", line.trim_end());
+        while line.last() == Some(&b' ') {
+            line.pop();
+        }
+        out.extend_from_slice(&line);
+        out.push(b'\n');
     }
-    Vec::from(out.as_bytes())
+    out
 }
 
 /// Get the cgroup path for a task (virtualized to its namespace)
@@ -1724,44 +1733,38 @@ fn gen_meminfo() -> Vec<u8> {
 /// Example: none / ramfs rw 0 0
 fn gen_mounts() -> Vec<u8> {
     use crate::ns::current_mnt_ns;
-    use alloc::fmt::Write;
 
-    let mut output = String::new();
+    let mut output = Vec::new();
 
     // Get root mount from current task's mount namespace
     if let Some(root_mount) = current_mnt_ns().get_root() {
-        // Output root mount
-        let fs_name = root_mount.sb.fs_type.name;
-        let _ = writeln!(output, "none / {} {} 0 0", fs_name, root_mount.opts());
-
-        // Walk children recursively
+        mounts_line(&mut output, b"/", &root_mount);
         gen_mounts_recursive(&root_mount, &mut output);
     }
+    output
+}
 
-    Vec::from(output.as_bytes())
+/// One /proc/mounts line (Linux show_vfsmnt): fields escaped so a name
+/// cannot split or forge a line
+fn mounts_line(out: &mut Vec<u8>, mountpoint: &[u8], m: &super::mount::Mount) {
+    const ESC: &[u8] = b" \t\n\\";
+    out.extend_from_slice(b"none ");
+    super::name::mangle(out, mountpoint, ESC);
+    out.push(b' ');
+    super::name::mangle(out, m.sb.fs_type.name.as_bytes(), b" \t\n\\#");
+    out.push(b' ');
+    out.extend_from_slice(m.opts().as_bytes());
+    out.extend_from_slice(b" 0 0\n");
 }
 
 /// Recursively generate mount entries for child mounts
-fn gen_mounts_recursive(mount: &super::mount::Mount, output: &mut String) {
-    use alloc::fmt::Write;
-
+fn gen_mounts_recursive(mount: &super::mount::Mount, output: &mut Vec<u8>) {
     for child in mount.children.read().iter() {
-        let fs_name = child.sb.fs_type.name;
-
-        // Get mount point path
-        let mountpoint = if let Some(mp) = child.get_mountpoint() {
-            mp.full_path()
-        } else {
-            String::from("unknown")
+        let mountpoint = match child.get_mountpoint() {
+            Some(mp) => mp.full_path(),
+            None => b"unknown".to_vec(),
         };
-
-        let _ = writeln!(
-            output,
-            "none {} {} {} 0 0",
-            mountpoint,
-            fs_name,
-            child.opts()
-        );
+        mounts_line(output, &mountpoint, child);
 
         // Recurse into children
         gen_mounts_recursive(child, output);

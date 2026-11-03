@@ -53,21 +53,16 @@ blocks belong in a missing wrapper:
   timer container_of, `smp_call<T: Sync>`) in place of `*mut ()` data
   casts.
 
-## Path names must be valid UTF-8
+## Path copy-in errors
 
-**Location:** `uaccess.rs` (`strncpy_from_user`).
+**Location:** `uaccess.rs` (`strncpy_from_user`) and its callers.
 
-Linux path names are any bytes except '/' and NUL. hk's VFS holds names
-as `String`, so the path copy-in takes only valid UTF-8 and rejects
-anything else. The same copy-in serves the other string arguments
-(symlink targets, mq, key, inotify/fanotify, swapon and acct names),
-so those also refuse non-UTF-8 bytes. Mapping the other bytes to chars would let two different
-byte names alias one String.
-
-The callers turn every copy-in error into EFAULT, including the
-rejection here and an overlong path, which Linux reports as
-ENAMETOOLONG. The fix is byte-string names through the VFS, with one
+The callers turn every copy-in error into EFAULT, including an
+overlong path, which Linux reports as ENAMETOOLONG. The fix is one
 `user_path_at` that maps errors (Phase G).
+
+cgroup names must be UTF-8 (`fs/cgroupfs.rs`: mkdir of another name is
+EINVAL; Linux kernfs takes any bytes).
 
 ## user/ does not follow doc/UNSAFE.md
 
@@ -258,7 +253,7 @@ too_many_unix_fds rule), so a user can pin at most about RLIMIT_NOFILE
 files (plus the queues of those sockets, each bounded by SO_SNDBUF and
 max_dgram_qlen). Unlike Linux the count is also capped at 2024 (Linux's
 UNIX_INFLIGHT_SANE_USER), so raising RLIMIT_NOFILE does not raise what
-can be pinned. Socket paths must be UTF-8 (other bytes are EINVAL).
+can be pinned.
 
 Not implemented: MSG_OOB on streams (EOPNOTSUPP; Linux supports one
 out-of-band byte), SO_PEEK_OFF, SO_PASSPIDFD / SCM_PIDFD /

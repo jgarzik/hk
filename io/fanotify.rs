@@ -745,7 +745,7 @@ pub fn sys_fanotify_mark(fd: i32, mark_flags: u32, mask: u64, dirfd: i32, pathna
         };
 
         // Get starting directory
-        let start: Option<Path> = if pathname_str.starts_with('/') {
+        let start: Option<Path> = if pathname_str.starts_with(b"/") {
             None // Absolute path
         } else if dirfd == -100 {
             // AT_FDCWD
