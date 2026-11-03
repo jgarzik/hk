@@ -25,12 +25,15 @@ impl PlatformBusDriver for Pl011PlatformDriver {
 
     fn probe_platform(
         &self,
-        _device: &PlatformDevice,
+        device: &PlatformDevice,
         _ctx: &mut BusContext,
     ) -> Result<Box<dyn Device>, DriverError> {
         // The UART is set up at boot (serial::init); its tty becomes a
         // console now
         crate::arch::aarch64::serial::register_console();
+        if let Some(irq) = device.irq() {
+            crate::arch::aarch64::serial::rx_irq_init(u32::from(irq));
+        }
         Ok(Box::new(Pl011Device))
     }
 }

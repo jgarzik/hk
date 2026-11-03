@@ -144,11 +144,11 @@ unsafe extern "C" fn restorer() -> ! {
 
 static HITS: AtomicU32 = AtomicU32::new(0);
 
-extern "C" fn on_sig(_s: i32) {
+pub(super) extern "C" fn on_sig(_s: i32) {
     HITS.store(HITS.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
 }
 
-fn sigaction(sig: u32, handler: u64, flags: u64) {
+pub(super) fn sigaction(sig: u32, handler: u64, flags: u64) {
     let a = SigAction {
         handler,
         flags: flags | SA_RESTORER,

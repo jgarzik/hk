@@ -761,9 +761,6 @@ fn handle_irq(irq: u64) {
         0 => {
             // Timer interrupt (PIT): the LAPIC timer drives the tick
         }
-        4 => {
-            // COM1 - serial interrupt (input not implemented, output-only console)
-        }
         _ => {
             // Dispatch to registered handlers
             super::irq::dispatch_irq(irq);

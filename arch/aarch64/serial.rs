@@ -7,7 +7,7 @@
 use core::fmt;
 
 use crate::fs::chardev::{DevId, major};
-use crate::tty::{RAW_LDISC, Tty, TtyDriver};
+use crate::tty::{Tty, TtyDriver};
 use crate::util::error::KernelError;
 use core::ptr::{read_volatile, write_volatile};
 
@@ -30,6 +30,10 @@ mod regs {
     pub const CR: usize = 0x030;
     /// Interrupt Mask Set/Clear Register
     pub const IMSC: usize = 0x038;
+    /// Masked Interrupt Status Register
+    pub const MIS: usize = 0x040;
+    /// Interrupt Clear Register
+    pub const ICR: usize = 0x044;
 }
 
 /// Flag Register bits
@@ -40,6 +44,14 @@ mod fr {
     pub const TXFF: u32 = 1 << 5;
     /// UART busy
     pub const BUSY: u32 = 1 << 3;
+}
+
+/// Interrupt bits (IMSC, MIS, ICR)
+mod int {
+    /// Receive (FIFO level reached)
+    pub const RX: u32 = 1 << 4;
+    /// Receive timeout (FIFO not empty, idle line)
+    pub const RT: u32 = 1 << 6;
 }
 
 /// Line Control Register bits
@@ -128,6 +140,29 @@ impl Pl011 {
         self.write_reg(regs::DR, byte as u32);
     }
 
+    /// Drain the receive FIFO into `tty`'s flip buffer (IRQ context;
+    /// Linux pl011_rx_chars). True if a receive interrupt was pending
+    fn rx_chars(&self, tty: &Tty) -> bool {
+        if self.read_reg(regs::MIS) & (int::RX | int::RT) == 0 {
+            return false;
+        }
+        let mut buf = [0u8; 64];
+        loop {
+            let mut n = 0;
+            while n < buf.len() && self.read_reg(regs::FR) & fr::RXFE == 0 {
+                // The low byte is the character, the bits above its errors
+                buf[n] = (self.read_reg(regs::DR) & 0xff) as u8;
+                n += 1;
+            }
+            crate::tty::flip::receive(tty, &buf[..n]);
+            if n < buf.len() {
+                break;
+            }
+        }
+        self.write_reg(regs::ICR, int::RX | int::RT);
+        true
+    }
+
     /// Write a string
     pub fn write_str(&self, s: &str) {
         for byte in s.bytes() {
@@ -143,29 +178,11 @@ impl Pl011 {
 static UART: Pl011 = Pl011::new(PL011_BASE);
 
 impl TtyDriver for Pl011 {
-    fn name(&self) -> &str {
-        "pl011"
-    }
-
     fn write(&self, data: &[u8]) -> Result<usize, KernelError> {
         for &b in data {
             self.write_byte(b);
         }
         Ok(data.len())
-    }
-
-    fn read(&self, buf: &mut [u8]) -> Result<usize, KernelError> {
-        let mut n = 0;
-        while n < buf.len() && self.poll_read() {
-            // The low byte is the character, the bits above its errors
-            buf[n] = (self.read_reg(regs::DR) & 0xff) as u8;
-            n += 1;
-        }
-        Ok(n)
-    }
-
-    fn poll_read(&self) -> bool {
-        self.read_reg(regs::FR) & fr::RXFE == 0
     }
 
     fn flush(&self) {
@@ -176,12 +193,29 @@ impl TtyDriver for Pl011 {
 }
 
 /// The PL011's tty, ttyAMA0 = (204, 64) (Linux devices.txt)
-pub static TTY_AMA0: Tty = Tty::new("ttyAMA0", DevId::new(major::AMBA, 64), &UART, &RAW_LDISC);
+pub static TTY_AMA0: Tty = Tty::new("ttyAMA0", DevId::new(major::AMBA, 64), &UART);
 
 /// The serial ports' ttys
 pub fn serial_ttys() -> &'static [&'static Tty] {
     static TTYS: [&Tty; 1] = [&TTY_AMA0];
     &TTYS
+}
+
+/// The PL011's interrupt handler (IRQ context): input to ttyAMA0
+fn pl011_irq(_irq: u32, _data: *mut ()) -> bool {
+    UART.rx_chars(&TTY_AMA0)
+}
+
+/// Take input by interrupt (Linux pl011_startup); `irq` is the GIC
+/// INTID
+pub fn rx_irq_init(irq: u32) {
+    if let Err(e) =
+        crate::arch::irq::register_irq_handler(irq, pl011_irq, core::ptr::null_mut(), PL011_BASE)
+    {
+        crate::printkln!("ttyAMA0: no IRQ {}: {}", irq, e);
+        return;
+    }
+    UART.write_reg(regs::IMSC, int::RX | int::RT);
 }
 
 /// Make ttyAMA0 a console (Linux pl011 console; it is /dev/console's

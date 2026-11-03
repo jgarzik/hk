@@ -9,7 +9,7 @@ use crate::console::{ConsolePriority, register_console};
 use crate::util::error::KernelError;
 
 use crate::fs::chardev::{DevId, major};
-use crate::tty::{RAW_LDISC, Tty, TtyDriver};
+use crate::tty::{Tty, TtyDriver};
 
 /// NS16550A register offsets
 mod regs {
@@ -24,6 +24,8 @@ mod regs {
     pub const DLH: u16 = 1;
     /// FIFO Control Register
     pub const FCR: u16 = 2;
+    /// Interrupt Identification Register (read)
+    pub const IIR: u16 = 2;
     /// Line Control Register
     pub const LCR: u16 = 3;
     /// Modem Control Register
@@ -40,6 +42,18 @@ mod lsr {
     pub const THRE: u8 = 0x20;
     /// Transmitter Empty (both THR and shift register empty)
     pub const TEMT: u8 = 0x40;
+}
+
+/// Interrupt Enable Register bits
+mod ier {
+    /// Received Data available Interrupt
+    pub const RDI: u8 = 0x01;
+}
+
+/// Interrupt Identification Register bits
+mod iir {
+    /// No interrupt pending
+    pub const NO_INT: u8 = 0x01;
 }
 
 /// Line Control Register bits
@@ -74,23 +88,19 @@ mod fcr {
 
 /// Serial port (NS16550A UART) driver
 ///
-/// This is a polled driver suitable for console use.
-/// For interrupt-driven operation, see the platform serial driver.
+/// Output is polled (console-safe); COM1 input comes by interrupt
+/// (`rx_irq_init`).
 pub struct SerialTty {
     /// I/O port base address
     port: u16,
-    /// Device name
-    name: &'static str,
 }
 
 impl SerialTty {
     /// Create a new serial TTY
     ///
-    /// # Arguments
-    /// * `port` - I/O port base address (e.g., 0x3F8 for COM1)
-    /// * `name` - Device name (e.g., "ttyS0")
-    pub const fn new(port: u16, name: &'static str) -> Self {
-        Self { port, name }
+    /// `port`: I/O port base address (e.g., 0x3F8 for COM1)
+    pub const fn new(port: u16) -> Self {
+        Self { port }
     }
 
     /// Initialize the UART hardware
@@ -149,9 +159,34 @@ impl SerialTty {
         }
     }
 
-    /// Check if data is available
-    fn data_available(&self) -> bool {
-        unsafe { self.inb(regs::LSR) & lsr::DR != 0 }
+    /// Drain the receive FIFO into `tty`'s flip buffer (IRQ context;
+    /// Linux serial8250_rx_chars). True if the UART had an interrupt
+    /// pending
+    fn rx_chars(&self, tty: &Tty) -> bool {
+        // SAFETY: IIR is a register of this UART
+        if unsafe { self.inb(regs::IIR) } & iir::NO_INT != 0 {
+            return false;
+        }
+        let mut buf = [0u8; 64];
+        loop {
+            let mut n = 0;
+            while n < buf.len()
+                && let Some(b) = self.read_byte()
+            {
+                buf[n] = b;
+                n += 1;
+            }
+            crate::tty::flip::receive(tty, &buf[..n]);
+            if n < buf.len() {
+                return true;
+            }
+        }
+    }
+
+    /// Enable the receive interrupt (IER.RDI; MCR.OUT2 is set already)
+    fn enable_rx_irq(&self) {
+        // SAFETY: IER is a register of this UART
+        unsafe { self.outb(regs::IER, ier::RDI) };
     }
 
     /// Wait for transmitter to be completely empty (all bytes sent)
@@ -200,37 +235,11 @@ impl SerialTty {
 }
 
 impl TtyDriver for SerialTty {
-    fn name(&self) -> &str {
-        self.name
-    }
-
     fn write(&self, data: &[u8]) -> Result<usize, KernelError> {
         for &byte in data {
             self.write_byte(byte);
         }
         Ok(data.len())
-    }
-
-    fn read(&self, buf: &mut [u8]) -> Result<usize, KernelError> {
-        let mut count = 0;
-        while count < buf.len() {
-            if let Some(byte) = self.read_byte() {
-                buf[count] = byte;
-                count += 1;
-            } else {
-                break;
-            }
-        }
-        Ok(count)
-    }
-
-    fn poll_read(&self) -> bool {
-        self.data_available()
-    }
-
-    fn init(&self) -> Result<(), KernelError> {
-        self.init_hardware(115200);
-        Ok(())
     }
 
     fn flush(&self) {
@@ -251,14 +260,14 @@ pub mod ports {
 }
 
 /// Static serial hardware driver instances for standard COM ports
-static SERIAL_DRIVER_S0: SerialTty = SerialTty::new(ports::COM1, "ttyS0");
-static SERIAL_DRIVER_S1: SerialTty = SerialTty::new(ports::COM2, "ttyS1");
+static SERIAL_DRIVER_S0: SerialTty = SerialTty::new(ports::COM1);
+static SERIAL_DRIVER_S1: SerialTty = SerialTty::new(ports::COM2);
 
 /// Static TTY instances wrapping the serial drivers
 ///
 /// These provide the proper layer separation: Console → TTY → Driver
-pub static SERIAL_TTY_S0: Tty = Tty::new("ttyS0", ttys_dev(0), &SERIAL_DRIVER_S0, &RAW_LDISC);
-pub static SERIAL_TTY_S1: Tty = Tty::new("ttyS1", ttys_dev(1), &SERIAL_DRIVER_S1, &RAW_LDISC);
+pub static SERIAL_TTY_S0: Tty = Tty::new("ttyS0", ttys_dev(0), &SERIAL_DRIVER_S0);
+pub static SERIAL_TTY_S1: Tty = Tty::new("ttyS1", ttys_dev(1), &SERIAL_DRIVER_S1);
 
 /// ttyS<n> is (4, 64 + n) (Linux devices.txt)
 const fn ttys_dev(n: u16) -> DevId {
@@ -296,6 +305,23 @@ pub fn init_serial_console() {
 #[cfg(target_arch = "x86_64")]
 pub fn write_byte_com1(byte: u8) {
     SERIAL_DRIVER_S0.write_byte(byte);
+}
+
+/// COM1's interrupt handler (IRQ context): input to ttyS0
+fn com1_irq(_irq: u32, _data: *mut ()) -> bool {
+    SERIAL_DRIVER_S0.rx_chars(&SERIAL_TTY_S0)
+}
+
+/// Take COM1's input by interrupt (Linux serial8250_startup); `irq` is
+/// its PIC line
+pub fn rx_irq_init(irq: u32) {
+    let id = usize::from(ports::COM1);
+    if let Err(e) = crate::arch::irq::register_irq_handler(irq, com1_irq, core::ptr::null_mut(), id)
+    {
+        crate::printkln!("ttyS0: no IRQ {}: {}", irq, e);
+        return;
+    }
+    SERIAL_DRIVER_S0.enable_rx_irq();
 }
 
 /// The serial ports' ttys (Linux serial8250 ports)

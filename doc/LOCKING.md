@@ -383,6 +383,11 @@ Printk locks (ALL IRQ-safe - can be acquired from interrupt context):
 /dev/kmsg (kmsg.rs):
     KmsgUser.cur (spin, per open; never held across a wait) → LOG
     KmsgUser.rate (spin leaf)
+
+TTYs (3.9): jobctrl CTTY_LOCK (spin) → Tty.ctrl (spin); Tty.termios,
+    Tty.ldata (spin leaves, thread context); Tty.flip (IrqSpinlock leaf,
+    also under IRQ_TABLE in the UART handler). No tty lock is held
+    across a signal, a sleep or a driver write.
 ```
 
 ### Key Rules
@@ -2780,13 +2785,25 @@ Each `Tty` struct contains:
 | Lock | Type | Purpose |
 |------|------|---------|
 | `termios` | `Mutex<Termios>` | Terminal I/O settings (baud, echo, etc.) |
-| `input` | `Mutex<InputBuffer>` | Hardware input ring buffer |
+| `ldata` | `Mutex<NTtyData>` | N_TTY read ring and edited line (Linux `n_tty_data`) |
 | `ctrl` | `Mutex<TtyCtrl>` | Session, foreground group, window size (Linux `ctrl.lock` + `winsize_mutex`) |
+| `flip` | `IrqSpinlock<Flip>` | Bytes from the UART interrupt handler (Linux `tty_bufhead`) |
+| `read_wait` | `WaitQueue` | Readers and pollers waiting for input |
 
-All are spin `Mutex`es taken in thread context only, briefly, one at a
-time, and never across a signal, a sleep or a driver write: the
-SIGWINCH of TIOCSWINSZ and the SIGHUP/SIGCONT of giving up a
-controlling tty are sent after `ctrl` is dropped.
+The `Mutex`es are spin locks taken in thread context only, briefly, one
+at a time (`termios` is copied out first), and never across a signal, a
+sleep or a driver write: N_TTY collects echo and ISIG signals under
+`ldata` and writes/sends them after dropping it; the SIGWINCH of
+TIOCSWINSZ and the SIGHUP/SIGCONT of giving up a controlling tty are sent
+after `ctrl` is dropped. A reader's wait condition takes `ldata`.
+
+Input (`tty/flip.rs`, Linux tty_buffer.c): the UART handler (IRQ
+context, under `IRQ_TABLE`) drains its FIFO into `Tty.flip` (leaf), sets
+`flip::PENDING` and wakes `flip::FLIP_WAIT`; the `ttyflip` kernel thread
+takes the bytes out (`flip`, released before the line discipline runs)
+and feeds them to N_TTY (`ldata`), then wakes `read_wait`. It is the only
+consumer, so input stays in order. Order: `IRQ_TABLE` → `Tty.flip`;
+`IRQ_TABLE` → wait queue head (the wakeup).
 
 `tty::jobctrl::CTTY_LOCK` (spin `Mutex`, thread context; Linux tty_lock
 + siglock in `__proc_set_tty`/`session_clear_tty`) serializes giving and
@@ -2813,7 +2830,7 @@ PRINTK (IrqSpinlock, ring buffer, brief hold during write)
     ↓
 CONSOLE_REGISTRY (IrqSpinlock, console dispatch to drivers)
     ↓
-Per-TTY locks (Mutex: termios, input, ctrl) - independent between TTYs
+Per-TTY locks (Mutex: termios, ldata, ctrl) - independent between TTYs
     ↓
 GfxConsole.state (Mutex, if graphics console receives output)
 ```
