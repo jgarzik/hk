@@ -300,14 +300,7 @@ fn do_msgsnd(msqid: i32, msgp: u64, msgsz: usize, msgflg: i32) -> Result<i32, i3
             continue;
         }
 
-        // Add message to queue
-        {
-            let mut messages = queue.messages.lock();
-            messages.push_back(MsgMsg {
-                mtype: msg.mtype,
-                mtext: msg.mtext.clone(),
-            });
-        }
+        queue.messages.lock().push_back(msg);
 
         queue.cbytes.fetch_add(msgsz as u64, Ordering::AcqRel);
         queue.qnum.fetch_add(1, Ordering::AcqRel);
