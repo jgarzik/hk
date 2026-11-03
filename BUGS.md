@@ -172,6 +172,30 @@ getcpu reports it; nothing else uses it. Missing (Linux
 - No page migration: migrate_pages and move_pages validate and move
   nothing; move_pages query mode reports node 0 for every page.
 - Nodemasks are one `u64` (64 nodes); no multi-node QEMU test config.
+- Node numbers are the firmware's (SRAT proximity domain, DT
+  `numa-node-id`) used as is: sparse or large domains leave holes or
+  are dropped (>= 64), and node 0 may not exist (Linux pxm_to_node
+  numbers the domains from 0).
+- The boot topology dump (`print_topology`) runs before any CPU has
+  come up (`cpu_up`), so with real NUMA tables every node shows 0 CPUs.
+
+## arm64 SMP assumes one-cell, Aff0-only CPU ids
+
+**Location**: `arch/aarch64/dtb.rs` (`parse_dtb`), `arch/aarch64/smp.rs`
+(`init`), `arch/aarch64/mod.rs` (`fallback_acpi_info`)
+
+Fine on QEMU virt (one `reg` cell, Aff0 only); wrong on multi-cluster
+hardware (Linux arm64 smp_init_cpus / of_get_cpu_hwid):
+
+- The DT CPU list reads `reg` as one u32: with `#address-cells = 2`
+  every CPU gets the Aff3 cell (0). `CpuInfo.hw_cpu_id` is a u32, so
+  Aff3 is lost anyway, and it is passed as is to PSCI CPU_ON.
+- The boot CPU is taken to be `reg == 0` in the DT list, and smp::init
+  skips the CPU whose id equals MPIDR Aff0 (`mpidr & 0xff`): with
+  clusters (0x100, ...) it can skip the wrong CPU or try to start
+  itself. Linux matches the full MPIDR_HWID_BITMASK affinity.
+- Without a usable DT, a hardcoded table of 4 CPUs (ids 0-3) is used
+  instead of booting just the boot CPU.
 
 ## exec ignores set-user-ID / set-group-ID bits and file capabilities
 
