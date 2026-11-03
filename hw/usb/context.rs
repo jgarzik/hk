@@ -218,33 +218,31 @@ impl EndpointContext {
         self.set_tr_dequeue_ptr(tr_dequeue, true); // DCS=1 initially
     }
 
-    /// Configure for Bulk IN endpoint
-    pub fn configure_bulk_in(&mut self, max_packet: u16, tr_dequeue: u64) {
-        self.set_ep_type(EndpointType::BULK_IN);
-        self.set_max_packet_size(max_packet);
+    /// Configure a bulk or interrupt endpoint (Linux xhci_endpoint_init):
+    /// `esit` is the payload per service interval (interrupt; 0 for
+    /// bulk), also the average TRB length
+    pub fn configure(&mut self, ep_type: u8, ep: &EpParams, tr_dequeue: u64) {
+        self.set_ep_type(ep_type);
+        self.set_max_packet_size(ep.max_packet);
+        self.set_max_burst_size(ep.burst);
         self.set_cerr(3);
-        self.set_average_trb_length(1024); // Typical bulk transfer
+        self.set_interval(ep.interval);
+        self.dword0 = (self.dword0 & !(0xFF << 24)) | (((ep.esit >> 16) & 0xFF) << 24);
+        self.dword4 = (ep.esit & 0xFFFF) << 16 | (ep.esit & 0xFFFF);
         self.set_tr_dequeue_ptr(tr_dequeue, true);
     }
+}
 
-    /// Configure for Bulk OUT endpoint
-    pub fn configure_bulk_out(&mut self, max_packet: u16, tr_dequeue: u64) {
-        self.set_ep_type(EndpointType::BULK_OUT);
-        self.set_max_packet_size(max_packet);
-        self.set_cerr(3);
-        self.set_average_trb_length(1024);
-        self.set_tr_dequeue_ptr(tr_dequeue, true);
-    }
-
-    /// Configure for Interrupt IN endpoint
-    pub fn configure_interrupt_in(&mut self, max_packet: u16, interval: u8, tr_dequeue: u64) {
-        self.set_ep_type(EndpointType::INTERRUPT_IN);
-        self.set_max_packet_size(max_packet);
-        self.set_cerr(3);
-        self.set_interval(interval);
-        self.set_average_trb_length(max_packet);
-        self.set_tr_dequeue_ptr(tr_dequeue, true);
-    }
+/// What an endpoint context needs from the descriptors
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EpParams {
+    pub max_packet: u16,
+    /// Max burst size (packets per burst - 1)
+    pub burst: u8,
+    /// Service interval exponent (125 us * 2^interval)
+    pub interval: u8,
+    /// Max ESIT payload
+    pub esit: u32,
 }
 
 /// Input Control Context (8 bytes, but padded to 32 for alignment)

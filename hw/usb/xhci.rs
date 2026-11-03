@@ -84,9 +84,13 @@ fn hcc_dma_mask(params1: u32) -> u64 {
     }
 }
 
+use super::context::EpParams;
 use super::context::{InputContext, OutputDeviceContext, endpoint_to_dci};
 use super::transfer::{CompletionCode, TransferRing, Trb as TransferTrb, TrbType};
-use super::{SetupPacket, UsbController, UsbDevice, UsbError, UsbSpeed};
+use super::{
+    EndpointType, SetupPacket, UsbController, UsbDevice, UsbEndpoint, UsbError, UsbSpeed, config,
+    descriptor_type,
+};
 
 // ============================================================================
 // Global USB Host Access
@@ -198,21 +202,6 @@ fn xhci_irq_handler_common() -> bool {
         .store(true, Ordering::Release);
 
     true // We handled the interrupt
-}
-
-/// Configure bulk endpoints for a USB device
-///
-/// Must be called before bulk_in/bulk_out operations.
-/// Returns Ok(()) on success, or error if configuration failed.
-pub fn usb_configure_endpoints(
-    slot_id: u8,
-    bulk_in_ep: u8,
-    bulk_out_ep: u8,
-    max_packet: u16,
-) -> Result<(), UsbError> {
-    let mut guard = acquire_usb_controller();
-    let controller = guard.as_mut().ok_or(UsbError::NoDevice)?;
-    controller.configure_bulk_endpoints(slot_id, bulk_in_ep, bulk_out_ep, max_packet)
 }
 
 /// RAII guard that manages USB_OUTPUT_ACTIVE flag alongside the mutex guard
@@ -442,7 +431,10 @@ mod trb_type {
     pub const DISABLE_SLOT: u8 = 10;
     pub const ADDRESS_DEVICE: u8 = 11;
     pub const CONFIGURE_ENDPOINT: u8 = 12;
+    pub const EVALUATE_CONTEXT: u8 = 13;
+    pub const RESET_ENDPOINT: u8 = 14;
     pub const STOP_ENDPOINT: u8 = 15;
+    pub const SET_TR_DEQUEUE: u8 = 16;
     pub const COMMAND_COMPLETION: u8 = 33;
     pub const TRANSFER_EVENT: u8 = 32;
 }
@@ -463,8 +455,9 @@ struct DeviceState {
     transfer_rings: BTreeMap<u8, TransferRing>,
     /// Whether the device has been addressed
     addressed: bool,
-    /// Whether endpoints have been configured
-    configured: bool,
+    /// Speed and root hub port (the slot context)
+    speed: UsbSpeed,
+    port: u8,
 }
 
 /// TRB completion codes
@@ -676,6 +669,8 @@ pub struct XhciController {
     ctx_size: usize,
     /// Chipset quirks (`quirk::*`), from the PCI IDs at creation
     quirks: u32,
+    /// HCIVERSION
+    hci_version: u16,
     /// Initialized flag
     initialized: bool,
     /// Connected devices
@@ -704,6 +699,7 @@ impl XhciController {
             max_slots: 0,
             max_ports: 0,
             ctx_size: 32,
+            hci_version: 0,
             initialized: false,
             devices: Vec::new(),
             device_states: BTreeMap::new(),
@@ -796,6 +792,7 @@ impl XhciController {
         // Read capability registers
         let caplength = (self.read_cap(0) & 0xFF) as u64;
         let hciversion = self.read_cap(0) >> 16;
+        self.hci_version = hciversion as u16;
         let hcsparams1 = self.read_cap(0x04);
         let dboff = self.read_cap(0x14);
         let rtsoff = self.read_cap(0x18);
@@ -1176,14 +1173,8 @@ impl XhciController {
             control.add_endpoint(1); // DCI 1 = EP0
         }
 
-        // Configure Slot Context
-        {
-            let slot = input_ctx.slot_mut();
-            slot.set_route_string(0); // Root hub device
-            slot.set_speed(speed as u8);
-            slot.set_context_entries(1); // Only slot + EP0 for now
-            slot.set_root_hub_port(port);
-        }
+        // Slot Context: slot + EP0
+        fill_slot(input_ctx.slot_mut(), speed, port, 1);
 
         // Configure EP0 Context (Control Endpoint)
         {
@@ -1227,7 +1218,8 @@ impl XhciController {
             input_ctx,
             transfer_rings,
             addressed: true,
-            configured: false,
+            speed,
+            port,
         };
         self.device_states.insert(slot_id, state);
 
@@ -1235,116 +1227,338 @@ impl XhciController {
         Ok(())
     }
 
-    /// Configure bulk endpoints for a device
-    ///
-    /// This must be called after address_device and before bulk transfers.
-    fn configure_bulk_endpoints(
-        &mut self,
-        slot_id: u8,
-        bulk_in_ep: u8,
-        bulk_out_ep: u8,
-        max_packet: u16,
-    ) -> Result<(), UsbError> {
-        // Calculate DCIs
-        let bulk_in_dci = endpoint_to_dci(bulk_in_ep | 0x80);
-        let bulk_out_dci = endpoint_to_dci(bulk_out_ep);
-
-        // Create Transfer Rings for bulk endpoints
-        let bulk_in_ring = TransferRing::new(&self.pci_dev).ok_or(UsbError::NoResources)?;
-        let bulk_out_ring = TransferRing::new(&self.pci_dev).ok_or(UsbError::NoResources)?;
-
-        let bulk_in_ring_addr = bulk_in_ring.dma_addr();
-        let bulk_out_ring_addr = bulk_out_ring.dma_addr();
-
-        // Get input context DMA address after configuring it
-        let input_ctx_addr = {
-            let state = self
-                .device_states
-                .get_mut(&slot_id)
-                .ok_or(UsbError::NoDevice)?;
-
-            if !state.addressed {
-                return Err(UsbError::NoDevice);
-            }
-
-            // Configure Input Context
-            state.input_ctx.clear();
-
-            {
-                let control = state.input_ctx.control_mut();
-                control.add_slot();
-                control.add_endpoint(bulk_in_dci);
-                control.add_endpoint(bulk_out_dci);
-            }
-
-            // Update Slot Context
-            {
-                let slot = state.input_ctx.slot_mut();
-                let max_dci = bulk_in_dci.max(bulk_out_dci);
-                slot.set_context_entries(max_dci);
-            }
-
-            // Configure Bulk IN endpoint
-            {
-                let ep = state
-                    .input_ctx
-                    .endpoint_mut(bulk_in_dci)
-                    .ok_or(UsbError::NoResources)?;
-                ep.configure_bulk_in(max_packet, bulk_in_ring_addr);
-            }
-
-            // Configure Bulk OUT endpoint
-            {
-                let ep = state
-                    .input_ctx
-                    .endpoint_mut(bulk_out_dci)
-                    .ok_or(UsbError::NoResources)?;
-                ep.configure_bulk_out(max_packet, bulk_out_ring_addr);
-            }
-
-            state.input_ctx.dma_addr()
-        };
-
-        // Issue Configure Endpoint command (state borrow is released)
+    /// Issue a command and wait for its completion event; a completion
+    /// code other than success fails it
+    fn command(&mut self, trb: Trb, what: &str) -> Result<Trb, UsbError> {
         let cmd_ring = self.cmd_ring.as_mut().ok_or(UsbError::NoResources)?;
-        let mut trb = Trb::new();
-        trb.parameter = input_ctx_addr;
-        trb.set_type(trb_type::CONFIGURE_ENDPOINT);
-        trb.control |= (slot_id as u32) << 24;
-
-        let trb_addr = cmd_ring.enqueue(trb);
-
-        printkln!(
-            "xHCI: Issuing Configure Endpoint command for slot {}",
-            slot_id
-        );
-
+        let addr = cmd_ring.enqueue(trb);
         self.ring_doorbell(0, 0);
-
-        // Wait for completion
-        let event = self.wait_for_command(trb_addr)?;
+        let event = self.wait_for_command(addr)?;
         let cc = ((event.status >> 24) & 0xFF) as u8;
         if cc != completion_code::SUCCESS {
-            printkln!("xHCI: Configure Endpoint failed with code {}", cc);
+            printkln!("xHCI: {} failed with code {}", what, cc);
             return Err(UsbError::TransferError(cc));
         }
+        Ok(event)
+    }
 
-        // Store Transfer Rings (reborrow state)
+    /// The state of addressed `slot_id` with its input context cleared,
+    /// and the context's DMA address
+    fn input_ctx(&mut self, slot_id: u8) -> Result<(&mut DeviceState, u64), UsbError> {
         let state = self
             .device_states
             .get_mut(&slot_id)
             .ok_or(UsbError::NoDevice)?;
-        state.transfer_rings.insert(bulk_in_dci, bulk_in_ring);
-        state.transfer_rings.insert(bulk_out_dci, bulk_out_ring);
-        state.configured = true;
+        if !state.addressed {
+            return Err(UsbError::NoDevice);
+        }
+        state.input_ctx.clear();
+        let addr = state.input_ctx.dma_addr();
+        Ok((state, addr))
+    }
 
-        printkln!(
-            "xHCI: Configured bulk endpoints for slot {} (IN DCI={}, OUT DCI={})",
-            slot_id,
-            bulk_in_dci,
-            bulk_out_dci
-        );
+    /// Evaluate Context: EP0's max packet size once the device
+    /// descriptor gives it (Linux xhci_check_maxpacket)
+    fn evaluate_ep0(&mut self, slot_id: u8, mps: u16) -> Result<(), UsbError> {
+        let (state, addr) = self.input_ctx(slot_id)?;
+        let ring = state
+            .transfer_rings
+            .get(&1)
+            .ok_or(UsbError::NoDevice)?
+            .dma_addr();
+        state.input_ctx.control_mut().add_endpoint(1);
+        state
+            .input_ctx
+            .endpoint_mut(1)
+            .ok_or(UsbError::NoResources)?
+            .configure_control(mps, ring);
+        self.command(
+            slot_trb(trb_type::EVALUATE_CONTEXT, slot_id, 0, addr),
+            "Evaluate Context",
+        )
+        .map(|_| ())
+    }
+
+    /// Configure Endpoint: add the endpoints of the configuration being
+    /// set (Linux usb_hcd_alloc_bandwidth: xhci_add_endpoint for each,
+    /// then xhci_check_bandwidth). Bulk and interrupt endpoints only:
+    /// others are skipped (BUGS.md)
+    fn configure_endpoints(&mut self, slot_id: u8, eps: &[UsbEndpoint]) -> Result<(), UsbError> {
+        let speed = self
+            .device_states
+            .get(&slot_id)
+            .ok_or(UsbError::NoDevice)?
+            .speed;
+        let mut add = Vec::new();
+        for ep in eps {
+            let Some(ty) = ep_ctx_type(ep) else {
+                printkln!(
+                    "xHCI: slot {} endpoint {:#04x}: {:?} unsupported",
+                    slot_id,
+                    ep.address,
+                    ep.ep_type
+                );
+                continue;
+            };
+            // Never EP0's context or a ring the device may be using
+            // (the parser already drops such descriptors)
+            let dci = endpoint_to_dci(ep.address);
+            let taken = self
+                .device_states
+                .get(&slot_id)
+                .is_some_and(|st| st.transfer_rings.contains_key(&dci));
+            if dci <= 1 || taken || add.iter().any(|a: &(u8, _, _, _)| a.0 == dci) {
+                continue;
+            }
+            let ring = TransferRing::new(&self.pci_dev).ok_or(UsbError::NoResources)?;
+            add.push((dci, ty, ep_params(ep, speed), ring));
+        }
+        if add.is_empty() {
+            return Ok(());
+        }
+        let (state, addr) = self.input_ctx(slot_id)?;
+        let (speed, port) = (state.speed, state.port);
+        let ctx = &mut state.input_ctx;
+        ctx.control_mut().add_slot();
+        let mut last = 1;
+        for (dci, ty, p, ring) in &add {
+            ctx.control_mut().add_endpoint(*dci);
+            ctx.endpoint_mut(*dci)
+                .ok_or(UsbError::NoResources)?
+                .configure(*ty, p, ring.dma_addr());
+            last = last.max(*dci);
+        }
+        fill_slot(ctx.slot_mut(), speed, port, last);
+        self.command(
+            slot_trb(trb_type::CONFIGURE_ENDPOINT, slot_id, 0, addr),
+            "Configure Endpoint",
+        )?;
+        let state = self
+            .device_states
+            .get_mut(&slot_id)
+            .ok_or(UsbError::NoDevice)?;
+        for (dci, _, _, ring) in add {
+            state.transfer_rings.insert(dci, ring);
+        }
         Ok(())
+    }
+
+    /// Recover a halted endpoint: Reset Endpoint, then its dequeue
+    /// pointer past what was queued (Linux xhci_handle_halted_endpoint,
+    /// the failed TD dropped)
+    fn reset_ep(&mut self, slot_id: u8, dci: u8) -> Result<(), UsbError> {
+        self.command(
+            slot_trb(trb_type::RESET_ENDPOINT, slot_id, dci, 0),
+            "Reset Endpoint",
+        )?;
+        let deq = self
+            .device_states
+            .get(&slot_id)
+            .and_then(|s| s.transfer_rings.get(&dci))
+            .ok_or(UsbError::NoDevice)?
+            .enqueue_ptr();
+        self.command(
+            slot_trb(trb_type::SET_TR_DEQUEUE, slot_id, dci, deq),
+            "Set TR Dequeue Pointer",
+        )
+        .map(|_| ())
+    }
+
+    /// A control transfer on EP0 (Linux xhci_queue_ctrl_tx): Setup,
+    /// optional Data and Status stages as one TD; `buf` receives (IN)
+    /// or supplies (OUT) the data stage, of at most a page. A timeout
+    /// leaves the TD queued and leaks its bounce buffer, as the bulk
+    /// path; any other failure halts EP0, which is reset
+    fn do_control(
+        &mut self,
+        slot_id: u8,
+        setup: &SetupPacket,
+        buf: &mut [u8],
+        timeout_us: u64,
+    ) -> Result<usize, UsbError> {
+        if !self.initialized {
+            return Err(UsbError::NoDevice);
+        }
+        let len = (setup.length as usize).min(buf.len());
+        if len > crate::mm::frame_alloc::FRAME_SIZE {
+            return Err(UsbError::InvalidParam);
+        }
+        let has_ep0 = self
+            .device_states
+            .get(&slot_id)
+            .is_some_and(|s| s.transfer_rings.contains_key(&1));
+        if !has_ep0 {
+            return Err(UsbError::NoDevice);
+        }
+        let is_in = setup.is_in();
+        let bounce = match len {
+            0 => None,
+            n => Some(
+                crate::hw::dma::dma_alloc_coherent(&self.pci_dev, n)
+                    .ok_or(UsbError::NoResources)?,
+            ),
+        };
+        if let Some(b) = &bounce
+            && !is_in
+        {
+            // SAFETY: a fresh allocation of `len` bytes, not yet the
+            // device's
+            unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), b.cpu_addr(), len) };
+        }
+        // Transfer type (TRT) from xHCI 1.0 on: 3 IN data, 2 OUT, 0 none
+        let trt = match (self.hci_version >= 0x100, &bounce, is_in) {
+            (true, Some(_), true) => 3,
+            (true, Some(_), false) => 2,
+            _ => 0,
+        };
+        let mut trbs = Vec::with_capacity(3);
+        trbs.push(TransferTrb::setup_stage(&setup.bytes(), trt));
+        if let Some(b) = &bounce {
+            trbs.push(TransferTrb::data_stage(
+                b.dma_addr().as_u64(),
+                len as u32,
+                is_in,
+            ));
+        }
+        // Status in the opposite direction of the data, IN without any
+        trbs.push(TransferTrb::status_stage(!(bounce.is_some() && is_in)));
+        let ring = self
+            .device_states
+            .get_mut(&slot_id)
+            .and_then(|s| s.transfer_rings.get_mut(&1))
+            .ok_or(UsbError::NoDevice)?;
+        let addrs = ring.enqueue_td(&trbs);
+        self.ring_doorbell(slot_id, 1);
+
+        let status = addrs[addrs.len() - 1];
+        let data = bounce.as_ref().map(|_| addrs[1]);
+        let mut done = len;
+        let failed = loop {
+            // A timeout returns here: `bounce` is leaked, never reused
+            let (at, residue, cc) = self.wait_for_trbs(slot_id, 1, &addrs, timeout_us)?;
+            let ok = cc == CompletionCode::SUCCESS || cc == CompletionCode::SHORT_PACKET;
+            if !ok {
+                break Some(cc);
+            }
+            if Some(at) == data {
+                done = len - (residue as usize).min(len);
+            }
+            if at == status {
+                break None;
+            }
+        };
+        if let Some(ring) = self
+            .device_states
+            .get_mut(&slot_id)
+            .and_then(|s| s.transfer_rings.get_mut(&1))
+        {
+            addrs.iter().for_each(|_| ring.advance_dequeue());
+        }
+        fence(Ordering::Acquire);
+        if let Some(b) = bounce {
+            if failed.is_none() && is_in {
+                // SAFETY: the TD completed: the device is done writing
+                // (ordered by the fence above); `done` <= len fits both
+                unsafe { core::ptr::copy_nonoverlapping(b.cpu_addr(), buf.as_mut_ptr(), done) };
+            }
+            // SAFETY: the TD completed or halted the endpoint: the
+            // device no longer touches the buffer
+            unsafe { crate::hw::dma::dma_free_coherent(&self.pci_dev, b) };
+        }
+        match failed {
+            None => Ok(if is_in { done } else { len }),
+            Some(cc) => {
+                let _ = self.reset_ep(slot_id, 1);
+                Err(if cc == CompletionCode::STALL_ERROR {
+                    UsbError::Stall
+                } else {
+                    UsbError::TransferError(cc)
+                })
+            }
+        }
+    }
+
+    /// GET_DESCRIPTOR of `len` bytes: what the device sent
+    fn get_descriptor(&mut self, slot_id: u8, ty: u8, len: usize) -> Result<Vec<u8>, UsbError> {
+        let mut buf = alloc::vec![0u8; len];
+        let setup = SetupPacket::get_descriptor(ty, 0, len as u16);
+        let n = self.do_control(slot_id, &setup, &mut buf, XHCI_TRANSFER_US)?;
+        buf.truncate(n);
+        Ok(buf)
+    }
+
+    /// EP0's max packet size from the first 8 bytes of the device
+    /// descriptor, below SuperSpeed (Linux hub_port_init): Evaluate
+    /// Context when it differs from the default
+    fn ep0_maxpacket(&mut self, slot_id: u8, speed: UsbSpeed) -> Result<(), UsbError> {
+        if speed.is_super() {
+            return Ok(());
+        }
+        let d = self.get_descriptor(slot_id, descriptor_type::DEVICE, 8)?;
+        let mps = *d.get(7).ok_or(UsbError::BufferError)? as u16;
+        if mps == speed.default_max_packet_size() {
+            return Ok(());
+        }
+        if speed == UsbSpeed::Low || !matches!(mps, 8 | 16 | 32 | 64) {
+            printkln!("xHCI: slot {}: invalid ep0 maxpacket {}", slot_id, mps);
+            return Err(UsbError::InvalidParam);
+        }
+        self.evaluate_ep0(slot_id, mps)
+    }
+
+    /// Read the device's descriptors (Linux hub_port_init,
+    /// usb_get_configuration): an undescribed device is not enumerated
+    fn describe(&mut self, dev: &mut UsbDevice) -> Result<(), UsbError> {
+        let slot = dev.slot_id;
+        self.ep0_maxpacket(slot, dev.speed)?;
+        let d = self.get_descriptor(slot, descriptor_type::DEVICE, config::USB_DT_DEVICE_SIZE)?;
+        if !config::parse_device(dev, &d) {
+            return Err(UsbError::BufferError);
+        }
+        if dev.num_configurations == 0 {
+            return Ok(());
+        }
+        let c = self.get_descriptor(
+            slot,
+            descriptor_type::CONFIGURATION,
+            config::USB_DT_CONFIG_SIZE,
+        )?;
+        let total = config::config_total_length(&c).ok_or(UsbError::BufferError)? as usize;
+        let max = crate::mm::frame_alloc::FRAME_SIZE;
+        let c = self.get_descriptor(
+            slot,
+            descriptor_type::CONFIGURATION,
+            total.clamp(config::USB_DT_CONFIG_SIZE, max),
+        )?;
+        let (cfg, intfs) = config::parse_config(&c).ok_or(UsbError::BufferError)?;
+        if let Err(e) = self.set_configuration(slot, cfg.value, &intfs) {
+            // Registered unconfigured, as Linux after a failed
+            // usb_set_configuration
+            printkln!("xHCI: slot {}: set configuration failed: {:?}", slot, e);
+            return Ok(());
+        }
+        dev.config = cfg;
+        dev.interfaces = intfs;
+        Ok(())
+    }
+
+    /// Make configuration `value` active: its interfaces' endpoints in
+    /// the controller, then SET_CONFIGURATION (Linux
+    /// usb_set_configuration: usb_hcd_alloc_bandwidth, then the request)
+    fn set_configuration(
+        &mut self,
+        slot_id: u8,
+        value: u8,
+        intfs: &[super::UsbInterface],
+    ) -> Result<(), UsbError> {
+        let eps: Vec<UsbEndpoint> = super::usbcore::cur_altsettings(intfs)
+            .iter()
+            .flat_map(|f| f.endpoints.iter().cloned())
+            .collect();
+        self.configure_endpoints(slot_id, &eps)?;
+        let setup = SetupPacket::set_configuration(value);
+        self.do_control(slot_id, &setup, &mut [], XHCI_TRANSFER_US)
+            .map(|_| ())
     }
 
     /// Wait for a transfer completion event
@@ -1359,6 +1573,19 @@ impl XhciController {
         trb: u64,
         timeout_us: u64,
     ) -> Result<(u32, u8), UsbError> {
+        self.wait_for_trbs(slot_id, ep_dci, &[trb], timeout_us)
+            .map(|(_, residue, cc)| (residue, cc))
+    }
+
+    /// Wait for the completion event of any TRB in `want`: the TRB's
+    /// address, its residue and completion code
+    fn wait_for_trbs(
+        &mut self,
+        slot_id: u8,
+        ep_dci: u8,
+        want: &[u64],
+        timeout_us: u64,
+    ) -> Result<(u64, u32, u8), UsbError> {
         // Always poll the event ring - interrupt is just an optimization hint
         let mut result = None;
         let _ = poll_timeout(timeout_us, 0, || {
@@ -1366,7 +1593,7 @@ impl XhciController {
             let _ = XHCI_IRQ_STATE
                 .interrupt_pending
                 .swap(false, Ordering::AcqRel);
-            result = self.try_dequeue_transfer_event(slot_id, ep_dci, trb);
+            result = self.try_dequeue_transfer_event(slot_id, ep_dci, want);
             result.is_some()
         });
         if let Some(result) = result {
@@ -1420,8 +1647,8 @@ impl XhciController {
         &mut self,
         slot_id: u8,
         ep_dci: u8,
-        want_trb: u64,
-    ) -> Option<Result<(u32, u8), UsbError>> {
+        want: &[u64],
+    ) -> Option<Result<(u64, u32, u8), UsbError>> {
         // Process all available events until we find a matching transfer event
         loop {
             let event_ring = self.event_ring.as_mut()?;
@@ -1453,8 +1680,8 @@ impl XhciController {
 
                 // The event's parameter is the address of the TRB it
                 // completes
-                if event_slot == slot_id && event_ep == ep_dci && trb.parameter == want_trb {
-                    return Some(Ok((transferred, cc)));
+                if event_slot == slot_id && event_ep == ep_dci && want.contains(&trb.parameter) {
+                    return Some(Ok((trb.parameter, transferred, cc)));
                 }
                 // Transfer for different slot/ep - continue consuming events
             } else if usb_trace() {
@@ -1819,6 +2046,73 @@ impl XhciController {
     }
 }
 
+/// A command TRB for `slot` (bits 31:24), endpoint `dci` (20:16)
+fn slot_trb(ty: u8, slot: u8, dci: u8, parameter: u64) -> Trb {
+    let mut trb = Trb::new();
+    trb.parameter = parameter;
+    trb.set_type(ty);
+    trb.control |= (slot as u32) << 24 | (dci as u32) << 16;
+    trb
+}
+
+/// A root-port device's slot context (route string 0)
+fn fill_slot(slot: &mut super::context::SlotContext, speed: UsbSpeed, port: u8, entries: u8) {
+    slot.set_route_string(0);
+    slot.set_speed(speed as u8);
+    slot.set_context_entries(entries);
+    slot.set_root_hub_port(port);
+}
+
+/// An endpoint's context type, if supported (bulk, interrupt)
+fn ep_ctx_type(ep: &UsbEndpoint) -> Option<u8> {
+    use super::context::EndpointType as T;
+    Some(match (ep.ep_type, ep.is_in()) {
+        (EndpointType::Bulk, true) => T::BULK_IN,
+        (EndpointType::Bulk, false) => T::BULK_OUT,
+        (EndpointType::Interrupt, true) => T::INTERRUPT_IN,
+        (EndpointType::Interrupt, false) => T::INTERRUPT_OUT,
+        _ => return None,
+    })
+}
+
+/// Linux fls
+fn fls(x: u32) -> i32 {
+    32 - x.leading_zeros() as i32
+}
+
+/// An endpoint context's parameters from its descriptors (Linux
+/// xhci_endpoint_init: xhci_get_endpoint_interval,
+/// xhci_get_endpoint_max_burst, xhci_get_max_esit_payload)
+fn ep_params(ep: &UsbEndpoint, speed: UsbSpeed) -> EpParams {
+    let periodic = matches!(
+        ep.ep_type,
+        EndpointType::Interrupt | EndpointType::Isochronous
+    );
+    let burst = match speed {
+        _ if speed.is_super() => ep.max_burst,
+        UsbSpeed::High if periodic => ep.mult(),
+        _ => 0,
+    };
+    let interval = match speed {
+        _ if !periodic => 0,
+        // xhci_parse_exponent_interval: 2^(bInterval-1) microframes
+        UsbSpeed::High | UsbSpeed::Super | UsbSpeed::SuperPlus => ep.interval.clamp(1, 16) - 1,
+        // xhci_parse_frame_interval: bInterval frames, as an exponent
+        _ => (fls(ep.interval as u32 * 8) - 1).clamp(3, 10) as u8,
+    };
+    let esit = match speed {
+        _ if !periodic => 0,
+        _ if speed.is_super() => ep.bytes_per_interval as u32,
+        _ => ep.maxp() as u32 * (burst as u32 + 1),
+    };
+    EpParams {
+        max_packet: ep.maxp(),
+        burst,
+        interval,
+        esit,
+    }
+}
+
 impl UsbController for XhciController {
     fn reset(&mut self) -> Result<(), UsbError> {
         self.halt()?;
@@ -1862,26 +2156,23 @@ impl UsbController for XhciController {
                 continue;
             }
 
-            // Create device info
-            // Note: Full enumeration would read device descriptors via control transfers
-            let device = UsbDevice {
-                slot_id,
-                address: slot_id,
-                speed,
-                port,
-                vendor_id: 0,
-                product_id: 0,
-                device_class: 0,
-                device_subclass: 0,
-                device_protocol: 0,
-                interfaces: Vec::new(),
-            };
-
+            let mut device = UsbDevice::new(slot_id, port, speed);
+            if let Err(e) = self.describe(&mut device) {
+                // Linux: "unable to enumerate USB device"
+                printkln!("xHCI: port {}: unable to enumerate: {:?}", port, e);
+                let _ = self.remove_device(slot_id);
+                continue;
+            }
             printkln!(
-                "xHCI: Device on port {}, slot {}, speed {:?} - addressed",
+                "xHCI: port {} slot {} {:?}: {:04x}:{:04x} class {:02x}, configuration {}, {} interfaces",
                 port,
                 slot_id,
-                speed
+                speed,
+                device.vendor_id,
+                device.product_id,
+                device.device_class,
+                device.config.value,
+                device.interfaces.len()
             );
             self.devices.push(device);
         }
@@ -1891,13 +2182,12 @@ impl UsbController for XhciController {
 
     fn control_transfer(
         &mut self,
-        _device: &UsbDevice,
-        _setup: &SetupPacket,
-        _data: Option<&mut [u8]>,
+        device: &UsbDevice,
+        setup: &SetupPacket,
+        data: Option<&mut [u8]>,
     ) -> Result<usize, UsbError> {
-        // Full control transfer implementation would go here
-        // For now, we have EP0 Transfer Ring but need to implement the TRB submission
-        Err(UsbError::NoResources)
+        let buf = data.unwrap_or(&mut []);
+        self.do_control(device.slot_id, setup, buf, XHCI_TRANSFER_US)
     }
 
     fn bulk_out(
@@ -1943,6 +2233,53 @@ mod tests {
         assert_eq!(hcs_max_scratchpad(4 << 27), 4);
         assert_eq!(hcs_max_scratchpad(1 << 21), 32);
         assert_eq!(hcs_max_scratchpad(0xffff_ffff), 1023);
+    }
+
+    fn ep(ep_type: EndpointType, max_packet_size: u16, interval: u8) -> UsbEndpoint {
+        UsbEndpoint {
+            address: 0x81,
+            ep_type,
+            max_packet_size,
+            interval,
+            max_burst: 0,
+            bytes_per_interval: 0,
+        }
+    }
+
+    #[test]
+    fn endpoint_params() {
+        // full-speed interrupt, 10 ms: 80 microframes -> 2^6
+        let p = ep_params(&ep(EndpointType::Interrupt, 8, 10), UsbSpeed::Full);
+        assert_eq!((p.interval, p.esit, p.burst), (6, 8, 0));
+        // clamped to 2^3..2^10 microframes
+        let low = ep_params(&ep(EndpointType::Interrupt, 8, 1), UsbSpeed::Low);
+        assert_eq!(low.interval, 3);
+        let long = ep_params(&ep(EndpointType::Interrupt, 8, 255), UsbSpeed::Full);
+        assert_eq!(long.interval, 10);
+        // high speed, 2 extra transactions: burst 2, payload 3 packets
+        let hs = ep(EndpointType::Interrupt, 1024 | (2 << 11), 4);
+        let p = ep_params(&hs, UsbSpeed::High);
+        assert_eq!(
+            (p.max_packet, p.burst, p.interval, p.esit),
+            (1024, 2, 3, 3072)
+        );
+        // bulk: no interval or payload; SuperSpeed burst from the companion
+        let mut b = ep(EndpointType::Bulk, 1024, 0);
+        b.max_burst = 15;
+        let p = ep_params(&b, UsbSpeed::Super);
+        assert_eq!(
+            (p.max_packet, p.burst, p.interval, p.esit),
+            (1024, 15, 0, 0)
+        );
+        assert_eq!(ep_params(&b, UsbSpeed::High).burst, 0);
+    }
+
+    #[test]
+    fn command_trb() {
+        let t = slot_trb(trb_type::RESET_ENDPOINT, 3, 1, 0);
+        assert_eq!(t.get_type(), trb_type::RESET_ENDPOINT);
+        assert_eq!(t.control >> 24, 3);
+        assert_eq!((t.control >> 16) & 0x1f, 1);
     }
 
     #[test]

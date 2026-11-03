@@ -2966,7 +2966,18 @@ context. `dma_alloc_coherent` allocates frames (thread context only).
 DMA buffers never live on a kernel stack (stacks are not in the linear
 map, `mm::vmstack`; `DirectDmaOps` panics on one): the mass-storage
 CBW/CSW and the INQUIRY/READ CAPACITY data are heap buffers, the
-console's output goes through `BOUNCE`.
+console's output goes through `BOUNCE`; control transfers bounce
+through a coherent buffer of their own.
+
+Enumeration (descriptor reads, Evaluate Context, Configure Endpoint,
+SET_CONFIGURATION) runs in the xHCI probe on the controller it owns,
+before it is published in `USB_CONTROLLER`: no lock. The devices are
+then registered under the PCI device's lock: the root hub `usb1`, its
+generic driver's probe adding the interfaces under `usb1`'s device
+lock, then each port's device the same way, so device locks nest PCI
+function -> usb_device -> interface (parent before child, as Linux);
+interface drivers' probes (usb-storage's SCSI scan) take
+`USB_CONTROLLER` per transfer under them.
 
 **ISR Pattern:** The xHCI ISR sets `interrupt_pending` atomic but does NOT acquire
 `USB_CONTROLLER` mutex. This avoids IRQ-context deadlock since the mutex is not

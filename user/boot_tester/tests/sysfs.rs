@@ -9,7 +9,7 @@ use hk_syscall::{
     sys_open, sys_read, sys_readlink, sys_stat, sys_statfs,
 };
 
-use super::helpers::{host_mode, print, print_num, println, read_file};
+use super::helpers::{host_mode, print, print_num, println, read_file, skip};
 use super::nl::{nladdr, recv_creds};
 
 const EACCES: i64 = -13;
@@ -28,6 +28,7 @@ pub fn run_tests() {
     test_bus_pci();
     test_bus_virtio();
     test_block();
+    test_bus_usb();
 }
 
 fn fail(name: &[u8], why: &[u8], v: i64) {
@@ -715,6 +716,128 @@ fn test_block() {
                 return fail(N, b"partition", j as i64);
             }
         }
+    }
+    ok(N);
+}
+
+/// `%04x\n` (Linux idVendor/idProduct)
+fn hex4(b: &[u8]) -> Option<u32> {
+    let v = b.strip_suffix(b"\n")?;
+    if v.len() != 4 || v.iter().any(|c| c.is_ascii_uppercase()) {
+        return None;
+    }
+    v.iter().try_fold(0u32, |a, &c| Some(a * 16 + (c as char).to_digit(16)?))
+}
+
+/// `%x` of `v`, into `out`: its length
+fn lower_hex(v: u32, out: &mut [u8; 8]) -> usize {
+    let digits = (1..8).find(|&d| v >> (4 * d) == 0).unwrap_or(8);
+    for i in 0..digits {
+        let d = (v >> (4 * (digits - 1 - i))) & 0xf;
+        out[i] = b"0123456789abcdef"[d as usize];
+    }
+    digits
+}
+
+/// The value of `key` ("KEY=") among uevent lines
+fn uevent_var<'a>(u: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
+    u.split(|&c| c == b'\n').find_map(|l| l.strip_prefix(key))
+}
+
+/// /sys/bus/usb/devices: each usb_device's idVendor/idProduct (%04x)
+/// agree with its uevent PRODUCT, BUSNUM/DEVNUM with busnum/devnum;
+/// each interface's modalias names its device's ids (upper hex) and is
+/// its uevent MODALIAS. On hk the root hub is 1d6b:0002 and the boot
+/// disk's interface is bound to usb-storage; the Linux reference VM
+/// may have no USB devices at all
+fn test_bus_usb() {
+    const N: &[u8] = b"SYSFS_BUS_USB";
+    let base: &[u8] = b"/sys/bus/usb/devices/";
+    let mut sb = [0u8; 256];
+    if stat(path(&mut sb, &[base])).is_err() {
+        if host_mode() {
+            return skip(N, b"no /sys/bus/usb");
+        }
+        return fail(N, b"no /sys/bus/usb", 0);
+    }
+    let devs = Names::of(b"/sys/bus/usb/devices\0", DT_LNK);
+    let attr = |d: &[u8], name: &[u8], out: &mut [u8]| -> usize {
+        let mut b = [0u8; 256];
+        read_file(path(&mut b, &[base, d, b"/", name]), out).max(0) as usize
+    };
+    let (mut root_hub, mut storage) = (false, false);
+    for i in 0..devs.n {
+        let d = devs.get(i);
+        let mut u = [0u8; 1024];
+        let un = attr(d, b"uevent", &mut u);
+        let u = &u[..un];
+        let mut v = [0u8; 128];
+        match uevent_var(u, b"DEVTYPE=") {
+            Some(b"usb_device") => {
+                let n = attr(d, b"idVendor", &mut v);
+                let Some(vendor) = hex4(&v[..n]) else {
+                    return fail(N, b"idVendor format", i as i64);
+                };
+                let n = attr(d, b"idProduct", &mut v);
+                let Some(product) = hex4(&v[..n]) else {
+                    return fail(N, b"idProduct format", i as i64);
+                };
+                // PRODUCT=%x/%x/%x
+                let mut want = [0u8; 18];
+                let mut h = [0u8; 8];
+                let a = lower_hex(vendor, &mut h);
+                want[..a].copy_from_slice(&h[..a]);
+                want[a] = b'/';
+                let b = lower_hex(product, &mut h);
+                want[a + 1..a + 1 + b].copy_from_slice(&h[..b]);
+                want[a + 1 + b] = b'/';
+                let p = uevent_var(u, b"PRODUCT=").unwrap_or(b"");
+                if !p.starts_with(&want[..a + b + 2]) {
+                    return fail(N, b"uevent PRODUCT", i as i64);
+                }
+                for (key, name) in [(&b"BUSNUM="[..], &b"busnum"[..]), (b"DEVNUM=", b"devnum")] {
+                    let n = attr(d, name, &mut v);
+                    let num = uevent_var(u, key).unwrap_or(b"");
+                    let num = num.strip_prefix(b"00").or(num.strip_prefix(b"0")).unwrap_or(num);
+                    if num.is_empty() || v[..n].strip_suffix(b"\n") != Some(num) {
+                        return fail(N, b"uevent BUSNUM/DEVNUM", i as i64);
+                    }
+                }
+                let n = attr(d, b"version", &mut v);
+                if n != 6 || v[2] != b'.' {
+                    return fail(N, b"version format", n as i64);
+                }
+                root_hub |= d == b"usb1" && vendor == 0x1d6b && product == 2;
+            }
+            Some(b"usb_interface") => {
+                // The device: the interface's parent directory (the root
+                // hub's interfaces are 1-0:1.0 below usb1)
+                let mut id = [0u8; 16];
+                let n = attr(d, b"../idVendor", &mut id);
+                let Some(vendor) = hex4(&id[..n]) else {
+                    return fail(N, b"interface's idVendor", i as i64);
+                };
+                let mut want = *b"usb:vXXXX";
+                upper_hex(vendor, 4, &mut want[5..]);
+                let n = attr(d, b"modalias", &mut v);
+                if !v[..n].starts_with(&want) {
+                    return fail(N, b"modalias", i as i64);
+                }
+                let m = uevent_var(u, b"MODALIAS=").unwrap_or(b"");
+                if v[..n].strip_suffix(b"\n") != Some(m) || uevent_var(u, b"INTERFACE=").is_none() {
+                    return fail(N, b"uevent MODALIAS/INTERFACE", i as i64);
+                }
+                let mut lb = [0u8; 256];
+                let mut t = [0u8; 256];
+                let p = path(&mut lb, &[base, d, b"/driver\0"]);
+                let n = sys_readlink(p.as_ptr(), t.as_mut_ptr(), t.len() as u64);
+                storage |= n > 0 && t[..n as usize].ends_with(b"/usb-storage");
+            }
+            _ => return fail(N, b"uevent DEVTYPE", i as i64),
+        }
+    }
+    if !host_mode() && !(root_hub && storage) {
+        return fail(N, b"hk: root hub or usb-storage interface", 0);
     }
     ok(N);
 }

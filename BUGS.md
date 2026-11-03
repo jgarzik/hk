@@ -622,9 +622,9 @@ all of them.
   the next one (most likely on the USB serial console, whose transfers
   time out after 100 ms). A timeout should stop the endpoint and move
   its dequeue pointer past the TRB (Linux xhci_handle_cmd_stop_ep).
-  Bulk transfers already match their own TRB (`wait_for_trb`) and
-  leak a timed-out transfer's bounce buffer, so a late completion is
-  dropped and its write lands nowhere in use; control transfers and
+  Bulk and control transfers already match their own TRBs
+  (`wait_for_trbs`) and leak a timed-out transfer's bounce buffer, so
+  a late completion is dropped and its write lands nowhere in use;
   commands still match by slot and endpoint only.
 - One controller only: the driver keeps a single global
   `USB_CONTROLLER`; a second xHCI's probe replaces the first, which is
@@ -634,12 +634,47 @@ all of them.
   via `?`) without `dma_unmap` and with its TRB still queued; the
   buffer (heap, freed by the caller) can still be written by the
   controller.
-- Enumeration reads no descriptors and sends no SET_CONFIGURATION
-  (`control_transfer` is a stub); devices get class 0 and no
-  interfaces. No hub support (route string 0).
-- `UsbMscBusDriver::matches` accepts any device and assumes QEMU's
-  endpoints (0x81/0x02); `main.rs` makes `sda` of the first one.
+- No hub support (route string 0): devices behind a hub are not
+  enumerated.
+- Only bulk and interrupt endpoints are added to the controller
+  (`configure_endpoints`): isochronous and non-default control
+  endpoints are skipped. A control data stage is one TRB of at most a
+  page: a configuration descriptor longer than 4 KiB is cut short.
 - Only 4 KiB controller pages and up to 512 scratchpad buffers.
+- The console recursion guard `USB_OUTPUT_ACTIVE` is one global flag:
+  a CPU dropping `USB_CONTROLLER` clears it while another CPU, now
+  the holder, may printk under the lock (an xHCI error message); the
+  live FTDI console then spins on the lock its own CPU holds.
+
+## USB core gaps
+
+**Location**: `hw/usb/usbcore.rs`, `hw/usb/xhci.rs`, `hw/usb/msc.rs`,
+`hw/usb/serial.rs`
+
+- One root hub: Linux gives an xHCI two (`usb1` USB 2.0 and `usb2`
+  USB 3.0, from the Supported Protocol capabilities, each numbering
+  its own ports); hk has `usb1` only and names every device
+  `1-<xHCI port>`, SuperSpeed ones too (Linux: `2-<port>`).
+- No hub driver (Linux "hub", hub_probe/hub_event): the root hub's
+  interface `1-0:1.0` stays unbound, `maxchild` is 0, and devices are
+  found once by the xHCI probe (no connect/disconnect handling).
+- No usbfs: no /dev/bus/usb/BBB/DDD (char major 189), so usb_device
+  uevents lack MAJOR/MINOR/DEVNAME; no "usbfs" interface driver.
+- sysfs subset: no string descriptors (`manufacturer`, `product`,
+  `serial`, `configuration`, interface `interface`), no `descriptors`,
+  `authorized`, `removable`, `quirks`, `urbnum`, `power/`, `ep_XX/`;
+  `bConfigurationValue` is read-only (Linux: writing it sets the
+  configuration).
+- The configuration is always the first (Linux
+  usb_choose_configuration) and is set at enumeration, not by the
+  generic driver's probe; no SET_INTERFACE (alternate settings stay at
+  0).
+- usb-storage: SCSI transparent command set over Bulk-Only Transport
+  only (no CB/CBI, RBC/UFI/8070 subclasses, UAS, or unusual_devs
+  quirks).
+- ftdi_sio: a console only, for the FT232 (0403:6001): no usb-serial
+  bus or ttyUSB0 tty device, no baud rate or modem control requests,
+  the bulk IN endpoint is never read.
 
 ## No DMA for 32-bit devices with RAM above 4GB
 

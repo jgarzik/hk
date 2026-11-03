@@ -154,7 +154,9 @@ impl Trb {
         trb.set_type(TrbType::DATA_STAGE);
         trb.set_transfer_length(len);
         if is_in {
-            trb.control |= 1 << 16; // Direction bit: 1=IN
+            // Direction IN, and an event on a short packet (Linux sets
+            // TRB_ISP for IN data stages only)
+            trb.control |= (1 << 16) | (1 << 2);
         }
         trb
     }
@@ -330,14 +332,53 @@ impl TransferRing {
         if self.cycle { addr | 1 } else { addr }
     }
 
+    /// The enqueue position with its cycle state (DCS in bit 0): where a
+    /// Set TR Dequeue Pointer command moves a halted endpoint
+    pub fn enqueue_ptr(&self) -> u64 {
+        let addr = self.dma.dma_addr().as_u64() + (self.enqueue * 16) as u64;
+        addr | self.cycle as u64
+    }
+
+    /// Enqueue the TRBs of one TD and return their DMA addresses. The
+    /// first is written with the wrong cycle bit and given the right one
+    /// last, so the controller never starts on a partial TD (Linux
+    /// giveback_first_trb)
+    pub fn enqueue_td(&mut self, trbs: &[Trb]) -> alloc::vec::Vec<u64> {
+        let first = self.enqueue;
+        let cycle = self.cycle;
+        let mut addrs = alloc::vec::Vec::with_capacity(trbs.len());
+        for (i, trb) in trbs.iter().enumerate() {
+            addrs.push(self.write(*trb, if i == 0 { !self.cycle } else { self.cycle }));
+        }
+        if !trbs.is_empty() {
+            // SAFETY: `first` < size: a TRB slot of this ring's page
+            let p = unsafe { (self.dma.cpu_addr() as *mut Trb).add(first) };
+            // SAFETY: as above; the ring is only touched under its owner's
+            // lock
+            unsafe {
+                let mut t = read_volatile(p);
+                t.set_cycle(cycle);
+                fence(Ordering::SeqCst);
+                write_volatile(p, t);
+            }
+            fence(Ordering::SeqCst);
+        }
+        addrs
+    }
+
     /// Enqueue a TRB and return its DMA address
-    pub fn enqueue(&mut self, mut trb: Trb) -> u64 {
+    pub fn enqueue(&mut self, trb: Trb) -> u64 {
+        self.write(trb, self.cycle)
+    }
+
+    /// Write `trb` with cycle bit `cycle` at the enqueue position and
+    /// advance it
+    fn write(&mut self, mut trb: Trb, cycle: bool) -> u64 {
         let index = self.enqueue;
         let trbs = self.dma.cpu_addr() as *mut Trb;
         let trb_ptr = unsafe { trbs.add(index) };
 
-        // Set cycle bit to make TRB valid
-        trb.set_cycle(self.cycle);
+        trb.set_cycle(cycle);
 
         // Memory barrier before writing
         fence(Ordering::SeqCst);
