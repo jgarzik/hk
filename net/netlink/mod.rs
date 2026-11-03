@@ -1,7 +1,8 @@
 //! AF_NETLINK sockets (Linux net/netlink/af_netlink.c)
 //!
 //! Protocols are described by `NlProto` (Linux netlink_kernel_cfg):
-//! NETLINK_ROUTE (`rtnetlink.rs`); others are EPROTONOSUPPORT. A socket is identified by its port id (`nl_pid`):
+//! NETLINK_ROUTE (`rtnetlink.rs`) and NETLINK_KOBJECT_UEVENT (kernel
+//! to user only, `base/uevent.rs`); others are EPROTONOSUPPORT. A socket is identified by its port id (`nl_pid`):
 //! bound explicitly, or autobound on first use to the process's tgid, then
 //! to unique negative values. Multicast groups are a bitmap; kernel
 //! notifications go to every subscribed socket of the namespace.
@@ -54,6 +55,7 @@ use crate::util::error::KernelError;
 
 pub const AF_NETLINK: i32 = 16;
 pub const NETLINK_ROUTE: i32 = 0;
+pub const NETLINK_KOBJECT_UEVENT: i32 = 15;
 pub const SOL_NETLINK: i32 = 270;
 
 /// Socket options (level SOL_NETLINK)
@@ -154,10 +156,16 @@ static ROUTE: NlProto = NlProto {
     input: Some(rtnetlink::rcv),
 };
 
+static UEVENT: NlProto = NlProto {
+    ngroups: 1,
+    input: None,
+};
+
 /// The protocol of socket(AF_NETLINK, _, `protocol`)
 fn proto(protocol: i32) -> Option<&'static NlProto> {
     match protocol {
         NETLINK_ROUTE => Some(&ROUTE),
+        NETLINK_KOBJECT_UEVENT => Some(&UEVENT),
         _ => None,
     }
 }

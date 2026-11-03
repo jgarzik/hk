@@ -3,6 +3,7 @@
 
 pub mod class;
 pub mod core;
+pub mod uevent;
 
 pub use class::Class;
 pub use core::{DevNode, Device, DeviceInfo, device_create};

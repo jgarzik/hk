@@ -1733,6 +1733,11 @@ at a time, with no RENAME_LOCK held (d_move drops it first).
 Device model (base/): `Class.devices` (spin Mutex, leaf; Linux
 klist_devices) is taken alone, after the device's sysfs entries exist.
 
+uevents (base/uevent.rs) broadcast with `ns::net::NET_NAMESPACE_LIST`
+(spin Mutex, leaf; Linux net_namespace_list) taken only to snapshot
+the namespaces, then each namespace's `NlTable.socks` -> `NlSock.rxq`;
+`ksysfs::UEVENT_HELPER` is a spin leaf.
+
 show()/store() run under an active reference (`KNode::get_active`),
 not a lock. `KNode::remove` deactivates the subtree and sleeps until
 active references drain (Linux kernfs_drain), with no lock held: a

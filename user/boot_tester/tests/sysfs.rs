@@ -1,5 +1,6 @@
 //! sysfs tests (hk and Linux): the mount, attribute files (seq_file
-//! read semantics, open permission, lseek), directory link counts.
+//! read semantics, open permission, lseek), directory link counts,
+//! class devices, uevents.
 //! Paths below /sys/devices differ between the kernels; tests use only
 //! what both have.
 
@@ -9,6 +10,7 @@ use hk_syscall::{
 };
 
 use super::helpers::{print, print_num, println, read_file};
+use super::nl::{nladdr, recv_creds};
 
 const EACCES: i64 = -13;
 const SYSFS_MAGIC: i64 = 0x6265_6572;
@@ -21,6 +23,7 @@ pub fn run_tests() {
     println(b"=== sysfs Tests ===");
     test_basic();
     test_class_mem();
+    test_uevent_synth();
 }
 
 fn fail(name: &[u8], why: &[u8], v: i64) {
@@ -225,4 +228,152 @@ fn test_class_mem() {
         }
     }
     ok(N);
+}
+
+const NETLINK_KOBJECT_UEVENT: i32 = 15;
+
+/// A socket on uevent group 1 with SO_PASSCRED
+fn uevent_sock() -> Option<i32> {
+    use hk_syscall::{SOCK_CLOEXEC, SOCK_DGRAM, sys_bind, sys_setsockopt, sys_socket};
+    let fd = sys_socket(16, SOCK_DGRAM | SOCK_CLOEXEC, NETLINK_KOBJECT_UEVENT);
+    if fd < 0 {
+        return None;
+    }
+    let fd = fd as i32;
+    let a = nladdr(0, 1);
+    let one: i32 = 1;
+    let pc = sys_setsockopt(fd, 1, 16, &one as *const i32 as *const u8, 4);
+    if sys_bind(fd, a.as_ptr(), 12) != 0 || pc != 0 {
+        sys_close(fd as u64);
+        return None;
+    }
+    Some(fd)
+}
+
+fn write_str(path: &[u8], data: &[u8]) -> i64 {
+    let fd = sys_open(path.as_ptr(), O_WRONLY, 0);
+    if fd < 0 {
+        return fd;
+    }
+    let r = hk_syscall::sys_write(fd as u64, data.as_ptr(), data.len() as u64);
+    sys_close(fd as u64);
+    r
+}
+
+/// Receive into `buf` until a message with header `head` arrives
+/// (skipping other devices' events): its length and the sender's
+/// credentials
+fn next_event(fd: i32, head: &[u8], buf: &mut [u8]) -> Option<(usize, (i32, u32, u32))> {
+    for _ in 0..16 {
+        let (n, c) = recv_creds(fd, buf);
+        if n <= 0 {
+            return None;
+        }
+        if vars(&buf[..n as usize]).next() == Some(head) {
+            return Some((n as usize, c?));
+        }
+    }
+    None
+}
+
+/// The NUL-separated strings of a uevent message (header first)
+fn vars(m: &[u8]) -> impl Iterator<Item = &[u8]> {
+    m.split(|&b| b == 0).filter(|p| !p.is_empty())
+}
+
+fn num(d: &[u8]) -> u64 {
+    d.iter()
+        .take_while(|d| d.is_ascii_digit())
+        .fold(0u64, |a, &d| a * 10 + (d - b'0') as u64)
+}
+
+/// The variables after the header are exactly `want`, then SEQNUM;
+/// returns its value
+fn exact_vars(m: &[u8], want: &[&[u8]]) -> Option<u64> {
+    let mut it = vars(m).skip(1);
+    for w in want {
+        if it.next()? != *w {
+            return None;
+        }
+    }
+    let seq = num(it.next()?.strip_prefix(b"SEQNUM=")?);
+    if it.next().is_some() { None } else { Some(seq) }
+}
+
+/// Writing to a device's uevent file: the synthetic event's header,
+/// variables in Linux order, root credentials, SEQNUM matching
+/// /sys/kernel/uevent_seqnum; UUID arguments; malformed writes EINVAL
+fn test_uevent_synth() {
+    const N: &[u8] = b"UEVENT_SYNTH";
+    let Some(fd) = uevent_sock() else {
+        return fail(N, b"socket", 0);
+    };
+    let r = (|| {
+        let ue = b"/sys/class/mem/null/uevent\0";
+        if write_str(ue, b"add\n") != 4 {
+            return Err((&b"write add"[..], 0));
+        }
+        let mut buf = [0u8; 2048];
+        let Some((n, cred)) = next_event(fd, b"add@/devices/virtual/mem/null", &mut buf) else {
+            return Err((&b"no add event"[..], 0));
+        };
+        let want: [&[u8]; 8] = [
+            b"ACTION=add",
+            b"DEVPATH=/devices/virtual/mem/null",
+            b"SUBSYSTEM=mem",
+            b"SYNTH_UUID=0",
+            b"MAJOR=1",
+            b"MINOR=3",
+            b"DEVNAME=null",
+            b"DEVMODE=0666",
+        ];
+        let Some(seq) = exact_vars(&buf[..n], &want) else {
+            return Err((&b"variables"[..], n as i64));
+        };
+        if cred != (0, 0, 0) {
+            return Err((&b"creds pid"[..], cred.0 as i64));
+        }
+        let mut b = [0u8; 32];
+        let k = read_file(b"/sys/kernel/uevent_seqnum\0", &mut b);
+        let cur = num(&b[..k.max(0) as usize]);
+        if cur < seq {
+            return Err((&b"uevent_seqnum"[..], cur as i64));
+        }
+        let arg = b"change 01234567-89ab-cdef-0123-456789abcdef A=1 bc=xy";
+        if write_str(ue, arg) != arg.len() as i64 {
+            return Err((&b"write change"[..], 0));
+        }
+        let head = b"change@/devices/virtual/mem/null";
+        let Some((n, _)) = next_event(fd, head, &mut buf) else {
+            return Err((&b"no change event"[..], 0));
+        };
+        let want: [&[u8]; 10] = [
+            b"ACTION=change",
+            b"DEVPATH=/devices/virtual/mem/null",
+            b"SUBSYSTEM=mem",
+            b"SYNTH_UUID=01234567-89ab-cdef-0123-456789abcdef",
+            b"SYNTH_ARG_A=1",
+            b"SYNTH_ARG_bc=xy",
+            b"MAJOR=1",
+            b"MINOR=3",
+            b"DEVNAME=null",
+            b"DEVMODE=0666",
+        ];
+        match exact_vars(&buf[..n], &want) {
+            Some(s2) if s2 > seq => {}
+            _ => return Err((&b"synth args"[..], n as i64)),
+        }
+        for bad in [&b"frob"[..], b"add zzz", b"add 01234567-89ab-cdef-0123-456789abcdef A"] {
+            let r = write_str(ue, bad);
+            if r != -22 {
+                return Err((&b"malformed"[..], r));
+            }
+        }
+        Ok(())
+    })();
+    sys_close(fd as u64);
+    match r {
+        Ok(()) => ok(N),
+        Err((why, v)) => fail(N, why, v),
+    }
 }

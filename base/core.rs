@@ -5,7 +5,8 @@
 //! device with a non-class parent sits in the parent's `<class>` glue
 //! directory (Linux get_device_parent). `device_add` creates its
 //! `uevent` and `dev` attributes, the `subsystem`/`device` links, the
-//! class link, `/sys/dev/{char,block}/M:m` and the devtmpfs node.
+//! class link, `/sys/dev/{char,block}/M:m` and the devtmpfs node, then
+//! sends the "add" uevent; `del` sends "remove" first.
 //!
 //! ## Locking
 //!
@@ -86,7 +87,8 @@ pub struct Device {
     me: Weak<Device>,
 }
 
-/// The `uevent` attribute: the device's environment (Linux uevent_show)
+/// The `uevent` attribute: the device's environment (Linux
+/// uevent_show); a write sends a synthetic event (uevent_store)
 struct UeventAttr(Weak<Device>);
 
 impl Attr for UeventAttr {
@@ -98,6 +100,12 @@ impl Attr for UeventAttr {
             }
         }
         Ok(())
+    }
+
+    fn store(&self, data: &[u8]) -> Result<usize, KernelError> {
+        let d = self.0.upgrade().ok_or(KernelError::NoDevice)?;
+        super::uevent::synth_uevent(&d, data)?;
+        Ok(data.len())
     }
 }
 
@@ -131,6 +139,11 @@ impl Device {
             name: self.name.replace('!', "/"),
             mode: 0,
         }
+    }
+
+    /// SUBSYSTEM of its uevents: the class name (Linux dev_uevent_name)
+    pub fn subsystem(&self) -> Option<&'static str> {
+        self.class.map(|c| c.name)
     }
 
     fn is_blk(&self) -> bool {
@@ -216,12 +229,14 @@ impl Device {
             let mode = if n.mode != 0 { n.mode } else { 0o600 };
             crate::fs::devtmpfs::device_add(&n.name, dt, self.is_blk(), mode);
         }
+        super::uevent::uevent(self, super::uevent::Action::Add);
         Ok(())
     }
 
     /// Linux device_del: undo `device_add`
     pub fn del(&self) {
         let Some(dir) = self.kobj.get() else { return };
+        super::uevent::uevent(self, super::uevent::Action::Remove);
         if let Some(dt) = self.devt {
             crate::fs::devtmpfs::device_del(&self.devnode().name);
             let mm = alloc::format!("{}:{}", dt.major, dt.minor);

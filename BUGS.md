@@ -297,6 +297,14 @@ Missing: fs.protected_hardlinks/symlinks/fifos/regular do not exist
 (behave as their kernel default 0); no
 immutable/append-only inodes (no IS_APPEND/IS_IMMUTABLE EPERM).
 
+## uevent gaps
+
+- `/sys/kernel/uevent_helper` stores a path, but no helper is run per
+  event (Linux call_usermodehelper; hk has no usermode helper).
+- NETLINK_KOBJECT_UEVENT has no kernel input: messages a
+  CAP_SYS_ADMIN sender addresses to port 0 are not rebroadcast (Linux
+  uevent_net_rcv, used by container managers).
+
 ## TTY gaps
 
 **Location:** `tty/`, `hw/serial.rs`, `arch/aarch64/serial.rs`.

@@ -14,11 +14,11 @@
 //! - Physical devices belong to the init namespace by default
 //! - Sockets, routes, and ARP entries are namespace-local
 
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use crate::sync::spin::RwLock;
+use crate::sync::spin::{Mutex, RwLock};
 use spin::Lazy;
 
 use crate::net::device::{LinkInfo, NetDevice, NetDeviceOps};
@@ -127,6 +127,8 @@ impl NetNamespace {
             arp: crate::net::neigh::NeighTable::new(&crate::net::arp::ARP_OPS),
             loopback: RwLock::new(None),
         });
+
+        NET_NAMESPACE_LIST.lock().push(Arc::downgrade(&ns));
 
         // Loopback device: ifindex 1, down and without addresses until
         // brought up (then 127.0.0.1/8, like Linux)
@@ -262,6 +264,16 @@ fn create_loopback_device() -> Arc<NetDevice> {
 ///
 /// Physical network devices are registered here. Created lazily on first access.
 pub static INIT_NET_NS: Lazy<Arc<NetNamespace>> = Lazy::new(NetNamespace::new);
+
+/// Every network namespace (Linux net_namespace_list; spin leaf)
+static NET_NAMESPACE_LIST: Mutex<Vec<Weak<NetNamespace>>> = Mutex::new(Vec::new());
+
+/// The live network namespaces (Linux for_each_net)
+pub fn all_net_ns() -> Vec<Arc<NetNamespace>> {
+    let mut l = NET_NAMESPACE_LIST.lock();
+    l.retain(|w| w.strong_count() > 0);
+    l.iter().filter_map(Weak::upgrade).collect()
+}
 
 /// Get the init network namespace
 pub fn init_net_ns() -> Arc<NetNamespace> {
