@@ -15,11 +15,11 @@
 //! - Test 62: fchmodat2() with invalid flags
 //! - Test 63: chroot() - change root directory
 
-use super::helpers::{host_mode, print, print_num, println};
+use super::helpers::{print, print_num, println};
 use hk_syscall::{
     O_CREAT, O_RDWR, O_WRONLY, Stat, Timespec, UTIME_NOW, UTIME_OMIT, sys_chmod, sys_chown,
-    sys_chroot, sys_close, sys_exit, sys_fchmod, sys_fchmodat2, sys_fchown, sys_fork, sys_lchown,
-    sys_lstat, sys_mkdir, sys_open, sys_stat, sys_symlink, sys_umask, sys_unlink, sys_utimensat,
+    sys_chdir, sys_chroot, sys_close, sys_exit, sys_fchmod, sys_fchmodat2, sys_fchown, sys_fork, sys_lchown,
+    sys_getcwd, sys_lstat, sys_mkdir, sys_open, sys_stat, sys_symlink, sys_umask, sys_unlink, sys_utimensat,
     sys_wait4,
 };
 
@@ -436,7 +436,9 @@ fn test_chroot() {
     }
 
     // chroot is permanent for the caller, so do it in a forked child that
-    // reports via exit status: 0 ok, 1 EPERM, 2 other error, 3 not confined
+    // reports via exit status: 0 ok, 1 EPERM, 2 other error, 3 not
+    // confined, 4 cwd outside the root not "(unreachable)", 5 "/.." left
+    // the root, 6 getcwd at the root
     let pid = sys_fork();
     if pid == 0 {
         let ret = sys_chroot(chroot_dir.as_ptr());
@@ -445,10 +447,30 @@ fn test_chroot() {
         } else if ret != 0 {
             sys_exit(2);
         }
-        // hk's chroot does not yet affect path resolution (BUGS.md), so only
-        // verify confinement on Linux: /proc is outside the new root
-        if host_mode() && sys_open(b"/proc\0".as_ptr(), 0, 0) != -2 {
+        // /proc is outside the new root
+        if sys_open(b"/proc\0".as_ptr(), 0, 0) != -2 {
             sys_exit(3);
+        }
+        // The cwd ("/" of the old root) is outside the new one
+        let mut buf = [0u8; 64];
+        let n = sys_getcwd(buf.as_mut_ptr(), buf.len());
+        if n < 14 || buf[..13] != *b"(unreachable)" {
+            sys_exit(4);
+        }
+        // ".." at the root stays there: a file made in the new root is
+        // found through "/.."
+        let fd = sys_open(b"/hk_in_root\0".as_ptr(), O_CREAT | O_WRONLY, 0o644);
+        sys_close(fd as u64);
+        let found = sys_open(b"/../hk_in_root\0".as_ptr(), 0, 0);
+        sys_unlink(b"/hk_in_root\0".as_ptr());
+        if fd < 0 || found < 0 {
+            sys_exit(5);
+        }
+        sys_close(found as u64);
+        sys_chdir(b"/\0".as_ptr());
+        let n = sys_getcwd(buf.as_mut_ptr(), buf.len());
+        if n != 2 || buf[..2] != *b"/\0" {
+            sys_exit(6);
         }
         sys_exit(0);
     }
@@ -460,6 +482,6 @@ fn test_chroot() {
     } else {
         print(b"CHROOT:FAIL: child exit code ");
         print_num(code as i64);
-        println(b" (1=EPERM 2=error 3=not confined)");
+        println(b" (1=EPERM 2=error 3=not confined 4=cwd 5=/.. 6=getcwd)");
     }
 }

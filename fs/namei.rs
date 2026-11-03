@@ -196,8 +196,12 @@ fn walk(
     Ok(cur)
 }
 
-/// The root absolute paths start at and ".." stops at (Linux nd->root)
+/// The root absolute paths start at and ".." stops at (Linux nd->root):
+/// the task's fs root (chroot), else the namespace's
 pub fn nd_root() -> Result<Path, KernelError> {
+    if let Some(fs) = crate::task::percpu::current_fs() {
+        return Ok(fs.get_root());
+    }
     let m = current_mnt_ns().get_root().ok_or(KernelError::NotFound)?;
     Ok(Path::new(m.clone(), m.root.clone()))
 }

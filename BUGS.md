@@ -76,17 +76,6 @@ Planned fix:
 - an `Mmap` RAII type for mmap'd memory;
 - atomics in place of `static mut`.
 
-## chroot() does not affect path resolution (security)
-
-**Location**: `fs/namei.rs` (`walk`, absolute-path lookup)
-
-`sys_chroot` records the new root (`fs.set_root`), but path walking
-always starts absolute paths at the mount namespace root
-(`mnt_ns.get_root_dentry()`) and never consults the task's fs root, so a
-chrooted process can still reach everything. `..` at the chroot root is
-not clamped either. Boot test `CHROOT` only verifies confinement on a
-Linux host (`user/boot_tester/tests/permissions.rs`).
-
 ## Network stack gaps (later phases of the network chunk)
 
 **Location**: `net/`
