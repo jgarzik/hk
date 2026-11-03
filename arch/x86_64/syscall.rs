@@ -9,6 +9,8 @@
 //! (e.g., aarch64) have different syscall numbers.
 #![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
+use crate::syscall::Sys;
+
 use super::cpu::{KERNEL_CODE_SELECTOR, USER_DATA_SELECTOR};
 
 // =============================================================================
@@ -742,13 +744,7 @@ use super::msr::{rdmsr, wrmsr};
 // x86-64 syscall dispatcher
 // =============================================================================
 
-/// x86-64 syscall dispatcher
-///
-/// This function dispatches syscalls based on Linux x86-64 syscall numbers.
-/// It calls generic handlers in vfs_syscall, time_syscall, and sched_syscall.
-///
-/// Called by `entry::do_syscall_64`, which stores the result in the
-/// frame and does the signal work of the return
+/// Dispatch syscall `num` with the argument registers
 pub fn x86_64_syscall_dispatch(
     num: u64,
     arg0: u64,
@@ -758,859 +754,329 @@ pub fn x86_64_syscall_dispatch(
     arg4: u64,
     arg5: u64,
 ) -> u64 {
-    use crate::fs::syscall::{
-        sys_access,
-        sys_chdir,
-        sys_chmod,
-        sys_chown,
-        sys_chroot,
-        sys_close,
-        sys_close_range,
-        sys_dup,
-        sys_dup2,
-        sys_dup3,
-        sys_faccessat,
-        sys_faccessat2,
-        sys_fchdir,
-        sys_fchmod,
-        sys_fchmodat,
-        sys_fchmodat2,
-        sys_fchown,
-        sys_fchownat,
-        // fcntl
-        sys_fcntl,
-        // Sync syscalls
-        sys_fdatasync,
-        sys_fgetxattr,
-        sys_flistxattr,
-        sys_fremovexattr,
-        sys_fsetxattr,
-        sys_fstat,
-        sys_fstatfs,
-        sys_fsync,
-        sys_ftruncate,
-        sys_getcwd,
-        sys_getdents,
-        sys_getdents64,
-        sys_getxattr,
-        // ioctl
-        sys_ioctl,
-        sys_lchown,
-        sys_lgetxattr,
-        sys_link,
-        sys_linkat,
-        sys_listxattr,
-        sys_llistxattr,
-        sys_lremovexattr,
-        sys_lseek,
-        sys_lsetxattr,
-        sys_lstat,
-        sys_mkdir,
-        sys_mkdirat,
-        sys_mknod,
-        sys_mknodat,
-        sys_mount,
-        sys_open,
-        sys_openat,
-        // Pipe syscalls
-        sys_pipe,
-        sys_pipe2,
-        sys_pivot_root,
-        // Poll syscalls
-        sys_poll,
-        sys_ppoll,
-        // Positioned read/write syscalls
-        sys_pread64,
-        sys_preadv,
-        sys_preadv2,
-        // Select syscalls
-        sys_pselect6,
-        sys_pwrite64,
-        sys_pwritev,
-        sys_pwritev2,
-        sys_read,
-        sys_readlink,
-        sys_readlinkat,
-        sys_readv,
-        sys_removexattr,
-        sys_rename,
-        sys_renameat,
-        sys_renameat2,
-        sys_rmdir,
-        sys_select,
-        // Extended attributes
-        sys_setxattr,
-        sys_stat,
-        sys_statfs,
-        sys_statx,
-        sys_symlink,
-        sys_symlinkat,
-        sys_sync,
-        sys_syncfs,
-        sys_truncate,
-        sys_umask,
-        sys_umount2,
-        sys_unlink,
-        sys_unlinkat,
-        sys_utime,
-        sys_utimensat,
-        sys_utimes,
-        sys_write,
-        sys_writev,
-    };
-    use crate::task::exec::{sys_execve, sys_execveat};
-    use crate::task::percpu;
-    use crate::task::syscall::{
-        sys_clone, sys_exit, sys_fork, sys_getegid, sys_geteuid, sys_getgid, sys_getpgid,
-        sys_getpid, sys_getppid, sys_getsid, sys_gettid, sys_getuid, sys_sched_yield, sys_setpgid,
-        sys_setsid, sys_vfork, sys_wait4, sys_waitid,
-    };
-    use crate::time::time_syscall::{
-        sys_adjtimex, sys_clock_getres, sys_clock_gettime, sys_clock_nanosleep, sys_clock_settime,
-        sys_eventfd, sys_eventfd2, sys_gettimeofday, sys_nanosleep, sys_settimeofday, sys_time,
-        sys_timerfd_create, sys_timerfd_gettime, sys_timerfd_settime,
-    };
-
+    let args = [arg0, arg1, arg2, arg3, arg4, arg5];
     match num {
-        SYS_READ => sys_read(arg0 as i32, arg1, arg2) as u64,
-        SYS_WRITE => sys_write(arg0 as i32, arg1, arg2) as u64,
-        SYS_READV => sys_readv(arg0 as i32, arg1, arg2 as i32) as u64,
-        SYS_WRITEV => sys_writev(arg0 as i32, arg1, arg2 as i32) as u64,
-        SYS_PREAD64 => sys_pread64(arg0 as i32, arg1, arg2, arg3 as i64) as u64,
-        SYS_PWRITE64 => sys_pwrite64(arg0 as i32, arg1, arg2, arg3 as i64) as u64,
-        SYS_PREADV => sys_preadv(arg0 as i32, arg1, arg2 as i32, arg3 as i64) as u64,
-        SYS_PWRITEV => sys_pwritev(arg0 as i32, arg1, arg2 as i32, arg3 as i64) as u64,
-        SYS_PREADV2 => sys_preadv2(arg0 as i32, arg1, arg2 as i32, arg3 as i64, arg5 as i32) as u64,
-        SYS_PWRITEV2 => {
-            sys_pwritev2(arg0 as i32, arg1, arg2 as i32, arg3 as i64, arg5 as i32) as u64
-        }
-        SYS_OPEN => sys_open(arg0, arg1 as u32, arg2 as u32) as u64,
-        SYS_CLOSE => sys_close(arg0 as i32) as u64,
-        SYS_CLOSE_RANGE => sys_close_range(arg0 as u32, arg1 as u32, arg2 as u32) as u64,
-        SYS_LSEEK => sys_lseek(arg0 as i32, arg1 as i64, arg2 as i32) as u64,
-        SYS_MMAP => {
-            crate::mm::syscall::sys_mmap(arg0, arg1, arg2 as u32, arg3 as u32, arg4 as i32, arg5)
-                as u64
-        }
-        SYS_MPROTECT => crate::mm::syscall::sys_mprotect(arg0, arg1, arg2 as u32) as u64,
-        SYS_MUNMAP => crate::mm::syscall::sys_munmap(arg0, arg1) as u64,
-        SYS_BRK => crate::mm::syscall::sys_brk(arg0) as u64,
-        SYS_MLOCK => crate::mm::syscall::sys_mlock(arg0, arg1) as u64,
-        SYS_MUNLOCK => crate::mm::syscall::sys_munlock(arg0, arg1) as u64,
-        SYS_MLOCKALL => crate::mm::syscall::sys_mlockall(arg0 as i32) as u64,
-        SYS_MUNLOCKALL => crate::mm::syscall::sys_munlockall() as u64,
-        SYS_MLOCK2 => crate::mm::syscall::sys_mlock2(arg0, arg1, arg2 as i32) as u64,
-        SYS_MSYNC => crate::mm::syscall::sys_msync(arg0, arg1, arg2 as i32) as u64,
-        SYS_MINCORE => crate::mm::syscall::sys_mincore(arg0, arg1, arg2) as u64,
-        SYS_MADVISE => crate::mm::madvise::sys_madvise(arg0, arg1, arg2 as i32) as u64,
-        SYS_MREMAP => crate::mm::syscall::sys_mremap(arg0, arg1, arg2, arg3 as u32, arg4) as u64,
-        SYS_FTRUNCATE => sys_ftruncate(arg0 as i32, arg1 as i64) as u64,
-        SYS_TRUNCATE => sys_truncate(arg0, arg1 as i64) as u64,
-        SYS_STAT => sys_stat(arg0, arg1) as u64,
-        SYS_FSTAT => sys_fstat(arg0 as i32, arg1) as u64,
-        SYS_NEWFSTATAT => crate::fs::stat::sys_fstatat(arg0 as i32, arg1, arg2, arg3 as i32) as u64,
-        SYS_STATFS => sys_statfs(arg0, arg1) as u64,
-        SYS_FSTATFS => sys_fstatfs(arg0 as i32, arg1) as u64,
-        SYS_STATX => sys_statx(arg0 as i32, arg1, arg2 as i32, arg3 as u32, arg4) as u64,
-        SYS_DUP => sys_dup(arg0 as i32) as u64,
-        SYS_DUP2 => sys_dup2(arg0 as i32, arg1 as i32) as u64,
-        SYS_FCNTL => sys_fcntl(arg0 as i32, arg1 as i32, arg2) as u64,
-        SYS_GETPID => sys_getpid(percpu::current_pid()) as u64,
-        SYS_GETTIMEOFDAY => sys_gettimeofday(arg0, arg1) as u64,
-        SYS_GETTID => sys_gettid(percpu::current_tid()) as u64,
-        SYS_GETDENTS => sys_getdents(arg0 as i32, arg1, arg2) as u64,
-        SYS_GETDENTS64 => sys_getdents64(arg0 as i32, arg1, arg2) as u64,
-        SYS_CLOCK_GETTIME => sys_clock_gettime(arg0 as i32, arg1) as u64,
-        SYS_CLOCK_GETRES => sys_clock_getres(arg0 as i32, arg1) as u64,
-        SYS_TIME => sys_time(arg0) as u64,
-        SYS_CLOCK_SETTIME => sys_clock_settime(arg0 as i32, arg1) as u64,
-        SYS_SETTIMEOFDAY => sys_settimeofday(arg0, arg1) as u64,
-        SYS_NANOSLEEP => sys_nanosleep(arg0, arg1) as u64,
-        SYS_CLOCK_NANOSLEEP => sys_clock_nanosleep(arg0 as i32, arg1 as i32, arg2, arg3) as u64,
-        SYS_TIMERFD_CREATE => sys_timerfd_create(arg0 as i32, arg1 as i32) as u64,
-        SYS_TIMERFD_SETTIME => sys_timerfd_settime(arg0 as i32, arg1 as i32, arg2, arg3) as u64,
-        SYS_TIMERFD_GETTIME => sys_timerfd_gettime(arg0 as i32, arg1) as u64,
-        SYS_ADJTIMEX => sys_adjtimex(arg0) as u64,
-        SYS_EVENTFD => sys_eventfd(arg0 as u32) as u64,
-        SYS_EVENTFD2 => sys_eventfd2(arg0 as u32, arg1 as i32) as u64,
-
-        // signalfd syscalls (Section 5)
-        SYS_SIGNALFD => crate::signal::syscall::sys_signalfd(arg0 as i32, arg1, arg2 as i32) as u64,
-        SYS_SIGNALFD4 => {
-            crate::signal::syscall::sys_signalfd4(arg0 as i32, arg1, arg2, arg3 as i32) as u64
-        }
-
-        // inotify syscalls (Section 9.2)
+        SYS_ACCESS => crate::fs::syscall::sys_access(args[0], args[1] as i32) as u64,
+        SYS_ALARM => crate::time::posix_timer::sys_alarm(args[0] as u32) as u64,
+        SYS_ARCH_PRCTL => crate::task::syscall::sys_arch_prctl(args[0] as i32, args[1]) as u64,
+        SYS_CHMOD => crate::fs::syscall::sys_chmod(args[0], args[1] as u32) as u64,
+        SYS_CHOWN => crate::fs::syscall::sys_chown(args[0], args[1] as u32, args[2] as u32) as u64,
+        SYS_DUP2 => crate::fs::syscall::sys_dup2(args[0] as i32, args[1] as i32) as u64,
+        SYS_EPOLL_CREATE => crate::io::epoll::sys_epoll_create(args[0] as i32) as u64,
+        SYS_EPOLL_WAIT => crate::io::epoll::sys_epoll_wait(
+            args[0] as i32,
+            args[1],
+            args[2] as i32,
+            args[3] as i32,
+        ) as u64,
+        SYS_EVENTFD => crate::time::time_syscall::sys_eventfd(args[0] as u32) as u64,
+        SYS_FORK => crate::task::syscall::sys_fork() as u64,
+        SYS_GETDENTS => crate::fs::syscall::sys_getdents(args[0] as i32, args[1], args[2]) as u64,
         SYS_INOTIFY_INIT => crate::io::inotify::sys_inotify_init() as u64,
-        SYS_INOTIFY_INIT1 => crate::io::inotify::sys_inotify_init1(arg0 as i32) as u64,
-        SYS_INOTIFY_ADD_WATCH => {
-            crate::io::inotify::sys_inotify_add_watch(arg0 as i32, arg1, arg2 as u32) as u64
-        }
-        SYS_INOTIFY_RM_WATCH => {
-            crate::io::inotify::sys_inotify_rm_watch(arg0 as i32, arg1 as i32) as u64
-        }
-
-        // fanotify syscalls (Section 9.2)
-        SYS_FANOTIFY_INIT => {
-            crate::io::fanotify::sys_fanotify_init(arg0 as u32, arg1 as u32) as u64
-        }
-        SYS_FANOTIFY_MARK => crate::io::fanotify::sys_fanotify_mark(
-            arg0 as i32,
-            arg1 as u32,
-            arg2,
-            arg3 as i32,
-            arg4,
-        ) as u64,
-
-        // epoll syscalls (Section 9.1)
-        SYS_EPOLL_CREATE => crate::io::epoll::sys_epoll_create(arg0 as i32) as u64,
-        SYS_EPOLL_CREATE1 => crate::io::epoll::sys_epoll_create1(arg0 as i32) as u64,
-        SYS_EPOLL_CTL => {
-            crate::io::epoll::sys_epoll_ctl(arg0 as i32, arg1 as i32, arg2 as i32, arg3) as u64
-        }
-        SYS_EPOLL_WAIT => {
-            crate::io::epoll::sys_epoll_wait(arg0 as i32, arg1, arg2 as i32, arg3 as i32) as u64
-        }
-        SYS_EPOLL_PWAIT => crate::io::epoll::sys_epoll_pwait(
-            arg0 as i32,
-            arg1,
-            arg2 as i32,
-            arg3 as i32,
-            arg4,
-            arg5,
-        ) as u64,
-        SYS_EPOLL_PWAIT2 => {
-            crate::io::epoll::sys_epoll_pwait2(arg0 as i32, arg1, arg2 as i32, arg3, arg4, arg5)
-                as u64
-        }
-
-        // io_uring syscalls (Section 9.3)
-        SYS_IO_URING_SETUP => crate::io::io_uring::sys_io_uring_setup(arg0 as u32, arg1) as u64,
-        SYS_IO_URING_ENTER => crate::io::io_uring::sys_io_uring_enter(
-            arg0 as u32,
-            arg1 as u32,
-            arg2 as u32,
-            arg3 as u32,
-            arg4,
-            arg5 as usize,
-        ) as u64,
-        SYS_IO_URING_REGISTER => {
-            crate::io::io_uring::sys_io_uring_register(arg0 as u32, arg1 as u32, arg2, arg3 as u32)
-                as u64
-        }
-
-        // POSIX timer syscalls (Section 6.2)
-        SYS_GETITIMER => crate::time::posix_timer::sys_getitimer(arg0 as i32, arg1) as u64,
-        SYS_SETITIMER => crate::time::posix_timer::sys_setitimer(arg0 as i32, arg1, arg2) as u64,
-        SYS_ALARM => crate::time::posix_timer::sys_alarm(arg0 as u32) as u64,
-        SYS_TIMER_CREATE => {
-            crate::time::posix_timer::sys_timer_create(arg0 as i32, arg1, arg2) as u64
-        }
-        SYS_TIMER_SETTIME => {
-            crate::time::posix_timer::sys_timer_settime(arg0 as i32, arg1 as i32, arg2, arg3) as u64
-        }
-        SYS_TIMER_GETTIME => crate::time::posix_timer::sys_timer_gettime(arg0 as i32, arg1) as u64,
-        SYS_TIMER_GETOVERRUN => crate::time::posix_timer::sys_timer_getoverrun(arg0 as i32) as u64,
-        SYS_TIMER_DELETE => crate::time::posix_timer::sys_timer_delete(arg0 as i32) as u64,
-
-        // POSIX message queue syscalls (Section 7.4)
-        SYS_MQ_OPEN => crate::ipc::sys_mq_open(arg0, arg1 as i32, arg2 as u32, arg3) as u64,
-        SYS_MQ_UNLINK => crate::ipc::sys_mq_unlink(arg0) as u64,
-        SYS_MQ_TIMEDSEND => {
-            crate::ipc::sys_mq_timedsend(arg0 as i32, arg1, arg2 as usize, arg3 as u32, arg4) as u64
-        }
-        SYS_MQ_TIMEDRECEIVE => {
-            crate::ipc::sys_mq_timedreceive(arg0 as i32, arg1, arg2 as usize, arg3, arg4) as u64
-        }
-        SYS_MQ_NOTIFY => crate::ipc::sys_mq_notify(arg0 as i32, arg1) as u64,
-        SYS_MQ_GETSETATTR => crate::ipc::sys_mq_getsetattr(arg0 as i32, arg1, arg2) as u64,
-
-        SYS_SCHED_YIELD => {
-            sys_sched_yield();
-            0
-        }
-        SYS_EXIT => sys_exit(arg0 as i32),
-
-        // Process IDs & basic info (Section 1.2)
-        SYS_GETPPID => sys_getppid(percpu::current_ppid()) as u64,
-        SYS_GETPGID => {
-            sys_getpgid(arg0 as i32, percpu::current_pid(), percpu::current_pgid()) as u64
-        }
-        SYS_GETSID => sys_getsid(arg0 as i32, percpu::current_pid(), percpu::current_sid()) as u64,
-        SYS_SETPGID => sys_setpgid(
-            arg0 as i32,
-            arg1 as i32,
-            percpu::current_pid(),
-            percpu::current_pgid(),
-            percpu::current_sid(),
-        ) as u64,
-        SYS_SETSID => sys_setsid(percpu::current_pid()) as u64,
-
-        // Credentials (Section 10.1)
-        SYS_GETUID => sys_getuid(percpu::current_cred().uid) as u64,
-        SYS_GETEUID => sys_geteuid(percpu::current_cred().euid) as u64,
-        SYS_GETGID => sys_getgid(percpu::current_cred().gid) as u64,
-        SYS_GETEGID => sys_getegid(percpu::current_cred().egid) as u64,
-        SYS_SETUID => {
-            use crate::task::syscall::sys_setuid;
-            sys_setuid(arg0 as u32, percpu::current_cred()) as u64
-        }
-        SYS_SETGID => {
-            use crate::task::syscall::sys_setgid;
-            sys_setgid(arg0 as u32, percpu::current_cred()) as u64
-        }
-        SYS_SETRESUID => {
-            use crate::task::syscall::sys_setresuid;
-            sys_setresuid(
-                arg0 as u32,
-                arg1 as u32,
-                arg2 as u32,
-                percpu::current_cred(),
-            ) as u64
-        }
-        SYS_GETRESUID => {
-            use crate::arch::Uaccess;
-            use crate::task::syscall::sys_getresuid;
-            sys_getresuid::<Uaccess>(arg0, arg1, arg2, percpu::current_cred()) as u64
-        }
-        SYS_GETGROUPS => {
-            crate::task::syscall::sys_getgroups::<crate::arch::Uaccess>(arg0 as i32, arg1) as u64
-        }
-        SYS_SETGROUPS => {
-            crate::task::syscall::sys_setgroups::<crate::arch::Uaccess>(arg0 as i32, arg1) as u64
-        }
-        SYS_SETRESGID => {
-            use crate::task::syscall::sys_setresgid;
-            sys_setresgid(
-                arg0 as u32,
-                arg1 as u32,
-                arg2 as u32,
-                percpu::current_cred(),
-            ) as u64
-        }
-        SYS_GETRESGID => {
-            use crate::arch::Uaccess;
-            use crate::task::syscall::sys_getresgid;
-            sys_getresgid::<Uaccess>(arg0, arg1, arg2, percpu::current_cred()) as u64
-        }
-        SYS_SETREUID => {
-            use crate::task::syscall::sys_setreuid;
-            sys_setreuid(arg0 as u32, arg1 as u32, percpu::current_cred()) as u64
-        }
-        SYS_SETREGID => {
-            use crate::task::syscall::sys_setregid;
-            sys_setregid(arg0 as u32, arg1 as u32, percpu::current_cred()) as u64
-        }
-        SYS_SETFSUID => {
-            use crate::task::syscall::sys_setfsuid;
-            sys_setfsuid(arg0 as u32, percpu::current_cred()) as u64
-        }
-        SYS_SETFSGID => {
-            use crate::task::syscall::sys_setfsgid;
-            sys_setfsgid(arg0 as u32, percpu::current_cred()) as u64
-        }
-        SYS_CAPGET => {
-            use crate::arch::Uaccess;
-            use crate::task::syscall::sys_capget;
-            sys_capget::<Uaccess>(arg0, arg1) as u64
-        }
-        SYS_CAPSET => {
-            use crate::arch::Uaccess;
-            use crate::task::syscall::sys_capset;
-            sys_capset::<Uaccess>(arg0, arg1) as u64
-        }
-
-        // Process creation (Section 1.1)
-        SYS_CLONE => sys_clone(arg0, arg1, arg2, arg3, arg4) as u64,
-        SYS_CLONE3 => {
-            use crate::task::syscall::sys_clone3;
-            sys_clone3(arg0, arg1) as u64
-        }
-        SYS_FORK => sys_fork() as u64,
-        SYS_VFORK => sys_vfork() as u64,
-        SYS_EXECVE => sys_execve(arg0, arg1, arg2) as u64,
-        SYS_EXECVEAT => sys_execveat(arg0 as i32, arg1, arg2, arg3, arg4 as i32) as u64,
-        SYS_WAIT4 => sys_wait4(arg0 as i32 as i64, arg1, arg2 as i32, arg3) as u64,
-        SYS_WAITID => sys_waitid(arg0 as i32, arg1, arg2, arg3 as i32, arg4) as u64,
-        SYS_EXIT_GROUP => crate::task::proc::sys_exit_group(arg0 as i32),
-
-        // Personality (execution domain)
-        SYS_PERSONALITY => {
-            use crate::task::syscall::sys_personality;
-            sys_personality(arg0 as u32) as u64
-        }
-
-        // I/O port permissions (x86-64 only)
-        SYS_IOPL => {
-            use crate::task::syscall::sys_iopl;
-            sys_iopl(arg0 as u32) as u64
-        }
-        SYS_IOPERM => {
-            use crate::task::syscall::sys_ioperm;
-            sys_ioperm(arg0, arg1, arg2 as i32) as u64
-        }
-
-        // System logging
-        SYS_SYSLOG => {
-            use crate::arch::Uaccess;
-            use crate::task::syscall::sys_syslog;
-            sys_syslog::<Uaccess>(arg0 as i32, arg1, arg2 as i32) as u64
-        }
-
-        // TTY control
-        SYS_VHANGUP => crate::tty::sys_vhangup() as u64,
-
-        // pidfd syscalls
-        SYS_PIDFD_OPEN => {
-            use crate::task::syscall::sys_pidfd_open;
-            sys_pidfd_open(arg0 as i32 as i64, arg1 as u32) as u64
-        }
-        SYS_PIDFD_SEND_SIGNAL => {
-            use crate::task::syscall::sys_pidfd_send_signal;
-            sys_pidfd_send_signal(arg0 as i32, arg1 as i32, arg2, arg3 as u32) as u64
-        }
-        SYS_PIDFD_GETFD => {
-            use crate::task::syscall::sys_pidfd_getfd;
-            sys_pidfd_getfd(arg0 as i32, arg1 as i32, arg2 as u32) as u64
-        }
-
-        // Power management
-        SYS_REBOOT => crate::power::sys_reboot(arg0 as u32, arg1 as u32, arg2 as u32, arg3) as u64,
-
-        // Filesystem syscalls (Section 2.1 / 3.1)
-        SYS_ACCESS => sys_access(arg0, arg1 as i32) as u64,
-        SYS_GETCWD => sys_getcwd(arg0, arg1) as u64,
-        SYS_CHDIR => sys_chdir(arg0) as u64,
-        SYS_FCHDIR => sys_fchdir(arg0 as i32) as u64,
-        SYS_CHROOT => sys_chroot(arg0) as u64,
-        SYS_OPENAT => sys_openat(arg0 as i32, arg1, arg2 as u32, arg3 as u32) as u64,
-        SYS_FACCESSAT => sys_faccessat(arg0 as i32, arg1, arg2 as i32) as u64,
-        SYS_DUP3 => sys_dup3(arg0 as i32, arg1 as i32, arg2 as u32) as u64,
-        SYS_PIPE => sys_pipe(arg0) as u64,
-        SYS_PIPE2 => sys_pipe2(arg0, arg1 as u32) as u64,
-        SYS_POLL => sys_poll(arg0, arg1 as u32, arg2 as i32) as u64,
-        SYS_PPOLL => sys_ppoll(arg0, arg1 as u32, arg2, arg3, arg4) as u64,
-        SYS_SELECT => sys_select(arg0 as i32, arg1, arg2, arg3, arg4) as u64,
-        SYS_PSELECT6 => sys_pselect6(arg0 as i32, arg1, arg2, arg3, arg4, arg5) as u64,
-        SYS_FACCESSAT2 => sys_faccessat2(arg0 as i32, arg1, arg2 as i32, arg3 as i32) as u64,
-
-        // Symlinks and hard links
-        SYS_LSTAT => sys_lstat(arg0, arg1) as u64,
-        SYS_LINK => sys_link(arg0, arg1) as u64,
-        SYS_SYMLINK => sys_symlink(arg0, arg1) as u64,
-        SYS_READLINK => sys_readlink(arg0, arg1, arg2) as u64,
-        SYS_LINKAT => sys_linkat(arg0 as i32, arg1, arg2 as i32, arg3, arg4 as i32) as u64,
-        SYS_SYMLINKAT => sys_symlinkat(arg0, arg1 as i32, arg2) as u64,
-        SYS_READLINKAT => sys_readlinkat(arg0 as i32, arg1, arg2, arg3) as u64,
-
-        // Directory creation/removal
-        SYS_MKDIR => sys_mkdir(arg0, arg1 as u32) as u64,
-        SYS_MKDIRAT => sys_mkdirat(arg0 as i32, arg1, arg2 as u32) as u64,
-        SYS_RMDIR => sys_rmdir(arg0) as u64,
-
-        // File deletion
-        SYS_UNLINK => sys_unlink(arg0) as u64,
-        SYS_UNLINKAT => sys_unlinkat(arg0 as i32, arg1, arg2 as i32) as u64,
-
-        // Node creation
-        SYS_MKNOD => sys_mknod(arg0, arg1 as u32, arg2) as u64,
-        SYS_MKNODAT => sys_mknodat(arg0 as i32, arg1, arg2 as u32, arg3) as u64,
-
-        // Filesystem mounting
-        SYS_MOUNT => sys_mount(arg0, arg1, arg2, arg3, arg4) as u64,
-        SYS_UMOUNT2 => sys_umount2(arg0, arg1 as i32) as u64,
-        SYS_PIVOT_ROOT => sys_pivot_root(arg0, arg1) as u64,
-
-        // Swap management
-        SYS_SWAPON => crate::mm::sys_swapon(arg0, arg1 as i32) as u64,
-        SYS_SWAPOFF => crate::mm::sys_swapoff(arg0) as u64,
-
-        // Sync operations
-        SYS_SYNC => sys_sync() as u64,
-        SYS_FSYNC => sys_fsync(arg0 as i32) as u64,
-        SYS_FDATASYNC => sys_fdatasync(arg0 as i32) as u64,
-        SYS_SYNCFS => sys_syncfs(arg0 as i32) as u64,
-
-        // ioctl
-        SYS_IOCTL => sys_ioctl(arg0 as i32, arg1 as u32, arg2) as u64,
-
-        // splice/sendfile/copy/flock
-        SYS_SENDFILE => {
-            crate::fs::splice::sys_sendfile64(arg0 as i32, arg1 as i32, arg2, arg3 as usize) as u64
-        }
-        SYS_FLOCK => crate::fs::flock::sys_flock(arg0 as i32, arg1 as i32) as u64,
-        SYS_SPLICE => crate::fs::splice::sys_splice(
-            arg0 as i32,
-            arg1,
-            arg2 as i32,
-            arg3,
-            arg4 as usize,
-            arg5 as u32,
-        ) as u64,
-        SYS_TEE => {
-            crate::fs::splice::sys_tee(arg0 as i32, arg1 as i32, arg2 as usize, arg3 as u32) as u64
-        }
-        SYS_VMSPLICE => {
-            crate::fs::splice::sys_vmsplice(arg0 as i32, arg1, arg2 as usize, arg3 as u32) as u64
-        }
-        SYS_FALLOCATE => {
-            crate::fs::misc::sys_fallocate(arg0 as i32, arg1 as i32, arg2 as i64, arg3 as i64)
-                as u64
-        }
-        SYS_COPY_FILE_RANGE => crate::fs::splice::sys_copy_file_range(
-            arg0 as i32,
-            arg1,
-            arg2 as i32,
-            arg3,
-            arg4,
-            arg5 as u32,
-        ) as u64,
-
-        // Permissions
-        SYS_CHMOD => sys_chmod(arg0, arg1 as u32) as u64,
-        SYS_FCHMOD => sys_fchmod(arg0 as i32, arg1 as u32) as u64,
-        SYS_FCHMODAT => sys_fchmodat(arg0 as i32, arg1, arg2 as u32, arg3 as i32) as u64,
-        SYS_FCHMODAT2 => sys_fchmodat2(arg0 as i32, arg1, arg2 as u32, arg3 as i32) as u64,
-
-        // Ownership
-        SYS_CHOWN => sys_chown(arg0, arg1 as u32, arg2 as u32) as u64,
-        SYS_FCHOWN => sys_fchown(arg0 as i32, arg1 as u32, arg2 as u32) as u64,
-        SYS_LCHOWN => sys_lchown(arg0, arg1 as u32, arg2 as u32) as u64,
-        SYS_FCHOWNAT => {
-            sys_fchownat(arg0 as i32, arg1, arg2 as u32, arg3 as u32, arg4 as i32) as u64
-        }
-
-        // File creation mask
-        SYS_UMASK => sys_umask(arg0 as u32) as u64,
-
-        // Timestamps
-        SYS_UTIME => sys_utime(arg0, arg1) as u64,
-        SYS_UTIMES => sys_utimes(arg0, arg1) as u64,
-        SYS_UTIMENSAT => sys_utimensat(arg0 as i32, arg1, arg2, arg3 as i32) as u64,
-
-        // Rename
-        SYS_RENAME => sys_rename(arg0, arg1) as u64,
-        SYS_RENAMEAT => sys_renameat(arg0 as i32, arg1, arg2 as i32, arg3) as u64,
-        SYS_RENAMEAT2 => sys_renameat2(arg0 as i32, arg1, arg2 as i32, arg3, arg4 as u32) as u64,
-
-        // Extended attributes
-        SYS_SETXATTR => sys_setxattr(arg0, arg1, arg2, arg3, arg4 as i32) as u64,
-        SYS_LSETXATTR => sys_lsetxattr(arg0, arg1, arg2, arg3, arg4 as i32) as u64,
-        SYS_FSETXATTR => sys_fsetxattr(arg0 as i32, arg1, arg2, arg3, arg4 as i32) as u64,
-        SYS_GETXATTR => sys_getxattr(arg0, arg1, arg2, arg3) as u64,
-        SYS_LGETXATTR => sys_lgetxattr(arg0, arg1, arg2, arg3) as u64,
-        SYS_FGETXATTR => sys_fgetxattr(arg0 as i32, arg1, arg2, arg3) as u64,
-        SYS_LISTXATTR => sys_listxattr(arg0, arg1, arg2) as u64,
-        SYS_LLISTXATTR => sys_llistxattr(arg0, arg1, arg2) as u64,
-        SYS_FLISTXATTR => sys_flistxattr(arg0 as i32, arg1, arg2) as u64,
-        SYS_REMOVEXATTR => sys_removexattr(arg0, arg1) as u64,
-        SYS_LREMOVEXATTR => sys_lremovexattr(arg0, arg1) as u64,
-        SYS_FREMOVEXATTR => sys_fremovexattr(arg0 as i32, arg1) as u64,
-
-        // UTS namespace (hostname, domainname, system info)
-        SYS_UNAME => crate::ns::uts::sys_uname(arg0) as u64,
-        SYS_SETHOSTNAME => crate::ns::uts::sys_sethostname(arg0, arg1) as u64,
-        SYS_SETDOMAINNAME => crate::ns::uts::sys_setdomainname(arg0, arg1) as u64,
-
-        // Namespace syscalls
-        SYS_UNSHARE => crate::ns::sys_unshare(arg0) as u64,
-        SYS_SETNS => crate::ns::sys_setns(arg0 as i32, arg1 as i32) as u64,
-
-        // Signal syscalls
-        SYS_RT_SIGACTION => {
-            crate::signal::syscall::sys_rt_sigaction(arg0 as u32, arg1, arg2, arg3) as u64
-        }
-        SYS_RT_SIGPROCMASK => {
-            crate::signal::syscall::sys_rt_sigprocmask(arg0 as i32, arg1, arg2, arg3) as u64
-        }
-        SYS_RT_SIGPENDING => crate::signal::syscall::sys_rt_sigpending(arg0, arg1) as u64,
-        SYS_RT_SIGTIMEDWAIT => {
-            crate::signal::syscall::sys_rt_sigtimedwait(arg0, arg1, arg2, arg3) as u64
-        }
-        SYS_SIGALTSTACK => crate::signal::syscall::sys_sigaltstack(arg0, arg1) as u64,
-        SYS_KILL => crate::signal::syscall::sys_kill(arg0 as i32 as i64, arg1 as u32) as u64,
-        SYS_TGKILL => {
-            crate::signal::syscall::sys_tgkill(arg0 as i32 as i64, arg1 as i32 as i64, arg2 as u32)
-                as u64
-        }
-        SYS_TKILL => crate::signal::syscall::sys_tkill(arg0 as i32 as i64, arg1 as u32) as u64,
-        SYS_RT_SIGQUEUEINFO => {
-            crate::signal::syscall::sys_rt_sigqueueinfo(arg0 as i32 as i64, arg1 as u32, arg2)
-                as u64
-        }
-        SYS_RT_SIGSUSPEND => crate::signal::syscall::sys_rt_sigsuspend(arg0, arg1) as u64,
-        SYS_RT_SIGRETURN => super::signal::sys_rt_sigreturn() as u64,
-        SYS_RT_TGSIGQUEUEINFO => crate::signal::syscall::sys_rt_tgsigqueueinfo(
-            arg0 as i32 as i64,
-            arg1 as i32 as i64,
-            arg2 as u32,
-            arg3,
-        ) as u64,
-
-        // membarrier syscall
-        SYS_MEMBARRIER => {
-            crate::task::membarrier::sys_membarrier(arg0 as i32, arg1 as u32, arg2 as i32) as u64
-        }
-
-        SYS_FADVISE64 => {
-            crate::fs::syscall::sys_fadvise64(arg0 as i32, arg1 as i64, arg2 as i64, arg3 as i32)
-                as u64
-        }
-        SYS_SYNC_FILE_RANGE => crate::fs::syscall::sys_sync_file_range(
-            arg0 as i32,
-            arg1 as i64,
-            arg2 as i64,
-            arg3 as u32,
-        ) as u64,
-
-        // readahead syscall
-        SYS_READAHEAD => {
-            crate::fs::syscall::sys_readahead(arg0 as i32, arg1 as i64, arg2 as usize) as u64
-        }
-
-        // NUMA memory policy
-        SYS_GET_MEMPOLICY => {
-            crate::mm::mempolicy::sys_get_mempolicy(arg0, arg1, arg2, arg3, arg4) as u64
-        }
-        SYS_SET_MEMPOLICY => {
-            crate::mm::mempolicy::sys_set_mempolicy(arg0 as i32, arg1, arg2) as u64
-        }
-        SYS_MBIND => {
-            crate::mm::mempolicy::sys_mbind(arg0, arg1, arg2, arg3, arg4, arg5 as u32) as u64
-        }
-        SYS_MIGRATE_PAGES => {
-            crate::mm::mempolicy::sys_migrate_pages(arg0 as i32 as i64, arg1, arg2, arg3) as u64
-        }
-        SYS_MOVE_PAGES => crate::mm::mempolicy::sys_move_pages(
-            arg0 as i32 as i64,
-            arg1,
-            arg2,
-            arg3,
-            arg4,
-            arg5 as i32,
-        ) as u64,
-
-        // Scheduling priority
-        SYS_GETPRIORITY => {
-            use crate::task::syscall::sys_getpriority;
-            sys_getpriority(arg0 as i32, arg1 as i32) as u64
-        }
-        SYS_SETPRIORITY => {
-            use crate::task::syscall::sys_setpriority;
-            sys_setpriority(arg0 as i32, arg1 as i32, arg2 as i32) as u64
-        }
-
-        // I/O priority
-        SYS_IOPRIO_SET => {
-            use crate::task::syscall::sys_ioprio_set;
-            sys_ioprio_set(arg0 as i32, arg1 as i32, arg2 as i32) as u64
-        }
-        SYS_IOPRIO_GET => {
-            use crate::task::syscall::sys_ioprio_get;
-            sys_ioprio_get(arg0 as i32, arg1 as i32) as u64
-        }
-
-        // Thread-local storage and process control
-        SYS_PRCTL => {
-            use crate::task::syscall::sys_prctl;
-            sys_prctl(arg0 as i32, arg1, arg2, arg3, arg4) as u64
-        }
-        SYS_ARCH_PRCTL => {
-            use crate::task::syscall::sys_arch_prctl;
-            sys_arch_prctl(arg0 as i32, arg1) as u64
-        }
-
-        // Ptrace (debugging/tracing)
-        SYS_PTRACE => {
-            crate::task::ptrace::sys_ptrace(arg0 as i64, arg1 as i32 as i64, arg2, arg3) as u64
-        }
-        SYS_SET_TID_ADDRESS => {
-            use crate::task::syscall::sys_set_tid_address;
-            sys_set_tid_address(arg0) as u64
-        }
-        SYS_SECCOMP => crate::seccomp::sys_seccomp(arg0, arg1, arg2) as u64,
-        SYS_BPF => crate::bpf::sys_bpf(arg0 as i32, arg1, arg2 as u32) as u64,
-
-        // Scheduling syscalls (Section 1.3)
-        SYS_SCHED_GETSCHEDULER => {
-            use crate::task::syscall::sys_sched_getscheduler;
-            sys_sched_getscheduler(arg0 as i32 as i64) as u64
-        }
-        SYS_SCHED_SETSCHEDULER => {
-            use crate::arch::Uaccess;
-            use crate::task::syscall::sys_sched_setscheduler;
-            sys_sched_setscheduler::<Uaccess>(arg0 as i32 as i64, arg1 as i32, arg2) as u64
-        }
-        SYS_SCHED_GETPARAM => {
-            use crate::arch::Uaccess;
-            use crate::task::syscall::sys_sched_getparam;
-            sys_sched_getparam::<Uaccess>(arg0 as i32 as i64, arg1) as u64
-        }
-        SYS_SCHED_SETPARAM => {
-            use crate::arch::Uaccess;
-            use crate::task::syscall::sys_sched_setparam;
-            sys_sched_setparam::<Uaccess>(arg0 as i32 as i64, arg1) as u64
-        }
-        SYS_SCHED_GETAFFINITY => {
-            use crate::arch::Uaccess;
-            use crate::task::syscall::sys_sched_getaffinity;
-            sys_sched_getaffinity::<Uaccess>(arg0 as i32 as i64, arg1, arg2) as u64
-        }
-        SYS_SCHED_SETAFFINITY => {
-            use crate::arch::Uaccess;
-            use crate::task::syscall::sys_sched_setaffinity;
-            sys_sched_setaffinity::<Uaccess>(arg0 as i32 as i64, arg1, arg2) as u64
-        }
-        SYS_SCHED_RR_GET_INTERVAL => {
-            use crate::arch::Uaccess;
-            use crate::task::syscall::sys_sched_rr_get_interval;
-            sys_sched_rr_get_interval::<Uaccess>(arg0 as i32 as i64, arg1) as u64
-        }
+        SYS_IOPERM => crate::task::syscall::sys_ioperm(args[0], args[1], args[2] as i32) as u64,
+        SYS_IOPL => crate::task::syscall::sys_iopl(args[0] as u32) as u64,
+        SYS_LCHOWN => {
+            crate::fs::syscall::sys_lchown(args[0], args[1] as u32, args[2] as u32) as u64
+        }
+        SYS_LINK => crate::fs::syscall::sys_link(args[0], args[1]) as u64,
+        SYS_LSTAT => crate::fs::syscall::sys_lstat(args[0], args[1]) as u64,
+        SYS_MKDIR => crate::fs::syscall::sys_mkdir(args[0], args[1] as u32) as u64,
+        SYS_MKNOD => crate::fs::syscall::sys_mknod(args[0], args[1] as u32, args[2]) as u64,
+        SYS_OPEN => crate::fs::syscall::sys_open(args[0], args[1] as u32, args[2] as u32) as u64,
         SYS_PAUSE => crate::signal::syscall::sys_pause() as u64,
-
-        // System information
-        SYS_GETCPU => {
-            use crate::arch::Uaccess;
-            crate::task::syscall::sys_getcpu::<Uaccess>(crate::cpu::this_id(), arg0, arg1) as u64
-        }
-        SYS_SYSINFO => {
-            use crate::arch::Uaccess;
-            use crate::task::syscall::sys_sysinfo;
-            sys_sysinfo::<Uaccess>(arg0) as u64
-        }
-        SYS_TIMES => crate::task::syscall::sys_times::<crate::arch::Uaccess>(arg0) as u64,
-        SYS_GETRUSAGE => {
-            use crate::arch::Uaccess;
-            use crate::task::syscall::sys_getrusage;
-            sys_getrusage::<Uaccess>(arg0 as i32, arg1) as u64
-        }
-        SYS_GETRANDOM => {
-            use crate::arch::Uaccess;
-            use crate::task::syscall::sys_getrandom;
-            sys_getrandom::<Uaccess>(arg0, arg1 as usize, arg2 as u32) as u64
-        }
-        SYS_ACCT => crate::task::acct::sys_acct(arg0) as u64,
-
-        // Resource limits
-        SYS_GETRLIMIT => crate::task::rlimit::sys_getrlimit(arg0 as u32, arg1) as u64,
-        SYS_SETRLIMIT => crate::task::rlimit::sys_setrlimit(arg0 as u32, arg1) as u64,
-        SYS_PRLIMIT64 => {
-            crate::task::rlimit::sys_prlimit64(arg0 as i32, arg1 as u32, arg2, arg3) as u64
-        }
-
-        // Socket syscalls
-        SYS_SOCKET => crate::net::syscall::sys_socket(arg0 as i32, arg1 as i32, arg2 as i32) as u64,
-        SYS_CONNECT => crate::net::syscall::sys_connect(arg0 as i32, arg1, arg2) as u64,
-        SYS_ACCEPT => crate::net::syscall::sys_accept(arg0 as i32, arg1, arg2) as u64,
-        SYS_SENDTO => {
-            crate::net::syscall::sys_sendto(arg0 as i32, arg1, arg2, arg3 as i32, arg4, arg5) as u64
-        }
-        SYS_RECVFROM => {
-            crate::net::syscall::sys_recvfrom(arg0 as i32, arg1, arg2, arg3 as i32, arg4, arg5)
+        SYS_PIPE => crate::fs::syscall::sys_pipe(args[0]) as u64,
+        SYS_POLL => crate::fs::syscall::sys_poll(args[0], args[1] as u32, args[2] as i32) as u64,
+        SYS_READLINK => crate::fs::syscall::sys_readlink(args[0], args[1], args[2]) as u64,
+        SYS_RENAME => crate::fs::syscall::sys_rename(args[0], args[1]) as u64,
+        SYS_RMDIR => crate::fs::syscall::sys_rmdir(args[0]) as u64,
+        SYS_RT_SIGRETURN => super::signal::sys_rt_sigreturn() as u64,
+        SYS_SELECT => {
+            crate::fs::syscall::sys_select(args[0] as i32, args[1], args[2], args[3], args[4])
                 as u64
         }
-        SYS_SHUTDOWN => crate::net::syscall::sys_shutdown(arg0 as i32, arg1 as i32) as u64,
-        SYS_BIND => crate::net::syscall::sys_bind(arg0 as i32, arg1, arg2) as u64,
-        SYS_LISTEN => crate::net::syscall::sys_listen(arg0 as i32, arg1 as i32) as u64,
-        SYS_GETSOCKNAME => crate::net::syscall::sys_getsockname(arg0 as i32, arg1, arg2) as u64,
-        SYS_GETPEERNAME => crate::net::syscall::sys_getpeername(arg0 as i32, arg1, arg2) as u64,
-        SYS_SETSOCKOPT => {
-            crate::net::syscall::sys_setsockopt(arg0 as i32, arg1 as i32, arg2 as i32, arg3, arg4)
-                as u64
+        SYS_SIGNALFD => {
+            crate::signal::syscall::sys_signalfd(args[0] as i32, args[1], args[2] as i32) as u64
         }
-        SYS_GETSOCKOPT => {
-            crate::net::syscall::sys_getsockopt(arg0 as i32, arg1 as i32, arg2 as i32, arg3, arg4)
-                as u64
-        }
-        SYS_ACCEPT4 => {
-            crate::net::syscall::sys_accept4(arg0 as i32, arg1, arg2, arg3 as i32) as u64
-        }
-        SYS_SOCKETPAIR => {
-            crate::net::syscall::sys_socketpair(arg0 as i32, arg1 as i32, arg2 as i32, arg3) as u64
-        }
-        SYS_SENDMSG => crate::net::syscall::sys_sendmsg(arg0 as i32, arg1, arg2 as i32) as u64,
-        SYS_RECVMSG => crate::net::syscall::sys_recvmsg(arg0 as i32, arg1, arg2 as i32) as u64,
-        SYS_SENDMMSG => {
-            crate::net::syscall::sys_sendmmsg(arg0 as i32, arg1, arg2 as u32, arg3 as i32) as u64
-        }
-        SYS_RECVMMSG => {
-            crate::net::syscall::sys_recvmmsg(arg0 as i32, arg1, arg2 as u32, arg3 as i32, arg4)
-                as u64
-        }
-
-        // Futex syscalls
-        SYS_FUTEX => {
-            crate::task::futex::sys_futex(arg0, arg1 as u32, arg2 as u32, arg3, arg4, arg5 as u32)
-                as u64
-        }
-        SYS_SET_ROBUST_LIST => crate::task::futex::sys_set_robust_list(arg0, arg1) as u64,
-        SYS_GET_ROBUST_LIST => {
-            crate::task::futex::sys_get_robust_list(arg0 as i32, arg1, arg2) as u64
-        }
-        SYS_FUTEX_WAITV => {
-            crate::task::futex::sys_futex_waitv(arg0, arg1 as u32, arg2 as u32, arg3, arg4 as i32)
-                as u64
-        }
-
-        // SysV IPC syscalls
-        SYS_SHMGET => crate::ipc::sys_shmget(arg0 as i32, arg1 as usize, arg2 as i32) as u64,
-        SYS_SHMAT => crate::ipc::sys_shmat(arg0 as i32, arg1, arg2 as i32) as u64,
-        SYS_SHMDT => crate::ipc::sys_shmdt(arg0) as u64,
-        SYS_SHMCTL => crate::ipc::sys_shmctl(arg0 as i32, arg1 as i32, arg2) as u64,
-        SYS_SEMGET => crate::ipc::sys_semget(arg0 as i32, arg1 as i32, arg2 as i32) as u64,
-        SYS_SEMOP => crate::ipc::sys_semop(arg0 as i32, arg1, arg2 as usize) as u64,
-        SYS_SEMTIMEDOP => crate::ipc::sys_semtimedop(arg0 as i32, arg1, arg2 as usize, arg3) as u64,
-        SYS_SEMCTL => crate::ipc::sys_semctl(arg0 as i32, arg1 as i32, arg2 as i32, arg3) as u64,
-        SYS_MSGGET => crate::ipc::sys_msgget(arg0 as i32, arg1 as i32) as u64,
-        SYS_MSGSND => crate::ipc::sys_msgsnd(arg0 as i32, arg1, arg2 as usize, arg3 as i32) as u64,
-        SYS_MSGRCV => {
-            crate::ipc::sys_msgrcv(arg0 as i32, arg1, arg2 as usize, arg3 as i64, arg4 as i32)
-                as u64
-        }
-        SYS_MSGCTL => crate::ipc::sys_msgctl(arg0 as i32, arg1 as i32, arg2) as u64,
-
-        // Keyring syscalls (Section 10.3)
-        SYS_ADD_KEY => crate::keys::sys_add_key(arg0, arg1, arg2, arg3, arg4 as i32) as u64,
-        SYS_REQUEST_KEY => crate::keys::sys_request_key(arg0, arg1, arg2, arg3 as i32) as u64,
-        SYS_KEYCTL => crate::keys::sys_keyctl(arg0 as i32, arg1, arg2, arg3, arg4) as u64,
-
-        // Cross-process memory access
-        SYS_PROCESS_VM_READV => {
-            crate::task::process_vm::sys_process_vm_readv(arg0 as i32, arg1, arg2, arg3, arg4, arg5)
-                as u64
-        }
-        SYS_PROCESS_VM_WRITEV => crate::task::process_vm::sys_process_vm_writev(
-            arg0 as i32,
-            arg1,
-            arg2,
-            arg3,
-            arg4,
-            arg5,
-        ) as u64,
-
-        // Process inspection (Section 13)
-        SYS_KCMP => {
-            crate::task::kcmp::sys_kcmp(arg0 as i32, arg1 as i32, arg2 as i32, arg3, arg4) as u64
-        }
-
-        // Syscall stubs (not fully implemented)
-        SYS_RSEQ => {
-            // Restartable sequences - not implemented, return ENOSYS
-            (-38i64) as u64 // ENOSYS
-        }
-        SYS_PERF_EVENT_OPEN => {
-            // Performance monitoring - not supported, return EOPNOTSUPP
-            (-95i64) as u64 // EOPNOTSUPP
-        }
-        SYS_KEXEC_LOAD => {
-            // Kernel execution load - check capability, return ENOSYS
-            if !crate::task::capable(crate::task::CAP_SYS_BOOT) {
-                (-1i64) as u64 // EPERM
-            } else {
-                (-38i64) as u64 // ENOSYS
-            }
-        }
-
-        _ => (-38i64) as u64, // ENOSYS
+        SYS_STAT => crate::fs::syscall::sys_stat(args[0], args[1]) as u64,
+        SYS_SYMLINK => crate::fs::syscall::sys_symlink(args[0], args[1]) as u64,
+        SYS_TIME => crate::time::time_syscall::sys_time(args[0]) as u64,
+        SYS_UNLINK => crate::fs::syscall::sys_unlink(args[0]) as u64,
+        SYS_UTIME => crate::fs::syscall::sys_utime(args[0], args[1]) as u64,
+        SYS_UTIMES => crate::fs::syscall::sys_utimes(args[0], args[1]) as u64,
+        SYS_VFORK => crate::task::syscall::sys_vfork() as u64,
+        _ => match sys_of(num) {
+            Some(s) => crate::syscall::dispatch(s, args),
+            None => crate::util::error::KernelError::NotImplemented.sysret() as u64,
+        },
     }
+}
+
+/// The call this architecture numbers `nr` (Linux unistd.h)
+pub fn sys_of(nr: u64) -> Option<Sys> {
+    Some(match nr {
+        SYS_ACCEPT => Sys::Accept,
+        SYS_ACCEPT4 => Sys::Accept4,
+        SYS_ACCT => Sys::Acct,
+        SYS_ADD_KEY => Sys::AddKey,
+        SYS_ADJTIMEX => Sys::Adjtimex,
+        SYS_BIND => Sys::Bind,
+        SYS_BPF => Sys::Bpf,
+        SYS_BRK => Sys::Brk,
+        SYS_CAPGET => Sys::Capget,
+        SYS_CAPSET => Sys::Capset,
+        SYS_CHDIR => Sys::Chdir,
+        SYS_CHROOT => Sys::Chroot,
+        SYS_CLOCK_GETRES => Sys::ClockGetres,
+        SYS_CLOCK_GETTIME => Sys::ClockGettime,
+        SYS_CLOCK_NANOSLEEP => Sys::ClockNanosleep,
+        SYS_CLOCK_SETTIME => Sys::ClockSettime,
+        SYS_CLONE => Sys::Clone,
+        SYS_CLONE3 => Sys::Clone3,
+        SYS_CLOSE => Sys::Close,
+        SYS_CLOSE_RANGE => Sys::CloseRange,
+        SYS_CONNECT => Sys::Connect,
+        SYS_COPY_FILE_RANGE => Sys::CopyFileRange,
+        SYS_DUP => Sys::Dup,
+        SYS_DUP3 => Sys::Dup3,
+        SYS_EPOLL_CREATE1 => Sys::EpollCreate1,
+        SYS_EPOLL_CTL => Sys::EpollCtl,
+        SYS_EPOLL_PWAIT => Sys::EpollPwait,
+        SYS_EPOLL_PWAIT2 => Sys::EpollPwait2,
+        SYS_EVENTFD2 => Sys::Eventfd2,
+        SYS_EXECVE => Sys::Execve,
+        SYS_EXECVEAT => Sys::Execveat,
+        SYS_EXIT => Sys::Exit,
+        SYS_EXIT_GROUP => Sys::ExitGroup,
+        SYS_FACCESSAT => Sys::Faccessat,
+        SYS_FACCESSAT2 => Sys::Faccessat2,
+        SYS_FADVISE64 => Sys::Fadvise64,
+        SYS_FALLOCATE => Sys::Fallocate,
+        SYS_FANOTIFY_INIT => Sys::FanotifyInit,
+        SYS_FANOTIFY_MARK => Sys::FanotifyMark,
+        SYS_FCHDIR => Sys::Fchdir,
+        SYS_FCHMOD => Sys::Fchmod,
+        SYS_FCHMODAT => Sys::Fchmodat,
+        SYS_FCHMODAT2 => Sys::Fchmodat2,
+        SYS_FCHOWN => Sys::Fchown,
+        SYS_FCHOWNAT => Sys::Fchownat,
+        SYS_FCNTL => Sys::Fcntl,
+        SYS_FDATASYNC => Sys::Fdatasync,
+        SYS_FGETXATTR => Sys::Fgetxattr,
+        SYS_FLISTXATTR => Sys::Flistxattr,
+        SYS_FLOCK => Sys::Flock,
+        SYS_FREMOVEXATTR => Sys::Fremovexattr,
+        SYS_FSETXATTR => Sys::Fsetxattr,
+        SYS_FSTAT => Sys::Fstat,
+        SYS_FSTATFS => Sys::Fstatfs,
+        SYS_FSYNC => Sys::Fsync,
+        SYS_FTRUNCATE => Sys::Ftruncate,
+        SYS_FUTEX => Sys::Futex,
+        SYS_FUTEX_WAITV => Sys::FutexWaitv,
+        SYS_GETCPU => Sys::Getcpu,
+        SYS_GETCWD => Sys::Getcwd,
+        SYS_GETDENTS64 => Sys::Getdents64,
+        SYS_GETEGID => Sys::Getegid,
+        SYS_GETEUID => Sys::Geteuid,
+        SYS_GETGID => Sys::Getgid,
+        SYS_GETGROUPS => Sys::Getgroups,
+        SYS_GETITIMER => Sys::Getitimer,
+        SYS_GETPEERNAME => Sys::Getpeername,
+        SYS_GETPGID => Sys::Getpgid,
+        SYS_GETPID => Sys::Getpid,
+        SYS_GETPPID => Sys::Getppid,
+        SYS_GETPRIORITY => Sys::Getpriority,
+        SYS_GETRANDOM => Sys::Getrandom,
+        SYS_GETRESGID => Sys::Getresgid,
+        SYS_GETRESUID => Sys::Getresuid,
+        SYS_GETRLIMIT => Sys::Getrlimit,
+        SYS_GETRUSAGE => Sys::Getrusage,
+        SYS_GETSID => Sys::Getsid,
+        SYS_GETSOCKNAME => Sys::Getsockname,
+        SYS_GETSOCKOPT => Sys::Getsockopt,
+        SYS_GETTID => Sys::Gettid,
+        SYS_GETTIMEOFDAY => Sys::Gettimeofday,
+        SYS_GETUID => Sys::Getuid,
+        SYS_GETXATTR => Sys::Getxattr,
+        SYS_GET_MEMPOLICY => Sys::GetMempolicy,
+        SYS_GET_ROBUST_LIST => Sys::GetRobustList,
+        SYS_INOTIFY_ADD_WATCH => Sys::InotifyAddWatch,
+        SYS_INOTIFY_INIT1 => Sys::InotifyInit1,
+        SYS_INOTIFY_RM_WATCH => Sys::InotifyRmWatch,
+        SYS_IOCTL => Sys::Ioctl,
+        SYS_IOPRIO_GET => Sys::IoprioGet,
+        SYS_IOPRIO_SET => Sys::IoprioSet,
+        SYS_IO_URING_ENTER => Sys::IoUringEnter,
+        SYS_IO_URING_REGISTER => Sys::IoUringRegister,
+        SYS_IO_URING_SETUP => Sys::IoUringSetup,
+        SYS_KCMP => Sys::Kcmp,
+        SYS_KEXEC_LOAD => Sys::KexecLoad,
+        SYS_KEYCTL => Sys::Keyctl,
+        SYS_KILL => Sys::Kill,
+        SYS_LGETXATTR => Sys::Lgetxattr,
+        SYS_LINKAT => Sys::Linkat,
+        SYS_LISTEN => Sys::Listen,
+        SYS_LISTXATTR => Sys::Listxattr,
+        SYS_LLISTXATTR => Sys::Llistxattr,
+        SYS_LREMOVEXATTR => Sys::Lremovexattr,
+        SYS_LSEEK => Sys::Lseek,
+        SYS_LSETXATTR => Sys::Lsetxattr,
+        SYS_MADVISE => Sys::Madvise,
+        SYS_MBIND => Sys::Mbind,
+        SYS_MEMBARRIER => Sys::Membarrier,
+        SYS_MIGRATE_PAGES => Sys::MigratePages,
+        SYS_MINCORE => Sys::Mincore,
+        SYS_MKDIRAT => Sys::Mkdirat,
+        SYS_MKNODAT => Sys::Mknodat,
+        SYS_MLOCK => Sys::Mlock,
+        SYS_MLOCK2 => Sys::Mlock2,
+        SYS_MLOCKALL => Sys::Mlockall,
+        SYS_MMAP => Sys::Mmap,
+        SYS_MOUNT => Sys::Mount,
+        SYS_MOVE_PAGES => Sys::MovePages,
+        SYS_MPROTECT => Sys::Mprotect,
+        SYS_MQ_GETSETATTR => Sys::MqGetsetattr,
+        SYS_MQ_NOTIFY => Sys::MqNotify,
+        SYS_MQ_OPEN => Sys::MqOpen,
+        SYS_MQ_TIMEDRECEIVE => Sys::MqTimedreceive,
+        SYS_MQ_TIMEDSEND => Sys::MqTimedsend,
+        SYS_MQ_UNLINK => Sys::MqUnlink,
+        SYS_MREMAP => Sys::Mremap,
+        SYS_MSGCTL => Sys::Msgctl,
+        SYS_MSGGET => Sys::Msgget,
+        SYS_MSGRCV => Sys::Msgrcv,
+        SYS_MSGSND => Sys::Msgsnd,
+        SYS_MSYNC => Sys::Msync,
+        SYS_MUNLOCK => Sys::Munlock,
+        SYS_MUNLOCKALL => Sys::Munlockall,
+        SYS_MUNMAP => Sys::Munmap,
+        SYS_NANOSLEEP => Sys::Nanosleep,
+        SYS_NEWFSTATAT => Sys::Newfstatat,
+        SYS_OPENAT => Sys::Openat,
+        SYS_PERF_EVENT_OPEN => Sys::PerfEventOpen,
+        SYS_PERSONALITY => Sys::Personality,
+        SYS_PIDFD_GETFD => Sys::PidfdGetfd,
+        SYS_PIDFD_OPEN => Sys::PidfdOpen,
+        SYS_PIDFD_SEND_SIGNAL => Sys::PidfdSendSignal,
+        SYS_PIPE2 => Sys::Pipe2,
+        SYS_PIVOT_ROOT => Sys::PivotRoot,
+        SYS_PPOLL => Sys::Ppoll,
+        SYS_PRCTL => Sys::Prctl,
+        SYS_PREAD64 => Sys::Pread64,
+        SYS_PREADV => Sys::Preadv,
+        SYS_PREADV2 => Sys::Preadv2,
+        SYS_PRLIMIT64 => Sys::Prlimit64,
+        SYS_PROCESS_VM_READV => Sys::ProcessVmReadv,
+        SYS_PROCESS_VM_WRITEV => Sys::ProcessVmWritev,
+        SYS_PSELECT6 => Sys::Pselect6,
+        SYS_PTRACE => Sys::Ptrace,
+        SYS_PWRITE64 => Sys::Pwrite64,
+        SYS_PWRITEV => Sys::Pwritev,
+        SYS_PWRITEV2 => Sys::Pwritev2,
+        SYS_READ => Sys::Read,
+        SYS_READAHEAD => Sys::Readahead,
+        SYS_READLINKAT => Sys::Readlinkat,
+        SYS_READV => Sys::Readv,
+        SYS_REBOOT => Sys::Reboot,
+        SYS_RECVFROM => Sys::Recvfrom,
+        SYS_RECVMMSG => Sys::Recvmmsg,
+        SYS_RECVMSG => Sys::Recvmsg,
+        SYS_REMOVEXATTR => Sys::Removexattr,
+        SYS_RENAMEAT => Sys::Renameat,
+        SYS_RENAMEAT2 => Sys::Renameat2,
+        SYS_REQUEST_KEY => Sys::RequestKey,
+        SYS_RSEQ => Sys::Rseq,
+        SYS_RT_SIGACTION => Sys::RtSigaction,
+        SYS_RT_SIGPENDING => Sys::RtSigpending,
+        SYS_RT_SIGPROCMASK => Sys::RtSigprocmask,
+        SYS_RT_SIGQUEUEINFO => Sys::RtSigqueueinfo,
+        SYS_RT_SIGSUSPEND => Sys::RtSigsuspend,
+        SYS_RT_SIGTIMEDWAIT => Sys::RtSigtimedwait,
+        SYS_RT_TGSIGQUEUEINFO => Sys::RtTgsigqueueinfo,
+        SYS_SCHED_GETAFFINITY => Sys::SchedGetaffinity,
+        SYS_SCHED_GETPARAM => Sys::SchedGetparam,
+        SYS_SCHED_GETSCHEDULER => Sys::SchedGetscheduler,
+        SYS_SCHED_RR_GET_INTERVAL => Sys::SchedRrGetInterval,
+        SYS_SCHED_SETAFFINITY => Sys::SchedSetaffinity,
+        SYS_SCHED_SETPARAM => Sys::SchedSetparam,
+        SYS_SCHED_SETSCHEDULER => Sys::SchedSetscheduler,
+        SYS_SCHED_YIELD => Sys::SchedYield,
+        SYS_SECCOMP => Sys::Seccomp,
+        SYS_SEMCTL => Sys::Semctl,
+        SYS_SEMGET => Sys::Semget,
+        SYS_SEMOP => Sys::Semop,
+        SYS_SEMTIMEDOP => Sys::Semtimedop,
+        SYS_SENDFILE => Sys::Sendfile,
+        SYS_SENDMMSG => Sys::Sendmmsg,
+        SYS_SENDMSG => Sys::Sendmsg,
+        SYS_SENDTO => Sys::Sendto,
+        SYS_SETDOMAINNAME => Sys::Setdomainname,
+        SYS_SETFSGID => Sys::Setfsgid,
+        SYS_SETFSUID => Sys::Setfsuid,
+        SYS_SETGID => Sys::Setgid,
+        SYS_SETGROUPS => Sys::Setgroups,
+        SYS_SETHOSTNAME => Sys::Sethostname,
+        SYS_SETITIMER => Sys::Setitimer,
+        SYS_SETNS => Sys::Setns,
+        SYS_SETPGID => Sys::Setpgid,
+        SYS_SETPRIORITY => Sys::Setpriority,
+        SYS_SETREGID => Sys::Setregid,
+        SYS_SETRESGID => Sys::Setresgid,
+        SYS_SETRESUID => Sys::Setresuid,
+        SYS_SETREUID => Sys::Setreuid,
+        SYS_SETRLIMIT => Sys::Setrlimit,
+        SYS_SETSID => Sys::Setsid,
+        SYS_SETSOCKOPT => Sys::Setsockopt,
+        SYS_SETTIMEOFDAY => Sys::Settimeofday,
+        SYS_SETUID => Sys::Setuid,
+        SYS_SETXATTR => Sys::Setxattr,
+        SYS_SET_MEMPOLICY => Sys::SetMempolicy,
+        SYS_SET_ROBUST_LIST => Sys::SetRobustList,
+        SYS_SET_TID_ADDRESS => Sys::SetTidAddress,
+        SYS_SHMAT => Sys::Shmat,
+        SYS_SHMCTL => Sys::Shmctl,
+        SYS_SHMDT => Sys::Shmdt,
+        SYS_SHMGET => Sys::Shmget,
+        SYS_SHUTDOWN => Sys::Shutdown,
+        SYS_SIGALTSTACK => Sys::Sigaltstack,
+        SYS_SIGNALFD4 => Sys::Signalfd4,
+        SYS_SOCKET => Sys::Socket,
+        SYS_SOCKETPAIR => Sys::Socketpair,
+        SYS_SPLICE => Sys::Splice,
+        SYS_STATFS => Sys::Statfs,
+        SYS_STATX => Sys::Statx,
+        SYS_SWAPOFF => Sys::Swapoff,
+        SYS_SWAPON => Sys::Swapon,
+        SYS_SYMLINKAT => Sys::Symlinkat,
+        SYS_SYNC => Sys::Sync,
+        SYS_SYNCFS => Sys::Syncfs,
+        SYS_SYNC_FILE_RANGE => Sys::SyncFileRange,
+        SYS_SYSINFO => Sys::Sysinfo,
+        SYS_SYSLOG => Sys::Syslog,
+        SYS_TEE => Sys::Tee,
+        SYS_TGKILL => Sys::Tgkill,
+        SYS_TIMERFD_CREATE => Sys::TimerfdCreate,
+        SYS_TIMERFD_GETTIME => Sys::TimerfdGettime,
+        SYS_TIMERFD_SETTIME => Sys::TimerfdSettime,
+        SYS_TIMER_CREATE => Sys::TimerCreate,
+        SYS_TIMER_DELETE => Sys::TimerDelete,
+        SYS_TIMER_GETOVERRUN => Sys::TimerGetoverrun,
+        SYS_TIMER_GETTIME => Sys::TimerGettime,
+        SYS_TIMER_SETTIME => Sys::TimerSettime,
+        SYS_TIMES => Sys::Times,
+        SYS_TKILL => Sys::Tkill,
+        SYS_TRUNCATE => Sys::Truncate,
+        SYS_UMASK => Sys::Umask,
+        SYS_UMOUNT2 => Sys::Umount2,
+        SYS_UNAME => Sys::Uname,
+        SYS_UNLINKAT => Sys::Unlinkat,
+        SYS_UNSHARE => Sys::Unshare,
+        SYS_UTIMENSAT => Sys::Utimensat,
+        SYS_VHANGUP => Sys::Vhangup,
+        SYS_VMSPLICE => Sys::Vmsplice,
+        SYS_WAIT4 => Sys::Wait4,
+        SYS_WAITID => Sys::Waitid,
+        SYS_WRITE => Sys::Write,
+        SYS_WRITEV => Sys::Writev,
+        _ => return None,
+    })
 }

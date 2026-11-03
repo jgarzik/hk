@@ -20,6 +20,7 @@ pub mod printk;
 pub mod selftest;
 pub mod smp;
 pub mod sync;
+pub mod syscall;
 pub mod sysctl;
 pub mod time;
 pub mod uaccess;

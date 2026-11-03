@@ -49,6 +49,9 @@ pub use aarch64::uaccess::Aarch64Uaccess as Uaccess;
 #[cfg(target_arch = "aarch64")]
 pub type CurrentArch = aarch64::Aarch64Arch;
 
+/// clone(2) takes tls before child_tid (Linux CONFIG_CLONE_BACKWARDS)
+pub const CLONE_BACKWARDS: bool = cfg!(target_arch = "aarch64");
+
 /// The current architecture's page table
 pub type ArchPageTable = <CurrentArch as SchedArch>::SchedPageTable;
 
