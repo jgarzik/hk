@@ -36,8 +36,6 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use crate::sync::spin::Mutex;
 use spin::Once;
 
-use crate::CurrentArch;
-use crate::arch::IoremapOps;
 use crate::arch::barrier::{dma_rmb, dma_wmb, wmb};
 use crate::bus::bus::{BusContext, BusDevice, BusDriver};
 use crate::bus::driver::{Device, DriverError};
@@ -235,8 +233,8 @@ impl TxRing {
 
 /// e1000 device state
 struct E1000 {
-    /// MMIO base (kernel virtual)
-    mmio_base: u64,
+    /// Register window (BAR0, 128KB)
+    regs: crate::mmio::IoMem,
     /// MAC address
     mac: [u8; 6],
     rx: Mutex<RxRing>,
@@ -254,11 +252,11 @@ struct E1000 {
 
 impl E1000 {
     fn read_reg(&self, offset: u32) -> u32 {
-        unsafe { read_volatile((self.mmio_base + offset as u64) as *const u32) }
+        self.regs.read32(offset as usize)
     }
 
     fn write_reg(&self, offset: u32, value: u32) {
-        unsafe { write_volatile((self.mmio_base + offset as u64) as *mut u32, value) }
+        self.regs.write32(offset as usize, value)
     }
 
     fn read_mac(&self) -> [u8; 6] {
@@ -666,12 +664,10 @@ impl BusDriver for E1000PciDriver {
             return Err(DriverError::MissingResource);
         }
         let mmio_phys = (bar0 & !0xF) as u64;
-        let mmio_base = match CurrentArch::ioremap(mmio_phys, 128 * 1024) {
-            Ok(virt) => virt as u64,
-            Err(e) => {
-                printkln!("e1000: Failed to ioremap MMIO region: {:?}", e);
-                return Err(DriverError::MissingResource);
-            }
+        // SAFETY: BAR0 of this e1000, its 128KB register space
+        let Some(regs) = (unsafe { crate::mmio::IoMem::ioremap(mmio_phys, 128 * 1024) }) else {
+            printkln!("e1000: Failed to ioremap MMIO region");
+            return Err(DriverError::MissingResource);
         };
 
         // The device DMAs descriptors and packets: it must master the bus
@@ -686,7 +682,7 @@ impl BusDriver for E1000PciDriver {
         let tx_bufs = alloc_bufs(pci, TX_RING_SIZE)?;
 
         let mut dev = E1000 {
-            mmio_base,
+            regs,
             mac: [0; 6],
             rx: Mutex::new(RxRing {
                 desc: rx_desc,

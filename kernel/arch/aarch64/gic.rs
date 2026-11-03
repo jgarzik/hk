@@ -5,11 +5,12 @@
 //! QEMU virt addresses:
 //! - Distributor (GICD): 0x0800_0000
 //! - Redistributor (GICR): 0x080A_0000 + (cpu_id * 0x20000)
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use crate::printkln;
 use core::arch::asm;
-use core::ptr::{read_volatile, write_volatile};
+use core::ptr::NonNull;
+
+use crate::mmio::IoMem;
 
 // QEMU virt GICv3 base addresses
 const GICD_BASE: u64 = super::paging::io_va(0x0800_0000);
@@ -55,29 +56,63 @@ fn gicr_base() -> u64 {
     GICR_BASE + (cpu_id * GICR_STRIDE)
 }
 
-/// Read a 32-bit value from a GIC register
-///
-/// # Safety
-/// `addr` is a mapped GIC register (distributor or redistributor).
-#[inline]
-unsafe fn read32(addr: u64) -> u32 {
-    unsafe { read_volatile(addr as *const u32) }
+/// Distributor window: 64KB of registers
+const GICD_LEN: usize = 0x1_0000;
+/// Redistributor windows: one per CPU, back to back
+const GICR_LEN: usize = GICR_STRIDE as usize * crate::cpumask::NR_CPUS;
+
+/// The distributor and redistributor register windows, in the device
+/// block the boot page tables map for good (`kmap::map_io`)
+static GICD: IoMem =
+    // SAFETY: QEMU virt's GICv3 distributor, inside the always-mapped
+    // device window
+    unsafe { IoMem::new(NonNull::new(GICD_BASE as *mut u8).unwrap(), GICD_LEN) };
+static GICR: IoMem =
+    // SAFETY: as above, its redistributor frames
+    unsafe { IoMem::new(NonNull::new(GICR_BASE as *mut u8).unwrap(), GICR_LEN) };
+
+/// The window holding GIC register address `addr`, and the offset in it
+fn window(addr: u64) -> (&'static IoMem, usize) {
+    match addr {
+        a if (GICD_BASE..GICD_BASE + GICD_LEN as u64).contains(&a) => {
+            (&GICD, (a - GICD_BASE) as usize)
+        }
+        a => (&GICR, a.wrapping_sub(GICR_BASE) as usize),
+    }
 }
 
-/// Write a 32-bit value to a GIC register
-///
-/// # Safety
-/// `addr` is a mapped GIC register, and writing `val` there is
-/// valid for the GIC's current state.
+/// Read a 32-bit GIC register (an address in its windows; panics outside)
 #[inline]
-unsafe fn write32(addr: u64, val: u32) {
-    unsafe { write_volatile(addr as *mut u32, val) }
+fn read32(addr: u64) -> u32 {
+    let (w, off) = window(addr);
+    w.read32(off)
+}
+
+/// Write a 32-bit GIC register (as `read32`)
+#[inline]
+fn write32(addr: u64, val: u32) {
+    let (w, off) = window(addr);
+    w.write32(off, val)
+}
+
+/// Write an 8-bit GIC register (as `read32`)
+fn write8(addr: u64, val: u8) {
+    let (w, off) = window(addr);
+    w.write8(off, val)
+}
+
+/// Write a 64-bit GIC register (as `read32`)
+fn write64(addr: u64, val: u64) {
+    let (w, off) = window(addr);
+    w.write64(off, val)
 }
 
 /// Initialize the GIC for the current CPU
 ///
 /// This must be called on each CPU.
 pub fn init() {
+    // SAFETY: init() runs once per CPU as it comes up, interrupts masked;
+    // the distributor only on CPU 0, before the APs
     unsafe {
         init_cpu_interface();
         init_redistributor();
@@ -96,6 +131,7 @@ pub fn init() {
 unsafe fn init_cpu_interface() {
     // Enable system register access (ICC_SRE_EL1.SRE = 1)
     // Also set DFB and DIB to disable IRQ/FIQ bypass
+    // SAFETY: this CPU's GIC CPU-interface registers, at bring-up
     unsafe {
         asm!(
             "mrs {tmp}, icc_sre_el1",
@@ -108,6 +144,7 @@ unsafe fn init_cpu_interface() {
     }
 
     // Set priority mask to accept all priorities (lowest priority = 0xFF)
+    // SAFETY: this CPU's GIC CPU-interface registers, at bring-up
     unsafe {
         asm!(
             "mov {tmp}, #0xFF",
@@ -118,11 +155,13 @@ unsafe fn init_cpu_interface() {
     }
 
     // Set binary point to 0 (all bits for priority, none for subpriority)
+    // SAFETY: this CPU's GIC CPU-interface registers, at bring-up
     unsafe {
         asm!("msr icc_bpr1_el1, xzr", options(nostack, preserves_flags));
     }
 
     // Enable Group 1 interrupts (ICC_IGRPEN1_EL1 = 1)
+    // SAFETY: this CPU's GIC CPU-interface registers, at bring-up
     unsafe {
         asm!(
             "mov {tmp}, #1",
@@ -142,34 +181,32 @@ unsafe fn init_redistributor() {
     let base = gicr_base();
 
     // Wake up the redistributor
-    unsafe {
-        let waker = read32(base + GICR_WAKER);
-        write32(base + GICR_WAKER, waker & !GICR_WAKER_PROCESSOR_SLEEP);
+    let waker = read32(base + GICR_WAKER);
+    write32(base + GICR_WAKER, waker & !GICR_WAKER_PROCESSOR_SLEEP);
 
-        // Wait for it to wake (ChildrenAsleep should clear)
-        let mut timeout = 1000000;
-        while (read32(base + GICR_WAKER) & GICR_WAKER_CHILDREN_ASLEEP) != 0 {
-            timeout -= 1;
-            if timeout == 0 {
-                printkln!("GIC: Redistributor wake timeout");
-                break;
-            }
+    // Wait for it to wake (ChildrenAsleep should clear)
+    let mut timeout = 1000000;
+    while (read32(base + GICR_WAKER) & GICR_WAKER_CHILDREN_ASLEEP) != 0 {
+        timeout -= 1;
+        if timeout == 0 {
+            printkln!("GIC: Redistributor wake timeout");
+            break;
         }
-
-        // Set all PPIs to Group 1 (non-secure)
-        write32(base + GICR_IGROUPR0, 0xFFFF_FFFF);
-
-        // Set default priority for all SGIs/PPIs (0x80 = middle priority)
-        for i in 0..8 {
-            write32(base + GICR_IPRIORITYR + (i * 4), 0x8080_8080);
-        }
-
-        // The IPI SGIs (ipi.rs)
-        write32(
-            base + GICR_ISENABLER0,
-            (1 << super::ipi::SGI_RESCHEDULE) | (1 << super::ipi::SGI_CALL_FUNCTION),
-        );
     }
+
+    // Set all PPIs to Group 1 (non-secure)
+    write32(base + GICR_IGROUPR0, 0xFFFF_FFFF);
+
+    // Set default priority for all SGIs/PPIs (0x80 = middle priority)
+    for i in 0..8 {
+        write32(base + GICR_IPRIORITYR + (i * 4), 0x8080_8080);
+    }
+
+    // The IPI SGIs (ipi.rs)
+    write32(
+        base + GICR_ISENABLER0,
+        (1 << super::ipi::SGI_RESCHEDULE) | (1 << super::ipi::SGI_CALL_FUNCTION),
+    );
 }
 
 /// Send SGI `intid` to the CPU with affinity `mpidr` (ICC_SGI1R_EL1,
@@ -201,33 +238,31 @@ pub fn send_sgi(mpidr: u64, intid: u32) {
 /// # Safety
 /// Once, on CPU 0, the distributor mapped, before other CPUs use it.
 unsafe fn init_distributor() {
-    unsafe {
-        // Disable distributor while configuring
-        write32(GICD_CTLR, 0);
+    // Disable distributor while configuring
+    write32(GICD_CTLR, 0);
 
-        // Read GICD_TYPER to find out how many interrupts are supported
-        let typer = read32(GICD_TYPER);
-        let it_lines = ((typer & 0x1F) + 1) * 32;
-        printkln!("GIC: {} interrupt lines", it_lines);
+    // Read GICD_TYPER to find out how many interrupts are supported
+    let typer = read32(GICD_TYPER);
+    let it_lines = ((typer & 0x1F) + 1) * 32;
+    printkln!("GIC: {} interrupt lines", it_lines);
 
-        // Set all SPIs to Group 1, priority 0x80
-        // SPIs start at interrupt 32
-        for i in 1..(it_lines / 32) {
-            // Group (offset 0x80): set all to Group 1
-            write32(GICD_BASE + 0x0080 + (i * 4) as u64, 0xFFFF_FFFF);
+    // Set all SPIs to Group 1, priority 0x80
+    // SPIs start at interrupt 32
+    for i in 1..(it_lines / 32) {
+        // Group (offset 0x80): set all to Group 1
+        write32(GICD_BASE + 0x0080 + (i * 4) as u64, 0xFFFF_FFFF);
 
-            // Priority (offset 0x400): each byte is one interrupt
-            for j in 0..8 {
-                write32(GICD_IPRIORITYR + (i * 32 + j * 4) as u64, 0x8080_8080);
-            }
+        // Priority (offset 0x400): each byte is one interrupt
+        for j in 0..8 {
+            write32(GICD_IPRIORITYR + (i * 32 + j * 4) as u64, 0x8080_8080);
         }
-
-        // Enable distributor with Group 1 and affinity routing
-        write32(
-            GICD_CTLR,
-            GICD_CTLR_ENABLE_G0 | GICD_CTLR_ENABLE_G1NS | GICD_CTLR_ARE_NS,
-        );
     }
+
+    // Enable distributor with Group 1 and affinity routing
+    write32(
+        GICD_CTLR,
+        GICD_CTLR_ENABLE_G0 | GICD_CTLR_ENABLE_G1NS | GICD_CTLR_ARE_NS,
+    );
 
     printkln!("GIC distributor initialized");
 }
@@ -248,7 +283,7 @@ pub enum Trigger {
 /// The distributor is mapped.
 unsafe fn gicd_wait_rwp() {
     let mut timeout = 1_000_000;
-    while unsafe { read32(GICD_CTLR) } & GICD_CTLR_RWP != 0 && timeout > 0 {
+    while read32(GICD_CTLR) & GICD_CTLR_RWP != 0 && timeout > 0 {
         timeout -= 1;
     }
 }
@@ -264,7 +299,7 @@ pub fn enable_spi(intid: u32, trigger: Trigger) {
         return;
     }
     let n = intid as u64;
-    unsafe {
+    {
         // Trigger: bit 1 of the 2-bit field (1 = edge, 0 = level)
         let cfg_reg = GICD_ICFGR + (n / 16) * 4;
         let shift = (n % 16) * 2 + 1;
@@ -276,15 +311,16 @@ pub fn enable_spi(intid: u32, trigger: Trigger) {
         write32(cfg_reg, cfg);
 
         // Priority (byte-addressed)
-        write_volatile((GICD_IPRIORITYR + n) as *mut u8, 0x80);
+        write8(GICD_IPRIORITYR + n, 0x80);
 
         // Route to CPU 0 by affinity (ARE is enabled; IRM = 0)
         let mpidr = super::percpu::get_percpu(0).mpidr() & 0xFF_00FF_FFFF;
-        write_volatile((GICD_IROUTER + n * 8) as *mut u64, mpidr);
+        write64(GICD_IROUTER + n * 8, mpidr);
 
         // Unmask
         write32(GICD_ISENABLER + (n / 32) * 4, 1 << (n % 32));
-        gicd_wait_rwp();
+        // SAFETY: the distributor is up (enable_spi runs after init)
+        unsafe { gicd_wait_rwp() };
     }
 }
 
@@ -294,19 +330,16 @@ pub fn disable_spi(intid: u32) {
         return;
     }
     let n = intid as u64;
-    unsafe {
-        write32(GICD_ICENABLER + (n / 32) * 4, 1 << (n % 32));
-        gicd_wait_rwp();
-    }
+    write32(GICD_ICENABLER + (n / 32) * 4, 1 << (n % 32));
+    // SAFETY: as in enable_spi
+    unsafe { gicd_wait_rwp() };
 }
 
 /// Enable a specific PPI/SGI interrupt (0-31)
 pub fn enable_ppi(intid: u32) {
     assert!(intid < 32, "PPI/SGI must be < 32");
     let base = gicr_base();
-    unsafe {
-        write32(base + GICR_ISENABLER0, 1 << intid);
-    }
+    write32(base + GICR_ISENABLER0, 1 << intid);
 }
 
 /// Acknowledge an interrupt (read ICC_IAR1_EL1)
@@ -314,6 +347,7 @@ pub fn enable_ppi(intid: u32) {
 /// Returns the interrupt ID (INTID). Returns 1020-1023 for spurious interrupts.
 pub fn acknowledge_interrupt() -> u32 {
     let intid: u64;
+    // SAFETY: reads this CPU's acknowledge register (the interrupt path)
     unsafe {
         asm!(
             "mrs {}, icc_iar1_el1",
@@ -329,6 +363,7 @@ pub fn acknowledge_interrupt() -> u32 {
 
 /// Signal end of interrupt (write ICC_EOIR1_EL1)
 pub fn end_interrupt(intid: u32) {
+    // SAFETY: ends the interrupt this CPU acknowledged
     unsafe {
         asm!(
             "msr icc_eoir1_el1, {}",

@@ -5,9 +5,8 @@
 //! - Enable/configure the Local APIC
 //! - Send Inter-Processor Interrupts (IPIs)
 //! - Handle the APIC timer
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
-use ::core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use ::core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 // LAPIC register offsets (from base address)
 const LAPIC_ID: u32 = 0x020; // Local APIC ID
@@ -55,8 +54,8 @@ const TIMER_MASKED: u32 = 0x10000;
 // Timer divide values
 const TIMER_DIV_16: u32 = 0x3;
 
-/// Global LAPIC base address (set during initialization)
-static LAPIC_BASE: AtomicU64 = AtomicU64::new(0);
+/// The LAPIC register page (the same address on every CPU; set once)
+static LAPIC: spin::Once<IoMem> = spin::Once::new();
 
 /// The LAPICs run in x2APIC mode (IA32_APIC_BASE.EXTD, as firmware left
 /// them; the same on every CPU): IPIs go through the ICR MSR
@@ -67,7 +66,7 @@ static LAPIC_TICKS_PER_MS: AtomicU32 = AtomicU32::new(0);
 
 /// Local APIC interface
 pub struct LocalApic {
-    base: u64,
+    regs: IoMem,
 }
 
 impl LocalApic {
@@ -76,12 +75,14 @@ impl LocalApic {
     /// # Safety
     /// The base address must be a valid, mapped LAPIC MMIO region.
     pub unsafe fn new(base: u64) -> Self {
-        LAPIC_BASE.store(base, Ordering::SeqCst);
+        let p = core::ptr::NonNull::new(base as *mut u8).expect("LAPIC base");
+        // SAFETY: the caller's mapped LAPIC page (4KB of registers)
+        let regs = *LAPIC.call_once(|| unsafe { IoMem::new(p, 4096) });
         X2APIC.store(
             rdmsr(IA32_APIC_BASE) & APIC_BASE_EXTD != 0,
             Ordering::Relaxed,
         );
-        Self { base }
+        Self { regs }
     }
 
     /// Get a LocalApic instance using the stored global base
@@ -89,27 +90,21 @@ impl LocalApic {
     /// # Panics
     /// Panics if the LAPIC has not been initialized.
     pub fn get() -> Self {
-        let base = LAPIC_BASE.load(Ordering::SeqCst);
-        assert!(base != 0, "LAPIC not initialized");
-        Self { base }
+        Self {
+            regs: *LAPIC.get().expect("LAPIC not initialized"),
+        }
     }
 
     /// Read a 32-bit LAPIC register
     #[inline]
     fn read(&self, offset: u32) -> u32 {
-        unsafe {
-            let addr = (self.base + offset as u64) as *const u32;
-            core::ptr::read_volatile(addr)
-        }
+        self.regs.read32(offset as usize)
     }
 
     /// Write a 32-bit LAPIC register
     #[inline]
     fn write(&self, offset: u32, value: u32) {
-        unsafe {
-            let addr = (self.base + offset as u64) as *mut u32;
-            core::ptr::write_volatile(addr, value);
-        }
+        self.regs.write32(offset as usize, value)
     }
 
     /// Get this CPU's APIC ID
@@ -296,6 +291,7 @@ const APIC_BASE_EXTD: u64 = 1 << 10;
 const X2APIC_ICR: u32 = 0x830;
 
 use super::msr::rdmsr;
+use crate::mmio::IoMem;
 
 /// Send the fixed IPI `vector` to the CPU with APIC id `apic_id`
 /// (physical destination; Linux __default_send_IPI_dest_field,
@@ -333,12 +329,8 @@ pub fn send_ipi(apic_id: u32, vector: u8) {
 /// Global function to send EOI (for use from interrupt handlers)
 #[inline]
 pub fn eoi() {
-    let base = LAPIC_BASE.load(Ordering::Relaxed);
-    if base != 0 {
-        unsafe {
-            let addr = (base + LAPIC_EOI as u64) as *mut u32;
-            core::ptr::write_volatile(addr, 0);
-        }
+    if let Some(regs) = LAPIC.get() {
+        regs.write32(LAPIC_EOI as usize, 0);
     }
 }
 
@@ -352,7 +344,7 @@ pub const SPURIOUS_APIC_VECTOR: u8 = SVR_SPURIOUS_VECTOR as u8;
 /// Latch and read this CPU's Error Status Register (the write latches
 /// the errors seen since the last one); 0 before the LAPIC is mapped
 pub fn read_esr() -> u32 {
-    if LAPIC_BASE.load(Ordering::Relaxed) == 0 {
+    if LAPIC.get().is_none() {
         return 0;
     }
     let lapic = LocalApic::get();
@@ -363,7 +355,7 @@ pub fn read_esr() -> u32 {
 /// `vector` is in service on this CPU (its ISR bit is set); false
 /// before the LAPIC is mapped (a stray vector then is only reported)
 pub fn in_service(vector: u8) -> bool {
-    if LAPIC_BASE.load(Ordering::Relaxed) == 0 {
+    if LAPIC.get().is_none() {
         return false;
     }
     let reg = LAPIC_ISR + ((vector as u32) >> 5) * 0x10;
@@ -372,15 +364,9 @@ pub fn in_service(vector: u8) -> bool {
 
 /// Get the current CPU's APIC ID
 pub fn current_apic_id() -> u8 {
-    let base = LAPIC_BASE.load(Ordering::Relaxed);
-    if base != 0 {
-        unsafe {
-            let addr = (base + LAPIC_ID as u64) as *const u32;
-            ((core::ptr::read_volatile(addr) >> 24) & 0xFF) as u8
-        }
-    } else {
-        0
-    }
+    LAPIC
+        .get()
+        .map_or(0, |r| ((r.read32(LAPIC_ID as usize) >> 24) & 0xFF) as u8)
 }
 
 /// Calibrate LAPIC timer and start periodic interrupts on BSP

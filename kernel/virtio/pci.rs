@@ -14,25 +14,22 @@
 //! bus enumeration). Afterwards the transport touches lock-free state
 //! only: config reads (generation-checked), notify writes (under the
 //! caller's queue lock) and the ISR byte (IRQ context).
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::ops::{Deref, DerefMut};
-use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use spin::Once;
 
 use super::ring::{self, Layout, Vring};
 use super::{VirtioIrq, find_driver, status};
-use crate::CurrentArch;
-use crate::arch::IoremapOps;
 use crate::arch::barrier::wmb;
 use crate::bus::bus::{BusContext, BusDevice, BusDriver};
 use crate::bus::driver::{Device, DriverError};
 use crate::bus::pci::{PciDevice, cap_id};
 use crate::dma::{DmaCoherent, DmaConfig, DmaDevice};
+use crate::mmio::IoMem;
 use crate::printkln;
 
 /// Red Hat / virtio vendor ID
@@ -130,16 +127,17 @@ fn find_caps(pci: &PciDevice) -> Caps {
 }
 
 /// ioremap the part of a BAR a capability describes (at most `max` bytes)
-fn map_cap(pci: &PciDevice, cap: Cap, max: u32) -> Result<(*mut u8, u32), DriverError> {
+fn map_cap(pci: &PciDevice, cap: Cap, max: u32) -> Result<IoMem, DriverError> {
     let len = cap.len.min(max);
     let bar = cap.bar as usize;
     let base = match pci.bar_address(bar) {
         Some(b) if pci.bar_is_mmio(bar) && len > 0 => b,
         _ => return Err(DriverError::MissingResource),
     };
-    let virt = CurrentArch::ioremap(base + cap.off as u64, len as u64)
-        .map_err(|_| DriverError::MissingResource)?;
-    Ok((virt, len))
+    // SAFETY: part of a memory BAR of this device, which the capability
+    // places there: registers, not RAM
+    unsafe { IoMem::ioremap(base + cap.off as u64, len as usize) }
+        .ok_or(DriverError::MissingResource)
 }
 
 /// A virtio device on the modern PCI transport (Linux virtio_pci_device)
@@ -147,12 +145,12 @@ pub struct VirtioDevice {
     /// Virtio device ID
     id: u32,
     pci: PciDevice,
-    common: *mut u8,
-    isr: *const u8,
-    device: *mut u8,
-    device_len: u32,
-    notify: *mut u8,
-    notify_len: u32,
+    /// Common configuration (spec 4.1.4.3), little-endian registers
+    common: IoMem,
+    isr: IoMem,
+    /// Device-specific configuration (None if the device has none)
+    device: Option<IoMem>,
+    notify: IoMem,
     notify_mul: u32,
     /// Negotiated features
     features: u64,
@@ -160,10 +158,6 @@ pub struct VirtioDevice {
     /// Interrupts that were ours (stats)
     irqs: AtomicU64,
 }
-
-// MMIO pointers into ioremapped BARs, valid for the device's life
-unsafe impl Send for VirtioDevice {}
-unsafe impl Sync for VirtioDevice {}
 
 impl VirtioDevice {
     /// Locate and map the transport structures
@@ -173,15 +167,15 @@ impl VirtioDevice {
             printkln!("virtio-pci: {} lacks a required capability", pci.bus_id());
             return Err(DriverError::MissingResource);
         };
-        let (common, clen) = map_cap(&pci, c, common::LEN)?;
-        if clen < common::LEN {
+        let common = map_cap(&pci, c, common::LEN)?;
+        if common.len() < common::LEN as usize {
             return Err(DriverError::MissingResource);
         }
-        let (notify, notify_len) = map_cap(&pci, n, u32::MAX)?;
-        let (isr, _) = map_cap(&pci, i, 1)?;
-        let (device, device_len) = match caps.device {
-            Some(d) => map_cap(&pci, d, 0x1000)?,
-            None => (core::ptr::null_mut(), 0),
+        let notify = map_cap(&pci, n, u32::MAX)?;
+        let isr = map_cap(&pci, i, 1)?;
+        let device = match caps.device {
+            Some(d) => Some(map_cap(&pci, d, 0x1000)?),
+            None => None,
         };
         Ok(Self {
             id,
@@ -189,9 +183,7 @@ impl VirtioDevice {
             common,
             isr,
             device,
-            device_len,
             notify,
-            notify_len,
             notify_mul: caps.notify_mul,
             features: 0,
             irq: Once::new(),
@@ -200,27 +192,27 @@ impl VirtioDevice {
     }
 
     fn r8(&self, off: usize) -> u8 {
-        unsafe { read_volatile(self.common.add(off)) }
+        self.common.read8(off)
     }
 
     fn w8(&self, off: usize, v: u8) {
-        unsafe { write_volatile(self.common.add(off), v) }
+        self.common.write8(off, v)
     }
 
     fn r16(&self, off: usize) -> u16 {
-        u16::from_le(unsafe { read_volatile(self.common.add(off) as *const u16) })
+        u16::from_le(self.common.read16(off))
     }
 
     fn w16(&self, off: usize, v: u16) {
-        unsafe { write_volatile(self.common.add(off) as *mut u16, v.to_le()) }
+        self.common.write16(off, v.to_le())
     }
 
     fn r32(&self, off: usize) -> u32 {
-        u32::from_le(unsafe { read_volatile(self.common.add(off) as *const u32) })
+        u32::from_le(self.common.read32(off))
     }
 
     fn w32(&self, off: usize, v: u32) {
-        unsafe { write_volatile(self.common.add(off) as *mut u32, v.to_le()) }
+        self.common.write32(off, v.to_le())
     }
 
     /// 64-bit fields as two 32-bit writes, low first (Linux
@@ -308,29 +300,27 @@ impl VirtioDevice {
 
     /// Device config byte (0 if absent)
     pub fn cfg8(&self, off: u32) -> u8 {
-        if off >= self.device_len {
-            return 0;
-        }
-        // SAFETY: inside the mapped device config window (checked)
-        unsafe { read_volatile(self.device.add(off as usize)) }
+        self.device
+            .and_then(|d| d.try_read8(off as usize))
+            .unwrap_or(0)
     }
 
     /// Device config le16 (0 if absent)
     pub fn cfg16(&self, off: u32) -> u16 {
-        if off.checked_add(2).is_none_or(|e| e > self.device_len) || off & 1 != 0 {
-            return 0;
-        }
-        // SAFETY: an aligned le16 inside the window (checked, no wrap)
-        u16::from_le(unsafe { read_volatile(self.device.add(off as usize) as *const u16) })
+        u16::from_le(
+            self.device
+                .and_then(|d| d.try_read16(off as usize))
+                .unwrap_or(0),
+        )
     }
 
     /// Device config le32 (0 if absent)
     pub fn cfg32(&self, off: u32) -> u32 {
-        if off.checked_add(4).is_none_or(|e| e > self.device_len) || off & 3 != 0 {
-            return 0;
-        }
-        // SAFETY: an aligned le32 inside the window (checked, no wrap)
-        u32::from_le(unsafe { read_volatile(self.device.add(off as usize) as *const u32) })
+        u32::from_le(
+            self.device
+                .and_then(|d| d.try_read32(off as usize))
+                .unwrap_or(0),
+        )
     }
 
     /// Device config le64 as two 32-bit reads, low first (spec 4.1.3.1;
@@ -349,10 +339,11 @@ impl VirtioDevice {
             return Err(DriverError::InitFailed);
         }
         let num = ring::pick_size(self.r16(common::Q_SIZE)).ok_or(DriverError::MissingResource)?;
-        let off = self.r16(common::Q_NOFF) as u64 * self.notify_mul as u64;
-        if off + 2 > self.notify_len as u64 {
-            return Err(DriverError::MissingResource);
-        }
+        let off = self.r16(common::Q_NOFF) as usize * self.notify_mul as usize;
+        let notify = self
+            .notify
+            .sub(off, 2)
+            .ok_or(DriverError::MissingResource)?;
         let lay = Layout::new(num);
         // Zeroed, page-aligned: satisfies every ring part's alignment
         let mem =
@@ -364,10 +355,12 @@ impl VirtioDevice {
         self.w64(common::Q_USED, d + lay.used as u64);
         self.w16(common::Q_ENABLE, 1);
         Ok(Virtqueue {
+            // SAFETY: `mem` is zeroed DMA memory of `lay.size` bytes for
+            // `num` entries, owned by the queue (`_mem`) for the ring's life
             ring: unsafe { Vring::new(mem.cpu_addr(), num) },
             _mem: mem,
             index,
-            notify: unsafe { self.notify.add(off as usize) as *mut u16 },
+            notify,
         })
     }
 
@@ -402,9 +395,11 @@ impl DmaDevice for VirtioDevice {
 
 /// Transport interrupt handler (Linux vp_interrupt; IRQ context)
 fn vp_interrupt(_irq: u32, data: *mut ()) -> bool {
+    // SAFETY: `data` is the Arc<VirtioDevice> pointer `request_irq`
+    // registered; the driver keeps that Arc for the device's life
     let vdev = unsafe { &*(data as *const VirtioDevice) };
     // Read-to-clear; deasserts the level-triggered line
-    let isr = unsafe { read_volatile(vdev.isr) };
+    let isr = vdev.isr.read8(0);
     if isr == 0 {
         return false; // shared line: not ours
     }
@@ -426,10 +421,14 @@ pub struct Virtqueue {
     /// Ring memory (lives as long as the queue: the device keeps using it)
     _mem: DmaCoherent,
     index: u16,
-    notify: *mut u16,
+    /// This queue's 2-byte doorbell
+    notify: IoMem,
 }
 
+// SAFETY: the ring is DMA memory reached under the driver's queue lock
+// (Vring's own rule); the doorbell is an IoMem
 unsafe impl Send for Virtqueue {}
+// SAFETY: as above
 unsafe impl Sync for Virtqueue {}
 
 impl Virtqueue {
@@ -439,7 +438,7 @@ impl Virtqueue {
         if self.ring.needs_notify() {
             // Ring writes before the doorbell MMIO write
             wmb();
-            unsafe { write_volatile(self.notify, self.index.to_le()) };
+            self.notify.write16(0, self.index.to_le());
         }
     }
 }

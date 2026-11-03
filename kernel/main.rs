@@ -34,6 +34,7 @@ pub mod irq;
 pub mod kcmp;
 pub mod kmem;
 pub mod list;
+pub mod mmio;
 pub mod pidfd;
 pub mod pipe;
 pub mod pod;
