@@ -1,9 +1,14 @@
 //! PL011 UART driver for AArch64
 //!
-//! This is a simple polled driver for the ARM PL011 UART found in
-//! QEMU's virt machine and many real ARM platforms.
+//! A polled driver for the ARM PL011 UART found in QEMU's virt machine
+//! and many real ARM platforms: the early console, and the tty ttyAMA0
+//! (Linux amba-pl011).
 
 use core::fmt;
+
+use crate::fs::chardev::{DevId, major};
+use crate::tty::{RAW_LDISC, Tty, TtyDriver};
+use crate::util::error::KernelError;
 use core::ptr::{read_volatile, write_volatile};
 
 /// PL011 UART base address on QEMU virt machine
@@ -29,6 +34,8 @@ mod regs {
 
 /// Flag Register bits
 mod fr {
+    /// Receive FIFO empty
+    pub const RXFE: u32 = 1 << 4;
     /// Transmit FIFO full
     pub const TXFF: u32 = 1 << 5;
     /// UART busy
@@ -134,6 +141,55 @@ impl Pl011 {
 
 /// Global UART instance (its methods take `&self`: MMIO only)
 static UART: Pl011 = Pl011::new(PL011_BASE);
+
+impl TtyDriver for Pl011 {
+    fn name(&self) -> &str {
+        "pl011"
+    }
+
+    fn write(&self, data: &[u8]) -> Result<usize, KernelError> {
+        for &b in data {
+            self.write_byte(b);
+        }
+        Ok(data.len())
+    }
+
+    fn read(&self, buf: &mut [u8]) -> Result<usize, KernelError> {
+        let mut n = 0;
+        while n < buf.len() && self.poll_read() {
+            // The low byte is the character, the bits above its errors
+            buf[n] = (self.read_reg(regs::DR) & 0xff) as u8;
+            n += 1;
+        }
+        Ok(n)
+    }
+
+    fn poll_read(&self) -> bool {
+        self.read_reg(regs::FR) & fr::RXFE == 0
+    }
+
+    fn flush(&self) {
+        while self.read_reg(regs::FR) & fr::BUSY != 0 {
+            core::hint::spin_loop();
+        }
+    }
+}
+
+/// The PL011's tty, ttyAMA0 = (204, 64) (Linux devices.txt)
+pub static TTY_AMA0: Tty = Tty::new("ttyAMA0", DevId::new(major::AMBA, 64), &UART, &RAW_LDISC);
+
+/// The serial ports' ttys
+pub fn serial_ttys() -> &'static [&'static Tty] {
+    static TTYS: [&Tty; 1] = [&TTY_AMA0];
+    &TTYS
+}
+
+/// Make ttyAMA0 a console (Linux pl011 console; it is /dev/console's
+/// tty). Printk keeps writing the UART directly
+pub fn register_console() {
+    use crate::console::{ConsoleFlags, ConsolePriority};
+    crate::console::register_console(&TTY_AMA0, ConsolePriority::Fallback, ConsoleFlags::empty());
+}
 
 /// Initialize the serial console
 pub fn init() {

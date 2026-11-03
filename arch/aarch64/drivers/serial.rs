@@ -28,7 +28,9 @@ impl PlatformBusDriver for Pl011PlatformDriver {
         _device: &PlatformDevice,
         _ctx: &mut BusContext,
     ) -> Result<Box<dyn Device>, DriverError> {
-        // PL011 is already initialized during early boot via serial::init()
+        // The UART is set up at boot (serial::init); its tty becomes a
+        // console now
+        crate::arch::aarch64::serial::register_console();
         Ok(Box::new(Pl011Device))
     }
 }

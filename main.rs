@@ -661,8 +661,8 @@ fn init_vfs_core() {
         ("tty", DevId::new(chardev_major::TTYAUX, 0), 0o666),
         ("console", DevId::new(chardev_major::TTYAUX, 1), 0o666),
     ];
-    if crate::fs::chardev::get_chardev(DevId::new(chardev_major::TTYS, 64)).is_some() {
-        nodes.push(("ttyS0", DevId::new(chardev_major::TTYS, 64), 0o666));
+    for tty in crate::arch::serial_ttys() {
+        nodes.push((tty.name(), tty.dev(), 0o666));
     }
     for (name, dev, mode) in nodes {
         let _ = fs::ramfs_create_chrdev(&dev_dentry, name.as_bytes(), dev, mode);

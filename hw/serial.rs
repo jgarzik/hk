@@ -8,6 +8,7 @@
 use crate::console::{ConsolePriority, register_console};
 use crate::util::error::KernelError;
 
+use crate::fs::chardev::{DevId, major};
 use crate::tty::{RAW_LDISC, Tty, TtyDriver};
 
 /// NS16550A register offsets
@@ -256,8 +257,13 @@ static SERIAL_DRIVER_S1: SerialTty = SerialTty::new(ports::COM2, "ttyS1");
 /// Static TTY instances wrapping the serial drivers
 ///
 /// These provide the proper layer separation: Console → TTY → Driver
-pub static SERIAL_TTY_S0: Tty = Tty::new("ttyS0", &SERIAL_DRIVER_S0, &RAW_LDISC);
-pub static SERIAL_TTY_S1: Tty = Tty::new("ttyS1", &SERIAL_DRIVER_S1, &RAW_LDISC);
+pub static SERIAL_TTY_S0: Tty = Tty::new("ttyS0", ttys_dev(0), &SERIAL_DRIVER_S0, &RAW_LDISC);
+pub static SERIAL_TTY_S1: Tty = Tty::new("ttyS1", ttys_dev(1), &SERIAL_DRIVER_S1, &RAW_LDISC);
+
+/// ttyS<n> is (4, 64 + n) (Linux devices.txt)
+const fn ttys_dev(n: u16) -> DevId {
+    DevId::new(major::TTYS, 64 + n)
+}
 
 /// Initialize the primary serial console
 ///
@@ -292,46 +298,8 @@ pub fn write_byte_com1(byte: u8) {
     SERIAL_DRIVER_S0.write_byte(byte);
 }
 
-use crate::fs::File;
-use crate::fs::chardev::{CharDevice, DevId, major, register_chardev};
-use crate::io::poll::PollTable;
-use alloc::sync::Arc;
-
-/// Wrapper to allow static TTY to be registered as Arc<dyn CharDevice>
-struct StaticTtyWrapper(&'static Tty);
-
-impl CharDevice for StaticTtyWrapper {
-    fn name(&self) -> &str {
-        self.0.name()
-    }
-
-    fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {
-        self.0.read(file, buf)
-    }
-
-    fn write(&self, file: &File, buf: &[u8]) -> Result<usize, KernelError> {
-        self.0.write(file, buf)
-    }
-
-    fn ioctl(&self, file: &File, cmd: u32, arg: u64) -> Result<i64, KernelError> {
-        self.0.ioctl(file, cmd, arg)
-    }
-
-    fn poll(&self, file: &File, pt: Option<&mut PollTable>) -> u16 {
-        self.0.poll(file, pt)
-    }
-}
-
-/// Register serial TTYs in the chardev registry
-///
-/// This must be called after the heap allocator is available.
-/// Creates entries for /dev/ttyS0, /dev/ttyS1 with major=4.
-pub fn register_serial_chardevs() {
-    // ttyS0 = major 4, minor 64 (Linux convention)
-    let tty_s0 = Arc::new(StaticTtyWrapper(&SERIAL_TTY_S0));
-    let _ = register_chardev(DevId::new(major::TTYS, 64), tty_s0);
-
-    // ttyS1 = major 4, minor 65
-    let tty_s1 = Arc::new(StaticTtyWrapper(&SERIAL_TTY_S1));
-    let _ = register_chardev(DevId::new(major::TTYS, 65), tty_s1);
+/// The serial ports' ttys (Linux serial8250 ports)
+pub fn serial_ttys() -> &'static [&'static Tty] {
+    static TTYS: [&Tty; 2] = [&SERIAL_TTY_S0, &SERIAL_TTY_S1];
+    &TTYS
 }

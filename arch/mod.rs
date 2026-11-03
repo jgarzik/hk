@@ -55,6 +55,12 @@ pub type CurrentArch = aarch64::Aarch64Arch;
 #[allow(unused_imports)]
 pub use x86_64::io::{inb, inl, inw, io_wait, outb, outl, outw};
 
+// The serial ports' ttys (16550 on x86, PL011 on arm64)
+#[cfg(target_arch = "x86_64")]
+pub use crate::hw::serial::serial_ttys;
+#[cfg(target_arch = "aarch64")]
+pub use aarch64::serial::serial_ttys;
+
 // Power management
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::power;

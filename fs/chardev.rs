@@ -93,6 +93,8 @@ pub mod major {
     pub const TTYS: DevMajor = 4;
     /// TTY special devices (/dev/tty, /dev/console, /dev/ptmx)
     pub const TTYAUX: DevMajor = 5;
+    /// AMBA serial ports (ttyAMA*, the arm64 PL011)
+    pub const AMBA: DevMajor = 204;
     /// USB serial ports (ttyUSB*)
     pub const TTYUSB: DevMajor = 188;
     /// Block device placeholder (for future)

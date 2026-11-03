@@ -38,7 +38,7 @@ use crate::sync::spin::Mutex;
 
 use crate::console::ConsoleDriver;
 use crate::fs::File;
-use crate::fs::chardev::CharDevice;
+use crate::fs::chardev::{CharDevice, DevId};
 use crate::io::poll::{POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM, PollTable};
 use crate::util::error::KernelError;
 
@@ -262,6 +262,8 @@ impl TtyState {
 pub struct Tty {
     /// Device name (e.g., "ttyS0", "ttyUSB0")
     name: &'static str,
+    /// Device number (/dev node)
+    dev: DevId,
     /// Terminal settings
     pub termios: Mutex<Termios>,
     /// Line discipline
@@ -278,17 +280,29 @@ impl Tty {
     /// Create a new TTY with the given driver (const fn for static init)
     pub const fn new(
         name: &'static str,
+        dev: DevId,
         driver: &'static dyn TtyDriver,
         ldisc: &'static dyn LineDiscipline,
     ) -> Self {
         Self {
             name,
+            dev,
             termios: Mutex::new(Termios::new()),
             ldisc,
             driver,
             input: Mutex::new(InputBuffer::new()),
             state: Mutex::new(TtyState::new()),
         }
+    }
+
+    /// Device name (/dev node)
+    pub fn name(&self) -> &'static str {
+        self.name
+    }
+
+    /// Device number
+    pub fn dev(&self) -> DevId {
+        self.dev
     }
 
     /// Check if echo is enabled
@@ -451,23 +465,47 @@ impl ConsoleDriver for Tty {
     }
 }
 
+/// A static tty as a registered character device
+struct TtyChar(&'static Tty);
+
+impl CharDevice for TtyChar {
+    fn name(&self) -> &str {
+        self.0.name
+    }
+
+    fn open(&self, file: &File) -> Result<(), KernelError> {
+        CharDevice::open(self.0, file)
+    }
+
+    fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {
+        CharDevice::read(self.0, file, buf)
+    }
+
+    fn write(&self, file: &File, buf: &[u8]) -> Result<usize, KernelError> {
+        CharDevice::write(self.0, file, buf)
+    }
+
+    fn ioctl(&self, file: &File, cmd: u32, arg: u64) -> Result<i64, KernelError> {
+        CharDevice::ioctl(self.0, file, cmd, arg)
+    }
+
+    fn poll(&self, file: &File, pt: Option<&mut PollTable>) -> u16 {
+        CharDevice::poll(self.0, file, pt)
+    }
+}
+
 /// Initialize TTY character devices in the chardev registry
 ///
 /// This registers serial TTYs for each architecture plus special devices
 /// like /dev/console and /dev/tty.
 /// Called from init_vfs() after heap is available.
 pub fn init_tty_chardevs() {
-    use crate::fs::chardev::{DevId, major, register_chardev};
+    use crate::fs::chardev::{major, register_chardev};
     use alloc::sync::Arc;
 
-    // Register platform-specific serial TTYs
-    #[cfg(target_arch = "x86_64")]
-    crate::hw::serial::register_serial_chardevs();
-
-    #[cfg(target_arch = "aarch64")]
-    {
-        // aarch64 serial registration will go here when implemented
-        // For now, no serial chardev on aarch64
+    // The serial ports (Linux uart_register_driver)
+    for &tty in crate::arch::serial_ttys() {
+        let _ = register_chardev(tty.dev, Arc::new(TtyChar(tty)));
     }
 
     // Register /dev/tty (major 5, minor 0) - controlling terminal
