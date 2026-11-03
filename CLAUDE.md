@@ -4,7 +4,7 @@ hk: stable-Rust (no nightly) no_std SMP kernel, x86-64 + aarch64, Linux syscall 
 
 ## Mission
 - Linux-compatible kernel for many-core 64-bit machines, grown in chunks toward full compatibility. Modern hardware only; targets: QEMU/virtio, Dell OptiPlex 3020.
-- Syscalls: 100%. ioctls, /proc, /sys: pragmatic subset driven by real apps.
+- ioctls, /proc, /sys: pragmatic subset driven by real apps.
 - IPv6 comes later: no IPv4-only assumptions in shared net layers.
 - No users yet: redesign internals freely (no compat shims) if `doc/LOCKING.md` stays correct. Linux ABI/semantics are binding.
 
