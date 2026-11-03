@@ -148,6 +148,9 @@ impl Driver {
             let _ = d.create_file(b"uevent", 0o200, Arc::new(DriverUevent(self)));
             let _ = d.create_file(b"bind", 0o200, Arc::new(BindAttr(self)));
             let _ = d.create_file(b"unbind", 0o200, Arc::new(UnbindAttr(self)));
+            if let Some(f) = self.bus.drv_attrs {
+                f(self, &d);
+            }
             d
         });
         self.add_module_links(made);

@@ -22,7 +22,12 @@ use crate::fs::kernfs::{self, Attr, BinAttr, SysBuf};
 use crate::sync::spin::Mutex;
 use crate::util::error::KernelError;
 
-pub static PCI_BUS: BusType = BusType::new("pci", pci_match, Some(pci_uevent));
+pub static PCI_BUS: BusType =
+    BusType::with_drv_attrs("pci", pci_match, Some(pci_uevent), Some(pci_drv_attrs));
+
+/// Ids added through drivers' new_id files, by driver name (Linux
+/// pci_driver.dynids; spin leaf)
+static DYNIDS: Mutex<Vec<(&'static str, PciDeviceId)>> = Mutex::new(Vec::new());
 
 /// Matches any vendor/device/subsystem id (Linux PCI_ANY_ID)
 pub const PCI_ANY_ID: u32 = !0;
@@ -74,12 +79,26 @@ impl PciDeviceId {
     /// Linux pci_match_one_device
     fn matches(&self, p: &PciDevice) -> bool {
         let h = &p.header;
-        let any = |want: u32, have: u16| want == PCI_ANY_ID || want == have as u32;
-        any(self.vendor, h.vendor_id)
-            && any(self.device, h.device_id)
-            && any(self.subvendor, h.subsystem_vendor_id)
-            && any(self.subdevice, h.subsystem_id)
-            && (self.class ^ p.class24()) & self.class_mask == 0
+        self.matches_ids(
+            [
+                h.vendor_id as u32,
+                h.device_id as u32,
+                h.subsystem_vendor_id as u32,
+                h.subsystem_id as u32,
+            ],
+            p.class24(),
+        )
+    }
+
+    /// pci_match_one_device against raw (vendor, device, subvendor,
+    /// subdevice) and class
+    fn matches_ids(&self, v: [u32; 4], class: u32) -> bool {
+        let any = |want: u32, have: u32| want == PCI_ANY_ID || want == have;
+        any(self.vendor, v[0])
+            && any(self.device, v[1])
+            && any(self.subvendor, v[2])
+            && any(self.subdevice, v[3])
+            && (self.class ^ class) & self.class_mask == 0
     }
 }
 
@@ -106,10 +125,111 @@ fn pci_match(dev: &Device, drv: &'static Driver) -> bool {
     if let Some(o) = d.driver_override.lock().as_deref() {
         return o == drv.name;
     }
-    let Some(PciIds(ids)) = drv.ids.downcast_ref::<PciIds>() else {
-        return false;
-    };
-    ids.iter().any(|id| id.matches(&d.pci))
+    let dynamic = DYNIDS
+        .lock()
+        .iter()
+        .any(|(n, id)| *n == drv.name && id.matches(&d.pci));
+    dynamic || static_ids(drv).iter().any(|id| id.matches(&d.pci))
+}
+
+fn static_ids(drv: &'static Driver) -> &'static [PciDeviceId] {
+    drv.ids.downcast_ref::<PciIds>().map_or(&[], |i| i.0)
+}
+
+/// An id from new_id/remove_id fields: vendor device [subvendor
+/// subdevice class class_mask] (missing ones match anything)
+fn field_id(f: &[u32]) -> PciDeviceId {
+    let get = |i: usize, d: u32| f.get(i).copied().unwrap_or(d);
+    PciDeviceId {
+        vendor: f[0],
+        device: f[1],
+        subvendor: get(2, PCI_ANY_ID),
+        subdevice: get(3, PCI_ANY_ID),
+        class: get(4, 0),
+        class_mask: get(5, 0),
+    }
+}
+
+/// new_id (Linux new_id_store): EEXIST if the driver matches such a
+/// device already, EINVAL for a driver_data no table entry has (hk ids
+/// carry none: only 0), then the id is added and unbound devices probed
+struct NewId(&'static Driver);
+
+impl Attr for NewId {
+    fn show(&self, _out: &mut SysBuf) -> Result<(), KernelError> {
+        Err(KernelError::Io)
+    }
+
+    fn store(&self, data: &[u8]) -> Result<usize, KernelError> {
+        let drv = self.0;
+        let f = crate::base::bus::hex_fields(data, 7);
+        if f.len() < 2 {
+            return Err(KernelError::InvalidArgument);
+        }
+        let id = field_id(&f);
+        if f.len() != 7 {
+            let dev = [id.vendor, id.device, id.subvendor, id.subdevice];
+            let dynamic = DYNIDS
+                .lock()
+                .iter()
+                .any(|(n, d)| *n == drv.name && d.matches_ids(dev, id.class));
+            if dynamic || static_ids(drv).iter().any(|s| s.matches_ids(dev, id.class)) {
+                return Err(KernelError::AlreadyExists);
+            }
+        } else if f[6] != 0 {
+            return Err(KernelError::InvalidArgument);
+        }
+        DYNIDS.lock().push((drv.name, id));
+        crate::base::dd::driver_attach(drv);
+        Ok(data.len())
+    }
+}
+
+/// remove_id (Linux remove_id_store): ENODEV if no such dynamic id
+struct RemoveId(&'static Driver);
+
+impl Attr for RemoveId {
+    fn show(&self, _out: &mut SysBuf) -> Result<(), KernelError> {
+        Err(KernelError::Io)
+    }
+
+    fn store(&self, data: &[u8]) -> Result<usize, KernelError> {
+        let f = crate::base::bus::hex_fields(data, 6);
+        if f.len() < 2 {
+            return Err(KernelError::InvalidArgument);
+        }
+        let id = field_id(&f);
+        let mut ids = DYNIDS.lock();
+        let i = ids
+            .iter()
+            .position(|(n, d)| {
+                *n == self.0.name
+                    && (
+                        d.vendor,
+                        d.device,
+                        d.subvendor,
+                        d.subdevice,
+                        d.class,
+                        d.class_mask,
+                    ) == (
+                        id.vendor,
+                        id.device,
+                        id.subvendor,
+                        id.subdevice,
+                        id.class,
+                        id.class_mask,
+                    )
+            })
+            .ok_or(KernelError::NoDevice)?;
+        ids.remove(i);
+        Ok(data.len())
+    }
+}
+
+/// new_id and remove_id of a PCI driver (Linux pci_drv_groups)
+fn pci_drv_attrs(drv: &'static Driver, dir: &Arc<crate::fs::kernfs::KNode>) {
+    let _ = dir.create_file(b"new_id", 0o200, Arc::new(NewId(drv)));
+    let _ = dir.create_file(b"remove_id", 0o200, Arc::new(RemoveId(drv)));
 }
 
 fn modalias(p: &PciDevice) -> String {

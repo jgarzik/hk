@@ -31,6 +31,7 @@ pub fn run_tests() {
     test_net();
     test_cpu();
     test_console();
+    test_new_id();
     test_bus_usb();
     test_unbind_usb();
     test_unbind_blk();
@@ -1494,6 +1495,57 @@ fn test_console() {
             return fail(N, b"console tty", count);
         }
         count += 1;
+    }
+    ok(N);
+}
+
+/// PCI and USB drivers' new_id/remove_id (Linux new_id_store,
+/// remove_id_store, usb_store_new_id): ids an existing entry matches
+/// are EEXIST, a removed one ENODEV on the second removal, malformed
+/// writes EINVAL; device-level USB drivers have no new_id
+fn test_new_id() {
+    const N: &[u8] = b"SYSFS_NEW_ID";
+    let pci = b"/sys/bus/pci/drivers/virtio-pci/";
+    let mut b = [0u8; 256];
+    if stat(path(&mut b, &[pci, b"new_id\0"])).is_err() {
+        if host_mode() {
+            return super::helpers::skip(N, b"no virtio-pci driver");
+        }
+        return fail(N, b"virtio-pci new_id", 0);
+    }
+    let w = |f: &[u8], d: &[u8]| {
+        let mut b = [0u8; 256];
+        write_str(path(&mut b, &[pci, f, b"\0"]), d)
+    };
+    let steps: [(&[u8], &[u8], i64); 7] = [
+        (b"new_id", b"1af4 1000\n", -17),
+        (b"new_id", b"1234 5678\n", 10),
+        (b"new_id", b"1234 5678\n", -17),
+        (b"new_id", b"1234 5679 ffffffff ffffffff 0 0 1\n", -22),
+        (b"remove_id", b"1234 5678\n", 10),
+        (b"remove_id", b"1234 5678\n", -19),
+        (b"new_id", b"zz\n", -22),
+    ];
+    for (i, (f, d, want)) in steps.iter().enumerate() {
+        let r = w(f, d);
+        if r != *want {
+            return fail(N, b"pci step", (i as i64) * 1000 + r);
+        }
+    }
+    let usb = b"/sys/bus/usb/drivers/usb-storage/";
+    if stat(path(&mut b, &[usb, b"new_id\0"])).is_ok() {
+        let mut p = [0u8; 256];
+        if write_str(path(&mut p, &[usb, b"new_id\0"]), b"1234 5678\n") != 10
+            || write_str(path(&mut p, &[usb, b"remove_id\0"]), b"1234 5678\n") != 10
+            || write_str(path(&mut p, &[usb, b"remove_id\0"]), b"1234\n") != -22
+        {
+            return fail(N, b"usb", 0);
+        }
+    } else if !host_mode() {
+        return fail(N, b"usb-storage new_id", 0);
+    }
+    if stat(b"/sys/bus/usb/drivers/usb/new_id\0").is_ok() {
+        return fail(N, b"usb generic new_id", 0);
     }
     ok(N);
 }

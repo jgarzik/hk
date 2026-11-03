@@ -319,7 +319,6 @@ immutable/append-only inodes (no IS_APPEND/IS_IMMUTABLE EPERM).
   below the interface), RAM disks are rdN (Linux brd: ramN).
 - PCI: no resource/resourceN/rom/enable/numa_node/local_cpus files;
   config is 256 bytes even for PCIe functions (no extended space).
-  Drivers have no new_id/remove_id (dynamic ids).
 - cpu: no cpuN/topology, cache/ or online files and no MODALIAS
   (CONFIG_GENERIC_CPU_AUTOPROBE); node: no meminfo/numastat/vmstat.
 - net: no queues/, phys_port_*, speed/duplex, ifalias or gro files;

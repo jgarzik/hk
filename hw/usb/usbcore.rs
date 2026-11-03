@@ -11,7 +11,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use super::driver::{UsbIds, modalias, product_env, usb_match_id};
+use super::driver::{UsbDeviceId, UsbIds, modalias, product_env, usb_match_id};
 use super::{EndpointType, UsbConfig, UsbDevice, UsbEndpoint, UsbInterface, UsbSpeed, class};
 use crate::base::bus::BusType;
 use crate::base::{Bound, Device, DeviceInfo, Driver, device_create};
@@ -19,7 +19,73 @@ use crate::fs::kernfs;
 use crate::printkln;
 use crate::util::error::KernelError;
 
-pub static USB_BUS: BusType = BusType::new("usb", usb_match, Some(usb_uevent));
+pub static USB_BUS: BusType =
+    BusType::with_drv_attrs("usb", usb_match, Some(usb_uevent), Some(usb_drv_attrs));
+
+/// Ids added through interface drivers' new_id files, by driver name
+/// (Linux usb_driver.dynids; spin leaf)
+static DYNIDS: crate::sync::spin::Mutex<Vec<(&'static str, UsbDeviceId)>> =
+    crate::sync::spin::Mutex::new(Vec::new());
+
+/// new_id (Linux usb_store_new_id): "idVendor idProduct
+/// [bInterfaceClass [refVendor refProduct]]"; the id is added and
+/// unbound interfaces probed
+struct NewId(&'static Driver);
+
+impl crate::fs::kernfs::Attr for NewId {
+    fn show(&self, _out: &mut crate::fs::kernfs::SysBuf) -> Result<(), KernelError> {
+        Err(KernelError::Io)
+    }
+
+    fn store(&self, data: &[u8]) -> Result<usize, KernelError> {
+        let f = crate::base::bus::hex_fields(data, 5);
+        if f.len() < 2 {
+            return Err(KernelError::InvalidArgument);
+        }
+        let mut id = UsbDeviceId::device(f[0] as u16, f[1] as u16);
+        if f.len() > 2 && f[2] != 0 {
+            if f[2] > 255 {
+                return Err(KernelError::InvalidArgument);
+            }
+            id.b_interface_class = f[2] as u8;
+            id.match_flags |= super::driver::id_match::INT_CLASS;
+        }
+        DYNIDS.lock().push((self.0.name, id));
+        crate::base::dd::driver_attach(self.0);
+        Ok(data.len())
+    }
+}
+
+/// remove_id (Linux usb_remove_id): every dynamic id of "idVendor
+/// idProduct" goes
+struct RemoveId(&'static Driver);
+
+impl crate::fs::kernfs::Attr for RemoveId {
+    fn show(&self, _out: &mut crate::fs::kernfs::SysBuf) -> Result<(), KernelError> {
+        Err(KernelError::Io)
+    }
+
+    fn store(&self, data: &[u8]) -> Result<usize, KernelError> {
+        let f = crate::base::bus::hex_fields(data, 2);
+        if f.len() < 2 {
+            return Err(KernelError::InvalidArgument);
+        }
+        let (v, p) = (f[0] as u16, f[1] as u16);
+        DYNIDS
+            .lock()
+            .retain(|(n, id)| !(*n == self.0.name && id.id_vendor == v && id.id_product == p));
+        Ok(data.len())
+    }
+}
+
+/// An interface driver's new_id and remove_id (Linux
+/// usb_create_newid_files)
+fn usb_drv_attrs(drv: &'static Driver, dir: &Arc<crate::fs::kernfs::KNode>) {
+    if matches!(drv.ids.downcast_ref::<UsbIds>(), Some(UsbIds::Interface(_))) {
+        let _ = dir.create_file(b"new_id", 0o200, Arc::new(NewId(drv)));
+        let _ = dir.create_file(b"remove_id", 0o200, Arc::new(RemoveId(drv)));
+    }
+}
 
 /// The generic usb_device driver (Linux usb_generic_driver)
 pub static USB_GENERIC_DRIVER: Driver =
@@ -62,9 +128,13 @@ pub fn usb_intf(dev: &Device) -> Option<(&UsbDevice, &UsbInterface)> {
 fn usb_match(dev: &Device, drv: &'static Driver) -> bool {
     match drv.ids.downcast_ref::<UsbIds>() {
         Some(UsbIds::Device) => usb_dev(dev).is_some(),
-        Some(UsbIds::Interface(ids)) => {
-            usb_intf(dev).is_some_and(|(d, f)| usb_match_id(ids, d, f).is_some())
-        }
+        Some(UsbIds::Interface(ids)) => usb_intf(dev).is_some_and(|(d, f)| {
+            let dynamic = DYNIDS
+                .lock()
+                .iter()
+                .any(|(n, id)| *n == drv.name && id.matches(d, f));
+            dynamic || usb_match_id(ids, d, f).is_some()
+        }),
         None => false,
     }
 }

@@ -38,6 +38,35 @@ pub fn system_dir() -> &'static Arc<KNode> {
 /// Adds a bus's variables to a device's uevent environment
 pub type UeventFn = fn(&Device, &mut Vec<Vec<u8>>);
 
+/// Adds a bus's files to a driver's directory (Linux bus->drv_groups)
+pub type DrvAttrsFn = fn(&'static Driver, &Arc<KNode>);
+
+/// Hex numbers of a sysfs write, as sscanf("%x %x ...") reads them:
+/// at most `max`, stopping at the first that does not parse
+pub fn hex_fields(data: &[u8], max: usize) -> Vec<u32> {
+    let mut out = Vec::new();
+    for w in data
+        .split(|c| c.is_ascii_whitespace())
+        .filter(|w| !w.is_empty())
+    {
+        if out.len() == max {
+            break;
+        }
+        let w = w
+            .strip_prefix(b"0x")
+            .or_else(|| w.strip_prefix(b"0X"))
+            .unwrap_or(w);
+        let Ok(t) = core::str::from_utf8(w) else {
+            break;
+        };
+        let Ok(v) = u32::from_str_radix(t, 16) else {
+            break;
+        };
+        out.push(v);
+    }
+    out
+}
+
 /// A bus's registered state (Linux struct subsys_private)
 struct BusPriv {
     dir: Arc<KNode>,
@@ -52,6 +81,8 @@ pub struct BusType {
     pub matches: fn(&Device, &'static Driver) -> bool,
     /// Bus variables of a device's uevents (Linux bus->uevent)
     pub uevent: Option<UeventFn>,
+    /// Bus files of each driver directory (Linux bus->drv_groups)
+    pub drv_attrs: Option<DrvAttrsFn>,
     p: Once<BusPriv>,
     /// Probe new devices and drivers (drivers_autoprobe)
     autoprobe: AtomicBool,
@@ -125,10 +156,21 @@ impl BusType {
         matches: fn(&Device, &'static Driver) -> bool,
         uevent: Option<UeventFn>,
     ) -> Self {
+        Self::with_drv_attrs(name, matches, uevent, None)
+    }
+
+    /// A bus whose driver directories get `drv_attrs`' files
+    pub const fn with_drv_attrs(
+        name: &'static str,
+        matches: fn(&Device, &'static Driver) -> bool,
+        uevent: Option<UeventFn>,
+        drv_attrs: Option<DrvAttrsFn>,
+    ) -> Self {
         Self {
             name,
             matches,
             uevent,
+            drv_attrs,
             p: Once::new(),
             autoprobe: AtomicBool::new(true),
             devices: Mutex::new(Vec::new()),
