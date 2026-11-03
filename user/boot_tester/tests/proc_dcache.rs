@@ -20,6 +20,7 @@ pub fn run_tests() {
     report(b"PROC_OWNER_REFRESH", owner_refresh());
     report(b"PROC_INO_UNIQUE", ino_unique());
     report(b"DROP_CACHES_DENTRIES", drop_dentries());
+    report(b"DCACHE_UMOUNT_FREED", umount_freed());
 }
 
 type R = Result<(), (&'static [u8], i64)>;
@@ -263,4 +264,55 @@ fn drop_dentries() -> R {
     }
     check(b"freed", before - after >= 100, before - after)?;
     check(b"mount kept", still, -1)
+}
+
+fn drop_caches2() {
+    for _ in 0..2 {
+        let fd = sys_open(b"/proc/sys/vm/drop_caches\0".as_ptr(), 1, 0);
+        sys_write(fd as u64, b"2\n".as_ptr(), 2);
+        sys_close(fd as u64);
+    }
+}
+
+/// What a filesystem cached goes with its last umount (Linux
+/// shrink_dcache_for_umount): a procfs mounted, 60 entries looked up,
+/// unmounted, leaves nr_dentry where it was
+fn umount_freed() -> R {
+    let mp = b"/tmp/dlk\0";
+    hk_syscall::sys_mkdir(b"/tmp\0".as_ptr(), 0o1777);
+    hk_syscall::sys_mkdir(mp.as_ptr(), 0o755);
+    drop_caches2();
+    let before = nr_dentry();
+    let r = hk_syscall::sys_mount(b"proc\0".as_ptr(), mp.as_ptr(), b"proc\0".as_ptr(), 0, 0);
+    let mut fds = [0i64; 60];
+    for f in fds.iter_mut() {
+        *f = sys_open(b"/tmp/dlk/self/status\0".as_ptr(), O_RDONLY, 0);
+    }
+    let mut p = *b"/tmp/dlk/self/fd/\0\0\0\0";
+    for &f in &fds {
+        let (mut v, mut d, mut k) = (f as u32, [0u8; 4], 0);
+        loop {
+            d[k] = b'0' + (v % 10) as u8;
+            k += 1;
+            v /= 10;
+            if v == 0 {
+                break;
+            }
+        }
+        for i in 0..k {
+            p[17 + i] = d[k - 1 - i];
+        }
+        p[17 + k] = 0;
+        let _ = stat(&p[..18 + k]);
+    }
+    for &f in &fds {
+        sys_close(f as u64);
+    }
+    let u = hk_syscall::sys_umount2(mp.as_ptr(), 0);
+    hk_syscall::sys_rmdir(mp.as_ptr());
+    drop_caches2();
+    let after = nr_dentry();
+    check(b"mount", r == 0, r)?;
+    check(b"umount", u == 0, u)?;
+    check(b"freed", after - before < 30, after - before)
 }

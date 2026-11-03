@@ -233,9 +233,19 @@ impl Drop for WriteAccess {
 }
 
 /// Every superblock (the dcache shrinker walks their trees); dead ones
-/// are dropped on the way
+/// are dropped when one is added
 static ALL_SBS: crate::sync::spin::Mutex<alloc::vec::Vec<alloc::sync::Weak<SuperBlock>>> =
     crate::sync::spin::Mutex::new(alloc::vec::Vec::new());
+
+impl Drop for SuperBlock {
+    /// What the filesystem had cached goes with it (Linux
+    /// shrink_dcache_for_umount)
+    fn drop(&mut self) {
+        if let Some(root) = self.root.get_mut().take() {
+            super::dentry::d_drop_tree(&root);
+        }
+    }
+}
 
 /// The `i`th live superblock, or None past the end (no allocation: the
 /// shrinker runs when memory is short)
@@ -341,7 +351,10 @@ impl SuperBlock {
             s_vfs_rename_mutex: sync::Mutex::new(()),
             s_umount: sync::RwSem::new(()),
         });
-        ALL_SBS.lock().push(Arc::downgrade(&sb));
+        let mut all = ALL_SBS.lock();
+        all.retain(|w| w.strong_count() != 0);
+        all.push(Arc::downgrade(&sb));
+        drop(all);
         sb
     }
 

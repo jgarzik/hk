@@ -1706,6 +1706,9 @@ next superblock, then per dentry the parent's d_lock (write) and the
 child's (read): spin locks only, allocating nothing. Direct reclaim
 never runs in atomic context (`may_direct_reclaim`), so an allocation
 under a d_lock or ALL_SBS cannot re-enter it.
+`dentry::d_drop_tree` (an unhashed dentry's cached subtree, a dying
+superblock's tree) takes the same parent-then-child d_locks one leaf
+at a time, with no RENAME_LOCK held (d_move drops it first).
 
 #### Mount Namespace & Mount Objects
 

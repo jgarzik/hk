@@ -160,6 +160,8 @@ impl Dentry {
             ci.children.clear();
         } else if let Some(c) = p.children.remove(name) {
             c.d_lock.write().flags.unhashed = true;
+            drop(p);
+            d_drop_tree(&c);
         }
     }
 
@@ -187,9 +189,9 @@ impl Dentry {
     /// later lookups ask the file system; a holder keeps an unhashed
     /// dentry
     pub fn remove_child(&self, name: &[u8]) -> Option<Arc<Dentry>> {
-        let mut p = self.d_lock.write();
-        let c = p.children.remove(name)?;
+        let c = self.d_lock.write().children.remove(name)?;
         c.d_lock.write().flags.unhashed = true;
+        d_drop_tree(&c);
         Some(c)
     }
 
@@ -321,6 +323,36 @@ fn prune_one(parent: &Arc<Dentry>, d: &Arc<Dentry>) -> bool {
     true
 }
 
+/// Everything cached below `d` leaves the tree (Linux
+/// shrink_dcache_parent / shrink_dcache_for_umount): a subtree out of
+/// the tree is no cache, and its parent<->child references would keep
+/// it alive. A dentry still held elsewhere (an open file, a cwd)
+/// survives, unhashed, with its parent chain. One leaf at a time, from
+/// `d` down, allocating nothing.
+pub fn d_drop_tree(d: &Arc<Dentry>) {
+    loop {
+        let mut cur = d.clone();
+        while let Some(c) = first_child(&cur) {
+            cur = c;
+        }
+        if Arc::ptr_eq(&cur, d) {
+            return;
+        }
+        let Some(parent) = cur.get_parent() else {
+            return;
+        };
+        let mut p = parent.d_lock.write();
+        let mut ci = cur.d_lock.write();
+        let gone = p.children.remove(&ci.name).is_some();
+        ci.flags.unhashed = true;
+        drop(ci);
+        drop(p);
+        if !gone {
+            return;
+        }
+    }
+}
+
 /// The child after `d` in `parent`, by name
 fn next_sibling(parent: &Dentry, d: &Dentry) -> Option<Arc<Dentry>> {
     use core::ops::Bound::{Excluded, Unbounded};
@@ -417,10 +449,15 @@ fn rehook(d: &Arc<Dentry>, parent: &Arc<Dentry>, name: FileName) {
 pub fn d_move(d: &Arc<Dentry>, parent: &Arc<Dentry>, name: &[u8]) {
     let _w = RENAME_LOCK.write();
     unhook(d);
-    if let Some(t) = parent.d_lock.write().children.remove(name) {
+    let t = parent.d_lock.write().children.remove(name);
+    if let Some(t) = &t {
         t.d_lock.write().flags.unhashed = true;
     }
     rehook(d, parent, name.into());
+    drop(_w);
+    if let Some(t) = t {
+        d_drop_tree(&t);
+    }
 }
 
 /// RENAME_EXCHANGE swapped `a` and `b` (Linux d_exchange): each takes
