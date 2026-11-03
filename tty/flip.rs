@@ -52,6 +52,12 @@ impl Flip {
         n
     }
 
+    /// Drop everything (an input flush)
+    pub(super) fn clear(&mut self) {
+        self.head = 0;
+        self.len = 0;
+    }
+
     /// Drop the oldest `n` bytes (the line discipline took them)
     fn consume(&mut self, n: usize) {
         self.head = (self.head + n) % FLIP_SIZE;
@@ -87,6 +93,8 @@ pub fn receive(tty: &Tty, bytes: &[u8]) {
 /// in order
 fn flush_to_ldisc(tty: &Tty) {
     let mut chunk = [0u8; 256];
+    // Held from peek to consume, so a flush_input cannot slip between
+    let _b = tty.buf_lock.lock();
     loop {
         let n = tty.flip.lock().peek(&mut chunk);
         if n == 0 {

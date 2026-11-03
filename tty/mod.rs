@@ -157,6 +157,9 @@ pub struct Tty {
     ldata: Mutex<n_tty::NTtyData>,
     /// Bytes from the driver's interrupt handler
     flip: IrqSpinlock<flip::Flip>,
+    /// Serializes feeding the flip buffer to the line discipline with
+    /// input flushes (Linux tty_bufhead.lock, a mutex)
+    buf_lock: crate::sync::Mutex<()>,
     /// Readers and pollers wait here for input (Linux read_wait)
     read_wait: WaitQueue,
     /// Session, foreground group, window size
@@ -173,6 +176,7 @@ impl Tty {
             driver,
             ldata: Mutex::new(n_tty::NTtyData::new()),
             flip: IrqSpinlock::new(flip::Flip::new()),
+            buf_lock: crate::sync::Mutex::new(()),
             read_wait: WaitQueue::new(),
             ctrl: Mutex::new(TtyCtrl::new()),
         }
@@ -266,7 +270,12 @@ impl Tty {
     }
 
     /// Flush the input buffer
+    /// Drop all received input, the flip buffer's too (Linux
+    /// tty_buffer_flush): under buf_lock, so bytes being fed to the line
+    /// discipline are not added after the flush
     pub fn flush_input(&self) {
+        let _b = self.buf_lock.lock();
+        self.flip.lock().clear();
         self.ldata.lock().reset();
     }
 
