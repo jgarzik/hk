@@ -454,9 +454,10 @@ fn kmain() -> ! {
     hw::usb::msc::USB_STORAGE_DRIVER.register();
     hw::usb::xhci::XHCI_PCI_DRIVER.register();
     hw::net::E1000_DRIVER.register();
-    hw::virtio::register_driver(&hw::net::virtio_net::VIRTIO_NET);
-    hw::virtio::register_driver(&hw::virtio::blk::VIRTIO_BLK);
+    hw::virtio::virtio_init();
     hw::virtio::VIRTIO_PCI_DRIVER.register();
+    hw::net::virtio_net::VIRTIO_NET_DRIVER.register();
+    hw::virtio::blk::VIRTIO_BLK_DRIVER.register();
 
     // RAM disk rd0 (Linux brd_init, a device initcall)
     let _ = crate::block::create_ramdisk(0, DEFAULT_RAMDISK_SIZE_MB);

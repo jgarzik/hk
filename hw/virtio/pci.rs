@@ -23,7 +23,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Once;
 
 use super::ring::{self, Layout, Vring};
-use super::{VirtioIrq, find_driver, status};
+use super::{VirtioIrq, status};
 use crate::arch::barrier::wmb;
 use crate::hw::dma::{DmaCoherent, DmaConfig, DmaDevice};
 use crate::hw::mmio::IoMem;
@@ -151,7 +151,7 @@ pub struct VirtioDevice {
     notify: IoMem,
     notify_mul: u32,
     /// Negotiated features
-    features: u64,
+    features: AtomicU64,
     irq: Once<Arc<dyn VirtioIrq>>,
     /// Interrupts that were ours (stats)
     irqs: AtomicU64,
@@ -183,7 +183,7 @@ impl VirtioDevice {
             device,
             notify,
             notify_mul: caps.notify_mul,
-            features: 0,
+            features: AtomicU64::new(0),
             irq: Once::new(),
             irqs: AtomicU64::new(0),
         })
@@ -251,7 +251,7 @@ impl VirtioDevice {
         Err(KernelError::Io)
     }
 
-    fn device_features(&self) -> u64 {
+    pub fn device_features(&self) -> u64 {
         self.w32(common::DFSELECT, 0);
         let lo = self.r32(common::DF) as u64;
         self.w32(common::DFSELECT, 1);
@@ -260,7 +260,7 @@ impl VirtioDevice {
     }
 
     /// Negotiate features and set FEATURES_OK (spec 3.1.1 steps 4-6)
-    fn negotiate(&mut self, driver: u64) -> Result<(), KernelError> {
+    pub fn negotiate(&self, driver: u64) -> Result<(), KernelError> {
         let f = super::negotiate(self.device_features(), driver)?;
         self.w32(common::GFSELECT, 0);
         self.w32(common::GF, f as u32);
@@ -270,13 +270,23 @@ impl VirtioDevice {
         if self.status() & status::FEATURES_OK == 0 {
             return Err(KernelError::NoDevice);
         }
-        self.features = f;
+        self.features.store(f, Ordering::Release);
         Ok(())
+    }
+
+    /// Negotiated features
+    pub fn features(&self) -> u64 {
+        self.features.load(Ordering::Acquire)
     }
 
     /// Feature bit `bit` was negotiated
     pub fn has_feature(&self, bit: u32) -> bool {
-        self.features & (1 << bit) != 0
+        self.features() & (1 << bit) != 0
+    }
+
+    /// Vendor id (Linux virtio_pci_modern_probe: the PCI subsystem vendor)
+    pub fn vendor(&self) -> u32 {
+        self.pci.header.subsystem_vendor_id as u32
     }
 
     /// Number of queues the device offers
@@ -471,22 +481,29 @@ fn virtio_id(pci: &PciDevice) -> Option<u32> {
     }
 }
 
-/// Reset, acknowledge and negotiate (spec 3.1.1 steps 1-6)
-fn vp_init(pci: &PciDevice, id: u32, driver: u64) -> Result<VirtioDevice, KernelError> {
+/// Map, reset and acknowledge (spec 3.1.1 steps 1-2; Linux
+/// register_virtio_device); the virtio bus probe negotiates
+fn vp_init(pci: &PciDevice, id: u32) -> Result<VirtioDevice, KernelError> {
     let mut pci = pci.clone();
     // Virtio devices address all 64 bits (Linux virtio_pci_modern_probe)
     pci.set_dma_mask_and_coherent(u64::MAX);
     pci.enable_memory_space();
     pci.enable_bus_master();
-    let mut vdev = VirtioDevice::map(pci, id)?;
+    let vdev = VirtioDevice::map(pci, id)?;
     vdev.reset()?;
     vdev.add_status(status::ACKNOWLEDGE);
-    vdev.add_status(status::DRIVER);
-    if let Err(e) = vdev.negotiate(driver) {
-        vdev.add_status(status::FAILED);
-        return Err(e);
-    }
     Ok(vdev)
+}
+
+/// A bound virtio-pci function: its virtio device
+struct VirtioPciDev {
+    _vdev: Arc<crate::base::Device>,
+}
+
+impl crate::base::Bound for VirtioPciDev {
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
 }
 
 /// Modern devices only (ENODEV for legacy ones, as without
@@ -496,15 +513,7 @@ fn virtio_pci_probe(
 ) -> Result<Box<dyn crate::base::Bound>, KernelError> {
     let pci = crate::hw::pci::driver::pci_dev(dev).ok_or(KernelError::NoDevice)?;
     let id = virtio_id(pci).ok_or(KernelError::NoDevice)?;
-    let drv = find_driver(id).ok_or(KernelError::NoDevice)?;
-    let vdev = Arc::new(vp_init(pci, id, drv.features())?);
-    printkln!(
-        "virtio-pci: {} device {} features {:#x}",
-        vdev.bus_id(),
-        id,
-        vdev.features
-    );
-    drv.probe(Arc::clone(&vdev)).inspect_err(|_| {
-        vdev.add_status(status::FAILED);
-    })
+    let vdev = Arc::new(vp_init(pci, id)?);
+    let v = super::register_virtio_device(dev, vdev)?;
+    Ok(Box::new(VirtioPciDev { _vdev: v }))
 }

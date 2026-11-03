@@ -1,10 +1,10 @@
-//! Virtio core: device status, feature negotiation, driver registry
+//! Virtio core: the virtio bus, device status, feature negotiation
 //!
 //! Linux reference: drivers/virtio/virtio.c; virtio 1.2 sections 2-3.
 //!
-//! Transports (`pci`: modern virtio-PCI only, no legacy) discover a device,
-//! negotiate features against the driver registered for its device ID and
-//! hand the driver an `Arc<VirtioDevice>`. Drivers set up their queues
+//! Transports (`pci`: modern virtio-PCI only, no legacy) register each
+//! device as virtio<N> on the virtio bus; binding negotiates features
+//! against the matching driver and hands it an `Arc<VirtioDevice>`. Drivers set up their queues
 //! (`setup_vq`), register an interrupt callback (`request_irq`) and call
 //! `ready()` (DRIVER_OK). Queues are split rings (`ring`) in coherent DMA
 //! memory, addressed only through the DMA API.
@@ -14,11 +14,17 @@ pub mod pci;
 pub mod ring;
 
 use alloc::boxed::Box;
+use alloc::format;
+use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::fmt::Write;
+use core::sync::atomic::{AtomicU32, Ordering};
 
-use crate::sync::spin::Mutex;
-
+use crate::base::bus::BusType;
+use crate::base::{Device, DeviceInfo, Driver, device_create};
+use crate::fs::kernfs;
+use crate::printkln;
 use crate::util::error::KernelError;
 
 pub use pci::{VIRTIO_PCI_DRIVER, VirtioDevice, Virtqueue};
@@ -74,9 +80,6 @@ pub trait VirtioIrq: Send + Sync {
 
 /// A driver for one virtio device type (Linux struct virtio_driver)
 pub trait VirtioDriver: Send + Sync {
-    fn name(&self) -> &'static str;
-    /// Virtio device ID handled
-    fn device_id(&self) -> u32;
     /// Device-specific feature bits the driver supports
     fn features(&self) -> u64;
     /// Bind to a device whose features are negotiated (FEATURES_OK set);
@@ -84,17 +87,125 @@ pub trait VirtioDriver: Send + Sync {
     fn probe(&self, vdev: Arc<VirtioDevice>) -> Result<Box<dyn crate::base::Bound>, KernelError>;
 }
 
-/// Registered virtio drivers (written at boot before bus enumeration)
-static DRIVERS: Mutex<Vec<&'static dyn VirtioDriver>> = Mutex::new(Vec::new());
+/// Matches any vendor (Linux VIRTIO_DEV_ANY_ID)
+pub const VIRTIO_DEV_ANY_ID: u32 = !0;
 
-/// Register a virtio driver (Linux register_virtio_driver)
-pub fn register_driver(drv: &'static dyn VirtioDriver) {
-    DRIVERS.lock().push(drv);
+/// A virtio driver's id table and callbacks (Linux virtio_driver's
+/// id_table and probe)
+pub struct VirtioIds {
+    /// (device id, vendor id) pairs
+    pub ids: &'static [(u32, u32)],
+    pub drv: &'static dyn VirtioDriver,
 }
 
-/// The driver for device ID `id`
-pub fn find_driver(id: u32) -> Option<&'static dyn VirtioDriver> {
-    DRIVERS.lock().iter().copied().find(|d| d.device_id() == id)
+pub static VIRTIO_BUS: BusType = BusType::new("virtio", virtio_match, Some(virtio_uevent));
+
+/// Linux virtio_init: the bus
+pub fn virtio_init() {
+    VIRTIO_BUS.register();
+}
+
+fn ids_of(drv: &'static Driver) -> Option<&'static VirtioIds> {
+    drv.ids.downcast_ref::<VirtioIds>()
+}
+
+/// Linux virtio_dev_match / virtio_id_match
+fn virtio_match(dev: &Device, drv: &'static Driver) -> bool {
+    let (Some(v), Some(ids)) = (dev.data::<VirtioDevice>(), ids_of(drv)) else {
+        return false;
+    };
+    ids.ids
+        .iter()
+        .any(|&(d, ven)| d == v.id() && (ven == VIRTIO_DEV_ANY_ID || ven == v.vendor()))
+}
+
+fn modalias(v: &VirtioDevice) -> String {
+    format!("virtio:d{:08X}v{:08X}", v.id(), v.vendor())
+}
+
+/// Linux virtio_uevent
+fn virtio_uevent(dev: &Device, env: &mut Vec<Vec<u8>>) {
+    if let Some(v) = dev.data::<VirtioDevice>() {
+        env.push(format!("MODALIAS={}", modalias(v)).into_bytes());
+    }
+}
+
+/// Linux virtio_dev_probe: DRIVER, features, then the driver's probe
+pub fn virtio_dev_probe(dev: &Arc<Device>) -> Result<Box<dyn crate::base::Bound>, KernelError> {
+    let vdev = dev
+        .data_arc::<VirtioDevice>()
+        .ok_or(KernelError::NoDevice)?;
+    let ids = dev.driver().and_then(ids_of).ok_or(KernelError::NoDevice)?;
+    vdev.add_status(status::DRIVER);
+    if let Err(e) = vdev.negotiate(ids.drv.features()) {
+        vdev.add_status(status::FAILED);
+        return Err(e);
+    }
+    printkln!(
+        "virtio: {} ({}) device {} features {:#x}",
+        dev.name(),
+        vdev.bus_id(),
+        vdev.id(),
+        vdev.features()
+    );
+    ids.drv.probe(vdev.clone()).inspect_err(|_| {
+        vdev.add_status(status::FAILED);
+    })
+}
+
+/// A virtio device's attributes (Linux virtio_dev_groups)
+fn virtio_attrs(dev: &Arc<Device>) -> Result<(), KernelError> {
+    let v = dev
+        .data_arc::<VirtioDevice>()
+        .ok_or(KernelError::NoDevice)?;
+    let text: [(&[u8], String); 3] = [
+        (b"device", format!("0x{:04x}\n", v.id())),
+        (b"vendor", format!("0x{:04x}\n", v.vendor())),
+        (b"modalias", format!("{}\n", modalias(&v))),
+    ];
+    for (name, s) in text {
+        dev.create_file(name, 0o444, kernfs::show(move |o| o.bytes(s.as_bytes())))?;
+    }
+    let st = v.clone();
+    dev.create_file(
+        b"status",
+        0o444,
+        kernfs::show(move |o| {
+            let _ = writeln!(o, "0x{:08x}", st.status());
+        }),
+    )?;
+    // Linux features_show: the first 64 bits, one digit each
+    dev.create_file(
+        b"features",
+        0o444,
+        kernfs::show(move |o| {
+            let f = v.features();
+            for i in 0..64 {
+                o.bytes(if f & (1 << i) != 0 { b"1" } else { b"0" });
+            }
+            o.bytes(b"\n");
+        }),
+    )?;
+    Ok(())
+}
+
+/// Next virtio index (Linux virtio_index_ida)
+static INDEX: AtomicU32 = AtomicU32::new(0);
+
+/// Register a transport's device as virtio<N> below it (Linux
+/// register_virtio_device)
+pub fn register_virtio_device(
+    parent: &Arc<Device>,
+    vdev: Arc<VirtioDevice>,
+) -> Result<Arc<Device>, KernelError> {
+    let n = INDEX.fetch_add(1, Ordering::Relaxed);
+    device_create(DeviceInfo {
+        parent: Some(parent),
+        bus: Some(&VIRTIO_BUS),
+        data: Some(vdev),
+        attrs: Some(virtio_attrs),
+        ..DeviceInfo::named(&format!("virtio{}", n))
+    })
 }
 
 #[cfg(test)]

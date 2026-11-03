@@ -424,14 +424,6 @@ fn setup_queues(vdev: &VirtioDevice) -> Result<(RxQueue, TxQueue), KernelError> 
 }
 
 impl VirtioDriver for VirtioNetDriver {
-    fn name(&self) -> &'static str {
-        "virtio-net"
-    }
-
-    fn device_id(&self) -> u32 {
-        virtio::id::NET
-    }
-
     fn features(&self) -> u64 {
         (1 << feature::MAC) | (1 << feature::STATUS)
     }
@@ -491,3 +483,15 @@ impl VirtioDriver for VirtioNetDriver {
         Ok(Box::new(VirtioNetWrapper { netdev, device }))
     }
 }
+
+/// The virtio_net driver on the virtio bus
+pub static VIRTIO_NET_DRIVER: crate::base::Driver = crate::base::Driver::new(
+    "virtio_net",
+    &virtio::VIRTIO_BUS,
+    None,
+    &virtio::VirtioIds {
+        ids: &[(virtio::id::NET, virtio::VIRTIO_DEV_ANY_ID)],
+        drv: &VIRTIO_NET,
+    },
+    virtio::virtio_dev_probe,
+);

@@ -393,14 +393,6 @@ fn new_disk(vdev: &Arc<VirtioDevice>) -> Result<Arc<Disk>, KernelError> {
 }
 
 impl VirtioDriver for VirtioBlkDriver {
-    fn name(&self) -> &'static str {
-        "virtio-blk"
-    }
-
-    fn device_id(&self) -> u32 {
-        virtio::id::BLOCK
-    }
-
     fn features(&self) -> u64 {
         [
             feature::SIZE_MAX,
@@ -431,3 +423,15 @@ impl VirtioDriver for VirtioBlkDriver {
         Ok(Box::new(VirtioBlkDev(blk)))
     }
 }
+
+/// The virtio_blk driver on the virtio bus
+pub static VIRTIO_BLK_DRIVER: crate::base::Driver = crate::base::Driver::new(
+    "virtio_blk",
+    &virtio::VIRTIO_BUS,
+    None,
+    &virtio::VirtioIds {
+        ids: &[(virtio::id::BLOCK, virtio::VIRTIO_DEV_ANY_ID)],
+        drv: &VIRTIO_BLK,
+    },
+    virtio::virtio_dev_probe,
+);

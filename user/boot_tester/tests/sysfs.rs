@@ -26,6 +26,7 @@ pub fn run_tests() {
     test_uevent_synth();
     test_bus_platform();
     test_bus_pci();
+    test_bus_virtio();
 }
 
 fn fail(name: &[u8], why: &[u8], v: i64) {
@@ -568,6 +569,59 @@ fn test_bus_pci() {
         if !has_id || !has_slot {
             return fail(N, b"uevent PCI_ID/PCI_SLOT_NAME", i as i64);
         }
+    }
+    ok(N);
+}
+
+/// Every virtio device: device/vendor formats agreeing with modalias
+/// and the uevent, a 64-digit features line; hk binds its net and block
+/// devices
+fn test_bus_virtio() {
+    const N: &[u8] = b"SYSFS_BUS_VIRTIO";
+    let devs = Names::of(b"/sys/bus/virtio/devices\0", DT_LNK);
+    let base: &[u8] = b"/sys/bus/virtio/devices/";
+    let mut bound = 0;
+    for i in 0..devs.n {
+        let d = devs.get(i);
+        let attr = |name: &[u8], out: &mut [u8]| -> usize {
+            let mut b = [0u8; 256];
+            let n = read_file(path(&mut b, &[base, d, b"/", name, b"\0"]), out);
+            n.max(0) as usize
+        };
+        let mut v = [0u8; 128];
+        let n = attr(b"device", &mut v);
+        let Some(device) = hex_attr(&v[..n], 4) else {
+            return fail(N, b"device format", i as i64);
+        };
+        let n = attr(b"vendor", &mut v);
+        let Some(vendor) = hex_attr(&v[..n], 4) else {
+            return fail(N, b"vendor format", i as i64);
+        };
+        let mut want = *b"virtio:dXXXXXXXXvXXXXXXXX\n";
+        upper_hex(device, 8, &mut want[8..16]);
+        upper_hex(vendor, 8, &mut want[17..25]);
+        let n = attr(b"modalias", &mut v);
+        if v[..n] != want {
+            return fail(N, b"modalias", i as i64);
+        }
+        let n = attr(b"features", &mut v);
+        if n != 65 || v[64] != b'\n' || !v[..64].iter().all(|&c| c == b'0' || c == b'1') {
+            return fail(N, b"features", n as i64);
+        }
+        let mut u = [0u8; 512];
+        let n = attr(b"uevent", &mut u);
+        let line = &want[..want.len() - 1];
+        let has = u[..n]
+            .split(|&c| c == b'\n')
+            .any(|l| l.strip_prefix(b"MODALIAS=") == Some(line));
+        if !has {
+            return fail(N, b"uevent MODALIAS", i as i64);
+        }
+        let mut b = [0u8; 256];
+        bound += stat(path(&mut b, &[base, d, b"/driver\0"])).is_ok() as i64;
+    }
+    if bound == 0 && !host_mode() {
+        return fail(N, b"no bound virtio device", 0);
     }
     ok(N);
 }
