@@ -11,8 +11,9 @@ infallible, so each one is investigated, not written off.
   batch): `BUSYBOX_NC_LO:FAIL status=0` (nc over loopback) in 1 of 5
   x86 `check-linux` runs, and in an hk x86 boot with one CPU
   (`QEMU_SMP=1`). Cause unknown: the test waits for the listener
-  (`wait_listen`) and retries the client. Seen again twice on 2026-11-03:
-  two uncached x86 `check-linux` runs of four (each passed on rerun).
+  (`wait_listen`) and retries the client. Seen again on 2026-11-03:
+  three uncached x86 `check-linux` runs and one hk x86 boot (each
+  passed on rerun).
 - **SWAPOUT_PAGEOUT flaky on the Linux reference** (J): one x86
   `check-linux` run had free swap 364 kB off the expected value after
   MADV_PAGEOUT of 16 MiB (beyond the test's tolerance), passing on the

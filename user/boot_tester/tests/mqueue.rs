@@ -49,6 +49,7 @@ pub fn run_tests() {
     test_mq_close_fd();
     test_mq_emsgsize();
     test_mq_name_slash();
+    test_mq_name_toolong();
 }
 
 /// Test mq_open creates a new queue
@@ -497,4 +498,32 @@ fn test_mq_name_slash() {
         return;
     }
     println(b"MQ_NAME_SLASH:OK");
+}
+
+/// A name longer than NAME_MAX is ENAMETOOLONG for mq_open and
+/// mq_unlink (Linux: getname, then the lookup in the mqueue root)
+fn test_mq_name_toolong() {
+    let mut name = [b'q'; 301];
+    name[300] = 0;
+    let attr = MqAttr {
+        mq_flags: 0,
+        mq_maxmsg: 4,
+        mq_msgsize: 64,
+        mq_curmsgs: 0,
+        __reserved: [0; 4],
+    };
+    let o = sys_mq_open(name.as_ptr(), O_RDWR as i32 | O_CREAT as i32, 0o644, &attr);
+    let u = sys_mq_unlink(name.as_ptr());
+    if o >= 0 {
+        sys_close(o as u64);
+    }
+    if o == -36 && u == -36 {
+        println(b"MQ_NAME_TOOLONG:OK");
+    } else {
+        print(b"MQ_NAME_TOOLONG:FAIL open=");
+        print_num(o);
+        print(b" unlink=");
+        print_num(u);
+        println(b"");
+    }
 }

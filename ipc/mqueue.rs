@@ -559,8 +559,11 @@ fn validate_mq_name(name: &[u8]) -> Result<(), KernelError> {
 /// mq_open - open a message queue
 pub fn sys_mq_open(name_ptr: u64, oflag: i32, mode: u32, attr_ptr: u64) -> i64 {
     // Read name from user space
+    // Longer than NAME_MAX: ENAMETOOLONG (Linux: the lookup of the
+    // name in the mqueue root)
     let name = match strncpy_from_user::<Uaccess>(name_ptr, NAME_MAX + 1) {
         Ok(s) => s,
+        Err(crate::uaccess::UaccessError::TooLong) => return KernelError::NameTooLong.sysret(),
         Err(_) => return KernelError::BadAddress.sysret(),
     };
 
@@ -663,8 +666,11 @@ pub fn sys_mq_open(name_ptr: u64, oflag: i32, mode: u32, attr_ptr: u64) -> i64 {
 /// mq_unlink - remove a message queue
 pub fn sys_mq_unlink(name_ptr: u64) -> i64 {
     // Read name from user space
+    // Longer than NAME_MAX: ENAMETOOLONG (Linux: the lookup of the
+    // name in the mqueue root)
     let name = match strncpy_from_user::<Uaccess>(name_ptr, NAME_MAX + 1) {
         Ok(s) => s,
+        Err(crate::uaccess::UaccessError::TooLong) => return KernelError::NameTooLong.sysret(),
         Err(_) => return KernelError::BadAddress.sysret(),
     };
 

@@ -65,8 +65,8 @@ fn stat_path(dirfd: i32, path_ptr: u64, flags: i32, statbuf: u64) -> Result<(), 
         return Err(KernelError::InvalidArgument);
     }
     let path = getname_maybe_null(path_ptr, flags)?;
-    let dentry = filename_lookup(dirfd, &path, LookupFlags::at(flags))?;
-    let inode = dentry.get_inode().ok_or(KernelError::NotFound)?;
+    let p = filename_lookup(dirfd, &path, LookupFlags::at(flags))?;
+    let inode = p.get_inode().ok_or(KernelError::NotFound)?;
     put_user::<Uaccess, Stat>(statbuf, fill_stat(&inode)).map_err(|_| KernelError::BadAddress)
 }
 
