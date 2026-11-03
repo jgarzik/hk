@@ -16,7 +16,12 @@
 //!   queue (the ISR status does not say which queue fired); completions
 //!   restart dispatch of bios that waited for room.
 //! - Disks: vda, vdb, ... on one dynamic major ("virtblk"), 16 minors
-//!   each (Linux PART_BITS 4).
+//!   each (Linux PART_BITS 4); the index is freed with the disk, after
+//!   its last reference (Linux virtblk_free_disk).
+//! - Remove (Linux virtblk_remove): `del_gendisk` fails new I/O and
+//!   waits for the requests in flight; the queues are taken back from
+//!   blk-mq, the IRQ freed, the device reset and the rings, header
+//!   pools freed (`del_vqs`).
 //!
 //! ## Locking (doc/LOCKING.md 3.10, Block Device Subsystem)
 //!
@@ -30,19 +35,19 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
-use core::sync::atomic::{AtomicU32, Ordering};
 
 use spin::Once;
 
 use crate::arch::phys_to_virt;
 use crate::block::blk_mq::{BlkMq, MqOps, Queued};
 use crate::block::blkdev::{Bio, BioList, BioOp, Disk, QueueLimits, RequestQueue, register_blkdev};
-use crate::block::genhd::{add_disk, disk_name};
+use crate::block::genhd::{add_disk, del_gendisk, disk_name};
 use crate::hw::dma::{DmaAddr, DmaCoherent, DmaDirection, dma_map_single, dma_unmap_single};
 use crate::hw::virtio::ring::Sg;
 use crate::hw::virtio::{self, VirtioDevice, VirtioDriver, VirtioIrq, Virtqueue};
 use crate::printkln;
 use crate::util::error::KernelError;
+use crate::util::ida::Ida;
 
 /// Device-specific feature bits
 mod feature {
@@ -257,6 +262,10 @@ impl MqOps for VbQueue {
             done.push(bio);
         }
     }
+
+    fn into_any(self: Box<Self>) -> Box<dyn Any + Send> {
+        self
+    }
 }
 
 /// A virtio-blk disk: interrupt side
@@ -290,6 +299,45 @@ impl crate::base::Bound for VirtioBlkDev {
             self.0.vdev.irqs()
         );
     }
+
+    /// Linux virtblk_remove
+    fn remove(&self) {
+        let b = &self.0;
+        // Nothing in flight, nothing more started
+        del_gendisk(&b.disk);
+        b.vdev.free_irq();
+        let qs = b.disk.queue.mq().map_or(Vec::new(), |m| m.release());
+        stop(&b.vdev, qs);
+        printkln!("virtio-blk: {} removed", b.disk.name);
+    }
+}
+
+/// Reset the device and free the queues' rings and header pools (Linux
+/// virtio_reset_device + del_vqs); on a reset that does not complete the
+/// memory is leaked
+fn stop(vdev: &VirtioDevice, qs: Vec<Box<dyn MqOps>>) {
+    let qs: Vec<VbQueue> = qs
+        .into_iter()
+        .filter_map(|q| q.into_any().downcast::<VbQueue>().ok())
+        .map(|q| *q)
+        .collect();
+    let mut pools = Vec::with_capacity(qs.len());
+    let vqs: Vec<Virtqueue> = qs
+        .into_iter()
+        .map(|q| {
+            pools.push(q.pool);
+            q.vq
+        })
+        .collect();
+    if vdev.del_vqs(vqs).is_err() {
+        printkln!("virtio-blk: {}: reset failed", vdev.bus_id());
+        return;
+    }
+    for p in pools {
+        // SAFETY: the device is reset (no DMA into the headers or status
+        // bytes) and its queue, the pool's only user, is gone
+        unsafe { crate::hw::dma::dma_free_coherent(vdev, p) };
+    }
 }
 
 /// The virtio-blk driver (registered with `virtio::register_driver`)
@@ -299,8 +347,17 @@ pub static VIRTIO_BLK: VirtioBlkDriver = VirtioBlkDriver;
 
 /// Dynamic major of all virtio disks
 static MAJOR: Once<u16> = Once::new();
-/// Next disk index (vda = 0)
-static INDEX: AtomicU32 = AtomicU32::new(0);
+/// Disk indexes (vda = 0; Linux vd_index_ida)
+static INDEX: Ida = Ida::new();
+
+/// A disk's index, freed with the disk (Linux virtblk_free_disk)
+struct VdIndex(u32);
+
+impl Drop for VdIndex {
+    fn drop(&mut self) {
+        INDEX.free(self.0);
+    }
+}
 
 fn limits(vdev: &VirtioDevice, ring: u16) -> QueueLimits {
     let f = |b| vdev.has_feature(b);
@@ -362,8 +419,8 @@ fn new_disk(vdev: &Arc<VirtioDevice>) -> Result<Arc<Disk>, KernelError> {
     let major = *MAJOR
         .try_call_once(|| register_blkdev(0, "virtblk"))
         .map_err(|_| KernelError::Io)?;
-    let index = INDEX.fetch_add(1, Ordering::Relaxed);
-    if index as usize * VD_MINORS as usize > u16::MAX as usize - VD_MINORS as usize {
+    let index = VdIndex(INDEX.alloc());
+    if index.0 as usize * VD_MINORS as usize > u16::MAX as usize - VD_MINORS as usize {
         return Err(KernelError::Io);
     }
     let (mq, ring) = setup_queues(vdev)?;
@@ -373,12 +430,13 @@ fn new_disk(vdev: &Arc<VirtioDevice>) -> Result<Arc<Disk>, KernelError> {
     let cap = vdev.read_config(|d| d.cfg64(cfg::CAPACITY));
     let disk = Disk::new(
         major,
-        index as u16 * VD_MINORS,
+        index.0 as u16 * VD_MINORS,
         VD_MINORS,
-        disk_name("vd", index),
+        disk_name("vd", index.0),
         cap,
         RequestQueue::new_mq(mq, lim, wc),
     );
+    disk.private.call_once(|| Box::new(index));
     disk.set_ro(vdev.has_feature(feature::RO));
     printkln!(
         "virtio-blk: {} {} sectors, {}/{} bytes, {} queues{}{}",
@@ -418,13 +476,19 @@ impl VirtioDriver for VirtioBlkDriver {
             vdev: vdev.clone(),
             disk: disk.clone(),
         });
-        vdev.request_irq(blk.clone() as Arc<dyn VirtioIrq>)
-            .map_err(|e| {
-                printkln!("virtio-blk: no IRQ ({})", e);
-                KernelError::NoDevice
-            })?;
+        let fail = |e| {
+            vdev.free_irq();
+            stop(&vdev, disk.queue.mq().map_or(Vec::new(), |m| m.release()));
+            e
+        };
+        if let Err(e) = vdev.request_irq(blk.clone() as Arc<dyn VirtioIrq>) {
+            printkln!("virtio-blk: no IRQ ({})", e);
+            return Err(fail(KernelError::NoDevice));
+        }
         vdev.ready();
-        add_disk(disk, Some(dev)).map_err(|_| KernelError::Io)?;
+        if add_disk(disk.clone(), Some(dev)).is_err() {
+            return Err(fail(KernelError::Io));
+        }
         Ok(Box::new(VirtioBlkDev(blk)))
     }
 }

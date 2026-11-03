@@ -750,7 +750,18 @@ fat_get_cluster keeps a per-inode cache of chain positions
   Linux also drives transitional devices), INTx only (no MSI-X),
   capacity changes (config interrupts) are ignored, no DISCARD,
   WRITE_ZEROES, GET_ID (serial) or secure erase. The disk's queues are
-  fixed at probe (no hot add/remove of virtio disks).
+  fixed at probe.
+- Disk removal (`del_gendisk`) drops the page cache without writing it
+  back; Linux syncs it first on an orderly removal (bdev_mark_dead with
+  surprise = false: sync_blockdev), so dirty device-file data is lost
+  on unbind.
+- virtio-pci remove leaves the BAR mappings (common, notify, ISR,
+  device config): `IoMem` windows are copyable and never unmapped, so
+  each transport rebind leaks the ioremap space of one device (Linux
+  vp_modern_remove iounmaps them).
+- A removed kernfs binary attribute (`Kind::Bin`, e.g. PCI `config`)
+  keeps its operations, and so the object behind them, while a stale
+  dentry or open file holds the node (text attributes drop theirs).
 - No /proc/devices block section, no /sys/block; the first disk
   registered decides the dynamic major (254 down, like Linux, but Linux
   usually has other dynamic majors registered first).

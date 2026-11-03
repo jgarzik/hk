@@ -197,14 +197,14 @@ fn bdev_device_add(b: &Arc<BlockDevice>, parent: Option<&Arc<Device>>) {
             if disk && let Some(sb) = SYS_BLOCK.get() {
                 let _ = sb.create_link(b.name.as_bytes(), d.kobj());
             }
-            b.kdev.call_once(|| d);
+            b.kdev.call_once(|| Arc::downgrade(&d));
         }
         Err(e) => crate::printkln!("block: {}: {:?}", b.name, e),
     }
 }
 
 fn bdev_device_del(b: &BlockDevice) {
-    if let Some(d) = b.kdev.get() {
+    if let Some(d) = b.kdev.get().and_then(|d| d.upgrade()) {
         if b.partno == 0
             && let Some(sb) = SYS_BLOCK.get()
         {
@@ -239,7 +239,7 @@ pub fn add_disk(
 /// Read the partition table and add a block device per partition
 /// (Linux blk_add_partitions); called with `open_mutex` held
 fn scan_partitions(whole: &BlockDevice) {
-    let parent = whole.kdev.get();
+    let parent = whole.kdev.get().and_then(|d| d.upgrade());
     let disk = &whole.disk;
     let mut rd = |s: u64, b: &mut [u8; 512]| bdev_rw_bytes(whole, BioOp::Read, s << 9, b);
     let parts = part::scan(&mut rd, whole.nr_sects(), disk.minors as usize);
@@ -252,7 +252,7 @@ fn scan_partitions(whole: &BlockDevice) {
             part_name(&disk.name, no),
         ));
         if register_bdev(b.clone()).is_ok() {
-            bdev_device_add(&b, parent);
+            bdev_device_add(&b, parent.as_ref());
         }
     }
 }
@@ -294,15 +294,19 @@ pub fn rescan(bdev: &BlockDevice) -> Result<(), KernelError> {
     Ok(())
 }
 
-/// Unregister a disk and its partitions (Linux del_gendisk)
+/// Unregister a disk and its partitions (Linux del_gendisk): new I/O
+/// fails with EIO, open files get EIO, and the requests in flight
+/// complete before it returns, so the driver may then stop the device
 pub fn del_gendisk(disk: &Arc<Disk>) {
     {
         // Under open_mutex, like a rescan: an open in progress either
         // finished before or sees the device dead
         let _g = disk.open_mutex.lock();
+        disk.queue.start_drain();
         drop_bdevs(disk, 0);
     }
     disk_release(disk);
+    disk.queue.drain();
 }
 
 /// /proc/partitions (Linux show_partition): every block device with a

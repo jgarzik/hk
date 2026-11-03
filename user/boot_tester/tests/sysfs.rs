@@ -31,6 +31,7 @@ pub fn run_tests() {
     test_net();
     test_cpu();
     test_bus_usb();
+    test_unbind_blk();
 }
 
 fn fail(name: &[u8], why: &[u8], v: i64) {
@@ -988,4 +989,179 @@ fn test_cpu() {
         return fail(N, b"node0/cpu0 link", 0);
     }
     ok(N);
+}
+
+/// Receive uevents until one with a header starting `act` and ending
+/// `tail` arrives (other devices' events skipped)
+fn event_ending(fd: i32, act: &[u8], tail: &[u8]) -> bool {
+    let mut buf = [0u8; 2048];
+    for _ in 0..64 {
+        let (n, _) = recv_creds(fd, &mut buf);
+        if n <= 0 {
+            return false;
+        }
+        if let Some(h) = vars(&buf[..n as usize]).next()
+            && h.starts_with(act)
+            && h.ends_with(tail)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// The transport level: unbinding the PCI function from virtio-pci
+/// deletes its virtio device `v` (and the disk `d` with it); binding it
+/// back registers it again under the freed index, with the disk
+fn unbind_pci(fd: i32, d: &[u8], v: &[u8], before: &[u8; 512]) -> Result<(), (&'static [u8], i64)> {
+    // The function: the directory above the virtio device
+    let mut lb = [0u8; 256];
+    let mut t = [0u8; 256];
+    let p = path(&mut lb, &[b"/sys/bus/virtio/devices/", v]);
+    let n = sys_readlink(p.as_ptr(), t.as_mut_ptr(), t.len() as u64);
+    if n <= 0 {
+        return Err((b"virtio device link", n));
+    }
+    let t = &t[..n as usize];
+    let up = &t[..t.iter().rposition(|&c| c == b'/').unwrap_or(0)];
+    let f = &up[up.iter().rposition(|&c| c == b'/').map_or(0, |k| k + 1)..];
+    let drv: &[u8] = b"/sys/bus/pci/drivers/virtio-pci/";
+    let mut ub = [0u8; 256];
+    let w = write_str(path(&mut ub, &[drv, b"unbind"]), f);
+    if w != f.len() as i64 {
+        return Err((b"pci unbind", w));
+    }
+    let mut tail = [0u8; 64];
+    tail[0] = b'/';
+    tail[1..=v.len()].copy_from_slice(v);
+    if !event_ending(fd, b"remove@", &tail[..=v.len()]) {
+        return Err((b"no virtio remove event", 0));
+    }
+    let mut sb = [0u8; 256];
+    if stat(path(&mut sb, &[b"/sys/bus/virtio/devices/", v])).is_ok() {
+        return Err((b"virtio device still there", 0));
+    }
+    let mut bb = [0u8; 256];
+    let w = write_str(path(&mut bb, &[drv, b"bind"]), f);
+    if w != f.len() as i64 {
+        return Err((b"pci bind", w));
+    }
+    let mut sb = [0u8; 256];
+    if stat(path(&mut sb, &[b"/sys/bus/virtio/devices/", v, b"/driver"])).is_err() {
+        return Err((b"virtio device not back", 0));
+    }
+    let mut after = [0u8; 512];
+    let r = sector0(d, &mut after);
+    if r != 512 || after != *before {
+        return Err((b"read after pci bind", r));
+    }
+    Ok(())
+}
+
+/// The first sector of /dev/<d>
+fn sector0(d: &[u8], out: &mut [u8; 512]) -> i64 {
+    let mut b = [0u8; 256];
+    let fd = sys_open(path(&mut b, &[b"/dev/", d]).as_ptr(), O_RDONLY, 0);
+    if fd < 0 {
+        return fd;
+    }
+    let n = hk_syscall::sys_pread64(fd as i32, out.as_mut_ptr(), 512, 0);
+    sys_close(fd as u64);
+    n
+}
+
+/// Unbinding the first virtio disk's device from virtio_blk removes the
+/// disk (/sys/block, /dev, "remove" then "unbind" uevents) and fails
+/// I/O on a file still open with EIO; binding it back brings the disk
+/// back under its name with the same data. hk only: the Linux reference
+/// VM may boot from its virtio disk
+fn test_unbind_blk() {
+    const N: &[u8] = b"SYSFS_UNBIND_BLK";
+    if host_mode() {
+        return skip(N, b"would remove the reference VM's disk");
+    }
+    let disks = Names::of(b"/sys/block\0", DT_LNK);
+    let Some(i) = (0..disks.n).find(|&i| disks.get(i).starts_with(b"vd")) else {
+        return fail(N, b"no virtio disk", 0);
+    };
+    let d = disks.get(i);
+    // The virtio device: the last part of the disk's device link
+    let mut lb = [0u8; 256];
+    let mut t = [0u8; 256];
+    let p = path(&mut lb, &[b"/sys/block/", d, b"/device"]);
+    let n = sys_readlink(p.as_ptr(), t.as_mut_ptr(), t.len() as u64);
+    if n <= 0 {
+        return fail(N, b"device link", n);
+    }
+    let t = &t[..n as usize];
+    let v = &t[t.iter().rposition(|&c| c == b'/').map_or(0, |k| k + 1)..];
+    if !v.starts_with(b"virtio") {
+        return fail(N, b"not a virtio device", 0);
+    }
+    let mut before = [0u8; 512];
+    let r = sector0(d, &mut before);
+    if r != 512 {
+        return fail(N, b"read before", r);
+    }
+    let Some(fd) = uevent_sock() else {
+        return fail(N, b"socket", 0);
+    };
+    let r = (|| {
+        let mut nb = [0u8; 256];
+        let node = path(&mut nb, &[b"/dev/", d]);
+        let held = sys_open(node.as_ptr(), O_RDONLY, 0);
+        if held < 0 {
+            return Err((&b"open"[..], held));
+        }
+        let drv: &[u8] = b"/sys/bus/virtio/drivers/virtio_blk/";
+        let mut ub = [0u8; 256];
+        let w = write_str(path(&mut ub, &[drv, b"unbind"]), v);
+        // Uncached data of the removed disk: EIO
+        let mut x = [0u8; 512];
+        let e = hk_syscall::sys_pread64(held as i32, x.as_mut_ptr(), 512, 1 << 20);
+        sys_close(held as u64);
+        if w != v.len() as i64 {
+            return Err((&b"unbind"[..], w));
+        }
+        if e != -5 {
+            return Err((&b"read of a removed disk"[..], e));
+        }
+        let mut tail = [0u8; 64];
+        tail[0] = b'/';
+        tail[1..=d.len()].copy_from_slice(d);
+        if !event_ending(fd, b"remove@", &tail[..=d.len()]) {
+            return Err((&b"no remove event"[..], 0));
+        }
+        tail[1..=v.len()].copy_from_slice(v);
+        if !event_ending(fd, b"unbind@", &tail[..=v.len()]) {
+            return Err((&b"no unbind event"[..], 0));
+        }
+        let mut sb = [0u8; 256];
+        if stat(path(&mut sb, &[b"/sys/block/", d])).is_ok() || stat(node).is_ok() {
+            return Err((&b"disk still there"[..], 0));
+        }
+        let mut bb = [0u8; 256];
+        let w = write_str(path(&mut bb, &[drv, b"bind"]), v);
+        if w != v.len() as i64 {
+            return Err((&b"bind"[..], w));
+        }
+        if !event_ending(fd, b"bind@", &tail[..=v.len()]) {
+            return Err((&b"no bind event"[..], 0));
+        }
+        let mut sb = [0u8; 256];
+        if stat(path(&mut sb, &[b"/sys/block/", d])).is_err() {
+            return Err((&b"disk not back"[..], 0));
+        }
+        let mut after = [0u8; 512];
+        let r = sector0(d, &mut after);
+        if r != 512 || after != before {
+            return Err((&b"read after bind"[..], r));
+        }
+        unbind_pci(fd, d, v, &before)
+    })();
+    sys_close(fd as u64);
+    match r {
+        Ok(()) => ok(N),
+        Err((why, v)) => fail(N, why, v),
+    }
 }

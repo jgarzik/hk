@@ -179,7 +179,7 @@ impl OpenAttr {
         self.event
             .store(a.event.load(Ordering::Acquire), Ordering::Release);
         let mut out = SysBuf::default();
-        a.ops.show(&mut out)?;
+        a.ops().ok_or(KernelError::NoDevice)?.show(&mut out)?;
         out.0.truncate(ATTR_MAX - 1);
         Ok(out.0)
     }
@@ -253,7 +253,10 @@ impl KernfsFops {
         }
         let _b = of.buf.lock();
         let _act = kn.get_active().ok_or(KernelError::NoDevice)?;
-        attr_node(&kn).ops.store(data)
+        attr_node(&kn)
+            .ops()
+            .ok_or(KernelError::NoDevice)?
+            .store(data)
     }
 }
 

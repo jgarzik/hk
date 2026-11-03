@@ -15,8 +15,10 @@
 //! Attribute show/store run under an active reference (Linux
 //! kernfs_get_active), never under a tree lock. Removal deactivates the
 //! whole subtree first, waits for in-flight operations to drain (Linux
-//! kernfs_drain), then unlinks it; operations on files opened before
-//! fail with ENODEV.
+//! kernfs_drain), then drops the attributes' operations (a node kept by
+//! a stale dentry or open file no longer pins the object behind them,
+//! as Linux kernfs nodes do not pin their kobject) and unlinks it;
+//! operations on files opened before fail with ENODEV.
 //!
 //! ## Locking
 //!
@@ -26,6 +28,8 @@
 //! - `KNode.children`, `KNode.name`, `KNode.parent` (spin `RwLock`,
 //!   leaves): taken alone, for lookups and listings, or under the rwsem
 //!   for changes.
+//! - `AttrNode.ops` (spin `RwLock`, leaf): read to clone the operations
+//!   under an active reference; cleared once, after the drain.
 //! - `KNode.active`: incremented lock-free by `get_active` (CAS, refused
 //!   once negative); the deactivation bias is added only under the
 //!   rwsem (write), once per node. Drain waits on `KNode.drain` with no
@@ -116,11 +120,20 @@ pub fn show(f: impl Fn(&mut SysBuf) + Send + Sync + 'static) -> Arc<dyn Attr> {
 
 /// An attribute node's state
 pub struct AttrNode {
-    pub ops: Arc<dyn Attr>,
+    /// None once the node is removed
+    ops: RwLock<Option<Arc<dyn Attr>>>,
     /// Bumped by `notify` (Linux kernfs_open_node.event)
     event: AtomicU32,
     /// Pollers of `event`
     poll: WaitQueue,
+}
+
+impl AttrNode {
+    /// The operations, while the node is not removed (call under an
+    /// active reference)
+    pub fn ops(&self) -> Option<Arc<dyn Attr>> {
+        self.ops.read().clone()
+    }
 }
 
 /// A child's key: (name hash, namespace tag, name)
@@ -335,7 +348,7 @@ impl KNode {
         ops: Arc<dyn Attr>,
     ) -> Result<Arc<KNode>, KernelError> {
         let a = AttrNode {
-            ops,
+            ops: RwLock::new(Some(ops)),
             event: AtomicU32::new(0),
             poll: WaitQueue::new(),
         };
@@ -406,6 +419,11 @@ impl KNode {
         for n in &nodes {
             n.drain
                 .wait_event(|| n.active.load(Ordering::Acquire) == DEACTIVATED);
+            if let Kind::Attr(a) = &n.kind {
+                // Dropped outside the lock: it may own the object
+                let ops = a.ops.write().take();
+                drop(ops);
+            }
         }
         let _w = KERNFS_RWSEM.write();
         let Some(p) = self.parent() else { return };
@@ -469,7 +487,10 @@ impl KNode {
             .iter()
             .zip(&to)
             .take_while(|(a, b)| Arc::ptr_eq(a, b))
-            .count();
+            .count()
+            // A strict ancestor of the target: a link to a directory
+            // above it names that directory ("../../../virtio0")
+            .min(to.len().saturating_sub(1));
         let mut p = Vec::new();
         for _ in common..from.len() {
             p.extend_from_slice(b"../");

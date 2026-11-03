@@ -6,7 +6,9 @@
 //! device as virtio<N> on the virtio bus; binding negotiates features
 //! against the matching driver and hands it an `Arc<VirtioDevice>`. Drivers set up their queues
 //! (`setup_vq`), register an interrupt callback (`request_irq`) and call
-//! `ready()` (DRIVER_OK). Queues are split rings (`ring`) in coherent DMA
+//! `ready()` (DRIVER_OK). Their remove resets the device (`reset`), frees
+//! the interrupt (`free_irq`) and drops their queues; the bus then
+//! acknowledges the device again for the next bind. Queues are split rings (`ring`) in coherent DMA
 //! memory, addressed only through the DMA API.
 
 pub mod blk;
@@ -18,14 +20,15 @@ use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::any::Any;
 use core::fmt::Write;
-use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::base::bus::BusType;
 use crate::base::{Device, DeviceInfo, Driver, device_create};
 use crate::fs::kernfs;
 use crate::printkln;
 use crate::util::error::KernelError;
+use crate::util::ida::Ida;
 
 pub use pci::{VIRTIO_PCI_DRIVER, VirtioDevice, Virtqueue};
 
@@ -152,9 +155,45 @@ pub fn virtio_dev_probe(dev: &Arc<Device>) -> Result<Box<dyn crate::base::Bound>
         vdev.id(),
         vdev.features()
     );
-    ids.drv.probe(dev, vdev.clone()).inspect_err(|_| {
-        vdev.add_status(status::FAILED);
-    })
+    match ids.drv.probe(dev, vdev.clone()) {
+        Ok(inner) => Ok(Box::new(VirtioBound { inner, vdev })),
+        Err(e) => {
+            vdev.add_status(status::FAILED);
+            Err(e)
+        }
+    }
+}
+
+/// A bound virtio driver's state, with the bus's remove around the
+/// driver's (Linux virtio_dev_remove)
+struct VirtioBound {
+    inner: Box<dyn crate::base::Bound>,
+    vdev: Arc<VirtioDevice>,
+}
+
+impl crate::base::Bound for VirtioBound {
+    fn as_any(&self) -> &dyn Any {
+        self.inner.as_any()
+    }
+
+    fn shutdown(&self) {
+        self.inner.shutdown();
+    }
+
+    /// The driver's remove, which resets the device; then the device
+    /// is acknowledged again, ready for the next probe to renegotiate
+    fn remove(&self) {
+        self.inner.remove();
+        // The driver should have reset the device (Linux WARN_ON_ONCE)
+        if self.vdev.status() != 0 {
+            printkln!(
+                "virtio: {}: driver left the device unreset",
+                self.vdev.bus_id()
+            );
+            let _ = self.vdev.reset();
+        }
+        self.vdev.add_status(status::ACKNOWLEDGE);
+    }
 }
 
 /// A virtio device's attributes (Linux virtio_dev_groups)
@@ -193,23 +232,37 @@ fn virtio_attrs(dev: &Arc<Device>) -> Result<(), KernelError> {
     Ok(())
 }
 
-/// Next virtio index (Linux virtio_index_ida)
-static INDEX: AtomicU32 = AtomicU32::new(0);
+/// Virtio device indexes (Linux virtio_index_ida)
+static INDEX: Ida = Ida::new();
 
 /// Register a transport's device as virtio<N> below it (Linux
-/// register_virtio_device)
+/// register_virtio_device); the device and N, which the transport
+/// frees with `free_index` after deleting the device
 pub fn register_virtio_device(
     parent: &Arc<Device>,
     vdev: Arc<VirtioDevice>,
-) -> Result<Arc<Device>, KernelError> {
-    let n = INDEX.fetch_add(1, Ordering::Relaxed);
-    device_create(DeviceInfo {
+) -> Result<(Arc<Device>, u32), KernelError> {
+    let n = INDEX.alloc();
+    let r = device_create(DeviceInfo {
         parent: Some(parent),
         bus: Some(&VIRTIO_BUS),
         data: Some(vdev),
         attrs: Some(virtio_attrs),
         ..DeviceInfo::named(&format!("virtio{}", n))
-    })
+    });
+    match r {
+        Ok(d) => Ok((d, n)),
+        Err(e) => {
+            INDEX.free(n);
+            Err(e)
+        }
+    }
+}
+
+/// Free a deleted device's index (Linux unregister_virtio_device's
+/// ida_free)
+pub fn free_index(n: u32) {
+    INDEX.free(n);
 }
 
 #[cfg(test)]
