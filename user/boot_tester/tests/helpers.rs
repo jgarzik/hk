@@ -19,8 +19,8 @@ pub fn init_host_mode() {
     HOST_MODE.store(!on_hk, Ordering::Relaxed);
 }
 
-/// Linux leaves pseudo-filesystems to init; hk mounts /proc itself
-pub fn host_setup() {
+/// Pseudo-filesystems are init's to mount, on both kernels
+pub fn fs_setup() {
     sys_mkdir(b"/proc\0".as_ptr(), 0o555);
     sys_mount(
         b"proc\0".as_ptr(),

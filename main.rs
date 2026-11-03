@@ -597,13 +597,13 @@ fn try_init(path: &str, args: &cmdline::InitArgs) -> i32 {
 /// Default RAM disk size in MB
 const DEFAULT_RAMDISK_SIZE_MB: u64 = 8;
 
-/// Initialize the core VFS with ramfs as root and procfs at /proc
+/// Initialize the core VFS with ramfs as root
 ///
 /// This is the unified VFS initialization shared between architectures.
 fn init_vfs_core() {
     use crate::block::create_ramdisk;
     use crate::fs::chardev::DevId;
-    use fs::{PROCFS_TYPE, RAMFS_TYPE, do_mount, init_fs_registry, ramfs_create_dir};
+    use fs::{RAMFS_TYPE, do_mount, init_fs_registry, ramfs_create_dir};
 
     init_fs_registry();
 
@@ -618,13 +618,7 @@ fn init_vfs_core() {
 
     fs::DCACHE.set_root(root_mount.root.clone());
 
-    // Create /proc and mount procfs
     let root_dentry = root_mount.root.clone();
-    let proc_dentry = match ramfs_create_dir(&root_dentry, b"proc") {
-        Ok(d) => d,
-        Err(_) => return,
-    };
-    let _ = do_mount(&PROCFS_TYPE, Some(proc_dentry));
 
     // Create /dev directory
     let dev_dentry = match ramfs_create_dir(&root_dentry, b"dev") {
