@@ -10,12 +10,13 @@
 extern crate alloc;
 
 // Core modules (formerly in core/ subdir)
+pub mod base;
 pub mod block;
-pub mod bus;
 pub mod console;
 pub mod cpu;
 pub mod entry;
 pub mod irq;
+mod ksysfs;
 pub mod printk;
 pub mod selftest;
 pub mod smp;
@@ -434,67 +435,35 @@ fn kmain() -> ! {
     crate::net::start_threads();
     CurrentArch::enable_interrupts();
 
-    // ========================================================================
-    // Bus/Driver Model: Layered device discovery
-    // ========================================================================
-    //
-    // Instead of hardcoding nested loops (PCI → xHCI → USB → USB-Serial),
-    // we use a Linux-style bus/driver model:
-    //
-    // 1. Create BusManager and register buses
-    // 2. Register drivers for each bus type
-    // 3. BusManager enumerates root buses (PCI)
-    // 4. PCI drivers (xHCI) create child buses (USB) when probed
-    // 5. USB drivers (USB-Serial) are matched on the new USB bus
-    // 6. The cascade continues automatically
-    //
-    // This is modular and extensible - no hardcoded loops needed!
-    // ========================================================================
+    // Linux order: mnt_init (start_kernel), then do_basic_setup:
+    // driver_init (devtmpfs), core initcalls (ksysfs), fs initcalls
+    // (chr_dev_init), then device initcalls (bus probes below)
+    mnt_init();
+    fs::devtmpfs::init();
+    base::driver_init();
+    ksysfs::init();
+    base::topology_init();
+    net::sysfs::net_sysfs_init();
+    chr_dev_init();
 
-    use crate::bus::BusManager;
-    use crate::hw::net::E1000PciDriver;
-    use crate::hw::pci::PciBus;
-    use crate::hw::usb::msc::{UsbMscBusDriver, UsbMscDeviceHandle};
-    use crate::hw::usb::{UsbSerialBusDriver, xhci::XhciPciDriver};
-    use alloc::boxed::Box;
+    // Device initcalls (Linux order: buses scanned, drivers registered,
+    // each registration probing what it matches; a probe may register
+    // child devices, probed in turn)
+    block::genhd::genhd_init();
+    CurrentArch::platform_init();
+    hw::pci::pci_scan();
+    hw::usb::usb_init();
+    hw::usb::USB_SERIAL_DRIVER.register();
+    hw::usb::msc::USB_STORAGE_DRIVER.register();
+    hw::usb::xhci::XHCI_PCI_DRIVER.register();
+    hw::net::E1000_DRIVER.register();
+    hw::virtio::virtio_init();
+    hw::virtio::VIRTIO_PCI_DRIVER.register();
+    hw::net::virtio_net::VIRTIO_NET_DRIVER.register();
+    hw::virtio::blk::VIRTIO_BLK_DRIVER.register();
 
-    // Create the bus manager
-    let mut bus_manager = BusManager::new();
-
-    // Let architecture register its platform bus and drivers
-    CurrentArch::arch_bus_init(&mut bus_manager);
-
-    // Register PCI bus (root bus)
-    bus_manager.register_bus("pci", Box::new(PciBus::new()));
-
-    // Register PCI drivers
-    bus_manager.register_driver("pci", Box::new(XhciPciDriver));
-    bus_manager.register_driver("pci", Box::new(E1000PciDriver));
-    bus_manager.register_driver("pci", Box::new(crate::hw::virtio::VirtioPciDriver));
-    crate::hw::virtio::register_driver(&crate::hw::net::virtio_net::VIRTIO_NET);
-    crate::hw::virtio::register_driver(&crate::hw::virtio::blk::VIRTIO_BLK);
-
-    // Register USB drivers (queued until USB bus is created by xHCI)
-    bus_manager.register_driver("usb", Box::new(UsbSerialBusDriver));
-    bus_manager.register_driver("usb", Box::new(UsbMscBusDriver));
-
-    // Start the enumeration cascade:
-    // Platform enumerate → PIC/PIT/Serial matched
-    // PCI enumerate → xHCI matched → USB bus created → USB-Serial/USB-MSC matched
-    bus_manager.enumerate_all(&mut frame_alloc);
-
-    // SCSI disk (sda) from a USB MSC device, if present
-    if let Some(handle) = bus_manager.find_device::<UsbMscDeviceHandle>() {
-        let _ = crate::block::create_scsi_disk(handle.scsi_host(), 0, 0);
-    }
-
-    // Kept for device_shutdown at power-off/restart
-    crate::bus::bus::set_system_buses(bus_manager);
-
-    // ========================================================================
-    // Phase 5: VFS Initialization
-    // ========================================================================
-    init_vfs_core();
+    // RAM disk rd0 (Linux brd_init, a device initcall)
+    let _ = crate::block::create_ramdisk(0, DEFAULT_RAMDISK_SIZE_MB);
 
     // pid 1's root and working directory: the VFS exists now
     if let Some(fs) = crate::fs::FsStruct::new_root() {
@@ -597,17 +566,13 @@ fn try_init(path: &str, args: &cmdline::InitArgs) -> i32 {
 /// Default RAM disk size in MB
 const DEFAULT_RAMDISK_SIZE_MB: u64 = 8;
 
-/// Initialize the core VFS with ramfs as root and procfs at /proc
-///
-/// This is the unified VFS initialization shared between architectures.
-fn init_vfs_core() {
-    use crate::block::create_ramdisk;
-    use crate::fs::chardev::DevId;
-    use fs::{PROCFS_TYPE, RAMFS_TYPE, do_mount, init_fs_registry, ramfs_create_dir};
+/// The VFS core (Linux mnt_init): filesystem types, kernfs/sysfs, the
+/// ramfs root with /dev
+fn mnt_init() {
+    use fs::{RAMFS_TYPE, do_mount, init_fs_registry, ramfs_create_dir};
 
     init_fs_registry();
-
-    // Mount ramfs as root filesystem
+    fs::sysfs::init();
     let root_mount = match do_mount(&RAMFS_TYPE, None) {
         Ok(m) => m,
         Err(e) => {
@@ -615,56 +580,25 @@ fn init_vfs_core() {
             return;
         }
     };
-
     fs::DCACHE.set_root(root_mount.root.clone());
+    let _ = ramfs_create_dir(&root_mount.root, b"dev");
+}
 
-    // Create /proc and mount procfs
-    let root_dentry = root_mount.root.clone();
-    let proc_dentry = match ramfs_create_dir(&root_dentry, b"proc") {
-        Ok(d) => d,
-        Err(_) => return,
-    };
-    let _ = do_mount(&PROCFS_TYPE, Some(proc_dentry));
+/// Memory and tty character devices (Linux chr_dev_init, fs_initcall)
+fn chr_dev_init() {
+    use crate::fs::chardev::DevId;
 
-    // Create /dev directory
-    let dev_dentry = match ramfs_create_dir(&root_dentry, b"dev") {
-        Ok(d) => d,
-        Err(_) => return,
-    };
-
-    // Register built-in character devices (null, zero)
     crate::fs::chardev::register_builtin_chardevs();
 
-    // Register TTY character devices (serial, etc.)
+    // Linux chr_dev_init ends in tty_init
     crate::tty::init_tty_chardevs();
 
-    // Device nodes: in devtmpfs, and the console's in the root's /dev
-    // (opened for init before anything mounts devtmpfs; Linux needs
-    // /dev/console in the initramfs)
-    fs::devtmpfs::init();
-    use crate::fs::chardev::major as chardev_major;
-    let mut nodes = alloc::vec![
-        ("null", DevId::new(chardev_major::MEM, 3), 0o666),
-        ("zero", DevId::new(chardev_major::MEM, 5), 0o666),
-        ("full", DevId::new(chardev_major::MEM, 7), 0o666),
-        ("random", DevId::new(chardev_major::MEM, 8), 0o666),
-        ("urandom", DevId::new(chardev_major::MEM, 9), 0o666),
-        ("kmsg", DevId::new(chardev_major::MEM, 11), 0o644),
-        // Ttys: only /dev/tty is 0666, the rest get the devtmpfs
-        // default 0600 (Linux tty_devnode)
-        ("tty", DevId::new(chardev_major::TTYAUX, 0), 0o666),
-        ("console", DevId::new(chardev_major::TTYAUX, 1), 0o600),
-    ];
-    for tty in crate::arch::serial_ttys() {
-        nodes.push((tty.name(), tty.dev(), 0o600));
+    // The rootfs's /dev/console, opened for init before anything mounts
+    // devtmpfs (Linux default_rootfs)
+    if let Ok(dev) = fs::lookup_path(b"/dev") {
+        let console = DevId::new(crate::fs::chardev::major::TTYAUX, 1);
+        let _ = fs::ramfs_create_chrdev(&dev, b"console", console, 0o600);
     }
-    for (name, dev, mode) in nodes {
-        let _ = fs::ramfs_create_chrdev(&dev_dentry, name.as_bytes(), dev, mode);
-        fs::devtmpfs::device_add(name, dev, false, mode);
-    }
-
-    // RAM disk rd0 (8MB)
-    let _ = create_ramdisk(0, DEFAULT_RAMDISK_SIZE_MB);
 
     printkln!("VFS: ok");
 }

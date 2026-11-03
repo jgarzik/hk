@@ -163,6 +163,38 @@ pub fn create(stype: i32, protocol: i32) -> Result<Arc<dyn ProtoOps>, KernelErro
     Ok(s)
 }
 
+/// Bound to `dev` (protocol set: Linux PACKET_SOCK_RUNNING)
+fn bound_to(s: &PacketSock, dev: &NetDevice) -> Option<u16> {
+    let (num, ifindex) = s.bound();
+    (ifindex > 0 && ifindex as u32 == dev.ifindex()).then_some(num)
+}
+
+/// `dev` went down (Linux packet_notifier NETDEV_DOWN, RTNL held): a
+/// socket receiving on it gets ENETDOWN
+pub fn netdev_down(net: &crate::net::NetNamespace, dev: &NetDevice) {
+    for s in net.packet.all() {
+        if bound_to(&s, dev).is_some_and(|n| n != 0) {
+            s.sk.set_err(KernelError::NetworkDown);
+        }
+    }
+}
+
+/// `dev` is unregistered (Linux packet_notifier NETDEV_UNREGISTER):
+/// its memberships go, and a socket bound to it is left bound to no
+/// device (ifindex -1), so it receives nothing and sends fail ENXIO
+pub fn netdev_unregister(
+    r: &crate::net::rtnl::RtnlGuard,
+    net: &crate::net::NetNamespace,
+    dev: &NetDevice,
+) {
+    for s in net.packet.all() {
+        opts::mclist_delete(r, &s, dev);
+        if let Some(num) = bound_to(&s, dev) {
+            s.set_bound(num, -1);
+        }
+    }
+}
+
 impl PacketSock {
     /// (protocol, ifindex) bound
     fn bound(&self) -> (u16, i32) {

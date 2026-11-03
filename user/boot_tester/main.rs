@@ -16,7 +16,7 @@ use hk_syscall::{
     sys_getpid, sys_reboot,
 };
 use tests::helpers::{
-    dev_setup, fail_count, host_mode, host_setup, init_host_mode, loopback_up, print, print_num,
+    dev_setup, fail_count, host_mode, fs_setup, init_host_mode, loopback_up, print, print_num,
     println,
 };
 
@@ -54,8 +54,8 @@ extern "C" fn rust_start() -> ! {
     println(b"=== hk Boot Tester ===");
     if host_mode() {
         println(b"(host mode: running on a non-hk kernel)");
-        host_setup();
     }
+    fs_setup();
     dev_setup();
     loopback_up();
     println(b"");

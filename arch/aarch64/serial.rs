@@ -207,15 +207,23 @@ fn pl011_irq(_irq: u32, _data: *mut ()) -> bool {
 }
 
 /// Take input by interrupt (Linux pl011_startup); `irq` is the GIC
-/// INTID
-pub fn rx_irq_init(irq: u32) {
+/// INTID. False without it
+fn rx_irq_init(irq: u32) -> bool {
     if let Err(e) =
         crate::arch::irq::register_irq_handler(irq, pl011_irq, core::ptr::null_mut(), PL011_BASE)
     {
         crate::printkln!("ttyAMA0: no IRQ {}: {}", irq, e);
-        return;
+        return false;
     }
     UART.write_reg(regs::IMSC, int::RX | int::RT);
+    true
+}
+
+/// Stop taking input by interrupt (Linux pl011_shutdown: IMSC cleared,
+/// then free_irq, which waits out a running handler)
+fn rx_irq_exit(irq: u32) {
+    UART.write_reg(regs::IMSC, 0);
+    let _ = crate::arch::irq::unregister_irq_handler(irq, PL011_BASE);
 }
 
 /// Make ttyAMA0 a console (Linux pl011 console; it is /dev/console's
@@ -272,4 +280,49 @@ macro_rules! early_println {
         $crate::early_print!($($arg)*);
         $crate::early_print!("\n");
     }};
+}
+
+/// The PL011 driver (Linux amba-pl011 "uart-pl011"): the UART is set up
+/// at boot; probing makes its tty a console and takes input by IRQ
+pub static PL011_DRIVER: crate::base::Driver = crate::base::Driver::new(
+    "uart-pl011",
+    &crate::base::platform::PLATFORM_BUS,
+    None,
+    &crate::base::platform::Names(&["arm,pl011"]),
+    pl011_probe,
+);
+
+/// A bound PL011: its IRQ and tty device
+struct Pl011Port {
+    irq: Option<u32>,
+    tty: Option<alloc::sync::Arc<crate::base::Device>>,
+}
+
+impl crate::base::Bound for Pl011Port {
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+
+    /// Linux pl011_remove, uart_remove_one_port: the tty device and
+    /// console go, the interrupt is off (no hangup of an open tty:
+    /// BUGS.md). Printk then has no console, as on Linux
+    fn remove(&self) {
+        if let Some(t) = &self.tty {
+            t.del();
+        }
+        crate::console::unregister_console(TTY_AMA0.name());
+        if let Some(irq) = self.irq {
+            rx_irq_exit(irq);
+        }
+    }
+}
+
+fn pl011_probe(
+    dev: &alloc::sync::Arc<crate::base::Device>,
+) -> Result<alloc::boxed::Box<dyn crate::base::Bound>, crate::util::error::KernelError> {
+    register_console();
+    let irq = crate::base::platform::pdev(dev).and_then(|p| p.irq);
+    let irq = irq.filter(|&irq| rx_irq_init(irq));
+    let tty = crate::tty::tty_register_device(&TTY_AMA0, dev);
+    Ok(alloc::boxed::Box::new(Pl011Port { irq, tty }))
 }

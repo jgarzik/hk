@@ -273,7 +273,8 @@ VFS locks (detailed order):
         ↓
     Inode.private
         ↓
-Filesystem-internal locks (ramfs children/data, procfs data)
+Filesystem-internal locks (ramfs children/data, procfs data;
+    kernfs `KNode.{children,name,parent}` spin leaves, 3.3 kernfs)
     ↓
 Leaves taken with no task lock held (their Arc is cloned out of the
 Task first, under its alloc_lock or lock-free by the task itself):
@@ -1721,6 +1722,60 @@ under a d_lock or ALL_SBS cannot re-enter it.
 superblock's tree) takes the same parent-then-child d_locks one leaf
 at a time, with no RENAME_LOCK held (d_move drops it first).
 
+#### kernfs / sysfs (fs/kernfs/, fs/sysfs.rs; Linux fs/kernfs)
+
+| Lock | Type | Order / rule |
+|------|------|--------------|
+| `kernfs::KERNFS_RWSEM` | sync::RwSem (Linux kernfs_rwsem) | write: add, remove, rename a node; read: symlink target paths. Taken by subsystems registering objects (in thread context, under their own locks such as RTNL), never under a VFS lock, never across show()/store() |
+| `KNode.children`, `.name`, `.parent` | spin RwLock, leaves | alone (lookup, readdir under the walk's i_rwsem) or under KERNFS_RWSEM |
+| `AttrNode.ops` | spin RwLock, leaf | read (clone) under an active reference by show()/store(); cleared by `KNode::remove` after the drain, with no lock held, the operations dropped after it is released (a removed node kept by a dentry or open file pins nothing) |
+| `OpenAttr.buf` | sync::Mutex (Linux kernfs_open_file.mutex), per open file | held across show()/store(), which take subsystem locks; under f_pos_lock for read/write |
+| `sysfs::SBS` | spin Mutex, leaf | per-network-namespace superblocks, taken only in mount |
+
+Device model (base/): `Device.lock` (sync::Mutex, Linux device_lock)
+guards the device's "dead" flag, set first by `del` (a dead device is
+never bound again), and is held across a driver's probe and the
+release of its binding; `del` takes the device off its bus's list
+before unbinding it, so no new probe finds it. `core::GLUE`
+(sync::Mutex, Linux gdp_mutex) serializes finding or making a class
+glue directory with making the device's directory in it, and the
+emptied-glue removal: Device.lock -> GLUE -> KERNFS_RWSEM. `Device.added`
+(spin Mutex, leaf) records what registration completed. A
+probe may register child devices (their sysfs entries, uevents and
+probes), so a parent's lock is taken before its children's, never the
+reverse. `Device.driver` (spin RwLock) and `Device.bound` (spin Mutex)
+are leaves read without the device lock. `Class.devices`,
+`BusType.{devices,drivers}` (Linux klist_devices/klist_drivers) and
+`core::DEVICES_LIST` (Linux devices_kset list) are spin leaves taken
+alone; lists are snapshotted before probing walks them.
+`device_shutdown` (reboot(2)) takes the list out under its lock and runs
+each bound driver's shutdown callback after dropping it, so callbacks
+(which may poll hardware or take driver locks such as `USB_CONTROLLER`)
+never run under it. `PciDev.driver_override` is a spin leaf.
+Net devices: `NetNamespace::register_device` drops the namespace's
+`devices` spin lock before creating the device's sysfs entries (under
+RTNL for driver registrations: RTNL -> KERNFS_RWSEM); a namespace's
+devices leave sysfs when it is dropped, in thread context. A NIC
+driver's probe and remove run under its device's lock and take RTNL
+(`register_netdev` / `unregister_netdev`): `Device.lock` -> RTNL ->
+KERNFS_RWSEM; no net device attribute's show() takes RTNL, so the
+removal's drain cannot wait on itself.
+Block devices: a disk's partitions are registered and removed (their
+sysfs entries, devtmpfs nodes, uevents) under the disk's `open_mutex`:
+`Disk.open_mutex` -> KERNFS_RWSEM -> devtmpfs root i_rwsem. Their
+attributes read the block device without it.
+
+uevents (base/uevent.rs) broadcast with `ns::net::NET_NAMESPACE_LIST`
+(spin Mutex, leaf; Linux net_namespace_list) taken only to snapshot
+the namespaces, then each namespace's `NlTable.socks` -> `NlSock.rxq`;
+`ksysfs::UEVENT_HELPER` is a spin leaf.
+
+show()/store() run under an active reference (`KNode::get_active`),
+not a lock. `KNode::remove` deactivates the subtree and sleeps until
+active references drain (Linux kernfs_drain), with no lock held: a
+caller must not hold a lock that a show()/store() of the removed nodes
+takes (Linux lockdep's kernfs active "lock").
+
 #### Mount Namespace & Mount Objects
 
 **Location:** `fs/mount.rs`
@@ -2919,16 +2974,37 @@ context. `dma_alloc_coherent` allocates frames (thread context only).
 
 | Lock | Type | Purpose |
 |------|------|---------|
-| `USB_CONTROLLER` | `Mutex<Option<XhciController>>` | Global xHCI controller access |
+| `USB_CONTROLLER` | `Mutex<Option<XhciController>>` | Global xHCI controller access; the USB console's transfer only `try_lock`s it (busy, by this CPU's printk or another's: the output is dropped), so a printk under it never deadlocks |
 | `XHCI_IRQ_STATE.*` | `AtomicU64`, `AtomicBool` | ISR state (lock-free) |
-| `USB_OUTPUT_ACTIVE` | `AtomicBool` | Console recursion guard |
-| `USB_SERIAL_CONSOLE` (hw/usb/serial.rs) | `Mutex<Option<&'static UsbSerialConsole>>` | The registered console (leaked: printk may hold it): a leaf, released before `unregister_console` takes `CONSOLE_REGISTRY` |
-| `BOUNCE` (hw/usb/serial.rs) | `Mutex<[u8; 256]>` | USB serial console DMA buffer: `try_lock` only (a busy buffer drops the output), held across the bulk transfer, so it orders before `USB_CONTROLLER` |
+| `PORT` (hw/usb/serial.rs) | spin `Mutex<Port>` | The USB serial console's device (slot, bulk OUT endpoint; none while no FTDI port is the console) and DMA buffer: the console write `try_lock`s it (busy: the output is dropped) and holds it across the bulk transfer, so it orders before `USB_CONTROLLER`; probe and remove take it alone (remove after `unregister_console` released `CONSOLE_REGISTRY`), and remove's clearing waits out a write in progress |
 
 DMA buffers never live on a kernel stack (stacks are not in the linear
 map, `mm::vmstack`; `DirectDmaOps` panics on one): the mass-storage
 CBW/CSW and the INQUIRY/READ CAPACITY data are heap buffers, the
-console's output goes through `BOUNCE`.
+console's output goes through `PORT`'s buffer; control transfers
+bounce through a coherent buffer of their own.
+
+Enumeration (descriptor reads, Evaluate Context, Configure Endpoint,
+SET_CONFIGURATION) runs in the xHCI probe on the controller it owns,
+before it is published in `USB_CONTROLLER`: no lock. The devices are
+then registered under the PCI device's lock: the root hub `usb1`, its
+generic driver's probe adding the interfaces under `usb1`'s device
+lock, then each port's device the same way, so device locks nest PCI
+function -> usb_device -> interface (parent before child, as Linux);
+interface drivers' probes (usb-storage's SCSI scan) take
+`USB_CONTROLLER` per transfer under them.
+
+Unbinding the xHCI runs the same nesting top-down (Linux
+usb_remove_hcd): under the PCI device's lock each USB device is
+deleted, the root hub last; its generic driver's release, under its
+lock, deletes the interfaces, whose drivers' removes run under the
+interface's lock (usb-storage: the disk's `open_mutex` for
+del_gendisk, then `UsbMscDevice.state`; ftdi_sio: `CONSOLE_REGISTRY`,
+then `PORT`). The controller is then taken out of `USB_CONTROLLER`
+(drivers' transfers fail with no device from there on) and stopped
+with no lock held: slots disabled, halted, reset, the IRQ handler
+unregistered (`IRQ_TABLE`, which waits out a running handler), memory
+freed.
 
 **ISR Pattern:** The xHCI ISR sets `interrupt_pending` atomic but does NOT acquire
 `USB_CONTROLLER` mutex. This avoids IRQ-context deadlock since the mutex is not
@@ -2951,13 +3027,20 @@ thread context, the driver completes it from its interrupt handler and
 | `BLKDEV_REGISTRY` | spin `RwLock` (dev_t -> block device; global like Linux's bdev map) | thread only | leaf |
 | `MAJORS` | spin `Mutex` (block majors, register_blkdev) | thread only | leaf |
 | blk-mq software queue (`BlkMq.ctxs[cpu]`) | `IrqSpinlock<BioList>`, one per CPU | thread (submit) | leaf: never taken with the hardware queue lock held; its pending bit in the hardware queue's `ctx_map` (Linux) is set and cleared under it, and a run visits only set bits (one that misses a bit being set is followed by the submitter's own run) |
-| blk-mq hardware queue (`BlkMq.hctxs[i]`) | `IrqSpinlock` over the dispatch list and the driver queue (virtio-blk: one virtqueue and its tags; Linux virtio_blk_vq.lock) | thread (dispatch) and hardirq (completion, restart) | leaf: `queue_rq`/`complete` only touch the ring, MMIO and the lock-free DMA API (`DMA_OPS` is a `Once`), never allocate or sleep; taken under `IRQ_TABLE` in the ISR |
+| blk-mq hardware queue (`BlkMq.hctxs[i]`) | `IrqSpinlock` over the dispatch list, the driver queue (virtio-blk: one virtqueue and its tags; Linux virtio_blk_vq.lock), the in-flight count and the dying flag | thread (dispatch, drain, release) and hardirq (completion, restart) | leaf: `queue_rq`/`complete` only touch the ring, MMIO and the lock-free DMA API (`DMA_OPS` is a `Once`), never allocate or sleep; taken under `IRQ_TABLE` in the ISR |
+| `BlkMq.drained` | `WaitQueue` (Linux mq_freeze_wq) | woken from hardirq (the completion that empties a dying queue, after its lock is dropped); waited in thread context (`del_gendisk`, no lock held) | its head lock -> run-queue lock; the condition takes each hardware queue lock alone |
 | `Completion.done` | `IrqSpinlock<u32>` | any context | -> its wait queue head -> run-queue lock (the wakeup is issued under it, Linux complete()) |
 | `RamDisk.pages` | spin `Mutex` | thread only (bio-based driver) | leaf |
-| devtmpfs `PENDING` | spin `Mutex` (nodes queued before VFS init) | thread only | leaf (holds the devtmpfs root read under it) |
 
 Rules:
 
+- **Disk removal (`del_gendisk`, Linux):** under `open_mutex` every
+  hardware queue is marked dying (nothing reaches `queue_rq` after,
+  pending bios end with EIO) and the block devices are dropped; then,
+  with no lock held, it sleeps on `BlkMq.drained` until the started
+  requests complete. The driver's remove then frees the IRQ, takes its
+  queues back (`BlkMq::release`) and resets the device before freeing
+  the rings (`VirtioDevice::del_vqs`).
 - **end_io runs in hardirq context** (virtio-blk) or in the submitter's
   thread (bio-based drivers: ramdisk, USB sd). It may only complete a
   `Completion`, touch atomics and wake; the bios are ended after the
@@ -3015,7 +3098,7 @@ not rely on either.
 | `Napi.sched`, `Napi.disable` | `AtomicBool` | IRQ + thread | `sched` set by `napi_schedule` (only the setter queues it), cleared by `napi_complete_done` (a SeqCst RMW: a full barrier before the driver re-checks its pending causes, Linux cmpxchg), held by `napi_disable` (driver `stop`, RTNL held, sleeps until a running poll completes) until `napi_enable` (driver `open`); `disable` makes softnet complete an over-budget poll instead of requeueing it |
 | `NetDevice.running` | `AtomicBool` | thread (RTNL writers; NAPI poll readers) | Linux __LINK_STATE_START (`netif_running`): set before the driver's `open`, cleared before its `stop`; polls re-enable device interrupts only while set, checked under the driver's `rx` lock that `stop` takes to mask, so open/close never strand a device masked or leave a stopped one unmasked |
 | `PTYPE_BASE`, `PTYPE_ALL` | `spin::RwLock` (`Vec<..>` / fixed array of taps) | thread only | leaf; handlers copied out, called after unlock. Taps (AF_PACKET) run from `netif_receive_skb` and from `dev_queue_xmit` (PACKET_OUTGOING), i.e. possibly under a caller's socket or neighbour-free transmit path: they take only the AF_PACKET leaves below |
-| `NAPI_LIST`, `SOFTNET_THREADS` | `spin::Mutex<Vec<..>>` | thread only | leaf; registration |
+| `NAPI_LIST`, `SOFTNET_THREADS` | `spin::Mutex<Vec<..>>` | thread only | leaf; registration (`netif_napi_add`/`netif_napi_del`, the latter only for a disabled NAPI) |
 | `Sock` (`net/sock.rs`, in every protocol socket) | atomics + `Sock.wq` (`WaitQueue`) | any (wakeups) | error, shutdown, buffer sizes, timeouts, SOL_SOCKET flags, SO_LINGER (switch and time in one word); one wait queue per socket for readers, writers, connect/accept and pollers (`sk_data_ready`/`sk_write_space`/`sk_state_change` = `wake_all`), woken after the socket's own protocol locks are dropped; another path may wake it under its own locks (an AF_PACKET tap queueing to a packet socket under a transmitting TCP socket's `cb`): `Sock.wq` is an IrqSpinlock taking only run-queue locks, so that never inverts |
 | sockfs inode `private` | `spin::RwLock` (VFS, `Inode.private`) | thread only | read per socket file operation (`sock_of`) to reach the protocol socket; leaf |
 | `TcpSock.cb` (`net/tcp/mod.rs`) | `spin::Mutex<Inner>` | thread only (softnet input, softnet/0 timers, socket calls) | the TCP socket lock: Linux `bh_lock_sock` plus the `tcp_sock` state it guards (the whole I/O-free `TcpCb`: state, sequence space, send/receive/out-of-order queues, RFC 7323 option state, delayed-ACK state, RTO, all timers, the IPPROTO_TCP options (`TcpCb.opts`; the separate `TcpSock.opts` leaf is gone); tuple, port ownership, listener link). Held for one bounded step: never across a sleep or a user copy. The step's `Out` is applied before the unlock (Linux transmits under the socket lock): error and shutdown bits are published and segments transmitted under it (cb -> FIB / neighbour / device TX, which never re-enter a socket lock), so one connection's segments are never reordered across CPUs; only wakeups follow the unlock. Segment input re-checks under it that the socket still has the tuple it was found by. A listener's is taken before its new child's (creating it, and sending its SYN-ACK); a child never takes its listener's `cb` (it queues itself under the listener's `queue` leaf and the listener is woken after the child's unlock) |
@@ -3056,23 +3139,26 @@ not rely on either.
 | `UnixSock.addr`, `UnixSock.peercred`, `UnixSock.relay` | `spin::RwLock` / `spin::Mutex` | thread only | leaves (Linux u->addr, sk_peer_lock, peer_wait.lock for peer_wake relays); `relay` also guards the registered sockets' `peer_wake` atomics |
 | `unix::scm::INFLIGHT`, `Task.fput_defer` | `spin::Mutex` | thread only | leaves: per-user in-flight file counts (charged under the receiver's `st`); the current task's files awaiting `defer_fput` (each task drains its own, like Linux task_work fput; `Some` marks the task draining, so nested releases queue instead of recursing; only the task itself takes it) |
 | `UnixSock` `state`/`dead`/`wmem`/`backlog`/`peer_wake` | atomics | thread only | |
+| `NetDevice.ops` | `spin::RwLock<Option<Arc<dyn NetDeviceOps>>>` | thread only | the driver while registered (Linux reg_state + netdev_ops); written once, under RTNL, by `rtnl::unregister_netdevice` (`detach_ops`: None = unregistered). Read-held across the driver's `xmit` (after the lock-free IFF_UP check, so a closed device's senders do not take it), so the write waits for transmits in flight (Linux synchronize_net after dev_deactivate); RTNL-side callbacks (open, stop, set_promisc) clone the `Arc` out, since they may sleep, and RTNL orders them with the detach. Under it: the driver's TX lock, `Softnet.backlog` (lo). Also read under `NeighTable.hash` (`is_gone`: no neighbour is created for an unregistered device after its flush) |
 | `NetDevice.net` | `spin::RwLock<Weak<NetNamespace>>` | thread only | read per received packet; written at registration under the namespace's `devices` write lock (order `devices` -> `NetDevice.net`) |
 | driver `netdev` / `Napi.poller` (`spin::Once<Weak<..>>`) | set once at probe, before the IRQ is registered and the NAPI added | read lock-free by polls (thread) | ISRs never read them (they use the driver struct passed as IRQ data) |
 | `icmp::ICMP_ECHO_REPLY_WQ` | `WaitQueue` | woken by ICMP input (softnet) | kernel self-test waiter only (`selftest.rs`), woken after the reply is recorded |
 | `UnixSock.peer_wait` | `WaitQueue` | thread only | Linux peer_wait: dgram senders blocked on a full peer wait here (no lock held); woken by the peer's reads and release, relays to pollers via `UnixSock.relay` |
 | `NetNamespace.sysctl`, `port_range` (`/proc/sys/net`, `sysctl.rs`) | atomics | thread only | no locks; a multi-value sysctl (ping_group_range, ip_local_port_range) is one packed atomic word, so readers never see half an update; the boot port/ISN secret is a `spin::Once` |
 | `NetDevice.stats`, `flags`, `mtu`, `ifindex`, `carrier`, `promiscuity`, `allmulti` | atomics | any (`promiscuity`/`allmulti` written only under RTNL) | `flags` holds administrative state only; IFF_RUNNING/IFF_LOWER_UP/operstate are derived on read |
-| e1000 `rx` ring | `spin::Mutex` | thread only (NAPI poll) | leaf; frames are delivered after it is dropped |
-| e1000 `tx` ring | `spin::Mutex` | thread only (xmit, poll reclaim) | leaf; ring full -> drop, `tx_dropped`, ENOBUFS |
+| e1000 `rx` ring | `spin::Mutex<Option<..>>` | thread only (NAPI poll, open, stop, remove) | leaf; frames are delivered after it is dropped; also holds `napi_off` (NAPI disabled by `stop`), read by remove after `unregister_netdev` to disable a NAPI that never was; taken out (rings freed) by remove after the chip reset and IRQ free |
+| e1000 `tx` ring | `spin::Mutex<Option<..>>` | thread only (xmit, poll reclaim, remove) | leaf; ring full -> drop, `tx_dropped`, ENOBUFS; empty once removed |
 | e1000 `pending_icr`, irq counters | atomics | IRQ + thread | ISR ORs ICR causes in; poll swaps them out |
-| virtio-net `rx` queue (`hw/net/virtio_net.rs`) | `spin::Mutex` | thread only (NAPI poll, open) | leaf: virtqueue + bounce buffers; frames are delivered after it is dropped |
-| virtio-net `tx` queue | `spin::Mutex` | thread only (xmit, poll reclaim) | leaf; one descriptor per frame; ring full -> drop, `tx_dropped`, ENOBUFS |
+| virtio-net `rx` queue (`hw/net/virtio_net.rs`) | `spin::Mutex<Option<..>>` | thread only (NAPI poll, open, stop, remove) | leaf: virtqueue + bounce buffers + `napi_off` (as e1000); frames are delivered after it is dropped; taken out by remove, whose `del_vqs` resets the device before the rings and buffers are freed |
+| virtio-net `tx` queue | `spin::Mutex<Option<..>>` | thread only (xmit, poll reclaim, remove) | leaf; one descriptor per frame; ring full -> drop, `tx_dropped`, ENOBUFS; empty once removed |
 | virtio-net `config_pending`; `VringCb` (RX avail NO_INTERRUPT flag) | atomics / lock-free MMIO-style store | IRQ + thread | the ISR suppresses RX interrupts and flags config changes; the poll re-enables under `rx` only while `netif_running`, and `stop` suppresses under `rx` |
-| virtio-PCI transport (`hw/virtio/pci.rs`) | none | probe (single-threaded enumeration), then IRQ (ISR byte) | common config written only during probe; device config reads are generation-checked and lock-free; queue notify writes happen under the caller's queue lock |
-| `virtio::DRIVERS` | `spin::Mutex<Vec>` | thread only (boot) | leaf; registered before bus enumeration, read by the PCI match/probe |
-| `SYSTEM_TRANSITION` (`power.rs`) | sleeping `sync::Mutex<()>` | thread only (reboot(2)) | Linux system_transition_mutex: held from after the permission and magic checks through `device_shutdown` and the arch power-off/restart/halt, which do not return; outermost: taken before `SYSTEM_BUSES` and every driver lock the shutdown callbacks take |
+| virtio-PCI transport (`hw/virtio/pci.rs`) | none | probe and remove (under the virtio device's or the PCI function's `Device.lock`), then IRQ (ISR byte) | common config (status, features, queues, reset) written only under those device locks; device config reads are generation-checked and lock-free; queue notify writes happen under the caller's queue lock |
+| `VirtioDevice.irq` (driver interrupt callbacks) | `IrqSpinlock<Option<Arc<dyn VirtioIrq>>>` | thread (`request_irq`, `free_irq`) and hardirq (`vp_interrupt`, under `IRQ_TABLE`) | leaf: the ISR clones the callbacks out and calls them after unlocking; `free_irq` unregisters the handler (`IRQ_TABLE`) before clearing it, so the ISR never drops the last reference |
+| PCI and USB `DYNIDS` (hw/pci/driver.rs, hw/usb/usbcore.rs; Linux dynids.lock) | spin Mutex | thread only | leaf: new_id/remove_id and each match take it alone; the probing after new_id runs with it dropped |
+| `ScsiDisk.state` (block/sd.rs, Linux sdev_state + state_mutex) | spin `Mutex<ScsiDeviceState>` | thread only | leaf: transitions (Linux's legal table) and each command's state check take it alone, never across I/O |
+| `util::ida::Ida` allocators: virtio, virtio-blk and sd indexes (Linux virtio_index_ida, vd_index_ida, sd_index_ida) | `IrqSpinlock` | alloc thread only; free any context | leaf; nothing allocates under it (alloc grows the bitmap with it dropped); a disk index is freed when the disk's last reference drops |
+| `SYSTEM_TRANSITION` (`power.rs`) | sleeping `sync::Mutex<()>` | thread only (reboot(2)) | Linux system_transition_mutex: held from after the permission and magic checks through `device_shutdown` and the arch power-off/restart/halt, which do not return; outermost: taken before `core::DEVICES_LIST` and every driver lock the shutdown callbacks take |
 | x86 `power::POWER` (`arch/x86_64/power.rs`) | `spin::Once` | thread only (boot set; power-off/reboot read) | set once from the FADT before `reboot(2)` can run, read lock-free after; the ACPI register sequences (`hw/acpi/hw.rs`) take no locks |
-| `bus::SYSTEM_BUSES` (`bus/bus.rs`) | sleeping `sync::Mutex<Option<BusManager>>` | thread only | set once after boot enumeration; `device_shutdown` (reboot(2), Linux device_shutdown) takes the manager out under it and runs the `Device::shutdown` callbacks after dropping it, so callbacks (which may poll hardware or take driver locks such as `USB_CONTROLLER`) never run under it |
 
 **Lock order (outermost first):**
 
@@ -3099,6 +3185,7 @@ NetDevice.addrs, NetNamespace tables, Fib.tables (RwLocks; lookups drop
   (AF_PACKET taps, from any receive or transmit path: PacketTable.socks,
    then PacketSock.filter / PacketSock.rxq, each a leaf;
    RTNL -> PacketSock.mclist)
+  -> NetDevice.ops (read across a transmit; NeighTable.hash -> it)
   -> device TX lock (e1000 tx, virtio-net tx)
   -> Softnet.backlog (lo xmit)           Softnet.poll_list; WaitQueue -> pi_lock
                                           -> rq (IrqSpinlocks, innermost)
@@ -3124,7 +3211,9 @@ by `netif_rx`), which is another CPU's if the task moved during the
 call (a user copy that slept); earlier packets on yet another CPU, and
 any flush that is missed, only wait for that CPU's softnet thread. Netlink requests are processed in
 the sender's `sendmsg` with no lock held on entry; mutating handlers take
-RTNL. Carrier changes (`netif_carrier_on/off`, from a driver's NAPI poll
+RTNL; handlers that change a device look it up under RTNL (Linux
+locked doits), so they never act on an unregistered one. Carrier
+changes (`netif_carrier_on/off`, from a driver's NAPI poll
 or `open()`) send RTM_NEWLINK without RTNL (NlTable.socks -> NlSock.rxq
 only). Open/close follow Linux __dev_open/__dev_close: `running` is set
 before the driver's open (which `napi_enable`s, then unmasks) and cleared
@@ -3133,6 +3222,22 @@ masks under `rx`). A poll re-enables interrupts only while `running`,
 under `rx`: a poll racing with open re-enables them, one racing with
 close leaves the device masked; `netif_receive_skb` drops frames of a
 down device.
+
+**Unregistration** (`rtnl::unregister_netdevice`, Linux
+unregister_netdevice_many_notify; from a driver's remove via
+`net::unregister_netdev`): under RTNL the device is closed (as above),
+unlisted from its namespace (lookups stop finding it; its ifindex is
+never reused), and its driver detached (`NetDevice.ops` write: waits
+for a transmit in flight; from then on no driver callback runs), then
+its addresses, routes and neighbours go and packet sockets lose it
+(NETDEV_UNREGISTER), RTM_DELLINK is sent and its sysfs device removed.
+The driver then disables a NAPI that is still enabled (`napi_disable`
+waits for a running poll), quiesces the hardware, frees its IRQ (no
+ISR runs after `unregister_irq_handler`, which takes the IRQ table
+lock every dispatch holds), `netif_napi_del`s and frees its DMA
+memory. A `NetDevice` still referenced (queued skbs) stays down and
+driverless; hk cannot wait for those references (Linux
+netdev_wait_allrefs) because skbs in socket queues hold them.
 
 **Driver ISR rules (e1000 pattern):** read ICR (read-to-clear; 0 => not
 ours on a shared line, return false), write IMC (mask all), record causes
@@ -3232,7 +3337,7 @@ else is taken under it) unless an order is given. "spin" is the
 | `NTtyLdisc.data` | tty/n_tty.rs | spin Mutex | line discipline buffer (input is polled, not IRQ-fed) |
 | `VgaCon.state` | arch/x86_64/vgacon.rs | IrqSpinlock | VGA text console state, under `CONSOLE_REGISTRY` (3.9) |
 | `SimpleGfxDevice.state`, `GFX_DEVICES`, `NEXT_MINOR` | gfx/ | spin | framebuffer device state and registry |
-| `UsbMscDevice.state` | hw/usb/msc.rs | spin | USB mass-storage device state |
+| `UsbMscDevice.state` | hw/usb/msc.rs | sleeping `sync::Mutex` (Linux us->dev_mutex), thread only | a mass-storage interface's CBW tag and disconnected flag, held across each BOT transaction (CBW, data, CSW: the transfers take `USB_CONTROLLER` under it); its unbind sets the flag under it, after the disk is gone and the command in progress is done |
 | `INTX_MAP` | arch/aarch64/pci_irq.rs | spin Mutex | PCI INTx routing from the device tree (boot) |
 | `PCI_LOCK` | arch/x86_64/pci_conf.rs (port I/O config access) | IrqSpinlock | Linux pci_lock: the CF8 address write and the CFC data access of one config read/write; leaf (port I/O only). ECAM accesses are single MMIO operations and take no lock |
 | PCI fixups (`hw/pci/quirks.rs`) | none | thread only (boot) | run by bus enumeration (single-threaded) on each function before driver probe |
@@ -3531,7 +3636,7 @@ this is the interrupt-safety invariant:
 | `RTNL` and every network `spin::Mutex`/`RwLock` | net/ | `sync::Mutex` / `Mutex` / `RwLock` | Configuration, sockets, tables, queues (3.10) |
 | Driver queue locks (e1000 / virtio-net `rx`, `tx`) | hw/net/ | `Mutex` | Rings: NAPI poll, xmit, open/stop |
 | `Softnet.backlog` | net/core/dev.rs | `Mutex` | `netif_rx` (lo), softnet |
-| `BLKDEV_REGISTRY`, `MAJORS`, `RamDisk.pages`, devtmpfs `PENDING` | block/, fs/devtmpfs.rs | `RwLock` / `Mutex` | Block device lookup, majors, RAM disk pages, early device nodes (3.10) |
+| `BLKDEV_REGISTRY`, `MAJORS`, `RamDisk.pages` | block/ | `RwLock` / `Mutex` | Block device lookup, majors, RAM disk pages (3.10) |
 | `Disk.open_mutex` | block/blkdev.rs | sleeping `sync::Mutex` | Block device open/release, partition scans |
 | Sleeping locks (`sync::Mutex`, `RwSem`) | sync/ | sleeping | Never in IRQ or atomic context (`might_sleep`) |
 

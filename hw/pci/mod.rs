@@ -3,23 +3,20 @@
 //! Provides PCI configuration space access via I/O ports CF8/CFC
 //! and bus enumeration for device discovery.
 //!
-//! Implements the Bus/Driver model for layered device enumeration.
+//! Functions are registered on the device core (`driver.rs`).
 
+pub mod driver;
 pub mod intx;
 pub mod quirks;
 
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::any::Any;
 
 use spin::Once;
 
 use crate::hw::dma::{DmaConfig, DmaDevice};
 use crate::printkln;
-
-use crate::bus::bus::{Bus, BusContext, BusDevice, BusDriver};
-use crate::bus::driver::{Device, DriverError};
 
 // ============================================================================
 // PCI BAR Allocator (for platforms without firmware BAR assignment)
@@ -711,7 +708,7 @@ impl PciDevice {
                         "PCI: Assigned BAR{} = {:#x} for {}",
                         i,
                         assigned,
-                        BusDevice::bus_id(self)
+                        self.bus_id()
                     );
                 }
             }
@@ -909,275 +906,58 @@ impl PciDevice {
     }
 }
 
-/// Implement BusDevice for PciDevice to participate in bus/driver model
-impl BusDevice for PciDevice {
-    fn name(&self) -> &str {
-        self.class_name()
-    }
-
-    fn bus_id(&self) -> String {
-        use alloc::format;
-        format!(
+impl PciDevice {
+    /// Slot name "0000:BB:DD.F" (Linux pci_name)
+    pub fn bus_id(&self) -> String {
+        alloc::format!(
             "{:04x}:{:02x}:{:02x}.{:x}",
-            0, // segment
+            0,
             self.bus,
             self.device,
             self.function
         )
     }
+}
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
+/// Set up configuration access once (the arch's mechanism: port I/O on
+/// x86, ECAM on arm64)
+fn config_init() {
+    if !is_initialized() {
+        use crate::arch::ArchBusOps;
+        crate::arch::CurrentArch::pci_config_init();
     }
 }
 
-/// Enumerate all devices on a PCI bus
-pub fn enumerate_bus() -> Vec<PciDevice> {
+/// Scan bus 0, assign unassigned BARs, run the final fixups, then
+/// register every function (Linux pci_scan_root_bus,
+/// pci_assign_unassigned_resources, pci_bus_add_devices)
+pub fn pci_scan() {
+    config_init();
+    driver::pci_bus_init();
     let mut devices = Vec::new();
-
-    // Scan bus 0 (we could scan more buses via PCI bridges)
     for dev in 0..32 {
-        // Check function 0 first
-        if let Some(pci_dev) = PciDevice::read(0, dev, 0) {
-            let is_multifunction = pci_dev.header.is_multifunction();
-            devices.push(pci_dev);
-
-            // If multi-function, scan other functions
-            if is_multifunction {
-                for func in 1..8 {
-                    if let Some(pci_dev) = PciDevice::read(0, dev, func) {
-                        devices.push(pci_dev);
-                    }
-                }
-            }
-        }
-    }
-
-    devices
-}
-
-// ============================================================================
-// PCI Bus Implementation (Bus/Driver Model)
-// ============================================================================
-
-/// PCI bus implementing the Bus trait for the bus/driver model
-pub struct PciBus {
-    /// Discovered PCI devices
-    devices: Vec<PciDevice>,
-    /// Registered drivers for PCI devices
-    drivers: Vec<Box<dyn BusDriver>>,
-    /// Probed devices (devices that have been matched to drivers)
-    probed_devices: Vec<Box<dyn Device>>,
-}
-
-impl PciBus {
-    /// Create a new PCI bus (does not enumerate yet)
-    pub fn new() -> Self {
-        Self {
-            devices: Vec::new(),
-            drivers: Vec::new(),
-            probed_devices: Vec::new(),
-        }
-    }
-}
-
-impl Default for PciBus {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Bus for PciBus {
-    fn name(&self) -> &str {
-        "pci"
-    }
-
-    fn probed_devices(&self) -> &[Box<dyn Device>] {
-        &self.probed_devices
-    }
-
-    fn register_driver(&mut self, driver: Box<dyn BusDriver>) {
-        printkln!("PCI: Registered driver '{}'", driver.name());
-        self.drivers.push(driver);
-    }
-
-    fn enumerate(&mut self, ctx: &mut BusContext) {
-        // Initialize PCI config access if not already done
-        if !is_initialized() {
-            #[cfg(target_arch = "x86_64")]
-            {
-                init_port_io();
-                printkln!("PCI: Using port I/O config access");
-            }
-
-            #[cfg(target_arch = "aarch64")]
-            {
-                use crate::arch::{CurrentArch, IoremapOps};
-                // ARM: Use ECAM with QEMU virt address (from DTB: reg = <0x40 0x10000000 ...>)
-                // ECAM needs 1MB for bus 0 (32 devices × 8 functions × 4KB)
-                let ecam_phys = 0x40_1000_0000u64; // QEMU virt high ECAM
-                let ecam_size = 0x10_0000u64; // 1MB for bus 0
-                // SAFETY: QEMU virt's ECAM window, device memory
-                let ecam_virt = unsafe { CurrentArch::ioremap(ecam_phys, ecam_size) }
-                    .expect("PCI: Failed to ioremap ECAM region");
-                // SAFETY: ecam_size bytes just mapped, never unmapped
-                unsafe {
-                    init_ecam(ecam_virt, ecam_size as usize);
-                }
-                printkln!(
-                    "PCI: Using ECAM config access at phys {:#x} -> virt {:p}",
-                    ecam_phys,
-                    ecam_virt
-                );
-            }
-        }
-
-        let _ = ctx; // Suppress unused warning
-        printkln!("PCI: Enumerating bus 0...");
-
-        // Scan bus 0 for devices
-        for dev in 0..32 {
-            if let Some(pci_dev) = PciDevice::read(0, dev, 0) {
-                let is_multifunction = pci_dev.header.is_multifunction();
-
-                printkln!(
-                    "PCI: Found {} at {}",
-                    pci_dev.class_name(),
-                    BusDevice::bus_id(&pci_dev)
-                );
-                self.devices.push(pci_dev);
-
-                // Check other functions if multi-function device
-                if is_multifunction {
-                    for func in 1..8 {
-                        if let Some(pci_dev) = PciDevice::read(0, dev, func) {
-                            printkln!(
-                                "PCI: Found {} at {}",
-                                pci_dev.class_name(),
-                                BusDevice::bus_id(&pci_dev)
-                            );
-                            self.devices.push(pci_dev);
-                        }
-                    }
-                }
-            }
-        }
-
-        printkln!("PCI: Found {} device(s)", self.devices.len());
-
-        // Assign BAR addresses for any unassigned BARs (cross-platform)
-        //
-        // On x86 with BIOS: BARs are pre-assigned, this loop does nothing
-        // On ARM with direct boot: BARs are 0, this allocates addresses
-        //
-        // Following Linux kernel pattern: pci_assign_unassigned_resources()
-        for device in &mut self.devices {
-            device.assign_all_bars();
-            // Enable memory space access (needed for newly assigned BARs)
-            device.enable_memory_space();
-        }
-
-        // Firmware hand-offs and chipset fixups, before any driver
-        // touches a device (Linux FIXUP_FINAL, pci_bus_add_device)
-        quirks::fixup_final(&self.devices);
-
-        // Match devices to drivers and probe
-        for device in &self.devices {
-            for driver in &self.drivers {
-                if driver.matches(device) {
-                    printkln!(
-                        "PCI: Driver '{}' matched device at {}",
-                        driver.name(),
-                        BusDevice::bus_id(device)
-                    );
-
-                    match driver.probe(device, ctx) {
-                        Ok(dev_instance) => {
-                            printkln!("PCI: Successfully probed '{}'", dev_instance.name());
-                            self.probed_devices.push(dev_instance);
-                        }
-                        Err(e) => {
-                            printkln!("PCI: Failed to probe: {:?}", e);
-                        }
-                    }
-
-                    // Only match first driver per device
-                    break;
-                }
-            }
-        }
-    }
-
-    fn is_root(&self) -> bool {
-        true // PCI is a root bus
-    }
-
-    /// Remove a device from this PCI bus (hotplug support)
-    ///
-    /// Following Linux kernel PCI hotplug patterns:
-    /// 1. Find the device by bus_id
-    /// 2. Find the driver that probed this device
-    /// 3. Call driver.remove() for cleanup
-    /// 4. Remove from probed_devices
-    /// 5. Remove from devices list
-    fn remove_device(&mut self, bus_id: &str) -> Result<(), DriverError> {
-        printkln!("PCI: Removing device at {}", bus_id);
-
-        // Find the device index
-        let device_idx = self
-            .devices
-            .iter()
-            .position(|d| BusDevice::bus_id(d) == bus_id);
-
-        let device_idx = match device_idx {
-            Some(idx) => idx,
-            None => {
-                printkln!("PCI: Device {} not found", bus_id);
-                return Err(DriverError::MissingResource);
-            }
+        let Some(f0) = PciDevice::read(0, dev, 0) else {
+            continue;
         };
-
-        // Get reference to device for driver matching
-        let device = &self.devices[device_idx];
-
-        // Find matching driver and call remove()
-        for driver in &self.drivers {
-            if driver.matches(device) {
-                printkln!(
-                    "PCI: Calling driver '{}' remove for {}",
-                    driver.name(),
-                    bus_id
-                );
-
-                // Call driver's remove callback
-                if let Err(e) = driver.remove(device) {
-                    printkln!("PCI: Driver remove failed: {:?}", e);
-                    return Err(e);
-                }
-
-                break;
-            }
+        let multi = f0.header.is_multifunction();
+        devices.push(f0);
+        if multi {
+            devices.extend((1..8).filter_map(|f| PciDevice::read(0, dev, f)));
         }
-
-        // Remove from probed_devices list
-        // The Device trait has bus_id() that returns Option<&str>
-        self.probed_devices.retain(|dev| {
-            if let Some(dev_bus_id) = dev.bus_id() {
-                dev_bus_id != bus_id
-            } else {
-                true // Keep devices without bus_id tracking
-            }
-        });
-
-        // Remove from devices list
-        self.devices.remove(device_idx);
-
-        printkln!("PCI: Device {} removed successfully", bus_id);
-        Ok(())
+    }
+    for d in &devices {
+        printkln!("PCI: Found {} at {}", d.class_name(), d.bus_id());
+    }
+    // On x86 firmware assigned the BARs; on arm64 direct boot they are 0
+    for d in &mut devices {
+        d.assign_all_bars();
+        d.enable_memory_space();
+    }
+    // Firmware hand-offs and chipset fixups, before any driver
+    // touches a device (Linux FIXUP_FINAL, pci_bus_add_device)
+    quirks::fixup_final(&devices);
+    for d in devices {
+        let _ = driver::pci_device_add(d);
     }
 }
 

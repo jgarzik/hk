@@ -204,6 +204,12 @@ pub fn netif_napi_add(napi: &Arc<Napi>, poller: Weak<dyn NapiPoll>) {
     }
 }
 
+/// Forget `napi` (Linux netif_napi_del; process context): it must be
+/// disabled (`napi_disable`), so it is on no poll list and no poll runs
+pub fn netif_napi_del(napi: &Arc<Napi>) {
+    NAPI_LIST.lock().retain(|n| !Arc::ptr_eq(n, napi));
+}
+
 /// Schedule `napi` for polling on this CPU's softnet thread
 ///
 /// IRQ-safe (Linux `napi_schedule`). The caller (an ISR) has masked the

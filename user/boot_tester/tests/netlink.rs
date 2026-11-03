@@ -66,6 +66,7 @@ pub fn run_tests() {
     test_overrun();
     test_deputy();
     test_dead_receiver();
+    test_passcred();
 }
 
 fn fail(name: &[u8], why: &[u8], v: i64) {
@@ -1242,4 +1243,38 @@ fn test_dead_receiver() {
         return fail(N, b"woken after ms", ms as i64);
     }
     ok(N);
+}
+
+/// SO_PASSCRED: kernel messages carry pid/uid/gid 0, a peer's carry its
+/// tgid and ids (Linux netlink_recvmsg -> scm_recv)
+fn test_passcred() {
+    const N: &[u8] = b"NL_PASSCRED";
+    const SO_PASSCRED: i32 = 16;
+    let (Some(mut a), Some(b)) = (Nl::open(), Nl::open()) else {
+        return fail(N, b"open", 0);
+    };
+    let one: i32 = 1;
+    let on = |fd: i32| {
+        sys_setsockopt(fd, SOL_SOCKET, SO_PASSCRED, &one as *const i32 as *const u8, 4)
+    };
+    if on(a.fd) != 0 || on(b.fd) != 0 {
+        return fail(N, b"setsockopt", 0);
+    }
+    let mut r = Req::new(RTM_GETLINK, 0, &ifinfo(1, 0, 0));
+    a.send(&mut r);
+    let buf = rxbuf();
+    let (n, c) = recv_creds(a.fd, buf);
+    if n <= 0 || c != Some((0, 0, 0)) {
+        let pid = c.map_or(-1, |c| c.0 as i64);
+        return fail(N, b"kernel creds pid", if n <= 0 { n } else { pid });
+    }
+    let dst = nladdr(sockname(b.fd).1, 0);
+    let msg = [0u8; 16];
+    sys_sendto(a.fd, msg.as_ptr(), msg.len(), 0, dst.as_ptr(), 12);
+    let (n, c) = recv_creds(b.fd, buf);
+    let me = sys_getpid() as i32;
+    match c {
+        Some((pid, 0, 0)) if n == 16 && pid == me => ok(N),
+        _ => fail(N, b"peer creds pid", c.map_or(n, |c| c.0 as i64)),
+    }
 }

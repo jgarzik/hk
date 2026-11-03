@@ -8,7 +8,9 @@ use core::any::Any;
 use super::*;
 use crate::io::poll::{POLLERR, POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM};
 use crate::net::msg::{MSG_DONTWAIT, MSG_PEEK, MSG_TRUNC, RecvMsg, SendMsg};
+use crate::net::sock::sf;
 use crate::net::socket::{AF_UNSPEC, OptIn, OptOut, SOL_SOCKET};
+use crate::net::unix::scm::{self, Creds, Scm};
 
 /// Parse a struct sockaddr_nl: (pid, groups); EINVAL if short or not
 /// AF_NETLINK
@@ -183,19 +185,24 @@ impl ProtoOps for NlSock {
         }
     }
 
-    /// Linux netlink_sendmsg: EMSGSIZE above sndbuf - 32 before copying
+    /// Linux netlink_sendmsg: EMSGSIZE above sndbuf - 32 before copying;
+    /// the message carries the sender's credentials, or those it passed
+    /// as SCM_CREDENTIALS (scm_send)
     fn sendmsg(&self, m: &mut SendMsg, flags: i32) -> Result<usize, KernelError> {
+        let creds = Scm::parse(&m.control)?.creds.unwrap_or_else(Creds::current);
         let dst = self.dest(m)?;
         let len = m.data.len();
         if len > self.max_msg() {
             return Err(KernelError::MessageTooLong);
         }
         let data = m.data.take(len)?;
-        self.arc().send(&data, dst, flags & MSG_DONTWAIT != 0)
+        self.arc()
+            .send(&data, dst, creds, flags & MSG_DONTWAIT != 0)
     }
 
     /// Datagram semantics: MSG_TRUNC in msg_flags when cut (the flag
-    /// returns the real length), NETLINK_PKTINFO control message
+    /// returns the real length); NETLINK_PKTINFO, then SCM_CREDENTIALS
+    /// with SO_PASSCRED (Linux netlink_recvmsg -> scm_recv)
     fn recvmsg(&self, m: &mut RecvMsg, flags: i32) -> Result<usize, KernelError> {
         let skb = self.recv(flags & MSG_PEEK != 0, flags & MSG_DONTWAIT != 0)?;
         let n = m.data.put(0, &skb.data)?;
@@ -209,6 +216,7 @@ impl ProtoOps for NlSock {
             m.cmsg
                 .put(SOL_NETLINK, NETLINK_PKTINFO, &skb.group.to_ne_bytes());
         }
+        scm::put(m, self.sk.flag(sf::PASSCRED), Some(skb.creds), None);
         Ok(if flags & MSG_TRUNC != 0 {
             skb.data.len()
         } else {

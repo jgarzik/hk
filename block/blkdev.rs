@@ -258,6 +258,8 @@ pub struct QueueLimits {
     pub max_sectors: u32,
     pub max_segments: u32,
     pub max_segment_size: u32,
+    /// Seeks cost (Linux !QUEUE_FLAG_NONROT)
+    pub rotational: bool,
 }
 
 impl Default for QueueLimits {
@@ -268,6 +270,7 @@ impl Default for QueueLimits {
             max_sectors: 128, // 64 KiB
             max_segments: 32,
             max_segment_size: PAGE as u32,
+            rotational: true,
         }
     }
 }
@@ -320,6 +323,22 @@ impl RequestQueue {
         }
     }
 
+    /// The disk is going away: nothing more is started (Linux
+    /// blk_queue_start_drain); bio-based drivers track nothing
+    pub(super) fn start_drain(&self) {
+        if let QueueKind::Mq(m) = &self.kind {
+            m.start_drain();
+        }
+    }
+
+    /// Wait for what was started before `start_drain` (Linux
+    /// blk_mq_freeze_queue_wait)
+    pub(super) fn drain(&self) {
+        if let QueueKind::Mq(m) = &self.kind {
+            m.drain();
+        }
+    }
+
     fn submit(&self, bio: Box<Bio>) {
         if bio.op == BioOp::Flush && !self.write_cache {
             return bio_endio(bio);
@@ -336,6 +355,10 @@ impl RequestQueue {
 // ============================================================================
 
 /// A disk (Linux struct gendisk)
+/// Next disk sequence number (Linux diskseq: an atomic64 counter; only
+/// uniqueness matters)
+static DISKSEQ: AtomicU64 = AtomicU64::new(1);
+
 pub struct Disk {
     pub major: DevMajor,
     pub first_minor: DevMinor,
@@ -350,6 +373,12 @@ pub struct Disk {
     pub(super) open_partitions: AtomicU32,
     /// Opens, releases and rescans (Linux open_mutex)
     pub(super) open_mutex: crate::sync::Mutex<()>,
+    /// Sequence number, unique for the boot, set at allocation (Linux
+    /// diskseq)
+    pub seq: u64,
+    /// Driver state freed with the disk, after its last reference
+    /// (Linux private_data with fops->free_disk: a driver's disk index)
+    pub private: spin::Once<Box<dyn core::any::Any + Send + Sync>>,
 }
 
 impl Disk {
@@ -373,6 +402,8 @@ impl Disk {
             bdi,
             open_partitions: AtomicU32::new(0),
             open_mutex: crate::sync::Mutex::new(()),
+            seq: DISKSEQ.fetch_add(1, Ordering::Relaxed),
+            private: spin::Once::new(),
         })
     }
 
@@ -413,6 +444,10 @@ pub struct BlockDevice {
     /// The device's inode in the bdev pseudo filesystem: its page cache
     /// (Linux bd_mapping) serves device-node I/O and filesystem metadata
     pub bd_inode: Arc<crate::fs::Inode>,
+    /// Its device in the block class (Linux bd_device); weak: the
+    /// device's data is this block device, and the class keeps it
+    /// while registered
+    pub kdev: spin::Once<alloc::sync::Weak<crate::base::Device>>,
 }
 
 impl BlockDevice {
@@ -429,6 +464,7 @@ impl BlockDevice {
             bsize: AtomicU32::new(512),
             dead: AtomicBool::new(false),
             bd_inode: crate::fs::blkdev_ops::bdev_inode(dev, nr_sects << SECTOR_SHIFT),
+            kdev: spin::Once::new(),
         }
     }
 
@@ -620,8 +656,10 @@ pub(super) fn disk_release(disk: &Disk) {
 /// Submit `bio` for `bdev` (Linux submit_bio): checked against the end
 /// of the device, remapped to the disk; completes through `end_io`
 pub fn submit_bio(bdev: &BlockDevice, mut bio: Box<Bio>) {
+    // A removed disk's I/O fails with EIO (Linux bio_queue_enter on a
+    // dead disk: bio_io_error)
     if bdev.is_dead() {
-        return bio_io_error(bio, KernelError::NoDeviceOrAddress);
+        return bio_io_error(bio, KernelError::Io);
     }
     if bio.op != BioOp::Flush {
         let end = bio.sector.checked_add(bio.sectors());

@@ -37,6 +37,8 @@ pub mod tty_dev;
 
 use alloc::sync::Arc;
 
+use crate::base::{Class, DevNode, Device, DeviceInfo, device_create};
+
 use crate::arch::IrqSpinlock;
 use crate::sync::spin::Mutex;
 use crate::sync::waitqueue::WaitQueue;
@@ -431,6 +433,75 @@ pub fn init_tty_chardevs() {
     // Register /dev/console (major 5, minor 1) - kernel console
     let console_dev = Arc::new(console_dev::ConsoleCharDevice);
     let _ = register_chardev(DevId::new(major::TTYAUX, 1), console_dev);
+
+    TTY_CLASS.register();
+    for (name, minor) in [("tty", 0), ("console", 1)] {
+        let d = device_create(DeviceInfo {
+            class: Some(&TTY_CLASS),
+            devt: Some(DevId::new(major::TTYAUX, minor)),
+            ..DeviceInfo::named(name)
+        });
+        if minor == 1
+            && let Ok(d) = d
+            && let Ok(a) =
+                d.create_file(b"active", 0o444, crate::fs::kernfs::show(show_cons_active))
+        {
+            CONS_ACTIVE.call_once(|| a);
+        }
+    }
+}
+
+/// /sys/class/tty/console/active (spin::Once, set at boot)
+static CONS_ACTIVE: spin::Once<Arc<crate::fs::kernfs::KNode>> = spin::Once::new();
+
+/// Linux show_cons_active: the enabled consoles' ttys, last registered
+/// first
+fn show_cons_active(out: &mut crate::fs::kernfs::SysBuf) {
+    let ttys = crate::console::console_ttys();
+    let mut first = true;
+    for t in ttys.iter().rev().flatten() {
+        if !first {
+            out.bytes(b" ");
+        }
+        out.bytes(t.name().as_bytes());
+        first = false;
+    }
+    out.bytes(b"\n");
+}
+
+/// The console list changed: wake pollers of console/active (Linux
+/// sysfs_notify in register_console/unregister_console)
+pub fn console_active_changed() {
+    if let Some(a) = CONS_ACTIVE.get() {
+        a.notify();
+    }
+}
+
+/// The class device of a port's tty, below the port's device (Linux
+/// tty_port_register_device)
+pub fn tty_register_device(tty: &'static Tty, parent: &Arc<Device>) -> Option<Arc<Device>> {
+    device_create(DeviceInfo {
+        parent: Some(parent),
+        class: Some(&TTY_CLASS),
+        devt: Some(tty.dev),
+        ..DeviceInfo::named(tty.name())
+    })
+    .ok()
+}
+
+/// The tty class (Linux tty_class)
+pub static TTY_CLASS: Class = Class::new("tty", Some(tty_devnode));
+
+/// Linux tty_devnode: /dev/tty and /dev/ptmx are 0666
+fn tty_devnode(d: &Device) -> Option<DevNode> {
+    let dt = d.devt?;
+    if dt.major == crate::fs::chardev::major::TTYAUX && (dt.minor == 0 || dt.minor == 2) {
+        return Some(DevNode {
+            name: d.name().into(),
+            mode: 0o666,
+        });
+    }
+    None
 }
 
 // =============================================================================

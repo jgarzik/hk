@@ -1,360 +1,150 @@
-//! USB Serial (CDC-ACM) Driver
-//!
-//! Implements USB Communications Device Class - Abstract Control Model
-//! for USB serial devices.
-//!
-//! Implements `BusDriver` for the USB bus to be automatically matched
-//! against CDC-ACM devices.
+//! FTDI USB serial converter (Linux drivers/usb/serial/ftdi_sio.c):
+//! QEMU's usb-serial is an FT232 (0403:6001). `USB_SERIAL_DRIVER`
+//! binds its interface on the USB bus as "ftdi_sio".
 //!
 //! ## Console Integration
 //!
-//! When a USB serial device is detected, it is registered as a console
-//! with Normal priority. This allows it to take precedence over legacy
-//! serial (Fallback priority) when both are present.
+//! The port is registered as a console with Normal priority, ahead of
+//! the legacy serial port (Fallback priority). Output goes out its
+//! bulk OUT endpoint raw (the FT232 frames only its IN data).
 
 use alloc::boxed::Box;
 use core::any::Any;
 
-use crate::bus::bus::{BusContext, BusDevice, BusDriver};
-use crate::bus::driver::{Device, DriverError};
 use crate::console::{ConsoleDriver, ConsolePriority, register_console};
-use crate::downcast_bus_device;
 use crate::printkln;
+use crate::sync::spin::Mutex;
+use crate::util::error::KernelError;
 
-use super::{SetupPacket, UsbDevice, UsbSpeed, cdc_subclass, class};
+use super::{UsbDeviceId, UsbIds};
 
-// ============================================================================
-// USB Serial Bus Driver (Bus/Driver Model)
-// ============================================================================
+/// FTDI's vendor id and the FT232's product id (Linux FTDI_VID,
+/// FTDI_8U232AM_PID)
+const FTDI_VID: u16 = 0x0403;
+const FTDI_8U232AM_PID: u16 = 0x6001;
 
-/// USB Serial driver for the bus/driver model
-///
-/// This driver matches USB devices with CDC-ACM class (Communications Device
-/// Class - Abstract Control Model) and creates serial device instances.
-pub struct UsbSerialBusDriver;
+/// Devices it drives (a subset of Linux ftdi_sio's id_table_combined)
+static FTDI_IDS: [UsbDeviceId; 1] = [UsbDeviceId::device(FTDI_VID, FTDI_8U232AM_PID)];
 
-impl BusDriver for UsbSerialBusDriver {
-    fn name(&self) -> &str {
-        "usb-serial"
-    }
+/// The FTDI serial driver: its port becomes a console
+pub static USB_SERIAL_DRIVER: crate::base::Driver = crate::base::Driver::new(
+    "ftdi_sio",
+    &super::USB_BUS,
+    Some("ftdi_sio"),
+    &UsbIds::Interface(&FTDI_IDS),
+    ftdi_probe,
+);
 
-    fn matches(&self, device: &dyn BusDevice) -> bool {
-        if let Some(usb_dev) = downcast_bus_device!(device, UsbDevice) {
-            return UsbSerial::is_cdc_acm_device(usb_dev);
-        }
-        false
-    }
-
-    /// Remove a USB serial device (hotplug)
-    ///
-    /// Called when the USB device is disconnected. Clears the global
-    /// console registration to prevent writes to disconnected device.
-    fn remove(&self, device: &dyn BusDevice) -> Result<(), DriverError> {
-        let usb_dev = downcast_bus_device!(device, UsbDevice).ok_or(DriverError::Unsupported)?;
-
-        printkln!(
-            "UsbSerial: Removing device slot {} (bus_id: {})",
-            usb_dev.slot_id,
-            BusDevice::bus_id(usb_dev)
-        );
-
-        // Off the console list; a printk holding a snapshot of the list
-        // may still call it, so it stays allocated and just goes quiet
-        let gone = USB_SERIAL_CONSOLE.lock().take();
-        if let Some(c) = gone {
-            c.alive.store(false, core::sync::atomic::Ordering::Release);
-            crate::console::unregister_console(c.name);
-        }
-
-        printkln!("UsbSerial: Device slot {} removed", usb_dev.slot_id);
-        Ok(())
-    }
-
-    fn probe(
-        &self,
-        device: &dyn BusDevice,
-        _ctx: &mut BusContext,
-    ) -> Result<Box<dyn Device>, DriverError> {
-        let usb_dev = downcast_bus_device!(device, UsbDevice).ok_or(DriverError::Unsupported)?;
-
-        printkln!(
-            "UsbSerial: Probing USB device at {}",
-            BusDevice::bus_id(usb_dev)
-        );
-
-        // Create USB serial device
-        let serial = UsbSerial::new(usb_dev.clone()).ok_or(DriverError::InitFailed)?;
-
-        // Register as console with Normal priority
-        // This allows USB serial to take precedence over legacy serial
-        register_usb_serial_console(&serial);
-
-        printkln!("USB_SERIAL_READY: {}", serial.name());
-
-        Ok(Box::new(serial))
-    }
+fn ftdi_probe(
+    dev: &alloc::sync::Arc<crate::base::Device>,
+) -> Result<Box<dyn crate::base::Bound>, KernelError> {
+    let (usb_dev, intf) = super::usb_intf(dev).ok_or(KernelError::NoDevice)?;
+    let Some((bulk_in_ep, bulk_out_ep)) = intf.bulk_eps() else {
+        printkln!("ftdi_sio {}: no bulk endpoints", dev.name());
+        return Err(KernelError::NoDevice);
+    };
+    let serial = UsbSerial {
+        slot_id: usb_dev.slot_id,
+        bulk_in_ep,
+        bulk_out_ep,
+    };
+    printkln!(
+        "ftdi_sio {}: FTDI USB Serial Device converter, bulk in {:#04x}, out {:#04x}",
+        dev.name(),
+        bulk_in_ep,
+        bulk_out_ep
+    );
+    register_usb_serial_console(&serial);
+    Ok(Box::new(serial))
 }
 
-/// CDC-ACM Line Coding structure
-#[derive(Debug, Clone, Copy)]
-#[repr(C, packed)]
-pub struct LineCoding {
-    /// Baud rate (e.g., 115200)
-    pub baud_rate: u32,
-    /// Stop bits: 0=1, 1=1.5, 2=2
-    pub stop_bits: u8,
-    /// Parity: 0=None, 1=Odd, 2=Even, 3=Mark, 4=Space
-    pub parity: u8,
-    /// Data bits: 5, 6, 7, or 8
-    pub data_bits: u8,
-}
-
-impl Default for LineCoding {
-    fn default() -> Self {
-        Self {
-            baud_rate: 115200,
-            stop_bits: 0, // 1 stop bit
-            parity: 0,    // No parity
-            data_bits: 8, // 8 data bits
-        }
-    }
-}
-
-/// CDC class-specific requests
-mod cdc_request {
-    pub const SET_LINE_CODING: u8 = 0x20;
-    pub const SET_CONTROL_LINE_STATE: u8 = 0x22;
-}
-
-/// USB Serial device instance
+/// A bound FTDI port
 pub struct UsbSerial {
-    /// USB device info
-    pub usb_device: UsbDevice,
+    /// The device's xHCI slot
+    pub slot_id: u8,
     /// Bulk IN endpoint address
     pub bulk_in_ep: u8,
     /// Bulk OUT endpoint address
     pub bulk_out_ep: u8,
-    /// Interrupt endpoint address (for serial state notifications)
-    pub interrupt_ep: u8,
-    /// Current line coding
-    pub line_coding: LineCoding,
-    /// Control interface number
-    pub control_iface: u8,
-    /// Data interface number
-    pub data_iface: u8,
 }
 
-impl UsbSerial {
-    /// Create a new USB serial device from a detected USB device
-    ///
-    /// This performs basic validation that the device looks like a CDC-ACM device.
-    pub fn new(usb_device: UsbDevice) -> Option<Self> {
-        // For a simple implementation, we assume the device is CDC-ACM
-        // A full implementation would parse the configuration descriptor
-        // to find the CDC control and data interfaces.
-
-        // CDC-ACM typically has:
-        // - Interface 0: CDC Control (class 0x02, subclass 0x02)
-        //   - Interrupt IN endpoint for notifications
-        // - Interface 1: CDC Data (class 0x0A)
-        //   - Bulk IN endpoint for receiving data
-        //   - Bulk OUT endpoint for sending data
-
-        // QEMU's usb-serial device uses these typical endpoint addresses:
-        // - Interrupt IN: 0x81
-        // - Bulk IN: 0x82
-        // - Bulk OUT: 0x02
-
-        printkln!(
-            "UsbSerial: Creating device for slot={}, port={}",
-            usb_device.slot_id,
-            usb_device.port
-        );
-
-        Some(Self {
-            usb_device,
-            bulk_in_ep: 0x82,   // Standard bulk IN
-            bulk_out_ep: 0x02,  // Standard bulk OUT
-            interrupt_ep: 0x81, // Standard interrupt IN
-            line_coding: LineCoding::default(),
-            control_iface: 0,
-            data_iface: 1,
-        })
-    }
-
-    /// Check if a USB device is a CDC-ACM serial device
-    pub fn is_cdc_acm_device(device: &UsbDevice) -> bool {
-        // Check device class
-        if device.device_class == class::CDC {
-            return true;
-        }
-
-        // For composite devices, check interfaces
-        for iface in &device.interfaces {
-            if iface.class == class::CDC && iface.subclass == cdc_subclass::ACM {
-                return true;
-            }
-        }
-
-        // For QEMU usb-serial, the device is class 0x02 (CDC)
-        // We can also check if it's a Full speed device on an expected port
-        // as a heuristic
-        device.speed == UsbSpeed::Full
-    }
-
-    /// Initialize the serial device with line coding
-    pub fn init(&mut self) -> Result<(), &'static str> {
-        // In a full implementation, we would:
-        // 1. Send SET_LINE_CODING to configure baud rate, etc.
-        // 2. Send SET_CONTROL_LINE_STATE to enable DTR/RTS
-
-        // Copy packed fields to avoid alignment issues
-        let baud = { self.line_coding.baud_rate };
-        let data_bits = { self.line_coding.data_bits };
-        let stop_bits = { self.line_coding.stop_bits };
-
-        printkln!(
-            "UsbSerial: Initialized at {} baud, {}N{}",
-            baud,
-            data_bits,
-            match stop_bits {
-                0 => 1,
-                1 => 15, // 1.5 represented as 15
-                _ => 2,
-            }
-        );
-
-        Ok(())
-    }
-
-    /// Create SET_LINE_CODING setup packet
-    #[allow(dead_code)]
-    pub fn set_line_coding_setup(&self) -> SetupPacket {
-        SetupPacket::class_interface(
-            cdc_request::SET_LINE_CODING,
-            0,
-            self.control_iface as u16,
-            core::mem::size_of::<LineCoding>() as u16,
-        )
-    }
-
-    /// Create SET_CONTROL_LINE_STATE setup packet
-    #[allow(dead_code)]
-    pub fn set_control_line_state_setup(&self, dtr: bool, rts: bool) -> SetupPacket {
-        let value = (if dtr { 1 } else { 0 }) | (if rts { 2 } else { 0 });
-        SetupPacket::class_interface(
-            cdc_request::SET_CONTROL_LINE_STATE,
-            value,
-            self.control_iface as u16,
-            0,
-        )
-    }
-}
-
-impl Device for UsbSerial {
-    fn name(&self) -> &str {
-        "usb-serial"
-    }
-
+impl crate::base::Bound for UsbSerial {
     fn as_any(&self) -> &dyn Any {
         self
     }
-}
 
-/// The registered USB serial console (spin leaf). Consoles are
-/// `&'static` (printk writes through a snapshot of the list outside its
-/// lock), so each one is leaked: a removed one stays valid, marked dead.
-static USB_SERIAL_CONSOLE: crate::sync::spin::Mutex<Option<&'static UsbSerialConsole>> =
-    crate::sync::spin::Mutex::new(None);
-
-/// Wrapper for USB serial as a console
-///
-/// This wrapper allows UsbSerial to be registered as a static console.
-/// Note: Actual USB bulk transfers require xHCI support which is not
-/// fully implemented. For now, this acts as a placeholder that shows
-/// the console infrastructure is working.
-pub struct UsbSerialConsole {
-    /// Device name
-    name: &'static str,
-    /// Slot ID for USB device
-    slot_id: u8,
-    /// Bulk OUT endpoint
-    bulk_out_ep: u8,
-    /// The device is still attached
-    alive: core::sync::atomic::AtomicBool,
-}
-
-impl UsbSerialConsole {
-    /// Create from a UsbSerial device
-    pub fn from_usb_serial(serial: &UsbSerial) -> Self {
-        Self {
-            name: "ttyUSB0",
-            slot_id: serial.usb_device.slot_id,
-            bulk_out_ep: serial.bulk_out_ep,
-            alive: core::sync::atomic::AtomicBool::new(true),
+    /// Off the console list if it is the console (Linux
+    /// usb_serial_console_disconnect); then, under the port lock, which
+    /// a write in progress holds, the console loses its device: a
+    /// printk still holding a snapshot of the list writes nothing
+    fn remove(&self) {
+        if PORT.lock().out != Some((self.slot_id, self.bulk_out_ep)) {
+            return;
         }
+        crate::console::unregister_console(USB_SERIAL_CONSOLE.name());
+        PORT.lock().out = None;
     }
 }
+
+/// The console's device and DMA buffer
+struct Port {
+    /// The bound port's slot and bulk OUT endpoint (None: no console)
+    out: Option<(u8, u8)>,
+    /// Output goes through it: the controller DMAs the data, and a
+    /// printk's may be on a kernel stack
+    buf: [u8; 256],
+}
+
+/// The USB serial console's port (spin leaf but for the transfer: a
+/// write holds it across the bulk transfer, so it orders before
+/// `USB_CONTROLLER`; `try_lock` there, a busy port drops the output)
+static PORT: Mutex<Port> = Mutex::new(Port {
+    out: None,
+    buf: [0; 256],
+});
+
+/// The FTDI port as a console (`ttyUSB0`); one at a time
+struct UsbSerialConsole;
+
+static USB_SERIAL_CONSOLE: UsbSerialConsole = UsbSerialConsole;
 
 impl ConsoleDriver for UsbSerialConsole {
     fn name(&self) -> &str {
-        self.name
+        "ttyUSB0"
     }
 
     fn write(&self, data: &[u8]) {
-        use crate::hw::usb::xhci::{is_usb_output_active, usb_console_out};
+        use crate::hw::usb::xhci::usb_console_out;
 
-        // Check recursion guard - if USB output is already active, skip to prevent deadlock
-        // This can happen when a printkln! inside USB code tries to write to USB serial
-        if is_usb_output_active() || !self.alive.load(core::sync::atomic::Ordering::Acquire) {
-            return;
-        }
-
-        // The controller DMAs the data, and printk's may be on a kernel
-        // stack: send it through a static buffer. Busy (another CPU, or
-        // a printk nested in this one): dropped, the console is
-        // best-effort like the transfer itself.
-        let Some(mut buf) = BOUNCE.try_lock() else {
+        // Busy (another CPU, or a printk nested in this one): dropped,
+        // the console is best-effort like the transfer itself
+        let Some(mut p) = PORT.try_lock() else {
             return;
         };
-        for chunk in data.chunks(buf.len()) {
-            buf[..chunk.len()].copy_from_slice(chunk);
-            let _ = usb_console_out(self.slot_id, self.bulk_out_ep, &buf[..chunk.len()]);
+        let Some((slot, ep)) = p.out else {
+            return;
+        };
+        for chunk in data.chunks(p.buf.len()) {
+            p.buf[..chunk.len()].copy_from_slice(chunk);
+            let _ = usb_console_out(slot, ep, &p.buf[..chunk.len()]);
         }
     }
 }
 
-/// The USB serial console's DMA buffer (spin leaf, try_lock only; held
-/// across the transfer, which takes `USB_CONTROLLER`)
-static BOUNCE: crate::sync::spin::Mutex<[u8; 256]> = crate::sync::spin::Mutex::new([0; 256]);
-
-/// Register a USB serial device as a console
-///
-/// This is called from the probe function when a USB serial device is detected.
-/// The device is registered with Normal priority, allowing it to take precedence
-/// over legacy serial (Fallback priority).
-pub fn register_usb_serial_console(serial: &UsbSerial) {
+/// Make the port the console (`ttyUSB0`) if there is none: Normal
+/// priority, above legacy serial's Fallback, no special flags
+fn register_usb_serial_console(serial: &UsbSerial) {
     use crate::console::ConsoleFlags;
 
-    let mut cur = USB_SERIAL_CONSOLE.lock();
-    if cur.is_some() {
-        return; // one ttyUSB0 console at a time
+    let mut p = PORT.lock();
+    if p.out.is_some() {
+        return;
     }
-    let console: &'static UsbSerialConsole =
-        Box::leak(Box::new(UsbSerialConsole::from_usb_serial(serial)));
-    *cur = Some(console);
-    drop(cur);
-    // Normal priority (above legacy serial's Fallback), no special flags
-    register_console(console, ConsolePriority::Normal, ConsoleFlags::empty());
-}
-
-/// Create a USB serial device from a detected USB device if it's CDC-ACM
-pub fn create_usb_serial(usb_device: UsbDevice) -> Option<UsbSerial> {
-    if UsbSerial::is_cdc_acm_device(&usb_device) {
-        let mut serial = UsbSerial::new(usb_device)?;
-        if serial.init().is_ok() {
-            return Some(serial);
-        }
-    }
-    None
+    p.out = Some((serial.slot_id, serial.bulk_out_ep));
+    drop(p);
+    register_console(
+        &USB_SERIAL_CONSOLE,
+        ConsolePriority::Normal,
+        ConsoleFlags::empty(),
+    );
 }

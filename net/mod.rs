@@ -77,6 +77,7 @@ pub mod sock;
 pub mod socket;
 pub mod syscall;
 pub mod sysctl;
+pub mod sysfs;
 pub mod tcp;
 pub mod udp;
 pub mod unix;
@@ -112,7 +113,7 @@ pub fn alloc_netdev(
     template: &str,
     mac: [u8; 6],
     link: device::LinkInfo,
-    ops: &'static dyn device::NetDeviceOps,
+    ops: Arc<dyn device::NetDeviceOps>,
 ) -> (rtnl::RtnlGuard, Arc<NetDevice>) {
     let r = rtnl::lock();
     let name = init_net_ns().dev_alloc_name(template);
@@ -133,6 +134,19 @@ pub fn register_netdev(rtnl: rtnl::RtnlGuard, dev: Arc<NetDevice>) {
         m[4],
         m[5]
     );
-    init_net_ns().register_device(dev);
+    let net = init_net_ns();
+    net.register_device(dev.clone());
+    // Linux register_netdevice's rtmsg_ifinfo(RTM_NEWLINK)
+    netlink::rtnetlink::notify_link(&net, &dev, Default::default());
     drop(rtnl);
+}
+
+/// Unregister a driver's device (Linux unregister_netdev: takes RTNL;
+/// see `rtnl::unregister_netdevice`). On return no driver callback runs
+/// for it again; the driver then stops its NAPI and frees the hardware.
+pub fn unregister_netdev(dev: &Arc<NetDevice>) {
+    let r = rtnl::lock();
+    rtnl::unregister_netdevice(&r, dev);
+    drop(r);
+    crate::printkln!("net: unregistered {}", dev.name());
 }

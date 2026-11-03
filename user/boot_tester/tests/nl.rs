@@ -533,3 +533,42 @@ pub fn net_setup_eth0() -> Result<u32, &'static str> {
     }
     Ok(eth.index)
 }
+
+/// SCM_CREDENTIALS of a received message: (pid, uid, gid)
+pub type Ucred = (i32, u32, u32);
+
+/// recvmsg one datagram into `buf` with a control buffer (waits up to
+/// 5 s); returns the length (<0 on error) and SCM_CREDENTIALS if sent
+pub fn recv_creds(fd: i32, buf: &mut [u8]) -> (i64, Option<Ucred>) {
+    if !wait_readable(fd, 5000) {
+        return (-11, None);
+    }
+    let mut iov = hk_syscall::IoVec {
+        iov_base: buf.as_mut_ptr(),
+        iov_len: buf.len(),
+    };
+    let mut ctl = [0u64; 16];
+    let mut msg = hk_syscall::MsgHdr::new(&mut iov, 1);
+    msg.msg_control = ctl.as_mut_ptr() as *mut u8;
+    msg.msg_controllen = core::mem::size_of_val(&ctl);
+    let n = hk_syscall::sys_recvmsg(fd, &mut msg, 0);
+    if n < 0 {
+        return (n, None);
+    }
+    // SAFETY: ctl is plain bytes of the size given to the kernel
+    let c = unsafe { core::slice::from_raw_parts(ctl.as_ptr() as *const u8, msg.msg_controllen) };
+    let w = |o: usize| u32::from_ne_bytes([c[o], c[o + 1], c[o + 2], c[o + 3]]);
+    let mut off = 0;
+    while off + 16 <= c.len() {
+        let len = u64::from_ne_bytes(c[off..off + 8].try_into().unwrap()) as usize;
+        if len < 16 || off + len > c.len() {
+            break;
+        }
+        // level SOL_SOCKET (1), type SCM_CREDENTIALS (2), struct ucred
+        if w(off + 8) == 1 && w(off + 12) == 2 && len >= 28 {
+            return (n, Some((w(off + 16) as i32, w(off + 20), w(off + 24))));
+        }
+        off += (len + 7) & !7;
+    }
+    (n, None)
+}

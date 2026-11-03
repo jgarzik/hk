@@ -9,7 +9,6 @@ pub mod barrier;
 pub mod cache;
 pub mod context;
 pub mod cpu;
-pub mod drivers;
 pub mod dtb;
 pub mod exceptions;
 pub mod gic;
@@ -418,21 +417,49 @@ impl PowerOps for Aarch64Arch {
 // ============================================================================
 
 impl ArchBusOps for Aarch64Arch {
-    fn arch_bus_init(bus_manager: &mut crate::bus::BusManager) {
-        use crate::bus::{PlatformBus, PlatformDevice};
-        use alloc::boxed::Box;
+    /// QEMU virt's PL011 and PL031 (the GIC is an irqchip set up at
+    /// boot, not a device: Linux IRQCHIP_DECLARE)
+    fn platform_init() {
+        use crate::base::platform::{PlatformDevice, platform_device_register};
+        let devs = [
+            PlatformDevice {
+                name: "pl011",
+                compatible: &["arm,pl011", "arm,primecell"],
+                base: Some(0x0900_0000),
+                irq: Some(33),
+            },
+            PlatformDevice {
+                name: "pl031",
+                compatible: &["arm,pl031", "arm,primecell"],
+                base: Some(0x0901_0000),
+                irq: None,
+            },
+        ];
+        for d in devs {
+            let _ = platform_device_register(d);
+        }
+        serial::PL011_DRIVER.register();
+        rtc::PL031_DRIVER.register();
+    }
 
-        // Create platform bus with ARM devices (QEMU virt addresses)
-        let platform_bus = PlatformBus::new(vec![
-            PlatformDevice::new("arm,gic-v3", Some(0x0800_0000), None),
-            PlatformDevice::new("arm,pl011", Some(0x0900_0000), Some(33)),
-            PlatformDevice::new("arm,pl031", Some(0x0901_0000), None),
-        ]);
-
-        bus_manager.register_bus("platform", Box::new(platform_bus));
-
-        // Register aarch64 platform drivers
-        drivers::register_platform_drivers(bus_manager);
+    /// QEMU virt's high ECAM window (DT reg <0x40 0x10000000 ...>), 1 MB
+    /// for bus 0 (32 devices x 8 functions x 4 KB)
+    fn pci_config_init() {
+        use crate::arch::IoremapOps;
+        let ecam_phys = 0x40_1000_0000u64;
+        let ecam_size = 0x10_0000u64;
+        // SAFETY: QEMU virt's ECAM window, device memory
+        let ecam_virt = unsafe { Aarch64Arch::ioremap(ecam_phys, ecam_size) }
+            .expect("PCI: Failed to ioremap ECAM region");
+        // SAFETY: ecam_size bytes just mapped, never unmapped
+        unsafe {
+            crate::hw::pci::init_ecam(ecam_virt, ecam_size as usize);
+        }
+        crate::printkln!(
+            "PCI: Using ECAM config access at phys {:#x} -> virt {:p}",
+            ecam_phys,
+            ecam_virt
+        );
     }
 }
 

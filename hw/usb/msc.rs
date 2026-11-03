@@ -6,26 +6,14 @@
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 
-use crate::sync::spin::Mutex;
+use crate::sync::Mutex;
 use core::any::Any;
-use core::sync::atomic::{AtomicBool, Ordering};
 
-use crate::block::{DataDirection, ScsiCommand, ScsiError, ScsiHost, ScsiResult};
-use crate::bus::bus::{BusContext, BusDevice, BusDriver};
-use crate::bus::driver::{Device, DriverError};
-use crate::downcast_bus_device;
+use crate::block::{DataDirection, ScsiCommand, ScsiError, ScsiHost, ScsiResult, SdDisk};
 use crate::printkln;
+use crate::util::error::KernelError;
 
-use super::{UsbDevice, UsbError, usb_bulk_in, usb_bulk_out, usb_configure_endpoints};
-
-/// USB Mass Storage class code
-const USB_CLASS_MASS_STORAGE: u8 = 0x08;
-
-/// USB Mass Storage subclass: SCSI transparent command set
-const USB_SUBCLASS_SCSI: u8 = 0x06;
-
-/// USB Mass Storage protocol: Bulk-Only Transport
-const USB_PROTOCOL_BOT: u8 = 0x50;
+use super::{UsbDeviceId, UsbError, UsbIds, usb_bulk_in, usb_bulk_out};
 
 /// CBW signature "USBC"
 const CBW_SIGNATURE: u32 = 0x43425355;
@@ -135,86 +123,49 @@ mod csw_status {
     pub const PHASE_ERROR: u8 = 2;
 }
 
-/// USB Mass Storage device state (protected by Mutex)
+/// USB Mass Storage device state, held across each BOT transaction
+/// (Linux us->dev_mutex)
 struct UsbMscState {
     /// Current CBW tag (incremented for each command)
     tag: u32,
+    /// The driver was unbound: no more commands (Linux
+    /// US_FLIDX_DISCONNECTING)
+    gone: bool,
 }
 
 /// USB Mass Storage Device
 ///
-/// Implements ScsiHost to allow the SCSI layer to send commands.
-#[repr(C)]
+/// Implements ScsiHost to allow the SCSI layer to send commands. Its
+/// bulk endpoints were added to the controller when the configuration
+/// was set.
 pub struct UsbMscDevice {
-    /// Mutable state under lock (place first for alignment)
+    /// Serializes the transactions (a BOT command is CBW, data, CSW)
     state: Mutex<UsbMscState>,
-    /// Whether endpoints have been configured (atomic for lock-free check)
-    configured: AtomicBool,
     /// USB device slot ID
     slot_id: u8,
     /// Bulk IN endpoint address
     bulk_in_ep: u8,
     /// Bulk OUT endpoint address
     bulk_out_ep: u8,
-    /// Padding
-    _pad: u8,
-    /// Max packet size for bulk endpoints
-    max_packet: u16,
 }
 
 impl UsbMscDevice {
-    /// Create a new USB MSC device
-    fn new(slot_id: u8, bulk_in_ep: u8, bulk_out_ep: u8, max_packet: u16) -> Self {
-        crate::printkln!(
-            "USB-MSC: Creating device slot={} in=0x{:02x} out=0x{:02x} pkt={}",
+    fn new(slot_id: u8, bulk_in_ep: u8, bulk_out_ep: u8) -> Self {
+        Self {
+            state: Mutex::new(UsbMscState {
+                tag: 1,
+                gone: false,
+            }),
             slot_id,
             bulk_in_ep,
             bulk_out_ep,
-            max_packet
-        );
-        let dev = Self {
-            state: Mutex::new(UsbMscState { tag: 1 }),
-            configured: AtomicBool::new(false),
-            slot_id,
-            bulk_in_ep,
-            bulk_out_ep,
-            _pad: 0,
-            max_packet,
-        };
-        crate::printkln!(
-            "USB-MSC: Created device slot={} in=0x{:02x} out=0x{:02x}",
-            dev.slot_id,
-            dev.bulk_in_ep,
-            dev.bulk_out_ep
-        );
-        dev
+        }
     }
 
-    /// Configure the bulk endpoints (must be called before transfers)
-    #[allow(dead_code)]
-    fn configure(&self) -> Result<(), UsbError> {
-        // Check if already configured (lock-free)
-        if self.configured.load(Ordering::Acquire) {
-            return Ok(());
-        }
-
-        // Extract endpoint numbers (remove direction bit)
-        let in_ep_num = self.bulk_in_ep & 0x0F;
-        let out_ep_num = self.bulk_out_ep & 0x0F;
-
-        crate::printkln!(
-            "USB-MSC: Configuring endpoints IN={} OUT={} for slot {}",
-            in_ep_num,
-            out_ep_num,
-            self.slot_id
-        );
-
-        usb_configure_endpoints(self.slot_id, in_ep_num, out_ep_num, self.max_packet)?;
-
-        crate::printkln!("USB-MSC: Endpoints configured successfully");
-
-        self.configured.store(true, Ordering::Release);
-        Ok(())
+    /// No commands from now on; waits for the one in progress (Linux
+    /// quiesce_and_remove_host's US_FLIDX_DISCONNECTING under dev_mutex)
+    fn disconnect(&self) {
+        self.state.lock().gone = true;
     }
 
     /// Execute a BOT transaction
@@ -228,13 +179,14 @@ impl UsbMscDevice {
         // Get transfer parameters
         let data_len = data.as_ref().map(|d| d.len()).unwrap_or(0) as u32;
 
-        // Get next tag and increment
-        let tag = {
-            let mut state = self.state.lock();
-            let t = state.tag;
-            state.tag = state.tag.wrapping_add(1);
-            t
-        };
+        // The whole transaction under the lock: another command's CBW
+        // must not come between this one's phases
+        let mut state = self.state.lock();
+        if state.gone {
+            return Err(ScsiError::NoDevice);
+        }
+        let tag = state.tag;
+        state.tag = state.tag.wrapping_add(1);
 
         let slot_id = self.slot_id;
         let bulk_out = self.bulk_out_ep & 0x0F;
@@ -299,29 +251,8 @@ impl UsbMscDevice {
     }
 }
 
-impl Device for UsbMscDevice {
-    fn name(&self) -> &str {
-        "usb-msc"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-}
-
 impl ScsiHost for UsbMscDevice {
     fn execute(&self, _target: u8, lun: u8, cmd: &ScsiCommand) -> ScsiResult<usize> {
-        // Ensure endpoints are configured
-        if !self.configured.load(Ordering::Acquire) {
-            let in_ep_num = self.bulk_in_ep & 0x0F;
-            let out_ep_num = self.bulk_out_ep & 0x0F;
-
-            usb_configure_endpoints(self.slot_id, in_ep_num, out_ep_num, self.max_packet)
-                .map_err(usb_to_scsi_error)?;
-
-            self.configured.store(true, Ordering::Release);
-        }
-
         // Prepare data buffer reference
         let data_ptr = cmd.data;
         let data_len = cmd.data_len;
@@ -365,160 +296,72 @@ fn usb_to_scsi_error(e: UsbError) -> ScsiError {
     }
 }
 
-/// USB Mass Storage Bus Driver
-///
-/// Matches USB devices with class 0x08 (Mass Storage) and creates
-/// UsbMscDevice instances for SCSI layer integration.
-pub struct UsbMscBusDriver;
+/// Interfaces it drives (Linux usb-storage's usb_storage_usb_ids):
+/// SCSI transparent command set over Bulk-Only Transport; the other
+/// subclasses and the CB/CBI and UAS transports are not supported
+/// (BUGS.md)
+static STORAGE_IDS: [UsbDeviceId; 1] = [UsbDeviceId::interface_info(
+    super::class::MASS_STORAGE,
+    USB_SC_SCSI,
+    USB_PR_BULK,
+)];
 
-impl BusDriver for UsbMscBusDriver {
-    fn name(&self) -> &str {
-        "usb-msc"
-    }
+/// bInterfaceSubClass: SCSI transparent command set
+const USB_SC_SCSI: u8 = 0x06;
+/// bInterfaceProtocol: Bulk-Only Transport
+const USB_PR_BULK: u8 = 0x50;
 
-    /// Remove a USB MSC device (hotplug)
-    ///
-    /// Called when the USB device is disconnected. Performs cleanup:
-    /// 1. Unregister associated SCSI disk from block device registry
-    /// 2. Invalidate page cache entries
-    fn remove(&self, device: &dyn BusDevice) -> Result<(), DriverError> {
-        let usb_dev = downcast_bus_device!(device, UsbDevice).ok_or(DriverError::Unsupported)?;
+/// The USB mass storage driver (Linux usb-storage): its SCSI disk is
+/// scanned at probe
+pub static USB_STORAGE_DRIVER: crate::base::Driver = crate::base::Driver::new(
+    "usb-storage",
+    &super::USB_BUS,
+    Some("usb_storage"),
+    &UsbIds::Interface(&STORAGE_IDS),
+    usb_storage_probe,
+);
 
-        printkln!(
-            "USB-MSC: Removing device slot {} (bus_id: {})",
-            usb_dev.slot_id,
-            BusDevice::bus_id(usb_dev)
-        );
-
-        // Unregister the SCSI disk associated with this device
-        // Currently we use a simple mapping: slot_id -> minor number
-        // A more robust implementation would track this mapping explicitly
-        let minor = usb_dev.slot_id as u16;
-        if let Err(e) = crate::block::sd::unregister_scsi_disk(minor) {
-            printkln!("USB-MSC: Failed to unregister SCSI disk: {:?}", e);
-            // Continue with removal even if unregister fails
-        }
-
-        printkln!("USB-MSC: Device slot {} removed", usb_dev.slot_id);
-        Ok(())
-    }
-
-    fn matches(&self, device: &dyn BusDevice) -> bool {
-        if let Some(usb_dev) = downcast_bus_device!(device, UsbDevice) {
-            // For QEMU usb-storage, the device class is typically set at interface level
-            // Check device class or interface class
-            if usb_dev.device_class == USB_CLASS_MASS_STORAGE {
-                return true;
-            }
-
-            // Check interfaces
-            for iface in &usb_dev.interfaces {
-                if iface.class == USB_CLASS_MASS_STORAGE
-                    && iface.subclass == USB_SUBCLASS_SCSI
-                    && iface.protocol == USB_PROTOCOL_BOT
-                {
-                    return true;
-                }
-            }
-
-            // For QEMU usb-storage without full enumeration, we might not have
-            // interface info. Accept any device on USB bus for now.
-            // Proper enumeration blocked on control transfer implementation
-            return true;
-        }
-        false
-    }
-
-    fn probe(
-        &self,
-        device: &dyn BusDevice,
-        _ctx: &mut BusContext,
-    ) -> Result<Box<dyn Device>, DriverError> {
-        let usb_dev = downcast_bus_device!(device, UsbDevice).ok_or(DriverError::Unsupported)?;
-
-        printkln!(
-            "USB-MSC: Probing device slot {} on port {}",
-            usb_dev.slot_id,
-            usb_dev.port
-        );
-
-        // Find bulk endpoints
-        // For QEMU usb-storage, typical endpoints are:
-        // - Bulk OUT: endpoint 2 (0x02)
-        // - Bulk IN: endpoint 1 (0x81)
-        // Since we don't have full enumeration yet, use defaults
-        let (bulk_in_ep, bulk_out_ep) = find_bulk_endpoints(usb_dev).unwrap_or((0x81, 0x02));
-
-        // Determine max packet size based on speed
-        let max_packet = usb_dev.speed.default_max_packet_size();
-
-        printkln!(
-            "USB-MSC: Bulk IN=0x{:02x}, OUT=0x{:02x}, max_packet={}",
-            bulk_in_ep,
-            bulk_out_ep,
-            max_packet
-        );
-
-        let msc_dev = Arc::new(UsbMscDevice::new(
-            usb_dev.slot_id,
-            bulk_in_ep,
-            bulk_out_ep,
-            max_packet,
-        ));
-
-        printkln!("USB-MSC: Device ready for SCSI layer");
-
-        Ok(Box::new(UsbMscDeviceHandle { device: msc_dev }))
-    }
+fn usb_storage_probe(
+    dev: &Arc<crate::base::Device>,
+) -> Result<Box<dyn crate::base::Bound>, KernelError> {
+    let (usb_dev, intf) = super::usb_intf(dev).ok_or(KernelError::NoDevice)?;
+    let Some((bulk_in_ep, bulk_out_ep)) = intf.bulk_eps() else {
+        printkln!("usb-storage {}: no bulk endpoints", dev.name());
+        return Err(KernelError::NoDevice);
+    };
+    printkln!(
+        "usb-storage {}: slot {}, bulk in {:#04x}, out {:#04x}",
+        dev.name(),
+        usb_dev.slot_id,
+        bulk_in_ep,
+        bulk_out_ep
+    );
+    let msc_dev = Arc::new(UsbMscDevice::new(usb_dev.slot_id, bulk_in_ep, bulk_out_ep));
+    let disk = crate::block::create_scsi_disk(msc_dev.clone(), 0, 0).inspect_err(|e| {
+        printkln!("usb-storage {}: no disk: {:?}", dev.name(), e);
+    })?;
+    Ok(Box::new(UsbStorage {
+        device: msc_dev,
+        disk,
+    }))
 }
 
-/// Find bulk IN and OUT endpoints for MSC device
-fn find_bulk_endpoints(usb_dev: &UsbDevice) -> Option<(u8, u8)> {
-    // First try to find from interface info
-    for iface in &usb_dev.interfaces {
-        if iface.class == USB_CLASS_MASS_STORAGE {
-            let mut bulk_in = None;
-            let mut bulk_out = None;
-
-            for ep in &iface.endpoints {
-                if ep.ep_type == super::EndpointType::Bulk {
-                    if (ep.address & 0x80) != 0 {
-                        bulk_in = Some(ep.address);
-                    } else {
-                        bulk_out = Some(ep.address);
-                    }
-                }
-            }
-
-            if let (Some(i), Some(o)) = (bulk_in, bulk_out) {
-                return Some((i, o));
-            }
-        }
-    }
-
-    None
-}
-
-/// Device handle returned from probe
-///
-/// This wraps the UsbMscDevice and provides access to the ScsiHost implementation.
-pub struct UsbMscDeviceHandle {
+/// A bound mass-storage interface (Linux struct us_data): its
+/// transport and the disk scanned on it
+struct UsbStorage {
     device: Arc<UsbMscDevice>,
+    disk: SdDisk,
 }
 
-impl UsbMscDeviceHandle {
-    /// Get the SCSI host interface for this device
-    pub fn scsi_host(&self) -> Arc<dyn ScsiHost> {
-        self.device.clone()
-    }
-}
-
-impl Device for UsbMscDeviceHandle {
-    fn name(&self) -> &str {
-        "usb-msc"
-    }
-
+impl crate::base::Bound for UsbStorage {
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    /// Linux usb_stor_disconnect: the disk goes (scsi_remove_host),
+    /// then the transport stops, after the command in progress
+    fn remove(&self) {
+        self.disk.remove();
+        self.device.disconnect();
     }
 }

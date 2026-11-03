@@ -14,11 +14,11 @@
 //! - Physical devices belong to the init namespace by default
 //! - Sockets, routes, and ARP entries are namespace-local
 
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use crate::sync::spin::RwLock;
+use crate::sync::spin::{Mutex, RwLock};
 use spin::Lazy;
 
 use crate::net::device::{LinkInfo, NetDevice, NetDeviceOps};
@@ -27,6 +27,9 @@ use crate::net::inet::port::PortRange;
 use crate::net::netlink::NlTable;
 use crate::net::udp::UdpTable;
 use crate::util::error::KernelError;
+
+/// Next network namespace id (Linux ns_common.inum, never reused)
+static NEXT_NET_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Network namespace - isolates network stack per-namespace
 ///
@@ -44,6 +47,9 @@ use crate::util::error::KernelError;
 /// - ARP cache
 /// - netlink sockets
 pub struct NetNamespace {
+    /// Unique id: the sysfs namespace tag of its devices
+    pub id: u64,
+
     /// Network devices in this namespace (registration = ifindex order)
     devices: RwLock<Vec<Arc<NetDevice>>>,
 
@@ -103,6 +109,7 @@ impl NetNamespace {
     /// Create a new network namespace with loopback device
     pub fn new() -> Arc<Self> {
         let ns = Arc::new(Self {
+            id: NEXT_NET_ID.fetch_add(1, Ordering::Relaxed),
             devices: RwLock::new(Vec::new()),
             next_ifindex: AtomicU32::new(1),
             fib: Fib::new(),
@@ -127,6 +134,8 @@ impl NetNamespace {
             arp: crate::net::neigh::NeighTable::new(&crate::net::arp::ARP_OPS),
             loopback: RwLock::new(None),
         });
+
+        NET_NAMESPACE_LIST.lock().push(Arc::downgrade(&ns));
 
         // Loopback device: ifindex 1, down and without addresses until
         // brought up (then 127.0.0.1/8, like Linux)
@@ -200,10 +209,23 @@ impl NetNamespace {
     /// Register a network device in this namespace: assign the next
     /// ifindex and set the device's netns (Linux register_netdevice)
     pub fn register_device(self: &Arc<Self>, dev: Arc<NetDevice>) {
-        let mut devs = self.devices.write();
-        let idx = self.next_ifindex.fetch_add(1, Ordering::Relaxed);
-        dev.set_net(self, idx);
-        devs.push(dev);
+        {
+            let mut devs = self.devices.write();
+            let idx = self.next_ifindex.fetch_add(1, Ordering::Relaxed);
+            dev.set_net(self, idx);
+            devs.push(dev.clone());
+        }
+        // Sleeping sysfs work, after the spin lock
+        crate::net::sysfs::netdev_register_kobject(&dev);
+    }
+
+    /// Take a device off this namespace's list (Linux
+    /// unlist_netdevice; RTNL held by `net::unregister_netdevice`): no
+    /// lookup finds it again; its ifindex is never reused
+    pub fn unlist_device(&self, dev: &NetDevice) {
+        self.devices
+            .write()
+            .retain(|d| !core::ptr::eq(Arc::as_ptr(d), dev));
     }
 }
 
@@ -240,9 +262,6 @@ impl NetDeviceOps for LoopbackOps {
     }
 }
 
-/// Static loopback operations
-static LOOPBACK_OPS: LoopbackOps = LoopbackOps;
-
 /// Create a loopback device (down, no addresses)
 fn create_loopback_device() -> Arc<NetDevice> {
     use alloc::string::String;
@@ -250,7 +269,7 @@ fn create_loopback_device() -> Arc<NetDevice> {
         String::from("lo"),
         [0; 6],
         LinkInfo::LOOPBACK,
-        &LOOPBACK_OPS,
+        Arc::new(LoopbackOps),
     ))
 }
 
@@ -262,6 +281,32 @@ fn create_loopback_device() -> Arc<NetDevice> {
 ///
 /// Physical network devices are registered here. Created lazily on first access.
 pub static INIT_NET_NS: Lazy<Arc<NetNamespace>> = Lazy::new(NetNamespace::new);
+
+/// Every network namespace (Linux net_namespace_list; spin leaf)
+static NET_NAMESPACE_LIST: Mutex<Vec<Weak<NetNamespace>>> = Mutex::new(Vec::new());
+
+/// A namespace's devices leave sysfs with it (Linux
+/// default_device_exit_batch unregistering them)
+impl Drop for NetNamespace {
+    fn drop(&mut self) {
+        let kdevs = self
+            .devices
+            .get_mut()
+            .iter()
+            .filter_map(|d| d.kdev.get().cloned())
+            .collect();
+        // Sleeping sysfs work: deferred (Linux cleanup_net runs from a
+        // workqueue); the last reference may drop in any context
+        crate::net::sysfs::netns_exit(kdevs);
+    }
+}
+
+/// The live network namespaces (Linux for_each_net)
+pub fn all_net_ns() -> Vec<Arc<NetNamespace>> {
+    let mut l = NET_NAMESPACE_LIST.lock();
+    l.retain(|w| w.strong_count() > 0);
+    l.iter().filter_map(Weak::upgrade).collect()
+}
 
 /// Get the init network namespace
 pub fn init_net_ns() -> Arc<NetNamespace> {

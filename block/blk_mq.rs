@@ -27,12 +27,24 @@
 //!   never locked under it, and `queue_rq`/`complete` must not allocate,
 //!   sleep or take other locks (lock-free DMA map/unmap and MMIO only).
 //! - `end_io` runs after the hardware queue lock is released.
+//!
+//! ## Removal (Linux del_gendisk: blk_queue_start_drain,
+//! blk_mq_freeze_queue_wait; the driver's blk_mq_free_tag_set)
+//!
+//! `start_drain` marks every hardware queue dying under its lock: from
+//! then on nothing reaches `queue_rq` (pending and new bios end with
+//! EIO). `drain` sleeps on `drained` until the requests started before
+//! have completed (each hardware queue counts them under its lock; the
+//! completion that empties a dying queue wakes). `release` then hands
+//! the driver's queue state back to its remove, which stops the device
+//! and frees the rings.
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::arch::IrqSpinlock;
+use crate::sync::waitqueue::WaitQueue;
 
 use super::blkdev::{Bio, BioList, bio_endio};
 use crate::util::error::KernelError;
@@ -58,20 +70,35 @@ pub trait MqOps: Send {
     fn commit(&mut self);
     /// Move finished bios, status set, to `done`
     fn complete(&mut self, done: &mut BioList);
+    /// The driver's own type, for its remove to take apart (`release`)
+    fn into_any(self: Box<Self>) -> Box<dyn core::any::Any + Send>;
 }
 
 struct HwState {
     /// Bios taken from the software queues, not yet started
     dispatch: BioList,
-    ops: Box<dyn MqOps>,
+    /// The driver's queue; None once released
+    ops: Option<Box<dyn MqOps>>,
+    /// Started, not yet completed
+    inflight: usize,
+    /// The disk is going away: nothing more is started (Linux
+    /// QUEUE_FLAG_DYING with the queue frozen)
+    dying: bool,
 }
 
 impl HwState {
     /// Start what fits; failed bios go to `done`
     fn dispatch(&mut self, done: &mut BioList) {
+        let Some(ops) = self.ops.as_mut().filter(|_| !self.dying) else {
+            while let Some(mut b) = self.dispatch.pop() {
+                b.status = Err(KernelError::Io);
+                done.push(b);
+            }
+            return;
+        };
         let mut n = 0;
         while let Some(bio) = self.dispatch.pop() {
-            match self.ops.queue_rq(bio) {
+            match ops.queue_rq(bio) {
                 Queued::Started => n += 1,
                 Queued::Busy(b) => {
                     self.dispatch.push_front(b);
@@ -84,8 +111,14 @@ impl HwState {
             }
         }
         if n > 0 {
-            self.ops.commit();
+            self.inflight += n;
+            ops.commit();
         }
+    }
+
+    /// Dying with nothing in flight
+    fn drained(&self) -> bool {
+        self.dying && self.inflight == 0
     }
 }
 
@@ -103,6 +136,8 @@ pub struct BlkMq {
     /// Per hardware queue, a bit per software queue mapped to it with
     /// bios pending (bit `cpu / nr_hw`; Linux hctx->ctx_map)
     ctx_maps: Vec<Box<[AtomicU64]>>,
+    /// `drain` waits here (Linux mq_freeze_wq)
+    drained: WaitQueue,
 }
 
 impl BlkMq {
@@ -120,10 +155,13 @@ impl BlkMq {
                 .map(|ops| {
                     IrqSpinlock::new(HwState {
                         dispatch: BioList::new(),
-                        ops,
+                        ops: Some(ops),
+                        inflight: 0,
+                        dying: false,
                     })
                 })
                 .collect(),
+            drained: WaitQueue::new(),
         }
     }
 
@@ -184,14 +222,27 @@ impl BlkMq {
     /// end finished bios and restart dispatch into the freed room
     pub fn complete(&self, h: usize) {
         let mut done = BioList::new();
-        {
+        let wake = {
             let mut hw = self.hctxs[h].lock();
-            hw.ops.complete(&mut done);
-            if !done.is_empty() {
+            let hw = &mut *hw;
+            let Some(ops) = hw.ops.as_mut() else { return };
+            let mut got = BioList::new();
+            ops.complete(&mut got);
+            let mut n = 0;
+            while let Some(b) = got.pop() {
+                done.push(b);
+                n += 1;
+            }
+            hw.inflight = hw.inflight.saturating_sub(n);
+            if n > 0 {
                 hw.dispatch(&mut done);
             }
-        }
+            n > 0 && hw.drained()
+        };
         end_all(&mut done);
+        if wake {
+            self.drained.wake_all();
+        }
     }
 
     /// Reap every hardware queue (polled completion before interrupts
@@ -200,5 +251,37 @@ impl BlkMq {
         for h in 0..self.hctxs.len() {
             self.complete(h);
         }
+    }
+
+    /// Start nothing more: bios not yet started end with EIO (Linux
+    /// blk_queue_start_drain on a dead disk)
+    pub fn start_drain(&self) {
+        for hctx in &self.hctxs {
+            let mut failed = BioList::new();
+            {
+                let mut hw = hctx.lock();
+                hw.dying = true;
+                hw.dispatch(&mut failed);
+            }
+            end_all(&mut failed);
+        }
+    }
+
+    /// Sleep until the requests started before `start_drain` have
+    /// completed (Linux blk_mq_freeze_queue_wait). Thread context.
+    pub fn drain(&self) {
+        self.drained
+            .wait_event(|| self.hctxs.iter().all(|h| h.lock().drained()));
+    }
+
+    /// Hand the driver's queue state back after `drain`, for its
+    /// remove to stop the device and free the rings (Linux
+    /// blk_mq_free_tag_set, then the driver's del_vqs); later
+    /// completions and dispatches find no queue. Thread context.
+    pub fn release(&self) -> Vec<Box<dyn MqOps>> {
+        self.hctxs
+            .iter()
+            .filter_map(|h| h.lock().ops.take())
+            .collect()
     }
 }

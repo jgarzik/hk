@@ -25,25 +25,9 @@ pub fn run_tests() {
     println(b"=== Cgroup Test Complete ===");
 }
 
-/// Test 1: Mount cgroupfs at /sys/fs/cgroup
+/// Test 1: Mount cgroupfs at /sys/fs/cgroup (sysfs's mount point)
 fn test_mount_cgroupfs() {
-    // First create /sys if it doesn't exist
-    let sys_path = b"/sys\0";
-    let _ = sys_mkdir(sys_path.as_ptr(), 0o755);
-
-    // Create /sys/fs if it doesn't exist
-    let sys_fs_path = b"/sys/fs\0";
-    let _ = sys_mkdir(sys_fs_path.as_ptr(), 0o755);
-
-    // Create /sys/fs/cgroup
     let cgroup_path = b"/sys/fs/cgroup\0";
-    let mkdir_ret = sys_mkdir(cgroup_path.as_ptr(), 0o755);
-    if mkdir_ret < 0 && mkdir_ret != -17 {
-        // -17 is EEXIST
-        print(b"ERROR: mkdir /sys/fs/cgroup failed: ");
-        print_num(mkdir_ret);
-        return;
-    }
 
     // Mount cgroup2 filesystem
     let source = b"none\0";

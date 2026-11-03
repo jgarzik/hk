@@ -17,7 +17,6 @@
 //! Locking: runs during bus enumeration (single-threaded, boot).
 
 use crate::arch::{CurrentArch, IoremapOps};
-use crate::bus::BusDevice;
 use crate::hw::pci;
 use crate::hw::pci::PciDevice;
 use crate::printkln;

@@ -217,7 +217,7 @@ impl PacketTable {
             .collect()
     }
 
-    fn all(&self) -> Vec<Arc<PacketSock>> {
+    pub(super) fn all(&self) -> Vec<Arc<PacketSock>> {
         self.socks.read().clone()
     }
 }

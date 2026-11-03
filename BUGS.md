@@ -96,6 +96,10 @@ IP_TRANSPARENT. /proc/net/raw and
 /proc/net/icmp do not exist.
 UDP_CORK/MSG_MORE are not implemented (each send is one datagram) and
 SO_PEEK_OFF is EOPNOTSUPP.
+NIC removal: e1000 leaves the function's bus mastering and memory
+space on (no pci_disable_device) and its BAR mapped (no iounmap); an
+unregistered `NetDevice` lives on while queued skbs reference it
+(no netdev_wait_allrefs; it is down and driverless).
 
 ## Memory management gaps
 
@@ -297,6 +301,45 @@ Missing: fs.protected_hardlinks/symlinks/fifos/regular do not exist
 (behave as their kernel default 0); no
 immutable/append-only inodes (no IS_APPEND/IS_IMMUTABLE EPERM).
 
+## sysfs gaps
+
+**Location**: `fs/kernfs/`, `fs/sysfs.rs`, `base/`, `block/genhd.rs`,
+`net/sysfs.rs`, `hw/pci/driver.rs`
+
+- No power/ directories (Linux dpm_sysfs_add: control, runtime_status,
+  wakeup ...), no /sys/power, /sys/firmware/{acpi,dmi,efi} or
+  /sys/class/dmi/id: the directories exist empty.
+- Missing classes: rtc (PL031 has no /dev/rtc0), input (Phase V),
+  misc, graphics/drm, pci_bus; no /sys/kernel/{security,debug,tracing,
+  config} mount points (hk has none of those filesystems).
+- Topology: places differ from Linux on QEMU: COM1's ttyS0 sits below
+  /sys/devices/platform/serial8250 (Linux binds 8250_pnp to the ACPI
+  PNP0501 device), PL011/PL031 are platform devices (Linux: amba bus),
+  SCSI disks of USB storage are virtual (Linux: host/target/device
+  below the interface), RAM disks are rdN (Linux brd: ramN).
+- PCI: no resource/resourceN/rom/enable/numa_node/local_cpus files;
+  config is 256 bytes even for PCIe functions (no extended space).
+- cpu: no cpuN/topology, cache/ or online files and no MODALIAS
+  (CONFIG_GENERIC_CPU_AUTOPROBE); node: no meminfo/numastat/vmstat.
+- net: no queues/, phys_port_*, speed/duplex, ifalias or gro files;
+  interfaces cannot be renamed or moved between namespaces, so no
+  "move" uevents.
+- chmod/chown on sysfs files change the inode only: a later lookup of a
+  dropped dentry shows the original mode (Linux keeps kernfs iattrs).
+- /sys/module lists built-in modules with drivers only; no parameters
+  or version files (hk has no module parameters).
+
+## uevent gaps
+
+- `/sys/kernel/uevent_helper` stores a path, but no helper is run per
+  event (Linux call_usermodehelper; hk has no usermode helper).
+- NETLINK_KOBJECT_UEVENT has no kernel input: messages a
+  CAP_SYS_ADMIN sender addresses to port 0 are not rebroadcast (Linux
+  uevent_net_rcv, used by container managers).
+- Network namespaces have no owning user namespace, so uevents go to
+  every namespace; Linux sends untagged events only into namespaces
+  owned by the initial user namespace (uevent_sock_list).
+
 ## TTY gaps
 
 **Location:** `tty/`, `hw/serial.rs`, `arch/aarch64/serial.rs`.
@@ -305,7 +348,11 @@ immutable/append-only inodes (no IS_APPEND/IS_IMMUTABLE EPERM).
   a session leader's exit, carrier loss), so open files stay usable.
   A leader's exit and TIOCNOTTY only send SIGHUP/SIGCONT to the
   foreground group and clear the session; vhangup(2) only checks
-  CAP_SYS_TTY_CONFIG.
+  CAP_SYS_TTY_CONFIG. Unbinding a serial port (serial8250, PL011)
+  removes its tty devices, console and interrupt but hangs up no open
+  file (Linux uart_remove_one_port: tty_port_tty_vhangup): writes to
+  an open ttyS0/ttyAMA0 or /dev/console still reach the UART. No boot
+  test unbinds the console UART (the test output goes there).
 - **Per-process controlling tty:** it is the session's tty, so TIOCNOTTY
   by a non-leader changes nothing (Linux clears that process's
   signal->tty only).
@@ -611,24 +658,58 @@ all of them.
   the next one (most likely on the USB serial console, whose transfers
   time out after 100 ms). A timeout should stop the endpoint and move
   its dequeue pointer past the TRB (Linux xhci_handle_cmd_stop_ep).
-  Bulk transfers already match their own TRB (`wait_for_trb`) and
-  leak a timed-out transfer's bounce buffer, so a late completion is
-  dropped and its write lands nowhere in use; control transfers and
+  Bulk and control transfers already match their own TRBs
+  (`wait_for_trbs`) and leak a timed-out transfer's bounce buffer, so
+  a late completion is dropped and its write lands nowhere in use;
   commands still match by slot and endpoint only.
 - One controller only: the driver keeps a single global
   `USB_CONTROLLER`; a second xHCI's probe replaces the first, which is
   left running, and both device handles act on the survivor at
-  shutdown.
+  shutdown (unbinding the first stops neither).
 - A timed-out bulk transfer returns early (`do_bulk_out`/`do_bulk_in`
   via `?`) without `dma_unmap` and with its TRB still queued; the
   buffer (heap, freed by the caller) can still be written by the
   controller.
-- Enumeration reads no descriptors and sends no SET_CONFIGURATION
-  (`control_transfer` is a stub); devices get class 0 and no
-  interfaces. No hub support (route string 0).
-- `UsbMscBusDriver::matches` accepts any device and assumes QEMU's
-  endpoints (0x81/0x02); `main.rs` makes `sda` of the first one.
+- No hub support (route string 0): devices behind a hub are not
+  enumerated.
+- Only bulk and interrupt endpoints are added to the controller
+  (`configure_endpoints`): isochronous and non-default control
+  endpoints are skipped. A control data stage is one TRB of at most a
+  page: a configuration descriptor longer than 4 KiB is cut short.
 - Only 4 KiB controller pages and up to 512 scratchpad buffers.
+- The USB serial console drops output while `USB_CONTROLLER` is held
+  (by any CPU): it only try-locks it; Linux queues console output in a
+  write FIFO sent asynchronously.
+
+## USB core gaps
+
+**Location**: `hw/usb/usbcore.rs`, `hw/usb/xhci.rs`, `hw/usb/msc.rs`,
+`hw/usb/serial.rs`
+
+- One root hub: Linux gives an xHCI two (`usb1` USB 2.0 and `usb2`
+  USB 3.0, from the Supported Protocol capabilities, each numbering
+  its own ports); hk has `usb1` only and names every device
+  `1-<xHCI port>`, SuperSpeed ones too (Linux: `2-<port>`).
+- No hub driver (Linux "hub", hub_probe/hub_event): the root hub's
+  interface `1-0:1.0` stays unbound, `maxchild` is 0, and devices are
+  found once by the xHCI probe (no connect/disconnect handling).
+- No usbfs: no /dev/bus/usb/BBB/DDD (char major 189), so usb_device
+  uevents lack MAJOR/MINOR/DEVNAME; no "usbfs" interface driver.
+- sysfs subset: no string descriptors (`manufacturer`, `product`,
+  `serial`, `configuration`, interface `interface`), no `descriptors`,
+  `authorized`, `removable`, `quirks`, `urbnum`, `power/`, `ep_XX/`;
+  `bConfigurationValue` is read-only (Linux: writing it sets the
+  configuration).
+- The configuration is always the first (Linux
+  usb_choose_configuration) and is set at enumeration, not by the
+  generic driver's probe; no SET_INTERFACE (alternate settings stay at
+  0).
+- usb-storage: SCSI transparent command set over Bulk-Only Transport
+  only (no CB/CBI, RBC/UFI/8070 subclasses, UAS, or unusual_devs
+  quirks).
+- ftdi_sio: a console only, for the FT232 (0403:6001): no usb-serial
+  bus or ttyUSB0 tty device, no baud rate or modem control requests,
+  the bulk IN endpoint is never read.
 
 ## No DMA for 32-bit devices with RAM above 4GB
 
@@ -704,13 +785,57 @@ fat_get_cluster keeps a per-inode cache of chain positions
   Linux also drives transitional devices), INTx only (no MSI-X),
   capacity changes (config interrupts) are ignored, no DISCARD,
   WRITE_ZEROES, GET_ID (serial) or secure erase. The disk's queues are
-  fixed at probe (no hot add/remove of virtio disks).
-- No /proc/devices block section, no /sys/block; the first disk
+  fixed at probe.
+- Disk removal (`del_gendisk`) drops the page cache without writing it
+  back; Linux syncs it first on an orderly removal (bdev_mark_dead with
+  surprise = false: sync_blockdev), so dirty device-file data is lost
+  on unbind.
+- virtio-pci remove leaves the BAR mappings (common, notify, ISR,
+  device config): `IoMem` windows are copyable and never unmapped, so
+  each transport rebind leaks the ioremap space of one device (Linux
+  vp_modern_remove iounmaps them).
+- A removed kernfs binary attribute (`Kind::Bin`, e.g. PCI `config`)
+  keeps its operations, and so the object behind them, while a stale
+  dentry or open file holds the node (text attributes drop theirs).
+- No /proc/devices block section; the first disk
   registered decides the dynamic major (254 down, like Linux, but Linux
   usually has other dynamic majors registered first).
 - A mounted filesystem or active swap opens its block device, but not
   exclusively: opening it O_EXCL and BLKBSZSET on a mounted partition
   are not refused.
+
+## Atomics audit findings (2026-11-03)
+
+Shared state kept in Atomic* fields instead of under the object's
+documented lock; ranked. Each needs a design from doc/LOCKING.md and
+Linux's equivalent.
+
+- ipc/sem.rs `Sem.semval`: semop checks and applies without a lock:
+  semval can go negative, multi-sop operations are not atomic, wakeups
+  can be lost, a semop can queue on a removed array (Linux sem_lock).
+- fs/dac.rs chmod/chown run without i_rwsem: chmod 4755 racing chown
+  root can leave a setuid-root file with user-chosen contents (Linux
+  notify_change under inode_lock).
+- cgroup pids.max is checked at fork and charged later: concurrent
+  forks overshoot it (Linux pids_can_fork charge-then-rollback). IPC
+  shm_tot / used_sems are check-then-add without the ids lock and leak
+  when alloc_id fails.
+- Inode i_size uses Relaxed loads/stores (Linux release/acquire with
+  i_size_write/read): an arm64 reader can see stale data past a
+  racing extend; fallocate updates i_size without i_rwsem.
+- Medium: mnt_flags lost update (remount vs propagation), lazy kcmp
+  cookies, a revoked key can be revived, cgroup rmdir races attach (no
+  cgroup_mutex), MsgQueue lspid/stime set outside the queue lock and
+  torn IPC_STAT snapshots, adjtimex ADJ_SETOFFSET lost offsets, TCP
+  shutdown bits outside `cb`, `TcpSock.connecting` beside the state.
+- Low: remount RDONLY set before the writer check (spurious EROFS),
+  GroupCputimer started by gettime, TimerList.not_before outside the
+  wheel lock, PacketSock bind read-then-store, Zone watermarks stored
+  apart from zone.lock, filemap mkclean load+store losing A/D bits,
+  cgroup controllers' check-then-act counters, Disk open counters
+  outside open_mutex.
+- doc/LOCKING.md 5.4 cites Inode mode/uid/gid, MsgQueue and
+  SemArray.pending as correct atomic use; they are among the above.
 
 ## Code-quality audit findings (2026-11-01), by phase
 

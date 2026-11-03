@@ -181,6 +181,23 @@ pub fn flush_mclist(s: &PacketSock) {
     }
 }
 
+/// Drop the memberships on an unregistered device (Linux
+/// packet_dev_mclist_delete)
+pub fn mclist_delete(r: &rtnl::RtnlGuard, s: &PacketSock, dev: &crate::net::NetDevice) {
+    let idx = dev.ifindex() as i32;
+    let gone: Vec<Mreq> = {
+        let mut l = s.mclist.lock();
+        let (gone, keep) = core::mem::take(&mut *l)
+            .into_iter()
+            .partition(|e| e.ifindex == idx);
+        *l = keep;
+        gone
+    };
+    for e in gone {
+        dev_mc(r, dev, e.ty, -1);
+    }
+}
+
 /// Apply a membership to the device (Linux packet_dev_mc; multicast
 /// and unicast address lists are not filtered by the drivers, so only
 /// promiscuity and allmulti counts change)

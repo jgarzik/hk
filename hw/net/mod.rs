@@ -5,4 +5,4 @@
 pub mod e1000;
 pub mod virtio_net;
 
-pub use e1000::E1000PciDriver;
+pub use e1000::E1000_DRIVER;

@@ -11,6 +11,7 @@
 //! Top:          console framework (kernel log + active console(s)).
 //! ```
 
+use crate::base::{Class, DevNode, Device, DeviceInfo, device_create};
 use crate::fs::File;
 use crate::io::poll::{POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM, PollTable};
 use crate::sync::spin::RwLock;
@@ -330,10 +331,30 @@ pub static NULL_CHARDEV: NullCharDevice = NullCharDevice;
 /// Static zero device instance
 pub static ZERO_CHARDEV: ZeroCharDevice = ZeroCharDevice;
 
-/// Register built-in character devices (null, zero, full, random,
-/// urandom)
-///
-/// This must be called after the heap allocator is available.
+/// The mem class (Linux drivers/char/mem.c mem_class)
+pub static MEM_CLASS: Class = Class::new("mem", Some(mem_devnode));
+
+/// Name and minor of each mem device, and its node mode (Linux devlist)
+const MEM_DEVS: [(&str, u16, u16); 6] = [
+    ("null", 3, 0o666),
+    ("zero", 5, 0o666),
+    ("full", 7, 0o666),
+    ("random", 8, 0o666),
+    ("urandom", 9, 0o666),
+    ("kmsg", 11, 0o644),
+];
+
+fn mem_devnode(d: &Device) -> Option<DevNode> {
+    let minor = d.devt?.minor;
+    let &(name, _, mode) = MEM_DEVS.iter().find(|m| m.1 == minor)?;
+    Some(DevNode {
+        name: name.into(),
+        mode,
+    })
+}
+
+/// Register the mem character devices (Linux chr_dev_init): the
+/// drivers, the class and its devices
 pub fn register_builtin_chardevs() {
     // /dev/null = major 1 (MEM), minor 3 (Linux convention)
     let null_dev = Arc::new(NullCharDevice);
@@ -352,4 +373,13 @@ pub fn register_builtin_chardevs() {
     // /dev/kmsg (1,11)
     let kmsg = Arc::new(crate::kmsg::KmsgCharDevice);
     let _ = register_chardev(DevId::new(major::MEM, 11), kmsg);
+
+    MEM_CLASS.register();
+    for (name, minor, _) in MEM_DEVS {
+        let _ = device_create(DeviceInfo {
+            class: Some(&MEM_CLASS),
+            devt: Some(DevId::new(major::MEM, minor)),
+            ..DeviceInfo::named(name)
+        });
+    }
 }

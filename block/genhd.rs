@@ -1,10 +1,12 @@
 //! Disk registration, partitions and naming (Linux block/genhd.c,
 //! block/partitions/core.c)
 //!
-//! `add_disk` registers the whole-disk block device, creates its
-//! devtmpfs node and scans the partition table; `rescan` (BLKRRPART)
-//! replaces the partitions; `/proc/partitions` lists every block device.
-//! Partition scans and rescans run under the disk's `open_mutex`.
+//! `add_disk` registers the whole-disk block device as a block-class
+//! device (its sysfs directory, /sys/block link, devtmpfs node and
+//! uevent) and scans the partition table, each partition a device below
+//! the disk; `rescan` (BLKRRPART) replaces the partitions;
+//! `/proc/partitions` lists every block device. Partition scans and
+//! rescans run under the disk's `open_mutex`.
 
 use alloc::format;
 use alloc::string::String;
@@ -13,7 +15,10 @@ use alloc::vec::Vec;
 use core::fmt::Write;
 use core::sync::atomic::Ordering;
 
-use crate::fs::devtmpfs;
+use spin::Once;
+
+use crate::base::{Class, Device, DeviceInfo, device_create};
+use crate::fs::kernfs::{self, KNode};
 use crate::util::error::KernelError;
 
 use super::blkdev::{
@@ -50,12 +55,178 @@ pub fn part_name(disk: &str, partno: u16) -> String {
     }
 }
 
-fn node_add(b: &BlockDevice) {
-    devtmpfs::device_add(&b.name, b.dev, true, 0o660);
+/// The block class (Linux block_class)
+pub static BLOCK_CLASS: Class = Class::block("block", Some(block_uevent));
+
+/// /sys/block (Linux block_depr)
+static SYS_BLOCK: Once<Arc<KNode>> = Once::new();
+
+/// Linux genhd_device_init: the class and /sys/block
+pub fn genhd_init() {
+    BLOCK_CLASS.register();
+    SYS_BLOCK.call_once(|| crate::fs::sysfs::top_dir(b"block"));
 }
 
-/// Register a disk and its partitions (Linux device_add_disk)
-pub fn add_disk(disk: Arc<Disk>) -> Result<Arc<BlockDevice>, KernelError> {
+fn bdev_of(dev: &Device) -> Option<&BlockDevice> {
+    dev.data::<BlockDevice>()
+}
+
+/// Linux part_uevent (PARTN) and disk_uevent (DISKSEQ)
+fn block_uevent(dev: &Device, env: &mut Vec<Vec<u8>>) {
+    let Some(b) = bdev_of(dev) else { return };
+    if b.partno != 0 {
+        env.push(format!("PARTN={}", b.partno).into_bytes());
+    } else {
+        env.push(format!("DISKSEQ={}", b.disk.seq).into_bytes());
+    }
+}
+
+/// A text attribute of `dev` showing `f(bdev)`; it refers to the block
+/// device weakly (a removed one's node may outlive it in the dcache,
+/// as Linux's kernfs_node does its kobject)
+fn battr(
+    dev: &Arc<Device>,
+    dir: &Arc<KNode>,
+    name: &[u8],
+    f: fn(&BlockDevice) -> String,
+) -> Result<(), KernelError> {
+    let b = dev.data_arc::<BlockDevice>().ok_or(KernelError::NoDevice)?;
+    let b = Arc::downgrade(&b);
+    dir.create_file(
+        name,
+        0o444,
+        kernfs::show(move |o| {
+            if let Some(b) = b.upgrade() {
+                o.bytes(f(&b).as_bytes());
+            }
+        }),
+    )?;
+    Ok(())
+}
+
+/// An attribute: its name and its value from the block device
+type BAttr = (&'static [u8], fn(&BlockDevice) -> String);
+
+/// Attributes both disks and partitions have
+const COMMON_ATTRS: [BAttr; 4] = [
+    (b"size", |b| format!("{}\n", b.nr_sects())),
+    (b"ro", |b| format!("{}\n", b.ro() as u8)),
+    (b"alignment_offset", |_| String::from("0\n")),
+    (b"discard_alignment", |_| String::from("0\n")),
+];
+
+/// A disk's attributes and queue/ (Linux disk_attrs, queue_attrs)
+fn disk_attrs(dev: &Arc<Device>) -> Result<(), KernelError> {
+    let d = dev.kobj();
+    let attrs: [BAttr; 7] = [
+        (b"removable", |_| String::from("0\n")),
+        (b"hidden", |_| String::from("0\n")),
+        (b"range", |b| format!("{}\n", b.disk.minors)),
+        (b"ext_range", |b| format!("{}\n", b.disk.minors)),
+        // GENHD_FL_NO_PART for a disk without partitions
+        (b"capability", |b| {
+            format!("{:x}\n", if b.disk.minors > 1 { 0 } else { 4 })
+        }),
+        (b"diskseq", |b| format!("{}\n", b.disk.seq)),
+        (b"inflight", |_| String::from("       0        0\n")),
+    ];
+    for (n, f) in COMMON_ATTRS.into_iter().chain(attrs) {
+        battr(dev, d, n, f)?;
+    }
+    let q = d.create_dir(b"queue", 0o755)?;
+    let qattrs: [BAttr; 11] = [
+        (b"logical_block_size", |b| {
+            format!("{}\n", b.logical_block_size())
+        }),
+        (b"physical_block_size", |b| {
+            format!("{}\n", b.physical_block_size())
+        }),
+        (b"hw_sector_size", |b| {
+            format!("{}\n", b.logical_block_size())
+        }),
+        (b"minimum_io_size", |b| {
+            format!("{}\n", b.physical_block_size())
+        }),
+        (b"optimal_io_size", |_| String::from("0\n")),
+        (b"rotational", |b| {
+            format!("{}\n", b.disk.queue.limits.rotational as u8)
+        }),
+        (b"max_sectors_kb", |b| {
+            format!("{}\n", b.disk.queue.limits.max_sectors / 2)
+        }),
+        (b"max_hw_sectors_kb", |b| {
+            format!("{}\n", b.disk.queue.limits.max_sectors / 2)
+        }),
+        (b"max_segments", |b| {
+            format!("{}\n", b.disk.queue.limits.max_segments)
+        }),
+        (b"max_segment_size", |b| {
+            format!("{}\n", b.disk.queue.limits.max_segment_size)
+        }),
+        (b"read_ahead_kb", |_| String::from("128\n")),
+    ];
+    for (n, f) in qattrs {
+        battr(dev, &q, n, f)?;
+    }
+    d.create_dir(b"holders", 0o755)?;
+    d.create_dir(b"slaves", 0o755)?;
+    Ok(())
+}
+
+/// A partition's attributes (Linux part_attrs)
+fn part_attrs(dev: &Arc<Device>) -> Result<(), KernelError> {
+    let d = dev.kobj();
+    let attrs: [BAttr; 2] = [
+        (b"partition", |b| format!("{}\n", b.partno)),
+        (b"start", |b| format!("{}\n", b.start)),
+    ];
+    for (n, f) in COMMON_ATTRS.into_iter().chain(attrs) {
+        battr(dev, d, n, f)?;
+    }
+    Ok(())
+}
+
+/// The block-class device of `b` below `parent` (Linux device_add of
+/// the disk's or partition's struct device)
+fn bdev_device_add(b: &Arc<BlockDevice>, parent: Option<&Arc<Device>>) {
+    let disk = b.partno == 0;
+    let r = device_create(DeviceInfo {
+        parent,
+        class: Some(&BLOCK_CLASS),
+        devt: Some(b.dev),
+        devtype: Some(if disk { "disk" } else { "partition" }),
+        data: Some(b.clone()),
+        attrs: Some(if disk { disk_attrs } else { part_attrs }),
+        ..DeviceInfo::named(&b.name)
+    });
+    match r {
+        Ok(d) => {
+            if disk && let Some(sb) = SYS_BLOCK.get() {
+                let _ = sb.create_link(b.name.as_bytes(), d.kobj());
+            }
+            b.kdev.call_once(|| Arc::downgrade(&d));
+        }
+        Err(e) => crate::printkln!("block: {}: {:?}", b.name, e),
+    }
+}
+
+fn bdev_device_del(b: &BlockDevice) {
+    if let Some(d) = b.kdev.get().and_then(|d| d.upgrade()) {
+        if b.partno == 0
+            && let Some(sb) = SYS_BLOCK.get()
+        {
+            sb.remove_child(b.name.as_bytes());
+        }
+        d.del();
+    }
+}
+
+/// Register a disk below `parent` and its partitions (Linux
+/// device_add_disk)
+pub fn add_disk(
+    disk: Arc<Disk>,
+    parent: Option<&Arc<Device>>,
+) -> Result<Arc<BlockDevice>, KernelError> {
     let whole = Arc::new(BlockDevice::new(
         disk.clone(),
         0,
@@ -64,7 +235,7 @@ pub fn add_disk(disk: Arc<Disk>) -> Result<Arc<BlockDevice>, KernelError> {
         disk.name.clone(),
     ));
     register_bdev(whole.clone())?;
-    node_add(&whole);
+    bdev_device_add(&whole, parent);
     if disk.minors > 1 {
         let _g = disk.open_mutex.lock();
         scan_partitions(&whole);
@@ -75,6 +246,7 @@ pub fn add_disk(disk: Arc<Disk>) -> Result<Arc<BlockDevice>, KernelError> {
 /// Read the partition table and add a block device per partition
 /// (Linux blk_add_partitions); called with `open_mutex` held
 fn scan_partitions(whole: &BlockDevice) {
+    let parent = whole.kdev.get().and_then(|d| d.upgrade());
     let disk = &whole.disk;
     let mut rd = |s: u64, b: &mut [u8; 512]| bdev_rw_bytes(whole, BioOp::Read, s << 9, b);
     let parts = part::scan(&mut rd, whole.nr_sects(), disk.minors as usize);
@@ -87,18 +259,22 @@ fn scan_partitions(whole: &BlockDevice) {
             part_name(&disk.name, no),
         ));
         if register_bdev(b.clone()).is_ok() {
-            node_add(&b);
+            bdev_device_add(&b, parent.as_ref());
         }
     }
 }
 
 /// Remove block devices of `disk` with `partno >= from`
 fn drop_bdevs(disk: &Arc<Disk>, from: u16) {
-    for b in disk_bdevs(disk) {
-        if b.partno >= from {
-            unregister_bdev(b.dev);
-            devtmpfs::device_del(&b.name);
-        }
+    let mut gone: Vec<_> = disk_bdevs(disk)
+        .into_iter()
+        .filter(|b| b.partno >= from)
+        .collect();
+    // Partitions before their disk
+    gone.sort_by_key(|b| core::cmp::Reverse(b.partno));
+    for b in gone {
+        unregister_bdev(b.dev);
+        bdev_device_del(&b);
     }
 }
 
@@ -125,14 +301,20 @@ pub fn rescan(bdev: &BlockDevice) -> Result<(), KernelError> {
     Ok(())
 }
 
-/// Unregister a disk and its partitions (Linux del_gendisk)
+/// Unregister a disk and its partitions (Linux del_gendisk): new I/O
+/// fails with EIO, open files get EIO, and the requests in flight
+/// complete before it returns, so the driver may then stop the device
 pub fn del_gendisk(disk: &Arc<Disk>) {
     {
         // Under open_mutex, like a rescan: an open in progress either
         // finished before or sees the device dead
         let _g = disk.open_mutex.lock();
+        disk.queue.start_drain();
         drop_bdevs(disk, 0);
     }
+    // Started requests complete before the bdi goes (Linux freezes the
+    // queue before tearing the disk down)
+    disk.queue.drain();
     disk_release(disk);
 }
 
