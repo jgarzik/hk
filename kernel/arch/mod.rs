@@ -238,6 +238,11 @@ pub trait UserRegs {
     /// syscall instruction, its number or first argument back in the
     /// return register)
     fn restart_syscall(&mut self);
+    /// After the PTRACE_SYSCALL entry stop, before seccomp: make the
+    /// recorded arguments the live ones, so seccomp filters exactly
+    /// what the syscall receives (arm64: orig_x0 = x0; x86 reads rdi
+    /// live and needs nothing)
+    fn sync_syscall_args(&mut self) {}
 }
 
 /// Architecture abstraction trait

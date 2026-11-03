@@ -129,6 +129,10 @@ impl crate::arch::UserRegs for Aarch64TrapFrame {
         self.elr = self.elr.wrapping_sub(4);
         self.x[0] = self.orig_x0;
     }
+
+    fn sync_syscall_args(&mut self) {
+        self.orig_x0 = self.x[0];
+    }
 }
 
 // Re-export TaskContext from context module

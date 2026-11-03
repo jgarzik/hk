@@ -92,6 +92,9 @@ pub fn syscall_enter_from_user_mode(regs: &UserFrame) -> u64 {
     crate::task::percpu::account_syscall_enter();
     if crate::task::percpu::current().has_tif(tif::SYSCALL_TRACE) {
         crate::task::ptrace::ptrace_report_syscall(true);
+        // The tracer may have changed the arguments: seccomp below and
+        // the dispatch after see the same values
+        regs.sync_syscall_args();
     }
     let nr = regs.syscall_nr();
     if nr != u64::MAX

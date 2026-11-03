@@ -139,4 +139,11 @@ impl<T: Clone + UserRegs> Frame<T> {
         // SAFETY: see above
         unsafe { self.with(|r| r.restart_syscall()) }
     }
+
+    /// The recorded arguments become the live ones (after a tracer stop)
+    #[inline]
+    pub fn sync_syscall_args(&self) {
+        // SAFETY: see above
+        unsafe { self.with(|r| r.sync_syscall_args()) }
+    }
 }
