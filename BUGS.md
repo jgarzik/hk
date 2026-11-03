@@ -9,6 +9,31 @@ None is known to fail today, but each is a soundness bug:
   - aarch64/x86 paging `entry_atomic` returns `&'static AtomicU64` into
     a table that can be freed; the mm `pte` helpers take `*mut u64`.
 
+## unsafe not yet wrapped or documented (doc/UNSAFE.md)
+
+There are 71 files with `#![allow(clippy::undocumented_unsafe_blocks)]
+// TODO(unsafe)` (`grep -rl 'TODO(unsafe)' kernel`). Most of their
+blocks belong in a missing wrapper:
+
+- **Frames:** an owned / page-locked / PTL-held frame borrow type in
+  place of the `frame_bytes` unsafe fn (17 callers: vfat, pipe, splice,
+  exec, fault, filemap, swap).
+- **Page tables:** a table / `Pte` reference type made only by the
+  walker and tied to the mmap_lock / PTL. It replaces `entry_atomic`,
+  `pagewalk::entry` and the `*mut u64` PTE helpers (the soundness item
+  above), and the boot kmap and ioremap walkers.
+- **DMA:** an owned `DmaBox<T: Pod>` with volatile field access, never
+  `&T` into device-written memory: xhci rings and contexts, virtio
+  rings and blk, e1000 descriptors, virtio-net buffers.
+- **MMIO:** the remaining raw MMIO users move to `mmio::IoMem`: xhci
+  operational/runtime registers, gfx framebuffer, vgacon, rtc,
+  pci_quirks, aarch64 serial, x86 power.
+- **Lists:** an intrusive `CursorMut` for the walk-and-remove loops
+  (futex, waitqueue, sched, percpu).
+- **Callbacks:** typed callback context (`register_irq<T: Sync>`,
+  timer container_of, `smp_call<T: Sync>`) in place of `*mut ()` data
+  casts.
+
 ## Path names must be valid UTF-8
 
 **Location:** `kernel/uaccess.rs` (`strncpy_from_user`).
