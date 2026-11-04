@@ -2348,7 +2348,7 @@ pub struct TimeKeeper {
     shift: AtomicU32,
     tsc_freq_hz: AtomicU64,
     initialized: AtomicU32,
-    read_cycles_fn: AtomicPtr<()>,
+    read_cycles_fn: spin::Once<fn() -> u64>,
 }
 ```
 
@@ -3323,7 +3323,7 @@ else is taken under it) unless an order is given. "spin" is the
 | `Eventfd.inner`, `Eventpoll.inner`, `Inotify.inner`, `Fanotify.inner`, `IoUring.inner`, `Pidfd.inner`, `Signalfd.inner`, `Timerfd.inner` | io/eventfd.rs, io/epoll.rs, io/inotify.rs, io/fanotify.rs, io/io_uring.rs, task/pidfd.rs, io/signalfd.rs, time/timerfd.rs | IrqSpinlock | per-object state of the anon-inode files; their wait queues are woken after unlocking (pidfd: under it -> wait queue head) |
 | `PIDFD_REGISTRY` | task/pidfd.rs | IrqSpinlock | live pidfds for exit notification; registry -> the instance's `inner` |
 | `SigHand.signalfd_wq` | signal/mod.rs | WaitQueue (its own IrqSpinlock) | signalfd readers and pollers of the tasks sharing a handler table (Linux sighand->signalfd_wqh); woken by send_signal after the target's signal state is unlocked; readers take `Signalfd.inner` and the caller's signal state only in its condition, after the queue's lock is dropped |
-| `Workqueue.inner` | task/workqueue.rs | IrqSpinlock | pending and delayed work lists (`SYSTEM_WQ`, `BDI_WORKQUEUE`); a work item's own `spin::Mutex<Work>` is taken and dropped before it |
+| `Workqueue.inner` | task/workqueue.rs | IrqSpinlock | pending and delayed work lists (`SYSTEM_WQ`, `BDI_WORKQUEUE`); queueing takes a work item's own `spin::Mutex<Work>` and drops it before this lock; `promote_delayed` takes the item lock under it (order: `Workqueue.inner` → item) |
 | `BDI_REGISTRY`, `BdiWriteback.dirty`, `BdiWriteback.dwork` | mm/writeback.rs | spin | per-disk writeback state: the devices with dirty data, the periodic work; leaves, writeback runs with none held |
 | `Task.cgroup`, `CSS_SET_CACHE`, `CgroupRoot.{root_cgrp, controllers}`, `Cgroup.{parent, children, ancestors, subsys, tasks}`, `CssSet.subsys`, `CgroupSubsysState.private`, `IoState.devices` | cgroup/ | spin (RwLock; `CSS_SET_CACHE`, `Task.cgroup` Mutex) | cgroup hierarchy and membership (`Task.cgroup`: the task's cgroup, a leaf reached through a `TaskRef` cloned out of TASKLIST, Linux task->cgroups); parent before child; never under TASKLIST |
 | `IpcIds.inner`, `KernIpcPerm.lock`, `MsgQueue.messages`, `SemArray.pending`, `SemUndoList.undos`, `MQ_REGISTRY`, `MqQueue.{messages, flags, notify}` | ipc/ | spin | SysV and POSIX IPC objects; `IpcIds.inner` -> the object's lock. `MsgQueue.messages` also guards the queue's and namespace's message counters and is taken by msgsnd's limit/removal check (Linux: the msq lock) |
@@ -3492,23 +3492,55 @@ guard.a = 1;
 guard.b = 2;
 ```
 
+#### Rules (phase L, from the 2026-11-03 atomics audit)
+
+1. **Lock first, atomics second.** An object with a lock keeps its fields
+   as plain data inside that lock. An atomic is justified only by a named
+   lockless reader (cite it in a comment, as Linux's READ_ONCE comments
+   do); writers still take the lock.
+2. **No check-then-act on atomics.** A `load` followed by a `store` or
+   `fetch_*` on a decision path is one RMW (`fetch_update`/CAS). Limits use
+   Linux's add-then-rollback (`page_counter_try_charge`,
+   `pids_try_charge`). Anything spanning two fields needs a lock.
+3. **No `Mutex<()>` guarding sibling atomics.** The protected state goes
+   inside the Mutex.
+4. **Publication is Release/Acquire.** A value whose observation implies
+   other data is visible (i_size, ready flags, pointers) is
+   Release/Acquire. Relaxed is for counters and statistics, with a
+   comment.
+5. **Set-once is `Once`, a constructor argument or a boot initcall**, not a
+   lazy flag on a hot path. Boot globals written only before SMP may stay
+   Relaxed atomics, documented as `__ro_after_init` equivalents.
+6. **Recursion and ownership guards are per holder** (owner CPU/task in the
+   lock, or `try_lock`), never a global bool.
+7. **Every shared atomic is documented here**: writer context and lock,
+   reader context, ordering, Linux equivalent.
+8. **IDs exposed to user space use an IDA when Linux does** (device
+   indexes), not a monotonic counter.
+9. **Counters hit on every packet or op on every CPU are per-CPU with
+   batching.**
+
 #### hk Pattern Examples
 
-The following patterns are CORRECT uses of atomics in hk:
+Correct uses of atomics in hk:
 
 | Subsystem | Atomic Fields | Why Correct |
 |-----------|---------------|-------------|
 | `TimeKeeper` | seq, cycle_base, mono_base_ns, etc. | Seqlock pattern - all read together with seq validation |
-| `Inode` | mode, uid, gid, size, nlink | Each field updated independently by different operations |
-| `File` | pos | File position modified independently (concurrent reads OK) |
-| `Sock` | flags, error, shutdown, buffer sizes | Independent flags; protocol data under the socket lock |
+| `File` | pos | Under `f_pos_lock` for writers; atomic for lockless readers |
+| `Sock` | flags, error, buffer sizes | Independent values; protocol data under the socket lock |
 | `CachedPage` | refcount, dirty, writeback, locked | Linux page cache pattern - flags + refcount |
-| `MsgQueue` | stime, rtime, cbytes, qnum, etc. | Different syscalls update different subsets |
 
-All hk structs that update multiple related fields atomically use locks:
-- `MsgQueue.messages: Mutex<VecDeque<MsgMsg>>` - protects message list
-- `SemArray.pending: Mutex<VecDeque<...>>` - serializes pending ops
-- `PageCache inner locks` - protect page maps
+Open (BUGS.md "Atomics audit findings", fixed during phase L; each fix
+moves its row above or into its subsystem table):
+
+| Subsystem | Atomic Fields | Problem |
+|-----------|---------------|---------|
+| `Inode` | mode, uid, gid | chmod/chown change them outside i_rwsem (rule 1) |
+| `Inode` | size | Relaxed; i_size_write/read are Release/Acquire (rule 4) |
+| `MsgQueue` | stime, rtime, lspid, lrpid, ctime, qbytes | set outside `messages`; IPC_STAT tears (rule 1) |
+| `SemArray` / `Sem` | semval, sempid; `pending` | semop checks and applies outside any lock (rules 1, 2) |
+| `Sock` | shutdown | TCP sets and clears it outside `cb` (rule 1) |
 
 ---
 
