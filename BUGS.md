@@ -839,8 +839,11 @@ fat_get_cluster keeps a per-inode cache of chain positions
 ## Atomics audit findings (2026-11-03)
 
 Shared state kept in Atomic* fields instead of under the object's
-documented lock; ranked. Each needs a design from doc/LOCKING.md and
-Linux's equivalent.
+documented lock; ranked. Roadmap phase L fixes them, each with its
+Linux design (doc/ROADMAP.md). Fixed since the audit: the USB console
+recursion flag, USB mass storage BOT serialization, kernfs concurrent
+deactivate, netlink bind groups, the SCSI disk state and the virtio/sd
+index IDAs.
 
 - ipc/sem.rs `Sem.semval`: semop checks and applies without a lock:
   semval can go negative, multi-sop operations are not atomic, wakeups
@@ -887,8 +890,8 @@ sched pid 0, flock/POSIX release, signalfd reader, errno flattening.
   queue an event (no fsnotify hooks in the VFS); there is no siginfo
   queue (signals are a bitmask: rt_sigqueueinfo's data, si_pid/si_uid
   and RT signal queueing are lost); waitid without WEXITED is EINVAL
-  (C); semctl GETNCNT/GETZCNT are 0; fallocate PUNCH_HOLE succeeds
-  without zeroing (F).
+  (C); semctl GETNCNT/GETZCNT are 0 (L); fallocate PUNCH_HOLE succeeds
+  without zeroing (L).
 - **Copied helpers** (J, or as touched): `get_nofile_limit` in eight
   places; `find_task_by_pid` in four (all root-namespace pids); four
   `current_time`s; about ten user-timespec readers each validating
@@ -923,59 +926,61 @@ sched pid 0, flock/POSIX release, signalfd reader, errno flattening.
   `ns/uts.rs:224`, `task/rlimit.rs:264`, `task/misc.rs:1311`.
 
 ## P2 review findings (open)
-From the P2 /code-review (unverified). Tag = when to fix.
-1. **pcp_free drains the hot end** (next batch).
+From the P2 /code-review (unverified). Tag = roadmap phase (doc/ROADMAP.md).
+1. **pcp_free drains the hot end** (J).
    `mm/page_alloc.rs:458`: freed page pushed at head, drain
    pops from head; Linux returns the cold tail.
 2. **arm64 /reserved-memory no-map regions are linear-mapped**
-   (next batch; real HW). `arch/aarch64/dtb.rs:175`: Linux
+   (D; real HW). `arch/aarch64/dtb.rs:175`: Linux
    memblock_mark_nomap removes them (speculative access to secure
    carve-outs).
 
 ## P3 review findings (open)
-From the P3 /code-review (unverified). Tag = when to fix.
-1. **Remote write gives up after 16 COW tries** (next batch).
+From the P3 /code-review (unverified). Tag = roadmap phase (doc/ROADMAP.md).
+1. **Remote write gives up after 16 COW tries** (C, with
+   FOLL_FORCE).
    `mm/remote.rs:176`: spurious EFAULT; break COW and write
    under one PTE-lock hold, or loop until fatal_signal_pending.
 
 ## Fix batch 1 review findings (open)
-From the fix-batch-1 /code-review (unverified). Tag = when to fix.
+From the fix-batch-1 /code-review (unverified). Tag = roadmap phase (doc/ROADMAP.md).
 3. **memblock holds at most 128 ranges** (J). `mm/memblock.rs:18`:
    a firmware map with more RAM or reserved ranges panics at boot
    (asserts in add/remove/reserve); Linux grows the array
    (memblock_double_array).
 
 ## P4 review findings (open)
-From the P4 /code-review (unverified unless noted). Tag = when to fix.
+From the P4 /code-review (unverified unless noted). Tag = roadmap phase (doc/ROADMAP.md).
 
-4. **LRU batch refs defeat exclusivity checks** (next batch).
+4. **LRU batch refs defeat exclusivity checks** (J).
    `mm/fault.rs:477` / `:545`: refcount==1 tests fail while a
    page sits in the per-CPU add batch → needless COW copies after
    swap-in. Linux drains and rechecks (wp_can_reuse_anon_folio).
 5. **alloc_slot linear scan under SwapInfo.map; two Vecs + sort per
-   reclaimed page** (P6). `mm/swap.rs:184`: cluster/free-hint
+   reclaimed page** (J). `mm/swap.rs:184`: cluster/free-hint
    allocator, cached sorted device list.
 7. **One AnonVma per fork family, Vec chain** (J).
    `mm/anon_vma.rs:85`: O(N×VMAs) under one family write lock.
 
 ## T0 findings (open)
-Found during T0 (2026-10-19). Tag = when to fix.
-1. **Syscalls report root-namespace pids** (P9). Tasks get a number in
+Found during T0 (2026-10-19). Tag = roadmap phase (doc/ROADMAP.md).
+1. **Syscalls report root-namespace pids** (C). Tasks get a number in
    every level of their pid namespace chain (`task/pid.rs`), but
    getpid/gettid/kill/wait//proc use the root number; a CLONE_NEWPID
    child is not pid 1 in its namespace. Use `Pid::nr_in(caller's ns)`
    at the syscall boundary.
-6. **No ptrace exec stop** (P9): a traced task's execve does not stop
+6. **No ptrace exec stop** (C): a traced task's execve does not stop
    with SIGTRAP / PTRACE_EVENT_EXEC (`task/exec.rs`), so a
    tracer cannot observe a non-leader exec's tid change.
-8. **MM_LIFE_EXEC_CHAIN intermittent on arm64 CI** (next batch). One
+8. **MM_LIFE_EXEC_CHAIN intermittent on arm64 CI** (flake:
+   investigate when it repeats). One
    GitHub `check-arm` run (TCG, NIC=e1000) reported
    `MM_LIFE_EXEC_CHAIN:FAIL -2`: both warmup chains passed, then the
    first measured one's child (busybox `env` x40 then `true`, i.e. 41
    execs in one process) exited nonzero. A failed exec, not a leak.
    MM_LIFE now prints a failing child's wait status (exit code vs
    signal); 16 eight-CPU arm64 stress boots did not repeat it.
-10. **Network test flake** (I):
+10. **Network test flake** (L: TcpSock.connecting beside the state):
    `SOCKCORE_CONNECT_REFUSED:FAIL SO_ERROR got 0` (hk arm64, 1 of 10
    `check-stress` boots: poll reported POLLOUT for a nonblocking
    connect to a just-closed loopback port, but no ECONNREFUSED was
