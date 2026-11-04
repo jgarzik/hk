@@ -2126,6 +2126,12 @@ nanoseconds), like Linux's `i_*time_sec` / `i_*time_nsec` fields:
 - **Writes** hold `i_rwsem` exclusive (Linux `notify_change` under
   `inode_lock`): utimensat/utimes/utime take it after `want_write` and the
   permission check, then set atime, mtime and ctime.
+- **Mode, uid and gid** follow the same rule: chmod and chown take
+  `i_rwsem` after `want_write` and keep it across the permission checks,
+  the set-id kill computed from the current mode, the stores and ctime
+  (Linux chmod_common/chown_common); a write or truncate kills set-id bits
+  under it (`remove_privs`). Readers (permission checks, stat, exec) load
+  them lock-free, as Linux reads i_mode with READ_ONCE.
 
 #### Timers (time/timer.rs; Linux kernel/time/timer.c)
 
@@ -3535,6 +3541,7 @@ Correct uses of atomics in hk:
 |-----------|---------------|-------------|
 | `TimeKeeper` | seq, cycle_base, mono_base_ns, etc. | Seqlock pattern - all read together with seq validation |
 | `File` | pos | Under `f_pos_lock` for writers; atomic for lockless readers |
+| `Inode` | mode, uid, gid | Written under i_rwsem (chmod, chown, set-id kill on write/truncate); read lock-free |
 | `Sock` | flags, error, buffer sizes | Independent values; protocol data under the socket lock |
 | `CachedPage` | refcount, dirty, writeback, locked | Linux page cache pattern - flags + refcount |
 
@@ -3543,7 +3550,6 @@ moves its row above or into its subsystem table):
 
 | Subsystem | Atomic Fields | Problem |
 |-----------|---------------|---------|
-| `Inode` | mode, uid, gid | chmod/chown change them outside i_rwsem (rule 1) |
 | `Inode` | size | Relaxed; i_size_write/read are Release/Acquire (rule 4) |
 | `Sock` | shutdown | TCP sets and clears it outside `cb` (rule 1) |
 

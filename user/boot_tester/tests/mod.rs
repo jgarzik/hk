@@ -8,6 +8,7 @@ pub mod anon_inode;
 mod append;
 #[cfg(target_arch = "x86_64")]
 pub mod arch_gs;
+pub mod attr_race;
 pub mod bigio;
 pub mod blk;
 pub mod bpf;
@@ -254,6 +255,7 @@ pub fn run_all_tests() {
     futex_requeue::run_tests();
     futex_shared::run_tests();
     sysv_race::run_tests();
+    attr_race::run_tests();
     timerfd::run_tests();
     posix_timer::run_tests();
     xattr::run_tests();

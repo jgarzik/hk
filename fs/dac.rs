@@ -291,7 +291,8 @@ pub fn kill_bits(c: &Cred, inode: &Inode) -> u16 {
     kill
 }
 
-/// file_remove_privs: drop set-id bits before data changes
+/// file_remove_privs: drop set-id bits before data changes; the caller
+/// holds i_rwsem (write, truncate), as chmod and chown do
 pub fn remove_privs(inode: &Inode) {
     if inode.mode().perm() & (S_ISUID | S_ISGID) == 0 {
         return;
@@ -303,10 +304,14 @@ pub fn remove_privs(inode: &Inode) {
 }
 
 /// chmod: owner or CAP_FOWNER; S_ISGID silently dropped unless the
-/// caller is in the file's group or has CAP_FSETID
+/// caller is in the file's group or has CAP_FSETID. The check and the
+/// change are one step under i_rwsem (Linux chmod_common: inode_lock
+/// around notify_change), so a racing chown or write cannot slip
+/// between them.
 pub fn chmod(p: &super::Path, perm: u16) -> Result<(), KernelError> {
     let inode = &*p.dentry.get_inode().ok_or(KernelError::NotFound)?;
     let _w = p.mnt.want_write()?;
+    let _l = inode.lock();
     inode.i_op.setattr_ok(inode)?;
     let c = cred();
     if !owner_or_capable(&c, inode) {
@@ -334,10 +339,13 @@ fn chgrp_ok(c: &Cred, inode: &Inode, gid: Gid) -> bool {
 
 /// chown_common + notify_change: permission per id, then for
 /// non-directories S_ISUID is always cleared and S_ISGID when
-/// group-executable or the caller could not keep it (even for root)
+/// group-executable or the caller could not keep it (even for root).
+/// Under i_rwsem across the checks, the kill computed from the current
+/// mode, and the id, mode and ctime changes (Linux chown_common).
 pub fn chown(p: &super::Path, uid: Option<Uid>, gid: Option<Gid>) -> Result<(), KernelError> {
     let inode = &*p.dentry.get_inode().ok_or(KernelError::NotFound)?;
     let _w = p.mnt.want_write()?;
+    let _l = inode.lock();
     inode.i_op.setattr_ok(inode)?;
     let c = cred();
     if uid.is_some_and(|u| !chown_ok(&c, inode, u)) || gid.is_some_and(|g| !chgrp_ok(&c, inode, g))
