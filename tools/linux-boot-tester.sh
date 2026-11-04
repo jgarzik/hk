@@ -92,12 +92,17 @@ if [ "$(dd if="$LINUX_KERNEL" bs=1 skip=4 count=4 status=none | tr -d '\0')" = z
         echo "linux-boot-tester: zboot compression $comp unsupported" >&2
         exit 1
     }
-    if [ ! "$WORK/Image" -nt "$LINUX_KERNEL" ]; then
-        tail -c +"$(($(le32 8) + 1))" "$LINUX_KERNEL" | head -c "$(le32 12)" |
-            if [ "$comp" = zstd ]; then zstd -dcq; else gzip -dc; fi > "$WORK/Image.tmp"
-        mv "$WORK/Image.tmp" "$WORK/Image"
+    # Named by the zboot file's hash: dpkg-deb keeps package mtimes, so
+    # a newer kernel can look older than the last unpack
+    img=$WORK/Image-$(sha256sum < "$LINUX_KERNEL" | cut -c1-16)
+    if [ ! -f "$img" ]; then
+        rm -f "$WORK"/Image-*
+        dd if="$LINUX_KERNEL" iflag=skip_bytes,count_bytes bs=1M status=none \
+            skip="$(le32 8)" count="$(le32 12)" |
+            if [ "$comp" = zstd ]; then zstd -dcq; else gzip -dc; fi > "$img.tmp"
+        mv "$img.tmp" "$img"
     fi
-    LINUX_KERNEL=$WORK/Image
+    LINUX_KERNEL=$img
     echo "Kernel: unpacked $comp zboot to $LINUX_KERNEL"
 fi
 
