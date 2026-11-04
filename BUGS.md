@@ -459,9 +459,10 @@ namespaces, the nullfs that stands in for an unmounted mount and the
 empty immutable regular file. Locks are not refused with ENOLCK
 (31a1fb90624d), MS_REMOUNT and umount of the root are not refused on
 the internal superblock (d791606bb915), and nothing marks knullfs's
-root as unmountable (e22e69c2ad88: dont_mount). The rootfs's
-filesystem type reads "ramfs" in mountinfo, where Linux has "rootfs".
-Kernel code that resolves a path from a kernel thread finds nothing
+root as unmountable (e22e69c2ad88: dont_mount). The rootfs is
+always a ramfs; Linux fills it as tmpfs when it has CONFIG_TMPFS
+(Ubuntu does), so statfs("/") on the initramfs differs until hk has a
+tmpfs (doc/ROADMAP.md phase 6). Kernel code that resolves a path from a kernel thread finds nothing
 (knullfs); hk has none today, and has no scoped_with_init_fs for one
 that would need init's root.
 

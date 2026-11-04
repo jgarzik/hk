@@ -345,8 +345,8 @@ impl Mount {
 }
 
 /// The initial mount tree (Linux init_mount_tree, 7.0+): a nullfs mount
-/// (id 1) is the namespace root and the mutable rootfs, a ramfs (id 2),
-/// is mounted on it. Root and cwd go to the rootfs, so it can be
+/// (id 1) is the namespace root and the mutable rootfs, a ramfs under
+/// the type name "rootfs" (id 2), is mounted on it. Root and cwd go to the rootfs, so it can be
 /// pivoted away or unmounted like any other mount. Then the private
 /// nullfs kernel threads start in (id 3, Linux 7.3 knullfs). Returns
 /// the rootfs.
@@ -359,8 +359,8 @@ pub fn init_mount_tree() -> Result<Arc<Mount>, KernelError> {
         false,
         b"nullfs".as_slice().into(),
     )?;
-    let ramfs = &super::ramfs::RAMFS_TYPE;
-    let sb = (ramfs.mount)(ramfs, b"")?;
+    let rootfs_type = &super::ramfs::ROOTFS_TYPE;
+    let sb = (rootfs_type.mount)(rootfs_type, b"")?;
     let on = Path::new(null.clone(), null.root.clone());
     let rootfs = attach(sb, Some(on), 0, false, b"rootfs".as_slice().into())?;
     let ksb = (nullfs.mount)(nullfs, b"")?;

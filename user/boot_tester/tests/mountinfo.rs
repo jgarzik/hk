@@ -106,10 +106,10 @@ fn mountinfo_id(mp: &[u8]) -> u64 {
         .unwrap_or(0)
 }
 
-/// The first line is the rootfs, on "/". Since Linux 7.0 (313c47f4fe4d,
-/// init_mount_tree) it is mount 2, on the nullfs root, mount 1, which is
-/// outside the root and not listed; before, the rootfs was mount 1 and
-/// its own parent.
+/// The first line is the rootfs, on "/", type and source "rootfs".
+/// Since Linux 7.0 (313c47f4fe4d, init_mount_tree) it is mount 2, on the
+/// nullfs root, mount 1, which is outside the root and not listed;
+/// before, the rootfs was mount 1 and its own parent.
 fn check_rootfs() -> R {
     let mut buf = [0u8; 8192];
     let n = slurp(b"/proc/self/mountinfo\0", &mut buf);
@@ -127,7 +127,13 @@ fn check_rootfs() -> R {
     let listed = buf[..n]
         .split(|&c| c == b'\n')
         .any(|l| l.split(|&c| c == b' ').next().and_then(num) == Some(parent));
-    check(b"parent listed", listed == (parent == id), parent as i64)
+    check(b"parent listed", listed == (parent == id), parent as i64)?;
+    // Type and source "rootfs" (Linux rootfs_fs_type, whatever fills it)
+    let tail = line
+        .windows(3)
+        .position(|w| w == b" - ")
+        .map_or(&b""[..], |i| &line[i + 3..]);
+    check(b"type rootfs", tail.starts_with(b"rootfs rootfs "), 0)
 }
 
 /// The line of /tmp/mi: id, a parent id that is another line's id,
