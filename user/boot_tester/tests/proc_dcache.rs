@@ -240,16 +240,21 @@ fn drop_dentries() -> R {
         let _ = stat(proc_path(&mut b, me, &rest[..4 + k]));
     }
     let before = nr_dentry();
-    // Twice: Linux's first pass may only clear each dentry's
-    // referenced bit (dentry_lru_isolate: LRU_ROTATE), and drop_slab
-    // goes round again only when a round freed more than 10
-    let mut w = 0;
-    for _ in 0..2 {
+    // Until they go (at most 8 writes): drop_caches is best effort. A
+    // pass may only clear each dentry's referenced bit (Linux
+    // dentry_lru_isolate: LRU_ROTATE), drop_slab goes round again only
+    // when a round freed more than 10, and Linux 7.0 can free nothing
+    // in the first two writes after boot
+    let (mut w, mut after) = (0, before);
+    for _ in 0..8 {
         let fd = sys_open(b"/proc/sys/vm/drop_caches\0".as_ptr(), 1, 0);
         w = sys_write(fd as u64, b"2\n".as_ptr(), 2);
         sys_close(fd as u64);
+        after = nr_dentry();
+        if w != 2 || before - after >= 100 {
+            break;
+        }
     }
-    let after = nr_dentry();
     let still = match (stat(mp), stat(b"/tmp\0")) {
         (Ok(a), Ok(b)) => a.st_dev != b.st_dev,
         _ => false,
