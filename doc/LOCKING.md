@@ -257,7 +257,8 @@ VFS locks (detailed order):
     SuperBlock.s_vfs_rename_mutex (cross-directory rename only)
         ↓
     Inode.i_rwsem (sync::RwSem; exclusive: directory operations,
-                   lock_rename, regular file write and truncate, the
+                   lock_rename, regular file write, truncate and
+                   fallocate, the
                    mountpoint during attach (Linux lock_mount); shared:
                    path-walk lookup on a dcache miss, readdir;
                    parent directory -> the link/unlink/rename victim or

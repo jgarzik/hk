@@ -836,6 +836,9 @@ fat_get_cluster keeps a per-inode cache of chain positions
   exclusively: opening it O_EXCL and BLKBSZSET on a mounted partition
   are not refused.
 
+fallocate on a block device is EOPNOTSUPP (Linux blkdev_fallocate zeroes
+or discards the range).
+
 ## Atomics audit findings (2026-11-03)
 
 Shared state kept in Atomic* fields instead of under the object's
@@ -890,7 +893,7 @@ sched pid 0, flock/POSIX release, signalfd reader, errno flattening.
   queue an event (no fsnotify hooks in the VFS); there is no siginfo
   queue (signals are a bitmask: rt_sigqueueinfo's data, si_pid/si_uid
   and RT signal queueing are lost); waitid without WEXITED is EINVAL
-  (C); fallocate PUNCH_HOLE succeeds without zeroing (L).
+  (C).
 - **Copied helpers** (J, or as touched): `get_nofile_limit` in eight
   places; `find_task_by_pid` in four (all root-namespace pids); four
   `current_time`s; about ten user-timespec readers each validating

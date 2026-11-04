@@ -262,6 +262,21 @@ pub trait InodeOps: Send + Sync {
         Err(KernelError::OperationNotSupported)
     }
 
+    /// Preallocate or punch a range (Linux f_op->fallocate), called by
+    /// sys_fallocate under i_rwsem after vfs_fallocate's checks.
+    /// Default: not supported (EOPNOTSUPP), as Linux for a filesystem
+    /// without the op.
+    fn fallocate(
+        &self,
+        inode: &Arc<Inode>,
+        mode: i32,
+        offset: u64,
+        len: u64,
+    ) -> Result<(), KernelError> {
+        let _ = (inode, mode, offset, len);
+        Err(KernelError::OperationNotSupported)
+    }
+
     /// Truncate or extend a file to a specified length
     ///
     /// If the file was larger than length, the extra data is discarded.
@@ -708,6 +723,26 @@ impl Inode {
     /// Get filesystem-specific private data
     pub fn get_private(&self) -> Option<Arc<dyn InodeData>> {
         self.private.read().clone()
+    }
+
+    /// A file may grow to `size` (Linux inode_newsize_ok): past
+    /// RLIMIT_FSIZE is SIGXFSZ and EFBIG; shrinking an active swap file
+    /// is ETXTBSY
+    pub fn newsize_ok(&self, size: u64) -> Result<(), KernelError> {
+        use crate::task::rlimit::{RLIM_INFINITY, RLIMIT_FSIZE, rlimit};
+        if size > self.get_size() {
+            let limit = rlimit(RLIMIT_FSIZE);
+            if limit != RLIM_INFINITY && size > limit {
+                crate::signal::send_signal(
+                    crate::task::percpu::current_tid(),
+                    crate::signal::SIGXFSZ,
+                );
+                return Err(KernelError::FileTooLarge);
+            }
+        } else if self.i_swapfile.load(Ordering::Acquire) {
+            return Err(KernelError::TextBusy);
+        }
+        Ok(())
     }
 
     /// Update file size (Linux i_size_write: smp_store_release). The
