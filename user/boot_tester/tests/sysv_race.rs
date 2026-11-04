@@ -21,6 +21,13 @@
 //!   a shared counter; no increment is lost and the value ends at 1.
 //! - SEM_GETALL_SUM: units move between two semaphores in atomic
 //!   two-operation semops; every GETALL snapshot keeps their sum.
+//!
+//! SEM_UNDO (Linux struct sem_undo, exit_sem):
+//! - SEM_UNDO_EXIT: a child's +3 with SEM_UNDO is undone when it exits.
+//! - SEM_UNDO_SETVAL: SETVAL clears every adjustment of that semaphore,
+//!   so the exit undoes nothing.
+//! - SEM_UNDO_ERANGE: an adjustment past -32768 is ERANGE and changes
+//!   nothing.
 
 use core::sync::atomic::{AtomicI32, Ordering};
 
@@ -49,6 +56,9 @@ pub fn run_tests() {
     report(b"SEM_ERRNO_ORDER", sem_errno_order());
     report(b"SEM_MUTEX_STRESS", sem_mutex_stress());
     report(b"SEM_GETALL_SUM", sem_getall_sum());
+    report(b"SEM_UNDO_EXIT", sem_undo(undo_exit_child, 0));
+    report(b"SEM_UNDO_SETVAL", sem_undo(undo_setval_child, 5));
+    report(b"SEM_UNDO_ERANGE", sem_undo(undo_erange_child, 0));
 }
 
 type R = Result<(), (&'static [u8], i64)>;
@@ -351,4 +361,54 @@ fn sem_getall_sum() -> R {
     }
     unshare(sh);
     check(b"sum", bad.is_none(), bad.unwrap_or(0) as i64)
+}
+
+const UNDO: i16 = hk_syscall::SEM_UNDO;
+
+/// Run `child(semid)` in a child (its exit status is its verdict), then
+/// expect the semaphore at `want` after its exit undo
+fn sem_undo(child: fn(i32) -> u64, want: i64) -> R {
+    let set = Set::new(1);
+    check(b"semget", set.0 >= 0, set.0 as i64)?;
+    let pid = sys_fork();
+    if pid == 0 {
+        sys_exit(child(set.0));
+    }
+    let mut ws = 0;
+    sys_wait4(pid, &mut ws, 0, 0);
+    check(b"child", ws == 0, (ws >> 8) as i64)?;
+    check(b"value", set.get(0) == want, set.get(0))
+}
+
+fn undo_exit_child(id: i32) -> u64 {
+    let op = [Sembuf::new(0, 3, UNDO)];
+    (sys_semop(id, op.as_ptr(), 1) != 0) as u64
+}
+
+fn undo_setval_child(id: i32) -> u64 {
+    let op = [Sembuf::new(0, 1, UNDO)];
+    if sys_semop(id, op.as_ptr(), 1) != 0 {
+        return 1;
+    }
+    (sys_semctl(id, 0, SETVAL, 5) != 0) as u64 * 2
+}
+
+fn undo_erange_child(id: i32) -> u64 {
+    // Adjustment -32767, then the value back to 0 without undo
+    let up = [Sembuf::new(0, 32767, UNDO)];
+    let down = [Sembuf::new(0, -32767, 0)];
+    let one = [Sembuf::new(0, 1, UNDO)];
+    if sys_semop(id, up.as_ptr(), 1) != 0 || sys_semop(id, down.as_ptr(), 1) != 0 {
+        return 1;
+    }
+    // -32768 is the last adjustment allowed
+    if sys_semop(id, one.as_ptr(), 1) != 0 {
+        return 2;
+    }
+    if sys_semop(id, one.as_ptr(), 1) != -34 {
+        return 3;
+    }
+    // The failed semop changed nothing: value 1; the exit adds -32768
+    // and clamps at 0
+    (sys_semctl(id, 0, GETVAL, 0) != 1) as u64 * 4
 }

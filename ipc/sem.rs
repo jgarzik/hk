@@ -6,7 +6,7 @@
 //! - Blocking with optional timeout
 //! - Automatic undo on process exit (SEM_UNDO)
 
-use alloc::collections::VecDeque;
+use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -69,6 +69,8 @@ pub struct SemQueue {
     sops: Vec<Sembuf>,
     /// Does this alter semaphore values?
     alter: bool,
+    /// The caller's undo list (SEM_UNDO), whose adjustments it changes
+    undo: Option<u64>,
     /// `SEM_WAITING` until a waker completes it under the array lock,
     /// then 0 or a negative errno (Release; the sleeper reads it Acquire
     /// without the lock, Linux q->status)
@@ -88,6 +90,9 @@ pub struct SemState {
     otime: i64,
     /// Last change time
     ctime: i64,
+    /// Each undo list's adjustments to this array (Linux sem_undo on
+    /// sma->list_id), by `SemUndoList.id`; applied when its owner exits
+    undo: BTreeMap<u64, Vec<i16>>,
 }
 
 /// Semaphore array
@@ -108,11 +113,20 @@ pub struct SemArray {
 /// perform_atomic_semop_slow, which also sums repeated operations on one
 /// semaphore): 0 when applied (sempid updated), 1 when an operation
 /// would block, or a negative errno (EAGAIN for a blocking operation
-/// with IPC_NOWAIT, ERANGE above SEMVMX). Undone on anything but 0.
-fn perform_atomic_semop(st: &mut SemState, sops: &[Sembuf], pid: i32) -> i32 {
+/// with IPC_NOWAIT, ERANGE above SEMVMX or past the adjustment range).
+/// A SEM_UNDO operation also changes the `undo` list's adjustment by
+/// its negative. Undone on anything but 0.
+fn perform_atomic_semop(st: &mut SemState, sops: &[Sembuf], pid: i32, undo: Option<u64>) -> i32 {
+    let SemState {
+        val,
+        pid: pids,
+        undo: undos,
+        ..
+    } = st;
+    let mut adj = undo.and_then(|u| undos.get_mut(&u));
     for (n, sop) in sops.iter().enumerate() {
         let i = sop.sem_num as usize;
-        let cur = st.val[i];
+        let cur = val[i];
         let result = cur + sop.sem_op as i32;
         let r = if (sop.sem_op == 0 && cur != 0) || result < 0 {
             if sop.sem_flg & IPC_NOWAIT as i16 != 0 {
@@ -122,17 +136,31 @@ fn perform_atomic_semop(st: &mut SemState, sops: &[Sembuf], pid: i32) -> i32 {
             }
         } else if result > SEMVMX {
             KernelError::Range.to_errno_neg()
+        } else if let (true, Some(a)) = (sop.sem_flg & SEM_UNDO != 0, adj.as_deref_mut()) {
+            // The adjustment must stay in -SEMAEM-1..=SEMAEM
+            match i16::try_from(a[i] as i32 - sop.sem_op as i32) {
+                Ok(v) => {
+                    a[i] = v;
+                    val[i] = result;
+                    continue;
+                }
+                Err(_) => KernelError::Range.to_errno_neg(),
+            }
         } else {
-            st.val[i] = result;
+            val[i] = result;
             continue;
         };
         for done in sops[..n].iter().rev() {
-            st.val[done.sem_num as usize] -= done.sem_op as i32;
+            let d = done.sem_num as usize;
+            val[d] -= done.sem_op as i32;
+            if let (true, Some(a)) = (done.sem_flg & SEM_UNDO != 0, adj.as_deref_mut()) {
+                a[d] += done.sem_op;
+            }
         }
         return r;
     }
     for sop in sops {
-        st.pid[sop.sem_num as usize] = pid;
+        pids[sop.sem_num as usize] = pid;
     }
     0
 }
@@ -146,7 +174,7 @@ fn update_queue(st: &mut SemState) -> bool {
     let mut i = 0;
     while i < st.pending.len() {
         let q = st.pending[i].clone();
-        let r = perform_atomic_semop(st, &q.sops, q.pid);
+        let r = perform_atomic_semop(st, &q.sops, q.pid, q.undo);
         if r == 1 {
             i += 1;
             continue;
@@ -176,6 +204,7 @@ impl SemArray {
                 pending: VecDeque::new(),
                 otime: 0,
                 ctime: current_time_secs(),
+                undo: BTreeMap::new(),
             }),
             waitq: WaitQueue::new(),
             ns,
@@ -363,17 +392,29 @@ fn do_semtimedop(semid: i32, sops_ptr: u64, nsops: usize, timeout_ptr: u64) -> R
     let has_undo = sops.iter().any(|s| s.sem_flg & SEM_UNDO != 0);
     let alter = sops.iter().any(|s| s.sem_op != 0);
 
-    let sem_array = ns.sem_ids().find_by_id(semid).ok_or(einval)?;
-    let sem_array: &SemArray = &sem_array;
+    let sem_array_ref = ns.sem_ids().find_by_id(semid).ok_or(einval)?;
+    let sem_array: &SemArray = &sem_array_ref;
     if max >= sem_array.nsems {
         return Err(KernelError::FileTooLarge.errno());
     }
     let access = if alter { IPC_PERM_WRITE } else { IPC_PERM_READ };
     ipc_checkperm(&sem_array.perm, access)?;
 
+    // The undo list knows the array before the array knows the list
+    // (Linux find_alloc_undo), so exit finds every adjustment
+    let undo = has_undo.then(|| {
+        let ul = get_or_create_undo_list(current_tid());
+        ul.register(semid, &sem_array_ref);
+        ul.id
+    });
     let pid = current_pid() as i32;
     let mut st = sem_array.lock_valid()?;
-    let r = perform_atomic_semop(&mut st, &sops, pid);
+    if let Some(u) = undo {
+        st.undo
+            .entry(u)
+            .or_insert_with(|| vec![0; sem_array.nsems as usize]);
+    }
+    let r = perform_atomic_semop(&mut st, &sops, pid, undo);
     if r <= 0 {
         if r == 0 {
             st.otime = current_time_secs();
@@ -386,9 +427,6 @@ fn do_semtimedop(semid: i32, sops_ptr: u64, nsops: usize, timeout_ptr: u64) -> R
         if r < 0 {
             return Err(-r);
         }
-        if has_undo {
-            record_undo_for_ops(semid, sem_array.nsems as usize, &sops);
-        }
         return Ok(0);
     }
 
@@ -398,6 +436,7 @@ fn do_semtimedop(semid: i32, sops_ptr: u64, nsops: usize, timeout_ptr: u64) -> R
         pid,
         sops,
         alter,
+        undo,
         status: AtomicI32::new(SEM_WAITING),
     });
     st.pending.push_back(queue.clone());
@@ -434,9 +473,6 @@ fn do_semtimedop(semid: i32, sops_ptr: u64, nsops: usize, timeout_ptr: u64) -> R
     };
     if status < 0 {
         return Err(-status);
-    }
-    if has_undo {
-        record_undo_for_ops(semid, sem_array.nsems as usize, &queue.sops);
     }
     Ok(0)
 }
@@ -559,6 +595,9 @@ fn do_semctl(semid: i32, semnum: i32, cmd: i32, arg: u64) -> Result<i32, i32> {
             let mut st = sem_array.lock_valid()?;
             st.val[semnum as usize] = val;
             st.pid[semnum as usize] = current_pid() as i32;
+            for adj in st.undo.values_mut() {
+                adj[semnum as usize] = 0;
+            }
             st.ctime = current_time_secs();
             sem_array.unlock_and_wake(st);
 
@@ -612,6 +651,9 @@ fn do_semctl(semid: i32, semnum: i32, cmd: i32, arg: u64) -> Result<i32, i32> {
             let mut st = sem_array.lock_valid()?;
             st.val = vals;
             st.pid.fill(pid);
+            for adj in st.undo.values_mut() {
+                adj.fill(0);
+            }
             st.ctime = current_time_secs();
             sem_array.unlock_and_wake(st);
 
@@ -656,100 +698,44 @@ fn do_semctl(semid: i32, semnum: i32, cmd: i32, arg: u64) -> Result<i32, i32> {
 // SEM_UNDO Support - Automatic semaphore adjustment on process exit
 // ============================================================================
 
-use crate::sync::spin::RwLock;
 use crate::task::Tid;
-use alloc::collections::BTreeMap;
+use alloc::sync::Weak;
 
-/// Individual semaphore undo entry for a specific semaphore array
+/// Undo list ids (never reused, so a stale entry cannot alias a new list)
+static UNDO_IDS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+
+/// Per-task semaphore undo list (Linux struct sem_undo_list)
 ///
-/// Tracks adjustments to semaphores that should be reversed on process exit.
-/// When a process performs semop() with SEM_UNDO flag, the operation's
-/// negative is recorded here.
-#[derive(Clone)]
-pub struct SemUndo {
-    /// Semaphore set ID
-    pub semid: i32,
-    /// Per-semaphore adjustments (negative of operations performed)
-    /// Index corresponds to semaphore number, value is cumulative adjustment
-    pub semadj: Vec<i16>,
-}
-
-impl SemUndo {
-    /// Create a new undo entry for a semaphore array
-    pub fn new(semid: i32, nsems: usize) -> Self {
-        Self {
-            semid,
-            semadj: vec![0; nsems],
-        }
-    }
-
-    /// Record an undo adjustment for a semaphore operation
-    ///
-    /// The adjustment is the negative of the operation value.
-    /// When the process exits, these adjustments will be applied.
-    pub fn record_adj(&mut self, sem_num: usize, sem_op: i16) {
-        if sem_num < self.semadj.len() {
-            // Record the negative - on exit, we reverse the operation
-            self.semadj[sem_num] = self.semadj[sem_num].saturating_sub(sem_op);
-        }
-    }
-
-    /// Check if all adjustments are zero (can be removed)
-    pub fn is_empty(&self) -> bool {
-        self.semadj.iter().all(|&adj| adj == 0)
-    }
-}
-
-/// Per-task semaphore undo list
-///
-/// Contains all SEM_UNDO adjustments for a task. When the task exits,
-/// all adjustments are applied to the corresponding semaphores.
-///
-/// When CLONE_SYSVSEM is used, multiple tasks share the same undo list
-/// via Arc. The adjustments are only applied when the last sharing task exits.
+/// The adjustments themselves live in each array (`SemState.undo`,
+/// under its lock); the list names the arrays it has adjustments in.
+/// When CLONE_SYSVSEM is used, tasks share it via Arc, and the
+/// adjustments are applied when the last sharing task exits.
 pub struct SemUndoList {
-    /// Map of semid -> SemUndo entries
-    pub undos: RwLock<BTreeMap<i32, SemUndo>>,
+    /// Key of this list's adjustments in each array
+    id: u64,
+    /// The arrays it has adjusted, by semid (a removed array or a reused
+    /// id is told apart by the Weak)
+    arrays: Mutex<BTreeMap<i32, Weak<SemArray>>>,
 }
 
 impl SemUndoList {
     /// Create a new empty undo list
     pub fn new() -> Self {
         Self {
-            undos: RwLock::new(BTreeMap::new()),
+            id: UNDO_IDS.fetch_add(1, Ordering::Relaxed),
+            arrays: Mutex::new(BTreeMap::new()),
         }
     }
 
-    /// Get or create an undo entry for a semaphore array
-    pub fn get_or_create(&self, semid: i32, nsems: usize) -> SemUndo {
-        let undos = self.undos.read();
-        if let Some(undo) = undos.get(&semid) {
-            return undo.clone();
+    /// Note that this list adjusts `sem` (Linux find_alloc_undo)
+    fn register(&self, semid: i32, sem: &Arc<SemArray>) {
+        let mut arrays = self.arrays.lock();
+        let same = arrays
+            .get(&semid)
+            .is_some_and(|w| core::ptr::eq(w.as_ptr(), Arc::as_ptr(sem)));
+        if !same {
+            arrays.insert(semid, Arc::downgrade(sem));
         }
-        drop(undos);
-
-        // Create new entry
-        let mut undos = self.undos.write();
-        undos
-            .entry(semid)
-            .or_insert_with(|| SemUndo::new(semid, nsems))
-            .clone()
-    }
-
-    /// Update an undo entry after recording an adjustment
-    pub fn update(&self, undo: SemUndo) {
-        let mut undos = self.undos.write();
-        if undo.is_empty() {
-            undos.remove(&undo.semid);
-        } else {
-            undos.insert(undo.semid, undo);
-        }
-    }
-
-    /// Take all undo entries (for exit processing)
-    pub fn take_all(&self) -> BTreeMap<i32, SemUndo> {
-        let mut undos = self.undos.write();
-        core::mem::take(&mut *undos)
     }
 }
 
@@ -805,77 +791,42 @@ pub fn clone_task_semundo(parent_tid: Tid, child_tid: Tid, share: bool) {
     // It will be created lazily if the child uses SEM_UNDO
 }
 
-/// Apply all semaphore undo operations for a task on exit
+/// Apply all semaphore undo operations for a task on exit (Linux
+/// exit_sem)
 ///
-/// This is called when a task exits. If the task's undo list is shared
-/// (via CLONE_SYSVSEM), the adjustments are only applied when the last
-/// sharing task exits (Arc refcount drops to 1).
+/// If the task's undo list is shared (via CLONE_SYSVSEM), the
+/// adjustments are only applied when the last sharing task exits (Arc
+/// refcount drops to 1).
 pub fn exit_sem(tid: Tid) {
-    // Remove this task's undo list reference
     let undo_list = {
         let mut table = TASKLIST.write();
-        if let Some(mut task) = table.get_mut(tid) {
-            task.sysvsem.take()
-        } else {
-            None
-        }
+        table.get_mut(tid).and_then(|mut t| t.sysvsem.take())
     };
-
     let Some(undo_list) = undo_list else {
-        return; // No undo list for this task
+        return;
     };
-
-    // Check if this is the last reference
-    // Arc::strong_count returns the number of references
-    // If it's 1, we are the last holder and should apply undos
     if Arc::strong_count(&undo_list) > 1 {
-        // Other tasks still sharing this list, don't apply undos yet
         return;
     }
-
-    // We're the last holder - apply all undo operations
-    let undos = undo_list.take_all();
-    let ns = current_ipc_ns();
-
-    for (semid, undo) in undos {
-        // Find the semaphore array
-        let Some(sem_obj) = ns.sem_ids().find_by_id(semid) else {
-            continue; // Semaphore array was deleted
+    let arrays = core::mem::take(&mut *undo_list.arrays.lock());
+    let pid = current_pid() as i32;
+    for (_, weak) in arrays {
+        // Gone, or removed (IPC_RMID): nothing to undo
+        let Some(sem_array) = weak.upgrade() else {
+            continue;
         };
-
-        let sem_array: &SemArray = &sem_obj;
-
-        // Apply the adjustments under the lock, then complete what can
-        // proceed (Linux exit_sem)
-        let pid = current_pid() as i32;
         let Ok(mut st) = sem_array.lock_valid() else {
             continue;
         };
-        for (i, &adj) in undo.semadj.iter().enumerate() {
-            if adj == 0 || i >= sem_array.nsems as usize {
-                continue;
+        let Some(adj) = st.undo.remove(&undo_list.id) else {
+            continue;
+        };
+        for (i, &a) in adj.iter().enumerate() {
+            if a != 0 {
+                st.val[i] = (st.val[i] + a as i32).clamp(0, SEMVMX);
+                st.pid[i] = pid;
             }
-            st.val[i] = (st.val[i] + adj as i32).clamp(0, SEMVMX);
-            st.pid[i] = pid;
         }
         sem_array.unlock_and_wake(st);
     }
-}
-
-/// Record SEM_UNDO adjustments for a successful semop
-///
-/// Called after a successful semop when any operation has SEM_UNDO flag set.
-fn record_undo_for_ops(semid: i32, nsems: usize, sops: &[Sembuf]) {
-    let tid = current_tid();
-    let undo_list = get_or_create_undo_list(tid);
-
-    let mut undo = undo_list.get_or_create(semid, nsems);
-
-    for sop in sops {
-        if sop.sem_flg & SEM_UNDO != 0 && sop.sem_op != 0 {
-            undo.record_adj(sop.sem_num as usize, sop.sem_op);
-        }
-    }
-
-    undo_list.update(undo);
 }
