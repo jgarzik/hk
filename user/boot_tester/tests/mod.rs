@@ -136,6 +136,7 @@ pub mod sync;
 pub mod sysctl;
 pub mod sysfs;
 pub mod sysinfo;
+pub mod sysv_race;
 pub mod tcp;
 pub mod tcp_close;
 pub mod tcp_conn;
@@ -252,6 +253,7 @@ pub fn run_all_tests() {
     futex::run_tests();
     futex_requeue::run_tests();
     futex_shared::run_tests();
+    sysv_race::run_tests();
     timerfd::run_tests();
     posix_timer::run_tests();
     xattr::run_tests();

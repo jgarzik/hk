@@ -219,6 +219,12 @@ impl<T> IpcIdsInner<T> {
 /// IPC IDs table - manages IPC object IDs for a namespace (one per
 /// object type, Linux ipc_ids)
 pub struct IpcIds<T> {
+    /// Serializes creation and removal (Linux ids->rwsem, held for write
+    /// by ipcget, IPC_RMID and IPC_SET): a key's lookup, the limit
+    /// checks and the insert are one step, so IPC_CREAT|IPC_EXCL creates
+    /// one object and the namespace totals never overshoot. Sleeping;
+    /// `inner` (the lookup table, Linux's idr) is taken under it.
+    pub rwsem: crate::sync::RwSem<()>,
     pub inner: RwLock<IpcIdsInner<T>>,
 }
 
@@ -226,6 +232,7 @@ impl<T: IpcObject> IpcIds<T> {
     /// Create new empty IDs table
     pub fn new() -> Self {
         Self {
+            rwsem: crate::sync::RwSem::new(()),
             inner: RwLock::new(IpcIdsInner::new()),
         }
     }
@@ -394,56 +401,61 @@ pub fn ipc_checkperm(perm: &KernIpcPerm, flag: u16) -> Result<(), i32> {
     Err(KernelError::PermissionDenied.errno())
 }
 
-/// Generic IPC get operation
-///
-/// Handles IPC_CREAT, IPC_EXCL, IPC_PRIVATE logic
-pub fn ipcget<T: IpcObject + 'static>(
+/// What ipcget needs from each IPC type (Linux struct ipc_ops)
+pub struct IpcOps<T, N, C, A>
+where
+    N: FnOnce(i32, u16) -> Result<Arc<T>, i32>,
+    C: FnOnce(&T) -> Result<(), i32>,
+    A: FnOnce(&T),
+{
+    /// Build a new object (Linux newary/newseg/newque up to ipc_addid):
+    /// the namespace limits are checked here, under `ids.rwsem`
+    pub new: N,
+    /// Extra checks on an existing object (Linux more_checks: semget's
+    /// nsems, shmget's size)
+    pub more_checks: C,
+    /// After the insert succeeded: charge the namespace totals (Linux
+    /// newary/newseg add used_sems/shm_tot after ipc_addid), so a failed
+    /// insert leaves nothing to undo
+    pub added: A,
+}
+
+/// Generic IPC get operation (Linux ipcget, ipcget_new, ipcget_public):
+/// under `ids.rwsem` (write) across the key lookup, the permission and
+/// type checks, and the creation and insert
+pub fn ipcget<T: IpcObject + 'static, N, C, A>(
     ids: &IpcIds<T>,
     key: i32,
     flags: i32,
     max_ids: u32,
-    create_fn: impl FnOnce(i32, u16) -> Result<Arc<T>, i32>,
-) -> Result<i32, i32> {
+    ops: IpcOps<T, N, C, A>,
+) -> Result<i32, i32>
+where
+    N: FnOnce(i32, u16) -> Result<Arc<T>, i32>,
+    C: FnOnce(&T) -> Result<(), i32>,
+    A: FnOnce(&T),
+{
     let mode = (flags as u16) & 0o777;
+    let _w = ids.rwsem.write();
 
-    // IPC_PRIVATE always creates new
-    if key == IPC_PRIVATE {
-        let obj = create_fn(key, mode)?;
-        return ids.alloc_id(obj, max_ids);
-    }
-
-    // Try to find existing
-    if let Some(existing) = ids.find_by_key(key) {
-        // Found existing - check flags
+    if key != IPC_PRIVATE
+        && let Some(existing) = ids.find_by_key(key)
+    {
         if flags & IPC_CREAT != 0 && flags & IPC_EXCL != 0 {
             return Err(KernelError::AlreadyExists.errno());
         }
-
-        // Check permissions for access
-        let access_flag = if flags & 0o4 != 0 {
-            IPC_PERM_READ
-        } else if flags & 0o2 != 0 {
-            IPC_PERM_WRITE
-        } else {
-            0
-        };
-
+        // Linux ipc_check_perms: ipcperms on the caller's mode bits
+        // (EACCES), then the type's own checks
         let perm = existing.perm();
-
-        if access_flag != 0
-            && let Err(e) = ipc_checkperm(perm, access_flag)
-        {
-            return Err(e);
-        }
-
+        ipc_checkperm(perm, mode)?;
+        (ops.more_checks)(&existing)?;
         return Ok(perm.lock.lock().id);
     }
-
-    // Not found - create if IPC_CREAT
-    if flags & IPC_CREAT != 0 {
-        let obj = create_fn(key, mode)?;
-        return ids.alloc_id(obj, max_ids);
+    if key != IPC_PRIVATE && flags & IPC_CREAT == 0 {
+        return Err(KernelError::NotFound.errno());
     }
-
-    Err(KernelError::NotFound.errno())
+    let obj = (ops.new)(key, mode)?;
+    let id = ids.alloc_id(obj.clone(), max_ids)?;
+    (ops.added)(&obj);
+    Ok(id)
 }

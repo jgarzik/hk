@@ -115,10 +115,10 @@ impl IpcNamespace {
 
             // Semaphore defaults (from Linux)
             sem_ctls: [
-                32000, // SEMMSL - max semaphores per array
-                32000, // SEMMNS - max semaphores system-wide (unused, tracked per-ns)
-                500,   // SEMOPM - max ops per semop
-                32000, // SEMMNI - max semaphore arrays
+                32000,         // SEMMSL - max semaphores per array
+                1_024_000_000, // SEMMNS - semaphores in all arrays (Linux SEMMNI*SEMMSL)
+                500,           // SEMOPM - max ops per semop
+                32000,         // SEMMNI - max semaphore arrays
             ],
             used_sems: AtomicU32::new(0),
 

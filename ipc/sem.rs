@@ -14,7 +14,7 @@ use core::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, Ordering};
 
 use crate::arch::Uaccess;
 use crate::ipc::util::{
-    IPC_PERM_READ, IPC_PERM_WRITE, IpcObject, KernIpcPerm, ipc_checkperm, ipcget,
+    IPC_PERM_READ, IPC_PERM_WRITE, IpcObject, IpcOps, KernIpcPerm, ipc_checkperm, ipcget,
 };
 use crate::ipc::{
     IPC_64, IPC_NOWAIT, IPC_RMID, IPC_SET, IPC_STAT, IpcNamespace, Sembuf, Semid64Ds,
@@ -279,27 +279,31 @@ fn do_semget(key: i32, nsems: i32, semflg: i32) -> Result<i32, i32> {
     let nsems_u32 = nsems as u32;
     let ns_clone = ns.clone();
 
-    ipcget(
-        ns.sem_ids(),
-        key,
-        semflg,
-        ns.sem_ctls[3] as u32,
-        move |k, mode| {
+    let ns_added = ns.clone();
+    let ops = IpcOps {
+        // Linux newary: EINVAL for no semaphores, ENOSPC past SEMMNS
+        new: move |k, mode| {
             if nsems_u32 == 0 {
                 return Err(KernelError::InvalidArgument.errno());
             }
-
-            // Check total semaphore limit
-            let current = ns_clone.used_sems.load(Ordering::Relaxed);
-            if current + nsems_u32 > ns_clone.sem_ctls[1] as u32 {
-                return Err(KernelError::OutOfMemory.errno());
+            let used = ns_clone.used_sems.load(Ordering::Relaxed) as u64;
+            if used + nsems_u32 as u64 > ns_clone.sem_ctls[1] as u64 {
+                return Err(KernelError::NoSpace.errno());
             }
-
-            let sem = SemArray::new(k, nsems_u32, mode, ns_clone.clone())?;
-            ns_clone.used_sems.fetch_add(nsems_u32, Ordering::Relaxed);
-            Ok(sem)
+            SemArray::new(k, nsems_u32, mode, ns_clone.clone())
         },
-    )
+        // Linux sem_more_checks
+        more_checks: |sem: &SemArray| {
+            if nsems_u32 > sem.nsems {
+                return Err(KernelError::InvalidArgument.errno());
+            }
+            Ok(())
+        },
+        added: move |sem: &SemArray| {
+            ns_added.used_sems.fetch_add(sem.nsems, Ordering::Relaxed);
+        },
+    };
+    ipcget(ns.sem_ids(), key, semflg, ns.sem_ctls[3] as u32, ops)
 }
 
 /// semop - semaphore operations
@@ -492,15 +496,17 @@ fn do_semctl(semid: i32, semnum: i32, cmd: i32, arg: u64) -> Result<i32, i32> {
         }
 
         IPC_SET => {
+            // Copied in first, before the IPC locks (Linux: the copy
+            // may fault)
+            let ds: Semid64Ds =
+                get_user::<Uaccess, Semid64Ds>(arg).map_err(|_| KernelError::BadAddress.errno())?;
+            let _w = ns.sem_ids().rwsem.write();
             let sem = ns
                 .sem_ids()
                 .find_by_id(semid)
                 .ok_or(KernelError::InvalidArgument.errno())?;
 
             let uid = crate::task::percpu::current_cred().euid;
-            // Copied in before the spin lock (the copy may fault)
-            let ds: Semid64Ds =
-                get_user::<Uaccess, Semid64Ds>(arg).map_err(|_| KernelError::BadAddress.errno())?;
             let perm = sem.perm();
             {
                 let mut p = perm.lock.lock();
@@ -517,6 +523,7 @@ fn do_semctl(semid: i32, semnum: i32, cmd: i32, arg: u64) -> Result<i32, i32> {
         }
 
         IPC_RMID => {
+            let _w = ns.sem_ids().rwsem.write();
             let sem = ns
                 .sem_ids()
                 .find_by_id(semid)

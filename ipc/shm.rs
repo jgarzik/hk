@@ -17,7 +17,7 @@ use core::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, Ordering};
 
 use crate::arch::Uaccess;
 use crate::ipc::util::{
-    IPC_PERM_READ, IPC_PERM_WRITE, IpcObject, KernIpcPerm, ipc_checkperm, ipcget,
+    IPC_PERM_READ, IPC_PERM_WRITE, IpcObject, IpcOps, KernIpcPerm, ipc_checkperm, ipcget,
 };
 use crate::ipc::{IPC_64, IPC_RMID, IPC_SET, IPC_STAT, IpcNamespace, Shmid64Ds, current_ipc_ns};
 use crate::mm::shmem::Shmem;
@@ -265,18 +265,32 @@ fn do_shmget(key: i32, size: usize, shmflg: i32) -> Result<i32, i32> {
     }
 
     let ns_clone = ns.clone();
-    ipcget(ns.shm_ids(), key, shmflg, ns.shm_ctlmni, move |k, mode| {
-        // Check total memory limit
-        let pages = size.div_ceil(PAGE_SIZE) as u64;
-        let current_tot = ns_clone.shm_tot.load(Ordering::Relaxed);
-        if current_tot + pages > ns_clone.shm_ctlall as u64 {
-            return Err(KernelError::OutOfMemory.errno());
-        }
-
-        let shm = ShmidKernel::new(k, size, mode, ns_clone.clone())?;
-        ns_clone.shm_tot.fetch_add(pages, Ordering::Relaxed);
-        Ok(shm)
-    })
+    let ns_added = ns.clone();
+    let pages = size.div_ceil(PAGE_SIZE) as u64;
+    let ops = IpcOps {
+        // Linux newseg: ENOSPC past SHMALL
+        new: move |k, mode| {
+            let tot = ns_clone.shm_tot.load(Ordering::Relaxed);
+            if tot
+                .checked_add(pages)
+                .is_none_or(|t| t > ns_clone.shm_ctlall as u64)
+            {
+                return Err(KernelError::NoSpace.errno());
+            }
+            ShmidKernel::new(k, size, mode, ns_clone.clone())
+        },
+        // Linux shm_more_checks
+        more_checks: |shm: &ShmidKernel| {
+            if shm.segsz < size {
+                return Err(KernelError::InvalidArgument.errno());
+            }
+            Ok(())
+        },
+        added: move |_: &ShmidKernel| {
+            ns_added.shm_tot.fetch_add(pages, Ordering::Relaxed);
+        },
+    };
+    ipcget(ns.shm_ids(), key, shmflg, ns.shm_ctlmni, ops)
 }
 
 /// shmat - attach shared memory segment
@@ -449,15 +463,15 @@ fn do_shmctl(shmid: i32, cmd: i32, buf: u64) -> Result<i32, i32> {
         }
 
         IPC_SET => {
+            // Copied in first, before the IPC locks (Linux: the copy
+            // may fault)
+            let ds: Shmid64Ds =
+                get_user::<Uaccess, Shmid64Ds>(buf).map_err(|_| KernelError::BadAddress.errno())?;
+            let _w = ns.shm_ids().rwsem.write();
             let shm = ns
                 .shm_ids()
                 .find_by_id(shmid)
                 .ok_or(KernelError::InvalidArgument.errno())?;
-
-            // Read user data first, never under the perm spinlock (Linux
-            // copies it in before taking the IPC locks)
-            let ds: Shmid64Ds =
-                get_user::<Uaccess, Shmid64Ds>(buf).map_err(|_| KernelError::BadAddress.errno())?;
 
             // Must be owner or have CAP_SYS_ADMIN; only uid, gid, mode
             // change
@@ -478,6 +492,7 @@ fn do_shmctl(shmid: i32, cmd: i32, buf: u64) -> Result<i32, i32> {
         }
 
         IPC_RMID => {
+            let _w = ns.shm_ids().rwsem.write();
             // Must be owner or have CAP_SYS_ADMIN
             let shm = ns
                 .shm_ids()

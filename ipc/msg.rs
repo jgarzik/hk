@@ -13,7 +13,7 @@ use core::sync::atomic::{AtomicI32, AtomicI64, AtomicU32, AtomicU64, Ordering};
 
 use crate::arch::Uaccess;
 use crate::ipc::util::{
-    IPC_PERM_READ, IPC_PERM_WRITE, IpcObject, KernIpcPerm, ipc_checkperm, ipcget,
+    IPC_PERM_READ, IPC_PERM_WRITE, IpcObject, IpcOps, KernIpcPerm, ipc_checkperm, ipcget,
 };
 use crate::ipc::{
     IPC_64, IPC_NOWAIT, IPC_RMID, IPC_SET, IPC_STAT, IpcNamespace, Msqid64Ds, current_ipc_ns,
@@ -270,9 +270,12 @@ fn do_msgget(key: i32, msgflg: i32) -> Result<i32, i32> {
     let ns = current_ipc_ns();
     let ns_clone = ns.clone();
 
-    ipcget(ns.msg_ids(), key, msgflg, ns.msg_ctlmni, move |k, mode| {
-        MsgQueue::new(k, mode, ns_clone.clone())
-    })
+    let ops = IpcOps {
+        new: move |k, mode| MsgQueue::new(k, mode, ns_clone.clone()),
+        more_checks: |_: &MsgQueue| Ok(()),
+        added: |_: &MsgQueue| {},
+    };
+    ipcget(ns.msg_ids(), key, msgflg, ns.msg_ctlmni, ops)
 }
 
 /// msgsnd - send message
@@ -443,15 +446,17 @@ fn do_msgctl(msqid: i32, cmd: i32, buf: u64) -> Result<i32, i32> {
         }
 
         IPC_SET => {
+            // Copied in first, before the IPC locks (Linux: the copy
+            // may fault)
+            let ds: Msqid64Ds =
+                get_user::<Uaccess, Msqid64Ds>(buf).map_err(|_| KernelError::BadAddress.errno())?;
+            let _w = ns.msg_ids().rwsem.write();
             let queue = ns
                 .msg_ids()
                 .find_by_id(msqid)
                 .ok_or(KernelError::InvalidArgument.errno())?;
 
             let uid = crate::task::percpu::current_cred().euid;
-            // Copied in before the spin lock (the copy may fault)
-            let ds: Msqid64Ds =
-                get_user::<Uaccess, Msqid64Ds>(buf).map_err(|_| KernelError::BadAddress.errno())?;
             let perm = queue.perm();
             {
                 let mut p = perm.lock.lock();
@@ -473,6 +478,7 @@ fn do_msgctl(msqid: i32, cmd: i32, buf: u64) -> Result<i32, i32> {
         }
 
         IPC_RMID => {
+            let _w = ns.msg_ids().rwsem.write();
             let queue = ns
                 .msg_ids()
                 .find_by_id(msqid)
