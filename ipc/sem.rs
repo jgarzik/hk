@@ -84,8 +84,9 @@ pub struct SemState {
     val: Vec<i32>,
     /// Each semaphore's last modifier (sempid)
     pid: Vec<i32>,
-    /// Waiting operations, oldest first
-    pending: VecDeque<Arc<SemQueue>>,
+    /// Waiting operations, oldest first, each with the index of the
+    /// operation it is blocked on (Linux q->blocking, for GETNCNT/GETZCNT)
+    pending: VecDeque<(Arc<SemQueue>, usize)>,
     /// Last semop time
     otime: i64,
     /// Last change time
@@ -115,8 +116,15 @@ pub struct SemArray {
 /// would block, or a negative errno (EAGAIN for a blocking operation
 /// with IPC_NOWAIT, ERANGE above SEMVMX or past the adjustment range).
 /// A SEM_UNDO operation also changes the `undo` list's adjustment by
-/// its negative. Undone on anything but 0.
-fn perform_atomic_semop(st: &mut SemState, sops: &[Sembuf], pid: i32, undo: Option<u64>) -> i32 {
+/// its negative. Undone on anything but 0; on 1, `blocking` is the
+/// index of the operation that would block.
+fn perform_atomic_semop(
+    st: &mut SemState,
+    sops: &[Sembuf],
+    pid: i32,
+    undo: Option<u64>,
+    blocking: &mut usize,
+) -> i32 {
     let SemState {
         val,
         pid: pids,
@@ -129,6 +137,7 @@ fn perform_atomic_semop(st: &mut SemState, sops: &[Sembuf], pid: i32, undo: Opti
         let cur = val[i];
         let result = cur + sop.sem_op as i32;
         let r = if (sop.sem_op == 0 && cur != 0) || result < 0 {
+            *blocking = n;
             if sop.sem_flg & IPC_NOWAIT as i16 != 0 {
                 KernelError::WouldBlock.to_errno_neg()
             } else {
@@ -173,9 +182,11 @@ fn update_queue(st: &mut SemState) -> bool {
     let mut woke = false;
     let mut i = 0;
     while i < st.pending.len() {
-        let q = st.pending[i].clone();
-        let r = perform_atomic_semop(st, &q.sops, q.pid, q.undo);
+        let q = st.pending[i].0.clone();
+        let mut blocking = 0;
+        let r = perform_atomic_semop(st, &q.sops, q.pid, q.undo, &mut blocking);
         if r == 1 {
+            st.pending[i].1 = blocking;
             i += 1;
             continue;
         }
@@ -251,7 +262,7 @@ impl IpcObject for SemArray {
     fn destroy(&self) {
         {
             let mut st = self.sem.lock();
-            for q in st.pending.drain(..) {
+            for (q, _) in st.pending.drain(..) {
                 q.status.store(
                     KernelError::IdentifierRemoved.to_errno_neg(),
                     Ordering::Release,
@@ -414,7 +425,8 @@ fn do_semtimedop(semid: i32, sops_ptr: u64, nsops: usize, timeout_ptr: u64) -> R
             .entry(u)
             .or_insert_with(|| vec![0; sem_array.nsems as usize]);
     }
-    let r = perform_atomic_semop(&mut st, &sops, pid, undo);
+    let mut blocking = 0;
+    let r = perform_atomic_semop(&mut st, &sops, pid, undo, &mut blocking);
     if r <= 0 {
         if r == 0 {
             st.otime = current_time_secs();
@@ -439,7 +451,7 @@ fn do_semtimedop(semid: i32, sops_ptr: u64, nsops: usize, timeout_ptr: u64) -> R
         undo,
         status: AtomicI32::new(SEM_WAITING),
     });
-    st.pending.push_back(queue.clone());
+    st.pending.push_back((queue.clone(), blocking));
     drop(st);
     let status = loop {
         // Sleep until completed, the deadline or a signal (semop is
@@ -464,7 +476,7 @@ fn do_semtimedop(semid: i32, sops_ptr: u64, nsops: usize, timeout_ptr: u64) -> R
             Ok(false) => true,
             Err(_) => false,
         };
-        st.pending.retain(|q| !Arc::ptr_eq(q, &queue));
+        st.pending.retain(|(q, _)| !Arc::ptr_eq(q, &queue));
         return Err(if timed_out {
             KernelError::WouldBlock.errno()
         } else {
@@ -678,16 +690,30 @@ fn do_semctl(semid: i32, semnum: i32, cmd: i32, arg: u64) -> Result<i32, i32> {
         }
 
         GETNCNT | GETZCNT => {
-            // Count waiting processes - simplified for now
             let sem = ns
                 .sem_ids()
                 .find_by_id(semid)
                 .ok_or(KernelError::InvalidArgument.errno())?;
 
             ipc_checkperm(sem.perm(), IPC_PERM_READ)?;
-
-            // Return 0 for now (full implementation would count waiters)
-            Ok(0)
+            let sem_array: &SemArray = &sem;
+            if semnum < 0 || semnum as u32 >= sem_array.nsems {
+                return Err(KernelError::InvalidArgument.errno());
+            }
+            // Linux count_semcnt: the waiters whose blocking operation is
+            // on `semnum`, decrements for GETNCNT, waits-for-zero for
+            // GETZCNT
+            let zero = cmd_only == GETZCNT;
+            let st = sem_array.lock_valid()?;
+            let n = st
+                .pending
+                .iter()
+                .filter(|(q, b)| {
+                    let op = &q.sops[*b];
+                    op.sem_num as i32 == semnum && if zero { op.sem_op == 0 } else { op.sem_op < 0 }
+                })
+                .count();
+            Ok(n as i32)
         }
 
         _ => Err(KernelError::InvalidArgument.errno()),

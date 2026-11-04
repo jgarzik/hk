@@ -28,15 +28,17 @@
 //!   so the exit undoes nothing.
 //! - SEM_UNDO_ERANGE: an adjustment past -32768 is ERANGE and changes
 //!   nothing.
+//! - SEM_NCNT: GETNCNT and GETZCNT count the waiters blocked on that
+//!   semaphore (Linux count_semcnt); IPC_RMID wakes them with EIDRM.
 
 use core::sync::atomic::{AtomicI32, Ordering};
 
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
-    GETALL, GETVAL, IPC_CREAT, IPC_EXCL, IPC_NOWAIT, IPC_PRIVATE, IPC_RMID, IPC_SET, MAP_ANONYMOUS,
-    MAP_SHARED, PROT_READ, PROT_WRITE, SETVAL, Sembuf, Timespec, sys_clock_gettime, sys_exit,
-    sys_fork, sys_mmap, sys_msgctl, sys_munmap, sys_semctl, sys_semget, sys_semop, sys_semtimedop,
-    sys_shmctl, sys_shmget, sys_wait4,
+    GETALL, GETNCNT, GETVAL, GETZCNT, IPC_CREAT, IPC_EXCL, IPC_NOWAIT, IPC_PRIVATE, IPC_RMID,
+    IPC_SET, MAP_ANONYMOUS, MAP_SHARED, PROT_READ, PROT_WRITE, SETVAL, Sembuf, Timespec,
+    sys_clock_gettime, sys_exit, sys_fork, sys_mmap, sys_msgctl, sys_munmap, sys_semctl,
+    sys_semget, sys_semop, sys_semtimedop, sys_shmctl, sys_shmget, sys_wait4,
 };
 
 const EINVAL: i64 = -22;
@@ -59,6 +61,7 @@ pub fn run_tests() {
     report(b"SEM_UNDO_EXIT", sem_undo(undo_exit_child, 0));
     report(b"SEM_UNDO_SETVAL", sem_undo(undo_setval_child, 5));
     report(b"SEM_UNDO_ERANGE", sem_undo(undo_erange_child, 0));
+    report(b"SEM_NCNT", sem_ncnt());
 }
 
 type R = Result<(), (&'static [u8], i64)>;
@@ -411,4 +414,50 @@ fn undo_erange_child(id: i32) -> u64 {
     // The failed semop changed nothing: value 1; the exit adds -32768
     // and clamps at 0
     (sys_semctl(id, 0, GETVAL, 0) != 1) as u64 * 4
+}
+
+/// Block in semop(`sem_op` on `num`); exit 0 on EIDRM
+fn ncnt_child(id: i32, num: u16, sem_op: i16) -> ! {
+    let op = [Sembuf::new(num, sem_op, 0)];
+    let r = sys_semop(id, op.as_ptr(), 1);
+    sys_exit(if r == -43 { 0 } else { 1 })
+}
+
+fn sem_ncnt() -> R {
+    let set = Set::new(2);
+    check(b"semget", set.0 >= 0, set.0 as i64)?;
+    set.set(1, 1);
+    let a = sys_fork();
+    if a == 0 {
+        ncnt_child(set.0, 0, -1);
+    }
+    let b = sys_fork();
+    if b == 0 {
+        ncnt_child(set.0, 1, 0);
+    }
+    let cnt = |cmd, num| sys_semctl(set.0, num, cmd, 0);
+    // Both children asleep: wait (bounded) until they are counted
+    let t0 = mono_ms();
+    while (cnt(GETNCNT, 0) != 1 || cnt(GETZCNT, 1) != 1) && mono_ms() - t0 < 2000 {
+        let ts = Timespec {
+            tv_sec: 0,
+            tv_nsec: 5_000_000,
+        };
+        hk_syscall::sys_nanosleep(&ts, core::ptr::null_mut());
+    }
+    let r = (|| {
+        check(b"ncnt 0", cnt(GETNCNT, 0) == 1, cnt(GETNCNT, 0))?;
+        check(b"zcnt 1", cnt(GETZCNT, 1) == 1, cnt(GETZCNT, 1))?;
+        check(b"zcnt 0", cnt(GETZCNT, 0) == 0, cnt(GETZCNT, 0))?;
+        check(b"ncnt 1", cnt(GETNCNT, 1) == 0, cnt(GETNCNT, 1))?;
+        check(b"semnum", cnt(GETNCNT, 2) == EINVAL, cnt(GETNCNT, 2))
+    })();
+    sys_semctl(set.0, 0, IPC_RMID, 0);
+    let mut ok = true;
+    for p in [a, b] {
+        let mut ws = 0;
+        ok &= sys_wait4(p, &mut ws, 0, 0) == p && ws == 0;
+    }
+    r?;
+    check(b"EIDRM", ok, 0)
 }
