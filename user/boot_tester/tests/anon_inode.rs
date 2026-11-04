@@ -15,8 +15,8 @@
 use super::helpers::{host_mode, print, print_num, println, skip};
 use hk_syscall::{
     O_CREAT, O_WRONLY, Stat, Timespec, sys_chmod, sys_chown, sys_close, sys_epoll_create1,
-    sys_eventfd2, sys_fchmod, sys_fchown, sys_fstat, sys_getpid, sys_inotify_init1, sys_nanosleep, sys_open,
-    sys_pidfd_open, sys_pipe2, sys_readlink, sys_signalfd4, sys_stat, sys_timerfd_create,
+    sys_eventfd2, sys_fchmod, sys_fchown, sys_fstat, sys_getpid, sys_inotify_init1, sys_nanosleep,
+    sys_open, sys_pidfd_open, sys_pipe2, sys_readlink, sys_signalfd4, sys_stat, sys_timerfd_create,
     sys_unlink, sys_utimensat,
 };
 
@@ -178,7 +178,10 @@ const EOPNOTSUPP: i64 = -95;
 
 fn anon_setattr() {
     if host_mode() {
-        skip(b"ANON_INODE_SETATTR", b"Linux before 6.16 lets setattr change the shared inode");
+        skip(
+            b"ANON_INODE_SETATTR",
+            b"Linux before 6.16 lets setattr change the shared inode",
+        );
         return;
     }
     let fd = sys_eventfd2(0, 0);

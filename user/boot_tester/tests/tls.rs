@@ -3,9 +3,9 @@
 //! CLONE_SETTLS through set_new_tls; ptrace putreg: EIO); arm64 takes
 //! any TPIDR_EL0 value.
 
-use super::helpers::{print, print_num, println};
 #[cfg(target_arch = "x86_64")]
 use super::helpers::host_mode;
+use super::helpers::{print, print_num, println};
 use hk_syscall::{sys_clone, sys_exit, sys_wait4};
 
 const SIGCHLD: u64 = 17;
@@ -13,7 +13,11 @@ const CLONE_SETTLS: u64 = 0x0008_0000;
 /// Non-canonical, a kernel address, and TASK_SIZE_MAX itself (hk's,
 /// 4-level paging; Linux with LA57 takes it)
 #[cfg(target_arch = "x86_64")]
-const BAD: [u64; 3] = [0x8000_0000_0000_0000, 0xffff_8000_0000_0000, 0x7fff_ffff_f000];
+const BAD: [u64; 3] = [
+    0x8000_0000_0000_0000,
+    0xffff_8000_0000_0000,
+    0x7fff_ffff_f000,
+];
 
 /// The bad bases this kernel must refuse
 #[cfg(target_arch = "x86_64")]

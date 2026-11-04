@@ -107,7 +107,14 @@ fn test_rt_place() {
         println(b"RT_PLACE:SKIP (2 to 8 CPUs)");
         return;
     }
-    let page = sys_mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    let page = sys_mmap(
+        0,
+        4096,
+        PROT_READ | PROT_WRITE,
+        MAP_SHARED | MAP_ANONYMOUS,
+        -1,
+        0,
+    );
     if !t.ok(b"mmap", page >= 0, page) {
         t.done();
         return;
@@ -212,7 +219,14 @@ fn fair_spinner(cpu: u32, nice: i32, policy: i32, counter: *mut u64) -> i64 {
 fn test_fair_share(name: &'static [u8], a: (i32, i32), b: (i32, i32), range: (u64, u64)) {
     use super::sk::T;
     let mut t = T::new(name);
-    let page = sys_mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    let page = sys_mmap(
+        0,
+        4096,
+        PROT_READ | PROT_WRITE,
+        MAP_SHARED | MAP_ANONYMOUS,
+        -1,
+        0,
+    );
     if !t.ok(b"mmap", page >= 0, page) {
         t.done();
         return;
@@ -237,7 +251,11 @@ fn test_fair_share(name: &'static [u8], a: (i32, i32), b: (i32, i32), range: (u6
     sys_munmap(page as u64, 4096);
     let tenths = da * 10 / db.max(1);
     t.ok(b"both ran", da > 0, da as i64);
-    t.ok(b"share a:b tenths", (range.0..=range.1).contains(&tenths), tenths as i64);
+    t.ok(
+        b"share a:b tenths",
+        (range.0..=range.1).contains(&tenths),
+        tenths as i64,
+    );
     t.done();
 }
 
@@ -296,7 +314,11 @@ fn test_sched_prio_fields() {
         t.eq(b"stat prio nice", s[0] * 100 + s[1], 25 * 100 + 5);
         let p = SchedParam { sched_priority: 10 };
         t.eq(b"set fifo", sys_sched_setscheduler(0, SCHED_FIFO, &p), 0);
-        t.eq(b"getscheduler", sys_sched_getscheduler(0), SCHED_FIFO as i64);
+        t.eq(
+            b"getscheduler",
+            sys_sched_getscheduler(0),
+            SCHED_FIFO as i64,
+        );
         let mut q = SchedParam { sched_priority: 0 };
         sys_sched_getparam(0, &mut q);
         t.eq(b"getparam", q.sched_priority as i64, 10);
@@ -371,7 +393,13 @@ fn spinner(cpu: u32, prio: i32, counter: *mut u64, ms: i64) -> i64 {
         let m = 1u64 << cpu;
         sys_sched_setaffinity(0, 8, &m);
         if prio != 0 {
-            sys_sched_setscheduler(0, 1, &SchedParam { sched_priority: prio });
+            sys_sched_setscheduler(
+                0,
+                1,
+                &SchedParam {
+                    sched_priority: prio,
+                },
+            );
         }
         let end = now_ms() + ms;
         loop {
@@ -391,7 +419,14 @@ fn spinner(cpu: u32, prio: i32, counter: *mut u64, ms: i64) -> i64 {
 fn test_rt_fifo() {
     use super::sk::T;
     let mut t = T::new(b"RT_FIFO");
-    let page = sys_mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    let page = sys_mmap(
+        0,
+        4096,
+        PROT_READ | PROT_WRITE,
+        MAP_SHARED | MAP_ANONYMOUS,
+        -1,
+        0,
+    );
     if !t.ok(b"mmap", page >= 0, page) {
         t.done();
         return;
@@ -428,7 +463,11 @@ fn test_rt_fifo() {
     reap(other);
     t.ok(b"fifo ran", f > 0, f as i64);
     // Starved while the FIFO task spins: under a fifth of its solo rate
-    t.ok(b"other starved", (o1 - o0) * 5 < solo.max(1), (o1 - o0) as i64);
+    t.ok(
+        b"other starved",
+        (o1 - o0) * 5 < solo.max(1),
+        (o1 - o0) as i64,
+    );
     // Two FIFO tasks of one priority on one CPU: the second waits for
     // the first to finish
     let a = spinner(cpu, 10, unsafe { c.add(2) }, 300);
@@ -453,7 +492,14 @@ fn test_balance() {
         return;
     }
     let n = ncpu.clamp(2, 4) as usize;
-    let page = sys_mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    let page = sys_mmap(
+        0,
+        4096,
+        PROT_READ | PROT_WRITE,
+        MAP_SHARED | MAP_ANONYMOUS,
+        -1,
+        0,
+    );
     if page < 0 {
         print(b"BALANCE:FAIL mmap ");
         print_num(page);
@@ -586,7 +632,14 @@ fn test_smp_spread() {
         return;
     }
     let n = ncpu.min(4) as usize;
-    let page = sys_mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    let page = sys_mmap(
+        0,
+        4096,
+        PROT_READ | PROT_WRITE,
+        MAP_SHARED | MAP_ANONYMOUS,
+        -1,
+        0,
+    );
     if page < 0 {
         print(b"SMP_SPREAD:FAIL mmap ");
         print_num(page);

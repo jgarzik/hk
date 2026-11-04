@@ -62,7 +62,11 @@ pub fn run_tests() {
     let mut st = 0i32;
     sys_wait4(pid, &mut st, 0, 0);
     // Exit code: one bit per failed check; 0x80 setup failed
-    let bits = if st & 0x7f != 0 { 0xff } else { (st >> 8) & 0xff };
+    let bits = if st & 0x7f != 0 {
+        0xff
+    } else {
+        (st >> 8) & 0xff
+    };
     for (i, n) in NAMES.iter().enumerate() {
         print(n);
         if bits & (1 << i) == 0 && bits & 0x80 == 0 {

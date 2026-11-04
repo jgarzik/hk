@@ -801,7 +801,9 @@ fn thp_round(round: u64) -> u64 {
     THP_BASE.store(base, Ordering::Relaxed);
     THP_GO.store(round, Ordering::Release);
     sys_madvise(base, HUGE, MADV_DONTNEED);
-    let bad = (0..HUGE / PAGE).filter(|i| get(base + i * PAGE) != 0).count() as u64;
+    let bad = (0..HUGE / PAGE)
+        .filter(|i| get(base + i * PAGE) != 0)
+        .count() as u64;
     // The splitter may still be in its madvise: wait before unmapping
     for _ in 0..4 {
         sys_sched_yield();

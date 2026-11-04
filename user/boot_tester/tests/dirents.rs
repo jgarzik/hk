@@ -6,9 +6,9 @@
 
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
-    O_CREAT, O_DIRECTORY, O_RDONLY, O_WRONLY, SEEK_SET, Stat, sys_chdir, sys_close,
-    sys_getcwd, sys_getdents64, sys_lseek, sys_mkdir, sys_open, sys_readlink, sys_rename,
-    sys_rmdir, sys_stat, sys_symlink, sys_unlink,
+    O_CREAT, O_DIRECTORY, O_RDONLY, O_WRONLY, SEEK_SET, Stat, sys_chdir, sys_close, sys_getcwd,
+    sys_getdents64, sys_lseek, sys_mkdir, sys_open, sys_readlink, sys_rename, sys_rmdir, sys_stat,
+    sys_symlink, sys_unlink,
 };
 
 const EINVAL: i64 = -22;
@@ -185,7 +185,11 @@ fn nonutf8_ops() -> Result<(), (&'static [u8], i64)> {
         return Err((b"symlink", r));
     }
     let mut buf = [0u8; 32];
-    let n = sys_readlink(b"/tmp/n\xff/l\0".as_ptr(), buf.as_mut_ptr(), buf.len() as u64);
+    let n = sys_readlink(
+        b"/tmp/n\xff/l\0".as_ptr(),
+        buf.as_mut_ptr(),
+        buf.len() as u64,
+    );
     if n != target.len() as i64 || buf[..target.len()] != *target {
         return Err((b"readlink bytes", n));
     }

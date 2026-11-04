@@ -114,7 +114,9 @@ fn test_basic() {
     }
     // Directory link count: subdirectories + 2
     let mut subdirs = 0;
-    each_entry(b"/sys/kernel\0", &mut |_, ty| subdirs += (ty == DT_DIR) as i64);
+    each_entry(b"/sys/kernel\0", &mut |_, ty| {
+        subdirs += (ty == DT_DIR) as i64
+    });
     match stat(b"/sys/kernel\0") {
         Ok(st) if st.st_nlink as i64 == subdirs + 2 => {}
         Ok(st) => return fail(N, b"nlink", st.st_nlink as i64),
@@ -232,7 +234,10 @@ fn test_class_mem() {
                 b"MAJOR=5\nMINOR=1\nDEVNAME=console\n",
             ),
         ),
-        (b"console dev", file_is(b"/sys/class/tty/console/dev\0", b"5:1\n")),
+        (
+            b"console dev",
+            file_is(b"/sys/class/tty/console/dev\0", b"5:1\n"),
+        ),
     ];
     for (why, good) in checks {
         if !good {
@@ -375,7 +380,11 @@ fn test_uevent_synth() {
             Some(s2) if s2 > seq => {}
             _ => return Err((&b"synth args"[..], n as i64)),
         }
-        for bad in [&b"frob"[..], b"add zzz", b"add 01234567-89ab-cdef-0123-456789abcdef A"] {
+        for bad in [
+            &b"frob"[..],
+            b"add zzz",
+            b"add 01234567-89ab-cdef-0123-456789abcdef A",
+        ] {
             let r = write_str(ue, bad);
             if r != -22 {
                 return Err((&b"malformed"[..], r));
@@ -480,7 +489,10 @@ fn test_bus_platform() {
             }
             let mut ub = [0u8; 256];
             let mut u = [0u8; 1024];
-            let k = read_file(path(&mut ub, &[base, b"devices/", dev, b"/uevent\0"]), &mut u);
+            let k = read_file(
+                path(&mut ub, &[base, b"devices/", dev, b"/uevent\0"]),
+                &mut u,
+            );
             let u = &u[..k.max(0) as usize];
             let mut has_drv = false;
             let mut has_alias = false;
@@ -507,7 +519,8 @@ fn hex_attr(b: &[u8], digits: usize) -> Option<u32> {
     if v.len() != digits {
         return None;
     }
-    v.iter().try_fold(0u32, |a, &c| Some(a * 16 + (c as char).to_digit(16)?))
+    v.iter()
+        .try_fold(0u32, |a, &c| Some(a * 16 + (c as char).to_digit(16)?))
 }
 
 fn upper_hex(v: u32, digits: usize, out: &mut [u8]) {
@@ -547,9 +560,7 @@ fn test_bus_pci() {
             return fail(N, b"class format", i as i64);
         }
         let mut cfg = [0u8; 4];
-        if attr(b"config", &mut cfg) != 4
-            || u32::from_le_bytes(cfg) != vendor | device << 16
-        {
+        if attr(b"config", &mut cfg) != 4 || u32::from_le_bytes(cfg) != vendor | device << 16 {
             return fail(N, b"config id", i as i64);
         }
         let mut b = [0u8; 256];
@@ -668,8 +679,11 @@ fn uevent_has(parts: &[&[u8]], want: &[&[u8]]) -> bool {
     v[..k].copy_from_slice(parts);
     v[k] = b"/uevent\0";
     let n = read_file(path(&mut b, &v[..=k]), &mut u).max(0) as usize;
-    want.iter()
-        .all(|w| u[..n].split(|&c| c == b'\n').any(|l| l == *w || (w.ends_with(b"=") && l.starts_with(w))))
+    want.iter().all(|w| {
+        u[..n]
+            .split(|&c| c == b'\n')
+            .any(|l| l == *w || (w.ends_with(b"=") && l.starts_with(w)))
+    })
 }
 
 /// /sys/block: each disk's dev and size agree with /proc/partitions,
@@ -733,7 +747,8 @@ fn hex4(b: &[u8]) -> Option<u32> {
     if v.len() != 4 || v.iter().any(|c| c.is_ascii_uppercase()) {
         return None;
     }
-    v.iter().try_fold(0u32, |a, &c| Some(a * 16 + (c as char).to_digit(16)?))
+    v.iter()
+        .try_fold(0u32, |a, &c| Some(a * 16 + (c as char).to_digit(16)?))
 }
 
 /// `%x` of `v`, into `out`: its length
@@ -805,7 +820,10 @@ fn test_bus_usb() {
                 for (key, name) in [(&b"BUSNUM="[..], &b"busnum"[..]), (b"DEVNUM=", b"devnum")] {
                     let n = attr(d, name, &mut v);
                     let num = uevent_var(u, key).unwrap_or(b"");
-                    let num = num.strip_prefix(b"00").or(num.strip_prefix(b"0")).unwrap_or(num);
+                    let num = num
+                        .strip_prefix(b"00")
+                        .or(num.strip_prefix(b"0"))
+                        .unwrap_or(num);
                     if num.is_empty() || v[..n].strip_suffix(b"\n") != Some(num) {
                         return fail(N, b"uevent BUSNUM/DEVNUM", i as i64);
                     }
@@ -854,7 +872,10 @@ fn test_bus_usb() {
 /// the mount made before keeps the old namespace's devices
 fn test_net() {
     const N: &[u8] = b"SYSFS_NET";
-    use hk_syscall::{CLONE_NEWNET, sys_exit, sys_fork, sys_mkdir, sys_mount, sys_rmdir, sys_umount2, sys_unshare, sys_wait4};
+    use hk_syscall::{
+        CLONE_NEWNET, sys_exit, sys_fork, sys_mkdir, sys_mount, sys_rmdir, sys_umount2,
+        sys_unshare, sys_wait4,
+    };
     if !link_is(b"/sys/class/net/lo\0", b"../../devices/virtual/net/lo") {
         return fail(N, b"lo link", 0);
     }
@@ -875,7 +896,10 @@ fn test_net() {
     let flags = f[..n]
         .strip_prefix(b"0x")
         .and_then(|v| v.strip_suffix(b"\n"))
-        .map(|v| v.iter().fold(0u32, |a, &c| a * 16 + (c as char).to_digit(16).unwrap_or(0)));
+        .map(|v| {
+            v.iter()
+                .fold(0u32, |a, &c| a * 16 + (c as char).to_digit(16).unwrap_or(0))
+        });
     // IFF_UP | IFF_LOOPBACK (boot_tester brought lo up)
     if flags.is_none_or(|fl| fl & 0x9 != 0x9) {
         return fail(N, b"lo flags", n as i64);
@@ -977,7 +1001,10 @@ fn test_cpu() {
         Ok(st) if st.st_mode & S_IFMT == S_IFDIR => {}
         _ => return fail(N, b"cpu0", 0),
     }
-    if !link_is(b"/sys/bus/cpu/devices/cpu0\0", b"../../../devices/system/cpu/cpu0") {
+    if !link_is(
+        b"/sys/bus/cpu/devices/cpu0\0",
+        b"../../../devices/system/cpu/cpu0",
+    ) {
         return fail(N, b"bus link", 0);
     }
     let Some(nodes) = list_of(b"/sys/devices/system/node/online\0") else {
@@ -1189,7 +1216,11 @@ fn eth0_flags(set: Option<u16>) -> i64 {
         r = sys_ioctl(fd as i32, SIOCSIFFLAGS, ifr.as_mut_ptr() as u64);
     }
     sys_close(fd as u64);
-    if r < 0 { r } else { u16::from_ne_bytes([ifr[16], ifr[17]]) as i64 }
+    if r < 0 {
+        r
+    } else {
+        u16::from_ne_bytes([ifr[16], ifr[17]]) as i64
+    }
 }
 
 fn eth0_ifindex() -> u64 {
@@ -1225,7 +1256,11 @@ fn test_unbind_net() {
     let mut lk = [0u8; 256];
     let n = sys_readlink(b"/sys/class/net/eth0\0".as_ptr(), lk.as_mut_ptr(), 255);
     if n < 0 {
-        return if host_mode() { skip(N, b"no eth0") } else { fail(N, b"no eth0", n) };
+        return if host_mode() {
+            skip(N, b"no eth0")
+        } else {
+            fail(N, b"no eth0", n)
+        };
     }
     // ../../devices/<parent>/net/eth0
     let Some(devpath) = lk[..n as usize].strip_prefix(b"../..") else {
@@ -1405,7 +1440,11 @@ fn usb_unbind_rebind(
             return Err((b"unbind event", i as i64));
         }
     }
-    let gone: [&[u8]; 3] = [b"/sys/block/sda\0", b"/sys/class/block/sda\0", b"/dev/sda\0"];
+    let gone: [&[u8]; 3] = [
+        b"/sys/block/sda\0",
+        b"/sys/class/block/sda\0",
+        b"/dev/sda\0",
+    ];
     for (i, p) in gone.iter().enumerate() {
         if stat(p).is_ok() {
             return Err((b"disk still there", i as i64));
@@ -1462,8 +1501,16 @@ fn test_unbind_usb() {
             fd,
             b"/sys/bus/pci/drivers/xhci_hcd/",
             &pb[..pl],
-            &[(b"remove@", b"/block/sda"), (b"remove@", b"/usb1"), (b"unbind@", b"")],
-            &[(b"add@", b"/usb1"), (b"add@", b"/block/sda"), (b"bind@", b"")],
+            &[
+                (b"remove@", b"/block/sda"),
+                (b"remove@", b"/usb1"),
+                (b"unbind@", b""),
+            ],
+            &[
+                (b"add@", b"/usb1"),
+                (b"add@", b"/block/sda"),
+                (b"bind@", b""),
+            ],
             &sector,
         )
         .map_err(|(why, v)| (why, v + 100))

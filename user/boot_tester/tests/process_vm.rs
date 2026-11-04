@@ -69,7 +69,11 @@ fn test_process_vm_sibling() {
                 sys_exit(3);
             }
         }
-        sys_exit(if SIB_RESULT.load(Ordering::Relaxed) == 1 { 0 } else { 1 });
+        sys_exit(if SIB_RESULT.load(Ordering::Relaxed) == 1 {
+            0
+        } else {
+            1
+        });
     }
     let mut st = 0i32;
     sys_wait4(pid, &mut st, 0, 0);

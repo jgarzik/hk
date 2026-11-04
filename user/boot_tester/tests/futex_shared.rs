@@ -17,9 +17,10 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use super::fork_mm::spawn_thread;
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
-    FUTEX_WAIT, FUTEX_WAKE, MAP_ANONYMOUS, RobustListHead, sys_set_robust_list, MAP_PRIVATE, MAP_SHARED, MREMAP_FIXED, MREMAP_MAYMOVE,
-    O_CREAT, O_RDWR, PROT_READ, PROT_WRITE, Timespec, sys_close, sys_exit, sys_fork, sys_ftruncate,
-    sys_futex, sys_mmap, sys_mremap, sys_munmap, sys_nanosleep, sys_open, sys_unlink, sys_wait4,
+    FUTEX_WAIT, FUTEX_WAKE, MAP_ANONYMOUS, MAP_PRIVATE, MAP_SHARED, MREMAP_FIXED, MREMAP_MAYMOVE,
+    O_CREAT, O_RDWR, PROT_READ, PROT_WRITE, RobustListHead, Timespec, sys_close, sys_exit,
+    sys_fork, sys_ftruncate, sys_futex, sys_mmap, sys_mremap, sys_munmap, sys_nanosleep, sys_open,
+    sys_set_robust_list, sys_unlink, sys_wait4,
 };
 
 const PAGE: u64 = 4096;
@@ -67,7 +68,14 @@ fn wait_shared(w: *mut u32, ms: i64) -> i64 {
 fn wake_shared(w: *mut u32) -> i64 {
     let mut r = 0;
     for _ in 0..200 {
-        r = sys_futex(w, FUTEX_WAKE, 1, core::ptr::null(), core::ptr::null_mut(), 0);
+        r = sys_futex(
+            w,
+            FUTEX_WAKE,
+            1,
+            core::ptr::null(),
+            core::ptr::null_mut(),
+            0,
+        );
         if r != 0 {
             break;
         }
@@ -135,7 +143,11 @@ fn shared_alias() {
     let res = ALIAS_RES.load(Ordering::SeqCst) as i32 as i64;
     sys_munmap(a as u64, PAGE);
     sys_munmap(b as u64, PAGE);
-    report(NAME, woke == 1 && joined && res == 0, if woke != 1 { woke } else { res });
+    report(
+        NAME,
+        woke == 1 && joined && res == 0,
+        if woke != 1 { woke } else { res },
+    );
 }
 
 fn shared_moved() {
@@ -196,7 +208,14 @@ fn private_split() {
     }
     let mut woke = 0;
     for _ in 0..20 {
-        woke = sys_futex(word, FUTEX_WAKE, 1, core::ptr::null(), core::ptr::null_mut(), 0);
+        woke = sys_futex(
+            word,
+            FUTEX_WAKE,
+            1,
+            core::ptr::null(),
+            core::ptr::null_mut(),
+            0,
+        );
         if woke != 0 {
             break;
         }
@@ -234,7 +253,14 @@ fn ctid_shared() {
             tv_sec: 2,
             tv_nsec: 0,
         };
-        r = sys_futex(&raw mut CTID, FUTEX_WAIT, tid, &ts, core::ptr::null_mut(), 0);
+        r = sys_futex(
+            &raw mut CTID,
+            FUTEX_WAIT,
+            tid,
+            &ts,
+            core::ptr::null_mut(),
+            0,
+        );
         if r != EAGAIN {
             break;
         }

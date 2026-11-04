@@ -12,9 +12,9 @@ use super::helpers::{
     BlkDev, dev_major, dev_minor, find_blkdev, print, print_num, println, read_file,
 };
 use hk_syscall::{
-    O_CREAT, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY, Stat, sys_close, sys_fstat, sys_fsync, sys_ioctl, sys_lseek,
-    sys_mkdir, sys_mount, sys_open, sys_pread64, sys_pwrite64, sys_read, sys_stat, sys_swapoff,
-    sys_rename, sys_swapon, sys_umount2, sys_unlink,
+    O_CREAT, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY, Stat, sys_close, sys_fstat, sys_fsync, sys_ioctl,
+    sys_lseek, sys_mkdir, sys_mount, sys_open, sys_pread64, sys_pwrite64, sys_read, sys_rename,
+    sys_stat, sys_swapoff, sys_swapon, sys_umount2, sys_unlink,
 };
 
 const BLKROGET: u64 = 0x125e;
@@ -139,7 +139,11 @@ fn cache(p3: &BlkDev) {
     let mut back = [0u8; 8];
     let n = sys_pread64(c, back.as_mut_ptr(), 8, OFF as i64 + 512);
     sys_close(c as u64);
-    verdict(b"BLK_WRITEBACK_CLOSE", w2 == 8 && n == 8 && &back == b"on disk!", n);
+    verdict(
+        b"BLK_WRITEBACK_CLOSE",
+        w2 == 8 && n == 8 && &back == b"on disk!",
+        n,
+    );
 }
 
 /// vda1..3 are partitions 1..3 of vda: same major, minors follow
@@ -451,7 +455,13 @@ fn vfat_remount(p1: &BlkDev) {
 fn mount_vd1(p1: &BlkDev, opts: &[u8]) -> i64 {
     let mut p = [0u8; 48];
     let path = p1.path(&mut p).as_ptr();
-    sys_mount(path, b"/mnt/vd1\0".as_ptr(), b"vfat\0".as_ptr(), 0, opts.as_ptr() as u64)
+    sys_mount(
+        path,
+        b"/mnt/vd1\0".as_ptr(),
+        b"vfat\0".as_ptr(),
+        0,
+        opts.as_ptr() as u64,
+    )
 }
 
 /// `name` is an entry of /mnt/vd1, byte for byte
@@ -521,7 +531,10 @@ fn vfat_names(p1: &BlkDev) {
 /// fat_make_mode: 0777 minus the mask); an unknown option or a bad
 /// value is EINVAL (MOUNT_BAD_OPT)
 fn vfat_opts(p1: &BlkDev) {
-    let r = mount_vd1(p1, b"iocharset=cp437,uid=1000,gid=1001,fmask=0133,dmask=0022\0");
+    let r = mount_vd1(
+        p1,
+        b"iocharset=cp437,uid=1000,gid=1001,fmask=0133,dmask=0022\0",
+    );
     // SAFETY: Stat is plain integers
     let mut f: Stat = unsafe { core::mem::zeroed() };
     // SAFETY: as above
@@ -536,7 +549,13 @@ fn vfat_opts(p1: &BlkDev) {
         && (d.st_uid, d.st_mode) == (1000, 0o40755);
     if !ok {
         print(b"VFAT_MOUNT_OPTS: r/uid/gid/fmode/dmode ");
-        for v in [r, f.st_uid as i64, f.st_gid as i64, f.st_mode as i64, d.st_mode as i64] {
+        for v in [
+            r,
+            f.st_uid as i64,
+            f.st_gid as i64,
+            f.st_mode as i64,
+            d.st_mode as i64,
+        ] {
             print_num(v);
             print(b" ");
         }
@@ -548,7 +567,11 @@ fn vfat_opts(p1: &BlkDev) {
     if bogus == 0 || badval == 0 {
         sys_umount2(b"/mnt/vd1\0".as_ptr(), 0);
     }
-    verdict(b"MOUNT_BAD_OPT", bogus == -22 && badval == -22, bogus * 100 + badval);
+    verdict(
+        b"MOUNT_BAD_OPT",
+        bogus == -22 && badval == -22,
+        bogus * 100 + badval,
+    );
 }
 
 /// Write `v` to /proc/sys/vm/drop_caches
@@ -590,7 +613,11 @@ fn drop_caches() {
     let n = sys_pread64(t, r.as_mut_ptr(), 14, 0);
     sys_close(t as u64);
     sys_unlink(b"/tmp/dc_ramfs\0".as_ptr());
-    verdict(b"DROP_CACHES_RAMFS", w == 2 && n == 14 && &r == b"ramfs keeps it", n);
+    verdict(
+        b"DROP_CACHES_RAMFS",
+        w == 2 && n == 14 && &r == b"ramfs keeps it",
+        n,
+    );
 }
 
 /// A vfat file can be a swap area (Linux: bmap, generic swapfile
@@ -607,10 +634,15 @@ fn vfat_swapfile() {
         hdr[1024..1028].copy_from_slice(&1u32.to_ne_bytes());
         hdr[1028..1032].copy_from_slice(&last.to_ne_bytes());
         hdr[4086..].copy_from_slice(b"SWAPSPACE2");
-        let ok = sys_pwrite64(fd, hdr.as_ptr(), 4096, 0) == 4096 && sys_ftruncate(fd, 256 * 4096) == 0;
+        let ok =
+            sys_pwrite64(fd, hdr.as_ptr(), 4096, 0) == 4096 && sys_ftruncate(fd, 256 * 4096) == 0;
         sys_fsync(fd);
         sys_close(fd as u64);
-        got[i] = if ok { sys_swapon(path.as_ptr(), 0) } else { -1000 };
+        got[i] = if ok {
+            sys_swapon(path.as_ptr(), 0)
+        } else {
+            -1000
+        };
         if got[i] == 0 {
             // Active: no write, truncate (also by O_TRUNC) or unlink
             // (Linux IS_SWAPFILE: ETXTBSY, EPERM for unlink)
@@ -776,7 +808,11 @@ fn vfat_neg_case(p1: &BlkDev) {
     let mut st: Stat = unsafe { core::mem::zeroed() };
     let miss = sys_stat(b"/mnt/vd1/NEGCASE.TXT\0".as_ptr(), &mut st);
     let miss2 = sys_stat(b"/mnt/vd1/td.\0".as_ptr(), &mut st);
-    let fd = sys_open(b"/mnt/vd1/negcase.txt\0".as_ptr(), O_CREAT | O_WRONLY, 0o644);
+    let fd = sys_open(
+        b"/mnt/vd1/negcase.txt\0".as_ptr(),
+        O_CREAT | O_WRONLY,
+        0o644,
+    );
     sys_close(fd as u64);
     let fd2 = sys_open(b"/mnt/vd1/td\0".as_ptr(), O_CREAT | O_WRONLY, 0o644);
     sys_close(fd2 as u64);
@@ -797,7 +833,13 @@ fn vfat_mount_alias(p1: &BlkDev) {
     sys_mkdir(b"/mnt/vd1/al\0".as_ptr(), 0o755);
     let fd = sys_open(b"/mnt/vd1/al/under\0".as_ptr(), O_CREAT | O_WRONLY, 0o644);
     sys_close(fd as u64);
-    let m = sys_mount(b"none\0".as_ptr(), b"/mnt/vd1/al\0".as_ptr(), b"ramfs\0".as_ptr(), 0, 0);
+    let m = sys_mount(
+        b"none\0".as_ptr(),
+        b"/mnt/vd1/al\0".as_ptr(),
+        b"ramfs\0".as_ptr(),
+        0,
+        0,
+    );
     // SAFETY: Stat is plain integers
     let mut st: Stat = unsafe { core::mem::zeroed() };
     let lower = sys_stat(b"/mnt/vd1/al/under\0".as_ptr(), &mut st);

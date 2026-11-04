@@ -1311,7 +1311,14 @@ pub(super) fn join(ctid: *mut u32) -> bool {
             tv_sec: 0,
             tv_nsec: 100_000_000,
         };
-        hk_syscall::sys_futex(ctid, hk_syscall::FUTEX_WAIT, v, &ts, core::ptr::null_mut(), 0);
+        hk_syscall::sys_futex(
+            ctid,
+            hk_syscall::FUTEX_WAIT,
+            v,
+            &ts,
+            core::ptr::null_mut(),
+            0,
+        );
     }
 }
 

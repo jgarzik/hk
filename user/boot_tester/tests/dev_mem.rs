@@ -36,7 +36,10 @@ fn report(name: &[u8], why: &[u8]) {
 
 /// Linux new_encode_dev's major and minor of st_rdev
 fn dev(rdev: u64) -> (u64, u64) {
-    ((rdev >> 8) & 0xfff, (rdev & 0xff) | ((rdev >> 12) & 0xfff00))
+    (
+        (rdev >> 8) & 0xfff,
+        (rdev & 0xff) | ((rdev >> 12) & 0xfff00),
+    )
 }
 
 fn nodes() {

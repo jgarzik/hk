@@ -149,9 +149,19 @@ fn test_mountpoint_busy() {
         sys_rename(mp.as_ptr(), b"/tmp/mnt_mp2\0".as_ptr()),
         EBUSY,
     );
-    f += chk(n, b"rename over", sys_rename(other.as_ptr(), mp.as_ptr()), EBUSY);
+    f += chk(
+        n,
+        b"rename over",
+        sys_rename(other.as_ptr(), mp.as_ptr()),
+        EBUSY,
+    );
     f += chk(n, b"umount", sys_umount2(mp.as_ptr(), 0), 0);
-    f += chk(n, b"rename over after", sys_rename(other.as_ptr(), mp.as_ptr()), 0);
+    f += chk(
+        n,
+        b"rename over after",
+        sys_rename(other.as_ptr(), mp.as_ptr()),
+        0,
+    );
     f += chk(n, b"rmdir after", sys_rmdir(mp.as_ptr()), 0);
     sys_rmdir(other.as_ptr());
     sys_rmdir(b"/tmp/mnt_mp2\0".as_ptr());
@@ -163,9 +173,19 @@ fn test_mountpoint_busy() {
     sys_mkdir(b"/tmp/mnt_pa/m\0".as_ptr(), 0o755);
     f += chk(n, b"mount in parent", ramfs(b"/tmp/mnt_pa/m\0", 0), 0);
     f += chk(n, b"rename parent", sys_rename(pa.as_ptr(), pb.as_ptr()), 0);
-    f += chk(n, b"rmdir after parent rename", sys_rmdir(m.as_ptr()), EBUSY);
+    f += chk(
+        n,
+        b"rmdir after parent rename",
+        sys_rmdir(m.as_ptr()),
+        EBUSY,
+    );
     // The mount moved with its parent: unmounted at the new path
-    f += chk(n, b"umount after parent rename", sys_umount2(m.as_ptr(), 0), 0);
+    f += chk(
+        n,
+        b"umount after parent rename",
+        sys_umount2(m.as_ptr(), 0),
+        0,
+    );
     f += chk(n, b"rmdir after umount", sys_rmdir(m.as_ptr()), 0);
     sys_rmdir(pb.as_ptr());
     done(n, f);
@@ -526,7 +546,12 @@ fn test_unsupported() {
     sys_mkdir(mp.as_ptr(), 0o755);
     let mut f = chk(n, b"MS_SYNCHRONOUS", ramfs(mp, MS_SYNCHRONOUS), EINVAL);
     f += chk(n, b"mount", ramfs(mp, MS_RDONLY | MS_NOEXEC), 0);
-    f += chk(n, b"remount nosymfollow", remount(mp, MS_NOSYMFOLLOW), EINVAL);
+    f += chk(
+        n,
+        b"remount nosymfollow",
+        remount(mp, MS_NOSYMFOLLOW),
+        EINVAL,
+    );
     f += chk(
         n,
         b"flags kept",

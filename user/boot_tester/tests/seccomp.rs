@@ -192,7 +192,11 @@ fn kill_thread() {
             return 3;
         }
         // It never returned from getppid
-        if THREAD_RET.load(Ordering::Acquire) == 12345 { 0 } else { 4 }
+        if THREAD_RET.load(Ordering::Acquire) == 12345 {
+            0
+        } else {
+            4
+        }
     });
     report(
         b"SECCOMP_KILL_THREAD",
@@ -232,7 +236,11 @@ fn trap() {
             return 1;
         }
         sys_getppid();
-        if TRAPPED.load(Ordering::Acquire) == 1 { 0 } else { 2 }
+        if TRAPPED.load(Ordering::Acquire) == 1 {
+            0
+        } else {
+            2
+        }
     });
     let ignored = child(|| {
         sigaction(SIGSYS, SIG_IGN);
@@ -245,7 +253,11 @@ fn trap() {
     report(
         b"SECCOMP_TRAP",
         handled == 0 && ignored & 0x7f == SIGSYS as i32,
-        if handled != 0 { 1000 + handled } else { ignored },
+        if handled != 0 {
+            1000 + handled
+        } else {
+            ignored
+        },
     );
 }
 
@@ -293,7 +305,11 @@ fn tsync() {
         if !join(&raw mut CTID) {
             return 3;
         }
-        if THREAD_RET.load(Ordering::Acquire) == -6 { 0 } else { 4 }
+        if THREAD_RET.load(Ordering::Acquire) == -6 {
+            0
+        } else {
+            4
+        }
     });
     report(b"SECCOMP_TSYNC", st == 0, st);
 }

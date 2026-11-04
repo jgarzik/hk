@@ -12,9 +12,7 @@ use super::fork_mm::spawn_thread;
 use super::helpers::{print, print_num, println};
 use super::sk::now_ms;
 use core::sync::atomic::{AtomicU32, Ordering};
-use hk_syscall::{
-    Timespec, sys_execve, sys_exit, sys_fork, sys_kill, sys_nanosleep, sys_wait4,
-};
+use hk_syscall::{Timespec, sys_execve, sys_exit, sys_fork, sys_kill, sys_nanosleep, sys_wait4};
 
 const ROUNDS: usize = 20;
 const TIMEOUT_MS: u64 = 10_000;

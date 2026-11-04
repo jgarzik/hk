@@ -6,9 +6,8 @@ use hk_syscall::{
     CLONE_SIGHAND, CLONE_VM, MAP_ANONYMOUS, MAP_FIXED, MAP_PRIVATE, MREMAP_FIXED, MREMAP_MAYMOVE,
     O_RDONLY, P_PID, PROT_NONE, PROT_READ, PROT_WRITE, SigInfo, Timespec, WEXITED, sys_clone,
     sys_close, sys_execve, sys_exit, sys_fork, sys_kill, sys_madvise, sys_mincore, sys_mmap,
-    sys_mprotect,
-    sys_mremap, sys_munmap, sys_nanosleep, sys_open, sys_pread64, sys_read, sys_sched_yield,
-    sys_vfork, sys_wait4, sys_waitid,
+    sys_mprotect, sys_mremap, sys_munmap, sys_nanosleep, sys_open, sys_pread64, sys_read,
+    sys_sched_yield, sys_vfork, sys_wait4, sys_waitid,
 };
 
 const CLONE_THREAD: u64 = 0x0001_0000;

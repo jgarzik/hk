@@ -24,9 +24,9 @@
 
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
-    O_NONBLOCK, O_RDONLY, O_RDWR, O_WRONLY, PollFd, Stat, Timespec, sys_close, sys_exit,
-    sys_fork, sys_lseek, sys_mknod, sys_nanosleep, sys_open, sys_poll, sys_read, sys_stat,
-    sys_unlink, sys_wait4, sys_write,
+    O_NONBLOCK, O_RDONLY, O_RDWR, O_WRONLY, PollFd, Stat, Timespec, sys_close, sys_exit, sys_fork,
+    sys_lseek, sys_mknod, sys_nanosleep, sys_open, sys_poll, sys_read, sys_stat, sys_unlink,
+    sys_wait4, sys_write,
 };
 
 const PATH: &[u8] = b"/fifo_test\0";
@@ -80,7 +80,11 @@ fn node() {
     let r = sys_stat(PATH.as_ptr(), &mut st);
     report(
         b"FIFO_NODE",
-        if r == 0 && st.st_mode & S_IFMT == S_IFIFO { 0 } else { 2 },
+        if r == 0 && st.st_mode & S_IFMT == S_IFIFO {
+            0
+        } else {
+            2
+        },
     );
 }
 

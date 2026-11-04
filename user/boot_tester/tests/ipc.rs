@@ -1142,7 +1142,12 @@ fn msg_send(msqid: i32, mtype: i64, len: usize) -> i64 {
         mtype,
         mtext: [b'x'; 32],
     };
-    sys_msgsnd(msqid, &m as *const TestMsg as *const u8, len, hk_syscall::IPC_NOWAIT)
+    sys_msgsnd(
+        msqid,
+        &m as *const TestMsg as *const u8,
+        len,
+        hk_syscall::IPC_NOWAIT,
+    )
 }
 
 /// msgrcv into a `size`-byte buffer; (result, type received)

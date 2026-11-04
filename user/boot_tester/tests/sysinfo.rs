@@ -13,8 +13,8 @@
 //! - Test 77: settimeofday() - set time
 //! - Test 78: settimeofday() EINVAL - invalid usec
 
-use super::sk::T;
 use super::helpers::{host_mode, print, print_cstr, print_num, println, starts_with};
+use super::sk::T;
 use hk_syscall::{
     Timespec, UtsName, sys_clock_gettime, sys_clock_settime, sys_sched_getaffinity,
     sys_sched_setaffinity, sys_setdomainname, sys_sethostname, sys_times, sys_uname,

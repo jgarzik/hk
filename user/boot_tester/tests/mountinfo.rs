@@ -121,7 +121,11 @@ fn check_mountinfo(id: u64) -> R {
     let parent_listed = text
         .split(|&c| c == b'\n')
         .any(|l| l.split(|&c| c == b' ').next().and_then(num) == Some(parent));
-    check(b"parent listed", parent_listed && parent != id, parent as i64)?;
+    check(
+        b"parent listed",
+        parent_listed && parent != id,
+        parent as i64,
+    )?;
     check(b"major:minor", f[2].contains(&b':'), 0)?;
     check(b"root", f[3] == b"/", 0)?;
     check(b"options", f[5].starts_with(b"rw"), 0)?;
@@ -134,7 +138,11 @@ fn check_mountinfo(id: u64) -> R {
     // /proc/mounts is a link to self/mounts, which lists it too
     let mut l = [0u8; 32];
     let r = sys_readlink(b"/proc/mounts\0".as_ptr(), l.as_mut_ptr(), l.len() as u64);
-    check(b"/proc/mounts link", r == 11 && l[..11] == *b"self/mounts", r)?;
+    check(
+        b"/proc/mounts link",
+        r == 11 && l[..11] == *b"self/mounts",
+        r,
+    )?;
     let n = slurp(b"/proc/self/mounts\0", &mut buf);
     let listed = buf[..n]
         .split(|&c| c == b'\n')
@@ -158,8 +166,16 @@ fn check_statx(id: u64) -> R {
     check(b"mask", st.stx_mask & STATX_MNT_ID != 0, st.stx_mask as i64)?;
     check(b"mnt_id", st.stx_mnt_id == id, st.stx_mnt_id as i64)?;
     let u = statx(b"/tmp/mi\0", STATX_MNT_ID_UNIQUE).map_err(|e| (&b"statx unique"[..], e))?;
-    check(b"unique mask", u.stx_mask & STATX_MNT_ID_UNIQUE != 0, u.stx_mask as i64)?;
-    check(b"unique id", u.stx_mnt_id > u32::MAX as u64, u.stx_mnt_id as i64)
+    check(
+        b"unique mask",
+        u.stx_mask & STATX_MNT_ID_UNIQUE != 0,
+        u.stx_mask as i64,
+    )?;
+    check(
+        b"unique id",
+        u.stx_mnt_id > u32::MAX as u64,
+        u.stx_mnt_id as i64,
+    )
 }
 
 /// The value of `key:\t` in fdinfo text
@@ -212,7 +228,11 @@ fn check_fdinfo(id: u64) -> R {
     check(b"flags cloexec", f & O_CLOEXEC as u64 != 0, f as i64)?;
     check(b"flags rdwr", f & 3 == O_RDWR as u64, f as i64)?;
     check(b"mnt_id", field(t, b"mnt_id").and_then(num) == Some(id), 0)?;
-    check(b"ino", field(t, b"ino").and_then(num) == Some(st.stx_ino), 0)
+    check(
+        b"ino",
+        field(t, b"ino").and_then(num) == Some(st.stx_ino),
+        0,
+    )
 }
 
 /// /proc/self/cwd and root name the cwd and root
@@ -221,6 +241,10 @@ fn check_cwd_root() -> R {
     let mut b = [0u8; 64];
     let r = sys_readlink(b"/proc/self/cwd\0".as_ptr(), b.as_mut_ptr(), b.len() as u64);
     check(b"cwd", r == 7 && b[..7] == *b"/tmp/mi", r)?;
-    let r = sys_readlink(b"/proc/self/root\0".as_ptr(), b.as_mut_ptr(), b.len() as u64);
+    let r = sys_readlink(
+        b"/proc/self/root\0".as_ptr(),
+        b.as_mut_ptr(),
+        b.len() as u64,
+    );
     check(b"root", r == 1 && b[0] == b'/', r)
 }

@@ -30,9 +30,9 @@ use super::helpers::{host_mode, print, print_num, println};
 use hk_syscall::{
     AT_EMPTY_PATH, AT_FDCWD, FIOCLEX, FIONBIO, FIONCLEX, IoVec, LinuxStatFs, O_CREAT, O_NONBLOCK,
     O_RDONLY, O_RDWR, O_TRUNC, PROC_SUPER_MAGIC, RAMFS_MAGIC, STATX_BASIC_STATS, Statx, sys_close,
-    sys_fcntl, sys_fstatfs, sys_getrandom, sys_ioctl, sys_lseek, sys_open, sys_pipe2, sys_pread64,
-    sys_preadv, sys_preadv2, sys_pwrite64, sys_pwritev, sys_pwritev2, sys_read, sys_readv,
-    sys_ftruncate, sys_statfs, sys_statx, sys_unlink, sys_write, sys_writev,
+    sys_fcntl, sys_fstatfs, sys_ftruncate, sys_getrandom, sys_ioctl, sys_lseek, sys_open,
+    sys_pipe2, sys_pread64, sys_preadv, sys_preadv2, sys_pwrite64, sys_pwritev, sys_pwritev2,
+    sys_read, sys_readv, sys_statfs, sys_statx, sys_unlink, sys_write, sys_writev,
 };
 
 // RWF flags for preadv2/pwritev2

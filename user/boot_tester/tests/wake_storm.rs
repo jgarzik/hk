@@ -63,7 +63,14 @@ fn reap_all(pids: &[i64], ms: i64) -> usize {
 
 fn test_futex_storm() {
     let mut t = T::new(b"WAKE_STORM_FUTEX");
-    let map = sys_mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    let map = sys_mmap(
+        0,
+        4096,
+        PROT_READ | PROT_WRITE,
+        MAP_SHARED | MAP_ANONYMOUS,
+        -1,
+        0,
+    );
     if !t.ok(b"mmap", map > 0, map) {
         return t.done();
     }
@@ -79,7 +86,14 @@ fn test_futex_storm() {
                 if v >= ROUNDS {
                     sys_exit(0);
                 }
-                sys_futex(word, FUTEX_WAIT, v, core::ptr::null(), core::ptr::null_mut(), 0);
+                sys_futex(
+                    word,
+                    FUTEX_WAIT,
+                    v,
+                    core::ptr::null(),
+                    core::ptr::null_mut(),
+                    0,
+                );
             }
         }
         *p = pid;
@@ -87,7 +101,14 @@ fn test_futex_storm() {
     for r in 1..=ROUNDS {
         // SAFETY: as above
         unsafe { core::ptr::write_volatile(word, r) };
-        sys_futex(word, FUTEX_WAKE, i32::MAX as u32, core::ptr::null(), core::ptr::null_mut(), 0);
+        sys_futex(
+            word,
+            FUTEX_WAKE,
+            i32::MAX as u32,
+            core::ptr::null(),
+            core::ptr::null_mut(),
+            0,
+        );
     }
     let ok = reap_all(&pids, 20_000);
     t.eq(b"waiters done", ok as i64, WAITERS as i64);

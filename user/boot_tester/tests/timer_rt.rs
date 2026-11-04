@@ -17,10 +17,10 @@
 
 use super::sk::T;
 use hk_syscall::{
-    CLOCK_MONOTONIC, CLOCK_REALTIME, ITimerSpec, PollFd, SigEvent, TFD_NONBLOCK,
-    TFD_TIMER_ABSTIME, TFD_TIMER_CANCEL_ON_SET, TIMER_ABSTIME, Timespec, sigev_notify,
-    sys_clock_gettime, sys_clock_settime, sys_close, sys_nanosleep, sys_ppoll, sys_read,
-    sys_timer_create, sys_timer_delete, sys_timer_gettime, sys_timer_settime, sys_timerfd_create,
+    CLOCK_MONOTONIC, CLOCK_REALTIME, ITimerSpec, PollFd, SigEvent, TFD_NONBLOCK, TFD_TIMER_ABSTIME,
+    TFD_TIMER_CANCEL_ON_SET, TIMER_ABSTIME, Timespec, sigev_notify, sys_clock_gettime,
+    sys_clock_settime, sys_close, sys_nanosleep, sys_ppoll, sys_read, sys_timer_create,
+    sys_timer_delete, sys_timer_gettime, sys_timer_settime, sys_timerfd_create,
     sys_timerfd_settime,
 };
 
@@ -87,7 +87,11 @@ fn test_timerfd_cancel_on_set() {
     let fd = sys_timerfd_create(CLOCK_REALTIME, TFD_NONBLOCK);
     let s = spec(clock_ns(CLOCK_REALTIME) + 60_000_000_000, 0);
     let flags = TFD_TIMER_ABSTIME | TFD_TIMER_CANCEL_ON_SET;
-    t.eq(b"settime", sys_timerfd_settime(fd as i32, flags, &s, core::ptr::null_mut()), 0);
+    t.eq(
+        b"settime",
+        sys_timerfd_settime(fd as i32, flags, &s, core::ptr::null_mut()),
+        0,
+    );
     t.eq(b"read before", tfd_read(fd), EAGAIN);
     // Set the clock to (about) now: the offset changes
     let now = ts(clock_ns(CLOCK_REALTIME) + 1_000_000);
@@ -110,7 +114,11 @@ fn test_timerfd_periodic_count() {
     let fd = sys_timerfd_create(CLOCK_MONOTONIC, 0);
     let s = spec(10_000_000, 10_000_000);
     let start = clock_ns(CLOCK_MONOTONIC);
-    t.eq(b"settime", sys_timerfd_settime(fd as i32, 0, &s, core::ptr::null_mut()), 0);
+    t.eq(
+        b"settime",
+        sys_timerfd_settime(fd as i32, 0, &s, core::ptr::null_mut()),
+        0,
+    );
     sleep_ns(200_000_000);
     let n = tfd_read(fd);
     let want = (clock_ns(CLOCK_MONOTONIC) - start) / 10_000_000;
@@ -126,9 +134,17 @@ fn test_posix_timer_abstime_rt() {
         ..SigEvent::default()
     };
     let mut id = -1i32;
-    t.eq(b"create", sys_timer_create(CLOCK_REALTIME, &sev, &mut id), 0);
+    t.eq(
+        b"create",
+        sys_timer_create(CLOCK_REALTIME, &sev, &mut id),
+        0,
+    );
     let s = spec(clock_ns(CLOCK_REALTIME) + 100_000_000, 0);
-    t.eq(b"settime", sys_timer_settime(id, TIMER_ABSTIME, &s, core::ptr::null_mut()), 0);
+    t.eq(
+        b"settime",
+        sys_timer_settime(id, TIMER_ABSTIME, &s, core::ptr::null_mut()),
+        0,
+    );
     let mut cur = spec(0, 0);
     sys_timer_gettime(id, &mut cur);
     let left = cur.it_value.tv_sec * 1_000_000_000 + cur.it_value.tv_nsec;
@@ -145,14 +161,26 @@ fn test_timer_tiny_period() {
     let mut t = T::new(b"TIMER_TINY_PERIOD");
     let fd = sys_timerfd_create(CLOCK_MONOTONIC, 0);
     let s = spec(1, 1);
-    t.eq(b"timerfd settime", sys_timerfd_settime(fd as i32, 0, &s, core::ptr::null_mut()), 0);
+    t.eq(
+        b"timerfd settime",
+        sys_timerfd_settime(fd as i32, 0, &s, core::ptr::null_mut()),
+        0,
+    );
     let sev = SigEvent {
         sigev_notify: sigev_notify::SIGEV_NONE,
         ..SigEvent::default()
     };
     let mut id = -1i32;
-    t.eq(b"timer_create", sys_timer_create(CLOCK_MONOTONIC, &sev, &mut id), 0);
-    t.eq(b"timer settime", sys_timer_settime(id, 0, &s, core::ptr::null_mut()), 0);
+    t.eq(
+        b"timer_create",
+        sys_timer_create(CLOCK_MONOTONIC, &sev, &mut id),
+        0,
+    );
+    t.eq(
+        b"timer settime",
+        sys_timer_settime(id, 0, &s, core::ptr::null_mut()),
+        0,
+    );
     // Every CPU's tasks still run: a short sleep is not held up
     let start = clock_ns(CLOCK_MONOTONIC);
     sleep_ns(20_000_000);

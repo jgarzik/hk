@@ -4,7 +4,12 @@
 //! mounts are ramfs on both kernels.
 
 use super::helpers::{print, print_num, println};
-use hk_syscall::{CLONE_NEWNS, O_CREAT, O_RDONLY, O_RDWR, O_WRONLY, Stat, sys_chdir, sys_chroot, sys_close, sys_exit, sys_faccessat, sys_fork, sys_getcwd, sys_link, sys_mkdir, sys_mount, sys_open, sys_pipe2, sys_pivot_root, sys_read, sys_readlink, sys_rename, sys_rmdir, sys_stat, sys_umount2, sys_unlink, sys_unshare, sys_wait4, sys_write};
+use hk_syscall::{
+    CLONE_NEWNS, O_CREAT, O_RDONLY, O_RDWR, O_WRONLY, Stat, sys_chdir, sys_chroot, sys_close,
+    sys_exit, sys_faccessat, sys_fork, sys_getcwd, sys_link, sys_mkdir, sys_mount, sys_open,
+    sys_pipe2, sys_pivot_root, sys_read, sys_readlink, sys_rename, sys_rmdir, sys_stat,
+    sys_umount2, sys_unlink, sys_unshare, sys_wait4, sys_write,
+};
 
 const ENOENT: i64 = -2;
 const EBUSY: i64 = -16;
@@ -64,7 +69,13 @@ fn report(name: &[u8], r: R) {
 }
 
 fn ramfs(target: &[u8]) -> i64 {
-    sys_mount(b"none\0".as_ptr(), target.as_ptr(), b"ramfs\0".as_ptr(), 0, 0)
+    sys_mount(
+        b"none\0".as_ptr(),
+        target.as_ptr(),
+        b"ramfs\0".as_ptr(),
+        0,
+        0,
+    )
 }
 
 /// st_dev of `p`, or the errno
@@ -118,7 +129,11 @@ fn nested_ops(mn: &[u8]) -> R {
     check(b"mount sub", ramfs(b"/tmp/mn/sub\0") == 0, -1)?;
     let d3 = dev(b"/tmp/mn/sub\0").map_err(|e| (&b"stat sub"[..], e))?;
     check(b"dev sub", d3 != d2, d3 as i64)?;
-    check(b"umount sub", sys_umount2(b"/tmp/mn/sub\0".as_ptr(), 0) == 0, -1)?;
+    check(
+        b"umount sub",
+        sys_umount2(b"/tmp/mn/sub\0".as_ptr(), 0) == 0,
+        -1,
+    )?;
     check(b"sub uncovered", dev(b"/tmp/mn/sub\0") == Ok(d2), -1)?;
     sys_rmdir(b"/tmp/mn/sub\0".as_ptr());
     // Unmounting the top one uncovers the first, with its file
@@ -175,7 +190,12 @@ fn pinned_trap() -> R {
     }
     let r = pinned_trap_ops();
     sys_chdir(b"/\0".as_ptr());
-    for p in [&b"/tmp/t/c/b/z\0"[..], b"/tmp/t/c/b\0", b"/tmp/t/c\0", b"/tmp/t/a/b\0"] {
+    for p in [
+        &b"/tmp/t/c/b/z\0"[..],
+        b"/tmp/t/c/b\0",
+        b"/tmp/t/c\0",
+        b"/tmp/t/a/b\0",
+    ] {
         sys_rmdir(p.as_ptr());
     }
     sys_rmdir(b"/tmp/t/a\0".as_ptr());
@@ -193,7 +213,11 @@ fn pinned_trap_ops() -> R {
     let mut buf = [0u8; 64];
     let n = sys_getcwd(buf.as_mut_ptr(), buf.len());
     let want = b"/tmp/t/c/b\0";
-    check(b"getcwd", n == want.len() as i64 && buf[..want.len()] == *want, n)
+    check(
+        b"getcwd",
+        n == want.len() as i64 && buf[..want.len()] == *want,
+        n,
+    )
 }
 
 /// A mount below a renamed directory stays reachable at the new path
@@ -341,15 +365,29 @@ fn exdev_same_sb() -> R {
     let (a, b) = (b"/tmp/x1\0", b"/tmp/x2\0");
     sys_mkdir(a.as_ptr(), 0o755);
     sys_mkdir(b.as_ptr(), 0o755);
-    let dt = |t: &[u8]| sys_mount(b"devtmpfs\0".as_ptr(), t.as_ptr(), b"devtmpfs\0".as_ptr(), 0, 0);
+    let dt = |t: &[u8]| {
+        sys_mount(
+            b"devtmpfs\0".as_ptr(),
+            t.as_ptr(),
+            b"devtmpfs\0".as_ptr(),
+            0,
+            0,
+        )
+    };
     let r = (|| {
         check(b"mount 1", dt(a) == 0, -1)?;
         check(b"mount 2", dt(b) == 0, -1)?;
         let r = sys_link(b"/tmp/x1/null\0".as_ptr(), b"/tmp/x2/hk_exdev\0".as_ptr());
         check(b"link", r == EXDEV, r)?;
-        let r = sys_rename(b"/tmp/x1/hk_none\0".as_ptr(), b"/tmp/x2/hk_none2\0".as_ptr());
+        let r = sys_rename(
+            b"/tmp/x1/hk_none\0".as_ptr(),
+            b"/tmp/x2/hk_none2\0".as_ptr(),
+        );
         check(b"rename", r == EXDEV, r)?;
-        let r = sys_rename(b"/tmp/x1/hk_none\0".as_ptr(), b"/tmp/x1/hk_none2\0".as_ptr());
+        let r = sys_rename(
+            b"/tmp/x1/hk_none\0".as_ptr(),
+            b"/tmp/x1/hk_none2\0".as_ptr(),
+        );
         check(b"same mount", r == ENOENT, r)
     })();
     sys_umount2(a.as_ptr(), 0);
@@ -360,7 +398,13 @@ fn exdev_same_sb() -> R {
 }
 
 fn bind(src: &[u8], dst: &[u8], extra: u64) -> i64 {
-    sys_mount(src.as_ptr(), dst.as_ptr(), core::ptr::null(), MS_BIND | extra, 0)
+    sys_mount(
+        src.as_ptr(),
+        dst.as_ptr(),
+        core::ptr::null(),
+        MS_BIND | extra,
+        0,
+    )
 }
 
 /// A bind mount shows the source directory (or file) at the target:
@@ -388,13 +432,22 @@ fn bind_view() -> R {
             .find(|l| l.split(|&c| c == b' ').nth(4) == Some(b"/tmp/bt"))
             .is_some_and(|l| l.split(|&c| c == b' ').nth(3) == Some(b"/tmp/bs/sub"));
         check(b"mountinfo root", root_ok, n as i64)?;
-        check(b"file on file", bind(b"/tmp/bfile\0", b"/tmp/btgt\0", 0) == 0, -1)?;
+        check(
+            b"file on file",
+            bind(b"/tmp/bfile\0", b"/tmp/btgt\0", 0) == 0,
+            -1,
+        )?;
         let r = bind(b"/tmp/bs\0", b"/tmp/bfile\0", 0);
         check(b"dir on file", r == ENOTDIR, r)
     })();
     sys_umount2(b"/tmp/btgt\0".as_ptr(), 0);
     sys_umount2(b"/tmp/bt\0".as_ptr(), 0);
-    for p in [&b"/tmp/bs/sub/f\0"[..], b"/tmp/bs/sub/g\0", b"/tmp/bfile\0", b"/tmp/btgt\0"] {
+    for p in [
+        &b"/tmp/bs/sub/f\0"[..],
+        b"/tmp/bs/sub/g\0",
+        b"/tmp/bfile\0",
+        b"/tmp/btgt\0",
+    ] {
         sys_unlink(p.as_ptr());
     }
     for p in [&b"/tmp/bs/sub\0"[..], b"/tmp/bs\0", b"/tmp/bt\0"] {
@@ -405,15 +458,28 @@ fn bind_view() -> R {
 
 /// MS_BIND copies one mount; MS_BIND|MS_REC the mounts below it too
 fn rbind() -> R {
-    for p in [&b"/tmp/rb_s\0"[..], b"/tmp/rb_s/m\0", b"/tmp/rb_t\0", b"/tmp/rb_u\0"] {
+    for p in [
+        &b"/tmp/rb_s\0"[..],
+        b"/tmp/rb_s/m\0",
+        b"/tmp/rb_t\0",
+        b"/tmp/rb_u\0",
+    ] {
         sys_mkdir(p.as_ptr(), 0o755);
     }
     let r = (|| {
         check(b"mount", ramfs(b"/tmp/rb_s/m\0") == 0, -1)?;
         check(b"touch", touch(b"/tmp/rb_s/m/x\0") >= 0, -1)?;
         check(b"bind", bind(b"/tmp/rb_s\0", b"/tmp/rb_t\0", 0) == 0, -1)?;
-        check(b"bind: not below", dev(b"/tmp/rb_t/m/x\0") == Err(ENOENT), -1)?;
-        check(b"rbind", bind(b"/tmp/rb_s\0", b"/tmp/rb_u\0", MS_REC) == 0, -1)?;
+        check(
+            b"bind: not below",
+            dev(b"/tmp/rb_t/m/x\0") == Err(ENOENT),
+            -1,
+        )?;
+        check(
+            b"rbind",
+            bind(b"/tmp/rb_s\0", b"/tmp/rb_u\0", MS_REC) == 0,
+            -1,
+        )?;
         check(b"rbind: below", dev(b"/tmp/rb_u/m/x\0").is_ok(), -1)
     })();
     for p in [&b"/tmp/rb_u/m\0"[..], b"/tmp/rb_u\0", b"/tmp/rb_t\0"] {
@@ -421,7 +487,12 @@ fn rbind() -> R {
     }
     sys_unlink(b"/tmp/rb_s/m/x\0".as_ptr());
     sys_umount2(b"/tmp/rb_s/m\0".as_ptr(), 0);
-    for p in [&b"/tmp/rb_s/m\0"[..], b"/tmp/rb_s\0", b"/tmp/rb_t\0", b"/tmp/rb_u\0"] {
+    for p in [
+        &b"/tmp/rb_s/m\0"[..],
+        b"/tmp/rb_s\0",
+        b"/tmp/rb_t\0",
+        b"/tmp/rb_u\0",
+    ] {
         sys_rmdir(p.as_ptr());
     }
     r
@@ -466,23 +537,43 @@ fn bind_ro() -> R {
 /// An unbindable mount cannot be bound (EINVAL) and is left out of an
 /// rbind of a tree holding it
 fn bind_unbindable() -> R {
-    for p in [&b"/tmp/ubp\0"[..], b"/tmp/ubp/u\0", b"/tmp/ubq\0", b"/tmp/ub2\0"] {
+    for p in [
+        &b"/tmp/ubp\0"[..],
+        b"/tmp/ubp/u\0",
+        b"/tmp/ubq\0",
+        b"/tmp/ub2\0",
+    ] {
         sys_mkdir(p.as_ptr(), 0o755);
     }
     let r = (|| {
         check(b"mount", ramfs(b"/tmp/ubp/u\0") == 0, -1)?;
-        let r = sys_mount(core::ptr::null(), b"/tmp/ubp/u\0".as_ptr(), core::ptr::null(), MS_UNBINDABLE, 0);
+        let r = sys_mount(
+            core::ptr::null(),
+            b"/tmp/ubp/u\0".as_ptr(),
+            core::ptr::null(),
+            MS_UNBINDABLE,
+            0,
+        );
         check(b"make unbindable", r == 0, r)?;
         let r = bind(b"/tmp/ubp/u\0", b"/tmp/ub2\0", 0);
         check(b"bind it", r == EINVAL, r)?;
-        check(b"rbind parent", bind(b"/tmp/ubp\0", b"/tmp/ubq\0", MS_REC) == 0, -1)?;
+        check(
+            b"rbind parent",
+            bind(b"/tmp/ubp\0", b"/tmp/ubq\0", MS_REC) == 0,
+            -1,
+        )?;
         let top = dev(b"/tmp/ubq\0").map_err(|e| (&b"stat"[..], e))?;
         check(b"left out", dev(b"/tmp/ubq/u\0") == Ok(top), -1)
     })();
     sys_umount2(b"/tmp/ubq\0".as_ptr(), 0);
     sys_umount2(b"/tmp/ub2\0".as_ptr(), 0);
     sys_umount2(b"/tmp/ubp/u\0".as_ptr(), 0);
-    for p in [&b"/tmp/ubp/u\0"[..], b"/tmp/ubp\0", b"/tmp/ubq\0", b"/tmp/ub2\0"] {
+    for p in [
+        &b"/tmp/ubp/u\0"[..],
+        b"/tmp/ubp\0",
+        b"/tmp/ubq\0",
+        b"/tmp/ub2\0",
+    ] {
         sys_rmdir(p.as_ptr());
     }
     r
@@ -616,7 +707,13 @@ fn ramfs_mode() -> R {
     let d = b"/tmp/rm\0";
     sys_mkdir(d.as_ptr(), 0o755);
     let opts = b"mode=0710,whatever=1\0";
-    let r = sys_mount(b"none\0".as_ptr(), d.as_ptr(), b"ramfs\0".as_ptr(), 0, opts.as_ptr() as u64);
+    let r = sys_mount(
+        b"none\0".as_ptr(),
+        d.as_ptr(),
+        b"ramfs\0".as_ptr(),
+        0,
+        opts.as_ptr() as u64,
+    );
     // SAFETY: Stat is plain integers
     let mut st: Stat = unsafe { core::mem::zeroed() };
     let s = sys_stat(d.as_ptr(), &mut st);

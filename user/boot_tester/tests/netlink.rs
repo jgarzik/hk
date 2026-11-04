@@ -1255,7 +1255,13 @@ fn test_passcred() {
     };
     let one: i32 = 1;
     let on = |fd: i32| {
-        sys_setsockopt(fd, SOL_SOCKET, SO_PASSCRED, &one as *const i32 as *const u8, 4)
+        sys_setsockopt(
+            fd,
+            SOL_SOCKET,
+            SO_PASSCRED,
+            &one as *const i32 as *const u8,
+            4,
+        )
     };
     if on(a.fd) != 0 || on(b.fd) != 0 {
         return fail(N, b"setsockopt", 0);

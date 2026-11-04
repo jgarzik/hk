@@ -256,7 +256,11 @@ fn getlk(path: &[u8]) -> (i16, i32) {
     };
     let r = sys_fcntl(fd as i32, F_GETLK, &mut fl as *mut Flock as u64);
     sys_close(fd as u64);
-    if r != 0 { (-1, 0) } else { (fl.l_type, fl.l_pid) }
+    if r != 0 {
+        (-1, 0)
+    } else {
+        (fl.l_type, fl.l_pid)
+    }
 }
 
 /// Take a write lock over the whole file through `fd`
@@ -351,13 +355,19 @@ fn test_lock_close_any() {
 }
 
 fn now_ms() -> i64 {
-    let mut ts = hk_syscall::Timespec { tv_sec: 0, tv_nsec: 0 };
+    let mut ts = hk_syscall::Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
     hk_syscall::sys_clock_gettime(1, &mut ts);
     ts.tv_sec * 1000 + ts.tv_nsec / 1_000_000
 }
 
 fn sleep_ms(ms: i64) {
-    let ts = hk_syscall::Timespec { tv_sec: 0, tv_nsec: ms * 1_000_000 };
+    let ts = hk_syscall::Timespec {
+        tv_sec: 0,
+        tv_nsec: ms * 1_000_000,
+    };
     hk_syscall::sys_nanosleep(&ts, core::ptr::null_mut());
 }
 

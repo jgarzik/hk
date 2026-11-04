@@ -17,10 +17,10 @@
 
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
-    O_CREAT, O_RDWR, O_WRONLY, Stat, Timespec, UTIME_NOW, UTIME_OMIT, sys_chmod, sys_chown,
-    sys_chdir, sys_chroot, sys_close, sys_exit, sys_fchmod, sys_fchmodat2, sys_fchown, sys_fork, sys_lchown,
-    sys_getcwd, sys_lstat, sys_mkdir, sys_open, sys_stat, sys_symlink, sys_umask, sys_unlink, sys_utimensat,
-    sys_wait4,
+    O_CREAT, O_RDWR, O_WRONLY, Stat, Timespec, UTIME_NOW, UTIME_OMIT, sys_chdir, sys_chmod,
+    sys_chown, sys_chroot, sys_close, sys_exit, sys_fchmod, sys_fchmodat2, sys_fchown, sys_fork,
+    sys_getcwd, sys_lchown, sys_lstat, sys_mkdir, sys_open, sys_stat, sys_symlink, sys_umask,
+    sys_unlink, sys_utimensat, sys_wait4,
 };
 
 /// Run all permission tests

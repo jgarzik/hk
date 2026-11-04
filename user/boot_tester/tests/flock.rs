@@ -475,7 +475,11 @@ fn test_flock_release_exit() {
     let pid = sys_fork();
     if pid == 0 {
         let fd = sys_open(path.as_ptr(), O_RDWR | O_CREAT, 0o644);
-        sys_exit(if fd >= 0 && sys_flock(fd as i32, LOCK_EX) == 0 { 0 } else { 1 });
+        sys_exit(if fd >= 0 && sys_flock(fd as i32, LOCK_EX) == 0 {
+            0
+        } else {
+            1
+        });
     }
     let mut st = 0i32;
     sys_wait4(pid, &mut st, 0, 0);
