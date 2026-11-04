@@ -16,7 +16,7 @@ use hk_syscall::{
     sys_getpid, sys_reboot,
 };
 use tests::helpers::{
-    dev_setup, fail_count, host_mode, fs_setup, init_host_mode, loopback_up, print, print_num,
+    dev_setup, fail_count, fs_setup, host_mode, init_host_mode, loopback_up, print, print_num,
     println,
 };
 

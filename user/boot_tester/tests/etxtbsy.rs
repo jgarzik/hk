@@ -41,7 +41,11 @@ fn open_exe() {
     if r >= 0 {
         sys_close(r as u64);
     }
-    verdict(b"ETXTBSY_OPEN", w == ETXTBSY && t == ETXTBSY && r >= 0, [w, t, r, 0]);
+    verdict(
+        b"ETXTBSY_OPEN",
+        w == ETXTBSY && t == ETXTBSY && r >= 0,
+        [w, t, r, 0],
+    );
     let tr = sys_truncate(exe.as_ptr(), 0);
     verdict(b"ETXTBSY_TRUNC", tr == ETXTBSY, [tr, 0, 0, 0]);
 }
@@ -75,5 +79,9 @@ fn exec_writer() {
     sys_close(dst as u64);
     sys_unlink(path.as_ptr());
     let code = (st >> 8) & 0xff;
-    verdict(b"ETXTBSY_EXEC", src >= 0 && off > 0 && code == 42, [src, off, code as i64, 0]);
+    verdict(
+        b"ETXTBSY_EXEC",
+        src >= 0 && off > 0 && code == 42,
+        [src, off, code as i64, 0],
+    );
 }

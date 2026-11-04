@@ -9,8 +9,8 @@
 use super::fork_mm::spawn_thread;
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
-    Timespec, sys_close, sys_execve, sys_exit, sys_exit_group, sys_fork, sys_kill,
-    sys_nanosleep, sys_pipe2, sys_read, sys_tgkill, sys_wait4, sys_write,
+    Timespec, sys_close, sys_execve, sys_exit, sys_exit_group, sys_fork, sys_kill, sys_nanosleep,
+    sys_pipe2, sys_read, sys_tgkill, sys_wait4, sys_write,
 };
 
 const SIGKILL: u32 = 9;
@@ -97,7 +97,10 @@ fn pipes() -> Pipes {
 
 /// In the child: a reader and a sleeper thread, their tids sent up
 fn spawn_blocked(p: &Pipes) {
-    send_tids(p, [start(0, reader, p.block[0] as u64), start(1, sleeper, 0)]);
+    send_tids(
+        p,
+        [start(0, reader, p.block[0] as u64), start(1, sleeper, 0)],
+    );
     // Let them block
     sleep_ms(50);
 }

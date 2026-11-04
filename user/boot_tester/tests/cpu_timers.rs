@@ -150,7 +150,11 @@ fn one_shot(name: &[u8], clock: i32) {
     let at = clock_ms(clock) - start;
     sys_timer_delete(id as i32);
     // Fired, not before its 100 ms (and within the 2 s bound)
-    report(name, HITS.load(Ordering::Relaxed) >= 1 && at >= 100 && used < 2000, at);
+    report(
+        name,
+        HITS.load(Ordering::Relaxed) >= 1 && at >= 100 && used < 2000,
+        at,
+    );
 }
 
 fn periodic() {

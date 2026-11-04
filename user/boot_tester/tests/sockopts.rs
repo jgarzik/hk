@@ -9,6 +9,7 @@ use hk_syscall::{
     sys_exit, sys_fork, sys_getsockopt, sys_listen, sys_setresuid, sys_setsockopt, sys_wait4,
 };
 
+use super::helpers::linux_at_least;
 use super::sk::*;
 
 pub fn run_tests() {
@@ -102,9 +103,15 @@ fn test_lengths() {
 }
 
 /// SO_RCVBUF/SO_SNDBUF are doubled, floored and capped at the sysctl
-/// maximum (default 212992); *FORCE needs CAP_NET_ADMIN
+/// maximum (default 4 MiB, 212992 before Linux 6.18); *FORCE needs
+/// CAP_NET_ADMIN
 fn test_bufs() {
     let mut t = T::new(b"SOCKOPT_BUFS");
+    let cap = 2 * if linux_at_least(6, 18) {
+        4 << 20
+    } else {
+        212992
+    };
     let fd = udp();
     setint(fd, SOL_SOCKET, SO_RCVBUF, 4096);
     t.eq(
@@ -128,13 +135,13 @@ fn test_bufs() {
     t.eq(
         b"rcvbuf cap",
         getint(fd, SOL_SOCKET, SO_RCVBUF).1 as i64,
-        425984,
+        cap,
     );
     setint(fd, SOL_SOCKET, SO_RCVBUF, -1);
     t.eq(
         b"rcvbuf negative",
         getint(fd, SOL_SOCKET, SO_RCVBUF).1 as i64,
-        425984,
+        cap,
     );
     t.eq(
         b"force as root",

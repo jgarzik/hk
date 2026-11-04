@@ -47,7 +47,11 @@ fn in_child(name: &[u8], f: fn() -> u64) {
     }
     let mut st = 0i32;
     sys_wait4(pid, &mut st, 0, 0);
-    let step = if st & 0x7f == 0 { (st >> 8) & 0xff } else { 100 };
+    let step = if st & 0x7f == 0 {
+        (st >> 8) & 0xff
+    } else {
+        100
+    };
     report(name, step as i64);
 }
 
@@ -155,5 +159,9 @@ fn run(f: fn() -> u64) -> i64 {
     }
     let mut st = 0i32;
     sys_wait4(pid, &mut st, 0, 0);
-    if st & 0x7f == 0 { ((st >> 8) & 0xff) as i64 } else { 100 }
+    if st & 0x7f == 0 {
+        ((st >> 8) & 0xff) as i64
+    } else {
+        100
+    }
 }

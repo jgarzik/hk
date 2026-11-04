@@ -46,6 +46,10 @@ use crate::util::error::KernelError;
 
 use super::blk_mq::BlkMq;
 
+/// Largest soft block size (Linux BLK_MAX_BLOCK_SIZE: 64K since 6.15
+/// with CONFIG_TRANSPARENT_HUGEPAGE); the size is only reported
+const BLK_MAX_BLOCK_SIZE: i32 = 64 * 1024;
+
 /// Fixed block major numbers (Linux include/uapi/linux/major.h)
 pub mod major {
     use super::DevMajor;
@@ -499,10 +503,10 @@ impl BlockDevice {
     }
 
     /// BLKBSZSET (Linux set_blocksize): a power of two from the logical
-    /// block size to the page size
+    /// block size to BLK_MAX_BLOCK_SIZE
     pub fn set_block_size(&self, size: i32) -> Result<(), KernelError> {
         let lbs = self.logical_block_size() as i32;
-        if !(lbs..=PAGE as i32).contains(&size) || !(size as u32).is_power_of_two() {
+        if !(lbs..=BLK_MAX_BLOCK_SIZE).contains(&size) || !(size as u32).is_power_of_two() {
             return Err(KernelError::InvalidArgument);
         }
         self.bsize.store(size as u32, Ordering::Relaxed);

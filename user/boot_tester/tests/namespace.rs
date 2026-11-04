@@ -396,8 +396,10 @@ fn test_pivot_root_enotdir() {
 
 /// Test: pivot_root with valid directories that aren't mountpoints returns EINVAL
 fn test_pivot_root_einval() {
-    // /bin exists but isn't a mount point - should get EINVAL
-    let ret = sys_pivot_root(b"/bin\0".as_ptr(), b"/bin\0".as_ptr());
+    // /proc/sys is a directory but not a mount point: EINVAL. Not on
+    // the root's mount, which is EBUSY first when the initramfs has a
+    // parent (Linux 7.0+: rootfs mounted on nullfs, path_pivot_root)
+    let ret = sys_pivot_root(b"/proc/sys\0".as_ptr(), b"/proc/sys\0".as_ptr());
     if ret == -22 {
         // EINVAL (not a mountpoint)
         println(b"PIVOT_ROOT_EINVAL:OK");

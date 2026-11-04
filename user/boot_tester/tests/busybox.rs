@@ -114,7 +114,11 @@ fn child(prog: Prog, args: &[&[u8]], inp: i32, outw: i32) -> ! {
     for (i, a) in args.iter().take(14).enumerate() {
         argv[i + 1] = a.as_ptr();
     }
-    let envp: [*const u8; 3] = [prog.env_path.as_ptr(), ENVP_HOME.as_ptr(), core::ptr::null()];
+    let envp: [*const u8; 3] = [
+        prog.env_path.as_ptr(),
+        ENVP_HOME.as_ptr(),
+        core::ptr::null(),
+    ];
     let e = sys_execve(prog.path.as_ptr(), argv.as_ptr(), envp.as_ptr());
     print(EXEC_FAILED);
     print_num(e);

@@ -25,9 +25,10 @@ use crate::sync::waitqueue::WaitQueue;
 use crate::task::Cred;
 use crate::util::error::KernelError;
 
-/// Linux rmem_default / wmem_default and rmem_max / wmem_max
+/// Linux rmem_default / wmem_default
 pub const BUF_DEFAULT: u32 = 212_992;
-pub const BUF_MAX: u32 = 212_992;
+/// Linux rmem_max / wmem_max (4 MiB since 6.18)
+pub const BUF_MAX: u32 = 4 << 20;
 /// Linux SOCK_MIN_RCVBUF / SOCK_MIN_SNDBUF (2048 + sizeof(sk_buff), x2)
 pub const MIN_RCVBUF: u32 = 2304;
 pub const MIN_SNDBUF: u32 = 4608;

@@ -113,8 +113,16 @@ fn restrict() {
     }
     let mut st = 0i32;
     sys_wait4(pid, &mut st, 0, 0);
-    let step = if st & 0x7f == 0 { (st >> 8) & 0xff } else { 100 };
-    report(b"KMSG_RESTRICT", if step == 0 { b"" } else { b"step" }, step as i64);
+    let step = if st & 0x7f == 0 {
+        (st >> 8) & 0xff
+    } else {
+        100
+    };
+    report(
+        b"KMSG_RESTRICT",
+        if step == 0 { b"" } else { b"step" },
+        step as i64,
+    );
 }
 
 fn report(name: &[u8], why: &[u8], detail: i64) {

@@ -102,7 +102,7 @@
 - [x] mkdirat
 - [x] rmdir (x86-64 only, legacy; use unlinkat with AT_REMOVEDIR)
 - [x] link (x86-64 only, legacy; use linkat)
-- [x] linkat (AT_SYMLINK_FOLLOW; AT_EMPTY_PATH needs CAP_DAC_READ_SEARCH)
+- [x] linkat (AT_SYMLINK_FOLLOW; AT_EMPTY_PATH on a descriptor needs its opener's creds or CAP_DAC_READ_SEARCH, Linux 6.10+)
 - [x] unlink (x86-64 only, legacy; use unlinkat)
 - [x] unlinkat
 - [x] rename (x86-64 only, legacy; use renameat2)

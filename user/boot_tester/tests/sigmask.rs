@@ -14,10 +14,10 @@
 use super::helpers::{print, print_num, println};
 use super::signals::restorer_addr;
 use hk_syscall::{
-    EpollEvent, PollFd, SA_RESTORER, SA_SIGINFO, SIG_BLOCK, SIG_DFL, SIG_SETMASK, SIGUSR1,
-    SIGUSR2, Timespec, sys_close, sys_epoll_create1, sys_epoll_pwait, sys_getpid, sys_gettid,
-    sys_pipe, sys_ppoll, sys_rt_sigaction, sys_rt_sigpending, sys_rt_sigprocmask,
-    sys_rt_sigsuspend, sys_tgkill,
+    EpollEvent, PollFd, SA_RESTORER, SA_SIGINFO, SIG_BLOCK, SIG_DFL, SIG_SETMASK, SIGUSR1, SIGUSR2,
+    Timespec, sys_close, sys_epoll_create1, sys_epoll_pwait, sys_getpid, sys_gettid, sys_pipe,
+    sys_ppoll, sys_rt_sigaction, sys_rt_sigpending, sys_rt_sigprocmask, sys_rt_sigsuspend,
+    sys_tgkill,
 };
 
 const EINTR: i64 = -4;

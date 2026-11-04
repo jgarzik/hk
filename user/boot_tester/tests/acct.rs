@@ -13,8 +13,8 @@ use super::fork_mm::spawn_thread;
 use super::helpers::{print, print_num, println};
 use core::ptr;
 use hk_syscall::{
-    O_CREAT, O_RDONLY, O_TRUNC, O_WRONLY, Timespec, sys_acct, sys_close, sys_exit_group,
-    sys_fork, sys_getpid, sys_nanosleep, sys_open, sys_read, sys_unlink, sys_wait4,
+    O_CREAT, O_RDONLY, O_TRUNC, O_WRONLY, Timespec, sys_acct, sys_close, sys_exit_group, sys_fork,
+    sys_getpid, sys_nanosleep, sys_open, sys_read, sys_unlink, sys_wait4,
 };
 
 /// Run all acct tests

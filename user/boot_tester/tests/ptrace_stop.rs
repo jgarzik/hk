@@ -47,7 +47,11 @@ fn stop_sig(pid: i64) -> i32 {
     if sys_wait4(pid, &mut st, 0, 0) != pid {
         return -1000;
     }
-    if st & 0xff == 0x7f { (st >> 8) & 0xff } else { -st }
+    if st & 0xff == 0x7f {
+        (st >> 8) & 0xff
+    } else {
+        -st
+    }
 }
 
 fn test_syscall_stop() {
@@ -67,7 +71,11 @@ fn test_syscall_stop() {
     t.eq(b"exit stop", stop_sig(pid) as i64, SYSGOOD_TRAP as i64);
     // exit's entry stop, then it runs
     sys_ptrace(PTRACE_SYSCALL, pid, 0, 0);
-    t.eq(b"exit entry stop", stop_sig(pid) as i64, SYSGOOD_TRAP as i64);
+    t.eq(
+        b"exit entry stop",
+        stop_sig(pid) as i64,
+        SYSGOOD_TRAP as i64,
+    );
     sys_ptrace(PTRACE_CONT, pid, 0, 0);
     let mut st = 0i32;
     sys_wait4(pid, &mut st, 0, 0);
@@ -83,10 +91,18 @@ fn change_syscall(t: &mut T, pid: i64) -> i64 {
     const PTRACE_SETREGS: i64 = 13;
     const ORIG_RAX: usize = 15;
     let mut regs = [0u64; 27];
-    t.eq(b"getregs", sys_ptrace(PTRACE_GETREGS, pid, 0, regs.as_mut_ptr() as u64), 0);
+    t.eq(
+        b"getregs",
+        sys_ptrace(PTRACE_GETREGS, pid, 0, regs.as_mut_ptr() as u64),
+        0,
+    );
     t.eq(b"orig_rax", regs[ORIG_RAX] as i64, 110);
     regs[ORIG_RAX] = 39;
-    t.eq(b"setregs", sys_ptrace(PTRACE_SETREGS, pid, 0, regs.as_ptr() as u64), 0);
+    t.eq(
+        b"setregs",
+        sys_ptrace(PTRACE_SETREGS, pid, 0, regs.as_ptr() as u64),
+        0,
+    );
     7
 }
 
@@ -131,7 +147,12 @@ fn peek_tracer() -> ! {
         }
         stop_sig(pid);
         let mut word = 0u64;
-        let r = sys_ptrace(PTRACE_PEEKDATA, pid, &MAGIC as *const u64 as u64, &mut word as *mut u64 as u64);
+        let r = sys_ptrace(
+            PTRACE_PEEKDATA,
+            pid,
+            &MAGIC as *const u64 as u64,
+            &mut word as *mut u64 as u64,
+        );
         if dumpable == 1 && (r != 0 || word != MAGIC) {
             bad |= 1;
         }

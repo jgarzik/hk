@@ -50,8 +50,12 @@ static MNT_IDS: crate::sync::spin::Mutex<MntIds> = crate::sync::spin::Mutex::new
     free: alloc::collections::BTreeSet::new(),
 });
 
-/// The next never-reused mount id (Linux mnt_id_ctr, from 2^32)
-static MNT_ID_UNIQUE: AtomicU64 = AtomicU64::new(1 << 32);
+/// Never-reused mount ids start above this (Linux MNT_UNIQUE_ID_OFFSET,
+/// 2^31 since 6.11), clear of the reused 32-bit ones
+const MNT_UNIQUE_ID_OFFSET: u64 = 1 << 31;
+
+/// The next never-reused mount id (Linux mnt_id_ctr + 1)
+static MNT_ID_UNIQUE: AtomicU64 = AtomicU64::new(MNT_UNIQUE_ID_OFFSET + 1);
 
 fn mnt_alloc_id() -> u32 {
     let mut ids = MNT_IDS.lock();

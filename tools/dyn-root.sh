@@ -24,13 +24,17 @@ case $2 in
     *) echo "dyn-root: unsupported arch $2" >&2; exit 1 ;;
 esac
 
-PACKAGES="libc6 libtinfo6 bash coreutils"
+# Ubuntu 25.10 and later: coreutils is a meta package (uutils by
+# default); gnu-coreutils holds GNU's programs, as /usr/bin/gnu<prog>
+COREUTILS=coreutils
+apt-cache show gnu-coreutils > /dev/null 2>&1 && COREUTILS=gnu-coreutils
+PACKAGES="libc6 libtinfo6 bash $COREUTILS"
 # coreutils programs that need nothing but libc
 PROGRAMS="echo cat head tail seq wc tr env true false tac printf uname basename cut"
 
 CACHE=$TOP/target/glibc/$DEB_ARCH
 TREE=$CACHE/root
-if [ ! -f "$CACHE/.done" ]; then
+if [ "$(cat "$CACHE/.done" 2> /dev/null)" != "$PACKAGES" ]; then
     echo "Fetching glibc, bash, coreutils ($DEB_ARCH)..."
     . "$TOP/tools/fetch-deb.sh"
     rm -rf "$CACHE"
@@ -39,14 +43,16 @@ if [ ! -f "$CACHE/.done" ]; then
         fetch_deb "$p" "$DEB_ARCH" "$CACHE/$p.deb"
         dpkg-deb -x "$CACHE/$p.deb" "$TREE"
     done
-    touch "$CACHE/.done"
+    echo "$PACKAGES" > "$CACHE/.done"
 fi
 
 LIBDIR=$ROOT/usr/lib/$TRIPLET
 mkdir -p "$ROOT/usr/bin" "$LIBDIR"
 cp -L "$TREE/usr/bin/bash" "$ROOT/usr/bin/bash"
 for p in $PROGRAMS; do
-    cp -L "$TREE/usr/bin/$p" "$ROOT/usr/bin/$p"
+    src=$TREE/usr/bin/$p
+    [ -e "$src" ] || src=$TREE/usr/bin/gnu$p
+    cp -L "$src" "$ROOT/usr/bin/$p"
 done
 
 # The dynamic linker, at the path the programs ask for

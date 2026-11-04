@@ -176,6 +176,30 @@ pub fn host_mode() -> bool {
     HOST_MODE.load(Ordering::Relaxed)
 }
 
+/// Whether the kernel has Linux `major.minor` semantics where Linux
+/// changed behavior: hk follows current Linux; a host kernel by its
+/// release ("7.0.0-42-generic"), so the reference matches CI's older
+/// Linux and a new one alike
+pub fn linux_at_least(major: u32, minor: u32) -> bool {
+    if !host_mode() {
+        return true;
+    }
+    // SAFETY: UtsName is plain bytes
+    let mut uts: UtsName = unsafe { core::mem::zeroed() };
+    if sys_uname(&mut uts) != 0 {
+        return true;
+    }
+    let mut v = [0u32; 2];
+    let mut parts = uts.release.split(|&c| c == b'.');
+    for n in v.iter_mut() {
+        let p = parts.next().unwrap_or(b"");
+        for &c in p.iter().take_while(|c| c.is_ascii_digit()) {
+            *n = *n * 10 + (c - b'0') as u32;
+        }
+    }
+    (v[0], v[1]) >= (major, minor)
+}
+
 /// Number of printed chunks containing "FAIL" in this process
 pub fn fail_count() -> u32 {
     FAIL_COUNT.load(Ordering::Relaxed)

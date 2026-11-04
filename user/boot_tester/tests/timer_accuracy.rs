@@ -135,19 +135,39 @@ fn test_select_remaining() {
         events: 1,
         revents: 0,
     }];
-    t.eq(b"ppoll ret", sys_ppoll(pfd.as_mut_ptr(), 1, &mut r, 0, 0), 1);
+    t.eq(
+        b"ppoll ret",
+        sys_ppoll(pfd.as_mut_ptr(), 1, &mut r, 0, 0),
+        1,
+    );
     let left = r.tv_sec * 1_000_000_000 + r.tv_nsec;
-    t.ok(b"ppoll left", (4_000_000_000..5_000_000_000).contains(&left), left);
+    t.ok(
+        b"ppoll left",
+        (4_000_000_000..5_000_000_000).contains(&left),
+        left,
+    );
     let mut set = FdSet::new();
     set.bits[p[0] as usize / 64] |= 1 << (p[0] % 64);
     let mut r = ts(5_000_000_000);
     let null = core::ptr::null_mut();
-    t.eq(b"pselect ret", sys_pselect6(p[0] + 1, &mut set, null, null, &mut r, 0), 1);
+    t.eq(
+        b"pselect ret",
+        sys_pselect6(p[0] + 1, &mut set, null, null, &mut r, 0),
+        1,
+    );
     let left = r.tv_sec * 1_000_000_000 + r.tv_nsec;
-    t.ok(b"pselect left", (4_000_000_000..5_000_000_000).contains(&left), left);
+    t.ok(
+        b"pselect left",
+        (4_000_000_000..5_000_000_000).contains(&left),
+        left,
+    );
     // Timed out: nothing left
     let mut r = ts(20_000_000);
-    t.eq(b"pselect timeout", sys_pselect6(0, null, null, null, &mut r, 0), 0);
+    t.eq(
+        b"pselect timeout",
+        sys_pselect6(0, null, null, null, &mut r, 0),
+        0,
+    );
     t.eq(b"pselect zero", r.tv_sec + r.tv_nsec, 0);
     #[cfg(target_arch = "x86_64")]
     {
@@ -157,7 +177,11 @@ fn test_select_remaining() {
         };
         let mut set = FdSet::new();
         set.bits[p[0] as usize / 64] |= 1 << (p[0] % 64);
-        t.eq(b"select ret", hk_syscall::sys_select(p[0] + 1, &mut set, null, null, &mut tv), 1);
+        t.eq(
+            b"select ret",
+            hk_syscall::sys_select(p[0] + 1, &mut set, null, null, &mut tv),
+            1,
+        );
         let left = tv.tv_sec * 1_000_000 + tv.tv_usec;
         t.ok(b"select left", (4_000_000..5_000_000).contains(&left), left);
     }
@@ -182,7 +206,12 @@ fn rt_sleeper(rel: i64, step: &dyn Fn() -> i64) -> i64 {
     let pid = sys_fork();
     if pid == 0 {
         let start = clock_ns(CLOCK_MONOTONIC);
-        let r = sys_clock_nanosleep(CLOCK_REALTIME, TIMER_ABSTIME, &deadline, core::ptr::null_mut());
+        let r = sys_clock_nanosleep(
+            CLOCK_REALTIME,
+            TIMER_ABSTIME,
+            &deadline,
+            core::ptr::null_mut(),
+        );
         let el = if r == 0 {
             (clock_ns(CLOCK_MONOTONIC) - start) / 1_000_000
         } else {

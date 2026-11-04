@@ -80,7 +80,11 @@ fn getcwd() {
     let n = sys_getcwd(buf.as_mut_ptr(), buf.len());
     let ok = n == 2 && &buf[..2] == b"/\0";
     let small = sys_getcwd(buf.as_mut_ptr(), 1);
-    report(b"GEN_GETCWD", ok && small == ERANGE, if ok { small } else { n });
+    report(
+        b"GEN_GETCWD",
+        ok && small == ERANGE,
+        if ok { small } else { n },
+    );
 }
 
 fn execveat() {

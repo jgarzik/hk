@@ -1,11 +1,12 @@
-//! linkat(2) flags (Linux 6.8 do_linkat / filename_linkat), on a fresh
+//! linkat(2) flags (Linux do_linkat / filename_linkat), on a fresh
 //! ramfs on both kernels: only AT_SYMLINK_FOLLOW and AT_EMPTY_PATH are
 //! valid (EINVAL before the paths are read); a final symlink is linked
 //! itself unless AT_SYMLINK_FOLLOW; AT_EMPTY_PATH links the descriptor's
-//! file, needs CAP_DAC_READ_SEARCH (ENOENT without it) and never brings
-//! back an unlinked file (ENOENT), even racing with unlinks
+//! file, needs the opener's creds or CAP_DAC_READ_SEARCH (ENOENT without;
+//! before 6.10 always the capability) and never brings back an unlinked
+//! file (ENOENT), even racing with unlinks
 
-use super::helpers::{print, print_num, println};
+use super::helpers::{linux_at_least, print, print_num, println};
 use hk_syscall::{
     _LINUX_CAPABILITY_VERSION_3, AT_FDCWD, CapUserData, CapUserHeader, O_CREAT, O_RDONLY, O_WRONLY,
     Stat, sys_capget, sys_capset, sys_close, sys_exit, sys_fork, sys_fstat, sys_linkat, sys_lstat,
@@ -149,10 +150,14 @@ fn drop_dac_read_search() -> bool {
     sys_capset(&h, d.as_ptr()) == 0
 }
 
-/// Without CAP_DAC_READ_SEARCH, AT_EMPTY_PATH is ENOENT, also with a
-/// non-empty path (Linux 6.8 do_linkat checks the flag, not the path)
+/// Without CAP_DAC_READ_SEARCH, AT_EMPTY_PATH on a descriptor opened
+/// with other creds is ENOENT. Since Linux 6.10 (path_init
+/// LOOKUP_LINKAT_EMPTY) a descriptor the caller opened with its current
+/// creds links, and a path not starting at the descriptor is an ordinary
+/// link; before, the flag alone was ENOENT
 fn empty_nocap() {
     let fd = sys_open(F.as_ptr(), O_RDONLY, 0) as i32;
+    let want = if linux_at_least(6, 10) { 0 } else { ENOENT };
     let pid = sys_fork();
     if pid == 0 {
         if !drop_dac_read_search() {
@@ -160,10 +165,17 @@ fn empty_nocap() {
         }
         let r = link(fd, b"\0", NAMES[3], EMPTY);
         let named = link(AT_FDCWD, F, NAMES[3], EMPTY);
+        sys_unlink(NAMES[3].as_ptr());
+        let own = sys_open(F.as_ptr(), O_RDONLY, 0) as i32;
+        let mine = link(own, b"\0", NAMES[3], EMPTY);
+        sys_close(own as u64);
+        sys_unlink(NAMES[3].as_ptr());
         sys_exit(if r != ENOENT {
             1
-        } else if named != ENOENT {
+        } else if named != want {
             3
+        } else if mine != want {
+            4
         } else {
             0
         });

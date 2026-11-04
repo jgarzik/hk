@@ -52,11 +52,7 @@ fn beyond_eof() {
     }
     let len = 16 * PAGE;
     let p = sys_mmap(0, len, PROT_READ, MAP_SHARED, fd as i32, 0);
-    let lock = if p >= 0 {
-        sys_mlock(p as u64, len)
-    } else {
-        p
-    };
+    let lock = if p >= 0 { sys_mlock(p as u64, len) } else { p };
     if p >= 0 {
         sys_munlock(p as u64, len);
         sys_munmap(p as u64, len);

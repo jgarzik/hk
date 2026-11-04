@@ -9,8 +9,8 @@
 
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
-    CLOCK_MONOTONIC, O_RDONLY, RLIMIT_NOFILE, RLimit, Timespec, sys_clock_gettime,
-    sys_close_range, sys_dup, sys_open, sys_setrlimit,
+    CLOCK_MONOTONIC, O_RDONLY, RLIMIT_NOFILE, RLimit, Timespec, sys_clock_gettime, sys_close_range,
+    sys_dup, sys_open, sys_setrlimit,
 };
 
 const LOW: i64 = 1000;

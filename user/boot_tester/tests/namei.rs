@@ -54,7 +54,11 @@ fn report(name: &[u8], r: R) {
 
 /// `got` must be `want`
 fn want(what: &'static [u8], got: i64, want: i64) -> R {
-    if got == want { Ok(()) } else { Err((what, got)) }
+    if got == want {
+        Ok(())
+    } else {
+        Err((what, got))
+    }
 }
 
 fn zst() -> Stat {
@@ -70,10 +74,22 @@ fn check_empty() -> R {
     want(b"mkdir", sys_mkdir(e, 0o755), ENOENT)?;
     want(b"open", sys_open(e, O_RDONLY, 0), ENOENT)?;
     want(b"unlink", sys_unlink(e), ENOENT)?;
-    want(b"symlink target", sys_symlink(e, b"/tmp/pe_l\0".as_ptr()), ENOENT)?;
+    want(
+        b"symlink target",
+        sys_symlink(e, b"/tmp/pe_l\0".as_ptr()),
+        ENOENT,
+    )?;
     let argv = [core::ptr::null::<u8>()];
-    want(b"execve", sys_execve(e, argv.as_ptr(), argv.as_ptr()), ENOENT)?;
-    want(b"fstatat empty cwd", sys_fstatat(AT_FDCWD, e, &mut st, AT_EMPTY_PATH), 0)?;
+    want(
+        b"execve",
+        sys_execve(e, argv.as_ptr(), argv.as_ptr()),
+        ENOENT,
+    )?;
+    want(
+        b"fstatat empty cwd",
+        sys_fstatat(AT_FDCWD, e, &mut st, AT_EMPTY_PATH),
+        0,
+    )?;
     // dirfd: EBADF, ENOTDIR for a file, unused for an absolute path,
     // any fd with AT_EMPTY_PATH
     let fd = sys_open(b"/tmp/pe_f\0".as_ptr(), O_CREAT | O_WRONLY, 0o644);
@@ -83,9 +99,21 @@ fn check_empty() -> R {
     let r = (|| {
         let x = b"x\0".as_ptr();
         want(b"bad dirfd", sys_fstatat(999, x, &mut st, 0), EBADF)?;
-        want(b"file dirfd", sys_fstatat(fd as i32, x, &mut st, 0), ENOTDIR)?;
-        want(b"absolute bad dirfd", sys_fstatat(999, b"/\0".as_ptr(), &mut st, 0), 0)?;
-        want(b"file empty path", sys_fstatat(fd as i32, e, &mut st, AT_EMPTY_PATH), 0)
+        want(
+            b"file dirfd",
+            sys_fstatat(fd as i32, x, &mut st, 0),
+            ENOTDIR,
+        )?;
+        want(
+            b"absolute bad dirfd",
+            sys_fstatat(999, b"/\0".as_ptr(), &mut st, 0),
+            0,
+        )?;
+        want(
+            b"file empty path",
+            sys_fstatat(fd as i32, e, &mut st, AT_EMPTY_PATH),
+            0,
+        )
     })();
     sys_close(fd as u64);
     sys_unlink(b"/tmp/pe_f\0".as_ptr());
@@ -98,15 +126,27 @@ fn check_toolong() -> R {
     p[4096] = 0;
     let mut st = zst();
     want(b"stat", sys_stat(p.as_ptr(), &mut st), ENAMETOOLONG)?;
-    want(b"open", sys_open(p.as_ptr(), O_CREAT | O_WRONLY, 0o644), ENAMETOOLONG)?;
+    want(
+        b"open",
+        sys_open(p.as_ptr(), O_CREAT | O_WRONLY, 0o644),
+        ENAMETOOLONG,
+    )?;
     want(b"mkdir", sys_mkdir(p.as_ptr(), 0o755), ENAMETOOLONG)?;
     want(b"unlink", sys_unlink(p.as_ptr()), ENAMETOOLONG)?;
-    want(b"rename", sys_rename(p.as_ptr(), b"/tmp/x\0".as_ptr()), ENAMETOOLONG)?;
+    want(
+        b"rename",
+        sys_rename(p.as_ptr(), b"/tmp/x\0".as_ptr()),
+        ENAMETOOLONG,
+    )?;
     want(b"chdir", sys_chdir(p.as_ptr()), ENAMETOOLONG)?;
     let mut c = [b'b'; 262];
     c[..5].copy_from_slice(b"/tmp/");
     c[261] = 0;
-    want(b"long name", sys_open(c.as_ptr(), O_CREAT | O_WRONLY, 0o644), ENAMETOOLONG)
+    want(
+        b"long name",
+        sys_open(c.as_ptr(), O_CREAT | O_WRONLY, 0o644),
+        ENAMETOOLONG,
+    )
 }
 
 fn trailing() -> R {
@@ -133,21 +173,45 @@ fn trailing_ops() -> R {
     let mut st = zst();
     want(b"stat file/", sys_stat(fs, &mut st), ENOTDIR)?;
     want(b"open file/", sys_open(fs, O_RDONLY, 0), ENOTDIR)?;
-    want(b"creat file/", sys_open(fs, O_CREAT | O_WRONLY, 0o644), EISDIR)?;
+    want(
+        b"creat file/",
+        sys_open(fs, O_CREAT | O_WRONLY, 0o644),
+        EISDIR,
+    )?;
     let new = b"/tmp/ts_n/\0".as_ptr();
-    want(b"creat new/", sys_open(new, O_CREAT | O_WRONLY, 0o644), EISDIR)?;
+    want(
+        b"creat new/",
+        sys_open(new, O_CREAT | O_WRONLY, 0o644),
+        EISDIR,
+    )?;
     want(b"mkdir new/", sys_mkdir(b"/tmp/ts_m/\0".as_ptr(), 0o755), 0)?;
     want(b"symlink new/", sys_symlink(b"x\0".as_ptr(), new), ENOENT)?;
     want(b"symlink file/", sys_symlink(b"x\0".as_ptr(), fs), EEXIST)?;
-    want(b"link to new/", sys_link(b"/tmp/ts_f\0".as_ptr(), new), ENOENT)?;
+    want(
+        b"link to new/",
+        sys_link(b"/tmp/ts_f\0".as_ptr(), new),
+        ENOENT,
+    )?;
     want(b"unlink file/", sys_unlink(fs), ENOTDIR)?;
     want(b"unlink dir/", sys_unlink(b"/tmp/ts_d/\0".as_ptr()), EISDIR)?;
     // lstat through a trailing slash follows the link to its directory
-    want(b"lstat link/", sys_lstat(b"/tmp/ts_l/\0".as_ptr(), &mut st), 0)?;
-    want(b"lstat link/ type", (st.st_mode & S_IFMT) as i64, S_IFDIR as i64)?;
+    want(
+        b"lstat link/",
+        sys_lstat(b"/tmp/ts_l/\0".as_ptr(), &mut st),
+        0,
+    )?;
+    want(
+        b"lstat link/ type",
+        (st.st_mode & S_IFMT) as i64,
+        S_IFDIR as i64,
+    )?;
     let g = b"/tmp/ts_g\0".as_ptr();
     want(b"rename file/", sys_rename(fs, g), ENOTDIR)?;
-    want(b"rename to new/", sys_rename(b"/tmp/ts_f\0".as_ptr(), b"/tmp/ts_g/\0".as_ptr()), ENOTDIR)?;
+    want(
+        b"rename to new/",
+        sys_rename(b"/tmp/ts_f\0".as_ptr(), b"/tmp/ts_g/\0".as_ptr()),
+        ENOTDIR,
+    )?;
     let (d, e) = (b"/tmp/ts_d/\0".as_ptr(), b"/tmp/ts_e/\0".as_ptr());
     want(b"rename dir/ dir/", sys_rename(d, e), 0)?;
     want(b"rename back", sys_rename(e, d), 0)
@@ -173,7 +237,11 @@ fn dots_ops() -> R {
     want(b"mkdir .", sys_mkdir(dot, 0o755), EEXIST)?;
     want(b"mkdir ..", sys_mkdir(dotdot, 0o755), EEXIST)?;
     want(b"mkdir /", sys_mkdir(root, 0o755), EEXIST)?;
-    want(b"mkdir missing/..", sys_mkdir(b"/tmp/dl_none/..\0".as_ptr(), 0o755), ENOENT)?;
+    want(
+        b"mkdir missing/..",
+        sys_mkdir(b"/tmp/dl_none/..\0".as_ptr(), 0o755),
+        ENOENT,
+    )?;
     want(b"rmdir .", sys_rmdir(dot), EINVAL)?;
     want(b"rmdir ..", sys_rmdir(dotdot), ENOTEMPTY)?;
     want(b"rmdir /", sys_rmdir(root), EBUSY)?;
@@ -182,7 +250,11 @@ fn dots_ops() -> R {
     want(b"symlink ..", sys_symlink(b"x\0".as_ptr(), dotdot), EEXIST)?;
     want(b"creat .", sys_open(dot, O_CREAT | O_WRONLY, 0o644), EISDIR)?;
     let f = b"/tmp/dl_f\0".as_ptr();
-    want(b"rename . src", sys_rename(dot, b"/tmp/dl/x\0".as_ptr()), EBUSY)?;
+    want(
+        b"rename . src",
+        sys_rename(dot, b"/tmp/dl/x\0".as_ptr()),
+        EBUSY,
+    )?;
     want(b"rename .. dst", sys_rename(f, dotdot), EBUSY)?;
     let r = sys_renameat2(AT_FDCWD, f, AT_FDCWD, dotdot, RENAME_NOREPLACE);
     want(b"rename .. noreplace", r, EEXIST)
@@ -206,8 +278,16 @@ fn negative() -> R {
         want(b"unlink", sys_unlink(p), 0)?;
         want(b"unlinked", sys_stat(p, &mut st), ENOENT)?;
         want(b"mkdir", sys_mkdir(p, 0o755), 0)?;
-        want(b"dir found", sys_stat(b"/tmp/nd_x/.\0".as_ptr(), &mut st), 0)?;
-        want(b"miss inside", sys_stat(b"/tmp/nd_x/y\0".as_ptr(), &mut st), ENOENT)?;
+        want(
+            b"dir found",
+            sys_stat(b"/tmp/nd_x/.\0".as_ptr(), &mut st),
+            0,
+        )?;
+        want(
+            b"miss inside",
+            sys_stat(b"/tmp/nd_x/y\0".as_ptr(), &mut st),
+            ENOENT,
+        )?;
         want(b"rmdir", sys_rmdir(p), 0)?;
         want(b"rmdir gone", sys_stat(p, &mut st), ENOENT)?;
         want(b"symlink", sys_symlink(b"tgt\0".as_ptr(), p), 0)?;
@@ -217,7 +297,11 @@ fn negative() -> R {
         sys_close(fd as u64);
         want(b"rename in", sys_rename(b"/tmp/nd_y\0".as_ptr(), p), 0)?;
         want(b"renamed found", sys_stat(p, &mut st), 0)?;
-        want(b"source gone", sys_stat(b"/tmp/nd_y\0".as_ptr(), &mut st), ENOENT)
+        want(
+            b"source gone",
+            sys_stat(b"/tmp/nd_y\0".as_ptr(), &mut st),
+            ENOENT,
+        )
     })();
     sys_unlink(p);
     sys_unlink(b"/tmp/nd_y\0".as_ptr());

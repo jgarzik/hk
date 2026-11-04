@@ -15,8 +15,8 @@
 
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
-    O_CLOEXEC, O_CREAT, O_RDONLY, O_TRUNC, O_WRONLY, sys_close, sys_dup3, sys_execve,
-    sys_execveat, sys_exit, sys_fork, sys_open, sys_read, sys_unlink, sys_wait4, sys_write,
+    O_CLOEXEC, O_CREAT, O_RDONLY, O_TRUNC, O_WRONLY, sys_close, sys_dup3, sys_execve, sys_execveat,
+    sys_exit, sys_fork, sys_open, sys_read, sys_unlink, sys_wait4, sys_write,
 };
 
 const OUT: &[u8] = b"/scr_out\0";
@@ -77,7 +77,13 @@ fn run(path: &[u8], fd: i32) -> i32 {
         let argv = [path.as_ptr(), b"x\0".as_ptr(), core::ptr::null()];
         let envp = [core::ptr::null()];
         let r = if fd >= 0 {
-            sys_execveat(fd, b"\0".as_ptr(), argv.as_ptr(), envp.as_ptr(), AT_EMPTY_PATH)
+            sys_execveat(
+                fd,
+                b"\0".as_ptr(),
+                argv.as_ptr(),
+                envp.as_ptr(),
+                AT_EMPTY_PATH,
+            )
         } else {
             sys_execve(path.as_ptr(), argv.as_ptr(), envp.as_ptr())
         };
@@ -99,7 +105,11 @@ fn exec() {
     script(b"/scr_a\0", b"#!/bin/echo -n\nignored\n");
     let st = run(b"/scr_a\0", -1);
     let mut b = [0u8; 64];
-    report(b"SCRIPT_EXEC", st == 0 && output(&mut b) == b"/scr_a x", st as i64);
+    report(
+        b"SCRIPT_EXEC",
+        st == 0 && output(&mut b) == b"/scr_a x",
+        st as i64,
+    );
 }
 
 fn arg_spaces() {

@@ -63,7 +63,10 @@ fn report(name: &[u8], why: &[u8], detail: i64) {
 
 /// clock_gettime in ns, or the errno (negative)
 fn now(id: i32) -> Result<i64, i64> {
-    let mut ts = Timespec { tv_sec: 0, tv_nsec: 0 };
+    let mut ts = Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
     match sys_clock_gettime(id, &mut ts) {
         0 => Ok(ts.tv_sec * SEC + ts.tv_nsec as i64),
         e => Err(e),
@@ -71,7 +74,10 @@ fn now(id: i32) -> Result<i64, i64> {
 }
 
 fn res(id: i32) -> Result<i64, i64> {
-    let mut ts = Timespec { tv_sec: 0, tv_nsec: 0 };
+    let mut ts = Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
     match sys_clock_getres(id, &mut ts) {
         0 => Ok(ts.tv_sec * SEC + ts.tv_nsec as i64),
         e => Err(e),
@@ -85,7 +91,15 @@ fn cpuclock(pid: i64, thread: bool) -> i32 {
 
 fn get() {
     let n = b"CLOCK_IDS_GET";
-    let hres = [REALTIME, MONOTONIC, PROCESS_CPU, THREAD_CPU, RAW, BOOTTIME, TAI];
+    let hres = [
+        REALTIME,
+        MONOTONIC,
+        PROCESS_CPU,
+        THREAD_CPU,
+        RAW,
+        BOOTTIME,
+        TAI,
+    ];
     for id in hres {
         if now(id).is_err() {
             return report(n, b"gettime", id as i64);
@@ -264,7 +278,10 @@ fn timers() {
         return report(n, b"timerfd boottime", fd);
     }
     let spec = ITimerSpec {
-        it_interval: Timespec { tv_sec: 0, tv_nsec: 0 },
+        it_interval: Timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        },
         it_value: ts(5_000_000),
     };
     let set = sys_timerfd_settime(fd as i32, 0, &spec, core::ptr::null_mut());

@@ -96,7 +96,10 @@ fn stat_children_ticks() -> i64 {
     };
     let mut field = 2;
     let mut sum = 0i64;
-    for tok in b[close + 1..].split(|&c| c == b' ').filter(|t| !t.is_empty()) {
+    for tok in b[close + 1..]
+        .split(|&c| c == b' ')
+        .filter(|t| !t.is_empty())
+    {
         field += 1;
         if field == 16 || field == 17 {
             let mut v = 0i64;

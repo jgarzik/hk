@@ -6,9 +6,8 @@
 
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
-    O_RDONLY, PR_SET_DUMPABLE, Stat, sys_close, sys_exit, sys_fork, sys_kill, sys_open,
-    sys_pipe2, sys_prctl, sys_read, sys_readlink, sys_setgid, sys_setuid, sys_stat, sys_wait4,
-    sys_write,
+    O_RDONLY, PR_SET_DUMPABLE, Stat, sys_close, sys_exit, sys_fork, sys_kill, sys_open, sys_pipe2,
+    sys_prctl, sys_read, sys_readlink, sys_setgid, sys_setuid, sys_stat, sys_wait4, sys_write,
 };
 
 const ENOENT: i64 = -2;
@@ -187,7 +186,11 @@ fn ino_unique() -> R {
     check(b"fd vs fdinfo", fd0 != 0 && fd0 != info0, fd0 as i64)?;
     let init = ino(b"/proc/1\0");
     let me = ino(b"/proc/self/\0");
-    check(b"pid dirs", init != 0 && (init != me || hk_syscall::sys_getpid() == 1), init as i64)
+    check(
+        b"pid dirs",
+        init != 0 && (init != me || hk_syscall::sys_getpid() == 1),
+        init as i64,
+    )
 }
 
 /// nr_dentry of /proc/sys/fs/dentry-state
@@ -197,7 +200,10 @@ fn nr_dentry() -> i64 {
     let n = sys_read(fd as u64, b.as_mut_ptr(), b.len() as u64);
     sys_close(fd as u64);
     let mut v = 0i64;
-    for &c in b[..n.max(0) as usize].iter().take_while(|c| c.is_ascii_digit()) {
+    for &c in b[..n.max(0) as usize]
+        .iter()
+        .take_while(|c| c.is_ascii_digit())
+    {
         v = v * 10 + (c - b'0') as i64;
     }
     v
@@ -234,16 +240,21 @@ fn drop_dentries() -> R {
         let _ = stat(proc_path(&mut b, me, &rest[..4 + k]));
     }
     let before = nr_dentry();
-    // Twice: Linux's first pass may only clear each dentry's
-    // referenced bit (dentry_lru_isolate: LRU_ROTATE), and drop_slab
-    // goes round again only when a round freed more than 10
-    let mut w = 0;
-    for _ in 0..2 {
+    // Until they go (at most 8 writes): drop_caches is best effort. A
+    // pass may only clear each dentry's referenced bit (Linux
+    // dentry_lru_isolate: LRU_ROTATE), drop_slab goes round again only
+    // when a round freed more than 10, and Linux 7.0 can free nothing
+    // in the first two writes after boot
+    let (mut w, mut after) = (0, before);
+    for _ in 0..8 {
         let fd = sys_open(b"/proc/sys/vm/drop_caches\0".as_ptr(), 1, 0);
         w = sys_write(fd as u64, b"2\n".as_ptr(), 2);
         sys_close(fd as u64);
+        after = nr_dentry();
+        if w != 2 || before - after >= 100 {
+            break;
+        }
     }
-    let after = nr_dentry();
     let still = match (stat(mp), stat(b"/tmp\0")) {
         (Ok(a), Ok(b)) => a.st_dev != b.st_dev,
         _ => false,

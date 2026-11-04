@@ -130,9 +130,17 @@ fn thread_ids() {
 }
 
 extern "C" fn exec_ids(_: u64) -> ! {
-    let argv: [*const u8; 3] = [b"boot_tester2\0".as_ptr(), b"ids\0".as_ptr(), core::ptr::null()];
+    let argv: [*const u8; 3] = [
+        b"boot_tester2\0".as_ptr(),
+        b"ids\0".as_ptr(),
+        core::ptr::null(),
+    ];
     let envp: [*const u8; 1] = [core::ptr::null()];
-    sys_execve(b"/bin/boot_tester2\0".as_ptr(), argv.as_ptr(), envp.as_ptr());
+    sys_execve(
+        b"/bin/boot_tester2\0".as_ptr(),
+        argv.as_ptr(),
+        envp.as_ptr(),
+    );
     sys_exit(127)
 }
 

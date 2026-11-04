@@ -11,7 +11,9 @@
 
 use super::helpers::{print, print_num, println};
 use core::sync::atomic::{AtomicU32, Ordering};
-use hk_syscall::{Timespec, sys_exit, sys_fork, sys_kill, sys_nanosleep, sys_rt_sigaction, sys_wait4};
+use hk_syscall::{
+    Timespec, sys_exit, sys_fork, sys_kill, sys_nanosleep, sys_rt_sigaction, sys_wait4,
+};
 
 const SA_RESTORER: u64 = 0x0400_0000;
 const SA_RESTART: u64 = 0x1000_0000;

@@ -55,7 +55,11 @@ fn test_fadvise_ramfs() {
     let n = sys_pread64(fd, back.as_mut_ptr(), 8192, 0);
     close_both(fd, p);
     let ok = a == 0 && b == -22 && c == 0 && d == 0 && n == 8192 && back.iter().all(|&x| x == 7);
-    verdict(b"FADVISE_DONTNEED_RAMFS", ok, [a, b, c, d, n, back[0] as i64]);
+    verdict(
+        b"FADVISE_DONTNEED_RAMFS",
+        ok,
+        [a, b, c, d, n, back[0] as i64],
+    );
 }
 
 fn verdict(name: &[u8], ok: bool, got: [i64; 6]) {
@@ -75,7 +79,11 @@ fn verdict(name: &[u8], ok: bool, got: [i64; 6]) {
 /// A temp file with 8KB written, and a pipe: (file, pipe read end)
 fn file_and_pipe() -> (i32, i32) {
     use hk_syscall::{O_CREAT, O_RDWR, O_TRUNC, sys_open, sys_pipe2, sys_pwrite64};
-    let fd = sys_open(b"/tmp/sfr_test\0".as_ptr(), O_CREAT | O_RDWR | O_TRUNC, 0o600) as i32;
+    let fd = sys_open(
+        b"/tmp/sfr_test\0".as_ptr(),
+        O_CREAT | O_RDWR | O_TRUNC,
+        0o600,
+    ) as i32;
     let buf = [7u8; 8192];
     sys_pwrite64(fd, buf.as_ptr(), 8192, 0);
     let mut p = [0i32; 2];
@@ -157,7 +165,14 @@ fn test_dirty_sysctls() {
     let (r1, y1) = (get(ratio), get(bytes));
     let w2 = put(ratio, b"20\n");
     let (r2, y2) = (get(ratio), get(bytes));
-    let ok = r0 == 20 && b0 == 10 && w1 > 0 && r1 == 0 && y1 == 67108864 && w2 > 0 && r2 == 20 && y2 == 0;
+    let ok = r0 == 20
+        && b0 == 10
+        && w1 > 0
+        && r1 == 0
+        && y1 == 67108864
+        && w2 > 0
+        && r2 == 20
+        && y2 == 0;
     if ok {
         println(b"VM_DIRTY_SYSCTLS:OK");
     } else {
@@ -320,14 +335,26 @@ fn test_membarrier_reg() {
             | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE
             | MEMBARRIER_CMD_GET_REGISTRATIONS;
         t.ok(b"query", q >= 0 && q as i32 & want == want, q);
-        t.eq(b"regs none", sys_membarrier(MEMBARRIER_CMD_GET_REGISTRATIONS, 0, 0), 0);
-        t.eq(b"private unreg", sys_membarrier(MEMBARRIER_CMD_PRIVATE_EXPEDITED, 0, 0), -1);
+        t.eq(
+            b"regs none",
+            sys_membarrier(MEMBARRIER_CMD_GET_REGISTRATIONS, 0, 0),
+            0,
+        );
+        t.eq(
+            b"private unreg",
+            sys_membarrier(MEMBARRIER_CMD_PRIVATE_EXPEDITED, 0, 0),
+            -1,
+        );
         t.eq(
             b"sync_core unreg",
             sys_membarrier(MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE, 0, 0),
             -1,
         );
-        t.eq(b"global exp", sys_membarrier(MEMBARRIER_CMD_GLOBAL_EXPEDITED, 0, 0), 0);
+        t.eq(
+            b"global exp",
+            sys_membarrier(MEMBARRIER_CMD_GLOBAL_EXPEDITED, 0, 0),
+            0,
+        );
         t.eq(
             b"flag cpu",
             sys_membarrier(MEMBARRIER_CMD_PRIVATE_EXPEDITED, MEMBARRIER_CMD_FLAG_CPU, 0),
@@ -346,20 +373,40 @@ fn test_membarrier_reg() {
         );
         // Registering SYNC_CORE marks the private state but not its
         // readiness (Linux sets PRIVATE_EXPEDITED, not its _READY)
-        t.eq(b"private after sync", sys_membarrier(MEMBARRIER_CMD_PRIVATE_EXPEDITED, 0, 0), -1);
+        t.eq(
+            b"private after sync",
+            sys_membarrier(MEMBARRIER_CMD_PRIVATE_EXPEDITED, 0, 0),
+            -1,
+        );
         t.eq(
             b"regs sync",
             sys_membarrier(MEMBARRIER_CMD_GET_REGISTRATIONS, 0, 0),
             (MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED
                 | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE) as i64,
         );
-        t.eq(b"reg global", sys_membarrier(MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED, 0, 0), 0);
-        t.eq(b"reg private", sys_membarrier(MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED, 0, 0), 0);
-        t.eq(b"private", sys_membarrier(MEMBARRIER_CMD_PRIVATE_EXPEDITED, 0, 0), 0);
+        t.eq(
+            b"reg global",
+            sys_membarrier(MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED, 0, 0),
+            0,
+        );
+        t.eq(
+            b"reg private",
+            sys_membarrier(MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED, 0, 0),
+            0,
+        );
+        t.eq(
+            b"private",
+            sys_membarrier(MEMBARRIER_CMD_PRIVATE_EXPEDITED, 0, 0),
+            0,
+        );
         let all = (MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED
             | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED
             | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE) as i64;
-        t.eq(b"regs all", sys_membarrier(MEMBARRIER_CMD_GET_REGISTRATIONS, 0, 0), all);
+        t.eq(
+            b"regs all",
+            sys_membarrier(MEMBARRIER_CMD_GET_REGISTRATIONS, 0, 0),
+            all,
+        );
         let c = sys_fork();
         if c == 0 {
             let r = sys_membarrier(MEMBARRIER_CMD_GET_REGISTRATIONS, 0, 0);

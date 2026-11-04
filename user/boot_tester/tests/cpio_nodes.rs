@@ -128,5 +128,8 @@ fn concat() {
     let fd = sys_open(b"/cpio_test/null\0".as_ptr(), O_WRONLY, 0);
     let w = sys_write(fd as u64, b"x".as_ptr(), 1);
     sys_close(fd as u64);
-    report(b"CPIO_CONCAT", if fd >= 0 && w == 1 { b"" } else { b"write" });
+    report(
+        b"CPIO_CONCAT",
+        if fd >= 0 && w == 1 { b"" } else { b"write" },
+    );
 }

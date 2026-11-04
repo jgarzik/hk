@@ -27,8 +27,9 @@
 /* L1 indices in the 0xffff8000... L0 slot (256): image GB and devices */
 .equ L1_IMAGE, 1
 .equ L1_IO, 8
-/* MAIR: Attr0 normal WB (0xff), Attr1 device-nGnRnE (0x00) */
-.equ MAIR_VALUE, 0xff00
+/* MAIR (Attr<n> in bits [8n+7:8n]): Attr0 normal WB (0xff), Attr1
+ * device-nGnRnE (0x00) */
+.equ MAIR_VALUE, 0x00ff
 /* TCR: T0SZ=T1SZ=16 (48-bit), 4KB granules, inner-shareable WB walks,
  * IPS 40-bit */
 .equ TCR_VALUE, 0x2B5103510

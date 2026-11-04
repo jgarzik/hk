@@ -19,8 +19,8 @@ use super::sk::recv_msg;
 use super::unix::{got_fds, send_fds};
 use hk_syscall::{
     AF_UNIX, CLONE_NEWNS, O_CREAT, O_DIRECTORY, O_RDONLY, O_WRONLY, SOCK_STREAM, sys_close,
-    sys_execveat, sys_exit, sys_fork, sys_mkdir, sys_mount, sys_open, sys_socketpair,
-    sys_unshare, sys_wait4, sys_write,
+    sys_execveat, sys_exit, sys_fork, sys_mkdir, sys_mount, sys_open, sys_socketpair, sys_unshare,
+    sys_wait4, sys_write,
 };
 
 const AT_FDCWD: i32 = -100;

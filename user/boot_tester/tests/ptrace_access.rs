@@ -118,7 +118,11 @@ fn own_group(_: u64) -> u64 {
             return 2;
         }
     }
-    if SIB_RESULT.load(Ordering::Relaxed) == EPERM { 0 } else { 3 }
+    if SIB_RESULT.load(Ordering::Relaxed) == EPERM {
+        0
+    } else {
+        3
+    }
 }
 
 fn report(name: &[u8], st: i32, want: i32) {

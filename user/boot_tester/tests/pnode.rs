@@ -6,9 +6,9 @@
 
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
-    sys_chdir, sys_chroot, sys_pivot_root,
-    CLONE_NEWNS, O_RDONLY, Stat, sys_close, sys_exit, sys_fork, sys_mkdir, sys_mount, sys_open,
-    sys_read, sys_rmdir, sys_stat, sys_umount2, sys_unshare, sys_wait4,
+    CLONE_NEWNS, O_RDONLY, Stat, sys_chdir, sys_chroot, sys_close, sys_exit, sys_fork, sys_mkdir,
+    sys_mount, sys_open, sys_pivot_root, sys_read, sys_rmdir, sys_stat, sys_umount2, sys_unshare,
+    sys_wait4,
 };
 
 const ENOENT: i64 = -2;
@@ -144,8 +144,16 @@ fn shared_bind() -> R {
         check(b"mount y via b", ramfs(b"/tmp/ps_b/y\0") == 0, -1)?;
         check(b"y at a", mounted(b"/tmp/ps_a/y\0", b"/tmp/ps_a\0"), -1)?;
         // PROPAG_UMOUNT
-        check(b"umount x", sys_umount2(b"/tmp/ps_a/x\0".as_ptr(), 0) == 0, -1)?;
-        check(b"x gone at b", !mounted(b"/tmp/ps_b/x\0", b"/tmp/ps_b\0"), -1)
+        check(
+            b"umount x",
+            sys_umount2(b"/tmp/ps_a/x\0".as_ptr(), 0) == 0,
+            -1,
+        )?;
+        check(
+            b"x gone at b",
+            !mounted(b"/tmp/ps_b/x\0", b"/tmp/ps_b\0"),
+            -1,
+        )
     })();
     for p in [&b"/tmp/ps_a/y\0"[..], b"/tmp/ps_b/x\0", b"/tmp/ps_a/x\0"] {
         sys_umount2(p.as_ptr(), MNT_DETACH);
@@ -174,7 +182,11 @@ fn slave_oneway() -> R {
         check(b"mount x", ramfs(b"/tmp/sl_a/x\0") == 0, -1)?;
         check(b"x at slave", mounted(b"/tmp/sl_b/x\0", b"/tmp/sl_b\0"), -1)?;
         check(b"mount y in slave", ramfs(b"/tmp/sl_b/y\0") == 0, -1)?;
-        check(b"y not at master", !mounted(b"/tmp/sl_a/y\0", b"/tmp/sl_a\0"), -1)
+        check(
+            b"y not at master",
+            !mounted(b"/tmp/sl_a/y\0", b"/tmp/sl_a\0"),
+            -1,
+        )
     })();
     for p in [&b"/tmp/sl_b/y\0"[..], b"/tmp/sl_a/x\0", b"/tmp/sl_b/x\0"] {
         sys_umount2(p.as_ptr(), MNT_DETACH);
@@ -217,7 +229,11 @@ fn unbindable() -> R {
         check(b"mount", ramfs(b"/tmp/pu_a\0") == 0, -1)?;
         let r = set(b"/tmp/pu_a\0", MS_SHARED | MS_PRIVATE);
         check(b"two types", r == EINVAL, r)?;
-        check(b"make shared", set(b"/tmp/pu_a\0", MS_SHARED | MS_REC) == 0, -1)?;
+        check(
+            b"make shared",
+            set(b"/tmp/pu_a\0", MS_SHARED | MS_REC) == 0,
+            -1,
+        )?;
         check(b"unbindable", set(b"/tmp/pu_a\0", MS_UNBINDABLE) == 0, -1)?;
         check(b"left group", opt(b"/tmp/pu_a", b"shared") == 0, -1)?;
         let r = bind(b"/tmp/pu_a\0", b"/tmp/pu_b\0");
@@ -267,7 +283,12 @@ fn unshare_peer() -> R {
 /// of shared slaves as slaves that are peers of one another: each
 /// source mount's copies form their own peer group
 fn slave_groups() -> R {
-    let dirs: [&[u8]; 4] = [b"/tmp/pg_a\0", b"/tmp/pg_b\0", b"/tmp/pg_c\0", b"/tmp/pg_t\0"];
+    let dirs: [&[u8]; 4] = [
+        b"/tmp/pg_a\0",
+        b"/tmp/pg_b\0",
+        b"/tmp/pg_c\0",
+        b"/tmp/pg_t\0",
+    ];
     mkdirs(&dirs);
     let r = (|| {
         check(b"mount a", ramfs(b"/tmp/pg_a\0") == 0, -1)?;
@@ -280,12 +301,29 @@ fn slave_groups() -> R {
         sys_mkdir(b"/tmp/pg_t/s\0".as_ptr(), 0o755);
         check(b"mount t/s", ramfs(b"/tmp/pg_t/s\0") == 0, -1)?;
         sys_mkdir(b"/tmp/pg_a/x\0".as_ptr(), 0o755);
-        let r = sys_mount(b"/tmp/pg_t\0".as_ptr(), b"/tmp/pg_a/x\0".as_ptr(), core::ptr::null(), MS_BIND | MS_REC, 0);
+        let r = sys_mount(
+            b"/tmp/pg_t\0".as_ptr(),
+            b"/tmp/pg_a/x\0".as_ptr(),
+            core::ptr::null(),
+            MS_BIND | MS_REC,
+            0,
+        );
         check(b"rbind", r == 0, r)?;
-        let (p, q) = (opt(b"/tmp/pg_b/x", b"shared"), opt(b"/tmp/pg_b/x/s", b"shared"));
-        check(b"two groups", p != 0 && q != 0 && p != q, (p * 1000 + q) as i64)?;
+        let (p, q) = (
+            opt(b"/tmp/pg_b/x", b"shared"),
+            opt(b"/tmp/pg_b/x/s", b"shared"),
+        );
+        check(
+            b"two groups",
+            p != 0 && q != 0 && p != q,
+            (p * 1000 + q) as i64,
+        )?;
         check(b"peers in c", opt(b"/tmp/pg_c/x", b"shared") == p, -1)?;
-        check(b"slaves", opt(b"/tmp/pg_b/x", b"master") == opt(b"/tmp/pg_a/x", b"shared"), -1)
+        check(
+            b"slaves",
+            opt(b"/tmp/pg_b/x", b"master") == opt(b"/tmp/pg_a/x", b"shared"),
+            -1,
+        )
     })();
     for p in [
         &b"/tmp/pg_c/x/s\0"[..],
