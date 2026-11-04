@@ -301,6 +301,19 @@ Missing: fs.protected_hardlinks/symlinks/fifos/regular do not exist
 (behave as their kernel default 0); no
 immutable/append-only inodes (no IS_APPEND/IS_IMMUTABLE EPERM).
 
+## Credentials have no identity
+
+**Location**: `task/mod.rs` (`Cred`), `fs/namei.rs` (`may_linkat_empty`)
+
+`Cred` is a value, not Linux's shared, refcounted `struct cred`. linkat
+AT_EMPTY_PATH compares `f_cred` with the caller's creds by value, where
+Linux compares pointers. Any commit_creds since the open, and fork's
+copy_creds, gives Linux a new pointer. So an fd inherited across fork
+by a same-uid child, or passed between same-cred processes, can be
+linked on hk without CAP_DAC_READ_SEARCH; Linux gives ENOENT. The
+capability is checked in the caller's namespace (Linux: the opener's
+`user_ns`); hk has one user namespace.
+
 ## sysfs gaps
 
 **Location**: `fs/kernfs/`, `fs/sysfs.rs`, `base/`, `block/genhd.rs`,
