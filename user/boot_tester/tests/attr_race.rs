@@ -6,14 +6,17 @@
 //!   chmod comes first and chown's set-id kill clears S_ISUID, or the
 //!   chown comes first and the user's chmod fails (no longer the
 //!   owner): never a setuid-root file with contents the user chose.
+//! - SIZE_PUBLISH: while a writer appends a pattern, a reader that sees
+//!   a size never reads stale bytes below it (Linux i_size_write and
+//!   i_size_read are release and acquire).
 
 use core::sync::atomic::{AtomicI32, Ordering};
 
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
-    MAP_ANONYMOUS, MAP_SHARED, O_CREAT, O_WRONLY, PROT_READ, PROT_WRITE, Stat, sys_chmod,
-    sys_chown, sys_close, sys_exit, sys_fork, sys_mkdir, sys_mmap, sys_munmap, sys_open,
-    sys_sched_yield, sys_setuid, sys_stat, sys_unlink, sys_wait4,
+    MAP_ANONYMOUS, MAP_SHARED, O_CREAT, O_RDONLY, O_WRONLY, PROT_READ, PROT_WRITE, Stat, sys_chmod,
+    sys_chown, sys_close, sys_exit, sys_fork, sys_fstat, sys_mkdir, sys_mmap, sys_munmap, sys_open,
+    sys_pread64, sys_pwrite64, sys_sched_yield, sys_setuid, sys_stat, sys_unlink, sys_wait4,
 };
 
 const S_ISUID: u32 = 0o4000;
@@ -21,6 +24,7 @@ const ROUNDS: i32 = 300;
 
 pub fn run_tests() {
     report(b"CHMOD_CHOWN_RACE", chmod_chown_race());
+    report(b"SIZE_PUBLISH", size_publish());
 }
 
 type R = Result<(), (&'static [u8], i64)>;
@@ -117,4 +121,61 @@ fn chmod_chown_race() -> R {
     sys_munmap(p as u64, 4096);
     sys_unlink(FILE.as_ptr());
     r
+}
+
+const CHUNK: usize = 64;
+const CHUNKS: u64 = 4000;
+const SIZE_FILE: &[u8] = b"/tmp/size_publish\0";
+
+fn size_publish() -> R {
+    let fd = sys_open(
+        SIZE_FILE.as_ptr(),
+        O_CREAT | O_WRONLY | hk_syscall::O_TRUNC,
+        0o644,
+    );
+    check(b"create", fd >= 0, fd)?;
+    let pid = sys_fork();
+    if pid == 0 {
+        let buf = [0xABu8; CHUNK];
+        for i in 0..CHUNKS {
+            sys_pwrite64(
+                fd as i32,
+                buf.as_ptr(),
+                CHUNK as u64,
+                (i * CHUNK as u64) as i64,
+            );
+        }
+        sys_exit(0);
+    }
+    let rd = sys_open(SIZE_FILE.as_ptr(), O_RDONLY, 0);
+    let mut bad = None;
+    let end = CHUNKS * CHUNK as u64;
+    loop {
+        // SAFETY: Stat is plain integers, valid all-zero
+        let mut st: Stat = unsafe { core::mem::zeroed() };
+        sys_fstat(rd as i32, &mut st);
+        let size = st.st_size as u64;
+        if size >= CHUNK as u64 {
+            let mut b = [0u8; CHUNK];
+            let n = sys_pread64(
+                rd as i32,
+                b.as_mut_ptr(),
+                CHUNK as u64,
+                (size - CHUNK as u64) as i64,
+            );
+            if n != CHUNK as i64 || b.iter().any(|&c| c != 0xAB) {
+                bad = Some(size as i64);
+                break;
+            }
+        }
+        if size >= end {
+            break;
+        }
+    }
+    let mut ws = 0;
+    sys_wait4(pid, &mut ws, 0, 0);
+    sys_close(rd as u64);
+    sys_close(fd as u64);
+    sys_unlink(SIZE_FILE.as_ptr());
+    check(b"stale bytes", bad.is_none(), bad.unwrap_or(0))
 }

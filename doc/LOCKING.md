@@ -1661,7 +1661,7 @@ the last reference.
 **Inode** (`fs/inode.rs`):
 ```rust
 pub struct Inode {
-    pub size: AtomicU64,                           // Lock-free size updates
+    size: AtomicU64,      // i_size: Release under i_rwsem, Acquire lock-free
     i_rwsem: RwSem,                                // Dir ops, file write/truncate
     pub private: RwLock<Option<Arc<dyn InodeData>>>, // FS-specific data
 }
@@ -3542,6 +3542,7 @@ Correct uses of atomics in hk:
 | `TimeKeeper` | seq, cycle_base, mono_base_ns, etc. | Seqlock pattern - all read together with seq validation |
 | `File` | pos | Under `f_pos_lock` for writers; atomic for lockless readers |
 | `Inode` | mode, uid, gid | Written under i_rwsem (chmod, chown, set-id kill on write/truncate); read lock-free |
+| `Inode` | size | Linux i_size_write/read: Release under i_rwsem, Acquire lock-free, so the bytes below it are visible first |
 | `Sock` | flags, error, buffer sizes | Independent values; protocol data under the socket lock |
 | `CachedPage` | refcount, dirty, writeback, locked | Linux page cache pattern - flags + refcount |
 
@@ -3550,7 +3551,6 @@ moves its row above or into its subsystem table):
 
 | Subsystem | Atomic Fields | Problem |
 |-----------|---------------|---------|
-| `Inode` | size | Relaxed; i_size_write/read are Release/Acquire (rule 4) |
 | `Sock` | shutdown | TCP sets and clears it outside `cb` (rule 1) |
 
 ---

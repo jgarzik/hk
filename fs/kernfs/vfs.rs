@@ -131,7 +131,7 @@ impl InodeOps for KernfsIops {
             mode: inode.mode(),
             uid: inode.uid(),
             gid: inode.gid(),
-            size: inode.size.load(Ordering::Relaxed),
+            size: inode.get_size(),
             nlink,
             rdev: inode.rdev,
             atime: inode.atime(),

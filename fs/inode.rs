@@ -294,7 +294,7 @@ pub trait InodeOps: Send + Sync {
             mode: inode.mode(),
             uid: inode.uid(),
             gid: inode.gid(),
-            size: inode.size.load(Ordering::Relaxed),
+            size: inode.get_size(),
             nlink: inode.get_nlink(),
             rdev: inode.rdev,
             atime: inode.atime(),
@@ -435,8 +435,9 @@ pub struct Inode {
     /// Owner group ID - atomic for chown support
     gid: AtomicU32,
 
-    /// File size in bytes
-    pub size: AtomicU64,
+    /// File size in bytes (Linux i_size): written under i_rwsem with
+    /// Release, read lock-free with Acquire, through `set_size`/`get_size`
+    size: AtomicU64,
 
     /// Link count (atomic for thread-safe hard link management)
     pub nlink: AtomicU32,
@@ -709,14 +710,17 @@ impl Inode {
         self.private.read().clone()
     }
 
-    /// Update file size
+    /// Update file size (Linux i_size_write: smp_store_release). The
+    /// caller holds i_rwsem; what the new size covers (page contents)
+    /// is visible before the size is
     pub fn set_size(&self, size: u64) {
-        self.size.store(size, Ordering::Relaxed);
+        self.size.store(size, Ordering::Release);
     }
 
-    /// Get current file size
+    /// Get current file size (Linux i_size_read: smp_load_acquire, pairs
+    /// with `set_size`): bytes below it are seen as written
     pub fn get_size(&self) -> u64 {
-        self.size.load(Ordering::Relaxed)
+        self.size.load(Ordering::Acquire)
     }
 
     /// Get current link count
