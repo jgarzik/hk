@@ -28,6 +28,7 @@ pub fn run_tests() {
     report(b"STATX_MNT_ID", check_statx(id));
     report(b"FDINFO_FIELDS", check_fdinfo(id));
     report(b"PROC_CWD_ROOT", check_cwd_root());
+    report(b"KTHREAD_ROOT", check_kthread_root());
     sys_chdir(b"/\0".as_ptr());
     sys_unlink(b"/tmp/mi/f\0".as_ptr());
     sys_umount2(mi.as_ptr(), 0);
@@ -259,6 +260,82 @@ fn check_fdinfo(id: u64) -> R {
         field(t, b"ino").and_then(num) == Some(st.stx_ino),
         0,
     )
+}
+
+/// A kernel thread's root and cwd: since Linux 7.3 (32750c77e811) the
+/// root of the private nullfs kernel threads start in, which has no
+/// parent to name, so "/" for both. Before, kernel threads shared pid
+/// 1's fs_struct (until 14adbd5341aa): pid 1's root and cwd.
+fn check_kthread_root() -> R {
+    let pid = (2..1000)
+        .find(|&p| is_kthread(p))
+        .ok_or((&b"no kthread"[..], 0))?;
+    for link in [&b"root"[..], b"cwd"] {
+        let mut want = [b'/'; 64];
+        let mut wn = 1;
+        if !linux_at_least(7, 3) {
+            let mut p1 = [0u8; 32];
+            let n = proc_path(&mut p1, 1, link);
+            let r = sys_readlink(p1[..n].as_ptr(), want.as_mut_ptr(), want.len() as u64);
+            check(b"pid 1", r > 0, r)?;
+            wn = r as usize;
+        }
+        let mut path = [0u8; 32];
+        let n = proc_path(&mut path, pid, link);
+        let mut b = [0u8; 64];
+        let r = sys_readlink(path[..n].as_ptr(), b.as_mut_ptr(), b.len() as u64);
+        check(link, r == wn as i64 && b[..wn] == want[..wn], r)?;
+    }
+    Ok(())
+}
+
+/// "/proc/<pid>/<what>\0" in `out`; its length with the NUL
+fn proc_path(out: &mut [u8; 32], pid: u32, what: &[u8]) -> usize {
+    let mut n = 0;
+    for &c in b"/proc/".iter() {
+        out[n] = c;
+        n += 1;
+    }
+    let mut d = [0u8; 10];
+    let (mut v, mut k) = (pid, 0);
+    loop {
+        d[k] = b'0' + (v % 10) as u8;
+        k += 1;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    for i in (0..k).rev() {
+        out[n] = d[i];
+        n += 1;
+    }
+    out[n] = b'/';
+    n += 1;
+    for &c in what {
+        out[n] = c;
+        n += 1;
+    }
+    out[n] = 0;
+    n + 1
+}
+
+/// PF_KTHREAD in /proc/<pid>/stat's flags, the 9th field
+fn is_kthread(pid: u32) -> bool {
+    const PF_KTHREAD: u64 = 0x0020_0000;
+    let mut path = [0u8; 32];
+    let n = proc_path(&mut path, pid, b"stat");
+    let mut buf = [0u8; 512];
+    let len = slurp(&path[..n], &mut buf);
+    let Some(end) = buf[..len].iter().rposition(|&c| c == b')') else {
+        return false;
+    };
+    buf[end + 1..len]
+        .split(|&c| c == b' ')
+        .filter(|f| !f.is_empty())
+        .nth(6)
+        .and_then(num)
+        .is_some_and(|f| f & PF_KTHREAD != 0)
 }
 
 /// /proc/self/cwd and root name the cwd and root

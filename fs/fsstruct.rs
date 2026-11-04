@@ -177,6 +177,22 @@ impl FsStruct {
 
 use crate::task::percpu::{current, with_task_lock};
 
+/// The fs_struct every kernel thread shares (Linux init_task.fs, 7.3+):
+/// root and cwd on the private nullfs instance `knullfs`, in no mount
+/// namespace and read-only, so a kernel thread resolves no user path
+/// and nothing is mounted or written through it. Not installed in the
+/// threads (one may already run, and only a task itself replaces its
+/// fs): [`get_task_fs`] gives it to a kernel thread that has none.
+/// Boot code before pid 1 has an fs resolves from the namespace
+/// instead (namei::nd_root).
+static KTHREAD_FS: spin::Once<Arc<FsStruct>> = spin::Once::new();
+
+/// Set up [`KTHREAD_FS`] on `knullfs` (Linux init_mount_tree)
+pub fn kthread_fs_init(knullfs: Arc<super::Mount>) {
+    let root = Path::new(knullfs.clone(), knullfs.root.clone());
+    KTHREAD_FS.call_once(|| FsStruct::new(root.clone(), root));
+}
+
 /// Initialize filesystem context for a new task (the task itself, or
 /// its creator before it runs); the old one is dropped after the lock
 pub fn init_task_fs(tid: Tid, fs: Arc<FsStruct>) {
@@ -188,13 +204,20 @@ pub fn init_task_fs(tid: Tid, fs: Arc<FsStruct>) {
 }
 
 /// Get the FsStruct for a task (returns cloned Arc; lock-free for the
-/// current task, Linux current->fs)
+/// current task, Linux current->fs); a kernel thread's is
+/// [`KTHREAD_FS`]
 pub fn get_task_fs(tid: Tid) -> Option<Arc<FsStruct>> {
     let me = current();
-    if me.tid() == tid {
-        return me.fs();
-    }
-    with_task_lock(tid, |a| a.fs().cloned()).flatten()
+    let fs = if me.tid() == tid {
+        me.fs()
+    } else {
+        with_task_lock(tid, |a| a.fs().cloned()).flatten()
+    };
+    fs.or_else(|| {
+        crate::task::kthread::is_kthread_tid(tid)
+            .then(|| KTHREAD_FS.get().cloned())
+            .flatten()
+    })
 }
 
 /// Remove filesystem context when task exits

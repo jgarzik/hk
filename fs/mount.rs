@@ -347,14 +347,31 @@ impl Mount {
 /// The initial mount tree (Linux init_mount_tree, 7.0+): a nullfs mount
 /// (id 1) is the namespace root and the mutable rootfs, a ramfs (id 2),
 /// is mounted on it. Root and cwd go to the rootfs, so it can be
-/// pivoted away or unmounted like any other mount. Returns the rootfs.
+/// pivoted away or unmounted like any other mount. Then the private
+/// nullfs kernel threads start in (id 3, Linux 7.3 knullfs). Returns
+/// the rootfs.
 pub fn init_mount_tree() -> Result<Arc<Mount>, KernelError> {
-    let nsb = (super::nullfs::NULLFS_TYPE.mount)(&super::nullfs::NULLFS_TYPE, b"")?;
-    let null = attach(nsb, None, 0, false, b"nullfs".as_slice().into())?;
+    let nullfs = &super::nullfs::NULLFS_TYPE;
+    let null = attach(
+        (nullfs.mount)(nullfs, b"")?,
+        None,
+        0,
+        false,
+        b"nullfs".as_slice().into(),
+    )?;
     let ramfs = &super::ramfs::RAMFS_TYPE;
     let sb = (ramfs.mount)(ramfs, b"")?;
     let on = Path::new(null.clone(), null.root.clone());
-    attach(sb, Some(on), 0, false, b"rootfs".as_slice().into())
+    let rootfs = attach(sb, Some(on), 0, false, b"rootfs".as_slice().into())?;
+    let ksb = (nullfs.mount)(nullfs, b"")?;
+    let root = ksb.get_root().ok_or(KernelError::InvalidArgument)?;
+    super::fsstruct::kthread_fs_init(Mount::new(
+        ksb,
+        root,
+        MNT_READONLY,
+        b"nullfs".as_slice().into(),
+    ));
+    Ok(rootfs)
 }
 
 /// Mount `sb` on `mountpoint` (None: as the namespace root) with MNT_*
