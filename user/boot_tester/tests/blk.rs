@@ -9,7 +9,7 @@
 //! The disk is attached with snapshot=on: each boot sees it pristine.
 
 use super::helpers::{
-    BlkDev, dev_major, dev_minor, find_blkdev, print, print_num, println, read_file,
+    BlkDev, dev_major, dev_minor, find_blkdev, linux_at_least, print, print_num, println, read_file,
 };
 use hk_syscall::{
     O_CREAT, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY, Stat, sys_close, sys_fstat, sys_fsync, sys_ioctl,
@@ -217,7 +217,8 @@ fn set_int(fd: i32, cmd: u64, v: i32) -> i64 {
     sys_ioctl(fd, cmd, &v as *const i32 as u64)
 }
 
-/// Sizes, block sizes, read-only flag; BLKBSZSET within 512..4096
+/// Sizes, block sizes, read-only flag; BLKBSZSET within 512..64K (the
+/// page size before Linux 6.15)
 fn ioctls(p3: &BlkDev) {
     let fd = open_dev(p3, O_RDWR);
     let (r, sz64) = get_u64(fd, BLKGETSIZE64);
@@ -236,8 +237,10 @@ fn ioctls(p3: &BlkDev) {
     let (_, now) = get_int(fd, BLKBSZGET);
     let b = set_int(fd, BLKBSZSET, 3000);
     let c = set_int(fd, BLKBSZSET, 8192);
+    let big = if linux_at_least(6, 15) { 0 } else { EINVAL };
+    let d = set_int(fd, BLKBSZSET, 128 * 1024);
     let e = set_int(fd, BLKBSZSET, 256);
-    let ok = a == 0 && now == 1024 && b == EINVAL && c == EINVAL && e == EINVAL;
+    let ok = a == 0 && now == 1024 && b == EINVAL && c == big && d == EINVAL && e == EINVAL;
     verdict(b"BLK_BSZSET", ok, if a != 0 { a } else { now as i64 });
     // BLKRRPART is for whole disks
     let r = sys_ioctl(fd, BLKRRPART, 0);
