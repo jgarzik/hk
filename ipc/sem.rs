@@ -10,7 +10,7 @@ use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, Ordering};
+use core::sync::atomic::{AtomicI32, Ordering};
 
 use crate::arch::Uaccess;
 use crate::ipc::util::{
@@ -57,167 +57,156 @@ pub const SEMVMX: i32 = 32767;
 // Semaphore Structures
 // ============================================================================
 
-/// Single semaphore within an array
-pub struct Sem {
-    /// Current value
-    pub semval: AtomicI32,
-    /// PID of last modifier
-    pub sempid: AtomicI32,
-}
+/// A queued operation's status while it waits (Linux: the sleeper sets
+/// -EINTR, the waker stores the result with release)
+const SEM_WAITING: i32 = -(KernelError::Interrupted as i32);
 
-impl Sem {
-    fn new() -> Self {
-        Self {
-            semval: AtomicI32::new(0),
-            sempid: AtomicI32::new(0),
-        }
-    }
-}
-
-/// Pending semaphore operation
+/// Pending semaphore operation (Linux struct sem_queue)
 pub struct SemQueue {
-    /// Task waiting for this operation
-    pub tid: u64,
+    /// Thread-group id recorded as sempid when it completes
+    pid: i32,
     /// Operations to perform
-    pub sops: Vec<Sembuf>,
-    /// Result status (-EIDRM, -EINTR, or 0)
-    pub status: AtomicI32,
-    /// Wakeup flag
-    pub woken: AtomicBool,
+    sops: Vec<Sembuf>,
     /// Does this alter semaphore values?
-    pub alter: bool,
+    alter: bool,
+    /// `SEM_WAITING` until a waker completes it under the array lock,
+    /// then 0 or a negative errno (Release; the sleeper reads it Acquire
+    /// without the lock, Linux q->status)
+    status: AtomicI32,
+}
+
+/// Everything semop and semctl read or change, under one lock (Linux:
+/// sem_perm.lock, the global mode of sem_lock)
+pub struct SemState {
+    /// Each semaphore's value
+    val: Vec<i32>,
+    /// Each semaphore's last modifier (sempid)
+    pid: Vec<i32>,
+    /// Waiting operations, oldest first
+    pending: VecDeque<Arc<SemQueue>>,
+    /// Last semop time
+    otime: i64,
+    /// Last change time
+    ctime: i64,
 }
 
 /// Semaphore array
 pub struct SemArray {
     /// IPC permissions and ID
     pub perm: KernIpcPerm,
-    /// Last semop time
-    pub otime: AtomicI64,
-    /// Last change time
-    pub ctime: AtomicI64,
     /// Number of semaphores
     pub nsems: u32,
-    /// The semaphores
-    pub sems: Vec<Sem>,
-    /// Pending operations queue
-    pub pending: Mutex<VecDeque<Arc<SemQueue>>>,
-    /// Wait queue for blocked operations
-    pub waitq: WaitQueue,
+    /// Values, pending operations and times
+    sem: Mutex<SemState>,
+    /// Sleepers in semop; each waits for its own queue entry's status
+    waitq: WaitQueue,
     /// Namespace reference
     ns: Arc<IpcNamespace>,
+}
+
+/// Apply `sops` to `st` in order, all or nothing (Linux
+/// perform_atomic_semop_slow, which also sums repeated operations on one
+/// semaphore): 0 when applied (sempid updated), 1 when an operation
+/// would block, or a negative errno (EAGAIN for a blocking operation
+/// with IPC_NOWAIT, ERANGE above SEMVMX). Undone on anything but 0.
+fn perform_atomic_semop(st: &mut SemState, sops: &[Sembuf], pid: i32) -> i32 {
+    for (n, sop) in sops.iter().enumerate() {
+        let i = sop.sem_num as usize;
+        let cur = st.val[i];
+        let result = cur + sop.sem_op as i32;
+        let r = if (sop.sem_op == 0 && cur != 0) || result < 0 {
+            if sop.sem_flg & IPC_NOWAIT as i16 != 0 {
+                KernelError::WouldBlock.to_errno_neg()
+            } else {
+                1
+            }
+        } else if result > SEMVMX {
+            KernelError::Range.to_errno_neg()
+        } else {
+            st.val[i] = result;
+            continue;
+        };
+        for done in sops[..n].iter().rev() {
+            st.val[done.sem_num as usize] -= done.sem_op as i32;
+        }
+        return r;
+    }
+    for sop in sops {
+        st.pid[sop.sem_num as usize] = pid;
+    }
+    0
+}
+
+/// Complete the waiting operations that can proceed now, oldest first
+/// (Linux update_queue): each completed one is unlinked and its status
+/// set; one that changed values restarts the scan. True if any was
+/// completed (its sleeper must be woken after the unlock).
+fn update_queue(st: &mut SemState) -> bool {
+    let mut woke = false;
+    let mut i = 0;
+    while i < st.pending.len() {
+        let q = st.pending[i].clone();
+        let r = perform_atomic_semop(st, &q.sops, q.pid);
+        if r == 1 {
+            i += 1;
+            continue;
+        }
+        st.pending.remove(i);
+        if r == 0 {
+            st.otime = current_time_secs();
+        }
+        q.status.store(r, Ordering::Release);
+        woke = true;
+        if r == 0 && q.alter {
+            i = 0;
+        }
+    }
+    woke
 }
 
 impl SemArray {
     /// Create a new semaphore array
     pub fn new(key: i32, nsems: u32, mode: u16, ns: Arc<IpcNamespace>) -> Result<Arc<Self>, i32> {
-        let mut sems = Vec::with_capacity(nsems as usize);
-        for _ in 0..nsems {
-            sems.push(Sem::new());
-        }
-
-        let now = current_time_secs();
-
         Ok(Arc::new(Self {
             perm: KernIpcPerm::new(key, mode),
-            otime: AtomicI64::new(0),
-            ctime: AtomicI64::new(now),
             nsems,
-            sems,
-            pending: Mutex::new(VecDeque::new()),
+            sem: Mutex::new(SemState {
+                val: vec![0; nsems as usize],
+                pid: vec![0; nsems as usize],
+                pending: VecDeque::new(),
+                otime: 0,
+                ctime: current_time_secs(),
+            }),
             waitq: WaitQueue::new(),
             ns,
         }))
     }
 
-    /// Try to perform operations atomically
-    ///
-    /// Returns Ok(true) if all ops succeeded, Ok(false) if would block, Err on error
-    fn try_atomic_ops(&self, sops: &[Sembuf]) -> Result<bool, i32> {
-        // First pass: check if all operations can succeed
-        for sop in sops {
-            let sem_num = sop.sem_num as usize;
-            if sem_num >= self.nsems as usize {
-                return Err(KernelError::FileTooLarge.errno());
-            }
-
-            let semval = self.sems[sem_num].semval.load(Ordering::Acquire);
-            let result = semval + sop.sem_op as i32;
-
-            if sop.sem_op < 0 {
-                // Decrement: must have enough
-                if result < 0 {
-                    return Ok(false); // Would block
-                }
-            } else if sop.sem_op == 0 {
-                // Wait for zero
-                if semval != 0 {
-                    return Ok(false); // Would block
-                }
-            }
-            // Increment always succeeds (unless overflow)
-            if result > SEMVMX {
-                return Err(KernelError::Range.errno());
-            }
+    /// The array's state, or EIDRM once removed (Linux sem_lock then
+    /// ipc_valid_object)
+    fn lock_valid(&self) -> Result<crate::sync::spin::MutexGuard<'_, SemState>, i32> {
+        let st = self.sem.lock();
+        if self.perm.is_deleted() {
+            return Err(KernelError::IdentifierRemoved.errno());
         }
-
-        // Second pass: apply all operations
-        let pid = current_pid() as i32;
-        for sop in sops {
-            let sem_num = sop.sem_num as usize;
-            let sem = &self.sems[sem_num];
-
-            if sop.sem_op != 0 {
-                sem.semval.fetch_add(sop.sem_op as i32, Ordering::AcqRel);
-            }
-            sem.sempid.store(pid, Ordering::Release);
-        }
-
-        self.otime.store(current_time_secs(), Ordering::Release);
-        Ok(true)
+        Ok(st)
     }
 
-    /// Wake up any pending operations that can now proceed
-    fn wake_pending(&self) {
-        let mut pending = self.pending.lock();
-        let mut i = 0;
-
-        while i < pending.len() {
-            let queue = &pending[i];
-            if queue.woken.load(Ordering::Acquire) {
-                i += 1;
-                continue;
-            }
-
-            // Try the operation
-            match self.try_atomic_ops(&queue.sops) {
-                Ok(true) => {
-                    // Success - wake the task
-                    queue.status.store(0, Ordering::Release);
-                    queue.woken.store(true, Ordering::Release);
-                    self.waitq.wake_all();
-                    pending.remove(i);
-                }
-                Ok(false) => {
-                    // Still blocked
-                    i += 1;
-                }
-                Err(e) => {
-                    // Error - wake with error
-                    queue.status.store(-e, Ordering::Release);
-                    queue.woken.store(true, Ordering::Release);
-                    self.waitq.wake_all();
-                    pending.remove(i);
-                }
-            }
+    /// After a change under the lock: complete what can proceed, then
+    /// (after the caller drops the lock) wake the sleepers
+    fn unlock_and_wake(&self, mut st: crate::sync::spin::MutexGuard<'_, SemState>) {
+        let woke = update_queue(&mut st);
+        drop(st);
+        if woke {
+            self.waitq.wake_all();
         }
     }
 
     /// Fill semid64_ds structure for IPC_STAT
-    pub fn fill_semid64_ds(&self, ds: &mut Semid64Ds) {
+    fn fill_semid64_ds(&self, st: &SemState, ds: &mut Semid64Ds) {
         self.perm.fill_ipc64_perm(&mut ds.sem_perm);
-        ds.sem_otime = self.otime.load(Ordering::Relaxed);
-        ds.sem_ctime = self.ctime.load(Ordering::Relaxed);
+        ds.sem_otime = st.otime;
+        ds.sem_ctime = st.ctime;
         ds.sem_nsems = self.nsems as u64;
         ds.__unused3 = 0;
         ds.__unused4 = 0;
@@ -229,19 +218,18 @@ impl IpcObject for SemArray {
         &self.perm
     }
 
+    /// Linux freeary: every waiter fails with EIDRM
     fn destroy(&self) {
-        // Wake all pending operations with EIDRM
-        let mut pending = self.pending.lock();
-        for queue in pending.drain(..) {
-            queue.status.store(
-                KernelError::IdentifierRemoved.to_errno_neg(),
-                Ordering::Release,
-            );
-            queue.woken.store(true, Ordering::Release);
+        {
+            let mut st = self.sem.lock();
+            for q in st.pending.drain(..) {
+                q.status.store(
+                    KernelError::IdentifierRemoved.to_errno_neg(),
+                    Ordering::Release,
+                );
+            }
         }
         self.waitq.wake_all();
-
-        // Update namespace count
         self.ns.used_sems.fetch_sub(self.nsems, Ordering::Relaxed);
     }
 }
@@ -333,135 +321,124 @@ crate::pod!(SemTimespec { tv_sec, tv_nsec });
 
 fn do_semtimedop(semid: i32, sops_ptr: u64, nsops: usize, timeout_ptr: u64) -> Result<i32, i32> {
     let ns = current_ipc_ns();
+    let einval = KernelError::InvalidArgument.errno();
 
-    // Validate
-    if nsops == 0 || nsops > ns.sem_ctls[2] as usize {
-        return Err(KernelError::ArgListTooLong.errno());
-    }
-
-    // Parse timeout if provided
-    // A relative timeout on CLOCK_MONOTONIC (Linux ktime_get() + timeout)
-    let deadline_ns: Option<u64> = if timeout_ptr != 0 {
-        let ts: SemTimespec = get_user::<Uaccess, SemTimespec>(timeout_ptr)
-            .map_err(|_| KernelError::BadAddress.errno())?;
-        // Validate timeout
-        if ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1_000_000_000 {
-            return Err(KernelError::InvalidArgument.errno());
-        }
-        let timeout_ns = crate::time::timespec_to_ns(ts.tv_sec, ts.tv_nsec);
-        Some(crate::time::deadline_after(
-            crate::time::monotonic_ns(),
-            timeout_ns,
-        ))
+    // Linux order: the timeout is copied in, then nsops (E2BIG, EINVAL),
+    // the operations, semid and the timeout's validity
+    let ts = if timeout_ptr != 0 {
+        Some(
+            get_user::<Uaccess, SemTimespec>(timeout_ptr)
+                .map_err(|_| KernelError::BadAddress.errno())?,
+        )
     } else {
         None
     };
-
-    // Read operations from user
+    if nsops > ns.sem_ctls[2] as usize {
+        return Err(KernelError::ArgListTooLong.errno());
+    }
+    if nsops == 0 {
+        return Err(einval);
+    }
     let mut sops = vec![Sembuf::default(); nsops];
-    for (i, sop) in sops.iter_mut().enumerate().take(nsops) {
+    for (i, sop) in sops.iter_mut().enumerate() {
         let offset = sops_ptr + (i * core::mem::size_of::<Sembuf>()) as u64;
         *sop = get_user::<Uaccess, Sembuf>(offset).map_err(|_| KernelError::BadAddress.errno())?;
     }
+    if semid < 0 {
+        return Err(einval);
+    }
+    // A relative timeout on CLOCK_MONOTONIC (Linux ktime_get() + timeout)
+    let deadline_ns = match ts {
+        Some(ts) if ts.tv_sec < 0 || !(0..1_000_000_000).contains(&ts.tv_nsec) => {
+            return Err(einval);
+        }
+        Some(ts) => Some(crate::time::deadline_after(
+            crate::time::monotonic_ns(),
+            crate::time::timespec_to_ns(ts.tv_sec, ts.tv_nsec),
+        )),
+        None => None,
+    };
 
-    // Check for IPC_NOWAIT in any operation
-    let nowait = sops.iter().any(|s| s.sem_flg & IPC_NOWAIT as i16 != 0);
-    // Check if any operation has SEM_UNDO flag
+    let max = sops.iter().map(|s| s.sem_num as u32).max().unwrap_or(0);
     let has_undo = sops.iter().any(|s| s.sem_flg & SEM_UNDO != 0);
-
-    // Find semaphore set
-    let sem_array = ns
-        .sem_ids()
-        .find_by_id(semid)
-        .ok_or(KernelError::InvalidArgument.errno())?;
-    let sem_array: &SemArray = &sem_array;
-
-    // Check permissions
     let alter = sops.iter().any(|s| s.sem_op != 0);
+
+    let sem_array = ns.sem_ids().find_by_id(semid).ok_or(einval)?;
+    let sem_array: &SemArray = &sem_array;
+    if max >= sem_array.nsems {
+        return Err(KernelError::FileTooLarge.errno());
+    }
     let access = if alter { IPC_PERM_WRITE } else { IPC_PERM_READ };
     ipc_checkperm(&sem_array.perm, access)?;
 
-    let nsems = sem_array.nsems as usize;
-
-    // Try the operation
-    loop {
-        match sem_array.try_atomic_ops(&sops) {
-            Ok(true) => {
-                // Success - record SEM_UNDO adjustments if needed
-                if has_undo {
-                    record_undo_for_ops(semid, nsems, &sops);
-                }
-                sem_array.wake_pending();
-                return Ok(0);
-            }
-            Ok(false) => {
-                // Would block
-                if nowait {
-                    return Err(KernelError::WouldBlock.errno());
-                }
-
-                // Check timeout before blocking
-                if deadline_ns.is_some_and(|d| crate::time::monotonic_ns() >= d) {
-                    return Err(KernelError::WouldBlock.errno());
-                }
-
-                // Add to pending queue
-                let queue = Arc::new(SemQueue {
-                    tid: current_tid(),
-                    sops: sops.clone(),
-                    status: AtomicI32::new(0),
-                    woken: AtomicBool::new(false),
-                    alter,
-                });
-
-                {
-                    let mut pending = sem_array.pending.lock();
-                    pending.push_back(queue.clone());
-                }
-
-                // Sleep until woken, the deadline or a signal (semop is
-                // never restarted: EINTR)
-                let r = sem_array.waitq.wait_event_interruptible_deadline(
-                    || queue.woken.load(Ordering::Acquire),
-                    deadline_ns,
-                    crate::time::hrtimer::HrClock::Monotonic,
-                );
-                if r.is_err() && !queue.woken.load(Ordering::Acquire) {
-                    sem_array.pending.lock().retain(|q| !Arc::ptr_eq(q, &queue));
-                    // A wakeup may have raced with the removal
-                    if !queue.woken.load(Ordering::Acquire) {
-                        return Err(KernelError::Interrupted.errno());
-                    }
-                }
-
-                // Check result
-                if queue.woken.load(Ordering::Acquire) {
-                    let status = queue.status.load(Ordering::Acquire);
-                    if status < 0 {
-                        return Err(-status);
-                    }
-                    // Success - record SEM_UNDO adjustments if needed
-                    if has_undo {
-                        record_undo_for_ops(semid, nsems, &sops);
-                    }
-                    return Ok(0);
-                }
-
-                // Check timeout after spurious wakeup or yield
-                if deadline_ns.is_some_and(|d| crate::time::monotonic_ns() >= d) {
-                    // Remove from pending queue
-                    {
-                        let mut pending = sem_array.pending.lock();
-                        pending.retain(|q| !Arc::ptr_eq(q, &queue));
-                    }
-                    return Err(KernelError::WouldBlock.errno());
-                }
-
-                // Spurious wakeup or polling iteration, retry
-            }
-            Err(e) => return Err(e),
+    let pid = current_pid() as i32;
+    let mut st = sem_array.lock_valid()?;
+    let r = perform_atomic_semop(&mut st, &sops, pid);
+    if r <= 0 {
+        if r == 0 {
+            st.otime = current_time_secs();
         }
+        if r == 0 && alter {
+            sem_array.unlock_and_wake(st);
+        } else {
+            drop(st);
+        }
+        if r < 0 {
+            return Err(-r);
+        }
+        if has_undo {
+            record_undo_for_ops(semid, sem_array.nsems as usize, &sops);
+        }
+        return Ok(0);
     }
+
+    // Would block: queue it and sleep (Linux: the status is -EINTR until
+    // a waker completes the operation)
+    let queue = Arc::new(SemQueue {
+        pid,
+        sops,
+        alter,
+        status: AtomicI32::new(SEM_WAITING),
+    });
+    st.pending.push_back(queue.clone());
+    drop(st);
+    let status = loop {
+        // Sleep until completed, the deadline or a signal (semop is
+        // never restarted: EINTR)
+        let r = sem_array.waitq.wait_event_interruptible_deadline(
+            || queue.status.load(Ordering::Acquire) != SEM_WAITING,
+            deadline_ns,
+            crate::time::hrtimer::HrClock::Monotonic,
+        );
+        let status = queue.status.load(Ordering::Acquire);
+        if status != SEM_WAITING {
+            break status;
+        }
+        // Not completed: recheck under the lock, then unlink
+        let mut st = sem_array.lock_valid()?;
+        let status = queue.status.load(Ordering::Acquire);
+        if status != SEM_WAITING {
+            break status;
+        }
+        let timed_out = match r {
+            Ok(true) => continue,
+            Ok(false) => true,
+            Err(_) => false,
+        };
+        st.pending.retain(|q| !Arc::ptr_eq(q, &queue));
+        return Err(if timed_out {
+            KernelError::WouldBlock.errno()
+        } else {
+            KernelError::Interrupted.errno()
+        });
+    };
+    if status < 0 {
+        return Err(-status);
+    }
+    if has_undo {
+        record_undo_for_ops(semid, sem_array.nsems as usize, &queue.sops);
+    }
+    Ok(0)
 }
 
 /// semctl - semaphore control
@@ -485,7 +462,7 @@ fn do_semctl(semid: i32, semnum: i32, cmd: i32, arg: u64) -> Result<i32, i32> {
             let sem_array: &SemArray = &sem;
 
             let mut ds = Semid64Ds::default();
-            sem_array.fill_semid64_ds(&mut ds);
+            sem_array.fill_semid64_ds(&sem_array.sem.lock(), &mut ds);
 
             if arg != 0 {
                 put_user::<Uaccess, Semid64Ds>(arg, ds)
@@ -517,7 +494,7 @@ fn do_semctl(semid: i32, semnum: i32, cmd: i32, arg: u64) -> Result<i32, i32> {
                 p.gid = ds.sem_perm.gid;
                 p.mode = ds.sem_perm.mode & 0o777;
             }
-            sem.ctime.store(current_time_secs(), Ordering::Relaxed);
+            sem.sem.lock().ctime = current_time_secs();
 
             Ok(0)
         }
@@ -556,10 +533,7 @@ fn do_semctl(semid: i32, semnum: i32, cmd: i32, arg: u64) -> Result<i32, i32> {
                 return Err(KernelError::InvalidArgument.errno());
             }
 
-            let val = sem_array.sems[semnum as usize]
-                .semval
-                .load(Ordering::Acquire);
-            Ok(val)
+            Ok(sem_array.lock_valid()?.val[semnum as usize])
         }
 
         SETVAL => {
@@ -581,18 +555,12 @@ fn do_semctl(semid: i32, semnum: i32, cmd: i32, arg: u64) -> Result<i32, i32> {
                 return Err(KernelError::Range.errno());
             }
 
-            sem_array.sems[semnum as usize]
-                .semval
-                .store(val, Ordering::Release);
-            sem_array.sems[semnum as usize]
-                .sempid
-                .store(current_pid() as i32, Ordering::Release);
-            sem_array
-                .ctime
-                .store(current_time_secs(), Ordering::Release);
-
-            // Wake pending operations
-            sem_array.wake_pending();
+            // Linux semctl_setval
+            let mut st = sem_array.lock_valid()?;
+            st.val[semnum as usize] = val;
+            st.pid[semnum as usize] = current_pid() as i32;
+            st.ctime = current_time_secs();
+            sem_array.unlock_and_wake(st);
 
             Ok(0)
         }
@@ -607,13 +575,11 @@ fn do_semctl(semid: i32, semnum: i32, cmd: i32, arg: u64) -> Result<i32, i32> {
 
             let sem_array: &SemArray = &sem;
 
-            for (i, s) in sem_array.sems[..sem_array.nsems as usize]
-                .iter()
-                .enumerate()
-            {
-                let val = s.semval.load(Ordering::Acquire) as u16;
+            // A snapshot under the lock, copied out after it
+            let vals = sem_array.lock_valid()?.val.clone();
+            for (i, &v) in vals.iter().enumerate() {
                 let offset = arg + (i * 2) as u64;
-                put_user::<Uaccess, u16>(offset, val)
+                put_user::<Uaccess, u16>(offset, v as u16)
                     .map_err(|_| KernelError::BadAddress.errno())?;
             }
 
@@ -630,27 +596,24 @@ fn do_semctl(semid: i32, semnum: i32, cmd: i32, arg: u64) -> Result<i32, i32> {
 
             let sem_array: &SemArray = &sem;
 
-            let pid = current_pid() as i32;
-            for (i, s) in sem_array.sems[..sem_array.nsems as usize]
-                .iter()
-                .enumerate()
-            {
+            // Copied in and checked first, then set under the lock
+            // (Linux semctl_main SETALL)
+            let mut vals = vec![0i32; sem_array.nsems as usize];
+            for (i, v) in vals.iter_mut().enumerate() {
                 let offset = arg + (i * 2) as u64;
                 let val: u16 = get_user::<Uaccess, u16>(offset)
                     .map_err(|_| KernelError::BadAddress.errno())?;
-
-                if val as i32 > SEMVMX {
-                    return Err(KernelError::Range.errno());
-                }
-
-                s.semval.store(val as i32, Ordering::Release);
-                s.sempid.store(pid, Ordering::Release);
+                *v = val as i32;
             }
-
-            sem_array
-                .ctime
-                .store(current_time_secs(), Ordering::Release);
-            sem_array.wake_pending();
+            if vals.iter().any(|&v| v > SEMVMX) {
+                return Err(KernelError::Range.errno());
+            }
+            let pid = current_pid() as i32;
+            let mut st = sem_array.lock_valid()?;
+            st.val = vals;
+            st.pid.fill(pid);
+            st.ctime = current_time_secs();
+            sem_array.unlock_and_wake(st);
 
             Ok(0)
         }
@@ -669,10 +632,7 @@ fn do_semctl(semid: i32, semnum: i32, cmd: i32, arg: u64) -> Result<i32, i32> {
                 return Err(KernelError::InvalidArgument.errno());
             }
 
-            let pid = sem_array.sems[semnum as usize]
-                .sempid
-                .load(Ordering::Acquire);
-            Ok(pid)
+            Ok(sem_array.lock_valid()?.pid[semnum as usize])
         }
 
         GETNCNT | GETZCNT => {
@@ -885,22 +845,20 @@ pub fn exit_sem(tid: Tid) {
 
         let sem_array: &SemArray = &sem_obj;
 
-        // Apply adjustments
+        // Apply the adjustments under the lock, then complete what can
+        // proceed (Linux exit_sem)
         let pid = current_pid() as i32;
+        let Ok(mut st) = sem_array.lock_valid() else {
+            continue;
+        };
         for (i, &adj) in undo.semadj.iter().enumerate() {
             if adj == 0 || i >= sem_array.nsems as usize {
                 continue;
             }
-
-            let sem = &sem_array.sems[i];
-            let old_val = sem.semval.load(Ordering::Acquire);
-            let new_val = (old_val + adj as i32).clamp(0, SEMVMX);
-            sem.semval.store(new_val, Ordering::Release);
-            sem.sempid.store(pid, Ordering::Release);
+            st.val[i] = (st.val[i] + adj as i32).clamp(0, SEMVMX);
+            st.pid[i] = pid;
         }
-
-        // Wake any pending operations that may now succeed
-        sem_array.wake_pending();
+        sem_array.unlock_and_wake(st);
     }
 }
 
