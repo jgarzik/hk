@@ -4,7 +4,7 @@
 //! a process's files follows its dumpability, and inode numbers do not
 //! collide
 
-use super::helpers::{print, print_num, println};
+use super::helpers::{host_mode, print, print_num, println};
 use hk_syscall::{
     O_RDONLY, PR_SET_DUMPABLE, Stat, sys_close, sys_exit, sys_fork, sys_kill, sys_open, sys_pipe2,
     sys_prctl, sys_read, sys_readlink, sys_setgid, sys_setuid, sys_stat, sys_wait4, sys_write,
@@ -240,13 +240,13 @@ fn drop_dentries() -> R {
         let _ = stat(proc_path(&mut b, me, &rest[..4 + k]));
     }
     let before = nr_dentry();
-    // Until they go (at most 8 writes): drop_caches is best effort. A
-    // pass may only clear each dentry's referenced bit (Linux
-    // dentry_lru_isolate: LRU_ROTATE), drop_slab goes round again only
-    // when a round freed more than 10, and Linux 7.0 can free nothing
-    // in the first two writes after boot
+    // Until they go: drop_caches is best effort. A pass may only clear
+    // each dentry's referenced bit (Linux dentry_lru_isolate:
+    // LRU_ROTATE), so hk gets two writes; Linux 7.0 can free nothing in
+    // the first two writes after boot, so the host gets up to 8
+    let tries = if host_mode() { 8 } else { 2 };
     let (mut w, mut after) = (0, before);
-    for _ in 0..8 {
+    for _ in 0..tries {
         let fd = sys_open(b"/proc/sys/vm/drop_caches\0".as_ptr(), 1, 0);
         w = sys_write(fd as u64, b"2\n".as_ptr(), 2);
         sys_close(fd as u64);
