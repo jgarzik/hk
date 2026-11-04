@@ -159,7 +159,7 @@ fn statx(path: &[u8], mask: u32) -> Result<Statx, i64> {
     }
 }
 
-/// statx always reports the mount id; the unique one (from 2^32) when
+/// statx always reports the mount id; the unique one (from 2^31) when
 /// asked for it
 fn check_statx(id: u64) -> R {
     let st = statx(b"/tmp/mi\0", STATX_INO).map_err(|e| (&b"statx"[..], e))?;
@@ -171,9 +171,10 @@ fn check_statx(id: u64) -> R {
         u.stx_mask & STATX_MNT_ID_UNIQUE != 0,
         u.stx_mask as i64,
     )?;
+    // Above 2^31 (Linux 6.11+, hk) or 2^32 (older): never a reused id
     check(
         b"unique id",
-        u.stx_mnt_id > u32::MAX as u64,
+        u.stx_mnt_id > i32::MAX as u64,
         u.stx_mnt_id as i64,
     )
 }
