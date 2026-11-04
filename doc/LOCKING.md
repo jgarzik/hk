@@ -148,8 +148,10 @@ user page faults, blocking pipe/socket I/O).
 - `RwSem<T>` (typed; `RwSem<()>` guards what its owner says):
   `read`/`write` guards, `read_killable`/`write_killable` (Linux
   down_*_killable: a `Killable` sleep, woken by wakeups and SIGKILL
-  only, that gives up with EINTR once SIGKILL is pending), `try_read`/
-  `try_write`, and the raw `down_read`/`up_read`, `down_write`/
+  only, that gives up with EINTR once SIGKILL is pending),
+  `read_interruptible`/`write_interruptible` (Linux
+  down_*_interruptible: any pending signal gives up with EINTR; no
+  caller yet), `try_read`/`try_write`, and the raw `down_read`/`up_read`, `down_write`/
   `up_write` pairs; writer preference: once a writer waits, new readers
   wait behind it (a killable writer that gives up wakes them). Its
   count word is a short `spin::Mutex` leaf never held across a sleep;

@@ -8,9 +8,10 @@
 //! sleep on one wait queue and are all woken on release (their
 //! conditions differ, see LOCKING.md wait queues).
 //!
-//! `read`/`write` return guards; `*_killable` give up with
-//! `KernelError::Interrupted` (EINTR) once SIGKILL is pending (Linux
-//! down_read_killable / down_write_killable); `try_*` never sleep. The
+//! `read`/`write` return guards; `*_interruptible` give up with
+//! `KernelError::Interrupted` (EINTR) once a signal is pending and
+//! `*_killable` once SIGKILL is (Linux down_read_interruptible,
+//! down_read_killable and the write forms); `try_*` never sleep. The
 //! raw `down_*`/`up_*` pairs serve callers that lock and unlock in
 //! different scopes.
 #![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
@@ -22,6 +23,7 @@ use crate::sync::spin::Mutex as SpinMutex;
 
 use super::{can_sleep, might_sleep};
 use crate::sync::waitqueue::WaitQueue;
+use crate::task::percpu::SleepState;
 use crate::util::error::KernelError;
 
 #[derive(Default)]
@@ -79,19 +81,25 @@ impl<T> RwSem<T> {
 }
 
 impl<T: ?Sized> RwSem<T> {
-    /// Sleep (or spin before scheduling) until `ok` might hold; with
-    /// `killable`, give up once SIGKILL is pending
-    fn wait(&self, ok: fn(&Count) -> bool, killable: bool) -> Result<(), KernelError> {
+    /// Sleep (or spin before scheduling) in `state` until `ok` might
+    /// hold: an interruptible sleep gives up on a signal, a killable one
+    /// on SIGKILL (EINTR)
+    fn wait(&self, ok: fn(&Count) -> bool, state: SleepState) -> Result<(), KernelError> {
         if !can_sleep() {
             core::hint::spin_loop();
             return Ok(());
         }
         let cond = || ok(&self.count.lock());
-        if killable {
-            self.wq.wait_event_killable(cond)
-        } else {
-            self.wq.wait_event(cond);
-            Ok(())
+        match state {
+            SleepState::Interruptible => self
+                .wq
+                .wait_event_interruptible(cond)
+                .map_err(|_| KernelError::Interrupted),
+            SleepState::Killable => self.wq.wait_event_killable(cond),
+            _ => {
+                self.wq.wait_event(cond);
+                Ok(())
+            }
         }
     }
 
@@ -116,17 +124,17 @@ impl<T: ?Sized> RwSem<T> {
         ok
     }
 
-    fn lock_read(&self, killable: bool) -> Result<(), KernelError> {
+    fn lock_read(&self, state: SleepState) -> Result<(), KernelError> {
         while !self.grab_read() {
-            self.wait(Count::read_ok, killable)?;
+            self.wait(Count::read_ok, state)?;
         }
         Ok(())
     }
 
-    fn lock_write(&self, killable: bool) -> Result<(), KernelError> {
+    fn lock_write(&self, state: SleepState) -> Result<(), KernelError> {
         self.count.lock().waiting_writers += 1;
         while !self.grab_write() {
-            if let Err(e) = self.wait(Count::write_ok, killable) {
+            if let Err(e) = self.wait(Count::write_ok, state) {
                 self.count.lock().waiting_writers -= 1;
                 // Readers queued behind this writer may go now
                 self.wq.wake_all();
@@ -140,7 +148,7 @@ impl<T: ?Sized> RwSem<T> {
     #[track_caller]
     pub fn down_read(&self) {
         might_sleep();
-        let _ = self.lock_read(false);
+        let _ = self.lock_read(SleepState::Uninterruptible);
     }
 
     /// Release a shared hold (Linux up_read)
@@ -162,7 +170,7 @@ impl<T: ?Sized> RwSem<T> {
     #[track_caller]
     pub fn down_write(&self) {
         might_sleep();
-        let _ = self.lock_write(false);
+        let _ = self.lock_write(SleepState::Uninterruptible);
     }
 
     /// Release an exclusive hold (Linux up_write)
@@ -193,7 +201,7 @@ impl<T: ?Sized> RwSem<T> {
     #[track_caller]
     pub fn read_killable(&self) -> Result<RwSemReadGuard<'_, T>, KernelError> {
         might_sleep();
-        self.lock_read(true)?;
+        self.lock_read(SleepState::Killable)?;
         Ok(RwSemReadGuard { s: self })
     }
 
@@ -202,7 +210,25 @@ impl<T: ?Sized> RwSem<T> {
     #[track_caller]
     pub fn write_killable(&self) -> Result<RwSemWriteGuard<'_, T>, KernelError> {
         might_sleep();
-        self.lock_write(true)?;
+        self.lock_write(SleepState::Killable)?;
+        Ok(RwSemWriteGuard { s: self })
+    }
+
+    /// Shared hold, or EINTR once a signal is pending (Linux
+    /// down_read_interruptible)
+    #[track_caller]
+    pub fn read_interruptible(&self) -> Result<RwSemReadGuard<'_, T>, KernelError> {
+        might_sleep();
+        self.lock_read(SleepState::Interruptible)?;
+        Ok(RwSemReadGuard { s: self })
+    }
+
+    /// Exclusive hold, or EINTR once a signal is pending (Linux
+    /// down_write_interruptible)
+    #[track_caller]
+    pub fn write_interruptible(&self) -> Result<RwSemWriteGuard<'_, T>, KernelError> {
+        might_sleep();
+        self.lock_write(SleepState::Interruptible)?;
         Ok(RwSemWriteGuard { s: self })
     }
 
