@@ -217,14 +217,16 @@ fn virtio_attrs(dev: &Arc<Device>) -> Result<(), KernelError> {
             let _ = writeln!(o, "0x{:08x}", st.status());
         }),
     )?;
-    // Linux features_show: the first 64 bits, one digit each
+    // Linux features_show: VIRTIO_FEATURES_BITS (128 since 6.17), one
+    // digit each; hk negotiates only the first 64
     dev.create_file(
         b"features",
         0o444,
         kernfs::show(move |o| {
             let f = v.features();
-            for i in 0..64 {
-                o.bytes(if f & (1 << i) != 0 { b"1" } else { b"0" });
+            for i in 0..128 {
+                let on = i < 64 && f & (1 << i) != 0;
+                o.bytes(if on { b"1" } else { b"0" });
             }
             o.bytes(b"\n");
         }),
