@@ -245,14 +245,3 @@ impl UserNamespace {
 /// All processes belong to this namespace unless they create child namespaces.
 /// This namespace has an identity UID/GID mapping.
 pub static INIT_USER_NS: Lazy<Arc<UserNamespace>> = Lazy::new(UserNamespace::new_init);
-
-/// Check if a user can set UID/GID maps for a target process
-///
-/// Per Linux semantics:
-/// - Must have CAP_SETUID/CAP_SETGID in the target's user namespace
-/// - Or be the target process itself (and have appropriate permissions)
-pub fn can_set_uid_gid_map(_target_ns: &UserNamespace) -> bool {
-    // For now, only allow root (euid 0) to set mappings
-    let cred = percpu::current_cred();
-    cred.euid == 0
-}

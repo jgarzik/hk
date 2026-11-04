@@ -221,7 +221,7 @@ pub fn sys_uname(buf: u64) -> i64 {
 /// sys_sethostname - set hostname
 ///
 /// Sets the hostname (nodename) in the current UTS namespace.
-/// Requires CAP_SYS_ADMIN (currently: euid == 0).
+/// Requires CAP_SYS_ADMIN.
 ///
 /// # Arguments
 /// * `name` - User pointer to hostname string
@@ -233,11 +233,9 @@ pub fn sys_uname(buf: u64) -> i64 {
 /// * -EINVAL if len > 64
 /// * -EFAULT if user pointer is invalid
 pub fn sys_sethostname(name: u64, len: u64) -> i64 {
-    use crate::task::percpu;
-
-    // Permission check (CAP_SYS_ADMIN in UTS ns's user ns)
-    // For now: check euid == 0
-    if percpu::current_cred().euid != 0 {
+    // Linux sethostname: CAP_SYS_ADMIN (in the UTS namespace's user
+    // namespace; hk has one set of capabilities)
+    if !crate::task::capable(crate::task::CAP_SYS_ADMIN) {
         return KernelError::NotPermitted.sysret();
     }
 
@@ -270,7 +268,7 @@ pub fn sys_sethostname(name: u64, len: u64) -> i64 {
 /// sys_setdomainname - set NIS domain name
 ///
 /// Sets the domainname in the current UTS namespace.
-/// Requires CAP_SYS_ADMIN (currently: euid == 0).
+/// Requires CAP_SYS_ADMIN.
 ///
 /// # Arguments
 /// * `name` - User pointer to domainname string
@@ -282,10 +280,8 @@ pub fn sys_sethostname(name: u64, len: u64) -> i64 {
 /// * -EINVAL if len > 64
 /// * -EFAULT if user pointer is invalid
 pub fn sys_setdomainname(name: u64, len: u64) -> i64 {
-    use crate::task::percpu;
-
-    // Permission check
-    if percpu::current_cred().euid != 0 {
+    // Linux setdomainname: CAP_SYS_ADMIN, as sethostname
+    if !crate::task::capable(crate::task::CAP_SYS_ADMIN) {
         return KernelError::NotPermitted.sysret();
     }
 

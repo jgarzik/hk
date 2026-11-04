@@ -5,6 +5,9 @@
 //!   process that kept CAP_SETUID (PR_SET_KEEPCAPS) may setuid to any
 //!   uid, but not setgid without CAP_SETGID (Linux kernel/sys.c
 //!   ns_capable_setid).
+//! - NS_CAPS: root without CAP_SYS_ADMIN is refused sethostname,
+//!   setdomainname, unshare(CLONE_NEWUTS) and setns (EPERM); uid 1000
+//!   holding CAP_SYS_ADMIN may unshare a UTS namespace and name it.
 
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
@@ -16,10 +19,14 @@ use hk_syscall::{
 const EPERM: i64 = -1;
 const CAP_SETGID: u32 = 6;
 const CAP_SETUID: u32 = 7;
+const CAP_SYS_ADMIN: u32 = 21;
+const CLONE_NEWUTS: u64 = 0x0400_0000;
 
 pub fn run_tests() {
     report(b"SETID_CAPS_DROPPED", in_child(setid_dropped));
     report(b"SETID_CAPS_KEPT", in_child(setid_kept));
+    report(b"NS_CAPS_DROPPED", in_child(ns_dropped));
+    report(b"NS_CAPS_KEPT", in_child(ns_kept));
 }
 
 fn report(name: &[u8], step: u64) {
@@ -103,6 +110,49 @@ fn setid_kept() -> u64 {
     }
     if sys_setgid(3000) != EPERM {
         return 5;
+    }
+    0
+}
+
+/// Root minus CAP_SYS_ADMIN
+fn ns_dropped() -> u64 {
+    if !set_effective(!(1u32 << CAP_SYS_ADMIN)) {
+        return 1;
+    }
+    let name = b"nocap";
+    if hk_syscall::sys_sethostname(name.as_ptr(), name.len() as u64) != EPERM {
+        return 2;
+    }
+    if hk_syscall::sys_setdomainname(name.as_ptr(), name.len() as u64) != EPERM {
+        return 3;
+    }
+    if hk_syscall::sys_unshare(CLONE_NEWUTS) != EPERM {
+        return 4;
+    }
+    let fd = hk_syscall::sys_open(b"/proc/self/ns/uts\0".as_ptr(), hk_syscall::O_RDONLY, 0);
+    if fd < 0 {
+        return 5;
+    }
+    if hk_syscall::sys_setns(fd as i32, CLONE_NEWUTS as i32) != EPERM {
+        return 6;
+    }
+    0
+}
+
+/// uid 1000 that kept its capabilities, CAP_SYS_ADMIN in effective
+fn ns_kept() -> u64 {
+    if sys_prctl(PR_SET_KEEPCAPS, 1, 0, 0, 0) != 0 || sys_setresuid(1000, 1000, 1000) != 0 {
+        return 1;
+    }
+    if !set_effective(1 << CAP_SYS_ADMIN) {
+        return 2;
+    }
+    if hk_syscall::sys_unshare(CLONE_NEWUTS) != 0 {
+        return 3;
+    }
+    let name = b"capns";
+    if hk_syscall::sys_sethostname(name.as_ptr(), name.len() as u64) != 0 {
+        return 4;
     }
     0
 }

@@ -314,6 +314,12 @@ linked on hk without CAP_DAC_READ_SEARCH; Linux gives ENOENT. The
 capability is checked in the caller's namespace (Linux: the opener's
 `user_ns`); hk has one user namespace.
 
+User namespaces grant no capabilities: creating any namespace but a
+user namespace needs the caller's own CAP_SYS_ADMIN, even together with
+CLONE_NEWUSER (Linux checks in the new user namespace, where the caller
+holds every capability), and /proc/<pid>/uid_map and gid_map cannot be
+written.
+
 ## sysfs gaps
 
 **Location**: `fs/kernfs/`, `fs/sysfs.rs`, `base/`, `block/genhd.rs`,
