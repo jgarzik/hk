@@ -35,15 +35,23 @@
 //!   on others keep switching the array into complex mode: the mutex
 //!   loses no increment, no waiter misses its wakeup (2 s timeouts),
 //!   and the moved units are all there.
+//!
+//! Message queues (Linux ipc/msg.c, one lock over the queue's state):
+//! - MSGCTL_QBYTES: an unprivileged owner may lower and raise qbytes up
+//!   to MSGMNB; above it needs CAP_SYS_RESOURCE (EPERM), as
+//!   msgctl_down.
+//! - MSG_STAT_STRESS: while one process sends and another receives
+//!   fixed-size messages, every IPC_STAT shows cbytes = qnum * size.
 
 use core::sync::atomic::{AtomicI32, Ordering};
 
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
     GETALL, GETNCNT, GETVAL, GETZCNT, IPC_CREAT, IPC_EXCL, IPC_NOWAIT, IPC_PRIVATE, IPC_RMID,
-    IPC_SET, MAP_ANONYMOUS, MAP_SHARED, PROT_READ, PROT_WRITE, SETVAL, Sembuf, Timespec,
-    sys_clock_gettime, sys_exit, sys_fork, sys_mmap, sys_msgctl, sys_munmap, sys_semctl,
-    sys_semget, sys_semop, sys_semtimedop, sys_shmctl, sys_shmget, sys_wait4,
+    IPC_SET, IPC_STAT, MAP_ANONYMOUS, MAP_SHARED, PROT_READ, PROT_WRITE, SETVAL, Sembuf, Timespec,
+    sys_clock_gettime, sys_exit, sys_fork, sys_mmap, sys_msgctl, sys_msgget, sys_msgrcv,
+    sys_msgsnd, sys_munmap, sys_semctl, sys_semget, sys_semop, sys_semtimedop, sys_setuid,
+    sys_shmctl, sys_shmget, sys_wait4,
 };
 
 const EINVAL: i64 = -22;
@@ -68,6 +76,8 @@ pub fn run_tests() {
     report(b"SEM_UNDO_ERANGE", sem_undo(undo_erange_child, 0));
     report(b"SEM_NCNT", sem_ncnt());
     report(b"SEM_MIXED_STRESS", sem_mixed_stress());
+    report(b"MSGCTL_QBYTES", msgctl_qbytes());
+    report(b"MSG_STAT_STRESS", msg_stat_stress());
 }
 
 type R = Result<(), (&'static [u8], i64)>;
@@ -526,4 +536,125 @@ fn sem_mixed_stress() -> R {
     check(b"mutex 1", set.get(0) == 1, set.get(0))?;
     let units = set.get(2) + set.get(3);
     check(b"units", units == 50, units)
+}
+
+/// struct msqid64_ds (120 bytes on x86-64 and arm64) as u64 words:
+/// msg_cbytes, msg_qnum and msg_qbytes are words 9, 10 and 11
+const MSQ_WORDS: usize = 15;
+const MSG_CBYTES: usize = 9;
+const MSG_QNUM: usize = 10;
+const MSG_QBYTES: usize = 11;
+const MSGMNB: u64 = 16384;
+const EPERM: i64 = -1;
+
+fn msq_stat(id: i32) -> Result<[u64; MSQ_WORDS], i64> {
+    let mut ds = [0u64; MSQ_WORDS];
+    let r = sys_msgctl(id, IPC_STAT, ds.as_mut_ptr() as u64);
+    if r != 0 { Err(r) } else { Ok(ds) }
+}
+
+fn msq_set_qbytes(id: i32, qbytes: u64) -> i64 {
+    let Ok(mut ds) = msq_stat(id) else {
+        return -999;
+    };
+    ds[MSG_QBYTES] = qbytes;
+    sys_msgctl(id, IPC_SET, ds.as_ptr() as u64)
+}
+
+/// As uid 1000, the owner of its own queue: lower, raise to MSGMNB,
+/// past MSGMNB (EPERM)
+fn qbytes_child() -> u64 {
+    if sys_setuid(1000) != 0 {
+        return 1;
+    }
+    let id = sys_msgget(IPC_PRIVATE, IPC_CREAT | 0o600) as i32;
+    if id < 0 {
+        return 2;
+    }
+    let verdict = (|| {
+        if msq_set_qbytes(id, 100) != 0 || msq_stat(id).map(|d| d[MSG_QBYTES]) != Ok(100) {
+            return 3;
+        }
+        if msq_set_qbytes(id, MSGMNB) != 0 {
+            return 4;
+        }
+        if msq_set_qbytes(id, MSGMNB + 1) != EPERM {
+            return 5;
+        }
+        if msq_stat(id).map(|d| d[MSG_QBYTES]) != Ok(MSGMNB) {
+            return 6;
+        }
+        0
+    })();
+    sys_msgctl(id, IPC_RMID, 0);
+    verdict
+}
+
+fn msgctl_qbytes() -> R {
+    let pid = sys_fork();
+    if pid == 0 {
+        sys_exit(qbytes_child());
+    }
+    let mut ws = 0;
+    sys_wait4(pid, &mut ws, 0, 0);
+    check(b"step", ws == 0, (ws >> 8) as i64)
+}
+
+const MSG_SIZE: usize = 32;
+
+fn msg_child(i: usize, out: &[AtomicI32]) {
+    let id = out[0].load(Ordering::Relaxed);
+    let mut buf = [0u8; 8 + MSG_SIZE];
+    buf[0] = 1; // mtype 1
+    for _ in 0..ROUNDS {
+        let r = if i == 0 {
+            sys_msgsnd(id, buf.as_ptr(), MSG_SIZE, 0)
+        } else {
+            sys_msgrcv(id, buf.as_mut_ptr(), MSG_SIZE, 0, 0)
+        };
+        if r < 0 {
+            out[1 + i].store(r as i32, Ordering::Relaxed);
+            return;
+        }
+    }
+}
+
+fn msg_stat_stress() -> R {
+    let id = sys_msgget(IPC_PRIVATE, IPC_CREAT | 0o600) as i32;
+    check(b"msgget", id >= 0, id as i64)?;
+    let sh = shared(3);
+    sh[0].store(id, Ordering::Relaxed);
+    let mut pids = [0i64; 2];
+    for (i, p) in pids.iter_mut().enumerate() {
+        *p = sys_fork();
+        if *p == 0 {
+            msg_child(i, sh);
+            sys_exit(0);
+        }
+    }
+    let mut bad = None;
+    for _ in 0..ROUNDS {
+        match msq_stat(id) {
+            Ok(d) if d[MSG_CBYTES] == d[MSG_QNUM] * MSG_SIZE as u64 => {}
+            Ok(d) => {
+                bad = Some(d[MSG_CBYTES] as i64);
+                break;
+            }
+            Err(e) => {
+                bad = Some(e);
+                break;
+            }
+        }
+    }
+    for p in pids {
+        let mut ws = 0;
+        sys_wait4(p, &mut ws, 0, 0);
+    }
+    let failed = (1..3)
+        .map(|i| sh[i].load(Ordering::Relaxed))
+        .find(|&r| r != 0);
+    unshare(sh);
+    sys_msgctl(id, IPC_RMID, 0);
+    check(b"children", failed.is_none(), failed.unwrap_or(0) as i64)?;
+    check(b"snapshot", bad.is_none(), bad.unwrap_or(0))
 }

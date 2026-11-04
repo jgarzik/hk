@@ -9,7 +9,7 @@ use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicI32, AtomicI64, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::Ordering;
 
 use crate::arch::Uaccess;
 use crate::ipc::util::{
@@ -87,29 +87,35 @@ impl Search {
     }
 }
 
+/// Everything msgsnd, msgrcv and msgctl read or change, under one lock
+/// (Linux: the msq lock, ipc_lock_object(&msq->q_perm))
+pub struct MsgState {
+    /// Message list
+    list: VecDeque<MsgMsg>,
+    /// Current bytes in queue
+    cbytes: u64,
+    /// Current number of messages
+    qnum: u64,
+    /// Maximum bytes allowed
+    qbytes: u64,
+    /// Last msgsnd time
+    stime: i64,
+    /// Last msgrcv time
+    rtime: i64,
+    /// Last change time
+    ctime: i64,
+    /// Last sender PID
+    lspid: i32,
+    /// Last receiver PID
+    lrpid: i32,
+}
+
 /// Message queue
 pub struct MsgQueue {
     /// IPC permissions and ID
     pub perm: KernIpcPerm,
-    /// Last msgsnd time
-    pub stime: AtomicI64,
-    /// Last msgrcv time
-    pub rtime: AtomicI64,
-    /// Last change time
-    pub ctime: AtomicI64,
-    /// Current bytes in queue
-    pub cbytes: AtomicU64,
-    /// Current number of messages
-    pub qnum: AtomicU32,
-    /// Maximum bytes allowed (IPC_SET changes it, msgsnd reads it
-    /// unlocked)
-    pub qbytes: AtomicU64,
-    /// Last sender PID
-    pub lspid: AtomicI32,
-    /// Last receiver PID
-    pub lrpid: AtomicI32,
-    /// Message list
-    pub messages: Mutex<VecDeque<MsgMsg>>,
+    /// The messages, counters, limit, times and pids
+    q: Mutex<MsgState>,
     /// Wait queue for blocked operations
     pub waitq: WaitQueue,
     /// Namespace reference
@@ -119,19 +125,19 @@ pub struct MsgQueue {
 impl MsgQueue {
     /// Create a new message queue
     pub fn new(key: i32, mode: u16, ns: Arc<IpcNamespace>) -> Result<Arc<Self>, i32> {
-        let now = current_time_secs();
-
         Ok(Arc::new(Self {
             perm: KernIpcPerm::new(key, mode),
-            stime: AtomicI64::new(0),
-            rtime: AtomicI64::new(0),
-            ctime: AtomicI64::new(now),
-            cbytes: AtomicU64::new(0),
-            qnum: AtomicU32::new(0),
-            qbytes: AtomicU64::new(ns.msg_ctlmnb as u64),
-            lspid: AtomicI32::new(0),
-            lrpid: AtomicI32::new(0),
-            messages: Mutex::new(VecDeque::new()),
+            q: Mutex::new(MsgState {
+                list: VecDeque::new(),
+                cbytes: 0,
+                qnum: 0,
+                qbytes: ns.msg_ctlmnb as u64,
+                stime: 0,
+                rtime: 0,
+                ctime: current_time_secs(),
+                lspid: 0,
+                lrpid: 0,
+            }),
             waitq: WaitQueue::new(),
             ns,
         }))
@@ -139,15 +145,23 @@ impl MsgQueue {
 
     /// A message matching `search` is queued
     fn has_msg(&self, search: Search) -> bool {
-        self.messages.lock().iter().any(|m| search.test(m.mtype))
+        self.q.lock().list.iter().any(|m| search.test(m.mtype))
     }
 
     /// Dequeue the message matching `search` (the first, or for
     /// LessEqual the first of the lowest type) if it fits in `msgsz`
-    /// bytes or may be truncated (Linux find_msg); E2BIG leaves it queued
-    fn take_msg(&self, search: Search, msgsz: usize, noerror: bool) -> Result<Option<MsgMsg>, i32> {
-        let mut messages = self.messages.lock();
-        let mut found = messages
+    /// bytes or may be truncated (Linux find_msg); E2BIG leaves it queued.
+    /// The receiver's pid and the time are recorded with it.
+    fn take_msg(
+        &self,
+        search: Search,
+        msgsz: usize,
+        noerror: bool,
+        pid: i32,
+    ) -> Result<Option<MsgMsg>, i32> {
+        let mut q = self.q.lock();
+        let mut found = q
+            .list
             .iter()
             .enumerate()
             .filter(|(_, m)| search.test(m.mtype));
@@ -159,70 +173,75 @@ impl MsgQueue {
         let Some(i) = idx else {
             return Ok(None);
         };
-        if messages[i].mtext.len() > msgsz && !noerror {
+        if q.list[i].mtext.len() > msgsz && !noerror {
             return Err(KernelError::ArgListTooLong.errno());
         }
-        let msg = messages.remove(i);
+        let msg = q.list.remove(i);
         if let Some(m) = &msg {
-            self.account(-(m.mtext.len() as i64));
+            self.account(&mut q, -(m.mtext.len() as i64));
+            q.rtime = current_time_secs();
+            q.lrpid = pid;
         }
         Ok(msg)
     }
 
     /// Queue `msg` if it fits (Linux do_msgsnd under the queue lock): the
-    /// limit and removal are checked, and the counters kept, with the
-    /// queue locked, so concurrent senders never pass qbytes and a removed
-    /// queue takes nothing. A message that does not fit comes back
-    fn try_send(&self, msg: MsgMsg) -> Result<Option<MsgMsg>, i32> {
-        let mut messages = self.messages.lock();
+    /// limit and removal are checked, the counters kept and the sender's
+    /// pid and time recorded with the queue locked, so concurrent senders
+    /// never pass qbytes and a removed queue takes nothing. A message that
+    /// does not fit comes back
+    fn try_send(&self, msg: MsgMsg, pid: i32) -> Result<Option<MsgMsg>, i32> {
+        let mut q = self.q.lock();
         if self.perm.is_deleted() {
             return Err(KernelError::IdentifierRemoved.errno());
         }
-        if !self.fits(msg.mtext.len()) {
+        if !Self::fits(&q, msg.mtext.len()) {
             return Ok(Some(msg));
         }
-        let len = msg.mtext.len() as u64;
-        messages.push_back(msg);
-        self.account(len as i64);
+        let len = msg.mtext.len() as i64;
+        q.list.push_back(msg);
+        self.account(&mut q, len);
+        q.stime = current_time_secs();
+        q.lspid = pid;
         Ok(None)
     }
 
     /// A message of `len` bytes fits (Linux msg_fits_inqueue): qbytes
     /// bounds the bytes and also the number of messages
-    fn fits(&self, len: usize) -> bool {
-        let qbytes = self.qbytes.load(Ordering::Relaxed);
-        self.cbytes.load(Ordering::Relaxed) + len as u64 <= qbytes
-            && u64::from(self.qnum.load(Ordering::Relaxed)) < qbytes
+    fn fits(q: &MsgState, len: usize) -> bool {
+        q.cbytes + len as u64 <= q.qbytes && q.qnum < q.qbytes
     }
 
-    /// One message of `bytes` added (> 0) or removed (< 0), under the
-    /// `messages` lock: queue and namespace counters
-    fn account(&self, bytes: i64) {
+    /// One message of `bytes` added (> 0) or removed (< 0): the queue's
+    /// counters (under its lock) and the namespace's statistics
+    fn account(&self, q: &mut MsgState, bytes: i64) {
         let n = bytes.unsigned_abs();
         if bytes >= 0 {
-            self.cbytes.fetch_add(n, Ordering::Relaxed);
-            self.qnum.fetch_add(1, Ordering::Relaxed);
+            q.cbytes += n;
+            q.qnum += 1;
             self.ns.msg_bytes.fetch_add(n, Ordering::Relaxed);
             self.ns.msg_hdrs.fetch_add(1, Ordering::Relaxed);
         } else {
-            self.cbytes.fetch_sub(n, Ordering::Relaxed);
-            self.qnum.fetch_sub(1, Ordering::Relaxed);
+            q.cbytes -= n;
+            q.qnum -= 1;
             self.ns.msg_bytes.fetch_sub(n, Ordering::Relaxed);
             self.ns.msg_hdrs.fetch_sub(1, Ordering::Relaxed);
         }
     }
 
-    /// Fill msqid64_ds structure for IPC_STAT
+    /// Fill msqid64_ds structure for IPC_STAT: one snapshot under the
+    /// queue lock (Linux msgctl_stat)
     pub fn fill_msqid64_ds(&self, ds: &mut Msqid64Ds) {
         self.perm.fill_ipc64_perm(&mut ds.msg_perm);
-        ds.msg_stime = self.stime.load(Ordering::Relaxed);
-        ds.msg_rtime = self.rtime.load(Ordering::Relaxed);
-        ds.msg_ctime = self.ctime.load(Ordering::Relaxed);
-        ds.msg_cbytes = self.cbytes.load(Ordering::Relaxed);
-        ds.msg_qnum = self.qnum.load(Ordering::Relaxed) as u64;
-        ds.msg_qbytes = self.qbytes.load(Ordering::Relaxed);
-        ds.msg_lspid = self.lspid.load(Ordering::Relaxed);
-        ds.msg_lrpid = self.lrpid.load(Ordering::Relaxed);
+        let q = self.q.lock();
+        ds.msg_stime = q.stime;
+        ds.msg_rtime = q.rtime;
+        ds.msg_ctime = q.ctime;
+        ds.msg_cbytes = q.cbytes;
+        ds.msg_qnum = q.qnum;
+        ds.msg_qbytes = q.qbytes;
+        ds.msg_lspid = q.lspid;
+        ds.msg_lrpid = q.lrpid;
         ds.__unused4 = 0;
         ds.__unused5 = 0;
     }
@@ -236,9 +255,9 @@ impl IpcObject for MsgQueue {
     fn destroy(&self) {
         // Marked deleted before this: after the lock no sender adds more
         {
-            let mut messages = self.messages.lock();
-            while let Some(m) = messages.pop_front() {
-                self.account(-(m.mtext.len() as i64));
+            let mut q = self.q.lock();
+            while let Some(m) = q.list.pop_front() {
+                self.account(&mut q, -(m.mtext.len() as i64));
             }
         }
         self.waitq.wake_all();
@@ -327,21 +346,21 @@ fn do_msgsnd(msqid: i32, msgp: u64, msgsz: usize, msgflg: i32) -> Result<i32, i3
     let pid = current_pid() as i32;
 
     let mut msg = msg;
-    while let Some(back) = queue.try_send(msg)? {
+    while let Some(back) = queue.try_send(msg, pid)? {
         msg = back;
         if nowait {
             return Err(KernelError::WouldBlock.errno());
         }
         // Sleep until space or removal; a signal ends the call
         // (System V IPC is never restarted after a handler)
-        let room = || queue.fits(msgsz) || queue.perm.is_deleted();
+        let room = || MsgQueue::fits(&queue.q.lock(), msgsz) || queue.perm.is_deleted();
         queue
             .waitq
             .wait_event_interruptible(room)
             .map_err(|_| KernelError::RestartNoHand.errno())?;
+        // Permissions may have changed while it slept (Linux rechecks)
+        ipc_checkperm(&queue.perm, IPC_PERM_WRITE)?;
     }
-    queue.stime.store(current_time_secs(), Ordering::Release);
-    queue.lspid.store(pid, Ordering::Release);
     // Wake any waiting receivers
     queue.waitq.wake_all();
     Ok(0)
@@ -377,10 +396,7 @@ fn do_msgrcv(msqid: i32, msgp: u64, msgsz: usize, msgtyp: i64, msgflg: i32) -> R
 
     let search = Search::new(msgtyp, msgflg);
     loop {
-        if let Some(msg) = queue.take_msg(search, msgsz, noerror)? {
-            queue.rtime.store(current_time_secs(), Ordering::Release);
-            queue.lrpid.store(pid, Ordering::Release);
-
+        if let Some(msg) = queue.take_msg(search, msgsz, noerror, pid)? {
             // Copy to user
             put_user::<Uaccess, i64>(msgp, msg.mtype)
                 .map_err(|_| KernelError::BadAddress.errno())?;
@@ -413,6 +429,8 @@ fn do_msgrcv(msqid: i32, msgp: u64, msgsz: usize, msgtyp: i64, msgflg: i32) -> R
         if queue.perm.is_deleted() {
             return Err(KernelError::IdentifierRemoved.errno());
         }
+        // Permissions may have changed while it slept (Linux rechecks)
+        ipc_checkperm(&queue.perm, IPC_PERM_READ)?;
     }
 }
 
@@ -458,21 +476,28 @@ fn do_msgctl(msqid: i32, cmd: i32, buf: u64) -> Result<i32, i32> {
 
             let uid = crate::task::percpu::current_cred().euid;
             let perm = queue.perm();
+            if !KernIpcPerm::is_owner(&perm.lock.lock(), perm.cuid, uid) {
+                return Err(KernelError::NotPermitted.errno());
+            }
+            // Linux msgctl_down: past MSGMNB needs CAP_SYS_RESOURCE; below
+            // it anyone allowed to IPC_SET may lower or raise the limit
+            if ds.msg_qbytes > ns.msg_ctlmnb as u64
+                && !crate::task::capable(crate::task::CAP_SYS_RESOURCE)
             {
+                return Err(KernelError::NotPermitted.errno());
+            }
+            {
+                let mut q = queue.q.lock();
                 let mut p = perm.lock.lock();
-                if !KernIpcPerm::is_owner(&p, perm.cuid, uid) {
-                    return Err(KernelError::NotPermitted.errno());
-                }
                 p.uid = ds.msg_perm.uid;
                 p.gid = ds.msg_perm.gid;
                 p.mode = ds.msg_perm.mode & 0o777;
-                // Only root raises the limit
-                if uid == 0 {
-                    queue.qbytes.store(ds.msg_qbytes, Ordering::Relaxed);
-                }
+                drop(p);
+                q.qbytes = ds.msg_qbytes;
+                q.ctime = current_time_secs();
             }
-
-            queue.ctime.store(current_time_secs(), Ordering::Release);
+            // Senders may fit now; receivers recheck their permission
+            queue.waitq.wake_all();
 
             Ok(0)
         }
