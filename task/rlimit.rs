@@ -254,26 +254,21 @@ pub fn sys_getrlimit(resource: u32, rlim_ptr: u64) -> i64 {
 ///
 /// Returns: 0 on success, negative errno on error
 pub fn sys_setrlimit(resource: u32, rlim_ptr: u64) -> i64 {
-    if resource as usize >= RLIM_NLIMITS {
-        return -22; // EINVAL
-    }
-
-    if rlim_ptr == 0 {
-        return -14; // EFAULT
-    }
-
-    // Copy from user
+    // Linux sys_setrlimit: copied in first (EFAULT), then do_prlimit
     let new_rlim = match copy_val_from_user::<Uaccess, RLimit>(rlim_ptr) {
         Ok(r) => r,
         Err(_) => return -14, // EFAULT
     };
+    if resource as usize >= RLIM_NLIMITS {
+        return -22; // EINVAL
+    }
 
     if let Err(e) = check(resource, &new_rlim) {
         return e;
     }
 
     let tid = current_tid();
-    let has_cap = current_cred().euid == 0; // Root has CAP_SYS_RESOURCE
+    let has_cap = crate::task::capable(crate::task::CAP_SYS_RESOURCE);
 
     match set_task_rlimit(tid, resource, new_rlim, has_cap) {
         Ok(()) => 0,
@@ -309,11 +304,17 @@ fn check(resource: u32, new: &RLimit) -> Result<(), i64> {
 ///
 /// Returns: 0 on success, negative errno on error
 pub fn sys_prlimit64(pid: i32, resource: u32, new_rlim_ptr: u64, old_rlim_ptr: u64) -> i64 {
-    if resource as usize >= RLIM_NLIMITS {
-        return -22; // EINVAL
-    }
-
-    // Determine target task
+    // Linux order: the new limit is copied in (EFAULT), the task found
+    // (ESRCH) and the caller's right to it checked (EPERM), then
+    // do_prlimit (EINVAL), and the old limit copied out last
+    let new = if new_rlim_ptr != 0 {
+        match copy_val_from_user::<Uaccess, RLimit>(new_rlim_ptr) {
+            Ok(r) => Some(r),
+            Err(_) => return -14, // EFAULT
+        }
+    } else {
+        None
+    };
     let target_tid = if pid == 0 {
         current_tid()
     } else {
@@ -322,34 +323,50 @@ pub fn sys_prlimit64(pid: i32, resource: u32, new_rlim_ptr: u64, old_rlim_ptr: u
             None => return -3, // ESRCH
         }
     };
-
-    // Get old value if requested
-    if old_rlim_ptr != 0 {
-        let old = match get_task_rlimit(target_tid, resource) {
-            Some(r) => r,
-            None => return -3, // ESRCH
-        };
-        if copy_val_to_user::<Uaccess, RLimit>(old_rlim_ptr, &old).is_err() {
-            return -14; // EFAULT
-        }
+    if let Err(e) = check_prlimit_permission(target_tid) {
+        return e;
     }
-
-    // Set new value if provided
-    if new_rlim_ptr != 0 {
-        let new = match copy_val_from_user::<Uaccess, RLimit>(new_rlim_ptr) {
-            Ok(r) => r,
-            Err(_) => return -14, // EFAULT
-        };
-
-        if let Err(e) = check(resource, &new) {
-            return e;
-        }
-
-        let has_cap = current_cred().euid == 0;
+    if resource as usize >= RLIM_NLIMITS {
+        return -22; // EINVAL
+    }
+    if let Some(new) = &new
+        && let Err(e) = check(resource, new)
+    {
+        return e;
+    }
+    let old = match get_task_rlimit(target_tid, resource) {
+        Some(r) => r,
+        None => return -3, // ESRCH
+    };
+    if let Some(new) = new {
+        let has_cap = crate::task::capable(crate::task::CAP_SYS_RESOURCE);
         if let Err(e) = set_task_rlimit(target_tid, resource, new, has_cap) {
             return e as i64;
         }
     }
-
+    if old_rlim_ptr != 0 && copy_val_to_user::<Uaccess, RLimit>(old_rlim_ptr, &old).is_err() {
+        return -14; // EFAULT
+    }
     0
+}
+
+/// Linux check_prlimit_permission: the caller itself, a task whose real,
+/// effective and saved ids all equal the caller's real ones, or
+/// CAP_SYS_RESOURCE; else EPERM
+fn check_prlimit_permission(target: crate::task::Tid) -> Result<(), i64> {
+    if target == current_tid() {
+        return Ok(());
+    }
+    let me = current_cred();
+    let t = crate::task::percpu::TASKLIST
+        .read()
+        .get(target)
+        .map(|t| t.cred())
+        .ok_or(-3i64)?; // ESRCH
+    let id_match = [t.uid, t.euid, t.suid].iter().all(|&u| u == me.uid)
+        && [t.gid, t.egid, t.sgid].iter().all(|&g| g == me.gid);
+    if !id_match && !crate::task::capable(crate::task::CAP_SYS_RESOURCE) {
+        return Err(-1); // EPERM
+    }
+    Ok(())
 }

@@ -8,6 +8,12 @@
 //! - NS_CAPS: root without CAP_SYS_ADMIN is refused sethostname,
 //!   setdomainname, unshare(CLONE_NEWUTS) and setns (EPERM); uid 1000
 //!   holding CAP_SYS_ADMIN may unshare a UTS namespace and name it.
+//! - PRLIMIT_PERM: prlimit64 on another task needs matching ids or
+//!   CAP_SYS_RESOURCE (Linux check_prlimit_permission), even to read: a
+//!   uid-1000 process gets EPERM for a root task, 0 for its own child;
+//!   root may read anyone's.
+//! - SETRLIMIT_EFAULT_FIRST: setrlimit copies the limit in before it
+//!   looks at the resource (EFAULT, not EINVAL).
 
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
@@ -27,6 +33,9 @@ pub fn run_tests() {
     report(b"SETID_CAPS_KEPT", in_child(setid_kept));
     report(b"NS_CAPS_DROPPED", in_child(ns_dropped));
     report(b"NS_CAPS_KEPT", in_child(ns_kept));
+    report(b"PRLIMIT_PERM", prlimit_perm());
+    let r = hk_syscall::sys_setrlimit(9999, core::ptr::null());
+    report(b"SETRLIMIT_EFAULT_FIRST", (r != -14) as u64);
 }
 
 fn report(name: &[u8], step: u64) {
@@ -155,4 +164,83 @@ fn ns_kept() -> u64 {
         return 4;
     }
     0
+}
+
+const RLIMIT_NOFILE: u32 = 7;
+
+fn prlimit_get(pid: i64) -> i64 {
+    let mut old = hk_syscall::RLimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    hk_syscall::sys_prlimit64(pid as i32, RLIMIT_NOFILE, core::ptr::null(), &mut old)
+}
+
+/// A child that sleeps until killed
+fn sleeper() -> i64 {
+    let pid = sys_fork();
+    if pid == 0 {
+        loop {
+            hk_syscall::sys_pause();
+        }
+    }
+    pid
+}
+
+fn reap(pid: i64) {
+    hk_syscall::sys_kill(pid, 9);
+    let mut ws = 0;
+    sys_wait4(pid, &mut ws, 0, 0);
+}
+
+/// As uid 1000: EPERM for root's `root_task`, 0 for its own child
+fn prlimit_user(root_task: i64) -> u64 {
+    if sys_setresuid(1000, 1000, 1000) != 0 {
+        return 1;
+    }
+    if prlimit_get(root_task) != EPERM {
+        return 2;
+    }
+    let mine = sleeper();
+    let new = hk_syscall::RLimit {
+        rlim_cur: 64,
+        rlim_max: 64,
+    };
+    let r = hk_syscall::sys_prlimit64(mine as i32, RLIMIT_NOFILE, &new, core::ptr::null_mut());
+    reap(mine);
+    if r != 0 {
+        return 3;
+    }
+    0
+}
+
+fn prlimit_perm() -> u64 {
+    let root_task = sleeper();
+    let pid = sys_fork();
+    if pid == 0 {
+        sys_exit(prlimit_user(root_task));
+    }
+    let mut ws = 0;
+    sys_wait4(pid, &mut ws, 0, 0);
+    let step = if ws & 0x7f != 0 {
+        101
+    } else {
+        (ws >> 8) as u64 & 0xff
+    };
+    // Root reads a uid-1000 task's limits (CAP_SYS_RESOURCE)
+    let user = sys_fork();
+    if user == 0 {
+        sys_setresuid(1000, 1000, 1000);
+        loop {
+            hk_syscall::sys_pause();
+        }
+    }
+    // Allowed whether or not it has dropped to uid 1000 yet
+    let r = prlimit_get(user);
+    reap(user);
+    reap(root_task);
+    if step != 0 {
+        return step;
+    }
+    if r != 0 { 10 } else { 0 }
 }
