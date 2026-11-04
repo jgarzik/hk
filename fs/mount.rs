@@ -26,8 +26,9 @@ pub const MNT_NOEXEC: u32 = 0x4;
 pub const MNT_READONLY: u32 = 0x40;
 /// Cannot be bind-mounted (Linux MNT_UNBINDABLE)
 pub const MNT_UNBINDABLE: u32 = 0x2000;
-/// Cannot be unmounted, moved or pivoted away: the initial root (Linux
-/// MNT_LOCKED, set by init_mount_tree)
+/// Cannot be unmounted, moved or pivoted away (Linux MNT_LOCKED: a mount
+/// a less privileged namespace copied, which would uncover what is
+/// under it; the initial root is protected by having no parent)
 pub const MNT_LOCKED: u32 = 0x80_0000;
 
 /// Old mount -> its copy, from [`Mount::clone_tree`]
@@ -343,18 +344,17 @@ impl Mount {
     }
 }
 
-/// Mount a fresh superblock of `fs_type` on `mountpoint`, a dentry of the
-/// namespace's root mount (boot-time mounts), or as the root
-pub fn do_mount(
-    fs_type: &'static FileSystemType,
-    mountpoint: Option<Arc<Dentry>>,
-) -> Result<Arc<Mount>, KernelError> {
-    let sb = (fs_type.mount)(fs_type, b"")?;
-    let mp = match mountpoint {
-        Some(d) => Some(Path::from_dentry(d).ok_or(KernelError::NotFound)?),
-        None => None,
-    };
-    attach(sb, mp, 0, false, fs_type.name.into())
+/// The initial mount tree (Linux init_mount_tree, 7.0+): a nullfs mount
+/// (id 1) is the namespace root and the mutable rootfs, a ramfs (id 2),
+/// is mounted on it. Root and cwd go to the rootfs, so it can be
+/// pivoted away or unmounted like any other mount. Returns the rootfs.
+pub fn init_mount_tree() -> Result<Arc<Mount>, KernelError> {
+    let nsb = (super::nullfs::NULLFS_TYPE.mount)(&super::nullfs::NULLFS_TYPE, b"")?;
+    let null = attach(nsb, None, 0, false, b"nullfs".as_slice().into())?;
+    let ramfs = &super::ramfs::RAMFS_TYPE;
+    let sb = (ramfs.mount)(ramfs, b"")?;
+    let on = Path::new(null.clone(), null.root.clone());
+    attach(sb, Some(on), 0, false, b"rootfs".as_slice().into())
 }
 
 /// Mount `sb` on `mountpoint` (None: as the namespace root) with MNT_*
@@ -387,7 +387,6 @@ pub fn attach(
         graft(&mount, &mp);
         drop(_dir_lock);
     } else {
-        mount.mark(MNT_LOCKED, true);
         mnt_ns.set_root(mount.clone());
     }
     Ok(mount)
@@ -455,19 +454,6 @@ pub fn do_loopback(old: &Path, mp: &Path, rec: bool) -> Result<(), KernelError> 
     };
     graft(&m, mp);
     Ok(())
-}
-
-/// Mount a filesystem at a path string
-pub fn mount_at_path(
-    fs_type: &'static FileSystemType,
-    path: &[u8],
-) -> Result<Arc<Mount>, KernelError> {
-    if path == b"/" || path.is_empty() {
-        return do_mount(fs_type, None);
-    }
-    let mp = super::namei::path_lookupat(None, path, super::LookupFlags::open())?;
-    let sb = (fs_type.mount)(fs_type, b"")?;
-    attach(sb, Some(mp), 0, false, fs_type.name.into())
 }
 
 /// Superblock of a device-backed filesystem (vfat, ...) on the block

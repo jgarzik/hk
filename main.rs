@@ -478,8 +478,9 @@ fn kmain() -> ! {
     // ========================================================================
     let initramfs_data = CurrentArch::get_initramfs();
     let root_dentry = crate::ns::init_mnt_ns()
-        .get_root_dentry()
-        .expect("VFS root not initialized");
+        .root_path()
+        .expect("VFS root not initialized")
+        .dentry;
     match fs::unpack_cpio(initramfs_data, &root_dentry) {
         Ok(n) => printkln!("initramfs: {} files", n),
         Err(e) => {
@@ -567,16 +568,16 @@ fn try_init(path: &str, args: &cmdline::InitArgs) -> i32 {
 const DEFAULT_RAMDISK_SIZE_MB: u64 = 8;
 
 /// The VFS core (Linux mnt_init): filesystem types, kernfs/sysfs, the
-/// ramfs root with /dev
+/// mount tree with /dev
 fn mnt_init() {
-    use fs::{RAMFS_TYPE, do_mount, init_fs_registry, ramfs_create_dir};
+    use fs::{init_fs_registry, ramfs_create_dir};
 
     init_fs_registry();
     fs::sysfs::init();
-    let root_mount = match do_mount(&RAMFS_TYPE, None) {
+    let root_mount = match fs::mount::init_mount_tree() {
         Ok(m) => m,
         Err(e) => {
-            printkln!("ERR: ramfs: {:?}", e);
+            printkln!("ERR: rootfs: {:?}", e);
             return;
         }
     };

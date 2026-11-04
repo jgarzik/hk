@@ -2,7 +2,7 @@
 //! fs/proc/fd.c, vfs_getattr): mountinfo lines, the mount id statx and
 //! fdinfo report, /proc/self/{cwd,root}, /proc/mounts -> self/mounts
 
-use super::helpers::{print, print_num, println};
+use super::helpers::{linux_at_least, print, print_num, println};
 use hk_syscall::{
     O_CLOEXEC, O_CREAT, O_RDONLY, O_RDWR, Statx, sys_chdir, sys_close, sys_mkdir, sys_mount,
     sys_open, sys_read, sys_readlink, sys_rmdir, sys_statx, sys_umount2, sys_unlink, sys_write,
@@ -24,6 +24,7 @@ pub fn run_tests() {
     }
     let id = mountinfo_id(b"/tmp/mi");
     report(b"MOUNTINFO", check_mountinfo(id));
+    report(b"MOUNTINFO_ROOTFS", check_rootfs());
     report(b"STATX_MNT_ID", check_statx(id));
     report(b"FDINFO_FIELDS", check_fdinfo(id));
     report(b"PROC_CWD_ROOT", check_cwd_root());
@@ -102,6 +103,30 @@ fn mountinfo_id(mp: &[u8]) -> u64 {
         .and_then(|l| l.split(|&c| c == b' ').next())
         .and_then(num)
         .unwrap_or(0)
+}
+
+/// The first line is the rootfs, on "/". Since Linux 7.0 (313c47f4fe4d,
+/// init_mount_tree) it is mount 2, on the nullfs root, mount 1, which is
+/// outside the root and not listed; before, the rootfs was mount 1 and
+/// its own parent.
+fn check_rootfs() -> R {
+    let mut buf = [0u8; 8192];
+    let n = slurp(b"/proc/self/mountinfo\0", &mut buf);
+    let line = buf[..n].split(|&c| c == b'\n').next().unwrap_or(b"");
+    let f: [&[u8]; 5] = {
+        let mut it = line.split(|&c| c == b' ');
+        core::array::from_fn(|_| it.next().unwrap_or(b""))
+    };
+    check(b"mount point", f[4] == b"/", 0)?;
+    let id = num(f[0]).ok_or((&b"id"[..], 0))?;
+    let parent = num(f[1]).ok_or((&b"parent"[..], 0))?;
+    let (want_id, want_parent) = if linux_at_least(7, 0) { (2, 1) } else { (1, 1) };
+    check(b"id", id == want_id, id as i64)?;
+    check(b"parent", parent == want_parent, parent as i64)?;
+    let listed = buf[..n]
+        .split(|&c| c == b'\n')
+        .any(|l| l.split(|&c| c == b' ').next().and_then(num) == Some(parent));
+    check(b"parent listed", listed == (parent == id), parent as i64)
 }
 
 /// The line of /tmp/mi: id, a parent id that is another line's id,

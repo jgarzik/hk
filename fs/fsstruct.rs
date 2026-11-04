@@ -77,14 +77,12 @@ impl FsStruct {
         })
     }
 
-    /// Create a new FsStruct initialized to the filesystem root
+    /// Create a new FsStruct at where "/" lands in the namespace: the
+    /// rootfs (Linux init_mount_tree: root and pwd on the mutable
+    /// rootfs, not the nullfs under it)
     pub fn new_root() -> Option<Arc<Self>> {
-        let mnt_ns = crate::ns::current_mnt_ns();
-        let root_dentry = mnt_ns.get_root_dentry()?;
-        let root_mnt = mnt_ns.get_root()?;
-        let root_path = Path::new(root_mnt.clone(), root_dentry.clone());
-        let pwd_path = Path::new(root_mnt, root_dentry);
-        Some(Self::new(root_path, pwd_path))
+        let root = crate::ns::current_mnt_ns().root_path()?;
+        Some(Self::new(root.clone(), root))
     }
 
     /// Get current working directory (returns cloned Path with bumped refs)

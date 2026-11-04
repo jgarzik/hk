@@ -40,10 +40,10 @@ impl Path {
         Self { mnt, dentry }
     }
 
-    /// A dentry of the namespace's root mount as a Path (boot-time
-    /// objects, internal files)
+    /// A dentry of the mount "/" lands on (the rootfs) as a Path
+    /// (boot-time objects, internal files)
     pub fn from_dentry(dentry: Arc<Dentry>) -> Option<Self> {
-        let mnt = crate::ns::current_mnt_ns().get_root()?;
+        let mnt = crate::ns::current_mnt_ns().root_path()?.mnt;
         Some(Self { mnt, dentry })
     }
 
