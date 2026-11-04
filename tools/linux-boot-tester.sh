@@ -82,6 +82,25 @@ if [ -z "${LINUX_KERNEL:-}" ]; then
 fi
 echo "Kernel: $LINUX_KERNEL"
 
+# arm64 EFI zboot (Ubuntu 26.04 and later): QEMU's -kernel loads only
+# gzip payloads, so unpack the zstd one. Header: "zimg" at 4, payload
+# offset and size (le32) at 8 and 12, compression name at 24.
+if [ "$(dd if="$LINUX_KERNEL" bs=1 skip=4 count=4 status=none | tr -d '\0')" = zimg ]; then
+    le32() { od -An -tu4 -j"$1" -N4 --endian=little "$LINUX_KERNEL" | tr -d ' '; }
+    comp=$(dd if="$LINUX_KERNEL" bs=1 skip=24 count=8 status=none | tr -d '\0')
+    [ "$comp" = zstd ] || [ "$comp" = gzip ] || {
+        echo "linux-boot-tester: zboot compression $comp unsupported" >&2
+        exit 1
+    }
+    if [ ! "$WORK/Image" -nt "$LINUX_KERNEL" ]; then
+        tail -c +"$(($(le32 8) + 1))" "$LINUX_KERNEL" | head -c "$(le32 12)" |
+            if [ "$comp" = zstd ]; then zstd -dcq; else gzip -dc; fi > "$WORK/Image.tmp"
+        mv "$WORK/Image.tmp" "$WORK/Image"
+    fi
+    LINUX_KERNEL=$WORK/Image
+    echo "Kernel: unpacked $comp zboot to $LINUX_KERNEL"
+fi
+
 # The tests need these built in (no modules in the initramfs): check the
 # kernel's config from its linux-buildinfo package (small; fetched once)
 if [ -n "${KDIR:-}" ]; then

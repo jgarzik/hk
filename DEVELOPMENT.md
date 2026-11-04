@@ -21,8 +21,9 @@ sudo apt install gcc-aarch64-linux-gnu
 
 # Verified .deb downloads (busybox-static, glibc, bash and coreutils for
 # the initramfs, Linux kernels for make check-linux*), the initramfs
-# library closure (readelf) and the HTTP test peer of the QEMU network
-sudo apt install curl gpgv xz-utils ubuntu-keyring python3 binutils
+# library closure (readelf), the HTTP test peer of the QEMU network and
+# unpacking zstd-compressed arm64 kernels (Ubuntu 26.04 and later)
+sudo apt install curl gpgv xz-utils ubuntu-keyring python3 binutils zstd
 ```
 
 ### Rust Components
