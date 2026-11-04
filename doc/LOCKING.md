@@ -707,8 +707,12 @@ CPU being idle) is a quiescent state for a future QSBR RCU.
 `kthread_run(name, fn, arg, cpu)` creates a pid-0 task bound to one CPU
 (created asleep in that CPU's rq, then woken). `KTHREADS`
 (`spin::Mutex<Vec<Arc<KThread>>>`, process context only, never held across
-a wakeup/sleep; order: may be taken while holding nothing else) maps tid ->
-control block. `kthread_should_stop/should_park/parkme` and
+a wakeup/sleep; order: may be taken while holding nothing else, or only
+sleeping locks such as a directory's `i_rwsem`) maps tid -> control
+block. `get_task_fs` takes it for a task with no fs of its own, to hand
+a kernel thread the shared knullfs fs_struct (fs/fsstruct.rs
+`KTHREAD_FS`; umask from create_mode runs under the directory's
+`i_rwsem`). `kthread_should_stop/should_park/parkme` and
 `kthread_stop/park/unpark` use atomics + `try_to_wake_up` + the block's
 `ack` WaitQueue. A thread created without a CPU gets one round-robin;
 every kernel thread stays on its CPU (`cpus_mask` holds only it, Linux

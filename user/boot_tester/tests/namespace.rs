@@ -4,12 +4,16 @@
 //! - unshare(2) - create new namespace(s) for current process
 //! - setns(2) - join existing namespace via file descriptor
 
-use super::helpers::{print, print_num, println};
+use super::helpers::{linux_at_least, print, print_num, println};
 use hk_syscall::{
-    CLONE_NEWNET, CLONE_NEWNS, CLONE_NEWPID, CLONE_NEWUSER, CLONE_NEWUTS, O_RDONLY, UtsName,
-    sys_close, sys_exit, sys_fork, sys_open, sys_pivot_root, sys_sethostname, sys_setns, sys_uname,
+    CLONE_NEWNET, CLONE_NEWNS, CLONE_NEWPID, CLONE_NEWUSER, CLONE_NEWUTS, O_CREAT, O_RDONLY,
+    O_WRONLY, Stat, UtsName, sys_chdir, sys_close, sys_exit, sys_fork, sys_mkdir, sys_mount,
+    sys_open, sys_pivot_root, sys_sethostname, sys_setns, sys_stat, sys_umount2, sys_uname,
     sys_unshare, sys_wait4,
 };
+
+const EINVAL: i64 = -22;
+const MNT_DETACH: u64 = 2;
 
 /// Run all namespace tests
 pub fn run_tests() {
@@ -25,6 +29,107 @@ pub fn run_tests() {
     test_pivot_root_enoent();
     test_pivot_root_enotdir();
     test_pivot_root_einval();
+    in_child(b"PIVOT_ROOT_ROOTFS", pivot_rootfs);
+    in_child(b"UMOUNT_ROOTFS_DETACH", umount_rootfs);
+}
+
+/// Run `f` in a child with a mount namespace of its own; its exit
+/// status is the result (0 OK, else which step failed)
+fn in_child(name: &[u8], f: fn() -> i32) {
+    print(name);
+    let pid = sys_fork();
+    if pid == 0 {
+        if sys_unshare(CLONE_NEWNS) != 0 {
+            sys_exit(100);
+        }
+        sys_exit(f() as u64);
+    }
+    let mut ws: i32 = 0;
+    if pid < 0 || sys_wait4(pid, &mut ws, 0, 0) != pid {
+        print(b":FAIL fork/wait ");
+        print_num(pid);
+        println(b"");
+        return;
+    }
+    let st = (ws >> 8) & 0xff;
+    if ws & 0x7f == 0 && st == 0 {
+        println(b":OK");
+    } else {
+        print(b":FAIL step ");
+        print_num(if ws & 0x7f != 0 {
+            -(ws as i64 & 0x7f)
+        } else {
+            st as i64
+        });
+        println(b"");
+    }
+}
+
+/// Did `want` come back: 0 when the initramfs has a parent (Linux 7.0+:
+/// the rootfs is mounted on nullfs), else EINVAL ("absolute root")
+fn rootfs_ret() -> i64 {
+    if linux_at_least(7, 0) { 0 } else { EINVAL }
+}
+
+/// The switch_root of Linux 7.0's ramfs-rootfs-initramfs.rst, from the
+/// initramfs: chdir to the new root, pivot_root(".", "."), unmount the
+/// old root stacked on it. The new root's file is then at "/".
+fn pivot_rootfs() -> i32 {
+    let dir = b"/tmp/pivot_new\0";
+    sys_mkdir(b"/tmp\0".as_ptr(), 0o1777);
+    sys_mkdir(dir.as_ptr(), 0o755);
+    if sys_mount(b"none\0".as_ptr(), dir.as_ptr(), b"ramfs\0".as_ptr(), 0, 0) != 0 {
+        return 1;
+    }
+    let fd = sys_open(
+        b"/tmp/pivot_new/marker\0".as_ptr(),
+        O_CREAT | O_WRONLY,
+        0o644,
+    );
+    if fd < 0 {
+        return 2;
+    }
+    sys_close(fd as u64);
+    if sys_chdir(dir.as_ptr()) != 0 {
+        return 3;
+    }
+    let r = sys_pivot_root(b".\0".as_ptr(), b".\0".as_ptr());
+    if r != rootfs_ret() {
+        return 4;
+    }
+    if r != 0 {
+        return 0;
+    }
+    if sys_umount2(b".\0".as_ptr(), MNT_DETACH) != 0 {
+        return 5;
+    }
+    if !exists(b"/marker\0") {
+        return 6;
+    }
+    // The old root is gone: nothing of the initramfs is left
+    if exists(b"/tmp\0") {
+        return 7;
+    }
+    0
+}
+
+fn exists(path: &[u8]) -> bool {
+    // SAFETY: Stat is plain integers, valid all-zero
+    let mut st: Stat = unsafe { core::mem::zeroed() };
+    sys_stat(path.as_ptr(), &mut st) == 0
+}
+
+/// umount2("/", MNT_DETACH) takes the rootfs off its nullfs parent
+/// (7.0+); the absolute root is EINVAL
+fn umount_rootfs() -> i32 {
+    if sys_umount2(b"/\0".as_ptr(), MNT_DETACH) != rootfs_ret() {
+        return 1;
+    }
+    // Root and cwd still hold the detached rootfs
+    if !exists(b"/proc\0") {
+        return 2;
+    }
+    0
 }
 
 /// Test: unshare(0) should succeed (no-op)

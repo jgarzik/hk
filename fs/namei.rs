@@ -35,6 +35,9 @@ pub struct LookupFlags {
     pub create: bool,
     /// Don't cross mount points
     pub no_xdev: bool,
+    /// linkat AT_EMPTY_PATH (Linux LOOKUP_LINKAT_EMPTY): a walk from
+    /// `dirfd` needs the opener's creds or CAP_DAC_READ_SEARCH
+    pub linkat_empty: bool,
 }
 
 impl LookupFlags {
@@ -45,6 +48,7 @@ impl LookupFlags {
             directory: false,
             create: false,
             no_xdev: false,
+            linkat_empty: false,
         }
     }
 
@@ -55,6 +59,7 @@ impl LookupFlags {
             directory: true,
             create: false,
             no_xdev: false,
+            linkat_empty: false,
         }
     }
 
@@ -233,13 +238,13 @@ fn walk(
 }
 
 /// The root absolute paths start at and ".." stops at (Linux nd->root):
-/// the task's fs root (chroot), else the namespace's
+/// the task's fs root (chroot), else, for boot code with no fs yet,
+/// where "/" lands in the namespace (the rootfs, not its nullfs root)
 pub fn nd_root() -> Result<Path, KernelError> {
     if let Some(fs) = crate::task::percpu::current_fs() {
         return Ok(fs.get_root());
     }
-    let m = current_mnt_ns().get_root().ok_or(KernelError::NotFound)?;
-    Ok(Path::new(m.clone(), m.root.clone()))
+    current_mnt_ns().root_path().ok_or(KernelError::NotFound)
 }
 
 /// ".." from `p` (Linux follow_dotdot): the root stays; at a mount's
@@ -394,8 +399,13 @@ pub fn getname_maybe_null(ptr: u64, at: i32) -> Result<Vec<u8>, KernelError> {
 
 /// Where a walk of `path` starts (Linux path_init): an absolute path at
 /// the root (dirfd unused), else the cwd or `dirfd`, which must be open
-/// (EBADF) and, unless the path is empty, a directory (ENOTDIR)
-pub fn path_start(dirfd: i32, path: &[u8]) -> Result<Option<Path>, KernelError> {
+/// (EBADF), pass the `linkat_empty` check (ENOENT) and, unless the path
+/// is empty, be a directory (ENOTDIR)
+pub fn path_start(
+    dirfd: i32,
+    path: &[u8],
+    linkat_empty: bool,
+) -> Result<Option<Path>, KernelError> {
     if path.starts_with(b"/") {
         return Ok(None);
     }
@@ -406,16 +416,31 @@ pub fn path_start(dirfd: i32, path: &[u8]) -> Result<Option<Path>, KernelError> 
         .lock()
         .get(dirfd)
         .ok_or(KernelError::BadFd)?;
+    if linkat_empty && !may_linkat_empty(&file) {
+        return Err(KernelError::NotFound);
+    }
     if !path.is_empty() && !file.is_dir() {
         return Err(KernelError::NotDirectory);
     }
     Ok(file.f_path())
 }
 
+/// Whether linkat may link `file` (Linux path_init LOOKUP_LINKAT_EMPTY):
+/// its opener creds are the caller's, or the caller has
+/// CAP_DAC_READ_SEARCH, so a descriptor passed to a less privileged
+/// process cannot be linked back into the tree. Checked on the same fd
+/// lookup the walk starts from. Linux compares cred pointers and uses
+/// ns_capable(f_cred->user_ns); hk compares values (BUGS.md) and has
+/// one user namespace.
+fn may_linkat_empty(file: &crate::fs::File) -> bool {
+    file.f_cred == crate::task::current_cred()
+        || crate::task::capable(crate::task::CAP_DAC_READ_SEARCH)
+}
+
 /// Resolve `path` relative to `dirfd` (Linux filename_lookup); an empty
 /// path (getname let it through: AT_EMPTY_PATH) names dirfd itself
 pub fn filename_lookup(dirfd: i32, path: &[u8], flags: LookupFlags) -> Result<Path, KernelError> {
-    let start = path_start(dirfd, path)?;
+    let start = path_start(dirfd, path, flags.linkat_empty)?;
     if path.is_empty() {
         return match start {
             Some(p) => Ok(p),
@@ -461,7 +486,7 @@ pub struct Parent {
 /// the parent must be a searchable directory; the last name is not
 /// looked up, only classified
 pub fn filename_parentat(dirfd: i32, path: &[u8]) -> Result<Parent, KernelError> {
-    let start = path_start(dirfd, path)?;
+    let start = path_start(dirfd, path, false)?;
     let end = path.iter().rposition(|&c| c != b'/').map_or(0, |i| i + 1);
     let slash = end < path.len();
     let trimmed = &path[..end];

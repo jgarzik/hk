@@ -1056,6 +1056,19 @@ pub static RAMFS_TYPE: FileSystemType = FileSystemType {
     file_ops: &RAMFS_FILE_OPS,
 };
 
+/// The rootfs filesystem type (Linux init/do_mounts.c rootfs_fs_type):
+/// the initramfs's, mounted on the nullfs root by init_mount_tree. A
+/// ramfs under its own name, which mountinfo and statfs callers see;
+/// Linux fills it as tmpfs when it has one, hk has only ramfs. Not
+/// registered, as Linux: mount(2) cannot name it.
+pub static ROOTFS_TYPE: FileSystemType = FileSystemType {
+    name: "rootfs",
+    fs_flags: 0,
+    mount: ramfs_mount,
+    mount_dev: None,
+    file_ops: &RAMFS_FILE_OPS,
+};
+
 use super::inode::{Gid, Uid};
 
 /// Create a directory in ramfs with ownership

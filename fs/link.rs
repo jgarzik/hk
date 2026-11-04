@@ -163,35 +163,17 @@ fn link_locked(dir: &Arc<Inode>, name: &[u8], inode: &Arc<Inode>) -> Result<(), 
 }
 
 /// The dentry linkat links to (Linux do_linkat, 6.10+): an empty path
-/// with AT_EMPTY_PATH names `dirfd` itself; the final symlink is
-/// followed only with AT_SYMLINK_FOLLOW. See [`may_linkat_empty`].
+/// with AT_EMPTY_PATH names `dirfd` itself, whose opener creds must be
+/// the caller's (LookupFlags::linkat_empty); the final symlink is
+/// followed only with AT_SYMLINK_FOLLOW
 fn link_source(dirfd: i32, path_ptr: u64, flags: i32) -> Result<Path, KernelError> {
     let path = getname(path_ptr, flags & AT_EMPTY_PATH != 0)?;
-    if flags & AT_EMPTY_PATH != 0 && !may_linkat_empty(dirfd, &path) {
-        return Err(KernelError::NotFound);
-    }
     let lf = LookupFlags {
         follow: flags & AT_SYMLINK_FOLLOW != 0,
+        linkat_empty: flags & AT_EMPTY_PATH != 0,
         ..LookupFlags::open()
     };
     filename_lookup(dirfd, &path, lf)
-}
-
-/// With AT_EMPTY_PATH, a walk that starts at `dirfd` needs the file's
-/// opener credentials to be the caller's or CAP_DAC_READ_SEARCH (Linux
-/// path_init LOOKUP_LINKAT_EMPTY, else ENOENT): a descriptor passed to
-/// a less privileged process cannot be linked back into the tree.
-/// Linux compares cred pointers (any commit_creds since the open makes
-/// them differ); hk compares values.
-fn may_linkat_empty(dirfd: i32, path: &[u8]) -> bool {
-    if dirfd == AT_FDCWD || path.starts_with(b"/") {
-        return true;
-    }
-    let file = crate::fs::syscall::current_fd_table().lock().get(dirfd);
-    // A bad fd is filename_lookup's EBADF
-    let Some(file) = file else { return true };
-    file.f_cred == crate::task::current_cred()
-        || crate::task::capable(crate::task::CAP_DAC_READ_SEARCH)
 }
 
 /// sys_linkat - create a hard link relative to directory fds

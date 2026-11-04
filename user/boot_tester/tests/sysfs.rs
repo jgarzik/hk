@@ -9,7 +9,7 @@ use hk_syscall::{
     sys_open, sys_read, sys_readlink, sys_stat, sys_statfs,
 };
 
-use super::helpers::{host_mode, print, print_num, println, read_file, skip};
+use super::helpers::{host_mode, linux_at_least, print, print_num, println, read_file, skip};
 use super::nl::{nladdr, recv_creds};
 
 const EACCES: i64 = -13;
@@ -608,7 +608,7 @@ fn test_bus_virtio() {
             let n = read_file(path(&mut b, &[base, d, b"/", name, b"\0"]), out);
             n.max(0) as usize
         };
-        let mut v = [0u8; 128];
+        let mut v = [0u8; 256];
         let n = attr(b"device", &mut v);
         let Some(device) = hex_attr(&v[..n], 4) else {
             return fail(N, b"device format", i as i64);
@@ -624,8 +624,10 @@ fn test_bus_virtio() {
         if v[..n] != want {
             return fail(N, b"modalias", i as i64);
         }
+        // VIRTIO_FEATURES_BITS digits: 128 since Linux 6.17, 64 before
+        let bits = if linux_at_least(6, 17) { 128 } else { 64 };
         let n = attr(b"features", &mut v);
-        if n != 65 || v[64] != b'\n' || !v[..64].iter().all(|&c| c == b'0' || c == b'1') {
+        if n != bits + 1 || v[bits] != b'\n' || !v[..bits].iter().all(|&c| c == b'0' || c == b'1') {
             return fail(N, b"features", n as i64);
         }
         let mut u = [0u8; 512];

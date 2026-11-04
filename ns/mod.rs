@@ -136,6 +136,17 @@ impl MntNamespace {
     pub fn get_root_dentry(&self) -> Option<Arc<crate::fs::dentry::Dentry>> {
         self.get_root().map(|m| m.root.clone())
     }
+
+    /// Where "/" lands in this namespace (Linux LOOKUP_DOWN from the
+    /// namespace root): the topmost mount on the nullfs root, the
+    /// rootfs until something is pivoted or mounted over it
+    pub fn root_path(&self) -> Option<crate::fs::Path> {
+        let m = self.get_root()?;
+        Some(crate::fs::mount::follow_mount(crate::fs::Path::new(
+            m.clone(),
+            m.root.clone(),
+        )))
+    }
 }
 
 impl Default for MntNamespace {
@@ -665,13 +676,12 @@ pub fn sys_setns(fd: i32, nstype: i32) -> i64 {
     };
 
     let mnt_root = matches!(ns_type, NamespaceType::Mnt)
-        .then(|| new_ns.mnt_ns.get_root())
+        .then(|| new_ns.mnt_ns.root_path())
         .flatten();
     switch_task_namespaces(tid, new_ns);
-    // Joining a mount namespace puts root and cwd at its root (Linux
-    // mntns_install)
-    if let (Some(m), Some(fs)) = (mnt_root, crate::task::percpu::current_fs()) {
-        let root = crate::fs::Path::new(m.clone(), m.root.clone());
+    // Joining a mount namespace puts root and cwd at its root, past
+    // what is mounted there (Linux mntns_install: LOOKUP_DOWN)
+    if let (Some(root), Some(fs)) = (mnt_root, crate::task::percpu::current_fs()) {
         fs.set_root(root.clone());
         fs.set_pwd(root);
     }

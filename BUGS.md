@@ -301,6 +301,19 @@ Missing: fs.protected_hardlinks/symlinks/fifos/regular do not exist
 (behave as their kernel default 0); no
 immutable/append-only inodes (no IS_APPEND/IS_IMMUTABLE EPERM).
 
+## Credentials have no identity
+
+**Location**: `task/mod.rs` (`Cred`), `fs/namei.rs` (`may_linkat_empty`)
+
+`Cred` is a value, not Linux's shared, refcounted `struct cred`. linkat
+AT_EMPTY_PATH compares `f_cred` with the caller's creds by value, where
+Linux compares pointers. Any commit_creds since the open, and fork's
+copy_creds, gives Linux a new pointer. So an fd inherited across fork
+by a same-uid child, or passed between same-cred processes, can be
+linked on hk without CAP_DAC_READ_SEARCH; Linux gives ENOENT. The
+capability is checked in the caller's namespace (Linux: the opener's
+`user_ns`); hk has one user namespace.
+
 ## sysfs gaps
 
 **Location**: `fs/kernfs/`, `fs/sysfs.rs`, `base/`, `block/genhd.rs`,
@@ -433,6 +446,25 @@ UTF-16 in UTF-8, iso8859-1 or cp437 only) and ramfs (mode=); procfs,
 devtmpfs and cgroupfs ignore theirs; mounts are not user-namespace aware (plain capable()).
 Crossing into a mount scans the current mount's children (Linux hashes
 (parent, mountpoint): mount_hashtable).
+
+## nullfs gaps
+
+**Location**: `fs/nullfs.rs`, `fs/mount.rs` init_mount_tree,
+`fs/fsstruct.rs` KTHREAD_FS
+
+The nullfs root (Linux 7.0) and the kernel threads' private nullfs
+(7.3) are in place, but no user path reaches either, so what Linux 7.3
+added for when they become reachable is not done: empty mount
+namespaces, the nullfs that stands in for an unmounted mount and the
+empty immutable regular file. Locks are not refused with ENOLCK
+(31a1fb90624d), MS_REMOUNT and umount of the root are not refused on
+the internal superblock (d791606bb915), and nothing marks knullfs's
+root as unmountable (e22e69c2ad88: dont_mount). The rootfs is
+always a ramfs; Linux fills it as tmpfs when it has CONFIG_TMPFS
+(Ubuntu does), so statfs("/") on the initramfs differs until hk has a
+tmpfs (doc/ROADMAP.md phase 6). Kernel code that resolves a path from a kernel thread finds nothing
+(knullfs); hk has none today, and has no scoped_with_init_fs for one
+that would need init's root.
 
 ## Thread-group exit gaps
 
