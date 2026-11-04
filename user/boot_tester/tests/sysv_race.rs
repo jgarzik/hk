@@ -30,6 +30,11 @@
 //!   nothing.
 //! - SEM_NCNT: GETNCNT and GETZCNT count the waiters blocked on that
 //!   semaphore (Linux count_semcnt); IPC_RMID wakes them with EIDRM.
+//! - SEM_MIXED_STRESS: single-operation semops on one semaphore (the
+//!   per-semaphore fast path) run while blocking two-operation semops
+//!   on others keep switching the array into complex mode: the mutex
+//!   loses no increment, no waiter misses its wakeup (2 s timeouts),
+//!   and the moved units are all there.
 
 use core::sync::atomic::{AtomicI32, Ordering};
 
@@ -62,6 +67,7 @@ pub fn run_tests() {
     report(b"SEM_UNDO_SETVAL", sem_undo(undo_setval_child, 5));
     report(b"SEM_UNDO_ERANGE", sem_undo(undo_erange_child, 0));
     report(b"SEM_NCNT", sem_ncnt());
+    report(b"SEM_MIXED_STRESS", sem_mixed_stress());
 }
 
 type R = Result<(), (&'static [u8], i64)>;
@@ -460,4 +466,64 @@ fn sem_ncnt() -> R {
     }
     r?;
     check(b"EIDRM", ok, 0)
+}
+
+const MIXED_ROUNDS: usize = 1000;
+
+fn timed(id: i32, sops: &[Sembuf]) -> i64 {
+    let ts = Timespec {
+        tv_sec: 2,
+        tv_nsec: 0,
+    };
+    sys_semtimedop(id, sops.as_ptr(), sops.len(), &ts)
+}
+
+/// Children 0 and 1: semaphore 0 as a mutex around out[1]; children 2
+/// and 3: move units 2 -> 3 and 3 -> 2. A failed semop marks out[2+i].
+fn mixed_child(i: usize, out: &[AtomicI32]) {
+    let id = out[0].load(Ordering::Relaxed);
+    let fail = |r: i64| {
+        if r != 0 {
+            out[2 + i].store(r as i32, Ordering::Relaxed);
+        }
+        r != 0
+    };
+    for _ in 0..MIXED_ROUNDS {
+        if i < 2 {
+            if fail(timed(id, &[Sembuf::new(0, -1, 0)])) {
+                return;
+            }
+            let c = out[1].load(Ordering::Relaxed);
+            out[1].store(c + 1, Ordering::Relaxed);
+            if fail(timed(id, &[Sembuf::new(0, 1, 0)])) {
+                return;
+            }
+        } else {
+            let (a, b) = if i == 2 { (2, 3) } else { (3, 2) };
+            if fail(timed(id, &[Sembuf::new(a, -1, 0), Sembuf::new(b, 1, 0)])) {
+                return;
+            }
+        }
+    }
+}
+
+fn sem_mixed_stress() -> R {
+    let set = Set::new(4);
+    check(b"semget", set.0 >= 0, set.0 as i64)?;
+    set.set(0, 1);
+    set.set(2, 50);
+    let sh = shared(2 + PROCS);
+    sh[0].store(set.0, Ordering::Relaxed);
+    let ran = in_children(mixed_child, sh);
+    let count = sh[1].load(Ordering::Relaxed) as i64;
+    let failed = (0..PROCS)
+        .map(|i| sh[2 + i].load(Ordering::Relaxed) as i64)
+        .find(|&r| r != 0);
+    unshare(sh);
+    check(b"children", ran, 0)?;
+    check(b"semop", failed.is_none(), failed.unwrap_or(0))?;
+    check(b"count", count == (2 * MIXED_ROUNDS) as i64, count)?;
+    check(b"mutex 1", set.get(0) == 1, set.get(0))?;
+    let units = set.get(2) + set.get(3);
+    check(b"units", units == 50, units)
 }
