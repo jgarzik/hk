@@ -433,13 +433,6 @@ so a pipe or FIFO with data reports 0. Linux do_vfs_ioctl handles
 FIONREAD only for regular files and passes the rest to f_op->ioctl
 (pipe_ioctl returns the buffered bytes).
 
-## Unaligned user pointers are EFAULT
-
-**Location**: `uaccess.rs` (`put_user`/`get_user`)
-
-A misaligned user address is rejected with EFAULT; Linux on x86-64 and
-arm64 accepts it. Needs a boot test (both kernels) before the fix.
-
 ## Sleeping-lock gaps
 
 **Location**: `sync` (RwSem)

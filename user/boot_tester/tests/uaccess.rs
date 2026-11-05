@@ -4,11 +4,16 @@
 //! array, or output vector must fail the syscall with EFAULT (Linux
 //! semantics) instead of faulting in the kernel. The address comes from an
 //! mmap'd-then-munmap'd page so it is unmapped on both hk and Linux.
+//!
+//! UACCESS_UNALIGNED: an int read and written through a misaligned user
+//! pointer (getsockopt's optlen, FIONREAD's result) works, as Linux's
+//! get_user/put_user on x86-64 and arm64.
 
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
-    IoVec, MAP_ANONYMOUS, MAP_PRIVATE, PROT_READ, PROT_WRITE, sys_close, sys_mincore, sys_mmap,
-    sys_munmap, sys_pipe, sys_readv, sys_vmsplice, sys_write, sys_writev,
+    IoVec, MAP_ANONYMOUS, MAP_PRIVATE, PROT_READ, PROT_WRITE, sys_close, sys_getsockopt, sys_ioctl,
+    sys_mincore, sys_mmap, sys_munmap, sys_pipe, sys_readv, sys_socketpair, sys_vmsplice,
+    sys_write, sys_writev,
 };
 
 const EFAULT: i64 = -14;
@@ -27,6 +32,62 @@ pub fn run_tests() {
     test_readv_bad_iov_array(bad);
     test_vmsplice_bad_base(bad);
     test_mincore_bad_vec();
+    test_unaligned();
+}
+
+fn test_unaligned() {
+    const AF_UNIX: i32 = 1;
+    const SOCK_STREAM: i32 = 1;
+    const SOL_SOCKET: i32 = 1;
+    const SO_TYPE: i32 = 3;
+    const FIONREAD: u64 = 0x541B;
+    let mut buf = [0u8; 16];
+    // 1 past a 4-byte boundary inside `buf`
+    let p = ((buf.as_mut_ptr() as u64 + 3) & !3) + 1;
+    let mut sv = [0i32; 2];
+    if sys_socketpair(AF_UNIX, SOCK_STREAM, 0, &mut sv) != 0 {
+        println(b"UACCESS_UNALIGNED:FAIL socketpair");
+        return;
+    }
+    // SAFETY: `p` and the 3 bytes after it lie inside `buf`
+    unsafe { core::ptr::write_unaligned(p as *mut u32, 4) };
+    let mut ty = 0i32;
+    let r = sys_getsockopt(
+        sv[0],
+        SOL_SOCKET,
+        SO_TYPE,
+        &mut ty as *mut i32 as *mut u8,
+        p as *mut u32,
+    );
+    // SAFETY: as above
+    let len = unsafe { core::ptr::read_unaligned(p as *const u32) };
+    let step = if r != 0 {
+        r
+    } else if ty != SOCK_STREAM || len != 4 {
+        1
+    } else {
+        sys_write(sv[1] as u64, b"abc".as_ptr(), 3);
+        let r = sys_ioctl(sv[0], FIONREAD, p);
+        // SAFETY: as above
+        let n = unsafe { core::ptr::read_unaligned(p as *const i32) };
+        if r != 0 {
+            r
+        } else if n != 3 {
+            2
+        } else {
+            0
+        }
+    };
+    sys_close(sv[0] as u64);
+    sys_close(sv[1] as u64);
+    print(b"UACCESS_UNALIGNED");
+    if step == 0 {
+        println(b":OK");
+    } else {
+        print(b":FAIL step ");
+        print_num(step);
+        println(b"");
+    }
 }
 
 /// Address of a page that was mapped and then unmapped

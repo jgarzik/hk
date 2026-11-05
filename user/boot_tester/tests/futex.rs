@@ -9,6 +9,8 @@
 //! - set_robust_list with wrong size returns -EINVAL
 //! - get_robust_list returns 0
 //! - futex_waitv tests (error cases and basic operation)
+//! - FUTEX_UNALIGNED: a futex word not 4-byte aligned is EINVAL for
+//!   wait, wake and a requeue target (Linux get_futex_key)
 
 use super::helpers::{print, print_num, println};
 use core::ptr;
@@ -33,6 +35,43 @@ pub fn run_tests() {
     test_futex_waitv_reserved_nonzero();
     test_futex_waitv_wrong_value();
     test_futex_waitv_invalid_size();
+    test_futex_unaligned();
+}
+
+fn test_futex_unaligned() {
+    const EINVAL: i64 = -22;
+    let mut words = [0u32; 3];
+    let base = words.as_mut_ptr();
+    // SAFETY: byte 1 of `words`, inside the array
+    let odd = unsafe { (base as *mut u8).add(1) } as *mut u32;
+    // A short timeout: should the wait be accepted, it ends
+    let ts = hk_syscall::Timespec {
+        tv_sec: 0,
+        tv_nsec: 10_000_000,
+    };
+    let pf = FUTEX_PRIVATE_FLAG;
+    let r = [
+        sys_futex(odd, FUTEX_WAIT | pf, 0, &ts, ptr::null_mut(), 0),
+        sys_futex(odd, FUTEX_WAKE | pf, 1, ptr::null(), ptr::null_mut(), 0),
+        sys_futex(
+            base,
+            hk_syscall::FUTEX_CMP_REQUEUE | pf,
+            1,
+            1 as *const hk_syscall::Timespec,
+            odd,
+            0,
+        ),
+    ];
+    match r.iter().position(|&x| x != EINVAL) {
+        None => println(b"FUTEX_UNALIGNED:OK"),
+        Some(i) => {
+            print(b"FUTEX_UNALIGNED:FAIL op ");
+            print_num(i as i64);
+            print(b" got ");
+            print_num(r[i]);
+            println(b"");
+        }
+    }
 }
 
 /// Test: FUTEX_WAKE with no waiters should return 0

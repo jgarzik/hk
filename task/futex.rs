@@ -434,7 +434,6 @@ impl RobustListHead {
 /// Uses proper uaccess infrastructure which:
 /// - Validates address is in user space range
 /// - Handles SMAP protection on x86_64
-/// - Checks alignment
 fn read_user_u32(addr: u64) -> Result<u32, i32> {
     get_user::<Uaccess, u32>(addr).map_err(|_| KernelError::BadAddress.to_errno_neg())
 }
@@ -458,7 +457,6 @@ fn get_value_locked(addr: u64) -> Result<u32, i32> {
 /// Uses proper uaccess infrastructure which:
 /// - Validates address is in user space range
 /// - Handles SMAP protection on x86_64
-/// - Checks alignment
 fn write_user_u32(addr: u64, val: u32) -> Result<(), i32> {
     put_user::<Uaccess, u32>(addr, val).map_err(|_| KernelError::BadAddress.to_errno_neg())
 }
@@ -468,7 +466,6 @@ fn write_user_u32(addr: u64, val: u32) -> Result<(), i32> {
 /// Uses proper uaccess infrastructure which:
 /// - Validates address is in user space range
 /// - Handles SMAP protection on x86_64
-/// - Checks alignment
 fn read_user_u64(addr: u64) -> Result<u64, i32> {
     get_user::<Uaccess, u64>(addr).map_err(|_| KernelError::BadAddress.to_errno_neg())
 }
@@ -499,9 +496,13 @@ fn read_user_timeout(timeout_ptr: u64) -> Result<Option<u64>, i32> {
 /// The futex key of `uaddr` in the current address space (Linux
 /// get_futex_key): a private futex is (mm, address); a shared one is
 /// the backing object and offset in a shared mapping, else (mm,
-/// address) apart from private keys. EFAULT without a mapping.
-/// Takes the mmap_lock (read) for a shared key, before any bucket lock.
+/// address) apart from private keys. EINVAL unless 4-byte aligned
+/// (checked first, as Linux), EFAULT without a mapping. Takes the
+/// mmap_lock (read) for a shared key, before any bucket lock.
 fn make_key(uaddr: u64, private: bool) -> Result<FutexKey, i32> {
+    if !uaddr.is_multiple_of(4) {
+        return Err(KernelError::InvalidArgument.to_errno_neg());
+    }
     let efault = KernelError::BadAddress.to_errno_neg();
     let mm = crate::task::percpu::current().mm().ok_or(efault)?;
     let id = alloc::sync::Arc::as_ptr(&mm) as u64;

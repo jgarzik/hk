@@ -249,7 +249,8 @@ pub fn copy_from_user_atomic<A: UaccessArch>(
 
 /// Write a single value to user space
 ///
-/// This is equivalent to Linux's `put_user()` macro.
+/// This is equivalent to Linux's `put_user()` macro: any alignment, as
+/// on x86-64 and arm64.
 ///
 /// # Arguments
 /// * `to` - User space destination address
@@ -265,11 +266,6 @@ pub fn put_user<A: UaccessArch, T: IntoBytes>(to: u64, value: T) -> UaccessResul
 
     // Validate user address
     if !A::access_ok(to, size) {
-        return Err(UaccessError::BadAddress);
-    }
-
-    // Check alignment
-    if !to.is_multiple_of(::core::mem::align_of::<T>() as u64) {
         return Err(UaccessError::BadAddress);
     }
 
@@ -292,7 +288,8 @@ pub fn put_user<A: UaccessArch, T: IntoBytes>(to: u64, value: T) -> UaccessResul
 
 /// Read a single value from user space
 ///
-/// This is equivalent to Linux's `get_user()` macro.
+/// This is equivalent to Linux's `get_user()` macro: any alignment, as
+/// on x86-64 and arm64.
 ///
 /// # Arguments
 /// * `from` - User space source address
@@ -307,11 +304,6 @@ pub fn get_user<A: UaccessArch, T: FromBytes>(from: u64) -> UaccessResult<T> {
 
     // Validate user address
     if !A::access_ok(from, size) {
-        return Err(UaccessError::BadAddress);
-    }
-
-    // Check alignment
-    if !from.is_multiple_of(::core::mem::align_of::<T>() as u64) {
         return Err(UaccessError::BadAddress);
     }
 
@@ -334,8 +326,8 @@ pub fn get_user<A: UaccessArch, T: FromBytes>(from: u64) -> UaccessResult<T> {
     Ok(unsafe { value.assume_init() })
 }
 
-/// Copy a plain-data value from user space (no alignment requirement,
-/// unlike [`get_user`]); for user structs such as `struct timespec[2]`
+/// Copy a plain-data value from user space; for user structs such as
+/// `struct timespec[2]`
 pub fn copy_val_from_user<A: UaccessArch, T: FromBytes>(from: u64) -> UaccessResult<T> {
     let mut value = MaybeUninit::<T>::zeroed();
     let size = ::core::mem::size_of::<T>();
@@ -346,8 +338,8 @@ pub fn copy_val_from_user<A: UaccessArch, T: FromBytes>(from: u64) -> UaccessRes
     Ok(unsafe { value.assume_init() })
 }
 
-/// Copy a plain-data value to user space (no alignment requirement, unlike
-/// [`put_user`]); `T` has no padding, which would leak kernel stack bytes
+/// Copy a plain-data value to user space; `T` has no padding, which
+/// would leak kernel stack bytes
 pub fn copy_val_to_user<A: UaccessArch, T: IntoBytes>(to: u64, value: &T) -> UaccessResult<()> {
     copy_to_user::<A>(to, value.as_bytes())?;
     Ok(())
