@@ -16,8 +16,8 @@
 //! goes out, or the delayed ACK timer is armed (`ack.rs`).
 
 use super::cb::{
-    OOW_RATELIMIT, Out, PAWS_WRAP, RCV_SHUTDOWN, Seg, SegIn, TIMEWAIT_LEN, TcpCb, TcpState, Tmr,
-    after, before, between, flags,
+    MemKind, OOO_OVERHEAD, OOW_RATELIMIT, Out, PAWS_WRAP, RCV_SHUTDOWN, Seg, SegIn, TIMEWAIT_LEN,
+    TcpCb, TcpState, Tmr, after, before, between, flags,
 };
 use crate::util::error::KernelError;
 
@@ -389,7 +389,7 @@ impl TcpCb {
             let n = upto.wrapping_sub(self.sndq_seq) as usize;
             self.sndq.drain(..n.min(self.sndq.len()));
             self.sndq_seq = upto;
-            self.charge();
+            self.mem_settle();
         }
         self.stats.bytes_acked += acked as u64;
         self.snd_una = ack;
@@ -472,6 +472,10 @@ impl TcpCb {
             out.err = Some(KernelError::ConnectionReset);
             return;
         }
+        if !data.is_empty() && !self.rmem_ok(seq, data.len(), out) {
+            // Dropped whole, FIN too; it comes again
+            return;
+        }
         if !data.is_empty() {
             self.queue_data(seq, data, now, out);
         }
@@ -500,6 +504,34 @@ impl TcpCb {
         hard.saturating_sub(self.rcvq.len())
     }
 
+    /// Memory for `len` bytes at `seq` (Linux tcp_try_rmem_schedule in
+    /// tcp_data_queue / tcp_data_queue_ofo): out-of-order pieces beyond
+    /// `seq` are pruned to make room. Failing that, out-of-order data is
+    /// dropped; in-order data is still taken into an empty receive queue
+    /// (sk_forced_mem_schedule, so the reader can always progress), else
+    /// dropped with an immediate zero-window ACK (ICSK_ACK_NOMEM). The
+    /// reader is woken either way.
+    fn rmem_ok(&mut self, seq: u32, len: usize, out: &mut Out) -> bool {
+        let in_order = seq == self.rcv_nxt;
+        let size = if in_order { len } else { len + OOO_OVERHEAD };
+        loop {
+            if self.mem_schedule(size, MemKind::Recv) {
+                return true;
+            }
+            if !self.ooo.prune_after(seq) {
+                break;
+            }
+        }
+        self.mem_settle();
+        out.wake = true;
+        if !in_order {
+            return false;
+        }
+        self.ack_nomem = true;
+        self.ack_now = true;
+        self.rcvq.is_empty()
+    }
+
     /// Accepted bytes at `seq`: in order to the receive queue (owing a
     /// possibly delayed ACK), else held out of order (ACK at once; also
     /// when a hole is filled, RFC 5681 4.2)
@@ -508,7 +540,7 @@ impl TcpCb {
         if seq != self.rcv_nxt {
             self.ooo.insert(self.rcv_nxt, seq, data);
             self.ack_now = true;
-            self.charge();
+            self.mem_settle();
             return;
         }
         let had_ooo = !self.ooo.is_empty();
@@ -523,7 +555,7 @@ impl TcpCb {
             self.ack_now = true;
         }
         out.wake = true;
-        self.charge();
+        self.mem_settle();
     }
 
     /// The peer's FIN is in sequence (RFC 9293 eighth check)

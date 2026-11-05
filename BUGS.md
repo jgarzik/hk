@@ -95,7 +95,9 @@ Planned fix:
 
 Listed because real traffic reaches them: TCP has no SACK (never
 advertised), no CUBIC (only "reno"; Linux defaults to cubic), no
-receive buffer autotuning (the window is SO_RCVBUF / 2), no per-netns
+receive or send buffer autotuning (the window is SO_RCVBUF / 2; no
+tcp_sndbuf_expand, so past the TCP memory hard limit a sender's
+SO_SNDBUF is not shrunk, sk_stream_moderate_sndbuf), no per-netns
 RFC 5961 challenge-ACK budget (only Linux's per-connection 500 ms
 limit), and TCP_DEFER_ACCEPT / TCP_FASTOPEN are stored only.
 No SYN cookies (a full listener drops SYNs). ICMP

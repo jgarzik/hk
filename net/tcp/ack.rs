@@ -108,6 +108,7 @@ impl TcpCb {
         self.dack.pushed = false;
         self.dack.at = None;
         self.ack_now = false;
+        self.ack_nomem = false;
     }
 
     /// New data went out at `now` (Linux tcp_event_data_sent): a reply

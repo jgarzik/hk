@@ -667,6 +667,11 @@ impl TcpSock {
     }
 
     /// Writers can stop waiting
+    /// The send buffer has room (Linux sk_stream_memory_free)
+    fn snd_room(&self) -> bool {
+        self.lock().cb.snd_space() > 0
+    }
+
     fn tx_ready(&self) -> bool {
         let g = self.cb.lock();
         g.cb.writable()
@@ -973,6 +978,32 @@ fn wait_connected(s: &TcpSock, timeo: &mut u64) -> Result<(), KernelError> {
     }
 }
 
+/// One memory wait of a sender (Linux sk_stream_wait_memory with
+/// vm_wait set): EAGAIN without time left, the signal errno of the
+/// whole send timeout if interrupted
+fn wait_memory(s: &TcpSock, timeo: &mut u64) -> Result<(), KernelError> {
+    use crate::net::sock::TIMEO_FOREVER;
+    if *timeo == 0 {
+        return Err(KernelError::WouldBlock);
+    }
+    let vm_wait = (2 + crate::random::get_random_u32() % 200) as u64 * 1_000_000;
+    let step = (*timeo).min(vm_wait);
+    let left = match s.sk.wait(step, || {
+        s.sk.has_err() || s.sk.shutdown() & SEND_SHUTDOWN != 0
+    }) {
+        Ok(left) => left,
+        Err(KernelError::WouldBlock) => 0,
+        Err(KernelError::Interrupted) if *timeo == TIMEO_FOREVER => {
+            return Err(KernelError::RestartSys);
+        }
+        Err(e) => return Err(e),
+    };
+    if *timeo != TIMEO_FOREVER {
+        *timeo -= step - left;
+    }
+    Ok(())
+}
+
 /// Linux tcp_sendmsg: queue everything (blocking) or what fits
 /// (non-blocking), copying through a bounded kernel buffer
 fn tcp_sendmsg(s: &TcpSock, m: &mut SendMsg, flags: i32) -> Result<usize, KernelError> {
@@ -1005,17 +1036,13 @@ fn tcp_sendmsg(s: &TcpSock, m: &mut SendMsg, flags: i32) -> Result<usize, Kernel
         at += n;
         sent += n;
         dev::netif_rx_flush_local();
-        if n == 0 && cb::mem_free() == 0 {
-            // Global TCP memory pressure: nobody wakes us when other
-            // connections free memory, so poll (Linux sk_stream_wait_memory
-            // under pressure also sleeps a short random time)
-            if timeo == 0 {
-                break Err(KernelError::WouldBlock);
-            }
-            let step = timeo.min(20_000_000);
-            let _ = s.sk.wait(step, || false);
-            if timeo != crate::net::sock::TIMEO_FOREVER {
-                timeo -= step;
+        if n == 0 && s.snd_room() {
+            // Room in the buffer but no TCP memory: nobody wakes us when
+            // other connections free some, so sleep a random 2..201 ms
+            // (Linux sk_stream_wait_memory vm_wait), cut short only by an
+            // error or shutdown
+            if let Err(e) = wait_memory(s, &mut timeo) {
+                break Err(e);
             }
         } else if n == 0
             && let Err(e) = s.sk.wait(timeo, || s.tx_ready()).map(|t| timeo = t)
