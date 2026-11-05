@@ -12,6 +12,11 @@
 //!   CAP_SYS_RESOURCE (Linux check_prlimit_permission), even to read: a
 //!   uid-1000 process gets EPERM for a root task, 0 for its own child;
 //!   root may read anyone's.
+//! - RLIMIT_RAISE_RACE: an unprivileged process lowers its hard
+//!   RLIMIT_NOFILE while a thread keeps setting the old hard value:
+//!   once lowered it stays lowered (a set that saw the old value but
+//!   stored after the lower would be an unprivileged raise; Linux
+//!   do_prlimit decides and stores under task_lock). 30 rounds.
 //! - SETRLIMIT_EFAULT_FIRST: setrlimit copies the limit in before it
 //!   looks at the resource (EFAULT, not EINVAL).
 //! - IPC_CAPS: SysV permissions as Linux ipcperms (a supplementary group
@@ -52,6 +57,7 @@ pub fn run_tests() {
     report(b"NS_CAPS_DROPPED", in_child(ns_dropped));
     report(b"NS_CAPS_KEPT", in_child(ns_kept));
     report(b"PRLIMIT_PERM", prlimit_perm());
+    report(b"RLIMIT_RAISE_RACE", rlimit_raise_race());
     let r = hk_syscall::sys_setrlimit(9999, core::ptr::null());
     report(b"SETRLIMIT_EFAULT_FIRST", (r != -14) as u64);
     report(b"IPC_CAPS", ipc_caps());
@@ -537,6 +543,72 @@ struct KStack([u8; 16384]);
 static mut KSTACK: KStack = KStack([0; 16384]);
 static mut KCTID: u32 = 0;
 static mut KSERIAL: i64 = 0;
+
+/// Set the hard NOFILE limit back to 100, over and over (EPERM once the
+/// main thread lowered it)
+extern "C" fn raiser(_: u64) -> ! {
+    let r = hk_syscall::RLimit {
+        rlim_cur: 20,
+        rlim_max: 100,
+    };
+    for _ in 0..300 {
+        hk_syscall::sys_setrlimit(RLIMIT_NOFILE, &r);
+    }
+    sys_exit(0)
+}
+
+/// One round in a fresh process: hard 100, unprivileged, then lowered
+/// to 50 while `raiser` runs: it must end at 50
+fn rlimit_round(spins: u64) -> u64 {
+    let start = hk_syscall::RLimit {
+        rlim_cur: 20,
+        rlim_max: 100,
+    };
+    if hk_syscall::sys_setrlimit(RLIMIT_NOFILE, &start) != 0 || sys_setresuid(1000, 1000, 1000) != 0
+    {
+        return 1;
+    }
+    // SAFETY: the thread runs on the file's static stack (free while
+    // this test runs) and clears KCTID when it exits
+    let t = unsafe {
+        core::ptr::write_volatile(&raw mut KCTID, 1);
+        let top = (&raw mut KSTACK as *mut u8).add(16384) as u64;
+        super::fork_mm::spawn_thread(top, raiser, 0, &raw mut KCTID)
+    };
+    if t <= 0 {
+        return 2;
+    }
+    for _ in 0..spins {
+        hk_syscall::sys_sched_yield();
+    }
+    let low = hk_syscall::RLimit {
+        rlim_cur: 20,
+        rlim_max: 50,
+    };
+    if hk_syscall::sys_setrlimit(RLIMIT_NOFILE, &low) != 0 {
+        return 3;
+    }
+    // SAFETY: KCTID is the thread's clear-child-tid word
+    while unsafe { core::ptr::read_volatile(&raw const KCTID) } != 0 {
+        hk_syscall::sys_sched_yield();
+    }
+    let mut now = hk_syscall::RLimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    hk_syscall::sys_getrlimit(RLIMIT_NOFILE, &mut now);
+    if now.rlim_max != 50 { 4 } else { 0 }
+}
+
+fn rlimit_raise_race() -> u64 {
+    for round in 0..30u64 {
+        let r = in_child_with(|| rlimit_round(round % 6));
+        if r != 0 {
+            return r * 100 + round;
+        }
+    }
+    0
+}
 
 /// Update the key over and over (its errors are expected once revoked)
 extern "C" fn updater(_: u64) -> ! {

@@ -1637,31 +1637,37 @@ impl SignalStruct {
         }
     }
 
-    /// Set a resource limit (with permission checks)
-    ///
-    /// Validates:
-    /// - rlim_cur <= rlim_max
-    /// - Only CAP_SYS_RESOURCE can raise hard limit (checked here)
-    pub fn set_rlimit(&self, resource: u32, new: RLimit, old: &RLimit) -> Result<(), i32> {
-        if resource as usize >= RLIM_NLIMITS {
+    /// Set a resource limit (Linux do_prlimit's update): EINVAL for a
+    /// bad resource or cur above max; raising the hard limit needs
+    /// CAP_SYS_RESOURCE (EPERM). The old value, the decision and the
+    /// store are one hold of `rlim`, so a racing change cannot slip a
+    /// raise past the check. The capability is asked outside the lock
+    /// (it reads the caller's credentials), only when the value seen
+    /// makes this a raise, and again if a racing change makes it one.
+    /// Returns the limit replaced.
+    pub fn set_rlimit(&self, resource: u32, new: RLimit) -> Result<RLimit, i32> {
+        let r = resource as usize;
+        if r >= RLIM_NLIMITS || new.rlim_cur > new.rlim_max {
             return Err(-22); // EINVAL
         }
-
-        // cur must be <= max
-        if new.rlim_cur > new.rlim_max {
-            return Err(-22); // EINVAL
+        let mut seen = self.rlim.lock()[r].rlim_max;
+        let mut privileged = false;
+        loop {
+            if new.rlim_max > seen && !privileged {
+                if !crate::task::capable(crate::task::CAP_SYS_RESOURCE) {
+                    return Err(-1); // EPERM
+                }
+                privileged = true;
+            }
+            let mut rlim = self.rlim.lock();
+            let old = rlim[r];
+            if new.rlim_max > old.rlim_max && !privileged {
+                seen = old.rlim_max;
+                continue;
+            }
+            rlim[r] = new;
+            return Ok(old);
         }
-
-        // Check if raising hard limit (requires CAP_SYS_RESOURCE)
-        // Asked only when raising it (Linux do_prlimit), so only a
-        // privileged raise marks the task PF_SUPERPRIV
-        if new.rlim_max > old.rlim_max && !crate::task::capable(crate::task::CAP_SYS_RESOURCE) {
-            return Err(-1); // EPERM
-        }
-
-        let mut rlim = self.rlim.lock();
-        rlim[resource as usize] = new;
-        Ok(())
     }
 
     /// Deep clone for fork (without CLONE_THREAD)

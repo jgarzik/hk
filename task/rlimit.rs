@@ -150,18 +150,12 @@ pub fn get_task_rlimit(tid: Tid, resource: u32) -> Option<RLimit> {
     signal.get_rlimit(resource)
 }
 
-/// Set a task's resource limit (with permission checks)
-///
-/// Validates:
-/// - Resource number is valid
-/// - rlim_cur <= rlim_max
-/// - Only CAP_SYS_RESOURCE (or root) can raise hard limit
-///
-/// Returns Ok(()) on success, or Err(errno) on failure.
-pub fn set_task_rlimit(tid: Tid, resource: u32, new: RLimit) -> Result<(), i32> {
+/// Set a task's resource limit (`SignalStruct::set_rlimit`: EINVAL,
+/// EPERM for an unprivileged raise of the hard limit); the limit it
+/// replaced, read in the same hold as the store
+pub fn set_task_rlimit(tid: Tid, resource: u32, new: RLimit) -> Result<RLimit, i32> {
     let signal = get_task_signal_struct(tid).ok_or(-3)?; // ESRCH
-    let old = signal.get_rlimit(resource).ok_or(-22)?; // EINVAL
-    signal.set_rlimit(resource, new, &old)?;
+    let old = signal.set_rlimit(resource, new)?;
     // A finite CPU limit is watched from now (Linux update_rlimit_cpu)
     if resource == RLIMIT_CPU {
         let pid = crate::task::percpu::TASKLIST
@@ -172,7 +166,7 @@ pub fn set_task_rlimit(tid: Tid, resource: u32, new: RLimit) -> Result<(), i32> 
             crate::time::cpu_timer::rlimit_cpu_changed(&signal, pid);
         }
     }
-    Ok(())
+    Ok(old)
 }
 
 /// Convenience function: get soft limit for current task
@@ -265,7 +259,7 @@ pub fn sys_setrlimit(resource: u32, rlim_ptr: u64) -> i64 {
     let tid = current_tid();
 
     match set_task_rlimit(tid, resource, new_rlim) {
-        Ok(()) => 0,
+        Ok(_) => 0,
         Err(e) => e as i64,
     }
 }
@@ -328,15 +322,18 @@ pub fn sys_prlimit64(pid: i32, resource: u32, new_rlim_ptr: u64, old_rlim_ptr: u
     {
         return e;
     }
-    let old = match get_task_rlimit(target_tid, resource) {
-        Some(r) => r,
-        None => return -3, // ESRCH
+    // The old value is the one replaced (Linux do_prlimit reads it
+    // under the same task_lock as the store)
+    let old = match new {
+        Some(new) => match set_task_rlimit(target_tid, resource, new) {
+            Ok(old) => old,
+            Err(e) => return e as i64,
+        },
+        None => match get_task_rlimit(target_tid, resource) {
+            Some(r) => r,
+            None => return -3, // ESRCH
+        },
     };
-    if let Some(new) = new
-        && let Err(e) = set_task_rlimit(target_tid, resource, new)
-    {
-        return e as i64;
-    }
     if old_rlim_ptr != 0 && copy_val_to_user::<Uaccess, RLimit>(old_rlim_ptr, &old).is_err() {
         return -14; // EFAULT
     }
