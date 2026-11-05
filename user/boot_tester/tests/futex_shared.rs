@@ -13,6 +13,8 @@
 //!   a free futex word wakes a waiter there (Linux handle_futex_death).
 //! - ROBUST_DEATH_WAKE: likewise for a word with waiters but no owner
 //!   (FUTEX_WAITERS alone): Linux wakes on the owner bits being 0.
+//! - ROBUST_DEATH_OTHER_OWNER: likewise for a word another thread
+//!   owns without FUTEX_WAITERS (Linux 7.2+; skipped on older hosts).
 //! - ROBUST_DEATH_WAITERS: a thread dies holding a robust lock while a
 //!   waiter sets FUTEX_WAITERS and sleeps: the death's update is a
 //!   cmpxchg, so the bit is never lost and the waiter always wakes
@@ -40,6 +42,7 @@ pub fn run_tests() {
     ctid_shared();
     robust_pending();
     robust_death_wake();
+    robust_death_other_owner();
     robust_death_waiters();
 }
 
@@ -333,6 +336,28 @@ fn robust_death_wake() {
     let left = unsafe { core::ptr::read_volatile(w) };
     // Woken, the word untouched
     report(NAME, r == 0 && joined && left == FUTEX_WAITERS, r);
+}
+
+fn robust_death_other_owner() {
+    const NAME: &[u8] = b"ROBUST_DEATH_OTHER_OWNER";
+    if !super::helpers::linux_at_least(7, 2) {
+        return super::helpers::skip(NAME, b"Linux 7.2 wake rule");
+    }
+    // Owned by this thread (never the dying one), no waiters marked
+    let other = hk_syscall::sys_gettid() as u32;
+    let w = unsafe { &raw mut ROBUST_ENTRY.word };
+    unsafe { core::ptr::write_volatile(w, other) };
+    if !spawn(robust_dier, 0) {
+        return report(NAME, false, -1);
+    }
+    let ts = Timespec {
+        tv_sec: 3,
+        tv_nsec: 0,
+    };
+    let r = sys_futex(w, FUTEX_WAIT, other, &ts, core::ptr::null_mut(), 0);
+    let joined = join();
+    let left = unsafe { core::ptr::read_volatile(w) };
+    report(NAME, r == 0 && joined && left == other, r);
 }
 
 /// The holder is ready: its TID is in the word

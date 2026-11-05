@@ -959,9 +959,11 @@ pub fn exit_robust_list(tid: Tid) {
 
 /// A robust futex of an exiting task (Linux handle_futex_death).
 ///
-/// - Pending op: a non-PI op on a word with no owner wakes one waiter,
-///   leaving the word alone. The task may have died after unlocking
-///   but before waking, or after being woken but before taking the lock.
+/// - Pending op on a word another task (or none) owns: a non-PI op wakes
+///   one waiter, leaving the word alone, if the word has no owner or no
+///   FUTEX_WAITERS (Linux 7.2+). The task may have died after unlocking
+///   but before waking, or after being woken but before taking the lock
+///   while a third task took the word without marking waiters.
 /// - Otherwise, if the task owns the word, it is marked
 ///   OWNER_DIED (WAITERS kept, the TID cleared so a reused TID is not
 ///   taken for the owner) by a cmpxchg against the value read. A waiter
@@ -983,11 +985,11 @@ fn handle_futex_death(entry: u64, futex_offset: i64, tid: Tid, pi: bool, pending
             return;
         };
         let owner = uval & futex_op::FUTEX_TID_MASK;
-        if pending_op && !pi && owner == 0 {
-            futex_wake(futex_addr, 1, any, false);
-            return;
-        }
         if owner != tid as u32 {
+            let waiters = uval & futex_op::FUTEX_WAITERS != 0;
+            if pending_op && !pi && (owner == 0 || !waiters) {
+                futex_wake(futex_addr, 1, any, false);
+            }
             return;
         }
         let mval = (uval & futex_op::FUTEX_WAITERS) | futex_op::FUTEX_OWNER_DIED;
