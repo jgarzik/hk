@@ -534,9 +534,7 @@ fn validate_mq_name(name: &[u8]) -> Result<(), KernelError> {
 /// mq_open - open a message queue
 /// Linux mq_attr_ok: both values positive; without CAP_SYS_RESOURCE a
 /// queue is capped at the soft defaults, with it at the hard maxima; the
-/// total storage must not overflow (EOVERFLOW). hk cannot store more
-/// than MAX_KMALLOC in one message, but the per-queue caps keep an
-/// unprivileged request well under that.
+/// total storage must not overflow (EOVERFLOW).
 fn mq_attr_ok(maxmsg: i64, msgsize: i64) -> Result<(i64, i64), KernelError> {
     if maxmsg <= 0 || msgsize <= 0 {
         return Err(KernelError::InvalidArgument);

@@ -15,8 +15,10 @@ The rules for `unsafe` are in `doc/UNSAFE.md` and the locking rules in
   for kernel invariants: a state that cannot happen unless the kernel has
   a bug. Anything a user, a device or a disk can cause is an error return.
 - **Fallible allocation for untrusted sizes.** The global allocator
-  panics the kernel when it cannot satisfy a request, and nothing above
-  `kmem::MAX_KMALLOC` (4 MiB, no vmalloc) can be satisfied. A buffer
+  panics the kernel when it cannot satisfy a request (large blocks come
+  from vmalloc, up to `kmem::MAX_KMALLOC`, Linux kvmalloc's INT_MAX;
+  vmalloc memory is not physically contiguous: never DMA from the
+  heap's large blocks, use `hw::dma`). A buffer
   whose size comes from a syscall argument, the network or a disk must
   grow through a fallible path: `kmem::try_vec` for a known size, or
   `kmem::KVec`/`KDeque` (whose growth is always `try_*`, ENOMEM) for one

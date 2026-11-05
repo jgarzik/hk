@@ -1,11 +1,11 @@
 //! Fallible allocation for sizes the user, the network or a disk control
 //!
 //! The global allocator cannot fail gracefully (an allocation it cannot
-//! meet panics), and the heap has no vmalloc, so nothing above
-//! [`MAX_KMALLOC`] can be satisfied. A buffer whose size comes from
-//! outside the kernel must therefore grow through a fallible path that
-//! returns [`KernelError::OutOfMemory`] (ENOMEM), as Linux's kvmalloc
-//! callers do.
+//! meet panics). A buffer whose size comes from outside the kernel must
+//! therefore grow through a fallible path that returns
+//! [`KernelError::OutOfMemory`] (ENOMEM), as Linux's kvmalloc callers
+//! do. The heap serves large blocks from `mm::vmalloc` (kvmalloc), up
+//! to [`MAX_KMALLOC`], Linux kvmalloc's INT_MAX.
 //!
 //! - [`try_vec`] allocates a filled buffer of a known size.
 //! - [`KVec`] and [`KDeque`] wrap the standard containers with growth
@@ -18,7 +18,11 @@ use alloc::vec::Vec;
 
 use crate::util::error::KernelError;
 
-/// Largest heap allocation (MAX_ORDER pages: no vmalloc)
+/// Largest heap allocation (Linux kvmalloc refuses more than INT_MAX).
+/// Host tests use a small cap so its limits can be reached.
+#[cfg(not(test))]
+pub const MAX_KMALLOC: usize = i32::MAX as usize;
+#[cfg(test)]
 pub const MAX_KMALLOC: usize = 4 << 20;
 
 /// ENOMEM unless `count` items of `T` fit under [`MAX_KMALLOC`]

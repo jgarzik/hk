@@ -94,6 +94,7 @@ pub fn run_tests() {
     test_array_map_ops();
     test_map_iteration();
     test_prog_load();
+    test_prog_load_big();
     test_invalid_map_type();
     test_invalid_fd();
 }
@@ -569,6 +570,52 @@ fn test_prog_load() {
     }
 
     println(b"BPF_PROG_LOAD:OK");
+}
+
+/// A 600,000-instruction program (4.8 MB) loads with CAP_BPF, as Linux
+/// allows up to BPF_COMPLEXITY_LIMIT_INSNS: the kernel's copy of it
+/// needs a heap block far past the slab's largest (vmalloc)
+fn test_prog_load_big() {
+    const N: usize = 600_000;
+    let len = (N * 8) as u64;
+    let p = hk_syscall::sys_mmap(0, len, 3, 0x22, -1, 0); // RW, PRIVATE|ANON
+    if p < 0 {
+        println(b"BPF_PROG_LOAD_BIG:FAIL mmap");
+        return;
+    }
+    // SAFETY: the mapping just made, N u64s
+    let insns = unsafe { core::slice::from_raw_parts_mut(p as *mut u64, N) };
+    insns.fill(0xb7); // r0 = 0
+    insns[N - 1] = 0x95; // exit
+    let license = b"GPL\0";
+    let attr = ProgLoadAttr {
+        prog_type: BPF_PROG_TYPE_SOCKET_FILTER,
+        insn_cnt: N as u32,
+        insns: p as u64,
+        license: license.as_ptr() as u64,
+        log_level: 0,
+        log_size: 0,
+        log_buf: 0,
+        kern_version: 0,
+        prog_flags: 0,
+        prog_name: [0; 16],
+        prog_ifindex: 0,
+        expected_attach_type: 0,
+    };
+    let fd = sys_bpf(
+        BPF_PROG_LOAD,
+        &attr as *const _ as u64,
+        size_of::<ProgLoadAttr>() as u32,
+    );
+    hk_syscall::sys_munmap(p as u64, len);
+    if fd < 0 {
+        print(b"BPF_PROG_LOAD_BIG:FAIL returned ");
+        print_num(fd);
+        println(b"");
+        return;
+    }
+    sys_close(fd as u64);
+    println(b"BPF_PROG_LOAD_BIG:OK");
 }
 
 /// Test invalid map type returns error

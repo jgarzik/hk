@@ -51,8 +51,7 @@ use crate::util::error::KernelError;
 static UNPRIV_DISABLED: AtomicU32 = AtomicU32::new(2);
 
 /// Most instructions in a program with CAP_BPF (Linux
-/// BPF_COMPLEXITY_LIMIT_INSNS); the heap's allocation cap may refuse
-/// one this long (ENOMEM)
+/// BPF_COMPLEXITY_LIMIT_INSNS)
 const MAX_INSNS_CAP: usize = 1_000_000;
 
 /// CAP_BPF, or CAP_SYS_ADMIN which implies it (Linux bpf_capable)
