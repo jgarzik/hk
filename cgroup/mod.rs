@@ -724,6 +724,31 @@ pub fn cgroup_exit_task(pid: Pid) {
 /// TASKLIST.
 pub static CGROUP_MUTEX: crate::sync::Mutex<()> = crate::sync::Mutex::new(());
 
+/// Fork against migration (Linux cgroup_threadgroup_rwsem, its default
+/// global form): a fork holds it shared from admission to post_fork, a
+/// cgroup.procs write exclusively while it moves a thread group, so no
+/// thread is created in the old cgroup behind a migration. Under
+/// CGROUP_MUTEX; above TASKLIST and the cgroup spin locks.
+pub static CGROUP_THREADGROUP_RWSEM: crate::sync::RwSem<()> = crate::sync::RwSem::new(());
+
+/// The threads of the process `pid` names (any of its threads; 0: the
+/// caller's): ESRCH if none (Linux cgroup_procs_write_start finds the
+/// task, then its group leader's whole group)
+pub fn thread_group(pid: Pid) -> Result<Vec<Tid>, KernelError> {
+    let table = crate::task::percpu::TASKLIST.read();
+    let tid = if pid == 0 {
+        crate::task::percpu::current_tid()
+    } else {
+        pid as Tid
+    };
+    let tgid = table.get(tid).ok_or(KernelError::NoProcess)?.task.pid;
+    Ok(table
+        .iter()
+        .filter(|t| t.task.pid == tgid)
+        .map(|t| t.task.tid())
+        .collect())
+}
+
 /// Create a child cgroup (Linux cgroup_mkdir: ENODEV in a removed
 /// parent)
 pub fn cgroup_mkdir(parent: &Arc<Cgroup>, name: &str) -> Result<Arc<Cgroup>, KernelError> {
@@ -805,9 +830,12 @@ pub struct ForkCg {
     cg: Arc<Cgroup>,
     /// The controllers whose `can_fork` admitted it
     charged: Vec<ControllerType>,
+    /// CGROUP_THREADGROUP_RWSEM, shared, until post_fork (Linux
+    /// cgroup_threadgroup_change_begin in cgroup_css_set_fork); dropped
+    /// after the charges are given back
+    _tg: crate::sync::RwSemReadGuard<'static, ()>,
     /// CLONE_INTO_CGROUP: CGROUP_MUTEX until post_fork (Linux
-    /// cgroup_css_set_fork .. cgroup_css_set_put_fork); dropped after
-    /// the charges are given back
+    /// cgroup_css_set_fork .. cgroup_css_set_put_fork), released last
     _lock: Option<crate::sync::MutexGuard<'static, ()>>,
 }
 
@@ -817,12 +845,14 @@ pub struct ForkCg {
 /// controller's `can_fork`, undone if a later one refuses
 pub fn can_fork(cg: &Arc<Cgroup>, into: bool) -> Result<ForkCg, KernelError> {
     let lock = into.then(|| CGROUP_MUTEX.lock());
+    let tg = CGROUP_THREADGROUP_RWSEM.read();
     if into && cg.is_dead() {
         return Err(KernelError::NoDevice);
     }
     let mut fc = ForkCg {
         cg: cg.clone(),
         charged: Vec::new(),
+        _tg: tg,
         _lock: lock,
     };
     for controller in cg.enabled_controllers() {

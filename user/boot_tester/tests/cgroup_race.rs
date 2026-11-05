@@ -18,6 +18,10 @@
 //! - CGROUP_RMDIR_RACE: a child joining a cgroup while it is removed:
 //!   either the join or the rmdir fails, never both succeed (an emptiness
 //!   check and an attach cannot interleave).
+//! - CGROUP_PROCS_TGID: writing a non-leader thread's tid to
+//!   cgroup.procs moves its whole thread group, and cgroup.procs lists
+//!   the process once (Linux: threadgroup migration under
+//!   cgroup_threadgroup_rwsem).
 //!
 //! Runs after cgroup.rs, which mounts cgroup2 at /sys/fs/cgroup and
 //! enables +pids at the root.
@@ -39,6 +43,7 @@ pub fn run_tests() {
     report(b"PIDS_MAX_RACE", pids_max_race());
     report(b"CGROUP_DEAD_ENODEV", cgroup_dead_enodev());
     report(b"CGROUP_RMDIR_RACE", cgroup_rmdir_race());
+    report(b"CGROUP_PROCS_TGID", in_child(cgroup_procs_tgid));
 }
 
 fn report(name: &[u8], step: i64) {
@@ -147,7 +152,8 @@ fn reap(pid: i64) {
 fn in_child(f: impl Fn() -> i64) -> i64 {
     let pid = sys_fork();
     if pid == 0 {
-        sys_exit(f() as u64);
+        // The whole process: f may have started threads
+        hk_syscall::sys_exit_group(f() as u64);
     }
     let mut ws = 0;
     sys_wait4(pid, &mut ws, 0, 0);
@@ -409,4 +415,94 @@ fn cgroup_rmdir_race() -> i64 {
     sys_munmap(p as u64, 4096);
     remove_cgroup(cg);
     bad
+}
+
+#[repr(C, align(16))]
+struct Stack([u8; 16384]);
+static mut STACK: Stack = Stack([0; 16384]);
+static mut CTID: u32 = 0;
+
+extern "C" fn idle_thread(_: u64) -> ! {
+    loop {
+        sys_pause();
+    }
+}
+
+/// "<file> of /proc/self/task/<tid>" names cgroup `pl_tg`
+fn in_tg_cgroup(tid: i64) -> bool {
+    let mut p = [0u8; 64];
+    let mut n = 0;
+    for part in [&b"/proc/self/task/"[..]] {
+        p[n..n + part.len()].copy_from_slice(part);
+        n += part.len();
+    }
+    let mut d = [0u8; 12];
+    let mut k = d.len();
+    let mut v = tid as u64;
+    loop {
+        k -= 1;
+        d[k] = b'0' + (v % 10) as u8;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    p[n..n + d.len() - k].copy_from_slice(&d[k..]);
+    n += d.len() - k;
+    let tail = b"/cgroup\0";
+    p[n..n + tail.len()].copy_from_slice(tail);
+    let fd = sys_open(p.as_ptr(), O_RDONLY, 0);
+    if fd < 0 {
+        return false;
+    }
+    let mut b = [0u8; 64];
+    let r = sys_read(fd as u64, b.as_mut_ptr(), b.len() as u64);
+    sys_close(fd as u64);
+    r > 0 && b[..r as usize].ends_with(b"/pl_tg\n")
+}
+
+/// In a child: a second thread, then its tid written to cgroup.procs
+fn cgroup_procs_tgid() -> i64 {
+    let cg = b"pl_tg";
+    let mut b = [0u8; 96];
+    sys_mkdir(path(&mut b, cg, b"").as_ptr(), 0o755);
+    // SAFETY: the thread runs on its own static stack until the process
+    // exits, and CTID is its clear-child-tid word
+    let tid = unsafe {
+        let top = (&raw mut STACK as *mut u8).add(16384) as u64;
+        super::fork_mm::spawn_thread(top, idle_thread, 0, &raw mut CTID)
+    };
+    if tid <= 0 {
+        return 1;
+    }
+    let mut d = [0u8; 12];
+    let mut k = d.len();
+    let mut v = tid as u64;
+    loop {
+        k -= 1;
+        d[k] = b'0' + (v % 10) as u8;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    if write_file(cg, b"cgroup.procs", &d[k..]) <= 0 {
+        return 2;
+    }
+    if !in_tg_cgroup(sys_getpid()) || !in_tg_cgroup(tid) {
+        return 3;
+    }
+    // One line, the process
+    let fd = sys_open(path(&mut b, cg, b"cgroup.procs").as_ptr(), O_RDONLY, 0);
+    let mut buf = [0u8; 64];
+    let n = sys_read(fd as u64, buf.as_mut_ptr(), buf.len() as u64);
+    sys_close(fd as u64);
+    let lines = buf[..n.max(0) as usize]
+        .iter()
+        .filter(|&&c| c == b'\n')
+        .count();
+    if lines != 1 {
+        return 4;
+    }
+    0
 }

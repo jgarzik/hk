@@ -113,6 +113,7 @@ impl CgroupControlFileType {
 }
 
 /// Cgroupfs inode private data
+#[derive(Clone)]
 pub enum CgroupfsInodeData {
     /// Cgroup directory
     Directory { cgroup: Weak<Cgroup> },
@@ -361,10 +362,20 @@ fn generate_control_file_content(
 ) -> Result<Vec<u8>, KernelError> {
     match file_type {
         CgroupControlFileType::Procs => {
-            // List all task PIDs in this cgroup
-            let tasks = cgroup.tasks();
+            // Each member process once, by its tgid (Linux cgroup.procs;
+            // cgroup.threads would list the threads)
+            let mut tgids: Vec<Pid> = {
+                let table = crate::task::percpu::TASKLIST.read();
+                cgroup
+                    .tasks()
+                    .into_iter()
+                    .filter_map(|tid| table.get(tid as crate::task::Tid).map(|t| t.task.pid))
+                    .collect()
+            };
+            tgids.sort_unstable();
+            tgids.dedup();
             let mut content = String::new();
-            for pid in tasks {
+            for pid in tgids {
                 content.push_str(&format!("{}\n", pid));
             }
             Ok(content.into_bytes())
@@ -434,7 +445,13 @@ fn handle_control_file_write(
             // Migrate a task to this cgroup
             let s = core::str::from_utf8(data).map_err(|_| KernelError::InvalidArgument)?;
             let pid: Pid = s.trim().parse().map_err(|_| KernelError::InvalidArgument)?;
-            cgroup_attach_task(cgroup, pid)
+            // The whole thread group moves, against forks (Linux
+            // cgroup_procs_write: cgroup_attach_lock, threadgroup)
+            let _tg = crate::cgroup::CGROUP_THREADGROUP_RWSEM.write();
+            for tid in crate::cgroup::thread_group(pid)? {
+                cgroup_attach_task(cgroup, tid as Pid)?;
+            }
+            Ok(())
         }
         CgroupControlFileType::SubtreeControl => {
             // Enable/disable controllers for children
@@ -564,13 +581,15 @@ impl FileOps for CgroupfsFileOps {
         // inode's spin lock; a removed cgroup's files are ENODEV (Linux
         // kernfs_fop_write: no active reference to a removed node)
         let _g = crate::cgroup::CGROUP_MUTEX.lock();
-        let data = wrapper.0.read();
+        // A copy, so no spin lock is held while the write sleeps
+        // (cgroup.procs takes the threadgroup rwsem)
+        let data = wrapper.0.read().clone();
         let live = |c: &alloc::sync::Weak<Cgroup>| {
             c.upgrade()
                 .filter(|c| !c.is_dead())
                 .ok_or(KernelError::NoDevice)
         };
-        match &*data {
+        match &data {
             CgroupfsInodeData::ControlFile { cgroup, file_type } => {
                 let cg = live(cgroup)?;
                 handle_control_file_write(&cg, *file_type, buf)?;
