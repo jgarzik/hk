@@ -44,6 +44,10 @@ pub const VMALLOC_START: u64 = 0xFFFF_8001_0000_0000;
 /// Kernel stacks (`mm::vmstack`): the gigabyte above the ioremap window
 pub const VMSTACK_START: u64 = VMALLOC_START + (1 << 30);
 
+/// vmalloc allocations (`mm::vmalloc`): 16 GiB, in the kernel image's L0 entry (TTBR1 is global)
+pub const VMALLOC_AREA: u64 = 0xFFFF_8004_0000_0000;
+pub const VMALLOC_AREA_SIZE: u64 = 16 << 30;
+
 /// Device window: physical 0-1GB (QEMU virt's GIC, UART, RTC, PCI MMIO)
 /// mapped as Device memory at IO_BASE + physical (an early fixmap)
 pub const IO_BASE: u64 = 0xFFFF_8002_0000_0000;

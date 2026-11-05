@@ -348,7 +348,9 @@ Memory allocator locks (Linux: ... → slab → pcp → zone->lock):
     (IrqSpinlock leaf);
     3.2 Heap Allocator, Frame Allocator
 
-Kernel mappings (3.2 Kernel Page Tables): vmstack FLUSH (sleeping,
+Kernel mappings (3.2 Kernel Page Tables): vmalloc FLUSH (sleeping;
+    held across the allocation area's TLB flush) → vmalloc AREA (spin
+    leaf; no mapping or flush under it); vmstack FLUSH (sleeping,
     thread context; held across the stack area's TLB flush) → IOREMAP,
     vmstack SLOTS (spin leaves; no mapping or flush under them); KTABLES
     (spin, thread context) → frame allocator
@@ -1541,6 +1543,20 @@ layout in `doc/MEMORY.md`
   `sync::Mutex`), so one cleaning a slot set from its snapshot cannot
   clean a slot freed again after another's flush. `SLOTS` is never
   taken in an interrupt handler.
+- Large heap blocks (`mm::vmalloc`, Linux vmalloc/kvmalloc): page
+  ranges of the 16 GiB vmalloc allocation area, each followed by an
+  unmapped guard page, handed out under `vmalloc::AREA` (`spin::Mutex`
+  leaf, thread context; bitmap updates only, no mapping, flush or
+  allocation under it). `alloc` needs a context that may sleep
+  (`in_atomic` false, else it fails); it maps single frames outside
+  `AREA`. `free` unmaps and frees the pages with a local flush and marks
+  them dirty under `AREA` (interrupts may be off); from an interrupt
+  handler it instead pushes the block on a lock-free list in its own
+  first bytes, freed by the next `alloc`. Dirty ranges are reused only
+  after a flush of the whole area on every CPU, done by `alloc` once
+  32 MiB wait or nothing clean fits, with `AREA` not held and purges
+  serialized by `vmalloc::FLUSH` (sleeping): frees during a flush go to
+  the second dirty bitmap and wait for the next purge.
 - User half: per address space, changed by its tasks under the mm lock
   (the fault path, see Address Spaces);
   never contains a kernel mapping.

@@ -9,6 +9,7 @@
 //! ffff800100000000 - ffff80013fffffff  vmalloc/ioremap window
 //! ffff800140000000 - ffff80015fffffff  kernel stacks (mm::vmstack)
 //! ffff800200000000 - ffff80023fffffff  device window (physical 0-1GB)
+//! ffff800400000000 - ffff8007ffffffff  vmalloc allocations (mm::vmalloc)
 //! ```
 //!
 //! boot.S enables the MMU on coarse boot tables (1GB blocks: an identity

@@ -7,6 +7,7 @@
 //! ffff888000000000 - ...               direct map of RAM (PAGE_OFFSET)
 //! ffffc90000000000 - ffffc9003fffffff  vmalloc/ioremap window
 //! ffffc90040000000 - ffffc9005fffffff  kernel stacks (mm::vmstack)
+//! ffffc90100000000 - ffffc904ffffffff  vmalloc allocations (mm::vmalloc)
 //! ffffffff80000000 - ...               kernel image (__START_KERNEL_map)
 //! ```
 //!

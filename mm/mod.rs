@@ -49,6 +49,7 @@ pub mod swap_state;
 pub mod syscall;
 pub mod tlb;
 pub mod vma;
+pub mod vmalloc;
 pub mod vmscan;
 pub mod vmstack;
 pub mod writeback;
