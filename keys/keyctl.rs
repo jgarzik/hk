@@ -416,30 +416,28 @@ pub fn keyctl_search(keyring_serial: i32, type_ptr: u64, desc_ptr: u64, dest_key
     }
 
     // Search the keyring recursively
-    if let Some(key) = keyring.keyring_search_recursive(&type_name, &description) {
-        // Check if key is valid
-        if key.is_revoked() {
-            return KernelError::KeyRevoked.sysret();
-        }
-
-        // Linking the found key needs LINK on it and WRITE on the
-        // destination (Linux keyctl_keyring_search)
-        if dest_keyring != 0 {
-            if !check_key_permission(&key, KEY_NEED_LINK) {
-                return KernelError::PermissionDenied.sysret();
-            }
-            if let Ok(dest) = resolve_special_keyring(dest_keyring, false, tid, uid, gid) {
-                if !check_key_permission(&dest, KEY_NEED_WRITE) {
-                    return KernelError::PermissionDenied.sysret();
-                }
-                let _ = keyring_link(&dest, &key);
-            }
-        }
-
-        return key.serial as i64;
+    let key = match keyring.keyring_search_recursive(&type_name, &description) {
+        Ok(k) => k,
+        Err(e) => return e.sysret(),
+    };
+    if key.is_revoked() {
+        return KernelError::KeyRevoked.sysret();
     }
 
-    KernelError::NoKey.sysret()
+    // Linking the found key needs LINK on it and WRITE on the
+    // destination (Linux keyctl_keyring_search)
+    if dest_keyring != 0 {
+        if !check_key_permission(&key, KEY_NEED_LINK) {
+            return KernelError::PermissionDenied.sysret();
+        }
+        if let Ok(dest) = resolve_special_keyring(dest_keyring, false, tid, uid, gid) {
+            if !check_key_permission(&dest, KEY_NEED_WRITE) {
+                return KernelError::PermissionDenied.sysret();
+            }
+            let _ = keyring_link(&dest, &key);
+        }
+    }
+    key.serial as i64
 }
 
 /// KEYCTL_READ - Read a key's payload

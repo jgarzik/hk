@@ -184,5 +184,5 @@ pub fn search_process_keyrings(type_name: &str, description: &str, tid: u64) -> 
     [k.thread_keyring, k.process_keyring, k.session_keyring]
         .into_iter()
         .flatten()
-        .find_map(|r| r.keyring_search_recursive(type_name, description))
+        .find_map(|r| r.keyring_search_recursive(type_name, description).ok())
 }

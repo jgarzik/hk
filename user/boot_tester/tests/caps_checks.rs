@@ -67,6 +67,7 @@ pub fn run_tests() {
     report(b"SIGNAL_PERM", signal_perm());
     report(b"KEY_CYCLE_EDEADLK", key_cycle());
     report(b"KEY_DEPTH_ELOOP", key_depth());
+    report(b"KEY_SEARCH_NESTED_PERM", key_search_nested());
     report(b"KEY_LINK_PERM", key_link_perm());
     report(b"KEY_QUOTA", key_quota());
     report(b"KEY_GC", key_gc());
@@ -499,6 +500,61 @@ fn key_depth() -> u64 {
     }
     if keyctl(KEYCTL_LINK, k[0] as u64, k[8] as u64, 0) != ELOOP {
         return 4;
+    }
+    0
+}
+
+/// KEYCTL_SEARCH checks SEARCH on every nested keyring and on the key
+/// it finds (Linux search_nested_keyrings): a denied nested keyring is
+/// skipped (ENOKEY), a denied match is EACCES
+fn key_search_nested() -> u64 {
+    const KEYCTL_SEARCH: i32 = 10;
+    const ENOKEY: i64 = -126;
+    const EACCES: i64 = -13;
+    const ALL: u64 = 0x3f3f_0000;
+    const NO_SEARCH: u64 = 0x3737_0000;
+    let outer = add_keyring(b"ns_outer\0");
+    let inner = hk_syscall::sys_add_key(
+        b"keyring\0".as_ptr(),
+        b"ns_inner\0".as_ptr(),
+        core::ptr::null(),
+        0,
+        outer as i32,
+    );
+    let key = hk_syscall::sys_add_key(
+        b"user\0".as_ptr(),
+        b"ns_key\0".as_ptr(),
+        b"x".as_ptr(),
+        1,
+        inner as i32,
+    );
+    if outer <= 0 || inner <= 0 || key <= 0 {
+        return 1;
+    }
+    let search = || {
+        keyctl(
+            KEYCTL_SEARCH,
+            outer as u64,
+            b"user\0".as_ptr() as u64,
+            b"ns_key\0".as_ptr() as u64,
+        )
+    };
+    if search() != key {
+        return 2;
+    }
+    if keyctl(KEYCTL_SETPERM, inner as u64, NO_SEARCH, 0) != 0 {
+        return 3;
+    }
+    if search() != ENOKEY {
+        return 4;
+    }
+    if keyctl(KEYCTL_SETPERM, inner as u64, ALL, 0) != 0
+        || keyctl(KEYCTL_SETPERM, key as u64, NO_SEARCH, 0) != 0
+    {
+        return 5;
+    }
+    if search() != EACCES {
+        return 6;
     }
     0
 }

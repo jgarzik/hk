@@ -496,28 +496,55 @@ impl Key {
             && !self.is_revoked()
     }
 
-    /// Recursively search this keyring and all nested keyrings
-    pub fn keyring_search_recursive(&self, type_name: &str, description: &str) -> Option<Arc<Key>> {
-        self.search_depth(type_name, description, KEYRING_SEARCH_MAX_DEPTH)
+    /// Recursively search this keyring and the nested keyrings the
+    /// caller may search (Linux search_nested_keyrings): a nested keyring
+    /// or a match without SEARCH permission is skipped; ENOKEY if nothing
+    /// is found, EACCES if only skipped keys matched
+    pub fn keyring_search_recursive(
+        &self,
+        type_name: &str,
+        description: &str,
+    ) -> Result<Arc<Key>, KernelError> {
+        let mut denied = false;
+        self.search_depth(
+            type_name,
+            description,
+            KEYRING_SEARCH_MAX_DEPTH,
+            &mut denied,
+        )
+        .ok_or(if denied {
+            KernelError::PermissionDenied
+        } else {
+            KernelError::NoKey
+        })
     }
 
-    /// At most `depth` nested keyrings deep (Linux KEYRING_SEARCH_MAX_DEPTH),
-    /// so a keyring cycle cannot drive unbounded recursion
-    fn search_depth(&self, type_name: &str, description: &str, depth: u32) -> Option<Arc<Key>> {
-        if !self.is_keyring() || depth == 0 {
+    /// At most `depth` nested keyrings deep (Linux KEYRING_SEARCH_MAX_DEPTH);
+    /// a keyring's own keys before its nested keyrings
+    fn search_depth(
+        &self,
+        type_name: &str,
+        description: &str,
+        depth: u32,
+        denied: &mut bool,
+    ) -> Option<Arc<Key>> {
+        if !self.is_keyring() {
             return None;
         }
-        for key in self.links() {
-            if key.matches(type_name, description) {
-                return Some(key);
+        let links = self.links();
+        for key in links.iter().filter(|k| k.matches(type_name, description)) {
+            if check_key_permission(key, KEY_NEED_SEARCH) {
+                return Some(key.clone());
             }
-            if key.is_keyring()
-                && let Some(found) = key.search_depth(type_name, description, depth - 1)
-            {
-                return Some(found);
-            }
+            *denied = true;
         }
-        None
+        if depth == 0 {
+            return None;
+        }
+        links
+            .iter()
+            .filter(|k| k.is_keyring() && check_key_permission(k, KEY_NEED_SEARCH))
+            .find_map(|k| k.search_depth(type_name, description, depth - 1, denied))
     }
 }
 
