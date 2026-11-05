@@ -36,9 +36,10 @@
 //!   pids.events 1; refused at the parent, only the parent's counters
 //!   move (Linux 6.11+ pids_event; skipped on older hosts).
 //! - CPU_MAX_RW: cpu.max reads back what was written ("max" keeps the
-//!   period; out of Linux's bounds is EINVAL); while one process rewrites it with two values, a reader
-//!   only ever sees one of them whole, never one's quota with the
-//!   other's period.
+//!   period; out of Linux's bounds is EINVAL); on hk, while one process
+//!   rewrites it with two values, a reader only ever sees one of them
+//!   whole, never one's quota with the other's period (Linux
+//!   cpu_max_show reads the two unlocked and may tear, so not there).
 //!
 //! Runs after cgroup.rs, which mounts cgroup2 at /sys/fs/cgroup and
 //! enables +pids at the root.
@@ -223,7 +224,7 @@ fn cpu_max_rw() -> i64 {
         for _ in 0..400 {
             let n = read_raw(CG, b"cpu.max", &mut d);
             let got = &d[..n.max(0) as usize];
-            if got != A && got != B {
+            if got != A && got != B && !super::helpers::host_mode() {
                 bad = 5;
             }
         }
