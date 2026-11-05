@@ -16,6 +16,7 @@ pub mod busybox;
 pub mod capabilities;
 pub mod caps_checks;
 pub mod cgroup;
+pub mod cgroup_race;
 pub mod clock_ids;
 pub mod cloexec;
 pub mod clone3_syslog;
@@ -310,6 +311,7 @@ pub fn run_all_tests() {
     process_vm::run_tests();
     tty::run_tests();
     cgroup::run_tests();
+    cgroup_race::run_tests();
     mempolicy::run_tests();
     bpf::run_tests();
     flock::run_tests();

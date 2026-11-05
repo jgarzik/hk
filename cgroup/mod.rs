@@ -711,37 +711,6 @@ pub fn cgroup_exit_task(pid: Pid) {
     }
 }
 
-/// Check if a task can fork (pids controller check)
-pub fn cgroup_can_fork(pid: Pid) -> Result<(), KernelError> {
-    if let Some(cg) = get_task_cgroup(pid)
-        && let Some(css) = cg.css(ControllerType::Pids)
-        && let Some(ops) = CGROUP_ROOT.get_controller(ControllerType::Pids)
-    {
-        return ops.can_fork(&css);
-    }
-    Ok(())
-}
-
-/// Called after successful fork to charge pids controller
-pub fn cgroup_fork(parent_pid: Pid, child_pid: Pid) -> Result<(), KernelError> {
-    // Child inherits parent's cgroup
-    if let Some(cg) = get_task_cgroup(parent_pid) {
-        // Call fork on all controllers
-        for controller in cg.enabled_controllers() {
-            if let Some(css) = cg.css(controller)
-                && let Some(ops) = CGROUP_ROOT.get_controller(controller)
-            {
-                ops.fork(&css, child_pid)?;
-            }
-        }
-
-        // Add child to same cgroup
-        cg.add_task(child_pid);
-        set_task_cgroup(child_pid, cg);
-    }
-    Ok(())
-}
-
 /// Create a child cgroup
 pub fn cgroup_mkdir(parent: &Arc<Cgroup>, name: &str) -> Result<Arc<Cgroup>, KernelError> {
     let root = CGROUP_ROOT.clone();
@@ -806,39 +775,56 @@ pub fn cgroup_rmdir(parent: &Arc<Cgroup>, name: &str) -> Result<(), KernelError>
 
 use crate::task::Tid;
 
-/// Check if forking is allowed for a cgroup (pids controller check)
-///
-/// Returns true if fork is allowed, false if pids.max limit would be exceeded.
-pub fn pids_can_fork(cgroup: &Arc<Cgroup>) -> bool {
-    // Check pids controller if enabled
-    if let Some(css) = cgroup.css(ControllerType::Pids)
-        && let Some(ops) = CGROUP_ROOT.get_controller(ControllerType::Pids)
-    {
-        return ops.can_fork(&css).is_ok();
-    }
-    // No pids controller enabled - allow fork
-    true
+/// A child admitted into its cgroup before it exists (Linux
+/// cgroup_can_fork .. cgroup_post_fork / cgroup_cancel_fork): the
+/// controllers' charges are held; dropping it (the fork failed) gives
+/// them back, `post_fork` makes the child a member
+pub struct ForkCg {
+    cg: Arc<Cgroup>,
+    /// The controllers whose `can_fork` admitted it
+    charged: Vec<ControllerType>,
 }
 
-/// Attach a task to a cgroup during clone
-///
-/// Called from do_clone to inherit parent's cgroup membership.
-/// This is a simpler version of cgroup_attach_task for the clone path.
-pub fn attach_task(tid: Tid, cgroup: &Arc<Cgroup>) {
-    let root = CGROUP_ROOT.clone();
-
-    // Call fork on all controllers to update accounting
-    for controller in cgroup.enabled_controllers() {
-        if let Some(css) = cgroup.css(controller)
-            && let Some(ops) = root.get_controller(controller)
+/// Admit a new task into `cg` (Linux cgroup_can_fork on the target
+/// css_set: the parent's cgroup or the CLONE_INTO_CGROUP one): every
+/// enabled controller's `can_fork`, undone if a later one refuses
+pub fn can_fork(cg: &Arc<Cgroup>) -> Result<ForkCg, KernelError> {
+    let mut fc = ForkCg {
+        cg: cg.clone(),
+        charged: Vec::new(),
+    };
+    for controller in cg.enabled_controllers() {
+        if let Some(css) = cg.css(controller)
+            && let Some(ops) = CGROUP_ROOT.get_controller(controller)
         {
-            let _ = ops.fork(&css, tid);
+            ops.can_fork(&css)?;
+            fc.charged.push(controller);
         }
     }
+    Ok(fc)
+}
 
-    // Add task to cgroup
-    cgroup.add_task(tid);
-    set_task_cgroup(tid, cgroup.clone());
+impl ForkCg {
+    /// The child exists: it joins the cgroup, keeping the charges
+    /// (Linux cgroup_post_fork)
+    pub fn post_fork(mut self, tid: Tid) {
+        self.charged.clear();
+        self.cg.add_task(tid);
+        set_task_cgroup(tid, self.cg.clone());
+    }
+}
+
+impl Drop for ForkCg {
+    /// Linux cgroup_cancel_fork
+    fn drop(&mut self) {
+        for &controller in &self.charged {
+            if let Some(css) = self.cg.css(controller)
+                && let Some(ops) = CGROUP_ROOT.get_controller(controller)
+            {
+                ops.cancel_fork(&css);
+            }
+        }
+    }
 }
 
 /// Detach a task from its cgroup on exit

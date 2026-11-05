@@ -1921,18 +1921,6 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         return Err(11); // EAGAIN
     }
 
-    // Check cgroup pids controller limit (if task is in a cgroup with pids.max)
-    // This is checked before allocating resources so we fail early if over limit
-    let parent_cgroup = {
-        let tid = current_tid();
-        crate::cgroup::get_task_cgroup(tid)
-    };
-    if let Some(ref cgroup) = parent_cgroup
-        && !crate::cgroup::pids_can_fork(cgroup)
-    {
-        return Err(11); // EAGAIN - resource temporarily unavailable
-    }
-
     // A TLS base the register cannot take (Linux copy_thread ->
     // set_new_tls -> do_arch_prctl_64)
     if config.flags & CLONE_SETTLS != 0 && !crate::arch::user_tls_ok(config.tls) {
@@ -2033,10 +2021,17 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     // is EBADF)
     let child_fs = crate::fs::fsstruct::fork_fs(current_tid, config.flags & CLONE_FS != 0);
     let child_ns = crate::ns::fork_nsproxy(current_tid, config.flags, child_fs.as_deref())?;
-    let into_cgroup = if config.flags & CLONE_INTO_CGROUP != 0 {
+    let target_cgroup = if config.flags & CLONE_INTO_CGROUP != 0 {
         Some(crate::task::cgroup_from_fd(current_tid, config.cgroup_fd).ok_or(9)?) // EBADF
     } else {
-        None
+        crate::cgroup::get_task_cgroup(current_tid)
+    };
+    // Admitted into the target cgroup now (Linux cgroup_can_fork: the
+    // pids limit is charged here, EAGAIN past it); an error below gives
+    // the charge back when `fork_cg` drops
+    let fork_cg = match &target_cgroup {
+        Some(cg) => Some(crate::cgroup::can_fork(cg).map_err(|e| e.errno())?),
+        None => None,
     };
 
     // The child's pid, numbered in each level of the parent's pid
@@ -2234,12 +2229,10 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     // Its namespaces (CLONE_NEW* flags), built above
     crate::ns::init_task_ns(child_tid, child_ns);
 
-    // Its cgroup: the CLONE_INTO_CGROUP target, else the parent's
-    if let Some(cgroup) = into_cgroup {
-        crate::cgroup::attach_task(child_tid, &cgroup);
-    } else if let Some(ref cgroup) = parent_cgroup {
-        // Inherit cgroup membership from parent
-        crate::cgroup::attach_task(child_tid, cgroup);
+    // Its cgroup: the CLONE_INTO_CGROUP target, else the parent's,
+    // charged above (Linux cgroup_post_fork)
+    if let Some(fc) = fork_cg {
+        fc.post_fork(child_tid);
     }
 
     // Handle signal handlers (CLONE_SIGHAND, CLONE_CLEAR_SIGHAND)

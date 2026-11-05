@@ -53,36 +53,44 @@ impl PidsState {
         }
     }
 
-    /// Check if we can add a task (walk hierarchy)
-    pub fn can_charge(&self) -> bool {
-        let current = self.current.load(Ordering::Relaxed);
-        let max = self.max.load(Ordering::Relaxed);
-
-        if max != PIDS_MAX_UNLIMITED && current >= max {
-            return false;
+    /// Charge a new task up to the root, which is never charged, or
+    /// refuse it (Linux pids_try_charge): each level adds first and
+    /// compares after, so concurrent forks cannot all pass a limit
+    /// they share; a level over its max undoes every level charged
+    pub fn try_charge(&self) -> bool {
+        let mut done: Vec<&PidsState> = Vec::new();
+        let mut p = self;
+        while let Some(parent) = p.parent.as_deref() {
+            let new = p.current.fetch_add(1, Ordering::Relaxed) + 1;
+            done.push(p);
+            let max = p.max.load(Ordering::Relaxed);
+            if max != PIDS_MAX_UNLIMITED && new > max {
+                for d in done {
+                    d.current.fetch_sub(1, Ordering::Relaxed);
+                }
+                return false;
+            }
+            p = parent;
         }
-
-        // Check parent hierarchy
-        if let Some(ref parent) = self.parent {
-            return parent.can_charge();
-        }
-
         true
     }
 
-    /// Charge a new task (increment counter up the hierarchy)
+    /// Charge a task without a limit check, up to the root (Linux
+    /// pids_charge: a migration is always admitted)
     pub fn charge(&self) {
-        self.current.fetch_add(1, Ordering::Relaxed);
-        if let Some(ref parent) = self.parent {
-            parent.charge();
+        let mut p = self;
+        while let Some(parent) = p.parent.as_deref() {
+            p.current.fetch_add(1, Ordering::Relaxed);
+            p = parent;
         }
     }
 
-    /// Uncharge a task (decrement counter up the hierarchy)
+    /// Uncharge a task up to the root (Linux pids_uncharge)
     pub fn uncharge(&self) {
-        self.current.fetch_sub(1, Ordering::Relaxed);
-        if let Some(ref parent) = self.parent {
-            parent.uncharge();
+        let mut p = self;
+        while let Some(parent) = p.parent.as_deref() {
+            p.current.fetch_sub(1, Ordering::Relaxed);
+            p = parent;
         }
     }
 
@@ -158,9 +166,10 @@ impl CgroupSubsysOps for PidsController {
         }
     }
 
+    /// Linux pids_can_fork: try-charge the target, EAGAIN past a limit
     fn can_fork(&self, css: &CgroupSubsysState) -> Result<(), KernelError> {
         if let Some(state) = css.private_as::<PidsState>() {
-            if state.can_charge() {
+            if state.try_charge() {
                 return Ok(());
             }
             state.record_max_event();
@@ -169,11 +178,11 @@ impl CgroupSubsysOps for PidsController {
         Ok(())
     }
 
-    fn fork(&self, css: &CgroupSubsysState, _child_pid: Pid) -> Result<(), KernelError> {
+    /// Linux pids_cancel_fork
+    fn cancel_fork(&self, css: &CgroupSubsysState) {
         if let Some(state) = css.private_as::<PidsState>() {
-            state.charge();
+            state.uncharge();
         }
-        Ok(())
     }
 
     fn exit(&self, css: &CgroupSubsysState, _pid: Pid) {

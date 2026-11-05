@@ -110,17 +110,16 @@ pub trait CgroupSubsysOps: Send + Sync {
     /// Called when a task is detached from a cgroup
     fn detach(&self, _css: &CgroupSubsysState, _pid: Pid) {}
 
-    /// Check if a task can fork
-    ///
-    /// Returns Err(EAGAIN) if resource limit would be exceeded.
+    /// Admit a new task into this cgroup before it exists (Linux
+    /// ->can_fork, on the child's target css): take what it will hold,
+    /// or Err (EAGAIN past a limit)
     fn can_fork(&self, _css: &CgroupSubsysState) -> Result<(), KernelError> {
         Ok(())
     }
 
-    /// Called after successful fork
-    fn fork(&self, _css: &CgroupSubsysState, _child_pid: Pid) -> Result<(), KernelError> {
-        Ok(())
-    }
+    /// The fork failed after `can_fork` admitted it: give back what it
+    /// took (Linux ->cancel_fork)
+    fn cancel_fork(&self, _css: &CgroupSubsysState) {}
 
     /// Called when a task exits
     fn exit(&self, _css: &CgroupSubsysState, _pid: Pid) {}
