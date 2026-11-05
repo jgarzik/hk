@@ -9,11 +9,6 @@ Optional improvements found while verifying the 2026-11-03 atomics audit; none o
   on the detach side as well. x86 `lock xadd` and arm64 `stlxr`+`ldar`
   give the ordering anyway; one fence makes it formal. ipc/shm.rs:223,
   ipc/shm.rs:513.
-- **TCP release sets SHUTDOWN_MASK outside `cb`**: `release` sets it
-  with a `fetch_or` before `step`, so it is harmless. Linux tcp_close
-  writes sk_shutdown under lock_sock, and the LOCKING §5.4 `Sock`
-  shutdown row says every write is under the protocol lock. Moving it
-  into the `step` closure makes the row true. net/tcp/mod.rs:1077.
 - **Boot-once statics** (audit #31): fpu `USE_XSAVE`/`XCR0`/
   `XSTATE_SIZE`/`MXCSR_MASK`, lapic `X2APIC`/`LAPIC_TICKS_PER_MS`,
   `SMAP_ON`, `PAN_ENABLED`, `INFO_PHYS`, `DTB_PHYS`, `DIRECT_END`, arm64

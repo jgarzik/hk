@@ -1072,9 +1072,11 @@ impl ProtoOps for TcpSock {
 
     /// Last close (Linux tcp_close)
     fn release(&self) {
-        self.sk.set_shutdown(SHUTDOWN_MASK);
         let linger0 = self.sk.linger() == Some(0);
         let q = self.step(|g, out| {
+            // Under `cb`, as every write of the shutdown bits (Linux
+            // __tcp_close under lock_sock)
+            self.sk.set_shutdown(SHUTDOWN_MASK);
             g.cb.orphan = true;
             if g.cb.state == TcpState::Listen {
                 self.sk.set_flag(sf::ACCEPTCONN, false);
