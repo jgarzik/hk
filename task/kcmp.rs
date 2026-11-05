@@ -154,9 +154,8 @@ pub fn sys_kcmp(pid1: i32, pid2: i32, kcmp_type: i32, idx1: u64, idx2: u64) -> i
         return KernelError::OperationNotSupported.sysret();
     }
 
-    // Look up both tasks; the signal handlers and undo lists are read
-    // under TASKLIST, the task_lock resources under each task's lock
-    let (t1, t2, sigs, sems) = {
+    // Look up both tasks
+    let (t1, t2) = {
         let table = TASKLIST.read();
         let Some(task1) = table.get(pid1) else {
             return KernelError::NoProcess.sysret();
@@ -164,17 +163,12 @@ pub fn sys_kcmp(pid1: i32, pid2: i32, kcmp_type: i32, idx1: u64, idx2: u64) -> i
         let Some(task2) = table.get(pid2) else {
             return KernelError::NoProcess.sysret();
         };
-        (
-            task_ref(task1.task),
-            task_ref(task2.task),
-            (arc_key(&task1.sighand), arc_key(&task2.sighand)),
-            (arc_key(&task1.sysvsem), arc_key(&task2.sysvsem)),
-        )
+        (task_ref(task1.task), task_ref(task2.task))
     };
     // Both thread groups' exec_update_lock for reading across the access
-    // checks and the comparison, so neither execs (a set-id program, a
-    // new mm or file table) between them (Linux kcmp_lock); two in
-    // thread-group order, one for the same group
+    // checks and everything compared, so neither execs (a set-id program,
+    // a new mm, file table or signal handlers) in between (Linux
+    // kcmp_lock); two in thread-group order, one for the same group
     let _exec = {
         use crate::signal::ExecUpdateRead;
         let (first, second) = if t1.pid <= t2.pid {
@@ -185,6 +179,18 @@ pub fn sys_kcmp(pid1: i32, pid2: i32, kcmp_type: i32, idx1: u64, idx2: u64) -> i
         let a = ExecUpdateRead::lock(first.tid());
         let b = (first.pid != second.pid).then(|| ExecUpdateRead::lock(second.tid()));
         (a, b)
+    };
+    // The signal handlers and undo lists, read under TASKLIST with the
+    // locks held
+    let (sigs, sems) = {
+        let table = TASKLIST.read();
+        let (Some(a), Some(b)) = (table.get(t1.tid()), table.get(t2.tid())) else {
+            return KernelError::NoProcess.sysret();
+        };
+        (
+            (arc_key(&a.sighand), arc_key(&b.sighand)),
+            (arc_key(&a.sysvsem), arc_key(&b.sysvsem)),
+        )
     };
     // Linux: ptrace_may_access(PTRACE_MODE_READ_REALCREDS) on both
     if !crate::task::ptrace::may_access_tid(t1.tid(), false)
