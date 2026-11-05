@@ -62,11 +62,11 @@ impl Drop for FilesGuard<'_> {
         // SAFETY: dropped exactly once, here
         unsafe { ManuallyDrop::drop(&mut self.0) };
         // A descriptor closed (close, dup2 over it, close_range): the
-        // caller's POSIX locks on its inode go (Linux filp_flush ->
-        // locks_remove_posix), however many other descriptors it has.
+        // caller's POSIX locks on its inode go and the file's flush runs
+        // (Linux filp_flush), however many other descriptors it has.
         // Files refused an install (`dead`) were never the caller's.
         for f in &closed {
-            crate::fs::posix_lock::release_posix_locks_on_close(f);
+            crate::fs::file::filp_flush(f);
         }
         drop(closed);
         drop(dead);
@@ -95,7 +95,19 @@ pub fn get_task_fd(tid: Tid) -> Option<Arc<Files>> {
 /// (releasing a socket can sleep)
 pub fn exit_task_fd(tid: Tid) {
     let files = with_task_lock(tid, |a| a.set_files(None)).flatten();
-    drop(files);
+    // The last reference closes every descriptor: each is flushed by the
+    // exiting task (Linux close_files -> filp_close)
+    if let Some(files) = files.and_then(Arc::into_inner) {
+        let open: alloc::vec::Vec<_> = {
+            let t = files.lock();
+            t.fds().filter_map(|&fd| t.get(fd)).collect()
+        };
+        for f in &open {
+            crate::fs::file::filp_flush(f);
+        }
+        drop(open);
+        drop(files);
+    }
 }
 
 /// At exec's point of no return: give the task a private table without
@@ -118,9 +130,9 @@ pub fn exec_task_fd(tid: Tid) {
     };
     init_task_fd(tid, new);
     // Linux do_close_on_exec closes them (filp_close): their POSIX locks
-    // go; every other lock stays across the exec
+    // go and they are flushed; every other lock stays across the exec
     for f in &cloexec {
-        crate::fs::posix_lock::release_posix_locks_on_close(f);
+        crate::fs::file::filp_flush(f);
     }
     drop(cloexec);
     drop(old);

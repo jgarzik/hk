@@ -254,6 +254,11 @@ pub trait FileOps: Send + Sync {
         Ok(())
     }
 
+    /// A descriptor of the file is being closed (close, dup2 over it,
+    /// close-on-exec, the closer's exit), in the closer's context (Linux
+    /// f_op->flush): unlike `release`, on every close, not the last
+    fn flush(&self, _file: &File) {}
+
     /// Release file (called when last reference is dropped)
     fn release(&self, _file: &File) -> Result<(), KernelError> {
         Ok(())
@@ -865,3 +870,11 @@ pub static CHAR_FILE_OPS: CharDevFileOps = CharDevFileOps;
 // ============================================================================
 // Generic Page-Cache File Operations
 // ============================================================================
+
+/// A descriptor of `file` was closed by the current task (Linux
+/// filp_flush): its POSIX locks on the inode go, then the file's own
+/// flush
+pub fn filp_flush(file: &File) {
+    crate::fs::posix_lock::release_posix_locks_on_close(file);
+    file.f_op.flush(file);
+}
