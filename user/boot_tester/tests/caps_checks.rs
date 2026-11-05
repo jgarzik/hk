@@ -19,6 +19,11 @@
 //!   ipcctl_obtain_check (CAP_SYS_ADMIN for a non-owner); POSIX queues
 //!   as generic_permission (CAP_DAC_OVERRIDE) with mq_unlink under the
 //!   sticky rule of the mqueue root (EPERM for another's queue).
+//! - KEYS_NO_ROOT_BYPASS: key permissions as Linux key_task_permission,
+//!   with no root bypass: a root-owned key with no permission bits is
+//!   unreadable even by root (EACCES); KEYCTL_SETPERM refuses unknown
+//!   bits (EINVAL); KEYCTL_CHOWN gives the key away (root) and is
+//!   EACCES for an owner without CAP_SYS_ADMIN.
 
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
@@ -42,6 +47,7 @@ pub fn run_tests() {
     let r = hk_syscall::sys_setrlimit(9999, core::ptr::null());
     report(b"SETRLIMIT_EFAULT_FIRST", (r != -14) as u64);
     report(b"IPC_CAPS", ipc_caps());
+    report(b"KEYS_NO_ROOT_BYPASS", in_child(keys_no_root_bypass));
 }
 
 fn report(name: &[u8], step: u64) {
@@ -379,4 +385,77 @@ fn ipc_caps() -> u64 {
     hk_syscall::sys_semctl(grp, 0, IPC_RMID, 0);
     hk_syscall::sys_mq_unlink(MQ_NAME.as_ptr());
     r
+}
+
+const KEYCTL_CHOWN: i32 = 4;
+const KEYCTL_SETPERM: i32 = 5;
+const KEYCTL_DESCRIBE: i32 = 6;
+const KEYCTL_READ: i32 = 11;
+const KEY_SPEC_PROCESS_KEYRING: i32 = -2;
+const KEY_USR_ALL: u64 = 0x003f_0000;
+
+fn add_key(desc: &[u8]) -> i64 {
+    let payload = b"secret";
+    hk_syscall::sys_add_key(
+        b"user\0".as_ptr(),
+        desc.as_ptr(),
+        payload.as_ptr(),
+        payload.len(),
+        KEY_SPEC_PROCESS_KEYRING,
+    )
+}
+
+fn keyctl(cmd: i32, a2: u64, a3: u64, a4: u64) -> i64 {
+    hk_syscall::sys_keyctl(cmd, a2, a3, a4, 0)
+}
+
+/// In a child (its own process keyring)
+fn keys_no_root_bypass() -> u64 {
+    let k = add_key(b"nobypass\0");
+    if k <= 0 {
+        return 1;
+    }
+    let mut buf = [0u8; 64];
+    // Unknown permission bits
+    if keyctl(KEYCTL_SETPERM, k as u64, 0x4000_0000, 0) != -22 {
+        return 2;
+    }
+    // No bits at all: root reads nothing
+    if keyctl(KEYCTL_SETPERM, k as u64, 0, 0) != 0 {
+        return 3;
+    }
+    if keyctl(
+        KEYCTL_READ,
+        k as u64,
+        buf.as_mut_ptr() as u64,
+        buf.len() as u64,
+    ) != EACCES
+    {
+        return 4;
+    }
+    // A key the user may set attributes on, given to uid 1000
+    let k2 = add_key(b"chown\0");
+    if keyctl(KEYCTL_SETPERM, k2 as u64, KEY_USR_ALL | 0x3f, 0) != 0 {
+        return 5;
+    }
+    if keyctl(KEYCTL_CHOWN, k2 as u64, 1000, u32::MAX as u64) != 0 {
+        return 6;
+    }
+    let n = keyctl(
+        KEYCTL_DESCRIBE,
+        k2 as u64,
+        buf.as_mut_ptr() as u64,
+        buf.len() as u64,
+    );
+    if n <= 0 || !buf.starts_with(b"user;1000;") {
+        return 7;
+    }
+    // Its new owner, without CAP_SYS_ADMIN, may not give it away
+    if sys_setresuid(1000, 1000, 1000) != 0 {
+        return 8;
+    }
+    if keyctl(KEYCTL_CHOWN, k2 as u64, 0, u32::MAX as u64) != EACCES {
+        return 9;
+    }
+    0
 }

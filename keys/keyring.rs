@@ -215,6 +215,27 @@ pub fn keyring_unlink(keyring: &Key, key: &Key) -> Result<(), i64> {
     keyring.keyring_remove(key.serial)
 }
 
+/// Whether task `tid` possesses `key` (Linux: lookup_user_key finds it
+/// through search_process_keyrings): it is, or is reachable from, the
+/// thread, process or session keyring, or the user-session keyring when
+/// there is no session keyring
+pub fn possessed(key: &Key, tid: u64) -> bool {
+    const KEYRING_SEARCH_MAX_DEPTH: u32 = 6;
+    let k = get_task_keyrings(tid);
+    let session = k.session_keyring.or_else(|| {
+        let uid = crate::task::percpu::current_cred().uid;
+        USER_KEYRINGS
+            .read()
+            .get(&uid)
+            .and_then(|u| u.user_session_keyring)
+    });
+    [k.thread_keyring, k.process_keyring, session]
+        .into_iter()
+        .flatten()
+        .filter_map(lookup_key)
+        .any(|r| r.keyring_reaches(key.serial, KEYRING_SEARCH_MAX_DEPTH))
+}
+
 /// Search all process keyrings for a key
 pub fn search_process_keyrings(type_name: &str, description: &str, tid: u64) -> Option<Arc<Key>> {
     let keyrings = get_task_keyrings(tid);

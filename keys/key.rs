@@ -148,11 +148,11 @@ pub struct Key {
     /// Key payload (type-specific data) - None for keyrings
     payload: RwLock<Option<Vec<u8>>>,
 
-    /// Owner UID
-    pub uid: u32,
-
-    /// Owner GID
-    pub gid: u32,
+    /// Owner UID and GID (Linux key->uid/gid: changed under key->sem,
+    /// here the payload lock, by KEYCTL_CHOWN; read lock-free by the
+    /// permission checks and describe)
+    uid: AtomicU32,
+    gid: AtomicU32,
 
     /// Permission mask
     perm: AtomicU32,
@@ -182,8 +182,8 @@ impl Key {
             type_name: String::from(key_type.name()),
             description,
             payload: RwLock::new(None),
-            uid,
-            gid,
+            uid: AtomicU32::new(uid),
+            gid: AtomicU32::new(gid),
             perm: AtomicU32::new(perm),
             state: AtomicU32::new(KeyState::Uninstantiated as u32),
             keyring_keys: RwLock::new(Vec::new()),
@@ -243,6 +243,45 @@ impl Key {
     /// Check if this key is a keyring
     pub fn is_keyring(&self) -> bool {
         self.type_name == "keyring"
+    }
+
+    /// Owner UID
+    pub fn uid(&self) -> u32 {
+        self.uid.load(Ordering::Relaxed)
+    }
+
+    /// Owner GID
+    pub fn gid(&self) -> u32 {
+        self.gid.load(Ordering::Relaxed)
+    }
+
+    /// Change the owner and/or group (Linux keyctl_chown_key's stores,
+    /// under key->sem: the payload lock)
+    pub fn set_owner(&self, uid: Option<u32>, gid: Option<u32>) {
+        let _sem = self.payload.write();
+        if let Some(u) = uid {
+            self.uid.store(u, Ordering::Relaxed);
+        }
+        if let Some(g) = gid {
+            self.gid.store(g, Ordering::Relaxed);
+        }
+    }
+
+    /// Whether `serial` is this keyring or reachable from it through
+    /// nested keyrings, at most `depth` levels (Linux
+    /// KEYRING_SEARCH_MAX_DEPTH)
+    pub fn keyring_reaches(&self, serial: KeySerial, depth: u32) -> bool {
+        if self.serial == serial {
+            return true;
+        }
+        if !self.is_keyring() || depth == 0 {
+            return false;
+        }
+        let keys = self.keyring_keys.read().clone();
+        keys.into_iter().any(|s| {
+            s == serial
+                || super::lookup_key(s).is_some_and(|k| k.keyring_reaches(serial, depth - 1))
+        })
     }
 
     /// Get the permission mask
@@ -371,33 +410,27 @@ impl Key {
     }
 }
 
-/// Check if the current task has the required permission on a key
-pub fn check_key_permission(key: &Key, needed: u32, uid: u32, gid: u32, is_root: bool) -> bool {
-    // Root can do anything
-    if is_root {
-        return true;
-    }
-
+/// Whether the current task may do `needed` (KEY_NEED_* bits) to `key`
+/// (Linux key_task_permission): one class of bits by the fsuid, the
+/// fsgid or a supplementary group (only if the key grants any group
+/// bits), else other's; a key the caller possesses (reachable from its
+/// thread, process or session keyring) adds the possessor bits. No root
+/// bypass: privileged operations check their own capability.
+pub fn check_key_permission(key: &Key, needed: u32) -> bool {
+    let c = crate::task::percpu::current_cred();
     let perm = key.perm();
-
-    // Check owner permissions
-    if key.uid == uid {
-        let shift = 16; // KEY_USR_* is in bits 16-21
-        if (perm >> shift) & needed == needed {
-            return true;
-        }
+    let gid = key.gid();
+    let mut k = if key.uid() == c.fsuid {
+        perm >> 16
+    } else if gid != u32::MAX && perm & KEY_GRP_ALL != 0 && crate::fs::dac::in_group(&c, gid) {
+        perm >> 8
+    } else {
+        perm
+    };
+    if super::keyring::possessed(key, crate::task::percpu::current_tid()) {
+        k |= perm >> 24;
     }
-
-    // Check group permissions
-    if key.gid == gid {
-        let shift = 8; // KEY_GRP_* is in bits 8-13
-        if (perm >> shift) & needed == needed {
-            return true;
-        }
-    }
-
-    // Check other permissions
-    (perm & needed) == needed
+    k & needed & 0xff == needed
 }
 
 /// Default permissions for new keys

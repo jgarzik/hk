@@ -83,8 +83,8 @@ impl KeyType for UserKeyType {
     fn describe(&self, key: &Key) -> String {
         format!(
             "user;{};{};{:08x};{}",
-            key.uid,
-            key.gid,
+            key.uid(),
+            key.gid(),
             key.perm(),
             key.description
         )
@@ -144,8 +144,8 @@ impl KeyType for KeyringKeyType {
     fn describe(&self, key: &Key) -> String {
         format!(
             "keyring;{};{};{:08x};{}",
-            key.uid,
-            key.gid,
+            key.uid(),
+            key.gid(),
             key.perm(),
             key.description
         )

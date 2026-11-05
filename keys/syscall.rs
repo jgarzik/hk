@@ -93,12 +93,14 @@ pub fn sys_add_key(type_ptr: u64, desc_ptr: u64, payload_ptr: u64, plen: u64, ke
 
     // Allocate new key
     let serial = alloc_serial();
+    // Owned by the fsuid and fsgid (Linux key_create_or_update ->
+    // key_alloc)
     let key = Key::new(
         serial,
         key_type.clone(),
         description,
-        uid,
-        gid,
+        cred.fsuid,
+        cred.fsgid,
         KEY_DEFAULT_PERM,
     );
 

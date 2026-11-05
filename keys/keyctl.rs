@@ -19,14 +19,12 @@ use super::{lookup_key, remove_key};
 const MAX_TYPE_LEN: usize = 256;
 const MAX_DESC_LEN: usize = 4096;
 
-/// Helper to get current credentials
-fn current_cred() -> (u64, u32, u32, bool) {
+/// The caller's tid and real uid and gid (the user keyrings belong to
+/// the real uid, Linux cred->user)
+fn current_cred() -> (u64, u32, u32) {
     let cred = percpu::current_cred();
     let tid = percpu::current_tid() as u64;
-    let uid = cred.uid;
-    let gid = cred.gid;
-    let is_root = cred.euid == 0;
-    (tid, uid, gid, is_root)
+    (tid, cred.uid, cred.gid)
 }
 
 /// KEYCTL_GET_KEYRING_ID - Get the ID of a special keyring
@@ -39,7 +37,7 @@ fn current_cred() -> (u64, u32, u32, bool) {
 /// * Keyring serial number on success
 /// * Negative errno on failure
 pub fn keyctl_get_keyring_id(special_id: i32, create: bool) -> i64 {
-    let (tid, uid, gid, _) = current_cred();
+    let (tid, uid, gid) = current_cred();
 
     match resolve_special_keyring(special_id, create, tid, uid, gid) {
         Ok(keyring) => keyring.serial as i64,
@@ -58,7 +56,7 @@ pub fn keyctl_get_keyring_id(special_id: i32, create: bool) -> i64 {
 /// * 0 on success
 /// * Negative errno on failure
 pub fn keyctl_update(key_serial: i32, payload_ptr: u64, plen: usize) -> i64 {
-    let (tid, uid, gid, is_root) = current_cred();
+    let (tid, uid, gid) = current_cred();
 
     // Look up the key
     let key = match resolve_special_keyring(key_serial, false, tid, uid, gid) {
@@ -70,7 +68,7 @@ pub fn keyctl_update(key_serial: i32, payload_ptr: u64, plen: usize) -> i64 {
     };
 
     // Check permission
-    if !check_key_permission(&key, KEY_NEED_WRITE, uid, gid, is_root) {
+    if !check_key_permission(&key, KEY_NEED_WRITE) {
         return KernelError::PermissionDenied.sysret();
     }
 
@@ -109,15 +107,13 @@ pub fn keyctl_update(key_serial: i32, payload_ptr: u64, plen: usize) -> i64 {
 /// * 0 on success
 /// * Negative errno on failure
 pub fn keyctl_revoke(key_serial: i32) -> i64 {
-    let (_tid, uid, gid, is_root) = current_cred();
-
     let key = match lookup_key(key_serial) {
         Some(k) => k,
         None => return KernelError::NoKey.sysret(),
     };
 
     // Check permission (need SETATTR to revoke)
-    if !check_key_permission(&key, KEY_NEED_SETATTR, uid, gid, is_root) {
+    if !check_key_permission(&key, KEY_NEED_SETATTR) {
         return KernelError::PermissionDenied.sysret();
     }
 
@@ -135,22 +131,29 @@ pub fn keyctl_revoke(key_serial: i32) -> i64 {
 /// # Returns
 /// * 0 on success
 /// * Negative errno on failure
-pub fn keyctl_chown(key_serial: i32, _new_uid: i32, _new_gid: i32) -> i64 {
-    let (_tid, _uid, _gid, is_root) = current_cred();
-
-    let _key = match lookup_key(key_serial) {
+pub fn keyctl_chown(key_serial: i32, new_uid: i32, new_gid: i32) -> i64 {
+    // Linux keyctl_chown_key: -1 leaves an id alone
+    let uid = (new_uid != -1).then_some(new_uid as u32);
+    let gid = (new_gid != -1).then_some(new_gid as u32);
+    if uid.is_none() && gid.is_none() {
+        return 0;
+    }
+    let key = match lookup_key(key_serial) {
         Some(k) => k,
         None => return KernelError::NoKey.sysret(),
     };
-
-    // Only root can change ownership
-    if !is_root {
-        return KernelError::NotPermitted.sysret();
+    if !check_key_permission(&key, KEY_NEED_SETATTR) {
+        return KernelError::PermissionDenied.sysret();
     }
-
-    // Note: In a full implementation, we would modify the key's uid/gid here.
-    // Since Key fields are not mutable after creation in our simple impl,
-    // we just succeed if root. A real implementation would use interior mutability.
+    // Another owner, or a group the caller is not in, takes
+    // CAP_SYS_ADMIN (EACCES)
+    let cred = percpu::current_cred();
+    let privileged = uid.is_some_and(|u| u != key.uid())
+        || gid.is_some_and(|g| g != key.gid() && !crate::fs::dac::in_group(&cred, g));
+    if privileged && !crate::task::capable(crate::task::CAP_SYS_ADMIN) {
+        return KernelError::PermissionDenied.sysret();
+    }
+    key.set_owner(uid, gid);
     0
 }
 
@@ -164,18 +167,24 @@ pub fn keyctl_chown(key_serial: i32, _new_uid: i32, _new_gid: i32) -> i64 {
 /// * 0 on success
 /// * Negative errno on failure
 pub fn keyctl_setperm(key_serial: i32, perm: u32) -> i64 {
-    let (_tid, uid, gid, is_root) = current_cred();
-
+    // Linux keyctl_setperm_key: only the four permission bytes
+    use super::key::{KEY_GRP_ALL, KEY_OTH_ALL, KEY_POS_ALL, KEY_USR_ALL};
+    if perm & !(KEY_POS_ALL | KEY_USR_ALL | KEY_GRP_ALL | KEY_OTH_ALL) != 0 {
+        return KernelError::InvalidArgument.sysret();
+    }
     let key = match lookup_key(key_serial) {
         Some(k) => k,
         None => return KernelError::NoKey.sysret(),
     };
-
-    // Check permission
-    if !check_key_permission(&key, KEY_NEED_SETATTR, uid, gid, is_root) {
+    if !check_key_permission(&key, KEY_NEED_SETATTR) {
         return KernelError::PermissionDenied.sysret();
     }
-
+    // The owner (fsuid) or CAP_SYS_ADMIN, else EACCES
+    if key.uid() != percpu::current_cred().fsuid
+        && !crate::task::capable(crate::task::CAP_SYS_ADMIN)
+    {
+        return KernelError::PermissionDenied.sysret();
+    }
     key.set_perm(perm);
     0
 }
@@ -191,7 +200,7 @@ pub fn keyctl_setperm(key_serial: i32, perm: u32) -> i64 {
 /// * Description length (including NUL) on success
 /// * Negative errno on failure
 pub fn keyctl_describe(key_serial: i32, buffer_ptr: u64, buflen: usize) -> i64 {
-    let (tid, uid, gid, is_root) = current_cred();
+    let (tid, uid, gid) = current_cred();
 
     let key = match resolve_special_keyring(key_serial, false, tid, uid, gid) {
         Ok(k) => k,
@@ -202,7 +211,7 @@ pub fn keyctl_describe(key_serial: i32, buffer_ptr: u64, buflen: usize) -> i64 {
     };
 
     // Check permission
-    if !check_key_permission(&key, KEY_NEED_VIEW, uid, gid, is_root) {
+    if !check_key_permission(&key, KEY_NEED_VIEW) {
         return KernelError::PermissionDenied.sysret();
     }
 
@@ -239,7 +248,7 @@ pub fn keyctl_describe(key_serial: i32, buffer_ptr: u64, buflen: usize) -> i64 {
 /// * 0 on success
 /// * Negative errno on failure
 pub fn keyctl_clear(keyring_serial: i32) -> i64 {
-    let (tid, uid, gid, is_root) = current_cred();
+    let (tid, uid, gid) = current_cred();
 
     let keyring = match resolve_special_keyring(keyring_serial, false, tid, uid, gid) {
         Ok(k) => k,
@@ -254,7 +263,7 @@ pub fn keyctl_clear(keyring_serial: i32) -> i64 {
     }
 
     // Check permission
-    if !check_key_permission(&keyring, KEY_NEED_WRITE, uid, gid, is_root) {
+    if !check_key_permission(&keyring, KEY_NEED_WRITE) {
         return KernelError::PermissionDenied.sysret();
     }
 
@@ -274,7 +283,7 @@ pub fn keyctl_clear(keyring_serial: i32) -> i64 {
 /// * 0 on success
 /// * Negative errno on failure
 pub fn keyctl_link(key_serial: i32, keyring_serial: i32) -> i64 {
-    let (tid, uid, gid, is_root) = current_cred();
+    let (tid, uid, gid) = current_cred();
 
     // Look up the key
     let key = match lookup_key(key_serial) {
@@ -296,7 +305,7 @@ pub fn keyctl_link(key_serial: i32, keyring_serial: i32) -> i64 {
     }
 
     // Check WRITE permission on keyring
-    if !check_key_permission(&keyring, KEY_NEED_WRITE, uid, gid, is_root) {
+    if !check_key_permission(&keyring, KEY_NEED_WRITE) {
         return KernelError::PermissionDenied.sysret();
     }
 
@@ -316,7 +325,7 @@ pub fn keyctl_link(key_serial: i32, keyring_serial: i32) -> i64 {
 /// * 0 on success
 /// * Negative errno on failure
 pub fn keyctl_unlink(key_serial: i32, keyring_serial: i32) -> i64 {
-    let (tid, uid, gid, is_root) = current_cred();
+    let (tid, uid, gid) = current_cred();
 
     // Look up the key
     let key = match lookup_key(key_serial) {
@@ -338,7 +347,7 @@ pub fn keyctl_unlink(key_serial: i32, keyring_serial: i32) -> i64 {
     }
 
     // Check WRITE permission on keyring
-    if !check_key_permission(&keyring, KEY_NEED_WRITE, uid, gid, is_root) {
+    if !check_key_permission(&keyring, KEY_NEED_WRITE) {
         return KernelError::PermissionDenied.sysret();
     }
 
@@ -360,7 +369,7 @@ pub fn keyctl_unlink(key_serial: i32, keyring_serial: i32) -> i64 {
 /// * Key serial on success
 /// * Negative errno on failure
 pub fn keyctl_search(keyring_serial: i32, type_ptr: u64, desc_ptr: u64, dest_keyring: i32) -> i64 {
-    let (tid, uid, gid, _is_root) = current_cred();
+    let (tid, uid, gid) = current_cred();
 
     // Copy type and description from userspace
     let type_name = match strncpy_from_user_str::<Uaccess>(type_ptr, MAX_TYPE_LEN) {
@@ -419,7 +428,7 @@ pub fn keyctl_search(keyring_serial: i32, type_ptr: u64, desc_ptr: u64, dest_key
 /// * Payload length on success (may be larger than buflen if truncated)
 /// * Negative errno on failure
 pub fn keyctl_read(key_serial: i32, buffer_ptr: u64, buflen: usize) -> i64 {
-    let (tid, uid, gid, is_root) = current_cred();
+    let (tid, uid, gid) = current_cred();
 
     let key = match resolve_special_keyring(key_serial, false, tid, uid, gid) {
         Ok(k) => k,
@@ -430,7 +439,7 @@ pub fn keyctl_read(key_serial: i32, buffer_ptr: u64, buflen: usize) -> i64 {
     };
 
     // Check permission
-    if !check_key_permission(&key, KEY_NEED_READ, uid, gid, is_root) {
+    if !check_key_permission(&key, KEY_NEED_READ) {
         return KernelError::PermissionDenied.sysret();
     }
 
@@ -480,8 +489,6 @@ pub fn keyctl_read(key_serial: i32, buffer_ptr: u64, buflen: usize) -> i64 {
 /// * 0 on success
 /// * Negative errno on failure
 pub fn keyctl_invalidate(key_serial: i32) -> i64 {
-    let (_tid, uid, gid, is_root) = current_cred();
-
     let key = match lookup_key(key_serial) {
         Some(k) => k,
         None => return KernelError::NoKey.sysret(),
@@ -489,7 +496,7 @@ pub fn keyctl_invalidate(key_serial: i32) -> i64 {
 
     // Check permission (need SEARCH to invalidate)
     // Note: Linux uses different permission checks; we simplify here
-    if !check_key_permission(&key, KEY_NEED_SETATTR, uid, gid, is_root) {
+    if !check_key_permission(&key, KEY_NEED_SETATTR) {
         return KernelError::PermissionDenied.sysret();
     }
 
