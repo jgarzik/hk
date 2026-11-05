@@ -489,7 +489,6 @@ pub struct CgroupRoot {
 
     /// Next inode number for cgroupfs
     next_ino: AtomicU64,
-
 }
 
 impl Default for CgroupRoot {
@@ -550,7 +549,6 @@ impl CgroupRoot {
     pub fn registered_controllers(&self) -> Vec<ControllerType> {
         self.controllers.read().keys().cloned().collect()
     }
-
 }
 
 /// Global unified cgroup hierarchy root

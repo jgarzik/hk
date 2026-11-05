@@ -277,7 +277,6 @@ fn drop_bdevs(disk: &Arc<Disk>, from: u16) {
     }
 }
 
-
 /// BLKRRPART: re-read the partition table (Linux disk_scan_partitions):
 /// EINVAL on a partition or a disk without partitions, EBUSY while a
 /// partition is in use
