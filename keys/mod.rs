@@ -206,6 +206,24 @@ pub fn key_user_charge(uid: u32, bytes: usize) -> Result<(), i64> {
     Ok(())
 }
 
+/// Change a key's byte charge from `old` to `new` (Linux
+/// key_payload_reserve): EDQUOT if growing passes `uid`'s maxbytes
+pub fn key_user_resize(uid: u32, old: usize, new: usize) -> Result<(), i64> {
+    let maxb = if uid == 0 {
+        KEY_ROOT_MAXBYTES
+    } else {
+        KEY_MAXBYTES
+    };
+    let mut users = KEY_USERS.write();
+    let u = users.entry(uid).or_default();
+    let n = u.nbytes.saturating_sub(old).saturating_add(new);
+    if new > old && n > maxb {
+        return Err(crate::util::error::KernelError::QuotaExceeded.sysret());
+    }
+    u.nbytes = n;
+    Ok(())
+}
+
 /// Return a key's charge when it is freed (Key's drop)
 pub fn key_user_uncharge(uid: u32, bytes: usize) {
     let mut users = KEY_USERS.write();

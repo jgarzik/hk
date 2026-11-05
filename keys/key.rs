@@ -242,6 +242,15 @@ impl Key {
             KeyState::Revoked | KeyState::Dead => return Err(KernelError::KeyRevoked),
             _ => {}
         }
+        // The charge follows the payload's size (Linux user_update ->
+        // key_payload_reserve: EDQUOT)
+        let old = self.quota_bytes.load(Ordering::Relaxed);
+        if old > 0 {
+            let new = self.description.len() + 1 + data.len();
+            super::key_user_resize(self.quota_uid.load(Ordering::Relaxed), old, new)
+                .map_err(|_| KernelError::QuotaExceeded)?;
+            self.quota_bytes.store(new, Ordering::Relaxed);
+        }
         *payload = Some(data);
         self.state
             .store(KeyState::Instantiated as u32, Ordering::Release);

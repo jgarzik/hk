@@ -71,6 +71,7 @@ pub fn run_tests() {
     report(b"KEY_LINK_PERM", key_link_perm());
     report(b"KEY_QUOTA", key_quota());
     report(b"KEY_GC", key_gc());
+    report(b"KEY_UPDATE_QUOTA", key_update_quota());
     report(b"BPF_UNPRIV_EPERM", in_child(bpf_unpriv));
     report(b"BPF_UNPRIV_SYSCTL", bpf_sysctl());
 }
@@ -607,6 +608,67 @@ fn key_quota() -> u64 {
             made += 1;
         }
         // Never hit the quota
+        sys_exit(5);
+    }
+    let mut st = 0i32;
+    sys_wait4(pid, &mut st, 0, 0);
+    if st & 0x7f != 0 {
+        return 80;
+    }
+    ((st >> 8) & 0xff) as u64
+}
+
+/// KEYCTL_UPDATE charges the payload's new size (Linux
+/// key_payload_reserve): growing six 1-byte keys to 4000 bytes passes the
+/// 20000-byte user quota (EDQUOT)
+fn key_update_quota() -> u64 {
+    const KEYCTL_UPDATE: i32 = 2;
+    let pid = sys_fork();
+    if pid == 0 {
+        if sys_setresuid(1000, 1000, 1000) != 0 {
+            sys_exit(2);
+        }
+        let big = [b'y'; 4000];
+        let mut keys = [0i64; 6];
+        // Earlier tests' uid-1000 keys may still await Linux's
+        // asynchronous key GC: wait out EDQUOT for up to 2 s
+        let ts = hk_syscall::Timespec {
+            tv_sec: 0,
+            tv_nsec: 10_000_000,
+        };
+        for (i, k) in keys.iter_mut().enumerate() {
+            let desc = [b'k', b'u', b'q', b'0' + i as u8, 0];
+            for _ in 0..200 {
+                *k = hk_syscall::sys_add_key(
+                    b"user\0".as_ptr(),
+                    desc.as_ptr(),
+                    b"x".as_ptr(),
+                    1,
+                    KEY_SPEC_PROCESS_KEYRING,
+                );
+                if *k != EDQUOT {
+                    break;
+                }
+                hk_syscall::sys_nanosleep(&ts, core::ptr::null_mut());
+            }
+            if *k <= 0 {
+                sys_exit(3);
+            }
+        }
+        for k in keys {
+            let r = keyctl(
+                KEYCTL_UPDATE,
+                k as u64,
+                big.as_ptr() as u64,
+                big.len() as u64,
+            );
+            if r == EDQUOT {
+                sys_exit(0);
+            }
+            if r != 0 {
+                sys_exit(4);
+            }
+        }
         sys_exit(5);
     }
     let mut st = 0i32;
