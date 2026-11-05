@@ -12,6 +12,9 @@
 //! - Test mq_getsetattr
 //! - Test mq_close fd
 //! - Test mq_emsgsize
+//! - MQ_NOTIFY_OWNER_EXIT: a child's registration on an inherited
+//!   descriptor ends when it exits (Linux mqueue_flush_file on its
+//!   close), so the parent may register (no EBUSY)
 
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
@@ -24,7 +27,6 @@ const ENOENT: i64 = -2;
 const EBADF: i64 = -9;
 const EAGAIN: i64 = -11;
 const EEXIST: i64 = -17;
-#[allow(dead_code)] // Available for future tests
 const EINVAL: i64 = -22;
 const EACCES: i64 = -13;
 const EMSGSIZE: i64 = -90;
@@ -50,6 +52,72 @@ pub fn run_tests() {
     test_mq_emsgsize();
     test_mq_name_slash();
     test_mq_name_toolong();
+    test_mq_attr_limits();
+    test_mq_notify_owner_exit();
+}
+
+/// SIGEV_NONE on `fd`: mq_notify's result
+fn notify_none(fd: i32) -> i64 {
+    let sev = hk_syscall::SigEvent {
+        sigev_notify: 1, // SIGEV_NONE
+        ..hk_syscall::SigEvent::default()
+    };
+    hk_syscall::sys_mq_notify(fd, &sev)
+}
+
+fn test_mq_notify_owner_exit() {
+    let name = b"test_mq_notify_exit\0";
+    let attr = MqAttr::new(4, 64);
+    let fd = sys_mq_open(name.as_ptr(), O_RDWR as i32 | O_CREAT as i32, 0o600, &attr) as i32;
+    if fd < 0 {
+        println(b"MQ_NOTIFY_OWNER_EXIT:FAIL open");
+        return;
+    }
+    let pid = hk_syscall::sys_fork();
+    if pid == 0 {
+        hk_syscall::sys_exit(if notify_none(fd) == 0 { 0 } else { 1 });
+    }
+    let mut st = 0i32;
+    hk_syscall::sys_wait4(pid, &mut st, 0, 0);
+    let r = notify_none(fd);
+    if st == 0 && r == 0 {
+        println(b"MQ_NOTIFY_OWNER_EXIT:OK");
+    } else {
+        print(b"MQ_NOTIFY_OWNER_EXIT:FAIL child status ");
+        print_num(st as i64);
+        print(b" parent ");
+        print_num(r);
+        println(b"");
+    }
+    sys_close(fd as u64);
+    sys_mq_unlink(name.as_ptr());
+}
+
+/// A message size above the hard maximum is rejected before any
+/// allocation (Linux mq_attr_ok), so a huge msgsize can never drive a
+/// giant kernel allocation. The hard cap applies to everyone, so this
+/// runs as root and agrees with Linux.
+fn test_mq_attr_limits() {
+    let name = b"mq_attr_lim\0";
+    let huge = MqAttr {
+        mq_flags: 0,
+        mq_maxmsg: 10,
+        mq_msgsize: (16 * 1024 * 1024) + 1, // one past HARD_MSGSIZEMAX
+        mq_curmsgs: 0,
+        __reserved: [0; 4],
+    };
+    let r = sys_mq_open(name.as_ptr(), O_RDWR as i32 | O_CREAT as i32, 0o644, &huge);
+    if r >= 0 {
+        sys_close(r as u64);
+        sys_mq_unlink(name.as_ptr());
+    }
+    if r == EINVAL as i64 {
+        println(b"MQ_MSGSIZE_LIMIT:OK");
+    } else {
+        print(b"MQ_MSGSIZE_LIMIT:FAIL r=");
+        print_num(r);
+        println(b"");
+    }
 }
 
 /// Test mq_open creates a new queue

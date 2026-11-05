@@ -132,15 +132,14 @@ impl ScsiDisk {
         let cap = read_capacity(&host, target, lun)?;
 
         // Device-reported geometry is untrusted (Linux sd_read_capacity):
-        // 512..4096-byte power-of-two sectors only; READ(10) addresses
-        // at most 2^32 blocks (last LBA 0xffffffff means "use READ
-        // CAPACITY(16)", which is not issued)
-        let sector_size = cap.block_length();
+        // 512..4096-byte power-of-two sectors only. Past 2^32 blocks
+        // every command is 16-byte (Linux use_16_for_rw)
+        let sector_size = cap.block_size;
         if !(512..=4096).contains(&sector_size) || !sector_size.is_power_of_two() {
             crate::printkln!("SCSI: unsupported sector size {}", sector_size);
             return Err(ScsiError::NotSupported);
         }
-        let capacity_sectors = cap.total_blocks().min(u32::MAX as u64);
+        let capacity_sectors = cap.blocks;
 
         Ok(Self {
             host,
@@ -200,6 +199,12 @@ impl ScsiDisk {
         self.capacity_sectors
     }
 
+    /// Every command 16-byte: the disk passes READ(10)'s 32-bit LBA
+    /// (Linux use_16_for_rw)
+    fn use_16(&self) -> bool {
+        self.capacity_sectors > u32::MAX as u64
+    }
+
     /// Get sector size
     pub fn sector_size(&self) -> u32 {
         self.sector_size
@@ -220,18 +225,13 @@ impl ScsiDisk {
             return Err(ScsiError::NoDevice);
         }
 
-        if lba > u32::MAX as u64 || count > u16::MAX as u32 {
-            // Would need READ(16) for larger values
-            return Err(ScsiError::IllegalRequest);
-        }
-
         let expected_len = count as usize * self.sector_size as usize;
         if buf.len() < expected_len {
             return Err(ScsiError::IllegalRequest);
         }
 
         let cmd = ScsiCommand::read(
-            Cdb::read_10(lba as u32, count as u16),
+            Cdb::rw(false, lba, count, self.use_16()),
             buf.as_mut_ptr(),
             expected_len,
             30000, // 30 second timeout for I/O
@@ -250,17 +250,13 @@ impl ScsiDisk {
             return Err(ScsiError::NoDevice);
         }
 
-        if lba > u32::MAX as u64 || count > u16::MAX as u32 {
-            return Err(ScsiError::IllegalRequest);
-        }
-
         let expected_len = count as usize * self.sector_size as usize;
         if buf.len() < expected_len {
             return Err(ScsiError::IllegalRequest);
         }
 
         let cmd = ScsiCommand::write(
-            Cdb::write_10(lba as u32, count as u16),
+            Cdb::rw(true, lba, count, self.use_16()),
             buf.as_ptr() as *mut u8,
             expected_len,
             30000,
@@ -456,6 +452,28 @@ mod tests {
     }
 
     use super::*;
+
+    /// 16-byte commands where READ(10) cannot address (Linux
+    /// sd_setup_rw_cmnd), and READ CAPACITY(16)'s data
+    #[test]
+    fn cdbs() {
+        use crate::block::scsi::{Cdb, capacity_16, opcode};
+        let c = Cdb::rw(false, 5, 8, false);
+        assert_eq!((c.len, c.bytes[0]), (10, opcode::READ_10));
+        let c = Cdb::rw(true, 1 << 32, 8, false);
+        assert_eq!((c.len, c.bytes[0]), (16, opcode::WRITE_16));
+        assert_eq!(&c.bytes[2..10], &(1u64 << 32).to_be_bytes());
+        assert_eq!(&c.bytes[10..14], &8u32.to_be_bytes());
+        assert_eq!(Cdb::rw(false, 0, 0x1_0000, false).len, 16);
+        assert_eq!(Cdb::rw(false, 0, 1, true).len, 16);
+        let c = Cdb::read_capacity_16();
+        assert_eq!((c.bytes[0], c.bytes[1], c.bytes[13]), (0x9e, 0x10, 32));
+        let mut d = [0u8; 32];
+        d[0..8].copy_from_slice(&0x1_2345_6789u64.to_be_bytes());
+        d[8..12].copy_from_slice(&4096u32.to_be_bytes());
+        let cap = capacity_16(&d);
+        assert_eq!((cap.blocks, cap.block_size), (0x1_2345_678a, 4096));
+    }
 
     #[test]
     fn index_reuse() {

@@ -342,26 +342,33 @@ struct IoUringInner {
 }
 
 impl IoUringInner {
-    fn new(sq_entries: u32, cq_entries: u32) -> Self {
+    fn new(sq_entries: u32, cq_entries: u32) -> Result<Self, KernelError> {
         let sq_mask = sq_entries - 1;
         let cq_mask = cq_entries - 1;
+        // The ring arrays are kernel-bounded but large (order 9/10):
+        // allocate them fallibly so a tight-memory setup is ENOMEM, not
+        // a kernel panic
+        use crate::util::kmem::try_vec;
+        let sq_array = try_vec(sq_entries as usize, 0u32)?;
+        let sqes = try_vec(sq_entries as usize, IoUringSqe::default())?;
+        let cqes = try_vec(cq_entries as usize, IoUringCqe::default())?;
 
-        Self {
+        Ok(Self {
             sq_entries,
             cq_entries,
             sq_mask,
             cq_mask,
             sq_head: 0,
             cq_tail: 0,
-            sq_array: alloc::vec![0u32; sq_entries as usize],
-            sqes: alloc::vec![IoUringSqe::default(); sq_entries as usize],
-            cqes: alloc::vec![IoUringCqe::default(); cq_entries as usize],
+            sq_array,
+            sqes,
+            cqes,
             cq_overflow: 0,
             sq_dropped: 0,
             registered_files: None,
             pending_ops: Vec::new(),
             next_pending_id: 0,
-        }
+        })
     }
 
     /// Post a completion queue entry
@@ -461,19 +468,19 @@ pub struct IoUring {
 
 impl IoUring {
     /// Create a new io_uring instance
-    pub fn new(sq_entries: u32, cq_entries: u32) -> Arc<Self> {
+    pub fn new(sq_entries: u32, cq_entries: u32) -> Result<Arc<Self>, KernelError> {
         // Calculate memory sizes
         let rings_size = Self::calc_rings_size(sq_entries, cq_entries);
         let sqes_size = (sq_entries as usize) * core::mem::size_of::<IoUringSqe>();
 
-        Arc::new(Self {
-            inner: IrqSpinlock::new(IoUringInner::new(sq_entries, cq_entries)),
+        Ok(Arc::new(Self {
+            inner: IrqSpinlock::new(IoUringInner::new(sq_entries, cq_entries)?),
             wq: WaitQueue::new(),
             sq_entries,
             cq_entries,
             rings_size,
             sqes_size,
-        })
+        }))
     }
 
     /// Calculate total ring buffer size
@@ -865,6 +872,17 @@ impl IoUring {
 
     /// Register files for fixed file access
     pub fn register_files(&self, fds: &[i32]) -> i64 {
+        // Reserve the table before any lock, so the allocation never
+        // runs under the inner IrqSpinlock (IRQs off)
+        let mut files = match crate::util::kmem::KVec::try_with_capacity(fds.len()) {
+            Ok(v) => v,
+            Err(e) => return e.sysret(),
+        };
+        let fd_table = match get_task_fd(current_tid()) {
+            Some(t) => t,
+            None => return KernelError::BadFd.sysret(),
+        };
+
         let mut inner = self.inner.lock();
 
         // Can't register if already registered
@@ -872,26 +890,20 @@ impl IoUring {
             return KernelError::Busy.sysret();
         }
 
-        // Resolve fds to File references
-        let fd_table = match get_task_fd(current_tid()) {
-            Some(t) => t,
-            None => return KernelError::BadFd.sysret(),
-        };
-
         let fd_table_locked = fd_table.lock();
-        let mut files = Vec::with_capacity(fds.len());
-
         for &fd in fds {
-            if fd == -1 {
-                // -1 means empty slot
-                files.push(None);
+            let slot = if fd == -1 {
+                None
             } else {
                 match fd_table_locked.get(fd) {
-                    Some(f) => files.push(Some(f)),
+                    Some(f) => Some(f),
                     None => return KernelError::BadFd.sysret(),
                 }
-            }
+            };
+            // Capacity is reserved; this cannot fail
+            let _ = files.try_push(slot);
         }
+        let files = files.into_vec();
 
         inner.registered_files = Some(files);
         0
@@ -1439,7 +1451,10 @@ pub fn sys_io_uring_setup(entries: u32, params_ptr: u64) -> i64 {
     };
 
     // Create io_uring instance
-    let ring = IoUring::new(sq_entries, cq_entries);
+    let ring = match IoUring::new(sq_entries, cq_entries) {
+        Ok(r) => r,
+        Err(e) => return e.sysret(),
+    };
 
     // Fill in params
     params.sq_entries = sq_entries;

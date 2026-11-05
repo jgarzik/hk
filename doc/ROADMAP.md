@@ -11,26 +11,26 @@ phase end. Gaps a phase leaves go to BUGS.md.
 
 | # | Phase | Why here |
 |---|-------|----------|
-| 1 | L — locking and atomics bugs (done) | real races, one security-relevant |
-| 2 | R2 — pass `&Task`, not tid | largest refactor; before new code |
-| 3 | R4 — private TaskInner fields, `Signal` | same object, mechanical |
-| 4 | M1 — uaccess and errors | ~400 call sites, mechanical |
-| 5 | M2 — arch dedup, IRQ table | IRQ-safe paths needed by 8 and 15 |
-| 6 | F — tmpfs/shmem, rootfs on tmpfs | Debian root filesystem |
-| 7 | C — group stop, job control, ptrace stops | Debian JOBCTL; VT needs stops |
-| 8 | Y — tty and console core | prerequisite of devpts (9) and VT (12) |
-| 9 | H — Debian kernel interfaces | DEB_SH, DEB_RCS |
-| 10 | I — Debian networking | DEB_NET |
-| 11 | T — device topology | SCSI midlayer for AHCI, USB hubs |
-| 12 | V — virtual terminals | console, keyboard, logind/Xorg ABI |
-| 13 | J — reclaim and OOM | long Debian runs |
-| 14 | N — credentials and login | DEB_LOGIN, DEB_SU; check-debian joins the gate |
-| 15 | M4 — DMA and MMIO | typed DMA for the real-hardware drivers |
-| 16 | D — Dell OptiPlex 3020 bring-up | interrupt routing, xHCI, AHCI, UEFI, NIC |
-| 17 | M3 — rest of the bus/DT cleanup | after the drivers settle |
-| 18 | M5 — split functions over 150 lines | pure moves |
-| 19 | S1 — idioms | small, wide |
-| 20 | S2 — docs | last: describes the final code |
+| 1 | R2 — pass `&Task`, not tid | largest refactor; before new code |
+| 2 | R4 — private TaskInner fields, `Signal` | same object, mechanical |
+| 3 | M1 — uaccess and errors | ~400 call sites, mechanical |
+| 4 | M2 — arch dedup, IRQ table | IRQ-safe paths needed by 7 and 14 |
+| 5 | F — tmpfs/shmem, rootfs on tmpfs | Debian root filesystem |
+| 6 | C — group stop, job control, ptrace stops | Debian JOBCTL; VT needs stops |
+| 7 | Y — tty and console core | prerequisite of devpts (8) and VT (11) |
+| 8 | H — Debian kernel interfaces | DEB_SH, DEB_RCS |
+| 9 | I — Debian networking | DEB_NET |
+| 10 | T — device topology | SCSI midlayer for AHCI, USB hubs |
+| 11 | V — virtual terminals | console, keyboard, logind/Xorg ABI |
+| 12 | J — reclaim and OOM | long Debian runs |
+| 13 | N — credentials and login | DEB_LOGIN, DEB_SU; check-debian joins the gate |
+| 14 | M4 — DMA and MMIO | typed DMA for the real-hardware drivers |
+| 15 | D — Dell OptiPlex 3020 bring-up | interrupt routing, xHCI, AHCI, UEFI, NIC |
+| 16 | M3 — rest of the bus/DT cleanup | after the drivers settle |
+| 17 | M5 — split functions over 150 lines | pure moves |
+| 18 | S1 — idioms | small, wide |
+| 19 | S2 — docs | last: describes the final code |
+| 20 | E — eBPF attach points, then a JIT | the engine (`bpf/`) is now specified and tested; README wishlist; not Debian-blocking |
 
 Not scheduled: HADL proper (`doc/ideas/HADL-driver-architecture-research.md`:
 typed register vocabulary, Ethernet engine, chip descriptions, signed
@@ -38,51 +38,7 @@ driver packages and loader, native escape modules). Only its
 preparatory items are in the phases above (M1, M2, M4, D's firmware
 loading); HADL itself waits for the owner's go-ahead.
 
-## 1. L — locking and atomics bugs (done 2026-11-05)
-
-Shared state kept in atomics instead of under its object's lock (the
-2026-11-03 atomics audit). Done: every item below landed with its
-LOCKING.md rows; the remaining gaps are in BUGS.md. Each fix: a repro boot test where
-reachable, the LOCKING.md row fixed, the BUGS line deleted.
-- L0 LOCKING.md 5.4 rules: lock first, an atomic only for a named
-  lockless reader; no check-then-act (one RMW, or Linux's
-  add-then-rollback); no `Mutex<()>` beside sibling atomics;
-  Release/Acquire for a value that publishes data; `Once` for set-once
-  values; per-holder recursion guards; every shared atomic documented;
-  an IDA for user-visible ids; per-CPU counters on hot paths. Drop the
-  wrong "correct" examples (Inode mode/uid/gid, MsgQueue,
-  SemArray.pending).
-- L1 ipc/sem semop: semval/sempid under the array lock; check, apply,
-  removed-check and enqueue under it, wake after unlock (Linux
-  sem_lock); SETVAL/SETALL/exit_sem under it.
-- L2 chmod/chown under i_rwsem across the permission check, privilege
-  drop and id/mode/ctime update (Linux notify_change).
-- L3 cgroup pids: charge in can_fork on the target set, cancel on
-  failure (Linux pids_can_fork).
-- L4 i_size with Release/Acquire (i_size_write/read); fallocate under
-  i_rwsem.
-- L5 ipcget under the ids lock; shm_tot/used_sems updated after insert,
-  under it.
-- L6 mount flags under mount_lock; MNT_WRITE_HOLD, RDONLY set only on
-  success.
-- L7 kcmp cookies set once at boot; Key.state CAS on instantiate,
-  revoke/update under the payload lock; MsgQueue state under
-  `messages` plus the IPC_SET qbytes EPERM ABI; NTP state in the
-  TimeKeeper seqlock, ADJ_SETOFFSET through inject_offset.
-- L8 cgroup_mutex and cgroup_threadgroup_rwsem (rmdir vs attach).
-- L9 TCP shutdown/disconnect bits and `connecting` under `cb`.
-- L10 TCP memory: per-CPU forward allocation, tcp_mem scaled to RAM.
-- L11 low batch: GroupCputimer started only by arming; timer wheel
-  `not_before` under the wheel lock; workqueue fields under their lock;
-  PacketSock bind as one update; zone watermarks under zone.lock; heap
-  init `Once`; filemap mkclean by swap/CAS; blkdev open counters under
-  open_mutex, capacity/ro plain; NR_CPU_IDS set once before any user.
-- L12 delete dead atomics; cgroup io/cpu/memory/freezer counters in
-  Linux's shape (page_counter, token bucket under its lock).
-- L13 `get_user`/`put_user` accept unaligned user pointers (Linux
-  does); boot test on both kernels first.
-
-## 2–4. R2, R4, M1 — the large mechanical refactors
+## 1–3. R2, R4, M1 — the large mechanical refactors
 
 - R2 `get_task_*(tid)` helpers take `&Task` or use `current()`;
   tid-to-task lookup only at the syscall boundary (kill, ptrace,
@@ -97,13 +53,13 @@ reachable, the LOCKING.md row fixed, the BUGS line deleted.
   fd lookups; redundant `access_ok` checks dropped; raw errno literals
   replaced.
 
-## 5. M2 — arch dedup and the IRQ table
+## 4. M2 — arch dedup and the IRQ table
 
 `IrqSpinlock` in `sync/irqspin.rs` over arch `local_irq_save/restore`;
 generic ioremap allocator (one IOREMAP_END); kmap skeleton generic;
 generic IRQ table with typed RAII `request_irq<T: IrqHandler>`.
 
-## 6. F — tmpfs/shmem and rootfs on tmpfs
+## 5. F — tmpfs/shmem and rootfs on tmpfs
 
 shmem on the page cache (swap-backed; size=, nr_inodes=, mode, uid,
 gid; statfs); rootfs is tmpfs (50% of RAM), the cpio unpacked into it,
@@ -111,7 +67,7 @@ initrd pages freed; devtmpfs, SysV shm and MAP_SHARED|MAP_ANONYMOUS
 on shmem; memfd_create with seals; O_TMPFILE; fallocate punch/zero.
 Tests TMPFS_LIMITS, MEMFD_SEALS, ROOTFS_TMPFS.
 
-## 7. C — group stop, job control, ptrace stops
+## 6. C — group stop, job control, ptrace stops
 
 Group stop and continue (SIGSTOP/TSTP/TTIN/TTOU defaults, SIGCONT,
 CLD_STOPPED/CLD_CONTINUED, orphaned process groups); wait4/waitid
@@ -121,7 +77,7 @@ Linux's thread choice; ptrace_stop (signal-delivery, syscall, exec
 stops), FOLL_FORCE for POKE; reboot CAD_ON/CAD_OFF. Tests JOBCTL,
 WAIT_STOPPED, PTRACE_STOP.
 
-## 8. Y — tty and console core
+## 7. Y — tty and console core
 
 - Tty open counts and release; TtyDriver ops (install, close, ioctl
   fall-through, resize, stop, start, init_termios) on the serial
@@ -140,7 +96,7 @@ WAIT_STOPPED, PTRACE_STOP.
   tty.
 - `-vga std` pinned in run-qemu.sh and linux-boot-tester.sh.
 
-## 9. H — Debian kernel interfaces
+## 8. H — Debian kernel interfaces
 
 devpts and ptys (ptmx, TIOCGPTN/TIOCSPTLCK/TIOCGPTPEER, newinstance);
 /proc: cmdline, stat, uptime, loadavg, filesystems, cpuinfo, swaps,
@@ -151,14 +107,14 @@ in Linux form; harness `tools/debian-root.sh` (apt-get download,
 dpkg-deb -x, fakeroot cpio) and `check-debian{,-arm}`, cached by input
 hash. Tests PTY_BASIC, PROC_BASICS, DEB_SH, DEB_RCS.
 
-## 10. I — Debian networking
+## 9. I — Debian networking
 
 ifupdown with dhclient (AF_PACKET and raw paths);
 /proc/sys/net/ipv4/{conf,neigh}/*, /proc/net/{snmp,raw,icmp}; SIOCETHTOOL
 where dhclient or ifup need it; Linux errnos where AF_INET6 is tried.
 Test DEB_NET (DHCP on QEMU slirp, ip addr, ping, TCP fetch, DNS).
 
-## 11. T — device topology
+## 10. T — device topology
 
 Missing intermediate subsystems, built in Linux's shape (no faked
 paths):
@@ -175,7 +131,7 @@ paths):
 - x86 ttyS0 below the ACPI PNP0501 device waits for ACPI namespace
   enumeration (D).
 
-## 12. V — virtual terminals
+## 11. V — virtual terminals
 
 Linux drivers/tty/vt equivalence:
 - P1 VT core and dummycon: tty1..63 and tty0, con_write C0 controls
@@ -199,20 +155,20 @@ Linux drivers/tty/vt equivalence:
   KIOCSOUND/KDMKTONE.
 - P9 virtio-gpu 2D (checked in check-gfx).
 
-## 13. J — reclaim and OOM
+## 12. J — reclaim and OOM
 
 kswapd, priority reclaim, the slab shrinker API, the OOM killer with
 oom_score_adj. Test: 1000 fork+exec of a dynamic binary with slab flat;
 OOM kill semantics.
 
-## 14. N — credentials and login
+## 13. N — credentials and login
 
 setuid/setgid exec and file capabilities (NOSUID honored),
 PR_CAPBSET_*, ambient capabilities, securebits; interactive login on a
 pty. Tests DEB_LOGIN (agetty autologin, bash job control), DEB_SU.
 `check-debian{,-arm}` joins `make gate`.
 
-## 15. M4 — DMA and MMIO
+## 14. M4 — DMA and MMIO
 
 The streaming DMA API kept and typed (no raw physical addresses, unmap
 on completion), `DmaAddr` with a private constructor, `DmaRing<T: Pod>`
@@ -221,7 +177,7 @@ the DMA API, ordered IoMem writes plus `_relaxed` variants, PL011/
 PL031/xHCI registers on IoMem, xHCI quirks as bitflags; releases the
 matching BUGS.md "unsafe not yet wrapped" items.
 
-## 16. D — Dell OptiPlex 3020 bring-up
+## 15. D — Dell OptiPlex 3020 bring-up
 
 In the Dell order: IOAPIC with ACPI _PRT routing, MSI and MSI-X (x86
 LAPIC messages; arm64 GICv3 ITS/GICv2m on QEMU virt), ACPI namespace
@@ -229,11 +185,11 @@ enumeration enough for PNP devices; request_firmware (Linux
 firmware_class paths); xHCI on Lynx Point; AHCI 8c02 through libata
 and SAT on the SCSI midlayer; UEFI boot; RTL8168g.
 
-## 17–20. M3, M5, S1, S2
+## 16–19. M3, M5, S1, S2
 
 - M3 aarch64 DT information in its own type, not AcpiInfo; remaining
   "(stub for now)" banners.
-- M5 the 21 functions over 150 lines (do_clone, bpf_run, sys_prctl,
+- M5 the 20 functions over 150 lines (do_clone, sys_prctl,
   kmain, sys_mmap, exec_file, tty_ioctl, sys_fcntl, do_semctl,
   do_select_internal, sys_mremap, procfs_mount, the NUMA/SRAT parsers,
   exit_current, both setup_rt_frame, fanotify_mark, waitid, adjtimex,
@@ -247,3 +203,22 @@ and SAT on the SCSI midlayer; UEFI boot; RTL8168g.
 - S2 `# Arguments`/`# Returns` blocks and `// ====` banners removed;
   history and speculative comments rewritten to the current state;
   `TODO(unsafe)` lines kept.
+
+## 20. E — eBPF attach points, then a JIT
+
+hk's single BPF engine (`bpf/`: RFC 9669 interpreter over checked
+regions, iterative verifier, Linux's classic converter) runs seccomp
+and classic socket filters; nothing yet runs a program loaded with
+bpf(2). In order:
+
+- Maps in programs: BPF_PSEUDO_MAP_FD loads, map_lookup/update/delete
+  helpers, map-value pointers (or-null until checked) in the verifier
+  and as a third interpreter region; map memory charged (BUGS.md).
+- The socket filter context (struct __sk_buff field rewrites, Linux
+  bpf_convert_ctx_access) and SO_ATTACH_BPF / SO_DETACH_BPF.
+- Verifier range tracking (scalar bounds, tnum) for variable offsets
+  and bounded loops; bpf-to-bpf calls; then cgroup skb/sock attach and
+  BPF_LINK, and the BTF libbpf needs.
+- Last, a per-arch JIT with constant blinding: it gives up the
+  interpreter's run-time region checks, so it waits until the verifier
+  is trusted (Linux's verifier bugs are its main CVE source).

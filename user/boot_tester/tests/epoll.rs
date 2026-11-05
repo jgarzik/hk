@@ -8,12 +8,16 @@
 //! - Test epoll_event layout: 64-bit data, multiple events
 //! - Test epoll_wait timeout behavior
 //! - Test EPOLLONESHOT mode
+//! - EPOLL_CLOSE_EOF: a watched pipe end closed is released (EOF)
+//! - EPOLL_LOOP_ELOOP / EPOLL_NEST_DEPTH: ep_loop_check
+//! - EPOLL_ET_REARM: edge-triggered reports each new event
+//! - EPOLL_MAXEVENTS: Linux's maxevents range
 
 use super::helpers::{host_mode, print, print_num, println, skip};
 use hk_syscall::{
-    EPOLL_CLOEXEC, EPOLL_CTL_ADD, EPOLL_CTL_DEL, EPOLL_CTL_MOD, EPOLLIN, EPOLLONESHOT, EPOLLOUT,
-    EpollEvent, Timespec, sys_close, sys_epoll_create, sys_epoll_create1, sys_epoll_ctl,
-    sys_epoll_pwait2, sys_epoll_wait, sys_eventfd2, sys_pipe2, sys_write,
+    EPOLL_CLOEXEC, EPOLL_CTL_ADD, EPOLL_CTL_DEL, EPOLL_CTL_MOD, EPOLLET, EPOLLIN, EPOLLONESHOT,
+    EPOLLOUT, EpollEvent, O_NONBLOCK, Timespec, sys_close, sys_epoll_create, sys_epoll_create1,
+    sys_epoll_ctl, sys_epoll_pwait2, sys_epoll_wait, sys_eventfd2, sys_pipe2, sys_write,
 };
 
 /// Run all epoll tests
@@ -31,7 +35,17 @@ pub fn run_tests() {
     test_epoll_pwait2_null_timeout();
     test_epoll_pwait2_zero_timeout();
     test_epoll_pwait2_with_data();
+    test_epoll_close_eof();
+    test_epoll_loop();
+    test_epoll_nest_depth();
+    test_epoll_et_rearm();
+    test_epoll_maxevents();
+    test_epoll_hup_events0();
+    test_epoll_et_partial_read();
 }
+
+const ELOOP: i64 = -40;
+const EINVAL: i64 = -22;
 
 /// Test epoll_create (legacy API)
 fn test_epoll_create() {
@@ -609,4 +623,218 @@ fn test_epoll_pwait2_with_data() {
     sys_close(pipefd[0] as u64);
     sys_close(pipefd[1] as u64);
     println(b"EPOLL_PWAIT2_DATA:OK");
+}
+
+fn ok_or_fail(name: &[u8], step: i64) {
+    print(name);
+    if step == 0 {
+        println(b":OK");
+    } else {
+        print(b":FAIL step ");
+        print_num(step);
+        println(b"");
+    }
+}
+
+/// A watched file holds no reference: closing the write end of a pipe
+/// that an epoll watches gives the reader EOF (Linux epitems pin
+/// nothing; the file's last close removes them)
+fn test_epoll_close_eof() {
+    let step = (|| {
+        let epfd = sys_epoll_create1(0) as i32;
+        let mut p = [0i32; 2];
+        if epfd < 0 || sys_pipe2(p.as_mut_ptr(), O_NONBLOCK) < 0 {
+            return 1;
+        }
+        let ev = EpollEvent::new(EPOLLOUT, 1);
+        if sys_epoll_ctl(epfd, EPOLL_CTL_ADD, p[1], &ev) != 0 {
+            return 2;
+        }
+        sys_close(p[1] as u64);
+        let mut b = [0u8; 1];
+        let r = hk_syscall::sys_read(p[0] as u64, b.as_mut_ptr(), 1);
+        sys_close(p[0] as u64);
+        sys_close(epfd as u64);
+        if r != 0 { 3 } else { 0 }
+    })();
+    ok_or_fail(b"EPOLL_CLOSE_EOF", step);
+}
+
+/// Watching an epoll from one it watches is ELOOP (Linux ep_loop_check)
+fn test_epoll_loop() {
+    let step = (|| {
+        let a = sys_epoll_create1(0) as i32;
+        let b = sys_epoll_create1(0) as i32;
+        if a < 0 || b < 0 {
+            return 1;
+        }
+        let ev = EpollEvent::new(EPOLLIN, 0);
+        if sys_epoll_ctl(a, EPOLL_CTL_ADD, b, &ev) != 0 {
+            return 2;
+        }
+        let r = sys_epoll_ctl(b, EPOLL_CTL_ADD, a, &ev);
+        sys_close(a as u64);
+        sys_close(b as u64);
+        if r != ELOOP { 3 } else { 0 }
+    })();
+    ok_or_fail(b"EPOLL_LOOP_ELOOP", step);
+}
+
+/// Five epolls chain (four nesting levels, EP_MAX_NESTS); a sixth is
+/// ELOOP
+fn test_epoll_nest_depth() {
+    let step = (|| {
+        let mut e = [0i32; 6];
+        for x in e.iter_mut() {
+            *x = sys_epoll_create1(0) as i32;
+            if *x < 0 {
+                return 1;
+            }
+        }
+        let ev = EpollEvent::new(EPOLLIN, 0);
+        let mut r = 0;
+        for i in 0..4 {
+            if sys_epoll_ctl(e[i + 1], EPOLL_CTL_ADD, e[i], &ev) != 0 {
+                r = 2;
+            }
+        }
+        if r == 0 && sys_epoll_ctl(e[5], EPOLL_CTL_ADD, e[4], &ev) != ELOOP {
+            r = 3;
+        }
+        for x in e {
+            sys_close(x as u64);
+        }
+        r
+    })();
+    ok_or_fail(b"EPOLL_NEST_DEPTH", step);
+}
+
+/// Edge-triggered: each new write is a new event even if the earlier
+/// data is still unread (Linux reports per wakeup, not per mask change)
+fn test_epoll_et_rearm() {
+    let step = (|| {
+        let epfd = sys_epoll_create1(0) as i32;
+        let mut p = [0i32; 2];
+        if epfd < 0 || sys_pipe2(p.as_mut_ptr(), 0) < 0 {
+            return 1;
+        }
+        let ev = EpollEvent::new(EPOLLIN | EPOLLET, 7);
+        if sys_epoll_ctl(epfd, EPOLL_CTL_ADD, p[0], &ev) != 0 {
+            return 2;
+        }
+        let mut out = [EpollEvent::empty(); 2];
+        sys_write(p[1] as u64, b"a".as_ptr(), 1);
+        let r = (|| {
+            if sys_epoll_wait(epfd, out.as_mut_ptr(), 2, 0) != 1 {
+                return 3;
+            }
+            // Nothing new: no event
+            if sys_epoll_wait(epfd, out.as_mut_ptr(), 2, 0) != 0 {
+                return 4;
+            }
+            // New data, old data unread: a new event
+            sys_write(p[1] as u64, b"b".as_ptr(), 1);
+            if sys_epoll_wait(epfd, out.as_mut_ptr(), 2, 0) != 1 {
+                return 5;
+            }
+            0
+        })();
+        sys_close(p[0] as u64);
+        sys_close(p[1] as u64);
+        sys_close(epfd as u64);
+        r
+    })();
+    ok_or_fail(b"EPOLL_ET_REARM", step);
+}
+
+/// maxevents past the old 4096 cap works (Linux EP_MAX_EVENTS is
+/// INT_MAX / sizeof(epoll_event)); more than that is EINVAL
+fn test_epoll_maxevents() {
+    let step = (|| {
+        const N: usize = 8192;
+        let size = core::mem::size_of::<EpollEvent>();
+        let buf = hk_syscall::sys_mmap(0, (N * size) as u64, 3, 0x22, -1, 0);
+        let epfd = sys_epoll_create1(0) as i32;
+        let efd = sys_eventfd2(1, 0) as i32;
+        if buf < 0 || epfd < 0 || efd < 0 {
+            return 1;
+        }
+        let ev = EpollEvent::new(EPOLLIN, 9);
+        sys_epoll_ctl(epfd, EPOLL_CTL_ADD, efd, &ev);
+        let out = buf as *mut EpollEvent;
+        let n = sys_epoll_wait(epfd, out, N as i32, 0);
+        let max = (i32::MAX as usize / size) as i32;
+        let over = sys_epoll_wait(epfd, out, max + 1, 0);
+        sys_close(efd as u64);
+        sys_close(epfd as u64);
+        hk_syscall::sys_munmap(buf as u64, (N * size) as u64);
+        if n != 1 {
+            2
+        } else if over != EINVAL {
+            3
+        } else {
+            0
+        }
+    })();
+    ok_or_fail(b"EPOLL_MAXEVENTS", step);
+}
+
+/// An item added with no events still reports a hangup: EPOLLERR and
+/// EPOLLHUP are always watched (Linux do_epoll_ctl)
+fn test_epoll_hup_events0() {
+    let step = (|| {
+        let epfd = sys_epoll_create1(0) as i32;
+        let mut p = [0i32; 2];
+        if epfd < 0 || sys_pipe2(p.as_mut_ptr(), 0) < 0 {
+            return 1;
+        }
+        let ev = EpollEvent::new(0, 5);
+        if sys_epoll_ctl(epfd, EPOLL_CTL_ADD, p[0], &ev) != 0 {
+            return 2;
+        }
+        sys_close(p[1] as u64);
+        let mut out = [EpollEvent::empty(); 2];
+        let n = sys_epoll_wait(epfd, out.as_mut_ptr(), 2, 0);
+        sys_close(p[0] as u64);
+        sys_close(epfd as u64);
+        if n != 1 || out[0].events & hk_syscall::EPOLLHUP == 0 {
+            3
+        } else {
+            0
+        }
+    })();
+    ok_or_fail(b"EPOLL_HUP_EVENTS0", step);
+}
+
+/// Edge-triggered: a partial read is no new event (the pipe wakes its
+/// writers with POLLOUT, which a reader's EPOLLIN item ignores)
+fn test_epoll_et_partial_read() {
+    let step = (|| {
+        let epfd = sys_epoll_create1(0) as i32;
+        let mut p = [0i32; 2];
+        if epfd < 0 || sys_pipe2(p.as_mut_ptr(), 0) < 0 {
+            return 1;
+        }
+        let ev = EpollEvent::new(EPOLLIN | EPOLLET, 6);
+        if sys_epoll_ctl(epfd, EPOLL_CTL_ADD, p[0], &ev) != 0 {
+            return 2;
+        }
+        sys_write(p[1] as u64, b"ab".as_ptr(), 2);
+        let mut out = [EpollEvent::empty(); 2];
+        let first = sys_epoll_wait(epfd, out.as_mut_ptr(), 2, 0);
+        let mut b = [0u8; 1];
+        hk_syscall::sys_read(p[0] as u64, b.as_mut_ptr(), 1);
+        let second = sys_epoll_wait(epfd, out.as_mut_ptr(), 2, 0);
+        sys_close(p[0] as u64);
+        sys_close(p[1] as u64);
+        sys_close(epfd as u64);
+        if first != 1 {
+            3
+        } else if second != 0 {
+            4
+        } else {
+            0
+        }
+    })();
+    ok_or_fail(b"EPOLL_ET_PARTIAL_READ", step);
 }

@@ -1325,13 +1325,10 @@ pub fn sys_pidfd_send_signal(pidfd: i32, sig: i32, _info: u64, flags: u32) -> i6
         Err(e) => return e.sysret(),
     };
 
-    // Signal 0 is a null signal - just check if process exists
-    if sig == 0 {
-        return 0;
-    }
-
-    // Send the signal
-    crate::signal::send_signal_to_process(target_pid, sig as u32) as i64
+    // Permission check and send (Linux pidfd_send_signal ->
+    // kill_pid_info). Signal 0 is a permission/existence probe.
+    let perm = crate::signal::syscall::user_group_send(target_pid, sig as u32);
+    perm as i64
 }
 
 /// sys_pidfd_getfd - obtain a duplicate of another process's file descriptor

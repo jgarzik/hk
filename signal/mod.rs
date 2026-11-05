@@ -113,6 +113,15 @@ pub const NSIG: u32 = 64;
 #[repr(transparent)]
 pub struct SigSet(pub u64);
 
+/// Signals a task's own faults raise, delivered before others (Linux
+/// SYNCHRONOUS_MASK)
+const SYNCHRONOUS_MASK: u64 = 1 << (SIGSEGV - 1)
+    | 1 << (SIGBUS - 1)
+    | 1 << (SIGILL - 1)
+    | 1 << (SIGTRAP - 1)
+    | 1 << (SIGFPE - 1)
+    | 1 << (SIGSYS - 1);
+
 // SAFETY: repr(transparent) over a u64: any bits valid, no padding
 unsafe impl crate::util::pod::FromBytes for SigSet {}
 // SAFETY: as above
@@ -175,6 +184,15 @@ impl SigSet {
     /// Subtract another set
     pub fn subtract(&self, other: &SigSet) -> SigSet {
         SigSet(self.0 & !other.0)
+    }
+
+    /// The set with SIGKILL and SIGSTOP cleared: the only mask that may
+    /// become a task's blocked set or a handler's mask (Linux
+    /// sigdelsetmask in set_current_blocked / do_sigaction). They can
+    /// never be blocked, so every path that stores a blocked mask runs
+    /// its input through this.
+    pub fn blockable(self) -> SigSet {
+        self.subtract(&UNMASKABLE_SIGNALS)
     }
 
     /// Check if any signals are set
@@ -423,13 +441,14 @@ impl SigPending {
         self.signal.remove(sig);
     }
 
-    /// Get next deliverable signal (not in blocked set)
-    ///
-    /// Removes and returns the lowest-numbered pending signal that is not blocked.
+    /// Remove and return the next deliverable signal (not blocked):
+    /// a synchronous one (SEGV, BUS, ILL, TRAP, FPE, SYS: a fault of the
+    /// task's own) first, else the lowest-numbered (Linux next_signal)
     pub fn dequeue(&mut self, blocked: &SigSet) -> Option<u32> {
-        // Find first pending signal not in blocked set
         let deliverable = self.signal.subtract(blocked);
-        if let Some(sig) = deliverable.first() {
+        let sync = SigSet(deliverable.0 & SYNCHRONOUS_MASK);
+        let pick = if sync.0 != 0 { sync } else { deliverable };
+        if let Some(sig) = pick.first() {
             self.signal.remove(sig);
             Some(sig)
         } else {
@@ -629,6 +648,10 @@ pub struct TaskSignalState {
     /// The mask before sigtimedwait unblocked the awaited signals
     /// (Linux real_blocked): such a signal does not kill on arrival
     pub real_blocked: SigSet,
+    /// A traced task's fault signal and its details, queued for normal
+    /// delivery (the tracer's stop first): the handler gets them as
+    /// force_sig_fault would have given (hk has no siginfo queue)
+    pub fault: Option<(u32, KSigInfo)>,
 }
 
 /// A thread group's shared pending set (Linux signal->shared_pending):
@@ -665,6 +688,7 @@ impl TaskSignalState {
             shared_pending: SharedPending(None),
             altstack: AltStack::new(),
             real_blocked: SigSet::EMPTY,
+            fault: None,
         }
     }
 
@@ -677,6 +701,7 @@ impl TaskSignalState {
             shared_pending: SharedPending::new(),
             altstack: AltStack::new(),
             real_blocked: SigSet::EMPTY,
+            fault: None,
         }
     }
 
@@ -838,6 +863,7 @@ pub fn clone_task_signal(
             },
             altstack: AltStack::new(), // Child starts with no altstack
             real_blocked: SigSet::EMPTY,
+            fault: None,
         }
     } else {
         TaskSignalState::new()
@@ -1832,7 +1858,13 @@ pub fn do_signal(regs: &UserFrame) {
                         regs.set_ret(EINTR);
                     }
                 }
-                if deliver_to_handler(tid, sig, &action, &KSigInfo::default(), regs) {
+                // A traced task's fault keeps its details (force_sig_fault)
+                let info = with_task_signal_state(tid, |s| {
+                    s.fault.take_if(|(f, _)| *f == sig).map(|(_, i)| i)
+                })
+                .flatten()
+                .unwrap_or_default();
+                if deliver_to_handler(tid, sig, &action, &info, regs) {
                     return;
                 }
                 // Frame setup failed: SIGSEGV was forced; deliver it
@@ -1867,7 +1899,7 @@ pub fn set_temp_sigmask(new: SigSet) -> Option<SigSet> {
     let me = crate::task::percpu::current();
     let old = with_task_signal_state(me.tid(), |state| {
         state.saved_sigmask = state.blocked;
-        state.blocked = new.subtract(&UNMASKABLE_SIGNALS);
+        state.blocked = new.blockable();
         state.saved_sigmask
     })?;
     me.set_tif(crate::task::tif::RESTORE_SIGMASK);
@@ -1949,6 +1981,9 @@ fn deliver_to_handler(
                 if action.flags & sa_flags::SA_NODEFER == 0 {
                     state.blocked.add(sig);
                 }
+                // SIGKILL/SIGSTOP are never blockable, whatever sa_mask
+                // or the signal is
+                state.blocked = state.blocked.blockable();
             });
             true
         }
@@ -2014,6 +2049,15 @@ pub fn force_sig_fault(sig: u32, info: KSigInfo, regs: &UserFrame) {
     let do_exit = do_group_exit;
 
     let tid = crate::task::percpu::current_tid();
+    // A traced task's fault signal is queued like any other, so the
+    // tracer sees its signal-delivery stop first (Linux force_sig_fault
+    // -> get_signal -> ptrace_signal); delivered on the way back to user
+    // space, it is unblocked and not ignored, as force_sig makes it
+    if crate::task::ptrace::is_traced(tid) {
+        with_task_signal_state(tid, |s| s.fault = Some((sig, info)));
+        force_sig(tid, sig);
+        return;
+    }
     let sighand = get_task_sighand(tid);
     let action = sighand
         .as_ref()
@@ -2047,4 +2091,31 @@ pub fn force_sig_fault(sig: u32, info: KSigInfo, regs: &UserFrame) {
 pub fn sigreturn_badframe() -> i64 {
     force_sigsegv(crate::task::percpu::current_tid());
     -14 // EFAULT
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A task's own fault comes before a lower-numbered signal (Linux
+    /// next_signal); otherwise the lowest first; blocked ones wait
+    #[test]
+    fn synchronous_first() {
+        let mut p = SigPending {
+            signal: SigSet::from_bits(0),
+        };
+        for s in [SIGHUP, SIGUSR1, SIGSEGV, SIGBUS] {
+            p.add(s);
+        }
+        let none = SigSet::from_bits(0);
+        assert_eq!(p.dequeue(&none), Some(SIGBUS));
+        assert_eq!(p.dequeue(&none), Some(SIGSEGV));
+        assert_eq!(p.dequeue(&none), Some(SIGHUP));
+        p.add(SIGFPE);
+        let mut blocked = SigSet::from_bits(0);
+        blocked.add(SIGFPE);
+        assert_eq!(p.dequeue(&blocked), Some(SIGUSR1));
+        assert_eq!(p.dequeue(&blocked), None);
+        assert_eq!(p.dequeue(&none), Some(SIGFPE));
+    }
 }

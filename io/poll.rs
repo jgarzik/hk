@@ -244,9 +244,17 @@ impl Drop for PollContext {
 ///
 /// Files call `poll_wait()` on this to register interest in wait queues.
 /// After poll_wait(), they return a mask of currently ready events.
+/// Who a poll table registers for
+enum Target<'a> {
+    /// A poll()/select() caller: wake it (its context)
+    Ctx(&'a mut PollContext),
+    /// An epoll item: its callback entries (Linux ep_ptable_queue_proc)
+    Ep(&'a mut crate::io::epoll::EpRegs),
+}
+
 pub struct PollTable<'a> {
-    /// Poll context (holds registrations)
-    ctx: &'a mut PollContext,
+    /// Who the registrations are for
+    target: Target<'a>,
     /// Event mask of interest (filters wakeups)
     pub key: u32,
     /// Whether to actually register (false after first ready event)
@@ -257,7 +265,16 @@ impl<'a> PollTable<'a> {
     /// Create a new poll table
     pub fn new(ctx: &'a mut PollContext) -> Self {
         Self {
-            ctx,
+            target: Target::Ctx(ctx),
+            key: 0,
+            qproc_enabled: true,
+        }
+    }
+
+    /// A table registering an epoll item's callbacks
+    pub(crate) fn for_epoll(regs: &'a mut crate::io::epoll::EpRegs) -> Self {
+        Self {
+            target: Target::Ep(regs),
             key: 0,
             qproc_enabled: true,
         }
@@ -275,14 +292,21 @@ impl<'a> PollTable<'a> {
             return;
         }
         // Wakeups are not filtered by key: the poller re-scans all fds
-        self.ctx.add_entry(wq);
+        match &mut self.target {
+            Target::Ctx(c) => c.add_entry(wq),
+            Target::Ep(r) => r.add(wq),
+        }
     }
 
     /// Keep `file` alive while registered on its wait queues (no-op once
     /// registration is disabled)
+    /// (An epoll item holds no reference to its file: the file's last
+    /// close unregisters it.)
     pub fn hold_file(&mut self, file: &Arc<File>) {
-        if self.qproc_enabled {
-            self.ctx.hold_file(file.clone());
+        if self.qproc_enabled
+            && let Target::Ctx(c) = &mut self.target
+        {
+            c.hold_file(file.clone());
         }
     }
 
@@ -291,7 +315,10 @@ impl<'a> PollTable<'a> {
     /// registration is disabled)
     pub fn hold(&mut self, owner: Arc<dyn core::any::Any + Send + Sync>) {
         if self.qproc_enabled {
-            self.ctx.owners.push(owner);
+            match &mut self.target {
+                Target::Ctx(c) => c.owners.push(owner),
+                Target::Ep(r) => r.hold(owner),
+            }
         }
     }
 

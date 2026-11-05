@@ -44,6 +44,7 @@ pub fn run_tests() {
     let _ = sys_mkdir(b"/tmp\0".as_ptr(), 0o755);
 
     test_setlk_wrlck();
+    test_setlk_range_limits();
     test_setlk_rdlck();
     test_getlk_no_conflict();
     test_setlk_unlock();
@@ -560,4 +561,45 @@ fn test_flock_upgrade() {
     sys_close(fd as u64);
     hk_syscall::sys_unlink(path.as_ptr());
     verdict(b"FLOCK_UPGRADE", got == 0 && st == 0, got, st as i64);
+}
+
+/// Lock ranges past OFFSET_MAX are EOVERFLOW, ones reaching below 0
+/// EINVAL (Linux flock64_to_posix_lock)
+fn test_setlk_range_limits() {
+    const EINVAL: i64 = -22;
+    const EOVERFLOW: i64 = -75;
+    let path = b"/tmp/posix_lock_range\0";
+    let fd = sys_open(path.as_ptr(), O_RDWR | O_CREAT | O_TRUNC, 0o644) as i32;
+    let try_lock = |l_start: i64, l_len: i64| {
+        let mut fl = Flock {
+            l_type: F_WRLCK,
+            l_whence: SEEK_SET,
+            l_start,
+            l_len,
+            l_pid: 0,
+        };
+        sys_fcntl(fd, F_SETLK, &mut fl as *mut Flock as u64)
+    };
+    let step = if fd < 0 {
+        1
+    } else if try_lock(i64::MAX, 2) != EOVERFLOW {
+        2
+    } else if try_lock(3, i64::MIN) != EINVAL {
+        3
+    } else if try_lock(i64::MAX, 1) != 0 {
+        4
+    } else {
+        0
+    };
+    if fd >= 0 {
+        sys_close(fd as u64);
+    }
+    print(b"POSIX_SETLK_RANGE_LIMITS");
+    if step == 0 {
+        println(b":OK");
+    } else {
+        print(b":FAIL step ");
+        print_num(step);
+        println(b"");
+    }
 }

@@ -33,6 +33,54 @@ pub fn run_tests() {
     test_vmsplice_bad_base(bad);
     test_mincore_bad_vec();
     test_unaligned();
+    test_iov_negative_len(bad);
+}
+
+/// An iovec length negative as ssize_t is EINVAL, also when an earlier
+/// segment's address is bad (Linux checks lengths while copying the
+/// array in, addresses after)
+fn test_iov_negative_len(bad: u64) {
+    const EINVAL: i64 = -22;
+    let mut p = [0i32; 2];
+    let buf = [0u8; 4];
+    let neg = 1usize << 63;
+    let step = if sys_pipe(p.as_mut_ptr()) != 0 {
+        1
+    } else {
+        let one = [IoVec {
+            iov_base: buf.as_ptr(),
+            iov_len: neg,
+        }];
+        let two = [
+            IoVec {
+                iov_base: bad as *const u8,
+                iov_len: 4,
+            },
+            IoVec {
+                iov_base: buf.as_ptr(),
+                iov_len: neg,
+            },
+        ];
+        let r1 = sys_writev(p[1] as u64, one.as_ptr(), 1);
+        let r2 = sys_writev(p[1] as u64, two.as_ptr(), 2);
+        sys_close(p[0] as u64);
+        sys_close(p[1] as u64);
+        if r1 != EINVAL {
+            2
+        } else if r2 != EINVAL {
+            3
+        } else {
+            0
+        }
+    };
+    print(b"IOV_NEGATIVE_LEN");
+    if step == 0 {
+        println(b":OK");
+    } else {
+        print(b":FAIL step ");
+        print_num(step);
+        println(b"");
+    }
 }
 
 fn test_unaligned() {

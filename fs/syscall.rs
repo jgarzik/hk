@@ -20,7 +20,6 @@ pub use super::pollsys::*;
 pub use super::stat::*;
 pub use super::sync::*;
 
-use crate::fs::KernelError;
 use crate::task::fdtable::get_task_fd;
 use crate::task::percpu::current_tid;
 
@@ -86,35 +85,6 @@ pub fn get_nofile_limit() -> u64 {
     } else {
         limit
     }
-}
-
-// =============================================================================
-// RLIMIT_FSIZE enforcement helpers
-// =============================================================================
-
-/// Check RLIMIT_FSIZE before a write operation
-///
-/// If the write would exceed RLIMIT_FSIZE, sends SIGXFSZ and returns EFBIG.
-/// Returns Ok(()) if the write is within limits.
-///
-/// # Arguments
-/// * `offset` - Starting offset for the write
-/// * `count` - Number of bytes to write
-#[inline]
-pub fn check_fsize_limit(offset: u64, count: usize) -> Result<(), i64> {
-    let limit = crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_FSIZE);
-    if limit == crate::task::rlimit::RLIM_INFINITY {
-        return Ok(());
-    }
-
-    let final_size = offset.saturating_add(count as u64);
-    if final_size > limit {
-        // Send SIGXFSZ before returning error (per POSIX/Linux requirement)
-        let tid = current_tid();
-        crate::signal::send_signal(tid, crate::signal::SIGXFSZ);
-        return Err(KernelError::FileTooLarge.sysret());
-    }
-    Ok(())
 }
 
 /// Get the current task's FD table

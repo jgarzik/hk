@@ -73,6 +73,10 @@ pub struct Pid {
     /// The process's wait status once all its threads have exited;
     /// ALIVE before
     exit: AtomicI64,
+    /// Execs the process it leads has done (Linux self_exec_id, which
+    /// the leader carries): what it registered before an exec is not
+    /// delivered after it
+    exec_gen: AtomicU64,
 }
 
 /// `Pid.exit` of a process that still runs
@@ -94,6 +98,16 @@ impl Pid {
     pub fn exited(&self) -> Option<i32> {
         let v = self.exit.load(Ordering::Acquire);
         (v != ALIVE).then_some(v as i32)
+    }
+
+    /// Execs of the process it leads
+    pub fn exec_gen(&self) -> u64 {
+        self.exec_gen.load(Ordering::Acquire)
+    }
+
+    /// The process it leads exec'd (its point of no return)
+    pub fn exec_done(&self) {
+        self.exec_gen.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Its process has exited with `status` (the last thread's exit):
@@ -286,6 +300,7 @@ pub fn alloc_pid_nr(ns: &Arc<PidNamespace>, root_nr: Option<u32>) -> Option<Arc<
         session: TableCell::new(List::new()),
         wait_pidfd: crate::sync::waitqueue::WaitQueue::new(),
         exit: AtomicI64::new(ALIVE),
+        exec_gen: AtomicU64::new(0),
     });
     let _g = PIDMAP_LOCK.lock();
     for u in pid.numbers.iter() {
@@ -314,6 +329,7 @@ pub static INIT_STRUCT_PID: spin::Lazy<Arc<Pid>> = spin::Lazy::new(|| {
         session: TableCell::new(List::new()),
         wait_pidfd: crate::sync::waitqueue::WaitQueue::new(),
         exit: AtomicI64::new(ALIVE),
+        exec_gen: AtomicU64::new(0),
     })
 });
 

@@ -27,7 +27,6 @@ use crate::fs::name::FileName;
 use crate::time::hrtimer::HrClock;
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
-use alloc::vec;
 use alloc::vec::Vec;
 use core::any::Any;
 use core::cmp::Ordering;
@@ -156,10 +155,13 @@ impl Ord for MqMessage {
     }
 }
 
-/// Notification registration
+/// Notification registration (Linux info->notify_owner, a referenced
+/// struct pid, and notify_self_exec_id): holding the owner's `Pid`
+/// keeps its number from naming another process
 struct MqNotify {
-    owner_pid: u64,
-    owner_tid: u64,
+    owner: Arc<crate::task::pid::Pid>,
+    /// The owner's exec generation when it registered
+    exec_gen: u64,
     sigev_notify: i32,
     sigev_signo: i32,
     sigev_value: u64,
@@ -260,7 +262,7 @@ impl MqQueue {
 
     fn send(
         &self,
-        data: &[u8],
+        data: Vec<u8>,
         priority: u32,
         nonblock: bool,
         deadline: Option<u64>,
@@ -270,10 +272,7 @@ impl MqQueue {
                 let mut msgs = self.messages.lock();
                 if (msgs.len() as i64) < self.maxmsg {
                     // Insert maintaining priority order (higher priority first)
-                    let msg = MqMessage {
-                        priority,
-                        data: data.to_vec(),
-                    };
+                    let msg = MqMessage { priority, data };
 
                     // Find insertion point (sorted by priority, descending)
                     let pos = msgs
@@ -314,26 +313,20 @@ impl MqQueue {
         }
     }
 
-    fn receive(
-        &self,
-        buf: &mut [u8],
-        nonblock: bool,
-        deadline: Option<u64>,
-    ) -> Result<(usize, u32), i64> {
+    fn receive(&self, nonblock: bool, deadline: Option<u64>) -> Result<(Vec<u8>, u32), i64> {
         loop {
             {
                 let mut msgs = self.messages.lock();
                 if !msgs.is_empty() {
-                    // Remove highest priority message (at front)
+                    // Remove highest priority message (at front); the
+                    // caller copies it out, so no kernel buffer is sized
+                    // by the user's request
                     let msg = msgs.remove(0);
-                    let len = msg.data.len().min(buf.len());
-                    buf[..len].copy_from_slice(&msg.data[..len]);
-
                     drop(msgs);
 
                     // Wake up senders
                     self.waitq_send.wake_all();
-                    return Ok((len, msg.priority));
+                    return Ok((msg.data, msg.priority));
                 }
             }
 
@@ -358,32 +351,16 @@ impl MqQueue {
     fn fire_notification(&self) {
         let mut notify = self.notify.lock();
         if let Some(n) = notify.take() {
-            // Log the notification for debugging (uses sigev_value)
-            // TODO: When siginfo support is added, include sigev_value in SI_MESGQ siginfo
-            let _sigev_value = n.sigev_value; // Will be passed in siginfo_t.si_value
-
-            match n.sigev_notify {
-                SIGEV_SIGNAL => {
-                    // Send signal to process
-                    // Full Linux ABI: signal should include siginfo with si_code=SI_MESGQ,
-                    // si_value=sigev_value, si_pid, si_uid
-                    let tgid = n.owner_pid as i64;
-                    let signo = n.sigev_signo;
-                    crate::signal::syscall::sys_kill(tgid, signo as u32);
-                }
-                SIGEV_THREAD_ID => {
-                    // Send signal to specific thread
-                    let tgid = n.owner_pid as i64;
-                    let tid = n.owner_tid as i64;
-                    let signo = n.sigev_signo;
-                    crate::signal::syscall::sys_tgkill(tgid, tid, signo as u32);
-                }
-                SIGEV_NONE => {
-                    // No notification - just unregister
-                }
-                _ => {}
+            // TODO: siginfo SI_MESGQ with sigev_value once hk queues siginfo
+            let _sigev_value = n.sigev_value;
+            // The registrant's authority, not the sender's (Linux
+            // __do_notify sends without the kill permission check), and
+            // only to the process that registered: not after it exited
+            // or exec'd
+            let live = n.owner.exited().is_none() && n.owner.exec_gen() == n.exec_gen;
+            if n.sigev_notify == SIGEV_SIGNAL && live {
+                crate::signal::send_signal_to_process(n.owner.nr() as u64, n.sigev_signo as u32);
             }
-            // Notification is one-shot, already removed by take()
         }
     }
 }
@@ -415,8 +392,12 @@ impl FileOps for MqFileOps {
             return Err(KernelError::PermissionDenied);
         }
 
-        match mq.queue.receive(buf, false, None) {
-            Ok((len, _prio)) => Ok(len),
+        match mq.queue.receive(false, None) {
+            Ok((data, _prio)) => {
+                let len = data.len().min(buf.len());
+                buf[..len].copy_from_slice(&data[..len]);
+                Ok(len)
+            }
             Err(_) => Err(KernelError::Io),
         }
     }
@@ -427,8 +408,13 @@ impl FileOps for MqFileOps {
             return Err(KernelError::PermissionDenied);
         }
 
+        if buf.len() as i64 > mq.queue.msgsize {
+            return Err(KernelError::MessageTooLong);
+        }
+        let mut data = crate::util::kmem::try_vec(buf.len(), 0u8)?;
+        data.copy_from_slice(buf);
         // Write with priority 0 (default)
-        match mq.queue.send(buf, 0, false, None) {
+        match mq.queue.send(data, 0, false, None) {
             Ok(()) => Ok(buf.len()),
             Err(_) => Err(KernelError::Io),
         }
@@ -455,17 +441,16 @@ impl FileOps for MqFileOps {
         events
     }
 
-    fn release(&self, file: &File) -> Result<(), KernelError> {
-        let mq = mq_of(file).ok_or(KernelError::BadFd)?;
-        // Clear notification if we own it
-        let current_pid = crate::task::percpu::current_pid();
-        let mut notify = mq.queue.notify.lock();
-        if let Some(ref n) = *notify
-            && n.owner_pid == current_pid
-        {
-            *notify = None;
+    /// The owner closing any descriptor of the queue drops its
+    /// registration (Linux mqueue_flush_file)
+    fn flush(&self, file: &File) {
+        if let Some(mq) = mq_of(file) {
+            let me = crate::task::percpu::current_pid();
+            let mut notify = mq.queue.notify.lock();
+            if notify.as_ref().is_some_and(|n| n.owner.nr() as u64 == me) {
+                *notify = None;
+            }
         }
-        Ok(())
     }
 }
 
@@ -547,6 +532,28 @@ fn validate_mq_name(name: &[u8]) -> Result<(), KernelError> {
 }
 
 /// mq_open - open a message queue
+/// Linux mq_attr_ok: both values positive; without CAP_SYS_RESOURCE a
+/// queue is capped at the soft defaults, with it at the hard maxima; the
+/// total storage must not overflow (EOVERFLOW).
+fn mq_attr_ok(maxmsg: i64, msgsize: i64) -> Result<(i64, i64), KernelError> {
+    if maxmsg <= 0 || msgsize <= 0 {
+        return Err(KernelError::InvalidArgument);
+    }
+    let (max_m, max_s) = if crate::task::capable(crate::task::CAP_SYS_RESOURCE) {
+        (HARD_MSGMAX, HARD_MSGSIZEMAX)
+    } else {
+        (DFLT_MSGMAX, DFLT_MSGSIZEMAX)
+    };
+    if maxmsg > max_m || msgsize > max_s {
+        return Err(KernelError::InvalidArgument);
+    }
+    // Total bytes must not overflow (Linux checks maxmsg*msgsize)
+    (maxmsg as u64)
+        .checked_mul(msgsize as u64)
+        .ok_or(KernelError::Overflow)?;
+    Ok((maxmsg, msgsize))
+}
+
 pub fn sys_mq_open(name_ptr: u64, oflag: i32, mode: u32, attr_ptr: u64) -> i64 {
     // Read name from user space
     // Longer than NAME_MAX: ENAMETOOLONG (Linux: the lookup of the
@@ -596,18 +603,13 @@ pub fn sys_mq_open(name_ptr: u64, oflag: i32, mode: u32, attr_ptr: u64) -> i64 {
                 return KernelError::NotFound.sysret();
             }
 
-            // Read attributes if provided
-            let (maxmsg, msgsize) = if let Some(attr) = attr_in {
-                // Validate attributes
-                if attr.mq_maxmsg <= 0 || attr.mq_maxmsg > HARD_MSGMAX {
-                    return KernelError::InvalidArgument.sysret();
-                }
-                if attr.mq_msgsize <= 0 || attr.mq_msgsize > HARD_MSGSIZEMAX {
-                    return KernelError::InvalidArgument.sysret();
-                }
-                (attr.mq_maxmsg, attr.mq_msgsize)
-            } else {
-                (DFLT_MSGMAX, DFLT_MSGSIZEMAX)
+            // Read attributes if provided (Linux mq_attr_ok)
+            let (maxmsg, msgsize) = match attr_in {
+                Some(attr) => match mq_attr_ok(attr.mq_maxmsg, attr.mq_msgsize) {
+                    Ok(v) => v,
+                    Err(e) => return e.sysret(),
+                },
+                None => (DFLT_MSGMAX, DFLT_MSGSIZEMAX),
             };
 
             let queue = Arc::new(MqQueue::new(
@@ -737,8 +739,11 @@ pub fn sys_mq_timedsend(
         return KernelError::MessageTooLong.sysret();
     }
 
-    // Read message from user space
-    let mut msg_buf = vec![0u8; msg_len];
+    // Read message from user space (bounded by msgsize, fallible)
+    let mut msg_buf = match crate::util::kmem::try_vec(msg_len, 0u8) {
+        Ok(b) => b,
+        Err(e) => return e.sysret(),
+    };
     if msg_len > 0 {
         if !Uaccess::access_ok(msg_ptr, msg_len) {
             return KernelError::BadAddress.sysret();
@@ -753,7 +758,7 @@ pub fn sys_mq_timedsend(
         Err(e) => return e.sysret(),
     };
     let nonblock = mq_ops.queue.is_nonblocking();
-    match mq_ops.queue.send(&msg_buf, msg_prio, nonblock, deadline) {
+    match mq_ops.queue.send(msg_buf, msg_prio, nonblock, deadline) {
         Ok(()) => 0,
         Err(e) => e,
     }
@@ -799,20 +804,18 @@ pub fn sys_mq_timedreceive(
         Err(e) => return e.sysret(),
     };
     let nonblock = mq_ops.queue.is_nonblocking();
-    // Messages are at most msgsize bytes: never allocate the user's length
-    let mut buf = vec![0u8; msg_len.min(mq_ops.queue.msgsize as usize)];
-
-    let (len, prio) = match mq_ops.queue.receive(&mut buf, nonblock, deadline) {
+    let (data, prio) = match mq_ops.queue.receive(nonblock, deadline) {
         Ok(r) => r,
         Err(e) => return e,
     };
+    let len = data.len().min(msg_len);
 
     // Write message to user space
     if len > 0 {
         if !Uaccess::access_ok(msg_ptr, len) {
             return KernelError::BadAddress.sysret();
         }
-        if copy_to_user::<Uaccess>(msg_ptr, &buf[..len]).is_err() {
+        if copy_to_user::<Uaccess>(msg_ptr, &data[..len]).is_err() {
             return KernelError::BadAddress.sysret();
         }
     }
@@ -845,16 +848,15 @@ pub fn sys_mq_notify(mqdes: i32, sevp_ptr: u64) -> i64 {
     };
 
     let current_pid = crate::task::percpu::current_pid();
-    let current_tid_val = current_tid();
 
     if sevp_ptr == 0 {
         // Remove notification (only if we own it)
         let mut notify = mq_ops.queue.notify.lock();
-        if let Some(ref n) = *notify
-            && n.owner_pid == current_pid
+        if notify
+            .as_ref()
+            .is_some_and(|n| n.owner.nr() as u64 == current_pid)
         {
             *notify = None;
-            return 0;
         }
         return 0; // Not an error to remove non-existent
     }
@@ -867,27 +869,32 @@ pub fn sys_mq_notify(mqdes: i32, sevp_ptr: u64) -> i64 {
 
     // Validate notification type
     match sev.sigev_notify {
-        SIGEV_NONE | SIGEV_SIGNAL | SIGEV_THREAD_ID => {}
-        SIGEV_THREAD => return KernelError::InvalidArgument.sysret(), // Not supported (requires user-space pthread)
+        SIGEV_NONE | SIGEV_SIGNAL => {}
+        // Linux mqueue notify does not take SIGEV_THREAD_ID (only
+        // timers do); SIGEV_THREAD is a user-space pthread mechanism
+        SIGEV_THREAD_ID | SIGEV_THREAD => return KernelError::InvalidArgument.sysret(),
         _ => return KernelError::InvalidArgument.sysret(),
     }
 
     // Check if already registered by another process
+    let Some(owner) = u32::try_from(current_pid)
+        .ok()
+        .and_then(|nr| crate::task::pid::find_pid(&crate::ns::INIT_PID_NS, nr))
+    else {
+        return KernelError::NoProcess.sysret();
+    };
     let mut notify = mq_ops.queue.notify.lock();
-    if let Some(ref n) = *notify
-        && n.owner_pid != current_pid
+    if notify
+        .as_ref()
+        .is_some_and(|n| n.owner.nr() as u64 != current_pid)
     {
         return KernelError::Busy.sysret();
     }
 
     // Register notification
     *notify = Some(MqNotify {
-        owner_pid: current_pid,
-        owner_tid: if sev.sigev_notify == SIGEV_THREAD_ID {
-            sev.sigev_notify_tid as u64
-        } else {
-            current_tid_val
-        },
+        exec_gen: owner.exec_gen(),
+        owner,
         sigev_notify: sev.sigev_notify,
         sigev_signo: sev.sigev_signo,
         sigev_value: sev.sigev_value,

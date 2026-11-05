@@ -17,6 +17,15 @@
 //!   exited alone (a zombie) does not stop a sibling's TSYNC (Linux
 //!   skips exiting threads)
 //! - SECCOMP_IP: the filter sees the syscall's user instruction pointer
+//! - SECCOMP_ARCH_PROLOGUE: the AUDIT_ARCH check every libseccomp and
+//!   systemd filter starts with (a constant >= 2^31) matches, and a
+//!   jump with jt = jf = 0 falls through
+//! - SECCOMP_SCRATCH: scratch memory M[] stores and loads
+//! - SECCOMP_REJECTS: what Linux refuses is EINVAL (16/8-bit and
+//!   unaligned or out-of-range loads, MOD, division by a zero constant,
+//!   RET X, a load of an unstored M[] slot, a jump past the end)
+//! - SECCOMP_PATH_ENOMEM: 4096-instruction filters stack 7 deep; the
+//!   8th passes MAX_INSNS_PER_PATH and is ENOMEM
 
 use super::fork_mm::{join, spawn_thread};
 use super::helpers::{print, print_num, println};
@@ -64,6 +73,17 @@ const fn ins(code: u16, jt: u8, jf: u8, k: u32) -> SockFilter {
 const LD_W_ABS: u16 = 0x20;
 const JEQ_K: u16 = 0x15;
 const RET_K: u16 = 0x06;
+/// BPF_LD|BPF_IMM, BPF_ST, BPF_LD|BPF_MEM
+const LD_IMM: u16 = 0x00;
+const ST: u16 = 0x02;
+const LD_MEM: u16 = 0x60;
+const EINVAL: i64 = -22;
+const ENOMEM: i64 = -12;
+
+#[cfg(target_arch = "x86_64")]
+const AUDIT_ARCH: u32 = 0xc000_003e;
+#[cfg(target_arch = "aarch64")]
+const AUDIT_ARCH: u32 = 0xc000_00b7;
 
 /// Install "getppid -> `action`, else ALLOW" with `flags`
 fn install(action: u32, flags: u32) -> i64 {
@@ -124,6 +144,10 @@ pub fn run_tests() {
     tsync();
     tsync_zombie();
     ip();
+    arch_prologue();
+    scratch();
+    rejects();
+    path_enomem();
 }
 
 fn errno() {
@@ -371,4 +395,88 @@ fn tsync_zombie() {
         sys_exit(0)
     });
     report(b"SECCOMP_TSYNC_ZOMBIE", st == 0, st);
+}
+
+fn arch_prologue() {
+    let st = child(|| {
+        let prog = [
+            ins(LD_W_ABS, 0, 0, 4),
+            ins(JEQ_K, 0, 0, 0),
+            ins(JEQ_K, 1, 0, AUDIT_ARCH),
+            ins(RET_K, 0, 0, RET_KILL_PROCESS),
+            ins(LD_W_ABS, 0, 0, 0),
+            ins(JEQ_K, 0, 1, SYS_GETPPID as u32),
+            ins(RET_K, 0, 0, RET_ERRNO | 5),
+            ins(RET_K, 0, 0, RET_ALLOW),
+        ];
+        if load(&prog, 0) != 0 {
+            return 1;
+        }
+        if sys_getppid() == -5 { 0 } else { 2 }
+    });
+    report(b"SECCOMP_ARCH_PROLOGUE", st == 0, st);
+}
+
+fn scratch() {
+    let st = child(|| {
+        let prog = [
+            ins(LD_W_ABS, 0, 0, 0),
+            ins(ST, 0, 0, 15),
+            ins(LD_IMM, 0, 0, 0),
+            ins(ST, 0, 0, 0),
+            ins(LD_MEM, 0, 0, 15),
+            ins(JEQ_K, 0, 1, SYS_GETPPID as u32),
+            ins(RET_K, 0, 0, RET_ERRNO | 7),
+            ins(RET_K, 0, 0, RET_ALLOW),
+        ];
+        if load(&prog, 0) != 0 {
+            return 1;
+        }
+        if sys_getppid() == -7 { 0 } else { 2 }
+    });
+    report(b"SECCOMP_SCRATCH", st == 0, st);
+}
+
+fn rejects() {
+    let st = child(|| {
+        let ret = ins(RET_K, 0, 0, RET_ALLOW);
+        let bad: [[SockFilter; 2]; 9] = [
+            [ins(0x28, 0, 0, 0), ret],                  // ld [0] halfword
+            [ins(0x30, 0, 0, 0), ret],                  // ld [0] byte
+            [ins(LD_W_ABS, 0, 0, 2), ret],              // unaligned
+            [ins(LD_W_ABS, 0, 0, 64), ret],             // past seccomp_data
+            [ins(0x94, 0, 0, 3), ret],                  // mod #3
+            [ins(0x34, 0, 0, 0), ret],                  // div #0
+            [ins(LD_MEM, 0, 0, 2), ret],                // M[2] never stored
+            [ins(0x05, 0, 0, 1), ret],                  // ja past the end
+            [ins(LD_IMM, 0, 0, 0), ins(0x0e, 0, 0, 0)], // ret x
+        ];
+        for (i, p) in bad.iter().enumerate() {
+            if load(p, 0) != EINVAL {
+                return 10 + i as u64;
+            }
+        }
+        // Nothing installed: getppid still works
+        if sys_getppid() <= 0 { 2 } else { 0 }
+    });
+    report(b"SECCOMP_REJECTS", st == 0, st);
+}
+
+/// 4095 loads and a RET: the longest program
+static BIG: [SockFilter; 4096] = {
+    let mut p = [ins(LD_IMM, 0, 0, 0); 4096];
+    p[4095] = ins(RET_K, 0, 0, RET_ALLOW);
+    p
+};
+
+fn path_enomem() {
+    let st = child(|| {
+        for n in 0..7 {
+            if load(&BIG, 0) != 0 {
+                return 10 + n;
+            }
+        }
+        if load(&BIG, 0) != ENOMEM { 2 } else { 0 }
+    });
+    report(b"SECCOMP_PATH_ENOMEM", st == 0, st);
 }

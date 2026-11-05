@@ -21,6 +21,12 @@ pub mod opcode {
     pub const WRITE_10: u8 = 0x2A;
     /// Synchronize Cache (10) - flush cache to media
     pub const SYNCHRONIZE_CACHE_10: u8 = 0x35;
+    /// Read (16) / Write (16): 64-bit LBA, 32-bit length
+    pub const READ_16: u8 = 0x88;
+    pub const WRITE_16: u8 = 0x8A;
+    /// Service Action In (16); service action READ CAPACITY (16)
+    pub const SERVICE_ACTION_IN_16: u8 = 0x9E;
+    pub const SAI_READ_CAPACITY_16: u8 = 0x10;
 }
 
 /// SCSI device types (from INQUIRY response)
@@ -69,6 +75,49 @@ impl Cdb {
         Self {
             bytes: [0; 16],
             len: 10,
+        }
+    }
+
+    /// Create a 16-byte CDB (zeroed)
+    pub fn new_16() -> Self {
+        Self {
+            bytes: [0; 16],
+            len: 16,
+        }
+    }
+
+    /// Build READ CAPACITY(16): 32 bytes of capacity data
+    pub fn read_capacity_16() -> Self {
+        let mut cdb = Self::new_16();
+        cdb.bytes[0] = opcode::SERVICE_ACTION_IN_16;
+        cdb.bytes[1] = opcode::SAI_READ_CAPACITY_16;
+        cdb.bytes[10..14].copy_from_slice(&32u32.to_be_bytes());
+        cdb
+    }
+
+    /// Build READ(16) or WRITE(16)
+    pub fn rw_16(write: bool, lba: u64, transfer_length: u32) -> Self {
+        let mut cdb = Self::new_16();
+        cdb.bytes[0] = if write {
+            opcode::WRITE_16
+        } else {
+            opcode::READ_16
+        };
+        cdb.bytes[2..10].copy_from_slice(&lba.to_be_bytes());
+        cdb.bytes[10..14].copy_from_slice(&transfer_length.to_be_bytes());
+        cdb
+    }
+
+    /// The READ/WRITE CDB for `count` blocks at `lba` (Linux
+    /// sd_setup_rw_cmnd): 16-byte if the disk needs it (`use_16`) or the
+    /// LBA or count does not fit READ(10), else 10-byte
+    pub fn rw(write: bool, lba: u64, count: u32, use_16: bool) -> Self {
+        if use_16 || lba > u32::MAX as u64 || count > u16::MAX as u32 {
+            Self::rw_16(write, lba, count)
+        } else if write {
+            Self::write_10(lba as u32, count as u16)
+        } else {
+            Self::read_10(lba as u32, count as u16)
         }
     }
 
@@ -391,25 +440,44 @@ pub fn inquiry(host: &Arc<dyn ScsiHost>, target: u8, lun: u8) -> ScsiResult<Inqu
     Ok(*data)
 }
 
-/// Execute READ CAPACITY(10) and return capacity data (heap buffer, as
-/// for `inquiry`)
-pub fn read_capacity(
-    host: &Arc<dyn ScsiHost>,
-    target: u8,
-    lun: u8,
-) -> ScsiResult<ReadCapacityData> {
+/// A disk's size (Linux sd_read_capacity)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Capacity {
+    pub blocks: u64,
+    pub block_size: u32,
+}
+
+/// READ CAPACITY(10), and READ CAPACITY(16) when the last LBA does not
+/// fit its 32 bits (it reports 0xffffffff: Linux sd_read_capacity)
+pub fn read_capacity(host: &Arc<dyn ScsiHost>, target: u8, lun: u8) -> ScsiResult<Capacity> {
     let mut data = Box::new(ReadCapacityData {
         last_lba: [0; 4],
         block_length: [0; 4],
     });
-
     let cmd = ScsiCommand::read(
         Cdb::read_capacity_10(),
         &mut *data as *mut ReadCapacityData as *mut u8,
         8,
         5000,
     );
-
     host.execute(target, lun, &cmd)?;
-    Ok(*data)
+    if data.last_lba() != u32::MAX {
+        return Ok(Capacity {
+            blocks: data.total_blocks(),
+            block_size: data.block_length(),
+        });
+    }
+    let mut d16 = Box::new([0u8; 32]);
+    let cmd = ScsiCommand::read(Cdb::read_capacity_16(), d16.as_mut_ptr(), 32, 5000);
+    host.execute(target, lun, &cmd)?;
+    Ok(capacity_16(&d16))
+}
+
+/// The READ CAPACITY(16) data: last LBA (8 bytes), block length (4)
+pub fn capacity_16(d: &[u8; 32]) -> Capacity {
+    let last = u64::from_be_bytes(d[0..8].try_into().unwrap_or([0; 8]));
+    Capacity {
+        blocks: last.saturating_add(1),
+        block_size: u32::from_be_bytes([d[8], d[9], d[10], d[11]]),
+    }
 }

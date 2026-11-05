@@ -21,6 +21,7 @@ use hk_syscall::{
 
 /// Run all mmap tests
 pub fn run_tests() {
+    test_mmap_offset_overflow();
     test_uaccess_demand_fault();
     test_uaccess_efault();
     test_uaccess_cow_child();
@@ -2453,4 +2454,39 @@ fn test_mmap_nodev() {
     } else {
         b"MMAP_NODEV:FAIL"
     });
+}
+
+/// A file mapping past the largest file offset is EOVERFLOW (Linux
+/// file_mmap_ok; do_mmap checks the page offset does not wrap)
+fn test_mmap_offset_overflow() {
+    const EOVERFLOW: i64 = -75;
+    let fd = sys_open(b"/tmp_mmap_ovf\0".as_ptr(), 0o100 | 2, 0o600) as i32; // O_CREAT|O_RDWR
+    let mut step = 0;
+    if fd < 0 {
+        step = 1;
+    } else {
+        for (i, off) in [0xffff_ffff_ffff_f000u64, 0x7fff_ffff_ffff_f000]
+            .into_iter()
+            .enumerate()
+        {
+            let r = sys_mmap(0, 8192, 1, 2, fd, off); // PROT_READ, MAP_PRIVATE
+            if r != EOVERFLOW {
+                step = 2 + i as i64;
+                if r > 0 {
+                    sys_munmap(r as u64, 8192);
+                }
+                break;
+            }
+        }
+        sys_close(fd as u64);
+        hk_syscall::sys_unlink(b"/tmp_mmap_ovf\0".as_ptr());
+    }
+    print(b"MMAP_OFFSET_EOVERFLOW");
+    if step == 0 {
+        println(b":OK");
+    } else {
+        print(b":FAIL step ");
+        print_num(step);
+        println(b"");
+    }
 }

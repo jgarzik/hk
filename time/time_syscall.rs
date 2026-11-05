@@ -959,7 +959,6 @@ pub const ADJ_STATUS: u32 = 0x0010;
 pub const ADJ_TIMECONST: u32 = 0x0020;
 pub const ADJ_TAI: u32 = 0x0080;
 pub const ADJ_SETOFFSET: u32 = 0x0100;
-#[allow(dead_code)]
 pub const ADJ_MICRO: u32 = 0x1000;
 pub const ADJ_NANO: u32 = 0x2000;
 pub const ADJ_TICK: u32 = 0x4000;
@@ -975,6 +974,29 @@ pub const TIME_OOP: i32 = 3;
 #[allow(dead_code)]
 pub const TIME_WAIT: i32 = 4;
 pub const TIME_ERROR: i32 = 5;
+
+/// Largest time constant (Linux MAXTC)
+const MAXTC: i64 = 10;
+
+/// timex.freq (ppm << 16) to time_freq (ns/s << 32), clamped to
+/// MAXFREQ (Linux ADJ_FREQUENCY: freq * PPM_SCALE)
+fn freq_set(freq: i64) -> i64 {
+    const PPM_SCALE: i64 = 1000 << (32 - 16);
+    const MAXFREQ_SCALED: i64 = 500_000 << 32;
+    freq.saturating_mul(PPM_SCALE)
+        .clamp(-MAXFREQ_SCALED, MAXFREQ_SCALED)
+}
+
+/// time_freq back to timex.freq (Linux __do_adjtimex's fixed-point
+/// inverse, rounding as it does)
+fn freq_get(time_freq: i64) -> i64 {
+    const PPM_SCALE: i64 = 1000 << (32 - 16);
+    const INV_SHIFT: u32 = 19;
+    const PPM_SCALE_INV: i64 = (1 << (INV_SHIFT + 32)) / PPM_SCALE + 1;
+    let x = (time_freq >> INV_SHIFT) * PPM_SCALE_INV;
+    // Linux shift_right: toward zero
+    if x < 0 { -((-x) >> 32) } else { x >> 32 }
+}
 
 /// Writable STA_* status flags (read-write mask)
 const STA_RW_MASK: i32 = crate::time::STA_PLL
@@ -1087,18 +1109,33 @@ pub fn sys_adjtimex(txc_p: u64) -> i64 {
     // timekeeper lock (Linux __do_adjtimex)
     let modes = txc.modes;
     let (ntp, tai, ts) = TIMEKEEPER.ntp_update(|n| {
-        if modes & ADJ_MAXERROR != 0 {
-            n.maxerror = txc.maxerror;
-        }
-        if modes & ADJ_ESTERROR != 0 {
-            n.esterror = txc.esterror;
-        }
+        // In Linux process_adjtimex_modes' order
         if modes & ADJ_STATUS != 0 {
             // Only allow setting writable status bits
-            n.status = txc.status & STA_RW_MASK;
+            n.status = (n.status & !STA_RW_MASK) | (txc.status & STA_RW_MASK);
+        }
+        if modes & ADJ_NANO != 0 {
+            n.status |= crate::time::STA_NANO;
+        }
+        if modes & ADJ_MICRO != 0 {
+            n.status &= !crate::time::STA_NANO;
+        }
+        if modes & ADJ_FREQUENCY != 0 {
+            n.freq = freq_set(txc.freq);
+        }
+        let limit = crate::time::NTP_PHASE_LIMIT;
+        if modes & ADJ_MAXERROR != 0 {
+            n.maxerror = txc.maxerror.clamp(0, limit);
+        }
+        if modes & ADJ_ESTERROR != 0 {
+            n.esterror = txc.esterror.clamp(0, limit);
         }
         if modes & ADJ_TIMECONST != 0 {
-            n.constant = txc.constant;
+            let mut c = txc.constant.clamp(0, MAXTC);
+            if n.status & crate::time::STA_NANO == 0 {
+                c += 4;
+            }
+            n.constant = c.clamp(0, MAXTC);
         }
         if modes & ADJ_TICK != 0 {
             n.tick = txc.tick;
@@ -1111,7 +1148,7 @@ pub fn sys_adjtimex(txc_p: u64) -> i64 {
     let status = ntp.status;
 
     txc.offset = 0; // No ongoing adjustment
-    txc.freq = 0; // No frequency offset
+    txc.freq = freq_get(ntp.freq);
     txc.maxerror = ntp.maxerror;
     txc.esterror = ntp.esterror;
     txc.status = status;
@@ -1210,5 +1247,21 @@ mod clock_tests {
             crate::task::percpu::TICK_NS
         );
         assert_eq!(PosixClock::Monotonic.res_ns(), 1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// timex.freq round-trips through time_freq as on Linux, clamped at
+    /// MAXFREQ (500 ppm)
+    #[test]
+    fn freq_scaling() {
+        for f in [0i64, 1, 65536, -65536, 100 << 16] {
+            assert_eq!(freq_get(freq_set(f)), f);
+        }
+        assert_eq!(freq_get(freq_set(600 << 16)), 500 << 16);
+        assert_eq!(freq_get(freq_set(-(600 << 16))), -(500 << 16));
     }
 }

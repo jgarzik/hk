@@ -10,7 +10,8 @@ use crate::uaccess::{copy_from_user, copy_to_user, strncpy_from_user_str};
 use crate::util::error::KernelError;
 
 use super::key::{
-    KEY_NEED_READ, KEY_NEED_SETATTR, KEY_NEED_VIEW, KEY_NEED_WRITE, check_key_permission,
+    KEY_NEED_LINK, KEY_NEED_READ, KEY_NEED_SEARCH, KEY_NEED_SETATTR, KEY_NEED_VIEW, KEY_NEED_WRITE,
+    check_key_permission,
 };
 use super::keyring::{keyring_link, keyring_unlink, resolve_special_keyring};
 use super::{lookup_key, remove_key};
@@ -314,8 +315,11 @@ pub fn keyctl_link(key_serial: i32, keyring_serial: i32) -> i64 {
         return KernelError::NotDirectory.sysret();
     }
 
-    // Check WRITE permission on keyring
-    if !check_key_permission(&keyring, KEY_NEED_WRITE) {
+    // WRITE on the keyring, and LINK on the key being linked (Linux
+    // lookup_user_key: KEY_NEED_LINK), else any user could link another
+    // user's key into its own keyring and then possess it
+    if !check_key_permission(&keyring, KEY_NEED_WRITE) || !check_key_permission(&key, KEY_NEED_LINK)
+    {
         return KernelError::PermissionDenied.sysret();
     }
 
@@ -405,26 +409,35 @@ pub fn keyctl_search(keyring_serial: i32, type_ptr: u64, desc_ptr: u64, dest_key
         return KernelError::NotDirectory.sysret();
     }
 
-    // Search the keyring recursively
-    if let Some(serial) = keyring.keyring_search_recursive(&type_name, &description)
-        && let Some(key) = lookup_key(serial)
-    {
-        // Check if key is valid
-        if key.is_revoked() {
-            return KernelError::KeyRevoked.sysret();
-        }
-
-        // Link to destination keyring if specified
-        if dest_keyring != 0
-            && let Ok(dest) = resolve_special_keyring(dest_keyring, false, tid, uid, gid)
-        {
-            let _ = keyring_link(&dest, &key);
-        }
-
-        return serial as i64;
+    // SEARCH on the keyring being searched (Linux lookup_user_key
+    // KEY_NEED_SEARCH)
+    if !check_key_permission(&keyring, KEY_NEED_SEARCH) {
+        return KernelError::PermissionDenied.sysret();
     }
 
-    KernelError::NoKey.sysret()
+    // Search the keyring recursively
+    let key = match keyring.keyring_search_recursive(&type_name, &description) {
+        Ok(k) => k,
+        Err(e) => return e.sysret(),
+    };
+    if key.is_revoked() {
+        return KernelError::KeyRevoked.sysret();
+    }
+
+    // Linking the found key needs LINK on it and WRITE on the
+    // destination (Linux keyctl_keyring_search)
+    if dest_keyring != 0 {
+        if !check_key_permission(&key, KEY_NEED_LINK) {
+            return KernelError::PermissionDenied.sysret();
+        }
+        if let Ok(dest) = resolve_special_keyring(dest_keyring, false, tid, uid, gid) {
+            if !check_key_permission(&dest, KEY_NEED_WRITE) {
+                return KernelError::PermissionDenied.sysret();
+            }
+            let _ = keyring_link(&dest, &key);
+        }
+    }
+    key.serial as i64
 }
 
 /// KEYCTL_READ - Read a key's payload
@@ -512,8 +525,10 @@ pub fn keyctl_invalidate(key_serial: i32) -> i64 {
 
     key.invalidate();
 
-    // Remove from global database
+    // Lookups no longer find it, and no keyring links it: it is freed
+    // with its last reference (Linux: the key GC unlinks invalidated keys)
     remove_key(key_serial);
+    crate::keys::unlink_everywhere(key_serial);
 
     0
 }

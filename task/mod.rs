@@ -785,6 +785,11 @@ impl<F> FdTable<F> {
         Ok(fd)
     }
 
+    /// Descriptors the table has room for (Linux fdtable->max_fds)
+    pub fn max_fds(&self) -> usize {
+        self.bits.max_fds()
+    }
+
     /// Get fd flags for a file descriptor
     pub fn get_fd_flags(&self, fd: Fd) -> u32 {
         self.fd_flags.get(&fd).copied().unwrap_or(0)

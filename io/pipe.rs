@@ -639,8 +639,9 @@ impl FileOps for PipeReadFileOps {
             if !inner.is_empty() {
                 let n = inner.read(buf);
                 drop(inner);
-                // Wake writers - there's now space
-                pipe.wait_queue.wake_all();
+                // Wake writers - there's now space (Linux pipe_read wakes
+                // wr_wait with EPOLLOUT | EPOLLWRNORM)
+                pipe.wait_queue.wake_poll((POLLOUT | POLLWRNORM) as u32);
                 return Ok(n);
             }
             drop(inner);
@@ -799,8 +800,9 @@ impl FileOps for PipeWriteFileOps {
                     };
                 }
                 done += n;
-                // Wake readers - there's data available
-                pipe.wait_queue.wake_all();
+                // Wake readers - there's data available (Linux pipe_write
+                // wakes rd_wait with EPOLLIN | EPOLLRDNORM)
+                pipe.wait_queue.wake_poll((POLLIN | POLLRDNORM) as u32);
             } else {
                 drop(inner);
             }

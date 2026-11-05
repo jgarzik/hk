@@ -592,12 +592,21 @@ fn wp_locked(
     if get_pte(ptep) != pte {
         return Ok(()); // changed meanwhile: the access is retried
     }
+    // This mapping's own page, writable only if the mapping is (a
+    // forced remote write into a read-only one: Linux maybe_mkwrite)
+    let own = |e: u64| {
+        if area.prot & PROT_WRITE != 0 {
+            paging::pte_mkwrite(e)
+        } else {
+            paging::pte_wrprotect(paging::pte_mkwrite(e))
+        }
+    };
     let old = paging::pte_addr(pte);
     if !area.shared && FRAME_ALLOCATOR.refcount(old) > 1 {
         reuse_swap_page(old);
     }
     if area.shared || FRAME_ALLOCATOR.refcount(old) <= 1 {
-        if set_pte(ptep, pte, paging::pte_mkwrite(pte)) {
+        if set_pte(ptep, pte, own(pte)) {
             flush_tlb_page(mm, addr);
             increment_min_flt();
         }
@@ -608,7 +617,7 @@ fn wp_locked(
     // SAFETY: the new frame is ours; `old` stays mapped and referenced
     unsafe { super::page::copy_page(new, old) };
     paging::sync_page(new, paging::pte_exec(pte));
-    let entry = paging::pte_mkwrite((pte & !paging::PTE_ADDR_MASK) | new);
+    let entry = own((pte & !paging::PTE_ADDR_MASK) | new);
     if !replace_pte(mm, ptep, pte, entry, addr) {
         FRAME_ALLOCATOR.free(new);
         return Ok(());
@@ -662,13 +671,15 @@ pub fn pagefault_out_of_memory() -> ! {
 /// (ptrace POKEDATA, process_vm_writev; Linux FOLL_WRITE): give it its
 /// own copy if it is still shared copy-on-write, so the write cannot
 /// reach the process it is shared with. The caller checked that the
-/// VMA is writable and private, and holds the target's mm lock; the new
-/// page joins the VMA's rmap (`anon_vma`) like a write fault's copy.
+/// VMA is private (writable, or the write is forced: ptrace), and holds
+/// the target's mm lock; the copy gets the VMA's `prot` and joins its
+/// rmap (`anon_vma`) like a write fault's copy.
 pub fn unshare_for_write(
     mm: &Mm,
     addr: u64,
     anon_vma: Option<Arc<AnonVma>>,
     index: u64,
+    prot: u32,
 ) -> Result<(), VmFault> {
     // Never a kernel-half address (shared kernel tables)
     if addr >= super::TASK_SIZE {
@@ -678,14 +689,20 @@ pub fn unshare_for_write(
         return Ok(()); // not mapped, or a 2MB page (never shared)
     };
     let pte = get_pte(ptep);
-    if !paging::pte_present(pte) || paging::pte_protnone(pte) || paging::pte_write(pte) {
+    // A PROT_NONE entry keeps its frame: a forced write copies it too
+    // (Linux FOLL_FORCE follows protnone), and the copy stays PROT_NONE
+    let mapped = paging::pte_present(pte) || paging::pte_protnone(pte);
+    if !mapped || paging::pte_write(pte) {
         return Ok(());
     }
     let page = addr & !(PAGE_SIZE - 1);
+    // The copy keeps the mapping's protection: a forced write into a
+    // read-only mapping leaves it read-only to the task (Linux
+    // maybe_mkwrite: writable only with VM_WRITE)
     let area = Area {
         start: page,
         end: page + PAGE_SIZE,
-        prot: PROT_READ | PROT_WRITE,
+        prot,
         shared: false,
         anon: anon_vma.is_some(),
         thp: false,

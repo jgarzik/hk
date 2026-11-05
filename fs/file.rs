@@ -77,6 +77,9 @@ pub mod seek {
     pub const SEEK_CUR: i32 = 1;
     /// Seek from end of file
     pub const SEEK_END: i32 = 2;
+    /// Next data at or after the offset / next hole
+    pub const SEEK_DATA: i32 = 3;
+    pub const SEEK_HOLE: i32 = 4;
 }
 
 /// Flags for read/write operations (preadv2/pwritev2 RWF_* flags)
@@ -154,42 +157,40 @@ impl<'a> DirContext<'a> {
     }
 }
 
-/// Linux generic_file_llseek for a file of `size` bytes
+/// Seek in a file of `size` bytes (Linux generic_file_llseek_size with
+/// the filesystem's s_maxbytes): the whole file is data, its end the
+/// only hole; a position below 0 or past s_maxbytes is EINVAL, SEEK_DATA
+/// / SEEK_HOLE at or past the end ENXIO
 pub fn generic_llseek(
     file: &File,
     size: u64,
     offset: i64,
     whence: i32,
 ) -> Result<u64, KernelError> {
-    let new_pos = match whence {
-        seek::SEEK_SET => {
-            if offset < 0 {
-                return Err(KernelError::InvalidArgument);
+    let max = file.get_inode().map_or(i64::MAX as u64, |i| i.maxbytes());
+    let new = match whence {
+        seek::SEEK_SET => Some(offset),
+        seek::SEEK_CUR => (file.get_pos() as i64).checked_add(offset),
+        seek::SEEK_END => (size as i64).checked_add(offset),
+        seek::SEEK_DATA | seek::SEEK_HOLE => {
+            if offset < 0 || offset as u64 >= size {
+                return Err(KernelError::NoDeviceOrAddress);
             }
-            offset as u64
-        }
-        seek::SEEK_CUR => {
-            let cur = file.get_pos();
-            if offset < 0 {
-                cur.checked_sub((-offset) as u64)
-                    .ok_or(KernelError::InvalidArgument)?
+            Some(if whence == seek::SEEK_DATA {
+                offset
             } else {
-                cur.saturating_add(offset as u64)
-            }
-        }
-        seek::SEEK_END => {
-            if offset < 0 {
-                size.checked_sub((-offset) as u64)
-                    .ok_or(KernelError::InvalidArgument)?
-            } else {
-                size.saturating_add(offset as u64)
-            }
+                size as i64
+            })
         }
         _ => return Err(KernelError::InvalidArgument),
     };
-
-    file.set_pos(new_pos);
-    Ok(new_pos)
+    // Linux vfs_setpos
+    let pos = match new {
+        Some(p) if p >= 0 && p as u64 <= max => p as u64,
+        _ => return Err(KernelError::InvalidArgument),
+    };
+    file.set_pos(pos);
+    Ok(pos)
 }
 
 /// File operations trait - filesystem-specific behavior for open files
@@ -253,6 +254,11 @@ pub trait FileOps: Send + Sync {
     fn fsync(&self, _file: &File) -> Result<(), KernelError> {
         Ok(())
     }
+
+    /// A descriptor of the file is being closed (close, dup2 over it,
+    /// close-on-exec, the closer's exit), in the closer's context (Linux
+    /// f_op->flush): unlike `release`, on every close, not the last
+    fn flush(&self, _file: &File) {}
 
     /// Release file (called when last reference is dropped)
     fn release(&self, _file: &File) -> Result<(), KernelError> {
@@ -395,6 +401,10 @@ pub struct File {
     /// Per-open state of the file's filesystem (Linux private_data), set
     /// at most once, by `FileOps::open`
     pub private: spin::Once<Arc<dyn core::any::Any + Send + Sync>>,
+
+    /// The epoll items watching this file (Linux f_ep), removed at its
+    /// last close (spin leaf)
+    pub f_ep: Mutex<alloc::vec::Vec<alloc::sync::Weak<crate::io::epoll::EpItem>>>,
 }
 
 impl File {
@@ -445,6 +455,7 @@ impl File {
             mnt,
             pos: AtomicU64::new(0),
             f_pos_lock: sync::Mutex::new(()),
+            f_ep: Mutex::new(alloc::vec::Vec::new()),
             f_lock: Mutex::new(flags),
             f_op,
             owner_pid: AtomicI32::new(0),
@@ -688,11 +699,14 @@ impl File {
                 (false, at) => at,
             };
             let pos = at.unwrap_or_else(|| self.get_pos());
-            super::syscall::check_fsize_limit(pos, len).map_err(|_| KernelError::FileTooLarge)?;
-            if len > 0 {
-                // file_remove_privs: set-id bits go unless CAP_FSETID
-                super::dac::remove_privs(&inode);
+            // A zero-length write checks nothing (Linux: count 0 returns
+            // before generic_write_checks)
+            if len == 0 {
+                return Ok(0);
             }
+            let len = inode.write_limit(pos, len)?;
+            // file_remove_privs: set-id bits go unless CAP_FSETID
+            super::dac::remove_privs(&inode);
             self.write_chunks(len, at, flags, src)
         })()
     }
@@ -754,6 +768,11 @@ impl File {
 
 impl Drop for File {
     fn drop(&mut self) {
+        // Leave every epoll first, while the wait queues the items are
+        // registered on still exist (Linux __fput -> eventpoll_release)
+        if !self.f_ep.lock().is_empty() {
+            crate::io::epoll::eventpoll_release(self);
+        }
         // Call release on file operations to allow cleanup (e.g., decrement pipe reader/writer counts)
         let _ = self.f_op.release(self);
 
@@ -865,3 +884,11 @@ pub static CHAR_FILE_OPS: CharDevFileOps = CharDevFileOps;
 // ============================================================================
 // Generic Page-Cache File Operations
 // ============================================================================
+
+/// A descriptor of `file` was closed by the current task (Linux
+/// filp_flush): its POSIX locks on the inode go, then the file's own
+/// flush
+pub fn filp_flush(file: &File) {
+    crate::fs::posix_lock::release_posix_locks_on_close(file);
+    file.f_op.flush(file);
+}

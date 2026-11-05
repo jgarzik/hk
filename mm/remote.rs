@@ -1,7 +1,14 @@
-//! Remote process memory access
+//! Remote process memory access (Linux access_remote_vm,
+//! get_user_pages_remote)
 //!
-//! Provides infrastructure for accessing another process's virtual memory,
-//! used by process_vm_readv/process_vm_writev syscalls.
+//! For process_vm_readv/writev (no force) and ptrace / /proc (force,
+//! Linux FOLL_FORCE). Each page is reached under the target's mmap_lock
+//! (read), taken here per page; a page not present is faulted in with
+//! the lock released, then retried, until a fatal signal (EINTR). As
+//! Linux check_vma_flags: without force a non-readable or non-writable
+//! mapping is EFAULT; with force a read reaches any mapping and a write
+//! only a private (copy-on-write) one, whose page is then copied and
+//! stays read-only to the target if its mapping is.
 
 use core::sync::atomic::Ordering;
 
@@ -31,18 +38,35 @@ fn translate_with_root(page_table_root: u64, va: u64) -> Option<u64> {
     Aarch64PageTable::translate_with_root(page_table_root, va)
 }
 
-/// The VMA of `addr` in the target, which must allow `prot` (Linux
-/// access_remote_vm / get_user_pages_remote): a user address with a
-/// VMA, else EFAULT; no read or write permission: EPERM
-fn remote_vma(mm: &MmStruct, addr: u64, prot: u32) -> Result<&Vma, KernelError> {
+/// The VMA of `addr` in the target, if it may be accessed (Linux
+/// check_vma_flags): a user address with a VMA; without `force` the VMA
+/// must allow the access; a forced write needs a private mapping
+fn remote_vma(mm: &MmStruct, addr: u64, write: bool, force: bool) -> Result<&Vma, KernelError> {
     if addr >= crate::mm::TASK_SIZE {
         return Err(KernelError::BadAddress);
     }
     let vma = mm.find_vma(addr).ok_or(KernelError::BadAddress)?;
-    if vma.prot & prot == 0 {
-        return Err(KernelError::NotPermitted);
+    let ok = if write {
+        vma.prot & PROT_WRITE != 0 || (force && !vma.is_shared())
+    } else {
+        vma.prot & PROT_READ != 0 || force
+    };
+    if ok {
+        Ok(vma)
+    } else {
+        Err(KernelError::BadAddress)
     }
-    Ok(vma)
+}
+
+/// Fault page `addr` of `target` in, the mmap_lock not held (it takes
+/// it); EFAULT if it cannot be, EINTR on a fatal signal
+fn fault_in(target: &Mm, addr: u64, write: bool) -> Result<(), KernelError> {
+    use crate::mm::fault::{Access, handle_mm_fault};
+    if crate::signal::fatal_signal_pending() {
+        return Err(KernelError::Interrupted);
+    }
+    let access = if write { Access::Write } else { Access::Read };
+    handle_mm_fault(target, addr, access).map_err(|_| KernelError::BadAddress)
 }
 
 /// `phys` is in a frame of the allocator (a 4KB page, or a 2MB page by
@@ -63,22 +87,14 @@ fn short(done: usize, e: KernelError) -> Result<usize, KernelError> {
     if done > 0 { Ok(done) } else { Err(e) }
 }
 
-/// Read from a remote process's memory into a kernel buffer, page by
-/// page, each in a readable VMA of the user half
-///
-/// # Arguments
-/// * `target` - The target process's address space
-/// * `mm` - Its VMAs (`target`'s mmap_lock held, for reading is enough)
-/// * `remote_addr` - Virtual address in the target's address space
-/// * `buf` - Kernel buffer to read into
-///
-/// # Returns
-/// Number of bytes read, or error
+/// Read `buf.len()` bytes at `remote_addr` of `target` (Linux
+/// access_remote_vm, FOLL_FORCE with `force`): the bytes read, short at
+/// the first page that cannot be, else its error
 pub fn access_remote_vm_read(
     target: &Mm,
-    mm: &MmStruct,
     remote_addr: u64,
     buf: &mut [u8],
+    force: bool,
 ) -> Result<usize, KernelError> {
     if remote_addr.checked_add(buf.len() as u64).is_none() {
         return Err(KernelError::BadAddress);
@@ -86,37 +102,34 @@ pub fn access_remote_vm_read(
     let mut done = 0usize;
     while done < buf.len() {
         let addr = remote_addr + done as u64;
-        if let Err(e) = remote_vma(mm, addr, PROT_READ) {
-            return short(done, e);
-        }
         let chunk = page_chunk(addr, buf.len() - done);
-        let n = read_pages(target, addr, &mut buf[done..done + chunk])?;
+        let n = {
+            let map = target.mmap_read();
+            if let Err(e) = remote_vma(&map, addr, false, force) {
+                return short(done, e);
+            }
+            read_pages(target, addr, &mut buf[done..done + chunk])?
+        };
         if n == 0 {
-            // Not faulted in
-            return short(done, KernelError::BadAddress);
+            // Not present: fault it in and retry
+            if let Err(e) = fault_in(target, addr, false) {
+                return short(done, e);
+            }
+            continue;
         }
         done += n;
     }
     Ok(done)
 }
 
-/// Write from a kernel buffer to a remote process's memory, page by
-/// page, each in a writable VMA of the user half and backed by an
-/// ordinary frame (never MMIO: Linux refuses VM_IO/VM_PFNMAP)
-///
-/// # Arguments
-/// * `target` - The target process's address space
-/// * `mm` - Its VMAs (`target`'s mmap_lock held, for reading is enough)
-/// * `remote_addr` - Virtual address in the target's address space
-/// * `buf` - Kernel buffer to write from
-///
-/// # Returns
-/// Number of bytes written, or error
+/// Write `buf` at `remote_addr` of `target` (Linux access_remote_vm with
+/// FOLL_WRITE, FOLL_FORCE with `force`), into ordinary frames only
+/// (never MMIO: Linux refuses VM_IO/VM_PFNMAP)
 pub fn access_remote_vm_write(
     target: &Mm,
-    mm: &MmStruct,
     remote_addr: u64,
     buf: &[u8],
+    force: bool,
 ) -> Result<usize, KernelError> {
     if remote_addr.checked_add(buf.len() as u64).is_none() {
         return Err(KernelError::BadAddress);
@@ -124,17 +137,33 @@ pub fn access_remote_vm_write(
     let mut done = 0usize;
     while done < buf.len() {
         let addr = remote_addr + done as u64;
-        let vma = match remote_vma(mm, addr, PROT_WRITE) {
-            Ok(v) => v,
-            Err(e) => return short(done, e),
-        };
         let chunk = page_chunk(addr, buf.len() - done);
-        let n = match write_page(target, vma, addr, &buf[done..done + chunk]) {
-            Ok(0) => return short(done, KernelError::BadAddress),
-            Ok(n) => n,
-            Err(e) => return short(done, e),
+        let (r, writable) = {
+            let map = target.mmap_read();
+            let vma = match remote_vma(&map, addr, true, force) {
+                Ok(v) => v,
+                Err(e) => return short(done, e),
+            };
+            let r = write_page(target, vma, addr, &buf[done..done + chunk]);
+            (r, vma.prot & PROT_WRITE != 0)
         };
-        done += n;
+        match r {
+            Ok(Wrote::Done(n)) => done += n,
+            // Not present: a read fault brings in the page a forced
+            // write then copies
+            Ok(Wrote::Absent) => {
+                if let Err(e) = fault_in(target, addr, writable) {
+                    return short(done, e);
+                }
+            }
+            // A racing fault left a shared page: copy again
+            Ok(Wrote::Shared) => {
+                if crate::signal::fatal_signal_pending() {
+                    return short(done, KernelError::Interrupted);
+                }
+            }
+            Err(e) => return short(done, e),
+        }
     }
     Ok(done)
 }
@@ -148,7 +177,9 @@ fn with_frame<R>(mm: &Mm, addr: u64, f: impl FnOnce(u64) -> R) -> Option<R> {
     loop {
         if let Some(p) = paging::pte_ptr(pgd, addr) {
             let _l = pte_lock(p);
-            return translate_with_root(pgd, addr).map(f);
+            // SAFETY: `p` points into a live table; its lock is held
+            let pte = unsafe { core::sync::atomic::AtomicU64::from_ptr(p) }.load(Ordering::Acquire);
+            return frame_of(pte, addr).map(f);
         }
         // No 4KB table: a 2MB page or nothing, both stable under the
         // page_table_lock unless a split installed a table meanwhile
@@ -171,82 +202,84 @@ fn read_pages(mm: &Mm, addr: u64, buf: &mut [u8]) -> Result<usize, KernelError> 
     .unwrap_or(0))
 }
 
-/// Tries at a private page before giving up (each lost to a racing
-/// zap or fault that left a page the write may not reach)
-const COW_TRIES: u32 = 16;
-
-/// Write `buf` to page `addr` (within one page) of `vma` in `mm`; the
-/// bytes written, 0 if no ordinary frame maps it. A private page still
-/// shared copy-on-write gets its own copy first, and the write happens
-/// only if, under the PTE lock that keeps the frame, the entry still
-/// maps a page this mapping alone owns (Linux can_follow_write_pte,
-/// after CVE-2016-5195): a racing MADV_DONTNEED or fault may have put
-/// another page there, which is never written through; the copy is
-/// then broken again.
-fn write_page(mm: &Mm, vma: &Vma, addr: u64, buf: &[u8]) -> Result<usize, KernelError> {
-    if vma.is_shared() {
-        return Ok(write_frame(mm, addr, buf, false).unwrap_or(0));
-    }
-    for _ in 0..COW_TRIES {
-        crate::mm::fault::unshare_for_write(mm, addr, vma.anon_vma.clone(), vma.index_of(addr))
-            .map_err(|_| KernelError::OutOfMemory)?;
-        match write_frame(mm, addr, buf, true) {
-            Some(n) => return Ok(n),
-            None if paging::pte_ptr(mm.pgd(), addr).is_none_or(|p| !present(p)) => return Ok(0),
-            None => {}
-        }
-    }
-    Err(KernelError::BadAddress)
+/// What one page write did
+enum Wrote {
+    /// Bytes written
+    Done(usize),
+    /// No page mapped there: fault it in
+    Absent,
+    /// The private page is not yet this mapping's own: copy again
+    Shared,
 }
 
-/// The entry at `p` maps a page
-fn present(p: *mut u64) -> bool {
-    // SAFETY: `p` points into a live table of the locked mm
-    paging::pte_present(
-        unsafe { core::sync::atomic::AtomicU64::from_ptr(p) }.load(Ordering::Acquire),
-    )
+/// Write `buf` to page `addr` (within one page) of `vma` in `mm`. A
+/// private page still shared copy-on-write gets its own copy first
+/// (read-only if the mapping is), and the write happens only if, under
+/// the PTE lock that keeps the frame, the entry still maps a page this
+/// mapping alone owns (Linux can_follow_write_pte, after CVE-2016-5195):
+/// a racing MADV_DONTNEED or fault may have put another page there,
+/// which is never written through. A frame outside the allocator
+/// (MMIO) is EFAULT.
+fn write_page(mm: &Mm, vma: &Vma, addr: u64, buf: &[u8]) -> Result<Wrote, KernelError> {
+    if !vma.is_shared() {
+        crate::mm::fault::unshare_for_write(
+            mm,
+            addr,
+            vma.anon_vma.clone(),
+            vma.index_of(addr),
+            vma.prot,
+        )
+        .map_err(|_| KernelError::OutOfMemory)?;
+    }
+    write_frame(mm, addr, buf, !vma.is_shared())
+}
+
+/// The byte of page `addr` a 4KB entry maps, also when it is PROT_NONE
+/// (it keeps its frame; a forced access reaches it, Linux FOLL_FORCE)
+fn frame_of(pte: u64, addr: u64) -> Option<u64> {
+    let mapped = paging::pte_present(pte) || paging::pte_protnone(pte);
+    mapped.then(|| paging::pte_addr(pte) | (addr & (PAGE_SIZE - 1)))
 }
 
 /// A private 4KB entry `pte` maps a page this mapping alone owns:
 /// writable, or neither copy-on-write nor referenced elsewhere
 fn exclusive(pte: u64) -> bool {
-    paging::pte_present(pte)
-        && !paging::pte_protnone(pte)
+    (paging::pte_present(pte) || paging::pte_protnone(pte))
         && (paging::pte_write(pte)
             || (!paging::pte_cow(pte)
                 && crate::FRAME_ALLOCATOR.refcount(paging::pte_addr(pte)) == 1))
 }
 
-/// Copy `buf` to page `addr` if an ordinary frame maps it, under the
-/// entry's page-table lock; with `private`, only if the 4KB entry is
-/// `exclusive` (a 2MB page is never shared). Some(bytes written, 0 if
-/// unmapped or not ordinary); None if a private entry is not exclusive.
-fn write_frame(mm: &Mm, addr: u64, buf: &[u8], private: bool) -> Option<usize> {
+/// Copy `buf` to page `addr` under the entry's page-table lock; with
+/// `private`, only if the 4KB entry is `exclusive` (a 2MB page is never
+/// shared)
+fn write_frame(mm: &Mm, addr: u64, buf: &[u8], private: bool) -> Result<Wrote, KernelError> {
     let pgd = mm.pgd();
     if private && let Some(p) = paging::pte_ptr(pgd, addr) {
         let _l = pte_lock(p);
         // SAFETY: `p` points into a live table; its lock is held
         let pte = unsafe { core::sync::atomic::AtomicU64::from_ptr(p) }.load(Ordering::Acquire);
-        if !paging::pte_present(pte) {
-            return Some(0);
-        }
+        let Some(phys) = frame_of(pte, addr) else {
+            return Ok(Wrote::Absent);
+        };
         if !exclusive(pte) {
-            return None;
+            return Ok(Wrote::Shared);
         }
-        return Some(translate_with_root(pgd, addr).map_or(0, |phys| copy_to_frame(phys, buf)));
+        return copy_to_frame(phys, buf);
     }
-    Some(with_frame(mm, addr, |phys| copy_to_frame(phys, buf)).unwrap_or(0))
+    with_frame(mm, addr, |phys| copy_to_frame(phys, buf)).unwrap_or(Ok(Wrote::Absent))
 }
 
-/// Copy `buf` into the frame at `phys` (an ordinary frame only)
-fn copy_to_frame(phys: u64, buf: &[u8]) -> usize {
+/// Copy `buf` into the frame at `phys`: an ordinary frame only (Linux
+/// refuses VM_IO/VM_PFNMAP: EFAULT)
+fn copy_to_frame(phys: u64, buf: &[u8]) -> Result<Wrote, KernelError> {
     if !ordinary(phys) {
-        return 0;
+        return Err(KernelError::BadAddress);
     }
     let n = buf.len();
     // SAFETY: a mapped frame, kept by the held page-table lock
     unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), phys_to_virt(phys), n) };
     // It may be code (ptrace POKETEXT; Linux flush_ptrace_access)
     crate::arch::paging::sync_icache(phys, n);
-    n
+    Ok(Wrote::Done(n))
 }

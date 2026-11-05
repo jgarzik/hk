@@ -13,8 +13,8 @@
 
 use crate::arch::Uaccess;
 use crate::signal::{
-    SIGKILL, SIGSTOP, SigAction, SigSet, UNMASKABLE_SIGNALS, get_task_sighand, kill_pgrp,
-    send_signal, send_signal_to_process, with_task_signal_state,
+    SIGKILL, SIGSTOP, SigAction, SigSet, get_task_sighand, kill_pgrp, send_signal,
+    send_signal_to_process, with_task_signal_state,
 };
 use crate::task::percpu::{current_pgid, current_tid, get_all_pids};
 use crate::uaccess::{get_user, put_user};
@@ -60,7 +60,7 @@ impl From<UserSigAction> for SigAction {
             handler: user.sa_handler.into(),
             flags: user.sa_flags,
             restorer: user.sa_restorer,
-            mask: SigSet::from_bits(user.sa_mask),
+            mask: SigSet::from_bits(user.sa_mask).blockable(),
         }
     }
 }
@@ -199,7 +199,7 @@ pub fn sys_rt_sigprocmask(how: i32, set_ptr: u64, oset_ptr: u64, sigsetsize: u64
             }
 
             // Never allow blocking SIGKILL/SIGSTOP
-            state.blocked = state.blocked.subtract(&UNMASKABLE_SIGNALS);
+            state.blocked = state.blocked.blockable();
         }
         Ok(old)
     });
@@ -322,6 +322,40 @@ fn check_kill_permission(target_pid: u64, sig: u32) -> i32 {
     -1 // EPERM - permission denied
 }
 
+/// A user signal to the process `pid` names: the permission check, then
+/// the send (Linux group_send_sig_info). Every user-facing path goes
+/// through this or [`user_thread_send`], so none can forget the check.
+pub(crate) fn user_group_send(pid: u64, sig: u32) -> i32 {
+    let perm = check_kill_permission(pid, sig);
+    if perm != 0 {
+        return perm;
+    }
+    send_signal_to_process(pid, sig)
+}
+
+/// A user signal to one thread `tid`, which must be in group `tgid`
+/// if one is given (Linux do_send_specific; tkill gives none): ESRCH
+/// if it is not, then the same
+/// permission check as a process-wide signal, then the send.
+fn user_thread_send(tgid: Option<u64>, tid: u64, sig: u32) -> i32 {
+    use crate::task::percpu::TASKLIST;
+    if let Some(tgid) = tgid {
+        let in_group = TASKLIST
+            .read()
+            .get(tid)
+            .map(|t| t.task.pid == tgid)
+            .unwrap_or(false);
+        if !in_group {
+            return -3; // ESRCH
+        }
+    }
+    let perm = check_kill_permission(tid, sig);
+    if perm != 0 {
+        return perm;
+    }
+    send_signal(tid, sig)
+}
+
 /// kill(pid, sig) - send signal to process
 ///
 /// # Arguments
@@ -340,31 +374,37 @@ pub fn sys_kill(pid: i64, sig: u32) -> i64 {
     }
 
     if pid > 0 {
-        // Send to specific process - check permissions first
-        let perm = check_kill_permission(pid as u64, sig);
-        if perm != 0 {
-            return perm as i64;
-        }
-        send_signal_to_process(pid as u64, sig) as i64
+        user_group_send(pid as u64, sig) as i64
     } else if pid == 0 {
         // Every process in the caller's process group, once each
         kill_pgrp(current_pgid(), sig, |p| check_kill_permission(p, sig)) as i64
     } else if pid == -1 {
         // Send to all processes (except init)
         // Signal 0 is a validity check, don't actually send
-        if sig == 0 {
-            return 0;
-        }
-        let mut sent = false;
+        // Every process the caller may signal, except init and its own
+        // thread group (Linux kill_something_info): a per-target EPERM
+        // does not fail the call, and ESRCH only if nothing matched
+        let self_tgid = {
+            let table = crate::task::percpu::TASKLIST.read();
+            table.get(current_tid()).map(|t| t.task.pid).unwrap_or(0)
+        };
+        let mut matched = false;
         for target_pid in get_all_pids() {
-            if target_pid != 1 {
-                // Skip init (pid 1)
-                if send_signal_to_process(target_pid, sig) == 0 {
-                    sent = true;
+            if target_pid <= 1 || target_pid == self_tgid {
+                continue;
+            }
+            match check_kill_permission(target_pid, sig) {
+                0 => {
+                    matched = true;
+                    if sig != 0 {
+                        send_signal_to_process(target_pid, sig);
+                    }
                 }
+                -1 => matched = true, // permission denied, but it exists
+                _ => {}               // ESRCH: gone between listing and now
             }
         }
-        if sent { 0 } else { -3 } // ESRCH if no process was signaled
+        if matched { 0 } else { -3 }
     } else {
         // pid < -1: every process in group -pid, once each (signal 0:
         // does the group exist, may we signal it)
@@ -383,26 +423,11 @@ pub fn sys_kill(pid: i64, sig: u32) -> i64 {
 /// # Returns
 /// 0 on success, negative errno on error
 pub fn sys_tgkill(tgid: i64, tid: i64, sig: u32) -> i64 {
-    use crate::task::percpu::TASKLIST;
-
     if sig > 64 || tid <= 0 || tgid <= 0 {
         return -22; // EINVAL
     }
 
-    // Verify tid belongs to tgid (thread group validation)
-    let valid = {
-        let table = TASKLIST.read();
-        table
-            .get(tid as u64)
-            .map(|t| t.task.pid == tgid as u64)
-            .unwrap_or(false)
-    };
-
-    if !valid {
-        return -3; // ESRCH - thread not in specified thread group
-    }
-
-    send_signal(tid as u64, sig) as i64
+    user_thread_send(Some(tgid as u64), tid as u64, sig) as i64
 }
 
 /// tkill(tid, sig) - send signal to thread (deprecated)
@@ -413,8 +438,7 @@ pub fn sys_tkill(tid: i64, sig: u32) -> i64 {
     if sig > 64 || tid <= 0 {
         return -22; // EINVAL
     }
-
-    send_signal(tid as u64, sig) as i64
+    user_thread_send(None, tid as u64, sig) as i64
 }
 
 /// rt_sigqueueinfo(pid, sig, uinfo) - send signal with info to a process
@@ -452,8 +476,7 @@ pub fn sys_rt_sigqueueinfo(pid: i64, sig: u32, uinfo: u64) -> i64 {
         return -1; // EPERM
     }
 
-    // Send signal to process
-    send_signal_to_process(pid as u64, sig) as i64
+    user_group_send(pid as u64, sig) as i64
 }
 
 /// rt_tgsigqueueinfo(tgid, tid, sig, uinfo) - send signal with info to a thread
@@ -471,8 +494,6 @@ pub fn sys_rt_sigqueueinfo(pid: i64, sig: u32, uinfo: u64) -> i64 {
 /// * -ESRCH: No such process/thread
 /// * -EFAULT: Bad uinfo pointer
 pub fn sys_rt_tgsigqueueinfo(tgid: i64, tid: i64, sig: u32, uinfo: u64) -> i64 {
-    use crate::task::percpu::TASKLIST;
-
     // Validate arguments
     if tid <= 0 || tgid <= 0 {
         return -22; // EINVAL
@@ -495,21 +516,7 @@ pub fn sys_rt_tgsigqueueinfo(tgid: i64, tid: i64, sig: u32, uinfo: u64) -> i64 {
         return -1; // EPERM
     }
 
-    // Verify tid belongs to tgid (thread group validation)
-    let valid = {
-        let table = TASKLIST.read();
-        table
-            .get(tid as u64)
-            .map(|t| t.task.pid == tgid as u64)
-            .unwrap_or(false)
-    };
-
-    if !valid {
-        return -3; // ESRCH - thread not in specified thread group
-    }
-
-    // Send signal to specific thread
-    send_signal(tid as u64, sig) as i64
+    user_thread_send(Some(tgid as u64), tid as u64, sig) as i64
 }
 
 /// rt_sigsuspend(mask, sigsetsize) - wait for signal with temporary mask

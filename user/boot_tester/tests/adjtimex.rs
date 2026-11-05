@@ -21,6 +21,50 @@ pub fn run_tests() {
     test_adjtimex_set_errors();
     test_adjtimex_invalid_tick();
     test_adjtimex_offset();
+    test_adjtimex_freq_constant();
+}
+
+/// ADJ_FREQUENCY reads back (clamped at 500 ppm); ADJ_TIMECONST is
+/// clamped to 0..MAXTC with +4 in microsecond mode; errors clamp to
+/// NTP_PHASE_LIMIT (Linux process_adjtimex_modes)
+fn test_adjtimex_freq_constant() {
+    const ADJ_FREQUENCY: u32 = 0x0002;
+    const ADJ_TIMECONST: u32 = 0x0020;
+    const ADJ_MICRO: u32 = 0x1000;
+    const ADJ_NANO: u32 = 0x2000;
+    let set = |modes: u32, f: &dyn Fn(&mut Timex)| {
+        let mut t = Timex::default();
+        t.modes = modes;
+        f(&mut t);
+        sys_adjtimex(&mut t);
+        let mut r = Timex::default();
+        sys_adjtimex(&mut r);
+        r
+    };
+    let mut step = 0;
+    if set(ADJ_FREQUENCY, &|t| t.freq = 65536).freq != 65536 {
+        step = 1;
+    } else if set(ADJ_FREQUENCY, &|t| t.freq = 600 << 16).freq != 500 << 16 {
+        step = 2;
+    } else if set(ADJ_TIMECONST | ADJ_MICRO, &|t| t.constant = 3).constant != 7 {
+        step = 3;
+    } else if set(ADJ_TIMECONST | ADJ_MICRO, &|t| t.constant = 20).constant != 10 {
+        step = 4;
+    } else if set(ADJ_MAXERROR, &|t| t.maxerror = i64::MAX).maxerror != 16_000_000 {
+        step = 5;
+    }
+    // Restore: no frequency offset, Linux's default constant 2
+    set(ADJ_FREQUENCY, &|t| t.freq = 0);
+    set(ADJ_TIMECONST | ADJ_NANO, &|t| t.constant = 2);
+    set(ADJ_MICRO, &|_| {});
+    print(b"ADJTIMEX_FREQ_CONSTANT");
+    if step == 0 {
+        println(b":OK");
+    } else {
+        print(b":FAIL step ");
+        print_num(step);
+        println(b"");
+    }
 }
 
 /// Test adjtimex read-only query (modes=0)

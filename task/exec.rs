@@ -61,7 +61,11 @@ fn copy_string_from_user(ptr: u64, max_len: usize) -> Result<Vec<u8>, i32> {
 /// Copy a null-terminated array of string pointers from user space
 ///
 /// Returns a Vec of strings, or an error.
-fn copy_string_array_from_user(argv_ptr: u64, max_strings: usize) -> Result<Vec<Vec<u8>>, i32> {
+fn copy_string_array_from_user(
+    argv_ptr: u64,
+    max_strings: usize,
+    budget: &mut usize,
+) -> Result<Vec<Vec<u8>>, i32> {
     if argv_ptr == 0 {
         return Ok(Vec::new());
     }
@@ -74,15 +78,14 @@ fn copy_string_array_from_user(argv_ptr: u64, max_strings: usize) -> Result<Vec<
         if str_ptr == 0 {
             break;
         }
-        result.push(copy_string_from_user(str_ptr, PATH_MAX)?);
+        let s = copy_string_from_user(str_ptr, PATH_MAX)?;
+        // Charge against the combined argv+envp budget as we go (Linux
+        // copy_strings), so a huge list is E2BIG before it is all copied
+        *budget = budget.checked_sub(s.len() + 1).ok_or(E2BIG)?;
+        result.push(s);
     }
 
     Ok(result)
-}
-
-/// Calculate total size of argument/environment strings
-fn total_string_bytes(strings: &[Vec<u8>]) -> usize {
-    strings.iter().map(|s| s.len() + 1).sum() // +1 for null terminator
 }
 
 /// What the new image tells the program through the auxiliary vector
@@ -1009,6 +1012,19 @@ where
     // Now we need to update the current task and switch to the new address space
     // This is the point of no return
 
+    // The thread and process keyrings are not for the new image (Linux
+    // prepare_exec_creds)
+    crate::keys::keyring::exec_keyrings(percpu::current_tid());
+
+    // What the process registered before (an mq_notify) is not for the
+    // new image (Linux setup_new_exec: self_exec_id++); after de_thread
+    // the caller leads the process
+    if let Ok(nr) = u32::try_from(percpu::current_pid())
+        && let Some(p) = crate::task::pid::find_pid(&crate::ns::INIT_PID_NS, nr)
+    {
+        p.exec_done();
+    }
+
     // Linux begin_new_exec clears PF_FORKNOEXEC before it closes the
     // close-on-exec descriptors: whoever sees one of them close (EOF on
     // a pipe) sees the exec, and its setpgid is EACCES
@@ -1086,22 +1102,17 @@ pub fn sys_execve(pathname: u64, argv_ptr: u64, envp_ptr: u64) -> i64 {
     };
 
     // Copy argv from user space
-    let argv = match copy_string_array_from_user(argv_ptr, 1024) {
+    let mut budget = MAX_ARG_PAGES * PAGE_SIZE as usize;
+    let argv = match copy_string_array_from_user(argv_ptr, 1024, &mut budget) {
         Ok(a) => a,
         Err(e) => return -(e as i64),
     };
 
     // Copy envp from user space
-    let envp = match copy_string_array_from_user(envp_ptr, 1024) {
+    let envp = match copy_string_array_from_user(envp_ptr, 1024, &mut budget) {
         Ok(e) => e,
         Err(e) => return -(e as i64),
     };
-
-    // Check total size of arguments
-    let total_bytes = total_string_bytes(&argv) + total_string_bytes(&envp);
-    if total_bytes > MAX_ARG_PAGES * PAGE_SIZE as usize {
-        return -(E2BIG as i64);
-    }
 
     // Get frame allocator
     let mut frame_alloc = FrameAllocRef(&FRAME_ALLOCATOR);
@@ -1135,18 +1146,15 @@ pub fn sys_execveat(dirfd: i32, pathname: u64, argv_ptr: u64, envp_ptr: u64, fla
         Ok(p) => p,
         Err(e) => return e.sysret(),
     };
-    let argv = match copy_string_array_from_user(argv_ptr, 1024) {
+    let mut budget = MAX_ARG_PAGES * PAGE_SIZE as usize;
+    let argv = match copy_string_array_from_user(argv_ptr, 1024, &mut budget) {
         Ok(a) => a,
         Err(e) => return -(e as i64),
     };
-    let envp = match copy_string_array_from_user(envp_ptr, 1024) {
+    let envp = match copy_string_array_from_user(envp_ptr, 1024, &mut budget) {
         Ok(e) => e,
         Err(e) => return -(e as i64),
     };
-    let total_bytes = total_string_bytes(&argv) + total_string_bytes(&envp);
-    if total_bytes > MAX_ARG_PAGES * PAGE_SIZE as usize {
-        return -(E2BIG as i64);
-    }
     let name = exec_name(dirfd, &path);
     // Linux BINPRM_FLAGS_PATH_INACCESSIBLE: the program came through a
     // close-on-exec fd, so a script's interpreter could not open it

@@ -139,6 +139,19 @@ pub fn file_writev(
     })
 }
 
+/// Linux rw_verify_area: on a file with a position (regular, block
+/// device), `pos + count` must stay a valid offset (EINVAL)
+fn verify_area(file: &File, at: Option<u64>, count: usize) -> Result<(), KernelError> {
+    if !reads_fully(file) {
+        return Ok(());
+    }
+    let pos = at.unwrap_or_else(|| file.get_pos());
+    match pos.checked_add(count as u64) {
+        Some(end) if end <= i64::MAX as u64 => Ok(()),
+        _ => Err(KernelError::InvalidArgument),
+    }
+}
+
 /// errno for a failed read/write: no access is EBADF, a missing op is
 /// ESPIPE for positioned I/O and EINVAL otherwise (EOPNOTSUPP stays for
 /// RWF_NOWAIT)
@@ -164,6 +177,9 @@ pub fn do_readv(fd: i32, segs: &[IoVec], at: Option<u64>, flags: RwFlags) -> i64
         return KernelError::IsDirectory.sysret();
     }
     let _pos = at.is_none().then(|| file.pos_lock());
+    if let Err(e) = verify_area(&file, at, seg_len(segs)) {
+        return e.sysret();
+    }
     match file_readv(&file, segs, at, flags) {
         Ok(n) => n as i64,
         Err(e) => rw_err(e, at, flags),
@@ -188,6 +204,9 @@ pub fn do_writev(
         return KernelError::IsDirectory.sysret();
     }
     let _pos = at.is_none().then(|| file.pos_lock());
+    if let Err(e) = verify_area(&file, at, seg_len(segs)) {
+        return e.sysret();
+    }
     match file_writev(&file, segs, at, flags, append) {
         Ok(n) => n as i64,
         Err(e) => rw_err(e, at, flags),

@@ -173,6 +173,11 @@ impl OpenFds {
     }
 
     /// Whether `fd` is marked open
+    /// Descriptors the bitmap has room for (Linux fdtable->max_fds)
+    pub fn max_fds(&self) -> usize {
+        self.open.len() * 64
+    }
+
     pub fn test(&self, fd: usize) -> bool {
         self.open
             .get(fd / BITS)

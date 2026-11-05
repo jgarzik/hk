@@ -104,6 +104,15 @@ pub const KEY_NEED_LINK: u32 = 0x10;
 /// Need SETATTR permission
 pub const KEY_NEED_SETATTR: u32 = 0x20;
 
+/// Deepest a keyring search or reachability walk goes (Linux
+/// KEYRING_SEARCH_MAX_DEPTH): bounds recursion over nested keyrings
+pub(crate) const KEYRING_SEARCH_MAX_DEPTH: u32 = 6;
+
+/// Serializes linking keyrings into keyrings, from the cycle check to
+/// the link (Linux keyring_serialise_link_lock; sleeping, above
+/// `Key.keyring_keys`)
+static KEYRING_LINK: crate::sync::Mutex<()> = crate::sync::Mutex::new(());
+
 /// Key state enumeration
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
@@ -160,11 +169,20 @@ pub struct Key {
     /// State (uninstantiated, instantiated, revoked, dead)
     state: AtomicU32,
 
-    /// For keyrings: contained keys (by serial number)
-    keyring_keys: RwLock<Vec<KeySerial>>,
+    /// For keyrings: the linked keys (Linux keyring links hold a
+    /// reference: a key lives while linked or otherwise referenced, and
+    /// is freed with the last; cycle checks keep links acyclic). An
+    /// unlinked key is dropped after the lock is released.
+    keyring_keys: RwLock<Vec<Arc<Key>>>,
 
     /// Key type reference for polymorphic operations
     key_type: Arc<dyn KeyType>,
+
+    /// The user charged for this key and the bytes charged (Linux
+    /// key_user quota). 0 bytes: not charged (internal keys). Set once
+    /// at creation, returned in `Drop`.
+    quota_uid: AtomicU32,
+    quota_bytes: core::sync::atomic::AtomicUsize,
 }
 
 impl Key {
@@ -188,7 +206,16 @@ impl Key {
             state: AtomicU32::new(KeyState::Uninstantiated as u32),
             keyring_keys: RwLock::new(Vec::new()),
             key_type,
+            quota_uid: AtomicU32::new(0),
+            quota_bytes: core::sync::atomic::AtomicUsize::new(0),
         })
+    }
+
+    /// Record that `bytes` were charged to `uid`'s key quota, so the
+    /// charge is returned when the key is freed
+    pub fn set_quota(&self, uid: u32, bytes: usize) {
+        self.quota_uid.store(uid, Ordering::Relaxed);
+        self.quota_bytes.store(bytes, Ordering::Relaxed);
     }
 
     /// Give an uninstantiated key its payload (Linux
@@ -214,6 +241,15 @@ impl Key {
         match self.state() {
             KeyState::Revoked | KeyState::Dead => return Err(KernelError::KeyRevoked),
             _ => {}
+        }
+        // The charge follows the payload's size (Linux user_update ->
+        // key_payload_reserve: EDQUOT)
+        let old = self.quota_bytes.load(Ordering::Relaxed);
+        if old > 0 {
+            let new = self.description.len() + 1 + data.len();
+            super::key_user_resize(self.quota_uid.load(Ordering::Relaxed), old, new)
+                .map_err(|_| KernelError::QuotaExceeded)?;
+            self.quota_bytes.store(new, Ordering::Relaxed);
         }
         *payload = Some(data);
         self.state
@@ -305,20 +341,48 @@ impl Key {
     }
 
     /// Whether `serial` is this keyring or reachable from it through
-    /// nested keyrings, at most `depth` levels (Linux
-    /// KEYRING_SEARCH_MAX_DEPTH)
-    pub fn keyring_reaches(&self, serial: KeySerial, depth: u32) -> bool {
+    /// nested keyrings, at most `depth` levels down; deeper keyrings are
+    /// not searched (possession, Linux search_process_keyrings)
+    pub(crate) fn keyring_reaches(&self, serial: KeySerial, depth: u32) -> bool {
+        self.reaches(serial, depth, false).unwrap_or(false)
+    }
+
+    /// As `keyring_reaches`, but a keyring past `depth` is ELOOP when
+    /// `too_deep` (Linux KEYRING_SEARCH_DETECT_TOO_DEEP). Each keyring's
+    /// own links are matched before any nested keyring is entered, as
+    /// Linux search_nested_keyrings does.
+    fn reaches(&self, serial: KeySerial, depth: u32, too_deep: bool) -> Result<bool, KernelError> {
         if self.serial == serial {
-            return true;
+            return Ok(true);
         }
-        if !self.is_keyring() || depth == 0 {
-            return false;
+        if !self.is_keyring() {
+            return Ok(false);
         }
-        let keys = self.keyring_keys.read().clone();
-        keys.into_iter().any(|s| {
-            s == serial
-                || super::lookup_key(s).is_some_and(|k| k.keyring_reaches(serial, depth - 1))
-        })
+        let links = self.links();
+        if links.iter().any(|k| k.serial == serial) {
+            return Ok(true);
+        }
+        for k in links.iter().filter(|k| k.is_keyring()) {
+            if depth == 0 {
+                if too_deep {
+                    return Err(KernelError::TooManySymlinks);
+                }
+                continue;
+            }
+            if k.reaches(serial, depth - 1, too_deep)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// The live keys linked in this keyring
+    pub(crate) fn links(&self) -> Vec<Arc<Key>> {
+        let keys = self.keyring_keys.read();
+        keys.iter()
+            .filter(|k| k.state() != KeyState::Dead)
+            .cloned()
+            .collect()
     }
 
     /// Get the permission mask
@@ -349,110 +413,147 @@ impl Key {
     // Keyring-specific operations
     // ==========================================================================
 
-    /// Add a key to this keyring (if this is a keyring)
-    pub fn keyring_add(&self, key_serial: KeySerial) -> Result<(), i64> {
+    /// Link `key` into this keyring (if this is a keyring)
+    pub fn keyring_add(&self, key: &Arc<Key>) -> Result<(), i64> {
         if !self.is_keyring() {
             return Err(KernelError::NotDirectory.sysret());
         }
 
-        let mut keys = self.keyring_keys.write();
-
-        // Check if already linked
-        if keys.contains(&key_serial) {
-            return Ok(()); // Already linked, success
+        if key.serial == self.serial {
+            return Err(KernelError::Deadlock.sysret());
+        }
+        // A keyring may not be linked into one it already reaches (Linux
+        // keyring_detect_cycle: EDEADLK; past the search depth ELOOP), or
+        // a search would recurse without end and the links would hold
+        // each other. Links of keyrings are serialized from the check to
+        // the link (Linux keyring_serialise_link_lock), else two links in
+        // opposite directions could both pass the check.
+        let _serial = key.is_keyring().then(|| KEYRING_LINK.lock());
+        if key.is_keyring() {
+            match key.reaches(self.serial, KEYRING_SEARCH_MAX_DEPTH, true) {
+                Ok(false) => {}
+                Ok(true) => return Err(KernelError::Deadlock.sysret()),
+                Err(e) => return Err(e.sysret()),
+            }
         }
 
-        keys.push(key_serial);
+        let mut keys = self.keyring_keys.write();
+        if keys.iter().any(|k| k.serial == key.serial) {
+            return Ok(()); // Already linked, success
+        }
+        keys.try_reserve(1)
+            .map_err(|_| KernelError::OutOfMemory.sysret())?;
+        keys.push(key.clone());
         Ok(())
     }
 
-    /// Remove a key from this keyring
+    /// Unlink the key `key_serial` from this keyring
     pub fn keyring_remove(&self, key_serial: KeySerial) -> Result<(), i64> {
         if !self.is_keyring() {
             return Err(KernelError::NotDirectory.sysret());
         }
-
-        let mut keys = self.keyring_keys.write();
-        if let Some(pos) = keys.iter().position(|&s| s == key_serial) {
-            keys.remove(pos);
-            Ok(())
-        } else {
-            Err(KernelError::NotFound.sysret())
+        let gone = {
+            let mut keys = self.keyring_keys.write();
+            let pos = keys.iter().position(|k| k.serial == key_serial);
+            pos.map(|i| keys.remove(i))
+        };
+        // The link's reference goes after the lock (it may be the last)
+        match gone {
+            Some(k) => {
+                drop(k);
+                Ok(())
+            }
+            None => Err(KernelError::NotFound.sysret()),
         }
     }
 
-    /// Clear all keys from this keyring
+    /// Unlink every key from this keyring
     pub fn keyring_clear(&self) -> Result<(), i64> {
         if !self.is_keyring() {
             return Err(KernelError::NotDirectory.sysret());
         }
-
-        self.keyring_keys.write().clear();
+        let gone = core::mem::take(&mut *self.keyring_keys.write());
+        drop(gone);
         Ok(())
     }
 
-    /// Get the list of key serials in this keyring
+    /// The serials of the live keys in this keyring
     pub fn keyring_keys(&self) -> Vec<KeySerial> {
-        self.keyring_keys.read().clone()
+        self.links().iter().map(|k| k.serial).collect()
     }
 
     /// Get the number of keys in this keyring
     pub fn keyring_count(&self) -> usize {
-        self.keyring_keys.read().len()
+        self.links().len()
     }
 
-    /// Search this keyring for a key by type and description
-    pub fn keyring_search(&self, type_name: &str, description: &str) -> Option<KeySerial> {
+    /// A matching key directly in this keyring
+    pub fn keyring_search(&self, type_name: &str, description: &str) -> Option<Arc<Key>> {
         if !self.is_keyring() {
             return None;
         }
-
-        let keys = self.keyring_keys.read();
-        for &serial in keys.iter() {
-            if let Some(key) = super::lookup_key(serial)
-                && key.type_name == type_name
-                && key.description == description
-                && key.is_instantiated()
-                && !key.is_revoked()
-            {
-                return Some(serial);
-            }
-        }
-        None
+        self.links()
+            .into_iter()
+            .find(|k| k.matches(type_name, description))
     }
 
-    /// Recursively search this keyring and all nested keyrings
+    /// An instantiated, unrevoked key of this type and description
+    fn matches(&self, type_name: &str, description: &str) -> bool {
+        self.type_name == type_name
+            && self.description == description
+            && self.is_instantiated()
+            && !self.is_revoked()
+    }
+
+    /// Recursively search this keyring and the nested keyrings the
+    /// caller may search (Linux search_nested_keyrings): a nested keyring
+    /// or a match without SEARCH permission is skipped; ENOKEY if nothing
+    /// is found, EACCES if only skipped keys matched
     pub fn keyring_search_recursive(
         &self,
         type_name: &str,
         description: &str,
-    ) -> Option<KeySerial> {
+    ) -> Result<Arc<Key>, KernelError> {
+        let mut denied = false;
+        self.search_depth(
+            type_name,
+            description,
+            KEYRING_SEARCH_MAX_DEPTH,
+            &mut denied,
+        )
+        .ok_or(if denied {
+            KernelError::PermissionDenied
+        } else {
+            KernelError::NoKey
+        })
+    }
+
+    /// At most `depth` nested keyrings deep (Linux KEYRING_SEARCH_MAX_DEPTH);
+    /// a keyring's own keys before its nested keyrings
+    fn search_depth(
+        &self,
+        type_name: &str,
+        description: &str,
+        depth: u32,
+        denied: &mut bool,
+    ) -> Option<Arc<Key>> {
         if !self.is_keyring() {
             return None;
         }
-
-        // Clone the keys while holding the lock, then release before recursion
-        let keys = self.keyring_keys.read().clone();
-
-        for serial in keys {
-            if let Some(key) = super::lookup_key(serial) {
-                // Check if this key matches
-                if key.type_name == type_name
-                    && key.description == description
-                    && key.is_instantiated()
-                    && !key.is_revoked()
-                {
-                    return Some(serial);
-                }
-                // Recursively search nested keyrings
-                if key.is_keyring()
-                    && let Some(found) = key.keyring_search_recursive(type_name, description)
-                {
-                    return Some(found);
-                }
+        let links = self.links();
+        for key in links.iter().filter(|k| k.matches(type_name, description)) {
+            if check_key_permission(key, KEY_NEED_SEARCH) {
+                return Some(key.clone());
             }
+            *denied = true;
         }
-        None
+        if depth == 0 {
+            return None;
+        }
+        links
+            .iter()
+            .filter(|k| k.is_keyring() && check_key_permission(k, KEY_NEED_SEARCH))
+            .find_map(|k| k.search_depth(type_name, description, depth - 1, denied))
     }
 }
 
@@ -488,3 +589,45 @@ pub const KEY_DEFAULT_PERM: KeyPerm = KEY_POS_ALL | KEY_USR_ALL;
 
 /// Default permissions for new keyrings
 pub const KEYRING_DEFAULT_PERM: KeyPerm = KEY_POS_ALL | KEY_USR_ALL | KEY_USR_SEARCH;
+
+impl Drop for Key {
+    /// The last link and reference went (Linux key_put -> key GC): the
+    /// key leaves the registry and its quota charge is returned
+    fn drop(&mut self) {
+        // The keyrings this one alone held are freed here in a loop, not
+        // by nested drops (a chain of linked keyrings may be as deep as
+        // the key quota allows: Linux's key GC is iterative too)
+        let mut stack = core::mem::take(self.keyring_keys.get_mut());
+        while let Some(k) = stack.pop() {
+            if let Some(mut key) = Arc::into_inner(k) {
+                stack.append(key.keyring_keys.get_mut());
+            }
+        }
+        super::unregister_key(self.serial, self as *const Key);
+        let bytes = self.quota_bytes.load(Ordering::Relaxed);
+        if bytes > 0 {
+            super::key_user_uncharge(self.quota_uid.load(Ordering::Relaxed), bytes);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A chain of linked keyrings deeper than any stack drops in a loop
+    #[test]
+    fn deep_keyring_chain_drops() {
+        let ty = super::super::types::keyring_key_type();
+        let make = |n: i32| Key::new(n, ty.clone(), alloc::string::String::from("k"), 0, 0, 0);
+        let top = make(1);
+        let mut cur = top.clone();
+        for n in 2..200_000 {
+            let next = make(n);
+            cur.keyring_keys.write().push(next.clone());
+            cur = next;
+        }
+        drop(cur);
+        drop(top);
+    }
+}

@@ -3,9 +3,15 @@
 //! Before the page allocator exists, allocations come from a small
 //! static boot arena (a first-fit linked-list allocator in the kernel
 //! image's bss); from then on from the slab allocator (`mm::slab`
-//! kmalloc). Memory is freed to whichever gave it (the arena by
-//! address). The arena's lock is an `IrqSpinlock` leaf, like the slab
-//! locks, so the heap is IRQ-safe.
+//! kmalloc), falling back as Linux kvmalloc does to `mm::vmalloc` for
+//! what the slab cannot serve: a block larger than its biggest page
+//! order, or a multi-page one it found no contiguous pages for. The
+//! fallback needs a context that may sleep; an atomic caller gets the
+//! slab's failure. Memory is freed to whichever gave it (by address).
+//! The arena's lock is an `IrqSpinlock` leaf, like the slab locks, so
+//! the heap is IRQ-safe; vmalloc frees from interrupts are deferred.
+//! A vmalloc block is not physically contiguous: heap memory handed to
+//! a device must come from the DMA API (`hw::dma` asserts).
 #![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use crate::arch::IrqSpinlock;
@@ -251,10 +257,29 @@ impl Default for KernelAlloc {
     }
 }
 
+/// Largest block the slab serves (its biggest page order)
+const SLAB_MAX: usize = 4096 << crate::mm::page_alloc::MAX_ORDER;
+
+/// kvmalloc: the slab, else vmalloc for a block it cannot serve
+fn kvmalloc(layout: Layout) -> *mut u8 {
+    let (size, align) = (layout.size(), layout.align());
+    if size <= SLAB_MAX {
+        let p = crate::mm::slab::kmalloc(size, align);
+        // One page or less: vmalloc could not do better
+        if !p.is_null() || size <= 4096 {
+            return p;
+        }
+    }
+    if align > 4096 {
+        return core::ptr::null_mut();
+    }
+    crate::mm::vmalloc::alloc(size)
+}
+
 unsafe impl GlobalAlloc for KernelAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         if self.slab.load(core::sync::atomic::Ordering::Acquire) {
-            crate::mm::slab::kmalloc(layout.size(), layout.align())
+            kvmalloc(layout)
         } else {
             unsafe { self.arena().alloc(layout) }
         }
@@ -263,14 +288,20 @@ unsafe impl GlobalAlloc for KernelAlloc {
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         if in_arena(ptr) {
             unsafe { self.arena.dealloc(ptr, layout) };
+        } else if crate::mm::vmalloc::contains(ptr as u64) {
+            crate::mm::vmalloc::free(ptr, layout.size());
         } else {
             crate::mm::slab::kfree(ptr, layout.size(), layout.align());
         }
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new: usize) -> *mut u8 {
-        let slab = !in_arena(ptr);
-        if slab && crate::mm::slab::fits(layout.size(), new, layout.align()) {
+        if crate::mm::vmalloc::contains(ptr as u64) {
+            // Same pages: in place
+            if layout.size().div_ceil(4096) == new.div_ceil(4096) {
+                return ptr;
+            }
+        } else if !in_arena(ptr) && crate::mm::slab::fits(layout.size(), new, layout.align()) {
             return ptr;
         }
         // SAFETY: as GlobalAlloc::realloc requires of the caller

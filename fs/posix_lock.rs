@@ -299,38 +299,52 @@ impl InodeLocks {
 /// Returns (start, end) where end is exclusive. EOF is represented as u64::MAX.
 fn resolve_range(flock: &Flock, file: &File) -> Result<(u64, u64), KernelError> {
     let inode = file.get_inode().ok_or(KernelError::BadFd)?;
-    let file_size = inode.get_size();
-
     let base = match flock.l_whence as i32 {
         seek::SEEK_SET => 0i64,
         seek::SEEK_CUR => file.get_pos() as i64,
-        seek::SEEK_END => file_size as i64,
+        seek::SEEK_END => inode.get_size() as i64,
         _ => return Err(KernelError::InvalidArgument),
     };
+    lock_range(base, flock.l_start, flock.l_len)
+}
 
-    let start = base
-        .checked_add(flock.l_start)
-        .ok_or(KernelError::InvalidArgument)?;
-
+/// The byte range [start, end) of a lock at `base + l_start` of
+/// `l_len` bytes (Linux flock64_to_posix_lock, whose end is inclusive
+/// and OFFSET_MAX = LLONG_MAX means "to EOF"; here end is exclusive and
+/// u64::MAX means EOF): past OFFSET_MAX is EOVERFLOW, below 0 EINVAL
+fn lock_range(base: i64, l_start: i64, l_len: i64) -> Result<(u64, u64), KernelError> {
+    const OFFSET_MAX: i64 = i64::MAX;
+    if l_start > OFFSET_MAX - base {
+        return Err(KernelError::Overflow);
+    }
+    // base >= 0: no overflow below
+    let start = base + l_start;
     if start < 0 {
         return Err(KernelError::InvalidArgument);
     }
-
-    let start = start as u64;
-    let end = if flock.l_len == 0 {
-        u64::MAX // To EOF
-    } else if flock.l_len > 0 {
-        start
-            .checked_add(flock.l_len as u64)
-            .ok_or(KernelError::InvalidArgument)?
-    } else {
-        // Negative length: lock bytes before start
-        let len = (-flock.l_len) as u64;
-        let new_start = start.checked_sub(len).ok_or(KernelError::InvalidArgument)?;
-        return Ok((new_start, start));
-    };
-
-    Ok((start, end))
+    match l_len {
+        0 => Ok((start as u64, u64::MAX)),
+        len if len > 0 => {
+            if len - 1 > OFFSET_MAX - start {
+                return Err(KernelError::Overflow);
+            }
+            // Last byte start + len - 1; ending at OFFSET_MAX is "to EOF"
+            let last = start + (len - 1);
+            let end = if last == OFFSET_MAX {
+                u64::MAX
+            } else {
+                last as u64 + 1
+            };
+            Ok((start as u64, end))
+        }
+        len => {
+            // Bytes before start (start >= 0 and len < 0: no overflow)
+            if start + len < 0 {
+                return Err(KernelError::InvalidArgument);
+            }
+            Ok(((start + len) as u64, start as u64))
+        }
+    }
 }
 
 // =============================================================================
@@ -464,5 +478,30 @@ pub fn release_all_posix_locks_for_pid(pid: u64) {
         inode
             .i_flctx
             .with(|l| ((), l.posix.remove_all_for_pid(pid)));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lock_ranges() {
+        let r = lock_range;
+        assert_eq!(r(0, 10, 5), Ok((10, 15)));
+        assert_eq!(r(0, 10, 0), Ok((10, u64::MAX)));
+        assert_eq!(r(0, 10, -4), Ok((6, 10)));
+        // Negative lengths and starts below 0
+        assert_eq!(r(0, 3, -4), Err(KernelError::InvalidArgument));
+        assert_eq!(r(0, 3, i64::MIN), Err(KernelError::InvalidArgument));
+        assert_eq!(r(0, -1, 1), Err(KernelError::InvalidArgument));
+        assert_eq!(r(100, -50, 0), Ok((50, u64::MAX)));
+        // Past OFFSET_MAX
+        assert_eq!(r(1, i64::MAX, 1), Err(KernelError::Overflow));
+        assert_eq!(r(0, i64::MAX, 2), Err(KernelError::Overflow));
+        assert_eq!(r(0, 2, i64::MAX), Err(KernelError::Overflow));
+        assert_eq!(r(0, 1, i64::MAX), Ok((1, u64::MAX)));
+        // Ending exactly at OFFSET_MAX is the same as "to EOF"
+        assert_eq!(r(0, i64::MAX, 1), Ok((i64::MAX as u64, u64::MAX)));
     }
 }

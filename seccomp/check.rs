@@ -77,6 +77,9 @@ pub fn check_syscall(
             let Some(filter) = filter else {
                 return Verdict::Allow;
             };
+            if filter.cache_allows(nr) {
+                return Verdict::Allow;
+            }
             let data = SeccompData {
                 nr: nr as i32,
                 arch: current_audit_arch(),

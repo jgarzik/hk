@@ -4,8 +4,8 @@
 //! The identity for file system checks is the caller's fsuid/fsgid; there
 //! is no uid 0 bypass: privilege comes only from effective capabilities
 //! (CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH, CAP_FOWNER, CAP_CHOWN,
-//! CAP_FSETID). hk has no supplementary groups, so group membership is
-//! the fsgid alone.
+//! CAP_FSETID). Group membership is the fsgid or a supplementary group
+//! (Linux in_group_p).
 //!
 //! Kernel-internal lookups and opens (boot, init exec) run with the root
 //! credentials of the boot context and so pass every check here.

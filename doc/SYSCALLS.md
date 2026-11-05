@@ -491,7 +491,7 @@ goes down later.
 
 10.4 Misc security / sandboxing
 
-- [x] seccomp (SECCOMP_SET_MODE_STRICT, SECCOMP_SET_MODE_FILTER (classic BPF, run as eBPF; FLAG_LOG, FLAG_TSYNC), SECCOMP_GET_ACTION_AVAIL; actions ALLOW, LOG, ERRNO, TRAP, KILL_THREAD, KILL_PROCESS; TRACE and USER_NOTIF are ENOSYS)
+- [x] seccomp (SECCOMP_SET_MODE_STRICT, SECCOMP_SET_MODE_FILTER (classic BPF, run as eBPF; FLAG_LOG, FLAG_TSYNC), SECCOMP_GET_ACTION_AVAIL; Linux's action cache; actions ALLOW, LOG, ERRNO, TRAP, KILL_THREAD, KILL_PROCESS; TRACE and USER_NOTIF are ENOSYS)
 - [x] prctl (PR_SET/GET_NAME, PR_SET/GET_PDEATHSIG, PR_SET/GET_DUMPABLE, PR_SET/GET_NO_NEW_PRIVS, PR_SET/GET_TIMERSLACK, PR_SET/GET_SECCOMP, PR_SET/GET_KEEPCAPS, PR_SET/GET_CHILD_SUBREAPER, PR_SET/GET_THP_DISABLE, PR_SET/GET_TSC [x86-64])
 - [x] mlock / mlockall (already listed under memory)
 
@@ -536,7 +536,7 @@ There are very few direct "cgroup_*" syscalls; the cgroup v1/v2 APIs are primari
 
 - [x] ptrace (TRACEME, ATTACH, SEIZE, DETACH, PEEKTEXT/PEEKDATA, POKETEXT/POKEDATA, GETREGS, SETREGS, CONT, SYSCALL, SINGLESTEP, KILL, SETOPTIONS, GETEVENTMSG)
 - [x] perf_event_open (stub, returns -EOPNOTSUPP)
-- [x] bpf (BPF_MAP_CREATE, BPF_MAP_LOOKUP/UPDATE/DELETE_ELEM, BPF_MAP_GET_NEXT_KEY, BPF_PROG_LOAD, BPF_OBJ_GET_INFO_BY_FD; map types: HASH, ARRAY; program type: SOCKET_FILTER)
+- [x] bpf (BPF_MAP_CREATE, BPF_MAP_LOOKUP/UPDATE/DELETE_ELEM, BPF_MAP_GET_NEXT_KEY, BPF_PROG_LOAD, BPF_OBJ_GET_INFO_BY_FD; map types: HASH, ARRAY; program type: SOCKET_FILTER, verified but not attachable; CAP_BPF or CAP_SYS_ADMIN unless kernel.unprivileged_bpf_disabled is 0, default 2)
 - [x] membarrier
 - [x] kcmp (compare processes)
 - [x] process_vm_readv

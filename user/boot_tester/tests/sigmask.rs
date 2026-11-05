@@ -53,6 +53,40 @@ pub fn run_tests() {
     test_epoll_pwait_restore();
     test_ppoll_restore();
     test_sigsuspend_restore();
+    test_sigkill_unblockable();
+}
+
+/// SIGKILL and SIGSTOP can never be blocked, even through a handler's
+/// sa_mask (Linux strips them in do_sigaction, and again when the mask
+/// is applied at delivery). Install a handler whose sa_mask names every
+/// signal, run it, and confirm those two bits are clear in the mask it
+/// ran under.
+fn test_sigkill_unblockable() {
+    const T: &[u8] = b"SIGKILL_UNBLOCKABLE";
+    const SIGKILL: u32 = 9;
+    const SIGSTOP: u32 = 19;
+    unsafe {
+        core::ptr::write_volatile(&raw mut HANDLED, 0);
+        core::ptr::write_volatile(&raw mut HANDLER_MASK, 0);
+    }
+    let act = SigAct {
+        handler: handler as *const () as u64,
+        flags: SA_SIGINFO | SA_RESTORER,
+        restorer: restorer_addr(),
+        mask: u64::MAX, // ask to block everything, including KILL/STOP
+    };
+    sys_rt_sigaction(SIGUSR1, &act as *const SigAct as u64, 0, 8);
+    raise(SIGUSR1);
+    let m = handler_mask();
+    uncatch();
+    let bad = (1u64 << (SIGKILL - 1)) | (1u64 << (SIGSTOP - 1));
+    if handled() & (1 << (SIGUSR1 - 1)) == 0 {
+        fail(T, b"handler did not run", 0);
+    } else if m & bad != 0 {
+        fail(T, b"KILL/STOP blocked, mask ", m as i64);
+    } else {
+        println(b"SIGKILL_UNBLOCKABLE:OK");
+    }
 }
 
 fn handled() -> u64 {

@@ -517,7 +517,8 @@ pub fn sys_rt_sigreturn() -> i64 {
     // Restore blocked signal mask
     let tid = crate::task::percpu::current_tid();
     crate::signal::with_task_signal_state(tid, |state| {
-        state.blocked = sigmask;
+        // SIGKILL/SIGSTOP can never be blocked, even via a crafted frame
+        state.blocked = sigmask.blockable();
     });
 
     // Everything goes back into the pt_regs the syscall returns through

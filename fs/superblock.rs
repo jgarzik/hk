@@ -323,6 +323,10 @@ pub struct SuperBlock {
     /// Unique device ID for this filesystem instance (for stat st_dev)
     pub dev_id: u64,
 
+    /// Largest file size (Linux s_maxbytes): writes are cut short at it,
+    /// growing past it is EFBIG. Set by the filesystem at mount.
+    s_maxbytes: AtomicU64,
+
     /// Filesystem-specific private data
     pub private: RwLock<Option<Arc<dyn SuperBlockData>>>,
 
@@ -350,6 +354,10 @@ pub struct SuperBlock {
 }
 
 use super::inode::AsAny;
+
+/// Largest file offset on a 64-bit kernel (Linux MAX_LFS_FILESIZE,
+/// LLONG_MAX): the default `s_maxbytes`
+pub const MAX_LFS_FILESIZE: u64 = i64::MAX as u64;
 
 /// Trait for filesystem-specific superblock data
 pub trait SuperBlockData: Send + Sync + AsAny {}
@@ -386,6 +394,7 @@ impl SuperBlock {
             s_mounts: crate::sync::spin::Mutex::new(alloc::vec::Vec::new()),
             next_ino: AtomicU64::new(1), // Start inode numbers at 1
             dev_id: NEXT_DEV_ID.fetch_add(1, Ordering::Relaxed),
+            s_maxbytes: AtomicU64::new(MAX_LFS_FILESIZE),
             private: RwLock::new(None),
             s_bdev: spin::Once::new(),
             s_dirty: crate::sync::spin::Mutex::new(alloc::vec::Vec::new()),
@@ -398,6 +407,16 @@ impl SuperBlock {
         all.push(Arc::downgrade(&sb));
         drop(all);
         sb
+    }
+
+    /// Largest file size on this filesystem (Linux s_maxbytes)
+    pub fn maxbytes(&self) -> u64 {
+        self.s_maxbytes.load(Ordering::Relaxed)
+    }
+
+    /// Set the largest file size (at mount)
+    pub fn set_maxbytes(&self, max: u64) {
+        self.s_maxbytes.store(max, Ordering::Relaxed);
     }
 
     /// True if mounted read-only (Linux sb_rdonly)

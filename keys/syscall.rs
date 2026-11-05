@@ -5,8 +5,6 @@
 //! - request_key: Search for a key, optionally requesting construction
 //! - keyctl: Multiplex control operations on keys
 
-use alloc::vec;
-
 use crate::arch::Uaccess;
 use crate::task::percpu;
 use crate::uaccess::{copy_from_user, strncpy_from_user_str};
@@ -15,7 +13,7 @@ use crate::util::error::KernelError;
 use super::key::{KEY_DEFAULT_PERM, Key};
 use super::keyring::{keyring_link, resolve_special_keyring, search_process_keyrings};
 use super::types::get_key_type;
-use super::{alloc_serial, register_key, remove_key};
+use super::{alloc_serial, register_key};
 
 /// Maximum type name length
 const MAX_TYPE_LEN: usize = 256;
@@ -65,7 +63,10 @@ pub fn sys_add_key(type_ptr: u64, desc_ptr: u64, payload_ptr: u64, plen: u64, ke
 
     // Copy payload from userspace (if any)
     let payload = if plen > 0 && payload_ptr != 0 {
-        let mut buf = vec![0u8; plen as usize];
+        let mut buf = match crate::util::kmem::try_vec(plen as usize, 0u8) {
+            Ok(b) => b,
+            Err(e) => return e.sysret(),
+        };
         if copy_from_user::<Uaccess>(&mut buf, payload_ptr, plen as usize).is_err() {
             return KernelError::BadAddress.sysret();
         }
@@ -91,6 +92,18 @@ pub fn sys_add_key(type_ptr: u64, desc_ptr: u64, payload_ptr: u64, plen: u64, ke
         return KernelError::NotDirectory.sysret();
     }
 
+    // WRITE on the destination keyring (Linux key_create_or_update ->
+    // lookup_user_key KEY_NEED_WRITE)
+    if !super::key::check_key_permission(&dest_keyring, super::key::KEY_NEED_WRITE) {
+        return KernelError::PermissionDenied.sysret();
+    }
+
+    // Charge the user's key quota (Linux key_alloc), EDQUOT past it
+    let charge = description.len() + 1 + payload.len();
+    if let Err(e) = super::key_user_charge(cred.fsuid, charge) {
+        return e;
+    }
+
     // Allocate new key
     let serial = alloc_serial();
     // Owned by the fsuid and fsgid (Linux key_create_or_update ->
@@ -103,6 +116,8 @@ pub fn sys_add_key(type_ptr: u64, desc_ptr: u64, payload_ptr: u64, plen: u64, ke
         cred.fsgid,
         KEY_DEFAULT_PERM,
     );
+    // Record the charge so a later failure (or invalidate) returns it
+    key.set_quota(cred.fsuid, charge);
 
     // Instantiate the key with payload
     if let Err(e) = key_type.instantiate(&key, &payload) {
@@ -110,12 +125,10 @@ pub fn sys_add_key(type_ptr: u64, desc_ptr: u64, payload_ptr: u64, plen: u64, ke
     }
 
     // Register in global database
-    register_key(key.clone());
+    register_key(&key);
 
-    // Link to destination keyring
+    // Link to destination keyring; on failure the key is freed here
     if let Err(e) = keyring_link(&dest_keyring, &key) {
-        // Cleanup on failure
-        remove_key(serial);
         return e;
     }
 
@@ -168,9 +181,13 @@ pub fn sys_request_key(
             return KernelError::KeyRevoked.sysret();
         }
 
-        // Link to destination keyring if specified
+        // Linking into the destination needs LINK on the key and WRITE
+        // on the destination (Linux request_key -> construct_get_dest_keyring
+        // / lookup_user_key)
         if dest_keyring != 0
             && let Ok(dest) = resolve_special_keyring(dest_keyring, false, tid, uid, gid)
+            && super::key::check_key_permission(&key, super::key::KEY_NEED_LINK)
+            && super::key::check_key_permission(&dest, super::key::KEY_NEED_WRITE)
         {
             let _ = keyring_link(&dest, &key);
         }

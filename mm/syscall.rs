@@ -62,6 +62,19 @@ fn file_prot_ok(f: &File, prot: u32, shared: bool) -> Result<(), KernelError> {
     Ok(())
 }
 
+/// The mapping stays inside the file's offset space (Linux
+/// file_mmap_ok): regular files, block devices and sockets end at
+/// MAX_LFS_FILESIZE, other files at 2^64
+fn file_mmap_ok(f: &File, pgoff: u64, len: u64) -> bool {
+    let max = match f.get_inode() {
+        Some(i) if i.mode().is_file() || i.mode().is_blkdev() || i.mode().is_socket() => {
+            crate::fs::superblock::MAX_LFS_FILESIZE
+        }
+        _ => u64::MAX,
+    };
+    len <= max && pgoff <= (max - len) / PAGE_SIZE
+}
+
 pub fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: u64) -> i64 {
     // Validate length
     if length == 0 {
@@ -77,6 +90,12 @@ pub fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: 
     // Validate offset alignment
     if offset & (PAGE_SIZE - 1) != 0 {
         return KernelError::InvalidArgument.sysret();
+    }
+    // The pages may not wrap past the end of the offset space (Linux
+    // do_mmap: EOVERFLOW)
+    let pgoff = offset / PAGE_SIZE;
+    if pgoff.checked_add(length / PAGE_SIZE).is_none() {
+        return KernelError::Overflow.sysret();
     }
 
     let is_anonymous = flags & MAP_ANONYMOUS != 0;
@@ -121,6 +140,11 @@ pub fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: 
     } else {
         None
     };
+    if let Some(f) = &file
+        && !file_mmap_ok(f, pgoff, length)
+    {
+        return KernelError::Overflow.sysret();
+    }
     if let Some(f) = &file
         && let Err(e) = file_prot_ok(f, prot, is_shared).and_then(|_| f.f_op.mmap(f, is_shared))
     {

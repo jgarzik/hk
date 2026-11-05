@@ -115,12 +115,7 @@ pub fn sys_process_vm_readv(
 
             // Read from remote into kernel buffer
             let mut buf = alloc::vec![0u8; to_transfer];
-            let bytes_read = match access_remote_vm_read(
-                &target_mm,
-                &target_mm.mmap_read(),
-                remote_addr,
-                &mut buf,
-            ) {
+            let bytes_read = match access_remote_vm_read(&target_mm, remote_addr, &mut buf, false) {
                 Ok(n) => n,
                 Err(_) => {
                     if total_bytes > 0 {
@@ -265,17 +260,15 @@ pub fn sys_process_vm_writev(
             }
 
             // Write to remote
-            let bytes_written =
-                match access_remote_vm_write(&target_mm, &target_mm.mmap_read(), remote_addr, &buf)
-                {
-                    Ok(n) => n,
-                    Err(_) => {
-                        if total_bytes > 0 {
-                            return total_bytes;
-                        }
-                        return KernelError::BadAddress.sysret();
+            let bytes_written = match access_remote_vm_write(&target_mm, remote_addr, &buf, false) {
+                Ok(n) => n,
+                Err(_) => {
+                    if total_bytes > 0 {
+                        return total_bytes;
                     }
-                };
+                    return KernelError::BadAddress.sysret();
+                }
+            };
 
             if bytes_written == 0 {
                 if total_bytes > 0 {

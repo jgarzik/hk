@@ -64,6 +64,17 @@ pub fn run_tests() {
     report(b"KEYS_NO_ROOT_BYPASS", in_child(keys_no_root_bypass));
     report(b"CLONE3_ERROR_NO_LEAK", in_child(clone3_error_no_leak));
     report(b"KEY_REVOKE_UPDATE", in_child_with(key_revoke_update));
+    report(b"SIGNAL_PERM", signal_perm());
+    report(b"KEY_CYCLE_EDEADLK", key_cycle());
+    report(b"KEY_DEPTH_ELOOP", key_depth());
+    report(b"KEY_SEARCH_NESTED_PERM", key_search_nested());
+    report(b"KEY_FORK_KEYRINGS", in_child(key_fork_keyrings));
+    report(b"KEY_LINK_PERM", key_link_perm());
+    report(b"KEY_QUOTA", key_quota());
+    report(b"KEY_GC", key_gc());
+    report(b"KEY_UPDATE_QUOTA", key_update_quota());
+    report(b"BPF_UNPRIV_EPERM", in_child(bpf_unpriv));
+    report(b"BPF_UNPRIV_SYSCTL", bpf_sysctl());
 }
 
 fn report(name: &[u8], step: u64) {
@@ -219,6 +230,44 @@ fn reap(pid: i64) {
     hk_syscall::sys_kill(pid, 9);
     let mut ws = 0;
     sys_wait4(pid, &mut ws, 0, 0);
+}
+
+/// An unprivileged process without CAP_KILL cannot signal a process it
+/// does not own (Linux check_kill_permission): kill and tgkill both
+/// return EPERM. The attacker drops to uid 1000 with no capabilities;
+/// the victim stays root.
+fn signal_perm() -> u64 {
+    const SIGKILL: u32 = 9;
+    let victim = sleeper();
+    if victim < 0 {
+        return 90;
+    }
+    let att = sys_fork();
+    if att == 0 {
+        const CAP_KILL: u32 = 5;
+        // Drop CAP_KILL while still root (capset can only shrink), then
+        // become uid 1000: now neither capability nor ownership permits
+        // signaling the root victim
+        let code = if !set_effective(!(1 << CAP_KILL)) {
+            2
+        } else if sys_setresuid(1000, 1000, 1000) != 0 {
+            3
+        } else if hk_syscall::sys_kill(victim, SIGKILL) != EPERM {
+            4
+        } else if hk_syscall::sys_tgkill(victim, victim, SIGKILL) != EPERM {
+            5
+        } else {
+            0
+        };
+        sys_exit(code);
+    }
+    let mut st = 0i32;
+    sys_wait4(att, &mut st, 0, 0);
+    reap(victim);
+    if st & 0x7f != 0 {
+        return 80;
+    }
+    ((st >> 8) & 0xff) as u64
 }
 
 /// As uid 1000: EPERM for root's `root_task`, 0 for its own child
@@ -423,6 +472,352 @@ fn add_key(desc: &[u8]) -> i64 {
 
 fn keyctl(cmd: i32, a2: u64, a3: u64, a4: u64) -> i64 {
     hk_syscall::sys_keyctl(cmd, a2, a3, a4, 0)
+}
+
+const KEYCTL_LINK: i32 = 8;
+const EDEADLK: i64 = -35;
+
+/// A "keyring" key in the process keyring
+/// A cycle found within the search depth is EDEADLK; a link whose
+/// check must go past 6 nested keyrings is ELOOP (Linux
+/// keyring_detect_cycle with KEYRING_SEARCH_DETECT_TOO_DEEP)
+fn key_depth() -> u64 {
+    const ELOOP: i64 = -40;
+    let mut k = [0i64; 9];
+    for (i, r) in k.iter_mut().enumerate() {
+        let desc = [b'd', b'e', b'p', b'0' + i as u8, 0];
+        *r = add_keyring(&desc);
+        if *r <= 0 {
+            return 1;
+        }
+    }
+    // K[i + 1] linked into K[i]: a chain nine deep
+    for i in 0..8 {
+        if keyctl(KEYCTL_LINK, k[i + 1] as u64, k[i] as u64, 0) != 0 {
+            return 2;
+        }
+    }
+    if keyctl(KEYCTL_LINK, k[0] as u64, k[7] as u64, 0) != EDEADLK {
+        return 3;
+    }
+    if keyctl(KEYCTL_LINK, k[0] as u64, k[8] as u64, 0) != ELOOP {
+        return 4;
+    }
+    0
+}
+
+/// KEYCTL_SEARCH checks SEARCH on every nested keyring and on the key
+/// it finds (Linux search_nested_keyrings): a denied nested keyring is
+/// skipped (ENOKEY), a denied match is EACCES
+fn key_search_nested() -> u64 {
+    const KEYCTL_SEARCH: i32 = 10;
+    const ENOKEY: i64 = -126;
+    const EACCES: i64 = -13;
+    const ALL: u64 = 0x3f3f_0000;
+    const NO_SEARCH: u64 = 0x3737_0000;
+    let outer = add_keyring(b"ns_outer\0");
+    let inner = hk_syscall::sys_add_key(
+        b"keyring\0".as_ptr(),
+        b"ns_inner\0".as_ptr(),
+        core::ptr::null(),
+        0,
+        outer as i32,
+    );
+    let key = hk_syscall::sys_add_key(
+        b"user\0".as_ptr(),
+        b"ns_key\0".as_ptr(),
+        b"x".as_ptr(),
+        1,
+        inner as i32,
+    );
+    if outer <= 0 || inner <= 0 || key <= 0 {
+        return 1;
+    }
+    let search = || {
+        keyctl(
+            KEYCTL_SEARCH,
+            outer as u64,
+            b"user\0".as_ptr() as u64,
+            b"ns_key\0".as_ptr() as u64,
+        )
+    };
+    if search() != key {
+        return 2;
+    }
+    if keyctl(KEYCTL_SETPERM, inner as u64, NO_SEARCH, 0) != 0 {
+        return 3;
+    }
+    if search() != ENOKEY {
+        return 4;
+    }
+    if keyctl(KEYCTL_SETPERM, inner as u64, ALL, 0) != 0
+        || keyctl(KEYCTL_SETPERM, key as u64, NO_SEARCH, 0) != 0
+    {
+        return 5;
+    }
+    if search() != EACCES {
+        return 6;
+    }
+    0
+}
+
+/// A forked process inherits its parent's session keyring but not its
+/// process keyring (Linux copy_creds)
+fn key_fork_keyrings() -> u64 {
+    const KEYCTL_GET_KEYRING_ID: i32 = 0;
+    const SESSION: u64 = -3i64 as u64;
+    const PROCESS: u64 = -2i64 as u64;
+    const ENOKEY: i64 = -126;
+    let ses = keyctl(KEYCTL_GET_KEYRING_ID, SESSION, 1, 0);
+    let proc_ = keyctl(KEYCTL_GET_KEYRING_ID, PROCESS, 1, 0);
+    if ses <= 0 || proc_ <= 0 {
+        return 1;
+    }
+    let pid = sys_fork();
+    if pid == 0 {
+        if keyctl(KEYCTL_GET_KEYRING_ID, SESSION, 0, 0) != ses {
+            sys_exit(2);
+        }
+        if keyctl(KEYCTL_GET_KEYRING_ID, PROCESS, 0, 0) != ENOKEY {
+            sys_exit(3);
+        }
+        sys_exit(0);
+    }
+    let mut st = 0i32;
+    sys_wait4(pid, &mut st, 0, 0);
+    if st & 0x7f != 0 {
+        return 80;
+    }
+    ((st >> 8) & 0xff) as u64
+}
+
+fn add_keyring(desc: &[u8]) -> i64 {
+    hk_syscall::sys_add_key(
+        b"keyring\0".as_ptr(),
+        desc.as_ptr(),
+        core::ptr::null(),
+        0,
+        KEY_SPEC_PROCESS_KEYRING,
+    )
+}
+
+/// Serial of a key the parent creates, read by the forked child
+static mut VICTIM_KEY: i64 = 0;
+
+const EDQUOT: i64 = -122;
+
+/// An unprivileged user cannot pin unbounded keys: past the per-user
+/// limit (Linux key_user maxkeys 200), add_key is EDQUOT.
+fn key_quota() -> u64 {
+    let pid = sys_fork();
+    if pid == 0 {
+        if sys_setresuid(1000, 1000, 1000) != 0 {
+            sys_exit(2);
+        }
+        let mut made = 0i32;
+        // Unique descriptions; well past the 200-key cap
+        let mut desc = *b"kq0000\0";
+        for i in 0..260i32 {
+            desc[2] = b'0' + (i / 100 % 10) as u8;
+            desc[3] = b'0' + (i / 10 % 10) as u8;
+            desc[4] = b'0' + (i % 10) as u8;
+            let r = hk_syscall::sys_add_key(
+                b"user\0".as_ptr(),
+                desc.as_ptr(),
+                b"x".as_ptr(),
+                1,
+                KEY_SPEC_PROCESS_KEYRING,
+            );
+            if r == EDQUOT {
+                // The cap is 200/user; keyrings this uid owns count too
+                // on Linux, so allow some slack
+                sys_exit(if made >= 190 { 0 } else { 3 });
+            }
+            if r <= 0 {
+                sys_exit(4);
+            }
+            made += 1;
+        }
+        // Never hit the quota
+        sys_exit(5);
+    }
+    let mut st = 0i32;
+    sys_wait4(pid, &mut st, 0, 0);
+    if st & 0x7f != 0 {
+        return 80;
+    }
+    ((st >> 8) & 0xff) as u64
+}
+
+/// KEYCTL_UPDATE charges the payload's new size (Linux
+/// key_payload_reserve): growing six 1-byte keys to 4000 bytes passes the
+/// 20000-byte user quota (EDQUOT)
+fn key_update_quota() -> u64 {
+    const KEYCTL_UPDATE: i32 = 2;
+    let pid = sys_fork();
+    if pid == 0 {
+        if sys_setresuid(1000, 1000, 1000) != 0 {
+            sys_exit(2);
+        }
+        let big = [b'y'; 4000];
+        let mut keys = [0i64; 6];
+        // Earlier tests' uid-1000 keys may still await Linux's
+        // asynchronous key GC: wait out EDQUOT for up to 2 s
+        let ts = hk_syscall::Timespec {
+            tv_sec: 0,
+            tv_nsec: 10_000_000,
+        };
+        for (i, k) in keys.iter_mut().enumerate() {
+            let desc = [b'k', b'u', b'q', b'0' + i as u8, 0];
+            for _ in 0..200 {
+                *k = hk_syscall::sys_add_key(
+                    b"user\0".as_ptr(),
+                    desc.as_ptr(),
+                    b"x".as_ptr(),
+                    1,
+                    KEY_SPEC_PROCESS_KEYRING,
+                );
+                if *k != EDQUOT {
+                    break;
+                }
+                hk_syscall::sys_nanosleep(&ts, core::ptr::null_mut());
+            }
+            if *k <= 0 {
+                sys_exit(3);
+            }
+        }
+        for k in keys {
+            let r = keyctl(
+                KEYCTL_UPDATE,
+                k as u64,
+                big.as_ptr() as u64,
+                big.len() as u64,
+            );
+            if r == EDQUOT {
+                sys_exit(0);
+            }
+            if r != 0 {
+                sys_exit(4);
+            }
+        }
+        sys_exit(5);
+    }
+    let mut st = 0i32;
+    sys_wait4(pid, &mut st, 0, 0);
+    if st & 0x7f != 0 {
+        return 80;
+    }
+    ((st >> 8) & 0xff) as u64
+}
+
+/// Unlinked keys are freed and their quota returned (Linux key_put and
+/// the key GC, which runs asynchronously: retried for up to 2 s)
+fn key_gc() -> u64 {
+    const KEYCTL_CLEAR: i32 = 7;
+    let pid = sys_fork();
+    if pid == 0 {
+        if sys_setresuid(1000, 1000, 1000) != 0 {
+            sys_exit(2);
+        }
+        let mut desc = *b"kg0000\0";
+        let mut add = |i: i32| {
+            desc[2] = b'0' + (i / 100 % 10) as u8;
+            desc[3] = b'0' + (i / 10 % 10) as u8;
+            desc[4] = b'0' + (i % 10) as u8;
+            hk_syscall::sys_add_key(
+                b"user\0".as_ptr(),
+                desc.as_ptr(),
+                b"x".as_ptr(),
+                1,
+                KEY_SPEC_PROCESS_KEYRING,
+            )
+        };
+        let mut i = 0;
+        while add(i) > 0 {
+            i += 1;
+            if i > 260 {
+                sys_exit(3);
+            }
+        }
+        if add(i) != EDQUOT {
+            sys_exit(4);
+        }
+        if keyctl(KEYCTL_CLEAR, KEY_SPEC_PROCESS_KEYRING as u64, 0, 0) != 0 {
+            sys_exit(5);
+        }
+        let ts = hk_syscall::Timespec {
+            tv_sec: 0,
+            tv_nsec: 10_000_000,
+        };
+        for _ in 0..200 {
+            if add(i) > 0 {
+                sys_exit(0);
+            }
+            hk_syscall::sys_nanosleep(&ts, core::ptr::null_mut());
+        }
+        sys_exit(6);
+    }
+    let mut st = 0i32;
+    sys_wait4(pid, &mut st, 0, 0);
+    if st & 0x7f != 0 {
+        return 80;
+    }
+    ((st >> 8) & 0xff) as u64
+}
+
+/// Linking a keyring into itself or into one it already reaches is
+/// EDEADLK (Linux keyring_detect_cycle), so a search cannot recurse
+/// forever
+fn key_cycle() -> u64 {
+    let a = add_keyring(b"cyc_a\0");
+    let b = add_keyring(b"cyc_b\0");
+    if a <= 0 || b <= 0 {
+        return 1;
+    }
+    if keyctl(KEYCTL_LINK, a as u64, a as u64, 0) != EDEADLK {
+        return 2; // self-link
+    }
+    if keyctl(KEYCTL_LINK, a as u64, b as u64, 0) != 0 {
+        return 3; // a into b: fine
+    }
+    if keyctl(KEYCTL_LINK, b as u64, a as u64, 0) != EDEADLK {
+        return 4; // b into a would cycle
+    }
+    0
+}
+
+/// An unprivileged process cannot link a key it does not own: the key's
+/// LINK permission is checked (Linux lookup_user_key KEY_NEED_LINK)
+fn key_link_perm() -> u64 {
+    // Parent (root) makes a key with default (owner-only) permissions
+    let victim = add_key(b"linkperm\0");
+    if victim <= 0 {
+        return 1;
+    }
+    // SAFETY: written before the fork; the child reads its own copy
+    unsafe { core::ptr::write_volatile(&raw mut VICTIM_KEY, victim) };
+    let pid = sys_fork();
+    if pid == 0 {
+        const CAP_SETUID: u32 = 7;
+        // Keep CAP_SETUID to change uid, drop the rest (no key override)
+        if !set_effective(1 << CAP_SETUID) || sys_setresuid(1000, 1000, 1000) != 0 {
+            sys_exit(2);
+        }
+        let ring = add_keyring(b"lp_ring\0");
+        if ring <= 0 {
+            sys_exit(3);
+        }
+        // SAFETY: the parent's value, copied by fork
+        let v = unsafe { core::ptr::read_volatile(&raw const VICTIM_KEY) };
+        let r = keyctl(KEYCTL_LINK, v as u64, ring as u64, 0);
+        sys_exit(if r == EACCES { 0 } else { 4 });
+    }
+    let mut st = 0i32;
+    sys_wait4(pid, &mut st, 0, 0);
+    if st & 0x7f != 0 {
+        return 80;
+    }
+    ((st >> 8) & 0xff) as u64
 }
 
 /// In a child (its own process keyring)
@@ -659,6 +1054,85 @@ fn key_revoke_update() -> u64 {
     }
     if keyctl(KEYCTL_READ, k2 as u64, buf.as_mut_ptr() as u64, 16) != EKEYREVOKED {
         return 6;
+    }
+    0
+}
+
+const BPF_MAP_CREATE: i32 = 0;
+const BPF_PROG_LOAD: i32 = 5;
+const UNPRIV_BPF: &[u8] = b"/proc/sys/kernel/unprivileged_bpf_disabled\0";
+
+/// An array map of one 4-byte value
+fn bpf_map() -> i64 {
+    let attr = [2u32, 4, 4, 1, 0, 0, 0, 0];
+    hk_syscall::sys_bpf(BPF_MAP_CREATE, attr.as_ptr() as u64, 32)
+}
+
+/// A socket filter "r0 = 0; exit"
+fn bpf_prog() -> i64 {
+    let insns = [0xb7u64, 0x95];
+    let license = b"GPL\0";
+    let attr = [
+        1u32, // BPF_PROG_TYPE_SOCKET_FILTER
+        2,
+        insns.as_ptr() as u64 as u32,
+        (insns.as_ptr() as u64 >> 32) as u32,
+        license.as_ptr() as u64 as u32,
+        (license.as_ptr() as u64 >> 32) as u32,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+    ];
+    hk_syscall::sys_bpf(BPF_PROG_LOAD, attr.as_ptr() as u64, 48)
+}
+
+/// With unprivileged BPF disabled (the default), root may create maps
+/// and load programs but uid 1000 without capabilities may not (EPERM)
+fn bpf_unpriv() -> u64 {
+    let mut b = [0u8; 4];
+    if super::helpers::read_file(UNPRIV_BPF, &mut b) < 1 || b[0] == b'0' {
+        return 1;
+    }
+    for fd in [bpf_map(), bpf_prog()] {
+        if fd < 0 {
+            return 2;
+        }
+        hk_syscall::sys_close(fd as u64);
+    }
+    if sys_setresuid(1000, 1000, 1000) != 0 {
+        return 3;
+    }
+    if bpf_map() != EPERM {
+        return 4;
+    }
+    if bpf_prog() != EPERM {
+        return 5;
+    }
+    0
+}
+
+/// kernel.unprivileged_bpf_disabled takes 0..2 (EINVAL past it)
+fn bpf_sysctl() -> u64 {
+    let write = |v: &[u8]| {
+        let fd = hk_syscall::sys_open(UNPRIV_BPF.as_ptr(), 1, 0);
+        if fd < 0 {
+            return fd;
+        }
+        let r = hk_syscall::sys_write(fd as u64, v.as_ptr(), v.len() as u64);
+        hk_syscall::sys_close(fd as u64);
+        r
+    };
+    if write(b"3") != -22 {
+        return 1;
+    }
+    if write(b"-1") != -22 {
+        return 2;
+    }
+    if write(b"2") != 1 {
+        return 3;
     }
     0
 }

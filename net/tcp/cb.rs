@@ -941,7 +941,13 @@ impl TcpCb {
     /// Queue up to `data.len()` bytes for sending; returns how many fit
     /// (the caller calls `output`)
     pub fn send(&mut self, data: &[u8]) -> usize {
-        let n = self.wmem_schedule(data.len().min(self.snd_space()));
+        let want = data.len().min(self.snd_space());
+        // Reserve before charging: a failed reservation is "no memory"
+        // (the caller waits, sk_stream_wait_memory), never a panic
+        if want > 0 && self.sndq.try_reserve(want).is_err() {
+            return 0;
+        }
+        let n = self.wmem_schedule(want);
         self.sndq.extend(&data[..n]);
         n
     }

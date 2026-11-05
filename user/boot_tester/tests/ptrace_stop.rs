@@ -10,6 +10,11 @@
 //! - PTRACE_PEEK_DUMPABLE: an unprivileged tracer's PEEKDATA stores the
 //!   word at `data` (the raw syscall returns 0); once the tracee made
 //!   itself non-dumpable it fails with EIO (Linux ptrace_access_vm)
+//! - PTRACE_POKE_TEXT: a tracer's POKETEXT into the tracee's program
+//!   text (read-only, private) succeeds with a copy only the tracee
+//!   sees, still read-only to it (its own write faults); without force,
+//!   process_vm_writev there is EFAULT, and process_vm_readv of a page
+//!   never touched reads zeros (both fault pages in: Linux GUP)
 
 use super::sk::T;
 use hk_syscall::{
@@ -30,6 +35,126 @@ pub fn run_tests() {
     test_syscall_stop();
     test_stop_kill();
     test_peek_dumpable();
+    test_poke_text();
+}
+
+/// Never called: the text word POKETEXT writes
+#[inline(never)]
+extern "C" fn poke_target() -> u64 {
+    core::hint::black_box(0x1234)
+}
+
+const POISON: u64 = 0x5a5a_5a5a_5a5a_5a5a;
+
+fn text_word() -> u64 {
+    // SAFETY: the function's own (readable) text
+    unsafe { core::ptr::read_volatile(poke_target as *const u64) }
+}
+
+fn test_poke_text() {
+    const PTRACE_PEEKTEXT: i64 = 1;
+    const PTRACE_POKETEXT: i64 = 4;
+    const EFAULT: i64 = -14;
+    const SIGSEGV: i32 = 11;
+    let mut t = T::new(b"PTRACE_POKE_TEXT");
+    let addr = poke_target as *const u64 as u64;
+    let orig = text_word();
+    // An anonymous page no one touches
+    let fresh = hk_syscall::sys_mmap(0, 4096, 3, 0x22, -1, 0);
+    // A written page made PROT_NONE: still reachable by a forced access
+    let none = hk_syscall::sys_mmap(0, 4096, 3, 0x22, -1, 0);
+    if none > 0 {
+        // SAFETY: the page just mapped read-write
+        unsafe { core::ptr::write_volatile(none as *mut u64, 0x1111) };
+        hk_syscall::sys_mprotect(none as u64, 4096, 0);
+    }
+    let pid = sys_fork();
+    if pid == 0 {
+        sys_ptrace(PTRACE_TRACEME, 0, 0, 0);
+        sys_kill(sys_getpid(), SIGSTOP);
+        if text_word() != POISON {
+            sys_exit(3);
+        }
+        // Still read-only to the tracee: this faults
+        // SAFETY: deliberately writes read-only text (expected SIGSEGV)
+        unsafe { core::ptr::write_volatile(addr as *mut u64, 0) };
+        sys_exit(4);
+    }
+    let step = (|| {
+        if fresh < 0 || stop_sig(pid) != SIGSTOP as i32 {
+            return 1;
+        }
+        if sys_ptrace(PTRACE_POKETEXT, pid, addr, POISON) != 0 {
+            return 2;
+        }
+        let mut w = 0u64;
+        if sys_ptrace(PTRACE_PEEKTEXT, pid, addr, &mut w as *mut u64 as u64) != 0 || w != POISON {
+            return 3;
+        }
+        if text_word() != orig {
+            return 4; // the tracer's own text changed: no copy was made
+        }
+        let local = [0u8; 8];
+        let liov = hk_syscall::IoVec {
+            iov_base: local.as_ptr(),
+            iov_len: 8,
+        };
+        let riov = hk_syscall::IoVec {
+            iov_base: addr as *const u8,
+            iov_len: 8,
+        };
+        if hk_syscall::sys_process_vm_writev(pid as i32, &liov, 1, &riov, 1, 0) != EFAULT {
+            return 5;
+        }
+        let mut got = [0xffu8; 8];
+        let liov = hk_syscall::IoVec {
+            iov_base: got.as_mut_ptr(),
+            iov_len: 8,
+        };
+        let riov = hk_syscall::IoVec {
+            iov_base: fresh as *const u8,
+            iov_len: 8,
+        };
+        if hk_syscall::sys_process_vm_readv(pid as i32, &liov, 1, &riov, 1, 0) != 8 || got != [0; 8]
+        {
+            return 6;
+        }
+        // PROT_NONE: a forced read and write reach it (Linux FOLL_FORCE)
+        let mut w = 0u64;
+        if none < 0
+            || sys_ptrace(PTRACE_PEEKTEXT, pid, none as u64, &mut w as *mut u64 as u64) != 0
+            || w != 0x1111
+        {
+            return 9;
+        }
+        if sys_ptrace(PTRACE_POKETEXT, pid, none as u64, 0x2222) != 0 {
+            return 10;
+        }
+        if sys_ptrace(PTRACE_PEEKTEXT, pid, none as u64, &mut w as *mut u64 as u64) != 0
+            || w != 0x2222
+        {
+            return 11;
+        }
+        sys_ptrace(PTRACE_CONT, pid, 0, 0);
+        // The tracee's write to its text: a SIGSEGV stop, then death
+        if stop_sig(pid) != SIGSEGV {
+            return 7;
+        }
+        sys_ptrace(PTRACE_CONT, pid, 0, SIGSEGV as u64);
+        let mut st = 0i32;
+        sys_wait4(pid, &mut st, 0, 0);
+        if st & 0x7f != SIGSEGV {
+            return 8;
+        }
+        0
+    })();
+    if step != 0 {
+        sys_kill(pid, SIGKILL);
+        let mut st = 0i32;
+        sys_wait4(pid, &mut st, 0, 0);
+    }
+    t.eq(b"step", step, 0);
+    t.done();
 }
 
 /// A child that stops for its tracer, then makes one getppid: exit 7 if

@@ -1,41 +1,31 @@
-//! eBPF (extended Berkeley Packet Filter) subsystem
+//! BPF: hk's one in-kernel program engine
 //!
-//! This module provides the eBPF virtual machine used for seccomp filters,
-//! packet filtering, and other programmable kernel extensions.
-//!
-//! ## Architecture
-//!
-//! eBPF programs execute in a sandboxed virtual machine with:
-//! - 11 64-bit registers (R0-R10)
-//! - 512-byte stack
-//! - Context pointer passed in R1
-//! - Return value in R0
-//!
-//! ## Syscall Interface
-//!
-//! The bpf() syscall provides userspace access to:
-//! - BPF maps (key-value stores): hash tables, arrays
-//! - BPF programs: loaded and verified before execution
-//!
-//! ## cBPF Compatibility
-//!
-//! For seccomp(2) compatibility, classic BPF (cBPF) programs using
-//! sock_filter format are converted to eBPF before execution.
+//! - `interp`: the RFC 9669 eBPF interpreter, every access checked
+//!   against its region (context, stack)
+//! - `verifier`: iterative checks of shape, forward-only control flow
+//!   and register/stack types before a program may run
+//! - `classic`: classic (sock_filter) programs: Linux's checker, and the
+//!   classic interpreter the converter is tested against
+//! - `convert`: Linux's classic-to-eBPF conversion; seccomp(2) and
+//!   SO_ATTACH_FILTER run their programs this way
+//! - `syscall`, `map`, `prog`, `fd`: bpf(2) maps and program loading
+//!   (nothing attaches a loaded program yet: doc/ROADMAP.md phase E)
 
-mod convert;
+pub mod classic;
+pub mod convert;
 mod fd;
 mod insn;
-mod interp;
+pub mod interp;
 mod map;
 mod prog;
 pub mod syscall;
-mod verifier;
+pub mod verifier;
 
-pub use convert::{SockFilter, cbpf_to_ebpf, validate_cbpf};
 pub use fd::{create_bpf_map_fd, create_bpf_prog_fd, get_bpf_map_from_fd, get_bpf_prog_from_fd};
 pub use insn::*;
-pub use interp::bpf_run;
 pub use map::{BpfMap, BpfMapOps, create_map};
 pub use prog::BpfProg;
 pub use syscall::sys_bpf;
-pub use verifier::verify_bpf_prog;
+
+#[cfg(test)]
+mod tests;

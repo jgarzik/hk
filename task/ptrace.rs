@@ -579,14 +579,12 @@ fn ptrace_peek_data(target_pid: Pid, addr: u64, data: u64) -> i64 {
         return -EIO;
     }
 
-    // Lock mm and read from tracee
-    let mm_guard = target_mm.mmap_read();
+    // Forced, as Linux ptrace_access_vm (FOLL_FORCE): any mapping reads
     let mut buf = [0u8; 8];
-    match crate::mm::remote::access_remote_vm_read(&target_mm, &mm_guard, addr, &mut buf) {
+    match crate::mm::remote::access_remote_vm_read(&target_mm, addr, &mut buf, true) {
         // The raw syscall stores the word at `data` and returns 0
         // (Linux generic_ptrace_peekdata; libc returns the word)
         Ok(8) => {
-            drop(mm_guard);
             match crate::uaccess::put_user::<crate::arch::Uaccess, u64>(
                 data,
                 u64::from_ne_bytes(buf),
@@ -620,10 +618,10 @@ fn ptrace_poke_data(target_pid: Pid, addr: u64, data: u64) -> i64 {
         return -EIO;
     }
 
-    // Lock mm and write to tracee
-    let mm_guard = target_mm.mmap_read();
+    // Forced (FOLL_FORCE): a private read-only mapping, program text
+    // for a breakpoint, gets its own read-only copy
     let buf = data.to_ne_bytes();
-    match crate::mm::remote::access_remote_vm_write(&target_mm, &mm_guard, addr, &buf) {
+    match crate::mm::remote::access_remote_vm_write(&target_mm, addr, &buf, true) {
         Ok(8) => 0,
         _ => -EIO,
     }
