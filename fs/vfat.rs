@@ -1123,18 +1123,17 @@ const INVALID_SHORT_CHARS: &[u8] = b" .\"*+,/:;<=>?[\\]|";
 ///
 /// Returns an 11-byte array with 8 chars for name + 3 chars for extension,
 /// both space-padded.
-fn generate_short_name(long_name: &str, existing_short_names: &[[u8; 11]]) -> [u8; 11] {
+fn generate_short_name(long_name: &str, existing_short_names: &[[u8; 11]]) -> Option<[u8; 11]> {
     let result = [b' '; 11];
 
-    // Find extension (last dot that isn't at the start)
-    let (base, ext) = if let Some(dot_pos) = long_name.rfind('.') {
-        if dot_pos > 0 {
-            (&long_name[..dot_pos], &long_name[dot_pos + 1..])
-        } else {
-            (long_name, "")
+    // The extension follows the last dot, unless all before it is dots
+    // and spaces ("...test", "  .txt": then all of it is the base, as
+    // Linux vfat_create_shortname and Windows)
+    let (base, ext) = match long_name.rfind('.') {
+        Some(d) if !long_name[..d].bytes().all(|c| c == b' ' || c == b'.') => {
+            (&long_name[..d], &long_name[d + 1..])
         }
-    } else {
-        (long_name, "")
+        _ => (long_name, ""),
     };
 
     // Convert base to uppercase, remove invalid chars
@@ -1150,6 +1149,11 @@ fn generate_short_name(long_name: &str, existing_short_names: &[[u8; 11]]) -> [u
             }
         })
         .collect();
+    // No base character left: no short name (Linux: EINVAL); one never
+    // starts with a space
+    if clean_base.is_empty() {
+        return None;
+    }
 
     // Convert extension similarly
     let clean_ext: String = ext
@@ -1176,7 +1180,7 @@ fn generate_short_name(long_name: &str, existing_short_names: &[[u8; 11]]) -> [u
         }
 
         if !existing_short_names.contains(&candidate) {
-            return candidate;
+            return Some(candidate);
         }
     }
 
@@ -1200,12 +1204,12 @@ fn generate_short_name(long_name: &str, existing_short_names: &[[u8; 11]]) -> [u
         }
 
         if !existing_short_names.contains(&candidate) {
-            return candidate;
+            return Some(candidate);
         }
     }
 
     // Fallback (should never happen with 999999 attempts)
-    result
+    Some(result)
 }
 
 /// Calculate checksum of 8.3 short name (11-byte format)
@@ -1368,7 +1372,8 @@ fn create_dir_entry_with_lfn(
         existing_entries.iter().map(|e| e.short_name).collect();
 
     // Generate short name
-    let short_name = generate_short_name(name, &existing_short_names);
+    let short_name =
+        generate_short_name(name, &existing_short_names).ok_or(KernelError::InvalidArgument)?;
 
     // Check if we need LFN entries
     let needs_lfn = {
@@ -2493,3 +2498,24 @@ pub static VFAT_TYPE: FileSystemType = FileSystemType {
     mount_dev: Some(vfat_mount_dev),
     file_ops: &VFAT_FILE_OPS,
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Short names never start with a space; a base of only dots and
+    /// spaces before the last dot makes the whole name the base (Linux
+    /// vfat_create_shortname)
+    #[test]
+    fn short_names() {
+        let g = |n: &str| generate_short_name(n, &[]);
+        assert_eq!(g("a.b"), Some(*b"A       B  "));
+        assert_eq!(g("  .txt"), Some(*b"TXT        "));
+        assert_eq!(g("...test"), Some(*b"TEST       "));
+        assert_eq!(g(".bashrc"), Some(*b"BASHRC     "));
+        assert_eq!(g(" "), None);
+        assert_eq!(g("..."), None);
+        let taken = [*b"A       B  "];
+        assert_eq!(generate_short_name("a.b", &taken), Some(*b"A~1     B  "));
+    }
+}
