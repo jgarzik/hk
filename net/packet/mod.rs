@@ -22,7 +22,8 @@
 //!
 //! `PacketTable.socks` (`crate::sync::spin::RwLock`, per namespace, leaf): delivery
 //! clones the matching `Arc`s and queues after dropping it. Per socket:
-//! `bind` is an atomic; `rxq` (`crate::sync::spin::Mutex` leaf) and `filter`
+//! `bind` is one atomic word, changed only by compare-exchange (bind,
+//! device unregister); `rxq` (`crate::sync::spin::Mutex` leaf) and `filter`
 //! (`crate::sync::spin::RwLock` leaf, the `Arc` is cloned out before running it).
 //! `mclist` (`crate::sync::spin::Mutex` leaf) is changed under RTNL, which device
 //! promiscuity changes need: RTNL -> `mclist`.
@@ -124,7 +125,11 @@ struct Dest {
 /// An AF_PACKET socket
 pub struct PacketSock {
     sk: Sock,
-    /// Bound protocol (host order, 0 = none) << 32 | ifindex (0 = all)
+    /// Bound protocol (host order, 0 = none) << 32 | ifindex (0 = all,
+    /// -1 = a device that went away): one word, read lock-free
+    /// (receive, send, getname) and changed only by compare-exchange
+    /// from the value the change was decided on (bind, a device's
+    /// unregister), so neither can undo the other (Linux po->bind_lock)
     bind: AtomicU64,
     flags: AtomicU32,
     rxq: rcv::PktQueue,
@@ -151,7 +156,7 @@ pub fn create(stype: i32, protocol: i32) -> Result<Arc<dyn ProtoOps>, KernelErro
     let net = crate::net::current_net_ns();
     let s = Arc::new(PacketSock {
         sk: Sock::new(net.clone(), AF_PACKET, stype, protocol),
-        bind: AtomicU64::new((proto as u64) << 32),
+        bind: AtomicU64::new(pack(proto, 0)),
         flags: AtomicU32::new(0),
         rxq: rcv::PktQueue::default(),
         filter: RwLock::new(None),
@@ -187,24 +192,41 @@ pub fn netdev_unregister(
     net: &crate::net::NetNamespace,
     dev: &NetDevice,
 ) {
+    // The device is unlisted already (unregister_netdevice): a bind
+    // that still found it stored first and is seen here; one that
+    // missed it moves itself to -1
     for s in net.packet.all() {
         opts::mclist_delete(r, &s, dev);
-        if let Some(num) = bound_to(&s, dev) {
-            s.set_bound(num, -1);
+        let mut w = s.bind.load(Ordering::Acquire);
+        loop {
+            let (num, ifindex) = unpack(w);
+            if ifindex <= 0 || ifindex as u32 != dev.ifindex() {
+                break;
+            }
+            match s
+                .bind
+                .compare_exchange(w, pack(num, -1), Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => break,
+                Err(now) => w = now,
+            }
         }
     }
+}
+
+/// The `bind` word of (protocol, ifindex)
+fn pack(proto: u16, ifindex: i32) -> u64 {
+    ((proto as u64) << 32) | ifindex as u32 as u64
+}
+
+fn unpack(w: u64) -> (u16, i32) {
+    ((w >> 32) as u16, w as u32 as i32)
 }
 
 impl PacketSock {
     /// (protocol, ifindex) bound
     fn bound(&self) -> (u16, i32) {
-        let b = self.bind.load(Ordering::Acquire);
-        ((b >> 32) as u16, b as u32 as i32)
-    }
-
-    fn set_bound(&self, proto: u16, ifindex: i32) {
-        let v = ((proto as u64) << 32) | ifindex as u32 as u64;
-        self.bind.store(v, Ordering::Release);
+        unpack(self.bind.load(Ordering::Acquire))
     }
 
     fn flag(&self, f: u32) -> bool {
@@ -363,13 +385,38 @@ impl ProtoOps for PacketSock {
         } else {
             None
         };
-        let (cur, cur_if) = self.bound();
-        let proto = if sll.protocol != 0 { sll.protocol } else { cur };
-        if proto == cur && sll.ifindex == cur_if {
-            return Ok(());
+        let mut w = self.bind.load(Ordering::Acquire);
+        let (proto, new) = loop {
+            let (cur, cur_if) = unpack(w);
+            let proto = if sll.protocol != 0 { sll.protocol } else { cur };
+            if proto == cur && sll.ifindex == cur_if {
+                return Ok(());
+            }
+            let new = pack(proto, sll.ifindex);
+            match self
+                .bind
+                .compare_exchange(w, new, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => break (proto, new),
+                Err(now) => w = now,
+            }
+        };
+        // Look again after storing: a device unregistered meanwhile was
+        // unlisted before its sockets were visited, so either that visit
+        // sees this binding or this lookup misses the device. Then the
+        // socket is bound to none, as Linux packet_do_bind's "unlisted"
+        // (the bind itself succeeds)
+        let mut ifindex = sll.ifindex;
+        if dev.is_some() && self.dev(sll.ifindex).is_none() {
+            let _ = self.bind.compare_exchange(
+                new,
+                pack(proto, -1),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+            ifindex = -1;
         }
-        self.set_bound(proto, sll.ifindex);
-        if proto != 0 && dev.is_some_and(|d| !d.is_up()) {
+        if proto != 0 && ifindex != -1 && dev.is_some_and(|d| !d.is_up()) {
             self.sk.set_err(KernelError::NetworkDown);
         }
         Ok(())

@@ -18,15 +18,18 @@ use crate::util::cpumask::NR_CPUS;
 static NR_CPU_IDS: AtomicU32 = AtomicU32::new(1);
 
 /// Number of possible CPUs: every CPU brought up at boot (hk has no
-/// hotplug), 1 until SMP bring-up is done
+/// hotplug), 1 until SMP bring-up is done (early boot code, on the boot
+/// CPU, sizes nothing per CPU before that). Acquire pairs with the one
+/// store: the application CPUs are already running when it is made.
 #[inline]
 pub fn nr_cpu_ids() -> u32 {
-    NR_CPU_IDS.load(Ordering::Relaxed)
+    NR_CPU_IDS.load(Ordering::Acquire)
 }
 
-/// Record the CPUs found at boot (`smp::init`, once)
+/// Record the CPUs found at boot (`smp::init`, once, on the boot CPU,
+/// before any CPU takes call-function IPIs or schedules)
 pub fn set_nr_cpu_ids(n: u32) {
-    NR_CPU_IDS.store(n.clamp(1, NR_CPUS as u32), Ordering::Relaxed);
+    NR_CPU_IDS.store(n.clamp(1, NR_CPUS as u32), Ordering::Release);
 }
 
 /// The calling CPU's logical id (Linux smp_processor_id); 0 before
