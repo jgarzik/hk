@@ -15,7 +15,6 @@
 
 use alloc::string::String;
 use alloc::sync::Arc;
-use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::block::BlockDevice;
@@ -174,10 +173,8 @@ fn ensure_clusters(inode: &Inode, sb_data: &VfatSbData, size: u64) -> Result<(),
         return Ok(());
     }
     let last = chain.last().copied().unwrap_or(0);
-    let new = extend_cluster_chain(sb_data, last, need - chain.len())?;
-    if d.start_cluster == 0
-        && let Some(&first) = new.first()
-    {
+    let first = extend_cluster_chain(sb_data, last, need - chain.len())?;
+    if d.start_cluster == 0 && first != 0 {
         if d.parent_cluster != 0 && inode.get_nlink() != 0 {
             update_dir_entry_by_short_name(
                 sb_data,
@@ -748,6 +745,7 @@ fn read_cluster_chain(sb_data: &VfatSbData, start_cluster: u32) -> Result<Vec<u3
     let mut cluster = start_cluster;
 
     while is_valid_cluster(cluster) {
+        chain.try_reserve(1).map_err(|_| KernelError::OutOfMemory)?;
         chain.push(cluster);
         cluster = get_fat_entry(sb_data, cluster)?;
         if is_end_of_chain(cluster) {
@@ -820,7 +818,7 @@ fn allocate_cluster(sb_data: &VfatSbData) -> Result<u32, KernelError> {
             let off = cluster_to_offset(sb_data, cluster);
             let len = sb_data.cluster_size as u64;
             filemap::invalidate_range(&sb_data.bdev.bd_inode, off, off + len)?;
-            let mut zeros = vec![0u8; len as usize];
+            let mut zeros = crate::util::kmem::try_vec(len as usize, 0u8)?;
             bdev_rw_bytes(&sb_data.bdev, BioOp::Write, off, &mut zeros)?;
             // Again: a page a reader cached before the zeros landed
             // holds the old bytes
@@ -850,32 +848,51 @@ fn free_cluster_chain(sb_data: &VfatSbData, start_cluster: u32) -> Result<(), Ke
     Ok(())
 }
 
-/// Extend a cluster chain by allocating new clusters
-///
-/// If last_cluster is 0, allocates a new chain. Otherwise extends the existing chain.
-/// Returns the vector of newly allocated clusters.
+/// Extend a cluster chain by `count` clusters, linking them as it goes
+/// (no buffer the size of the file). `last_cluster` 0 starts a new
+/// chain. Returns the first new cluster (0 if `count` is 0). On failure
+/// partway, the partial chain is freed, so no clusters leak.
 fn extend_cluster_chain(
     sb_data: &VfatSbData,
     last_cluster: u32,
     count: usize,
-) -> Result<Vec<u32>, KernelError> {
-    let mut new_clusters = Vec::with_capacity(count);
-
-    for i in 0..count {
-        let cluster = allocate_cluster(sb_data)?;
-        new_clusters.push(cluster);
-
-        // Link to previous cluster
-        if i == 0 && last_cluster != 0 {
-            // Link from existing chain
-            set_fat_entry(sb_data, last_cluster, cluster)?;
-        } else if i > 0 {
-            // Link from previous new cluster
-            set_fat_entry(sb_data, new_clusters[i - 1], cluster)?;
+) -> Result<u32, KernelError> {
+    // Undo a partial extension: free the clusters already linked from
+    // `first`, and point the existing chain's tail back at end-of-chain
+    fn rollback(sb_data: &VfatSbData, first: u32, last_cluster: u32) {
+        if first != 0 {
+            let _ = free_cluster_chain(sb_data, first);
+        }
+        if last_cluster != 0 {
+            let _ = set_fat_entry(sb_data, last_cluster, FAT_EOC);
         }
     }
 
-    Ok(new_clusters)
+    let mut first = 0u32;
+    let mut prev = last_cluster;
+    for _ in 0..count {
+        let cluster = match allocate_cluster(sb_data) {
+            Ok(c) => c,
+            Err(e) => {
+                rollback(sb_data, first, last_cluster);
+                return Err(e);
+            }
+        };
+        if prev != 0
+            && let Err(e) = set_fat_entry(sb_data, prev, cluster)
+        {
+            // `cluster` is allocated but not yet linked into `first`:
+            // free it directly, then unwind the rest
+            let _ = set_fat_entry(sb_data, cluster, FAT_FREE);
+            rollback(sb_data, first, last_cluster);
+            return Err(e);
+        }
+        if first == 0 {
+            first = cluster;
+        }
+        prev = cluster;
+    }
+    Ok(first)
 }
 
 /// Get the last cluster in a chain
@@ -1292,11 +1309,11 @@ fn find_free_dir_slots(
 
     // Not enough space - extend directory by allocating new cluster
     let last_cluster = *chain.last().unwrap_or(&dir_cluster);
-    let new_clusters = extend_cluster_chain(sb_data, last_cluster, 1)?;
+    let new_cluster = extend_cluster_chain(sb_data, last_cluster, 1)?;
 
-    if let Some(&new_cluster) = new_clusters.first() {
+    if new_cluster != 0 {
         // Initialize new cluster with end markers
-        let mut end_markers = vec![0u8; sb_data.cluster_size as usize];
+        let mut end_markers = crate::util::kmem::try_vec(sb_data.cluster_size as usize, 0u8)?;
         // First byte of first entry should be END_MARKER (rest are zeros which is fine)
         end_markers[0] = END_MARKER;
         let new_cluster_offset = cluster_to_offset(sb_data, new_cluster);
@@ -1783,7 +1800,7 @@ impl InodeOps for VfatInodeOps {
         let cluster_size = sb_data.cluster_size as usize;
 
         // Zero out the cluster first
-        let zeros = vec![0u8; cluster_size];
+        let zeros = crate::util::kmem::try_vec(cluster_size, 0u8)?;
         write_bytes(&sb_data.bdev, cluster_offset, &zeros)?;
 
         // Create . entry (points to self)
@@ -2380,12 +2397,45 @@ fn vfat_mount_dev(
         return Err(KernelError::InvalidArgument);
     }
 
+    // sectors_per_cluster must be a power of two (this rejects 0, which
+    // would divide by zero in the cluster math), with a non-zero FAT
+    // count and reserved region and a valid media byte (Linux
+    // fat_fill_super)
+    let spc = boot_sector.sectors_per_cluster;
+    if spc == 0 || !spc.is_power_of_two() {
+        return Err(KernelError::InvalidArgument);
+    }
+    if boot_sector.num_fats == 0 || boot_sector.reserved_sector_count == 0 {
+        return Err(KernelError::InvalidArgument);
+    }
+    let media = boot_sector.media_type;
+    if media != 0xf0 && media < 0xf8 {
+        return Err(KernelError::InvalidArgument);
+    }
+
     // Calculate filesystem layout
     let fat_start_sector = boot_sector.reserved_sector_count as u64;
     let fat_sectors = boot_sector.fat_size_32 as u64;
     let num_fats = boot_sector.num_fats as u64;
     let data_start_sector = fat_start_sector + (fat_sectors * num_fats);
-    let cluster_size = (boot_sector.sectors_per_cluster as u32) * (bytes_per_sector as u32);
+    let cluster_size = (spc as u32) * (bytes_per_sector as u32);
+
+    // The data region must fit, and the FAT must hold an entry (4 bytes)
+    // for every data cluster plus the two reserved entries (Linux: the
+    // cluster count is checked against the FAT size)
+    let total_sectors = if boot_sector.total_sectors_16 != 0 {
+        boot_sector.total_sectors_16 as u64
+    } else {
+        boot_sector.total_sectors_32 as u64
+    };
+    if total_sectors <= data_start_sector {
+        return Err(KernelError::InvalidArgument);
+    }
+    let total_clusters = (total_sectors - data_start_sector) / spc as u64;
+    let fat_entries = fat_sectors.saturating_mul(bytes_per_sector as u64) / 4;
+    if total_clusters == 0 || total_clusters + 2 > fat_entries {
+        return Err(KernelError::InvalidArgument);
+    }
 
     // Create superblock data
     let sb_data = Arc::new(VfatSbData {
