@@ -158,7 +158,6 @@ impl Ord for MqMessage {
 /// Notification registration
 struct MqNotify {
     owner_pid: u64,
-    owner_tid: u64,
     sigev_notify: i32,
     sigev_signo: i32,
     sigev_value: u64,
@@ -352,26 +351,13 @@ impl MqQueue {
             // TODO: When siginfo support is added, include sigev_value in SI_MESGQ siginfo
             let _sigev_value = n.sigev_value; // Will be passed in siginfo_t.si_value
 
-            match n.sigev_notify {
-                SIGEV_SIGNAL => {
-                    // Send signal to process
-                    // Full Linux ABI: signal should include siginfo with si_code=SI_MESGQ,
-                    // si_value=sigev_value, si_pid, si_uid
-                    let tgid = n.owner_pid as i64;
-                    let signo = n.sigev_signo;
-                    crate::signal::syscall::sys_kill(tgid, signo as u32);
-                }
-                SIGEV_THREAD_ID => {
-                    // Send signal to specific thread
-                    let tgid = n.owner_pid as i64;
-                    let tid = n.owner_tid as i64;
-                    let signo = n.sigev_signo;
-                    crate::signal::syscall::sys_tgkill(tgid, tid, signo as u32);
-                }
-                SIGEV_NONE => {
-                    // No notification - just unregister
-                }
-                _ => {}
+            // The notification carries the registrant's authority, not
+            // the message sender's (Linux __do_notify bypasses the kill
+            // permission check), so send directly rather than through
+            // the checked syscall path. hk has no siginfo queue, so
+            // si_code SI_MESGQ / sigev_value are not conveyed yet.
+            if n.sigev_notify == SIGEV_SIGNAL {
+                crate::signal::send_signal_to_process(n.owner_pid, n.sigev_signo as u32);
             }
             // Notification is one-shot, already removed by take()
         }
@@ -864,7 +850,6 @@ pub fn sys_mq_notify(mqdes: i32, sevp_ptr: u64) -> i64 {
     };
 
     let current_pid = crate::task::percpu::current_pid();
-    let current_tid_val = current_tid();
 
     if sevp_ptr == 0 {
         // Remove notification (only if we own it)
@@ -886,8 +871,10 @@ pub fn sys_mq_notify(mqdes: i32, sevp_ptr: u64) -> i64 {
 
     // Validate notification type
     match sev.sigev_notify {
-        SIGEV_NONE | SIGEV_SIGNAL | SIGEV_THREAD_ID => {}
-        SIGEV_THREAD => return KernelError::InvalidArgument.sysret(), // Not supported (requires user-space pthread)
+        SIGEV_NONE | SIGEV_SIGNAL => {}
+        // Linux mqueue notify does not take SIGEV_THREAD_ID (only
+        // timers do); SIGEV_THREAD is a user-space pthread mechanism
+        SIGEV_THREAD_ID | SIGEV_THREAD => return KernelError::InvalidArgument.sysret(),
         _ => return KernelError::InvalidArgument.sysret(),
     }
 
@@ -902,11 +889,6 @@ pub fn sys_mq_notify(mqdes: i32, sevp_ptr: u64) -> i64 {
     // Register notification
     *notify = Some(MqNotify {
         owner_pid: current_pid,
-        owner_tid: if sev.sigev_notify == SIGEV_THREAD_ID {
-            sev.sigev_notify_tid as u64
-        } else {
-            current_tid_val
-        },
         sigev_notify: sev.sigev_notify,
         sigev_signo: sev.sigev_signo,
         sigev_value: sev.sigev_value,

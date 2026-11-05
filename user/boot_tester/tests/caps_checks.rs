@@ -64,6 +64,7 @@ pub fn run_tests() {
     report(b"KEYS_NO_ROOT_BYPASS", in_child(keys_no_root_bypass));
     report(b"CLONE3_ERROR_NO_LEAK", in_child(clone3_error_no_leak));
     report(b"KEY_REVOKE_UPDATE", in_child_with(key_revoke_update));
+    report(b"SIGNAL_PERM", signal_perm());
 }
 
 fn report(name: &[u8], step: u64) {
@@ -219,6 +220,44 @@ fn reap(pid: i64) {
     hk_syscall::sys_kill(pid, 9);
     let mut ws = 0;
     sys_wait4(pid, &mut ws, 0, 0);
+}
+
+/// An unprivileged process without CAP_KILL cannot signal a process it
+/// does not own (Linux check_kill_permission): kill and tgkill both
+/// return EPERM. The attacker drops to uid 1000 with no capabilities;
+/// the victim stays root.
+fn signal_perm() -> u64 {
+    const SIGKILL: u32 = 9;
+    let victim = sleeper();
+    if victim < 0 {
+        return 90;
+    }
+    let att = sys_fork();
+    if att == 0 {
+        const CAP_KILL: u32 = 5;
+        // Drop CAP_KILL while still root (capset can only shrink), then
+        // become uid 1000: now neither capability nor ownership permits
+        // signaling the root victim
+        let code = if !set_effective(!(1 << CAP_KILL)) {
+            2
+        } else if sys_setresuid(1000, 1000, 1000) != 0 {
+            3
+        } else if hk_syscall::sys_kill(victim, SIGKILL) != EPERM {
+            4
+        } else if hk_syscall::sys_tgkill(victim, victim, SIGKILL) != EPERM {
+            5
+        } else {
+            0
+        };
+        sys_exit(code);
+    }
+    let mut st = 0i32;
+    sys_wait4(att, &mut st, 0, 0);
+    reap(victim);
+    if st & 0x7f != 0 {
+        return 80;
+    }
+    ((st >> 8) & 0xff) as u64
 }
 
 /// As uid 1000: EPERM for root's `root_task`, 0 for its own child
