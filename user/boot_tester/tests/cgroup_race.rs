@@ -34,7 +34,7 @@
 //!   pids.events.local and in pids.events there and above (not below):
 //!   refused at the child, both count 1 in the child and the parent's
 //!   pids.events 1; refused at the parent, only the parent's counters
-//!   move (Linux pids_event).
+//!   move (Linux 6.11+ pids_event; skipped on older hosts).
 //! - CPU_MAX_RW: cpu.max reads back what was written ("max" keeps the
 //!   period; out of Linux's bounds is EINVAL); while one process rewrites it with two values, a reader
 //!   only ever sees one of them whole, never one's quota with the
@@ -64,7 +64,13 @@ pub fn run_tests() {
     report(b"CGROUP_PROCS_TGID", in_child(cgroup_procs_tgid));
     report(b"CGROUP_PROCS_EXITED_LEADER", procs_exited_leader());
     report(b"CGROUP_SUBTREE_CONTROL", subtree_control());
-    report(b"PIDS_EVENTS", pids_events());
+    // Hierarchical pids.events and pids.events.local: Linux 6.11
+    // (3f26a885a068); CI's reference kernel may be older
+    if super::helpers::linux_at_least(6, 11) {
+        report(b"PIDS_EVENTS", pids_events());
+    } else {
+        super::helpers::skip(b"PIDS_EVENTS", b"Linux 6.11 pids events");
+    }
     report(b"CPU_MAX_RW", cpu_max_rw());
 }
 
