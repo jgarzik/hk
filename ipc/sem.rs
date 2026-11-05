@@ -1112,19 +1112,18 @@ pub fn clone_task_semundo(parent_tid: Tid, child_tid: Tid, share: bool) {
 /// exit_sem)
 ///
 /// If the task's undo list is shared (via CLONE_SYSVSEM), the
-/// adjustments are only applied when the last sharing task exits (Arc
-/// refcount drops to 1).
+/// adjustments are only applied when the last sharing task exits (its
+/// drop is the one `Arc::into_inner` gives the list to).
 pub fn exit_sem(tid: Tid) {
     let undo_list = {
         let mut table = TASKLIST.write();
         table.get_mut(tid).and_then(|mut t| t.sysvsem.take())
     };
-    let Some(undo_list) = undo_list else {
+    // The last sharer's drop gives the list back, exactly once even when
+    // CLONE_SYSVSEM sharers exit together (Linux refcount_dec_and_test)
+    let Some(undo_list) = undo_list.and_then(Arc::into_inner) else {
         return;
     };
-    if Arc::strong_count(&undo_list) > 1 {
-        return;
-    }
     let arrays = core::mem::take(&mut *undo_list.arrays.lock());
     let pid = current_pid() as i32;
     for (_, weak) in arrays {
