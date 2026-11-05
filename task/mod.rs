@@ -895,6 +895,9 @@ pub mod pf {
     pub const FORKNOEXEC: u32 = 0x0000_0040;
     /// Kernel thread (Linux PF_KTHREAD)
     pub const KTHREAD: u32 = 0x0020_0000;
+    /// Used a capability (Linux PF_SUPERPRIV, set by ns_capable_common;
+    /// not inherited by fork): the process accounting ASU flag
+    pub const SUPERPRIV: u32 = 0x0000_0100;
     /// Its CPU affinity is not the user's to change (Linux
     /// PF_NO_SETAFFINITY): every hk kernel thread is bound to its CPU
     pub const NO_SETAFFINITY: u32 = 0x0400_0000;
@@ -2246,11 +2249,17 @@ pub fn cap_fix_setfsuid(old: &Cred, new: &mut Cred) {
     }
 }
 
+/// The current task holds `cap` (Linux capable: ns_capable_common, which
+/// marks the task PF_SUPERPRIV when it does)
 pub fn capable(cap: u32) -> bool {
     if cap > CAP_LAST_CAP {
         return false;
     }
-    percpu::current_cred().cap_effective.has(cap)
+    let ok = percpu::current_cred().cap_effective.has(cap);
+    if ok {
+        percpu::current().set_flag(pf::SUPERPRIV);
+    }
+    ok
 }
 
 // =============================================================================

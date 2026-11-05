@@ -48,10 +48,16 @@ pub fn cred() -> Cred {
     crate::task::current_cred()
 }
 
-/// Effective capability check against explicit credentials
-/// (capable_wrt_inode_uidgid: hk has a single user namespace)
+/// Effective capability check against explicit credentials (the
+/// caller's, or its override credentials: capable_wrt_inode_uidgid; hk
+/// has a single user namespace); a granted one marks the task
+/// PF_SUPERPRIV, as Linux ns_capable_common
 pub fn capable(c: &Cred, cap: u32) -> bool {
-    c.cap_effective.has(cap)
+    let ok = c.cap_effective.has(cap);
+    if ok {
+        crate::task::percpu::current().set_flag(crate::task::pf::SUPERPRIV);
+    }
+    ok
 }
 
 /// in_group_p: the fsgid or a supplementary group

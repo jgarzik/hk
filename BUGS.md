@@ -887,14 +887,6 @@ From a whole-tree audit for designs that grew one commit at a time.
 Fixed already: clock setting, seccomp actions, kcmp/pidfd_getfd access,
 sched pid 0, flock/POSIX release, signalfd reader, errno flattening.
 
-- **Privilege by uid instead of capable()** (L): about 29 `euid == 0`
-  style checks remain where Linux tests a capability (`task/id.rs` x6
-  CAP_SETUID/SETGID, `ns/uts.rs` and `ns/mod.rs` CAP_SYS_ADMIN,
-  `task/rlimit.rs` CAP_SYS_RESOURCE, `ipc/msg.rs` CAP_SYS_RESOURCE,
-  `ipc/mqueue.rs` DAC_OVERRIDE, `ipc/util.rs` CAP_IPC_OWNER missing,
-  `keys/key.rs` (fsuid, no root bypass), `task/acct.rs` ASU flag). Linux's
-  own uid-0 rules (`sysctl.rs`, `fs/dac.rs`) are right as they are.
-  `task::capable` should be the only privilege test.
 - **Syscalls that do not deliver** (H/C): inotify and fanotify never
   queue an event (no fsnotify hooks in the VFS); there is no siginfo
   queue (signals are a bitmask: rt_sigqueueinfo's data, si_pid/si_uid
@@ -930,8 +922,7 @@ sched pid 0, flock/POSIX release, signalfd reader, errno flattening.
   TASKLIST and network locks inside it (not in LOCKING.md).
 - **Stale comments and dead code** (as touched): about 155
   `#[allow(dead_code)]`, 90 "for now"/TODO markers; comments that
-  contradict the code in `task/id.rs:87`, `ns/mod.rs:558`,
-  `ns/uts.rs:224`, `task/rlimit.rs:264`, `task/misc.rs:1311`.
+  contradict the code in `ns/mod.rs` (setns) and `task/misc.rs`.
 
 ## P2 review findings (open)
 From the P2 /code-review (unverified). Tag = roadmap phase (doc/ROADMAP.md).
