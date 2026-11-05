@@ -934,15 +934,6 @@ Tag = roadmap phase (doc/ROADMAP.md).
    by key (removals check the entry). The test prints the lines with
    either port when it fails.
 
-## Security gaps (Linux CVE patterns)
-
-Ranked. P# = the pattern's number in doc/res/hk-linux-cve-patterns.md.
-
-1. **mmap offset + length is not checked for wrap** (P6).
-   `mm/syscall.rs:78`: a file offset near 2^64 wraps the page index of
-   the mapping's pages; Linux do_mmap is EOVERFLOW when
-   pgoff + (len >> PAGE_SHIFT) wraps.
-
 ## epoll accepts files Linux cannot poll
 
 **Location**: `io/epoll.rs`, `fs/file.rs` (`FileOps::poll`)
