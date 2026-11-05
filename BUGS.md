@@ -948,6 +948,16 @@ Ranked. P# = the pattern's number in doc/res/hk-linux-cve-patterns.md.
    that read as errnos. Linux rw_verify_area (EINVAL) and
    generic_write_check_limits (EFBIG at MAX_LFS_FILESIZE).
 
+## epoll accepts files Linux cannot poll
+
+**Location**: `io/epoll.rs`, `fs/file.rs` (`FileOps::poll`)
+
+EPOLL_CTL_ADD of a regular file or directory is EPERM on Linux
+(file_can_poll: no f_op->poll), but every hk `FileOps` has a default
+poll, so hk accepts it and reports it always ready. Needs a
+`FileOps::can_poll` (false for the regular-file and directory ops of
+ramfs/tmpfs/vfat and most procfs files) checked at add.
+
 ## Allocation sizing and pure-code gaps
 
 Ranked. Not yet confirmed by a test.
