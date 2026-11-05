@@ -2157,8 +2157,10 @@ nanoseconds), like Linux's `i_*time_sec` / `i_*time_nsec` fields:
   `generic_fillattr`). A read racing a write may pair the new seconds with
   the old nanoseconds, as on Linux.
 - **Writes** hold `i_rwsem` exclusive (Linux `notify_change` under
-  `inode_lock`): utimensat/utimes/utime take it after `want_write` and the
-  permission check, then set atime, mtime and ctime.
+  `inode_lock`): utimensat/utimes/utime take it after `want_write`, then
+  check permission (owner, CAP_FOWNER or write access; Linux
+  setattr_prepare inside notify_change) and set atime, mtime and ctime
+  in the same hold.
 - **Mode, uid and gid** follow the same rule: chmod and chown take
   `i_rwsem` after `want_write` and keep it across the permission checks,
   the set-id kill computed from the current mode, the stores and ctime
