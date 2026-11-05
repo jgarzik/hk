@@ -2452,6 +2452,8 @@ fn vfat_mount_dev(
 
     // Create superblock
     let sb = SuperBlock::new(fs_type, &VFAT_SUPER_OPS, 0);
+    // FAT sizes are 32-bit (Linux fat_fill_super: s_maxbytes 0xffffffff)
+    sb.set_maxbytes(0xffff_ffff);
     sb.set_private(sb_data.clone());
 
     // Create root inode

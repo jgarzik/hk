@@ -942,11 +942,6 @@ Ranked. P# = the pattern's number in doc/res/hk-linux-cve-patterns.md.
    `mm/syscall.rs:78`: a file offset near 2^64 wraps the page index of
    the mapping's pages; Linux do_mmap is EOVERFLOW when
    pgoff + (len >> PAGE_SHIFT) wraps.
-2. **pwrite/write past LLONG_MAX is not refused** (P6). `fs/io.rs:210`
-   checks only `offset >= 0` and there is no s_maxbytes: pos + count
-   can exceed i64::MAX, giving a negative st_size and lseek results
-   that read as errnos. Linux rw_verify_area (EINVAL) and
-   generic_write_check_limits (EFBIG at MAX_LFS_FILESIZE).
 
 ## epoll accepts files Linux cannot poll
 

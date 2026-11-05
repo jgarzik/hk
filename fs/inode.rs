@@ -725,12 +725,49 @@ impl Inode {
         self.private.read().clone()
     }
 
+    /// Largest size this inode's filesystem allows (s_maxbytes)
+    pub fn maxbytes(&self) -> u64 {
+        self.sb
+            .upgrade()
+            .map_or(super::superblock::MAX_LFS_FILESIZE, |sb| sb.maxbytes())
+    }
+
+    /// Cut a write of `count` bytes at `pos` to the limits (Linux
+    /// generic_write_check_limits): RLIMIT_FSIZE (at or past it SIGXFSZ
+    /// and EFBIG, else a short write up to it), then s_maxbytes (EFBIG
+    /// at or past it, else short)
+    pub fn write_limit(&self, pos: u64, count: usize) -> Result<usize, KernelError> {
+        use crate::task::rlimit::{RLIM_INFINITY, RLIMIT_FSIZE, rlimit};
+        let mut count = count as u64;
+        let limit = rlimit(RLIMIT_FSIZE);
+        if limit != RLIM_INFINITY {
+            if pos >= limit {
+                crate::signal::send_signal(
+                    crate::task::percpu::current_tid(),
+                    crate::signal::SIGXFSZ,
+                );
+                return Err(KernelError::FileTooLarge);
+            }
+            count = count.min(limit - pos);
+        }
+        let max = self.maxbytes();
+        if pos >= max {
+            return Err(KernelError::FileTooLarge);
+        }
+        Ok(count.min(max - pos) as usize)
+    }
+
     /// A file may grow to `size` (Linux inode_newsize_ok): past
-    /// RLIMIT_FSIZE is SIGXFSZ and EFBIG; shrinking an active swap file
-    /// is ETXTBSY
+    /// s_maxbytes is EFBIG, past RLIMIT_FSIZE SIGXFSZ and EFBIG;
+    /// shrinking an active swap file is ETXTBSY
     pub fn newsize_ok(&self, size: u64) -> Result<(), KernelError> {
         use crate::task::rlimit::{RLIM_INFINITY, RLIMIT_FSIZE, rlimit};
         if size > self.get_size() {
+            // Past the filesystem's largest file (s_maxbytes): EFBIG,
+            // with no signal
+            if size > self.maxbytes() {
+                return Err(KernelError::FileTooLarge);
+            }
             let limit = rlimit(RLIMIT_FSIZE);
             if limit != RLIM_INFINITY && size > limit {
                 crate::signal::send_signal(

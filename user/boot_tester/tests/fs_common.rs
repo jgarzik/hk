@@ -93,6 +93,63 @@ pub fn run_normalized_tests(prefix: &[u8], fs_name: &[u8]) {
     test_ftruncate_extend(prefix, fs_name);
     test_rename(prefix, fs_name);
     test_rename_overwrite(prefix, fs_name);
+    test_write_limits(prefix, fs_name);
+}
+
+/// The write limits (Linux rw_verify_area, generic_write_check_limits,
+/// inode_newsize_ok): an end past LLONG_MAX is EINVAL; a write crossing
+/// RLIMIT_FSIZE is cut short at it, and one at it is SIGXFSZ (which
+/// kills); on vfat, growing past 4 GiB - 1 (s_maxbytes) is EFBIG
+fn test_write_limits(prefix: &[u8], fs_name: &[u8]) {
+    const EINVAL: i64 = -22;
+    const EFBIG: i64 = -27;
+    const SIGXFSZ: i32 = 25;
+    let mut path_buf = [0u8; 128];
+    let test_file = make_path(prefix, b"norm_limits.txt", &mut path_buf);
+    let fd = sys_open(test_file.as_ptr(), O_CREAT | O_RDWR, 0o644);
+    let buf = [b'z'; 200];
+    let step = (|| {
+        if fd < 0 {
+            return 1;
+        }
+        if hk_syscall::sys_pwrite64(fd as i32, buf.as_ptr(), 10, i64::MAX - 5) != EINVAL {
+            return 2;
+        }
+        if fs_name == b"VFAT" && sys_ftruncate(fd as i32, 1 << 32) != EFBIG {
+            return 3;
+        }
+        let pid = hk_syscall::sys_fork();
+        if pid == 0 {
+            let lim = hk_syscall::RLimit {
+                rlim_cur: 100,
+                rlim_max: 100,
+            };
+            if hk_syscall::sys_setrlimit(1, &lim) != 0 {
+                hk_syscall::sys_exit(4);
+            }
+            if sys_write(fd as u64, buf.as_ptr(), 200) != 100 {
+                hk_syscall::sys_exit(5);
+            }
+            sys_write(fd as u64, buf.as_ptr(), 1);
+            hk_syscall::sys_exit(6);
+        }
+        let mut st = 0i32;
+        hk_syscall::sys_wait4(pid, &mut st, 0, 0);
+        if st & 0x7f != SIGXFSZ {
+            return 10 + ((st >> 8) & 0xff) as i64;
+        }
+        0
+    })();
+    if fd >= 0 {
+        sys_close(fd as u64);
+    }
+    sys_unlink(test_file.as_ptr());
+    if step != 0 {
+        print(b"  write limits step ");
+        print_num(step);
+        println(b"");
+    }
+    print_marker(fs_name, b"WRITE_LIMITS", step == 0);
 }
 
 /// Test: mkdir - create a directory

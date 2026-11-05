@@ -26,6 +26,10 @@ use super::syscall::{current_fd_table, get_nofile_limit};
 fn do_truncate(inode: &Arc<super::Inode>, length: u64) -> i64 {
     // Check RLIMIT_FSIZE when extending the file
     let current_size = inode.get_size();
+    // Past the filesystem's largest file (Linux inode_newsize_ok)
+    if length > current_size && length > inode.maxbytes() {
+        return KernelError::FileTooLarge.sysret();
+    }
     if length > current_size {
         let limit = crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_FSIZE);
         if limit != crate::task::rlimit::RLIM_INFINITY && length > limit {

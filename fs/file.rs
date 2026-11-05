@@ -698,11 +698,14 @@ impl File {
                 (false, at) => at,
             };
             let pos = at.unwrap_or_else(|| self.get_pos());
-            super::syscall::check_fsize_limit(pos, len).map_err(|_| KernelError::FileTooLarge)?;
-            if len > 0 {
-                // file_remove_privs: set-id bits go unless CAP_FSETID
-                super::dac::remove_privs(&inode);
+            // A zero-length write checks nothing (Linux: count 0 returns
+            // before generic_write_checks)
+            if len == 0 {
+                return Ok(0);
             }
+            let len = inode.write_limit(pos, len)?;
+            // file_remove_privs: set-id bits go unless CAP_FSETID
+            super::dac::remove_privs(&inode);
             self.write_chunks(len, at, flags, src)
         })()
     }
