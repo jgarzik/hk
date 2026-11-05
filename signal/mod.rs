@@ -2036,6 +2036,14 @@ pub fn force_sig_fault(sig: u32, info: KSigInfo, regs: &UserFrame) {
     let do_exit = do_group_exit;
 
     let tid = crate::task::percpu::current_tid();
+    // A traced task's fault signal is queued like any other, so the
+    // tracer sees its signal-delivery stop first (Linux force_sig_fault
+    // -> get_signal -> ptrace_signal); delivered on the way back to user
+    // space, it is unblocked and not ignored, as force_sig makes it
+    if crate::task::ptrace::is_traced(tid) {
+        force_sig(tid, sig);
+        return;
+    }
     let sighand = get_task_sighand(tid);
     let action = sighand
         .as_ref()
