@@ -1012,6 +1012,10 @@ where
     // Now we need to update the current task and switch to the new address space
     // This is the point of no return
 
+    // The thread and process keyrings are not for the new image (Linux
+    // prepare_exec_creds)
+    crate::keys::keyring::exec_keyrings(percpu::current_tid());
+
     // What the process registered before (an mq_notify) is not for the
     // new image (Linux setup_new_exec: self_exec_id++); after de_thread
     // the caller leads the process

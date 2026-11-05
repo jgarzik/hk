@@ -80,6 +80,27 @@ pub fn set_task_keyrings(tid: u64, keyrings: TaskKeyrings) {
     }
 }
 
+/// The keyrings of a new task (Linux copy_creds): the session keyring
+/// always; the process keyring only for a thread of the same process;
+/// a thread keyring of its own for a thread whose creator has one
+pub fn fork_keyrings(parent: &TaskKeyrings, thread: bool, uid: u32, gid: u32) -> TaskKeyrings {
+    TaskKeyrings {
+        session_keyring: parent.session_keyring.clone(),
+        process_keyring: parent.process_keyring.clone().filter(|_| thread),
+        thread_keyring: (thread && parent.thread_keyring.is_some())
+            .then(|| create_keyring("_tid", uid, gid)),
+    }
+}
+
+/// At exec's point of no return (Linux prepare_exec_creds): the thread
+/// and process keyrings go, the session keyring stays
+pub fn exec_keyrings(tid: u64) {
+    let mut k = get_task_keyrings(tid);
+    k.thread_keyring = None;
+    k.process_keyring = None;
+    set_task_keyrings(tid, k);
+}
+
 /// Create a new keyring with the given description
 pub fn create_keyring(description: &str, uid: u32, gid: u32) -> Arc<Key> {
     let serial = alloc_serial();

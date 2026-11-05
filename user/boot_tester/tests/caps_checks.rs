@@ -68,6 +68,7 @@ pub fn run_tests() {
     report(b"KEY_CYCLE_EDEADLK", key_cycle());
     report(b"KEY_DEPTH_ELOOP", key_depth());
     report(b"KEY_SEARCH_NESTED_PERM", key_search_nested());
+    report(b"KEY_FORK_KEYRINGS", in_child(key_fork_keyrings));
     report(b"KEY_LINK_PERM", key_link_perm());
     report(b"KEY_QUOTA", key_quota());
     report(b"KEY_GC", key_gc());
@@ -558,6 +559,36 @@ fn key_search_nested() -> u64 {
         return 6;
     }
     0
+}
+
+/// A forked process inherits its parent's session keyring but not its
+/// process keyring (Linux copy_creds)
+fn key_fork_keyrings() -> u64 {
+    const KEYCTL_GET_KEYRING_ID: i32 = 0;
+    const SESSION: u64 = -3i64 as u64;
+    const PROCESS: u64 = -2i64 as u64;
+    const ENOKEY: i64 = -126;
+    let ses = keyctl(KEYCTL_GET_KEYRING_ID, SESSION, 1, 0);
+    let proc_ = keyctl(KEYCTL_GET_KEYRING_ID, PROCESS, 1, 0);
+    if ses <= 0 || proc_ <= 0 {
+        return 1;
+    }
+    let pid = sys_fork();
+    if pid == 0 {
+        if keyctl(KEYCTL_GET_KEYRING_ID, SESSION, 0, 0) != ses {
+            sys_exit(2);
+        }
+        if keyctl(KEYCTL_GET_KEYRING_ID, PROCESS, 0, 0) != ENOKEY {
+            sys_exit(3);
+        }
+        sys_exit(0);
+    }
+    let mut st = 0i32;
+    sys_wait4(pid, &mut st, 0, 0);
+    if st & 0x7f != 0 {
+        return 80;
+    }
+    ((st >> 8) & 0xff) as u64
 }
 
 fn add_keyring(desc: &[u8]) -> i64 {

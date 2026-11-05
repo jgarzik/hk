@@ -2194,6 +2194,18 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     if parent_nproc_exceeded {
         child_task.set_flag(crate::task::pf::NPROC_EXCEEDED);
     }
+    // Its keyrings (Linux copy_creds), made before it is visible
+    {
+        // The child's credentials are a copy of the parent's here
+        let parent_keys = current().keyrings.lock().clone();
+        let keys = crate::keys::keyring::fork_keyrings(
+            &parent_keys,
+            config.flags & CLONE_THREAD != 0,
+            parent_cred.fsuid,
+            parent_cred.fsgid,
+        );
+        *child_task.keyrings.lock() = keys;
+    }
     child_task
         .se
         .set_params(policy_class(c_policy), c_policy, c_static, c_rt);
