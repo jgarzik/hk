@@ -3571,7 +3571,7 @@ Correct uses of atomics in hk:
 | `Inode` | size | Linux i_size_write/read: Release under i_rwsem, Acquire lock-free, so the bytes below it are visible first |
 | `Sock` | flags, error, buffer sizes | Independent values; protocol data under the socket lock |
 | `Sock` | shutdown | Written under the protocol socket lock (TCP `cb`, unix `st`); read lock-free by poll |
-| TCP `MEM` (`net/tcp/cb.rs`) | global quanta allocated | Linux tcp_memory_allocated: a connection adds what its queues lack under its `cb`, then checks the limit and subtracts again on failure (add-then-check, never a separate free-space read); Relaxed, a count that publishes nothing |
+| TCP memory (`net/tcp/mem.rs`) | `ALLOCATED`, `LIMITS` (tcp_mem), `PRESSURE`, `SOCKETS` | Linux tcp_memory_allocated, sysctl_tcp_mem, tcp_memory_pressure, tcp_sockets_allocated: a connection adds what its queues lack under its `cb`, then checks the limits and subtracts again on failure (add-then-check, never a separate free-space read); the limits are independent sysctl words; pressure is a mode flag any raise may set or clear; all Relaxed, counts and modes that publish nothing |
 | `CachedPage` | refcount, dirty, writeback, locked | Linux page cache pattern - flags + refcount |
 
 ---

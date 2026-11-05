@@ -97,7 +97,9 @@ Listed because real traffic reaches them: TCP has no SACK (never
 advertised), no CUBIC (only "reno"; Linux defaults to cubic), no
 receive or send buffer autotuning (the window is SO_RCVBUF / 2; no
 tcp_sndbuf_expand, so past the TCP memory hard limit a sender's
-SO_SNDBUF is not shrunk, sk_stream_moderate_sndbuf), no per-netns
+SO_SNDBUF is not shrunk, sk_stream_moderate_sndbuf; no rcv_ssthresh,
+so memory pressure does not clamp windows), no orphan count limit
+(tcp_max_orphans; only the memory half of tcp_out_of_resources), no per-netns
 RFC 5961 challenge-ACK budget (only Linux's per-connection 500 ms
 limit), and TCP_DEFER_ACCEPT / TCP_FASTOPEN are stored only.
 No SYN cookies (a full listener drops SYNs). ICMP
@@ -934,6 +936,9 @@ sched pid 0, flock/POSIX release, signalfd reader, errno flattening.
   (no seq_file records, so chunked reads of /proc/net/* can tear);
   global generators run under the procfs inode's read lock and take
   TASKLIST and network locks inside it (not in LOCKING.md).
+  /proc/sys is one static tree: the sysctls Linux registers for the
+  initial network namespace only (net/ipv4/tcp_mem) appear in every
+  namespace.
 - **Stale comments and dead code** (as touched): about 155
   `#[allow(dead_code)]`, 90 "for now"/TODO markers; comments that
   contradict the code in `ns/mod.rs` (setns) and `task/misc.rs`.

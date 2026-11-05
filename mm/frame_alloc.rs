@@ -212,6 +212,13 @@ impl FrameAllocator {
         self.zone.free_pages_all()
     }
 
+    /// Free pages above the high watermark (Linux nr_free_buffer_pages,
+    /// which sizes the network memory limits)
+    pub fn buffer_pages(&self) -> usize {
+        self.free_frames()
+            .saturating_sub(self.zone.wmark(Wmark::High))
+    }
+
     /// Free memory is down to the low watermark, where user data
     /// (anonymous pages, unevictable page cache) stops
     pub fn low(&self) -> bool {

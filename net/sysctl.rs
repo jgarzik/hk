@@ -362,6 +362,13 @@ pub static CTLS: &[Ctl] = &[
         text: None,
     },
     Ctl {
+        path: "net/ipv4/tcp_mem",
+        mode: 0o644,
+        show: crate::net::tcp::mem::sysctl_show,
+        store: crate::net::tcp::mem::sysctl_store,
+        text: None,
+    },
+    Ctl {
         path: "net/ipv4/tcp_rmem",
         mode: 0o644,
         show: rmem_show,

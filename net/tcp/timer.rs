@@ -29,7 +29,9 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::sync::spin::Mutex;
 
-use super::cb::{ORPHAN_RETRIES, Out, RTO_FALLBACK, RTO_MAX, RTO_MIN, TcpCb, TcpState, Tmr};
+use super::cb::{
+    ORPHAN_RETRIES, Out, RTO_FALLBACK, RTO_MAX, RTO_MIN, TIMEWAIT_LEN, TcpCb, TcpState, Tmr,
+};
 use super::output::Push;
 use crate::util::error::KernelError;
 
@@ -156,6 +158,12 @@ impl TcpCb {
             // The head went out about one (backed-off) RTO ago
             self.rtx_stamp = Some(now.saturating_sub(self.rto_cur()));
         }
+        // Linux tcp_write_timeout: reset while the RTO is short or the
+        // retries are not used up
+        let reset = self.rto_cur() < RTO_MAX || !self.gave_up(self.backoff, now);
+        if !handshake && self.out_of_resources(now, reset, out) {
+            return;
+        }
         if self.gave_up(self.backoff, now) {
             self.timed_out(out);
             return;
@@ -177,6 +185,25 @@ impl TcpCb {
         self.arm_rtx(now);
     }
 
+    /// An orphan holding send data while TCP memory is past its hard
+    /// limit is dropped (Linux tcp_out_of_resources, its memory half):
+    /// with a reset when `reset`, when it sent within TIME_WAIT's length,
+    /// or when the peer's window is shut with nothing in flight
+    fn out_of_resources(&mut self, now: u64, reset: bool, out: &mut Out) -> bool {
+        if !self.orphan || !super::mem::out_of_memory(self.sndq.len()) {
+            return false;
+        }
+        let reset = reset
+            || now.saturating_sub(self.lsndtime) <= TIMEWAIT_LEN
+            || (self.snd_wnd == 0 && self.snd_una == self.snd_max);
+        if reset {
+            self.abort(out);
+        } else {
+            self.set_closed(out);
+        }
+        true
+    }
+
     /// Probe timer (Linux tcp_probe_timer / tcp_send_probe0): an open
     /// window means data held by cork or Nagle: push one segment; a zero
     /// window is probed, backing off; a peer that never answers is given
@@ -195,6 +222,9 @@ impl TcpCb {
         self.probes += 1;
         if self.gave_up(self.probes - 1, now) {
             self.timed_out(out);
+            return;
+        }
+        if self.out_of_resources(now, true, out) {
             return;
         }
         self.send_probe(out);

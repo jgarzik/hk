@@ -144,6 +144,7 @@ pub mod sysv_race;
 pub mod tcp;
 pub mod tcp_close;
 pub mod tcp_conn;
+pub mod tcp_mem;
 pub mod tcp_opt;
 pub mod tcp_xfer;
 pub mod timer_accuracy;
@@ -305,6 +306,7 @@ pub fn run_all_tests() {
     packet::run_tests();
     tcp_xfer::run_tests();
     tcp_conn::run_tests();
+    tcp_mem::run_tests();
     tcp_opt::run_tests();
     tcp_close::run_tests();
     net_stress::run_tests();
