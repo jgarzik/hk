@@ -469,6 +469,7 @@ fn bpf_prog_load(attr_buf: &[u8]) -> i64 {
     const SOCKET_FILTER: Kind = Kind {
         ctx_size: 64,
         helpers: &[],
+        unreachable_ok: false,
     };
     if let Err(e) = verify(&insns, &SOCKET_FILTER, super::insn::BPF_MAXINSNS) {
         return e.sysret();

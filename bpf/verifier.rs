@@ -9,7 +9,7 @@
 //!    width, no division by a zero constant, no write to R10), every
 //!    jump goes forward and lands inside the program and not on the
 //!    second half of a 64-bit immediate, every instruction is reachable
-//!    and none falls off the end. Forward-only jumps make every program
+//!    (unless the kind allows dead code) and none falls off the end. Forward-only jumps make every program
 //!    terminate within its length (Linux before bounded loops).
 //! 2. `do_check` follows every path with an explicit worklist, tracking
 //!    each register as uninitialized, a scalar (a known constant or
@@ -52,6 +52,9 @@ pub struct Kind {
     pub ctx_size: usize,
     /// Callable helpers: (id, number of scalar arguments)
     pub helpers: &'static [(i32, u8)],
+    /// Unreachable instructions are allowed (converted classic
+    /// programs: Linux accepts dead classic code)
+    pub unreachable_ok: bool,
 }
 
 /// What the verifier learned about a program it accepted
@@ -270,7 +273,7 @@ fn check_cfg(insns: &[BpfInsn], kind: &Kind) -> Result<Vec<bool>, KernelError> {
         if class == BPF_LD {
             second[pc + 1] = true;
         }
-        if !reach[pc] {
+        if !reach[pc] && !kind.unreachable_ok {
             return inval();
         }
         let (next, jump) = successors(insns, pc);

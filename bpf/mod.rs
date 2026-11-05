@@ -23,6 +23,7 @@
 //! socket filters and seccomp(2).
 
 pub mod classic;
+pub mod convert;
 mod fd;
 mod insn;
 pub mod interp;

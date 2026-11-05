@@ -359,6 +359,7 @@ use crate::util::error::KernelError;
 const KIND: Kind = Kind {
     ctx_size: 64,
     helpers: &[(7, 2)],
+    unreachable_ok: false,
 };
 
 fn check(p: &[BpfInsn]) -> Result<Verified, KernelError> {
@@ -528,4 +529,305 @@ fn verifier_explosion() {
     }
     p.push(EXIT);
     assert_eq!(check(&p), Err(KernelError::ArgListTooLong));
+}
+
+// ============================================================================
+// Classic BPF: convert-then-eBPF against the classic interpreter
+// ============================================================================
+
+use super::classic::{self as cl, Insn as CInsn};
+use super::convert;
+
+/// xorshift64*: deterministic test randomness
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 >> 12;
+        self.0 ^= self.0 << 25;
+        self.0 ^= self.0 >> 27;
+        self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
+    }
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+    /// A constant from the interesting ones, or random
+    fn k(&mut self) -> u32 {
+        const K: [u32; 8] = [
+            0,
+            1,
+            2,
+            31,
+            0x7fff_ffff,
+            0x8000_0000,
+            0xc000_003e,
+            0xffff_ffff,
+        ];
+        if self.below(2) == 0 {
+            K[self.below(8) as usize]
+        } else {
+            self.next() as u32
+        }
+    }
+}
+
+/// A packet and ancillary values (classic Env)
+struct Pkt {
+    data: alloc::vec::Vec<u8>,
+    salt: u32,
+}
+
+impl cl::Env for Pkt {
+    fn pkt_len(&self) -> u32 {
+        self.data.len() as u32
+    }
+    fn load(&self, off: i32, size: usize) -> Option<u32> {
+        let o = if off >= 0 {
+            off as usize
+        } else if off >= cl::SKF_LL_OFF && off < cl::SKF_NET_OFF {
+            (off - cl::SKF_LL_OFF) as usize
+        } else {
+            return None;
+        };
+        let b = self.data.get(o..o.checked_add(size)?)?;
+        Some(b.iter().fold(0u32, |v, &b| (v << 8) | b as u32))
+    }
+    fn anc(&self, ad: u32) -> u32 {
+        ad.wrapping_mul(0x9e37_79b9) ^ self.salt
+    }
+}
+
+/// seccomp_data-like words (classic Env, LDX_W_ABS)
+struct Words([u8; 64]);
+
+impl cl::Env for Words {
+    fn word(&self, k: u32) -> Option<u32> {
+        let k = k as usize;
+        let w = self.0.get(k..k + 4)?;
+        Some(u32::from_ne_bytes([w[0], w[1], w[2], w[3]]))
+    }
+}
+
+const fn c(code: u16, jt: u8, jf: u8, k: u32) -> CInsn {
+    CInsn { code, jt, jf, k }
+}
+
+/// One random body instruction at `pc` of `len` (`sc`: seccomp's subset)
+fn gen_insn(r: &mut Rng, pc: usize, len: usize, sc: bool) -> CInsn {
+    use cl::*;
+    let left = (len - pc - 1) as u64; // instructions after this one
+    let jt = |r: &mut Rng| r.below(left.min(255)) as u8;
+    loop {
+        let f = match r.below(14) {
+            0 | 1 => {
+                let ops = [ADD, SUB, MUL, DIV, OR, AND, LSH, RSH, XOR, MOD, NEG];
+                let op = ops[r.below(if sc { 9 } else { 11 }) as usize];
+                let x = r.below(2) == 1;
+                let mut k = r.k();
+                if !x && (op == LSH || op == RSH) {
+                    k %= 32;
+                }
+                if !x && (op == DIV || op == MOD) && k == 0 {
+                    k = 3;
+                }
+                let src = if x && op != NEG { X } else { K };
+                c(ALU | op | src, 0, 0, k)
+            }
+            2 => c(LD | IMM, 0, 0, r.k()),
+            3 => c(LDX | IMM, 0, 0, r.k()),
+            4 => c(
+                if r.below(2) == 0 { LD | MEM } else { LDX | MEM },
+                0,
+                0,
+                r.below(16) as u32,
+            ),
+            5 => c(
+                if r.below(2) == 0 { ST } else { STX },
+                0,
+                0,
+                r.below(16) as u32,
+            ),
+            6 => c(MISC | if r.below(2) == 0 { TAX } else { TXA }, 0, 0, 0),
+            7 if sc => c(LD | W | ABS, 0, 0, 4 * r.below(16) as u32),
+            7 => {
+                let size = [W, H, B][r.below(3) as usize];
+                let k = match r.below(4) {
+                    0 => (SKF_AD_OFF as u32).wrapping_add(4 * r.below(16) as u32),
+                    1 => (SKF_LL_OFF as u32).wrapping_add(r.below(40) as u32),
+                    _ => r.below(48) as u32,
+                };
+                c(LD | size | ABS, 0, 0, k)
+            }
+            8 if !sc => c(
+                LD | [W, H, B][r.below(3) as usize] | IND,
+                0,
+                0,
+                r.below(48) as u32,
+            ),
+            9 if !sc => c(LDX | B | MSH, 0, 0, r.below(48) as u32),
+            10 => c(
+                if r.below(2) == 0 {
+                    LD | W | LEN
+                } else {
+                    LDX | W | LEN
+                },
+                0,
+                0,
+                0,
+            ),
+            11 | 12 if left > 0 => {
+                let op = [JEQ, JGT, JGE, JSET][r.below(4) as usize];
+                let src = if r.below(3) == 0 { X } else { K };
+                c(JMP | op | src, jt(r), jt(r), r.k())
+            }
+            13 if left > 0 => c(JMP | JA, 0, 0, r.below(left) as u32),
+            13 => c(RET | if r.below(2) == 0 { A } else { K }, 0, 0, r.k()),
+            _ => continue,
+        };
+        return f;
+    }
+}
+
+/// A random program that passes classic::check: all of M[] stored
+/// first, then a random body, then a RET
+fn gen_prog(r: &mut Rng, sc: bool) -> alloc::vec::Vec<CInsn> {
+    use cl::*;
+    let body = 1 + r.below(120) as usize;
+    let mut p = alloc::vec::Vec::new();
+    for m in 0..16 {
+        p.push(c(LD | IMM, 0, 0, r.k()));
+        p.push(c(ST, 0, 0, m));
+    }
+    let len = p.len() + body + 1;
+    for pc in p.len()..len - 1 {
+        p.push(gen_insn(r, pc, len, sc));
+    }
+    p.push(c(RET | A, 0, 0, 0));
+    p
+}
+
+/// seccomp's load rewrite (as seccomp_check_filter does)
+fn seccomp_rewrite(p: &mut [CInsn]) {
+    for f in p {
+        if f.code == cl::LD | cl::W | cl::ABS {
+            f.code = cl::LDX_W_ABS;
+        } else if f.code == cl::LD | cl::W | cl::LEN {
+            *f = c(cl::LD | cl::IMM, 0, 0, 64);
+        } else if f.code == cl::LDX | cl::W | cl::LEN {
+            *f = c(cl::LDX | cl::IMM, 0, 0, 64);
+        }
+    }
+}
+
+#[test]
+fn differential_socket() {
+    let mut r = Rng(0x1234_5678_9abc_def1);
+    for _ in 0..3000 {
+        let p = gen_prog(&mut r, false);
+        cl::check(&p).unwrap();
+        let e = convert::convert(&p, &convert::SOCKET).unwrap();
+        assert!(super::verifier::verify(&e, &convert::SOCKET, usize::MAX).is_ok());
+        for _ in 0..4 {
+            let n = r.below(48) as usize;
+            let data = (0..n).map(|_| r.next() as u8).collect();
+            let env = Pkt {
+                data,
+                salt: r.next() as u32,
+            };
+            assert_eq!(cl::run(&p, &env), convert::run(&e, &[], &env), "{p:?}");
+        }
+    }
+}
+
+#[test]
+fn differential_seccomp() {
+    let mut r = Rng(0xfeed_face_cafe_beef);
+    for _ in 0..3000 {
+        let mut p = gen_prog(&mut r, true);
+        cl::check(&p).unwrap();
+        seccomp_rewrite(&mut p);
+        let e = convert::convert(&p, &convert::SECCOMP).unwrap();
+        assert!(super::verifier::verify(&e, &convert::SECCOMP, usize::MAX).is_ok());
+        for _ in 0..4 {
+            let mut w = [0u8; 64];
+            for b in &mut w {
+                *b = r.next() as u8;
+            }
+            let env = Words(w);
+            assert_eq!(cl::run(&p, &env), convert::run(&e, &w, &env), "{p:?}");
+        }
+    }
+}
+
+/// Linux's encoding: the lengths seccomp's path limit counts
+#[test]
+fn convert_lengths() {
+    use cl::*;
+    let len = |p: &[CInsn]| convert::convert(p, &convert::SECCOMP).unwrap().len();
+    // Prologue 3; RET K is two instructions; RET A one
+    assert_eq!(len(&[c(RET | K, 0, 0, 0)]), 5);
+    assert_eq!(len(&[c(RET | A, 0, 0, 0)]), 4);
+    // jf = 0: one jump; jt = 0 (JEQ): one inverted jump; else two
+    let j = |jt, jf, k| {
+        [
+            c(JMP | JEQ | K, jt, jf, k),
+            c(RET | A, 0, 0, 0),
+            c(RET | A, 0, 0, 0),
+        ]
+    };
+    assert_eq!(len(&j(1, 0, 5)), 3 + 1 + 2);
+    assert_eq!(len(&j(0, 1, 5)), 3 + 1 + 2);
+    assert_eq!(len(&j(0, 0, 5)), 3 + 1 + 2);
+    // A constant >= 2^31 goes through a register first
+    assert_eq!(len(&j(1, 0, 0xc000_003e)), 3 + 2 + 2);
+    // Division by X checks for zero
+    assert_eq!(
+        len(&[c(ALU | DIV | X, 0, 0, 0), c(RET | A, 0, 0, 0)]),
+        3 + 5 + 1
+    );
+}
+
+/// Unreachable classic code is legal (Linux accepts it)
+#[test]
+fn convert_unreachable() {
+    use cl::*;
+    let p = [
+        c(RET | K, 0, 0, 1),
+        c(LD | IMM, 0, 0, 2),
+        c(RET | A, 0, 0, 0),
+    ];
+    cl::check(&p).unwrap();
+    let e = convert::convert(&p, &convert::SECCOMP).unwrap();
+    assert_eq!(convert::run(&e, &[0; 64], &Words([0; 64])), 1);
+}
+
+/// busybox udhcpc's socket filter, converted
+#[test]
+fn convert_udhcpc() {
+    use cl::*;
+    let p = [
+        c(LD | B | ABS, 0, 0, 9),
+        c(JMP | JEQ | K, 0, 6, 17),
+        c(LD | H | ABS, 0, 0, 6),
+        c(JMP | JSET | K, 4, 0, 0x1fff),
+        c(LDX | B | MSH, 0, 0, 0),
+        c(LD | H | IND, 0, 0, 2),
+        c(JMP | JEQ | K, 0, 1, 68),
+        c(RET | K, 0, 0, 0x7fff_ffff),
+        c(RET | K, 0, 0, 0),
+    ];
+    let e = convert::convert(&p, &convert::SOCKET).unwrap();
+    let pkt = |dport: u16, frag: u16, n: usize| {
+        let mut d = alloc::vec![0u8; 28];
+        d[0] = 0x45;
+        d[6..8].copy_from_slice(&frag.to_be_bytes());
+        d[9] = 17;
+        d[22..24].copy_from_slice(&dport.to_be_bytes());
+        d.truncate(n);
+        Pkt { data: d, salt: 0 }
+    };
+    assert_eq!(convert::run(&e, &[], &pkt(68, 0, 28)), 0x7fff_ffff);
+    assert_eq!(convert::run(&e, &[], &pkt(67, 0, 28)), 0);
+    assert_eq!(convert::run(&e, &[], &pkt(68, 1, 28)), 0);
+    assert_eq!(convert::run(&e, &[], &pkt(68, 0, 21)), 0);
 }
