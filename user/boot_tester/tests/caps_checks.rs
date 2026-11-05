@@ -66,6 +66,7 @@ pub fn run_tests() {
     report(b"KEY_REVOKE_UPDATE", in_child_with(key_revoke_update));
     report(b"SIGNAL_PERM", signal_perm());
     report(b"KEY_CYCLE_EDEADLK", key_cycle());
+    report(b"KEY_DEPTH_ELOOP", key_depth());
     report(b"KEY_LINK_PERM", key_link_perm());
     report(b"KEY_QUOTA", key_quota());
     report(b"KEY_GC", key_gc());
@@ -474,6 +475,34 @@ const KEYCTL_LINK: i32 = 8;
 const EDEADLK: i64 = -35;
 
 /// A "keyring" key in the process keyring
+/// A cycle found within the search depth is EDEADLK; a link whose
+/// check must go past 6 nested keyrings is ELOOP (Linux
+/// keyring_detect_cycle with KEYRING_SEARCH_DETECT_TOO_DEEP)
+fn key_depth() -> u64 {
+    const ELOOP: i64 = -40;
+    let mut k = [0i64; 9];
+    for (i, r) in k.iter_mut().enumerate() {
+        let desc = [b'd', b'e', b'p', b'0' + i as u8, 0];
+        *r = add_keyring(&desc);
+        if *r <= 0 {
+            return 1;
+        }
+    }
+    // K[i + 1] linked into K[i]: a chain nine deep
+    for i in 0..8 {
+        if keyctl(KEYCTL_LINK, k[i + 1] as u64, k[i] as u64, 0) != 0 {
+            return 2;
+        }
+    }
+    if keyctl(KEYCTL_LINK, k[0] as u64, k[7] as u64, 0) != EDEADLK {
+        return 3;
+    }
+    if keyctl(KEYCTL_LINK, k[0] as u64, k[8] as u64, 0) != ELOOP {
+        return 4;
+    }
+    0
+}
+
 fn add_keyring(desc: &[u8]) -> i64 {
     hk_syscall::sys_add_key(
         b"keyring\0".as_ptr(),

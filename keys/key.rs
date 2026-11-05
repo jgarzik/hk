@@ -108,6 +108,11 @@ pub const KEY_NEED_SETATTR: u32 = 0x20;
 /// KEYRING_SEARCH_MAX_DEPTH): bounds recursion over nested keyrings
 pub(crate) const KEYRING_SEARCH_MAX_DEPTH: u32 = 6;
 
+/// Serializes linking keyrings into keyrings, from the cycle check to
+/// the link (Linux keyring_serialise_link_lock; sleeping, above
+/// `Key.keyring_keys`)
+static KEYRING_LINK: crate::sync::Mutex<()> = crate::sync::Mutex::new(());
+
 /// Key state enumeration
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
@@ -327,18 +332,39 @@ impl Key {
     }
 
     /// Whether `serial` is this keyring or reachable from it through
-    /// nested keyrings, at most `depth` levels (Linux
-    /// KEYRING_SEARCH_MAX_DEPTH)
+    /// nested keyrings, at most `depth` levels down; deeper keyrings are
+    /// not searched (possession, Linux search_process_keyrings)
     pub(crate) fn keyring_reaches(&self, serial: KeySerial, depth: u32) -> bool {
+        self.reaches(serial, depth, false).unwrap_or(false)
+    }
+
+    /// As `keyring_reaches`, but a keyring past `depth` is ELOOP when
+    /// `too_deep` (Linux KEYRING_SEARCH_DETECT_TOO_DEEP). Each keyring's
+    /// own links are matched before any nested keyring is entered, as
+    /// Linux search_nested_keyrings does.
+    fn reaches(&self, serial: KeySerial, depth: u32, too_deep: bool) -> Result<bool, KernelError> {
         if self.serial == serial {
-            return true;
+            return Ok(true);
         }
-        if !self.is_keyring() || depth == 0 {
-            return false;
+        if !self.is_keyring() {
+            return Ok(false);
         }
-        self.links()
-            .iter()
-            .any(|k| k.serial == serial || k.keyring_reaches(serial, depth - 1))
+        let links = self.links();
+        if links.iter().any(|k| k.serial == serial) {
+            return Ok(true);
+        }
+        for k in links.iter().filter(|k| k.is_keyring()) {
+            if depth == 0 {
+                if too_deep {
+                    return Err(KernelError::TooManySymlinks);
+                }
+                continue;
+            }
+            if k.reaches(serial, depth - 1, too_deep)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// The live keys linked in this keyring
@@ -384,13 +410,22 @@ impl Key {
             return Err(KernelError::NotDirectory.sysret());
         }
 
-        // A keyring may not be linked into itself or into one it already
-        // reaches (Linux keyring_detect_cycle: EDEADLK), or a search
-        // would recurse without end and the links would hold each other
-        if key.serial == self.serial
-            || (key.is_keyring() && key.keyring_reaches(self.serial, KEYRING_SEARCH_MAX_DEPTH))
-        {
+        if key.serial == self.serial {
             return Err(KernelError::Deadlock.sysret());
+        }
+        // A keyring may not be linked into one it already reaches (Linux
+        // keyring_detect_cycle: EDEADLK; past the search depth ELOOP), or
+        // a search would recurse without end and the links would hold
+        // each other. Links of keyrings are serialized from the check to
+        // the link (Linux keyring_serialise_link_lock), else two links in
+        // opposite directions could both pass the check.
+        let _serial = key.is_keyring().then(|| KEYRING_LINK.lock());
+        if key.is_keyring() {
+            match key.reaches(self.serial, KEYRING_SEARCH_MAX_DEPTH, true) {
+                Ok(false) => {}
+                Ok(true) => return Err(KernelError::Deadlock.sysret()),
+                Err(e) => return Err(e.sysret()),
+            }
         }
 
         let mut keys = self.keyring_keys.write();
