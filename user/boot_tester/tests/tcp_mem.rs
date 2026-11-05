@@ -3,6 +3,8 @@
 //! - TCP_MEM_SYSCTL: /proc/sys/net/ipv4/tcp_mem holds three page counts
 //!   sized from RAM as tcp_init_mem (min = 3/4 of pressure, max = twice
 //!   min); it takes writes back as written and refuses negative values.
+//! - TCP_MEM_NETNS: from another network namespace tcp_mem cannot be
+//!   changed (Linux: no such file there; hk: EPERM), nor is it.
 //! - MEM_PCPU_RSV: net.core.mem_pcpu_rsv, the per-CPU reserve batching
 //!   the count (1 MiB in pages), refuses less than that.
 //! - TCP_MEM_PRESSURE: with every limit at 4 pages, 8 loopback pairs each
@@ -27,6 +29,7 @@ pub fn run_tests() {
     let n = read_file(PATH, &mut old);
     test_sysctl(&old[..n.max(0) as usize]);
     test_pcpu_rsv();
+    test_netns();
     test_pressure();
     if n > 0 {
         write_file(PATH, &old[..n as usize]);
@@ -74,6 +77,32 @@ fn test_sysctl(old: &[u8]) {
         b"unchanged",
         parse(&buf[..n.max(0) as usize]) == Some([100, 200, 300]),
         n,
+    );
+    t.done();
+}
+
+fn test_netns() {
+    let mut t = T::new(b"TCP_MEM_NETNS");
+    let mut before = [0u8; 96];
+    let n = read_file(PATH, &mut before);
+    let pid = sys_fork();
+    if pid == 0 {
+        if hk_syscall::sys_unshare(hk_syscall::CLONE_NEWNET) != 0 {
+            sys_exit(1);
+        }
+        sys_exit(if write_file(PATH, b"1 1 1\n") < 0 {
+            0
+        } else {
+            2
+        });
+    }
+    t.eq(b"child", wait_child(pid) as i64, 0);
+    let mut after = [0u8; 96];
+    let m = read_file(PATH, &mut after);
+    t.ok(
+        b"unchanged",
+        n > 0 && before[..n as usize] == after[..m.max(0) as usize],
+        m,
     );
     t.done();
 }

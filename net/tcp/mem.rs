@@ -151,6 +151,19 @@ pub fn sysctl_show() -> Vec<i64> {
     (0..3).map(|i| limit(i) as i64).collect()
 }
 
+/// These sysctls are machine-wide: Linux registers them for the initial
+/// network namespace only. hk's /proc/sys is one tree, so another
+/// namespace sees them, but may not change them (EPERM: CAP_NET_ADMIN
+/// over a container's own namespace is no right over the host's TCP)
+fn init_net_only() -> Result<(), KernelError> {
+    let net = crate::net::current_net_ns();
+    if alloc::sync::Arc::ptr_eq(&net, &crate::net::init_net_ns()) {
+        Ok(())
+    } else {
+        Err(KernelError::NotPermitted)
+    }
+}
+
 /// /proc/sys/net/core/mem_pcpu_rsv
 pub fn rsv_show() -> Vec<i64> {
     alloc::vec![PCPU_RSV.load(Ordering::Relaxed) as i64]
@@ -159,6 +172,7 @@ pub fn rsv_show() -> Vec<i64> {
 /// mem_pcpu_rsv write (Linux proc_dointvec_minmax, at least
 /// SK_MEMORY_PCPU_RESERVE)
 pub fn rsv_store(v: &[i64]) -> Result<(), KernelError> {
+    init_net_only()?;
     crate::sysctl::range(v[0], PCPU_RSV_MIN as i64, i32::MAX as i64)?;
     PCPU_RSV.store(v[0] as i32, Ordering::Relaxed);
     Ok(())
@@ -167,6 +181,7 @@ pub fn rsv_store(v: &[i64]) -> Result<(), KernelError> {
 /// tcp_mem write (Linux proc_doulongvec_minmax without bounds:
 /// negative values are EINVAL)
 pub fn sysctl_store(v: &[i64]) -> Result<(), KernelError> {
+    init_net_only()?;
     if v.iter().any(|&x| x < 0) {
         return Err(KernelError::InvalidArgument);
     }
