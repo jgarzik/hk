@@ -450,15 +450,32 @@ fn handle_control_file_write(
         CgroupControlFileType::SubtreeControl => {
             // Enable/disable controllers for children
             // Format: "+controller -controller"
+            // Linux cgroup_subtree_control_write: every token parsed
+            // first (an unknown one is EINVAL), then a controller can be
+            // enabled only where it is available: on the root, or in a
+            // cgroup that has it itself (ENOENT)
             let s = core::str::from_utf8(data).map_err(|_| KernelError::InvalidArgument)?;
+            let mut changes = Vec::new();
             for token in s.split_whitespace() {
-                if let Some(name) = token.strip_prefix('+')
-                    && let Some(ctrl) = ControllerType::from_name(name)
-                {
+                let (on, name) = match (token.strip_prefix('+'), token.strip_prefix('-')) {
+                    (Some(n), _) => (true, n),
+                    (_, Some(n)) => (false, n),
+                    _ => return Err(KernelError::InvalidArgument),
+                };
+                let ctrl = ControllerType::from_name(name).ok_or(KernelError::InvalidArgument)?;
+                changes.push((on, ctrl));
+            }
+            let is_root = cgroup.parent().is_none();
+            if changes
+                .iter()
+                .any(|&(on, c)| on && !is_root && cgroup.css(c).is_none())
+            {
+                return Err(KernelError::NotFound);
+            }
+            for (on, ctrl) in changes {
+                if on {
                     cgroup.enable_subtree_control(ctrl);
-                } else if let Some(name) = token.strip_prefix('-')
-                    && let Some(ctrl) = ControllerType::from_name(name)
-                {
+                } else {
                     cgroup.disable_subtree_control(ctrl);
                 }
             }

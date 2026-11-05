@@ -61,6 +61,18 @@ blocks belong in a missing wrapper:
 mkdir of a name that is not valid UTF-8 is EINVAL; Linux kernfs takes
 any bytes.
 
+## cgroup controller application gaps
+
+**Location**: `cgroup/mod.rs`, `fs/cgroupfs.rs`
+
+Enabling a controller in cgroup.subtree_control creates its state only
+for cgroups made afterwards (Linux cgroup_apply_control creates it for
+the existing children and migrates their tasks), and disabling it
+removes nothing. A task in a cgroup without a controller is charged
+nowhere; Linux charges the nearest ancestor that has it (the effective
+css). The no-internal-processes rule (EBUSY when enabling in a cgroup
+with tasks) is not enforced.
+
 ## user/ does not follow doc/UNSAFE.md
 
 The `user/syscall` wrappers are safe `pub fn`s, and about 330 of them take

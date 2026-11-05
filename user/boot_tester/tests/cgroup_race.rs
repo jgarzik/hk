@@ -26,6 +26,9 @@
 //!   is moved by its remaining thread: the exited leader is skipped
 //!   (Linux: PF_EXITING), so once the process is gone the cgroup is
 //!   empty (rmdir works) and its pids charge is back to 0.
+//! - CGROUP_SUBTREE_CONTROL: a cgroup may enable for its children only a
+//!   controller it has itself (ENOENT otherwise); an unknown token is
+//!   EINVAL (Linux cgroup_subtree_control_write).
 //!
 //! Runs after cgroup.rs, which mounts cgroup2 at /sys/fs/cgroup and
 //! enables +pids at the root.
@@ -49,6 +52,7 @@ pub fn run_tests() {
     report(b"CGROUP_RMDIR_RACE", cgroup_rmdir_race());
     report(b"CGROUP_PROCS_TGID", in_child(cgroup_procs_tgid));
     report(b"CGROUP_PROCS_EXITED_LEADER", procs_exited_leader());
+    report(b"CGROUP_SUBTREE_CONTROL", subtree_control());
 }
 
 fn report(name: &[u8], step: i64) {
@@ -571,6 +575,30 @@ fn procs_exited_leader() -> i64 {
     }
     if rm != 0 {
         return 2;
+    }
+    0
+}
+
+/// pl_sub has pids (the root enables it) and nothing else
+fn subtree_control() -> i64 {
+    let cg = b"pl_sub";
+    let mut b = [0u8; 96];
+    if sys_mkdir(path(&mut b, cg, b"").as_ptr(), 0o755) != 0 {
+        return 90;
+    }
+    let ok = write_file(cg, b"cgroup.subtree_control", b"+pids");
+    let bogus = write_file(cg, b"cgroup.subtree_control", b"+bogus");
+    let missing = write_file(cg, b"cgroup.subtree_control", b"+io");
+    write_file(cg, b"cgroup.subtree_control", b"-pids");
+    remove_cgroup(cg);
+    if ok <= 0 {
+        return 1;
+    }
+    if bogus != -22 {
+        return 2;
+    }
+    if missing != -2 {
+        return 3;
     }
     0
 }
