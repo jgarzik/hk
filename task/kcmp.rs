@@ -143,7 +143,6 @@ pub fn sys_kcmp(pid1: i32, pid2: i32, kcmp_type: i32, idx1: u64, idx2: u64) -> i
         return KernelError::NoProcess.sysret();
     }
     let (pid1, pid2) = (pid1 as u64, pid2 as u64);
-    // Initialize cookies on first use
 
     // Validate type
     if !(0..KCMP_TYPES).contains(&kcmp_type) {
