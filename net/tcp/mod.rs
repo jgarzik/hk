@@ -47,7 +47,7 @@ use alloc::collections::VecDeque;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::any::Any;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::Ordering;
 
 use crate::sync::spin::{Mutex, MutexGuard};
 
@@ -113,6 +113,9 @@ struct Inner {
     /// The listener of a child still in SYN_RECEIVED
     parent: Option<Weak<TcpSock>>,
     slot: Slot,
+    /// A non-blocking connect is in progress (Linux sock->state
+    /// SS_CONNECTING, under lock_sock)
+    connecting: bool,
 }
 
 /// A listener's queues (Linux request_sock_queue + accept queue)
@@ -138,8 +141,6 @@ pub struct TcpSock {
     pub inet: Inet,
     cb: Mutex<Inner>,
     queue: Mutex<Option<Accept>>,
-    /// A non-blocking connect is in progress (Linux SS_CONNECTING)
-    connecting: AtomicBool,
     /// Serializes readers across peek, user copy and consume (the
     /// reader part of Linux lock_sock; sleeping, above `cb`)
     rd: crate::sync::Mutex<()>,
@@ -234,9 +235,9 @@ impl TcpSock {
                 bound: false,
                 parent: None,
                 slot: Slot::default(),
+                connecting: false,
             }),
             queue: Mutex::new(None),
-            connecting: AtomicBool::new(false),
             rd: crate::sync::Mutex::new(()),
             me: me.clone(),
         })
@@ -542,9 +543,17 @@ impl TcpSock {
     // --- user calls -----------------------------------------------------------
 
     /// Linux tcp_v4_connect: route, local address and port, ISN, SYN
-    fn start_connect(&self, daddr: Ipv4Addr, dport: u16) -> Result<(), KernelError> {
+    /// Begin a connection to `daddr:dport` (Linux tcp_v4_connect), the
+    /// socket locked
+    fn start_connect(
+        &self,
+        g: &mut Inner,
+        out: &mut Out,
+        daddr: Ipv4Addr,
+        dport: u16,
+    ) -> Result<(), KernelError> {
         let me = self.arc();
-        self.step(|g, out| {
+        {
             if g.cb.state != TcpState::Closed {
                 return Err(KernelError::AlreadyConnected);
             }
@@ -594,7 +603,7 @@ impl TcpSock {
             };
             g.cb.connect(o, now_ms(), out);
             Ok(())
-        })
+        }
     }
 
     /// Wait for the handshake (Linux inet_wait_for_connect): send timeout
@@ -701,25 +710,37 @@ impl TcpSock {
     /// Linux tcp_disconnect (connect(AF_UNSPEC)): abort, stop listening,
     /// back to an unconnected socket keeping a bind()-fixed address/port
     fn disconnect(&self) {
-        let q = self.step(|g, out| {
-            let q = if g.cb.state == TcpState::Listen {
-                self.sk.set_flag(sf::ACCEPTCONN, false);
-                self.sk
-                    .net
-                    .tcp
-                    .listen_del(self.inet.get().sport, &self.arc());
-                self.queue.lock().take()
-            } else {
-                None
-            };
-            g.cb.abort(out);
-            out.shut = 0;
-            q
-        });
+        let q = self.step(|g, out| self.disconnect_locked(g, out));
+        self.disconnect_done(q);
+    }
+
+    /// tcp_disconnect's part under the socket lock: stop listening,
+    /// abort, clear the shutdown bits and the connecting state; the
+    /// listener's queue, if any, to stop after the unlock
+    fn disconnect_locked(&self, g: &mut Inner, out: &mut Out) -> Option<Accept> {
+        let q = if g.cb.state == TcpState::Listen {
+            self.sk.set_flag(sf::ACCEPTCONN, false);
+            self.sk
+                .net
+                .tcp
+                .listen_del(self.inet.get().sport, &self.arc());
+            self.queue.lock().take()
+        } else {
+            None
+        };
+        g.cb.abort(out);
+        out.shut = 0;
+        self.sk.clear_shutdown();
+        g.connecting = false;
+        q
+    }
+
+    /// tcp_disconnect's rest, after the unlock: the listener's queue
+    /// and the connection's addresses
+    fn disconnect_done(&self, q: Option<Accept>) {
         if let Some(q) = q {
             self.listen_stop(q);
         }
-        self.sk.clear_shutdown();
         dev::netif_rx_flush_local();
         let mut ad = self.inet.addr.lock();
         ad.daddr = Ipv4Addr::default();
@@ -1092,42 +1113,59 @@ impl ProtoOps for TcpSock {
         Ok(())
     }
 
-    /// Linux __inet_stream_connect
+    /// Linux __inet_stream_connect: the state checks, the start and
+    /// SS_CONNECTING under the socket lock (`cb`); only the wait is not
     fn connect(&self, a: &[u8], nonblock: bool) -> Result<(), KernelError> {
         if af_inet::sa_family(a)? == AF_UNSPEC {
             self.disconnect();
             return Ok(());
         }
-        let state = self.state();
-        if matches!(state, TcpState::SynSent | TcpState::SynReceived) {
-            if nonblock {
-                return Err(KernelError::AlreadyInProgress);
+        enum Next {
+            Wait,
+            Done(Result<(), KernelError>),
+        }
+        let next = self.step(|g, out| {
+            let state = g.cb.state;
+            if matches!(state, TcpState::SynSent | TcpState::SynReceived) {
+                return if nonblock {
+                    Next::Done(Err(KernelError::AlreadyInProgress))
+                } else {
+                    Next::Wait
+                };
             }
-            let r = self.wait_connect();
-            self.connecting.store(false, Ordering::Release);
-            return r;
-        }
-        // The outcome of an earlier non-blocking connect (SS_CONNECTING)
-        if self.connecting.swap(false, Ordering::AcqRel) {
-            return match state {
-                TcpState::Closed => {
-                    Err(self.sk.take_err().unwrap_or(KernelError::ConnectionAborted))
+            // The outcome of an earlier non-blocking connect
+            if g.connecting {
+                g.connecting = false;
+                return Next::Done(match state {
+                    TcpState::Closed => {
+                        Err(self.sk.take_err().unwrap_or(KernelError::ConnectionAborted))
+                    }
+                    _ => Ok(()),
+                });
+            }
+            if state != TcpState::Closed {
+                return Next::Done(Err(KernelError::AlreadyConnected));
+            }
+            let r = af_inet::sin_parse(a, false)
+                .and_then(|(daddr, dport)| self.start_connect(g, out, daddr, dport));
+            match r {
+                Err(e) => Next::Done(Err(e)),
+                Ok(()) if nonblock => {
+                    g.connecting = true;
+                    Next::Done(Err(KernelError::InProgress))
                 }
-                _ => Ok(()),
-            };
-        }
-        if state != TcpState::Closed {
-            return Err(KernelError::AlreadyConnected);
-        }
-        let (daddr, dport) = af_inet::sin_parse(a, false)?;
-        let r = self.start_connect(daddr, dport);
+                Ok(()) => Next::Wait,
+            }
+        });
         dev::netif_rx_flush_local();
-        r?;
-        if nonblock {
-            self.connecting.store(true, Ordering::Release);
-            return Err(KernelError::InProgress);
+        match next {
+            Next::Done(r) => r,
+            Next::Wait => {
+                let r = self.wait_connect();
+                self.cb.lock().connecting = false;
+                r
+            }
         }
-        self.wait_connect()
     }
 
     /// Linux inet_listen (autobinds an unbound socket); a listening
@@ -1272,41 +1310,34 @@ impl ProtoOps for TcpSock {
         self.cb.lock().cb.rcvq_len()
     }
 
-    /// Linux inet_shutdown + tcp_shutdown
+    /// Linux inet_shutdown + tcp_shutdown: the state test and the
+    /// shutdown change under the socket lock (`cb`)
     fn shutdown(&self, how: i32) -> Result<(), KernelError> {
         let bits = shut_bits(how)?;
-        let state = self.state();
-        let r = match state {
+        let (r, q) = self.step(|g, out| match g.cb.state {
             TcpState::Closed => {
-                self.sk.set_shutdown(bits);
-                Err(KernelError::NotConnected)
+                self.sk.or_shutdown(bits);
+                (Err(KernelError::NotConnected), None)
             }
-            TcpState::Listen => {
-                // Linux inet_shutdown: stop listening (disconnect)
-                if bits & RCV_SHUTDOWN != 0 {
-                    self.disconnect();
-                }
-                Ok(())
-            }
-            TcpState::SynSent => {
-                // Linux: disconnect, back to unconnected
-                self.disconnect();
-                Ok(())
-            }
+            // Linux: a listener stops listening on SHUT_RD, a SYN_SENT
+            // socket goes back to unconnected (disconnect)
+            TcpState::Listen if bits & RCV_SHUTDOWN == 0 => (Ok(()), None),
+            TcpState::Listen | TcpState::SynSent => (Ok(()), Some(self.disconnect_locked(g, out))),
             _ => {
-                self.sk.set_shutdown(bits);
-                self.step(|g, out| {
-                    if bits & RCV_SHUTDOWN != 0 {
-                        g.cb.rcv_shut = true;
-                    }
-                    if bits & SEND_SHUTDOWN != 0 {
-                        g.cb.shutdown_wr(now_ms(), out);
-                    }
-                });
-                dev::netif_rx_flush_local();
-                Ok(())
+                self.sk.or_shutdown(bits);
+                if bits & RCV_SHUTDOWN != 0 {
+                    g.cb.rcv_shut = true;
+                }
+                if bits & SEND_SHUTDOWN != 0 {
+                    g.cb.shutdown_wr(now_ms(), out);
+                }
+                (Ok(()), None)
             }
-        };
+        });
+        match q {
+            Some(q) => self.disconnect_done(q),
+            None => dev::netif_rx_flush_local(),
+        }
         self.sk.state_change();
         r
     }

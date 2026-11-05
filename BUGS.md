@@ -991,7 +991,8 @@ Found during T0 (2026-10-19). Tag = roadmap phase (doc/ROADMAP.md).
    execs in one process) exited nonzero. A failed exec, not a leak.
    MM_LIFE now prints a failing child's wait status (exit code vs
    signal); 16 eight-CPU arm64 stress boots did not repeat it.
-10. **Network test flake** (L: TcpSock.connecting beside the state):
+10. **Network test flake** (suspected TcpSock.connecting beside the
+   state, which phase L moved under `cb`; drop if check-stress stays clean):
    `SOCKCORE_CONNECT_REFUSED:FAIL SO_ERROR got 0` (hk arm64, 1 of 10
    `check-stress` boots: poll reported POLLOUT for a nonblocking
    connect to a just-closed loopback port, but no ECONNREFUSED was
