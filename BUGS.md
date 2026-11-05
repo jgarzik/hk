@@ -952,8 +952,7 @@ Ranked. Not yet confirmed by a test.
    encode_comp_t skips Linux's rounding; getxattr ERANGE above 64 KiB
    (Linux clamps); adjtimex
    ignores ADJ_FREQUENCY (freq reads back 0) and stores ADJ_TIMECONST
-   unclamped (Linux 0..MAXTC, +4 without STA_NANO); memory.max sizes
-   take K/M/G but not T/P/E (`cgroup/memory.rs`, Linux memparse); a
+   unclamped (Linux 0..MAXTC, +4 without STA_NANO); a
    READ CAPACITY(10) last LBA of 0xFFFFFFFF is not retried with READ
    CAPACITY(16) (`block/scsi.rs`, Linux sd_read_capacity).
 2. **Minor**: `arch/x86_64/rtc.rs:131` panics on a CMOS month >= 14
