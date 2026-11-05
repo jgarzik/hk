@@ -155,6 +155,12 @@ impl<'a, T> IntoIterator for &'a KVec<T> {
     }
 }
 
+/// The capacity after `len` (full): doubled, at least 4, at most `max`
+/// items (`len < max`, so it always grows)
+fn grow(len: usize, max: usize) -> usize {
+    len.saturating_mul(2).max(4).min(max)
+}
+
 /// A `VecDeque` whose every growth is fallible (ENOMEM, capped at
 /// [`MAX_KMALLOC`]): used for queues fed by untrusted input, e.g. a
 /// stream of data chunks.
@@ -174,9 +180,8 @@ impl<T> KDeque<T> {
         fits::<T>(len.saturating_add(1))?;
         if len == self.0.capacity() {
             let max = MAX_KMALLOC / core::mem::size_of::<T>().max(1);
-            let want = len.saturating_mul(2).clamp(4, max);
             self.0
-                .try_reserve_exact(want - len)
+                .try_reserve_exact(grow(len, max) - len)
                 .map_err(|_| KernelError::OutOfMemory)?;
         }
         self.0.push_back(v);
@@ -234,6 +239,15 @@ mod tests {
         let mut big: KVec<u8> = KVec::new();
         big.try_resize(MAX_KMALLOC, 0).unwrap();
         assert!(big.try_push(0).is_err());
+    }
+
+    #[test]
+    fn growth_never_passes_max() {
+        assert_eq!(grow(0, 1), 1);
+        assert_eq!(grow(1, 2), 2);
+        assert_eq!(grow(0, 100), 4);
+        assert_eq!(grow(64, 104), 104);
+        assert_eq!(grow(8, 100), 16);
     }
 
     #[test]
