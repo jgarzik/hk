@@ -2377,11 +2377,12 @@ readers accept a torn snapshot). Nothing is taken under it.
 
 ```rust
 pub struct TimeKeeper {
-    lock: IrqSpinlock<()>,       // Serializes writers, IRQs off (leaf)
+    lock: IrqSpinlock<Ntp>,      // Serializes writers, IRQs off (leaf); the adjtimex NTP state
     seq: AtomicU32,              // Sequence counter (odd = write in progress)
     cycle_base: AtomicU64,
     mono_base_ns: AtomicU64,
     realtime_offset_ns: AtomicI64,
+    tai_offset: AtomicI32,       // TAI - UTC, seconds; seqlock-protected (CLOCK_TAI reads it in the same pass)
     mult: AtomicU64,
     shift: AtomicU32,
     tsc_freq_hz: AtomicU64,
