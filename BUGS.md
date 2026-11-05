@@ -860,37 +860,6 @@ fat_get_cluster keeps a per-inode cache of chain positions
 fallocate on a block device is EOPNOTSUPP (Linux blkdev_fallocate zeroes
 or discards the range).
 
-## Atomics audit findings (2026-11-03)
-
-Shared state kept in Atomic* fields instead of under the object's
-documented lock; ranked. Roadmap phase L fixes them, each with its
-Linux design (doc/ROADMAP.md). Fixed since the audit: the USB console
-recursion flag, USB mass storage BOT serialization, kernfs concurrent
-deactivate, netlink bind groups, the SCSI disk state and the virtio/sd
-index IDAs.
-
-- ipc/sem.rs `Sem.semval`: semop checks and applies without a lock:
-  semval can go negative, multi-sop operations are not atomic, wakeups
-  can be lost, a semop can queue on a removed array (Linux sem_lock).
-- fs/dac.rs chmod/chown run without i_rwsem: chmod 4755 racing chown
-  root can leave a setuid-root file with user-chosen contents (Linux
-  notify_change under inode_lock).
-- cgroup pids.max is checked at fork and charged later: concurrent
-  forks overshoot it (Linux pids_can_fork charge-then-rollback). IPC
-  shm_tot / used_sems are check-then-add without the ids lock and leak
-  when alloc_id fails.
-- Inode i_size uses Relaxed loads/stores (Linux release/acquire with
-  i_size_write/read): an arm64 reader can see stale data past a
-  racing extend; fallocate updates i_size without i_rwsem.
-- Medium: mnt_flags lost update (remount vs propagation), lazy kcmp
-  cookies, a revoked key can be revived, cgroup rmdir races attach (no
-  cgroup_mutex), MsgQueue lspid/stime set outside the queue lock and
-  torn IPC_STAT snapshots, adjtimex ADJ_SETOFFSET lost offsets, TCP
-  shutdown bits outside `cb`, `TcpSock.connecting` beside the state.
-- Low: remount RDONLY set before the writer check (spurious EROFS).
-- doc/LOCKING.md 5.4 cites Inode mode/uid/gid, MsgQueue and
-  SemArray.pending as correct atomic use; they are among the above.
-
 ## Code-quality audit findings (2026-11-01), by phase
 
 From a whole-tree audit for designs that grew one commit at a time.
