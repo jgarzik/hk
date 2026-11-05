@@ -196,9 +196,44 @@ static NEXT_DEV_ID: AtomicU64 = AtomicU64::new(1);
 /// Read-only file system (Linux SB_RDONLY)
 pub const SB_RDONLY: u32 = 1;
 
-/// Write access to a file system (from `SuperBlock::want_write`),
-/// released on drop (Linux mnt_drop_write); `none()` for objects without
-/// a superblock
+/// The hold bit of a writer count (Linux WRITE_HOLD): while set, new
+/// writers wait; it shares the count's word, so one atomic operation
+/// orders a writer against a holder
+pub(super) const WRITE_HOLD: u64 = 1 << 63;
+
+/// Take write access on a writer count (Linux mnt_get_write_access):
+/// count first, wait out a hold (spinning: a holder holds MOUNT_LOCK and
+/// never waits for writers), then check read-only state, which a holder
+/// sets before it releases the hold
+pub(super) fn get_write(w: &AtomicU64, readonly: impl Fn() -> bool) -> Result<(), KernelError> {
+    if w.fetch_add(1, Ordering::SeqCst) & WRITE_HOLD != 0 {
+        while w.load(Ordering::Acquire) & WRITE_HOLD != 0 {
+            core::hint::spin_loop();
+        }
+    }
+    if readonly() {
+        w.fetch_sub(1, Ordering::SeqCst);
+        return Err(KernelError::ReadOnlyFs);
+    }
+    Ok(())
+}
+
+/// Hold new writers off (Linux mnt_hold_writers): true if none holds
+/// write access now
+pub(super) fn hold_writers(w: &AtomicU64) -> bool {
+    w.fetch_or(WRITE_HOLD, Ordering::SeqCst) & !WRITE_HOLD == 0
+}
+
+/// Let writers in again (Linux mnt_unhold_writers): after the read-only
+/// state they must see
+pub(super) fn unhold_writers(w: &AtomicU64) {
+    w.fetch_and(!WRITE_HOLD, Ordering::Release);
+}
+
+/// Write access to a file system (from `SuperBlock::want_write` for an
+/// object without a mount, `Mount::want_write` otherwise), released on
+/// drop (Linux mnt_drop_write); `none()` for objects without a
+/// superblock
 pub struct WriteAccess {
     sb: Option<Arc<SuperBlock>>,
     /// The mount's write access too (Linux mnt_want_write on a path)
@@ -214,10 +249,12 @@ impl WriteAccess {
         }
     }
 
-    /// Also hold `mnt`'s write count (taken by the caller)
-    pub(super) fn with_mnt(mut self, mnt: Arc<super::mount::Mount>) -> Self {
-        self.mnt = Some(mnt);
-        self
+    /// `mnt`'s write count (taken by the caller)
+    pub(super) fn mnt(mnt: Arc<super::mount::Mount>) -> Self {
+        Self {
+            sb: None,
+            mnt: Some(mnt),
+        }
     }
 }
 
@@ -266,9 +303,13 @@ pub struct SuperBlock {
     /// SB_* flags (Linux s_flags): SB_RDONLY
     s_flags: AtomicU32,
 
-    /// Holders of write access (Linux mnt writers, mnt_want_write):
-    /// open-for-write files and in-progress modifications
+    /// Holders of write access to objects without a mount (internal
+    /// files), and the WRITE_HOLD bit (see get_write); writes through a
+    /// mount count on the mount
     s_writers: AtomicU64,
+    /// Its mounts (Linux s_mounts), for a read-only remount to hold their
+    /// writers; dead ones pruned on insert. A leaf under MOUNT_LOCK.
+    s_mounts: crate::sync::spin::Mutex<alloc::vec::Vec<alloc::sync::Weak<super::mount::Mount>>>,
 
     /// Next inode number to allocate
     next_ino: AtomicU64,
@@ -342,6 +383,7 @@ impl SuperBlock {
             s_flags: AtomicU32::new(flags),
             mounted_on: AtomicU32::new(0),
             s_writers: AtomicU64::new(0),
+            s_mounts: crate::sync::spin::Mutex::new(alloc::vec::Vec::new()),
             next_ino: AtomicU64::new(1), // Start inode numbers at 1
             dev_id: NEXT_DEV_ID.fetch_add(1, Ordering::Relaxed),
             private: RwLock::new(None),
@@ -363,36 +405,55 @@ impl SuperBlock {
         self.s_flags.load(Ordering::SeqCst) & SB_RDONLY != 0
     }
 
-    /// Take write access (Linux mnt_want_write): EROFS on a read-only
-    /// file system. Held until the returned guard drops.
-    ///
-    /// Against `make_rdonly`: each side publishes its change (SeqCst)
-    /// before reading the other's, so either the writer sees SB_RDONLY
-    /// or the remount sees the writer, never neither.
+    /// Take write access to an object reached without a mount (internal
+    /// files): EROFS on a read-only file system. Held until the
+    /// returned guard drops. Writes through a mount count on the mount
+    /// instead (`Mount::want_write`), as Linux.
     pub fn want_write(self: &Arc<Self>) -> Result<WriteAccess, KernelError> {
-        self.s_writers.fetch_add(1, Ordering::SeqCst);
-        if self.rdonly() {
-            self.s_writers.fetch_sub(1, Ordering::SeqCst);
-            return Err(KernelError::ReadOnlyFs);
-        }
+        get_write(&self.s_writers, || self.rdonly())?;
         Ok(WriteAccess {
             sb: Some(self.clone()),
             mnt: None,
         })
     }
 
-    /// Make the file system read-only (Linux sb_prepare_remount_readonly
-    /// and SB_RDONLY): EBUSY, and nothing changed, while anyone holds
-    /// write access
+    /// Note a new mount of this superblock (Linux sb->s_mounts)
+    pub(super) fn add_mount(&self, m: &Arc<super::mount::Mount>) {
+        let mut mounts = self.s_mounts.lock();
+        mounts.retain(|w| w.strong_count() != 0);
+        mounts.push(Arc::downgrade(m));
+    }
+
+    /// Make the file system read-only (Linux sb_prepare_remount_readonly,
+    /// then SB_RDONLY): under MOUNT_LOCK every writable mount of it, and
+    /// its mountless writers, are held; with no writer anywhere it goes
+    /// read-only before the holds are released, else EBUSY and nothing
+    /// changed (no window where a writer sees a read-only file system
+    /// that then stays writable)
     pub fn make_rdonly(&self) -> Result<(), KernelError> {
-        if self.s_flags.fetch_or(SB_RDONLY, Ordering::SeqCst) & SB_RDONLY != 0 {
+        if self.rdonly() {
             return Ok(());
         }
-        if self.s_writers.load(Ordering::SeqCst) != 0 {
-            self.s_flags.fetch_and(!SB_RDONLY, Ordering::SeqCst);
-            return Err(KernelError::Busy);
+        let _ml = super::mount::MOUNT_LOCK.write();
+        let mounts: alloc::vec::Vec<Arc<super::mount::Mount>> = self
+            .s_mounts
+            .lock()
+            .iter()
+            .filter_map(|w| w.upgrade())
+            .filter(|m| m.flags() & super::mount::MNT_READONLY == 0)
+            .collect();
+        let mut free = hold_writers(&self.s_writers);
+        for m in &mounts {
+            free &= m.hold_writers();
         }
-        Ok(())
+        if free {
+            self.s_flags.fetch_or(SB_RDONLY, Ordering::SeqCst);
+        }
+        for m in &mounts {
+            m.unhold_writers();
+        }
+        unhold_writers(&self.s_writers);
+        if free { Ok(()) } else { Err(KernelError::Busy) }
     }
 
     /// Make the file system read-write

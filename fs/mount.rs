@@ -113,8 +113,8 @@ pub struct Mount {
     /// Marked by a first umount2(MNT_EXPIRE) (Linux mnt_expiry_mark)
     expiry: core::sync::atomic::AtomicBool,
 
-    /// Holders of write access through this mount (Linux mnt_writers):
-    /// against making it read-only, the protocol of SuperBlock::s_writers
+    /// Holders of write access through this mount and the WRITE_HOLD bit
+    /// (Linux mnt_writers and WRITE_HOLD): see superblock::get_write
     writers: AtomicU64,
 
     /// Id in /proc/<pid>/mountinfo and statx (Linux mnt_id): reused
@@ -141,7 +141,7 @@ impl Mount {
         flags: u32,
         devname: super::name::FileName,
     ) -> Arc<Self> {
-        Arc::new(Self {
+        let m = Arc::new(Self {
             sb,
             root,
             mountpoint: RwLock::new(None),
@@ -157,7 +157,9 @@ impl Mount {
             mnt_id_unique: MNT_ID_UNIQUE.fetch_add(1, Ordering::Relaxed),
             devname,
             mnt_count: AtomicU64::new(0),
-        })
+        });
+        m.sb.add_mount(&m);
+        m
     }
 
     /// A copy of `self` for a namespace copy: same filesystem, root,
@@ -186,16 +188,28 @@ impl Mount {
         let _ml = MOUNT_LOCK.write();
         // Lock state is not the caller's to set here
         let f = (f & !MNT_LOCKED) | (self.flags() & MNT_LOCKED);
-        let old = self.mnt_flags.fetch_or(f & MNT_READONLY, Ordering::SeqCst);
-        if f & MNT_READONLY != 0
-            && old & MNT_READONLY == 0
-            && self.writers.load(Ordering::SeqCst) != 0
-        {
-            self.mnt_flags.fetch_and(!MNT_READONLY, Ordering::SeqCst);
-            return Err(KernelError::Busy);
+        // Linux mnt_make_readonly: writers held off; read-only only if
+        // none holds access, set before the hold is released
+        if f & MNT_READONLY != 0 && self.flags() & MNT_READONLY == 0 {
+            let free = self.hold_writers();
+            if free {
+                self.mnt_flags.store(f, Ordering::SeqCst);
+            }
+            self.unhold_writers();
+            return if free { Ok(()) } else { Err(KernelError::Busy) };
         }
         self.mnt_flags.store(f, Ordering::SeqCst);
         Ok(())
+    }
+
+    /// Linux mnt_hold_writers, under MOUNT_LOCK
+    pub(super) fn hold_writers(&self) -> bool {
+        super::superblock::hold_writers(&self.writers)
+    }
+
+    /// Linux mnt_unhold_writers, under MOUNT_LOCK
+    pub(super) fn unhold_writers(&self) {
+        super::superblock::unhold_writers(&self.writers)
     }
 
     /// Set (`on`) or clear MNT_* bits that need no other checks, under
@@ -234,18 +248,8 @@ impl Mount {
     /// for a read-only mount or superblock; hold the guard across the
     /// modification
     pub fn want_write(self: &Arc<Self>) -> Result<super::superblock::WriteAccess, KernelError> {
-        self.writers.fetch_add(1, Ordering::SeqCst);
-        if self.flags() & MNT_READONLY != 0 {
-            self.put_write();
-            return Err(KernelError::ReadOnlyFs);
-        }
-        match self.sb.want_write() {
-            Ok(w) => Ok(w.with_mnt(self.clone())),
-            Err(e) => {
-                self.put_write();
-                Err(e)
-            }
-        }
+        super::superblock::get_write(&self.writers, || self.is_readonly())?;
+        Ok(super::superblock::WriteAccess::mnt(self.clone()))
     }
 
     /// Release what want_write took

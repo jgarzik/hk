@@ -80,6 +80,7 @@ pub mod mm_oom;
 pub mod mm_populate;
 pub mod mmap;
 pub mod mmlock;
+pub mod mount_race;
 pub mod mountflags;
 pub mod mountinfo;
 pub mod mounts;
@@ -259,6 +260,7 @@ pub fn run_all_tests() {
     sysv_race::run_tests();
     attr_race::run_tests();
     caps_checks::run_tests();
+    mount_race::run_tests();
     timerfd::run_tests();
     posix_timer::run_tests();
     xattr::run_tests();
