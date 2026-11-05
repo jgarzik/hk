@@ -325,9 +325,9 @@ Global subsystem locks (TASKLIST, fd table `Files`)  ← NOT IRQ-safe;
     under its alloc_lock (3.1.1); under them only leaves:
     TaskSignalState.shared_pending (Mutex) → SigHand.action
     (IrqSpinlock); SignalStruct.rlim (IrqSpinlock leaf, also under
-    `Files`; setrlimit/prlimit64 read the old limit, decide and store
-    in one hold, as Linux do_prlimit under task_lock; the capability
-    is asked outside it and the decision re-checked inside); NPROC;
+    `Files`; setrlimit/prlimit64 read the old limit, decide (with the
+    lock-free capable()) and store in one hold, as Linux do_prlimit
+    under task_lock); NPROC;
     wait queue heads
     ↓
 Address space: mmap_lock (sleeping RwSem; under i_rwsem: a write's user
