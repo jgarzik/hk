@@ -944,13 +944,11 @@ poll, so hk accepts it and reports it always ready. Needs a
 `FileOps::can_poll` (false for the regular-file and directory ops of
 ramfs/tmpfs/vfat and most procfs files) checked at add.
 
-## Allocation sizing and pure-code gaps
+## adjtimex does not steer the clock
 
-Ranked. Not yet confirmed by a test.
+**Location**: `time/time_syscall.rs`, `time/mod.rs`
 
-1. **ABI**: adjtimex keeps
-   the NTP frequency but does not steer the clock by it, and maxerror
-   does not grow each second (Linux second_overflow).
-2. **Minor**:
-   the `fs/dac.rs` header says there are no supplementary groups
-   (`in_group` uses them).
+adjtimex keeps and reports the NTP frequency (ADJ_FREQUENCY) and the
+tick, but neither changes how fast the clock runs (Linux
+ntp_update_frequency), and maxerror does not grow each second (Linux
+second_overflow).
