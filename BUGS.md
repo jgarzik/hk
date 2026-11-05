@@ -971,11 +971,13 @@ Found during T0 (2026-10-19). Tag = roadmap phase (doc/ROADMAP.md).
    `check-stress` boots: poll reported POLLOUT for a nonblocking
    connect to a just-closed loopback port, but no ECONNREFUSED was
    pending).
-11. **TCP_PROC_NET flake** (procfs regeneration): `TCP_PROC_NET:FAIL
-   client line got 0` (CI hk arm64, 1 run of 2 on the same commit).
-   Every /proc read regenerates the whole file and slices it (see
-   "procfs" above), so a multi-read of /proc/net/tcp can drop a line
-   when sockets (earlier tests' TIME_WAIT) come and go between reads.
+11. **TCP_PROC_NET flake** (cause unknown): one end of a fresh,
+   accepted loopback connection is missing from /proc/net/tcp as state
+   01: `client line got 0` (CI hk arm64) and `server line got 0` (1 of
+   20 check-stress boots, hk arm64). Not a torn read: the file comes in
+   one regeneration (well under the 64 KiB read chunk). Not ehash
+   removal by key (removals check the entry). The test now prints the
+   lines with either port when it fails.
 
 ## CVE-pattern audit findings (2026-11-05)
 

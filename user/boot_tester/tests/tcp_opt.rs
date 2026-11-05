@@ -365,9 +365,23 @@ fn test_proc_net_tcp() {
     est[13] = b' ';
     est[14..].copy_from_slice(&lo);
     t.ok(b"client line", has_line(text, &[&est, b" 01 "]), 0);
+    let client_ok = has_line(text, &[&est, b" 01 "]);
     est[..13].copy_from_slice(&lo);
     est[14..].copy_from_slice(&lc);
-    t.ok(b"server line", has_line(text, &[&est, b" 01 "]), 0);
+    let server_ok = has_line(text, &[&est, b" 01 "]);
+    t.ok(b"server line", server_ok, 0);
+    if !(client_ok && server_ok) {
+        // Intermittent (BUGS flake list): show what was listed for the
+        // two ports, the first 60 columns of each line
+        super::helpers::print_num(n);
+        super::helpers::println(b" bytes read; lines with either port:");
+        for l in text.split(|&c| c == b'\n') {
+            let has = |port: &[u8]| l.windows(port.len()).any(|w| w == port);
+            if has(&lo[8..]) || has(&lc[8..]) {
+                super::helpers::println(&l[..l.len().min(60)]);
+            }
+        }
+    }
     close(c);
     close(s);
     close(l);
