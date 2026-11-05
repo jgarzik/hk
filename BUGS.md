@@ -938,43 +938,33 @@ Tag = roadmap phase (doc/ROADMAP.md).
 
 Ranked. P# = the pattern's number in doc/res/hk-linux-cve-patterns.md.
 
-1. **Keys: link and destination checks missing** (P4). add_key takes a
-   destination keyring by serial without KEY_NEED_WRITE
-   (`keys/syscall.rs:84`); KEYCTL_LINK does not need KEY_NEED_LINK on
-   the key (`keys/keyctl.rs:285`); KEYCTL_SEARCH needs no SEARCH on the
-   keyring or the keys it walks and links into `dest` unchecked
-   (`keys/keyctl.rs:399,409`); request_key links into `dest` unchecked
-   (`keys/syscall.rs:173`). Serials are sequential, so a user links
-   another user's key into its own session keyring, then possesses it
-   (KEY_POS_ALL) and KEYCTL_READs the payload. Linux lookup_user_key
-   with KEY_NEED_WRITE / KEY_NEED_LINK / KEY_NEED_SEARCH.
-2. **Nested epoll has no loop or depth check** (P8, recursion through
+1. **Nested epoll has no loop or depth check** (P8, recursion through
    poll). `io/epoll.rs:449` refuses only adding an epoll to itself, and
    `Eventpoll::poll` (`io/epoll.rs:281`) polls its items under its own
    IrqSpinlock: A in B in A deadlocks the CPU with interrupts off on
    the first epoll_wait, and a long chain recurses off the stack. Linux
    ep_loop_check: ELOOP for cycles and nesting past EP_MAX_NESTS (4).
-3. **An epoll item keeps its file open** (P1, use after teardown).
+2. **An epoll item keeps its file open** (P1, use after teardown).
    `EpItem.file` is an `Arc<File>` (`io/epoll.rs:86`) and nothing
    removes items at the file's last close (no eventpoll_release): a
    closed pipe write end registered in an epoll never gives the reader
    EOF, a closed socket is never released, and epoll_wait keeps
    reporting it. Linux epitems hold no reference; __fput removes them.
-4. **Keys have no quota** (P13). add_key (`keys/syscall.rs:42`) takes
+3. **Keys have no quota** (P13). add_key (`keys/syscall.rs:42`) takes
    up to 1MB per key with no per-user count or byte limit, so any user
    can fill the kernel heap (whose exhaustion panics). Linux
    key_payload_reserve / key_user: maxkeys 200, maxbytes 20000 for
    non-root (/proc/sys/kernel/keys/*).
-5. **bpf() is open to unprivileged users** (P9). `bpf/syscall.rs:228`
+4. **bpf() is open to unprivileged users** (P9). `bpf/syscall.rs:228`
    has no capability check: any user creates maps (uncharged, see
    above) and loads programs. Linux's default
    kernel.unprivileged_bpf_disabled=2 (BPF_UNPRIV_DEFAULT_OFF) makes
    map_create and prog_load EPERM without CAP_BPF.
-6. **mmap offset + length is not checked for wrap** (P6).
+5. **mmap offset + length is not checked for wrap** (P6).
    `mm/syscall.rs:78`: a file offset near 2^64 wraps the page index of
    the mapping's pages; Linux do_mmap is EOVERFLOW when
    pgoff + (len >> PAGE_SHIFT) wraps.
-7. **pwrite/write past LLONG_MAX is not refused** (P6). `fs/io.rs:210`
+6. **pwrite/write past LLONG_MAX is not refused** (P6). `fs/io.rs:210`
    checks only `offset >= 0` and there is no s_maxbytes: pos + count
    can exceed i64::MAX, giving a negative st_size and lseek results
    that read as errnos. Linux rw_verify_area (EINVAL) and

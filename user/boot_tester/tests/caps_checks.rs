@@ -65,6 +65,8 @@ pub fn run_tests() {
     report(b"CLONE3_ERROR_NO_LEAK", in_child(clone3_error_no_leak));
     report(b"KEY_REVOKE_UPDATE", in_child_with(key_revoke_update));
     report(b"SIGNAL_PERM", signal_perm());
+    report(b"KEY_CYCLE_EDEADLK", key_cycle());
+    report(b"KEY_LINK_PERM", key_link_perm());
 }
 
 fn report(name: &[u8], step: u64) {
@@ -462,6 +464,78 @@ fn add_key(desc: &[u8]) -> i64 {
 
 fn keyctl(cmd: i32, a2: u64, a3: u64, a4: u64) -> i64 {
     hk_syscall::sys_keyctl(cmd, a2, a3, a4, 0)
+}
+
+const KEYCTL_LINK: i32 = 8;
+const EDEADLK: i64 = -35;
+
+/// A "keyring" key in the process keyring
+fn add_keyring(desc: &[u8]) -> i64 {
+    hk_syscall::sys_add_key(
+        b"keyring\0".as_ptr(),
+        desc.as_ptr(),
+        core::ptr::null(),
+        0,
+        KEY_SPEC_PROCESS_KEYRING,
+    )
+}
+
+/// Serial of a key the parent creates, read by the forked child
+static mut VICTIM_KEY: i64 = 0;
+
+/// Linking a keyring into itself or into one it already reaches is
+/// EDEADLK (Linux keyring_detect_cycle), so a search cannot recurse
+/// forever
+fn key_cycle() -> u64 {
+    let a = add_keyring(b"cyc_a\0");
+    let b = add_keyring(b"cyc_b\0");
+    if a <= 0 || b <= 0 {
+        return 1;
+    }
+    if keyctl(KEYCTL_LINK, a as u64, a as u64, 0) != EDEADLK {
+        return 2; // self-link
+    }
+    if keyctl(KEYCTL_LINK, a as u64, b as u64, 0) != 0 {
+        return 3; // a into b: fine
+    }
+    if keyctl(KEYCTL_LINK, b as u64, a as u64, 0) != EDEADLK {
+        return 4; // b into a would cycle
+    }
+    0
+}
+
+/// An unprivileged process cannot link a key it does not own: the key's
+/// LINK permission is checked (Linux lookup_user_key KEY_NEED_LINK)
+fn key_link_perm() -> u64 {
+    // Parent (root) makes a key with default (owner-only) permissions
+    let victim = add_key(b"linkperm\0");
+    if victim <= 0 {
+        return 1;
+    }
+    // SAFETY: written before the fork; the child reads its own copy
+    unsafe { core::ptr::write_volatile(&raw mut VICTIM_KEY, victim) };
+    let pid = sys_fork();
+    if pid == 0 {
+        const CAP_SETUID: u32 = 7;
+        // Keep CAP_SETUID to change uid, drop the rest (no key override)
+        if !set_effective(1 << CAP_SETUID) || sys_setresuid(1000, 1000, 1000) != 0 {
+            sys_exit(2);
+        }
+        let ring = add_keyring(b"lp_ring\0");
+        if ring <= 0 {
+            sys_exit(3);
+        }
+        // SAFETY: the parent's value, copied by fork
+        let v = unsafe { core::ptr::read_volatile(&raw const VICTIM_KEY) };
+        let r = keyctl(KEYCTL_LINK, v as u64, ring as u64, 0);
+        sys_exit(if r == EACCES { 0 } else { 4 });
+    }
+    let mut st = 0i32;
+    sys_wait4(pid, &mut st, 0, 0);
+    if st & 0x7f != 0 {
+        return 80;
+    }
+    ((st >> 8) & 0xff) as u64
 }
 
 /// In a child (its own process keyring)

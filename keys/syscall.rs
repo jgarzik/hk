@@ -92,6 +92,12 @@ pub fn sys_add_key(type_ptr: u64, desc_ptr: u64, payload_ptr: u64, plen: u64, ke
         return KernelError::NotDirectory.sysret();
     }
 
+    // WRITE on the destination keyring (Linux key_create_or_update ->
+    // lookup_user_key KEY_NEED_WRITE)
+    if !super::key::check_key_permission(&dest_keyring, super::key::KEY_NEED_WRITE) {
+        return KernelError::PermissionDenied.sysret();
+    }
+
     // Allocate new key
     let serial = alloc_serial();
     // Owned by the fsuid and fsgid (Linux key_create_or_update ->
@@ -169,9 +175,13 @@ pub fn sys_request_key(
             return KernelError::KeyRevoked.sysret();
         }
 
-        // Link to destination keyring if specified
+        // Linking into the destination needs LINK on the key and WRITE
+        // on the destination (Linux request_key -> construct_get_dest_keyring
+        // / lookup_user_key)
         if dest_keyring != 0
             && let Ok(dest) = resolve_special_keyring(dest_keyring, false, tid, uid, gid)
+            && super::key::check_key_permission(&key, super::key::KEY_NEED_LINK)
+            && super::key::check_key_permission(&dest, super::key::KEY_NEED_WRITE)
         {
             let _ = keyring_link(&dest, &key);
         }
