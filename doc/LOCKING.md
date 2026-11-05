@@ -168,6 +168,13 @@ the mmap_lock (`Mm.map`), `AnonVma.chain`; `Mutex`:
 `UnixSock.bindlock`, `UnixSock.iolock`, `Disk.open_mutex`, `SWAPON` and
 `Pipe.inner` (Linux pipe->mutex).
 
+### 1.4.1 SeqLock (sync/seqlock.rs)
+
+Linux seqlock_t: `write()` takes a spin lock and keeps the sequence odd
+while held (Release fences around the writer's stores); lockless
+readers use `read_begin`/`read_retry` and repeat a read that raced a
+writer. Thread context only. Used for `MOUNT_LOCK`.
+
 ### 1.5 Lockdep-lite (`sync::lockdep`, feature `lockdep`)
 
 Kernel code takes `crate::sync::spin::{Mutex, RwLock}` (never the `spin`
@@ -279,7 +286,10 @@ VFS locks (detailed order):
                    attach, umount, namespace copy; read for /proc mount
                    lists)
         ↓
-    SuperBlock.s_umount (sync::RwSem; write for remount)
+    SuperBlock.s_umount (sync::RwSem; write for remount, read for a
+                   bind remount)
+        ↓
+    mount::MOUNT_LOCK (SeqLock writer, spin; every mnt_flags write)
         ↓
     dentry::RENAME_LOCK (spin RwLock, Linux rename_lock: write in
                    d_move/d_exchange, read in is_subdir/d_path)
@@ -1813,7 +1823,9 @@ Linux `vfsmount.mnt_count` pattern:
 | `Mount.parent` | `RwLock<Option<Weak<Mount>>>` | Parent mount reference |
 | `Mount.children` | `RwLock<Vec<Arc<Mount>>>` | Child mounts |
 | `Mount.mnt_count` | `AtomicU64` | Open file reference count |
-| `Mount.mnt_flags` | `AtomicU32` | MNT_NOSUID/NODEV/NOEXEC; set by mount/remount, read lock-free (open, exec, statfs) |
+| `Mount.mnt_flags` | `AtomicU32` | MNT_NOSUID/NODEV/NOEXEC/READONLY/LOCKED; every write under `MOUNT_LOCK` (remount, reconfigure, pivot_root's MNT_LOCKED), read lock-free (open, exec, statfs) |
+| `MOUNT_LOCK` | `SeqLock` (spin writer + sequence) | Linux mount_lock (lock_mount_hash): serializes `mnt_flags` writers; under NAMESPACE_SEM and s_umount, nothing taken under it; the sequence is there for lockless readers |
+| `Mount.t_flags` | `AtomicU32` | T_UNBINDABLE (Linux mnt_t_flags): written only under NAMESPACE_SEM write (change_propagation), read lock-free |
 | `SuperBlock.s_flags` | `AtomicU32` | SB_RDONLY; set by mount/remount, read lock-free by permission checks |
 | `SuperBlock.s_writers` | `AtomicU64` | Write-access holders (`want_write` guard, Linux mnt_want_write). Lock-free protocol against `make_rdonly`: the writer increments `s_writers` then reads `s_flags`; the remount sets SB_RDONLY then reads `s_writers` (all SeqCst), backing out (EROFS / EBUSY) if it sees the other side, so a writer and a read-only remount never both succeed |
 

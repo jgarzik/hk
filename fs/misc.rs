@@ -118,7 +118,9 @@ fn remount(m: &Arc<super::mount::Mount>, flags: u64) -> Result<(), KernelError> 
 /// MS_REMOUNT|MS_BIND (Linux do_reconfigure_mnt): this mount's flags
 /// only, read-only included; the superblock is untouched
 fn reconfigure_mnt(m: &Arc<super::mount::Mount>, flags: u64) -> Result<(), KernelError> {
-    let _s = m.sb.s_umount.write();
+    // s_umount shared, as Linux do_reconfigure_mnt: the superblock does
+    // not change, MOUNT_LOCK serializes the flag writers
+    let _s = m.sb.s_umount.read();
     m.set_flags(mnt_flags(flags))
 }
 

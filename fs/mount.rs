@@ -24,12 +24,17 @@ pub const MNT_NODEV: u32 = 0x2;
 pub const MNT_NOEXEC: u32 = 0x4;
 /// This mount is read-only, whatever its superblock (Linux MNT_READONLY)
 pub const MNT_READONLY: u32 = 0x40;
-/// Cannot be bind-mounted (Linux MNT_UNBINDABLE)
-pub const MNT_UNBINDABLE: u32 = 0x2000;
+/// Cannot be bind-mounted (Linux T_UNBINDABLE, in `t_flags`)
+pub const T_UNBINDABLE: u32 = 0x1;
 /// Cannot be unmounted, moved or pivoted away (Linux MNT_LOCKED: a mount
 /// a less privileged namespace copied, which would uncover what is
 /// under it; the initial root is protected by having no parent)
 pub const MNT_LOCKED: u32 = 0x80_0000;
+
+/// Every write of a mount's `mnt_flags` (Linux mount_lock,
+/// lock_mount_hash: a seqlock whose sequence lockless readers may check);
+/// under NAMESPACE_SEM and s_umount, above nothing but leaves
+pub static MOUNT_LOCK: crate::sync::SeqLock = crate::sync::SeqLock::new();
 
 /// Old mount -> its copy, from [`Mount::clone_tree`]
 pub type MountMap = Vec<(Arc<Mount>, Arc<Mount>)>;
@@ -99,6 +104,9 @@ pub struct Mount {
 
     /// Peer group, 0 if not shared (Linux mnt_group_id; fs/pnode.rs)
     pub(super) group: AtomicU32,
+    /// Topology flags (Linux mnt_t_flags: T_UNBINDABLE), written only
+    /// under NAMESPACE_SEM write, read lock-free
+    t_flags: AtomicU32,
     /// Group this mount is a slave of, 0 if none (Linux mnt_master)
     pub(super) master: AtomicU32,
 
@@ -143,6 +151,7 @@ impl Mount {
             writers: AtomicU64::new(0),
             expiry: core::sync::atomic::AtomicBool::new(false),
             group: AtomicU32::new(0),
+            t_flags: AtomicU32::new(0),
             master: AtomicU32::new(0),
             mnt_id: mnt_alloc_id(),
             mnt_id_unique: MNT_ID_UNIQUE.fetch_add(1, Ordering::Relaxed),
@@ -174,9 +183,9 @@ impl Mount {
     /// is EBUSY, nothing changed, while anyone holds write access
     /// through the mount (Linux mnt_make_readonly)
     pub fn set_flags(&self, f: u32) -> Result<(), KernelError> {
-        // Propagation and lock state are not the caller's to set here
-        const KEEP: u32 = MNT_UNBINDABLE | MNT_LOCKED;
-        let f = (f & !KEEP) | (self.flags() & KEEP);
+        let _ml = MOUNT_LOCK.write();
+        // Lock state is not the caller's to set here
+        let f = (f & !MNT_LOCKED) | (self.flags() & MNT_LOCKED);
         let old = self.mnt_flags.fetch_or(f & MNT_READONLY, Ordering::SeqCst);
         if f & MNT_READONLY != 0
             && old & MNT_READONLY == 0
@@ -189,12 +198,29 @@ impl Mount {
         Ok(())
     }
 
-    /// Set (`on`) or clear MNT_* bits that need no other checks
+    /// Set (`on`) or clear MNT_* bits that need no other checks, under
+    /// MOUNT_LOCK as every mnt_flags write
     pub fn mark(&self, bits: u32, on: bool) {
+        let _ml = MOUNT_LOCK.write();
         if on {
             self.mnt_flags.fetch_or(bits, Ordering::SeqCst);
         } else {
             self.mnt_flags.fetch_and(!bits, Ordering::SeqCst);
+        }
+    }
+
+    /// Cannot be bind-mounted (Linux IS_MNT_UNBINDABLE)
+    pub fn is_unbindable(&self) -> bool {
+        self.t_flags.load(Ordering::Acquire) & T_UNBINDABLE != 0
+    }
+
+    /// Make it (un)bindable; the caller holds NAMESPACE_SEM write (Linux
+    /// change_mnt_propagation, EXCL[namespace_sem])
+    pub(super) fn set_unbindable(&self, on: bool) {
+        if on {
+            self.t_flags.fetch_or(T_UNBINDABLE, Ordering::Release);
+        } else {
+            self.t_flags.fetch_and(!T_UNBINDABLE, Ordering::Release);
         }
     }
 
@@ -415,7 +441,7 @@ pub fn clone_mnt(m: &Mount, root: Arc<Dentry>) -> Arc<Mount> {
     Mount::new(
         m.sb.clone(),
         root,
-        m.flags() & !(MNT_UNBINDABLE | MNT_LOCKED),
+        m.flags() & !MNT_LOCKED,
         m.devname.clone(),
     )
 }
@@ -433,7 +459,7 @@ pub fn copy_tree(m: &Arc<Mount>, root: &Arc<Dentry>) -> Arc<Mount> {
                 continue;
             };
             let below = !Arc::ptr_eq(&src, m) || super::is_subdir(&mp, root);
-            if !below || c.flags() & MNT_UNBINDABLE != 0 {
+            if !below || c.is_unbindable() {
                 continue;
             }
             let n = clone_mnt(&c, c.root.clone());
@@ -449,7 +475,7 @@ pub fn copy_tree(m: &Arc<Mount>, root: &Arc<Dentry>) -> Arc<Mount> {
 /// and graft_tree): an unbindable source is EINVAL; a directory goes
 /// only on a directory and a file on a file (ENOTDIR)
 pub fn do_loopback(old: &Path, mp: &Path, rec: bool) -> Result<(), KernelError> {
-    if old.mnt.flags() & MNT_UNBINDABLE != 0 {
+    if old.mnt.is_unbindable() {
         return Err(KernelError::InvalidArgument);
     }
     let is_dir = |d: &Dentry| d.get_inode().is_some_and(|i| i.mode().is_dir());
@@ -680,7 +706,7 @@ pub fn do_move(old: &Path, mp: &Path) -> Result<(), KernelError> {
         || (shared(&mp.mnt)
             && super::pnode::subtree(&old.mnt)
                 .iter()
-                .any(|m| m.flags() & MNT_UNBINDABLE != 0))
+                .any(|m| m.is_unbindable()))
     {
         return Err(KernelError::InvalidArgument);
     }
