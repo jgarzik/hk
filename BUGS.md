@@ -937,7 +937,8 @@ sched pid 0, flock/POSIX release, signalfd reader, errno flattening.
   global generators run under the procfs inode's read lock and take
   TASKLIST and network locks inside it (not in LOCKING.md).
   /proc/sys is one static tree: the sysctls Linux registers for the
-  initial network namespace only (net/ipv4/tcp_mem) appear in every
+  initial network namespace only (net/ipv4/tcp_mem,
+  net/core/mem_pcpu_rsv) appear in every
   namespace.
 - **Stale comments and dead code** (as touched): about 155
   `#[allow(dead_code)]`, 90 "for now"/TODO markers; comments that

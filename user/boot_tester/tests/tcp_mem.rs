@@ -3,6 +3,8 @@
 //! - TCP_MEM_SYSCTL: /proc/sys/net/ipv4/tcp_mem holds three page counts
 //!   sized from RAM as tcp_init_mem (min = 3/4 of pressure, max = twice
 //!   min); it takes writes back as written and refuses negative values.
+//! - MEM_PCPU_RSV: net.core.mem_pcpu_rsv, the per-CPU reserve batching
+//!   the count (1 MiB in pages), refuses less than that.
 //! - TCP_MEM_PRESSURE: with every limit at 4 pages, 8 loopback pairs each
 //!   move 128 KiB intact (charges forced for empty queues keep every
 //!   connection progressing), and the limits restore. Senders stay open
@@ -24,6 +26,7 @@ pub fn run_tests() {
     let mut old = [0u8; 96];
     let n = read_file(PATH, &mut old);
     test_sysctl(&old[..n.max(0) as usize]);
+    test_pcpu_rsv();
     test_pressure();
     if n > 0 {
         write_file(PATH, &old[..n as usize]);
@@ -72,6 +75,20 @@ fn test_sysctl(old: &[u8]) {
         parse(&buf[..n.max(0) as usize]) == Some([100, 200, 300]),
         n,
     );
+    t.done();
+}
+
+fn test_pcpu_rsv() {
+    const RSV: &[u8] = b"/proc/sys/net/core/mem_pcpu_rsv\0";
+    let mut t = T::new(b"MEM_PCPU_RSV");
+    let mut buf = [0u8; 32];
+    let n = read_file(RSV, &mut buf);
+    t.ok(b"default", n > 0 && &buf[..n as usize] == b"256\n", n);
+    t.eq(b"below", write_file(RSV, b"255\n"), EINVAL);
+    t.eq(b"raise", write_file(RSV, b"512\n"), 4);
+    let n = read_file(RSV, &mut buf);
+    t.ok(b"read back", n > 0 && &buf[..n as usize] == b"512\n", n);
+    write_file(RSV, b"256\n");
     t.done();
 }
 

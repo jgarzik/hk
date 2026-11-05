@@ -1277,7 +1277,8 @@ impl TcpCb {
             return true;
         }
         let amt = need - self.held;
-        if self.mem_raise(mem::add(amt), size, kind) {
+        mem::add(amt);
+        if self.mem_raise(mem::allocated(), size, kind) {
             self.held = need;
             return true;
         }

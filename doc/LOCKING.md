@@ -3571,7 +3571,7 @@ Correct uses of atomics in hk:
 | `Inode` | size | Linux i_size_write/read: Release under i_rwsem, Acquire lock-free, so the bytes below it are visible first |
 | `Sock` | flags, error, buffer sizes | Independent values; protocol data under the socket lock |
 | `Sock` | shutdown | Written under the protocol socket lock (TCP `cb`, unix `st`); read lock-free by poll |
-| TCP memory (`net/tcp/mem.rs`) | `ALLOCATED`, `LIMITS` (tcp_mem), `PRESSURE`, `SOCKETS` | Linux tcp_memory_allocated, sysctl_tcp_mem, tcp_memory_pressure, tcp_sockets_allocated: a connection adds what its queues lack under its `cb`, then checks the limits and subtracts again on failure (add-then-check, never a separate free-space read); the limits are independent sysctl words; pressure is a mode flag any raise may set or clear; all Relaxed, counts and modes that publish nothing |
+| TCP memory (`net/tcp/mem.rs`) | `ALLOCATED`, per-CPU `FW_ALLOC`, `LIMITS` (tcp_mem), `PCPU_RSV`, `PRESSURE`, `SOCKETS` | Linux tcp_memory_allocated, tcp_memory_per_cpu_fw_alloc, sysctl_tcp_mem, mem_pcpu_rsv, tcp_memory_pressure, tcp_sockets_allocated: a connection adds what its queues lack under its `cb`, then checks the limits and subtracts again on failure (add-then-check, never a separate free-space read); adds and subtracts go to this CPU's reserve by atomic RMW (correct even after a migration, as this_cpu ops) and move to `ALLOCATED` past ±`PCPU_RSV` (rule 9), so the limits see a count lagging by up to the reserve per CPU, as Linux; the limits are independent sysctl words; pressure is a mode flag any raise may set or clear; all Relaxed, counts and modes that publish nothing |
 | `CachedPage` | refcount, dirty, writeback, locked | Linux page cache pattern - flags + refcount |
 
 ---

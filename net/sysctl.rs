@@ -445,6 +445,13 @@ pub static CTLS: &[Ctl] = &[
         text: None,
     },
     Ctl {
+        path: "net/core/mem_pcpu_rsv",
+        mode: 0o644,
+        show: crate::net::tcp::mem::rsv_show,
+        store: crate::net::tcp::mem::rsv_store,
+        text: None,
+    },
+    Ctl {
         path: "net/core/somaxconn",
         mode: 0o644,
         show: || get_i32(|s| &s.somaxconn),
