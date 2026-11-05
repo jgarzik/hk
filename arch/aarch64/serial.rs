@@ -202,16 +202,15 @@ pub fn serial_ttys() -> &'static [&'static Tty] {
 }
 
 /// The PL011's interrupt handler (IRQ context): input to ttyAMA0
-fn pl011_irq(_irq: u32, _data: *mut ()) -> bool {
+fn pl011_irq(_irq: u32) -> bool {
     UART.rx_chars(&TTY_AMA0)
 }
 
 /// Take input by interrupt (Linux pl011_startup); `irq` is the GIC
 /// INTID. False without it
 fn rx_irq_init(irq: u32) -> bool {
-    if let Err(e) =
-        crate::arch::irq::register_irq_handler(irq, pl011_irq, core::ptr::null_mut(), PL011_BASE)
-    {
+    let h = alloc::sync::Arc::new(crate::irq::IrqFn(pl011_irq));
+    if let Err(e) = crate::arch::irq::register_irq_handler(irq, h, PL011_BASE) {
         crate::printkln!("ttyAMA0: no IRQ {}: {}", irq, e);
         return false;
     }

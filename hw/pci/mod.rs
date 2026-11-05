@@ -834,11 +834,10 @@ impl PciDevice {
     /// The IRQ number on success, or an error description
     pub fn register_irq_handler(
         &self,
-        handler: crate::arch::irq::IrqHandler,
-        data: *mut (),
+        handler: alloc::sync::Arc<dyn crate::irq::IrqHandler>,
     ) -> Result<u32, &'static str> {
         let irq = self.intx_irq().ok_or("No valid IRQ assigned to device")?;
-        crate::arch::irq::register_irq_handler(irq, handler, data, self.irq_id())?;
+        crate::arch::irq::register_irq_handler(irq, handler, self.irq_id())?;
 
         // Clear INTERRUPT_DISABLE bit in command register to enable interrupts
         let cmd = pci_read16(self.bus, self.device, self.function, offset::COMMAND);
@@ -870,7 +869,11 @@ impl PciDevice {
             cmd | command::INTERRUPT_DISABLE,
         );
 
-        crate::arch::irq::unregister_irq_handler(irq, self.irq_id())?;
+        // The table's reference to the handler goes here, unlocked
+        drop(crate::arch::irq::unregister_irq_handler(
+            irq,
+            self.irq_id(),
+        )?);
         Ok(irq)
     }
 

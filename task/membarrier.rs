@@ -139,14 +139,11 @@ fn ipi_sync_core(_: usize) {
 
 /// Refresh this CPU's cached registrations if it runs address space
 /// `mm` (Linux ipi_sync_rq_state)
-fn ipi_sync_state(mm: usize) {
+fn ipi_sync_state(mm: &Mm) {
     if let Some(s) = crate::task::percpu::current_percpu_sched()
-        && s.curr_mm.load(Ordering::Relaxed) == mm
+        && s.curr_mm.load(Ordering::Relaxed) == core::ptr::from_ref(mm).addr()
     {
-        // SAFETY: the registering caller runs in `mm` and waits for us
-        let st = unsafe { &*(mm as *const Mm) }
-            .membarrier_state()
-            .load(Ordering::Relaxed);
+        let st = mm.membarrier_state().load(Ordering::Relaxed);
         s.membarrier_state.store(st, Ordering::Relaxed);
     }
 }
@@ -225,7 +222,7 @@ fn register(set: u32, ready: u32) -> i64 {
     let me = Arc::as_ptr(&mm) as usize;
     {
         let _g = IPI_MUTEX.lock();
-        ipi_sync_state(me);
+        ipi_sync_state(&mm);
         fence(Ordering::SeqCst);
         let mut mask = CpuSet::default();
         for cpu in crate::smp::active_cpus().iter() {
@@ -235,7 +232,7 @@ fn register(set: u32, ready: u32) -> i64 {
                 mask.set(cpu);
             }
         }
-        crate::smp::smp_call_function_many(&mask, ipi_sync_state, me, true);
+        crate::smp::smp_call_many_ref(&mask, ipi_sync_state, &*mm);
     }
     st.fetch_or(ready, Ordering::AcqRel);
     0

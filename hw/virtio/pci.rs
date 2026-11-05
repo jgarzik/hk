@@ -391,11 +391,9 @@ impl VirtioDevice {
             }
             *irq = Some(cb);
         }
-        // The handler's pointer stays valid until `free_irq`: the driver
-        // keeps its Arc while bound, and frees the IRQ in its remove
-        let r = self
-            .pci
-            .register_irq_handler(vp_interrupt, Arc::as_ptr(self) as *mut ());
+        // The IRQ table holds a reference until `free_irq` (the driver's
+        // remove)
+        let r = self.pci.register_irq_handler(self.clone());
         if r.is_err() {
             self.irq.lock().take();
         }
@@ -458,12 +456,14 @@ impl DmaDevice for VirtioDevice {
     }
 }
 
+impl crate::irq::IrqHandler for VirtioDevice {
+    fn handle(&self, _irq: u32) -> bool {
+        vp_interrupt(self)
+    }
+}
+
 /// Transport interrupt handler (Linux vp_interrupt; IRQ context)
-fn vp_interrupt(_irq: u32, data: *mut ()) -> bool {
-    // SAFETY: `data` is the Arc<VirtioDevice> pointer `request_irq`
-    // registered; the driver keeps that Arc until `free_irq`, which
-    // unregisters this handler (under the IRQ table lock it runs under)
-    let vdev = unsafe { &*(data as *const VirtioDevice) };
+fn vp_interrupt(vdev: &VirtioDevice) -> bool {
     // Read-to-clear; deasserts the level-triggered line
     let isr = vdev.isr.read8(0);
     if isr == 0 {

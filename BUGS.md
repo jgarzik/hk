@@ -52,9 +52,9 @@ blocks belong in a missing wrapper:
   pci_quirks, aarch64 serial, x86 power.
 - **Lists:** an intrusive `CursorMut` for the walk-and-remove loops
   (futex, waitqueue, sched, percpu).
-- **Callbacks:** typed callback context (`register_irq<T: Sync>`,
-  timer container_of, `smp_call<T: Sync>`) in place of `*mut ()` data
-  casts.
+- **Callbacks:** smp calls with a plain `usize` (`smp_call_function_many`
+  without wait, `stop_one_cpu_nowait`, kthread `fn(usize)`) still carry
+  integers or casts; the waiting forms have typed `_ref` variants.
 
 ## cgroup names must be UTF-8
 

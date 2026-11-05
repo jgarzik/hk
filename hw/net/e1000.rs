@@ -480,9 +480,14 @@ impl E1000 {
     }
 }
 
+impl crate::irq::IrqHandler for E1000 {
+    fn handle(&self, _irq: u32) -> bool {
+        e1000_isr(self)
+    }
+}
+
 /// Interrupt handler (IRQ context): ack, mask, schedule NAPI
-fn e1000_isr(_irq: u32, data: *mut ()) -> bool {
-    let dev = unsafe { &*(data as *const E1000) };
+fn e1000_isr(dev: &E1000) -> bool {
     let icr = dev.read_reg(reg::ICR); // read-to-clear
     if icr == 0 {
         // Shared line: another device's interrupt
@@ -794,7 +799,7 @@ fn e1000_probe(
 
     // Shareable level-triggered INTx; the device's interrupts stay
     // masked until userspace brings the interface up (open())
-    match pci.register_irq_handler(e1000_isr, Arc::as_ptr(&device) as *mut ()) {
+    match pci.register_irq_handler(device.clone()) {
         Ok(irq) => printkln!("e1000: IRQ {}", irq),
         Err(e) => {
             printkln!("e1000: no IRQ ({}), RX disabled", e);

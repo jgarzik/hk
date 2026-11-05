@@ -84,6 +84,13 @@ pub fn stop_one_cpu(cpu: u32, func: fn(usize), arg: usize) -> bool {
     true
 }
 
+/// [`stop_one_cpu`] with a borrowed argument (the call waits, so `arg`
+/// outlives it)
+pub fn stop_one_cpu_ref<T: Sync>(cpu: u32, func: fn(&T), arg: &T) -> bool {
+    let call = (func, arg);
+    stop_one_cpu(cpu, crate::smp::call_ref::<T>, (&raw const call).addr())
+}
+
 /// Queue `func(arg)` on `cpu`'s stopper without waiting (Linux
 /// stop_one_cpu_nowait); any context. False if it has no stopper or
 /// already has a call queued.

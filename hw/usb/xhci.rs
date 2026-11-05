@@ -144,7 +144,7 @@ static TRANSFER_COUNT: AtomicUsize = AtomicUsize::new(0);
 /// xHCI interrupt handler
 ///
 /// Called from the IRQ dispatch system when the xHCI's IRQ fires.
-fn xhci_irq_handler(_irq: u32, _data: *mut ()) -> bool {
+fn xhci_irq_handler(_irq: u32) -> bool {
     xhci_irq_handler_common()
 }
 
@@ -990,7 +990,7 @@ impl XhciController {
         // Register IRQ handler with PCI device
         match self
             .pci_dev
-            .register_irq_handler(xhci_irq_handler, core::ptr::null_mut())
+            .register_irq_handler(alloc::sync::Arc::new(crate::irq::IrqFn(xhci_irq_handler)))
         {
             Ok(irq) => {
                 self.irq = Some(irq);

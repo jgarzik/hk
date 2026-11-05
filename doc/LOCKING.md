@@ -3032,9 +3032,11 @@ ISRs only ack the device, set atomics and use IRQ-safe deferral
 |------|------|-----------|-------|
 | `IRQ_TABLE` (per arch) | `IrqSpinlock` | taken in IRQ (`dispatch_irq`) and process context (register/unregister) | leaf except for the interrupt-controller MMIO it programs; handlers run under it |
 
-Generic interface (`crate::arch::irq`): `IrqHandler = fn(u32, *mut ()) ->
-bool`, `register_irq_handler(irq, handler, data, id)` (shareable; first
-handler unmasks the line, last one masks it), `unregister_irq_handler`,
+Generic interface (`crate::arch::irq`): `register_irq_handler(irq,
+Arc<dyn crate::irq::IrqHandler>, id)` (shareable; first handler unmasks
+the line, last one masks it; the table holds the handler's device state
+while registered, `IrqFn` wraps a stateless fn), `unregister_irq_handler`
+(hands the reference back, dropped by the caller after the table lock),
 `pci_intx_irq(bus, dev, fn, pin, line)`. `PciDevice::register_irq_handler`
 uses these on both arches. Every handler of a shared line is called; a line
 nobody claims 100000 times in a row is masked (stuck level INTx).

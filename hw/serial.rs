@@ -308,7 +308,7 @@ pub fn write_byte_com1(byte: u8) {
 }
 
 /// COM1's interrupt handler (IRQ context): input to ttyS0
-fn com1_irq(_irq: u32, _data: *mut ()) -> bool {
+fn com1_irq(_irq: u32) -> bool {
     SERIAL_DRIVER_S0.rx_chars(&SERIAL_TTY_S0)
 }
 
@@ -316,8 +316,8 @@ fn com1_irq(_irq: u32, _data: *mut ()) -> bool {
 /// its PIC line. False without it
 fn rx_irq_init(irq: u32) -> bool {
     let id = usize::from(ports::COM1);
-    if let Err(e) = crate::arch::irq::register_irq_handler(irq, com1_irq, core::ptr::null_mut(), id)
-    {
+    let h = alloc::sync::Arc::new(crate::irq::IrqFn(com1_irq));
+    if let Err(e) = crate::arch::irq::register_irq_handler(irq, h, id) {
         crate::printkln!("ttyS0: no IRQ {}: {}", irq, e);
         return false;
     }

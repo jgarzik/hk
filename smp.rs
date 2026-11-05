@@ -162,6 +162,28 @@ pub fn on_each_cpu(func: fn(usize), info: usize) {
     local_irq_restore(irq);
 }
 
+/// [`smp_call_function_many`] with a borrowed argument, waiting: the
+/// call returns once every target ran `func(arg)`, so `arg` outlives them
+pub fn smp_call_many_ref<T: Sync>(mask: &CpuSet, func: fn(&T), arg: &T) {
+    let call = (func, arg);
+    smp_call_function_many(mask, call_ref::<T>, (&raw const call).addr(), true);
+}
+
+/// [`on_each_cpu`] with a borrowed argument
+pub fn on_each_cpu_ref<T: Sync>(func: fn(&T), arg: &T) {
+    let call = (func, arg);
+    on_each_cpu(call_ref::<T>, (&raw const call).addr());
+}
+
+/// The target side of the `_ref` calls: `info` is the address of the
+/// sender's `(func, arg)`
+pub(crate) fn call_ref<T: Sync>(info: usize) {
+    // SAFETY: the `_ref` senders pass their pair's address and wait for
+    // every call, so it is live and unchanged
+    let (func, arg) = unsafe { *(info as *const (fn(&T), &T)) };
+    func(arg);
+}
+
 /// Ask `cpu` to reschedule (Linux smp_send_reschedule): wakes it from
 /// idle to pick up a remote wakeup. Any context.
 pub fn smp_send_reschedule(cpu: u32) {

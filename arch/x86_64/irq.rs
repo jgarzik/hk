@@ -13,34 +13,21 @@
 //! Locking: `IRQ_TABLE` is an `IrqSpinlock` (taken by `dispatch_irq` in IRQ
 //! context, by register/unregister in process context). Handlers run with
 //! it held and must not register/unregister.
-#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::arch::IrqSpinlock;
+use crate::irq::IrqHandler;
 
 /// Number of legacy PIC lines
 const NR_IRQS: usize = 16;
 
-/// IRQ handler function signature (same on all arches)
-///
-/// Arguments:
-/// - `irq`: The IRQ number (0-15)
-/// - `data`: Opaque pointer to driver instance state
-///
-/// Returns `true` if the interrupt was handled by this driver
-pub type IrqHandler = fn(irq: u32, data: *mut ()) -> bool;
-
 /// Entry in the IRQ handler table
 struct IrqEntry {
-    handler: IrqHandler,
-    data: *mut (),
+    handler: Arc<dyn IrqHandler>,
     id: usize,
 }
-
-// SAFETY: IrqEntry is only accessed under the IRQ_TABLE lock
-unsafe impl Send for IrqEntry {}
-unsafe impl Sync for IrqEntry {}
 
 /// One PIC line
 struct IrqLine {
@@ -71,8 +58,7 @@ static IRQ_TABLE: IrqSpinlock<IrqTable> = IrqSpinlock::new(IrqTable::new());
 /// Register a (shareable) handler for IRQ `irq` (0-15) and unmask it
 pub fn register_irq_handler(
     irq: u32,
-    handler: IrqHandler,
-    data: *mut (),
+    handler: Arc<dyn IrqHandler>,
     id: usize,
 ) -> Result<(), &'static str> {
     if irq as usize >= NR_IRQS {
@@ -83,7 +69,7 @@ pub fn register_irq_handler(
     if line.handlers.iter().any(|e| e.id == id) {
         return Err("Handler with this ID already registered");
     }
-    line.handlers.push(IrqEntry { handler, data, id });
+    line.handlers.push(IrqEntry { handler, id });
     line.spurious.reset();
     if line.handlers.len() == 1 {
         super::pic::enable_irq(irq as u8);
@@ -92,7 +78,7 @@ pub fn register_irq_handler(
 }
 
 /// Unregister a handler; the line is masked when its last handler goes
-pub fn unregister_irq_handler(irq: u32, id: usize) -> Result<(), &'static str> {
+pub fn unregister_irq_handler(irq: u32, id: usize) -> Result<Arc<dyn IrqHandler>, &'static str> {
     if irq as usize >= NR_IRQS {
         return Err("IRQ number out of range (0-15)");
     }
@@ -103,11 +89,11 @@ pub fn unregister_irq_handler(irq: u32, id: usize) -> Result<(), &'static str> {
         .iter()
         .position(|e| e.id == id)
         .ok_or("Handler not found")?;
-    line.handlers.remove(pos);
+    let e = line.handlers.remove(pos);
     if line.handlers.is_empty() {
         super::pic::disable_irq(irq as u8);
     }
-    Ok(())
+    Ok(e.handler)
 }
 
 /// Dispatch an IRQ to registered handlers (IRQ context)
@@ -125,7 +111,7 @@ pub fn dispatch_irq(irq: u8) -> bool {
     let mut handled = false;
     for entry in &line.handlers {
         crate::sync::lockdep::irq_enter();
-        handled |= (entry.handler)(u32::from(irq), entry.data);
+        handled |= entry.handler.handle(u32::from(irq));
         crate::sync::lockdep::irq_exit();
     }
     // A line without handlers is masked already (spurious IRQ7/15)

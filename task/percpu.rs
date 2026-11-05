@@ -3226,8 +3226,8 @@ fn balance_tick(cpu: u32) {
 }
 
 /// A task to move and where (`migration_cpu_stop`'s argument)
-struct Migration {
-    task: *const Task,
+struct Migration<'a> {
+    task: &'a Task,
     dest: u32,
 }
 
@@ -3236,11 +3236,8 @@ struct Migration {
 /// CPU runs meanwhile, so a task on it is queued, not running. One that
 /// sleeps (it moved meanwhile, or it is the caller waiting for this)
 /// wakes on `dest` if it can (its `wake_cpu`).
-fn migration_cpu_stop(arg: usize) {
-    // SAFETY: the caller waits for this call, holding the task
-    let m = unsafe { &*(arg as *const Migration) };
-    // SAFETY: as above
-    let p = unsafe { &*m.task };
+fn migration_cpu_stop(m: &Migration<'_>) {
+    let p = m.task;
     let _pi = p.pi_lock.lock();
     let Some(sched) = this_sched() else { return };
     let rq = sched.lock.lock();
@@ -3298,7 +3295,7 @@ pub fn set_cpus_allowed_ptr(p: &Task, mask: &crate::util::cpumask::CpuSet) -> Re
         (cpu, find_idlest_cpu(&allowed, cpu))
     };
     let m = Migration { task: p, dest };
-    crate::task::stop_machine::stop_one_cpu(cpu, migration_cpu_stop, &raw const m as usize);
+    crate::task::stop_machine::stop_one_cpu_ref(cpu, migration_cpu_stop, &m);
     Ok(())
 }
 
@@ -3318,11 +3315,8 @@ pub fn sched_exec() {
     if dest == this {
         return;
     }
-    let m = Migration {
-        task: &raw const *me,
-        dest,
-    };
-    crate::task::stop_machine::stop_one_cpu(this, migration_cpu_stop, &raw const m as usize);
+    let m = Migration { task: &me, dest };
+    crate::task::stop_machine::stop_one_cpu_ref(this, migration_cpu_stop, &m);
 }
 
 /// Wait until `p`, asleep, is off its CPU (Linux wait_task_inactive):

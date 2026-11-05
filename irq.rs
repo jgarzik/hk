@@ -11,6 +11,23 @@
 //! Locking: none of its own; each line's state lives under its arch
 //! dispatcher's `IRQ_TABLE` lock.
 
+/// An interrupt handler with its device state (Linux irq_handler_t and
+/// its dev_id): the IRQ table holds a reference while it is registered
+pub trait IrqHandler: Send + Sync {
+    /// Handle interrupt `irq` (IRQ context, under the IRQ table lock);
+    /// true if this device raised it
+    fn handle(&self, irq: u32) -> bool;
+}
+
+/// A handler with no state of its own
+pub struct IrqFn(pub fn(u32) -> bool);
+
+impl IrqHandler for IrqFn {
+    fn handle(&self, irq: u32) -> bool {
+        (self.0)(irq)
+    }
+}
+
 /// Interrupts per accounting window (Linux note_interrupt)
 const WINDOW: u32 = 100_000;
 

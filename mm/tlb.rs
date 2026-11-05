@@ -152,15 +152,8 @@ pub fn flush_tlb_mm_range(mm: &Mm, start: u64, end: u64, stride_shift: u32, free
     let mut others = ctx.cpumask.snapshot();
     others.clear(cpu);
     if !others.is_empty() {
-        let p = &raw const info as usize;
-        crate::smp::smp_call_function_many(&others, flush_ipi, p, true);
+        crate::smp::smp_call_many_ref(&others, flush_func, &info);
     }
-}
-
-/// `flush_func` on a target CPU (call-function IPI, interrupts off)
-fn flush_ipi(info: usize) {
-    // SAFETY: the sender's FlushInfo, alive until every target returned
-    flush_func(unsafe { &*(info as *const FlushInfo) });
 }
 
 /// Flush the page at `va` of `mm`
@@ -183,13 +176,11 @@ pub fn flush_tlb_kernel_range(start: u64, end: u64) {
     }
     // Every CPU, this one included: kernel threads run everywhere
     let range = (start, end);
-    crate::smp::on_each_cpu(kernel_flush_ipi, &raw const range as usize);
+    crate::smp::on_each_cpu_ref(kernel_flush_ipi, &range);
 }
 
 /// The kernel-range flush on one CPU (interrupts off)
-fn kernel_flush_ipi(info: usize) {
-    // SAFETY: the sender's range, alive until every CPU returned
-    let (start, end) = unsafe { *(info as *const (u64, u64)) };
+fn kernel_flush_ipi(&(start, end): &(u64, u64)) {
     local_flush(start, end, PAGE_SHIFT);
 }
 
