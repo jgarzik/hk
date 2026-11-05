@@ -1087,8 +1087,9 @@ pub struct Zone {
 - Both are IRQ-safe: allocating or freeing in interrupt context cannot
   deadlock against an interrupted allocator (policy is still no
   allocation in IRQ context).
-- Watermarks (min/low/high, from min_free_kbytes) are set once at boot
-  and checked lock-free against the zone's free count (an atomic
+- Watermarks (min/low/high, from min_free_kbytes) are set at boot and
+  by vm.min_free_kbytes writes, all three under `Zone.lock` (Linux
+  __setup_per_zone_wmarks), and checked lock-free against the zone's free count (an atomic
   written under `Zone.lock`) plus this CPU's list count (its atomic;
   a refill only moves pages between the two), as Linux
   zone_watermark_ok.
@@ -1632,7 +1633,9 @@ dropped before and after it is zeroed on the disk.)
   pages under their locks and unmaps again.
 - Writeback write-protects a page in every mapping of it before
   writing it (`mkclean`, Linux folio_mkclean): under the page lock,
-  i_mmap read -> each PTE lock, a TLB flush per entry. The write fault
+  i_mmap read -> each PTE lock, a TLB flush per entry. The entry is
+  write-protected by compare-exchange, keeping accessed/dirty bits the
+  MMU sets meanwhile. The write fault
   that follows makes it writable and dirties it again under the page
   lock (mmap_lock read -> page lock -> PTE lock), so writeback never
   sees it writable but clean; then it may throttle (balance_dirty_pages

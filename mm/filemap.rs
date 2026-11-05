@@ -485,9 +485,29 @@ fn mkclean(m: &AddressSpace, index: u64, phys: u64) {
         let _l = super::ptl::pte_lock(ptep);
         // SAFETY: a live table of a VMA in the chain, under its PTE lock
         let e = unsafe { AtomicU64::from_ptr(ptep) };
-        let pte = e.load(Ordering::Acquire);
-        if paging::pte_present(pte) && paging::pte_addr(pte) == phys && paging::pte_write(pte) {
-            e.store(paging::pte_wrprotect(pte), Ordering::Release);
+        // The MMU may set accessed/dirty meanwhile (under the PTE lock
+        // only it changes the entry): a compare-exchange keeps those
+        // bits, where a load then store could drop a dirty bit set by a
+        // write racing the clean (as mprotect's change_pte)
+        let mut pte = e.load(Ordering::Acquire);
+        let cleaned = loop {
+            if !(paging::pte_present(pte)
+                && paging::pte_addr(pte) == phys
+                && paging::pte_write(pte))
+            {
+                break false;
+            }
+            match e.compare_exchange(
+                pte,
+                paging::pte_wrprotect(pte),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break true,
+                Err(now) => pte = now,
+            }
+        };
+        if cleaned {
             super::tlb::flush_tlb_page(&mm, addr);
         }
     }
