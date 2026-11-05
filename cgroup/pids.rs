@@ -153,11 +153,12 @@ impl CgroupSubsysOps for PidsController {
         // Nothing to clean up
     }
 
-    fn attach(&self, css: &CgroupSubsysState, _pid: Pid) -> Result<(), KernelError> {
+    /// Linux pids_attach: the charge moves unconditionally (a migration
+    /// may exceed pids.max)
+    fn attach(&self, css: &CgroupSubsysState, _pid: Pid) {
         if let Some(state) = css.private_as::<PidsState>() {
             state.charge();
         }
-        Ok(())
     }
 
     fn detach(&self, css: &CgroupSubsysState, _pid: Pid) {

@@ -706,7 +706,7 @@ fn migrate_one(root: &CgroupRoot, target: &Arc<Cgroup>, tid: Tid) {
     }
     for c in target.enabled_controllers() {
         if let (Some(css), Some(ops)) = (target.css(c), root.get_controller(c)) {
-            let _ = ops.attach(&css, pid);
+            ops.attach(&css, pid);
         }
     }
     target.add_task(pid);

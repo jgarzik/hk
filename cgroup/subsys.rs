@@ -102,10 +102,10 @@ pub trait CgroupSubsysOps: Send + Sync {
         Ok(())
     }
 
-    /// Called when a task is attached to a cgroup
-    fn attach(&self, _css: &CgroupSubsysState, _pid: Pid) -> Result<(), KernelError> {
-        Ok(())
-    }
+    /// Commit a task's move into a cgroup (Linux ss->attach, void):
+    /// cannot fail, since the threads before it have already moved;
+    /// refusing belongs in `can_attach`
+    fn attach(&self, _css: &CgroupSubsysState, _pid: Pid) {}
 
     /// Called when a task is detached from a cgroup
     fn detach(&self, _css: &CgroupSubsysState, _pid: Pid) {}
