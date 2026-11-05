@@ -10,7 +10,7 @@
 //!
 //! TLS (Thread Local Storage) handling follows the Linux kernel pattern:
 //! save/restore FS base in Rust before calling the pure-asm switch.
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use super::fpu::{self, FpuArea};
 use super::percpu::{write_fs_base, write_user_gsbase};

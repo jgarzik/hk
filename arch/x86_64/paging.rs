@@ -2,7 +2,7 @@
 //!
 //! Implements the PageTable trait for x86-64 4-level paging:
 //! PML4 -> PDPT -> PD -> PT -> Physical Page
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -645,7 +645,6 @@ impl X86_64PageTable {
 
     /// Translate a virtual address to physical address
     /// Returns None if the address is not mapped
-    #[allow(dead_code)]
     pub fn virt_to_phys(&self, vaddr: u64) -> Option<u64> {
         let (pml4_idx, pdpt_idx, pd_idx, pt_idx) = page_indices(vaddr);
 

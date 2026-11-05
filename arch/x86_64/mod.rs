@@ -7,7 +7,7 @@
 //! - Interrupt handling (PIC, PIT)
 //! - SMP support (ACPI, LAPIC, per-CPU data)
 //! - Platform drivers (PIC, PIT, Serial)
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 // Note: no_std is inherited from the kernel crate
 

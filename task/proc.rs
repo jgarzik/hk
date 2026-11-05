@@ -6,7 +6,7 @@
 //! - exit (process termination)
 //! - wait4, waitid (child process waiting)
 //! - set_tid_address (thread exit notification)
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use crate::util::error::KernelError;
 
@@ -292,11 +292,10 @@ crate::pod!(SigInfo {
 const CLD_EXITED: i32 = 1; // Child has exited
 const CLD_KILLED: i32 = 2; // Child was killed
 const CLD_DUMPED: i32 = 3; // Child terminated abnormally
-#[allow(dead_code)]
 const CLD_TRAPPED: i32 = 4; // Traced child has trapped
-#[allow(dead_code)]
+#[expect(dead_code)]
 const CLD_STOPPED: i32 = 5; // Child has stopped
-#[allow(dead_code)]
+#[expect(dead_code)]
 const CLD_CONTINUED: i32 = 6; // Stopped child has continued
 
 // Signal number for SIGCHLD

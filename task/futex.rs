@@ -32,7 +32,7 @@
 //! unlock(bucket)
 //! sleep
 //! ```
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
@@ -1108,7 +1108,7 @@ const FUTEX_WAITV_MAX: usize = 128;
 
 /// FUTEX2 size flags
 mod futex2 {
-    #![allow(dead_code)]
+    #![expect(dead_code)]
     pub const SIZE_U8: u32 = 0x00;
     pub const SIZE_U16: u32 = 0x01;
     pub const SIZE_U32: u32 = 0x02;

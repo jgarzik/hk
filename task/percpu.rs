@@ -8,7 +8,7 @@
 //! - Each CPU only modifies its own run queue
 //! - Run queue lock must be held with IRQs disabled
 //! - Context switch happens with the run queue lock held
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use crate::task::TaskInner;
 use crate::task::TaskLock;

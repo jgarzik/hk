@@ -162,7 +162,7 @@ pub const STACK_GUARD_GAP: u64 = 256 * 1024;
 pub struct MmStruct {
     /// List of VMAs, sorted by start address; each its own allocation
     /// (Linux vm_area_cachep: the VMA slab cache)
-    #[allow(clippy::vec_box)]
+    #[expect(clippy::vec_box)]
     vmas: Vec<alloc::boxed::Box<Vma>>,
     /// Top of the mmap region: allocations grow down from here
     mmap_base: u64,

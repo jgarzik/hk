@@ -1,7 +1,7 @@
 //! AArch64 Exception Handling
 //!
 //! This module contains exception handlers for synchronous exceptions and IRQs.
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use crate::printkln;
 use core::arch::asm;

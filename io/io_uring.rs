@@ -174,7 +174,7 @@ pub const IORING_REGISTER_FILES_UPDATE: u32 = 6;
 const IORING_MAX_ENTRIES: u32 = 32768;
 
 /// Minimum ring size (used for validation)
-#[allow(dead_code)] // Used in future phases
+#[expect(dead_code)] // Used in future phases
 const IORING_MIN_ENTRIES: u32 = 1;
 
 // ============================================================================
@@ -303,7 +303,7 @@ enum PendingOpType {
 /// Pending operation that hasn't completed yet
 struct PendingOp {
     user_data: u64,
-    #[allow(dead_code)] // Used for async completion handling
+    #[expect(dead_code)] // Used for async completion handling
     op_type: PendingOpType,
     cancelled: bool,
 }
@@ -428,7 +428,7 @@ impl IoUringInner {
     }
 
     /// Find and remove a pending poll by fd
-    #[allow(dead_code)] // Will be used for poll completion
+    #[expect(dead_code)] // Will be used for poll completion
     fn find_poll_by_fd(&mut self, fd: i32) -> Option<u64> {
         let mut found_idx = None;
         for (i, op) in self.pending_ops.iter().enumerate() {
@@ -456,9 +456,9 @@ pub struct IoUring {
     wq: WaitQueue,
 
     /// Ring sizes (immutable after creation, used for mmap)
-    #[allow(dead_code)] // Used for mmap in future
+    #[expect(dead_code)] // Used for mmap in future
     sq_entries: u32,
-    #[allow(dead_code)] // Used for mmap in future
+    #[expect(dead_code)] // Used for mmap in future
     cq_entries: u32,
 
     /// Physical addresses for mmap (set during setup)

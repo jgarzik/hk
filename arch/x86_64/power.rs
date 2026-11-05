@@ -7,7 +7,7 @@
 //!
 //! Locking: `POWER` is a `spin::Once`, set at boot before any caller
 //! can power off and read-only after.
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use core::arch::asm;
 

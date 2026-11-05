@@ -9,7 +9,7 @@
 
 /// 32-bit MMIO register access at byte offsets into one mapping (a real
 /// BAR, or a host-test double)
-#[allow(clippy::len_without_is_empty)]
+#[expect(clippy::len_without_is_empty)]
 pub trait Mmio {
     fn read32(&self, off: u32) -> u32;
     fn write32(&self, off: u32, val: u32);

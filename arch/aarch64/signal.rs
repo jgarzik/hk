@@ -22,8 +22,6 @@
 //! The FP/SIMD registers come from (and rt_sigreturn writes them back to)
 //! the task's EL0 trap frame, where they live while it is in the kernel.
 
-#![allow(dead_code)]
-
 use crate::arch::Uaccess;
 use crate::signal::{KSigInfo, SigAction, SigHandler, SigSet, sa_flags};
 use crate::uaccess::{UaccessArch, copy_to_user};

@@ -2,10 +2,10 @@
 //!
 //! Provides shutdown, reboot, and halt functionality for aarch64.
 //! Uses PSCI (Power State Coordination Interface) for power control.
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 /// PSCI function IDs (SMCCC compliant)
-#[allow(dead_code)]
+#[expect(dead_code)]
 pub mod psci {
     /// PSCI version
     pub const PSCI_VERSION: u32 = 0x84000000;

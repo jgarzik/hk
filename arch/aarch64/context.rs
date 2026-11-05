@@ -8,7 +8,7 @@
 //!
 //! TLS (Thread Local Storage) handling follows the Linux kernel pattern:
 //! save/restore TPIDR_EL0 in Rust before calling the pure-asm switch.
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use super::percpu::write_tpidr_el0;
 

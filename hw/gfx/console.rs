@@ -3,7 +3,7 @@
 //! Provides a text console that renders to a DRM scanout surface.
 //! This console implements the ConsoleDriver trait and can be registered
 //! as a kernel console alongside serial.
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use core::ptr;
 

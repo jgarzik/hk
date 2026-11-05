@@ -14,7 +14,7 @@
 //!
 //! Uses Linux acct_v3 format (64 bytes per record).
 //! Records are written when processes exit (group leader exits).
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use alloc::sync::Arc;
 
@@ -34,7 +34,6 @@ pub const AFORK: u8 = 0x01;
 /// Used superuser privileges
 pub const ASU: u8 = 0x02;
 /// Compatibility mode (unused)
-#[allow(dead_code)]
 pub const ACOMPAT: u8 = 0x04;
 /// Dumped core
 pub const ACORE: u8 = 0x08;

@@ -3,7 +3,7 @@
 //! This module handles bringing up Application Processors (APs) on an SMP system.
 //! The Bootstrap Processor (BSP) uses INIT-SIPI-SIPI to wake each AP, which then
 //! executes a trampoline to transition from real mode to long mode.
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use ::core::sync::atomic::{AtomicU32, Ordering};
 

@@ -12,7 +12,7 @@
 //! the heap is IRQ-safe; vmalloc frees from interrupts are deferred.
 //! A vmalloc block is not physically contiguous: heap memory handed to
 //! a device must come from the DMA API (`hw::dma` asserts).
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use crate::arch::IrqSpinlock;
 use ::core::alloc::{GlobalAlloc, Layout};

@@ -58,7 +58,7 @@ pub type ArchPageTable = <CurrentArch as SchedArch>::SchedPageTable;
 // I/O port access - x86-64 specific
 // Re-exported for platform drivers (PIC, PIT, serial, PCI)
 #[cfg(target_arch = "x86_64")]
-#[allow(unused_imports)]
+#[expect(unused_imports)]
 pub use x86_64::io::{inb, inl, inw, io_wait, outb, outl, outw};
 
 // The serial ports' ttys (16550 on x86, PL011 on arm64)
@@ -87,7 +87,7 @@ pub use x86_64::irq;
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::percpu::{preempt_count, preempt_disable, preempt_enable};
 #[cfg(target_arch = "x86_64")]
-#[allow(unused_imports)]
+#[allow(unused_imports, reason = "not every arch uses every re-export")]
 pub use x86_64::spinlock::{
     IrqSpinlock, IrqSpinlockGuard, irqs_disabled, local_irq_restore, local_irq_save,
 };
@@ -98,7 +98,7 @@ pub use aarch64::irq;
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::percpu::{preempt_count, preempt_disable, preempt_enable};
 #[cfg(target_arch = "aarch64")]
-#[allow(unused_imports)]
+#[allow(unused_imports, reason = "not every arch uses every re-export")]
 pub use aarch64::spinlock::{
     IrqSpinlock, IrqSpinlockGuard, irqs_disabled, local_irq_restore, local_irq_save,
 };
@@ -384,7 +384,6 @@ pub trait FrameAlloc {
 ///
 /// This trait abstracts access to per-CPU data used by the scheduler.
 /// On x86-64, this is accessed via the GS segment. On aarch64, via TPIDR_EL1.
-#[allow(dead_code)]
 pub trait PerCpuOps {
     /// Try to get the current CPU ID
     ///
@@ -414,7 +413,6 @@ pub trait PerCpuOps {
 ///
 /// This trait abstracts CPU-level operations like interrupt enable/disable
 /// and halt. These are used by the scheduler for idle loops and critical sections.
-#[allow(dead_code)]
 pub trait CpuOps {
     /// Enable interrupts
     fn enable_interrupts();
@@ -436,7 +434,6 @@ pub trait CpuOps {
 ///
 /// This trait abstracts the task context structure and context switch mechanism.
 /// Each architecture has its own register save format and switch implementation.
-#[allow(dead_code)]
 pub trait ContextOps: Sized {
     /// The task context type (callee-saved registers, etc.)
     type TaskContext: Default + Clone;
@@ -541,7 +538,6 @@ pub trait SchedArch: Arch + PerCpuOps + CpuOps + ContextOps + UserModeOps {
 ///
 /// Provides architecture-specific CPU halt functionality for error paths
 /// and idle loops where the CPU should stop executing.
-#[allow(dead_code)]
 pub trait HaltOps {
     /// Halt the CPU forever (for panic/error paths)
     ///
@@ -554,7 +550,6 @@ pub trait HaltOps {
 ///
 /// Called early in boot before the kernel heap is available.
 /// Initializes fundamental hardware needed for kernel operation.
-#[allow(dead_code)]
 pub trait EarlyArchInit {
     /// Initialize architecture-specific hardware
     ///
@@ -567,7 +562,6 @@ pub trait EarlyArchInit {
 ///
 /// Provides architecture-independent interface for mapping device memory
 /// into the kernel's virtual address space.
-#[allow(dead_code)]
 pub trait IoremapOps {
     /// Error type for ioremap operations
     type IoremapError: core::fmt::Debug;
@@ -617,7 +611,7 @@ pub struct CpuInfo {
 /// Power management information from ACPI/device tree
 /// Fields are x86-specific (ACPI); ARM uses PSCI instead
 #[derive(Debug, Clone, Copy, Default)]
-#[allow(dead_code)]
+#[allow(dead_code, reason = "some fields are read on x86-64 only")]
 pub struct PowerInfo {
     /// The FADT's power management register blocks
     pub pm: crate::hw::acpi::hw::PmRegs,
@@ -641,7 +635,6 @@ pub struct AcpiInfo {
     /// Bootstrap processor CPU ID (32-bit for X2APIC support)
     pub bsp_cpu_id: u32,
     /// Power management info (if available, x86-specific)
-    #[allow(dead_code)]
     pub power_info: Option<PowerInfo>,
 }
 
@@ -649,7 +642,6 @@ pub struct AcpiInfo {
 ///
 /// Abstracts ACPI parsing on x86 and device tree parsing on ARM
 /// into a common interface for hardware discovery.
-#[allow(dead_code)]
 pub trait AcpiOps {
     /// Parse platform firmware tables and return hardware info
     ///
@@ -661,7 +653,6 @@ pub trait AcpiOps {
 ///
 /// Handles initialization of additional CPU cores beyond the bootstrap
 /// processor.
-#[allow(dead_code)]
 pub trait SmpOps {
     /// Initialize and start application processors
     ///
@@ -691,7 +682,6 @@ pub trait SmpOps {
 ///
 /// Abstracts the local interrupt controller (LAPIC on x86, GIC redistributor
 /// on ARM) and its associated per-CPU timer.
-#[allow(dead_code)]
 pub trait LocalTimerOps {
     /// Interrupt vector number for the local timer
     const TIMER_VECTOR: u8;
@@ -726,7 +716,7 @@ pub trait LocalTimerOps {
 ///
 /// Abstracts timekeeping hardware - high-resolution cycle counters
 /// (TSC on x86, generic timer on ARM) and real-time clocks.
-#[allow(dead_code)]
+#[expect(dead_code)]
 pub trait TimekeeperOps {
     /// Clock source type (TSC info on x86, etc.)
     type ClockSource;
@@ -761,7 +751,6 @@ pub trait TimekeeperOps {
 ///
 /// Provides interface for system power state transitions
 /// (shutdown, reboot, sleep).
-#[allow(dead_code)]
 pub trait PowerOps {
     /// Initialize power management with platform info
     ///
@@ -821,7 +810,6 @@ pub trait MemoryLayoutOps {
 /// Abstracts late exception/interrupt setup that happens after early_init.
 /// On x86_64 this is typically a no-op since IDT/PIC are set up in early_init.
 /// On aarch64 this installs exception vectors and initializes the GIC.
-#[allow(dead_code)]
 pub trait ExceptionOps {
     /// Initialize exception vectors and interrupt controller
     ///
@@ -835,7 +823,6 @@ pub trait ExceptionOps {
 /// Abstracts how each architecture locates the initramfs data.
 /// On x86_64 this uses multiboot2 module lookup.
 /// On aarch64 this uses DTB extraction or falls back to embedded initramfs.
-#[allow(dead_code)]
 pub trait InitramfsOps {
     /// Get initramfs data from boot information
     ///
@@ -849,7 +836,6 @@ pub trait InitramfsOps {
 /// Allows architectures to perform additional VFS setup after core init.
 /// On x86_64 this sets up VFAT ramdisk from multiboot2 module.
 /// On aarch64 this is typically a no-op.
-#[allow(dead_code)]
 pub trait VfsInitOps {
     /// Additional VFS setup after core init
     ///

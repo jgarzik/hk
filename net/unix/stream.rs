@@ -322,7 +322,7 @@ pub fn recvmsg(s: &UnixSock, m: &mut RecvMsg<'_>, flags: i32) -> Result<usize, K
 
 /// One pass under `iolock`: `Ok(Some(()))` = wait for more data,
 /// `Ok(None)` = done, `Err` = error (returned unless data was copied)
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn read_some(
     s: &UnixSock,
     m: &mut RecvMsg<'_>,

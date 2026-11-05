@@ -1267,7 +1267,7 @@ impl<T> TableCell<T> {
     /// # Safety
     /// TASKLIST is held mutably by the caller, and no other reference
     /// to this cell's data exists.
-    #[allow(clippy::mut_from_ref)]
+    #[expect(clippy::mut_from_ref)]
     pub unsafe fn get_mut(&self) -> &mut T {
         // SAFETY: see above
         unsafe { &mut *self.0.get() }
@@ -1554,7 +1554,7 @@ impl TaskLock<'_> {
 
 impl Task {
     /// A task with its locked fields (not yet in the table)
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn new(
         tid: Tid,
         ids: TaskIds,

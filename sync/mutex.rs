@@ -10,7 +10,7 @@
 //! (any, or SIGKILL) is pending while they would sleep; a waiter that
 //! gives up after an unlock picked it passes the wakeup on to the next
 //! (`WaitQueue` exclusive waits). `try_lock` (Linux mutex_trylock) never sleeps.
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use core::cell::UnsafeCell;
 use core::marker::PhantomData;

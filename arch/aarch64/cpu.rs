@@ -2,7 +2,7 @@
 //!
 //! Handles early CPU setup including exception level detection,
 //! feature verification, and basic CPU configuration.
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use core::arch::asm;
 

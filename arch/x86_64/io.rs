@@ -1,7 +1,7 @@
 //! x86-64 I/O port access
 //!
 //! Provides safe wrappers around the x86 IN and OUT instructions.
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 /// Write a byte to an I/O port
 #[inline]
@@ -46,7 +46,6 @@ pub fn outw(port: u16, value: u16) {
 
 /// Read a 16-bit word from an I/O port
 #[inline]
-#[allow(dead_code)]
 pub fn inw(port: u16) -> u16 {
     let value: u16;
     unsafe {

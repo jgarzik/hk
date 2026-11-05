@@ -28,7 +28,7 @@
 //! - poll/epoll support for integration with event loops
 //! - Multiple watches per inotify instance
 //! - Watch descriptors (wd) are unique per instance
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -152,12 +152,12 @@ const INOTIFY_EVENT_HEADER_SIZE: usize = core::mem::size_of::<InotifyEventHeader
 /// An inotify watch on a specific path
 struct InotifyWatch {
     /// Watch descriptor (unique within instance)
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     wd: i32,
     /// Events to watch for
     mask: u32,
     /// Path being watched (for reference)
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     path: crate::fs::name::FileName,
     /// Inode number of watched file/dir
     ino: u64,
@@ -206,7 +206,7 @@ struct InotifyInner {
     /// Queued events
     events: Vec<QueuedEvent>,
     /// Cookie counter for rename events (reserved for future use)
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     next_cookie: u32,
 }
 
@@ -511,7 +511,6 @@ pub fn get_inotify(file: &File) -> Option<Arc<Inotify>> {
 }
 
 /// Generate a unique cookie for rename event pairing
-#[allow(dead_code)]
 pub fn generate_cookie() -> u32 {
     NEXT_RENAME_COOKIE.fetch_add(1, Ordering::Relaxed) as u32
 }

@@ -8,7 +8,7 @@
 //! - CNTP_CTL_EL0: Physical timer control
 //! - CNTP_TVAL_EL0: Physical timer value (countdown)
 //! - CNTP_CVAL_EL0: Physical timer compare value (absolute)
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use crate::printkln;
 use core::arch::asm;

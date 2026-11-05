@@ -96,7 +96,7 @@ impl PipePage {
     /// # Safety
     /// Under the pipe's `Pipe.inner`; written only while no other buffer
     /// shares the page (CAN_MERGE).
-    #[allow(clippy::mut_from_ref)]
+    #[expect(clippy::mut_from_ref)]
     pub unsafe fn bytes(&self) -> &mut [u8] {
         // SAFETY: the page's own frame; the caller's contract
         unsafe { crate::mm::page::frame_bytes(self.frame) }
@@ -230,19 +230,17 @@ impl PipeInner {
     }
 
     /// Number of free buffer slots
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     fn free_slots(&self) -> usize {
         PIPE_BUFFERS - self.buffer_count()
     }
 
     /// Bytes available for reading
-    #[allow(dead_code)]
     pub fn bytes_available(&self) -> usize {
         self.total_len
     }
 
     /// Get the tail buffer (for reading)
-    #[allow(dead_code)]
     pub fn tail_buf(&self) -> Option<&PipeBuffer> {
         if self.is_empty() {
             None
@@ -252,7 +250,6 @@ impl PipeInner {
     }
 
     /// Get mutable tail buffer
-    #[allow(dead_code)]
     pub fn tail_buf_mut(&mut self) -> Option<&mut PipeBuffer> {
         if self.is_empty() {
             None
@@ -262,7 +259,6 @@ impl PipeInner {
     }
 
     /// Get the head buffer for writing (last used slot, for merging)
-    #[allow(dead_code)]
     pub fn head_buf_for_merge(&self) -> Option<&PipeBuffer> {
         if self.is_empty() {
             None
@@ -292,7 +288,6 @@ impl PipeInner {
     }
 
     /// Advance tail after consuming a buffer
-    #[allow(dead_code)]
     pub fn advance_tail(&mut self, bytes: usize) {
         self.total_len = self.total_len.saturating_sub(bytes);
         self.tail = (self.tail + 1) % PIPE_RING;

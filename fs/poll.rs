@@ -4,7 +4,7 @@
 //! - poll, ppoll (polling file descriptors)
 //! - select, pselect6 (selecting file descriptors)
 //! - sync, fsync, fdatasync, syncfs (filesystem synchronization)
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use alloc::vec::Vec;
 

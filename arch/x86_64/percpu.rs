@@ -12,7 +12,6 @@
 //! instructions around those swaps: their (paranoid) entries read
 //! MSR_GS_BASE instead (a kernel address is negative; a user one is
 //! below TASK_SIZE).
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use ::core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
@@ -368,7 +367,7 @@ pub fn preempt_enable() {
 
 /// Check if preemption is currently disabled
 #[inline]
-#[allow(dead_code)] // Utility function for future use and debugging
+#[expect(dead_code)] // Utility function for future use and debugging
 pub fn preempt_disabled() -> bool {
     try_current_cpu()
         .map(|percpu| percpu.preempt_count.load(Ordering::Relaxed) > 0)
@@ -377,7 +376,6 @@ pub fn preempt_disabled() -> bool {
 
 /// Get the current preempt_count value (for debugging)
 #[inline]
-#[allow(dead_code)] // Utility function for future use and debugging
 pub fn preempt_count() -> u32 {
     try_current_cpu()
         .map(|percpu| percpu.preempt_count.load(Ordering::Relaxed))

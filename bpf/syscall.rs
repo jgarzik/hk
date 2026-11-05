@@ -25,7 +25,7 @@
 //! CONFIG_BPF_UNPRIV_DEFAULT_OFF) set, creating maps and loading
 //! programs needs CAP_BPF or CAP_SYS_ADMIN (EPERM). The sysctl takes
 //! 0..2 from CAP_SYS_ADMIN only, and 1 is permanent.
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use alloc::vec;
 use alloc::vec::Vec;

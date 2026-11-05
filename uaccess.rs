@@ -17,7 +17,7 @@
 //!
 //! Functions return the number of bytes that could NOT be copied (0 = success),
 //! following the Linux kernel convention. This allows partial copies to be detected.
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 extern crate alloc;
 

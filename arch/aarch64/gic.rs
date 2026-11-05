@@ -275,7 +275,7 @@ pub enum Trigger {
     /// Level-sensitive (PCI INTx, most device lines)
     Level,
     /// Edge-triggered (platform devices; PCI INTx is level)
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     Edge,
 }
 

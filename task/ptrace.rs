@@ -9,7 +9,7 @@
 //! This implementation follows the Linux ptrace ABI for both x86-64 and aarch64.
 //! Not all ptrace operations are implemented; this focuses on the core subset
 //! needed for basic debugging and tracing.
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use crate::signal::{self, SIGKILL, SIGSTOP, SIGTRAP};
 use crate::task::percpu::{self, TASKLIST};

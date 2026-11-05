@@ -527,7 +527,7 @@ impl Inode {
     ///
     /// # Arguments
     /// * `mtime` - Modification time (atime and ctime are initialized to same value)
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn new(
         ino: InodeId,
         mode: InodeMode,
@@ -571,7 +571,7 @@ impl Inode {
     /// # Arguments
     /// * `rdev` - Device ID (major/minor numbers)
     /// * `mtime` - Modification time
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn new_device(
         ino: InodeId,
         mode: InodeMode,

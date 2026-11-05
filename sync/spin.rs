@@ -48,7 +48,7 @@ const fn class() -> Class {
 /// (`check`: a blocking acquisition, which records order edges)
 #[inline(always)]
 #[track_caller]
-#[allow(unused_variables)]
+#[expect(unused_variables)]
 fn enter(id: usize, class: Class, check: bool) {
     preempt_disable();
     #[cfg(feature = "lockdep")]
@@ -57,7 +57,7 @@ fn enter(id: usize, class: Class, check: bool) {
 
 /// After releasing lock `id` (or failing to take it)
 #[inline(always)]
-#[allow(unused_variables)]
+#[expect(unused_variables)]
 fn leave(id: usize) {
     #[cfg(feature = "lockdep")]
     super::lockdep::release(id);

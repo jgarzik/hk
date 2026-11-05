@@ -14,7 +14,7 @@
 //! Lock ordering: IrqSpinlock should be the innermost lock when combining
 //! with non-IRQ-safe locks (Mutex, RwLock). Never acquire a non-IRQ-safe
 //! lock from interrupt context.
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use ::core::cell::UnsafeCell;
 use ::core::marker::PhantomData;
@@ -260,7 +260,6 @@ fn restore_irq(_saved_daif: u64) {}
 /// might_sleep check)
 #[cfg(not(test))]
 #[inline]
-#[allow(dead_code)]
 pub fn irqs_disabled() -> bool {
     let daif: u64;
     unsafe {
@@ -270,7 +269,7 @@ pub fn irqs_disabled() -> bool {
 }
 
 #[cfg(test)]
-#[allow(dead_code)]
+#[expect(dead_code)]
 pub fn irqs_disabled() -> bool {
     false
 }

@@ -19,7 +19,7 @@
 //!
 //! XSAVE/XRSTOR (standard format) are used when the CPU supports them, with
 //! XCR0 = x87 | SSE (| AVX); otherwise FXSAVE/FXRSTOR (x87 + SSE only).
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 

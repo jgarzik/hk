@@ -15,20 +15,20 @@ use core::mem::size_of;
 const GFX_IOCTL_BASE: u8 = b'd';
 
 /// Build a DRM ioctl number
-#[allow(dead_code)]
+#[expect(dead_code)]
 const fn gfx_io(nr: u8) -> u32 {
     // _IO('d', nr)
     ((GFX_IOCTL_BASE as u32) << 8) | (nr as u32)
 }
 
-#[allow(dead_code)]
+#[expect(dead_code)]
 const fn gfx_ior<T>(nr: u8) -> u32 {
     // _IOR('d', nr, type) - direction bit 2 (read from kernel)
     let size = size_of::<T>() as u32;
     (2 << 30) | ((GFX_IOCTL_BASE as u32) << 8) | (nr as u32) | (size << 16)
 }
 
-#[allow(dead_code)]
+#[expect(dead_code)]
 const fn gfx_iow<T>(nr: u8) -> u32 {
     // _IOW('d', nr, type) - direction bit 1 (write to kernel)
     let size = size_of::<T>() as u32;
@@ -90,40 +90,30 @@ pub const GFX_MODE_DISCONNECTED: u32 = 2;
 pub const GFX_MODE_UNKNOWNCONNECTION: u32 = 3;
 
 // Connector types (names match Linux DRM header for ABI compatibility)
-#[allow(non_upper_case_globals, dead_code)]
+#[expect(non_upper_case_globals)]
 pub const GFX_MODE_CONNECTOR_Unknown: u32 = 0;
-#[allow(dead_code)]
 pub const GFX_MODE_CONNECTOR_VGA: u32 = 1;
-#[allow(dead_code)]
 pub const GFX_MODE_CONNECTOR_DVII: u32 = 2;
-#[allow(dead_code)]
 pub const GFX_MODE_CONNECTOR_DVID: u32 = 3;
-#[allow(dead_code)]
 pub const GFX_MODE_CONNECTOR_DVIA: u32 = 4;
-#[allow(non_upper_case_globals, dead_code)]
+#[expect(non_upper_case_globals)]
 pub const GFX_MODE_CONNECTOR_Composite: u32 = 5;
-#[allow(dead_code)]
 pub const GFX_MODE_CONNECTOR_SVIDEO: u32 = 6;
-#[allow(dead_code)]
 pub const GFX_MODE_CONNECTOR_LVDS: u32 = 7;
-#[allow(non_upper_case_globals, dead_code)]
+#[expect(non_upper_case_globals)]
 pub const GFX_MODE_CONNECTOR_Component: u32 = 8;
-#[allow(non_upper_case_globals, dead_code)]
+#[expect(non_upper_case_globals)]
 pub const GFX_MODE_CONNECTOR_9PinDIN: u32 = 9;
-#[allow(non_upper_case_globals, dead_code)]
+#[expect(non_upper_case_globals)]
 pub const GFX_MODE_CONNECTOR_DisplayPort: u32 = 10;
-#[allow(dead_code)]
 pub const GFX_MODE_CONNECTOR_HDMIA: u32 = 11;
-#[allow(dead_code)]
 pub const GFX_MODE_CONNECTOR_HDMIB: u32 = 12;
-#[allow(dead_code)]
 pub const GFX_MODE_CONNECTOR_TV: u32 = 13;
-#[allow(non_upper_case_globals, dead_code)]
+#[expect(non_upper_case_globals)]
 pub const GFX_MODE_CONNECTOR_eDP: u32 = 14;
 pub const GFX_MODE_CONNECTOR_VIRTUAL: u32 = 15;
 
 // Encoder types
-#[allow(dead_code)]
 pub const GFX_MODE_ENCODER_NONE: u32 = 0;
 pub const GFX_MODE_ENCODER_DAC: u32 = 1;
 pub const GFX_MODE_ENCODER_TMDS: u32 = 2;

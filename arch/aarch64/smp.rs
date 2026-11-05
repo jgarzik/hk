@@ -1,7 +1,7 @@
 //! AArch64 SMP initialization
 //!
 //! Uses PSCI CPU_ON to bring up Application Processors.
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 

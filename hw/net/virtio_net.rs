@@ -37,7 +37,7 @@
 //! - `tx`: `crate::sync::spin::Mutex`, thread context only (xmit, NAPI poll reclaim);
 //!   taken under socket/ARP locks (end of the network lock order). Leaf.
 //!   Empty once removed.
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use alloc::boxed::Box;
 use alloc::sync::{Arc, Weak};
@@ -248,7 +248,7 @@ impl VirtioNet {
 
     /// Receive up to `budget` frames, reposting each buffer; frames are
     /// delivered by the caller after the lock is dropped
-    #[allow(clippy::vec_box)] // skbs travel as Box<SkBuff> through the stack
+    #[expect(clippy::vec_box)] // skbs travel as Box<SkBuff> through the stack
     /// Returns the buffers consumed (bad frames count against the budget)
     fn receive(&self, dev: &Arc<NetDevice>, budget: usize, out: &mut Vec<Box<SkBuff>>) -> usize {
         let mut rx = self.rx.lock();

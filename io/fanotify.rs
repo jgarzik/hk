@@ -26,7 +26,7 @@
 //! - Events can include fd to the affected file
 //! - Support for permission events (blocking operations pending user decision)
 //! - Multiple marks per fanotify instance
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -119,7 +119,7 @@ pub const FAN_MARK_EVICTABLE: u32 = 0x00000200;
 pub const FAN_MARK_IGNORE: u32 = 0x00000400;
 
 /// Mark type mask
-#[allow(dead_code)]
+#[expect(dead_code)]
 const FAN_MARK_TYPE_MASK: u32 = FAN_MARK_MOUNT | FAN_MARK_FILESYSTEM;
 
 /// Mark inode (default, no flag set)
@@ -245,7 +245,7 @@ struct FanotifyMark {
     /// Events to watch for
     mask: u64,
     /// Flags from mark operation
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     flags: u32,
     /// Ignored event mask
     ignored_mask: u64,
@@ -272,10 +272,10 @@ struct FanotifyEvent {
     /// PID of process causing event
     pid: i32,
     /// Path to file (for opening fd when event is read)
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     path: Option<String>,
     /// Inode number (for matching)
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     ino: u64,
 }
 
@@ -311,7 +311,7 @@ pub struct Fanotify {
     /// Init flags
     init_flags: u32,
     /// Event file flags (O_RDONLY, O_RDWR, etc.)
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     event_f_flags: u32,
 }
 
@@ -392,7 +392,6 @@ impl Fanotify {
     }
 
     /// Queue an event
-    #[allow(dead_code)]
     pub fn queue_event(&self, mask: u64, pid: i32, path: Option<String>, ino: u64) {
         let mut inner = self.inner.lock();
 
@@ -507,7 +506,6 @@ impl Fanotify {
     }
 
     /// Get the total size of queued events
-    #[allow(dead_code)]
     pub fn queued_size(&self) -> usize {
         let inner = self.inner.lock();
         inner.events.iter().map(|e| e.serialized_size()).sum()

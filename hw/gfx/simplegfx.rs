@@ -50,7 +50,7 @@ struct SimpleGfxState {
     /// The firmware framebuffer info
     fb_info: FramebufferInfo,
     /// Dumb buffer handle counter (for future use)
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     next_handle: u32,
     /// Dumb buffers (handle -> DumbBuffer)
     dumb_buffers: Vec<(u32, DumbBuffer)>,

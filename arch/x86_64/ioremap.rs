@@ -3,7 +3,7 @@
 //! Provides Linux-like ioremap/iounmap functions for mapping physical
 //! MMIO regions to kernel virtual addresses. Uses a dedicated virtual
 //! address region separate from the kernel heap and user space.
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use crate::sync::spin::Mutex;
 
@@ -276,7 +276,6 @@ pub fn retarget(va: u64, pa: u64) -> Result<(), IoremapError> {
 /// # Arguments
 /// * `virt_addr` - Virtual address returned by ioremap
 /// * `size` - Size that was passed to ioremap
-#[allow(dead_code)]
 pub fn iounmap(virt_addr: *mut u8, size: u64) {
     let virt = virt_addr as u64;
 

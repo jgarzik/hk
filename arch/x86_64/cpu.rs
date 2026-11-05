@@ -8,7 +8,7 @@
 //! cpu_tss_rw): the TSS holds this CPU's RSP0 (the kernel stack an
 //! interrupt from user mode switches to) and its IST stacks, and a
 //! TSS is marked busy by `ltr` in the GDT that names it.
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use ::core::cell::UnsafeCell;
 use ::core::mem::size_of;

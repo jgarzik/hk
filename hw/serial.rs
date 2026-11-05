@@ -3,7 +3,7 @@
 //! NS16550A-compatible UART driver implementing TtyDriver.
 //!
 //! This provides the hardware interface for serial ports like /dev/ttyS0.
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use crate::console::{ConsolePriority, register_console};
 use crate::util::error::KernelError;

@@ -113,7 +113,6 @@ pub struct UtsNamespace {
     ///
     /// None = init user namespace (root always has CAP_SYS_ADMIN)
     /// Future: proper user namespace with capability checking
-    #[allow(dead_code)]
     user_ns: Option<Arc<super::UserNamespace>>,
 }
 

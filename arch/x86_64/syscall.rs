@@ -7,7 +7,7 @@
 //!
 //! The SYS_* constants are x86-64 Linux ABI specific. Other architectures
 //! (e.g., aarch64) have different syscall numbers.
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use crate::syscall::Sys;
 

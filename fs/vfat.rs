@@ -896,7 +896,7 @@ fn extend_cluster_chain(
 }
 
 /// Get the last cluster in a chain
-#[allow(dead_code)]
+#[expect(dead_code)]
 fn get_last_cluster(sb_data: &VfatSbData, start_cluster: u32) -> Result<u32, KernelError> {
     let mut cluster = start_cluster;
     let mut count = 0;
@@ -1116,7 +1116,7 @@ fn read_directory_entries(
 // ============================================================================
 
 /// Characters invalid in FAT short names
-#[allow(dead_code)]
+#[expect(dead_code)]
 const INVALID_SHORT_CHARS: &[u8] = b" .\"*+,/:;<=>?[\\]|";
 
 /// Generate an 8.3 short name from a long filename
@@ -1437,7 +1437,7 @@ fn create_dir_entry_with_lfn(
 }
 
 /// Update the file size in a directory entry
-#[allow(dead_code)]
+#[expect(dead_code)]
 fn update_dir_entry_size(
     sb_data: &VfatSbData,
     parent_cluster: u32,

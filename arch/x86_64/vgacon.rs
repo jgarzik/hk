@@ -9,7 +9,7 @@
 //! - VGA text buffer: 0xB8000 (80x25 characters, 2 bytes per cell)
 //! - CRT Controller: I/O ports 0x3D4 (index) and 0x3D5 (data)
 //! - Cursor position: CRT registers 14 (high) and 15 (low)
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use crate::arch::IrqSpinlock;
 use crate::console::{ConsoleDriver, ConsoleFlags, ConsolePriority, register_console};

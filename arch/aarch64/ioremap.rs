@@ -8,7 +8,7 @@
 //! already mapped with device attributes at IO_BASE + phys (kmap.rs);
 //! other addresses get pages in the ioremap window. Both are in TTBR1,
 //! shared by every address space.
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use crate::mm::tlb::flush_tlb_kernel_range;
 use crate::sync::spin::Mutex;
@@ -264,7 +264,6 @@ pub fn retarget(va: u64, pa: u64) -> Result<(), IoremapError> {
 }
 
 /// Unmap a previously ioremap'd region
-#[allow(dead_code)]
 pub fn iounmap(virt_addr: *mut u8, size: u64) {
     let virt = virt_addr as u64;
 

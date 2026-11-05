@@ -135,11 +135,11 @@ Give no `options(...)` without a comment that justifies each one.
 The workspace `[lints]` table in `Cargo.toml` and `clippy.toml`
 (`check-private-items`) enforce these rules. The gate runs clippy with
 `-D warnings`, so every lint listed there, warn-level included, blocks
-a commit. Do not `allow` an `unsafe` lint locally without a comment
+a commit. Do not silence an `unsafe` lint locally without a comment
 saying why.
 
 `undocumented_unsafe_blocks` is denied crate-wide. Files written before
-this policy carry `#![allow(clippy::undocumented_unsafe_blocks)] //
+this policy carry `#![expect(clippy::undocumented_unsafe_blocks)] //
 TODO(unsafe)` until their blocks are documented or wrapped. Remove the
 line when the file is clean, and never add it to a new file
 (`git grep -l 'TODO(unsafe)' -- '*.rs' ':!user'` lists what is left).

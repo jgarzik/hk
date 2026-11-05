@@ -243,7 +243,7 @@ impl SchedEntity {
     /// # Safety
     /// The rq lock of the task's CPU is held (or the task is not yet
     /// on a run queue), and no other reference to the frame is live.
-    #[allow(clippy::mut_from_ref)]
+    #[expect(clippy::mut_from_ref)]
     pub unsafe fn ctx(&self) -> &mut TaskContext {
         // SAFETY: see above
         unsafe { &mut *self.ctx.get() }

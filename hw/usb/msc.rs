@@ -116,7 +116,7 @@ impl Csw {
 }
 
 /// CSW status values
-#[allow(dead_code)]
+#[expect(dead_code)]
 mod csw_status {
     pub const PASSED: u8 = 0;
     pub const FAILED: u8 = 1;

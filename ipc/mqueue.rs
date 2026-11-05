@@ -169,7 +169,7 @@ struct MqNotify {
 
 /// Message queue
 pub struct MqQueue {
-    #[allow(dead_code)] // Used for debugging and future /dev/mqueue filesystem
+    #[expect(dead_code)] // Used for debugging and future /dev/mqueue filesystem
     name: FileName,
     maxmsg: i64,
     msgsize: i64,
@@ -234,7 +234,7 @@ impl MqQueue {
     }
 
     /// Get the queue name (for debugging and future /dev/mqueue filesystem)
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     fn name(&self) -> &[u8] {
         &self.name
     }

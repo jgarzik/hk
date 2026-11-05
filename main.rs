@@ -5,7 +5,14 @@
 #![cfg_attr(not(test), no_std)]
 #![cfg_attr(not(test), no_main)]
 // Host unit tests (`make test`) build only a subset; skip dead-code noise
-#![cfg_attr(test, allow(dead_code, unused))]
+#![cfg_attr(
+    test,
+    allow(
+        dead_code,
+        unused,
+        reason = "host tests build kernel code they do not call"
+    )
+)]
 
 extern crate alloc;
 
@@ -69,7 +76,7 @@ use crate::arch::{
 
 use crate::hw::dma::{DirectDmaOps, dma_init};
 
-#[allow(unused_imports)]
+#[expect(unused_imports)]
 use fs::inode::AsAny; // Trait needed for .as_any() on dyn InodeData
 
 /// Kernel heap: boot arena, then slab (host unit tests use the std

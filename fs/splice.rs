@@ -23,7 +23,7 @@
 //! - Linux fs/splice.c
 //! - Linux include/linux/pipe_fs_i.h
 //! - Linux include/linux/splice.h
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use alloc::sync::Arc;
 
@@ -44,18 +44,15 @@ use crate::uaccess::{copy_from_user, get_user, put_user};
 // =============================================================================
 
 /// Move pages instead of copying (hint, may not always be honored)
-#[allow(dead_code)]
 pub const SPLICE_F_MOVE: u32 = 0x01;
 
 /// Don't block on I/O
 pub const SPLICE_F_NONBLOCK: u32 = 0x02;
 
 /// Hint that more data is coming (for TCP_CORK)
-#[allow(dead_code)]
 pub const SPLICE_F_MORE: u32 = 0x04;
 
 /// Pages passed in are a gift (for vmsplice)
-#[allow(dead_code)]
 pub const SPLICE_F_GIFT: u32 = 0x08;
 
 // =============================================================================

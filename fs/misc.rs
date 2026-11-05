@@ -1095,7 +1095,6 @@ pub mod falloc_mode {
     /// Deallocate range (punch hole) - must be combined with KEEP_SIZE
     pub const FALLOC_FL_PUNCH_HOLE: i32 = 0x02;
     /// Reserved for future use
-    #[allow(dead_code)]
     pub const FALLOC_FL_NO_HIDE_STALE: i32 = 0x04;
     /// Collapse range, removing a hole
     pub const FALLOC_FL_COLLAPSE_RANGE: i32 = 0x08;
@@ -1106,7 +1105,6 @@ pub mod falloc_mode {
     /// Write zeroes to the range, allocating it (Linux 6.17+)
     pub const FALLOC_FL_WRITE_ZEROES: i32 = 0x80;
     /// Unshare shared blocks (for reflinked files)
-    #[allow(dead_code)]
     pub const FALLOC_FL_UNSHARE_RANGE: i32 = 0x40;
 }
 

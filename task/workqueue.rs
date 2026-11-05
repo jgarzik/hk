@@ -519,7 +519,6 @@ pub fn init() {
 ///
 /// Waits for all currently pending work items to complete (runs them
 /// synchronously in the caller if the queue has no worker).
-#[allow(dead_code)]
 pub fn flush_workqueue(wq: &Workqueue) {
     while wq.has_pending() {
         wq.process_pending();

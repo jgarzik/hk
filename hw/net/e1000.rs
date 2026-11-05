@@ -29,7 +29,7 @@
 //! - `tx`: `crate::sync::spin::Mutex`, thread context only (xmit, NAPI poll reclaim).
 //!   Taken under socket/ARP locks (end of the network lock order). Leaf.
 //!   Empty once removed.
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use alloc::boxed::Box;
 use alloc::sync::{Arc, Weak};
@@ -409,7 +409,7 @@ impl E1000 {
 
     /// Receive up to `budget` frames; returns them (delivered by the caller
     /// after the ring lock is dropped)
-    #[allow(clippy::vec_box)] // skbs travel as Box<SkBuff> through the stack
+    #[expect(clippy::vec_box)] // skbs travel as Box<SkBuff> through the stack
     fn receive(&self, dev: &Arc<NetDevice>, budget: usize, out: &mut Vec<Box<SkBuff>>) {
         let mut rx = self.rx.lock();
         let Some(rx) = rx.as_mut() else { return };

@@ -10,7 +10,7 @@
 //! NOTE: ACPI tables can be located anywhere in physical memory, including
 //! above the identity-mapped region. We use ioremap to map tables before
 //! accessing them.
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use super::ioremap::{ioremap, iounmap};
 use crate::arch::PowerInfo;
@@ -65,7 +65,7 @@ pub struct CpuInfo {
 
 /// Information about an I/O APIC found in MADT
 #[derive(Debug, Clone, Copy)]
-#[allow(dead_code)] // Fields used for future I/O APIC configuration
+#[expect(dead_code)] // Fields used for future I/O APIC configuration
 pub struct IoApicInfo {
     /// I/O APIC ID
     pub id: u8,

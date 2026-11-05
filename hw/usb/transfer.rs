@@ -5,7 +5,7 @@
 //!
 //! Unlike the Command Ring which is shared across all devices, each endpoint
 //! has a dedicated Transfer Ring for submitting transfer TRBs.
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{Ordering, fence};
@@ -174,7 +174,7 @@ impl Trb {
 }
 
 /// TRB types
-#[allow(non_snake_case)]
+#[expect(non_snake_case)]
 pub mod TrbType {
     /// Normal TRB - used for bulk/interrupt data transfers
     pub const NORMAL: u8 = 1;
@@ -233,7 +233,7 @@ pub mod TrbType {
 }
 
 /// TRB completion codes
-#[allow(non_snake_case)]
+#[expect(non_snake_case)]
 pub mod CompletionCode {
     pub const INVALID: u8 = 0;
     pub const SUCCESS: u8 = 1;

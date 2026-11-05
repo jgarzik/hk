@@ -15,7 +15,7 @@
 //! - `Offline` - Device offline, I/O fails
 //! - `TransportOffline` - Transport layer reports offline
 //! - `Block` - Device blocked for I/O
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
@@ -103,10 +103,10 @@ pub struct ScsiDisk {
     /// Sector size in bytes (typically 512)
     sector_size: u32,
     /// Vendor identification
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     vendor: [u8; 8],
     /// Product identification
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     product: [u8; 16],
 }
 

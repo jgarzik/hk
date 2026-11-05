@@ -22,7 +22,7 @@ use crate::util::error::KernelError;
 // =============================================================================
 
 /// Unspecified map type
-#[allow(dead_code)]
+#[expect(dead_code)]
 pub const BPF_MAP_TYPE_UNSPEC: u32 = 0;
 /// Hash table map
 pub const BPF_MAP_TYPE_HASH: u32 = 1;
@@ -34,14 +34,14 @@ pub const BPF_MAP_TYPE_ARRAY: u32 = 2;
 // =============================================================================
 
 /// Create new element or update existing
-#[allow(dead_code)]
+#[allow(dead_code, reason = "UAPI flag value; BPF_ANY is the zero default")]
 pub const BPF_ANY: u64 = 0;
 /// Create new element only if it doesn't exist
 pub const BPF_NOEXIST: u64 = 1;
 /// Update existing element only
 pub const BPF_EXIST: u64 = 2;
 /// Update with spin_lock held
-#[allow(dead_code)]
+#[expect(dead_code)]
 pub const BPF_F_LOCK: u64 = 4;
 
 // =============================================================================

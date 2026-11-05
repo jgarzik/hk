@@ -6,7 +6,7 @@
 //! ARM requires explicit cache maintenance:
 //! - Before DMA from device (FromDevice): Invalidate cache so CPU reads fresh data
 //! - Before DMA to device (ToDevice): Clean cache so device sees CPU writes
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use core::arch::asm;
 
@@ -19,7 +19,6 @@ const CACHE_LINE_SIZE: usize = 64;
 /// visible to devices that read from RAM directly.
 ///
 /// Uses DC CVAC (Clean by Virtual Address to Point of Coherency).
-#[allow(dead_code)]
 #[inline(always)]
 fn dc_cvac(addr: u64) {
     unsafe {

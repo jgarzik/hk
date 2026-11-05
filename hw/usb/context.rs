@@ -8,7 +8,7 @@
 //! - EndpointContext: Per-endpoint configuration (type, max packet, ring)
 //! - InputContext: Used for Address Device and Configure Endpoint commands
 //! - OutputDeviceContext: Where xHCI writes device state
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use crate::hw::dma::{DmaCoherent, DmaDevice, dma_alloc_coherent};
 
@@ -87,7 +87,7 @@ impl SlotContext {
 }
 
 /// Endpoint State values
-#[allow(non_snake_case)]
+#[expect(non_snake_case)]
 pub mod EndpointState {
     pub const DISABLED: u8 = 0;
     pub const RUNNING: u8 = 1;
@@ -97,7 +97,7 @@ pub mod EndpointState {
 }
 
 /// Endpoint Type values (for EP Context)
-#[allow(non_snake_case)]
+#[expect(non_snake_case)]
 pub mod EndpointType {
     pub const NOT_VALID: u8 = 0;
     pub const ISOCH_OUT: u8 = 1;

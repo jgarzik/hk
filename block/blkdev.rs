@@ -28,7 +28,7 @@
 //! - `end_io` runs in the completion context, possibly hardirq: it may
 //!   only use IRQ-safe operations (atomics, `Completion::complete`, wait
 //!   queue wakeups); it must not sleep or take a `Mutex`/`RwLock`.
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;

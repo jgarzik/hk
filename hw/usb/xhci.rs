@@ -3,7 +3,7 @@
 //! Implements the USB host controller interface for xHCI (eXtensible Host Controller Interface).
 //!
 //! `XHCI_PCI_DRIVER` binds the controller on the PCI bus.
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
@@ -424,10 +424,10 @@ mod trb_type {
 /// Tracks the Device Context, Input Context, and Transfer Rings for each endpoint.
 struct DeviceState {
     /// Slot ID assigned by xHCI
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     slot_id: u8,
     /// Output Device Context (xHCI writes device state here)
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     output_ctx: OutputDeviceContext,
     /// Input Context (for Address Device and Configure Endpoint)
     input_ctx: InputContext,

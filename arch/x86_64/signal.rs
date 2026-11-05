@@ -12,7 +12,7 @@
 //! When the handler returns, it executes the trampoline which calls rt_sigreturn
 //! to restore the original context.
 
-#![allow(dead_code)]
+#![expect(dead_code)]
 
 use crate::arch::Uaccess;
 use crate::signal::{KSigInfo, SigAction, SigHandler, SigSet, sa_flags};
