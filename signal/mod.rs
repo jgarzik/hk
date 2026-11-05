@@ -648,6 +648,10 @@ pub struct TaskSignalState {
     /// The mask before sigtimedwait unblocked the awaited signals
     /// (Linux real_blocked): such a signal does not kill on arrival
     pub real_blocked: SigSet,
+    /// A traced task's fault signal and its details, queued for normal
+    /// delivery (the tracer's stop first): the handler gets them as
+    /// force_sig_fault would have given (hk has no siginfo queue)
+    pub fault: Option<(u32, KSigInfo)>,
 }
 
 /// A thread group's shared pending set (Linux signal->shared_pending):
@@ -684,6 +688,7 @@ impl TaskSignalState {
             shared_pending: SharedPending(None),
             altstack: AltStack::new(),
             real_blocked: SigSet::EMPTY,
+            fault: None,
         }
     }
 
@@ -696,6 +701,7 @@ impl TaskSignalState {
             shared_pending: SharedPending::new(),
             altstack: AltStack::new(),
             real_blocked: SigSet::EMPTY,
+            fault: None,
         }
     }
 
@@ -857,6 +863,7 @@ pub fn clone_task_signal(
             },
             altstack: AltStack::new(), // Child starts with no altstack
             real_blocked: SigSet::EMPTY,
+            fault: None,
         }
     } else {
         TaskSignalState::new()
@@ -1851,7 +1858,13 @@ pub fn do_signal(regs: &UserFrame) {
                         regs.set_ret(EINTR);
                     }
                 }
-                if deliver_to_handler(tid, sig, &action, &KSigInfo::default(), regs) {
+                // A traced task's fault keeps its details (force_sig_fault)
+                let info = with_task_signal_state(tid, |s| {
+                    s.fault.take_if(|(f, _)| *f == sig).map(|(_, i)| i)
+                })
+                .flatten()
+                .unwrap_or_default();
+                if deliver_to_handler(tid, sig, &action, &info, regs) {
                     return;
                 }
                 // Frame setup failed: SIGSEGV was forced; deliver it
@@ -2041,6 +2054,7 @@ pub fn force_sig_fault(sig: u32, info: KSigInfo, regs: &UserFrame) {
     // -> get_signal -> ptrace_signal); delivered on the way back to user
     // space, it is unblocked and not ignored, as force_sig makes it
     if crate::task::ptrace::is_traced(tid) {
+        with_task_signal_state(tid, |s| s.fault = Some((sig, info)));
         force_sig(tid, sig);
         return;
     }

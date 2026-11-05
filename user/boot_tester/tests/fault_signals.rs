@@ -295,6 +295,63 @@ fn in_child(name: &[u8], f: fn() -> u64) {
     }
 }
 
+/// As `in_child`, the child traced by its parent: the parent passes on
+/// each signal-delivery stop's signal (a fault's SIGSEGV), so the
+/// child's handler still gets the fault's details (Linux keeps the
+/// siginfo across the ptrace stop)
+fn in_traced_child(name: &[u8], f: fn() -> u64) {
+    const PTRACE_TRACEME: i64 = 0;
+    const PTRACE_CONT: i64 = 7;
+    let pid = sys_fork();
+    if pid == 0 {
+        hk_syscall::sys_ptrace(PTRACE_TRACEME, 0, 0, 0);
+        hk_syscall::sys_kill(hk_syscall::sys_getpid(), 19); // SIGSTOP
+        sys_exit(f());
+    }
+    if pid < 0 {
+        print(name);
+        println(b":FAIL: fork");
+        return;
+    }
+    let mut status: i32 = 0;
+    loop {
+        sys_wait4(pid, &mut status, 0, 0);
+        if status & 0xff != 0x7f {
+            break;
+        }
+        // A stop: SIGSTOP is swallowed, anything else passed on
+        let sig = (status >> 8) & 0xff;
+        let pass = if sig == 19 { 0 } else { sig as u64 };
+        hk_syscall::sys_ptrace(PTRACE_CONT, pid, 0, pass);
+    }
+    if status & 0x7f != 0 {
+        print(name);
+        print(b":FAIL: child killed by signal ");
+        print_num((status & 0x7f) as i64);
+        println(b"");
+    }
+}
+
+/// segv_maperr under a tracer
+fn segv_traced() -> u64 {
+    if !install(SIGSEGV) {
+        return 9;
+    }
+    let addr = unmapped_page() + 0x30;
+    #[cfg(target_arch = "x86_64")]
+    let a = run_fault!("mov rax, [rdi]", addr);
+    #[cfg(target_arch = "aarch64")]
+    let a = run_fault!("ldr x12, [x0]", addr);
+    verify(
+        b"FAULT_SEGV_TRACED",
+        &a,
+        SIGSEGV,
+        SEGV_MAPERR,
+        addr,
+        a.fault_pc,
+    )
+}
+
 fn unmapped_page() -> u64 {
     let a = sys_mmap(0, 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     sys_munmap(a as u64, 4096);
@@ -476,6 +533,7 @@ fn prep_ignored() -> bool {
 /// Run all fault-signal tests
 pub fn run_tests() {
     in_child(b"FAULT_SEGV_MAPERR", segv_maperr);
+    in_traced_child(b"FAULT_SEGV_TRACED", segv_traced);
     in_child(b"FAULT_SEGV_ACCERR", segv_accerr);
     in_child(b"FAULT_PROT_NONE", segv_prot_none);
     in_child(b"FAULT_SIGILL", sigill);
