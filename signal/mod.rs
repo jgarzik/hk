@@ -113,6 +113,15 @@ pub const NSIG: u32 = 64;
 #[repr(transparent)]
 pub struct SigSet(pub u64);
 
+/// Signals a task's own faults raise, delivered before others (Linux
+/// SYNCHRONOUS_MASK)
+const SYNCHRONOUS_MASK: u64 = 1 << (SIGSEGV - 1)
+    | 1 << (SIGBUS - 1)
+    | 1 << (SIGILL - 1)
+    | 1 << (SIGTRAP - 1)
+    | 1 << (SIGFPE - 1)
+    | 1 << (SIGSYS - 1);
+
 // SAFETY: repr(transparent) over a u64: any bits valid, no padding
 unsafe impl crate::util::pod::FromBytes for SigSet {}
 // SAFETY: as above
@@ -432,13 +441,14 @@ impl SigPending {
         self.signal.remove(sig);
     }
 
-    /// Get next deliverable signal (not in blocked set)
-    ///
-    /// Removes and returns the lowest-numbered pending signal that is not blocked.
+    /// Remove and return the next deliverable signal (not blocked):
+    /// a synchronous one (SEGV, BUS, ILL, TRAP, FPE, SYS: a fault of the
+    /// task's own) first, else the lowest-numbered (Linux next_signal)
     pub fn dequeue(&mut self, blocked: &SigSet) -> Option<u32> {
-        // Find first pending signal not in blocked set
         let deliverable = self.signal.subtract(blocked);
-        if let Some(sig) = deliverable.first() {
+        let sync = SigSet(deliverable.0 & SYNCHRONOUS_MASK);
+        let pick = if sync.0 != 0 { sync } else { deliverable };
+        if let Some(sig) = pick.first() {
             self.signal.remove(sig);
             Some(sig)
         } else {
@@ -2059,4 +2069,31 @@ pub fn force_sig_fault(sig: u32, info: KSigInfo, regs: &UserFrame) {
 pub fn sigreturn_badframe() -> i64 {
     force_sigsegv(crate::task::percpu::current_tid());
     -14 // EFAULT
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A task's own fault comes before a lower-numbered signal (Linux
+    /// next_signal); otherwise the lowest first; blocked ones wait
+    #[test]
+    fn synchronous_first() {
+        let mut p = SigPending {
+            signal: SigSet::from_bits(0),
+        };
+        for s in [SIGHUP, SIGUSR1, SIGSEGV, SIGBUS] {
+            p.add(s);
+        }
+        let none = SigSet::from_bits(0);
+        assert_eq!(p.dequeue(&none), Some(SIGBUS));
+        assert_eq!(p.dequeue(&none), Some(SIGSEGV));
+        assert_eq!(p.dequeue(&none), Some(SIGHUP));
+        p.add(SIGFPE);
+        let mut blocked = SigSet::from_bits(0);
+        blocked.add(SIGFPE);
+        assert_eq!(p.dequeue(&blocked), Some(SIGUSR1));
+        assert_eq!(p.dequeue(&blocked), None);
+        assert_eq!(p.dequeue(&none), Some(SIGFPE));
+    }
 }
