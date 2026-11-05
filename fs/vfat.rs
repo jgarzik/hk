@@ -13,6 +13,7 @@
 //! - File Allocation Table (FAT) for cluster chains
 //! - 32-byte directory entries with optional long filename entries
 
+use crate::util::scope::ScopeGuard;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -858,41 +859,32 @@ fn extend_cluster_chain(
     count: usize,
 ) -> Result<u32, KernelError> {
     // Undo a partial extension: free the clusters already linked from
-    // `first`, and point the existing chain's tail back at end-of-chain
-    fn rollback(sb_data: &VfatSbData, first: u32, last_cluster: u32) {
+    // the first new one, and point the existing chain's tail back at
+    // end-of-chain
+    let mut first = ScopeGuard::new_with_data(0u32, |first| {
         if first != 0 {
             let _ = free_cluster_chain(sb_data, first);
         }
         if last_cluster != 0 {
             let _ = set_fat_entry(sb_data, last_cluster, FAT_EOC);
         }
-    }
-
-    let mut first = 0u32;
+    });
     let mut prev = last_cluster;
     for _ in 0..count {
-        let cluster = match allocate_cluster(sb_data) {
-            Ok(c) => c,
-            Err(e) => {
-                rollback(sb_data, first, last_cluster);
-                return Err(e);
-            }
-        };
+        let cluster = allocate_cluster(sb_data)?;
         if prev != 0
             && let Err(e) = set_fat_entry(sb_data, prev, cluster)
         {
-            // `cluster` is allocated but not yet linked into `first`:
-            // free it directly, then unwind the rest
+            // `cluster` is allocated but not yet linked: free it directly
             let _ = set_fat_entry(sb_data, cluster, FAT_FREE);
-            rollback(sb_data, first, last_cluster);
             return Err(e);
         }
-        if first == 0 {
-            first = cluster;
+        if *first == 0 {
+            *first = cluster;
         }
         prev = cluster;
     }
-    Ok(first)
+    Ok(first.dismiss())
 }
 
 /// Get the last cluster in a chain

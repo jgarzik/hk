@@ -12,6 +12,7 @@
 
 use crate::mm::tlb::flush_tlb_kernel_range;
 use crate::sync::spin::Mutex;
+use crate::util::scope::ScopeGuard;
 use core::arch::asm;
 
 use super::paging::{
@@ -227,22 +228,23 @@ pub unsafe fn ioremap(phys_addr: u64, size: u64) -> Result<*mut u8, IoremapError
     // Kernel (TTBR1) table
     let l0_phys = super::kmap::swapper_phys();
 
-    // Map each page with device memory attributes
-    for i in 0..num_pages {
-        let va = virt_base + (i as u64) * PAGE_SIZE;
-        let pa = aligned_phys + (i as u64) * PAGE_SIZE;
-
-        if let Err(e) = map_device_page(l0_phys, va, pa) {
-            // Rollback: unmap pages we've already mapped
-            for j in 0..i {
-                let rollback_va = virt_base + (j as u64) * PAGE_SIZE;
-                unmap_page(l0_phys, rollback_va);
-            }
-            flush_tlb_kernel_range(virt_base, virt_base + aligned_size);
-            IOREMAP.lock().free(virt_base, num_pages);
-            return Err(e);
+    // Map each page with device memory attributes; on failure, unmap the ones mapped and free the range
+    let mut mapped = ScopeGuard::new_with_data(0u64, |n| {
+        for j in 0..n {
+            unmap_page(l0_phys, virt_base + j * PAGE_SIZE);
         }
+        flush_tlb_kernel_range(virt_base, virt_base + aligned_size);
+        IOREMAP.lock().free(virt_base, num_pages);
+    });
+    for i in 0..aligned_size / PAGE_SIZE {
+        map_device_page(
+            l0_phys,
+            virt_base + i * PAGE_SIZE,
+            aligned_phys + i * PAGE_SIZE,
+        )?;
+        *mapped += 1;
     }
+    mapped.dismiss();
 
     // Make the entries visible on every CPU (a stale entry of a range
     // used before is already gone: iounmap flushed it)

@@ -6,6 +6,7 @@
 #![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use crate::sync::spin::Mutex;
+use crate::util::scope::ScopeGuard;
 
 use super::kmap::swapper_phys;
 use super::paging::{
@@ -234,23 +235,19 @@ pub unsafe fn ioremap(phys_addr: u64, size: u64) -> Result<*mut u8, IoremapError
     // Kernel half: the same tables in every address space
     let cr3 = swapper_phys();
 
-    // Map each page
-    for i in 0..num_pages {
-        let va = virt_base + (i as u64) * PAGE_SIZE;
-        let pa = aligned_phys + (i as u64) * PAGE_SIZE;
-
-        if let Err(e) = map_mmio_page(cr3, va, pa) {
-            // Rollback: unmap pages we've already mapped
-            for j in 0..i {
-                let rollback_va = virt_base + (j as u64) * PAGE_SIZE;
-                unmap_page(cr3, rollback_va);
-            }
-            flush_tlb_kernel_range(virt_base, virt_base + aligned_size);
-            // Free the virtual address range
-            IOREMAP.lock().free(virt_base, num_pages);
-            return Err(e);
+    // Map each page; on failure, unmap the ones mapped and free the range
+    let mut mapped = ScopeGuard::new_with_data(0u64, |n| {
+        for j in 0..n {
+            unmap_page(cr3, virt_base + j * PAGE_SIZE);
         }
+        flush_tlb_kernel_range(virt_base, virt_base + aligned_size);
+        IOREMAP.lock().free(virt_base, num_pages);
+    });
+    for i in 0..aligned_size / PAGE_SIZE {
+        map_mmio_page(cr3, virt_base + i * PAGE_SIZE, aligned_phys + i * PAGE_SIZE)?;
+        *mapped += 1;
     }
+    mapped.dismiss();
 
     // No flush: the entries were not present (x86 caches no
     // not-present entry) and iounmap flushed any earlier use of the range

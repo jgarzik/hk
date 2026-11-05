@@ -9,3 +9,4 @@ pub mod ida;
 pub mod kmem;
 pub mod list;
 pub mod pod;
+pub mod scope;

@@ -4,6 +4,7 @@
 //! arguments in with uaccess, call the protocol, copy results out. The
 //! file's O_NONBLOCK is read at every call.
 
+use crate::util::scope::ScopeGuard;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
@@ -80,19 +81,11 @@ pub fn sys_socketpair(domain: i32, stype: i32, protocol: i32, sv: u64) -> i64 {
         let (nb, cloexec) = type_flags(stype & !SOCK_TYPE_MASK)?;
         let cur = get_user::<Uaccess, [i32; 2]>(sv).map_err(|_| KernelError::BadAddress)?;
         put_user::<Uaccess, [i32; 2]>(sv, cur).map_err(|_| KernelError::BadAddress)?;
-        let a = sock_create(domain, stype & SOCK_TYPE_MASK, protocol)?;
-        let b = match sock_create(domain, stype & SOCK_TYPE_MASK, protocol) {
-            Ok(b) => b,
-            Err(e) => {
-                a.release();
-                return Err(e);
-            }
-        };
-        if let Err(e) = a.socketpair(&*b) {
-            a.release();
-            b.release();
-            return Err(e);
-        }
+        let create = || sock_create(domain, stype & SOCK_TYPE_MASK, protocol);
+        let a = ScopeGuard::new_with_data(create()?, |s| s.release());
+        let b = ScopeGuard::new_with_data(create()?, |s| s.release());
+        a.socketpair(&**b)?;
+        let (a, b) = (a.dismiss(), b.dismiss());
         let fds = install_pair(sock_alloc_file(a, nb), sock_alloc_file(b, nb), cloexec)?;
         put_user::<Uaccess, [i32; 2]>(sv, fds).map_err(|_| KernelError::BadAddress)?;
         Ok(0)

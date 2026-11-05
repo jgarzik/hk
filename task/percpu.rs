@@ -1936,9 +1936,6 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         return Err(1); // EPERM
     }
 
-    // Helper macro to handle early returns with NPROC cleanup
-    // If we incremented the process count and then fail, we must decrement it
-
     // Get current CPU ID
     let cpu_id = crate::cpu::this_id();
 
