@@ -33,15 +33,25 @@ pub fn set_nr_cpu_ids(n: u32) {
 /// per-CPU data exists, when only the boot CPU runs
 #[inline]
 pub fn this_id() -> u32 {
-    CurrentArch::try_current_cpu_id().unwrap_or(0)
+    try_this_id().unwrap_or(0)
 }
 
 /// The calling CPU's id once its per-CPU data exists; None before (the
 /// boot CPU early, or a CPU coming up): per-CPU caches (slab, page
 /// lists) must not be used then
+#[cfg(not(test))]
 #[inline]
 pub fn try_this_id() -> Option<u32> {
     CurrentArch::try_current_cpu_id()
+}
+
+/// Host unit tests run in user space, where the per-CPU base register
+/// is out of reach (arm64 TPIDR_EL1 traps at EL0): no per-CPU data, so
+/// everything uses slot 0
+#[cfg(test)]
+#[inline]
+pub fn try_this_id() -> Option<u32> {
+    None
 }
 
 /// One `T` per possible CPU
