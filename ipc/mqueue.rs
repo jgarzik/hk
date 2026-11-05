@@ -192,53 +192,43 @@ impl MqQueue {
             messages: Mutex::new(Vec::new()),
             flags: Mutex::new(0),
             mode,
-            uid: cred.euid,
-            gid: cred.egid,
+            // Linux mqueue_get_inode: the creator's fsuid and fsgid
+            uid: cred.fsuid,
+            gid: cred.fsgid,
             notify: Mutex::new(None),
             waitq_send: WaitQueue::new(),
             waitq_recv: WaitQueue::new(),
         }
     }
 
-    /// Check if the given access mode is permitted
+    /// Check if the given access mode is permitted (Linux mq_open:
+    /// inode_permission of the queue's inode, generic_permission)
     fn check_access(&self, access_mode: i32) -> bool {
-        let cred = crate::task::percpu::current_cred();
-
-        // Root always has access
-        if cred.fsuid == 0 {
-            return true;
-        }
-
-        // Determine which permission bits to check
-        let (read_needed, write_needed) = match access_mode {
-            O_RDONLY => (true, false),
-            O_WRONLY => (false, true),
-            O_RDWR => (true, true),
-            _ => (true, true),
+        use crate::fs::dac::{MAY_READ, MAY_WRITE};
+        let mask = match access_mode {
+            O_RDONLY => MAY_READ,
+            O_WRONLY => MAY_WRITE,
+            _ => MAY_READ | MAY_WRITE,
         };
+        let cred = crate::task::percpu::current_cred();
+        crate::fs::dac::permission_ids(
+            &cred,
+            self.uid,
+            self.gid,
+            self.mode as u16 & 0o7777,
+            false,
+            mask,
+        )
+        .is_ok()
+    }
 
-        // Owner permissions (bits 6-8)
-        if cred.fsuid == self.uid {
-            let owner_read = (self.mode & 0o400) != 0;
-            let owner_write = (self.mode & 0o200) != 0;
-            if (!read_needed || owner_read) && (!write_needed || owner_write) {
-                return true;
-            }
-        }
-
-        // Group permissions (bits 3-5)
-        if cred.fsgid == self.gid {
-            let group_read = (self.mode & 0o040) != 0;
-            let group_write = (self.mode & 0o020) != 0;
-            if (!read_needed || group_read) && (!write_needed || group_write) {
-                return true;
-            }
-        }
-
-        // Other permissions (bits 0-2)
-        let other_read = (self.mode & 0o004) != 0;
-        let other_write = (self.mode & 0o002) != 0;
-        (!read_needed || other_read) && (!write_needed || other_write)
+    /// May the caller remove it (Linux mq_unlink: vfs_unlink in the
+    /// mqueue root, a 01777 directory owned by root): write and search
+    /// there are everyone's, so the sticky bit decides (check_sticky):
+    /// the queue's owner, the directory's (root) or CAP_FOWNER
+    fn may_unlink(&self) -> bool {
+        let cred = crate::task::percpu::current_cred();
+        cred.fsuid == self.uid || cred.fsuid == 0 || crate::task::capable(crate::task::CAP_FOWNER)
     }
 
     /// Get the queue name (for debugging and future /dev/mqueue filesystem)
@@ -681,9 +671,9 @@ pub fn sys_mq_unlink(name_ptr: u64) -> i64 {
 
     let mut registry = MQ_REGISTRY.write();
     if let Some(q) = registry.get(queue_name.as_slice()) {
-        // Check write permission (needed for unlink)
-        if !q.check_access(O_WRONLY) {
-            return KernelError::PermissionDenied.sysret();
+        // The mqueue root's sticky bit (Linux may_delete): EPERM
+        if !q.may_unlink() {
+            return KernelError::NotPermitted.sysret();
         }
         registry.remove(queue_name.as_slice());
         0

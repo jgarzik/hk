@@ -14,6 +14,11 @@
 //!   root may read anyone's.
 //! - SETRLIMIT_EFAULT_FIRST: setrlimit copies the limit in before it
 //!   looks at the resource (EFAULT, not EINVAL).
+//! - IPC_CAPS: SysV permissions as Linux ipcperms (a supplementary group
+//!   grants group bits; CAP_IPC_OWNER overrides) and IPC_RMID as
+//!   ipcctl_obtain_check (CAP_SYS_ADMIN for a non-owner); POSIX queues
+//!   as generic_permission (CAP_DAC_OVERRIDE) with mq_unlink under the
+//!   sticky rule of the mqueue root (EPERM for another's queue).
 
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
@@ -36,6 +41,7 @@ pub fn run_tests() {
     report(b"PRLIMIT_PERM", prlimit_perm());
     let r = hk_syscall::sys_setrlimit(9999, core::ptr::null());
     report(b"SETRLIMIT_EFAULT_FIRST", (r != -14) as u64);
+    report(b"IPC_CAPS", ipc_caps());
 }
 
 fn report(name: &[u8], step: u64) {
@@ -243,4 +249,134 @@ fn prlimit_perm() -> u64 {
         return step;
     }
     if r != 0 { 10 } else { 0 }
+}
+
+const EACCES: i64 = -13;
+const IPC_PRIVATE: i32 = 0;
+const IPC_CREAT: i32 = 0o1000;
+const IPC_RMID: i32 = 0;
+const GETVAL: i32 = 12;
+const CAP_DAC_OVERRIDE: u32 = 1;
+const CAP_DAC_READ_SEARCH: u32 = 2;
+const CAP_IPC_OWNER: u32 = 15;
+const MQ_NAME: &[u8] = b"caps_checks_q\0";
+
+/// uid/gid 1000 in supplementary group 500, keeping capabilities, with
+/// effective set `caps`
+fn become_user(caps: u32) -> bool {
+    let groups = [500u32];
+    sys_prctl(PR_SET_KEEPCAPS, 1, 0, 0, 0) == 0
+        && hk_syscall::sys_setgroups(1, groups.as_ptr()) == 0
+        && hk_syscall::sys_setresgid(1000, 1000, 1000) == 0
+        && sys_setresuid(1000, 1000, 1000) == 0
+        && set_effective(caps)
+}
+
+/// Root-owned 0600 set `own`, root-owned 0060 set `grp` of group 500,
+/// root's 0600 queue: what uid 1000 may do with and without capabilities
+fn ipc_user(own: i32, grp: i32) -> u64 {
+    let getval = |id| hk_syscall::sys_semctl(id, 0, GETVAL, 0);
+    // No capabilities: the owner's bits refuse it, the group's admit it
+    let none = in_child_with(|| {
+        if !become_user(0) {
+            return 1;
+        }
+        if getval(own) != EACCES {
+            return 2;
+        }
+        if getval(grp) != 0 {
+            return 3;
+        }
+        if hk_syscall::sys_semctl(own, 0, IPC_RMID, 0) != EPERM {
+            return 4;
+        }
+        let q = hk_syscall::sys_mq_open(
+            MQ_NAME.as_ptr(),
+            hk_syscall::O_RDWR as i32,
+            0,
+            core::ptr::null(),
+        );
+        if q != EACCES {
+            return 5;
+        }
+        if hk_syscall::sys_mq_unlink(MQ_NAME.as_ptr()) != EPERM {
+            return 6;
+        }
+        0
+    });
+    if none != 0 {
+        return none;
+    }
+    // CAP_IPC_OWNER, CAP_DAC_OVERRIDE and CAP_SYS_ADMIN
+    let caps =
+        1 << CAP_IPC_OWNER | 1 << CAP_DAC_OVERRIDE | 1 << CAP_DAC_READ_SEARCH | 1 << CAP_SYS_ADMIN;
+    in_child_with(move || {
+        if !become_user(caps) {
+            return 11;
+        }
+        if getval(own) != 0 {
+            return 12;
+        }
+        let q = hk_syscall::sys_mq_open(
+            MQ_NAME.as_ptr(),
+            hk_syscall::O_RDWR as i32,
+            0,
+            core::ptr::null(),
+        );
+        if q < 0 {
+            return 13;
+        }
+        hk_syscall::sys_close(q as u64);
+        if hk_syscall::sys_semctl(own, 0, IPC_RMID, 0) != 0 {
+            return 14;
+        }
+        0
+    })
+}
+
+/// `f`'s verdict from a child
+fn in_child_with(f: impl Fn() -> u64) -> u64 {
+    let pid = sys_fork();
+    if pid == 0 {
+        sys_exit(f());
+    }
+    let mut ws = 0;
+    sys_wait4(pid, &mut ws, 0, 0);
+    if ws & 0x7f != 0 {
+        101
+    } else {
+        (ws >> 8) as u64 & 0xff
+    }
+}
+
+fn ipc_caps() -> u64 {
+    let own = hk_syscall::sys_semget(IPC_PRIVATE, 1, IPC_CREAT | 0o600) as i32;
+    let grp = hk_syscall::sys_semget(IPC_PRIVATE, 1, IPC_CREAT | 0o600) as i32;
+    if own < 0 || grp < 0 {
+        return 90;
+    }
+    // grp: group 500, mode 0060 (IPC_STAT, then IPC_SET with them)
+    let mut ds = [0u32; 32];
+    hk_syscall::sys_semctl(grp, 0, 2, ds.as_mut_ptr() as u64);
+    ds[2] = 500; // sem_perm.gid
+    ds[5] = 0o060; // sem_perm.mode
+    if hk_syscall::sys_semctl(grp, 0, 1, ds.as_ptr() as u64) != 0 {
+        return 91;
+    }
+    hk_syscall::sys_mq_unlink(MQ_NAME.as_ptr());
+    let q = hk_syscall::sys_mq_open(
+        MQ_NAME.as_ptr(),
+        hk_syscall::O_RDWR as i32 | hk_syscall::O_CREAT as i32,
+        0o600,
+        core::ptr::null(),
+    );
+    if q < 0 {
+        return 92;
+    }
+    hk_syscall::sys_close(q as u64);
+    let r = ipc_user(own, grp);
+    hk_syscall::sys_semctl(own, 0, IPC_RMID, 0);
+    hk_syscall::sys_semctl(grp, 0, IPC_RMID, 0);
+    hk_syscall::sys_mq_unlink(MQ_NAME.as_ptr());
+    r
 }

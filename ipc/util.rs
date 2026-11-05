@@ -91,9 +91,9 @@ impl KernIpcPerm {
     }
 
     /// The owner may change the object (IPC_SET, IPC_RMID): its uid, its
-    /// creator, or root (Linux ipcctl_obtain_check; no CAP_SYS_ADMIN yet)
+    /// creator, or CAP_SYS_ADMIN (Linux ipcctl_obtain_check)
     pub fn is_owner(inner: &KernIpcPermMutable, perm_cuid: u32, uid: u32) -> bool {
-        uid == inner.uid || uid == perm_cuid || uid == 0
+        uid == inner.uid || uid == perm_cuid || crate::task::capable(crate::task::CAP_SYS_ADMIN)
     }
 
     /// Increment reference count
@@ -368,7 +368,6 @@ pub const IPC_PERM_WRITE: u16 = 0o222;
 pub fn ipc_checkperm(perm: &KernIpcPerm, flag: u16) -> Result<(), i32> {
     let cred = crate::task::percpu::current_cred();
     let euid = cred.euid;
-    let gid = cred.egid;
 
     // Extract requested permission bits (collapse to lowest 3 bits like Linux)
     // Linux: requested_mode = (flag >> 6) | (flag >> 3) | flag
@@ -381,8 +380,11 @@ pub fn ipc_checkperm(perm: &KernIpcPerm, flag: u16) -> Result<(), i32> {
     let granted = if euid == perm.cuid || euid == inner.uid {
         // Owner permissions
         (inner.mode >> 6) & 0o7
-    } else if gid == perm.cgid || gid == inner.gid {
-        // Group permissions
+    } else if crate::fs::dac::in_group(&cred, perm.cgid)
+        || crate::fs::dac::in_group(&cred, inner.gid)
+    {
+        // Group permissions (Linux in_group_p: fsgid or a supplementary
+        // group)
         (inner.mode >> 3) & 0o7
     } else {
         // Other permissions
@@ -392,11 +394,9 @@ pub fn ipc_checkperm(perm: &KernIpcPerm, flag: u16) -> Result<(), i32> {
     // Check if all requested bits are present in granted bits
     // Linux: (requested_mode & ~granted_mode & 0007) means "any bit requested but not granted"
     // We invert: (granted & requested) == requested means "all requested bits are granted"
-    if (granted & requested) == requested {
+    if (granted & requested) == requested || crate::task::capable(crate::task::CAP_IPC_OWNER) {
         return Ok(());
     }
-
-    // TODO: CAP_IPC_OWNER capability check
 
     Err(KernelError::PermissionDenied.errno())
 }

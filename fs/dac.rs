@@ -71,11 +71,11 @@ pub fn owner_or_capable(c: &Cred, inode: &Inode) -> bool {
 
 /// acl_permission_check: only the caller's class (owner, group, other)
 /// of mode bits counts
-fn mode_ok(c: &Cred, inode: &Inode, mask: u32) -> bool {
-    let m = inode.mode().perm() as u32;
-    let bits = if c.fsuid == inode.uid() {
+fn mode_ok(c: &Cred, uid: Uid, gid: Gid, perm: u16, mask: u32) -> bool {
+    let m = perm as u32;
+    let bits = if c.fsuid == uid {
         m >> 6
-    } else if in_group(c, inode.gid()) {
+    } else if in_group(c, gid) {
         m >> 3
     } else {
         m
@@ -88,12 +88,33 @@ fn mode_ok(c: &Cred, inode: &Inode, mask: u32) -> bool {
 /// CAP_DAC_OVERRIDE grants everything except exec of a file with no
 /// x bit at all.
 pub fn generic_permission(c: &Cred, inode: &Inode, mask: u32) -> Result<(), KernelError> {
+    let mode = inode.mode();
+    permission_ids(
+        c,
+        inode.uid(),
+        inode.gid(),
+        mode.perm(),
+        mode.is_dir(),
+        mask,
+    )
+}
+
+/// `generic_permission` for an object described by its owner, group and
+/// mode bits rather than an inode (POSIX message queues, which Linux
+/// keeps as mqueue-fs inodes)
+pub fn permission_ids(
+    c: &Cred,
+    uid: Uid,
+    gid: Gid,
+    perm: u16,
+    is_dir: bool,
+    mask: u32,
+) -> Result<(), KernelError> {
     let mask = mask & (MAY_READ | MAY_WRITE | MAY_EXEC);
-    if mode_ok(c, inode, mask) {
+    if mode_ok(c, uid, gid, perm, mask) {
         return Ok(());
     }
-    let mode = inode.mode();
-    if mode.is_dir() {
+    if is_dir {
         if mask & MAY_WRITE == 0 && capable(c, CAP_DAC_READ_SEARCH) {
             return Ok(());
         }
@@ -105,7 +126,7 @@ pub fn generic_permission(c: &Cred, inode: &Inode, mask: u32) -> Result<(), Kern
     if mask == MAY_READ && capable(c, CAP_DAC_READ_SEARCH) {
         return Ok(());
     }
-    if (mask & MAY_EXEC == 0 || mode.perm() & S_IXUGO != 0) && capable(c, CAP_DAC_OVERRIDE) {
+    if (mask & MAY_EXEC == 0 || perm & S_IXUGO != 0) && capable(c, CAP_DAC_OVERRIDE) {
         return Ok(());
     }
     Err(KernelError::PermissionDenied)
