@@ -1030,3 +1030,49 @@ pattern number). Ranked.
    can exceed i64::MAX, giving a negative st_size and lseek results
    that read as errnos. Linux rw_verify_area (EINVAL) and
    generic_write_check_limits (EFBIG at MAX_LFS_FILESIZE).
+
+## Review findings (2026-11-05): allocation sizing, pure code (unverified)
+
+From a read-only review of allocation sizing (~/tmp/hk-with-capacity.md)
+and of host-testable code (~/tmp/hk-unit-test-opportunities.md). Not yet
+confirmed by a test. Ranked.
+
+1. **Unprivileged kernel panics by allocation size** (heap objects are
+   at most 4 MiB, MAX_KMALLOC; an infallible allocation that fails
+   panics):
+   - `ipc/mqueue.rs:741,803`: mq_open accepts msgsize up to 16 MiB with
+     no limit check (Linux mq_attr_ok: msg_max/msgsize_max unless
+     CAP_SYS_RESOURCE, RLIMIT_MSGQUEUE), then send/receive allocate
+     `vec![0; msgsize]`.
+   - `net/msg.rs:91` (`gather_at`): AF_UNIX dgram and netlink sends up
+     to sndbuf (8 MiB unprivileged) are gathered into one Vec; also
+     `net/netlink/rtnetlink.rs:170`. Fix: `kmem::try_vec`, ENOBUFS.
+   - `fs/vfat.rs:862`: `extend_cluster_chain` collects every new
+     cluster (ftruncate to 4 GiB with 512-byte clusters: 32 MiB).
+     `sectors_per_cluster` 0 from disk divides by zero at `:166,:806`.
+   - TCP receive/send VecDeques double under `cb` past 4 MiB with
+     large SO_RCVBUF/SO_SNDBUF (`net/tcp/input.rs:547`, `cb.rs:945`).
+   - Bounded but large, ENOMEM on Linux: io_uring rings (2 MiB), keys
+     (1 MiB), `task/id.rs:625` (256 KiB).
+2. **seccomp cBPF** (`bpf/convert.rs`, `bpf/interp.rs`):
+   - jeq/jgt/jge against a constant >= 0x80000000 never match (the
+     constant is sign-extended against a zero-extended u32): the
+     `jeq #AUDIT_ARCH_X86_64` (0xC000003E) every libseccomp, systemd
+     and container filter starts with fails.
+   - A jump with jt=jf=0 emits no instruction but `fixup_jumps` still
+     consumes an offset: later jumps shift, can index past the program
+     (panic) or loop backwards (hang); reachable unprivileged with
+     no_new_privs.
+   - R10 is 0, so scratch-memory ST/LD always fail (KILL_THREAD).
+   - `validate_cbpf` accepts what Linux rejects (H/B/IND/MSH loads,
+     unaligned or out-of-range `ld [k]`, `div #0`, `ret x`); ALU32
+     DIV/MOD by a constant >= 2^31 is wrong.
+3. **ABI**: `acct` ac_etime is seconds where Linux has AHZ ticks, and
+   encode_comp_t skips Linux's rounding; getxattr ERANGE above 64 KiB
+   (Linux clamps); epoll_wait maxevents capped at 4096 and poll at
+   1024 fds (Linux: ~INT_MAX/12, RLIMIT_NOFILE); sysctl integers are
+   not parsed in base 0 (`0x10`, `010`) and `+5` is accepted.
+4. **Minor**: `fs/posix_lock.rs:328` `-l_len` overflows at i64::MIN
+   and lengths past i64::MAX are not EOVERFLOW; `arch/x86_64/rtc.rs:131`
+   panics on a CMOS month >= 14; vfat short names can start with a
+   space.
