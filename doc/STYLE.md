@@ -14,6 +14,15 @@ The rules for `unsafe` are in `doc/UNSAFE.md` and the locking rules in
 - **No panics on user input.** `panic!`, `unwrap` and `expect` are only
   for kernel invariants: a state that cannot happen unless the kernel has
   a bug. Anything a user, a device or a disk can cause is an error return.
+- **Fallible allocation for untrusted sizes.** The global allocator
+  panics the kernel when it cannot satisfy a request, and nothing above
+  `kmem::MAX_KMALLOC` (4 MiB, no vmalloc) can be satisfied. A buffer
+  whose size comes from a syscall argument, the network or a disk must
+  grow through a fallible path: `kmem::try_vec` for a known size, or
+  `kmem::KVec`/`KDeque` (whose growth is always `try_*`, ENOMEM) for one
+  built up over time. Never `vec![x; n]`, `with_capacity`, `push`,
+  `extend`, `resize` or `reserve` on a length the kernel does not bound
+  itself. A stream of bytes is a queue of bounded chunks, not one buffer.
 - **Types carry meaning.** Use newtypes for addresses and numbers that
   must not be mixed up (`PhysAddr`, `VirtAddr`, `Pfn`, device numbers,
   fds), `bitflags` for flag words, and enums for closed sets.
