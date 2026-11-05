@@ -166,11 +166,19 @@ impl<T> KDeque<T> {
         Self(VecDeque::new())
     }
 
+    /// Append `v`. Growth doubles, but reserves exactly and never past
+    /// [`MAX_KMALLOC`] (amortized `try_reserve` may round up beyond the
+    /// cap and fail while `len + 1` still fits)
     pub fn try_push_back(&mut self, v: T) -> Result<(), KernelError> {
-        fits::<T>(self.0.len().saturating_add(1))?;
-        self.0
-            .try_reserve(1)
-            .map_err(|_| KernelError::OutOfMemory)?;
+        let len = self.0.len();
+        fits::<T>(len.saturating_add(1))?;
+        if len == self.0.capacity() {
+            let max = MAX_KMALLOC / core::mem::size_of::<T>().max(1);
+            let want = len.saturating_mul(2).clamp(4, max);
+            self.0
+                .try_reserve_exact(want - len)
+                .map_err(|_| KernelError::OutOfMemory)?;
+        }
         self.0.push_back(v);
         Ok(())
     }
@@ -226,6 +234,18 @@ mod tests {
         let mut big: KVec<u8> = KVec::new();
         big.try_resize(MAX_KMALLOC, 0).unwrap();
         assert!(big.try_push(0).is_err());
+    }
+
+    #[test]
+    fn kdeque_fills_to_the_cap() {
+        // 104 items of 40000 bytes fit; doubling from 64 would not
+        let mut q: KDeque<[u8; 40000]> = KDeque::new();
+        let max = MAX_KMALLOC / 40000;
+        for _ in 0..max {
+            q.try_push_back([0; 40000]).unwrap();
+            assert!(q.0.capacity() * 40000 <= MAX_KMALLOC);
+        }
+        assert_eq!(q.try_push_back([0; 40000]), Err(KernelError::OutOfMemory));
     }
 
     #[test]
