@@ -8,8 +8,8 @@ use crate::uaccess::{UaccessArch, copy_from_user};
 
 use super::io::{do_readv, do_writev};
 use super::syscall::{
-    IOV_MAX, RWF_APPEND, RWF_ATOMIC, RWF_DONTCACHE, RWF_DSYNC, RWF_NOAPPEND, RWF_NOWAIT,
-    RWF_SUPPORTED, RWF_SYNC, sys_fsync,
+    IOV_MAX, MAX_RW_COUNT, RWF_APPEND, RWF_ATOMIC, RWF_DONTCACHE, RWF_DSYNC, RWF_NOAPPEND,
+    RWF_NOWAIT, RWF_SUPPORTED, RWF_SYNC, sys_fsync,
 };
 
 /// Linux iovec structure for scatter/gather I/O
@@ -69,15 +69,27 @@ fn validate_iovec_array(iov_ptr: u64, iovcnt: i32) -> Result<alloc::vec::Vec<IoV
         return Err(KernelError::BadAddress.sysret());
     }
 
-    // Validate each iovec buffer (non-zero length only)
-    for iov in &iovecs {
-        if iov.iov_len == 0 {
-            continue;
+    // A length negative as ssize_t is EINVAL, for any segment before
+    // any address is checked (Linux copy_iovec_from_user)
+    if iovecs.iter().any(|v| (v.iov_len as i64) < 0) {
+        return Err(KernelError::InvalidArgument.sysret());
+    }
+    // One segment is cut to MAX_RW_COUNT, then checked (Linux
+    // import_ubuf); several are checked whole, then cut so the total
+    // stays within MAX_RW_COUNT (__import_iovec)
+    let single = iovecs.len() == 1;
+    let mut total = 0usize;
+    for iov in &mut iovecs {
+        let mut len = iov.iov_len as usize;
+        if single {
+            len = len.min(MAX_RW_COUNT);
         }
-        // Validate buffer address
-        if !Uaccess::access_ok(iov.iov_base, iov.iov_len as usize) {
+        if len != 0 && !Uaccess::access_ok(iov.iov_base, len) {
             return Err(KernelError::BadAddress.sysret());
         }
+        len = len.min(MAX_RW_COUNT - total);
+        iov.iov_len = len as u64;
+        total += len;
     }
 
     Ok(iovecs)
