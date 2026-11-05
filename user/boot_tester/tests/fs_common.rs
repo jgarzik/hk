@@ -94,6 +94,52 @@ pub fn run_normalized_tests(prefix: &[u8], fs_name: &[u8]) {
     test_rename(prefix, fs_name);
     test_rename_overwrite(prefix, fs_name);
     test_write_limits(prefix, fs_name);
+    test_lseek_limits(prefix, fs_name);
+}
+
+/// lseek as Linux generic_file_llseek_size: below 0 or past s_maxbytes
+/// is EINVAL (vfat: 4 GiB - 1); SEEK_DATA/SEEK_HOLE see one data run
+/// and the end as the hole, ENXIO at or past the end
+fn test_lseek_limits(prefix: &[u8], fs_name: &[u8]) {
+    const EINVAL: i64 = -22;
+    const ENXIO: i64 = -6;
+    const SEEK_DATA: i32 = 3;
+    const SEEK_HOLE: i32 = 4;
+    let mut path_buf = [0u8; 128];
+    let test_file = make_path(prefix, b"norm_lseek_lim.txt", &mut path_buf);
+    let fd = sys_open(test_file.as_ptr(), O_CREAT | O_RDWR, 0o644) as i32;
+    let step = (|| {
+        if fd < 0 {
+            return 1;
+        }
+        sys_write(fd as u64, b"0123456789".as_ptr(), 10);
+        if sys_lseek(fd, 5, SEEK_SET) != 5 || sys_lseek(fd, i64::MIN, SEEK_CUR) != EINVAL {
+            return 2;
+        }
+        if sys_lseek(fd, i64::MAX, SEEK_END) != EINVAL {
+            return 3;
+        }
+        if fs_name == b"VFAT" && sys_lseek(fd, 1 << 32, SEEK_SET) != EINVAL {
+            return 4;
+        }
+        if sys_lseek(fd, 3, SEEK_DATA) != 3 || sys_lseek(fd, 3, SEEK_HOLE) != 10 {
+            return 5;
+        }
+        if sys_lseek(fd, 10, SEEK_DATA) != ENXIO || sys_lseek(fd, -1, SEEK_HOLE) != ENXIO {
+            return 6;
+        }
+        0
+    })();
+    if fd >= 0 {
+        sys_close(fd as u64);
+    }
+    sys_unlink(test_file.as_ptr());
+    if step != 0 {
+        print(b"  lseek limits step ");
+        print_num(step);
+        println(b"");
+    }
+    print_marker(fs_name, b"LSEEK_LIMITS", step == 0);
 }
 
 /// The write limits (Linux rw_verify_area, generic_write_check_limits,

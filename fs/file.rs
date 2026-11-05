@@ -77,6 +77,9 @@ pub mod seek {
     pub const SEEK_CUR: i32 = 1;
     /// Seek from end of file
     pub const SEEK_END: i32 = 2;
+    /// Next data at or after the offset / next hole
+    pub const SEEK_DATA: i32 = 3;
+    pub const SEEK_HOLE: i32 = 4;
 }
 
 /// Flags for read/write operations (preadv2/pwritev2 RWF_* flags)
@@ -154,42 +157,40 @@ impl<'a> DirContext<'a> {
     }
 }
 
-/// Linux generic_file_llseek for a file of `size` bytes
+/// Seek in a file of `size` bytes (Linux generic_file_llseek_size with
+/// the filesystem's s_maxbytes): the whole file is data, its end the
+/// only hole; a position below 0 or past s_maxbytes is EINVAL, SEEK_DATA
+/// / SEEK_HOLE at or past the end ENXIO
 pub fn generic_llseek(
     file: &File,
     size: u64,
     offset: i64,
     whence: i32,
 ) -> Result<u64, KernelError> {
-    let new_pos = match whence {
-        seek::SEEK_SET => {
-            if offset < 0 {
-                return Err(KernelError::InvalidArgument);
+    let max = file.get_inode().map_or(i64::MAX as u64, |i| i.maxbytes());
+    let new = match whence {
+        seek::SEEK_SET => Some(offset),
+        seek::SEEK_CUR => (file.get_pos() as i64).checked_add(offset),
+        seek::SEEK_END => (size as i64).checked_add(offset),
+        seek::SEEK_DATA | seek::SEEK_HOLE => {
+            if offset < 0 || offset as u64 >= size {
+                return Err(KernelError::NoDeviceOrAddress);
             }
-            offset as u64
-        }
-        seek::SEEK_CUR => {
-            let cur = file.get_pos();
-            if offset < 0 {
-                cur.checked_sub((-offset) as u64)
-                    .ok_or(KernelError::InvalidArgument)?
+            Some(if whence == seek::SEEK_DATA {
+                offset
             } else {
-                cur.saturating_add(offset as u64)
-            }
-        }
-        seek::SEEK_END => {
-            if offset < 0 {
-                size.checked_sub((-offset) as u64)
-                    .ok_or(KernelError::InvalidArgument)?
-            } else {
-                size.saturating_add(offset as u64)
-            }
+                size as i64
+            })
         }
         _ => return Err(KernelError::InvalidArgument),
     };
-
-    file.set_pos(new_pos);
-    Ok(new_pos)
+    // Linux vfs_setpos
+    let pos = match new {
+        Some(p) if p >= 0 && p as u64 <= max => p as u64,
+        _ => return Err(KernelError::InvalidArgument),
+    };
+    file.set_pos(pos);
+    Ok(pos)
 }
 
 /// File operations trait - filesystem-specific behavior for open files
