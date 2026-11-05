@@ -252,10 +252,16 @@ pub fn set_uptodate(phys: u64) {
 
 /// Zero the page from byte `from` to its end
 pub fn zero_page(phys: u64, from: usize) {
-    if from < PAGE_SIZE {
+    zero_bytes(phys, from, PAGE_SIZE);
+}
+
+/// Zero the page's bytes [from, to)
+fn zero_bytes(phys: u64, from: usize, to: usize) {
+    let to = to.min(PAGE_SIZE);
+    if from < to {
         // SAFETY: the caller owns it (locked or not yet visible)
         let bytes = unsafe { frame_bytes(phys) };
-        bytes[from..].fill(0);
+        bytes[from..to].fill(0);
     }
 }
 
@@ -396,12 +402,17 @@ pub fn remove(m: &AddressSpace, phys: u64) {
 /// truncate_inode_pages_range): each is locked first, so a writer or
 /// reader holding it finishes
 pub fn truncate_from(m: &AddressSpace, from: u64) {
+    truncate_pages(m, from, u64::MAX);
+}
+
+/// Remove the pages with index in [from, last], as `truncate_from`
+fn truncate_pages(m: &AddressSpace, from: u64, last: u64) {
     let mut at = from;
-    loop {
+    while at <= last {
         let next = {
             let pages = m.i_pages.lock();
             pages
-                .find(at, u64::MAX, None)
+                .find(at, last, None)
                 .filter(|&(_, p)| FRAME_ALLOCATOR.incref(p))
         };
         let Some((index, phys)) = next else {
@@ -411,7 +422,10 @@ pub fn truncate_from(m: &AddressSpace, from: u64) {
         remove(m, phys);
         unlock_page(phys);
         put_page(phys);
-        at = index + 1;
+        match index.checked_add(1) {
+            Some(i) => at = i,
+            None => return,
+        }
     }
 }
 
@@ -471,9 +485,29 @@ fn mkclean(m: &AddressSpace, index: u64, phys: u64) {
         let _l = super::ptl::pte_lock(ptep);
         // SAFETY: a live table of a VMA in the chain, under its PTE lock
         let e = unsafe { AtomicU64::from_ptr(ptep) };
-        let pte = e.load(Ordering::Acquire);
-        if paging::pte_present(pte) && paging::pte_addr(pte) == phys && paging::pte_write(pte) {
-            e.store(paging::pte_wrprotect(pte), Ordering::Release);
+        // The MMU may set accessed/dirty meanwhile (under the PTE lock
+        // only it changes the entry): a compare-exchange keeps those
+        // bits, where a load then store could drop a dirty bit set by a
+        // write racing the clean (as mprotect's change_pte)
+        let mut pte = e.load(Ordering::Acquire);
+        let cleaned = loop {
+            if !(paging::pte_present(pte)
+                && paging::pte_addr(pte) == phys
+                && paging::pte_write(pte))
+            {
+                break false;
+            }
+            match e.compare_exchange(
+                pte,
+                paging::pte_wrprotect(pte),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break true,
+                Err(now) => pte = now,
+            }
+        };
+        if cleaned {
             super::tlb::flush_tlb_page(&mm, addr);
         }
     }
@@ -812,6 +846,46 @@ pub fn truncate_setsize(inode: &Inode, size: u64) {
         }
         unlock_page(phys);
         put_page(phys);
+    }
+}
+
+/// Zero bytes [start, end) of a file whose cache is its only copy
+/// (Linux shmem_truncate_range for a punched hole, with
+/// truncate_pagecache_range): whole pages are unmapped and dropped (they
+/// read back as zeroes), the partial pages at either edge zeroed in
+/// place. The caller holds i_rwsem.
+pub fn punch_range(inode: &Inode, start: u64, end: u64) {
+    if start >= end {
+        return;
+    }
+    let m = &inode.i_data;
+    let ps = PAGE_SIZE as u64;
+    let (first, past) = (start.div_ceil(ps), end / ps);
+    if first < past {
+        unmap_pages(m, first, past - 1);
+        truncate_pages(m, first, past - 1);
+        unmap_pages(m, first, past - 1);
+    }
+    let zero = |index: u64, from: u64, to: u64| {
+        if let Some(phys) = find_get(m, index) {
+            lock_page(phys);
+            if uptodate(phys) {
+                zero_bytes(phys, from as usize, to as usize);
+            }
+            unlock_page(phys);
+            put_page(phys);
+        }
+    };
+    let (si, ei) = (start / ps, end / ps);
+    if si == ei {
+        zero(si, start % ps, end % ps);
+        return;
+    }
+    if !start.is_multiple_of(ps) {
+        zero(si, start % ps, ps);
+    }
+    if !end.is_multiple_of(ps) {
+        zero(ei, 0, end % ps);
     }
 }
 

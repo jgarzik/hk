@@ -15,11 +15,13 @@ pub mod lockdep;
 mod mutex;
 mod racy;
 mod rwsem;
+mod seqlock;
 pub mod spin;
 
 pub use mutex::{Mutex, MutexGuard};
 pub use racy::RacyCell;
 pub use rwsem::{RwSem, RwSemReadGuard, RwSemWriteGuard};
+pub use seqlock::{SeqLock, SeqWriteGuard};
 
 /// The caller is a task that may sleep (not tid 0: an idle task or the
 /// boot context, which never contend for a sleeping lock)

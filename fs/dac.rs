@@ -48,10 +48,16 @@ pub fn cred() -> Cred {
     crate::task::current_cred()
 }
 
-/// Effective capability check against explicit credentials
-/// (capable_wrt_inode_uidgid: hk has a single user namespace)
+/// Effective capability check against explicit credentials (the
+/// caller's, or its override credentials: capable_wrt_inode_uidgid; hk
+/// has a single user namespace); a granted one marks the task
+/// PF_SUPERPRIV, as Linux ns_capable_common
 pub fn capable(c: &Cred, cap: u32) -> bool {
-    c.cap_effective.has(cap)
+    let ok = c.cap_effective.has(cap);
+    if ok {
+        crate::task::percpu::current().set_flag(crate::task::pf::SUPERPRIV);
+    }
+    ok
 }
 
 /// in_group_p: the fsgid or a supplementary group
@@ -71,11 +77,11 @@ pub fn owner_or_capable(c: &Cred, inode: &Inode) -> bool {
 
 /// acl_permission_check: only the caller's class (owner, group, other)
 /// of mode bits counts
-fn mode_ok(c: &Cred, inode: &Inode, mask: u32) -> bool {
-    let m = inode.mode().perm() as u32;
-    let bits = if c.fsuid == inode.uid() {
+fn mode_ok(c: &Cred, uid: Uid, gid: Gid, perm: u16, mask: u32) -> bool {
+    let m = perm as u32;
+    let bits = if c.fsuid == uid {
         m >> 6
-    } else if in_group(c, inode.gid()) {
+    } else if in_group(c, gid) {
         m >> 3
     } else {
         m
@@ -88,12 +94,33 @@ fn mode_ok(c: &Cred, inode: &Inode, mask: u32) -> bool {
 /// CAP_DAC_OVERRIDE grants everything except exec of a file with no
 /// x bit at all.
 pub fn generic_permission(c: &Cred, inode: &Inode, mask: u32) -> Result<(), KernelError> {
+    let mode = inode.mode();
+    permission_ids(
+        c,
+        inode.uid(),
+        inode.gid(),
+        mode.perm(),
+        mode.is_dir(),
+        mask,
+    )
+}
+
+/// `generic_permission` for an object described by its owner, group and
+/// mode bits rather than an inode (POSIX message queues, which Linux
+/// keeps as mqueue-fs inodes)
+pub fn permission_ids(
+    c: &Cred,
+    uid: Uid,
+    gid: Gid,
+    perm: u16,
+    is_dir: bool,
+    mask: u32,
+) -> Result<(), KernelError> {
     let mask = mask & (MAY_READ | MAY_WRITE | MAY_EXEC);
-    if mode_ok(c, inode, mask) {
+    if mode_ok(c, uid, gid, perm, mask) {
         return Ok(());
     }
-    let mode = inode.mode();
-    if mode.is_dir() {
+    if is_dir {
         if mask & MAY_WRITE == 0 && capable(c, CAP_DAC_READ_SEARCH) {
             return Ok(());
         }
@@ -105,7 +132,7 @@ pub fn generic_permission(c: &Cred, inode: &Inode, mask: u32) -> Result<(), Kern
     if mask == MAY_READ && capable(c, CAP_DAC_READ_SEARCH) {
         return Ok(());
     }
-    if (mask & MAY_EXEC == 0 || mode.perm() & S_IXUGO != 0) && capable(c, CAP_DAC_OVERRIDE) {
+    if (mask & MAY_EXEC == 0 || perm & S_IXUGO != 0) && capable(c, CAP_DAC_OVERRIDE) {
         return Ok(());
     }
     Err(KernelError::PermissionDenied)
@@ -291,7 +318,8 @@ pub fn kill_bits(c: &Cred, inode: &Inode) -> u16 {
     kill
 }
 
-/// file_remove_privs: drop set-id bits before data changes
+/// file_remove_privs: drop set-id bits before data changes; the caller
+/// holds i_rwsem (write, truncate), as chmod and chown do
 pub fn remove_privs(inode: &Inode) {
     if inode.mode().perm() & (S_ISUID | S_ISGID) == 0 {
         return;
@@ -303,10 +331,14 @@ pub fn remove_privs(inode: &Inode) {
 }
 
 /// chmod: owner or CAP_FOWNER; S_ISGID silently dropped unless the
-/// caller is in the file's group or has CAP_FSETID
+/// caller is in the file's group or has CAP_FSETID. The check and the
+/// change are one step under i_rwsem (Linux chmod_common: inode_lock
+/// around notify_change), so a racing chown or write cannot slip
+/// between them.
 pub fn chmod(p: &super::Path, perm: u16) -> Result<(), KernelError> {
     let inode = &*p.dentry.get_inode().ok_or(KernelError::NotFound)?;
     let _w = p.mnt.want_write()?;
+    let _l = inode.lock();
     inode.i_op.setattr_ok(inode)?;
     let c = cred();
     if !owner_or_capable(&c, inode) {
@@ -334,10 +366,13 @@ fn chgrp_ok(c: &Cred, inode: &Inode, gid: Gid) -> bool {
 
 /// chown_common + notify_change: permission per id, then for
 /// non-directories S_ISUID is always cleared and S_ISGID when
-/// group-executable or the caller could not keep it (even for root)
+/// group-executable or the caller could not keep it (even for root).
+/// Under i_rwsem across the checks, the kill computed from the current
+/// mode, and the id, mode and ctime changes (Linux chown_common).
 pub fn chown(p: &super::Path, uid: Option<Uid>, gid: Option<Gid>) -> Result<(), KernelError> {
     let inode = &*p.dentry.get_inode().ok_or(KernelError::NotFound)?;
     let _w = p.mnt.want_write()?;
+    let _l = inode.lock();
     inode.i_op.setattr_ok(inode)?;
     let c = cred();
     if uid.is_some_and(|u| !chown_ok(&c, inode, u)) || gid.is_some_and(|g| !chgrp_ok(&c, inode, g))

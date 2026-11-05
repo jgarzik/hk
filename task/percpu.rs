@@ -1921,18 +1921,6 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         return Err(11); // EAGAIN
     }
 
-    // Check cgroup pids controller limit (if task is in a cgroup with pids.max)
-    // This is checked before allocating resources so we fail early if over limit
-    let parent_cgroup = {
-        let tid = current_tid();
-        crate::cgroup::get_task_cgroup(tid)
-    };
-    if let Some(ref cgroup) = parent_cgroup
-        && !crate::cgroup::pids_can_fork(cgroup)
-    {
-        return Err(11); // EAGAIN - resource temporarily unavailable
-    }
-
     // A TLS base the register cannot take (Linux copy_thread ->
     // set_new_tls -> do_arch_prctl_64)
     if config.flags & CLONE_SETTLS != 0 && !crate::arch::user_tls_ok(config.tls) {
@@ -2024,6 +2012,24 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
             c_static = sched::DEFAULT_PRIO;
         }
     }
+
+    // What can still fail runs before the child exists, so an error
+    // leaves no task, pid or zombie behind (Linux copy_process: copy_fs,
+    // copy_namespaces and the CLONE_INTO_CGROUP lookup come before the
+    // child is attached): its fs context, its namespaces (a new mount
+    // namespace moves that fs context) and the target cgroup (a bad fd
+    // is EBADF)
+    let child_fs = crate::fs::fsstruct::fork_fs(current_tid, config.flags & CLONE_FS != 0);
+    let child_ns = crate::ns::fork_nsproxy(current_tid, config.flags, child_fs.as_deref())?;
+    let into_cgroup = if config.flags & CLONE_INTO_CGROUP != 0 {
+        Some(crate::task::cgroup_from_fd(current_tid, config.cgroup_fd)?)
+    } else {
+        None
+    };
+    // Admitted into the target cgroup now (Linux cgroup_can_fork: the
+    // pids limit is charged here, EAGAIN past it); an error below gives
+    // the charge back when `fork_cg` drops
+    let fork_cg = crate::cgroup::can_fork(into_cgroup).map_err(|e| e.errno())?;
 
     // The child's pid, numbered in each level of the parent's pid
     // namespace (Linux alloc_pid); a new process's pid is its tid
@@ -2206,37 +2212,24 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         }
     }
 
-    // Handle filesystem context (CLONE_FS)
-    // If CLONE_FS is set, child shares parent's FsStruct (cwd changes affect both)
-    // Otherwise, child gets an independent copy
-    crate::fs::clone_task_fs(current_tid, child_tid, config.flags & CLONE_FS != 0);
+    // Its fs context (CLONE_FS: the parent's, cwd changes affect both;
+    // else a copy)
+    if let Some(fs) = child_fs {
+        crate::fs::fsstruct::install_fork_fs(child_tid, fs, config.flags & CLONE_FS != 0);
+    }
 
     // Handle FD table (CLONE_FILES)
     // If CLONE_FILES is set, child shares parent's FD table
     // Otherwise, child gets an independent deep copy
     crate::task::fdtable::clone_task_fd(current_tid, child_tid, config.flags & CLONE_FILES != 0);
 
-    // Handle namespace context (CLONE_NEW* flags)
-    // This must come after filesystem context since mount namespace affects VFS
-    crate::ns::copy_namespaces(current_tid, child_tid, config.flags)?;
+    // Its namespaces (CLONE_NEW* flags), built above
+    crate::ns::init_task_ns(child_tid, child_ns);
 
-    // Handle cgroup membership
-    // If CLONE_INTO_CGROUP is set, look up cgroup from fd and use that
-    // Otherwise, inherit from parent
-    if config.flags & CLONE_INTO_CGROUP != 0 && config.cgroup_fd >= 0 {
-        // Look up cgroup from file descriptor
-        match crate::task::cgroup_from_fd(current_tid, config.cgroup_fd) {
-            Some(cgroup) => {
-                crate::cgroup::attach_task(child_tid, &cgroup);
-            }
-            None => {
-                // Invalid cgroup fd
-                return Err(9); // EBADF
-            }
-        }
-    } else if let Some(ref cgroup) = parent_cgroup {
-        // Inherit cgroup membership from parent
-        crate::cgroup::attach_task(child_tid, cgroup);
+    // Its cgroup: the CLONE_INTO_CGROUP target, else the parent's,
+    // charged above (Linux cgroup_post_fork)
+    if let Some(fc) = fork_cg {
+        fc.post_fork(child_tid);
     }
 
     // Handle signal handlers (CLONE_SIGHAND, CLONE_CLEAR_SIGHAND)

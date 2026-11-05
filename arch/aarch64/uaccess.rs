@@ -104,6 +104,12 @@ impl UaccessArch for Aarch64Uaccess {
         unsafe { hk_copy_user(dst, src, len) }
     }
 
+    /// LL/SC on the user word (Linux futex_atomic_cmpxchg_inatomic)
+    #[inline(always)]
+    unsafe fn cmpxchg_user_raw(uaddr: *mut u32, old: u32, new: u32, cur: *mut u32) -> i32 {
+        unsafe { hk_cmpxchg_user(uaddr, old, new, cur) }
+    }
+
     /// End user access (re-enable PAN if available)
     ///
     /// This restores protection against accidental user memory access.
@@ -164,21 +170,72 @@ core::arch::global_asm!(
     ".popsection",
 );
 
+// User compare-and-exchange (Linux futex_atomic_cmpxchg_inatomic):
+// x0=uaddr, w1=old, w2=new, x3=where the value found goes. ldxr, then
+// stlxr only if the value is `old`; a failed exclusive store retries,
+// 128 times (FUTEX_MAX_LOOPS), then -EAGAIN; a stored value is followed
+// by dmb ish. An unresolvable fault on either access resumes at the
+// fixup (-EFAULT). Only the loop is in the table's range; the store
+// through x3 (kernel memory) is after it.
+core::arch::global_asm!(
+    ".pushsection .text.hk_cmpxchg_user, \"ax\"",
+    ".global hk_cmpxchg_user",
+    "hk_cmpxchg_user:",
+    "    mov w5, #128",
+    ".global hk_cmpxchg_user_start",
+    "hk_cmpxchg_user_start:",
+    "1:  ldxr w4, [x0]",
+    "    sub w6, w4, w1",
+    "    cbnz w6, 4f",
+    "    stlxr w6, w2, [x0]",
+    "    cbz w6, 3f",
+    "    sub w5, w5, w6",
+    "    cbnz w5, 1b",
+    "    mov w0, #-11",
+    "    ret",
+    "3:  dmb ish",
+    "4:",
+    ".global hk_cmpxchg_user_end",
+    "hk_cmpxchg_user_end:",
+    "    str w4, [x3]",
+    "    mov w0, #0",
+    "    ret",
+    ".global hk_cmpxchg_user_fixup",
+    "hk_cmpxchg_user_fixup:",
+    "    mov w0, #-14",
+    "    ret",
+    ".popsection",
+);
+
 unsafe extern "C" {
     fn hk_copy_user(dst: *mut u8, src: *const u8, len: usize) -> usize;
     static hk_copy_user_start: u8;
     static hk_copy_user_end: u8;
     static hk_copy_user_fixup: u8;
+    fn hk_cmpxchg_user(uaddr: *mut u32, old: u32, new: u32, cur: *mut u32) -> i32;
+    static hk_cmpxchg_user_start: u8;
+    static hk_cmpxchg_user_end: u8;
+    static hk_cmpxchg_user_fixup: u8;
 }
 
-/// Exception-table lookup: if a kernel-mode fault at `pc` is inside the
-/// user-copy routine, return the address to resume at (Linux: fixup_exception)
+/// Exception-table lookup (Linux fixup_exception over __ex_table): if a
+/// kernel-mode fault at `pc` is inside a user-access routine's accesses,
+/// the address to resume at
 pub fn uaccess_fixup(pc: u64) -> Option<u64> {
-    let start = &raw const hk_copy_user_start as u64;
-    let end = &raw const hk_copy_user_end as u64;
-    if (start..end).contains(&pc) {
-        Some(&raw const hk_copy_user_fixup as u64)
-    } else {
-        None
-    }
+    let table = [
+        (
+            &raw const hk_copy_user_start,
+            &raw const hk_copy_user_end,
+            &raw const hk_copy_user_fixup,
+        ),
+        (
+            &raw const hk_cmpxchg_user_start,
+            &raw const hk_cmpxchg_user_end,
+            &raw const hk_cmpxchg_user_fixup,
+        ),
+    ];
+    table
+        .into_iter()
+        .find(|&(lo, hi, _)| (lo as u64..hi as u64).contains(&pc))
+        .map(|(_, _, fix)| fix as u64)
 }

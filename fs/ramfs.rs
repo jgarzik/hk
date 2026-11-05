@@ -531,6 +531,39 @@ impl InodeOps for RamfsInodeOps {
         Ok(())
     }
 
+    /// As Linux shmem_fallocate (hk's ramfs stands in for tmpfs, the
+    /// Linux rootfs): allocate, KEEP_SIZE and PUNCH_HOLE only; the cache
+    /// is the only copy, so a hole reads back as zeroes. On success the
+    /// file counts as modified (Linux file_modified).
+    fn fallocate(
+        &self,
+        inode: &Arc<Inode>,
+        mode: i32,
+        offset: u64,
+        len: u64,
+    ) -> Result<(), KernelError> {
+        use super::misc::falloc_mode::{FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE};
+        if mode & !(FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE) != 0 {
+            return Err(KernelError::OperationNotSupported);
+        }
+        let end = offset + len;
+        if mode & FALLOC_FL_PUNCH_HOLE != 0 {
+            // Nothing is cached past i_size: only the part of the hole
+            // below it (a hole wholly past EOF changes nothing)
+            filemap::punch_range(inode, offset, end.min(inode.get_size()));
+        } else {
+            inode.newsize_ok(end)?;
+            if mode & FALLOC_FL_KEEP_SIZE == 0 && end > inode.get_size() {
+                inode.set_size(end);
+            }
+        }
+        super::dac::remove_privs(inode);
+        let now = current_time();
+        inode.set_mtime(now);
+        inode.set_ctime(now);
+        Ok(())
+    }
+
     fn unlink(&self, dir: &Inode, name: &[u8]) -> Result<(), KernelError> {
         let private = dir.get_private().ok_or(KernelError::Io)?;
         let dir_data = private

@@ -115,7 +115,8 @@ impl GroupCputimer {
     }
 
     /// Start keeping totals from the group's CPU time `now` (Linux
-    /// thread_group_start_cputime)
+    /// thread_group_start_cputime); under the group's `posix_timers`,
+    /// as every start and stop, so the load-then-stores cannot race
     fn start(&self, now: (u64, u64)) {
         if !self.active.load(Ordering::Acquire) {
             self.sums[0].store(now.0, Ordering::Relaxed);
@@ -156,15 +157,16 @@ fn my_group() -> Option<Arc<crate::signal::SignalStruct>> {
     crate::task::percpu::current().cpu_group().cloned()
 }
 
-/// Group `pid`'s current CPU time, starting its totals if they are not
-/// kept yet; the totals after (thread context)
+/// Group `pid`'s current CPU time: its kept totals, else the sum over
+/// its threads (Linux cpu_clock_sample_group with start=false; thread
+/// context). Never starts the totals: only arming a process timer does
+/// (`arm_group`, under `posix_timers`), so timer_gettime, settime's old
+/// value and clock_nanosleep's remainder leave the group's accounting
+/// as they found it.
 pub fn group_sample(sig: &crate::signal::SignalStruct, pid: crate::task::Pid) -> (u64, u64) {
-    if let Some(t) = sig.cputimer.totals() {
-        return t;
-    }
-    let now = crate::task::percpu::get_process_times(pid);
-    sig.cputimer.start(now);
-    sig.cputimer.totals().unwrap_or(now)
+    sig.cputimer
+        .totals()
+        .unwrap_or_else(|| crate::task::percpu::get_process_times(pid))
 }
 
 /// Thread `tid`'s (utime, stime) now, if it is alive

@@ -271,7 +271,7 @@ pub fn write_acct_record(tid: Tid, pid: Pid, exit_status: i32) {
 /// Write the record of process `pid` (thread `tid`) to `file`
 fn write_record(file: &File, tid: Tid, pid: Pid, exit_status: i32) {
     // Get task information
-    let task_info = match get_task_info(tid, pid) {
+    let task_info = match get_task_info(tid) {
         Some(info) => info,
         None => return, // Task not found
     };
@@ -279,13 +279,12 @@ fn write_record(file: &File, tid: Tid, pid: Pid, exit_status: i32) {
     // Compute flags
     let mut ac_flag: u8 = 0;
 
-    // Check if forked but didn't exec
-    if task_info.did_fork && !task_info.did_exec {
+    // Linux acct_collect: forked and not exec'd (PF_FORKNOEXEC), used a
+    // capability (PF_SUPERPRIV)
+    if task_info.forknoexec {
         ac_flag |= AFORK;
     }
-
-    // Check if used superuser privileges
-    if task_info.uid == 0 || task_info.euid == 0 {
+    if task_info.superpriv {
         ac_flag |= ASU;
     }
 
@@ -340,7 +339,6 @@ fn write_record(file: &File, tid: Tid, pid: Pid, exit_status: i32) {
 /// Task information gathered for accounting
 struct TaskInfo {
     uid: u32,
-    euid: u32,
     gid: u32,
     ppid: Pid,
     tty: u16,
@@ -351,12 +349,14 @@ struct TaskInfo {
     minflt: u64,
     majflt: u64,
     comm: [u8; 16],
-    did_fork: bool,
-    did_exec: bool,
+    /// Forked and not exec'd (PF_FORKNOEXEC)
+    forknoexec: bool,
+    /// Used a capability (PF_SUPERPRIV)
+    superpriv: bool,
 }
 
 /// Get task information for accounting
-fn get_task_info(tid: Tid, pid: Pid) -> Option<TaskInfo> {
+fn get_task_info(tid: Tid) -> Option<TaskInfo> {
     use crate::task::percpu::TASKLIST;
 
     let table = TASKLIST.read();
@@ -367,7 +367,7 @@ fn get_task_info(tid: Tid, pid: Pid) -> Option<TaskInfo> {
 
     // Get credentials - Arc<Cred> can be dereferenced directly
     let cred = &task.cred();
-    let (uid, euid, gid) = (cred.uid, cred.euid, cred.gid);
+    let (uid, gid) = (cred.uid, cred.gid);
 
     // Calculate elapsed time using task.start_time (monotonic ns since boot)
     let now_ns = crate::time::monotonic_ns();
@@ -390,7 +390,6 @@ fn get_task_info(tid: Tid, pid: Pid) -> Option<TaskInfo> {
 
     Some(TaskInfo {
         uid,
-        euid,
         gid,
         ppid: task.task.ppid(),
         tty: 0, // TODO: Get controlling terminal
@@ -407,8 +406,8 @@ fn get_task_info(tid: Tid, pid: Pid) -> Option<TaskInfo> {
             .maj_flt
             .load(core::sync::atomic::Ordering::Relaxed),
         comm,
-        did_fork: pid != tid as Pid, // Simple heuristic: different PID/TID means forked
-        did_exec: comm[0] != 0,      // Has a name means exec'd
+        forknoexec: task.task.has_flag(crate::task::pf::FORKNOEXEC),
+        superpriv: task.task.has_flag(crate::task::pf::SUPERPRIV),
     })
 }
 

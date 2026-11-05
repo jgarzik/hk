@@ -932,6 +932,20 @@ fn ooo_intervals_merge() {
 }
 
 #[test]
+fn ooo_prune_from_the_top() {
+    use super::cb::Ooo;
+    let mut o = Ooo::default();
+    o.insert(100, 110, &[1; 10]);
+    o.insert(100, 130, &[3; 10]);
+    // Only pieces beyond the incoming segment go, highest first
+    assert!(o.prune_after(120));
+    assert_eq!(o.bytes(), 10);
+    assert!(!o.prune_after(120));
+    assert!(o.prune_after(100));
+    assert!(o.is_empty() && !o.prune_after(100));
+}
+
+#[test]
 fn rcv_nxt_only_over_accepted_bytes() {
     let mut p = Pair::with_cap(60_000, 10_000);
     // b offers 10000; a 30000-byte flood is cut at the window edge

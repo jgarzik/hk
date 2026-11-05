@@ -24,6 +24,7 @@ pub fn run_tests() {
     super::helpers::println(b"=== TCP Connection Tests ===");
     test_backlog();
     test_half_close();
+    test_connect_race();
     test_rst_unread();
     test_linger0();
     test_time_wait_bind();
@@ -325,5 +326,64 @@ fn test_connect_timeout() {
         write_file(SYN_RETRIES, &old[..n as usize]);
     }
     t.eq(b"connect failed in time", st as i64, 0);
+    t.done();
+}
+
+/// Two processes connect one non-blocking socket at once (Linux
+/// __inet_stream_connect under lock_sock): one starts the handshake
+/// (EINPROGRESS); the other sees it under way (EALREADY) or done (0,
+/// EISCONN), never a second start
+fn test_connect_race() {
+    use core::sync::atomic::{AtomicI32, Ordering};
+    const EALREADY: i64 = -114;
+    const EISCONN: i64 = -106;
+    let mut t = T::new(b"TCP_CONNECT_RACE");
+    let (l, p) = listener(64);
+    set_timeo(l, 2_000);
+    let m = hk_syscall::sys_mmap(
+        0,
+        4096,
+        hk_syscall::PROT_READ | hk_syscall::PROT_WRITE,
+        hk_syscall::MAP_SHARED | hk_syscall::MAP_ANONYMOUS,
+        -1,
+        0,
+    );
+    // SAFETY: a fresh MAP_SHARED page of 3 i32s: a go flag and the two
+    // results; unmapped below
+    let sh = unsafe { core::slice::from_raw_parts(m as *const AtomicI32, 3) };
+    for round in 1..=100 {
+        let fd = nb_tcp();
+        sh[0].store(0, Ordering::Relaxed);
+        let pid = sys_fork();
+        if pid == 0 {
+            while sh[0].load(Ordering::Acquire) != round {
+                hk_syscall::sys_sched_yield();
+            }
+            sh[2].store(connect(fd, LO, p) as i32, Ordering::Release);
+            sys_exit(0);
+        }
+        sh[0].store(round, Ordering::Release);
+        let mine = connect(fd, LO, p);
+        wait_child(pid);
+        let theirs = sh[2].load(Ordering::Acquire) as i64;
+        let starts = [mine, theirs].iter().filter(|&&r| r == EINPROGRESS).count();
+        let known = |r: i64| [EINPROGRESS, EALREADY, EISCONN, 0].contains(&r);
+        if starts > 1
+            || !known(mine)
+            || !known(theirs)
+            || (mine != EINPROGRESS && theirs != EINPROGRESS)
+        {
+            t.ok(b"results", false, mine * 1000 + theirs);
+            close(fd);
+            break;
+        }
+        let s = accept(l);
+        if s >= 0 {
+            close(s);
+        }
+        close(fd);
+    }
+    hk_syscall::sys_munmap(m as u64, 4096);
+    close(l);
     t.done();
 }

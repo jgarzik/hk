@@ -8,6 +8,9 @@
 //!   writes one acct_v3 record, not one per thread (Linux acct_process
 //!   runs for the group's last thread); switching accounting off writes
 //!   the caller's record (Linux acct_pin_kill)
+//! - ACCT_ASU: ASU marks a process that used a capability (Linux
+//!   PF_SUPERPRIV), not one that ran as root; AFORK one that forked and
+//!   never exec'd (PF_FORKNOEXEC)
 
 use super::fork_mm::spawn_thread;
 use super::helpers::{print, print_num, println};
@@ -22,6 +25,7 @@ pub fn run_tests() {
     test_acct_disable();
     test_acct_invalid_path();
     test_acct_group_once();
+    test_acct_asu();
 }
 
 const THREADS: usize = 7;
@@ -126,4 +130,71 @@ fn test_acct_invalid_path() {
     }
 
     println(b"ACCT_INVALID_PATH:OK");
+}
+
+const AFORK: u8 = 0x01;
+const ASU: u8 = 0x02;
+
+/// Two root children, one that uses a capability (setuid(0):
+/// CAP_SETUID) and one that does not: only the first is ASU, both AFORK
+fn test_acct_asu() {
+    let path = b"/tmp/acct_asu\0";
+    let fd = sys_open(path.as_ptr(), O_CREAT | O_WRONLY | O_TRUNC, 0o600);
+    sys_close(fd as u64);
+    if sys_acct(path.as_ptr()) != 0 {
+        println(b"ACCT_ASU:FAIL acct on");
+        return;
+    }
+    let plain = sys_fork();
+    if plain == 0 {
+        sys_exit_group(0);
+    }
+    let mut st = 0i32;
+    sys_wait4(plain, &mut st, 0, 0);
+    let privileged = sys_fork();
+    if privileged == 0 {
+        hk_syscall::sys_setuid(0);
+        sys_exit_group(0);
+    }
+    sys_wait4(privileged, &mut st, 0, 0);
+    // Root, but nothing it does needs a capability: ids set to what they
+    // are, a limit lowered (Linux asks only when a change needs it)
+    let unneeded = sys_fork();
+    if unneeded == 0 {
+        hk_syscall::sys_setresuid(0, 0, 0);
+        hk_syscall::sys_setreuid(0, u32::MAX);
+        let low = hk_syscall::RLimit {
+            rlim_cur: 64,
+            rlim_max: 64,
+        };
+        hk_syscall::sys_setrlimit(7, &low); // RLIMIT_NOFILE
+        sys_exit_group(0);
+    }
+    sys_wait4(unneeded, &mut st, 0, 0);
+    sys_acct(ptr::null());
+    let mut buf = [0u8; 512];
+    let fd = sys_open(path.as_ptr(), O_RDONLY, 0);
+    let n = sys_read(fd as u64, buf.as_mut_ptr(), buf.len() as u64).max(0) as usize;
+    sys_close(fd as u64);
+    sys_unlink(path.as_ptr());
+    let pid_of = |r: &[u8]| u32::from_ne_bytes([r[16], r[17], r[18], r[19]]) as i64;
+    let flag_of = |pid| {
+        buf[..n - n % 64]
+            .chunks(64)
+            .find(|r| pid_of(r) == pid)
+            .map_or(0xff, |r| r[0])
+    };
+    let (p, q, u) = (flag_of(plain), flag_of(privileged), flag_of(unneeded));
+    if p & (AFORK | ASU) == AFORK && q & (AFORK | ASU) == AFORK | ASU && u & (AFORK | ASU) == AFORK
+    {
+        println(b"ACCT_ASU:OK");
+    } else {
+        print(b"ACCT_ASU:FAIL plain ");
+        print_num(p as i64);
+        print(b" privileged ");
+        print_num(q as i64);
+        print(b" unneeded ");
+        print_num(u as i64);
+        println(b"");
+    }
 }

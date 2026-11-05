@@ -98,6 +98,7 @@ pub fn start_threads() {
 
 /// Initialize the network subsystem
 pub fn init() {
+    tcp::mem::init();
     // Protocol handlers by EtherType (IPv6 will add 0x86DD here)
     dev::dev_add_pack(EtherType::Ipv4.to_be(), ipv4::ip_rcv);
     dev::dev_add_pack(EtherType::Arp.to_be(), arp::arp_rcv);

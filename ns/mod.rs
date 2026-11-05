@@ -333,39 +333,40 @@ pub fn exit_task_ns(tid: Tid) {
     drop(ns);
 }
 
-/// Clone nsproxy for fork/clone
-///
-/// If any CLONE_NEW* flags are set, creates a new NsProxy with
-/// new namespace(s). Otherwise, shares the parent's NsProxy.
-///
-/// # Arguments
-/// * `parent_tid` - Parent task's TID
-/// * `child_tid` - Child task's TID
-/// * `flags` - Clone flags
-///
-/// # Returns
-/// * `Ok(())` - Success
-/// * `Err(errno)` - On allocation failure
-pub fn copy_namespaces(parent_tid: Tid, child_tid: Tid, flags: u64) -> Result<(), i32> {
+/// New namespaces other than a user namespace need CAP_SYS_ADMIN (Linux
+/// copy_namespaces, unshare_nsproxy_namespaces); a user namespace alone
+/// needs none. Linux checks in the new user namespace when CLONE_NEWUSER
+/// comes with them, where the caller holds every capability; hk's user
+/// namespaces grant none (BUGS.md), so it checks the caller's own.
+fn may_create_namespaces(ns_flags: u64) -> bool {
+    ns_flags & !CLONE_NEWUSER == 0 || crate::task::capable(crate::task::CAP_SYS_ADMIN)
+}
+
+/// The namespaces a child of `parent_tid` gets (Linux copy_namespaces):
+/// new ones for the CLONE_NEW* flags, else the parent's. `child_fs` is
+/// the child's fs context, moved to the copies of its root's and cwd's
+/// mounts in a new mount namespace. Built before the child is visible,
+/// so a failure leaves nothing behind.
+pub fn fork_nsproxy(
+    parent_tid: Tid,
+    flags: u64,
+    child_fs: Option<&crate::fs::FsStruct>,
+) -> Result<Arc<NsProxy>, i32> {
     let ns_flags = flags & CLONE_NS_FLAGS;
-
-    let child_ns = if ns_flags != 0 {
-        // Some namespace flags set - copy with potential new namespaces
-        let parent_ns = get_task_ns(parent_tid).unwrap_or_else(|| INIT_NSPROXY.clone());
-        // CLONE_NEWNS with a shared fs struct is EINVAL (Linux
-        // copy_process); the child's own copy follows its new mounts
-        if ns_flags & CLONE_NEWNS != 0 && flags & crate::task::clone_flags::CLONE_FS != 0 {
-            return Err(22);
-        }
-        let fs = crate::fs::get_task_fs(child_tid);
-        parent_ns.copy(ns_flags, fs.as_deref())?
-    } else {
-        // No namespace flags - share parent's nsproxy
-        get_task_ns(parent_tid).unwrap_or_else(|| INIT_NSPROXY.clone())
-    };
-
-    init_task_ns(child_tid, child_ns);
-    Ok(())
+    // CLONE_NEWNS with a shared fs struct is EINVAL, before any
+    // permission check (Linux copy_process); the child's own copy
+    // follows its new mounts
+    if ns_flags & CLONE_NEWNS != 0 && flags & crate::task::clone_flags::CLONE_FS != 0 {
+        return Err(22);
+    }
+    if !may_create_namespaces(ns_flags) {
+        return Err(EPERM as i32);
+    }
+    let parent_ns = get_task_ns(parent_tid).unwrap_or_else(|| INIT_NSPROXY.clone());
+    if ns_flags == 0 {
+        return Ok(parent_ns);
+    }
+    parent_ns.copy(ns_flags, child_fs)
 }
 
 // ============================================================================
@@ -473,10 +474,7 @@ pub fn sys_unshare(unshare_flags: u64) -> i64 {
         return -EINVAL;
     }
 
-    // Permission check: CAP_SYS_ADMIN required for namespace creation
-    // In our current model, only euid==0 has this capability
-    let cred = crate::task::percpu::current_cred();
-    if cred.euid != 0 {
+    if !may_create_namespaces(ns_flags) {
         return -EPERM;
     }
 
@@ -594,9 +592,11 @@ pub fn sys_setns(fd: i32, nstype: i32) -> i64 {
         None => return -ESRCH,
     };
 
-    // Permission check: require root for now
-    let cred = crate::task::percpu::current_cred();
-    if cred.euid != 0 {
+    // Linux ->install: CAP_SYS_ADMIN, and CAP_SYS_CHROOT for a mount
+    // namespace (mntns_install)
+    let chroot_ok =
+        !matches!(ns_type, NamespaceType::Mnt) || crate::task::capable(crate::task::CAP_SYS_CHROOT);
+    if !crate::task::capable(crate::task::CAP_SYS_ADMIN) || !chroot_ok {
         return -EPERM;
     }
 

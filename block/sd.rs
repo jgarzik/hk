@@ -426,6 +426,7 @@ pub fn create_scsi_disk(
         name.clone(),
         scsi_disk.capacity_bytes() >> SECTOR_SHIFT,
         q,
+        false,
     );
     let bdev = add_disk(disk, None)?;
     crate::printkln!(

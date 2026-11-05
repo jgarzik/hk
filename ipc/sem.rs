@@ -6,15 +6,16 @@
 //! - Blocking with optional timeout
 //! - Automatic undo on process exit (SEM_UNDO)
 
-use alloc::collections::VecDeque;
+use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, Ordering};
+use core::cell::UnsafeCell;
+use core::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 
 use crate::arch::Uaccess;
 use crate::ipc::util::{
-    IPC_PERM_READ, IPC_PERM_WRITE, IpcObject, KernIpcPerm, ipc_checkperm, ipcget,
+    IPC_PERM_READ, IPC_PERM_WRITE, IpcObject, IpcOps, KernIpcPerm, ipc_checkperm, ipcget,
 };
 use crate::ipc::{
     IPC_64, IPC_NOWAIT, IPC_RMID, IPC_SET, IPC_STAT, IpcNamespace, Sembuf, Semid64Ds,
@@ -54,170 +55,427 @@ pub const SEM_INFO: i32 = 19;
 pub const SEMVMX: i32 = 32767;
 
 // ============================================================================
-// Semaphore Structures
+// Semaphore Structures and locking (Linux ipc/sem.c sem_lock)
 // ============================================================================
+//
+// Two lock levels, as Linux:
+// - each semaphore's `SemSlot.lock` (Linux sem->lock) covers its value,
+//   sempid, otime, its single-operation waiters and its SEM_UNDO
+//   adjustments: a semop of one operation takes only that lock, so
+//   different semaphores of one array do not contend;
+// - `SemArray.global` (Linux sem_perm.lock) covers the multi-operation
+//   waiters, `complex_count` and ctime, and in complex mode every
+//   semaphore's data.
+// Complex mode (`use_global_lock` != 0, Linux complex_mode with its
+// hysteresis): a multi-operation semop, semctl, exit and removal take
+// the global lock, set the flag and take and drop every semaphore lock,
+// which waits out the single-operation holders; a single operation that
+// then finds the flag set takes the global lock instead. The flag stays
+// set while multi-operation waiters exist and for
+// USE_GLOBAL_LOCK_HYSTERESIS further global holds, then is cleared with
+// release; the fast path rechecks it with acquire after its semaphore
+// lock (Linux SEM_BARRIER_1).
 
-/// Single semaphore within an array
-pub struct Sem {
-    /// Current value
-    pub semval: AtomicI32,
-    /// PID of last modifier
-    pub sempid: AtomicI32,
-}
+/// A queued operation's status while it waits (Linux: the sleeper sets
+/// -EINTR, the waker stores the result with release)
+const SEM_WAITING: i32 = -(KernelError::Interrupted as i32);
 
-impl Sem {
-    fn new() -> Self {
-        Self {
-            semval: AtomicI32::new(0),
-            sempid: AtomicI32::new(0),
-        }
-    }
-}
+/// Global holds before complex mode is left (Linux
+/// USE_GLOBAL_LOCK_HYSTERESIS)
+const USE_GLOBAL_LOCK_HYSTERESIS: u32 = 10;
 
-/// Pending semaphore operation
+/// Pending semaphore operation (Linux struct sem_queue)
 pub struct SemQueue {
-    /// Task waiting for this operation
-    pub tid: u64,
+    /// Thread-group id recorded as sempid when it completes
+    pid: i32,
     /// Operations to perform
-    pub sops: Vec<Sembuf>,
-    /// Result status (-EIDRM, -EINTR, or 0)
-    pub status: AtomicI32,
-    /// Wakeup flag
-    pub woken: AtomicBool,
+    sops: Vec<Sembuf>,
     /// Does this alter semaphore values?
-    pub alter: bool,
+    alter: bool,
+    /// The caller's undo list (SEM_UNDO), whose adjustments it changes
+    undo: Option<u64>,
+    /// `SEM_WAITING` until a waker completes it under the array's locks,
+    /// then 0 or a negative errno (Release; the sleeper reads it Acquire
+    /// without a lock, Linux q->status)
+    status: AtomicI32,
+}
+
+/// A waiting operation and the index of the one it is blocked on
+/// (Linux q->blocking, for GETNCNT/GETZCNT)
+type Waiter = (Arc<SemQueue>, usize);
+
+/// One semaphore's state (Linux struct sem)
+struct PerSem {
+    val: i32,
+    /// Last modifier (sempid)
+    pid: i32,
+    /// Last semop on it (Linux sem_otime; IPC_STAT reports the latest)
+    otime: i64,
+    /// Single-operation waiters on it, oldest first (Linux pending_alter
+    /// and pending_const; alter waiters move to the array's list while
+    /// multi-operation waiters exist, Linux merge_queues)
+    pending: VecDeque<Waiter>,
+    /// Each undo list's adjustment of it, by `SemUndoList.id` (Linux
+    /// un->semadj[i]); a zero adjustment is not kept
+    undo: BTreeMap<u64, i16>,
+}
+
+/// A semaphore and its lock; `data` is reached only through `SemLock`
+struct SemSlot {
+    lock: Mutex<()>,
+    data: UnsafeCell<PerSem>,
+}
+
+// SAFETY: `data` is only accessed through a `SemLock`, which holds this
+// slot's `lock` or the array's global lock in complex mode (see above):
+// one context at a time.
+unsafe impl Sync for SemSlot {}
+
+/// The array-wide state (under `SemArray.global`)
+struct GlobalState {
+    /// Multi-operation waiters, and single-operation alter waiters while
+    /// any exist (Linux sma->pending_alter/pending_const), oldest first
+    pending: VecDeque<Waiter>,
+    /// Multi-operation waiters queued (Linux complex_count)
+    complex_count: usize,
+    /// Last change time
+    ctime: i64,
 }
 
 /// Semaphore array
 pub struct SemArray {
     /// IPC permissions and ID
     pub perm: KernIpcPerm,
-    /// Last semop time
-    pub otime: AtomicI64,
-    /// Last change time
-    pub ctime: AtomicI64,
     /// Number of semaphores
     pub nsems: u32,
     /// The semaphores
-    pub sems: Vec<Sem>,
-    /// Pending operations queue
-    pub pending: Mutex<VecDeque<Arc<SemQueue>>>,
-    /// Wait queue for blocked operations
-    pub waitq: WaitQueue,
+    sems: Vec<SemSlot>,
+    /// Linux sem_perm.lock
+    global: Mutex<GlobalState>,
+    /// Complex mode (Linux use_global_lock): written under `global`,
+    /// read by the single-operation fast path without it
+    use_global_lock: AtomicU32,
+    /// Sleepers in semop; each waits for its own queue entry's status
+    waitq: WaitQueue,
     /// Namespace reference
     ns: Arc<IpcNamespace>,
+}
+
+/// The array locked for an operation: one semaphore (fast path) or the
+/// whole array (complex mode)
+enum SemLock<'a> {
+    One {
+        arr: &'a SemArray,
+        n: usize,
+        _g: crate::sync::spin::MutexGuard<'a, ()>,
+    },
+    All {
+        arr: &'a SemArray,
+        g: crate::sync::spin::MutexGuard<'a, GlobalState>,
+    },
+}
+
+impl SemLock<'_> {
+    /// Semaphore `n`'s state: the one locked, or any in complex mode
+    fn sem(&mut self, n: usize) -> &mut PerSem {
+        let arr = match self {
+            SemLock::One { arr, n: held, .. } => {
+                assert_eq!(n, *held, "semaphore {} not locked", n);
+                *arr
+            }
+            SemLock::All { arr, .. } => *arr,
+        };
+        // SAFETY: `One` holds semaphore n's lock and saw complex mode off
+        // after taking it, so no global holder touches it; `All` holds
+        // the global lock in complex mode, which waited out every
+        // single-semaphore holder and keeps new ones out. `&mut self`
+        // makes the reference unique.
+        unsafe { &mut *arr.sems[n].data.get() }
+    }
+
+    /// The array-wide state (complex mode only)
+    fn global(&mut self) -> Option<&mut GlobalState> {
+        match self {
+            SemLock::All { g, .. } => Some(g),
+            SemLock::One { .. } => None,
+        }
+    }
+}
+
+impl Drop for SemLock<'_> {
+    /// Linux sem_unlock: the global holder moves single-operation alter
+    /// waiters back once no multi-operation one is left (unmerge_queues)
+    /// and counts down complex mode (complexmode_tryleave)
+    fn drop(&mut self) {
+        let SemLock::All { arr, g } = self else {
+            return;
+        };
+        if g.complex_count != 0 {
+            return;
+        }
+        let back: Vec<Waiter> = g.pending.drain(..).collect();
+        for w in back {
+            let n = w.0.sops[0].sem_num as usize;
+            // SAFETY: complex mode, under the global lock (as `sem`)
+            unsafe { &mut *arr.sems[n].data.get() }.pending.push_back(w);
+        }
+        let u = arr.use_global_lock.load(Ordering::Relaxed);
+        if u == 1 {
+            arr.use_global_lock.store(0, Ordering::Release);
+        } else if u > 1 {
+            arr.use_global_lock.store(u - 1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Apply `sops` in order, all or nothing (Linux
+/// perform_atomic_semop_slow, which also sums repeated operations on one
+/// semaphore): 0 when applied (sempid and otime updated), 1 when an
+/// operation would block (`blocking` is its index), or a negative errno
+/// (EAGAIN for a blocking operation with IPC_NOWAIT, ERANGE above SEMVMX
+/// or past the adjustment range). A SEM_UNDO operation also changes the
+/// `undo` list's adjustment by its negative. Undone on anything but 0.
+fn perform_atomic_semop(
+    l: &mut SemLock,
+    sops: &[Sembuf],
+    pid: i32,
+    undo: Option<u64>,
+    blocking: &mut usize,
+) -> i32 {
+    let adj_of = |s: &PerSem| undo.and_then(|u| s.undo.get(&u).copied()).unwrap_or(0);
+    for (n, sop) in sops.iter().enumerate() {
+        let s = l.sem(sop.sem_num as usize);
+        let cur = s.val;
+        let result = cur + sop.sem_op as i32;
+        let r = if (sop.sem_op == 0 && cur != 0) || result < 0 {
+            *blocking = n;
+            if sop.sem_flg & IPC_NOWAIT as i16 != 0 {
+                KernelError::WouldBlock.to_errno_neg()
+            } else {
+                1
+            }
+        } else if result > SEMVMX {
+            KernelError::Range.to_errno_neg()
+        } else if let (true, Some(u)) = (sop.sem_flg & SEM_UNDO != 0, undo) {
+            // The adjustment must stay in -SEMAEM-1..=SEMAEM
+            match i16::try_from(adj_of(s) as i32 - sop.sem_op as i32) {
+                Ok(v) => {
+                    set_adj(s, u, v);
+                    s.val = result;
+                    continue;
+                }
+                Err(_) => KernelError::Range.to_errno_neg(),
+            }
+        } else {
+            s.val = result;
+            continue;
+        };
+        for done in sops[..n].iter().rev() {
+            let s = l.sem(done.sem_num as usize);
+            s.val -= done.sem_op as i32;
+            if let (true, Some(u)) = (done.sem_flg & SEM_UNDO != 0, undo) {
+                let v = adj_of(s) + done.sem_op;
+                set_adj(s, u, v);
+            }
+        }
+        return r;
+    }
+    let now = current_time_secs();
+    for sop in sops {
+        let s = l.sem(sop.sem_num as usize);
+        s.pid = pid;
+        s.otime = now;
+    }
+    0
+}
+
+fn set_adj(s: &mut PerSem, undo: u64, v: i16) {
+    if v == 0 {
+        s.undo.remove(&undo);
+    } else {
+        s.undo.insert(undo, v);
+    }
+}
+
+/// Retry the waiters in `q`, oldest first (Linux update_queue): each
+/// completed one is unlinked and its status set; one that changed values
+/// restarts the scan. Returns whether any was completed and whether one
+/// changed values; `done` collects the semaphores the completed alter
+/// operations changed.
+fn retry(l: &mut SemLock, q: &mut VecDeque<Waiter>, done: &mut Vec<usize>) -> (bool, bool) {
+    let (mut woke, mut altered) = (false, false);
+    let mut i = 0;
+    while i < q.len() {
+        let w = q[i].0.clone();
+        let mut blocking = 0;
+        let r = perform_atomic_semop(l, &w.sops, w.pid, w.undo, &mut blocking);
+        if r == 1 {
+            q[i].1 = blocking;
+            i += 1;
+            continue;
+        }
+        q.remove(i);
+        if w.sops.len() > 1
+            && let Some(g) = l.global()
+        {
+            g.complex_count -= 1;
+        }
+        w.status.store(r, Ordering::Release);
+        woke = true;
+        if r == 0 && w.alter {
+            altered = true;
+            done.extend(w.sops.iter().map(|s| s.sem_num as usize));
+            i = 0;
+        }
+    }
+    (woke, altered)
+}
+
+/// After a change: complete what can proceed now (Linux
+/// do_smart_update). Under one semaphore's lock only its waiters exist
+/// to try; in complex mode the array's waiters and those of every
+/// semaphore that changed, until nothing more completes. True if a
+/// sleeper must be woken after the unlock.
+fn update_queue(l: &mut SemLock, changed: impl IntoIterator<Item = usize>) -> bool {
+    let mut woke = false;
+    let mut dirty: Vec<usize> = changed.into_iter().collect();
+    loop {
+        let mut again = false;
+        // The array's waiters first; what they change joins `dirty`
+        if let Some(g) = l.global() {
+            let mut q = core::mem::take(&mut g.pending);
+            let (w, _) = retry(l, &mut q, &mut dirty);
+            let g = l.global().expect("complex mode");
+            q.append(&mut g.pending);
+            g.pending = q;
+            woke |= w;
+        }
+        while let Some(n) = dirty.pop() {
+            let mut q = core::mem::take(&mut l.sem(n).pending);
+            let mut more = Vec::new();
+            let (w, a) = retry(l, &mut q, &mut more);
+            let s = l.sem(n);
+            q.append(&mut s.pending);
+            s.pending = q;
+            woke |= w;
+            // A value changed: the array's waiters may proceed now
+            again |= a && l.global().is_some();
+            dirty.extend(more.into_iter().filter(|&m| m != n));
+        }
+        if !again {
+            break;
+        }
+    }
+    woke
 }
 
 impl SemArray {
     /// Create a new semaphore array
     pub fn new(key: i32, nsems: u32, mode: u16, ns: Arc<IpcNamespace>) -> Result<Arc<Self>, i32> {
-        let mut sems = Vec::with_capacity(nsems as usize);
-        for _ in 0..nsems {
-            sems.push(Sem::new());
-        }
-
-        let now = current_time_secs();
-
+        let sems = (0..nsems)
+            .map(|_| SemSlot {
+                lock: Mutex::new(()),
+                data: UnsafeCell::new(PerSem {
+                    val: 0,
+                    pid: 0,
+                    otime: 0,
+                    pending: VecDeque::new(),
+                    undo: BTreeMap::new(),
+                }),
+            })
+            .collect();
         Ok(Arc::new(Self {
             perm: KernIpcPerm::new(key, mode),
-            otime: AtomicI64::new(0),
-            ctime: AtomicI64::new(now),
             nsems,
             sems,
-            pending: Mutex::new(VecDeque::new()),
+            global: Mutex::new(GlobalState {
+                pending: VecDeque::new(),
+                complex_count: 0,
+                ctime: current_time_secs(),
+            }),
+            use_global_lock: AtomicU32::new(0),
             waitq: WaitQueue::new(),
             ns,
         }))
     }
 
-    /// Try to perform operations atomically
-    ///
-    /// Returns Ok(true) if all ops succeeded, Ok(false) if would block, Err on error
-    fn try_atomic_ops(&self, sops: &[Sembuf]) -> Result<bool, i32> {
-        // First pass: check if all operations can succeed
-        for sop in sops {
-            let sem_num = sop.sem_num as usize;
-            if sem_num >= self.nsems as usize {
-                return Err(KernelError::FileTooLarge.errno());
+    /// The whole array, in complex mode (Linux sem_lock for nsops != 1
+    /// and semctl: complexmode_enter)
+    fn lock_all(&self) -> SemLock<'_> {
+        let g = self.global.lock();
+        if self.use_global_lock.load(Ordering::Relaxed) == 0 {
+            self.use_global_lock
+                .store(USE_GLOBAL_LOCK_HYSTERESIS, Ordering::SeqCst);
+            // Wait out every single-semaphore holder
+            for s in &self.sems {
+                drop(s.lock.lock());
             }
-
-            let semval = self.sems[sem_num].semval.load(Ordering::Acquire);
-            let result = semval + sop.sem_op as i32;
-
-            if sop.sem_op < 0 {
-                // Decrement: must have enough
-                if result < 0 {
-                    return Ok(false); // Would block
-                }
-            } else if sop.sem_op == 0 {
-                // Wait for zero
-                if semval != 0 {
-                    return Ok(false); // Would block
-                }
-            }
-            // Increment always succeeds (unless overflow)
-            if result > SEMVMX {
-                return Err(KernelError::Range.errno());
-            }
+        } else {
+            self.use_global_lock
+                .store(USE_GLOBAL_LOCK_HYSTERESIS, Ordering::Relaxed);
         }
-
-        // Second pass: apply all operations
-        let pid = current_pid() as i32;
-        for sop in sops {
-            let sem_num = sop.sem_num as usize;
-            let sem = &self.sems[sem_num];
-
-            if sop.sem_op != 0 {
-                sem.semval.fetch_add(sop.sem_op as i32, Ordering::AcqRel);
-            }
-            sem.sempid.store(pid, Ordering::Release);
-        }
-
-        self.otime.store(current_time_secs(), Ordering::Release);
-        Ok(true)
+        SemLock::All { arr: self, g }
     }
 
-    /// Wake up any pending operations that can now proceed
-    fn wake_pending(&self) {
-        let mut pending = self.pending.lock();
-        let mut i = 0;
-
-        while i < pending.len() {
-            let queue = &pending[i];
-            if queue.woken.load(Ordering::Acquire) {
-                i += 1;
-                continue;
+    /// The locks `sops` need (Linux sem_lock): a single operation takes
+    /// only its semaphore's lock unless complex mode is on
+    fn lock_for(&self, sops: &[Sembuf]) -> SemLock<'_> {
+        if sops.len() != 1 {
+            return self.lock_all();
+        }
+        let n = sops[0].sem_num as usize;
+        if self.use_global_lock.load(Ordering::Acquire) == 0 {
+            let g = self.sems[n].lock.lock();
+            // Pairs with the release that leaves complex mode
+            if self.use_global_lock.load(Ordering::Acquire) == 0 {
+                return SemLock::One {
+                    arr: self,
+                    n,
+                    _g: g,
+                };
             }
+        }
+        let gl = self.global.lock();
+        if self.use_global_lock.load(Ordering::Relaxed) == 0 {
+            // Left complex mode meanwhile: down to the semaphore's lock
+            let g = self.sems[n].lock.lock();
+            drop(gl);
+            return SemLock::One {
+                arr: self,
+                n,
+                _g: g,
+            };
+        }
+        SemLock::All { arr: self, g: gl }
+    }
 
-            // Try the operation
-            match self.try_atomic_ops(&queue.sops) {
-                Ok(true) => {
-                    // Success - wake the task
-                    queue.status.store(0, Ordering::Release);
-                    queue.woken.store(true, Ordering::Release);
-                    self.waitq.wake_all();
-                    pending.remove(i);
-                }
-                Ok(false) => {
-                    // Still blocked
-                    i += 1;
-                }
-                Err(e) => {
-                    // Error - wake with error
-                    queue.status.store(-e, Ordering::Release);
-                    queue.woken.store(true, Ordering::Release);
-                    self.waitq.wake_all();
-                    pending.remove(i);
-                }
-            }
+    /// `lock_all`, or EIDRM once removed (Linux ipc_valid_object)
+    fn lock_valid(&self) -> Result<SemLock<'_>, i32> {
+        let l = self.lock_all();
+        if self.perm.is_deleted() {
+            return Err(KernelError::IdentifierRemoved.errno());
+        }
+        Ok(l)
+    }
+
+    /// After a change under `l`: complete what can proceed, then (after
+    /// the unlock) wake the sleepers
+    fn unlock_and_wake(&self, mut l: SemLock<'_>, changed: impl IntoIterator<Item = usize>) {
+        let woke = update_queue(&mut l, changed);
+        drop(l);
+        if woke {
+            self.waitq.wake_all();
         }
     }
 
-    /// Fill semid64_ds structure for IPC_STAT
-    pub fn fill_semid64_ds(&self, ds: &mut Semid64Ds) {
+    /// Fill semid64_ds structure for IPC_STAT (complex mode)
+    fn fill_semid64_ds(&self, l: &mut SemLock, ds: &mut Semid64Ds) {
         self.perm.fill_ipc64_perm(&mut ds.sem_perm);
-        ds.sem_otime = self.otime.load(Ordering::Relaxed);
-        ds.sem_ctime = self.ctime.load(Ordering::Relaxed);
+        ds.sem_otime = (0..self.nsems as usize)
+            .map(|i| l.sem(i).otime)
+            .max()
+            .unwrap_or(0);
+        ds.sem_ctime = l.global().map_or(0, |g| g.ctime);
         ds.sem_nsems = self.nsems as u64;
         ds.__unused3 = 0;
         ds.__unused4 = 0;
@@ -229,19 +487,23 @@ impl IpcObject for SemArray {
         &self.perm
     }
 
+    /// Linux freeary: every waiter fails with EIDRM
     fn destroy(&self) {
-        // Wake all pending operations with EIDRM
-        let mut pending = self.pending.lock();
-        for queue in pending.drain(..) {
-            queue.status.store(
-                KernelError::IdentifierRemoved.to_errno_neg(),
-                Ordering::Release,
-            );
-            queue.woken.store(true, Ordering::Release);
+        {
+            let mut l = self.lock_all();
+            let eidrm = KernelError::IdentifierRemoved.to_errno_neg();
+            let g = l.global().expect("complex mode");
+            g.complex_count = 0;
+            for (q, _) in g.pending.drain(..) {
+                q.status.store(eidrm, Ordering::Release);
+            }
+            for i in 0..self.nsems as usize {
+                for (q, _) in l.sem(i).pending.drain(..) {
+                    q.status.store(eidrm, Ordering::Release);
+                }
+            }
         }
         self.waitq.wake_all();
-
-        // Update namespace count
         self.ns.used_sems.fetch_sub(self.nsems, Ordering::Relaxed);
     }
 }
@@ -279,27 +541,31 @@ fn do_semget(key: i32, nsems: i32, semflg: i32) -> Result<i32, i32> {
     let nsems_u32 = nsems as u32;
     let ns_clone = ns.clone();
 
-    ipcget(
-        ns.sem_ids(),
-        key,
-        semflg,
-        ns.sem_ctls[3] as u32,
-        move |k, mode| {
+    let ns_added = ns.clone();
+    let ops = IpcOps {
+        // Linux newary: EINVAL for no semaphores, ENOSPC past SEMMNS
+        new: move |k, mode| {
             if nsems_u32 == 0 {
                 return Err(KernelError::InvalidArgument.errno());
             }
-
-            // Check total semaphore limit
-            let current = ns_clone.used_sems.load(Ordering::Relaxed);
-            if current + nsems_u32 > ns_clone.sem_ctls[1] as u32 {
-                return Err(KernelError::OutOfMemory.errno());
+            let used = ns_clone.used_sems.load(Ordering::Relaxed) as u64;
+            if used + nsems_u32 as u64 > ns_clone.sem_ctls[1] as u64 {
+                return Err(KernelError::NoSpace.errno());
             }
-
-            let sem = SemArray::new(k, nsems_u32, mode, ns_clone.clone())?;
-            ns_clone.used_sems.fetch_add(nsems_u32, Ordering::Relaxed);
-            Ok(sem)
+            SemArray::new(k, nsems_u32, mode, ns_clone.clone())
         },
-    )
+        // Linux sem_more_checks
+        more_checks: |sem: &SemArray| {
+            if nsems_u32 > sem.nsems {
+                return Err(KernelError::InvalidArgument.errno());
+            }
+            Ok(())
+        },
+        added: move |sem: &SemArray| {
+            ns_added.used_sems.fetch_add(sem.nsems, Ordering::Relaxed);
+        },
+    };
+    ipcget(ns.sem_ids(), key, semflg, ns.sem_ctls[3] as u32, ops)
 }
 
 /// semop - semaphore operations
@@ -329,135 +595,171 @@ crate::pod!(SemTimespec { tv_sec, tv_nsec });
 
 fn do_semtimedop(semid: i32, sops_ptr: u64, nsops: usize, timeout_ptr: u64) -> Result<i32, i32> {
     let ns = current_ipc_ns();
+    let einval = KernelError::InvalidArgument.errno();
 
-    // Validate
-    if nsops == 0 || nsops > ns.sem_ctls[2] as usize {
-        return Err(KernelError::ArgListTooLong.errno());
-    }
-
-    // Parse timeout if provided
-    // A relative timeout on CLOCK_MONOTONIC (Linux ktime_get() + timeout)
-    let deadline_ns: Option<u64> = if timeout_ptr != 0 {
-        let ts: SemTimespec = get_user::<Uaccess, SemTimespec>(timeout_ptr)
-            .map_err(|_| KernelError::BadAddress.errno())?;
-        // Validate timeout
-        if ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1_000_000_000 {
-            return Err(KernelError::InvalidArgument.errno());
-        }
-        let timeout_ns = crate::time::timespec_to_ns(ts.tv_sec, ts.tv_nsec);
-        Some(crate::time::deadline_after(
-            crate::time::monotonic_ns(),
-            timeout_ns,
-        ))
+    // Linux order: the timeout is copied in, then nsops (E2BIG, EINVAL),
+    // the operations, semid and the timeout's validity
+    let ts = if timeout_ptr != 0 {
+        Some(
+            get_user::<Uaccess, SemTimespec>(timeout_ptr)
+                .map_err(|_| KernelError::BadAddress.errno())?,
+        )
     } else {
         None
     };
-
-    // Read operations from user
+    if nsops > ns.sem_ctls[2] as usize {
+        return Err(KernelError::ArgListTooLong.errno());
+    }
+    if nsops == 0 {
+        return Err(einval);
+    }
     let mut sops = vec![Sembuf::default(); nsops];
-    for (i, sop) in sops.iter_mut().enumerate().take(nsops) {
+    for (i, sop) in sops.iter_mut().enumerate() {
         let offset = sops_ptr + (i * core::mem::size_of::<Sembuf>()) as u64;
         *sop = get_user::<Uaccess, Sembuf>(offset).map_err(|_| KernelError::BadAddress.errno())?;
     }
+    if semid < 0 {
+        return Err(einval);
+    }
+    // A relative timeout on CLOCK_MONOTONIC (Linux ktime_get() + timeout)
+    let deadline_ns = match ts {
+        Some(ts) if ts.tv_sec < 0 || !(0..1_000_000_000).contains(&ts.tv_nsec) => {
+            return Err(einval);
+        }
+        Some(ts) => Some(crate::time::deadline_after(
+            crate::time::monotonic_ns(),
+            crate::time::timespec_to_ns(ts.tv_sec, ts.tv_nsec),
+        )),
+        None => None,
+    };
 
-    // Check for IPC_NOWAIT in any operation
-    let nowait = sops.iter().any(|s| s.sem_flg & IPC_NOWAIT as i16 != 0);
-    // Check if any operation has SEM_UNDO flag
+    let max = sops.iter().map(|s| s.sem_num as u32).max().unwrap_or(0);
     let has_undo = sops.iter().any(|s| s.sem_flg & SEM_UNDO != 0);
-
-    // Find semaphore set
-    let sem_array = ns
-        .sem_ids()
-        .find_by_id(semid)
-        .ok_or(KernelError::InvalidArgument.errno())?;
-    let sem_array: &SemArray = &sem_array;
-
-    // Check permissions
     let alter = sops.iter().any(|s| s.sem_op != 0);
+
+    let sem_array_ref = ns.sem_ids().find_by_id(semid).ok_or(einval)?;
+    let sem_array: &SemArray = &sem_array_ref;
+    if max >= sem_array.nsems {
+        return Err(KernelError::FileTooLarge.errno());
+    }
     let access = if alter { IPC_PERM_WRITE } else { IPC_PERM_READ };
     ipc_checkperm(&sem_array.perm, access)?;
 
-    let nsems = sem_array.nsems as usize;
-
-    // Try the operation
-    loop {
-        match sem_array.try_atomic_ops(&sops) {
-            Ok(true) => {
-                // Success - record SEM_UNDO adjustments if needed
-                if has_undo {
-                    record_undo_for_ops(semid, nsems, &sops);
-                }
-                sem_array.wake_pending();
-                return Ok(0);
-            }
-            Ok(false) => {
-                // Would block
-                if nowait {
-                    return Err(KernelError::WouldBlock.errno());
-                }
-
-                // Check timeout before blocking
-                if deadline_ns.is_some_and(|d| crate::time::monotonic_ns() >= d) {
-                    return Err(KernelError::WouldBlock.errno());
-                }
-
-                // Add to pending queue
-                let queue = Arc::new(SemQueue {
-                    tid: current_tid(),
-                    sops: sops.clone(),
-                    status: AtomicI32::new(0),
-                    woken: AtomicBool::new(false),
-                    alter,
-                });
-
-                {
-                    let mut pending = sem_array.pending.lock();
-                    pending.push_back(queue.clone());
-                }
-
-                // Sleep until woken, the deadline or a signal (semop is
-                // never restarted: EINTR)
-                let r = sem_array.waitq.wait_event_interruptible_deadline(
-                    || queue.woken.load(Ordering::Acquire),
-                    deadline_ns,
-                    crate::time::hrtimer::HrClock::Monotonic,
-                );
-                if r.is_err() && !queue.woken.load(Ordering::Acquire) {
-                    sem_array.pending.lock().retain(|q| !Arc::ptr_eq(q, &queue));
-                    // A wakeup may have raced with the removal
-                    if !queue.woken.load(Ordering::Acquire) {
-                        return Err(KernelError::Interrupted.errno());
-                    }
-                }
-
-                // Check result
-                if queue.woken.load(Ordering::Acquire) {
-                    let status = queue.status.load(Ordering::Acquire);
-                    if status < 0 {
-                        return Err(-status);
-                    }
-                    // Success - record SEM_UNDO adjustments if needed
-                    if has_undo {
-                        record_undo_for_ops(semid, nsems, &sops);
-                    }
-                    return Ok(0);
-                }
-
-                // Check timeout after spurious wakeup or yield
-                if deadline_ns.is_some_and(|d| crate::time::monotonic_ns() >= d) {
-                    // Remove from pending queue
-                    {
-                        let mut pending = sem_array.pending.lock();
-                        pending.retain(|q| !Arc::ptr_eq(q, &queue));
-                    }
-                    return Err(KernelError::WouldBlock.errno());
-                }
-
-                // Spurious wakeup or polling iteration, retry
-            }
-            Err(e) => return Err(e),
-        }
+    // The undo list knows the array before the array knows the list
+    // (Linux find_alloc_undo), so exit finds every adjustment
+    let undo = has_undo.then(|| {
+        let ul = get_or_create_undo_list(current_tid());
+        ul.register(semid, &sem_array_ref);
+        ul.id
+    });
+    let pid = current_pid() as i32;
+    let mut l = sem_array.lock_for(&sops);
+    if sem_array.perm.is_deleted() {
+        return Err(KernelError::IdentifierRemoved.errno());
     }
+    let mut blocking = 0;
+    let r = perform_atomic_semop(&mut l, &sops, pid, undo, &mut blocking);
+    if r <= 0 {
+        if r == 0 && alter {
+            sem_array.unlock_and_wake(l, sops.iter().map(|s| s.sem_num as usize));
+        } else {
+            drop(l);
+        }
+        if r < 0 {
+            return Err(-r);
+        }
+        return Ok(0);
+    }
+
+    // Would block: queue it and sleep (Linux: the status is -EINTR until
+    // a waker completes the operation). A single operation waits on its
+    // semaphore, unless it alters while multi-operation waiters exist;
+    // those, and multi-operation ones, wait on the array.
+    let queue = Arc::new(SemQueue {
+        pid,
+        sops,
+        alter,
+        undo,
+        status: AtomicI32::new(SEM_WAITING),
+    });
+    let w = (queue.clone(), blocking);
+    if queue.sops.len() == 1 {
+        let n = queue.sops[0].sem_num as usize;
+        match l.global() {
+            Some(g) if alter && g.complex_count != 0 => g.pending.push_back(w),
+            _ => l.sem(n).pending.push_back(w),
+        }
+    } else {
+        let g = l.global().expect("complex mode");
+        if g.complex_count == 0 {
+            // Linux merge_queues: single-operation alter waiters join the
+            // array's queue, keeping their order with the new one
+            for i in 0..sem_array.nsems as usize {
+                let s = l.sem(i);
+                let (alt, rest): (VecDeque<Waiter>, VecDeque<Waiter>) =
+                    s.pending.drain(..).partition(|(q, _)| q.alter);
+                s.pending = rest;
+                l.global().expect("complex mode").pending.extend(alt);
+            }
+        }
+        let g = l.global().expect("complex mode");
+        g.pending.push_back(w);
+        g.complex_count += 1;
+    }
+    drop(l);
+    let status = loop {
+        // Sleep until completed, the deadline or a signal (semop is
+        // never restarted: EINTR)
+        let r = sem_array.waitq.wait_event_interruptible_deadline(
+            || queue.status.load(Ordering::Acquire) != SEM_WAITING,
+            deadline_ns,
+            crate::time::hrtimer::HrClock::Monotonic,
+        );
+        let status = queue.status.load(Ordering::Acquire);
+        if status != SEM_WAITING {
+            break status;
+        }
+        // Not completed: recheck under the locks, then unlink
+        let mut l = sem_array.lock_for(&queue.sops);
+        if sem_array.perm.is_deleted() {
+            return Err(KernelError::IdentifierRemoved.errno());
+        }
+        let status = queue.status.load(Ordering::Acquire);
+        if status != SEM_WAITING {
+            break status;
+        }
+        let timed_out = match r {
+            Ok(true) => continue,
+            Ok(false) => true,
+            Err(_) => false,
+        };
+        unlink(&mut l, &queue);
+        return Err(if timed_out {
+            KernelError::WouldBlock.errno()
+        } else {
+            KernelError::Interrupted.errno()
+        });
+    };
+    if status < 0 {
+        return Err(-status);
+    }
+    Ok(0)
+}
+
+/// Take a waiter that gave up off its queue (Linux unlink_queue)
+fn unlink(l: &mut SemLock, q: &Arc<SemQueue>) {
+    let mine = |(w, _): &Waiter| Arc::ptr_eq(w, q);
+    if let Some(g) = l.global()
+        && let Some(i) = g.pending.iter().position(mine)
+    {
+        g.pending.remove(i);
+        if q.sops.len() > 1 {
+            g.complex_count -= 1;
+        }
+        return;
+    }
+    let n = q.sops[0].sem_num as usize;
+    l.sem(n).pending.retain(|w| !mine(w));
 }
 
 /// semctl - semaphore control
@@ -481,7 +783,9 @@ fn do_semctl(semid: i32, semnum: i32, cmd: i32, arg: u64) -> Result<i32, i32> {
             let sem_array: &SemArray = &sem;
 
             let mut ds = Semid64Ds::default();
-            sem_array.fill_semid64_ds(&mut ds);
+            let mut l = sem_array.lock_all();
+            sem_array.fill_semid64_ds(&mut l, &mut ds);
+            drop(l);
 
             if arg != 0 {
                 put_user::<Uaccess, Semid64Ds>(arg, ds)
@@ -492,15 +796,17 @@ fn do_semctl(semid: i32, semnum: i32, cmd: i32, arg: u64) -> Result<i32, i32> {
         }
 
         IPC_SET => {
+            // Copied in first, before the IPC locks (Linux: the copy
+            // may fault)
+            let ds: Semid64Ds =
+                get_user::<Uaccess, Semid64Ds>(arg).map_err(|_| KernelError::BadAddress.errno())?;
+            let _w = ns.sem_ids().rwsem.write();
             let sem = ns
                 .sem_ids()
                 .find_by_id(semid)
                 .ok_or(KernelError::InvalidArgument.errno())?;
 
             let uid = crate::task::percpu::current_cred().euid;
-            // Copied in before the spin lock (the copy may fault)
-            let ds: Semid64Ds =
-                get_user::<Uaccess, Semid64Ds>(arg).map_err(|_| KernelError::BadAddress.errno())?;
             let perm = sem.perm();
             {
                 let mut p = perm.lock.lock();
@@ -511,12 +817,15 @@ fn do_semctl(semid: i32, semnum: i32, cmd: i32, arg: u64) -> Result<i32, i32> {
                 p.gid = ds.sem_perm.gid;
                 p.mode = ds.sem_perm.mode & 0o777;
             }
-            sem.ctime.store(current_time_secs(), Ordering::Relaxed);
+            if let Some(g) = sem.lock_all().global() {
+                g.ctime = current_time_secs();
+            }
 
             Ok(0)
         }
 
         IPC_RMID => {
+            let _w = ns.sem_ids().rwsem.write();
             let sem = ns
                 .sem_ids()
                 .find_by_id(semid)
@@ -549,10 +858,7 @@ fn do_semctl(semid: i32, semnum: i32, cmd: i32, arg: u64) -> Result<i32, i32> {
                 return Err(KernelError::InvalidArgument.errno());
             }
 
-            let val = sem_array.sems[semnum as usize]
-                .semval
-                .load(Ordering::Acquire);
-            Ok(val)
+            Ok(sem_array.lock_valid()?.sem(semnum as usize).val)
         }
 
         SETVAL => {
@@ -574,18 +880,16 @@ fn do_semctl(semid: i32, semnum: i32, cmd: i32, arg: u64) -> Result<i32, i32> {
                 return Err(KernelError::Range.errno());
             }
 
-            sem_array.sems[semnum as usize]
-                .semval
-                .store(val, Ordering::Release);
-            sem_array.sems[semnum as usize]
-                .sempid
-                .store(current_pid() as i32, Ordering::Release);
-            sem_array
-                .ctime
-                .store(current_time_secs(), Ordering::Release);
-
-            // Wake pending operations
-            sem_array.wake_pending();
+            // Linux semctl_setval
+            let mut l = sem_array.lock_valid()?;
+            let s = l.sem(semnum as usize);
+            s.val = val;
+            s.pid = current_pid() as i32;
+            s.undo.clear();
+            if let Some(g) = l.global() {
+                g.ctime = current_time_secs();
+            }
+            sem_array.unlock_and_wake(l, [semnum as usize]);
 
             Ok(0)
         }
@@ -600,13 +904,16 @@ fn do_semctl(semid: i32, semnum: i32, cmd: i32, arg: u64) -> Result<i32, i32> {
 
             let sem_array: &SemArray = &sem;
 
-            for (i, s) in sem_array.sems[..sem_array.nsems as usize]
-                .iter()
-                .enumerate()
-            {
-                let val = s.semval.load(Ordering::Acquire) as u16;
+            // A snapshot under the lock, copied out after it
+            let vals: Vec<i32> = {
+                let mut l = sem_array.lock_valid()?;
+                (0..sem_array.nsems as usize)
+                    .map(|i| l.sem(i).val)
+                    .collect()
+            };
+            for (i, &v) in vals.iter().enumerate() {
                 let offset = arg + (i * 2) as u64;
-                put_user::<Uaccess, u16>(offset, val)
+                put_user::<Uaccess, u16>(offset, v as u16)
                     .map_err(|_| KernelError::BadAddress.errno())?;
             }
 
@@ -623,27 +930,30 @@ fn do_semctl(semid: i32, semnum: i32, cmd: i32, arg: u64) -> Result<i32, i32> {
 
             let sem_array: &SemArray = &sem;
 
-            let pid = current_pid() as i32;
-            for (i, s) in sem_array.sems[..sem_array.nsems as usize]
-                .iter()
-                .enumerate()
-            {
+            // Copied in and checked first, then set under the lock
+            // (Linux semctl_main SETALL)
+            let mut vals = vec![0i32; sem_array.nsems as usize];
+            for (i, v) in vals.iter_mut().enumerate() {
                 let offset = arg + (i * 2) as u64;
                 let val: u16 = get_user::<Uaccess, u16>(offset)
                     .map_err(|_| KernelError::BadAddress.errno())?;
-
-                if val as i32 > SEMVMX {
-                    return Err(KernelError::Range.errno());
-                }
-
-                s.semval.store(val as i32, Ordering::Release);
-                s.sempid.store(pid, Ordering::Release);
+                *v = val as i32;
             }
-
-            sem_array
-                .ctime
-                .store(current_time_secs(), Ordering::Release);
-            sem_array.wake_pending();
+            if vals.iter().any(|&v| v > SEMVMX) {
+                return Err(KernelError::Range.errno());
+            }
+            let pid = current_pid() as i32;
+            let mut l = sem_array.lock_valid()?;
+            for (i, &v) in vals.iter().enumerate() {
+                let s = l.sem(i);
+                s.val = v;
+                s.pid = pid;
+                s.undo.clear();
+            }
+            if let Some(g) = l.global() {
+                g.ctime = current_time_secs();
+            }
+            sem_array.unlock_and_wake(l, 0..sem_array.nsems as usize);
 
             Ok(0)
         }
@@ -662,23 +972,39 @@ fn do_semctl(semid: i32, semnum: i32, cmd: i32, arg: u64) -> Result<i32, i32> {
                 return Err(KernelError::InvalidArgument.errno());
             }
 
-            let pid = sem_array.sems[semnum as usize]
-                .sempid
-                .load(Ordering::Acquire);
-            Ok(pid)
+            Ok(sem_array.lock_valid()?.sem(semnum as usize).pid)
         }
 
         GETNCNT | GETZCNT => {
-            // Count waiting processes - simplified for now
             let sem = ns
                 .sem_ids()
                 .find_by_id(semid)
                 .ok_or(KernelError::InvalidArgument.errno())?;
 
             ipc_checkperm(sem.perm(), IPC_PERM_READ)?;
-
-            // Return 0 for now (full implementation would count waiters)
-            Ok(0)
+            let sem_array: &SemArray = &sem;
+            if semnum < 0 || semnum as u32 >= sem_array.nsems {
+                return Err(KernelError::InvalidArgument.errno());
+            }
+            // Linux count_semcnt: the waiters whose blocking operation is
+            // on `semnum`, decrements for GETNCNT, waits-for-zero for
+            // GETZCNT
+            let zero = cmd_only == GETZCNT;
+            let counts = |(q, b): &Waiter| {
+                let op = &q.sops[*b];
+                op.sem_num as i32 == semnum && if zero { op.sem_op == 0 } else { op.sem_op < 0 }
+            };
+            let mut l = sem_array.lock_valid()?;
+            let mut n = l
+                .sem(semnum as usize)
+                .pending
+                .iter()
+                .filter(|w| counts(w))
+                .count();
+            n += l
+                .global()
+                .map_or(0, |g| g.pending.iter().filter(|w| counts(w)).count());
+            Ok(n as i32)
         }
 
         _ => Err(KernelError::InvalidArgument.errno()),
@@ -689,100 +1015,44 @@ fn do_semctl(semid: i32, semnum: i32, cmd: i32, arg: u64) -> Result<i32, i32> {
 // SEM_UNDO Support - Automatic semaphore adjustment on process exit
 // ============================================================================
 
-use crate::sync::spin::RwLock;
 use crate::task::Tid;
-use alloc::collections::BTreeMap;
+use alloc::sync::Weak;
 
-/// Individual semaphore undo entry for a specific semaphore array
+/// Undo list ids (never reused, so a stale entry cannot alias a new list)
+static UNDO_IDS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+
+/// Per-task semaphore undo list (Linux struct sem_undo_list)
 ///
-/// Tracks adjustments to semaphores that should be reversed on process exit.
-/// When a process performs semop() with SEM_UNDO flag, the operation's
-/// negative is recorded here.
-#[derive(Clone)]
-pub struct SemUndo {
-    /// Semaphore set ID
-    pub semid: i32,
-    /// Per-semaphore adjustments (negative of operations performed)
-    /// Index corresponds to semaphore number, value is cumulative adjustment
-    pub semadj: Vec<i16>,
-}
-
-impl SemUndo {
-    /// Create a new undo entry for a semaphore array
-    pub fn new(semid: i32, nsems: usize) -> Self {
-        Self {
-            semid,
-            semadj: vec![0; nsems],
-        }
-    }
-
-    /// Record an undo adjustment for a semaphore operation
-    ///
-    /// The adjustment is the negative of the operation value.
-    /// When the process exits, these adjustments will be applied.
-    pub fn record_adj(&mut self, sem_num: usize, sem_op: i16) {
-        if sem_num < self.semadj.len() {
-            // Record the negative - on exit, we reverse the operation
-            self.semadj[sem_num] = self.semadj[sem_num].saturating_sub(sem_op);
-        }
-    }
-
-    /// Check if all adjustments are zero (can be removed)
-    pub fn is_empty(&self) -> bool {
-        self.semadj.iter().all(|&adj| adj == 0)
-    }
-}
-
-/// Per-task semaphore undo list
-///
-/// Contains all SEM_UNDO adjustments for a task. When the task exits,
-/// all adjustments are applied to the corresponding semaphores.
-///
-/// When CLONE_SYSVSEM is used, multiple tasks share the same undo list
-/// via Arc. The adjustments are only applied when the last sharing task exits.
+/// The adjustments themselves live in each array (`SemState.undo`,
+/// under its lock); the list names the arrays it has adjustments in.
+/// When CLONE_SYSVSEM is used, tasks share it via Arc, and the
+/// adjustments are applied when the last sharing task exits.
 pub struct SemUndoList {
-    /// Map of semid -> SemUndo entries
-    pub undos: RwLock<BTreeMap<i32, SemUndo>>,
+    /// Key of this list's adjustments in each array
+    id: u64,
+    /// The arrays it has adjusted, by semid (a removed array or a reused
+    /// id is told apart by the Weak)
+    arrays: Mutex<BTreeMap<i32, Weak<SemArray>>>,
 }
 
 impl SemUndoList {
     /// Create a new empty undo list
     pub fn new() -> Self {
         Self {
-            undos: RwLock::new(BTreeMap::new()),
+            id: UNDO_IDS.fetch_add(1, Ordering::Relaxed),
+            arrays: Mutex::new(BTreeMap::new()),
         }
     }
 
-    /// Get or create an undo entry for a semaphore array
-    pub fn get_or_create(&self, semid: i32, nsems: usize) -> SemUndo {
-        let undos = self.undos.read();
-        if let Some(undo) = undos.get(&semid) {
-            return undo.clone();
+    /// Note that this list adjusts `sem` (Linux find_alloc_undo)
+    fn register(&self, semid: i32, sem: &Arc<SemArray>) {
+        let mut arrays = self.arrays.lock();
+        let same = arrays
+            .get(&semid)
+            .is_some_and(|w| core::ptr::eq(w.as_ptr(), Arc::as_ptr(sem)));
+        if !same {
+            arrays.insert(semid, Arc::downgrade(sem));
         }
-        drop(undos);
-
-        // Create new entry
-        let mut undos = self.undos.write();
-        undos
-            .entry(semid)
-            .or_insert_with(|| SemUndo::new(semid, nsems))
-            .clone()
-    }
-
-    /// Update an undo entry after recording an adjustment
-    pub fn update(&self, undo: SemUndo) {
-        let mut undos = self.undos.write();
-        if undo.is_empty() {
-            undos.remove(&undo.semid);
-        } else {
-            undos.insert(undo.semid, undo);
-        }
-    }
-
-    /// Take all undo entries (for exit processing)
-    pub fn take_all(&self) -> BTreeMap<i32, SemUndo> {
-        let mut undos = self.undos.write();
-        core::mem::take(&mut *undos)
     }
 }
 
@@ -838,79 +1108,41 @@ pub fn clone_task_semundo(parent_tid: Tid, child_tid: Tid, share: bool) {
     // It will be created lazily if the child uses SEM_UNDO
 }
 
-/// Apply all semaphore undo operations for a task on exit
+/// Apply all semaphore undo operations for a task on exit (Linux
+/// exit_sem)
 ///
-/// This is called when a task exits. If the task's undo list is shared
-/// (via CLONE_SYSVSEM), the adjustments are only applied when the last
-/// sharing task exits (Arc refcount drops to 1).
+/// If the task's undo list is shared (via CLONE_SYSVSEM), the
+/// adjustments are only applied when the last sharing task exits (its
+/// drop is the one `Arc::into_inner` gives the list to).
 pub fn exit_sem(tid: Tid) {
-    // Remove this task's undo list reference
     let undo_list = {
         let mut table = TASKLIST.write();
-        if let Some(mut task) = table.get_mut(tid) {
-            task.sysvsem.take()
-        } else {
-            None
-        }
+        table.get_mut(tid).and_then(|mut t| t.sysvsem.take())
     };
-
-    let Some(undo_list) = undo_list else {
-        return; // No undo list for this task
-    };
-
-    // Check if this is the last reference
-    // Arc::strong_count returns the number of references
-    // If it's 1, we are the last holder and should apply undos
-    if Arc::strong_count(&undo_list) > 1 {
-        // Other tasks still sharing this list, don't apply undos yet
+    // The last sharer's drop gives the list back, exactly once even when
+    // CLONE_SYSVSEM sharers exit together (Linux refcount_dec_and_test)
+    let Some(undo_list) = undo_list.and_then(Arc::into_inner) else {
         return;
-    }
-
-    // We're the last holder - apply all undo operations
-    let undos = undo_list.take_all();
-    let ns = current_ipc_ns();
-
-    for (semid, undo) in undos {
-        // Find the semaphore array
-        let Some(sem_obj) = ns.sem_ids().find_by_id(semid) else {
-            continue; // Semaphore array was deleted
+    };
+    let arrays = core::mem::take(&mut *undo_list.arrays.lock());
+    let pid = current_pid() as i32;
+    for (_, weak) in arrays {
+        // Gone, or removed (IPC_RMID): nothing to undo
+        let Some(sem_array) = weak.upgrade() else {
+            continue;
         };
-
-        let sem_array: &SemArray = &sem_obj;
-
-        // Apply adjustments
-        let pid = current_pid() as i32;
-        for (i, &adj) in undo.semadj.iter().enumerate() {
-            if adj == 0 || i >= sem_array.nsems as usize {
-                continue;
+        let Ok(mut l) = sem_array.lock_valid() else {
+            continue;
+        };
+        let mut changed = Vec::new();
+        for i in 0..sem_array.nsems as usize {
+            let s = l.sem(i);
+            if let Some(a) = s.undo.remove(&undo_list.id) {
+                s.val = (s.val + a as i32).clamp(0, SEMVMX);
+                s.pid = pid;
+                changed.push(i);
             }
-
-            let sem = &sem_array.sems[i];
-            let old_val = sem.semval.load(Ordering::Acquire);
-            let new_val = (old_val + adj as i32).clamp(0, SEMVMX);
-            sem.semval.store(new_val, Ordering::Release);
-            sem.sempid.store(pid, Ordering::Release);
         }
-
-        // Wake any pending operations that may now succeed
-        sem_array.wake_pending();
+        sem_array.unlock_and_wake(l, changed);
     }
-}
-
-/// Record SEM_UNDO adjustments for a successful semop
-///
-/// Called after a successful semop when any operation has SEM_UNDO flag set.
-fn record_undo_for_ops(semid: i32, nsems: usize, sops: &[Sembuf]) {
-    let tid = current_tid();
-    let undo_list = get_or_create_undo_list(tid);
-
-    let mut undo = undo_list.get_or_create(semid, nsems);
-
-    for sop in sops {
-        if sop.sem_flg & SEM_UNDO != 0 && sop.sem_op != 0 {
-            undo.record_adj(sop.sem_num as usize, sop.sem_op);
-        }
-    }
-
-    undo_list.update(undo);
 }

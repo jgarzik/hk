@@ -806,7 +806,12 @@ impl Zone {
     /// Called once every boot memory range is in the zone (the base is
     /// the final managed count), and again when vm.min_free_kbytes is
     /// written (`kb`; None = the formula)
+    ///
+    /// Under the zone lock, as Linux: two writers of vm.min_free_kbytes
+    /// never leave one's min with the other's low and high; the
+    /// allocator reads them lock-free (each a word of its own)
     pub fn setup_wmarks(&self, kb: Option<usize>) {
+        let _z = self.lock.lock();
         let managed = self.managed();
         let kb = kb.unwrap_or_else(|| min_free_kbytes(managed));
         self.min_kb.store(kb, Ordering::Relaxed);

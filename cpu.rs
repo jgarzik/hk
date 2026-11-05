@@ -18,30 +18,43 @@ use crate::util::cpumask::NR_CPUS;
 static NR_CPU_IDS: AtomicU32 = AtomicU32::new(1);
 
 /// Number of possible CPUs: every CPU brought up at boot (hk has no
-/// hotplug), 1 until SMP bring-up is done
+/// hotplug), 1 until SMP bring-up is done (early boot code, on the boot
+/// CPU, sizes nothing per CPU before that). Acquire pairs with the one
+/// store: the application CPUs are already running when it is made.
 #[inline]
 pub fn nr_cpu_ids() -> u32 {
-    NR_CPU_IDS.load(Ordering::Relaxed)
+    NR_CPU_IDS.load(Ordering::Acquire)
 }
 
-/// Record the CPUs found at boot (`smp::init`, once)
+/// Record the CPUs found at boot (`smp::init`, once, on the boot CPU,
+/// before any CPU takes call-function IPIs or schedules)
 pub fn set_nr_cpu_ids(n: u32) {
-    NR_CPU_IDS.store(n.clamp(1, NR_CPUS as u32), Ordering::Relaxed);
+    NR_CPU_IDS.store(n.clamp(1, NR_CPUS as u32), Ordering::Release);
 }
 
 /// The calling CPU's logical id (Linux smp_processor_id); 0 before
 /// per-CPU data exists, when only the boot CPU runs
 #[inline]
 pub fn this_id() -> u32 {
-    CurrentArch::try_current_cpu_id().unwrap_or(0)
+    try_this_id().unwrap_or(0)
 }
 
 /// The calling CPU's id once its per-CPU data exists; None before (the
 /// boot CPU early, or a CPU coming up): per-CPU caches (slab, page
 /// lists) must not be used then
+#[cfg(not(test))]
 #[inline]
 pub fn try_this_id() -> Option<u32> {
     CurrentArch::try_current_cpu_id()
+}
+
+/// Host unit tests run in user space, where the per-CPU base register
+/// is out of reach (arm64 TPIDR_EL1 traps at EL0): no per-CPU data, so
+/// everything uses slot 0
+#[cfg(test)]
+#[inline]
+pub fn try_this_id() -> Option<u32> {
+    None
 }
 
 /// One `T` per possible CPU

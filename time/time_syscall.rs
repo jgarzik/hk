@@ -7,10 +7,9 @@
 
 use crate::arch::Uaccess;
 use crate::time::hrtimer::HrClock;
-use crate::time::{ClockId, NTP_STATE, STA_NANO, STA_UNSYNC, TIMEKEEPER};
+use crate::time::{ClockId, STA_NANO, STA_UNSYNC, TIMEKEEPER};
 use crate::uaccess::{UaccessArch, get_user, put_user};
 use crate::util::error::KernelError;
-use core::sync::atomic::Ordering;
 
 /// Linux clock IDs
 pub const CLOCK_REALTIME: i32 = 0;
@@ -122,7 +121,7 @@ impl PosixClock {
             }
             Self::RealtimeCoarse => coarse(read(ClockId::Realtime)),
             Self::MonotonicCoarse => coarse(read(ClockId::Monotonic)),
-            Self::Tai => read(ClockId::Realtime) + tai_offset_ns(),
+            Self::Tai => read(ClockId::Tai),
             Self::Cpu { pid, thread, which } => cpu_clock_ns(pid, thread, which, true)? as i128,
         })
     }
@@ -140,7 +139,7 @@ impl PosixClock {
 
 /// TAI - UTC (adjtimex ADJ_TAI), in ns
 pub fn tai_offset_ns() -> i128 {
-    NTP_STATE.tai_offset.load(Ordering::Relaxed) as i128 * 1_000_000_000
+    TIMEKEEPER.tai_offset() as i128 * 1_000_000_000
 }
 
 /// A CPU clock's time (Linux posix_cpu_clock_get / lookup_task): a
@@ -1065,33 +1064,8 @@ pub fn sys_adjtimex(txc_p: u64) -> i64 {
         txc.modes = 0;
     }
 
-    // Apply modifications to kernel state
-    if txc.modes & ADJ_MAXERROR != 0 {
-        NTP_STATE.maxerror.store(txc.maxerror, Ordering::Relaxed);
-    }
-    if txc.modes & ADJ_ESTERROR != 0 {
-        NTP_STATE.esterror.store(txc.esterror, Ordering::Relaxed);
-    }
-    if txc.modes & ADJ_STATUS != 0 {
-        // Only allow setting writable status bits
-        let new_status = txc.status & STA_RW_MASK;
-        NTP_STATE.status.store(new_status, Ordering::Relaxed);
-    }
-    // Linux __do_adjtimex: the new TAI offset is `constant`, ignored
-    // outside 0..=MAX_TAI_OFFSET (`tai` is only read back)
-    if txc.modes & ADJ_TAI != 0 && (0..=100_000).contains(&txc.constant) {
-        NTP_STATE
-            .tai_offset
-            .store(txc.constant as i32, Ordering::Relaxed);
-    }
-    if txc.modes & ADJ_TIMECONST != 0 {
-        NTP_STATE.constant.store(txc.constant, Ordering::Relaxed);
-    }
-    if txc.modes & ADJ_TICK != 0 {
-        NTP_STATE.tick.store(txc.tick, Ordering::Relaxed);
-    }
-
-    // Handle ADJ_SETOFFSET - inject time offset
+    // ADJ_SETOFFSET first, in its own write section (Linux do_adjtimex:
+    // timekeeping_inject_offset before the NTP state)
     if txc.modes & ADJ_SETOFFSET != 0 {
         let offset_ns = if txc.modes & ADJ_NANO != 0 {
             txc.time
@@ -1104,26 +1078,44 @@ pub fn sys_adjtimex(txc_p: u64) -> i64 {
                 .saturating_mul(1_000_000_000)
                 .saturating_add(txc.time.tv_usec.saturating_mul(1000))
         };
-
-        // Get current realtime and add offset
-        let current = TIMEKEEPER.read(ClockId::Realtime, TIMEKEEPER.get_read_cycles());
-        let new_ns = current.to_nanos() + offset_ns as i128;
-        let new_time = crate::time::Timespec::from_nanos(new_ns);
-        if !TIMEKEEPER.set_realtime(new_time) {
+        if !TIMEKEEPER.inject_offset(offset_ns) {
             return KernelError::InvalidArgument.sysret();
         }
     }
 
-    // Read current state back into txc
-    let ts = TIMEKEEPER.read(ClockId::Realtime, TIMEKEEPER.get_read_cycles());
-    let status = NTP_STATE.status.load(Ordering::Relaxed);
+    // The NTP state changes and the read-back under one hold of the
+    // timekeeper lock (Linux __do_adjtimex)
+    let modes = txc.modes;
+    let (ntp, tai, ts) = TIMEKEEPER.ntp_update(|n| {
+        if modes & ADJ_MAXERROR != 0 {
+            n.maxerror = txc.maxerror;
+        }
+        if modes & ADJ_ESTERROR != 0 {
+            n.esterror = txc.esterror;
+        }
+        if modes & ADJ_STATUS != 0 {
+            // Only allow setting writable status bits
+            n.status = txc.status & STA_RW_MASK;
+        }
+        if modes & ADJ_TIMECONST != 0 {
+            n.constant = txc.constant;
+        }
+        if modes & ADJ_TICK != 0 {
+            n.tick = txc.tick;
+        }
+        // Linux __do_adjtimex: the new TAI offset is `constant`, ignored
+        // outside 0..=MAX_TAI_OFFSET (`tai` is only read back)
+        (modes & ADJ_TAI != 0 && (0..=100_000).contains(&txc.constant))
+            .then_some(txc.constant as i32)
+    });
+    let status = ntp.status;
 
     txc.offset = 0; // No ongoing adjustment
     txc.freq = 0; // No frequency offset
-    txc.maxerror = NTP_STATE.maxerror.load(Ordering::Relaxed);
-    txc.esterror = NTP_STATE.esterror.load(Ordering::Relaxed);
+    txc.maxerror = ntp.maxerror;
+    txc.esterror = ntp.esterror;
     txc.status = status;
-    txc.constant = NTP_STATE.constant.load(Ordering::Relaxed);
+    txc.constant = ntp.constant;
     txc.precision = 1; // 1 microsecond precision
     txc.tolerance = 500; // 500 ppm tolerance
     txc.time.tv_sec = ts.sec;
@@ -1132,7 +1124,7 @@ pub fn sys_adjtimex(txc_p: u64) -> i64 {
     } else {
         ts.nsec as i64 / 1000
     };
-    txc.tick = NTP_STATE.tick.load(Ordering::Relaxed);
+    txc.tick = ntp.tick;
     txc.ppsfreq = 0;
     txc.jitter = 0;
     txc.shift = 0;
@@ -1141,7 +1133,7 @@ pub fn sys_adjtimex(txc_p: u64) -> i64 {
     txc.calcnt = 0;
     txc.errcnt = 0;
     txc.stbcnt = 0;
-    txc.tai = NTP_STATE.tai_offset.load(Ordering::Relaxed);
+    txc.tai = tai;
 
     // Copy result back to user space
     txc.modes = user_modes;

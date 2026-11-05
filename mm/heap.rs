@@ -211,7 +211,10 @@ pub struct KernelAlloc {
     arena: HeapAllocator,
     /// Set once the page allocator is up (Release; read Acquire)
     slab: core::sync::atomic::AtomicBool,
-    once: core::sync::atomic::AtomicBool,
+    /// The arena is set up: by the first allocation, and every other
+    /// caller waits until it is (a flag set before the setup let a
+    /// second early caller use it half made)
+    init: spin::Once<()>,
 }
 
 impl KernelAlloc {
@@ -219,16 +222,15 @@ impl KernelAlloc {
         Self {
             arena: HeapAllocator::new(),
             slab: core::sync::atomic::AtomicBool::new(false),
-            once: core::sync::atomic::AtomicBool::new(false),
+            init: spin::Once::new(),
         }
     }
 
     fn arena(&self) -> &HeapAllocator {
-        use core::sync::atomic::Ordering;
-        if !self.once.swap(true, Ordering::AcqRel) {
-            // SAFETY: the buffer is used by this arena only
+        self.init.call_once(|| {
+            // SAFETY: the buffer is used by this arena only, set up once
             unsafe { self.arena.init(ARENA_BUF.0.get() as usize, ARENA_SIZE) };
-        }
+        });
         &self.arena
     }
 

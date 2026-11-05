@@ -11,7 +11,7 @@ phase end. Gaps a phase leaves go to BUGS.md.
 
 | # | Phase | Why here |
 |---|-------|----------|
-| 1 | L — locking and atomics bugs | real races, one security-relevant |
+| 1 | L — locking and atomics bugs (done) | real races, one security-relevant |
 | 2 | R2 — pass `&Task`, not tid | largest refactor; before new code |
 | 3 | R4 — private TaskInner fields, `Signal` | same object, mechanical |
 | 4 | M1 — uaccess and errors | ~400 call sites, mechanical |
@@ -38,10 +38,11 @@ driver packages and loader, native escape modules). Only its
 preparatory items are in the phases above (M1, M2, M4, D's firmware
 loading); HADL itself waits for the owner's go-ahead.
 
-## 1. L — locking and atomics bugs
+## 1. L — locking and atomics bugs (done 2026-11-05)
 
-Shared state kept in atomics instead of under its object's lock
-(BUGS.md "Atomics audit findings"). Each fix: a repro boot test where
+Shared state kept in atomics instead of under its object's lock (the
+2026-11-03 atomics audit). Done: every item below landed with its
+LOCKING.md rows; the remaining gaps are in BUGS.md. Each fix: a repro boot test where
 reachable, the LOCKING.md row fixed, the BUGS line deleted.
 - L0 LOCKING.md 5.4 rules: lock first, an atomic only for a named
   lockless reader; no check-then-act (one RMW, or Linux's

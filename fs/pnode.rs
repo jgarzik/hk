@@ -16,7 +16,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 
 use super::dentry::Dentry;
-use super::mount::{MNT_UNBINDABLE, Mount, attach_mnt, clone_mnt};
+use super::mount::{Mount, attach_mnt, clone_mnt};
 use super::path_ref::Path;
 
 /// A peer group: its members, and the mounts it is master of
@@ -169,7 +169,7 @@ fn make_slave(m: &Arc<Mount>) {
 pub fn change_propagation(m: &Arc<Mount>, p: Prop) {
     if p == Prop::Shared {
         // Shared ends unbindable (Linux set_mnt_shared: T_SHARED_MASK)
-        m.mark(MNT_UNBINDABLE, false);
+        m.set_unbindable(false);
         if m.group.load(Ordering::SeqCst) == 0 {
             join(m, alloc_group());
         }
@@ -178,7 +178,7 @@ pub fn change_propagation(m: &Arc<Mount>, p: Prop) {
     make_slave(m);
     if p != Prop::Slave {
         set_master(m, 0);
-        m.mark(MNT_UNBINDABLE, p == Prop::Unbindable);
+        m.set_unbindable(p == Prop::Unbindable);
     }
 }
 
@@ -329,7 +329,7 @@ pub fn optional_fields(m: &Mount, visible_peer: &dyn Fn(u32) -> bool) -> Vec<u8>
             let _ = write!(s, " propagate_from:{}", dom);
         }
     }
-    if m.flags() & MNT_UNBINDABLE != 0 {
+    if m.is_unbindable() {
         s.push_str(" unbindable");
     }
     s.into_bytes()

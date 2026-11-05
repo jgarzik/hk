@@ -435,9 +435,9 @@ fn new_disk(vdev: &Arc<VirtioDevice>) -> Result<Arc<Disk>, KernelError> {
         disk_name("vd", index.0),
         cap,
         RequestQueue::new_mq(mq, lim, wc),
+        vdev.has_feature(feature::RO),
     );
     disk.private.call_once(|| Box::new(index));
-    disk.set_ro(vdev.has_feature(feature::RO));
     printkln!(
         "virtio-blk: {} {} sectors, {}/{} bytes, {} queues{}{}",
         disk.name,

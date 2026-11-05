@@ -5,6 +5,9 @@
 //! - Test adjtimex returns TIME_ERROR when unsynchronized
 //! - Test adjtimex setting maxerror/esterror
 //! - Test adjtimex returns EINVAL for invalid tick
+//! - ADJTIMEX_OFFSET: two processes inject +1 s with ADJ_SETOFFSET at
+//!   once; realtime moves 2 s against monotonic (Linux
+//!   timekeeping_inject_offset adds inside the lock: no offset is lost)
 
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
@@ -17,6 +20,7 @@ pub fn run_tests() {
     test_adjtimex_unsync();
     test_adjtimex_set_errors();
     test_adjtimex_invalid_tick();
+    test_adjtimex_offset();
 }
 
 /// Test adjtimex read-only query (modes=0)
@@ -104,6 +108,55 @@ fn test_adjtimex_invalid_tick() {
     } else {
         print(b"ADJTIMEX_INVALID_TICK:FAIL: expected EINVAL(-22), got ");
         print_num(ret);
+        println(b"");
+    }
+}
+
+fn clock_ns(id: i32) -> i64 {
+    let mut ts = hk_syscall::Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    hk_syscall::sys_clock_gettime(id, &mut ts);
+    ts.tv_sec * 1_000_000_000 + ts.tv_nsec
+}
+
+/// REALTIME - MONOTONIC, ns
+fn real_minus_mono() -> i64 {
+    clock_ns(0) - clock_ns(1)
+}
+
+fn set_offset(sec: i64) -> i64 {
+    let mut txc = Timex::default();
+    txc.modes = hk_syscall::ADJ_SETOFFSET;
+    txc.time.tv_sec = sec;
+    txc.time.tv_usec = 0;
+    sys_adjtimex(&mut txc)
+}
+
+fn test_adjtimex_offset() {
+    let before = real_minus_mono();
+    let kids: [i64; 2] = core::array::from_fn(|_| {
+        let pid = hk_syscall::sys_fork();
+        if pid == 0 {
+            let r = set_offset(1);
+            hk_syscall::sys_exit((r < 0) as u64);
+        }
+        pid
+    });
+    let mut ok = true;
+    for pid in kids {
+        let mut ws = 0;
+        ok &= hk_syscall::sys_wait4(pid, &mut ws, 0, 0) == pid && ws == 0;
+    }
+    let moved = real_minus_mono() - before;
+    set_offset(-2);
+    let off = moved - 2_000_000_000;
+    if ok && off.abs() < 50_000_000 {
+        println(b"ADJTIMEX_OFFSET:OK");
+    } else {
+        print(b"ADJTIMEX_OFFSET:FAIL moved ns ");
+        print_num(moved);
         println(b"");
     }
 }

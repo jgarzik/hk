@@ -434,7 +434,6 @@ impl RobustListHead {
 /// Uses proper uaccess infrastructure which:
 /// - Validates address is in user space range
 /// - Handles SMAP protection on x86_64
-/// - Checks alignment
 fn read_user_u32(addr: u64) -> Result<u32, i32> {
     get_user::<Uaccess, u32>(addr).map_err(|_| KernelError::BadAddress.to_errno_neg())
 }
@@ -453,22 +452,11 @@ fn get_value_locked(addr: u64) -> Result<u32, i32> {
     r.map_err(|_| KernelError::WouldBlock.to_errno_neg())
 }
 
-/// Write a u32 to user memory
-///
-/// Uses proper uaccess infrastructure which:
-/// - Validates address is in user space range
-/// - Handles SMAP protection on x86_64
-/// - Checks alignment
-fn write_user_u32(addr: u64, val: u32) -> Result<(), i32> {
-    put_user::<Uaccess, u32>(addr, val).map_err(|_| KernelError::BadAddress.to_errno_neg())
-}
-
 /// Read a u64 from user memory
 ///
 /// Uses proper uaccess infrastructure which:
 /// - Validates address is in user space range
 /// - Handles SMAP protection on x86_64
-/// - Checks alignment
 fn read_user_u64(addr: u64) -> Result<u64, i32> {
     get_user::<Uaccess, u64>(addr).map_err(|_| KernelError::BadAddress.to_errno_neg())
 }
@@ -499,9 +487,13 @@ fn read_user_timeout(timeout_ptr: u64) -> Result<Option<u64>, i32> {
 /// The futex key of `uaddr` in the current address space (Linux
 /// get_futex_key): a private futex is (mm, address); a shared one is
 /// the backing object and offset in a shared mapping, else (mm,
-/// address) apart from private keys. EFAULT without a mapping.
-/// Takes the mmap_lock (read) for a shared key, before any bucket lock.
+/// address) apart from private keys. EINVAL unless 4-byte aligned
+/// (checked first, as Linux), EFAULT without a mapping. Takes the
+/// mmap_lock (read) for a shared key, before any bucket lock.
 fn make_key(uaddr: u64, private: bool) -> Result<FutexKey, i32> {
+    if !uaddr.is_multiple_of(4) {
+        return Err(KernelError::InvalidArgument.to_errno_neg());
+    }
     let efault = KernelError::BadAddress.to_errno_neg();
     let mm = crate::task::percpu::current().mm().ok_or(efault)?;
     let id = alloc::sync::Arc::as_ptr(&mm) as u64;
@@ -965,33 +957,49 @@ pub fn exit_robust_list(tid: Tid) {
     }
 }
 
-/// A robust futex of an exiting task (Linux handle_futex_death): if it
-/// holds the lock, mark the owner dead (waiters kept, its TID cleared so
-/// a reused TID is not taken for the owner) and wake a waiter of a
-/// non-PI futex (PI futexes are not implemented). A pending non-PI op
-/// on a free word wakes a waiter: the task may have died between being
-/// woken and taking the lock
+/// A robust futex of an exiting task (Linux handle_futex_death).
+///
+/// - Pending op on a word another task (or none) owns: a non-PI op wakes
+///   one waiter, leaving the word alone, if the word has no owner or no
+///   FUTEX_WAITERS (Linux 7.2+). The task may have died after unlocking
+///   but before waking, or after being woken but before taking the lock
+///   while a third task took the word without marking waiters.
+/// - Otherwise, if the task owns the word, it is marked
+///   OWNER_DIED (WAITERS kept, the TID cleared so a reused TID is not
+///   taken for the owner) by a cmpxchg against the value read. A waiter
+///   setting WAITERS meanwhile makes it read and try again, so that bit
+///   is never lost. Then, for a non-PI futex with waiters, one waiter is
+///   woken (PI futexes are not implemented).
+///
+/// The word is in shared memory as often as not: keys are shared. A
+/// fault the handler cannot resolve leaves the futex alone (Linux gives
+/// up when fault_in_user_writeable fails).
 fn handle_futex_death(entry: u64, futex_offset: i64, tid: Tid, pi: bool, pending_op: bool) {
     let futex_addr = entry.wrapping_add_signed(futex_offset);
     if !futex_addr.is_multiple_of(4) {
         return;
     }
-    let Ok(uval) = read_user_u32(futex_addr) else {
-        return;
-    };
     let any = futex_op::FUTEX_BITSET_MATCH_ANY;
-    if pending_op && !pi && uval == 0 {
-        futex_wake(futex_addr, 1, any, false);
-        return;
-    }
-    if uval & futex_op::FUTEX_TID_MASK != tid as u32 {
-        return;
-    }
-    let mval = (uval & futex_op::FUTEX_WAITERS) | futex_op::FUTEX_OWNER_DIED;
-    if write_user_u32(futex_addr, mval).is_err() {
-        return;
-    }
-    // Shared: a robust futex may be in shared memory
+    let uval = loop {
+        let Ok(uval) = read_user_u32(futex_addr) else {
+            return;
+        };
+        let owner = uval & futex_op::FUTEX_TID_MASK;
+        if owner != tid as u32 {
+            let waiters = uval & futex_op::FUTEX_WAITERS != 0;
+            if pending_op && !pi && (owner == 0 || !waiters) {
+                futex_wake(futex_addr, 1, any, false);
+            }
+            return;
+        }
+        let mval = (uval & futex_op::FUTEX_WAITERS) | futex_op::FUTEX_OWNER_DIED;
+        match crate::uaccess::cmpxchg_user_u32::<Uaccess>(futex_addr, uval, mval) {
+            Ok(nval) if nval == uval => break uval,
+            Ok(_) => {}
+            Err(crate::uaccess::UaccessError::Again) => crate::task::percpu::cond_resched(),
+            Err(_) => return,
+        }
+    };
     if !pi && uval & futex_op::FUTEX_WAITERS != 0 {
         futex_wake(futex_addr, 1, any, false);
     }

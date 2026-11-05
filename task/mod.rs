@@ -895,6 +895,9 @@ pub mod pf {
     pub const FORKNOEXEC: u32 = 0x0000_0040;
     /// Kernel thread (Linux PF_KTHREAD)
     pub const KTHREAD: u32 = 0x0020_0000;
+    /// Used a capability (Linux PF_SUPERPRIV, set by ns_capable_common;
+    /// not inherited by fork): the process accounting ASU flag
+    pub const SUPERPRIV: u32 = 0x0000_0100;
     /// Its CPU affinity is not the user's to change (Linux
     /// PF_NO_SETAFFINITY): every hk kernel thread is bound to its CPU
     pub const NO_SETAFFINITY: u32 = 0x0400_0000;
@@ -2246,11 +2249,17 @@ pub fn cap_fix_setfsuid(old: &Cred, new: &mut Cred) {
     }
 }
 
+/// The current task holds `cap` (Linux capable: ns_capable_common, which
+/// marks the task PF_SUPERPRIV when it does)
 pub fn capable(cap: u32) -> bool {
     if cap > CAP_LAST_CAP {
         return false;
     }
-    percpu::current_cred().cap_effective.has(cap)
+    let ok = percpu::current_cred().cap_effective.has(cap);
+    if ok {
+        percpu::current().set_flag(pf::SUPERPRIV);
+    }
+    ok
 }
 
 // =============================================================================
@@ -2610,29 +2619,27 @@ pub fn set_set_child_tid(tid: Tid, addr: u64) {
 // Cgroup file descriptor lookup (for CLONE_INTO_CGROUP)
 // =============================================================================
 
-/// Look up a cgroup from a file descriptor.
-///
-/// The fd must refer to an open directory on cgroupfs.
-/// Returns the cgroup Arc if valid, None otherwise.
-pub fn cgroup_from_fd(tid: Tid, fd: i32) -> Option<alloc::sync::Arc<crate::cgroup::Cgroup>> {
+/// The cgroup a CLONE_INTO_CGROUP fd names (Linux cgroup_get_from_file):
+/// EBADF for no file or a file that is not a cgroup directory, ENOENT
+/// for a removed one (css_tryget_online_from_dir)
+pub fn cgroup_from_fd(tid: Tid, fd: i32) -> Result<alloc::sync::Arc<crate::cgroup::Cgroup>, i32> {
     use crate::fs::cgroupfs::{CgroupfsInodeData, CgroupfsInodeWrapper};
-
-    // Get the file from fd
-    let fd_table = fdtable::get_task_fd(tid)?;
-    let file = fd_table.lock().get(fd)?;
-
-    // Get the inode from the file
-    let inode = file.get_inode()?;
-
-    // Check if it's a cgroupfs directory inode
-    let private = inode.get_private()?;
-    let wrapper = private.as_any().downcast_ref::<CgroupfsInodeWrapper>()?;
+    const EBADF: i32 = 9;
+    const ENOENT: i32 = 2;
+    let file = fdtable::get_task_fd(tid)
+        .and_then(|t| t.lock().get(fd))
+        .ok_or(EBADF)?;
+    let private = file
+        .get_inode()
+        .and_then(|i| i.get_private())
+        .ok_or(EBADF)?;
+    let wrapper = private
+        .as_any()
+        .downcast_ref::<CgroupfsInodeWrapper>()
+        .ok_or(EBADF)?;
     let data = wrapper.0.read();
-
-    // Must be a directory (cgroup) not a control file
-    if let CgroupfsInodeData::Directory { cgroup } = &*data {
-        cgroup.upgrade()
-    } else {
-        None
-    }
+    let CgroupfsInodeData::Directory { cgroup } = &*data else {
+        return Err(EBADF);
+    };
+    cgroup.upgrade().filter(|c| !c.is_dead()).ok_or(ENOENT)
 }

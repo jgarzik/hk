@@ -23,6 +23,7 @@ use crate::task::workqueue::{DelayedWork, SYSTEM_WQ, Work};
 static EVENT_WQ: WaitQueue = WaitQueue::new();
 static WORK_RAN: AtomicBool = AtomicBool::new(false);
 static DELAYED_RAN_TICK: AtomicU64 = AtomicU64::new(0);
+static MOD_RUNS: AtomicU64 = AtomicU64::new(0);
 static CHILD_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// Start the self-test thread
@@ -73,6 +74,48 @@ fn selftest_thread(_arg: usize) {
     let ran = DELAYED_RAN_TICK.load(Ordering::Acquire);
     check("delayed_work_ran", left > 0, 0);
     check("delayed_work_delay", ran >= t0 + 5, ran.saturating_sub(t0));
+
+    // 3b. mod_delayed_work (Linux semantics): an idle item is queued
+    // (false); a timed one is re-timed to now (true) and runs once; a
+    // cancelled one does not run
+    let mw = Arc::new(Mutex::new(DelayedWork::new(|| {
+        MOD_RUNS.fetch_add(1, Ordering::AcqRel);
+        EVENT_WQ.wake_all();
+    })));
+    check(
+        "mod_delayed_idle",
+        !SYSTEM_WQ.mod_delayed_work(&mw, 10_000),
+        0,
+    );
+    check("mod_delayed_timed", SYSTEM_WQ.mod_delayed_work(&mw, 0), 0);
+    let left = EVENT_WQ.wait_event_timeout(|| MOD_RUNS.load(Ordering::Acquire) != 0, 200);
+    check("mod_delayed_ran", left > 0, 0);
+    sleep_ms(50);
+    check(
+        "mod_delayed_once",
+        MOD_RUNS.load(Ordering::Acquire) == 1,
+        MOD_RUNS.load(Ordering::Acquire),
+    );
+    SYSTEM_WQ.queue_delayed_work(mw.clone(), 10);
+    check("cancel_delayed", SYSTEM_WQ.cancel_delayed_work(&mw), 0);
+    sleep_ms(200);
+    check(
+        "cancel_delayed_norun",
+        MOD_RUNS.load(Ordering::Acquire) == 1,
+        MOD_RUNS.load(Ordering::Acquire),
+    );
+    // Zero-delay kicks in a row (writeback's wakeup) run it once more,
+    // never zero times
+    check("mod_delayed_idle2", !SYSTEM_WQ.mod_delayed_work(&mw, 0), 0);
+    for _ in 0..8 {
+        SYSTEM_WQ.mod_delayed_work(&mw, 0);
+    }
+    let left = EVENT_WQ.wait_event_timeout(|| MOD_RUNS.load(Ordering::Acquire) >= 2, 200);
+    check(
+        "mod_delayed_kicks_run",
+        left > 0,
+        MOD_RUNS.load(Ordering::Acquire),
+    );
 
     // 4. kthread park/unpark/stop with the child on another CPU
     let other = if crate::cpu::this_id() == 0 && cpu_has_scheduler(1) {

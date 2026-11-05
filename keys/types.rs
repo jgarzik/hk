@@ -54,8 +54,7 @@ impl KeyType for UserKeyType {
     }
 
     fn instantiate(&self, key: &Key, data: &[u8]) -> Result<(), i64> {
-        key.set_payload(data.to_vec());
-        Ok(())
+        key.instantiate(data.to_vec()).map_err(|e| e.sysret())
     }
 
     fn read(&self, key: &Key, buffer: &mut [u8]) -> Result<usize, i64> {
@@ -73,18 +72,14 @@ impl KeyType for UserKeyType {
     }
 
     fn update(&self, key: &Key, data: &[u8]) -> Result<(), i64> {
-        if key.is_revoked() {
-            return Err(KernelError::KeyRevoked.sysret());
-        }
-        key.set_payload(data.to_vec());
-        Ok(())
+        key.update(data.to_vec()).map_err(|e| e.sysret())
     }
 
     fn describe(&self, key: &Key) -> String {
         format!(
             "user;{};{};{:08x};{}",
-            key.uid,
-            key.gid,
+            key.uid(),
+            key.gid(),
             key.perm(),
             key.description
         )
@@ -112,8 +107,7 @@ impl KeyType for KeyringKeyType {
     }
 
     fn instantiate(&self, _key: &Key, _data: &[u8]) -> Result<(), i64> {
-        // Keyrings don't have payloads - just mark as instantiated
-        // The key's state is set by the Key::set_payload or directly
+        // Keyrings have no payload; create_keyring instantiates them
         Ok(())
     }
 
@@ -144,8 +138,8 @@ impl KeyType for KeyringKeyType {
     fn describe(&self, key: &Key) -> String {
         format!(
             "keyring;{};{};{:08x};{}",
-            key.uid,
-            key.gid,
+            key.uid(),
+            key.gid(),
             key.perm(),
             key.description
         )

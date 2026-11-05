@@ -68,6 +68,9 @@ pub enum ClockId {
     Realtime,
     /// CLOCK_MONOTONIC - Never goes backward, unaffected by time adjustments
     Monotonic,
+    /// CLOCK_TAI - realtime plus the TAI offset, read in the same
+    /// seqlock pass
+    Tai,
 }
 
 /// Placeholder function for uninitialized TSC reader
@@ -110,38 +113,34 @@ pub const STA_UNSYNC: i32 = 0x0040;
 pub const STA_FREQHOLD: i32 = 0x0080;
 pub const STA_NANO: i32 = 0x2000;
 
-/// Extended timekeeper state for NTP/adjtimex support
-pub struct NtpState {
+/// The NTP state adjtimex sets and reads back (Linux struct ntp_data
+/// fields hk keeps), under `TimeKeeper.lock` as Linux's under
+/// tk_core.lock
+#[derive(Clone, Copy)]
+pub struct Ntp {
     /// Maximum error (microseconds)
-    pub maxerror: AtomicI64,
+    pub maxerror: i64,
     /// Estimated error (microseconds)
-    pub esterror: AtomicI64,
+    pub esterror: i64,
     /// Clock status flags (STA_*)
-    pub status: AtomicI32,
-    /// TAI offset (seconds)
-    pub tai_offset: AtomicI32,
+    pub status: i32,
     /// PLL time constant
-    pub constant: AtomicI64,
+    pub constant: i64,
     /// Tick value (usec per tick, nominally 10000 for 100Hz)
-    pub tick: AtomicI64,
+    pub tick: i64,
 }
 
-impl NtpState {
-    /// Create a new NtpState with default values
+impl Ntp {
     const fn new() -> Self {
         Self {
-            maxerror: AtomicI64::new(500_000),  // 0.5 sec default
-            esterror: AtomicI64::new(500_000),  // 0.5 sec default
-            status: AtomicI32::new(STA_UNSYNC), // Initially unsynchronized
-            tai_offset: AtomicI32::new(0),
-            constant: AtomicI64::new(2),
-            tick: AtomicI64::new(10000), // 10ms in usec (100Hz)
+            maxerror: 500_000, // 0.5 sec default
+            esterror: 500_000,
+            status: STA_UNSYNC, // Initially unsynchronized
+            constant: 2,
+            tick: 10000, // 10ms in usec (100Hz)
         }
     }
 }
-
-/// Global NTP state
-pub static NTP_STATE: NtpState = NtpState::new();
 
 /// Global timekeeper with seqlock protection
 ///
@@ -153,8 +152,9 @@ pub struct TimeKeeper {
     /// IRQs stay off for the whole odd-`seq` window, so the tick on this
     /// CPU never spins on a write it interrupted, and two writers (the
     /// CPU 0 tick, clock_settime) never interleave their `seq` bumps.
-    /// Leaf: nothing is taken under it; readers never take it
-    lock: IrqSpinlock<()>,
+    /// Leaf: nothing is taken under it; readers never take it. It also
+    /// holds the NTP state adjtimex changes (Linux: under tk_core.lock)
+    lock: IrqSpinlock<Ntp>,
 
     /// Seqlock sequence counter (odd = write in progress)
     seq: AtomicU32,
@@ -168,6 +168,9 @@ pub struct TimeKeeper {
     /// Realtime offset from monotonic in nanoseconds
     /// realtime = monotonic + offset
     realtime_offset_ns: AtomicI64,
+
+    /// TAI - UTC in seconds (Linux tk->tai_offset), seqlock-protected
+    tai_offset: AtomicI32,
 
     /// Cycles to nanoseconds multiplier
     /// ns = (cycles * mult) >> shift
@@ -196,11 +199,12 @@ impl TimeKeeper {
     /// Create a new uninitialized timekeeper
     pub const fn new() -> Self {
         Self {
-            lock: IrqSpinlock::new(()),
+            lock: IrqSpinlock::new(Ntp::new()),
             seq: AtomicU32::new(0),
             cycle_base: AtomicU64::new(0),
             mono_base_ns: AtomicU64::new(0),
             realtime_offset_ns: AtomicI64::new(0),
+            tai_offset: AtomicI32::new(0),
             mult: AtomicU64::new(0),
             shift: AtomicU32::new(0),
             tsc_freq_hz: AtomicU64::new(0),
@@ -326,6 +330,7 @@ impl TimeKeeper {
             let cycle_base = self.cycle_base.load(Ordering::Relaxed);
             let mono_base = self.mono_base_ns.load(Ordering::Relaxed);
             let realtime_offset = self.realtime_offset_ns.load(Ordering::Relaxed);
+            let tai = self.tai_offset.load(Ordering::Relaxed);
             let mult = self.mult.load(Ordering::Relaxed);
             let shift = self.shift.load(Ordering::Relaxed);
 
@@ -349,6 +354,9 @@ impl TimeKeeper {
             let ns = match clock_id {
                 ClockId::Monotonic => mono_ns as i128,
                 ClockId::Realtime => mono_ns as i128 + realtime_offset as i128,
+                ClockId::Tai => {
+                    mono_ns as i128 + realtime_offset as i128 + tai as i128 * 1_000_000_000
+                }
             };
 
             return Timespec::from_nanos(ns);
@@ -413,6 +421,50 @@ impl TimeKeeper {
     /// CLOCK_REALTIME - CLOCK_MONOTONIC, ns
     pub fn real_offset(&self) -> i64 {
         self.realtime_offset_ns.load(Ordering::Relaxed)
+    }
+
+    /// TAI - UTC, seconds (a single word; writers hold the lock)
+    pub fn tai_offset(&self) -> i32 {
+        self.tai_offset.load(Ordering::Acquire)
+    }
+
+    /// Add `delta_ns` to CLOCK_REALTIME in one write section (Linux
+    /// timekeeping_inject_offset): concurrent offsets all count and no
+    /// time passes between reading the clock and moving it. False, with
+    /// nothing changed, if the result is out of range.
+    pub fn inject_offset(&self, delta_ns: i64) -> bool {
+        if !self.is_initialized() {
+            return false;
+        }
+        let read_tsc = self.get_read_cycles();
+        let g = self.lock.lock();
+        let now = self.read(ClockId::Realtime, read_tsc).to_nanos();
+        if !settod_valid(&Timespec::from_nanos(now + delta_ns as i128)) {
+            return false;
+        }
+        self.write_begin();
+        let off = self.realtime_offset_ns.load(Ordering::Relaxed);
+        self.realtime_offset_ns
+            .store(off.wrapping_add(delta_ns), Ordering::Relaxed);
+        self.write_end();
+        drop(g);
+        clock_was_set();
+        true
+    }
+
+    /// adjtimex's state change and read-back under one hold of the lock
+    /// (Linux __do_adjtimex under tk_core.lock): `f` changes the NTP state
+    /// and may set a new TAI offset; returns the NTP state, the TAI
+    /// offset and CLOCK_REALTIME as they are after it
+    pub fn ntp_update(&self, f: impl FnOnce(&mut Ntp) -> Option<i32>) -> (Ntp, i32, Timespec) {
+        let mut g = self.lock.lock();
+        if let Some(tai) = f(&mut g) {
+            self.write_begin();
+            self.tai_offset.store(tai, Ordering::Relaxed);
+            self.write_end();
+        }
+        let now = self.read(ClockId::Realtime, self.get_read_cycles());
+        (*g, self.tai_offset.load(Ordering::Relaxed), now)
     }
 }
 

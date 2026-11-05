@@ -1960,6 +1960,35 @@ impl InodeOps for VfatInodeOps {
         update_size(inode, &sb_data)
     }
 
+    /// As Linux fat_fallocate: KEEP_SIZE allocates clusters past the end
+    /// (fat_add_clusters), plain mode is an expanding truncate
+    /// (fat_cont_expand); nothing else
+    fn fallocate(
+        &self,
+        inode: &Arc<Inode>,
+        mode: i32,
+        offset: u64,
+        len: u64,
+    ) -> Result<(), KernelError> {
+        use super::misc::falloc_mode::FALLOC_FL_KEEP_SIZE;
+        if mode & !FALLOC_FL_KEEP_SIZE != 0 || !inode.mode().is_file() {
+            return Err(KernelError::OperationNotSupported);
+        }
+        let end = offset + len;
+        if end > u32::MAX as u64 {
+            return Err(KernelError::FileTooLarge);
+        }
+        if mode & FALLOC_FL_KEEP_SIZE != 0 {
+            let sb = inode.superblock().ok_or(KernelError::Io)?;
+            return ensure_clusters(inode, &get_sb_data(&sb)?, end);
+        }
+        if end <= inode.get_size() {
+            return Ok(());
+        }
+        inode.newsize_ok(end)?;
+        self.truncate(inode, end)
+    }
+
     fn rename(
         &self,
         old_dir: &Inode,

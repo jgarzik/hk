@@ -362,6 +362,13 @@ pub static CTLS: &[Ctl] = &[
         text: None,
     },
     Ctl {
+        path: "net/ipv4/tcp_mem",
+        mode: 0o644,
+        show: crate::net::tcp::mem::sysctl_show,
+        store: crate::net::tcp::mem::sysctl_store,
+        text: None,
+    },
+    Ctl {
         path: "net/ipv4/tcp_rmem",
         mode: 0o644,
         show: rmem_show,
@@ -435,6 +442,13 @@ pub static CTLS: &[Ctl] = &[
         mode: 0o644,
         show: || get_i32(|s| &s.frag_time),
         store: |v| set_int(|s| &s.frag_time, v, 1, INT_MAX),
+        text: None,
+    },
+    Ctl {
+        path: "net/core/mem_pcpu_rsv",
+        mode: 0o644,
+        show: crate::net::tcp::mem::rsv_show,
+        store: crate::net::tcp::mem::rsv_store,
         text: None,
     },
     Ctl {

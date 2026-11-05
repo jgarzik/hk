@@ -26,10 +26,10 @@
 
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicUsize, Ordering};
 
 use super::ack::Dack;
 use super::cong::Cong;
+use super::mem;
 use crate::util::error::KernelError;
 
 /// TCP header flags
@@ -115,15 +115,17 @@ pub const OOW_RATELIMIT: u64 = 500;
 /// than this (ms) is not trusted
 pub const PAWS_WRAP: u64 = (i32::MAX as u64 / 1_000_000) * 1000;
 
-/// Global TCP buffer memory (send + receive queues of all connections;
-/// Linux tcp_mem): past `MEM_LIMIT`, senders wait and receive windows
-/// only shrink, so many connections cannot exhaust the kernel heap
-static MEM: AtomicUsize = AtomicUsize::new(0);
-pub const MEM_LIMIT: usize = 4 * 1024 * 1024;
+/// Linux tcp_wmem[0] (4096) in hk's byte counts, which leave out
+/// truesize overhead (half, as SO_SNDBUF): the send bytes a connection
+/// may queue whatever the memory (tcp_wmem_schedule) and below the hard
+/// limit (__sk_mem_raise_allocated); tcp_rmem[0] / 2 likewise
+const WMEM_MIN: usize = 2048;
 
-/// Bytes of the global TCP memory still free
-pub fn mem_free() -> usize {
-    MEM_LIMIT.saturating_sub(MEM.load(Ordering::Relaxed))
+/// Which queue a charge is for (Linux SK_MEM_SEND / SK_MEM_RECV)
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum MemKind {
+    Send,
+    Recv,
 }
 
 /// Per-namespace knobs a connection uses (sysctls, read at creation)
@@ -138,6 +140,9 @@ pub struct Cfg {
     pub wscale: bool,
     /// tcp_timestamps (0 off, 1 on with offset, 2 on without offset)
     pub ts: u8,
+    /// tcp_rmem[0]: receive bytes a connection may always hold below
+    /// the hard memory limit
+    pub rmem_min: u32,
     /// tcp_rmem[2]: the receive space the window scale allows for
     pub rmem_max: u32,
     /// tcp_keepalive_time / _intvl (ms), tcp_keepalive_probes
@@ -155,6 +160,7 @@ impl Default for Cfg {
             fin_timeout: 60_000,
             wscale: true,
             ts: 1,
+            rmem_min: 4096,
             rmem_max: 6 * 1024 * 1024,
             keepidle: 7_200_000,
             keepintvl: 75_000,
@@ -537,6 +543,22 @@ impl Ooo {
         }
     }
 
+    /// Drop the last piece if it lies after `seq`: true if one went
+    /// (Linux tcp_prune_ofo_queue, from the highest sequence down)
+    pub fn prune_after(&mut self, seq: u32) -> bool {
+        let at = seq.wrapping_sub(self.base);
+        let Some((&s, _)) = self.map.iter().next_back() else {
+            return false;
+        };
+        if s <= at {
+            return false;
+        }
+        if let Some(d) = self.map.remove(&s) {
+            self.bytes -= d.len();
+        }
+        true
+    }
+
     /// The first piece that reaches `nxt`, trimmed to start there;
     /// pieces `nxt` already passed are dropped on the way
     pub fn take(&mut self, nxt: u32) -> Option<Vec<u8>> {
@@ -666,12 +688,17 @@ pub struct TcpCb {
     pub soft_err: Option<KernelError>,
     /// An ACK must go out now (pure ACK if no data segment carries it)
     pub(super) ack_now: bool,
+    /// In-order data was dropped for memory: the next ACK offers a zero
+    /// window (Linux ICSK_ACK_NOMEM)
+    pub(super) ack_nomem: bool,
     /// When the last out-of-window / challenge ACK went out
     pub(super) last_oow: Option<u64>,
     /// Counters (TCP_INFO)
     pub(super) stats: Stats,
-    /// Bytes charged to the global TCP memory
-    charged: usize,
+    /// Quanta held in the global TCP memory: the queues' bytes rounded
+    /// up, never more (Linux sk_forward_alloc, reclaimed below a page
+    /// on every uncharge)
+    held: usize,
 }
 
 /// Counters for TCP_INFO
@@ -695,6 +722,7 @@ pub struct Stats {
 impl TcpCb {
     /// A closed control block
     pub fn new(cfg: Cfg) -> Self {
+        mem::socket_inc();
         Self {
             state: TcpState::Closed,
             cfg,
@@ -752,9 +780,10 @@ impl TcpCb {
             orphan: false,
             soft_err: None,
             ack_now: false,
+            ack_nomem: false,
             last_oow: None,
             stats: Stats::default(),
-            charged: 0,
+            held: 0,
         }
     }
 
@@ -912,10 +941,24 @@ impl TcpCb {
     /// Queue up to `data.len()` bytes for sending; returns how many fit
     /// (the caller calls `output`)
     pub fn send(&mut self, data: &[u8]) -> usize {
-        let n = data.len().min(self.snd_space());
+        let n = self.wmem_schedule(data.len().min(self.snd_space()));
         self.sndq.extend(&data[..n]);
-        self.charge();
         n
+    }
+
+    /// How much of `n` bytes may be queued (Linux tcp_wmem_schedule):
+    /// all if memory allows; else, so a sender with little queued still
+    /// progresses, its tcp_wmem[0] floor is charged regardless and what
+    /// the held quanta cover is taken; 0: wait for memory
+    fn wmem_schedule(&mut self, n: usize) -> usize {
+        if n == 0 || self.mem_schedule(n, MemKind::Send) {
+            return n;
+        }
+        let left = WMEM_MIN.saturating_sub(self.sndq.len());
+        if left > 0 {
+            self.mem_force(left.min(n));
+        }
+        n.min((self.held * mem::QUANTUM).saturating_sub(self.mem_used()))
     }
 
     /// Room in the send queue (none while TCP_NOTSENT_LOWAT unsent
@@ -925,7 +968,7 @@ impl TcpCb {
         if lowat != 0 && self.unsent() >= lowat {
             return 0;
         }
-        self.snd_cap.saturating_sub(self.sndq.len()).min(mem_free())
+        self.snd_cap.saturating_sub(self.sndq.len())
     }
 
     /// Bytes queued for sending, sent or not (SIOCOUTQ)
@@ -947,10 +990,7 @@ impl TcpCb {
     pub fn writable(&self) -> bool {
         let free = self.snd_cap.saturating_sub(self.sndq.len());
         let lowat = self.opts.notsent_lowat;
-        free > 0
-            && free * 2 >= self.sndq.len()
-            && mem_free() > 0
-            && (lowat == 0 || self.unsent() < lowat as usize)
+        free > 0 && free * 2 >= self.sndq.len() && (lowat == 0 || self.unsent() < lowat as usize)
     }
 
     /// Bytes readable
@@ -966,7 +1006,7 @@ impl TcpCb {
         copy_out(&self.rcvq, skip, &mut buf[..n]);
         if take && n > 0 {
             self.rcvq.drain(..skip + n);
-            self.charge();
+            self.mem_settle();
             self.cleanup_rbuf(out);
         }
         n
@@ -976,7 +1016,7 @@ impl TcpCb {
     pub fn discard(&mut self, n: usize, out: &mut Out) -> usize {
         let n = n.min(self.rcvq.len());
         self.rcvq.drain(..n);
-        self.charge();
+        self.mem_settle();
         if n > 0 {
             self.cleanup_rbuf(out);
         }
@@ -1087,7 +1127,7 @@ impl TcpCb {
         self.sndq.clear();
         self.ooo = Ooo::default();
         self.stop_timers();
-        self.charge();
+        self.mem_settle();
         out.shut |= SHUTDOWN_MASK;
         out.wake = true;
         out.done = true;
@@ -1098,7 +1138,7 @@ impl TcpCb {
         self.state = TcpState::TimeWait;
         self.stop_timers();
         self.sndq.clear();
-        self.charge();
+        self.mem_settle();
         self.wait_at = Some(now + TIMEWAIT_LEN);
         out.timewait = true;
         out.wake = true;
@@ -1134,12 +1174,10 @@ impl TcpCb {
         (self.rcv_cap as u32).clamp(1, MAX_WINDOW << self.rcv_wscale)
     }
 
-    /// Unused receive space (Linux tcp_space), also bounded by the
-    /// global TCP memory
+    /// Unused receive space (Linux tcp_space)
     fn free_space(&self) -> u32 {
         let used = self.rcvq.len() + self.ooo.truesize();
-        let free = (self.full_space() as usize).saturating_sub(used);
-        free.min(mem_free()) as u32
+        (self.full_space() as usize).saturating_sub(used) as u32
     }
 
     /// Window currently offered (Linux tcp_receive_window)
@@ -1183,6 +1221,13 @@ impl TcpCb {
     /// right edge never moves left (a scaled window rounds up to its
     /// unit); records Last.ACK.sent
     pub(super) fn select_window(&mut self) -> u16 {
+        // Data dropped for memory: close the window to stop the sender
+        // (the one case the right edge moves left)
+        if self.ack_nomem {
+            self.rcv_adv = self.rcv_nxt;
+            self.rcv_wup = self.rcv_nxt;
+            return 0;
+        }
         let unit = 1u32 << self.rcv_wscale;
         let cur = self.rcv_wnd();
         let mut w = self.window_now();
@@ -1216,15 +1261,85 @@ impl TcpCb {
 
     // --- memory ------------------------------------------------------------
 
-    /// Re-charge the global TCP memory for the current queue sizes
-    pub(super) fn charge(&mut self) {
-        let now = self.sndq.len() + self.rcvq.len() + self.ooo.truesize();
-        if now >= self.charged {
-            MEM.fetch_add(now - self.charged, Ordering::Relaxed);
-        } else {
-            MEM.fetch_sub(self.charged - now, Ordering::Relaxed);
+    /// Bytes in the queues (Linux sk_wmem_queued + sk_rmem_alloc)
+    fn mem_used(&self) -> usize {
+        self.sndq.len() + self.rcvq.len() + self.ooo.truesize()
+    }
+
+    /// Cover `size` more bytes before queueing them (Linux
+    /// sk_wmem_schedule / sk_rmem_schedule): what the held quanta lack
+    /// is added to the global count first, then checked, and taken back
+    /// on failure (__sk_mem_raise_allocated), so racing connections
+    /// never all pass one check
+    pub(super) fn mem_schedule(&mut self, size: usize, kind: MemKind) -> bool {
+        let need = mem::quanta(self.mem_used() + size);
+        if need <= self.held {
+            return true;
         }
-        self.charged = now;
+        let amt = need - self.held;
+        mem::add(amt);
+        if self.mem_raise(mem::allocated(), size, kind) {
+            self.held = need;
+            return true;
+        }
+        mem::sub(amt);
+        false
+    }
+
+    /// May the total, `allocated` with this charge in it, stand (Linux
+    /// __sk_mem_raise_allocated)? Under tcp_mem[0] always, leaving
+    /// pressure; past [1] pressure starts; past [2] never, except a
+    /// sender filling its own buffer (suppress_allocation for
+    /// SOCK_STREAM: it cannot wait for memory it is not using). Between,
+    /// when not under pressure, or for a connection under its
+    /// tcp_rmem[0] / tcp_wmem[0] floor or using less than an even share
+    /// of [2].
+    fn mem_raise(&self, allocated: usize, size: usize, kind: MemKind) -> bool {
+        if allocated <= mem::limit(0) {
+            mem::leave_pressure();
+            return true;
+        }
+        if allocated > mem::limit(1) {
+            mem::enter_pressure();
+        }
+        if allocated <= mem::limit(2) {
+            let floor = match kind {
+                MemKind::Recv => {
+                    self.rcvq.len() + self.ooo.truesize() < self.cfg.rmem_min as usize / 2
+                }
+                MemKind::Send => self.sndq.len() < WMEM_MIN,
+            };
+            if floor {
+                return true;
+            }
+            if !mem::under_pressure() || mem::limit(2) > mem::sockets() * self.held {
+                return true;
+            }
+        }
+        kind == MemKind::Send && self.sndq.len() + size >= self.snd_cap
+    }
+
+    /// Charge `size` more bytes without a limit (Linux
+    /// sk_forced_mem_schedule)
+    fn mem_force(&mut self, size: usize) {
+        let need = mem::quanta(self.mem_used() + size);
+        if need > self.held {
+            mem::add(need - self.held);
+            self.held = need;
+        }
+    }
+
+    /// Settle the held quanta on the queues (Linux sk_mem_uncharge +
+    /// sk_mem_reclaim; up only for a charge already granted or forced,
+    /// sk_forced_mem_schedule)
+    pub(super) fn mem_settle(&mut self) {
+        let now = mem::quanta(self.mem_used());
+        if now >= self.held {
+            mem::add(now - self.held);
+        } else {
+            mem::sub(self.held - now);
+        }
+        self.held = now;
     }
 
     // --- timers --------------------------------------------------------------
@@ -1253,6 +1368,7 @@ impl TcpCb {
 
 impl Drop for TcpCb {
     fn drop(&mut self) {
-        MEM.fetch_sub(self.charged, Ordering::Relaxed);
+        mem::sub(self.held);
+        mem::socket_dec();
     }
 }

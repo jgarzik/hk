@@ -31,10 +31,7 @@ use super::file::{DirContext, DirEntry, File, FileOps};
 use super::inode::{AsAny, FileType, Inode, InodeData, InodeMode, InodeOps, Timespec};
 use super::superblock::{FileSystemType, StatFs, SuperBlock, SuperOps};
 
-use crate::cgroup::{
-    CGROUP_ROOT, Cgroup, ControllerType, cgroup_attach_task, cgroup_init, cgroup_mkdir,
-    cgroup_rmdir,
-};
+use crate::cgroup::{CGROUP_ROOT, Cgroup, ControllerType, cgroup_init, cgroup_mkdir, cgroup_rmdir};
 use crate::task::Pid;
 
 /// Cgroup2 superblock magic
@@ -113,6 +110,7 @@ impl CgroupControlFileType {
 }
 
 /// Cgroupfs inode private data
+#[derive(Clone)]
 pub enum CgroupfsInodeData {
     /// Cgroup directory
     Directory { cgroup: Weak<Cgroup> },
@@ -220,18 +218,15 @@ impl InodeOps for CgroupfsInodeOps {
             .downcast_ref::<CgroupfsInodeWrapper>()
             .ok_or(KernelError::Io)?;
 
-        let data = wrapper.0.read();
-        match &*data {
-            CgroupfsInodeData::Directory { cgroup } => {
-                let parent_cg = cgroup.upgrade().ok_or(KernelError::NotFound)?;
-
-                // Create new cgroup
-                let new_cg = cgroup_mkdir(&parent_cg, name)?;
-
-                Ok(create_cgroup_dir_inode(dir, &new_cg))
-            }
-            _ => Err(KernelError::NotDirectory),
-        }
+        // Out of the inode's spin lock before cgroup_mkdir takes
+        // CGROUP_MUTEX
+        let parent = match &*wrapper.0.read() {
+            CgroupfsInodeData::Directory { cgroup } => cgroup.clone(),
+            _ => return Err(KernelError::NotDirectory),
+        };
+        let parent_cg = parent.upgrade().ok_or(KernelError::NoDevice)?;
+        let new_cg = cgroup_mkdir(&parent_cg, name)?;
+        Ok(create_cgroup_dir_inode(dir, &new_cg))
     }
 
     fn rmdir(&self, dir: &Inode, name: &[u8]) -> Result<(), KernelError> {
@@ -243,14 +238,14 @@ impl InodeOps for CgroupfsInodeOps {
             .downcast_ref::<CgroupfsInodeWrapper>()
             .ok_or(KernelError::Io)?;
 
-        let data = wrapper.0.read();
-        match &*data {
-            CgroupfsInodeData::Directory { cgroup } => {
-                let parent_cg = cgroup.upgrade().ok_or(KernelError::NotFound)?;
-                cgroup_rmdir(&parent_cg, name)
-            }
-            _ => Err(KernelError::NotDirectory),
-        }
+        // Out of the inode's spin lock before cgroup_rmdir takes
+        // CGROUP_MUTEX
+        let parent = match &*wrapper.0.read() {
+            CgroupfsInodeData::Directory { cgroup } => cgroup.clone(),
+            _ => return Err(KernelError::NotDirectory),
+        };
+        let parent_cg = parent.upgrade().ok_or(KernelError::NotFound)?;
+        cgroup_rmdir(&parent_cg, name)
     }
 }
 
@@ -364,10 +359,20 @@ fn generate_control_file_content(
 ) -> Result<Vec<u8>, KernelError> {
     match file_type {
         CgroupControlFileType::Procs => {
-            // List all task PIDs in this cgroup
-            let tasks = cgroup.tasks();
+            // Each member process once, by its tgid (Linux cgroup.procs;
+            // cgroup.threads would list the threads)
+            let mut tgids: Vec<Pid> = {
+                let table = crate::task::percpu::TASKLIST.read();
+                cgroup
+                    .tasks()
+                    .into_iter()
+                    .filter_map(|tid| table.get(tid as crate::task::Tid).map(|t| t.task.pid))
+                    .collect()
+            };
+            tgids.sort_unstable();
+            tgids.dedup();
             let mut content = String::new();
-            for pid in tasks {
+            for pid in tgids {
                 content.push_str(&format!("{}\n", pid));
             }
             Ok(content.into_bytes())
@@ -437,20 +442,40 @@ fn handle_control_file_write(
             // Migrate a task to this cgroup
             let s = core::str::from_utf8(data).map_err(|_| KernelError::InvalidArgument)?;
             let pid: Pid = s.trim().parse().map_err(|_| KernelError::InvalidArgument)?;
-            cgroup_attach_task(cgroup, pid)
+            // The whole thread group moves, against forks (Linux
+            // cgroup_procs_write: cgroup_attach_lock, threadgroup)
+            let _tg = crate::cgroup::CGROUP_THREADGROUP_RWSEM.write();
+            crate::cgroup::migrate_thread_group(cgroup, pid)
         }
         CgroupControlFileType::SubtreeControl => {
             // Enable/disable controllers for children
             // Format: "+controller -controller"
+            // Linux cgroup_subtree_control_write: every token parsed
+            // first (an unknown one is EINVAL), then a controller can be
+            // enabled only where it is available: on the root, or in a
+            // cgroup that has it itself (ENOENT)
             let s = core::str::from_utf8(data).map_err(|_| KernelError::InvalidArgument)?;
+            let mut changes = Vec::new();
             for token in s.split_whitespace() {
-                if let Some(name) = token.strip_prefix('+')
-                    && let Some(ctrl) = ControllerType::from_name(name)
-                {
+                let (on, name) = match (token.strip_prefix('+'), token.strip_prefix('-')) {
+                    (Some(n), _) => (true, n),
+                    (_, Some(n)) => (false, n),
+                    _ => return Err(KernelError::InvalidArgument),
+                };
+                let ctrl = ControllerType::from_name(name).ok_or(KernelError::InvalidArgument)?;
+                changes.push((on, ctrl));
+            }
+            let is_root = cgroup.parent().is_none();
+            if changes
+                .iter()
+                .any(|&(on, c)| on && !is_root && cgroup.css(c).is_none())
+            {
+                return Err(KernelError::NotFound);
+            }
+            for (on, ctrl) in changes {
+                if on {
                     cgroup.enable_subtree_control(ctrl);
-                } else if let Some(name) = token.strip_prefix('-')
-                    && let Some(ctrl) = ControllerType::from_name(name)
-                {
+                } else {
                     cgroup.disable_subtree_control(ctrl);
                 }
             }
@@ -562,10 +587,22 @@ impl FileOps for CgroupfsFileOps {
             .downcast_ref::<CgroupfsInodeWrapper>()
             .ok_or(KernelError::Io)?;
 
-        let data = wrapper.0.read();
-        match &*data {
+        // Writes run under CGROUP_MUTEX (Linux cgroup_kn_lock_live for
+        // cgroup.procs, subtree_control and freeze), taken before the
+        // inode's spin lock; a removed cgroup's files are ENODEV (Linux
+        // kernfs_fop_write: no active reference to a removed node)
+        let _g = crate::cgroup::CGROUP_MUTEX.lock();
+        // A copy, so no spin lock is held while the write sleeps
+        // (cgroup.procs takes the threadgroup rwsem)
+        let data = wrapper.0.read().clone();
+        let live = |c: &alloc::sync::Weak<Cgroup>| {
+            c.upgrade()
+                .filter(|c| !c.is_dead())
+                .ok_or(KernelError::NoDevice)
+        };
+        match &data {
             CgroupfsInodeData::ControlFile { cgroup, file_type } => {
-                let cg = cgroup.upgrade().ok_or(KernelError::NotFound)?;
+                let cg = live(cgroup)?;
                 handle_control_file_write(&cg, *file_type, buf)?;
                 Ok(buf.len())
             }
@@ -574,7 +611,7 @@ impl FileOps for CgroupfsFileOps {
                 controller,
                 file_name,
             } => {
-                let cg = cgroup.upgrade().ok_or(KernelError::NotFound)?;
+                let cg = live(cgroup)?;
                 handle_subsys_file_write(&cg, *controller, file_name, buf)?;
                 Ok(buf.len())
             }
@@ -753,9 +790,6 @@ fn cgroupfs_mount(
 
     // Set root in superblock
     sb.set_root(root_dentry);
-
-    // Mark as mounted
-    CGROUP_ROOT.mount();
 
     Ok(sb)
 }

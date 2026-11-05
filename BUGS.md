@@ -61,6 +61,27 @@ blocks belong in a missing wrapper:
 mkdir of a name that is not valid UTF-8 is EINVAL; Linux kernfs takes
 any bytes.
 
+## cgroup controller application gaps
+
+**Location**: `cgroup/mod.rs`, `fs/cgroupfs.rs`
+
+Enabling a controller in cgroup.subtree_control creates its state only
+for cgroups made afterwards (Linux cgroup_apply_control creates it for
+the existing children and migrates their tasks), and disabling it
+removes nothing. A task in a cgroup without a controller is charged
+nowhere; Linux charges the nearest ancestor that has it (the effective
+css). The no-internal-processes rule (EBUSY when enabling in a cgroup
+with tasks) is not enforced.
+
+No controller but pids is applied: CPU bandwidth, memory and IO
+limits, and cgroup.freeze are stored (and read back) but nothing is
+charged, throttled or frozen. cpu.stat, memory.current/stat/events and
+io.stat report zeros. When they are applied, use Linux's shapes: CPU
+bandwidth under the bandwidth lock (cfs_b->lock, an IrqSpinlock: the
+period timer), memory by page_counter_try_charge (add, check, roll
+back up the hierarchy), the IO token bucket under the queue's lock
+(blk-throttle), freezing under cgroup_mutex.
+
 ## user/ does not follow doc/UNSAFE.md
 
 The `user/syscall` wrappers are safe `pub fn`s, and about 330 of them take
@@ -83,7 +104,11 @@ Planned fix:
 
 Listed because real traffic reaches them: TCP has no SACK (never
 advertised), no CUBIC (only "reno"; Linux defaults to cubic), no
-receive buffer autotuning (the window is SO_RCVBUF / 2), no per-netns
+receive or send buffer autotuning (the window is SO_RCVBUF / 2; no
+tcp_sndbuf_expand, so past the TCP memory hard limit a sender's
+SO_SNDBUF is not shrunk, sk_stream_moderate_sndbuf; no rcv_ssthresh,
+so memory pressure does not clamp windows), no orphan count limit
+(tcp_max_orphans; only the memory half of tcp_out_of_resources), no per-netns
 RFC 5961 challenge-ACK budget (only Linux's per-connection 500 ms
 limit), and TCP_DEFER_ACCEPT / TCP_FASTOPEN are stored only.
 No SYN cookies (a full listener drops SYNs). ICMP
@@ -314,6 +339,12 @@ linked on hk without CAP_DAC_READ_SEARCH; Linux gives ENOENT. The
 capability is checked in the caller's namespace (Linux: the opener's
 `user_ns`); hk has one user namespace.
 
+User namespaces grant no capabilities: creating any namespace but a
+user namespace needs the caller's own CAP_SYS_ADMIN, even together with
+CLONE_NEWUSER (Linux checks in the new user namespace, where the caller
+holds every capability), and /proc/<pid>/uid_map and gid_map cannot be
+written.
+
 ## sysfs gaps
 
 **Location**: `fs/kernfs/`, `fs/sysfs.rs`, `base/`, `block/genhd.rs`,
@@ -392,11 +423,8 @@ capability is checked in the caller's namespace (Linux: the opener's
 
 **Location:** `task/futex.rs`
 
-- **Robust owner death** updates the futex word with a plain read and
-  write: a FUTEX_WAITERS set by a waiter in between is lost. Linux
-  uses an atomic user-space cmpxchg (futex_atomic_cmpxchg_inatomic);
-  hk has no such uaccess primitive yet (it would also serve
-  FUTEX_WAKE_OP and PI futexes, both missing).
+- **FUTEX_WAKE_OP and PI futexes** are missing (the user cmpxchg they
+  need, `uaccess::cmpxchg_user_u32`, exists).
 - **MAP_PRIVATE file mappings:** a shared futex there is keyed by
   (mm, address) from the VMA; Linux keys a page still in the page
   cache (not yet COW'd) by inode and offset, so a MAP_SHARED mapping
@@ -410,13 +438,6 @@ The generic FIONREAD arm answers every file except chardevs with 0,
 so a pipe or FIFO with data reports 0. Linux do_vfs_ioctl handles
 FIONREAD only for regular files and passes the rest to f_op->ioctl
 (pipe_ioctl returns the buffered bytes).
-
-## Unaligned user pointers are EFAULT
-
-**Location**: `uaccess.rs` (`put_user`/`get_user`)
-
-A misaligned user address is rejected with EFAULT; Linux on x86-64 and
-arm64 accepts it. Needs a boot test (both kernels) before the fix.
 
 ## Sleeping-lock gaps
 
@@ -836,38 +857,8 @@ fat_get_cluster keeps a per-inode cache of chain positions
   exclusively: opening it O_EXCL and BLKBSZSET on a mounted partition
   are not refused.
 
-## Atomics audit findings (2026-11-03)
-
-Shared state kept in Atomic* fields instead of under the object's
-documented lock; ranked. Each needs a design from doc/LOCKING.md and
-Linux's equivalent.
-
-- ipc/sem.rs `Sem.semval`: semop checks and applies without a lock:
-  semval can go negative, multi-sop operations are not atomic, wakeups
-  can be lost, a semop can queue on a removed array (Linux sem_lock).
-- fs/dac.rs chmod/chown run without i_rwsem: chmod 4755 racing chown
-  root can leave a setuid-root file with user-chosen contents (Linux
-  notify_change under inode_lock).
-- cgroup pids.max is checked at fork and charged later: concurrent
-  forks overshoot it (Linux pids_can_fork charge-then-rollback). IPC
-  shm_tot / used_sems are check-then-add without the ids lock and leak
-  when alloc_id fails.
-- Inode i_size uses Relaxed loads/stores (Linux release/acquire with
-  i_size_write/read): an arm64 reader can see stale data past a
-  racing extend; fallocate updates i_size without i_rwsem.
-- Medium: mnt_flags lost update (remount vs propagation), lazy kcmp
-  cookies, a revoked key can be revived, cgroup rmdir races attach (no
-  cgroup_mutex), MsgQueue lspid/stime set outside the queue lock and
-  torn IPC_STAT snapshots, adjtimex ADJ_SETOFFSET lost offsets, TCP
-  shutdown bits outside `cb`, `TcpSock.connecting` beside the state.
-- Low: remount RDONLY set before the writer check (spurious EROFS),
-  GroupCputimer started by gettime, TimerList.not_before outside the
-  wheel lock, PacketSock bind read-then-store, Zone watermarks stored
-  apart from zone.lock, filemap mkclean load+store losing A/D bits,
-  cgroup controllers' check-then-act counters, Disk open counters
-  outside open_mutex.
-- doc/LOCKING.md 5.4 cites Inode mode/uid/gid, MsgQueue and
-  SemArray.pending as correct atomic use; they are among the above.
+fallocate on a block device is EOPNOTSUPP (Linux blkdev_fallocate zeroes
+or discards the range).
 
 ## Code-quality audit findings (2026-11-01), by phase
 
@@ -875,20 +866,11 @@ From a whole-tree audit for designs that grew one commit at a time.
 Fixed already: clock setting, seccomp actions, kcmp/pidfd_getfd access,
 sched pid 0, flock/POSIX release, signalfd reader, errno flattening.
 
-- **Privilege by uid instead of capable()** (L): about 29 `euid == 0`
-  style checks remain where Linux tests a capability (`task/id.rs` x6
-  CAP_SETUID/SETGID, `ns/uts.rs` and `ns/mod.rs` CAP_SYS_ADMIN,
-  `task/rlimit.rs` CAP_SYS_RESOURCE, `ipc/msg.rs` CAP_SYS_RESOURCE,
-  `ipc/mqueue.rs` DAC_OVERRIDE, `ipc/util.rs` CAP_IPC_OWNER missing,
-  `keys/key.rs` (fsuid, no root bypass), `task/acct.rs` ASU flag). Linux's
-  own uid-0 rules (`sysctl.rs`, `fs/dac.rs`) are right as they are.
-  `task::capable` should be the only privilege test.
 - **Syscalls that do not deliver** (H/C): inotify and fanotify never
   queue an event (no fsnotify hooks in the VFS); there is no siginfo
   queue (signals are a bitmask: rt_sigqueueinfo's data, si_pid/si_uid
   and RT signal queueing are lost); waitid without WEXITED is EINVAL
-  (C); semctl GETNCNT/GETZCNT are 0; fallocate PUNCH_HOLE succeeds
-  without zeroing (F).
+  (C).
 - **Copied helpers** (J, or as touched): `get_nofile_limit` in eight
   places; `find_task_by_pid` in four (all root-namespace pids); four
   `current_time`s; about ten user-timespec readers each validating
@@ -917,66 +899,190 @@ sched pid 0, flock/POSIX release, signalfd reader, errno flattening.
   (no seq_file records, so chunked reads of /proc/net/* can tear);
   global generators run under the procfs inode's read lock and take
   TASKLIST and network locks inside it (not in LOCKING.md).
+  /proc/sys is one static tree: the sysctls Linux registers for the
+  initial network namespace only (net/ipv4/tcp_mem,
+  net/core/mem_pcpu_rsv) appear in every
+  namespace. /proc/sys/net values act on the namespace of the task
+  reading or writing, not the one the file was opened in (Linux binds
+  the file to the opener's namespace): an fd passed across namespaces
+  reads and writes the other one's values.
 - **Stale comments and dead code** (as touched): about 155
   `#[allow(dead_code)]`, 90 "for now"/TODO markers; comments that
-  contradict the code in `task/id.rs:87`, `ns/mod.rs:558`,
-  `ns/uts.rs:224`, `task/rlimit.rs:264`, `task/misc.rs:1311`.
+  contradict the code in `ns/mod.rs` (setns) and `task/misc.rs`.
 
 ## P2 review findings (open)
-From the P2 /code-review (unverified). Tag = when to fix.
-1. **pcp_free drains the hot end** (next batch).
+From the P2 /code-review (unverified). Tag = roadmap phase (doc/ROADMAP.md).
+1. **pcp_free drains the hot end** (J).
    `mm/page_alloc.rs:458`: freed page pushed at head, drain
    pops from head; Linux returns the cold tail.
 2. **arm64 /reserved-memory no-map regions are linear-mapped**
-   (next batch; real HW). `arch/aarch64/dtb.rs:175`: Linux
+   (D; real HW). `arch/aarch64/dtb.rs:175`: Linux
    memblock_mark_nomap removes them (speculative access to secure
    carve-outs).
 
 ## P3 review findings (open)
-From the P3 /code-review (unverified). Tag = when to fix.
-1. **Remote write gives up after 16 COW tries** (next batch).
+From the P3 /code-review (unverified). Tag = roadmap phase (doc/ROADMAP.md).
+1. **Remote write gives up after 16 COW tries** (C, with
+   FOLL_FORCE).
    `mm/remote.rs:176`: spurious EFAULT; break COW and write
    under one PTE-lock hold, or loop until fatal_signal_pending.
 
 ## Fix batch 1 review findings (open)
-From the fix-batch-1 /code-review (unverified). Tag = when to fix.
+From the fix-batch-1 /code-review (unverified). Tag = roadmap phase (doc/ROADMAP.md).
 3. **memblock holds at most 128 ranges** (J). `mm/memblock.rs:18`:
    a firmware map with more RAM or reserved ranges panics at boot
    (asserts in add/remove/reserve); Linux grows the array
    (memblock_double_array).
 
 ## P4 review findings (open)
-From the P4 /code-review (unverified unless noted). Tag = when to fix.
+From the P4 /code-review (unverified unless noted). Tag = roadmap phase (doc/ROADMAP.md).
 
-4. **LRU batch refs defeat exclusivity checks** (next batch).
+4. **LRU batch refs defeat exclusivity checks** (J).
    `mm/fault.rs:477` / `:545`: refcount==1 tests fail while a
    page sits in the per-CPU add batch → needless COW copies after
    swap-in. Linux drains and rechecks (wp_can_reuse_anon_folio).
 5. **alloc_slot linear scan under SwapInfo.map; two Vecs + sort per
-   reclaimed page** (P6). `mm/swap.rs:184`: cluster/free-hint
+   reclaimed page** (J). `mm/swap.rs:184`: cluster/free-hint
    allocator, cached sorted device list.
 7. **One AnonVma per fork family, Vec chain** (J).
    `mm/anon_vma.rs:85`: O(N×VMAs) under one family write lock.
 
 ## T0 findings (open)
-Found during T0 (2026-10-19). Tag = when to fix.
-1. **Syscalls report root-namespace pids** (P9). Tasks get a number in
+Found during T0 (2026-10-19). Tag = roadmap phase (doc/ROADMAP.md).
+1. **Syscalls report root-namespace pids** (C). Tasks get a number in
    every level of their pid namespace chain (`task/pid.rs`), but
    getpid/gettid/kill/wait//proc use the root number; a CLONE_NEWPID
    child is not pid 1 in its namespace. Use `Pid::nr_in(caller's ns)`
    at the syscall boundary.
-6. **No ptrace exec stop** (P9): a traced task's execve does not stop
+6. **No ptrace exec stop** (C): a traced task's execve does not stop
    with SIGTRAP / PTRACE_EVENT_EXEC (`task/exec.rs`), so a
    tracer cannot observe a non-leader exec's tid change.
-8. **MM_LIFE_EXEC_CHAIN intermittent on arm64 CI** (next batch). One
+8. **MM_LIFE_EXEC_CHAIN intermittent on arm64 CI** (flake:
+   investigate when it repeats). One
    GitHub `check-arm` run (TCG, NIC=e1000) reported
    `MM_LIFE_EXEC_CHAIN:FAIL -2`: both warmup chains passed, then the
    first measured one's child (busybox `env` x40 then `true`, i.e. 41
    execs in one process) exited nonzero. A failed exec, not a leak.
    MM_LIFE now prints a failing child's wait status (exit code vs
    signal); 16 eight-CPU arm64 stress boots did not repeat it.
-10. **Network test flake** (I):
+10. **Network test flake** (suspected TcpSock.connecting beside the
+   state, which phase L moved under `cb`; drop if check-stress stays clean):
    `SOCKCORE_CONNECT_REFUSED:FAIL SO_ERROR got 0` (hk arm64, 1 of 10
    `check-stress` boots: poll reported POLLOUT for a nonblocking
    connect to a just-closed loopback port, but no ECONNREFUSED was
    pending).
+11. **TCP_PROC_NET flake** (cause unknown): one end of a fresh,
+   accepted loopback connection is missing from /proc/net/tcp as state
+   01: `client line got 0` (CI hk arm64) and `server line got 0` (1 of
+   20 check-stress boots, hk arm64). Not a torn read: the file comes in
+   one regeneration (well under the 64 KiB read chunk). Not ehash
+   removal by key (removals check the entry). The test now prints the
+   lines with either port when it fails.
+
+## CVE-pattern audit findings (2026-11-05)
+
+From an audit against the Linux CVE-fix pattern catalog (P# = its
+pattern number). Ranked.
+
+1. **tkill, tgkill, rt_(tg)sigqueueinfo and pidfd_send_signal skip the
+   kill permission check** (P4, check skipped on one path).
+   `signal/syscall.rs:405,417,456,512`, `task/misc.rs:1334`: only
+   kill(2) calls `check_kill_permission`; these send straight through
+   `send_signal`, so any user can SIGKILL any other user's process
+   (root daemons; pidfd_open is unprivileged too). Linux runs
+   check_kill_permission on all of them (do_send_specific,
+   kill_pid_info_type).
+2. **SIGKILL/SIGSTOP can be blocked** (P4, check skipped on one path).
+   rt_sigreturn stores `uc_sigmask` as is (`arch/x86_64/signal.rs:539`,
+   `arch/aarch64/signal.rs:520`) and rt_sigaction keeps them in
+   `sa_mask` (`signal/syscall.rs:63`, applied at handler entry in
+   `signal/mod.rs:1954`). A blocked SIGKILL is neither fatal on arrival
+   nor dequeued, so a process makes itself unkillable. Linux
+   set_current_blocked and do_sigaction strip both.
+3. **Keys: link and destination checks missing** (P4). add_key takes a
+   destination keyring by serial without KEY_NEED_WRITE
+   (`keys/syscall.rs:84`); KEYCTL_LINK does not need KEY_NEED_LINK on
+   the key (`keys/keyctl.rs:285`); KEYCTL_SEARCH needs no SEARCH on the
+   keyring or the keys it walks and links into `dest` unchecked
+   (`keys/keyctl.rs:399,409`); request_key links into `dest` unchecked
+   (`keys/syscall.rs:173`). Serials are sequential, so a user links
+   another user's key into its own session keyring, then possesses it
+   (KEY_POS_ALL) and KEYCTL_READs the payload. Linux lookup_user_key
+   with KEY_NEED_WRITE / KEY_NEED_LINK / KEY_NEED_SEARCH.
+4. **Nested epoll has no loop or depth check** (P8, recursion through
+   poll). `io/epoll.rs:449` refuses only adding an epoll to itself, and
+   `Eventpoll::poll` (`io/epoll.rs:281`) polls its items under its own
+   IrqSpinlock: A in B in A deadlocks the CPU with interrupts off on
+   the first epoll_wait, and a long chain recurses off the stack. Linux
+   ep_loop_check: ELOOP for cycles and nesting past EP_MAX_NESTS (4).
+5. **An epoll item keeps its file open** (P1, use after teardown).
+   `EpItem.file` is an `Arc<File>` (`io/epoll.rs:86`) and nothing
+   removes items at the file's last close (no eventpoll_release): a
+   closed pipe write end registered in an epoll never gives the reader
+   EOF, a closed socket is never released, and epoll_wait keeps
+   reporting it. Linux epitems hold no reference; __fput removes them.
+6. **Keys have no quota** (P13). add_key (`keys/syscall.rs:42`) takes
+   up to 1MB per key with no per-user count or byte limit, so any user
+   can fill the kernel heap (whose exhaustion panics). Linux
+   key_payload_reserve / key_user: maxkeys 200, maxbytes 20000 for
+   non-root (/proc/sys/kernel/keys/*).
+7. **bpf() is open to unprivileged users** (P9). `bpf/syscall.rs:228`
+   has no capability check: any user creates maps (uncharged, see
+   above) and loads programs. Linux's default
+   kernel.unprivileged_bpf_disabled=2 (BPF_UNPRIV_DEFAULT_OFF) makes
+   map_create and prog_load EPERM without CAP_BPF.
+8. **mmap offset + length is not checked for wrap** (P6).
+   `mm/syscall.rs:78`: a file offset near 2^64 wraps the page index of
+   the mapping's pages; Linux do_mmap is EOVERFLOW when
+   pgoff + (len >> PAGE_SHIFT) wraps.
+9. **pwrite/write past LLONG_MAX is not refused** (P6). `fs/io.rs:210`
+   checks only `offset >= 0` and there is no s_maxbytes: pos + count
+   can exceed i64::MAX, giving a negative st_size and lseek results
+   that read as errnos. Linux rw_verify_area (EINVAL) and
+   generic_write_check_limits (EFBIG at MAX_LFS_FILESIZE).
+
+## Review findings (2026-11-05): allocation sizing, pure code (unverified)
+
+From a read-only review of allocation sizing (~/tmp/hk-with-capacity.md)
+and of host-testable code (~/tmp/hk-unit-test-opportunities.md). Not yet
+confirmed by a test. Ranked.
+
+1. **Unprivileged kernel panics by allocation size** (heap objects are
+   at most 4 MiB, MAX_KMALLOC; an infallible allocation that fails
+   panics):
+   - `ipc/mqueue.rs:741,803`: mq_open accepts msgsize up to 16 MiB with
+     no limit check (Linux mq_attr_ok: msg_max/msgsize_max unless
+     CAP_SYS_RESOURCE, RLIMIT_MSGQUEUE), then send/receive allocate
+     `vec![0; msgsize]`.
+   - `net/msg.rs:91` (`gather_at`): AF_UNIX dgram and netlink sends up
+     to sndbuf (8 MiB unprivileged) are gathered into one Vec; also
+     `net/netlink/rtnetlink.rs:170`. Fix: `kmem::try_vec`, ENOBUFS.
+   - `fs/vfat.rs:862`: `extend_cluster_chain` collects every new
+     cluster (ftruncate to 4 GiB with 512-byte clusters: 32 MiB).
+     `sectors_per_cluster` 0 from disk divides by zero at `:166,:806`.
+   - TCP receive/send VecDeques double under `cb` past 4 MiB with
+     large SO_RCVBUF/SO_SNDBUF (`net/tcp/input.rs:547`, `cb.rs:945`).
+   - Bounded but large, ENOMEM on Linux: io_uring rings (2 MiB), keys
+     (1 MiB), `task/id.rs:625` (256 KiB).
+2. **seccomp cBPF** (`bpf/convert.rs`, `bpf/interp.rs`):
+   - jeq/jgt/jge against a constant >= 0x80000000 never match (the
+     constant is sign-extended against a zero-extended u32): the
+     `jeq #AUDIT_ARCH_X86_64` (0xC000003E) every libseccomp, systemd
+     and container filter starts with fails.
+   - A jump with jt=jf=0 emits no instruction but `fixup_jumps` still
+     consumes an offset: later jumps shift, can index past the program
+     (panic) or loop backwards (hang); reachable unprivileged with
+     no_new_privs.
+   - R10 is 0, so scratch-memory ST/LD always fail (KILL_THREAD).
+   - `validate_cbpf` accepts what Linux rejects (H/B/IND/MSH loads,
+     unaligned or out-of-range `ld [k]`, `div #0`, `ret x`); ALU32
+     DIV/MOD by a constant >= 2^31 is wrong.
+3. **ABI**: `acct` ac_etime is seconds where Linux has AHZ ticks, and
+   encode_comp_t skips Linux's rounding; getxattr ERANGE above 64 KiB
+   (Linux clamps); epoll_wait maxevents capped at 4096 and poll at
+   1024 fds (Linux: ~INT_MAX/12, RLIMIT_NOFILE); sysctl integers are
+   not parsed in base 0 (`0x10`, `010`) and `+5` is accepted.
+4. **Minor**: `fs/posix_lock.rs:328` `-l_len` overflows at i64::MIN
+   and lengths past i64::MAX are not EOVERFLOW; `arch/x86_64/rtc.rs:131`
+   panics on a CMOS month >= 14; vfat short names can start with a
+   space.

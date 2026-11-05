@@ -35,8 +35,13 @@ pub struct PidsState {
     /// Current task count (pids.current)
     current: AtomicU64,
 
-    /// Number of times fork was denied due to limit (pids.events)
+    /// Forks refused by this level or a descendant's limit
+    /// (pids.events "max", Linux events[PIDCG_MAX])
     events_max: AtomicU64,
+
+    /// Forks refused by this level's own limit (pids.events.local
+    /// "max", Linux events_local[PIDCG_MAX])
+    events_local_max: AtomicU64,
 
     /// Parent pids state (for hierarchical limits)
     parent: Option<Arc<PidsState>>,
@@ -49,48 +54,66 @@ impl PidsState {
             max: AtomicU64::new(PIDS_MAX_UNLIMITED),
             current: AtomicU64::new(0),
             events_max: AtomicU64::new(0),
+            events_local_max: AtomicU64::new(0),
             parent,
         }
     }
 
-    /// Check if we can add a task (walk hierarchy)
-    pub fn can_charge(&self) -> bool {
-        let current = self.current.load(Ordering::Relaxed);
-        let max = self.max.load(Ordering::Relaxed);
-
-        if max != PIDS_MAX_UNLIMITED && current >= max {
-            return false;
+    /// Charge a new task up to the root, which is never charged, or
+    /// refuse it (Linux pids_try_charge): each level adds first and
+    /// compares after, so concurrent forks cannot all pass a limit
+    /// they share. A level over its max undoes the levels charged, from
+    /// this one up to and including it (no list kept, as Linux), and is
+    /// returned.
+    pub fn try_charge(&self) -> Result<(), &PidsState> {
+        let mut p = self;
+        while let Some(parent) = p.parent.as_deref() {
+            let new = p.current.fetch_add(1, Ordering::Relaxed) + 1;
+            let max = p.max.load(Ordering::Relaxed);
+            if max != PIDS_MAX_UNLIMITED && new > max {
+                let mut q = self;
+                loop {
+                    q.current.fetch_sub(1, Ordering::Relaxed);
+                    if core::ptr::eq(q, p) {
+                        break;
+                    }
+                    q = q.parent.as_deref().unwrap_or(p);
+                }
+                return Err(p);
+            }
+            p = parent;
         }
-
-        // Check parent hierarchy
-        if let Some(ref parent) = self.parent {
-            return parent.can_charge();
-        }
-
-        true
+        Ok(())
     }
 
-    /// Charge a new task (increment counter up the hierarchy)
+    /// Charge a task without a limit check, up to the root (Linux
+    /// pids_charge: a migration is always admitted)
     pub fn charge(&self) {
-        self.current.fetch_add(1, Ordering::Relaxed);
-        if let Some(ref parent) = self.parent {
-            parent.charge();
+        let mut p = self;
+        while let Some(parent) = p.parent.as_deref() {
+            p.current.fetch_add(1, Ordering::Relaxed);
+            p = parent;
         }
     }
 
-    /// Uncharge a task (decrement counter up the hierarchy)
+    /// Uncharge a task up to the root (Linux pids_uncharge)
     pub fn uncharge(&self) {
-        self.current.fetch_sub(1, Ordering::Relaxed);
-        if let Some(ref parent) = self.parent {
-            parent.uncharge();
+        let mut p = self;
+        while let Some(parent) = p.parent.as_deref() {
+            p.current.fetch_sub(1, Ordering::Relaxed);
+            p = parent;
         }
     }
 
-    /// Record a max hit event
+    /// A fork was refused by this level's limit (Linux pids_event,
+    /// default hierarchy without pids_localevents): counted locally
+    /// here, and hierarchically here and in every ancestor but the root
     pub fn record_max_event(&self) {
-        self.events_max.fetch_add(1, Ordering::Relaxed);
-        if let Some(ref parent) = self.parent {
-            parent.record_max_event();
+        self.events_local_max.fetch_add(1, Ordering::Relaxed);
+        let mut p = self;
+        while let Some(parent) = p.parent.as_deref() {
+            p.events_max.fetch_add(1, Ordering::Relaxed);
+            p = parent;
         }
     }
 
@@ -145,11 +168,12 @@ impl CgroupSubsysOps for PidsController {
         // Nothing to clean up
     }
 
-    fn attach(&self, css: &CgroupSubsysState, _pid: Pid) -> Result<(), KernelError> {
+    /// Linux pids_attach: the charge moves unconditionally (a migration
+    /// may exceed pids.max)
+    fn attach(&self, css: &CgroupSubsysState, _pid: Pid) {
         if let Some(state) = css.private_as::<PidsState>() {
             state.charge();
         }
-        Ok(())
     }
 
     fn detach(&self, css: &CgroupSubsysState, _pid: Pid) {
@@ -158,22 +182,22 @@ impl CgroupSubsysOps for PidsController {
         }
     }
 
+    /// Linux pids_can_fork: try-charge the target, EAGAIN past a limit
     fn can_fork(&self, css: &CgroupSubsysState) -> Result<(), KernelError> {
         if let Some(state) = css.private_as::<PidsState>() {
-            if state.can_charge() {
-                return Ok(());
-            }
-            state.record_max_event();
-            return Err(KernelError::WouldBlock); // EAGAIN
+            return state.try_charge().map_err(|over| {
+                over.record_max_event();
+                KernelError::WouldBlock // EAGAIN
+            });
         }
         Ok(())
     }
 
-    fn fork(&self, css: &CgroupSubsysState, _child_pid: Pid) -> Result<(), KernelError> {
+    /// Linux pids_cancel_fork
+    fn cancel_fork(&self, css: &CgroupSubsysState) {
         if let Some(state) = css.private_as::<PidsState>() {
-            state.charge();
+            state.uncharge();
         }
-        Ok(())
     }
 
     fn exit(&self, css: &CgroupSubsysState, _pid: Pid) {
@@ -191,7 +215,7 @@ impl CgroupSubsysOps for PidsController {
 pub static PIDS_CONTROLLER: PidsController = PidsController;
 
 /// Control files for pids controller
-static PIDS_FILES: [ControlFile; 3] = [
+static PIDS_FILES: [ControlFile; 4] = [
     ControlFile {
         name: "pids.max",
         mode: 0o644,
@@ -208,6 +232,12 @@ static PIDS_FILES: [ControlFile; 3] = [
         name: "pids.events",
         mode: 0o444,
         read: Some(pids_events_read),
+        write: None,
+    },
+    ControlFile {
+        name: "pids.events.local",
+        mode: 0o444,
+        read: Some(pids_events_local_read),
         write: None,
     },
 ];
@@ -264,4 +294,11 @@ fn pids_events_read(css: &CgroupSubsysState) -> Result<Vec<u8>, KernelError> {
     } else {
         Err(KernelError::Io)
     }
+}
+
+/// Read pids.events.local
+fn pids_events_local_read(css: &CgroupSubsysState) -> Result<Vec<u8>, KernelError> {
+    let state = css.private_as::<PidsState>().ok_or(KernelError::Io)?;
+    let n = state.events_local_max.load(Ordering::Relaxed);
+    Ok(format!("max {}\n", n).into_bytes())
 }

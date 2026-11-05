@@ -47,6 +47,9 @@ fn do_truncate(inode: &Arc<super::Inode>, length: u64) -> i64 {
     let r = if inode.i_swapfile.load(core::sync::atomic::Ordering::Acquire) {
         Err(KernelError::TextBusy)
     } else {
+        // The set-id kill with the size change (Linux do_truncate:
+        // ATTR_KILL_* in the same notify_change)
+        super::dac::remove_privs(inode);
         inode.i_op.truncate(inode, length)
     };
     drop(lock);
@@ -95,7 +98,6 @@ pub fn sys_ftruncate(fd: i32, length: i64) -> i64 {
         return KernelError::InvalidArgument.sysret();
     }
 
-    super::dac::remove_privs(&inode);
     do_truncate(&inode, length as u64)
 }
 
@@ -155,7 +157,6 @@ pub fn sys_truncate(path_ptr: u64, length: i64) -> i64 {
     if let Err(e) = super::dac::may_truncate(&inode) {
         return e.sysret();
     }
-    super::dac::remove_privs(&inode);
     do_truncate(&inode, length as u64)
 }
 

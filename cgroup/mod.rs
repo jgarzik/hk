@@ -28,7 +28,7 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use spin::Lazy;
 
 use crate::task::Pid;
@@ -91,8 +91,10 @@ pub struct Cgroup {
     /// Tasks currently in this cgroup (pid list for iteration)
     tasks: RwLock<Vec<Pid>>,
 
-    /// Reference count for tasks using this cgroup
-    nr_tasks: AtomicU32,
+    /// Removed (Linux CGRP_DEAD): set under CGROUP_MUTEX by rmdir, read
+    /// under it (and lock-free by the file paths, which then fail
+    /// ENODEV as kernfs does for a removed node)
+    dead: AtomicBool,
 
     /// Subtree control - which controllers are enabled for children
     /// Bitmask of ControllerType values
@@ -126,7 +128,7 @@ impl Cgroup {
             ancestors: RwLock::new(Vec::new()),
             subsys: RwLock::new(BTreeMap::new()),
             tasks: RwLock::new(Vec::new()),
-            nr_tasks: AtomicU32::new(0),
+            dead: AtomicBool::new(false),
             subtree_control: AtomicU64::new(0),
             frozen: AtomicBool::new(false),
             ino,
@@ -226,7 +228,6 @@ impl Cgroup {
         let mut tasks = self.tasks.write();
         if !tasks.contains(&pid) {
             tasks.push(pid);
-            self.nr_tasks.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -235,13 +236,17 @@ impl Cgroup {
         let mut tasks = self.tasks.write();
         if let Some(pos) = tasks.iter().position(|&p| p == pid) {
             tasks.remove(pos);
-            self.nr_tasks.fetch_sub(1, Ordering::Relaxed);
         }
     }
 
     /// Get task count
     pub fn nr_tasks(&self) -> u32 {
-        self.nr_tasks.load(Ordering::Relaxed)
+        self.tasks.read().len() as u32
+    }
+
+    /// Removed by rmdir (Linux cgroup_is_dead)
+    pub fn is_dead(&self) -> bool {
+        self.dead.load(Ordering::Acquire)
     }
 
     /// Get all tasks in this cgroup
@@ -251,7 +256,7 @@ impl Cgroup {
 
     /// Check if cgroup is empty (no tasks, no children)
     pub fn is_empty(&self) -> bool {
-        self.nr_tasks() == 0 && self.children.read().is_empty()
+        self.tasks.read().is_empty() && self.children.read().is_empty()
     }
 
     /// Check if this cgroup or any ancestor is frozen
@@ -265,7 +270,12 @@ impl Cgroup {
         false
     }
 
-    /// Set frozen state
+    /// This cgroup's own cgroup.freeze, ancestors aside
+    pub fn self_frozen(&self) -> bool {
+        self.frozen.load(Ordering::Acquire)
+    }
+
+    /// Set frozen state (under CGROUP_MUTEX: cgroup.freeze writes)
     pub fn set_frozen(&self, freeze: bool) {
         self.frozen.store(freeze, Ordering::Release);
     }
@@ -331,9 +341,6 @@ pub struct CgroupSubsysState {
     /// Parent CSS (for resource inheritance)
     parent: Option<Weak<CgroupSubsysState>>,
 
-    /// Reference count (tasks using this CSS)
-    refcount: AtomicU32,
-
     /// Controller-specific private data
     private: RwLock<Option<Arc<dyn CssPrivate>>>,
 }
@@ -351,7 +358,6 @@ impl CgroupSubsysState {
             controller,
             id,
             parent: parent_css.map(Arc::downgrade),
-            refcount: AtomicU32::new(1),
             private: RwLock::new(None),
         })
     }
@@ -364,21 +370,6 @@ impl CgroupSubsysState {
     /// Get parent CSS
     pub fn parent(&self) -> Option<Arc<CgroupSubsysState>> {
         self.parent.as_ref().and_then(Weak::upgrade)
-    }
-
-    /// Increment reference count
-    pub fn get(&self) {
-        self.refcount.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Decrement reference count
-    pub fn put(&self) {
-        self.refcount.fetch_sub(1, Ordering::Relaxed);
-    }
-
-    /// Get reference count
-    pub fn refcount(&self) -> u32 {
-        self.refcount.load(Ordering::Relaxed)
     }
 
     /// Set controller-specific private data
@@ -404,9 +395,6 @@ impl CgroupSubsysState {
 /// This reduces memory overhead when many tasks are in identical cgroup
 /// configurations (common case: all tasks in root cgroups).
 pub struct CssSet {
-    /// Reference count (tasks using this set)
-    refcount: AtomicU32,
-
     /// Hash of CSS pointers (for fast CssSet lookup)
     hash: u64,
 
@@ -425,7 +413,6 @@ impl CssSet {
     ) -> Arc<Self> {
         let hash = Self::compute_hash(&css_map);
         Arc::new(Self {
-            refcount: AtomicU32::new(1),
             hash,
             subsys: RwLock::new(css_map),
             default_cgroup: Arc::downgrade(default),
@@ -455,16 +442,6 @@ impl CssSet {
         }
     }
 
-    /// Get reference count
-    pub fn get(&self) {
-        self.refcount.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Decrement reference count
-    pub fn put(&self) {
-        self.refcount.fetch_sub(1, Ordering::Relaxed);
-    }
-
     /// Get hash
     pub fn hash(&self) -> u64 {
         self.hash
@@ -487,7 +464,6 @@ pub fn find_css_set(
     if let Some(weak) = cache.get(&hash)
         && let Some(css_set) = weak.upgrade()
     {
-        css_set.get();
         return css_set;
     }
 
@@ -513,9 +489,6 @@ pub struct CgroupRoot {
 
     /// Next inode number for cgroupfs
     next_ino: AtomicU64,
-
-    /// Mount count (for reference tracking)
-    mount_count: AtomicU32,
 }
 
 impl Default for CgroupRoot {
@@ -532,7 +505,6 @@ impl CgroupRoot {
             controllers: RwLock::new(BTreeMap::new()),
             next_cg_id: AtomicU64::new(1),
             next_ino: AtomicU64::new(1),
-            mount_count: AtomicU32::new(0),
         }
     }
 
@@ -576,21 +548,6 @@ impl CgroupRoot {
     /// Get all registered controllers
     pub fn registered_controllers(&self) -> Vec<ControllerType> {
         self.controllers.read().keys().cloned().collect()
-    }
-
-    /// Increment mount count
-    pub fn mount(&self) {
-        self.mount_count.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Decrement mount count
-    pub fn umount(&self) {
-        self.mount_count.fetch_sub(1, Ordering::Relaxed);
-    }
-
-    /// Check if mounted
-    pub fn is_mounted(&self) -> bool {
-        self.mount_count.load(Ordering::Relaxed) > 0
     }
 }
 
@@ -650,49 +607,62 @@ pub fn cgroup_init() {
     }
 }
 
-/// Attach a task to a cgroup
-///
-/// Migrates the task from its current cgroup to the target cgroup.
-pub fn cgroup_attach_task(target_cg: &Arc<Cgroup>, pid: Pid) -> Result<(), KernelError> {
+/// Move the process `pid` names into `target` (Linux cgroup_migrate,
+/// under CGROUP_MUTEX and CGROUP_THREADGROUP_RWSEM write): every
+/// controller's can_attach for every live thread first, so a refusal
+/// moves none; then each thread under its own cgroup pointer's lock,
+/// which exit also takes to detach it, so a thread that exits meanwhile
+/// is skipped, never re-attached
+pub fn migrate_thread_group(target: &Arc<Cgroup>, pid: Pid) -> Result<(), KernelError> {
     let root = CGROUP_ROOT.clone();
-
-    // Get old cgroup if any
-    let old_cg = get_task_cgroup(pid);
-
-    // Call can_attach on all controllers
-    for controller in target_cg.enabled_controllers() {
-        if let Some(css) = target_cg.css(controller)
-            && let Some(ops) = root.get_controller(controller)
-        {
-            ops.can_attach(&css, pid)?;
+    let tids = thread_group(pid)?;
+    let ctrls: Vec<_> = target
+        .enabled_controllers()
+        .into_iter()
+        .filter_map(|c| Some((target.css(c)?, root.get_controller(c)?)))
+        .collect();
+    for &tid in &tids {
+        for (css, ops) in &ctrls {
+            ops.can_attach(css, tid as Pid)?;
         }
     }
+    for tid in tids {
+        migrate_one(&root, target, tid);
+    }
+    Ok(())
+}
 
-    // Detach from old cgroup
-    if let Some(ref old) = old_cg {
-        for controller in old.enabled_controllers() {
-            if let Some(css) = old.css(controller)
-                && let Some(ops) = root.get_controller(controller)
-            {
+/// One thread's move (Linux cgroup_migrate_execute for one task)
+fn migrate_one(root: &CgroupRoot, target: &Arc<Cgroup>, tid: Tid) {
+    let Some(t) = task(tid as Pid) else {
+        return;
+    };
+    let mut slot = t.cgroup.lock();
+    // Exiting: exit owns it (Linux skips PF_EXITING). Exit sets the flag
+    // before it detaches under this lock, so a thread seen live here is
+    // detached from wherever this leaves it
+    if t.has_flag(crate::task::pf::EXITING) {
+        return;
+    }
+    let pid = tid as Pid;
+    if let Some(old) = slot.clone() {
+        if Arc::ptr_eq(&old, target) {
+            return;
+        }
+        for c in old.enabled_controllers() {
+            if let (Some(css), Some(ops)) = (old.css(c), root.get_controller(c)) {
                 ops.detach(&css, pid);
             }
         }
         old.remove_task(pid);
     }
-
-    // Attach to new cgroup
-    for controller in target_cg.enabled_controllers() {
-        if let Some(css) = target_cg.css(controller)
-            && let Some(ops) = root.get_controller(controller)
-        {
-            ops.attach(&css, pid)?;
+    for c in target.enabled_controllers() {
+        if let (Some(css), Some(ops)) = (target.css(c), root.get_controller(c)) {
+            ops.attach(&css, pid);
         }
     }
-
-    target_cg.add_task(pid);
-    set_task_cgroup(pid, target_cg.clone());
-
-    Ok(())
+    target.add_task(pid);
+    *slot = Some(target.clone());
 }
 
 /// Detach a task from its cgroup (on exit)
@@ -711,39 +681,46 @@ pub fn cgroup_exit_task(pid: Pid) {
     }
 }
 
-/// Check if a task can fork (pids controller check)
-pub fn cgroup_can_fork(pid: Pid) -> Result<(), KernelError> {
-    if let Some(cg) = get_task_cgroup(pid)
-        && let Some(css) = cg.css(ControllerType::Pids)
-        && let Some(ops) = CGROUP_ROOT.get_controller(ControllerType::Pids)
-    {
-        return ops.can_fork(&css);
-    }
-    Ok(())
+/// The cgroup hierarchy's sleeping lock (Linux cgroup_mutex): mkdir,
+/// rmdir, cgroup.procs, subtree_control and freeze writes, and a
+/// CLONE_INTO_CGROUP fork from admission to post_fork; whoever holds it
+/// sees a cgroup's death and membership settle together. Under a
+/// cgroupfs directory's i_rwsem; above every cgroup spin lock and
+/// TASKLIST.
+pub static CGROUP_MUTEX: crate::sync::Mutex<()> = crate::sync::Mutex::new(());
+
+/// Fork against migration (Linux cgroup_threadgroup_rwsem, its default
+/// global form): a fork holds it shared from admission to post_fork, a
+/// cgroup.procs write exclusively while it moves a thread group, so no
+/// thread is created in the old cgroup behind a migration. Under
+/// CGROUP_MUTEX; above TASKLIST and the cgroup spin locks.
+pub static CGROUP_THREADGROUP_RWSEM: crate::sync::RwSem<()> = crate::sync::RwSem::new(());
+
+/// The threads of the process `pid` names (any of its threads; 0: the
+/// caller's): ESRCH if none (Linux cgroup_procs_write_start finds the
+/// task, then its group leader's whole group)
+pub fn thread_group(pid: Pid) -> Result<Vec<Tid>, KernelError> {
+    let table = crate::task::percpu::TASKLIST.read();
+    let tid = if pid == 0 {
+        crate::task::percpu::current_tid()
+    } else {
+        pid as Tid
+    };
+    let tgid = table.get(tid).ok_or(KernelError::NoProcess)?.task.pid;
+    Ok(table
+        .iter()
+        .filter(|t| t.task.pid == tgid && !t.task.has_flag(crate::task::pf::EXITING))
+        .map(|t| t.task.tid())
+        .collect())
 }
 
-/// Called after successful fork to charge pids controller
-pub fn cgroup_fork(parent_pid: Pid, child_pid: Pid) -> Result<(), KernelError> {
-    // Child inherits parent's cgroup
-    if let Some(cg) = get_task_cgroup(parent_pid) {
-        // Call fork on all controllers
-        for controller in cg.enabled_controllers() {
-            if let Some(css) = cg.css(controller)
-                && let Some(ops) = CGROUP_ROOT.get_controller(controller)
-            {
-                ops.fork(&css, child_pid)?;
-            }
-        }
-
-        // Add child to same cgroup
-        cg.add_task(child_pid);
-        set_task_cgroup(child_pid, cg);
-    }
-    Ok(())
-}
-
-/// Create a child cgroup
+/// Create a child cgroup (Linux cgroup_mkdir: ENODEV in a removed
+/// parent)
 pub fn cgroup_mkdir(parent: &Arc<Cgroup>, name: &str) -> Result<Arc<Cgroup>, KernelError> {
+    let _g = CGROUP_MUTEX.lock();
+    if parent.is_dead() {
+        return Err(KernelError::NoDevice);
+    }
     let root = CGROUP_ROOT.clone();
 
     // Check if name already exists
@@ -775,14 +752,18 @@ pub fn cgroup_mkdir(parent: &Arc<Cgroup>, name: &str) -> Result<Arc<Cgroup>, Ker
     Ok(new_cg)
 }
 
-/// Remove a cgroup
+/// Remove a cgroup (Linux cgroup_destroy_locked, under cgroup_mutex):
+/// EBUSY while it has tasks or children, else it is dead from here on,
+/// so no attach or CLONE_INTO_CGROUP can join it after the check
 pub fn cgroup_rmdir(parent: &Arc<Cgroup>, name: &str) -> Result<(), KernelError> {
+    let _g = CGROUP_MUTEX.lock();
     let child = parent.lookup_child(name).ok_or(KernelError::NotFound)?;
 
     // Check if empty
     if !child.is_empty() {
         return Err(KernelError::Busy);
     }
+    child.dead.store(true, Ordering::Release);
 
     // Cleanup CSS for all controllers
     let root = CGROUP_ROOT.clone();
@@ -806,39 +787,78 @@ pub fn cgroup_rmdir(parent: &Arc<Cgroup>, name: &str) -> Result<(), KernelError>
 
 use crate::task::Tid;
 
-/// Check if forking is allowed for a cgroup (pids controller check)
-///
-/// Returns true if fork is allowed, false if pids.max limit would be exceeded.
-pub fn pids_can_fork(cgroup: &Arc<Cgroup>) -> bool {
-    // Check pids controller if enabled
-    if let Some(css) = cgroup.css(ControllerType::Pids)
-        && let Some(ops) = CGROUP_ROOT.get_controller(ControllerType::Pids)
-    {
-        return ops.can_fork(&css).is_ok();
-    }
-    // No pids controller enabled - allow fork
-    true
+/// A child admitted into its cgroup before it exists (Linux
+/// cgroup_can_fork .. cgroup_post_fork / cgroup_cancel_fork): the
+/// controllers' charges are held; dropping it (the fork failed) gives
+/// them back, `post_fork` makes the child a member
+pub struct ForkCg {
+    cg: Arc<Cgroup>,
+    /// The controllers whose `can_fork` admitted it
+    charged: Vec<ControllerType>,
+    /// CGROUP_THREADGROUP_RWSEM, shared, until post_fork (Linux
+    /// cgroup_threadgroup_change_begin in cgroup_css_set_fork); dropped
+    /// after the charges are given back
+    _tg: crate::sync::RwSemReadGuard<'static, ()>,
+    /// CLONE_INTO_CGROUP: CGROUP_MUTEX until post_fork (Linux
+    /// cgroup_css_set_fork .. cgroup_css_set_put_fork), released last
+    _lock: Option<crate::sync::MutexGuard<'static, ()>>,
 }
 
-/// Attach a task to a cgroup during clone
-///
-/// Called from do_clone to inherit parent's cgroup membership.
-/// This is a simpler version of cgroup_attach_task for the clone path.
-pub fn attach_task(tid: Tid, cgroup: &Arc<Cgroup>) {
-    let root = CGROUP_ROOT.clone();
-
-    // Call fork on all controllers to update accounting
-    for controller in cgroup.enabled_controllers() {
-        if let Some(css) = cgroup.css(controller)
-            && let Some(ops) = root.get_controller(controller)
+/// Admit a new task into its cgroup (Linux cgroup_css_set_fork +
+/// cgroup_can_fork): `into`, the CLONE_INTO_CGROUP one, which is locked
+/// and must not be dead (ENODEV), else the parent's, read under
+/// CGROUP_THREADGROUP_RWSEM so no migration moves the parent in between;
+/// every enabled controller's `can_fork`, undone if a later one
+/// refuses. None when the parent is in no cgroup.
+pub fn can_fork(into: Option<Arc<Cgroup>>) -> Result<Option<ForkCg>, KernelError> {
+    let lock = into.is_some().then(|| CGROUP_MUTEX.lock());
+    let tg = CGROUP_THREADGROUP_RWSEM.read();
+    let cg = match into {
+        Some(cg) if cg.is_dead() => return Err(KernelError::NoDevice),
+        Some(cg) => cg,
+        None => match get_task_cgroup(crate::task::percpu::current_tid() as Pid) {
+            Some(cg) => cg,
+            None => return Ok(None),
+        },
+    };
+    let mut fc = ForkCg {
+        cg: cg.clone(),
+        charged: Vec::new(),
+        _tg: tg,
+        _lock: lock,
+    };
+    for controller in cg.enabled_controllers() {
+        if let Some(css) = cg.css(controller)
+            && let Some(ops) = CGROUP_ROOT.get_controller(controller)
         {
-            let _ = ops.fork(&css, tid);
+            ops.can_fork(&css)?;
+            fc.charged.push(controller);
         }
     }
+    Ok(Some(fc))
+}
 
-    // Add task to cgroup
-    cgroup.add_task(tid);
-    set_task_cgroup(tid, cgroup.clone());
+impl ForkCg {
+    /// The child exists: it joins the cgroup, keeping the charges
+    /// (Linux cgroup_post_fork)
+    pub fn post_fork(mut self, tid: Tid) {
+        self.charged.clear();
+        self.cg.add_task(tid);
+        set_task_cgroup(tid, self.cg.clone());
+    }
+}
+
+impl Drop for ForkCg {
+    /// Linux cgroup_cancel_fork
+    fn drop(&mut self) {
+        for &controller in &self.charged {
+            if let Some(css) = self.cg.css(controller)
+                && let Some(ops) = CGROUP_ROOT.get_controller(controller)
+            {
+                ops.cancel_fork(&css);
+            }
+        }
+    }
 }
 
 /// Detach a task from its cgroup on exit

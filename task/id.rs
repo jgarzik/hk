@@ -63,7 +63,7 @@ pub fn sys_getegid(egid: u32) -> i64 {
 
 /// sys_setuid - set user identity (Linux-compatible)
 ///
-/// If the caller is privileged (euid=0), sets real, saved, effective, and
+/// If the caller has CAP_SETUID, sets real, saved, effective, and
 /// filesystem UID to the specified value. After this, root privileges are
 /// permanently dropped.
 ///
@@ -84,8 +84,8 @@ pub fn sys_getegid(egid: u32) -> i64 {
 /// - Privileged: sets uid, suid, euid, fsuid (permanently drops privileges)
 /// - Unprivileged: sets only euid, fsuid (can switch between uid and suid)
 pub fn sys_setuid(uid: u32, current_cred: super::Cred) -> i64 {
-    // Privileged: euid==0 (or CAP_SETUID, which we don't have yet)
-    if current_cred.euid == 0 {
+    // Privileged: CAP_SETUID (Linux __sys_setuid: ns_capable_setid)
+    if super::capable(super::CAP_SETUID) {
         // Set all UIDs: uid, suid, euid, fsuid - permanently drops root
         super::percpu::set_current_uid_all(uid);
         return 0;
@@ -103,7 +103,7 @@ pub fn sys_setuid(uid: u32, current_cred: super::Cred) -> i64 {
 
 /// sys_setgid - set group identity (Linux-compatible)
 ///
-/// If the caller is privileged (euid=0), sets real, saved, effective, and
+/// If the caller has CAP_SETGID, sets real, saved, effective, and
 /// filesystem GID to the specified value.
 ///
 /// If not privileged, can only set effective GID (and fsgid) to the current
@@ -122,12 +122,9 @@ pub fn sys_setuid(uid: u32, current_cred: super::Cred) -> i64 {
 /// This matches setgid(2) with _POSIX_SAVED_IDS:
 /// - Privileged: sets gid, sgid, egid, fsgid
 /// - Unprivileged: sets only egid, fsgid (can switch between gid and sgid)
-///
-/// Note: Linux checks euid==0 (not egid==0) for privilege.
 pub fn sys_setgid(gid: u32, current_cred: super::Cred) -> i64 {
-    // Privileged: euid==0 (or CAP_SETGID, which we don't have yet)
-    // Note: Linux checks euid, not egid, for setgid privilege
-    if current_cred.euid == 0 {
+    // Privileged: CAP_SETGID (Linux __sys_setgid: ns_capable_setid)
+    if super::capable(super::CAP_SETGID) {
         // Set all GIDs: gid, sgid, egid, fsgid
         super::percpu::set_current_gid_all(gid);
         return 0;
@@ -261,7 +258,7 @@ pub fn sys_getresgid<A: crate::uaccess::UaccessArch>(
 ///
 /// # Permission Model (Linux-compatible)
 /// - If unprivileged: can only set each field to one of {current uid, euid, suid}
-/// - If privileged (euid=0 or CAP_SETUID): can set any field to any value
+/// - With CAP_SETUID: can set any field to any value
 /// - When euid changes, fsuid follows (set to new euid)
 ///
 /// # Locking
@@ -272,8 +269,8 @@ pub fn sys_setresuid(ruid: u32, euid: u32, suid: u32, current_cred: super::Cred)
 
     // Check permissions for each field that will be changed
     // Unprivileged: can only set to current uid, euid, or suid
-    // Privileged (euid=0): can set to any value
-    let is_privileged = current_cred.euid == 0;
+    // Privileged (CAP_SETUID): can set to any value
+    let is_privileged = || super::capable(super::CAP_SETUID);
 
     // Helper to check if a value is in the current credential set
     let is_permitted = |val: u32| -> bool {
@@ -281,13 +278,13 @@ pub fn sys_setresuid(ruid: u32, euid: u32, suid: u32, current_cred: super::Cred)
     };
 
     // Check each field
-    if ruid != NO_CHANGE && !is_privileged && !is_permitted(ruid) {
+    if ruid != NO_CHANGE && !is_permitted(ruid) && !is_privileged() {
         return KernelError::NotPermitted.sysret();
     }
-    if euid != NO_CHANGE && !is_privileged && !is_permitted(euid) {
+    if euid != NO_CHANGE && !is_permitted(euid) && !is_privileged() {
         return KernelError::NotPermitted.sysret();
     }
-    if suid != NO_CHANGE && !is_privileged && !is_permitted(suid) {
+    if suid != NO_CHANGE && !is_permitted(suid) && !is_privileged() {
         return KernelError::NotPermitted.sysret();
     }
 
@@ -319,7 +316,7 @@ pub fn sys_setresuid(ruid: u32, euid: u32, suid: u32, current_cred: super::Cred)
 ///
 /// # Permission Model (Linux-compatible)
 /// - If unprivileged: can only set each field to one of {current gid, egid, sgid}
-/// - If privileged (euid=0 or CAP_SETGID): can set any field to any value
+/// - With CAP_SETGID: can set any field to any value
 /// - When egid changes, fsgid follows (set to new egid)
 /// - Note: Linux checks euid (not egid) for privilege
 ///
@@ -328,8 +325,8 @@ pub fn sys_setresuid(ruid: u32, euid: u32, suid: u32, current_cred: super::Cred)
 pub fn sys_setresgid(rgid: u32, egid: u32, sgid: u32, current_cred: super::Cred) -> i64 {
     const NO_CHANGE: u32 = 0xFFFFFFFF; // -1 as unsigned
 
-    // Check permissions - note: Linux checks euid, not egid, for setgid privilege
-    let is_privileged = current_cred.euid == 0;
+    // Privileged: CAP_SETGID (Linux __sys_setresgid)
+    let is_privileged = || super::capable(super::CAP_SETGID);
 
     // Helper to check if a value is in the current credential set
     let is_permitted = |val: u32| -> bool {
@@ -337,13 +334,13 @@ pub fn sys_setresgid(rgid: u32, egid: u32, sgid: u32, current_cred: super::Cred)
     };
 
     // Check each field
-    if rgid != NO_CHANGE && !is_privileged && !is_permitted(rgid) {
+    if rgid != NO_CHANGE && !is_permitted(rgid) && !is_privileged() {
         return KernelError::NotPermitted.sysret();
     }
-    if egid != NO_CHANGE && !is_privileged && !is_permitted(egid) {
+    if egid != NO_CHANGE && !is_permitted(egid) && !is_privileged() {
         return KernelError::NotPermitted.sysret();
     }
-    if sgid != NO_CHANGE && !is_privileged && !is_permitted(sgid) {
+    if sgid != NO_CHANGE && !is_permitted(sgid) && !is_privileged() {
         return KernelError::NotPermitted.sysret();
     }
 
@@ -383,20 +380,24 @@ pub fn sys_setresgid(rgid: u32, egid: u32, sgid: u32, current_cred: super::Cred)
 pub fn sys_setreuid(ruid: u32, euid: u32, current_cred: super::Cred) -> i64 {
     const NO_CHANGE: u32 = 0xFFFFFFFF; // -1 as unsigned
 
-    let is_privileged = current_cred.euid == 0;
+    // Privileged: CAP_SETUID (Linux __sys_setreuid)
+    let is_privileged = || super::capable(super::CAP_SETUID);
 
     // Permission check for ruid: must be in {uid, euid} or privileged
-    if ruid != NO_CHANGE && !is_privileged && ruid != current_cred.uid && ruid != current_cred.euid
+    if ruid != NO_CHANGE
+        && ruid != current_cred.uid
+        && ruid != current_cred.euid
+        && !is_privileged()
     {
         return KernelError::NotPermitted.sysret();
     }
 
     // Permission check for euid: must be in {uid, euid, suid} or privileged
     if euid != NO_CHANGE
-        && !is_privileged
         && euid != current_cred.uid
         && euid != current_cred.euid
         && euid != current_cred.suid
+        && !is_privileged()
     {
         return KernelError::NotPermitted.sysret();
     }
@@ -449,21 +450,24 @@ pub fn sys_setreuid(ruid: u32, euid: u32, current_cred: super::Cred) -> i64 {
 pub fn sys_setregid(rgid: u32, egid: u32, current_cred: super::Cred) -> i64 {
     const NO_CHANGE: u32 = 0xFFFFFFFF; // -1 as unsigned
 
-    // Note: Linux checks euid, not egid, for setgid privilege
-    let is_privileged = current_cred.euid == 0;
+    // Privileged: CAP_SETGID (Linux __sys_setregid)
+    let is_privileged = || super::capable(super::CAP_SETGID);
 
     // Permission check for rgid: must be in {gid, egid} or privileged
-    if rgid != NO_CHANGE && !is_privileged && rgid != current_cred.gid && rgid != current_cred.egid
+    if rgid != NO_CHANGE
+        && rgid != current_cred.gid
+        && rgid != current_cred.egid
+        && !is_privileged()
     {
         return KernelError::NotPermitted.sysret();
     }
 
     // Permission check for egid: must be in {gid, egid, sgid} or privileged
     if egid != NO_CHANGE
-        && !is_privileged
         && egid != current_cred.gid
         && egid != current_cred.egid
         && egid != current_cred.sgid
+        && !is_privileged()
     {
         return KernelError::NotPermitted.sysret();
     }
@@ -519,14 +523,14 @@ pub fn sys_setfsuid(uid: u32, current_cred: super::Cred) -> i64 {
     }
 
     // Permission check: must be in {uid, euid, suid, fsuid} or CAP_SETUID
-    let is_privileged = current_cred.cap_effective.has(super::CAP_SETUID);
+    let is_privileged = || super::capable(super::CAP_SETUID);
 
     let is_permitted = uid == current_cred.uid
         || uid == current_cred.euid
         || uid == current_cred.suid
         || uid == current_cred.fsuid;
 
-    if !is_privileged && !is_permitted {
+    if !is_permitted && !is_privileged() {
         // Permission denied - return old fsuid without changing
         return old_fsuid as i64;
     }
@@ -567,14 +571,14 @@ pub fn sys_setfsgid(gid: u32, current_cred: super::Cred) -> i64 {
     }
 
     // Permission check: must be in {gid, egid, sgid, fsgid} or CAP_SETGID
-    let is_privileged = current_cred.cap_effective.has(super::CAP_SETGID);
+    let is_privileged = || super::capable(super::CAP_SETGID);
 
     let is_permitted = gid == current_cred.gid
         || gid == current_cred.egid
         || gid == current_cred.sgid
         || gid == current_cred.fsgid;
 
-    if !is_privileged && !is_permitted {
+    if !is_permitted && !is_privileged() {
         // Permission denied - return old fsgid without changing
         return old_fsgid as i64;
     }

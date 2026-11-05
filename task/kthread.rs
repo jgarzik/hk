@@ -135,8 +135,9 @@ pub fn kthread_run_prio(
 fn pick_cpu() -> u32 {
     let ncpu = crate::cpu::nr_cpu_ids();
     for _ in 0..ncpu {
-        let c = NEXT_CPU.load(Ordering::Relaxed) % ncpu;
-        NEXT_CPU.store(c + 1, Ordering::Relaxed);
+        // One fetch_add: racing creators get different CPUs (a load
+        // then store handed several the same one)
+        let c = NEXT_CPU.fetch_add(1, Ordering::Relaxed) % ncpu;
         if cpu_has_scheduler(c) {
             return c;
         }
