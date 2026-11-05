@@ -6,7 +6,7 @@
 //! - sync, fsync, fdatasync, syncfs (filesystem synchronization)
 #![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
-use alloc::vec;
+use alloc::vec::Vec;
 
 use crate::arch::Uaccess;
 use crate::fs::KernelError;
@@ -159,9 +159,8 @@ fn do_poll_internal(fds: u64, nfds: u32, deadline: Deadline) -> i64 {
     use crate::task::percpu::{SleepState, set_current_state};
     use crate::uaccess::{copy_from_user, copy_to_user};
 
-    // Limit nfds to prevent DoS
-    const MAX_NFDS: u32 = 1024;
-    if nfds > MAX_NFDS {
+    // As many as the caller may have open (Linux do_sys_poll)
+    if nfds as u64 > crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_NOFILE) {
         return KernelError::InvalidArgument.sysret();
     }
 
@@ -178,7 +177,10 @@ fn do_poll_internal(fds: u64, nfds: u32, deadline: Deadline) -> i64 {
     // Copy pollfd array from user space
     let pollfd_size = core::mem::size_of::<PollFd>();
     let total_size = pollfd_size * nfds as usize;
-    let mut pollfds = vec![PollFd::default(); nfds as usize];
+    let mut pollfds = match crate::util::kmem::try_vec(nfds as usize, PollFd::default()) {
+        Ok(v) => v,
+        Err(e) => return e.sysret(),
+    };
 
     let bytes_slice =
         unsafe { core::slice::from_raw_parts_mut(pollfds.as_mut_ptr() as *mut u8, total_size) };
@@ -204,9 +206,9 @@ fn do_poll_internal(fds: u64, nfds: u32, deadline: Deadline) -> i64 {
         first_pass = false;
         ready_count = 0;
 
-        // Get FD table
+        // Each file is looked up alone and polled with no lock held
+        // (Linux fdget per fd): a poll method may sleep
         let fd_table = current_fd_table();
-        let table = fd_table.lock();
 
         // Check each fd
         for pollfd in pollfds.iter_mut() {
@@ -218,7 +220,8 @@ fn do_poll_internal(fds: u64, nfds: u32, deadline: Deadline) -> i64 {
             }
 
             // Look up the file
-            let file = match table.get(pollfd.fd) {
+            let file = fd_table.lock().get(pollfd.fd);
+            let file = match file {
                 Some(f) => f,
                 None => {
                     // Invalid fd - set POLLNVAL
@@ -245,8 +248,6 @@ fn do_poll_internal(fds: u64, nfds: u32, deadline: Deadline) -> i64 {
                 poll_table.disable();
             }
         }
-
-        drop(table);
 
         // If any fds are ready, or timeout is 0 (immediate), return
         if ready_count > 0 || deadline == Some(0) {
@@ -453,74 +454,48 @@ fn do_select_internal(
     exceptfds: u64,
     deadline: Deadline,
 ) -> i64 {
-    use crate::io::poll::{
-        FdSet, POLLERR, POLLHUP, POLLIN, POLLOUT, POLLPRI, PollContext, PollTable,
-    };
+    use crate::io::poll::{POLLERR, POLLHUP, POLLIN, POLLOUT, POLLPRI, PollContext, PollTable};
     use crate::task::percpu::{SleepState, set_current_state};
-    use crate::uaccess::{copy_from_user, copy_to_user};
 
-    // Validate nfds
-    const FD_SETSIZE: i32 = 1024;
-    if !(0..=FD_SETSIZE).contains(&nfds) {
+    if nfds < 0 {
         return KernelError::InvalidArgument.sysret();
     }
-
-    let tid = current_tid();
+    // Past the table's size nothing can be open (Linux core_sys_select)
+    let n = (nfds as usize).min(current_fd_table().lock().max_fds());
 
     // Empty select: just sleep for the timeout (or until a signal)
-    if nfds == 0 && readfds == 0 && writefds == 0 && exceptfds == 0 {
+    if n == 0 && readfds == 0 && writefds == 0 && exceptfds == 0 {
         if deadline == Some(0) {
             return 0;
         }
         return poll_sleep_only(deadline);
     }
 
-    // Calculate how many bytes to copy
-    let bytes_needed = FdSet::bytes_for_nfds(nfds);
+    let sets = (|| -> Result<[Vec<u64>; 3], KernelError> {
+        Ok([
+            get_fd_set(readfds, n)?,
+            get_fd_set(writefds, n)?,
+            get_fd_set(exceptfds, n)?,
+        ])
+    })();
+    let [rd, wr, ex] = match sets {
+        Ok(s) => s,
+        Err(e) => return e.sysret(),
+    };
+    let words = n.div_ceil(64);
+    let mut out = match (|| -> Result<[Vec<u64>; 3], KernelError> {
+        use crate::util::kmem::try_vec;
+        Ok([try_vec(words, 0)?, try_vec(words, 0)?, try_vec(words, 0)?])
+    })() {
+        Ok(o) => o,
+        Err(e) => return e.sysret(),
+    };
+    let bit = |v: &[u64], fd: usize| v.get(fd / 64).is_some_and(|w| w & (1 << (fd % 64)) != 0);
 
-    // Copy fd_sets from user space
-    let mut read_set = FdSet::new();
-    let mut write_set = FdSet::new();
-    let mut except_set = FdSet::new();
-
-    if readfds != 0 && bytes_needed > 0 {
-        let bytes = unsafe {
-            core::slice::from_raw_parts_mut(read_set.bits.as_mut_ptr() as *mut u8, bytes_needed)
-        };
-        if copy_from_user::<Uaccess>(bytes, readfds, bytes_needed).is_err() {
-            return KernelError::BadAddress.sysret();
-        }
-    }
-
-    if writefds != 0 && bytes_needed > 0 {
-        let bytes = unsafe {
-            core::slice::from_raw_parts_mut(write_set.bits.as_mut_ptr() as *mut u8, bytes_needed)
-        };
-        if copy_from_user::<Uaccess>(bytes, writefds, bytes_needed).is_err() {
-            return KernelError::BadAddress.sysret();
-        }
-    }
-
-    if exceptfds != 0 && bytes_needed > 0 {
-        let bytes = unsafe {
-            core::slice::from_raw_parts_mut(except_set.bits.as_mut_ptr() as *mut u8, bytes_needed)
-        };
-        if copy_from_user::<Uaccess>(bytes, exceptfds, bytes_needed).is_err() {
-            return KernelError::BadAddress.sysret();
-        }
-    }
-
-    // Create poll context
-    let mut ctx = PollContext::new(tid);
-
-    // Output sets (initially zeroed)
-    let mut out_read;
-    let mut out_write;
-    let mut out_except;
-
+    let mut ctx = PollContext::new(current_tid());
     let mut first_pass = true;
     let mut ready_count;
-
+    let fd_table = current_fd_table();
     loop {
         // State first, then scan: a wakeup during the scan is not lost
         set_current_state(SleepState::Interruptible);
@@ -531,82 +506,52 @@ fn do_select_internal(
         }
         first_pass = false;
         ready_count = 0i32;
-        out_read = FdSet::new();
-        out_write = FdSet::new();
-        out_except = FdSet::new();
-
-        // Get FD table
-        let fd_table = current_fd_table();
-        let table = fd_table.lock();
-
-        // Check each fd from 0 to nfds-1
-        for fd in 0..nfds {
-            let check_read = readfds != 0 && read_set.is_set(fd);
-            let check_write = writefds != 0 && write_set.is_set(fd);
-            let check_except = exceptfds != 0 && except_set.is_set(fd);
-
-            if !check_read && !check_write && !check_except {
+        for o in out.iter_mut() {
+            o.fill(0);
+        }
+        for fd in 0..n {
+            let (r, w, x) = (bit(&rd, fd), bit(&wr, fd), bit(&ex, fd));
+            if !r && !w && !x {
                 continue;
             }
-
-            // Look up the file
-            let file = match table.get(fd) {
-                Some(f) => f,
-                None => {
-                    set_current_state(SleepState::Running);
-                    return KernelError::BadFd.sysret();
-                }
+            // Looked up alone, polled with no lock held (a poll may sleep)
+            let file = fd_table.lock().get(fd as i32);
+            let Some(file) = file else {
+                set_current_state(SleepState::Running);
+                return KernelError::BadFd.sysret();
             };
             poll_table.hold_file(&file);
-
-            // Set key for events we're interested in
             let mut events = 0u16;
-            if check_read {
+            if r {
                 events |= POLLIN;
             }
-            if check_write {
+            if w {
                 events |= POLLOUT;
             }
-            if check_except {
+            if x {
                 events |= POLLPRI;
             }
             poll_table.set_key(events);
-
-            // Call file's poll method
             let mask = file.poll(Some(&mut poll_table));
-
-            // Check results
-            let mut fd_ready = false;
-
-            if check_read && (mask & (POLLIN | POLLERR | POLLHUP)) != 0 {
-                out_read.set(fd);
-                fd_ready = true;
+            let hits = [
+                r && mask & (POLLIN | POLLERR | POLLHUP) != 0,
+                w && mask & (POLLOUT | POLLERR | POLLHUP) != 0,
+                x && mask & (POLLPRI | POLLERR) != 0,
+            ];
+            for (o, hit) in out.iter_mut().zip(hits) {
+                if hit {
+                    o[fd / 64] |= 1 << (fd % 64);
+                }
             }
-
-            if check_write && (mask & (POLLOUT | POLLERR | POLLHUP)) != 0 {
-                out_write.set(fd);
-                fd_ready = true;
-            }
-
-            if check_except && (mask & (POLLPRI | POLLERR)) != 0 {
-                out_except.set(fd);
-                fd_ready = true;
-            }
-
-            if fd_ready {
+            if hits.iter().any(|&h| h) {
                 ready_count += 1;
                 poll_table.disable();
             }
         }
-
-        drop(table);
-
-        // If any fds are ready, or timeout is 0 (immediate), return
         if ready_count > 0 || deadline == Some(0) {
             set_current_state(SleepState::Running);
             break;
         }
-
         match poll_sleep(deadline) {
             Some(0) => break,
             Some(r) => return r,
@@ -615,33 +560,41 @@ fn do_select_internal(
     }
     drop(ctx);
 
-    // Copy results back to user space
-    if readfds != 0 && bytes_needed > 0 {
-        let bytes = unsafe {
-            core::slice::from_raw_parts(out_read.bits.as_ptr() as *const u8, bytes_needed)
-        };
-        if copy_to_user::<Uaccess>(readfds, bytes).is_err() {
-            return KernelError::BadAddress.sysret();
+    for (ptr, o) in [readfds, writefds, exceptfds].into_iter().zip(&out) {
+        if let Err(e) = set_fd_set(ptr, o) {
+            return e.sysret();
         }
     }
-
-    if writefds != 0 && bytes_needed > 0 {
-        let bytes = unsafe {
-            core::slice::from_raw_parts(out_write.bits.as_ptr() as *const u8, bytes_needed)
-        };
-        if copy_to_user::<Uaccess>(writefds, bytes).is_err() {
-            return KernelError::BadAddress.sysret();
-        }
-    }
-
-    if exceptfds != 0 && bytes_needed > 0 {
-        let bytes = unsafe {
-            core::slice::from_raw_parts(out_except.bits.as_ptr() as *const u8, bytes_needed)
-        };
-        if copy_to_user::<Uaccess>(exceptfds, bytes).is_err() {
-            return KernelError::BadAddress.sysret();
-        }
-    }
-
     ready_count as i64
+}
+
+/// An fd_set of `n` bits from the user, whole words (Linux get_fd_set,
+/// FDS_BYTES); all clear if `ptr` is null
+fn get_fd_set(ptr: u64, n: usize) -> Result<Vec<u64>, KernelError> {
+    use crate::util::kmem::try_vec;
+    let words = n.div_ceil(64);
+    let mut v = try_vec(words, 0u64)?;
+    if ptr != 0 && words > 0 {
+        let mut raw = try_vec(words * 8, 0u8)?;
+        crate::uaccess::copy_from_user::<Uaccess>(&mut raw, ptr, words * 8)
+            .map_err(|_| KernelError::BadAddress)?;
+        for (w, b) in v.iter_mut().zip(raw.as_chunks::<8>().0) {
+            *w = u64::from_ne_bytes(*b);
+        }
+    }
+    Ok(v)
+}
+
+/// Copy a result set out (Linux set_fd_set): nothing if `ptr` is null
+fn set_fd_set(ptr: u64, v: &[u64]) -> Result<(), KernelError> {
+    if ptr == 0 || v.is_empty() {
+        return Ok(());
+    }
+    let mut raw = crate::util::kmem::try_vec(v.len() * 8, 0u8)?;
+    for (b, w) in raw.as_chunks_mut::<8>().0.iter_mut().zip(v) {
+        *b = w.to_ne_bytes();
+    }
+    crate::uaccess::copy_to_user::<Uaccess>(ptr, &raw)
+        .map(|_| ())
+        .map_err(|_| KernelError::BadAddress)
 }

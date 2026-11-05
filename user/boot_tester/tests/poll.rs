@@ -26,6 +26,89 @@ pub fn run_tests() {
     test_ppoll_null_sigmask();
     test_ppoll_with_timeout();
     test_pselect6_null_sigmask();
+    report_nfds(in_child_nfds());
+}
+
+/// poll takes up to RLIMIT_NOFILE entries (EINVAL past it), select any
+/// nfds up to the table's size (Linux do_sys_poll, core_sys_select);
+/// both past the old fixed 1024. In a child that raises RLIMIT_NOFILE
+fn in_child_nfds() -> i64 {
+    let pid = hk_syscall::sys_fork();
+    if pid == 0 {
+        hk_syscall::sys_exit(nfds_check() as u64);
+    }
+    let mut st = 0i32;
+    hk_syscall::sys_wait4(pid, &mut st, 0, 0);
+    if st & 0x7f != 0 {
+        80
+    } else {
+        ((st >> 8) & 0xff) as i64
+    }
+}
+
+fn nfds_check() -> i64 {
+    const RLIMIT_NOFILE: u32 = 7;
+    const N: usize = 4097;
+    let lim = hk_syscall::RLimit {
+        rlim_cur: 4096,
+        rlim_max: 4096,
+    };
+    if hk_syscall::sys_setrlimit(RLIMIT_NOFILE, &lim) != 0 {
+        return 1;
+    }
+    let efd = hk_syscall::sys_eventfd2(1, 0) as i32;
+    let size = core::mem::size_of::<PollFd>();
+    let buf = hk_syscall::sys_mmap(0, (N * size) as u64, 3, 0x22, -1, 0);
+    if efd < 0 || buf < 0 {
+        return 2;
+    }
+    // SAFETY: the mapping just made, N entries
+    let fds = unsafe { core::slice::from_raw_parts_mut(buf as *mut PollFd, N) };
+    for f in fds.iter_mut() {
+        f.fd = -1;
+        f.events = 0;
+        f.revents = 0;
+    }
+    fds[1999].fd = efd;
+    fds[1999].events = POLLIN as i16;
+    if sys_poll(fds.as_mut_ptr(), 2000, 0) != 1 {
+        return 3;
+    }
+    if sys_poll(fds.as_mut_ptr(), N as u32, 0) != -22 {
+        return 4;
+    }
+    // select with nfds 2000 and the eventfd at 1500
+    if hk_syscall::sys_dup3(efd, 1500, 0) != 1500 {
+        return 5;
+    }
+    let mut set = [0u64; 32];
+    set[1500 / 64] |= 1 << (1500 % 64);
+    let mut tv = Timeval {
+        tv_sec: 0,
+        tv_usec: 0,
+    };
+    let r = sys_select(
+        2000,
+        set.as_mut_ptr() as *mut FdSet,
+        core::ptr::null_mut(),
+        core::ptr::null_mut(),
+        &mut tv,
+    );
+    if r != 1 || set[1500 / 64] & (1 << (1500 % 64)) == 0 {
+        return 6;
+    }
+    0
+}
+
+fn report_nfds(step: i64) {
+    print(b"POLL_SELECT_NFDS");
+    if step == 0 {
+        println(b":OK");
+    } else {
+        print(b":FAIL step ");
+        print_num(step);
+        println(b"");
+    }
 }
 
 /// Test poll() with a readable pipe

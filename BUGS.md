@@ -954,8 +954,7 @@ Ranked. Not yet confirmed by a test.
 
 1. **ABI**: `acct` ac_etime is seconds where Linux has AHZ ticks, and
    encode_comp_t skips Linux's rounding; getxattr ERANGE above 64 KiB
-   (Linux clamps); poll capped at
-   1024 fds (Linux: ~INT_MAX/12, RLIMIT_NOFILE); sysctl integers are
+   (Linux clamps); sysctl integers are
    not parsed in base 0 (`0x10`, `010`) and `+5` is accepted;
    `SigPending::dequeue` (`signal/mod.rs:429`) takes the lowest
    pending signal where Linux next_signal takes synchronous ones (SEGV,
