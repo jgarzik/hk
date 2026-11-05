@@ -171,6 +171,21 @@ pub fn sys_kcmp(pid1: i32, pid2: i32, kcmp_type: i32, idx1: u64, idx2: u64) -> i
             (arc_key(&task1.sysvsem), arc_key(&task2.sysvsem)),
         )
     };
+    // Both thread groups' exec_update_lock for reading across the access
+    // checks and the comparison, so neither execs (a set-id program, a
+    // new mm or file table) between them (Linux kcmp_lock); two in
+    // thread-group order, one for the same group
+    let _exec = {
+        use crate::signal::ExecUpdateRead;
+        let (first, second) = if t1.pid <= t2.pid {
+            (&t1, &t2)
+        } else {
+            (&t2, &t1)
+        };
+        let a = ExecUpdateRead::lock(first.tid());
+        let b = (first.pid != second.pid).then(|| ExecUpdateRead::lock(second.tid()));
+        (a, b)
+    };
     // Linux: ptrace_may_access(PTRACE_MODE_READ_REALCREDS) on both
     if !crate::task::ptrace::may_access_tid(t1.tid(), false)
         || !crate::task::ptrace::may_access_tid(t2.tid(), false)

@@ -960,8 +960,10 @@ taken, except `cred_guard` around `exec_update`):
   writing, inside `cred_guard`, while it installs the new mm, name and
   dumpability under TASKLIST and the task's alloc_lock; process_vm_readv/writev (`access_mm`),
   the /proc mm_access paths (maps, environ; the stat fields gated by
-  access) hold it for reading (`signal::ExecUpdateRead`) around the
-  access decision and taking the mm.
+  access), pidfd_getfd and kcmp hold it for reading
+  (`signal::ExecUpdateRead`) around the access decision and what it
+  guards. kcmp holds two (Linux kcmp_lock): the lower thread-group id's
+  first, one if both tasks share a group.
 
 Dumpability is an atomic in the `Mm` (Linux mm->flags MMF_DUMPABLE),
 shared by every task of the address space: read lock-free (under
