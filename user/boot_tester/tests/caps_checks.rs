@@ -24,6 +24,10 @@
 //!   unreadable even by root (EACCES); KEYCTL_SETPERM refuses unknown
 //!   bits (EINVAL); KEYCTL_CHOWN gives the key away (root) and is
 //!   EACCES for an owner without CAP_SYS_ADMIN.
+//! - CLONE3_ERROR_NO_LEAK: clone3 that fails late (CLONE_INTO_CGROUP with
+//!   a file that is no cgroup: EBADF; CLONE_NEWNS with CLONE_FS: EINVAL)
+//!   leaves no child behind to wait for (Linux copy_process checks
+//!   these before the child exists).
 
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
@@ -48,6 +52,7 @@ pub fn run_tests() {
     report(b"SETRLIMIT_EFAULT_FIRST", (r != -14) as u64);
     report(b"IPC_CAPS", ipc_caps());
     report(b"KEYS_NO_ROOT_BYPASS", in_child(keys_no_root_bypass));
+    report(b"CLONE3_ERROR_NO_LEAK", in_child(clone3_error_no_leak));
 }
 
 fn report(name: &[u8], step: u64) {
@@ -456,6 +461,53 @@ fn keys_no_root_bypass() -> u64 {
     }
     if keyctl(KEYCTL_CHOWN, k2 as u64, 0, u32::MAX as u64) != EACCES {
         return 9;
+    }
+    0
+}
+
+/// In a child with no children of its own
+fn clone3_error_no_leak() -> u64 {
+    const CLONE_FS: u64 = 0x200;
+    const CLONE_NEWNS: u64 = 0x2_0000;
+    const CLONE_INTO_CGROUP: u64 = 0x2_0000_0000;
+    const SIGCHLD: u64 = 17;
+    let fd = hk_syscall::sys_open(b"/proc/self/status\0".as_ptr(), hk_syscall::O_RDONLY, 0);
+    if fd < 0 {
+        return 1;
+    }
+    let mut args = hk_syscall::CloneArgs {
+        flags: CLONE_INTO_CGROUP,
+        pidfd: 0,
+        child_tid: 0,
+        parent_tid: 0,
+        exit_signal: SIGCHLD,
+        stack: 0,
+        stack_size: 0,
+        tls: 0,
+        set_tid: 0,
+        set_tid_size: 0,
+        cgroup: fd as u64,
+    };
+    let size = core::mem::size_of::<hk_syscall::CloneArgs>();
+    let r = hk_syscall::sys_clone3(&args, size);
+    if r == 0 {
+        sys_exit(0);
+    }
+    if r != -9 {
+        return 2;
+    }
+    args.flags = CLONE_NEWNS | CLONE_FS;
+    let r = hk_syscall::sys_clone3(&args, size);
+    if r == 0 {
+        sys_exit(0);
+    }
+    if r != -22 {
+        return 3;
+    }
+    // Nothing to wait for
+    let mut ws = 0;
+    if hk_syscall::sys_wait4(-1, &mut ws, 1, 0) != -10 {
+        return 4;
     }
     0
 }

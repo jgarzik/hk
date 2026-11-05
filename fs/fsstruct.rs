@@ -234,27 +234,23 @@ pub fn exit_task_fs(tid: Tid) {
     drop(fs);
 }
 
-/// Clone filesystem context for fork/clone
-///
-/// If `share` is true (CLONE_FS), the child shares the parent's FsStruct.
-/// If `share` is false (normal fork), the child gets a copy.
-pub fn clone_task_fs(parent_tid: Tid, child_tid: Tid, share: bool) {
-    let child_fs = if share {
-        // CLONE_FS: share the same Arc<FsStruct>
-        get_task_fs(parent_tid).inspect(|fs| {
-            fs.users.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
-        })
-    } else {
-        // Normal fork: copy the FsStruct
-        get_task_fs(parent_tid).map(|fs| fs.copy())
-    };
-
-    if let Some(fs) = child_fs {
-        init_task_fs(child_tid, fs);
-    } else {
-        // Fallback: create new FsStruct at root
-        if let Some(fs) = FsStruct::new_root() {
-            init_task_fs(child_tid, fs);
-        }
+/// The fs context a child of `parent_tid` gets (Linux copy_fs): the
+/// parent's own with CLONE_FS, else a copy (a parent without one: a new
+/// one at the root). Nothing is counted yet, so a fork that fails
+/// afterwards just drops it.
+pub fn fork_fs(parent_tid: Tid, share: bool) -> Option<Arc<FsStruct>> {
+    match get_task_fs(parent_tid) {
+        Some(fs) if share => Some(fs),
+        Some(fs) => Some(fs.copy()),
+        None => FsStruct::new_root(),
     }
+}
+
+/// Give the child its fork-time fs context, counting one more sharer
+/// for CLONE_FS (Linux fs->users++)
+pub fn install_fork_fs(child_tid: Tid, fs: Arc<FsStruct>, shared: bool) {
+    if shared {
+        fs.users.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    }
+    init_task_fs(child_tid, fs);
 }
