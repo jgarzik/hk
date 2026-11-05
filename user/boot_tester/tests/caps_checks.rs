@@ -27,7 +27,8 @@
 //! - CLONE3_ERROR_NO_LEAK: clone3 that fails late (CLONE_INTO_CGROUP with
 //!   a file that is no cgroup: EBADF; CLONE_NEWNS with CLONE_FS: EINVAL)
 //!   leaves no child behind to wait for (Linux copy_process checks
-//!   these before the child exists).
+//!   these before the child exists); the second is EINVAL even for an
+//!   unprivileged caller.
 
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
@@ -508,6 +509,17 @@ fn clone3_error_no_leak() -> u64 {
     let mut ws = 0;
     if hk_syscall::sys_wait4(-1, &mut ws, 1, 0) != -10 {
         return 4;
+    }
+    // The flag combination is EINVAL before any capability check
+    if sys_setresuid(1000, 1000, 1000) != 0 {
+        return 5;
+    }
+    let r = hk_syscall::sys_clone3(&args, size);
+    if r == 0 {
+        sys_exit(0);
+    }
+    if r != -22 {
+        return 6;
     }
     0
 }

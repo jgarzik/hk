@@ -353,17 +353,18 @@ pub fn fork_nsproxy(
     child_fs: Option<&crate::fs::FsStruct>,
 ) -> Result<Arc<NsProxy>, i32> {
     let ns_flags = flags & CLONE_NS_FLAGS;
+    // CLONE_NEWNS with a shared fs struct is EINVAL, before any
+    // permission check (Linux copy_process); the child's own copy
+    // follows its new mounts
+    if ns_flags & CLONE_NEWNS != 0 && flags & crate::task::clone_flags::CLONE_FS != 0 {
+        return Err(22);
+    }
     if !may_create_namespaces(ns_flags) {
         return Err(EPERM as i32);
     }
     let parent_ns = get_task_ns(parent_tid).unwrap_or_else(|| INIT_NSPROXY.clone());
     if ns_flags == 0 {
         return Ok(parent_ns);
-    }
-    // CLONE_NEWNS with a shared fs struct is EINVAL (Linux
-    // copy_process); the child's own copy follows its new mounts
-    if ns_flags & CLONE_NEWNS != 0 && flags & crate::task::clone_flags::CLONE_FS != 0 {
-        return Err(22);
     }
     parent_ns.copy(ns_flags, child_fs)
 }
