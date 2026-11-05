@@ -2021,8 +2021,9 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     // is EBADF)
     let child_fs = crate::fs::fsstruct::fork_fs(current_tid, config.flags & CLONE_FS != 0);
     let child_ns = crate::ns::fork_nsproxy(current_tid, config.flags, child_fs.as_deref())?;
-    let target_cgroup = if config.flags & CLONE_INTO_CGROUP != 0 {
-        Some(crate::task::cgroup_from_fd(current_tid, config.cgroup_fd).ok_or(9)?) // EBADF
+    let into = config.flags & CLONE_INTO_CGROUP != 0;
+    let target_cgroup = if into {
+        Some(crate::task::cgroup_from_fd(current_tid, config.cgroup_fd)?)
     } else {
         crate::cgroup::get_task_cgroup(current_tid)
     };
@@ -2030,7 +2031,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     // pids limit is charged here, EAGAIN past it); an error below gives
     // the charge back when `fork_cg` drops
     let fork_cg = match &target_cgroup {
-        Some(cg) => Some(crate::cgroup::can_fork(cg).map_err(|e| e.errno())?),
+        Some(cg) => Some(crate::cgroup::can_fork(cg, into).map_err(|e| e.errno())?),
         None => None,
     };
 

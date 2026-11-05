@@ -220,18 +220,15 @@ impl InodeOps for CgroupfsInodeOps {
             .downcast_ref::<CgroupfsInodeWrapper>()
             .ok_or(KernelError::Io)?;
 
-        let data = wrapper.0.read();
-        match &*data {
-            CgroupfsInodeData::Directory { cgroup } => {
-                let parent_cg = cgroup.upgrade().ok_or(KernelError::NotFound)?;
-
-                // Create new cgroup
-                let new_cg = cgroup_mkdir(&parent_cg, name)?;
-
-                Ok(create_cgroup_dir_inode(dir, &new_cg))
-            }
-            _ => Err(KernelError::NotDirectory),
-        }
+        // Out of the inode's spin lock before cgroup_mkdir takes
+        // CGROUP_MUTEX
+        let parent = match &*wrapper.0.read() {
+            CgroupfsInodeData::Directory { cgroup } => cgroup.clone(),
+            _ => return Err(KernelError::NotDirectory),
+        };
+        let parent_cg = parent.upgrade().ok_or(KernelError::NoDevice)?;
+        let new_cg = cgroup_mkdir(&parent_cg, name)?;
+        Ok(create_cgroup_dir_inode(dir, &new_cg))
     }
 
     fn rmdir(&self, dir: &Inode, name: &[u8]) -> Result<(), KernelError> {
@@ -243,14 +240,14 @@ impl InodeOps for CgroupfsInodeOps {
             .downcast_ref::<CgroupfsInodeWrapper>()
             .ok_or(KernelError::Io)?;
 
-        let data = wrapper.0.read();
-        match &*data {
-            CgroupfsInodeData::Directory { cgroup } => {
-                let parent_cg = cgroup.upgrade().ok_or(KernelError::NotFound)?;
-                cgroup_rmdir(&parent_cg, name)
-            }
-            _ => Err(KernelError::NotDirectory),
-        }
+        // Out of the inode's spin lock before cgroup_rmdir takes
+        // CGROUP_MUTEX
+        let parent = match &*wrapper.0.read() {
+            CgroupfsInodeData::Directory { cgroup } => cgroup.clone(),
+            _ => return Err(KernelError::NotDirectory),
+        };
+        let parent_cg = parent.upgrade().ok_or(KernelError::NotFound)?;
+        cgroup_rmdir(&parent_cg, name)
     }
 }
 
@@ -562,10 +559,20 @@ impl FileOps for CgroupfsFileOps {
             .downcast_ref::<CgroupfsInodeWrapper>()
             .ok_or(KernelError::Io)?;
 
+        // Writes run under CGROUP_MUTEX (Linux cgroup_kn_lock_live for
+        // cgroup.procs, subtree_control and freeze), taken before the
+        // inode's spin lock; a removed cgroup's files are ENODEV (Linux
+        // kernfs_fop_write: no active reference to a removed node)
+        let _g = crate::cgroup::CGROUP_MUTEX.lock();
         let data = wrapper.0.read();
+        let live = |c: &alloc::sync::Weak<Cgroup>| {
+            c.upgrade()
+                .filter(|c| !c.is_dead())
+                .ok_or(KernelError::NoDevice)
+        };
         match &*data {
             CgroupfsInodeData::ControlFile { cgroup, file_type } => {
-                let cg = cgroup.upgrade().ok_or(KernelError::NotFound)?;
+                let cg = live(cgroup)?;
                 handle_control_file_write(&cg, *file_type, buf)?;
                 Ok(buf.len())
             }
@@ -574,7 +581,7 @@ impl FileOps for CgroupfsFileOps {
                 controller,
                 file_name,
             } => {
-                let cg = cgroup.upgrade().ok_or(KernelError::NotFound)?;
+                let cg = live(cgroup)?;
                 handle_subsys_file_write(&cg, *controller, file_name, buf)?;
                 Ok(buf.len())
             }

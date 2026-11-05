@@ -91,8 +91,10 @@ pub struct Cgroup {
     /// Tasks currently in this cgroup (pid list for iteration)
     tasks: RwLock<Vec<Pid>>,
 
-    /// Reference count for tasks using this cgroup
-    nr_tasks: AtomicU32,
+    /// Removed (Linux CGRP_DEAD): set under CGROUP_MUTEX by rmdir, read
+    /// under it (and lock-free by the file paths, which then fail
+    /// ENODEV as kernfs does for a removed node)
+    dead: AtomicBool,
 
     /// Subtree control - which controllers are enabled for children
     /// Bitmask of ControllerType values
@@ -126,7 +128,7 @@ impl Cgroup {
             ancestors: RwLock::new(Vec::new()),
             subsys: RwLock::new(BTreeMap::new()),
             tasks: RwLock::new(Vec::new()),
-            nr_tasks: AtomicU32::new(0),
+            dead: AtomicBool::new(false),
             subtree_control: AtomicU64::new(0),
             frozen: AtomicBool::new(false),
             ino,
@@ -226,7 +228,6 @@ impl Cgroup {
         let mut tasks = self.tasks.write();
         if !tasks.contains(&pid) {
             tasks.push(pid);
-            self.nr_tasks.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -235,13 +236,17 @@ impl Cgroup {
         let mut tasks = self.tasks.write();
         if let Some(pos) = tasks.iter().position(|&p| p == pid) {
             tasks.remove(pos);
-            self.nr_tasks.fetch_sub(1, Ordering::Relaxed);
         }
     }
 
     /// Get task count
     pub fn nr_tasks(&self) -> u32 {
-        self.nr_tasks.load(Ordering::Relaxed)
+        self.tasks.read().len() as u32
+    }
+
+    /// Removed by rmdir (Linux cgroup_is_dead)
+    pub fn is_dead(&self) -> bool {
+        self.dead.load(Ordering::Acquire)
     }
 
     /// Get all tasks in this cgroup
@@ -251,7 +256,7 @@ impl Cgroup {
 
     /// Check if cgroup is empty (no tasks, no children)
     pub fn is_empty(&self) -> bool {
-        self.nr_tasks() == 0 && self.children.read().is_empty()
+        self.tasks.read().is_empty() && self.children.read().is_empty()
     }
 
     /// Check if this cgroup or any ancestor is frozen
@@ -711,8 +716,21 @@ pub fn cgroup_exit_task(pid: Pid) {
     }
 }
 
-/// Create a child cgroup
+/// The cgroup hierarchy's sleeping lock (Linux cgroup_mutex): mkdir,
+/// rmdir, cgroup.procs, subtree_control and freeze writes, and a
+/// CLONE_INTO_CGROUP fork from admission to post_fork; whoever holds it
+/// sees a cgroup's death and membership settle together. Under a
+/// cgroupfs directory's i_rwsem; above every cgroup spin lock and
+/// TASKLIST.
+pub static CGROUP_MUTEX: crate::sync::Mutex<()> = crate::sync::Mutex::new(());
+
+/// Create a child cgroup (Linux cgroup_mkdir: ENODEV in a removed
+/// parent)
 pub fn cgroup_mkdir(parent: &Arc<Cgroup>, name: &str) -> Result<Arc<Cgroup>, KernelError> {
+    let _g = CGROUP_MUTEX.lock();
+    if parent.is_dead() {
+        return Err(KernelError::NoDevice);
+    }
     let root = CGROUP_ROOT.clone();
 
     // Check if name already exists
@@ -744,14 +762,18 @@ pub fn cgroup_mkdir(parent: &Arc<Cgroup>, name: &str) -> Result<Arc<Cgroup>, Ker
     Ok(new_cg)
 }
 
-/// Remove a cgroup
+/// Remove a cgroup (Linux cgroup_destroy_locked, under cgroup_mutex):
+/// EBUSY while it has tasks or children, else it is dead from here on,
+/// so no attach or CLONE_INTO_CGROUP can join it after the check
 pub fn cgroup_rmdir(parent: &Arc<Cgroup>, name: &str) -> Result<(), KernelError> {
+    let _g = CGROUP_MUTEX.lock();
     let child = parent.lookup_child(name).ok_or(KernelError::NotFound)?;
 
     // Check if empty
     if !child.is_empty() {
         return Err(KernelError::Busy);
     }
+    child.dead.store(true, Ordering::Release);
 
     // Cleanup CSS for all controllers
     let root = CGROUP_ROOT.clone();
@@ -783,15 +805,25 @@ pub struct ForkCg {
     cg: Arc<Cgroup>,
     /// The controllers whose `can_fork` admitted it
     charged: Vec<ControllerType>,
+    /// CLONE_INTO_CGROUP: CGROUP_MUTEX until post_fork (Linux
+    /// cgroup_css_set_fork .. cgroup_css_set_put_fork); dropped after
+    /// the charges are given back
+    _lock: Option<crate::sync::MutexGuard<'static, ()>>,
 }
 
 /// Admit a new task into `cg` (Linux cgroup_can_fork on the target
-/// css_set: the parent's cgroup or the CLONE_INTO_CGROUP one): every
-/// enabled controller's `can_fork`, undone if a later one refuses
-pub fn can_fork(cg: &Arc<Cgroup>) -> Result<ForkCg, KernelError> {
+/// css_set: the parent's cgroup or, `into`, the CLONE_INTO_CGROUP one,
+/// which is locked and must not be dead: ENODEV): every enabled
+/// controller's `can_fork`, undone if a later one refuses
+pub fn can_fork(cg: &Arc<Cgroup>, into: bool) -> Result<ForkCg, KernelError> {
+    let lock = into.then(|| CGROUP_MUTEX.lock());
+    if into && cg.is_dead() {
+        return Err(KernelError::NoDevice);
+    }
     let mut fc = ForkCg {
         cg: cg.clone(),
         charged: Vec::new(),
+        _lock: lock,
     };
     for controller in cg.enabled_controllers() {
         if let Some(css) = cg.css(controller)

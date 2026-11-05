@@ -10,6 +10,15 @@
 //!   three members already there: exactly five forks succeed (the charge
 //!   is added and checked in one step; nothing passes the limit).
 //!
+//!
+//! cgroup_mutex and dead cgroups (Linux cgroup_kn_lock_live,
+//! cgroup_destroy_locked):
+//! - CGROUP_DEAD_ENODEV: after rmdir, a write to the cgroup's open
+//!   cgroup.procs is ENODEV and clone3 into its open directory ENOENT.
+//! - CGROUP_RMDIR_RACE: a child joining a cgroup while it is removed:
+//!   either the join or the rmdir fails, never both succeed (an emptiness
+//!   check and an attach cannot interleave).
+//!
 //! Runs after cgroup.rs, which mounts cgroup2 at /sys/fs/cgroup and
 //! enables +pids at the root.
 
@@ -28,6 +37,8 @@ pub fn run_tests() {
     report(b"PIDS_MAX_FORK", pids_max_fork());
     report(b"PIDS_INTO_CGROUP", pids_into_cgroup());
     report(b"PIDS_MAX_RACE", pids_max_race());
+    report(b"CGROUP_DEAD_ENODEV", cgroup_dead_enodev());
+    report(b"CGROUP_RMDIR_RACE", cgroup_rmdir_race());
 }
 
 fn report(name: &[u8], step: i64) {
@@ -289,4 +300,113 @@ fn pids_max_race() -> i64 {
     sys_munmap(p as u64, 4096);
     remove_cgroup(cg);
     r
+}
+
+fn clone3_into(fd: i64) -> i64 {
+    let args = CloneArgs {
+        flags: 0x2_0000_0000, // CLONE_INTO_CGROUP
+        pidfd: 0,
+        child_tid: 0,
+        parent_tid: 0,
+        exit_signal: 17,
+        stack: 0,
+        stack_size: 0,
+        tls: 0,
+        set_tid: 0,
+        set_tid_size: 0,
+        cgroup: fd as u64,
+    };
+    let r = sys_clone3(&args, core::mem::size_of::<CloneArgs>());
+    if r == 0 {
+        sys_exit(0);
+    }
+    if r > 0 {
+        let mut ws = 0;
+        sys_wait4(r, &mut ws, 0, 0);
+    }
+    r
+}
+
+fn cgroup_dead_enodev() -> i64 {
+    let cg = b"pl_dead";
+    let mut b = [0u8; 96];
+    if sys_mkdir(path(&mut b, cg, b"").as_ptr(), 0o755) != 0 {
+        return 90;
+    }
+    let procs = sys_open(path(&mut b, cg, b"cgroup.procs").as_ptr(), O_WRONLY, 0);
+    let dir = sys_open(path(&mut b, cg, b"").as_ptr(), O_RDONLY | O_DIRECTORY, 0);
+    let rm = sys_rmdir(path(&mut b, cg, b"").as_ptr());
+    let pid = b"1";
+    let w = sys_write(procs as u64, pid.as_ptr(), 1);
+    let c = clone3_into(dir);
+    sys_close(procs as u64);
+    sys_close(dir as u64);
+    if procs < 0 || dir < 0 || rm != 0 {
+        return 1;
+    }
+    if w != -19 {
+        return 2;
+    }
+    if c != -2 {
+        return 3;
+    }
+    0
+}
+
+const RMDIR_ROUNDS: i32 = 200;
+
+fn cgroup_rmdir_race() -> i64 {
+    let cg = b"pl_rmrace";
+    let p = sys_mmap(
+        0,
+        4096,
+        PROT_READ | PROT_WRITE,
+        MAP_SHARED | MAP_ANONYMOUS,
+        -1,
+        0,
+    );
+    if p <= 0 {
+        return 90;
+    }
+    // [0]: round started, [1]: the child's join result, [2]: rmdir done
+    // SAFETY: a fresh MAP_SHARED page of 3 i32s, unmapped below
+    let sh = unsafe { core::slice::from_raw_parts(p as *const AtomicI32, 3) };
+    let mut bad = 0;
+    for round in 1..=RMDIR_ROUNDS {
+        let mut b = [0u8; 96];
+        sys_mkdir(path(&mut b, cg, b"").as_ptr(), 0o755);
+        sh[1].store(0, Ordering::Relaxed);
+        sh[2].store(0, Ordering::Relaxed);
+        let child = sys_fork();
+        if child == 0 {
+            while sh[0].load(Ordering::Acquire) != round {
+                sys_sched_yield();
+            }
+            sh[1].store(if join(cg) { 1 } else { -1 }, Ordering::Release);
+            // Stay a member until the rmdir has run
+            while sh[2].load(Ordering::Acquire) == 0 {
+                sys_sched_yield();
+            }
+            sys_exit(0);
+        }
+        sh[0].store(round, Ordering::Release);
+        let rm = sys_rmdir(path(&mut b, cg, b"").as_ptr());
+        while sh[1].load(Ordering::Acquire) == 0 {
+            sys_sched_yield();
+        }
+        let joined = sh[1].load(Ordering::Acquire) == 1;
+        sh[2].store(1, Ordering::Release);
+        let mut ws = 0;
+        sys_wait4(child, &mut ws, 0, 0);
+        if joined && rm == 0 {
+            bad = round as i64;
+            break;
+        }
+        if rm != 0 {
+            sys_rmdir(path(&mut b, cg, b"").as_ptr());
+        }
+    }
+    sys_munmap(p as u64, 4096);
+    remove_cgroup(cg);
+    bad
 }
