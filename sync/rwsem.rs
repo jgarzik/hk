@@ -46,6 +46,11 @@ impl Count {
 }
 
 /// Sleeping reader/writer lock over a `T`
+///
+/// # Invariants
+/// `data` is shared by the `count.readers` readers or held by the one
+/// writer (`count.writer`), never both; `count` changes only under its
+/// spin lock.
 pub struct RwSem<T: ?Sized = ()> {
     count: SpinMutex<Count>,
     wq: WaitQueue,
@@ -53,7 +58,7 @@ pub struct RwSem<T: ?Sized = ()> {
 }
 
 // SAFETY: `data` is shared only by readers (needs Sync) and handed to
-// one writer at a time (needs Send)
+// one writer at a time (needs Send): the type invariant
 unsafe impl<T: ?Sized + Send> Send for RwSem<T> {}
 unsafe impl<T: ?Sized + Send + Sync> Sync for RwSem<T> {}
 

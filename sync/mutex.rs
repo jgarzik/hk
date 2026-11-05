@@ -28,13 +28,18 @@ const UNLOCKED: u64 = 0;
 const NO_TASK: u64 = u64::MAX;
 
 /// Sleeping mutual-exclusion lock
+///
+/// # Invariants
+/// `data` is accessed only by the holder: the task whose id (or
+/// `NO_TASK` before tasks exist) `owner` holds; `owner` is `UNLOCKED`
+/// when nobody holds it.
 pub struct Mutex<T> {
     owner: AtomicU64,
     wq: WaitQueue,
     data: UnsafeCell<T>,
 }
 
-// SAFETY: access to `data` is serialized by `owner`
+// SAFETY: access to `data` is serialized by `owner` (type invariant)
 unsafe impl<T: Send> Send for Mutex<T> {}
 unsafe impl<T: Send> Sync for Mutex<T> {}
 

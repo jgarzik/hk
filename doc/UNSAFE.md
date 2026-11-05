@@ -57,7 +57,11 @@ open-coded `unsafe` it replaces.
   a bullet list of conditions.
 - **`/// # Invariants`** goes on a type whose `unsafe` code relies on
   properties of its fields. Code that establishes or changes such a field
-  says why the invariant still holds, with `// INVARIANT:`.
+  says why the invariant still holds, with `// INVARIANT:`. A `SAFETY`
+  comment that depends on one says so ("type invariant"), so a later
+  change to the invariant finds every block that relied on it
+  (Rust-for-Linux coding guidelines). Examples: `util::list::List`,
+  `sync::LockedBy`, `sync::Mutex`, `WaitEntry`.
 - **One unsafe operation per block**, so each comment covers exactly one
   obligation. Exception: a dense arch or asm sequence may share one block
   if its comment justifies each operation.

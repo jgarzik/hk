@@ -94,6 +94,11 @@ pub type WakeFn = fn(&WaitEntry, WakeMode, usize) -> bool;
 /// A task's registration on one wait queue (Linux `wait_queue_entry`)
 ///
 /// Pin it (on the stack: `pin!(WaitEntry::new())`) before linking it.
+///
+/// # Invariants
+/// `wq` is the queue the entry is linked on, or null when unlinked; it
+/// and `link` change only under that queue's lock, and a waker clears
+/// `wq` last (Release). `task` outlives the entry's time on a queue.
 pub struct WaitEntry {
     link: Link,
     /// The waiting task (the entry is unlinked before it can go away)
@@ -110,7 +115,7 @@ pub struct WaitEntry {
 }
 
 // SAFETY: the links and `task` are only followed under the owning
-// queue's lock (see the module docs)
+// queue's lock (type invariant)
 unsafe impl Sync for WaitEntry {}
 unsafe impl Send for WaitEntry {}
 
