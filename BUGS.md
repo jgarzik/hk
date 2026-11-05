@@ -950,9 +950,7 @@ Ranked. Not yet confirmed by a test.
 
 1. **ABI**: `acct` ac_etime is seconds where Linux has AHZ ticks, and
    encode_comp_t skips Linux's rounding; getxattr ERANGE above 64 KiB
-   (Linux clamps); sysctl integers are
-   not parsed in base 0 (`0x10`, `010`) and `+5` is accepted;
-   adjtimex
+   (Linux clamps); adjtimex
    ignores ADJ_FREQUENCY (freq reads back 0) and stores ADJ_TIMECONST
    unclamped (Linux 0..MAXTC, +4 without STA_NANO); memory.max sizes
    take K/M/G but not T/P/E (`cgroup/memory.rs`, Linux memparse); a

@@ -76,6 +76,31 @@ pub fn format(v: &[i64]) -> Vec<u8> {
     s.into_bytes()
 }
 
+/// One integer as Linux proc_get_long: an optional '-', then a digit,
+/// then base 0 (`0x` hex, a leading `0` octal, else decimal); no '+'
+fn parse_long(tok: &str) -> Option<i64> {
+    let (neg, body) = match tok.strip_prefix('-') {
+        Some(b) => (true, b),
+        None => (false, tok),
+    };
+    if !body.as_bytes().first()?.is_ascii_digit() {
+        return None;
+    }
+    let (radix, digits) = if let Some(h) = body.strip_prefix("0x").or(body.strip_prefix("0X")) {
+        (16, h)
+    } else if body.len() > 1 && body.starts_with('0') {
+        (8, &body[1..])
+    } else {
+        (10, body)
+    };
+    let v = u64::from_str_radix(digits, radix).ok()?;
+    if neg {
+        0i64.checked_sub_unsigned(v)
+    } else {
+        i64::try_from(v).ok()
+    }
+}
+
 /// Parse a write over `cur` (Linux __do_proc_dointvec): up to `cur.len()`
 /// integers; at least one
 pub fn parse(buf: &[u8], cur: &[i64]) -> Result<Vec<i64>, KernelError> {
@@ -87,7 +112,7 @@ pub fn parse(buf: &[u8], cur: &[i64]) -> Result<Vec<i64>, KernelError> {
         if n == out.len() {
             break;
         }
-        out[n] = tok.parse().map_err(|_| KernelError::InvalidArgument)?;
+        out[n] = parse_long(tok).ok_or(KernelError::InvalidArgument)?;
         n += 1;
     }
     if n == 0 {
@@ -153,6 +178,14 @@ mod tests {
         assert_eq!(parse(b"1 2 3", &[5, 6]).unwrap(), [1, 2]);
         assert_eq!(parse(b"-4", &[5]).unwrap(), [-4]);
         assert!(parse(b"x", &[5]).is_err());
+        // Base 0 as Linux proc_get_long; no '+'
+        assert_eq!(parse(b"0x10 010 0", &[0, 0, 0]).unwrap(), [16, 8, 0]);
+        assert_eq!(parse(b"-0x10", &[0]).unwrap(), [-16]);
+        assert!(parse(b"+5", &[5]).is_err());
+        assert!(parse(b"08", &[5]).is_err());
+        assert!(parse(b"0x", &[5]).is_err());
+        assert!(parse(b"-", &[5]).is_err());
+        assert!(parse(b"1x", &[5]).is_err());
         assert!(parse(b"\n", &[5]).is_err());
         assert_eq!(format(&[1, 0]), b"1\t0\n");
     }
