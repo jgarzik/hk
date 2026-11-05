@@ -124,6 +124,12 @@ space on (no pci_disable_device) and its BAR mapped (no iounmap); an
 unregistered `NetDevice` lives on while queued skbs reference it
 (no netdev_wait_allrefs; it is down and driverless).
 
+
+The TCP send and receive queues are one contiguous `VecDeque<u8>`
+each (`net/tcp/cb.rs`), grown fallibly but still a single allocation up
+to SO_SNDBUF/SO_RCVBUF: a large buffer fragments the heap. Linux keeps a
+queue of bounded skbs; hk should hold a queue of bounded chunks.
+
 ## Memory management gaps
 
 **Location**: `mm/`, `arch/*/paging.rs`, `ipc/shm.rs`
@@ -993,16 +999,7 @@ Ranked. P# = the pattern's number in doc/res/hk-linux-cve-patterns.md.
 
 Ranked. Not yet confirmed by a test.
 
-1. **Kernel panics by allocation size** (heap objects are at most
-   4 MiB, MAX_KMALLOC; an infallible allocation that fails panics):
-   - `fs/vfat.rs`: `extend_cluster_chain` collects every new cluster
-     (ftruncate to 4 GiB with 512-byte clusters: 32 MiB); a
-     `sectors_per_cluster` of 0 from disk divides by zero. Mount does
-     not validate the BPB (Linux fat_fill_super).
-   - TCP receive/send VecDeques double under `cb` past 4 MiB with large
-     SO_RCVBUF/SO_SNDBUF (`net/tcp/input.rs`, `net/tcp/cb.rs`): a queue
-     of bounded chunks, as Linux skb queues.
-2. **seccomp cBPF** (`bpf/convert.rs`, `bpf/interp.rs`):
+1. **seccomp cBPF** (`bpf/convert.rs`, `bpf/interp.rs`):
    - jeq/jgt/jge against a constant >= 0x80000000 never match (the
      constant is sign-extended against a zero-extended u32): the
      `jeq #AUDIT_ARCH_X86_64` (0xC000003E) every libseccomp, systemd
@@ -1017,7 +1014,7 @@ Ranked. Not yet confirmed by a test.
    - `validate_cbpf` accepts what Linux rejects (H/B/IND/MSH loads,
      unaligned or out-of-range `ld [k]`, `div #0`, `ret x`); ALU32
      DIV/MOD by a constant >= 2^31 is wrong.
-3. **ABI**: `acct` ac_etime is seconds where Linux has AHZ ticks, and
+2. **ABI**: `acct` ac_etime is seconds where Linux has AHZ ticks, and
    encode_comp_t skips Linux's rounding; getxattr ERANGE above 64 KiB
    (Linux clamps); epoll_wait maxevents capped at 4096 and poll at
    1024 fds (Linux: ~INT_MAX/12, RLIMIT_NOFILE); sysctl integers are
@@ -1031,7 +1028,7 @@ Ranked. Not yet confirmed by a test.
    take K/M/G but not T/P/E (`cgroup/memory.rs`, Linux memparse); a
    READ CAPACITY(10) last LBA of 0xFFFFFFFF is not retried with READ
    CAPACITY(16) (`block/scsi.rs`, Linux sd_read_capacity).
-4. **Minor**: `fs/posix_lock.rs:328` `-l_len` overflows at i64::MIN
+3. **Minor**: `fs/posix_lock.rs:328` `-l_len` overflows at i64::MIN
    and lengths past i64::MAX are not EOVERFLOW; `arch/x86_64/rtc.rs:131`
    panics on a CMOS month >= 14 and keeps 12 AM as hour 12; vfat short
    names can start with a space; `dt/mod.rs` panics on an out-of-range

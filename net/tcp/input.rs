@@ -543,10 +543,25 @@ impl TcpCb {
             self.mem_settle();
             return;
         }
+        // Reserve before queueing: on ENOMEM drop in order (rcv_nxt is
+        // not advanced, so the peer retransmits), never a panic
+        if self.rcvq.try_reserve(data.len()).is_err() {
+            self.ack_nomem = true;
+            self.ack_now = true;
+            self.mem_settle();
+            out.wake = true;
+            return;
+        }
         let had_ooo = !self.ooo.is_empty();
         self.rcvq.extend(data);
         self.rcv_nxt = self.rcv_nxt.wrapping_add(data.len() as u32);
         while let Some(d) = self.ooo.take(self.rcv_nxt) {
+            if self.rcvq.try_reserve(d.len()).is_err() {
+                // Drop this out-of-order piece (rcv_nxt is not advanced
+                // past it, so the peer resends); stop draining the rest
+                self.ack_nomem = true;
+                break;
+            }
             self.rcv_nxt = self.rcv_nxt.wrapping_add(d.len() as u32);
             self.rcvq.extend(&d);
         }
