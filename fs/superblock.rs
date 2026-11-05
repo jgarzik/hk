@@ -417,8 +417,12 @@ impl SuperBlock {
         })
     }
 
-    /// Note a new mount of this superblock (Linux sb->s_mounts)
+    /// Note a new mount of this superblock (Linux clone_mnt adds to
+    /// sb->s_mounts under lock_mount_hash): under MOUNT_LOCK, so a
+    /// read-only remount either sees it and holds its writers, or ran
+    /// before it existed (its writers then see SB_RDONLY)
     pub(super) fn add_mount(&self, m: &Arc<super::mount::Mount>) {
+        let _ml = super::mount::MOUNT_LOCK.write();
         let mut mounts = self.s_mounts.lock();
         mounts.retain(|w| w.strong_count() != 0);
         mounts.push(Arc::downgrade(m));
@@ -434,8 +438,12 @@ impl SuperBlock {
         if self.rdonly() {
             return Ok(());
         }
-        let _ml = super::mount::MOUNT_LOCK.write();
-        let mounts: alloc::vec::Vec<Arc<super::mount::Mount>> = self
+        // The references live outside MOUNT_LOCK: a mount whose last
+        // other reference went meanwhile is torn down after the unlock,
+        // never under it (Mount::drop takes dentry and id locks)
+        let mounts: alloc::vec::Vec<Arc<super::mount::Mount>>;
+        let ml = super::mount::MOUNT_LOCK.write();
+        mounts = self
             .s_mounts
             .lock()
             .iter()
@@ -453,6 +461,8 @@ impl SuperBlock {
             m.unhold_writers();
         }
         unhold_writers(&self.s_writers);
+        drop(ml);
+        drop(mounts);
         if free { Ok(()) } else { Err(KernelError::Busy) }
     }
 

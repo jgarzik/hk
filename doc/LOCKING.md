@@ -290,6 +290,8 @@ VFS locks (detailed order):
                    bind remount)
         ↓
     mount::MOUNT_LOCK (SeqLock writer, spin; every mnt_flags write)
+        → SuperBlock.s_mounts (spin leaf: a new mount, a read-only
+                   remount's snapshot)
         ↓
     dentry::RENAME_LOCK (spin RwLock, Linux rename_lock: write in
                    d_move/d_exchange, read in is_subdir/d_path)
@@ -1824,11 +1826,11 @@ Linux `vfsmount.mnt_count` pattern:
 | `Mount.children` | `RwLock<Vec<Arc<Mount>>>` | Child mounts |
 | `Mount.mnt_count` | `AtomicU64` | Open file reference count |
 | `Mount.mnt_flags` | `AtomicU32` | MNT_NOSUID/NODEV/NOEXEC/READONLY/LOCKED; every write under `MOUNT_LOCK` (remount, reconfigure, pivot_root's MNT_LOCKED), read lock-free (open, exec, statfs) |
-| `MOUNT_LOCK` | `SeqLock` (spin writer + sequence) | Linux mount_lock (lock_mount_hash): serializes `mnt_flags` writers; under NAMESPACE_SEM and s_umount, nothing taken under it; the sequence is there for lockless readers |
+| `MOUNT_LOCK` | `SeqLock` (spin writer + sequence) | Linux mount_lock (lock_mount_hash): serializes `mnt_flags` writers and `s_mounts` changes; under NAMESPACE_SEM and s_umount; only `SuperBlock.s_mounts` is taken under it (no mount is dropped under it: `make_rdonly` releases its references after the unlock); the sequence is there for lockless readers |
 | `Mount.t_flags` | `AtomicU32` | T_UNBINDABLE (Linux mnt_t_flags): written only under NAMESPACE_SEM write (change_propagation), read lock-free |
 | `SuperBlock.s_flags` | `AtomicU32` | SB_RDONLY; set by mount/remount, read lock-free by permission checks |
 | `Mount.writers`, `SuperBlock.s_writers` | `AtomicU64` (count + WRITE_HOLD bit 63) | Write-access holders (Linux mnt_writers + WRITE_HOLD): through a mount on the mount, for mountless internal objects on the superblock. A writer adds itself, spins while WRITE_HOLD is set, then checks read-only state (EROFS, backing out). Making a mount read-only (`set_flags`, Linux mnt_make_readonly) or the file system (`make_rdonly`, Linux sb_prepare_remount_readonly: every writable mount in `s_mounts` and `s_writers`) sets WRITE_HOLD under `MOUNT_LOCK`, is EBUSY with nothing changed if any count is nonzero, else sets the read-only flag before clearing the hold (Release). The writer's spin is invisible to lockdep; holders never wait for writers |
-| `SuperBlock.s_mounts` | spin Mutex leaf | the superblock's mounts (Weak; Linux s_mounts), under `MOUNT_LOCK` for a read-only remount |
+| `SuperBlock.s_mounts` | spin Mutex leaf | the superblock's mounts (Weak; Linux s_mounts), always under `MOUNT_LOCK`: a new mount is added there (`Mount::new`, Linux clone_mnt under lock_mount_hash), so a read-only remount's snapshot misses no mount a writer could use |
 
 **Reference Counting (mntget/mntput):**
 
