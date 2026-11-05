@@ -191,14 +191,18 @@ impl EpItem {
 /// A wakeup on one of an item's queues (Linux ep_poll_callback): under
 /// that queue's lock, possibly in an interrupt; queues the item and
 /// wakes the epoll's waiters
-fn ep_poll_callback(e: &WaitEntry, _mode: WakeMode, _key: usize) -> bool {
+fn ep_poll_callback(e: &WaitEntry, _mode: WakeMode, key: usize) -> bool {
     // SAFETY: the entry lives in its item's `regs` and is unregistered
     // before the item goes; the epoll outlives its registered entries
     let item = unsafe { &*(e.private as *const EpItem) };
     // SAFETY: as above: the epoll unregisters its items before it goes
     let ep = unsafe { &*item.ep_raw };
+    let events = item.events.load(Ordering::Acquire);
+    // A wakeup that names its events and none this item waits for is
+    // not one (Linux: pollflags && !(pollflags & epi->event.events))
     if item.dead.load(Ordering::Acquire)
-        || item.events.load(Ordering::Acquire) & !EP_PRIVATE_BITS == 0
+        || events & !EP_PRIVATE_BITS == 0
+        || (key != 0 && key as u32 & events == 0)
     {
         return false;
     }
@@ -325,15 +329,29 @@ impl Eventpoll {
             }
             f_ep.push(Arc::downgrade(&item));
         }
-        // Register the callbacks (Linux ep_item_poll with the queue proc)
+        // Register the callbacks (Linux ep_item_poll with the queue
+        // proc). The file is polled with no lock held (a poll method may
+        // sleep); its entries go into the item after, or are removed if
+        // it was deleted meanwhile
+        let mut local = EpRegs {
+            entries: Vec::new(),
+            owners: Vec::new(),
+            item: Arc::as_ptr(&item),
+        };
         let revents = {
-            let mut regs = item.regs.lock();
-            if item.dead.load(Ordering::Acquire) {
-                return Ok(());
-            }
-            let mut pt = PollTable::for_epoll(&mut regs);
+            let mut pt = PollTable::for_epoll(&mut local);
             file.f_op.poll(file, Some(&mut pt)) as u32
         };
+        {
+            let mut regs = item.regs.lock();
+            if item.dead.load(Ordering::Acquire) {
+                drop(regs);
+                local.clear();
+                return Ok(());
+            }
+            regs.entries.append(&mut local.entries);
+            regs.owners.append(&mut local.owners);
+        }
         if revents & (ev.events | EPOLLERR | EPOLLHUP) != 0 {
             self.queue_if_ready(&item);
         }
@@ -361,6 +379,10 @@ impl Eventpoll {
     /// Take `item` out of the map and the ready list, and unregister it
     /// (Linux ep_remove); its Arcs are dropped after the lock
     fn remove(&self, item: &Arc<EpItem>) {
+        // No callback first (it could queue the item again once off the
+        // ready list): unregistering waits out any one running, under
+        // its queue's lock (Linux ep_remove: ep_unregister_pollwait)
+        item.unregister();
         // The file is held across the lock: no last reference to it may
         // go under `lock` (its release takes `lock`)
         let file = item.file.upgrade();
@@ -376,7 +398,6 @@ impl Eventpoll {
                 .then(|| unsafe { inner.rdl.remove(item) });
             (mapped, ready)
         };
-        item.unregister();
         if let Some(f) = &file {
             f.f_ep
                 .lock()
@@ -518,7 +539,9 @@ impl Eventpoll {
             }
             v
         };
-        let any = ready.iter().any(|it| it.poll() != 0);
+        let any = ready
+            .iter()
+            .any(|it| !it.dead.load(Ordering::Acquire) && it.poll() != 0);
         drop(ready);
         if any { POLLIN | POLLRDNORM } else { 0 }
     }
@@ -586,25 +609,47 @@ pub fn eventpoll_release(file: &File) {
     }
 }
 
+/// Epolls already measured in one loop check, by address (Linux marks
+/// them with loop_check_gen): every epoll is walked once per check
+type Seen = BTreeMap<usize, Option<u32>>;
+
 /// How deep `ep`'s epoll targets go, None if one is `into` (a cycle) or
 /// deeper than EP_MAX_NESTS (Linux ep_loop_check_proc)
-fn down_depth(ep: &Arc<Eventpoll>, into: &Arc<Eventpoll>, depth: u32) -> Option<u32> {
-    let mut d = 0;
+fn down_depth(
+    ep: &Arc<Eventpoll>,
+    into: &Arc<Eventpoll>,
+    depth: u32,
+    seen: &mut Seen,
+) -> Option<u32> {
+    let k = Arc::as_ptr(ep) as usize;
+    if let Some(&d) = seen.get(&k) {
+        return d;
+    }
+    let mut d = Some(0);
     for t in ep.epoll_targets() {
         if Arc::ptr_eq(&t, into) || depth > EP_MAX_NESTS {
-            return None;
+            d = None;
+            break;
         }
-        d = d.max(down_depth(&t, into, depth + 1)? + 1);
-        if d > EP_MAX_NESTS {
-            return None;
+        match down_depth(&t, into, depth + 1, seen) {
+            Some(x) if x < EP_MAX_NESTS => d = d.map(|v| v.max(x + 1)),
+            _ => {
+                d = None;
+                break;
+            }
         }
     }
-    Some(d)
+    seen.insert(k, d);
+    d
 }
 
 /// How many epoll levels watch `ep` from above (Linux
 /// ep_get_upwards_depth_proc); bounded, as every insert checked it
-fn up_depth(ep: &Eventpoll) -> u32 {
+fn up_depth(ep: &Eventpoll, seen: &mut Seen) -> u32 {
+    let k = ep as *const Eventpoll as usize;
+    if let Some(&Some(d)) = seen.get(&k) {
+        return d;
+    }
     let Some(file) = ep.file.get().and_then(Weak::upgrade) else {
         return 0;
     };
@@ -614,15 +659,21 @@ fn up_depth(ep: &Eventpoll) -> u32 {
         .iter()
         .filter_map(|w| w.upgrade().and_then(|it| it.ep.upgrade()))
         .collect();
-    watchers.iter().map(|w| up_depth(w) + 1).max().unwrap_or(0)
+    let d = watchers
+        .iter()
+        .map(|w| up_depth(w, seen) + 1)
+        .max()
+        .unwrap_or(0);
+    seen.insert(k, Some(d));
+    d
 }
 
 /// Whether watching `target` from `ep` would make a cycle or a chain
 /// deeper than EP_MAX_NESTS (Linux ep_loop_check)
 fn ep_loop_check(ep: &Arc<Eventpoll>, target: &Arc<Eventpoll>) -> bool {
-    match down_depth(target, ep, 0) {
+    match down_depth(target, ep, 0, &mut Seen::new()) {
         None => true,
-        Some(d) => d > EP_MAX_NESTS || d + 1 + up_depth(ep) > EP_MAX_NESTS,
+        Some(d) => d > EP_MAX_NESTS || d + 1 + up_depth(ep, &mut Seen::new()) > EP_MAX_NESTS,
     }
 }
 
@@ -765,6 +816,10 @@ fn epoll_ctl(epfd: i32, op: i32, fd: i32, event_ptr: u64) -> Result<(), KernelEr
         {
             return Err(KernelError::InvalidArgument);
         }
+    }
+    // Errors and hangups are always reported (Linux do_epoll_ctl)
+    if op != EPOLL_CTL_DEL {
+        ev.events |= EPOLLERR | EPOLLHUP;
     }
     match op {
         EPOLL_CTL_ADD => match target_ep {

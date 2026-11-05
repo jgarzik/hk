@@ -945,6 +945,12 @@ poll, so hk accepts it and reports it always ready. Needs a
 `FileOps::can_poll` (false for the regular-file and directory ops of
 ramfs/tmpfs/vfat and most procfs files) checked at add.
 
+
+Only pipes wake with the poll events that happened (Linux passes them
+to every wake_up_poll): other files (sockets, eventfd, ttys) wake with
+none, so an edge-triggered item there is queued on any wakeup of its
+queue and reported again while it stays ready, where Linux reports it
+once per matching event.
 ## adjtimex does not steer the clock
 
 **Location**: `time/time_syscall.rs`, `time/mod.rs`

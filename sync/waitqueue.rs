@@ -496,6 +496,14 @@ impl WaitQueue {
         self.wake_common(WakeMode::Any, 1, 0) != 0
     }
 
+    /// Wake every waiter for the poll events `key` (POLL* bits; Linux
+    /// wake_up_poll): tasks wake as for `wake_all`; an epoll callback
+    /// whose item waits for none of them ignores it. Returns the number
+    /// woken.
+    pub fn wake_poll(&self, key: u32) -> usize {
+        self.wake_common(WakeMode::Any, usize::MAX, key as usize)
+    }
+
     /// Wake all waiters. Returns the number of waiters woken.
     pub fn wake_all(&self) -> usize {
         self.wake_common(WakeMode::Any, usize::MAX, 0)

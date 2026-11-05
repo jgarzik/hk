@@ -40,6 +40,8 @@ pub fn run_tests() {
     test_epoll_nest_depth();
     test_epoll_et_rearm();
     test_epoll_maxevents();
+    test_epoll_hup_events0();
+    test_epoll_et_partial_read();
 }
 
 const ELOOP: i64 = -40;
@@ -775,4 +777,64 @@ fn test_epoll_maxevents() {
         }
     })();
     ok_or_fail(b"EPOLL_MAXEVENTS", step);
+}
+
+/// An item added with no events still reports a hangup: EPOLLERR and
+/// EPOLLHUP are always watched (Linux do_epoll_ctl)
+fn test_epoll_hup_events0() {
+    let step = (|| {
+        let epfd = sys_epoll_create1(0) as i32;
+        let mut p = [0i32; 2];
+        if epfd < 0 || sys_pipe2(p.as_mut_ptr(), 0) < 0 {
+            return 1;
+        }
+        let ev = EpollEvent::new(0, 5);
+        if sys_epoll_ctl(epfd, EPOLL_CTL_ADD, p[0], &ev) != 0 {
+            return 2;
+        }
+        sys_close(p[1] as u64);
+        let mut out = [EpollEvent::empty(); 2];
+        let n = sys_epoll_wait(epfd, out.as_mut_ptr(), 2, 0);
+        sys_close(p[0] as u64);
+        sys_close(epfd as u64);
+        if n != 1 || out[0].events & hk_syscall::EPOLLHUP == 0 {
+            3
+        } else {
+            0
+        }
+    })();
+    ok_or_fail(b"EPOLL_HUP_EVENTS0", step);
+}
+
+/// Edge-triggered: a partial read is no new event (the pipe wakes its
+/// writers with POLLOUT, which a reader's EPOLLIN item ignores)
+fn test_epoll_et_partial_read() {
+    let step = (|| {
+        let epfd = sys_epoll_create1(0) as i32;
+        let mut p = [0i32; 2];
+        if epfd < 0 || sys_pipe2(p.as_mut_ptr(), 0) < 0 {
+            return 1;
+        }
+        let ev = EpollEvent::new(EPOLLIN | EPOLLET, 6);
+        if sys_epoll_ctl(epfd, EPOLL_CTL_ADD, p[0], &ev) != 0 {
+            return 2;
+        }
+        sys_write(p[1] as u64, b"ab".as_ptr(), 2);
+        let mut out = [EpollEvent::empty(); 2];
+        let first = sys_epoll_wait(epfd, out.as_mut_ptr(), 2, 0);
+        let mut b = [0u8; 1];
+        hk_syscall::sys_read(p[0] as u64, b.as_mut_ptr(), 1);
+        let second = sys_epoll_wait(epfd, out.as_mut_ptr(), 2, 0);
+        sys_close(p[0] as u64);
+        sys_close(p[1] as u64);
+        sys_close(epfd as u64);
+        if first != 1 {
+            3
+        } else if second != 0 {
+            4
+        } else {
+            0
+        }
+    })();
+    ok_or_fail(b"EPOLL_ET_PARTIAL_READ", step);
 }
