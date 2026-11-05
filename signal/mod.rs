@@ -177,6 +177,15 @@ impl SigSet {
         SigSet(self.0 & !other.0)
     }
 
+    /// The set with SIGKILL and SIGSTOP cleared: the only mask that may
+    /// become a task's blocked set or a handler's mask (Linux
+    /// sigdelsetmask in set_current_blocked / do_sigaction). They can
+    /// never be blocked, so every path that stores a blocked mask runs
+    /// its input through this.
+    pub fn blockable(self) -> SigSet {
+        self.subtract(&UNMASKABLE_SIGNALS)
+    }
+
     /// Check if any signals are set
     pub fn any(&self) -> bool {
         self.0 != 0
@@ -1867,7 +1876,7 @@ pub fn set_temp_sigmask(new: SigSet) -> Option<SigSet> {
     let me = crate::task::percpu::current();
     let old = with_task_signal_state(me.tid(), |state| {
         state.saved_sigmask = state.blocked;
-        state.blocked = new.subtract(&UNMASKABLE_SIGNALS);
+        state.blocked = new.blockable();
         state.saved_sigmask
     })?;
     me.set_tif(crate::task::tif::RESTORE_SIGMASK);
@@ -1949,6 +1958,9 @@ fn deliver_to_handler(
                 if action.flags & sa_flags::SA_NODEFER == 0 {
                     state.blocked.add(sig);
                 }
+                // SIGKILL/SIGSTOP are never blockable, whatever sa_mask
+                // or the signal is
+                state.blocked = state.blocked.blockable();
             });
             true
         }
