@@ -98,6 +98,12 @@ pub fn sys_add_key(type_ptr: u64, desc_ptr: u64, payload_ptr: u64, plen: u64, ke
         return KernelError::PermissionDenied.sysret();
     }
 
+    // Charge the user's key quota (Linux key_alloc), EDQUOT past it
+    let charge = description.len() + 1 + payload.len();
+    if let Err(e) = super::key_user_charge(cred.fsuid, charge) {
+        return e;
+    }
+
     // Allocate new key
     let serial = alloc_serial();
     // Owned by the fsuid and fsgid (Linux key_create_or_update ->
@@ -110,6 +116,8 @@ pub fn sys_add_key(type_ptr: u64, desc_ptr: u64, payload_ptr: u64, plen: u64, ke
         cred.fsgid,
         KEY_DEFAULT_PERM,
     );
+    // Record the charge so a later failure (or invalidate) returns it
+    key.set_quota(cred.fsuid, charge);
 
     // Instantiate the key with payload
     if let Err(e) = key_type.instantiate(&key, &payload) {

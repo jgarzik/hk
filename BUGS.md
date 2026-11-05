@@ -356,6 +356,17 @@ creates queues, where Linux lets any user. mq_attr_ok's soft caps
 (msgsize_max 8192, msg_max 10 without CAP_SYS_RESOURCE) are therefore
 unreachable today.
 
+## Keys are freed only on invalidate
+
+**Location:** `keys/mod.rs`, `keys/key.rs`
+
+A key stays in `KEY_DATABASE` until KEYCTL_INVALIDATE; unlinking it or
+the owner exiting does not free it (Linux drops a key when its last
+link and reference go, via the key GC). So its per-user quota charge is
+returned only on invalidate, and a process that exits without
+invalidating leaves its keys (and their quota) charged. Add a GC that
+frees an unreferenced, unlinked key.
+
 ## sysfs gaps
 
 **Location**: `fs/kernfs/`, `fs/sysfs.rs`, `base/`, `block/genhd.rs`,
@@ -950,21 +961,16 @@ Ranked. P# = the pattern's number in doc/res/hk-linux-cve-patterns.md.
    closed pipe write end registered in an epoll never gives the reader
    EOF, a closed socket is never released, and epoll_wait keeps
    reporting it. Linux epitems hold no reference; __fput removes them.
-3. **Keys have no quota** (P13). add_key (`keys/syscall.rs:42`) takes
-   up to 1MB per key with no per-user count or byte limit, so any user
-   can fill the kernel heap (whose exhaustion panics). Linux
-   key_payload_reserve / key_user: maxkeys 200, maxbytes 20000 for
-   non-root (/proc/sys/kernel/keys/*).
-4. **bpf() is open to unprivileged users** (P9). `bpf/syscall.rs:228`
+3. **bpf() is open to unprivileged users** (P9). `bpf/syscall.rs:228`
    has no capability check: any user creates maps (uncharged, see
    above) and loads programs. Linux's default
    kernel.unprivileged_bpf_disabled=2 (BPF_UNPRIV_DEFAULT_OFF) makes
    map_create and prog_load EPERM without CAP_BPF.
-5. **mmap offset + length is not checked for wrap** (P6).
+4. **mmap offset + length is not checked for wrap** (P6).
    `mm/syscall.rs:78`: a file offset near 2^64 wraps the page index of
    the mapping's pages; Linux do_mmap is EOVERFLOW when
    pgoff + (len >> PAGE_SHIFT) wraps.
-6. **pwrite/write past LLONG_MAX is not refused** (P6). `fs/io.rs:210`
+5. **pwrite/write past LLONG_MAX is not refused** (P6). `fs/io.rs:210`
    checks only `offset >= 0` and there is no s_maxbytes: pos + count
    can exceed i64::MAX, giving a negative st_size and lseek results
    that read as errnos. Linux rw_verify_area (EINVAL) and

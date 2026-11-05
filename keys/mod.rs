@@ -137,6 +137,49 @@ pub fn remove_key(serial: KeySerial) -> Option<Arc<Key>> {
     KEY_DATABASE.write().remove(&serial)
 }
 
+/// Per-user key accounting (Linux key_user): bounds how many keys and
+/// bytes of payload one user can pin, so keys cannot exhaust the heap.
+#[derive(Default)]
+struct KeyUser {
+    nkeys: usize,
+    nbytes: usize,
+}
+
+static KEY_USERS: RwLock<BTreeMap<u32, KeyUser>> = RwLock::new(BTreeMap::new());
+
+/// Linux root/non-root key quota (key.c): maxkeys / maxbytes
+const KEY_MAXKEYS: usize = 200;
+const KEY_MAXBYTES: usize = 20000;
+const KEY_ROOT_MAXKEYS: usize = 1_000_000;
+const KEY_ROOT_MAXBYTES: usize = 25_000_000;
+
+/// Charge one key of `bytes` to `uid`, or EDQUOT past its limit (Linux
+/// key_alloc / key_payload_reserve)
+pub fn key_user_charge(uid: u32, bytes: usize) -> Result<(), i64> {
+    let (maxk, maxb) = if uid == 0 {
+        (KEY_ROOT_MAXKEYS, KEY_ROOT_MAXBYTES)
+    } else {
+        (KEY_MAXKEYS, KEY_MAXBYTES)
+    };
+    let mut users = KEY_USERS.write();
+    let u = users.entry(uid).or_default();
+    if u.nkeys + 1 > maxk || u.nbytes.saturating_add(bytes) > maxb {
+        return Err(crate::util::error::KernelError::QuotaExceeded.sysret());
+    }
+    u.nkeys += 1;
+    u.nbytes += bytes;
+    Ok(())
+}
+
+/// Return a key's charge when it is freed (Key's drop)
+pub fn key_user_uncharge(uid: u32, bytes: usize) {
+    let mut users = KEY_USERS.write();
+    if let Some(u) = users.get_mut(&uid) {
+        u.nkeys = u.nkeys.saturating_sub(1);
+        u.nbytes = u.nbytes.saturating_sub(bytes);
+    }
+}
+
 /// Get the number of keys in the database (for testing/debugging)
 pub fn key_count() -> usize {
     KEY_DATABASE.read().len()

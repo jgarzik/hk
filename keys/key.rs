@@ -169,6 +169,12 @@ pub struct Key {
 
     /// Key type reference for polymorphic operations
     key_type: Arc<dyn KeyType>,
+
+    /// The user charged for this key and the bytes charged (Linux
+    /// key_user quota). 0 bytes: not charged (internal keys). Set once
+    /// at creation, returned in `Drop`.
+    quota_uid: AtomicU32,
+    quota_bytes: core::sync::atomic::AtomicUsize,
 }
 
 impl Key {
@@ -192,7 +198,16 @@ impl Key {
             state: AtomicU32::new(KeyState::Uninstantiated as u32),
             keyring_keys: RwLock::new(Vec::new()),
             key_type,
+            quota_uid: AtomicU32::new(0),
+            quota_bytes: core::sync::atomic::AtomicUsize::new(0),
         })
+    }
+
+    /// Record that `bytes` were charged to `uid`'s key quota, so the
+    /// charge is returned when the key is freed
+    pub fn set_quota(&self, uid: u32, bytes: usize) {
+        self.quota_uid.store(uid, Ordering::Relaxed);
+        self.quota_bytes.store(bytes, Ordering::Relaxed);
     }
 
     /// Give an uninstantiated key its payload (Linux
@@ -511,3 +526,12 @@ pub const KEY_DEFAULT_PERM: KeyPerm = KEY_POS_ALL | KEY_USR_ALL;
 
 /// Default permissions for new keyrings
 pub const KEYRING_DEFAULT_PERM: KeyPerm = KEY_POS_ALL | KEY_USR_ALL | KEY_USR_SEARCH;
+
+impl Drop for Key {
+    fn drop(&mut self) {
+        let bytes = self.quota_bytes.load(Ordering::Relaxed);
+        if bytes > 0 {
+            super::key_user_uncharge(self.quota_uid.load(Ordering::Relaxed), bytes);
+        }
+    }
+}

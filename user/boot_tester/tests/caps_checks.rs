@@ -67,6 +67,7 @@ pub fn run_tests() {
     report(b"SIGNAL_PERM", signal_perm());
     report(b"KEY_CYCLE_EDEADLK", key_cycle());
     report(b"KEY_LINK_PERM", key_link_perm());
+    report(b"KEY_QUOTA", key_quota());
 }
 
 fn report(name: &[u8], step: u64) {
@@ -482,6 +483,52 @@ fn add_keyring(desc: &[u8]) -> i64 {
 
 /// Serial of a key the parent creates, read by the forked child
 static mut VICTIM_KEY: i64 = 0;
+
+const EDQUOT: i64 = -122;
+
+/// An unprivileged user cannot pin unbounded keys: past the per-user
+/// limit (Linux key_user maxkeys 200), add_key is EDQUOT.
+fn key_quota() -> u64 {
+    let pid = sys_fork();
+    if pid == 0 {
+        if sys_setresuid(1000, 1000, 1000) != 0 {
+            sys_exit(2);
+        }
+        let mut made = 0i32;
+        // Unique descriptions; well past the 200-key cap
+        let mut desc = *b"kq0000\0";
+        for i in 0..260i32 {
+            desc[2] = b'0' + (i / 100 % 10) as u8;
+            desc[3] = b'0' + (i / 10 % 10) as u8;
+            desc[4] = b'0' + (i % 10) as u8;
+            let r = hk_syscall::sys_add_key(
+                b"user\0".as_ptr(),
+                desc.as_ptr(),
+                b"x".as_ptr(),
+                1,
+                KEY_SPEC_PROCESS_KEYRING,
+            );
+            if r == EDQUOT {
+                // The cap is 200/user; a few keys may already be
+                // charged to this uid from earlier tests (hk does not
+                // free keys on process exit), so allow some slack
+                sys_exit(if made >= 190 { 0 } else { 3 });
+            }
+            if r <= 0 {
+                sys_exit(4);
+            }
+            made += 1;
+        }
+        // Never hit the quota
+        sys_exit(5);
+    }
+    let mut st = 0i32;
+    sys_wait4(pid, &mut st, 0, 0);
+    if st & 0x7f != 0 {
+        return 80;
+    }
+    ((st >> 8) & 0xff) as u64
+}
 
 /// Linking a keyring into itself or into one it already reaches is
 /// EDEADLK (Linux keyring_detect_cycle), so a search cannot recurse
