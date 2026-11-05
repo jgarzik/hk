@@ -68,6 +68,7 @@ pub fn run_tests() {
     report(b"KEY_CYCLE_EDEADLK", key_cycle());
     report(b"KEY_LINK_PERM", key_link_perm());
     report(b"KEY_QUOTA", key_quota());
+    report(b"KEY_GC", key_gc());
     report(b"BPF_UNPRIV_EPERM", in_child(bpf_unpriv));
     report(b"BPF_UNPRIV_SYSCTL", bpf_sysctl());
 }
@@ -511,9 +512,8 @@ fn key_quota() -> u64 {
                 KEY_SPEC_PROCESS_KEYRING,
             );
             if r == EDQUOT {
-                // The cap is 200/user; a few keys may already be
-                // charged to this uid from earlier tests (hk does not
-                // free keys on process exit), so allow some slack
+                // The cap is 200/user; keyrings this uid owns count too
+                // on Linux, so allow some slack
                 sys_exit(if made >= 190 { 0 } else { 3 });
             }
             if r <= 0 {
@@ -523,6 +523,61 @@ fn key_quota() -> u64 {
         }
         // Never hit the quota
         sys_exit(5);
+    }
+    let mut st = 0i32;
+    sys_wait4(pid, &mut st, 0, 0);
+    if st & 0x7f != 0 {
+        return 80;
+    }
+    ((st >> 8) & 0xff) as u64
+}
+
+/// Unlinked keys are freed and their quota returned (Linux key_put and
+/// the key GC, which runs asynchronously: retried for up to 2 s)
+fn key_gc() -> u64 {
+    const KEYCTL_CLEAR: i32 = 7;
+    let pid = sys_fork();
+    if pid == 0 {
+        if sys_setresuid(1000, 1000, 1000) != 0 {
+            sys_exit(2);
+        }
+        let mut desc = *b"kg0000\0";
+        let mut add = |i: i32| {
+            desc[2] = b'0' + (i / 100 % 10) as u8;
+            desc[3] = b'0' + (i / 10 % 10) as u8;
+            desc[4] = b'0' + (i % 10) as u8;
+            hk_syscall::sys_add_key(
+                b"user\0".as_ptr(),
+                desc.as_ptr(),
+                b"x".as_ptr(),
+                1,
+                KEY_SPEC_PROCESS_KEYRING,
+            )
+        };
+        let mut i = 0;
+        while add(i) > 0 {
+            i += 1;
+            if i > 260 {
+                sys_exit(3);
+            }
+        }
+        if add(i) != EDQUOT {
+            sys_exit(4);
+        }
+        if keyctl(KEYCTL_CLEAR, KEY_SPEC_PROCESS_KEYRING as u64, 0, 0) != 0 {
+            sys_exit(5);
+        }
+        let ts = hk_syscall::Timespec {
+            tv_sec: 0,
+            tv_nsec: 10_000_000,
+        };
+        for _ in 0..200 {
+            if add(i) > 0 {
+                sys_exit(0);
+            }
+            hk_syscall::sys_nanosleep(&ts, core::ptr::null_mut());
+        }
+        sys_exit(6);
     }
     let mut st = 0i32;
     sys_wait4(pid, &mut st, 0, 0);

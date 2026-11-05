@@ -164,8 +164,11 @@ pub struct Key {
     /// State (uninstantiated, instantiated, revoked, dead)
     state: AtomicU32,
 
-    /// For keyrings: contained keys (by serial number)
-    keyring_keys: RwLock<Vec<KeySerial>>,
+    /// For keyrings: the linked keys (Linux keyring links hold a
+    /// reference: a key lives while linked or otherwise referenced, and
+    /// is freed with the last; cycle checks keep links acyclic). An
+    /// unlinked key is dropped after the lock is released.
+    keyring_keys: RwLock<Vec<Arc<Key>>>,
 
     /// Key type reference for polymorphic operations
     key_type: Arc<dyn KeyType>,
@@ -333,11 +336,18 @@ impl Key {
         if !self.is_keyring() || depth == 0 {
             return false;
         }
-        let keys = self.keyring_keys.read().clone();
-        keys.into_iter().any(|s| {
-            s == serial
-                || super::lookup_key(s).is_some_and(|k| k.keyring_reaches(serial, depth - 1))
-        })
+        self.links()
+            .iter()
+            .any(|k| k.serial == serial || k.keyring_reaches(serial, depth - 1))
+    }
+
+    /// The live keys linked in this keyring
+    pub(crate) fn links(&self) -> Vec<Arc<Key>> {
+        let keys = self.keyring_keys.read();
+        keys.iter()
+            .filter(|k| k.state() != KeyState::Dead)
+            .cloned()
+            .collect()
     }
 
     /// Get the permission mask
@@ -368,126 +378,108 @@ impl Key {
     // Keyring-specific operations
     // ==========================================================================
 
-    /// Add a key to this keyring (if this is a keyring)
-    pub fn keyring_add(&self, key_serial: KeySerial) -> Result<(), i64> {
+    /// Link `key` into this keyring (if this is a keyring)
+    pub fn keyring_add(&self, key: &Arc<Key>) -> Result<(), i64> {
         if !self.is_keyring() {
             return Err(KernelError::NotDirectory.sysret());
         }
 
         // A keyring may not be linked into itself or into one it already
         // reaches (Linux keyring_detect_cycle: EDEADLK), or a search
-        // would recurse without end
-        if key_serial == self.serial {
-            return Err(KernelError::Deadlock.sysret());
-        }
-        if let Some(k) = super::lookup_key(key_serial)
-            && k.is_keyring()
-            && k.keyring_reaches(self.serial, KEYRING_SEARCH_MAX_DEPTH)
+        // would recurse without end and the links would hold each other
+        if key.serial == self.serial
+            || (key.is_keyring() && key.keyring_reaches(self.serial, KEYRING_SEARCH_MAX_DEPTH))
         {
             return Err(KernelError::Deadlock.sysret());
         }
 
         let mut keys = self.keyring_keys.write();
-
-        // Check if already linked
-        if keys.contains(&key_serial) {
+        if keys.iter().any(|k| k.serial == key.serial) {
             return Ok(()); // Already linked, success
         }
-
-        keys.push(key_serial);
+        keys.try_reserve(1)
+            .map_err(|_| KernelError::OutOfMemory.sysret())?;
+        keys.push(key.clone());
         Ok(())
     }
 
-    /// Remove a key from this keyring
+    /// Unlink the key `key_serial` from this keyring
     pub fn keyring_remove(&self, key_serial: KeySerial) -> Result<(), i64> {
         if !self.is_keyring() {
             return Err(KernelError::NotDirectory.sysret());
         }
-
-        let mut keys = self.keyring_keys.write();
-        if let Some(pos) = keys.iter().position(|&s| s == key_serial) {
-            keys.remove(pos);
-            Ok(())
-        } else {
-            Err(KernelError::NotFound.sysret())
+        let gone = {
+            let mut keys = self.keyring_keys.write();
+            let pos = keys.iter().position(|k| k.serial == key_serial);
+            pos.map(|i| keys.remove(i))
+        };
+        // The link's reference goes after the lock (it may be the last)
+        match gone {
+            Some(k) => {
+                drop(k);
+                Ok(())
+            }
+            None => Err(KernelError::NotFound.sysret()),
         }
     }
 
-    /// Clear all keys from this keyring
+    /// Unlink every key from this keyring
     pub fn keyring_clear(&self) -> Result<(), i64> {
         if !self.is_keyring() {
             return Err(KernelError::NotDirectory.sysret());
         }
-
-        self.keyring_keys.write().clear();
+        let gone = core::mem::take(&mut *self.keyring_keys.write());
+        drop(gone);
         Ok(())
     }
 
-    /// Get the list of key serials in this keyring
+    /// The serials of the live keys in this keyring
     pub fn keyring_keys(&self) -> Vec<KeySerial> {
-        self.keyring_keys.read().clone()
+        self.links().iter().map(|k| k.serial).collect()
     }
 
     /// Get the number of keys in this keyring
     pub fn keyring_count(&self) -> usize {
-        self.keyring_keys.read().len()
+        self.links().len()
     }
 
-    /// Search this keyring for a key by type and description
-    pub fn keyring_search(&self, type_name: &str, description: &str) -> Option<KeySerial> {
+    /// A matching key directly in this keyring
+    pub fn keyring_search(&self, type_name: &str, description: &str) -> Option<Arc<Key>> {
         if !self.is_keyring() {
             return None;
         }
+        self.links()
+            .into_iter()
+            .find(|k| k.matches(type_name, description))
+    }
 
-        let keys = self.keyring_keys.read();
-        for &serial in keys.iter() {
-            if let Some(key) = super::lookup_key(serial)
-                && key.type_name == type_name
-                && key.description == description
-                && key.is_instantiated()
-                && !key.is_revoked()
-            {
-                return Some(serial);
-            }
-        }
-        None
+    /// An instantiated, unrevoked key of this type and description
+    fn matches(&self, type_name: &str, description: &str) -> bool {
+        self.type_name == type_name
+            && self.description == description
+            && self.is_instantiated()
+            && !self.is_revoked()
     }
 
     /// Recursively search this keyring and all nested keyrings
-    pub fn keyring_search_recursive(
-        &self,
-        type_name: &str,
-        description: &str,
-    ) -> Option<KeySerial> {
+    pub fn keyring_search_recursive(&self, type_name: &str, description: &str) -> Option<Arc<Key>> {
         self.search_depth(type_name, description, KEYRING_SEARCH_MAX_DEPTH)
     }
 
     /// At most `depth` nested keyrings deep (Linux KEYRING_SEARCH_MAX_DEPTH),
     /// so a keyring cycle cannot drive unbounded recursion
-    fn search_depth(&self, type_name: &str, description: &str, depth: u32) -> Option<KeySerial> {
+    fn search_depth(&self, type_name: &str, description: &str, depth: u32) -> Option<Arc<Key>> {
         if !self.is_keyring() || depth == 0 {
             return None;
         }
-
-        // Clone the keys while holding the lock, then release before recursion
-        let keys = self.keyring_keys.read().clone();
-
-        for serial in keys {
-            if let Some(key) = super::lookup_key(serial) {
-                // Check if this key matches
-                if key.type_name == type_name
-                    && key.description == description
-                    && key.is_instantiated()
-                    && !key.is_revoked()
-                {
-                    return Some(serial);
-                }
-                // Recursively search nested keyrings
-                if key.is_keyring()
-                    && let Some(found) = key.search_depth(type_name, description, depth - 1)
-                {
-                    return Some(found);
-                }
+        for key in self.links() {
+            if key.matches(type_name, description) {
+                return Some(key);
+            }
+            if key.is_keyring()
+                && let Some(found) = key.search_depth(type_name, description, depth - 1)
+            {
+                return Some(found);
             }
         }
         None
@@ -528,7 +520,10 @@ pub const KEY_DEFAULT_PERM: KeyPerm = KEY_POS_ALL | KEY_USR_ALL;
 pub const KEYRING_DEFAULT_PERM: KeyPerm = KEY_POS_ALL | KEY_USR_ALL | KEY_USR_SEARCH;
 
 impl Drop for Key {
+    /// The last link and reference went (Linux key_put -> key GC): the
+    /// key leaves the registry and its quota charge is returned
     fn drop(&mut self) {
+        super::unregister_key(self.serial, self as *const Key);
         let bytes = self.quota_bytes.load(Ordering::Relaxed);
         if bytes > 0 {
             super::key_user_uncharge(self.quota_uid.load(Ordering::Relaxed), bytes);

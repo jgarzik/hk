@@ -13,7 +13,7 @@ use crate::util::error::KernelError;
 use super::key::{KEY_DEFAULT_PERM, Key};
 use super::keyring::{keyring_link, resolve_special_keyring, search_process_keyrings};
 use super::types::get_key_type;
-use super::{alloc_serial, register_key, remove_key};
+use super::{alloc_serial, register_key};
 
 /// Maximum type name length
 const MAX_TYPE_LEN: usize = 256;
@@ -125,12 +125,10 @@ pub fn sys_add_key(type_ptr: u64, desc_ptr: u64, payload_ptr: u64, plen: u64, ke
     }
 
     // Register in global database
-    register_key(key.clone());
+    register_key(&key);
 
-    // Link to destination keyring
+    // Link to destination keyring; on failure the key is freed here
     if let Err(e) = keyring_link(&dest_keyring, &key) {
-        // Cleanup on failure
-        remove_key(serial);
         return e;
     }
 

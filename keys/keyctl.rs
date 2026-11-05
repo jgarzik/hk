@@ -416,9 +416,7 @@ pub fn keyctl_search(keyring_serial: i32, type_ptr: u64, desc_ptr: u64, dest_key
     }
 
     // Search the keyring recursively
-    if let Some(serial) = keyring.keyring_search_recursive(&type_name, &description)
-        && let Some(key) = lookup_key(serial)
-    {
+    if let Some(key) = keyring.keyring_search_recursive(&type_name, &description) {
         // Check if key is valid
         if key.is_revoked() {
             return KernelError::KeyRevoked.sysret();
@@ -438,7 +436,7 @@ pub fn keyctl_search(keyring_serial: i32, type_ptr: u64, desc_ptr: u64, dest_key
             }
         }
 
-        return serial as i64;
+        return key.serial as i64;
     }
 
     KernelError::NoKey.sysret()
@@ -529,8 +527,10 @@ pub fn keyctl_invalidate(key_serial: i32) -> i64 {
 
     key.invalidate();
 
-    // Remove from global database
+    // Lookups no longer find it, and no keyring links it: it is freed
+    // with its last reference (Linux: the key GC unlinks invalidated keys)
     remove_key(key_serial);
+    crate::keys::unlink_everywhere(key_serial);
 
     0
 }

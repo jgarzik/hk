@@ -356,17 +356,6 @@ creates queues, where Linux lets any user. mq_attr_ok's soft caps
 (msgsize_max 8192, msg_max 10 without CAP_SYS_RESOURCE) are therefore
 unreachable today.
 
-## Keys are freed only on invalidate
-
-**Location:** `keys/mod.rs`, `keys/key.rs`
-
-A key stays in `KEY_DATABASE` until KEYCTL_INVALIDATE; unlinking it or
-the owner exiting does not free it (Linux drops a key when its last
-link and reference go, via the key GC). So its per-user quota charge is
-returned only on invalidate, and a process that exits without
-invalidating leaves its keys (and their quota) charged. Add a GC that
-frees an unreferenced, unlinked key.
-
 ## sysfs gaps
 
 **Location**: `fs/kernfs/`, `fs/sysfs.rs`, `base/`, `block/genhd.rs`,
