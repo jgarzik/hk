@@ -980,22 +980,7 @@ Ranked. P# = the pattern's number in doc/res/hk-linux-cve-patterns.md.
 
 Ranked. Not yet confirmed by a test.
 
-1. **seccomp cBPF** (`bpf/convert.rs`, `bpf/interp.rs`):
-   - jeq/jgt/jge against a constant >= 0x80000000 never match (the
-     constant is sign-extended against a zero-extended u32): the
-     `jeq #AUDIT_ARCH_X86_64` (0xC000003E) every libseccomp, systemd
-     and container filter starts with fails.
-   - A jump with jt=jf=0 emits no instruction but `fixup_jumps` still
-     consumes an offset: later jumps shift, can index past the program
-     (panic) or loop backwards (hang); reachable unprivileged with
-     no_new_privs.
-   - R10 is 0, so scratch-memory ST/LD always fail (KILL_THREAD).
-   - `bpf_run`'s bound counts the program counter (`pc > BPF_MAXINSNS`),
-     not steps: a backward jump loops forever.
-   - `validate_cbpf` accepts what Linux rejects (H/B/IND/MSH loads,
-     unaligned or out-of-range `ld [k]`, `div #0`, `ret x`); ALU32
-     DIV/MOD by a constant >= 2^31 is wrong.
-2. **ABI**: `acct` ac_etime is seconds where Linux has AHZ ticks, and
+1. **ABI**: `acct` ac_etime is seconds where Linux has AHZ ticks, and
    encode_comp_t skips Linux's rounding; getxattr ERANGE above 64 KiB
    (Linux clamps); epoll_wait maxevents capped at 4096 and poll at
    1024 fds (Linux: ~INT_MAX/12, RLIMIT_NOFILE); sysctl integers are
@@ -1009,7 +994,7 @@ Ranked. Not yet confirmed by a test.
    take K/M/G but not T/P/E (`cgroup/memory.rs`, Linux memparse); a
    READ CAPACITY(10) last LBA of 0xFFFFFFFF is not retried with READ
    CAPACITY(16) (`block/scsi.rs`, Linux sd_read_capacity).
-3. **Minor**: `fs/posix_lock.rs:328` `-l_len` overflows at i64::MIN
+2. **Minor**: `fs/posix_lock.rs:328` `-l_len` overflows at i64::MIN
    and lengths past i64::MAX are not EOVERFLOW; `arch/x86_64/rtc.rs:131`
    panics on a CMOS month >= 14 and keeps 12 AM as hour 12; vfat short
    names can start with a space; `dt/mod.rs` panics on an out-of-range

@@ -58,30 +58,7 @@ Blocks:
 Value = bug likelihood x blast radius x ease. "Easy" = pure function or local
 instance; "medium" = needs a small fixture or cfg(test) shim.
 
-### 1. seccomp cBPF path: `bpf/convert.rs:45` `cbpf_to_ebpf`, `bpf/interp.rs:22` `bpf_run`, `seccomp/filter.rs:83` `SeccompFilter::run`, `seccomp/check.rs:58,94` `check_syscall`/`verdict`
-- What: seccomp(2) converts the user's cBPF to eBPF and interprets it at every syscall
-  entry. The socket-filter path (`net/core/filter.rs`) is a separate, tested
-  interpreter; the seccomp path has **no tests** (`bpf/verifier.rs` has 3 unrelated ones).
-- Coverage: none. Boot test `user/boot_tester/tests/seccomp.rs` only compares
-  `nr == getppid` (a small K).
-- Bugs these tests catch: BUGS.md seccomp cBPF items.
-- Tests to write (all pure: build `SockFilter` arrays, run `SeccompFilter::from_cbpf(..).run(&SeccompData{..})`):
-  - libseccomp prologue: `ld [4]; jeq #0xC000003E,1,0; ret KILL; ld [0]; jeq #nr,0,1; ret ERRNO|5; ret ALLOW`.
-  - `jge`/`jgt` with K = 0x80000000 and 0xFFFFFFFF; `jset` with the high bit.
-  - jt=jf=0 conditionals (one, and three in a row before `ret`): must equal the
-    program without them, must not panic.
-  - `st M[3]; ldx M[3]; txa; ret a` round trip; all 16 slots.
-  - `div #0x80000000`, `mod #0xFFFFFFFF`, `div x` with X=0 (Linux: filter returns 0).
-  - `ld [64]`, `ld [62]` (out of seccomp_data): result 0; `ld len` = 64.
-  - Linux seccomp_check_filter rejects H/B ABS, IND, MSH, unaligned/oob `ld [k]`;
-    `validate_cbpf` (`bpf/convert.rs:622`) accepts them: decide and pin.
-  - Filter chains: KILL_PROCESS beats everything, ties keep the newest filter's data,
-    ERRNO data clamps to 4095, unknown action is KillProcess, STRICT allows only
-    read/write/exit/exit_group/rt_sigreturn (arch-specific numbers).
-  - `bpf_run` direct: a backward JA (`off = -1`) must terminate.
-- Value/effort: highest value (security, ABI: systemd/docker/chrome filters), easy.
-
-### 2. sysctl integer parsing: `sysctl.rs:80` `parse`
+### 1. sysctl integer parsing: `sysctl.rs:80` `parse`
 - What: every integer /proc/sys write (Linux `__do_proc_dointvec`).
 - Coverage: partial (`parse_vectors`: spacing, extra values, a negative, garbage).
 - Linux expectations: base 0 (`0x10` = 16, `010` = 8), `+5` rejected (BUGS.md), a lone
@@ -92,7 +69,7 @@ instance; "medium" = needs a small fixture or cfg(test) shim.
   CAP_NET_ADMIN only for `net/` paths, no DAC override for 0444 files. Pure (takes `&Cred`).
 - Value: high (ABI, scripts write hex), easy.
 
-### 3. Process accounting encoders: `task/acct.rs:119` `encode_comp_t`, `:145` `encode_elapsed_float`
+### 2. Process accounting encoders: `task/acct.rs:119` `encode_comp_t`, `:145` `encode_elapsed_float`
 - Coverage: none.
 - Linux `kernel/acct.c`: comp_t rounds to nearest (`rnd = value & 4` before each
   `>>= 3`, then carry: 8196 -> 0x2401); `ac_etime` is `encode_float(nsec_to_AHZ(elapsed))`,
@@ -101,7 +78,7 @@ instance; "medium" = needs a small fixture or cfg(test) shim.
   1, 100, 2^24+1 (truncation), 2^40.
 - Value: medium (ABI for `lastcomm`/`sa`), trivial.
 
-### 4. DAC permission core: `fs/dac.rs:111` `permission_ids`, `:308` `kill_bits`, `:271` `create_mode`, `:176` `access_cred`, `:189` `acc_mode`, `:236` `sticky`, `:206` `may_open`
+### 3. DAC permission core: `fs/dac.rs:111` `permission_ids`, `:308` `kill_bits`, `:271` `create_mode`, `:176` `access_cred`, `:189` `acc_mode`, `:236` `sticky`, `:206` `may_open`
 - Coverage: none.
 - `permission_ids` takes `&Cred` + ids + mode bits: pure. Cases: owner class only (a
   0o077 file is unreadable by its owner), group via fsgid and via supplementary
@@ -118,7 +95,7 @@ instance; "medium" = needs a small fixture or cfg(test) shim.
 - Note: header comment ("hk has no supplementary groups") is stale; `in_group` uses `groups`.
 - Value: high (security), easy for `permission_ids`/`acc_mode`/`access_cred`, medium for inode ones.
 
-### 5. Capability fixups on uid change: `task/mod.rs:2210` `cap_fix_setuid`, `:2243` `cap_fix_setfsuid`
+### 4. Capability fixups on uid change: `task/mod.rs:2210` `cap_fix_setuid`, `:2243` `cap_fix_setfsuid`
 - Coverage: none. Pure on two `Cred`s.
 - Cases (Linux `cap_emulate_setxuid`, `cap_task_fix_setuid(LSM_SETID_FS)`): leaving
   all-zero ids clears permitted+effective+ambient; with keep_caps keeps permitted,
@@ -127,7 +104,7 @@ instance; "medium" = needs a small fixture or cfg(test) shim.
   CAP_FS_SET bits from effective, x->0 re-raises them from permitted only.
 - Value: high (privilege drop correctness), trivial.
 
-### 6. Control messages: `net/msg.rs:425` `cmsgs`, `:404` `Cmsg::put`
+### 5. Control messages: `net/msg.rs:425` `cmsgs`, `:404` `Cmsg::put`
 - Coverage: none. Peer/user controlled (sendmsg control buffer; recvmsg output).
 - Cases: empty buffer; buffer shorter than a header (ignored); `cmsg_len` < 16 or past
   the end -> one `Err` then stop; two messages with the 8-byte alignment padding;
@@ -138,7 +115,7 @@ instance; "medium" = needs a small fixture or cfg(test) shim.
   SCM_RIGHTS with 0 fds -> None. (`add_fds` needs a task fd table: stop at parse.)
 - Value: high, easy.
 
-### 7. N_TTY line discipline core: `tty/n_tty.rs:35` `NTtyData`, `:273` `receive_char`, `:338` `canon_char`, `copy`, `inq`, `set_icanon`
+### 6. N_TTY line discipline core: `tty/n_tty.rs:35` `NTtyData`, `:273` `receive_char`, `:338` `canon_char`, `copy`, `inq`, `set_icanon`
 - Coverage: none. Pure: `NTtyData::new()`, `Termios::default()`, an `Effects`.
 - Cases: canonical line assembly and one-line-per-read; short read buffer splits a
   line, next read continues; VERASE / VWERASE (IEXTEN only) / VKILL with ECHOK vs
@@ -150,7 +127,7 @@ instance; "medium" = needs a small fixture or cfg(test) shim.
   queued bytes one line); `inq` counting with EOF marks; VMIN in raw mode.
 - Value: high (every shell, getty), easy.
 
-### 8. POSIX record locks: `fs/posix_lock.rs:137` `InodeLocks` (`try_lock`, `unlock_range`, `coalesce_locks`, `find_conflict`), `:300` `resolve_range`
+### 7. POSIX record locks: `fs/posix_lock.rs:137` `InodeLocks` (`try_lock`, `unlock_range`, `coalesce_locks`, `find_conflict`), `:300` `resolve_range`
 - Coverage: none.
 - Cases: split by middle unlock; partial overlaps at each end; same-owner type change
   (write [0,100) then read [25,50) -> W/R/W); merge of adjacent same-type; different
@@ -161,7 +138,7 @@ instance; "medium" = needs a small fixture or cfg(test) shim.
   EOVERFLOW, hk accepts up to u64), SEEK_END with negative start.
 - Value: high (data integrity for databases), easy for InodeLocks.
 
-### 9. IPv4 receive validation and checksums: `net/ipv4.rs:373` `ip_options_ok`, `:346` `ip_check`, `:246` `ip_checksum`, `:278` `pseudo_header_checksum`; `net/udp.rs:723-756` `csum_ok`/`add_words`/`fold`/`udp_checksum`; `net/tcp/output.rs:340` `checksum`
+### 8. IPv4 receive validation and checksums: `net/ipv4.rs:373` `ip_options_ok`, `:346` `ip_check`, `:246` `ip_checksum`, `:278` `pseudo_header_checksum`; `net/udp.rs:723-756` `csum_ok`/`add_words`/`fold`/`udp_checksum`; `net/tcp/output.rs:340` `checksum`
 - Coverage: none for these (TCP option parsing is well tested).
 - Cases: RFC 1071 example vector; odd length; all-0xFF data (fold carries); UDP 0 ->
   0xFFFF; the three checksum implementations agree on random data and verify to
@@ -171,7 +148,7 @@ instance; "medium" = needs a small fixture or cfg(test) shim.
   past data, bad checksum, total length < IHL or > data, Ethernet padding trimmed.
 - Value: high (peer input), easy.
 
-### 10. Flattened device tree parser: `dt/mod.rs:57` `DeviceTree::from_fdt`, `root`, `find_node`, `find_compatible`, `Node::reg`/`regs`/`cells`/`interrupts`, `skip_node`
+### 9. Flattened device tree parser: `dt/mod.rs:57` `DeviceTree::from_fdt`, `root`, `find_node`, `find_compatible`, `Node::reg`/`regs`/`cells`/`interrupts`, `skip_node`
 - Coverage: none (generic code, runs on both hosts).
 - Cases: hand-built minimal FDT (header + struct + strings) with nested nodes, NOPs,
   `#address-cells`/`#size-cells` 1 and 2, `chosen/stdout-path`; then malformed blobs:
@@ -180,7 +157,7 @@ instance; "medium" = needs a small fixture or cfg(test) shim.
   panic rather than return `DtError`.
 - Value: medium (boot input, trusted), easy; tests would drive bounds checks.
 
-### 11. Address-space bookkeeping: `mm/mod.rs:456` `find_free_area`, `:473` `gap_around`, `overlaps`, `:757` `split_vma`, `:837` `merge_adjacent`; `mm/vma.rs:418` `Vma::can_merge_with`; `mm/madvise.rs:123` `check_range`, `:335` `new_flags`
+### 10. Address-space bookkeeping: `mm/mod.rs:456` `find_free_area`, `:473` `gap_around`, `overlaps`, `:757` `split_vma`, `:837` `merge_adjacent`; `mm/vma.rs:418` `Vma::can_merge_with`; `mm/madvise.rs:123` `check_range`, `:335` `new_flags`
 - Coverage: partial (`mm/mod.rs` tests cover `remove_range` and anon chains, with a
   `map()` helper ready to reuse).
 - Cases: top-down search skipping a VMA straddling `mmap_base`, exact-fit gap, nothing
@@ -190,7 +167,7 @@ instance; "medium" = needs a small fixture or cfg(test) shim.
   EINVAL, len 0 -> None; WIPEONFORK on file/shared EINVAL, RANDOM/SEQUENTIAL exclusive.
 - Value: medium-high (memory corruption if wrong), easy.
 
-### 12. SysV message selection: `ipc/msg.rs:62` `Search`, `:155` `take_msg`, `try_send`, `:211` `fits`
+### 11. SysV message selection: `ipc/msg.rs:62` `Search`, `:155` `take_msg`, `try_send`, `:211` `fits`
 - Coverage: none.
 - Cases (Linux `convert_mode`/`find_msg`/`msg_fits_inqueue`): msgtyp 0 first message;
   >0 exact; >0 with MSG_EXCEPT first other type; <0 lowest type <= |t|, FIFO among
@@ -200,7 +177,7 @@ instance; "medium" = needs a small fixture or cfg(test) shim.
   `current_time_secs` (0 on host): medium.
 - Value: medium (ABI), easy-medium.
 
-### 13. VFAT name handling: `fs/vfat.rs:933` `lfn_checksum`, `:1195` `short_name_checksum`, `:1109` `generate_short_name`, `:1206` `create_lfn_entries` / `:970` `lfn_entry_chars` / `:983` `lfn_name`, `:942` `short_name_to_string`, `Charset::to_text`/`to_bytes`, `:552` `VfatOpts::parse`
+### 12. VFAT name handling: `fs/vfat.rs:933` `lfn_checksum`, `:1195` `short_name_checksum`, `:1109` `generate_short_name`, `:1206` `create_lfn_entries` / `:970` `lfn_entry_chars` / `:983` `lfn_name`, `:942` `short_name_to_string`, `Charset::to_text`/`to_bytes`, `:552` `VfatOpts::parse`
 - Coverage: none.
 - Cases: checksum known vectors (from a mkfs.vfat image or the FAT spec example);
   LFN round trip for 1, 12, 13, 14, 26, 255 UTF-16 units and astral chars split across
@@ -213,7 +190,7 @@ instance; "medium" = needs a small fixture or cfg(test) shim.
   EINVAL, `utf8` overrides iocharset).
 - Value: medium (on-disk names), easy.
 
-### 14. initramfs cpio parser: `fs/cpio.rs:68` `parse`, `:249` `parse_hex`
+### 13. initramfs cpio parser: `fs/cpio.rs:68` `parse`, `:249` `parse_hex`
 - Coverage: none.
 - Cases: newc and crc magics; header + name + body alignment to 4; namesize 0
   (InvalidHeader); truncated header/name/body (BufferTooSmall, no panic); non-hex
@@ -221,7 +198,7 @@ instance; "medium" = needs a small fixture or cfg(test) shim.
   ramfs root: near-miss.)
 - Value: medium (boot input), trivial.
 
-### 15. EEVDF fair-class math: `task/fair.rs:41` `weight`, `:57` `calc_delta_fair`, `:85` `avg_vruntime`, `pick`, `save_lag`, `:123` `place`, `update_curr`
+### 14. EEVDF fair-class math: `task/fair.rs:41` `weight`, `:57` `calc_delta_fair`, `:85` `avg_vruntime`, `pick`, `save_lag`, `:123` `place`, `update_curr`
 - Coverage: none (`task/sched.rs` tests only the RT `PrioQueue`).
 - Cases: weight table vs Linux `sched_prio_to_weight` (nice -20 = 88761, 0 = 1024,
   19 = 15), SCHED_IDLE = 3; delta scaling at nice 0 identity and nice 19 x68;
@@ -230,7 +207,7 @@ instance; "medium" = needs a small fixture or cfg(test) shim.
   to +-(slice+tick); `place` initial half slice. Uses `SchedEntity::new(state)`.
 - Value: medium (fairness, starvation), easy.
 
-### 16. Load average: `task/loadavg.rs:26` `calc_load`, `:67` `proc_loadavg` formatting
+### 15. Load average: `task/loadavg.rs:26` `calc_load`, `:67` `proc_loadavg` formatting
 - Coverage: none.
 - Cases: Linux known values: from 0 with 1 active, 12 updates of EXP_1 reach ~0.86
   (11-bit fixed point); decay to exactly 0 eventually (round-up only when rising);
@@ -238,7 +215,7 @@ instance; "medium" = needs a small fixture or cfg(test) shim.
   test without task counts.
 - Value: low-medium, trivial.
 
-### 17. Time conversions and the timekeeper: `time/mod.rs:516` `timespec_to_ns`, `deadline_after`, `:546` `deadline_ts`, `:484` `settod_valid`, `:474` `cycles_delta`, `ns_to_clock_t`/`ms_to_clock_t`; `TimeKeeper` (`init`, `read`, `update`, `set_realtime`, `inject_offset`)
+### 16. Time conversions and the timekeeper: `time/mod.rs:516` `timespec_to_ns`, `deadline_after`, `:546` `deadline_ts`, `:484` `settod_valid`, `:474` `cycles_delta`, `ns_to_clock_t`/`ms_to_clock_t`; `TimeKeeper` (`init`, `read`, `update`, `set_realtime`, `inject_offset`)
 - Coverage: none.
 - Cases: negative sec/nsec -> 0, overflow saturates at KTIME_MAX, (0,0) deadline is
   `Some(0)`, nsec = 1e9 invalid, TIME_SETTOD_SEC_MAX bound; `cycles_delta` of a lagging
@@ -249,7 +226,7 @@ instance; "medium" = needs a small fixture or cfg(test) shim.
 - Value: medium-high (every timeout), easy (the fake counter static must be
   test-private to avoid races).
 
-### 18. Periodic timer overruns and timer value conversions: `time/timer.rs:321` `forward`, `time/posix_timer.rs:975` `ts_to_tv`, `time/timerfd.rs:76-100` `ItimerSpec` (`value_to_ns`, `is_valid`, `from_ns`)
+### 17. Periodic timer overruns and timer value conversions: `time/timer.rs:321` `forward`, `time/posix_timer.rs:975` `ts_to_tv`, `time/timerfd.rs:76-100` `ItimerSpec` (`value_to_ns`, `is_valid`, `from_ns`)
 - Coverage: none.
 - Cases: `forward` with now == expires (1 period), now just before the next period,
   interval 0 (division guard), result at/after KTIME_MAX -> None, huge interval
@@ -257,7 +234,7 @@ instance; "medium" = needs a small fixture or cfg(test) shim.
   `from_ns`/`value_to_ns` round trip; nsec 1e9 invalid.
 - Value: medium (timer_settime/getitimer ABI), trivial.
 
-### 19. RTC date math (x86-64 runner only): `arch/x86_64/rtc.rs:118` `date_to_unix`, `is_leap_year`
+### 18. RTC date math (x86-64 runner only): `arch/x86_64/rtc.rs:118` `date_to_unix`, `is_leap_year`
 - Coverage: none.
 - Cases: 1970-01-01 = 0, 2000-02-29, 2100-03-01 (not leap), 2038-01-19T03:14:08 =
   2^31; month 0 / 13+ (month >= 14 indexes `DAYS_IN_MONTH[12]`: panic on a garbage
@@ -265,7 +242,7 @@ instance; "medium" = needs a small fixture or cfg(test) shim.
   stays hour 12): extract a `decode(regs) -> tm` to test it.
 - Value: low-medium, trivial.
 
-### 20. eventfd counter semantics: `io/eventfd.rs:92` `read`, `:130` `write` (non-blocking), `poll`
+### 19. eventfd counter semantics: `io/eventfd.rs:92` `read`, `:130` `write` (non-blocking), `poll`
 - Coverage: none.
 - Cases: write u64::MAX EINVAL; count may reach 0xFFFF_FFFF_FFFF_FFFE, one more EAGAIN;
   write 0 succeeds; EFD_SEMAPHORE reads 1 and decrements; normal read resets; empty
@@ -273,7 +250,7 @@ instance; "medium" = needs a small fixture or cfg(test) shim.
   is public; wake_all with no waiters is fine on host.
 - Value: medium (glibc/systemd use it), easy.
 
-### 21. cgroup value parsers: `cgroup/memory.rs:166` `parse_memory_size`, `cgroup/io.rs:247` `parse_io_value`; inline parses in `cgroup/cpu.rs:188` `cpu_max_write`, `:227` `cpu_weight_write`, `cgroup/pids.rs:261` `pids_max_write`
+### 20. cgroup value parsers: `cgroup/memory.rs:166` `parse_memory_size`, `cgroup/io.rs:247` `parse_io_value`; inline parses in `cgroup/cpu.rs:188` `cpu_max_write`, `:227` `cpu_weight_write`, `cgroup/pids.rs:261` `pids_max_write`
 - Coverage: none.
 - Cases (Linux `memparse` / `page_counter_memparse`): K/M/G/T/P/E suffixes, `max`, whitespace, overflow -> EINVAL vs Linux ERANGE, byte values
   rounded down to pages; cpu.max `"max 100000"`, `"50000"` (period default),
@@ -281,14 +258,14 @@ instance; "medium" = needs a small fixture or cfg(test) shim.
 - Value: medium (container managers write these), easy for the two pure ones; the
   rest need the parse split out (see near-misses).
 
-### 22. uevent synthetic events: `base/uevent.rs:145` `synth_parse`, `:122` `synth_args`, `uuid_valid`, `Action::parse/name`
+### 21. uevent synthetic events: `base/uevent.rs:145` `synth_parse`, `:122` `synth_args`, `uuid_valid`, `Action::parse/name`
 - Coverage: none.
 - Cases (Linux `kobject_synth_uevent`): `add\n`, `add\0`, unknown action EINVAL, UUID
   with wrong dash positions/length, `UUID KEY=val` pairs, non-alnum key/value rejected,
   double space rejected, missing UUID with args.
 - Value: low-medium (udev coldplug), trivial.
 
-### 23. Signal sets and dequeue order: `signal/mod.rs:120-200` `SigSet`, `:429` `SigPending::dequeue`, `:1337` `default_action`
+### 22. Signal sets and dequeue order: `signal/mod.rs:120-200` `SigSet`, `:429` `SigPending::dequeue`, `:1337` `default_action`
 - Coverage: none.
 - Cases: sig 0 and 65 ignored by add/contains; `first` = lowest; dequeue skips blocked;
   default action table vs signal(7) (SIGSTKFLT/SIGPWR terminate, SIGURG/SIGWINCH
@@ -297,14 +274,14 @@ instance; "medium" = needs a small fixture or cfg(test) shim.
   the choice.
 - Value: low-medium, trivial.
 
-### 24. sockaddr parsing: `net/af_inet.rs:343` `sin_parse`; `net/unix/mod.rs:630` `validate`, `:639` `bsd_name`
+### 23. sockaddr parsing: `net/af_inet.rs:343` `sin_parse`; `net/unix/mod.rs:630` `validate`, `:639` `bsd_name`
 - Coverage: none.
 - Cases: short address EINVAL; AF_UNSPEC only when allowed; port/addr byte order;
   AF_UNIX length exactly 2 (EINVAL, autobind is handled elsewhere), 110 max, path
   without NUL, embedded NUL ends the path, abstract name (leading NUL) passed through.
 - Value: medium, trivial.
 
-### 25. SCSI command building and response parsing: `block/scsi.rs:60-135` `Cdb::*`, `:280-325` `InquiryData`/`ReadCapacityData`, `:341-420` `test_unit_ready`/`inquiry`/`read_capacity`; `hw/usb/msc.rs:46-115` `Cbw::as_bytes`, `Csw::from_bytes`
+### 24. SCSI command building and response parsing: `block/scsi.rs:60-135` `Cdb::*`, `:280-325` `InquiryData`/`ReadCapacityData`, `:341-420` `test_unit_ready`/`inquiry`/`read_capacity`; `hw/usb/msc.rs:46-115` `Cbw::as_bytes`, `Csw::from_bytes`
 - Coverage: `block/sd.rs` has state-machine and index tests only.
 - Cases: READ(10)/WRITE(10) byte layout (big-endian LBA and length); vendor/product
   trimming; READ CAPACITY last_lba 0xFFFFFFFF (Linux falls back to READ CAPACITY 16);
@@ -312,14 +289,14 @@ instance; "medium" = needs a small fixture or cfg(test) shim.
   mock host returning canned buffers tests the command helpers without hardware.
 - Value: low-medium (OptiPlex USB disks), easy.
 
-### 26. ELF image layout: `task/exec.rs:331` `image_layout`
+### 25. ELF image layout: `task/exec.rs:331` `image_layout`
 - Coverage: none (`util/elf.rs` parsing is well tested and has an `exe()` builder).
 - Cases: start_code/end_code from executable segments only, data from highest segment,
   no executable segment -> start_code 0, base offset applied (PIE). `check_segments`
   reads `FRAME_ALLOCATOR` (split the free-memory test out to make the bounds part testable).
 - Value: low-medium (/proc/pid/stat, brk placement), easy.
 
-### 27. netlink attributes: `net/netlink/attr.rs` `Attrs::parse`, `Msg::nest_end`, `Attrs::str`
+### 26. netlink attributes: `net/netlink/attr.rs` `Attrs::parse`, `Msg::nest_end`, `Attrs::str`
 - Coverage: partial (`build_and_parse`, `malformed`).
 - Gaps: NLA_F_NESTED / NLA_F_NET_BYTEORDER bits masked from the type; type > max
   ignored; trailing < 4 bytes ignored (Linux liberal parse); `str` with no NUL, NUL at
@@ -327,7 +304,7 @@ instance; "medium" = needs a small fixture or cfg(test) shim.
   silently truncates `nla_len` in `nest_end` (u16 cast).
 - Value: low-medium, trivial.
 
-### 28. errno table: `util/error.rs:213` `from_errno` vs discriminants
+### 27. errno table: `util/error.rs:213` `from_errno` vs discriminants
 - Coverage: none. Currently consistent (86 variants, 86 arms), but nothing keeps it so.
 - Case: for each variant, `from_errno(e.errno()) == Some(e)`; spot values vs
   asm-generic errno.h (EDEADLK 35, ENOTSUP 95, ERESTARTSYS 512).
