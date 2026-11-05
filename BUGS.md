@@ -948,8 +948,7 @@ ramfs/tmpfs/vfat and most procfs files) checked at add.
 
 Ranked. Not yet confirmed by a test.
 
-1. **ABI**: `acct` ac_etime is seconds where Linux has AHZ ticks, and
-   encode_comp_t skips Linux's rounding; adjtimex
+1. **ABI**: adjtimex
    ignores ADJ_FREQUENCY (freq reads back 0) and stores ADJ_TIMECONST
    unclamped (Linux 0..MAXTC, +4 without STA_NANO); a
    READ CAPACITY(10) last LBA of 0xFFFFFFFF is not retried with READ

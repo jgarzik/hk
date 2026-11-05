@@ -109,45 +109,51 @@ impl AcctV3 {
 // comp_t Encoding
 // =============================================================================
 
-/// Encode a value into comp_t format
-///
-/// comp_t is a 16-bit floating point with:
-/// - 3-bit base-8 exponent (bits 13-15)
-/// - 13-bit mantissa (bits 0-12)
-///
-/// Value = mantissa * 8^exponent
-pub fn encode_comp_t(value: u64) -> u16 {
+/// AHZ: the accounting clock (Linux acct v3: USER_HZ)
+const AHZ: u64 = 100;
+
+/// Nanoseconds as AHZ ticks (Linux nsec_to_AHZ)
+fn nsec_to_ahz(ns: u64) -> u64 {
+    ns / (1_000_000_000 / AHZ)
+}
+
+/// comp_t: 13-bit mantissa, 3-bit base-8 exponent, rounded on the last
+/// bit shifted out; past its range 0xffff (Linux encode_comp_t)
+pub fn encode_comp_t(mut value: u64) -> u16 {
+    const MANTSIZE: u32 = 13;
+    const EXPSIZE: u32 = 3;
+    const MAXFRACT: u64 = (1 << MANTSIZE) - 1;
+    let (mut exp, mut rnd) = (0u32, 0u64);
+    while value > MAXFRACT {
+        rnd = value & (1 << (EXPSIZE - 1));
+        value >>= EXPSIZE;
+        exp += 1;
+    }
+    if rnd != 0 {
+        value += 1;
+        if value > MAXFRACT {
+            value >>= EXPSIZE;
+            exp += 1;
+        }
+    }
+    if exp > (u16::MAX >> MANTSIZE) as u32 {
+        return u16::MAX;
+    }
+    ((exp << MANTSIZE) as u64 + value) as u16
+}
+
+/// An IEEE single of `value` with its mantissa truncated, as Linux
+/// encode_float (acct v3 ac_etime)
+fn encode_float(mut value: u64) -> u32 {
     if value == 0 {
         return 0;
     }
-
-    let mut exp: u32 = 0;
-    let mut mantissa = value;
-
-    // Scale down until mantissa fits in 13 bits (0x1FFF = 8191)
-    while mantissa > 0x1FFF && exp < 7 {
-        mantissa >>= 3; // Divide by 8
-        exp += 1;
+    let mut exp = 190u32;
+    while (value as i64) > 0 {
+        value <<= 1;
+        exp -= 1;
     }
-
-    // Clamp mantissa to 13 bits if still too large
-    if mantissa > 0x1FFF {
-        mantissa = 0x1FFF;
-    }
-
-    ((exp as u16) << 13) | (mantissa as u16)
-}
-
-/// Encode elapsed time as IEEE float
-///
-/// Linux uses a simple float representation for elapsed time in acct_v3.
-/// This encodes nanoseconds as seconds in float format.
-fn encode_elapsed_float(elapsed_ns: u64) -> u32 {
-    // Convert nanoseconds to seconds as f32
-    let seconds = elapsed_ns as f64 / 1_000_000_000.0;
-
-    // Convert to IEEE 754 single precision float bits
-    (seconds as f32).to_bits()
+    ((value >> 40) as u32 & 0x7f_ffff) | (exp << 23)
 }
 
 // =============================================================================
@@ -309,12 +315,12 @@ fn write_record(file: &File, tid: Tid, pid: Pid, exit_status: i32) {
         ac_pid: pid as u32,
         ac_ppid: task_info.ppid as u32,
         ac_btime: task_info.start_time,
-        ac_etime: encode_elapsed_float(task_info.elapsed_ns),
-        ac_utime: encode_comp_t(task_info.utime_ns / 10_000_000), // Convert to centiseconds
-        ac_stime: encode_comp_t(task_info.stime_ns / 10_000_000), // Convert to centiseconds
-        ac_mem: 0,                                                // TODO: Track memory usage
-        ac_io: 0,                                                 // TODO: Track I/O
-        ac_rw: 0,                                                 // TODO: Track block I/O
+        ac_etime: encode_float(nsec_to_ahz(task_info.elapsed_ns)),
+        ac_utime: encode_comp_t(nsec_to_ahz(task_info.utime_ns)),
+        ac_stime: encode_comp_t(nsec_to_ahz(task_info.stime_ns)),
+        ac_mem: 0, // TODO: Track memory usage
+        ac_io: 0,  // TODO: Track I/O
+        ac_rw: 0,  // TODO: Track block I/O
         ac_minflt: encode_comp_t(task_info.minflt),
         ac_majflt: encode_comp_t(task_info.majflt),
         ac_swaps: 0, // Swaps not tracked
@@ -421,4 +427,31 @@ fn write_record_to_file(file: &File, record: &AcctV3) -> Result<(), KernelError>
     file.write(bytes)?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn comp_t() {
+        assert_eq!(encode_comp_t(0), 0);
+        assert_eq!(encode_comp_t(8191), 8191);
+        assert_eq!(encode_comp_t(8192), 0x2000 | 1024);
+        // The last bit shifted out rounds up
+        assert_eq!(encode_comp_t(8196), 0x2000 | 1025);
+        // Rounding past the mantissa moves to the next exponent
+        assert_eq!(encode_comp_t(65532), 0x4000 | 1024);
+        assert_eq!(encode_comp_t(u64::MAX), 0xffff);
+    }
+
+    #[test]
+    fn float_bits() {
+        assert_eq!(encode_float(0), 0);
+        assert_eq!(encode_float(1), 1.0f32.to_bits());
+        assert_eq!(encode_float(100), 100.0f32.to_bits());
+        // Truncated, not rounded: 2^24 + 1 keeps 2^24
+        assert_eq!(encode_float((1 << 24) + 1), 16_777_216.0f32.to_bits());
+        assert_eq!(nsec_to_ahz(2_500_000_000), 250);
+    }
 }
