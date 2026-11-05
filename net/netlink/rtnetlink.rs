@@ -164,26 +164,48 @@ pub fn rcv(sk: &Arc<NlSock>, mut data: &[u8], explicit: bool) {
 /// Queue an NLMSG_ERROR (err 0 = ACK) for request `msg` (Linux
 /// netlink_ack): errors echo the whole request unless NETLINK_CAP_ACK
 fn ack(sk: &NlSock, h: &Hdr, msg: &[u8], err: i32) {
-    // Echo the whole request on error, but fallibly: a request too big
-    // to allocate falls back to a capped ACK (Linux netlink_ack reports
-    // ENOBUFS rather than failing the kernel)
-    let want_echo = err != 0 && !sk.has_flag(sflags::CAP_ACK);
-    let mut body = KVec::new();
-    // One reservation for the error word plus the echoed request
-    let echoed = want_echo
-        && body.try_reserve(4 + msg.len()).is_ok()
-        && body.try_extend_from_slice(&err.to_ne_bytes()).is_ok()
-        && body.try_extend_from_slice(msg).is_ok();
-    if !echoed {
-        body.clear();
-        // The error and the request header always fit
-        let _ = body.try_extend_from_slice(&err.to_ne_bytes());
-        let _ = body.try_extend_from_slice(&msg[..NLMSG_HDRLEN]);
+    let echo = err != 0 && !sk.has_flag(sflags::CAP_ACK);
+    reply(sk, ack_msg(h.seq, sk.portid(), msg, err, echo));
+}
+
+/// nlmsghdr bytes
+fn nlmsg_hdr(len: usize, ty: u16, flags: u16, seq: u32, pid: u32) -> [u8; NLMSG_HDRLEN] {
+    let mut b = [0u8; NLMSG_HDRLEN];
+    b[0..4].copy_from_slice(&(len as u32).to_ne_bytes());
+    b[4..6].copy_from_slice(&ty.to_ne_bytes());
+    b[6..8].copy_from_slice(&flags.to_ne_bytes());
+    b[8..12].copy_from_slice(&seq.to_ne_bytes());
+    b[12..16].copy_from_slice(&pid.to_ne_bytes());
+    b
+}
+
+/// The NLMSG_ERROR for request `msg`: the error, then the whole request
+/// when `echo` and the message fits a fallible allocation; else the
+/// error and the request header with NLM_F_CAPPED (Linux netlink_ack
+/// falls back rather than fail). The capped form is a fixed 36 bytes,
+/// built on the stack.
+fn ack_msg(seq: u32, pid: u32, msg: &[u8], err: i32, echo: bool) -> Vec<u8> {
+    if echo && let Some(m) = echo_msg(seq, pid, msg, err) {
+        return m;
     }
-    let flags = if echoed { 0 } else { NLM_F_CAPPED };
-    let mut m = Msg::new(NLMSG_ERROR, flags, h.seq, sk.portid());
-    m.put(body.as_slice());
-    reply(sk, m.finish());
+    const LEN: usize = NLMSG_HDRLEN + 4 + NLMSG_HDRLEN;
+    let mut b = [0u8; LEN];
+    b[..NLMSG_HDRLEN].copy_from_slice(&nlmsg_hdr(LEN, NLMSG_ERROR, NLM_F_CAPPED, seq, pid));
+    b[NLMSG_HDRLEN..NLMSG_HDRLEN + 4].copy_from_slice(&err.to_ne_bytes());
+    b[NLMSG_HDRLEN + 4..].copy_from_slice(&msg[..NLMSG_HDRLEN]);
+    b.to_vec()
+}
+
+/// The echoing NLMSG_ERROR, allocated fallibly in one exact piece
+fn echo_msg(seq: u32, pid: u32, msg: &[u8], err: i32) -> Option<Vec<u8>> {
+    let len = NLMSG_HDRLEN + 4 + align(msg.len());
+    let mut m = KVec::try_with_capacity(len).ok()?;
+    m.try_extend_from_slice(&nlmsg_hdr(len, NLMSG_ERROR, 0, seq, pid))
+        .ok()?;
+    m.try_extend_from_slice(&err.to_ne_bytes()).ok()?;
+    m.try_extend_from_slice(msg).ok()?;
+    m.try_resize(len, 0).ok()?;
+    Some(m.into_vec())
 }
 
 fn reply(sk: &NlSock, data: Vec<u8>) {
@@ -1017,4 +1039,57 @@ fn getneigh(sk: &NlSock, h: &Hdr, p: &[u8]) -> Result<Done, KernelError> {
         .ok_or(KernelError::NotFound)?;
     reply(sk, fill_neigh(&e, RTM_NEWNEIGH, 0, h.seq, sk.portid()));
     Ok(Done::Ok)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::util::kmem::MAX_KMALLOC;
+
+    fn req(len: usize) -> Vec<u8> {
+        let mut m = alloc::vec![0xabu8; len];
+        m[..4].copy_from_slice(&(len as u32).to_ne_bytes());
+        m
+    }
+
+    fn u32_at(b: &[u8], o: usize) -> u32 {
+        u32::from_ne_bytes(b[o..o + 4].try_into().unwrap())
+    }
+
+    /// An error echoes the request, padded to 4
+    #[test]
+    fn ack_echoes() {
+        let r = req(21);
+        let m = ack_msg(7, 9, &r, -22, true);
+        assert_eq!(m.len(), 16 + 4 + 24);
+        assert_eq!(u32_at(&m, 0) as usize, m.len());
+        assert_eq!(u16::from_ne_bytes([m[6], m[7]]), 0);
+        assert_eq!(u32_at(&m, 8), 7);
+        assert_eq!(u32_at(&m, 16) as i32, -22);
+        assert_eq!(&m[20..41], &r[..]);
+    }
+
+    /// An ACK (or CAP_ACK) carries the error and the request header
+    #[test]
+    fn ack_capped() {
+        let r = req(40);
+        let m = ack_msg(1, 2, &r, 0, false);
+        assert_eq!(m.len(), 36);
+        assert_eq!(u32_at(&m, 0), 36);
+        assert_eq!(u16::from_ne_bytes([m[4], m[5]]), NLMSG_ERROR);
+        assert_eq!(u16::from_ne_bytes([m[6], m[7]]), NLM_F_CAPPED);
+        assert_eq!(u32_at(&m, 16), 0);
+        assert_eq!(&m[20..36], &r[..16]);
+    }
+
+    /// A request whose echo would pass MAX_KMALLOC once the headers are
+    /// added gets the capped form, never an oversized allocation
+    #[test]
+    fn ack_echo_too_big() {
+        let r = req(MAX_KMALLOC - 8);
+        let m = ack_msg(1, 2, &r, -22, true);
+        assert_eq!(m.len(), 36);
+        assert_eq!(u16::from_ne_bytes([m[6], m[7]]), NLM_F_CAPPED);
+        assert_eq!(u32_at(&m, 16) as i32, -22);
+    }
 }
