@@ -61,6 +61,13 @@ fn test_poke_text() {
     let orig = text_word();
     // An anonymous page no one touches
     let fresh = hk_syscall::sys_mmap(0, 4096, 3, 0x22, -1, 0);
+    // A written page made PROT_NONE: still reachable by a forced access
+    let none = hk_syscall::sys_mmap(0, 4096, 3, 0x22, -1, 0);
+    if none > 0 {
+        // SAFETY: the page just mapped read-write
+        unsafe { core::ptr::write_volatile(none as *mut u64, 0x1111) };
+        hk_syscall::sys_mprotect(none as u64, 4096, 0);
+    }
     let pid = sys_fork();
     if pid == 0 {
         sys_ptrace(PTRACE_TRACEME, 0, 0, 0);
@@ -111,6 +118,22 @@ fn test_poke_text() {
         if hk_syscall::sys_process_vm_readv(pid as i32, &liov, 1, &riov, 1, 0) != 8 || got != [0; 8]
         {
             return 6;
+        }
+        // PROT_NONE: a forced read and write reach it (Linux FOLL_FORCE)
+        let mut w = 0u64;
+        if none < 0
+            || sys_ptrace(PTRACE_PEEKTEXT, pid, none as u64, &mut w as *mut u64 as u64) != 0
+            || w != 0x1111
+        {
+            return 9;
+        }
+        if sys_ptrace(PTRACE_POKETEXT, pid, none as u64, 0x2222) != 0 {
+            return 10;
+        }
+        if sys_ptrace(PTRACE_PEEKTEXT, pid, none as u64, &mut w as *mut u64 as u64) != 0
+            || w != 0x2222
+        {
+            return 11;
         }
         sys_ptrace(PTRACE_CONT, pid, 0, 0);
         // The tracee's write to its text: a SIGSEGV stop, then death

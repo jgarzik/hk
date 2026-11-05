@@ -177,7 +177,9 @@ fn with_frame<R>(mm: &Mm, addr: u64, f: impl FnOnce(u64) -> R) -> Option<R> {
     loop {
         if let Some(p) = paging::pte_ptr(pgd, addr) {
             let _l = pte_lock(p);
-            return translate_with_root(pgd, addr).map(f);
+            // SAFETY: `p` points into a live table; its lock is held
+            let pte = unsafe { core::sync::atomic::AtomicU64::from_ptr(p) }.load(Ordering::Acquire);
+            return frame_of(pte, addr).map(f);
         }
         // No 4KB table: a 2MB page or nothing, both stable under the
         // page_table_lock unless a split installed a table meanwhile
@@ -232,11 +234,17 @@ fn write_page(mm: &Mm, vma: &Vma, addr: u64, buf: &[u8]) -> Result<Wrote, Kernel
     write_frame(mm, addr, buf, !vma.is_shared())
 }
 
+/// The byte of page `addr` a 4KB entry maps, also when it is PROT_NONE
+/// (it keeps its frame; a forced access reaches it, Linux FOLL_FORCE)
+fn frame_of(pte: u64, addr: u64) -> Option<u64> {
+    let mapped = paging::pte_present(pte) || paging::pte_protnone(pte);
+    mapped.then(|| paging::pte_addr(pte) | (addr & (PAGE_SIZE - 1)))
+}
+
 /// A private 4KB entry `pte` maps a page this mapping alone owns:
 /// writable, or neither copy-on-write nor referenced elsewhere
 fn exclusive(pte: u64) -> bool {
-    paging::pte_present(pte)
-        && !paging::pte_protnone(pte)
+    (paging::pte_present(pte) || paging::pte_protnone(pte))
         && (paging::pte_write(pte)
             || (!paging::pte_cow(pte)
                 && crate::FRAME_ALLOCATOR.refcount(paging::pte_addr(pte)) == 1))
@@ -251,16 +259,13 @@ fn write_frame(mm: &Mm, addr: u64, buf: &[u8], private: bool) -> Result<Wrote, K
         let _l = pte_lock(p);
         // SAFETY: `p` points into a live table; its lock is held
         let pte = unsafe { core::sync::atomic::AtomicU64::from_ptr(p) }.load(Ordering::Acquire);
-        if !paging::pte_present(pte) {
+        let Some(phys) = frame_of(pte, addr) else {
             return Ok(Wrote::Absent);
-        }
+        };
         if !exclusive(pte) {
             return Ok(Wrote::Shared);
         }
-        return match translate_with_root(pgd, addr) {
-            Some(phys) => copy_to_frame(phys, buf),
-            None => Ok(Wrote::Absent),
-        };
+        return copy_to_frame(phys, buf);
     }
     with_frame(mm, addr, |phys| copy_to_frame(phys, buf)).unwrap_or(Ok(Wrote::Absent))
 }

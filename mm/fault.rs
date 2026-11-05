@@ -689,7 +689,10 @@ pub fn unshare_for_write(
         return Ok(()); // not mapped, or a 2MB page (never shared)
     };
     let pte = get_pte(ptep);
-    if !paging::pte_present(pte) || paging::pte_protnone(pte) || paging::pte_write(pte) {
+    // A PROT_NONE entry keeps its frame: a forced write copies it too
+    // (Linux FOLL_FORCE follows protnone), and the copy stays PROT_NONE
+    let mapped = paging::pte_present(pte) || paging::pte_protnone(pte);
+    if !mapped || paging::pte_write(pte) {
         return Ok(());
     }
     let page = addr & !(PAGE_SIZE - 1);
