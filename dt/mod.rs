@@ -80,6 +80,15 @@ impl<'a> DeviceTree<'a> {
             return Err(DtError::BadVersion);
         }
 
+        // The struct and strings regions must lie within the blob, so
+        // every later offset the parser derives from them is in bounds
+        let struct_end = struct_offset
+            .checked_add(struct_size)
+            .ok_or(DtError::Truncated)?;
+        if struct_end > totalsize || strings_offset > totalsize {
+            return Err(DtError::Truncated);
+        }
+
         let info = FdtInfo {
             struct_offset,
             struct_size,
@@ -414,7 +423,10 @@ impl<'a> Property<'a> {
     pub fn data(&self) -> &'a [u8] {
         let len = read_be32(self.data, self.offset + 4) as usize;
         let data_start = self.offset + 12;
-        &self.data[data_start..data_start + len]
+        self.data
+            .get(data_start..)
+            .and_then(|s| s.get(..len))
+            .unwrap_or(&[])
     }
 
     /// Try to interpret as a string
@@ -587,31 +599,74 @@ fn read_cells(data: &[u8], offset: usize, cells: usize) -> u64 {
     }
 }
 
-/// Read a big-endian u32
+/// Read a big-endian u32; FDT_END (a terminator) when out of range, so a
+/// walk over a truncated or malformed blob ends instead of panicking
 fn read_be32(data: &[u8], offset: usize) -> u32 {
-    u32::from_be_bytes([
-        data[offset],
-        data[offset + 1],
-        data[offset + 2],
-        data[offset + 3],
-    ])
+    match data.get(offset..).and_then(|s| s.get(..4)) {
+        Some(b) => u32::from_be_bytes([b[0], b[1], b[2], b[3]]),
+        None => FDT_END,
+    }
 }
 
-/// Read a big-endian u64
+/// Read a big-endian u64; 0 when out of range
 fn read_be64(data: &[u8], offset: usize) -> u64 {
-    u64::from_be_bytes([
-        data[offset],
-        data[offset + 1],
-        data[offset + 2],
-        data[offset + 3],
-        data[offset + 4],
-        data[offset + 5],
-        data[offset + 6],
-        data[offset + 7],
-    ])
+    match data.get(offset..).and_then(|s| s.get(..8)) {
+        Some(b) => u64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]),
+        None => 0,
+    }
 }
 
-/// Align to 4-byte boundary
+/// Align to 4-byte boundary (saturating, so a malformed length cannot
+/// wrap the offset)
 fn align4(n: usize) -> usize {
-    (n + 3) & !3
+    n.saturating_add(3) & !3
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A valid 40-byte header with the given fields (big-endian)
+    fn header(totalsize: u32, struct_off: u32, strings_off: u32, struct_size: u32) -> [u8; 64] {
+        let mut h = [0u8; 64];
+        h[0..4].copy_from_slice(&FDT_MAGIC.to_be_bytes());
+        h[4..8].copy_from_slice(&totalsize.to_be_bytes());
+        h[8..12].copy_from_slice(&struct_off.to_be_bytes());
+        h[12..16].copy_from_slice(&strings_off.to_be_bytes());
+        h[20..24].copy_from_slice(&17u32.to_be_bytes()); // version
+        h[36..40].copy_from_slice(&struct_size.to_be_bytes());
+        h
+    }
+
+    #[test]
+    fn rejects_malformed_without_panic() {
+        // Too short
+        assert!(matches!(
+            DeviceTree::from_fdt(&[0u8; 8]),
+            Err(DtError::Truncated)
+        ));
+        // Bad magic
+        assert!(matches!(
+            DeviceTree::from_fdt(&[0xffu8; 64]),
+            Err(DtError::BadMagic)
+        ));
+        // totalsize beyond the buffer
+        let h = header(1 << 20, 40, 48, 8);
+        assert!(matches!(DeviceTree::from_fdt(&h), Err(DtError::Truncated)));
+        // struct region past the end (offset + size wraps/overflows)
+        let h = header(64, 40, 48, u32::MAX);
+        assert!(matches!(DeviceTree::from_fdt(&h), Err(DtError::Truncated)));
+        // strings offset past the end
+        let h = header(64, 40, 1000, 8);
+        assert!(matches!(DeviceTree::from_fdt(&h), Err(DtError::Truncated)));
+    }
+
+    #[test]
+    fn readers_are_bounds_checked() {
+        let d = [0u8; 4];
+        assert_eq!(read_be32(&d, 8), FDT_END);
+        assert_eq!(read_be32(&d, usize::MAX), FDT_END);
+        assert_eq!(read_be64(&d, 2), 0);
+        assert_eq!(align4(usize::MAX), usize::MAX & !3);
+    }
 }
