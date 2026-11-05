@@ -78,7 +78,7 @@ pub fn owner_or_capable(c: &Cred, inode: &Inode) -> bool {
 /// acl_permission_check: only the caller's class (owner, group, other)
 /// of mode bits counts
 fn mode_ok(c: &Cred, uid: Uid, gid: Gid, perm: u16, mask: u32) -> bool {
-    let m = perm as u32;
+    let m = u32::from(perm);
     let bits = if c.fsuid == uid {
         m >> 6
     } else if in_group(c, gid) {

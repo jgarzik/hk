@@ -123,7 +123,7 @@ impl ShmidKernel {
         ds.shm_ctime = self.ctim.load(Ordering::Relaxed);
         ds.shm_cpid = self.cpid;
         ds.shm_lpid = self.lpid.load(Ordering::Relaxed);
-        ds.shm_nattch = self.nattch.load(Ordering::Relaxed) as u64;
+        ds.shm_nattch = u64::from(self.nattch.load(Ordering::Relaxed));
         ds.__unused4 = 0;
         ds.__unused5 = 0;
     }
@@ -233,8 +233,8 @@ impl Drop for ShmAttach {
 /// Convert Result to syscall return value
 fn result_to_i64(res: Result<i32, i32>) -> i64 {
     match res {
-        Ok(v) => v as i64,
-        Err(e) => -(e as i64),
+        Ok(v) => i64::from(v),
+        Err(e) => -i64::from(e),
     }
 }
 
@@ -242,7 +242,7 @@ fn result_to_i64(res: Result<i32, i32>) -> i64 {
 fn result_u64_to_i64(res: Result<u64, i32>) -> i64 {
     match res {
         Ok(v) => v as i64,
-        Err(e) => -(e as i64),
+        Err(e) => -i64::from(e),
     }
 }
 

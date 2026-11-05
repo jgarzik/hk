@@ -170,7 +170,7 @@ fn speed_mbps(s: UsbSpeed) -> &'static str {
 
 /// Linux usb_get_max_power: mA
 fn max_power_ma(d: &UsbDevice) -> u32 {
-    d.config.max_power as u32 * if d.speed.is_super() { 8 } else { 2 }
+    u32::from(d.config.max_power) * if d.speed.is_super() { 8 } else { 2 }
 }
 
 /// Read-only attributes `files` of `dev`
@@ -251,7 +251,7 @@ fn usb_intf_attrs(dev: &Arc<Device>) -> Result<(), KernelError> {
 
 /// Linux bin2bcd
 fn bcd(x: u8) -> u16 {
-    (((x / 10) << 4) | (x % 10)) as u16
+    u16::from(((x / 10) << 4) | (x % 10))
 }
 
 /// The USB 2.0 root hub (Linux usb2_rh_dev_descriptor,

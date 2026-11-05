@@ -380,7 +380,7 @@ impl UnixSock {
 
     /// Linux unix_recvq_full_lockless: more queued than the limit
     fn recvq_full(&self) -> bool {
-        self.rq.lock().q.len() as u64 > self.backlog.load(Ordering::Acquire) as u64
+        self.rq.lock().q.len() as u64 > u64::from(self.backlog.load(Ordering::Acquire))
     }
 
     /// Linux unix_writable: under a quarter of sndbuf in flight

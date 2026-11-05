@@ -385,7 +385,7 @@ fn limits(vdev: &VirtioDevice, ring: u16) -> QueueLimits {
         logical_block_size: lbs,
         physical_block_size: pbs.min(PAGE),
         max_sectors: 128,
-        max_segments: seg_max.min(MAX_SEGS as u32).min(ring as u32 - 2),
+        max_segments: seg_max.min(MAX_SEGS as u32).min(u32::from(ring) - 2),
         max_segment_size: size_max,
         rotational: true,
     }

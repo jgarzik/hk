@@ -132,7 +132,7 @@ pub fn sys_add_key(type_ptr: u64, desc_ptr: u64, payload_ptr: u64, plen: u64, ke
         return e;
     }
 
-    serial as i64
+    i64::from(serial)
 }
 
 /// request_key syscall
@@ -192,7 +192,7 @@ pub fn sys_request_key(
             let _ = keyring_link(&dest, &key);
         }
 
-        return key.serial as i64;
+        return i64::from(key.serial);
     }
 
     // Key not found (we don't support userspace upcall)

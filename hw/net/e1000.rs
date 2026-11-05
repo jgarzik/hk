@@ -710,7 +710,7 @@ fn e1000_probe(
         printkln!("e1000: BAR0 not configured");
         return Err(KernelError::NoDevice);
     }
-    let mmio_phys = (bar0 & !0xF) as u64;
+    let mmio_phys = u64::from(bar0 & !0xF);
     // SAFETY: BAR0 of this e1000, its 128KB register space
     let Some(regs) = (unsafe { crate::hw::mmio::IoMem::ioremap(mmio_phys, 128 * 1024) }) else {
         printkln!("e1000: Failed to ioremap MMIO region");

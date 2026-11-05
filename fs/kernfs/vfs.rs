@@ -375,7 +375,7 @@ impl FileOps for KernfsFops {
                 if (n.ns, &name) <= (l.1, &l.2) {
                     continue;
                 }
-                ctx.pos = h as u64;
+                ctx.pos = u64::from(h);
             }
             let file_type = match n.kind {
                 Kind::Dir(_) => FileType::Directory,
@@ -387,7 +387,7 @@ impl FileOps for KernfsFops {
                 file_type,
                 name: name.clone(),
             };
-            if !ctx.emit_at(h as u64, e) {
+            if !ctx.emit_at(u64::from(h), e) {
                 return Ok(());
             }
             if let Some(o) = &od {

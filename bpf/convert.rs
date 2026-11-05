@@ -357,14 +357,14 @@ impl<E: classic::Env> interp::Env for ClassicEnv<'_, E> {
     fn call(&mut self, id: i32, a: [u64; 5]) -> Option<u64> {
         let load = |size| {
             let v = self.env.load(a[0] as i32, size);
-            Some(v.map_or(u64::MAX, |v| v as u64))
+            Some(v.map_or(u64::MAX, u64::from))
         };
         match id {
             helper::LD_B => load(1),
             helper::LD_H => load(2),
             helper::LD_W => load(4),
-            helper::ANC => Some(self.env.anc(a[0] as u32) as u64),
-            helper::LEN => Some(self.env.pkt_len() as u64),
+            helper::ANC => Some(u64::from(self.env.anc(a[0] as u32))),
+            helper::LEN => Some(u64::from(self.env.pkt_len())),
             _ => None,
         }
     }

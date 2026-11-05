@@ -81,10 +81,10 @@ impl PciDeviceId {
         let h = &p.header;
         self.matches_ids(
             [
-                h.vendor_id as u32,
-                h.device_id as u32,
-                h.subsystem_vendor_id as u32,
-                h.subsystem_id as u32,
+                u32::from(h.vendor_id),
+                u32::from(h.device_id),
+                u32::from(h.subsystem_vendor_id),
+                u32::from(h.subsystem_id),
             ],
             p.class24(),
         )

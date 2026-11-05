@@ -279,8 +279,8 @@ impl BpfArrayMap {
         // Each entry: its lock and Vec header, and the value's kmalloc
         // class (powers of two from 16 bytes)
         let entry = core::mem::size_of::<IrqSpinlock<Vec<u8>>>() as u64
-            + (value_size as u64).next_power_of_two().max(16);
-        let bytes = max_entries as u64 * entry;
+            + u64::from(value_size).next_power_of_two().max(16);
+        let bytes = u64::from(max_entries) * entry;
         if bytes > prealloc_budget() {
             return Err(KernelError::OutOfMemory);
         }

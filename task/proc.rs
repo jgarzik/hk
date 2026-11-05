@@ -99,7 +99,7 @@ fn clone(config: super::percpu::CloneConfig) -> i64 {
     let mut frame_alloc = crate::mm::frame_alloc::FrameAllocRef(&crate::FRAME_ALLOCATOR);
     match super::percpu::do_clone(config, &mut frame_alloc) {
         Ok(child_tid) => child_tid as i64,
-        Err(errno) => -(errno as i64),
+        Err(errno) => -i64::from(errno),
     }
 }
 

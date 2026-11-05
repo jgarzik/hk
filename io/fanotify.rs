@@ -662,8 +662,8 @@ pub fn sys_fanotify_init(init_flags: u32, event_f_flags: u32) -> i64 {
     };
 
     match table.alloc_with_flags(file, fd_flags, nofile_limit) {
-        Ok(fd) => fd as i64,
-        Err(e) => -(e as i64),
+        Ok(fd) => i64::from(fd),
+        Err(e) => -i64::from(e),
     }
 }
 
@@ -698,7 +698,7 @@ pub fn sys_fanotify_mark(fd: i32, mark_flags: u32, mask: u64, dirfd: i32, pathna
     let is_flush = (mark_flags & FAN_MARK_FLUSH) != 0;
 
     // Exactly one of ADD, REMOVE, FLUSH must be set (or none for flush compatibility)
-    let op_count = is_add as u32 + is_remove as u32 + is_flush as u32;
+    let op_count = u32::from(is_add) + u32::from(is_remove) + u32::from(is_flush);
     if op_count > 1 {
         return -22; // EINVAL
     }
@@ -707,7 +707,7 @@ pub fn sys_fanotify_mark(fd: i32, mark_flags: u32, mask: u64, dirfd: i32, pathna
     if is_flush {
         return match fanotify.flush_marks(mark_flags) {
             Ok(()) => 0,
-            Err(e) => e as i64,
+            Err(e) => i64::from(e),
         };
     }
 
@@ -716,7 +716,7 @@ pub fn sys_fanotify_mark(fd: i32, mark_flags: u32, mask: u64, dirfd: i32, pathna
         // Treat as flush
         return match fanotify.flush_marks(mark_flags) {
             Ok(()) => 0,
-            Err(e) => e as i64,
+            Err(e) => i64::from(e),
         };
     }
 
@@ -821,13 +821,13 @@ pub fn sys_fanotify_mark(fd: i32, mark_flags: u32, mask: u64, dirfd: i32, pathna
     if is_remove {
         match fanotify.remove_mark(mark_flags, mask, target_id) {
             Ok(()) => 0,
-            Err(e) => e as i64,
+            Err(e) => i64::from(e),
         }
     } else {
         // ADD (default if no op specified and pathname given)
         match fanotify.add_mark(mark_flags, mask, target_id) {
             Ok(()) => 0,
-            Err(e) => e as i64,
+            Err(e) => i64::from(e),
         }
     }
 }

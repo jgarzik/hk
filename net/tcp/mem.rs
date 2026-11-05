@@ -166,14 +166,14 @@ fn init_net_only() -> Result<(), KernelError> {
 
 /// /proc/sys/net/core/mem_pcpu_rsv
 pub fn rsv_show() -> Vec<i64> {
-    alloc::vec![PCPU_RSV.load(Ordering::Relaxed) as i64]
+    alloc::vec![i64::from(PCPU_RSV.load(Ordering::Relaxed))]
 }
 
 /// mem_pcpu_rsv write (Linux proc_dointvec_minmax, at least
 /// SK_MEMORY_PCPU_RESERVE)
 pub fn rsv_store(v: &[i64]) -> Result<(), KernelError> {
     init_net_only()?;
-    crate::sysctl::range(v[0], PCPU_RSV_MIN as i64, i32::MAX as i64)?;
+    crate::sysctl::range(v[0], i64::from(PCPU_RSV_MIN), i64::from(i32::MAX))?;
     PCPU_RSV.store(v[0] as i32, Ordering::Relaxed);
     Ok(())
 }

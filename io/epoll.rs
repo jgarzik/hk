@@ -177,7 +177,7 @@ impl EpItem {
         let Some(file) = self.file.upgrade() else {
             return 0;
         };
-        let revents = file.f_op.poll(&file, None) as u32;
+        let revents = u32::from(file.f_op.poll(&file, None));
         revents & (self.events.load(Ordering::Acquire) | EPOLLERR | EPOLLHUP)
     }
 
@@ -340,7 +340,7 @@ impl Eventpoll {
         };
         let revents = {
             let mut pt = PollTable::for_epoll(&mut local);
-            file.f_op.poll(file, Some(&mut pt)) as u32
+            u32::from(file.f_op.poll(file, Some(&mut pt)))
         };
         {
             let mut regs = item.regs.lock();
@@ -770,8 +770,8 @@ pub fn sys_epoll_create1(eflags: i32) -> i64 {
         0
     };
     match table.alloc_with_flags(file, fd_flags, get_nofile_limit()) {
-        Ok(fd) => fd as i64,
-        Err(e) => -(e as i64),
+        Ok(fd) => i64::from(fd),
+        Err(e) => -i64::from(e),
     }
 }
 

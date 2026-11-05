@@ -93,7 +93,7 @@ fn integer(b: &mut &[u8]) -> Option<u64> {
 /// A little-endian integer of `n` bytes
 fn le(b: &[u8], n: usize) -> Option<u64> {
     let bytes = b.get(..n)?;
-    Some(bytes.iter().rev().fold(0, |v, &x| (v << 8) | x as u64))
+    Some(bytes.iter().rev().fold(0, |v, &x| (v << 8) | u64::from(x)))
 }
 
 #[cfg(test)]

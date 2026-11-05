@@ -99,7 +99,7 @@ pub fn sys_membarrier(cmd: i32, flags: u32, _cpu_id: i32) -> i64 {
         return EINVAL;
     }
     match cmd {
-        MEMBARRIER_CMD_QUERY => SUPPORTED_CMDS as i64,
+        MEMBARRIER_CMD_QUERY => i64::from(SUPPORTED_CMDS),
         MEMBARRIER_CMD_GLOBAL => global(),
         MEMBARRIER_CMD_GLOBAL_EXPEDITED => {
             let _g = IPI_MUTEX.lock();
@@ -265,5 +265,5 @@ fn registrations() -> i64 {
             mask |= cmd;
         }
     }
-    mask as i64
+    i64::from(mask)
 }

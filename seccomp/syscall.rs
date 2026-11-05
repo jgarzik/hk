@@ -219,8 +219,8 @@ pub fn prctl_get_seccomp() -> i64 {
 
     let table = TASKLIST.read();
     match table.get(tid) {
-        Some(task) => task.task.seccomp_mode() as i64,
-        None => SECCOMP_MODE_DISABLED as i64,
+        Some(task) => i64::from(task.task.seccomp_mode()),
+        None => i64::from(SECCOMP_MODE_DISABLED),
     }
 }
 

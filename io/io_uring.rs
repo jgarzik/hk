@@ -583,7 +583,7 @@ impl IoUring {
             self.wq.wake_all();
         }
 
-        submitted as i64
+        i64::from(submitted)
     }
 
     /// Process a single SQE
@@ -850,11 +850,11 @@ impl IoUring {
         let available = inner.cq_tail; // Simplified - should compare with user's CQ head
 
         if available >= min_complete {
-            return available as i64;
+            return i64::from(available);
         }
 
         // TODO: Implement proper blocking wait
-        available as i64
+        i64::from(available)
     }
 
     /// Get mmap size for the given offset
@@ -996,7 +996,7 @@ impl IoUring {
 
         if ready & wanted != 0 {
             // Already ready - return the events
-            return ready as i32;
+            return i32::from(ready);
         }
 
         // Not ready - add to pending operations
@@ -1186,7 +1186,7 @@ impl IoUring {
     fn do_send(&self, sqe: &IoUringSqe) -> i32 {
         let fd = sqe.fd;
         let buf = sqe.addr;
-        let len = sqe.len as u64;
+        let len = u64::from(sqe.len);
         let flags = sqe.op_flags as i32;
 
         // send is equivalent to sendto with NULL destination
@@ -1197,7 +1197,7 @@ impl IoUring {
     fn do_recv(&self, sqe: &IoUringSqe) -> i32 {
         let fd = sqe.fd;
         let buf = sqe.addr;
-        let len = sqe.len as u64;
+        let len = u64::from(sqe.len);
         let flags = sqe.op_flags as i32;
 
         // recv is equivalent to recvfrom with NULL source
@@ -1506,7 +1506,7 @@ pub fn sys_io_uring_setup(entries: u32, params_ptr: u64) -> i64 {
         .alloc_with_flags(file, FD_CLOEXEC, get_nofile_limit())
     {
         Ok(fd) => fd,
-        Err(e) => return -(e as i64),
+        Err(e) => return -i64::from(e),
     };
 
     // Write params back to user space
@@ -1516,7 +1516,7 @@ pub fn sys_io_uring_setup(entries: u32, params_ptr: u64) -> i64 {
         return KernelError::BadAddress.sysret();
     }
 
-    fd as i64
+    i64::from(fd)
 }
 
 /// sys_io_uring_enter - Submit I/O and/or wait for completions

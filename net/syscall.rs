@@ -51,7 +51,7 @@ pub fn fd_install(file: Arc<File>, cloexec: bool) -> Result<i64, KernelError> {
         .lock()
         .alloc_with_flags(file, fl, nofile())
         .map_err(|_| KernelError::ProcessFileLimit)?;
-    Ok(fd as i64)
+    Ok(i64::from(fd))
 }
 
 /// SOCK_NONBLOCK / SOCK_CLOEXEC of a type or accept4 flags argument
@@ -345,7 +345,7 @@ pub fn sys_sendmmsg(fd: i32, vec: u64, vlen: u32, flags: i32) -> i64 {
     ret((|| {
         let (file, s) = sockfd(fd)?;
         let mut n = 0u64;
-        for i in 0..(vlen as u64).min(msg::UIO_MAXIOV as u64) {
+        for i in 0..u64::from(vlen).min(msg::UIO_MAXIOV as u64) {
             let at = vec.wrapping_add(i * MMSG_SIZE);
             match sendmsg_one(&file, &*s, at, flags) {
                 Ok(k) => {
@@ -370,7 +370,7 @@ pub fn sys_recvmmsg(fd: i32, vec: u64, vlen: u32, flags: i32, timeout: u64) -> i
         let deadline = mmsg_deadline(timeout)?;
         let mut flags = flags;
         let mut n = 0u64;
-        for i in 0..(vlen as u64).min(msg::UIO_MAXIOV as u64) {
+        for i in 0..u64::from(vlen).min(msg::UIO_MAXIOV as u64) {
             let at = vec.wrapping_add(i * MMSG_SIZE);
             match recvmsg_one(&file, &*s, at, flags) {
                 Ok(k) => {

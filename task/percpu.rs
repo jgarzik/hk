@@ -977,10 +977,10 @@ impl GlobalTaskTable {
             // SAFETY: in this list; no view is live
             let ti = unsafe { self.inner_mut_of(t) };
             old.extend(ti.pgrp.replace(pg.clone()));
-            t.pgid.store(pg.nr() as Pid, Ordering::Relaxed);
+            t.pgid.store(Pid::from(pg.nr()), Ordering::Relaxed);
             if let Some(s) = s {
                 old.extend(ti.session.replace(s.clone()));
-                t.sid.store(s.nr() as Pid, Ordering::Relaxed);
+                t.sid.store(Pid::from(s.nr()), Ordering::Relaxed);
             }
         }
         self.attach_pids(&l);
@@ -1212,7 +1212,7 @@ fn create_kernel_task(
                 .ok_or("No pid left for kernel thread")?,
         )
     };
-    let tid = thread_pid.as_ref().map_or(0, |p| p.nr() as Tid);
+    let tid = thread_pid.as_ref().map_or(0, |p| Tid::from(p.nr()));
     let pid = tid;
 
     let stack_base = crate::mm::vmstack::alloc().ok_or("Out of memory for kernel thread stack")?;
@@ -2035,7 +2035,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     // namespace (Linux alloc_pid); a new process's pid is its tid
     // (leader pid == tid), a thread keeps its group's
     let child_thread_pid = crate::task::pid::alloc_pid(&parent_pid_ns).ok_or(11)?; // EAGAIN
-    let child_tid = child_thread_pid.nr() as Tid;
+    let child_tid = Tid::from(child_thread_pid.nr());
     let child_pid = if config.flags & CLONE_THREAD != 0 {
         parent_pid
     } else {
@@ -2963,8 +2963,8 @@ pub fn sched_cpu_update(cpu: u32) {
 /// (lower is more important)
 fn prio(se: &sched::SchedEntity) -> i32 {
     match se.class() {
-        Class::Rt | Class::Stop => 99 - se.rt_priority() as i32,
-        _ => se.static_prio() as i32,
+        Class::Rt | Class::Stop => 99 - i32::from(se.rt_priority()),
+        _ => i32::from(se.static_prio()),
     }
 }
 
@@ -2974,7 +2974,7 @@ fn rank(p: &Task) -> u32 {
     match p.se.class() {
         Class::Idle => 0,
         Class::Fair => 1,
-        Class::Rt => 2 + p.se.rt_priority() as u32,
+        Class::Rt => 2 + u32::from(p.se.rt_priority()),
         Class::Stop => 200,
     }
 }
@@ -3159,7 +3159,7 @@ pub fn nr_active() -> u64 {
         .filter_map(|c| PERCPU_SCHEDS.try_get(c))
         .map(|s| s.nr_uninterruptible.load(Ordering::Relaxed))
         .sum();
-    nr_running_all() as u64 + unint.max(0) as u64
+    u64::from(nr_running_all()) + unint.max(0) as u64
 }
 
 /// `cpu`'s load for balancing: its task count, one more while an rt or
@@ -3167,7 +3167,7 @@ pub fn nr_active() -> u64 {
 /// running (Linux lowers such a CPU's capacity, scale_rt_capacity)
 fn balance_load(cpu: u32) -> u32 {
     let s = PERCPU_SCHEDS.get(cpu);
-    s.nr_running.load(Ordering::Relaxed) + (s.curr_rank.load(Ordering::Relaxed) > 1) as u32
+    s.nr_running.load(Ordering::Relaxed) + u32::from(s.curr_rank.load(Ordering::Relaxed) > 1)
 }
 
 /// Pull queued tasks from the busiest CPU to `this` until the two are
@@ -3873,7 +3873,7 @@ pub fn lookup_task_policy(pid: Pid) -> Option<i32> {
 /// For SCHED_NORMAL tasks, returns 0.
 pub fn lookup_task_rt_priority(pid: Pid) -> Option<i32> {
     let table = TASKLIST.read();
-    table.get(pid).map(|t| t.task.se.rt_priority() as i32)
+    table.get(pid).map(|t| i32::from(t.task.se.rt_priority()))
 }
 
 /// Get a task's CPU time statistics by TID
@@ -4012,7 +4012,7 @@ pub fn set_task_scheduler(pid: Pid, policy: i32, rt_priority: i32) -> Result<(),
     }
     // Nothing changes (Linux __sched_setscheduler: same policy and
     // priority only updates reset-on-fork)
-    if base_policy == task.se.policy() && rt_priority == task.se.rt_priority() as i32 {
+    if base_policy == task.se.policy() && rt_priority == i32::from(task.se.rt_priority()) {
         task.se.set_reset_on_fork(reset_on_fork);
         return Ok(());
     }
@@ -4069,7 +4069,7 @@ pub fn task_count() -> usize {
 /// - ESRCH (3): Process not found
 pub fn set_task_nice(pid: Pid, nice: i32) -> Result<(), i32> {
     let task = TASKLIST.read().task(pid).ok_or(3)?; // ESRCH
-    let static_prio = (sched::DEFAULT_PRIO as i32 + nice.clamp(-20, 19)) as u8;
+    let static_prio = (i32::from(sched::DEFAULT_PRIO) + nice.clamp(-20, 19)) as u8;
     change_class(&task, |se| {
         se.set_params(se.class(), se.policy(), static_prio, se.rt_priority())
     });

@@ -246,7 +246,7 @@ fn perform_atomic_semop(
     for (n, sop) in sops.iter().enumerate() {
         let s = l.sem(sop.sem_num as usize);
         let cur = s.val;
-        let result = cur + sop.sem_op as i32;
+        let result = cur + i32::from(sop.sem_op);
         let r = if (sop.sem_op == 0 && cur != 0) || result < 0 {
             *blocking = n;
             if sop.sem_flg & IPC_NOWAIT as i16 != 0 {
@@ -258,7 +258,7 @@ fn perform_atomic_semop(
             KernelError::Range.to_errno_neg()
         } else if let (true, Some(u)) = (sop.sem_flg & SEM_UNDO != 0, undo) {
             // The adjustment must stay in -SEMAEM-1..=SEMAEM
-            match i16::try_from(adj_of(s) as i32 - sop.sem_op as i32) {
+            match i16::try_from(i32::from(adj_of(s)) - i32::from(sop.sem_op)) {
                 Ok(v) => {
                     set_adj(s, u, v);
                     s.val = result;
@@ -272,7 +272,7 @@ fn perform_atomic_semop(
         };
         for done in sops[..n].iter().rev() {
             let s = l.sem(done.sem_num as usize);
-            s.val -= done.sem_op as i32;
+            s.val -= i32::from(done.sem_op);
             if let (true, Some(u)) = (done.sem_flg & SEM_UNDO != 0, undo) {
                 let v = adj_of(s) + done.sem_op;
                 set_adj(s, u, v);
@@ -476,7 +476,7 @@ impl SemArray {
             .max()
             .unwrap_or(0);
         ds.sem_ctime = l.global().map_or(0, |g| g.ctime);
-        ds.sem_nsems = self.nsems as u64;
+        ds.sem_nsems = u64::from(self.nsems);
         ds.__unused3 = 0;
         ds.__unused4 = 0;
     }
@@ -516,8 +516,8 @@ impl IpcObject for SemArray {
 /// Convert Result to syscall return value
 fn result_to_i64(res: Result<i32, i32>) -> i64 {
     match res {
-        Ok(v) => v as i64,
-        Err(e) => -(e as i64),
+        Ok(v) => i64::from(v),
+        Err(e) => -i64::from(e),
     }
 }
 
@@ -548,8 +548,8 @@ fn do_semget(key: i32, nsems: i32, semflg: i32) -> Result<i32, i32> {
             if nsems_u32 == 0 {
                 return Err(KernelError::InvalidArgument.errno());
             }
-            let used = ns_clone.used_sems.load(Ordering::Relaxed) as u64;
-            if used + nsems_u32 as u64 > ns_clone.sem_ctls[1] as u64 {
+            let used = u64::from(ns_clone.used_sems.load(Ordering::Relaxed));
+            if used + u64::from(nsems_u32) > ns_clone.sem_ctls[1] as u64 {
                 return Err(KernelError::NoSpace.errno());
             }
             SemArray::new(k, nsems_u32, mode, ns_clone.clone())
@@ -633,7 +633,7 @@ fn do_semtimedop(semid: i32, sops_ptr: u64, nsops: usize, timeout_ptr: u64) -> R
         None => None,
     };
 
-    let max = sops.iter().map(|s| s.sem_num as u32).max().unwrap_or(0);
+    let max = sops.iter().map(|s| u32::from(s.sem_num)).max().unwrap_or(0);
     let has_undo = sops.iter().any(|s| s.sem_flg & SEM_UNDO != 0);
     let alter = sops.iter().any(|s| s.sem_op != 0);
 
@@ -937,7 +937,7 @@ fn do_semctl(semid: i32, semnum: i32, cmd: i32, arg: u64) -> Result<i32, i32> {
                 let offset = arg + (i * 2) as u64;
                 let val: u16 = get_user::<Uaccess, u16>(offset)
                     .map_err(|_| KernelError::BadAddress.errno())?;
-                *v = val as i32;
+                *v = i32::from(val);
             }
             if vals.iter().any(|&v| v > SEMVMX) {
                 return Err(KernelError::Range.errno());
@@ -992,7 +992,7 @@ fn do_semctl(semid: i32, semnum: i32, cmd: i32, arg: u64) -> Result<i32, i32> {
             let zero = cmd_only == GETZCNT;
             let counts = |(q, b): &Waiter| {
                 let op = &q.sops[*b];
-                op.sem_num as i32 == semnum && if zero { op.sem_op == 0 } else { op.sem_op < 0 }
+                i32::from(op.sem_num) == semnum && if zero { op.sem_op == 0 } else { op.sem_op < 0 }
             };
             let mut l = sem_array.lock_valid()?;
             let mut n = l
@@ -1138,7 +1138,7 @@ pub fn exit_sem(tid: Tid) {
         for i in 0..sem_array.nsems as usize {
             let s = l.sem(i);
             if let Some(a) = s.undo.remove(&undo_list.id) {
-                s.val = (s.val + a as i32).clamp(0, SEMVMX);
+                s.val = (s.val + i32::from(a)).clamp(0, SEMVMX);
                 s.pid = pid;
                 changed.push(i);
             }

@@ -80,7 +80,7 @@ impl Buf {
         self.0.extend_from_slice(&v.to_ne_bytes());
     }
     fn ms_ago(&mut self, now: u64, t: u64) {
-        self.u32(now.saturating_sub(t).min(u32::MAX as u64) as u32);
+        self.u32(now.saturating_sub(t).min(u64::from(u32::MAX)) as u32);
     }
 }
 
@@ -161,7 +161,7 @@ pub fn tcp_info(cb: &TcpCb, now: u64) -> Vec<u8> {
     for _ in 0..3 {
         b.u64(0); // busy_time, rwnd_limited, sndbuf_limited
     }
-    b.u32(pkts(st.bytes_acked.min(u32::MAX as u64) as u32, mss)); // delivered
+    b.u32(pkts(st.bytes_acked.min(u64::from(u32::MAX)) as u32, mss)); // delivered
     b.u32(0); // delivered_ce
     b.u64(st.bytes_sent);
     b.u64(st.bytes_retrans);
@@ -171,7 +171,7 @@ pub fn tcp_info(cb: &TcpCb, now: u64) -> Vec<u8> {
     b.u32(if synced { cb.snd_wnd } else { 0 });
     b.u32(if synced { cb.rcv_wnd() } else { 0 });
     b.u32(0); // rehash
-    b.u16(st.rto_count.min(u16::MAX as u32) as u16);
+    b.u16(st.rto_count.min(u32::from(u16::MAX)) as u16);
     b.u16(0); // total_rto_recoveries
     b.u32(0); // total_rto_time
     for _ in 0..8 {
@@ -226,11 +226,11 @@ fn sock_line(out: &mut String, i: usize, s: &super::TcpSock, now: u64) {
     let (tr, when) = timer(cb, now);
     let ss = cb.cong.ssthresh;
     let last: i64 = if listen {
-        cb.opts.fastopen as i64
+        i64::from(cb.opts.fastopen)
     } else if ss >= INFINITE_SSTHRESH {
         -1
     } else {
-        pkts(ss, cb.mss) as i64
+        i64::from(pkts(ss, cb.mss))
     };
     let l = alloc::format!(
         "{:4}: {:08X}:{:04X} {:08X}:{:04X} {:02X} {:08X}:{:08X} {:02X}:{:08X} {:08X} {:5} {:8} {} {} {:016x} {} {} {} {} {}",
@@ -252,7 +252,7 @@ fn sock_line(out: &mut String, i: usize, s: &super::TcpSock, now: u64) {
         0,
         ticks(cb.rto_cur()),
         ticks(cb.dack.ato),
-        (cb.dack.quick << 1) | cb.dack.pingpong as u32,
+        (cb.dack.quick << 1) | u32::from(cb.dack.pingpong),
         pkts(cb.cong.cwnd, cb.mss),
         last
     );

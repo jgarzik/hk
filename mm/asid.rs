@@ -73,7 +73,7 @@ impl AsidAlloc {
 
     /// Set the ASID width (boot, before any address space runs)
     pub fn set_bits(&self, bits: u32) {
-        self.bits.store(bits as u64, Ordering::Relaxed);
+        self.bits.store(u64::from(bits), Ordering::Relaxed);
         self.generation.store(1 << bits, Ordering::Relaxed);
     }
 

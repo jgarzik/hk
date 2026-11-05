@@ -295,7 +295,7 @@ pub fn init_gdt() {
         ::core::arch::asm!(
             "mov fs, {ds:x}",
             "mov gs, {ds:x}",
-            ds = in(reg) KERNEL_DATA_SELECTOR as u32,
+            ds = in(reg) u32::from(KERNEL_DATA_SELECTOR),
             options(nostack, preserves_flags)
         );
     }
@@ -350,8 +350,8 @@ unsafe fn load_gdt_raw(limit: u16, base: u64) {
             "mov ds, {ds:x}",
             "mov es, {ds:x}",
             "mov ss, {ds:x}",
-            cs = in(reg) KERNEL_CODE_SELECTOR as u64,
-            ds = in(reg) KERNEL_DATA_SELECTOR as u32,
+            cs = in(reg) u64::from(KERNEL_CODE_SELECTOR),
+            ds = in(reg) u32::from(KERNEL_DATA_SELECTOR),
             tmp = lateout(reg) _,
             options(preserves_flags)
         );
@@ -360,7 +360,7 @@ unsafe fn load_gdt_raw(limit: u16, base: u64) {
 
 /// ELF auxv AT_HWCAP: CPUID.1:EDX (Linux ELF_HWCAP on x86-64)
 pub fn elf_hwcap() -> u64 {
-    core::arch::x86_64::__cpuid(1).edx as u64
+    u64::from(core::arch::x86_64::__cpuid(1).edx)
 }
 
 /// ELF auxv AT_PLATFORM string

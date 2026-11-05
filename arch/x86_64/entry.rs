@@ -133,8 +133,8 @@ extern "C" fn do_syscall_64(regs: &crate::arch::UserFrame) -> bool {
 fn sysret_ok(r: &PtRegs) -> bool {
     r.rcx == r.rip
         && r.r11 == r.rflags
-        && r.cs == USER_CODE_SELECTOR as u64
-        && r.ss == USER_DATA_SELECTOR as u64
+        && r.cs == u64::from(USER_CODE_SELECTOR)
+        && r.ss == u64::from(USER_DATA_SELECTOR)
         && r.rip < super::paging::TASK_SIZE
         && r.rflags & SYSRET_BAD_FLAGS == 0
 }
@@ -253,7 +253,7 @@ unsafe extern "C" {
 
 /// Address of the catch-all stub for `vector`
 pub fn vector_stub(vector: u8) -> u64 {
-    (&raw const idt_vector_stubs) as u64 + vector as u64 * 16
+    (&raw const idt_vector_stubs) as u64 + u64::from(vector) * 16
 }
 
 /// Common IDT entry: interrupts are off (interrupt gates); from user
@@ -487,10 +487,10 @@ pub unsafe fn enter_user(entry: u64, sp: u64, kstack_top: u64) -> ! {
     unsafe {
         regs.write(PtRegs {
             rip: entry,
-            cs: USER_CODE_SELECTOR as u64,
+            cs: u64::from(USER_CODE_SELECTOR),
             rflags: 0x202, // IF + reserved bit 1
             rsp: sp,
-            ss: USER_DATA_SELECTOR as u64,
+            ss: u64::from(USER_DATA_SELECTOR),
             orig_rax: u64::MAX,
             ..Default::default()
         });

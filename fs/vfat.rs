@@ -45,7 +45,7 @@ pub struct VfatAops;
 /// The disk runs (byte offset, length) holding bytes [pos, pos + len)
 /// of the file whose cluster chain is `chain`, within its clusters
 fn disk_runs(sb: &VfatSbData, chain: &[u32], pos: u64, len: usize) -> Vec<(u64, usize)> {
-    let cs = sb.cluster_size as u64;
+    let cs = u64::from(sb.cluster_size);
     let mut runs: Vec<(u64, usize)> = Vec::new();
     let mut at = pos;
     let end = pos + len as u64;
@@ -162,7 +162,7 @@ fn cont_expand(inode: &Inode, cs: u64, from: u64, to: u64) -> Result<(), KernelE
 /// first cluster in the inode and its directory entry
 fn ensure_clusters(inode: &Inode, sb_data: &VfatSbData, size: u64) -> Result<(), KernelError> {
     let d = get_inode_data(inode)?;
-    let cs = sb_data.cluster_size as u64;
+    let cs = u64::from(sb_data.cluster_size);
     let need = size.div_ceil(cs) as usize;
     let chain = if d.start_cluster != 0 {
         read_cluster_chain(sb_data, d.start_cluster)?
@@ -218,13 +218,13 @@ fn vfat_write(inode: &Arc<Inode>, buf: &[u8], pos: u64) -> Result<usize, KernelE
     let sb = inode.superblock().ok_or(KernelError::Io)?;
     let sb_data = get_sb_data(&sb)?;
     let end = pos + buf.len() as u64;
-    if end > u32::MAX as u64 {
+    if end > u64::from(u32::MAX) {
         return Err(KernelError::FileTooLarge);
     }
     let old = inode.get_size();
     ensure_clusters(inode, &sb_data, end.max(old))?;
     if pos > old {
-        cont_expand(inode, sb_data.cluster_size as u64, old, pos)?;
+        cont_expand(inode, u64::from(sb_data.cluster_size), old, pos)?;
     }
     let n = filemap::perform_write(inode, buf, pos)?;
     super::fs_writeback::mark_inode_dirty(inode);
@@ -712,11 +712,11 @@ fn get_inode_data(inode: &Inode) -> Result<VfatInodeData, KernelError> {
 
 /// Read a FAT entry for a cluster
 fn get_fat_entry(sb_data: &VfatSbData, cluster: u32) -> Result<u32, KernelError> {
-    let fat_offset = (cluster as u64) * 4;
-    let fat_sector = sb_data.fat_start_sector + fat_offset / sb_data.bytes_per_sector as u64;
-    let offset_in_sector = (fat_offset % sb_data.bytes_per_sector as u64) as usize;
+    let fat_offset = u64::from(cluster) * 4;
+    let fat_sector = sb_data.fat_start_sector + fat_offset / u64::from(sb_data.bytes_per_sector);
+    let offset_in_sector = (fat_offset % u64::from(sb_data.bytes_per_sector)) as usize;
 
-    let byte_offset = fat_sector * sb_data.bytes_per_sector as u64 + offset_in_sector as u64;
+    let byte_offset = fat_sector * u64::from(sb_data.bytes_per_sector) + offset_in_sector as u64;
     let mut buf = [0u8; 4];
     read_bytes(&sb_data.bdev, byte_offset, &mut buf)?;
 
@@ -735,8 +735,8 @@ fn is_valid_cluster(cluster: u32) -> bool {
 
 /// Convert cluster number to byte offset in data region
 fn cluster_to_offset(sb_data: &VfatSbData, cluster: u32) -> u64 {
-    let data_offset = (cluster as u64 - 2) * sb_data.cluster_size as u64;
-    sb_data.data_start_sector * sb_data.bytes_per_sector as u64 + data_offset
+    let data_offset = (u64::from(cluster) - 2) * u64::from(sb_data.cluster_size);
+    sb_data.data_start_sector * u64::from(sb_data.bytes_per_sector) + data_offset
 }
 
 /// Read a cluster chain starting from a cluster
@@ -772,8 +772,8 @@ const FAT_FREE: u32 = 0x0000_0000;
 
 /// Write a FAT entry for a cluster (updates all FAT copies)
 fn set_fat_entry(sb_data: &VfatSbData, cluster: u32, value: u32) -> Result<(), KernelError> {
-    let fat_offset = (cluster as u64) * 4;
-    let offset_in_fat = fat_offset % (sb_data.fat_sectors * sb_data.bytes_per_sector as u64);
+    let fat_offset = u64::from(cluster) * 4;
+    let offset_in_fat = fat_offset % (sb_data.fat_sectors * u64::from(sb_data.bytes_per_sector));
 
     // Preserve high 4 bits of existing entry (reserved bits in FAT32)
     let existing = get_fat_entry(sb_data, cluster)?;
@@ -784,7 +784,7 @@ fn set_fat_entry(sb_data: &VfatSbData, cluster: u32, value: u32) -> Result<(), K
     let num_fats = 2u64; // FAT32 standard
     for fat_num in 0..num_fats {
         let fat_start = sb_data.fat_start_sector + fat_num * sb_data.fat_sectors;
-        let byte_offset = fat_start * sb_data.bytes_per_sector as u64 + offset_in_fat;
+        let byte_offset = fat_start * u64::from(sb_data.bytes_per_sector) + offset_in_fat;
         write_bytes(&sb_data.bdev, byte_offset, &buf)?;
     }
 
@@ -799,9 +799,9 @@ fn allocate_cluster(sb_data: &VfatSbData) -> Result<u32, KernelError> {
     // Calculate total data clusters
     // Total sectors = fat_start + fat_sectors * num_fats + data_sectors
     // data_clusters = data_sectors / sectors_per_cluster
-    let total_sectors = sb_data.bdev.capacity() / sb_data.bytes_per_sector as u64;
+    let total_sectors = sb_data.bdev.capacity() / u64::from(sb_data.bytes_per_sector);
     let data_sectors = total_sectors.saturating_sub(sb_data.data_start_sector);
-    let total_clusters = (data_sectors / sb_data.sectors_per_cluster as u64) as u32;
+    let total_clusters = (data_sectors / u64::from(sb_data.sectors_per_cluster)) as u32;
 
     // Search for free cluster (start from cluster 2, which is first data cluster)
     for cluster in 2..total_clusters + 2 {
@@ -816,7 +816,7 @@ fn allocate_cluster(sb_data: &VfatSbData) -> Result<u32, KernelError> {
             // device cache, so no stale or dirty copy of an old
             // directory block may outlive the reuse
             let off = cluster_to_offset(sb_data, cluster);
-            let len = sb_data.cluster_size as u64;
+            let len = u64::from(sb_data.cluster_size);
             filemap::invalidate_range(&sb_data.bdev.bd_inode, off, off + len)?;
             let mut zeros = crate::util::kmem::try_vec(len as usize, 0u8)?;
             bdev_rw_bytes(&sb_data.bdev, BioOp::Write, off, &mut zeros)?;
@@ -1089,7 +1089,7 @@ fn read_directory_entries(
                 }
 
                 let start_cluster =
-                    ((dirent.first_cluster_hi as u32) << 16) | (dirent.first_cluster_lo as u32);
+                    (u32::from(dirent.first_cluster_hi) << 16) | u32::from(dirent.first_cluster_lo);
 
                 // Build short_name array from name (8 bytes) + ext (3 bytes)
                 let mut short_name = [b' '; 11];
@@ -1621,8 +1621,8 @@ fn delete_dir_entry(
                 // Restore lfn_start for deletion
                 let lfn_start = current_lfn_start;
                 // Found it! Get start cluster before deleting
-                let cluster_hi = u16::from_le_bytes([buf[20], buf[21]]) as u32;
-                let cluster_lo = u16::from_le_bytes([buf[26], buf[27]]) as u32;
+                let cluster_hi = u32::from(u16::from_le_bytes([buf[20], buf[21]]));
+                let cluster_lo = u32::from(u16::from_le_bytes([buf[26], buf[27]]));
                 let start_cluster_to_free = (cluster_hi << 16) | cluster_lo;
 
                 // Delete LFN entries if any
@@ -1947,11 +1947,11 @@ impl InodeOps for VfatInodeOps {
         if d.is_dir {
             return Err(KernelError::IsDirectory);
         }
-        if length > u32::MAX as u64 {
+        if length > u64::from(u32::MAX) {
             return Err(KernelError::FileTooLarge);
         }
         let old = inode.get_size();
-        let cs = sb_data.cluster_size as u64;
+        let cs = u64::from(sb_data.cluster_size);
         if length < old {
             filemap::truncate_setsize(inode, length);
             let keep = length.div_ceil(cs) as usize;
@@ -1997,7 +1997,7 @@ impl InodeOps for VfatInodeOps {
             return Err(KernelError::OperationNotSupported);
         }
         let end = offset + len;
-        if end > u32::MAX as u64 {
+        if end > u64::from(u32::MAX) {
             return Err(KernelError::FileTooLarge);
         }
         if mode & FALLOC_FL_KEEP_SIZE != 0 {
@@ -2109,8 +2109,8 @@ pub static VFAT_INODE_OPS: VfatInodeOps = VfatInodeOps;
 fn ikey(parent: u32, short: &[u8; 11]) -> u64 {
     short
         .iter()
-        .fold(parent as u64 ^ 0xcbf2_9ce4_8422_2325, |h, &b| {
-            (h ^ b as u64).wrapping_mul(0x100_0000_01b3)
+        .fold(u64::from(parent) ^ 0xcbf2_9ce4_8422_2325, |h, &b| {
+            (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)
         })
 }
 
@@ -2184,7 +2184,7 @@ fn create_inode_for_entry(
         mode,
         o.uid,
         o.gid,
-        entry.file_size as u64,
+        u64::from(entry.file_size),
         Timespec::ZERO,
         Arc::downgrade(sb),
         &VFAT_INODE_OPS,
@@ -2288,7 +2288,7 @@ impl FileOps for VfatFileOps {
 
             // Use cluster as pseudo-inode number
             let ino = if entry.start_cluster > 0 {
-                entry.start_cluster as u64
+                u64::from(entry.start_cluster)
             } else {
                 sb.alloc_ino()
             };
@@ -2388,7 +2388,7 @@ fn vfat_mount_dev(
     // A FAT sector smaller than the device's logical block (Linux
     // fat_fill_super: "logical sector size too small for device"): a
     // metadata write-back of one block would cover other sectors
-    if (bytes_per_sector as u32) < bdev.logical_block_size() {
+    if u32::from(bytes_per_sector) < bdev.logical_block_size() {
         return Err(KernelError::InvalidArgument);
     }
 
@@ -2419,25 +2419,25 @@ fn vfat_mount_dev(
     }
 
     // Calculate filesystem layout
-    let fat_start_sector = boot_sector.reserved_sector_count as u64;
-    let fat_sectors = boot_sector.fat_size_32 as u64;
-    let num_fats = boot_sector.num_fats as u64;
+    let fat_start_sector = u64::from(boot_sector.reserved_sector_count);
+    let fat_sectors = u64::from(boot_sector.fat_size_32);
+    let num_fats = u64::from(boot_sector.num_fats);
     let data_start_sector = fat_start_sector + (fat_sectors * num_fats);
-    let cluster_size = (spc as u32) * (bytes_per_sector as u32);
+    let cluster_size = u32::from(spc) * u32::from(bytes_per_sector);
 
     // The data region must fit, and the FAT must hold an entry (4 bytes)
     // for every data cluster plus the two reserved entries (Linux: the
     // cluster count is checked against the FAT size)
     let total_sectors = if boot_sector.total_sectors_16 != 0 {
-        boot_sector.total_sectors_16 as u64
+        u64::from(boot_sector.total_sectors_16)
     } else {
-        boot_sector.total_sectors_32 as u64
+        u64::from(boot_sector.total_sectors_32)
     };
     if total_sectors <= data_start_sector {
         return Err(KernelError::InvalidArgument);
     }
-    let total_clusters = (total_sectors - data_start_sector) / spc as u64;
-    let fat_entries = fat_sectors.saturating_mul(bytes_per_sector as u64) / 4;
+    let total_clusters = (total_sectors - data_start_sector) / u64::from(spc);
+    let fat_entries = fat_sectors.saturating_mul(u64::from(bytes_per_sector)) / 4;
     if total_clusters == 0 || total_clusters + 2 > fat_entries {
         return Err(KernelError::InvalidArgument);
     }
@@ -2445,8 +2445,8 @@ fn vfat_mount_dev(
     // Create superblock data
     let sb_data = Arc::new(VfatSbData {
         bdev: bdev.clone(),
-        bytes_per_sector: bytes_per_sector as u32,
-        sectors_per_cluster: boot_sector.sectors_per_cluster as u32,
+        bytes_per_sector: u32::from(bytes_per_sector),
+        sectors_per_cluster: u32::from(boot_sector.sectors_per_cluster),
         fat_start_sector,
         fat_sectors,
         data_start_sector,

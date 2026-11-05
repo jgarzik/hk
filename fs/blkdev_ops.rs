@@ -281,7 +281,7 @@ fn need_admin() -> Result<(), KernelError> {
 /// Linux blkdev_common_ioctl / blkdev_ioctl subset
 fn blkdev_ioctl(b: &BlockDevice, cmd: u32, arg: u64) -> Result<i64, KernelError> {
     match cmd {
-        ioc::BLKROGET => put_int(arg, b.ro() as i32),
+        ioc::BLKROGET => put_int(arg, i32::from(b.ro())),
         ioc::BLKSSZGET => put_int(arg, b.logical_block_size() as i32),
         ioc::BLKPBSZGET => put_int(arg, b.physical_block_size() as i32),
         ioc::BLKBSZGET => put_int(arg, b.block_size() as i32),

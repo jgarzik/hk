@@ -50,7 +50,7 @@ fn touch(cpu: usize) {
 /// From this CPU's tick (interrupt context; Linux
 /// watchdog_timer_fn)
 pub fn tick() {
-    let thresh = THRESH.load(Ordering::Relaxed) as u64 * 1_000_000_000;
+    let thresh = u64::from(THRESH.load(Ordering::Relaxed)) * 1_000_000_000;
     let Some(cpu) = crate::cpu::try_this_id() else {
         return;
     };

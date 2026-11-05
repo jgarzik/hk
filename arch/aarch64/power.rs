@@ -35,7 +35,7 @@ pub fn psci_version() -> u32 {
         core::arch::asm!(
             "mov x0, {func}",
             "hvc #0",
-            func = in(reg) psci::PSCI_VERSION as u64,
+            func = in(reg) u64::from(psci::PSCI_VERSION),
             lateout("x0") result,
             out("x1") _,
             out("x2") _,
@@ -67,7 +67,7 @@ pub unsafe fn psci_cpu_on(target_mpidr: u64, entry_point: u64, context_id: u64) 
             "mov x2, {entry}",
             "mov x3, {ctx}",
             "hvc #0",
-            func = in(reg) psci::CPU_ON_64 as u64,
+            func = in(reg) u64::from(psci::CPU_ON_64),
             mpidr = in(reg) target_mpidr,
             entry = in(reg) entry_point,
             ctx = in(reg) context_id,
@@ -87,7 +87,7 @@ pub fn shutdown() -> ! {
         core::arch::asm!(
             "mov x0, {func}",
             "hvc #0",
-            func = in(reg) psci::SYSTEM_OFF as u64,
+            func = in(reg) u64::from(psci::SYSTEM_OFF),
             options(nostack, nomem)
         );
     }
@@ -106,7 +106,7 @@ pub fn reboot() -> ! {
         core::arch::asm!(
             "mov x0, {func}",
             "hvc #0",
-            func = in(reg) psci::SYSTEM_RESET as u64,
+            func = in(reg) u64::from(psci::SYSTEM_RESET),
             options(nostack, nomem)
         );
     }

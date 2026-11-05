@@ -135,7 +135,7 @@ impl Pl011 {
         while self.read_reg(regs::FR) & fr::TXFF != 0 {
             core::hint::spin_loop();
         }
-        self.write_reg(regs::DR, byte as u32);
+        self.write_reg(regs::DR, u32::from(byte));
     }
 
     /// Drain the receive FIFO into `tty`'s flip buffer (IRQ context;

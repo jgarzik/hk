@@ -186,7 +186,7 @@ impl SchedEntity {
     }
 
     pub fn policy(&self) -> i32 {
-        self.policy.load(Ordering::Relaxed) as i32
+        i32::from(self.policy.load(Ordering::Relaxed))
     }
 
     pub fn static_prio(&self) -> u8 {
@@ -195,7 +195,7 @@ impl SchedEntity {
 
     /// Linux task_nice
     pub fn nice(&self) -> i32 {
-        self.static_prio() as i32 - DEFAULT_PRIO as i32
+        i32::from(self.static_prio()) - i32::from(DEFAULT_PRIO)
     }
 
     pub fn rt_priority(&self) -> u8 {

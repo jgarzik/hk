@@ -145,7 +145,7 @@ pub static MM_CTLS: &[crate::sysctl::Ctl] = &[crate::sysctl::Ctl {
     mode: 0o644,
     show: || alloc::vec![max_map_count() as i64],
     store: |v| {
-        crate::sysctl::range(v[0], 0, i32::MAX as i64)?;
+        crate::sysctl::range(v[0], 0, i64::from(i32::MAX))?;
         MAX_MAP_COUNT.store(v[0] as usize, Ordering::Relaxed);
         Ok(())
     },

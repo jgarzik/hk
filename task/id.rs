@@ -34,7 +34,7 @@ pub fn sys_getppid(ppid: Pid) -> i64 {
 /// Returns the real user ID of the calling process.
 /// No locking needed - credentials are immutable during syscall execution.
 pub fn sys_getuid(uid: u32) -> i64 {
-    uid as i64
+    i64::from(uid)
 }
 
 /// sys_geteuid - get effective user ID
@@ -42,7 +42,7 @@ pub fn sys_getuid(uid: u32) -> i64 {
 /// Returns the effective user ID of the calling process.
 /// No locking needed - credentials are immutable during syscall execution.
 pub fn sys_geteuid(euid: u32) -> i64 {
-    euid as i64
+    i64::from(euid)
 }
 
 /// sys_getgid - get real group ID
@@ -50,7 +50,7 @@ pub fn sys_geteuid(euid: u32) -> i64 {
 /// Returns the real group ID of the calling process.
 /// No locking needed - credentials are immutable during syscall execution.
 pub fn sys_getgid(gid: u32) -> i64 {
-    gid as i64
+    i64::from(gid)
 }
 
 /// sys_getegid - get effective group ID
@@ -58,7 +58,7 @@ pub fn sys_getgid(gid: u32) -> i64 {
 /// Returns the effective group ID of the calling process.
 /// No locking needed - credentials are immutable during syscall execution.
 pub fn sys_getegid(egid: u32) -> i64 {
-    egid as i64
+    i64::from(egid)
 }
 
 /// sys_setuid - set user identity (Linux-compatible)
@@ -519,7 +519,7 @@ pub fn sys_setfsuid(uid: u32, current_cred: super::Cred) -> i64 {
 
     // Check if uid is valid (treat -1 as "query only")
     if uid == 0xFFFFFFFF {
-        return old_fsuid as i64;
+        return i64::from(old_fsuid);
     }
 
     // Permission check: must be in {uid, euid, suid, fsuid} or CAP_SETUID
@@ -532,13 +532,13 @@ pub fn sys_setfsuid(uid: u32, current_cred: super::Cred) -> i64 {
 
     if !is_permitted && !is_privileged() {
         // Permission denied - return old fsuid without changing
-        return old_fsuid as i64;
+        return i64::from(old_fsuid);
     }
 
     // Apply the change
     super::percpu::set_current_fsuid(uid);
 
-    old_fsuid as i64
+    i64::from(old_fsuid)
 }
 
 /// sys_setfsgid - set filesystem GID
@@ -567,7 +567,7 @@ pub fn sys_setfsgid(gid: u32, current_cred: super::Cred) -> i64 {
 
     // Check if gid is valid (treat -1 as "query only")
     if gid == 0xFFFFFFFF {
-        return old_fsgid as i64;
+        return i64::from(old_fsgid);
     }
 
     // Permission check: must be in {gid, egid, sgid, fsgid} or CAP_SETGID
@@ -580,13 +580,13 @@ pub fn sys_setfsgid(gid: u32, current_cred: super::Cred) -> i64 {
 
     if !is_permitted && !is_privileged() {
         // Permission denied - return old fsgid without changing
-        return old_fsgid as i64;
+        return i64::from(old_fsgid);
     }
 
     // Apply the change
     super::percpu::set_current_fsgid(gid);
 
-    old_fsgid as i64
+    i64::from(old_fsgid)
 }
 
 /// getgroups(size, list) (Linux kernel/groups.c): the supplementary

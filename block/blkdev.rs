@@ -527,7 +527,7 @@ impl BlockDevice {
     /// that divides the size (Linux set_init_blocksize)
     fn init_block_size(&self) {
         let size = self.capacity();
-        let mut bs = self.logical_block_size() as u64;
+        let mut bs = u64::from(self.logical_block_size());
         while bs < PAGE as u64 && size & bs == 0 {
             bs <<= 1;
         }

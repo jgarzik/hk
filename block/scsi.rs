@@ -112,7 +112,7 @@ impl Cdb {
     /// sd_setup_rw_cmnd): 16-byte if the disk needs it (`use_16`) or the
     /// LBA or count does not fit READ(10), else 10-byte
     pub fn rw(write: bool, lba: u64, count: u32, use_16: bool) -> Self {
-        if use_16 || lba > u32::MAX as u64 || count > u16::MAX as u32 {
+        if use_16 || lba > u64::from(u32::MAX) || count > u32::from(u16::MAX) {
             Self::rw_16(write, lba, count)
         } else if write {
             Self::write_10(lba as u32, count as u16)
@@ -369,7 +369,7 @@ impl ReadCapacityData {
 
     /// Get total capacity in blocks
     pub fn total_blocks(&self) -> u64 {
-        self.last_lba() as u64 + 1
+        u64::from(self.last_lba()) + 1
     }
 }
 

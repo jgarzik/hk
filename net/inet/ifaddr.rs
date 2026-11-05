@@ -116,7 +116,7 @@ pub fn inet_make_mask(prefixlen: u8) -> Ipv4Addr {
     match prefixlen {
         0 => Ipv4Addr(0),
         n if n >= 32 => Ipv4Addr(u32::MAX),
-        n => Ipv4Addr(u32::MAX << (32 - n as u32)),
+        n => Ipv4Addr(u32::MAX << (32 - u32::from(n))),
     }
 }
 

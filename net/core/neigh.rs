@@ -450,7 +450,7 @@ pub fn now_ms() -> u64 {
 
 /// Linux neigh_rand_reach_time: uniform in [base/2, 3*base/2)
 fn rand_reach(base: u64) -> u64 {
-    base / 2 + crate::random::get_random_u32() as u64 % base.max(1)
+    base / 2 + u64::from(crate::random::get_random_u32()) % base.max(1)
 }
 
 impl NeighTable {

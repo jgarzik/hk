@@ -42,7 +42,7 @@ pub fn rdmsr(msr: u32) -> u64 {
             options(nostack, preserves_flags)
         );
     }
-    ((hi as u64) << 32) | lo as u64
+    (u64::from(hi) << 32) | u64::from(lo)
 }
 
 /// Write `v` to MSR `msr`

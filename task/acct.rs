@@ -136,10 +136,10 @@ pub fn encode_comp_t(mut value: u64) -> u16 {
             exp += 1;
         }
     }
-    if exp > (u16::MAX >> MANTSIZE) as u32 {
+    if exp > u32::from(u16::MAX >> MANTSIZE) {
         return u16::MAX;
     }
-    ((exp << MANTSIZE) as u64 + value) as u16
+    (u64::from(exp << MANTSIZE) + value) as u16
 }
 
 /// An IEEE single of `value` with its mantissa truncated, as Linux

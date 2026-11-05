@@ -142,7 +142,7 @@ impl VgaConState {
 
     /// Clear the entire screen
     fn clear_screen(&mut self) {
-        let blank = (self.attribute as u16) << 8 | 0x20u16; // Space with attribute
+        let blank = u16::from(self.attribute) << 8 | 0x20u16; // Space with attribute
         unsafe {
             for i in 0..(VGA_WIDTH * VGA_HEIGHT) {
                 core::ptr::write_volatile(self.buffer.add(i), blank);
@@ -183,7 +183,7 @@ impl VgaConState {
             _ => {
                 // Printable character
                 let offset = self.cursor_y * VGA_WIDTH + self.cursor_x;
-                let cell = (self.attribute as u16) << 8 | (c as u16);
+                let cell = u16::from(self.attribute) << 8 | u16::from(c);
 
                 unsafe {
                     core::ptr::write_volatile(self.buffer.add(offset), cell);
@@ -219,7 +219,7 @@ impl VgaConState {
             core::ptr::copy(src, dst, count);
 
             // Clear the last line
-            let blank = (self.attribute as u16) << 8 | (b' ' as u16);
+            let blank = u16::from(self.attribute) << 8 | u16::from(b' ');
             let last_line = self.buffer.add(VGA_WIDTH * (VGA_HEIGHT - 1));
             for i in 0..VGA_WIDTH {
                 core::ptr::write_volatile(last_line.add(i), blank);

@@ -77,7 +77,7 @@ static FREEZER_FILES: [ControlFile; 1] = [ControlFile {
 /// cgrp->freezer.freeze, ancestors aside)
 fn freeze_read(css: &CgroupSubsysState) -> Result<Vec<u8>, KernelError> {
     let cgroup = css.cgroup().ok_or(KernelError::Io)?;
-    Ok(format!("{}\n", cgroup.self_frozen() as u8).into_bytes())
+    Ok(format!("{}\n", u8::from(cgroup.self_frozen())).into_bytes())
 }
 
 /// Write cgroup.freeze ("0" or "1"); the cgroupfs write holds

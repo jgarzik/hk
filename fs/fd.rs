@@ -189,8 +189,8 @@ pub fn sys_dup(oldfd: i32) -> i64 {
 
     // Allocate fd (RLIMIT_NOFILE enforced inside alloc)
     match table.alloc(file, get_nofile_limit()) {
-        Ok(newfd) => newfd as i64,
-        Err(e) => -(e as i64),
+        Ok(newfd) => i64::from(newfd),
+        Err(e) => -i64::from(e),
     }
 }
 
@@ -211,7 +211,7 @@ pub fn sys_dup2(oldfd: i32, newfd: i32) -> i64 {
         let fd_table = current_fd_table();
         let table = fd_table.lock();
         return if table.is_valid(oldfd) {
-            newfd as i64
+            i64::from(newfd)
         } else {
             KernelError::BadFd.sysret()
         };
@@ -254,7 +254,7 @@ pub fn sys_dup3(oldfd: i32, newfd: i32, flags: u32) -> i64 {
 fn dup_to(oldfd: i32, newfd: i32, fd_flags: u32) -> i64 {
     let nofile = get_nofile_limit();
     // Linux takes newfd unsigned: a negative one is past any limit
-    if newfd as u32 as u64 >= nofile {
+    if u64::from(newfd as u32) >= nofile {
         return KernelError::BadFd.sysret();
     }
     let fd_table = current_fd_table();
@@ -266,12 +266,12 @@ fn dup_to(oldfd: i32, newfd: i32, fd_flags: u32) -> i64 {
     match room {
         Ok(()) => {}
         Err(24) => return KernelError::BadFd.sysret(), // EMFILE
-        Err(e) => return -(e as i64),
+        Err(e) => return -i64::from(e),
     }
     table.close(newfd);
     match table.alloc_at_with_flags(newfd, file, fd_flags, nofile) {
-        Ok(()) => newfd as i64,
-        Err(e) => -(e as i64),
+        Ok(()) => i64::from(newfd),
+        Err(e) => -i64::from(e),
     }
 }
 
@@ -346,7 +346,7 @@ pub fn sys_pipe2(pipefd: u64, flags: u32) -> i64 {
 
     let read_fd = match table.alloc_with_flags(read_file, fd_flags, nofile) {
         Ok(fd) => fd,
-        Err(e) => return -(e as i64),
+        Err(e) => return -i64::from(e),
     };
 
     let write_fd = match table.alloc_with_flags(write_file, fd_flags, nofile) {
@@ -354,7 +354,7 @@ pub fn sys_pipe2(pipefd: u64, flags: u32) -> i64 {
         Err(e) => {
             // Clean up read fd on failure
             table.close(read_fd);
-            return -(e as i64);
+            return -i64::from(e);
         }
     };
 
@@ -457,8 +457,8 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> i64 {
             }
             // RLIMIT_NOFILE enforced inside alloc_at_or_above
             match table.alloc_at_or_above(file, min_fd, 0, nofile) {
-                Ok(new_fd) => new_fd as i64,
-                Err(e) => -(e as i64),
+                Ok(new_fd) => i64::from(new_fd),
+                Err(e) => -i64::from(e),
             }
         }
 
@@ -478,8 +478,8 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> i64 {
             }
             // RLIMIT_NOFILE enforced inside alloc_at_or_above
             match table.alloc_at_or_above(file, min_fd, crate::task::FD_CLOEXEC, nofile) {
-                Ok(new_fd) => new_fd as i64,
-                Err(e) => -(e as i64),
+                Ok(new_fd) => i64::from(new_fd),
+                Err(e) => -i64::from(e),
             }
         }
 
@@ -488,7 +488,7 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> i64 {
             if !table.is_valid(fd) {
                 return KernelError::BadFd.sysret();
             }
-            table.get_fd_flags(fd) as i64
+            i64::from(table.get_fd_flags(fd))
         }
 
         F_SETFD => {
@@ -505,7 +505,7 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> i64 {
                 Some(f) => f,
                 None => return KernelError::BadFd.sysret(),
             };
-            file.get_flags() as i64
+            i64::from(file.get_flags())
         }
 
         F_SETFL => {
@@ -623,7 +623,7 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> i64 {
                 Some(f) => f,
                 None => return KernelError::BadFd.sysret(),
             };
-            file.get_owner() as i64
+            i64::from(file.get_owner())
         }
 
         F_SETSIG => {
@@ -647,7 +647,7 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> i64 {
                 Some(f) => f,
                 None => return KernelError::BadFd.sysret(),
             };
-            file.get_sig() as i64
+            i64::from(file.get_sig())
         }
 
         _ => KernelError::InvalidArgument.sysret(),
@@ -664,7 +664,7 @@ pub fn f_setown(file: &File, who: i32) -> Result<(), KernelError> {
     let exists = match who {
         0 => true,
         w if w > 0 => crate::task::percpu::lookup_task_pgid(w as u64).is_some(),
-        w => crate::task::percpu::pgrp_exists(w.unsigned_abs() as u64),
+        w => crate::task::percpu::pgrp_exists(u64::from(w.unsigned_abs())),
     };
     if !exists {
         return Err(KernelError::NoProcess);

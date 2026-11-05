@@ -215,8 +215,8 @@ impl Default for IcmpRate {
 impl IcmpRate {
     fn global_allow(&self, net: &NetNamespace, now: u64) -> bool {
         let s = &net.sysctl;
-        let per_sec = s.icmp_msgs_per_sec.load(Ordering::Relaxed) as i64;
-        let burst = s.icmp_msgs_burst.load(Ordering::Relaxed) as i64;
+        let per_sec = i64::from(s.icmp_msgs_per_sec.load(Ordering::Relaxed));
+        let burst = i64::from(s.icmp_msgs_burst.load(Ordering::Relaxed));
         self.st.lock().global.allow(now, per_sec, burst)
     }
 
@@ -235,7 +235,7 @@ impl IcmpRate {
     }
 
     fn consume(&self) {
-        let c = (crate::random::get_random_u32() % 3) as i64;
+        let c = i64::from(crate::random::get_random_u32() % 3);
         self.st.lock().global.consume(c);
     }
 }
@@ -402,9 +402,9 @@ fn icmp_unreach(net: &NetNamespace, skb: &SkBuff) {
     }
     let mut info = u32::from_be_bytes([d[4], d[5], d[6], d[7]]);
     if ty == icmp_type::DEST_UNREACH && code == code::FRAG_NEEDED {
-        info = u16::from_be_bytes([d[6], d[7]]) as u32;
+        info = u32::from(u16::from_be_bytes([d[6], d[7]]));
     } else if ty == icmp_type::PARAMETERPROB {
-        info = (d[4] as u32) << 24;
+        info = u32::from(d[4]) << 24;
     }
     let e = IcmpErr {
         ty,

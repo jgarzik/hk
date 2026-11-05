@@ -216,7 +216,7 @@ pub fn netdev_unregister(
 
 /// The `bind` word of (protocol, ifindex)
 fn pack(proto: u16, ifindex: i32) -> u64 {
-    ((proto as u64) << 32) | ifindex as u32 as u64
+    (u64::from(proto) << 32) | u64::from(ifindex as u32)
 }
 
 fn unpack(w: u64) -> (u16, i32) {

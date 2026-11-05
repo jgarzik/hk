@@ -76,7 +76,7 @@ impl OptIn {
         match self.len {
             0 => Err(KernelError::InvalidArgument),
             1..=3 => get_user::<Uaccess, u8>(self.ptr)
-                .map(|v| v as i32)
+                .map(i32::from)
                 .map_err(|_| KernelError::BadAddress),
             _ => self.int(),
         }
@@ -219,7 +219,7 @@ pub fn sock_create(
     }
     let create = FAMILIES
         .iter()
-        .find(|(f, _)| *f as i32 == family)
+        .find(|(f, _)| i32::from(*f) == family)
         .map(|(_, c)| c)
         .ok_or(KernelError::AddressFamilyNotSupported)?;
     create(stype, protocol)
@@ -550,11 +550,11 @@ pub fn sock_getsockopt(s: &dyn ProtoOps, opt: i32) -> Result<OptOut, KernelError
     match opt {
         SO_TYPE => int(sk.stype),
         SO_PROTOCOL => int(sk.protocol),
-        SO_DOMAIN => int(sk.family as i32),
+        SO_DOMAIN => int(i32::from(sk.family)),
         SO_ERROR => int(sk.take_errno()),
-        SO_ACCEPTCONN => int(sk.flag(sf::ACCEPTCONN) as i32),
-        SO_REUSEPORT => int(sk.flag(sf::REUSEPORT) as i32),
-        SO_DEBUG => int(sk.flag(sf::DEBUG) as i32),
+        SO_ACCEPTCONN => int(i32::from(sk.flag(sf::ACCEPTCONN))),
+        SO_REUSEPORT => int(i32::from(sk.flag(sf::REUSEPORT))),
+        SO_DEBUG => int(i32::from(sk.flag(sf::DEBUG))),
         SO_SNDBUF => int(sk.sndbuf() as i32),
         SO_RCVBUF => int(sk.rcvbuf() as i32),
         SO_PRIORITY => int(sk.priority.load(Ordering::Acquire) as i32),
@@ -568,7 +568,7 @@ pub fn sock_getsockopt(s: &dyn ProtoOps, opt: i32) -> Result<OptOut, KernelError
         SO_LINGER => {
             let mut b = Vec::with_capacity(8);
             let (on, secs) = sk.linger_opt();
-            b.extend_from_slice(&(on as i32).to_ne_bytes());
+            b.extend_from_slice(&i32::from(on).to_ne_bytes());
             b.extend_from_slice(&(secs as i32).to_ne_bytes());
             Ok(OptOut::Bytes(b))
         }
@@ -586,7 +586,7 @@ pub fn sock_getsockopt(s: &dyn ProtoOps, opt: i32) -> Result<OptOut, KernelError
         }
         o => {
             let f = bool_opt(o).ok_or(KernelError::NoProtocolOption)?;
-            int(sk.flag(f) as i32)
+            int(i32::from(sk.flag(f)))
         }
     }
 }

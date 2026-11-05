@@ -27,7 +27,7 @@ pub type DevId = u64;
 
 /// Encode major:minor into DevId
 pub fn make_dev(major: u32, minor: u32) -> DevId {
-    ((major as u64) << 32) | (minor as u64)
+    (u64::from(major) << 32) | u64::from(minor)
 }
 
 /// Decode DevId into major:minor

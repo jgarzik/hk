@@ -567,8 +567,8 @@ pub fn sys_inotify_init1(in_flags: i32) -> i64 {
     };
 
     match table.alloc_with_flags(file, fd_flags, nofile_limit) {
-        Ok(fd) => fd as i64,
-        Err(e) => -(e as i64),
+        Ok(fd) => i64::from(fd),
+        Err(e) => -i64::from(e),
     }
 }
 
@@ -624,8 +624,8 @@ pub fn sys_inotify_add_watch(fd: i32, pathname_ptr: u64, mask: u32) -> i64 {
 
     // Add watch
     match inotify.add_watch(&pathname, mask, ino) {
-        Ok(wd) => wd as i64,
-        Err(e) => e as i64,
+        Ok(wd) => i64::from(wd),
+        Err(e) => i64::from(e),
     }
 }
 
@@ -655,7 +655,7 @@ pub fn sys_inotify_rm_watch(fd: i32, wd: i32) -> i64 {
     // Remove watch
     match inotify.rm_watch(wd) {
         Ok(()) => 0,
-        Err(e) => e as i64,
+        Err(e) => i64::from(e),
     }
 }
 

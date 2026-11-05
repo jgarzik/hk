@@ -42,14 +42,14 @@ pub fn weight(se: &SchedEntity) -> u64 {
     if se.policy() == crate::task::SCHED_IDLE {
         return WEIGHT_IDLEPRIO;
     }
-    PRIO_TO_WEIGHT[(se.nice() + 20).clamp(0, 39) as usize] as u64
+    u64::from(PRIO_TO_WEIGHT[(se.nice() + 20).clamp(0, 39) as usize])
 }
 
 /// The base slice in ns (Linux sysctl_sched_base_slice, 0.75 ms scaled
 /// by 1 + log2 of the CPUs up to 8: sched_update_scaling)
 pub fn base_slice() -> u64 {
     let n = crate::cpu::nr_cpu_ids().clamp(1, 8);
-    750_000 * (1 + n.ilog2() as u64)
+    750_000 * (1 + u64::from(n.ilog2()))
 }
 
 /// `delta` ns of real time in `se`'s virtual time (Linux
@@ -59,7 +59,7 @@ fn calc_delta_fair(delta: u64, se: &SchedEntity) -> u64 {
     if w == NICE_0_LOAD {
         return delta;
     }
-    (delta as u128 * NICE_0_LOAD as u128 / w as u128) as u64
+    (u128::from(delta) * u128::from(NICE_0_LOAD) / u128::from(w)) as u64
 }
 
 /// Charge the running `se` for the time since it last was (Linux
@@ -89,8 +89,8 @@ pub fn avg_vruntime<'a>(ents: impl Iterator<Item = &'a SchedEntity> + Clone) -> 
         .min()?;
     let (mut sum, mut w) = (0i128, 0i128);
     for e in ents {
-        let ew = weight(e) as i128;
-        sum += ew * (e.vruntime.load(Ordering::Relaxed) - base) as i128;
+        let ew = i128::from(weight(e));
+        sum += ew * i128::from(e.vruntime.load(Ordering::Relaxed) - base);
         w += ew;
     }
     Some(base + (sum / w) as u64)
@@ -111,8 +111,8 @@ pub fn pick<'a, T: Copy>(ents: impl Iterator<Item = (T, &'a SchedEntity)> + Clon
 /// the timing granularity; every slice here is the base slice)
 pub fn save_lag(se: &SchedEntity, avg: u64) {
     let limit = calc_delta_fair(base_slice() + super::percpu::TICK_NS, se) as i64;
-    let lag = (avg as i128 - se.vruntime.load(Ordering::Relaxed) as i128)
-        .clamp(-limit as i128, limit as i128) as i64;
+    let lag = (i128::from(avg) - i128::from(se.vruntime.load(Ordering::Relaxed)))
+        .clamp(i128::from(-limit), i128::from(limit)) as i64;
     se.vlag.store(lag, Ordering::Relaxed);
 }
 
@@ -121,12 +121,12 @@ pub fn save_lag(se: &SchedEntity, avg: u64) {
 /// scaled so the average stays put); a new task (`initial`) gets half a
 /// slice to its first deadline (PLACE_DEADLINE_INITIAL)
 pub fn place(se: &SchedEntity, avg: u64, load: u64, initial: bool) {
-    let w = weight(se) as i128;
-    let mut lag = se.vlag.swap(0, Ordering::Relaxed) as i128;
+    let w = i128::from(weight(se));
+    let mut lag = i128::from(se.vlag.swap(0, Ordering::Relaxed));
     if load > 0 {
-        lag = lag * (load as i128 + w) / load as i128;
+        lag = lag * (i128::from(load) + w) / i128::from(load);
     }
-    let v = (avg as i128 - lag).max(0) as u64;
+    let v = (i128::from(avg) - lag).max(0) as u64;
     se.vruntime.store(v, Ordering::Relaxed);
     let mut vslice = calc_delta_fair(base_slice(), se);
     if initial {

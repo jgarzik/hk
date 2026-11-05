@@ -1172,7 +1172,7 @@ pub(crate) fn parse_octal(v: &[u8]) -> Option<u16> {
         return None;
     }
     v.iter().try_fold(0u16, |n, &c| match c {
-        b'0'..=b'7' => n.checked_mul(8)?.checked_add((c - b'0') as u16),
+        b'0'..=b'7' => n.checked_mul(8)?.checked_add(u16::from(c - b'0')),
         _ => None,
     })
 }

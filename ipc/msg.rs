@@ -131,7 +131,7 @@ impl MsgQueue {
                 list: VecDeque::new(),
                 cbytes: 0,
                 qnum: 0,
-                qbytes: ns.msg_ctlmnb as u64,
+                qbytes: u64::from(ns.msg_ctlmnb),
                 stime: 0,
                 rtime: 0,
                 ctime: current_time_secs(),
@@ -271,8 +271,8 @@ impl IpcObject for MsgQueue {
 /// Convert Result to syscall return value
 fn result_to_i64(res: Result<i32, i32>) -> i64 {
     match res {
-        Ok(v) => v as i64,
-        Err(e) => -(e as i64),
+        Ok(v) => i64::from(v),
+        Err(e) => -i64::from(e),
     }
 }
 
@@ -481,7 +481,7 @@ fn do_msgctl(msqid: i32, cmd: i32, buf: u64) -> Result<i32, i32> {
             }
             // Linux msgctl_down: past MSGMNB needs CAP_SYS_RESOURCE; below
             // it anyone allowed to IPC_SET may lower or raise the limit
-            if ds.msg_qbytes > ns.msg_ctlmnb as u64
+            if ds.msg_qbytes > u64::from(ns.msg_ctlmnb)
                 && !crate::task::capable(crate::task::CAP_SYS_RESOURCE)
             {
                 return Err(KernelError::NotPermitted.errno());

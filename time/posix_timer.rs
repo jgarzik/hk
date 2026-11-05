@@ -231,7 +231,7 @@ impl PosixTimer {
                 .and_then(|c| c.timer_base())
                 .unwrap_or(HrClock::Monotonic);
             let value_ns = if pclock == Some(crate::time::time_syscall::PosixClock::Tai) {
-                (value_ns as i128 - crate::time::time_syscall::tai_offset_ns()).max(0) as u64
+                (i128::from(value_ns) - crate::time::time_syscall::tai_offset_ns()).max(0) as u64
             } else {
                 value_ns
             };
@@ -747,7 +747,7 @@ pub fn sys_timer_create(clockid: i32, sevp: u64, timerid: u64) -> i64 {
             }
             0
         }
-        Err(e) => e as i64,
+        Err(e) => i64::from(e),
     }
 }
 
@@ -857,7 +857,7 @@ pub fn sys_timer_getoverrun(timerid: TimerT) -> i64 {
         None => return -22, // EINVAL - timer not found
     };
 
-    timer.getoverrun() as i64
+    i64::from(timer.getoverrun())
 }
 
 /// sys_timer_delete - Delete a POSIX timer
@@ -875,7 +875,7 @@ pub fn sys_timer_delete(timerid: TimerT) -> i64 {
     }
     match delete_posix_timer(tid, timerid) {
         Ok(()) => 0,
-        Err(e) => e as i64,
+        Err(e) => i64::from(e),
     }
 }
 
@@ -1049,7 +1049,7 @@ pub fn sys_alarm(seconds: u32) -> i64 {
     let spec = ITimerSpec {
         it_interval: crate::time::time_syscall::LinuxTimespec::default(),
         it_value: crate::time::time_syscall::LinuxTimespec {
-            tv_sec: seconds as i64,
+            tv_sec: i64::from(seconds),
             tv_nsec: 0,
         },
     };

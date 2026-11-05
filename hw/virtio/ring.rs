@@ -260,7 +260,7 @@ impl Vring {
         let e = self.used_elem(self.last_used & (self.num - 1));
         let id = u32::from_le(unsafe { read_volatile(e) });
         let len = u32::from_le(unsafe { read_volatile(e.add(1)) });
-        if id >= self.num as u32 || self.chain[id as usize] == 0 {
+        if id >= u32::from(self.num) || self.chain[id as usize] == 0 {
             // Linux BAD_RING: stop using the queue
             self.broken = true;
             return None;

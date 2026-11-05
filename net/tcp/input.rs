@@ -333,7 +333,7 @@ impl TcpCb {
         let ack = s.ack;
         let span = self
             .max_wnd
-            .min(self.stats.bytes_acked.min(u32::MAX as u64) as u32);
+            .min(self.stats.bytes_acked.min(u64::from(u32::MAX)) as u32);
         if after(ack, self.snd_max) || before(ack, self.snd_una.wrapping_sub(span)) {
             self.challenge_ack(out);
             return false;
@@ -391,7 +391,7 @@ impl TcpCb {
             self.sndq_seq = upto;
             self.mem_settle();
         }
-        self.stats.bytes_acked += acked as u64;
+        self.stats.bytes_acked += u64::from(acked);
         self.snd_una = ack;
         if before(self.snd_nxt, ack) {
             self.snd_nxt = ack;
@@ -419,7 +419,7 @@ impl TcpCb {
 
     /// Segment text and FIN (Linux tcp_data_queue / tcp_fin)
     fn rcv_text(&mut self, s: &SegIn, now: u64, out: &mut Out) {
-        let mut seq = s.seq.wrapping_add(s.has(flags::SYN) as u32);
+        let mut seq = s.seq.wrapping_add(u32::from(s.has(flags::SYN)));
         let mut data = s.data;
         let mut fin = s.has(flags::FIN);
         if before(seq, self.rcv_nxt) {

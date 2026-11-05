@@ -71,7 +71,7 @@ pub fn create() -> Result<Arc<dyn ProtoOps>, KernelError> {
     }
     // INET_PROTOSW_REUSE: identifiers are shared unless a socket clears
     // SO_REUSEADDR
-    let sk = Sock::new(net, AF_INET, SOCK_DGRAM, IPPROTO_ICMP as i32);
+    let sk = Sock::new(net, AF_INET, SOCK_DGRAM, i32::from(IPPROTO_ICMP));
     sk.set_flag(sf::REUSEADDR, true);
     Ok(Arc::new_cyclic(|me| PingSock {
         sk,

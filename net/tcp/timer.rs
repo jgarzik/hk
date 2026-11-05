@@ -53,7 +53,7 @@ impl TcpCb {
 
     /// TCP_USER_TIMEOUT time left while retransmitting or probing
     fn user_left(&self, now: u64) -> Option<u64> {
-        let ut = self.opts.user_timeout as u64;
+        let ut = u64::from(self.opts.user_timeout);
         let start = self.rtx_stamp?;
         (ut != 0).then(|| (start + ut).saturating_sub(now))
     }
@@ -242,14 +242,14 @@ impl TcpCb {
     pub(super) fn keep_idle(&self) -> u64 {
         match self.opts.keepidle {
             0 => self.cfg.keepidle,
-            s => s as u64 * 1000,
+            s => u64::from(s) * 1000,
         }
     }
 
     pub(super) fn keep_intvl(&self) -> u64 {
         match self.opts.keepintvl {
             0 => self.cfg.keepintvl,
-            s => s as u64 * 1000,
+            s => u64::from(s) * 1000,
         }
     }
 
@@ -298,7 +298,7 @@ impl TcpCb {
         let next = if busy {
             self.keep_idle()
         } else if idle >= self.keep_idle() {
-            let ut = self.opts.user_timeout as u64;
+            let ut = u64::from(self.opts.user_timeout);
             if (ut != 0 && idle >= ut && self.probes > 0)
                 || (ut == 0 && self.probes >= self.keep_cnt())
             {

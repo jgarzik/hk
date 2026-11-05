@@ -181,7 +181,7 @@ pub fn sys_umask(mask: u32) -> i64 {
     let new_mask = (mask & 0o7777) as u16;
 
     if let Some(fs) = crate::task::percpu::current_fs() {
-        fs.set_umask(new_mask) as i64
+        i64::from(fs.set_umask(new_mask))
     } else {
         0o022
     }

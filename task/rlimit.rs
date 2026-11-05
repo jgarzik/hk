@@ -260,7 +260,7 @@ pub fn sys_setrlimit(resource: u32, rlim_ptr: u64) -> i64 {
 
     match set_task_rlimit(tid, resource, new_rlim) {
         Ok(_) => 0,
-        Err(e) => e as i64,
+        Err(e) => i64::from(e),
     }
 }
 
@@ -327,7 +327,7 @@ pub fn sys_prlimit64(pid: i32, resource: u32, new_rlim_ptr: u64, old_rlim_ptr: u
     let old = match new {
         Some(new) => match set_task_rlimit(target_tid, resource, new) {
             Ok(old) => old,
-            Err(e) => return e as i64,
+            Err(e) => return i64::from(e),
         },
         None => match get_task_rlimit(target_tid, resource) {
             Some(r) => r,

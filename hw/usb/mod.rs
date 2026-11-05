@@ -117,7 +117,7 @@ impl SetupPacket {
         Self {
             request_type: USB_DIR_IN,
             request: 0x06,
-            value: ((desc_type as u16) << 8) | (desc_index as u16),
+            value: (u16::from(desc_type) << 8) | u16::from(desc_index),
             index: 0,
             length,
         }
@@ -128,7 +128,7 @@ impl SetupPacket {
         Self {
             request_type: 0x00,
             request: 0x09,
-            value: config as u16,
+            value: u16::from(config),
             index: 0,
             length: 0,
         }

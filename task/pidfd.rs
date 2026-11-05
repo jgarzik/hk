@@ -48,7 +48,7 @@ pub struct Pidfd {
 impl Pidfd {
     /// The process's pid
     pub fn pid(&self) -> Pid {
-        self.pid.nr() as Pid
+        Pid::from(self.pid.nr())
     }
 
     /// Its `Pid`

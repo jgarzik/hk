@@ -180,8 +180,8 @@ impl PtRegs {
         Self {
             rip: entry,
             rsp: user_stack,
-            cs: cpu::USER_CODE_SELECTOR as u64,
-            ss: cpu::USER_DATA_SELECTOR as u64,
+            cs: u64::from(cpu::USER_CODE_SELECTOR),
+            ss: u64::from(cpu::USER_DATA_SELECTOR),
             rflags: 0x202, // IF (interrupt enable) + reserved bit 1
             orig_rax: u64::MAX,
             ..Default::default()
@@ -339,7 +339,7 @@ impl LocalTimerOps for X86_64Arch {
     }
 
     fn current_hw_cpu_id() -> u32 {
-        lapic::current_apic_id() as u32
+        u32::from(lapic::current_apic_id())
     }
 
     fn calibrate_and_start_timer(vector: u8, interval_ms: u32) -> u32 {

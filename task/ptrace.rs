@@ -721,7 +721,7 @@ fn ptrace_getregs(target_pid: Pid, data: u64) -> i64 {
             }
             0
         }
-        Err(e) => e as i64,
+        Err(e) => i64::from(e),
     }
 }
 
@@ -752,7 +752,7 @@ fn ptrace_setregs(target_pid: Pid, data: u64) -> i64 {
         }
         match crate::arch::ptrace::set_user_regs(target_tid, &regs) {
             Ok(()) => 0,
-            Err(e) => e as i64,
+            Err(e) => i64::from(e),
         }
     }
 
@@ -770,7 +770,7 @@ fn ptrace_setregs(target_pid: Pid, data: u64) -> i64 {
         }
         match crate::arch::ptrace::set_user_regs(target_tid, &regs) {
             Ok(()) => 0,
-            Err(e) => e as i64,
+            Err(e) => i64::from(e),
         }
     }
 }

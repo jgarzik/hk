@@ -92,7 +92,7 @@ const ATTRS: [NAttr; 14] = [
         if !n.is_up() {
             return Err(KernelError::InvalidArgument);
         }
-        Ok(format!("{}\n", n.carrier_ok() as u8))
+        Ok(format!("{}\n", u8::from(n.carrier_ok())))
     }),
     (b"carrier_changes", |n| {
         Ok(format!("{}\n", n.carrier_changes()))

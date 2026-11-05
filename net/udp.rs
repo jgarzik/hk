@@ -259,7 +259,7 @@ pub fn tx_cmsgs(c: &[u8]) -> Result<TxCmsg, KernelError> {
         let int = || -> Result<i32, KernelError> {
             match d.len() {
                 4 => Ok(i32::from_ne_bytes([d[0], d[1], d[2], d[3]])),
-                1 => Ok(d[0] as i32),
+                1 => Ok(i32::from(d[0])),
                 _ => Err(KernelError::InvalidArgument),
             }
         };
@@ -626,8 +626,8 @@ fn lookup(t: &UdpTable, k: &Key) -> Option<Arc<UdpSock>> {
     let h = port::siphash(
         [0x9e37_79b9, 0x7f4a_7c15],
         &[
-            ((k.saddr.0 as u64) << 32) | k.daddr.0 as u64,
-            ((k.sport as u64) << 16) | k.dport as u64,
+            (u64::from(k.saddr.0) << 32) | u64::from(k.daddr.0),
+            (u64::from(k.sport) << 16) | u64::from(k.dport),
         ],
     );
     Some((*group[(h as usize) % group.len()]).clone())
@@ -729,7 +729,7 @@ fn csum_ok(saddr: Ipv4Addr, daddr: Ipv4Addr, pkt: &[u8]) -> bool {
 fn add_words(mut sum: u32, d: &[u8]) -> u32 {
     let mut i = 0;
     while i + 1 < d.len() {
-        sum = sum.wrapping_add(u16::from_be_bytes([d[i], d[i + 1]]) as u32);
+        sum = sum.wrapping_add(u32::from(u16::from_be_bytes([d[i], d[i + 1]])));
         // Fold early so long datagrams cannot overflow
         if sum & 0x8000_0000 != 0 {
             sum = (sum & 0xffff) + (sum >> 16);
@@ -737,7 +737,7 @@ fn add_words(mut sum: u32, d: &[u8]) -> u32 {
         i += 2;
     }
     if i < d.len() {
-        sum = sum.wrapping_add((d[i] as u32) << 8);
+        sum = sum.wrapping_add(u32::from(d[i]) << 8);
     }
     sum
 }

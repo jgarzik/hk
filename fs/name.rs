@@ -112,7 +112,7 @@ pub fn name_to_int(name: &[u8]) -> Option<u64> {
         if !c.is_ascii_digit() {
             return None;
         }
-        n = n.checked_mul(10)?.checked_add((c - b'0') as u64)?;
+        n = n.checked_mul(10)?.checked_add(u64::from(c - b'0'))?;
     }
     Some(n)
 }

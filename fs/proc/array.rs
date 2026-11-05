@@ -114,7 +114,7 @@ fn snap(pid: Pid) -> Option<Snap> {
         maj_flt: t.task.maj_flt.load(core::sync::atomic::Ordering::Relaxed),
         nice: t.task.se.nice(),
         policy: t.task.se.policy(),
-        rt_priority: t.task.se.rt_priority() as i32,
+        rt_priority: i32::from(t.task.se.rt_priority()),
         cpus: t.task.cpus_mask.snapshot(),
         cpu: t.task.cpu.load(core::sync::atomic::Ordering::Relaxed),
         exit_signal: t.exit_signal,
@@ -295,7 +295,7 @@ pub fn gen_status(pid: Pid) -> Vec<u8> {
     let _ = writeln!(o, " ");
     let _ = writeln!(o, "NStgid:\t{}\nNSpid:\t{}", s.tgid, s.pid);
     let _ = writeln!(o, "NSpgid:\t{}\nNSsid:\t{}", s.pgid, s.sid);
-    let _ = writeln!(o, "Kthread:\t{}", s.kthread as u8);
+    let _ = writeln!(o, "Kthread:\t{}", u8::from(s.kthread));
     if let Some(v) = task_vm(s.tid) {
         status_mem(&mut o, &v);
     }
@@ -310,7 +310,7 @@ pub fn gen_status(pid: Pid) -> Vec<u8> {
     for (k, v) in caps {
         let _ = writeln!(o, "{k}:\t{v:016x}");
     }
-    let _ = writeln!(o, "NoNewPrivs:\t{}", s.no_new_privs as u8);
+    let _ = writeln!(o, "NoNewPrivs:\t{}", u8::from(s.no_new_privs));
     let _ = writeln!(o, "Seccomp:\t{}\nSeccomp_filters:\t0", s.seccomp);
     let _ = writeln!(o, "Speculation_Store_Bypass:\tunknown");
     let _ = writeln!(o, "SpeculationIndirectBranch:\tunknown");
@@ -392,7 +392,7 @@ pub fn gen_stat(pid: Pid) -> Vec<u8> {
     let prio = if rt { -1 - s.rt_priority } else { 20 + s.nice };
     let flags = if s.kthread { PF_KTHREAD } else { 0 } | if s.exiting { PF_EXITING } else { 0 };
     let running = matches!(s.state, TaskState::Running | TaskState::Ready);
-    let wchan = (permitted && s.threads < 2 && !running) as u8;
+    let wchan = u8::from(permitted && s.threads < 2 && !running);
     let mut o = Out(Vec::new());
     let _ = write!(o, "{} (", s.pid);
     o.0.extend_from_slice(&comm(&s, false));

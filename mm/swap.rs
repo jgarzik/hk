@@ -457,7 +457,7 @@ fn parse_header(hdr: &[u8; PAGE_SIZE], size: u64) -> Result<u64, KernelError> {
     let info = unsafe {
         core::ptr::read_unaligned(hdr[SWAP_HEADER_INFO_OFFSET..].as_ptr() as *const SwapHeaderInfo)
     };
-    let max = info.last_page as u64 + 1;
+    let max = u64::from(info.last_page) + 1;
     if info.version != 1 || info.last_page == 0 || max > size {
         return Err(KernelError::InvalidArgument);
     }

@@ -41,7 +41,7 @@ pub fn keyctl_get_keyring_id(special_id: i32, create: bool) -> i64 {
     let (tid, uid, gid) = current_cred();
 
     match resolve_special_keyring(special_id, create, tid, uid, gid) {
-        Ok(keyring) => keyring.serial as i64,
+        Ok(keyring) => i64::from(keyring.serial),
         Err(e) => e,
     }
 }
@@ -437,7 +437,7 @@ pub fn keyctl_search(keyring_serial: i32, type_ptr: u64, desc_ptr: u64, dest_key
             let _ = keyring_link(&dest, &key);
         }
     }
-    key.serial as i64
+    i64::from(key.serial)
 }
 
 /// KEYCTL_READ - Read a key's payload

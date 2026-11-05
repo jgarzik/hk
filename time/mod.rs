@@ -57,7 +57,7 @@ impl Timespec {
 
     /// Convert to total nanoseconds
     pub fn to_nanos(&self) -> i128 {
-        self.sec as i128 * 1_000_000_000 + self.nsec as i128
+        i128::from(self.sec) * 1_000_000_000 + i128::from(self.nsec)
     }
 }
 
@@ -244,7 +244,7 @@ impl TimeKeeper {
         // Using fixed-point: ns = (cycles * mult) >> shift
         // Choose shift=32 for good precision
         let shift = 32u32;
-        let mult = ((1_000_000_000u128) << shift) / tsc_freq_hz as u128;
+        let mult = ((1_000_000_000u128) << shift) / u128::from(tsc_freq_hz);
 
         let now_cycles = read_tsc();
 
@@ -306,7 +306,7 @@ impl TimeKeeper {
         let shift = self.shift.load(Ordering::Relaxed);
 
         let delta_cycles = cycles_delta(now_cycles, cycle_base);
-        let delta_ns = ((delta_cycles as u128 * mult as u128) >> shift) as u64;
+        let delta_ns = ((u128::from(delta_cycles) * u128::from(mult)) >> shift) as u64;
 
         self.cycle_base.store(now_cycles, Ordering::Relaxed);
         self.mono_base_ns
@@ -355,14 +355,16 @@ impl TimeKeeper {
 
             // Calculate current time
             let delta_cycles = cycles_delta(now_cycles, cycle_base);
-            let delta_ns = ((delta_cycles as u128 * mult as u128) >> shift) as u64;
+            let delta_ns = ((u128::from(delta_cycles) * u128::from(mult)) >> shift) as u64;
             let mono_ns = mono_base.wrapping_add(delta_ns);
 
             let ns = match clock_id {
-                ClockId::Monotonic => mono_ns as i128,
-                ClockId::Realtime => mono_ns as i128 + realtime_offset as i128,
+                ClockId::Monotonic => i128::from(mono_ns),
+                ClockId::Realtime => i128::from(mono_ns) + i128::from(realtime_offset),
                 ClockId::Tai => {
-                    mono_ns as i128 + realtime_offset as i128 + tai as i128 * 1_000_000_000
+                    i128::from(mono_ns)
+                        + i128::from(realtime_offset)
+                        + i128::from(tai) * 1_000_000_000
                 }
             };
 
@@ -407,13 +409,13 @@ impl TimeKeeper {
         let shift = self.shift.load(Ordering::Relaxed);
 
         let delta_cycles = cycles_delta(now_cycles, cycle_base);
-        let delta_ns = ((delta_cycles as u128 * mult as u128) >> shift) as u64;
+        let delta_ns = ((u128::from(delta_cycles) * u128::from(mult)) >> shift) as u64;
         let mono_ns = mono_base.wrapping_add(delta_ns);
 
         // Calculate new offset: realtime = monotonic + offset
         // So offset = realtime - monotonic
         let new_time_ns = new_time.to_nanos();
-        let new_offset = new_time_ns - mono_ns as i128;
+        let new_offset = new_time_ns - i128::from(mono_ns);
 
         // Store new offset
         self.realtime_offset_ns
@@ -446,7 +448,7 @@ impl TimeKeeper {
         let read_tsc = self.get_read_cycles();
         let g = self.lock.lock();
         let now = self.read(ClockId::Realtime, read_tsc).to_nanos();
-        if !settod_valid(&Timespec::from_nanos(now + delta_ns as i128)) {
+        if !settod_valid(&Timespec::from_nanos(now + i128::from(delta_ns))) {
             return false;
         }
         self.write_begin();
@@ -569,7 +571,7 @@ pub fn realtime_ns() -> u64 {
     if ts.sec < 0 {
         return 0;
     }
-    timespec_to_ns(ts.sec, ts.nsec as i64)
+    timespec_to_ns(ts.sec, i64::from(ts.nsec))
 }
 
 /// Get current monotonic time in nanoseconds
@@ -578,5 +580,5 @@ pub fn realtime_ns() -> u64 {
 /// Suitable for process start times and precise timing measurements.
 pub fn monotonic_ns() -> u64 {
     let ts = TIMEKEEPER.read(ClockId::Monotonic, TIMEKEEPER.get_read_cycles());
-    timespec_to_ns(ts.sec, ts.nsec as i64)
+    timespec_to_ns(ts.sec, i64::from(ts.nsec))
 }

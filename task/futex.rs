@@ -297,7 +297,7 @@ fn futex_clock_ns(realtime: bool) -> u64 {
     let ts = TIMEKEEPER.read(clock, TIMEKEEPER.get_read_cycles());
     (ts.sec as u64)
         .saturating_mul(1_000_000_000)
-        .saturating_add(ts.nsec as u64)
+        .saturating_add(u64::from(ts.nsec))
 }
 
 /// Sleep interruptibly until `queued()` turns false (a waker dequeued us),
@@ -1203,7 +1203,7 @@ pub fn sys_futex_waitv(
     let entry_size = core::mem::size_of::<UserFutexWaitv>() as u64;
 
     for i in 0..nr_futexes {
-        let entry_ptr = waiters_ptr + (i as u64) * entry_size;
+        let entry_ptr = waiters_ptr + u64::from(i) * entry_size;
 
         // Read the futex_waitv struct from userspace
         let val = match read_user_u64(entry_ptr) {

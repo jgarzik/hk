@@ -112,7 +112,7 @@ impl NlSock {
             return Ok(OptOut::Bytes(b));
         }
         let f = Self::opt_flag(opt).ok_or(KernelError::NoProtocolOption)?;
-        Ok(OptOut::Int(self.has_flag(f) as i32))
+        Ok(OptOut::Int(i32::from(self.has_flag(f))))
     }
 
     fn arc(&self) -> Arc<NlSock> {

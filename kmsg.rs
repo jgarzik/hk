@@ -261,8 +261,8 @@ pub fn log_text(bytes: &[u8], panicking: bool) {
                 ..
             } = &mut *log;
             let (level, text) = match &line[..*line_len] {
-                [1, l @ b'0'..=b'7', rest @ ..] => ((l - b'0') as u16, rest),
-                t => (DEFAULT_LEVEL as u16, t),
+                [1, l @ b'0'..=b'7', rest @ ..] => (u16::from(l - b'0'), rest),
+                t => (u16::from(DEFAULT_LEVEL), t),
             };
             buf.push(level, *line_ts, text);
             *line_len = 0;
@@ -311,7 +311,7 @@ fn push_num(out: &mut Vec<u8>, mut n: u64, width: usize) {
 /// A record in /dev/kmsg form: `pri,seq,usec,-;text\n` (Linux
 /// info_print_ext_header + msg_print_ext_body)
 pub fn format_kmsg(r: &Rec<'_>, out: &mut Vec<u8>) {
-    push_num(out, r.pri as u64, 0);
+    push_num(out, u64::from(r.pri), 0);
     out.push(b',');
     push_num(out, r.seq, 0);
     out.push(b',');
@@ -331,7 +331,7 @@ pub fn format_kmsg(r: &Rec<'_>, out: &mut Vec<u8>) {
 /// A record in syslog(2) form: `<pri>[ssss.uuuuuu] text\n`
 fn format_syslog(r: &Rec<'_>, out: &mut Vec<u8>) {
     out.push(b'<');
-    push_num(out, r.pri as u64, 0);
+    push_num(out, u64::from(r.pri), 0);
     out.extend_from_slice(b">[");
     push_num(out, r.ts_ns / 1_000_000_000, 5);
     out.push(b'.');
@@ -358,7 +358,7 @@ fn ndigits(mut n: u64) -> usize {
 fn syslog_len(r: &Rec<'_>) -> usize {
     // '<' pri ">[" secs '.' usecs "] " text '\n'
     let secs = ndigits(r.ts_ns / 1_000_000_000).max(5);
-    1 + ndigits(r.pri as u64) + 2 + secs + 1 + 6 + 2 + r.text.len() + 1
+    1 + ndigits(u64::from(r.pri)) + 2 + secs + 1 + 6 + 2 + r.text.len() + 1
 }
 
 /// Longest formatted record: header text plus every byte escaped
@@ -632,7 +632,7 @@ impl crate::fs::FileOps for KmsgFileOps {
                 return Ok(buf.len());
             }
         }
-        let (mut fac, mut level, mut text) = (LOG_USER as u16, DEFAULT_LEVEL as u16, buf);
+        let (mut fac, mut level, mut text) = (u16::from(LOG_USER), u16::from(DEFAULT_LEVEL), buf);
         if let [b'<', rest @ ..] = buf
             && let Some(end) = rest.iter().position(|&c| c == b'>')
             && end > 0
@@ -645,7 +645,7 @@ impl crate::fs::FileOps for KmsgFileOps {
             level = (n & 7) as u16;
             fac = ((n & 0x3f8) >> 3) as u16;
             if fac == 0 {
-                fac = LOG_USER as u16;
+                fac = u16::from(LOG_USER);
             }
             text = &rest[end + 1..];
         }

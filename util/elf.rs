@@ -474,7 +474,7 @@ impl ElfExecutable {
                 return;
             };
             for r in chunk.as_chunks::<RELA_SIZE>().0 {
-                if u64_at(r, 8) & 0xffff_ffff == R_RELATIVE as u64 {
+                if u64_at(r, 8) & 0xffff_ffff == u64::from(R_RELATIVE) {
                     f(ElfRelocation {
                         offset: u64_at(r, 0),
                         addend: u64_at(r, 16) as i64,

@@ -2,6 +2,11 @@
 //!
 //! Mirrors arch/x86/include/uapi/asm/ in Linux.
 
+/// `st_nlink` from an inode link count; the field is u64 on this arch
+pub fn st_nlink(n: u32) -> u64 {
+    u64::from(n)
+}
+
 /// `struct stat` (arch/x86/include/uapi/asm/stat.h, x86_64 layout)
 #[repr(C)]
 #[derive(Clone, Copy, Default)]

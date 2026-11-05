@@ -57,7 +57,7 @@ impl SwapEntry {
     #[inline]
     pub fn new(swap_type: u8, offset: u64) -> Self {
         debug_assert!((swap_type as usize) < MAX_SWAPFILES);
-        let entry = (offset << Self::OFFSET_SHIFT) | (swap_type as u64 & Self::TYPE_MASK);
+        let entry = (offset << Self::OFFSET_SHIFT) | (u64::from(swap_type) & Self::TYPE_MASK);
         Self(entry)
     }
 

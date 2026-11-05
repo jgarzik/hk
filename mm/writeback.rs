@@ -207,7 +207,7 @@ pub static WB_CTLS: &[crate::sysctl::Ctl] = &[
         mode: 0o644,
         show: || alloc::vec![EXPIRE_CS.load(Ordering::Relaxed) as i64],
         store: |v| {
-            crate::sysctl::range(v[0], 0, i32::MAX as i64)?;
+            crate::sysctl::range(v[0], 0, i64::from(i32::MAX))?;
             EXPIRE_CS.store(v[0] as u64, Ordering::Relaxed);
             Ok(())
         },
@@ -218,7 +218,7 @@ pub static WB_CTLS: &[crate::sysctl::Ctl] = &[
         mode: 0o644,
         show: || alloc::vec![WRITEBACK_CS.load(Ordering::Relaxed) as i64],
         store: |v| {
-            crate::sysctl::range(v[0], 0, i32::MAX as i64)?;
+            crate::sysctl::range(v[0], 0, i64::from(i32::MAX))?;
             WRITEBACK_CS.store(v[0] as u64, Ordering::Relaxed);
             Ok(())
         },

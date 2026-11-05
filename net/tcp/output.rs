@@ -49,7 +49,7 @@ impl TcpCb {
             ack: if synack { self.rcv_nxt } else { 0 },
             flags: flags::SYN | if synack { flags::ACK } else { 0 },
             wnd: self.syn_window(),
-            mss: Some(self.adv_mss.min(u16::MAX as u32) as u16),
+            mss: Some(self.adv_mss.min(u32::from(u16::MAX)) as u16),
             ws: self.wscale_ok.then_some(self.rcv_wscale),
             ts,
             data: Vec::new(),
@@ -226,7 +226,7 @@ impl TcpCb {
         if fin {
             fl |= flags::FIN;
         }
-        let next = seq.wrapping_add(n + fin as u32);
+        let next = seq.wrapping_add(n + u32::from(fin));
         let new = after(next, self.snd_max);
         if self.snd_nxt == self.snd_max && self.rtt_seq.is_none() {
             self.rtt_seq = Some((next, now));
@@ -240,9 +240,9 @@ impl TcpCb {
         }
         if before(seq, self.snd_max) {
             self.stats.total_retrans += 1;
-            self.stats.bytes_retrans += n as u64;
+            self.stats.bytes_retrans += u64::from(n);
         }
-        self.stats.bytes_sent += n as u64;
+        self.stats.bytes_sent += u64::from(n);
         self.snd_nxt = next;
         if new {
             self.snd_max = next;
@@ -302,7 +302,7 @@ impl TcpCb {
     /// (zero window, or a partial segment held by cork/Nagle): arm the
     /// probe timer (Linux tcp_check_probe_timer)
     pub(super) fn check_persist(&mut self, now: u64) {
-        let pending = self.snd_nxt != self.data_end().wrapping_add(self.fin_queued as u32);
+        let pending = self.snd_nxt != self.data_end().wrapping_add(u32::from(self.fin_queued));
         if self.may_send() && pending && self.snd_una == self.snd_max && self.tmr.is_none() {
             let t = self.rto_cur().max(RTO_MIN);
             self.tmr = Some((Tmr::Probe, now + t));
@@ -338,13 +338,18 @@ pub fn reset_for(s: &SegIn) -> Option<Seg> {
 
 /// Internet checksum of a TCP segment with the IPv4 pseudo header
 pub fn checksum(saddr: Ipv4Addr, daddr: Ipv4Addr, seg: &[u8]) -> u16 {
-    let mut sum = ipv4::pseudo_header_checksum(saddr, daddr, IPPROTO_TCP, seg.len() as u16) as u64;
+    let mut sum = u64::from(ipv4::pseudo_header_checksum(
+        saddr,
+        daddr,
+        IPPROTO_TCP,
+        seg.len() as u16,
+    ));
     let (words, rest) = seg.as_chunks::<2>();
     for w in words {
-        sum += u16::from_be_bytes(*w) as u64;
+        sum += u64::from(u16::from_be_bytes(*w));
     }
     if let [b] = rest {
-        sum += (*b as u64) << 8;
+        sum += u64::from(*b) << 8;
     }
     while sum >> 16 != 0 {
         sum = (sum & 0xffff) + (sum >> 16);

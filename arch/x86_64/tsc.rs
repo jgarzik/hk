@@ -65,7 +65,7 @@ impl TscClockSource {
                 options(nostack, preserves_flags)
             );
         }
-        ((high as u64) << 32) | (low as u64)
+        (u64::from(high) << 32) | u64::from(low)
     }
 }
 

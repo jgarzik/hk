@@ -145,7 +145,7 @@ pub fn init_cpu(bsp: bool) {
         let has_avx = ecx & (1 << 28) != 0;
         if has_xsave {
             let (supported_lo, _, _, supported_hi) = cpuid(0xd, 0);
-            let supported = ((supported_hi as u64) << 32) | supported_lo as u64;
+            let supported = (u64::from(supported_hi) << 32) | u64::from(supported_lo);
             let mut xcr0 = XFEATURE_X87 | XFEATURE_SSE;
             if has_avx && supported & XFEATURE_AVX != 0 {
                 xcr0 |= XFEATURE_AVX;

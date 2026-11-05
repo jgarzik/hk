@@ -176,7 +176,7 @@ fn selftest_thread(_arg: usize) {
             || icmp::ICMP_IN_ECHO_REPS.load(Ordering::Acquire) > before,
             200,
         );
-        check("icmp_lo_reply", left > 0, dst.to_u32() as u64);
+        check("icmp_lo_reply", left > 0, u64::from(dst.to_u32()));
     }
 
     // 6. mremap's move allocates first: ENOMEM loses no page

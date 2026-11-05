@@ -24,10 +24,10 @@ impl PortIoConfigAccess {
     #[inline]
     fn encode_addr(bus: u8, dev: u8, func: u8, offset: u8) -> u32 {
         0x8000_0000
-            | ((bus as u32) << 16)
-            | ((dev as u32) << 11)
-            | ((func as u32) << 8)
-            | ((offset as u32) & 0xFC)
+            | (u32::from(bus) << 16)
+            | (u32::from(dev) << 11)
+            | (u32::from(func) << 8)
+            | (u32::from(offset) & 0xFC)
     }
 }
 
@@ -40,7 +40,7 @@ impl PortIoConfigAccess {
     /// CFC + the offset's low bits for a byte or word
     fn select(bus: u8, dev: u8, func: u8, offset: u8) -> u16 {
         crate::arch::outl(PCI_CONFIG_ADDR, Self::encode_addr(bus, dev, func, offset));
-        PCI_CONFIG_DATA + (offset & 3) as u16
+        PCI_CONFIG_DATA + u16::from(offset & 3)
     }
 }
 

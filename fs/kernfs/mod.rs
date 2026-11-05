@@ -171,7 +171,7 @@ pub struct KNode {
 fn name_hash(name: &[u8]) -> u32 {
     let mut h: u32 = 0x811c_9dc5;
     for &b in name {
-        h = (h ^ b as u32).wrapping_mul(0x0100_0193);
+        h = (h ^ u32::from(b)).wrapping_mul(0x0100_0193);
     }
     let h = h & 0x7fff_ffff;
     if h < 2 {

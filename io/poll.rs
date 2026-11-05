@@ -337,7 +337,7 @@ impl<'a> PollTable<'a> {
     /// Set the event key for the next poll_wait call
     pub fn set_key(&mut self, events: u16) {
         // Include error/hangup events that are always monitored
-        self.key = (events | POLLERR | POLLHUP) as u32;
+        self.key = u32::from(events | POLLERR | POLLHUP);
     }
 }
 

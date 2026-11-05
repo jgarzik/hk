@@ -160,7 +160,7 @@ fn do_poll_internal(fds: u64, nfds: u32, deadline: Deadline) -> i64 {
     use crate::uaccess::{copy_from_user, copy_to_user};
 
     // As many as the caller may have open (Linux do_sys_poll)
-    if nfds as u64 > crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_NOFILE) {
+    if u64::from(nfds) > crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_NOFILE) {
         return KernelError::InvalidArgument.sysret();
     }
 
@@ -565,7 +565,7 @@ fn do_select_internal(
             return e.sysret();
         }
     }
-    ready_count as i64
+    i64::from(ready_count)
 }
 
 /// An fd_set of `n` bits from the user, whole words (Linux get_fd_set,

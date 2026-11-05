@@ -172,7 +172,7 @@ impl NumaTopology {
     /// Get the NUMA node for a given CPU
     pub fn cpu_to_node(&self, cpu: u32) -> u32 {
         if (cpu as usize) < NR_CPUS {
-            self.cpu_to_node[cpu as usize] as u32
+            u32::from(self.cpu_to_node[cpu as usize])
         } else {
             0 // Default to node 0
         }
@@ -260,7 +260,7 @@ impl NumaTopology {
         self.hwid_node[..self.nr_hwid]
             .iter()
             .find(|e| e.0 == hwid)
-            .map(|e| e.1 as u32)
+            .map(|e| u32::from(e.1))
             .filter(|&n| self.node_online(n))
             .unwrap_or(self.node_online_mask.trailing_zeros() % 64)
     }

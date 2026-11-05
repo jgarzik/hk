@@ -233,7 +233,7 @@ pub trait PciConfigAccess: Send + Sync {
         let shift = (offset & 2) * 8;
         let mask = !(0xFFFF << shift);
         let old = self.read32(bus, dev, func, offset & 0xFC);
-        let new = (old & mask) | ((val as u32) << shift);
+        let new = (old & mask) | (u32::from(val) << shift);
         self.write32(bus, dev, func, offset & 0xFC, new);
     }
 
@@ -242,7 +242,7 @@ pub trait PciConfigAccess: Send + Sync {
         let shift = (offset & 3) * 8;
         let mask = !(0xFF << shift);
         let old = self.read32(bus, dev, func, offset & 0xFC);
-        let new = (old & mask) | ((val as u32) << shift);
+        let new = (old & mask) | (u32::from(val) << shift);
         self.write32(bus, dev, func, offset & 0xFC, new);
     }
 }
@@ -465,7 +465,7 @@ impl PciDeviceHeader {
 /// hardwired to zero, so the size is not the mask's complement.
 fn bar_size_from_mask(io: bool, lo: u32, hi: u32) -> u64 {
     let lo = if io { lo & !0x3 } else { lo & !0xF };
-    let mask = (hi as u64) << 32 | lo as u64;
+    let mask = u64::from(hi) << 32 | u64::from(lo);
     mask.isolate_lowest_one()
 }
 
@@ -587,22 +587,22 @@ impl PciDevice {
         // Check if I/O or memory BAR
         if (bar & 1) != 0 {
             // I/O BAR - return I/O port address
-            Some((bar & !0x3) as u64)
+            Some(u64::from(bar & !0x3))
         } else {
             // Memory BAR
             let bar_type = (bar >> 1) & 0x3;
             match bar_type {
                 0 => {
                     // 32-bit BAR
-                    Some((bar & !0xF) as u64)
+                    Some(u64::from(bar & !0xF))
                 }
                 2 => {
                     // 64-bit BAR - need to read next BAR too
                     if bar_index >= 5 {
                         return None;
                     }
-                    let high = self.header.bar[bar_index + 1] as u64;
-                    Some((high << 32) | (bar & !0xF) as u64)
+                    let high = u64::from(self.header.bar[bar_index + 1]);
+                    Some((high << 32) | u64::from(bar & !0xF))
                 }
                 _ => None,
             }
@@ -779,9 +779,9 @@ impl PciDevice {
     /// Class code, subclass and programming interface as one 24-bit value
     /// (Linux pci_dev.class)
     pub fn class24(&self) -> u32 {
-        (self.header.class_code as u32) << 16
-            | (self.header.subclass as u32) << 8
-            | self.header.prog_if as u32
+        u32::from(self.header.class_code) << 16
+            | u32::from(self.header.subclass) << 8
+            | u32::from(self.header.prog_if)
     }
 
     /// Put the function in D3hot, if it has power management (Linux

@@ -97,7 +97,11 @@ struct Autoprobe(&'static BusType);
 
 impl Attr for Autoprobe {
     fn show(&self, out: &mut SysBuf) -> Result<(), KernelError> {
-        let _ = writeln!(out, "{}", self.0.autoprobe.load(Ordering::Acquire) as u8);
+        let _ = writeln!(
+            out,
+            "{}",
+            u8::from(self.0.autoprobe.load(Ordering::Acquire))
+        );
         Ok(())
     }
 

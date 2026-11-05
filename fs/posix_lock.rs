@@ -299,7 +299,7 @@ impl InodeLocks {
 /// Returns (start, end) where end is exclusive. EOF is represented as u64::MAX.
 fn resolve_range(flock: &Flock, file: &File) -> Result<(u64, u64), KernelError> {
     let inode = file.get_inode().ok_or(KernelError::BadFd)?;
-    let base = match flock.l_whence as i32 {
+    let base = match i32::from(flock.l_whence) {
         seek::SEEK_SET => 0i64,
         seek::SEEK_CUR => file.get_pos() as i64,
         seek::SEEK_END => inode.get_size() as i64,

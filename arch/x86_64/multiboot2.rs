@@ -114,8 +114,8 @@ pub fn get_cmdline() -> Option<&'static str> {
 
 /// Module tag fields: (physical start, physical end, cmdline)
 fn module(tag: &'static [u8]) -> Option<(u64, u64, Option<&'static str>)> {
-    let start = le32(tag, 8)? as u64;
-    let end = le32(tag, 12)? as u64;
+    let start = u64::from(le32(tag, 8)?);
+    let end = u64::from(le32(tag, 12)?);
     Some((start, end, tag.get(16..).and_then(cstr)))
 }
 
@@ -177,7 +177,7 @@ pub fn get_framebuffer() -> Option<crate::gfx::FramebufferInfo> {
     } else {
         return None;
     };
-    let size = (pitch as u64) * (height as u64);
+    let size = u64::from(pitch) * u64::from(height);
     Some(FramebufferInfo::new(
         addr, size, width, height, pitch, format,
     ))

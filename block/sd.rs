@@ -202,7 +202,7 @@ impl ScsiDisk {
     /// Every command 16-byte: the disk passes READ(10)'s 32-bit LBA
     /// (Linux use_16_for_rw)
     fn use_16(&self) -> bool {
-        self.capacity_sectors > u32::MAX as u64
+        self.capacity_sectors > u64::from(u32::MAX)
     }
 
     /// Get sector size
@@ -212,7 +212,7 @@ impl ScsiDisk {
 
     /// Get capacity in bytes
     pub fn capacity_bytes(&self) -> u64 {
-        self.capacity_sectors * self.sector_size as u64
+        self.capacity_sectors * u64::from(self.sector_size)
     }
 
     /// Read sectors from disk
@@ -289,7 +289,7 @@ pub struct ScsiDiskDriver {
 impl ScsiDiskDriver {
     /// Run one bio; segments are consecutive on the disk
     fn do_bio(&self, bio: &Bio) -> Result<(), KernelError> {
-        let ss = self.disk.sector_size() as u64;
+        let ss = u64::from(self.disk.sector_size());
         if bio.op == BioOp::Flush {
             return self.disk.sync_cache().map_err(|_| KernelError::Io);
         }

@@ -125,7 +125,7 @@ pub fn dispatch_irq(irq: u8) -> bool {
     let mut handled = false;
     for entry in &line.handlers {
         crate::sync::lockdep::irq_enter();
-        handled |= (entry.handler)(irq as u32, entry.data);
+        handled |= (entry.handler)(u32::from(irq), entry.data);
         crate::sync::lockdep::irq_exit();
     }
     // A line without handlers is masked already (spurious IRQ7/15)
@@ -135,7 +135,7 @@ pub fn dispatch_irq(irq: u8) -> bool {
     }
     drop(table);
     if bad {
-        crate::irq::report_nobody_cared(irq as u32);
+        crate::irq::report_nobody_cared(u32::from(irq));
     }
     handled
 }
@@ -146,5 +146,5 @@ pub fn pci_intx_irq(_bus: u8, _device: u8, _function: u8, pin: u8, line: u8) -> 
     if pin == 0 || line >= NR_IRQS as u8 {
         return None;
     }
-    Some(line as u32)
+    Some(u32::from(line))
 }

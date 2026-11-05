@@ -257,10 +257,8 @@ pub fn extract_initramfs() -> Option<InitramfsInfo> {
     let end = chosen.property("linux,initrd-end")?;
 
     // Try 64-bit first, fall back to 32-bit
-    let start_addr = start
-        .as_u64()
-        .or_else(|| start.as_u32().map(|v| v as u64))?;
-    let end_addr = end.as_u64().or_else(|| end.as_u32().map(|v| v as u64))?;
+    let start_addr = start.as_u64().or_else(|| start.as_u32().map(u64::from))?;
+    let end_addr = end.as_u64().or_else(|| end.as_u32().map(u64::from))?;
 
     // Sanity check
     if end_addr <= start_addr || (end_addr - start_addr) > 1024 * 1024 * 1024 {
@@ -436,7 +434,7 @@ pub fn init_numa_topology() -> Result<bool, &'static str> {
             // Its MPIDR affinity, from reg (one or two cells)
             let hwid = match cpu_child.property("reg") {
                 Some(reg) if reg.data().len() >= 8 => reg.as_u64().unwrap_or(0),
-                Some(reg) => reg.as_u32().unwrap_or(0) as u64,
+                Some(reg) => u64::from(reg.as_u32().unwrap_or(0)),
                 None => continue,
             };
             let hwid = hwid & super::cpu::MPIDR_HWID_BITMASK;

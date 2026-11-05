@@ -162,7 +162,7 @@ fn map_acpi_table(phys_addr: u64) -> Result<*mut u8, &'static str> {
         iounmap(ptr, header_size);
 
         // Now map the full table
-        ioremap(phys_addr, length as u64).map_err(|_| "Failed to ioremap ACPI table")
+        ioremap(phys_addr, u64::from(length)).map_err(|_| "Failed to ioremap ACPI table")
     }
 }
 
@@ -178,10 +178,10 @@ pub fn parse_acpi() -> Result<AcpiInfo, &'static str> {
             if (*rsdp2).xsdt_address != 0 {
                 ((*rsdp2).xsdt_address, true)
             } else {
-                ((*rsdp).rsdt_address as u64, false)
+                (u64::from((*rsdp).rsdt_address), false)
             }
         } else {
-            ((*rsdp).rsdt_address as u64, false)
+            (u64::from((*rsdp).rsdt_address), false)
         }
     };
 
@@ -336,7 +336,7 @@ fn for_each_table(
             let entry_phys = if is_xsdt {
                 core::ptr::read_unaligned(entry_ptr as *const u64)
             } else {
-                core::ptr::read_unaligned(entry_ptr as *const u32) as u64
+                u64::from(core::ptr::read_unaligned(entry_ptr as *const u32))
             };
 
             if table_signature(entry_phys).as_ref() == Some(signature) && !f(entry_phys) {
@@ -377,7 +377,7 @@ fn parse_madt_mapped(madt_phys: u64) -> Result<AcpiInfo, &'static str> {
         // Read fields using offsets (packed struct)
         // MadtHeader layout: SdtHeader (36 bytes) + lapic_address (4) + flags (4)
         let lapic_addr_ptr = madt_ptr.add(36) as *const u32;
-        let lapic_base = core::ptr::read_unaligned(lapic_addr_ptr) as u64;
+        let lapic_base = u64::from(core::ptr::read_unaligned(lapic_addr_ptr));
 
         let mut info = AcpiInfo {
             lapic_base,
@@ -413,7 +413,7 @@ fn parse_madt_mapped(madt_phys: u64) -> Result<AcpiInfo, &'static str> {
 
                     if enabled {
                         has_lapic_cpus = true;
-                        let apic_id = core::ptr::read_unaligned(ptr.add(3)) as u32;
+                        let apic_id = u32::from(core::ptr::read_unaligned(ptr.add(3)));
                         info.cpus.push(CpuInfo {
                             apic_id,
                             enabled,
@@ -575,7 +575,7 @@ fn parse_fadt_mapped(fadt_phys: u64) -> Result<(PowerInfo, u64), &'static str> {
         acpi_enable: t.u8(fadt::ACPI_ENABLE),
     };
     let dsdt = match t.u64(fadt::X_DSDT) {
-        0 => t.u32(fadt::DSDT) as u64,
+        0 => u64::from(t.u32(fadt::DSDT)),
         x => x,
     };
 
@@ -675,10 +675,10 @@ pub fn init_numa_topology() -> Result<bool, &'static str> {
             if (*rsdp2).xsdt_address != 0 {
                 ((*rsdp2).xsdt_address, true)
             } else {
-                ((*rsdp).rsdt_address as u64, false)
+                (u64::from((*rsdp).rsdt_address), false)
             }
         } else {
-            ((*rsdp).rsdt_address as u64, false)
+            (u64::from((*rsdp).rsdt_address), false)
         }
     };
 
@@ -760,10 +760,10 @@ fn parse_srat_mapped(srat_phys: u64) -> Result<(), &'static str> {
                 // 16: length_lo (4), 20: length_hi (4), 24: reserved (4)
                 // 28: flags (4), 32: reserved (8)
                 let prox_domain_lo = core::ptr::read_unaligned(ptr.add(2) as *const u32);
-                let base_lo = core::ptr::read_unaligned(ptr.add(8) as *const u32) as u64;
-                let base_hi = core::ptr::read_unaligned(ptr.add(12) as *const u32) as u64;
-                let len_lo = core::ptr::read_unaligned(ptr.add(16) as *const u32) as u64;
-                let len_hi = core::ptr::read_unaligned(ptr.add(20) as *const u32) as u64;
+                let base_lo = u64::from(core::ptr::read_unaligned(ptr.add(8) as *const u32));
+                let base_hi = u64::from(core::ptr::read_unaligned(ptr.add(12) as *const u32));
+                let len_lo = u64::from(core::ptr::read_unaligned(ptr.add(16) as *const u32));
+                let len_hi = u64::from(core::ptr::read_unaligned(ptr.add(20) as *const u32));
                 let flags = core::ptr::read_unaligned(ptr.add(28) as *const u32);
 
                 // Bit 0: Enabled
@@ -818,17 +818,17 @@ fn parse_srat_mapped(srat_phys: u64) -> Result<(), &'static str> {
                     // 0: type (1), 1: length (1), 2: proximity_domain_lo (1)
                     // 3: apic_id (1), 4: flags (4), 8: sapic_eid (1)
                     // 9: proximity_domain_hi (3), 12: clock_domain (4)
-                    let prox_domain_lo = core::ptr::read_unaligned(ptr.add(2)) as u32;
-                    let apic_id = core::ptr::read_unaligned(ptr.add(3)) as u32;
+                    let prox_domain_lo = u32::from(core::ptr::read_unaligned(ptr.add(2)));
+                    let apic_id = u32::from(core::ptr::read_unaligned(ptr.add(3)));
                     let flags = core::ptr::read_unaligned(ptr.add(4) as *const u32);
                     let prox_hi_bytes: [u8; 3] = [
                         core::ptr::read_unaligned(ptr.add(9)),
                         core::ptr::read_unaligned(ptr.add(10)),
                         core::ptr::read_unaligned(ptr.add(11)),
                     ];
-                    let prox_domain_hi = (prox_hi_bytes[0] as u32)
-                        | ((prox_hi_bytes[1] as u32) << 8)
-                        | ((prox_hi_bytes[2] as u32) << 16);
+                    let prox_domain_hi = u32::from(prox_hi_bytes[0])
+                        | (u32::from(prox_hi_bytes[1]) << 8)
+                        | (u32::from(prox_hi_bytes[2]) << 16);
 
                     let enabled = (flags & 0x1) != 0;
 
@@ -836,7 +836,7 @@ fn parse_srat_mapped(srat_phys: u64) -> Result<(), &'static str> {
                         let node_id = (prox_domain_lo | (prox_domain_hi << 8)) as usize;
                         // By APIC id: the logical CPU joins at bring-up
                         if node_id < MAX_NUMA_NODES {
-                            topology.set_hwid_node(apic_id as u64, node_id as u32);
+                            topology.set_hwid_node(u64::from(apic_id), node_id as u32);
                         }
                     }
                 }
@@ -856,7 +856,7 @@ fn parse_srat_mapped(srat_phys: u64) -> Result<(), &'static str> {
                         let node_id = prox_domain as usize;
                         // By x2APIC id: the logical CPU joins at bring-up
                         if node_id < MAX_NUMA_NODES {
-                            topology.set_hwid_node(x2apic_id as u64, node_id as u32);
+                            topology.set_hwid_node(u64::from(x2apic_id), node_id as u32);
                         }
                     }
                 }

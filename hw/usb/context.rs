@@ -52,27 +52,27 @@ impl SlotContext {
 
     /// Set Speed (4 bits: 1=Full, 2=Low, 3=High, 4=Super, 5=SuperPlus)
     pub fn set_speed(&mut self, speed: u8) {
-        self.dword0 = (self.dword0 & !(0xF << 20)) | (((speed as u32) & 0xF) << 20);
+        self.dword0 = (self.dword0 & !(0xF << 20)) | ((u32::from(speed) & 0xF) << 20);
     }
 
     /// Set Context Entries (5 bits) - indicates highest valid endpoint context
     pub fn set_context_entries(&mut self, entries: u8) {
-        self.dword0 = (self.dword0 & !(0x1F << 27)) | (((entries as u32) & 0x1F) << 27);
+        self.dword0 = (self.dword0 & !(0x1F << 27)) | ((u32::from(entries) & 0x1F) << 27);
     }
 
     /// Set Root Hub Port Number (8 bits)
     pub fn set_root_hub_port(&mut self, port: u8) {
-        self.dword1 = (self.dword1 & !(0xFF << 16)) | (((port as u32) & 0xFF) << 16);
+        self.dword1 = (self.dword1 & !(0xFF << 16)) | ((u32::from(port) & 0xFF) << 16);
     }
 
     /// Set Max Exit Latency (16 bits)
     pub fn set_max_exit_latency(&mut self, latency: u16) {
-        self.dword1 = (self.dword1 & !0xFFFF) | (latency as u32);
+        self.dword1 = (self.dword1 & !0xFFFF) | u32::from(latency);
     }
 
     /// Set Interrupter Target (10 bits)
     pub fn set_interrupter_target(&mut self, target: u16) {
-        self.dword2 = (self.dword2 & !(0x3FF << 22)) | (((target as u32) & 0x3FF) << 22);
+        self.dword2 = (self.dword2 & !(0x3FF << 22)) | ((u32::from(target) & 0x3FF) << 22);
     }
 
     /// Get USB Device Address
@@ -147,7 +147,7 @@ impl EndpointContext {
 
     /// Set Endpoint Type (3 bits)
     pub fn set_ep_type(&mut self, ep_type: u8) {
-        self.dword1 = (self.dword1 & !(0x7 << 3)) | (((ep_type as u32) & 0x7) << 3);
+        self.dword1 = (self.dword1 & !(0x7 << 3)) | ((u32::from(ep_type) & 0x7) << 3);
     }
 
     /// Get Endpoint Type
@@ -157,7 +157,7 @@ impl EndpointContext {
 
     /// Set Max Packet Size (16 bits)
     pub fn set_max_packet_size(&mut self, size: u16) {
-        self.dword1 = (self.dword1 & !0xFFFF0000) | ((size as u32) << 16);
+        self.dword1 = (self.dword1 & !0xFFFF0000) | (u32::from(size) << 16);
     }
 
     /// Get Max Packet Size
@@ -167,17 +167,17 @@ impl EndpointContext {
 
     /// Set Max Burst Size (8 bits) - for USB 3.0 SuperSpeed
     pub fn set_max_burst_size(&mut self, burst: u8) {
-        self.dword1 = (self.dword1 & !(0xFF << 8)) | (((burst as u32) & 0xFF) << 8);
+        self.dword1 = (self.dword1 & !(0xFF << 8)) | ((u32::from(burst) & 0xFF) << 8);
     }
 
     /// Set CErr (Error Count, 2 bits) - usually 3 for bulk/control
     pub fn set_cerr(&mut self, cerr: u8) {
-        self.dword1 = (self.dword1 & !(0x3 << 1)) | (((cerr as u32) & 0x3) << 1);
+        self.dword1 = (self.dword1 & !(0x3 << 1)) | ((u32::from(cerr) & 0x3) << 1);
     }
 
     /// Set Interval (8 bits) - for interrupt/isoch endpoints
     pub fn set_interval(&mut self, interval: u8) {
-        self.dword0 = (self.dword0 & !(0xFF << 16)) | (((interval as u32) & 0xFF) << 16);
+        self.dword0 = (self.dword0 & !(0xFF << 16)) | ((u32::from(interval) & 0xFF) << 16);
     }
 
     /// Set Transfer Ring Dequeue Pointer (64-bit, 16-byte aligned)
@@ -191,7 +191,7 @@ impl EndpointContext {
 
     /// Get Transfer Ring Dequeue Pointer
     pub fn get_tr_dequeue_ptr(&self) -> u64 {
-        ((self.tr_dequeue_hi as u64) << 32) | (self.tr_dequeue_lo as u64 & !0xF)
+        (u64::from(self.tr_dequeue_hi) << 32) | (u64::from(self.tr_dequeue_lo) & !0xF)
     }
 
     /// Get Dequeue Cycle State
@@ -201,7 +201,7 @@ impl EndpointContext {
 
     /// Set Average TRB Length (16 bits) - used for bandwidth calculations
     pub fn set_average_trb_length(&mut self, len: u16) {
-        self.dword4 = (self.dword4 & !0xFFFF) | (len as u32);
+        self.dword4 = (self.dword4 & !0xFFFF) | u32::from(len);
     }
 
     /// Get Endpoint State

@@ -80,7 +80,7 @@ fn hcc_dma_mask(params1: u32) -> u64 {
     if params1 & 1 != 0 {
         u64::MAX
     } else {
-        u32::MAX as u64
+        u64::from(u32::MAX)
     }
 }
 
@@ -388,7 +388,7 @@ impl Trb {
     }
 
     fn set_type(&mut self, trb_type: u8) {
-        self.control = (self.control & !0xFC00) | ((trb_type as u32) << 10);
+        self.control = (self.control & !0xFC00) | (u32::from(trb_type) << 10);
     }
 
     fn get_type(&self) -> u8 {
@@ -715,13 +715,13 @@ impl XhciController {
 
     /// Read port register
     fn read_port(&self, port: u8, offset: usize) -> u32 {
-        let port_offset = self.port_regs + ((port as u64 - 1) * 0x10);
+        let port_offset = self.port_regs + ((u64::from(port) - 1) * 0x10);
         unsafe { read_volatile((port_offset + offset as u64) as *const u32) }
     }
 
     /// Write port register
     fn write_port(&self, port: u8, offset: usize, value: u32) {
-        let port_offset = self.port_regs + ((port as u64 - 1) * 0x10);
+        let port_offset = self.port_regs + ((u64::from(port) - 1) * 0x10);
         unsafe {
             write_volatile((port_offset + offset as u64) as *mut u32, value);
         }
@@ -735,9 +735,9 @@ impl XhciController {
     fn ring_doorbell(&self, slot: u8, target: u8) {
         // Write barrier to ensure all TRB writes are visible to device
         fence(Ordering::Release);
-        let db_offset = self.db_regs + (slot as u64 * 4);
+        let db_offset = self.db_regs + (u64::from(slot) * 4);
         unsafe {
-            write_volatile(db_offset as *mut u32, target as u32);
+            write_volatile(db_offset as *mut u32, u32::from(target));
         }
     }
 
@@ -780,7 +780,7 @@ impl XhciController {
         // frame_alloc still used for device context allocations below
 
         // Read capability registers
-        let caplength = (self.read_cap(0) & 0xFF) as u64;
+        let caplength = u64::from(self.read_cap(0) & 0xFF);
         let hciversion = self.read_cap(0) >> 16;
         self.hci_version = hciversion as u16;
         let hcsparams1 = self.read_cap(0x04);
@@ -798,8 +798,8 @@ impl XhciController {
 
         // Calculate register offsets
         self.op_regs = self.mmio_base + caplength;
-        self.db_regs = self.mmio_base + (dboff as u64);
-        self.rt_regs = self.mmio_base + (rtsoff as u64);
+        self.db_regs = self.mmio_base + u64::from(dboff);
+        self.rt_regs = self.mmio_base + u64::from(rtsoff);
         self.port_regs = self.op_regs + 0x400;
 
         printkln!(
@@ -942,7 +942,7 @@ impl XhciController {
     /// Configure the controller
     fn configure(&mut self) -> Result<(), UsbError> {
         // Set max device slots
-        self.write_op(0x38, self.max_slots as u32);
+        self.write_op(0x38, u32::from(self.max_slots));
 
         // Set DCBAAP
         self.write_op(0x30, (self.dcbaa_phys & 0xFFFF_FFFF) as u32);
@@ -1187,7 +1187,7 @@ impl XhciController {
         let mut trb = Trb::new();
         trb.parameter = input_ctx.dma_addr();
         trb.set_type(trb_type::ADDRESS_DEVICE);
-        trb.control |= (slot_id as u32) << 24; // Slot ID in bits 31:24
+        trb.control |= u32::from(slot_id) << 24; // Slot ID in bits 31:24
 
         let trb_addr = cmd_ring.enqueue(trb);
         self.ring_doorbell(0, 0); // Host controller doorbell
@@ -1487,7 +1487,7 @@ impl XhciController {
             return Ok(());
         }
         let d = self.get_descriptor(slot_id, descriptor_type::DEVICE, 8)?;
-        let mps = *d.get(7).ok_or(UsbError::BufferError)? as u16;
+        let mps = u16::from(*d.get(7).ok_or(UsbError::BufferError)?);
         if mps == speed.default_max_packet_size() {
             return Ok(());
         }
@@ -1904,8 +1904,8 @@ impl XhciController {
 
             let mut trb = Trb::new();
             trb.set_type(trb_type::STOP_ENDPOINT);
-            trb.control |= (slot_id as u32) << 24; // Slot ID in bits 31:24
-            trb.control |= (dci as u32) << 16; // Endpoint ID in bits 20:16
+            trb.control |= u32::from(slot_id) << 24; // Slot ID in bits 31:24
+            trb.control |= u32::from(dci) << 16; // Endpoint ID in bits 20:16
 
             let trb_addr = cmd_ring.enqueue(trb);
             self.ring_doorbell(0, 0);
@@ -1930,7 +1930,7 @@ impl XhciController {
 
         let mut trb = Trb::new();
         trb.set_type(trb_type::DISABLE_SLOT);
-        trb.control |= (slot_id as u32) << 24; // Slot ID in bits 31:24
+        trb.control |= u32::from(slot_id) << 24; // Slot ID in bits 31:24
 
         let trb_addr = cmd_ring.enqueue(trb);
         self.ring_doorbell(0, 0);
@@ -2067,7 +2067,7 @@ fn slot_trb(ty: u8, slot: u8, dci: u8, parameter: u64) -> Trb {
     let mut trb = Trb::new();
     trb.parameter = parameter;
     trb.set_type(ty);
-    trb.control |= (slot as u32) << 24 | (dci as u32) << 16;
+    trb.control |= u32::from(slot) << 24 | u32::from(dci) << 16;
     trb
 }
 
@@ -2114,12 +2114,12 @@ fn ep_params(ep: &UsbEndpoint, speed: UsbSpeed) -> EpParams {
         // xhci_parse_exponent_interval: 2^(bInterval-1) microframes
         UsbSpeed::High | UsbSpeed::Super | UsbSpeed::SuperPlus => ep.interval.clamp(1, 16) - 1,
         // xhci_parse_frame_interval: bInterval frames, as an exponent
-        _ => (fls(ep.interval as u32 * 8) - 1).clamp(3, 10) as u8,
+        _ => (fls(u32::from(ep.interval) * 8) - 1).clamp(3, 10) as u8,
     };
     let esit = match speed {
         _ if !periodic => 0,
-        _ if speed.is_super() => ep.bytes_per_interval as u32,
-        _ => ep.maxp() as u32 * (burst as u32 + 1),
+        _ if speed.is_super() => u32::from(ep.bytes_per_interval),
+        _ => u32::from(ep.maxp()) * (u32::from(burst) + 1),
     };
     EpParams {
         max_packet: ep.maxp(),

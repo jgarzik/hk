@@ -129,8 +129,8 @@ fn do_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> Result<i64, Ke
     let fd_table = current_fd_table();
     let mut table = fd_table.lock();
     match table.alloc_with_flags(file, fd_flags, get_nofile_limit()) {
-        Ok(fd) => Ok(fd as i64),
-        Err(e) => Ok(-(e as i64)),
+        Ok(fd) => Ok(i64::from(fd)),
+        Err(e) => Ok(-i64::from(e)),
     }
 }
 

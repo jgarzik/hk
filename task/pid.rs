@@ -113,7 +113,7 @@ impl Pid {
     /// Its process has exited with `status` (the last thread's exit):
     /// pidfd pollers wake (Linux do_notify_pidfd)
     pub fn set_exited(&self, status: i32) {
-        self.exit.store(status as i64, Ordering::Release);
+        self.exit.store(i64::from(status), Ordering::Release);
         self.wait_pidfd.wake_all();
     }
 

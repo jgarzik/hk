@@ -91,7 +91,7 @@ fn parse(data: &[u8], off: usize) -> Result<Entry<'_>, CpioError> {
         uid: f(2)?,
         gid: f(3)?,
         nlink: f(4)?,
-        mtime: Timespec::from_secs(f(5)? as i64),
+        mtime: Timespec::from_secs(i64::from(f(5)?)),
         dev: (f(7)?, f(8)?),
         rdev: (f(9)?, f(10)?),
         name,
@@ -231,7 +231,7 @@ fn do_entry(root: &Arc<Dentry>, e: &Entry<'_>, links: &mut Links) -> Result<bool
 /// (rmdir for a directory); one of the same type is returned
 fn clean_path(parent: &Arc<Dentry>, dir: &Inode, name: &[u8], ty: u32) -> Option<Arc<Inode>> {
     let old = dir.i_op.lookup(dir, name).ok()?;
-    if old.mode().0 as u32 & S_IFMT == ty {
+    if u32::from(old.mode().0) & S_IFMT == ty {
         return Some(old);
     }
     let gone = if old.mode().is_dir() {

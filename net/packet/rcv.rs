@@ -327,7 +327,7 @@ pub fn proc_net_packet() -> Vec<u8> {
             s.sk.stype,
             num,
             ifindex,
-            (num != 0) as u8,
+            u8::from(num != 0),
             s.rxq.rmem(),
             s.sk.cred.fsuid,
             s.sk.ino.load(Ordering::Acquire),

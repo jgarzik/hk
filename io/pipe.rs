@@ -641,7 +641,7 @@ impl FileOps for PipeReadFileOps {
                 drop(inner);
                 // Wake writers - there's now space (Linux pipe_read wakes
                 // wr_wait with EPOLLOUT | EPOLLWRNORM)
-                pipe.wait_queue.wake_poll((POLLOUT | POLLWRNORM) as u32);
+                pipe.wait_queue.wake_poll(u32::from(POLLOUT | POLLWRNORM));
                 return Ok(n);
             }
             drop(inner);
@@ -802,7 +802,7 @@ impl FileOps for PipeWriteFileOps {
                 done += n;
                 // Wake readers - there's data available (Linux pipe_write
                 // wakes rd_wait with EPOLLIN | EPOLLRDNORM)
-                pipe.wait_queue.wake_poll((POLLIN | POLLRDNORM) as u32);
+                pipe.wait_queue.wake_poll(u32::from(POLLIN | POLLRDNORM));
             } else {
                 drop(inner);
             }

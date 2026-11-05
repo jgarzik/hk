@@ -163,9 +163,9 @@ pub(super) fn cfg(net: &NetNamespace) -> Cfg {
     let s = &net.sysctl;
     let secs = |v: &core::sync::atomic::AtomicI32| v.load(Ordering::Relaxed).max(1) as u64 * 1000;
     Cfg {
-        syn_retries: s.tcp_syn_retries.load(Ordering::Relaxed) as u32,
-        synack_retries: s.tcp_synack_retries.load(Ordering::Relaxed) as u32,
-        retries2: s.tcp_retries2.load(Ordering::Relaxed) as u32,
+        syn_retries: u32::from(s.tcp_syn_retries.load(Ordering::Relaxed)),
+        synack_retries: u32::from(s.tcp_synack_retries.load(Ordering::Relaxed)),
+        retries2: u32::from(s.tcp_retries2.load(Ordering::Relaxed)),
         fin_timeout: secs(&s.tcp_fin_timeout),
         wscale: s.tcp_window_scaling.load(Ordering::Relaxed) != 0,
         ts: s.tcp_timestamps.load(Ordering::Relaxed),
@@ -173,7 +173,7 @@ pub(super) fn cfg(net: &NetNamespace) -> Cfg {
         rmem_max: s.tcp_rmem[2].load(Ordering::Relaxed).max(1) as u32,
         keepidle: secs(&s.tcp_keepalive_time),
         keepintvl: secs(&s.tcp_keepalive_intvl),
-        keepcnt: s.tcp_keepalive_probes.load(Ordering::Relaxed) as u32,
+        keepcnt: u32::from(s.tcp_keepalive_probes.load(Ordering::Relaxed)),
     }
 }
 
@@ -181,8 +181,8 @@ pub(super) fn cfg(net: &NetNamespace) -> Cfg {
 /// 64 ns clock (Linux secure_tcp_seq)
 fn isn(t: &Tuple) -> u32 {
     let w = [
-        ((t.laddr.0 as u64) << 32) | t.raddr.0 as u64,
-        ((t.lport as u64) << 16) | t.rport as u64,
+        (u64::from(t.laddr.0) << 32) | u64::from(t.raddr.0),
+        (u64::from(t.lport) << 16) | u64::from(t.rport),
     ];
     let h = crate::net::inet::port::secure_hash(0x7463_7073_6571, &w) as u32;
     h.wrapping_add((crate::time::monotonic_ns() >> 6) as u32)
@@ -193,8 +193,8 @@ fn isn(t: &Tuple) -> u32 {
 /// neither uptime nor other connections' offsets)
 fn ts_off(t: &Tuple) -> u32 {
     let w = [
-        ((t.laddr.0 as u64) << 32) | t.raddr.0 as u64,
-        ((t.lport as u64) << 16) | t.rport as u64,
+        (u64::from(t.laddr.0) << 32) | u64::from(t.raddr.0),
+        (u64::from(t.lport) << 16) | u64::from(t.rport),
     ];
     crate::net::inet::port::secure_hash(0x7463_7074_736f, &w) as u32
 }
@@ -537,7 +537,7 @@ impl TcpSock {
     /// TCP_SYNCNT or the sysctl
     fn syncnt(&self, o: &cb::Opts) -> u32 {
         match o.syncnt {
-            0 => self.sk.net.sysctl.tcp_syn_retries.load(Ordering::Relaxed) as u32,
+            0 => u32::from(self.sk.net.sysctl.tcp_syn_retries.load(Ordering::Relaxed)),
             v => v,
         }
     }
@@ -764,7 +764,7 @@ impl TcpSock {
             Some(s) if s != 0 && !crate::task::percpu::current_exiting() => s,
             _ => return,
         };
-        let ns = secs as u64 * 1_000_000_000;
+        let ns = u64::from(secs) * 1_000_000_000;
         let _ = self.sk.wait(ns, || {
             !matches!(
                 self.state(),
@@ -986,7 +986,7 @@ fn wait_memory(s: &TcpSock, timeo: &mut u64) -> Result<(), KernelError> {
     if *timeo == 0 {
         return Err(KernelError::WouldBlock);
     }
-    let vm_wait = (2 + crate::random::get_random_u32() % 200) as u64 * 1_000_000;
+    let vm_wait = u64::from(2 + crate::random::get_random_u32() % 200) * 1_000_000;
     let step = (*timeo).min(vm_wait);
     let left = match s.sk.wait(step, || {
         s.sk.has_err() || s.sk.shutdown() & SEND_SHUTDOWN != 0
@@ -1495,9 +1495,9 @@ impl TcpSock {
                     g.cb.mss
                 }
             }
-            TCP_NODELAY => o.nodelay as u32,
-            TCP_CORK => o.cork as u32,
-            TCP_QUICKACK => g.cb.quickack() as u32,
+            TCP_NODELAY => u32::from(o.nodelay),
+            TCP_CORK => u32::from(o.cork),
+            TCP_QUICKACK => u32::from(g.cb.quickack()),
             TCP_KEEPIDLE => g.cb.keep_idle() as u32 / 1000,
             TCP_KEEPINTVL => g.cb.keep_intvl() as u32 / 1000,
             TCP_KEEPCNT => g.cb.keep_cnt(),

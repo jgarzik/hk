@@ -1,7 +1,7 @@
 //! File status syscalls (stat, fstat, fstatat, lstat, statfs, fstatfs, statx)
 
 use crate::arch::Uaccess;
-use crate::arch::uapi::Stat;
+use crate::arch::uapi::{Stat, st_nlink};
 use crate::fs::namei::{filename_lookup, getname_maybe_null, user_path_at};
 use crate::fs::{Inode, KernelError, LinuxStatFs, LookupFlags};
 use crate::uaccess::{UaccessArch, put_user};
@@ -27,12 +27,12 @@ fn fill_stat(inode: &Inode) -> Stat {
         0
     };
 
-    // Field types differ per arch (e.g. st_nlink/st_blksize width), hence `as _`
+    // Field widths differ per arch (st_nlink, st_*time_nsec)
     Stat {
         st_dev,
         st_ino: attr.ino,
-        st_nlink: attr.nlink as _,
-        st_mode: attr.mode.raw() as u32,
+        st_nlink: st_nlink(attr.nlink),
+        st_mode: u32::from(attr.mode.raw()),
         st_uid: attr.uid,
         st_gid: attr.gid,
         st_rdev,
@@ -40,11 +40,11 @@ fn fill_stat(inode: &Inode) -> Stat {
         st_blksize: 4096,
         st_blocks: attr.size.div_ceil(512) as i64,
         st_atime: attr.atime.sec,
-        st_atime_nsec: attr.atime.nsec as _,
+        st_atime_nsec: attr.atime.nsec.into(),
         st_mtime: attr.mtime.sec,
-        st_mtime_nsec: attr.mtime.nsec as _,
+        st_mtime_nsec: attr.mtime.nsec.into(),
         st_ctime: attr.ctime.sec,
-        st_ctime_nsec: attr.ctime.nsec as _,
+        st_ctime_nsec: attr.ctime.nsec.into(),
         ..Default::default()
     }
 }
@@ -307,8 +307,8 @@ pub fn sys_statfs(path_ptr: u64, buf: u64) -> i64 {
 fn st_flags(mnt_flags: u32, sb: &super::SuperBlock) -> u64 {
     const ST_VALID: u64 = 0x20;
     // MNT_NOSUID/NODEV/NOEXEC (1, 2, 4) map to ST_NOSUID/NODEV/NOEXEC (2, 4, 8)
-    let mnt = mnt_flags as u64;
-    ST_VALID | sb.rdonly() as u64 | (mnt & 7) << 1
+    let mnt = u64::from(mnt_flags);
+    ST_VALID | u64::from(sb.rdonly()) | (mnt & 7) << 1
 }
 
 /// sys_fstatfs - get filesystem statistics by file descriptor
@@ -413,7 +413,7 @@ fn fill_statx(inode: &Inode, mask: u32, mnt: Option<&super::mount::Mount>) -> St
         stx_dev_minor: (st_dev & 0xff) as u32,
         stx_mnt_id: match mnt {
             Some(m) if mask & STATX_MNT_ID_UNIQUE != 0 => m.mnt_id_unique,
-            Some(m) => m.mnt_id as u64,
+            Some(m) => u64::from(m.mnt_id),
             None => 0,
         },
         stx_dio_mem_align: 0,

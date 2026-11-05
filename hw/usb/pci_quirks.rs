@@ -91,7 +91,7 @@ impl Bar {
     /// Map BAR0 of `dev`
     fn map(dev: &PciDevice) -> Option<Self> {
         let phys = dev.bar_address(0).filter(|&a| a != 0)?;
-        let len = dev.bar_size(0).min(u32::MAX as u64);
+        let len = dev.bar_size(0).min(u64::from(u32::MAX));
         if len < 0x100 || !dev.bar_is_mmio(0) {
             return None;
         }
@@ -106,7 +106,7 @@ impl Bar {
 
 impl Drop for Bar {
     fn drop(&mut self) {
-        CurrentArch::iounmap(self.virt, self.len as u64);
+        CurrentArch::iounmap(self.virt, u64::from(self.len));
     }
 }
 

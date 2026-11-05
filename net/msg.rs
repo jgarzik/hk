@@ -207,7 +207,7 @@ impl MsgHdr {
 
     /// Destination/source address for sendmsg, if any
     pub fn addr(&self) -> Result<Option<Vec<u8>>, KernelError> {
-        addr_in(self.name, self.namelen as u64)
+        addr_in(self.name, u64::from(self.namelen))
     }
 
     /// Control data for sendmsg (ENOBUFS above optmem_max)

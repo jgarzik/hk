@@ -126,10 +126,10 @@ impl NetNamespace {
             unix: Default::default(),
             packet: Default::default(),
             ip_id_key: [
-                ((crate::random::get_random_u32() as u64) << 32)
-                    | crate::random::get_random_u32() as u64,
-                ((crate::random::get_random_u32() as u64) << 32)
-                    | crate::random::get_random_u32() as u64,
+                (u64::from(crate::random::get_random_u32()) << 32)
+                    | u64::from(crate::random::get_random_u32()),
+                (u64::from(crate::random::get_random_u32()) << 32)
+                    | u64::from(crate::random::get_random_u32()),
             ],
             arp: crate::net::neigh::NeighTable::new(&crate::net::arp::ARP_OPS),
             loopback: RwLock::new(None),

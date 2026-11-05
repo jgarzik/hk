@@ -302,7 +302,7 @@ impl ProtoOps for RawSock {
         match level {
             SOL_SOCKET => None,
             SOL_RAW if opt != ICMP_FILTER => Some(Err(KernelError::NoProtocolOption)),
-            SOL_RAW if self.num != IPPROTO_ICMP as u16 => {
+            SOL_RAW if self.num != u16::from(IPPROTO_ICMP) => {
                 Some(Err(KernelError::OperationNotSupported))
             }
             SOL_RAW => Some(v.bytes(4).map(|b| {
@@ -319,7 +319,7 @@ impl ProtoOps for RawSock {
         match level {
             SOL_SOCKET => None,
             SOL_RAW if opt != ICMP_FILTER => Some(Err(KernelError::NoProtocolOption)),
-            SOL_RAW if self.num != IPPROTO_ICMP as u16 => {
+            SOL_RAW if self.num != u16::from(IPPROTO_ICMP) => {
                 Some(Err(KernelError::OperationNotSupported))
             }
             SOL_RAW => Some(Ok(OptOut::Bytes(
@@ -422,7 +422,7 @@ impl RawTable {
     fn matching(&self, proto: u8, raddr: Ipv4Addr, laddr: Ipv4Addr, dif: u32) -> Vec<Arc<RawSock>> {
         self.socks
             .read()
-            .get(&(proto as u16))
+            .get(&u16::from(proto))
             .map(|v| {
                 v.iter()
                     .filter(|s| s.matches(raddr, laddr, dif))

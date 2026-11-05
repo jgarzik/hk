@@ -319,7 +319,7 @@ impl NlSock {
             self.autobind()?;
         }
         let mask = (1u64 << self.proto.ngroups) - 1;
-        let g = groups as u64 & mask;
+        let g = u64::from(groups) & mask;
         // One update of the first 32 groups: a concurrent
         // ADD/DROP_MEMBERSHIP of a higher group is not lost (Linux does
         // both under netlink_table_grab)

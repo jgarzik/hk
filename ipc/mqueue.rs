@@ -253,11 +253,11 @@ impl MqQueue {
     fn set_flags(&self, new_flags: i64) {
         // Only O_NONBLOCK can be changed
         let mut flags = self.flags.lock();
-        *flags = new_flags & (O_NONBLOCK as i64);
+        *flags = new_flags & i64::from(O_NONBLOCK);
     }
 
     fn is_nonblocking(&self) -> bool {
-        (*self.flags.lock() & (O_NONBLOCK as i64)) != 0
+        (*self.flags.lock() & i64::from(O_NONBLOCK)) != 0
     }
 
     fn send(
@@ -359,7 +359,10 @@ impl MqQueue {
             // or exec'd
             let live = n.owner.exited().is_none() && n.owner.exec_gen() == n.exec_gen;
             if n.sigev_notify == SIGEV_SIGNAL && live {
-                crate::signal::send_signal_to_process(n.owner.nr() as u64, n.sigev_signo as u32);
+                crate::signal::send_signal_to_process(
+                    u64::from(n.owner.nr()),
+                    n.sigev_signo as u32,
+                );
             }
         }
     }
@@ -447,7 +450,10 @@ impl FileOps for MqFileOps {
         if let Some(mq) = mq_of(file) {
             let me = crate::task::percpu::current_pid();
             let mut notify = mq.queue.notify.lock();
-            if notify.as_ref().is_some_and(|n| n.owner.nr() as u64 == me) {
+            if notify
+                .as_ref()
+                .is_some_and(|n| u64::from(n.owner.nr()) == me)
+            {
                 *notify = None;
             }
         }
@@ -621,7 +627,7 @@ pub fn sys_mq_open(name_ptr: u64, oflag: i32, mode: u32, attr_ptr: u64) -> i64 {
 
             // Set initial flags
             if oflag & O_NONBLOCK != 0 {
-                queue.set_flags(O_NONBLOCK as i64);
+                queue.set_flags(i64::from(O_NONBLOCK));
             }
 
             registry.insert(queue_name.into(), queue.clone());
@@ -650,8 +656,8 @@ pub fn sys_mq_open(name_ptr: u64, oflag: i32, mode: u32, attr_ptr: u64) -> i64 {
         .lock()
         .alloc_with_flags(file, fd_flags, get_nofile_limit())
     {
-        Ok(fd) => fd as i64,
-        Err(e) => -(e as i64),
+        Ok(fd) => i64::from(fd),
+        Err(e) => -i64::from(e),
     }
 }
 
@@ -854,7 +860,7 @@ pub fn sys_mq_notify(mqdes: i32, sevp_ptr: u64) -> i64 {
         let mut notify = mq_ops.queue.notify.lock();
         if notify
             .as_ref()
-            .is_some_and(|n| n.owner.nr() as u64 == current_pid)
+            .is_some_and(|n| u64::from(n.owner.nr()) == current_pid)
         {
             *notify = None;
         }
@@ -886,7 +892,7 @@ pub fn sys_mq_notify(mqdes: i32, sevp_ptr: u64) -> i64 {
     let mut notify = mq_ops.queue.notify.lock();
     if notify
         .as_ref()
-        .is_some_and(|n| n.owner.nr() as u64 != current_pid)
+        .is_some_and(|n| u64::from(n.owner.nr()) != current_pid)
     {
         return KernelError::Busy.sysret();
     }

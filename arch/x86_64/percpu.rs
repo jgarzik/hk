@@ -177,10 +177,10 @@ pub fn try_current_cpu() -> Option<&'static PerCpu> {
 ///
 /// This must be called early in boot, before any per-CPU access.
 pub fn init_bsp(apic_id: u8) {
-    BSP_APIC_ID.store(apic_id as u32, Ordering::SeqCst);
+    BSP_APIC_ID.store(u32::from(apic_id), Ordering::SeqCst);
 
     let percpu = get_percpu(0);
-    percpu.init(0, apic_id as u32, true);
+    percpu.init(0, u32::from(apic_id), true);
 
     // Set GS base to point to our per-CPU data; no user GS base yet
     set_gs_base(percpu.as_ptr() as u64);
@@ -190,7 +190,7 @@ pub fn init_bsp(apic_id: u8) {
     // Mark BSP as online
     percpu.set_online();
     CPU_COUNT.store(1, Ordering::SeqCst);
-    crate::mm::numa::cpu_up(0, apic_id as u64);
+    crate::mm::numa::cpu_up(0, u64::from(apic_id));
 }
 
 /// Initialize per-CPU data for an AP
@@ -203,7 +203,7 @@ pub fn init_ap(apic_id: u8) -> u32 {
     assert!((cpu_id as usize) < MAX_CPUS, "Too many CPUs");
 
     let percpu = get_percpu(cpu_id);
-    percpu.init(cpu_id, apic_id as u32, false);
+    percpu.init(cpu_id, u32::from(apic_id), false);
 
     // Set GS base to point to our per-CPU data; no user GS base yet
     set_gs_base(percpu.as_ptr() as u64);
@@ -211,7 +211,7 @@ pub fn init_ap(apic_id: u8) -> u32 {
 
     // Mark as online
     percpu.set_online();
-    crate::mm::numa::cpu_up(cpu_id, apic_id as u64);
+    crate::mm::numa::cpu_up(cpu_id, u64::from(apic_id));
 
     cpu_id
 }
@@ -229,7 +229,7 @@ const MSR_TSC_AUX: u32 = 0xC0000103;
 fn set_tsc_aux(cpu_id: u32) {
     // SAFETY: TSC_AUX exists (RDTSCP checked at boot) and only feeds
     // RDTSCP/RDPID
-    unsafe { super::msr::wrmsr(MSR_TSC_AUX, cpu_id as u64) };
+    unsafe { super::msr::wrmsr(MSR_TSC_AUX, u64::from(cpu_id)) };
 }
 
 /// MSR_GS_BASE: the live GS base (in the kernel: this CPU's PerCpu)

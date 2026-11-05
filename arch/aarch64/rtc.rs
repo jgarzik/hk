@@ -30,7 +30,7 @@ const RTCCR: usize = 0x00C; // Control Register
 pub fn read_rtc() -> i64 {
     // The PL031 data register directly contains Unix time in seconds
     let time = unsafe { ptr::read_volatile((PL031_BASE + RTCDR) as *const u32) };
-    time as i64
+    i64::from(time)
 }
 
 /// Initialize the PL031 RTC

@@ -294,7 +294,7 @@ impl HrQueues {
                 // SAFETY: queued timers are live
                 .map(|t| unsafe { (*t).expires.load(Ordering::Relaxed) })
         };
-        let real = head(&self.real).map(|e| (e as i128 - off).max(0) as u64);
+        let real = head(&self.real).map(|e| (i128::from(e) - off).max(0) as u64);
         match (head(&self.mono), real) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
@@ -376,7 +376,7 @@ fn base_of(cpu: u32, flags: u8) -> &'static HrBase {
 /// (interrupts off)
 fn reprogram(cpu: u32) {
     let mono = crate::time::monotonic_ns();
-    let off = crate::time::realtime_ns() as i128 - mono as i128;
+    let off = i128::from(crate::time::realtime_ns()) - i128::from(mono);
     let [hard, soft] = BASES.get(cpu);
     // SOFT timers handed to ktimers/N are its to run (SOFT_ACTIVATED)
     let bases: &[&HrBase] = match SOFT_ACTIVATED.get(cpu).load(Ordering::Relaxed) {

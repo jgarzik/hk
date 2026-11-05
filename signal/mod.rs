@@ -1610,7 +1610,7 @@ impl SignalStruct {
             if cur & GROUP_EXIT != 0 || (cur & GROUP_EXEC != 0 && !over_exec) {
                 return false;
             }
-            let new = GROUP_EXIT | code as u32 as u64;
+            let new = GROUP_EXIT | u64::from(code as u32);
             match self
                 .group_exit
                 .compare_exchange(cur, new, Ordering::AcqRel, Ordering::Acquire)

@@ -141,7 +141,7 @@ pub fn write(ctl: &Ctl, buf: &[u8], pos: u64) -> Result<usize, KernelError> {
 /// rest (no CAP_DAC_OVERRIDE: a read-only sysctl is read-only for root
 /// too). `mask` holds MAY_READ / MAY_WRITE / MAY_EXEC bits.
 pub fn permission(ctl: &Ctl, c: &crate::task::Cred, mask: u32) -> Result<(), KernelError> {
-    let m = ctl.mode as u32;
+    let m = u32::from(ctl.mode);
     // Linux test_perm: root gets the owner bits; CAP_NET_ADMIN counts
     // as root only for the network namespace's own files
     // (net_ctl_permissions), never for vm/ and the rest

@@ -1601,7 +1601,10 @@ fn mincore_chunk(
     let end = vma.end.min(addr + pages * PAGE_SIZE);
     let n = ((end - addr) / PAGE_SIZE) as usize;
     for (i, b) in buf[..n].iter_mut().enumerate() {
-        *b = super::memory::resident(mm.pgd(), addr + i as u64 * PAGE_SIZE) as u8;
+        *b = u8::from(super::memory::resident(
+            mm.pgd(),
+            addr + i as u64 * PAGE_SIZE,
+        ));
     }
     Ok(n)
 }

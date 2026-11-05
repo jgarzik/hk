@@ -111,9 +111,9 @@ pub(super) fn alu64(op: u8, off: i16, dst: u64, src: u64) -> Option<u64> {
         BPF_NEG => dst.wrapping_neg(),
         BPF_MOV => match off {
             0 => src,
-            8 => src as i8 as i64 as u64,
-            16 => src as i16 as i64 as u64,
-            32 => src as i32 as i64 as u64,
+            8 => i64::from(src as i8) as u64,
+            16 => i64::from(src as i16) as u64,
+            32 => i64::from(src as i32) as u64,
             _ => return None,
         },
         _ => return None,
@@ -143,23 +143,23 @@ pub(super) fn alu32(op: u8, off: i16, dst: u64, src: u64) -> Option<u64> {
         BPF_NEG => d.wrapping_neg(),
         BPF_MOV => match off {
             0 => s,
-            8 => s as i8 as i32 as u32,
-            16 => s as i16 as i32 as u32,
+            8 => i32::from(s as i8) as u32,
+            16 => i32::from(s as i16) as u32,
             _ => return None,
         },
         _ => return None,
     };
-    Some(v as u64)
+    Some(u64::from(v))
 }
 
 /// Byte-order conversion (class ALU: `to_be` per the source bit; class
 /// ALU64: an unconditional swap), truncated to `bits`
 pub(super) fn endian(v: u64, bits: i32, swap: bool) -> Option<u64> {
     Some(match (bits, swap) {
-        (16, false) => v as u16 as u64,
-        (16, true) => (v as u16).swap_bytes() as u64,
-        (32, false) => v as u32 as u64,
-        (32, true) => (v as u32).swap_bytes() as u64,
+        (16, false) => u64::from(v as u16),
+        (16, true) => u64::from((v as u16).swap_bytes()),
+        (32, false) => u64::from(v as u32),
+        (32, true) => u64::from((v as u32).swap_bytes()),
         (64, false) => v,
         (64, true) => v.swap_bytes(),
         _ => return None,
@@ -176,7 +176,12 @@ pub(super) fn end_swaps(code: u8) -> bool {
 pub(super) fn cond(op: u8, w32: bool, a: u64, b: u64) -> Option<bool> {
     let (a, b, sa, sb) = if w32 {
         let (a, b) = (a as u32, b as u32);
-        (a as u64, b as u64, a as i32 as i64, b as i32 as i64)
+        (
+            u64::from(a),
+            u64::from(b),
+            i64::from(a as i32),
+            i64::from(b as i32),
+        )
     } else {
         (a, b, a as i64, b as i64)
     };
@@ -213,7 +218,7 @@ impl<E: Env> Vm<'_, E> {
             Region::Stack => BPF_STACK_SIZE,
             _ => return Err(Fault::Mem),
         };
-        let at = r.v.wrapping_add(off as i64 as u64);
+        let at = r.v.wrapping_add(i64::from(off) as u64);
         match at.checked_add(size as u64) {
             Some(end) if end <= len as u64 => Ok(at as usize),
             _ => Err(Fault::Mem),
@@ -229,9 +234,9 @@ impl<E: Env> Vm<'_, E> {
         let mut b = [0u8; 8];
         b[..size].copy_from_slice(bytes);
         let v = match size {
-            1 => b[0] as u64,
-            2 => u16::from_ne_bytes([b[0], b[1]]) as u64,
-            4 => u32::from_ne_bytes([b[0], b[1], b[2], b[3]]) as u64,
+            1 => u64::from(b[0]),
+            2 => u64::from(u16::from_ne_bytes([b[0], b[1]])),
+            4 => u64::from(u32::from_ne_bytes([b[0], b[1], b[2], b[3]])),
             _ => u64::from_ne_bytes(b),
         };
         let mut reg = Reg::scalar(v);
@@ -269,9 +274,9 @@ impl<E: Env> Vm<'_, E> {
         let src = if bpf_src(code) == BPF_X {
             self.regs[s]
         } else if w64 {
-            Reg::scalar(insn.imm as i64 as u64)
+            Reg::scalar(i64::from(insn.imm) as u64)
         } else {
-            Reg::scalar(insn.imm as u32 as u64)
+            Reg::scalar(u64::from(insn.imm as u32))
         };
         let v = if w64 {
             alu64(op, insn.off, dst.v, src.v)
@@ -298,7 +303,7 @@ impl<E: Env> Vm<'_, E> {
         let (d, s) = (insn.dst_reg() as usize, insn.src_reg() as usize);
         let (base, src) = (self.regs[d], self.regs[s]);
         let old = self.read(base, insn.off, size)?;
-        let trunc = |v: u64| if size == 4 { v as u32 as u64 } else { v };
+        let trunc = |v: u64| if size == 4 { u64::from(v as u32) } else { v };
         let new = match insn.imm {
             BPF_XCHG => src.v,
             BPF_CMPXCHG => {
@@ -371,7 +376,7 @@ impl<E: Env> Vm<'_, E> {
                     self.regs[d] = v;
                 }
                 BPF_ST if bpf_mode(code) == BPF_MEM => {
-                    let v = Reg::scalar(insn.imm as i64 as u64);
+                    let v = Reg::scalar(i64::from(insn.imm) as u64);
                     self.write(self.regs[d], insn.off, size_bytes(code), v)?;
                 }
                 BPF_STX if bpf_mode(code) == BPF_MEM => {
@@ -381,7 +386,7 @@ impl<E: Env> Vm<'_, E> {
                 BPF_STX if bpf_mode(code) == BPF_ATOMIC => self.atomic(insn)?,
                 BPF_LD if code == BPF_LD | BPF_IMM | BPF_DW && s == 0 => {
                     let hi = prog.get(pc).ok_or(Fault::BadInsn)?;
-                    let v = (hi.imm as u32 as u64) << 32 | insn.imm as u32 as u64;
+                    let v = u64::from(hi.imm as u32) << 32 | u64::from(insn.imm as u32);
                     self.regs[d] = Reg::scalar(v);
                     pc += 1;
                 }
@@ -392,9 +397,9 @@ impl<E: Env> Vm<'_, E> {
                         BPF_CALL if !w32 => self.call(insn)?,
                         BPF_JA => {
                             let off = if w32 {
-                                insn.imm as i64
+                                i64::from(insn.imm)
                             } else {
-                                insn.off as i64
+                                i64::from(insn.off)
                             };
                             pc = (pc as i64).wrapping_add(off) as usize;
                         }
@@ -402,11 +407,11 @@ impl<E: Env> Vm<'_, E> {
                             let b = if bpf_src(code) == BPF_X {
                                 self.regs[s].v
                             } else {
-                                insn.imm as i64 as u64
+                                i64::from(insn.imm) as u64
                             };
                             let a = self.regs[d].v;
                             if cond(op, w32, a, b).ok_or(Fault::BadInsn)? {
-                                pc = (pc as i64).wrapping_add(insn.off as i64) as usize;
+                                pc = (pc as i64).wrapping_add(i64::from(insn.off)) as usize;
                             }
                         }
                     }

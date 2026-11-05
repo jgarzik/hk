@@ -17,7 +17,7 @@ pub struct IntxMapEntry {
 
 /// Child unit-address phys.hi cell for a PCI function
 pub fn phys_hi(bus: u8, device: u8, function: u8) -> u32 {
-    ((bus as u32) << 16) | ((device as u32) << 11) | ((function as u32) << 8)
+    (u32::from(bus) << 16) | (u32::from(device) << 11) | (u32::from(function) << 8)
 }
 
 /// Look up (bus, device, function, pin) in a parsed interrupt-map
@@ -31,7 +31,7 @@ pub fn match_interrupt_map(
     pin: u8,
 ) -> Option<u32> {
     let key_hi = phys_hi(bus, device, function) & mask_hi;
-    let key_pin = pin as u32 & mask_pin;
+    let key_pin = u32::from(pin) & mask_pin;
     entries
         .iter()
         .find(|e| e.phys_hi == key_hi && e.pin == key_pin)
@@ -41,7 +41,7 @@ pub fn match_interrupt_map(
 /// QEMU virt fixed INTx routing (hw/arm/virt.c create_pcie_irq_map): slot
 /// s, pin p (1 = INTA) -> SPI 3 + (s + p - 1) % 4, i.e. INTID 35..38
 pub fn qemu_virt_swizzle(device: u8, pin: u8) -> u32 {
-    32 + 3 + ((device as u32 + pin as u32 - 1) % 4)
+    32 + 3 + ((u32::from(device) + u32::from(pin) - 1) % 4)
 }
 
 #[cfg(test)]

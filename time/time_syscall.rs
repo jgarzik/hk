@@ -113,7 +113,7 @@ impl PosixClock {
     /// not exist or may not be read (EINVAL)
     pub fn now_ns(self) -> Result<i128, KernelError> {
         let read = |c| TIMEKEEPER.read(c, TIMEKEEPER.get_read_cycles()).to_nanos();
-        let coarse = |ns: i128| ns - ns.rem_euclid(crate::task::percpu::TICK_NS as i128);
+        let coarse = |ns: i128| ns - ns.rem_euclid(i128::from(crate::task::percpu::TICK_NS));
         Ok(match self {
             Self::Realtime | Self::RealtimeAlarm => read(ClockId::Realtime),
             Self::Monotonic | Self::MonotonicRaw | Self::Boottime | Self::BoottimeAlarm => {
@@ -122,7 +122,7 @@ impl PosixClock {
             Self::RealtimeCoarse => coarse(read(ClockId::Realtime)),
             Self::MonotonicCoarse => coarse(read(ClockId::Monotonic)),
             Self::Tai => read(ClockId::Tai),
-            Self::Cpu { pid, thread, which } => cpu_clock_ns(pid, thread, which, true)? as i128,
+            Self::Cpu { pid, thread, which } => i128::from(cpu_clock_ns(pid, thread, which, true)?),
         })
     }
 
@@ -139,7 +139,7 @@ impl PosixClock {
 
 /// TAI - UTC (adjtimex ADJ_TAI), in ns
 pub fn tai_offset_ns() -> i128 {
-    TIMEKEEPER.tai_offset() as i128 * 1_000_000_000
+    i128::from(TIMEKEEPER.tai_offset()) * 1_000_000_000
 }
 
 /// A CPU clock's time (Linux posix_cpu_clock_get / lookup_task): a
@@ -269,7 +269,7 @@ pub fn sys_clock_gettime(clockid: i32, tp: u64) -> i64 {
     let ts = crate::time::Timespec::from_nanos(ns);
     let result = LinuxTimespec {
         tv_sec: ts.sec,
-        tv_nsec: ts.nsec as i64,
+        tv_nsec: i64::from(ts.nsec),
     };
 
     // Copy to user space using put_user
@@ -299,7 +299,7 @@ pub fn sys_gettimeofday(tv: u64, tz: u64) -> i64 {
 
         let result = Timeval {
             tv_sec: ts.sec,
-            tv_usec: ts.nsec as i64 / 1000, // Convert ns to us
+            tv_usec: i64::from(ts.nsec) / 1000, // Convert ns to us
         };
 
         // Copy to user space
@@ -404,7 +404,7 @@ pub fn sys_clock_nanosleep(clockid: i32, flags: i32, req: u64, rem: u64) -> i64 
         // sleep follows clock_settime (Linux hrtimer_nanosleep)
         // A TAI deadline is a realtime one TAI - UTC earlier
         let deadline = if pclock == PosixClock::Tai {
-            (req_ns as i128 - tai_offset_ns()).max(0) as u64
+            (i128::from(req_ns) - tai_offset_ns()).max(0) as u64
         } else {
             req_ns
         };
@@ -690,8 +690,8 @@ pub fn sys_timerfd_create(clockid: i32, flags: i32) -> i64 {
     };
 
     match table.alloc_with_flags(file, fd_flags, get_nofile_limit()) {
-        Ok(fd) => fd as i64,
-        Err(e) => -(e as i64),
+        Ok(fd) => i64::from(fd),
+        Err(e) => -i64::from(e),
     }
 }
 
@@ -818,7 +818,7 @@ pub fn sys_eventfd2(initval: u32, flags: i32) -> i64 {
     }
 
     // Create the eventfd file
-    let file = match create_eventfd(initval as u64, flags) {
+    let file = match create_eventfd(u64::from(initval), flags) {
         Ok(f) => f,
         Err(_) => return KernelError::ProcessFileLimit.sysret(),
     };
@@ -836,8 +836,8 @@ pub fn sys_eventfd2(initval: u32, flags: i32) -> i64 {
     };
 
     match table.alloc_with_flags(file, fd_flags, get_nofile_limit()) {
-        Ok(fd) => fd as i64,
-        Err(e) => -(e as i64),
+        Ok(fd) => i64::from(fd),
+        Err(e) => -i64::from(e),
     }
 }
 
@@ -1157,9 +1157,9 @@ pub fn sys_adjtimex(txc_p: u64) -> i64 {
     txc.tolerance = 500; // 500 ppm tolerance
     txc.time.tv_sec = ts.sec;
     txc.time.tv_usec = if status & STA_NANO != 0 {
-        ts.nsec as i64
+        i64::from(ts.nsec)
     } else {
-        ts.nsec as i64 / 1000
+        i64::from(ts.nsec) / 1000
     };
     txc.tick = ntp.tick;
     txc.ppsfreq = 0;
@@ -1180,9 +1180,9 @@ pub fn sys_adjtimex(txc_p: u64) -> i64 {
 
     // Return clock state
     if status & STA_UNSYNC != 0 {
-        TIME_ERROR as i64
+        i64::from(TIME_ERROR)
     } else {
-        TIME_OK as i64
+        i64::from(TIME_OK)
     }
 }
 

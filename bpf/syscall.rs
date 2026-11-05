@@ -84,7 +84,7 @@ fn unpriv_store(v: &[i64]) -> Result<(), KernelError> {
 pub static BPF_CTLS: &[crate::sysctl::Ctl] = &[crate::sysctl::Ctl {
     path: "kernel/unprivileged_bpf_disabled",
     mode: 0o644,
-    show: || alloc::vec![UNPRIV_DISABLED.load(Ordering::Relaxed) as i64],
+    show: || alloc::vec![i64::from(UNPRIV_DISABLED.load(Ordering::Relaxed))],
     store: unpriv_store,
     text: None,
 }];
@@ -352,7 +352,7 @@ fn bpf_map_create(attr_buf: &[u8]) -> i64 {
 
     // Create file descriptor
     match create_bpf_map_fd(map) {
-        Ok(fd) => fd as i64,
+        Ok(fd) => i64::from(fd),
         Err(e) => e.sysret(),
     }
 }
@@ -543,7 +543,7 @@ fn bpf_prog_load(attr_buf: &[u8]) -> i64 {
 
     // Create file descriptor
     match create_bpf_prog_fd(prog, attr.prog_type) {
-        Ok(fd) => fd as i64,
+        Ok(fd) => i64::from(fd),
         Err(e) => e.sysret(),
     }
 }

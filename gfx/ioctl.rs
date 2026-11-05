@@ -601,7 +601,9 @@ fn handle_setcrtc(driver: &dyn GfxDriver, arg: u64) -> Result<i64, GfxError> {
     let mut connectors = alloc::vec::Vec::new();
     if crtc_cmd.count_connectors > 0 && crtc_cmd.set_connectors_ptr != 0 {
         for i in 0..crtc_cmd.count_connectors {
-            connectors.push(read_arg::<u32>(crtc_cmd.set_connectors_ptr + i as u64 * 4)?);
+            connectors.push(read_arg::<u32>(
+                crtc_cmd.set_connectors_ptr + u64::from(i) * 4,
+            )?);
         }
     }
 
@@ -765,14 +767,14 @@ fn modeinfo_to_drmmode(info: &GfxModeModeinfo) -> GfxModeInfo {
 
     GfxModeInfo {
         clock: info.clock,
-        hdisplay: info.hdisplay as u32,
-        hsync_start: info.hsync_start as u32,
-        hsync_end: info.hsync_end as u32,
-        htotal: info.htotal as u32,
-        vdisplay: info.vdisplay as u32,
-        vsync_start: info.vsync_start as u32,
-        vsync_end: info.vsync_end as u32,
-        vtotal: info.vtotal as u32,
+        hdisplay: u32::from(info.hdisplay),
+        hsync_start: u32::from(info.hsync_start),
+        hsync_end: u32::from(info.hsync_end),
+        htotal: u32::from(info.htotal),
+        vdisplay: u32::from(info.vdisplay),
+        vsync_start: u32::from(info.vsync_start),
+        vsync_end: u32::from(info.vsync_end),
+        vtotal: u32::from(info.vtotal),
         vrefresh: info.vrefresh,
         flags: info.flags,
         type_: info.type_,
