@@ -11,6 +11,12 @@
 //!   waiter on the tid word.
 //! - FUTEX_ROBUST_PENDING: a thread exiting with a robust pending op on
 //!   a free futex word wakes a waiter there (Linux handle_futex_death).
+//! - ROBUST_DEATH_WAKE: likewise for a word with waiters but no owner
+//!   (FUTEX_WAITERS alone): Linux wakes on the owner bits being 0.
+//! - ROBUST_DEATH_WAITERS: a thread dies holding a robust lock while a
+//!   waiter sets FUTEX_WAITERS and sleeps: the death's update is a
+//!   cmpxchg, so the bit is never lost and the waiter always wakes
+//!   (200 rounds).
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -33,6 +39,8 @@ pub fn run_tests() {
     private_split();
     ctid_shared();
     robust_pending();
+    robust_death_wake();
+    robust_death_waiters();
 }
 
 fn report(name: &[u8], ok: bool, got: i64) {
@@ -303,4 +311,130 @@ fn robust_pending() {
     let r = wait_shared(unsafe { &raw mut ROBUST_ENTRY.word }, 3000);
     let joined = join();
     report(NAME, r == 0 && joined, r);
+}
+
+const FUTEX_WAITERS: u32 = 0x8000_0000;
+const FUTEX_OWNER_DIED: u32 = 0x4000_0000;
+const FUTEX_TID_MASK: u32 = 0x3fff_ffff;
+
+fn robust_death_wake() {
+    const NAME: &[u8] = b"ROBUST_DEATH_WAKE";
+    let w = unsafe { &raw mut ROBUST_ENTRY.word };
+    unsafe { core::ptr::write_volatile(w, FUTEX_WAITERS) };
+    if !spawn(robust_dier, 0) {
+        return report(NAME, false, -1);
+    }
+    let ts = Timespec {
+        tv_sec: 3,
+        tv_nsec: 0,
+    };
+    let r = sys_futex(w, FUTEX_WAIT, FUTEX_WAITERS, &ts, core::ptr::null_mut(), 0);
+    let joined = join();
+    let left = unsafe { core::ptr::read_volatile(w) };
+    // Woken, the word untouched
+    report(NAME, r == 0 && joined && left == FUTEX_WAITERS, r);
+}
+
+/// The holder is ready: its TID is in the word
+static HOLDER_READY: AtomicU32 = AtomicU32::new(0);
+
+/// Takes `ROBUST_ENTRY` (its TID in the word, the entry on its robust
+/// list), then exits after `spins` yields
+extern "C" fn robust_holder(spins: u64) -> ! {
+    unsafe {
+        let head = &raw mut ROBUST_HEAD;
+        let e = &raw mut ROBUST_ENTRY;
+        (*e).next = head as u64;
+        (*head).list = e as u64;
+        (*head).list_op_pending = 0;
+        core::ptr::write_volatile(&raw mut (*e).word, hk_syscall::sys_gettid() as u32);
+        sys_set_robust_list(head, core::mem::size_of::<RobustListHead>());
+    }
+    HOLDER_READY.store(1, Ordering::Release);
+    for _ in 0..spins {
+        hk_syscall::sys_sched_yield();
+    }
+    sys_exit(0)
+}
+
+/// Compare-and-swap on a futex word: the value found (no atomic RMW
+/// from core: on arm64 it needs a libc helper boot_tester lacks)
+fn cas(p: *mut u32, old: u32, new: u32) -> u32 {
+    let found: u32;
+    // SAFETY: `p` is a live, aligned u32 shared only through atomics
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::asm!(
+            "lock cmpxchg dword ptr [{p}], {new:e}",
+            p = in(reg) p,
+            new = in(reg) new,
+            inout("eax") old => found,
+            options(nostack),
+        );
+    }
+    // SAFETY: as above
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        core::arch::asm!(
+            "1: ldaxr {f:w}, [{p}]",
+            "   cmp {f:w}, {old:w}",
+            "   b.ne 2f",
+            "   stlxr {t:w}, {new:w}, [{p}]",
+            "   cbnz {t:w}, 1b",
+            "2: clrex",
+            p = in(reg) p,
+            old = in(reg) old,
+            new = in(reg) new,
+            f = out(reg) found,
+            t = out(reg) _,
+            options(nostack),
+        );
+    }
+    found
+}
+
+/// One round: 0, or ETIMEDOUT if the waiter was never woken
+fn robust_round(spins: u64) -> i64 {
+    let w = unsafe { &raw mut ROBUST_ENTRY.word };
+    HOLDER_READY.store(0, Ordering::Relaxed);
+    if !spawn(robust_holder, spins) {
+        return -1;
+    }
+    while HOLDER_READY.load(Ordering::Acquire) == 0 {
+        hk_syscall::sys_sched_yield();
+    }
+    let mut r = 0;
+    loop {
+        let v = unsafe { core::ptr::read_volatile(w) };
+        if v & FUTEX_OWNER_DIED != 0 || v & FUTEX_TID_MASK == 0 {
+            break;
+        }
+        let want = v | FUTEX_WAITERS;
+        if v != want && cas(w, v, want) != v {
+            continue;
+        }
+        let ts = Timespec {
+            tv_sec: 2,
+            tv_nsec: 0,
+        };
+        r = sys_futex(w, FUTEX_WAIT, want, &ts, core::ptr::null_mut(), 0);
+        if r == ETIMEDOUT {
+            break;
+        }
+    }
+    if !join() {
+        return -2;
+    }
+    if r == ETIMEDOUT { r } else { 0 }
+}
+
+fn robust_death_waiters() {
+    const NAME: &[u8] = b"ROBUST_DEATH_WAITERS";
+    for round in 0..200u64 {
+        let r = robust_round(round % 8);
+        if r != 0 {
+            return report(NAME, false, r);
+        }
+    }
+    report(NAME, true, 0);
 }

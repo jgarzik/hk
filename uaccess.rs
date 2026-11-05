@@ -76,6 +76,9 @@ pub enum UaccessError {
     Encoding,
     /// No NUL within the string's maximum length
     TooLong,
+    /// An exclusive store kept failing ([`cmpxchg_user_u32`] on LL/SC
+    /// machines; Linux -EAGAIN): retry
+    Again,
 }
 
 /// Result type for user access operations
@@ -121,6 +124,19 @@ pub trait UaccessArch {
     /// The kernel side must be valid for `len` bytes; must be called between
     /// `user_access_begin()`/`user_access_end()`.
     unsafe fn copy_user_raw(dst: *mut u8, src: *const u8, len: usize) -> usize;
+
+    /// Atomically store `new` in the user word at `uaddr` if it holds
+    /// `old` (Linux futex_atomic_cmpxchg_inatomic). 0 with the value
+    /// found in `*cur` (`old` when `new` was stored); -EFAULT on a fault
+    /// the page-fault handler cannot resolve (caught via the arch
+    /// exception fixup); -EAGAIN when an exclusive store kept failing
+    /// (LL/SC), `*cur` untouched then.
+    ///
+    /// # Safety
+    /// `uaddr` passed `access_ok` for 4 bytes and is 4-byte aligned;
+    /// `cur` is valid for a write; must be called between
+    /// `user_access_begin()`/`user_access_end()`.
+    unsafe fn cmpxchg_user_raw(uaddr: *mut u32, old: u32, new: u32, cur: *mut u32) -> i32;
 
     /// Disable user memory access (for SMAP-enabled CPUs)
     ///
@@ -324,6 +340,33 @@ pub fn get_user<A: UaccessArch, T: FromBytes>(from: u64) -> UaccessResult<T> {
     // SAFETY: every byte is set (zeroed, then copied over), and any bit
     // pattern is a valid T (FromBytes)
     Ok(unsafe { value.assume_init() })
+}
+
+/// Compare and exchange a u32 in user space (Linux
+/// futex_atomic_cmpxchg_inatomic, its faults resolved unless page faults
+/// are disabled): the value found, `old` when `new` was stored.
+/// BadAddress outside user space or not 4-byte aligned; Fault for an
+/// unresolvable fault; Again when an exclusive store kept failing
+#[track_caller]
+pub fn cmpxchg_user_u32<A: UaccessArch>(uaddr: u64, old: u32, new: u32) -> UaccessResult<u32> {
+    might_fault();
+    if !A::access_ok(uaddr, 4) || !uaddr.is_multiple_of(4) {
+        return Err(UaccessError::BadAddress);
+    }
+    let mut cur = 0u32;
+    // SAFETY: `uaddr` passed access_ok for 4 bytes and is aligned (a
+    // fault is caught by the fixup); `cur` is a local; begin/end paired
+    let r = unsafe {
+        A::user_access_begin();
+        let r = A::cmpxchg_user_raw(uaddr as *mut u32, old, new, &mut cur);
+        A::user_access_end();
+        r
+    };
+    match r {
+        0 => Ok(cur),
+        -11 => Err(UaccessError::Again),
+        _ => Err(UaccessError::Fault),
+    }
 }
 
 /// Copy a plain-data value from user space; for user structs such as

@@ -2845,7 +2845,11 @@ For `futex_requeue()` with two different buckets:
 Robust futexes are cleaned up during task exit via `exit_robust_list()`:
 1. Called from task exit path in `task/percpu.rs`
 2. Walks the userspace robust list with a 2048 entry limit
-3. For each entry, sets `FUTEX_OWNER_DIED` bit and wakes one waiter
+3. For each entry the task owns, sets `FUTEX_OWNER_DIED` by a user
+   cmpxchg against the value read (`uaccess::cmpxchg_user_u32`, Linux
+   futex_atomic_cmpxchg_inatomic), retried when the word changed, so a
+   waiter's `FUTEX_WAITERS` is never lost; then wakes one waiter. No
+   lock is held: faults are resolved in place.
 4. Uses shared bucket lock only briefly per entry
 
 #### Key Rules

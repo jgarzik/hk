@@ -414,11 +414,8 @@ written.
 
 **Location:** `task/futex.rs`
 
-- **Robust owner death** updates the futex word with a plain read and
-  write: a FUTEX_WAITERS set by a waiter in between is lost. Linux
-  uses an atomic user-space cmpxchg (futex_atomic_cmpxchg_inatomic);
-  hk has no such uaccess primitive yet (it would also serve
-  FUTEX_WAKE_OP and PI futexes, both missing).
+- **FUTEX_WAKE_OP and PI futexes** are missing (the user cmpxchg they
+  need, `uaccess::cmpxchg_user_u32`, exists).
 - **MAP_PRIVATE file mappings:** a shared futex there is keyed by
   (mm, address) from the VMA; Linux keys a page still in the page
   cache (not yet COW'd) by inode and offset, so a MAP_SHARED mapping

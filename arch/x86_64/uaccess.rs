@@ -61,6 +61,12 @@ impl UaccessArch for X86_64Uaccess {
         unsafe { hk_copy_user(dst, src, len) }
     }
 
+    /// `lock cmpxchg` on the user word (Linux futex_atomic_cmpxchg_inatomic)
+    #[inline(always)]
+    unsafe fn cmpxchg_user_raw(uaddr: *mut u32, old: u32, new: u32, cur: *mut u32) -> i32 {
+        unsafe { hk_cmpxchg_user(uaddr, old, new, cur) }
+    }
+
     /// Disable user memory access by clearing AC flag
     ///
     /// Executes `clac` if SMAP is available, otherwise no-op.
@@ -85,6 +91,8 @@ core::arch::global_asm!(
     ".global hk_copy_user_insn",
     "hk_copy_user_insn:",
     "    rep movsb",
+    ".global hk_copy_user_insn_end",
+    "hk_copy_user_insn_end:",
     "    xor eax, eax",
     "    ret",
     ".global hk_copy_user_fixup",
@@ -94,21 +102,61 @@ core::arch::global_asm!(
     ".popsection",
 );
 
+// User compare-and-exchange (Linux futex_atomic_cmpxchg_inatomic +
+// _ASM_EXTABLE_UA): rdi=uaddr, esi=old, edx=new, rcx=where the value
+// found goes. A fault on the `lock cmpxchg` that the page-fault handler
+// cannot resolve resumes at the fixup, which returns -EFAULT.
+core::arch::global_asm!(
+    ".pushsection .text.hk_cmpxchg_user, \"ax\"",
+    ".global hk_cmpxchg_user",
+    "hk_cmpxchg_user:",
+    "    mov eax, esi",
+    ".global hk_cmpxchg_user_insn",
+    "hk_cmpxchg_user_insn:",
+    "    lock cmpxchg dword ptr [rdi], edx",
+    ".global hk_cmpxchg_user_insn_end",
+    "hk_cmpxchg_user_insn_end:",
+    "    mov dword ptr [rcx], eax",
+    "    xor eax, eax",
+    "    ret",
+    ".global hk_cmpxchg_user_fixup",
+    "hk_cmpxchg_user_fixup:",
+    "    mov eax, -14",
+    "    ret",
+    ".popsection",
+);
+
 unsafe extern "C" {
     fn hk_copy_user(dst: *mut u8, src: *const u8, len: usize) -> usize;
     static hk_copy_user_insn: u8;
+    static hk_copy_user_insn_end: u8;
     static hk_copy_user_fixup: u8;
+    fn hk_cmpxchg_user(uaddr: *mut u32, old: u32, new: u32, cur: *mut u32) -> i32;
+    static hk_cmpxchg_user_insn: u8;
+    static hk_cmpxchg_user_insn_end: u8;
+    static hk_cmpxchg_user_fixup: u8;
 }
 
-/// Exception-table lookup: if a kernel-mode fault at `rip` is inside the
-/// user-copy routine, return the address to resume at (Linux: fixup_exception)
+/// Exception-table lookup (Linux fixup_exception over __ex_table): if a
+/// kernel-mode fault at `rip` is on a user-access instruction, the
+/// address to resume at
 pub fn uaccess_fixup(rip: u64) -> Option<u64> {
-    let insn = &raw const hk_copy_user_insn as u64;
-    if rip == insn {
-        Some(&raw const hk_copy_user_fixup as u64)
-    } else {
-        None
-    }
+    let table = [
+        (
+            &raw const hk_copy_user_insn,
+            &raw const hk_copy_user_insn_end,
+            &raw const hk_copy_user_fixup,
+        ),
+        (
+            &raw const hk_cmpxchg_user_insn,
+            &raw const hk_cmpxchg_user_insn_end,
+            &raw const hk_cmpxchg_user_fixup,
+        ),
+    ];
+    table
+        .into_iter()
+        .find(|&(lo, hi, _)| (lo as u64..hi as u64).contains(&rip))
+        .map(|(_, _, fix)| fix as u64)
 }
 
 /// Check if SMAP is currently enabled
