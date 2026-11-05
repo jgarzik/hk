@@ -22,6 +22,7 @@
 //! For seccomp(2) compatibility, classic BPF (cBPF) programs using
 //! sock_filter format are converted to eBPF before execution.
 
+pub mod classic;
 mod convert;
 mod fd;
 mod insn;
