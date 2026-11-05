@@ -1,12 +1,12 @@
 # hk: preparing for HADL (loadable, description-driven drivers)
 
-Status: finalized design and plan, 2026-11-03. Inputs: doc/ideas/HADL-driver-architecture-research.md, a survey of hk's driver code, and the owner's answers (below). No code changed yet.
+Design and plan, from doc/ideas/HADL-driver-architecture-research.md. doc/ROADMAP.md schedules only the preparatory items (M1, M2, M4, D); H2–H7 (HADL proper) are not scheduled.
 
-## 0. Decisions (owner answers)
+## 0. Constraints
 
-| # | Question | Decision |
+| # | Topic | Rule |
 |---|---|---|
-| 1 | Runtime driver loading | **Required, high priority.** hk designs its own module/driver loader and API; Linux .ko compatibility is not a goal. |
+| 1 | Runtime driver loading | Required, high priority: hk designs its own module/driver loader and API; Linux .ko compatibility is not a goal. |
 | 1a | What a loadable driver contains | Everything the driver needs to operate, per HADL (§3 defines the package). |
 | 1b | init_module / finit_module / delete_module | **Front the hk loader**: same syscalls, /proc/modules, CAP_SYS_MODULE, modules_disabled; they take hk driver packages, not ELF .ko. |
 | 2 | AHCI path | **libata/SAT**: ATA through the SCSI layer (sdX, SG_IO, ATA passthrough), as Linux. |
@@ -20,17 +20,16 @@ Status: finalized design and plan, 2026-11-03. Inputs: doc/ideas/HADL-driver-arc
 | 10 | Escape hooks after built-in Rust | **Native first** (signed, trusted, hk C-ABI, H7); a small verified IR only if a need appears later. |
 | 11 | Package delivery | **Files + init_module**: initramfs and /lib/modules/<release>, loaded by modprobe/insmod through finit_module/init_module; no kernel auto-fetch. |
 | 12 | Unsigned packages | **Allowed with a warning and taint** unless signature enforcement is on (cmdline/config), as Linux. |
-| 13 | sysfs | **Its own phase before H5 and VT**: pragmatic sysfs + uevent netlink (what Debian's udev, logind, modprobe need), shared by the loader and the VT work. |
 
-## 1. Where hk stands (grounding)
+## 1. Targets in the code
 
-- e1000.rs (758 lines) and virtio_net.rs (498) duplicate one NAPI skeleton (poll: swap causes, link, tx reclaim, rx under lock, deliver after unlock, napi_complete_done + rearm under rx with netif_running and MISSED recheck; open; stop; 2 KiB bounce per descriptor; Ops glue + wrapper). Per-chip: cause ack/mask, ring format and doorbell, link status. That is the engine boundary.
-- e1000 descriptors: raw volatile field writes through DmaCoherent::cpu_addr (TODO(unsafe)); publish-last coded by hand. Registers are bare consts (nothing says ICR is read-clear, IMC/IMS write-only). reset() spins 100k iterations without a time base.
-- xhci: two `Trb` types (hw/usb/xhci.rs, hw/usb/transfer.rs), three open-coded cycle-bit rings, u32 quirks + match, global USB_CONTROLLER, 35 unsafe.
-- IRQ: `fn(u32, *mut ()) -> bool` with raw `*mut ()` casts in ISRs.
-- Block: blk-mq `MqOps` (queue_rq/commit/complete in hardirq under hctx IrqSpinlock) is a sound engine boundary; block/scsi.rs `ScsiHost` exists (USB mass storage) → base for libata/SAT.
+- e1000.rs and virtio_net.rs duplicate one NAPI skeleton (poll: swap causes, link, tx reclaim, rx under lock, deliver after unlock, napi_complete_done + rearm under rx with netif_running and MISSED recheck; open; stop; 2 KiB bounce per descriptor; Ops glue + wrapper). Per-chip: cause ack/mask, ring format and doorbell, link status. That is the engine boundary.
+- e1000 descriptors: raw volatile field writes through DmaCoherent::cpu_addr; publish-last coded by hand. Registers are bare consts (nothing says ICR is read-clear, IMC/IMS write-only). reset() spins a fixed iteration count without a time base (`hw/net/e1000.rs`).
+- xhci: two `Trb` types (`hw/usb/xhci.rs`, `hw/usb/transfer.rs`), three open-coded cycle-bit rings, u32 quirks + match, global USB_CONTROLLER.
+- IRQ: `fn(u32, *mut ()) -> bool` with raw `*mut ()` casts in ISRs (`arch/x86_64/irq.rs`).
+- Block: blk-mq `MqOps` (queue_rq/commit/complete in hardirq under hctx IrqSpinlock) is a sound engine boundary; block/scsi.rs `ScsiHost` (USB mass storage) is the base for libata/SAT.
 - Net: `SkBuff` (net/skb.rs), `netif_rx`/`netif_receive_skb` (net/core/dev.rs), `NetDeviceOps::xmit(Box<SkBuff>)`.
-- Existing helpers: hw/pci/quirks.rs `PciFixup` (static match table), hw/virtio/ring.rs `Vring` + host `Fake` device (test template), arch barriers (dma_wmb/dma_rmb/wmb), util/pod.rs (Pod, FromBytes, IntoBytes, pod!), bitflags, offset_of!.
+- Helpers to build on: hw/pci/quirks.rs `PciFixup`, hw/virtio/ring.rs `Vring` + host `Fake` device (test template), arch barriers (dma_wmb/dma_rmb/wmb), util/pod.rs, bitflags, offset_of!.
 - Missing for the Dell: IOAPIC/MSI (BUGS.md), request_firmware, libata, RTL8168g driver, module loader.
 
 ## 2. Architecture
@@ -91,11 +90,11 @@ Lifecycle (doc §5.7, §7): `Loaded → Bound → Running → Quiescing → Revo
 Size L; risk high (interrupt delivery is everything). Tests: MSI-X on virtio-net/virtio-blk in QEMU (x86 + arm64), firmware load boot test (on Linux and hk: a test firmware in initramfs read through a test hook, or via a driver that needs firmware).
 
 ### H1 — planned series items, shaped for HADL (M3/M4)
-- Static PCI ID tables carrying typed family data (`PciDeviceId<D> { ..., data: &'static D }`, `PciDriver<D>`, `PciDriverDyn`), revision/subsystem matching; PciFixup on the same matcher. This is the in-kernel form of the package `MATCH` section.
+- PCI ID tables carrying typed family data (`PciDeviceId<D> { ..., data: &'static D }`, `PciDriver<D>`, `PciDriverDyn`; the Linux-shaped untyped `PciDeviceId`/`PciIds` and dynamic ids exist), revision matching; PciFixup on the same matcher. This is the in-kernel form of the package `MATCH` section.
 - Typed `request_irq<T: IrqHandler>` RAII (`IrqReturn`, `IrqRegistration`), MSI-X vectors (H0.2) included.
 - `DmaRing<T: Pod>` split into memory (volatile element/field access, `publish(i, v, own_field)`) and index/ownership state; `Field<T, F>` + `field!`; Le16/32/64 Pod newtypes.
 - IoMem ordered + `_relaxed` + a `RegIo` trait (engines generic over `R: RegIo = IoMem`), `MockRegs` for host tests.
-- DriverError→KernelError, bus/ ceremony removal, DmaAddr private constructor, xhci quirks as `PciDeviceId<XhciQuirks>` data.
+- DmaAddr private constructor (`hw/dma.rs`: `pub struct DmaAddr(pub u64)`), xhci quirks as `PciDeviceId<XhciQuirks>` data.
 
 ### H2 — hardware vocabulary
 - Typed registers `Reg<W, A>` (Ro, Wo, Rw, Rc, W1c), `RegArray`, `regs!` macro: the in-kernel form of `REGS`. Converts e1000, xhci, virtio common cfg.
@@ -107,7 +106,7 @@ Size L; risk high (interrupt delivery is everything). Tests: MSI-X on virtio-net
 ### H3 — Ethernet engine with zero-copy buffers (hw/net/eth.rs)
 - `EthDev<H: EthHw>`: owns rx/tx locks, NAPI poll (budget, deliver after unlock, complete + rearm under rx, MISSED recheck), open/stop, stats, LOCKING rows move to `EthDev.{rx,tx}` (same class/order).
 - `EthHw` trait: irq_causes / irq_mask / irq_unmask -> bool / link_up / tx_post(desc set) / tx_clean / rx_post(buffers) / rx_clean(f) / doorbells / start / stop.
-- **Zero-copy (Q7):** per-RX-queue `PagePool` (Linux page_pool): pages DMA-mapped once, recycled when the stack frees the SkBuff; RX descriptors point at pool fragments; received frames become `SkBuff`s that reference pool pages (frag ownership + release callback) instead of copied buffers. TX: map `SkBuff` data (linear + frags) directly via the DMA API (streaming map, unmap on completion) with scatter/gather descriptors where the ring supports it; copy only below a small threshold (Linux copybreak). Requires: SkBuff page fragments + destructor (net/skb.rs), streaming DMA map/unmap (keep or rebuild the API that M4 was going to delete: **do not delete it; reshape it for the engine**), cache sync on non-coherent arm64.
+- **Zero-copy (Q7):** per-RX-queue `PagePool` (Linux page_pool): pages DMA-mapped once, recycled when the stack frees the SkBuff; RX descriptors point at pool fragments; received frames become `SkBuff`s that reference pool pages (frag ownership + release callback) instead of copied buffers. TX: map `SkBuff` data (linear + frags) directly via the DMA API (streaming map, unmap on completion) with scatter/gather descriptors where the ring supports it; copy only below a small threshold (Linux copybreak). Requires: SkBuff page fragments + destructor (net/skb.rs), streaming DMA map/unmap (the API, kept and typed in M4, reshaped for the engine), cache sync on non-coherent arm64.
 - Converts e1000 and virtio-net (two commits, each gated).
 - Host tests: fake `EthHw` (budget, rearm race), pool recycle, ring models; QEMU throughput baseline before/after.
 
@@ -116,11 +115,7 @@ Size L; risk high (interrupt delivery is everything). Tests: MSI-X on virtio-net
 - RTL8168g native on `EthDev` (Dell; needs H0 + firmware), adding `OwnerRing`.
 - Extract `NicFamily` const descriptions from e1000/e1000e/RTL8168g: `REGS/DESC/QUEUE/IRQ/LIFE/VAR/FW` as Rust data, hooks as built-in fns. Chip files shrink to description + hooks. LOC ledger (doc §8 D): engine + vocabulary + descriptions + hooks.
 
-### SYS — sysfs + uevent (own phase, before H5 and the VT work)
-- Pragmatic sysfs (kobject/kset/attribute model as Linux) and uevent netlink (NETLINK_KOBJECT_UEVENT), driven by what modern Debian's udev, systemd-logind and modprobe read: /sys/bus, /sys/class (tty, input, net, block), /sys/devices tree, /sys/module, driver bind/unbind/new_id, MODALIAS/uevent files.
-- Tests on hk + Linux reference (paths, attribute contents, uevent on device add).
-
-### H5 — package format and loader (dynamic loading, data-only; after SYS)
+### H5 — package format and loader (dynamic loading, data-only)
 - Package container (`HEAD/SIGN/MATCH/ENGINE/CAPS/REGS/DESC/QUEUE/IRQ/LIFE/VAR/FW/HOOK`), built-in keyring + Ed25519 verification, taint for unsigned, bounded parser and validator in the kernel (every offset against claimed BARs, field layouts against descriptor size, op counts, engine version, hook ids against the built-in hook table), deserializes into the exact `NicFamily` structs from H4.
 - `tools/hkd`: host tool that builds packages from the H4 Rust const descriptions (or HADL source later), signs them, and emits modules.alias.
 - init_module / finit_module / delete_module fronting the loader; /proc/modules; CAP_SYS_MODULE; modules_disabled; signature enforcement; device rebinding on load; unload state machine (§3).
@@ -138,32 +133,15 @@ Size L; risk high (interrupt delivery is everything). Tests: MSI-X on virtio-net
 ### Later research (kept visible, not scheduled)
 Bytecode/IR for complex escapes with a verifier; JIT only if measured; userspace or VMX/EL2 compartments; IOMMU/SMMU domains; vendor-produced descriptions from SystemRDL/SVD.
 
-## 5. Alternatives (compared honestly)
-
-| Approach | Cost | Safety | Debug | Perf | stable no_std | Dynamic loading | Role |
-|---|---|---|---|---|---|---|---|
-| Linux-shaped cores + native drivers | lowest up front | good with wrappers | best | best | perfect | none by itself | kept: class cores |
-| Trait engines (`EthHw`) | M | chip code unsafe-free | good | zero overhead | perfect | through descriptions | **chosen (H3)** |
-| Const descriptions + bounded op scripts | M | validated | medium (needs trace: mmiotrace) | init-path only | perfect | **same structs deserialize from packages** | **chosen (H4→H5)** |
-| build.rs codegen from HADL source | M–L | as generated | worse | = engines | fine | none alone | optional authoring front end later |
-| Runtime binary description packages | L | validator is attack surface | poor without trace | resolved at bind | fine | direct | **chosen (H5), data-only first** |
-| proc-macro DSL | M + deps | good | medium | = engines | works | none | not needed (macro_rules!) |
-| Native modules, hk C-ABI | L | trusted, signed | good | best | fine | yes | **chosen (H7), escapes only** |
-| Native Linux .ko compatibility | XL | n/a | n/a | n/a | n/a | n/a | rejected (owner) |
-| Full HADL DSL + offline compiler | XL | compiler-dependent | worst early | ? | fine | via packages | after 3+ families; source front end for `tools/hkd` |
-
-## 6. First proof (doc Phase A–D mapped to hk)
+## 5. First proof (doc Phase A–D mapped to hk)
 1. H3 with e1000 + virtio-net (CI devices): engine boundary proven, zero-copy path in place, throughput not regressed.
 2. H4 e1000e (CI) + RTL8168g (Dell): cross-vendor (head/tail vs owner-bit rings), revisions, firmware.
 3. H5: the e1000e description loaded as a package from initramfs, unloaded, reloaded.
 Success: chip files contain no `unsafe`; e1000 ≤ ~300 lines (description + hooks), RTL8168g ≤ ~500 (excl. PHY tables); host tests for engine, rings, pools, package validator; no throughput/latency regression; LOCKING.md engine section; LOC ledger per doc §8 D; every commit gated.
 
-## 7. Risks
+## 6. Risks
 - Interrupt routing (H0) gates all real-hardware work; MSI-X on arm64 needs ITS/v2m.
 - Zero-copy touches the net stack's buffer ownership (SkBuff frags, destructors, page lifetime vs pool); needs careful LOCKING and lifetime rules; arm64 non-coherent sync if ever targeted.
 - RTL8168g PHY magic and firmware variants (Linux rtl8168g_1 hw_phy_config).
 - Package validator is new attack surface: fuzz it on the host (cargo test with corpus).
 - Unload safety across IRQ/DMA/SMP (doc §7): needs DMA fencing (bus-master disable + reset) before freeing memory.
-
-## 8. Open questions
-None remaining; decisions 1–13 in §0. New questions go to the owner as phases start.

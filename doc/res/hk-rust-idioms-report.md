@@ -1,54 +1,42 @@
 # Rust idioms for hk: what pays off in LOC
 
-Scope: kernel crate at HEAD `1b13f4d` (160.8k LOC .rs, excluding user/ and tools/),
-plus user/ (65.5k). Toolchain: `channel = "stable"`, which is rustc **1.99.0**, edition 2024.
-Feature stability was checked by compiling probes on 1.99.
-
-How it was measured: grep and Python counts over the tree. The big items were also
-applied to a throwaway copy of HEAD (in the session scratchpad, not the repo) and
-checked with `cargo check`/`clippy` on both arches. Numbers marked **measured** come
-from those runs; numbers marked **est.** are pattern counts times lines saved.
-
-The short answer: the codebase already uses most modern idioms (108 let-chains,
-128 `is_some_and`, 113 `matches!`, `[const {..}; N]`, `div_ceil`, `&raw const`).
-The real LOC is in **error plumbing at the syscall boundary** and in **lint-driven
-boilerplate**. The gut call on `Default` is partly right: it pays in a few big
-constructors and by deleting `impl Default` boilerplate. Wider use is limited
-because `Default` is not `const` on stable, so `const fn new()` has to stay for statics.
+Idioms (stable Rust, edition 2024) that cut boilerplate in the kernel crate. The LOC
+is in **error plumbing at the syscall boundary** and in **lint-driven boilerplate**;
+`Default` pays in a few big constructors and by deleting `impl Default` boilerplate
+(`Default` is not `const` on stable, so `const fn new()` stays for statics). Item 2
+belongs to doc/ROADMAP.md phase M1, the rest to S1.
 
 ## Ranking (LOC saved per unit of risk)
 
 | # | Item | Lines saved | Risk | Prio |
 |---|------|-------------|------|------|
-| 1 | Drop `new_without_default` boilerplate | **-420 measured** | ~0 (compiler-checked) | high |
-| 2 | `SysRet` trait + `From<UaccessError>`: `?` in `sys_*` | **-750 est.** | low-med (errno mapping) | high |
-| 3 | let-else for `match {Some(x)=>x, None=>return}` | **-288 measured** | ~0 | high |
-| 4 | `#[expect]` / delete dead code behind `allow(dead_code)` | **-200 est.** | ~0 | high |
-| 5 | Struct update `..Default::default()` / `..zeroed()` | -300 (kernel) / -120 (user) est. | low | med |
-| 6 | `bool::then` / `then_some` for `if c {Some(x)} else {None}` | -70 est. | low (eager eval) | med |
-| 7 | One `util/bytes` LE/BE reader on `first_chunk` | -40 est. | low | low |
-| 8 | `next_power_of_two` / `next_multiple_of` for hand-rolled ones | -25 est. | low (overflow) | low |
+| 1 | Drop `new_without_default` boilerplate | about -420 | ~0 (compiler-checked) | high |
+| 2 | `SysRet` trait + `From<UaccessError>`: `?` in `sys_*` | about -750 | low-med (errno mapping) | high |
+| 3 | let-else for `match {Some(x)=>x, None=>return}` | about -288 | ~0 | high |
+| 4 | `#[expect]` / delete dead code behind `allow(dead_code)` | about -200 | ~0 | high |
+| 5 | Struct update `..Default::default()` / `..zeroed()` | -300 (kernel) / -120 (user) | low | med |
+| 6 | `bool::then` / `then_some` for `if c {Some(x)} else {None}` | -70 | low (eager eval) | med |
+| 7 | One `util/bytes` LE/BE reader on `first_chunk` | -40 | low | low |
+| 8 | `next_power_of_two` / `next_multiple_of` for hand-rolled ones | -25 | low (overflow) | low |
 | 9 | Pointer-API lints (`&raw`, `.cast()`, `ptr::from_ref`) | 0 | 0 | med (policy) |
 
-Suggested order: 1 and 4 are mechanical and can be one commit each. Do 2 per
-subsystem, since it also removes most of item 3's `sysret` sites. Then do 3 on the
-rest and turn its lint on.
+Order: 1 and 4 are mechanical, one commit each. 2 goes per subsystem (M1) and also
+removes most of item 3's `sysret` sites; then 3 on the rest, with its lint on.
 
 ---
 
 ## 1. Delete `impl Default { Self::new() }`: allow `clippy::new_without_default`
 
 - **Feature:** clippy lint config (workspace `[lints.clippy]`). Not a new Rust feature.
-- **Evidence:** 92 `impl Default for`. Of these, 73 are exactly
+- **Evidence:** about 90 `impl Default for`. Of these, about 73 are exactly
   `fn default() -> Self { Self::new() }` (examples: `sync/waitqueue.rs`, `mm/heap.rs`,
   `fs/dentry.rs`, `time/mod.rs`, `signal/mod.rs` x6). They exist only to quiet
   `new_without_default`. Most are singletons (`KernelAlloc`, `DentryCache`,
   `TimeKeeper`, `ConsoleRegistry`) that nothing ever builds through `Default`.
-- **Measured:** removing all 73 compile-fails on only 3 types that really use
-  `Default`: `FileLock` (fs/locks.rs:39), `TaskSignalState` (signal/mod.rs:815) and
-  `SigAction` (8 sites in signal/mod.rs). Removing the other 70 and adding
-  `new_without_default = "allow"` gives **59 files, +1/-420**. Clippy is clean on
-  x86-64 and aarch64.
+- **Keep:** the 3 types that really use `Default`: `FileLock` (fs/locks.rs),
+  `TaskSignalState` and `SigAction` (signal/mod.rs). Remove the others and add
+  `new_without_default = "allow"`. Also turn the 7 non-const all-default `new()`s
+  into `derive(Default)` (about -50).
 - **Before/after**
   ```rust
   impl Default for WaitQueue {        // -6 lines, x70
@@ -75,7 +63,7 @@ rest and turn its lint on.
   - 85 x `if put_user(..).is_err() { return KernelError::BadAddress.sysret(); }`
   - 61 x `.map_err(|_| KernelError::BadAddress)`. There is no
     `impl From<UaccessError> for KernelError` (uaccess.rs:67).
-  - 3 copies of a local `fn ret()` (fs/perm.rs:52, fs/stat.rs:73, net/syscall.rs:23)
+  - 3 copies of a local `fn ret()` (fs/perm.rs:47, fs/stat.rs:73, net/syscall.rs:23)
   - 39 ad-hoc `Result<_, i64>` errno-as-error fns (fs/io.rs:198 `one_seg`, :210 `pos_arg`)
   - 171 raw errno literals (`return -22; // EINVAL`, `-ESRCH`, `Err(-14)`), which
     break the STYLE.md rule "No raw errno numbers"
@@ -154,10 +142,9 @@ rest and turn its lint on.
 - **Evidence:** clippy `manual_let_else` (pedantic, off today) finds **249 sites on
   x86-64 + 4 aarch64-only**. Grep agrees: 180 `Some` and 75 `Ok(_)/Err(_)` matches
   that diverge.
-- **Measured:** applying clippy's suggestions plus `cargo fmt` on a scratch copy gives
-  **50 files, +530/-818 = -288**. It builds on both arches; one follow-up
-  `unnecessary_cast` appears at task/percpu.rs:2408.
-- **Before/after** (main.rs:698):
+- **Action:** apply clippy's suggestions plus `cargo fmt` (about -288), then turn
+  the lint on.
+- **Before/after** (main.rs:626):
   ```rust
   let vfat_data = match arch::x86_64::multiboot2::find_module("vfat") {
       Some(data) => data,
@@ -173,11 +160,9 @@ rest and turn its lint on.
 
 ## 4. `#[expect(dead_code)]` (1.81) and deleting what it hides
 
-- **Evidence:** 147 `#[allow(dead_code)]` (142 plain + 5 inner), 0 `#[expect]`.
-  STYLE.md says "No dead or speculative code".
-- **Measured:** deleting every `allow(dead_code)` gives only **45 warnings on x86-64
-  and 54 on aarch64; 44 are shared**. So about 90 of the allows are stale, and about
-  44 items really are dead on both arches. Examples: `ADJ_OFFSET`, `TIME_INS..WAIT`
+- **Evidence:** over a hundred `#[allow(dead_code)]`, 0 `#[expect]`. STYLE.md says
+  "No dead or speculative code". Most of the allows are stale; dozens of items are
+  really dead on both arches. Examples: `ADJ_OFFSET`, `TIME_INS..WAIT`
   (time/time_syscall.rs:954-977); `gfx_io/ior/iow` (gfx/ioctl.rs:19-32);
   `cmdline_console_count`/`get_cmdline_console`/`primary_cmdline_console`
   (cmdline.rs:230-251); `get_last_cluster`, `update_dir_entry_size` (fs/vfat.rs:718,
@@ -185,7 +170,7 @@ rest and turn its lint on.
   io/fanotify.rs:249-315, ipc/msg.rs:63-74.
 - **Action:**
   - Remove the stale allows (about -90 lines).
-  - Delete the dead items (about -100+ lines, est.).
+  - Delete the dead items (about -100 lines).
   - Anything kept for ABI completeness gets
     `#[expect(dead_code, reason = "uapi constant")]`, so it warns once it becomes used.
   - Arch-only deadness gets `cfg_attr(target_arch=..., expect(..))`, or the item moves
@@ -204,8 +189,7 @@ rest and turn its lint on.
     task/percpu.rs:1237/1443/2109 `TaskInner` (22/19/15); task/misc.rs:80 `SysInfo`
     (14); hw/usb/xhci.rs:753 (13); fs/stat.rs:370 `Statx` (13); ns/net.rs:105;
     net/skb.rs:101.
-- **Verified:** `#[derive(Default)]` on `TcpCb` fails only because `TcpState` has no
-  default. Adding `#[default] Closed` (net/tcp/cb.rs:48) makes the 62-line ctor about 10:
+- `#[derive(Default)]` on `TcpCb` fails only because `TcpState` has no default. Adding `#[default] Closed` (net/tcp/cb.rs:48) makes the 62-line ctor about 10:
   ```rust
   pub fn new(cfg: Cfg) -> Self {
       Self { cfg, snd_cap: 64 * 1024, rcv_cap: 64 * 1024, mss: MSS_DEFAULT,
@@ -230,8 +214,7 @@ rest and turn its lint on.
   - This removes `unsafe` from tests too.
 - **Limits and risk:**
   - Not usable in `const` contexts: `Default` isn't const on stable, and
-    default-field-values (`a: u32 = 0`) is **still unstable on 1.99 (verified
-    E0658)**. So `ZERO_CONTEXT` (arch/x86_64/context.rs:339) and the 25
+    default-field-values (`a: u32 = 0`) is unstable. So `ZERO_CONTEXT` (arch/x86_64/context.rs:339) and the 25
     all-default `const fn new()` stay.
   - Semantic risk: a new field silently defaults to 0. Fine for counters and state;
     review the `TaskInner` sites, where `exit_signal` and `leader` differ per path.
@@ -276,7 +259,7 @@ rest and turn its lint on.
 
 ## 8. Integer helpers: `next_power_of_two`, `next_multiple_of` (1.73), `is_multiple_of` (1.87)
 
-- io/io_uring.rs:1394 `round_up_pow2` (12 lines of bit-smearing) becomes
+- io/io_uring.rs:1368 `round_up_pow2` (12 lines of bit-smearing) becomes
   `n.max(1).next_power_of_two()`. Callers must bound `n`, since it panics in debug
   above 2^31.
 - `align_up`/`round_up` (fs/cpio.rs:255, mm/heap.rs:103) and 14 open-coded
@@ -290,13 +273,13 @@ rest and turn its lint on.
 
 ## 9. Pointer APIs: enforce UNSAFE.md rule 7 with lints (0 LOC, policy)
 
-- UNSAFE.md mandates `&raw` and the provenance APIs. Clippy, run on a scratch copy, shows:
+- UNSAFE.md mandates `&raw` and the provenance APIs. Clippy's pointer lints flag:
   - `borrow_as_ptr` 57 (`&x as *const T`, should be `&raw const x`, 1.82)
   - `ptr_as_ptr` 114 (should be `.cast()`)
   - `ref_as_ptr` 55 (should be `ptr::from_ref`, 1.76)
   - `ptr_cast_constness` 34 (should be `cast_mut`/`cast_const`)
-- One `addr_of!` is left at hw/usb/xhci.rs:688; rule 7 forbids it.
-- The `phys_to_virt` chokepoints (arch/x86_64/paging.rs:60, arch/aarch64/paging.rs:68)
+- One `addr_of!` is left at hw/usb/xhci.rs:603; rule 7 forbids it.
+- The `phys_to_virt` chokepoints (arch/x86_64/paging.rs:61, arch/aarch64/paging.rs:69)
   do `(phys + PAGE_OFFSET) as *mut u8`. Rule 7 says they use
   `with_exposed_provenance_mut` (1.84). The semantics are the same, but the code and
   the doc disagree.
@@ -311,43 +294,12 @@ rest and turn its lint on.
 
 - `#[diagnostic::on_unimplemented]` (1.78) on `FromBytes`/`IntoBytes`
   (util/pod.rs:23) gives readable `pod!` errors ("field X is not plain data"). 0 LOC.
-- `cfg_select!` (stable on 1.99, verified): 34 adjacent `#[cfg(x86_64)]` /
+- `cfg_select!` (stable): about 34 adjacent `#[cfg(x86_64)]` /
   `#[cfg(aarch64)]` pairs. About 1 line saved each, but CLAUDE.md wants those moved
   into `arch/`, not prettified.
 
-## Considered and rejected
+## Comment LOC (not idioms; ROADMAP S2)
 
-- **default field values** (`a: u32 = 0`): unstable on 1.99 (verified).
-- **const `Default` / const trait impls**: unstable. That is why the 25 all-default
-  `const fn new()` used by statics can't become `derive(Default)` (only 7 non-const
-  ones can, about -50 lines; fold those into item 1).
-- **`core::cell::OnceCell`/`LazyCell` (1.70/1.80)** in place of `spin::Once`/`Lazy`
-  (50 sites): they are `!Sync` so unusable in statics. `OnceLock`/`LazyLock` are std-only.
-- **More let-chains (1.88)**: already 108 uses; clippy `collapsible_if` enforces them;
-  about 30 nested candidates remain, most with statements between.
-- **`mem::take`/`mem::replace`**: already used idiomatically (46 sites); no
-  clone-then-clear patterns found.
-- **enum `#[default]`**: already used (4); the only new need is `TcpState` (item 5).
-- **`array::from_fn`, inline `const {}` array init, `div_ceil`, `is_some_and`/`is_none_or`**:
-  already adopted (0 open-coded `div_ceil`, 0 `map_or(false, ..)`).
-- **GATs, RPITIT/async-fn-in-trait, `impl Trait` in more positions**: no executor
-  and no trait-object pain points; no LOC payoff.
-- **`cast_lossless` / `u64::from` everywhere** (735 sites): STYLE prefers `from`,
-  but it adds characters; not a LOC win.
-- **`option_if_let_else` / `map_or_else`** (101 sites): usually less readable than `if let`.
-- **`chunk_by`, `map_while`, `array_windows`, `repeat_n`**: no hand-written loops
-  of those shapes found (4 `for i in 0..x.len()` total).
-- **`Box::new_zeroed`**: no large `Box::new([0; N])` stack temporaries found.
-- **`strict_*` / `unbounded_sh*` arithmetic**: niche; `checked_*`/`saturating_*`
-  are already standard (315 sites).
-
-## Noticed in passing (not idioms, but LOC or correctness)
-
-- 1067 `// =====` banner lines and 479 `/// # Arguments` / `/// # Returns` sections
+- About a thousand `// =====` banner lines and hundreds of `/// # Arguments` / `/// # Returns` sections
   on `sys_*` fns. These are the largest pure-comment LOC sinks; STYLE.md says
   comments should say why.
-- `put_user`/`get_user` return EFAULT for **unaligned** user pointers
-  (uaccess.rs:271). Linux x86-64 and arm64 accept unaligned user addresses. This may
-  be an ABI deviation; worth a boot test.
-- 171 raw errno literals (time/posix_timer.rs:775 `return -22`, `-ESRCH`
-  sites): a STYLE violation that item 2 removes.

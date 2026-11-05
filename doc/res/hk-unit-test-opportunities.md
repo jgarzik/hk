@@ -2,8 +2,8 @@
 
 Survey of the kernel crate (repo root, ~all subsystems) for code that runs under
 `make test` (= `cargo test -p hk-kernel` on the x86-64 and arm64 CI hosts) and is
-untested or thinly tested. Read-only survey against the tree at `58a3100` plus the
-uncommitted edits present at the time. Line numbers are approximate to that tree.
+untested or thinly tested. Line numbers are approximate. Bugs these tests would catch
+are in BUGS.md ("Allocation sizing and pure-code gaps").
 
 ## Conventions (from existing tests)
 
@@ -64,12 +64,7 @@ instance; "medium" = needs a small fixture or cfg(test) shim.
   interpreter; the seccomp path has **no tests** (`bpf/verifier.rs` has 3 unrelated ones).
 - Coverage: none. Boot test `user/boot_tester/tests/seccomp.rs` only compares
   `nr == getppid` (a small K).
-- Bugs a test catches today (see "Notable findings"): JEQ/JGT/JGE against
-  K >= 0x80000000 never match (sign-extended immediate), so every libseccomp-style
-  `jeq #AUDIT_ARCH_X86_64` (0xC000003E) arch check fails; a conditional with jt=jf=0
-  shifts every later jump fixup by one and can index past the eBPF vector (kernel
-  panic); scratch memory M[] (ST/LD MEM) always yields 0 = KILL_THREAD because R10 is 0;
-  ALU32 DIV/MOD by K >= 2^31 is wrong.
+- Bugs these tests catch: BUGS.md seccomp cBPF items.
 - Tests to write (all pure: build `SockFilter` arrays, run `SeccompFilter::from_cbpf(..).run(&SeccompData{..})`):
   - libseccomp prologue: `ld [4]; jeq #0xC000003E,1,0; ret KILL; ld [0]; jeq #nr,0,1; ret ERRNO|5; ret ALLOW`.
   - `jge`/`jgt` with K = 0x80000000 and 0xFFFFFFFF; `jset` with the high bit.
@@ -83,16 +78,14 @@ instance; "medium" = needs a small fixture or cfg(test) shim.
   - Filter chains: KILL_PROCESS beats everything, ties keep the newest filter's data,
     ERRNO data clamps to 4095, unknown action is KillProcess, STRICT allows only
     read/write/exit/exit_group/rt_sigreturn (arch-specific numbers).
-  - `bpf_run` direct: a backward JA (`off = -1`) must terminate (the bound counts `pc`,
-    not steps, so it currently loops forever).
+  - `bpf_run` direct: a backward JA (`off = -1`) must terminate.
 - Value/effort: highest value (security, ABI: systemd/docker/chrome filters), easy.
 
 ### 2. sysctl integer parsing: `sysctl.rs:80` `parse`
 - What: every integer /proc/sys write (Linux `__do_proc_dointvec`).
 - Coverage: partial (`parse_vectors`: spacing, extra values, a negative, garbage).
-- Gaps / Linux expectations: Linux parses base 0, so `0x10` = 16 and `010` = 8; hk
-  rejects `0x10` and reads `010` as 10. Linux rejects `+5` (needs a digit after an
-  optional `-`); Rust's `i64::from_str` accepts it. Also: a lone `-` (Linux EINVAL),
+- Linux expectations: base 0 (`0x10` = 16, `010` = 8), `+5` rejected (BUGS.md), a lone
+  `-` (Linux EINVAL),
   21+ digit tokens (Linux EINVAL), values beyond i32 for int sysctls (Linux EINVAL,
   `proc_dointvec` conv), trailing NULs, `\t`/`\n` separators.
 - Also `sysctl.rs:116` `permission`: euid 0 owner bits, egid 0 group bits,
@@ -101,10 +94,9 @@ instance; "medium" = needs a small fixture or cfg(test) shim.
 
 ### 3. Process accounting encoders: `task/acct.rs:119` `encode_comp_t`, `:145` `encode_elapsed_float`
 - Coverage: none.
-- Linux `kernel/acct.c` diffs a test exposes: comp_t lacks Linux's round-to-nearest
-  (`rnd = value & 4` before each `>>= 3`, then carry), e.g. 8196 -> Linux 0x2401, hk
-  0x2400; `ac_etime` in Linux v3 is `encode_float(nsec_to_AHZ(elapsed))`, a float of
-  AHZ=100 ticks built by shifting (truncation), hk stores seconds as `f32` (100x off).
+- Linux `kernel/acct.c`: comp_t rounds to nearest (`rnd = value & 4` before each
+  `>>= 3`, then carry: 8196 -> 0x2401); `ac_etime` is `encode_float(nsec_to_AHZ(elapsed))`,
+  a float of AHZ=100 ticks built by shifting (truncation). hk's gaps: BUGS.md.
 - Cases: 0, 8191, 8192, 8196, 65535, 2^24, u64::MAX (0xFFFF); encode_float of
   1, 100, 2^24+1 (truncation), 2^40.
 - Value: medium (ABI for `lastcomm`/`sa`), trivial.
@@ -281,12 +273,11 @@ instance; "medium" = needs a small fixture or cfg(test) shim.
   is public; wake_all with no waiters is fine on host.
 - Value: medium (glibc/systemd use it), easy.
 
-### 21. cgroup value parsers: `cgroup/memory.rs:302` `parse_memory_size`, `cgroup/io.rs:379` `parse_io_value`; inline parses in `cgroup/cpu.rs:289` `cpu_max_write`, `:330` `cpu_weight_write`, `cgroup/pids.rs:241` `pids_max_write`
+### 21. cgroup value parsers: `cgroup/memory.rs:166` `parse_memory_size`, `cgroup/io.rs:247` `parse_io_value`; inline parses in `cgroup/cpu.rs:188` `cpu_max_write`, `:227` `cpu_weight_write`, `cgroup/pids.rs:261` `pids_max_write`
 - Coverage: none.
-- Cases (Linux `memparse` / `page_counter_memparse`): K/M/G and also T/P/E suffixes
-  (hk: no T/P/E), `max`, whitespace, overflow -> EINVAL vs Linux ERANGE, byte values
+- Cases (Linux `memparse` / `page_counter_memparse`): K/M/G/T/P/E suffixes, `max`, whitespace, overflow -> EINVAL vs Linux ERANGE, byte values
   rounded down to pages; cpu.max `"max 100000"`, `"50000"` (period default),
-  zero/too small quota; cpu.weight 0 and 10001 EINVAL; pids.max `max`.
+  zero/too small quota (EINVAL); cpu.weight 0 and 10001 EINVAL; pids.max `max`.
 - Value: medium (container managers write these), easy for the two pure ones; the
   rest need the parse split out (see near-misses).
 
@@ -342,11 +333,6 @@ instance; "medium" = needs a small fixture or cfg(test) shim.
   asm-generic errno.h (EDEADLK 35, ENOTSUP 95, ERESTARTSYS 512).
 - Value: low, trivial.
 
-### Already well covered (add only edge cases)
-TCP control block (`net/tcp/tests.rs`, 55), page allocator (18), USB PCI quirks (13),
-`util/elf.rs` (10), ACPI HW/AML (16), partition tables MBR/GPT (14), neighbour state
-machine (8), xarray, memblock, fdbits, frag, port/SipHash, kmsg, ChaCha, binfmt_script.
-
 ## Near-misses (need a pure core split out)
 
 - **Host `UaccessArch`** (`uaccess.rs:101` trait): a `#[cfg(test)]` impl whose
@@ -365,11 +351,10 @@ machine (8), xarray, memblock, fdbits, frag, port/SipHash, kmsg, ChaCha, binfmt_
   including CAP_IPC_OWNER and the possessor bits.
 - **adjtimex** (`time/time_syscall.rs:1001`): validation and the NTP field updates sit
   between `get_user` and `put_user`. Extract `fn adjtimex_apply(ntp: &mut Ntp, txc: &Timex, cap: bool)`;
-  tests would also show Linux deviations: ADJ_FREQUENCY is ignored (freq reads back
-  0) and ADJ_TIMECONST is stored unclamped (Linux clamps to 0..MAXTC, +4 without STA_NANO).
+  tests would also catch its Linux deviations (BUGS.md).
 - **readv/writev iovec checks** (`fs/iov.rs:41`): copy and validation are one function;
   split validation of the copied array so `iov_len` > MAX_RW_COUNT or negative as
-  ssize_t can be tested (Linux EINVAL; hk returns EFAULT via `access_ok`).
+  ssize_t can be tested (Linux EINVAL; BUGS.md).
 - **cgroup knob writers** (`cgroup/cpu.rs:289`, `cgroup/pids.rs:241`, memory.max): parse
   inline on a `CgroupSubsysState`; a `parse_max_u64(&str) -> Result<Option<u64>>`
   shared helper is both testable and removes duplication.
@@ -397,43 +382,3 @@ machine (8), xarray, memblock, fdbits, frag, port/SipHash, kmsg, ChaCha, binfmt_
 - **SysV semaphores** (`ipc/sem.rs`, 1148 lines): the "try all sops atomically, else
   undo" core and SEM_UNDO adjustment math (SEMVMX bounds, ERANGE) would be worth a
   pure function over a `&mut [u16]` value array.
-
-## Notable findings (not fixed)
-
-1. **seccomp: compares against K >= 0x80000000 never match** (`bpf/convert.rs:348`
-   `convert_jmp`, executed by `bpf/interp.rs:146-167`). The converter emits
-   `BPF_JMP|op|BPF_K` with `imm = k as i32`; the interpreter sign-extends `imm` to 64
-   bits (correct eBPF) while A is a zero-extended u32, so `jeq #0xC000003E` compares
-   against 0xFFFFFFFF_C000003E. Linux's `bpf_convert_filter` handles exactly this
-   (`(int)fp->k < 0` -> MOV32 to a temp and compare with BPF_X). Effect: the standard
-   arch check in libseccomp/systemd/docker/chrome filters fails, so those programs take
-   the "wrong arch" branch (usually KILL). JGT/JGE against such K are also wrong. The
-   interpreter's JMP32+K path has the matching bug (sign-extended imm compared against
-   a u32).
-2. **seccomp: a conditional jump with jt = jf = 0 breaks jump fixup**
-   (`bpf/convert.rs:509` `fixup_jumps`). `convert_jmp` emits nothing for it, but
-   `fixup_jumps` still takes the `jf == 0` branch, writes `off` into whatever eBPF
-   instruction is at `ebpf_idx` and advances `ebpf_idx`, desynchronising every later
-   jump. `[jeq 0,0; jeq 0,0; jeq 0,0; ret k]` passes `validate_cbpf` and indexes
-   `ebpf[2]` of a 2-element vector: a kernel panic reachable by an unprivileged
-   process (no_new_privs + seccomp(SET_MODE_FILTER)). A corrupted offset can also
-   produce a backward jump, and `bpf_run`'s bound (`pc > BPF_MAXINSNS`) does not stop
-   loops, so the kernel can spin forever in syscall entry.
-3. **seccomp: cBPF scratch memory always kills**: `bpf_run` sets R10 = 0
-   (`bpf/interp.rs:31`) while ST/LD MEM are converted to `[R10 - 4(k+1)]`, which is
-   outside the stack check, so the program returns 0 (SECCOMP_RET_KILL_THREAD).
-4. **seccomp accepts filters Linux rejects**: `validate_cbpf` allows LD H/B ABS, LD IND,
-   LDX MSH, unaligned or out-of-range `ld [k]`, `div #0`, RET X; Linux
-   `seccomp_check_filter` returns EINVAL. ALU32 DIV/MOD by K >= 2^31 uses the
-   sign-extended immediate (wrong quotient).
-5. **sysctl integer writes are not Linux-compatible** (`sysctl.rs:80`): base 0 parsing
-   is missing (`0x10` EINVAL, `010` = 10 vs Linux 8) and `+5` is accepted.
-6. **acct records**: `ac_etime` is seconds as f32 instead of Linux's AHZ ticks
-   (100x off) and `encode_comp_t` does not round like Linux (`task/acct.rs:119,145`).
-7. **Minor**: `fs/posix_lock.rs:328` `(-flock.l_len)` overflows for `i64::MIN`
-   (panic in overflow-checked builds) and lengths past i64::MAX are accepted (Linux
-   EOVERFLOW); `arch/x86_64/rtc.rs:131` indexes `DAYS_IN_MONTH` with an unvalidated
-   CMOS month (panic for month >= 14) and keeps 12 AM as hour 12; `fs/vfat.rs:1109`
-   can produce a short name starting with a space when the base cleans to empty;
-   `fs/dac.rs:7` doc says there are no supplementary groups, the code uses them;
-   `dt/mod.rs` panics instead of returning `DtError` on out-of-range offsets.
