@@ -345,85 +345,77 @@ impl Inotify {
             return Err(KernelError::InvalidArgument);
         }
 
-        loop {
-            let mut inner = self.inner.lock();
-
-            if !inner.events.is_empty() {
-                let mut bytes_written = 0;
-
-                // Copy as many events as will fit
-                while !inner.events.is_empty() {
-                    let event = &inner.events[0];
-                    let event_size = event.serialized_size();
-
-                    if bytes_written + event_size > buf.len() {
-                        if bytes_written == 0 {
-                            // First event doesn't fit
-                            return Err(KernelError::InvalidArgument);
-                        }
-                        break;
-                    }
-
-                    // Remove event from queue
-                    let event = inner.events.remove(0);
-
-                    // Serialize header
-                    let name_len = event.name.as_ref().map(|n| n.len() + 1).unwrap_or(0);
-                    let padded_len = if name_len > 0 {
-                        (name_len + 15) & !15
-                    } else {
-                        0
-                    };
-
-                    let header = InotifyEventHeader {
-                        wd: event.wd,
-                        mask: event.mask,
-                        cookie: event.cookie,
-                        len: padded_len as u32,
-                    };
-
-                    // Copy header
-                    let header_bytes = unsafe {
-                        core::slice::from_raw_parts(
-                            (&raw const header).cast::<u8>(),
-                            INOTIFY_EVENT_HEADER_SIZE,
-                        )
-                    };
-                    buf[bytes_written..bytes_written + INOTIFY_EVENT_HEADER_SIZE]
-                        .copy_from_slice(header_bytes);
-                    bytes_written += INOTIFY_EVENT_HEADER_SIZE;
-
-                    // Copy name if present
-                    if let Some(name) = event.name {
-                        let name_bytes = name.as_bytes();
-                        buf[bytes_written..bytes_written + name_bytes.len()]
-                            .copy_from_slice(name_bytes);
-                        bytes_written += name_bytes.len();
-                        // Null terminator
-                        buf[bytes_written] = 0;
-                        bytes_written += 1;
-                        // Padding
-                        let padding = padded_len - name_bytes.len() - 1;
-                        for i in 0..padding {
-                            buf[bytes_written + i] = 0;
-                        }
-                        bytes_written += padding;
-                    }
-                }
-
-                return Ok(bytes_written);
-            }
-
-            drop(inner);
-
+        let mut inner = self.inner.lock();
+        if inner.events.is_empty() {
             if nonblock {
                 return Err(KernelError::WouldBlock);
             }
-
             // Wait for events (a signal ends the wait)
             self.wait_queue
-                .wait_event_interruptible(|| !self.inner.lock().events.is_empty())?;
+                .wait_event_interruptible_locked(&mut inner, |i| !i.events.is_empty())?;
         }
+        let mut bytes_written = 0;
+
+        // Copy as many events as will fit
+        while !inner.events.is_empty() {
+            let event = &inner.events[0];
+            let event_size = event.serialized_size();
+
+            if bytes_written + event_size > buf.len() {
+                if bytes_written == 0 {
+                    // First event doesn't fit
+                    return Err(KernelError::InvalidArgument);
+                }
+                break;
+            }
+
+            // Remove event from queue
+            let event = inner.events.remove(0);
+
+            // Serialize header
+            let name_len = event.name.as_ref().map(|n| n.len() + 1).unwrap_or(0);
+            let padded_len = if name_len > 0 {
+                (name_len + 15) & !15
+            } else {
+                0
+            };
+
+            let header = InotifyEventHeader {
+                wd: event.wd,
+                mask: event.mask,
+                cookie: event.cookie,
+                len: padded_len as u32,
+            };
+
+            // Copy header
+            let header_bytes = unsafe {
+                core::slice::from_raw_parts(
+                    (&raw const header).cast::<u8>(),
+                    INOTIFY_EVENT_HEADER_SIZE,
+                )
+            };
+            buf[bytes_written..bytes_written + INOTIFY_EVENT_HEADER_SIZE]
+                .copy_from_slice(header_bytes);
+            bytes_written += INOTIFY_EVENT_HEADER_SIZE;
+
+            // Copy name if present
+            if let Some(name) = event.name {
+                let name_bytes = name.as_bytes();
+                buf[bytes_written..bytes_written + name_bytes.len()].copy_from_slice(name_bytes);
+                bytes_written += name_bytes.len();
+                // Null terminator
+                buf[bytes_written] = 0;
+                bytes_written += 1;
+                // Padding
+                let padding = padded_len - name_bytes.len() - 1;
+                for i in 0..padding {
+                    buf[bytes_written + i] = 0;
+                }
+                bytes_written += padding;
+            }
+        }
+
+        Ok(bytes_written)
     }
 
     /// Poll for readiness

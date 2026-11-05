@@ -90,36 +90,27 @@ impl Eventfd {
     /// In normal mode, resets counter to 0.
     /// In semaphore mode, decrements counter by 1.
     pub fn read(&self, nonblock: bool) -> Result<u64, KernelError> {
-        loop {
-            {
-                let mut inner = self.inner.lock();
-                if inner.count > 0 {
-                    let value = if inner.is_semaphore() {
-                        // Semaphore mode: return 1, decrement by 1
-                        inner.count -= 1;
-                        1
-                    } else {
-                        // Normal mode: return count, reset to 0
-                        let count = inner.count;
-                        inner.count = 0;
-                        count
-                    };
-
-                    // Wake any blocked writers since we freed up space
-                    drop(inner);
-                    self.wait_queue.wake_all();
-                    return Ok(value);
-                }
-            }
-
+        let mut inner = self.inner.lock();
+        if inner.count == 0 {
             if nonblock {
                 return Err(KernelError::WouldBlock);
             }
-
             // Wait for someone to write (a signal ends the wait)
             self.wait_queue
-                .wait_event_interruptible(|| self.inner.lock().count > 0)?;
+                .wait_event_interruptible_locked(&mut inner, |i| i.count > 0)?;
         }
+        let value = if inner.is_semaphore() {
+            // Semaphore mode: return 1, decrement by 1
+            inner.count -= 1;
+            1
+        } else {
+            // Normal mode: return count, reset to 0
+            core::mem::take(&mut inner.count)
+        };
+        // Wake any blocked writers since we freed up space
+        drop(inner);
+        self.wait_queue.wake_all();
+        Ok(value)
     }
 
     /// Write to the eventfd (adds to counter)
@@ -133,28 +124,21 @@ impl Eventfd {
             return Err(KernelError::InvalidArgument);
         }
 
-        loop {
-            {
-                let mut inner = self.inner.lock();
-                // Check if we can add without overflow
-                // Must have room for at least value more (count + value < ULLONG_MAX)
-                if ULLONG_MAX - inner.count > value {
-                    inner.count += value;
-                    // Wake any blocked readers
-                    drop(inner);
-                    self.wait_queue.wake_all();
-                    return Ok(8);
-                }
-            }
-
+        let mut inner = self.inner.lock();
+        // Room for `value` more: count + value < ULLONG_MAX
+        if ULLONG_MAX - inner.count <= value {
             if nonblock {
                 return Err(KernelError::WouldBlock);
             }
-
             // Wait for someone to read (a signal ends the wait)
             self.wait_queue
-                .wait_event_interruptible(|| ULLONG_MAX - self.inner.lock().count > value)?;
+                .wait_event_interruptible_locked(&mut inner, |i| ULLONG_MAX - i.count > value)?;
         }
+        inner.count += value;
+        // Wake any blocked readers
+        drop(inner);
+        self.wait_queue.wake_all();
+        Ok(8)
     }
 
     /// Poll for readiness

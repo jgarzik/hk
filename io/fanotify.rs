@@ -430,66 +430,59 @@ impl Fanotify {
             return Err(KernelError::InvalidArgument);
         }
 
-        loop {
-            let mut inner = self.inner.lock();
-
-            if !inner.events.is_empty() {
-                let mut bytes_written = 0;
-
-                // Copy as many events as will fit
-                while !inner.events.is_empty() {
-                    let event = &inner.events[0];
-                    let event_size = event.serialized_size();
-
-                    if bytes_written + event_size > buf.len() {
-                        if bytes_written == 0 {
-                            // First event doesn't fit
-                            return Err(KernelError::InvalidArgument);
-                        }
-                        break;
-                    }
-
-                    // Remove event from queue
-                    let event = inner.events.remove(0);
-
-                    // Create metadata structure
-                    // Note: In a full implementation, we would open the file here
-                    // and pass the fd. For now, we pass -1 (FAN_NOFD equivalent).
-                    let metadata = FanotifyEventMetadata {
-                        event_len: FANOTIFY_METADATA_SIZE as u32,
-                        vers: FANOTIFY_METADATA_VERSION,
-                        reserved: 0,
-                        metadata_len: FANOTIFY_METADATA_SIZE as u16,
-                        mask: event.mask,
-                        fd: -1, // FAN_NOFD - file descriptor not provided
-                        pid: event.pid,
-                    };
-
-                    // Copy metadata to buffer
-                    let metadata_bytes = unsafe {
-                        core::slice::from_raw_parts(
-                            (&raw const metadata).cast::<u8>(),
-                            FANOTIFY_METADATA_SIZE,
-                        )
-                    };
-                    buf[bytes_written..bytes_written + FANOTIFY_METADATA_SIZE]
-                        .copy_from_slice(metadata_bytes);
-                    bytes_written += FANOTIFY_METADATA_SIZE;
-                }
-
-                return Ok(bytes_written);
-            }
-
-            drop(inner);
-
+        let mut inner = self.inner.lock();
+        if inner.events.is_empty() {
             if nonblock {
                 return Err(KernelError::WouldBlock);
             }
-
             // Wait for events (a signal ends the wait)
             self.wait_queue
-                .wait_event_interruptible(|| !self.inner.lock().events.is_empty())?;
+                .wait_event_interruptible_locked(&mut inner, |i| !i.events.is_empty())?;
         }
+        let mut bytes_written = 0;
+
+        // Copy as many events as will fit
+        while !inner.events.is_empty() {
+            let event = &inner.events[0];
+            let event_size = event.serialized_size();
+
+            if bytes_written + event_size > buf.len() {
+                if bytes_written == 0 {
+                    // First event doesn't fit
+                    return Err(KernelError::InvalidArgument);
+                }
+                break;
+            }
+
+            // Remove event from queue
+            let event = inner.events.remove(0);
+
+            // Create metadata structure
+            // Note: In a full implementation, we would open the file here
+            // and pass the fd. For now, we pass -1 (FAN_NOFD equivalent).
+            let metadata = FanotifyEventMetadata {
+                event_len: FANOTIFY_METADATA_SIZE as u32,
+                vers: FANOTIFY_METADATA_VERSION,
+                reserved: 0,
+                metadata_len: FANOTIFY_METADATA_SIZE as u16,
+                mask: event.mask,
+                fd: -1, // FAN_NOFD - file descriptor not provided
+                pid: event.pid,
+            };
+
+            // Copy metadata to buffer
+            let metadata_bytes = unsafe {
+                core::slice::from_raw_parts(
+                    (&raw const metadata).cast::<u8>(),
+                    FANOTIFY_METADATA_SIZE,
+                )
+            };
+            buf[bytes_written..bytes_written + FANOTIFY_METADATA_SIZE]
+                .copy_from_slice(metadata_bytes);
+            bytes_written += FANOTIFY_METADATA_SIZE;
+        }
+
+        Ok(bytes_written)
     }
 
     /// Poll for readiness

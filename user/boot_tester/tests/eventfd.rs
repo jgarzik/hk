@@ -7,11 +7,12 @@
 //! - Test eventfd semaphore mode
 //! - Test eventfd nonblock
 //! - Test eventfd poll
+//! - Blocking read woken by a write; blocking write woken by a read
 
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
-    EFD_NONBLOCK, EFD_SEMAPHORE, POLLIN, PollFd, sys_close, sys_eventfd2, sys_poll, sys_read,
-    sys_write,
+    EFD_NONBLOCK, EFD_SEMAPHORE, POLLIN, PollFd, Timespec, sys_close, sys_eventfd2, sys_exit,
+    sys_fork, sys_nanosleep, sys_poll, sys_read, sys_wait4, sys_write,
 };
 
 /// Run all eventfd tests
@@ -22,6 +23,8 @@ pub fn run_tests() {
     test_eventfd_semaphore();
     test_eventfd_nonblock();
     test_eventfd_poll();
+    test_eventfd_block_read();
+    test_eventfd_block_write();
 }
 
 /// Test eventfd2 creation
@@ -285,4 +288,69 @@ fn test_eventfd_poll() {
 
     sys_close(fd as u64);
     println(b"EVENTFD_POLL:OK");
+}
+
+/// A child that sleeps 20 ms, then runs `f` on `fd` and exits 0 if it
+/// returns true
+fn after_delay(fd: i64, f: fn(i64) -> bool) -> i64 {
+    let pid = sys_fork();
+    if pid == 0 {
+        let ts = Timespec {
+            tv_sec: 0,
+            tv_nsec: 20_000_000,
+        };
+        sys_nanosleep(&ts, core::ptr::null_mut());
+        sys_exit(if f(fd) { 0 } else { 1 });
+    }
+    pid
+}
+
+fn reaped_ok(pid: i64) -> bool {
+    let mut status = 0i32;
+    sys_wait4(pid, &mut status, 0, 0) == pid && status == 0
+}
+
+/// A read of an empty eventfd sleeps until another process writes
+fn test_eventfd_block_read() {
+    let fd = sys_eventfd2(0, 0);
+    let pid = after_delay(fd, |fd| {
+        sys_write(fd as u64, 5u64.to_ne_bytes().as_ptr(), 8) == 8
+    });
+    let mut buf = [0u8; 8];
+    let ret = sys_read(fd as u64, buf.as_mut_ptr(), 8);
+    let ok = reaped_ok(pid);
+    sys_close(fd as u64);
+    if ret == 8 && u64::from_ne_bytes(buf) == 5 && ok {
+        println(b"EVENTFD_BLOCK_READ:OK");
+    } else {
+        print(b"EVENTFD_BLOCK_READ:FAIL: read returned ");
+        print_num(ret);
+    }
+}
+
+/// A write that would pass ULLONG_MAX - 1 sleeps until a read drains
+/// the counter
+fn test_eventfd_block_write() {
+    let fd = sys_eventfd2(0, 0);
+    let full = (u64::MAX - 1).to_ne_bytes();
+    if sys_write(fd as u64, full.as_ptr(), 8) != 8 {
+        println(b"EVENTFD_BLOCK_WRITE:FAIL: fill");
+        sys_close(fd as u64);
+        return;
+    }
+    let pid = after_delay(fd, |fd| {
+        let mut b = [0u8; 8];
+        sys_read(fd as u64, b.as_mut_ptr(), 8) == 8 && u64::from_ne_bytes(b) == u64::MAX - 1
+    });
+    let ret = sys_write(fd as u64, 3u64.to_ne_bytes().as_ptr(), 8);
+    let ok = reaped_ok(pid);
+    let mut buf = [0u8; 8];
+    let got = sys_read(fd as u64, buf.as_mut_ptr(), 8);
+    sys_close(fd as u64);
+    if ret == 8 && ok && got == 8 && u64::from_ne_bytes(buf) == 3 {
+        println(b"EVENTFD_BLOCK_WRITE:OK");
+    } else {
+        print(b"EVENTFD_BLOCK_WRITE:FAIL: write returned ");
+        print_num(ret);
+    }
 }

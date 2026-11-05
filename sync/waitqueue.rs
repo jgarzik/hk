@@ -59,6 +59,14 @@
 //! spinlock, and never wake while holding this CPU's run-queue lock.
 #![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
+/// A lock guard that can let its lock go for a while (the waits that
+/// take a guard: [`WaitQueue::wait_event_interruptible_locked`])
+pub trait Relock {
+    /// Release the lock, run `f`, take the lock again. Kernel panics do
+    /// not unwind, so a panic in `f` cannot release the lock twice.
+    fn unlocked<R>(&mut self, f: impl FnOnce() -> R) -> R;
+}
+
 use core::marker::PhantomPinned;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicPtr, AtomicU8, Ordering};
@@ -412,7 +420,51 @@ impl WaitQueue {
         exclusive: bool,
     ) -> Result<u64, KernelError> {
         crate::sync::might_sleep();
-        if cond() {
+        self.wait_ctx(
+            &mut (),
+            |()| cond(),
+            |(), t| schedule_timeout(t),
+            timeout,
+            state,
+            exclusive,
+        )
+    }
+
+    /// Sleep until `cond(guard)` is true or a signal is pending, with
+    /// the lock `guard` holds taken around every check and let go only
+    /// while asleep (Linux wait_event_interruptible_locked, Rust-for-Linux
+    /// CondVar::wait). Returns with the lock held, `Ok` with the
+    /// condition true or `Err(KernelError::RestartSys)` on a signal.
+    /// A waker makes the condition true under the lock and wakes after.
+    /// Lock order: the guard's lock, then this queue's.
+    pub fn wait_event_interruptible_locked<G: Relock>(
+        &self,
+        guard: &mut G,
+        cond: impl FnMut(&mut G) -> bool,
+    ) -> Result<(), KernelError> {
+        self.wait_ctx(
+            guard,
+            cond,
+            |g, t| g.unlocked(|| schedule_timeout(t)),
+            MAX_SCHEDULE_TIMEOUT,
+            SleepState::Interruptible,
+            false,
+        )
+        .map(|_| ())
+    }
+
+    /// The wait loop: `cond(ctx)` is checked after queueing, `sleep(ctx,
+    /// ticks)` sleeps and returns the ticks left
+    fn wait_ctx<C>(
+        &self,
+        ctx: &mut C,
+        mut cond: impl FnMut(&mut C) -> bool,
+        mut sleep: impl FnMut(&mut C, u64) -> u64,
+        timeout: u64,
+        state: SleepState,
+        exclusive: bool,
+    ) -> Result<u64, KernelError> {
+        if cond(ctx) {
             return Ok(timeout.max(1));
         }
         let w = core::pin::pin!(WaitEntry::new());
@@ -426,7 +478,7 @@ impl WaitQueue {
         let mut left = timeout;
         let result = loop {
             prepare(w.as_ref());
-            if cond() {
+            if cond(ctx) {
                 break Ok(left.max(1));
             }
             if interrupted(state) {
@@ -438,11 +490,11 @@ impl WaitQueue {
             if left == 0 {
                 break Ok(0);
             }
-            left = schedule_timeout(left);
+            left = sleep(ctx, left);
             if left == 0 {
                 // Timed out: one last look (Linux __wait_event_timeout)
                 prepare(w.as_ref());
-                break Ok(if cond() { 1 } else { 0 });
+                break Ok(if cond(ctx) { 1 } else { 0 });
             }
         };
         // A waker that picked this exclusive entry (it is no longer

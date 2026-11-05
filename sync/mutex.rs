@@ -186,6 +186,17 @@ impl<T> DerefMut for MutexGuard<'_, T> {
     }
 }
 
+impl<T> crate::sync::waitqueue::Relock for MutexGuard<'_, T> {
+    fn unlocked<R>(&mut self, f: impl FnOnce() -> R) -> R {
+        // SAFETY: the guard holds the lock; it is taken again below
+        // before the guard is used or dropped
+        unsafe { self.m.unlock_raw() };
+        let r = f();
+        self.m.lock_raw();
+        r
+    }
+}
+
 impl<T> Drop for MutexGuard<'_, T> {
     fn drop(&mut self) {
         // SAFETY: the guard holds the lock

@@ -194,6 +194,20 @@ impl<'a, T> IrqSpinlockGuard<'a, T> {
     }
 }
 
+impl<T> crate::sync::waitqueue::Relock for IrqSpinlockGuard<'_, T> {
+    fn unlocked<R>(&mut self, f: impl FnOnce() -> R) -> R {
+        let lock = self.lock;
+        // SAFETY: the guard is dropped (unlock, IRQ state restored) and
+        // rewritten below before anything reads it; panics abort, so no
+        // path sees it dropped
+        unsafe { core::ptr::drop_in_place(self) };
+        let r = f();
+        // SAFETY: `self` was dropped above, so writing it leaks nothing
+        unsafe { core::ptr::write(self, lock.lock()) };
+        r
+    }
+}
+
 impl<T> Drop for IrqSpinlockGuard<'_, T> {
     fn drop(&mut self) {
         // Release the lock
