@@ -24,7 +24,6 @@ const ENOENT: i64 = -2;
 const EBADF: i64 = -9;
 const EAGAIN: i64 = -11;
 const EEXIST: i64 = -17;
-#[allow(dead_code)] // Available for future tests
 const EINVAL: i64 = -22;
 const EACCES: i64 = -13;
 const EMSGSIZE: i64 = -90;
@@ -50,6 +49,34 @@ pub fn run_tests() {
     test_mq_emsgsize();
     test_mq_name_slash();
     test_mq_name_toolong();
+    test_mq_attr_limits();
+}
+
+/// A message size above the hard maximum is rejected before any
+/// allocation (Linux mq_attr_ok), so a huge msgsize can never drive a
+/// giant kernel allocation. The hard cap applies to everyone, so this
+/// runs as root and agrees with Linux.
+fn test_mq_attr_limits() {
+    let name = b"mq_attr_lim\0";
+    let huge = MqAttr {
+        mq_flags: 0,
+        mq_maxmsg: 10,
+        mq_msgsize: (16 * 1024 * 1024) + 1, // one past HARD_MSGSIZEMAX
+        mq_curmsgs: 0,
+        __reserved: [0; 4],
+    };
+    let r = sys_mq_open(name.as_ptr(), O_RDWR as i32 | O_CREAT as i32, 0o644, &huge);
+    if r >= 0 {
+        sys_close(r as u64);
+        sys_mq_unlink(name.as_ptr());
+    }
+    if r == EINVAL as i64 {
+        println(b"MQ_MSGSIZE_LIMIT:OK");
+    } else {
+        print(b"MQ_MSGSIZE_LIMIT:FAIL r=");
+        print_num(r);
+        println(b"");
+    }
 }
 
 /// Test mq_open creates a new queue

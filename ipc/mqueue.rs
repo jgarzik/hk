@@ -27,7 +27,6 @@ use crate::fs::name::FileName;
 use crate::time::hrtimer::HrClock;
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
-use alloc::vec;
 use alloc::vec::Vec;
 use core::any::Any;
 use core::cmp::Ordering;
@@ -260,7 +259,7 @@ impl MqQueue {
 
     fn send(
         &self,
-        data: &[u8],
+        data: Vec<u8>,
         priority: u32,
         nonblock: bool,
         deadline: Option<u64>,
@@ -270,10 +269,7 @@ impl MqQueue {
                 let mut msgs = self.messages.lock();
                 if (msgs.len() as i64) < self.maxmsg {
                     // Insert maintaining priority order (higher priority first)
-                    let msg = MqMessage {
-                        priority,
-                        data: data.to_vec(),
-                    };
+                    let msg = MqMessage { priority, data };
 
                     // Find insertion point (sorted by priority, descending)
                     let pos = msgs
@@ -314,26 +310,20 @@ impl MqQueue {
         }
     }
 
-    fn receive(
-        &self,
-        buf: &mut [u8],
-        nonblock: bool,
-        deadline: Option<u64>,
-    ) -> Result<(usize, u32), i64> {
+    fn receive(&self, nonblock: bool, deadline: Option<u64>) -> Result<(Vec<u8>, u32), i64> {
         loop {
             {
                 let mut msgs = self.messages.lock();
                 if !msgs.is_empty() {
-                    // Remove highest priority message (at front)
+                    // Remove highest priority message (at front); the
+                    // caller copies it out, so no kernel buffer is sized
+                    // by the user's request
                     let msg = msgs.remove(0);
-                    let len = msg.data.len().min(buf.len());
-                    buf[..len].copy_from_slice(&msg.data[..len]);
-
                     drop(msgs);
 
                     // Wake up senders
                     self.waitq_send.wake_all();
-                    return Ok((len, msg.priority));
+                    return Ok((msg.data, msg.priority));
                 }
             }
 
@@ -415,8 +405,12 @@ impl FileOps for MqFileOps {
             return Err(KernelError::PermissionDenied);
         }
 
-        match mq.queue.receive(buf, false, None) {
-            Ok((len, _prio)) => Ok(len),
+        match mq.queue.receive(false, None) {
+            Ok((data, _prio)) => {
+                let len = data.len().min(buf.len());
+                buf[..len].copy_from_slice(&data[..len]);
+                Ok(len)
+            }
             Err(_) => Err(KernelError::Io),
         }
     }
@@ -427,8 +421,13 @@ impl FileOps for MqFileOps {
             return Err(KernelError::PermissionDenied);
         }
 
+        if buf.len() as i64 > mq.queue.msgsize {
+            return Err(KernelError::MessageTooLong);
+        }
+        let mut data = crate::util::kmem::try_vec(buf.len(), 0u8)?;
+        data.copy_from_slice(buf);
         // Write with priority 0 (default)
-        match mq.queue.send(buf, 0, false, None) {
+        match mq.queue.send(data, 0, false, None) {
             Ok(()) => Ok(buf.len()),
             Err(_) => Err(KernelError::Io),
         }
@@ -547,6 +546,30 @@ fn validate_mq_name(name: &[u8]) -> Result<(), KernelError> {
 }
 
 /// mq_open - open a message queue
+/// Linux mq_attr_ok: both values positive; without CAP_SYS_RESOURCE a
+/// queue is capped at the soft defaults, with it at the hard maxima; the
+/// total storage must not overflow (EOVERFLOW). hk cannot store more
+/// than MAX_KMALLOC in one message, but the per-queue caps keep an
+/// unprivileged request well under that.
+fn mq_attr_ok(maxmsg: i64, msgsize: i64) -> Result<(i64, i64), KernelError> {
+    if maxmsg <= 0 || msgsize <= 0 {
+        return Err(KernelError::InvalidArgument);
+    }
+    let (max_m, max_s) = if crate::task::capable(crate::task::CAP_SYS_RESOURCE) {
+        (HARD_MSGMAX, HARD_MSGSIZEMAX)
+    } else {
+        (DFLT_MSGMAX, DFLT_MSGSIZEMAX)
+    };
+    if maxmsg > max_m || msgsize > max_s {
+        return Err(KernelError::InvalidArgument);
+    }
+    // Total bytes must not overflow (Linux checks maxmsg*msgsize)
+    (maxmsg as u64)
+        .checked_mul(msgsize as u64)
+        .ok_or(KernelError::Overflow)?;
+    Ok((maxmsg, msgsize))
+}
+
 pub fn sys_mq_open(name_ptr: u64, oflag: i32, mode: u32, attr_ptr: u64) -> i64 {
     // Read name from user space
     // Longer than NAME_MAX: ENAMETOOLONG (Linux: the lookup of the
@@ -596,18 +619,13 @@ pub fn sys_mq_open(name_ptr: u64, oflag: i32, mode: u32, attr_ptr: u64) -> i64 {
                 return KernelError::NotFound.sysret();
             }
 
-            // Read attributes if provided
-            let (maxmsg, msgsize) = if let Some(attr) = attr_in {
-                // Validate attributes
-                if attr.mq_maxmsg <= 0 || attr.mq_maxmsg > HARD_MSGMAX {
-                    return KernelError::InvalidArgument.sysret();
-                }
-                if attr.mq_msgsize <= 0 || attr.mq_msgsize > HARD_MSGSIZEMAX {
-                    return KernelError::InvalidArgument.sysret();
-                }
-                (attr.mq_maxmsg, attr.mq_msgsize)
-            } else {
-                (DFLT_MSGMAX, DFLT_MSGSIZEMAX)
+            // Read attributes if provided (Linux mq_attr_ok)
+            let (maxmsg, msgsize) = match attr_in {
+                Some(attr) => match mq_attr_ok(attr.mq_maxmsg, attr.mq_msgsize) {
+                    Ok(v) => v,
+                    Err(e) => return e.sysret(),
+                },
+                None => (DFLT_MSGMAX, DFLT_MSGSIZEMAX),
             };
 
             let queue = Arc::new(MqQueue::new(
@@ -737,8 +755,11 @@ pub fn sys_mq_timedsend(
         return KernelError::MessageTooLong.sysret();
     }
 
-    // Read message from user space
-    let mut msg_buf = vec![0u8; msg_len];
+    // Read message from user space (bounded by msgsize, fallible)
+    let mut msg_buf = match crate::util::kmem::try_vec(msg_len, 0u8) {
+        Ok(b) => b,
+        Err(e) => return e.sysret(),
+    };
     if msg_len > 0 {
         if !Uaccess::access_ok(msg_ptr, msg_len) {
             return KernelError::BadAddress.sysret();
@@ -753,7 +774,7 @@ pub fn sys_mq_timedsend(
         Err(e) => return e.sysret(),
     };
     let nonblock = mq_ops.queue.is_nonblocking();
-    match mq_ops.queue.send(&msg_buf, msg_prio, nonblock, deadline) {
+    match mq_ops.queue.send(msg_buf, msg_prio, nonblock, deadline) {
         Ok(()) => 0,
         Err(e) => e,
     }
@@ -799,20 +820,18 @@ pub fn sys_mq_timedreceive(
         Err(e) => return e.sysret(),
     };
     let nonblock = mq_ops.queue.is_nonblocking();
-    // Messages are at most msgsize bytes: never allocate the user's length
-    let mut buf = vec![0u8; msg_len.min(mq_ops.queue.msgsize as usize)];
-
-    let (len, prio) = match mq_ops.queue.receive(&mut buf, nonblock, deadline) {
+    let (data, prio) = match mq_ops.queue.receive(nonblock, deadline) {
         Ok(r) => r,
         Err(e) => return e,
     };
+    let len = data.len().min(msg_len);
 
     // Write message to user space
     if len > 0 {
         if !Uaccess::access_ok(msg_ptr, len) {
             return KernelError::BadAddress.sysret();
         }
-        if copy_to_user::<Uaccess>(msg_ptr, &buf[..len]).is_err() {
+        if copy_to_user::<Uaccess>(msg_ptr, &data[..len]).is_err() {
             return KernelError::BadAddress.sysret();
         }
     }
