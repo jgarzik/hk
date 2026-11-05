@@ -427,6 +427,10 @@ pub fn check_key_permission(key: &Key, needed: u32) -> bool {
     } else {
         perm
     };
+    // The keyring walk only when the class bits are not enough
+    if k & needed & 0xff == needed {
+        return true;
+    }
     if super::keyring::possessed(key, crate::task::percpu::current_tid()) {
         k |= perm >> 24;
     }
