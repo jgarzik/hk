@@ -12,6 +12,11 @@
 //! capped (MAX_INSNS_PER_PATH, ENOMEM, as Linux counts them), which also bounds the chain's length;
 //! a chain is walked and dropped iteratively, never by recursion.
 //!
+//! Each filter also has Linux's action cache (seccomp_cache_prepare): a
+//! bitmap of the syscalls every filter in its chain allows whatever the
+//! arguments, found by emulating the classic program with only `nr` and
+//! `arch` known. Those syscalls skip the filters at entry.
+//!
 //! No locks: a filter is immutable and shared by `Arc` (the task's
 //! pointer to its chain is under TASKLIST).
 
@@ -29,10 +34,16 @@ use super::{SECCOMP_RET_ACTION_FULL, SeccompData};
 /// MAX_INSNS_PER_PATH: 256 KiB of sock_filter)
 pub const MAX_INSNS_PER_PATH: usize = (1 << 18) / 8;
 
+/// Syscall numbers the action cache covers (both syscall tables fit;
+/// higher numbers always run the filters)
+const CACHE_NR: usize = 512;
+
 /// A seccomp filter: a converted program and the filter it stacks on
 #[derive(Debug)]
 pub struct SeccompFilter {
     prog: Vec<BpfInsn>,
+    /// Syscalls allowed whatever their arguments, by this whole chain
+    cache: [u64; CACHE_NR / 64],
     /// The filter this one was installed on (run after it)
     prev: Option<Arc<SeccompFilter>>,
     /// Whether to log non-ALLOW actions
@@ -89,6 +100,48 @@ fn check_filter(insns: &mut [Insn]) -> Result<(), KernelError> {
     Ok(())
 }
 
+/// Whether checked program `insns` returns ALLOW for syscall `nr` on
+/// the native arch whatever the arguments (Linux seccomp_is_const_allow:
+/// only loads of nr and arch, AND, constant jumps and RET K)
+fn const_allow(insns: &[Insn], nr: u32) -> bool {
+    use classic::*;
+    let mut a = 0u32;
+    let mut pc = 0;
+    while let Some(f) = insns.get(pc) {
+        pc += 1;
+        match f.code {
+            LDX_W_ABS if f.k == 0 => a = nr,
+            LDX_W_ABS if f.k == 4 => a = super::current_audit_arch(),
+            c if c == RET | K => return f.k == super::SECCOMP_RET_ALLOW,
+            c if c == JMP | JA => pc += f.k as usize,
+            c if c & 0x0f == JMP | K && c != JMP | JA => {
+                let taken = match c & 0xf0 {
+                    JEQ => a == f.k,
+                    JGE => a >= f.k,
+                    JGT => a > f.k,
+                    _ => a & f.k != 0,
+                };
+                pc += if taken { f.jt } else { f.jf } as usize;
+            }
+            c if c == ALU | AND | K => a &= f.k,
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// The action cache of a filter on `prev` (Linux
+/// seccomp_cache_prepare_bitmap): as restrictive as `prev`'s
+fn cache_prepare(insns: &[Insn], prev: Option<&SeccompFilter>) -> [u64; CACHE_NR / 64] {
+    let mut bits = prev.map_or([u64::MAX; CACHE_NR / 64], |p| p.cache);
+    for nr in 0..CACHE_NR {
+        if bits[nr / 64] & (1 << (nr % 64)) != 0 && !const_allow(insns, nr as u32) {
+            bits[nr / 64] &= !(1 << (nr % 64));
+        }
+    }
+    bits
+}
+
 /// The action of `ret` ordered by restrictiveness: lower is stricter,
 /// KILL_PROCESS (0x80000000) lowest (Linux ACTION_ONLY)
 fn action_rank(ret: u32) -> i32 {
@@ -132,7 +185,20 @@ impl SeccompFilter {
         if total > MAX_INSNS_PER_PATH {
             return Err(KernelError::OutOfMemory);
         }
-        Ok(Arc::new(Self { prog, prev, log }))
+        let cache = cache_prepare(&insns, prev.as_deref());
+        Ok(Arc::new(Self {
+            prog,
+            cache,
+            prev,
+            log,
+        }))
+    }
+
+    /// Whether syscall `nr` is allowed without running the filters
+    /// (Linux seccomp_cache_check_allow)
+    pub fn cache_allows(&self, nr: u64) -> bool {
+        let nr = nr as usize;
+        nr < CACHE_NR && self.cache[nr / 64] & (1 << (nr % 64)) != 0
     }
 
     /// Run this filter and every one it stacks on: the most restrictive
@@ -438,10 +504,66 @@ mod tests {
         for _ in 0..500_000 {
             f = Some(Arc::new(SeccompFilter {
                 prog: Vec::new(),
+                cache: [0; CACHE_NR / 64],
                 prev: f,
                 log: false,
             }));
         }
         drop(f);
+    }
+
+    /// The action cache: constant ALLOWs only, and as strict as the chain
+    #[test]
+    fn action_cache() {
+        let arch = crate::seccomp::current_audit_arch();
+        // ALLOW all but nr 39, which depends on an argument; nr 60 KILLs
+        let p = [
+            stmt(LD | W | ABS, 4),
+            jmp(JMP | JEQ | K, arch, 1, 0),
+            stmt(RET | K, SECCOMP_RET_KILL_PROCESS),
+            stmt(LD | W | ABS, 0),
+            jmp(JMP | JEQ | K, 39, 0, 3),
+            stmt(LD | W | ABS, 16),
+            jmp(JMP | JEQ | K, 0, 0, 2),
+            stmt(RET | K, SECCOMP_RET_ALLOW),
+            jmp(JMP | JEQ | K, 60, 0, 1),
+            stmt(RET | K, SECCOMP_RET_KILL_PROCESS),
+            stmt(RET | K, SECCOMP_RET_ALLOW),
+        ];
+        let f = filter(&p);
+        assert!(f.cache_allows(0));
+        assert!(f.cache_allows(511));
+        assert!(!f.cache_allows(39));
+        assert!(!f.cache_allows(60));
+        assert!(!f.cache_allows(512));
+        // A stacked filter that ERRNOs nr 1 removes it from the cache
+        let q = [
+            stmt(LD | W | ABS, 0),
+            jmp(JMP | JEQ | K, 1, 0, 1),
+            stmt(RET | K, ERRNO5),
+            stmt(RET | K, SECCOMP_RET_ALLOW),
+        ];
+        let g = SeccompFilter::new(q.to_vec(), Some(f), false).unwrap();
+        assert!(!g.cache_allows(1) && !g.cache_allows(39) && g.cache_allows(2));
+        // Anything else than nr/arch loads, AND, K jumps and RET K is
+        // not cached
+        let r = [stmt(LD | IMM, 0), stmt(RET | K, SECCOMP_RET_ALLOW)];
+        assert!(!filter(&r).cache_allows(0));
+        let r = [
+            stmt(LD | W | ABS, 0),
+            stmt(ALU | AND | K, 0xff),
+            jmp(JMP | JEQ | K, 7, 0, 1),
+            stmt(RET | K, ERRNO5),
+            stmt(RET | K, SECCOMP_RET_ALLOW),
+        ];
+        let h = filter(&r);
+        assert!(!h.cache_allows(7) && !h.cache_allows(263) && h.cache_allows(8));
+        // A cached syscall skips the filters; others still run them
+        let v = |f: &Arc<SeccompFilter>, nr, a0| {
+            check_syscall(SECCOMP_MODE_FILTER, Some(f), nr, 0, [a0, 0, 0, 0, 0, 0])
+        };
+        assert_eq!(v(&g, 39, 1), Verdict::KillProcess);
+        assert_eq!(v(&g, 39, 0), Verdict::Allow);
+        assert_eq!(v(&g, 2, 0), Verdict::Allow);
     }
 }
