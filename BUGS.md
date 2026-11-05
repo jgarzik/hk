@@ -961,9 +961,7 @@ Ranked. Not yet confirmed by a test.
    take K/M/G but not T/P/E (`cgroup/memory.rs`, Linux memparse); a
    READ CAPACITY(10) last LBA of 0xFFFFFFFF is not retried with READ
    CAPACITY(16) (`block/scsi.rs`, Linux sd_read_capacity).
-2. **Minor**: `fs/posix_lock.rs:328` `-l_len` overflows at i64::MIN
-   and lengths past i64::MAX are not EOVERFLOW; `arch/x86_64/rtc.rs:131`
-   panics on a CMOS month >= 14 and keeps 12 AM as hour 12; vfat short
-   names can start with a space; `dt/mod.rs` panics on an out-of-range
-   offset instead of returning `DtError`; the `fs/dac.rs` header says
-   there are no supplementary groups (`in_group` uses them).
+2. **Minor**: `arch/x86_64/rtc.rs:131` panics on a CMOS month >= 14
+   and keeps 12 AM as hour 12; vfat short names can start with a space;
+   the `fs/dac.rs` header says there are no supplementary groups
+   (`in_group` uses them).
