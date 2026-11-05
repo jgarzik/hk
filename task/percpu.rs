@@ -647,18 +647,18 @@ impl core::ops::DerefMut for TaskViewMut<'_> {
     }
 }
 
-fn view(task: &Task) -> TaskView<'_> {
-    // SAFETY: the caller borrows the locked table, so no `&mut` view
-    // exists meanwhile
-    let inner = unsafe { task.inner().get() };
+fn view<'a>(table: &'a GlobalTaskTable, task: &'a Task) -> TaskView<'a> {
+    let inner = task.inner().access(table);
     let inner = inner.as_ref().expect("task table: boot task");
     TaskView { task, inner }
 }
 
-fn view_mut(task: &Task) -> TaskViewMut<'_> {
-    // SAFETY: the caller borrows the locked table mutably, and each
-    // task's view is handed out once
-    let inner = unsafe { task.inner().get_mut() };
+/// # Safety
+/// `table` comes from a mutable borrow of the locked table, and no
+/// other view of `task` is live for 'a.
+unsafe fn view_mut<'a>(table: &'a GlobalTaskTable, task: &'a Task) -> TaskViewMut<'a> {
+    // SAFETY: see above
+    let inner = unsafe { task.inner().access_mut_unchecked(table) };
     let inner = inner.as_mut().expect("task table: boot task");
     TaskViewMut { task, inner }
 }
@@ -715,6 +715,9 @@ impl TaskViewMut<'_> {
     }
 }
 
+// SAFETY: `new` is private to this module and called once, for TASKLIST
+unsafe impl crate::sync::UniqueOwner for GlobalTaskTable {}
+
 impl GlobalTaskTable {
     const fn new() -> Self {
         Self {
@@ -734,12 +737,14 @@ impl GlobalTaskTable {
 
     /// Task `tid`
     pub fn get(&self, tid: Tid) -> Option<TaskView<'_>> {
-        self.lookup(tid).map(view)
+        self.lookup(tid).map(|t| view(self, t))
     }
 
     /// Task `tid`, writable
     pub fn get_mut(&mut self, tid: Tid) -> Option<TaskViewMut<'_>> {
-        self.lookup(tid).map(view_mut)
+        let me = &*self;
+        // SAFETY: `me` comes from `&mut self`; one view is handed out
+        me.lookup(tid).map(|t| unsafe { view_mut(me, t) })
     }
 
     /// A reference to task `tid`
@@ -749,12 +754,15 @@ impl GlobalTaskTable {
 
     /// Every task
     pub fn iter(&self) -> impl Iterator<Item = TaskView<'_>> {
-        self.tasks.iter().map(view)
+        self.tasks.iter().map(|t| view(self, t))
     }
 
     /// Every task, writable
     pub fn iter_mut(&mut self) -> impl Iterator<Item = TaskViewMut<'_>> {
-        self.tasks.iter().map(view_mut)
+        let me = &*self;
+        // SAFETY: `me` comes from `&mut self`; the list holds each task
+        // once, so each view is handed out once
+        me.tasks.iter().map(|t| unsafe { view_mut(me, t) })
     }
 
     /// The first task `f` accepts
@@ -767,13 +775,10 @@ impl GlobalTaskTable {
         self.iter_mut().find(|t| f(t))
     }
 
-    /// The locked fields of a task in the list, writable
-    ///
-    /// # Safety
-    /// `t` is in this list, and no view of it is live.
-    unsafe fn inner_mut_of<'a>(&'a mut self, t: &'a Task) -> &'a mut TaskInner {
-        // SAFETY: see above; the list is locked for writing
-        unsafe { t.inner().get_mut() }
+    /// The locked fields of a task, writable
+    fn inner_mut_of<'a>(&'a mut self, t: &'a Task) -> &'a mut TaskInner {
+        t.inner()
+            .access_mut(self)
             .as_mut()
             .expect("task table: boot task")
     }
@@ -781,8 +786,7 @@ impl GlobalTaskTable {
     /// Put `child` (a group leader in this list) on its real parent's
     /// `children` (Linux list_add_tail(&p->sibling, &parent->children))
     pub fn link_child(&mut self, child: &TaskRef) {
-        // SAFETY: in this list; no view is live (we hold &mut self)
-        let ci = unsafe { self.inner_mut_of(child) };
+        let ci = self.inner_mut_of(child);
         let Some(parent) = ci.real_parent.as_ref().and_then(|w| w.upgrade()) else {
             return;
         };
@@ -790,24 +794,20 @@ impl GlobalTaskTable {
             return;
         }
         ci.in_children = true;
-        // SAFETY: the parent is alive and in this list (it is unlinked
-        // only after its children were reparented)
-        let pi = unsafe { self.inner_mut_of(&parent) };
+        let pi = self.inner_mut_of(&parent);
         pi.children.push_back(child.clone());
     }
 
     /// Take `child` off its real parent's `children`
     fn unlink_child(&mut self, child: &Task) {
-        // SAFETY: in this list; no view is live
-        let ci = unsafe { self.inner_mut_of(child) };
+        let ci = self.inner_mut_of(child);
         if !core::mem::take(&mut ci.in_children) {
             return;
         }
         let Some(parent) = ci.real_parent.as_ref().and_then(|w| w.upgrade()) else {
             return;
         };
-        // SAFETY: as in link_child; the child is on its list
-        let pi = unsafe { self.inner_mut_of(&parent) };
+        let pi = self.inner_mut_of(&parent);
         drop(unsafe { pi.children.remove(child) });
     }
 
@@ -816,12 +816,10 @@ impl GlobalTaskTable {
     pub fn reparent(&mut self, task: &Task, reaper: &TaskRef) -> bool {
         let mut zombie = false;
         loop {
-            // SAFETY: in this list; no view is live
-            let Some(child) = (unsafe { self.inner_mut_of(task) }).children.pop_front() else {
+            let Some(child) = self.inner_mut_of(task).children.pop_front() else {
                 break;
             };
-            // SAFETY: as above, a different task
-            let ci = unsafe { self.inner_mut_of(&child) };
+            let ci = self.inner_mut_of(&child);
             ci.in_children = false;
             ci.real_parent = Some(Arc::downgrade(reaper));
             zombie |= matches!(ci.state, TaskState::Zombie(_));
@@ -834,8 +832,7 @@ impl GlobalTaskTable {
     /// Add a task (fork, kernel thread creation); it has a pid. It joins
     /// its group leader's threads (a new process leads its own).
     pub fn insert(&mut self, task: TaskRef) {
-        // SAFETY: the list is locked for writing
-        if let Some(inner) = unsafe { task.inner().get() }
+        if let Some(inner) = task.inner().access(self)
             && let Some(p) = &inner.thread_pid
         {
             p.set_task(Arc::as_ptr(&task).cast::<()>());
@@ -848,15 +845,14 @@ impl GlobalTaskTable {
             self.task(task.pid)
         };
         if let Some(l) = leader {
-            // SAFETY: in this list; no view is live
-            unsafe { self.inner_mut_of(&l) }.threads.push_back(task);
+            self.inner_mut_of(&l).threads.push_back(task);
         }
     }
 
     /// The threads of process `pid` (its leader's thread group)
     pub fn threads(&self, pid: Pid) -> impl Iterator<Item = TaskView<'_>> {
         self.get(pid)
-            .map(|l| l.fields().threads.iter().map(view))
+            .map(move |l| l.fields().threads.iter().map(move |t| view(self, t)))
             .into_iter()
             .flatten()
     }
@@ -864,9 +860,7 @@ impl GlobalTaskTable {
     /// Take `t` off its leader's thread group
     fn unlink_thread(&mut self, t: &Task) {
         let Some(l) = self.task(t.pid) else { return };
-        // SAFETY: in this list; no view is live; `t` is in its leader's
-        // group (every task in the list is)
-        let li = unsafe { self.inner_mut_of(&l) };
+        let li = self.inner_mut_of(&l);
         if li.threads.iter().any(|x| core::ptr::eq(x, t)) {
             drop(unsafe { li.threads.remove(t) });
         }
@@ -879,8 +873,7 @@ impl GlobalTaskTable {
         self.unlink_child(&t);
         self.unlink_thread(&t);
         self.detach_pids(&t);
-        // SAFETY: the list is locked for writing, so no view exists
-        if let Some(inner) = unsafe { t.inner().get() }
+        if let Some(inner) = t.inner().access(self)
             && let Some(p) = &inner.thread_pid
         {
             p.set_task(core::ptr::null());
@@ -896,9 +889,7 @@ impl GlobalTaskTable {
         &'a self,
         pg: &'a crate::task::pid::Pid,
     ) -> impl Iterator<Item = TaskView<'a>> + 'a {
-        // SAFETY: TASKLIST is held for 'a (we borrow the table); the
-        // list changes only with the table borrowed mutably
-        unsafe { pg.pgrp.get() }.iter().map(view)
+        pg.pgrp.access(self).iter().map(move |t| view(self, t))
     }
 
     /// The threads of every process in group `pg` (Linux
@@ -915,17 +906,13 @@ impl GlobalTaskTable {
     /// setpgid or setsid is not missed); the creator is in this list,
     /// the child not yet
     pub fn inherit_pids(&mut self, child: &Task, parent: &Task) {
-        // SAFETY: the parent is in this list, locked for writing; no
-        // `&mut` view of it is live
-        let Some(pi) = (unsafe { parent.inner().get() }).as_ref() else {
+        let Some(pi) = parent.inner().access(self).as_ref() else {
             return;
         };
         let (pg, s) = (pi.pgrp.clone(), pi.session.clone());
         child.pgid.store(parent.pgid(), Ordering::Relaxed);
         child.sid.store(parent.sid(), Ordering::Relaxed);
-        // SAFETY: the child is not in the list yet: nothing else reaches
-        // its locked fields
-        if let Some(ci) = unsafe { child.inner().get_mut() }.as_mut() {
+        if let Some(ci) = child.inner().access_mut(self).as_mut() {
             ci.pgrp = pg;
             ci.session = s;
         }
@@ -934,37 +921,34 @@ impl GlobalTaskTable {
     /// Put group leader `t` on its process group's and session's lists
     /// (Linux attach_pid PIDTYPE_PGID, PIDTYPE_SID)
     fn attach_pids(&mut self, t: &Task) {
-        // SAFETY: in this list; no view is live
-        let ti = unsafe { self.inner_mut_of(t) };
+        let ti = self.inner_mut_of(t);
         if ti.pids_linked || !ti.leader {
             return;
         }
-        let (Some(pg), Some(s)) = (ti.pgrp.as_ref(), ti.session.as_ref()) else {
+        let (Some(pg), Some(s)) = (ti.pgrp.clone(), ti.session.clone()) else {
             return;
         };
-        // SAFETY: the table is locked for writing; `t` stays live while
-        // in the table and leaves these lists before it (`remove`)
-        unsafe {
-            pg.pgrp.get_mut().push_back(t);
-            s.session.get_mut().push_back(t);
-        }
         ti.pids_linked = true;
+        // SAFETY: `t` stays live while in the table and leaves these
+        // lists before it (`remove`)
+        unsafe {
+            pg.pgrp.access_mut(self).push_back(t);
+            s.session.access_mut(self).push_back(t);
+        }
     }
 
     /// Take `t` off its process group's and session's lists (Linux
     /// detach_pid)
     fn detach_pids(&mut self, t: &Task) {
-        // SAFETY: in this list; no view is live
-        let ti = unsafe { self.inner_mut_of(t) };
+        let ti = self.inner_mut_of(t);
         if !core::mem::take(&mut ti.pids_linked) {
             return;
         }
-        if let (Some(pg), Some(s)) = (ti.pgrp.as_ref(), ti.session.as_ref()) {
-            // SAFETY: the table is locked for writing; linked means on
-            // both lists
+        if let (Some(pg), Some(s)) = (ti.pgrp.clone(), ti.session.clone()) {
+            // SAFETY: linked means on both lists
             unsafe {
-                pg.pgrp.get_mut().remove(t);
-                s.session.get_mut().remove(t);
+                pg.pgrp.access_mut(self).remove(t);
+                s.session.access_mut(self).remove(t);
             }
         }
     }
@@ -983,8 +967,7 @@ impl GlobalTaskTable {
         self.detach_pids(&l);
         let threads: Vec<TaskRef> = self.threads(pid).map(|t| task_ref(t.task)).collect();
         for t in &threads {
-            // SAFETY: in this list; no view is live
-            let ti = unsafe { self.inner_mut_of(t) };
+            let ti = self.inner_mut_of(t);
             old.extend(ti.pgrp.replace(pg.clone()));
             t.pgid.store(Pid::from(pg.nr()), Ordering::Relaxed);
             if let Some(s) = s {
@@ -1697,8 +1680,7 @@ pub fn take_leadership(tgid: Pid, tid: Tid) -> Vec<TaskRef> {
     // references go after TASKLIST
     let mut old_threads = crate::util::list::ArcList::new();
     if let Some(l) = table.task(ltid) {
-        // SAFETY: in the list; no view is live
-        let li = unsafe { table.inner_mut_of(&l) };
+        let li = table.inner_mut_of(&l);
         core::mem::swap(&mut li.threads, &mut old_threads);
     }
     let mut dead: Vec<TaskRef> = Vec::new();
@@ -1713,9 +1695,7 @@ pub fn take_leadership(tgid: Pid, tid: Tid) -> Vec<TaskRef> {
     // exchange_tids: the caller takes the leader's tid and pid (Linux
     // de_thread), the old leader (released here) its own
     if let Some(l) = gone.iter().find(|t| t.tid() == ltid) {
-        // SAFETY: TASKLIST is held; neither task is in the table now,
-        // and the old leader is dead
-        let (mi, li) = unsafe { (me.inner().get_mut(), l.inner().get_mut()) };
+        let (mi, li) = me.inner().access_pair_mut(l.inner(), &mut *table);
         if let (Some(mi), Some(li)) = (mi.as_mut(), li.as_mut()) {
             // The old leader's CPU time stays the group's (Linux
             // release_task -> __exit_signal)
@@ -1743,10 +1723,7 @@ pub fn take_leadership(tgid: Pid, tid: Tid) -> Vec<TaskRef> {
     // children (tracer and parent links are task references: nothing
     // else names the old tid) and leads the group
     table.link_child(&me);
-    // SAFETY: in the list; no view is live
-    unsafe { table.inner_mut_of(&me) }
-        .threads
-        .push_back(me.clone());
+    table.inner_mut_of(&me).threads.push_back(me.clone());
     let sig = table.get(ltid).and_then(|t| t.signal.clone());
     if let Some(mut m) = table.get_mut(ltid) {
         m.leader = true;

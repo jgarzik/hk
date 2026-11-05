@@ -874,10 +874,11 @@ only on the task's own CPU with interrupts off (its syscall entry and
 exit, its context switches, the tick) inside the `acct_seq` sequence
 count, which readers on other CPUs retry on); `cred` (below); the
 alloc_lock fields; and
-the rest, `TaskInner`, in a `TableCell` that only the locked
-table's views reach (`GlobalTaskTable::get`/`iter` read it,
-`get_mut`/`iter_mut` write it with the table borrowed mutably; Linux
-LockedBy). A `TaskRef` cloned out of the table keeps the task alive but
+the rest, `TaskInner`, in a `TableCell` (`sync::LockedBy` owned by
+`GlobalTaskTable`): a borrow of the locked table is the key, `&table`
+reads it and `&mut table` writes it, checked by the compiler (the
+table is a `UniqueOwner`: TASKLIST holds the only one). The `Pid`
+process-group and session lists are owned the same way. A `TaskRef` cloned out of the table keeps the task alive but
 reads only its fixed and atomic fields without the lock.
 
 **alloc_lock fields** (Linux task_lock(p), `p->alloc_lock`): `mm`,

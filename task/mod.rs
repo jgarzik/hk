@@ -1245,34 +1245,9 @@ pub struct TaskInner {
     pub ptrace_code: u32,
 }
 
-/// Data owned by the TASKLIST lock (Rust-for-Linux LockedBy): only
-/// `GlobalTaskTable`'s views reach it, with the table locked
-pub struct TableCell<T>(UnsafeCell<T>);
-
-// SAFETY: every access goes through a view of the locked table
-unsafe impl<T: Send> Sync for TableCell<T> {}
-
-impl<T> TableCell<T> {
-    pub const fn new(v: T) -> Self {
-        Self(UnsafeCell::new(v))
-    }
-
-    /// # Safety
-    /// TASKLIST is held, and no `&mut` to this cell's data exists.
-    pub unsafe fn get(&self) -> &T {
-        // SAFETY: see above
-        unsafe { &*self.0.get() }
-    }
-
-    /// # Safety
-    /// TASKLIST is held mutably by the caller, and no other reference
-    /// to this cell's data exists.
-    #[expect(clippy::mut_from_ref)]
-    pub unsafe fn get_mut(&self) -> &mut T {
-        // SAFETY: see above
-        unsafe { &mut *self.0.get() }
-    }
-}
+/// Data owned by the TASKLIST lock: reached through a borrow of the
+/// locked table
+pub type TableCell<T> = crate::sync::LockedBy<T, crate::task::percpu::GlobalTaskTable>;
 
 /// The adapter of `Task.sibling` (children lists)
 pub struct Sibling;
