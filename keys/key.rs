@@ -594,10 +594,40 @@ impl Drop for Key {
     /// The last link and reference went (Linux key_put -> key GC): the
     /// key leaves the registry and its quota charge is returned
     fn drop(&mut self) {
+        // The keyrings this one alone held are freed here in a loop, not
+        // by nested drops (a chain of linked keyrings may be as deep as
+        // the key quota allows: Linux's key GC is iterative too)
+        let mut stack = core::mem::take(self.keyring_keys.get_mut());
+        while let Some(k) = stack.pop() {
+            if let Some(mut key) = Arc::into_inner(k) {
+                stack.append(key.keyring_keys.get_mut());
+            }
+        }
         super::unregister_key(self.serial, self as *const Key);
         let bytes = self.quota_bytes.load(Ordering::Relaxed);
         if bytes > 0 {
             super::key_user_uncharge(self.quota_uid.load(Ordering::Relaxed), bytes);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A chain of linked keyrings deeper than any stack drops in a loop
+    #[test]
+    fn deep_keyring_chain_drops() {
+        let ty = super::super::types::keyring_key_type();
+        let make = |n: i32| Key::new(n, ty.clone(), alloc::string::String::from("k"), 0, 0, 0);
+        let top = make(1);
+        let mut cur = top.clone();
+        for n in 2..200_000 {
+            let next = make(n);
+            cur.keyring_keys.write().push(next.clone());
+            cur = next;
+        }
+        drop(cur);
+        drop(top);
     }
 }
