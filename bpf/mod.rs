@@ -25,6 +25,7 @@
 pub mod classic;
 mod fd;
 mod insn;
+pub mod interp;
 mod map;
 mod prog;
 pub mod syscall;
@@ -36,3 +37,6 @@ pub use map::{BpfMap, BpfMapOps, create_map};
 pub use prog::BpfProg;
 pub use syscall::sys_bpf;
 pub use verifier::verify_bpf_prog;
+
+#[cfg(test)]
+mod tests;
