@@ -79,7 +79,9 @@ impl<T> KVec<T> {
 
     pub fn try_push(&mut self, v: T) -> Result<(), KernelError> {
         if self.0.len() == self.0.capacity() {
-            self.try_reserve(1)?;
+            let max = MAX_KMALLOC / core::mem::size_of::<T>().max(1);
+            let target = grow(self.0.len(), max);
+            self.try_reserve(target.saturating_sub(self.0.len()))?;
         }
         self.0.push(v);
         Ok(())
