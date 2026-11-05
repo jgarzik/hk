@@ -146,15 +146,20 @@ pub fn keyctl_chown(key_serial: i32, new_uid: i32, new_gid: i32) -> i64 {
         return KernelError::PermissionDenied.sysret();
     }
     // Another owner, or a group the caller is not in, takes
-    // CAP_SYS_ADMIN (EACCES)
+    // CAP_SYS_ADMIN (EACCES); decided under the key's lock
     let cred = percpu::current_cred();
-    let privileged = uid.is_some_and(|u| u != key.uid())
-        || gid.is_some_and(|g| g != key.gid() && !crate::fs::dac::in_group(&cred, g));
-    if privileged && !crate::task::capable(crate::task::CAP_SYS_ADMIN) {
-        return KernelError::PermissionDenied.sysret();
+    let r = key.chown(uid, gid, |cur_uid, cur_gid| {
+        let privileged = uid.is_some_and(|u| u != cur_uid)
+            || gid.is_some_and(|g| g != cur_gid && !crate::fs::dac::in_group(&cred, g));
+        if privileged && !crate::task::capable(crate::task::CAP_SYS_ADMIN) {
+            return Err(KernelError::PermissionDenied);
+        }
+        Ok(())
+    });
+    match r {
+        Ok(()) => 0,
+        Err(e) => e.sysret(),
     }
-    key.set_owner(uid, gid);
-    0
 }
 
 /// KEYCTL_SETPERM - Set a key's permissions
@@ -179,14 +184,19 @@ pub fn keyctl_setperm(key_serial: i32, perm: u32) -> i64 {
     if !check_key_permission(&key, KEY_NEED_SETATTR) {
         return KernelError::PermissionDenied.sysret();
     }
-    // The owner (fsuid) or CAP_SYS_ADMIN, else EACCES
-    if key.uid() != percpu::current_cred().fsuid
-        && !crate::task::capable(crate::task::CAP_SYS_ADMIN)
-    {
-        return KernelError::PermissionDenied.sysret();
+    // The owner (fsuid) or CAP_SYS_ADMIN, else EACCES; decided under
+    // the key's lock
+    let fsuid = percpu::current_cred().fsuid;
+    let r = key.setperm(perm, |owner| {
+        if owner != fsuid && !crate::task::capable(crate::task::CAP_SYS_ADMIN) {
+            return Err(KernelError::PermissionDenied);
+        }
+        Ok(())
+    });
+    match r {
+        Ok(()) => 0,
+        Err(e) => e.sysret(),
     }
-    key.set_perm(perm);
-    0
 }
 
 /// KEYCTL_DESCRIBE - Describe a key

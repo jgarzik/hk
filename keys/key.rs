@@ -283,16 +283,25 @@ impl Key {
         self.gid.load(Ordering::Relaxed)
     }
 
-    /// Change the owner and/or group (Linux keyctl_chown_key's stores,
-    /// under key->sem: the payload lock)
-    pub fn set_owner(&self, uid: Option<u32>, gid: Option<u32>) {
+    /// Change the owner and/or group (Linux keyctl_chown_key, under
+    /// key->sem: the payload lock): `allow` decides on the owner and
+    /// group as they are in that hold, so a racing chown cannot change
+    /// what the decision was about
+    pub fn chown(
+        &self,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        allow: impl FnOnce(u32, u32) -> Result<(), KernelError>,
+    ) -> Result<(), KernelError> {
         let _sem = self.payload.write();
+        allow(self.uid(), self.gid())?;
         if let Some(u) = uid {
             self.uid.store(u, Ordering::Relaxed);
         }
         if let Some(g) = gid {
             self.gid.store(g, Ordering::Relaxed);
         }
+        Ok(())
     }
 
     /// Whether `serial` is this keyring or reachable from it through
@@ -317,9 +326,18 @@ impl Key {
         self.perm.load(Ordering::Relaxed)
     }
 
-    /// Set the permission mask
-    pub fn set_perm(&self, perm: KeyPerm) {
+    /// Set the permission mask (Linux keyctl_setperm_key, under
+    /// key->sem): `allow` decides on the owner as it is in that hold,
+    /// so the old owner's change cannot land after a chown
+    pub fn setperm(
+        &self,
+        perm: KeyPerm,
+        allow: impl FnOnce(u32) -> Result<(), KernelError>,
+    ) -> Result<(), KernelError> {
+        let _sem = self.payload.write();
+        allow(self.uid())?;
         self.perm.store(perm, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Get the key type
