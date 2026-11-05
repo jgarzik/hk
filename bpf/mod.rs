@@ -1,26 +1,15 @@
-//! eBPF (extended Berkeley Packet Filter) subsystem
+//! BPF: hk's one in-kernel program engine
 //!
-//! This module provides the eBPF virtual machine used for seccomp filters,
-//! packet filtering, and other programmable kernel extensions.
-//!
-//! ## Architecture
-//!
-//! eBPF programs execute in a sandboxed virtual machine with:
-//! - 11 64-bit registers (R0-R10)
-//! - 512-byte stack
-//! - Context pointer passed in R1
-//! - Return value in R0
-//!
-//! ## Syscall Interface
-//!
-//! The bpf() syscall provides userspace access to:
-//! - BPF maps (key-value stores): hash tables, arrays
-//! - BPF programs: loaded and verified before execution
-//!
-//! ## Classic BPF
-//!
-//! `classic` checks and runs classic (sock_filter) programs, for
-//! socket filters and seccomp(2).
+//! - `interp`: the RFC 9669 eBPF interpreter, every access checked
+//!   against its region (context, stack)
+//! - `verifier`: iterative checks of shape, forward-only control flow
+//!   and register/stack types before a program may run
+//! - `classic`: classic (sock_filter) programs: Linux's checker, and the
+//!   classic interpreter the converter is tested against
+//! - `convert`: Linux's classic-to-eBPF conversion; seccomp(2) and
+//!   SO_ATTACH_FILTER run their programs this way
+//! - `syscall`, `map`, `prog`, `fd`: bpf(2) maps and program loading
+//!   (nothing attaches a loaded program yet: doc/ROADMAP.md phase E)
 
 pub mod classic;
 pub mod convert;

@@ -30,6 +30,7 @@ phase end. Gaps a phase leaves go to BUGS.md.
 | 17 | M5 — split functions over 150 lines | pure moves |
 | 18 | S1 — idioms | small, wide |
 | 19 | S2 — docs | last: describes the final code |
+| 20 | E — eBPF attach points, then a JIT | the engine (`bpf/`) is now specified and tested; README wishlist; not Debian-blocking |
 
 Not scheduled: HADL proper (`doc/ideas/HADL-driver-architecture-research.md`:
 typed register vocabulary, Ethernet engine, chip descriptions, signed
@@ -188,7 +189,7 @@ and SAT on the SCSI midlayer; UEFI boot; RTL8168g.
 
 - M3 aarch64 DT information in its own type, not AcpiInfo; remaining
   "(stub for now)" banners.
-- M5 the 21 functions over 150 lines (do_clone, bpf_run, sys_prctl,
+- M5 the 20 functions over 150 lines (do_clone, sys_prctl,
   kmain, sys_mmap, exec_file, tty_ioctl, sys_fcntl, do_semctl,
   do_select_internal, sys_mremap, procfs_mount, the NUMA/SRAT parsers,
   exit_current, both setup_rt_frame, fanotify_mark, waitid, adjtimex,
@@ -202,3 +203,22 @@ and SAT on the SCSI midlayer; UEFI boot; RTL8168g.
 - S2 `# Arguments`/`# Returns` blocks and `// ====` banners removed;
   history and speculative comments rewritten to the current state;
   `TODO(unsafe)` lines kept.
+
+## 20. E — eBPF attach points, then a JIT
+
+hk's single BPF engine (`bpf/`: RFC 9669 interpreter over checked
+regions, iterative verifier, Linux's classic converter) runs seccomp
+and classic socket filters; nothing yet runs a program loaded with
+bpf(2). In order:
+
+- Maps in programs: BPF_PSEUDO_MAP_FD loads, map_lookup/update/delete
+  helpers, map-value pointers (or-null until checked) in the verifier
+  and as a third interpreter region; map memory charged (BUGS.md).
+- The socket filter context (struct __sk_buff field rewrites, Linux
+  bpf_convert_ctx_access) and SO_ATTACH_BPF / SO_DETACH_BPF.
+- Verifier range tracking (scalar bounds, tnum) for variable offsets
+  and bounded loops; bpf-to-bpf calls; then cgroup skb/sock attach and
+  BPF_LINK, and the BTF libbpf needs.
+- Last, a per-arch JIT with constant blinding: it gives up the
+  interpreter's run-time region checks, so it waits until the verifier
+  is trusted (Linux's verifier bugs are its main CVE source).
