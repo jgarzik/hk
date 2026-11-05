@@ -242,6 +242,19 @@ fn do_utimes(dirfd: i32, pathname: u64, times: Option<[UserTimespec; 2]>, flags:
         Ok(w) => w,
         Err(e) => return e.sysret(),
     };
+    // notify_change under i_rwsem (Linux vfs_utimes: inode_lock), its
+    // checks too (setattr_prepare: owner, CAP_FOWNER or write access),
+    // so a racing chown cannot leave the old owner's decision standing
+    let lock = inode.lock();
+    if let Err(e) = inode
+        .i_op
+        .setattr_ok(&inode)
+        .and_then(|_| dac::may_utimes(&inode, times.is_some()))
+    {
+        return e.sysret();
+    }
+    // The time is taken in the hold, so ctime never goes backwards
+    // between racing updates (Linux notify_change under inode_lock)
     let now = current_time();
     let pick = |t: &UserTimespec| match t.tv_nsec {
         UTIME_OMIT => None,
@@ -255,17 +268,6 @@ fn do_utimes(dirfd: i32, pathname: u64, times: Option<[UserTimespec; 2]>, flags:
         None => (Some(now), Some(now)),
         Some(t) => (pick(&t[0]), pick(&t[1])),
     };
-    // notify_change under i_rwsem (Linux vfs_utimes: inode_lock), its
-    // checks too (setattr_prepare: owner, CAP_FOWNER or write access),
-    // so a racing chown cannot leave the old owner's decision standing
-    let lock = inode.lock();
-    if let Err(e) = inode
-        .i_op
-        .setattr_ok(&inode)
-        .and_then(|_| dac::may_utimes(&inode, times.is_some()))
-    {
-        return e.sysret();
-    }
     if let Some(t) = atime {
         inode.set_atime(t);
     }
