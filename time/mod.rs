@@ -128,13 +128,20 @@ pub struct Ntp {
     pub constant: i64,
     /// Tick value (usec per tick, nominally 10000 for 100Hz)
     pub tick: i64,
+    /// Frequency offset, ns/s << 32 (Linux time_freq; reported, not yet
+    /// applied to the clock)
+    pub freq: i64,
 }
+
+/// Beyond the largest dispersion, us (Linux NTP_PHASE_LIMIT)
+pub const NTP_PHASE_LIMIT: i64 = (500_000_000 / 1000) << 5;
 
 impl Ntp {
     const fn new() -> Self {
         Self {
-            maxerror: 500_000, // 0.5 sec default
-            esterror: 500_000,
+            maxerror: NTP_PHASE_LIMIT,
+            esterror: NTP_PHASE_LIMIT,
+            freq: 0,
             status: STA_UNSYNC, // Initially unsynchronized
             constant: 2,
             tick: 10000, // 10ms in usec (100Hz)
