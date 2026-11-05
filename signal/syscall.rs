@@ -334,17 +334,20 @@ pub(crate) fn user_group_send(pid: u64, sig: u32) -> i32 {
 }
 
 /// A user signal to one thread `tid`, which must be in group `tgid`
-/// (Linux do_send_specific): ESRCH if it is not, then the same
+/// if one is given (Linux do_send_specific; tkill gives none): ESRCH
+/// if it is not, then the same
 /// permission check as a process-wide signal, then the send.
-fn user_thread_send(tgid: u64, tid: u64, sig: u32) -> i32 {
+fn user_thread_send(tgid: Option<u64>, tid: u64, sig: u32) -> i32 {
     use crate::task::percpu::TASKLIST;
-    let in_group = TASKLIST
-        .read()
-        .get(tid)
-        .map(|t| t.task.pid == tgid)
-        .unwrap_or(false);
-    if !in_group {
-        return -3; // ESRCH
+    if let Some(tgid) = tgid {
+        let in_group = TASKLIST
+            .read()
+            .get(tid)
+            .map(|t| t.task.pid == tgid)
+            .unwrap_or(false);
+        if !in_group {
+            return -3; // ESRCH
+        }
     }
     let perm = check_kill_permission(tid, sig);
     if perm != 0 {
@@ -424,7 +427,7 @@ pub fn sys_tgkill(tgid: i64, tid: i64, sig: u32) -> i64 {
         return -22; // EINVAL
     }
 
-    user_thread_send(tgid as u64, tid as u64, sig) as i64
+    user_thread_send(Some(tgid as u64), tid as u64, sig) as i64
 }
 
 /// tkill(tid, sig) - send signal to thread (deprecated)
@@ -435,12 +438,7 @@ pub fn sys_tkill(tid: i64, sig: u32) -> i64 {
     if sig > 64 || tid <= 0 {
         return -22; // EINVAL
     }
-
-    let perm = check_kill_permission(tid as u64, sig);
-    if perm != 0 {
-        return perm as i64;
-    }
-    send_signal(tid as u64, sig) as i64
+    user_thread_send(None, tid as u64, sig) as i64
 }
 
 /// rt_sigqueueinfo(pid, sig, uinfo) - send signal with info to a process
@@ -496,8 +494,6 @@ pub fn sys_rt_sigqueueinfo(pid: i64, sig: u32, uinfo: u64) -> i64 {
 /// * -ESRCH: No such process/thread
 /// * -EFAULT: Bad uinfo pointer
 pub fn sys_rt_tgsigqueueinfo(tgid: i64, tid: i64, sig: u32, uinfo: u64) -> i64 {
-    use crate::task::percpu::TASKLIST;
-
     // Validate arguments
     if tid <= 0 || tgid <= 0 {
         return -22; // EINVAL
@@ -520,24 +516,7 @@ pub fn sys_rt_tgsigqueueinfo(tgid: i64, tid: i64, sig: u32, uinfo: u64) -> i64 {
         return -1; // EPERM
     }
 
-    // Verify tid belongs to tgid (thread group validation)
-    let valid = {
-        let table = TASKLIST.read();
-        table
-            .get(tid as u64)
-            .map(|t| t.task.pid == tgid as u64)
-            .unwrap_or(false)
-    };
-
-    if !valid {
-        return -3; // ESRCH - thread not in specified thread group
-    }
-
-    let perm = check_kill_permission(tid as u64, sig);
-    if perm != 0 {
-        return perm as i64;
-    }
-    send_signal(tid as u64, sig) as i64
+    user_thread_send(Some(tgid as u64), tid as u64, sig) as i64
 }
 
 /// rt_sigsuspend(mask, sigsetsize) - wait for signal with temporary mask
