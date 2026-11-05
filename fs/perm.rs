@@ -249,7 +249,7 @@ fn do_utimes(dirfd: i32, pathname: u64, times: Option<[UserTimespec; 2]>, flags:
     if let Err(e) = inode
         .i_op
         .setattr_ok(&inode)
-        .and_then(|_| dac::may_utimes(&inode, times.is_some()))
+        .and_then(|()| dac::may_utimes(&inode, times.is_some()))
     {
         return e.sysret();
     }

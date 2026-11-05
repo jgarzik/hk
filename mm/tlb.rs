@@ -134,7 +134,7 @@ pub fn flush_tlb_mm_range(mm: &Mm, start: u64, end: u64, stride_shift: u32, free
     // and before the cpumask is read
     let new_gen = ctx.tlb_gen.fetch_add(1, Ordering::SeqCst) + 1;
     let info = FlushInfo {
-        mm: mm as *const Mm as usize,
+        mm: core::ptr::from_ref::<Mm>(mm) as usize,
         start,
         end,
         stride_shift,
@@ -152,7 +152,7 @@ pub fn flush_tlb_mm_range(mm: &Mm, start: u64, end: u64, stride_shift: u32, free
     let mut others = ctx.cpumask.snapshot();
     others.clear(cpu);
     if !others.is_empty() {
-        let p = &info as *const FlushInfo as usize;
+        let p = &raw const info as usize;
         crate::smp::smp_call_function_many(&others, flush_ipi, p, true);
     }
 }
@@ -183,7 +183,7 @@ pub fn flush_tlb_kernel_range(start: u64, end: u64) {
     }
     // Every CPU, this one included: kernel threads run everywhere
     let range = (start, end);
-    crate::smp::on_each_cpu(kernel_flush_ipi, &range as *const (u64, u64) as usize);
+    crate::smp::on_each_cpu(kernel_flush_ipi, &raw const range as usize);
 }
 
 /// The kernel-range flush on one CPU (interrupts off)
@@ -254,7 +254,7 @@ pub fn switch_mm(next: Option<&Mm>) {
 fn switch_mm_irqs_off(next: Option<&Mm>) {
     let cpu = this_id();
     let st = this_state();
-    let next_ptr = next.map_or(0, |m| m as *const Mm as usize);
+    let next_ptr = next.map_or(0, |m| core::ptr::from_ref::<Mm>(m) as usize);
     let prev = st.loaded_mm.load(Ordering::Relaxed);
     if prev == next_ptr {
         // Same address space (threads of one process, or kernel threads):

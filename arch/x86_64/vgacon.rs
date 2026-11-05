@@ -44,7 +44,7 @@ const DEFAULT_ATTR: u8 = 0x07;
 ///
 /// Returns true if VGA buffer is present and responsive.
 fn probe_vga_buffer() -> bool {
-    let p = super::paging::phys_to_virt(VGA_BUFFER_PHYS) as *mut u16;
+    let p = super::paging::phys_to_virt(VGA_BUFFER_PHYS).cast::<u16>();
     unsafe {
         // Save original values
         let saved1 = core::ptr::read_volatile(p);
@@ -102,7 +102,7 @@ impl VgaConState {
 
     /// Initialize the VGA console state
     fn init(&mut self) {
-        self.buffer = super::paging::phys_to_virt(VGA_BUFFER_PHYS) as *mut u16;
+        self.buffer = super::paging::phys_to_virt(VGA_BUFFER_PHYS).cast::<u16>();
         self.attribute = DEFAULT_ATTR;
 
         // Probe VGA buffer - this also "wakes up" VGA hardware that may

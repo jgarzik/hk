@@ -347,8 +347,11 @@ impl CpuRunQueue {
         let q = self.queue.as_ref().expect("run queue not initialized");
         let ents = q
             .fair_iter()
-            .map(|t| (t as *const Task, &t.se))
-            .chain(self.curr_fair().map(|c| (c as *const Task, &c.se)));
+            .map(|t| (core::ptr::from_ref::<Task>(t), &t.se))
+            .chain(
+                self.curr_fair()
+                    .map(|c| (core::ptr::from_ref::<Task>(c), &c.se)),
+            );
         crate::task::fair::pick(ents).is_some_and(|t| core::ptr::eq(t, p))
     }
 
@@ -396,7 +399,10 @@ impl CpuRunQueue {
     fn pick_fair(&mut self) -> Option<*const Task> {
         let t = {
             let q = self.queue.as_ref().expect("run queue not initialized");
-            crate::task::fair::pick(q.fair_iter().map(|t| (t as *const Task, &t.se)))?
+            crate::task::fair::pick(
+                q.fair_iter()
+                    .map(|t| (core::ptr::from_ref::<Task>(t), &t.se)),
+            )?
         };
         // SAFETY: on the fair list (just found there)
         unsafe { self.queue().remove(t, Class::Fair, 0) };
@@ -586,10 +592,13 @@ crate::adapter!(pub SessionLink, Task, session_link);
 /// A new reference to a task that lives in an `Arc` (every task but the
 /// boot task does: the table and run queues hold `TaskRef`s)
 pub fn task_ref(t: &Task) -> TaskRef {
-    let p = t as *const Task;
+    let p = core::ptr::from_ref::<Task>(t);
     // The static boot task is in no Arc: one pointer compare keeps this
     // safe fn from corrupting the memory before it
-    assert!(!core::ptr::eq(p, &INIT_TASK), "task_ref of the boot task");
+    assert!(
+        !core::ptr::eq(p, &raw const INIT_TASK),
+        "task_ref of the boot task"
+    );
     // SAFETY: `t` is the data of a live `Arc<Task>` (see above)
     unsafe {
         Arc::increment_strong_count(p);
@@ -716,7 +725,7 @@ impl GlobalTaskTable {
     /// Task `tid`, found through the pid hash (root namespace)
     fn lookup(&self, tid: Tid) -> Option<&Task> {
         let pid = crate::task::pid::find_pid(&crate::ns::INIT_PID_NS, u32::try_from(tid).ok()?)?;
-        let t = pid.task() as *const Task;
+        let t = pid.task().cast::<Task>();
         // SAFETY: a nonzero `task` is in this list (set by `insert`,
         // cleared by `remove` under the write lock), which holds a
         // reference; the caller borrows the locked list
@@ -829,7 +838,7 @@ impl GlobalTaskTable {
         if let Some(inner) = unsafe { task.inner().get() }
             && let Some(p) = &inner.thread_pid
         {
-            p.set_task(Arc::as_ptr(&task) as *const ());
+            p.set_task(Arc::as_ptr(&task).cast::<()>());
         }
         self.tasks.push_back(task.clone());
         self.attach_pids(&task);
@@ -1716,7 +1725,7 @@ pub fn take_leadership(tgid: Pid, tid: Tid) -> Vec<TaskRef> {
             core::mem::swap(&mut mi.thread_pid, &mut li.thread_pid);
             // The pid hash names the caller by its new number
             if let Some(p) = &mi.thread_pid {
-                p.set_task(Arc::as_ptr(&me) as *const ());
+                p.set_task(Arc::as_ptr(&me).cast::<()>());
             }
             if let Some(p) = &li.thread_pid {
                 p.set_task(core::ptr::null());
@@ -2337,10 +2346,9 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     // p->vfork_done)
     let vfork = crate::sync::completion::Completion::new();
     if config.flags & CLONE_VFORK != 0 {
-        child_task.vfork_done.store(
-            &vfork as *const crate::sync::completion::Completion as *mut _,
-            Ordering::Release,
-        );
+        child_task
+            .vfork_done
+            .store((&raw const vfork).cast_mut(), Ordering::Release);
     }
 
     // The child exists now: its charge is released with it; the parent
@@ -2437,7 +2445,7 @@ fn forget_original_parent() {
     let live = crate::signal::task_live;
     let mut reaper = table
         .threads(me.pid)
-        .find(|t| !core::ptr::eq(t.task, &*me) && live(t))
+        .find(|t| !core::ptr::eq(t.task, &raw const *me) && live(t))
         .map(|t| task_ref(t.task));
     if reaper.is_none() {
         let mut p = table.get(me.tid()).and_then(|t| t.real_parent.clone());
@@ -2635,7 +2643,7 @@ pub fn exit_current(status: Option<i32>) -> ! {
     // SAFETY: a task of this run queue, alive while it holds it
     let (next_kstack, next_mm, (next_tls, next_gs)) = make_current(unsafe { &*next });
     rq.curr = next;
-    rq.prev = &*me;
+    rq.prev = &raw const *me;
     sched.nr_switches.fetch_add(1, Ordering::Relaxed);
 
     // The rq lock stays held across the switch, as for any switch: the
@@ -2689,7 +2697,7 @@ fn make_current(t: &Task) -> (u64, *const crate::mm::Mm, (u64, u64)) {
         s.membarrier_state.store(st, Ordering::Relaxed);
         s.curr_rank.store(rank(t), Ordering::Relaxed);
     }
-    CurrentArch::set_current_task_ptr(t as *const Task as usize);
+    CurrentArch::set_current_task_ptr(core::ptr::from_ref::<Task>(t) as usize);
     // Linux prepare_task
     t.se.set_on_cpu(true);
     // A fair task's runtime counts from now (Linux set_next_entity)
@@ -2875,7 +2883,7 @@ pub fn schedule_timeout(timeout: u64) -> u64 {
         process_timeout,
         crate::time::timer::TIMER_HARD
     ));
-    t.set_data(&*me as *const Task as usize);
+    t.set_data(&raw const *me as usize);
     t.as_ref().mod_timer(expire);
     schedule();
     t.del_timer_sync();
@@ -3316,11 +3324,7 @@ pub fn set_cpus_allowed_ptr(p: &Task, mask: &crate::util::cpumask::CpuSet) -> Re
         (cpu, find_idlest_cpu(&allowed, cpu))
     };
     let m = Migration { task: p, dest };
-    crate::task::stop_machine::stop_one_cpu(
-        cpu,
-        migration_cpu_stop,
-        &m as *const Migration as usize,
-    );
+    crate::task::stop_machine::stop_one_cpu(cpu, migration_cpu_stop, &raw const m as usize);
     Ok(())
 }
 
@@ -3340,12 +3344,11 @@ pub fn sched_exec() {
     if dest == this {
         return;
     }
-    let m = Migration { task: &*me, dest };
-    crate::task::stop_machine::stop_one_cpu(
-        this,
-        migration_cpu_stop,
-        &m as *const Migration as usize,
-    );
+    let m = Migration {
+        task: &raw const *me,
+        dest,
+    };
+    crate::task::stop_machine::stop_one_cpu(this, migration_cpu_stop, &raw const m as usize);
 }
 
 /// Wait until `p`, asleep, is off its CPU (Linux wait_task_inactive):
@@ -3442,7 +3445,7 @@ impl Drop for WakeQ {
 /// CPU (it is the caller, or not running) or not running at all.
 pub fn kick_process(t: &Task) {
     let cpu = t.cpu();
-    let running = CurrentArch::current_task_ptr_of(cpu) == t as *const Task as usize;
+    let running = CurrentArch::current_task_ptr_of(cpu) == core::ptr::from_ref::<Task>(t) as usize;
     if running && crate::cpu::try_this_id() != Some(cpu) {
         crate::smp::smp_send_reschedule(cpu);
     }
@@ -3677,7 +3680,7 @@ fn yield_cpu(preempted: bool) -> bool {
         rq.enqueue_prev(&me, preempted);
     }
     let next = rq.pick_next();
-    if core::ptr::eq(next, &*me) {
+    if core::ptr::eq(next, &raw const *me) {
         return false;
     }
     context_switch_locked(sched, rq, &me, next);
@@ -4088,7 +4091,7 @@ fn change_class(p: &Task, f: impl FnOnce(&sched::SchedEntity)) {
         return;
     }
     let mut rq = task_rq_lock(p);
-    let pp = p as *const Task;
+    let pp = core::ptr::from_ref::<Task>(p);
     let running = core::ptr::eq(rq.curr, pp);
     let queued = p.se.on_rq() && !running && !core::ptr::eq(rq.idle, pp);
     let (old, old_rt, old_prio) = (p.se.class(), p.se.rt_priority(), prio(&p.se));

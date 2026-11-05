@@ -108,7 +108,7 @@ impl RawSock {
     }
 
     /// Destination (Linux raw_sendmsg: AF_UNSPEC is tolerated)
-    fn dest(&self, m: &SendMsg) -> Result<Ipv4Addr, KernelError> {
+    fn dest(&self, m: &SendMsg<'_>) -> Result<Ipv4Addr, KernelError> {
         let Some(a) = &m.addr else {
             if !self.connected.load(Ordering::Acquire) {
                 return Err(KernelError::DestAddrRequired);
@@ -331,7 +331,7 @@ impl ProtoOps for RawSock {
     }
 
     /// Linux raw_sendmsg
-    fn sendmsg(&self, m: &mut SendMsg, flags: i32) -> Result<usize, KernelError> {
+    fn sendmsg(&self, m: &mut SendMsg<'_>, flags: i32) -> Result<usize, KernelError> {
         let len = m.data.len();
         if len > 0xffff {
             return Err(KernelError::MessageTooLong);
@@ -379,7 +379,7 @@ impl ProtoOps for RawSock {
 
     /// Linux raw_recvmsg: the packet from its IP header, source address
     /// with port 0
-    fn recvmsg(&self, m: &mut RecvMsg, flags: i32) -> Result<usize, KernelError> {
+    fn recvmsg(&self, m: &mut RecvMsg<'_>, flags: i32) -> Result<usize, KernelError> {
         if flags & MSG_OOB != 0 {
             return Err(KernelError::OperationNotSupported);
         }
@@ -461,7 +461,7 @@ pub fn raw_deliver(net: &NetNamespace, skb: &SkBuff) -> bool {
 
 /// An ICMP error about a packet of a raw socket's protocol (Linux
 /// raw_icmp_error + raw_err)
-pub fn raw_err(net: &NetNamespace, e: &IcmpErr) {
+pub fn raw_err(net: &NetNamespace, e: &IcmpErr<'_>) {
     for s in net
         .raw
         .matching(e.proto(), e.inner_daddr(), e.inner_saddr(), e.rx.ifindex)
@@ -470,7 +470,7 @@ pub fn raw_err(net: &NetNamespace, e: &IcmpErr) {
     }
 }
 
-fn err_one(s: &RawSock, e: &IcmpErr) {
+fn err_one(s: &RawSock, e: &IcmpErr<'_>) {
     let recverr = s.inet.flag(ipf::RECVERR);
     if !recverr && !s.connected.load(Ordering::Acquire) {
         return;

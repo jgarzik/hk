@@ -423,7 +423,7 @@ impl FileOps for MqFileOps {
         }
     }
 
-    fn poll(&self, file: &File, table: Option<&mut PollTable>) -> u16 {
+    fn poll(&self, file: &File, table: Option<&mut PollTable<'_>>) -> u16 {
         let Some(mq) = mq_of(file) else {
             return crate::io::poll::POLLERR;
         };

@@ -411,7 +411,7 @@ impl TcpSock {
     /// A segment for this connection (Linux tcp_v4_do_rcv), found in
     /// ehash under `t`: dropped if the socket left that tuple between
     /// the lookup and taking its lock
-    fn rcv(&self, s: &SegIn, t: Tuple, now: u64) {
+    fn rcv(&self, s: &SegIn<'_>, t: Tuple, now: u64) {
         self.step(|g, out| {
             if g.tuple != Some(t) {
                 return;
@@ -440,7 +440,7 @@ impl TcpSock {
     /// A SYN for this listener (Linux tcp_conn_request): a child in
     /// SYN_RECEIVED answers with SYN-ACK. Dropped when the accept queue
     /// or the SYN queue is full (no syncookies).
-    fn listen_rcv(&self, s: &SegIn, t: Tuple, now: u64) {
+    fn listen_rcv(&self, s: &SegIn<'_>, t: Tuple, now: u64) {
         if s.has(flags::RST) {
             return;
         }
@@ -472,7 +472,7 @@ impl TcpSock {
     /// Create, hash and queue a SYN_RECEIVED child and send its SYN-ACK
     /// (listener locked, then the child's lock; `opts` are the
     /// listener's)
-    fn child(&self, s: &SegIn, t: Tuple, opts: cb::Opts, now: u64) {
+    fn child(&self, s: &SegIn<'_>, t: Tuple, opts: cb::Opts, now: u64) {
         let c = TcpSock::new(Sock::clone_from(&self.sk));
         c.inet.clone_opts(&self.inet);
         {
@@ -639,7 +639,7 @@ impl TcpSock {
     /// `m` at `off`; MSG_PEEK reads past the `off` bytes already peeked
     fn take_rx(
         &self,
-        m: &mut RecvMsg,
+        m: &mut RecvMsg<'_>,
         off: usize,
         want: usize,
         flags: i32,
@@ -827,7 +827,7 @@ pub fn tcp_rcv(skb: SkBuff) {
 }
 
 /// An ICMP error quoting one of our segments (Linux tcp_v4_err)
-pub fn tcp_err(net: &NetNamespace, e: &IcmpErr) {
+pub fn tcp_err(net: &NetNamespace, e: &IcmpErr<'_>) {
     let l4 = e.l4();
     if l4.len() < 8 {
         return;
@@ -881,7 +881,7 @@ pub fn tcp_err(net: &NetNamespace, e: &IcmpErr) {
 // ============================================================================
 
 /// Linux tcp_recvmsg main loop (no urgent data)
-fn tcp_recvmsg(s: &TcpSock, m: &mut RecvMsg, flags: i32) -> Result<usize, KernelError> {
+fn tcp_recvmsg(s: &TcpSock, m: &mut RecvMsg<'_>, flags: i32) -> Result<usize, KernelError> {
     if s.state() == TcpState::Listen {
         return Err(KernelError::NotConnected);
     }
@@ -1006,7 +1006,7 @@ fn wait_memory(s: &TcpSock, timeo: &mut u64) -> Result<(), KernelError> {
 
 /// Linux tcp_sendmsg: queue everything (blocking) or what fits
 /// (non-blocking), copying through a bounded kernel buffer
-fn tcp_sendmsg(s: &TcpSock, m: &mut SendMsg, flags: i32) -> Result<usize, KernelError> {
+fn tcp_sendmsg(s: &TcpSock, m: &mut SendMsg<'_>, flags: i32) -> Result<usize, KernelError> {
     if flags & MSG_OOB != 0 {
         return Err(KernelError::OperationNotSupported);
     }
@@ -1391,11 +1391,11 @@ impl ProtoOps for TcpSock {
         }
     }
 
-    fn sendmsg(&self, m: &mut SendMsg, flags: i32) -> Result<usize, KernelError> {
+    fn sendmsg(&self, m: &mut SendMsg<'_>, flags: i32) -> Result<usize, KernelError> {
         tcp_sendmsg(self, m, flags)
     }
 
-    fn recvmsg(&self, m: &mut RecvMsg, flags: i32) -> Result<usize, KernelError> {
+    fn recvmsg(&self, m: &mut RecvMsg<'_>, flags: i32) -> Result<usize, KernelError> {
         tcp_recvmsg(self, m, flags)
     }
 }

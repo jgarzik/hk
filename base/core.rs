@@ -263,7 +263,7 @@ impl Device {
     /// Environment of the device's uevents (Linux dev_uevent)
     pub fn uevent_env(&self) -> Vec<Vec<u8>> {
         let mut env = Vec::new();
-        let mut kv = |args: core::fmt::Arguments| {
+        let mut kv = |args: core::fmt::Arguments<'_>| {
             let mut s = String::new();
             let _ = s.write_fmt(args);
             env.push(s.into_bytes());
@@ -445,7 +445,7 @@ impl Device {
 }
 
 /// Create and register a device (Linux device_create)
-pub fn device_create(info: DeviceInfo) -> Result<Arc<Device>, KernelError> {
+pub fn device_create(info: DeviceInfo<'_>) -> Result<Arc<Device>, KernelError> {
     let d = Arc::new_cyclic(|me| Device {
         name: info.name,
         parent: info.parent.cloned(),

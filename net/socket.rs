@@ -141,8 +141,8 @@ pub trait ProtoOps: Send + Sync {
         None
     }
     /// `flags` includes MSG_DONTWAIT for non-blocking files
-    fn sendmsg(&self, m: &mut SendMsg, flags: i32) -> Result<usize, KernelError>;
-    fn recvmsg(&self, m: &mut RecvMsg, flags: i32) -> Result<usize, KernelError>;
+    fn sendmsg(&self, m: &mut SendMsg<'_>, flags: i32) -> Result<usize, KernelError>;
+    fn recvmsg(&self, m: &mut RecvMsg<'_>, flags: i32) -> Result<usize, KernelError>;
     /// Bytes queued for reading / not yet sent (FIONREAD, SIOCOUTQ)
     fn inq(&self) -> usize {
         0
@@ -251,7 +251,11 @@ pub fn file_nb(file: &File, flags: i32) -> i32 {
 
 /// Send with the socket-layer EPIPE rule: SIGPIPE unless MSG_NOSIGNAL
 /// (Linux sock_sendmsg callers / sk_stream_error)
-pub fn sock_sendmsg(s: &dyn ProtoOps, m: &mut SendMsg, flags: i32) -> Result<usize, KernelError> {
+pub fn sock_sendmsg(
+    s: &dyn ProtoOps,
+    m: &mut SendMsg<'_>,
+    flags: i32,
+) -> Result<usize, KernelError> {
     let r = s.sendmsg(m, flags);
     if r == Err(KernelError::BrokenPipe) && flags & MSG_NOSIGNAL == 0 && s.sigpipe() {
         let tid = crate::task::percpu::current_tid();
@@ -287,7 +291,7 @@ impl FileOps for SockFile {
         Err(KernelError::IllegalSeek)
     }
 
-    fn poll(&self, file: &File, pt: Option<&mut PollTable>) -> u16 {
+    fn poll(&self, file: &File, pt: Option<&mut PollTable<'_>>) -> u16 {
         let Some(s) = sock_of(file) else {
             return crate::io::poll::POLLNVAL;
         };

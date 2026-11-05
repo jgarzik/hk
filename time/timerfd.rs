@@ -281,7 +281,7 @@ impl Timerfd {
     }
 
     /// Poll for readiness
-    pub fn poll(&self, pt: Option<&mut PollTable>) -> u16 {
+    pub fn poll(&self, pt: Option<&mut PollTable<'_>>) -> u16 {
         if let Some(poll_table) = pt {
             poll_table.poll_wait(&self.wait_queue);
         }
@@ -438,7 +438,7 @@ impl FileOps for TimerfdFileOps {
         Err(KernelError::InvalidArgument)
     }
 
-    fn poll(&self, file: &File, pt: Option<&mut PollTable>) -> u16 {
+    fn poll(&self, file: &File, pt: Option<&mut PollTable<'_>>) -> u16 {
         let Some(timerfd) = file.private_ref::<Timerfd>() else {
             return crate::io::poll::POLLERR;
         };

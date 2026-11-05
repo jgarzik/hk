@@ -64,7 +64,7 @@ fn validate_iovec_array(iov_ptr: u64, iovcnt: i32) -> Result<alloc::vec::Vec<IoV
     // SAFETY: IoVec is repr(C) plain data; the byte view covers exactly the
     // `iovcnt` initialized elements of `iovecs`.
     let bytes =
-        unsafe { core::slice::from_raw_parts_mut(iovecs.as_mut_ptr() as *mut u8, total_size) };
+        unsafe { core::slice::from_raw_parts_mut(iovecs.as_mut_ptr().cast::<u8>(), total_size) };
     if copy_from_user::<Uaccess>(bytes, iov_ptr, total_size).is_err() {
         return Err(KernelError::BadAddress.sysret());
     }

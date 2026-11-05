@@ -95,7 +95,7 @@ impl Filter {
     }
 
     /// Run the program: bytes of the packet to keep (0 = drop)
-    pub fn run(&self, c: &Ctx) -> u32 {
+    pub fn run(&self, c: &Ctx<'_>) -> u32 {
         convert::run(&self.prog, &[], c)
     }
 }

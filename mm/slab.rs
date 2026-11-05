@@ -281,7 +281,7 @@ impl KmemCache {
         pg.private.store(free as u64, Ordering::Relaxed);
         pg.inuse.store(0, Ordering::Relaxed);
         pg.mapping
-            .store(self as *const Self as u64, Ordering::Relaxed);
+            .store(core::ptr::from_ref::<Self>(self) as u64, Ordering::Relaxed);
         pg.set_flag(PG_SLAB);
         self.nr_slabs.fetch_add(1, Ordering::Relaxed);
         let mut l = self.list_lock.lock();

@@ -243,7 +243,7 @@ impl PacketSock {
 
     /// Identity for skipping our own outgoing frames
     fn id(&self) -> usize {
-        self as *const Self as usize
+        core::ptr::from_ref::<Self>(self) as usize
     }
 
     fn dev(&self, ifindex: i32) -> Option<Arc<NetDevice>> {
@@ -255,7 +255,7 @@ impl PacketSock {
 
     /// Destination of a send, from msg_name or the binding (Linux
     /// packet_snd)
-    fn dest(&self, m: &SendMsg) -> Result<Dest, KernelError> {
+    fn dest(&self, m: &SendMsg<'_>) -> Result<Dest, KernelError> {
         let Some(a) = &m.addr else {
             let (proto, ifindex) = self.bound();
             let dev = self.dev(ifindex).ok_or(KernelError::NoDeviceOrAddress)?;
@@ -470,7 +470,7 @@ impl ProtoOps for PacketSock {
     }
 
     /// Linux packet_snd
-    fn sendmsg(&self, m: &mut SendMsg, _flags: i32) -> Result<usize, KernelError> {
+    fn sendmsg(&self, m: &mut SendMsg<'_>, _flags: i32) -> Result<usize, KernelError> {
         let Dest { dev, proto, addr } = self.dest(m)?;
         if !dev.is_up() {
             return Err(KernelError::NetworkDown);
@@ -490,7 +490,7 @@ impl ProtoOps for PacketSock {
     }
 
     /// Linux packet_recvmsg
-    fn recvmsg(&self, m: &mut RecvMsg, flags: i32) -> Result<usize, KernelError> {
+    fn recvmsg(&self, m: &mut RecvMsg<'_>, flags: i32) -> Result<usize, KernelError> {
         let ok = MSG_PEEK | MSG_DONTWAIT | MSG_TRUNC | MSG_ERRQUEUE;
         if flags & !ok != 0 {
             return Err(KernelError::InvalidArgument);

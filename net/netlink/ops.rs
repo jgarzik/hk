@@ -52,7 +52,7 @@ fn may_send_to(pid: u32, group: u32) -> Result<(), KernelError> {
 
 impl NlSock {
     /// Destination of a send: explicit sockaddr_nl or the connected one
-    fn dest(&self, m: &SendMsg) -> Result<NlDst, KernelError> {
+    fn dest(&self, m: &SendMsg<'_>) -> Result<NlDst, KernelError> {
         let Some(a) = &m.addr else {
             let (portid, group) = self.dst();
             return Ok(NlDst {
@@ -188,7 +188,7 @@ impl ProtoOps for NlSock {
     /// Linux netlink_sendmsg: EMSGSIZE above sndbuf - 32 before copying;
     /// the message carries the sender's credentials, or those it passed
     /// as SCM_CREDENTIALS (scm_send)
-    fn sendmsg(&self, m: &mut SendMsg, flags: i32) -> Result<usize, KernelError> {
+    fn sendmsg(&self, m: &mut SendMsg<'_>, flags: i32) -> Result<usize, KernelError> {
         let creds = Scm::parse(&m.control)?.creds.unwrap_or_else(Creds::current);
         let dst = self.dest(m)?;
         let len = m.data.len();
@@ -203,7 +203,7 @@ impl ProtoOps for NlSock {
     /// Datagram semantics: MSG_TRUNC in msg_flags when cut (the flag
     /// returns the real length); NETLINK_PKTINFO, then SCM_CREDENTIALS
     /// with SO_PASSCRED (Linux netlink_recvmsg -> scm_recv)
-    fn recvmsg(&self, m: &mut RecvMsg, flags: i32) -> Result<usize, KernelError> {
+    fn recvmsg(&self, m: &mut RecvMsg<'_>, flags: i32) -> Result<usize, KernelError> {
         let skb = self.recv(flags & MSG_PEEK != 0, flags & MSG_DONTWAIT != 0)?;
         let n = m.data.put(0, &skb.data)?;
         if n < skb.data.len() {

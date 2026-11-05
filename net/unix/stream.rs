@@ -199,7 +199,7 @@ pub fn accept(s: &UnixSock, nonblock: bool) -> Result<Arc<UnixSock>, KernelError
 /// waiting for sndbuf room; files ride on the first chunk only. A
 /// partial write returns its count; EPIPE (SIGPIPE from the socket
 /// layer) only when nothing was sent.
-pub fn sendmsg(s: &UnixSock, m: &mut SendMsg, flags: i32) -> Result<usize, KernelError> {
+pub fn sendmsg(s: &UnixSock, m: &mut SendMsg<'_>, flags: i32) -> Result<usize, KernelError> {
     let mut scm = Scm::parse(&m.control)?;
     if flags & MSG_OOB != 0 {
         return Err(KernelError::OperationNotSupported);
@@ -232,7 +232,7 @@ pub fn sendmsg(s: &UnixSock, m: &mut SendMsg, flags: i32) -> Result<usize, Kerne
 fn send_chunk(
     s: &UnixSock,
     other: &Arc<UnixSock>,
-    m: &SendMsg,
+    m: &SendMsg<'_>,
     off: usize,
     scm: &mut Scm,
     timeo: &mut u64,
@@ -273,7 +273,7 @@ struct Got {
 }
 
 /// Linux unix_stream_read_generic
-pub fn recvmsg(s: &UnixSock, m: &mut RecvMsg, flags: i32) -> Result<usize, KernelError> {
+pub fn recvmsg(s: &UnixSock, m: &mut RecvMsg<'_>, flags: i32) -> Result<usize, KernelError> {
     if s.state() != ESTABLISHED {
         return Err(KernelError::InvalidArgument);
     }
@@ -325,7 +325,7 @@ pub fn recvmsg(s: &UnixSock, m: &mut RecvMsg, flags: i32) -> Result<usize, Kerne
 #[allow(clippy::too_many_arguments)]
 fn read_some(
     s: &UnixSock,
-    m: &mut RecvMsg,
+    m: &mut RecvMsg<'_>,
     flags: i32,
     size: usize,
     target: usize,
@@ -385,7 +385,7 @@ fn may_join(
     s: &UnixSock,
     creds: Option<Creds>,
     from: &UnixSock,
-    m: &mut RecvMsg,
+    m: &mut RecvMsg<'_>,
     g: &mut Got,
 ) -> bool {
     if g.check_creds {
@@ -404,7 +404,12 @@ fn may_join(
 }
 
 /// Consume from the head message (iolock held: only we remove)
-fn read_one(s: &UnixSock, m: &mut RecvMsg, size: usize, g: &mut Got) -> Result<Step, KernelError> {
+fn read_one(
+    s: &UnixSock,
+    m: &mut RecvMsg<'_>,
+    size: usize,
+    g: &mut Got,
+) -> Result<Step, KernelError> {
     let mut skb = {
         let mut q = s.rq.lock();
         let Some(front) = q.q.pop_front() else {
@@ -454,7 +459,7 @@ fn read_one(s: &UnixSock, m: &mut RecvMsg, size: usize, g: &mut Got) -> Result<S
 /// duplicated (Linux unix_peek_fds) and end the read
 fn peek_one(
     s: &UnixSock,
-    m: &mut RecvMsg,
+    m: &mut RecvMsg<'_>,
     size: usize,
     g: &mut Got,
     peek_at: &mut usize,

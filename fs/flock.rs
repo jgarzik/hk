@@ -291,7 +291,7 @@ pub fn sys_flock(fd: i32, operation: i32) -> i64 {
 /// The open file description `file` is gone (File::drop, its last
 /// reference): its flock locks go (Linux locks_remove_file)
 pub fn release_file_locks(file: &File) {
-    let owner = file as *const File as u64;
+    let owner = core::ptr::from_ref::<File>(file) as u64;
     let _ = with_lock(file, |l| {
         let held = l.unlock(owner);
         (Ok(()), held)

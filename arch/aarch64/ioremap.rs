@@ -357,7 +357,7 @@ fn map_page(l0_phys: u64, va: u64, pa: u64, attrs: u64) -> Result<(), IoremapErr
         l3_entry.set_page(pa, attrs);
 
         // Data cache clean to ensure MMU sees the new entry
-        let entry_addr = l3_entry as *mut PageTableEntry as u64;
+        let entry_addr = core::ptr::from_mut::<PageTableEntry>(l3_entry) as u64;
         asm!(
             "dc cvau, {}",
             "dsb ish",
@@ -400,7 +400,7 @@ fn unmap_page(l0_phys: u64, va: u64) -> Option<u64> {
         l3_entry.clear();
 
         // Data cache clean
-        let entry_addr = l3_entry as *mut PageTableEntry as u64;
+        let entry_addr = core::ptr::from_mut::<PageTableEntry>(l3_entry) as u64;
         asm!(
             "dc cvau, {}",
             "dsb ish",

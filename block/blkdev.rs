@@ -208,7 +208,7 @@ impl BioList {
 
     pub fn push(&mut self, mut bio: Box<Bio>) {
         bio.next = None;
-        let p: *mut Bio = &mut *bio;
+        let p: *mut Bio = &raw mut *bio;
         if self.tail.is_null() {
             self.head = Some(bio);
         } else {
@@ -221,7 +221,7 @@ impl BioList {
     pub fn push_front(&mut self, mut bio: Box<Bio>) {
         bio.next = self.head.take();
         if bio.next.is_none() {
-            self.tail = &mut *bio;
+            self.tail = &raw mut *bio;
         }
         self.head = Some(bio);
     }
@@ -710,7 +710,7 @@ pub fn submit_bio_wait(
         bio: AtomicPtr::new(core::ptr::null_mut()),
     };
     bio.end_io = Some(wait_endio);
-    bio.private = &w as *const Waiter as usize;
+    bio.private = &raw const w as usize;
     submit_bio(bdev, bio);
     w.done.wait();
     let mut bio = unsafe { Box::from_raw(w.bio.load(Ordering::Acquire)) };

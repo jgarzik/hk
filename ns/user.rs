@@ -201,7 +201,7 @@ impl UserNamespace {
 
     /// Check if this namespace is an ancestor of another
     pub fn is_ancestor_of(&self, other: &UserNamespace) -> bool {
-        let self_ptr = self as *const UserNamespace;
+        let self_ptr = core::ptr::from_ref::<UserNamespace>(self);
         let mut current = other.parent.as_ref();
 
         while let Some(ns) = current {

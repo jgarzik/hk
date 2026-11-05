@@ -90,14 +90,14 @@ impl ScanoutSurface {
             PixelFormat::Xrgb8888 | PixelFormat::Xbgr8888 => {
                 let pixel = color.to_pixel(self.format);
                 unsafe {
-                    let ptr = self.buffer.add(offset) as *mut u32;
+                    let ptr = self.buffer.add(offset).cast::<u32>();
                     ptr::write_volatile(ptr, pixel);
                 }
             }
             PixelFormat::Rgb565 => {
                 let pixel = color.to_pixel(self.format) as u16;
                 unsafe {
-                    let ptr = self.buffer.add(offset) as *mut u16;
+                    let ptr = self.buffer.add(offset).cast::<u16>();
                     ptr::write_volatile(ptr, pixel);
                 }
             }
@@ -115,11 +115,11 @@ impl ScanoutSurface {
                 let offset = row_offset + (col * bpp) as usize;
                 match self.format {
                     PixelFormat::Xrgb8888 | PixelFormat::Xbgr8888 => unsafe {
-                        let ptr = self.buffer.add(offset) as *mut u32;
+                        let ptr = self.buffer.add(offset).cast::<u32>();
                         ptr::write_volatile(ptr, pixel);
                     },
                     PixelFormat::Rgb565 => unsafe {
-                        let ptr = self.buffer.add(offset) as *mut u16;
+                        let ptr = self.buffer.add(offset).cast::<u16>();
                         ptr::write_volatile(ptr, pixel as u16);
                     },
                 }
@@ -167,11 +167,11 @@ impl ScanoutSurface {
 
                 match self.format {
                     PixelFormat::Xrgb8888 | PixelFormat::Xbgr8888 => unsafe {
-                        let ptr = self.buffer.add(offset) as *mut u32;
+                        let ptr = self.buffer.add(offset).cast::<u32>();
                         ptr::write_volatile(ptr, pixel);
                     },
                     PixelFormat::Rgb565 => unsafe {
-                        let ptr = self.buffer.add(offset) as *mut u16;
+                        let ptr = self.buffer.add(offset).cast::<u16>();
                         ptr::write_volatile(ptr, pixel as u16);
                     },
                 }

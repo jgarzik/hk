@@ -312,7 +312,7 @@ impl TcpCb {
 
 /// RST answering segment `s` that has no connection (RFC 9293 3.10.7.1,
 /// Linux tcp_v4_send_reset): seq = its ACK if any, else ACK its end
-pub fn reset_for(s: &SegIn) -> Option<Seg> {
+pub fn reset_for(s: &SegIn<'_>) -> Option<Seg> {
     if s.has(flags::RST) {
         return None;
     }
@@ -432,7 +432,7 @@ pub fn parse(b: &[u8]) -> Option<(u16, u16, SegIn<'_>)> {
 /// The options of a segment (Linux tcp_parse_options: parsing stops at
 /// EOL, a length below 2 or past the header; an MSS of 0 is ignored;
 /// MSS and window scale count only on a SYN; a scale above 14 is 14)
-fn parse_opts(mut o: &[u8], s: &mut SegIn) {
+fn parse_opts(mut o: &[u8], s: &mut SegIn<'_>) {
     let syn = s.has(flags::SYN);
     while let Some(&k) = o.first() {
         match k {

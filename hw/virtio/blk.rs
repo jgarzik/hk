@@ -147,9 +147,9 @@ impl VbQueue {
     fn write_hdr(&self, t: u16, ty: u32, sector: u64) {
         let h = unsafe { self.pool.cpu_addr().add(t as usize * SLOT) };
         unsafe {
-            core::ptr::write_volatile(h as *mut u32, ty.to_le());
-            core::ptr::write_volatile(h.add(4) as *mut u32, 0);
-            core::ptr::write_volatile(h.add(8) as *mut u64, sector.to_le());
+            core::ptr::write_volatile(h.cast::<u32>(), ty.to_le());
+            core::ptr::write_volatile(h.add(4).cast::<u32>(), 0);
+            core::ptr::write_volatile(h.add(8).cast::<u64>(), sector.to_le());
             core::ptr::write_volatile(self.status(t), 0xff);
         }
     }

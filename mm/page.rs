@@ -422,7 +422,7 @@ const _: () = assert!(SECTION_MAP == 2 << 20 && core::mem::size_of::<Page>() == 
 
 /// Fill the `len` bytes of fresh boot memory at `pa` with struct pages
 fn init_pages(pa: u64, len: u64) {
-    let p = crate::arch::phys_to_virt(pa) as *mut Page;
+    let p = crate::arch::phys_to_virt(pa).cast::<Page>();
     for i in 0..(len as usize / core::mem::size_of::<Page>()) {
         // SAFETY: fresh memory for that many struct pages
         unsafe { p.add(i).write(Page::new()) };

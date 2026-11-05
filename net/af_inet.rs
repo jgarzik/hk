@@ -403,7 +403,7 @@ pub fn bind_check(
 /// msg_name, `payload` (its transport payload as quoted) the data
 pub fn ip_icmp_error(
     sk: &Sock,
-    e: &crate::net::icmp::IcmpErr,
+    e: &crate::net::icmp::IcmpErr<'_>,
     errno: KernelError,
     port: u16,
     payload: &[u8],
@@ -449,7 +449,7 @@ pub fn ip_local_error(
 pub fn ip_recv_error(
     sk: &Sock,
     inet: &Inet,
-    m: &mut crate::net::msg::RecvMsg,
+    m: &mut crate::net::msg::RecvMsg<'_>,
 ) -> Result<usize, KernelError> {
     use crate::net::msg::{MSG_ERRQUEUE, MSG_TRUNC};
     let e = sk.dequeue_err().ok_or(KernelError::WouldBlock)?;

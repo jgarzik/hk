@@ -469,7 +469,7 @@ impl Fanotify {
                     // Copy metadata to buffer
                     let metadata_bytes = unsafe {
                         core::slice::from_raw_parts(
-                            &metadata as *const FanotifyEventMetadata as *const u8,
+                            (&raw const metadata).cast::<u8>(),
                             FANOTIFY_METADATA_SIZE,
                         )
                     };
@@ -494,7 +494,7 @@ impl Fanotify {
     }
 
     /// Poll for readiness
-    pub fn poll(&self, pt: Option<&mut PollTable>) -> u16 {
+    pub fn poll(&self, pt: Option<&mut PollTable<'_>>) -> u16 {
         if let Some(poll_table) = pt {
             poll_table.poll_wait(&self.wait_queue);
         }
@@ -544,7 +544,7 @@ impl FileOps for FanotifyFileOps {
         Err(KernelError::InvalidArgument)
     }
 
-    fn poll(&self, file: &File, pt: Option<&mut PollTable>) -> u16 {
+    fn poll(&self, file: &File, pt: Option<&mut PollTable<'_>>) -> u16 {
         let Some(fanotify) = file.private_ref::<Fanotify>() else {
             return crate::io::poll::POLLERR;
         };

@@ -72,7 +72,7 @@ pub fn stop_one_cpu(cpu: u32, func: fn(usize), arg: usize) -> bool {
             *w = Some(Work {
                 func,
                 arg,
-                done: &done,
+                done: &raw const done,
             });
             break;
         }

@@ -320,7 +320,7 @@ impl CharDevice for Tty {
 
     /// Output is written synchronously: always writable (Linux
     /// n_tty_poll)
-    fn poll(&self, _file: &File, pt: Option<&mut PollTable>) -> u16 {
+    fn poll(&self, _file: &File, pt: Option<&mut PollTable<'_>>) -> u16 {
         if let Some(pt) = pt {
             pt.poll_wait(&self.read_wait);
         }
@@ -406,7 +406,7 @@ impl CharDevice for TtyChar {
         CharDevice::ioctl(self.0, file, cmd, arg)
     }
 
-    fn poll(&self, file: &File, pt: Option<&mut PollTable>) -> u16 {
+    fn poll(&self, file: &File, pt: Option<&mut PollTable<'_>>) -> u16 {
         CharDevice::poll(self.0, file, pt)
     }
 }

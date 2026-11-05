@@ -173,8 +173,8 @@ pub fn splice_from_pipe(pipe: &Pipe) -> Option<(Arc<PipePage>, u32, u32)> {
 pub fn link_pipe(src: &Pipe, dst: &Pipe, len: usize, _flags: u32) -> Result<usize, KernelError> {
     // Lock both pipes in consistent order to prevent deadlock
     // Use pointer addresses to determine order
-    let src_addr = src as *const Pipe as usize;
-    let dst_addr = dst as *const Pipe as usize;
+    let src_addr = core::ptr::from_ref::<Pipe>(src) as usize;
+    let dst_addr = core::ptr::from_ref::<Pipe>(dst) as usize;
 
     if src_addr == dst_addr {
         return Err(KernelError::InvalidArgument);
@@ -378,8 +378,8 @@ pub fn sys_splice(
 
 /// Splice from pipe to pipe (move buffers)
 fn do_splice_pipe_to_pipe(src: &Pipe, dst: &Pipe, len: usize, flags: u32) -> i64 {
-    let src_addr = src as *const Pipe as usize;
-    let dst_addr = dst as *const Pipe as usize;
+    let src_addr = core::ptr::from_ref::<Pipe>(src) as usize;
+    let dst_addr = core::ptr::from_ref::<Pipe>(dst) as usize;
 
     if src_addr == dst_addr {
         return KernelError::InvalidArgument.sysret();
@@ -601,7 +601,9 @@ fn do_splice_pipe_to_file(
         // Copy data from page to temporary buffer
         let mut buf = [0u8; PAGE_SIZE];
         unsafe {
-            let src = (crate::arch::phys_to_virt(page.frame) as *const u8).add(offset as usize);
+            let src = crate::arch::phys_to_virt(page.frame)
+                .cast_const()
+                .add(offset as usize);
             core::ptr::copy_nonoverlapping(src, buf.as_mut_ptr(), to_write);
         }
 

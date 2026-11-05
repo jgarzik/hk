@@ -667,7 +667,7 @@ impl FileOps for PipeReadFileOps {
         Err(KernelError::InvalidArgument)
     }
 
-    fn poll(&self, file: &File, pt: Option<&mut PollTable>) -> u16 {
+    fn poll(&self, file: &File, pt: Option<&mut PollTable<'_>>) -> u16 {
         let Some(pipe) = file.private_ref::<Pipe>() else {
             return POLLERR;
         };
@@ -828,7 +828,7 @@ impl FileOps for PipeWriteFileOps {
         }
     }
 
-    fn poll(&self, file: &File, pt: Option<&mut PollTable>) -> u16 {
+    fn poll(&self, file: &File, pt: Option<&mut PollTable<'_>>) -> u16 {
         let Some(pipe) = file.private_ref::<Pipe>() else {
             return POLLERR;
         };
@@ -1056,7 +1056,7 @@ impl FileOps for FifoFileOps {
 
     /// Linux pipe_poll for a FIFO: POLLHUP only once a writer has come
     /// and gone since this reader opened
-    fn poll(&self, file: &File, pt: Option<&mut PollTable>) -> u16 {
+    fn poll(&self, file: &File, pt: Option<&mut PollTable<'_>>) -> u16 {
         let Ok(f) = fifo_of(file) else {
             return POLLERR;
         };

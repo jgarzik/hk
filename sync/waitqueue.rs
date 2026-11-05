@@ -118,7 +118,7 @@ impl WaitEntry {
     pub fn with_func(func: Option<WakeFn>, private: usize) -> Self {
         Self {
             link: Link::new(),
-            task: &*current() as *const Task,
+            task: &raw const *current(),
             flags: AtomicU8::new(0),
             func,
             private,
@@ -189,7 +189,7 @@ impl WaitQueue {
             return;
         }
         w.flags.store(flags, Ordering::Relaxed);
-        let p = &*w as *const WaitEntry;
+        let p = &raw const *w;
         // SAFETY: pinned, on no list, unlinked before it goes (Drop)
         unsafe {
             if flags & WQ_EXCLUSIVE != 0 {
@@ -198,7 +198,10 @@ impl WaitQueue {
                 list.push_front(p);
             }
         }
-        w.wq.store(self as *const Self as *mut Self, Ordering::Release);
+        w.wq.store(
+            core::ptr::from_ref::<Self>(self).cast_mut(),
+            Ordering::Release,
+        );
     }
 
     /// Register `w` (if not registered) and set the current task's state
@@ -231,7 +234,7 @@ impl WaitQueue {
         let mut list = self.head.lock();
         if core::ptr::eq(w.wq.load(Ordering::Relaxed), self) {
             // SAFETY: on this list (its queue pointer says so)
-            unsafe { list.remove(&*w) };
+            unsafe { list.remove(&raw const *w) };
             w.wq.store(core::ptr::null_mut(), Ordering::Release);
         }
     }
@@ -667,9 +670,9 @@ fn test_page_wait_table_hash() {
 
     // These should be different wait queues (different bucket indices)
     // We test by checking their addresses are different
-    let addr1 = wq1 as *const WaitQueue as usize;
-    let addr2 = wq2 as *const WaitQueue as usize;
-    let addr3 = wq3 as *const WaitQueue as usize;
+    let addr1 = core::ptr::from_ref::<WaitQueue>(wq1) as usize;
+    let addr2 = core::ptr::from_ref::<WaitQueue>(wq2) as usize;
+    let addr3 = core::ptr::from_ref::<WaitQueue>(wq3) as usize;
 
     // At least 2 of 3 should be different (with good hash)
     let different_count = (if addr1 != addr2 { 1 } else { 0 })

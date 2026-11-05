@@ -257,7 +257,7 @@ impl ScsiDisk {
 
         let cmd = ScsiCommand::write(
             Cdb::rw(true, lba, count, self.use_16()),
-            buf.as_ptr() as *mut u8,
+            buf.as_ptr().cast_mut(),
             expected_len,
             30000,
         );
@@ -301,7 +301,7 @@ impl ScsiDiskDriver {
             let (lba, n) = (pos / ss, (seg.len as u64 / ss) as u32);
             let p = unsafe { crate::arch::phys_to_virt(seg.frame).add(seg.offset) };
             let r = if bio.op == BioOp::Write {
-                let buf = unsafe { core::slice::from_raw_parts(p as *const u8, seg.len) };
+                let buf = unsafe { core::slice::from_raw_parts(p.cast_const(), seg.len) };
                 self.disk.write_sectors(lba, n, buf)
             } else {
                 let buf = unsafe { core::slice::from_raw_parts_mut(p, seg.len) };

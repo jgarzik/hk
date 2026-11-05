@@ -279,7 +279,7 @@ pub fn load_idt() {
     unsafe {
         ::core::arch::asm!(
             "lidt [{}]",
-            in(reg) &idt_ptr,
+            in(reg) &raw const idt_ptr,
             options(nostack)
         );
     }
@@ -329,7 +329,7 @@ fn math_error_code(vector: u64) -> i32 {
     let err: u32 = if vector == 19 {
         let mut mxcsr: u32 = 0;
         unsafe {
-            ::core::arch::asm!("stmxcsr [{}]", in(reg) &mut mxcsr, options(nostack));
+            ::core::arch::asm!("stmxcsr [{}]", in(reg) &raw mut mxcsr, options(nostack));
         }
         (mxcsr & 0x3f) & !((mxcsr >> 7) & 0x3f)
     } else {
@@ -338,8 +338,8 @@ fn math_error_code(vector: u64) -> i32 {
             ::core::arch::asm!(
                 "fnstcw [{}]",
                 "fnstsw [{}]",
-                in(reg) &mut cwd,
-                in(reg) &mut swd,
+                in(reg) &raw mut cwd,
+                in(reg) &raw mut swd,
                 options(nostack)
             );
         }

@@ -462,7 +462,7 @@ impl Workqueue {
         let k = crate::task::kthread::kthread_run(
             self.name,
             worker_thread_fn,
-            self as *const Workqueue as usize,
+            core::ptr::from_ref::<Workqueue>(self) as usize,
             cpu,
         )?;
         self.inner.lock().worker_tid = k.tid();

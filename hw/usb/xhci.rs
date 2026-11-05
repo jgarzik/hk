@@ -476,7 +476,7 @@ impl CommandRing {
         }
 
         // Set up link TRB at end of ring (points back to start)
-        let trbs = phys_to_virt(phys) as *mut Trb;
+        let trbs = phys_to_virt(phys).cast::<Trb>();
         unsafe {
             let link = trbs.add(Self::SIZE - 1);
             (*link).parameter = phys;
@@ -579,14 +579,14 @@ impl EventRing {
             core::ptr::write_bytes(phys_to_virt(erst_phys), 0, 4096);
 
             // Set up single ERST entry
-            let erst = phys_to_virt(erst_phys) as *mut ErstEntry;
+            let erst = phys_to_virt(erst_phys).cast::<ErstEntry>();
             (*erst).ring_segment_base = phys;
             (*erst).ring_segment_size = Self::SIZE as u16;
         }
 
         Some(Self {
             phys,
-            trbs: TrbPtr(phys_to_virt(phys) as *mut Trb),
+            trbs: TrbPtr(phys_to_virt(phys).cast::<Trb>()),
             size: Self::SIZE,
             dequeue: 0,
             cycle: true,
@@ -879,7 +879,7 @@ impl XhciController {
         };
         let array = zeroed(frame_alloc).ok_or(UsbError::NoResources)?;
         self.scratch.push(array);
-        let entries = phys_to_virt(array) as *mut u64;
+        let entries = phys_to_virt(array).cast::<u64>();
         for i in 0..n {
             let buf = zeroed(frame_alloc).ok_or(UsbError::NoResources)?;
             self.scratch.push(buf);
@@ -887,7 +887,7 @@ impl XhciController {
             unsafe { write_volatile(entries.add(i as usize), buf) };
         }
         // SAFETY: entry 0 of the DCBAA frame
-        unsafe { write_volatile(phys_to_virt(self.dcbaa_phys) as *mut u64, array) };
+        unsafe { write_volatile(phys_to_virt(self.dcbaa_phys).cast::<u64>(), array) };
         printkln!("xHCI: {} scratchpad buffers", n);
         Ok(())
     }
@@ -932,7 +932,7 @@ impl XhciController {
         // No register but USBSTS until Controller Not Ready clears
         let ready = || self.read_op(0x04) & usbsts::CNR == 0;
         poll_timeout(timeout_us, 10, reset_done)
-            .and_then(|_| poll_timeout(timeout_us, 10, ready))
+            .and_then(|()| poll_timeout(timeout_us, 10, ready))
             .map_err(|_| {
                 printkln!("xHCI: Timeout waiting for reset");
                 UsbError::Timeout
@@ -1177,7 +1177,7 @@ impl XhciController {
 
         // Set DCBAA entry for this slot
         unsafe {
-            let dcbaa = phys_to_virt(self.dcbaa_phys) as *mut u64;
+            let dcbaa = phys_to_virt(self.dcbaa_phys).cast::<u64>();
             write_volatile(dcbaa.add(slot_id as usize), output_ctx.dma_addr());
         }
         fence(Ordering::SeqCst);
@@ -1940,7 +1940,7 @@ impl XhciController {
 
         // Clear DCBAA entry for this slot
         unsafe {
-            let dcbaa = phys_to_virt(self.dcbaa_phys) as *mut u64;
+            let dcbaa = phys_to_virt(self.dcbaa_phys).cast::<u64>();
             write_volatile(dcbaa.add(slot_id as usize), 0);
         }
         fence(Ordering::SeqCst);

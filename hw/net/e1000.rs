@@ -214,20 +214,20 @@ struct TxRing {
 
 impl RxRing {
     fn desc(&self, i: usize) -> *mut RxDesc {
-        unsafe { (self.desc.cpu_addr() as *mut RxDesc).add(i) }
+        unsafe { self.desc.cpu_addr().cast::<RxDesc>().add(i) }
     }
 }
 
 impl TxRing {
     fn desc(&self, i: usize) -> *mut TxDesc {
-        unsafe { (self.desc.cpu_addr() as *mut TxDesc).add(i) }
+        unsafe { self.desc.cpu_addr().cast::<TxDesc>().add(i) }
     }
 
     /// Reclaim descriptors the device is done with; returns how many
     fn reclaim(&mut self) -> usize {
         let mut n = 0;
         while self.clean != self.tail {
-            let st = unsafe { read_volatile(&(*self.desc(self.clean)).status) };
+            let st = unsafe { read_volatile(&raw const (*self.desc(self.clean)).status) };
             if st & txd_stat::DD == 0 {
                 break;
             }
@@ -389,13 +389,16 @@ impl E1000 {
         unsafe {
             core::ptr::copy_nonoverlapping(skb.data_ptr(), tx.bufs[i].cpu_addr(), len);
             let d = tx.desc(i);
-            write_volatile(&mut (*d).length, len as u16);
-            write_volatile(&mut (*d).cso, 0);
-            write_volatile(&mut (*d).css, 0);
-            write_volatile(&mut (*d).special, 0);
-            write_volatile(&mut (*d).status, 0);
+            write_volatile(&raw mut (*d).length, len as u16);
+            write_volatile(&raw mut (*d).cso, 0);
+            write_volatile(&raw mut (*d).css, 0);
+            write_volatile(&raw mut (*d).special, 0);
+            write_volatile(&raw mut (*d).status, 0);
             dma_wmb();
-            write_volatile(&mut (*d).cmd, txd_cmd::EOP | txd_cmd::IFCS | txd_cmd::RS);
+            write_volatile(
+                &raw mut (*d).cmd,
+                txd_cmd::EOP | txd_cmd::IFCS | txd_cmd::RS,
+            );
         }
         tx.tail = next;
         // Descriptor and buffer writes before the doorbell
@@ -414,14 +417,14 @@ impl E1000 {
         while out.len() < budget {
             let i = rx.next;
             let d = rx.desc(i);
-            let st = unsafe { read_volatile(&(*d).status) };
+            let st = unsafe { read_volatile(&raw const (*d).status) };
             if st & rxd_stat::DD == 0 {
                 break;
             }
             // Status before the length and data it covers
             dma_rmb();
-            let len = unsafe { read_volatile(&(*d).length) } as usize;
-            let errors = unsafe { read_volatile(&(*d).errors) };
+            let len = unsafe { read_volatile(&raw const (*d).length) } as usize;
+            let errors = unsafe { read_volatile(&raw const (*d).errors) };
             if st & rxd_stat::EOP == 0 || errors != 0 || !(14..=MAX_FRAME).contains(&len) {
                 // Multi-descriptor (oversize) or errored frame
                 dev.stats.inc_rx_errors();
@@ -444,9 +447,9 @@ impl E1000 {
             }
             // Give the descriptor back
             unsafe {
-                write_volatile(&mut (*d).status, 0);
-                write_volatile(&mut (*d).errors, 0);
-                write_volatile(&mut (*d).length, 0);
+                write_volatile(&raw mut (*d).status, 0);
+                write_volatile(&raw mut (*d).errors, 0);
+                write_volatile(&raw mut (*d).length, 0);
             }
             last = Some(i);
             rx.next = (i + 1) % RX_RING_SIZE;

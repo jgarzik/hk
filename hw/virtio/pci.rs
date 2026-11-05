@@ -375,7 +375,7 @@ impl VirtioDevice {
             // `num` entries, owned by the queue (`mem`) for the ring's life
             ring: unsafe { Vring::new(mem.cpu_addr(), num) },
             mem,
-            owner: self as *const Self as usize,
+            owner: core::ptr::from_ref::<Self>(self) as usize,
             index,
             notify,
         })
@@ -411,7 +411,7 @@ impl VirtioDevice {
         let r = self.reset();
         for vq in vqs {
             // A DmaCoherent not freed is leaked (it has no Drop)
-            if r.is_ok() && vq.owner == self as *const Self as usize {
+            if r.is_ok() && vq.owner == core::ptr::from_ref::<Self>(self) as usize {
                 // SAFETY: the device is reset: it no longer reads or
                 // writes the ring, and the ring (`vq.ring`, the only CPU
                 // pointer into it) goes with `vq` here

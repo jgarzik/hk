@@ -125,7 +125,7 @@ impl Pid {
     /// Attach (non-null) or detach (null) its task; TASKLIST held for
     /// writing
     pub fn set_task(&self, t: *const ()) {
-        self.task.store(t as *mut (), Ordering::Release);
+        self.task.store(t.cast_mut(), Ordering::Release);
     }
 
     /// The namespace it was created in
@@ -253,7 +253,8 @@ static HASH: [AtomicPtr<UPid>; BUCKETS] =
 static PIDMAP_LOCK: Mutex<()> = Mutex::new(());
 
 fn bucket(ns: &PidNamespace, nr: u32) -> &'static AtomicPtr<UPid> {
-    let h = (ns as *const PidNamespace as usize >> 4) ^ (nr as usize).wrapping_mul(0x9e37_79b9);
+    let h = (core::ptr::from_ref::<PidNamespace>(ns) as usize >> 4)
+        ^ (nr as usize).wrapping_mul(0x9e37_79b9);
     &HASH[h & (BUCKETS - 1)]
 }
 
@@ -304,11 +305,11 @@ pub fn alloc_pid_nr(ns: &Arc<PidNamespace>, root_nr: Option<u32>) -> Option<Arc<
     });
     let _g = PIDMAP_LOCK.lock();
     for u in pid.numbers.iter() {
-        let weak = Weak::into_raw(Arc::downgrade(&pid)) as *mut Pid;
+        let weak = Weak::into_raw(Arc::downgrade(&pid)).cast_mut();
         u.pid.store(weak, Ordering::Relaxed);
         let b = bucket(&u.ns, u.nr);
         u.next.store(b.load(Ordering::Relaxed), Ordering::Relaxed);
-        b.store(u as *const UPid as *mut UPid, Ordering::Release);
+        b.store(core::ptr::from_ref::<UPid>(u).cast_mut(), Ordering::Release);
     }
     Some(pid)
 }
@@ -368,7 +369,7 @@ impl Drop for Pid {
             let _g = PIDMAP_LOCK.lock();
             for (i, u) in self.numbers.iter().enumerate() {
                 let b = bucket(&u.ns, u.nr);
-                let me = u as *const UPid as *mut UPid;
+                let me = core::ptr::from_ref::<UPid>(u).cast_mut();
                 let mut link = b;
                 loop {
                     let cur = link.load(Ordering::Relaxed);

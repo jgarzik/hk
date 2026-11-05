@@ -1285,7 +1285,11 @@ unsafe impl crate::util::list::Adapter for Sibling {
     }
     unsafe fn item(l: *const crate::util::list::Link) -> *const Task {
         // SAFETY: `l` is the `sibling` of a live task
-        unsafe { (l as *const u8).sub(core::mem::offset_of!(Task, sibling)) as *const Task }
+        unsafe {
+            l.cast::<u8>()
+                .sub(core::mem::offset_of!(Task, sibling))
+                .cast::<Task>()
+        }
     }
 }
 
@@ -1300,7 +1304,11 @@ unsafe impl crate::util::list::Adapter for ThreadNode {
     }
     unsafe fn item(l: *const crate::util::list::Link) -> *const Task {
         // SAFETY: `l` is the `thread_node` of a live task
-        unsafe { (l as *const u8).sub(core::mem::offset_of!(Task, thread_node)) as *const Task }
+        unsafe {
+            l.cast::<u8>()
+                .sub(core::mem::offset_of!(Task, thread_node))
+                .cast::<Task>()
+        }
     }
 }
 
@@ -1354,15 +1362,15 @@ struct TaskCred(AtomicPtr<Cred>);
 
 impl TaskCred {
     fn new(c: Arc<Cred>) -> Self {
-        Self(AtomicPtr::new(Arc::into_raw(c) as *mut Cred))
+        Self(AtomicPtr::new(Arc::into_raw(c).cast_mut()))
     }
 
     const fn boot() -> Self {
-        Self(AtomicPtr::new(&INIT_CRED as *const Cred as *mut Cred))
+        Self(AtomicPtr::new((&raw const INIT_CRED).cast_mut()))
     }
 
     fn is_static(p: *const Cred) -> bool {
-        core::ptr::eq(p, &INIT_CRED)
+        core::ptr::eq(p, &raw const INIT_CRED)
     }
 
     /// # Safety
@@ -1390,9 +1398,7 @@ impl TaskCred {
     /// TASKLIST is held, and the caller is the task itself or it has
     /// not run yet.
     unsafe fn replace(&self, new: Arc<Cred>) -> Option<Arc<Cred>> {
-        let old = self
-            .0
-            .swap(Arc::into_raw(new) as *mut Cred, Ordering::AcqRel);
+        let old = self.0.swap(Arc::into_raw(new).cast_mut(), Ordering::AcqRel);
         // SAFETY: from Arc::into_raw unless static
         (!Self::is_static(old)).then(|| unsafe { Arc::from_raw(old) })
     }

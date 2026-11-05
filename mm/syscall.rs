@@ -146,7 +146,7 @@ pub fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: 
         return KernelError::Overflow.sysret();
     }
     if let Some(f) = &file
-        && let Err(e) = file_prot_ok(f, prot, is_shared).and_then(|_| f.f_op.mmap(f, is_shared))
+        && let Err(e) = file_prot_ok(f, prot, is_shared).and_then(|()| f.f_op.mmap(f, is_shared))
     {
         return e.sysret();
     }
@@ -609,7 +609,7 @@ fn populate_pages(
             return Err(KernelError::Interrupted);
         }
         match handle_mm_fault(mm, a, access) {
-            Ok(_) => {}
+            Ok(()) => {}
             Err(VmFault::Oom) => return Err(KernelError::OutOfMemory),
             Err(_) => return Err(KernelError::BadAddress),
         }

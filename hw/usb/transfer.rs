@@ -298,7 +298,7 @@ impl TransferRing {
             core::ptr::write_bytes(dma.cpu_addr(), 0, FRAME_SIZE);
         }
 
-        let trbs = dma.cpu_addr() as *mut Trb;
+        let trbs = dma.cpu_addr().cast::<Trb>();
         let size = Self::DEFAULT_SIZE;
 
         // Set up Link TRB at the end
@@ -352,7 +352,7 @@ impl TransferRing {
         }
         if !trbs.is_empty() {
             // SAFETY: `first` < size: a TRB slot of this ring's page
-            let p = unsafe { (self.dma.cpu_addr() as *mut Trb).add(first) };
+            let p = unsafe { self.dma.cpu_addr().cast::<Trb>().add(first) };
             // SAFETY: as above; the ring is only touched under its owner's
             // lock
             unsafe {
@@ -375,7 +375,7 @@ impl TransferRing {
     /// advance it
     fn write(&mut self, mut trb: Trb, cycle: bool) -> u64 {
         let index = self.enqueue;
-        let trbs = self.dma.cpu_addr() as *mut Trb;
+        let trbs = self.dma.cpu_addr().cast::<Trb>();
         let trb_ptr = unsafe { trbs.add(index) };
 
         trb.set_cycle(cycle);

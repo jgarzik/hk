@@ -330,7 +330,7 @@ fn bpf_map_create(attr_buf: &[u8]) -> i64 {
 
     // Safety: we've verified the buffer is large enough
     let attr: MapCreateAttr =
-        unsafe { core::ptr::read_unaligned(attr_buf.as_ptr() as *const MapCreateAttr) };
+        unsafe { core::ptr::read_unaligned(attr_buf.as_ptr().cast::<MapCreateAttr>()) };
 
     // Validate map type
     match attr.map_type {
@@ -364,7 +364,7 @@ fn bpf_map_lookup_elem(attr_buf: &[u8]) -> i64 {
     }
 
     let attr: MapElemAttr =
-        unsafe { core::ptr::read_unaligned(attr_buf.as_ptr() as *const MapElemAttr) };
+        unsafe { core::ptr::read_unaligned(attr_buf.as_ptr().cast::<MapElemAttr>()) };
 
     // Get map from fd
     let map = match get_bpf_map_from_fd(attr.map_fd as i32) {
@@ -399,7 +399,7 @@ fn bpf_map_update_elem(attr_buf: &[u8]) -> i64 {
     }
 
     let attr: MapElemAttr =
-        unsafe { core::ptr::read_unaligned(attr_buf.as_ptr() as *const MapElemAttr) };
+        unsafe { core::ptr::read_unaligned(attr_buf.as_ptr().cast::<MapElemAttr>()) };
 
     // Get map from fd
     let map = match get_bpf_map_from_fd(attr.map_fd as i32) {
@@ -435,7 +435,7 @@ fn bpf_map_delete_elem(attr_buf: &[u8]) -> i64 {
     }
 
     let attr: MapElemAttr =
-        unsafe { core::ptr::read_unaligned(attr_buf.as_ptr() as *const MapElemAttr) };
+        unsafe { core::ptr::read_unaligned(attr_buf.as_ptr().cast::<MapElemAttr>()) };
 
     // Get map from fd
     let map = match get_bpf_map_from_fd(attr.map_fd as i32) {
@@ -464,7 +464,7 @@ fn bpf_map_get_next_key(attr_buf: &[u8]) -> i64 {
     }
 
     let attr: MapElemAttr =
-        unsafe { core::ptr::read_unaligned(attr_buf.as_ptr() as *const MapElemAttr) };
+        unsafe { core::ptr::read_unaligned(attr_buf.as_ptr().cast::<MapElemAttr>()) };
 
     // Get map from fd
     let map = match get_bpf_map_from_fd(attr.map_fd as i32) {
@@ -504,7 +504,7 @@ fn bpf_prog_load(attr_buf: &[u8]) -> i64 {
     }
 
     let attr: ProgLoadAttr =
-        unsafe { core::ptr::read_unaligned(attr_buf.as_ptr() as *const ProgLoadAttr) };
+        unsafe { core::ptr::read_unaligned(attr_buf.as_ptr().cast::<ProgLoadAttr>()) };
 
     if let Err(e) = unpriv_ok() {
         return e.sysret();
@@ -555,7 +555,7 @@ fn bpf_obj_get_info_by_fd(attr_buf: &[u8]) -> i64 {
     }
 
     let attr: ObjGetInfoAttr =
-        unsafe { core::ptr::read_unaligned(attr_buf.as_ptr() as *const ObjGetInfoAttr) };
+        unsafe { core::ptr::read_unaligned(attr_buf.as_ptr().cast::<ObjGetInfoAttr>()) };
 
     // Try to get as map first
     if let Ok(map) = get_bpf_map_from_fd(attr.bpf_fd as i32) {
@@ -571,7 +571,7 @@ fn bpf_obj_get_info_by_fd(attr_buf: &[u8]) -> i64 {
 
         let info_size = core::cmp::min(attr.info_len as usize, size_of::<BpfMapInfo>());
         let info_bytes =
-            unsafe { core::slice::from_raw_parts(&info as *const _ as *const u8, info_size) };
+            unsafe { core::slice::from_raw_parts((&raw const info).cast::<u8>(), info_size) };
 
         if copy_to_user::<Uaccess>(attr.info, info_bytes).is_err() {
             return KernelError::BadAddress.sysret();
@@ -594,7 +594,7 @@ fn bpf_obj_get_info_by_fd(attr_buf: &[u8]) -> i64 {
 
         let info_size = core::cmp::min(attr.info_len as usize, size_of::<BpfProgInfo>());
         let info_bytes =
-            unsafe { core::slice::from_raw_parts(&info as *const _ as *const u8, info_size) };
+            unsafe { core::slice::from_raw_parts((&raw const info).cast::<u8>(), info_size) };
 
         if copy_to_user::<Uaccess>(attr.info, info_bytes).is_err() {
             return KernelError::BadAddress.sysret();

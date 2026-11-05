@@ -340,7 +340,7 @@ impl UnixSock {
 
     /// Identity (lock order, tables)
     fn id(&self) -> usize {
-        self as *const Self as usize
+        core::ptr::from_ref::<Self>(self) as usize
     }
 
     pub fn state(&self) -> u8 {
@@ -800,7 +800,7 @@ impl ProtoOps for UnixSock {
         (opt == SO_PEERCRED).then(|| Ok(self.peercred_opt()))
     }
 
-    fn sendmsg(&self, m: &mut SendMsg, flags: i32) -> Result<usize, KernelError> {
+    fn sendmsg(&self, m: &mut SendMsg<'_>, flags: i32) -> Result<usize, KernelError> {
         match self.sk.stype {
             SOCK_STREAM => stream::sendmsg(self, m, flags),
             SOCK_SEQPACKET => dgram::seqpacket_sendmsg(self, m, flags),
@@ -808,7 +808,7 @@ impl ProtoOps for UnixSock {
         }
     }
 
-    fn recvmsg(&self, m: &mut RecvMsg, flags: i32) -> Result<usize, KernelError> {
+    fn recvmsg(&self, m: &mut RecvMsg<'_>, flags: i32) -> Result<usize, KernelError> {
         match self.sk.stype {
             SOCK_STREAM => stream::recvmsg(self, m, flags),
             SOCK_SEQPACKET => dgram::seqpacket_recvmsg(self, m, flags),
@@ -919,6 +919,6 @@ fn rcv_shut(s: &UnixSock) -> bool {
 }
 
 /// Common receive tail: credentials and files into control messages
-fn scm_recv(s: &UnixSock, m: &mut RecvMsg, creds: Option<Creds>, fds: Option<FpList>) {
+fn scm_recv(s: &UnixSock, m: &mut RecvMsg<'_>, creds: Option<Creds>, fds: Option<FpList>) {
     scm::put(m, s.passcred(), creds, fds);
 }

@@ -425,7 +425,7 @@ impl TwCb {
 
     /// A SYN that may reuse the tuple (Linux TCP_TW_SYN): beyond
     /// RCV.NXT, or with a newer timestamp
-    pub fn tw_syn_ok(&self, s: &SegIn) -> bool {
+    pub fn tw_syn_ok(&self, s: &SegIn<'_>) -> bool {
         s.has(flags::SYN)
             && !s.has(flags::ACK | flags::RST)
             && (after(s.seq, self.rcv_nxt)
@@ -833,7 +833,7 @@ impl TcpCb {
     /// SYN_RECEIVED with the SYN-ACK queued (Linux tcp_conn_request +
     /// tcp_create_openreq_child); options are those of the SYN that the
     /// sysctls allow
-    pub fn passive(&mut self, syn: &SegIn, o: Open, now: u64, out: &mut Out) {
+    pub fn passive(&mut self, syn: &SegIn<'_>, o: Open, now: u64, out: &mut Out) {
         self.open(&o, now);
         self.wscale_ok = self.cfg.wscale && syn.ws.is_some();
         self.ts_ok = self.cfg.ts != 0 && syn.ts.is_some();
@@ -845,7 +845,7 @@ impl TcpCb {
 
     /// Record the peer's SYN: IRS, window, options (`wscale_ok` and
     /// `ts_ok` hold what we offered or accept)
-    pub(super) fn syn_rcvd(&mut self, s: &SegIn, now: u64) {
+    pub(super) fn syn_rcvd(&mut self, s: &SegIn<'_>, now: u64) {
         self.irs = s.seq;
         self.rcv_nxt = s.seq.wrapping_add(1);
         self.rcv_adv = self.rcv_nxt;
@@ -1257,7 +1257,7 @@ impl TcpCb {
     }
 
     /// The peer's window field of `s` in bytes
-    pub(super) fn seg_wnd(&self, s: &SegIn) -> u32 {
+    pub(super) fn seg_wnd(&self, s: &SegIn<'_>) -> u32 {
         if s.has(flags::SYN) {
             u32::from(s.wnd)
         } else {

@@ -168,7 +168,7 @@ pub fn remove_inode_hash(inode: &Inode) {
     if !inode.i_hashed.swap(false, Ordering::AcqRel) {
         return;
     }
-    let me = inode as *const Inode;
+    let me = core::ptr::from_ref::<Inode>(inode);
     let hashval = inode.i_hash.load(Ordering::Relaxed);
     let sb = inode.sb.as_ptr() as usize;
     bucket(sb, hashval)

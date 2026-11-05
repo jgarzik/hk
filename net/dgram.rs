@@ -151,7 +151,7 @@ impl RxQueue {
 pub fn deliver(
     sk: &Sock,
     inet: &Inet,
-    m: &mut RecvMsg,
+    m: &mut RecvMsg<'_>,
     d: &Dgram,
     flags: i32,
 ) -> Result<usize, KernelError> {
@@ -174,7 +174,7 @@ pub fn deliver(
 /// SOL_SOCKET control messages (Linux __sock_recv_cmsgs) of a packet
 /// that arrived at `stamp` (CLOCK_REALTIME ns) with the socket's drop
 /// count at `drops`
-pub fn sock_cmsgs(sk: &Sock, m: &mut RecvMsg, stamp: i128, drops: u32) {
+pub fn sock_cmsgs(sk: &Sock, m: &mut RecvMsg<'_>, stamp: i128, drops: u32) {
     if sk.flag(sf::TIMESTAMPNS) {
         let mut b = [0u8; 16];
         b[..8].copy_from_slice(&((stamp / 1_000_000_000) as i64).to_ne_bytes());

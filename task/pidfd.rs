@@ -60,7 +60,7 @@ impl Pidfd {
         self.pid.exited().is_some()
     }
 
-    pub fn poll(&self, pt: Option<&mut PollTable>) -> u16 {
+    pub fn poll(&self, pt: Option<&mut PollTable<'_>>) -> u16 {
         if let Some(poll_table) = pt {
             poll_table.poll_wait(&self.pid.wait_pidfd);
         }
@@ -92,7 +92,7 @@ impl FileOps for PidfdFileOps {
         Err(KernelError::InvalidArgument)
     }
 
-    fn poll(&self, file: &File, pt: Option<&mut PollTable>) -> u16 {
+    fn poll(&self, file: &File, pt: Option<&mut PollTable<'_>>) -> u16 {
         let Some(pidfd) = file.private_ref::<Pidfd>() else {
             return crate::io::poll::POLLERR;
         };

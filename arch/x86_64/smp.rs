@@ -110,11 +110,11 @@ pub fn init<F: FrameAlloc<PhysAddr = u64>>(acpi: &AcpiInfo, frame_alloc: &mut F)
             let apic_id_offset = &raw const __ap_data_apic_id as usize - start;
 
             let base = phys_to_virt(TRAMPOLINE_ADDR);
-            let pml4_ptr = base.add(pml4_offset) as *mut u64;
-            let entry_ptr = base.add(entry_offset) as *mut u64;
-            let stack_ptr = base.add(stack_offset) as *mut u64;
-            let cpu_id_ptr = base.add(cpu_id_offset) as *mut u32;
-            let apic_id_ptr = base.add(apic_id_offset) as *mut u32;
+            let pml4_ptr = base.add(pml4_offset).cast::<u64>();
+            let entry_ptr = base.add(entry_offset).cast::<u64>();
+            let stack_ptr = base.add(stack_offset).cast::<u64>();
+            let cpu_id_ptr = base.add(cpu_id_offset).cast::<u32>();
+            let apic_id_ptr = base.add(apic_id_offset).cast::<u32>();
 
             core::ptr::write_volatile(pml4_ptr, cr3);
             core::ptr::write_volatile(entry_ptr, ap_entry as *const () as u64);

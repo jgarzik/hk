@@ -38,7 +38,7 @@ impl FileOps for BpfMapFileOps {
         Err(KernelError::InvalidArgument)
     }
 
-    fn poll(&self, _file: &File, _pt: Option<&mut PollTable>) -> u16 {
+    fn poll(&self, _file: &File, _pt: Option<&mut PollTable<'_>>) -> u16 {
         // BPF map fds are always "ready" (operations never block)
         0
     }
@@ -81,7 +81,7 @@ impl FileOps for BpfProgFileOps {
         Err(KernelError::InvalidArgument)
     }
 
-    fn poll(&self, _file: &File, _pt: Option<&mut PollTable>) -> u16 {
+    fn poll(&self, _file: &File, _pt: Option<&mut PollTable<'_>>) -> u16 {
         0
     }
 

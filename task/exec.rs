@@ -137,7 +137,7 @@ impl StackWriter<'_> {
 /// Entries of the auxiliary vector, AT_NULL included
 const AUXV_LEN: usize = 20;
 
-fn auxv(info: &ExecInfo, random: u64, execfn: u64, platform: u64) -> [(u64, u64); AUXV_LEN] {
+fn auxv(info: &ExecInfo<'_>, random: u64, execfn: u64, platform: u64) -> [(u64, u64); AUXV_LEN] {
     const AT_NULL: u64 = 0;
     const AT_PHDR: u64 = 3;
     const AT_PHENT: u64 = 4;
@@ -196,7 +196,7 @@ fn setup_user_stack<FA: FrameAlloc<PhysAddr = u64>>(
     frame_alloc: &mut FA,
     argv: &[Vec<u8>],
     envp: &[Vec<u8>],
-    info: &ExecInfo,
+    info: &ExecInfo<'_>,
 ) -> Result<(MmLayout, u64), i32> {
     // Calculate stack pages based on RLIMIT_STACK
     let stack_limit = crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_STACK);
@@ -493,7 +493,7 @@ fn interp_base(interp: &ElfExecutable, prog: &ElfExecutable, prog_base: u64) -> 
 /// Returns the end address of the highest loaded segment (for setting brk).
 fn load_elf_segments<FA: FrameAlloc<PhysAddr = u64>>(
     elf: &ElfExecutable,
-    image: &FileImage,
+    image: &FileImage<'_>,
     page_table: &mut ArchPageTable,
     frame_alloc: &mut FA,
     base_addr: u64,
@@ -602,7 +602,7 @@ fn load_elf_segments<FA: FrameAlloc<PhysAddr = u64>>(
 /// Apply ELF relocations for PIE binaries
 fn apply_relocations(
     elf: &ElfExecutable,
-    image: &FileImage,
+    image: &FileImage<'_>,
     base_addr: u64,
     page_table: &ArchPageTable,
 ) {
@@ -619,7 +619,7 @@ fn apply_relocations(
 
         if let Some(phys) = page_table.translate(target_vaddr) {
             unsafe {
-                let ptr = phys_to_virt(phys) as *mut u64;
+                let ptr = phys_to_virt(phys).cast::<u64>();
                 core::ptr::write_volatile(ptr, value);
             }
             // Text relocations land in code

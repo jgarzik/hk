@@ -385,7 +385,7 @@ impl Inotify {
                     // Copy header
                     let header_bytes = unsafe {
                         core::slice::from_raw_parts(
-                            &header as *const InotifyEventHeader as *const u8,
+                            (&raw const header).cast::<u8>(),
                             INOTIFY_EVENT_HEADER_SIZE,
                         )
                     };
@@ -427,7 +427,7 @@ impl Inotify {
     }
 
     /// Poll for readiness
-    pub fn poll(&self, pt: Option<&mut PollTable>) -> u16 {
+    pub fn poll(&self, pt: Option<&mut PollTable<'_>>) -> u16 {
         if let Some(poll_table) = pt {
             poll_table.poll_wait(&self.wait_queue);
         }
@@ -470,7 +470,7 @@ impl FileOps for InotifyFileOps {
         Err(KernelError::InvalidArgument)
     }
 
-    fn poll(&self, file: &File, pt: Option<&mut PollTable>) -> u16 {
+    fn poll(&self, file: &File, pt: Option<&mut PollTable<'_>>) -> u16 {
         let Some(inotify) = file.private_ref::<Inotify>() else {
             return crate::io::poll::POLLERR;
         };

@@ -73,7 +73,7 @@ impl TimeWait {
 
     /// A segment for this tuple. False: it is a new connection's SYN,
     /// this entry is gone and the caller hands it to a listener.
-    pub fn rcv(self: &Arc<Self>, s: &SegIn, now: u64) -> bool {
+    pub fn rcv(self: &Arc<Self>, s: &SegIn<'_>, now: u64) -> bool {
         let mut out = Out::default();
         {
             let mut g = self.inner.lock();

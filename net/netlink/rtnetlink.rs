@@ -412,7 +412,7 @@ fn ifinfo(p: &[u8]) -> Result<IfInfo, KernelError> {
 fn link_dev(
     net: &NetNamespace,
     ifm: &IfInfo,
-    a: &Attrs,
+    a: &Attrs<'_>,
 ) -> Result<Option<Arc<NetDevice>>, KernelError> {
     if ifm.index > 0 {
         return Ok(net.dev_get_by_index(ifm.index));
@@ -991,7 +991,10 @@ fn ndmsg(p: &[u8]) -> Result<NdReq<'_>, KernelError> {
 /// Device and key of a neighbour request (Linux neigh_add/neigh_delete
 /// checks, in their order): EINVAL without NDA_DST or a device,
 /// ENODEV for an unknown device, EAFNOSUPPORT for other families
-fn nd_target(net: &NetNamespace, r: &NdReq) -> Result<(Arc<NetDevice>, neigh::Key), KernelError> {
+fn nd_target(
+    net: &NetNamespace,
+    r: &NdReq<'_>,
+) -> Result<(Arc<NetDevice>, neigh::Key), KernelError> {
     let dst = r.attrs.get(NDA_DST).ok_or(KernelError::InvalidArgument)?;
     let dev = match r.ifindex {
         0 => None,

@@ -172,15 +172,15 @@ impl Vring {
     }
 
     fn desc(&self, i: u16) -> *mut Desc {
-        unsafe { (self.base as *mut Desc).add(i as usize) }
+        unsafe { self.base.cast::<Desc>().add(i as usize) }
     }
 
     fn avail16(&self, i: usize) -> *mut u16 {
-        unsafe { (self.base.add(self.lay.avail) as *mut u16).add(i) }
+        unsafe { self.base.add(self.lay.avail).cast::<u16>().add(i) }
     }
 
     fn used16(&self, i: usize) -> *mut u16 {
-        unsafe { (self.base.add(self.lay.used) as *mut u16).add(i) }
+        unsafe { self.base.add(self.lay.used).cast::<u16>().add(i) }
     }
 
     fn used_elem(&self, slot: u16) -> *const u32 {

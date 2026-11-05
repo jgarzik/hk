@@ -125,7 +125,7 @@ impl EpRegs {
             self.item as usize,
         ));
         wq.add_wait_queue(e.as_ref());
-        self.entries.push((wq as *const WaitQueue, e));
+        self.entries.push((core::ptr::from_ref::<WaitQueue>(wq), e));
     }
 
     /// Keep `owner` alive while registered
@@ -520,7 +520,7 @@ impl Eventpoll {
     /// Readiness of the epoll file itself (Linux ep_eventpoll_poll): an
     /// item on the ready list with an event; the queue it waits on is
     /// `poll_wq`
-    pub fn poll(&self, pt: Option<&mut PollTable>) -> u16 {
+    pub fn poll(&self, pt: Option<&mut PollTable<'_>>) -> u16 {
         if let Some(pt) = pt {
             pt.poll_wait(&self.poll_wq);
         }
@@ -534,7 +534,7 @@ impl Eventpoll {
                 // SAFETY: on the list, which holds an Arc to it
                 v.push(unsafe {
                     Arc::increment_strong_count(it);
-                    Arc::from_raw(it as *const EpItem)
+                    Arc::from_raw(core::ptr::from_ref::<EpItem>(it))
                 });
             }
             v
@@ -646,7 +646,7 @@ fn down_depth(
 /// How many epoll levels watch `ep` from above (Linux
 /// ep_get_upwards_depth_proc); bounded, as every insert checked it
 fn up_depth(ep: &Eventpoll, seen: &mut Seen) -> u32 {
-    let k = ep as *const Eventpoll as usize;
+    let k = core::ptr::from_ref::<Eventpoll>(ep) as usize;
     if let Some(&Some(d)) = seen.get(&k) {
         return d;
     }
@@ -699,7 +699,7 @@ impl FileOps for EpollFileOps {
         Err(KernelError::InvalidArgument)
     }
 
-    fn poll(&self, file: &File, pt: Option<&mut PollTable>) -> u16 {
+    fn poll(&self, file: &File, pt: Option<&mut PollTable<'_>>) -> u16 {
         let Some(ep) = file.private_ref::<Eventpoll>() else {
             return crate::io::poll::POLLERR;
         };

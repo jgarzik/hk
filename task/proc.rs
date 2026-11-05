@@ -578,9 +578,8 @@ pub fn sys_clone3(uargs: u64, size: u64) -> i64 {
     // Copy clone_args from userspace (zero-fill any missing fields)
     let mut args = CloneArgs::default();
     let copy_size = core::cmp::min(size as usize, core::mem::size_of::<CloneArgs>());
-    let args_bytes = unsafe {
-        core::slice::from_raw_parts_mut(&mut args as *mut CloneArgs as *mut u8, copy_size)
-    };
+    let args_bytes =
+        unsafe { core::slice::from_raw_parts_mut((&raw mut args).cast::<u8>(), copy_size) };
     if copy_from_user::<Uaccess>(args_bytes, uargs, copy_size).is_err() {
         return KernelError::BadAddress.sysret();
     }

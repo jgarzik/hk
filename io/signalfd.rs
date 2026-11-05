@@ -186,10 +186,7 @@ impl Signalfd {
                     let offset = bytes_written;
                     // Copy siginfo to buffer
                     let siginfo_bytes = unsafe {
-                        core::slice::from_raw_parts(
-                            &siginfo as *const SignalfdSiginfo as *const u8,
-                            SIGINFO_SIZE,
-                        )
+                        core::slice::from_raw_parts((&raw const siginfo).cast::<u8>(), SIGINFO_SIZE)
                     };
                     buf[offset..offset + SIGINFO_SIZE].copy_from_slice(siginfo_bytes);
                     bytes_written += SIGINFO_SIZE;
@@ -228,7 +225,7 @@ impl Signalfd {
     }
 
     /// Poll for readiness
-    pub fn poll(&self, pt: Option<&mut PollTable>) -> u16 {
+    pub fn poll(&self, pt: Option<&mut PollTable<'_>>) -> u16 {
         // The caller's handler table, held by the poll for as long as it
         // stays registered on its queue (Linux instead detaches pollers
         // when it is freed, signalfd_cleanup)
@@ -268,7 +265,7 @@ impl FileOps for SignalfdFileOps {
         Err(KernelError::InvalidArgument)
     }
 
-    fn poll(&self, file: &File, pt: Option<&mut PollTable>) -> u16 {
+    fn poll(&self, file: &File, pt: Option<&mut PollTable<'_>>) -> u16 {
         let Some(signalfd) = file.private_ref::<Signalfd>() else {
             return crate::io::poll::POLLERR;
         };

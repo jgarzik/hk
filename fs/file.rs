@@ -239,7 +239,7 @@ pub trait FileOps: Send + Sync {
     }
 
     /// Read directory entries from `ctx.pos` on (Linux iterate_shared)
-    fn readdir(&self, file: &File, ctx: &mut DirContext) -> Result<(), KernelError> {
+    fn readdir(&self, file: &File, ctx: &mut DirContext<'_>) -> Result<(), KernelError> {
         let _ = (file, ctx);
         Err(KernelError::NotDirectory)
     }
@@ -280,7 +280,7 @@ pub trait FileOps: Send + Sync {
     /// 2. Return current ready events mask
     ///
     /// Default: regular files are always readable and writable.
-    fn poll(&self, _file: &File, _pt: Option<&mut PollTable>) -> u16 {
+    fn poll(&self, _file: &File, _pt: Option<&mut PollTable<'_>>) -> u16 {
         // Default for regular files - always ready
         DEFAULT_POLLMASK
     }
@@ -751,7 +751,7 @@ impl File {
     }
 
     /// Read directory entries
-    pub fn readdir(&self, ctx: &mut DirContext) -> Result<(), KernelError> {
+    pub fn readdir(&self, ctx: &mut DirContext<'_>) -> Result<(), KernelError> {
         if !self.is_dir() {
             return Err(KernelError::NotDirectory);
         }
@@ -761,7 +761,7 @@ impl File {
     /// Poll for events
     ///
     /// Returns mask of ready events (POLLIN, POLLOUT, etc.)
-    pub fn poll(&self, pt: Option<&mut PollTable>) -> u16 {
+    pub fn poll(&self, pt: Option<&mut PollTable<'_>>) -> u16 {
         self.f_op.poll(self, pt)
     }
 }
@@ -802,7 +802,7 @@ impl FileOps for NullFileOps {
         Err(KernelError::OperationNotSupported)
     }
 
-    fn poll(&self, _file: &File, _pt: Option<&mut PollTable>) -> u16 {
+    fn poll(&self, _file: &File, _pt: Option<&mut PollTable<'_>>) -> u16 {
         POLLERR
     }
 }
@@ -870,7 +870,7 @@ impl FileOps for CharDevFileOps {
         Self::dev(file)?.ioctl(file, cmd, arg)
     }
 
-    fn poll(&self, file: &File, pt: Option<&mut PollTable>) -> u16 {
+    fn poll(&self, file: &File, pt: Option<&mut PollTable<'_>>) -> u16 {
         match Self::dev(file) {
             Ok(d) => d.poll(file, pt),
             Err(_) => POLLHUP | POLLERR,

@@ -427,7 +427,7 @@ fn icmp_unreach(net: &NetNamespace, skb: &SkBuff) {
 }
 
 /// Frag needed for a packet we sent: remember the smaller path MTU
-fn update_pmtu(net: &NetNamespace, e: &IcmpErr) {
+fn update_pmtu(net: &NetNamespace, e: &IcmpErr<'_>) {
     if net.fib.addr_type(e.inner_saddr()) != RouteType::Local {
         return;
     }
@@ -437,7 +437,7 @@ fn update_pmtu(net: &NetNamespace, e: &IcmpErr) {
 }
 
 /// Hand an error to the raw sockets and the inner protocol
-fn deliver_err(net: &NetNamespace, e: &IcmpErr) {
+fn deliver_err(net: &NetNamespace, e: &IcmpErr<'_>) {
     crate::net::raw::raw_err(net, e);
     match e.proto() {
         ipv4::IPPROTO_TCP => crate::net::tcp::tcp_err(net, e),
@@ -476,7 +476,7 @@ impl<'a> Offender<'a> {
 }
 
 /// May an error be sent about `o` at all (Linux __icmp_send guards)?
-fn may_send(net: &NetNamespace, o: &Offender, ty: u8) -> bool {
+fn may_send(net: &NetNamespace, o: &Offender<'_>, ty: u8) -> bool {
     let p = o.pkt;
     if p.len() < IP_HLEN_MIN || !o.host || o.bcast {
         return false;
@@ -502,7 +502,7 @@ fn may_send(net: &NetNamespace, o: &Offender, ty: u8) -> bool {
 
 /// Send ICMP `ty`/`code` with 4 bytes of `rest` about `o` (Linux
 /// __icmp_send)
-pub fn icmp_send(net: &NetNamespace, o: &Offender, ty: u8, code: u8, rest: [u8; 4]) {
+pub fn icmp_send(net: &NetNamespace, o: &Offender<'_>, ty: u8, code: u8, rest: [u8; 4]) {
     if !may_send(net, o, ty) {
         return;
     }

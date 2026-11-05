@@ -236,7 +236,7 @@ impl Drop for SemLock<'_> {
 /// or past the adjustment range). A SEM_UNDO operation also changes the
 /// `undo` list's adjustment by its negative. Undone on anything but 0.
 fn perform_atomic_semop(
-    l: &mut SemLock,
+    l: &mut SemLock<'_>,
     sops: &[Sembuf],
     pid: i32,
     undo: Option<u64>,
@@ -302,7 +302,7 @@ fn set_adj(s: &mut PerSem, undo: u64, v: i16) {
 /// restarts the scan. Returns whether any was completed and whether one
 /// changed values; `done` collects the semaphores the completed alter
 /// operations changed.
-fn retry(l: &mut SemLock, q: &mut VecDeque<Waiter>, done: &mut Vec<usize>) -> (bool, bool) {
+fn retry(l: &mut SemLock<'_>, q: &mut VecDeque<Waiter>, done: &mut Vec<usize>) -> (bool, bool) {
     let (mut woke, mut altered) = (false, false);
     let mut i = 0;
     while i < q.len() {
@@ -336,7 +336,7 @@ fn retry(l: &mut SemLock, q: &mut VecDeque<Waiter>, done: &mut Vec<usize>) -> (b
 /// to try; in complex mode the array's waiters and those of every
 /// semaphore that changed, until nothing more completes. True if a
 /// sleeper must be woken after the unlock.
-fn update_queue(l: &mut SemLock, changed: impl IntoIterator<Item = usize>) -> bool {
+fn update_queue(l: &mut SemLock<'_>, changed: impl IntoIterator<Item = usize>) -> bool {
     let mut woke = false;
     let mut dirty: Vec<usize> = changed.into_iter().collect();
     loop {
@@ -469,7 +469,7 @@ impl SemArray {
     }
 
     /// Fill semid64_ds structure for IPC_STAT (complex mode)
-    fn fill_semid64_ds(&self, l: &mut SemLock, ds: &mut Semid64Ds) {
+    fn fill_semid64_ds(&self, l: &mut SemLock<'_>, ds: &mut Semid64Ds) {
         self.perm.fill_ipc64_perm(&mut ds.sem_perm);
         ds.sem_otime = (0..self.nsems as usize)
             .map(|i| l.sem(i).otime)
@@ -747,7 +747,7 @@ fn do_semtimedop(semid: i32, sops_ptr: u64, nsops: usize, timeout_ptr: u64) -> R
 }
 
 /// Take a waiter that gave up off its queue (Linux unlink_queue)
-fn unlink(l: &mut SemLock, q: &Arc<SemQueue>) {
+fn unlink(l: &mut SemLock<'_>, q: &Arc<SemQueue>) {
     let mine = |(w, _): &Waiter| Arc::ptr_eq(w, q);
     if let Some(g) = l.global()
         && let Some(i) = g.pending.iter().position(mine)

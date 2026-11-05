@@ -455,7 +455,11 @@ fn parse_header(hdr: &[u8; PAGE_SIZE], size: u64) -> Result<u64, KernelError> {
     }
     // SAFETY: the header info lies inside the page; read unaligned
     let info = unsafe {
-        core::ptr::read_unaligned(hdr[SWAP_HEADER_INFO_OFFSET..].as_ptr() as *const SwapHeaderInfo)
+        core::ptr::read_unaligned(
+            hdr[SWAP_HEADER_INFO_OFFSET..]
+                .as_ptr()
+                .cast::<SwapHeaderInfo>(),
+        )
     };
     let max = u64::from(info.last_page) + 1;
     if info.version != 1 || info.last_page == 0 || max > size {
@@ -507,12 +511,12 @@ fn swapon(path_ptr: u64, swap_flags: i32) -> Result<(), KernelError> {
     }
     let mut hdr = [0u8; PAGE_SIZE];
     let read = match &bdev {
-        Some(b) => bdev_rw(b, BioOp::Read, 0, &mut hdr).map(|_| PAGE_SIZE),
+        Some(b) => bdev_rw(b, BioOp::Read, 0, &mut hdr).map(|()| PAGE_SIZE),
         None => inode
             .i_data
             .aops()
             .swap_rw(&inode, 0, &mut hdr, false)
-            .map(|_| PAGE_SIZE),
+            .map(|()| PAGE_SIZE),
     };
     if read.unwrap_or(0) < PAGE_SIZE {
         return Err(KernelError::InvalidArgument);

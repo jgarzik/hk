@@ -367,7 +367,7 @@ impl InputContext {
 
     /// Get mutable pointer to Input Control Context
     pub fn control_mut(&mut self) -> &mut InputControlContext {
-        unsafe { &mut *(self.dma.cpu_addr() as *mut InputControlContext) }
+        unsafe { &mut *self.dma.cpu_addr().cast::<InputControlContext>() }
     }
 
     /// Get mutable pointer to Slot Context

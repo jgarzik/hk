@@ -157,7 +157,7 @@ fn map_acpi_table(phys_addr: u64) -> Result<*mut u8, &'static str> {
         let ptr = ioremap(phys_addr, header_size).map_err(|_| "Failed to ioremap SDT header")?;
 
         // Read length field using read_unaligned (packed struct)
-        let length_ptr = (ptr as *const u8).add(4) as *const u32; // offset of length field
+        let length_ptr = ptr.cast_const().add(4).cast::<u32>(); // offset of length field
         let length = core::ptr::read_unaligned(length_ptr);
         iounmap(ptr, header_size);
 
@@ -174,7 +174,7 @@ pub fn parse_acpi() -> Result<AcpiInfo, &'static str> {
     // Get RSDT or XSDT address (physical address, may be above 512MB!)
     let (sdt_phys, is_xsdt) = unsafe {
         if (*rsdp).revision >= 2 {
-            let rsdp2 = rsdp as *const Rsdp2;
+            let rsdp2 = rsdp.cast::<Rsdp2>();
             if (*rsdp2).xsdt_address != 0 {
                 ((*rsdp2).xsdt_address, true)
             } else {
@@ -242,10 +242,10 @@ fn search_rsdp(start: usize, length: usize) -> Option<*const Rsdp> {
         if signature == *RSDP_SIGNATURE {
             let ptr = virt(addr) as *const Rsdp;
             // Verify basic checksum (first 20 bytes)
-            if checksum_valid(ptr as *const u8, core::mem::size_of::<Rsdp>()) {
+            if checksum_valid(ptr.cast::<u8>(), core::mem::size_of::<Rsdp>()) {
                 // For ACPI 2.0+, also verify extended checksum (full 36 bytes)
                 let revision = unsafe { core::ptr::read_volatile(virt(addr + 15) as *const u8) };
-                if revision >= 2 && !checksum_valid(ptr as *const u8, core::mem::size_of::<Rsdp2>())
+                if revision >= 2 && !checksum_valid(ptr.cast::<u8>(), core::mem::size_of::<Rsdp2>())
                 {
                     // Extended checksum failed, keep searching
                     addr += 16;
@@ -318,12 +318,12 @@ fn for_each_table(
         let sdt_ptr = map_acpi_table(sdt_phys)?;
 
         // Read length using offset (packed struct)
-        let length_ptr = (sdt_ptr as *const u8).add(4) as *const u32;
+        let length_ptr = sdt_ptr.cast_const().add(4).cast::<u32>();
         let total_length = core::ptr::read_unaligned(length_ptr) as usize;
 
         // Validate RSDT/XSDT checksum (warn but continue per Linux behavior)
         let table_name = if is_xsdt { "XSDT" } else { "RSDT" };
-        validate_table_checksum(sdt_ptr as *const u8, total_length, table_name);
+        validate_table_checksum(sdt_ptr.cast_const(), total_length, table_name);
 
         let header_size = core::mem::size_of::<SdtHeader>();
         let entry_size = if is_xsdt { 8 } else { 4 };
@@ -372,7 +372,7 @@ fn parse_madt_mapped(madt_phys: u64) -> Result<AcpiInfo, &'static str> {
         let madt_length = core::ptr::read_unaligned(length_ptr) as usize;
 
         // Validate MADT checksum (warn but continue per Linux behavior)
-        validate_table_checksum(madt_ptr as *const u8, madt_length, "MADT");
+        validate_table_checksum(madt_ptr.cast_const(), madt_length, "MADT");
 
         // Read fields using offsets (packed struct)
         // MadtHeader layout: SdtHeader (36 bytes) + lapic_address (4) + flags (4)
@@ -530,7 +530,7 @@ impl Table {
         let mut b = [0; N];
         if off + N <= self.len {
             // SAFETY: in bounds of the mapped table
-            b = unsafe { core::ptr::read_unaligned(self.ptr.add(off) as *const [u8; N]) };
+            b = unsafe { core::ptr::read_unaligned(self.ptr.add(off).cast::<[u8; N]>()) };
         }
         b
     }
@@ -671,7 +671,7 @@ pub fn init_numa_topology() -> Result<bool, &'static str> {
     // Get RSDT or XSDT address
     let (sdt_phys, is_xsdt) = unsafe {
         if (*rsdp).revision >= 2 {
-            let rsdp2 = rsdp as *const Rsdp2;
+            let rsdp2 = rsdp.cast::<Rsdp2>();
             if (*rsdp2).xsdt_address != 0 {
                 ((*rsdp2).xsdt_address, true)
             } else {
@@ -735,7 +735,7 @@ fn parse_srat_mapped(srat_phys: u64) -> Result<(), &'static str> {
         let srat_length = core::ptr::read_unaligned(length_ptr) as usize;
 
         // Validate SRAT checksum
-        validate_table_checksum(srat_ptr as *const u8, srat_length, "SRAT");
+        validate_table_checksum(srat_ptr.cast_const(), srat_length, "SRAT");
 
         // SRAT header: SdtHeader (36) + Reserved (4) + Reserved (8) = 48 bytes
         let entries_start = srat_ptr.add(48);
@@ -894,7 +894,7 @@ fn parse_slit_mapped(slit_phys: u64) -> Result<(), &'static str> {
         let slit_length = core::ptr::read_unaligned(length_ptr) as usize;
 
         // Validate SLIT checksum
-        validate_table_checksum(slit_ptr as *const u8, slit_length, "SLIT");
+        validate_table_checksum(slit_ptr.cast_const(), slit_length, "SLIT");
 
         // SLIT header: SdtHeader (36) + Number of System Localities (8)
         let num_localities = core::ptr::read_unaligned(slit_ptr.add(36) as *const u64) as usize;

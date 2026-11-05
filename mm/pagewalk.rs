@@ -32,7 +32,11 @@ pub(super) fn entry(p: *mut u64) -> &'static AtomicU64 {
 /// Slot `i` of the table frame `table`
 pub(super) fn table_slot(table: u64, i: u64) -> *mut u64 {
     // SAFETY: a live table frame, through the direct map
-    unsafe { (crate::arch::phys_to_virt(table) as *mut u64).add(i as usize) }
+    unsafe {
+        crate::arch::phys_to_virt(table)
+            .cast::<u64>()
+            .add(i as usize)
+    }
 }
 
 /// The part of one PTE table a walk visits: the 4KB entries of

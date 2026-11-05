@@ -293,11 +293,11 @@ fn blkdev_ioctl(b: &BlockDevice, cmd: u32, arg: u64) -> Result<i64, KernelError>
                 return Err(KernelError::InvalidArgument);
             }
             let n = get_user::<Uaccess, i32>(arg).map_err(|_| KernelError::BadAddress)?;
-            b.set_block_size(n).map(|_| 0)
+            b.set_block_size(n).map(|()| 0)
         }
         ioc::BLKRRPART => {
             need_admin()?;
-            genhd::rescan(b).map(|_| 0)
+            genhd::rescan(b).map(|()| 0)
         }
         // No buffer cache to write back or drop yet
         // Write the cache back and drop it (Linux blkdev_flushbuf)

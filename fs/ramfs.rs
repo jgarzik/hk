@@ -625,8 +625,8 @@ impl InodeOps for RamfsInodeOps {
 
         // Check if same directory (optimization for simple renames)
         let same_dir = core::ptr::eq(
-            old_dir_data as *const RamfsInodeData,
-            new_dir_data as *const RamfsInodeData,
+            core::ptr::from_ref::<RamfsInodeData>(old_dir_data),
+            core::ptr::from_ref::<RamfsInodeData>(new_dir_data),
         );
 
         if same_dir {
@@ -941,7 +941,7 @@ impl FileOps for RamfsFileOps {
         filemap::perform_write(&inode, buf, offset).map_err(page_err)
     }
 
-    fn readdir(&self, file: &File, ctx: &mut DirContext) -> Result<(), KernelError> {
+    fn readdir(&self, file: &File, ctx: &mut DirContext<'_>) -> Result<(), KernelError> {
         let inode = file.get_inode().ok_or(KernelError::BadFd)?;
         if !inode.mode().is_dir() {
             return Err(KernelError::NotDirectory);

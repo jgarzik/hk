@@ -674,7 +674,7 @@ impl crate::fs::FileOps for KmsgFileOps {
         Ok(0)
     }
 
-    fn poll(&self, file: &crate::fs::File, pt: Option<&mut crate::io::poll::PollTable>) -> u16 {
+    fn poll(&self, file: &crate::fs::File, pt: Option<&mut crate::io::poll::PollTable<'_>>) -> u16 {
         use crate::io::poll::{POLLERR, POLLIN, POLLPRI, POLLRDNORM};
         if let Some(pt) = pt {
             pt.poll_wait(&WAITERS);

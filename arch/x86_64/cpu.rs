@@ -336,7 +336,7 @@ unsafe fn load_gdt_raw(limit: u16, base: u64) {
     unsafe {
         ::core::arch::asm!(
             "lgdt [{}]",
-            in(reg) &ptr,
+            in(reg) &raw const ptr,
             options(nostack)
         );
 

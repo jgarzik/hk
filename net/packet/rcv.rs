@@ -145,7 +145,7 @@ impl PktQueue {
 /// messages and PACKET_AUXDATA
 pub fn deliver(
     s: &PacketSock,
-    m: &mut RecvMsg,
+    m: &mut RecvMsg<'_>,
     f: &Frame,
     flags: i32,
 ) -> Result<usize, KernelError> {
@@ -208,7 +208,7 @@ impl PacketTable {
         }
     }
 
-    fn matching(&self, t: &Tap, proto: u16) -> Vec<Arc<PacketSock>> {
+    fn matching(&self, t: &Tap<'_>, proto: u16) -> Vec<Arc<PacketSock>> {
         self.socks
             .read()
             .iter()
@@ -238,7 +238,7 @@ impl PacketSock {
     /// This socket gets a copy of the frame (Linux: its prot_hook is on
     /// ptype_all for ETH_P_ALL, ptype_base otherwise; outgoing frames
     /// only go to ptype_all, never back to their sender)
-    fn wants(&self, t: &Tap, proto: u16) -> bool {
+    fn wants(&self, t: &Tap<'_>, proto: u16) -> bool {
         let (num, ifindex) = self.bound();
         if num == 0 || (ifindex != 0 && ifindex as u32 != t.dev.ifindex()) {
             return false;
@@ -250,7 +250,7 @@ impl PacketSock {
     }
 
     /// Queue a copy of a tapped frame (Linux packet_rcv)
-    fn rcv(&self, t: &Tap, proto: u16) {
+    fn rcv(&self, t: &Tap<'_>, proto: u16) {
         let raw = self.sk.stype == SOCK_RAW;
         let data = if raw { t.frame } else { &t.frame[ETH_HLEN..] };
         let mut snap = data.len();
@@ -301,7 +301,7 @@ impl PacketSock {
 
 /// The ptype_all tap: give every matching packet socket of the device's
 /// namespace a copy (thread context: softnet or a transmitting task)
-pub fn tap(t: &Tap) {
+pub fn tap(t: &Tap<'_>) {
     if NSOCKS.load(Ordering::Acquire) == 0 || t.frame.len() < ETH_HLEN {
         return;
     }

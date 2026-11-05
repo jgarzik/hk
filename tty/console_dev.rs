@@ -39,7 +39,7 @@ impl CharDevice for ConsoleCharDevice {
         CharDevice::ioctl(Redirect::tty(file)?, file, cmd, arg)
     }
 
-    fn poll(&self, file: &File, pt: Option<&mut PollTable>) -> u16 {
+    fn poll(&self, file: &File, pt: Option<&mut PollTable<'_>>) -> u16 {
         match Redirect::tty(file) {
             Ok(t) => CharDevice::poll(t, file, pt),
             Err(_) => crate::io::poll::POLLERR,

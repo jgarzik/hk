@@ -363,7 +363,7 @@ pub fn sys_pipe2(pipefd: u64, flags: u32) -> i64 {
     // Write file descriptors to user space
     let fds: [i32; 2] = [read_fd, write_fd];
     let fds_bytes = unsafe {
-        core::slice::from_raw_parts(fds.as_ptr() as *const u8, core::mem::size_of::<[i32; 2]>())
+        core::slice::from_raw_parts(fds.as_ptr().cast::<u8>(), core::mem::size_of::<[i32; 2]>())
     };
 
     match copy_to_user::<Uaccess>(pipefd, fds_bytes) {
@@ -530,7 +530,7 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> i64 {
             let mut flock = Flock::default();
             let flock_size = core::mem::size_of::<Flock>();
             let flock_bytes = unsafe {
-                core::slice::from_raw_parts_mut(&mut flock as *mut Flock as *mut u8, flock_size)
+                core::slice::from_raw_parts_mut((&raw mut flock).cast::<u8>(), flock_size)
             };
             if copy_from_user::<Uaccess>(flock_bytes, arg, flock_size).is_err() {
                 return KernelError::BadAddress.sysret();
@@ -542,9 +542,8 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> i64 {
             }
 
             // Copy result back
-            let flock_bytes = unsafe {
-                core::slice::from_raw_parts(&flock as *const Flock as *const u8, flock_size)
-            };
+            let flock_bytes =
+                unsafe { core::slice::from_raw_parts((&raw const flock).cast::<u8>(), flock_size) };
             if copy_to_user::<Uaccess>(arg, flock_bytes).is_err() {
                 return KernelError::BadAddress.sysret();
             }
@@ -564,7 +563,7 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> i64 {
             let mut flock = Flock::default();
             let flock_size = core::mem::size_of::<Flock>();
             let flock_bytes = unsafe {
-                core::slice::from_raw_parts_mut(&mut flock as *mut Flock as *mut u8, flock_size)
+                core::slice::from_raw_parts_mut((&raw mut flock).cast::<u8>(), flock_size)
             };
             if copy_from_user::<Uaccess>(flock_bytes, arg, flock_size).is_err() {
                 return KernelError::BadAddress.sysret();
@@ -591,7 +590,7 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> i64 {
             let mut flock = Flock::default();
             let flock_size = core::mem::size_of::<Flock>();
             let flock_bytes = unsafe {
-                core::slice::from_raw_parts_mut(&mut flock as *mut Flock as *mut u8, flock_size)
+                core::slice::from_raw_parts_mut((&raw mut flock).cast::<u8>(), flock_size)
             };
             if copy_from_user::<Uaccess>(flock_bytes, arg, flock_size).is_err() {
                 return KernelError::BadAddress.sysret();

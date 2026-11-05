@@ -183,7 +183,7 @@ fn do_poll_internal(fds: u64, nfds: u32, deadline: Deadline) -> i64 {
     };
 
     let bytes_slice =
-        unsafe { core::slice::from_raw_parts_mut(pollfds.as_mut_ptr() as *mut u8, total_size) };
+        unsafe { core::slice::from_raw_parts_mut(pollfds.as_mut_ptr().cast::<u8>(), total_size) };
 
     if copy_from_user::<Uaccess>(bytes_slice, fds, total_size).is_err() {
         return KernelError::BadAddress.sysret();
@@ -265,7 +265,7 @@ fn do_poll_internal(fds: u64, nfds: u32, deadline: Deadline) -> i64 {
 
     // Copy results back to user space
     let result_bytes =
-        unsafe { core::slice::from_raw_parts(pollfds.as_ptr() as *const u8, total_size) };
+        unsafe { core::slice::from_raw_parts(pollfds.as_ptr().cast::<u8>(), total_size) };
 
     if copy_to_user::<Uaccess>(fds, result_bytes).is_err() {
         return KernelError::BadAddress.sysret();

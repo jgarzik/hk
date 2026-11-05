@@ -87,7 +87,7 @@ macro_rules! adapter {
             }
             unsafe fn item(link: *const $crate::util::list::Link) -> *const $t {
                 // SAFETY: the caller passes a link inside a live item
-                unsafe { (link as *const u8).sub(core::mem::offset_of!($t, $($field).+)) as *const $t }
+                unsafe { link.cast::<u8>().sub(core::mem::offset_of!($t, $($field).+)).cast::<$t>() }
             }
         }
     };
@@ -129,7 +129,7 @@ impl<A: Adapter> List<A> {
 
     fn lk(item: *const A::Item) -> *mut Link {
         // SAFETY: callers pass live items
-        A::link(unsafe { &*item }) as *const Link as *mut Link
+        core::ptr::from_ref::<Link>(A::link(unsafe { &*item })).cast_mut()
     }
 
     /// Append `item` (Linux list_add_tail)
@@ -330,7 +330,7 @@ impl<A: Adapter> ArcList<A> {
     /// # Safety
     /// `item` is on this list.
     pub unsafe fn remove(&mut self, item: &A::Item) -> Arc<A::Item> {
-        let p = item as *const A::Item;
+        let p = core::ptr::from_ref::<A::Item>(item);
         // SAFETY: on this list, which holds the reference from into_raw
         unsafe {
             self.list.remove(p);

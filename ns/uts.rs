@@ -207,7 +207,7 @@ pub fn sys_uname(buf: u64) -> i64 {
     // SAFETY: NewUtsname is repr(C) plain bytes with no padding
     let bytes = unsafe {
         core::slice::from_raw_parts(
-            &tmp as *const NewUtsname as *const u8,
+            (&raw const tmp).cast::<u8>(),
             core::mem::size_of::<NewUtsname>(),
         )
     };

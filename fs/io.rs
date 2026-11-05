@@ -48,7 +48,7 @@ impl<'a> Cursor<'a> {
             let s = self.segs.get(self.i).ok_or(KernelError::BadAddress)?;
             let n = (s.iov_len as usize - self.off).min(len);
             if n > 0 {
-                f(s.iov_base + self.off as u64, n, done).map_err(|_| KernelError::BadAddress)?;
+                f(s.iov_base + self.off as u64, n, done).map_err(|()| KernelError::BadAddress)?;
             }
             self.off += n;
             done += n;

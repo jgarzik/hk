@@ -138,7 +138,7 @@ fn check_range(start: u64, len: u64) -> Result<Option<u64>, KernelError> {
 /// madvise_walk_vmas). The walk goes by address, as a VMA may be split
 /// or merged under it.
 fn walk(
-    map: &mut Map,
+    map: &mut Map<'_>,
     owner: &Mm,
     start: u64,
     end: u64,
@@ -177,7 +177,7 @@ fn walk(
 /// Apply `advice` to [start, end), inside one VMA (Linux
 /// madvise_vma_behavior)
 fn vma_advise(
-    map: &mut Map,
+    map: &mut Map<'_>,
     owner: &Mm,
     start: u64,
     end: u64,

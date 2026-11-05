@@ -396,7 +396,7 @@ type Side<'a> = (&'a Parent, &'a Arc<Inode>);
 /// check + vfs_rename): may_delete of the source, may_create or
 /// may_delete of the target, and write permission on a directory that
 /// changes parent (its ".." is rewritten)
-fn rename_locked(old: Side, new: Side, flags: u32) -> Result<(), KernelError> {
+fn rename_locked(old: Side<'_>, new: Side<'_>, flags: u32) -> Result<(), KernelError> {
     let ((op, oname), odir) = ((&old.0.dir, old.0.name.as_slice()), old.1);
     let ((np, nname), ndir) = ((&new.0.dir, new.0.name.as_slice()), new.1);
     let src = lookup_one(op, oname)?;

@@ -1121,7 +1121,7 @@ pub fn dup_mm(parent: &MmRef, pgd: u64) -> Result<MmRef, i32> {
         .membarrier
         .store(parent.membarrier.load(Ordering::Relaxed), Ordering::Relaxed);
     // On error `child` goes with its partial copy (outside the lock)
-    res.map(|_| child)
+    res.map(|()| child)
 }
 
 /// A fresh, empty address space for exec / the first task, rooted at

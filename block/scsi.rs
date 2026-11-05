@@ -429,12 +429,7 @@ pub fn inquiry(host: &Arc<dyn ScsiHost>, target: u8, lun: u8) -> ScsiResult<Inqu
         revision: [0; 4],
     });
 
-    let cmd = ScsiCommand::read(
-        Cdb::inquiry(36),
-        &mut *data as *mut InquiryData as *mut u8,
-        36,
-        5000,
-    );
+    let cmd = ScsiCommand::read(Cdb::inquiry(36), (&raw mut *data).cast::<u8>(), 36, 5000);
 
     host.execute(target, lun, &cmd)?;
     Ok(*data)
@@ -456,7 +451,7 @@ pub fn read_capacity(host: &Arc<dyn ScsiHost>, target: u8, lun: u8) -> ScsiResul
     });
     let cmd = ScsiCommand::read(
         Cdb::read_capacity_10(),
-        &mut *data as *mut ReadCapacityData as *mut u8,
+        (&raw mut *data).cast::<u8>(),
         8,
         5000,
     );

@@ -164,7 +164,7 @@ impl AddressSpace {
     }
 
     fn key(&self) -> u64 {
-        self as *const Self as u64
+        core::ptr::from_ref::<Self>(self) as u64
     }
 }
 

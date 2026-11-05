@@ -358,7 +358,7 @@ pub fn cmpxchg_user_u32<A: UaccessArch>(uaddr: u64, old: u32, new: u32) -> Uacce
     // fault is caught by the fixup); `cur` is a local; begin/end paired
     let r = unsafe {
         A::user_access_begin();
-        let r = A::cmpxchg_user_raw(uaddr as *mut u32, old, new, &mut cur);
+        let r = A::cmpxchg_user_raw(uaddr as *mut u32, old, new, &raw mut cur);
         A::user_access_end();
         r
     };

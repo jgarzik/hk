@@ -638,7 +638,7 @@ pub fn init_vfat_ramdisk(
 /// Panic handler (only for bare metal)
 #[cfg(not(test))]
 #[panic_handler]
-fn panic(info: &PanicInfo) -> ! {
+fn panic(info: &PanicInfo<'_>) -> ! {
     // Disable interrupts to prevent further issues
     CurrentArch::disable_interrupts();
 

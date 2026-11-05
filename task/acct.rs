@@ -101,7 +101,12 @@ const _: () = assert!(ACCT_V3_SIZE == 64);
 impl AcctV3 {
     /// Get the record as a byte slice
     pub fn as_bytes(&self) -> &[u8] {
-        unsafe { core::slice::from_raw_parts(self as *const AcctV3 as *const u8, ACCT_V3_SIZE) }
+        unsafe {
+            core::slice::from_raw_parts(
+                core::ptr::from_ref::<AcctV3>(self).cast::<u8>(),
+                ACCT_V3_SIZE,
+            )
+        }
     }
 }
 

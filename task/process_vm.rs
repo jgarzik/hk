@@ -357,7 +357,7 @@ fn copy_iovecs_from_user(iov_ptr: u64, count: usize) -> Result<Vec<IoVec>, Kerne
     // SAFETY: IoVec is repr(C) plain data; the byte view covers exactly the
     // `count` initialized elements of `iovecs`.
     let bytes =
-        unsafe { core::slice::from_raw_parts_mut(iovecs.as_mut_ptr() as *mut u8, total_size) };
+        unsafe { core::slice::from_raw_parts_mut(iovecs.as_mut_ptr().cast::<u8>(), total_size) };
     if copy_from_user::<Uaccess>(bytes, iov_ptr, total_size).is_err() {
         return Err(KernelError::BadAddress);
     }

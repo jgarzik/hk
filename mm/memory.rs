@@ -88,7 +88,7 @@ pub(super) fn exit_mmap(mm: &Mm) {
 /// them, `free_pgtables`). Only
 /// user addresses: callers pass ranges inside VMAs, a range past
 /// TASK_SIZE is a bug (clamped).
-pub fn zap_range(tlb: &mut Gather, start: u64, end: u64) {
+pub fn zap_range(tlb: &mut Gather<'_>, start: u64, end: u64) {
     let pgd = tlb.mm().pgd();
     let _ = walk_pte_range(pgd, start, end, &mut Zap { tlb });
 }
@@ -138,7 +138,7 @@ impl PteWalk for Zap<'_, '_> {
 /// empty. Its parent entry is cleared at once; the frame goes to `tlb`,
 /// freed after the flush that drops the paging-structure caches. The
 /// top-level table stays.
-pub fn free_pgtables(tlb: &mut Gather, start: u64, end: u64, floor: u64, ceiling: u64) {
+pub fn free_pgtables(tlb: &mut Gather<'_>, start: u64, end: u64, floor: u64, ceiling: u64) {
     if start < end {
         let r = PtRange {
             start,
@@ -161,7 +161,7 @@ struct PtRange {
 /// The entries of the table `table` at `level` (3: top level, 1: the
 /// 2MB level) whose spans meet [r.start, r.end), `base` being the
 /// table's first address: each child table is freed bottom-up
-fn free_level(tlb: &mut Gather, table: u64, level: u32, base: u64, r: &PtRange) {
+fn free_level(tlb: &mut Gather<'_>, table: u64, level: u32, base: u64, r: &PtRange) {
     let span = 1u64 << (12 + 9 * level);
     let first = (r.start.max(base) - base) / span;
     let last = ((r.end - 1).min(base + 512 * span - 1) - base) / span;

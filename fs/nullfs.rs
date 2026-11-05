@@ -88,7 +88,7 @@ impl FileOps for NullfsFileOps {
     }
 
     /// "." and ".." only, both the root (Linux empty_dir_readdir)
-    fn readdir(&self, file: &File, ctx: &mut DirContext) -> Result<(), KernelError> {
+    fn readdir(&self, file: &File, ctx: &mut DirContext<'_>) -> Result<(), KernelError> {
         let ino = file.get_inode().map_or(1, |i| i.ino);
         for (at, name) in [(0, &b"."[..]), (1, b"..")] {
             let e = DirEntry {

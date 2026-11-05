@@ -202,7 +202,7 @@ impl FutexQ {
         Self {
             link: Link::new(),
             key: UnsafeCell::new(key),
-            task: &*crate::task::percpu::current() as *const Task,
+            task: &raw const *crate::task::percpu::current(),
             bitset,
             lock_ptr: AtomicPtr::new(core::ptr::null_mut()),
             _pin: PhantomPinned,
@@ -224,9 +224,9 @@ impl FutexQ {
     fn queue(self: Pin<&Self>, b: &FutexHashBucket, list: &mut List<QAdapter>) {
         // SAFETY: pinned until it is unlinked (unqueue or a waker,
         // and Drop)
-        unsafe { list.push_back(&*self) };
+        unsafe { list.push_back(&raw const *self) };
         self.lock_ptr.store(
-            b as *const FutexHashBucket as *mut FutexHashBucket,
+            core::ptr::from_ref::<FutexHashBucket>(b).cast_mut(),
             Ordering::Relaxed,
         );
     }
@@ -731,11 +731,12 @@ pub fn futex_requeue(
         };
         op.run(b1, &mut l, b2, None, &mut to_wake)
     } else {
-        let (first, second) = if (b1 as *const FutexHashBucket) < (b2 as *const _) {
-            (b1, b2)
-        } else {
-            (b2, b1)
-        };
+        let (first, second) =
+            if core::ptr::from_ref::<FutexHashBucket>(b1) < core::ptr::from_ref(b2) {
+                (b1, b2)
+            } else {
+                (b2, b1)
+            };
         let mut g1 = first.waiters.lock();
         let mut g2 = second.waiters.lock();
         let (l1, l2) = if core::ptr::eq(first, b1) {
@@ -811,7 +812,7 @@ impl Requeue {
                     b1.dec_waiters();
                     b2.inc_waiters();
                     q.lock_ptr.store(
-                        b2 as *const FutexHashBucket as *mut FutexHashBucket,
+                        core::ptr::from_ref::<FutexHashBucket>(b2).cast_mut(),
                         Ordering::Release,
                     );
                 }

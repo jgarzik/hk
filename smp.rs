@@ -173,7 +173,7 @@ pub fn smp_send_reschedule(cpu: u32) {
 /// Push `csd` onto `head`; true if the queue was empty (the IPI is ours
 /// to send)
 fn enqueue(head: &AtomicPtr<Csd>, csd: &Csd) -> bool {
-    let new = csd as *const Csd as *mut Csd;
+    let new = core::ptr::from_ref::<Csd>(csd).cast_mut();
     let mut old = head.load(Ordering::Relaxed);
     loop {
         csd.next.store(old, Ordering::Relaxed);
@@ -248,7 +248,7 @@ fn run_queue(me: u32) {
         let csd = unsafe { &*list };
         list = csd.next.load(Ordering::Relaxed);
         csd.next.store(fifo, Ordering::Relaxed);
-        fifo = csd as *const Csd as *mut Csd;
+        fifo = core::ptr::from_ref::<Csd>(csd).cast_mut();
     }
     while !fifo.is_null() {
         // SAFETY: as above

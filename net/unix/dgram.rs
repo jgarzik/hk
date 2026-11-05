@@ -129,7 +129,7 @@ enum Tx {
 }
 
 /// Linux unix_dgram_sendmsg
-pub fn sendmsg(s: &UnixSock, m: &mut SendMsg, flags: i32) -> Result<usize, KernelError> {
+pub fn sendmsg(s: &UnixSock, m: &mut SendMsg<'_>, flags: i32) -> Result<usize, KernelError> {
     let mut scm = Scm::parse(&m.control)?;
     if flags & MSG_OOB != 0 {
         return Err(KernelError::OperationNotSupported);
@@ -238,7 +238,11 @@ fn peer_died(
 
 /// Linux unix_seqpacket_sendmsg: established only; an address is
 /// ignored
-pub fn seqpacket_sendmsg(s: &UnixSock, m: &mut SendMsg, flags: i32) -> Result<usize, KernelError> {
+pub fn seqpacket_sendmsg(
+    s: &UnixSock,
+    m: &mut SendMsg<'_>,
+    flags: i32,
+) -> Result<usize, KernelError> {
     if let Some(e) = s.sk.take_err() {
         return Err(e);
     }
@@ -250,7 +254,11 @@ pub fn seqpacket_sendmsg(s: &UnixSock, m: &mut SendMsg, flags: i32) -> Result<us
 }
 
 /// Linux unix_seqpacket_recvmsg
-pub fn seqpacket_recvmsg(s: &UnixSock, m: &mut RecvMsg, flags: i32) -> Result<usize, KernelError> {
+pub fn seqpacket_recvmsg(
+    s: &UnixSock,
+    m: &mut RecvMsg<'_>,
+    flags: i32,
+) -> Result<usize, KernelError> {
     if s.state() != ESTABLISHED {
         return Err(KernelError::NotConnected);
     }
@@ -308,7 +316,7 @@ fn take(s: &UnixSock, peek: bool) -> Option<Rx> {
 /// buffer (and as a flag returns the full length). With nothing queued:
 /// EAGAIN when non-blocking (0 for a shut-down seqpacket socket), 0
 /// after receive shutdown, ENOTCONN for a disconnected seqpacket socket.
-pub fn recvmsg(s: &UnixSock, m: &mut RecvMsg, flags: i32) -> Result<usize, KernelError> {
+pub fn recvmsg(s: &UnixSock, m: &mut RecvMsg<'_>, flags: i32) -> Result<usize, KernelError> {
     if flags & MSG_OOB != 0 {
         return Err(KernelError::OperationNotSupported);
     }
@@ -351,7 +359,12 @@ pub fn recvmsg(s: &UnixSock, m: &mut RecvMsg, flags: i32) -> Result<usize, Kerne
 }
 
 /// Copy one message out with its address and ancillary data
-fn deliver(s: &UnixSock, m: &mut RecvMsg, flags: i32, mut rx: Rx) -> Result<usize, KernelError> {
+fn deliver(
+    s: &UnixSock,
+    m: &mut RecvMsg<'_>,
+    flags: i32,
+    mut rx: Rx,
+) -> Result<usize, KernelError> {
     if m.want_name {
         m.name = rx.from.addr().map(|a| a.name.clone());
     }

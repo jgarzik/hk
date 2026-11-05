@@ -60,7 +60,7 @@ pub fn parse_dtb() -> Option<AcpiInfo> {
 }
 
 /// Extract GIC distributor base address from DTB
-fn extract_gic_base(dt: &DeviceTree) -> Option<u64> {
+fn extract_gic_base(dt: &DeviceTree<'_>) -> Option<u64> {
     // Look for GICv3: compatible = "arm,gic-v3"
     let gic_nodes = dt.find_compatible("arm,gic-v3");
     if let Some(gic) = gic_nodes.first()
@@ -83,7 +83,7 @@ fn extract_gic_base(dt: &DeviceTree) -> Option<u64> {
 }
 
 /// Extract CPU list from DTB /cpus node
-fn extract_cpus(dt: &DeviceTree) -> Vec<CpuInfo> {
+fn extract_cpus(dt: &DeviceTree<'_>) -> Vec<CpuInfo> {
     let mut cpus = Vec::new();
 
     let cpus_node = match dt.find_node("/cpus") {
@@ -148,7 +148,7 @@ fn blob() -> Option<&'static [u8]> {
     if dtb == 0 {
         return None;
     }
-    let p = phys_to_virt(dtb) as *const u8;
+    let p = phys_to_virt(dtb).cast_const();
     // SAFETY: 8 readable bytes at the recorded address (`set_boot`)
     let h = unsafe { core::slice::from_raw_parts(p, 8) };
     if h[..4] != [0xd0, 0x0d, 0xfe, 0xed] {
@@ -175,7 +175,7 @@ pub fn for_each_memory(mut f: impl FnMut(u64, u64)) -> bool {
     let cells = root.cells();
     let mut any = false;
     let disabled =
-        |c: &crate::dt::Node| c.property("status").and_then(|p| p.as_str()) == Some("disabled");
+        |c: &crate::dt::Node<'_>| c.property("status").and_then(|p| p.as_str()) == Some("disabled");
     for c in root.children() {
         if (c.name() == "memory" || c.name().starts_with("memory@")) && !disabled(&c) {
             for (base, size) in c.regs(cells).filter(|&(_, size)| size != 0) {

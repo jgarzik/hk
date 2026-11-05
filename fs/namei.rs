@@ -354,7 +354,7 @@ pub fn delete_entry(p: &Parent, isdir: bool) -> Result<(), KernelError> {
         let r = if super::mount::is_local_mountpoint(&victim) {
             Err(KernelError::Busy)
         } else if isdir {
-            dir.i_op.rmdir(&dir, name).inspect(|_| inode.set_dead())
+            dir.i_op.rmdir(&dir, name).inspect(|()| inode.set_dead())
         } else {
             dir.i_op.unlink(&dir, name)
         };

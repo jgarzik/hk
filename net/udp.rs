@@ -159,7 +159,7 @@ impl UdpSock {
     // --- send ------------------------------------------------------------
 
     /// Destination of a send: msg_name or the connected peer
-    fn dest(&self, m: &SendMsg) -> Result<(Ipv4Addr, u16, bool), KernelError> {
+    fn dest(&self, m: &SendMsg<'_>) -> Result<(Ipv4Addr, u16, bool), KernelError> {
         if let Some(a) = &m.addr {
             let (addr, port) = af_inet::sin_parse(a, true)?;
             if port == 0 {
@@ -439,7 +439,7 @@ impl ProtoOps for UdpSock {
     }
 
     /// Linux udp_sendmsg
-    fn sendmsg(&self, m: &mut SendMsg, flags: i32) -> Result<usize, KernelError> {
+    fn sendmsg(&self, m: &mut SendMsg<'_>, flags: i32) -> Result<usize, KernelError> {
         if flags & MSG_OOB != 0 {
             return Err(KernelError::OperationNotSupported);
         }
@@ -483,7 +483,7 @@ impl ProtoOps for UdpSock {
     }
 
     /// Linux udp_recvmsg
-    fn recvmsg(&self, m: &mut RecvMsg, flags: i32) -> Result<usize, KernelError> {
+    fn recvmsg(&self, m: &mut RecvMsg<'_>, flags: i32) -> Result<usize, KernelError> {
         if flags & MSG_ERRQUEUE != 0 {
             return af_inet::ip_recv_error(&self.sk, &self.inet, m);
         }
@@ -691,7 +691,7 @@ pub fn udp_rcv(skb: SkBuff) {
 /// An ICMP error about a datagram we sent (Linux udp_err): the socket
 /// that sent it gets the error queued (IP_RECVERR) and/or as its pending
 /// error; without IP_RECVERR only hard errors on connected sockets count
-pub fn udp_err(net: &crate::net::NetNamespace, e: &crate::net::icmp::IcmpErr) {
+pub fn udp_err(net: &crate::net::NetNamespace, e: &crate::net::icmp::IcmpErr<'_>) {
     let l4 = e.l4();
     let (sport, dport) = (
         u16::from_be_bytes([l4[0], l4[1]]),

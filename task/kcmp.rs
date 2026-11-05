@@ -86,7 +86,7 @@ fn kcmp_ptr(ptr1: u64, ptr2: u64, kcmp_type: i32) -> i64 {
 
 /// The address of an optional shared object
 fn ptr_key<T>(o: Option<&Arc<T>>) -> Option<u64> {
-    o.map(|a| Arc::as_ptr(a) as *const () as u64)
+    o.map(|a| Arc::as_ptr(a).cast::<()>() as u64)
 }
 
 fn arc_key<T>(o: &Option<Arc<T>>) -> Option<u64> {

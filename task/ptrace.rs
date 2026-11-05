@@ -712,7 +712,7 @@ fn ptrace_getregs(target_pid: Pid, data: u64) -> i64 {
         Ok(regs) => {
             let bytes = unsafe {
                 core::slice::from_raw_parts(
-                    &regs as *const _ as *const u8,
+                    (&raw const regs).cast::<u8>(),
                     core::mem::size_of_val(&regs),
                 )
             };
@@ -743,7 +743,7 @@ fn ptrace_setregs(target_pid: Pid, data: u64) -> i64 {
         let mut regs = crate::arch::ptrace::UserRegsStruct::default();
         let bytes = unsafe {
             core::slice::from_raw_parts_mut(
-                &mut regs as *mut _ as *mut u8,
+                (&raw mut regs).cast::<u8>(),
                 core::mem::size_of_val(&regs),
             )
         };
@@ -761,7 +761,7 @@ fn ptrace_setregs(target_pid: Pid, data: u64) -> i64 {
         let mut regs = crate::arch::ptrace::UserPtRegs::default();
         let bytes = unsafe {
             core::slice::from_raw_parts_mut(
-                &mut regs as *mut _ as *mut u8,
+                (&raw mut regs).cast::<u8>(),
                 core::mem::size_of_val(&regs),
             )
         };

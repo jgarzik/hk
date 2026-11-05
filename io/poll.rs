@@ -214,7 +214,8 @@ impl PollContext {
         }
         let entry = Box::pin(WaitEntry::new());
         wq.add_wait_queue(entry.as_ref());
-        self.entries.push((wq as *const WaitQueue, entry));
+        self.entries
+            .push((core::ptr::from_ref::<WaitQueue>(wq), entry));
     }
 
     /// Number of registrations

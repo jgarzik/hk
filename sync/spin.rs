@@ -65,7 +65,7 @@ fn leave(id: usize) {
 }
 
 fn addr<T: ?Sized>(p: &T) -> usize {
-    p as *const T as *const u8 as usize
+    core::ptr::from_ref::<T>(p).cast::<u8>() as usize
 }
 
 /// Spinning mutex (Linux spinlock_t)

@@ -163,7 +163,7 @@ pub trait CharDevice: Send + Sync {
 
     /// Ready events (Linux f_op->poll): register on the device's wait
     /// queues through `pt`, then return the mask. Default: always ready
-    fn poll(&self, _file: &File, _pt: Option<&mut PollTable>) -> u16 {
+    fn poll(&self, _file: &File, _pt: Option<&mut PollTable<'_>>) -> u16 {
         POLLIN | POLLRDNORM | POLLOUT | POLLWRNORM
     }
 }

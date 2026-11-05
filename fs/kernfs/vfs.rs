@@ -337,7 +337,7 @@ impl FileOps for KernfsFops {
     }
 
     /// Linux kernfs_fop_readdir: ".", "..", then children by hash
-    fn readdir(&self, file: &File, ctx: &mut DirContext) -> Result<(), KernelError> {
+    fn readdir(&self, file: &File, ctx: &mut DirContext<'_>) -> Result<(), KernelError> {
         let inode = file.get_inode().ok_or(KernelError::BadFd)?;
         let kn = knode(&inode).ok_or(KernelError::Io)?;
         if !kn.is_dir() {
@@ -400,7 +400,7 @@ impl FileOps for KernfsFops {
     }
 
     /// Linux kernfs_generic_poll
-    fn poll(&self, file: &File, pt: Option<&mut PollTable>) -> u16 {
+    fn poll(&self, file: &File, pt: Option<&mut PollTable<'_>>) -> u16 {
         let Ok((kn, of)) = attr_of(file) else {
             return DEFAULT_POLLMASK;
         };

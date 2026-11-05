@@ -120,7 +120,7 @@ impl Mmio for Bar {
     fn write32(&self, off: u32, val: u32) {
         debug_assert!(off + 4 <= self.len);
         // SAFETY: as read32
-        unsafe { core::ptr::write_volatile(self.virt.add(off as usize) as *mut u32, val) }
+        unsafe { core::ptr::write_volatile(self.virt.add(off as usize).cast::<u32>(), val) }
     }
 
     fn len(&self) -> u32 {

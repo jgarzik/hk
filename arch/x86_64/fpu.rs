@@ -218,7 +218,7 @@ pub fn restore(area: &FpuArea) {
 /// `area` must be valid for writes of an `FpuArea` and 64-byte aligned.
 #[inline]
 pub unsafe fn save_raw(area: *mut FpuArea) {
-    let p = area as *mut u8;
+    let p = area.cast::<u8>();
     unsafe {
         if use_xsave() {
             // XSAVE writes only XSTATE_BV of the header: XCOMP_BV and the
@@ -244,7 +244,7 @@ pub unsafe fn save_raw(area: *mut FpuArea) {
 /// validated by [`sanitize_sigframe`]), 64-byte aligned.
 #[inline]
 pub unsafe fn restore_raw(area: *const FpuArea) {
-    let p = area as *const u8;
+    let p = area.cast::<u8>();
     unsafe {
         if use_xsave() {
             core::arch::asm!(

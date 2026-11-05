@@ -102,7 +102,7 @@ fn create(minor: u16, bytes: u64, data: &[u8]) -> Result<Arc<BlockDevice>, Kerne
     let rd = Arc::new(RamDisk {
         pages: Mutex::new(BTreeMap::new()),
     });
-    rd.copy(true, 0, data.as_ptr() as *mut u8, data.len())?;
+    rd.copy(true, 0, data.as_ptr().cast_mut(), data.len())?;
     // brd: no seek cost (Linux QUEUE_FLAG_NONROT)
     let limits = QueueLimits {
         rotational: false,

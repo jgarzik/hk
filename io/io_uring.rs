@@ -1255,7 +1255,7 @@ impl FileOps for IoUringFileOps {
         Err(KernelError::InvalidArgument)
     }
 
-    fn poll(&self, file: &File, pt: Option<&mut PollTable>) -> u16 {
+    fn poll(&self, file: &File, pt: Option<&mut PollTable<'_>>) -> u16 {
         let Some(ring) = file.private_ref::<IoUring>() else {
             return crate::io::poll::POLLERR;
         };
@@ -1346,7 +1346,7 @@ fn read_user_fds(arg: u64, n: usize) -> Result<Vec<i32>, KernelError> {
     }
     let mut fds = crate::util::kmem::try_vec(n, 0i32)?;
     // SAFETY: byte view of the `n` initialized i32 elements of `fds`
-    let bytes = unsafe { core::slice::from_raw_parts_mut(fds.as_mut_ptr() as *mut u8, n * 4) };
+    let bytes = unsafe { core::slice::from_raw_parts_mut(fds.as_mut_ptr().cast::<u8>(), n * 4) };
     copy_from_user::<Uaccess>(bytes, arg, n * 4).map_err(|_| KernelError::BadAddress)?;
     Ok(fds)
 }

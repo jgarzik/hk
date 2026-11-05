@@ -61,14 +61,14 @@ pub fn node_alloc() -> Option<NonNull<Node>> {
     #[cfg(test)]
     tests::LIVE.with(|l| l.set(l.get() + 1));
     // SAFETY: Node is not zero-sized; all-zero is a valid empty node
-    NonNull::new(unsafe { alloc_zeroed(Layout::new::<Node>()) } as *mut Node)
+    NonNull::new(unsafe { alloc_zeroed(Layout::new::<Node>()) }.cast::<Node>())
 }
 
 fn node_free(n: NonNull<Node>) {
     #[cfg(test)]
     tests::LIVE.with(|l| l.set(l.get() - 1));
     // SAFETY: allocated by `node_alloc` with this layout
-    unsafe { dealloc(n.as_ptr() as *mut u8, Layout::new::<Node>()) }
+    unsafe { dealloc(n.as_ptr().cast::<u8>(), Layout::new::<Node>()) }
 }
 
 /// Nodes allocated before taking the tree's lock (Linux xas_nomem /

@@ -202,7 +202,7 @@ impl<T> Drop for IrqSpinlockGuard<'_, T> {
         // Re-enable preemption (decrement preempt_count)
         percpu::preempt_enable();
         crate::sync::lockdep::irqsafe_release(
-            self.lock as *const _ as *const u8 as usize,
+            core::ptr::from_ref(self.lock).cast::<u8>() as usize,
             self.irq_state & (1 << 7) == 0,
         );
 

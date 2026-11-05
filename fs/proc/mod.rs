@@ -1390,7 +1390,7 @@ impl FileOps for ProcfsFileOps {
         Ok(n)
     }
 
-    fn readdir(&self, file: &File, ctx: &mut DirContext) -> Result<(), KernelError> {
+    fn readdir(&self, file: &File, ctx: &mut DirContext<'_>) -> Result<(), KernelError> {
         let inode = file.get_inode().ok_or(KernelError::BadFd)?;
 
         if !inode.mode().is_dir() {
@@ -1515,7 +1515,7 @@ const PID_POS: u64 = 256;
 
 /// Emit PID directory entries for /proc readdir; a PID's position is
 /// PID_POS + pid (Linux proc_pid_readdir), stable while others exit
-fn readdir_emit_pids(proc_ino: u64, ctx: &mut DirContext) -> Result<(), KernelError> {
+fn readdir_emit_pids(proc_ino: u64, ctx: &mut DirContext<'_>) -> Result<(), KernelError> {
     use crate::task::percpu::TASKLIST;
 
     // Collect PIDs first to release lock quickly (sorted, unique)
@@ -1545,7 +1545,7 @@ fn readdir_emit_pids(proc_ino: u64, ctx: &mut DirContext) -> Result<(), KernelEr
 }
 
 /// Emit entries for /proc/<pid>/ directory
-fn readdir_emit_pid_entries(pid: Pid, ctx: &mut DirContext) -> Result<(), KernelError> {
+fn readdir_emit_pid_entries(pid: Pid, ctx: &mut DirContext<'_>) -> Result<(), KernelError> {
     // Emit "ns" subdirectory
     let should_continue = ctx.emit(DirEntry {
         ino: pid_ino(pid, 1),
@@ -1612,7 +1612,7 @@ fn readdir_emit_pid_entries(pid: Pid, ctx: &mut DirContext) -> Result<(), Kernel
 }
 
 /// Emit entries for /proc/<pid>/ns/ directory
-fn readdir_emit_ns_entries(pid: Pid, ctx: &mut DirContext) -> Result<(), KernelError> {
+fn readdir_emit_ns_entries(pid: Pid, ctx: &mut DirContext<'_>) -> Result<(), KernelError> {
     // Emit all namespace files
     for (idx, ns_type) in NamespaceType::all().iter().enumerate() {
         let should_continue = ctx.emit(DirEntry {
@@ -1630,7 +1630,7 @@ fn readdir_emit_ns_entries(pid: Pid, ctx: &mut DirContext) -> Result<(), KernelE
 }
 
 /// Emit entries for /proc/<pid>/fd/ directory
-fn readdir_emit_fd_entries(pid: Pid, ctx: &mut DirContext) -> Result<(), KernelError> {
+fn readdir_emit_fd_entries(pid: Pid, ctx: &mut DirContext<'_>) -> Result<(), KernelError> {
     // Get the task's TID
     let tid = match get_tid_for_pid(pid) {
         Some(t) => t,
@@ -1669,7 +1669,7 @@ fn readdir_emit_fd_entries(pid: Pid, ctx: &mut DirContext) -> Result<(), KernelE
 }
 
 /// Emit entries for /proc/<pid>/fdinfo/ directory
-fn readdir_emit_fdinfo_entries(pid: Pid, ctx: &mut DirContext) -> Result<(), KernelError> {
+fn readdir_emit_fdinfo_entries(pid: Pid, ctx: &mut DirContext<'_>) -> Result<(), KernelError> {
     // Get the task's TID
     let tid = match get_tid_for_pid(pid) {
         Some(t) => t,
