@@ -33,8 +33,9 @@
 //! sleeps on `wait` with a timeout until the earliest delay expires, so
 //! nothing runs in IRQ context. `inner` is an `IrqSpinlock` (leaf); the
 //! per-item `Mutex` is never held while the work function runs, so work may
-//! re-queue itself. `queue_work`/`queue_delayed_work` are process-context
-//! only (they take the item's Mutex).
+//! re-queue itself. Queueing, `mod_delayed_work` and
+//! `cancel_delayed_work` are process-context only (they take the item's
+//! Mutex, under `inner` for delayed work).
 
 extern crate alloc;
 
@@ -42,7 +43,7 @@ use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::sync::spin::Mutex;
 
@@ -89,12 +90,13 @@ pub type WorkFn = Box<dyn FnMut() + Send + 'static>;
 /// A work item that can be queued for execution
 ///
 /// Similar to Linux's `work_struct`. Contains a callback function that
-/// will be executed by a worker thread.
+/// will be executed by a worker thread. Its state is a plain field
+/// under the item's own `Mutex`, which every user holds to touch it.
 pub struct Work {
     /// Callback function to execute
     func: Option<WorkFn>,
-    /// Atomic state flags (WORK_PENDING, WORK_RUNNING)
-    state: AtomicU32,
+    /// WORK_PENDING, WORK_RUNNING
+    state: u32,
 }
 
 impl Work {
@@ -102,34 +104,30 @@ impl Work {
     pub fn new<F: FnMut() + Send + 'static>(func: F) -> Self {
         Self {
             func: Some(Box::new(func)),
-            state: AtomicU32::new(0),
+            state: 0,
         }
     }
 
     /// Check if work is pending execution
     pub fn is_pending(&self) -> bool {
-        self.state.load(Ordering::Acquire) & work_flags::WORK_PENDING != 0
+        self.state & work_flags::WORK_PENDING != 0
     }
 
-    /// Try to mark as pending (returns true if successful, false if already pending)
-    fn try_set_pending(&self) -> bool {
-        let prev = self
-            .state
-            .fetch_or(work_flags::WORK_PENDING, Ordering::AcqRel);
-        prev & work_flags::WORK_PENDING == 0
+    /// Mark pending; false if it already was
+    fn try_set_pending(&mut self) -> bool {
+        let was = self.is_pending();
+        self.state |= work_flags::WORK_PENDING;
+        !was
     }
 
-    /// Clear pending flag
-    fn clear_pending(&self) {
-        self.state
-            .fetch_and(!work_flags::WORK_PENDING, Ordering::Release);
+    fn clear_pending(&mut self) {
+        self.state &= !work_flags::WORK_PENDING;
     }
 
     /// Start running: mark RUNNING, clear PENDING (so the function may
     /// re-queue the item) and hand out the callback
     fn begin_run(&mut self) -> Option<WorkFn> {
-        self.state
-            .fetch_or(work_flags::WORK_RUNNING, Ordering::AcqRel);
+        self.state |= work_flags::WORK_RUNNING;
         self.clear_pending();
         self.func.take()
     }
@@ -137,8 +135,7 @@ impl Work {
     /// Finish a run started with `begin_run`
     fn end_run(&mut self, func: Option<WorkFn>) {
         self.func = func;
-        self.state
-            .fetch_and(!work_flags::WORK_RUNNING, Ordering::Release);
+        self.state &= !work_flags::WORK_RUNNING;
     }
 
     /// Run the callback of `work` without holding its lock during the call
@@ -150,9 +147,17 @@ impl Work {
         work.lock().end_run(func);
     }
 
-    /// Run a delayed work item without holding its lock during the call
-    fn run_delayed(dw: &Mutex<DelayedWork>) {
-        let mut func = dw.lock().work.begin_run();
+    /// Run a promoted delayed work item without holding its lock during
+    /// the call; nothing if it was re-timed or cancelled after `seq`
+    /// was taken (Linux: try_to_grab_pending stole it off the worklist)
+    fn run_delayed(dw: &Mutex<DelayedWork>, seq: u64) {
+        let mut func = {
+            let mut g = dw.lock();
+            if g.seq != seq {
+                return;
+            }
+            g.work.begin_run()
+        };
         if let Some(f) = func.as_mut() {
             f();
         }
@@ -167,12 +172,17 @@ impl Work {
 /// A work item that executes after a delay
 ///
 /// Similar to Linux's `delayed_work`. Combines a Work with a timer that
-/// fires after a specified number of timer ticks.
+/// fires after a specified number of timer ticks. Plain fields under the
+/// item's `Mutex`; `wake_tick` and the workqueue's delayed list change
+/// together (under `Workqueue.inner`, then the item).
 pub struct DelayedWork {
     /// Underlying work item
     work: Work,
-    /// Wake tick (0 = not scheduled, >0 = scheduled for that tick)
-    wake_tick: AtomicU64,
+    /// The tick it is due at while on the delayed list; 0 when not on it
+    wake_tick: u64,
+    /// Bumped when a promoted copy on the pending list must not run
+    /// (re-timed or cancelled before the worker reached it)
+    seq: u64,
 }
 
 impl DelayedWork {
@@ -180,35 +190,17 @@ impl DelayedWork {
     pub fn new<F: FnMut() + Send + 'static>(func: F) -> Self {
         Self {
             work: Work::new(func),
-            wake_tick: AtomicU64::new(0),
+            wake_tick: 0,
+            seq: 0,
         }
     }
 
-    /// Check if the timer is armed (scheduled for future execution)
+    /// The timer is armed: on the delayed list (Linux timer_pending)
     pub fn is_timer_pending(&self) -> bool {
-        self.wake_tick.load(Ordering::Acquire) != 0
+        self.wake_tick != 0
     }
 
-    /// Get the scheduled wake tick (0 if not scheduled)
-    pub fn get_wake_tick(&self) -> u64 {
-        self.wake_tick.load(Ordering::Acquire)
-    }
-
-    /// Schedule for execution at the given tick
-    ///
-    /// Returns the previous wake tick (0 if was not scheduled)
-    fn schedule_at(&self, tick: u64) -> u64 {
-        self.wake_tick.swap(tick, Ordering::AcqRel)
-    }
-
-    /// Cancel the timer
-    ///
-    /// Returns true if was pending, false if not scheduled
-    pub fn cancel_timer(&self) -> bool {
-        self.wake_tick.swap(0, Ordering::AcqRel) != 0
-    }
-
-    /// Check if the work is pending execution
+    /// Check if the work is pending execution (timed or queued)
     pub fn is_pending(&self) -> bool {
         self.work.is_pending()
     }
@@ -285,11 +277,8 @@ impl Workqueue {
     /// Returns true if the work was queued, false if it was already pending.
     pub fn queue_work(&self, work: Arc<Mutex<Work>>) -> bool {
         // Try to mark as pending
-        {
-            let guard = work.lock();
-            if !guard.try_set_pending() {
-                return false; // Already pending
-            }
+        if !work.lock().try_set_pending() {
+            return false; // Already pending
         }
 
         // Add to pending queue
@@ -305,57 +294,70 @@ impl Workqueue {
         true
     }
 
-    /// Queue delayed work for execution after delay_ticks
-    ///
-    /// Returns true if the work was queued, false if it was already pending.
+    /// Queue delayed work for execution after `delay_ticks` (Linux
+    /// queue_delayed_work): false if it was already pending
     pub fn queue_delayed_work(&self, work: Arc<Mutex<DelayedWork>>, delay_ticks: u64) -> bool {
-        let current_tick = get_ticks();
-        let wake_tick = current_tick.saturating_add(delay_ticks);
-
-        // Try to mark as pending and schedule
-        {
-            let guard = work.lock();
-            if !guard.work.try_set_pending() {
-                return false; // Already pending
-            }
-            guard.schedule_at(wake_tick);
-        }
-
-        // Add to delayed queue
+        let wake_tick = get_ticks().saturating_add(delay_ticks).max(1);
         {
             let mut inner = self.inner.lock();
+            let mut g = work.lock();
+            if !g.work.try_set_pending() {
+                return false;
+            }
+            g.wake_tick = wake_tick;
+            drop(g);
             inner.delayed.push(work);
         }
-
-        // Let the worker re-arm its timeout for the new deadline
-        self.delayed_gen.fetch_add(1, Ordering::AcqRel);
-        self.wait.wake_one();
-
+        self.kick_delayed();
         true
     }
 
-    /// Modify a delayed work's delay (reschedule)
-    ///
-    /// If the work is already pending, cancels the old timer and reschedules.
-    /// Returns true if modified, false if work wasn't found.
+    /// Run delayed work after `delay_ticks` from now, whatever its state
+    /// (Linux mod_delayed_work): a timed item is re-timed; one already
+    /// moved to the pending list is taken back and timed; an idle one is
+    /// queued. True if it was pending.
     pub fn mod_delayed_work(&self, work: &Arc<Mutex<DelayedWork>>, delay_ticks: u64) -> bool {
-        let current_tick = get_ticks();
-        let wake_tick = current_tick.saturating_add(delay_ticks);
-
-        let modified = {
-            let guard = work.lock();
-            if guard.is_timer_pending() || guard.is_pending() {
-                guard.schedule_at(wake_tick);
-                true
-            } else {
-                false
+        let wake_tick = get_ticks().saturating_add(delay_ticks).max(1);
+        let was = {
+            let mut inner = self.inner.lock();
+            let mut g = work.lock();
+            let was = g.work.is_pending();
+            if g.wake_tick == 0 {
+                // Promoted (its copy must not run) or idle: onto the list
+                g.seq += 1;
+                g.work.try_set_pending();
+                inner.delayed.push(work.clone());
             }
+            g.wake_tick = wake_tick;
+            was
         };
-        if modified {
-            self.delayed_gen.fetch_add(1, Ordering::AcqRel);
-            self.wait.wake_one();
+        self.kick_delayed();
+        was
+    }
+
+    /// Take pending delayed work back without running it (Linux
+    /// cancel_delayed_work: a run already under way is not waited for).
+    /// True if it was pending.
+    pub fn cancel_delayed_work(&self, work: &Arc<Mutex<DelayedWork>>) -> bool {
+        let mut inner = self.inner.lock();
+        let mut g = work.lock();
+        if !g.work.is_pending() {
+            return false;
         }
-        modified
+        if g.wake_tick != 0 {
+            inner.delayed.retain(|d| !Arc::ptr_eq(d, work));
+            g.wake_tick = 0;
+        } else {
+            g.seq += 1;
+        }
+        g.work.clear_pending();
+        true
+    }
+
+    /// Delayed work was added or re-timed: the worker re-arms its sleep
+    fn kick_delayed(&self) {
+        self.delayed_gen.fetch_add(1, Ordering::AcqRel);
+        self.wait.wake_one();
     }
 
     /// Move expired delayed work to the pending queue (worker thread)
@@ -366,18 +368,20 @@ impl Workqueue {
         let mut next: Option<u64> = None;
         let mut i = 0;
         while i < inner.delayed.len() {
-            let wake_tick = inner.delayed[i].lock().get_wake_tick();
-            if wake_tick == 0 || wake_tick <= current_tick {
-                // Expired (or cancelled: run it now, as Linux flush does)
+            let mut g = inner.delayed[i].lock();
+            let wake_tick = g.wake_tick;
+            if wake_tick <= current_tick {
+                g.wake_tick = 0;
+                let seq = g.seq;
+                drop(g);
                 let dw = inner.delayed.remove(i);
-                dw.lock().wake_tick.store(0, Ordering::Release);
-                let dw_run = dw.clone();
-                let work = Work::new(move || Work::run_delayed(&dw_run));
+                let mut work = Work::new(move || Work::run_delayed(&dw, seq));
                 // The wrapper is fresh: mark it pending like queue_work
                 work.try_set_pending();
                 inner.pending.push_back(Arc::new(Mutex::new(work)));
                 inner.has_work = true;
             } else {
+                drop(g);
                 next = Some(next.map_or(wake_tick, |n: u64| n.min(wake_tick)));
                 i += 1;
             }

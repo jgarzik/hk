@@ -76,8 +76,7 @@ impl BdiWriteback {
     /// wb_start_background_writeback)
     pub fn wakeup(&self, dev: DevId) {
         self.dirty.lock().insert(dev);
-        self.dwork.lock().cancel_timer();
-        BDI_WORKQUEUE.queue_delayed_work(self.dwork.clone(), 0);
+        BDI_WORKQUEUE.mod_delayed_work(&self.dwork, 0);
     }
 }
 
@@ -244,7 +243,7 @@ pub fn bdi_register(dev_id: DevId) -> Arc<BdiWriteback> {
 /// Unregister it when the disk goes (Linux bdi_unregister)
 pub fn bdi_unregister(dev_id: DevId) {
     if let Some(bdi) = BDI_REGISTRY.write().remove(&dev_id) {
-        bdi.dwork.lock().cancel_timer();
+        BDI_WORKQUEUE.cancel_delayed_work(&bdi.dwork);
     }
 }
 
