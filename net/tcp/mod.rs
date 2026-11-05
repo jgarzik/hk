@@ -669,11 +669,6 @@ impl TcpSock {
     }
 
     /// Writers can stop waiting
-    /// The send buffer has room (Linux sk_stream_memory_free)
-    fn snd_room(&self) -> bool {
-        self.lock().cb.snd_space() > 0
-    }
-
     fn tx_ready(&self) -> bool {
         let g = self.cb.lock();
         g.cb.writable()
@@ -683,8 +678,11 @@ impl TcpSock {
     }
 
     /// Queue `data` (Linux tcp_sendmsg_locked step; `more`: MSG_MORE
-    /// holds a partial last segment); Err if the connection cannot send
-    fn push(&self, data: &[u8], more: bool) -> Result<usize, KernelError> {
+    /// holds a partial last segment): the bytes queued, and whether none
+    /// were for want of TCP memory while the send buffer had room
+    /// (decided in the same hold, Linux sk_stream_memory_free at the
+    /// failed charge); Err if the connection cannot send
+    fn push(&self, data: &[u8], more: bool) -> Result<(usize, bool), KernelError> {
         self.step(|g, out| {
             if self.sk.has_err() {
                 return Err(self.sk.take_err().unwrap_or(KernelError::BrokenPipe));
@@ -700,7 +698,7 @@ impl TcpSock {
             } else if n > 0 {
                 g.cb.output(now_ms(), out);
             }
-            Ok(n)
+            Ok((n, n == 0 && g.cb.snd_space() > 0))
         })
     }
 
@@ -1031,14 +1029,14 @@ fn tcp_sendmsg(s: &TcpSock, m: &mut SendMsg, flags: i32) -> Result<usize, Kernel
         }
         // MSG_MORE holds only the last piece (Linux tcp_push)
         let more = flags & MSG_MORE != 0 || (total - sent > buf.len() - at);
-        let n = match s.push(&buf[at..], more) {
-            Ok(n) => n,
+        let (n, no_mem) = match s.push(&buf[at..], more) {
+            Ok(r) => r,
             Err(e) => break Err(e),
         };
         at += n;
         sent += n;
         dev::netif_rx_flush_local();
-        if n == 0 && s.snd_room() {
+        if no_mem {
             // Room in the buffer but no TCP memory: nobody wakes us when
             // other connections free some, so sleep a random 2..201 ms
             // (Linux sk_stream_wait_memory vm_wait), cut short only by an
