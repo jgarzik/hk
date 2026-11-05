@@ -157,6 +157,20 @@ fn test_acct_asu() {
         sys_exit_group(0);
     }
     sys_wait4(privileged, &mut st, 0, 0);
+    // Root, but nothing it does needs a capability: ids set to what they
+    // are, a limit lowered (Linux asks only when a change needs it)
+    let unneeded = sys_fork();
+    if unneeded == 0 {
+        hk_syscall::sys_setresuid(0, 0, 0);
+        hk_syscall::sys_setreuid(0, u32::MAX);
+        let low = hk_syscall::RLimit {
+            rlim_cur: 64,
+            rlim_max: 64,
+        };
+        hk_syscall::sys_setrlimit(7, &low); // RLIMIT_NOFILE
+        sys_exit_group(0);
+    }
+    sys_wait4(unneeded, &mut st, 0, 0);
     sys_acct(ptr::null());
     let mut buf = [0u8; 512];
     let fd = sys_open(path.as_ptr(), O_RDONLY, 0);
@@ -170,14 +184,17 @@ fn test_acct_asu() {
             .find(|r| pid_of(r) == pid)
             .map_or(0xff, |r| r[0])
     };
-    let (p, q) = (flag_of(plain), flag_of(privileged));
-    if p & (AFORK | ASU) == AFORK && q & (AFORK | ASU) == AFORK | ASU {
+    let (p, q, u) = (flag_of(plain), flag_of(privileged), flag_of(unneeded));
+    if p & (AFORK | ASU) == AFORK && q & (AFORK | ASU) == AFORK | ASU && u & (AFORK | ASU) == AFORK
+    {
         println(b"ACCT_ASU:OK");
     } else {
         print(b"ACCT_ASU:FAIL plain ");
         print_num(p as i64);
         print(b" privileged ");
         print_num(q as i64);
+        print(b" unneeded ");
+        print_num(u as i64);
         println(b"");
     }
 }

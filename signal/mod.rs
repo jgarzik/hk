@@ -1641,14 +1641,8 @@ impl SignalStruct {
     ///
     /// Validates:
     /// - rlim_cur <= rlim_max
-    /// - Only CAP_SYS_RESOURCE can raise hard limit
-    pub fn set_rlimit(
-        &self,
-        resource: u32,
-        new: RLimit,
-        old: &RLimit,
-        has_cap_sys_resource: bool,
-    ) -> Result<(), i32> {
+    /// - Only CAP_SYS_RESOURCE can raise hard limit (checked here)
+    pub fn set_rlimit(&self, resource: u32, new: RLimit, old: &RLimit) -> Result<(), i32> {
         if resource as usize >= RLIM_NLIMITS {
             return Err(-22); // EINVAL
         }
@@ -1659,7 +1653,9 @@ impl SignalStruct {
         }
 
         // Check if raising hard limit (requires CAP_SYS_RESOURCE)
-        if new.rlim_max > old.rlim_max && !has_cap_sys_resource {
+        // Asked only when raising it (Linux do_prlimit), so only a
+        // privileged raise marks the task PF_SUPERPRIV
+        if new.rlim_max > old.rlim_max && !crate::task::capable(crate::task::CAP_SYS_RESOURCE) {
             return Err(-1); // EPERM
         }
 

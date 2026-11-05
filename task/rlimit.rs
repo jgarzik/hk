@@ -158,15 +158,10 @@ pub fn get_task_rlimit(tid: Tid, resource: u32) -> Option<RLimit> {
 /// - Only CAP_SYS_RESOURCE (or root) can raise hard limit
 ///
 /// Returns Ok(()) on success, or Err(errno) on failure.
-pub fn set_task_rlimit(
-    tid: Tid,
-    resource: u32,
-    new: RLimit,
-    has_cap_sys_resource: bool,
-) -> Result<(), i32> {
+pub fn set_task_rlimit(tid: Tid, resource: u32, new: RLimit) -> Result<(), i32> {
     let signal = get_task_signal_struct(tid).ok_or(-3)?; // ESRCH
     let old = signal.get_rlimit(resource).ok_or(-22)?; // EINVAL
-    signal.set_rlimit(resource, new, &old, has_cap_sys_resource)?;
+    signal.set_rlimit(resource, new, &old)?;
     // A finite CPU limit is watched from now (Linux update_rlimit_cpu)
     if resource == RLIMIT_CPU {
         let pid = crate::task::percpu::TASKLIST
@@ -268,9 +263,8 @@ pub fn sys_setrlimit(resource: u32, rlim_ptr: u64) -> i64 {
     }
 
     let tid = current_tid();
-    let has_cap = crate::task::capable(crate::task::CAP_SYS_RESOURCE);
 
-    match set_task_rlimit(tid, resource, new_rlim, has_cap) {
+    match set_task_rlimit(tid, resource, new_rlim) {
         Ok(()) => 0,
         Err(e) => e as i64,
     }
@@ -338,11 +332,10 @@ pub fn sys_prlimit64(pid: i32, resource: u32, new_rlim_ptr: u64, old_rlim_ptr: u
         Some(r) => r,
         None => return -3, // ESRCH
     };
-    if let Some(new) = new {
-        let has_cap = crate::task::capable(crate::task::CAP_SYS_RESOURCE);
-        if let Err(e) = set_task_rlimit(target_tid, resource, new, has_cap) {
-            return e as i64;
-        }
+    if let Some(new) = new
+        && let Err(e) = set_task_rlimit(target_tid, resource, new)
+    {
+        return e as i64;
     }
     if old_rlim_ptr != 0 && copy_val_to_user::<Uaccess, RLimit>(old_rlim_ptr, &old).is_err() {
         return -14; // EFAULT
