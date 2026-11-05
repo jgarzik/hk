@@ -171,6 +171,7 @@ impl Mount {
             self.flags(),
             self.devname.clone(),
         );
+        c.inherit_t_flags(self);
         // A namespace copy keeps peerage (Linux copy_mnt_ns: CL_COPY_ALL)
         super::pnode::clone_prop(self, &c);
         c
@@ -226,6 +227,13 @@ impl Mount {
     /// Cannot be bind-mounted (Linux IS_MNT_UNBINDABLE)
     pub fn is_unbindable(&self) -> bool {
         self.t_flags.load(Ordering::Acquire) & T_UNBINDABLE != 0
+    }
+
+    /// A new copy of `old` stays unbindable if `old` is (Linux clone_mnt:
+    /// `mnt_t_flags = old->mnt_t_flags & T_UNBINDABLE`); not yet visible
+    fn inherit_t_flags(&self, old: &Mount) {
+        let t = old.t_flags.load(Ordering::Acquire) & T_UNBINDABLE;
+        self.t_flags.store(t, Ordering::Release);
     }
 
     /// Make it (un)bindable; the caller holds NAMESPACE_SEM write (Linux
@@ -442,12 +450,14 @@ pub fn attach(
 /// A new mount of `m`'s filesystem rooted at `root`, with its flags
 /// and source (Linux clone_mnt); not attached
 pub fn clone_mnt(m: &Mount, root: Arc<Dentry>) -> Arc<Mount> {
-    Mount::new(
+    let c = Mount::new(
         m.sb.clone(),
         root,
         m.flags() & !MNT_LOCKED,
         m.devname.clone(),
-    )
+    );
+    c.inherit_t_flags(m);
+    c
 }
 
 /// `m` at `root` with the mounts below `root` in it (Linux copy_tree):

@@ -28,6 +28,12 @@ pub fn run_tests() {
     report(b"PROPAG_PRIVATE", private());
     report(b"PROPAG_UNBINDABLE", unbindable());
     report(b"PROPAG_UNSHARE_PEER", unshare_peer());
+    // Linux 6.17..7.2 lost it (406fea799925; fixed by 1ab8904ae61b)
+    if super::helpers::linux_at_least(7, 3) {
+        report(b"PROPAG_UNSHARE_UNBINDABLE", unshare_unbindable());
+    } else {
+        super::helpers::skip(b"PROPAG_UNSHARE_UNBINDABLE", b"Linux 7.3 fix");
+    }
     report(b"PROPAG_SLAVE_GROUPS", slave_groups());
     report(b"PROPAG_UNBIND_THEN_SHARED", unbind_then_shared());
     report(b"PIVOT_ROOT_SHARED", pivot_shared());
@@ -241,6 +247,36 @@ fn unbindable() -> R {
     })();
     sys_umount2(b"/tmp/pu_b\0".as_ptr(), 0);
     sys_umount2(b"/tmp/pu_a\0".as_ptr(), 0);
+    rmdirs(&dirs);
+    r
+}
+
+/// unshare(CLONE_NEWNS) copies an unbindable mount unbindable (Linux
+/// 7.3+ clone_mnt keeps T_UNBINDABLE): binding it in the new namespace
+/// is EINVAL
+fn unshare_unbindable() -> R {
+    let dirs: [&[u8]; 2] = [b"/tmp/puu_a\0", b"/tmp/puu_b\0"];
+    mkdirs(&dirs);
+    let r = (|| {
+        check(b"mount", ramfs(b"/tmp/puu_a\0") == 0, -1)?;
+        check(b"unbindable", set(b"/tmp/puu_a\0", MS_UNBINDABLE) == 0, -1)?;
+        let pid = sys_fork();
+        if pid == 0 {
+            let code = if sys_unshare(CLONE_NEWNS) != 0 {
+                1
+            } else if bind(b"/tmp/puu_a\0", b"/tmp/puu_b\0") != EINVAL {
+                2
+            } else {
+                0
+            };
+            sys_exit(code);
+        }
+        let mut st = 0i32;
+        sys_wait4(pid, &mut st, 0, 0);
+        check(b"child", st == 0, (st >> 8) as i64)
+    })();
+    sys_umount2(b"/tmp/puu_b\0".as_ptr(), 0);
+    sys_umount2(b"/tmp/puu_a\0".as_ptr(), 0);
     rmdirs(&dirs);
     r
 }
