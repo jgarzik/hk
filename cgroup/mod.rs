@@ -270,7 +270,12 @@ impl Cgroup {
         false
     }
 
-    /// Set frozen state
+    /// This cgroup's own cgroup.freeze, ancestors aside
+    pub fn self_frozen(&self) -> bool {
+        self.frozen.load(Ordering::Acquire)
+    }
+
+    /// Set frozen state (under CGROUP_MUTEX: cgroup.freeze writes)
     pub fn set_frozen(&self, freeze: bool) {
         self.frozen.store(freeze, Ordering::Release);
     }

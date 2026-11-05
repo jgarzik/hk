@@ -73,6 +73,15 @@ nowhere; Linux charges the nearest ancestor that has it (the effective
 css). The no-internal-processes rule (EBUSY when enabling in a cgroup
 with tasks) is not enforced.
 
+No controller but pids is applied: CPU bandwidth, memory and IO
+limits, and cgroup.freeze are stored (and read back) but nothing is
+charged, throttled or frozen. cpu.stat, memory.current/stat/events and
+io.stat report zeros. When they are applied, use Linux's shapes: CPU
+bandwidth under the bandwidth lock (cfs_b->lock, an IrqSpinlock: the
+period timer), memory by page_counter_try_charge (add, check, roll
+back up the hierarchy), the IO token bucket under the queue's lock
+(blk-throttle), freezing under cgroup_mutex.
+
 ## user/ does not follow doc/UNSAFE.md
 
 The `user/syscall` wrappers are safe `pub fn`s, and about 330 of them take
@@ -878,8 +887,7 @@ index IDAs.
   cgroup_mutex), MsgQueue lspid/stime set outside the queue lock and
   torn IPC_STAT snapshots, adjtimex ADJ_SETOFFSET lost offsets, TCP
   shutdown bits outside `cb`, `TcpSock.connecting` beside the state.
-- Low: remount RDONLY set before the writer check (spurious EROFS),
-  cgroup controllers' check-then-act counters.
+- Low: remount RDONLY set before the writer check (spurious EROFS).
 - doc/LOCKING.md 5.4 cites Inode mode/uid/gid, MsgQueue and
   SemArray.pending as correct atomic use; they are among the above.
 

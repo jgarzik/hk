@@ -9,16 +9,14 @@
 //! - `io.max`: Per-device limits ("$MAJ:$MIN rbps=$N wbps=$N riops=$N wiops=$N")
 //! - `io.stat`: Per-device I/O statistics
 
-use crate::sync::spin::RwLock;
+use crate::sync::spin::Mutex;
 use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
-use core::sync::atomic::{AtomicU64, Ordering};
 
-use crate::task::Pid;
 use crate::util::error::KernelError;
 
 use super::CgroupSubsysState;
@@ -37,174 +35,49 @@ pub fn dev_major_minor(dev: DevId) -> (u32, u32) {
     ((dev >> 32) as u32, dev as u32)
 }
 
-/// Per-device IO limits and statistics
-pub struct DeviceIoState {
-    /// Read bytes per second limit (0 = unlimited)
-    pub rbps: AtomicU64,
-    /// Write bytes per second limit (0 = unlimited)
-    pub wbps: AtomicU64,
-    /// Read IOPS limit (0 = unlimited)
-    pub riops: AtomicU64,
-    /// Write IOPS limit (0 = unlimited)
-    pub wiops: AtomicU64,
-
-    /// Statistics: total bytes read
-    pub rbytes: AtomicU64,
-    /// Statistics: total bytes written
-    pub wbytes: AtomicU64,
-    /// Statistics: read IOs completed
-    pub rios: AtomicU64,
-    /// Statistics: write IOs completed
-    pub wios: AtomicU64,
-
-    /// Token bucket: available read bytes
-    pub read_tokens: AtomicU64,
-    /// Token bucket: available write bytes
-    pub write_tokens: AtomicU64,
-    /// Last refill timestamp (microseconds)
-    pub last_refill: AtomicU64,
+/// One device's io.max limits (0 = unlimited)
+#[derive(Clone, Copy, Default)]
+pub struct IoMax {
+    pub rbps: u64,
+    pub wbps: u64,
+    pub riops: u64,
+    pub wiops: u64,
 }
 
-impl DeviceIoState {
-    /// Create new device IO state
-    pub fn new() -> Self {
-        Self {
-            rbps: AtomicU64::new(0),
-            wbps: AtomicU64::new(0),
-            riops: AtomicU64::new(0),
-            wiops: AtomicU64::new(0),
-            rbytes: AtomicU64::new(0),
-            wbytes: AtomicU64::new(0),
-            rios: AtomicU64::new(0),
-            wios: AtomicU64::new(0),
-            read_tokens: AtomicU64::new(0),
-            write_tokens: AtomicU64::new(0),
-            last_refill: AtomicU64::new(0),
-        }
-    }
-
-    /// Check if any limits are set
-    pub fn has_limits(&self) -> bool {
-        self.rbps.load(Ordering::Relaxed) > 0
-            || self.wbps.load(Ordering::Relaxed) > 0
-            || self.riops.load(Ordering::Relaxed) > 0
-            || self.wiops.load(Ordering::Relaxed) > 0
+impl IoMax {
+    fn has_limits(&self) -> bool {
+        self.rbps | self.wbps | self.riops | self.wiops != 0
     }
 }
 
-impl Default for DeviceIoState {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Per-cgroup IO state
+/// Per-cgroup IO state: io.max per device, values under one lock, so a
+/// write's limits land together (thread context only). No IO is
+/// throttled or accounted yet (BUGS "cgroup controller application");
+/// when it is, the token bucket lives under the queue's lock, as Linux
+/// blk-throttle under queue_lock.
 pub struct IoState {
-    /// Per-device limits and stats
-    devices: RwLock<BTreeMap<DevId, Arc<DeviceIoState>>>,
-
-    /// Parent for hierarchy
-    parent: Option<Arc<IoState>>,
+    devices: Mutex<BTreeMap<DevId, IoMax>>,
 }
 
 impl IoState {
     /// Create a new IO state
-    pub fn new(parent: Option<Arc<IoState>>) -> Self {
+    pub fn new() -> Self {
         Self {
-            devices: RwLock::new(BTreeMap::new()),
-            parent,
+            devices: Mutex::new(BTreeMap::new()),
         }
     }
 
-    /// Get or create device state
-    pub fn get_device(&self, dev: DevId) -> Arc<DeviceIoState> {
-        {
-            let devices = self.devices.read();
-            if let Some(state) = devices.get(&dev) {
-                return state.clone();
-            }
-        }
-
-        let mut devices = self.devices.write();
-        devices
-            .entry(dev)
-            .or_insert_with(|| Arc::new(DeviceIoState::new()))
-            .clone()
-    }
-
-    /// Get all devices
-    pub fn devices(&self) -> Vec<(DevId, Arc<DeviceIoState>)> {
+    /// The devices with limits, in device order
+    pub fn limits(&self) -> Vec<(DevId, IoMax)> {
         self.devices
-            .read()
+            .lock()
             .iter()
-            .map(|(&k, v)| (k, v.clone()))
+            .filter(|(_, m)| m.has_limits())
+            .map(|(&d, &m)| (d, m))
             .collect()
     }
 
-    /// Try to acquire bandwidth for an IO operation
-    ///
-    /// Returns true if allowed, false if should be throttled.
-    pub fn try_acquire(&self, dev: DevId, bytes: u64, is_write: bool, now_usec: u64) -> bool {
-        let device = self.get_device(dev);
-
-        let bps_limit = if is_write {
-            device.wbps.load(Ordering::Relaxed)
-        } else {
-            device.rbps.load(Ordering::Relaxed)
-        };
-
-        if bps_limit == 0 {
-            // No limit, always allow
-            return true;
-        }
-
-        // Refill tokens based on time elapsed
-        let last = device.last_refill.load(Ordering::Relaxed);
-        let elapsed_usec = now_usec.saturating_sub(last);
-        if elapsed_usec > 0 {
-            // Refill: tokens = bps * elapsed_sec
-            let refill = (bps_limit * elapsed_usec) / 1_000_000;
-            if is_write {
-                device.write_tokens.fetch_add(refill, Ordering::Relaxed);
-            } else {
-                device.read_tokens.fetch_add(refill, Ordering::Relaxed);
-            }
-            device.last_refill.store(now_usec, Ordering::Relaxed);
-        }
-
-        // Try to consume tokens
-        let tokens = if is_write {
-            &device.write_tokens
-        } else {
-            &device.read_tokens
-        };
-
-        let available = tokens.load(Ordering::Relaxed);
-        if available >= bytes {
-            tokens.fetch_sub(bytes, Ordering::Relaxed);
-            return true;
-        }
-
-        false
-    }
-
-    /// Record completed IO
-    pub fn record_io(&self, dev: DevId, bytes: u64, is_write: bool) {
-        let device = self.get_device(dev);
-        if is_write {
-            device.wbytes.fetch_add(bytes, Ordering::Relaxed);
-            device.wios.fetch_add(1, Ordering::Relaxed);
-        } else {
-            device.rbytes.fetch_add(bytes, Ordering::Relaxed);
-            device.rios.fetch_add(1, Ordering::Relaxed);
-        }
-
-        if let Some(ref parent) = self.parent {
-            parent.record_io(dev, bytes, is_write);
-        }
-    }
-
-    /// Set limits for a device
+    /// Set limits for a device (None keeps a value), all in one hold
     pub fn set_limits(
         &self,
         dev: DevId,
@@ -213,19 +86,21 @@ impl IoState {
         riops: Option<u64>,
         wiops: Option<u64>,
     ) {
-        let device = self.get_device(dev);
-        if let Some(v) = rbps {
-            device.rbps.store(v, Ordering::Relaxed);
+        let mut devices = self.devices.lock();
+        let m = devices.entry(dev).or_default();
+        m.rbps = rbps.unwrap_or(m.rbps);
+        m.wbps = wbps.unwrap_or(m.wbps);
+        m.riops = riops.unwrap_or(m.riops);
+        m.wiops = wiops.unwrap_or(m.wiops);
+        if !m.has_limits() {
+            devices.remove(&dev);
         }
-        if let Some(v) = wbps {
-            device.wbps.store(v, Ordering::Relaxed);
-        }
-        if let Some(v) = riops {
-            device.riops.store(v, Ordering::Relaxed);
-        }
-        if let Some(v) = wiops {
-            device.wiops.store(v, Ordering::Relaxed);
-        }
+    }
+}
+
+impl Default for IoState {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -251,8 +126,8 @@ impl CgroupSubsysOps for IoController {
         &self,
         parent_css: Option<&Arc<CgroupSubsysState>>,
     ) -> Result<Arc<dyn CssPrivate>, KernelError> {
-        let parent_state = parent_css.and_then(|css| css.private_as::<IoState>());
-        Ok(Arc::new(IoState::new(parent_state)))
+        let _ = parent_css;
+        Ok(Arc::new(IoState::new()))
     }
 
     fn css_free(&self, _css: &CgroupSubsysState) {
@@ -288,29 +163,22 @@ fn io_max_read(css: &CgroupSubsysState) -> Result<Vec<u8>, KernelError> {
     if let Some(state) = css.private_as::<IoState>() {
         let mut content = String::new();
 
-        for (dev, device) in state.devices() {
+        for (dev, m) in state.limits() {
             let (major, minor) = dev_major_minor(dev);
-            if device.has_limits() {
-                let rbps = device.rbps.load(Ordering::Relaxed);
-                let wbps = device.wbps.load(Ordering::Relaxed);
-                let riops = device.riops.load(Ordering::Relaxed);
-                let wiops = device.wiops.load(Ordering::Relaxed);
-
-                content.push_str(&format!("{}:{}", major, minor));
-                if rbps > 0 {
-                    content.push_str(&format!(" rbps={}", rbps));
-                }
-                if wbps > 0 {
-                    content.push_str(&format!(" wbps={}", wbps));
-                }
-                if riops > 0 {
-                    content.push_str(&format!(" riops={}", riops));
-                }
-                if wiops > 0 {
-                    content.push_str(&format!(" wiops={}", wiops));
-                }
-                content.push('\n');
+            content.push_str(&format!("{}:{}", major, minor));
+            if m.rbps > 0 {
+                content.push_str(&format!(" rbps={}", m.rbps));
             }
+            if m.wbps > 0 {
+                content.push_str(&format!(" wbps={}", m.wbps));
+            }
+            if m.riops > 0 {
+                content.push_str(&format!(" riops={}", m.riops));
+            }
+            if m.wiops > 0 {
+                content.push_str(&format!(" wiops={}", m.wiops));
+            }
+            content.push('\n');
         }
 
         Ok(content.into_bytes())
@@ -384,47 +252,9 @@ fn parse_io_value(s: &str) -> Result<u64, KernelError> {
     }
 }
 
-/// Read io.stat
+/// Read io.stat: a line per device with IO accounted (Linux); none is
+/// accounted yet
 fn io_stat_read(css: &CgroupSubsysState) -> Result<Vec<u8>, KernelError> {
-    if let Some(state) = css.private_as::<IoState>() {
-        let mut content = String::new();
-
-        for (dev, device) in state.devices() {
-            let (major, minor) = dev_major_minor(dev);
-            let rbytes = device.rbytes.load(Ordering::Relaxed);
-            let wbytes = device.wbytes.load(Ordering::Relaxed);
-            let rios = device.rios.load(Ordering::Relaxed);
-            let wios = device.wios.load(Ordering::Relaxed);
-
-            content.push_str(&format!(
-                "{}:{} rbytes={} wbytes={} rios={} wios={}\n",
-                major, minor, rbytes, wbytes, rios, wios
-            ));
-        }
-
-        Ok(content.into_bytes())
-    } else {
-        Err(KernelError::Io)
-    }
-}
-
-/// Try to acquire IO bandwidth for a task
-pub fn try_acquire_io(pid: Pid, dev: DevId, bytes: u64, is_write: bool, now_usec: u64) -> bool {
-    if let Some(cgroup) = super::get_task_cgroup(pid)
-        && let Some(css) = cgroup.css(ControllerType::Io)
-        && let Some(state) = css.private_as::<IoState>()
-    {
-        return state.try_acquire(dev, bytes, is_write, now_usec);
-    }
-    true // No limits if not in a cgroup
-}
-
-/// Record IO for a task
-pub fn record_io(pid: Pid, dev: DevId, bytes: u64, is_write: bool) {
-    if let Some(cgroup) = super::get_task_cgroup(pid)
-        && let Some(css) = cgroup.css(ControllerType::Io)
-        && let Some(state) = css.private_as::<IoState>()
-    {
-        state.record_io(dev, bytes, is_write);
-    }
+    css.private_as::<IoState>().ok_or(KernelError::Io)?;
+    Ok(Vec::new())
 }

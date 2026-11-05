@@ -30,6 +30,11 @@
 //!   controller it has itself (ENOENT otherwise); an unknown token is
 //!   EINVAL (Linux cgroup_subtree_control_write).
 //!
+//! - CPU_MAX_RW: cpu.max reads back what was written ("max" keeps the
+//!   period); while one process rewrites it with two values, a reader
+//!   only ever sees one of them whole, never one's quota with the
+//!   other's period.
+//!
 //! Runs after cgroup.rs, which mounts cgroup2 at /sys/fs/cgroup and
 //! enables +pids at the root.
 
@@ -53,6 +58,67 @@ pub fn run_tests() {
     report(b"CGROUP_PROCS_TGID", in_child(cgroup_procs_tgid));
     report(b"CGROUP_PROCS_EXITED_LEADER", procs_exited_leader());
     report(b"CGROUP_SUBTREE_CONTROL", subtree_control());
+    report(b"CPU_MAX_RW", cpu_max_rw());
+}
+
+/// The whole of `file` of cgroup `name` in `d`; its length or -errno
+fn read_raw(name: &[u8], file: &[u8], d: &mut [u8]) -> i64 {
+    let mut b = [0u8; 96];
+    let fd = sys_open(path(&mut b, name, file).as_ptr(), O_RDONLY, 0);
+    if fd < 0 {
+        return fd;
+    }
+    let n = sys_read(fd as u64, d.as_mut_ptr(), d.len() as u64);
+    sys_close(fd as u64);
+    n
+}
+
+fn cpu_max_rw() -> i64 {
+    const CG: &[u8] = b"cpumax";
+    const A: &[u8] = b"10000 20000\n";
+    const B: &[u8] = b"30000 40000\n";
+    if write_file(b"", b"cgroup.subtree_control", b"+cpu") < 0 {
+        return 1;
+    }
+    let mut b = [0u8; 96];
+    sys_mkdir(path(&mut b, CG, b"").as_ptr(), 0o755);
+    let mut d = [0u8; 64];
+    let step = (|| {
+        if write_file(CG, b"cpu.max", b"50000 100000") < 0 {
+            return 2;
+        }
+        let n = read_raw(CG, b"cpu.max", &mut d);
+        if n < 0 || &d[..n as usize] != b"50000 100000\n" {
+            return 3;
+        }
+        write_file(CG, b"cpu.max", b"max");
+        let n = read_raw(CG, b"cpu.max", &mut d);
+        if n < 0 || &d[..n as usize] != b"max 100000\n" {
+            return 4;
+        }
+        write_file(CG, b"cpu.max", A);
+        let pid = sys_fork();
+        if pid == 0 {
+            for i in 0..400 {
+                write_file(CG, b"cpu.max", if i % 2 == 0 { B } else { A });
+            }
+            sys_exit(0);
+        }
+        let mut bad = 0;
+        for _ in 0..400 {
+            let n = read_raw(CG, b"cpu.max", &mut d);
+            let got = &d[..n.max(0) as usize];
+            if got != A && got != B {
+                bad = 5;
+            }
+        }
+        let mut st = 0;
+        sys_wait4(pid, &mut st, 0, 0);
+        bad
+    })();
+    write_file(CG, b"cpu.max", b"max 100000");
+    sys_rmdir(path(&mut b, CG, b"").as_ptr());
+    step
 }
 
 fn report(name: &[u8], step: i64) {

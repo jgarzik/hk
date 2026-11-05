@@ -15,9 +15,7 @@ use alloc::format;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use crate::task::Pid;
 use crate::util::error::KernelError;
 
 use super::CgroupSubsysState;
@@ -35,177 +33,67 @@ pub const CPU_QUOTA_UNLIMITED: u64 = u64::MAX;
 /// Default period (100ms in microseconds)
 pub const CPU_PERIOD_DEFAULT: u64 = 100_000;
 
-/// Per-cgroup CPU state
+/// cpu.weight and cpu.max: what a write sets together and a read sees
+/// together (Linux keeps quota and period under cfs_b->lock)
+#[derive(Clone, Copy)]
+struct CpuBw {
+    /// Relative weight for fair scheduling (1-10000)
+    weight: u64,
+    /// Maximum microseconds per period (u64::MAX = "max")
+    quota: u64,
+    /// Period in microseconds
+    period: u64,
+}
+
+/// Per-cgroup CPU state: the interface values under one lock, so a
+/// cpu.max write never tears against a read (thread context only; no
+/// bandwidth is enforced yet, see BUGS "cgroup controller application")
 pub struct CpuState {
-    /// cpu.weight: relative weight for fair scheduling (1-10000)
-    weight: AtomicU64,
-
-    /// cpu.max quota: maximum microseconds per period (u64::MAX = "max")
-    quota: AtomicU64,
-
-    /// cpu.max period: period in microseconds
-    period: AtomicU64,
-
-    /// cpu.stat: total CPU time used (microseconds)
-    usage_usec: AtomicU64,
-
-    /// cpu.stat: user mode time (microseconds)
-    user_usec: AtomicU64,
-
-    /// cpu.stat: system mode time (microseconds)
-    system_usec: AtomicU64,
-
-    /// cpu.stat: number of periods elapsed
-    nr_periods: AtomicU64,
-
-    /// cpu.stat: number of times throttled
-    nr_throttled: AtomicU64,
-
-    /// cpu.stat: time spent throttled (microseconds)
-    throttled_usec: AtomicU64,
-
-    /// Bandwidth tracking: timestamp when current period started
-    period_start: AtomicU64,
-
-    /// Bandwidth tracking: microseconds used in current period
-    period_used: AtomicU64,
-
-    /// Currently throttled?
-    throttled: AtomicBool,
-
-    /// Parent state for hierarchy
-    parent: Option<Arc<CpuState>>,
+    bw: spin::Mutex<CpuBw>,
 }
 
 impl CpuState {
     /// Create a new CPU state
-    pub fn new(parent: Option<Arc<CpuState>>) -> Self {
+    pub fn new() -> Self {
         Self {
-            weight: AtomicU64::new(CPU_WEIGHT_DEFAULT),
-            quota: AtomicU64::new(CPU_QUOTA_UNLIMITED),
-            period: AtomicU64::new(CPU_PERIOD_DEFAULT),
-            usage_usec: AtomicU64::new(0),
-            user_usec: AtomicU64::new(0),
-            system_usec: AtomicU64::new(0),
-            nr_periods: AtomicU64::new(0),
-            nr_throttled: AtomicU64::new(0),
-            throttled_usec: AtomicU64::new(0),
-            period_start: AtomicU64::new(0),
-            period_used: AtomicU64::new(0),
-            throttled: AtomicBool::new(false),
-            parent,
+            bw: spin::Mutex::new(CpuBw {
+                weight: CPU_WEIGHT_DEFAULT,
+                quota: CPU_QUOTA_UNLIMITED,
+                period: CPU_PERIOD_DEFAULT,
+            }),
         }
     }
 
     /// Get weight
     pub fn weight(&self) -> u64 {
-        self.weight.load(Ordering::Relaxed)
+        self.bw.lock().weight
     }
 
     /// Set weight
     pub fn set_weight(&self, weight: u64) {
-        let clamped = weight.clamp(CPU_WEIGHT_MIN, CPU_WEIGHT_MAX);
-        self.weight.store(clamped, Ordering::Relaxed);
+        self.bw.lock().weight = weight.clamp(CPU_WEIGHT_MIN, CPU_WEIGHT_MAX);
     }
 
-    /// Get quota
-    pub fn quota(&self) -> u64 {
-        self.quota.load(Ordering::Relaxed)
+    /// cpu.max: (quota, period), read together
+    pub fn max(&self) -> (u64, u64) {
+        let b = *self.bw.lock();
+        (b.quota, b.period)
     }
 
-    /// Get period
-    pub fn period(&self) -> u64 {
-        self.period.load(Ordering::Relaxed)
-    }
-
-    /// Set bandwidth limit
-    pub fn set_max(&self, quota: u64, period: u64) {
-        self.quota.store(quota, Ordering::Relaxed);
-        self.period.store(period, Ordering::Relaxed);
-    }
-
-    /// Check if throttled
-    pub fn is_throttled(&self) -> bool {
-        self.throttled.load(Ordering::Acquire)
-    }
-
-    /// Charge CPU usage and check for throttling
-    ///
-    /// Called from timer interrupt or context switch.
-    /// Returns true if task should continue running, false if throttled.
-    pub fn charge_usage(&self, usec: u64, is_user: bool) -> bool {
-        // Update usage stats
-        self.usage_usec.fetch_add(usec, Ordering::Relaxed);
-        if is_user {
-            self.user_usec.fetch_add(usec, Ordering::Relaxed);
-        } else {
-            self.system_usec.fetch_add(usec, Ordering::Relaxed);
-        }
-
-        // Bandwidth enforcement
-        let quota = self.quota.load(Ordering::Relaxed);
-        if quota != CPU_QUOTA_UNLIMITED {
-            let used = self.period_used.fetch_add(usec, Ordering::Relaxed) + usec;
-            if used >= quota && !self.throttled.load(Ordering::Acquire) {
-                self.throttled.store(true, Ordering::Release);
-                self.nr_throttled.fetch_add(1, Ordering::Relaxed);
-                return false;
-            }
-        }
-
-        // Propagate to parent
-        if let Some(ref parent) = self.parent {
-            return parent.charge_usage(usec, is_user);
-        }
-
-        !self.is_throttled()
-    }
-
-    /// Called on period boundary to refill bandwidth
-    pub fn period_tick(&self, now_usec: u64) {
-        let period = self.period.load(Ordering::Relaxed);
-        let period_start = self.period_start.load(Ordering::Relaxed);
-
-        if now_usec - period_start >= period {
-            self.nr_periods.fetch_add(1, Ordering::Relaxed);
-            self.period_start.store(now_usec, Ordering::Relaxed);
-
-            // Track time spent throttled
-            if self.throttled.load(Ordering::Acquire) {
-                let throttled_time =
-                    now_usec - period_start - self.period_used.load(Ordering::Relaxed);
-                self.throttled_usec
-                    .fetch_add(throttled_time, Ordering::Relaxed);
-            }
-
-            self.period_used.store(0, Ordering::Relaxed);
-            self.throttled.store(false, Ordering::Release);
+    /// Set the bandwidth limit; `period` None keeps the current one
+    /// (decided under the same hold as the store)
+    pub fn set_max(&self, quota: u64, period: Option<u64>) {
+        let mut b = self.bw.lock();
+        b.quota = quota;
+        if let Some(p) = period {
+            b.period = p;
         }
     }
+}
 
-    /// Get usage statistics
-    pub fn usage_usec(&self) -> u64 {
-        self.usage_usec.load(Ordering::Relaxed)
-    }
-
-    pub fn user_usec(&self) -> u64 {
-        self.user_usec.load(Ordering::Relaxed)
-    }
-
-    pub fn system_usec(&self) -> u64 {
-        self.system_usec.load(Ordering::Relaxed)
-    }
-
-    pub fn nr_periods(&self) -> u64 {
-        self.nr_periods.load(Ordering::Relaxed)
-    }
-
-    pub fn nr_throttled(&self) -> u64 {
-        self.nr_throttled.load(Ordering::Relaxed)
-    }
-
-    pub fn throttled_usec(&self) -> u64 {
-        self.throttled_usec.load(Ordering::Relaxed)
+impl Default for CpuState {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -231,8 +119,8 @@ impl CgroupSubsysOps for CpuController {
         &self,
         parent_css: Option<&Arc<CgroupSubsysState>>,
     ) -> Result<Arc<dyn CssPrivate>, KernelError> {
-        let parent_state = parent_css.and_then(|css| css.private_as::<CpuState>());
-        Ok(Arc::new(CpuState::new(parent_state)))
+        let _ = parent_css;
+        Ok(Arc::new(CpuState::new()))
     }
 
     fn css_free(&self, _css: &CgroupSubsysState) {
@@ -272,8 +160,7 @@ static CPU_FILES: [ControlFile; 3] = [
 /// Read cpu.max
 fn cpu_max_read(css: &CgroupSubsysState) -> Result<Vec<u8>, KernelError> {
     if let Some(state) = css.private_as::<CpuState>() {
-        let quota = state.quota();
-        let period = state.period();
+        let (quota, period) = state.max();
         let content = if quota == CPU_QUOTA_UNLIMITED {
             format!("max {}\n", period)
         } else {
@@ -303,10 +190,9 @@ fn cpu_max_write(css: &CgroupSubsysState, data: &[u8]) -> Result<(), KernelError
                 .map_err(|_| KernelError::InvalidArgument)?
         };
 
-        let period = if let Some(p) = period_str {
-            p.parse().map_err(|_| KernelError::InvalidArgument)?
-        } else {
-            state.period()
+        let period = match period_str {
+            Some(p) => Some(p.parse().map_err(|_| KernelError::InvalidArgument)?),
+            None => None,
         };
 
         state.set_max(quota, period);
@@ -343,46 +229,17 @@ fn cpu_weight_write(css: &CgroupSubsysState, data: &[u8]) -> Result<(), KernelEr
     }
 }
 
-/// Read cpu.stat
+/// Read cpu.stat: no CPU time is charged to cgroups yet, so every
+/// counter is 0
 fn cpu_stat_read(css: &CgroupSubsysState) -> Result<Vec<u8>, KernelError> {
-    if let Some(state) = css.private_as::<CpuState>() {
-        let content = format!(
-            "usage_usec {}\n\
-             user_usec {}\n\
-             system_usec {}\n\
-             nr_periods {}\n\
-             nr_throttled {}\n\
-             throttled_usec {}\n",
-            state.usage_usec(),
-            state.user_usec(),
-            state.system_usec(),
-            state.nr_periods(),
-            state.nr_throttled(),
-            state.throttled_usec(),
-        );
-        Ok(content.into_bytes())
-    } else {
-        Err(KernelError::Io)
+    if css.private_as::<CpuState>().is_none() {
+        return Err(KernelError::Io);
     }
-}
-
-/// Check if a task is CPU throttled
-pub fn task_cpu_throttled(pid: Pid) -> bool {
-    if let Some(cgroup) = super::get_task_cgroup(pid)
-        && let Some(css) = cgroup.css(ControllerType::Cpu)
-        && let Some(state) = css.private_as::<CpuState>()
-    {
-        return state.is_throttled();
-    }
-    false
-}
-
-/// Charge CPU time for a task
-pub fn charge_cpu_time(pid: Pid, usec: u64, is_user: bool) {
-    if let Some(cgroup) = super::get_task_cgroup(pid)
-        && let Some(css) = cgroup.css(ControllerType::Cpu)
-        && let Some(state) = css.private_as::<CpuState>()
-    {
-        state.charge_usage(usec, is_user);
-    }
+    Ok(b"usage_usec 0\n\
+         user_usec 0\n\
+         system_usec 0\n\
+         nr_periods 0\n\
+         nr_throttled 0\n\
+         throttled_usec 0\n"
+        .to_vec())
 }
