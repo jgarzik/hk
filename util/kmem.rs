@@ -67,9 +67,7 @@ impl<T> KVec<T> {
 
     /// Room for `n` more items, total under [`MAX_KMALLOC`]. Reserves
     /// exactly, so the allocation never exceeds the cap `fits` enforced
-    /// (amortized `try_reserve` can round up to roughly twice it); build
-    /// a buffer incrementally with `try_with_capacity` first, not a loop
-    /// of `try_push`.
+    /// (amortized `try_reserve` can round up to roughly twice it).
     pub fn try_reserve(&mut self, n: usize) -> Result<(), KernelError> {
         fits::<T>(self.0.len().saturating_add(n))?;
         self.0
@@ -77,6 +75,8 @@ impl<T> KVec<T> {
             .map_err(|_| KernelError::OutOfMemory)
     }
 
+    /// Append `v`; when full, the capacity doubles (exactly, at most to
+    /// [`MAX_KMALLOC`]), so a loop of pushes copies O(n) in all
     pub fn try_push(&mut self, v: T) -> Result<(), KernelError> {
         if self.0.len() == self.0.capacity() {
             let len = self.0.len();
@@ -249,6 +249,24 @@ mod tests {
         let mut big: KVec<u8> = KVec::new();
         big.try_resize(MAX_KMALLOC, 0).unwrap();
         assert!(big.try_push(0).is_err());
+    }
+
+    #[test]
+    fn kvec_push_grows_geometrically() {
+        // Doubling, not one slot per push
+        let mut v: KVec<u8> = KVec::new();
+        for i in 0..5 {
+            v.try_push(i).unwrap();
+        }
+        assert!(v.0.capacity() >= 8);
+        // ...and never past the cap: 104 items of 40000 bytes fit
+        let mut big: KVec<[u8; 40000]> = KVec::new();
+        let max = MAX_KMALLOC / 40000;
+        for _ in 0..max {
+            big.try_push([0; 40000]).unwrap();
+            assert!(big.0.capacity() * 40000 <= MAX_KMALLOC);
+        }
+        assert_eq!(big.try_push([0; 40000]), Err(KernelError::OutOfMemory));
     }
 
     #[test]
