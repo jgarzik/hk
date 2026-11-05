@@ -18,11 +18,19 @@
 //! - `BPF_MAP_GET_NEXT_KEY`: Iterate through map keys
 //! - `BPF_PROG_LOAD`: Load a BPF program
 //! - `BPF_OBJ_GET_INFO_BY_FD`: Get object info
+//!
+//! ## Privilege
+//!
+//! As Linux: with kernel.unprivileged_bpf_disabled (default 2, Linux's
+//! CONFIG_BPF_UNPRIV_DEFAULT_OFF) set, creating maps and loading
+//! programs needs CAP_BPF or CAP_SYS_ADMIN (EPERM). The sysctl takes
+//! 0..2 from CAP_SYS_ADMIN only, and 1 is permanent.
 #![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use alloc::vec;
 use alloc::vec::Vec;
 use core::mem::size_of;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use super::fd::{
     create_bpf_map_fd, create_bpf_prog_fd, get_bpf_map_from_fd, get_bpf_prog_info_from_fd,
@@ -34,6 +42,53 @@ use super::verifier::{Kind, verify};
 use crate::arch::Uaccess;
 use crate::uaccess::{copy_from_user, copy_to_user};
 use crate::util::error::KernelError;
+
+// =============================================================================
+// Privilege (Linux kernel.unprivileged_bpf_disabled)
+// =============================================================================
+
+/// 0: allowed; 1: disabled for good; 2: disabled, an admin may re-enable
+static UNPRIV_DISABLED: AtomicU32 = AtomicU32::new(2);
+
+/// Most instructions in a program with CAP_BPF (Linux
+/// BPF_COMPLEXITY_LIMIT_INSNS); the heap's allocation cap may refuse
+/// one this long (ENOMEM)
+const MAX_INSNS_CAP: usize = 1_000_000;
+
+/// CAP_BPF, or CAP_SYS_ADMIN which implies it (Linux bpf_capable)
+fn bpf_capable() -> bool {
+    use crate::task::{CAP_BPF, CAP_SYS_ADMIN, capable};
+    capable(CAP_BPF) || capable(CAP_SYS_ADMIN)
+}
+
+/// EPERM unless unprivileged BPF is enabled or the caller is capable
+fn unpriv_ok() -> Result<(), KernelError> {
+    if UNPRIV_DISABLED.load(Ordering::Relaxed) != 0 && !bpf_capable() {
+        return Err(KernelError::NotPermitted);
+    }
+    Ok(())
+}
+
+/// Store to kernel.unprivileged_bpf_disabled (Linux bpf_unpriv_handler)
+fn unpriv_store(v: &[i64]) -> Result<(), KernelError> {
+    if !crate::task::capable(crate::task::CAP_SYS_ADMIN) {
+        return Err(KernelError::NotPermitted);
+    }
+    crate::sysctl::range(v[0], 0, 2)?;
+    if UNPRIV_DISABLED.load(Ordering::Relaxed) == 1 && v[0] != 1 {
+        return Err(KernelError::NotPermitted);
+    }
+    UNPRIV_DISABLED.store(v[0] as u32, Ordering::Relaxed);
+    Ok(())
+}
+
+pub static BPF_CTLS: &[crate::sysctl::Ctl] = &[crate::sysctl::Ctl {
+    path: "kernel/unprivileged_bpf_disabled",
+    mode: 0o644,
+    show: || alloc::vec![UNPRIV_DISABLED.load(Ordering::Relaxed) as i64],
+    store: unpriv_store,
+    text: None,
+}];
 
 // =============================================================================
 // BPF Commands (Linux ABI)
@@ -61,6 +116,19 @@ pub const BPF_PROG_ATTACH: i32 = 8;
 pub const BPF_PROG_DETACH: i32 = 9;
 /// Test run a program
 pub const BPF_PROG_TEST_RUN: i32 = 10;
+/// Copy `n` instructions from user `ptr`, fallibly (ENOMEM past the
+/// heap's cap)
+fn copy_insns(ptr: u64, n: usize) -> Result<Vec<BpfInsn>, KernelError> {
+    let bytes = n * size_of::<BpfInsn>();
+    let mut raw = crate::util::kmem::try_vec(bytes, 0u8)?;
+    copy_from_user::<Uaccess>(&mut raw, ptr, bytes).map_err(|_| KernelError::BadAddress)?;
+    let mut insns = crate::util::kmem::try_vec(n, BpfInsn::default())?;
+    for (i, b) in insns.iter_mut().zip(raw.as_chunks::<8>().0) {
+        *i = BpfInsn::from_bytes(b);
+    }
+    Ok(insns)
+}
+
 /// Get object info by fd
 pub const BPF_OBJ_GET_INFO_BY_FD: i32 = 29;
 /// Freeze a map (make read-only)
@@ -257,6 +325,9 @@ fn bpf_map_create(attr_buf: &[u8]) -> i64 {
     if attr_buf.len() < size_of::<MapCreateAttr>() {
         return KernelError::InvalidArgument.sysret();
     }
+    if let Err(e) = unpriv_ok() {
+        return e.sysret();
+    }
 
     // Safety: we've verified the buffer is large enough
     let attr: MapCreateAttr =
@@ -436,33 +507,26 @@ fn bpf_prog_load(attr_buf: &[u8]) -> i64 {
     let attr: ProgLoadAttr =
         unsafe { core::ptr::read_unaligned(attr_buf.as_ptr() as *const ProgLoadAttr) };
 
-    // Validate program type
+    if let Err(e) = unpriv_ok() {
+        return e.sysret();
+    }
+    let max = if bpf_capable() {
+        MAX_INSNS_CAP
+    } else {
+        super::insn::BPF_MAXINSNS
+    };
+    let n = attr.insn_cnt as usize;
+    if n == 0 || n > max {
+        return KernelError::ArgListTooLong.sysret();
+    }
     match attr.prog_type {
         BPF_PROG_TYPE_SOCKET_FILTER => {}
         _ => return KernelError::InvalidArgument.sysret(),
     }
-
-    // Validate instruction count
-    if attr.insn_cnt == 0 || attr.insn_cnt as usize > super::insn::BPF_MAXINSNS {
-        return KernelError::InvalidArgument.sysret();
-    }
-
-    // Read instructions from userspace
-    let insn_count = attr.insn_cnt as usize;
-    let insn_bytes = insn_count * size_of::<BpfInsn>();
-    let mut insn_buf = vec![0u8; insn_bytes];
-
-    if copy_from_user::<Uaccess>(&mut insn_buf, attr.insns, insn_bytes).is_err() {
-        return KernelError::BadAddress.sysret();
-    }
-
-    // Convert bytes to instructions
-    let insns: Vec<BpfInsn> = insn_buf
-        .as_chunks::<{ size_of::<BpfInsn>() }>()
-        .0
-        .iter()
-        .map(|chunk| unsafe { core::ptr::read_unaligned(chunk.as_ptr() as *const BpfInsn) })
-        .collect();
+    let insns = match copy_insns(attr.insns, n) {
+        Ok(v) => v,
+        Err(e) => return e.sysret(),
+    };
 
     // Nothing attaches a loaded program yet: no helpers, and the
     // context is a 64-byte placeholder for struct __sk_buff
@@ -471,7 +535,7 @@ fn bpf_prog_load(attr_buf: &[u8]) -> i64 {
         helpers: &[],
         unreachable_ok: false,
     };
-    if let Err(e) = verify(&insns, &SOCKET_FILTER, super::insn::BPF_MAXINSNS) {
+    if let Err(e) = verify(&insns, &SOCKET_FILTER, max) {
         return e.sysret();
     }
 

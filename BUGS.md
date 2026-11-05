@@ -961,16 +961,11 @@ Ranked. P# = the pattern's number in doc/res/hk-linux-cve-patterns.md.
    closed pipe write end registered in an epoll never gives the reader
    EOF, a closed socket is never released, and epoll_wait keeps
    reporting it. Linux epitems hold no reference; __fput removes them.
-3. **bpf() is open to unprivileged users** (P9). `bpf/syscall.rs:228`
-   has no capability check: any user creates maps (uncharged, see
-   above) and loads programs. Linux's default
-   kernel.unprivileged_bpf_disabled=2 (BPF_UNPRIV_DEFAULT_OFF) makes
-   map_create and prog_load EPERM without CAP_BPF.
-4. **mmap offset + length is not checked for wrap** (P6).
+3. **mmap offset + length is not checked for wrap** (P6).
    `mm/syscall.rs:78`: a file offset near 2^64 wraps the page index of
    the mapping's pages; Linux do_mmap is EOVERFLOW when
    pgoff + (len >> PAGE_SHIFT) wraps.
-5. **pwrite/write past LLONG_MAX is not refused** (P6). `fs/io.rs:210`
+4. **pwrite/write past LLONG_MAX is not refused** (P6). `fs/io.rs:210`
    checks only `offset >= 0` and there is no s_maxbytes: pos + count
    can exceed i64::MAX, giving a negative st_size and lseek results
    that read as errnos. Linux rw_verify_area (EINVAL) and

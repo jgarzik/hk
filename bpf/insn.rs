@@ -31,6 +31,16 @@ impl BpfInsn {
         }
     }
 
+    /// Decode the 8-byte user representation
+    pub fn from_bytes(b: &[u8; 8]) -> Self {
+        Self {
+            code: b[0],
+            regs: b[1],
+            off: i16::from_ne_bytes([b[2], b[3]]),
+            imm: i32::from_ne_bytes([b[4], b[5], b[6], b[7]]),
+        }
+    }
+
     /// Get destination register number (0-10)
     #[inline]
     pub fn dst_reg(&self) -> u8 {

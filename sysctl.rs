@@ -58,6 +58,7 @@ pub fn tables() -> &'static [&'static [Ctl]] {
         crate::mm::writeback::WB_CTLS,
         crate::mm::MM_CTLS,
         crate::task::fdbits::FS_CTLS,
+        crate::bpf::syscall::BPF_CTLS,
     ];
     TABLES
 }

@@ -68,6 +68,8 @@ pub fn run_tests() {
     report(b"KEY_CYCLE_EDEADLK", key_cycle());
     report(b"KEY_LINK_PERM", key_link_perm());
     report(b"KEY_QUOTA", key_quota());
+    report(b"BPF_UNPRIV_EPERM", in_child(bpf_unpriv));
+    report(b"BPF_UNPRIV_SYSCTL", bpf_sysctl());
 }
 
 fn report(name: &[u8], step: u64) {
@@ -819,6 +821,85 @@ fn key_revoke_update() -> u64 {
     }
     if keyctl(KEYCTL_READ, k2 as u64, buf.as_mut_ptr() as u64, 16) != EKEYREVOKED {
         return 6;
+    }
+    0
+}
+
+const BPF_MAP_CREATE: i32 = 0;
+const BPF_PROG_LOAD: i32 = 5;
+const UNPRIV_BPF: &[u8] = b"/proc/sys/kernel/unprivileged_bpf_disabled\0";
+
+/// An array map of one 4-byte value
+fn bpf_map() -> i64 {
+    let attr = [2u32, 4, 4, 1, 0, 0, 0, 0];
+    hk_syscall::sys_bpf(BPF_MAP_CREATE, attr.as_ptr() as u64, 32)
+}
+
+/// A socket filter "r0 = 0; exit"
+fn bpf_prog() -> i64 {
+    let insns = [0xb7u64, 0x95];
+    let license = b"GPL\0";
+    let attr = [
+        1u32, // BPF_PROG_TYPE_SOCKET_FILTER
+        2,
+        insns.as_ptr() as u64 as u32,
+        (insns.as_ptr() as u64 >> 32) as u32,
+        license.as_ptr() as u64 as u32,
+        (license.as_ptr() as u64 >> 32) as u32,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+    ];
+    hk_syscall::sys_bpf(BPF_PROG_LOAD, attr.as_ptr() as u64, 48)
+}
+
+/// With unprivileged BPF disabled (the default), root may create maps
+/// and load programs but uid 1000 without capabilities may not (EPERM)
+fn bpf_unpriv() -> u64 {
+    let mut b = [0u8; 4];
+    if super::helpers::read_file(UNPRIV_BPF, &mut b) < 1 || b[0] == b'0' {
+        return 1;
+    }
+    for fd in [bpf_map(), bpf_prog()] {
+        if fd < 0 {
+            return 2;
+        }
+        hk_syscall::sys_close(fd as u64);
+    }
+    if sys_setresuid(1000, 1000, 1000) != 0 {
+        return 3;
+    }
+    if bpf_map() != EPERM {
+        return 4;
+    }
+    if bpf_prog() != EPERM {
+        return 5;
+    }
+    0
+}
+
+/// kernel.unprivileged_bpf_disabled takes 0..2 (EINVAL past it)
+fn bpf_sysctl() -> u64 {
+    let write = |v: &[u8]| {
+        let fd = hk_syscall::sys_open(UNPRIV_BPF.as_ptr(), 1, 0);
+        if fd < 0 {
+            return fd;
+        }
+        let r = hk_syscall::sys_write(fd as u64, v.as_ptr(), v.len() as u64);
+        hk_syscall::sys_close(fd as u64);
+        r
+    };
+    if write(b"3") != -22 {
+        return 1;
+    }
+    if write(b"-1") != -22 {
+        return 2;
+    }
+    if write(b"2") != 1 {
+        return 3;
     }
     0
 }
