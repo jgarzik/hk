@@ -938,23 +938,11 @@ Tag = roadmap phase (doc/ROADMAP.md).
 
 Ranked. P# = the pattern's number in doc/res/hk-linux-cve-patterns.md.
 
-1. **Nested epoll has no loop or depth check** (P8, recursion through
-   poll). `io/epoll.rs:449` refuses only adding an epoll to itself, and
-   `Eventpoll::poll` (`io/epoll.rs:281`) polls its items under its own
-   IrqSpinlock: A in B in A deadlocks the CPU with interrupts off on
-   the first epoll_wait, and a long chain recurses off the stack. Linux
-   ep_loop_check: ELOOP for cycles and nesting past EP_MAX_NESTS (4).
-2. **An epoll item keeps its file open** (P1, use after teardown).
-   `EpItem.file` is an `Arc<File>` (`io/epoll.rs:86`) and nothing
-   removes items at the file's last close (no eventpoll_release): a
-   closed pipe write end registered in an epoll never gives the reader
-   EOF, a closed socket is never released, and epoll_wait keeps
-   reporting it. Linux epitems hold no reference; __fput removes them.
-3. **mmap offset + length is not checked for wrap** (P6).
+1. **mmap offset + length is not checked for wrap** (P6).
    `mm/syscall.rs:78`: a file offset near 2^64 wraps the page index of
    the mapping's pages; Linux do_mmap is EOVERFLOW when
    pgoff + (len >> PAGE_SHIFT) wraps.
-4. **pwrite/write past LLONG_MAX is not refused** (P6). `fs/io.rs:210`
+2. **pwrite/write past LLONG_MAX is not refused** (P6). `fs/io.rs:210`
    checks only `offset >= 0` and there is no s_maxbytes: pos + count
    can exceed i64::MAX, giving a negative st_size and lseek results
    that read as errnos. Linux rw_verify_area (EINVAL) and
@@ -966,7 +954,7 @@ Ranked. Not yet confirmed by a test.
 
 1. **ABI**: `acct` ac_etime is seconds where Linux has AHZ ticks, and
    encode_comp_t skips Linux's rounding; getxattr ERANGE above 64 KiB
-   (Linux clamps); epoll_wait maxevents capped at 4096 and poll at
+   (Linux clamps); poll capped at
    1024 fds (Linux: ~INT_MAX/12, RLIMIT_NOFILE); sysctl integers are
    not parsed in base 0 (`0x10`, `010`) and `+5` is accepted;
    `SigPending::dequeue` (`signal/mod.rs:429`) takes the lowest

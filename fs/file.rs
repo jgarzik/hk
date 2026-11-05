@@ -400,6 +400,10 @@ pub struct File {
     /// Per-open state of the file's filesystem (Linux private_data), set
     /// at most once, by `FileOps::open`
     pub private: spin::Once<Arc<dyn core::any::Any + Send + Sync>>,
+
+    /// The epoll items watching this file (Linux f_ep), removed at its
+    /// last close (spin leaf)
+    pub f_ep: Mutex<alloc::vec::Vec<alloc::sync::Weak<crate::io::epoll::EpItem>>>,
 }
 
 impl File {
@@ -450,6 +454,7 @@ impl File {
             mnt,
             pos: AtomicU64::new(0),
             f_pos_lock: sync::Mutex::new(()),
+            f_ep: Mutex::new(alloc::vec::Vec::new()),
             f_lock: Mutex::new(flags),
             f_op,
             owner_pid: AtomicI32::new(0),
@@ -759,6 +764,11 @@ impl File {
 
 impl Drop for File {
     fn drop(&mut self) {
+        // Leave every epoll first, while the wait queues the items are
+        // registered on still exist (Linux __fput -> eventpoll_release)
+        if !self.f_ep.lock().is_empty() {
+            crate::io::epoll::eventpoll_release(self);
+        }
         // Call release on file operations to allow cleanup (e.g., decrement pipe reader/writer counts)
         let _ = self.f_op.release(self);
 
