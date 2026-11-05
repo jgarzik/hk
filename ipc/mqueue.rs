@@ -155,9 +155,13 @@ impl Ord for MqMessage {
     }
 }
 
-/// Notification registration
+/// Notification registration (Linux info->notify_owner, a referenced
+/// struct pid, and notify_self_exec_id): holding the owner's `Pid`
+/// keeps its number from naming another process
 struct MqNotify {
-    owner_pid: u64,
+    owner: Arc<crate::task::pid::Pid>,
+    /// The owner's exec generation when it registered
+    exec_gen: u64,
     sigev_notify: i32,
     sigev_signo: i32,
     sigev_value: u64,
@@ -347,19 +351,16 @@ impl MqQueue {
     fn fire_notification(&self) {
         let mut notify = self.notify.lock();
         if let Some(n) = notify.take() {
-            // Log the notification for debugging (uses sigev_value)
-            // TODO: When siginfo support is added, include sigev_value in SI_MESGQ siginfo
-            let _sigev_value = n.sigev_value; // Will be passed in siginfo_t.si_value
-
-            // The notification carries the registrant's authority, not
-            // the message sender's (Linux __do_notify bypasses the kill
-            // permission check), so send directly rather than through
-            // the checked syscall path. hk has no siginfo queue, so
-            // si_code SI_MESGQ / sigev_value are not conveyed yet.
-            if n.sigev_notify == SIGEV_SIGNAL {
-                crate::signal::send_signal_to_process(n.owner_pid, n.sigev_signo as u32);
+            // TODO: siginfo SI_MESGQ with sigev_value once hk queues siginfo
+            let _sigev_value = n.sigev_value;
+            // The registrant's authority, not the sender's (Linux
+            // __do_notify sends without the kill permission check), and
+            // only to the process that registered: not after it exited
+            // or exec'd
+            let live = n.owner.exited().is_none() && n.owner.exec_gen() == n.exec_gen;
+            if n.sigev_notify == SIGEV_SIGNAL && live {
+                crate::signal::send_signal_to_process(n.owner.nr() as u64, n.sigev_signo as u32);
             }
-            // Notification is one-shot, already removed by take()
         }
     }
 }
@@ -440,17 +441,16 @@ impl FileOps for MqFileOps {
         events
     }
 
-    fn release(&self, file: &File) -> Result<(), KernelError> {
-        let mq = mq_of(file).ok_or(KernelError::BadFd)?;
-        // Clear notification if we own it
-        let current_pid = crate::task::percpu::current_pid();
-        let mut notify = mq.queue.notify.lock();
-        if let Some(ref n) = *notify
-            && n.owner_pid == current_pid
-        {
-            *notify = None;
+    /// The owner closing any descriptor of the queue drops its
+    /// registration (Linux mqueue_flush_file)
+    fn flush(&self, file: &File) {
+        if let Some(mq) = mq_of(file) {
+            let me = crate::task::percpu::current_pid();
+            let mut notify = mq.queue.notify.lock();
+            if notify.as_ref().is_some_and(|n| n.owner.nr() as u64 == me) {
+                *notify = None;
+            }
         }
-        Ok(())
     }
 }
 
@@ -854,11 +854,11 @@ pub fn sys_mq_notify(mqdes: i32, sevp_ptr: u64) -> i64 {
     if sevp_ptr == 0 {
         // Remove notification (only if we own it)
         let mut notify = mq_ops.queue.notify.lock();
-        if let Some(ref n) = *notify
-            && n.owner_pid == current_pid
+        if notify
+            .as_ref()
+            .is_some_and(|n| n.owner.nr() as u64 == current_pid)
         {
             *notify = None;
-            return 0;
         }
         return 0; // Not an error to remove non-existent
     }
@@ -879,16 +879,24 @@ pub fn sys_mq_notify(mqdes: i32, sevp_ptr: u64) -> i64 {
     }
 
     // Check if already registered by another process
+    let Some(owner) = u32::try_from(current_pid)
+        .ok()
+        .and_then(|nr| crate::task::pid::find_pid(&crate::ns::INIT_PID_NS, nr))
+    else {
+        return KernelError::NoProcess.sysret();
+    };
     let mut notify = mq_ops.queue.notify.lock();
-    if let Some(ref n) = *notify
-        && n.owner_pid != current_pid
+    if notify
+        .as_ref()
+        .is_some_and(|n| n.owner.nr() as u64 != current_pid)
     {
         return KernelError::Busy.sysret();
     }
 
     // Register notification
     *notify = Some(MqNotify {
-        owner_pid: current_pid,
+        exec_gen: owner.exec_gen(),
+        owner,
         sigev_notify: sev.sigev_notify,
         sigev_signo: sev.sigev_signo,
         sigev_value: sev.sigev_value,

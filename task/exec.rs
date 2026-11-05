@@ -1012,6 +1012,15 @@ where
     // Now we need to update the current task and switch to the new address space
     // This is the point of no return
 
+    // What the process registered before (an mq_notify) is not for the
+    // new image (Linux setup_new_exec: self_exec_id++); after de_thread
+    // the caller leads the process
+    if let Ok(nr) = u32::try_from(percpu::current_pid())
+        && let Some(p) = crate::task::pid::find_pid(&crate::ns::INIT_PID_NS, nr)
+    {
+        p.exec_done();
+    }
+
     // Linux begin_new_exec clears PF_FORKNOEXEC before it closes the
     // close-on-exec descriptors: whoever sees one of them close (EOF on
     // a pipe) sees the exec, and its setpgid is EACCES
