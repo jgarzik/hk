@@ -314,14 +314,21 @@ impl Workqueue {
 
     /// Run delayed work after `delay_ticks` from now, whatever its state
     /// (Linux mod_delayed_work): a timed item is re-timed; one already
-    /// moved to the pending list is taken back and timed; an idle one is
-    /// queued. True if it was pending.
+    /// moved to the pending list stays there for a zero delay, else is
+    /// taken back and timed; an idle one is queued. True if it was
+    /// pending.
     pub fn mod_delayed_work(&self, work: &Arc<Mutex<DelayedWork>>, delay_ticks: u64) -> bool {
         let wake_tick = get_ticks().saturating_add(delay_ticks).max(1);
         let was = {
             let mut inner = self.inner.lock();
             let mut g = work.lock();
             let was = g.work.is_pending();
+            if was && g.wake_tick == 0 && delay_ticks == 0 {
+                // Already on the pending list to run now: leave it
+                // there (Linux: a zero delay queues straight to the
+                // worklist), so repeated kicks never void a queued run
+                return true;
+            }
             if g.wake_tick == 0 {
                 // Promoted (its copy must not run) or idle: onto the list
                 g.seq += 1;

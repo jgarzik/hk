@@ -242,7 +242,10 @@ pub fn bdi_register(dev_id: DevId) -> Arc<BdiWriteback> {
 
 /// Unregister it when the disk goes (Linux bdi_unregister)
 pub fn bdi_unregister(dev_id: DevId) {
-    if let Some(bdi) = BDI_REGISTRY.write().remove(&dev_id) {
+    // The registry guard is gone before the workqueue's locks are taken
+    // (BDI_REGISTRY stays a leaf)
+    let bdi = BDI_REGISTRY.write().remove(&dev_id);
+    if let Some(bdi) = bdi {
         BDI_WORKQUEUE.cancel_delayed_work(&bdi.dwork);
     }
 }

@@ -104,6 +104,18 @@ fn selftest_thread(_arg: usize) {
         MOD_RUNS.load(Ordering::Acquire) == 1,
         MOD_RUNS.load(Ordering::Acquire),
     );
+    // Zero-delay kicks in a row (writeback's wakeup) run it once more,
+    // never zero times
+    check("mod_delayed_idle2", !SYSTEM_WQ.mod_delayed_work(&mw, 0), 0);
+    for _ in 0..8 {
+        SYSTEM_WQ.mod_delayed_work(&mw, 0);
+    }
+    let left = EVENT_WQ.wait_event_timeout(|| MOD_RUNS.load(Ordering::Acquire) >= 2, 200);
+    check(
+        "mod_delayed_kicks_run",
+        left > 0,
+        MOD_RUNS.load(Ordering::Acquire),
+    );
 
     // 4. kthread park/unpark/stop with the child on another CPU
     let other = if crate::cpu::this_id() == 0 && cpu_has_scheduler(1) {
