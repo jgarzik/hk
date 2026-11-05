@@ -5,8 +5,6 @@
 //! - request_key: Search for a key, optionally requesting construction
 //! - keyctl: Multiplex control operations on keys
 
-use alloc::vec;
-
 use crate::arch::Uaccess;
 use crate::task::percpu;
 use crate::uaccess::{copy_from_user, strncpy_from_user_str};
@@ -65,7 +63,10 @@ pub fn sys_add_key(type_ptr: u64, desc_ptr: u64, payload_ptr: u64, plen: u64, ke
 
     // Copy payload from userspace (if any)
     let payload = if plen > 0 && payload_ptr != 0 {
-        let mut buf = vec![0u8; plen as usize];
+        let mut buf = match crate::util::kmem::try_vec(plen as usize, 0u8) {
+            Ok(b) => b,
+            Err(e) => return e.sysret(),
+        };
         if copy_from_user::<Uaccess>(&mut buf, payload_ptr, plen as usize).is_err() {
             return KernelError::BadAddress.sysret();
         }

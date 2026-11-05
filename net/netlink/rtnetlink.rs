@@ -27,6 +27,7 @@ use crate::net::inet::route;
 use crate::net::ipv4::Ipv4Addr;
 use crate::net::neigh::{self, NeighInfo, nud};
 use crate::net::rtnl;
+use crate::util::kmem::KVec;
 
 // Message types (Linux RTM_*)
 pub const RTM_BASE: u16 = 16;
@@ -163,14 +164,25 @@ pub fn rcv(sk: &Arc<NlSock>, mut data: &[u8], explicit: bool) {
 /// Queue an NLMSG_ERROR (err 0 = ACK) for request `msg` (Linux
 /// netlink_ack): errors echo the whole request unless NETLINK_CAP_ACK
 fn ack(sk: &NlSock, h: &Hdr, msg: &[u8], err: i32) {
-    let capped = err == 0 || sk.has_flag(sflags::CAP_ACK);
-    let flags = if capped { NLM_F_CAPPED } else { 0 };
+    // Echo the whole request on error, but fallibly: a request too big
+    // to allocate falls back to a capped ACK (Linux netlink_ack reports
+    // ENOBUFS rather than failing the kernel)
+    let want_echo = err != 0 && !sk.has_flag(sflags::CAP_ACK);
+    let mut body = KVec::new();
+    // One reservation for the error word plus the echoed request
+    let echoed = want_echo
+        && body.try_reserve(4 + msg.len()).is_ok()
+        && body.try_extend_from_slice(&err.to_ne_bytes()).is_ok()
+        && body.try_extend_from_slice(msg).is_ok();
+    if !echoed {
+        body.clear();
+        // The error and the request header always fit
+        let _ = body.try_extend_from_slice(&err.to_ne_bytes());
+        let _ = body.try_extend_from_slice(&msg[..NLMSG_HDRLEN]);
+    }
+    let flags = if echoed { 0 } else { NLM_F_CAPPED };
     let mut m = Msg::new(NLMSG_ERROR, flags, h.seq, sk.portid());
-    let orig = if capped { &msg[..NLMSG_HDRLEN] } else { msg };
-    let mut body = Vec::with_capacity(4 + orig.len());
-    body.extend_from_slice(&err.to_ne_bytes());
-    body.extend_from_slice(orig);
-    m.put(&body);
+    m.put(body.as_slice());
     reply(sk, m.finish());
 }
 

@@ -622,7 +622,10 @@ pub fn sys_setgroups<A: crate::uaccess::UaccessArch>(size: i32, list: u64) -> i6
         return KernelError::InvalidArgument.sysret();
     }
     let n = size as usize;
-    let mut bytes = alloc::vec![0u8; n * 4];
+    let mut bytes = match crate::util::kmem::try_vec(n * 4, 0u8) {
+        Ok(b) => b,
+        Err(e) => return e.sysret(),
+    };
     if n > 0 && crate::uaccess::copy_from_user::<A>(&mut bytes, list, n * 4).is_err() {
         return KernelError::BadAddress.sysret();
     }

@@ -343,6 +343,13 @@ CLONE_NEWUSER (Linux checks in the new user namespace, where the caller
 holds every capability), and /proc/<pid>/uid_map and gid_map cannot be
 written.
 
+
+POSIX message queues reject creation by an unprivileged user with
+EACCES (`ipc/mqueue.rs`): hk has no 01777 `/dev/mqueue`, so only root
+creates queues, where Linux lets any user. mq_attr_ok's soft caps
+(msgsize_max 8192, msg_max 10 without CAP_SYS_RESOURCE) are therefore
+unreachable today.
+
 ## sysfs gaps
 
 **Location**: `fs/kernfs/`, `fs/sysfs.rs`, `base/`, `block/genhd.rs`,
@@ -986,23 +993,15 @@ Ranked. P# = the pattern's number in doc/res/hk-linux-cve-patterns.md.
 
 Ranked. Not yet confirmed by a test.
 
-1. **Unprivileged kernel panics by allocation size** (heap objects are
-   at most 4 MiB, MAX_KMALLOC; an infallible allocation that fails
-   panics):
-   - `ipc/mqueue.rs:741,803`: mq_open accepts msgsize up to 16 MiB with
-     no limit check (Linux mq_attr_ok: msg_max/msgsize_max unless
-     CAP_SYS_RESOURCE, RLIMIT_MSGQUEUE), then send/receive allocate
-     `vec![0; msgsize]`.
-   - `net/msg.rs:91` (`gather_at`): AF_UNIX dgram and netlink sends up
-     to sndbuf (8 MiB unprivileged) are gathered into one Vec; also
-     `net/netlink/rtnetlink.rs:170`. Fix: `kmem::try_vec`, ENOBUFS.
-   - `fs/vfat.rs:862`: `extend_cluster_chain` collects every new
-     cluster (ftruncate to 4 GiB with 512-byte clusters: 32 MiB).
-     `sectors_per_cluster` 0 from disk divides by zero at `:166,:806`.
-   - TCP receive/send VecDeques double under `cb` past 4 MiB with
-     large SO_RCVBUF/SO_SNDBUF (`net/tcp/input.rs:547`, `cb.rs:945`).
-   - Bounded but large, ENOMEM on Linux: io_uring rings (2 MiB), keys
-     (1 MiB), `task/id.rs:625` (256 KiB).
+1. **Kernel panics by allocation size** (heap objects are at most
+   4 MiB, MAX_KMALLOC; an infallible allocation that fails panics):
+   - `fs/vfat.rs`: `extend_cluster_chain` collects every new cluster
+     (ftruncate to 4 GiB with 512-byte clusters: 32 MiB); a
+     `sectors_per_cluster` of 0 from disk divides by zero. Mount does
+     not validate the BPB (Linux fat_fill_super).
+   - TCP receive/send VecDeques double under `cb` past 4 MiB with large
+     SO_RCVBUF/SO_SNDBUF (`net/tcp/input.rs`, `net/tcp/cb.rs`): a queue
+     of bounded chunks, as Linux skb queues.
 2. **seccomp cBPF** (`bpf/convert.rs`, `bpf/interp.rs`):
    - jeq/jgt/jge against a constant >= 0x80000000 never match (the
      constant is sign-extended against a zero-extended u32): the

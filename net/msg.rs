@@ -88,7 +88,7 @@ impl Iov {
     /// Copy in up to `max` bytes starting `skip` bytes into the vector
     pub fn gather_at(&self, mut skip: usize, max: usize) -> Result<Vec<u8>, KernelError> {
         let want = self.total.saturating_sub(skip).min(max);
-        let mut out = alloc::vec![0u8; want];
+        let mut out = crate::util::kmem::try_vec(want, 0u8)?;
         let mut off = 0;
         for s in &self.segs {
             if off == want {
