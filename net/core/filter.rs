@@ -1,6 +1,8 @@
 //! Classic BPF socket filters (Linux net/core/filter.c: SO_ATTACH_FILTER)
 //!
-//! A filter is checked once when attached (`bpf::classic::check`). The
+//! A filter is checked once when attached (`bpf::classic::check`),
+//! converted to eBPF and verified (`bpf::convert`, Linux
+//! bpf_migrate_filter), and runs on the eBPF interpreter. The
 //! program sees the packet as the socket will receive it (from the
 //! link-layer header for SOCK_RAW packet sockets, from the network
 //! header for SOCK_DGRAM), plus the SKF_NET_OFF / SKF_LL_OFF negative
@@ -12,8 +14,10 @@
 
 use alloc::vec::Vec;
 
+use crate::bpf::BpfInsn;
 use crate::bpf::classic::{self, SKF_AD_OFF, SKF_LL_OFF, SKF_NET_OFF, ad};
 pub use crate::bpf::classic::{BPF_MAXINSNS, Insn};
+use crate::bpf::convert;
 use crate::util::error::KernelError;
 
 /// What a program may inspect besides the packet bytes
@@ -75,30 +79,24 @@ impl classic::Env for Ctx<'_> {
     }
 }
 
-/// A checked classic BPF program
+/// A socket filter: a checked classic program, converted to eBPF
 #[derive(Debug)]
 pub struct Filter {
-    insns: Vec<Insn>,
+    prog: Vec<BpfInsn>,
 }
 
 impl Filter {
     /// Check a program (Linux bpf_check_basics_ok + bpf_check_classic)
+    /// and convert it (bpf_migrate_filter)
     pub fn new(insns: Vec<Insn>) -> Result<Self, KernelError> {
         classic::check(&insns)?;
-        Ok(Self { insns })
-    }
-
-    pub fn len(&self) -> usize {
-        self.insns.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.insns.is_empty()
+        let prog = convert::convert(&insns, &convert::SOCKET)?;
+        Ok(Self { prog })
     }
 
     /// Run the program: bytes of the packet to keep (0 = drop)
     pub fn run(&self, c: &Ctx) -> u32 {
-        classic::run(&self.insns, c)
+        convert::run(&self.prog, &[], c)
     }
 }
 

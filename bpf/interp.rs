@@ -19,9 +19,6 @@
 //! moves and loads, byte swaps, and the atomic operations on the stack.
 //! No locks: all state is on the caller's stack.
 
-// Run by classic filters once they are converted (bpf/convert.rs)
-#![cfg_attr(not(test), allow(dead_code))]
-
 use super::insn::*;
 
 /// Instructions one run may execute before it is stopped

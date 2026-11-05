@@ -19,9 +19,6 @@
 //!
 //! No locks: pure functions over the caller's data.
 
-// Used by seccomp and socket filters from the next change
-#![cfg_attr(not(test), allow(dead_code))]
-
 use super::classic::{self, Insn, ad};
 use super::insn::*;
 use super::interp;

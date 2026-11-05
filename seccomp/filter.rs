@@ -4,10 +4,12 @@
 //! A filter is a classic BPF program checked twice when installed:
 //! `bpf::classic::check` (Linux bpf_check_classic), then
 //! `check_filter`, which allows only what seccomp_data needs and
-//! rewrites its loads as Linux does. Filters stack: each holds the one
+//! rewrites its loads as Linux does; it is then converted to eBPF and
+//! verified (`bpf::convert`, Linux bpf_migrate_filter) and runs on the
+//! eBPF interpreter with seccomp_data as its context. Filters stack: each holds the one
 //! it was installed on, and a syscall runs all of them, the most
-//! restrictive action winning. The instructions on one path are capped
-//! (MAX_INSNS_PER_PATH, ENOMEM), which also bounds the chain's length;
+//! restrictive action winning. The eBPF instructions on one path are
+//! capped (MAX_INSNS_PER_PATH, ENOMEM, as Linux counts them), which also bounds the chain's length;
 //! a chain is walked and dropped iteratively, never by recursion.
 //!
 //! No locks: a filter is immutable and shared by `Arc` (the task's
@@ -16,7 +18,9 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
+use crate::bpf::BpfInsn;
 use crate::bpf::classic::{self, Insn};
+use crate::bpf::convert;
 use crate::util::error::KernelError;
 
 use super::{SECCOMP_RET_ACTION_FULL, SeccompData};
@@ -25,17 +29,17 @@ use super::{SECCOMP_RET_ACTION_FULL, SeccompData};
 /// MAX_INSNS_PER_PATH: 256 KiB of sock_filter)
 pub const MAX_INSNS_PER_PATH: usize = (1 << 18) / 8;
 
-/// A seccomp filter: a checked classic program and the filter it stacks on
+/// A seccomp filter: a converted program and the filter it stacks on
 #[derive(Debug)]
 pub struct SeccompFilter {
-    insns: Vec<Insn>,
+    prog: Vec<BpfInsn>,
     /// The filter this one was installed on (run after it)
     prev: Option<Arc<SeccompFilter>>,
     /// Whether to log non-ALLOW actions
     log: bool,
 }
 
-/// seccomp_data words for the classic program (LDX_W_ABS)
+/// seccomp_data words (LDX_W_ABS; the classic interpreter's view)
 impl classic::Env for SeccompData {
     fn word(&self, k: u32) -> Option<u32> {
         let b = crate::util::pod::IntoBytes::as_bytes(self);
@@ -117,26 +121,28 @@ impl SeccompFilter {
     ) -> Result<Arc<Self>, KernelError> {
         classic::check(&insns)?;
         check_filter(&mut insns)?;
-        let mut total = insns.len();
+        let prog = convert::convert(&insns, &convert::SECCOMP)?;
+        let mut total = prog.len();
         let mut f = prev.as_ref();
         while let Some(cur) = f {
             // Each stacked filter costs 4 more (Linux's call penalty)
-            total += cur.insns.len() + 4;
+            total += cur.prog.len() + 4;
             f = cur.prev.as_ref();
         }
         if total > MAX_INSNS_PER_PATH {
             return Err(KernelError::OutOfMemory);
         }
-        Ok(Arc::new(Self { insns, prev, log }))
+        Ok(Arc::new(Self { prog, prev, log }))
     }
 
     /// Run this filter and every one it stacks on: the most restrictive
     /// result, the first one found on a tie (Linux seccomp_run_filters)
     pub fn run(&self, data: &SeccompData) -> u32 {
-        let mut ret = classic::run(&self.insns, data);
+        let ctx = crate::util::pod::IntoBytes::as_bytes(data);
+        let mut ret = convert::run(&self.prog, ctx, data);
         let mut f = self.prev.as_deref();
         while let Some(cur) = f {
-            let r = classic::run(&cur.insns, data);
+            let r = convert::run(&cur.prog, ctx, data);
             if action_rank(r) < action_rank(ret) {
                 ret = r;
             }
@@ -408,7 +414,8 @@ mod tests {
         assert_eq!(v(SECCOMP_RET_ALLOW), Verdict::Allow);
     }
 
-    /// 4096-instruction filters stack 7 deep (MAX_INSNS_PER_PATH)
+    /// 4096-instruction filters (4100 converted) stack 7 deep
+    /// (MAX_INSNS_PER_PATH)
     #[test]
     fn path_limit() {
         let mut p = alloc::vec![stmt(LD | IMM, 0); BPF_MAXINSNS];
@@ -430,7 +437,7 @@ mod tests {
         let mut f = None;
         for _ in 0..500_000 {
             f = Some(Arc::new(SeccompFilter {
-                insns: Vec::new(),
+                prog: Vec::new(),
                 prev: f,
                 log: false,
             }));
