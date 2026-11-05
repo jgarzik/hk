@@ -12,6 +12,10 @@ infallible, so each one is investigated, not written off.
   uncached x86 `check-linux` runs and in hk x86 boots, one CPU
   (`QEMU_SMP=1`) included; passes on rerun. Cause unknown: the test
   waits for the listener (`wait_listen`) and retries the client.
+- **NICE_ADJACENT flaky on the arm64 Linux reference**: one emulated
+  `check-linux-arm` run had two adjacent-nice spinners' CPU share off
+  (`share a:b tenths got 26`); passed on the uncached rerun. Likely
+  TCG timing noise in a ratio test; widen the tolerance if it recurs.
 - **SWAPOUT_PAGEOUT flaky on the Linux reference** (J): one x86
   `check-linux` run had free swap 364 kB off the expected value after
   MADV_PAGEOUT of 16 MiB (beyond the test's tolerance), passing on the
@@ -896,37 +900,34 @@ Tag = roadmap phase (doc/ROADMAP.md).
 2. **arm64 /reserved-memory no-map regions are linear-mapped** (D;
    real HW). `arch/aarch64/dtb.rs:192`: Linux memblock_mark_nomap
    removes them (speculative access to secure carve-outs).
-3. **Remote write gives up after 16 COW tries** (C, with FOLL_FORCE).
-   `mm/remote.rs:176`: spurious EFAULT; break COW and write under one
-   PTE-lock hold, or loop until fatal_signal_pending.
-4. **memblock holds at most 128 ranges** (J). `mm/memblock.rs:18`: a
+3. **memblock holds at most 128 ranges** (J). `mm/memblock.rs:18`: a
    firmware map with more RAM or reserved ranges panics at boot
    (asserts in add/remove/reserve); Linux grows the array
    (memblock_double_array).
-5. **LRU batch refs defeat exclusivity checks** (J). `mm/fault.rs:504`
+4. **LRU batch refs defeat exclusivity checks** (J). `mm/fault.rs:504`
    / `:596`: refcount==1 tests fail while a page sits in the per-CPU
    add batch, so swap-in makes needless COW copies. Linux drains and
    rechecks (wp_can_reuse_anon_folio).
-6. **alloc_slot linear scan under SwapInfo.map; two Vecs + sort per
+5. **alloc_slot linear scan under SwapInfo.map; two Vecs + sort per
    reclaimed page** (J). `mm/swap.rs:206`: cluster/free-hint
    allocator, cached sorted device list.
-7. **One AnonVma per fork family, Vec chain** (J).
+6. **One AnonVma per fork family, Vec chain** (J).
    `mm/anon_vma.rs:85`: O(N×VMAs) under one family write lock.
-8. **Syscalls report root-namespace pids** (C). Tasks get a number in
+7. **Syscalls report root-namespace pids** (C). Tasks get a number in
    every level of their pid namespace chain (`task/pid.rs`), but
    getpid/gettid/kill/wait//proc use the root number; a CLONE_NEWPID
    child is not pid 1 in its namespace. Use `Pid::nr_in(caller's ns)`
    at the syscall boundary.
-9. **MM_LIFE_EXEC_CHAIN flake** (arm64 CI, TCG, NIC=e1000):
+8. **MM_LIFE_EXEC_CHAIN flake** (arm64 CI, TCG, NIC=e1000):
    `MM_LIFE_EXEC_CHAIN:FAIL -2`, a measured chain's child (busybox
    `env` x40 then `true`: 41 execs in one process) exited nonzero: a
    failed exec, not a leak. MM_LIFE prints the child's wait status;
    investigate when it repeats.
-10. **SOCKCORE_CONNECT_REFUSED flake** (cause unknown):
+9. **SOCKCORE_CONNECT_REFUSED flake** (cause unknown):
    `SOCKCORE_CONNECT_REFUSED:FAIL SO_ERROR got 0` (hk arm64,
    `check-stress`): poll reported POLLOUT for a nonblocking connect to
    a just-closed loopback port, but no ECONNREFUSED was pending.
-11. **TCP_PROC_NET flake** (cause unknown): one end of a fresh,
+10. **TCP_PROC_NET flake** (cause unknown): one end of a fresh,
    accepted loopback connection is missing from /proc/net/tcp as state
    01 (`client line got 0`, `server line got 0`; hk arm64, CI and
    `check-stress`). Not a torn read: the file comes in one

@@ -12,6 +12,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt::Write;
 
+use crate::fs::KernelError;
 use crate::mm::{Mm, MmLayout, MmStruct, PROT_EXEC, PROT_WRITE, VM_GROWSDOWN, VM_SHARED};
 use crate::task::percpu::TASKLIST;
 use crate::task::{Cred, Pid, TaskKind, TaskState, Tid};
@@ -451,15 +452,15 @@ pub fn gen_stat(pid: Pid) -> Vec<u8> {
     o.0
 }
 
-/// Read [start, end) of `mm` (Linux access_remote_vm), mmap_lock held;
-/// what could be read, at most ARGS_MAX bytes
-fn read_remote(mm: &Mm, m: &MmStruct, start: u64, end: u64) -> Vec<u8> {
+/// Read [start, end) of `mm` (Linux access_remote_vm, FOLL_FORCE), the
+/// mmap_lock not held; what could be read, at most ARGS_MAX bytes
+fn read_remote(mm: &Mm, start: u64, end: u64) -> Vec<u8> {
     let len = end.saturating_sub(start).min(ARGS_MAX) as usize;
     let mut buf = match crate::util::kmem::try_vec(len, 0u8) {
         Ok(b) => b,
         Err(_) => return Vec::new(),
     };
-    let n = crate::mm::remote::access_remote_vm_read(mm, m, start, &mut buf).unwrap_or(0);
+    let n = crate::mm::remote::access_remote_vm_read(mm, start, &mut buf, true).unwrap_or(0);
     buf.truncate(n);
     buf
 }
@@ -474,14 +475,14 @@ pub fn gen_cmdline(pid: Pid) -> Vec<u8> {
     let Some(mm) = crate::mm::get_task_mm_users(tid) else {
         return Vec::new();
     };
-    let Ok(m) = mm.mmap_read_killable() else {
-        return Vec::new();
+    let a = match mm.mmap_read_killable() {
+        Ok(m) => m.args(),
+        Err(_) => return Vec::new(),
     };
-    let a = m.args();
     if a.arg_start >= a.arg_end {
         return Vec::new();
     }
-    let args = read_remote(&mm, &m, a.arg_start, a.arg_end);
+    let args = read_remote(&mm, a.arg_start, a.arg_end);
     if args.last().is_none_or(|&c| c == 0) {
         return args;
     }
@@ -491,7 +492,7 @@ pub fn gen_cmdline(pid: Pid) -> Vec<u8> {
     } else {
         a.arg_end
     };
-    let mut all = read_remote(&mm, &m, a.arg_start, end);
+    let mut all = read_remote(&mm, a.arg_start, end);
     if let Some(nul) = all.iter().position(|&c| c == 0) {
         all.truncate(nul + 1);
     }
@@ -500,10 +501,10 @@ pub fn gen_cmdline(pid: Pid) -> Vec<u8> {
 
 /// /proc/<pid>/environ (Linux environ_read): the environment strings of
 /// the address space pinned at open, which checked ptrace-read access
-pub fn gen_environ(mm: &Mm, m: &MmStruct) -> Vec<u8> {
-    let a = m.args();
+pub fn gen_environ(mm: &Mm) -> Result<Vec<u8>, KernelError> {
+    let a = mm.mmap_read_killable()?.args();
     if a.env_end == 0 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
-    read_remote(mm, m, a.env_start, a.env_end)
+    Ok(read_remote(mm, a.env_start, a.env_end))
 }

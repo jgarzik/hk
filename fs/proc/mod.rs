@@ -959,7 +959,7 @@ pub enum PidGen {
     /// Private content of the address space: open needs ptrace-read
     /// access and pins the mm it reads from (Linux proc_mem_open: an
     /// mm_count reference)
-    Mm(fn(&crate::mm::Mm, &crate::mm::MmStruct) -> Vec<u8>),
+    Mm(fn(&crate::mm::Mm) -> Result<Vec<u8>, KernelError>),
 }
 
 /// The address space a /proc/<pid>/ file reads, if the caller may
@@ -1005,9 +1005,9 @@ fn pid_content(file: Option<&File>, pid: Pid, g: PidGen) -> Result<Vec<u8>, Kern
             let Some(m) = users else {
                 return Ok(Vec::new());
             };
-            let g = m.mmap_read_killable()?;
-            let out = f(&m, &g);
-            Ok(out)
+            // The generator takes the mmap_lock itself, for as long as it
+            // needs (a remote read faults with it released)
+            f(&m)
         }
     }
 }
@@ -1110,7 +1110,13 @@ fn exe_link(pid: Pid) -> Result<Vec<u8>, KernelError> {
 }
 
 /// /proc/<pid>/maps: one line per VMA (Linux show_map_vma)
-fn gen_maps(_: &crate::mm::Mm, mm: &crate::mm::MmStruct) -> Vec<u8> {
+fn gen_maps(m: &crate::mm::Mm) -> Result<Vec<u8>, KernelError> {
+    let g = m.mmap_read_killable()?;
+    Ok(maps_of(&g))
+}
+
+/// /proc/<pid>/maps of `mm`, its mmap_lock held
+fn maps_of(mm: &crate::mm::MmStruct) -> Vec<u8> {
     use crate::mm::{PROT_EXEC, PROT_READ, PROT_WRITE, VM_GROWSDOWN, VM_SHARED};
     use alloc::fmt::Write;
     let mut out = Vec::new();

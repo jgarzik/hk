@@ -1215,9 +1215,11 @@ pub struct Zone {
   first takes it for writing, grows, and the fault starts over), so a
   fault cannot race fork's copy, munmap, mprotect or mremap of its
   range, which hold it for writing. Faults, MADV_DONTNEED/FREE/REMOVE
-  and remote access (ptrace PEEK/POKE, process_vm_*) hold it for
-  reading and may run at once: they change entries under the
-  page-table locks (Page-table locks below). Under the mm lock:
+  and remote access (ptrace PEEK/POKE, process_vm_*, /proc cmdline and
+  environ) hold it for reading and may run at once: they change entries
+  under the page-table locks (Page-table locks below). Remote access
+  takes it per page (`mm::remote`) and drops it to fault an absent page
+  in (`handle_mm_fault` takes it itself), as Linux GUP retries. Under the mm lock:
   page-table and page allocation (`FRAME_ALLOCATOR`), a shared object's
   `Shmem.root`, rmap/LRU, and the reads that may sleep (a file page:
   `pread` or the page cache for a ramfs page; a swap slot), as in Linux
