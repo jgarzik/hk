@@ -28,7 +28,7 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use spin::Lazy;
 
 use crate::task::Pid;
@@ -341,9 +341,6 @@ pub struct CgroupSubsysState {
     /// Parent CSS (for resource inheritance)
     parent: Option<Weak<CgroupSubsysState>>,
 
-    /// Reference count (tasks using this CSS)
-    refcount: AtomicU32,
-
     /// Controller-specific private data
     private: RwLock<Option<Arc<dyn CssPrivate>>>,
 }
@@ -361,7 +358,6 @@ impl CgroupSubsysState {
             controller,
             id,
             parent: parent_css.map(Arc::downgrade),
-            refcount: AtomicU32::new(1),
             private: RwLock::new(None),
         })
     }
@@ -374,21 +370,6 @@ impl CgroupSubsysState {
     /// Get parent CSS
     pub fn parent(&self) -> Option<Arc<CgroupSubsysState>> {
         self.parent.as_ref().and_then(Weak::upgrade)
-    }
-
-    /// Increment reference count
-    pub fn get(&self) {
-        self.refcount.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Decrement reference count
-    pub fn put(&self) {
-        self.refcount.fetch_sub(1, Ordering::Relaxed);
-    }
-
-    /// Get reference count
-    pub fn refcount(&self) -> u32 {
-        self.refcount.load(Ordering::Relaxed)
     }
 
     /// Set controller-specific private data
@@ -414,9 +395,6 @@ impl CgroupSubsysState {
 /// This reduces memory overhead when many tasks are in identical cgroup
 /// configurations (common case: all tasks in root cgroups).
 pub struct CssSet {
-    /// Reference count (tasks using this set)
-    refcount: AtomicU32,
-
     /// Hash of CSS pointers (for fast CssSet lookup)
     hash: u64,
 
@@ -435,7 +413,6 @@ impl CssSet {
     ) -> Arc<Self> {
         let hash = Self::compute_hash(&css_map);
         Arc::new(Self {
-            refcount: AtomicU32::new(1),
             hash,
             subsys: RwLock::new(css_map),
             default_cgroup: Arc::downgrade(default),
@@ -465,16 +442,6 @@ impl CssSet {
         }
     }
 
-    /// Get reference count
-    pub fn get(&self) {
-        self.refcount.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Decrement reference count
-    pub fn put(&self) {
-        self.refcount.fetch_sub(1, Ordering::Relaxed);
-    }
-
     /// Get hash
     pub fn hash(&self) -> u64 {
         self.hash
@@ -497,7 +464,6 @@ pub fn find_css_set(
     if let Some(weak) = cache.get(&hash)
         && let Some(css_set) = weak.upgrade()
     {
-        css_set.get();
         return css_set;
     }
 
@@ -524,8 +490,6 @@ pub struct CgroupRoot {
     /// Next inode number for cgroupfs
     next_ino: AtomicU64,
 
-    /// Mount count (for reference tracking)
-    mount_count: AtomicU32,
 }
 
 impl Default for CgroupRoot {
@@ -542,7 +506,6 @@ impl CgroupRoot {
             controllers: RwLock::new(BTreeMap::new()),
             next_cg_id: AtomicU64::new(1),
             next_ino: AtomicU64::new(1),
-            mount_count: AtomicU32::new(0),
         }
     }
 
@@ -588,20 +551,6 @@ impl CgroupRoot {
         self.controllers.read().keys().cloned().collect()
     }
 
-    /// Increment mount count
-    pub fn mount(&self) {
-        self.mount_count.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Decrement mount count
-    pub fn umount(&self) {
-        self.mount_count.fetch_sub(1, Ordering::Relaxed);
-    }
-
-    /// Check if mounted
-    pub fn is_mounted(&self) -> bool {
-        self.mount_count.load(Ordering::Relaxed) > 0
-    }
 }
 
 /// Global unified cgroup hierarchy root

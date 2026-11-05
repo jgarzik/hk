@@ -791,9 +791,6 @@ fn cgroupfs_mount(
     // Set root in superblock
     sb.set_root(root_dentry);
 
-    // Mark as mounted
-    CGROUP_ROOT.mount();
-
     Ok(sb)
 }
 

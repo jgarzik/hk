@@ -41,7 +41,6 @@
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::AtomicU32;
 
 use crate::arch::{IrqSpinlock, Uaccess};
 use crate::fs::KernelError;
@@ -288,31 +287,6 @@ pub struct IoUringCqe {
     pub user_data: u64, // from corresponding SQE
     pub res: i32,       // result code
     pub flags: u32,     // completion flags
-}
-
-/// Ring memory layout for SQ (used when mmap support is implemented)
-#[repr(C)]
-#[allow(dead_code)] // Used for mmap in future phases
-struct SqRing {
-    head: AtomicU32,
-    tail: AtomicU32,
-    ring_mask: u32,
-    ring_entries: u32,
-    flags: AtomicU32,
-    dropped: AtomicU32,
-    // array follows (u32 indices into SQE array)
-}
-
-/// Ring memory layout for CQ (used when mmap support is implemented)
-#[repr(C)]
-#[allow(dead_code)] // Used for mmap in future phases
-struct CqRing {
-    head: AtomicU32,
-    tail: AtomicU32,
-    ring_mask: u32,
-    ring_entries: u32,
-    overflow: AtomicU32,
-    // CQEs follow
 }
 
 // ============================================================================
