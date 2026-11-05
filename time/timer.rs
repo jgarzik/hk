@@ -52,7 +52,8 @@ pub struct TimerList {
     link: Link,
     /// Expiry in jiffies (under the base lock)
     expires: AtomicU64,
-    /// Not before this CLOCK_MONOTONIC ns (0: no bound; `mod_timer_ns`)
+    /// Not before this CLOCK_MONOTONIC ns (0: no bound; `mod_timer_ns`);
+    /// set with the expiry under the base lock, read there by `run`
     not_before: AtomicU64,
     func: TimerFn,
     /// The callback's data (an owner pointer)
@@ -127,8 +128,7 @@ impl TimerList {
     /// (Re)arm to fire at jiffy `expires` (Linux mod_timer); true if it
     /// was pending
     pub fn mod_timer(self: Pin<&Self>, expires: u64) -> bool {
-        self.not_before.store(0, Ordering::Relaxed);
-        self.arm(expires)
+        self.arm(expires, 0)
     }
 
     /// (Re)arm to fire once CLOCK_MONOTONIC reaches `deadline_ns`, at
@@ -136,15 +136,19 @@ impl TimerList {
     pub fn mod_timer_ns(self: Pin<&Self>, deadline_ns: u64) {
         let now = crate::time::monotonic_ns();
         let ticks = deadline_ns.saturating_sub(now).div_ceil(TICK_NS);
-        self.not_before.store(deadline_ns.max(1), Ordering::Relaxed);
         // The current jiffy is partly over: one more never fires early
-        self.arm(get_ticks().saturating_add(ticks).saturating_add(1));
+        let expires = get_ticks().saturating_add(ticks).saturating_add(1);
+        self.arm(expires, deadline_ns.max(1));
     }
 
-    fn arm(self: Pin<&Self>, expires: u64) -> bool {
+    /// Expiry and lower bound change together under the base lock, so
+    /// a `run` racing a re-arm sees one arm's pair, never a mix (a
+    /// jiffy-armed timer firing early on a stale bound, or the reverse)
+    fn arm(self: Pin<&Self>, expires: u64, not_before: u64) -> bool {
         let base = self.home();
         let mut w = base.wheel.lock();
         let was = w.detach(&self);
+        self.not_before.store(not_before, Ordering::Relaxed);
         w.insert(&self, expires);
         was
     }

@@ -879,8 +879,7 @@ index IDAs.
   torn IPC_STAT snapshots, adjtimex ADJ_SETOFFSET lost offsets, TCP
   shutdown bits outside `cb`, `TcpSock.connecting` beside the state.
 - Low: remount RDONLY set before the writer check (spurious EROFS),
-  GroupCputimer started by gettime, TimerList.not_before outside the
-  wheel lock, PacketSock bind read-then-store, Zone watermarks stored
+  PacketSock bind read-then-store, Zone watermarks stored
   apart from zone.lock, filemap mkclean load+store losing A/D bits,
   cgroup controllers' check-then-act counters, Disk open counters
   outside open_mutex.
