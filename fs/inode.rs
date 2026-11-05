@@ -763,17 +763,17 @@ impl Inode {
     pub fn newsize_ok(&self, size: u64) -> Result<(), KernelError> {
         use crate::task::rlimit::{RLIM_INFINITY, RLIMIT_FSIZE, rlimit};
         if size > self.get_size() {
-            // Past the filesystem's largest file (s_maxbytes): EFBIG,
-            // with no signal
-            if size > self.maxbytes() {
-                return Err(KernelError::FileTooLarge);
-            }
+            // RLIMIT_FSIZE first (SIGXFSZ), then the filesystem's largest
+            // file (EFBIG, no signal), in Linux inode_newsize_ok's order
             let limit = rlimit(RLIMIT_FSIZE);
             if limit != RLIM_INFINITY && size > limit {
                 crate::signal::send_signal(
                     crate::task::percpu::current_tid(),
                     crate::signal::SIGXFSZ,
                 );
+                return Err(KernelError::FileTooLarge);
+            }
+            if size > self.maxbytes() {
                 return Err(KernelError::FileTooLarge);
             }
         } else if self.i_swapfile.load(Ordering::Acquire) {

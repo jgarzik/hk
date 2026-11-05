@@ -184,6 +184,23 @@ fn test_write_limits(prefix: &[u8], fs_name: &[u8]) {
         if st & 0x7f != SIGXFSZ {
             return 10 + ((st >> 8) & 0xff) as i64;
         }
+        // Growing past both RLIMIT_FSIZE and s_maxbytes: the rlimit is
+        // checked first, so SIGXFSZ (Linux inode_newsize_ok)
+        let pid = hk_syscall::sys_fork();
+        if pid == 0 {
+            let lim = hk_syscall::RLimit {
+                rlim_cur: 100,
+                rlim_max: 100,
+            };
+            hk_syscall::sys_setrlimit(1, &lim);
+            sys_ftruncate(fd as i32, 1 << 33);
+            hk_syscall::sys_exit(7);
+        }
+        let mut st = 0i32;
+        hk_syscall::sys_wait4(pid, &mut st, 0, 0);
+        if st & 0x7f != SIGXFSZ {
+            return 30 + ((st >> 8) & 0xff) as i64;
+        }
         0
     })();
     if fd >= 0 {
