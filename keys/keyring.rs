@@ -88,7 +88,7 @@ pub fn create_keyring(description: &str, uid: u32, gid: u32) -> Arc<Key> {
         KEYRING_DEFAULT_PERM,
     );
     // Mark as instantiated since keyrings don't need payload
-    key.set_payload(alloc::vec![]);
+    let _ = key.instantiate(alloc::vec![]);
     register_key(key.clone());
     key
 }

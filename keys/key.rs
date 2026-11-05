@@ -191,12 +191,34 @@ impl Key {
         })
     }
 
-    /// Set the key's payload and mark it as instantiated
-    pub fn set_payload(&self, data: Vec<u8>) {
+    /// Give an uninstantiated key its payload (Linux
+    /// __key_instantiate_and_link): under the payload lock (key->sem),
+    /// and only from Uninstantiated (EBUSY otherwise), so a revoked or
+    /// invalidated key is never brought back
+    pub fn instantiate(&self, data: Vec<u8>) -> Result<(), KernelError> {
         let mut payload = self.payload.write();
+        if self.state() != KeyState::Uninstantiated {
+            return Err(KernelError::Busy);
+        }
         *payload = Some(data);
         self.state
             .store(KeyState::Instantiated as u32, Ordering::Release);
+        Ok(())
+    }
+
+    /// Replace the payload (Linux key_update under key->sem): a key
+    /// revoked or invalidated meanwhile is refused under the same lock
+    /// (EKEYREVOKED), never revived
+    pub fn update(&self, data: Vec<u8>) -> Result<(), KernelError> {
+        let mut payload = self.payload.write();
+        match self.state() {
+            KeyState::Revoked | KeyState::Dead => return Err(KernelError::KeyRevoked),
+            _ => {}
+        }
+        *payload = Some(data);
+        self.state
+            .store(KeyState::Instantiated as u32, Ordering::Release);
+        Ok(())
     }
 
     /// Read the key's payload
@@ -229,14 +251,20 @@ impl Key {
         self.state() == KeyState::Dead
     }
 
-    /// Revoke the key
+    /// Revoke the key (Linux key_revoke, under key->sem): an
+    /// invalidated key stays dead
     pub fn revoke(&self) {
-        self.state
-            .store(KeyState::Revoked as u32, Ordering::Release);
+        let _sem = self.payload.write();
+        if self.state() != KeyState::Dead {
+            self.state
+                .store(KeyState::Revoked as u32, Ordering::Release);
+        }
     }
 
-    /// Invalidate the key (mark as dead)
+    /// Invalidate the key (mark as dead; Linux key_invalidate, under
+    /// key->sem)
     pub fn invalidate(&self) {
+        let _sem = self.payload.write();
         self.state.store(KeyState::Dead as u32, Ordering::Release);
     }
 

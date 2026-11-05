@@ -29,6 +29,9 @@
 //!   leaves no child behind to wait for (Linux copy_process checks
 //!   these before the child exists); the second is EINVAL even for an
 //!   unprivileged caller.
+//! - KEY_REVOKE_UPDATE: an update after a revoke is EKEYREVOKED, and a
+//!   thread updating in a loop while the key is revoked never revives
+//!   it (Linux: key_update and key_revoke under key->sem).
 
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
@@ -54,6 +57,7 @@ pub fn run_tests() {
     report(b"IPC_CAPS", ipc_caps());
     report(b"KEYS_NO_ROOT_BYPASS", in_child(keys_no_root_bypass));
     report(b"CLONE3_ERROR_NO_LEAK", in_child(clone3_error_no_leak));
+    report(b"KEY_REVOKE_UPDATE", in_child_with(key_revoke_update));
 }
 
 fn report(name: &[u8], step: u64) {
@@ -519,6 +523,69 @@ fn clone3_error_no_leak() -> u64 {
         sys_exit(0);
     }
     if r != -22 {
+        return 6;
+    }
+    0
+}
+
+const KEYCTL_UPDATE: i32 = 2;
+const KEYCTL_REVOKE: i32 = 3;
+const EKEYREVOKED: i64 = -128;
+
+#[repr(C, align(16))]
+struct KStack([u8; 16384]);
+static mut KSTACK: KStack = KStack([0; 16384]);
+static mut KCTID: u32 = 0;
+static mut KSERIAL: i64 = 0;
+
+/// Update the key over and over (its errors are expected once revoked)
+extern "C" fn updater(_: u64) -> ! {
+    // SAFETY: KSERIAL is set before this thread exists
+    let k = unsafe { KSERIAL };
+    let p = b"v";
+    for _ in 0..2000 {
+        keyctl(KEYCTL_UPDATE, k as u64, p.as_ptr() as u64, 1);
+    }
+    hk_syscall::sys_exit(0)
+}
+
+/// In a child (its own process keyring)
+fn key_revoke_update() -> u64 {
+    let k = add_key(b"revoke1\0");
+    if k <= 0 {
+        return 1;
+    }
+    keyctl(KEYCTL_REVOKE, k as u64, 0, 0);
+    let p = b"v";
+    if keyctl(KEYCTL_UPDATE, k as u64, p.as_ptr() as u64, 1) != EKEYREVOKED {
+        return 2;
+    }
+    let mut buf = [0u8; 16];
+    if keyctl(KEYCTL_READ, k as u64, buf.as_mut_ptr() as u64, 16) != EKEYREVOKED {
+        return 3;
+    }
+    // A revoke racing a stream of updates
+    let k2 = add_key(b"revoke2\0");
+    if k2 <= 0 {
+        return 4;
+    }
+    // SAFETY: set before the thread exists; the thread runs on its own
+    // static stack and its tid word is CTID
+    let t = unsafe {
+        KSERIAL = k2;
+        let top = (&raw mut KSTACK as *mut u8).add(16384) as u64;
+        super::fork_mm::spawn_thread(top, updater, 0, &raw mut KCTID)
+    };
+    if t <= 0 {
+        return 5;
+    }
+    keyctl(KEYCTL_REVOKE, k2 as u64, 0, 0);
+    // Wait for the updater (CLONE_CHILD_CLEARTID clears KCTID)
+    // SAFETY: KCTID is the thread's clear-child-tid word
+    while unsafe { core::ptr::read_volatile(&raw const KCTID) } != 0 {
+        hk_syscall::sys_sched_yield();
+    }
+    if keyctl(KEYCTL_READ, k2 as u64, buf.as_mut_ptr() as u64, 16) != EKEYREVOKED {
         return 6;
     }
     0
