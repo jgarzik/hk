@@ -13,7 +13,6 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt::Write;
-use core::sync::atomic::Ordering;
 
 use spin::Once;
 
@@ -278,11 +277,6 @@ fn drop_bdevs(disk: &Arc<Disk>, from: u16) {
     }
 }
 
-/// A partition is open: a file, a mounted filesystem or active swap
-/// (each opens the device, as in Linux)
-fn parts_held(disk: &Arc<Disk>) -> bool {
-    disk.open_partitions.load(Ordering::Relaxed) != 0
-}
 
 /// BLKRRPART: re-read the partition table (Linux disk_scan_partitions):
 /// EINVAL on a partition or a disk without partitions, EBUSY while a
@@ -292,8 +286,10 @@ pub fn rescan(bdev: &BlockDevice) -> Result<(), KernelError> {
     if bdev.partno != 0 || disk.minors <= 1 {
         return Err(KernelError::InvalidArgument);
     }
-    let _g = disk.open_mutex.lock();
-    if parts_held(disk) {
+    let st = disk.open_mutex.lock();
+    // A partition is open: a file, a mounted filesystem or active swap
+    // (each opens the device, as in Linux)
+    if st.open_partitions != 0 {
         return Err(KernelError::Busy);
     }
     drop_bdevs(disk, 1);

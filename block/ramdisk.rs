@@ -116,6 +116,7 @@ fn create(minor: u16, bytes: u64, data: &[u8]) -> Result<Arc<BlockDevice>, Kerne
         format!("rd{}", minor),
         bytes >> SECTOR_SHIFT,
         q,
+        false,
     );
     add_disk(disk, None)
 }

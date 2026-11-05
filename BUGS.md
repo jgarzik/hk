@@ -879,8 +879,7 @@ index IDAs.
   torn IPC_STAT snapshots, adjtimex ADJ_SETOFFSET lost offsets, TCP
   shutdown bits outside `cb`, `TcpSock.connecting` beside the state.
 - Low: remount RDONLY set before the writer check (spurious EROFS),
-  cgroup controllers' check-then-act counters, Disk open counters
-  outside open_mutex.
+  cgroup controllers' check-then-act counters.
 - doc/LOCKING.md 5.4 cites Inode mode/uid/gid, MsgQueue and
   SemArray.pending as correct atomic use; they are among the above.
 

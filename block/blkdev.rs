@@ -358,6 +358,14 @@ impl RequestQueue {
 // Disks and block devices
 // ============================================================================
 
+/// What a disk's `open_mutex` guards beyond serializing opens,
+/// releases and rescans
+#[derive(Default)]
+pub(super) struct OpenState {
+    /// Partitions currently open (Linux open_partitions)
+    pub(super) open_partitions: u32,
+}
+
 /// A disk (Linux struct gendisk)
 /// Next disk sequence number (Linux diskseq: an atomic64 counter; only
 /// uniqueness matters)
@@ -369,14 +377,15 @@ pub struct Disk {
     /// Minors reserved: 1 + the most partitions (1 = no partitions)
     pub minors: u16,
     pub name: String,
-    capacity: AtomicU64,
-    ro: AtomicBool,
+    /// Size in sectors, fixed at creation (no resize yet)
+    capacity: u64,
+    /// Write-protected, fixed before the disk is added
+    ro: bool,
     pub queue: RequestQueue,
     pub bdi: Arc<BdiWriteback>,
-    /// Partitions currently open (Linux open_partitions)
-    pub(super) open_partitions: AtomicU32,
-    /// Opens, releases and rescans (Linux open_mutex)
-    pub(super) open_mutex: crate::sync::Mutex<()>,
+    /// Opens, releases and rescans (Linux open_mutex), and the state
+    /// they share
+    pub(super) open_mutex: crate::sync::Mutex<OpenState>,
     /// Sequence number, unique for the boot, set at allocation (Linux
     /// diskseq)
     pub seq: u64,
@@ -393,6 +402,7 @@ impl Disk {
         name: String,
         capacity: u64,
         queue: RequestQueue,
+        ro: bool,
     ) -> Arc<Self> {
         let bdi = bdi_register(DevId::new(major, first_minor));
         Arc::new(Self {
@@ -400,12 +410,11 @@ impl Disk {
             first_minor,
             minors,
             name,
-            capacity: AtomicU64::new(capacity),
-            ro: AtomicBool::new(false),
+            capacity,
+            ro,
             queue,
             bdi,
-            open_partitions: AtomicU32::new(0),
-            open_mutex: crate::sync::Mutex::new(()),
+            open_mutex: crate::sync::Mutex::new(OpenState::default()),
             seq: DISKSEQ.fetch_add(1, Ordering::Relaxed),
             private: spin::Once::new(),
         })
@@ -413,15 +422,11 @@ impl Disk {
 
     /// Capacity in sectors
     pub fn capacity(&self) -> u64 {
-        self.capacity.load(Ordering::Relaxed)
-    }
-
-    pub fn set_ro(&self, ro: bool) {
-        self.ro.store(ro, Ordering::Relaxed);
+        self.capacity
     }
 
     pub fn ro(&self) -> bool {
-        self.ro.load(Ordering::Relaxed)
+        self.ro
     }
 
     pub fn devt(&self) -> DevId {
@@ -436,12 +441,15 @@ pub struct BlockDevice {
     pub partno: u16,
     /// First sector on the disk
     pub start: u64,
-    nr_sects: AtomicU64,
+    /// Size in sectors, fixed at creation
+    nr_sects: u64,
     pub dev: DevId,
     pub name: String,
-    /// Open files (Linux bd_openers)
+    /// Open files (Linux bd_openers): changed only under the disk's
+    /// `open_mutex`, an atomic because it lives here, as in Linux
     openers: AtomicU32,
-    /// Soft block size (Linux i_blkbits of the bdev inode, BLKBSZGET)
+    /// Soft block size (Linux i_blkbits of the bdev inode, BLKBSZGET):
+    /// set under the disk's `open_mutex`, read lock-free
     bsize: AtomicU32,
     /// Removed (hot unplug or partition rescan): I/O fails
     dead: AtomicBool,
@@ -461,7 +469,7 @@ impl BlockDevice {
             disk,
             partno,
             start,
-            nr_sects: AtomicU64::new(nr_sects),
+            nr_sects,
             dev,
             name,
             openers: AtomicU32::new(0),
@@ -474,7 +482,7 @@ impl BlockDevice {
 
     /// Size in sectors
     pub fn nr_sects(&self) -> u64 {
-        self.nr_sects.load(Ordering::Relaxed)
+        self.nr_sects
     }
 
     /// Size in bytes
@@ -503,12 +511,14 @@ impl BlockDevice {
     }
 
     /// BLKBSZSET (Linux set_blocksize): a power of two from the logical
-    /// block size to BLK_MAX_BLOCK_SIZE
+    /// block size to BLK_MAX_BLOCK_SIZE; under `open_mutex`, so it never
+    /// interleaves with the first open setting the initial size
     pub fn set_block_size(&self, size: i32) -> Result<(), KernelError> {
         let lbs = self.logical_block_size() as i32;
         if !(lbs..=BLK_MAX_BLOCK_SIZE).contains(&size) || !(size as u32).is_power_of_two() {
             return Err(KernelError::InvalidArgument);
         }
+        let _g = self.disk.open_mutex.lock();
         self.bsize.store(size as u32, Ordering::Relaxed);
         Ok(())
     }
@@ -534,7 +544,7 @@ impl BlockDevice {
 
     /// A file opened the device (Linux blkdev_get_whole/_part)
     pub fn open(&self) -> Result<(), KernelError> {
-        let _g = self.disk.open_mutex.lock();
+        let mut st = self.disk.open_mutex.lock();
         // Checked under open_mutex: a rescan or removal that replaced
         // this device (it holds the mutex) is seen, so an open never
         // binds to a removed partition
@@ -544,7 +554,7 @@ impl BlockDevice {
         if self.openers.fetch_add(1, Ordering::Relaxed) == 0 {
             self.init_block_size();
             if self.partno != 0 {
-                self.disk.open_partitions.fetch_add(1, Ordering::Relaxed);
+                st.open_partitions += 1;
             }
         }
         Ok(())
@@ -563,12 +573,12 @@ impl BlockDevice {
     /// blkdev_flush_mapping: sync_blockdev + kill_bdev), under
     /// open_mutex, so the next opener reads the disk
     pub fn release(&self) {
-        let _g = self.disk.open_mutex.lock();
+        let mut st = self.disk.open_mutex.lock();
         if self.openers.fetch_sub(1, Ordering::Relaxed) == 1 {
             let _ = sync_blockdev(self);
             crate::mm::filemap::invalidate(&self.bd_inode);
             if self.partno != 0 {
-                self.disk.open_partitions.fetch_sub(1, Ordering::Relaxed);
+                st.open_partitions -= 1;
             }
         }
     }
