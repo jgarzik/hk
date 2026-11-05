@@ -12,7 +12,6 @@
 
 use alloc::sync::Arc;
 use core::cmp::Ordering;
-use core::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use crate::task::Task;
 use crate::task::percpu::{TASKLIST, task_ref};
@@ -38,43 +37,25 @@ pub const KCMP_EPOLL_TFD: i32 = 7;
 /// Number of comparison types
 pub const KCMP_TYPES: i32 = 8;
 
-// Obfuscation cookies for pointer comparison (like Linux)
-// Two cookies per type: XOR value and multiplier
-static COOKIES: [[AtomicU64; 2]; KCMP_TYPES as usize] = [
-    [AtomicU64::new(0), AtomicU64::new(0)],
-    [AtomicU64::new(0), AtomicU64::new(0)],
-    [AtomicU64::new(0), AtomicU64::new(0)],
-    [AtomicU64::new(0), AtomicU64::new(0)],
-    [AtomicU64::new(0), AtomicU64::new(0)],
-    [AtomicU64::new(0), AtomicU64::new(0)],
-    [AtomicU64::new(0), AtomicU64::new(0)],
-    [AtomicU64::new(0), AtomicU64::new(0)],
-];
+/// Obfuscation cookies for pointer comparison (Linux kcmp_cookies): an
+/// XOR value and an odd multiplier per type, made once (Linux fills them
+/// in an initcall; here the first kcmp, serialized by the Once) and never
+/// changed, so every comparison uses the same pair
+static COOKIES: spin::Once<[[u64; 2]; KCMP_TYPES as usize]> = spin::Once::new();
 
-static COOKIES_INITIALIZED: AtomicU64 = AtomicU64::new(0);
-
-/// Initialize the obfuscation cookies using kernel random source
-fn init_cookies() {
-    if COOKIES_INITIALIZED.load(AtomicOrdering::Relaxed) != 0 {
-        return;
-    }
-
-    // Use get_random_bytes to initialize cookies
-    for cookie_pair in COOKIES.iter() {
-        let mut buf = [0u8; 16];
-        let _ = crate::random::get_random_bytes(&mut buf, 0);
-
-        let xor_val = u64::from_ne_bytes(buf[0..8].try_into().unwrap());
-        let mut mult = u64::from_ne_bytes(buf[8..16].try_into().unwrap());
-
-        // Ensure multiplier is odd (for unique products modulo 2^64)
-        mult |= 1 | (1u64 << 63);
-
-        cookie_pair[0].store(xor_val, AtomicOrdering::Relaxed);
-        cookie_pair[1].store(mult, AtomicOrdering::Relaxed);
-    }
-
-    COOKIES_INITIALIZED.store(1, AtomicOrdering::Release);
+fn cookies() -> &'static [[u64; 2]; KCMP_TYPES as usize] {
+    COOKIES.call_once(|| {
+        let mut c = [[0u64; 2]; KCMP_TYPES as usize];
+        for pair in c.iter_mut() {
+            let mut buf = [0u8; 16];
+            let _ = crate::random::get_random_bytes(&mut buf, 0);
+            let (x, m) = buf.split_at(8);
+            pair[0] = u64::from_ne_bytes(x.try_into().unwrap_or_default());
+            // Odd, so the product is a bijection modulo 2^64
+            pair[1] = u64::from_ne_bytes(m.try_into().unwrap_or_default()) | 1 | (1u64 << 63);
+        }
+        c
+    })
 }
 
 /// Obfuscate a kernel pointer for comparison
@@ -82,9 +63,7 @@ fn init_cookies() {
 /// This prevents userspace from learning actual kernel pointer values
 /// while still providing consistent ordering for sorting.
 fn kptr_obfuscate(ptr: u64, kcmp_type: i32) -> u64 {
-    let idx = kcmp_type as usize;
-    let xor_val = COOKIES[idx][0].load(AtomicOrdering::Relaxed);
-    let mult = COOKIES[idx][1].load(AtomicOrdering::Relaxed);
+    let [xor_val, mult] = cookies()[kcmp_type as usize];
     (ptr ^ xor_val).wrapping_mul(mult)
 }
 
@@ -165,7 +144,6 @@ pub fn sys_kcmp(pid1: i32, pid2: i32, kcmp_type: i32, idx1: u64, idx2: u64) -> i
     }
     let (pid1, pid2) = (pid1 as u64, pid2 as u64);
     // Initialize cookies on first use
-    init_cookies();
 
     // Validate type
     if !(0..KCMP_TYPES).contains(&kcmp_type) {
