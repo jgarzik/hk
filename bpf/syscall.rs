@@ -30,7 +30,7 @@ use super::fd::{
 use super::insn::BpfInsn;
 use super::map::{BPF_MAP_TYPE_ARRAY, BPF_MAP_TYPE_HASH, BpfMapOps, create_map};
 use super::prog::BpfProg;
-use super::verifier::verify_bpf_prog;
+use super::verifier::{Kind, verify};
 use crate::arch::Uaccess;
 use crate::uaccess::{copy_from_user, copy_to_user};
 use crate::util::error::KernelError;
@@ -464,14 +464,13 @@ fn bpf_prog_load(attr_buf: &[u8]) -> i64 {
         .map(|chunk| unsafe { core::ptr::read_unaligned(chunk.as_ptr() as *const BpfInsn) })
         .collect();
 
-    // Verify the program
-    // Context size depends on program type - for socket filter, it's the packet context
-    let ctx_size = match attr.prog_type {
-        BPF_PROG_TYPE_SOCKET_FILTER => 64, // Approximate, depends on actual context
-        _ => 0,
+    // Nothing attaches a loaded program yet: no helpers, and the
+    // context is a 64-byte placeholder for struct __sk_buff
+    const SOCKET_FILTER: Kind = Kind {
+        ctx_size: 64,
+        helpers: &[],
     };
-
-    if let Err(e) = verify_bpf_prog(&insns, ctx_size) {
+    if let Err(e) = verify(&insns, &SOCKET_FILTER, super::insn::BPF_MAXINSNS) {
         return e.sysret();
     }
 

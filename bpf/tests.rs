@@ -348,3 +348,184 @@ fn calls_and_control() {
     // A 64-bit immediate needs its second half
     assert_eq!(run(&[lddw(0, 1)[0]]), Err(Fault::BadInsn));
 }
+
+// ============================================================================
+// Verifier
+// ============================================================================
+
+use super::verifier::{Kind, Verified, verify};
+use crate::util::error::KernelError;
+
+const KIND: Kind = Kind {
+    ctx_size: 64,
+    helpers: &[(7, 2)],
+};
+
+fn check(p: &[BpfInsn]) -> Result<Verified, KernelError> {
+    verify(p, &KIND, BPF_MAXINSNS)
+}
+
+const INVAL: Result<Verified, KernelError> = Err(KernelError::InvalidArgument);
+const ACCES: Result<Verified, KernelError> = Err(KernelError::PermissionDenied);
+
+fn ok(p: &[BpfInsn]) -> bool {
+    check(p).is_ok()
+}
+
+/// R2 = an unknown scalar (a context load)
+const LOAD: BpfInsn = i(BPF_LDX | BPF_MEM | BPF_W, 2, 1, 0, 0);
+
+#[test]
+fn verifier_shape() {
+    assert!(ok(&[mov64(0, 0), EXIT]));
+    assert_eq!(check(&[]), INVAL);
+    assert_eq!(check(&[mov64(0, 0)]), INVAL); // falls off the end
+    assert_eq!(check(&[i(BPF_JMP | BPF_JA, 0, 0, -1, 0), EXIT]), INVAL); // back edge
+    assert_eq!(check(&[i(BPF_JMP | BPF_JA, 0, 0, 1, 0), EXIT]), INVAL); // past the end
+    assert_eq!(check(&[mov64(0, 0), EXIT, EXIT]), INVAL); // unreachable
+    assert_eq!(check(&[i(0xff, 0, 0, 0, 0), EXIT]), INVAL);
+    assert_eq!(check(&[mov64(11, 0), EXIT]), INVAL);
+    assert_eq!(check(&[mov64(10, 0), mov64(0, 0), EXIT]), INVAL); // R10 is read-only
+    let div0 = i(BPF_ALU64 | BPF_DIV | BPF_K, 0, 0, 0, 0);
+    assert_eq!(check(&[mov64(0, 1), div0, EXIT]), INVAL);
+    let shl = i(BPF_ALU | BPF_LSH | BPF_K, 0, 0, 0, 32);
+    assert_eq!(check(&[mov64(0, 1), shl, EXIT]), INVAL);
+    assert_eq!(check(&[i(BPF_JMP | BPF_CALL, 0, 0, 0, 8), EXIT]), INVAL);
+    // No jump into the second half of a 64-bit immediate
+    let mut p = alloc::vec![LOAD, mov64(0, 0), i(BPF_JMP | BPF_JEQ | BPF_K, 2, 0, 1, 0)];
+    p.extend(lddw(0, 1));
+    p.push(EXIT);
+    assert_eq!(check(&p), INVAL);
+    p[2].off = 2;
+    assert!(ok(&p));
+    // A 64-bit immediate needs its second half
+    assert_eq!(check(&[lddw(0, 1)[0], EXIT]), INVAL);
+}
+
+#[test]
+fn verifier_values() {
+    // Reads of uninitialized registers and stack
+    assert_eq!(check(&[EXIT]), ACCES);
+    assert_eq!(
+        check(&[i(BPF_ALU64 | BPF_ADD | BPF_K, 0, 0, 0, 1), EXIT]),
+        ACCES
+    );
+    let ld = i(BPF_LDX | BPF_MEM | BPF_W, 0, 10, -4, 0);
+    assert_eq!(check(&[ld, EXIT]), ACCES);
+    let st = i(BPF_ST | BPF_MEM | BPF_H, 10, 0, -4, 0);
+    assert_eq!(check(&[st, ld, EXIT]), ACCES); // two of four bytes written
+    let st = i(BPF_ST | BPF_MEM | BPF_W, 10, 0, -4, 0);
+    assert!(ok(&[st, ld, EXIT]));
+    // Context: in bounds, aligned, read-only
+    assert!(ok(&[i(BPF_LDX | BPF_MEM | BPF_DW, 0, 1, 56, 0), EXIT]));
+    assert_eq!(
+        check(&[i(BPF_LDX | BPF_MEM | BPF_DW, 0, 1, 60, 0), EXIT]),
+        ACCES
+    );
+    assert_eq!(
+        check(&[i(BPF_LDX | BPF_MEM | BPF_W, 0, 1, 2, 0), EXIT]),
+        ACCES
+    );
+    let w = i(BPF_ST | BPF_MEM | BPF_W, 1, 0, 0, 0);
+    assert_eq!(check(&[w, mov64(0, 0), EXIT]), ACCES);
+    // Stack bounds
+    let st = |off| i(BPF_ST | BPF_MEM | BPF_B, 10, 0, off, 0);
+    assert_eq!(check(&[st(0), mov64(0, 0), EXIT]), ACCES);
+    assert_eq!(check(&[st(-513), mov64(0, 0), EXIT]), ACCES);
+    assert!(ok(&[st(-512), mov64(0, 0), EXIT]));
+    // A pointer never leaves in R0
+    let leak = i(BPF_ALU64 | BPF_MOV | BPF_X, 0, 10, 0, 0);
+    assert_eq!(check(&[leak, EXIT]), ACCES);
+    // Pointer arithmetic: constant offsets in 64 bits only
+    let p = |op: BpfInsn| {
+        [
+            i(BPF_ALU64 | BPF_MOV | BPF_X, 3, 1, 0, 0),
+            LOAD,
+            op,
+            mov64(0, 0),
+            EXIT,
+        ]
+    };
+    assert!(ok(&p(i(BPF_ALU64 | BPF_ADD | BPF_K, 3, 0, 0, 8))));
+    assert_eq!(check(&p(i(BPF_ALU64 | BPF_ADD | BPF_X, 3, 2, 0, 0))), ACCES);
+    assert_eq!(check(&p(i(BPF_ALU | BPF_ADD | BPF_K, 3, 0, 0, 8))), ACCES);
+    assert_eq!(check(&p(i(BPF_ALU64 | BPF_MUL | BPF_K, 3, 0, 0, 2))), ACCES);
+    assert_eq!(check(&p(i(BPF_ALU | BPF_MOV | BPF_X, 3, 1, 0, 0))), ACCES);
+    // ... and the moved pointer is bounds-checked at its new offset
+    let p = [
+        i(BPF_ALU64 | BPF_MOV | BPF_X, 3, 1, 0, 0),
+        i(BPF_ALU64 | BPF_ADD | BPF_K, 3, 0, 0, 60),
+        i(BPF_LDX | BPF_MEM | BPF_W, 0, 3, 0, 0),
+        EXIT,
+    ];
+    assert!(ok(&p));
+    let mut q = p;
+    q[1].imm = 64;
+    assert_eq!(check(&q), ACCES);
+    // A spilled pointer comes back whole; a partial spill is refused
+    let p = [
+        i(BPF_STX | BPF_MEM | BPF_DW, 10, 1, -8, 0),
+        i(BPF_LDX | BPF_MEM | BPF_DW, 3, 10, -8, 0),
+        i(BPF_LDX | BPF_MEM | BPF_W, 0, 3, 4, 0),
+        EXIT,
+    ];
+    assert!(ok(&p));
+    let half = i(BPF_STX | BPF_MEM | BPF_W, 10, 1, -8, 0);
+    assert_eq!(check(&[half, mov64(0, 0), EXIT]), ACCES);
+    // Helpers: scalar arguments; R1..R5 are dead after the call
+    let call = i(BPF_JMP | BPF_CALL, 0, 0, 0, 7);
+    assert!(ok(&[mov64(1, 1), mov64(2, 2), call, EXIT]));
+    assert_eq!(check(&[mov64(2, 2), call, EXIT]), ACCES); // R1 is the ctx
+    let use_r1 = i(BPF_ALU64 | BPF_MOV | BPF_X, 0, 1, 0, 0);
+    assert_eq!(
+        check(&[mov64(1, 1), mov64(2, 2), call, use_r1, EXIT]),
+        ACCES
+    );
+}
+
+/// Both sides of every branch are checked; constants decide branches
+#[test]
+fn verifier_paths() {
+    // The bad path is only on one side
+    let p = [
+        LOAD,
+        i(BPF_JMP | BPF_JEQ | BPF_K, 2, 0, 1, 0),
+        mov64(0, 0),
+        EXIT,
+    ];
+    assert_eq!(check(&p), ACCES);
+    // A constant comparison never takes the bad side
+    let p = [
+        mov64(2, 5),
+        i(BPF_JMP | BPF_JEQ | BPF_K, 2, 0, 1, 5),
+        EXIT,
+        mov64(0, 0),
+        EXIT,
+    ];
+    assert!(ok(&p));
+}
+
+/// 2000 branches in a row: no recursion, and pruning keeps it linear
+#[test]
+fn verifier_deep() {
+    let mut p = alloc::vec![LOAD, mov64(0, 0)];
+    for _ in 0..2000 {
+        p.push(i(BPF_JMP | BPF_JEQ | BPF_K, 2, 0, 1, 1));
+        p.push(mov64(3, 1));
+    }
+    p.push(EXIT);
+    assert_eq!(check(&p), Ok(Verified::default()));
+}
+
+/// 2^n distinct states: E2BIG at the complexity limit, not a hang
+#[test]
+fn verifier_explosion() {
+    let mut p = alloc::vec![LOAD, mov64(0, 0), mov64(4, 0)];
+    for _ in 0..40 {
+        p.push(i(BPF_JMP | BPF_JEQ | BPF_K, 2, 0, 1, 1));
+        p.push(i(BPF_ALU64 | BPF_ADD | BPF_K, 4, 0, 0, 1));
+        p.push(i(BPF_ALU64 | BPF_LSH | BPF_K, 4, 0, 0, 1));
+    }
+    p.push(EXIT);
+    assert_eq!(check(&p), Err(KernelError::ArgListTooLong));
+}

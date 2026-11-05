@@ -29,14 +29,13 @@ pub mod interp;
 mod map;
 mod prog;
 pub mod syscall;
-mod verifier;
+pub mod verifier;
 
 pub use fd::{create_bpf_map_fd, create_bpf_prog_fd, get_bpf_map_from_fd, get_bpf_prog_from_fd};
 pub use insn::*;
 pub use map::{BpfMap, BpfMapOps, create_map};
 pub use prog::BpfProg;
 pub use syscall::sys_bpf;
-pub use verifier::verify_bpf_prog;
 
 #[cfg(test)]
 mod tests;

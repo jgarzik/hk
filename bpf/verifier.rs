@@ -1,662 +1,616 @@
-//! BPF program verifier
+//! eBPF verifier (Linux kernel/bpf/verifier.c check_cfg + do_check, a
+//! strict subset)
 //!
-//! This module implements verification of BPF programs before they can be loaded.
-//! The verifier ensures that programs:
-//! - Terminate (have EXIT instruction, no infinite loops)
-//! - Don't access uninitialized registers
-//! - Don't overflow the stack
-//! - Don't access memory out of bounds
-//! - Use valid opcodes
+//! Two passes, both iterative: no program shape reaches the kernel
+//! stack.
 //!
-//! ## Verification Approach
+//! 1. `check_cfg`, one sweep: every instruction is well formed (known
+//!    opcode, registers, fields that must be zero, shifts below the
+//!    width, no division by a zero constant, no write to R10), every
+//!    jump goes forward and lands inside the program and not on the
+//!    second half of a 64-bit immediate, every instruction is reachable
+//!    and none falls off the end. Forward-only jumps make every program
+//!    terminate within its length (Linux before bounded loops).
+//! 2. `do_check` follows every path with an explicit worklist, tracking
+//!    each register as uninitialized, a scalar (a known constant or
+//!    not) or a pointer at a known offset into the context or the
+//!    stack, and which stack bytes are written. A path is dropped where
+//!    an already-checked state at that jump target covers it. Errors:
+//!    malformed EINVAL; uninitialized reads, out-of-bounds or misaligned
+//!    context access, stores to the context, pointer arithmetic other
+//!    than a constant offset, and a pointer in R0 at EXIT are EACCES;
+//!    more than `COMPLEXITY_LIMIT` instructions processed is E2BIG.
 //!
-//! The verifier performs abstract interpretation, tracking the state of each
-//! register at each program point. It follows all possible execution paths
-//! to ensure safety properties hold.
+//! The interpreter checks every access again at run time
+//! (bpf/interp.rs), so a verifier bug cannot reach kernel memory.
+//! No locks: all state is the caller's.
 
-use alloc::vec;
+use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 use super::insn::*;
+use super::interp::{self, BPF_CMPXCHG, BPF_FETCH, BPF_MEMSX, BPF_XCHG};
 use crate::util::error::KernelError;
 
-// =============================================================================
-// Register State
-// =============================================================================
+/// Most instructions processed over all paths (Linux
+/// BPF_COMPLEXITY_LIMIT_INSNS)
+pub const COMPLEXITY_LIMIT: usize = 1_000_000;
 
-/// Type of value held in a register
+/// Most states kept for pruning (bounds the verifier's memory)
+const MAX_STORED: usize = 4096;
+
+/// Most states kept at one jump target (bounds each pruning check)
+const MAX_PER_TARGET: usize = 16;
+
+/// Most paths waiting to be followed (E2BIG past it)
+const MAX_PENDING: usize = 4096;
+
+/// What a program type allows
+#[derive(Clone, Copy, Debug)]
+pub struct Kind {
+    /// Bytes of the context R1 points to (read-only)
+    pub ctx_size: usize,
+    /// Callable helpers: (id, number of scalar arguments)
+    pub helpers: &'static [(i32, u8)],
+}
+
+/// What the verifier learned about a program it accepted
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[allow(dead_code)]
-pub enum RegType {
-    /// Register has not been written (uninitialized)
-    #[default]
-    NotInit,
-    /// Register holds a scalar value (number)
-    Scalar,
-    /// Register holds a pointer to the context
-    PtrToCtx,
-    /// Register holds a pointer to the stack
-    PtrToStack,
-    /// Register holds a pointer to a map value
-    PtrToMapValue,
-    /// Register holds a constant known at verification time
-    Const(i64),
-}
-
-/// State of a single register
-#[derive(Clone, Debug, Default)]
-#[allow(dead_code)]
-pub struct RegState {
-    /// Type of value in the register
-    pub reg_type: RegType,
-    /// Minimum possible value (for range tracking)
-    pub smin_value: i64,
-    /// Maximum possible value (for range tracking)
-    pub smax_value: i64,
-    /// Unsigned minimum
-    pub umin_value: u64,
-    /// Unsigned maximum
-    pub umax_value: u64,
-}
-
-impl RegState {
-    /// Create a new uninitialized register
-    pub fn new() -> Self {
-        Self {
-            reg_type: RegType::NotInit,
-            smin_value: i64::MIN,
-            smax_value: i64::MAX,
-            umin_value: 0,
-            umax_value: u64::MAX,
-        }
-    }
-
-    /// Create a scalar register with unknown value
-    pub fn scalar() -> Self {
-        Self {
-            reg_type: RegType::Scalar,
-            smin_value: i64::MIN,
-            smax_value: i64::MAX,
-            umin_value: 0,
-            umax_value: u64::MAX,
-        }
-    }
-
-    /// Create a register with a known constant value
-    pub fn constant(val: i64) -> Self {
-        Self {
-            reg_type: RegType::Const(val),
-            smin_value: val,
-            smax_value: val,
-            umin_value: val as u64,
-            umax_value: val as u64,
-        }
-    }
-
-    /// Create a context pointer register
-    pub fn ctx_ptr() -> Self {
-        Self {
-            reg_type: RegType::PtrToCtx,
-            smin_value: 0,
-            smax_value: i64::MAX,
-            umin_value: 0,
-            umax_value: u64::MAX,
-        }
-    }
-
-    /// Create a stack pointer register
-    pub fn stack_ptr(offset: i64) -> Self {
-        Self {
-            reg_type: RegType::PtrToStack,
-            smin_value: offset,
-            smax_value: offset,
-            umin_value: 0,
-            umax_value: u64::MAX,
-        }
-    }
-
-    /// Check if register is readable (initialized)
-    pub fn is_readable(&self) -> bool {
-        !matches!(self.reg_type, RegType::NotInit)
-    }
-
-    /// Check if register holds a pointer
-    #[allow(dead_code)]
-    pub fn is_pointer(&self) -> bool {
-        matches!(
-            self.reg_type,
-            RegType::PtrToCtx | RegType::PtrToStack | RegType::PtrToMapValue
-        )
-    }
-}
-
-// =============================================================================
-// Verifier State
-// =============================================================================
-
-/// Stack slot state
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[allow(dead_code)]
-pub enum StackSlotType {
-    /// Slot is uninitialized
-    #[default]
-    Invalid,
-    /// Slot contains spilled register
-    Spill,
-    /// Slot contains misc data (written by store)
-    Misc,
-}
-
-/// Verification state at a program point
-#[derive(Clone, Debug)]
-pub struct VerifierState {
-    /// Register states (R0-R10)
-    pub regs: [RegState; MAX_BPF_REG],
-    /// Stack slot states (each slot is 8 bytes, 64 slots for 512-byte stack)
-    pub stack: [StackSlotType; BPF_STACK_SIZE / 8],
-    /// Current stack depth (bytes used from stack top)
+pub struct Verified {
+    /// Deepest stack byte used
     pub stack_depth: usize,
 }
 
-impl VerifierState {
-    /// Create initial state for program entry
-    pub fn new() -> Self {
-        let mut state = Self {
-            regs: Default::default(),
-            stack: [StackSlotType::Invalid; BPF_STACK_SIZE / 8],
-            stack_depth: 0,
-        };
-
-        // R1 contains context pointer at entry
-        state.regs[BPF_REG_1 as usize] = RegState::ctx_ptr();
-        // R10 is the frame pointer (read-only)
-        state.regs[BPF_REG_10 as usize] = RegState::stack_ptr(0);
-
-        state
-    }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Region {
+    Ctx,
+    Stack,
 }
 
-impl Default for VerifierState {
-    fn default() -> Self {
-        Self::new()
-    }
+/// What a register holds
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Val {
+    Uninit,
+    /// A number, with its value if known
+    Scalar(Option<u64>),
+    /// A pointer at a known offset into a region (stack: from its end)
+    Ptr(Region, i32),
 }
 
-// =============================================================================
-// Verifier
-// =============================================================================
+const UNKNOWN: Val = Val::Scalar(None);
+const SLOTS: usize = BPF_STACK_SIZE / 8;
 
-/// BPF program verifier
-pub struct Verifier<'a> {
-    /// Instructions to verify
-    insns: &'a [BpfInsn],
-    /// Context size (for bounds checking)
-    ctx_size: usize,
-    /// Visited instruction bitmap
-    visited: Vec<bool>,
-    /// States at each instruction (for path merging)
-    states: Vec<Option<VerifierState>>,
+/// The abstract machine at one instruction
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct State {
+    regs: [Val; MAX_BPF_REG],
+    /// One bit per written stack byte (bit i: offset i from the base)
+    init: [u64; BPF_STACK_SIZE / 64],
+    /// The pointer spilled to each 8-byte slot
+    spill: [Option<(Region, i32)>; SLOTS],
 }
 
-impl<'a> Verifier<'a> {
-    /// Create a new verifier for the given instructions
-    pub fn new(insns: &'a [BpfInsn], ctx_size: usize) -> Self {
-        let len = insns.len();
+impl State {
+    fn entry() -> Self {
+        let mut regs = [Val::Uninit; MAX_BPF_REG];
+        regs[BPF_REG_1 as usize] = Val::Ptr(Region::Ctx, 0);
+        regs[BPF_REG_10 as usize] = Val::Ptr(Region::Stack, 0);
         Self {
-            insns,
-            ctx_size,
-            visited: vec![false; len],
-            states: vec![None; len],
+            regs,
+            init: [0; BPF_STACK_SIZE / 64],
+            spill: [None; SLOTS],
         }
     }
 
-    /// Verify the program
-    pub fn verify(&mut self) -> Result<(), KernelError> {
-        if self.insns.is_empty() {
-            return Err(KernelError::InvalidArgument);
-        }
-
-        if self.insns.len() > BPF_MAXINSNS {
-            return Err(KernelError::InvalidArgument);
-        }
-
-        // First pass: check for EXIT instruction and basic validity
-        self.check_basic_validity()?;
-
-        // Second pass: simulate execution and track state
-        let initial_state = VerifierState::new();
-        self.verify_from(0, initial_state)?;
-
-        Ok(())
+    /// Whether every path safe from `self` is safe from `new` (Linux
+    /// states_equal, without range tracking)
+    fn covers(&self, new: &State) -> bool {
+        let regs = self.regs.iter().zip(&new.regs).all(|(o, n)| {
+            *o == Val::Uninit || o == n || (*o == UNKNOWN && matches!(n, Val::Scalar(_)))
+        });
+        let init = self.init.iter().zip(&new.init).all(|(o, n)| o & !n == 0);
+        regs && init && self.spill == new.spill
     }
 
-    /// Check basic program validity
-    fn check_basic_validity(&self) -> Result<(), KernelError> {
-        let mut has_exit = false;
-
-        for (i, insn) in self.insns.iter().enumerate() {
-            let class = bpf_class(insn.code);
-            let op = bpf_op(insn.code);
-
-            // Check for EXIT instruction
-            if class == BPF_JMP && op == BPF_EXIT {
-                has_exit = true;
-            }
-
-            // Check jump targets are in bounds
-            if (class == BPF_JMP || class == BPF_JMP32) && op != BPF_EXIT && op != BPF_CALL {
-                let target = i as i32 + 1 + insn.off as i32;
-                if target < 0 || target as usize >= self.insns.len() {
-                    return Err(KernelError::InvalidArgument);
-                }
-            }
-
-            // Validate registers are in range
-            if insn.dst_reg() > BPF_REG_10 {
-                return Err(KernelError::InvalidArgument);
-            }
-            if insn.src_reg() > BPF_REG_10 {
-                return Err(KernelError::InvalidArgument);
-            }
-
-            // R10 (frame pointer) is read-only
-            if insn.dst_reg() == BPF_REG_10 {
-                // Allow only if this is a load with R10 as base
-                let mode = bpf_mode(insn.code);
-                if class != BPF_LDX && class != BPF_STX && class != BPF_ST && mode != BPF_MEM {
-                    return Err(KernelError::InvalidArgument);
-                }
-                // For ALU/JMP, R10 as dst is always invalid
-                if class == BPF_ALU || class == BPF_ALU64 {
-                    return Err(KernelError::InvalidArgument);
-                }
-            }
-
-            // Check for 64-bit immediate loads (2 instruction sequence)
-            if class == BPF_LD
-                && bpf_mode(insn.code) == BPF_IMM
-                && bpf_size(insn.code) == BPF_DW
-                && i + 1 >= self.insns.len()
-            {
-                return Err(KernelError::InvalidArgument);
-            }
-        }
-
-        if !has_exit {
-            return Err(KernelError::InvalidArgument);
-        }
-
-        Ok(())
+    fn written(&self, at: usize, size: usize) -> bool {
+        (at..at + size).all(|b| self.init[b / 64] & (1 << (b % 64)) != 0)
     }
 
-    /// Verify from a specific instruction with given state
-    fn verify_from(&mut self, mut pc: usize, mut state: VerifierState) -> Result<(), KernelError> {
-        const MAX_ITERATIONS: usize = 1_000_000;
-        let mut iterations = 0;
-
-        while pc < self.insns.len() {
-            iterations += 1;
-            if iterations > MAX_ITERATIONS {
-                // Likely infinite loop
-                return Err(KernelError::PermissionDenied);
-            }
-
-            // Check if we've already verified this path
-            if self.visited[pc] {
-                // State merge would go here for full verification
-                return Ok(());
-            }
-            self.visited[pc] = true;
-            self.states[pc] = Some(state.clone());
-
-            let insn = &self.insns[pc];
-            let class = bpf_class(insn.code);
-            let op = bpf_op(insn.code);
-            let _src = bpf_src(insn.code);
-
-            match class {
-                BPF_ALU | BPF_ALU64 => {
-                    self.verify_alu(insn, &mut state)?;
-                    pc += 1;
-                }
-                BPF_LDX => {
-                    self.verify_ldx(insn, &mut state)?;
-                    pc += 1;
-                }
-                BPF_STX | BPF_ST => {
-                    self.verify_stx(insn, &mut state)?;
-                    pc += 1;
-                }
-                BPF_LD => {
-                    // Handle 64-bit immediate load
-                    if bpf_mode(insn.code) == BPF_IMM && bpf_size(insn.code) == BPF_DW {
-                        self.verify_ld_imm64(insn, pc, &mut state)?;
-                        pc += 2; // Skip the second instruction
-                    } else {
-                        // Other LD modes (packet access) not supported yet
-                        return Err(KernelError::InvalidArgument);
-                    }
-                }
-                BPF_JMP | BPF_JMP32 => {
-                    if op == BPF_EXIT {
-                        // R0 must be readable (contains return value)
-                        if !state.regs[BPF_REG_0 as usize].is_readable() {
-                            return Err(KernelError::PermissionDenied);
-                        }
-                        return Ok(());
-                    } else if op == BPF_CALL {
-                        self.verify_call(insn, &mut state)?;
-                        pc += 1;
-                    } else if op == BPF_JA {
-                        // Unconditional jump
-                        let target = (pc as i32 + 1 + insn.off as i32) as usize;
-                        pc = target;
-                    } else {
-                        // Conditional jump
-                        self.verify_jmp_cond(insn, &state)?;
-
-                        // Verify both paths
-                        let target = (pc as i32 + 1 + insn.off as i32) as usize;
-
-                        // Fork: verify the taken branch
-                        let taken_state = state.clone();
-                        self.verify_from(target, taken_state)?;
-
-                        // Continue with fall-through
-                        pc += 1;
-                    }
-                }
-                _ => {
-                    return Err(KernelError::InvalidArgument);
-                }
-            }
+    fn mark(&mut self, at: usize, size: usize) {
+        for b in at..at + size {
+            self.init[b / 64] |= 1 << (b % 64);
         }
-
-        // Fell off the end without EXIT
-        Err(KernelError::PermissionDenied)
     }
+}
 
-    /// Verify ALU instruction
-    fn verify_alu(&self, insn: &BpfInsn, state: &mut VerifierState) -> Result<(), KernelError> {
-        let dst = insn.dst_reg() as usize;
-        let src = insn.src_reg() as usize;
-        let op = bpf_op(insn.code);
-        let is_src_reg = bpf_src(insn.code) == BPF_X;
+fn inval<T>() -> Result<T, KernelError> {
+    Err(KernelError::InvalidArgument)
+}
 
-        // Source must be readable (if using register)
-        if is_src_reg && !state.regs[src].is_readable() {
-            return Err(KernelError::PermissionDenied);
-        }
+fn acces<T>() -> Result<T, KernelError> {
+    Err(KernelError::PermissionDenied)
+}
 
-        // For most ops, dst must be readable (except MOV)
-        if op != BPF_MOV && op != BPF_NEG && !state.regs[dst].is_readable() {
-            return Err(KernelError::PermissionDenied);
-        }
+// ============================================================================
+// Pass 1: shape
+// ============================================================================
 
-        // Check for division by zero (conservatively - could track ranges better)
-        if op == BPF_DIV || op == BPF_MOD {
-            if is_src_reg {
-                // We can't statically prove divisor is non-zero for registers
-                // In real use, this would need more sophisticated analysis
-            } else if insn.imm == 0 {
-                return Err(KernelError::InvalidArgument);
-            }
-        }
-
-        // Update destination register state
-        match op {
-            BPF_MOV => {
-                if is_src_reg {
-                    state.regs[dst] = state.regs[src].clone();
-                } else {
-                    state.regs[dst] = RegState::constant(insn.imm as i64);
+/// A well-formed ALU instruction
+fn alu_ok(insn: &BpfInsn) -> bool {
+    let code = insn.code;
+    let w64 = bpf_class(code) == BPF_ALU64;
+    let x = bpf_src(code) == BPF_X;
+    let (src, off, imm) = (insn.src_reg(), insn.off, insn.imm);
+    let fields = if x { imm == 0 } else { src == 0 };
+    match bpf_op(code) {
+        BPF_END => src == 0 && off == 0 && matches!(imm, 16 | 32 | 64) && !(w64 && x),
+        BPF_NEG => !x && src == 0 && off == 0 && imm == 0,
+        BPF_MOV => {
+            fields
+                && match off {
+                    0 => true,
+                    8 | 16 => x,
+                    32 => x && w64,
+                    _ => false,
                 }
-            }
-            BPF_NEG => {
-                state.regs[dst] = RegState::scalar();
-            }
-            _ => {
-                // Result is scalar with unknown value
-                // (Could do range propagation here for better analysis)
-                state.regs[dst] = RegState::scalar();
-            }
         }
-
-        Ok(())
+        BPF_DIV | BPF_MOD => fields && matches!(off, 0 | 1) && (x || imm != 0),
+        BPF_LSH | BPF_RSH | BPF_ARSH => {
+            let width = if w64 { 64 } else { 32 };
+            fields && off == 0 && (x || (0..width).contains(&imm))
+        }
+        BPF_ADD | BPF_SUB | BPF_MUL | BPF_OR | BPF_AND | BPF_XOR => fields && off == 0,
+        _ => false,
     }
+}
 
-    /// Verify LDX (load from memory) instruction
-    fn verify_ldx(&self, insn: &BpfInsn, state: &mut VerifierState) -> Result<(), KernelError> {
-        let dst = insn.dst_reg() as usize;
-        let src = insn.src_reg() as usize;
-
-        // Source register must be readable
-        if !state.regs[src].is_readable() {
-            return Err(KernelError::PermissionDenied);
+/// A well-formed load, store or atomic instruction
+fn mem_ok(insn: &BpfInsn) -> bool {
+    let code = insn.code;
+    let (src, imm) = (insn.src_reg(), insn.imm);
+    match (bpf_class(code), bpf_mode(code)) {
+        (BPF_LDX, BPF_MEM) => imm == 0,
+        (BPF_LDX, BPF_MEMSX) => imm == 0 && bpf_size(code) != BPF_DW,
+        (BPF_ST, BPF_MEM) => src == 0,
+        (BPF_STX, BPF_MEM) => imm == 0,
+        (BPF_STX, BPF_ATOMIC) => {
+            let ops = [BPF_ADD, BPF_OR, BPF_AND, BPF_XOR].map(|o| o as i32);
+            matches!(bpf_size(code), BPF_W | BPF_DW)
+                && (ops.contains(&(imm & !BPF_FETCH)) || imm == BPF_XCHG || imm == BPF_CMPXCHG)
         }
-
-        // Check memory access based on source type
-        match state.regs[src].reg_type {
-            RegType::PtrToCtx => {
-                // Check context bounds
-                let offset = insn.off as i64;
-                let size = self.access_size(insn.code);
-                if offset < 0 || (offset as usize + size) > self.ctx_size {
-                    return Err(KernelError::PermissionDenied);
-                }
-                state.regs[dst] = RegState::scalar();
-            }
-            RegType::PtrToStack => {
-                // Check stack bounds
-                let base_off = state.regs[src].smin_value;
-                let offset = base_off + insn.off as i64;
-                let size = self.access_size(insn.code) as i64;
-
-                // Stack grows down, valid range is [-512, 0)
-                if offset < -(BPF_STACK_SIZE as i64) || offset + size > 0 {
-                    return Err(KernelError::PermissionDenied);
-                }
-
-                // Check if stack slot is initialized
-                let slot = ((-offset - 1) / 8) as usize;
-                if slot >= BPF_STACK_SIZE / 8 {
-                    return Err(KernelError::PermissionDenied);
-                }
-                if state.stack[slot] == StackSlotType::Invalid {
-                    return Err(KernelError::PermissionDenied);
-                }
-
-                state.regs[dst] = RegState::scalar();
-            }
-            RegType::PtrToMapValue => {
-                // Map value access - bounds would be checked with map info
-                state.regs[dst] = RegState::scalar();
-            }
-            _ => {
-                // Can't load from non-pointer
-                return Err(KernelError::PermissionDenied);
-            }
-        }
-
-        Ok(())
+        _ => false,
     }
+}
 
-    /// Verify STX/ST (store to memory) instruction
-    fn verify_stx(&self, insn: &BpfInsn, state: &mut VerifierState) -> Result<(), KernelError> {
-        let dst = insn.dst_reg() as usize;
-        let src = insn.src_reg() as usize;
+/// A well-formed jump; `kind` decides which helpers exist
+fn jmp_ok(insn: &BpfInsn, kind: &Kind) -> bool {
+    let code = insn.code;
+    let w32 = bpf_class(code) == BPF_JMP32;
+    let x = bpf_src(code) == BPF_X;
+    let (dst, src, off, imm) = (insn.dst_reg(), insn.src_reg(), insn.off, insn.imm);
+    match bpf_op(code) {
+        BPF_JA if w32 => !x && dst == 0 && src == 0 && off == 0,
+        BPF_JA => !x && dst == 0 && src == 0 && imm == 0,
+        BPF_EXIT => !w32 && !x && dst == 0 && src == 0 && off == 0 && imm == 0,
+        BPF_CALL => {
+            !w32 && !x
+                && dst == 0
+                && src == 0
+                && off == 0
+                && kind.helpers.iter().any(|h| h.0 == imm)
+        }
+        BPF_JEQ | BPF_JNE | BPF_JGT | BPF_JGE | BPF_JLT | BPF_JLE | BPF_JSET | BPF_JSGT
+        | BPF_JSGE | BPF_JSLT | BPF_JSLE => {
+            if x {
+                imm == 0
+            } else {
+                src == 0
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Where control goes after `pc`: (fall-through, jump target)
+fn successors(insns: &[BpfInsn], pc: usize) -> (Option<usize>, Option<isize>) {
+    let insn = &insns[pc];
+    let class = bpf_class(insn.code);
+    if class == BPF_LD {
+        return (Some(pc + 2), None);
+    }
+    if class != BPF_JMP && class != BPF_JMP32 {
+        return (Some(pc + 1), None);
+    }
+    let off = |o: i64| Some(pc as isize + 1 + o as isize);
+    match bpf_op(insn.code) {
+        BPF_EXIT => (None, None),
+        BPF_CALL => (Some(pc + 1), None),
+        BPF_JA if class == BPF_JMP32 => (None, off(insn.imm as i64)),
+        BPF_JA => (None, off(insn.off as i64)),
+        _ => (Some(pc + 1), off(insn.off as i64)),
+    }
+}
+
+/// Pass 1: shape, forward jumps, reachability; the jump targets
+fn check_cfg(insns: &[BpfInsn], kind: &Kind) -> Result<Vec<bool>, KernelError> {
+    let len = insns.len();
+    let mut reach = crate::util::kmem::try_vec(len, false)?;
+    let mut target = crate::util::kmem::try_vec(len, false)?;
+    let mut second = crate::util::kmem::try_vec(len, false)?;
+    reach[0] = true;
+    for pc in 0..len {
+        let insn = &insns[pc];
+        if insn.dst_reg() > BPF_REG_10 || insn.src_reg() > BPF_REG_10 {
+            return inval();
+        }
         let class = bpf_class(insn.code);
-
-        // Destination (base pointer) must be readable
-        if !state.regs[dst].is_readable() {
-            return Err(KernelError::PermissionDenied);
-        }
-
-        // For STX, source must be readable
-        if class == BPF_STX && !state.regs[src].is_readable() {
-            return Err(KernelError::PermissionDenied);
-        }
-
-        // Check memory access based on destination type
-        match state.regs[dst].reg_type {
-            RegType::PtrToStack => {
-                let base_off = state.regs[dst].smin_value;
-                let offset = base_off + insn.off as i64;
-                let size = self.access_size(insn.code) as i64;
-
-                // Stack grows down, valid range is [-512, 0)
-                if offset < -(BPF_STACK_SIZE as i64) || offset + size > 0 {
-                    return Err(KernelError::PermissionDenied);
-                }
-
-                // Mark stack slot as initialized
-                let slot = ((-offset - 1) / 8) as usize;
-                if slot < BPF_STACK_SIZE / 8 {
-                    state.stack[slot] = StackSlotType::Misc;
-                }
-
-                // Track stack depth
-                let depth = (-offset) as usize;
-                if depth > state.stack_depth {
-                    state.stack_depth = depth;
-                }
-            }
-            RegType::PtrToMapValue => {
-                // Map value store - bounds would be checked with map info
-            }
-            RegType::PtrToCtx => {
-                // Context is typically read-only
-                return Err(KernelError::PermissionDenied);
-            }
+        let ok = match class {
+            BPF_ALU | BPF_ALU64 => alu_ok(insn),
+            BPF_LDX | BPF_ST | BPF_STX => mem_ok(insn),
+            BPF_JMP | BPF_JMP32 => jmp_ok(insn, kind),
+            _ if second[pc] => true,
             _ => {
-                return Err(KernelError::PermissionDenied);
+                let hi = insns.get(pc + 1);
+                insn.code == BPF_LD | BPF_IMM | BPF_DW
+                    && insn.src_reg() == 0
+                    && insn.off == 0
+                    && hi.is_some_and(|h| h.code == 0 && h.regs == 0 && h.off == 0)
+            }
+        };
+        if !ok {
+            return inval();
+        }
+        // Only stores name R10 as their destination (its base)
+        if insn.dst_reg() == BPF_REG_10 && !matches!(class, BPF_ST | BPF_STX) {
+            return inval();
+        }
+        if second[pc] {
+            continue;
+        }
+        if class == BPF_LD {
+            second[pc + 1] = true;
+        }
+        if !reach[pc] {
+            return inval();
+        }
+        let (next, jump) = successors(insns, pc);
+        if let Some(n) = next {
+            // Falling off the end
+            if n >= len {
+                return inval();
+            }
+            reach[n] = true;
+        }
+        if let Some(t) = jump {
+            // Forward only, inside the program
+            if t <= pc as isize || t as usize >= len {
+                return inval();
+            }
+            reach[t as usize] = true;
+            target[t as usize] = true;
+        }
+    }
+    // Nothing may jump into the second half of a 64-bit immediate
+    if (0..len).any(|pc| second[pc] && reach[pc]) {
+        return inval();
+    }
+    Ok(target)
+}
+
+// ============================================================================
+// Pass 2: values
+// ============================================================================
+
+struct Checker<'a> {
+    insns: &'a [BpfInsn],
+    kind: &'a Kind,
+    /// Jump targets: where states are kept for pruning
+    target: Vec<bool>,
+    /// Checked states at each jump target
+    seen: BTreeMap<usize, Vec<State>>,
+    stored: usize,
+    depth: usize,
+}
+
+/// A register's value as an operand: uninitialized is EACCES
+fn read(v: Val) -> Result<Val, KernelError> {
+    if v == Val::Uninit { acces() } else { Ok(v) }
+}
+
+impl Checker<'_> {
+    /// The ALU instruction's result
+    fn alu(&self, insn: &BpfInsn, st: &State) -> Result<Val, KernelError> {
+        let code = insn.code;
+        let (d, s) = (insn.dst_reg() as usize, insn.src_reg() as usize);
+        let w64 = bpf_class(code) == BPF_ALU64;
+        let op = bpf_op(code);
+        let src = if bpf_src(code) == BPF_X {
+            read(st.regs[s])?
+        } else if w64 {
+            Val::Scalar(Some(insn.imm as i64 as u64))
+        } else {
+            Val::Scalar(Some(insn.imm as u32 as u64))
+        };
+        if op == BPF_MOV && insn.off == 0 && w64 {
+            return Ok(src);
+        }
+        if op == BPF_END {
+            return match read(st.regs[d])? {
+                Val::Scalar(a) => {
+                    let swap = interp::end_swaps(code);
+                    Ok(Val::Scalar(
+                        a.and_then(|a| interp::endian(a, insn.imm, swap)),
+                    ))
+                }
+                _ => acces(),
+            };
+        }
+        let dst = if op == BPF_MOV {
+            Val::Scalar(Some(0))
+        } else {
+            read(st.regs[d])?
+        };
+        match (dst, src) {
+            (Val::Scalar(a), Val::Scalar(b)) => {
+                let v = match (a, b) {
+                    (Some(a), Some(b)) if w64 => interp::alu64(op, insn.off, a, b),
+                    (Some(a), Some(b)) => interp::alu32(op, insn.off, a, b),
+                    _ => None,
+                };
+                Ok(Val::Scalar(v))
+            }
+            // A pointer moves only by a known constant, in 64 bits
+            (Val::Ptr(r, o), Val::Scalar(Some(c))) if w64 && op == BPF_ADD => offset(r, o, c),
+            (Val::Ptr(r, o), Val::Scalar(Some(c))) if w64 && op == BPF_SUB => {
+                offset(r, o, c.wrapping_neg())
+            }
+            (Val::Scalar(Some(c)), Val::Ptr(r, o)) if w64 && op == BPF_ADD => offset(r, o, c),
+            (Val::Ptr(r1, _), Val::Ptr(r2, _)) if w64 && op == BPF_SUB && r1 == r2 => Ok(UNKNOWN),
+            _ => acces(),
+        }
+    }
+
+    /// Byte offset of `[ptr + off, + size)`, if in bounds for `write`
+    fn place(
+        &self,
+        base: Val,
+        off: i16,
+        size: usize,
+        write: bool,
+    ) -> Result<(Region, usize), KernelError> {
+        let Val::Ptr(r, o) = read(base)? else {
+            return acces();
+        };
+        let at = o as i64 + off as i64;
+        let size = size as i64;
+        match r {
+            Region::Ctx if !write && at >= 0 && at + size <= self.kind.ctx_size as i64 => {
+                if at % size != 0 {
+                    return acces();
+                }
+                Ok((r, at as usize))
+            }
+            Region::Stack if at >= -(BPF_STACK_SIZE as i64) && at + size <= 0 => {
+                Ok((r, (at + BPF_STACK_SIZE as i64) as usize))
+            }
+            _ => acces(),
+        }
+    }
+
+    fn load(&mut self, insn: &BpfInsn, st: &mut State) -> Result<(), KernelError> {
+        let size = interp::size_bytes(insn.code);
+        let (r, at) = self.place(st.regs[insn.src_reg() as usize], insn.off, size, false)?;
+        let v = match r {
+            Region::Ctx => UNKNOWN,
+            Region::Stack => {
+                if !st.written(at, size) {
+                    return acces();
+                }
+                let spilled = st.spill[at / 8].filter(|_| size == 8 && at.is_multiple_of(8));
+                match spilled {
+                    Some((r, o)) if bpf_mode(insn.code) == BPF_MEM => Val::Ptr(r, o),
+                    _ => UNKNOWN,
+                }
+            }
+        };
+        st.regs[insn.dst_reg() as usize] = v;
+        Ok(())
+    }
+
+    fn store(&mut self, insn: &BpfInsn, st: &mut State, v: Val) -> Result<(), KernelError> {
+        let size = interp::size_bytes(insn.code);
+        let (_, at) = self.place(st.regs[insn.dst_reg() as usize], insn.off, size, true)?;
+        read(v)?;
+        st.spill[at / 8] = None;
+        st.spill[(at + size - 1) / 8] = None;
+        if let Val::Ptr(r, o) = v {
+            // Only whole, aligned pointer spills
+            if size != 8 || !at.is_multiple_of(8) {
+                return acces();
+            }
+            st.spill[at / 8] = Some((r, o));
+        }
+        st.mark(at, size);
+        self.depth = self.depth.max(BPF_STACK_SIZE - at);
+        Ok(())
+    }
+
+    fn atomic(&mut self, insn: &BpfInsn, st: &mut State) -> Result<(), KernelError> {
+        let size = interp::size_bytes(insn.code);
+        let (r, at) = self.place(st.regs[insn.dst_reg() as usize], insn.off, size, true)?;
+        let s = insn.src_reg() as usize;
+        if r != Region::Stack || !st.written(at, size) || st.spill[at / 8].is_some() {
+            return acces();
+        }
+        if !matches!(read(st.regs[s])?, Val::Scalar(_)) {
+            return acces();
+        }
+        if insn.imm == BPF_CMPXCHG {
+            if !matches!(read(st.regs[0])?, Val::Scalar(_)) {
+                return acces();
+            }
+            st.regs[0] = UNKNOWN;
+        } else if insn.imm & BPF_FETCH != 0 {
+            st.regs[s] = UNKNOWN;
+        }
+        Ok(())
+    }
+
+    fn call(&self, insn: &BpfInsn, st: &mut State) -> Result<(), KernelError> {
+        let n = self
+            .kind
+            .helpers
+            .iter()
+            .find(|h| h.0 == insn.imm)
+            .map_or(0, |h| h.1);
+        for r in 1..=n as usize {
+            if !matches!(read(st.regs[r])?, Val::Scalar(_)) {
+                return acces();
             }
         }
-
+        st.regs[0] = UNKNOWN;
+        for r in &mut st.regs[1..=5] {
+            *r = Val::Uninit;
+        }
         Ok(())
     }
 
-    /// Verify 64-bit immediate load
-    fn verify_ld_imm64(
-        &self,
-        insn: &BpfInsn,
-        pc: usize,
-        state: &mut VerifierState,
-    ) -> Result<(), KernelError> {
-        let dst = insn.dst_reg() as usize;
-
-        // Ensure we have the second instruction
-        if pc + 1 >= self.insns.len() {
-            return Err(KernelError::InvalidArgument);
-        }
-
-        let insn2 = &self.insns[pc + 1];
-
-        // Second instruction must have code 0
-        if insn2.code != 0 {
-            return Err(KernelError::InvalidArgument);
-        }
-
-        // Combine immediates into 64-bit value
-        let imm64 = ((insn2.imm as u64) << 32) | (insn.imm as u32 as u64);
-
-        state.regs[dst] = RegState::constant(imm64 as i64);
-
-        Ok(())
+    /// Whether the jump is taken: Some if decided by constants
+    fn branch(&self, insn: &BpfInsn, st: &State) -> Result<Option<bool>, KernelError> {
+        let a = read(st.regs[insn.dst_reg() as usize])?;
+        let b = if bpf_src(insn.code) == BPF_X {
+            read(st.regs[insn.src_reg() as usize])?
+        } else {
+            Val::Scalar(Some(insn.imm as i64 as u64))
+        };
+        let w32 = bpf_class(insn.code) == BPF_JMP32;
+        Ok(match (a, b) {
+            (Val::Scalar(Some(a)), Val::Scalar(Some(b))) => {
+                interp::cond(bpf_op(insn.code), w32, a, b)
+            }
+            _ => None,
+        })
     }
 
-    /// Verify conditional jump
-    fn verify_jmp_cond(&self, insn: &BpfInsn, state: &VerifierState) -> Result<(), KernelError> {
-        let dst = insn.dst_reg() as usize;
-        let src = insn.src_reg() as usize;
-        let is_src_reg = bpf_src(insn.code) == BPF_X;
-
-        // Destination must be readable
-        if !state.regs[dst].is_readable() {
-            return Err(KernelError::PermissionDenied);
+    /// Whether a checked state at `pc` covers `st`; else keep `st`
+    fn prune(&mut self, pc: usize, st: &State) -> Result<bool, KernelError> {
+        if !self.target[pc] {
+            return Ok(false);
         }
-
-        // Source must be readable if using register
-        if is_src_reg && !state.regs[src].is_readable() {
-            return Err(KernelError::PermissionDenied);
+        let seen = self.seen.entry(pc).or_default();
+        if seen.iter().any(|o| o.covers(st)) {
+            return Ok(true);
         }
-
-        Ok(())
+        if self.stored < MAX_STORED && seen.len() < MAX_PER_TARGET {
+            seen.try_reserve(1).map_err(|_| KernelError::OutOfMemory)?;
+            seen.push(*st);
+            self.stored += 1;
+        }
+        Ok(false)
     }
 
-    /// Verify helper call
-    fn verify_call(&self, insn: &BpfInsn, state: &mut VerifierState) -> Result<(), KernelError> {
-        // R1-R5 are caller-saved, become undefined after call
-        for reg in &mut state.regs[1..=5] {
-            *reg = RegState::new();
+    /// Pass 2: follow every path from the entry
+    fn run(&mut self) -> Result<(), KernelError> {
+        let mut work: Vec<(usize, State)> = Vec::new();
+        work.try_reserve(1).map_err(|_| KernelError::OutOfMemory)?;
+        work.push((0, State::entry()));
+        let mut steps = 0usize;
+        while let Some((mut pc, mut st)) = work.pop() {
+            loop {
+                steps += 1;
+                if steps > COMPLEXITY_LIMIT {
+                    return Err(KernelError::ArgListTooLong);
+                }
+                if self.prune(pc, &st)? {
+                    break;
+                }
+                let insn = &self.insns[pc];
+                let (d, s) = (insn.dst_reg() as usize, insn.src_reg() as usize);
+                match bpf_class(insn.code) {
+                    BPF_ALU | BPF_ALU64 => st.regs[d] = self.alu(insn, &st)?,
+                    BPF_LDX => self.load(insn, &mut st)?,
+                    BPF_ST => {
+                        let v = Val::Scalar(Some(insn.imm as i64 as u64));
+                        self.store(insn, &mut st, v)?;
+                    }
+                    BPF_STX if bpf_mode(insn.code) == BPF_ATOMIC => self.atomic(insn, &mut st)?,
+                    BPF_STX => {
+                        let v = st.regs[s];
+                        self.store(insn, &mut st, v)?;
+                    }
+                    BPF_LD => {
+                        let hi = self.insns[pc + 1].imm as u32 as u64;
+                        st.regs[d] = Val::Scalar(Some(hi << 32 | insn.imm as u32 as u64));
+                    }
+                    _ => match bpf_op(insn.code) {
+                        BPF_EXIT => {
+                            // R0 is the result: a number, never a pointer
+                            if !matches!(st.regs[0], Val::Scalar(_)) {
+                                return acces();
+                            }
+                            break;
+                        }
+                        BPF_CALL => self.call(insn, &mut st)?,
+                        BPF_JA => {}
+                        _ => {
+                            let (_, Some(t)) = successors(self.insns, pc) else {
+                                return inval();
+                            };
+                            match self.branch(insn, &st)? {
+                                Some(true) => {
+                                    pc = t as usize;
+                                    continue;
+                                }
+                                Some(false) => {}
+                                None => {
+                                    if work.len() >= MAX_PENDING {
+                                        return Err(KernelError::ArgListTooLong);
+                                    }
+                                    work.try_reserve(1).map_err(|_| KernelError::OutOfMemory)?;
+                                    work.push((t as usize, st));
+                                }
+                            }
+                        }
+                    },
+                }
+                let (next, jump) = successors(self.insns, pc);
+                pc = match (next, jump) {
+                    (_, Some(t)) if bpf_op(insn.code) == BPF_JA => t as usize,
+                    (Some(n), _) => n,
+                    _ => return inval(),
+                };
+            }
         }
-
-        // R0 contains return value
-        state.regs[BPF_REG_0 as usize] = RegState::scalar();
-
-        // For now, we allow any helper ID
-        // A real verifier would check against allowed helpers for the program type
-        let _helper_id = insn.imm;
-
         Ok(())
-    }
-
-    /// Get access size from instruction code
-    fn access_size(&self, code: u8) -> usize {
-        match bpf_size(code) {
-            BPF_B => 1,
-            BPF_H => 2,
-            BPF_W => 4,
-            BPF_DW => 8,
-            _ => 0,
-        }
     }
 }
 
-// =============================================================================
-// Public API
-// =============================================================================
-
-/// Verify a BPF program
-///
-/// Returns Ok(()) if the program passes verification, Err with errno otherwise.
-///
-/// # Arguments
-/// * `insns` - The BPF instructions to verify
-/// * `ctx_size` - Size of the context structure for bounds checking
-pub fn verify_bpf_prog(insns: &[BpfInsn], ctx_size: usize) -> Result<(), KernelError> {
-    let mut verifier = Verifier::new(insns, ctx_size);
-    verifier.verify()
+/// `r + o + c` if it stays a sane offset
+fn offset(r: Region, o: i32, c: u64) -> Result<Val, KernelError> {
+    let v = o as i64 + c as i64;
+    if (i16::MIN as i64..=i16::MAX as i64).contains(&v) {
+        Ok(Val::Ptr(r, v as i32))
+    } else {
+        acces()
+    }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_simple_exit() {
-        // mov r0, 0; exit
-        let insns = [
-            BpfInsn::new(BPF_ALU64 | BPF_MOV | BPF_K, 0, 0, 0, 0),
-            BpfInsn::new(BPF_JMP | BPF_EXIT, 0, 0, 0, 0),
-        ];
-        assert!(verify_bpf_prog(&insns, 0).is_ok());
+/// Check `insns` for a program of `kind` (Linux bpf_check)
+pub fn verify(insns: &[BpfInsn], kind: &Kind, max: usize) -> Result<Verified, KernelError> {
+    if insns.is_empty() || insns.len() > max {
+        return inval();
     }
-
-    #[test]
-    fn test_missing_exit() {
-        // mov r0, 0 (no exit)
-        let insns = [BpfInsn::new(BPF_ALU64 | BPF_MOV | BPF_K, 0, 0, 0, 0)];
-        assert!(verify_bpf_prog(&insns, 0).is_err());
-    }
-
-    #[test]
-    fn test_uninitialized_read() {
-        // add r0, r2; exit (r2 not initialized)
-        let insns = [
-            BpfInsn::new(BPF_ALU64 | BPF_ADD | BPF_X, 0, 2, 0, 0),
-            BpfInsn::new(BPF_JMP | BPF_EXIT, 0, 0, 0, 0),
-        ];
-        assert!(verify_bpf_prog(&insns, 0).is_err());
-    }
+    let target = check_cfg(insns, kind)?;
+    let mut c = Checker {
+        insns,
+        kind,
+        target,
+        seen: BTreeMap::new(),
+        stored: 0,
+        depth: 0,
+    };
+    c.run()?;
+    Ok(Verified {
+        stack_depth: c.depth,
+    })
 }
