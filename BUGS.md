@@ -177,10 +177,6 @@ Missing:
 - MADV_REMOVE of a file mapping is EOPNOTSUPP (no filesystem punches
   holes); shmdt needs the address an attachment starts at (Linux also
   finds a piece moved by mremap); SHM_EXEC is ignored.
-- Remote writes (ptrace POKEDATA/POKETEXT, process_vm_writev) need a
-  writable VMA: POKE into read-only text fails with EIO (Linux
-  FOLL_FORCE writes a private copy, e.g. for breakpoints), and a page
-  not yet faulted in is not faulted (EIO / short write).
 - munmap or MADV_DONTNEED of part of a 2MB page that cannot be split
   (out of memory) leaves the whole page mapped (Linux preallocates the
   page table); shmat checks RLIMIT_AS before SHM_REMAP unmaps the old
@@ -610,17 +606,17 @@ beyond two each, but nothing asks them under pressure), no slab
 merging, poisoning or red zones.
 
 Heap allocations cannot fail gracefully (Rust's global allocator): one
-the page allocator cannot meet panics. Buffers sized by a syscall
-argument use `kmem::try_vec` (ENOMEM) where nothing else bounds the size
-(listxattr, keyctl read/update, process_vm, io_uring fixed files, bpf
-array maps); the many sites bounded by a sysctl or a constant still
-allocate infallibly. The heap goes down to the min
+neither the slab nor the vmalloc fallback can meet panics. Buffers
+sized by a syscall argument, the network or a disk use `kmem` (`try_vec`,
+`KVec`, `KDeque`: ENOMEM); the many sites bounded by a sysctl or a
+constant still allocate infallibly, as do `Box::new`/`Arc::new` (see
+doc/res/hk-rust-for-linux-idioms.md item 1). The heap goes down to the min
 watermark while user data stops at low (also after direct reclaim:
 user allocations stop at low until the OOM killer (J); then Linux's
 min), so only kernel objects can get there (no memcg or OOM killer bounds what a process pins in pipes,
-sockets or fds); a large contiguous kmalloc can fail first (over 4MB
-always, no vmalloc; above low - min, about 700KB at 512MB, once free
-memory is near the low watermark).
+sockets or fds); a large allocation in atomic context (no vmalloc
+fallback) can fail first (above low - min, about 700KB at 512MB, once
+free memory is near the low watermark).
 
 exec maps PT_LOAD segments from the page cache, except a static PIE
 with no interpreter (hk relocates it in the kernel, so its pages are
