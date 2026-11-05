@@ -438,12 +438,8 @@ impl SuperBlock {
         if self.rdonly() {
             return Ok(());
         }
-        // The references live outside MOUNT_LOCK: a mount whose last
-        // other reference went meanwhile is torn down after the unlock,
-        // never under it (Mount::drop takes dentry and id locks)
-        let mounts: alloc::vec::Vec<Arc<super::mount::Mount>>;
         let ml = super::mount::MOUNT_LOCK.write();
-        mounts = self
+        let mounts: alloc::vec::Vec<Arc<super::mount::Mount>> = self
             .s_mounts
             .lock()
             .iter()
@@ -461,6 +457,9 @@ impl SuperBlock {
             m.unhold_writers();
         }
         unhold_writers(&self.s_writers);
+        // The references go after the unlock: a mount whose last other
+        // reference went meanwhile is torn down outside MOUNT_LOCK
+        // (Mount::drop takes dentry and id locks)
         drop(ml);
         drop(mounts);
         if free { Ok(()) } else { Err(KernelError::Busy) }
