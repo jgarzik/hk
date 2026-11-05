@@ -2,10 +2,6 @@
 
 Optional improvements found while verifying the 2026-11-03 atomics audit; none of these is a bug.
 
-- **pids try-charge allocates on the fork path**: `try_charge` collects
-  the charged levels in a `Vec` so it can undo them. Linux
-  pids_try_charge walks again from the start up to the level that
-  failed, with no allocation. cgroup/pids.rs:60-77.
 - **ShmAttach::drop pairs with IPC_RMID only through the hardware**: the
   last detach does a SeqCst `fetch_sub` and then an Acquire load of
   `deleted`. IPC_RMID does store, fence(SeqCst), load. Under the Rust

@@ -30,6 +30,11 @@
 //!   controller it has itself (ENOENT otherwise); an unknown token is
 //!   EINVAL (Linux cgroup_subtree_control_write).
 //!
+//! - PIDS_EVENTS: a fork refused by a cgroup's pids.max counts in its
+//!   pids.events.local and in pids.events there and above (not below):
+//!   refused at the child, both count 1 in the child and the parent's
+//!   pids.events 1; refused at the parent, only the parent's counters
+//!   move (Linux pids_event).
 //! - CPU_MAX_RW: cpu.max reads back what was written ("max" keeps the
 //!   period); while one process rewrites it with two values, a reader
 //!   only ever sees one of them whole, never one's quota with the
@@ -58,7 +63,100 @@ pub fn run_tests() {
     report(b"CGROUP_PROCS_TGID", in_child(cgroup_procs_tgid));
     report(b"CGROUP_PROCS_EXITED_LEADER", procs_exited_leader());
     report(b"CGROUP_SUBTREE_CONTROL", subtree_control());
+    report(b"PIDS_EVENTS", pids_events());
     report(b"CPU_MAX_RW", cpu_max_rw());
+}
+
+/// The count in "max N" of `file` of cgroup `name`, -1 if unreadable
+fn read_max_event(name: &[u8], file: &[u8]) -> i64 {
+    let mut d = [0u8; 32];
+    let n = read_raw(name, file, &mut d);
+    let Some(rest) = d[..n.max(0) as usize].strip_prefix(b"max ") else {
+        return -1;
+    };
+    let mut v = 0i64;
+    for &c in rest.iter().take_while(|c| c.is_ascii_digit()) {
+        v = v * 10 + (c - b'0') as i64;
+    }
+    v
+}
+
+/// clone3(CLONE_INTO_CGROUP) into `name`; the child exits at once.
+/// The result (EAGAIN when refused)
+fn clone_into(name: &[u8]) -> i64 {
+    let mut b = [0u8; 96];
+    let fd = sys_open(path(&mut b, name, b"").as_ptr(), O_RDONLY | O_DIRECTORY, 0);
+    if fd < 0 {
+        return fd;
+    }
+    let args = CloneArgs {
+        flags: 0x2_0000_0000, // CLONE_INTO_CGROUP
+        pidfd: 0,
+        child_tid: 0,
+        parent_tid: 0,
+        exit_signal: 17,
+        stack: 0,
+        stack_size: 0,
+        tls: 0,
+        set_tid: 0,
+        set_tid_size: 0,
+        cgroup: fd as u64,
+    };
+    let r = sys_clone3(&args, core::mem::size_of::<CloneArgs>());
+    if r == 0 {
+        sys_exit(0);
+    }
+    sys_close(fd as u64);
+    if r > 0 {
+        let mut ws = 0;
+        sys_wait4(r, &mut ws, 0, 0);
+    }
+    r
+}
+
+fn pids_events() -> i64 {
+    const P: &[u8] = b"pev";
+    const C: &[u8] = b"pev/c";
+    let mut b = [0u8; 96];
+    sys_mkdir(path(&mut b, P, b"").as_ptr(), 0o755);
+    write_file(P, b"cgroup.subtree_control", b"+pids");
+    sys_mkdir(path(&mut b, C, b"").as_ptr(), 0o755);
+    let step = (|| {
+        let ev = |cg, f| read_max_event(cg, f);
+        if write_file(C, b"pids.max", b"0") < 0 {
+            return 1;
+        }
+        if clone_into(C) != EAGAIN {
+            return 2;
+        }
+        let got = [
+            ev(C, b"pids.events"),
+            ev(C, b"pids.events.local"),
+            ev(P, b"pids.events"),
+            ev(P, b"pids.events.local"),
+        ];
+        if got != [1, 1, 1, 0] {
+            return 10 + got.iter().fold(0, |a, &x| a * 10 + x);
+        }
+        write_file(C, b"pids.max", b"max");
+        write_file(P, b"pids.max", b"0");
+        if clone_into(C) != EAGAIN {
+            return 3;
+        }
+        let got = [
+            ev(C, b"pids.events"),
+            ev(C, b"pids.events.local"),
+            ev(P, b"pids.events"),
+            ev(P, b"pids.events.local"),
+        ];
+        if got != [1, 1, 2, 1] {
+            return 100_000 + got.iter().fold(0, |a, &x| a * 10 + x);
+        }
+        0
+    })();
+    sys_rmdir(path(&mut b, C, b"").as_ptr());
+    sys_rmdir(path(&mut b, P, b"").as_ptr());
+    step
 }
 
 /// The whole of `file` of cgroup `name` in `d`; its length or -errno
