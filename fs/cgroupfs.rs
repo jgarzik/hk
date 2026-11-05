@@ -31,10 +31,7 @@ use super::file::{DirContext, DirEntry, File, FileOps};
 use super::inode::{AsAny, FileType, Inode, InodeData, InodeMode, InodeOps, Timespec};
 use super::superblock::{FileSystemType, StatFs, SuperBlock, SuperOps};
 
-use crate::cgroup::{
-    CGROUP_ROOT, Cgroup, ControllerType, cgroup_attach_task, cgroup_init, cgroup_mkdir,
-    cgroup_rmdir,
-};
+use crate::cgroup::{CGROUP_ROOT, Cgroup, ControllerType, cgroup_init, cgroup_mkdir, cgroup_rmdir};
 use crate::task::Pid;
 
 /// Cgroup2 superblock magic
@@ -448,10 +445,7 @@ fn handle_control_file_write(
             // The whole thread group moves, against forks (Linux
             // cgroup_procs_write: cgroup_attach_lock, threadgroup)
             let _tg = crate::cgroup::CGROUP_THREADGROUP_RWSEM.write();
-            for tid in crate::cgroup::thread_group(pid)? {
-                cgroup_attach_task(cgroup, tid as Pid)?;
-            }
-            Ok(())
+            crate::cgroup::migrate_thread_group(cgroup, pid)
         }
         CgroupControlFileType::SubtreeControl => {
             // Enable/disable controllers for children

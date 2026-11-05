@@ -655,49 +655,62 @@ pub fn cgroup_init() {
     }
 }
 
-/// Attach a task to a cgroup
-///
-/// Migrates the task from its current cgroup to the target cgroup.
-pub fn cgroup_attach_task(target_cg: &Arc<Cgroup>, pid: Pid) -> Result<(), KernelError> {
+/// Move the process `pid` names into `target` (Linux cgroup_migrate,
+/// under CGROUP_MUTEX and CGROUP_THREADGROUP_RWSEM write): every
+/// controller's can_attach for every live thread first, so a refusal
+/// moves none; then each thread under its own cgroup pointer's lock,
+/// which exit also takes to detach it, so a thread that exits meanwhile
+/// is skipped, never re-attached
+pub fn migrate_thread_group(target: &Arc<Cgroup>, pid: Pid) -> Result<(), KernelError> {
     let root = CGROUP_ROOT.clone();
-
-    // Get old cgroup if any
-    let old_cg = get_task_cgroup(pid);
-
-    // Call can_attach on all controllers
-    for controller in target_cg.enabled_controllers() {
-        if let Some(css) = target_cg.css(controller)
-            && let Some(ops) = root.get_controller(controller)
-        {
-            ops.can_attach(&css, pid)?;
+    let tids = thread_group(pid)?;
+    let ctrls: Vec<_> = target
+        .enabled_controllers()
+        .into_iter()
+        .filter_map(|c| Some((target.css(c)?, root.get_controller(c)?)))
+        .collect();
+    for &tid in &tids {
+        for (css, ops) in &ctrls {
+            ops.can_attach(css, tid as Pid)?;
         }
     }
+    for tid in tids {
+        migrate_one(&root, target, tid);
+    }
+    Ok(())
+}
 
-    // Detach from old cgroup
-    if let Some(ref old) = old_cg {
-        for controller in old.enabled_controllers() {
-            if let Some(css) = old.css(controller)
-                && let Some(ops) = root.get_controller(controller)
-            {
+/// One thread's move (Linux cgroup_migrate_execute for one task)
+fn migrate_one(root: &CgroupRoot, target: &Arc<Cgroup>, tid: Tid) {
+    let Some(t) = task(tid as Pid) else {
+        return;
+    };
+    let mut slot = t.cgroup.lock();
+    // Exiting: exit owns it (Linux skips PF_EXITING). Exit sets the flag
+    // before it detaches under this lock, so a thread seen live here is
+    // detached from wherever this leaves it
+    if t.has_flag(crate::task::pf::EXITING) {
+        return;
+    }
+    let pid = tid as Pid;
+    if let Some(old) = slot.clone() {
+        if Arc::ptr_eq(&old, target) {
+            return;
+        }
+        for c in old.enabled_controllers() {
+            if let (Some(css), Some(ops)) = (old.css(c), root.get_controller(c)) {
                 ops.detach(&css, pid);
             }
         }
         old.remove_task(pid);
     }
-
-    // Attach to new cgroup
-    for controller in target_cg.enabled_controllers() {
-        if let Some(css) = target_cg.css(controller)
-            && let Some(ops) = root.get_controller(controller)
-        {
-            ops.attach(&css, pid)?;
+    for c in target.enabled_controllers() {
+        if let (Some(css), Some(ops)) = (target.css(c), root.get_controller(c)) {
+            let _ = ops.attach(&css, pid);
         }
     }
-
-    target_cg.add_task(pid);
-    set_task_cgroup(pid, target_cg.clone());
-
-    Ok(())
+    target.add_task(pid);
+    *slot = Some(target.clone());
 }
 
 /// Detach a task from its cgroup (on exit)
@@ -744,7 +757,7 @@ pub fn thread_group(pid: Pid) -> Result<Vec<Tid>, KernelError> {
     let tgid = table.get(tid).ok_or(KernelError::NoProcess)?.task.pid;
     Ok(table
         .iter()
-        .filter(|t| t.task.pid == tgid)
+        .filter(|t| t.task.pid == tgid && !t.task.has_flag(crate::task::pf::EXITING))
         .map(|t| t.task.tid())
         .collect())
 }
@@ -839,16 +852,23 @@ pub struct ForkCg {
     _lock: Option<crate::sync::MutexGuard<'static, ()>>,
 }
 
-/// Admit a new task into `cg` (Linux cgroup_can_fork on the target
-/// css_set: the parent's cgroup or, `into`, the CLONE_INTO_CGROUP one,
-/// which is locked and must not be dead: ENODEV): every enabled
-/// controller's `can_fork`, undone if a later one refuses
-pub fn can_fork(cg: &Arc<Cgroup>, into: bool) -> Result<ForkCg, KernelError> {
-    let lock = into.then(|| CGROUP_MUTEX.lock());
+/// Admit a new task into its cgroup (Linux cgroup_css_set_fork +
+/// cgroup_can_fork): `into`, the CLONE_INTO_CGROUP one, which is locked
+/// and must not be dead (ENODEV), else the parent's, read under
+/// CGROUP_THREADGROUP_RWSEM so no migration moves the parent in between;
+/// every enabled controller's `can_fork`, undone if a later one
+/// refuses. None when the parent is in no cgroup.
+pub fn can_fork(into: Option<Arc<Cgroup>>) -> Result<Option<ForkCg>, KernelError> {
+    let lock = into.is_some().then(|| CGROUP_MUTEX.lock());
     let tg = CGROUP_THREADGROUP_RWSEM.read();
-    if into && cg.is_dead() {
-        return Err(KernelError::NoDevice);
-    }
+    let cg = match into {
+        Some(cg) if cg.is_dead() => return Err(KernelError::NoDevice),
+        Some(cg) => cg,
+        None => match get_task_cgroup(crate::task::percpu::current_tid() as Pid) {
+            Some(cg) => cg,
+            None => return Ok(None),
+        },
+    };
     let mut fc = ForkCg {
         cg: cg.clone(),
         charged: Vec::new(),
@@ -863,7 +883,7 @@ pub fn can_fork(cg: &Arc<Cgroup>, into: bool) -> Result<ForkCg, KernelError> {
             fc.charged.push(controller);
         }
     }
-    Ok(fc)
+    Ok(Some(fc))
 }
 
 impl ForkCg {

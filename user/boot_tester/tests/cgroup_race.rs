@@ -22,6 +22,10 @@
 //!   cgroup.procs moves its whole thread group, and cgroup.procs lists
 //!   the process once (Linux: threadgroup migration under
 //!   cgroup_threadgroup_rwsem).
+//! - CGROUP_PROCS_EXITED_LEADER: a process whose main thread has exited
+//!   is moved by its remaining thread: the exited leader is skipped
+//!   (Linux: PF_EXITING), so once the process is gone the cgroup is
+//!   empty (rmdir works) and its pids charge is back to 0.
 //!
 //! Runs after cgroup.rs, which mounts cgroup2 at /sys/fs/cgroup and
 //! enables +pids at the root.
@@ -44,6 +48,7 @@ pub fn run_tests() {
     report(b"CGROUP_DEAD_ENODEV", cgroup_dead_enodev());
     report(b"CGROUP_RMDIR_RACE", cgroup_rmdir_race());
     report(b"CGROUP_PROCS_TGID", in_child(cgroup_procs_tgid));
+    report(b"CGROUP_PROCS_EXITED_LEADER", procs_exited_leader());
 }
 
 fn report(name: &[u8], step: i64) {
@@ -503,6 +508,69 @@ fn cgroup_procs_tgid() -> i64 {
         .count();
     if lines != 1 {
         return 4;
+    }
+    0
+}
+
+static mut STACK2: Stack = Stack([0; 16384]);
+static mut CTID2: u32 = 0;
+static mut LEADER: u64 = 0;
+
+/// The remaining thread: wait for the leader's exit, move the process,
+/// end it (exit status 0 if the write worked)
+extern "C" fn mover_thread(_: u64) -> ! {
+    // SAFETY: LEADER was set before this thread was created
+    let pid = unsafe { LEADER };
+    let ts = hk_syscall::Timespec {
+        tv_sec: 0,
+        tv_nsec: 50_000_000,
+    };
+    hk_syscall::sys_nanosleep(&ts, core::ptr::null_mut());
+    let mut d = [0u8; 12];
+    let mut k = d.len();
+    let mut v = pid;
+    loop {
+        k -= 1;
+        d[k] = b'0' + (v % 10) as u8;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    let ok = write_file(b"pl_lead", b"cgroup.procs", &d[k..]) > 0;
+    hk_syscall::sys_exit_group(!ok as u64)
+}
+
+fn procs_exited_leader() -> i64 {
+    let cg = b"pl_lead";
+    let mut b = [0u8; 96];
+    if sys_mkdir(path(&mut b, cg, b"").as_ptr(), 0o755) != 0 {
+        return 90;
+    }
+    let pid = sys_fork();
+    if pid == 0 {
+        // SAFETY: set before the thread exists; the thread runs on its
+        // own static stack until the group exits
+        unsafe {
+            LEADER = sys_getpid() as u64;
+            let top = (&raw mut STACK2 as *mut u8).add(16384) as u64;
+            super::fork_mm::spawn_thread(top, mover_thread, 0, &raw mut CTID2);
+        }
+        // The main thread alone ends
+        sys_exit(0);
+    }
+    let mut ws = 0;
+    sys_wait4(pid, &mut ws, 0, 0);
+    let current = read_num(cg, b"pids.current");
+    let rm = sys_rmdir(path(&mut b, cg, b"").as_ptr());
+    if ws != 0 {
+        return 1;
+    }
+    if current != 0 {
+        return 10 + current;
+    }
+    if rm != 0 {
+        return 2;
     }
     0
 }
