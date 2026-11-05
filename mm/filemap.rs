@@ -835,6 +835,9 @@ pub fn truncate_setsize(inode: &Inode, size: u64) {
 /// read back as zeroes), the partial pages at either edge zeroed in
 /// place. The caller holds i_rwsem.
 pub fn punch_range(inode: &Inode, start: u64, end: u64) {
+    if start >= end {
+        return;
+    }
     let m = &inode.i_data;
     let ps = PAGE_SIZE as u64;
     let (first, past) = (start.div_ceil(ps), end / ps);

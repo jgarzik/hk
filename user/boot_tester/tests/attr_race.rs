@@ -17,7 +17,8 @@
 //!   EOPNOTSUPP for a bad mode or a mode the filesystem lacks, ESPIPE
 //!   for a pipe, EFBIG on overflow).
 //! - FALLOCATE_PUNCH: a punched hole reads back as zeroes, the bytes
-//!   around it stay, the size does not change.
+//!   around it stay, the size does not change; a hole past EOF changes
+//!   nothing.
 //! - FALLOCATE_RACE: fallocate extending a file that a writer is
 //!   growing never moves its size backwards.
 
@@ -261,6 +262,16 @@ fn fallocate_punch() -> R {
             let want = if hole { 0 } else { 0xCD };
             check(b"byte", b == want, i as i64)?;
         }
+        // A hole wholly past EOF, starting beyond a partial last page,
+        // touches nothing below EOF
+        hk_syscall::sys_ftruncate(fd as i32, 5000);
+        sys_pwrite64(fd as i32, buf.as_ptr(), 904, 4096);
+        let r = hk_syscall::sys_fallocate(fd as i32, PUNCH_HOLE | KEEP_SIZE, 8192, 4096);
+        check(b"punch past EOF", r == 0, r)?;
+        let mut tail = [0u8; 904];
+        let n = sys_pread64(fd as i32, tail.as_mut_ptr(), 904, 4096);
+        check(b"tail read", n == 904, n)?;
+        check(b"tail kept", tail.iter().all(|&b| b == 0xCD), 0)?;
         Ok(())
     })();
     sys_close(fd as u64);

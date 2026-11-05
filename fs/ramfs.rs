@@ -548,6 +548,8 @@ impl InodeOps for RamfsInodeOps {
         }
         let end = offset + len;
         if mode & FALLOC_FL_PUNCH_HOLE != 0 {
+            // Nothing is cached past i_size: only the part of the hole
+            // below it (a hole wholly past EOF changes nothing)
             filemap::punch_range(inode, offset, end.min(inode.get_size()));
         } else {
             inode.newsize_ok(end)?;
