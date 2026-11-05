@@ -84,16 +84,13 @@ pub fn read_rtc() -> i64 {
         // Handle AM/PM bit in 12-hour mode before BCD conversion
         let pm = hour & 0x80 != 0;
         hour = bcd_to_bin(hour & 0x7F);
-        if !is_24hour && pm {
-            hour = (hour % 12) + 12;
+        if !is_24hour {
+            hour = hour12(hour, pm);
         }
         year = bcd_to_bin(year);
     } else if !is_24hour {
         let pm = hour & 0x80 != 0;
-        hour &= 0x7F;
-        if pm {
-            hour = (hour % 12) + 12;
-        }
+        hour = hour12(hour & 0x7F, pm);
     }
 
     // Convert to binary values
@@ -103,15 +100,34 @@ pub fn read_rtc() -> i64 {
     // Assume 21st century (year 00-99 -> 2000-2099)
     let year_full = 2000 + year as i64;
 
-    // Convert to Unix timestamp
-    date_to_unix(
-        year_full,
+    // A time the clock cannot hold starts the system at 0 (Linux
+    // rtc_valid_tm, then mach_get_cmos_time)
+    let (month, day, hour, min, sec) = (
         month as i64,
         day as i64,
         hour as i64,
         min as i64,
         sec as i64,
-    )
+    );
+    if !valid(year_full, month, day, hour, min, sec) {
+        return 0;
+    }
+    date_to_unix(year_full, month, day, hour, min, sec)
+}
+
+/// A 12-hour clock's hour in 24 hours: 12 AM is 0, 12 PM is 12
+fn hour12(hour: u8, pm: bool) -> u8 {
+    hour % 12 + if pm { 12 } else { 0 }
+}
+
+/// A real date and time (Linux rtc_valid_tm; month 1-based here)
+fn valid(year: i64, month: i64, day: i64, hour: i64, min: i64, sec: i64) -> bool {
+    const DAYS_IN_MONTH: [i64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    if !(1..=12).contains(&month) || year < 1970 {
+        return false;
+    }
+    let mdays = DAYS_IN_MONTH[(month - 1) as usize] + (month == 2 && is_leap_year(year)) as i64;
+    (1..=mdays).contains(&day) && hour < 24 && min < 60 && sec < 60 && hour >= 0
 }
 
 /// Convert date/time to Unix timestamp (seconds since 1970-01-01 00:00:00 UTC)
@@ -145,4 +161,27 @@ fn date_to_unix(year: i64, month: i64, day: i64, hour: i64, min: i64, sec: i64) 
 /// Check if a year is a leap year
 fn is_leap_year(year: i64) -> bool {
     (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hours_and_dates() {
+        assert_eq!(hour12(12, false), 0);
+        assert_eq!(hour12(12, true), 12);
+        assert_eq!(hour12(1, true), 13);
+        assert_eq!(hour12(11, false), 11);
+        assert!(valid(2026, 2, 28, 23, 59, 59));
+        assert!(!valid(2026, 2, 29, 0, 0, 0));
+        assert!(valid(2028, 2, 29, 0, 0, 0));
+        assert!(!valid(2026, 13, 1, 0, 0, 0));
+        assert!(!valid(2026, 14, 1, 0, 0, 0));
+        assert!(!valid(2026, 0, 1, 0, 0, 0));
+        assert!(!valid(2026, 1, 32, 0, 0, 0));
+        assert!(!valid(2026, 1, 1, 24, 0, 0));
+        assert_eq!(date_to_unix(1970, 1, 1, 0, 0, 0), 0);
+        assert_eq!(date_to_unix(2000, 3, 1, 0, 0, 0), 951_868_800);
+    }
 }

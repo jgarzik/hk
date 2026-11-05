@@ -951,7 +951,6 @@ Ranked. Not yet confirmed by a test.
 1. **ABI**: adjtimex keeps
    the NTP frequency but does not steer the clock by it, and maxerror
    does not grow each second (Linux second_overflow).
-2. **Minor**: `arch/x86_64/rtc.rs:131` panics on a CMOS month >= 14
-   and keeps 12 AM as hour 12; vfat short names can start with a space;
+2. **Minor**: vfat short names can start with a space;
    the `fs/dac.rs` header says there are no supplementary groups
    (`in_group` uses them).
