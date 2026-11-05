@@ -32,6 +32,11 @@ pub const CPU_WEIGHT_MAX: u64 = 10000;
 pub const CPU_QUOTA_UNLIMITED: u64 = u64::MAX;
 /// Default period (100ms in microseconds)
 pub const CPU_PERIOD_DEFAULT: u64 = 100_000;
+/// Linux min_bw_quota_period_us / max_bw_quota_period_us (1 ms, 1 s)
+const CPU_PERIOD_MIN: u64 = 1_000;
+const CPU_PERIOD_MAX: u64 = 1_000_000;
+/// Linux max_bw_runtime_us (MAX_BW: 2^44 - 1 us)
+const CPU_QUOTA_MAX: u64 = (1 << 44) - 1;
 
 /// cpu.weight and cpu.max: what a write sets together and a read sees
 /// together (Linux keeps quota and period under cfs_b->lock)
@@ -80,14 +85,21 @@ impl CpuState {
         (b.quota, b.period)
     }
 
-    /// Set the bandwidth limit; `period` None keeps the current one
-    /// (decided under the same hold as the store)
-    pub fn set_max(&self, quota: u64, period: Option<u64>) {
+    /// Set the bandwidth limit; `period` None keeps the current one.
+    /// Linux tg_set_bandwidth's bounds, checked in the same hold as the
+    /// store (the kept period is the one in it): a period from 1 ms to
+    /// 1 s, a quota ("max" aside) from 1 ms to MAX_BW, else EINVAL
+    pub fn set_max(&self, quota: u64, period: Option<u64>) -> Result<(), KernelError> {
         let mut b = self.bw.lock();
-        b.quota = quota;
-        if let Some(p) = period {
-            b.period = p;
+        let p = period.unwrap_or(b.period);
+        if !(CPU_PERIOD_MIN..=CPU_PERIOD_MAX).contains(&p)
+            || (quota != CPU_QUOTA_UNLIMITED && !(CPU_PERIOD_MIN..=CPU_QUOTA_MAX).contains(&quota))
+        {
+            return Err(KernelError::InvalidArgument);
         }
+        b.quota = quota;
+        b.period = p;
+        Ok(())
     }
 }
 
@@ -195,8 +207,7 @@ fn cpu_max_write(css: &CgroupSubsysState, data: &[u8]) -> Result<(), KernelError
             None => None,
         };
 
-        state.set_max(quota, period);
-        Ok(())
+        state.set_max(quota, period)
     } else {
         Err(KernelError::Io)
     }

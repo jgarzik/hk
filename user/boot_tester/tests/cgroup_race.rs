@@ -36,7 +36,7 @@
 //!   pids.events 1; refused at the parent, only the parent's counters
 //!   move (Linux pids_event).
 //! - CPU_MAX_RW: cpu.max reads back what was written ("max" keeps the
-//!   period); while one process rewrites it with two values, a reader
+//!   period; out of Linux's bounds is EINVAL); while one process rewrites it with two values, a reader
 //!   only ever sees one of them whole, never one's quota with the
 //!   other's period.
 //!
@@ -53,6 +53,7 @@ use hk_syscall::{
 };
 
 const EAGAIN: i64 = -11;
+const EINVAL: i64 = -22;
 
 pub fn run_tests() {
     report(b"PIDS_MAX_FORK", pids_max_fork());
@@ -193,6 +194,16 @@ fn cpu_max_rw() -> i64 {
         let n = read_raw(CG, b"cpu.max", &mut d);
         if n < 0 || &d[..n as usize] != b"max 100000\n" {
             return 4;
+        }
+        // Linux tg_set_bandwidth bounds: EINVAL, nothing changed
+        for bad in [&b"max 0"[..], b"0 100000", b"500 100000", b"max 2000000"] {
+            if write_file(CG, b"cpu.max", bad) != EINVAL {
+                return 6;
+            }
+        }
+        let n = read_raw(CG, b"cpu.max", &mut d);
+        if n < 0 || &d[..n as usize] != b"max 100000\n" {
+            return 7;
         }
         write_file(CG, b"cpu.max", A);
         let pid = sys_fork();
