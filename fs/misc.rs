@@ -505,8 +505,9 @@ fn xattr_error_to_errno(e: KernelError) -> i64 {
 fn copy_xattr_value_from_user(value_ptr: u64, size: u64) -> Result<alloc::vec::Vec<u8>, i64> {
     use crate::uaccess::copy_from_user;
 
+    // Linux setxattr_copy: E2BIG
     if size > XATTR_SIZE_MAX as u64 {
-        return Err(KernelError::Range.sysret());
+        return Err(KernelError::ArgListTooLong.sysret());
     }
 
     if size == 0 {
@@ -752,10 +753,8 @@ fn do_getxattr(
         }
     }
 
-    // Validate size
-    if size > XATTR_SIZE_MAX as u64 {
-        return KernelError::Range.sysret();
-    }
+    // A larger buffer is clamped (Linux do_getxattr): no value is longer
+    let size = size.min(XATTR_SIZE_MAX as u64);
 
     // Validate user buffer
     if !Uaccess::access_ok(value_ptr, size as usize) {
@@ -815,10 +814,8 @@ pub fn sys_fgetxattr(fd: i32, name_ptr: u64, value_ptr: u64, size: u64) -> i64 {
         }
     }
 
-    // Validate size
-    if size > XATTR_SIZE_MAX as u64 {
-        return KernelError::Range.sysret();
-    }
+    // A larger buffer is clamped (Linux do_getxattr): no value is longer
+    let size = size.min(XATTR_SIZE_MAX as u64);
 
     // Validate user buffer
     if !Uaccess::access_ok(value_ptr, size as usize) {

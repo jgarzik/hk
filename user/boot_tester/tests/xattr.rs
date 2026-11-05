@@ -43,6 +43,43 @@ pub fn run_tests() {
     test_removexattr_enodata();
     test_xattr_on_directory();
     test_getxattr_erange();
+    test_xattr_size_limits();
+}
+
+/// A getxattr buffer past XATTR_SIZE_MAX is clamped, not refused; a
+/// setxattr value past it is E2BIG (Linux do_getxattr, setxattr_copy)
+fn test_xattr_size_limits() {
+    const E2BIG: i64 = -7;
+    const BIG: usize = 100_000;
+    let path = b"/tmp/xattr_size\0";
+    let name = b"user.s\0";
+    let fd = sys_open(path.as_ptr(), O_RDWR | O_CREAT, 0o644);
+    let buf = hk_syscall::sys_mmap(0, BIG as u64, 3, 0x22, -1, 0);
+    let step = if fd < 0 || buf < 0 {
+        1
+    } else if sys_setxattr(path.as_ptr(), name.as_ptr(), b"abcd".as_ptr(), 4, 0) != 0 {
+        2
+    } else if sys_getxattr(path.as_ptr(), name.as_ptr(), buf as *mut u8, BIG) != 4 {
+        3
+    } else if sys_setxattr(path.as_ptr(), name.as_ptr(), buf as *const u8, 70_000, 0) != E2BIG {
+        4
+    } else {
+        0
+    };
+    if fd >= 0 {
+        sys_close(fd as u64);
+    }
+    if buf >= 0 {
+        hk_syscall::sys_munmap(buf as u64, BIG as u64);
+    }
+    print(b"XATTR_SIZE_LIMITS");
+    if step == 0 {
+        println(b":OK");
+    } else {
+        print(b":FAIL step ");
+        print_num(step);
+        println(b"");
+    }
 }
 
 /// Test basic setxattr and getxattr
