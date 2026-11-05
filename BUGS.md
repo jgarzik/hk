@@ -902,7 +902,10 @@ sched pid 0, flock/POSIX release, signalfd reader, errno flattening.
   /proc/sys is one static tree: the sysctls Linux registers for the
   initial network namespace only (net/ipv4/tcp_mem,
   net/core/mem_pcpu_rsv) appear in every
-  namespace.
+  namespace. /proc/sys/net values act on the namespace of the task
+  reading or writing, not the one the file was opened in (Linux binds
+  the file to the opener's namespace): an fd passed across namespaces
+  reads and writes the other one's values.
 - **Stale comments and dead code** (as touched): about 155
   `#[allow(dead_code)]`, 90 "for now"/TODO markers; comments that
   contradict the code in `ns/mod.rs` (setns) and `task/misc.rs`.
