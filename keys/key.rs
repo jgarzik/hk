@@ -104,6 +104,10 @@ pub const KEY_NEED_LINK: u32 = 0x10;
 /// Need SETATTR permission
 pub const KEY_NEED_SETATTR: u32 = 0x20;
 
+/// Deepest a keyring search or reachability walk goes (Linux
+/// KEYRING_SEARCH_MAX_DEPTH): bounds recursion over nested keyrings
+pub(crate) const KEYRING_SEARCH_MAX_DEPTH: u32 = 6;
+
 /// Key state enumeration
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
@@ -307,7 +311,7 @@ impl Key {
     /// Whether `serial` is this keyring or reachable from it through
     /// nested keyrings, at most `depth` levels (Linux
     /// KEYRING_SEARCH_MAX_DEPTH)
-    pub fn keyring_reaches(&self, serial: KeySerial, depth: u32) -> bool {
+    pub(crate) fn keyring_reaches(&self, serial: KeySerial, depth: u32) -> bool {
         if self.serial == serial {
             return true;
         }
@@ -353,6 +357,19 @@ impl Key {
     pub fn keyring_add(&self, key_serial: KeySerial) -> Result<(), i64> {
         if !self.is_keyring() {
             return Err(KernelError::NotDirectory.sysret());
+        }
+
+        // A keyring may not be linked into itself or into one it already
+        // reaches (Linux keyring_detect_cycle: EDEADLK), or a search
+        // would recurse without end
+        if key_serial == self.serial {
+            return Err(KernelError::Deadlock.sysret());
+        }
+        if let Some(k) = super::lookup_key(key_serial)
+            && k.is_keyring()
+            && k.keyring_reaches(self.serial, KEYRING_SEARCH_MAX_DEPTH)
+        {
+            return Err(KernelError::Deadlock.sysret());
         }
 
         let mut keys = self.keyring_keys.write();
@@ -427,7 +444,13 @@ impl Key {
         type_name: &str,
         description: &str,
     ) -> Option<KeySerial> {
-        if !self.is_keyring() {
+        self.search_depth(type_name, description, KEYRING_SEARCH_MAX_DEPTH)
+    }
+
+    /// At most `depth` nested keyrings deep (Linux KEYRING_SEARCH_MAX_DEPTH),
+    /// so a keyring cycle cannot drive unbounded recursion
+    fn search_depth(&self, type_name: &str, description: &str, depth: u32) -> Option<KeySerial> {
+        if !self.is_keyring() || depth == 0 {
             return None;
         }
 
@@ -446,7 +469,7 @@ impl Key {
                 }
                 // Recursively search nested keyrings
                 if key.is_keyring()
-                    && let Some(found) = key.keyring_search_recursive(type_name, description)
+                    && let Some(found) = key.search_depth(type_name, description, depth - 1)
                 {
                     return Some(found);
                 }

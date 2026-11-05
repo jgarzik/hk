@@ -220,7 +220,7 @@ pub fn keyring_unlink(keyring: &Key, key: &Key) -> Result<(), i64> {
 /// thread, process or session keyring, or the user-session keyring when
 /// there is no session keyring
 pub fn possessed(key: &Key, tid: u64) -> bool {
-    const KEYRING_SEARCH_MAX_DEPTH: u32 = 6;
+    use super::key::KEYRING_SEARCH_MAX_DEPTH;
     let k = get_task_keyrings(tid);
     let session = k.session_keyring.or_else(|| {
         let uid = crate::task::percpu::current_cred().uid;
