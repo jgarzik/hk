@@ -62,8 +62,8 @@
 /// A lock guard that can let its lock go for a while (the waits that
 /// take a guard: [`WaitQueue::wait_event_interruptible_locked`])
 pub trait Relock {
-    /// Release the lock, run `f`, take the lock again. Kernel panics do
-    /// not unwind, so a panic in `f` cannot release the lock twice.
+    /// Release the lock, run `f`, take the lock again, also when `f`
+    /// unwinds (host tests), so the guard is never released twice
     fn unlocked<R>(&mut self, f: impl FnOnce() -> R) -> R;
 }
 
@@ -748,4 +748,35 @@ fn test_page_wait_table_hash() {
     );
 
     printkln!("  page wait table hash: OK");
+}
+
+#[cfg(test)]
+mod relock_tests {
+    extern crate std;
+    use super::Relock;
+    use crate::arch::IrqSpinlock;
+    use core::panic::AssertUnwindSafe;
+
+    /// A closure that unwinds out of `unlocked` leaves the lock held
+    /// again, so the guard still owns it (no double release)
+    #[test]
+    fn irqspinlock_relocks_on_unwind() {
+        let l = IrqSpinlock::new(0u32);
+        let mut g = l.lock();
+        let r = std::panic::catch_unwind(AssertUnwindSafe(|| g.unlocked(|| panic!("boom"))));
+        assert!(r.is_err());
+        assert!(l.try_lock().is_none(), "lock released by the unwind");
+        *g += 1;
+        drop(g);
+        assert_eq!(*l.lock(), 1);
+    }
+
+    #[test]
+    fn relock_after_normal_return() {
+        let l = IrqSpinlock::new(5u32);
+        let mut g = l.lock();
+        assert_eq!(g.unlocked(|| 7), 7);
+        assert!(l.try_lock().is_none());
+        drop(g);
+    }
 }

@@ -197,13 +197,18 @@ impl<'a, T> IrqSpinlockGuard<'a, T> {
 impl<T> crate::sync::waitqueue::Relock for IrqSpinlockGuard<'_, T> {
     fn unlocked<R>(&mut self, f: impl FnOnce() -> R) -> R {
         let lock = self.lock;
+        let me: *mut Self = self;
         // SAFETY: the guard is dropped (unlock, IRQ state restored) and
-        // rewritten below before anything reads it; panics abort, so no
-        // path sees it dropped
-        unsafe { core::ptr::drop_in_place(self) };
+        // rewritten by `relock` before anything reads it
+        unsafe { core::ptr::drop_in_place(me) };
+        // Taken again however `f` ends, unwinding included (host tests
+        // unwind), so the caller's guard is never dropped twice
+        let relock = crate::util::scope::ScopeGuard::new(|()| {
+            // SAFETY: `*me` was dropped above, so writing it leaks nothing
+            unsafe { core::ptr::write(me, lock.lock()) };
+        });
         let r = f();
-        // SAFETY: `self` was dropped above, so writing it leaks nothing
-        unsafe { core::ptr::write(self, lock.lock()) };
+        drop(relock);
         r
     }
 }
