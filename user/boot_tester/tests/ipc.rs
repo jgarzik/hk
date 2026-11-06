@@ -9,12 +9,12 @@
 
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
-    FdSet, GETALL, GETVAL, IPC_CREAT, IPC_PRIVATE, IPC_RMID, IPC_STAT, IoVec, O_RDONLY, POLLIN,
-    POLLNVAL, POLLOUT, PollFd, SETALL, SETVAL, Sembuf, Semid64Ds, Timespec, Timeval,
+    FdSet, GETALL, GETVAL, IPC_CREAT, IPC_PRIVATE, IPC_RMID, IPC_STAT, IoVec, O_NONBLOCK, O_RDONLY,
+    POLLIN, POLLNVAL, POLLOUT, PollFd, SETALL, SETVAL, Sembuf, Semid64Ds, Timespec, Timeval,
     sys_clock_gettime, sys_close, sys_msgctl, sys_msgget, sys_msgrcv, sys_msgsnd, sys_open,
-    sys_pipe, sys_poll, sys_read, sys_select, sys_semctl, sys_semget, sys_semop, sys_semtimedop,
-    sys_sendfile, sys_shmat, sys_shmctl, sys_shmdt, sys_shmget, sys_splice, sys_tee, sys_vmsplice,
-    sys_write,
+    sys_pipe, sys_pipe2, sys_poll, sys_read, sys_select, sys_semctl, sys_semget, sys_semop,
+    sys_semtimedop, sys_sendfile, sys_shmat, sys_shmctl, sys_shmdt, sys_shmget, sys_splice,
+    sys_tee, sys_vmsplice, sys_write,
 };
 
 /// Run all IPC tests
@@ -24,6 +24,7 @@ pub fn run_tests() {
     // Pipe tests
     test_pipe_basic();
     test_pipe_read_write();
+    test_pipe_read_edges();
     test_poll_data_ready();
     test_poll_no_data();
     test_poll_invalid_fd();
@@ -141,6 +142,37 @@ fn test_pipe_read_write() {
         println(b"PIPE_RW:OK");
     } else {
         println(b"PIPE_RW:FAIL");
+    }
+}
+
+/// Linux pipe_read: a zero-length read returns 0 at once (even on an
+/// empty nonblocking pipe), and a read whose copy faults is EFAULT and
+/// leaves the data in the pipe
+fn test_pipe_read_edges() {
+    let mut fds: [i32; 2] = [0, 0];
+    if sys_pipe2(fds.as_mut_ptr(), O_NONBLOCK) != 0 {
+        println(b"PIPE_READ_EDGES:FAIL");
+        return;
+    }
+    let (r, w) = (fds[0] as u64, fds[1] as u64);
+    let mut buf = [0u8; 8];
+    let zero = sys_read(r, buf.as_mut_ptr(), 0);
+    let wrote = sys_write(w, b"abc".as_ptr(), 3);
+    let fault = sys_read(r, 8 as *mut u8, 3);
+    let got = sys_read(r, buf.as_mut_ptr(), 8);
+    sys_close(r);
+    sys_close(w);
+    print(b"zero-read=");
+    print_num(zero);
+    print(b" fault-read=");
+    print_num(fault);
+    print(b" then=");
+    print_num(got);
+    println(b"");
+    if zero == 0 && wrote == 3 && fault == -14 && got == 3 && &buf[..3] == b"abc" {
+        println(b"PIPE_READ_EDGES:OK");
+    } else {
+        println(b"PIPE_READ_EDGES:FAIL");
     }
 }
 

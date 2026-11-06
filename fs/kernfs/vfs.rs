@@ -6,14 +6,18 @@
 //! ended (the first, one at offset 0, one after a seek) runs show() into
 //! a per-open buffer that continuing reads slice;
 //! one write() is one store() of at most `ATTR_MAX` bytes (E2BIG past
-//! it, Linux atomic_write_len). poll() reports POLLERR|POLLPRI once the
-//! node was notified since the file last read it. Binary attributes
-//! read and write at the file offset, below their size.
+//! it, Linux atomic_write_len), copied in before the lock. poll()
+//! reports POLLERR|POLLPRI once the node was notified since the file
+//! last read it. Binary attributes read and write at the file offset,
+//! below their size, at most a page per call (Linux
+//! kernfs_file_read_iter / kernfs_fop_write_iter).
 //!
 //! ## Locking
 //!
 //! `OpenAttr.buf` (sleeping `Mutex`, Linux kernfs_open_file.mutex) is
-//! held across show()/store(), under an active reference.
+//! held across show()/store(), under an active reference, and across a
+//! read's copy to the caller (it may fault: -> mmap_lock), with no
+//! active reference held then.
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -21,13 +25,16 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use super::{ATTR_MAX, AttrNode, BinAttr, KNode, Kind, SysBuf};
 use crate::fs::KernelError;
-use crate::fs::file::{DirContext, DirEntry, File, FileOps, generic_llseek};
+use crate::fs::file::{DirContext, DirEntry, File, FileOps, RwFlags, generic_llseek};
 use crate::fs::inode::{AsAny, FileType, Inode, InodeAttr, InodeData, InodeMode, InodeOps};
+use crate::fs::iov_iter::{IovDest, IovSource};
 use crate::fs::superblock::SuperBlock;
 use crate::io::poll::{DEFAULT_POLLMASK, POLLERR, POLLPRI, PollTable};
+use crate::mm::filemap::PAGE_SIZE;
 use crate::sync::Mutex;
 use crate::sync::spin::Mutex as SpinMutex;
 use crate::util::kalloc::try_arc;
+use crate::util::kmem::try_vec;
 
 /// Inode private data: the node
 pub struct KfInode(pub Arc<KNode>);
@@ -223,10 +230,41 @@ fn bin_io(
     io(len.min((size - off) as usize))
 }
 
+/// Linux kernfs_file_read_iter of a binary attribute: at most a page,
+/// read into a kernel buffer under an active reference, copied out
+/// after it
+fn bin_read(
+    kn: &KNode,
+    b: &dyn BinAttr,
+    to: &mut IovDest<'_>,
+    off: u64,
+) -> Result<usize, KernelError> {
+    let mut buf = try_vec(to.len().min(PAGE_SIZE), 0u8)?;
+    let n = bin_io(kn, b, off, buf.len(), |n| b.read(off, &mut buf[..n]))?;
+    to.copy_to(&buf[..n])
+}
+
+/// Linux kernfs_fop_write_iter of a binary attribute: at most a page,
+/// copied in before the active reference is taken
+fn bin_write(
+    kn: &KNode,
+    b: &dyn BinAttr,
+    from: &mut IovSource<'_>,
+    off: u64,
+) -> Result<usize, KernelError> {
+    let room = usize::try_from(b.size().saturating_sub(off)).unwrap_or(usize::MAX);
+    let mut buf = try_vec(from.len().min(PAGE_SIZE).min(room), 0u8)?;
+    let c = from.copy_from(&mut buf)?;
+    bin_io(kn, b, off, c, |n| b.write(off, &buf[..n]))
+}
+
 impl KernfsFops {
-    fn read_at(&self, file: &File, buf: &mut [u8], off: u64) -> Result<usize, KernelError> {
+    /// Read at `off`: an attribute from its show() buffer, filled again
+    /// unless this read continues the last; the copy runs under
+    /// `OpenAttr.buf` (Linux seq_read_iter under m->lock)
+    fn read_at(&self, file: &File, to: &mut IovDest<'_>, off: u64) -> Result<usize, KernelError> {
         if let Some((kn, b)) = bin_of(file) {
-            return bin_io(&kn, &*b, off, buf.len(), |n| b.read(off, &mut buf[..n]));
+            return bin_read(&kn, &*b, to, off);
         }
         let (kn, of) = attr_of(file)?;
         let a = attr_node(&kn);
@@ -238,33 +276,45 @@ impl KernfsFops {
                 read_pos: off,
             },
         };
-        let start = (off as usize).min(sb.data.len());
-        let n = (sb.data.len() - start).min(buf.len());
-        buf[..n].copy_from_slice(&sb.data[start..start + n]);
+        let start = usize::try_from(off).map_or(sb.data.len(), |o| o.min(sb.data.len()));
+        let r = match &sb.data[start..] {
+            [] => Ok(0),
+            rest => to.copy_to(rest),
+        };
+        let n = r.as_ref().map_or(0, |&n| n);
         *b = Some(SeqBuf {
             read_pos: off + n as u64,
             ..sb
         });
-        Ok(n)
+        r
     }
 
-    fn write_any(&self, file: &File, data: &[u8], off: u64) -> Result<usize, KernelError> {
+    /// Write at `off`: one store() of the whole write (E2BIG past
+    /// `ATTR_MAX`), from a kernel copy taken before the lock
+    fn write_any(
+        &self,
+        file: &File,
+        from: &mut IovSource<'_>,
+        off: u64,
+    ) -> Result<usize, KernelError> {
         if let Some((kn, b)) = bin_of(file) {
-            return bin_io(&kn, &*b, off, data.len(), |n| b.write(off, &data[..n]));
+            return bin_write(&kn, &*b, from, off);
         }
         let (kn, of) = attr_of(file)?;
-        if data.len() > ATTR_MAX {
+        if from.len() > ATTR_MAX {
             return Err(KernelError::ArgListTooLong);
         }
-        if data.is_empty() {
+        if from.is_empty() {
             return Ok(0);
         }
+        let mut data = try_vec(from.len(), 0u8)?;
+        let c = from.copy_from(&mut data)?;
         let _b = of.buf.lock();
         let _act = kn.get_active().ok_or(KernelError::NoDevice)?;
         attr_node(&kn)
             .ops()
             .ok_or(KernelError::NoDevice)?
-            .store(data)
+            .store(&data[..c])
     }
 }
 
@@ -306,26 +356,41 @@ impl FileOps for KernfsFops {
         Ok(())
     }
 
-    fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {
-        let pos = file.get_pos();
-        let n = self.read_at(file, buf, pos)?;
-        file.set_pos(pos + n as u64);
+    /// No FMODE_NOWAIT: RWF_NOWAIT is EOPNOTSUPP
+    fn read_iter(
+        &self,
+        file: &File,
+        to: &mut IovDest<'_>,
+        at: Option<u64>,
+        rw: RwFlags,
+    ) -> Result<usize, KernelError> {
+        if rw.nowait {
+            return Err(KernelError::OperationNotSupported);
+        }
+        let off = at.unwrap_or_else(|| file.get_pos());
+        let n = self.read_at(file, to, off)?;
+        if at.is_none() {
+            file.set_pos(off + n as u64);
+        }
         Ok(n)
     }
 
-    fn pread(&self, file: &File, buf: &mut [u8], off: u64) -> Result<usize, KernelError> {
-        self.read_at(file, buf, off)
-    }
-
-    fn write(&self, file: &File, data: &[u8]) -> Result<usize, KernelError> {
-        let pos = file.get_pos();
-        let n = self.write_any(file, data, pos)?;
-        file.set_pos(pos + n as u64);
+    fn write_iter(
+        &self,
+        file: &File,
+        from: &mut IovSource<'_>,
+        at: Option<u64>,
+        rw: RwFlags,
+    ) -> Result<usize, KernelError> {
+        if rw.nowait {
+            return Err(KernelError::OperationNotSupported);
+        }
+        let off = at.unwrap_or_else(|| file.get_pos());
+        let n = self.write_any(file, from, off)?;
+        if at.is_none() {
+            file.set_pos(off + n as u64);
+        }
         Ok(n)
-    }
-
-    fn pwrite(&self, file: &File, data: &[u8], off: u64) -> Result<usize, KernelError> {
-        self.write_any(file, data, off)
     }
 
     /// Linux kernfs_fop_llseek: generic_file_llseek (SEEK_END is

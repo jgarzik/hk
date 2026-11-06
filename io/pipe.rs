@@ -31,7 +31,9 @@
 //! ## Locking
 //!
 //! `Pipe.inner` is a sleeping mutex (Linux pipe->mutex, `Pipe::lock`):
-//! its holder may allocate pages. Wait conditions and poll never take
+//! its holder may allocate pages, and read and write copy between the
+//! pipe pages and the caller's iterator under it (a user copy may
+//! fault: -> mmap_lock, as in Linux). Wait conditions and poll never take
 //! it (poll runs under epoll's spin lock): like Linux pipe_readable /
 //! pipe_writable they read the ring indices `Pipe.head`/`Pipe.tail`,
 //! which the guard publishes as it unlocks. Wakeups follow the unlock.
@@ -51,6 +53,7 @@ use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use crate::fs::KernelError;
 use crate::fs::file::{File, FileOps, RwFlags, flags};
+use crate::fs::iov_iter::{IovDest, IovSource};
 use crate::io::poll::{POLLERR, POLLHUP, POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM, PollTable};
 use crate::mm::filemap::PAGE_SIZE;
 use crate::sync::waitqueue::WaitQueue;
@@ -306,119 +309,98 @@ impl PipeInner {
         Ok(())
     }
 
-    /// Write data to the pipe using page-based buffers
-    ///
-    /// Allocates pages as needed. Returns number of bytes written.
-    fn write(&mut self, data: &[u8]) -> usize {
-        if data.is_empty() {
-            return 0;
+    /// Append from `from` (Linux pipe_write's copy_page_from_iter):
+    /// into the head buffer while it may merge, then into new pages
+    /// while slots are free. Returns the bytes taken and the error that
+    /// stopped it early (EFAULT, ENOMEM), if any.
+    fn write_from(&mut self, from: &mut IovSource<'_>) -> (usize, Option<KernelError>) {
+        let written = match self.merge_from(from) {
+            Ok(c) => c,
+            Err(e) => return (0, Some(e)),
+        };
+        self.total_len += written;
+        if !from.is_empty() && self.head_buf_for_merge().is_some_and(|b| b.can_merge()) {
+            // The merge copy stopped short: a fault
+            return (written, Some(KernelError::BadAddress));
         }
-
-        let mut written = 0;
-
-        // First, try to merge with existing head buffer
-        if let Some(buf) = self.head_buf_for_merge_mut()
-            && buf.can_merge()
-        {
-            let space = buf.space_available();
-            let to_write = data.len().min(space);
-            if to_write > 0 {
-                // Get page frame and write data
-                if let Some(ref page) = buf.page {
-                    let offset = (buf.offset + buf.len) as usize;
-                    // SAFETY: under Pipe.inner, an unshared CAN_MERGE page
-                    let bytes = unsafe { page.bytes() };
-                    bytes[offset..offset + to_write].copy_from_slice(&data[..to_write]);
-                    buf.len += to_write as u32;
-                    self.total_len += to_write;
-                    written += to_write;
-                }
-            }
-        }
-
-        // Write remaining data to new buffers
-        while written < data.len() && !self.is_full() {
-            // Allocate a new page for this buffer
-            let page = match allocate_pipe_page() {
-                Some(p) => p,
-                None => break, // Out of memory
+        let mut written = written;
+        while !from.is_empty() && !self.is_full() {
+            let Some(page) = allocate_pipe_page() else {
+                return (written, Some(KernelError::OutOfMemory));
             };
-
-            let remaining = data.len() - written;
-            let to_write = remaining.min(PAGE_SIZE);
-
-            // Copy data to the new page
+            let n = from.len().min(PAGE_SIZE);
             // SAFETY: a page just allocated for this buffer, under Pipe.inner
-            let bytes = unsafe { page.bytes() };
-            bytes[..to_write].copy_from_slice(&data[written..written + to_write]);
-
-            // Create buffer with OWNED and CAN_MERGE flags
-            let buf = PipeBuffer::new(
-                page,
-                0,
-                to_write as u32,
-                pipe_buf_flags::OWNED | pipe_buf_flags::CAN_MERGE,
-            );
-
-            if self.push_buffer(buf).is_err() {
+            let r = from.copy_from(unsafe { &mut page.bytes()[..n] });
+            let c = match r {
+                Ok(c) if c > 0 => c,
+                Ok(_) | Err(_) => return (written, Some(KernelError::BadAddress)),
+            };
+            let flags = pipe_buf_flags::OWNED | pipe_buf_flags::CAN_MERGE;
+            if self
+                .push_buffer(PipeBuffer::new(page, 0, c as u32, flags))
+                .is_err()
+            {
                 break;
             }
-
-            written += to_write;
+            written += c;
+            if c < n {
+                return (written, Some(KernelError::BadAddress));
+            }
         }
-
-        written
+        (written, None)
     }
 
-    /// Read data from the pipe
-    ///
-    /// Returns number of bytes read.
-    fn read(&mut self, buf: &mut [u8]) -> usize {
-        if buf.is_empty() {
-            return 0;
-        }
+    /// Append to the head buffer while it may merge (it is unshared):
+    /// the bytes copied
+    fn merge_from(&mut self, from: &mut IovSource<'_>) -> Result<usize, KernelError> {
+        let Some(buf) = self.head_buf_for_merge_mut().filter(|b| b.can_merge()) else {
+            return Ok(0);
+        };
+        let Some(page) = buf.page.as_ref() else {
+            return Ok(0);
+        };
+        let off = (buf.offset + buf.len) as usize;
+        let n = from.len().min(PAGE_SIZE - off);
+        // SAFETY: under Pipe.inner, an unshared CAN_MERGE page
+        let c = from.copy_from(unsafe { &mut page.bytes()[off..off + n] })?;
+        buf.len += c as u32;
+        Ok(c)
+    }
 
+    /// Consume into `to` from the tail on (Linux pipe_read's
+    /// copy_page_to_iter): the bytes copied, EFAULT if a fault stopped
+    /// it before the first
+    fn read_to(&mut self, to: &mut IovDest<'_>) -> Result<usize, KernelError> {
         let mut read = 0;
-
-        while read < buf.len() && !self.is_empty() {
-            // Get the current tail index
-            let tail_idx = self.tail;
-            let pipe_buf = &mut self.bufs[tail_idx];
-
-            if pipe_buf.is_empty() {
-                // Empty buffer slot, advance and try next
-                self.tail = (self.tail + 1) % PIPE_RING;
+        while !to.is_empty() && !self.is_empty() {
+            let tail = self.tail;
+            let buf = &mut self.bufs[tail];
+            let Some(page) = buf.page.as_ref().filter(|_| buf.len > 0) else {
+                // An empty slot: skip it
+                self.tail = (tail + 1) % PIPE_RING;
                 continue;
+            };
+            let (off, len) = (buf.offset as usize, buf.len as usize);
+            // SAFETY: read under Pipe.inner
+            let r = to.copy_to(unsafe { &page.bytes()[off..off + len] });
+            let c = match r {
+                Ok(c) => c,
+                Err(_) if read > 0 => break,
+                Err(e) => return Err(e),
+            };
+            buf.offset += c as u32;
+            buf.len -= c as u32;
+            read += c;
+            if buf.len == 0 {
+                buf.release();
+                self.tail = (tail + 1) % PIPE_RING;
             }
-
-            let available = pipe_buf.len as usize;
-            let to_read = (buf.len() - read).min(available);
-
-            // Copy data from page to user buffer
-            if let Some(ref page) = pipe_buf.page {
-                let off = pipe_buf.offset as usize;
-                // SAFETY: read under Pipe.inner
-                buf[read..read + to_read]
-                    .copy_from_slice(&unsafe { page.bytes() }[off..off + to_read]);
-
-                pipe_buf.offset += to_read as u32;
-                pipe_buf.len -= to_read as u32;
-                read += to_read;
-
-                // If buffer is now empty, release it and advance tail
-                if pipe_buf.len == 0 {
-                    pipe_buf.release();
-                    self.tail = (self.tail + 1) % PIPE_RING;
-                }
-            } else {
-                // Shouldn't happen, but handle gracefully
-                self.tail = (self.tail + 1) % PIPE_RING;
+            if c < len && !to.is_empty() {
+                break;
             }
         }
-
-        // Update total length after all reads
         self.total_len = self.total_len.saturating_sub(read);
-        read
+        Ok(read)
     }
 }
 
@@ -581,6 +563,87 @@ impl Drop for PipeGuard<'_> {
     }
 }
 
+/// Linux pipe_read: wait for data unless `nonblock`; a read takes what
+/// is there (at most `to`'s room) and returns, 0 at EOF (no writers).
+/// The copy runs under the sleeping `Pipe.inner` (it may fault).
+fn pipe_read(pipe: &Pipe, to: &mut IovDest<'_>, nonblock: bool) -> Result<usize, KernelError> {
+    if to.is_empty() {
+        return Ok(0);
+    }
+    loop {
+        let mut inner = pipe.lock();
+        if !inner.is_empty() {
+            let r = inner.read_to(to);
+            drop(inner);
+            // Room for writers (Linux pipe_read wakes wr_wait with
+            // EPOLLOUT | EPOLLWRNORM)
+            pipe.wait_queue.wake_poll(u32::from(POLLOUT | POLLWRNORM));
+            return r;
+        }
+        drop(inner);
+        if !pipe.has_writers() {
+            return Ok(0);
+        }
+        if nonblock {
+            return Err(KernelError::WouldBlock);
+        }
+        // Block until data or EOF; a signal ends the wait (-ERESTARTSYS)
+        pipe.wait_queue
+            .wait_event_interruptible(|| pipe.readable())?;
+    }
+}
+
+/// EPIPE's SIGPIPE to the writing thread
+fn sigpipe() {
+    use crate::signal::{SIGPIPE, send_signal};
+    let _ = send_signal(crate::task::percpu::current_tid(), SIGPIPE);
+}
+
+/// Linux pipe_write: a blocking writer stays until everything is
+/// written; a signal, `nonblock`, a fault or no memory ends it early,
+/// returning the bytes written so far if any. Writes of at most PIPE_BUF
+/// bytes are never split (any free slot takes them whole). No reader:
+/// SIGPIPE and EPIPE. The copy runs under the sleeping `Pipe.inner`.
+fn pipe_write(pipe: &Pipe, from: &mut IovSource<'_>, nonblock: bool) -> Result<usize, KernelError> {
+    if from.is_empty() {
+        return Ok(0);
+    }
+    let partial = |done: usize, e| if done > 0 { Ok(done) } else { Err(e) };
+    let mut done = 0;
+    loop {
+        if !pipe.has_readers() {
+            sigpipe();
+            return partial(done, KernelError::BrokenPipe);
+        }
+        let mut inner = pipe.lock();
+        if !inner.is_full() {
+            let (n, err) = inner.write_from(from);
+            drop(inner);
+            done += n;
+            if n > 0 {
+                // Data for readers (Linux pipe_write wakes rd_wait with
+                // EPOLLIN | EPOLLRDNORM)
+                pipe.wait_queue.wake_poll(u32::from(POLLIN | POLLRDNORM));
+            }
+            if let Some(e) = err {
+                return partial(done, e);
+            }
+        } else {
+            drop(inner);
+        }
+        if from.is_empty() {
+            return Ok(done);
+        }
+        if nonblock {
+            return partial(done, KernelError::WouldBlock);
+        }
+        // Block until space or no readers; a signal ends the wait
+        if let Err(e) = pipe.wait_queue.wait_event_interruptible(|| pipe.writable()) {
+            return partial(done, e);
+        }
+    }
+}
+
 // =============================================================================
 // Pipe Read End
 // =============================================================================
@@ -623,42 +686,18 @@ impl FileOps for PipeReadFileOps {
         self
     }
 
-    fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {
-        let pipe = pipe_of(file)?;
-        let nonblock = file.get_flags() & flags::O_NONBLOCK != 0;
-
-        loop {
-            // Try to read
-            let mut inner = pipe.lock();
-            if !inner.is_empty() {
-                let n = inner.read(buf);
-                drop(inner);
-                // Wake writers - there's now space (Linux pipe_read wakes
-                // wr_wait with EPOLLOUT | EPOLLWRNORM)
-                pipe.wait_queue.wake_poll(u32::from(POLLOUT | POLLWRNORM));
-                return Ok(n);
-            }
-            drop(inner);
-
-            // Buffer is empty
-            if !pipe.has_writers() {
-                // EOF - no more writers
-                return Ok(0);
-            }
-
-            if nonblock {
-                return Err(KernelError::WouldBlock);
-            }
-
-            // Block until data or EOF; a signal ends the wait (-ERESTARTSYS)
-            pipe.wait_queue
-                .wait_event_interruptible(|| pipe.readable())?;
+    fn read_iter(
+        &self,
+        file: &File,
+        to: &mut IovDest<'_>,
+        at: Option<u64>,
+        rw: RwFlags,
+    ) -> Result<usize, KernelError> {
+        if at.is_some() {
+            return Err(KernelError::OperationNotSupported);
         }
-    }
-
-    fn write(&self, _file: &File, _buf: &[u8]) -> Result<usize, KernelError> {
-        // Cannot write to read end
-        Err(KernelError::InvalidArgument)
+        let nonblock = file.get_flags() & flags::O_NONBLOCK != 0 || rw.nowait;
+        pipe_read(pipe_of(file)?, to, nonblock)
     }
 
     fn poll(&self, file: &File, pt: Option<&mut PollTable<'_>>) -> u16 {
@@ -687,23 +726,6 @@ impl FileOps for PipeReadFileOps {
         // Decrement reader count when file is closed
         pipe.remove_reader();
         Ok(())
-    }
-
-    fn read_with_flags(
-        &self,
-        file: &File,
-        buf: &mut [u8],
-        flags: RwFlags,
-    ) -> Result<usize, KernelError> {
-        let pipe = pipe_of(file)?;
-        if flags.nowait && pipe.ring_empty() {
-            // No data available
-            if !pipe.has_writers() {
-                return Ok(0); // EOF - write end closed
-            }
-            return Err(KernelError::WouldBlock);
-        }
-        self.read(file, buf)
     }
 }
 
@@ -748,78 +770,18 @@ impl FileOps for PipeWriteFileOps {
         self
     }
 
-    fn read(&self, _file: &File, _buf: &mut [u8]) -> Result<usize, KernelError> {
-        // Cannot read from write end
-        Err(KernelError::InvalidArgument)
-    }
-
-    /// Linux pipe_write: a blocking writer stays until everything is
-    /// written; a signal or O_NONBLOCK ends it early, returning the bytes
-    /// written so far if any. Writes of at most PIPE_BUF bytes are never
-    /// split (any free slot takes them whole).
-    fn write(&self, file: &File, buf: &[u8]) -> Result<usize, KernelError> {
-        let pipe = pipe_of(file)?;
-        if buf.is_empty() {
-            return Ok(0);
+    fn write_iter(
+        &self,
+        file: &File,
+        from: &mut IovSource<'_>,
+        at: Option<u64>,
+        rw: RwFlags,
+    ) -> Result<usize, KernelError> {
+        if at.is_some() {
+            return Err(KernelError::OperationNotSupported);
         }
-
-        let nonblock = file.get_flags() & flags::O_NONBLOCK != 0;
-        let mut done = 0;
-
-        loop {
-            // Check for EPIPE (no readers)
-            if !pipe.has_readers() {
-                // Send SIGPIPE to calling thread
-                use crate::signal::{SIGPIPE, send_signal};
-                use crate::task::percpu::current_tid;
-                let _ = send_signal(current_tid(), SIGPIPE);
-                return if done > 0 {
-                    Ok(done)
-                } else {
-                    Err(KernelError::BrokenPipe)
-                };
-            }
-
-            // Try to write (page allocation under the sleeping lock)
-            let mut inner = pipe.lock();
-            if !inner.is_full() {
-                let n = inner.write(&buf[done..]);
-                drop(inner);
-                if n == 0 {
-                    // No page for a free slot
-                    return if done > 0 {
-                        Ok(done)
-                    } else {
-                        Err(KernelError::OutOfMemory)
-                    };
-                }
-                done += n;
-                // Wake readers - there's data available (Linux pipe_write
-                // wakes rd_wait with EPOLLIN | EPOLLRDNORM)
-                pipe.wait_queue.wake_poll(u32::from(POLLIN | POLLRDNORM));
-            } else {
-                drop(inner);
-            }
-            if done == buf.len() {
-                return Ok(done);
-            }
-
-            if nonblock {
-                return if done > 0 {
-                    Ok(done)
-                } else {
-                    Err(KernelError::WouldBlock)
-                };
-            }
-
-            // Block until space or no readers; a signal ends the wait
-            let r = pipe.wait_queue.wait_event_interruptible(|| pipe.writable());
-            match r {
-                Err(_) if done > 0 => return Ok(done),
-                Err(e) => return Err(e),
-                Ok(()) => {}
-            }
-        }
+        let nonblock = file.get_flags() & flags::O_NONBLOCK != 0 || rw.nowait;
+        pipe_write(pipe_of(file)?, from, nonblock)
     }
 
     fn poll(&self, file: &File, pt: Option<&mut PollTable<'_>>) -> u16 {
@@ -850,30 +812,6 @@ impl FileOps for PipeWriteFileOps {
         // Decrement writer count when file is closed
         pipe.remove_writer();
         Ok(())
-    }
-
-    fn write_with_flags(
-        &self,
-        file: &File,
-        buf: &[u8],
-        flags: RwFlags,
-    ) -> Result<usize, KernelError> {
-        let pipe = pipe_of(file)?;
-        if flags.nowait {
-            // Check for no readers (EPIPE)
-            if !pipe.has_readers() {
-                // Send SIGPIPE to calling thread
-                use crate::signal::{SIGPIPE, send_signal};
-                use crate::task::percpu::current_tid;
-                let _ = send_signal(current_tid(), SIGPIPE);
-                return Err(KernelError::BrokenPipe);
-            }
-            // Check if buffer has space without blocking
-            if pipe.ring_full() {
-                return Err(KernelError::WouldBlock);
-            }
-        }
-        self.write(file, buf)
     }
 }
 
@@ -1020,40 +958,40 @@ impl FileOps for FifoFileOps {
         Ok(())
     }
 
-    fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {
+    /// A FIFO has no FMODE_NOWAIT (Linux sets it only on pipe() files),
+    /// so RWF_NOWAIT is EOPNOTSUPP (kiocb_set_rw_flags)
+    fn read_iter(
+        &self,
+        file: &File,
+        to: &mut IovDest<'_>,
+        at: Option<u64>,
+        rw: RwFlags,
+    ) -> Result<usize, KernelError> {
+        if rw.nowait || at.is_some() {
+            return Err(KernelError::OperationNotSupported);
+        }
         if file.get_flags() & flags::O_ACCMODE == flags::O_WRONLY {
             return Err(KernelError::BadFd);
         }
-        PIPE_READ_FOPS.read(file, buf)
+        let nonblock = file.get_flags() & flags::O_NONBLOCK != 0;
+        pipe_read(&fifo_of(file)?.pipe, to, nonblock)
     }
 
-    fn write(&self, file: &File, buf: &[u8]) -> Result<usize, KernelError> {
+    fn write_iter(
+        &self,
+        file: &File,
+        from: &mut IovSource<'_>,
+        at: Option<u64>,
+        rw: RwFlags,
+    ) -> Result<usize, KernelError> {
+        if rw.nowait || at.is_some() {
+            return Err(KernelError::OperationNotSupported);
+        }
         if file.get_flags() & flags::O_ACCMODE == flags::O_RDONLY {
             return Err(KernelError::BadFd);
         }
-        PIPE_WRITE_FOPS.write(file, buf)
-    }
-
-    /// preadv2 / pwritev2 flags: a FIFO has no FMODE_NOWAIT (Linux sets
-    /// it only on pipe() files), so RWF_NOWAIT is EOPNOTSUPP
-    /// (kiocb_set_rw_flags)
-    fn read_with_flags(
-        &self,
-        file: &File,
-        buf: &mut [u8],
-        rw: RwFlags,
-    ) -> Result<usize, KernelError> {
-        if rw.nowait {
-            return Err(KernelError::OperationNotSupported);
-        }
-        self.read(file, buf)
-    }
-
-    fn write_with_flags(&self, file: &File, buf: &[u8], rw: RwFlags) -> Result<usize, KernelError> {
-        if rw.nowait {
-            return Err(KernelError::OperationNotSupported);
-        }
-        self.write(file, buf)
+        let nonblock = file.get_flags() & flags::O_NONBLOCK != 0;
+        pipe_write(&fifo_of(file)?.pipe, from, nonblock)
     }
 
     fn llseek(&self, _file: &File, _offset: i64, _whence: i32) -> Result<u64, KernelError> {

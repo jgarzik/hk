@@ -23,12 +23,12 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 
 use crate::sync::spin::RwLock;
-use core::cmp::min;
 
 use super::KernelError;
 use super::dentry::Dentry;
-use super::file::{DirContext, DirEntry, File, FileOps};
+use super::file::{DirContext, DirEntry, File, FileOps, RwFlags, WRITE_CHUNK};
 use super::inode::{AsAny, FileType, Inode, InodeData, InodeMode, InodeOps, Timespec};
+use super::iov_iter::{IovDest, IovSource};
 use super::superblock::{FileSystemType, StatFs, SuperBlock, SuperOps};
 
 use crate::cgroup::{CGROUP_ROOT, Cgroup, ControllerType, cgroup_init, cgroup_mkdir, cgroup_rmdir};
@@ -536,6 +536,75 @@ fn handle_subsys_file_write(
 // File Operations
 // ============================================================================
 
+/// The content of the cgroupfs file `file`
+fn cgroupfs_content(file: &File) -> Result<Vec<u8>, KernelError> {
+    let inode = file.get_inode().ok_or(KernelError::BadFd)?;
+    let private = inode.get_private().ok_or(KernelError::Io)?;
+    let wrapper = private
+        .as_ref()
+        .as_any()
+        .downcast_ref::<CgroupfsInodeWrapper>()
+        .ok_or(KernelError::Io)?;
+    let data = wrapper.0.read();
+    match &*data {
+        CgroupfsInodeData::ControlFile { cgroup, file_type } => {
+            let cg = cgroup.upgrade().ok_or(KernelError::NotFound)?;
+            generate_control_file_content(&cg, *file_type)
+        }
+        CgroupfsInodeData::SubsysFile {
+            cgroup,
+            controller,
+            file_name,
+        } => {
+            let cg = cgroup.upgrade().ok_or(KernelError::NotFound)?;
+            generate_subsys_file_content(&cg, *controller, file_name)
+        }
+        CgroupfsInodeData::Directory { .. } => Err(KernelError::IsDirectory),
+    }
+}
+
+/// Hand `buf` to the write handler of the cgroupfs file `file`
+fn cgroupfs_write(file: &File, buf: &[u8]) -> Result<usize, KernelError> {
+    let inode = file.get_inode().ok_or(KernelError::BadFd)?;
+    let private = inode.get_private().ok_or(KernelError::Io)?;
+    let wrapper = private
+        .as_ref()
+        .as_any()
+        .downcast_ref::<CgroupfsInodeWrapper>()
+        .ok_or(KernelError::Io)?;
+
+    // Writes run under CGROUP_MUTEX (Linux cgroup_kn_lock_live for
+    // cgroup.procs, subtree_control and freeze), taken before the
+    // inode's spin lock; a removed cgroup's files are ENODEV (Linux
+    // kernfs_fop_write: no active reference to a removed node)
+    let _g = crate::cgroup::CGROUP_MUTEX.lock();
+    // A copy, so no spin lock is held while the write sleeps
+    // (cgroup.procs takes the threadgroup rwsem)
+    let data = wrapper.0.read().clone();
+    let live = |c: &alloc::sync::Weak<Cgroup>| {
+        c.upgrade()
+            .filter(|c| !c.is_dead())
+            .ok_or(KernelError::NoDevice)
+    };
+    match &data {
+        CgroupfsInodeData::ControlFile { cgroup, file_type } => {
+            let cg = live(cgroup)?;
+            handle_control_file_write(&cg, *file_type, buf)?;
+            Ok(buf.len())
+        }
+        CgroupfsInodeData::SubsysFile {
+            cgroup,
+            controller,
+            file_name,
+        } => {
+            let cg = live(cgroup)?;
+            handle_subsys_file_write(&cg, *controller, file_name, buf)?;
+            Ok(buf.len())
+        }
+        CgroupfsInodeData::Directory { .. } => Err(KernelError::IsDirectory),
+    }
+}
+
 /// Cgroupfs file operations
 pub struct CgroupfsFileOps;
 
@@ -544,83 +613,45 @@ impl FileOps for CgroupfsFileOps {
         self
     }
 
-    fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {
-        let inode = file.get_inode().ok_or(KernelError::BadFd)?;
-        let private = inode.get_private().ok_or(KernelError::Io)?;
-        let wrapper = private
-            .as_ref()
-            .as_any()
-            .downcast_ref::<CgroupfsInodeWrapper>()
-            .ok_or(KernelError::Io)?;
-
-        let data = wrapper.0.read();
-        let content = match &*data {
-            CgroupfsInodeData::ControlFile { cgroup, file_type } => {
-                let cg = cgroup.upgrade().ok_or(KernelError::NotFound)?;
-                generate_control_file_content(&cg, *file_type)?
-            }
-            CgroupfsInodeData::SubsysFile {
-                cgroup,
-                controller,
-                file_name,
-            } => {
-                let cg = cgroup.upgrade().ok_or(KernelError::NotFound)?;
-                generate_subsys_file_content(&cg, *controller, file_name)?
-            }
-            CgroupfsInodeData::Directory { .. } => return Err(KernelError::IsDirectory),
-        };
-
-        let pos = file.get_pos() as usize;
-        if pos >= content.len() {
-            return Ok(0);
+    /// Generate the content and copy it from the file position on; no
+    /// positioned reads, no FMODE_NOWAIT (EOPNOTSUPP)
+    fn read_iter(
+        &self,
+        file: &File,
+        to: &mut IovDest<'_>,
+        at: Option<u64>,
+        rw: RwFlags,
+    ) -> Result<usize, KernelError> {
+        if rw.nowait || at.is_some() {
+            return Err(KernelError::OperationNotSupported);
         }
-
-        let to_read = min(buf.len(), content.len() - pos);
-        buf[..to_read].copy_from_slice(&content[pos..pos + to_read]);
-        file.advance_pos(to_read as u64);
-
-        Ok(to_read)
+        let content = cgroupfs_content(file)?;
+        let rest = usize::try_from(file.get_pos())
+            .ok()
+            .and_then(|p| content.get(p..));
+        let n = match rest {
+            Some(rest) if !rest.is_empty() => to.copy_to(rest)?,
+            _ => 0,
+        };
+        file.advance_pos(n as u64);
+        Ok(n)
     }
 
-    fn write(&self, file: &File, buf: &[u8]) -> Result<usize, KernelError> {
-        let inode = file.get_inode().ok_or(KernelError::BadFd)?;
-        let private = inode.get_private().ok_or(KernelError::Io)?;
-        let wrapper = private
-            .as_ref()
-            .as_any()
-            .downcast_ref::<CgroupfsInodeWrapper>()
-            .ok_or(KernelError::Io)?;
-
-        // Writes run under CGROUP_MUTEX (Linux cgroup_kn_lock_live for
-        // cgroup.procs, subtree_control and freeze), taken before the
-        // inode's spin lock; a removed cgroup's files are ENODEV (Linux
-        // kernfs_fop_write: no active reference to a removed node)
-        let _g = crate::cgroup::CGROUP_MUTEX.lock();
-        // A copy, so no spin lock is held while the write sleeps
-        // (cgroup.procs takes the threadgroup rwsem)
-        let data = wrapper.0.read().clone();
-        let live = |c: &alloc::sync::Weak<Cgroup>| {
-            c.upgrade()
-                .filter(|c| !c.is_dead())
-                .ok_or(KernelError::NoDevice)
-        };
-        match &data {
-            CgroupfsInodeData::ControlFile { cgroup, file_type } => {
-                let cg = live(cgroup)?;
-                handle_control_file_write(&cg, *file_type, buf)?;
-                Ok(buf.len())
-            }
-            CgroupfsInodeData::SubsysFile {
-                cgroup,
-                controller,
-                file_name,
-            } => {
-                let cg = live(cgroup)?;
-                handle_subsys_file_write(&cg, *controller, file_name, buf)?;
-                Ok(buf.len())
-            }
-            CgroupfsInodeData::Directory { .. } => Err(KernelError::IsDirectory),
+    /// One write handler call on at most `WRITE_CHUNK` bytes, copied in
+    /// before `CGROUP_MUTEX` is taken
+    fn write_iter(
+        &self,
+        file: &File,
+        from: &mut IovSource<'_>,
+        at: Option<u64>,
+        rw: RwFlags,
+    ) -> Result<usize, KernelError> {
+        if rw.nowait || at.is_some() {
+            return Err(KernelError::OperationNotSupported);
         }
+        let mut buf = crate::util::kmem::try_vec(from.len().min(WRITE_CHUNK), 0u8)?;
+        let c = from.copy_from(&mut buf)?;
+        cgroupfs_write(file, &buf[..c])
     }
 
     fn readdir(&self, file: &File, ctx: &mut DirContext<'_>) -> Result<(), KernelError> {

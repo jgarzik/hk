@@ -23,12 +23,12 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::sync::spin::RwLock;
-use ::core::cmp::min;
 
 use super::KernelError;
 use super::dentry::Dentry;
-use super::file::{DirContext, DirEntry, File, FileOps};
+use super::file::{DirContext, DirEntry, File, FileOps, RwFlags, WRITE_CHUNK};
 use super::inode::{AsAny, FileType, Inode, InodeData, InodeMode, InodeOps, Timespec};
+use super::iov_iter::{IovDest, IovSource};
 use super::superblock::{FileSystemType, PROC_SUPER_MAGIC, StatFs, SuperBlock, SuperOps};
 use crate::task::Cred;
 use crate::task::Pid;
@@ -1209,27 +1209,41 @@ fn get_task_cgroup_path(pid: Pid) -> String {
     cgroup_ns.translate_path(&cgroup)
 }
 
-/// Copy `content` from the file position on into `buf` and advance it
-fn copy_out(file: &File, buf: &mut [u8], content: &[u8]) -> usize {
-    let pos = file.get_pos() as usize;
-    if pos >= content.len() {
-        return 0; // EOF
+/// The content of the procfs file `file` (Linux: its show() / sysctl
+/// handler output). Per-process generators may sleep (exec_update_lock,
+/// mmap_lock): they run after the inode data's spinning read lock is
+/// dropped.
+fn proc_content(file: &File) -> Result<Vec<u8>, KernelError> {
+    let inode = file.get_inode().ok_or(KernelError::BadFd)?;
+    let private = inode.get_private().ok_or(KernelError::Io)?;
+    let wrapper = private
+        .as_ref()
+        .as_any()
+        .downcast_ref::<ProcfsInodeWrapper>()
+        .ok_or(KernelError::Io)?;
+    let data = wrapper.0.read();
+    if let ProcfsInodeData::PidFile { pid, generator } = &*data {
+        let (pid, g) = (*pid, *generator);
+        drop(data);
+        return pid_content(Some(file), pid, g);
     }
-    let n = min(buf.len(), content.len() - pos);
-    buf[..n].copy_from_slice(&content[pos..pos + n]);
-    file.advance_pos(n as u64);
-    n
-}
-
-/// Copy `content` from `offset` on into `buf` (pread: no position)
-fn copy_at(buf: &mut [u8], content: &[u8], offset: u64) -> usize {
-    let pos = offset as usize;
-    if pos >= content.len() {
-        return 0;
-    }
-    let n = min(buf.len(), content.len() - pos);
-    buf[..n].copy_from_slice(&content[pos..pos + n]);
-    n
+    Ok(match &*data {
+        ProcfsInodeData::File { generator } => generator(),
+        ProcfsInodeData::NamespaceFile { pid, ns_type } => gen_namespace_content(*pid, *ns_type),
+        ProcfsInodeData::FdinfoFile { pid, fd } => gen_fdinfo_content(*pid, *fd),
+        ProcfsInodeData::Sysctl { ctl } => crate::sysctl::read(ctl),
+        ProcfsInodeData::PidFile { .. }
+        | ProcfsInodeData::FdSymlink { .. }
+        | ProcfsInodeData::PidLink { .. }
+        | ProcfsInodeData::SelfLink
+        | ProcfsInodeData::FixedLink(_) => return Err(KernelError::Io),
+        ProcfsInodeData::Directory { .. }
+        | ProcfsInodeData::PidDirectory { .. }
+        | ProcfsInodeData::PidTaskDirectory { .. }
+        | ProcfsInodeData::PidNsDirectory { .. }
+        | ProcfsInodeData::PidFdDirectory { .. }
+        | ProcfsInodeData::PidFdinfoDirectory { .. } => return Err(KernelError::IsDirectory),
+    })
 }
 
 /// Static procfs inode ops
@@ -1282,111 +1296,49 @@ impl FileOps for ProcfsFileOps {
         }
     }
 
-    fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {
-        let inode = file.get_inode().ok_or(KernelError::BadFd)?;
-        let private = inode.get_private().ok_or(KernelError::Io)?;
-        let wrapper = private
-            .as_ref()
-            .as_any()
-            .downcast_ref::<ProcfsInodeWrapper>()
-            .ok_or(KernelError::Io)?;
-
-        let data = wrapper.0.read();
-        // Per-process generators may sleep (exec_update_lock, mmap_lock):
-        // they run after the inode data's spinning read lock is dropped
-        if let ProcfsInodeData::PidFile { pid, generator } = &*data {
-            let (pid, g) = (*pid, *generator);
-            drop(data);
-            let content = pid_content(Some(file), pid, g)?;
-            return Ok(copy_out(file, buf, &content));
+    /// Generate the content and copy it from the offset on (Linux
+    /// seq_read_iter / proc_sys_read); no FMODE_NOWAIT: RWF_NOWAIT is
+    /// EOPNOTSUPP
+    fn read_iter(
+        &self,
+        file: &File,
+        to: &mut IovDest<'_>,
+        at: Option<u64>,
+        rw: RwFlags,
+    ) -> Result<usize, KernelError> {
+        if rw.nowait {
+            return Err(KernelError::OperationNotSupported);
         }
-        let content = match &*data {
-            ProcfsInodeData::File { generator } => generator(),
-            ProcfsInodeData::NamespaceFile { pid, ns_type } => {
-                gen_namespace_content(*pid, *ns_type)
-            }
-            ProcfsInodeData::FdinfoFile { pid, fd } => gen_fdinfo_content(*pid, *fd),
-            ProcfsInodeData::PidFile { .. } => return Err(KernelError::Io),
-            ProcfsInodeData::Sysctl { ctl } => crate::sysctl::read(ctl),
-            ProcfsInodeData::FdSymlink { .. }
-            | ProcfsInodeData::PidLink { .. }
-            | ProcfsInodeData::SelfLink
-            | ProcfsInodeData::FixedLink(_) => {
-                return Err(KernelError::Io);
-            }
-            ProcfsInodeData::Directory { .. }
-            | ProcfsInodeData::PidDirectory { .. }
-            | ProcfsInodeData::PidTaskDirectory { .. }
-            | ProcfsInodeData::PidNsDirectory { .. }
-            | ProcfsInodeData::PidFdDirectory { .. }
-            | ProcfsInodeData::PidFdinfoDirectory { .. } => return Err(KernelError::IsDirectory),
+        let content = proc_content(file)?;
+        let pos = at.unwrap_or_else(|| file.get_pos());
+        let n = match usize::try_from(pos).ok().and_then(|p| content.get(p..)) {
+            Some(rest) if !rest.is_empty() => to.copy_to(rest)?,
+            _ => 0,
         };
-
-        drop(data);
-        Ok(copy_out(file, buf, &content))
+        if at.is_none() {
+            file.advance_pos(n as u64);
+        }
+        Ok(n)
     }
 
-    fn pread(&self, file: &File, buf: &mut [u8], offset: u64) -> Result<usize, KernelError> {
-        let inode = file.get_inode().ok_or(KernelError::BadFd)?;
-        let private = inode.get_private().ok_or(KernelError::Io)?;
-        let wrapper = private
-            .as_ref()
-            .as_any()
-            .downcast_ref::<ProcfsInodeWrapper>()
-            .ok_or(KernelError::Io)?;
-
-        let data = wrapper.0.read();
-        // Per-process generators may sleep (exec_update_lock, mmap_lock):
-        // they run after the inode data's spinning read lock is dropped
-        if let ProcfsInodeData::PidFile { pid, generator } = &*data {
-            let (pid, g) = (*pid, *generator);
-            drop(data);
-            let content = pid_content(Some(file), pid, g)?;
-            return Ok(copy_at(buf, &content, offset));
+    /// Writes reach /proc/sys files only, at the file position: one
+    /// store of at most `WRITE_CHUNK` bytes
+    fn write_iter(
+        &self,
+        file: &File,
+        from: &mut IovSource<'_>,
+        at: Option<u64>,
+        rw: RwFlags,
+    ) -> Result<usize, KernelError> {
+        if rw.nowait || at.is_some() {
+            return Err(KernelError::OperationNotSupported);
         }
-        let content = match &*data {
-            ProcfsInodeData::File { generator } => generator(),
-            ProcfsInodeData::NamespaceFile { pid, ns_type } => {
-                gen_namespace_content(*pid, *ns_type)
-            }
-            ProcfsInodeData::FdinfoFile { pid, fd } => gen_fdinfo_content(*pid, *fd),
-            ProcfsInodeData::PidFile { .. } => return Err(KernelError::Io),
-            ProcfsInodeData::Sysctl { ctl } => crate::sysctl::read(ctl),
-            ProcfsInodeData::FdSymlink { .. }
-            | ProcfsInodeData::PidLink { .. }
-            | ProcfsInodeData::SelfLink
-            | ProcfsInodeData::FixedLink(_) => {
-                return Err(KernelError::Io);
-            }
-            ProcfsInodeData::Directory { .. }
-            | ProcfsInodeData::PidDirectory { .. }
-            | ProcfsInodeData::PidTaskDirectory { .. }
-            | ProcfsInodeData::PidNsDirectory { .. }
-            | ProcfsInodeData::PidFdDirectory { .. }
-            | ProcfsInodeData::PidFdinfoDirectory { .. } => return Err(KernelError::IsDirectory),
-        };
-
-        let pos = offset as usize;
-
-        if pos >= content.len() {
-            return Ok(0); // EOF
-        }
-
-        let available = content.len() - pos;
-        let to_read = min(buf.len(), available);
-
-        buf[..to_read].copy_from_slice(&content[pos..pos + to_read]);
-        // NOTE: Unlike read(), we do NOT advance file position
-
-        Ok(to_read)
-    }
-
-    /// Writes reach /proc/sys files only
-    fn write(&self, file: &File, buf: &[u8]) -> Result<usize, KernelError> {
         let inode = file.get_inode().ok_or(KernelError::BadFd)?;
         let ctl = sysctl_of(&inode).ok_or(KernelError::Io)?;
         crate::sysctl::permission(ctl, &crate::task::current_cred(), crate::fs::MAY_WRITE)?;
-        let n = crate::sysctl::write(ctl, buf, file.get_pos())?;
+        let mut buf = crate::util::kmem::try_vec(from.len().min(WRITE_CHUNK), 0u8)?;
+        let c = from.copy_from(&mut buf)?;
+        let n = crate::sysctl::write(ctl, &buf[..c], file.get_pos())?;
         file.advance_pos(n as u64);
         Ok(n)
     }

@@ -356,7 +356,10 @@ Kernel mappings (3.2 Kernel Page Tables): vmalloc FLUSH (sleeping;
     (spin, thread context) → frame allocator
 
 Pipes (3.11): Pipe.inner (sleeping; two in address order) → frame
-    allocator; no other lock under it, none of these above it
+    allocator, and the mmap_lock of a faulting user copy (read and
+    write copy between pipe pages and the caller's memory under it,
+    Linux pipe_read/pipe_write); no other lock under it, none of these
+    above it
 
 Block locks (3.10 Block Device Subsystem):
     Disk.open_mutex (sleeping) → devtmpfs root i_rwsem → BLKDEV_REGISTRY,
@@ -1800,7 +1803,7 @@ at a time, with no RENAME_LOCK held (d_move drops it first).
 | `kernfs::KERNFS_RWSEM` | sync::RwSem (Linux kernfs_rwsem) | write: add, remove, rename a node; read: symlink target paths. Taken by subsystems registering objects (in thread context, under their own locks such as RTNL), never under a VFS lock, never across show()/store() |
 | `KNode.children`, `.name`, `.parent` | spin RwLock, leaves | alone (lookup, readdir under the walk's i_rwsem) or under KERNFS_RWSEM |
 | `AttrNode.ops` | spin RwLock, leaf | read (clone) under an active reference by show()/store(); cleared by `KNode::remove` after the drain, with no lock held, the operations dropped after it is released (a removed node kept by a dentry or open file pins nothing) |
-| `OpenAttr.buf` | sync::Mutex (Linux kernfs_open_file.mutex), per open file | held across show()/store(), which take subsystem locks; under f_pos_lock for read/write |
+| `OpenAttr.buf` | sync::Mutex (Linux kernfs_open_file.mutex), per open file | held across show()/store(), which take subsystem locks, and across a read's copy to the caller (may fault: -> mmap_lock; no active reference held then, Linux seq_read_iter under m->lock); a write copies its data in before taking it; under f_pos_lock for read/write |
 | `sysfs::SBS` | spin Mutex, leaf | per-network-namespace superblocks, taken only in mount |
 
 Device model (base/): `Device.lock` (sync::Mutex, Linux device_lock)
@@ -3427,7 +3430,7 @@ else is taken under it) unless an order is given. "spin" is the
 | `RamfsInodeData.xattrs`, `RamfsSbData.sb` | fs/ramfs.rs | spin | ramfs xattrs and superblock back-pointer (under VFS locks) |
 | membarrier `GLOBAL_MUTEX` → `IPI_MUTEX` | task/membarrier.rs | sleeping (`sync::Mutex`; `IPI_MUTEX` is Linux membarrier_ipi_mutex) | `IPI_MUTEX` serializes the membarrier commands that interrupt other CPUs, so callers cannot multiply the IPIs; held only across `smp_call_function_many` (waited); nothing is taken under it. `GLOBAL_MUTEX` (killable) paces MEMBARRIER_CMD_GLOBAL to one call per tick: held across its IPIs and its one-tick sleep, so GLOBAL callers never delay the expedited ones. The targets are chosen from each CPU's `PerCpuScheduler.curr_mm` / `membarrier_state` (atomics written at every switch in `make_current`: `curr_mm` SeqCst, then a full fence, then the registrations read, so a registration either sees the CPU in its mm and refreshes it by IPI or is seen by the switch; Linux rq->curr->mm and rq->membarrier_state), compared, never dereferenced |
 | `Inode.i_pipe` | fs/inode.rs, io/pipe.rs (FIFOs) | spin Mutex leaf (Linux inode->i_lock around i_pipe) | a FIFO's pipe and its open-file count: attached by the first open, dropped by the last release; every change of the pipe's reader/writer counts and open counters happens under it (so a blocking open decides, and samples the counter it waits on, before unlocking; the release wakes the other side under it: -> `Pipe.wait_queue`); never held across a wait (a blocking open waits on `Pipe.wait_queue` after unlocking) or under `Pipe.inner` |
-| `Pipe.inner` | io/pipe.rs | sleeping (`sync::Mutex`, Linux pipe->mutex) | the pipe's buffer ring; held across page allocation, never under a spin lock; two pipes (splice, tee) in address order (Linux pipe_double_lock); -> frame allocator. `Pipe.head`/`tail` (atomics) are published as the guard unlocks and read locklessly by wait conditions and poll (poll runs under `Eventpoll.inner`, an IrqSpinlock); wakeups follow the unlock |
+| `Pipe.inner` | io/pipe.rs | sleeping (`sync::Mutex`, Linux pipe->mutex) | the pipe's buffer ring; held across page allocation and across read/write's copy to or from the caller's memory (may fault: -> mmap_lock, as Linux pipe->mutex), never under a spin lock; two pipes (splice, tee) in address order (Linux pipe_double_lock); -> frame allocator. `Pipe.head`/`tail` (atomics) are published as the guard unlocks and read locklessly by wait conditions and poll (poll runs under `Eventpoll.inner`, an IrqSpinlock); wakeups follow the unlock |
 | `NTtyLdisc.data` | tty/n_tty.rs | spin Mutex | line discipline buffer (input is polled, not IRQ-fed) |
 | `VgaCon.state` | arch/x86_64/vgacon.rs | IrqSpinlock | VGA text console state, under `CONSOLE_REGISTRY` (3.9) |
 | `SimpleGfxDevice.state`, `GFX_DEVICES`, `NEXT_MINOR` | gfx/ | spin | framebuffer device state and registry |
