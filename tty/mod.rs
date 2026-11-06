@@ -166,6 +166,10 @@ pub struct Tty {
     buf_lock: crate::sync::Mutex<()>,
     /// Readers and pollers wait here for input (Linux read_wait)
     read_wait: WaitQueue,
+    /// One reader at a time, so a canonical line goes whole to one
+    /// reader though it is copied out in pieces (Linux
+    /// n_tty_data.atomic_read_lock)
+    read_lock: crate::sync::Mutex<()>,
     /// Session, foreground group, window size
     ctrl: Mutex<TtyCtrl>,
 }
@@ -181,6 +185,7 @@ impl Tty {
             ldata: Mutex::new(n_tty::NTtyData::new()),
             flip: IrqSpinlock::new(flip::Flip::new()),
             buf_lock: crate::sync::Mutex::new(()),
+            read_lock: crate::sync::Mutex::new(()),
             read_wait: WaitQueue::new(),
             ctrl: Mutex::new(TtyCtrl::new()),
         }

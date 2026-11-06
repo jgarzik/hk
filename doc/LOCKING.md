@@ -429,7 +429,9 @@ TTYs (3.9): jobctrl CTTY_LOCK (spin) → TASKLIST (read) → Tty.ctrl
     (spin; never takes TASKLIST under it); Tty.ldata → Tty.termios
     (spin, thread context; termios is read under ldata by input
     processing and swapped under it by set_termios, as Linux's
-    termios_rwsem spans both); Tty.buf_lock (sleeping Mutex, Linux
+    termios_rwsem spans both); Tty.read_lock (sleeping Mutex, Linux
+    atomic_read_lock) → Tty.ldata, Tty.flip: held by a reader across its
+    sleeps on read_wait; Tty.buf_lock (sleeping Mutex, Linux
     tty_bufhead.lock) → Tty.ldata: held by the flip thread across
     feeding input (including the echo's driver write) and by
     flush_input; Tty.flip (IrqSpinlock leaf,
@@ -2954,6 +2956,7 @@ Each `Tty` struct contains:
 | `ctrl` | `Mutex<TtyCtrl>` | Session, foreground group, window size (Linux `ctrl.lock` + `winsize_mutex`) |
 | `flip` | `IrqSpinlock<Flip>` | Bytes from the UART interrupt handler (Linux `tty_bufhead`) |
 | `buf_lock` | `sync::Mutex<()>` (sleeping) | Feeding `flip` to N_TTY vs input flushes (Linux `tty_bufhead.lock`); outside `ldata` |
+| `read_lock` | `sync::Mutex<()>` (sleeping) | One N_TTY reader at a time, held across the whole read and its sleeps (Linux `atomic_read_lock`): a canonical line copied out in pieces goes to one reader; outermost tty lock, taken before `ldata` |
 | `read_wait` | `WaitQueue` | Readers and pollers waiting for input |
 
 The `Mutex`es are spin locks taken in thread context only, briefly, one

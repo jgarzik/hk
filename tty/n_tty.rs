@@ -430,6 +430,13 @@ pub fn read(tty: &Tty, file: &File, to: &mut IovDest<'_>) -> Result<usize, Kerne
         }
     }
     let nonblock = file.get_flags() & O_NONBLOCK != 0;
+    // One reader at a time (Linux atomic_read_lock): EAGAIN if taken
+    // and O_NONBLOCK, else a signal ends the wait
+    let _reader = if nonblock {
+        tty.read_lock.try_lock().ok_or(KernelError::WouldBlock)?
+    } else {
+        tty.read_lock.lock_interruptible()?
+    };
     let ready = || tty.ldata.lock().available(1);
     let mut n = 0;
     loop {
