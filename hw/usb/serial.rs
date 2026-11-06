@@ -7,6 +7,7 @@
 //! The port is registered as a console with Normal priority, ahead of
 //! the legacy serial port (Fallback priority). Output goes out its
 //! bulk OUT endpoint raw (the FT232 frames only its IN data).
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::boxed::Box;
 use core::any::Any;

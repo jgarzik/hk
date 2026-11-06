@@ -23,6 +23,7 @@
 //! block; it is never held across a wakeup or sleep. Stop/park requests are
 //! atomics plus a direct `try_to_wake_up`; requesters wait on the control
 //! block's `WaitQueue` for the thread to acknowledge.
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;

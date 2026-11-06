@@ -34,6 +34,7 @@
 //!   once negative); the deactivation bias is added only under the
 //!   rwsem (write), once per node. Drain waits on `KNode.drain` with no
 //!   lock held, woken when the count reaches the bias.
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 pub mod vfs;
 

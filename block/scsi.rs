@@ -3,6 +3,7 @@
 //! Provides SCSI command structures, CDB builders, and the ScsiHost trait
 //! that transport drivers (SAT, USB Mass Storage) implement.
 #![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;

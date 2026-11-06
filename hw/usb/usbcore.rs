@@ -4,6 +4,7 @@
 //! usb_device driver "usb", whose probe adds the active
 //! configuration's interfaces `N-<port>:C.I` (DEVTYPE=usb_interface;
 //! Linux usb_set_configuration), and their attributes.
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::boxed::Box;
 use alloc::format;

@@ -22,6 +22,7 @@
 //! - `cpu`: CPU bandwidth limits and weights
 //! - `memory`: Memory usage limits and accounting
 //! - `io`: Block I/O bandwidth limits
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use crate::sync::spin::{Mutex, RwLock};
 use alloc::collections::BTreeMap;

@@ -26,6 +26,7 @@
 //! - Controlling ttys and job control (`jobctrl`), ioctls (`ioctl`)
 //! - Serial ttys: 16550 ttyS* on x86, PL011 ttyAMA0 on arm64
 //! - /dev/tty, /dev/console, and a Tty as a kernel console
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 pub mod console_dev;
 pub mod flip;

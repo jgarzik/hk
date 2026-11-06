@@ -10,6 +10,7 @@
 //!
 //! Locking: `BDI_REGISTRY`, `BdiWriteback.dirty` and the work item are
 //! spin leaves; writeback runs in the worker thread with none held.
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 extern crate alloc;
 

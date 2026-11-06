@@ -9,6 +9,7 @@
 //! - Run queue lock must be held with IRQs disabled
 //! - Context switch happens with the run queue lock held
 #![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use crate::task::TaskInner;
 use crate::task::TaskLock;

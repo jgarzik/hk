@@ -1,4 +1,5 @@
 //! Task management
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 pub mod acct;
 pub(crate) mod binfmt_script;

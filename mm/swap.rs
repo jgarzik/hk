@@ -13,6 +13,7 @@
 //! swap-in), never with the swap cache's lock held. `SWAP_INFO` (a
 //! spin `RwLock`, read mostly) holds the devices; `SWAPON` (a sleeping
 //! `Mutex`) serializes swapon and swapoff.
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 extern crate alloc;
 

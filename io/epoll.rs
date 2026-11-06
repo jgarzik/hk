@@ -28,6 +28,7 @@
 //! - `File.f_ep` (spin leaf): the items watching the file.
 //! - `EPNESTED` (sleeping): the loop check and insert of an epoll target
 //!   (Linux epnested_mutex), with no spin lock held.
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};

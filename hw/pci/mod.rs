@@ -4,6 +4,7 @@
 //! and bus enumeration for device discovery.
 //!
 //! Functions are registered on the device core (`driver.rs`).
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 pub mod driver;
 pub mod intx;

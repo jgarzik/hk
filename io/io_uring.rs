@@ -38,6 +38,7 @@
 //! - Batched submissions and completions
 //! - Optional kernel-side polling (SQPOLL)
 //! - Registered buffers and files for performance
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;

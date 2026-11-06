@@ -18,6 +18,7 @@
 //! `UdpSock.rxq` is a separate leaf. Receive takes the table read lock
 //! and then each candidate's `Inet.addr`; it never holds the table lock
 //! while queueing. No lock is held across a sleep or a transmit.
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};

@@ -2,6 +2,7 @@
 //!
 //! Handles virtual memory areas (VMAs), mmap/munmap syscalls, and
 //! demand paging for user processes.
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 pub(crate) mod frame_alloc;
 pub(crate) mod heap;

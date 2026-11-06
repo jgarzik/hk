@@ -6,6 +6,7 @@ pub mod cpumask;
 pub mod elf;
 pub mod error;
 pub mod ida;
+pub mod kalloc;
 pub mod kmem;
 pub mod list;
 pub mod pod;

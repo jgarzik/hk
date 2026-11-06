@@ -24,6 +24,7 @@
 //! printk takes it under its OUTPUT_LOCK. Readers are woken from the
 //! scheduler tick (printk may hold run-queue locks; Linux defers the
 //! klogd wakeup through irq_work).
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use core::sync::atomic::{AtomicBool, Ordering};
 

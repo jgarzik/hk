@@ -20,6 +20,7 @@
 //! clones, so no guard escapes (RCU-ready, plan 3a). Order: RTNL ->
 //! device address lists -> `Fib.tables` (leaf; never held while calling
 //! out, notifications are sent after it is dropped).
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;

@@ -9,6 +9,7 @@
 //! - `pids.max`: Read/write limit (or "max" for unlimited)
 //! - `pids.current`: Read-only current task count
 //! - `pids.events`: Read-only event counter ("max N")
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::format;
 use alloc::string::ToString;

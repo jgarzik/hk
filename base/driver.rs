@@ -2,6 +2,7 @@
 //! /sys/bus/<bus>/drivers/<drv>/{bind,unbind,uevent,module}, and the
 //! built-in module's /sys/module/<mod>/drivers/<bus>:<drv> link (when
 //! the bus names the module).
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::boxed::Box;
 use alloc::format;

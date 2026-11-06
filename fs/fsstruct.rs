@@ -18,6 +18,7 @@
 //!
 //! In our Rust implementation, Arc provides the reference counting,
 //! and Mutex provides the locking.
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::sync::Arc;
 

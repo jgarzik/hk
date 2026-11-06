@@ -12,6 +12,7 @@
 //! - Boot sector with BIOS Parameter Block (BPB)
 //! - File Allocation Table (FAT) for cluster chains
 //! - 32-byte directory entries with optional long filename entries
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use crate::util::scope::ScopeGuard;
 use alloc::string::String;

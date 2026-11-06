@@ -2,6 +2,7 @@
 //! drivers_autoprobe,drivers_probe,uevent}; a device added to a bus is
 //! matched against the bus's drivers, a registered driver against its
 //! unbound devices (Linux bus_probe_device, driver_attach).
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;

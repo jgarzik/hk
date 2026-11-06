@@ -19,6 +19,7 @@
 //!
 //! No locks: a filter is immutable and shared by `Arc` (the task's
 //! pointer to its chain is under TASKLIST).
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;

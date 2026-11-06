@@ -1,4 +1,5 @@
 //! File open/close syscalls
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::sync::Arc;
 

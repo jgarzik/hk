@@ -16,6 +16,7 @@
 //! - `cpu.max`, `cpu.weight`, `cpu.stat` - CPU controller files
 //! - `memory.max`, `memory.current`, `memory.stat` - Memory controller files
 //! - `io.max`, `io.stat` - IO controller files
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::format;
 use alloc::string::String;

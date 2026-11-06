@@ -23,6 +23,7 @@
 //!
 //! - `UserNamespace.uid_map.extents`: RwLock
 //! - `UserNamespace.gid_map.extents`: RwLock
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use crate::sync::spin::RwLock;
 use alloc::sync::Arc;

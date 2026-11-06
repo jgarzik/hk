@@ -1,4 +1,5 @@
 //! /sys/kernel (Linux kernel/ksysfs.c, mm/mm_init.c mm_sysfs_init)
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;

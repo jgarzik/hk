@@ -7,6 +7,7 @@
 //! the disk; `rescan` (BLKRRPART) replaces the partitions;
 //! `/proc/partitions` lists every block device. Partition scans and
 //! rescans run under the disk's `open_mutex`.
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::format;
 use alloc::string::String;

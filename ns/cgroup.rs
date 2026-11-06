@@ -12,6 +12,7 @@
 //!
 //! For example, if a process in `/docker/container1` creates a cgroup namespace,
 //! it will see its cgroup as `/` in `/proc/self/cgroup`.
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::string::String;
 use alloc::sync::Arc;

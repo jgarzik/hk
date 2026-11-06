@@ -7,6 +7,7 @@
 //! which also drops it (Linux blkdev_flush_mapping). mmap maps it.
 //! The open file holds its block device (`File.private`), counted as an
 //! opener (BLKRRPART, BLKBSZGET's initial value).
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::sync::Arc;
 

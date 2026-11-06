@@ -3,6 +3,7 @@
 //! A polled driver for the ARM PL011 UART found in QEMU's virt machine
 //! and many real ARM platforms: the early console, and the tty ttyAMA0
 //! (Linux amba-pl011).
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use core::fmt;
 

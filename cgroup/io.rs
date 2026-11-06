@@ -8,6 +8,7 @@
 //!
 //! - `io.max`: Per-device limits ("$MAJ:$MIN rbps=$N wbps=$N riops=$N wiops=$N")
 //! - `io.stat`: Per-device I/O statistics
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use crate::sync::spin::Mutex;
 use alloc::collections::BTreeMap;

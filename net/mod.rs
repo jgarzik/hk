@@ -43,6 +43,7 @@
 //! gets 127.0.0.1/8 when brought up). Userspace configures links,
 //! addresses and routes with NETLINK_ROUTE (`netlink/`) or SIOC* ioctls
 //! (`devioctl.rs`); all changes serialize on RTNL (`rtnl.rs`).
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::sync::Arc;
 

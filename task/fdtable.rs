@@ -15,6 +15,7 @@
 //! file_close_fd_locked, then filp_close/fput after spin_unlock).
 //! Likewise a task's last reference to its table is dropped after its
 //! alloc_lock is released, never under it.
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use crate::sync::spin::{Mutex, MutexGuard};
 use alloc::sync::Arc;

@@ -1,6 +1,7 @@
 //! Mount - filesystem mount infrastructure
 //!
 //! Manages the mount tree that connects filesystems into a unified namespace.
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;

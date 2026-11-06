@@ -4,6 +4,7 @@
 //! shows the nodes tagged with that namespace (net devices) besides the
 //! untagged ones (Linux sysfs_get_tree: kobj_ns_grab_current(NET)).
 //! Subsystems hang their directories off `root()` as they initialize.
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;

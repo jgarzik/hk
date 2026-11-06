@@ -25,6 +25,7 @@
 //! `inner` is held: state changes return actions that run after the
 //! unlock. `TABLES` and `TIMER` (`crate::sync::spin::Mutex`) are leaves except that
 //! `TIMER` is held across arming (-> the timer base IrqSpinlock).
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, VecDeque};

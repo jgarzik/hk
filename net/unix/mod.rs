@@ -46,6 +46,7 @@
 //!   `peercred` (leaf, Linux sk_peer_lock).
 //! - Wakeups (`Sock.wq`, `peer_wait`) happen after unlocking; queued
 //!   messages and their files are always dropped with no lock held.
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 pub mod dgram;
 pub mod scm;

@@ -10,6 +10,7 @@
 //! - `cpu.max`: Bandwidth limit ("$QUOTA $PERIOD" in microseconds, or "max $PERIOD")
 //! - `cpu.weight`: Relative weight 1-10000 (default 100)
 //! - `cpu.stat`: Usage statistics
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::format;
 use alloc::sync::Arc;

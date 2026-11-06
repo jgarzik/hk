@@ -11,6 +11,7 @@
 //! - `memory.current`: Current usage in bytes
 //! - `memory.stat`: Detailed breakdown (anon, file, kernel)
 //! - `memory.events`: OOM and limit events
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::format;
 use alloc::string::ToString;

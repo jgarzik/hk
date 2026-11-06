@@ -13,6 +13,7 @@
 //! Blocking follows the file's O_NONBLOCK at every call (fcntl/FIONBIO
 //! take effect immediately) plus MSG_DONTWAIT; timeouts and signal
 //! rules are in `Sock::wait`.
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;

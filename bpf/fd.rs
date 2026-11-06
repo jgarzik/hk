@@ -3,6 +3,7 @@
 //! This module provides file descriptor support for BPF objects (maps and programs).
 //! BPF objects are exposed as file descriptors to userspace, allowing them to be
 //! managed with standard fd operations (close, dup, etc.).
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::sync::Arc;
 

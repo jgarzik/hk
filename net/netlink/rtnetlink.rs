@@ -9,6 +9,7 @@
 //!
 //! Dumps are resumable cursors (`RtDump`): parts of at most `DUMP_SIZE`
 //! bytes are produced as the reader drains its queue, NLMSG_DONE last.
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;

@@ -1,6 +1,7 @@
 //! AF_PACKET socket options (Linux packet_setsockopt/getsockopt,
 //! packet_mc_add/drop) and the SO_ATTACH_FILTER family
 //! (net/core/sock.c, net/core/filter.c sk_attach_filter)
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;

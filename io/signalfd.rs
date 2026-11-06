@@ -22,6 +22,7 @@
 //! - poll() support for integration with select/poll/epoll
 //! - Mask can be updated by calling signalfd4 with existing fd
 #![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::sync::Arc;
 

@@ -2,6 +2,7 @@
 //!
 //! This module defines the Key struct which represents a security key
 //! in the Linux keyring subsystem.
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use crate::sync::spin::RwLock;
 use alloc::string::String;

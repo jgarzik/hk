@@ -30,6 +30,7 @@
 //! thread context or, restarting, in the IRQ handler; `complete` in the
 //! IRQ handler or a polling submitter. Neither allocates nor sleeps.
 #![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;

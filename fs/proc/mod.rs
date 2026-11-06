@@ -13,6 +13,7 @@
 //! - `/proc/<pid>/ns/user` - User namespace
 //!
 //! These files can be opened and passed to `setns(2)` to join namespaces.
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 mod array;
 mod mounts;

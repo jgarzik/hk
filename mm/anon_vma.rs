@@ -24,6 +24,7 @@
 //! Deviation from Linux: one AnonVma per family of VMAs (fork shares
 //! the parent's instead of chaining a child one under it), and the chain
 //! is a vector, not an interval tree.
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 extern crate alloc;
 

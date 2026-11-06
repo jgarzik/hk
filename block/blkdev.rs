@@ -29,6 +29,7 @@
 //!   only use IRQ-safe operations (atomics, `Completion::complete`, wait
 //!   queue wakeups); it must not sleep or take a `Mutex`/`RwLock`.
 #![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;

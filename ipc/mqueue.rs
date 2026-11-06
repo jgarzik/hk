@@ -22,6 +22,7 @@
 //!
 //! - Linux kernel ipc/mqueue.c
 //! - POSIX.1-2017 mq_overview(7)
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use crate::fs::name::FileName;
 use crate::time::hrtimer::HrClock;

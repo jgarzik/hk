@@ -4,6 +4,7 @@
 //!
 //! `XHCI_PCI_DRIVER` binds the controller on the PCI bus.
 #![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;

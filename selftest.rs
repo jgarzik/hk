@@ -4,6 +4,7 @@
 //! cross-CPU wakeups) in parallel with user space, and prints one line:
 //! `KSELFTEST:OK`, or `KSELFTEST:FAIL ...` per failed check (make check
 //! fails on any FAIL in the serial log).
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -186,6 +187,9 @@ fn selftest_thread(_arg: usize) {
     if let Some(what) = crate::mm::pagewalk::selftest() {
         check(what, false, 0);
     }
+
+    // 6b. Fallible Arc: std's Arc takes the block kalloc reserved
+    check("kalloc_arc_reserve", crate::util::kalloc::selftest(), 0);
 
     // 7. Cross-CPU calls from every CPU at once: none lost, no deadlock
     if let Err((what, n)) = ipi_stress() {

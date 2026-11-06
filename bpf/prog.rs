@@ -2,6 +2,7 @@
 //!
 //! This module provides the `BpfProg` struct that holds a validated
 //! eBPF program ready for execution.
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;

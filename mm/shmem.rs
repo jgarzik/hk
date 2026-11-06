@@ -18,6 +18,7 @@
 //! the mm lock (mm lock -> Shmem.root) and by MADV_REMOVE with no lock
 //! held; under it only `FRAME_ALLOCATOR` and the heap are taken. The drop takes no
 //! lock (doc/LOCKING.md, Address Spaces).
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::sync::Arc;
 

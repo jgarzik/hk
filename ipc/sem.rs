@@ -5,6 +5,7 @@
 //! - Atomic multi-semaphore operations
 //! - Blocking with optional timeout
 //! - Automatic undo on process exit (SEM_UNDO)
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;

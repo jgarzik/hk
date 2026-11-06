@@ -8,6 +8,7 @@
 //!
 //! - `cgroup.freeze`: Write 1 to freeze, 0 to thaw
 //! - `cgroup.events` (core): shows whether it is frozen
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::format;
 use alloc::sync::Arc;

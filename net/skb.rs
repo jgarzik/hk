@@ -21,6 +21,7 @@
 //! Data:     data..tail (actual packet data)
 //! Tailroom: tail..end  (for appending data)
 //! ```
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;

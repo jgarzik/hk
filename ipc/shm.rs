@@ -10,6 +10,7 @@
 //! their removal by munmap, shmdt, exit or exec all keep it right, and the
 //! last detach of a segment removed with IPC_RMID destroys it. The pages
 //! go when the segment and its last VMA are gone.
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;

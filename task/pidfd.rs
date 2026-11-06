@@ -24,6 +24,7 @@
 //! - Signal sending via pidfd
 //! - Integration with waitid(P_PIDFD)
 //! - CLONE_PIDFD support for automatic pidfd creation
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::sync::Arc;
 

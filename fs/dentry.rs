@@ -8,6 +8,7 @@
 //! Following Linux's `d_lock` pattern, each dentry has a single RwLock (`d_lock`)
 //! that protects all mutable state. This simplifies lock ordering and matches
 //! the proven Linux design.
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};

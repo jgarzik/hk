@@ -23,6 +23,7 @@
 //! - Signal notification (SIGEV_SIGNAL, SIGEV_NONE)
 //! - Overrun counting for missed expirations
 //! - One-shot and periodic timers
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;

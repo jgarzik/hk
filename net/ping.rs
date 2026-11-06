@@ -15,6 +15,7 @@
 //! (`crate::sync::spin::RwLock`) -> `Inet.addr`; `RxQueue` and `Sock.errq` are
 //! separate leaves. Receive takes the table read lock, clones the `Arc`
 //! and queues after dropping it.
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};

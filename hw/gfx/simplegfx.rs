@@ -14,6 +14,7 @@
 //!
 //! This allows userspace to discover the display and render to it
 //! via standard DRM/KMS APIs without needing hardware-specific drivers.
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 extern crate alloc;
 

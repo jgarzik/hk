@@ -4,6 +4,7 @@
 //!
 //! This provides the hardware interface for serial ports like /dev/ttyS0.
 #![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use crate::console::{ConsolePriority, register_console};
 use crate::util::error::KernelError;

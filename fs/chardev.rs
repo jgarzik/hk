@@ -10,6 +10,7 @@
 //! Middle:       tty framework (interactive terminals implemented as chrdevs).
 //! Top:          console framework (kernel log + active console(s)).
 //! ```
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use crate::base::{Class, DevNode, Device, DeviceInfo, device_create};
 use crate::fs::File;

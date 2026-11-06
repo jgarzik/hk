@@ -2,6 +2,7 @@
 //!
 //! This module provides the VFS layer and filesystem implementations
 //! including CPIO (initramfs), ramfs, and procfs.
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 pub mod chardev;
 

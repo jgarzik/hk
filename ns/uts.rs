@@ -13,6 +13,7 @@
 //!
 //! `UtsNamespace.name` is protected by `RwLock` for read-heavy access
 //! (uname is called frequently, sethostname/setdomainname are rare).
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use crate::sync::spin::RwLock;
 use alloc::sync::Arc;

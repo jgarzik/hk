@@ -24,6 +24,7 @@
 //! ## References
 //!
 //! - Linux kernel ipc/util.c, ipc/shm.c, ipc/sem.c, ipc/msg.c
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 pub mod mqueue;
 pub mod msg;

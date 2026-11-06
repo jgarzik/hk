@@ -2,6 +2,7 @@
 //!
 //! This module defines the KeyType trait for pluggable key types and provides
 //! implementations for the built-in "user" and "keyring" key types.
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::format;
 use alloc::string::String;

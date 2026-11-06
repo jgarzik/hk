@@ -27,6 +27,7 @@
 //! (`crate::sync::spin::RwLock` leaf, the `Arc` is cloned out before running it).
 //! `mclist` (`crate::sync::spin::Mutex` leaf) is changed under RTNL, which device
 //! promiscuity changes need: RTNL -> `mclist`.
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 mod opts;
 mod rcv;

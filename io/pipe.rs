@@ -42,6 +42,7 @@
 //! - `./select-poll.md` - Implementation guide
 //! - Linux pipe(7) man page
 //! - Linux fs/pipe.c
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use crate::sync::{Mutex, MutexGuard};
 use alloc::sync::Arc;

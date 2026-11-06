@@ -1,1 +1,8 @@
 check-private-items = true
+# Kernel objects are built fallibly (util/kalloc.rs): an allocation the
+# global allocator cannot meet panics, where Linux returns ENOMEM
+disallowed-methods = [
+    { path = "alloc::boxed::Box::new", reason = "use util::kalloc::try_box (ENOMEM instead of a panic)" },
+    { path = "alloc::sync::Arc::new", reason = "use util::kalloc::try_arc (ENOMEM instead of a panic)" },
+    { path = "alloc::sync::Arc::new_cyclic", reason = "use util::kalloc::try_arc_cyclic" },
+]

@@ -15,6 +15,7 @@
 //! `RawTable.socks` (`crate::sync::spin::RwLock`, per namespace) -> `Inet.addr`;
 //! delivery clones the matching `Arc`s and queues (`RxQueue`, leaf)
 //! after dropping the table lock. `RawSock.filter` is an atomic.
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;

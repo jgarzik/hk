@@ -6,6 +6,7 @@
 //! - syslog (kernel logging)
 //! - capget, capset (capabilities)
 //! - pidfd_open, pidfd_send_signal, pidfd_getfd (pidfd operations)
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use crate::util::error::KernelError;
 

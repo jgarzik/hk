@@ -15,6 +15,7 @@
 //! probe and release; the driver and its state are spin leaves read
 //! without it. Bus, class and `DEVICES_LIST` are spin leaves; sysfs
 //! changes take kernfs's locks (doc/LOCKING.md 3.3).
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};

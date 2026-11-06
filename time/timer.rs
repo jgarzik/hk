@@ -21,6 +21,7 @@
 //! Locking: `TimerBase.wheel` is an IrqSpinlock leaf (only the wheel's
 //! lists and the timers' `expires`/`pending` under it); callbacks run
 //! with no timer lock held.
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::boxed::Box;
 use core::marker::PhantomPinned;

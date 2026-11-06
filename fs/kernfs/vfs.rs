@@ -14,6 +14,7 @@
 //!
 //! `OpenAttr.buf` (sleeping `Mutex`, Linux kernfs_open_file.mutex) is
 //! held across show()/store(), under an active reference.
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;

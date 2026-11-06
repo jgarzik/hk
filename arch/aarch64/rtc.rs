@@ -13,6 +13,7 @@
 //! - RTCMIS (0x018): Masked Interrupt Status
 //! - RTCICR (0x01C): Interrupt Clear Register
 #![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use core::ptr;
 

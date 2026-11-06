@@ -13,6 +13,7 @@
 //! `NetDevice.kdev` is set once, when its sysfs device is created (under
 //! RTNL for driver registrations); `NET_SYSFS` is set once at init.
 //! Attributes read the device without RTNL, as its receive path does.
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::format;
 use alloc::string::String;

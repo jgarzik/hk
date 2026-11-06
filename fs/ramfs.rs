@@ -16,6 +16,7 @@
 //!
 //! File data (`RamfsInodeData.data`) uses RwLock independently for concurrent
 //! read access and exclusive write access during file I/O.
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;

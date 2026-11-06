@@ -8,6 +8,7 @@
 //!
 //! - `BPF_MAP_TYPE_HASH`: Hash table with arbitrary keys
 //! - `BPF_MAP_TYPE_ARRAY`: Fixed-size array indexed by u32
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;

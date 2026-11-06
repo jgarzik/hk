@@ -13,6 +13,7 @@
 //! - New namespaces start with only a loopback device
 //! - Physical devices belong to the init namespace by default
 //! - Sockets, routes, and ARP entries are namespace-local
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;

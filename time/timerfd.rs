@@ -23,6 +23,7 @@
 //! - Blocking and non-blocking reads
 //! - poll() support for integration with select/poll/epoll
 //! - CLOCK_REALTIME, CLOCK_MONOTONIC, CLOCK_BOOTTIME and the alarm clocks
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::sync::{Arc, Weak};
 use core::pin::Pin;

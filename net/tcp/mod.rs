@@ -30,6 +30,7 @@
 //! takes its listener's `cb`) -> tables (`bhash` -> `ehash`, `lhash`) ->
 //! `Inet.addr` -> `TcpSock.queue` (listener SYN/accept queues, leaf) ->
 //! timer `TIMERS`; and `cb` -> FIB / neighbour / device TX (transmit).
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 pub mod ack;
 pub mod cb;

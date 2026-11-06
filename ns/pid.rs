@@ -5,6 +5,7 @@
 //! ancestor). Each namespace has its number bitmap (`task::pid`), and a
 //! task gets a number in each level of its parent's namespace chain;
 //! syscalls still report the root number (BUGS.md).
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::sync::Arc;
 use spin::Lazy;

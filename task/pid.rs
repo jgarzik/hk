@@ -16,6 +16,7 @@
 //! it). The hash holds a weak reference per number: a lookup takes a
 //! strong one only while the `Pid` is alive, and the last drop unhashes
 //! it and frees its numbers.
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::boxed::Box;
 use alloc::sync::{Arc, Weak};

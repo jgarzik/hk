@@ -6,6 +6,7 @@
 //! - setuid, setgid, setreuid, setregid (set user/group IDs)
 //! - setresuid, setresgid, getresuid, getresgid (real/effective/saved IDs)
 //! - setfsuid, setfsgid (filesystem user/group IDs)
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use crate::util::error::KernelError;
 

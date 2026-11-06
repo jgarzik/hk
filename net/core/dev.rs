@@ -33,6 +33,7 @@
 //!   run in the receive path (softnet or an inline backlog flush) and in
 //!   `dev_queue_xmit` callers, with no lock held by this module.
 //! - `NAPI_LIST`: `crate::sync::spin::Mutex`, thread context only, leaf.
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;

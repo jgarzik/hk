@@ -6,6 +6,7 @@
 //! device, class, config, driver_override, ...) and uevent variables.
 //! Drivers match by id table, or only by name once driver_override is
 //! set.
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::format;
 use alloc::string::String;

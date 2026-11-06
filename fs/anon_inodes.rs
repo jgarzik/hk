@@ -15,6 +15,7 @@
 //! [`get_next_ino`] numbers inodes of pseudo filesystems (pipes,
 //! sockets): each CPU takes a batch of numbers from a shared counter
 //! and hands them out without touching it (Linux LAST_INO_BATCH).
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::sync::{Arc, Weak};
 use core::any::Any;

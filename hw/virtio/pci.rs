@@ -19,6 +19,7 @@
 //! (`VirtioDevice.irq`) are an `IrqSpinlock` leaf: set by
 //! `request_irq`, cleared by `free_irq` after the handler is
 //! unregistered, read (cloned) by the handler under `IRQ_TABLE`.
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;

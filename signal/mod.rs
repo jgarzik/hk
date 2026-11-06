@@ -16,6 +16,7 @@
 //!   thread-group pending set is a `spin::Mutex`, taken under it
 //!
 //! See doc/LOCKING.md for full lock ordering.
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 pub mod syscall;
 

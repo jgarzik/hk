@@ -4,6 +4,7 @@
 //! - Multiple message types for selective receiving
 //! - Blocking send/receive with optional timeout
 //! - Per-queue byte limits
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;

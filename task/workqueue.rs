@@ -36,6 +36,7 @@
 //! re-queue itself. Queueing, `mod_delayed_work` and
 //! `cancel_delayed_work` are process-context only (they take the item's
 //! Mutex, under `inner` for delayed work).
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 extern crate alloc;
 

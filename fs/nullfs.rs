@@ -13,6 +13,7 @@
 //! One inode, a directory with no entries that nothing can change
 //! (Linux make_empty_dir_inode plus S_IMMUTABLE): lookups find nothing,
 //! creating or changing anything is EPERM.
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::sync::Arc;
 

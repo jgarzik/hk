@@ -2,6 +2,7 @@
 //!
 //! Implements the Bulk-Only Transport (BOT) protocol for USB mass storage devices.
 //! This driver implements the ScsiHost trait to integrate with the SCSI layer.
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;

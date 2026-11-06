@@ -278,6 +278,10 @@ fn kvmalloc(layout: Layout) -> *mut u8 {
 
 unsafe impl GlobalAlloc for KernelAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        // A block `util::kalloc` reserved for this allocation
+        if let Some(p) = crate::util::kalloc::take_reserved(layout) {
+            return p;
+        }
         if self.slab.load(core::sync::atomic::Ordering::Acquire) {
             kvmalloc(layout)
         } else {

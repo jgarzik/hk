@@ -27,6 +27,7 @@
 //! - Support for permission events (blocking operations pending user decision)
 //! - Multiple marks per fanotify instance
 #![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;

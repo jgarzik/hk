@@ -22,6 +22,7 @@
 //! - Blocking and non-blocking reads/writes
 //! - poll() support for integration with select/poll/epoll
 //! - Semaphore mode (EFD_SEMAPHORE) for decrement-by-1 semantics
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::sync::Arc;
 

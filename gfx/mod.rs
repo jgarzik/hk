@@ -32,6 +32,7 @@
 //! - GFX_IOCTL_MODE_CREATE_DUMB
 //! - GFX_IOCTL_MODE_MAP_DUMB
 //! - GFX_IOCTL_MODE_DESTROY_DUMB
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 extern crate alloc;
 

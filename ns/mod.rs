@@ -21,6 +21,7 @@
 //! ## Lock Ordering
 //!
 //! VFS locks → Namespace locks → Filesystem context → Per-CPU scheduler → TASKLIST
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 pub mod cgroup;
 pub mod net;

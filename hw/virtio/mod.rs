@@ -10,6 +10,7 @@
 //! the interrupt (`free_irq`) and drops their queues; the bus then
 //! acknowledges the device again for the next bind. Queues are split rings (`ring`) in coherent DMA
 //! memory, addressed only through the DMA API.
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 pub mod blk;
 pub mod pci;

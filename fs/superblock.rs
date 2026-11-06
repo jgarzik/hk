@@ -2,6 +2,7 @@
 //!
 //! Each mounted filesystem has a superblock that holds filesystem-wide
 //! state and provides operations for managing inodes.
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::sync::Arc;
 

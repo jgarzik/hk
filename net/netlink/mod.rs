@@ -34,6 +34,7 @@
 //! - Order: RTNL -> FIB/addresses -> `NlTable.socks` -> `NlSock.rxq`;
 //!   `NlSock.dump` -> devices/FIB/ARP snapshots -> `NlSock.rxq`. RTNL is
 //!   never taken under `NlSock.dump`.
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 pub mod attr;
 pub mod ops;

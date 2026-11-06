@@ -1,6 +1,7 @@
 //! The platform bus (Linux drivers/base/platform.c): devices with fixed
 //! resources, below /sys/devices/platform, matched by name or DT
 //! compatible string.
+#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::format;
 use alloc::string::String;
