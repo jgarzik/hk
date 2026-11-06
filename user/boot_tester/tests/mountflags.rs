@@ -554,6 +554,18 @@ fn test_sync_nosymfollow() {
     );
     f += chk(n, b"mounts sync", mounts_opt(b"/tmp/mnt_uns", b",sync"), 1);
     sys_umount2(mp.as_ptr(), 0);
+    // A second mount of a superblock already mounted (sysfs) leaves its
+    // flags alone (Linux applies them to a new superblock only)
+    let r = sys_mount(
+        b"sysfs\0".as_ptr(),
+        mp.as_ptr(),
+        b"sysfs\0".as_ptr(),
+        MS_SYNCHRONOUS,
+        0,
+    );
+    f += chk(n, b"sysfs again", r, 0);
+    f += chk(n, b"sysfs kept", st_flags(b"/sys\0") & ST_SYNCHRONOUS, 0);
+    sys_umount2(mp.as_ptr(), 0);
     f += chk(n, b"MS_DIRSYNC", ramfs(mp, MS_DIRSYNC), 0);
     f += chk(
         n,

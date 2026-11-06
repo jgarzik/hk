@@ -2,20 +2,23 @@
 //! users' processes (noaccess: their directories refuse entry, EPERM;
 //! invisible: absent, ENOENT, and not listed), gid= exempts a group,
 //! subset=pid leaves only the processes and self; options show in
-//! /proc/self/mounts, a remount changes them, an unknown one is EINVAL
+//! /proc/self/mounts, a remount changes them (a failed one does not),
+//! an unknown one is EINVAL
 //!
 //! - PROC_HIDEPID: one line, the first failed step
 
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
-    O_DIRECTORY, O_RDONLY, Stat, sys_close, sys_exit, sys_fork, sys_getdents64, sys_getpid,
-    sys_mkdir, sys_mount, sys_open, sys_rmdir, sys_setresgid, sys_setresuid, sys_stat, sys_umount2,
-    sys_wait4,
+    O_DIRECTORY, O_RDONLY, O_WRONLY, Stat, sys_close, sys_exit, sys_fork, sys_getdents64,
+    sys_getpid, sys_mkdir, sys_mount, sys_open, sys_rmdir, sys_setresgid, sys_setresuid, sys_stat,
+    sys_umount2, sys_wait4,
 };
 
 const EPERM: i64 = -1;
 const ENOENT: i64 = -2;
 const EINVAL: i64 = -22;
+const EBUSY: i64 = -16;
+const MS_RDONLY: u64 = 1;
 const MS_REMOUNT: u64 = 32;
 const MP: &[u8] = b"/tmp/ph\0";
 const GID: u32 = 4242;
@@ -187,6 +190,15 @@ fn run() -> R {
     check(b"remount shows", shows(b",gid=4242,hidepid=noaccess"), 0)?;
     let v = as_user(UID, noaccess);
     check(b"noaccess", v == 0, v)?;
+    // A remount that fails (read-only while a file is open for writing)
+    // changes nothing, its options included (Linux reconfigure_super)
+    let w = sys_open(b"/tmp/ph/sys/vm/drop_caches\0".as_ptr(), O_WRONLY, 0);
+    let r = mount(MS_REMOUNT | MS_RDONLY, b"hidepid=invisible\0");
+    if w >= 0 {
+        sys_close(w as u64);
+    }
+    check(b"busy remount", w >= 0 && r == EBUSY, r)?;
+    check(b"busy remount kept options", shows(b",hidepid=noaccess"), 0)?;
     sys_umount2(MP.as_ptr(), 0);
     let r = mount(0, b"subset=pid\0");
     check(b"subset mount", r == 0, r)?;

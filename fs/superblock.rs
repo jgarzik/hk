@@ -491,6 +491,11 @@ impl SuperBlock {
         mounts.push(Arc::downgrade(m));
     }
 
+    /// Some mount of it is alive
+    pub fn is_mounted(&self) -> bool {
+        self.s_mounts.lock().iter().any(|w| w.strong_count() != 0)
+    }
+
     /// Make the file system read-only (Linux sb_prepare_remount_readonly,
     /// then SB_RDONLY): under MOUNT_LOCK every writable mount of it, and
     /// its mountless writers, are held; with no writer anywhere it goes

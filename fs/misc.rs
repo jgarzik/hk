@@ -155,10 +155,20 @@ fn sb_sync_flags(flags: u64) -> u32 {
 /// with nothing changed); only then the per-mount flags are replaced.
 fn remount(m: &Arc<super::mount::Mount>, flags: u64, data: &[u8]) -> Result<(), KernelError> {
     let _s = m.sb.s_umount.write();
-    m.sb.s_op.remount(&m.sb, data)?;
+    // Read-only first (EBUSY changes nothing), then the filesystem's
+    // options; their error undoes the switch (Linux reconfigure_super:
+    // sb_prepare_remount_readonly, ->reconfigure, cancel on error)
+    let was_ro = m.sb.rdonly();
     if flags & ms::RDONLY != 0 {
         m.sb.make_rdonly()?;
-    } else {
+    }
+    if let Err(e) = m.sb.s_op.remount(&m.sb, data) {
+        if !was_ro && m.sb.rdonly() {
+            m.sb.make_rdwr();
+        }
+        return Err(e);
+    }
+    if flags & ms::RDONLY == 0 {
         m.sb.make_rdwr();
     }
     m.sb.set_sync_flags(sb_sync_flags(flags));
@@ -336,7 +346,11 @@ fn new_mount(
         (fs_type.mount)(fs_type, data)
     };
     let r = sb.and_then(|sb| {
-        sb.set_sync_flags(sb_sync_flags(flags));
+        // A superblock already mounted elsewhere (sysfs of a namespace)
+        // keeps its flags (Linux: only a new one gets the mount's)
+        if !sb.is_mounted() {
+            sb.set_sync_flags(sb_sync_flags(flags));
+        }
         // Linux: no source is "none"
         let devname = if source.is_empty() {
             b"none".as_slice()
