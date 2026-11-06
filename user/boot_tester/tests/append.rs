@@ -7,9 +7,10 @@
 
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
-    MAP_ANONYMOUS, MAP_PRIVATE, O_APPEND, O_CREAT, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY, PROT_READ,
-    SEEK_CUR, Stat, sys_close, sys_exit, sys_fork, sys_fstat, sys_lseek, sys_mmap, sys_open,
-    sys_pipe, sys_pread64, sys_pwrite64, sys_read, sys_unlink, sys_wait4, sys_write,
+    MAP_ANONYMOUS, MAP_PRIVATE, MAP_SHARED, O_APPEND, O_CREAT, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY,
+    PROT_READ, PROT_WRITE, SEEK_CUR, Stat, sys_close, sys_exit, sys_fork, sys_fstat, sys_lseek,
+    sys_mmap, sys_munmap, sys_open, sys_pipe, sys_pread64, sys_pwrite64, sys_read, sys_unlink,
+    sys_wait4, sys_write,
 };
 
 const REC: usize = 32;
@@ -20,6 +21,31 @@ pub fn run_tests() {
     test_faulting_writer();
     test_append_pwrite();
     test_shared_pos();
+    test_append_mmap();
+}
+
+/// A shared writable mapping of an O_APPEND descriptor is allowed (Linux
+/// do_mmap refuses only an append-only inode, IS_APPEND, not the open
+/// flag); stores through it reach the file
+fn test_append_mmap() {
+    let path = b"/tmp/append_map\0";
+    let fd = sys_open(path.as_ptr(), O_CREAT | O_RDWR | O_TRUNC | O_APPEND, 0o644);
+    if fd < 0 {
+        return verdict(b"APPEND_MMAP_SHARED", false, fd);
+    }
+    let page = [b'a'; 4096];
+    sys_write(fd as u64, page.as_ptr(), 4096);
+    let m = sys_mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd as i32, 0);
+    let mut buf = [0u8; 4];
+    if m >= 0 {
+        // SAFETY: a fresh 4096-byte shared mapping of the file
+        unsafe { core::ptr::copy_nonoverlapping(b"MAP!".as_ptr(), m as *mut u8, 4) };
+        sys_munmap(m as u64, 4096);
+        sys_pread64(fd as i32, buf.as_mut_ptr(), 4, 0);
+    }
+    sys_close(fd as u64);
+    sys_unlink(path.as_ptr());
+    verdict(b"APPEND_MMAP_SHARED", m >= 0 && &buf == b"MAP!", m);
 }
 
 fn verdict(name: &[u8], ok: bool, got: i64) {

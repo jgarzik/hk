@@ -316,6 +316,12 @@ fn do_huge_anon(mm: &Mm, addr: u64, area: &Area) -> bool {
     let Some(frame) = FRAME_ALLOCATOR.alloc_huge() else {
         return false;
     };
+    // The table its split will need, kept with it (Linux
+    // pte_alloc_one + pgtable_trans_huge_deposit)
+    let Some(pt) = FRAME_ALLOCATOR.alloc() else {
+        FRAME_ALLOCATOR.free_huge(frame);
+        return false;
+    };
     // SAFETY: a fresh 2MB frame, reached through the direct map
     unsafe { core::ptr::write_bytes(phys_to_virt(frame), 0, HUGE_PAGE_SIZE as usize) };
     if area.prot & PROT_EXEC != 0 {
@@ -332,7 +338,11 @@ fn do_huge_anon(mm: &Mm, addr: u64, area: &Area) -> bool {
     let _l = super::ptl::pt_lock(mm);
     if ArchPageTable::map_huge_page(mm.pgd(), base, frame, flags, &mut &FRAME_ALLOCATOR).is_err() {
         FRAME_ALLOCATOR.free_huge(frame);
+        FRAME_ALLOCATOR.free(pt);
         return false;
+    }
+    if let Some(pmdp) = paging::pmd_ptr(mm.pgd(), base) {
+        super::huge_page::deposit(pmdp, pt);
     }
     add_anon(frame, area, base);
     increment_min_flt();
@@ -400,6 +410,17 @@ fn file_page(
         Err(e) => return Some(Err(e)),
     };
     paging::sync_page(page, exec);
+    if area.shared && area.prot & PROT_WRITE != 0 && inode.i_swapfile.load(Ordering::Acquire) {
+        // An active swap file is written only by swap: a write through
+        // a mapping made before swapon is SIGBUS (Linux
+        // do_page_mkwrite), a read maps the page read-only
+        if access == Access::Write {
+            super::page::unlock_page(page);
+            super::filemap::put_page(page);
+            return Some(Err(VmFault::Bus));
+        }
+        return Some(Ok((page, true, true)));
+    }
     if area.shared {
         if area.prot & PROT_WRITE != 0 {
             super::filemap::dirty_page(&inode.i_data, page);
@@ -549,6 +570,11 @@ fn do_wp_page(mm: &Mm, ptep: *mut u64, pte: u64, addr: u64, area: &Area) -> Resu
         && let Some(inode) = area.file.as_ref().and_then(|f| f.mapping_inode())
         && inode.i_op.maps_cache()
     {
+        // An active swap file is written only by swap (Linux
+        // do_page_mkwrite: SIGBUS), also after a read mapped it
+        if inode.i_swapfile.load(Ordering::Acquire) {
+            return Err(VmFault::Bus);
+        }
         let phys = paging::pte_addr(pte);
         if !FRAME_ALLOCATOR.incref(phys) {
             return Ok(());

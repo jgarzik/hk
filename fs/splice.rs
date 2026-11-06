@@ -23,7 +23,6 @@
 //! - Linux fs/splice.c
 //! - Linux include/linux/pipe_fs_i.h
 //! - Linux include/linux/splice.h
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use alloc::sync::Arc;
 
@@ -38,24 +37,22 @@ use crate::mm::filemap::PAGE_SIZE;
 use crate::task::fdtable::get_task_fd;
 use crate::task::percpu::current_tid;
 use crate::uaccess::{copy_from_user, get_user, put_user};
+use crate::util::kalloc::try_arc;
 
 // =============================================================================
 // Splice flags (from include/linux/splice.h)
 // =============================================================================
 
 /// Move pages instead of copying (hint, may not always be honored)
-#[allow(dead_code)]
 pub const SPLICE_F_MOVE: u32 = 0x01;
 
 /// Don't block on I/O
 pub const SPLICE_F_NONBLOCK: u32 = 0x02;
 
 /// Hint that more data is coming (for TCP_CORK)
-#[allow(dead_code)]
 pub const SPLICE_F_MORE: u32 = 0x04;
 
 /// Pages passed in are a gift (for vmsplice)
-#[allow(dead_code)]
 pub const SPLICE_F_GIFT: u32 = 0x08;
 
 // =============================================================================
@@ -173,8 +170,8 @@ pub fn splice_from_pipe(pipe: &Pipe) -> Option<(Arc<PipePage>, u32, u32)> {
 pub fn link_pipe(src: &Pipe, dst: &Pipe, len: usize, _flags: u32) -> Result<usize, KernelError> {
     // Lock both pipes in consistent order to prevent deadlock
     // Use pointer addresses to determine order
-    let src_addr = src as *const Pipe as usize;
-    let dst_addr = dst as *const Pipe as usize;
+    let src_addr = core::ptr::from_ref::<Pipe>(src) as usize;
+    let dst_addr = core::ptr::from_ref::<Pipe>(dst) as usize;
 
     if src_addr == dst_addr {
         return Err(KernelError::InvalidArgument);
@@ -378,8 +375,8 @@ pub fn sys_splice(
 
 /// Splice from pipe to pipe (move buffers)
 fn do_splice_pipe_to_pipe(src: &Pipe, dst: &Pipe, len: usize, flags: u32) -> i64 {
-    let src_addr = src as *const Pipe as usize;
-    let dst_addr = dst as *const Pipe as usize;
+    let src_addr = core::ptr::from_ref::<Pipe>(src) as usize;
+    let dst_addr = core::ptr::from_ref::<Pipe>(dst) as usize;
 
     if src_addr == dst_addr {
         return KernelError::InvalidArgument.sysret();
@@ -530,6 +527,9 @@ fn do_splice_file_to_pipe(
     };
 
     // Copy data to page
+    // SAFETY: `page` is a fresh, kernel-mapped frame of PAGE_SIZE bytes
+    // owned by this call; `bytes_read <= to_read <= PAGE_SIZE` bytes of
+    // `buf` are copied in
     unsafe {
         core::ptr::copy_nonoverlapping(
             buf.as_ptr(),
@@ -600,8 +600,13 @@ fn do_splice_pipe_to_file(
 
         // Copy data from page to temporary buffer
         let mut buf = [0u8; PAGE_SIZE];
+        // SAFETY: the pipe buffer holds `page` (kernel-mapped, PAGE_SIZE)
+        // with valid data at `offset..offset + buf_len` inside it, and
+        // `to_write <= buf_len` bytes of it are copied out
         unsafe {
-            let src = (crate::arch::phys_to_virt(page.frame) as *const u8).add(offset as usize);
+            let src = crate::arch::phys_to_virt(page.frame)
+                .cast_const()
+                .add(offset as usize);
             core::ptr::copy_nonoverlapping(src, buf.as_mut_ptr(), to_write);
         }
 
@@ -643,8 +648,7 @@ fn allocate_pipe_page() -> Option<Arc<PipePage>> {
     // User data (Linux GFP_HIGHUSER | __GFP_ACCOUNT): stops at the low
     // watermark like the user pages it was copied from
     let frame = FRAME_ALLOCATOR.alloc_gfp(crate::mm::page_alloc::Gfp::HIGHUSER_MOVABLE)?;
-    let page = Arc::new(PipePage::new(frame));
-    Some(page)
+    try_arc(PipePage::new(frame)).ok()
 }
 
 /// sys_tee - duplicate pipe content

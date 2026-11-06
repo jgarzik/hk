@@ -23,11 +23,13 @@
 //! - poll() support for integration with select/poll/epoll
 //! - Semaphore mode (EFD_SEMAPHORE) for decrement-by-1 semantics
 
+use crate::util::kalloc::try_arc;
 use alloc::sync::Arc;
 
 use crate::arch::IrqSpinlock;
 use crate::fs::KernelError;
-use crate::fs::file::{File, FileOps, flags};
+use crate::fs::file::{File, FileOps, RwFlags, flags, nowait_rw};
+use crate::fs::iov_iter::{IovDest, IovSource};
 use crate::io::poll::{POLLERR, POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM, PollTable};
 use crate::sync::waitqueue::WaitQueue;
 
@@ -76,8 +78,8 @@ pub struct Eventfd {
 
 impl Eventfd {
     /// Create a new eventfd
-    pub fn new(initval: u64, flags: i32) -> Arc<Self> {
-        Arc::new(Self {
+    pub fn new(initval: u64, flags: i32) -> Result<Arc<Self>, KernelError> {
+        try_arc(Self {
             inner: IrqSpinlock::new(EventfdInner::new(initval, flags)),
             wait_queue: WaitQueue::new(),
         })
@@ -90,36 +92,27 @@ impl Eventfd {
     /// In normal mode, resets counter to 0.
     /// In semaphore mode, decrements counter by 1.
     pub fn read(&self, nonblock: bool) -> Result<u64, KernelError> {
-        loop {
-            {
-                let mut inner = self.inner.lock();
-                if inner.count > 0 {
-                    let value = if inner.is_semaphore() {
-                        // Semaphore mode: return 1, decrement by 1
-                        inner.count -= 1;
-                        1
-                    } else {
-                        // Normal mode: return count, reset to 0
-                        let count = inner.count;
-                        inner.count = 0;
-                        count
-                    };
-
-                    // Wake any blocked writers since we freed up space
-                    drop(inner);
-                    self.wait_queue.wake_all();
-                    return Ok(value);
-                }
-            }
-
+        let mut inner = self.inner.lock();
+        if inner.count == 0 {
             if nonblock {
                 return Err(KernelError::WouldBlock);
             }
-
             // Wait for someone to write (a signal ends the wait)
             self.wait_queue
-                .wait_event_interruptible(|| self.inner.lock().count > 0)?;
+                .wait_event_interruptible_locked(&mut inner, |i| i.count > 0)?;
         }
+        let value = if inner.is_semaphore() {
+            // Semaphore mode: return 1, decrement by 1
+            inner.count -= 1;
+            1
+        } else {
+            // Normal mode: return count, reset to 0
+            core::mem::take(&mut inner.count)
+        };
+        // Wake any blocked writers since we freed up space
+        drop(inner);
+        self.wait_queue.wake_all();
+        Ok(value)
     }
 
     /// Write to the eventfd (adds to counter)
@@ -133,32 +126,25 @@ impl Eventfd {
             return Err(KernelError::InvalidArgument);
         }
 
-        loop {
-            {
-                let mut inner = self.inner.lock();
-                // Check if we can add without overflow
-                // Must have room for at least value more (count + value < ULLONG_MAX)
-                if ULLONG_MAX - inner.count > value {
-                    inner.count += value;
-                    // Wake any blocked readers
-                    drop(inner);
-                    self.wait_queue.wake_all();
-                    return Ok(8);
-                }
-            }
-
+        let mut inner = self.inner.lock();
+        // Room for `value` more: count + value < ULLONG_MAX
+        if ULLONG_MAX - inner.count <= value {
             if nonblock {
                 return Err(KernelError::WouldBlock);
             }
-
             // Wait for someone to read (a signal ends the wait)
             self.wait_queue
-                .wait_event_interruptible(|| ULLONG_MAX - self.inner.lock().count > value)?;
+                .wait_event_interruptible_locked(&mut inner, |i| ULLONG_MAX - i.count > value)?;
         }
+        inner.count += value;
+        // Wake any blocked readers
+        drop(inner);
+        self.wait_queue.wake_all();
+        Ok(8)
     }
 
     /// Poll for readiness
-    pub fn poll(&self, pt: Option<&mut PollTable>) -> u16 {
+    pub fn poll(&self, pt: Option<&mut PollTable<'_>>) -> u16 {
         if let Some(poll_table) = pt {
             poll_table.poll_wait(&self.wait_queue);
         }
@@ -195,38 +181,44 @@ impl FileOps for EventfdFileOps {
         self
     }
 
-    fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {
+    /// One counter read, 8 bytes; a smaller buffer is EINVAL. The
+    /// counter is taken under the lock and copied out after it.
+    fn read_iter(
+        &self,
+        file: &File,
+        to: &mut IovDest<'_>,
+        at: Option<u64>,
+        flags: RwFlags,
+    ) -> Result<usize, KernelError> {
+        let nb = nowait_rw(file, at, flags)?;
         let eventfd = file.private_ref::<Eventfd>().ok_or(KernelError::BadFd)?;
-        // eventfd read always returns 8 bytes (u64)
-        if buf.len() < 8 {
+        if to.len() < 8 {
             return Err(KernelError::InvalidArgument);
         }
-
-        let nonblock = file.get_flags() & flags::O_NONBLOCK != 0;
-        let count = eventfd.read(nonblock)?;
-
-        // Write u64 to buffer (little-endian)
-        buf[0..8].copy_from_slice(&count.to_le_bytes());
+        let count = eventfd.read(nb)?;
+        to.copy_to_full(&count.to_le_bytes())?;
         Ok(8)
     }
 
-    fn write(&self, file: &File, buf: &[u8]) -> Result<usize, KernelError> {
+    /// Add the first 8 bytes to the counter; fewer is EINVAL
+    fn write_iter(
+        &self,
+        file: &File,
+        from: &mut IovSource<'_>,
+        at: Option<u64>,
+        flags: RwFlags,
+    ) -> Result<usize, KernelError> {
+        let nb = nowait_rw(file, at, flags)?;
         let eventfd = file.private_ref::<Eventfd>().ok_or(KernelError::BadFd)?;
-        // eventfd write requires exactly 8 bytes (u64)
-        if buf.len() < 8 {
+        if from.len() < 8 {
             return Err(KernelError::InvalidArgument);
         }
-
-        // Read u64 from buffer (little-endian)
-        let value = u64::from_le_bytes([
-            buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
-        ]);
-
-        let nonblock = file.get_flags() & flags::O_NONBLOCK != 0;
-        eventfd.write(value, nonblock)
+        let mut v = [0u8; 8];
+        from.copy_from_full(&mut v)?;
+        eventfd.write(u64::from_le_bytes(v), nb)
     }
 
-    fn poll(&self, file: &File, pt: Option<&mut PollTable>) -> u16 {
+    fn poll(&self, file: &File, pt: Option<&mut PollTable<'_>>) -> u16 {
         let Some(eventfd) = file.private_ref::<Eventfd>() else {
             return POLLERR;
         };
@@ -243,7 +235,7 @@ impl FileOps for EventfdFileOps {
 /// # Returns
 /// Arc<File> for the new eventfd
 pub fn create_eventfd(initval: u64, efd_flags: i32) -> Result<Arc<File>, KernelError> {
-    let eventfd = Eventfd::new(initval, efd_flags);
+    let eventfd = Eventfd::new(initval, efd_flags)?;
 
     // Create dummy dentry for eventfd
 
@@ -253,8 +245,12 @@ pub fn create_eventfd(initval: u64, efd_flags: i32) -> Result<Arc<File>, KernelE
         file_flags |= flags::O_NONBLOCK;
     }
 
-    let file =
-        crate::fs::anon_inodes::anon_inode_getfile("[eventfd]", &EVENTFD_FOPS, eventfd, file_flags);
+    let file = crate::fs::anon_inodes::anon_inode_getfile(
+        "[eventfd]",
+        &EVENTFD_FOPS,
+        eventfd,
+        file_flags,
+    )?;
     Ok(file)
 }
 

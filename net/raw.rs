@@ -16,6 +16,7 @@
 //! delivery clones the matching `Arc`s and queues (`RxQueue`, leaf)
 //! after dropping the table lock. `RawSock.filter` is an atomic.
 
+use crate::util::kalloc::try_arc;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -75,14 +76,14 @@ pub fn create(protocol: i32) -> Result<Arc<dyn ProtoOps>, KernelError> {
     let sk = Sock::new(net.clone(), AF_INET, SOCK_RAW, protocol);
     // INET_PROTOSW_REUSE
     sk.set_flag(sf::REUSEADDR, true);
-    let s = Arc::new(RawSock {
+    let s = try_arc(RawSock {
         sk,
         inet: Inet::default(),
         num: protocol as u16,
         connected: AtomicBool::new(false),
         filter: AtomicU32::new(0),
         rxq: RxQueue::default(),
-    });
+    })?;
     if protocol == IPPROTO_RAW {
         s.inet.set_hdrincl(true);
     }
@@ -108,7 +109,7 @@ impl RawSock {
     }
 
     /// Destination (Linux raw_sendmsg: AF_UNSPEC is tolerated)
-    fn dest(&self, m: &SendMsg) -> Result<Ipv4Addr, KernelError> {
+    fn dest(&self, m: &SendMsg<'_>) -> Result<Ipv4Addr, KernelError> {
         let Some(a) = &m.addr else {
             if !self.connected.load(Ordering::Acquire) {
                 return Err(KernelError::DestAddrRequired);
@@ -302,7 +303,7 @@ impl ProtoOps for RawSock {
         match level {
             SOL_SOCKET => None,
             SOL_RAW if opt != ICMP_FILTER => Some(Err(KernelError::NoProtocolOption)),
-            SOL_RAW if self.num != IPPROTO_ICMP as u16 => {
+            SOL_RAW if self.num != u16::from(IPPROTO_ICMP) => {
                 Some(Err(KernelError::OperationNotSupported))
             }
             SOL_RAW => Some(v.bytes(4).map(|b| {
@@ -319,7 +320,7 @@ impl ProtoOps for RawSock {
         match level {
             SOL_SOCKET => None,
             SOL_RAW if opt != ICMP_FILTER => Some(Err(KernelError::NoProtocolOption)),
-            SOL_RAW if self.num != IPPROTO_ICMP as u16 => {
+            SOL_RAW if self.num != u16::from(IPPROTO_ICMP) => {
                 Some(Err(KernelError::OperationNotSupported))
             }
             SOL_RAW => Some(Ok(OptOut::Bytes(
@@ -331,7 +332,7 @@ impl ProtoOps for RawSock {
     }
 
     /// Linux raw_sendmsg
-    fn sendmsg(&self, m: &mut SendMsg, flags: i32) -> Result<usize, KernelError> {
+    fn sendmsg(&self, m: &mut SendMsg<'_>, flags: i32) -> Result<usize, KernelError> {
         let len = m.data.len();
         if len > 0xffff {
             return Err(KernelError::MessageTooLong);
@@ -379,7 +380,7 @@ impl ProtoOps for RawSock {
 
     /// Linux raw_recvmsg: the packet from its IP header, source address
     /// with port 0
-    fn recvmsg(&self, m: &mut RecvMsg, flags: i32) -> Result<usize, KernelError> {
+    fn recvmsg(&self, m: &mut RecvMsg<'_>, flags: i32) -> Result<usize, KernelError> {
         if flags & MSG_OOB != 0 {
             return Err(KernelError::OperationNotSupported);
         }
@@ -422,7 +423,7 @@ impl RawTable {
     fn matching(&self, proto: u8, raddr: Ipv4Addr, laddr: Ipv4Addr, dif: u32) -> Vec<Arc<RawSock>> {
         self.socks
             .read()
-            .get(&(proto as u16))
+            .get(&u16::from(proto))
             .map(|v| {
                 v.iter()
                     .filter(|s| s.matches(raddr, laddr, dif))
@@ -461,7 +462,7 @@ pub fn raw_deliver(net: &NetNamespace, skb: &SkBuff) -> bool {
 
 /// An ICMP error about a packet of a raw socket's protocol (Linux
 /// raw_icmp_error + raw_err)
-pub fn raw_err(net: &NetNamespace, e: &IcmpErr) {
+pub fn raw_err(net: &NetNamespace, e: &IcmpErr<'_>) {
     for s in net
         .raw
         .matching(e.proto(), e.inner_daddr(), e.inner_saddr(), e.rx.ifindex)
@@ -470,7 +471,7 @@ pub fn raw_err(net: &NetNamespace, e: &IcmpErr) {
     }
 }
 
-fn err_one(s: &RawSock, e: &IcmpErr) {
+fn err_one(s: &RawSock, e: &IcmpErr<'_>) {
     let recverr = s.inet.flag(ipf::RECVERR);
     if !recverr && !s.connected.load(Ordering::Acquire) {
         return;

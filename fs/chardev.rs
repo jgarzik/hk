@@ -13,9 +13,11 @@
 
 use crate::base::{Class, DevNode, Device, DeviceInfo, device_create};
 use crate::fs::File;
+use crate::fs::iov_iter::{IovDest, IovSource};
 use crate::io::poll::{POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM, PollTable};
 use crate::sync::spin::RwLock;
 use crate::util::error::KernelError;
+use crate::util::kalloc::arc_nofail;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 
@@ -138,15 +140,35 @@ pub trait CharDevice: Send + Sync {
     /// Last close of `file` (Linux f_op->release)
     fn release(&self, _file: &File) {}
 
-    /// Read bytes from the device (`file`'s O_NONBLOCK says whether it
-    /// may sleep)
-    fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, KernelError>;
+    /// Read from the device into `to` (Linux f_op->read_iter; `file`'s
+    /// O_NONBLOCK says whether it may sleep). Never copy to `to` under a
+    /// spin lock. Data already copied wins over a later error.
+    fn read(&self, file: &File, to: &mut IovDest<'_>) -> Result<usize, KernelError>;
 
-    /// Write bytes to the device
-    fn write(&self, file: &File, buf: &[u8]) -> Result<usize, KernelError>;
+    /// Write `from` to the device (Linux f_op->write_iter)
+    fn write(&self, file: &File, from: &mut IovSource<'_>) -> Result<usize, KernelError>;
+
+    /// pread/pwrite reach `read`/`write`, which ignore the position
+    /// (Linux: FMODE_PREAD/PWRITE kept, no stream_open). Default no:
+    /// ESPIPE, as a stream.
+    fn positional(&self) -> bool {
+        false
+    }
+
+    /// lseek (Linux f_op->llseek). Default none: ESPIPE.
+    fn llseek(&self, file: &File, offset: i64, whence: i32) -> Result<u64, KernelError> {
+        let _ = (file, offset, whence);
+        Err(KernelError::OperationNotSupported)
+    }
 
     /// The device can be mapped (Linux: its fops have mmap)
     fn mmap_ok(&self) -> bool {
+        false
+    }
+
+    /// A shared mapping of it is shared anonymous memory (Linux
+    /// mmap_zero -> shmem_zero_setup)
+    fn shared_anon(&self) -> bool {
         false
     }
 
@@ -163,7 +185,7 @@ pub trait CharDevice: Send + Sync {
 
     /// Ready events (Linux f_op->poll): register on the device's wait
     /// queues through `pt`, then return the mask. Default: always ready
-    fn poll(&self, _file: &File, _pt: Option<&mut PollTable>) -> u16 {
+    fn poll(&self, _file: &File, _pt: Option<&mut PollTable<'_>>) -> u16 {
         POLLIN | POLLRDNORM | POLLOUT | POLLWRNORM
     }
 }
@@ -237,6 +259,15 @@ pub fn unregister_chardev(id: DevId) -> Option<Arc<dyn CharDevice>> {
     CHARDEV_REGISTRY.write().unregister(id)
 }
 
+/// A shared mapping of `file` is shared anonymous memory instead (a
+/// character device such as /dev/zero; Linux shmem_zero_setup)
+pub fn maps_shared_anon(file: &crate::fs::File) -> bool {
+    file.get_inode()
+        .filter(|i| i.mode().is_chrdev())
+        .and_then(|i| get_chardev(i.rdev))
+        .is_some_and(|d| d.shared_anon())
+}
+
 /// Look up a character device by ID
 pub fn get_chardev(id: DevId) -> Option<Arc<dyn CharDevice>> {
     CHARDEV_REGISTRY.read().get(id)
@@ -250,13 +281,45 @@ impl CharDevice for NullCharDevice {
         "null"
     }
 
-    fn read(&self, _file: &File, _buf: &mut [u8]) -> Result<usize, KernelError> {
+    fn positional(&self) -> bool {
+        true
+    }
+
+    /// Linux null_lseek: the position is always 0
+    fn llseek(&self, file: &File, _offset: i64, _whence: i32) -> Result<u64, KernelError> {
+        file.set_pos(0);
+        Ok(0)
+    }
+
+    fn read(&self, _file: &File, _to: &mut IovDest<'_>) -> Result<usize, KernelError> {
         Ok(0) // EOF
     }
 
-    fn write(&self, _file: &File, buf: &[u8]) -> Result<usize, KernelError> {
-        Ok(buf.len()) // Discard
+    fn write(&self, _file: &File, from: &mut IovSource<'_>) -> Result<usize, KernelError> {
+        Ok(from.len()) // Discard
     }
+}
+
+/// Zeros to fill `to` (Linux read_iter_zero): a page at a time, ending
+/// early at a signal
+fn read_zero(to: &mut IovDest<'_>) -> Result<usize, KernelError> {
+    let mut done = 0;
+    while !to.is_empty() {
+        if done > 0 {
+            if crate::sync::waitqueue::signal_pending() {
+                break;
+            }
+            crate::task::percpu::cond_resched();
+        }
+        let n = to.len().min(4096);
+        match to.zero(n) {
+            Ok(c) if c == n => done += c,
+            Ok(c) => return Ok(done + c),
+            Err(e) if done == 0 => return Err(e),
+            Err(_) => break,
+        }
+    }
+    Ok(done)
 }
 
 /// Zero character device - returns zeros on read, discards writes
@@ -267,18 +330,31 @@ impl CharDevice for ZeroCharDevice {
         "zero"
     }
 
-    /// Linux mmap_zero: private zero pages
+    fn positional(&self) -> bool {
+        true
+    }
+
+    /// Linux null_lseek: the position is always 0
+    fn llseek(&self, file: &File, _offset: i64, _whence: i32) -> Result<u64, KernelError> {
+        file.set_pos(0);
+        Ok(0)
+    }
+
+    /// Linux mmap_zero: private zero pages, or shared anonymous memory
     fn mmap_ok(&self) -> bool {
         true
     }
 
-    fn read(&self, _file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {
-        buf.fill(0);
-        Ok(buf.len())
+    fn shared_anon(&self) -> bool {
+        true
     }
 
-    fn write(&self, _file: &File, buf: &[u8]) -> Result<usize, KernelError> {
-        Ok(buf.len()) // Discard
+    fn read(&self, _file: &File, to: &mut IovDest<'_>) -> Result<usize, KernelError> {
+        read_zero(to)
+    }
+
+    fn write(&self, _file: &File, from: &mut IovSource<'_>) -> Result<usize, KernelError> {
+        Ok(from.len()) // Discard
     }
 }
 
@@ -291,12 +367,21 @@ impl CharDevice for FullCharDevice {
         "full"
     }
 
-    fn read(&self, _file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {
-        buf.fill(0);
-        Ok(buf.len())
+    fn positional(&self) -> bool {
+        true
     }
 
-    fn write(&self, _file: &File, _buf: &[u8]) -> Result<usize, KernelError> {
+    /// Linux null_lseek: the position is always 0
+    fn llseek(&self, file: &File, _offset: i64, _whence: i32) -> Result<u64, KernelError> {
+        file.set_pos(0);
+        Ok(0)
+    }
+
+    fn read(&self, _file: &File, to: &mut IovDest<'_>) -> Result<usize, KernelError> {
+        read_zero(to)
+    }
+
+    fn write(&self, _file: &File, _from: &mut IovSource<'_>) -> Result<usize, KernelError> {
         Err(KernelError::NoSpace)
     }
 }
@@ -311,17 +396,50 @@ impl CharDevice for RandomCharDevice {
         self.0
     }
 
-    fn read(&self, _file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {
-        let n = crate::random::stream(buf.len(), |off, b| {
-            buf[off..off + b.len()].copy_from_slice(b);
-            true
-        });
-        Ok(n)
+    fn positional(&self) -> bool {
+        true
     }
 
-    fn write(&self, _file: &File, buf: &[u8]) -> Result<usize, KernelError> {
-        crate::random::add_device_randomness(buf);
-        Ok(buf.len())
+    /// Linux noop_llseek: the position stays
+    fn llseek(&self, file: &File, _offset: i64, _whence: i32) -> Result<u64, KernelError> {
+        Ok(file.get_pos())
+    }
+
+    /// Straight from the CRNG stream (no lock held) to `to`
+    fn read(&self, _file: &File, to: &mut IovDest<'_>) -> Result<usize, KernelError> {
+        let mut got = 0;
+        let mut fault = None;
+        crate::random::stream(to.len(), |_, b| match to.copy_to(b) {
+            Ok(c) => {
+                got += c;
+                c == b.len()
+            }
+            Err(e) => {
+                fault = Some(e);
+                false
+            }
+        });
+        match fault {
+            Some(e) if got == 0 => Err(e),
+            _ => Ok(got),
+        }
+    }
+
+    /// Mixed in a block at a time (Linux write_pool_user)
+    fn write(&self, _file: &File, from: &mut IovSource<'_>) -> Result<usize, KernelError> {
+        let mut block = [0u8; 64];
+        let mut done = 0;
+        while !from.is_empty() {
+            let c = match from.copy_from(&mut block) {
+                Ok(c) => c,
+                Err(e) if done == 0 => return Err(e),
+                Err(_) => break,
+            };
+            crate::random::add_device_randomness(&block[..c]);
+            done += c;
+        }
+        block.fill(0);
+        Ok(done)
     }
 }
 
@@ -357,21 +475,21 @@ fn mem_devnode(d: &Device) -> Option<DevNode> {
 /// drivers, the class and its devices
 pub fn register_builtin_chardevs() {
     // /dev/null = major 1 (MEM), minor 3 (Linux convention)
-    let null_dev = Arc::new(NullCharDevice);
+    let null_dev = arc_nofail(NullCharDevice);
     let _ = register_chardev(DevId::new(major::MEM, 3), null_dev);
 
     // /dev/zero = major 1 (MEM), minor 5 (Linux convention)
-    let zero_dev = Arc::new(ZeroCharDevice);
+    let zero_dev = arc_nofail(ZeroCharDevice);
     let _ = register_chardev(DevId::new(major::MEM, 5), zero_dev);
 
     // /dev/full (1,7), /dev/random (1,8), /dev/urandom (1,9)
-    let _ = register_chardev(DevId::new(major::MEM, 7), Arc::new(FullCharDevice));
-    let random = Arc::new(RandomCharDevice("random"));
+    let _ = register_chardev(DevId::new(major::MEM, 7), arc_nofail(FullCharDevice));
+    let random = arc_nofail(RandomCharDevice("random"));
     let _ = register_chardev(DevId::new(major::MEM, 8), random);
-    let urandom = Arc::new(RandomCharDevice("urandom"));
+    let urandom = arc_nofail(RandomCharDevice("urandom"));
     let _ = register_chardev(DevId::new(major::MEM, 9), urandom);
     // /dev/kmsg (1,11)
-    let kmsg = Arc::new(crate::kmsg::KmsgCharDevice);
+    let kmsg = arc_nofail(crate::kmsg::KmsgCharDevice);
     let _ = register_chardev(DevId::new(major::MEM, 11), kmsg);
 
     MEM_CLASS.register();

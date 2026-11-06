@@ -346,7 +346,9 @@ fn test_move_pages_invalid_node() {
     }
 
     let pages: [u64; 1] = [ptr as u64];
-    let nodes: [i32; 1] = [1]; // Node 1 doesn't exist
+    // No machine here has a node 63 (hk and Linux both number below
+    // MAX_NUMNODES, so it is a valid id, just not online: ENODEV)
+    let nodes: [i32; 1] = [63];
     let mut status: [i32; 1] = [0];
 
     let ret = sys_move_pages(0, 1, pages.as_ptr(), nodes.as_ptr(), status.as_mut_ptr(), 0);

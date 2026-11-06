@@ -186,7 +186,7 @@ impl SchedEntity {
     }
 
     pub fn policy(&self) -> i32 {
-        self.policy.load(Ordering::Relaxed) as i32
+        i32::from(self.policy.load(Ordering::Relaxed))
     }
 
     pub fn static_prio(&self) -> u8 {
@@ -195,7 +195,7 @@ impl SchedEntity {
 
     /// Linux task_nice
     pub fn nice(&self) -> i32 {
-        self.static_prio() as i32 - DEFAULT_PRIO as i32
+        i32::from(self.static_prio()) - i32::from(DEFAULT_PRIO)
     }
 
     pub fn rt_priority(&self) -> u8 {
@@ -243,7 +243,7 @@ impl SchedEntity {
     /// # Safety
     /// The rq lock of the task's CPU is held (or the task is not yet
     /// on a run queue), and no other reference to the frame is live.
-    #[allow(clippy::mut_from_ref)]
+    #[expect(clippy::mut_from_ref)]
     pub unsafe fn ctx(&self) -> &mut TaskContext {
         // SAFETY: see above
         unsafe { &mut *self.ctx.get() }

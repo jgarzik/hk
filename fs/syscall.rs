@@ -60,7 +60,7 @@ pub const RWF_SUPPORTED: i32 = RWF_HIPRI
 pub const PATH_MAX: usize = 4096;
 
 /// Largest single read/write transfer (Linux MAX_RW_COUNT = INT_MAX & PAGE_MASK);
-/// data moves through bounded kernel buffers (`file::WRITE_CHUNK`)
+/// file types copy straight between their data and the caller (`fs::iov_iter`)
 pub const MAX_RW_COUNT: usize = 0x7fff_f000;
 
 /// Maximum number of iovec entries (Linux default)

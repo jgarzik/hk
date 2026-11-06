@@ -11,6 +11,7 @@
 //! last detach of a segment removed with IPC_RMID destroys it. The pages
 //! go when the segment and its last VMA are gone.
 
+use crate::util::kalloc::try_arc;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, Ordering};
@@ -99,7 +100,7 @@ impl ShmidKernel {
         let now = current_time_secs();
         let pid = current_pid() as i32;
 
-        Ok(Arc::new(Self {
+        try_arc(Self {
             perm: KernIpcPerm::new(key, mode),
             segsz: size,
             nattch: AtomicU32::new(0),
@@ -108,10 +109,11 @@ impl ShmidKernel {
             ctim: AtomicI64::new(now),
             cpid: pid,
             lpid: AtomicI32::new(pid),
-            shmem: Shmem::new(size.div_ceil(PAGE_SIZE) as u64),
+            shmem: Shmem::new(size.div_ceil(PAGE_SIZE) as u64).map_err(|e| e.errno())?,
             destroyed: AtomicBool::new(false),
             ns,
-        }))
+        })
+        .map_err(KernelError::errno)
     }
 
     /// Fill shmid64_ds structure for IPC_STAT
@@ -123,7 +125,7 @@ impl ShmidKernel {
         ds.shm_ctime = self.ctim.load(Ordering::Relaxed);
         ds.shm_cpid = self.cpid;
         ds.shm_lpid = self.lpid.load(Ordering::Relaxed);
-        ds.shm_nattch = self.nattch.load(Ordering::Relaxed) as u64;
+        ds.shm_nattch = u64::from(self.nattch.load(Ordering::Relaxed));
         ds.__unused4 = 0;
         ds.__unused5 = 0;
     }
@@ -233,8 +235,8 @@ impl Drop for ShmAttach {
 /// Convert Result to syscall return value
 fn result_to_i64(res: Result<i32, i32>) -> i64 {
     match res {
-        Ok(v) => v as i64,
-        Err(e) => -(e as i64),
+        Ok(v) => i64::from(v),
+        Err(e) => -i64::from(e),
     }
 }
 
@@ -242,7 +244,7 @@ fn result_to_i64(res: Result<i32, i32>) -> i64 {
 fn result_u64_to_i64(res: Result<u64, i32>) -> i64 {
     match res {
         Ok(v) => v as i64,
-        Err(e) => -(e as i64),
+        Err(e) => -i64::from(e),
     }
 }
 

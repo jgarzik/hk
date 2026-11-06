@@ -9,6 +9,7 @@ use core::fmt;
 use crate::fs::chardev::{DevId, major};
 use crate::tty::{Tty, TtyDriver};
 use crate::util::error::KernelError;
+use crate::util::kalloc::{try_arc, try_box};
 use core::ptr::{read_volatile, write_volatile};
 
 /// PL011 UART base address on QEMU virt machine
@@ -135,7 +136,7 @@ impl Pl011 {
         while self.read_reg(regs::FR) & fr::TXFF != 0 {
             core::hint::spin_loop();
         }
-        self.write_reg(regs::DR, byte as u32);
+        self.write_reg(regs::DR, u32::from(byte));
     }
 
     /// Drain the receive FIFO into `tty`'s flip buffer (IRQ context;
@@ -202,16 +203,17 @@ pub fn serial_ttys() -> &'static [&'static Tty] {
 }
 
 /// The PL011's interrupt handler (IRQ context): input to ttyAMA0
-fn pl011_irq(_irq: u32, _data: *mut ()) -> bool {
+fn pl011_irq(_irq: u32) -> bool {
     UART.rx_chars(&TTY_AMA0)
 }
 
 /// Take input by interrupt (Linux pl011_startup); `irq` is the GIC
 /// INTID. False without it
 fn rx_irq_init(irq: u32) -> bool {
-    if let Err(e) =
-        crate::arch::irq::register_irq_handler(irq, pl011_irq, core::ptr::null_mut(), PL011_BASE)
-    {
+    let Ok(h) = try_arc(crate::irq::IrqFn(pl011_irq)) else {
+        return false;
+    };
+    if let Err(e) = crate::arch::irq::register_irq_handler(irq, h, PL011_BASE) {
         crate::printkln!("ttyAMA0: no IRQ {}: {}", irq, e);
         return false;
     }
@@ -320,9 +322,14 @@ impl crate::base::Bound for Pl011Port {
 fn pl011_probe(
     dev: &alloc::sync::Arc<crate::base::Device>,
 ) -> Result<alloc::boxed::Box<dyn crate::base::Bound>, crate::util::error::KernelError> {
+    // Allocated first, so ENOMEM leaves nothing registered
+    let mut port = try_box(Pl011Port {
+        irq: None,
+        tty: None,
+    })?;
     register_console();
     let irq = crate::base::platform::pdev(dev).and_then(|p| p.irq);
-    let irq = irq.filter(|&irq| rx_irq_init(irq));
-    let tty = crate::tty::tty_register_device(&TTY_AMA0, dev);
-    Ok(alloc::boxed::Box::new(Pl011Port { irq, tty }))
+    port.irq = irq.filter(|&irq| rx_irq_init(irq));
+    port.tty = crate::tty::tty_register_device(&TTY_AMA0, dev);
+    Ok(port)
 }

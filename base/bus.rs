@@ -16,6 +16,7 @@ use crate::fs::KernelError;
 use crate::fs::kernfs::{Attr, KNode, SysBuf};
 use crate::fs::sysfs;
 use crate::sync::spin::Mutex;
+use crate::util::kalloc::arc_nofail;
 
 static BUS_DIR: Once<Arc<KNode>> = Once::new();
 static SYSTEM_DIR: Once<Arc<KNode>> = Once::new();
@@ -97,7 +98,11 @@ struct Autoprobe(&'static BusType);
 
 impl Attr for Autoprobe {
     fn show(&self, out: &mut SysBuf) -> Result<(), KernelError> {
-        let _ = writeln!(out, "{}", self.0.autoprobe.load(Ordering::Acquire) as u8);
+        let _ = writeln!(
+            out,
+            "{}",
+            u8::from(self.0.autoprobe.load(Ordering::Acquire))
+        );
         Ok(())
     }
 
@@ -198,11 +203,11 @@ impl BusType {
             let dir = root
                 .create_dir(self.name.as_bytes(), 0o755)
                 .expect("bus directory");
-            let _ = dir.create_file(b"uevent", 0o200, Arc::new(BusUevent(self)));
+            let _ = dir.create_file(b"uevent", 0o200, arc_nofail(BusUevent(self)));
             let devices_dir = dir.create_dir(b"devices", 0o755).expect("bus devices");
             let drivers_dir = dir.create_dir(b"drivers", 0o755).expect("bus drivers");
-            let _ = dir.create_file(b"drivers_probe", 0o200, Arc::new(DriversProbe(self)));
-            let _ = dir.create_file(b"drivers_autoprobe", 0o644, Arc::new(Autoprobe(self)));
+            let _ = dir.create_file(b"drivers_probe", 0o200, arc_nofail(DriversProbe(self)));
+            let _ = dir.create_file(b"drivers_autoprobe", 0o644, arc_nofail(Autoprobe(self)));
             BusPriv {
                 dir,
                 devices_dir,

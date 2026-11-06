@@ -12,7 +12,7 @@
 //! When the handler returns, it executes the trampoline which calls rt_sigreturn
 //! to restore the original context.
 
-#![allow(dead_code)]
+#![expect(dead_code)]
 
 use crate::arch::Uaccess;
 use crate::signal::{KSigInfo, SigAction, SigHandler, SigSet, sa_flags};
@@ -439,7 +439,7 @@ pub fn setup_rt_frame(
     regs.rsp = frame_addr;
     regs.rip = handler;
     regs.rflags = user_rflags & !HANDLER_CLEAR_EFLAGS;
-    regs.rdi = sig as u64;
+    regs.rdi = u64::from(sig);
     regs.rsi = info_addr;
     regs.rdx = uc_addr;
     // RAX = 0 for handlers without SA_SIGINFO (Linux: regs->ax = 0)

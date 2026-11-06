@@ -9,7 +9,7 @@
 //! This implementation follows the Linux ptrace ABI for both x86-64 and aarch64.
 //! Not all ptrace operations are implemented; this focuses on the core subset
 //! needed for basic debugging and tracing.
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use crate::signal::{self, SIGKILL, SIGSTOP, SIGTRAP};
 use crate::task::percpu::{self, TASKLIST};
@@ -712,7 +712,7 @@ fn ptrace_getregs(target_pid: Pid, data: u64) -> i64 {
         Ok(regs) => {
             let bytes = unsafe {
                 core::slice::from_raw_parts(
-                    &regs as *const _ as *const u8,
+                    (&raw const regs).cast::<u8>(),
                     core::mem::size_of_val(&regs),
                 )
             };
@@ -721,7 +721,7 @@ fn ptrace_getregs(target_pid: Pid, data: u64) -> i64 {
             }
             0
         }
-        Err(e) => e as i64,
+        Err(e) => i64::from(e),
     }
 }
 
@@ -743,7 +743,7 @@ fn ptrace_setregs(target_pid: Pid, data: u64) -> i64 {
         let mut regs = crate::arch::ptrace::UserRegsStruct::default();
         let bytes = unsafe {
             core::slice::from_raw_parts_mut(
-                &mut regs as *mut _ as *mut u8,
+                (&raw mut regs).cast::<u8>(),
                 core::mem::size_of_val(&regs),
             )
         };
@@ -752,7 +752,7 @@ fn ptrace_setregs(target_pid: Pid, data: u64) -> i64 {
         }
         match crate::arch::ptrace::set_user_regs(target_tid, &regs) {
             Ok(()) => 0,
-            Err(e) => e as i64,
+            Err(e) => i64::from(e),
         }
     }
 
@@ -761,7 +761,7 @@ fn ptrace_setregs(target_pid: Pid, data: u64) -> i64 {
         let mut regs = crate::arch::ptrace::UserPtRegs::default();
         let bytes = unsafe {
             core::slice::from_raw_parts_mut(
-                &mut regs as *mut _ as *mut u8,
+                (&raw mut regs).cast::<u8>(),
                 core::mem::size_of_val(&regs),
             )
         };
@@ -770,7 +770,7 @@ fn ptrace_setregs(target_pid: Pid, data: u64) -> i64 {
         }
         match crate::arch::ptrace::set_user_regs(target_tid, &regs) {
             Ok(()) => 0,
-            Err(e) => e as i64,
+            Err(e) => i64::from(e),
         }
     }
 }

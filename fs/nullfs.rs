@@ -19,10 +19,12 @@ use alloc::sync::Arc;
 use super::KernelError;
 use super::dac::MAY_WRITE;
 use super::dentry::Dentry;
-use super::file::{DirContext, DirEntry, File, FileOps};
+use super::file::{DirContext, DirEntry, File, FileOps, RwFlags};
 use super::inode::{FileType, Inode, InodeMode, InodeOps};
+use super::iov_iter::{IovDest, IovSource};
 use super::superblock::{FileSystemType, StatFs, SuperBlock, SuperOps};
 use crate::task::Cred;
+use crate::util::kalloc::try_arc;
 
 /// statfs f_type (Linux NULL_FS_MAGIC, "NULL")
 pub const NULL_FS_MAGIC: u64 = 0x4E55_4C4C;
@@ -83,12 +85,30 @@ impl FileOps for NullfsFileOps {
         self
     }
 
-    fn read(&self, _file: &File, _buf: &mut [u8]) -> Result<usize, KernelError> {
+    /// A directory (Linux generic_read_dir)
+    fn read_iter(
+        &self,
+        _file: &File,
+        _to: &mut IovDest<'_>,
+        _at: Option<u64>,
+        _flags: RwFlags,
+    ) -> Result<usize, KernelError> {
         Err(KernelError::IsDirectory)
     }
 
+    /// No write op
+    fn write_iter(
+        &self,
+        _file: &File,
+        _from: &mut IovSource<'_>,
+        _at: Option<u64>,
+        _flags: RwFlags,
+    ) -> Result<usize, KernelError> {
+        Err(KernelError::OperationNotSupported)
+    }
+
     /// "." and ".." only, both the root (Linux empty_dir_readdir)
-    fn readdir(&self, file: &File, ctx: &mut DirContext) -> Result<(), KernelError> {
+    fn readdir(&self, file: &File, ctx: &mut DirContext<'_>) -> Result<(), KernelError> {
         let ino = file.get_inode().map_or(1, |i| i.ino);
         for (at, name) in [(0, &b"."[..]), (1, b"..")] {
             let e = DirEntry {
@@ -109,8 +129,8 @@ static NULLFS_FILE_OPS: NullfsFileOps = NullfsFileOps;
 /// A new instance (Linux nullfs_fs_fill_super): the root is inode 1,
 /// mode 0555, owned by root
 fn mount(fs_type: &'static FileSystemType, _opts: &[u8]) -> Result<Arc<SuperBlock>, KernelError> {
-    let sb = SuperBlock::new(fs_type, &NULLFS_SUPER_OPS, 0);
-    let root = Arc::new(Inode::new(
+    let sb = SuperBlock::new(fs_type, &NULLFS_SUPER_OPS, 0)?;
+    let root = try_arc(Inode::new(
         1,
         InodeMode::directory(0o555),
         0,
@@ -119,8 +139,8 @@ fn mount(fs_type: &'static FileSystemType, _opts: &[u8]) -> Result<Arc<SuperBloc
         crate::time::TIMEKEEPER.current_time(),
         Arc::downgrade(&sb),
         &NULLFS_INODE_OPS,
-    ));
-    sb.set_root(Arc::new(Dentry::new_root(root, Arc::downgrade(&sb))));
+    ))?;
+    sb.set_root(try_arc(Dentry::new_root(root, Arc::downgrade(&sb)))?);
     Ok(sb)
 }
 

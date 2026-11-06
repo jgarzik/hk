@@ -22,6 +22,7 @@
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
+use core::mem::MaybeUninit;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -34,6 +35,7 @@ use crate::hw::mmio::IoMem;
 use crate::hw::pci::{PciDevice, cap_id};
 use crate::printkln;
 use crate::util::error::KernelError;
+use crate::util::kalloc::{try_arc, try_box};
 
 /// Red Hat / virtio vendor ID
 const VENDOR_VIRTIO: u16 = 0x1AF4;
@@ -139,7 +141,7 @@ fn map_cap(pci: &PciDevice, cap: Cap, max: u32) -> Result<IoMem, KernelError> {
     };
     // SAFETY: part of a memory BAR of this device, which the capability
     // places there: registers, not RAM
-    unsafe { IoMem::ioremap(base + cap.off as u64, len as usize) }.ok_or(KernelError::NoDevice)
+    unsafe { IoMem::ioremap(base + u64::from(cap.off), len as usize) }.ok_or(KernelError::NoDevice)
 }
 
 /// A virtio device on the modern PCI transport (Linux virtio_pci_device)
@@ -264,9 +266,9 @@ impl VirtioDevice {
 
     pub fn device_features(&self) -> u64 {
         self.w32(common::DFSELECT, 0);
-        let lo = self.r32(common::DF) as u64;
+        let lo = u64::from(self.r32(common::DF));
         self.w32(common::DFSELECT, 1);
-        let hi = self.r32(common::DF) as u64;
+        let hi = u64::from(self.r32(common::DF));
         (hi << 32) | lo
     }
 
@@ -297,7 +299,7 @@ impl VirtioDevice {
 
     /// Vendor id (Linux virtio_pci_modern_probe: the PCI subsystem vendor)
     pub fn vendor(&self) -> u32 {
-        self.pci.header.subsystem_vendor_id as u32
+        u32::from(self.pci.header.subsystem_vendor_id)
     }
 
     /// Number of queues the device offers
@@ -345,7 +347,7 @@ impl VirtioDevice {
     /// Device config le64 as two 32-bit reads, low first (spec 4.1.3.1;
     /// wrap in `read_config` for a consistent value)
     pub fn cfg64(&self, off: u32) -> u64 {
-        self.cfg32(off) as u64 | ((self.cfg32(off.saturating_add(4)) as u64) << 32)
+        u64::from(self.cfg32(off)) | (u64::from(self.cfg32(off.saturating_add(4))) << 32)
     }
 
     /// Set up queue `index` (spec 4.1.5.1.3); before `ready()`
@@ -375,7 +377,7 @@ impl VirtioDevice {
             // `num` entries, owned by the queue (`mem`) for the ring's life
             ring: unsafe { Vring::new(mem.cpu_addr(), num) },
             mem,
-            owner: self as *const Self as usize,
+            owner: core::ptr::from_ref::<Self>(self) as usize,
             index,
             notify,
         })
@@ -391,11 +393,9 @@ impl VirtioDevice {
             }
             *irq = Some(cb);
         }
-        // The handler's pointer stays valid until `free_irq`: the driver
-        // keeps its Arc while bound, and frees the IRQ in its remove
-        let r = self
-            .pci
-            .register_irq_handler(vp_interrupt, Arc::as_ptr(self) as *mut ());
+        // The IRQ table holds a reference until `free_irq` (the driver's
+        // remove)
+        let r = self.pci.register_irq_handler(self.clone());
         if r.is_err() {
             self.irq.lock().take();
         }
@@ -411,7 +411,7 @@ impl VirtioDevice {
         let r = self.reset();
         for vq in vqs {
             // A DmaCoherent not freed is leaked (it has no Drop)
-            if r.is_ok() && vq.owner == self as *const Self as usize {
+            if r.is_ok() && vq.owner == core::ptr::from_ref::<Self>(self) as usize {
                 // SAFETY: the device is reset: it no longer reads or
                 // writes the ring, and the ring (`vq.ring`, the only CPU
                 // pointer into it) goes with `vq` here
@@ -458,12 +458,14 @@ impl DmaDevice for VirtioDevice {
     }
 }
 
+impl crate::irq::IrqHandler for VirtioDevice {
+    fn handle(&self, _irq: u32) -> bool {
+        vp_interrupt(self)
+    }
+}
+
 /// Transport interrupt handler (Linux vp_interrupt; IRQ context)
-fn vp_interrupt(_irq: u32, data: *mut ()) -> bool {
-    // SAFETY: `data` is the Arc<VirtioDevice> pointer `request_irq`
-    // registered; the driver keeps that Arc until `free_irq`, which
-    // unregisters this handler (under the IRQ table lock it runs under)
-    let vdev = unsafe { &*(data as *const VirtioDevice) };
+fn vp_interrupt(vdev: &VirtioDevice) -> bool {
     // Read-to-clear; deasserts the level-triggered line
     let isr = vdev.isr.read8(0);
     if isr == 0 {
@@ -546,7 +548,7 @@ pub static VIRTIO_PCI_DRIVER: crate::base::Driver = crate::base::Driver::new(
 fn virtio_id(pci: &PciDevice) -> Option<u32> {
     let h = &pci.header;
     if h.vendor_id == VENDOR_VIRTIO && (MODERN_BASE..=MODERN_LAST).contains(&h.device_id) {
-        Some((h.device_id - MODERN_BASE) as u32)
+        Some(u32::from(h.device_id - MODERN_BASE))
     } else {
         None
     }
@@ -604,12 +606,17 @@ fn virtio_pci_probe(
 ) -> Result<Box<dyn crate::base::Bound>, KernelError> {
     let pci = crate::hw::pci::driver::pci_dev(dev).ok_or(KernelError::NoDevice)?;
     let id = virtio_id(pci).ok_or(KernelError::NoDevice)?;
-    let vdev = Arc::new(vp_init(pci, id)?);
+    // The binding's memory first: nothing to undo should it fail
+    let slot = try_box(MaybeUninit::<VirtioPciDev>::uninit())?;
+    let vdev = try_arc(vp_init(pci, id)?)?;
     let (v, index) = super::register_virtio_device(dev, vdev.clone())?;
-    Ok(Box::new(VirtioPciDev {
-        pci: pci.clone(),
-        dev: v,
-        vdev,
-        index,
-    }))
+    Ok(Box::write(
+        slot,
+        VirtioPciDev {
+            pci: pci.clone(),
+            dev: v,
+            vdev,
+            index,
+        },
+    ))
 }

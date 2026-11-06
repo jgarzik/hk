@@ -48,7 +48,7 @@ const fn class() -> Class {
 /// (`check`: a blocking acquisition, which records order edges)
 #[inline(always)]
 #[track_caller]
-#[allow(unused_variables)]
+#[cfg_attr(not(feature = "lockdep"), expect(unused_variables))]
 fn enter(id: usize, class: Class, check: bool) {
     preempt_disable();
     #[cfg(feature = "lockdep")]
@@ -57,7 +57,7 @@ fn enter(id: usize, class: Class, check: bool) {
 
 /// After releasing lock `id` (or failing to take it)
 #[inline(always)]
-#[allow(unused_variables)]
+#[cfg_attr(not(feature = "lockdep"), expect(unused_variables))]
 fn leave(id: usize) {
     #[cfg(feature = "lockdep")]
     super::lockdep::release(id);
@@ -65,7 +65,7 @@ fn leave(id: usize) {
 }
 
 fn addr<T: ?Sized>(p: &T) -> usize {
-    p as *const T as *const u8 as usize
+    core::ptr::from_ref::<T>(p).cast::<u8>() as usize
 }
 
 /// Spinning mutex (Linux spinlock_t)

@@ -28,6 +28,11 @@ use core::sync::atomic::{AtomicPtr, Ordering::Relaxed};
 const UNLINKED: *mut Link = core::ptr::dangling_mut();
 
 /// The list hook embedded in an item (Linux struct list_head)
+///
+/// # Invariants
+/// `next` is `UNLINKED` exactly when the link is on no list (`prev`
+/// too, once an insert finished); a claimed link (`next` null, by
+/// `claim`) belongs to the one insert that claimed it.
 pub struct Link {
     next: AtomicPtr<Link>,
     prev: AtomicPtr<Link>,
@@ -87,7 +92,7 @@ macro_rules! adapter {
             }
             unsafe fn item(link: *const $crate::util::list::Link) -> *const $t {
                 // SAFETY: the caller passes a link inside a live item
-                unsafe { (link as *const u8).sub(core::mem::offset_of!($t, $($field).+)) as *const $t }
+                unsafe { link.cast::<u8>().sub(core::mem::offset_of!($t, $($field).+)).cast::<$t>() }
             }
         }
     };
@@ -96,6 +101,11 @@ macro_rules! adapter {
 /// A doubly linked list of items linked through adapter `A` (Linux
 /// list_head as a list head). Movable: the ends are pointers, not a
 /// sentinel.
+///
+/// # Invariants
+/// `head`..`tail` through `next` (and back through `prev`) are the
+/// links of `len` live items, each on no other list through this
+/// adapter's link; `head` and `tail` are both null when `len` is 0.
 pub struct List<A: Adapter> {
     head: *mut Link,
     tail: *mut Link,
@@ -129,7 +139,7 @@ impl<A: Adapter> List<A> {
 
     fn lk(item: *const A::Item) -> *mut Link {
         // SAFETY: callers pass live items
-        A::link(unsafe { &*item }) as *const Link as *mut Link
+        core::ptr::from_ref::<Link>(A::link(unsafe { &*item })).cast_mut()
     }
 
     /// Append `item` (Linux list_add_tail)
@@ -139,7 +149,8 @@ impl<A: Adapter> List<A> {
     /// until removed.
     pub unsafe fn push_back(&mut self, item: *const A::Item) {
         let l = Self::lk(item);
-        // SAFETY: `l` and the tail are live links of this list
+        // SAFETY: `l` is live (the caller) and the tail is a live link of
+        // this list (type invariant)
         unsafe {
             (*l).next.store(null_mut(), Relaxed);
             (*l).prev.store(self.tail, Relaxed);
@@ -148,6 +159,7 @@ impl<A: Adapter> List<A> {
                 None => self.head = l,
             }
         }
+        // INVARIANT: `l` is linked after the old tail, and counted
         self.tail = l;
         self.len += 1;
     }
@@ -209,6 +221,8 @@ impl<A: Adapter> List<A> {
                 Some(p) => p.next.store(next, Relaxed),
                 None => self.head = next,
             }
+            // INVARIANT: on no list again (`claim` is only raced by a
+            // buggy caller, which its assert stops)
             (*l).next.store(UNLINKED, Relaxed);
             (*l).prev.store(UNLINKED, Relaxed);
         }
@@ -288,6 +302,10 @@ impl<'a, A: Adapter> Iterator for Iter<'a, A> {
 }
 
 /// A [`List`] that owns a strong reference to each entry
+///
+/// # Invariants
+/// Every item on `list` was inserted with `Arc::into_raw`: the list
+/// holds that reference until the item leaves it through `from_raw`.
 pub struct ArcList<A: Adapter> {
     list: List<A>,
     /// It drops `Arc<Item>`s wherever it goes: Send/Sync as Arc's
@@ -330,7 +348,7 @@ impl<A: Adapter> ArcList<A> {
     /// # Safety
     /// `item` is on this list.
     pub unsafe fn remove(&mut self, item: &A::Item) -> Arc<A::Item> {
-        let p = item as *const A::Item;
+        let p = core::ptr::from_ref::<A::Item>(item);
         // SAFETY: on this list, which holds the reference from into_raw
         unsafe {
             self.list.remove(p);

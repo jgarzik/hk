@@ -15,6 +15,7 @@ use crate::console::{ConsoleDriver, ConsolePriority, register_console};
 use crate::printkln;
 use crate::sync::spin::Mutex;
 use crate::util::error::KernelError;
+use crate::util::kalloc::try_box;
 
 use super::{UsbDeviceId, UsbIds};
 
@@ -43,11 +44,11 @@ fn ftdi_probe(
         printkln!("ftdi_sio {}: no bulk endpoints", dev.name());
         return Err(KernelError::NoDevice);
     };
-    let serial = UsbSerial {
+    let serial = try_box(UsbSerial {
         slot_id: usb_dev.slot_id,
         bulk_in_ep,
         bulk_out_ep,
-    };
+    })?;
     printkln!(
         "ftdi_sio {}: FTDI USB Serial Device converter, bulk in {:#04x}, out {:#04x}",
         dev.name(),
@@ -55,7 +56,7 @@ fn ftdi_probe(
         bulk_out_ep
     );
     register_usb_serial_console(&serial);
-    Ok(Box::new(serial))
+    Ok(serial)
 }
 
 /// A bound FTDI port

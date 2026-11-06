@@ -37,12 +37,13 @@
 //! - `tx`: `crate::sync::spin::Mutex`, thread context only (xmit, NAPI poll reclaim);
 //!   taken under socket/ARP locks (end of the network lock order). Leaf.
 //!   Empty once removed.
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use alloc::boxed::Box;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::any::Any;
+use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::sync::spin::Mutex;
@@ -60,6 +61,7 @@ use crate::net::device::{LinkInfo, NetDevice, NetDeviceOps};
 use crate::net::skb::{NET_SKB_PAD, SkBuff};
 use crate::printkln;
 use crate::util::error::KernelError;
+use crate::util::kalloc::{try_arc, try_box};
 
 /// Device-specific feature bits
 mod feature {
@@ -248,7 +250,7 @@ impl VirtioNet {
 
     /// Receive up to `budget` frames, reposting each buffer; frames are
     /// delivered by the caller after the lock is dropped
-    #[allow(clippy::vec_box)] // skbs travel as Box<SkBuff> through the stack
+    #[expect(clippy::vec_box)] // skbs travel as Box<SkBuff> through the stack
     /// Returns the buffers consumed (bad frames count against the budget)
     fn receive(&self, dev: &Arc<NetDevice>, budget: usize, out: &mut Vec<Box<SkBuff>>) -> usize {
         let mut rx = self.rx.lock();
@@ -484,10 +486,12 @@ impl VirtioDriver for VirtioNetDriver {
         dev: &Arc<crate::base::Device>,
         vdev: Arc<VirtioDevice>,
     ) -> Result<Box<dyn crate::base::Bound>, KernelError> {
+        // The binding's memory first: nothing to undo should it fail
+        let slot = try_box(MaybeUninit::<VirtioNetWrapper>::uninit())?;
         let mac = read_mac(&vdev);
         let (rx, tx) = setup_queues(&vdev)?;
         let rx_cb = rx.vq.cb();
-        let device = Arc::new(VirtioNet {
+        let device = try_arc(VirtioNet {
             vdev: Arc::clone(&vdev),
             mac,
             rx: Mutex::new(Some(rx)),
@@ -496,7 +500,10 @@ impl VirtioDriver for VirtioNetDriver {
             napi: Napi::new(NAPI_POLL_WEIGHT),
             netdev: Once::new(),
             config_pending: AtomicBool::new(false),
-        });
+        })?;
+        let ops: Arc<dyn NetDeviceOps> = try_arc(VirtioNetOps {
+            device: Arc::clone(&device),
+        })?;
         let poller: Weak<dyn NapiPoll> = Arc::downgrade(&device) as Weak<dyn NapiPoll>;
         net::dev::netif_napi_add(&device.napi, poller);
 
@@ -512,9 +519,6 @@ impl VirtioDriver for VirtioNetDriver {
             rx.vq.kick();
         }
 
-        let ops: Arc<dyn NetDeviceOps> = Arc::new(VirtioNetOps {
-            device: Arc::clone(&device),
-        });
         // RTNL from naming to registration (Linux register_netdev)
         let (rtnl, netdev) = net::alloc_netdev("eth%d", mac, LinkInfo::ETHER, ops);
         device.netdev.call_once(|| Arc::downgrade(&netdev));
@@ -538,7 +542,7 @@ impl VirtioDriver for VirtioNetDriver {
         );
         netdev.parent.call_once(|| dev.clone());
         net::register_netdev(rtnl, Arc::clone(&netdev));
-        Ok(Box::new(VirtioNetWrapper { netdev, device }))
+        Ok(Box::write(slot, VirtioNetWrapper { netdev, device }))
     }
 }
 

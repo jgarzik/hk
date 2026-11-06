@@ -13,6 +13,7 @@ use super::dentry::Dentry;
 use super::inode::FileType;
 use super::path_ref::Path;
 use super::superblock::{FileSystemType, SuperBlock};
+use crate::util::kalloc::{arc_nofail, try_arc};
 
 use crate::block::get_blkdev;
 
@@ -22,8 +23,19 @@ pub const MNT_NOSUID: u32 = 0x1;
 pub const MNT_NODEV: u32 = 0x2;
 /// No program execution (Linux MNT_NOEXEC)
 pub const MNT_NOEXEC: u32 = 0x4;
+/// No atime updates (Linux MNT_NOATIME)
+pub const MNT_NOATIME: u32 = 0x8;
+/// No atime updates on directories (Linux MNT_NODIRATIME)
+pub const MNT_NODIRATIME: u32 = 0x10;
+/// atime updated only when older than mtime/ctime or a day (Linux
+/// MNT_RELATIME, the default)
+pub const MNT_RELATIME: u32 = 0x20;
+/// The atime flags (Linux MNT_ATIME_MASK)
+pub const MNT_ATIME_MASK: u32 = MNT_NOATIME | MNT_NODIRATIME | MNT_RELATIME;
 /// This mount is read-only, whatever its superblock (Linux MNT_READONLY)
 pub const MNT_READONLY: u32 = 0x40;
+/// Symlinks on this mount are not followed (Linux MNT_NOSYMFOLLOW)
+pub const MNT_NOSYMFOLLOW: u32 = 0x80;
 /// Cannot be bind-mounted (Linux T_UNBINDABLE, in `t_flags`)
 pub const T_UNBINDABLE: u32 = 0x1;
 /// Cannot be unmounted, moved or pivoted away (Linux MNT_LOCKED: a mount
@@ -134,14 +146,38 @@ pub struct Mount {
 }
 
 impl Mount {
-    /// Create a new mount
+    /// Create a new mount, or ENOMEM
     pub fn new(
         sb: Arc<SuperBlock>,
         root: Arc<Dentry>,
         flags: u32,
         devname: super::name::FileName,
+    ) -> Result<Arc<Self>, KernelError> {
+        let m = try_arc(Self::init(sb, root, flags, devname))?;
+        m.sb.add_mount(&m);
+        Ok(m)
+    }
+
+    /// [`Mount::new`] for a tree copy, which cannot unwind a partial
+    /// copy (its peer groups and attachments) on failure
+    fn new_nofail(
+        sb: Arc<SuperBlock>,
+        root: Arc<Dentry>,
+        flags: u32,
+        devname: super::name::FileName,
     ) -> Arc<Self> {
-        let m = Arc::new(Self {
+        let m = arc_nofail(Self::init(sb, root, flags, devname));
+        m.sb.add_mount(&m);
+        m
+    }
+
+    fn init(
+        sb: Arc<SuperBlock>,
+        root: Arc<Dentry>,
+        flags: u32,
+        devname: super::name::FileName,
+    ) -> Self {
+        Self {
             sb,
             root,
             mountpoint: RwLock::new(None),
@@ -157,15 +193,13 @@ impl Mount {
             mnt_id_unique: MNT_ID_UNIQUE.fetch_add(1, Ordering::Relaxed),
             devname,
             mnt_count: AtomicU64::new(0),
-        });
-        m.sb.add_mount(&m);
-        m
+        }
     }
 
     /// A copy of `self` for a namespace copy: same filesystem, root,
     /// flags and source, new ids, not attached
     fn copy(&self) -> Arc<Self> {
-        let c = Self::new(
+        let c = Self::new_nofail(
             self.sb.clone(),
             self.root.clone(),
             self.flags(),
@@ -274,6 +308,14 @@ impl Mount {
         self.mnt_count.fetch_add(1, Ordering::Relaxed);
         // Use clears an MNT_EXPIRE mark (Linux mntput)
         self.expiry.store(false, Ordering::Relaxed);
+    }
+
+    /// A use of the mount ended (Linux mntput): an MNT_EXPIRE mark
+    /// goes; read first, so the common case writes nothing
+    pub fn clear_expiry(&self) {
+        if self.expiry.load(Ordering::Relaxed) {
+            self.expiry.store(false, Ordering::Relaxed);
+        }
     }
 
     /// Decrement mount reference count (like Linux mntput)
@@ -408,7 +450,7 @@ pub fn init_mount_tree() -> Result<Arc<Mount>, KernelError> {
         root,
         MNT_READONLY,
         b"nullfs".as_slice().into(),
-    ));
+    )?);
     Ok(rootfs)
 }
 
@@ -427,7 +469,7 @@ pub fn attach(
     if ro {
         sb.make_rdonly()?;
     }
-    let mount = Mount::new(sb, root, mnt_flags, devname);
+    let mount = Mount::new(sb, root, mnt_flags, devname)?;
     let mnt_ns = crate::ns::current_mnt_ns();
     if let Some(mp) = mountpoint {
         // Under the mountpoint's i_rwsem (Linux lock_mount), which rmdir
@@ -450,7 +492,7 @@ pub fn attach(
 /// A new mount of `m`'s filesystem rooted at `root`, with its flags
 /// and source (Linux clone_mnt); not attached
 pub fn clone_mnt(m: &Mount, root: Arc<Dentry>) -> Arc<Mount> {
-    let c = Mount::new(
+    let c = Mount::new_nofail(
         m.sb.clone(),
         root,
         m.flags() & !MNT_LOCKED,

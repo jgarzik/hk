@@ -307,7 +307,7 @@ fn check_creds(data: &[u8]) -> Result<Creds, KernelError> {
 /// Deliver received ancillary data (Linux scm_recv_unix): credentials
 /// when the receiver set SO_PASSCRED, then the files. Without control
 /// space everything is truncated (MSG_CTRUNC) and the files closed.
-pub fn put(m: &mut RecvMsg, passcred: bool, creds: Option<Creds>, fds: Option<FpList>) {
+pub fn put(m: &mut RecvMsg<'_>, passcred: bool, creds: Option<Creds>, fds: Option<FpList>) {
     if m.cmsg.capacity() == 0 {
         if passcred || fds.is_some() {
             m.cmsg.trunc = true;
@@ -326,7 +326,7 @@ pub fn put(m: &mut RecvMsg, passcred: bool, creds: Option<Creds>, fds: Option<Fp
 
 /// Install as many files as fit (Linux scm_detach_fds); the rest are
 /// closed with MSG_CTRUNC
-fn put_fds(m: &mut RecvMsg, fpl: FpList) {
+fn put_fds(m: &mut RecvMsg<'_>, fpl: FpList) {
     let cloexec = m.flags & MSG_CMSG_CLOEXEC != 0;
     let room = m.cmsg.room();
     let max = if room <= CMSG_HDR {

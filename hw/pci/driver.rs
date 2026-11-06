@@ -21,6 +21,7 @@ use crate::base::{Device, DeviceInfo, Driver, device_create};
 use crate::fs::kernfs::{self, Attr, BinAttr, SysBuf};
 use crate::sync::spin::Mutex;
 use crate::util::error::KernelError;
+use crate::util::kalloc::{arc_nofail, try_arc};
 
 pub static PCI_BUS: BusType =
     BusType::with_drv_attrs("pci", pci_match, Some(pci_uevent), Some(pci_drv_attrs));
@@ -81,10 +82,10 @@ impl PciDeviceId {
         let h = &p.header;
         self.matches_ids(
             [
-                h.vendor_id as u32,
-                h.device_id as u32,
-                h.subsystem_vendor_id as u32,
-                h.subsystem_id as u32,
+                u32::from(h.vendor_id),
+                u32::from(h.device_id),
+                u32::from(h.subsystem_vendor_id),
+                u32::from(h.subsystem_id),
             ],
             p.class24(),
         )
@@ -228,8 +229,8 @@ impl Attr for RemoveId {
 
 /// new_id and remove_id of a PCI driver (Linux pci_drv_groups)
 fn pci_drv_attrs(drv: &'static Driver, dir: &Arc<crate::fs::kernfs::KNode>) {
-    let _ = dir.create_file(b"new_id", 0o200, Arc::new(NewId(drv)));
-    let _ = dir.create_file(b"remove_id", 0o200, Arc::new(RemoveId(drv)));
+    let _ = dir.create_file(b"new_id", 0o200, arc_nofail(NewId(drv)));
+    let _ = dir.create_file(b"remove_id", 0o200, arc_nofail(RemoveId(drv)));
 }
 
 fn modalias(p: &PciDevice) -> String {
@@ -386,10 +387,10 @@ fn pci_attrs(dev: &Arc<Device>) -> Result<(), KernelError> {
     dev.create_file(
         b"driver_override",
         0o644,
-        Arc::new(DriverOverride(d.clone())),
+        try_arc(DriverOverride(d.clone()))?,
     )?;
     dev.kobj()
-        .create_bin(b"config", 0o644, Arc::new(ConfigAttr(d)))?;
+        .create_bin(b"config", 0o644, try_arc(ConfigAttr(d))?)?;
     Ok(())
 }
 
@@ -406,10 +407,10 @@ pub fn pci_bus_init() {
 pub fn pci_device_add(pci: PciDevice) -> Result<Arc<Device>, KernelError> {
     let name = format!("0000:{:02x}:{:02x}.{:x}", pci.bus, pci.device, pci.function);
     let root = ROOT.get().ok_or(KernelError::NoDevice)?;
-    let data = Arc::new(PciDev {
+    let data = try_arc(PciDev {
         pci,
         driver_override: Mutex::new(None),
-    });
+    })?;
     device_create(DeviceInfo {
         parent: Some(root),
         bus: Some(&PCI_BUS),

@@ -39,6 +39,7 @@
 //! - Optional kernel-side polling (SQPOLL)
 //! - Registered buffers and files for performance
 
+use crate::util::kalloc::try_arc;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
@@ -174,7 +175,7 @@ pub const IORING_REGISTER_FILES_UPDATE: u32 = 6;
 const IORING_MAX_ENTRIES: u32 = 32768;
 
 /// Minimum ring size (used for validation)
-#[allow(dead_code)] // Used in future phases
+#[expect(dead_code)] // Used in future phases
 const IORING_MIN_ENTRIES: u32 = 1;
 
 // ============================================================================
@@ -303,7 +304,7 @@ enum PendingOpType {
 /// Pending operation that hasn't completed yet
 struct PendingOp {
     user_data: u64,
-    #[allow(dead_code)] // Used for async completion handling
+    #[expect(dead_code)] // Used for async completion handling
     op_type: PendingOpType,
     cancelled: bool,
 }
@@ -428,7 +429,7 @@ impl IoUringInner {
     }
 
     /// Find and remove a pending poll by fd
-    #[allow(dead_code)] // Will be used for poll completion
+    #[expect(dead_code)] // Will be used for poll completion
     fn find_poll_by_fd(&mut self, fd: i32) -> Option<u64> {
         let mut found_idx = None;
         for (i, op) in self.pending_ops.iter().enumerate() {
@@ -456,9 +457,9 @@ pub struct IoUring {
     wq: WaitQueue,
 
     /// Ring sizes (immutable after creation, used for mmap)
-    #[allow(dead_code)] // Used for mmap in future
+    #[expect(dead_code)] // Used for mmap in future
     sq_entries: u32,
-    #[allow(dead_code)] // Used for mmap in future
+    #[expect(dead_code)] // Used for mmap in future
     cq_entries: u32,
 
     /// Physical addresses for mmap (set during setup)
@@ -473,14 +474,14 @@ impl IoUring {
         let rings_size = Self::calc_rings_size(sq_entries, cq_entries);
         let sqes_size = (sq_entries as usize) * core::mem::size_of::<IoUringSqe>();
 
-        Ok(Arc::new(Self {
+        try_arc(Self {
             inner: IrqSpinlock::new(IoUringInner::new(sq_entries, cq_entries)?),
             wq: WaitQueue::new(),
             sq_entries,
             cq_entries,
             rings_size,
             sqes_size,
-        }))
+        })
     }
 
     /// Calculate total ring buffer size
@@ -583,7 +584,7 @@ impl IoUring {
             self.wq.wake_all();
         }
 
-        submitted as i64
+        i64::from(submitted)
     }
 
     /// Process a single SQE
@@ -850,11 +851,11 @@ impl IoUring {
         let available = inner.cq_tail; // Simplified - should compare with user's CQ head
 
         if available >= min_complete {
-            return available as i64;
+            return i64::from(available);
         }
 
         // TODO: Implement proper blocking wait
-        available as i64
+        i64::from(available)
     }
 
     /// Get mmap size for the given offset
@@ -996,7 +997,7 @@ impl IoUring {
 
         if ready & wanted != 0 {
             // Already ready - return the events
-            return ready as i32;
+            return i32::from(ready);
         }
 
         // Not ready - add to pending operations
@@ -1186,7 +1187,7 @@ impl IoUring {
     fn do_send(&self, sqe: &IoUringSqe) -> i32 {
         let fd = sqe.fd;
         let buf = sqe.addr;
-        let len = sqe.len as u64;
+        let len = u64::from(sqe.len);
         let flags = sqe.op_flags as i32;
 
         // send is equivalent to sendto with NULL destination
@@ -1197,7 +1198,7 @@ impl IoUring {
     fn do_recv(&self, sqe: &IoUringSqe) -> i32 {
         let fd = sqe.fd;
         let buf = sqe.addr;
-        let len = sqe.len as u64;
+        let len = u64::from(sqe.len);
         let flags = sqe.op_flags as i32;
 
         // recv is equivalent to recvfrom with NULL source
@@ -1245,17 +1246,7 @@ impl FileOps for IoUringFileOps {
         self
     }
 
-    fn read(&self, _file: &File, _buf: &mut [u8]) -> Result<usize, KernelError> {
-        // io_uring fds are not directly readable
-        Err(KernelError::InvalidArgument)
-    }
-
-    fn write(&self, _file: &File, _buf: &[u8]) -> Result<usize, KernelError> {
-        // io_uring fds are not directly writable
-        Err(KernelError::InvalidArgument)
-    }
-
-    fn poll(&self, file: &File, pt: Option<&mut PollTable>) -> u16 {
+    fn poll(&self, file: &File, pt: Option<&mut PollTable<'_>>) -> u16 {
         let Some(ring) = file.private_ref::<IoUring>() else {
             return crate::io::poll::POLLERR;
         };
@@ -1280,12 +1271,7 @@ pub fn get_io_uring(file: &File) -> Option<Arc<IoUring>> {
 
 /// Create an io_uring file
 fn create_io_uring_file(ring: Arc<IoUring>) -> Result<Arc<File>, KernelError> {
-    Ok(crate::fs::anon_inodes::anon_inode_getfile(
-        "[io_uring]",
-        &IO_URING_FOPS,
-        ring,
-        flags::O_RDWR,
-    ))
+    crate::fs::anon_inodes::anon_inode_getfile("[io_uring]", &IO_URING_FOPS, ring, flags::O_RDWR)
 }
 
 // ============================================================================
@@ -1346,7 +1332,7 @@ fn read_user_fds(arg: u64, n: usize) -> Result<Vec<i32>, KernelError> {
     }
     let mut fds = crate::util::kmem::try_vec(n, 0i32)?;
     // SAFETY: byte view of the `n` initialized i32 elements of `fds`
-    let bytes = unsafe { core::slice::from_raw_parts_mut(fds.as_mut_ptr() as *mut u8, n * 4) };
+    let bytes = unsafe { core::slice::from_raw_parts_mut(fds.as_mut_ptr().cast::<u8>(), n * 4) };
     copy_from_user::<Uaccess>(bytes, arg, n * 4).map_err(|_| KernelError::BadAddress)?;
     Ok(fds)
 }
@@ -1506,7 +1492,7 @@ pub fn sys_io_uring_setup(entries: u32, params_ptr: u64) -> i64 {
         .alloc_with_flags(file, FD_CLOEXEC, get_nofile_limit())
     {
         Ok(fd) => fd,
-        Err(e) => return -(e as i64),
+        Err(e) => return -i64::from(e),
     };
 
     // Write params back to user space
@@ -1516,7 +1502,7 @@ pub fn sys_io_uring_setup(entries: u32, params_ptr: u64) -> i64 {
         return KernelError::BadAddress.sysret();
     }
 
-    fd as i64
+    i64::from(fd)
 }
 
 /// sys_io_uring_enter - Submit I/O and/or wait for completions

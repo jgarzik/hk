@@ -25,6 +25,7 @@
 //! - Integration with waitid(P_PIDFD)
 //! - CLONE_PIDFD support for automatic pidfd creation
 
+use crate::util::kalloc::try_arc;
 use alloc::sync::Arc;
 
 use crate::fs::KernelError;
@@ -48,7 +49,7 @@ pub struct Pidfd {
 impl Pidfd {
     /// The process's pid
     pub fn pid(&self) -> Pid {
-        self.pid.nr() as Pid
+        Pid::from(self.pid.nr())
     }
 
     /// Its `Pid`
@@ -60,7 +61,7 @@ impl Pidfd {
         self.pid.exited().is_some()
     }
 
-    pub fn poll(&self, pt: Option<&mut PollTable>) -> u16 {
+    pub fn poll(&self, pt: Option<&mut PollTable<'_>>) -> u16 {
         if let Some(poll_table) = pt {
             poll_table.poll_wait(&self.pid.wait_pidfd);
         }
@@ -82,17 +83,7 @@ impl FileOps for PidfdFileOps {
         self
     }
 
-    fn read(&self, _file: &File, _buf: &mut [u8]) -> Result<usize, KernelError> {
-        // pidfds don't support read
-        Err(KernelError::InvalidArgument)
-    }
-
-    fn write(&self, _file: &File, _buf: &[u8]) -> Result<usize, KernelError> {
-        // pidfds don't support write
-        Err(KernelError::InvalidArgument)
-    }
-
-    fn poll(&self, file: &File, pt: Option<&mut PollTable>) -> u16 {
+    fn poll(&self, file: &File, pt: Option<&mut PollTable<'_>>) -> u16 {
         let Some(pidfd) = file.private_ref::<Pidfd>() else {
             return crate::io::poll::POLLERR;
         };
@@ -116,7 +107,7 @@ pub fn create_pidfd(pid: Pid, file_flags: u32) -> Result<Arc<File>, KernelError>
     let nr = u32::try_from(pid).map_err(|_| KernelError::NoProcess)?;
     let pid =
         crate::task::pid::find_pid(&crate::ns::INIT_PID_NS, nr).ok_or(KernelError::NoProcess)?;
-    let pidfd = Arc::new(Pidfd { pid });
+    let pidfd = try_arc(Pidfd { pid })?;
 
     // Create dummy dentry for pidfd
 
@@ -126,7 +117,7 @@ pub fn create_pidfd(pid: Pid, file_flags: u32) -> Result<Arc<File>, KernelError>
         f_flags |= flags::O_NONBLOCK;
     }
 
-    let file = crate::fs::anon_inodes::anon_inode_getfile("[pidfd]", &PIDFD_FOPS, pidfd, f_flags);
+    let file = crate::fs::anon_inodes::anon_inode_getfile("[pidfd]", &PIDFD_FOPS, pidfd, f_flags)?;
     Ok(file)
 }
 

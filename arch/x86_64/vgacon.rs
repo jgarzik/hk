@@ -9,7 +9,7 @@
 //! - VGA text buffer: 0xB8000 (80x25 characters, 2 bytes per cell)
 //! - CRT Controller: I/O ports 0x3D4 (index) and 0x3D5 (data)
 //! - Cursor position: CRT registers 14 (high) and 15 (low)
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use crate::arch::IrqSpinlock;
 use crate::console::{ConsoleDriver, ConsoleFlags, ConsolePriority, register_console};
@@ -44,7 +44,7 @@ const DEFAULT_ATTR: u8 = 0x07;
 ///
 /// Returns true if VGA buffer is present and responsive.
 fn probe_vga_buffer() -> bool {
-    let p = super::paging::phys_to_virt(VGA_BUFFER_PHYS) as *mut u16;
+    let p = super::paging::phys_to_virt(VGA_BUFFER_PHYS).cast::<u16>();
     unsafe {
         // Save original values
         let saved1 = core::ptr::read_volatile(p);
@@ -102,7 +102,7 @@ impl VgaConState {
 
     /// Initialize the VGA console state
     fn init(&mut self) {
-        self.buffer = super::paging::phys_to_virt(VGA_BUFFER_PHYS) as *mut u16;
+        self.buffer = super::paging::phys_to_virt(VGA_BUFFER_PHYS).cast::<u16>();
         self.attribute = DEFAULT_ATTR;
 
         // Probe VGA buffer - this also "wakes up" VGA hardware that may
@@ -142,7 +142,7 @@ impl VgaConState {
 
     /// Clear the entire screen
     fn clear_screen(&mut self) {
-        let blank = (self.attribute as u16) << 8 | 0x20u16; // Space with attribute
+        let blank = u16::from(self.attribute) << 8 | 0x20u16; // Space with attribute
         unsafe {
             for i in 0..(VGA_WIDTH * VGA_HEIGHT) {
                 core::ptr::write_volatile(self.buffer.add(i), blank);
@@ -183,7 +183,7 @@ impl VgaConState {
             _ => {
                 // Printable character
                 let offset = self.cursor_y * VGA_WIDTH + self.cursor_x;
-                let cell = (self.attribute as u16) << 8 | (c as u16);
+                let cell = u16::from(self.attribute) << 8 | u16::from(c);
 
                 unsafe {
                     core::ptr::write_volatile(self.buffer.add(offset), cell);
@@ -219,7 +219,7 @@ impl VgaConState {
             core::ptr::copy(src, dst, count);
 
             // Clear the last line
-            let blank = (self.attribute as u16) << 8 | (b' ' as u16);
+            let blank = u16::from(self.attribute) << 8 | u16::from(b' ');
             let last_line = self.buffer.add(VGA_WIDTH * (VGA_HEIGHT - 1));
             for i in 0..VGA_WIDTH {
                 core::ptr::write_volatile(last_line.add(i), blank);

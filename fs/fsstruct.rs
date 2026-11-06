@@ -25,6 +25,8 @@ use crate::sync::spin::Mutex;
 
 use super::path_ref::Path;
 use crate::task::Tid;
+use crate::util::error::KernelError;
+use crate::util::kalloc::{arc_nofail, try_arc};
 
 /// Per-task filesystem context
 ///
@@ -67,7 +69,7 @@ struct FsStructInner {
 impl FsStruct {
     /// Create a new FsStruct with the given root and pwd
     pub fn new(root: Path, pwd: Path) -> Arc<Self> {
-        Arc::new(Self {
+        arc_nofail(Self {
             inner: Mutex::new(FsStructInner {
                 pwd: Pinned::new(pwd),
                 root: Pinned::new(root),
@@ -154,9 +156,9 @@ impl FsStruct {
     /// Creates a new FsStruct with the same pwd/root/umask,
     /// but independent (changes don't affect original).
     /// The underlying mount/dentry objects are still shared via Arc.
-    pub fn copy(&self) -> Arc<Self> {
+    pub fn copy(&self) -> Result<Arc<Self>, KernelError> {
         let inner = self.inner.lock();
-        Arc::new(Self {
+        try_arc(Self {
             inner: Mutex::new(FsStructInner {
                 pwd: Pinned::new(inner.pwd.0.clone()),
                 root: Pinned::new(inner.root.0.clone()),
@@ -237,13 +239,13 @@ pub fn exit_task_fs(tid: Tid) {
 /// The fs context a child of `parent_tid` gets (Linux copy_fs): the
 /// parent's own with CLONE_FS, else a copy (a parent without one: a new
 /// one at the root). Nothing is counted yet, so a fork that fails
-/// afterwards just drops it.
-pub fn fork_fs(parent_tid: Tid, share: bool) -> Option<Arc<FsStruct>> {
-    match get_task_fs(parent_tid) {
+/// afterwards just drops it. ENOMEM if the copy cannot be made.
+pub fn fork_fs(parent_tid: Tid, share: bool) -> Result<Option<Arc<FsStruct>>, KernelError> {
+    Ok(match get_task_fs(parent_tid) {
         Some(fs) if share => Some(fs),
-        Some(fs) => Some(fs.copy()),
+        Some(fs) => Some(fs.copy()?),
         None => FsStruct::new_root(),
-    }
+    })
 }
 
 /// Give the child its fork-time fs context, counting one more sharer

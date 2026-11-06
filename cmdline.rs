@@ -226,7 +226,7 @@ pub fn is_cmdline_console(name: &str) -> bool {
 }
 
 /// Get the number of console specifications
-#[allow(dead_code)]
+#[expect(dead_code)]
 pub fn cmdline_console_count() -> usize {
     CMDLINE_CONSOLE.lock().count
 }
@@ -234,7 +234,7 @@ pub fn cmdline_console_count() -> usize {
 /// Get a console specification by index
 ///
 /// Returns None if index is out of bounds
-#[allow(dead_code)]
+#[expect(dead_code)]
 pub fn get_cmdline_console(index: usize) -> Option<ConsoleSpec> {
     let console = CMDLINE_CONSOLE.lock();
     if index < console.count {
@@ -247,7 +247,7 @@ pub fn get_cmdline_console(index: usize) -> Option<ConsoleSpec> {
 /// Get the primary (last specified) console device name
 ///
 /// Returns None if no console= was specified
-#[allow(dead_code)]
+#[expect(dead_code)]
 pub fn primary_cmdline_console() -> Option<ConsoleSpec> {
     let console = CMDLINE_CONSOLE.lock();
     if console.count > 0 {

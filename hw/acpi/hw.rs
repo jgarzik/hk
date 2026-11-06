@@ -146,7 +146,7 @@ pub fn sleep_retry(io: &mut impl PortIo, regs: &PmRegs, typ: SleepType) {
 /// other bits (SCI_EN included) as read
 fn sleep_values(io: &mut impl PortIo, regs: &PmRegs, typ: SleepType) -> (u16, u16) {
     let cnt = pm1_cnt_read(io, regs) & !(SLP_TYP | SLP_EN);
-    let field = |t: u8| ((t as u16) << SLP_TYP_SHIFT) & SLP_TYP;
+    let field = |t: u8| (u16::from(t) << SLP_TYP_SHIFT) & SLP_TYP;
     (cnt | field(typ.a), cnt | field(typ.b))
 }
 
@@ -176,7 +176,7 @@ fn gpe_blocks(regs: &PmRegs) -> impl Iterator<Item = (u16, u16)> {
     [(regs.gpe0, regs.gpe0_len), (regs.gpe1, regs.gpe1_len)]
         .into_iter()
         .filter(|&(base, len)| base != 0 && len >= 2)
-        .map(|(base, len)| (base, len as u16 / 2))
+        .map(|(base, len)| (base, u16::from(len) / 2))
 }
 
 /// PM1 control, a and b ORed, write-only bits clear (Linux
@@ -205,7 +205,7 @@ fn pm1_sts_write(io: &mut impl PortIo, regs: &PmRegs, val: u16) {
 
 /// Write PM1 enable, a and b
 fn pm1_en_write(io: &mut impl PortIo, regs: &PmRegs, val: u16) {
-    pm1_evt_write(io, regs, regs.pm1_evt_len as u16 / 2, val);
+    pm1_evt_write(io, regs, u16::from(regs.pm1_evt_len) / 2, val);
 }
 
 /// Write the register at `off` in the PM1a and PM1b event blocks

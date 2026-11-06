@@ -3,6 +3,11 @@
 //! arm64 mostly uses the asm-generic UAPI (include/uapi/asm-generic/) plus
 //! overrides in arch/arm64/include/uapi/asm/ in Linux.
 
+/// `st_nlink` from an inode link count; the field is u32 on this arch
+pub fn st_nlink(n: u32) -> u32 {
+    n
+}
+
 /// `struct stat` (include/uapi/asm-generic/stat.h)
 #[repr(C)]
 #[derive(Clone, Copy, Default)]

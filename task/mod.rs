@@ -111,6 +111,8 @@ pub mod wait_options {
     pub const P_PIDFD: i32 = 3;
 }
 
+use crate::util::error::KernelError;
+use crate::util::kalloc::{arc_nofail, try_arc};
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -314,7 +316,7 @@ pub fn current_cred() -> Cred {
 /// let mut new_cred = prepare_creds();
 /// new_cred.uid = new_uid;
 /// new_cred.euid = new_uid;
-/// commit_creds(Arc::new(new_cred));
+/// commit_creds(try_arc(new_cred)?);
 /// ```
 pub fn prepare_creds() -> Cred {
     current_cred()
@@ -360,15 +362,15 @@ pub fn nproc_exec_check() -> Result<(), i32> {
 /// - Otherwise (fork): Deep copy credentials (new Arc with copied data)
 ///
 /// This follows Linux's pattern from kernel/cred.c:copy_creds().
-pub fn copy_creds(clone_flags: u64, parent_cred: &Arc<Cred>) -> Arc<Cred> {
+pub fn copy_creds(clone_flags: u64, parent_cred: &Arc<Cred>) -> Result<Arc<Cred>, KernelError> {
     use clone_flags::CLONE_THREAD;
 
     if clone_flags & CLONE_THREAD != 0 {
         // Threads share credentials - just clone the Arc (bump refcount)
-        parent_cred.clone()
+        Ok(parent_cred.clone())
     } else {
         // Fork: deep copy credentials (child gets independent copy)
-        Arc::new((**parent_cred).clone())
+        try_arc((**parent_cred).clone())
     }
 }
 
@@ -978,6 +980,10 @@ pub struct Task {
     /// Page-fault-disable depth (Linux p->pagefault_disabled), written
     /// by the task itself (`uaccess::pagefault_disable`)
     pub pagefault_disabled: AtomicU32,
+    /// Fault-injection countdown (Linux p->fail_nth): the allocation
+    /// that takes it to 0 fails (`mm::fault_inject`); written by the
+    /// task itself through /proc/thread-self/fail-nth
+    pub fail_nth: AtomicU32,
     /// CPU whose network backlog this task last queued a packet to
     /// (`netif_rx`; u32::MAX: none), written by the task itself: its
     /// loopback flush covers that backlog even if it moved since
@@ -1245,34 +1251,9 @@ pub struct TaskInner {
     pub ptrace_code: u32,
 }
 
-/// Data owned by the TASKLIST lock (Rust-for-Linux LockedBy): only
-/// `GlobalTaskTable`'s views reach it, with the table locked
-pub struct TableCell<T>(UnsafeCell<T>);
-
-// SAFETY: every access goes through a view of the locked table
-unsafe impl<T: Send> Sync for TableCell<T> {}
-
-impl<T> TableCell<T> {
-    pub const fn new(v: T) -> Self {
-        Self(UnsafeCell::new(v))
-    }
-
-    /// # Safety
-    /// TASKLIST is held, and no `&mut` to this cell's data exists.
-    pub unsafe fn get(&self) -> &T {
-        // SAFETY: see above
-        unsafe { &*self.0.get() }
-    }
-
-    /// # Safety
-    /// TASKLIST is held mutably by the caller, and no other reference
-    /// to this cell's data exists.
-    #[allow(clippy::mut_from_ref)]
-    pub unsafe fn get_mut(&self) -> &mut T {
-        // SAFETY: see above
-        unsafe { &mut *self.0.get() }
-    }
-}
+/// Data owned by the TASKLIST lock: reached through a borrow of the
+/// locked table
+pub type TableCell<T> = crate::sync::LockedBy<T, crate::task::percpu::GlobalTaskTable>;
 
 /// The adapter of `Task.sibling` (children lists)
 pub struct Sibling;
@@ -1285,7 +1266,11 @@ unsafe impl crate::util::list::Adapter for Sibling {
     }
     unsafe fn item(l: *const crate::util::list::Link) -> *const Task {
         // SAFETY: `l` is the `sibling` of a live task
-        unsafe { (l as *const u8).sub(core::mem::offset_of!(Task, sibling)) as *const Task }
+        unsafe {
+            l.cast::<u8>()
+                .sub(core::mem::offset_of!(Task, sibling))
+                .cast::<Task>()
+        }
     }
 }
 
@@ -1300,7 +1285,11 @@ unsafe impl crate::util::list::Adapter for ThreadNode {
     }
     unsafe fn item(l: *const crate::util::list::Link) -> *const Task {
         // SAFETY: `l` is the `thread_node` of a live task
-        unsafe { (l as *const u8).sub(core::mem::offset_of!(Task, thread_node)) as *const Task }
+        unsafe {
+            l.cast::<u8>()
+                .sub(core::mem::offset_of!(Task, thread_node))
+                .cast::<Task>()
+        }
     }
 }
 
@@ -1354,15 +1343,15 @@ struct TaskCred(AtomicPtr<Cred>);
 
 impl TaskCred {
     fn new(c: Arc<Cred>) -> Self {
-        Self(AtomicPtr::new(Arc::into_raw(c) as *mut Cred))
+        Self(AtomicPtr::new(Arc::into_raw(c).cast_mut()))
     }
 
     const fn boot() -> Self {
-        Self(AtomicPtr::new(&INIT_CRED as *const Cred as *mut Cred))
+        Self(AtomicPtr::new((&raw const INIT_CRED).cast_mut()))
     }
 
     fn is_static(p: *const Cred) -> bool {
-        core::ptr::eq(p, &INIT_CRED)
+        core::ptr::eq(p, &raw const INIT_CRED)
     }
 
     /// # Safety
@@ -1377,7 +1366,8 @@ impl TaskCred {
     unsafe fn arc(&self) -> Arc<Cred> {
         let p = self.0.load(Ordering::Acquire);
         if Self::is_static(p) {
-            return Arc::new(INIT_CRED.clone());
+            // The boot task's static set: no caller can fail here
+            return arc_nofail(INIT_CRED.clone());
         }
         // SAFETY: `p` came from Arc::into_raw and holds a count
         unsafe {
@@ -1390,9 +1380,7 @@ impl TaskCred {
     /// TASKLIST is held, and the caller is the task itself or it has
     /// not run yet.
     unsafe fn replace(&self, new: Arc<Cred>) -> Option<Arc<Cred>> {
-        let old = self
-            .0
-            .swap(Arc::into_raw(new) as *mut Cred, Ordering::AcqRel);
+        let old = self.0.swap(Arc::into_raw(new).cast_mut(), Ordering::AcqRel);
         // SAFETY: from Arc::into_raw unless static
         (!Self::is_static(old)).then(|| unsafe { Arc::from_raw(old) })
     }
@@ -1548,7 +1536,7 @@ impl TaskLock<'_> {
 
 impl Task {
     /// A task with its locked fields (not yet in the table)
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn new(
         tid: Tid,
         ids: TaskIds,
@@ -1559,6 +1547,7 @@ impl Task {
         cred: Arc<Cred>,
         mm: Option<crate::mm::MmRef>,
         alloc: TaskAlloc,
+        sig: TaskSignalState,
         inner: TaskInner,
     ) -> Self {
         let now = crate::time::monotonic_ns();
@@ -1578,6 +1567,7 @@ impl Task {
             wake_cpu: AtomicU32::new(cpu),
             cpus_mask: crate::util::cpumask::CpuMask::from_set(cpus),
             pagefault_disabled: AtomicU32::new(0),
+            fail_nth: AtomicU32::new(0),
             rx_cpu: AtomicU32::new(u32::MAX),
             se: sched::SchedEntity::new(0),
             started: AtomicBool::new(false),
@@ -1588,7 +1578,7 @@ impl Task {
             tls: AtomicU64::new(0),
             gsbase: AtomicU64::new(0),
             seccomp_mode: AtomicU8::new(ids.seccomp_mode),
-            sig: crate::sync::spin::Mutex::new(TaskSignalState::new()),
+            sig: crate::sync::spin::Mutex::new(sig),
             keyrings: crate::sync::spin::Mutex::new(crate::keys::keyring::TaskKeyrings::new()),
             cgroup: crate::sync::spin::Mutex::new(None),
             fput_defer: crate::sync::spin::Mutex::new(None),
@@ -1641,6 +1631,7 @@ impl Task {
             wake_cpu: AtomicU32::new(0),
             cpus_mask: crate::util::cpumask::CpuMask::new(),
             pagefault_disabled: AtomicU32::new(0),
+            fail_nth: AtomicU32::new(0),
             rx_cpu: AtomicU32::new(u32::MAX),
             se: sched::SchedEntity::new(0),
             started: AtomicBool::new(true),
@@ -2490,16 +2481,16 @@ pub fn set_task_io_context(tid: Tid, ctx: Arc<IoContext>) {
 
 /// The I/O context of a task, a new one if it has none (Linux
 /// set_task_ioprio's alloc_io_context under task_lock); None if there
-/// is no such task
-pub fn task_io_context(tid: Tid) -> Option<Arc<IoContext>> {
-    let new = Arc::new(IoContext::new());
-    percpu::with_task_lock(tid, |a| match a.io_context() {
+/// is no such task, ENOMEM if one cannot be made
+pub fn task_io_context(tid: Tid) -> Result<Option<Arc<IoContext>>, KernelError> {
+    let new = try_arc(IoContext::new())?;
+    Ok(percpu::with_task_lock(tid, |a| match a.io_context() {
         Some(c) => c.clone(),
         None => {
             a.set_io_context(Some(new.clone()));
             new
         }
-    })
+    }))
 }
 
 /// Remove the I/O context for a task (on exit)
@@ -2507,27 +2498,20 @@ pub fn remove_task_io_context(tid: Tid) {
     drop(percpu::with_task_lock(tid, |a| a.set_io_context(None)));
 }
 
-/// Clone I/O context for a new task
+/// The I/O context for a new task, built before it exists (installed
+/// with `set_task_io_context`)
 ///
 /// If `share` is true (CLONE_IO set), child shares parent's Arc<IoContext>.
 /// Otherwise, child gets a new IoContext inheriting parent's ioprio value.
-pub fn clone_task_io(parent_tid: Tid, child_tid: Tid, share: bool) {
-    let parent_ctx = get_task_io_context(parent_tid);
-
-    let child_ctx = if let Some(parent_ctx) = parent_ctx {
-        if share {
-            // CLONE_IO: share the same context
-            parent_ctx
-        } else {
-            // No CLONE_IO: create new context with inherited ioprio
-            Arc::new(IoContext::with_ioprio(parent_ctx.get_ioprio()))
-        }
-    } else {
+pub fn fork_io(parent_tid: Tid, share: bool) -> Result<Arc<IoContext>, KernelError> {
+    match get_task_io_context(parent_tid) {
+        // CLONE_IO: share the same context
+        Some(parent_ctx) if share => Ok(parent_ctx),
+        // No CLONE_IO: create new context with inherited ioprio
+        Some(parent_ctx) => try_arc(IoContext::with_ioprio(parent_ctx.get_ioprio())),
         // Parent has no context, create default for child
-        Arc::new(IoContext::new())
-    };
-
-    set_task_io_context(child_tid, child_ctx);
+        None => try_arc(IoContext::new()),
+    }
 }
 
 // =============================================================================

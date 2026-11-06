@@ -14,6 +14,7 @@ use super::flags::{
 use super::mount::MNT_NODEV;
 use super::syscall::{current_fd_table, get_nofile_limit};
 use crate::task::FD_CLOEXEC;
+use crate::util::kalloc::try_arc;
 
 /// Create regular file `name` in `parent` for O_CREAT (Linux
 /// lookup_open + may_o_create) under the parent's lock: an entry that
@@ -41,9 +42,11 @@ fn create_in(
         let _w = w?;
         dac::may_create(&c, &dir)?;
         let perm = dac::create_mode(&c, &dir, (mode & 0o7777) as u16);
+        // The dentry first, so an ENOMEM leaves no file made
+        let d = Dentry::prealloc(parent, name)?;
         let inode = dir.i_op.create(&dir, name, InodeMode::regular(perm))?;
-        let d = Dentry::alloc(parent, name, Some(inode));
-        Ok((d, true))
+        dir.touch_mc();
+        Ok((Dentry::add(parent, d, Some(inode)), true))
     })()
 }
 
@@ -81,6 +84,13 @@ fn open_target(
     if p.last != Last::Norm || p.slash {
         return Err(KernelError::IsDirectory);
     }
+    // A final symlink is followed to where the file is (or is made),
+    // a dangling one included
+    let p = if lf.follow {
+        super::namei::resolve_last_links(p)?
+    } else {
+        p
+    };
     let dir = Path::new(p.mnt.clone(), p.dir.clone());
     let (d, created) = match path_lookupat(Some(dir), &p.name, lf) {
         Ok(d) => (d, false),
@@ -95,6 +105,14 @@ fn open_target(
     }
     if !created && d.get_inode().is_some_and(|i| i.mode().is_dir()) {
         return Err(KernelError::IsDirectory);
+    }
+    // An existing file opened O_CREAT in a sticky directory (Linux
+    // may_create_in_sticky: fs.protected_fifos / _regular)
+    // The directory is the one holding the file the walk ended on, after
+    // a final symlink (Linux nd->dir_mode after the follow)
+    let parent = d.dentry.get_parent().unwrap_or_else(|| p.dir.clone());
+    if !created && let (Some(dir), Some(inode)) = (parent.get_inode(), d.get_inode()) {
+        super::dac::may_create_in_sticky(&crate::task::current_cred(), &dir, &inode)?;
     }
     Ok((d, created))
 }
@@ -129,8 +147,8 @@ fn do_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> Result<i64, Ke
     let fd_table = current_fd_table();
     let mut table = fd_table.lock();
     match table.alloc_with_flags(file, fd_flags, get_nofile_limit()) {
-        Ok(fd) => Ok(fd as i64),
-        Err(e) => Ok(-(e as i64)),
+        Ok(fd) => Ok(i64::from(fd)),
+        Err(e) => Ok(-i64::from(e)),
     }
 }
 
@@ -180,7 +198,10 @@ fn filp_open(dirfd: i32, path: &[u8], flags: u32, mode: u32) -> Result<Arc<File>
             return Err(KernelError::TextBusy);
         }
         dac::remove_privs(&inode);
-        inode.i_op.truncate(&inode, 0).ok();
+        // ATTR_MTIME | ATTR_CTIME, also for a file already empty
+        if inode.i_op.truncate(&inode, 0).is_ok() {
+            inode.touch_mc();
+        }
     }
 
     // Get the file operations based on inode type
@@ -199,13 +220,13 @@ fn filp_open(dirfd: i32, path: &[u8], flags: u32, mode: u32) -> Result<Arc<File>
             .unwrap_or(&RAMFS_FILE_OPS)
     };
 
-    let mut file = File::new(dentry, Some(path.mnt), flags, f_op);
+    let mut file = File::new(dentry, Some(path.mnt.clone()), flags, f_op);
     if flags & O_ACCMODE != O_RDONLY {
         file.write_access = w;
         file.i_write = iw;
     }
     f_op.open(&file)?;
-    Ok(Arc::new(file))
+    try_arc(file)
 }
 
 /// Give init /dev/console as stdin, stdout and stderr (Linux
@@ -250,8 +271,8 @@ pub fn sys_close_range(fd: u32, max_fd: u32, flags: u32) -> i64 {
     }
     let files = if flags & CLOSE_RANGE_UNSHARE != 0 {
         match crate::task::fdtable::unshare_task_fd(crate::task::percpu::current_tid()) {
-            Some(f) => f,
-            None => return KernelError::BadFd.sysret(),
+            Ok(f) => f,
+            Err(e) => return e.sysret(),
         }
     } else {
         current_fd_table()

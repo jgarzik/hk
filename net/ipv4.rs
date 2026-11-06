@@ -234,7 +234,10 @@ fn idents_reserve(hash: u32, segs: u32) -> u32 {
 pub fn select_ident(net: &NetNamespace, saddr: Ipv4Addr, daddr: Ipv4Addr, proto: u8) -> u16 {
     let h = crate::net::inet::port::siphash(
         net.ip_id_key,
-        &[((daddr.0 as u64) << 32) | saddr.0 as u64, proto as u64],
+        &[
+            (u64::from(daddr.0) << 32) | u64::from(saddr.0),
+            u64::from(proto),
+        ],
     );
     idents_reserve(h as u32, 1) as u16
 }
@@ -249,13 +252,13 @@ pub fn ip_checksum(data: &[u8]) -> u16 {
     // Sum all 16-bit words
     let mut i = 0;
     while i + 1 < data.len() {
-        sum += u16::from_be_bytes([data[i], data[i + 1]]) as u32;
+        sum += u32::from(u16::from_be_bytes([data[i], data[i + 1]]));
         i += 2;
     }
 
     // Add odd byte if present
     if i < data.len() {
-        sum += (data[i] as u32) << 8;
+        sum += u32::from(data[i]) << 8;
     }
 
     // Fold 32-bit sum to 16 bits
@@ -280,19 +283,19 @@ pub fn pseudo_header_checksum(saddr: Ipv4Addr, daddr: Ipv4Addr, protocol: u8, le
 
     // Source address
     let s = saddr.to_be_bytes();
-    sum += u16::from_be_bytes([s[0], s[1]]) as u32;
-    sum += u16::from_be_bytes([s[2], s[3]]) as u32;
+    sum += u32::from(u16::from_be_bytes([s[0], s[1]]));
+    sum += u32::from(u16::from_be_bytes([s[2], s[3]]));
 
     // Destination address
     let d = daddr.to_be_bytes();
-    sum += u16::from_be_bytes([d[0], d[1]]) as u32;
-    sum += u16::from_be_bytes([d[2], d[3]]) as u32;
+    sum += u32::from(u16::from_be_bytes([d[0], d[1]]));
+    sum += u32::from(u16::from_be_bytes([d[2], d[3]]));
 
     // Protocol
-    sum += protocol as u32;
+    sum += u32::from(protocol);
 
     // Length
-    sum += len as u32;
+    sum += u32::from(len);
 
     sum
 }

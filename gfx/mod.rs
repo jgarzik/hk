@@ -47,7 +47,9 @@ use alloc::vec::Vec;
 
 use crate::fs::File;
 use crate::fs::chardev::{CharDevice, DevId};
+use crate::fs::iov_iter::{IovDest, IovSource};
 use crate::util::error::KernelError;
+use crate::util::kalloc::try_arc;
 
 /// DRM major device number (Linux convention)
 pub const GFX_MAJOR: u16 = 226;
@@ -210,12 +212,12 @@ impl CharDevice for GfxCharDevice {
         true
     }
 
-    fn read(&self, _file: &File, _buf: &mut [u8]) -> Result<usize, KernelError> {
+    fn read(&self, _file: &File, _to: &mut IovDest<'_>) -> Result<usize, KernelError> {
         // DRM devices don't support read
         Err(KernelError::OperationNotSupported)
     }
 
-    fn write(&self, _file: &File, _buf: &[u8]) -> Result<usize, KernelError> {
+    fn write(&self, _file: &File, _from: &mut IovSource<'_>) -> Result<usize, KernelError> {
         // DRM devices don't support write
         Err(KernelError::OperationNotSupported)
     }
@@ -242,7 +244,7 @@ pub fn register_gfx_device(driver: Arc<dyn GfxDriver>) -> Result<u32, GfxError> 
         m
     };
 
-    let chardev = Arc::new(GfxCharDevice::new(driver, minor));
+    let chardev = try_arc(GfxCharDevice::new(driver, minor)).map_err(|_| GfxError::NoMemory)?;
     let dev_id = DevId::new(GFX_MAJOR, minor as u16);
 
     // Register with character device subsystem
@@ -349,7 +351,6 @@ impl FramebufferInfo {
     }
 
     /// Calculate console dimensions in characters for a given font size
-    #[allow(dead_code)]
     pub const fn console_dimensions(&self, font_width: u32, font_height: u32) -> (u32, u32) {
         let cols = self.width / font_width;
         let rows = self.height / font_height;
@@ -364,13 +365,11 @@ impl FramebufferInfo {
 pub static BOOT_FRAMEBUFFER: spin::Once<FramebufferInfo> = spin::Once::new();
 
 /// Check if a boot framebuffer is available
-#[allow(dead_code)]
 pub fn has_boot_framebuffer() -> bool {
     BOOT_FRAMEBUFFER.get().is_some()
 }
 
 /// Get the boot framebuffer info if available
-#[allow(dead_code)]
 pub fn get_boot_framebuffer() -> Option<&'static FramebufferInfo> {
     BOOT_FRAMEBUFFER.get()
 }
@@ -391,35 +390,21 @@ impl Color {
     /// Standard VGA colors
     pub const BLACK: Color = Color::new(0, 0, 0);
     pub const WHITE: Color = Color::new(255, 255, 255);
-    #[allow(dead_code)]
     pub const RED: Color = Color::new(255, 0, 0);
-    #[allow(dead_code)]
     pub const GREEN: Color = Color::new(0, 255, 0);
-    #[allow(dead_code)]
     pub const BLUE: Color = Color::new(0, 0, 255);
-    #[allow(dead_code)]
     pub const CYAN: Color = Color::new(0, 255, 255);
-    #[allow(dead_code)]
     pub const MAGENTA: Color = Color::new(255, 0, 255);
-    #[allow(dead_code)]
     pub const YELLOW: Color = Color::new(255, 255, 0);
 
     /// Light variants for bright colors
-    #[allow(dead_code)]
     pub const BRIGHT_BLACK: Color = Color::new(85, 85, 85);
-    #[allow(dead_code)]
     pub const BRIGHT_WHITE: Color = Color::new(255, 255, 255);
-    #[allow(dead_code)]
     pub const BRIGHT_RED: Color = Color::new(255, 85, 85);
-    #[allow(dead_code)]
     pub const BRIGHT_GREEN: Color = Color::new(85, 255, 85);
-    #[allow(dead_code)]
     pub const BRIGHT_BLUE: Color = Color::new(85, 85, 255);
-    #[allow(dead_code)]
     pub const BRIGHT_CYAN: Color = Color::new(85, 255, 255);
-    #[allow(dead_code)]
     pub const BRIGHT_MAGENTA: Color = Color::new(255, 85, 255);
-    #[allow(dead_code)]
     pub const BRIGHT_YELLOW: Color = Color::new(255, 255, 85);
 
     /// Convert to pixel value for given format

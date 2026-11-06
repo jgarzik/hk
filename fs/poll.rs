@@ -4,7 +4,7 @@
 //! - poll, ppoll (polling file descriptors)
 //! - select, pselect6 (selecting file descriptors)
 //! - sync, fsync, fdatasync, syncfs (filesystem synchronization)
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use alloc::vec::Vec;
 
@@ -160,7 +160,7 @@ fn do_poll_internal(fds: u64, nfds: u32, deadline: Deadline) -> i64 {
     use crate::uaccess::{copy_from_user, copy_to_user};
 
     // As many as the caller may have open (Linux do_sys_poll)
-    if nfds as u64 > crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_NOFILE) {
+    if u64::from(nfds) > crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_NOFILE) {
         return KernelError::InvalidArgument.sysret();
     }
 
@@ -183,7 +183,7 @@ fn do_poll_internal(fds: u64, nfds: u32, deadline: Deadline) -> i64 {
     };
 
     let bytes_slice =
-        unsafe { core::slice::from_raw_parts_mut(pollfds.as_mut_ptr() as *mut u8, total_size) };
+        unsafe { core::slice::from_raw_parts_mut(pollfds.as_mut_ptr().cast::<u8>(), total_size) };
 
     if copy_from_user::<Uaccess>(bytes_slice, fds, total_size).is_err() {
         return KernelError::BadAddress.sysret();
@@ -265,7 +265,7 @@ fn do_poll_internal(fds: u64, nfds: u32, deadline: Deadline) -> i64 {
 
     // Copy results back to user space
     let result_bytes =
-        unsafe { core::slice::from_raw_parts(pollfds.as_ptr() as *const u8, total_size) };
+        unsafe { core::slice::from_raw_parts(pollfds.as_ptr().cast::<u8>(), total_size) };
 
     if copy_to_user::<Uaccess>(fds, result_bytes).is_err() {
         return KernelError::BadAddress.sysret();
@@ -565,7 +565,7 @@ fn do_select_internal(
             return e.sysret();
         }
     }
-    ready_count as i64
+    i64::from(ready_count)
 }
 
 /// An fd_set of `n` bits from the user, whole words (Linux get_fd_set,

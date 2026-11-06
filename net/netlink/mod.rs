@@ -39,6 +39,7 @@ pub mod attr;
 pub mod ops;
 pub mod rtnetlink;
 
+use crate::util::kalloc::try_arc_cyclic;
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::{Arc, Weak};
@@ -231,9 +232,9 @@ static ROVER: AtomicI32 = AtomicI32::new(-4097);
 
 impl NlSock {
     /// New socket in the current task's namespace
-    fn new(proto: &'static NlProto, protocol: i32, stype: i32) -> Arc<Self> {
+    fn new(proto: &'static NlProto, protocol: i32, stype: i32) -> Result<Arc<Self>, KernelError> {
         let net = crate::net::current_net_ns();
-        Arc::new_cyclic(|me| Self {
+        try_arc_cyclic(|me| Self {
             sk: Sock::new(net, AF_NETLINK as u16, stype, protocol),
             proto,
             portid: AtomicU32::new(0),
@@ -319,7 +320,7 @@ impl NlSock {
             self.autobind()?;
         }
         let mask = (1u64 << self.proto.ngroups) - 1;
-        let g = groups as u64 & mask;
+        let g = u64::from(groups) & mask;
         // One update of the first 32 groups: a concurrent
         // ADD/DROP_MEMBERSHIP of a higher group is not lost (Linux does
         // both under netlink_table_grab)
@@ -731,5 +732,5 @@ pub fn create(stype: i32, protocol: i32) -> Result<Arc<dyn ProtoOps>, KernelErro
         return Err(KernelError::SocketTypeNotSupported);
     }
     let p = proto(protocol).ok_or(KernelError::ProtocolNotSupported)?;
-    Ok(NlSock::new(p, protocol, stype))
+    Ok(NlSock::new(p, protocol, stype)?)
 }

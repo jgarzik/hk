@@ -27,6 +27,7 @@ const BLKGETSIZE64: u64 = 0x8008_1272;
 const BLKPBSZGET: u64 = 0x127b;
 
 const EINVAL: i64 = -22;
+const EIO: i64 = -5;
 const EBUSY: i64 = -16;
 const ENOSPC: i64 = -28;
 const S_IFMT: u32 = 0o170000;
@@ -408,6 +409,8 @@ fn vfat(d: &Disk) {
     vfat_opts(p1);
     vfat_neg_case(p1);
     vfat_mount_alias(p1);
+    vfat_sync(p1);
+    vfat_corrupt_chain(p1);
 }
 
 /// What was written through the page cache (write() and a shared
@@ -631,6 +634,7 @@ fn vfat_swapfile() {
     let path = b"/mnt/vd1/SWAP.BIN\0";
     let mut got = [0i64; 3];
     let mut busy = [0i64; 4];
+    let mut map = [0i64; 5];
     for (i, last) in [0u32, 0x7fff_ffff, 255].into_iter().enumerate() {
         let fd = sys_open(path.as_ptr(), O_RDWR | O_CREAT, 0o600) as i32;
         let mut hdr = [0u8; 4096];
@@ -641,11 +645,38 @@ fn vfat_swapfile() {
             sys_pwrite64(fd, hdr.as_ptr(), 4096, 0) == 4096 && sys_ftruncate(fd, 256 * 4096) == 0;
         sys_fsync(fd);
         sys_close(fd as u64);
+        // A shared writable mapping made before swapon
+        let rw = sys_open(path.as_ptr(), O_RDWR, 0) as i32;
+        let early = hk_syscall::sys_mmap(
+            0,
+            4096,
+            hk_syscall::PROT_READ | hk_syscall::PROT_WRITE,
+            hk_syscall::MAP_SHARED,
+            rw,
+            4096,
+        );
+        let early_ro = hk_syscall::sys_mmap(
+            0,
+            4096,
+            hk_syscall::PROT_READ,
+            hk_syscall::MAP_SHARED,
+            rw,
+            0,
+        );
         got[i] = if ok {
             sys_swapon(path.as_ptr(), 0)
         } else {
             -1000
         };
+        if got[i] == 0 {
+            map = swapfile_map(rw, early, early_ro);
+        }
+        for m in [early, early_ro] {
+            if m > 0 {
+                hk_syscall::sys_munmap(m as u64, 4096);
+            }
+        }
+        sys_close(rw as u64);
         if got[i] == 0 {
             // Active: no write, truncate (also by O_TRUNC) or unlink
             // (Linux IS_SWAPFILE: ETXTBSY, EPERM for unlink)
@@ -670,6 +701,86 @@ fn vfat_swapfile() {
         busy == [-26, -26, -26, -1],
         busy[0] * 1000 + busy[1] * 100 + busy[2] * 10 + busy[3],
     );
+    // mmap shared writable and copy_file_range into it are ETXTBSY; a
+    // write through a mapping made before swapon is SIGBUS (Linux
+    // do_mmap, generic_copy_file_checks, do_page_mkwrite), and mprotect
+    // may still make such a mapping writable (VM_MAYWRITE was decided
+    // at mmap)
+    verdict(
+        b"VFAT_SWAPFILE_MAP",
+        map == [-26, -26, 0x100 + 7, 0, -26],
+        map[0] * 1_000_000 + map[1] * 1000 + map[2] + map[3] * 10_000_000 + map[4] * 100_000_000,
+    );
+}
+
+/// How a child writing a byte at `p` (after reading it first with
+/// `read_first`) ends: 0x100 + signal, or its exit status
+fn writer_ends(p: i64, read_first: bool) -> i64 {
+    let pid = hk_syscall::sys_fork();
+    if pid == 0 {
+        if read_first {
+            unsafe { core::ptr::read_volatile(p as *const u8) };
+        }
+        unsafe { core::ptr::write_volatile(p as *mut u8, 1) };
+        hk_syscall::sys_exit(0);
+    }
+    let mut st = 0i32;
+    hk_syscall::sys_wait4(pid, &mut st, 0, 0);
+    if st & 0x7f != 0 {
+        0x100 + i64::from(st & 0x7f)
+    } else {
+        i64::from(st >> 8)
+    }
+}
+
+/// On an active swap file open read-write as `rw` with `early` mapped
+/// shared writable and `early_ro` shared read-only before swapon:
+/// [mmap shared writable, copy_file_range into it, how a child writing
+/// `early` ends (0x100 + signal), mprotect of `early_ro` writable,
+/// mmap shared writable through a write-only descriptor (the swap file
+/// is checked before readability, Linux do_mmap: ETXTBSY)]
+fn swapfile_map(rw: i32, early: i64, early_ro: i64) -> [i64; 5] {
+    use hk_syscall::{MAP_SHARED, PROT_READ, PROT_WRITE};
+    let m = hk_syscall::sys_mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, rw, 0);
+    if m > 0 {
+        hk_syscall::sys_munmap(m as u64, 4096);
+    }
+    let src = sys_open(b"/mnt/vd1/CFR.SRC\0".as_ptr(), O_RDWR | O_CREAT, 0o600) as i32;
+    sys_pwrite64(src, b"y".as_ptr(), 1, 0);
+    let mut off: u64 = 8192;
+    let c = hk_syscall::sys_copy_file_range(src, core::ptr::null_mut(), rw, &mut off, 1, 0);
+    sys_close(src as u64);
+    sys_unlink(b"/mnt/vd1/CFR.SRC\0".as_ptr());
+    let mut child = -1;
+    if early > 0 {
+        // A plain write, then a write after a read (the read maps the
+        // page read-only; the write-protect fault must refuse it too)
+        let w = writer_ends(early, false);
+        let rw = writer_ends(early, true);
+        child = if w == rw { w } else { w * 1000 + rw };
+    }
+    let mp = if early_ro > 0 {
+        hk_syscall::sys_mprotect(
+            early_ro as u64,
+            4096,
+            hk_syscall::PROT_READ | hk_syscall::PROT_WRITE,
+        )
+    } else {
+        -1000
+    };
+    let wo = sys_open(b"/mnt/vd1/SWAP.BIN\0".as_ptr(), O_WRONLY, 0) as i32;
+    let mw = hk_syscall::sys_mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, wo, 0);
+    if mw > 0 {
+        hk_syscall::sys_munmap(mw as u64, 4096);
+    }
+    sys_close(wo as u64);
+    [
+        if m > 0 { 0 } else { m },
+        c,
+        child,
+        mp,
+        if mw > 0 { 0 } else { mw },
+    ]
 }
 
 /// A shared mapping of a vfat file is its page cache (Linux
@@ -853,4 +964,87 @@ fn vfat_mount_alias(p1: &BlkDev) {
     sys_umount2(b"/mnt/vd1\0".as_ptr(), 0);
     let ok = r == 0 && fd >= 0 && m == 0 && lower == -2 && upper == -2;
     verdict(b"VFAT_MOUNT_ALIAS", ok, lower * 100 + upper);
+}
+
+/// Dirty kB after writing 2 MiB to a new file on vda1 mounted with
+/// `flags`, opened with `oflags` (Linux generic_write_sync)
+fn dirty_after_write(p1: &BlkDev, flags: u64, oflags: u32) -> i64 {
+    use super::helpers::proc_kb;
+    let mut p = [0u8; 48];
+    let r = sys_mount(
+        p1.path(&mut p).as_ptr(),
+        b"/mnt/vd1\0".as_ptr(),
+        b"vfat\0".as_ptr(),
+        flags,
+        b"iocharset=cp437\0".as_ptr() as u64,
+    );
+    if r != 0 {
+        return r * 1_000_000;
+    }
+    let f = b"/mnt/vd1/SYNC.BIN\0";
+    let fd = sys_open(f.as_ptr(), O_CREAT | O_WRONLY | oflags, 0o644) as i32;
+    let buf = [b's'; 4096];
+    let before = proc_kb(b"/proc/meminfo\0", b"Dirty:");
+    for i in 0..512 {
+        sys_pwrite64(fd, buf.as_ptr(), 4096, i * 4096);
+    }
+    let after = proc_kb(b"/proc/meminfo\0", b"Dirty:");
+    sys_close(fd as u64);
+    sys_unlink(f.as_ptr());
+    sys_umount2(b"/mnt/vd1\0".as_ptr(), 0);
+    after - before
+}
+
+/// A write on an MS_SYNCHRONOUS mount, or through an O_SYNC descriptor,
+/// reaches the disk before it returns: 2 MiB written leaves (almost)
+/// nothing dirty, where a plain write leaves it dirty
+fn vfat_sync(p1: &BlkDev) {
+    const MS_SYNCHRONOUS: u64 = 16;
+    const O_SYNC: u32 = 0o4010000;
+    let plain = dirty_after_write(p1, 0, 0);
+    let sync = dirty_after_write(p1, MS_SYNCHRONOUS, 0);
+    let osync = dirty_after_write(p1, 0, O_SYNC);
+    verdict(
+        b"VFAT_SYNC_WRITE",
+        plain >= 1024 && sync < 512 && osync < 512,
+        plain * 1_000_000 + sync * 1000 + osync,
+    );
+}
+
+/// A corrupt cluster chain is EIO (Linux fat_get_cluster / fat_ent_read):
+/// the root directory's FAT entry set free, then pointing at itself
+/// (a loop), fails the mount; the entry put back, it mounts again
+fn vfat_corrupt_chain(p1: &BlkDev) {
+    let fd = open_dev(p1, O_RDWR);
+    let mut bpb = [0u8; 512];
+    sys_pread64(fd, bpb.as_mut_ptr(), 512, 0);
+    let bps = u64::from(u16::from_le_bytes([bpb[11], bpb[12]]));
+    let reserved = u64::from(u16::from_le_bytes([bpb[14], bpb[15]]));
+    let root = u32::from_le_bytes([bpb[44], bpb[45], bpb[46], bpb[47]]);
+    let at = (reserved * bps + u64::from(root) * 4) as i64;
+    let mut old = [0u8; 4];
+    sys_pread64(fd, old.as_mut_ptr(), 4, at);
+    let put = |v: &[u8; 4]| {
+        sys_pwrite64(fd, v.as_ptr(), 4, at);
+        sys_fsync(fd);
+        mount_vd1(p1, b"iocharset=cp437\0")
+    };
+    let free = put(&[0; 4]);
+    if free == 0 {
+        sys_umount2(b"/mnt/vd1\0".as_ptr(), 0);
+    }
+    let lp = put(&root.to_le_bytes());
+    if lp == 0 {
+        sys_umount2(b"/mnt/vd1\0".as_ptr(), 0);
+    }
+    let back = put(&old);
+    if back == 0 {
+        sys_umount2(b"/mnt/vd1\0".as_ptr(), 0);
+    }
+    sys_close(fd as u64);
+    verdict(
+        b"VFAT_CORRUPT_CHAIN",
+        free == EIO && lp == EIO && back == 0,
+        free * 10000 + lp * 100 + back,
+    );
 }

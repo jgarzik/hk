@@ -4,11 +4,13 @@
 //! - Test: personality() - query and set execution domain
 //! - Test: syslog() - kernel logging operations
 //! - Test: clone3() - modern extensible clone (basic validation only)
+//! - Test: clone3() - a struct larger than the kernel's: zero tail ok, else E2BIG
 
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
     PER_LINUX, PERSONALITY_QUERY, SYSLOG_ACTION_CLOSE, SYSLOG_ACTION_CONSOLE_LEVEL,
-    SYSLOG_ACTION_OPEN, SYSLOG_ACTION_SIZE_BUFFER, sys_personality, sys_syslog,
+    SYSLOG_ACTION_OPEN, SYSLOG_ACTION_SIZE_BUFFER, sys_clone3, sys_exit, sys_personality,
+    sys_syslog, sys_wait4,
 };
 
 /// Run all clone3/personality/syslog tests
@@ -19,6 +21,7 @@ pub fn run_tests() {
     test_syslog_size_buffer();
     test_syslog_console_level();
     test_syslog_invalid_type();
+    test_clone3_big_struct();
 }
 
 /// Test: personality() - query current personality
@@ -115,5 +118,42 @@ fn test_syslog_invalid_type() {
     } else {
         print(b"SYSLOG_EINVAL:FAIL: expected -22 (EINVAL), got ");
         print_num(ret);
+    }
+}
+
+/// clone3 with a struct larger than any the kernel knows (Linux
+/// copy_struct_from_user): a zero tail is accepted, a nonzero byte in it
+/// is E2BIG, and a size over a page is E2BIG
+fn test_clone3_big_struct() {
+    const SIGCHLD: u64 = 17;
+    // 13 words: 104 bytes, past every clone_args version
+    let mut a = [0u64; 13];
+    a[4] = SIGCHLD; // exit_signal
+    let p = a.as_ptr().cast();
+    let pid = sys_clone3(p, 104);
+    if pid == 0 {
+        sys_exit(0);
+    }
+    let mut st = 0i32;
+    let zero_tail_ok = pid > 0 && sys_wait4(pid, &mut st, 0, 0) == pid;
+    a[12] = 1;
+    let tail = sys_clone3(a.as_ptr().cast(), 104);
+    if tail == 0 {
+        sys_exit(0);
+    }
+    let big = sys_clone3(a.as_ptr().cast(), 4097);
+    if big == 0 {
+        sys_exit(0);
+    }
+    if zero_tail_ok && tail == -7 && big == -7 {
+        println(b"CLONE3_BIG_STRUCT:OK");
+    } else {
+        print(b"CLONE3_BIG_STRUCT:FAIL: zero tail ");
+        print_num(pid);
+        print(b" nonzero tail ");
+        print_num(tail);
+        print(b" over a page ");
+        print_num(big);
+        println(b"");
     }
 }

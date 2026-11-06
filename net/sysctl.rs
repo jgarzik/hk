@@ -101,7 +101,7 @@ impl NetSysctl {
 
     fn set_ping_group(&self, lo: u32, hi: u32) {
         self.ping_group
-            .store(((hi as u64) << 32) | lo as u64, Ordering::Release);
+            .store((u64::from(hi) << 32) | u64::from(lo), Ordering::Release);
     }
 
     pub fn icmp_echo_ignore_all(&self) -> bool {
@@ -118,11 +118,15 @@ impl NetSysctl {
 }
 
 fn get_i32(f: fn(&NetSysctl) -> &AtomicI32) -> Vec<i64> {
-    vec![f(&current_net_ns().sysctl).load(Ordering::Relaxed) as i64]
+    vec![i64::from(
+        f(&current_net_ns().sysctl).load(Ordering::Relaxed),
+    )]
 }
 
 fn get_u8(f: fn(&NetSysctl) -> &AtomicU8) -> Vec<i64> {
-    vec![f(&current_net_ns().sysctl).load(Ordering::Relaxed) as i64]
+    vec![i64::from(
+        f(&current_net_ns().sysctl).load(Ordering::Relaxed),
+    )]
 }
 
 /// A u8 sysctl (Linux proc_dou8vec_minmax: 0..=255)
@@ -167,7 +171,7 @@ fn ping_group_store(v: &[i64]) -> Result<(), KernelError> {
 
 fn ping_group_show() -> Vec<i64> {
     let (lo, hi) = current_net_ns().sysctl.ping_group();
-    vec![lo as i64, hi as i64]
+    vec![i64::from(lo), i64::from(hi)]
 }
 
 /// Linux ipv4_local_port_range: 1..65535, low <= high, low above the
@@ -184,7 +188,7 @@ fn port_range_store(v: &[i64]) -> Result<(), KernelError> {
 
 fn port_range_show() -> Vec<i64> {
     let (lo, hi) = current_net_ns().port_range.get();
-    vec![lo as i64, hi as i64]
+    vec![i64::from(lo), i64::from(hi)]
 }
 
 fn frag_show(high: bool) -> Vec<i64> {
@@ -210,7 +214,7 @@ fn rmem_show() -> Vec<i64> {
     let s = &current_net_ns().sysctl;
     s.tcp_rmem
         .iter()
-        .map(|v| v.load(Ordering::Relaxed) as i64)
+        .map(|v| i64::from(v.load(Ordering::Relaxed)))
         .collect()
 }
 

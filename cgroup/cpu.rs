@@ -11,6 +11,7 @@
 //! - `cpu.weight`: Relative weight 1-10000 (default 100)
 //! - `cpu.stat`: Usage statistics
 
+use crate::util::kalloc::try_arc;
 use alloc::format;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -132,7 +133,7 @@ impl CgroupSubsysOps for CpuController {
         parent_css: Option<&Arc<CgroupSubsysState>>,
     ) -> Result<Arc<dyn CssPrivate>, KernelError> {
         let _ = parent_css;
-        Ok(Arc::new(CpuState::new()))
+        Ok(try_arc(CpuState::new())?)
     }
 
     fn css_free(&self, _css: &CgroupSubsysState) {

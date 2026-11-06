@@ -24,6 +24,8 @@
 //! - Overrun counting for missed expirations
 //! - One-shot and periodic timers
 
+use crate::util::error::KernelError;
+use crate::util::kalloc::{arc_nofail, try_arc};
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use core::pin::Pin;
@@ -152,12 +154,22 @@ pub struct PosixTimer {
 }
 
 impl PosixTimer {
-    /// Create a new POSIX timer
-    fn new(timer_id: TimerT, clockid: i32, owner_tid: Tid, sigevent: SigEvent) -> Arc<Self> {
-        Self::with_cpu(timer_id, clockid, owner_tid, sigevent, None, false)
+    /// An itimer, made on first use (Linux keeps them in signal_struct:
+    /// getitimer, setitimer and alarm cannot fail)
+    fn itimer(
+        timer_id: TimerT,
+        clockid: i32,
+        owner_tid: Tid,
+        sigevent: SigEvent,
+        cpu: Option<crate::time::cpu_timer::CpuClock>,
+    ) -> Arc<Self> {
+        Self::own_data(arc_nofail(Self::fresh(
+            timer_id, clockid, owner_tid, sigevent, cpu, false,
+        )))
     }
 
-    /// A timer on CPU clock `cpu` (if any); `sleeper`: clock_nanosleep's
+    /// A timer on CPU clock `cpu` (if any); `sleeper`: clock_nanosleep's.
+    /// ENOMEM
     fn with_cpu(
         timer_id: TimerT,
         clockid: i32,
@@ -165,8 +177,22 @@ impl PosixTimer {
         sigevent: SigEvent,
         cpu: Option<crate::time::cpu_timer::CpuClock>,
         sleeper: bool,
-    ) -> Arc<Self> {
-        let timer = Arc::new(Self {
+    ) -> Result<Arc<Self>, KernelError> {
+        Ok(Self::own_data(try_arc(Self::fresh(
+            timer_id, clockid, owner_tid, sigevent, cpu, sleeper,
+        ))?))
+    }
+
+    /// Its state, before it is in its Arc
+    fn fresh(
+        timer_id: TimerT,
+        clockid: i32,
+        owner_tid: Tid,
+        sigevent: SigEvent,
+        cpu: Option<crate::time::cpu_timer::CpuClock>,
+        sleeper: bool,
+    ) -> Self {
+        Self {
             timer_id,
             clockid,
             owner_tid: AtomicU64::new(owner_tid),
@@ -176,7 +202,11 @@ impl PosixTimer {
             cpu,
             sleeper,
             wq: crate::sync::waitqueue::WaitQueue::new(),
-        });
+        }
+    }
+
+    /// Point its timer at it, in its Arc
+    fn own_data(timer: Arc<Self>) -> Arc<Self> {
         timer.timer.set_data(Arc::as_ptr(&timer) as usize);
         timer
     }
@@ -231,7 +261,7 @@ impl PosixTimer {
                 .and_then(|c| c.timer_base())
                 .unwrap_or(HrClock::Monotonic);
             let value_ns = if pclock == Some(crate::time::time_syscall::PosixClock::Tai) {
-                (value_ns as i128 - crate::time::time_syscall::tai_offset_ns()).max(0) as u64
+                (i128::from(value_ns) - crate::time::time_syscall::tai_offset_ns()).max(0) as u64
             } else {
                 value_ns
             };
@@ -578,10 +608,12 @@ pub fn create_posix_timer(
     {
         timer_id = with_timers(tid, |registry| {
             let id = registry.alloc_id();
-            registry.add(PosixTimer::with_cpu(id, clockid, tid, sev, cpu, false));
-            id
+            let t = PosixTimer::with_cpu(id, clockid, tid, sev, cpu, false)
+                .map_err(|e| e.to_errno_neg())?;
+            registry.add(t);
+            Ok::<_, i32>(id)
         })
-        .ok_or(-11)?; // EAGAIN: no thread group
+        .ok_or(-11)??; // EAGAIN: no thread group; ENOMEM
     }
 
     Ok(timer_id)
@@ -631,13 +663,15 @@ pub fn cpu_nanosleep(clockid: i32, abs: bool, value_ns: u64) -> Result<(), (Kern
         sigev_notify: sigev_notify::SIGEV_NONE,
         ..SigEvent::default()
     };
-    let Some(t) = with_timers(tid, |reg| {
+    let t = match with_timers(tid, |reg| {
         let id = reg.alloc_id();
-        let t = PosixTimer::with_cpu(id, clockid, tid, sev, Some(c), true);
+        let t = PosixTimer::with_cpu(id, clockid, tid, sev, Some(c), true)?;
         reg.add(t.clone());
-        t
-    }) else {
-        return Err((crate::util::error::KernelError::InvalidArgument, 0));
+        Ok(t)
+    }) {
+        Some(Ok(t)) => t,
+        Some(Err(e)) => return Err((e, 0)),
+        None => return Err((crate::util::error::KernelError::InvalidArgument, 0)),
     };
     let spec = ITimerSpec::from_ns(value_ns, 0);
     let r = if value_ns == 0 && !abs {
@@ -747,7 +781,7 @@ pub fn sys_timer_create(clockid: i32, sevp: u64, timerid: u64) -> i64 {
             }
             0
         }
-        Err(e) => e as i64,
+        Err(e) => i64::from(e),
     }
 }
 
@@ -857,7 +891,7 @@ pub fn sys_timer_getoverrun(timerid: TimerT) -> i64 {
         None => return -22, // EINVAL - timer not found
     };
 
-    timer.getoverrun() as i64
+    i64::from(timer.getoverrun())
 }
 
 /// sys_timer_delete - Delete a POSIX timer
@@ -875,7 +909,7 @@ pub fn sys_timer_delete(timerid: TimerT) -> i64 {
     }
     match delete_posix_timer(tid, timerid) {
         Ok(()) => 0,
-        Err(e) => e as i64,
+        Err(e) => i64::from(e),
     }
 }
 
@@ -918,11 +952,11 @@ fn itimer_real() -> Arc<PosixTimer> {
         if let Some(t) = reg.get(ITIMER_REAL_ID) {
             return t;
         }
-        let t = PosixTimer::new(ITIMER_REAL_ID, 1, tid, SigEvent::default());
+        let t = PosixTimer::itimer(ITIMER_REAL_ID, 1, tid, SigEvent::default(), None);
         reg.add(Arc::clone(&t));
         t
     })
-    .unwrap_or_else(|| PosixTimer::new(ITIMER_REAL_ID, 1, tid, SigEvent::default()))
+    .unwrap_or_else(|| PosixTimer::itimer(ITIMER_REAL_ID, 1, tid, SigEvent::default(), None))
 }
 
 /// The current process's itimer `which`, created on first use
@@ -945,7 +979,7 @@ fn itimer(which: i32) -> Arc<PosixTimer> {
             sample,
         };
         // CLOCK_PROCESS_CPUTIME_ID
-        PosixTimer::with_cpu(id, 2, tid, sev, Some(clock), false)
+        PosixTimer::itimer(id, 2, tid, sev, Some(clock))
     };
     with_timers(tid, |reg| {
         if let Some(t) = reg.get(id) {
@@ -1049,7 +1083,7 @@ pub fn sys_alarm(seconds: u32) -> i64 {
     let spec = ITimerSpec {
         it_interval: crate::time::time_syscall::LinuxTimespec::default(),
         it_value: crate::time::time_syscall::LinuxTimespec {
-            tv_sec: seconds as i64,
+            tv_sec: i64::from(seconds),
             tv_nsec: 0,
         },
     };

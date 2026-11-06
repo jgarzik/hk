@@ -52,7 +52,7 @@ pub const TIMER_PPI: u32 = 30;
 
 /// Get the redistributor base address for the current CPU
 fn gicr_base() -> u64 {
-    let cpu_id = super::cpu::cpu_id() as u64;
+    let cpu_id = u64::from(super::cpu::cpu_id());
     GICR_BASE + (cpu_id * GICR_STRIDE)
 }
 
@@ -218,7 +218,7 @@ pub fn send_sgi(mpidr: u64, intid: u32) {
     let aff0 = aff(0);
     let val = (aff(3) << 48)
         | (aff(2) << 32)
-        | ((intid as u64 & 0xf) << 24)
+        | ((u64::from(intid) & 0xf) << 24)
         | (aff(1) << 16)
         | ((aff0 >> 4) << 44)
         | (1 << (aff0 & 0xf));
@@ -252,11 +252,11 @@ unsafe fn init_distributor() {
     // SPIs start at interrupt 32
     for i in 1..(it_lines / 32) {
         // Group (offset 0x80): set all to Group 1
-        write32(GICD_BASE + 0x0080 + (i * 4) as u64, 0xFFFF_FFFF);
+        write32(GICD_BASE + 0x0080 + u64::from(i * 4), 0xFFFF_FFFF);
 
         // Priority (offset 0x400): each byte is one interrupt
         for j in 0..8 {
-            write32(GICD_IPRIORITYR + (i * 32 + j * 4) as u64, 0x8080_8080);
+            write32(GICD_IPRIORITYR + u64::from(i * 32 + j * 4), 0x8080_8080);
         }
     }
 
@@ -275,7 +275,7 @@ pub enum Trigger {
     /// Level-sensitive (PCI INTx, most device lines)
     Level,
     /// Edge-triggered (platform devices; PCI INTx is level)
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     Edge,
 }
 
@@ -300,7 +300,7 @@ pub fn enable_spi(intid: u32, trigger: Trigger) {
     if !(32..1020).contains(&intid) {
         return;
     }
-    let n = intid as u64;
+    let n = u64::from(intid);
     {
         // Trigger: bit 1 of the 2-bit field (1 = edge, 0 = level)
         let cfg_reg = GICD_ICFGR + (n / 16) * 4;
@@ -331,7 +331,7 @@ pub fn disable_spi(intid: u32) {
     if !(32..1020).contains(&intid) {
         return;
     }
-    let n = intid as u64;
+    let n = u64::from(intid);
     write32(GICD_ICENABLER + (n / 32) * 4, 1 << (n % 32));
     // SAFETY: as in enable_spi
     unsafe { gicd_wait_rwp() };
@@ -371,7 +371,7 @@ pub fn end_interrupt(intid: u32) {
             "msr icc_eoir1_el1, {}",
             // ISB ensures EOI completes before further processing
             "isb",
-            in(reg) intid as u64,
+            in(reg) u64::from(intid),
             options(nostack)
         );
     }

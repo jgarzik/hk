@@ -5,7 +5,14 @@
 #![cfg_attr(not(test), no_std)]
 #![cfg_attr(not(test), no_main)]
 // Host unit tests (`make test`) build only a subset; skip dead-code noise
-#![cfg_attr(test, allow(dead_code, unused))]
+#![cfg_attr(
+    test,
+    allow(
+        dead_code,
+        unused,
+        reason = "host tests build kernel code they do not call"
+    )
+)]
 
 extern crate alloc;
 
@@ -69,7 +76,7 @@ use crate::arch::{
 
 use crate::hw::dma::{DirectDmaOps, dma_init};
 
-#[allow(unused_imports)]
+#[expect(unused_imports)]
 use fs::inode::AsAny; // Trait needed for .as_any() on dyn InodeData
 
 /// Kernel heap: boot arena, then slab (host unit tests use the std
@@ -200,10 +207,7 @@ fn init_numa_topology() {
     #[cfg(target_arch = "x86_64")]
     {
         match arch::x86_64::acpi::init_numa_topology() {
-            Ok(true) => {
-                mm::numa::print_topology();
-                return;
-            }
+            Ok(true) => return,
             Ok(false) => {
                 // No SRAT table, use single-node fallback
             }
@@ -216,10 +220,7 @@ fn init_numa_topology() {
     #[cfg(target_arch = "aarch64")]
     {
         match arch::aarch64::dtb::init_numa_topology() {
-            Ok(true) => {
-                mm::numa::print_topology();
-                return;
-            }
+            Ok(true) => return,
             Ok(false) => {
                 // No numa-node-id properties, use single-node fallback
             }
@@ -351,6 +352,8 @@ fn kmain() -> ! {
 
                 let online = CurrentArch::smp_init(&acpi_info, &mut frame_alloc);
                 smp::init(online as u32);
+                // Every CPU has recorded its node (numa::cpu_up) by now
+                mm::numa::print_topology();
 
                 // Calibrate and start local timer (10ms interval)
                 let ticks_per_ms = CurrentArch::calibrate_and_start_timer(
@@ -480,7 +483,8 @@ fn kmain() -> ! {
     let root_dentry = crate::ns::init_mnt_ns()
         .root_path()
         .expect("VFS root not initialized")
-        .dentry;
+        .dentry
+        .clone();
     match fs::unpack_cpio(initramfs_data, &root_dentry) {
         Ok(n) => printkln!("initramfs: {} files", n),
         Err(e) => {
@@ -638,7 +642,7 @@ pub fn init_vfat_ramdisk(
 /// Panic handler (only for bare metal)
 #[cfg(not(test))]
 #[panic_handler]
-fn panic(info: &PanicInfo) -> ! {
+fn panic(info: &PanicInfo<'_>) -> ! {
     // Disable interrupts to prevent further issues
     CurrentArch::disable_interrupts();
 

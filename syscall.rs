@@ -504,7 +504,7 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
             }
         }
         Sys::Keyctl => crate::keys::sys_keyctl(a[0] as i32, a[1], a[2], a[3], a[4]) as u64,
-        Sys::Kill => crate::signal::syscall::sys_kill(a[0] as i32 as i64, a[1] as u32) as u64,
+        Sys::Kill => crate::signal::syscall::sys_kill(i64::from(a[0] as i32), a[1] as u32) as u64,
         Sys::Lgetxattr => crate::fs::syscall::sys_lgetxattr(a[0], a[1], a[2], a[3]) as u64,
         Sys::Linkat => {
             crate::fs::syscall::sys_linkat(a[0] as i32, a[1], a[2] as i32, a[3], a[4] as i32) as u64
@@ -525,7 +525,7 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
             crate::task::membarrier::sys_membarrier(a[0] as i32, a[1] as u32, a[2] as i32) as u64
         }
         Sys::MigratePages => {
-            crate::mm::mempolicy::sys_migrate_pages(a[0] as i32 as i64, a[1], a[2], a[3]) as u64
+            crate::mm::mempolicy::sys_migrate_pages(i64::from(a[0] as i32), a[1], a[2], a[3]) as u64
         }
         Sys::Mincore => crate::mm::syscall::sys_mincore(a[0], a[1], a[2]) as u64,
         Sys::Mkdirat => crate::fs::syscall::sys_mkdirat(a[0] as i32, a[1], a[2] as u32) as u64,
@@ -541,7 +541,7 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
         }
         Sys::Mount => crate::fs::syscall::sys_mount(a[0], a[1], a[2], a[3], a[4]) as u64,
         Sys::MovePages => crate::mm::mempolicy::sys_move_pages(
-            a[0] as i32 as i64,
+            i64::from(a[0] as i32),
             a[1],
             a[2],
             a[3],
@@ -584,7 +584,7 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
             crate::task::syscall::sys_pidfd_getfd(a[0] as i32, a[1] as i32, a[2] as u32) as u64
         }
         Sys::PidfdOpen => {
-            crate::task::syscall::sys_pidfd_open(a[0] as i32 as i64, a[1] as u32) as u64
+            crate::task::syscall::sys_pidfd_open(i64::from(a[0] as i32), a[1] as u32) as u64
         }
         Sys::PidfdSendSignal => {
             crate::task::syscall::sys_pidfd_send_signal(a[0] as i32, a[1] as i32, a[2], a[3] as u32)
@@ -626,7 +626,7 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
             crate::fs::syscall::sys_pselect6(a[0] as i32, a[1], a[2], a[3], a[4], a[5]) as u64
         }
         Sys::Ptrace => {
-            crate::task::ptrace::sys_ptrace(a[0] as i64, a[1] as i32 as i64, a[2], a[3]) as u64
+            crate::task::ptrace::sys_ptrace(a[0] as i64, i64::from(a[1] as i32), a[2], a[3]) as u64
         }
         Sys::Pwrite64 => {
             crate::fs::syscall::sys_pwrite64(a[0] as i32, a[1], a[2], a[3] as i64) as u64
@@ -675,7 +675,7 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
             crate::signal::syscall::sys_rt_sigprocmask(a[0] as i32, a[1], a[2], a[3]) as u64
         }
         Sys::RtSigqueueinfo => {
-            crate::signal::syscall::sys_rt_sigqueueinfo(a[0] as i32 as i64, a[1] as u32, a[2])
+            crate::signal::syscall::sys_rt_sigqueueinfo(i64::from(a[0] as i32), a[1] as u32, a[2])
                 as u64
         }
         Sys::RtSigsuspend => crate::signal::syscall::sys_rt_sigsuspend(a[0], a[1]) as u64,
@@ -683,34 +683,36 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
             crate::signal::syscall::sys_rt_sigtimedwait(a[0], a[1], a[2], a[3]) as u64
         }
         Sys::RtTgsigqueueinfo => crate::signal::syscall::sys_rt_tgsigqueueinfo(
-            a[0] as i32 as i64,
-            a[1] as i32 as i64,
+            i64::from(a[0] as i32),
+            i64::from(a[1] as i32),
             a[2] as u32,
             a[3],
         ) as u64,
-        Sys::SchedGetaffinity => {
-            crate::task::syscall::sys_sched_getaffinity::<Uaccess>(a[0] as i32 as i64, a[1], a[2])
-                as u64
-        }
+        Sys::SchedGetaffinity => crate::task::syscall::sys_sched_getaffinity::<Uaccess>(
+            i64::from(a[0] as i32),
+            a[1],
+            a[2],
+        ) as u64,
         Sys::SchedGetparam => {
-            crate::task::syscall::sys_sched_getparam::<Uaccess>(a[0] as i32 as i64, a[1]) as u64
+            crate::task::syscall::sys_sched_getparam::<Uaccess>(i64::from(a[0] as i32), a[1]) as u64
         }
         Sys::SchedGetscheduler => {
-            crate::task::syscall::sys_sched_getscheduler(a[0] as i32 as i64) as u64
+            crate::task::syscall::sys_sched_getscheduler(i64::from(a[0] as i32)) as u64
         }
         Sys::SchedRrGetInterval => {
-            crate::task::syscall::sys_sched_rr_get_interval::<Uaccess>(a[0] as i32 as i64, a[1])
+            crate::task::syscall::sys_sched_rr_get_interval::<Uaccess>(i64::from(a[0] as i32), a[1])
                 as u64
         }
-        Sys::SchedSetaffinity => {
-            crate::task::syscall::sys_sched_setaffinity::<Uaccess>(a[0] as i32 as i64, a[1], a[2])
-                as u64
-        }
+        Sys::SchedSetaffinity => crate::task::syscall::sys_sched_setaffinity::<Uaccess>(
+            i64::from(a[0] as i32),
+            a[1],
+            a[2],
+        ) as u64,
         Sys::SchedSetparam => {
-            crate::task::syscall::sys_sched_setparam::<Uaccess>(a[0] as i32 as i64, a[1]) as u64
+            crate::task::syscall::sys_sched_setparam::<Uaccess>(i64::from(a[0] as i32), a[1]) as u64
         }
         Sys::SchedSetscheduler => crate::task::syscall::sys_sched_setscheduler::<Uaccess>(
-            a[0] as i32 as i64,
+            i64::from(a[0] as i32),
             a[1] as i32,
             a[2],
         ) as u64,
@@ -848,10 +850,11 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
         Sys::Tee => {
             crate::fs::splice::sys_tee(a[0] as i32, a[1] as i32, a[2] as usize, a[3] as u32) as u64
         }
-        Sys::Tgkill => {
-            crate::signal::syscall::sys_tgkill(a[0] as i32 as i64, a[1] as i32 as i64, a[2] as u32)
-                as u64
-        }
+        Sys::Tgkill => crate::signal::syscall::sys_tgkill(
+            i64::from(a[0] as i32),
+            i64::from(a[1] as i32),
+            a[2] as u32,
+        ) as u64,
         Sys::TimerfdCreate => {
             crate::time::time_syscall::sys_timerfd_create(a[0] as i32, a[1] as i32) as u64
         }
@@ -872,7 +875,7 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
             crate::time::posix_timer::sys_timer_settime(a[0] as i32, a[1] as i32, a[2], a[3]) as u64
         }
         Sys::Times => crate::task::syscall::sys_times::<Uaccess>(a[0]) as u64,
-        Sys::Tkill => crate::signal::syscall::sys_tkill(a[0] as i32 as i64, a[1] as u32) as u64,
+        Sys::Tkill => crate::signal::syscall::sys_tkill(i64::from(a[0] as i32), a[1] as u32) as u64,
         Sys::Truncate => crate::fs::syscall::sys_truncate(a[0], a[1] as i64) as u64,
         Sys::Umask => crate::fs::syscall::sys_umask(a[0] as u32) as u64,
         Sys::Umount2 => crate::fs::syscall::sys_umount2(a[0], a[1] as i32) as u64,
@@ -887,7 +890,7 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
             crate::fs::splice::sys_vmsplice(a[0] as i32, a[1], a[2] as usize, a[3] as u32) as u64
         }
         Sys::Wait4 => {
-            crate::task::syscall::sys_wait4(a[0] as i32 as i64, a[1], a[2] as i32, a[3]) as u64
+            crate::task::syscall::sys_wait4(i64::from(a[0] as i32), a[1], a[2] as i32, a[3]) as u64
         }
         Sys::Waitid => {
             crate::task::syscall::sys_waitid(a[0] as i32, a[1], a[2], a[3] as i32, a[4]) as u64

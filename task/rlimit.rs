@@ -17,7 +17,7 @@
 //! - Fork creates independent rlimit copies
 //! - prlimit64 can modify another process's rlimits
 
-#![allow(dead_code)]
+#![expect(dead_code)]
 
 use crate::arch::Uaccess;
 use crate::signal::get_task_signal_struct;
@@ -182,7 +182,7 @@ pub fn rlimit(resource: u32) -> u64 {
 /// Convenience function: get hard limit for current task
 ///
 /// Returns RLIM_INFINITY if the task or resource doesn't exist.
-#[allow(dead_code)]
+#[expect(dead_code)]
 pub fn rlimit_max(resource: u32) -> u64 {
     let tid = current_tid();
     get_task_rlimit(tid, resource)
@@ -260,7 +260,7 @@ pub fn sys_setrlimit(resource: u32, rlim_ptr: u64) -> i64 {
 
     match set_task_rlimit(tid, resource, new_rlim) {
         Ok(_) => 0,
-        Err(e) => e as i64,
+        Err(e) => i64::from(e),
     }
 }
 
@@ -327,7 +327,7 @@ pub fn sys_prlimit64(pid: i32, resource: u32, new_rlim_ptr: u64, old_rlim_ptr: u
     let old = match new {
         Some(new) => match set_task_rlimit(target_tid, resource, new) {
             Ok(old) => old,
-            Err(e) => return e as i64,
+            Err(e) => return i64::from(e),
         },
         None => match get_task_rlimit(target_tid, resource) {
             Some(r) => r,

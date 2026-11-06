@@ -64,13 +64,8 @@ getxattr/listxattr/getdents), or allocated fallibly (`kmem::try_vec` /
 
 Allocations unbounded by input are in BUGS.md ("Allocation sizing and pure-code gaps").
 
-Validated, but the bound allows order 4. Infallible allocation then means a panic if the
-heap is out of memory (the vmalloc fallback covers fragmentation in sleepable context),
-where Linux's kvmalloc caller returns ENOMEM. Switch to `kmem::try_vec`.
-
-| site | n source / check | max bytes |
-|---|---|---|
-| `fs/misc.rs` xattr value buffers (`vec![0u8; size]` in set/get) | `<= XATTR_SIZE_MAX` | 64 KiB |
+Validated sites whose bound allows order 4 use `kmem::try_vec`
+(ENOMEM, as Linux's kvmalloc callers).
 
 ## 3. Conversion opportunities (hot paths first)
 

@@ -86,6 +86,11 @@ pub struct NumaTopology {
     pub node_online_mask: u64,
     /// Whether topology has been initialized
     pub initialized: bool,
+    /// ACPI proximity domain of each node, in the order first seen
+    /// (Linux node_to_pxm_map): node numbers run from 0 whatever the
+    /// firmware's domain numbers
+    pxm: [u32; MAX_NUMA_NODES],
+    nr_pxm: usize,
 }
 
 impl Default for NumaTopology {
@@ -106,7 +111,28 @@ impl NumaTopology {
             distance: [[0; MAX_NUMA_NODES]; MAX_NUMA_NODES],
             node_online_mask: 0,
             initialized: false,
+            pxm: [0; MAX_NUMA_NODES],
+            nr_pxm: 0,
         }
+    }
+
+    /// The node of ACPI proximity domain `pxm`, numbering it if new
+    /// (Linux acpi_map_pxm_to_node); None once every node is taken
+    pub fn acpi_map_pxm(&mut self, pxm: u32) -> Option<usize> {
+        if let Some(n) = self.pxm_to_node(pxm) {
+            return Some(n);
+        }
+        if self.nr_pxm == MAX_NUMA_NODES {
+            return None;
+        }
+        self.pxm[self.nr_pxm] = pxm;
+        self.nr_pxm += 1;
+        Some(self.nr_pxm - 1)
+    }
+
+    /// The node proximity domain `pxm` was numbered (Linux pxm_to_node)
+    pub fn pxm_to_node(&self, pxm: u32) -> Option<usize> {
+        self.pxm[..self.nr_pxm].iter().position(|&p| p == pxm)
     }
 
     /// Initialize with a single-node fallback topology
@@ -172,7 +198,7 @@ impl NumaTopology {
     /// Get the NUMA node for a given CPU
     pub fn cpu_to_node(&self, cpu: u32) -> u32 {
         if (cpu as usize) < NR_CPUS {
-            self.cpu_to_node[cpu as usize] as u32
+            u32::from(self.cpu_to_node[cpu as usize])
         } else {
             0 // Default to node 0
         }
@@ -260,7 +286,7 @@ impl NumaTopology {
         self.hwid_node[..self.nr_hwid]
             .iter()
             .find(|e| e.0 == hwid)
-            .map(|e| e.1 as u32)
+            .map(|e| u32::from(e.1))
             .filter(|&n| self.node_online(n))
             .unwrap_or(self.node_online_mask.trailing_zeros() % 64)
     }
@@ -334,6 +360,22 @@ pub fn print_topology() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Sparse and large proximity domains get node numbers from 0 in
+    /// the order seen; past MAX_NUMA_NODES distinct domains, none
+    #[test]
+    fn pxm_numbering() {
+        let mut t = NumaTopology::new();
+        assert_eq!(t.acpi_map_pxm(7), Some(0));
+        assert_eq!(t.acpi_map_pxm(300), Some(1));
+        assert_eq!(t.acpi_map_pxm(7), Some(0));
+        assert_eq!(t.pxm_to_node(300), Some(1));
+        assert_eq!(t.pxm_to_node(5), None);
+        for p in 1000..1000 + MAX_NUMA_NODES as u32 - 2 {
+            assert!(t.acpi_map_pxm(p).is_some());
+        }
+        assert_eq!(t.acpi_map_pxm(99_999), None);
+    }
 
     #[test]
     fn test_single_node_init() {

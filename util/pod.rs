@@ -65,7 +65,10 @@ pub unsafe trait IntoBytes: Copy {
     fn as_bytes(&self) -> &[u8] {
         // SAFETY: the value's own memory, all initialized (trait)
         unsafe {
-            core::slice::from_raw_parts((self as *const Self).cast::<u8>(), size_of::<Self>())
+            core::slice::from_raw_parts(
+                core::ptr::from_ref::<Self>(self).cast::<u8>(),
+                size_of::<Self>(),
+            )
         }
     }
 }
@@ -78,7 +81,10 @@ pub trait Pod: FromBytes + IntoBytes {
         // SAFETY: the value's own memory, initialized (IntoBytes); any
         // bytes written are a valid value (FromBytes)
         unsafe {
-            core::slice::from_raw_parts_mut((self as *mut Self).cast::<u8>(), size_of::<Self>())
+            core::slice::from_raw_parts_mut(
+                core::ptr::from_mut::<Self>(self).cast::<u8>(),
+                size_of::<Self>(),
+            )
         }
     }
 }

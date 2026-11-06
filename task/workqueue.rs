@@ -39,6 +39,7 @@
 
 extern crate alloc;
 
+use crate::util::kalloc::{arc_nofail, box_nofail};
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
@@ -103,7 +104,9 @@ impl Work {
     /// Create a new work item with the given callback
     pub fn new<F: FnMut() + Send + 'static>(func: F) -> Self {
         Self {
-            func: Some(Box::new(func)),
+            // Like INIT_WORK, a work item cannot fail to be made: its
+            // callers (and DelayedWork's) have no error path
+            func: Some(box_nofail(func)),
             state: 0,
         }
     }
@@ -385,7 +388,8 @@ impl Workqueue {
                 let mut work = Work::new(move || Work::run_delayed(&dw, seq));
                 // The wrapper is fresh: mark it pending like queue_work
                 work.try_set_pending();
-                inner.pending.push_back(Arc::new(Mutex::new(work)));
+                // The worker thread: failure cannot be reported
+                inner.pending.push_back(arc_nofail(Mutex::new(work)));
                 inner.has_work = true;
             } else {
                 drop(g);
@@ -462,7 +466,7 @@ impl Workqueue {
         let k = crate::task::kthread::kthread_run(
             self.name,
             worker_thread_fn,
-            self as *const Workqueue as usize,
+            core::ptr::from_ref::<Workqueue>(self) as usize,
             cpu,
         )?;
         self.inner.lock().worker_tid = k.tid();
@@ -519,7 +523,6 @@ pub fn init() {
 ///
 /// Waits for all currently pending work items to complete (runs them
 /// synchronously in the caller if the queue has no worker).
-#[allow(dead_code)]
 pub fn flush_workqueue(wq: &Workqueue) {
     while wq.has_pending() {
         wq.process_pending();

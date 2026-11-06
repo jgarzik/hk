@@ -28,8 +28,8 @@
 //! - poll/epoll support for integration with event loops
 //! - Multiple watches per inotify instance
 //! - Watch descriptors (wd) are unique per instance
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
+use crate::util::kalloc::try_arc;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -38,9 +38,11 @@ use core::sync::atomic::{AtomicI32, Ordering};
 
 use crate::arch::IrqSpinlock;
 use crate::fs::KernelError;
-use crate::fs::file::{File, FileOps, flags};
+use crate::fs::file::{File, FileOps, RwFlags, flags, stream_rw};
+use crate::fs::iov_iter::IovDest;
 use crate::io::poll::{POLLIN, POLLRDNORM, PollTable};
 use crate::sync::waitqueue::WaitQueue;
+use crate::util::pod::IntoBytes;
 
 // =============================================================================
 // Inotify Constants (Linux ABI)
@@ -143,6 +145,13 @@ pub struct InotifyEventHeader {
     pub len: u32,
 }
 
+crate::pod!(InotifyEventHeader {
+    wd,
+    mask,
+    cookie,
+    len
+});
+
 const INOTIFY_EVENT_HEADER_SIZE: usize = core::mem::size_of::<InotifyEventHeader>();
 
 // =============================================================================
@@ -152,12 +161,12 @@ const INOTIFY_EVENT_HEADER_SIZE: usize = core::mem::size_of::<InotifyEventHeader
 /// An inotify watch on a specific path
 struct InotifyWatch {
     /// Watch descriptor (unique within instance)
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     wd: i32,
     /// Events to watch for
     mask: u32,
     /// Path being watched (for reference)
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     path: crate::fs::name::FileName,
     /// Inode number of watched file/dir
     ino: u64,
@@ -180,16 +189,36 @@ struct QueuedEvent {
 }
 
 impl QueuedEvent {
+    /// Bytes of the name field: the name, its NUL and padding to a
+    /// multiple of the header size (16 bytes); 0 without a name
+    fn name_field_len(&self) -> usize {
+        self.name.as_ref().map_or(0, |n| (n.len() + 1 + 15) & !15)
+    }
+
     /// Calculate total size of this event when serialized
     fn serialized_size(&self) -> usize {
-        let name_len = self.name.as_ref().map(|n| n.len() + 1).unwrap_or(0);
-        // Pad to multiple of inotify_event size (16 bytes)
-        let padded_len = if name_len > 0 {
-            (name_len + 15) & !15
-        } else {
-            0
+        INOTIFY_EVENT_HEADER_SIZE + self.name_field_len()
+    }
+
+    /// Copy the event out whole (Linux copy_event_to_user): EFAULT if
+    /// a fault cuts it short
+    fn copy_out(&self, to: &mut IovDest<'_>) -> Result<usize, KernelError> {
+        let len = self.name_field_len();
+        let header = InotifyEventHeader {
+            wd: self.wd,
+            mask: self.mask,
+            cookie: self.cookie,
+            len: len as u32,
         };
-        INOTIFY_EVENT_HEADER_SIZE + padded_len
+        to.copy_to_full(header.as_bytes())?;
+        if let Some(name) = &self.name {
+            to.copy_to_full(name.as_bytes())?;
+            let pad = len - name.len();
+            if to.zero(pad)? != pad {
+                return Err(KernelError::BadAddress);
+            }
+        }
+        Ok(INOTIFY_EVENT_HEADER_SIZE + len)
     }
 }
 
@@ -206,7 +235,7 @@ struct InotifyInner {
     /// Queued events
     events: Vec<QueuedEvent>,
     /// Cookie counter for rename events (reserved for future use)
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     next_cookie: u32,
 }
 
@@ -223,8 +252,8 @@ static NEXT_RENAME_COOKIE: AtomicI32 = AtomicI32::new(1);
 
 impl Inotify {
     /// Create a new inotify instance
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self {
+    pub fn new() -> Result<Arc<Self>, KernelError> {
+        try_arc(Self {
             inner: IrqSpinlock::new(InotifyInner {
                 next_wd: 1,
                 watches: BTreeMap::new(),
@@ -338,96 +367,47 @@ impl Inotify {
         !self.inner.lock().events.is_empty()
     }
 
-    /// Read events from the inotify instance
-    pub fn read(&self, buf: &mut [u8], nonblock: bool) -> Result<usize, KernelError> {
-        // Buffer must be at least big enough for one event header
-        if buf.len() < INOTIFY_EVENT_HEADER_SIZE {
-            return Err(KernelError::InvalidArgument);
-        }
-
-        loop {
-            let mut inner = self.inner.lock();
-
-            if !inner.events.is_empty() {
-                let mut bytes_written = 0;
-
-                // Copy as many events as will fit
-                while !inner.events.is_empty() {
-                    let event = &inner.events[0];
-                    let event_size = event.serialized_size();
-
-                    if bytes_written + event_size > buf.len() {
-                        if bytes_written == 0 {
-                            // First event doesn't fit
-                            return Err(KernelError::InvalidArgument);
-                        }
-                        break;
-                    }
-
-                    // Remove event from queue
-                    let event = inner.events.remove(0);
-
-                    // Serialize header
-                    let name_len = event.name.as_ref().map(|n| n.len() + 1).unwrap_or(0);
-                    let padded_len = if name_len > 0 {
-                        (name_len + 15) & !15
-                    } else {
-                        0
-                    };
-
-                    let header = InotifyEventHeader {
-                        wd: event.wd,
-                        mask: event.mask,
-                        cookie: event.cookie,
-                        len: padded_len as u32,
-                    };
-
-                    // Copy header
-                    let header_bytes = unsafe {
-                        core::slice::from_raw_parts(
-                            &header as *const InotifyEventHeader as *const u8,
-                            INOTIFY_EVENT_HEADER_SIZE,
-                        )
-                    };
-                    buf[bytes_written..bytes_written + INOTIFY_EVENT_HEADER_SIZE]
-                        .copy_from_slice(header_bytes);
-                    bytes_written += INOTIFY_EVENT_HEADER_SIZE;
-
-                    // Copy name if present
-                    if let Some(name) = event.name {
-                        let name_bytes = name.as_bytes();
-                        buf[bytes_written..bytes_written + name_bytes.len()]
-                            .copy_from_slice(name_bytes);
-                        bytes_written += name_bytes.len();
-                        // Null terminator
-                        buf[bytes_written] = 0;
-                        bytes_written += 1;
-                        // Padding
-                        let padding = padded_len - name_bytes.len() - 1;
-                        for i in 0..padding {
-                            buf[bytes_written + i] = 0;
-                        }
-                        bytes_written += padding;
-                    }
-                }
-
-                return Ok(bytes_written);
-            }
-
-            drop(inner);
-
+    /// The oldest event if it fits in `room` bytes (EINVAL if not),
+    /// waiting for one unless `nonblock` (Linux get_one_event)
+    fn get_event(&self, room: usize, nonblock: bool) -> Result<QueuedEvent, KernelError> {
+        let mut inner = self.inner.lock();
+        if inner.events.is_empty() {
             if nonblock {
                 return Err(KernelError::WouldBlock);
             }
-
             // Wait for events (a signal ends the wait)
             self.wait_queue
-                .wait_event_interruptible(|| !self.inner.lock().events.is_empty())?;
+                .wait_event_interruptible_locked(&mut inner, |i| !i.events.is_empty())?;
+        }
+        if inner.events[0].serialized_size() > room {
+            return Err(KernelError::InvalidArgument);
+        }
+        Ok(inner.events.remove(0))
+    }
+
+    /// Read events into `to` (Linux inotify_read): each is taken off
+    /// the queue under the lock and copied out after it. Blocks only
+    /// while nothing was read; a first event too big for the buffer is
+    /// EINVAL. A fault loses the event and is EFAULT even after earlier
+    /// events were copied (Linux).
+    pub fn read(&self, to: &mut IovDest<'_>, nonblock: bool) -> Result<usize, KernelError> {
+        // Buffer must be at least big enough for one event header
+        if to.len() < INOTIFY_EVENT_HEADER_SIZE {
+            return Err(KernelError::InvalidArgument);
+        }
+        let mut done = 0;
+        loop {
+            let event = match self.get_event(to.len(), nonblock || done > 0) {
+                Ok(e) => e,
+                Err(_) if done > 0 => return Ok(done),
+                Err(e) => return Err(e),
+            };
+            done += event.copy_out(to)?;
         }
     }
 
     /// Poll for readiness
-    pub fn poll(&self, pt: Option<&mut PollTable>) -> u16 {
+    pub fn poll(&self, pt: Option<&mut PollTable<'_>>) -> u16 {
         if let Some(poll_table) = pt {
             poll_table.poll_wait(&self.wait_queue);
         }
@@ -460,17 +440,20 @@ impl FileOps for InotifyFileOps {
         self
     }
 
-    fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {
+    fn read_iter(
+        &self,
+        file: &File,
+        to: &mut IovDest<'_>,
+        at: Option<u64>,
+        flags: RwFlags,
+    ) -> Result<usize, KernelError> {
+        stream_rw(at, flags)?;
         let inotify = file.private_ref::<Inotify>().ok_or(KernelError::BadFd)?;
         let nonblock = file.get_flags() & flags::O_NONBLOCK != 0;
-        inotify.read(buf, nonblock)
+        inotify.read(to, nonblock)
     }
 
-    fn write(&self, _file: &File, _buf: &[u8]) -> Result<usize, KernelError> {
-        Err(KernelError::InvalidArgument)
-    }
-
-    fn poll(&self, file: &File, pt: Option<&mut PollTable>) -> u16 {
+    fn poll(&self, file: &File, pt: Option<&mut PollTable<'_>>) -> u16 {
         let Some(inotify) = file.private_ref::<Inotify>() else {
             return crate::io::poll::POLLERR;
         };
@@ -490,7 +473,7 @@ impl FileOps for InotifyFileOps {
 /// # Returns
 /// Arc<File> for the new inotify fd
 pub fn create_inotify(in_flags: i32) -> Result<Arc<File>, KernelError> {
-    let inotify = Inotify::new();
+    let inotify = Inotify::new()?;
 
     // Create dummy dentry for inotify
 
@@ -501,7 +484,7 @@ pub fn create_inotify(in_flags: i32) -> Result<Arc<File>, KernelError> {
     }
 
     let file =
-        crate::fs::anon_inodes::anon_inode_getfile("inotify", &INOTIFY_FOPS, inotify, file_flags);
+        crate::fs::anon_inodes::anon_inode_getfile("inotify", &INOTIFY_FOPS, inotify, file_flags)?;
     Ok(file)
 }
 
@@ -511,7 +494,6 @@ pub fn get_inotify(file: &File) -> Option<Arc<Inotify>> {
 }
 
 /// Generate a unique cookie for rename event pairing
-#[allow(dead_code)]
 pub fn generate_cookie() -> u32 {
     NEXT_RENAME_COOKIE.fetch_add(1, Ordering::Relaxed) as u32
 }
@@ -567,8 +549,8 @@ pub fn sys_inotify_init1(in_flags: i32) -> i64 {
     };
 
     match table.alloc_with_flags(file, fd_flags, nofile_limit) {
-        Ok(fd) => fd as i64,
-        Err(e) => -(e as i64),
+        Ok(fd) => i64::from(fd),
+        Err(e) => -i64::from(e),
     }
 }
 
@@ -624,8 +606,8 @@ pub fn sys_inotify_add_watch(fd: i32, pathname_ptr: u64, mask: u32) -> i64 {
 
     // Add watch
     match inotify.add_watch(&pathname, mask, ino) {
-        Ok(wd) => wd as i64,
-        Err(e) => e as i64,
+        Ok(wd) => i64::from(wd),
+        Err(e) => i64::from(e),
     }
 }
 
@@ -655,7 +637,7 @@ pub fn sys_inotify_rm_watch(fd: i32, wd: i32) -> i64 {
     // Remove watch
     match inotify.rm_watch(wd) {
         Ok(()) => 0,
-        Err(e) => e as i64,
+        Err(e) => i64::from(e),
     }
 }
 

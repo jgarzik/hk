@@ -9,6 +9,7 @@
 //! - `cgroup.freeze`: Write 1 to freeze, 0 to thaw
 //! - `cgroup.events` (core): shows whether it is frozen
 
+use crate::util::kalloc::try_arc;
 use alloc::format;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -49,7 +50,7 @@ impl CgroupSubsysOps for FreezerController {
         parent_css: Option<&Arc<CgroupSubsysState>>,
     ) -> Result<Arc<dyn CssPrivate>, KernelError> {
         let _ = parent_css;
-        Ok(Arc::new(FreezerState))
+        Ok(try_arc(FreezerState)?)
     }
 
     fn css_free(&self, _css: &CgroupSubsysState) {
@@ -77,7 +78,7 @@ static FREEZER_FILES: [ControlFile; 1] = [ControlFile {
 /// cgrp->freezer.freeze, ancestors aside)
 fn freeze_read(css: &CgroupSubsysState) -> Result<Vec<u8>, KernelError> {
     let cgroup = css.cgroup().ok_or(KernelError::Io)?;
-    Ok(format!("{}\n", cgroup.self_frozen() as u8).into_bytes())
+    Ok(format!("{}\n", u8::from(cgroup.self_frozen())).into_bytes())
 }
 
 /// Write cgroup.freeze ("0" or "1"); the cgroupfs write holds

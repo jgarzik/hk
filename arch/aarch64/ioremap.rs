@@ -8,10 +8,11 @@
 //! already mapped with device attributes at IO_BASE + phys (kmap.rs);
 //! other addresses get pages in the ioremap window. Both are in TTBR1,
 //! shared by every address space.
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use crate::mm::tlb::flush_tlb_kernel_range;
 use crate::sync::spin::Mutex;
+use crate::util::scope::ScopeGuard;
 use core::arch::asm;
 
 use super::paging::{
@@ -227,22 +228,23 @@ pub unsafe fn ioremap(phys_addr: u64, size: u64) -> Result<*mut u8, IoremapError
     // Kernel (TTBR1) table
     let l0_phys = super::kmap::swapper_phys();
 
-    // Map each page with device memory attributes
-    for i in 0..num_pages {
-        let va = virt_base + (i as u64) * PAGE_SIZE;
-        let pa = aligned_phys + (i as u64) * PAGE_SIZE;
-
-        if let Err(e) = map_device_page(l0_phys, va, pa) {
-            // Rollback: unmap pages we've already mapped
-            for j in 0..i {
-                let rollback_va = virt_base + (j as u64) * PAGE_SIZE;
-                unmap_page(l0_phys, rollback_va);
-            }
-            flush_tlb_kernel_range(virt_base, virt_base + aligned_size);
-            IOREMAP.lock().free(virt_base, num_pages);
-            return Err(e);
+    // Map each page with device memory attributes; on failure, unmap the ones mapped and free the range
+    let mut mapped = ScopeGuard::new_with_data(0u64, |n| {
+        for j in 0..n {
+            unmap_page(l0_phys, virt_base + j * PAGE_SIZE);
         }
+        flush_tlb_kernel_range(virt_base, virt_base + aligned_size);
+        IOREMAP.lock().free(virt_base, num_pages);
+    });
+    for i in 0..aligned_size / PAGE_SIZE {
+        map_device_page(
+            l0_phys,
+            virt_base + i * PAGE_SIZE,
+            aligned_phys + i * PAGE_SIZE,
+        )?;
+        *mapped += 1;
     }
+    mapped.dismiss();
 
     // Make the entries visible on every CPU (a stale entry of a range
     // used before is already gone: iounmap flushed it)
@@ -264,7 +266,6 @@ pub fn retarget(va: u64, pa: u64) -> Result<(), IoremapError> {
 }
 
 /// Unmap a previously ioremap'd region
-#[allow(dead_code)]
 pub fn iounmap(virt_addr: *mut u8, size: u64) {
     let virt = virt_addr as u64;
 
@@ -357,7 +358,7 @@ fn map_page(l0_phys: u64, va: u64, pa: u64, attrs: u64) -> Result<(), IoremapErr
         l3_entry.set_page(pa, attrs);
 
         // Data cache clean to ensure MMU sees the new entry
-        let entry_addr = l3_entry as *mut PageTableEntry as u64;
+        let entry_addr = core::ptr::from_mut::<PageTableEntry>(l3_entry) as u64;
         asm!(
             "dc cvau, {}",
             "dsb ish",
@@ -400,7 +401,7 @@ fn unmap_page(l0_phys: u64, va: u64) -> Option<u64> {
         l3_entry.clear();
 
         // Data cache clean
-        let entry_addr = l3_entry as *mut PageTableEntry as u64;
+        let entry_addr = core::ptr::from_mut::<PageTableEntry>(l3_entry) as u64;
         asm!(
             "dc cvau, {}",
             "dsb ish",

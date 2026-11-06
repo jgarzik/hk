@@ -14,8 +14,10 @@
 
 use crate::sync::spin::Mutex;
 
-/// Ranges per set (Linux INIT_MEMBLOCK_REGIONS)
-pub const MAX_REGIONS: usize = 128;
+/// Ranges per set: four times Linux INIT_MEMBLOCK_REGIONS (hk does not
+/// grow the arrays later, Linux memblock_double_array); the largest
+/// firmware maps have a few hundred entries
+pub const MAX_REGIONS: usize = 512;
 
 const PAGE: u64 = 4096;
 
@@ -74,21 +76,38 @@ impl RangeSet {
         true
     }
 
-    /// Remove [base, end) (splitting a range that straddles it). False
-    /// if a split found the set full (the set is then unchanged).
+    /// Remove [base, end) (splitting a range that straddles it), in
+    /// place. False if a split found the set full (the set is then
+    /// unchanged).
     pub fn remove(&mut self, base: u64, end: u64) -> bool {
         if base >= end {
             return true;
         }
-        let mut out = RangeSet::new();
-        for x in self.ranges() {
-            for (b, e) in [(x.base, x.end.min(base)), (x.base.max(end), x.end)] {
-                if b < e && !out.add(b, e) {
-                    return false;
-                }
-            }
+        let lo = self.r[..self.n].partition_point(|x| x.end <= base);
+        let hi = self.r[..self.n].partition_point(|x| x.base < end);
+        if lo >= hi {
+            return true;
         }
-        *self = out;
+        let first = self.r[lo];
+        let last = self.r[hi - 1];
+        let left = (first.base < base).then_some(Range {
+            base: first.base,
+            end: base,
+        });
+        let right = (last.end > end).then_some(Range {
+            base: end,
+            end: last.end,
+        });
+        let keep = usize::from(left.is_some()) + usize::from(right.is_some());
+        let n = self.n - (hi - lo) + keep;
+        if n > MAX_REGIONS {
+            return false;
+        }
+        self.r.copy_within(hi..self.n, lo + keep);
+        for (i, piece) in left.into_iter().chain(right).enumerate() {
+            self.r[lo + i] = piece;
+        }
+        self.n = n;
         true
     }
 
@@ -125,6 +144,15 @@ fn outer(base: u64, size: u64) -> (u64, u64) {
     (base.min(PHYS_LIMIT) & !(PAGE - 1), end)
 }
 
+/// RAM at [b, e) did not fit the memory map (Linux memblock_add's
+/// error). Host tests do not print: printk needs the kernel's per-CPU
+/// state, which an arm64 host cannot read from user mode.
+fn warn_dropped(b: u64, e: u64) {
+    if !cfg!(test) {
+        crate::printkln!("memblock: memory map full, ignoring RAM {b:#x}-{e:#x}");
+    }
+}
+
 /// RAM and reserved ranges, plus the highest address early allocations
 /// may use (Linux memblock.current_limit)
 pub struct Memblock {
@@ -144,15 +172,40 @@ impl Memblock {
 
     /// RAM at [base, base + size), trimmed to whole pages; firmware
     /// ranges past the physical address limit or wrapping are clipped
+    /// A range that does not fit is dropped with a warning: that RAM goes
+    /// unused, the boot goes on (Linux memblock_add failing before
+    /// resizing is allowed)
     pub fn add(&mut self, base: u64, size: u64) {
         let (b, e) = inner(base, size);
-        assert!(self.memory.add(b, e), "memblock: too many memory ranges");
+        if !self.memory.add(b, e) {
+            warn_dropped(b, e);
+        }
     }
 
-    /// Forget RAM at [base, base + size) (e.g. past the direct map)
+    /// Forget RAM at [base, base + size) (e.g. past the direct map); if
+    /// a split finds the set full, that RAM stays unused as well: the
+    /// whole range straddling the hole is dropped
     pub fn remove(&mut self, base: u64, size: u64) {
         let (b, e) = outer(base, size);
-        assert!(self.memory.remove(b, e), "memblock: too many memory ranges");
+        if !self.memory.remove(b, e) {
+            self.drop_straddling(b, e);
+        }
+    }
+
+    /// Remove every memory range meeting [b, e) whole
+    fn drop_straddling(&mut self, b: u64, e: u64) {
+        let m = &mut self.memory;
+        let mut kept = 0;
+        for i in 0..m.n {
+            let x = m.r[i];
+            if x.end <= b || x.base >= e {
+                m.r[kept] = x;
+                kept += 1;
+            } else {
+                warn_dropped(x.base, x.end);
+            }
+        }
+        m.n = kept;
     }
 
     /// Mark [base, base + size) in use, widened to whole pages
@@ -194,18 +247,18 @@ impl Memblock {
     /// Allocate `size` bytes aligned to `align` (a power of two), top
     /// down below the limit, and reserve them (Linux memblock_phys_alloc)
     pub fn alloc(&mut self, size: u64, align: u64) -> Option<u64> {
-        let mut free = [Range::default(); 2 * MAX_REGIONS];
-        let mut n = 0;
+        // Free ranges come in address order: the last that fits is the
+        // highest (no buffer of them on the boot stack)
+        let limit = self.limit;
+        let mut found = None;
         self.for_each_free(|base, end| {
-            if n < free.len() {
-                free[n] = Range { base, end };
-                n += 1;
+            if let Some(top) = end.min(limit).checked_sub(size).map(|t| t & !(align - 1))
+                && top >= base
+            {
+                found = Some(top);
             }
         });
-        let found = free[..n].iter().rev().find_map(|r| {
-            let top = r.end.min(self.limit).checked_sub(size)? & !(align - 1);
-            (top >= r.base).then_some(top)
-        })?;
+        let found = found?;
         self.reserve(found, size);
         Some(found)
     }
@@ -293,6 +346,19 @@ mod tests {
         // Merging needs no new slot
         assert!(s.add(5, 10));
         assert!(s.add(10_000, 10_005));
+    }
+
+    /// A firmware map with more RAM ranges than fit loses the extra
+    /// ranges (Linux memblock_add before resizing is allowed: the add
+    /// fails and the range is dropped), never the boot
+    #[test]
+    fn huge_memory_map_does_not_panic() {
+        let mut m = Memblock::new();
+        for i in 0..(MAX_REGIONS as u64 + 100) {
+            m.add(0x10_0000 + i * 0x2000, 0x1000);
+        }
+        assert_eq!(m.memory.ranges().len(), MAX_REGIONS);
+        assert!(m.alloc(0x1000, 0x1000).is_some());
     }
 
     #[test]

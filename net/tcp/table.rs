@@ -284,7 +284,7 @@ impl TcpTables {
             if (!a.is_unspecified() && a != daddr) || (dev != 0 && dev != dif) {
                 return -1;
             }
-            (!a.is_unspecified()) as i32 * 2 + (dev != 0) as i32
+            i32::from(!a.is_unspecified()) * 2 + i32::from(dev != 0)
         };
         let best = v.iter().map(|s| score(s)).max().filter(|&b| b >= 0)?;
         v.iter().find(|s| score(s) == best).cloned()

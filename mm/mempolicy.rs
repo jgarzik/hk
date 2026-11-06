@@ -64,7 +64,6 @@ pub const MPOL_MF_MOVE: u32 = 1 << 1;
 /// Move all pages (requires CAP_SYS_NICE)
 pub const MPOL_MF_MOVE_ALL: u32 = 1 << 2;
 /// Unsupported: lazy migration on fault
-#[allow(dead_code)]
 pub const MPOL_MF_LAZY: u32 = 1 << 3;
 
 /// Valid mbind flags mask

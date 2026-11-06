@@ -770,8 +770,8 @@ fn test_getcpu() {
 
     // Test with both pointers
     let ret = sys_getcpu(&mut cpu, &mut node);
-    // cpu should be < 16 (MAX_CPUS), node should be 0 (no NUMA support)
-    if ret == 0 && cpu < 16 && node == 0 {
+    // The node is the one whose cpulist holds the cpu
+    if ret == 0 && cpu_in_node(cpu, node) {
         println(b"GETCPU:OK");
     } else {
         print(b"GETCPU:FAIL ret=");
@@ -782,6 +782,42 @@ fn test_getcpu() {
         print_num(node as i64);
         println(b"");
     }
+}
+
+/// `cpu` is in /sys/devices/system/node/node<node>/cpulist ("0-1,4")
+fn cpu_in_node(cpu: u32, node: u32) -> bool {
+    let mut path = *b"/sys/devices/system/node/node\0\0\0\0";
+    let base = 29;
+    let mut digits = [0u8; 3];
+    let mut n = node;
+    let mut len = 0;
+    loop {
+        digits[len] = b'0' + (n % 10) as u8;
+        len += 1;
+        n /= 10;
+        if n == 0 || len == 3 {
+            break;
+        }
+    }
+    for i in 0..len {
+        path[base + i] = digits[len - 1 - i];
+    }
+    let mut p = [0u8; 48];
+    p[..base + len].copy_from_slice(&path[..base + len]);
+    p[base + len..base + len + 9].copy_from_slice(b"/cpulist\0");
+    let mut buf = [0u8; 256];
+    let r = super::helpers::read_file(&p, &mut buf);
+    if r <= 0 {
+        return false;
+    }
+    let num = |s: &[u8]| s.iter().fold(0u32, |v, c| v * 10 + u32::from(c - b'0'));
+    buf[..r as usize]
+        .split(|&c| c == b',' || c == b'\n')
+        .filter(|t| !t.is_empty())
+        .any(|t| match t.iter().position(|&c| c == b'-') {
+            Some(d) => (num(&t[..d])..=num(&t[d + 1..])).contains(&cpu),
+            None => num(t) == cpu,
+        })
 }
 
 /// Test 29: getcpu syscall with NULL pointers

@@ -77,7 +77,7 @@ pub fn table_lock(table: u64) -> PteLock {
     preempt_disable();
     #[cfg(feature = "lockdep")]
     crate::sync::lockdep::acquire(
-        word as *const _ as usize,
+        core::ptr::from_ref(word) as usize,
         class(),
         core::panic::Location::caller(),
         true,
@@ -97,7 +97,7 @@ impl Drop for PteLock {
     fn drop(&mut self) {
         self.word.store(0, Ordering::Release);
         #[cfg(feature = "lockdep")]
-        crate::sync::lockdep::release(self.word as *const _ as usize);
+        crate::sync::lockdep::release(core::ptr::from_ref(self.word) as usize);
         preempt_enable();
     }
 }

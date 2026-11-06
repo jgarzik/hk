@@ -181,7 +181,7 @@ pub fn sys_umask(mask: u32) -> i64 {
     let new_mask = (mask & 0o7777) as u16;
 
     if let Some(fs) = crate::task::percpu::current_fs() {
-        fs.set_umask(new_mask) as i64
+        i64::from(fs.set_umask(new_mask))
     } else {
         0o022
     }
@@ -249,7 +249,7 @@ fn do_utimes(dirfd: i32, pathname: u64, times: Option<[UserTimespec; 2]>, flags:
     if let Err(e) = inode
         .i_op
         .setattr_ok(&inode)
-        .and_then(|_| dac::may_utimes(&inode, times.is_some()))
+        .and_then(|()| dac::may_utimes(&inode, times.is_some()))
     {
         return e.sysret();
     }
@@ -275,6 +275,7 @@ fn do_utimes(dirfd: i32, pathname: u64, times: Option<[UserTimespec; 2]>, flags:
         inode.set_mtime(t);
     }
     inode.set_ctime(now);
+    inode.i_op.setattr_done(&inode);
     drop(lock);
     0
 }

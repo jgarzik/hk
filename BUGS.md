@@ -21,6 +21,19 @@ infallible, so each one is investigated, not written off.
   MADV_PAGEOUT of 16 MiB (beyond the test's tolerance), passing on the
   rerun. Linux's swap accounting after pageout is not exact (swap
   cache); the tolerance may need to grow on Linux.
+- **RLIMIT_CPU_XCPU flaky on the x86 Linux reference**: one uncached
+  `check-linux` run, run alongside `check-arm`, got `RLIMIT_CPU_XCPU:FAIL
+  got 9` (SIGKILL where SIGXCPU was expected first); passed on rerun.
+  Likely CPU-time accounting under a loaded host.
+
+## Seen on hk only
+
+- **MM_FAULT_STORM once under LOCKDEP**: one x86 `make check LOCKDEP=1`
+  run reported `MM_FAULT_STORM:FAIL got 0` (no wrong value: a thread did
+  not finish within the 60 s join); three later LOCKDEP runs (x86 twice,
+  arm64) passed. Either LOCKDEP slowness against the join timeout or a
+  missed wakeup on the contended mmap_lock; a recurrence should dump
+  the stuck threads' state.
 
 ## Safe kernel code that can cause UB (doc/UNSAFE.md)
 
@@ -33,7 +46,7 @@ None is known to fail today, but each is a soundness bug:
 
 ## unsafe not yet wrapped or documented (doc/UNSAFE.md)
 
-There are 71 files with `#![allow(clippy::undocumented_unsafe_blocks)]
+There are 63 files with `#![expect(clippy::undocumented_unsafe_blocks)]
 // TODO(unsafe)` (`git grep -l 'TODO(unsafe)' -- '*.rs' ':!user'`). Most of their
 blocks belong in a missing wrapper:
 
@@ -52,9 +65,9 @@ blocks belong in a missing wrapper:
   pci_quirks, aarch64 serial, x86 power.
 - **Lists:** an intrusive `CursorMut` for the walk-and-remove loops
   (futex, waitqueue, sched, percpu).
-- **Callbacks:** typed callback context (`register_irq<T: Sync>`,
-  timer container_of, `smp_call<T: Sync>`) in place of `*mut ()` data
-  casts.
+- **Callbacks:** smp calls with a plain `usize` (`smp_call_function_many`
+  without wait, `stop_one_cpu_nowait`, kthread `fn(usize)`) still carry
+  integers or casts; the waiting forms have typed `_ref` variants.
 
 ## cgroup names must be UTF-8
 
@@ -155,9 +168,7 @@ Missing:
   (pages are reclaimed oldest first), synchronous writes, no kswapd; 2MB pages stay
   off the LRU (never reclaimed whole; a split puts their 4KB pages on
   it). Pages exec copies the image into (see the heap section) are not
-  on the reverse map (never swapped). An active swap file can still
-  be mapped writable (Linux: no write access to an S_SWAPFILE inode),
-  and copy_file_range into it is not refused (Linux ETXTBSY). Swap
+  on the reverse map (never swapped). Swap
   files go through their filesystem's swap_rw,
   a page at a time (walking the cluster chain each time; Linux maps
   the extents once at swapon). Page faults, swapoff, page-cache, heap
@@ -169,23 +180,13 @@ Missing:
   by id still work there).
 - File mappings: no fault-around (Linux maps up to 16 cached pages
   per read fault); filesystems without a page cache (procfs) still
-  map a private copy. A truncate racing an mremap or fork of a mapping of
-  the file can miss entries in flight: mremap unlinks the old VMA from
-  i_mmap before its i_mmap-locked entry move, fork copies the parent's
-  entries after linking the child (Linux takes the rmap locks across
-  move_vma, and fork does not copy shared file entries).
+  map a private copy.
 - MADV_REMOVE of a file mapping is EOPNOTSUPP (no filesystem punches
   holes); shmdt needs the address an attachment starts at (Linux also
   finds a piece moved by mremap); SHM_EXEC is ignored.
-- munmap or MADV_DONTNEED of part of a 2MB page that cannot be split
-  (out of memory) leaves the whole page mapped (Linux preallocates the
-  page table); shmat checks RLIMIT_AS before SHM_REMAP unmaps the old
+- shmat checks RLIMIT_AS before SHM_REMAP unmaps the old
   range, and an address that SHM_RND rounds to 0 is EPERM (Linux picks
   an address).
-- vm.max_map_count is enforced for mmap, brk, munmap and MAP_FIXED
-  holes, mprotect, madvise and mremap, not for the splits of mlock
-  (Linux mlock_fixup fails with ENOMEM there). A locked mapping grown
-  by mremap is not faulted in (Linux populates it).
 
 ## NUMA gaps
 
@@ -204,13 +205,11 @@ getcpu reports it; nothing else uses it. Missing (Linux
   local) affects where pages come from.
 - No page migration: migrate_pages and move_pages validate and move
   nothing; move_pages query mode reports node 0 for every page.
-- Nodemasks are one `u64` (64 nodes); no multi-node QEMU test config.
-- Node numbers are the firmware's (SRAT proximity domain, DT
-  `numa-node-id`) used as is: sparse or large domains leave holes or
-  are dropped (>= 64), and node 0 may not exist (Linux pxm_to_node
-  numbers the domains from 0).
-- The boot topology dump (`print_topology`) runs before any CPU has
-  come up (`cpu_up`), so with real NUMA tables every node shows 0 CPUs.
+- Nodemasks are one `u64` (64 nodes); the gate has no multi-node QEMU
+  run (by hand: `QEMU_EXTRA="-object memory-backend-ram,id=m0,size=256M
+  -object memory-backend-ram,id=m1,size=256M -numa
+  node,nodeid=0,memdev=m0,cpus=0-1 -numa node,nodeid=1,memdev=m1,cpus=2-3"
+  make check`).
 
 ## arm64 SMP assumes one-cell, Aff0-only CPU ids
 
@@ -273,12 +272,7 @@ lo (hk has no checksum offload states).
 
 **Location**: `fs/locks.rs`, `fs/posix_lock.rs`
 
-POSIX lock owners are pids, not the files_struct (Linux fl_owner):
-threads of one process share them, but a CLONE_FILES child that is
-another process has its own (Linux: one owner), and a process's locks
-are released at its exit through a global list of the inodes with
-POSIX locks (searched on each F_SETLK, scanned at each exit). No
-leases (F_SETLEASE) and no OFD locks (F_OFD_*).
+No leases (F_SETLEASE) and no OFD locks (F_OFD_*).
 
 ## seccomp gaps
 
@@ -326,9 +320,8 @@ SIOCUNIXFILE, SO_PEERSEC (ENOPROTOOPT, as on Linux without an LSM).
 
 **Location**: `fs/dac.rs`, `task/exec.rs`
 
-Missing: fs.protected_hardlinks/symlinks/fifos/regular do not exist
-(behave as their kernel default 0); no
-immutable/append-only inodes (no IS_APPEND/IS_IMMUTABLE EPERM).
+Missing: immutable/append-only inodes (no IS_APPEND/IS_IMMUTABLE
+EPERM).
 
 ## Credentials have no identity
 
@@ -379,8 +372,6 @@ unreachable today.
 - net: no queues/, phys_port_*, speed/duplex, ifalias or gro files;
   interfaces cannot be renamed or moved between namespaces, so no
   "move" uevents.
-- chmod/chown on sysfs files change the inode only: a later lookup of a
-  dropped dentry shows the original mode (Linux keeps kernfs iattrs).
 - /sys/module lists built-in modules with drivers only; no parameters
   or version files (hk has no module parameters).
 
@@ -449,26 +440,32 @@ so a pipe or FIFO with data reports 0. Linux do_vfs_ioctl handles
 FIONREAD only for regular files and passes the rest to f_op->ioctl
 (pipe_ioctl returns the buffered bytes).
 
+## O_ASYNC: no SIGIO
+
+**Location:** `fs/fd.rs` (F_SETFL), `fs/misc.rs` (FIOASYNC)
+
+No file raises SIGIO: there is no fasync list (Linux fasync_helper,
+kill_fasync). F_SETFL drops O_ASYNC and FIOASYNC's set is a no-op
+(O_ASYNC is not a settable flag); F_SETOWN and F_SETSIG are stored
+but unused.
+
 ## Mount flag gaps
 
 **Location**: `fs/misc.rs` sys_mount/sys_umount2, `fs/mount.rs`
 
-Accepted without effect: atime flags (no atime updates), MS_SILENT,
-MS_MANDLOCK, MS_POSIXACL, MS_I_VERSION, MS_LAZYTIME.
-EINVAL instead of Linux behavior: MS_SYNCHRONOUS, MS_DIRSYNC and
-MS_NOSYMFOLLOW. Propagation (`fs/pnode.rs`): a propagated copy lands
-on top of what is already mounted at the target (Linux tucks it
-under); a slave's master is its master's peer group, not one mount;
-copies of a namespace are always peers and not locked (Linux
+Accepted without effect: MS_SILENT, MS_MANDLOCK, MS_POSIXACL,
+MS_I_VERSION, MS_LAZYTIME. Propagation (`fs/pnode.rs`): a propagated
+copy lands on top of what is already mounted at the target (Linux
+tucks it under); a slave's master is its master's peer group, not one
+mount; copies of a namespace are always peers and not locked (Linux
 copy_mnt_ns for a less privileged user namespace makes shared mounts
 slaves, CL_SHARED_TO_SLAVE, and locks them, lock_mnt_tree): harmless
 while CLONE_NEWNS needs root and mounts ignore user namespaces, but
-required before mounts become user-namespace aware. umount2 MNT_EXPIRE's
-mark is not cleared by use (Linux mntput clears it).
-Unlike Linux (MNT_WRITE_HOLD), a write access racing a read-only remount
-that then fails with EBUSY can see a spurious EROFS. Mount options are parsed by vfat (Linux's set; long names
-UTF-16 in UTF-8, iso8859-1 or cp437 only) and ramfs (mode=); procfs,
-devtmpfs and cgroupfs ignore theirs; mounts are not user-namespace aware (plain capable()).
+required before mounts become user-namespace aware. Mount options are
+parsed by vfat (Linux's set; long names UTF-16 in UTF-8, iso8859-1 or
+cp437 only), ramfs (mode=) and procfs (hidepid=, gid=, subset=pid);
+devtmpfs and cgroupfs ignore theirs, and only procfs applies options
+on a remount or shows them in /proc/mounts; mounts are not user-namespace aware (plain capable()).
 Crossing into a mount scans the current mount's children (Linux hashes
 (parent, mountpoint): mount_hashtable).
 
@@ -605,12 +602,10 @@ with RAM; what is missing: no shrinker (caches give back empty slabs
 beyond two each, but nothing asks them under pressure), no slab
 merging, poisoning or red zones.
 
-Heap allocations cannot fail gracefully (Rust's global allocator): one
-neither the slab nor the vmalloc fallback can meet panics. Buffers
-sized by a syscall argument, the network or a disk use `kmem` (`try_vec`,
-`KVec`, `KDeque`: ENOMEM); the many sites bounded by a sysctl or a
-constant still allocate infallibly, as do `Box::new`/`Arc::new` (see
-doc/res/hk-rust-for-linux-idioms.md item 1). The heap goes down to the min
+Objects are built fallibly (`util/kalloc.rs` try_box/try_arc, ENOMEM) and
+buffers sized from outside through `kmem`; the `*_nofail` calls (boot
+setup, NOFAIL paths) and plain `Vec`/`String` growth bounded by a sysctl
+or a constant still panic when the heap cannot meet them. The heap goes down to the min
 watermark while user data stops at low (also after direct reclaim:
 user allocations stop at low until the OOM killer (J); then Linux's
 min), so only kernel objects can get there (no memcg or OOM killer bounds what a process pins in pipes,
@@ -621,10 +616,7 @@ free memory is near the low watermark).
 exec maps PT_LOAD segments from the page cache, except a static PIE
 with no interpreter (hk relocates it in the kernel, so its pages are
 private copies; Linux applies no relocations at all) and the partial
-last page and bss of each segment (copied). Kernel object leaks cost free
-memory: each fork+exec keeps two dentries and two inodes plus ~900
-bytes of kmalloc. The MM_LIFE tests count MemFree + Slab so they check user memory only; these leaks
-are listed here instead.
+last page and bss of each segment (copied).
 
 ## The memory cgroup's memory.max is not enforced
 
@@ -652,17 +644,18 @@ nothing adds maps up: no RLIMIT_MEMLOCK or memcg charge (Linux
 bpf_map_charge_memlock / memcg accounting), so many maps can still use
 up memory.
 
-## Heap allocations in atomic context are not reported
+## Heap allocations under spin locks
 
-**Location**: `mm/slab.rs` (`heap_gfp`), `sync/lockdep.rs`
+**Location**: `mm/slab.rs` (`heap_gfp`); sites listed by LOCKDEP
 
-The heap picks GFP_ATOMIC by itself under a spin lock or with
-interrupts off, so an allocation there takes the atomic reserve
-silently. Linux needs an explicit GFP_ATOMIC and might_alloc reports a
-GFP_KERNEL allocation in atomic context. LOCKDEP has no such report
-(an `atomic_alloc()` scope would give one): the global allocator has no
-call site to attribute it to, so the sites (allocations under spin locks
-across net, fs, ipc) cannot be audited yet.
+The heap picks GFP_ATOMIC by itself under a spin lock, so an allocation
+there takes the atomic reserve silently (Linux needs it named, and
+might_alloc reports a GFP_KERNEL one in atomic context). A LOCKDEP boot
+lists each lock allocated under once (`LOCKDEP:ATOMIC_ALLOC ... under
+<lock> (taken at ...)`; the shutdown summary counts them): 109 locks,
+mostly collections grown under spin mutexes, in fs, net, task and
+ipc (procfs: only its mount-time tree building). Each wants its allocation moved out of the
+lock (preallocate, or a sleeping lock as in Linux).
 
 ## Scheduler gaps (deviations from Linux)
 
@@ -822,9 +815,6 @@ fat_get_cluster keeps a per-inode cache of chain positions
   device config): `IoMem` windows are copyable and never unmapped, so
   each transport rebind leaks the ioremap space of one device (Linux
   vp_modern_remove iounmaps them).
-- A removed kernfs binary attribute (`Kind::Bin`, e.g. PCI `config`)
-  keeps its operations, and so the object behind them, while a stale
-  dentry or open file holds the node (text attributes drop theirs).
 - No /proc/devices block section; the first disk
   registered decides the dynamic major (254 down, like Linux, but Linux
   usually has other dynamic majors registered first).
@@ -871,10 +861,10 @@ Designs that grew one commit at a time. Tag = roadmap phase
 - **ID allocators** (J): PidMap, fdbits, IPC ids, and plain counters
   (bpf, keys, mqueue, posix timers, which wrap with no collision
   check): one IDR/IDA.
-- **procfs** (H): every read regenerates the whole file and slices it
-  (no seq_file records, so chunked reads of /proc/net/* can tear);
-  global generators run under the procfs inode's read lock and take
-  TASKLIST and network locks inside it (not in LOCKING.md).
+- **procfs** (H): a file is generated whole (no seq_file records): an
+  open file's reads continuing one another see one generation, where
+  Linux generates record by record, so a long file's later chunks are
+  as old as its first.
   /proc/sys is one static tree: the sysctls Linux registers for the
   initial network namespace only (net/ipv4/tcp_mem,
   net/core/mem_pcpu_rsv) appear in every
@@ -882,8 +872,8 @@ Designs that grew one commit at a time. Tag = roadmap phase
   reading or writing, not the one the file was opened in (Linux binds
   the file to the opener's namespace): an fd passed across namespaces
   reads and writes the other one's values.
-- **Stale comments and dead code** (as touched): over a hundred
-  `#[allow(dead_code)]` and as many "for now"/TODO markers; comments that
+- **Stale comments and dead code** (as touched): 56 `#[expect(dead_code)]`
+  and over a hundred "for now"/TODO markers; comments that
   contradict the code in `ns/mod.rs` (setns) and `task/misc.rs`.
 
 ## Review gaps, by phase
@@ -896,10 +886,10 @@ Tag = roadmap phase (doc/ROADMAP.md).
 2. **arm64 /reserved-memory no-map regions are linear-mapped** (D;
    real HW). `arch/aarch64/dtb.rs:192`: Linux memblock_mark_nomap
    removes them (speculative access to secure carve-outs).
-3. **memblock holds at most 128 ranges** (J). `mm/memblock.rs:18`: a
-   firmware map with more RAM or reserved ranges panics at boot
-   (asserts in add/remove/reserve); Linux grows the array
-   (memblock_double_array).
+3. **memblock does not grow its arrays** (J). `mm/memblock.rs`: 512
+   ranges per set; RAM ranges past that are dropped with a warning (as
+   Linux before memblock_allow_resize), but a reservation past it still
+   panics; Linux doubles the arrays then (memblock_double_array).
 4. **LRU batch refs defeat exclusivity checks** (J). `mm/fault.rs:504`
    / `:596`: refcount==1 tests fail while a page sits in the per-CPU
    add batch, so swap-in makes needless COW copies. Linux drains and

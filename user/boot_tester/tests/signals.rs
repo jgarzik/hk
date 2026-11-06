@@ -68,6 +68,7 @@ pub fn run_tests() {
     test_tgkill_wrong_tgid();
     test_tkill_sig0();
     test_sigaction();
+    test_sigaction_same_buffer();
     test_sigaction_einval();
     test_sigaction_sigkill();
     test_clone_clear_sighand();
@@ -229,6 +230,29 @@ fn test_sigaction() {
     }
 }
 
+/// rt_sigaction with one buffer for act and oact (Linux reads act
+/// before writing oact): the new action is installed, the old returned
+fn test_sigaction_same_buffer() {
+    const SIGUSR2: u32 = 12;
+    let mut sa: [u64; 4] = [1, 0, 0, 0]; // SIG_IGN
+    let p = sa.as_mut_ptr() as u64;
+    let r = sys_rt_sigaction(SIGUSR2, p, p, 8);
+    let old = sa[0];
+    let mut now: [u64; 4] = [0; 4];
+    sys_rt_sigaction(SIGUSR2, 0, now.as_mut_ptr() as u64, 8);
+    let dfl: [u64; 4] = [0; 4];
+    sys_rt_sigaction(SIGUSR2, dfl.as_ptr() as u64, 0, 8);
+    if r == 0 && old == 0 && now[0] == 1 {
+        println(b"SIGACTION_SAME_BUF:OK");
+    } else {
+        print(b"SIGACTION_SAME_BUF:FAIL: old ");
+        print_num(old as i64);
+        print(b" installed ");
+        print_num(now[0] as i64);
+        println(b"");
+    }
+}
+
 /// Test 81: rt_sigaction() with invalid signal should fail
 fn test_sigaction_einval() {
     let ret = sys_rt_sigaction(0, 0, 0, 8); // Signal 0 is invalid
@@ -246,7 +270,14 @@ fn test_sigaction_sigkill() {
     // Try to set a handler for SIGKILL (should fail)
     let new_action: [u64; 4] = [SIG_IGN, 0, 0, 0];
     let ret = sys_rt_sigaction(SIGKILL, new_action.as_ptr() as u64, 0, 8);
-    if ret == -22 {
+    // Querying it is allowed (Linux rejects only a new action)
+    let mut old: [u64; 4] = [9; 4];
+    let q = sys_rt_sigaction(SIGKILL, 0, old.as_mut_ptr() as u64, 8);
+    if q != 0 || old[0] != SIG_DFL {
+        print(b"SIGACTION_SIGKILL:FAIL: query returned ");
+        print_num(q);
+        println(b"");
+    } else if ret == -22 {
         // EINVAL - can't change SIGKILL
         println(b"SIGACTION_SIGKILL:OK");
     } else {

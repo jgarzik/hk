@@ -95,6 +95,7 @@ pub fn run_tests() {
     madv_shared();
     mlock_args();
     mlock_split();
+    mremap_grow_locked();
     mlock_holes();
     mlock_limit();
     munmap_args();
@@ -653,6 +654,59 @@ fn mlock_split_on(a: u64) -> i64 {
         return 6;
     }
     0
+}
+
+/// mremap growing a locked mapping faults the new part in (Linux
+/// mremap: mm_populate of the added range): resident before any touch
+fn mremap_grow_locked() {
+    const NAME: &[u8] = b"MREMAP_GROW_LOCKED";
+    let Some(a) = area(2) else {
+        return report(NAME, -1);
+    };
+    let mut code = if sys_mlock(a, 2 * P) == 0 { 0 } else { 1 };
+    let mut b = a;
+    if code == 0 {
+        let r = hk_syscall::sys_mremap(a, 2 * P, 4 * P, hk_syscall::MREMAP_MAYMOVE, 0);
+        if r < 0 {
+            code = 2;
+        } else {
+            b = r as u64;
+            let mut v = [0u8; 4];
+            sys_mincore(b, 4 * P, v.as_mut_ptr());
+            if v.iter().any(|&x| x & 1 == 0) {
+                code = 10 + v.iter().filter(|&&x| x & 1 == 0).count() as i64;
+            }
+        }
+    }
+    sys_munlock(b, 4 * P);
+    sys_munmap(b, 4 * P);
+    if code == 0 {
+        code = mremap_grow_onfault();
+    }
+    report(NAME, code);
+}
+
+/// The same with MLOCK_ONFAULT: the added pages stay unpopulated (Linux
+/// populate_vma_page_range skips VM_LOCKONFAULT); 0 if none is resident
+fn mremap_grow_onfault() -> i64 {
+    let Some(a) = area(2) else {
+        return -1;
+    };
+    if sys_mlock2(a, 2 * P, MLOCK_ONFAULT) != 0 {
+        sys_munmap(a, 2 * P);
+        return 20;
+    }
+    let r = hk_syscall::sys_mremap(a, 2 * P, 4 * P, hk_syscall::MREMAP_MAYMOVE, 0);
+    if r < 0 {
+        sys_munmap(a, 2 * P);
+        return 21;
+    }
+    let b = r as u64;
+    let mut v = [0u8; 2];
+    sys_mincore(b + 2 * P, 2 * P, v.as_mut_ptr());
+    sys_munlock(b, 4 * P);
+    sys_munmap(b, 4 * P);
+    v.iter().filter(|&&x| x & 1 != 0).count() as i64
 }
 
 fn mlock_holes() {

@@ -10,6 +10,7 @@
 //! - `io.stat`: Per-device I/O statistics
 
 use crate::sync::spin::Mutex;
+use crate::util::kalloc::try_arc;
 use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::String;
@@ -27,7 +28,7 @@ pub type DevId = u64;
 
 /// Encode major:minor into DevId
 pub fn make_dev(major: u32, minor: u32) -> DevId {
-    ((major as u64) << 32) | (minor as u64)
+    (u64::from(major) << 32) | u64::from(minor)
 }
 
 /// Decode DevId into major:minor
@@ -127,7 +128,7 @@ impl CgroupSubsysOps for IoController {
         parent_css: Option<&Arc<CgroupSubsysState>>,
     ) -> Result<Arc<dyn CssPrivate>, KernelError> {
         let _ = parent_css;
-        Ok(Arc::new(IoState::new()))
+        Ok(try_arc(IoState::new())?)
     }
 
     fn css_free(&self, _css: &CgroupSubsysState) {

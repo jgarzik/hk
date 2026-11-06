@@ -28,7 +28,7 @@
 //! - `end_io` runs in the completion context, possibly hardirq: it may
 //!   only use IRQ-safe operations (atomics, `Completion::complete`, wait
 //!   queue wakeups); it must not sleep or take a `Mutex`/`RwLock`.
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
@@ -43,6 +43,7 @@ use crate::sync::spin::{Mutex, RwLock};
 pub use crate::fs::chardev::{DevId, DevMajor, DevMinor};
 use crate::mm::writeback::{BdiWriteback, bdi_register, bdi_unregister};
 use crate::util::error::KernelError;
+use crate::util::kalloc::{box_nofail, try_arc};
 
 use super::blk_mq::BlkMq;
 
@@ -142,8 +143,10 @@ pub struct Bio {
 }
 
 impl Bio {
+    /// Linux bio_alloc: from a mempool, it cannot fail (GFP_NOIO
+    /// writeback must make progress)
     pub fn new(op: BioOp, sector: u64) -> Box<Self> {
-        Box::new(Self {
+        box_nofail(Self {
             op,
             sector,
             segs: Vec::new(),
@@ -208,7 +211,7 @@ impl BioList {
 
     pub fn push(&mut self, mut bio: Box<Bio>) {
         bio.next = None;
-        let p: *mut Bio = &mut *bio;
+        let p: *mut Bio = &raw mut *bio;
         if self.tail.is_null() {
             self.head = Some(bio);
         } else {
@@ -221,7 +224,7 @@ impl BioList {
     pub fn push_front(&mut self, mut bio: Box<Bio>) {
         bio.next = self.head.take();
         if bio.next.is_none() {
-            self.tail = &mut *bio;
+            self.tail = &raw mut *bio;
         }
         self.head = Some(bio);
     }
@@ -403,9 +406,10 @@ impl Disk {
         capacity: u64,
         queue: RequestQueue,
         ro: bool,
-    ) -> Arc<Self> {
-        let bdi = bdi_register(DevId::new(major, first_minor));
-        Arc::new(Self {
+    ) -> Result<Arc<Self>, KernelError> {
+        let dev = DevId::new(major, first_minor);
+        let bdi = bdi_register(dev);
+        try_arc(Self {
             major,
             first_minor,
             minors,
@@ -418,6 +422,7 @@ impl Disk {
             seq: DISKSEQ.fetch_add(1, Ordering::Relaxed),
             private: spin::Once::new(),
         })
+        .inspect_err(|_| bdi_unregister(dev))
     }
 
     /// Capacity in sectors
@@ -527,7 +532,7 @@ impl BlockDevice {
     /// that divides the size (Linux set_init_blocksize)
     fn init_block_size(&self) {
         let size = self.capacity();
-        let mut bs = self.logical_block_size() as u64;
+        let mut bs = u64::from(self.logical_block_size());
         while bs < PAGE as u64 && size & bs == 0 {
             bs <<= 1;
         }
@@ -622,9 +627,9 @@ pub fn register_bdev(bdev: Arc<BlockDevice>) -> Result<(), KernelError> {
     // The device's inode does I/O on this device only (never a later
     // one with the same number)
     bdev.bd_inode
-        .set_private(Arc::new(crate::fs::blkdev_ops::BdevOwner(Arc::downgrade(
+        .set_private(try_arc(crate::fs::blkdev_ops::BdevOwner(Arc::downgrade(
             &bdev,
-        ))));
+        )))?);
     let mut r = BLKDEV_REGISTRY.write();
     if r.contains_key(&bdev.dev) {
         return Err(KernelError::AlreadyExists);
@@ -710,7 +715,7 @@ pub fn submit_bio_wait(
         bio: AtomicPtr::new(core::ptr::null_mut()),
     };
     bio.end_io = Some(wait_endio);
-    bio.private = &w as *const Waiter as usize;
+    bio.private = &raw const w as usize;
     submit_bio(bdev, bio);
     w.done.wait();
     let mut bio = unsafe { Box::from_raw(w.bio.load(Ordering::Acquire)) };

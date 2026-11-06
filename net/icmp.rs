@@ -215,8 +215,8 @@ impl Default for IcmpRate {
 impl IcmpRate {
     fn global_allow(&self, net: &NetNamespace, now: u64) -> bool {
         let s = &net.sysctl;
-        let per_sec = s.icmp_msgs_per_sec.load(Ordering::Relaxed) as i64;
-        let burst = s.icmp_msgs_burst.load(Ordering::Relaxed) as i64;
+        let per_sec = i64::from(s.icmp_msgs_per_sec.load(Ordering::Relaxed));
+        let burst = i64::from(s.icmp_msgs_burst.load(Ordering::Relaxed));
         self.st.lock().global.allow(now, per_sec, burst)
     }
 
@@ -235,7 +235,7 @@ impl IcmpRate {
     }
 
     fn consume(&self) {
-        let c = (crate::random::get_random_u32() % 3) as i64;
+        let c = i64::from(crate::random::get_random_u32() % 3);
         self.st.lock().global.consume(c);
     }
 }
@@ -402,9 +402,9 @@ fn icmp_unreach(net: &NetNamespace, skb: &SkBuff) {
     }
     let mut info = u32::from_be_bytes([d[4], d[5], d[6], d[7]]);
     if ty == icmp_type::DEST_UNREACH && code == code::FRAG_NEEDED {
-        info = u16::from_be_bytes([d[6], d[7]]) as u32;
+        info = u32::from(u16::from_be_bytes([d[6], d[7]]));
     } else if ty == icmp_type::PARAMETERPROB {
-        info = (d[4] as u32) << 24;
+        info = u32::from(d[4]) << 24;
     }
     let e = IcmpErr {
         ty,
@@ -427,7 +427,7 @@ fn icmp_unreach(net: &NetNamespace, skb: &SkBuff) {
 }
 
 /// Frag needed for a packet we sent: remember the smaller path MTU
-fn update_pmtu(net: &NetNamespace, e: &IcmpErr) {
+fn update_pmtu(net: &NetNamespace, e: &IcmpErr<'_>) {
     if net.fib.addr_type(e.inner_saddr()) != RouteType::Local {
         return;
     }
@@ -437,7 +437,7 @@ fn update_pmtu(net: &NetNamespace, e: &IcmpErr) {
 }
 
 /// Hand an error to the raw sockets and the inner protocol
-fn deliver_err(net: &NetNamespace, e: &IcmpErr) {
+fn deliver_err(net: &NetNamespace, e: &IcmpErr<'_>) {
     crate::net::raw::raw_err(net, e);
     match e.proto() {
         ipv4::IPPROTO_TCP => crate::net::tcp::tcp_err(net, e),
@@ -476,7 +476,7 @@ impl<'a> Offender<'a> {
 }
 
 /// May an error be sent about `o` at all (Linux __icmp_send guards)?
-fn may_send(net: &NetNamespace, o: &Offender, ty: u8) -> bool {
+fn may_send(net: &NetNamespace, o: &Offender<'_>, ty: u8) -> bool {
     let p = o.pkt;
     if p.len() < IP_HLEN_MIN || !o.host || o.bcast {
         return false;
@@ -502,7 +502,7 @@ fn may_send(net: &NetNamespace, o: &Offender, ty: u8) -> bool {
 
 /// Send ICMP `ty`/`code` with 4 bytes of `rest` about `o` (Linux
 /// __icmp_send)
-pub fn icmp_send(net: &NetNamespace, o: &Offender, ty: u8, code: u8, rest: [u8; 4]) {
+pub fn icmp_send(net: &NetNamespace, o: &Offender<'_>, ty: u8, code: u8, rest: [u8; 4]) {
     if !may_send(net, o, ty) {
         return;
     }

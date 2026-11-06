@@ -10,7 +10,7 @@
 //!
 //! TLS (Thread Local Storage) handling follows the Linux kernel pattern:
 //! save/restore FS base in Rust before calling the pure-asm switch.
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use super::fpu::{self, FpuArea};
 use super::percpu::{write_fs_base, write_user_gsbase};
@@ -31,6 +31,21 @@ unsafe extern "C" {
     ///   next_sp - next task's saved RSP value
     ///   new_kstack - new kernel stack top (for TSS.RSP0 and SYSCALL_KERNEL_STACK)
     fn __switch_to_asm_first(next_sp: u64, new_kstack: u64);
+}
+
+/// Host tests link the scheduler without switch_to.S (build.rs
+/// assembles it for the kernel only); nothing switches there
+#[cfg(test)]
+mod host_stubs {
+    #[unsafe(no_mangle)]
+    extern "C" fn __switch_to_asm(_prev_sp_ptr: *mut u64, _next_sp: u64, _new_kstack: u64) {
+        unreachable!("context switch in a host test");
+    }
+
+    #[unsafe(no_mangle)]
+    extern "C" fn __switch_to_asm_first(_next_sp: u64, _new_kstack: u64) {
+        unreachable!("context switch in a host test");
+    }
 }
 
 /// Kernel thread context (callee-saved registers only)

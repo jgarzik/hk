@@ -24,6 +24,7 @@
 //! atomics plus a direct `try_to_wake_up`; requesters wait on the control
 //! block's `WaitQueue` for the thread to acknowledge.
 
+use crate::util::kalloc::try_arc;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -110,7 +111,7 @@ pub fn kthread_run_prio(
         Some(_) => return Err(KernelError::InvalidArgument),
         None => pick_cpu(),
     };
-    let k = Arc::new(KThread {
+    let k = try_arc(KThread {
         task: spin::Once::new(),
         cpu,
         func,
@@ -120,7 +121,7 @@ pub fn kthread_run_prio(
         parked: AtomicBool::new(false),
         exited: AtomicBool::new(false),
         ack: WaitQueue::new(),
-    });
+    })?;
     // The task is created asleep: register it before it can look itself up
     let task = create_kthread_task(cpu, name, kthread_entry as *const () as usize, priority)
         .map_err(|_| KernelError::OutOfMemory)?;

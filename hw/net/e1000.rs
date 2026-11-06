@@ -29,12 +29,13 @@
 //! - `tx`: `crate::sync::spin::Mutex`, thread context only (xmit, NAPI poll reclaim).
 //!   Taken under socket/ARP locks (end of the network lock order). Leaf.
 //!   Empty once removed.
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use alloc::boxed::Box;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::any::Any;
+use core::mem::MaybeUninit;
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
@@ -53,6 +54,7 @@ use crate::net::device::{LinkInfo, NetDevice, NetDeviceOps};
 use crate::net::skb::{NET_SKB_PAD, SkBuff};
 use crate::printkln;
 use crate::util::error::KernelError;
+use crate::util::kalloc::{try_arc, try_box};
 
 // ============================================================================
 // Hardware Constants
@@ -214,20 +216,20 @@ struct TxRing {
 
 impl RxRing {
     fn desc(&self, i: usize) -> *mut RxDesc {
-        unsafe { (self.desc.cpu_addr() as *mut RxDesc).add(i) }
+        unsafe { self.desc.cpu_addr().cast::<RxDesc>().add(i) }
     }
 }
 
 impl TxRing {
     fn desc(&self, i: usize) -> *mut TxDesc {
-        unsafe { (self.desc.cpu_addr() as *mut TxDesc).add(i) }
+        unsafe { self.desc.cpu_addr().cast::<TxDesc>().add(i) }
     }
 
     /// Reclaim descriptors the device is done with; returns how many
     fn reclaim(&mut self) -> usize {
         let mut n = 0;
         while self.clean != self.tail {
-            let st = unsafe { read_volatile(&(*self.desc(self.clean)).status) };
+            let st = unsafe { read_volatile(&raw const (*self.desc(self.clean)).status) };
             if st & txd_stat::DD == 0 {
                 break;
             }
@@ -389,13 +391,16 @@ impl E1000 {
         unsafe {
             core::ptr::copy_nonoverlapping(skb.data_ptr(), tx.bufs[i].cpu_addr(), len);
             let d = tx.desc(i);
-            write_volatile(&mut (*d).length, len as u16);
-            write_volatile(&mut (*d).cso, 0);
-            write_volatile(&mut (*d).css, 0);
-            write_volatile(&mut (*d).special, 0);
-            write_volatile(&mut (*d).status, 0);
+            write_volatile(&raw mut (*d).length, len as u16);
+            write_volatile(&raw mut (*d).cso, 0);
+            write_volatile(&raw mut (*d).css, 0);
+            write_volatile(&raw mut (*d).special, 0);
+            write_volatile(&raw mut (*d).status, 0);
             dma_wmb();
-            write_volatile(&mut (*d).cmd, txd_cmd::EOP | txd_cmd::IFCS | txd_cmd::RS);
+            write_volatile(
+                &raw mut (*d).cmd,
+                txd_cmd::EOP | txd_cmd::IFCS | txd_cmd::RS,
+            );
         }
         tx.tail = next;
         // Descriptor and buffer writes before the doorbell
@@ -406,7 +411,7 @@ impl E1000 {
 
     /// Receive up to `budget` frames; returns them (delivered by the caller
     /// after the ring lock is dropped)
-    #[allow(clippy::vec_box)] // skbs travel as Box<SkBuff> through the stack
+    #[expect(clippy::vec_box)] // skbs travel as Box<SkBuff> through the stack
     fn receive(&self, dev: &Arc<NetDevice>, budget: usize, out: &mut Vec<Box<SkBuff>>) {
         let mut rx = self.rx.lock();
         let Some(rx) = rx.as_mut() else { return };
@@ -414,14 +419,14 @@ impl E1000 {
         while out.len() < budget {
             let i = rx.next;
             let d = rx.desc(i);
-            let st = unsafe { read_volatile(&(*d).status) };
+            let st = unsafe { read_volatile(&raw const (*d).status) };
             if st & rxd_stat::DD == 0 {
                 break;
             }
             // Status before the length and data it covers
             dma_rmb();
-            let len = unsafe { read_volatile(&(*d).length) } as usize;
-            let errors = unsafe { read_volatile(&(*d).errors) };
+            let len = unsafe { read_volatile(&raw const (*d).length) } as usize;
+            let errors = unsafe { read_volatile(&raw const (*d).errors) };
             if st & rxd_stat::EOP == 0 || errors != 0 || !(14..=MAX_FRAME).contains(&len) {
                 // Multi-descriptor (oversize) or errored frame
                 dev.stats.inc_rx_errors();
@@ -444,9 +449,9 @@ impl E1000 {
             }
             // Give the descriptor back
             unsafe {
-                write_volatile(&mut (*d).status, 0);
-                write_volatile(&mut (*d).errors, 0);
-                write_volatile(&mut (*d).length, 0);
+                write_volatile(&raw mut (*d).status, 0);
+                write_volatile(&raw mut (*d).errors, 0);
+                write_volatile(&raw mut (*d).length, 0);
             }
             last = Some(i);
             rx.next = (i + 1) % RX_RING_SIZE;
@@ -477,9 +482,14 @@ impl E1000 {
     }
 }
 
+impl crate::irq::IrqHandler for E1000 {
+    fn handle(&self, _irq: u32) -> bool {
+        e1000_isr(self)
+    }
+}
+
 /// Interrupt handler (IRQ context): ack, mask, schedule NAPI
-fn e1000_isr(_irq: u32, data: *mut ()) -> bool {
-    let dev = unsafe { &*(data as *const E1000) };
+fn e1000_isr(dev: &E1000) -> bool {
     let icr = dev.read_reg(reg::ICR); // read-to-clear
     if icr == 0 {
         // Shared line: another device's interrupt
@@ -697,6 +707,8 @@ fn e1000_probe(
     pdev: &Arc<crate::base::Device>,
 ) -> Result<Box<dyn crate::base::Bound>, KernelError> {
     let pci = crate::hw::pci::driver::pci_dev(pdev).ok_or(KernelError::NoDevice)?;
+    // The binding's memory first: nothing to undo should it fail
+    let slot = try_box(MaybeUninit::<E1000DeviceWrapper>::uninit())?;
 
     printkln!(
         "e1000: probing {:04x}:{:04x} at {}",
@@ -710,7 +722,7 @@ fn e1000_probe(
         printkln!("e1000: BAR0 not configured");
         return Err(KernelError::NoDevice);
     }
-    let mmio_phys = (bar0 & !0xF) as u64;
+    let mmio_phys = u64::from(bar0 & !0xF);
     // SAFETY: BAR0 of this e1000, its 128KB register space
     let Some(regs) = (unsafe { crate::hw::mmio::IoMem::ioremap(mmio_phys, 128 * 1024) }) else {
         printkln!("e1000: Failed to ioremap MMIO region");
@@ -763,17 +775,20 @@ fn e1000_probe(
         mac[4],
         mac[5]
     );
-    dev.set_mac_filter();
-    dev.init_rx();
-    dev.init_tx();
 
-    let device = Arc::new(dev);
+    // Allocated while the chip is reset and its rings unprogrammed:
+    // ENOMEM leaves no DMA running
+    let device = try_arc(dev)?;
+    let ops: Arc<dyn NetDeviceOps> = try_arc(E1000Ops {
+        device: Arc::clone(&device),
+    })
+    .inspect_err(|_| device.free_rings())?;
+
+    device.set_mac_filter();
+    device.init_rx();
+    device.init_tx();
     let poller: Weak<dyn NapiPoll> = Arc::downgrade(&device) as Weak<dyn NapiPoll>;
     net::dev::netif_napi_add(&device.napi, poller);
-
-    let ops: Arc<dyn NetDeviceOps> = Arc::new(E1000Ops {
-        device: Arc::clone(&device),
-    });
     // RTNL from naming to registration (Linux register_netdev)
     let (rtnl, netdev) = net::alloc_netdev("eth%d", mac, LinkInfo::ETHER, ops);
     device.netdev.call_once(|| Arc::downgrade(&netdev));
@@ -791,7 +806,7 @@ fn e1000_probe(
 
     // Shareable level-triggered INTx; the device's interrupts stay
     // masked until userspace brings the interface up (open())
-    match pci.register_irq_handler(e1000_isr, Arc::as_ptr(&device) as *mut ()) {
+    match pci.register_irq_handler(device.clone()) {
         Ok(irq) => printkln!("e1000: IRQ {}", irq),
         Err(e) => {
             printkln!("e1000: no IRQ ({}), RX disabled", e);
@@ -805,5 +820,5 @@ fn e1000_probe(
     netdev.parent.call_once(|| pdev.clone());
     net::register_netdev(rtnl, Arc::clone(&netdev));
 
-    Ok(Box::new(E1000DeviceWrapper { netdev, device }))
+    Ok(Box::write(slot, E1000DeviceWrapper { netdev, device }))
 }

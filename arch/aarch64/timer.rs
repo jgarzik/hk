@@ -8,7 +8,7 @@
 //! - CNTP_CTL_EL0: Physical timer control
 //! - CNTP_TVAL_EL0: Physical timer value (countdown)
 //! - CNTP_CVAL_EL0: Physical timer compare value (absolute)
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use crate::printkln;
 use core::arch::asm;
@@ -112,9 +112,9 @@ pub fn init() {
 /// Start the periodic timer with the specified interval
 pub fn start(interval_ms: u32) {
     let ticks_per_ms = TICKS_PER_MS.load(Ordering::Relaxed);
-    let tval = ticks_per_ms * interval_ms as u64;
+    let tval = ticks_per_ms * u64::from(interval_ms);
 
-    TIMER_INTERVAL_MS.store(interval_ms as u64, Ordering::Relaxed);
+    TIMER_INTERVAL_MS.store(u64::from(interval_ms), Ordering::Relaxed);
 
     // Set countdown value
     write_tval(tval);
@@ -132,7 +132,8 @@ pub fn start(interval_ms: u32) {
 /// event device, Linux arch_timer_set_next_event; interrupts off)
 pub fn set_next_event(delta_ns: u64) {
     let freq = TIMER_FREQ.load(Ordering::Relaxed);
-    let cycles = (delta_ns as u128 * freq as u128 / 1_000_000_000).clamp(1, u32::MAX as u128);
+    let cycles =
+        (u128::from(delta_ns) * u128::from(freq) / 1_000_000_000).clamp(1, u128::from(u32::MAX));
     // An absolute compare value: no 32-bit countdown limit
     write_cval(read_cntpct().wrapping_add(cycles as u64));
 }

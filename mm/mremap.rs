@@ -148,7 +148,7 @@ pub fn selftest() -> Option<&'static str> {
             break;
         };
         // SAFETY: a fresh frame, reached through the direct map
-        unsafe { *(phys_to_virt(frame) as *mut u64) = 0xa5a5_0000 + i as u64 };
+        unsafe { *phys_to_virt(frame).cast::<u64>() = 0xa5a5_0000 + i as u64 };
         *pte = paging::mk_pte(frame, super::PROT_READ | super::PROT_WRITE);
         entry(p).store(*pte, Ordering::Release);
     }

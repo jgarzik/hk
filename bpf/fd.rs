@@ -4,6 +4,7 @@
 //! BPF objects are exposed as file descriptors to userspace, allowing them to be
 //! managed with standard fd operations (close, dup, etc.).
 
+use crate::util::kalloc::try_arc;
 use alloc::sync::Arc;
 
 use super::map::BpfMap;
@@ -28,17 +29,7 @@ impl FileOps for BpfMapFileOps {
         self
     }
 
-    fn read(&self, _file: &File, _buf: &mut [u8]) -> Result<usize, KernelError> {
-        // BPF map fds don't support read()
-        Err(KernelError::InvalidArgument)
-    }
-
-    fn write(&self, _file: &File, _buf: &[u8]) -> Result<usize, KernelError> {
-        // BPF map fds don't support write()
-        Err(KernelError::InvalidArgument)
-    }
-
-    fn poll(&self, _file: &File, _pt: Option<&mut PollTable>) -> u16 {
+    fn poll(&self, _file: &File, _pt: Option<&mut PollTable<'_>>) -> u16 {
         // BPF map fds are always "ready" (operations never block)
         0
     }
@@ -71,17 +62,7 @@ impl FileOps for BpfProgFileOps {
         self
     }
 
-    fn read(&self, _file: &File, _buf: &mut [u8]) -> Result<usize, KernelError> {
-        // BPF program fds don't support read()
-        Err(KernelError::InvalidArgument)
-    }
-
-    fn write(&self, _file: &File, _buf: &[u8]) -> Result<usize, KernelError> {
-        // BPF program fds don't support write()
-        Err(KernelError::InvalidArgument)
-    }
-
-    fn poll(&self, _file: &File, _pt: Option<&mut PollTable>) -> u16 {
+    fn poll(&self, _file: &File, _pt: Option<&mut PollTable<'_>>) -> u16 {
         0
     }
 
@@ -97,7 +78,7 @@ impl FileOps for BpfProgFileOps {
 
 /// Create a file descriptor for a BPF map
 pub fn create_bpf_map_fd(map: Arc<BpfMap>) -> Result<i32, KernelError> {
-    let file = anon_inode_getfile("bpf-map", &BPF_MAP_FOPS, map, flags::O_RDWR);
+    let file = anon_inode_getfile("bpf-map", &BPF_MAP_FOPS, map, flags::O_RDWR)?;
 
     // Allocate file descriptor using the fd table
     let fd_table = current_fd_table();
@@ -111,9 +92,9 @@ pub fn create_bpf_map_fd(map: Arc<BpfMap>) -> Result<i32, KernelError> {
 
 /// Create a file descriptor for a BPF program
 pub fn create_bpf_prog_fd(prog: Arc<BpfProg>, prog_type: u32) -> Result<i32, KernelError> {
-    let private = Arc::new(BpfProgFile { prog, prog_type });
+    let private = try_arc(BpfProgFile { prog, prog_type })?;
 
-    let file = anon_inode_getfile("bpf-prog", &BPF_PROG_FOPS, private, flags::O_RDWR);
+    let file = anon_inode_getfile("bpf-prog", &BPF_PROG_FOPS, private, flags::O_RDWR)?;
 
     // Allocate file descriptor using the fd table
     let fd_table = current_fd_table();

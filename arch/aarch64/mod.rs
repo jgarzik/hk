@@ -1,7 +1,7 @@
 //! AArch64 architecture support
 //!
 //! This module provides aarch64-specific implementations for the kernel.
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 extern crate alloc;
 

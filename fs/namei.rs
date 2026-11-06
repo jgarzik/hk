@@ -92,7 +92,7 @@ pub fn lookup_path_at(
     path: &[u8],
     flags: LookupFlags,
 ) -> Result<Arc<Dentry>, KernelError> {
-    path_lookupat(start, path, flags).map(|p| p.dentry)
+    path_lookupat(start, path, flags).map(|p| p.dentry.clone())
 }
 
 /// As [`lookup_path_at`], the mount too (Linux path_lookupat)
@@ -126,13 +126,14 @@ pub fn lookup_one(parent: &Arc<Dentry>, name: &[u8]) -> Result<Arc<Dentry>, Kern
     }
     let dir = parent.get_inode().ok_or(KernelError::NotFound)?;
     match dir.i_op.lookup(&dir, name) {
-        Ok(inode) => Ok(Dentry::alloc(parent, name, Some(inode))),
+        Ok(inode) => Dentry::alloc(parent, name, Some(inode)),
         Err(KernelError::NotFound) => {
             let in_memory = dir
                 .superblock()
                 .is_some_and(|sb| sb.fs_type.fs_flags == super::superblock::fs_flags::FS_IN_MEMORY);
             if in_memory {
-                Dentry::alloc(parent, name, None);
+                // A negative dentry is only a cache: none on ENOMEM
+                let _ = Dentry::alloc(parent, name, None);
             }
             Err(KernelError::NotFound)
         }
@@ -266,7 +267,7 @@ fn follow_dotdot(p: Path, root: &Path) -> Path {
         }
     }
     match p.dentry.get_parent() {
-        Some(parent) => follow_mount(Path::new(p.mnt, parent)),
+        Some(parent) => follow_mount(Path::new(p.mnt.clone(), parent)),
         None => p,
     }
 }
@@ -282,7 +283,17 @@ fn follow_link(
     depth: usize,
 ) -> Result<Path, KernelError> {
     let inode = link.get_inode().ok_or(KernelError::NotFound)?;
+    // fs.protected_symlinks first, then a nosymfollow mount (Linux
+    // pick_link: may_follow_link, then MNT_NOSYMFOLLOW on the link's
+    // mount)
+    if let Some(d) = dir.dentry.get_inode() {
+        super::dac::may_follow_link(c, &d, &inode)?;
+    }
+    if dir.mnt.flags() & super::mount::MNT_NOSYMFOLLOW != 0 {
+        return Err(KernelError::TooManySymlinks);
+    }
     let target = inode.i_op.readlink(&inode)?;
+    inode.touch_atime(&dir.mnt);
     let mut path = target;
     for comp in rest {
         path.push(b'/');
@@ -318,9 +329,11 @@ pub fn create_entry(
         }
         let _w = w?;
         super::dac::may_create(&c, &dir)?;
+        // The dentry first, so an ENOMEM leaves no entry made
+        let d = Dentry::prealloc(parent, name)?;
         let inode = make(&dir, &c)?;
-        let d = Dentry::alloc(parent, name, Some(inode));
-        Ok(d)
+        dir.touch_mc();
+        Ok(Dentry::add(parent, d, Some(inode)))
     })()
 }
 
@@ -354,10 +367,16 @@ pub fn delete_entry(p: &Parent, isdir: bool) -> Result<(), KernelError> {
         let r = if super::mount::is_local_mountpoint(&victim) {
             Err(KernelError::Busy)
         } else if isdir {
-            dir.i_op.rmdir(&dir, name).inspect(|_| inode.set_dead())
+            dir.i_op.rmdir(&dir, name).inspect(|()| inode.set_dead())
         } else {
             dir.i_op.unlink(&dir, name)
         };
+        // The parent's mtime and ctime, the victim's ctime
+        // (simple_unlink)
+        if r.is_ok() {
+            dir.touch_mc();
+            inode.touch_c();
+        }
         drop(victim_lock);
         r?;
         // A dentry no one else holds becomes negative in place; a held
@@ -486,16 +505,21 @@ pub struct Parent {
 /// the parent must be a searchable directory; the last name is not
 /// looked up, only classified
 pub fn filename_parentat(dirfd: i32, path: &[u8]) -> Result<Parent, KernelError> {
-    let start = path_start(dirfd, path, false)?;
+    path_parentat(path_start(dirfd, path, false)?, path)
+}
+
+/// `filename_parentat` from `start` (None: the root, as for an absolute
+/// path)
+fn path_parentat(start: Option<Path>, path: &[u8]) -> Result<Parent, KernelError> {
     let end = path.iter().rposition(|&c| c != b'/').map_or(0, |i| i + 1);
     let slash = end < path.len();
     let trimmed = &path[..end];
     if trimmed.is_empty() {
         // Only slashes: the root, no last component
-        let root = nd_root()?;
+        let (mnt, dir) = nd_root()?.into_parts();
         return Ok(Parent {
-            dir: root.dentry,
-            mnt: root.mnt,
+            dir,
+            mnt,
             name: Vec::new(),
             last: Last::Root,
             slash: false,
@@ -505,10 +529,11 @@ pub fn filename_parentat(dirfd: i32, path: &[u8]) -> Result<Parent, KernelError>
         Some(i) => (&path[..=i], &trimmed[i + 1..]),
         None => (b"", trimmed),
     };
-    let Path { mnt, dentry: dir } = match (dir_path.is_empty(), start) {
+    let (mnt, dir) = match (dir_path.is_empty(), start) {
         (true, Some(p)) => p,
         (_, start) => path_lookupat(start, dir_path, LookupFlags::opendir())?,
-    };
+    }
+    .into_parts();
     // link_path_walk: search permission before the last component too
     may_lookup(&cred(), &dir)?;
     let last = match name {
@@ -523,6 +548,49 @@ pub fn filename_parentat(dirfd: i32, path: &[u8]) -> Result<Parent, KernelError>
         last,
         slash,
     })
+}
+
+/// Where an O_CREAT open of `p` lands (Linux open_last_lookups +
+/// step_into on the last component): while the last name is a
+/// symlink, its target's parent and last name, each link checked as a
+/// walk checks it (fs.protected_symlinks, then nosymfollow); ELOOP past
+/// MAX_SYMLINKS. A target ending in '/', "." or ".." is EISDIR.
+pub fn resolve_last_links(mut p: Parent) -> Result<Parent, KernelError> {
+    const MAX_SYMLINKS: usize = 40;
+    let c = cred();
+    for _ in 0..MAX_SYMLINKS {
+        let dir = Path::new(p.mnt.clone(), p.dir.clone());
+        let nofollow = LookupFlags {
+            follow: false,
+            ..LookupFlags::open()
+        };
+        let found = match path_lookupat(Some(dir.clone()), &p.name, nofollow) {
+            Ok(f) => f,
+            Err(KernelError::NotFound) => return Ok(p),
+            Err(e) => return Err(e),
+        };
+        let Some(inode) = found.get_inode().filter(|i| i.mode().is_symlink()) else {
+            return Ok(p);
+        };
+        if let Some(d) = p.dir.get_inode() {
+            super::dac::may_follow_link(&c, &d, &inode)?;
+        }
+        if p.mnt.flags() & super::mount::MNT_NOSYMFOLLOW != 0 {
+            return Err(KernelError::TooManySymlinks);
+        }
+        let target = inode.i_op.readlink(&inode)?;
+        inode.touch_atime(&found.mnt);
+        let start = if target.starts_with(b"/") {
+            None
+        } else {
+            Some(dir)
+        };
+        p = path_parentat(start, &target)?;
+        if p.last != Last::Norm || p.slash {
+            return Err(KernelError::IsDirectory);
+        }
+    }
+    Err(KernelError::TooManySymlinks)
 }
 
 /// The parent and new name for mkdir/mknod/symlink/link/bind (Linux

@@ -78,7 +78,7 @@ pub fn owner_or_capable(c: &Cred, inode: &Inode) -> bool {
 /// acl_permission_check: only the caller's class (owner, group, other)
 /// of mode bits counts
 fn mode_ok(c: &Cred, uid: Uid, gid: Gid, perm: u16, mask: u32) -> bool {
-    let m = perm as u32;
+    let m = u32::from(perm);
     let bits = if c.fsuid == uid {
         m >> 6
     } else if in_group(c, gid) {
@@ -350,6 +350,7 @@ pub fn chmod(p: &super::Path, perm: u16) -> Result<(), KernelError> {
     }
     inode.set_mode_perm(perm);
     inode.set_ctime(crate::time::TIMEKEEPER.current_time());
+    inode.i_op.setattr_done(inode);
     Ok(())
 }
 
@@ -403,6 +404,7 @@ pub fn chown(p: &super::Path, uid: Option<Uid>, gid: Option<Gid>) -> Result<(), 
     }
     // chown_common: ATTR_CTIME even when no id changes
     inode.set_ctime(crate::time::TIMEKEEPER.current_time());
+    inode.i_op.setattr_done(inode);
     Ok(())
 }
 
@@ -465,4 +467,181 @@ pub fn xattr_permission(inode: &Inode, name: &str, mask: u32) -> Result<(), Kern
         }
     }
     permission_as(&c, inode, mask)
+}
+
+// fs.protected_* (Linux fs/namei.c sysctl_protected_*): kernel defaults
+// 0, as on Linux (distributions raise them at boot)
+static PROTECTED_SYMLINKS: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+static PROTECTED_HARDLINKS: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+static PROTECTED_FIFOS: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+static PROTECTED_REGULAR: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+fn knob(k: &core::sync::atomic::AtomicU8) -> u8 {
+    k.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+macro_rules! protected_ctl {
+    ($path:literal, $k:ident, $max:literal) => {
+        crate::sysctl::Ctl {
+            path: $path,
+            mode: 0o600,
+            show: || alloc::vec![i64::from(knob(&$k))],
+            store: |v| {
+                crate::sysctl::range(v[0], 0, $max)?;
+                $k.store(v[0] as u8, core::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            },
+            text: None,
+        }
+    };
+}
+
+/// /proc/sys/fs/protected_* (mode 0600, as Linux)
+pub static PROTECTED_CTLS: &[crate::sysctl::Ctl] = &[
+    protected_ctl!("fs/protected_symlinks", PROTECTED_SYMLINKS, 1),
+    protected_ctl!("fs/protected_hardlinks", PROTECTED_HARDLINKS, 1),
+    protected_ctl!("fs/protected_fifos", PROTECTED_FIFOS, 2),
+    protected_ctl!("fs/protected_regular", PROTECTED_REGULAR, 2),
+];
+
+const S_IWOTH: u16 = 0o002;
+const S_IWGRP: u16 = 0o020;
+
+/// Following symlink `link` found in `dir` (Linux may_follow_link): with
+/// fs.protected_symlinks, a link in a sticky world-writable directory
+/// is followed only by its owner or when the directory's owner owns it
+/// (EACCES)
+pub fn may_follow_link(c: &Cred, dir: &Inode, link: &Inode) -> Result<(), KernelError> {
+    if knob(&PROTECTED_SYMLINKS) == 0 || link.uid() == c.fsuid {
+        return Ok(());
+    }
+    let mode = dir.mode().raw();
+    if mode & (S_ISVTX | S_IWOTH) != S_ISVTX | S_IWOTH || dir.uid() == link.uid() {
+        return Ok(());
+    }
+    Err(KernelError::PermissionDenied)
+}
+
+/// Hard-linking `inode` (Linux may_linkat): with fs.protected_hardlinks
+/// only its owner (or CAP_FOWNER) may, unless it is a safe source: a
+/// regular file, not set-user-ID, not set-group-ID-executable, that the
+/// caller may read and write (EPERM)
+pub fn may_linkat(c: &Cred, inode: &Inode) -> Result<(), KernelError> {
+    if knob(&PROTECTED_HARDLINKS) == 0 || owner_or_capable(c, inode) {
+        return Ok(());
+    }
+    let mode = inode.mode();
+    let raw = mode.raw();
+    let safe = mode.is_file()
+        && raw & S_ISUID == 0
+        && raw & (S_ISGID | S_IXGRP) != S_ISGID | S_IXGRP
+        && permission_as(c, inode, MAY_READ | MAY_WRITE).is_ok();
+    if safe {
+        Ok(())
+    } else {
+        Err(KernelError::NotPermitted)
+    }
+}
+
+/// An O_CREAT open of the existing `inode` in `dir` (Linux
+/// may_create_in_sticky): with fs.protected_fifos / _regular, a FIFO or
+/// regular file in a sticky directory owned by neither the directory's
+/// owner nor the caller is refused if the directory is world-writable
+/// (level 1), or group-writable (level 2) (EACCES)
+pub fn may_create_in_sticky(c: &Cred, dir: &Inode, inode: &Inode) -> Result<(), KernelError> {
+    let dmode = dir.mode().raw();
+    let mode = inode.mode();
+    // A regular file or FIFO only when its knob is on; any other type
+    // is checked whatever the knobs (Linux may_create_in_sticky)
+    let level = if mode.is_file() {
+        Some(knob(&PROTECTED_REGULAR))
+    } else if mode.is_fifo() {
+        Some(knob(&PROTECTED_FIFOS))
+    } else {
+        None
+    };
+    if dmode & S_ISVTX == 0 || level == Some(0) {
+        return Ok(());
+    }
+    if inode.uid() == dir.uid() || inode.uid() == c.fsuid {
+        return Ok(());
+    }
+    // World-writable: refused; group-writable: only at level 2
+    if dmode & S_IWOTH != 0 || (dmode & S_IWGRP != 0 && level.is_some_and(|l| l >= 2)) {
+        return Err(KernelError::PermissionDenied);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::task::GroupInfo;
+
+    const R: u32 = MAY_READ;
+    const W: u32 = MAY_WRITE;
+    const X: u32 = MAY_EXEC;
+
+    fn ok(c: &Cred, uid: Uid, gid: Gid, perm: u16, dir: bool, mask: u32) -> bool {
+        permission_ids(c, uid, gid, perm, dir, mask).is_ok()
+    }
+
+    /// Linux acl_permission_check: only the caller's class counts; an
+    /// owner denied by the owner bits is not let in by group or other
+    #[test]
+    fn class_bits_only() {
+        let u = Cred::new(1000, 1000);
+        assert!(ok(&u, 1000, 0, 0o600, false, R | W));
+        assert!(!ok(&u, 1000, 0, 0o066, false, R));
+        assert!(ok(&u, 0, 1000, 0o040, false, R));
+        assert!(!ok(&u, 0, 1000, 0o404, false, R));
+        assert!(ok(&u, 0, 0, 0o004, false, R));
+        assert!(!ok(&u, 0, 0, 0o770, false, R));
+        assert!(!ok(&u, 1000, 1000, 0o600, false, X));
+    }
+
+    /// The fsuid and fsgid decide, and a supplementary group is a group
+    #[test]
+    fn fs_ids_and_groups() {
+        let mut u = Cred::new(1000, 1000);
+        u.fsuid = 2000;
+        assert!(!ok(&u, 1000, 0, 0o600, false, R));
+        assert!(ok(&u, 2000, 0, 0o600, false, R));
+        u.groups = GroupInfo::new(alloc::vec![27, 5]);
+        assert!(ok(&u, 0, 27, 0o060, false, R | W));
+        assert!(!ok(&u, 0, 28, 0o060, false, R));
+    }
+
+    /// MAY_OPEN and MAY_APPEND are not mode bits: they never refuse
+    #[test]
+    fn extra_mask_bits_ignored() {
+        let u = Cred::new(1000, 1000);
+        assert!(ok(&u, 1000, 1000, 0o200, false, W | MAY_APPEND | MAY_OPEN));
+    }
+
+    /// Linux ACC_MODE plus O_TRUNC (write) and O_APPEND (MAY_APPEND)
+    #[test]
+    fn open_access_mode() {
+        assert_eq!(acc_mode(0), R);
+        assert_eq!(acc_mode(1), W);
+        assert_eq!(acc_mode(2), R | W);
+        assert_eq!(acc_mode(3), R | W);
+        assert_eq!(acc_mode(O_TRUNC), R | W);
+        assert_eq!(acc_mode(1 | O_APPEND), W | MAY_APPEND);
+    }
+
+    /// access(2) checks with the real ids, and keeps capabilities only
+    /// for a real root (Linux access_override_creds)
+    #[test]
+    fn access_uses_real_ids() {
+        let mut c = Cred::new(1000, 1000);
+        c.euid = 0;
+        c.fsuid = 0;
+        c.cap_permitted = crate::task::KernelCap::full();
+        let a = access_cred(&c);
+        assert_eq!((a.fsuid, a.fsgid), (1000, 1000));
+        assert!(!a.cap_effective.has(CAP_DAC_OVERRIDE));
+        let r = access_cred(&Cred::ROOT);
+        assert!(r.cap_effective.has(CAP_DAC_OVERRIDE));
+    }
 }

@@ -106,11 +106,13 @@ pub fn run_tests() {
     // At the limit, a hole or a middle mprotect would add a VMA
     let hole = sys_munmap(last as u64 + PAGE, PAGE);
     let mid = sys_mprotect(last as u64 + PAGE, PAGE, PROT_READ | 2);
+    // So would locking or unlocking the middle page (Linux mlock_fixup)
+    let lock = hk_syscall::sys_mlock(last as u64 + PAGE, PAGE);
     let whole = sys_munmap(last as u64, 3 * PAGE);
     verdict(
         b"MAX_MAP_COUNT_SPLIT",
-        hole == ENOMEM && mid == ENOMEM && whole == 0,
-        hole * 1000 + mid,
+        hole == ENOMEM && mid == ENOMEM && lock == ENOMEM && whole == 0,
+        hole * 1_000_000 + mid * 1000 + lock,
     );
     let restored = write_limit(def);
     let again = map(PROT_READ);

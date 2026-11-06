@@ -19,6 +19,9 @@ sudo apt install build-essential cpio grub-pc-bin grub-common mtools xorriso dos
 # Cross-compiler for aarch64 userspace
 sudo apt install gcc-aarch64-linux-gnu
 
+# arm64 host unit tests (make test-arm) on an x86-64 host
+sudo apt install qemu-user qemu-user-binfmt libc6-dev-arm64-cross
+
 # Verified .deb downloads (busybox-static, glibc, bash and coreutils for
 # the initramfs, Linux kernels for make check-linux*), the initramfs
 # library closure (readelf), the HTTP test peer of the QEMU network and

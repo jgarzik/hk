@@ -7,7 +7,6 @@
 //! - Some legacy syscalls removed (open, fork, dup2)
 
 // Syscall numbers are a reference table for Linux ABI compatibility
-#![allow(dead_code)]
 
 use crate::syscall::Sys;
 
@@ -310,7 +309,6 @@ pub const SYS_RT_SIGACTION: u64 = 134;
 pub const SYS_RT_SIGPROCMASK: u64 = 135;
 pub const SYS_RT_SIGPENDING: u64 = 136;
 pub const SYS_RT_SIGTIMEDWAIT: u64 = 137;
-#[allow(dead_code)] // Infrastructure for future signal delivery
 pub const SYS_RT_SIGRETURN: u64 = 139;
 /// rt_sigqueueinfo(pid, sig, uinfo)
 pub const SYS_RT_SIGQUEUEINFO: u64 = 138;

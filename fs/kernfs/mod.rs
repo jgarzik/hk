@@ -47,6 +47,7 @@ use crate::sync::RwSem;
 use crate::sync::spin::RwLock;
 use crate::sync::waitqueue::WaitQueue;
 use crate::util::error::KernelError;
+use crate::util::kalloc::{arc_nofail, try_arc};
 
 /// Serializes changes to the tree's shape
 static KERNFS_RWSEM: RwSem<()> = RwSem::new(());
@@ -115,7 +116,7 @@ impl<F: Fn(&mut SysBuf) + Send + Sync> Attr for ShowFn<F> {
 
 /// Read-only attribute showing `f()`
 pub fn show(f: impl Fn(&mut SysBuf) + Send + Sync + 'static) -> Arc<dyn Attr> {
-    Arc::new(ShowFn(f))
+    arc_nofail(ShowFn(f))
 }
 
 /// An attribute node's state
@@ -136,6 +137,21 @@ impl AttrNode {
     }
 }
 
+/// A binary attribute node's operations (Linux kernfs_ops of a bin
+/// attribute): revoked at removal, so a node a dentry or open file
+/// keeps holds no device object
+pub struct BinNode {
+    /// None once the node is removed
+    ops: RwLock<Option<Arc<dyn BinAttr>>>,
+}
+
+impl BinNode {
+    /// The operations, while the node is not removed
+    pub fn ops(&self) -> Option<Arc<dyn BinAttr>> {
+        self.ops.read().clone()
+    }
+}
+
 /// A child's key: (name hash, namespace tag, name)
 type Key = (u32, u64, Vec<u8>);
 
@@ -145,10 +161,22 @@ pub type Children = RwLock<BTreeMap<Key, Arc<KNode>>>;
 pub enum Kind {
     Dir(Children),
     Attr(AttrNode),
-    Bin(Arc<dyn BinAttr>),
+    Bin(BinNode),
     /// Symlink to a node (Linux holds a reference; a link outliving its
     /// target reads as ENOENT)
     Link(Weak<KNode>),
+}
+
+/// Attributes set on a node by chmod, chown or utimes (Linux struct
+/// kernfs_iattrs): every inode made for it starts from them
+#[derive(Clone, Copy)]
+pub struct Iattr {
+    pub perm: u16,
+    pub uid: crate::task::Uid,
+    pub gid: crate::task::Gid,
+    pub atime: crate::time::Timespec,
+    pub mtime: crate::time::Timespec,
+    pub ctime: crate::time::Timespec,
 }
 
 /// A kernfs node (Linux struct kernfs_node)
@@ -165,13 +193,15 @@ pub struct KNode {
     active: AtomicI32,
     /// Removal waits here for `active` to drain
     drain: WaitQueue,
+    /// What chmod/chown/utimes set (None: the defaults)
+    pub iattr: crate::sync::spin::Mutex<Option<Iattr>>,
 }
 
 /// Linux kernfs_name_hash: positions 0, 1 and i32::MAX are reserved
 fn name_hash(name: &[u8]) -> u32 {
     let mut h: u32 = 0x811c_9dc5;
     for &b in name {
-        h = (h ^ b as u32).wrapping_mul(0x0100_0193);
+        h = (h ^ u32::from(b)).wrapping_mul(0x0100_0193);
     }
     let h = h & 0x7fff_ffff;
     if h < 2 {
@@ -200,12 +230,12 @@ impl Drop for Active<'_> {
 }
 
 impl KNode {
-    fn new(name: &[u8], mode: u16, kind: Kind) -> Arc<Self> {
+    fn new(name: &[u8], mode: u16, kind: Kind) -> Self {
         Self::new_ns(name, mode, kind, 0)
     }
 
-    fn new_ns(name: &[u8], mode: u16, kind: Kind, ns: u64) -> Arc<Self> {
-        Arc::new(Self {
+    fn new_ns(name: &[u8], mode: u16, kind: Kind, ns: u64) -> Self {
+        Self {
             name: RwLock::new(name.to_vec()),
             parent: RwLock::new(Weak::new()),
             mode,
@@ -214,12 +244,17 @@ impl KNode {
             kind,
             active: AtomicI32::new(0),
             drain: WaitQueue::new(),
-        })
+            iattr: crate::sync::spin::Mutex::new(None),
+        }
     }
 
     /// A new root directory
     pub fn new_root() -> Arc<Self> {
-        Self::new(b"", 0o755, Kind::Dir(RwLock::new(BTreeMap::new())))
+        arc_nofail(Self::new(
+            b"",
+            0o755,
+            Kind::Dir(RwLock::new(BTreeMap::new())),
+        ))
     }
 
     pub fn name(&self) -> Vec<u8> {
@@ -337,7 +372,7 @@ impl KNode {
         ns: u64,
     ) -> Result<Arc<KNode>, KernelError> {
         let kind = Kind::Dir(RwLock::new(BTreeMap::new()));
-        self.add(Self::new_ns(name, mode, kind, ns))
+        self.add(try_arc(Self::new_ns(name, mode, kind, ns))?)
     }
 
     /// New attribute `name` with permission bits `mode`
@@ -352,7 +387,7 @@ impl KNode {
             event: AtomicU32::new(0),
             poll: WaitQueue::new(),
         };
-        self.add(Self::new(name, mode, Kind::Attr(a)))
+        self.add(try_arc(Self::new(name, mode, Kind::Attr(a)))?)
     }
 
     /// New binary attribute `name`
@@ -362,7 +397,10 @@ impl KNode {
         mode: u16,
         ops: Arc<dyn BinAttr>,
     ) -> Result<Arc<KNode>, KernelError> {
-        self.add(Self::new(name, mode, Kind::Bin(ops)))
+        let b = BinNode {
+            ops: RwLock::new(Some(ops)),
+        };
+        self.add(try_arc(Self::new(name, mode, Kind::Bin(b)))?)
     }
 
     /// New symlink `name` -> `target`
@@ -382,7 +420,7 @@ impl KNode {
         ns: u64,
     ) -> Result<Arc<KNode>, KernelError> {
         let kind = Kind::Link(Arc::downgrade(target));
-        self.add(Self::new_ns(name, 0o777, kind, ns))
+        self.add(try_arc(Self::new_ns(name, 0o777, kind, ns))?)
     }
 
     /// The subtree rooted here, parents first
@@ -419,10 +457,11 @@ impl KNode {
         for n in &nodes {
             n.drain
                 .wait_event(|| n.active.load(Ordering::Acquire) == DEACTIVATED);
-            if let Kind::Attr(a) = &n.kind {
-                // Dropped outside the lock: it may own the object
-                let ops = a.ops.write().take();
-                drop(ops);
+            // Dropped outside the lock: they may own the object
+            match &n.kind {
+                Kind::Attr(a) => drop(a.ops.write().take()),
+                Kind::Bin(b) => drop(b.ops.write().take()),
+                _ => {}
             }
         }
         let _w = KERNFS_RWSEM.write();
@@ -509,6 +548,42 @@ impl KNode {
         if let Kind::Attr(a) = &self.kind {
             a.event.fetch_add(1, Ordering::AcqRel);
             a.poll.wake_all();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Probe;
+
+    impl BinAttr for Probe {
+        fn size(&self) -> u64 {
+            4
+        }
+
+        fn read(&self, _off: u64, _buf: &mut [u8]) -> Result<usize, KernelError> {
+            Ok(0)
+        }
+    }
+
+    /// Linux kernfs_drain, then the ops are gone: a removed binary
+    /// attribute no longer holds its object, though the node lives on
+    #[test]
+    // The kernfs locks reach aarch64 per-CPU and IRQ-state registers,
+    // which a host (EL0) test cannot read
+    #[cfg_attr(target_arch = "aarch64", ignore)]
+    fn removed_bin_drops_ops() {
+        let root = KNode::new_root();
+        let ops: Arc<dyn BinAttr> = Arc::new(Probe);
+        let kn = root.create_bin(b"config", 0o644, ops.clone()).unwrap();
+        assert_eq!(Arc::strong_count(&ops), 2);
+        kn.remove();
+        assert_eq!(Arc::strong_count(&ops), 1);
+        match &kn.kind {
+            Kind::Bin(b) => assert!(b.ops().is_none()),
+            _ => panic!("not a bin attribute"),
         }
     }
 }

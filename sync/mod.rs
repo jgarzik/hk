@@ -12,12 +12,14 @@ pub mod completion;
 pub mod waitqueue;
 
 pub mod lockdep;
+mod locked_by;
 mod mutex;
 mod racy;
 mod rwsem;
 mod seqlock;
 pub mod spin;
 
+pub use locked_by::{LockedBy, UniqueOwner};
 pub use mutex::{Mutex, MutexGuard};
 pub use racy::RacyCell;
 pub use rwsem::{RwSem, RwSemReadGuard, RwSemWriteGuard};

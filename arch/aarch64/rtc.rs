@@ -12,7 +12,7 @@
 //! - RTCRIS (0x014): Raw Interrupt Status
 //! - RTCMIS (0x018): Masked Interrupt Status
 //! - RTCICR (0x01C): Interrupt Clear Register
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use core::ptr;
 
@@ -30,7 +30,7 @@ const RTCCR: usize = 0x00C; // Control Register
 pub fn read_rtc() -> i64 {
     // The PL031 data register directly contains Unix time in seconds
     let time = unsafe { ptr::read_volatile((PL031_BASE + RTCDR) as *const u32) };
-    time as i64
+    i64::from(time)
 }
 
 /// Initialize the PL031 RTC
@@ -49,7 +49,7 @@ pub fn init() {
 }
 
 /// Set the RTC time (optional - typically set by firmware/hypervisor)
-#[allow(dead_code)]
+#[expect(dead_code)]
 pub fn set_rtc(seconds_since_epoch: u32) {
     unsafe {
         ptr::write_volatile((PL031_BASE + RTCLR) as *mut u32, seconds_since_epoch);
@@ -76,5 +76,5 @@ impl crate::base::Bound for Pl031 {
 fn pl031_probe(
     _dev: &alloc::sync::Arc<crate::base::Device>,
 ) -> Result<alloc::boxed::Box<dyn crate::base::Bound>, crate::util::error::KernelError> {
-    Ok(alloc::boxed::Box::new(Pl031))
+    Ok(crate::util::kalloc::try_box(Pl031)?)
 }

@@ -19,7 +19,7 @@
 //!
 //! XSAVE/XRSTOR (standard format) are used when the CPU supports them, with
 //! XCR0 = x87 | SSE (| AVX); otherwise FXSAVE/FXRSTOR (x87 + SSE only).
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
@@ -145,7 +145,7 @@ pub fn init_cpu(bsp: bool) {
         let has_avx = ecx & (1 << 28) != 0;
         if has_xsave {
             let (supported_lo, _, _, supported_hi) = cpuid(0xd, 0);
-            let supported = ((supported_hi as u64) << 32) | supported_lo as u64;
+            let supported = (u64::from(supported_hi) << 32) | u64::from(supported_lo);
             let mut xcr0 = XFEATURE_X87 | XFEATURE_SSE;
             if has_avx && supported & XFEATURE_AVX != 0 {
                 xcr0 |= XFEATURE_AVX;
@@ -218,7 +218,7 @@ pub fn restore(area: &FpuArea) {
 /// `area` must be valid for writes of an `FpuArea` and 64-byte aligned.
 #[inline]
 pub unsafe fn save_raw(area: *mut FpuArea) {
-    let p = area as *mut u8;
+    let p = area.cast::<u8>();
     unsafe {
         if use_xsave() {
             // XSAVE writes only XSTATE_BV of the header: XCOMP_BV and the
@@ -244,7 +244,7 @@ pub unsafe fn save_raw(area: *mut FpuArea) {
 /// validated by [`sanitize_sigframe`]), 64-byte aligned.
 #[inline]
 pub unsafe fn restore_raw(area: *const FpuArea) {
-    let p = area as *const u8;
+    let p = area.cast::<u8>();
     unsafe {
         if use_xsave() {
             core::arch::asm!(

@@ -16,6 +16,7 @@
 
 extern crate alloc;
 
+use crate::util::kalloc::try_arc;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
@@ -295,14 +296,29 @@ fn find_swap_by_path(path: &[u8]) -> Option<u8> {
 /// blocks at swapon and bypasses the filesystem)
 pub fn get_swap_page() -> Option<SwapEntry> {
     let reclaiming = crate::task::percpu::current().has_flag(crate::task::pf::MEMALLOC);
-    let devs: Vec<Arc<SwapInfo>> = SWAP_INFO.read().iter().flatten().cloned().collect();
-    let mut devs: Vec<_> = devs
-        .into_iter()
-        .filter(|s| s.writeok() && !(reclaiming && s.inode.is_some()))
-        .collect();
-    devs.sort_by_key(|s| core::cmp::Reverse(s.priority));
-    devs.iter()
-        .find_map(|si| si.alloc_slot().map(|off| SwapEntry::new(si.swap_type, off)))
+    // A copy of the table (no allocation under its lock), then the
+    // usable devices in priority order
+    let mut devs = SWAP_INFO.read().clone();
+    for d in devs.iter_mut() {
+        if d.as_ref()
+            .is_some_and(|s| !s.writeok() || (reclaiming && s.inode.is_some()))
+        {
+            *d = None;
+        }
+    }
+    loop {
+        let best = devs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, d)| d.as_ref().map(|s| (i, s.priority)))
+            // Equal priorities: the lower type first, as before
+            .max_by_key(|&(i, p)| (p, core::cmp::Reverse(i)))?
+            .0;
+        let si = devs[best].take()?;
+        if let Some(off) = si.alloc_slot() {
+            return Some(SwapEntry::new(si.swap_type, off));
+        }
+    }
 }
 
 /// One more swap PTE references `e` (Linux swap_duplicate: fork, and
@@ -455,9 +471,13 @@ fn parse_header(hdr: &[u8; PAGE_SIZE], size: u64) -> Result<u64, KernelError> {
     }
     // SAFETY: the header info lies inside the page; read unaligned
     let info = unsafe {
-        core::ptr::read_unaligned(hdr[SWAP_HEADER_INFO_OFFSET..].as_ptr() as *const SwapHeaderInfo)
+        core::ptr::read_unaligned(
+            hdr[SWAP_HEADER_INFO_OFFSET..]
+                .as_ptr()
+                .cast::<SwapHeaderInfo>(),
+        )
     };
-    let max = info.last_page as u64 + 1;
+    let max = u64::from(info.last_page) + 1;
     if info.version != 1 || info.last_page == 0 || max > size {
         return Err(KernelError::InvalidArgument);
     }
@@ -507,12 +527,12 @@ fn swapon(path_ptr: u64, swap_flags: i32) -> Result<(), KernelError> {
     }
     let mut hdr = [0u8; PAGE_SIZE];
     let read = match &bdev {
-        Some(b) => bdev_rw(b, BioOp::Read, 0, &mut hdr).map(|_| PAGE_SIZE),
+        Some(b) => bdev_rw(b, BioOp::Read, 0, &mut hdr).map(|()| PAGE_SIZE),
         None => inode
             .i_data
             .aops()
             .swap_rw(&inode, 0, &mut hdr, false)
-            .map(|_| PAGE_SIZE),
+            .map(|()| PAGE_SIZE),
     };
     if read.unwrap_or(0) < PAGE_SIZE {
         return Err(KernelError::InvalidArgument);
@@ -534,14 +554,14 @@ fn swapon(path_ptr: u64, swap_flags: i32) -> Result<(), KernelError> {
         Some(b) => (None, Some(b)),
         None => (Some(inode), None),
     };
-    let si = SwapInfo::new(backing, path, swap_type, max, priority)?;
+    let si = try_arc(SwapInfo::new(backing, path, swap_type, max, priority)?)?;
     // S_SWAPFILE under i_rwsem (Linux claim_swapfile under inode_lock):
     // a write or truncate in flight finishes first, later ones see it
     let si_inode = si.swapfile_inode();
     let lock = si_inode.lock();
     si_inode.i_swapfile.store(true, Ordering::Release);
     drop(lock);
-    SWAP_INFO.write()[swap_type as usize] = Some(Arc::new(si));
+    SWAP_INFO.write()[swap_type as usize] = Some(si);
     TOTAL_SWAP_PAGES.fetch_add(max - 1, Ordering::Relaxed);
     Ok(())
 }

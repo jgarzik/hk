@@ -19,6 +19,8 @@ use super::inode::Inode;
 use super::name::FileName;
 use super::path_ref::Path;
 use super::superblock::SuperBlock;
+use crate::util::error::KernelError;
+use crate::util::kalloc::try_arc;
 
 /// Dentry flags
 #[derive(Debug, Clone, Copy, Default)]
@@ -104,7 +106,30 @@ impl Dentry {
     /// The child `name` of `parent` with `inode` (Linux d_alloc +
     /// d_add): the cached one if there is one (a negative one gets
     /// `inode`), so a name never has two dentries
-    pub fn alloc(parent: &Arc<Dentry>, name: &[u8], inode: Option<Arc<Inode>>) -> Arc<Dentry> {
+    pub fn alloc(
+        parent: &Arc<Dentry>,
+        name: &[u8],
+        inode: Option<Arc<Inode>>,
+    ) -> Result<Arc<Dentry>, KernelError> {
+        let d = Self::prealloc(parent, name)?;
+        Ok(Self::add(parent, d, inode))
+    }
+
+    /// A new child dentry of `parent`, not yet in the tree: the
+    /// allocation a create does before the filesystem makes the entry
+    /// (Linux d_alloc in lookup_create), so an ENOMEM leaves nothing
+    /// half made
+    pub fn prealloc(parent: &Arc<Dentry>, name: &[u8]) -> Result<Arc<Dentry>, KernelError> {
+        try_arc(Self::with(name.into(), None, parent.sb.clone()))
+    }
+
+    /// Put `d` (from `prealloc` on `parent`) in the tree with `inode`
+    /// (Linux d_add / d_instantiate): the cached child of that name if
+    /// there is one (a negative one gets `inode`), so a name never has
+    /// two dentries
+    pub fn add(parent: &Arc<Dentry>, d: Arc<Dentry>, inode: Option<Arc<Inode>>) -> Arc<Dentry> {
+        let name = d.name();
+        let name = name.as_bytes();
         let mut p = parent.d_lock.write();
         if let Some(c) = p.children.get(name) {
             let mut ci = c.d_lock.write();
@@ -123,8 +148,11 @@ impl Dentry {
             }
             ci.flags.unhashed = true;
         }
-        let d = Arc::new(Self::with(name.into(), inode, parent.sb.clone()));
-        d.d_lock.write().parent = Some(parent.clone());
+        {
+            let mut dl = d.d_lock.write();
+            dl.inode = inode;
+            dl.parent = Some(parent.clone());
+        }
         p.children.insert(name.into(), d.clone());
         d
     }

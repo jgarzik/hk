@@ -28,7 +28,7 @@ impl DumbBuffer {
         let min_pitch = width * bytes_per_pixel;
         let pitch = (min_pitch + 63) & !63;
 
-        let size = (pitch as u64) * (height as u64);
+        let size = u64::from(pitch) * u64::from(height);
 
         Self {
             handle,
@@ -40,7 +40,7 @@ impl DumbBuffer {
 
     /// Create a dumb buffer with explicit pitch
     pub fn with_pitch(handle: u32, pitch: u32, height: u32, phys_addr: u64) -> Self {
-        let size = (pitch as u64) * (height as u64);
+        let size = u64::from(pitch) * u64::from(height);
 
         Self {
             handle,

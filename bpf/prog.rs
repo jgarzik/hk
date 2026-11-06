@@ -3,6 +3,8 @@
 //! This module provides the `BpfProg` struct that holds a validated
 //! eBPF program ready for execution.
 
+use crate::util::error::KernelError;
+use crate::util::kalloc::try_arc;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
@@ -25,9 +27,9 @@ impl BpfProg {
     /// Create a new BPF program from instructions
     ///
     /// The instructions should already be validated.
-    pub fn new(insns: Vec<BpfInsn>) -> Arc<Self> {
+    pub fn new(insns: Vec<BpfInsn>) -> Result<Arc<Self>, KernelError> {
         let len = insns.len();
-        Arc::new(Self { insns, len })
+        try_arc(Self { insns, len })
     }
 
     /// Get the program instructions

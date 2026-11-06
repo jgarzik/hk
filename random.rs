@@ -224,7 +224,7 @@ pub fn add_device_randomness(data: &[u8]) {
         let mut base = BASE.lock();
         let mut key = base.key;
         for (i, b) in chunk.iter().enumerate() {
-            key[i / 4] ^= (*b as u32) << (8 * (i % 4));
+            key[i / 4] ^= u32::from(*b) << (8 * (i % 4));
         }
         let mut blk = chacha20_block(&key, 0, &[0x6d69_7800, 0, 0]);
         base.key.copy_from_slice(&blk[..8]);

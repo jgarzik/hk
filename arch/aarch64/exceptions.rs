@@ -1,7 +1,7 @@
 //! AArch64 Exception Handling
 //!
 //! This module contains exception handlers for synchronous exceptions and IRQs.
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use crate::printkln;
 use core::arch::asm;
@@ -32,7 +32,7 @@ unsafe extern "C" {
 /// Installs the exception vector table by writing its address to VBAR_EL1.
 pub fn init() {
     unsafe {
-        let vbar = &exception_vectors as *const u8 as u64;
+        let vbar = &raw const exception_vectors as u64;
         asm!(
             "msr vbar_el1, {0}",
             "isb",
@@ -40,9 +40,10 @@ pub fn init() {
             options(nostack, preserves_flags)
         );
     }
-    printkln!("Exception vectors installed at {:#x}", unsafe {
-        &exception_vectors as *const u8 as u64
-    });
+    printkln!(
+        "Exception vectors installed at {:#x}",
+        &raw const exception_vectors as u64
+    );
 }
 
 /// Handle synchronous exception from EL1 (kernel mode)

@@ -100,7 +100,7 @@ impl GroupCputimer {
     /// (Linux account_group_*_time)
     pub fn charge(&self, delta: u64, kernel: bool) {
         if self.active.load(Ordering::Relaxed) {
-            self.sums[kernel as usize].fetch_add(delta, Ordering::Relaxed);
+            self.sums[usize::from(kernel)].fetch_add(delta, Ordering::Relaxed);
         }
     }
 

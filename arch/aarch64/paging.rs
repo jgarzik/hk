@@ -11,7 +11,7 @@
 //!
 //! TTBR0_EL1 maps user space only (lower half of the address space);
 //! TTBR1_EL1 maps the kernel (upper half): see kmap.rs and doc/MEMORY.md.
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use core::arch::asm;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -88,7 +88,7 @@ pub fn virt_to_phys(virt: u64) -> u64 {
 /// Convert physical address to page table pointer
 #[inline]
 pub fn phys_to_virt_table(phys: u64) -> *mut RawPageTable {
-    phys_to_virt(phys) as *mut RawPageTable
+    phys_to_virt(phys).cast::<RawPageTable>()
 }
 
 /// Convert physical address to const page table pointer
@@ -172,13 +172,13 @@ pub fn pte_ptr(root: u64, va: u64) -> Option<*mut u64> {
     if !user_va(va) {
         return None;
     }
-    let mut table = phys_to_virt(root) as *mut u64;
+    let mut table = phys_to_virt(root).cast::<u64>();
     for shift in [39, 30, 21] {
         let e = unsafe { *table.add(((va >> shift) & 511) as usize) };
         if e & 0b11 != DESC_TABLE {
             return None;
         }
-        table = phys_to_virt(e & ADDR_MASK) as *mut u64;
+        table = phys_to_virt(e & ADDR_MASK).cast::<u64>();
     }
     Some(unsafe { table.add(((va >> 12) & 511) as usize) })
 }
@@ -277,13 +277,13 @@ pub fn pmd_ptr(root: u64, va: u64) -> Option<*mut u64> {
     if !user_va(va) {
         return None;
     }
-    let mut table = phys_to_virt(root) as *mut u64;
+    let mut table = phys_to_virt(root).cast::<u64>();
     for shift in [39, 30] {
         let e = entry_atomic(table, va >> shift).load(Ordering::Acquire);
         if e & 0b11 != DESC_TABLE {
             return None;
         }
-        table = phys_to_virt(e & ADDR_MASK) as *mut u64;
+        table = phys_to_virt(e & ADDR_MASK).cast::<u64>();
     }
     Some(entry_atomic(table, va >> 21).as_ptr())
 }
@@ -306,7 +306,7 @@ pub fn pte_alloc(root: u64, va: u64) -> Option<*mut u64> {
     if !user_va(va) {
         return None;
     }
-    let mut table = phys_to_virt(root) as *mut u64;
+    let mut table = phys_to_virt(root).cast::<u64>();
     for shift in [39, 30, 21] {
         let slot = entry_atomic(table, va >> shift);
         let mut e = crate::mm::huge_page::pmd_settled(slot);
@@ -329,7 +329,7 @@ pub fn pte_alloc(root: u64, va: u64) -> Option<*mut u64> {
         if e & 0b11 != DESC_TABLE {
             return None;
         }
-        table = phys_to_virt(e & ADDR_MASK) as *mut u64;
+        table = phys_to_virt(e & ADDR_MASK).cast::<u64>();
     }
     Some(entry_atomic(table, va >> 12).as_ptr())
 }
@@ -492,6 +492,10 @@ fn free_level(phys: u64, level: u32, put: &mut dyn FnMut(Leaf)) {
             2 if e.is_table() => free_level(e.addr(), 3, put),
             _ => {}
         }
+    }
+    // A PMD table: the page tables its 2MB pages kept for a split
+    if level == 2 {
+        crate::mm::huge_page::free_deposits(phys);
     }
     crate::FRAME_ALLOCATOR.free(phys);
 }

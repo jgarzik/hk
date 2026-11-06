@@ -112,7 +112,7 @@ fn do_readlinkat(dirfd: i32, path_ptr: u64, buf: u64, bufsiz: i32) -> Result<usi
         &path,
         LookupFlags::at(super::file::flags::AT_SYMLINK_NOFOLLOW),
     )?;
-    let inode = dentry.get_inode().ok_or(KernelError::NotFound)?;
+    let inode = dentry.dentry.get_inode().ok_or(KernelError::NotFound)?;
     if !inode.mode().is_symlink() {
         return Err(if path.is_empty() {
             KernelError::NotFound
@@ -128,6 +128,7 @@ fn do_readlinkat(dirfd: i32, path_ptr: u64, buf: u64, bufsiz: i32) -> Result<usi
     };
     let n = target.len().min(bufsiz as usize);
     copy_to_user::<Uaccess>(buf, &target[..n]).map_err(|_| KernelError::BadAddress)?;
+    inode.touch_atime(&dentry.mnt);
     Ok(n)
 }
 
@@ -158,7 +159,9 @@ fn link_locked(dir: &Arc<Inode>, name: &[u8], inode: &Arc<Inode>) -> Result<(), 
     if inode.get_nlink() == 0 {
         Err(KernelError::NotFound)
     } else {
-        dir.i_op.link(dir, name, inode)
+        dir.i_op
+            .link(dir, name, inode)
+            .inspect(|()| inode.touch_c())
     }
 }
 
@@ -214,8 +217,11 @@ pub fn sys_linkat(
         return KernelError::CrossDevice.sysret();
     }
 
+    // Linux do_linkat: may_linkat (fs.protected_hardlinks), then
     // vfs_link: may_create on the new parent, then no directories
-    // (fs.protected_hardlinks is not implemented: its kernel default is 0)
+    if let Err(e) = crate::fs::dac::may_linkat(&crate::task::current_cred(), &old_inode) {
+        return e.sysret();
+    }
     let r = create_entry(&p, |dir, _| {
         if old_inode.mode().is_dir() {
             return Err(KernelError::NotPermitted);
@@ -396,7 +402,7 @@ type Side<'a> = (&'a Parent, &'a Arc<Inode>);
 /// check + vfs_rename): may_delete of the source, may_create or
 /// may_delete of the target, and write permission on a directory that
 /// changes parent (its ".." is rewritten)
-fn rename_locked(old: Side, new: Side, flags: u32) -> Result<(), KernelError> {
+fn rename_locked(old: Side<'_>, new: Side<'_>, flags: u32) -> Result<(), KernelError> {
     let ((op, oname), odir) = ((&old.0.dir, old.0.name.as_slice()), old.1);
     let ((np, nname), ndir) = ((&new.0.dir, new.0.name.as_slice()), new.1);
     let src = lookup_one(op, oname)?;
@@ -484,6 +490,16 @@ fn rename_locked(old: Side, new: Side, flags: u32) -> Result<(), KernelError> {
         && r.is_ok()
     {
         d.set_dead();
+    }
+    // Both parents' mtime and ctime, both inodes' ctime (Linux
+    // simple_rename_timestamp)
+    if r.is_ok() {
+        odir.touch_mc();
+        ndir.touch_mc();
+        sinode.touch_c();
+        if let Some(d) = &dinode {
+            d.touch_c();
+        }
     }
     drop(dead_lock);
     drop(nondirs);

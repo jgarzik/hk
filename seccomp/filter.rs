@@ -20,6 +20,7 @@
 //! No locks: a filter is immutable and shared by `Arc` (the task's
 //! pointer to its chain is under TASKLIST).
 
+use crate::util::kalloc::try_arc;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
@@ -186,12 +187,12 @@ impl SeccompFilter {
             return Err(KernelError::OutOfMemory);
         }
         let cache = cache_prepare(&insns, prev.as_deref());
-        Ok(Arc::new(Self {
+        try_arc(Self {
             prog,
             cache,
             prev,
             log,
-        }))
+        })
     }
 
     /// Whether syscall `nr` is allowed without running the filters

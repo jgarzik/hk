@@ -17,7 +17,7 @@
 //!
 //! Functions return the number of bytes that could NOT be copied (0 = success),
 //! following the Linux kernel convention. This allows partial copies to be detected.
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 extern crate alloc;
 
@@ -57,7 +57,8 @@ pub fn pagefault_disabled() -> bool {
 #[track_caller]
 #[inline]
 fn might_fault() {
-    if !pagefault_disabled() {
+    // Host tests have no current task
+    if !cfg!(test) && !pagefault_disabled() {
         crate::sync::might_sleep();
     }
 }
@@ -224,6 +225,64 @@ pub fn copy_from_user<A: UaccessArch>(
     Ok(0)
 }
 
+/// `copy_to_user` that reports progress (Linux raw_copy_to_user, which
+/// returns the bytes not copied): the bytes copied before a fault
+/// stopped it, all of `from` on success, 0 for an address outside user
+/// space
+#[track_caller]
+pub fn copy_to_user_some<A: UaccessArch>(to: u64, from: &[u8]) -> usize {
+    might_fault();
+    if !A::access_ok(to, from.len()) {
+        return 0;
+    }
+    // SAFETY: `to` passed access_ok for the length (a fault is caught by
+    // the fixup and counted); `from` is a kernel slice; begin/end paired
+    let left = unsafe {
+        A::user_access_begin();
+        let left = A::copy_user_raw(to as *mut u8, from.as_ptr(), from.len());
+        A::user_access_end();
+        left
+    };
+    from.len() - left
+}
+
+/// `copy_from_user` that reports progress: the bytes copied into the
+/// front of `to` before a fault stopped it (see [`copy_to_user_some`])
+#[track_caller]
+pub fn copy_from_user_some<A: UaccessArch>(to: &mut [u8], from: u64) -> usize {
+    might_fault();
+    if !A::access_ok(from, to.len()) {
+        return 0;
+    }
+    // SAFETY: as in copy_to_user_some, the other way
+    let left = unsafe {
+        A::user_access_begin();
+        let left = A::copy_user_raw(to.as_mut_ptr(), from as *const u8, to.len());
+        A::user_access_end();
+        left
+    };
+    to.len() - left
+}
+
+/// [`copy_from_user_some`] for a copy under a lock a fault must not nest
+/// under: faults disabled for the copy, missing pages faulted in
+/// between tries (as `copy_from_user_atomic`); the bytes copied
+#[track_caller]
+pub fn copy_from_user_atomic_some<A: UaccessArch>(to: &mut [u8], from: u64) -> usize {
+    let mut done = 0;
+    while done < to.len() {
+        pagefault_disable();
+        let c = copy_from_user_some::<A>(&mut to[done..], from + done as u64);
+        pagefault_enable();
+        done += c;
+        let rest = to.len() - done;
+        if done < to.len() && c == 0 && fault_in_readable::<A>(from + done as u64, rest) == rest {
+            break;
+        }
+    }
+    done
+}
+
 /// Linux fault_in_readable: fault in every page of [addr, addr + len)
 /// for reading (one byte read per page, faults resolved as usual).
 /// Returns the bytes from the first page that could not be faulted in
@@ -358,7 +417,7 @@ pub fn cmpxchg_user_u32<A: UaccessArch>(uaddr: u64, old: u32, new: u32) -> Uacce
     // fault is caught by the fixup); `cur` is a local; begin/end paired
     let r = unsafe {
         A::user_access_begin();
-        let r = A::cmpxchg_user_raw(uaddr as *mut u32, old, new, &mut cur);
+        let r = A::cmpxchg_user_raw(uaddr as *mut u32, old, new, &raw mut cur);
         A::user_access_end();
         r
     };
@@ -452,4 +511,349 @@ pub fn strndup_user_bytes<A: UaccessArch>(
         ptr = ptr.checked_add(n as u64).ok_or(UaccessError::Overflow)?;
     }
     Err(UaccessError::TooLong)
+}
+
+impl From<UaccessError> for crate::util::error::KernelError {
+    /// The errno a syscall returns for a failed user access: EFAULT for
+    /// a bad or unmapped address, EAGAIN for a contended exclusive
+    /// store, EINVAL for text that is not UTF-8, ENAMETOOLONG for a
+    /// string without a NUL in its limit (callers with another limit
+    /// errno map `TooLong` themselves)
+    fn from(e: UaccessError) -> Self {
+        use crate::util::error::KernelError as E;
+        match e {
+            UaccessError::BadAddress | UaccessError::Overflow | UaccessError::Fault => {
+                E::BadAddress
+            }
+            UaccessError::Again => E::WouldBlock,
+            UaccessError::Encoding => E::InvalidArgument,
+            UaccessError::TooLong => E::NameTooLong,
+        }
+    }
+}
+
+/// A user-space address of a `T` (Linux `T __user *`): never
+/// dereferenced, only copied through with the uaccess functions, so a
+/// user address cannot be mistaken for a kernel one
+#[repr(transparent)]
+pub struct UserPtr<T> {
+    addr: u64,
+    _t: core::marker::PhantomData<fn() -> T>,
+}
+
+impl<T> Clone for UserPtr<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<T> Copy for UserPtr<T> {}
+
+impl<T> core::fmt::Debug for UserPtr<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "UserPtr({:#x})", self.addr)
+    }
+}
+
+impl<T> UserPtr<T> {
+    /// The user address `addr` (a syscall argument)
+    pub const fn new(addr: u64) -> Self {
+        Self {
+            addr,
+            _t: core::marker::PhantomData,
+        }
+    }
+
+    pub const fn addr(self) -> u64 {
+        self.addr
+    }
+
+    pub const fn is_null(self) -> bool {
+        self.addr == 0
+    }
+
+    /// The `n`th `T` after this one; None on overflow
+    pub fn offset(self, n: usize) -> Option<Self> {
+        let off = n.checked_mul(core::mem::size_of::<T>())?;
+        Some(Self::new(self.addr.checked_add(off as u64)?))
+    }
+
+    /// The same address as a `U`
+    pub const fn cast<U>(self) -> UserPtr<U> {
+        UserPtr::new(self.addr)
+    }
+}
+
+impl<T: FromBytes> UserPtr<T> {
+    /// The `T` at this address, read once
+    #[track_caller]
+    pub fn read(self) -> UaccessResult<T> {
+        get_user::<crate::arch::Uaccess, T>(self.addr)
+    }
+}
+
+impl<T: IntoBytes> UserPtr<T> {
+    /// Store `v` at this address
+    #[track_caller]
+    pub fn write(self, v: &T) -> UaccessResult<()> {
+        copy_to_user::<crate::arch::Uaccess>(self.addr, v.as_bytes()).map(|_| ())
+    }
+}
+
+/// A user buffer of `len` bytes at `addr` (Rust-for-Linux `UserSlice`):
+/// read it through one [`UserSliceReader`] or write it through one
+/// [`UserSliceWriter`], each moving forward only, so no byte is fetched
+/// twice (no double fetch to race against)
+pub struct UserSlice {
+    addr: u64,
+    len: usize,
+}
+
+impl UserSlice {
+    pub const fn new(addr: u64, len: usize) -> Self {
+        Self { addr, len }
+    }
+
+    /// Read the buffer front to back
+    pub fn reader(self) -> UserSliceReader {
+        UserSliceReader::<crate::arch::Uaccess>::new(self.addr, self.len)
+    }
+
+    /// Write the buffer front to back
+    pub fn writer(self) -> UserSliceWriter {
+        UserSliceWriter::<crate::arch::Uaccess>::new(self.addr, self.len)
+    }
+}
+
+/// The reading half of a [`UserSlice`]
+pub struct UserSliceReader<A: UaccessArch = crate::arch::Uaccess> {
+    addr: u64,
+    len: usize,
+    _a: core::marker::PhantomData<A>,
+}
+
+impl<A: UaccessArch> UserSliceReader<A> {
+    pub const fn new(addr: u64, len: usize) -> Self {
+        Self {
+            addr,
+            len,
+            _a: core::marker::PhantomData,
+        }
+    }
+
+    /// Bytes not read yet
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Fill `out` from the buffer and move past it; Overflow if fewer
+    /// bytes are left (nothing consumed then)
+    #[track_caller]
+    pub fn read_slice(&mut self, out: &mut [u8]) -> UaccessResult<()> {
+        if out.len() > self.len {
+            return Err(UaccessError::Overflow);
+        }
+        copy_from_user::<A>(out, self.addr, out.len())?;
+        self.skip(out.len())
+    }
+
+    /// The next `T` in the buffer
+    #[track_caller]
+    pub fn read<T: FromBytes>(&mut self) -> UaccessResult<T> {
+        let mut v = T::zeroed();
+        // SAFETY: `v`'s own bytes; any bytes written leave a valid T
+        // (FromBytes), and `v` is initialized (zeroed)
+        let b = unsafe {
+            core::slice::from_raw_parts_mut(
+                core::ptr::from_mut(&mut v).cast::<u8>(),
+                core::mem::size_of::<T>(),
+            )
+        };
+        self.read_slice(b)?;
+        Ok(v)
+    }
+
+    /// Move past `n` bytes unread
+    pub fn skip(&mut self, n: usize) -> UaccessResult<()> {
+        if n > self.len {
+            return Err(UaccessError::Overflow);
+        }
+        self.addr = self
+            .addr
+            .checked_add(n as u64)
+            .ok_or(UaccessError::Overflow)?;
+        self.len -= n;
+        Ok(())
+    }
+}
+
+/// The writing half of a [`UserSlice`]
+pub struct UserSliceWriter<A: UaccessArch = crate::arch::Uaccess> {
+    addr: u64,
+    len: usize,
+    _a: core::marker::PhantomData<A>,
+}
+
+impl<A: UaccessArch> UserSliceWriter<A> {
+    pub const fn new(addr: u64, len: usize) -> Self {
+        Self {
+            addr,
+            len,
+            _a: core::marker::PhantomData,
+        }
+    }
+
+    /// Room left
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Append `data`; Overflow if it does not fit (nothing written then)
+    #[track_caller]
+    pub fn write_slice(&mut self, data: &[u8]) -> UaccessResult<()> {
+        if data.len() > self.len {
+            return Err(UaccessError::Overflow);
+        }
+        copy_to_user::<A>(self.addr, data)?;
+        self.addr += data.len() as u64;
+        self.len -= data.len();
+        Ok(())
+    }
+
+    /// Append `v`'s bytes (no padding: `IntoBytes`)
+    #[track_caller]
+    pub fn write<T: IntoBytes>(&mut self, v: &T) -> UaccessResult<()> {
+        self.write_slice(v.as_bytes())
+    }
+}
+
+/// Linux copy_struct_from_user: a size-versioned struct (clone_args,
+/// open_how, sched_attr) of `usize` bytes at `src` into `dst`. A shorter
+/// user struct leaves `dst`'s tail zero (older ABI); a longer one must
+/// be zero past `dst`'s size (newer ABI fields this kernel does not
+/// know), else `E2BIG` (`Err(None)`). A failed access is `Err(Some(e))`.
+pub fn copy_struct_from_user<A: UaccessArch, T: FromBytes + IntoBytes>(
+    src: u64,
+    usize: usize,
+) -> Result<T, Option<UaccessError>> {
+    let ksize = core::mem::size_of::<T>();
+    let mut r = UserSliceReader::<A>::new(src, usize);
+    let mut v = T::zeroed();
+    // SAFETY: `v`'s own initialized bytes; any bytes leave a valid T
+    let b =
+        unsafe { core::slice::from_raw_parts_mut(core::ptr::from_mut(&mut v).cast::<u8>(), ksize) };
+    let n = ksize.min(usize);
+    r.read_slice(&mut b[..n]).map_err(Some)?;
+    // The rest of a longer user struct must be zero (Linux
+    // check_zeroed_user)
+    let mut chunk = [0u8; 64];
+    while !r.is_empty() {
+        let n = r.len().min(chunk.len());
+        r.read_slice(&mut chunk[..n]).map_err(Some)?;
+        if chunk[..n].iter().any(|&b| b != 0) {
+            return Err(None);
+        }
+    }
+    Ok(v)
+}
+
+/// A uaccess "architecture" over the host's own memory, for host unit
+/// tests of code that copies from and to user space: user addresses are
+/// host pointers
+#[cfg(test)]
+pub struct HostUaccess;
+
+#[cfg(test)]
+impl UaccessArch for HostUaccess {
+    const TASK_SIZE: u64 = u64::MAX;
+
+    unsafe fn user_access_begin() {}
+
+    unsafe fn copy_user_raw(dst: *mut u8, src: *const u8, len: usize) -> usize {
+        // SAFETY: test "user" addresses are live host buffers
+        unsafe { core::ptr::copy(src, dst, len) };
+        0
+    }
+
+    unsafe fn cmpxchg_user_raw(uaddr: *mut u32, old: u32, new: u32, cur: *mut u32) -> i32 {
+        // SAFETY: as above; aligned (the caller checked)
+        let a = unsafe { core::sync::atomic::AtomicU32::from_ptr(uaddr) };
+        let v = match a.compare_exchange(old, new, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(v) | Err(v) => v,
+        };
+        // SAFETY: `cur` is valid for a write (the caller)
+        unsafe { cur.write(v) };
+        0
+    }
+
+    unsafe fn user_access_end() {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ua<T>(p: &T) -> u64 {
+        core::ptr::from_ref(p).addr() as u64
+    }
+
+    #[test]
+    fn reader_moves_forward_once() {
+        let buf: [u32; 3] = [1, 2, 3];
+        let mut r = UserSliceReader::<HostUaccess>::new(ua(&buf), 12);
+        assert_eq!(r.read::<u32>(), Ok(1));
+        assert_eq!(r.read::<u64>(), Ok(2 | (3 << 32)));
+        assert!(r.is_empty());
+        assert_eq!(r.read::<u8>(), Err(UaccessError::Overflow));
+    }
+
+    #[test]
+    fn writer_bounds() {
+        let mut buf = [0u8; 6];
+        let mut w = UserSliceWriter::<HostUaccess>::new(buf.as_mut_ptr().addr() as u64, 6);
+        w.write(&0x0403_0201u32).unwrap();
+        assert_eq!(w.write(&0u32), Err(UaccessError::Overflow));
+        w.write_slice(&[5, 6]).unwrap();
+        assert_eq!(buf, [1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn struct_versions() {
+        // Shorter user struct: the tail stays zero
+        let short: [u32; 1] = [7];
+        let v = copy_struct_from_user::<HostUaccess, [u32; 2]>(ua(&short), 4);
+        assert_eq!(v, Ok([7, 0]));
+        // Longer with a zero tail: accepted
+        let long: [u32; 3] = [7, 8, 0];
+        let v = copy_struct_from_user::<HostUaccess, [u32; 2]>(ua(&long), 12);
+        assert_eq!(v, Ok([7, 8]));
+        // Longer with a nonzero tail: E2BIG
+        let long: [u32; 3] = [7, 8, 9];
+        let v = copy_struct_from_user::<HostUaccess, [u32; 2]>(ua(&long), 12);
+        assert_eq!(v, Err(None));
+    }
+
+    #[test]
+    fn strings_and_cmpxchg() {
+        let s = *b"hello\0world";
+        assert_eq!(
+            strndup_user_bytes::<HostUaccess>(ua(&s), 64).unwrap(),
+            b"hello"
+        );
+        assert_eq!(
+            strndup_user_bytes::<HostUaccess>(ua(&s), 3),
+            Err(UaccessError::TooLong)
+        );
+        let mut w = 5u32;
+        let wa = core::ptr::from_mut(&mut w).addr() as u64;
+        assert_eq!(cmpxchg_user_u32::<HostUaccess>(wa, 5, 9), Ok(5));
+        assert_eq!(cmpxchg_user_u32::<HostUaccess>(wa, 5, 1), Ok(9));
+    }
 }

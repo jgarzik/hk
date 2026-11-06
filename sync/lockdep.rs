@@ -25,7 +25,8 @@
 
 #[cfg(feature = "lockdep")]
 pub use imp::{
-    acquire, irq_enter, irq_exit, irqsafe_acquire, irqsafe_release, might_sleep, release,
+    acquire, atomic_alloc, irq_enter, irq_exit, irqsafe_acquire, irqsafe_release, might_sleep,
+    release,
 };
 
 /// Interrupt handler entry/exit (no-ops without `lockdep`)
@@ -51,6 +52,11 @@ pub fn irqsafe_release(_lock: usize, _enables: bool) {}
 #[cfg(not(feature = "lockdep"))]
 #[inline(always)]
 pub fn might_sleep() {}
+
+/// The heap is about to allocate (no-op without `lockdep`)
+#[cfg(not(feature = "lockdep"))]
+#[inline(always)]
+pub fn atomic_alloc() {}
 
 #[cfg(feature = "lockdep")]
 mod imp {
@@ -130,6 +136,26 @@ mod imp {
     static FULL: AtomicBool = AtomicBool::new(false);
     /// Reports printed (for the summary line)
     static NREPORTS: AtomicU32 = AtomicU32::new(0);
+    /// Distinct locks heap allocations were made under
+    static NATOMIC: AtomicU32 = AtomicU32::new(0);
+    /// Their keys, apart from the report table (`Graph.reported`): the
+    /// audit list cannot use up the room real reports need
+    static ATOMIC_SEEN: [core::sync::atomic::AtomicU64; 512] =
+        [const { core::sync::atomic::AtomicU64::new(0) }; 512];
+
+    /// First time `k` (nonzero) is seen in ATOMIC_SEEN; false once full
+    fn atomic_first(k: u64) -> bool {
+        let n = ATOMIC_SEEN.len();
+        for i in 0..n {
+            let slot = &ATOMIC_SEEN[(k as usize + i) % n];
+            match slot.compare_exchange(0, k, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => return true,
+                Err(v) if v == k => return false,
+                Err(_) => {}
+            }
+        }
+        false
+    }
 
     fn cpu() -> Option<&'static Cpu> {
         Some(&CPUS.this().0)
@@ -147,9 +173,9 @@ mod imp {
     fn key(l: Loc) -> u64 {
         let mut h = 0xcbf2_9ce4_8422_2325u64;
         for b in l.file().bytes() {
-            h = (h ^ b as u64).wrapping_mul(0x100_0000_01b3);
+            h = (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3);
         }
-        h ^ ((l.line() as u64) << 20) ^ l.column() as u64
+        h ^ (u64::from(l.line()) << 20) ^ u64::from(l.column())
     }
 
     fn slot(a: u64, b: u64) -> usize {
@@ -398,15 +424,47 @@ mod imp {
         });
     }
 
+    /// The heap is about to allocate: under a spin lock (outside an
+    /// interrupt handler) that takes the atomic reserve silently (the
+    /// heap picks GFP_ATOMIC by itself; Linux needs it named and
+    /// might_alloc reports a GFP_KERNEL one there). Listed once per
+    /// innermost lock as `LOCKDEP:ATOMIC_ALLOC`, an audit list, not a
+    /// failure.
+    pub fn atomic_alloc() {
+        let Some(c) = cpu() else {
+            return;
+        };
+        let depth = c.depth.get().min(DEPTH);
+        if c.busy.get() || c.irq.get() != 0 || depth == 0 {
+            return;
+        }
+        let Some(h) = c.held[depth - 1].get() else {
+            return;
+        };
+        if !atomic_first(key(h.class) | 1) {
+            return;
+        }
+        c.busy.set(true);
+        NATOMIC.fetch_add(1, Ordering::Relaxed);
+        crate::printkln!(
+            "LOCKDEP:ATOMIC_ALLOC heap allocation under {} (taken at {}), tid {}",
+            h.class,
+            h.at,
+            crate::task::percpu::current_tid()
+        );
+        c.busy.set(false);
+    }
+
     /// Summary (shutdown): reports and edge-table use
     pub fn summary() {
         // Read under the graph lock, print after (printing may take
         // tracked locks, which take the graph lock)
         let used = GRAPH.lock().used;
         crate::printkln!(
-            "lockdep: {} reports, {} order edges{}",
+            "lockdep: {} reports, {} order edges, {} locks allocated under{}",
             NREPORTS.load(Ordering::Relaxed),
             used,
+            NATOMIC.load(Ordering::Relaxed),
             if FULL.load(Ordering::Relaxed) {
                 " (table full)"
             } else {

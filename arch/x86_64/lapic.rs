@@ -162,7 +162,7 @@ impl LocalApic {
         // APIC errors raise ERROR_APIC_VECTOR (Linux setup_local_APIC
         // and lapic_setup_esr): clear the ESR, then unmask
         self.write(LAPIC_ESR, 0);
-        self.write(LAPIC_ERROR_LVT, ERROR_APIC_VECTOR as u32);
+        self.write(LAPIC_ERROR_LVT, u32::from(ERROR_APIC_VECTOR));
         self.write(LAPIC_ESR, 0);
     }
 
@@ -182,7 +182,7 @@ impl LocalApic {
     /// Send an INIT IPI to another processor
     pub fn send_init(&self, apic_id: u8) {
         // Set destination APIC ID in high register
-        self.write(LAPIC_ICR_HIGH, (apic_id as u32) << 24);
+        self.write(LAPIC_ICR_HIGH, u32::from(apic_id) << 24);
 
         // Send INIT IPI (level triggered, assert)
         self.write(
@@ -193,7 +193,7 @@ impl LocalApic {
         self.wait_for_ipi();
 
         // Deassert INIT
-        self.write(LAPIC_ICR_HIGH, (apic_id as u32) << 24);
+        self.write(LAPIC_ICR_HIGH, u32::from(apic_id) << 24);
         self.write(
             LAPIC_ICR_LOW,
             ICR_INIT | ICR_LEVEL_DEASSERT | ICR_TRIGGER_LEVEL | ICR_DEST_FIELD,
@@ -207,10 +207,10 @@ impl LocalApic {
     /// The vector specifies the page number (vector * 0x1000 = startup address).
     /// For example, vector 0x08 means the AP starts at physical address 0x8000.
     pub fn send_sipi(&self, apic_id: u8, vector: u8) {
-        self.write(LAPIC_ICR_HIGH, (apic_id as u32) << 24);
+        self.write(LAPIC_ICR_HIGH, u32::from(apic_id) << 24);
         self.write(
             LAPIC_ICR_LOW,
-            ICR_STARTUP | ICR_DEST_FIELD | (vector as u32),
+            ICR_STARTUP | ICR_DEST_FIELD | u32::from(vector),
         );
         self.wait_for_ipi();
     }
@@ -227,7 +227,7 @@ impl LocalApic {
         self.write(LAPIC_TIMER_DIV, divider);
 
         // Set timer LVT entry (one-shot mode: mode bits 0, not masked)
-        self.write(LAPIC_TIMER_LVT, vector as u32);
+        self.write(LAPIC_TIMER_LVT, u32::from(vector));
 
         // Set initial count (starts the timer)
         self.write(LAPIC_TIMER_INIT, initial_count);
@@ -302,7 +302,7 @@ pub fn send_ipi(apic_id: u32, vector: u8) {
     if X2APIC.load(Ordering::Relaxed) {
         // WRMSR to the ICR is not serializing: earlier stores (the
         // queued call) first (Linux weak_wrmsr_fence)
-        let icr = ((apic_id as u64) << 32) | vector as u64;
+        let icr = (u64::from(apic_id) << 32) | u64::from(vector);
         // SAFETY: writes the x2APIC ICR
         unsafe {
             core::arch::asm!(
@@ -321,7 +321,7 @@ pub fn send_ipi(apic_id: u32, vector: u8) {
         // MMIO stores keep program order with the queue store
         lapic.wait_for_ipi();
         lapic.write(LAPIC_ICR_HIGH, apic_id << 24);
-        lapic.write(LAPIC_ICR_LOW, ICR_DEST_FIELD | vector as u32);
+        lapic.write(LAPIC_ICR_LOW, ICR_DEST_FIELD | u32::from(vector));
     }
     super::spinlock::local_irq_restore(irq);
 }
@@ -358,7 +358,7 @@ pub fn in_service(vector: u8) -> bool {
     if LAPIC.get().is_none() {
         return false;
     }
-    let reg = LAPIC_ISR + ((vector as u32) >> 5) * 0x10;
+    let reg = LAPIC_ISR + (u32::from(vector) >> 5) * 0x10;
     LocalApic::get().read(reg) & (1 << (vector & 0x1f)) != 0
 }
 
@@ -408,7 +408,8 @@ pub fn start_timer_on_ap(vector: u8, interval_ms: u32) {
 /// Program this CPU's timer interrupt `delta_ns` from now (the clock
 /// event device, Linux lapic_next_event; interrupts off)
 pub fn set_next_event(delta_ns: u64) {
-    let per_ms = LAPIC_TICKS_PER_MS.load(Ordering::Relaxed) as u64;
-    let count = (delta_ns as u128 * per_ms as u128 / 1_000_000).clamp(1, u32::MAX as u128);
+    let per_ms = u64::from(LAPIC_TICKS_PER_MS.load(Ordering::Relaxed));
+    let count =
+        (u128::from(delta_ns) * u128::from(per_ms) / 1_000_000).clamp(1, u128::from(u32::MAX));
     LocalApic::get().write(LAPIC_TIMER_INIT, count as u32);
 }

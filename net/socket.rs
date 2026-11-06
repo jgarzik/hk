@@ -14,6 +14,7 @@
 //! take effect immediately) plus MSG_DONTWAIT; timeouts and signal
 //! rules are in `Sock::wait`.
 
+use crate::util::kalloc::try_arc;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
@@ -21,8 +22,9 @@ use core::sync::atomic::Ordering;
 
 use crate::arch::Uaccess;
 use crate::fs::dentry::Dentry;
-use crate::fs::file::{File, FileOps, flags as fflags};
+use crate::fs::file::{File, FileOps, RwFlags, flags as fflags, nowait_rw};
 use crate::fs::inode::{AsAny, Inode, InodeData, InodeMode, NULL_INODE_OPS};
+use crate::fs::iov_iter::{IovDest, IovSource};
 use crate::io::poll::PollTable;
 use crate::net::msg::{Dst, MSG_DONTWAIT, MSG_NOSIGNAL, RecvMsg, SendMsg, Src};
 use crate::net::sock::{Sock, TIMEO_FOREVER, sf};
@@ -76,7 +78,7 @@ impl OptIn {
         match self.len {
             0 => Err(KernelError::InvalidArgument),
             1..=3 => get_user::<Uaccess, u8>(self.ptr)
-                .map(|v| v as i32)
+                .map(i32::from)
                 .map_err(|_| KernelError::BadAddress),
             _ => self.int(),
         }
@@ -141,8 +143,8 @@ pub trait ProtoOps: Send + Sync {
         None
     }
     /// `flags` includes MSG_DONTWAIT for non-blocking files
-    fn sendmsg(&self, m: &mut SendMsg, flags: i32) -> Result<usize, KernelError>;
-    fn recvmsg(&self, m: &mut RecvMsg, flags: i32) -> Result<usize, KernelError>;
+    fn sendmsg(&self, m: &mut SendMsg<'_>, flags: i32) -> Result<usize, KernelError>;
+    fn recvmsg(&self, m: &mut RecvMsg<'_>, flags: i32) -> Result<usize, KernelError>;
     /// Bytes queued for reading / not yet sent (FIONREAD, SIOCOUTQ)
     fn inq(&self) -> usize {
         0
@@ -179,13 +181,22 @@ pub fn sock_of(file: &File) -> Option<Arc<dyn ProtoOps>> {
     Some(p.as_any().downcast_ref::<SockInode>()?.0.clone())
 }
 
-/// Wrap a protocol socket in a new sockfs file (Linux sock_alloc_file)
-pub fn sock_alloc_file(sock: Arc<dyn ProtoOps>, nonblock: bool) -> Arc<File> {
+/// Wrap a protocol socket in a new sockfs file (Linux sock_alloc_file:
+/// on failure the socket is released)
+pub fn sock_alloc_file(sock: Arc<dyn ProtoOps>, nonblock: bool) -> Result<Arc<File>, KernelError> {
+    let r = sock_file(sock.clone(), nonblock);
+    if r.is_err() {
+        sock.release();
+    }
+    r
+}
+
+fn sock_file(sock: Arc<dyn ProtoOps>, nonblock: bool) -> Result<Arc<File>, KernelError> {
     let ino = crate::fs::anon_inodes::get_next_ino();
     sock.sk().ino.store(ino, Ordering::Release);
     let cred = &sock.sk().cred;
     let now = crate::time::TIMEKEEPER.current_time();
-    let inode = Arc::new(Inode::new(
+    let inode = try_arc(Inode::new(
         ino,
         InodeMode::socket(0o777),
         cred.fsuid,
@@ -194,15 +205,15 @@ pub fn sock_alloc_file(sock: Arc<dyn ProtoOps>, nonblock: bool) -> Arc<File> {
         now,
         alloc::sync::Weak::new(),
         &NULL_INODE_OPS,
-    ));
-    inode.set_private(Arc::new(SockInode(sock)));
+    ))?;
+    inode.set_private(try_arc(SockInode(sock))?);
     let name = alloc::format!("socket:[{}]", ino);
-    let dentry = Arc::new(Dentry::new_anonymous(name.as_str().into(), Some(inode)));
+    let dentry = try_arc(Dentry::new_anonymous(name.as_str().into(), Some(inode)))?;
     let mut flags = fflags::O_RDWR;
     if nonblock {
         flags |= fflags::O_NONBLOCK;
     }
-    Arc::new(File::new(dentry, None, flags, &SOCK_FOPS))
+    try_arc(File::new(dentry, None, flags, &SOCK_FOPS))
 }
 
 /// Create a protocol socket (Linux __sock_create)
@@ -219,7 +230,7 @@ pub fn sock_create(
     }
     let create = FAMILIES
         .iter()
-        .find(|(f, _)| *f as i32 == family)
+        .find(|(f, _)| i32::from(*f) == family)
         .map(|(_, c)| c)
         .ok_or(KernelError::AddressFamilyNotSupported)?;
     create(stype, protocol)
@@ -251,7 +262,11 @@ pub fn file_nb(file: &File, flags: i32) -> i32 {
 
 /// Send with the socket-layer EPIPE rule: SIGPIPE unless MSG_NOSIGNAL
 /// (Linux sock_sendmsg callers / sk_stream_error)
-pub fn sock_sendmsg(s: &dyn ProtoOps, m: &mut SendMsg, flags: i32) -> Result<usize, KernelError> {
+pub fn sock_sendmsg(
+    s: &dyn ProtoOps,
+    m: &mut SendMsg<'_>,
+    flags: i32,
+) -> Result<usize, KernelError> {
     let r = s.sendmsg(m, flags);
     if r == Err(KernelError::BrokenPipe) && flags & MSG_NOSIGNAL == 0 && s.sigpipe() {
         let tid = crate::task::percpu::current_tid();
@@ -265,20 +280,41 @@ impl FileOps for SockFile {
         self
     }
 
-    fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {
+    /// recv(fd, buf, len, 0), the protocol copying straight into `to`
+    /// (Linux sock_read_iter)
+    fn read_iter(
+        &self,
+        file: &File,
+        to: &mut IovDest<'_>,
+        at: Option<u64>,
+        flags: RwFlags,
+    ) -> Result<usize, KernelError> {
+        let nb = nowait_rw(file, at, flags)?;
         let s = sock_of(file).ok_or(KernelError::NotSocket)?;
-        let mut m = RecvMsg::new(Dst::Kern(buf), false, 0);
-        s.recvmsg(&mut m, file_nb(file, 0))
+        let mut m = RecvMsg::new(Dst::iter(to), false, 0);
+        let r = s.recvmsg(&mut m, if nb { MSG_DONTWAIT } else { 0 });
+        m.data.restore(to);
+        r
     }
 
-    fn write(&self, file: &File, buf: &[u8]) -> Result<usize, KernelError> {
+    /// send(fd, buf, len, 0), SIGPIPE included, the protocol copying
+    /// straight from `from` (Linux sock_write_iter)
+    fn write_iter(
+        &self,
+        file: &File,
+        from: &mut IovSource<'_>,
+        at: Option<u64>,
+        flags: RwFlags,
+    ) -> Result<usize, KernelError> {
+        let nb = nowait_rw(file, at, flags)?;
         let s = sock_of(file).ok_or(KernelError::NotSocket)?;
         let mut m = SendMsg {
             addr: None,
-            data: Src::Kern(buf),
+            data: Src::iter(from),
             control: Vec::new(),
         };
-        let r = sock_sendmsg(&*s, &mut m, file_nb(file, 0));
+        let r = sock_sendmsg(&*s, &mut m, if nb { MSG_DONTWAIT } else { 0 });
+        m.data.restore(from);
         crate::net::dev::netif_rx_flush_local();
         r
     }
@@ -287,7 +323,7 @@ impl FileOps for SockFile {
         Err(KernelError::IllegalSeek)
     }
 
-    fn poll(&self, file: &File, pt: Option<&mut PollTable>) -> u16 {
+    fn poll(&self, file: &File, pt: Option<&mut PollTable<'_>>) -> u16 {
         let Some(s) = sock_of(file) else {
             return crate::io::poll::POLLNVAL;
         };
@@ -550,11 +586,11 @@ pub fn sock_getsockopt(s: &dyn ProtoOps, opt: i32) -> Result<OptOut, KernelError
     match opt {
         SO_TYPE => int(sk.stype),
         SO_PROTOCOL => int(sk.protocol),
-        SO_DOMAIN => int(sk.family as i32),
+        SO_DOMAIN => int(i32::from(sk.family)),
         SO_ERROR => int(sk.take_errno()),
-        SO_ACCEPTCONN => int(sk.flag(sf::ACCEPTCONN) as i32),
-        SO_REUSEPORT => int(sk.flag(sf::REUSEPORT) as i32),
-        SO_DEBUG => int(sk.flag(sf::DEBUG) as i32),
+        SO_ACCEPTCONN => int(i32::from(sk.flag(sf::ACCEPTCONN))),
+        SO_REUSEPORT => int(i32::from(sk.flag(sf::REUSEPORT))),
+        SO_DEBUG => int(i32::from(sk.flag(sf::DEBUG))),
         SO_SNDBUF => int(sk.sndbuf() as i32),
         SO_RCVBUF => int(sk.rcvbuf() as i32),
         SO_PRIORITY => int(sk.priority.load(Ordering::Acquire) as i32),
@@ -568,7 +604,7 @@ pub fn sock_getsockopt(s: &dyn ProtoOps, opt: i32) -> Result<OptOut, KernelError
         SO_LINGER => {
             let mut b = Vec::with_capacity(8);
             let (on, secs) = sk.linger_opt();
-            b.extend_from_slice(&(on as i32).to_ne_bytes());
+            b.extend_from_slice(&i32::from(on).to_ne_bytes());
             b.extend_from_slice(&(secs as i32).to_ne_bytes());
             Ok(OptOut::Bytes(b))
         }
@@ -586,7 +622,7 @@ pub fn sock_getsockopt(s: &dyn ProtoOps, opt: i32) -> Result<OptOut, KernelError
         }
         o => {
             let f = bool_opt(o).ok_or(KernelError::NoProtocolOption)?;
-            int(sk.flag(f) as i32)
+            int(i32::from(sk.flag(f)))
         }
     }
 }

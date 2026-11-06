@@ -2,7 +2,7 @@
 //!
 //! x86 is TSO and uncached MMIO stores are not reordered with earlier
 //! stores, so the DMA barriers only need to stop the compiler.
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use core::sync::atomic::{Ordering, compiler_fence};
 

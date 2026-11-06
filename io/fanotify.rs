@@ -26,8 +26,8 @@
 //! - Events can include fd to the affected file
 //! - Support for permission events (blocking operations pending user decision)
 //! - Multiple marks per fanotify instance
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
+use crate::util::kalloc::try_arc;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -35,9 +35,11 @@ use alloc::vec::Vec;
 
 use crate::arch::IrqSpinlock;
 use crate::fs::KernelError;
-use crate::fs::file::{File, FileOps, flags};
+use crate::fs::file::{File, FileOps, RwFlags, flags, stream_rw};
+use crate::fs::iov_iter::IovDest;
 use crate::io::poll::{POLLIN, POLLRDNORM, PollTable};
 use crate::sync::waitqueue::WaitQueue;
+use crate::util::pod::IntoBytes;
 
 // =============================================================================
 // Fanotify Init Flags (Linux ABI)
@@ -119,7 +121,7 @@ pub const FAN_MARK_EVICTABLE: u32 = 0x00000200;
 pub const FAN_MARK_IGNORE: u32 = 0x00000400;
 
 /// Mark type mask
-#[allow(dead_code)]
+#[expect(dead_code)]
 const FAN_MARK_TYPE_MASK: u32 = FAN_MARK_MOUNT | FAN_MARK_FILESYSTEM;
 
 /// Mark inode (default, no flag set)
@@ -223,6 +225,16 @@ pub struct FanotifyEventMetadata {
     pub pid: i32,
 }
 
+crate::pod!(FanotifyEventMetadata {
+    event_len,
+    vers,
+    reserved,
+    metadata_len,
+    mask,
+    fd,
+    pid
+});
+
 /// Metadata version
 pub const FANOTIFY_METADATA_VERSION: u8 = 3;
 
@@ -245,7 +257,7 @@ struct FanotifyMark {
     /// Events to watch for
     mask: u64,
     /// Flags from mark operation
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     flags: u32,
     /// Ignored event mask
     ignored_mask: u64,
@@ -272,10 +284,10 @@ struct FanotifyEvent {
     /// PID of process causing event
     pid: i32,
     /// Path to file (for opening fd when event is read)
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     path: Option<String>,
     /// Inode number (for matching)
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     ino: u64,
 }
 
@@ -311,14 +323,14 @@ pub struct Fanotify {
     /// Init flags
     init_flags: u32,
     /// Event file flags (O_RDONLY, O_RDWR, etc.)
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     event_f_flags: u32,
 }
 
 impl Fanotify {
     /// Create a new fanotify instance
-    pub fn new(init_flags: u32, event_f_flags: u32) -> Arc<Self> {
-        Arc::new(Self {
+    pub fn new(init_flags: u32, event_f_flags: u32) -> Result<Arc<Self>, KernelError> {
+        try_arc(Self {
             inner: IrqSpinlock::new(FanotifyInner {
                 inode_marks: BTreeMap::new(),
                 mount_marks: BTreeMap::new(),
@@ -392,7 +404,6 @@ impl Fanotify {
     }
 
     /// Queue an event
-    #[allow(dead_code)]
     pub fn queue_event(&self, mask: u64, pid: i32, path: Option<String>, ino: u64) {
         let mut inner = self.inner.lock();
 
@@ -424,77 +435,59 @@ impl Fanotify {
         !self.inner.lock().events.is_empty()
     }
 
-    /// Read events from the fanotify instance
-    pub fn read(&self, buf: &mut [u8], nonblock: bool) -> Result<usize, KernelError> {
-        // Buffer must be at least big enough for one event
-        if buf.len() < FANOTIFY_METADATA_SIZE {
-            return Err(KernelError::InvalidArgument);
-        }
-
-        loop {
-            let mut inner = self.inner.lock();
-
-            if !inner.events.is_empty() {
-                let mut bytes_written = 0;
-
-                // Copy as many events as will fit
-                while !inner.events.is_empty() {
-                    let event = &inner.events[0];
-                    let event_size = event.serialized_size();
-
-                    if bytes_written + event_size > buf.len() {
-                        if bytes_written == 0 {
-                            // First event doesn't fit
-                            return Err(KernelError::InvalidArgument);
-                        }
-                        break;
-                    }
-
-                    // Remove event from queue
-                    let event = inner.events.remove(0);
-
-                    // Create metadata structure
-                    // Note: In a full implementation, we would open the file here
-                    // and pass the fd. For now, we pass -1 (FAN_NOFD equivalent).
-                    let metadata = FanotifyEventMetadata {
-                        event_len: FANOTIFY_METADATA_SIZE as u32,
-                        vers: FANOTIFY_METADATA_VERSION,
-                        reserved: 0,
-                        metadata_len: FANOTIFY_METADATA_SIZE as u16,
-                        mask: event.mask,
-                        fd: -1, // FAN_NOFD - file descriptor not provided
-                        pid: event.pid,
-                    };
-
-                    // Copy metadata to buffer
-                    let metadata_bytes = unsafe {
-                        core::slice::from_raw_parts(
-                            &metadata as *const FanotifyEventMetadata as *const u8,
-                            FANOTIFY_METADATA_SIZE,
-                        )
-                    };
-                    buf[bytes_written..bytes_written + FANOTIFY_METADATA_SIZE]
-                        .copy_from_slice(metadata_bytes);
-                    bytes_written += FANOTIFY_METADATA_SIZE;
-                }
-
-                return Ok(bytes_written);
-            }
-
-            drop(inner);
-
+    /// The oldest event if it fits in `room` bytes (EINVAL if not),
+    /// waiting for one unless `nonblock` (Linux get_one_event)
+    fn get_event(&self, room: usize, nonblock: bool) -> Result<FanotifyEvent, KernelError> {
+        let mut inner = self.inner.lock();
+        if inner.events.is_empty() {
             if nonblock {
                 return Err(KernelError::WouldBlock);
             }
-
             // Wait for events (a signal ends the wait)
             self.wait_queue
-                .wait_event_interruptible(|| !self.inner.lock().events.is_empty())?;
+                .wait_event_interruptible_locked(&mut inner, |i| !i.events.is_empty())?;
+        }
+        if inner.events[0].serialized_size() > room {
+            return Err(KernelError::InvalidArgument);
+        }
+        Ok(inner.events.remove(0))
+    }
+
+    /// Read events into `to` (Linux fanotify_read): each is taken off
+    /// the queue under the lock and copied out after it. Blocks only
+    /// while nothing was read; a first event too big for the buffer is
+    /// EINVAL. A fault loses the event and is EFAULT even after earlier
+    /// events were copied (Linux).
+    pub fn read(&self, to: &mut IovDest<'_>, nonblock: bool) -> Result<usize, KernelError> {
+        // Buffer must be at least big enough for one event
+        if to.len() < FANOTIFY_METADATA_SIZE {
+            return Err(KernelError::InvalidArgument);
+        }
+        let mut done = 0;
+        loop {
+            let event = match self.get_event(to.len(), nonblock || done > 0) {
+                Ok(e) => e,
+                Err(_) if done > 0 => return Ok(done),
+                Err(e) => return Err(e),
+            };
+            // Note: In a full implementation, we would open the file here
+            // and pass the fd. For now, we pass -1 (FAN_NOFD equivalent).
+            let metadata = FanotifyEventMetadata {
+                event_len: FANOTIFY_METADATA_SIZE as u32,
+                vers: FANOTIFY_METADATA_VERSION,
+                reserved: 0,
+                metadata_len: FANOTIFY_METADATA_SIZE as u16,
+                mask: event.mask,
+                fd: -1, // FAN_NOFD - file descriptor not provided
+                pid: event.pid,
+            };
+            to.copy_to_full(metadata.as_bytes())?;
+            done += FANOTIFY_METADATA_SIZE;
         }
     }
 
     /// Poll for readiness
-    pub fn poll(&self, pt: Option<&mut PollTable>) -> u16 {
+    pub fn poll(&self, pt: Option<&mut PollTable<'_>>) -> u16 {
         if let Some(poll_table) = pt {
             poll_table.poll_wait(&self.wait_queue);
         }
@@ -507,7 +500,6 @@ impl Fanotify {
     }
 
     /// Get the total size of queued events
-    #[allow(dead_code)]
     pub fn queued_size(&self) -> usize {
         let inner = self.inner.lock();
         inner.events.iter().map(|e| e.serialized_size()).sum()
@@ -533,18 +525,20 @@ impl FileOps for FanotifyFileOps {
         self
     }
 
-    fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {
+    fn read_iter(
+        &self,
+        file: &File,
+        to: &mut IovDest<'_>,
+        at: Option<u64>,
+        flags: RwFlags,
+    ) -> Result<usize, KernelError> {
+        stream_rw(at, flags)?;
         let fanotify = file.private_ref::<Fanotify>().ok_or(KernelError::BadFd)?;
         let nonblock = file.get_flags() & flags::O_NONBLOCK != 0;
-        fanotify.read(buf, nonblock)
+        fanotify.read(to, nonblock)
     }
 
-    fn write(&self, _file: &File, _buf: &[u8]) -> Result<usize, KernelError> {
-        // TODO: Write is used for responding to permission events
-        Err(KernelError::InvalidArgument)
-    }
-
-    fn poll(&self, file: &File, pt: Option<&mut PollTable>) -> u16 {
+    fn poll(&self, file: &File, pt: Option<&mut PollTable<'_>>) -> u16 {
         let Some(fanotify) = file.private_ref::<Fanotify>() else {
             return crate::io::poll::POLLERR;
         };
@@ -558,7 +552,7 @@ impl FileOps for FanotifyFileOps {
 
 /// Create a new fanotify instance
 pub fn create_fanotify(init_flags: u32, event_f_flags: u32) -> Result<Arc<File>, KernelError> {
-    let fanotify = Fanotify::new(init_flags, event_f_flags);
+    let fanotify = Fanotify::new(init_flags, event_f_flags)?;
 
     // Create dummy dentry for fanotify
 
@@ -573,7 +567,7 @@ pub fn create_fanotify(init_flags: u32, event_f_flags: u32) -> Result<Arc<File>,
         &FANOTIFY_FOPS,
         fanotify,
         file_flags,
-    );
+    )?;
     Ok(file)
 }
 
@@ -662,8 +656,8 @@ pub fn sys_fanotify_init(init_flags: u32, event_f_flags: u32) -> i64 {
     };
 
     match table.alloc_with_flags(file, fd_flags, nofile_limit) {
-        Ok(fd) => fd as i64,
-        Err(e) => -(e as i64),
+        Ok(fd) => i64::from(fd),
+        Err(e) => -i64::from(e),
     }
 }
 
@@ -698,7 +692,7 @@ pub fn sys_fanotify_mark(fd: i32, mark_flags: u32, mask: u64, dirfd: i32, pathna
     let is_flush = (mark_flags & FAN_MARK_FLUSH) != 0;
 
     // Exactly one of ADD, REMOVE, FLUSH must be set (or none for flush compatibility)
-    let op_count = is_add as u32 + is_remove as u32 + is_flush as u32;
+    let op_count = u32::from(is_add) + u32::from(is_remove) + u32::from(is_flush);
     if op_count > 1 {
         return -22; // EINVAL
     }
@@ -707,7 +701,7 @@ pub fn sys_fanotify_mark(fd: i32, mark_flags: u32, mask: u64, dirfd: i32, pathna
     if is_flush {
         return match fanotify.flush_marks(mark_flags) {
             Ok(()) => 0,
-            Err(e) => e as i64,
+            Err(e) => i64::from(e),
         };
     }
 
@@ -716,7 +710,7 @@ pub fn sys_fanotify_mark(fd: i32, mark_flags: u32, mask: u64, dirfd: i32, pathna
         // Treat as flush
         return match fanotify.flush_marks(mark_flags) {
             Ok(()) => 0,
-            Err(e) => e as i64,
+            Err(e) => i64::from(e),
         };
     }
 
@@ -821,13 +815,13 @@ pub fn sys_fanotify_mark(fd: i32, mark_flags: u32, mask: u64, dirfd: i32, pathna
     if is_remove {
         match fanotify.remove_mark(mark_flags, mask, target_id) {
             Ok(()) => 0,
-            Err(e) => e as i64,
+            Err(e) => i64::from(e),
         }
     } else {
         // ADD (default if no op specified and pathname given)
         match fanotify.add_mark(mark_flags, mask, target_id) {
             Ok(()) => 0,
-            Err(e) => e as i64,
+            Err(e) => i64::from(e),
         }
     }
 }

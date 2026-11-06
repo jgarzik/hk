@@ -6,14 +6,18 @@
 //! ended (the first, one at offset 0, one after a seek) runs show() into
 //! a per-open buffer that continuing reads slice;
 //! one write() is one store() of at most `ATTR_MAX` bytes (E2BIG past
-//! it, Linux atomic_write_len). poll() reports POLLERR|POLLPRI once the
-//! node was notified since the file last read it. Binary attributes
-//! read and write at the file offset, below their size.
+//! it, Linux atomic_write_len), copied in before the lock. poll()
+//! reports POLLERR|POLLPRI once the node was notified since the file
+//! last read it. Binary attributes read and write at the file offset,
+//! below their size, at most a page per call (Linux
+//! kernfs_file_read_iter / kernfs_fop_write_iter).
 //!
 //! ## Locking
 //!
 //! `OpenAttr.buf` (sleeping `Mutex`, Linux kernfs_open_file.mutex) is
-//! held across show()/store(), under an active reference.
+//! held across show()/store(), under an active reference, and across a
+//! read's copy to the caller (it may fault: -> mmap_lock), with no
+//! active reference held then.
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -21,12 +25,16 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use super::{ATTR_MAX, AttrNode, BinAttr, KNode, Kind, SysBuf};
 use crate::fs::KernelError;
-use crate::fs::file::{DirContext, DirEntry, File, FileOps, generic_llseek};
+use crate::fs::file::{DirContext, DirEntry, File, FileOps, RwFlags, generic_llseek};
 use crate::fs::inode::{AsAny, FileType, Inode, InodeAttr, InodeData, InodeMode, InodeOps};
+use crate::fs::iov_iter::{IovDest, IovSource};
 use crate::fs::superblock::SuperBlock;
 use crate::io::poll::{DEFAULT_POLLMASK, POLLERR, POLLPRI, PollTable};
+use crate::mm::filemap::PAGE_SIZE;
 use crate::sync::Mutex;
 use crate::sync::spin::Mutex as SpinMutex;
+use crate::util::kalloc::try_arc;
+use crate::util::kmem::try_vec;
 
 /// Inode private data: the node
 pub struct KfInode(pub Arc<KNode>);
@@ -69,15 +77,15 @@ pub fn knode(inode: &Inode) -> Option<Arc<KNode>> {
 }
 
 /// A new inode for `kn` on `sb` (Linux kernfs_init_inode)
-pub fn inode(sb: &Arc<SuperBlock>, kn: &Arc<KNode>) -> Arc<Inode> {
+pub fn inode(sb: &Arc<SuperBlock>, kn: &Arc<KNode>) -> Result<Arc<Inode>, KernelError> {
     let (mode, size) = match &kn.kind {
         Kind::Dir(_) => (InodeMode::directory(kn.mode), 0),
         Kind::Attr(_) => (InodeMode::regular(kn.mode), ATTR_MAX as u64),
-        Kind::Bin(b) => (InodeMode::regular(kn.mode), b.size()),
+        Kind::Bin(b) => (InodeMode::regular(kn.mode), b.ops().map_or(0, |o| o.size())),
         Kind::Link(_) => (InodeMode::symlink(), 0),
     };
     let now = crate::time::TIMEKEEPER.current_time();
-    let i = Arc::new(Inode::new(
+    let i = try_arc(Inode::new(
         kn.ino,
         mode,
         0,
@@ -86,9 +94,18 @@ pub fn inode(sb: &Arc<SuperBlock>, kn: &Arc<KNode>) -> Arc<Inode> {
         now,
         Arc::downgrade(sb),
         &KERNFS_IOPS,
-    ));
-    i.set_private(Arc::new(KfInode(kn.clone())));
-    i
+    ))?;
+    i.set_private(try_arc(KfInode(kn.clone()))?);
+    let saved = *kn.iattr.lock();
+    if let Some(a) = saved {
+        i.set_mode_perm(a.perm);
+        i.set_uid(a.uid);
+        i.set_gid(a.gid);
+        i.set_atime(a.atime);
+        i.set_mtime(a.mtime);
+        i.set_ctime(a.ctime);
+    }
+    Ok(i)
 }
 
 pub struct KernfsIops;
@@ -101,7 +118,21 @@ impl InodeOps for KernfsIops {
             return Err(KernelError::NotFound);
         }
         let sb = dir.superblock().ok_or(KernelError::Io)?;
-        Ok(inode(&sb, &kn))
+        inode(&sb, &kn)
+    }
+
+    /// Linux kernfs_iop_setattr: the node keeps the attributes, so an
+    /// inode made after this one is dropped shows them too
+    fn setattr_done(&self, inode: &Inode) {
+        let Some(kn) = knode(inode) else { return };
+        *kn.iattr.lock() = Some(super::Iattr {
+            perm: inode.mode().perm(),
+            uid: inode.uid(),
+            gid: inode.gid(),
+            atime: inode.atime(),
+            mtime: inode.mtime(),
+            ctime: inode.ctime(),
+        });
     }
 
     /// Linux kernfs_dop_revalidate: a removed node's dentry is stale
@@ -194,16 +225,18 @@ impl OpenAttr {
 
 pub struct KernfsFops;
 
-/// The node of an open binary attribute
-fn bin_of(file: &File) -> Option<(Arc<KNode>, Arc<dyn BinAttr>)> {
+/// An open binary attribute: its node and operations
+type BinFile = (Arc<KNode>, Arc<dyn BinAttr>);
+
+/// The node of an open binary attribute and its operations (ENODEV
+/// once it is removed); None for any other file
+fn bin_of(file: &File) -> Option<Result<BinFile, KernelError>> {
     let kn = knode(&*file.get_inode()?)?;
-    match &kn.kind {
-        Kind::Bin(b) => {
-            let b = b.clone();
-            Some((kn, b))
-        }
-        _ => None,
-    }
+    let b = match &kn.kind {
+        Kind::Bin(b) => b.ops().ok_or(KernelError::NoDevice),
+        _ => return None,
+    };
+    Some(b.map(|b| (kn, b)))
 }
 
 /// Linux sysfs_kf_bin_read/write: clipped to the size, EOF past it
@@ -222,10 +255,43 @@ fn bin_io(
     io(len.min((size - off) as usize))
 }
 
+/// Linux kernfs_file_read_iter of a binary attribute: at most a page,
+/// read into a kernel buffer under an active reference, copied out
+/// after it
+fn bin_read(
+    kn: &KNode,
+    b: &dyn BinAttr,
+    to: &mut IovDest<'_>,
+    off: u64,
+) -> Result<usize, KernelError> {
+    let mut buf = try_vec(to.len().min(PAGE_SIZE), 0u8)?;
+    let n = bin_io(kn, b, off, buf.len(), |n| b.read(off, &mut buf[..n]))?;
+    to.copy_to(&buf[..n])
+}
+
+/// Linux kernfs_fop_write_iter of a binary attribute: at most a page,
+/// copied in before the active reference is taken
+fn bin_write(
+    kn: &KNode,
+    b: &dyn BinAttr,
+    from: &mut IovSource<'_>,
+    off: u64,
+) -> Result<usize, KernelError> {
+    let room = usize::try_from(b.size().saturating_sub(off)).unwrap_or(usize::MAX);
+    let mut buf = try_vec(from.len().min(PAGE_SIZE).min(room), 0u8)?;
+    // Whole or EFAULT (Linux kernfs_fop_write_iter)
+    from.copy_from_full(&mut buf)?;
+    bin_io(kn, b, off, buf.len(), |n| b.write(off, &buf[..n]))
+}
+
 impl KernfsFops {
-    fn read_at(&self, file: &File, buf: &mut [u8], off: u64) -> Result<usize, KernelError> {
-        if let Some((kn, b)) = bin_of(file) {
-            return bin_io(&kn, &*b, off, buf.len(), |n| b.read(off, &mut buf[..n]));
+    /// Read at `off`: an attribute from its show() buffer, filled again
+    /// unless this read continues the last; the copy runs under
+    /// `OpenAttr.buf` (Linux seq_read_iter under m->lock)
+    fn read_at(&self, file: &File, to: &mut IovDest<'_>, off: u64) -> Result<usize, KernelError> {
+        if let Some(r) = bin_of(file) {
+            let (kn, b) = r?;
+            return bin_read(&kn, &*b, to, off);
         }
         let (kn, of) = attr_of(file)?;
         let a = attr_node(&kn);
@@ -237,33 +303,47 @@ impl KernfsFops {
                 read_pos: off,
             },
         };
-        let start = (off as usize).min(sb.data.len());
-        let n = (sb.data.len() - start).min(buf.len());
-        buf[..n].copy_from_slice(&sb.data[start..start + n]);
+        let start = usize::try_from(off).map_or(sb.data.len(), |o| o.min(sb.data.len()));
+        let r = match &sb.data[start..] {
+            [] => Ok(0),
+            rest => to.copy_to(rest),
+        };
+        let n = r.as_ref().map_or(0, |&n| n);
         *b = Some(SeqBuf {
             read_pos: off + n as u64,
             ..sb
         });
-        Ok(n)
+        r
     }
 
-    fn write_any(&self, file: &File, data: &[u8], off: u64) -> Result<usize, KernelError> {
-        if let Some((kn, b)) = bin_of(file) {
-            return bin_io(&kn, &*b, off, data.len(), |n| b.write(off, &data[..n]));
+    /// Write at `off`: one store() of the whole write (E2BIG past
+    /// `ATTR_MAX`), from a kernel copy taken before the lock
+    fn write_any(
+        &self,
+        file: &File,
+        from: &mut IovSource<'_>,
+        off: u64,
+    ) -> Result<usize, KernelError> {
+        if let Some(r) = bin_of(file) {
+            let (kn, b) = r?;
+            return bin_write(&kn, &*b, from, off);
         }
         let (kn, of) = attr_of(file)?;
-        if data.len() > ATTR_MAX {
+        if from.len() > ATTR_MAX {
             return Err(KernelError::ArgListTooLong);
         }
-        if data.is_empty() {
+        if from.is_empty() {
             return Ok(0);
         }
+        let mut data = try_vec(from.len(), 0u8)?;
+        // Whole or EFAULT (Linux kernfs_fop_write_iter)
+        from.copy_from_full(&mut data)?;
         let _b = of.buf.lock();
         let _act = kn.get_active().ok_or(KernelError::NoDevice)?;
         attr_node(&kn)
             .ops()
             .ok_or(KernelError::NoDevice)?
-            .store(data)
+            .store(&data)
     }
 }
 
@@ -278,19 +358,21 @@ impl FileOps for KernfsFops {
         let inode = file.get_inode().ok_or(KernelError::BadFd)?;
         let kn = knode(&inode).ok_or(KernelError::Io)?;
         if kn.is_dir() {
-            file.private.call_once(|| {
-                Arc::new(OpenDir {
-                    last: SpinMutex::new(None),
-                })
-            });
+            let od = try_arc(OpenDir {
+                last: SpinMutex::new(None),
+            })?;
+            file.private.call_once(|| od);
             return Ok(());
         }
         if !matches!(kn.kind, Kind::Attr(_) | Kind::Bin(_)) {
             return Ok(());
         }
-        if (file.is_writable() && kn.mode & 0o222 == 0)
-            || (file.is_readable() && kn.mode & 0o444 == 0)
-        {
+        // The inode's mode as chmod left it, and the node's own (its
+        // creation mode stands for has_read/has_write: no write bit, no
+        // store)
+        let (im, km) = (inode.mode().perm(), kn.mode);
+        let refused = |bits: u16| im & bits == 0 || km & bits == 0;
+        if (file.is_writable() && refused(0o222)) || (file.is_readable() && refused(0o444)) {
             return Err(KernelError::PermissionDenied);
         }
         if matches!(kn.kind, Kind::Bin(_)) {
@@ -301,30 +383,46 @@ impl FileOps for KernfsFops {
             buf: Mutex::new(None),
             event: AtomicU32::new(attr_node(&kn).event.load(Ordering::Acquire)),
         };
-        file.private.call_once(|| Arc::new(of));
+        let of = try_arc(of)?;
+        file.private.call_once(|| of);
         Ok(())
     }
 
-    fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {
-        let pos = file.get_pos();
-        let n = self.read_at(file, buf, pos)?;
-        file.set_pos(pos + n as u64);
+    /// No FMODE_NOWAIT: RWF_NOWAIT is EOPNOTSUPP
+    fn read_iter(
+        &self,
+        file: &File,
+        to: &mut IovDest<'_>,
+        at: Option<u64>,
+        rw: RwFlags,
+    ) -> Result<usize, KernelError> {
+        if rw.nowait {
+            return Err(KernelError::OperationNotSupported);
+        }
+        let off = at.unwrap_or_else(|| file.get_pos());
+        let n = self.read_at(file, to, off)?;
+        if at.is_none() {
+            file.set_pos(off + n as u64);
+        }
         Ok(n)
     }
 
-    fn pread(&self, file: &File, buf: &mut [u8], off: u64) -> Result<usize, KernelError> {
-        self.read_at(file, buf, off)
-    }
-
-    fn write(&self, file: &File, data: &[u8]) -> Result<usize, KernelError> {
-        let pos = file.get_pos();
-        let n = self.write_any(file, data, pos)?;
-        file.set_pos(pos + n as u64);
+    fn write_iter(
+        &self,
+        file: &File,
+        from: &mut IovSource<'_>,
+        at: Option<u64>,
+        rw: RwFlags,
+    ) -> Result<usize, KernelError> {
+        if rw.nowait {
+            return Err(KernelError::OperationNotSupported);
+        }
+        let off = at.unwrap_or_else(|| file.get_pos());
+        let n = self.write_any(file, from, off)?;
+        if at.is_none() {
+            file.set_pos(off + n as u64);
+        }
         Ok(n)
-    }
-
-    fn pwrite(&self, file: &File, data: &[u8], off: u64) -> Result<usize, KernelError> {
-        self.write_any(file, data, off)
     }
 
     /// Linux kernfs_fop_llseek: generic_file_llseek (SEEK_END is
@@ -337,7 +435,7 @@ impl FileOps for KernfsFops {
     }
 
     /// Linux kernfs_fop_readdir: ".", "..", then children by hash
-    fn readdir(&self, file: &File, ctx: &mut DirContext) -> Result<(), KernelError> {
+    fn readdir(&self, file: &File, ctx: &mut DirContext<'_>) -> Result<(), KernelError> {
         let inode = file.get_inode().ok_or(KernelError::BadFd)?;
         let kn = knode(&inode).ok_or(KernelError::Io)?;
         if !kn.is_dir() {
@@ -375,7 +473,7 @@ impl FileOps for KernfsFops {
                 if (n.ns, &name) <= (l.1, &l.2) {
                     continue;
                 }
-                ctx.pos = h as u64;
+                ctx.pos = u64::from(h);
             }
             let file_type = match n.kind {
                 Kind::Dir(_) => FileType::Directory,
@@ -387,7 +485,7 @@ impl FileOps for KernfsFops {
                 file_type,
                 name: name.clone(),
             };
-            if !ctx.emit_at(h as u64, e) {
+            if !ctx.emit_at(u64::from(h), e) {
                 return Ok(());
             }
             if let Some(o) = &od {
@@ -400,7 +498,7 @@ impl FileOps for KernfsFops {
     }
 
     /// Linux kernfs_generic_poll
-    fn poll(&self, file: &File, pt: Option<&mut PollTable>) -> u16 {
+    fn poll(&self, file: &File, pt: Option<&mut PollTable<'_>>) -> u16 {
         let Ok((kn, of)) = attr_of(file) else {
             return DEFAULT_POLLMASK;
         };

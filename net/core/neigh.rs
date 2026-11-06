@@ -26,6 +26,7 @@
 //! unlock. `TABLES` and `TIMER` (`crate::sync::spin::Mutex`) are leaves except that
 //! `TIMER` is held across arming (-> the timer base IrqSpinlock).
 
+use crate::util::kalloc::{arc_nofail, try_arc};
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::{Arc, Weak};
@@ -450,13 +451,14 @@ pub fn now_ms() -> u64 {
 
 /// Linux neigh_rand_reach_time: uniform in [base/2, 3*base/2)
 fn rand_reach(base: u64) -> u64 {
-    base / 2 + crate::random::get_random_u32() as u64 % base.max(1)
+    base / 2 + u64::from(crate::random::get_random_u32()) % base.max(1)
 }
 
 impl NeighTable {
     /// A new table, registered with the neighbour timer
     pub fn new(ops: &'static NeighOps) -> Arc<Self> {
-        let t = Arc::new(Self {
+        // NetNamespace::new cannot fail yet
+        let t = arc_nofail(Self {
             ops,
             parms: Parms::DEFAULT,
             hash: RwLock::new(BTreeMap::new()),
@@ -488,7 +490,7 @@ impl NeighTable {
         }
         let now = now_ms();
         self.maybe_forced_gc(now)?;
-        let n = Arc::new(Neighbour {
+        let n = try_arc(Neighbour {
             key: *key,
             dev: dev.clone(),
             inner: Mutex::new(Inner {
@@ -497,7 +499,7 @@ impl NeighTable {
                 qbytes: 0,
                 dead: false,
             }),
-        });
+        })?;
         let n = {
             let mut h = self.hash.write();
             // An unregistered device's entries were flushed after it was

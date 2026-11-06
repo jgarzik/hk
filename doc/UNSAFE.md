@@ -57,7 +57,11 @@ open-coded `unsafe` it replaces.
   a bullet list of conditions.
 - **`/// # Invariants`** goes on a type whose `unsafe` code relies on
   properties of its fields. Code that establishes or changes such a field
-  says why the invariant still holds, with `// INVARIANT:`.
+  says why the invariant still holds, with `// INVARIANT:`. A `SAFETY`
+  comment that depends on one says so ("type invariant"), so a later
+  change to the invariant finds every block that relied on it
+  (Rust-for-Linux coding guidelines). Examples: `util::list::List`,
+  `sync::LockedBy`, `sync::Mutex`, `WaitEntry`.
 - **One unsafe operation per block**, so each comment covers exactly one
   obligation. Exception: a dense arch or asm sequence may share one block
   if its comment justifies each operation.
@@ -135,11 +139,11 @@ Give no `options(...)` without a comment that justifies each one.
 The workspace `[lints]` table in `Cargo.toml` and `clippy.toml`
 (`check-private-items`) enforce these rules. The gate runs clippy with
 `-D warnings`, so every lint listed there, warn-level included, blocks
-a commit. Do not `allow` an `unsafe` lint locally without a comment
+a commit. Do not silence an `unsafe` lint locally without a comment
 saying why.
 
 `undocumented_unsafe_blocks` is denied crate-wide. Files written before
-this policy carry `#![allow(clippy::undocumented_unsafe_blocks)] //
+this policy carry `#![expect(clippy::undocumented_unsafe_blocks)] //
 TODO(unsafe)` until their blocks are documented or wrapped. Remove the
 line when the file is clean, and never add it to a new file
 (`git grep -l 'TODO(unsafe)' -- '*.rs' ':!user'` lists what is left).

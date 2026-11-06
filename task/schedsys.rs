@@ -76,14 +76,14 @@ pub fn sys_getpriority(which: i32, who: i32) -> i64 {
     if which != PRIO_USER && who < 0 {
         return KernelError::NoProcess.sysret();
     }
-    let who = who as u32 as u64;
+    let who = u64::from(who as u32);
     match which {
         PRIO_PROCESS => {
             // 0 is the calling thread (Linux: current)
             let target_pid = if who == 0 { current_tid() } else { who };
             match super::percpu::lookup_task_nice(target_pid) {
                 // 20 - nice (range 1-40) to avoid negative return values
-                Some(nice) => (20 - nice) as i64,
+                Some(nice) => i64::from(20 - nice),
                 None => KernelError::NoProcess.sysret(),
             }
         }
@@ -98,14 +98,14 @@ pub fn sys_getpriority(which: i32, who: i32) -> i64 {
             super::percpu::get_tids_by_pgid(pgid)
                 .into_iter()
                 .filter_map(super::percpu::lookup_task_nice)
-                .map(|n| (20 - n) as i64)
+                .map(|n| i64::from(20 - n))
                 .max()
                 .unwrap_or(KernelError::NoProcess.sysret())
         }
         PRIO_USER => tids_of_user(who)
             .into_iter()
             .filter_map(super::percpu::lookup_task_nice)
-            .map(|n| (20 - n) as i64)
+            .map(|n| i64::from(20 - n))
             .max()
             .unwrap_or(KernelError::NoProcess.sysret()),
         _ => KernelError::InvalidArgument.sysret(),
@@ -154,7 +154,7 @@ fn set_one_prio(tid: Pid, niceval: i32, caller_euid: super::Uid, error: i64) -> 
     match super::percpu::set_task_nice(tid, niceval) {
         Ok(()) if error == KernelError::NoProcess.sysret() => 0,
         Ok(()) => error,
-        Err(errno) => -(errno as i64),
+        Err(errno) => -i64::from(errno),
     }
 }
 
@@ -183,7 +183,7 @@ pub fn sys_setpriority(which: i32, who: i32, niceval: i32) -> i64 {
     if which != PRIO_USER && who < 0 {
         return KernelError::NoProcess.sysret();
     }
-    let who = who as u32 as u64;
+    let who = u64::from(who as u32);
     let caller_euid = super::percpu::current_cred().euid;
 
     match which {
@@ -244,7 +244,7 @@ pub fn sys_sched_getscheduler(pid: i64) -> i64 {
     let target_pid = if pid == 0 { current_tid() } else { pid as u64 };
 
     match super::percpu::lookup_task_policy(target_pid) {
-        Some(policy) => policy as i64,
+        Some(policy) => i64::from(policy),
         None => KernelError::NoProcess.sysret(),
     }
 }
@@ -310,7 +310,7 @@ pub fn sys_sched_setscheduler<A: crate::uaccess::UaccessArch>(
     // Set the scheduler
     match super::percpu::set_task_scheduler(target_pid, policy, param.sched_priority) {
         Ok(()) => 0,
-        Err(errno) => -(errno as i64),
+        Err(errno) => -i64::from(errno),
     }
 }
 
@@ -340,7 +340,7 @@ fn check_setscheduler(
             t.cred(),
             se.policy(),
             se.reset_on_fork(),
-            se.rt_priority() as i32,
+            i32::from(se.rt_priority()),
             se.nice(),
         )
     });
@@ -490,7 +490,7 @@ pub fn sys_sched_setparam<A: crate::uaccess::UaccessArch>(pid: i64, param_ptr: u
     // Set the scheduler with current policy
     match super::percpu::set_task_scheduler(target_pid, current_policy, param.sched_priority) {
         Ok(()) => 0,
-        Err(errno) => -(errno as i64),
+        Err(errno) => -i64::from(errno),
     }
 }
 
@@ -523,7 +523,7 @@ pub fn sys_sched_getaffinity<A: crate::uaccess::UaccessArch>(
     }
 
     // Room for nr_cpu_ids bits, in whole longs (Linux)
-    if cpusetsize.saturating_mul(8) < crate::cpu::nr_cpu_ids() as u64
+    if cpusetsize.saturating_mul(8) < u64::from(crate::cpu::nr_cpu_ids())
         || !cpusetsize.is_multiple_of(8)
     {
         return KernelError::InvalidArgument.sysret();
@@ -623,7 +623,7 @@ pub fn sys_sched_setaffinity<A: crate::uaccess::UaccessArch>(
     // Set the CPU affinity mask
     match super::percpu::set_task_cpus_allowed(target_pid, mask) {
         Ok(()) => 0,
-        Err(errno) => -(errno as i64),
+        Err(errno) => -i64::from(errno),
     }
 }
 
@@ -754,8 +754,10 @@ pub fn sys_ioprio_set(which: i32, who: i32, ioprio: i32) -> i64 {
                 return KernelError::NotPermitted.sysret();
             }
             // Get or create IoContext for the target
-            let Some(ctx) = super::task_io_context(tid) else {
-                return KernelError::NoProcess.sysret();
+            let ctx = match super::task_io_context(tid) {
+                Ok(Some(c)) => c,
+                Ok(None) => return KernelError::NoProcess.sysret(),
+                Err(e) => return e.sysret(),
             };
 
             ctx.set_ioprio(ioprio);
@@ -778,8 +780,10 @@ pub fn sys_ioprio_set(which: i32, who: i32, ioprio: i32) -> i64 {
                 if !ioprio_owner_ok(tid) {
                     return KernelError::NotPermitted.sysret();
                 }
-                if let Some(ctx) = super::task_io_context(tid) {
-                    ctx.set_ioprio(ioprio);
+                match super::task_io_context(tid) {
+                    Ok(Some(ctx)) => ctx.set_ioprio(ioprio),
+                    Ok(None) => {}
+                    Err(e) => return e.sysret(),
                 }
             }
             0
@@ -834,8 +838,8 @@ pub fn sys_ioprio_get(which: i32, who: i32) -> i64 {
             }
 
             match get_task_io_context(tid) {
-                Some(ctx) => ctx.get_ioprio() as i64,
-                None => IOPRIO_DEFAULT as i64,
+                Some(ctx) => i64::from(ctx.get_ioprio()),
+                None => i64::from(IOPRIO_DEFAULT),
             }
         }
         IOPRIO_WHO_PGRP => {
@@ -861,12 +865,12 @@ pub fn sys_ioprio_get(which: i32, who: i32) -> i64 {
                     }
                 }
             }
-            best_ioprio as i64
+            i64::from(best_ioprio)
         }
         IOPRIO_WHO_USER => {
             // Get highest ioprio for all processes of a user - not fully implemented
             // Return default for simplicity
-            IOPRIO_DEFAULT as i64
+            i64::from(IOPRIO_DEFAULT)
         }
         _ => KernelError::InvalidArgument.sysret(),
     }

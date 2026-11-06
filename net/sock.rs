@@ -350,7 +350,8 @@ impl Sock {
 
     pub fn set_linger(&self, on: bool, secs: u32) {
         let on_bit = if on { LINGER_ON } else { 0 };
-        self.linger.store(on_bit | secs as u64, Ordering::Release);
+        self.linger
+            .store(on_bit | u64::from(secs), Ordering::Release);
         self.set_flag(sf::LINGER, on);
     }
 

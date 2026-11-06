@@ -25,6 +25,7 @@
 //! - `UserNamespace.gid_map.extents`: RwLock
 
 use crate::sync::spin::RwLock;
+use crate::util::kalloc::{arc_nofail, try_arc};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use spin::Lazy;
@@ -159,7 +160,8 @@ pub struct UserNamespace {
 impl UserNamespace {
     /// Create the initial (root) user namespace
     fn new_init() -> Arc<Self> {
-        Arc::new(Self {
+        // Boot: failure cannot be reported
+        arc_nofail(Self {
             uid_map: UidGidMap::new_identity(),
             gid_map: UidGidMap::new_identity(),
             level: 0,
@@ -189,19 +191,20 @@ impl UserNamespace {
         // Get creator's credentials
         let cred = percpu::current_cred();
 
-        Ok(Arc::new(Self {
+        try_arc(Self {
             uid_map: UidGidMap::new(),
             gid_map: UidGidMap::new(),
             level: parent.level + 1,
             parent: Some(parent.clone()),
             owner: cred.uid,
             group: cred.gid,
-        }))
+        })
+        .map_err(|e| e.errno())
     }
 
     /// Check if this namespace is an ancestor of another
     pub fn is_ancestor_of(&self, other: &UserNamespace) -> bool {
-        let self_ptr = self as *const UserNamespace;
+        let self_ptr = core::ptr::from_ref::<UserNamespace>(self);
         let mut current = other.parent.as_ref();
 
         while let Some(ns) = current {

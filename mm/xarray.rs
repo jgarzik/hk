@@ -61,14 +61,14 @@ pub fn node_alloc() -> Option<NonNull<Node>> {
     #[cfg(test)]
     tests::LIVE.with(|l| l.set(l.get() + 1));
     // SAFETY: Node is not zero-sized; all-zero is a valid empty node
-    NonNull::new(unsafe { alloc_zeroed(Layout::new::<Node>()) } as *mut Node)
+    NonNull::new(unsafe { alloc_zeroed(Layout::new::<Node>()) }.cast::<Node>())
 }
 
 fn node_free(n: NonNull<Node>) {
     #[cfg(test)]
     tests::LIVE.with(|l| l.set(l.get() - 1));
     // SAFETY: allocated by `node_alloc` with this layout
-    unsafe { dealloc(n.as_ptr() as *mut u8, Layout::new::<Node>()) }
+    unsafe { dealloc(n.as_ptr().cast::<u8>(), Layout::new::<Node>()) }
 }
 
 /// Nodes allocated before taking the tree's lock (Linux xas_nomem /
@@ -137,12 +137,12 @@ unsafe fn node_mut<'a>(p: u64) -> &'a mut Node {
 
 /// Indexes a tree of `height` levels holds
 fn span(height: u8) -> u128 {
-    1u128 << (SHIFT * height as u32)
+    1u128 << (SHIFT * u32::from(height))
 }
 
 /// Slot of `idx` in a node at `level` (1: a leaf node)
 fn slot_of(idx: u64, level: u8) -> usize {
-    ((idx >> (SHIFT * (level as u32 - 1))) as usize) & (SLOTS - 1)
+    ((idx >> (SHIFT * (u32::from(level) - 1))) as usize) & (SLOTS - 1)
 }
 
 impl XArray {
@@ -161,7 +161,7 @@ impl XArray {
 
     /// The leaf node holding `idx` and its slot, if the path exists
     fn leaf(&self, idx: u64) -> Option<(u64, usize)> {
-        if self.height == 0 || idx as u128 >= span(self.height) {
+        if self.height == 0 || u128::from(idx) >= span(self.height) {
             return None;
         }
         let mut n = self.head;
@@ -194,7 +194,7 @@ impl XArray {
             t.count = 1;
             if self.height == 0 {
                 for m in 0..MARKS {
-                    t.marks[m] = ((self.head_marks >> m) & 1) as u64;
+                    t.marks[m] = u64::from((self.head_marks >> m) & 1);
                 }
             } else {
                 // SAFETY: a live node of this tree, borrowed as the method's self
@@ -202,7 +202,7 @@ impl XArray {
                 old.parent = t;
                 old.offset = 0;
                 for m in 0..MARKS {
-                    t.marks[m] = (old.marks[m] != 0) as u64;
+                    t.marks[m] = u64::from(old.marks[m] != 0);
                 }
             }
         }
@@ -227,13 +227,13 @@ impl XArray {
         }
         if self.head == 0 {
             let mut h = 1;
-            while idx as u128 >= span(h) {
+            while u128::from(idx) >= span(h) {
                 h += 1;
             }
             self.head = alloc()?.as_ptr() as u64;
             self.height = h;
         }
-        while idx as u128 >= span(self.height) {
+        while u128::from(idx) >= span(self.height) {
             match alloc() {
                 Some(t) => self.grow(t),
                 None => {
@@ -468,7 +468,7 @@ impl XArray {
             let ok = m.is_none_or(|m| self.head_marks & (1 << m) != 0);
             return (from == 0 && ok).then_some((0, self.head));
         }
-        if from as u128 >= span(self.height) {
+        if u128::from(from) >= span(self.height) {
             return None;
         }
         // SAFETY: a live node of this tree, borrowed as the method's self
@@ -542,7 +542,7 @@ fn find_in(
     to: u64,
     m: Option<usize>,
 ) -> Option<(u64, u64)> {
-    let shift = SHIFT * (level as u32 - 1);
+    let shift = SHIFT * (u32::from(level) - 1);
     let first = if from > base {
         ((from - base) >> shift) as usize
     } else {

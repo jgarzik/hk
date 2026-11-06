@@ -183,7 +183,7 @@ fn dev_ifreq(net: &NetNamespace, cmd: u32, ifr: &mut Ifreq) -> Result<(), Kernel
         }
         SIOCSIFFLAGS => {
             let r = r.as_ref().ok_or(KernelError::InvalidArgument)?;
-            rtnl::dev_change_flags(r, net, &dev, ifr.short() as u32, NlInfo::default())?;
+            rtnl::dev_change_flags(r, net, &dev, u32::from(ifr.short()), NlInfo::default())?;
         }
         SIOCSIFMTU => {
             let mtu = ifr.i32();

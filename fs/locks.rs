@@ -13,21 +13,19 @@
 //! locker follows that chain from its blocker and gets EDEADLK if it
 //! comes back to itself (at most MAX_DEADLK_ITERATIONS steps, as Linux).
 //!
-//! `POSIX_INODES` lists the inodes holding POSIX locks, for the release
-//! of a process's locks at its exit (hk's lock owner is the pid; Linux
-//! uses the files_struct and needs no list).
+//! A POSIX lock's owner is the holder's descriptor table (Linux fl_owner
+//! = files_struct: `posix_lock::current_owner`), so CLONE_FILES tasks
+//! share their locks; closing any descriptor of the file in that table
+//! drops them, the table's last user closing all at exit.
 //!
 //! Locking: `flc_lock` is a spin leaf but for `BLOCKED` (flc_lock ->
-//! BLOCKED, Linux flc_lock -> blocked_lock_lock); `POSIX_INODES` is a
-//! leaf taken with neither held. Waits sleep with none held.
+//! BLOCKED, Linux flc_lock -> blocked_lock_lock). Waits sleep with none
+//! held.
 
 use alloc::collections::BTreeMap;
-use alloc::sync::{Arc, Weak};
-use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::flock::FileLock;
-use super::inode::Inode;
 use super::posix_lock::InodeLocks;
 use crate::sync::spin::Mutex;
 use crate::sync::waitqueue::WaitQueue;
@@ -122,25 +120,4 @@ pub fn block_on(owner: u64, blocker: u64) -> Result<(), KernelError> {
 /// `owner` no longer waits
 pub fn unblock(owner: u64) {
     BLOCKED.lock().remove(&owner);
-}
-
-/// Inodes with POSIX locks (for `release_posix_for_pid`)
-static POSIX_INODES: Mutex<Vec<Weak<Inode>>> = Mutex::new(Vec::new());
-
-/// `inode` now has POSIX locks
-pub fn note_posix_inode(inode: &Arc<Inode>) {
-    let mut l = POSIX_INODES.lock();
-    l.retain(|w| w.strong_count() > 0);
-    if !l.iter().any(|w| Weak::as_ptr(w) == Arc::as_ptr(inode)) {
-        l.push(Arc::downgrade(inode));
-    }
-}
-
-/// The inodes that may hold POSIX locks
-pub fn posix_inodes() -> Vec<Arc<Inode>> {
-    POSIX_INODES
-        .lock()
-        .iter()
-        .filter_map(Weak::upgrade)
-        .collect()
 }

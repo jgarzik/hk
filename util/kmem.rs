@@ -36,10 +36,22 @@ fn fits<T>(count: usize) -> Result<usize, KernelError> {
     Ok(bytes)
 }
 
+/// An allocation is about to be made: ENOMEM if fault injection picked
+/// it (`mm::fault_inject`)
+fn inject() -> Result<(), KernelError> {
+    if crate::mm::fault_inject::should_fail() {
+        return Err(KernelError::OutOfMemory);
+    }
+    Ok(())
+}
+
 /// `n` copies of `v`, or ENOMEM if that is over [`MAX_KMALLOC`] or the
 /// heap cannot provide it
 pub fn try_vec<T: Clone>(n: usize, v: T) -> Result<Vec<T>, KernelError> {
     fits::<T>(n)?;
+    if n > 0 && core::mem::size_of::<T>() > 0 {
+        inject()?;
+    }
     let mut x = Vec::new();
     x.try_reserve_exact(n)
         .map_err(|_| KernelError::OutOfMemory)?;
@@ -70,6 +82,9 @@ impl<T> KVec<T> {
     /// (amortized `try_reserve` can round up to roughly twice it).
     pub fn try_reserve(&mut self, n: usize) -> Result<(), KernelError> {
         fits::<T>(self.0.len().saturating_add(n))?;
+        if self.0.capacity() - self.0.len() < n {
+            inject()?;
+        }
         self.0
             .try_reserve_exact(n)
             .map_err(|_| KernelError::OutOfMemory)
@@ -189,6 +204,7 @@ impl<T> KDeque<T> {
         let len = self.0.len();
         fits::<T>(len.saturating_add(1))?;
         if len == self.0.capacity() {
+            inject()?;
             let max = MAX_KMALLOC / core::mem::size_of::<T>().max(1);
             self.0
                 .try_reserve_exact(grow(len, max) - len)

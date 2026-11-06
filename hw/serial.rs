@@ -3,10 +3,11 @@
 //! NS16550A-compatible UART driver implementing TtyDriver.
 //!
 //! This provides the hardware interface for serial ports like /dev/ttyS0.
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use crate::console::{ConsolePriority, register_console};
 use crate::util::error::KernelError;
+use crate::util::kalloc::{try_arc, try_box};
 
 use crate::fs::chardev::{DevId, major};
 use crate::tty::{Tty, TtyDriver};
@@ -308,7 +309,7 @@ pub fn write_byte_com1(byte: u8) {
 }
 
 /// COM1's interrupt handler (IRQ context): input to ttyS0
-fn com1_irq(_irq: u32, _data: *mut ()) -> bool {
+fn com1_irq(_irq: u32) -> bool {
     SERIAL_DRIVER_S0.rx_chars(&SERIAL_TTY_S0)
 }
 
@@ -316,8 +317,10 @@ fn com1_irq(_irq: u32, _data: *mut ()) -> bool {
 /// its PIC line. False without it
 fn rx_irq_init(irq: u32) -> bool {
     let id = usize::from(ports::COM1);
-    if let Err(e) = crate::arch::irq::register_irq_handler(irq, com1_irq, core::ptr::null_mut(), id)
-    {
+    let Ok(h) = try_arc(crate::irq::IrqFn(com1_irq)) else {
+        return false;
+    };
+    if let Err(e) = crate::arch::irq::register_irq_handler(irq, h, id) {
         crate::printkln!("ttyS0: no IRQ {}: {}", irq, e);
         return false;
     }
@@ -377,6 +380,11 @@ impl crate::base::Bound for Serial8250 {
 fn serial8250_probe(
     dev: &alloc::sync::Arc<crate::base::Device>,
 ) -> Result<alloc::boxed::Box<dyn crate::base::Bound>, crate::util::error::KernelError> {
+    // Allocated first, so ENOMEM leaves nothing registered
+    let mut port = try_box(Serial8250 {
+        irq: None,
+        ttys: alloc::vec::Vec::new(),
+    })?;
     // Registered at boot already, or again after an unbind (Linux
     // uart_add_one_port's uart_configure_port -> register_console)
     register_console(
@@ -385,10 +393,10 @@ fn serial8250_probe(
         crate::console::ConsoleFlags::BOOT,
     );
     let irq = crate::base::platform::pdev(dev).and_then(|p| p.irq);
-    let irq = irq.filter(|&irq| rx_irq_init(irq));
-    let ttys = serial_ttys()
+    port.irq = irq.filter(|&irq| rx_irq_init(irq));
+    port.ttys = serial_ttys()
         .iter()
         .filter_map(|t| crate::tty::tty_register_device(t, dev))
         .collect();
-    Ok(alloc::boxed::Box::new(Serial8250 { irq, ttys }))
+    Ok(port)
 }

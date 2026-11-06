@@ -47,9 +47,11 @@ use crate::console::ConsoleDriver;
 use crate::fs::File;
 use crate::fs::chardev::{CharDevice, DevId};
 use crate::fs::flags::O_NOCTTY;
+use crate::fs::iov_iter::{IovDest, IovSource};
 use crate::io::poll::{POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM, PollTable};
 use crate::task::pid::Pid;
 use crate::util::error::KernelError;
+use crate::util::kalloc::{arc_nofail, try_arc};
 
 // Re-export commonly used types
 pub use termios::{
@@ -164,6 +166,10 @@ pub struct Tty {
     buf_lock: crate::sync::Mutex<()>,
     /// Readers and pollers wait here for input (Linux read_wait)
     read_wait: WaitQueue,
+    /// One reader at a time, so a canonical line goes whole to one
+    /// reader though it is copied out in pieces (Linux
+    /// n_tty_data.atomic_read_lock)
+    read_lock: crate::sync::Mutex<()>,
     /// Session, foreground group, window size
     ctrl: Mutex<TtyCtrl>,
 }
@@ -179,6 +185,7 @@ impl Tty {
             ldata: Mutex::new(n_tty::NTtyData::new()),
             flip: IrqSpinlock::new(flip::Flip::new()),
             buf_lock: crate::sync::Mutex::new(()),
+            read_lock: crate::sync::Mutex::new(()),
             read_wait: WaitQueue::new(),
             ctrl: Mutex::new(TtyCtrl::new()),
         }
@@ -301,17 +308,17 @@ impl CharDevice for Tty {
     }
 
     /// A background reader gets SIGTTIN (Linux job_control)
-    fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {
+    fn read(&self, file: &File, to: &mut IovDest<'_>) -> Result<usize, KernelError> {
         jobctrl::check_change(self, crate::signal::SIGTTIN)?;
-        n_tty::read(self, file, buf)
+        n_tty::read(self, file, to)
     }
 
     /// With TOSTOP a background writer gets SIGTTOU (Linux n_tty_write)
-    fn write(&self, _file: &File, buf: &[u8]) -> Result<usize, KernelError> {
+    fn write(&self, _file: &File, from: &mut IovSource<'_>) -> Result<usize, KernelError> {
         if self.get_termios().c_lflag & TOSTOP != 0 {
             jobctrl::check_change(self, crate::signal::SIGTTOU)?;
         }
-        n_tty::write(self, buf)
+        n_tty::write(self, from)
     }
 
     fn ioctl(&self, file: &File, cmd: u32, arg: u64) -> Result<i64, KernelError> {
@@ -320,7 +327,7 @@ impl CharDevice for Tty {
 
     /// Output is written synchronously: always writable (Linux
     /// n_tty_poll)
-    fn poll(&self, _file: &File, pt: Option<&mut PollTable>) -> u16 {
+    fn poll(&self, _file: &File, pt: Option<&mut PollTable<'_>>) -> u16 {
         if let Some(pt) = pt {
             pt.poll_wait(&self.read_wait);
         }
@@ -370,8 +377,10 @@ struct Redirect(&'static Tty);
 
 impl Redirect {
     /// Point `file` at `tty` (at open)
-    fn set(file: &File, tty: &'static Tty) {
-        file.private.call_once(|| Arc::new(Redirect(tty)));
+    fn set(file: &File, tty: &'static Tty) -> Result<(), KernelError> {
+        let r = try_arc(Redirect(tty))?;
+        file.private.call_once(|| r);
+        Ok(())
     }
 
     /// The tty `file` was pointed at
@@ -394,19 +403,19 @@ impl CharDevice for TtyChar {
         CharDevice::open(self.0, file)
     }
 
-    fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {
-        CharDevice::read(self.0, file, buf)
+    fn read(&self, file: &File, to: &mut IovDest<'_>) -> Result<usize, KernelError> {
+        CharDevice::read(self.0, file, to)
     }
 
-    fn write(&self, file: &File, buf: &[u8]) -> Result<usize, KernelError> {
-        CharDevice::write(self.0, file, buf)
+    fn write(&self, file: &File, from: &mut IovSource<'_>) -> Result<usize, KernelError> {
+        CharDevice::write(self.0, file, from)
     }
 
     fn ioctl(&self, file: &File, cmd: u32, arg: u64) -> Result<i64, KernelError> {
         CharDevice::ioctl(self.0, file, cmd, arg)
     }
 
-    fn poll(&self, file: &File, pt: Option<&mut PollTable>) -> u16 {
+    fn poll(&self, file: &File, pt: Option<&mut PollTable<'_>>) -> u16 {
         CharDevice::poll(self.0, file, pt)
     }
 }
@@ -423,15 +432,15 @@ pub fn init_tty_chardevs() {
     // thread
     flip::init();
     for &tty in crate::arch::serial_ttys() {
-        let _ = register_chardev(tty.dev, Arc::new(TtyChar(tty)));
+        let _ = register_chardev(tty.dev, arc_nofail(TtyChar(tty)));
     }
 
     // Register /dev/tty (major 5, minor 0) - controlling terminal
-    let tty_dev = Arc::new(tty_dev::TtyCharDevice);
+    let tty_dev = arc_nofail(tty_dev::TtyCharDevice);
     let _ = register_chardev(DevId::new(major::TTYAUX, 0), tty_dev);
 
     // Register /dev/console (major 5, minor 1) - kernel console
-    let console_dev = Arc::new(console_dev::ConsoleCharDevice);
+    let console_dev = arc_nofail(console_dev::ConsoleCharDevice);
     let _ = register_chardev(DevId::new(major::TTYAUX, 1), console_dev);
 
     TTY_CLASS.register();

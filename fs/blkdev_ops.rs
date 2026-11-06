@@ -23,7 +23,9 @@ use crate::uaccess::{get_user, put_user};
 use crate::util::error::KernelError;
 use core::sync::atomic::Ordering;
 
-use super::file::{File, FileOps, seek};
+use super::file::{File, FileOps, RwFlags, seek};
+use super::iov_iter::{IovDest, IovSource};
+use crate::util::kalloc::arc_nofail;
 
 /// Block device ioctls (Linux include/uapi/linux/fs.h)
 pub mod ioc {
@@ -50,19 +52,19 @@ fn bdev(file: &File) -> Result<Arc<BlockDevice>, KernelError> {
 }
 
 /// Read at `pos`: short at the end, 0 past it (Linux blkdev_read_iter)
-fn read_at(file: &File, buf: &mut [u8], pos: u64) -> Result<usize, KernelError> {
+fn read_at(file: &File, to: &mut IovDest<'_>, pos: u64) -> Result<usize, KernelError> {
     let b = bdev(file)?;
     let size = b.capacity();
-    if pos >= size || buf.is_empty() {
+    if pos >= size || to.is_empty() {
         return Ok(0);
     }
-    let n = buf.len().min((size - pos) as usize);
-    filemap::read(&b.bd_inode, &mut buf[..n], pos)
+    to.truncate((size - pos).min(usize::MAX as u64) as usize);
+    filemap::read_iter(&b.bd_inode, to, pos)
 }
 
 /// Write at `pos`: EPERM if read-only, ENOSPC at or past the end, short
 /// at it (Linux blkdev_write_iter)
-fn write_at(file: &File, buf: &[u8], pos: u64) -> Result<usize, KernelError> {
+fn write_at(file: &File, from: &mut IovSource<'_>, pos: u64) -> Result<usize, KernelError> {
     let b = bdev(file)?;
     if b.ro() {
         return Err(KernelError::NotPermitted);
@@ -71,15 +73,15 @@ fn write_at(file: &File, buf: &[u8], pos: u64) -> Result<usize, KernelError> {
     if b.bd_inode.i_swapfile.load(Ordering::Acquire) {
         return Err(KernelError::TextBusy);
     }
-    if buf.is_empty() {
+    if from.is_empty() {
         return Ok(0);
     }
     let size = b.capacity();
     if pos >= size {
         return Err(KernelError::NoSpace);
     }
-    let n = buf.len().min((size - pos) as usize);
-    filemap::perform_write(&b.bd_inode, &buf[..n], pos)
+    from.truncate((size - pos).min(usize::MAX as u64) as usize);
+    filemap::write_iter(&b.bd_inode, from, pos)
 }
 
 /// The pages of a block device's inode are its sectors (Linux
@@ -230,7 +232,7 @@ static BDEV_AOPS: BdevAops = BdevAops;
 /// The bdev pseudo filesystem's inode of device `dev` with `size`
 /// bytes (Linux bdev_alloc): unhashed, no superblock
 pub fn bdev_inode(dev: DevId, size: u64) -> Arc<Inode> {
-    let inode = Arc::new(Inode::new_device(
+    let inode = arc_nofail(Inode::new_device(
         0,
         InodeMode::blockdev(0o600),
         0,
@@ -281,7 +283,7 @@ fn need_admin() -> Result<(), KernelError> {
 /// Linux blkdev_common_ioctl / blkdev_ioctl subset
 fn blkdev_ioctl(b: &BlockDevice, cmd: u32, arg: u64) -> Result<i64, KernelError> {
     match cmd {
-        ioc::BLKROGET => put_int(arg, b.ro() as i32),
+        ioc::BLKROGET => put_int(arg, i32::from(b.ro())),
         ioc::BLKSSZGET => put_int(arg, b.logical_block_size() as i32),
         ioc::BLKPBSZGET => put_int(arg, b.physical_block_size() as i32),
         ioc::BLKBSZGET => put_int(arg, b.block_size() as i32),
@@ -293,11 +295,11 @@ fn blkdev_ioctl(b: &BlockDevice, cmd: u32, arg: u64) -> Result<i64, KernelError>
                 return Err(KernelError::InvalidArgument);
             }
             let n = get_user::<Uaccess, i32>(arg).map_err(|_| KernelError::BadAddress)?;
-            b.set_block_size(n).map(|_| 0)
+            b.set_block_size(n).map(|()| 0)
         }
         ioc::BLKRRPART => {
             need_admin()?;
-            genhd::rescan(b).map(|_| 0)
+            genhd::rescan(b).map(|()| 0)
         }
         // No buffer cache to write back or drop yet
         // Write the cache back and drop it (Linux blkdev_flushbuf)
@@ -342,24 +344,40 @@ impl FileOps for BlockFileOps {
         Ok(())
     }
 
-    fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {
-        let n = read_at(file, buf, file.get_pos())?;
-        file.advance_pos(n as u64);
+    /// Through the device's page cache; no RWF_NOWAIT (EOPNOTSUPP)
+    fn read_iter(
+        &self,
+        file: &File,
+        to: &mut IovDest<'_>,
+        at: Option<u64>,
+        flags: RwFlags,
+    ) -> Result<usize, KernelError> {
+        if flags.nowait {
+            return Err(KernelError::OperationNotSupported);
+        }
+        let n = read_at(file, to, at.unwrap_or_else(|| file.get_pos()))?;
+        if at.is_none() {
+            file.advance_pos(n as u64);
+        }
         Ok(n)
     }
 
-    fn write(&self, file: &File, buf: &[u8]) -> Result<usize, KernelError> {
-        let n = write_at(file, buf, file.get_pos())?;
-        file.advance_pos(n as u64);
+    /// Through the device's page cache; no RWF_NOWAIT (EOPNOTSUPP)
+    fn write_iter(
+        &self,
+        file: &File,
+        from: &mut IovSource<'_>,
+        at: Option<u64>,
+        flags: RwFlags,
+    ) -> Result<usize, KernelError> {
+        if flags.nowait {
+            return Err(KernelError::OperationNotSupported);
+        }
+        let n = write_at(file, from, at.unwrap_or_else(|| file.get_pos()))?;
+        if at.is_none() {
+            file.advance_pos(n as u64);
+        }
         Ok(n)
-    }
-
-    fn pread(&self, file: &File, buf: &mut [u8], offset: u64) -> Result<usize, KernelError> {
-        read_at(file, buf, offset)
-    }
-
-    fn pwrite(&self, file: &File, buf: &[u8], offset: u64) -> Result<usize, KernelError> {
-        write_at(file, buf, offset)
     }
 
     /// Positions within the device only (Linux fixed_size_llseek)

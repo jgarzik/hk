@@ -8,6 +8,7 @@
 use crate::console::console_tty;
 use crate::fs::File;
 use crate::fs::chardev::CharDevice;
+use crate::fs::iov_iter::{IovDest, IovSource};
 use crate::io::poll::PollTable;
 use crate::util::error::KernelError;
 
@@ -23,23 +24,22 @@ impl CharDevice for ConsoleCharDevice {
 
     fn open(&self, file: &File) -> Result<(), KernelError> {
         let tty = console_tty().ok_or(KernelError::NoDevice)?;
-        Redirect::set(file, tty);
-        Ok(())
+        Redirect::set(file, tty)
     }
 
-    fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {
-        CharDevice::read(Redirect::tty(file)?, file, buf)
+    fn read(&self, file: &File, to: &mut IovDest<'_>) -> Result<usize, KernelError> {
+        CharDevice::read(Redirect::tty(file)?, file, to)
     }
 
-    fn write(&self, file: &File, buf: &[u8]) -> Result<usize, KernelError> {
-        CharDevice::write(Redirect::tty(file)?, file, buf)
+    fn write(&self, file: &File, from: &mut IovSource<'_>) -> Result<usize, KernelError> {
+        CharDevice::write(Redirect::tty(file)?, file, from)
     }
 
     fn ioctl(&self, file: &File, cmd: u32, arg: u64) -> Result<i64, KernelError> {
         CharDevice::ioctl(Redirect::tty(file)?, file, cmd, arg)
     }
 
-    fn poll(&self, file: &File, pt: Option<&mut PollTable>) -> u16 {
+    fn poll(&self, file: &File, pt: Option<&mut PollTable<'_>>) -> u16 {
         match Redirect::tty(file) {
             Ok(t) => CharDevice::poll(t, file, pt),
             Err(_) => crate::io::poll::POLLERR,

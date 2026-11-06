@@ -57,6 +57,10 @@ The rules for `unsafe` are in `doc/UNSAFE.md` and the locking rules in
 - Comments say *why* and give the Linux counterpart. Doc comments
   describe current behaviour only, with no history.
 - Run `make fmt`. Clippy must be clean at the workspace lint levels.
+- Silence a lint with `#[expect(...)]`, never `#[allow(...)]`: a stale
+  `expect` fails the build. Use `allow` only where the lint fires on
+  some configurations (arch, host tests) and not others, and give it a
+  `reason = "..."`.
 
 ## Arch split
 

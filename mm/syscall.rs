@@ -48,15 +48,38 @@ pub const MCL_ONFAULT: i32 = 4;
 ///
 /// # Returns
 /// Address of mapping on success, negative errno on failure
-/// File checks of do_mmap (Linux): the file must be readable, and a
-/// shared writable mapping needs it open for writing and not
-/// append-only (EACCES)
+/// mprotect's file checks (Linux VM_MAYWRITE, decided at mmap): the
+/// file must be readable, and a shared writable mapping needs it open
+/// for writing (EACCES); O_APPEND does not matter (Linux refuses only
+/// an append-only inode, which hk does not have)
 fn file_prot_ok(f: &File, prot: u32, shared: bool) -> Result<(), KernelError> {
-    use crate::fs::flags::O_APPEND;
     if !f.is_readable() {
         return Err(KernelError::PermissionDenied);
     }
-    if shared && prot & PROT_WRITE != 0 && (!f.is_writable() || f.get_flags() & O_APPEND != 0) {
+    if shared && prot & PROT_WRITE != 0 && !f.is_writable() {
+        return Err(KernelError::PermissionDenied);
+    }
+    Ok(())
+}
+
+/// mmap's file checks in Linux's order (do_mmap): a shared writable
+/// mapping needs the file open for writing (EACCES) and not an active
+/// swap file (ETXTBSY; mprotect does not check that, a write fault is
+/// SIGBUS instead); then any mapping needs it readable (EACCES). An
+/// O_APPEND descriptor may be mapped (Linux refuses an append-only
+/// inode, IS_APPEND, which hk does not have).
+fn mmap_file_ok(f: &File, prot: u32, shared: bool) -> Result<(), KernelError> {
+    if shared && prot & PROT_WRITE != 0 {
+        if !f.is_writable() {
+            return Err(KernelError::PermissionDenied);
+        }
+        if f.mapping_inode()
+            .is_some_and(|i| i.i_swapfile.load(core::sync::atomic::Ordering::Acquire))
+        {
+            return Err(KernelError::TextBusy);
+        }
+    }
+    if !f.is_readable() {
         return Err(KernelError::PermissionDenied);
     }
     Ok(())
@@ -146,7 +169,7 @@ pub fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: 
         return KernelError::Overflow.sysret();
     }
     if let Some(f) = &file
-        && let Err(e) = file_prot_ok(f, prot, is_shared).and_then(|_| f.f_op.mmap(f, is_shared))
+        && let Err(e) = mmap_file_ok(f, prot, is_shared).and_then(|()| f.f_op.mmap(f, is_shared))
     {
         return e.sysret();
     }
@@ -155,6 +178,13 @@ pub fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: 
     let noexec = file.as_ref().is_some_and(|f| f.noexec());
     if noexec && prot & super::PROT_EXEC != 0 {
         return KernelError::NotPermitted.sysret();
+    }
+    // A regular file's mmap is an access (Linux generic_file_mmap:
+    // file_accessed)
+    if let Some(f) = &file
+        && let Some(i) = f.get_inode().filter(|i| i.mode().is_file())
+    {
+        f.accessed(&i);
     }
 
     // Every user task has an address space; kernel threads have none
@@ -224,6 +254,9 @@ pub fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: 
         }
     }
 
+    // A shared mapping of /dev/zero is shared anonymous memory (Linux
+    // mmap_zero -> shmem_zero_setup)
+    let file = file.filter(|f| !(is_shared && crate::fs::chardev::maps_shared_anon(f)));
     // Create VMA
     let mut vma = if let Some(f) = file {
         Vma::new_file(map_addr, map_addr + length, prot, flags, f, offset)
@@ -233,10 +266,13 @@ pub fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: 
         // Set up anon_vma for private anonymous mappings (for swap-out
         // reverse mapping); shared ones get a shared object for their
         // pages (Linux shmem_zero_setup)
-        if is_private {
-            v.set_anon_vma(AnonVma::new());
+        let made = if is_private {
+            AnonVma::new().map(|av| v.set_anon_vma(av))
         } else {
-            v.shmem = Some(super::shmem::Shmem::new(length / PAGE_SIZE));
+            super::shmem::Shmem::new(length / PAGE_SIZE).map(|s| v.shmem = Some(s))
+        };
+        if let Err(e) = made {
+            return e.sysret();
         }
         v
     };
@@ -452,7 +488,10 @@ pub fn sys_brk(brk: u64) -> i64 {
     if !brk_fits(&map, old, new) || !map.may_map() {
         return cur as i64;
     }
-    brk_grow(&mut map, old, new);
+    // Without memory the break stays (Linux brk: the old one returned)
+    if brk_grow(&mut map, old, new).is_err() {
+        return cur as i64;
+    }
     map.update_brk(brk);
     brk as i64
 }
@@ -488,8 +527,9 @@ fn brk_fits(mm: &super::MmStruct, old: u64, new: u64) -> bool {
 }
 
 /// Map [old, new) for the heap: the heap VMA ending at `old` grows, or a
-/// new one is made (merged with its neighbours); pages come on demand
-fn brk_grow(mm: &mut super::MmStruct, old: u64, new: u64) {
+/// new one is made (merged with its neighbours); pages come on demand.
+/// ENOMEM
+fn brk_grow(mm: &mut super::MmStruct, old: u64, new: u64) -> Result<(), KernelError> {
     match mm.find_vma_index(old - 1) {
         Some(i) if mm.get_vma(i).is_some_and(|v| v.end == old && is_heap(v)) => {
             mm.set_end(i, new);
@@ -501,13 +541,14 @@ fn brk_grow(mm: &mut super::MmStruct, old: u64, new: u64) {
                 new,
                 PROT_READ | PROT_WRITE,
                 MAP_PRIVATE | MAP_ANONYMOUS,
-                AnonVma::new(),
+                AnonVma::new()?,
             );
             let i = mm.insert_vma(heap);
             mm.merge_adjacent(i);
         }
     }
     mm.add_total_vm((new - old) / PAGE_SIZE);
+    Ok(())
 }
 
 /// A VMA the heap can grow into: private anonymous memory, no file
@@ -609,7 +650,7 @@ fn populate_pages(
             return Err(KernelError::Interrupted);
         }
         match handle_mm_fault(mm, a, access) {
-            Ok(_) => {}
+            Ok(()) => {}
             Err(VmFault::Oom) => return Err(KernelError::OutOfMemory),
             Err(_) => return Err(KernelError::BadAddress),
         }
@@ -750,7 +791,7 @@ fn mlock_vmas(
     while addr < end {
         let i = mm.find_vma_index(addr).ok_or(KernelError::OutOfMemory)?;
         let e = mm.get_vma(i).map_or(end, |v| v.end.min(end));
-        mlock_fixup(mm, i, addr, e, vm_flags);
+        mlock_fixup(mm, i, addr, e, vm_flags)?;
         addr = e;
     }
     Ok(())
@@ -758,19 +799,26 @@ fn mlock_vmas(
 
 /// [start, end) of the VMA at `idx` takes the lock flags `vm_flags`
 /// (Linux mlock_fixup): split off at the range edges, locked_vm
-/// counted, and merged with its neighbours. No change: no split.
-fn mlock_fixup(mm: &mut super::MmStruct, idx: usize, start: u64, end: u64, vm_flags: u32) {
+/// counted, and merged with its neighbours. No change: no split. A
+/// split at vm.max_map_count is ENOMEM (Linux vma_modify_flags).
+fn mlock_fixup(
+    mm: &mut super::MmStruct,
+    idx: usize,
+    start: u64,
+    end: u64,
+    vm_flags: u32,
+) -> Result<(), KernelError> {
     let Some(old) = mm.get_vma(idx).map(|v| v.flags) else {
-        return;
+        return Ok(());
     };
     let new = (old & !VM_LOCKED_MASK) | vm_flags;
     if new == old {
-        return;
+        return Ok(());
     }
-    mm.split_at(start);
-    mm.split_at(end);
+    mm.split_at_checked(start)?;
+    mm.split_at_checked(end)?;
     let Some(i) = mm.find_vma_exact(start) else {
-        return;
+        return Ok(());
     };
     mm.set_flags(i, new);
     let pages = (end - start) / PAGE_SIZE;
@@ -780,6 +828,7 @@ fn mlock_fixup(mm: &mut super::MmStruct, idx: usize, start: u64, end: u64, vm_fl
         _ => {}
     }
     mm.merge_adjacent(i);
+    Ok(())
 }
 
 /// munlock syscall - Unlock pages (Linux munlock): the range as mlock
@@ -1382,6 +1431,12 @@ pub fn sys_mremap(old_addr: u64, old_len: u64, new_len: u64, flags: u32, new_add
         return KernelError::OutOfMemory.sysret();
     }
     let locked = mm_guard.get_vma(vma_idx).is_some_and(|v| v.is_locked());
+    // What grows is faulted in, unless locked on fault (Linux
+    // populate_vma_page_range skips VM_LOCKONFAULT)
+    let populate = locked
+        && mm_guard
+            .get_vma(vma_idx)
+            .is_some_and(|v| v.flags & super::vma::VM_LOCKONFAULT == 0);
     if locked && new_len_aligned > old_len && !memlock_ok(&mm_guard, new_len_aligned - old_len) {
         return KernelError::WouldBlock.sysret();
     }
@@ -1397,6 +1452,10 @@ pub fn sys_mremap(old_addr: u64, old_len: u64, new_len: u64, flags: u32, new_add
         {
             #[cfg(feature = "mmcheck")]
             super::check::verify(&mm_guard, mm.pgd(), "mremap expand");
+            drop(mm_guard);
+            if populate {
+                populate_grown(old_addr, old_len, new_len_aligned);
+            }
             return old_addr as i64;
         }
         if !may_move {
@@ -1437,7 +1496,19 @@ pub fn sys_mremap(old_addr: u64, old_len: u64, new_len: u64, flags: u32, new_add
     super::check::verify(&mm_guard, mm.pgd(), "mremap move");
     drop(mm_guard);
     drop(gone);
+    if populate {
+        populate_grown(target, old_len, new_len_aligned);
+    }
     target as i64
+}
+
+/// A locked mapping that mremap grew at `addr` from `old_len` to
+/// `new_len` has its added part faulted in, mm lock dropped (Linux
+/// mremap: mm_populate of the new range; a failure is not reported)
+fn populate_grown(addr: u64, old_len: u64, new_len: u64) {
+    if new_len > old_len {
+        let _ = populate_range(addr + old_len, new_len - old_len, true);
+    }
 }
 
 /// `bytes` more of locked memory fit RLIMIT_MEMLOCK (or the task has
@@ -1479,9 +1550,9 @@ fn move_vma_out(mm: &mut super::MmStruct, old_addr: u64, dontunmap: bool, gone: 
 /// in one VMA and the new one unmapped. What the move needs is
 /// allocated first (`mremap::move_prep`): ENOMEM leaves the old mapping
 /// as it was. Then, under the same mm lock hold, the old range is split
-/// into a VMA of its own, retired (kept empty with MREMAP_DONTUNMAP),
-/// its copy inserted at the new address, and the entries moved into it
-/// (each page once, with its reference).
+/// into a VMA of its own, its copy inserted at the new address, the
+/// entries moved into it (each page once, with its reference), and the
+/// old VMA retired (kept empty with MREMAP_DONTUNMAP).
 fn move_mapping(
     mm: &mut super::MmStruct,
     owner: &super::Mm,
@@ -1501,7 +1572,6 @@ fn move_mapping(
         .and_then(|i| mm.get_vma(i))
         .ok_or(KernelError::BadAddress)?
         .clone();
-    move_vma_out(mm, old_addr, dontunmap, gone);
     new_vma.start = new_addr;
     new_vma.end = new_addr + new_len;
     // The lock moves with the mapping (Linux: locked_vm charged to the
@@ -1510,14 +1580,20 @@ fn move_mapping(
         mm.add_locked_vm(new_len / PAGE_SIZE);
     }
     let inode = new_vma.inode();
-    let idx = mm.insert_vma(new_vma);
+    // The copy is linked first and the old VMA retired only after the
+    // entries moved, with a file's i_mmap held across the move (Linux
+    // move_vma: copy_vma, move_page_tables under take_rmap_locks, then
+    // the old range unmapped): a truncate walking i_mmap always finds
+    // the entries, at the old address or the new
+    mm.insert_vma(new_vma);
     mm.add_total_vm(new_len / PAGE_SIZE);
-    mm.merge_adjacent(idx);
-    // A file's i_mmap held across the move (Linux take_rmap_locks): a
-    // truncate walking it sees the entries at the old address or the new
     {
         let _rmap = inode.as_ref().map(|i| i.i_data.i_mmap.lock_write());
         super::mremap::move_ptes(owner, old_addr, new_addr, old_len);
+    }
+    move_vma_out(mm, old_addr, dontunmap, gone);
+    if let Some(idx) = mm.find_vma_exact(new_addr) {
+        mm.merge_adjacent(idx);
     }
     if !dontunmap {
         // The old range's tables, now empty (Linux move_vma unmaps it)
@@ -1601,7 +1677,10 @@ fn mincore_chunk(
     let end = vma.end.min(addr + pages * PAGE_SIZE);
     let n = ((end - addr) / PAGE_SIZE) as usize;
     for (i, b) in buf[..n].iter_mut().enumerate() {
-        *b = super::memory::resident(mm.pgd(), addr + i as u64 * PAGE_SIZE) as u8;
+        *b = u8::from(super::memory::resident(
+            mm.pgd(),
+            addr + i as u64 * PAGE_SIZE,
+        ));
     }
     Ok(n)
 }

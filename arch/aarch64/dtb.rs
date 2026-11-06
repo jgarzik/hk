@@ -3,7 +3,7 @@
 //! This module extracts hardware configuration from the Device Tree Blob (DTB)
 //! passed by the bootloader. It produces an AcpiInfo structure compatible with
 //! the architecture-independent kernel code.
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 extern crate alloc;
 
@@ -60,7 +60,7 @@ pub fn parse_dtb() -> Option<AcpiInfo> {
 }
 
 /// Extract GIC distributor base address from DTB
-fn extract_gic_base(dt: &DeviceTree) -> Option<u64> {
+fn extract_gic_base(dt: &DeviceTree<'_>) -> Option<u64> {
     // Look for GICv3: compatible = "arm,gic-v3"
     let gic_nodes = dt.find_compatible("arm,gic-v3");
     if let Some(gic) = gic_nodes.first()
@@ -83,7 +83,7 @@ fn extract_gic_base(dt: &DeviceTree) -> Option<u64> {
 }
 
 /// Extract CPU list from DTB /cpus node
-fn extract_cpus(dt: &DeviceTree) -> Vec<CpuInfo> {
+fn extract_cpus(dt: &DeviceTree<'_>) -> Vec<CpuInfo> {
     let mut cpus = Vec::new();
 
     let cpus_node = match dt.find_node("/cpus") {
@@ -148,7 +148,7 @@ fn blob() -> Option<&'static [u8]> {
     if dtb == 0 {
         return None;
     }
-    let p = phys_to_virt(dtb) as *const u8;
+    let p = phys_to_virt(dtb).cast_const();
     // SAFETY: 8 readable bytes at the recorded address (`set_boot`)
     let h = unsafe { core::slice::from_raw_parts(p, 8) };
     if h[..4] != [0xd0, 0x0d, 0xfe, 0xed] {
@@ -175,7 +175,7 @@ pub fn for_each_memory(mut f: impl FnMut(u64, u64)) -> bool {
     let cells = root.cells();
     let mut any = false;
     let disabled =
-        |c: &crate::dt::Node| c.property("status").and_then(|p| p.as_str()) == Some("disabled");
+        |c: &crate::dt::Node<'_>| c.property("status").and_then(|p| p.as_str()) == Some("disabled");
     for c in root.children() {
         if (c.name() == "memory" || c.name().starts_with("memory@")) && !disabled(&c) {
             for (base, size) in c.regs(cells).filter(|&(_, size)| size != 0) {
@@ -257,10 +257,8 @@ pub fn extract_initramfs() -> Option<InitramfsInfo> {
     let end = chosen.property("linux,initrd-end")?;
 
     // Try 64-bit first, fall back to 32-bit
-    let start_addr = start
-        .as_u64()
-        .or_else(|| start.as_u32().map(|v| v as u64))?;
-    let end_addr = end.as_u64().or_else(|| end.as_u32().map(|v| v as u64))?;
+    let start_addr = start.as_u64().or_else(|| start.as_u32().map(u64::from))?;
+    let end_addr = end.as_u64().or_else(|| end.as_u32().map(u64::from))?;
 
     // Sanity check
     if end_addr <= start_addr || (end_addr - start_addr) > 1024 * 1024 * 1024 {
@@ -436,7 +434,7 @@ pub fn init_numa_topology() -> Result<bool, &'static str> {
             // Its MPIDR affinity, from reg (one or two cells)
             let hwid = match cpu_child.property("reg") {
                 Some(reg) if reg.data().len() >= 8 => reg.as_u64().unwrap_or(0),
-                Some(reg) => reg.as_u32().unwrap_or(0) as u64,
+                Some(reg) => u64::from(reg.as_u32().unwrap_or(0)),
                 None => continue,
             };
             let hwid = hwid & super::cpu::MPIDR_HWID_BITMASK;

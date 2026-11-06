@@ -3,9 +3,11 @@
 //! This module defines the KeyType trait for pluggable key types and provides
 //! implementations for the built-in "user" and "keyring" key types.
 
+use crate::util::kalloc::arc_nofail;
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
+use spin::Lazy;
 
 use crate::util::error::KernelError;
 
@@ -88,7 +90,9 @@ impl KeyType for UserKeyType {
 
 /// Get a reference to the "user" key type
 pub fn user_key_type() -> Arc<dyn KeyType> {
-    Arc::new(UserKeyType)
+    // Registered once (Linux register_key_type)
+    static T: Lazy<Arc<dyn KeyType>> = Lazy::new(|| arc_nofail(UserKeyType));
+    T.clone()
 }
 
 // =============================================================================
@@ -148,7 +152,8 @@ impl KeyType for KeyringKeyType {
 
 /// Get a reference to the "keyring" key type
 pub fn keyring_key_type() -> Arc<dyn KeyType> {
-    Arc::new(KeyringKeyType)
+    static T: Lazy<Arc<dyn KeyType>> = Lazy::new(|| arc_nofail(KeyringKeyType));
+    T.clone()
 }
 
 // =============================================================================

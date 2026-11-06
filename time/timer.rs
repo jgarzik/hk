@@ -22,6 +22,7 @@
 //! lists and the timers' `expires`/`pending` under it); callbacks run
 //! with no timer lock held.
 
+use crate::util::kalloc::box_nofail;
 use alloc::boxed::Box;
 use core::marker::PhantomPinned;
 use core::pin::Pin;
@@ -113,7 +114,7 @@ impl TimerList {
         } else {
             base_of(0, self.flags)
         };
-        let p = want as *const TimerBase as *mut TimerBase;
+        let p = core::ptr::from_ref::<TimerBase>(want).cast_mut();
         match self.base.compare_exchange(
             core::ptr::null_mut(),
             p,
@@ -169,7 +170,7 @@ impl TimerList {
         let Some(base) = base_ref(self.base.load(Ordering::Acquire)) else {
             return false;
         };
-        let me = self as *const TimerList as *mut TimerList;
+        let me = core::ptr::from_ref::<TimerList>(self).cast_mut();
         let mut was = false;
         loop {
             was |= base.wheel.lock().detach(self);
@@ -241,7 +242,7 @@ impl Wheel {
                 .slot(i)
                 .iter()
                 .find(|t| t.expires.load(Ordering::Relaxed) <= now)
-                .map(|t| t as *const TimerList);
+                .map(core::ptr::from_ref::<TimerList>);
             if found.is_some() {
                 return found;
             }
@@ -310,7 +311,7 @@ impl TimerBase {
                 w.insert(t, now + 1);
                 continue;
             }
-            self.running.store(p as *mut TimerList, Ordering::Release);
+            self.running.store(p.cast_mut(), Ordering::Release);
             drop(w);
             (t.func)(t);
             self.running.store(core::ptr::null_mut(), Ordering::Release);
@@ -345,7 +346,8 @@ fn base_of(cpu: u32, flags: u8) -> &'static TimerBase {
 /// Give `cpu` its wheels (bring-up, thread context)
 pub fn init_cpu(cpu: u32) {
     for b in BASES.get(cpu) {
-        let slots = Box::new([const { List::new() }; WHEEL]);
+        // CPU bring-up: failure cannot be reported
+        let slots = box_nofail([const { List::new() }; WHEEL]);
         let mut w = b.wheel.lock();
         if w.slots.is_none() {
             w.slots = Some(slots);
@@ -449,7 +451,8 @@ impl Alarm {
             return;
         }
         *s = at_ns;
-        self.timer.set_data(self as *const Alarm as usize);
+        self.timer
+            .set_data(core::ptr::from_ref::<Alarm>(self) as usize);
         Pin::static_ref(&self.timer).mod_timer_ns(at_ns);
     }
 

@@ -5,7 +5,7 @@
 //! - fcntl (file control operations)
 //! - truncate, ftruncate (file size modification)
 //! - pipe, pipe2 (pipe creation)
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use alloc::sync::Arc;
 
@@ -22,8 +22,11 @@ use super::syscall::{current_fd_table, get_nofile_limit};
 // truncate, ftruncate syscalls
 // =============================================================================
 
-/// Helper to perform truncate on an inode with RLIMIT and error handling
-fn do_truncate(inode: &Arc<super::Inode>, length: u64) -> i64 {
+/// Helper to perform truncate on an inode with RLIMIT and error handling.
+/// `times` (ftruncate: Linux ATTR_MTIME | ATTR_CTIME): mtime and ctime
+/// are set even when the size stays; without it only a size change
+/// sets them (the file system's setattr, as ext4, tmpfs and vfat).
+fn do_truncate(inode: &Arc<super::Inode>, length: u64, times: bool) -> i64 {
     // Check RLIMIT_FSIZE when extending the file
     let current_size = inode.get_size();
     // RLIMIT_FSIZE (SIGXFSZ), then the filesystem's largest file (Linux
@@ -55,7 +58,12 @@ fn do_truncate(inode: &Arc<super::Inode>, length: u64) -> i64 {
         // The set-id kill with the size change (Linux do_truncate:
         // ATTR_KILL_* in the same notify_change)
         super::dac::remove_privs(inode);
-        inode.i_op.truncate(inode, length)
+        let changed = inode.get_size() != length;
+        inode.i_op.truncate(inode, length).inspect(|()| {
+            if times || changed {
+                inode.touch_mc();
+            }
+        })
     };
     drop(lock);
     match r {
@@ -103,7 +111,7 @@ pub fn sys_ftruncate(fd: i32, length: i64) -> i64 {
         return KernelError::InvalidArgument.sysret();
     }
 
-    do_truncate(&inode, length as u64)
+    do_truncate(&inode, length as u64, true)
 }
 
 /// sys_truncate - truncate a file to a specified length by path
@@ -162,7 +170,7 @@ pub fn sys_truncate(path_ptr: u64, length: i64) -> i64 {
     if let Err(e) = super::dac::may_truncate(&inode) {
         return e.sysret();
     }
-    do_truncate(&inode, length as u64)
+    do_truncate(&inode, length as u64, false)
 }
 
 // =============================================================================
@@ -189,8 +197,8 @@ pub fn sys_dup(oldfd: i32) -> i64 {
 
     // Allocate fd (RLIMIT_NOFILE enforced inside alloc)
     match table.alloc(file, get_nofile_limit()) {
-        Ok(newfd) => newfd as i64,
-        Err(e) => -(e as i64),
+        Ok(newfd) => i64::from(newfd),
+        Err(e) => -i64::from(e),
     }
 }
 
@@ -211,7 +219,7 @@ pub fn sys_dup2(oldfd: i32, newfd: i32) -> i64 {
         let fd_table = current_fd_table();
         let table = fd_table.lock();
         return if table.is_valid(oldfd) {
-            newfd as i64
+            i64::from(newfd)
         } else {
             KernelError::BadFd.sysret()
         };
@@ -254,7 +262,7 @@ pub fn sys_dup3(oldfd: i32, newfd: i32, flags: u32) -> i64 {
 fn dup_to(oldfd: i32, newfd: i32, fd_flags: u32) -> i64 {
     let nofile = get_nofile_limit();
     // Linux takes newfd unsigned: a negative one is past any limit
-    if newfd as u32 as u64 >= nofile {
+    if u64::from(newfd as u32) >= nofile {
         return KernelError::BadFd.sysret();
     }
     let fd_table = current_fd_table();
@@ -266,12 +274,12 @@ fn dup_to(oldfd: i32, newfd: i32, fd_flags: u32) -> i64 {
     match room {
         Ok(()) => {}
         Err(24) => return KernelError::BadFd.sysret(), // EMFILE
-        Err(e) => return -(e as i64),
+        Err(e) => return -i64::from(e),
     }
     table.close(newfd);
     match table.alloc_at_with_flags(newfd, file, fd_flags, nofile) {
-        Ok(()) => newfd as i64,
-        Err(e) => -(e as i64),
+        Ok(()) => i64::from(newfd),
+        Err(e) => -i64::from(e),
     }
 }
 
@@ -346,7 +354,7 @@ pub fn sys_pipe2(pipefd: u64, flags: u32) -> i64 {
 
     let read_fd = match table.alloc_with_flags(read_file, fd_flags, nofile) {
         Ok(fd) => fd,
-        Err(e) => return -(e as i64),
+        Err(e) => return -i64::from(e),
     };
 
     let write_fd = match table.alloc_with_flags(write_file, fd_flags, nofile) {
@@ -354,7 +362,7 @@ pub fn sys_pipe2(pipefd: u64, flags: u32) -> i64 {
         Err(e) => {
             // Clean up read fd on failure
             table.close(read_fd);
-            return -(e as i64);
+            return -i64::from(e);
         }
     };
 
@@ -363,7 +371,7 @@ pub fn sys_pipe2(pipefd: u64, flags: u32) -> i64 {
     // Write file descriptors to user space
     let fds: [i32; 2] = [read_fd, write_fd];
     let fds_bytes = unsafe {
-        core::slice::from_raw_parts(fds.as_ptr() as *const u8, core::mem::size_of::<[i32; 2]>())
+        core::slice::from_raw_parts(fds.as_ptr().cast::<u8>(), core::mem::size_of::<[i32; 2]>())
     };
 
     match copy_to_user::<Uaccess>(pipefd, fds_bytes) {
@@ -457,8 +465,8 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> i64 {
             }
             // RLIMIT_NOFILE enforced inside alloc_at_or_above
             match table.alloc_at_or_above(file, min_fd, 0, nofile) {
-                Ok(new_fd) => new_fd as i64,
-                Err(e) => -(e as i64),
+                Ok(new_fd) => i64::from(new_fd),
+                Err(e) => -i64::from(e),
             }
         }
 
@@ -478,8 +486,8 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> i64 {
             }
             // RLIMIT_NOFILE enforced inside alloc_at_or_above
             match table.alloc_at_or_above(file, min_fd, crate::task::FD_CLOEXEC, nofile) {
-                Ok(new_fd) => new_fd as i64,
-                Err(e) => -(e as i64),
+                Ok(new_fd) => i64::from(new_fd),
+                Err(e) => -i64::from(e),
             }
         }
 
@@ -488,7 +496,7 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> i64 {
             if !table.is_valid(fd) {
                 return KernelError::BadFd.sysret();
             }
-            table.get_fd_flags(fd) as i64
+            i64::from(table.get_fd_flags(fd))
         }
 
         F_SETFD => {
@@ -505,15 +513,26 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> i64 {
                 Some(f) => f,
                 None => return KernelError::BadFd.sysret(),
             };
-            file.get_flags() as i64
+            i64::from(file.get_flags())
         }
 
         F_SETFL => {
-            // Set file status flags (only O_APPEND, O_NONBLOCK can be changed)
+            // Set file status flags (O_APPEND, O_NONBLOCK, O_NOATIME)
             let file = match table.get(fd) {
                 Some(f) => f,
                 None => return KernelError::BadFd.sysret(),
             };
+            // Linux setfl: setting O_NOATIME needs the owner or
+            // CAP_FOWNER
+            let noatime = super::dac::O_NOATIME;
+            if arg as u32 & noatime != 0
+                && file.get_flags() & noatime == 0
+                && !file
+                    .get_inode()
+                    .is_some_and(|i| super::dac::owner_or_capable(&super::dac::cred(), &i))
+            {
+                return KernelError::NotPermitted.sysret();
+            }
             file.set_status_flags(arg as u32);
             0
         }
@@ -530,7 +549,7 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> i64 {
             let mut flock = Flock::default();
             let flock_size = core::mem::size_of::<Flock>();
             let flock_bytes = unsafe {
-                core::slice::from_raw_parts_mut(&mut flock as *mut Flock as *mut u8, flock_size)
+                core::slice::from_raw_parts_mut((&raw mut flock).cast::<u8>(), flock_size)
             };
             if copy_from_user::<Uaccess>(flock_bytes, arg, flock_size).is_err() {
                 return KernelError::BadAddress.sysret();
@@ -542,9 +561,8 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> i64 {
             }
 
             // Copy result back
-            let flock_bytes = unsafe {
-                core::slice::from_raw_parts(&flock as *const Flock as *const u8, flock_size)
-            };
+            let flock_bytes =
+                unsafe { core::slice::from_raw_parts((&raw const flock).cast::<u8>(), flock_size) };
             if copy_to_user::<Uaccess>(arg, flock_bytes).is_err() {
                 return KernelError::BadAddress.sysret();
             }
@@ -564,7 +582,7 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> i64 {
             let mut flock = Flock::default();
             let flock_size = core::mem::size_of::<Flock>();
             let flock_bytes = unsafe {
-                core::slice::from_raw_parts_mut(&mut flock as *mut Flock as *mut u8, flock_size)
+                core::slice::from_raw_parts_mut((&raw mut flock).cast::<u8>(), flock_size)
             };
             if copy_from_user::<Uaccess>(flock_bytes, arg, flock_size).is_err() {
                 return KernelError::BadAddress.sysret();
@@ -591,7 +609,7 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> i64 {
             let mut flock = Flock::default();
             let flock_size = core::mem::size_of::<Flock>();
             let flock_bytes = unsafe {
-                core::slice::from_raw_parts_mut(&mut flock as *mut Flock as *mut u8, flock_size)
+                core::slice::from_raw_parts_mut((&raw mut flock).cast::<u8>(), flock_size)
             };
             if copy_from_user::<Uaccess>(flock_bytes, arg, flock_size).is_err() {
                 return KernelError::BadAddress.sysret();
@@ -623,7 +641,7 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> i64 {
                 Some(f) => f,
                 None => return KernelError::BadFd.sysret(),
             };
-            file.get_owner() as i64
+            i64::from(file.get_owner())
         }
 
         F_SETSIG => {
@@ -647,7 +665,7 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> i64 {
                 Some(f) => f,
                 None => return KernelError::BadFd.sysret(),
             };
-            file.get_sig() as i64
+            i64::from(file.get_sig())
         }
 
         _ => KernelError::InvalidArgument.sysret(),
@@ -664,7 +682,7 @@ pub fn f_setown(file: &File, who: i32) -> Result<(), KernelError> {
     let exists = match who {
         0 => true,
         w if w > 0 => crate::task::percpu::lookup_task_pgid(w as u64).is_some(),
-        w => crate::task::percpu::pgrp_exists(w.unsigned_abs() as u64),
+        w => crate::task::percpu::pgrp_exists(u64::from(w.unsigned_abs())),
     };
     if !exists {
         return Err(KernelError::NoProcess);

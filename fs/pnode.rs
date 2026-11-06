@@ -245,7 +245,7 @@ fn to_slaves(g: u32, d: &Arc<Dentry>, src: &Arc<Mount>, up: &BTreeMap<usize, u32
         let new = core::cell::RefCell::new(BTreeMap::<usize, u32>::new());
         for m in set.iter().filter(|m| visible(m, d)) {
             let c = copy_prop(src, &|o, c| {
-                let k = o as *const Mount as usize;
+                let k = core::ptr::from_ref::<Mount>(o) as usize;
                 set_master(c, up.get(&k).copied().unwrap_or(0));
                 if sg != 0 {
                     let ng = *new.borrow_mut().entry(k).or_insert_with(alloc_group);

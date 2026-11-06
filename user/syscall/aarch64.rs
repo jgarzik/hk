@@ -197,6 +197,7 @@ pub const SYS_SYMLINKAT: u64 = 36;
 pub const SYS_LINKAT: u64 = 37;
 pub const SYS_RENAMEAT: u64 = 38;
 pub const SYS_RENAMEAT2: u64 = 276;
+pub const SYS_TRUNCATE: u64 = 45;
 pub const SYS_FTRUNCATE: u64 = 46;
 pub const SYS_FCHMODAT: u64 = 53;
 pub const SYS_FCHOWNAT: u64 = 54;
@@ -1127,15 +1128,9 @@ pub fn sys_ftruncate(fd: i32, length: i64) -> i64 {
     unsafe { syscall2!(SYS_FTRUNCATE, fd, length) }
 }
 
-/// truncate(pathname, length) - compatibility wrapper
+/// truncate(pathname, length)
 pub fn sys_truncate(pathname: *const u8, length: i64) -> i64 {
-    let fd = sys_openat(AT_FDCWD, pathname, 1, 0); // O_WRONLY = 1
-    if fd < 0 {
-        return fd;
-    }
-    let ret = sys_ftruncate(fd as i32, length);
-    sys_close(fd as u64);
-    ret
+    unsafe { syscall2!(SYS_TRUNCATE, pathname, length) }
 }
 
 /// fchmodat(dirfd, pathname, mode, flags)

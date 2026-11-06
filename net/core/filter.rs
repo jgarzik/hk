@@ -61,16 +61,16 @@ impl classic::Env for Ctx<'_> {
         } else {
             return None;
         };
-        Some(bytes.iter().fold(0u32, |v, &b| (v << 8) | b as u32))
+        Some(bytes.iter().fold(0u32, |v, &b| (v << 8) | u32::from(b)))
     }
 
     fn anc(&self, k: u32) -> u32 {
         match k {
-            ad::PROTOCOL => self.protocol as u32,
-            ad::PKTTYPE => self.pkt_type as u32,
+            ad::PROTOCOL => u32::from(self.protocol),
+            ad::PKTTYPE => u32::from(self.pkt_type),
             ad::IFINDEX => self.ifindex,
             ad::MARK => self.mark,
-            ad::HATYPE => self.hatype as u32,
+            ad::HATYPE => u32::from(self.hatype),
             ad::CPU => crate::cpu::this_id(),
             ad::RANDOM => crate::random::get_random_u32(),
             // No netlink attributes, queues, hashes or VLAN tags here
@@ -95,7 +95,7 @@ impl Filter {
     }
 
     /// Run the program: bytes of the packet to keep (0 = drop)
-    pub fn run(&self, c: &Ctx) -> u32 {
+    pub fn run(&self, c: &Ctx<'_>) -> u32 {
         convert::run(&self.prog, &[], c)
     }
 }

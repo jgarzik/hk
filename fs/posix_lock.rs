@@ -93,8 +93,11 @@ impl PosixLockType {
 /// A single byte-range lock
 #[derive(Debug, Clone)]
 pub struct PosixLock {
-    /// Owning process ID
+    /// Owner: the holder's descriptor table (Linux fl_owner, the
+    /// files_struct; see `current_owner`)
     pub owner: u64,
+    /// Process that set it (Linux fl_pid: F_GETLK's l_pid)
+    pub pid: u64,
     /// Start offset (inclusive)
     pub start: u64,
     /// End offset (exclusive), u64::MAX means EOF
@@ -145,49 +148,57 @@ impl InodeLocks {
         start: u64,
         end: u64,
         lock_type: PosixLockType,
-        pid: u64,
+        owner: u64,
     ) -> Option<&PosixLock> {
         self.locks
             .iter()
-            .find(|lock| lock.overlaps(start, end) && lock.conflicts_with(lock_type, pid))
+            .find(|lock| lock.overlaps(start, end) && lock.conflicts_with(lock_type, owner))
     }
 
     /// Try to set a lock (F_SETLK)
     fn try_lock(
         &mut self,
-        pid: u64,
+        (owner, pid): (u64, u64),
         start: u64,
         end: u64,
         lock_type: PosixLockType,
     ) -> Result<(), KernelError> {
         // Check for conflicts
-        if self.find_conflict(start, end, lock_type, pid).is_some() {
+        if self.find_conflict(start, end, lock_type, owner).is_some() {
             return Err(KernelError::WouldBlock);
+        }
+        // Already held as asked: nothing changes, the lock keeps its
+        // pid (Linux posix_lock_inode)
+        if self.locks.iter().any(|l| {
+            l.owner == owner && l.lock_type == lock_type && l.start <= start && l.end >= end
+        }) {
+            return Ok(());
         }
 
         // Remove overlapping locks from same owner (they'll be replaced/merged)
-        self.unlock_range(pid, start, end);
+        self.unlock_range(owner, start, end);
 
         // Add new lock
         self.locks.push(PosixLock {
-            owner: pid,
+            owner,
+            pid,
             start,
             end,
             lock_type,
         });
 
         // Coalesce adjacent locks of same type from same owner
-        self.coalesce_locks(pid);
+        self.coalesce_locks(owner);
 
         Ok(())
     }
 
     /// Unlock a range - may split existing locks
-    fn unlock_range(&mut self, pid: u64, start: u64, end: u64) {
+    fn unlock_range(&mut self, owner: u64, start: u64, end: u64) {
         let mut new_locks = Vec::new();
 
         for lock in self.locks.drain(..) {
-            if lock.owner != pid {
+            if lock.owner != owner {
                 // Not our lock, keep it
                 new_locks.push(lock);
                 continue;
@@ -211,6 +222,7 @@ impl InodeLocks {
                 // Left part
                 new_locks.push(PosixLock {
                     owner: lock.owner,
+                    pid: lock.pid,
                     start: lock.start,
                     end: start,
                     lock_type: lock.lock_type,
@@ -218,6 +230,7 @@ impl InodeLocks {
                 // Right part
                 new_locks.push(PosixLock {
                     owner: lock.owner,
+                    pid: lock.pid,
                     start: end,
                     end: lock.end,
                     lock_type: lock.lock_type,
@@ -229,6 +242,7 @@ impl InodeLocks {
             if lock.start >= start && lock.start < end && lock.end > end {
                 new_locks.push(PosixLock {
                     owner: lock.owner,
+                    pid: lock.pid,
                     start: end,
                     end: lock.end,
                     lock_type: lock.lock_type,
@@ -240,6 +254,7 @@ impl InodeLocks {
             if lock.start < start && lock.end > start && lock.end <= end {
                 new_locks.push(PosixLock {
                     owner: lock.owner,
+                    pid: lock.pid,
                     start: lock.start,
                     end: start,
                     lock_type: lock.lock_type,
@@ -250,9 +265,8 @@ impl InodeLocks {
         self.locks = new_locks;
     }
 
-    /// Remove all locks held by a PID
-    /// Drop every lock of `pid`: whether it had any
-    fn remove_all_for_pid(&mut self, pid: u64) -> bool {
+    /// Drop every lock of `owner`: whether it had any
+    fn remove_all_for_owner(&mut self, pid: u64) -> bool {
         let n = self.locks.len();
         self.locks.retain(|l| l.owner != pid);
         self.locks.len() != n
@@ -299,7 +313,7 @@ impl InodeLocks {
 /// Returns (start, end) where end is exclusive. EOF is represented as u64::MAX.
 fn resolve_range(flock: &Flock, file: &File) -> Result<(u64, u64), KernelError> {
     let inode = file.get_inode().ok_or(KernelError::BadFd)?;
-    let base = match flock.l_whence as i32 {
+    let base = match i32::from(flock.l_whence) {
         seek::SEEK_SET => 0i64,
         seek::SEEK_CUR => file.get_pos() as i64,
         seek::SEEK_END => inode.get_size() as i64,
@@ -359,9 +373,9 @@ pub fn posix_getlk(file: &File, flock: &mut Flock) -> Result<(), KernelError> {
     let inode = file.get_inode().ok_or(KernelError::BadFd)?;
     let (start, end) = resolve_range(flock, file)?;
     let lock_type = PosixLockType::from_flock(flock.l_type).ok_or(KernelError::InvalidArgument)?;
-    let pid = current_pid();
+    let owner = current_owner();
     let conflict = inode.i_flctx.with(|l| {
-        let c = l.posix.find_conflict(start, end, lock_type, pid).cloned();
+        let c = l.posix.find_conflict(start, end, lock_type, owner).cloned();
         (c, false)
     });
     match conflict {
@@ -374,7 +388,7 @@ pub fn posix_getlk(file: &File, flock: &mut Flock) -> Result<(), KernelError> {
             } else {
                 (c.end - c.start) as i64
             };
-            flock.l_pid = c.owner as i32;
+            flock.l_pid = c.pid as i32;
         }
         None => flock.l_type = F_UNLCK,
     }
@@ -388,25 +402,28 @@ fn set(
     (start, end): (u64, u64),
     l_type: i16,
 ) -> Result<(), (KernelError, Option<u64>)> {
-    let pid = current_pid();
+    let owner = current_owner();
     if l_type == F_UNLCK {
         inode.i_flctx.with(|l| {
-            l.posix.unlock_range(pid, start, end);
+            l.posix.unlock_range(owner, start, end);
             ((), true)
         });
         return Ok(());
     }
     let lock_type =
         PosixLockType::from_flock(l_type).ok_or((KernelError::InvalidArgument, None))?;
-    super::locks::note_posix_inode(inode);
+    let pid = current_pid();
     inode.i_flctx.with(|l| {
-        let r = l.posix.try_lock(pid, start, end, lock_type).map_err(|e| {
-            let owner = l
-                .posix
-                .find_conflict(start, end, lock_type, pid)
-                .map(|c| c.owner);
-            (e, owner)
-        });
+        let r = l
+            .posix
+            .try_lock((owner, pid), start, end, lock_type)
+            .map_err(|e| {
+                let blocker = l
+                    .posix
+                    .find_conflict(start, end, lock_type, owner)
+                    .map(|c| c.owner);
+                (e, blocker)
+            });
         // A lock set may replace or split one of ours, releasing a
         // range; a refused one changed nothing (counting it would wake
         // the other waiters into a retry loop)
@@ -443,7 +460,7 @@ pub fn posix_unlock(file: &File, range: (u64, u64)) {
 pub fn posix_setlkw(file: &File, flock: &Flock) -> Result<(u64, u64), KernelError> {
     let inode = file.get_inode().ok_or(KernelError::BadFd)?;
     let range = resolve_range(flock, file)?;
-    let me = current_pid();
+    let me = current_owner();
     loop {
         let g = inode.i_flctx.generation();
         match set(&inode, range, flock.l_type) {
@@ -459,25 +476,24 @@ pub fn posix_setlkw(file: &File, flock: &Flock) -> Result<(u64, u64), KernelErro
     }
 }
 
-/// Release all POSIX locks held by current process on a file
-///
-/// Called when any fd to file is closed. POSIX semantics require
-/// releasing ALL locks when ANY fd to the file is closed.
-pub fn release_posix_locks_on_close(file: &File) {
-    if let Some(inode) = file.get_inode() {
-        let pid = current_pid();
-        inode
-            .i_flctx
-            .with(|l| ((), l.posix.remove_all_for_pid(pid)));
+/// The lock owner of the current task: its descriptor table (Linux
+/// fl_owner = current->files), shared by CLONE_FILES; a task without
+/// one (kernel threads) is owned by its pid, kept apart by the top bit
+pub fn current_owner() -> u64 {
+    match crate::task::percpu::current().files() {
+        Some(f) => f.id(),
+        None => current_pid() | 1 << 63,
     }
 }
 
-/// Release all POSIX locks held by a process (at its exit)
-pub fn release_all_posix_locks_for_pid(pid: u64) {
-    for inode in super::locks::posix_inodes() {
+/// A descriptor of `file` in the table `owner` was closed: every POSIX
+/// lock `owner` holds on the inode goes (Linux locks_remove_posix with
+/// the closer's files_struct), whichever descriptor took it
+pub fn release_posix_locks_on_close(file: &File, owner: u64) {
+    if let Some(inode) = file.get_inode() {
         inode
             .i_flctx
-            .with(|l| ((), l.posix.remove_all_for_pid(pid)));
+            .with(|l| ((), l.posix.remove_all_for_owner(owner)));
     }
 }
 
@@ -503,5 +519,86 @@ mod tests {
         assert_eq!(r(0, 1, i64::MAX), Ok((1, u64::MAX)));
         // Ending exactly at OFFSET_MAX is the same as "to EOF"
         assert_eq!(r(0, i64::MAX, 1), Ok((i64::MAX as u64, u64::MAX)));
+    }
+
+    use PosixLockType::{Read, Write};
+
+    fn ranges(l: &InodeLocks, owner: u64) -> Vec<(u64, u64, PosixLockType)> {
+        let mut v: Vec<_> = l
+            .locks
+            .iter()
+            .filter(|k| k.owner == owner)
+            .map(|k| (k.start, k.end, k.lock_type))
+            .collect();
+        v.sort_by_key(|k| k.0);
+        v
+    }
+
+    /// Reads share, a write excludes; an owner never conflicts with
+    /// itself (Linux posix_locks_conflict)
+    #[test]
+    fn conflicts() {
+        let mut l = InodeLocks::default();
+        l.try_lock((1, 1), 0, 10, Read).unwrap();
+        assert!(l.try_lock((2, 2), 5, 15, Read).is_ok());
+        assert_eq!(
+            l.try_lock((3, 3), 9, 20, Write),
+            Err(KernelError::WouldBlock)
+        );
+        assert!(l.try_lock((3, 3), 15, 20, Write).is_ok());
+        assert!(l.find_conflict(0, 1, Write, 9).is_some());
+        assert!(l.find_conflict(10, 15, Write, 2).is_none());
+        assert!(l.try_lock((1, 1), 0, 10, Write).is_err());
+        // End is exclusive: [0, 10) and [10, ..) do not touch
+        assert!(l.find_conflict(20, u64::MAX, Write, 9).is_none());
+    }
+
+    /// Unlocking the middle splits a lock; the ends shrink it
+    #[test]
+    fn unlock_splits() {
+        let mut l = InodeLocks::default();
+        l.try_lock((1, 1), 0, 100, Write).unwrap();
+        l.unlock_range(1, 40, 60);
+        assert_eq!(ranges(&l, 1), [(0, 40, Write), (60, 100, Write)]);
+        l.unlock_range(1, 0, 10);
+        l.unlock_range(1, 90, u64::MAX);
+        assert_eq!(ranges(&l, 1), [(10, 40, Write), (60, 90, Write)]);
+        l.unlock_range(1, 0, u64::MAX);
+        assert!(ranges(&l, 1).is_empty());
+    }
+
+    /// A new lock replaces the owner's overlap, changing its type in
+    /// the overlap only; touching locks of one type merge (Linux
+    /// posix_lock_inode)
+    #[test]
+    fn replace_and_merge() {
+        let mut l = InodeLocks::default();
+        l.try_lock((1, 1), 0, 10, Read).unwrap();
+        l.try_lock((1, 1), 10, 20, Read).unwrap();
+        assert_eq!(ranges(&l, 1), [(0, 20, Read)]);
+        l.try_lock((1, 1), 5, 15, Write).unwrap();
+        assert_eq!(
+            ranges(&l, 1),
+            [(0, 5, Read), (5, 15, Write), (15, 20, Read)]
+        );
+        l.try_lock((1, 1), 0, 20, Read).unwrap();
+        assert_eq!(ranges(&l, 1), [(0, 20, Read)]);
+        // Another owner's locks are untouched
+        l.try_lock((2, 2), 30, 40, Write).unwrap();
+        l.try_lock((1, 1), 20, 30, Read).unwrap();
+        assert_eq!(ranges(&l, 1), [(0, 30, Read)]);
+        assert_eq!(ranges(&l, 2), [(30, 40, Write)]);
+        assert!(l.remove_all_for_owner(1));
+        assert!(!l.remove_all_for_owner(1));
+        assert_eq!(ranges(&l, 2), [(30, 40, Write)]);
+    }
+
+    /// A lock already held as asked keeps its pid (F_GETLK's l_pid)
+    #[test]
+    fn same_lock_keeps_pid() {
+        let mut l = InodeLocks::default();
+        l.try_lock((1, 100), 0, 10, Write).unwrap();
+        l.try_lock((1, 200), 2, 8, Write).unwrap();
+        assert_eq!(l.find_conflict(0, 10, Read, 2).map(|k| k.pid), Some(100));
     }
 }

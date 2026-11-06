@@ -46,7 +46,7 @@ fn info() -> Option<&'static [u8]> {
     if pa == 0 {
         return None;
     }
-    let base = phys_to_virt(pa) as *const u8;
+    let base = phys_to_virt(pa).cast_const();
     // SAFETY: the header's 8 bytes of the recorded structure (`set_boot`)
     let head = unsafe { core::slice::from_raw_parts(base, 8) };
     let total = (le32(head, 0)? as usize).clamp(8, 1 << 20);
@@ -114,8 +114,8 @@ pub fn get_cmdline() -> Option<&'static str> {
 
 /// Module tag fields: (physical start, physical end, cmdline)
 fn module(tag: &'static [u8]) -> Option<(u64, u64, Option<&'static str>)> {
-    let start = le32(tag, 8)? as u64;
-    let end = le32(tag, 12)? as u64;
+    let start = u64::from(le32(tag, 8)?);
+    let end = u64::from(le32(tag, 12)?);
     Some((start, end, tag.get(16..).and_then(cstr)))
 }
 
@@ -140,7 +140,7 @@ pub fn find_module(name: &str) -> Option<&'static [u8]> {
     let (start, end, _) = tags_of(TAG_MODULE)
         .filter_map(module)
         .find(|&(s, e, c)| s < e && c.is_some_and(|c| c.contains(name)))?;
-    let p = phys_to_virt(start) as *const u8;
+    let p = phys_to_virt(start).cast_const();
     // SAFETY: a module the info structure lists, reserved for good
     // (`set_boot`), `end - start` bytes
     Some(unsafe { core::slice::from_raw_parts(p, (end - start) as usize) })
@@ -177,7 +177,7 @@ pub fn get_framebuffer() -> Option<crate::gfx::FramebufferInfo> {
     } else {
         return None;
     };
-    let size = (pitch as u64) * (height as u64);
+    let size = u64::from(pitch) * u64::from(height);
     Some(FramebufferInfo::new(
         addr, size, width, height, pitch, format,
     ))

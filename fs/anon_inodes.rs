@@ -28,6 +28,7 @@ use crate::fs::dentry::Dentry;
 use crate::fs::file::{File, FileOps};
 use crate::fs::inode::{Inode, InodeMode, InodeOps, Timespec};
 use crate::util::error::KernelError;
+use crate::util::kalloc::{arc_nofail, try_arc};
 
 /// Numbers one CPU takes from the shared counter at a time
 const LAST_INO_BATCH: u64 = 1024;
@@ -75,7 +76,7 @@ static ANON_INODE: Once<Arc<Inode>> = Once::new();
 fn anon_inode() -> Arc<Inode> {
     ANON_INODE
         .call_once(|| {
-            Arc::new(Inode::new(
+            arc_nofail(Inode::new(
                 get_next_ino(),
                 InodeMode(0o600),
                 0,
@@ -96,7 +97,7 @@ pub fn anon_inode_getfile(
     f_op: &'static dyn FileOps,
     private: Arc<dyn Any + Send + Sync>,
     flags: u32,
-) -> Arc<File> {
-    let dentry = Arc::new(Dentry::new_anonymous(name.into(), Some(anon_inode())));
-    Arc::new(File::new_anon(dentry, flags, f_op, private))
+) -> Result<Arc<File>, KernelError> {
+    let dentry = try_arc(Dentry::new_anonymous(name.into(), Some(anon_inode())))?;
+    try_arc(File::new_anon(dentry, flags, f_op, private))
 }

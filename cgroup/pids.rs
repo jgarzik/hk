@@ -10,6 +10,7 @@
 //! - `pids.current`: Read-only current task count
 //! - `pids.events`: Read-only event counter ("max N")
 
+use crate::util::kalloc::try_arc;
 use alloc::format;
 use alloc::string::ToString;
 use alloc::sync::Arc;
@@ -161,7 +162,7 @@ impl CgroupSubsysOps for PidsController {
         parent_css: Option<&Arc<CgroupSubsysState>>,
     ) -> Result<Arc<dyn CssPrivate>, KernelError> {
         let parent_state = parent_css.and_then(|css| css.private_as::<PidsState>());
-        Ok(Arc::new(PidsState::new(parent_state)))
+        Ok(try_arc(PidsState::new(parent_state))?)
     }
 
     fn css_free(&self, _css: &CgroupSubsysState) {

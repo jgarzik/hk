@@ -1,7 +1,7 @@
 //! Interrupt Descriptor Table (IDT) and interrupt handling
 //!
 //! Sets up the IDT with exception handlers and IRQ handlers.
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use ::core::mem::size_of;
 use ::core::sync::atomic::{AtomicU64, Ordering};
@@ -279,7 +279,7 @@ pub fn load_idt() {
     unsafe {
         ::core::arch::asm!(
             "lidt [{}]",
-            in(reg) &idt_ptr,
+            in(reg) &raw const idt_ptr,
             options(nostack)
         );
     }
@@ -306,10 +306,10 @@ pub extern "C" fn idt_dispatch(regs: &UserFrame, vector: u64) {
     match vector {
         0..=31 => handle_exception(regs, vector),
         32..=47 => handle_irq(vector - 32),
-        v if v == LAPIC_TIMER_VECTOR as u64 => handle_lapic_timer(),
-        v if v == CALL_FUNCTION_VECTOR as u64 => handle_call_function(),
-        v if v == RESCHEDULE_VECTOR as u64 => handle_reschedule(),
-        v if v == lapic::ERROR_APIC_VECTOR as u64 => in_irq(handle_apic_error),
+        v if v == u64::from(LAPIC_TIMER_VECTOR) => handle_lapic_timer(),
+        v if v == u64::from(CALL_FUNCTION_VECTOR) => handle_call_function(),
+        v if v == u64::from(RESCHEDULE_VECTOR) => handle_reschedule(),
+        v if v == u64::from(lapic::ERROR_APIC_VECTOR) => in_irq(handle_apic_error),
         v => in_irq(|| handle_spurious(v as u8)),
     }
     // Back to user mode: its pending work first (Linux
@@ -329,7 +329,7 @@ fn math_error_code(vector: u64) -> i32 {
     let err: u32 = if vector == 19 {
         let mut mxcsr: u32 = 0;
         unsafe {
-            ::core::arch::asm!("stmxcsr [{}]", in(reg) &mut mxcsr, options(nostack));
+            ::core::arch::asm!("stmxcsr [{}]", in(reg) &raw mut mxcsr, options(nostack));
         }
         (mxcsr & 0x3f) & !((mxcsr >> 7) & 0x3f)
     } else {
@@ -338,12 +338,12 @@ fn math_error_code(vector: u64) -> i32 {
             ::core::arch::asm!(
                 "fnstcw [{}]",
                 "fnstsw [{}]",
-                in(reg) &mut cwd,
-                in(reg) &mut swd,
+                in(reg) &raw mut cwd,
+                in(reg) &raw mut swd,
                 options(nostack)
             );
         }
-        (swd & !cwd) as u32
+        u32::from(swd & !cwd)
     };
     if err & 0x001 != 0 {
         si_code::FPE_FLTINV
@@ -494,7 +494,7 @@ fn handle_exception(uframe: &UserFrame, vector: u64) {
 fn die(frame: &PtRegs, vector: u8, error_code: u64, cr2: u64) -> ! {
     crate::printk::set_oops_in_progress();
     let name = EXCEPTION_NAMES.get(vector as usize).copied().unwrap_or("?");
-    let cpu = crate::cpu::try_this_id().map_or(-1, |c| c as i64);
+    let cpu = crate::cpu::try_this_id().map_or(-1, i64::from);
     printkln!(
         "Oops: {} (#{}) error {:#x} CPU {} tid {}",
         name,
@@ -666,7 +666,7 @@ fn report_irq(count: &AtomicU64) -> bool {
 /// handle_spurious_interrupt): the LAPIC's spurious vector is never
 /// acknowledged (SDM vol 3); any other is acknowledged if in service
 fn handle_spurious(vector: u8) {
-    let cpu = crate::cpu::try_this_id().map_or(-1, |c| c as i64);
+    let cpu = crate::cpu::try_this_id().map_or(-1, i64::from);
     let report = report_irq(&SPURIOUS_COUNT);
     if vector == lapic::SPURIOUS_APIC_VECTOR {
         if report {
@@ -709,7 +709,7 @@ fn handle_apic_error() {
     if !report_irq(&APIC_ERROR_COUNT) {
         return;
     }
-    let cpu = crate::cpu::try_this_id().map_or(-1, |c| c as i64);
+    let cpu = crate::cpu::try_this_id().map_or(-1, i64::from);
     printk!("APIC error on CPU{}: {:02x}", cpu, esr & 0xff);
     for (i, why) in REASONS.iter().enumerate() {
         if esr & (1 << i) != 0 {

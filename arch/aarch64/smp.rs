@@ -1,7 +1,7 @@
 //! AArch64 SMP initialization
 //!
 //! Uses PSCI CPU_ON to bring up Application Processors.
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -115,7 +115,7 @@ pub fn init<FA: FrameAlloc<PhysAddr = u64>>(acpi: &AcpiInfo, _frame_alloc: &mut 
 
         // Build MPIDR for target CPU
         // QEMU virt uses Aff0 for CPU ID within cluster
-        let target_mpidr = cpu_info.hw_cpu_id as u64;
+        let target_mpidr = u64::from(cpu_info.hw_cpu_id);
 
         // Set up boot data for this AP
         // SAFETY: this AP's slot, written by the BSP alone while the AP
@@ -197,7 +197,7 @@ fn wait_for_ap(timeout_ms: u32) -> bool {
 
     // Calculate timeout in counter ticks
     let ticks_per_ms = freq / 1000;
-    let timeout_ticks = ticks_per_ms * timeout_ms as u64;
+    let timeout_ticks = ticks_per_ms * u64::from(timeout_ms);
 
     // Read starting counter value
     let start: u64;

@@ -21,16 +21,18 @@
 //! - Signals are consumed from pending queue (not copied)
 //! - poll() support for integration with select/poll/epoll
 //! - Mask can be updated by calling signalfd4 with existing fd
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
+use crate::util::kalloc::try_arc;
 use alloc::sync::Arc;
 
 use crate::arch::IrqSpinlock;
 use crate::fs::KernelError;
-use crate::fs::file::{File, FileOps, flags};
+use crate::fs::file::{File, FileOps, RwFlags, flags, nowait_rw};
+use crate::fs::iov_iter::IovDest;
 use crate::io::poll::{POLLIN, POLLRDNORM, PollTable};
 use crate::signal::{SigSet, UNMASKABLE_SIGNALS, with_task_signal_state};
 use crate::task::percpu::current_tid;
+use crate::util::pod::IntoBytes;
 
 /// Signalfd flags
 pub mod sfd_flags {
@@ -90,6 +92,31 @@ pub struct SignalfdSiginfo {
     __pad: [u8; 28],
 }
 
+crate::pod!(SignalfdSiginfo {
+    ssi_signo,
+    ssi_errno,
+    ssi_code,
+    ssi_pid,
+    ssi_uid,
+    ssi_fd,
+    ssi_tid,
+    ssi_band,
+    ssi_overrun,
+    ssi_trapno,
+    ssi_status,
+    ssi_int,
+    ssi_ptr,
+    ssi_utime,
+    ssi_stime,
+    ssi_addr,
+    ssi_addr_lsb,
+    __pad2,
+    ssi_syscall,
+    ssi_call_addr,
+    ssi_arch,
+    __pad,
+});
+
 // Compile-time assertion that SignalfdSiginfo is exactly 128 bytes
 const _: () = assert!(core::mem::size_of::<SignalfdSiginfo>() == 128);
 
@@ -109,10 +136,10 @@ pub struct Signalfd {
 
 impl Signalfd {
     /// Create a new signalfd
-    pub fn new(mask: SigSet) -> Arc<Self> {
+    pub fn new(mask: SigSet) -> Result<Arc<Self>, KernelError> {
         // Cannot monitor SIGKILL or SIGSTOP
         let filtered_mask = mask.subtract(&UNMASKABLE_SIGNALS);
-        Arc::new(Self {
+        try_arc(Self {
             inner: IrqSpinlock::new(SignalfdInner {
                 mask: filtered_mask,
             }),
@@ -164,48 +191,37 @@ impl Signalfd {
         })?
     }
 
-    /// Read signals from the signalfd
+    /// Read signals from the signalfd into `to` (Linux signalfd_read)
     ///
-    /// Blocks until at least one matching signal is pending (unless nonblock).
-    /// Returns signalfd_siginfo structures (128 bytes each).
-    pub fn read(&self, buf: &mut [u8], nonblock: bool) -> Result<usize, KernelError> {
-        const SIGINFO_SIZE: usize = 128;
+    /// Blocks until at least one matching signal is pending (unless
+    /// nonblock), then takes as many more as fit without blocking.
+    /// Each is one 128-byte signalfd_siginfo, dequeued and then copied
+    /// out with no lock held; a smaller buffer is EINVAL, and a fault
+    /// loses that signal (EFAULT unless earlier ones were copied).
+    pub fn read(&self, to: &mut IovDest<'_>, nonblock: bool) -> Result<usize, KernelError> {
+        const SIGINFO_SIZE: usize = core::mem::size_of::<SignalfdSiginfo>();
 
-        if buf.len() < SIGINFO_SIZE {
+        if to.len() < SIGINFO_SIZE {
             return Err(KernelError::InvalidArgument);
         }
-
-        let max_signals = buf.len() / SIGINFO_SIZE;
-        let mut bytes_written = 0;
-
+        let mut done = 0;
         loop {
-            // Try to dequeue signals up to max_signals
-            while bytes_written / SIGINFO_SIZE < max_signals {
-                if let Some(sig) = self.dequeue_signal() {
-                    let siginfo = self.build_siginfo(sig);
-                    let offset = bytes_written;
-                    // Copy siginfo to buffer
-                    let siginfo_bytes = unsafe {
-                        core::slice::from_raw_parts(
-                            &siginfo as *const SignalfdSiginfo as *const u8,
-                            SIGINFO_SIZE,
-                        )
-                    };
-                    buf[offset..offset + SIGINFO_SIZE].copy_from_slice(siginfo_bytes);
-                    bytes_written += SIGINFO_SIZE;
-                } else {
+            while to.len() >= SIGINFO_SIZE {
+                let Some(sig) = self.dequeue_signal() else {
                     break;
+                };
+                match to.copy_to_full(self.build_siginfo(sig).as_bytes()) {
+                    Ok(()) => done += SIGINFO_SIZE,
+                    Err(_) if done > 0 => return Ok(done),
+                    Err(e) => return Err(e),
                 }
             }
-
-            if bytes_written > 0 {
-                return Ok(bytes_written);
+            if done > 0 {
+                return Ok(done);
             }
-
             if nonblock {
                 return Err(KernelError::WouldBlock);
             }
-
             // Wait on the caller's handler table for a matching signal
             // (a signal ends the wait)
             let Some(sighand) = crate::signal::get_task_sighand(current_tid()) else {
@@ -228,7 +244,7 @@ impl Signalfd {
     }
 
     /// Poll for readiness
-    pub fn poll(&self, pt: Option<&mut PollTable>) -> u16 {
+    pub fn poll(&self, pt: Option<&mut PollTable<'_>>) -> u16 {
         // The caller's handler table, held by the poll for as long as it
         // stays registered on its queue (Linux instead detaches pollers
         // when it is freed, signalfd_cleanup)
@@ -257,18 +273,19 @@ impl FileOps for SignalfdFileOps {
         self
     }
 
-    fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {
+    fn read_iter(
+        &self,
+        file: &File,
+        to: &mut IovDest<'_>,
+        at: Option<u64>,
+        flags: RwFlags,
+    ) -> Result<usize, KernelError> {
+        let nb = nowait_rw(file, at, flags)?;
         let signalfd = file.private_ref::<Signalfd>().ok_or(KernelError::BadFd)?;
-        let nonblock = file.get_flags() & flags::O_NONBLOCK != 0;
-        signalfd.read(buf, nonblock)
+        signalfd.read(to, nb)
     }
 
-    fn write(&self, _file: &File, _buf: &[u8]) -> Result<usize, KernelError> {
-        // signalfd doesn't support write
-        Err(KernelError::InvalidArgument)
-    }
-
-    fn poll(&self, file: &File, pt: Option<&mut PollTable>) -> u16 {
+    fn poll(&self, file: &File, pt: Option<&mut PollTable<'_>>) -> u16 {
         let Some(signalfd) = file.private_ref::<Signalfd>() else {
             return crate::io::poll::POLLERR;
         };
@@ -285,7 +302,7 @@ impl FileOps for SignalfdFileOps {
 /// # Returns
 /// Arc<File> for the new signalfd
 pub fn create_signalfd(mask: SigSet, sfd_flags: i32) -> Result<Arc<File>, KernelError> {
-    let signalfd = Signalfd::new(mask);
+    let signalfd = Signalfd::new(mask)?;
 
     // Create dummy dentry for signalfd
 
@@ -300,7 +317,7 @@ pub fn create_signalfd(mask: SigSet, sfd_flags: i32) -> Result<Arc<File>, Kernel
         &SIGNALFD_FOPS,
         signalfd,
         file_flags,
-    );
+    )?;
     Ok(file)
 }
 

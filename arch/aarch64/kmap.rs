@@ -18,7 +18,7 @@
 //! TTBR1 tables once the heap exists (the DTB parser needs it) and
 //! leaves TTBR0 with an empty table; user page tables only ever hold
 //! user mappings. Boot-time tables come from a static pool.
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use core::arch::asm;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};

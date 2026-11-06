@@ -8,6 +8,8 @@
 //!   memory keeps the data (it lives in the shared object); MADV_REMOVE
 //!   frees it (reads zero)
 //! - FILE_SHARED_FORK: the same for a MAP_SHARED mapping of a file
+//! - ZERO_SHARED_FORK: a MAP_SHARED mapping of /dev/zero is shared
+//!   memory (Linux shmem_zero_setup): parent and child see each other
 //! - FILE_SHARED_COHERENT: a shared file mapping, another mapping of the
 //!   file and read()/write() all see the same data
 //! - FILE_PRIVATE_RDONLY: a MAP_PRIVATE mapping of a read-only fd made
@@ -41,6 +43,12 @@
 //! - FORK_COW_RACE: threads keep writing private pages while another
 //!   thread forks, and the parent writes right after each fork (hot TLB
 //!   entry): every child sees only its pre-fork snapshot
+//! - TRUNC_FORK_RACE: a thread truncates a shared-mapped file while the
+//!   process forks: a child that touches the cut page after the truncate
+//!   returned gets SIGBUS (fork copies no shared PTE that truncate missed)
+//! - MREMAP_TRUNC_RACE: the same thread truncates while mremap moves the
+//!   shared mapping: afterwards the cut page is not resident at the new
+//!   address (mincore), no stale entry moved with the mapping
 //! - FAULT_MPROTECT_RACE: a thread keeps read-faulting pages in while
 //!   the range is zapped and made read-only: afterwards no page has a
 //!   writable entry left (a kernel write into each is EFAULT)
@@ -110,6 +118,9 @@ pub fn run_tests() {
     mprotect_cow();
     rdonly_cow();
     cow_race();
+    zero_shared_fork();
+    trunc_fork_race();
+    mremap_trunc_race();
     mprotect_race();
     remote_write_cow();
     remote_write_perm();
@@ -1395,6 +1406,207 @@ fn cow_race() {
     }
     report(NAME, code);
     sys_munmap(base, RACE_PAGES * PAGE);
+}
+
+/// A page of /dev/zero mapped MAP_SHARED, written before fork: the child
+/// reads the parent's value and its own write shows in the parent
+fn zero_shared_fork() {
+    const NAME: &[u8] = b"ZERO_SHARED_FORK";
+    let fd = sys_open(b"/dev/zero\0".as_ptr(), O_RDWR, 0) as i32;
+    let p = sys_mmap(0, PAGE, RW, MAP_SHARED, fd, 0);
+    sys_close(fd as u64);
+    if p < 0 {
+        report(NAME, -1);
+        return;
+    }
+    let p = p as u64;
+    put(p + 8, PARENT);
+    let pid = sys_fork();
+    if pid == 0 {
+        let saw = get(p + 8);
+        put(p + 16, CHILD);
+        sys_exit(if saw == PARENT { 0 } else { 3 });
+    }
+    let r = reap(pid);
+    let code = if r != 0 {
+        r
+    } else if get(p + 16) != CHILD {
+        4
+    } else {
+        0
+    };
+    sys_munmap(p, PAGE);
+    report(NAME, code);
+}
+
+// ---------------------------------------------------------------------
+// TRUNC_FORK_RACE: truncate vs fork of a shared file mapping
+// ---------------------------------------------------------------------
+
+static TRUNC_FD: AtomicU64 = AtomicU64::new(0);
+/// Round the truncating thread should do next; it stores it in
+/// TRUNC_DONE once its ftruncate returned (0: stop)
+static TRUNC_GO: AtomicU64 = AtomicU64::new(0);
+static TRUNC_DONE: AtomicU64 = AtomicU64::new(0);
+
+extern "C" fn truncater(_: u64) -> ! {
+    let mut last = 0;
+    loop {
+        let go = TRUNC_GO.load(Ordering::Acquire);
+        if go == u64::MAX {
+            sys_exit(0);
+        }
+        if go != last {
+            sys_ftruncate(TRUNC_FD.load(Ordering::Relaxed) as i32, PAGE as i64);
+            TRUNC_DONE.store(go, Ordering::Release);
+            last = go;
+        }
+    }
+}
+
+/// One round: grow the file, fault its second page in, then fork while
+/// the thread cuts the file back to one page. The child waits for the
+/// cut to finish and touches the page: SIGBUS is right, reading it
+/// means a stale entry survived the truncate.
+fn trunc_round(fd: i32, p: u64, round: u64, pipe: [i32; 2]) -> i64 {
+    sys_ftruncate(fd, 2 * PAGE as i64);
+    put(p + PAGE + 8, PARENT);
+    TRUNC_GO.store(round, Ordering::Release);
+    // A varying head start for the truncate
+    for _ in 0..(round % 7) * 50 {
+        core::hint::spin_loop();
+    }
+    let pid = sys_fork();
+    if pid == 0 {
+        let mut b = [0u8; 1];
+        sys_read(pipe[0] as u64, b.as_mut_ptr(), 1);
+        get(p + PAGE + 8);
+        sys_exit(0);
+    }
+    while TRUNC_DONE.load(Ordering::Acquire) != round {
+        core::hint::spin_loop();
+    }
+    sys_write(pipe[1] as u64, b"x".as_ptr(), 1);
+    let r = reap(pid);
+    if r == 0x100 + SIGBUS {
+        0
+    } else {
+        round as i64 * 1000 + r
+    }
+}
+
+fn trunc_fork_race() {
+    const NAME: &[u8] = b"TRUNC_FORK_RACE";
+    let Some((fd, p)) = map_file(2 * PAGE as i64, 2 * PAGE) else {
+        report(NAME, -1);
+        return;
+    };
+    let mut pipe = [0i32; 2];
+    sys_pipe(pipe.as_mut_ptr());
+    TRUNC_FD.store(fd as u64, Ordering::Relaxed);
+    TRUNC_GO.store(0, Ordering::Relaxed);
+    TRUNC_DONE.store(0, Ordering::Relaxed);
+    let ctid = unsafe { &raw mut CTIDS[0] } as *mut u32;
+    let top = unsafe { (&raw mut STACKS[0] as *mut u8).add(16384) } as u64;
+    unsafe { core::ptr::write_volatile(ctid, 1) };
+    let mut code = if unsafe { spawn_thread(top, truncater, 0, ctid) } > 0 {
+        0
+    } else {
+        -2
+    };
+    for round in 1..=300u64 {
+        if code != 0 {
+            break;
+        }
+        code = trunc_round(fd, p, round, pipe);
+    }
+    TRUNC_GO.store(u64::MAX, Ordering::Release);
+    if !join(ctid) && code == 0 {
+        code = -3;
+    }
+    sys_close(pipe[0] as u64);
+    sys_close(pipe[1] as u64);
+    unmap_file(fd, p, 2 * PAGE);
+    report(NAME, code);
+}
+
+/// One round: map the grown file, fault the second page in, then move
+/// the mapping while the thread cuts the file to one page. 0 if the cut
+/// page is not resident at the new address once both are done.
+fn mremap_trunc_round(fd: i32, round: u64, dst: u64) -> i64 {
+    // A placeholder keeps the file's mapping off `dst`; MREMAP_FIXED
+    // replaces it
+    const MAP_FIXED: u32 = 0x10;
+    sys_mmap(
+        dst,
+        2 * PAGE,
+        0,
+        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
+        -1,
+        0,
+    );
+    sys_ftruncate(fd, 2 * PAGE as i64);
+    let p = sys_mmap(0, 2 * PAGE, RW, MAP_SHARED, fd, 0);
+    if p < 0 {
+        return -4;
+    }
+    let p = p as u64;
+    put(p + PAGE + 8, PARENT);
+    TRUNC_GO.store(round, Ordering::Release);
+    for _ in 0..(round % 7) * 50 {
+        core::hint::spin_loop();
+    }
+    let flags = MREMAP_MAYMOVE | 2; // MREMAP_FIXED
+    let q = sys_mremap(p, 2 * PAGE, 2 * PAGE, flags, dst);
+    while TRUNC_DONE.load(Ordering::Acquire) != round {
+        core::hint::spin_loop();
+    }
+    let mut vec = [0u8; 1];
+    let r = hk_syscall::sys_mincore(dst + PAGE, PAGE, vec.as_mut_ptr());
+    sys_munmap(if q > 0 { dst } else { p }, 2 * PAGE);
+    if q < 0 || r != 0 {
+        return -5;
+    }
+    if vec[0] & 1 == 0 { 0 } else { round as i64 }
+}
+
+fn mremap_trunc_race() {
+    const NAME: &[u8] = b"MREMAP_TRUNC_RACE";
+    let Some((fd, p)) = map_file(2 * PAGE as i64, 2 * PAGE) else {
+        report(NAME, -1);
+        return;
+    };
+    sys_munmap(p, 2 * PAGE);
+    // A fixed destination: a range mapped and released
+    let dst = sys_mmap(0, 2 * PAGE, RW, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if dst < 0 {
+        report(NAME, -1);
+        return;
+    }
+    let dst = dst as u64;
+    TRUNC_FD.store(fd as u64, Ordering::Relaxed);
+    TRUNC_GO.store(0, Ordering::Relaxed);
+    TRUNC_DONE.store(0, Ordering::Relaxed);
+    let ctid = unsafe { &raw mut CTIDS[0] } as *mut u32;
+    let top = unsafe { (&raw mut STACKS[0] as *mut u8).add(16384) } as u64;
+    unsafe { core::ptr::write_volatile(ctid, 1) };
+    let mut code = if unsafe { spawn_thread(top, truncater, 0, ctid) } > 0 {
+        0
+    } else {
+        -2
+    };
+    for round in 1..=300u64 {
+        if code != 0 {
+            break;
+        }
+        code = mremap_trunc_round(fd, round, dst);
+    }
+    TRUNC_GO.store(u64::MAX, Ordering::Release);
+    if !join(ctid) && code == 0 {
+        code = -3;
+    }
+    unmap_file(fd, 0, 0);
+    report(NAME, code);
 }
 
 // ---------------------------------------------------------------------

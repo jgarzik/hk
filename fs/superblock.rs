@@ -13,6 +13,7 @@ use crate::sync;
 use super::KernelError;
 use super::dentry::Dentry;
 use super::inode::{Inode, InodeId, InodeMode, InodeOps};
+use crate::util::kalloc::try_arc;
 
 /// Superblock operations trait - filesystem-specific behavior
 pub trait SuperOps: Send + Sync {
@@ -35,6 +36,19 @@ pub trait SuperOps: Send + Sync {
     /// Get filesystem statistics
     fn statfs(&self) -> StatFs {
         StatFs::default()
+    }
+
+    /// The options string of a remount (Linux ->reconfigure), before
+    /// the flags change; an error changes nothing. Default: ignored.
+    fn remount(&self, sb: &SuperBlock, data: &[u8]) -> Result<(), KernelError> {
+        let _ = (sb, data);
+        Ok(())
+    }
+
+    /// This filesystem's own options in /proc/mounts, each as ",name"
+    /// (Linux ->show_options). Default none.
+    fn show_options(&self, sb: &SuperBlock, out: &mut alloc::vec::Vec<u8>) {
+        let _ = (sb, out);
     }
 }
 
@@ -195,6 +209,10 @@ static NEXT_DEV_ID: AtomicU64 = AtomicU64::new(1);
 /// The superblock structure - represents a mounted filesystem instance
 /// Read-only file system (Linux SB_RDONLY)
 pub const SB_RDONLY: u32 = 1;
+/// Writes are synchronous (Linux SB_SYNCHRONOUS)
+pub const SB_SYNCHRONOUS: u32 = 16;
+/// Directory changes are synchronous (Linux SB_DIRSYNC)
+pub const SB_DIRSYNC: u32 = 128;
 
 /// The hold bit of a writer count (Linux WRITE_HOLD): while set, new
 /// writers wait; it shares the count's word, so one atomic operation
@@ -300,7 +318,7 @@ pub struct SuperBlock {
     /// Superblock operations
     pub s_op: &'static dyn SuperOps,
 
-    /// SB_* flags (Linux s_flags): SB_RDONLY
+    /// SB_* flags (Linux s_flags): SB_RDONLY, SB_SYNCHRONOUS, SB_DIRSYNC
     s_flags: AtomicU32,
 
     /// Holders of write access to objects without a mount (internal
@@ -383,8 +401,8 @@ impl SuperBlock {
         fs_type: &'static FileSystemType,
         s_op: &'static dyn SuperOps,
         flags: u32,
-    ) -> Arc<Self> {
-        let sb = Arc::new(Self {
+    ) -> Result<Arc<Self>, KernelError> {
+        let sb = try_arc(Self {
             fs_type,
             root: RwLock::new(None),
             s_op,
@@ -401,12 +419,12 @@ impl SuperBlock {
             s_wb_lock: crate::sync::Mutex::new(()),
             s_vfs_rename_mutex: sync::Mutex::new(()),
             s_umount: sync::RwSem::new(()),
-        });
+        })?;
         let mut all = ALL_SBS.lock();
         all.retain(|w| w.strong_count() != 0);
         all.push(Arc::downgrade(&sb));
         drop(all);
-        sb
+        Ok(sb)
     }
 
     /// Largest file size on this filesystem (Linux s_maxbytes)
@@ -422,6 +440,32 @@ impl SuperBlock {
     /// True if mounted read-only (Linux sb_rdonly)
     pub fn rdonly(&self) -> bool {
         self.s_flags.load(Ordering::SeqCst) & SB_RDONLY != 0
+    }
+
+    /// The SB_* flags
+    pub fn flags(&self) -> u32 {
+        self.s_flags.load(Ordering::Relaxed)
+    }
+
+    /// True if writes are synchronous (Linux IS_SYNC of the superblock)
+    pub fn synchronous(&self) -> bool {
+        self.s_flags.load(Ordering::Relaxed) & SB_SYNCHRONOUS != 0
+    }
+
+    /// True if directory changes are synchronous (Linux IS_DIRSYNC of
+    /// the superblock: SB_SYNCHRONOUS implies it)
+    pub fn dirsync(&self) -> bool {
+        self.s_flags.load(Ordering::Relaxed) & (SB_SYNCHRONOUS | SB_DIRSYNC) != 0
+    }
+
+    /// Replace SB_SYNCHRONOUS and SB_DIRSYNC with `f` (mount, remount)
+    pub fn set_sync_flags(&self, f: u32) {
+        let mask = SB_SYNCHRONOUS | SB_DIRSYNC;
+        let _ = self
+            .s_flags
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
+                Some((v & !mask) | (f & mask))
+            });
     }
 
     /// Take write access to an object reached without a mount (internal
@@ -445,6 +489,11 @@ impl SuperBlock {
         let mut mounts = self.s_mounts.lock();
         mounts.retain(|w| w.strong_count() != 0);
         mounts.push(Arc::downgrade(m));
+    }
+
+    /// Some mount of it is alive
+    pub fn is_mounted(&self) -> bool {
+        self.s_mounts.lock().iter().any(|w| w.strong_count() != 0)
     }
 
     /// Make the file system read-only (Linux sb_prepare_remount_readonly,

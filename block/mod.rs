@@ -10,7 +10,6 @@ pub mod part;
 pub mod ramdisk;
 
 // SCSI layer
-#[allow(clippy::module_inception)]
 pub mod scsi;
 pub mod sd;
 

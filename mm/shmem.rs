@@ -19,10 +19,12 @@
 //! held; under it only `FRAME_ALLOCATOR` and the heap are taken. The drop takes no
 //! lock (doc/LOCKING.md, Address Spaces).
 
+use crate::util::error::KernelError;
+use crate::util::kalloc::try_arc;
 use alloc::sync::Arc;
 
 use super::fault::VmFault;
-use super::xarray::{XArray, node_alloc};
+use super::xarray::{Preload, XArray};
 use crate::FRAME_ALLOCATOR;
 use crate::sync::spin::Mutex;
 
@@ -45,9 +47,9 @@ fn zeroed() -> Option<u64> {
 }
 
 impl Shmem {
-    /// A new, empty object of `size` pages
-    pub fn new(size: u64) -> Arc<Self> {
-        Arc::new(Self {
+    /// A new, empty object of `size` pages, or ENOMEM
+    pub fn new(size: u64) -> Result<Arc<Self>, KernelError> {
+        try_arc(Self {
             size,
             root: Mutex::new(XArray::new()),
             seq: crate::task::futex::KeySeq::new(),
@@ -62,16 +64,49 @@ impl Shmem {
         if idx >= self.size {
             return Err(VmFault::Bus);
         }
-        let mut root = self.root.lock();
-        let mut page = root.load(idx);
-        if page == 0 {
-            page = zeroed().ok_or(VmFault::Oom)?;
-            if root.store(idx, page, &mut node_alloc).is_none() {
-                FRAME_ALLOCATOR.free(page);
-                return Err(VmFault::Oom);
+        {
+            let root = self.root.lock();
+            let page = root.load(idx);
+            if page != 0 {
+                // The object holds a reference until `root` is unlocked
+                let held = FRAME_ALLOCATOR.incref(page);
+                debug_assert!(held);
+                return Ok(page);
             }
         }
-        // The object holds a reference until `root` is unlocked
+        // A new page is allocated with no spin lock held (it may
+        // reclaim), then stored unless a racing fault stored one first
+        // (Linux shmem_alloc_and_add_folio). The store needs tree nodes
+        // only now and then: without them it is retried with nodes
+        // allocated unlocked too (Linux xas_nomem)
+        let new = zeroed().ok_or(VmFault::Oom)?;
+        let mut pre: Option<Preload> = None;
+        let root = loop {
+            let mut root = self.root.lock();
+            if root.load(idx) != 0 {
+                break root;
+            }
+            let stored = match pre.as_mut() {
+                Some(p) => root.store(idx, new, &mut || p.take()),
+                None => root.store(idx, new, &mut || None),
+            };
+            if stored.is_some() {
+                break root;
+            }
+            drop(root);
+            if pre.is_some() {
+                FRAME_ALLOCATOR.free(new);
+                return Err(VmFault::Oom);
+            }
+            pre = Some(Preload::new().ok_or_else(|| {
+                FRAME_ALLOCATOR.free(new);
+                VmFault::Oom
+            })?);
+        };
+        let page = root.load(idx);
+        if page != new {
+            FRAME_ALLOCATOR.free(new);
+        }
         let held = FRAME_ALLOCATOR.incref(page);
         debug_assert!(held);
         Ok(page)

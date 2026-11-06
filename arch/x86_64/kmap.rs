@@ -17,7 +17,7 @@
 //! the vmalloc PDPT is preallocated, so ioremap's PD/PT changes are seen by
 //! every address space (Linux: preallocate_vmalloc_pages). Boot-time
 //! tables come from a static pool (the frame allocator does not exist yet).
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 

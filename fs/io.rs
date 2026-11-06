@@ -2,12 +2,12 @@
 //! pread64, pwrite64 and the shared core used by the vectored calls
 
 use alloc::sync::Arc;
-use alloc::vec;
 
 use crate::arch::Uaccess;
-use crate::fs::file::WRITE_CHUNK;
 use crate::fs::{File, KernelError, RwFlags};
-use crate::uaccess::{UaccessArch, copy_from_user_atomic, copy_to_user};
+use crate::uaccess::UaccessArch;
+
+use super::iov_iter::{IovDest, IovSource};
 
 use super::iov::IoVec;
 use super::syscall::{MAX_RW_COUNT, current_fd_table};
@@ -23,109 +23,18 @@ fn seg_len(segs: &[IoVec]) -> usize {
     total.min(MAX_RW_COUNT)
 }
 
-/// Position in a list of user segments (Linux iov_iter over user
-/// memory)
-struct Cursor<'a> {
-    segs: &'a [IoVec],
-    i: usize,
-    off: usize,
-}
-
-impl<'a> Cursor<'a> {
-    fn new(segs: &'a [IoVec]) -> Self {
-        Self { segs, i: 0, off: 0 }
-    }
-
-    /// Visit the next `len` bytes of user memory as (address, length)
-    /// runs and advance past them
-    fn step(
-        &mut self,
-        mut len: usize,
-        f: &mut dyn FnMut(u64, usize, usize) -> Result<(), ()>,
-    ) -> Result<(), KernelError> {
-        let mut done = 0;
-        while len > 0 {
-            let s = self.segs.get(self.i).ok_or(KernelError::BadAddress)?;
-            let n = (s.iov_len as usize - self.off).min(len);
-            if n > 0 {
-                f(s.iov_base + self.off as u64, n, done).map_err(|_| KernelError::BadAddress)?;
-            }
-            self.off += n;
-            done += n;
-            len -= n;
-            if self.off == s.iov_len as usize {
-                self.i += 1;
-                self.off = 0;
-            }
-        }
-        Ok(())
-    }
-
-    /// Fill `buf` from the user segments. A file write copies under
-    /// i_rwsem: page faults are disabled for the copy and missing pages
-    /// faulted in first (`copy_from_user_atomic`, Linux
-    /// generic_perform_write)
-    fn copy_in(&mut self, buf: &mut [u8]) -> Result<(), KernelError> {
-        self.step(buf.len(), &mut |a, n, at| {
-            copy_from_user_atomic::<Uaccess>(&mut buf[at..at + n], a, n)
-                .map(|_| ())
-                .map_err(|_| ())
-        })
-    }
-
-    /// Copy `data` out to the user segments
-    fn copy_out(&mut self, data: &[u8]) -> Result<(), KernelError> {
-        self.step(data.len(), &mut |a, n, at| {
-            copy_to_user::<Uaccess>(a, &data[at..at + n])
-                .map(|_| ())
-                .map_err(|_| ())
-        })
-    }
-}
-
-/// Files whose reads return everything asked for unless at EOF (more
-/// chunks are read); for others (pipes, sockets, terminals) one chunk is
-/// one read, since a second could block although data was returned
-fn reads_fully(file: &File) -> bool {
-    file.get_inode()
-        .is_some_and(|i| i.mode().is_file() || i.mode().is_blkdev())
-}
-
 /// Read from `file` into `segs` at `at` (None: the file position)
-/// through a kernel buffer of at most `WRITE_CHUNK` bytes (Linux
-/// vfs_readv). Data already returned wins over a later error.
+/// (Linux vfs_readv)
 pub fn file_readv(
     file: &File,
     segs: &[IoVec],
     at: Option<u64>,
     flags: RwFlags,
 ) -> Result<usize, KernelError> {
-    let total = seg_len(segs);
-    let mut buf = vec![0u8; total.min(WRITE_CHUNK)];
-    let mut cur = Cursor::new(segs);
-    let mut done = 0;
-    loop {
-        let n = (total - done).min(WRITE_CHUNK);
-        let r = match at {
-            None => file.read_with_flags(&mut buf[..n], flags),
-            Some(o) => file.pread_with_flags(&mut buf[..n], o + done as u64, flags),
-        };
-        let r = match r {
-            Ok(r) => r,
-            Err(_) if done > 0 => return Ok(done),
-            Err(e) => return Err(e),
-        };
-        if let Err(e) = cur.copy_out(&buf[..r]) {
-            return if done > 0 { Ok(done) } else { Err(e) };
-        }
-        done += r;
-        if r < n || done >= total || !reads_fully(file) {
-            return Ok(done);
-        }
-    }
+    file.read_iter(&mut IovDest::user(segs, MAX_RW_COUNT), at, flags)
 }
 
-/// Write `segs` to `file` as one write (see `File::write_from`)
+/// Write `segs` to `file` as one write (see `File::write_iter`)
 pub fn file_writev(
     file: &File,
     segs: &[IoVec],
@@ -133,10 +42,13 @@ pub fn file_writev(
     flags: RwFlags,
     append: Option<bool>,
 ) -> Result<usize, KernelError> {
-    let mut cur = Cursor::new(segs);
-    file.write_from(seg_len(segs), at, flags, append, &mut |dst| {
-        cur.copy_in(dst)
-    })
+    file.write_iter(&mut IovSource::user(segs, MAX_RW_COUNT), at, flags, append)
+}
+
+/// Files with a position (regular, block device)
+fn reads_fully(file: &File) -> bool {
+    file.get_inode()
+        .is_some_and(|i| i.mode().is_file() || i.mode().is_blkdev())
 }
 
 /// Linux rw_verify_area: on a file with a position (regular, block

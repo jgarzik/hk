@@ -8,6 +8,7 @@
 //! - pidfd_open, pidfd_send_signal, pidfd_getfd (pidfd operations)
 
 use crate::util::error::KernelError;
+use crate::util::kalloc::try_arc;
 
 use super::Pid;
 
@@ -407,7 +408,7 @@ pub fn sys_getrandom<A: crate::uaccess::UaccessArch>(buf: u64, buflen: usize, fl
 
     // Flags first (EINVAL even for an empty buffer, as on Linux)
     if let Err(e) = random::get_random_bytes(&mut [], flags) {
-        return e as i64;
+        return i64::from(e);
     }
     // Linux getrandom: at most MAX_RW_COUNT per call; a fault before
     // any byte is EFAULT, after some returns the count
@@ -548,7 +549,7 @@ pub fn sys_prctl(option: i32, arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> 
         PR_SET_DUMPABLE => {
             // Only 0/1 are settable; SUID_DUMP_ROOT (2) is reserved to the
             // suid_dumpable sysctl (Linux kernel/sys.c PR_SET_DUMPABLE)
-            if arg2 != SUID_DUMP_DISABLE as u64 && arg2 != SUID_DUMP_USER as u64 {
+            if arg2 != u64::from(SUID_DUMP_DISABLE) && arg2 != u64::from(SUID_DUMP_USER) {
                 return KernelError::InvalidArgument.sysret();
             }
             let value = arg2 as u8;
@@ -566,7 +567,7 @@ pub fn sys_prctl(option: i32, arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> 
         PR_GET_DUMPABLE => {
             // Return dumpable flag value
             match crate::mm::get_task_mm(tid) {
-                Some(mm) => mm.dumpable() as i64,
+                Some(mm) => i64::from(mm.dumpable()),
                 None => KernelError::NoProcess.sysret(),
             }
         }
@@ -710,7 +711,7 @@ pub fn sys_prctl(option: i32, arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> 
                 }
             };
 
-            if put_user::<Uaccess, i32>(arg2, tsc_mode as i32).is_err() {
+            if put_user::<Uaccess, i32>(arg2, i32::from(tsc_mode)).is_err() {
                 return KernelError::BadAddress.sysret();
             }
             0
@@ -881,13 +882,13 @@ pub fn sys_personality(personality: u32) -> i64 {
 
     // If querying only, return current value
     if personality == 0xFFFFFFFF {
-        return old as i64;
+        return i64::from(old);
     }
 
     // Set new personality
     super::percpu::set_current_personality(personality);
 
-    old as i64
+    i64::from(old)
 }
 
 // =============================================================================
@@ -1201,7 +1202,10 @@ pub fn sys_capset<A: crate::uaccess::UaccessArch>(header_addr: u64, data_addr: u
     // Note: bset and ambient are not modified by capset
 
     // Commit the new credentials
-    super::commit_creds(alloc::sync::Arc::new(new_cred));
+    match try_arc(new_cred) {
+        Ok(c) => super::commit_creds(c),
+        Err(e) => return e.sysret(),
+    }
 
     0
 }
@@ -1275,8 +1279,8 @@ pub fn sys_pidfd_open(pid: i64, flags: u32) -> i64 {
     };
 
     match table.alloc_with_flags(pidfd_file, fd_flags, nofile) {
-        Ok(fd) => fd as i64,
-        Err(e) => e as i64,
+        Ok(fd) => i64::from(fd),
+        Err(e) => i64::from(e),
     }
 }
 
@@ -1328,7 +1332,7 @@ pub fn sys_pidfd_send_signal(pidfd: i32, sig: i32, _info: u64, flags: u32) -> i6
     // Permission check and send (Linux pidfd_send_signal ->
     // kill_pid_info). Signal 0 is a permission/existence probe.
     let perm = crate::signal::syscall::user_group_send(target_pid, sig as u32);
-    perm as i64
+    i64::from(perm)
 }
 
 /// sys_pidfd_getfd - obtain a duplicate of another process's file descriptor
@@ -1412,11 +1416,11 @@ pub fn sys_pidfd_getfd(pidfd: i32, targetfd: i32, flags: u32) -> i64 {
         let mut table = caller_fd_table.lock();
         match table.alloc_with_flags(target_file, super::FD_CLOEXEC, nofile) {
             Ok(fd) => fd,
-            Err(e) => return e as i64,
+            Err(e) => return i64::from(e),
         }
     };
 
-    new_fd as i64
+    i64::from(new_fd)
 }
 
 /// Find a task by PID (returns TID of the main thread)
@@ -1465,12 +1469,12 @@ pub fn sys_iopl(level: u32) -> i64 {
     let old = super::percpu::current_iopl_emul();
 
     // No change? Done.
-    if level == old as u32 {
+    if level == u32::from(old) {
         return 0;
     }
 
     // Lowering privilege is always allowed
-    if level < old as u32 {
+    if level < u32::from(old) {
         super::percpu::set_current_iopl_emul(level as u8);
         return 0;
     }

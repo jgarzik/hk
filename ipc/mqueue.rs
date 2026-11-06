@@ -25,6 +25,7 @@
 
 use crate::fs::name::FileName;
 use crate::time::hrtimer::HrClock;
+use crate::util::kalloc::try_arc;
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
@@ -37,8 +38,9 @@ use spin::Lazy;
 
 use crate::arch::Uaccess;
 use crate::fs::dentry::Dentry;
-use crate::fs::file::{File, FileOps, flags};
+use crate::fs::file::{File, FileOps, RwFlags, flags};
 use crate::fs::inode::{Inode, InodeMode, NULL_INODE_OPS, Timespec as InodeTimespec};
+use crate::fs::iov_iter::IovDest;
 use crate::io::pipe::FD_CLOEXEC;
 use crate::io::poll::{POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM, PollTable};
 use crate::sync::waitqueue::WaitQueue;
@@ -169,7 +171,7 @@ struct MqNotify {
 
 /// Message queue
 pub struct MqQueue {
-    #[allow(dead_code)] // Used for debugging and future /dev/mqueue filesystem
+    #[expect(dead_code)] // Used for debugging and future /dev/mqueue filesystem
     name: FileName,
     maxmsg: i64,
     msgsize: i64,
@@ -184,6 +186,27 @@ pub struct MqQueue {
 }
 
 impl MqQueue {
+    /// "QSIZE:... NOTIFY:... SIGNO:... NOTIFY_PID:...\n" (Linux
+    /// mqueue_read_file's format)
+    fn status(&self) -> alloc::string::String {
+        let qsize: usize = self.messages.lock().iter().map(|m| m.data.len()).sum();
+        let (notify, signo, pid) = match self.notify.lock().as_ref() {
+            Some(n) => (
+                n.sigev_notify,
+                if n.sigev_notify == SIGEV_SIGNAL {
+                    n.sigev_signo
+                } else {
+                    0
+                },
+                n.owner.nr(),
+            ),
+            None => (0, 0, 0),
+        };
+        alloc::format!(
+            "QSIZE:{qsize:<10} NOTIFY:{notify:<5} SIGNO:{signo:<5} NOTIFY_PID:{pid:<6}\n"
+        )
+    }
+
     fn new(name: FileName, mode: u32, maxmsg: i64, msgsize: i64) -> Self {
         // Get current task's effective uid/gid as owner
         let cred = crate::task::percpu::current_cred();
@@ -234,7 +257,7 @@ impl MqQueue {
     }
 
     /// Get the queue name (for debugging and future /dev/mqueue filesystem)
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     fn name(&self) -> &[u8] {
         &self.name
     }
@@ -253,11 +276,11 @@ impl MqQueue {
     fn set_flags(&self, new_flags: i64) {
         // Only O_NONBLOCK can be changed
         let mut flags = self.flags.lock();
-        *flags = new_flags & (O_NONBLOCK as i64);
+        *flags = new_flags & i64::from(O_NONBLOCK);
     }
 
     fn is_nonblocking(&self) -> bool {
-        (*self.flags.lock() & (O_NONBLOCK as i64)) != 0
+        (*self.flags.lock() & i64::from(O_NONBLOCK)) != 0
     }
 
     fn send(
@@ -359,7 +382,10 @@ impl MqQueue {
             // or exec'd
             let live = n.owner.exited().is_none() && n.owner.exec_gen() == n.exec_gen;
             if n.sigev_notify == SIGEV_SIGNAL && live {
-                crate::signal::send_signal_to_process(n.owner.nr() as u64, n.sigev_signo as u32);
+                crate::signal::send_signal_to_process(
+                    u64::from(n.owner.nr()),
+                    n.sigev_signo as u32,
+                );
             }
         }
     }
@@ -386,41 +412,27 @@ impl FileOps for MqFileOps {
         self
     }
 
-    fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {
+    /// The queue's status line (Linux mqueue_read_file): bytes queued
+    /// and the notification registered; no message is consumed. The
+    /// file position moves through the line.
+    fn read_iter(
+        &self,
+        file: &File,
+        to: &mut IovDest<'_>,
+        at: Option<u64>,
+        _flags: RwFlags,
+    ) -> Result<usize, KernelError> {
         let mq = mq_of(file).ok_or(KernelError::BadFd)?;
-        if mq.access_mode == O_WRONLY {
-            return Err(KernelError::PermissionDenied);
+        let line = mq.queue.status();
+        let pos = at.unwrap_or_else(|| file.get_pos()) as usize;
+        let n = to.copy_to(line.as_bytes().get(pos..).unwrap_or(&[]))?;
+        if at.is_none() {
+            file.advance_pos(n as u64);
         }
-
-        match mq.queue.receive(false, None) {
-            Ok((data, _prio)) => {
-                let len = data.len().min(buf.len());
-                buf[..len].copy_from_slice(&data[..len]);
-                Ok(len)
-            }
-            Err(_) => Err(KernelError::Io),
-        }
+        Ok(n)
     }
 
-    fn write(&self, file: &File, buf: &[u8]) -> Result<usize, KernelError> {
-        let mq = mq_of(file).ok_or(KernelError::BadFd)?;
-        if mq.access_mode == O_RDONLY {
-            return Err(KernelError::PermissionDenied);
-        }
-
-        if buf.len() as i64 > mq.queue.msgsize {
-            return Err(KernelError::MessageTooLong);
-        }
-        let mut data = crate::util::kmem::try_vec(buf.len(), 0u8)?;
-        data.copy_from_slice(buf);
-        // Write with priority 0 (default)
-        match mq.queue.send(data, 0, false, None) {
-            Ok(()) => Ok(buf.len()),
-            Err(_) => Err(KernelError::Io),
-        }
-    }
-
-    fn poll(&self, file: &File, table: Option<&mut PollTable>) -> u16 {
+    fn poll(&self, file: &File, table: Option<&mut PollTable<'_>>) -> u16 {
         let Some(mq) = mq_of(file) else {
             return crate::io::poll::POLLERR;
         };
@@ -447,7 +459,10 @@ impl FileOps for MqFileOps {
         if let Some(mq) = mq_of(file) {
             let me = crate::task::percpu::current_pid();
             let mut notify = mq.queue.notify.lock();
-            if notify.as_ref().is_some_and(|n| n.owner.nr() as u64 == me) {
+            if notify
+                .as_ref()
+                .is_some_and(|n| u64::from(n.owner.nr()) == me)
+            {
                 *notify = None;
             }
         }
@@ -479,7 +494,7 @@ fn get_nofile_limit() -> u64 {
 fn create_mq_file(queue: Arc<MqQueue>, access_mode: i32, oflag: i32) -> Result<Arc<File>, i64> {
     // Create anonymous inode
     let mode = InodeMode::regular(0o644);
-    let inode = Arc::new(Inode::new(
+    let inode = try_arc(Inode::new(
         MQ_NEXT_ID.fetch_add(1, AtomicOrdering::SeqCst),
         mode,
         0,                           // uid
@@ -488,9 +503,11 @@ fn create_mq_file(queue: Arc<MqQueue>, access_mode: i32, oflag: i32) -> Result<A
         InodeTimespec::from_secs(0), // mtime
         Weak::new(),                 // no superblock
         &NULL_INODE_OPS,
-    ));
+    ))
+    .map_err(KernelError::sysret)?;
 
-    let dentry = Arc::new(Dentry::new_anonymous("mqueue".into(), Some(inode)));
+    let dentry = try_arc(Dentry::new_anonymous("mqueue".into(), Some(inode)))
+        .map_err(KernelError::sysret)?;
 
     let mut file_flags = match access_mode {
         O_RDONLY => flags::O_RDONLY,
@@ -503,9 +520,8 @@ fn create_mq_file(queue: Arc<MqQueue>, access_mode: i32, oflag: i32) -> Result<A
         file_flags |= flags::O_NONBLOCK;
     }
 
-    let private = Arc::new(MqFile { queue, access_mode });
-    let file = Arc::new(File::new_anon(dentry, file_flags, &MQ_FOPS, private));
-    Ok(file)
+    let private = try_arc(MqFile { queue, access_mode }).map_err(KernelError::sysret)?;
+    try_arc(File::new_anon(dentry, file_flags, &MQ_FOPS, private)).map_err(KernelError::sysret)
 }
 
 // ============================================================================
@@ -612,16 +628,19 @@ pub fn sys_mq_open(name_ptr: u64, oflag: i32, mode: u32, attr_ptr: u64) -> i64 {
                 None => (DFLT_MSGMAX, DFLT_MSGSIZEMAX),
             };
 
-            let queue = Arc::new(MqQueue::new(
+            let queue = match try_arc(MqQueue::new(
                 queue_name.clone().into(),
                 mode,
                 maxmsg,
                 msgsize,
-            ));
+            )) {
+                Ok(q) => q,
+                Err(e) => return e.sysret(),
+            };
 
             // Set initial flags
             if oflag & O_NONBLOCK != 0 {
-                queue.set_flags(O_NONBLOCK as i64);
+                queue.set_flags(i64::from(O_NONBLOCK));
             }
 
             registry.insert(queue_name.into(), queue.clone());
@@ -650,8 +669,8 @@ pub fn sys_mq_open(name_ptr: u64, oflag: i32, mode: u32, attr_ptr: u64) -> i64 {
         .lock()
         .alloc_with_flags(file, fd_flags, get_nofile_limit())
     {
-        Ok(fd) => fd as i64,
-        Err(e) => -(e as i64),
+        Ok(fd) => i64::from(fd),
+        Err(e) => -i64::from(e),
     }
 }
 
@@ -854,7 +873,7 @@ pub fn sys_mq_notify(mqdes: i32, sevp_ptr: u64) -> i64 {
         let mut notify = mq_ops.queue.notify.lock();
         if notify
             .as_ref()
-            .is_some_and(|n| n.owner.nr() as u64 == current_pid)
+            .is_some_and(|n| u64::from(n.owner.nr()) == current_pid)
         {
             *notify = None;
         }
@@ -886,7 +905,7 @@ pub fn sys_mq_notify(mqdes: i32, sevp_ptr: u64) -> i64 {
     let mut notify = mq_ops.queue.notify.lock();
     if notify
         .as_ref()
-        .is_some_and(|n| n.owner.nr() as u64 != current_pid)
+        .is_some_and(|n| u64::from(n.owner.nr()) != current_pid)
     {
         return KernelError::Busy.sysret();
     }

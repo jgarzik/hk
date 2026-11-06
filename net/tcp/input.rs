@@ -23,7 +23,7 @@ use crate::util::error::KernelError;
 
 impl TcpCb {
     /// Process a segment for this connection
-    pub fn input(&mut self, s: &SegIn, now: u64, out: &mut Out) {
+    pub fn input(&mut self, s: &SegIn<'_>, now: u64, out: &mut Out) {
         self.tick(now);
         self.stats.segs_in += 1;
         if !s.data.is_empty() {
@@ -37,7 +37,7 @@ impl TcpCb {
     }
 
     /// RFC 9293 3.10.7.3 (Linux tcp_rcv_synsent_state_process)
-    fn rcv_syn_sent(&mut self, s: &SegIn, now: u64, out: &mut Out) {
+    fn rcv_syn_sent(&mut self, s: &SegIn<'_>, now: u64, out: &mut Out) {
         let ack_ok = s.has(flags::ACK);
         if ack_ok
             && (!after(s.ack, self.iss) || after(s.ack, self.snd_max) || !self.synack_ts_ok(s))
@@ -77,7 +77,7 @@ impl TcpCb {
 
     /// A SYN-ACK's echo must lie between our SYN's TSval and now (Linux
     /// tcp_rcv_synsent_state_process "PAWS active rejected")
-    fn synack_ts_ok(&self, s: &SegIn) -> bool {
+    fn synack_ts_ok(&self, s: &SegIn<'_>) -> bool {
         match s.ts {
             Some((_, e)) if self.ts_ok && e != 0 => {
                 let sent = (self.lsndtime as u32).wrapping_add(self.ts_off);
@@ -88,7 +88,7 @@ impl TcpCb {
     }
 
     /// The handshake completed with `s`
-    fn established(&mut self, s: &SegIn, now: u64, out: &mut Out) {
+    fn established(&mut self, s: &SegIn<'_>, now: u64, out: &mut Out) {
         // shutdown(SHUT_WR) in SYN_RECEIVED queued a FIN
         self.state = if self.fin_queued {
             TcpState::FinWait1
@@ -119,7 +119,7 @@ impl TcpCb {
     }
 
     /// Linux tcp_sequence: the segment overlaps [RCV.NXT, RCV.NXT+WND]
-    fn acceptable(&self, s: &SegIn) -> bool {
+    fn acceptable(&self, s: &SegIn<'_>) -> bool {
         let end = s.seq.wrapping_add(s.seq_len());
         !before(end, self.rcv_nxt) && !after(s.seq, self.rcv_nxt.wrapping_add(self.rcv_wnd()))
     }
@@ -134,7 +134,7 @@ impl TcpCb {
 
     /// RFC 7323 5.3 PAWS (Linux tcp_validate_incoming + tcp_paws_discard
     /// + tcp_disordered_ack_check): true if `s` must be dropped
-    fn paws_reject(&self, s: &SegIn) -> bool {
+    fn paws_reject(&self, s: &SegIn<'_>) -> bool {
         let Some((v, _)) = s.ts else {
             return false;
         };
@@ -153,7 +153,7 @@ impl TcpCb {
     }
 
     /// Linux tcp_may_update_window
-    fn may_update_window(&self, s: &SegIn) -> bool {
+    fn may_update_window(&self, s: &SegIn<'_>) -> bool {
         after(s.ack, self.snd_una)
             || after(s.seq, self.snd_wl1)
             || (s.seq == self.snd_wl1 && (self.seg_wnd(s) > self.snd_wnd || s.wnd == 0))
@@ -161,7 +161,7 @@ impl TcpCb {
 
     /// RFC 7323 4.3 (Linux tcp_replace_ts_recent): remember the TSval of
     /// a segment at or before Last.ACK.sent
-    fn update_ts_recent(&mut self, s: &SegIn) {
+    fn update_ts_recent(&mut self, s: &SegIn<'_>) {
         if let Some((v, _)) = s.ts
             && self.ts_ok
             && !after(s.seq, self.rcv_wup)
@@ -174,7 +174,7 @@ impl TcpCb {
 
     /// RTT from the timestamp echo of a segment acknowledging new data
     /// (RFC 7323 4; valid for retransmitted data too)
-    fn ts_rtt(&self, s: &SegIn) -> Option<u64> {
+    fn ts_rtt(&self, s: &SegIn<'_>) -> Option<u64> {
         let (_, e) = s.ts?;
         if !self.ts_ok || e == 0 {
             return None;
@@ -184,7 +184,7 @@ impl TcpCb {
     }
 
     /// Synchronized states and SYN_RECEIVED
-    fn rcv_synced(&mut self, s: &SegIn, now: u64, out: &mut Out) {
+    fn rcv_synced(&mut self, s: &SegIn<'_>, now: u64, out: &mut Out) {
         if self.state == TcpState::SynReceived
             && s.has(flags::SYN)
             && !s.has(flags::ACK | flags::RST)
@@ -264,7 +264,7 @@ impl TcpCb {
 
     /// Linux tcp_oow_rate_limited: data segments are never limited
     /// (they are not part of an ACK loop), pure ones and SYNs are
-    fn oow_limited(&mut self, s: &SegIn) -> bool {
+    fn oow_limited(&mut self, s: &SegIn<'_>) -> bool {
         if !s.data.is_empty() && !s.has(flags::SYN) {
             return false;
         }
@@ -282,7 +282,7 @@ impl TcpCb {
     /// An unacceptable or old segment: ACK at once (Linux
     /// tcp_send_dupack: duplicated data means our ACK was lost, so stop
     /// delaying ACKs for a while)
-    fn dupack(&mut self, s: &SegIn, out: &mut Out) {
+    fn dupack(&mut self, s: &SegIn<'_>, out: &mut Out) {
         if !s.data.is_empty() && before(s.seq, self.rcv_nxt) {
             self.enter_quickack();
         }
@@ -329,11 +329,11 @@ impl TcpCb {
     /// acceptable range below SND.UNA is min(max window, bytes acked) as
     /// in Linux tcp_ack); false if the segment must be dropped. An old
     /// ACK (below SND.UNA) updates neither TS.Recent nor the window.
-    fn rcv_ack(&mut self, s: &SegIn, now: u64, out: &mut Out) -> bool {
+    fn rcv_ack(&mut self, s: &SegIn<'_>, now: u64, out: &mut Out) -> bool {
         let ack = s.ack;
         let span = self
             .max_wnd
-            .min(self.stats.bytes_acked.min(u32::MAX as u64) as u32);
+            .min(self.stats.bytes_acked.min(u64::from(u32::MAX)) as u32);
         if after(ack, self.snd_max) || before(ack, self.snd_una.wrapping_sub(span)) {
             self.challenge_ack(out);
             return false;
@@ -376,7 +376,7 @@ impl TcpCb {
     }
 
     /// `s` acknowledges new data (Linux tcp_clean_rtx_queue)
-    fn ack_new(&mut self, s: &SegIn, now: u64, out: &mut Out) {
+    fn ack_new(&mut self, s: &SegIn<'_>, now: u64, out: &mut Out) {
         let ack = s.ack;
         let acked = ack.wrapping_sub(self.snd_una);
         // Data bytes covered (not the FIN)
@@ -391,7 +391,7 @@ impl TcpCb {
             self.sndq_seq = upto;
             self.mem_settle();
         }
-        self.stats.bytes_acked += acked as u64;
+        self.stats.bytes_acked += u64::from(acked);
         self.snd_una = ack;
         if before(self.snd_nxt, ack) {
             self.snd_nxt = ack;
@@ -418,8 +418,8 @@ impl TcpCb {
     }
 
     /// Segment text and FIN (Linux tcp_data_queue / tcp_fin)
-    fn rcv_text(&mut self, s: &SegIn, now: u64, out: &mut Out) {
-        let mut seq = s.seq.wrapping_add(s.has(flags::SYN) as u32);
+    fn rcv_text(&mut self, s: &SegIn<'_>, now: u64, out: &mut Out) {
+        let mut seq = s.seq.wrapping_add(u32::from(s.has(flags::SYN)));
         let mut data = s.data;
         let mut fin = s.has(flags::FIN);
         if before(seq, self.rcv_nxt) {

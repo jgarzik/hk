@@ -14,6 +14,7 @@
 //! RTNL for driver registrations); `NET_SYSFS` is set once at init.
 //! Attributes read the device without RTNL, as its receive path does.
 
+use crate::util::kalloc::{arc_nofail, try_arc};
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
@@ -92,7 +93,7 @@ const ATTRS: [NAttr; 14] = [
         if !n.is_up() {
             return Err(KernelError::InvalidArgument);
         }
-        Ok(format!("{}\n", n.carrier_ok() as u8))
+        Ok(format!("{}\n", u8::from(n.carrier_ok())))
     }),
     (b"carrier_changes", |n| {
         Ok(format!("{}\n", n.carrier_changes()))
@@ -116,7 +117,7 @@ impl kernfs::Attr for NetAttr {
 
 fn add_attrs(dir: &Arc<KNode>, n: &Arc<NetDevice>) -> Result<(), KernelError> {
     for (name, f) in ATTRS {
-        dir.create_file(name, 0o444, Arc::new(NetAttr(Arc::downgrade(n), f)))?;
+        dir.create_file(name, 0o444, try_arc(NetAttr(Arc::downgrade(n), f))?)?;
     }
     let st = dir.create_dir(b"statistics", 0o755)?;
     let stats: [NAttr; 8] = [
@@ -182,7 +183,7 @@ fn add_attrs(dir: &Arc<KNode>, n: &Arc<NetDevice>) -> Result<(), KernelError> {
         }),
     ];
     for (name, f) in stats {
-        st.create_file(name, 0o444, Arc::new(NetAttr(Arc::downgrade(n), f)))?;
+        st.create_file(name, 0o444, try_arc(NetAttr(Arc::downgrade(n), f))?)?;
     }
     Ok(())
 }
@@ -200,13 +201,15 @@ pub fn netdev_register_kobject(n: &Arc<NetDevice>) {
     }
     let Some(net) = n.net() else { return };
     let parent = n.parent.get();
-    let r = device_create(DeviceInfo {
-        parent,
-        class: Some(&NET_CLASS),
-        data: Some(Arc::new(NetDevRef(Arc::downgrade(n)))),
-        attrs: Some(net_attrs),
-        ns: net.id,
-        ..DeviceInfo::named(n.name())
+    let r = try_arc(NetDevRef(Arc::downgrade(n))).and_then(|data| {
+        device_create(DeviceInfo {
+            parent,
+            class: Some(&NET_CLASS),
+            data: Some(data),
+            attrs: Some(net_attrs),
+            ns: net.id,
+            ..DeviceInfo::named(n.name())
+        })
     });
     match r {
         Ok(d) => {
@@ -235,7 +238,8 @@ pub fn netns_exit(kdevs: Vec<Arc<Device>>) {
             d.del();
         }
     });
-    let work = Arc::new(crate::sync::spin::Mutex::new(work));
+    // Namespace teardown cannot fail
+    let work = arc_nofail(crate::sync::spin::Mutex::new(work));
     crate::task::workqueue::SYSTEM_WQ.queue_work(work);
 }
 

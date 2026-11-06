@@ -51,6 +51,7 @@ pub mod dgram;
 pub mod scm;
 pub mod stream;
 
+use crate::util::kalloc::{try_arc, try_arc_cyclic};
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
@@ -282,10 +283,10 @@ impl UnixTable {
         if t.names.get(&key).is_some_and(|w| w.strong_count() > 0) {
             return Err(KernelError::AddressInUse);
         }
-        *s.addr.write() = Some(Arc::new(UnixAddr {
+        *s.addr.write() = Some(try_arc(UnixAddr {
             name: key.1.clone(),
             path: None,
-        }));
+        })?);
         t.names.insert(key, Arc::downgrade(s));
         Ok(())
     }
@@ -311,9 +312,9 @@ fn inode_key(d: &Dentry) -> Option<usize> {
 
 impl UnixSock {
     /// A new socket in `net` (Linux unix_create1)
-    fn new(net: Arc<NetNamespace>, stype: i32) -> Arc<Self> {
+    fn new(net: Arc<NetNamespace>, stype: i32) -> Result<Arc<Self>, KernelError> {
         let qlen = net.sysctl.unix_max_dgram_qlen.load(Ordering::Relaxed) as u32;
-        let s = Arc::new_cyclic(|me| Self {
+        let s = try_arc_cyclic(|me| Self {
             sk: Sock::new(net, AF_UNIX, stype, 0),
             me: me.clone(),
             st: Mutex::new(None),
@@ -329,9 +330,9 @@ impl UnixSock {
             dead: AtomicBool::new(false),
             backlog: AtomicU32::new(qlen),
             peercred: Mutex::new(None),
-        });
+        })?;
         s.sk.net.unix.insert(&s);
-        s
+        Ok(s)
     }
 
     fn arc(&self) -> Arc<Self> {
@@ -340,7 +341,7 @@ impl UnixSock {
 
     /// Identity (lock order, tables)
     fn id(&self) -> usize {
-        self as *const Self as usize
+        core::ptr::from_ref::<Self>(self) as usize
     }
 
     pub fn state(&self) -> u8 {
@@ -380,7 +381,7 @@ impl UnixSock {
 
     /// Linux unix_recvq_full_lockless: more queued than the limit
     fn recvq_full(&self) -> bool {
-        self.rq.lock().q.len() as u64 > self.backlog.load(Ordering::Acquire) as u64
+        self.rq.lock().q.len() as u64 > u64::from(self.backlog.load(Ordering::Acquire))
     }
 
     /// Linux unix_writable: under a quarter of sndbuf in flight
@@ -459,6 +460,17 @@ impl UnixSock {
             KernelError::AlreadyExists => KernelError::AddressInUse,
             e => e,
         })?;
+        let key = inode_key(&d);
+        let addr = match try_arc(UnixAddr {
+            name,
+            path: Some(d),
+        }) {
+            Ok(a) => a,
+            Err(e) => {
+                crate::fs::dir::unlink_sock(&path);
+                return Err(e);
+            }
+        };
         let b = self.bindlock.lock();
         if self.addr().is_some() {
             // Unlinked after bindlock is dropped (Linux out_unlink: the
@@ -467,12 +479,9 @@ impl UnixSock {
             crate::fs::dir::unlink_sock(&path);
             return Err(KernelError::InvalidArgument);
         }
-        let key = inode_key(&d).ok_or(KernelError::NotFound)?;
+        let key = key.ok_or(KernelError::NotFound)?;
         let mut t = BSD.write();
-        *self.addr.write() = Some(Arc::new(UnixAddr {
-            name,
-            path: Some(d),
-        }));
+        *self.addr.write() = Some(addr);
         t.insert(key, self.me.clone());
         Ok(())
     }
@@ -684,7 +693,7 @@ pub fn create(stype: i32, protocol: i32) -> Result<Arc<dyn ProtoOps>, KernelErro
         SOCK_RAW => SOCK_DGRAM,
         _ => return Err(KernelError::SocketTypeNotSupported),
     };
-    Ok(UnixSock::new(crate::net::current_net_ns(), stype))
+    Ok(UnixSock::new(crate::net::current_net_ns(), stype)?)
 }
 
 impl ProtoOps for UnixSock {
@@ -800,7 +809,7 @@ impl ProtoOps for UnixSock {
         (opt == SO_PEERCRED).then(|| Ok(self.peercred_opt()))
     }
 
-    fn sendmsg(&self, m: &mut SendMsg, flags: i32) -> Result<usize, KernelError> {
+    fn sendmsg(&self, m: &mut SendMsg<'_>, flags: i32) -> Result<usize, KernelError> {
         match self.sk.stype {
             SOCK_STREAM => stream::sendmsg(self, m, flags),
             SOCK_SEQPACKET => dgram::seqpacket_sendmsg(self, m, flags),
@@ -808,7 +817,7 @@ impl ProtoOps for UnixSock {
         }
     }
 
-    fn recvmsg(&self, m: &mut RecvMsg, flags: i32) -> Result<usize, KernelError> {
+    fn recvmsg(&self, m: &mut RecvMsg<'_>, flags: i32) -> Result<usize, KernelError> {
         match self.sk.stype {
             SOCK_STREAM => stream::recvmsg(self, m, flags),
             SOCK_SEQPACKET => dgram::seqpacket_recvmsg(self, m, flags),
@@ -919,6 +928,6 @@ fn rcv_shut(s: &UnixSock) -> bool {
 }
 
 /// Common receive tail: credentials and files into control messages
-fn scm_recv(s: &UnixSock, m: &mut RecvMsg, creds: Option<Creds>, fds: Option<FpList>) {
+fn scm_recv(s: &UnixSock, m: &mut RecvMsg<'_>, creds: Option<Creds>, fds: Option<FpList>) {
     scm::put(m, s.passcred(), creds, fds);
 }

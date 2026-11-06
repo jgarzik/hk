@@ -25,14 +25,24 @@
 //! - Test 42: pwritev2() with RWF_APPEND appends to file
 //! - Test 43: preadv2() with invalid flags returns -EOPNOTSUPP
 //! - Test 44: preadv2() with RWF_NOWAIT on ramfs returns -EOPNOTSUPP
+//! - WRITE_OWN_MAP: a write sourced from a mapping of the page it writes
+//! - IOV_PARTIAL_FAULT: writev/readv stop at a bad segment with the
+//!   bytes done
+//! - SYSCTL_PARTIAL_FAULT: a sysctl write whose data faults partway is
+//!   EFAULT and stores nothing
+//! - RWF_NOWAIT_STREAMS: preadv2 RWF_NOWAIT on an empty eventfd, timerfd
+//!   (Linux 6.10+) or socket is EAGAIN (Linux FMODE_NOWAIT), not EOPNOTSUPP
+//! - RW_STRADDLE: read/write with one buffer running off mapped memory
+//!   mid-page move the mapped part and return its length
 
 use super::helpers::{host_mode, print, print_num, println};
 use hk_syscall::{
-    AT_EMPTY_PATH, AT_FDCWD, FIOCLEX, FIONBIO, FIONCLEX, IoVec, LinuxStatFs, O_CREAT, O_NONBLOCK,
-    O_RDONLY, O_RDWR, O_TRUNC, PROC_SUPER_MAGIC, RAMFS_MAGIC, STATX_BASIC_STATS, Statx, sys_close,
-    sys_fcntl, sys_fstatfs, sys_ftruncate, sys_getrandom, sys_ioctl, sys_lseek, sys_open,
-    sys_pipe2, sys_pread64, sys_preadv, sys_preadv2, sys_pwrite64, sys_pwritev, sys_pwritev2,
-    sys_read, sys_readv, sys_statfs, sys_statx, sys_unlink, sys_write, sys_writev,
+    AT_EMPTY_PATH, AT_FDCWD, FIOCLEX, FIONBIO, FIONCLEX, IoVec, LinuxStatFs, MAP_ANONYMOUS,
+    MAP_PRIVATE, MAP_SHARED, O_CREAT, O_NONBLOCK, O_RDONLY, O_RDWR, O_TRUNC, PROC_SUPER_MAGIC,
+    PROT_READ, RAMFS_MAGIC, STATX_BASIC_STATS, Statx, sys_close, sys_fcntl, sys_fstatfs,
+    sys_ftruncate, sys_getrandom, sys_ioctl, sys_lseek, sys_mmap, sys_munmap, sys_open, sys_pipe2,
+    sys_pread64, sys_preadv, sys_preadv2, sys_pwrite64, sys_pwritev, sys_pwritev2, sys_read,
+    sys_readv, sys_statfs, sys_statx, sys_unlink, sys_write, sys_writev,
 };
 
 // RWF flags for preadv2/pwritev2
@@ -65,6 +75,11 @@ pub fn run_tests() {
     test_fcntl_dupfd_cloexec();
     test_fcntl_ebadf();
     test_trunc_tail();
+    test_write_own_map();
+    test_iov_partial_fault();
+    test_rw_straddle();
+    test_rwf_nowait_streams();
+    test_sysctl_partial_fault();
     test_getrandom();
     test_getrandom_einval();
     test_getrandom_stream();
@@ -1655,6 +1670,229 @@ fn test_trunc_tail() {
         print_num(n);
         print(b" byte100=");
         print_num(buf[100] as i64);
+        println(b"");
+    }
+}
+
+/// A write whose source is a not yet faulted-in shared mapping of the
+/// very page it writes (and then of another page of the file): the
+/// source fault must not wait on the page lock the write holds (Linux
+/// generic_perform_write faults the source in before locking)
+fn test_write_own_map() {
+    let path = b"/tmp/write_own_map\0";
+    let fd = sys_open(path.as_ptr(), O_CREAT | O_RDWR | O_TRUNC, 0o644) as i32;
+    let mut buf = [b'a'; 8192];
+    buf[4096..].fill(b'b');
+    let w = sys_pwrite64(fd, buf.as_ptr(), 8192, 0);
+    let map = sys_mmap(0, 8192, PROT_READ, MAP_SHARED, fd, 0);
+    let (w1, w2) = if map > 0 {
+        let m = map as u64;
+        let w1 = sys_pwrite64(fd, m as *const u8, 4096, 0);
+        let w2 = sys_pwrite64(fd, (m + 4096) as *const u8, 4096, 0);
+        sys_munmap(m, 8192);
+        (w1, w2)
+    } else {
+        (map, map)
+    };
+    buf.fill(0);
+    let n = sys_pread64(fd, buf.as_mut_ptr(), 8192, 0);
+    sys_close(fd as u64);
+    sys_unlink(path.as_ptr());
+    if w == 8192 && w1 == 4096 && w2 == 4096 && n == 8192 && buf.iter().all(|&c| c == b'b') {
+        println(b"WRITE_OWN_MAP:OK");
+    } else {
+        print(b"WRITE_OWN_MAP:FAIL w1=");
+        print_num(w1);
+        print(b" w2=");
+        print_num(w2);
+        print(b" n=");
+        print_num(n);
+        println(b"");
+    }
+}
+
+/// writev/readv whose second segment is unreadable/unwritable memory
+/// move the first segment and return its length; readv advances the
+/// position by just that
+fn test_iov_partial_fault() {
+    let path = b"/tmp/iov_partial\0";
+    let fd = sys_open(path.as_ptr(), O_CREAT | O_RDWR | O_TRUNC, 0o644) as i32;
+    let bad = sys_mmap(0, 4096, 0, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    let data = [b'c'; 10];
+    let mut back = [0u8; 10];
+    let mut w = -1;
+    let mut r = -1;
+    let mut pos = -1;
+    if bad > 0 {
+        let iov = [
+            IoVec {
+                iov_base: data.as_ptr(),
+                iov_len: data.len(),
+            },
+            IoVec {
+                iov_base: bad as *const u8,
+                iov_len: 100,
+            },
+        ];
+        w = sys_writev(fd as u64, iov.as_ptr(), 2);
+        let pad = [b'd'; 100];
+        sys_write(fd as u64, pad.as_ptr(), pad.len() as u64);
+        sys_lseek(fd, 0, 0);
+        let iov = [
+            IoVec {
+                iov_base: back.as_mut_ptr(),
+                iov_len: back.len(),
+            },
+            IoVec {
+                iov_base: bad as *const u8,
+                iov_len: 100,
+            },
+        ];
+        r = sys_readv(fd as u64, iov.as_ptr(), 2);
+        pos = sys_lseek(fd, 0, 1);
+        sys_munmap(bad as u64, 4096);
+    }
+    sys_close(fd as u64);
+    sys_unlink(path.as_ptr());
+    if w == 10 && r == 10 && pos == 10 && back == data {
+        println(b"IOV_PARTIAL_FAULT:OK");
+    } else {
+        print(b"IOV_PARTIAL_FAULT:FAIL w=");
+        print_num(w);
+        print(b" r=");
+        print_num(r);
+        print(b" pos=");
+        print_num(pos);
+        println(b"");
+    }
+}
+
+/// read and write whose single buffer starts 2048 bytes before an
+/// unmapped page: the mapped 2048 bytes move and that count returns
+/// (Linux copy_to_iter / copy_page_from_iter_atomic report partial
+/// copies). A pipe read is EFAULT instead and consumes nothing (Linux
+/// pipe_read): the data is still there for a good buffer
+fn test_rw_straddle() {
+    let path = b"/tmp/rw_straddle\0";
+    let fd = sys_open(path.as_ptr(), O_CREAT | O_RDWR | O_TRUNC, 0o644) as i32;
+    let fill = [b'x'; 8192];
+    sys_write(fd as u64, fill.as_ptr(), fill.len() as u64);
+    let base = sys_mmap(0, 8192, 3, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    let (mut r, mut w, mut pr) = (-1, -1, -1);
+    if base > 0 {
+        sys_munmap(base as u64 + 4096, 4096);
+        let p = (base as u64 + 2048) as *mut u8;
+        sys_lseek(fd, 0, 0);
+        r = sys_read(fd as u64, p, 4096);
+        // SAFETY: p..p+2048 is mapped
+        let got = unsafe { core::slice::from_raw_parts(p, 2048) };
+        if !got.iter().all(|&b| b == b'x') {
+            r = -100;
+        }
+        sys_lseek(fd, 0, 0);
+        w = sys_write(fd as u64, p, 4096);
+        let mut pfd = [0i32; 2];
+        if sys_pipe2(pfd.as_mut_ptr(), 0) == 0 {
+            sys_write(pfd[1] as u64, fill.as_ptr(), 4096);
+            pr = sys_read(pfd[0] as u64, p, 4096);
+            let mut good = [0u8; 4096];
+            if sys_read(pfd[0] as u64, good.as_mut_ptr(), 4096) != 4096 {
+                pr = -200;
+            }
+            sys_close(pfd[0] as u64);
+            sys_close(pfd[1] as u64);
+        }
+        sys_munmap(base as u64, 4096);
+    }
+    sys_close(fd as u64);
+    sys_unlink(path.as_ptr());
+    if r == 2048 && w == 2048 && pr == -14 {
+        println(b"RW_STRADDLE:OK");
+    } else {
+        print(b"RW_STRADDLE:FAIL read=");
+        print_num(r);
+        print(b" write=");
+        print_num(w);
+        print(b" pipe read=");
+        print_num(pr);
+        println(b"");
+    }
+}
+
+/// writev to a sysctl whose second segment is unmapped: Linux copies a
+/// store's data whole or not at all (EFAULT), so "12" alone is never
+/// stored
+fn test_sysctl_partial_fault() {
+    let path = b"/proc/sys/vm/dirty_expire_centisecs\0";
+    let fd = sys_open(path.as_ptr(), O_RDWR, 0) as i32;
+    let mut before = [0u8; 32];
+    let nb = sys_read(fd as u64, before.as_mut_ptr(), 32);
+    let bad = sys_mmap(0, 4096, 0, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    let head = *b"12";
+    let iov = [
+        IoVec {
+            iov_base: head.as_ptr(),
+            iov_len: 2,
+        },
+        IoVec {
+            iov_base: bad as *const u8,
+            iov_len: 3,
+        },
+    ];
+    let w = sys_writev(fd as u64, iov.as_ptr(), 2);
+    let mut after = [0u8; 32];
+    sys_lseek(fd, 0, 0);
+    let na = sys_read(fd as u64, after.as_mut_ptr(), 32);
+    sys_munmap(bad as u64, 4096);
+    sys_close(fd as u64);
+    if fd >= 0 && w == -14 && nb > 0 && na == nb && before == after {
+        println(b"SYSCTL_PARTIAL_FAULT:OK");
+    } else {
+        print(b"SYSCTL_PARTIAL_FAULT:FAIL writev=");
+        print_num(w);
+        print(b" before/after len ");
+        print_num(nb);
+        print(b" ");
+        print_num(na);
+        println(b"");
+    }
+}
+
+/// RWF_NOWAIT on files Linux marks FMODE_NOWAIT (eventfd, timerfd,
+/// sockets): an empty one is EAGAIN without blocking
+fn test_rwf_nowait_streams() {
+    let mut buf = [0u8; 8];
+    let iov = [IoVec {
+        iov_base: buf.as_mut_ptr(),
+        iov_len: 8,
+    }];
+    let efd = hk_syscall::sys_eventfd2(0, 0);
+    let e = sys_preadv2(efd as i32, iov.as_ptr(), 1, -1, RWF_NOWAIT);
+    sys_close(efd as u64);
+    let tfd = hk_syscall::sys_timerfd_create(1, 0);
+    let t = sys_preadv2(tfd as i32, iov.as_ptr(), 1, -1, RWF_NOWAIT);
+    sys_close(tfd as u64);
+    let mut sv = [0i32; 2];
+    hk_syscall::sys_socketpair(1, 1, 0, &mut sv);
+    let k = sys_preadv2(sv[0], iov.as_ptr(), 1, -1, RWF_NOWAIT);
+    sys_close(sv[0] as u64);
+    sys_close(sv[1] as u64);
+    // timerfd took RWF_NOWAIT in Linux 6.10 (read_iter); before, the
+    // flag is EOPNOTSUPP there (hk follows current Linux)
+    let t_want = if super::helpers::linux_at_least(6, 10) {
+        -11
+    } else {
+        -95
+    };
+    if e == -11 && t == t_want && k == -11 {
+        println(b"RWF_NOWAIT_STREAMS:OK");
+    } else {
+        print(b"RWF_NOWAIT_STREAMS:FAIL eventfd ");
+        print_num(e);
+        print(b" timerfd ");
+        print_num(t);
+        print(b" socket ");
+        print_num(k);
         println(b"");
     }
 }

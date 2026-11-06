@@ -1,7 +1,7 @@
 //! execve implementation
 //!
 //! Replaces the current process image with a new program.
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use crate::arch::ArchPageTable;
 use crate::fs::file::flags::{AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW};
@@ -137,7 +137,7 @@ impl StackWriter<'_> {
 /// Entries of the auxiliary vector, AT_NULL included
 const AUXV_LEN: usize = 20;
 
-fn auxv(info: &ExecInfo, random: u64, execfn: u64, platform: u64) -> [(u64, u64); AUXV_LEN] {
+fn auxv(info: &ExecInfo<'_>, random: u64, execfn: u64, platform: u64) -> [(u64, u64); AUXV_LEN] {
     const AT_NULL: u64 = 0;
     const AT_PHDR: u64 = 3;
     const AT_PHENT: u64 = 4;
@@ -170,11 +170,11 @@ fn auxv(info: &ExecInfo, random: u64, execfn: u64, platform: u64) -> [(u64, u64)
         (AT_BASE, info.base),
         (AT_FLAGS, 0),
         (AT_ENTRY, info.entry),
-        (AT_UID, c.uid as u64),
-        (AT_EUID, c.euid as u64),
-        (AT_GID, c.gid as u64),
-        (AT_EGID, c.egid as u64),
-        (AT_SECURE, secure as u64),
+        (AT_UID, u64::from(c.uid)),
+        (AT_EUID, u64::from(c.euid)),
+        (AT_GID, u64::from(c.gid)),
+        (AT_EGID, u64::from(c.egid)),
+        (AT_SECURE, u64::from(secure)),
         (AT_RANDOM, random),
         (AT_HWCAP2, crate::arch::elf_hwcap2()),
         (AT_EXECFN, execfn),
@@ -196,7 +196,7 @@ fn setup_user_stack<FA: FrameAlloc<PhysAddr = u64>>(
     frame_alloc: &mut FA,
     argv: &[Vec<u8>],
     envp: &[Vec<u8>],
-    info: &ExecInfo,
+    info: &ExecInfo<'_>,
 ) -> Result<(MmLayout, u64), i32> {
     // Calculate stack pages based on RLIMIT_STACK
     let stack_limit = crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_STACK);
@@ -378,12 +378,13 @@ pub fn image_vmas(
 
 fn anon_vma(start: u64, end: u64, prot: u32) -> crate::mm::Vma {
     use crate::mm::{MAP_ANONYMOUS, MAP_PRIVATE, Vma, anon_vma::AnonVma};
+    // Past exec's point of no return: failure cannot be reported
     Vma::new_anon(
         start,
         end,
         prot,
         MAP_PRIVATE | MAP_ANONYMOUS,
-        AnonVma::new(),
+        crate::util::kalloc::arc_nofail(AnonVma::default()),
     )
 }
 
@@ -421,9 +422,9 @@ fn segment_vmas(elf: &ElfExecutable, base: u64, file: Option<&Arc<File>>) -> Vec
             continue;
         }
         let f = &seg.flags;
-        let prot = (f.read as u32 * PROT_READ)
-            | (f.write as u32 * PROT_WRITE)
-            | (f.execute as u32 * PROT_EXEC);
+        let prot = (u32::from(f.read) * PROT_READ)
+            | (u32::from(f.write) * PROT_WRITE)
+            | (u32::from(f.execute) * PROT_EXEC);
         let fm = mapped
             .as_ref()
             .and_then(|m| m[k])
@@ -493,7 +494,7 @@ fn interp_base(interp: &ElfExecutable, prog: &ElfExecutable, prog_base: u64) -> 
 /// Returns the end address of the highest loaded segment (for setting brk).
 fn load_elf_segments<FA: FrameAlloc<PhysAddr = u64>>(
     elf: &ElfExecutable,
-    image: &FileImage,
+    image: &FileImage<'_>,
     page_table: &mut ArchPageTable,
     frame_alloc: &mut FA,
     base_addr: u64,
@@ -602,7 +603,7 @@ fn load_elf_segments<FA: FrameAlloc<PhysAddr = u64>>(
 /// Apply ELF relocations for PIE binaries
 fn apply_relocations(
     elf: &ElfExecutable,
-    image: &FileImage,
+    image: &FileImage<'_>,
     base_addr: u64,
     page_table: &ArchPageTable,
 ) {
@@ -619,7 +620,7 @@ fn apply_relocations(
 
         if let Some(phys) = page_table.translate(target_vaddr) {
             unsafe {
-                let ptr = phys_to_virt(phys) as *mut u64;
+                let ptr = phys_to_virt(phys).cast::<u64>();
                 core::ptr::write_volatile(ptr, value);
             }
             // Text relocations land in code
@@ -1105,13 +1106,13 @@ pub fn sys_execve(pathname: u64, argv_ptr: u64, envp_ptr: u64) -> i64 {
     let mut budget = MAX_ARG_PAGES * PAGE_SIZE as usize;
     let argv = match copy_string_array_from_user(argv_ptr, 1024, &mut budget) {
         Ok(a) => a,
-        Err(e) => return -(e as i64),
+        Err(e) => return -i64::from(e),
     };
 
     // Copy envp from user space
     let envp = match copy_string_array_from_user(envp_ptr, 1024, &mut budget) {
         Ok(e) => e,
-        Err(e) => return -(e as i64),
+        Err(e) => return -i64::from(e),
     };
 
     // Get frame allocator
@@ -1120,7 +1121,7 @@ pub fn sys_execve(pathname: u64, argv_ptr: u64, envp_ptr: u64) -> i64 {
     // Do the exec - on success this never returns, on error returns negative errno
     let result = do_execve(path, argv, envp, &mut frame_alloc);
     // If we get here, exec failed - result is already negative
-    result as i64
+    i64::from(result)
 }
 
 /// sys_execveat - execute a program relative to a directory file descriptor
@@ -1140,7 +1141,7 @@ pub fn sys_execveat(dirfd: i32, pathname: u64, argv_ptr: u64, envp_ptr: u64, fla
     use crate::mm::frame_alloc::FrameAllocRef;
 
     if flags & !(AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW) != 0 {
-        return -(EINVAL as i64);
+        return -i64::from(EINVAL);
     }
     let path = match crate::fs::namei::getname(pathname, flags & AT_EMPTY_PATH != 0) {
         Ok(p) => p,
@@ -1149,11 +1150,11 @@ pub fn sys_execveat(dirfd: i32, pathname: u64, argv_ptr: u64, envp_ptr: u64, fla
     let mut budget = MAX_ARG_PAGES * PAGE_SIZE as usize;
     let argv = match copy_string_array_from_user(argv_ptr, 1024, &mut budget) {
         Ok(a) => a,
-        Err(e) => return -(e as i64),
+        Err(e) => return -i64::from(e),
     };
     let envp = match copy_string_array_from_user(envp_ptr, 1024, &mut budget) {
         Ok(e) => e,
-        Err(e) => return -(e as i64),
+        Err(e) => return -i64::from(e),
     };
     let name = exec_name(dirfd, &path);
     // Linux BINPRM_FLAGS_PATH_INACCESSIBLE: the program came through a
@@ -1167,7 +1168,14 @@ pub fn sys_execveat(dirfd: i32, pathname: u64, argv_ptr: u64, envp_ptr: u64, fla
             != 0;
     let open = |_: &[u8]| exec_lookup(dirfd, &path, flags).and_then(crate::fs::open_exec);
     let mut frame_alloc = FrameAllocRef(&FRAME_ALLOCATOR);
-    exec_file(name, open, inaccessible, argv, envp, &mut frame_alloc) as i64
+    i64::from(exec_file(
+        name,
+        open,
+        inaccessible,
+        argv,
+        envp,
+        &mut frame_alloc,
+    ))
 }
 
 /// bprm->filename for execveat: the path itself when absolute or from

@@ -91,7 +91,7 @@ fn parse(data: &[u8], off: usize) -> Result<Entry<'_>, CpioError> {
         uid: f(2)?,
         gid: f(3)?,
         nlink: f(4)?,
-        mtime: Timespec::from_secs(f(5)? as i64),
+        mtime: Timespec::from_secs(i64::from(f(5)?)),
         dev: (f(7)?, f(8)?),
         rdev: (f(9)?, f(10)?),
         name,
@@ -231,7 +231,7 @@ fn do_entry(root: &Arc<Dentry>, e: &Entry<'_>, links: &mut Links) -> Result<bool
 /// (rmdir for a directory); one of the same type is returned
 fn clean_path(parent: &Arc<Dentry>, dir: &Inode, name: &[u8], ty: u32) -> Option<Arc<Inode>> {
     let old = dir.i_op.lookup(dir, name).ok()?;
-    if old.mode().0 as u32 & S_IFMT == ty {
+    if u32::from(old.mode().0) & S_IFMT == ty {
         return Some(old);
     }
     let gone = if old.mode().is_dir() {
@@ -254,4 +254,86 @@ fn parse_hex(data: &[u8]) -> Result<u32, CpioError> {
 /// Align a value up to the given alignment
 fn align_up(value: usize, align: usize) -> usize {
     (value + align - 1) & !(align - 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A newc header for `name` with `body`, padded as the format pads
+    fn entry(mode: u32, name: &[u8], body: &[u8]) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(b"070701");
+        let fields = [
+            7,
+            mode,
+            1000,
+            100,
+            1,
+            12345,
+            body.len() as u32,
+            0,
+            1,
+            0,
+            0,
+            name.len() as u32 + 1,
+            0,
+        ];
+        for f in fields {
+            v.extend_from_slice(alloc::format!("{f:08X}").as_bytes());
+        }
+        v.extend_from_slice(name);
+        v.push(0);
+        v.resize(v.len().next_multiple_of(4), 0);
+        v.extend_from_slice(body);
+        v.resize(v.len().next_multiple_of(4), 0);
+        v
+    }
+
+    /// Header fields, name, body and the 4-byte aligned next entry
+    #[test]
+    fn parses_newc() {
+        let mut a = entry(0o100644, b"etc/hosts", b"127.0.0.1 x\n");
+        let second = a.len();
+        a.extend(entry(0o040755, b"dir", b""));
+        let e = parse(&a, 0).unwrap();
+        assert_eq!(
+            (e.ino, e.mode, e.uid, e.gid, e.nlink),
+            (7, 0o100644, 1000, 100, 1)
+        );
+        assert_eq!(e.name, b"etc/hosts");
+        assert_eq!(e.body, b"127.0.0.1 x\n");
+        assert_eq!(e.next, second);
+        let d = parse(&a, e.next).unwrap();
+        assert_eq!((d.name, d.body.len()), (&b"dir"[..], 0));
+        assert_eq!(d.next, a.len());
+    }
+
+    /// Bad magic, a zero name size, a header, name or body running past
+    /// the archive, and non-hex fields are errors, never a panic
+    #[test]
+    fn rejects_bad_input() {
+        let good = entry(0o100644, b"f", b"data");
+        let mut bad = good.clone();
+        bad[..6].copy_from_slice(b"070707");
+        assert!(matches!(parse(&bad, 0), Err(CpioError::InvalidMagic)));
+        assert!(matches!(
+            parse(&good[..100], 0),
+            Err(CpioError::BufferTooSmall)
+        ));
+        assert!(matches!(
+            parse(&good[..good.len() - 4], 0),
+            Err(CpioError::BufferTooSmall)
+        ));
+        let mut huge = good.clone();
+        huge[6 + 8 * 6..14 + 8 * 6].copy_from_slice(b"FFFFFFFF");
+        assert!(matches!(parse(&huge, 0), Err(CpioError::BufferTooSmall)));
+        let mut noname = good.clone();
+        noname[6 + 8 * 11..14 + 8 * 11].copy_from_slice(b"00000000");
+        assert!(matches!(parse(&noname, 0), Err(CpioError::InvalidHeader)));
+        let mut nothex = good;
+        nothex[6..14].copy_from_slice(b"0000000G");
+        assert!(matches!(parse(&nothex, 0), Err(CpioError::InvalidHeader)));
+        assert!(matches!(parse(b"", 0), Err(CpioError::BufferTooSmall)));
+    }
 }

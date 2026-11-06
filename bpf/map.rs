@@ -9,6 +9,7 @@
 //! - `BPF_MAP_TYPE_HASH`: Hash table with arbitrary keys
 //! - `BPF_MAP_TYPE_ARRAY`: Fixed-size array indexed by u32
 
+use crate::util::kalloc::try_arc;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -22,7 +23,7 @@ use crate::util::error::KernelError;
 // =============================================================================
 
 /// Unspecified map type
-#[allow(dead_code)]
+#[expect(dead_code)]
 pub const BPF_MAP_TYPE_UNSPEC: u32 = 0;
 /// Hash table map
 pub const BPF_MAP_TYPE_HASH: u32 = 1;
@@ -34,14 +35,14 @@ pub const BPF_MAP_TYPE_ARRAY: u32 = 2;
 // =============================================================================
 
 /// Create new element or update existing
-#[allow(dead_code)]
+#[allow(dead_code, reason = "UAPI flag value; BPF_ANY is the zero default")]
 pub const BPF_ANY: u64 = 0;
 /// Create new element only if it doesn't exist
 pub const BPF_NOEXIST: u64 = 1;
 /// Update existing element only
 pub const BPF_EXIST: u64 = 2;
 /// Update with spin_lock held
-#[allow(dead_code)]
+#[expect(dead_code)]
 pub const BPF_F_LOCK: u64 = 4;
 
 // =============================================================================
@@ -138,12 +139,12 @@ impl BpfHashMap {
             return Err(KernelError::InvalidArgument);
         }
 
-        Ok(Arc::new(Self {
+        try_arc(Self {
             data: IrqSpinlock::new(BTreeMap::new()),
             key_size,
             value_size,
             max_entries,
-        }))
+        })
     }
 }
 
@@ -279,8 +280,8 @@ impl BpfArrayMap {
         // Each entry: its lock and Vec header, and the value's kmalloc
         // class (powers of two from 16 bytes)
         let entry = core::mem::size_of::<IrqSpinlock<Vec<u8>>>() as u64
-            + (value_size as u64).next_power_of_two().max(16);
-        let bytes = max_entries as u64 * entry;
+            + u64::from(value_size).next_power_of_two().max(16);
+        let bytes = u64::from(max_entries) * entry;
         if bytes > prealloc_budget() {
             return Err(KernelError::OutOfMemory);
         }
@@ -294,11 +295,11 @@ impl BpfArrayMap {
             )?));
         }
 
-        Ok(Arc::new(Self {
+        try_arc(Self {
             data,
             value_size,
             max_entries,
-        }))
+        })
     }
 
     /// Convert key bytes to index
@@ -402,9 +403,9 @@ pub struct BpfMap {
 
 impl BpfMap {
     /// Create a new map container
-    pub fn new(ops: Arc<dyn BpfMapOps>, flags: u32) -> Arc<Self> {
+    pub fn new(ops: Arc<dyn BpfMapOps>, flags: u32) -> Result<Arc<Self>, KernelError> {
         let id = NEXT_MAP_ID.fetch_add(1, Ordering::Relaxed);
-        Arc::new(Self { id, ops, flags })
+        try_arc(Self { id, ops, flags })
     }
 
     /// Get the underlying map operations
@@ -472,7 +473,7 @@ pub fn create_map(
         _ => return Err(KernelError::InvalidArgument),
     };
 
-    Ok(BpfMap::new(ops, flags))
+    BpfMap::new(ops, flags)
 }
 
 #[cfg(test)]

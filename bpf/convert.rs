@@ -137,7 +137,7 @@ fn helper_size(code: u16) -> i32 {
 }
 
 /// A conditional jump (Linux's jt/jf cases)
-fn jump(f: &Insn, i: usize, map: &Map, o: &mut Out) -> Result<(), KernelError> {
+fn jump(f: &Insn, i: usize, map: &Map<'_>, o: &mut Out) -> Result<(), KernelError> {
     let op = (f.code & 0xf0) as u8;
     let (src, s_reg, imm) = if f.code & classic::X != 0 {
         (BPF_X, X, 0)
@@ -196,7 +196,7 @@ fn ld_abs(f: &Insn, o: &mut Out) {
 }
 
 /// Convert classic instruction `i`
-fn one(f: &Insn, i: usize, map: &Map, o: &mut Out) -> Result<(), KernelError> {
+fn one(f: &Insn, i: usize, map: &Map<'_>, o: &mut Out) -> Result<(), KernelError> {
     use classic::{
         ABS, ALU, DIV, IMM, IND, JA, JMP, LD, LDX, LDX_W_ABS, LEN, MEM, MISC, MOD, MSH, NEG, RET,
         ST, STX, TAX,
@@ -357,14 +357,14 @@ impl<E: classic::Env> interp::Env for ClassicEnv<'_, E> {
     fn call(&mut self, id: i32, a: [u64; 5]) -> Option<u64> {
         let load = |size| {
             let v = self.env.load(a[0] as i32, size);
-            Some(v.map_or(u64::MAX, |v| v as u64))
+            Some(v.map_or(u64::MAX, u64::from))
         };
         match id {
             helper::LD_B => load(1),
             helper::LD_H => load(2),
             helper::LD_W => load(4),
-            helper::ANC => Some(self.env.anc(a[0] as u32) as u64),
-            helper::LEN => Some(self.env.pkt_len() as u64),
+            helper::ANC => Some(u64::from(self.env.anc(a[0] as u32))),
+            helper::LEN => Some(u64::from(self.env.pkt_len())),
             _ => None,
         }
     }

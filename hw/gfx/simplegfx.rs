@@ -32,6 +32,7 @@ use crate::gfx::mode::{
 };
 use crate::gfx::{FramebufferInfo, PixelFormat};
 use crate::gfx::{GfxDriver, GfxError};
+use crate::util::kalloc::try_arc;
 
 /// SimpleDRM device state
 struct SimpleGfxState {
@@ -50,7 +51,7 @@ struct SimpleGfxState {
     /// The firmware framebuffer info
     fb_info: FramebufferInfo,
     /// Dumb buffer handle counter (for future use)
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     next_handle: u32,
     /// Dumb buffers (handle -> DumbBuffer)
     dumb_buffers: Vec<(u32, DumbBuffer)>,
@@ -73,7 +74,7 @@ impl SimpleGfxDevice {
     const BOOT_HANDLE: u32 = 1;
 
     /// Create a new SimpleDRM device from framebuffer info
-    pub fn new(fb_info: FramebufferInfo) -> Arc<Self> {
+    pub fn new(fb_info: FramebufferInfo) -> Result<Arc<Self>, GfxError> {
         // Create the display mode from framebuffer info
         let mode = GfxModeInfo::new(fb_info.width, fb_info.height, 60);
 
@@ -140,9 +141,10 @@ impl SimpleGfxDevice {
             dumb_buffers: vec![(Self::BOOT_HANDLE, boot_dumb)],
         };
 
-        Arc::new(Self {
+        try_arc(Self {
             state: Mutex::new(state),
         })
+        .map_err(|_| GfxError::NoMemory)
     }
 }
 
@@ -362,7 +364,7 @@ pub fn init_simplegfx() -> Option<u32> {
         fb_info.phys_addr
     );
 
-    let device = SimpleGfxDevice::new(fb_info);
+    let device = SimpleGfxDevice::new(fb_info).ok()?;
     let minor = crate::gfx::register_gfx_device(device).ok()?;
 
     Some(minor)

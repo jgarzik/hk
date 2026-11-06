@@ -12,6 +12,7 @@
 //! - `memory.stat`: Detailed breakdown (anon, file, kernel)
 //! - `memory.events`: OOM and limit events
 
+use crate::util::kalloc::try_arc;
 use alloc::format;
 use alloc::string::ToString;
 use alloc::sync::Arc;
@@ -84,7 +85,7 @@ impl CgroupSubsysOps for MemoryController {
         parent_css: Option<&Arc<CgroupSubsysState>>,
     ) -> Result<Arc<dyn CssPrivate>, KernelError> {
         let _ = parent_css;
-        Ok(Arc::new(MemoryState::new()))
+        Ok(try_arc(MemoryState::new())?)
     }
 
     fn css_free(&self, _css: &CgroupSubsysState) {

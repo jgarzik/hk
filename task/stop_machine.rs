@@ -72,7 +72,7 @@ pub fn stop_one_cpu(cpu: u32, func: fn(usize), arg: usize) -> bool {
             *w = Some(Work {
                 func,
                 arg,
-                done: &done,
+                done: &raw const done,
             });
             break;
         }
@@ -82,6 +82,13 @@ pub fn stop_one_cpu(cpu: u32, func: fn(usize), arg: usize) -> bool {
     st.wq.wake_all();
     done.wait();
     true
+}
+
+/// [`stop_one_cpu`] with a borrowed argument (the call waits, so `arg`
+/// outlives it)
+pub fn stop_one_cpu_ref<T: Sync>(cpu: u32, func: fn(&T), arg: &T) -> bool {
+    let call = (func, arg);
+    stop_one_cpu(cpu, crate::smp::call_ref::<T>, (&raw const call).addr())
 }
 
 /// Queue `func(arg)` on `cpu`'s stopper without waiting (Linux

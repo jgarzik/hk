@@ -281,7 +281,7 @@ impl KmemCache {
         pg.private.store(free as u64, Ordering::Relaxed);
         pg.inuse.store(0, Ordering::Relaxed);
         pg.mapping
-            .store(self as *const Self as u64, Ordering::Relaxed);
+            .store(core::ptr::from_ref::<Self>(self) as u64, Ordering::Relaxed);
         pg.set_flag(PG_SLAB);
         self.nr_slabs.fetch_add(1, Ordering::Relaxed);
         let mut l = self.list_lock.lock();
@@ -308,7 +308,7 @@ impl KmemCache {
     ///
     /// # Safety
     /// Interrupts are off until the returned borrow ends.
-    #[allow(clippy::mut_from_ref)]
+    #[expect(clippy::mut_from_ref)]
     unsafe fn array(&self) -> Option<&mut ArrayCache> {
         // SAFETY: only this CPU uses its cell, and interrupts are off
         this_cpu().map(|c| unsafe { &mut *self.cpu[c].0.get() })
@@ -758,7 +758,7 @@ pub mod tests {
     #[test]
     fn named_caches_take_their_exact_layout() {
         #[repr(align(64))]
-        #[allow(dead_code)]
+        #[expect(dead_code)]
         struct Odd([u8; 200]);
         assert_eq!(arc_of::<Odd>(), (320, 64));
         assert_eq!(arc_of::<u8>(), (24, 8));

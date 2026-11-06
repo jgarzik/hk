@@ -26,7 +26,7 @@ pub struct PortRange {
 impl Default for PortRange {
     fn default() -> Self {
         Self {
-            r: AtomicU32::new(((PORT_LO as u32) << 16) | PORT_HI as u32),
+            r: AtomicU32::new((u32::from(PORT_LO) << 16) | u32::from(PORT_HI)),
         }
     }
 }
@@ -39,7 +39,7 @@ impl PortRange {
 
     pub fn set(&self, lo: u16, hi: u16) {
         self.r
-            .store(((lo as u32) << 16) | hi as u32, Ordering::Relaxed);
+            .store((u32::from(lo) << 16) | u32::from(hi), Ordering::Relaxed);
     }
 }
 
@@ -139,8 +139,8 @@ fn secret() -> [u64; 2] {
 fn secret() -> [u64; 2] {
     *SECRET.call_once(|| {
         let r = || {
-            ((crate::random::get_random_u32() as u64) << 32)
-                | crate::random::get_random_u32() as u64
+            (u64::from(crate::random::get_random_u32()) << 32)
+                | u64::from(crate::random::get_random_u32())
                 | 1
         };
         [r(), r()]
@@ -196,7 +196,7 @@ pub fn ephemeral(
     if hi < lo {
         return None;
     }
-    let mut n = (hi - lo) as u32 + 1;
+    let mut n = u32::from(hi - lo) + 1;
     let step = if parity == Parity::Any || n == 1 {
         1
     } else {
@@ -204,9 +204,9 @@ pub fn ephemeral(
     };
     n &= !(step - 1);
     let words = [
-        f.proto as u64,
-        ((f.saddr.0 as u64) << 32) | f.daddr.0 as u64,
-        f.dport as u64,
+        u64::from(f.proto),
+        (u64::from(f.saddr.0) << 32) | u64::from(f.daddr.0),
+        u64::from(f.dport),
     ];
     let k = secret();
     let offset = siphash(k, &words) as u32;

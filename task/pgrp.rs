@@ -95,7 +95,7 @@ pub fn sys_setpgid(
 
     match super::percpu::set_task_pgid(caller_pid, target_pid, new_pgid, caller_sid) {
         Ok(()) => 0,
-        Err(errno) => -(errno as i64),
+        Err(errno) => -i64::from(errno),
     }
 }
 
@@ -113,6 +113,6 @@ pub fn sys_setpgid(
 pub fn sys_setsid(caller_pid: Pid) -> i64 {
     match super::percpu::create_session(caller_pid) {
         Ok(new_sid) => new_sid as i64,
-        Err(errno) => -(errno as i64),
+        Err(errno) => -i64::from(errno),
     }
 }

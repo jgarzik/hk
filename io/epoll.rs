@@ -29,6 +29,7 @@
 //! - `EPNESTED` (sleeping): the loop check and insert of an epoll target
 //!   (Linux epnested_mutex), with no spin lock held.
 
+use crate::util::kalloc::{try_arc, try_arc_cyclic};
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
@@ -125,7 +126,7 @@ impl EpRegs {
             self.item as usize,
         ));
         wq.add_wait_queue(e.as_ref());
-        self.entries.push((wq as *const WaitQueue, e));
+        self.entries.push((core::ptr::from_ref::<WaitQueue>(wq), e));
     }
 
     /// Keep `owner` alive while registered
@@ -177,7 +178,7 @@ impl EpItem {
         let Some(file) = self.file.upgrade() else {
             return 0;
         };
-        let revents = file.f_op.poll(&file, None) as u32;
+        let revents = u32::from(file.f_op.poll(&file, None));
         revents & (self.events.load(Ordering::Acquire) | EPOLLERR | EPOLLHUP)
     }
 
@@ -259,8 +260,8 @@ fn key(file: &Arc<File>, fd: Fd) -> (usize, Fd) {
 
 impl Eventpoll {
     /// Create a new epoll instance
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self {
+    pub fn new() -> Result<Arc<Self>, KernelError> {
+        try_arc(Self {
             lock: IrqSpinlock::new(EpInner {
                 items: BTreeMap::new(),
                 rdl: ArcList::new(),
@@ -298,7 +299,7 @@ impl Eventpoll {
         ev: &EpollEvent,
     ) -> Result<(), KernelError> {
         let k = key(file, fd);
-        let item = Arc::new_cyclic(|w: &Weak<EpItem>| EpItem {
+        let item = try_arc_cyclic(|w: &Weak<EpItem>| EpItem {
             rdlink: Link::new(),
             fd,
             file: Arc::downgrade(file),
@@ -312,7 +313,7 @@ impl Eventpoll {
                 owners: Vec::new(),
                 item: w.as_ptr(),
             }),
-        });
+        })?;
         {
             let mut inner = self.lock.lock();
             if inner.items.contains_key(&k) {
@@ -340,7 +341,7 @@ impl Eventpoll {
         };
         let revents = {
             let mut pt = PollTable::for_epoll(&mut local);
-            file.f_op.poll(file, Some(&mut pt)) as u32
+            u32::from(file.f_op.poll(file, Some(&mut pt)))
         };
         {
             let mut regs = item.regs.lock();
@@ -520,7 +521,7 @@ impl Eventpoll {
     /// Readiness of the epoll file itself (Linux ep_eventpoll_poll): an
     /// item on the ready list with an event; the queue it waits on is
     /// `poll_wq`
-    pub fn poll(&self, pt: Option<&mut PollTable>) -> u16 {
+    pub fn poll(&self, pt: Option<&mut PollTable<'_>>) -> u16 {
         if let Some(pt) = pt {
             pt.poll_wait(&self.poll_wq);
         }
@@ -534,7 +535,7 @@ impl Eventpoll {
                 // SAFETY: on the list, which holds an Arc to it
                 v.push(unsafe {
                     Arc::increment_strong_count(it);
-                    Arc::from_raw(it as *const EpItem)
+                    Arc::from_raw(core::ptr::from_ref::<EpItem>(it))
                 });
             }
             v
@@ -646,7 +647,7 @@ fn down_depth(
 /// How many epoll levels watch `ep` from above (Linux
 /// ep_get_upwards_depth_proc); bounded, as every insert checked it
 fn up_depth(ep: &Eventpoll, seen: &mut Seen) -> u32 {
-    let k = ep as *const Eventpoll as usize;
+    let k = core::ptr::from_ref::<Eventpoll>(ep) as usize;
     if let Some(&Some(d)) = seen.get(&k) {
         return d;
     }
@@ -691,15 +692,7 @@ impl FileOps for EpollFileOps {
         self
     }
 
-    fn read(&self, _file: &File, _buf: &mut [u8]) -> Result<usize, KernelError> {
-        Err(KernelError::InvalidArgument)
-    }
-
-    fn write(&self, _file: &File, _buf: &[u8]) -> Result<usize, KernelError> {
-        Err(KernelError::InvalidArgument)
-    }
-
-    fn poll(&self, file: &File, pt: Option<&mut PollTable>) -> u16 {
+    fn poll(&self, file: &File, pt: Option<&mut PollTable<'_>>) -> u16 {
         let Some(ep) = file.private_ref::<Eventpoll>() else {
             return crate::io::poll::POLLERR;
         };
@@ -709,7 +702,7 @@ impl FileOps for EpollFileOps {
 
 /// Create an epoll file
 pub fn create_epoll_file(eflags: i32) -> Result<Arc<File>, KernelError> {
-    let ep = Eventpoll::new();
+    let ep = Eventpoll::new()?;
     let mut file_flags = flags::O_RDWR;
     if eflags & EPOLL_CLOEXEC != 0 {
         file_flags |= flags::O_CLOEXEC;
@@ -719,7 +712,7 @@ pub fn create_epoll_file(eflags: i32) -> Result<Arc<File>, KernelError> {
         &EPOLL_FOPS,
         ep.clone(),
         file_flags,
-    );
+    )?;
     ep.file.call_once(|| Arc::downgrade(&file));
     Ok(file)
 }
@@ -770,8 +763,8 @@ pub fn sys_epoll_create1(eflags: i32) -> i64 {
         0
     };
     match table.alloc_with_flags(file, fd_flags, get_nofile_limit()) {
-        Ok(fd) => fd as i64,
-        Err(e) => -(e as i64),
+        Ok(fd) => i64::from(fd),
+        Err(e) => -i64::from(e),
     }
 }
 

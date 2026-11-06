@@ -3,7 +3,7 @@
 //! This module handles bringing up Application Processors (APs) on an SMP system.
 //! The Bootstrap Processor (BSP) uses INIT-SIPI-SIPI to wake each AP, which then
 //! executes a trampoline to transition from real mode to long mode.
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use ::core::sync::atomic::{AtomicU32, Ordering};
 
@@ -50,7 +50,7 @@ static AP_READY: AtomicU32 = AtomicU32::new(0);
 pub fn init<F: FrameAlloc<PhysAddr = u64>>(acpi: &AcpiInfo, frame_alloc: &mut F) -> usize {
     // Use existing LAPIC instance (already mapped via ioremap in main.rs)
     let lapic = LocalApic::get();
-    let bsp_apic_id = lapic.id() as u32;
+    let bsp_apic_id = u32::from(lapic.id());
 
     // Initialize BSP per-CPU data
     // Note: percpu uses u8 APIC ID for xAPIC compatibility
@@ -110,11 +110,11 @@ pub fn init<F: FrameAlloc<PhysAddr = u64>>(acpi: &AcpiInfo, frame_alloc: &mut F)
             let apic_id_offset = &raw const __ap_data_apic_id as usize - start;
 
             let base = phys_to_virt(TRAMPOLINE_ADDR);
-            let pml4_ptr = base.add(pml4_offset) as *mut u64;
-            let entry_ptr = base.add(entry_offset) as *mut u64;
-            let stack_ptr = base.add(stack_offset) as *mut u64;
-            let cpu_id_ptr = base.add(cpu_id_offset) as *mut u32;
-            let apic_id_ptr = base.add(apic_id_offset) as *mut u32;
+            let pml4_ptr = base.add(pml4_offset).cast::<u64>();
+            let entry_ptr = base.add(entry_offset).cast::<u64>();
+            let stack_ptr = base.add(stack_offset).cast::<u64>();
+            let cpu_id_ptr = base.add(cpu_id_offset).cast::<u32>();
+            let apic_id_ptr = base.add(apic_id_offset).cast::<u32>();
 
             core::ptr::write_volatile(pml4_ptr, cr3);
             core::ptr::write_volatile(entry_ptr, ap_entry as *const () as u64);
@@ -189,7 +189,7 @@ fn start_ap(lapic: &LocalApic, apic_id: u32) -> bool {
 
 /// Wait for an AP to signal ready
 fn wait_for_ap(timeout_ms: u32) -> bool {
-    let deadline = get_ticks() + timeout_ms as u64;
+    let deadline = get_ticks() + u64::from(timeout_ms);
 
     while get_ticks() < deadline {
         if AP_READY.load(Ordering::Acquire) != 0 {
@@ -232,8 +232,8 @@ fn delay_ms(ms: u32) {
 fn read_pit_count() -> u16 {
     // Latch count for channel 0
     super::io::outb(0x43, 0x00);
-    let low = super::io::inb(0x40) as u16;
-    let high = super::io::inb(0x40) as u16;
+    let low = u16::from(super::io::inb(0x40));
+    let high = u16::from(super::io::inb(0x40));
     (high << 8) | low
 }
 
@@ -251,7 +251,7 @@ fn get_ticks() -> u64 {
             options(nostack, preserves_flags)
         );
         // Divide by approximate cycles per ms (assume ~1GHz for rough timing)
-        (((high as u64) << 32) | (low as u64)) / 1_000_000
+        ((u64::from(high) << 32) | u64::from(low)) / 1_000_000
     }
 }
 

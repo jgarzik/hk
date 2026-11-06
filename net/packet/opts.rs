@@ -2,7 +2,7 @@
 //! packet_mc_add/drop) and the SO_ATTACH_FILTER family
 //! (net/core/sock.c, net/core/filter.c sk_attach_filter)
 
-use alloc::sync::Arc;
+use crate::util::kalloc::try_arc;
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 
@@ -217,7 +217,7 @@ fn set_filter(s: &PacketSock, opt: i32, v: OptIn) -> Result<(), KernelError> {
     match opt {
         SO_ATTACH_FILTER => {
             let f = read_fprog(v, locked)?;
-            *s.filter.write() = Some(Arc::new(f));
+            *s.filter.write() = Some(try_arc(f)?);
         }
         SO_DETACH_FILTER => {
             if locked {
@@ -263,7 +263,7 @@ fn read_fprog(v: OptIn, locked: bool) -> Result<Filter, KernelError> {
 /// getsockopt: SOL_PACKET options and SO_LOCK_FILTER
 pub fn get(s: &PacketSock, level: i32, opt: i32) -> Option<Result<OptOut, KernelError>> {
     match (level, opt) {
-        (SOL_SOCKET, SO_LOCK_FILTER) => Some(Ok(OptOut::Int(s.flag(pf::FILTER_LOCKED) as i32))),
+        (SOL_SOCKET, SO_LOCK_FILTER) => Some(Ok(OptOut::Int(i32::from(s.flag(pf::FILTER_LOCKED))))),
         (SOL_SOCKET, _) => None,
         (SOL_PACKET, _) => Some(get_packet(s, opt)),
         _ => Some(Err(KernelError::NoProtocolOption)),
@@ -271,7 +271,7 @@ pub fn get(s: &PacketSock, level: i32, opt: i32) -> Option<Result<OptOut, Kernel
 }
 
 fn get_packet(s: &PacketSock, opt: i32) -> Result<OptOut, KernelError> {
-    let flag = |f| Ok(OptOut::Int(s.flag(f) as i32));
+    let flag = |f| Ok(OptOut::Int(i32::from(s.flag(f))));
     match opt {
         PACKET_AUXDATA => flag(pf::AUXDATA),
         PACKET_ORIGDEV => flag(pf::ORIGDEV),

@@ -32,7 +32,7 @@
 //! unlock(bucket)
 //! sleep
 //! ```
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
@@ -202,7 +202,7 @@ impl FutexQ {
         Self {
             link: Link::new(),
             key: UnsafeCell::new(key),
-            task: &*crate::task::percpu::current() as *const Task,
+            task: &raw const *crate::task::percpu::current(),
             bitset,
             lock_ptr: AtomicPtr::new(core::ptr::null_mut()),
             _pin: PhantomPinned,
@@ -224,9 +224,9 @@ impl FutexQ {
     fn queue(self: Pin<&Self>, b: &FutexHashBucket, list: &mut List<QAdapter>) {
         // SAFETY: pinned until it is unlinked (unqueue or a waker,
         // and Drop)
-        unsafe { list.push_back(&*self) };
+        unsafe { list.push_back(&raw const *self) };
         self.lock_ptr.store(
-            b as *const FutexHashBucket as *mut FutexHashBucket,
+            core::ptr::from_ref::<FutexHashBucket>(b).cast_mut(),
             Ordering::Relaxed,
         );
     }
@@ -297,7 +297,7 @@ fn futex_clock_ns(realtime: bool) -> u64 {
     let ts = TIMEKEEPER.read(clock, TIMEKEEPER.get_read_cycles());
     (ts.sec as u64)
         .saturating_mul(1_000_000_000)
-        .saturating_add(ts.nsec as u64)
+        .saturating_add(u64::from(ts.nsec))
 }
 
 /// Sleep interruptibly until `queued()` turns false (a waker dequeued us),
@@ -731,11 +731,12 @@ pub fn futex_requeue(
         };
         op.run(b1, &mut l, b2, None, &mut to_wake)
     } else {
-        let (first, second) = if (b1 as *const FutexHashBucket) < (b2 as *const _) {
-            (b1, b2)
-        } else {
-            (b2, b1)
-        };
+        let (first, second) =
+            if core::ptr::from_ref::<FutexHashBucket>(b1) < core::ptr::from_ref(b2) {
+                (b1, b2)
+            } else {
+                (b2, b1)
+            };
         let mut g1 = first.waiters.lock();
         let mut g2 = second.waiters.lock();
         let (l1, l2) = if core::ptr::eq(first, b1) {
@@ -811,7 +812,7 @@ impl Requeue {
                     b1.dec_waiters();
                     b2.inc_waiters();
                     q.lock_ptr.store(
-                        b2 as *const FutexHashBucket as *mut FutexHashBucket,
+                        core::ptr::from_ref::<FutexHashBucket>(b2).cast_mut(),
                         Ordering::Release,
                     );
                 }
@@ -1107,7 +1108,7 @@ const FUTEX_WAITV_MAX: usize = 128;
 
 /// FUTEX2 size flags
 mod futex2 {
-    #![allow(dead_code)]
+    #![expect(dead_code)]
     pub const SIZE_U8: u32 = 0x00;
     pub const SIZE_U16: u32 = 0x01;
     pub const SIZE_U32: u32 = 0x02;
@@ -1203,7 +1204,7 @@ pub fn sys_futex_waitv(
     let entry_size = core::mem::size_of::<UserFutexWaitv>() as u64;
 
     for i in 0..nr_futexes {
-        let entry_ptr = waiters_ptr + (i as u64) * entry_size;
+        let entry_ptr = waiters_ptr + u64::from(i) * entry_size;
 
         // Read the futex_waitv struct from userspace
         let val = match read_user_u64(entry_ptr) {

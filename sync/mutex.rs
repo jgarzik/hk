@@ -10,7 +10,7 @@
 //! (any, or SIGKILL) is pending while they would sleep; a waiter that
 //! gives up after an unlock picked it passes the wakeup on to the next
 //! (`WaitQueue` exclusive waits). `try_lock` (Linux mutex_trylock) never sleeps.
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use core::cell::UnsafeCell;
 use core::marker::PhantomData;
@@ -28,13 +28,18 @@ const UNLOCKED: u64 = 0;
 const NO_TASK: u64 = u64::MAX;
 
 /// Sleeping mutual-exclusion lock
+///
+/// # Invariants
+/// `data` is accessed only by the holder: the task whose id (or
+/// `NO_TASK` before tasks exist) `owner` holds; `owner` is `UNLOCKED`
+/// when nobody holds it.
 pub struct Mutex<T> {
     owner: AtomicU64,
     wq: WaitQueue,
     data: UnsafeCell<T>,
 }
 
-// SAFETY: access to `data` is serialized by `owner`
+// SAFETY: access to `data` is serialized by `owner` (type invariant)
 unsafe impl<T: Send> Send for Mutex<T> {}
 unsafe impl<T: Send> Sync for Mutex<T> {}
 
@@ -183,6 +188,20 @@ impl<T> DerefMut for MutexGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut T {
         // SAFETY: the guard holds the lock
         unsafe { &mut *self.m.data.get() }
+    }
+}
+
+impl<T> crate::sync::waitqueue::Relock for MutexGuard<'_, T> {
+    fn unlocked<R>(&mut self, f: impl FnOnce() -> R) -> R {
+        // SAFETY: the guard holds the lock; `relock` takes it again
+        // before the guard is used or dropped
+        unsafe { self.m.unlock_raw() };
+        // However `f` ends, unwinding included (host tests unwind)
+        let m = self.m;
+        let relock = crate::util::scope::ScopeGuard::new(|()| m.lock_raw());
+        let r = f();
+        drop(relock);
+        r
     }
 }
 

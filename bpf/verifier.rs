@@ -177,7 +177,7 @@ fn mem_ok(insn: &BpfInsn) -> bool {
         (BPF_ST, BPF_MEM) => src == 0,
         (BPF_STX, BPF_MEM) => imm == 0,
         (BPF_STX, BPF_ATOMIC) => {
-            let ops = [BPF_ADD, BPF_OR, BPF_AND, BPF_XOR].map(|o| o as i32);
+            let ops = [BPF_ADD, BPF_OR, BPF_AND, BPF_XOR].map(i32::from);
             matches!(bpf_size(code), BPF_W | BPF_DW)
                 && (ops.contains(&(imm & !BPF_FETCH)) || imm == BPF_XCHG || imm == BPF_CMPXCHG)
         }
@@ -228,9 +228,9 @@ fn successors(insns: &[BpfInsn], pc: usize) -> (Option<usize>, Option<isize>) {
     match bpf_op(insn.code) {
         BPF_EXIT => (None, None),
         BPF_CALL => (Some(pc + 1), None),
-        BPF_JA if class == BPF_JMP32 => (None, off(insn.imm as i64)),
-        BPF_JA => (None, off(insn.off as i64)),
-        _ => (Some(pc + 1), off(insn.off as i64)),
+        BPF_JA if class == BPF_JMP32 => (None, off(i64::from(insn.imm))),
+        BPF_JA => (None, off(i64::from(insn.off))),
+        _ => (Some(pc + 1), off(i64::from(insn.off))),
     }
 }
 
@@ -330,9 +330,9 @@ impl Checker<'_> {
         let src = if bpf_src(code) == BPF_X {
             read(st.regs[s])?
         } else if w64 {
-            Val::Scalar(Some(insn.imm as i64 as u64))
+            Val::Scalar(Some(i64::from(insn.imm) as u64))
         } else {
-            Val::Scalar(Some(insn.imm as u32 as u64))
+            Val::Scalar(Some(u64::from(insn.imm as u32)))
         };
         if op == BPF_MOV && insn.off == 0 && w64 {
             return Ok(src);
@@ -384,7 +384,7 @@ impl Checker<'_> {
         let Val::Ptr(r, o) = read(base)? else {
             return acces();
         };
-        let at = o as i64 + off as i64;
+        let at = i64::from(o) + i64::from(off);
         let size = size as i64;
         match r {
             Region::Ctx if !write && at >= 0 && at + size <= self.kind.ctx_size as i64 => {
@@ -484,7 +484,7 @@ impl Checker<'_> {
         let b = if bpf_src(insn.code) == BPF_X {
             read(st.regs[insn.src_reg() as usize])?
         } else {
-            Val::Scalar(Some(insn.imm as i64 as u64))
+            Val::Scalar(Some(i64::from(insn.imm) as u64))
         };
         let w32 = bpf_class(insn.code) == BPF_JMP32;
         Ok(match (a, b) {
@@ -533,7 +533,7 @@ impl Checker<'_> {
                     BPF_ALU | BPF_ALU64 => st.regs[d] = self.alu(insn, &st)?,
                     BPF_LDX => self.load(insn, &mut st)?,
                     BPF_ST => {
-                        let v = Val::Scalar(Some(insn.imm as i64 as u64));
+                        let v = Val::Scalar(Some(i64::from(insn.imm) as u64));
                         self.store(insn, &mut st, v)?;
                     }
                     BPF_STX if bpf_mode(insn.code) == BPF_ATOMIC => self.atomic(insn, &mut st)?,
@@ -542,8 +542,8 @@ impl Checker<'_> {
                         self.store(insn, &mut st, v)?;
                     }
                     BPF_LD => {
-                        let hi = self.insns[pc + 1].imm as u32 as u64;
-                        st.regs[d] = Val::Scalar(Some(hi << 32 | insn.imm as u32 as u64));
+                        let hi = u64::from(self.insns[pc + 1].imm as u32);
+                        st.regs[d] = Val::Scalar(Some(hi << 32 | u64::from(insn.imm as u32)));
                     }
                     _ => match bpf_op(insn.code) {
                         BPF_EXIT => {
@@ -590,8 +590,8 @@ impl Checker<'_> {
 
 /// `r + o + c` if it stays a sane offset
 fn offset(r: Region, o: i32, c: u64) -> Result<Val, KernelError> {
-    let v = o as i64 + c as i64;
-    if (i16::MIN as i64..=i16::MAX as i64).contains(&v) {
+    let v = i64::from(o) + c as i64;
+    if (i64::from(i16::MIN)..=i64::from(i16::MAX)).contains(&v) {
         Ok(Val::Ptr(r, v as i32))
     } else {
         acces()

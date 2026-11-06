@@ -2,7 +2,7 @@
 //!
 //! This module provides per-CPU data storage accessed via the TPIDR_EL1 register.
 //! Each CPU has its own `PerCpu` structure containing CPU-local state.
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use core::arch::asm;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -291,7 +291,7 @@ pub fn preempt_enable() {
 
 /// Check if preemption is currently disabled
 #[inline]
-#[allow(dead_code)] // Utility function for future use and debugging
+#[expect(dead_code)] // Utility function for future use and debugging
 pub fn preempt_disabled() -> bool {
     try_current_cpu()
         .map(|percpu| percpu.preempt_count.load(Ordering::Relaxed) > 0)
@@ -300,7 +300,6 @@ pub fn preempt_disabled() -> bool {
 
 /// Get the current preempt_count value (for debugging)
 #[inline]
-#[allow(dead_code)] // Utility function for future use and debugging
 pub fn preempt_count() -> u32 {
     try_current_cpu()
         .map(|percpu| percpu.preempt_count.load(Ordering::Relaxed))

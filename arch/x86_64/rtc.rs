@@ -98,16 +98,16 @@ pub fn read_rtc() -> i64 {
     let month = if is_bcd { bcd_to_bin(month) } else { month };
 
     // Assume 21st century (year 00-99 -> 2000-2099)
-    let year_full = 2000 + year as i64;
+    let year_full = 2000 + i64::from(year);
 
     // A time the clock cannot hold starts the system at 0 (Linux
     // rtc_valid_tm, then mach_get_cmos_time)
     let (month, day, hour, min, sec) = (
-        month as i64,
-        day as i64,
-        hour as i64,
-        min as i64,
-        sec as i64,
+        i64::from(month),
+        i64::from(day),
+        i64::from(hour),
+        i64::from(min),
+        i64::from(sec),
     );
     if !valid(year_full, month, day, hour, min, sec) {
         return 0;
@@ -126,7 +126,7 @@ fn valid(year: i64, month: i64, day: i64, hour: i64, min: i64, sec: i64) -> bool
     if !(1..=12).contains(&month) || year < 1970 {
         return false;
     }
-    let mdays = DAYS_IN_MONTH[(month - 1) as usize] + (month == 2 && is_leap_year(year)) as i64;
+    let mdays = DAYS_IN_MONTH[(month - 1) as usize] + i64::from(month == 2 && is_leap_year(year));
     (1..=mdays).contains(&day) && hour < 24 && min < 60 && sec < 60 && hour >= 0
 }
 

@@ -54,11 +54,11 @@ pub const SIN_LEN: usize = 16;
 pub fn create(stype: i32, protocol: i32) -> Result<Arc<dyn ProtoOps>, KernelError> {
     match stype {
         SOCK_STREAM => match protocol {
-            IPPROTO_IP | IPPROTO_TCP => Ok(crate::net::tcp::create()),
+            IPPROTO_IP | IPPROTO_TCP => crate::net::tcp::create(),
             _ => Err(KernelError::ProtocolNotSupported),
         },
         SOCK_DGRAM => match protocol {
-            IPPROTO_IP | IPPROTO_UDP => Ok(crate::net::udp::create()),
+            IPPROTO_IP | IPPROTO_UDP => crate::net::udp::create(),
             IPPROTO_ICMP => crate::net::ping::create(),
             _ => Err(KernelError::ProtocolNotSupported),
         },
@@ -248,18 +248,18 @@ impl Inet {
     /// getsockopt(SOL_IP)
     pub fn getsockopt(&self, opt: i32) -> Result<OptOut, KernelError> {
         let v = match opt {
-            IP_TOS => self.tos() as i32,
-            IP_TTL => self.ttl() as i32,
-            IP_PKTINFO => self.flag(ipf::PKTINFO) as i32,
-            IP_RECVTTL => self.flag(ipf::RECVTTL) as i32,
-            IP_RECVTOS => self.flag(ipf::RECVTOS) as i32,
-            IP_RECVERR => self.flag(ipf::RECVERR) as i32,
-            IP_FREEBIND => self.flag(ipf::FREEBIND) as i32,
-            IP_BIND_ADDRESS_NO_PORT => self.flag(ipf::BIND_NO_PORT) as i32,
-            IP_MTU_DISCOVER => self.pmtudisc.load(Ordering::Acquire) as i32,
-            IP_MULTICAST_TTL => self.mc_ttl.load(Ordering::Acquire) as i32,
-            IP_MULTICAST_LOOP => self.flag(ipf::MC_LOOP) as i32,
-            IP_HDRINCL => self.flag(ipf::HDRINCL) as i32,
+            IP_TOS => i32::from(self.tos()),
+            IP_TTL => i32::from(self.ttl()),
+            IP_PKTINFO => i32::from(self.flag(ipf::PKTINFO)),
+            IP_RECVTTL => i32::from(self.flag(ipf::RECVTTL)),
+            IP_RECVTOS => i32::from(self.flag(ipf::RECVTOS)),
+            IP_RECVERR => i32::from(self.flag(ipf::RECVERR)),
+            IP_FREEBIND => i32::from(self.flag(ipf::FREEBIND)),
+            IP_BIND_ADDRESS_NO_PORT => i32::from(self.flag(ipf::BIND_NO_PORT)),
+            IP_MTU_DISCOVER => i32::from(self.pmtudisc.load(Ordering::Acquire)),
+            IP_MULTICAST_TTL => i32::from(self.mc_ttl.load(Ordering::Acquire)),
+            IP_MULTICAST_LOOP => i32::from(self.flag(ipf::MC_LOOP)),
+            IP_HDRINCL => i32::from(self.flag(ipf::HDRINCL)),
             _ => return Err(KernelError::NoProtocolOption),
         };
         Ok(OptOut::Int(v))
@@ -276,7 +276,7 @@ impl Inet {
             c.put(SOL_IP, IP_PKTINFO, &b);
         }
         if self.flag(ipf::RECVTTL) {
-            c.put(SOL_IP, IP_TTL, &(info.ttl as i32).to_ne_bytes());
+            c.put(SOL_IP, IP_TTL, &i32::from(info.ttl).to_ne_bytes());
         }
         if self.flag(ipf::RECVTOS) {
             c.put(SOL_IP, IP_TOS, &[info.tos]);
@@ -403,7 +403,7 @@ pub fn bind_check(
 /// msg_name, `payload` (its transport payload as quoted) the data
 pub fn ip_icmp_error(
     sk: &Sock,
-    e: &crate::net::icmp::IcmpErr,
+    e: &crate::net::icmp::IcmpErr<'_>,
     errno: KernelError,
     port: u16,
     payload: &[u8],
@@ -449,7 +449,7 @@ pub fn ip_local_error(
 pub fn ip_recv_error(
     sk: &Sock,
     inet: &Inet,
-    m: &mut crate::net::msg::RecvMsg,
+    m: &mut crate::net::msg::RecvMsg<'_>,
 ) -> Result<usize, KernelError> {
     use crate::net::msg::{MSG_ERRQUEUE, MSG_TRUNC};
     let e = sk.dequeue_err().ok_or(KernelError::WouldBlock)?;

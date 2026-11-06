@@ -13,12 +13,12 @@ belongs to doc/ROADMAP.md phase M1, the rest to S1.
 | 1 | Drop `new_without_default` boilerplate | about -420 | ~0 (compiler-checked) | high |
 | 2 | `SysRet` trait + `From<UaccessError>`: `?` in `sys_*` | about -750 | low-med (errno mapping) | high |
 | 3 | let-else for `match {Some(x)=>x, None=>return}` | about -288 | ~0 | high |
-| 4 | `#[expect]` / delete dead code behind `allow(dead_code)` | about -200 | ~0 | high |
+| 4 | Delete the dead code behind `expect(dead_code)` | about -100 | ~0 | high |
 | 5 | Struct update `..Default::default()` / `..zeroed()` | -300 (kernel) / -120 (user) | low | med |
 | 6 | `bool::then` / `then_some` for `if c {Some(x)} else {None}` | -70 | low (eager eval) | med |
 | 7 | One `util/bytes` LE/BE reader on `first_chunk` | -40 | low | low |
 | 8 | `next_power_of_two` / `next_multiple_of` for hand-rolled ones | -25 | low (overflow) | low |
-| 9 | Pointer-API lints (`&raw`, `.cast()`, `ptr::from_ref`) | 0 | 0 | med (policy) |
+| 9 | Last pointer-API gaps (`addr_of!`, `phys_to_virt` provenance, xhci MMIO) | 0 | 0 | low |
 
 Order: 1 and 4 are mechanical, one commit each. 2 goes per subsystem (M1) and also
 removes most of item 3's `sysret` sites; then 3 on the rest, with its lint on.
@@ -158,24 +158,17 @@ removes most of item 3's `sysret` sites; then 3 on the rest, with its lint on.
   saving is 1 to 3 lines per site. Do item 2 first in syscall code, where `?` beats
   let-else.
 
-## 4. `#[expect(dead_code)]` (1.81) and deleting what it hides
+## 4. Deleting what `expect(dead_code)` hides
 
-- **Evidence:** over a hundred `#[allow(dead_code)]`, 0 `#[expect]`. STYLE.md says
-  "No dead or speculative code". Most of the allows are stale; dozens of items are
-  really dead on both arches. Examples: `ADJ_OFFSET`, `TIME_INS..WAIT`
-  (time/time_syscall.rs:954-977); `gfx_io/ior/iow` (gfx/ioctl.rs:19-32);
-  `cmdline_console_count`/`get_cmdline_console`/`primary_cmdline_console`
-  (cmdline.rs:230-251); `get_last_cluster`, `update_dir_entry_size` (fs/vfat.rs:718,
-  1272); `BPF_ANY`, `BPF_F_LOCK` (bpf/map.rs); unused fields in io/inotify.rs:156,
-  io/fanotify.rs:249-315, ipc/msg.rs:63-74.
-- **Action:**
-  - Remove the stale allows (about -90 lines).
-  - Delete the dead items (about -100 lines).
-  - Anything kept for ABI completeness gets
-    `#[expect(dead_code, reason = "uapi constant")]`, so it warns once it becomes used.
-  - Arch-only deadness gets `cfg_attr(target_arch=..., expect(..))`, or the item moves
-    into `arch/`.
-  - Do the same for the 4 `allow(unused_imports)` and 2 `allow(unused_variables)`.
+- **Evidence:** 56 `#[expect(dead_code)]` remain (the stale allows are gone; the
+  lint now proves each one hides something). STYLE.md says "No dead or speculative
+  code". Examples: `ADJ_OFFSET`, `TIME_INS..WAIT` (time/time_syscall.rs);
+  `gfx_io/ior/iow` (gfx/ioctl.rs); `cmdline_console_count`/`get_cmdline_console`/
+  `primary_cmdline_console` (cmdline.rs); `get_last_cluster`,
+  `update_dir_entry_size` (fs/vfat.rs); unused fields in io/inotify.rs,
+  io/fanotify.rs, ipc/msg.rs.
+- **Action:** delete the dead items (about -100 lines); what stays for ABI
+  completeness gets `reason = "uapi constant"`.
 - **Risk:** none. Check `cargo test` (host) as well, since tests can be the only user.
 
 ## 5. Struct update syntax: `..Default::default()` / `..FromBytes::zeroed()`
@@ -271,24 +264,15 @@ removes most of item 3's `sysret` sites; then 3 on the rest, with its lint on.
   on hot paths with a runtime power-of-two.
 - `is_multiple_of`: 27 `% a == 0` / `& (a-1) == 0` sites. Readability only, 0 LOC.
 
-## 9. Pointer APIs: enforce UNSAFE.md rule 7 with lints (0 LOC, policy)
+## 9. Pointer APIs: the last rule-7 gaps (0 LOC)
 
-- UNSAFE.md mandates `&raw` and the provenance APIs. Clippy's pointer lints flag:
-  - `borrow_as_ptr` 57 (`&x as *const T`, should be `&raw const x`, 1.82)
-  - `ptr_as_ptr` 114 (should be `.cast()`)
-  - `ref_as_ptr` 55 (should be `ptr::from_ref`, 1.76)
-  - `ptr_cast_constness` 34 (should be `cast_mut`/`cast_const`)
-- One `addr_of!` is left at hw/usb/xhci.rs:603; rule 7 forbids it.
-- The `phys_to_virt` chokepoints (arch/x86_64/paging.rs:61, arch/aarch64/paging.rs:69)
-  do `(phys + PAGE_OFFSET) as *mut u8`. Rule 7 says they use
-  `with_exposed_provenance_mut` (1.84). The semantics are the same, but the code and
-  the doc disagree.
-- hw/usb/xhci.rs:777-823 does MMIO through `(base + off) as *const u32` integers,
-  not `IoMem` (rule 8 / rule 2 wrapper).
-- **Action:** add `borrow_as_ptr`, `ptr_as_ptr`, `ref_as_ptr` and
-  `ptr_cast_constness` as `warn` to `[workspace.lints.clippy]` after a
-  machine-applicable `clippy --fix` pass. Medium priority: it hardens `unsafe`, it
-  does not shrink code.
+The pointer lints (`borrow_as_ptr`, `ptr_as_ptr`, `ref_as_ptr`,
+`ptr_cast_constness`) are on. Left:
+- One `addr_of!` at hw/usb/xhci.rs:610; rule 7 forbids it.
+- The `phys_to_virt` chokepoints (arch/x86_64/paging.rs, arch/aarch64/paging.rs)
+  do `(phys + PAGE_OFFSET) as *mut u8`; rule 7 says `with_exposed_provenance_mut`.
+- hw/usb/xhci.rs does MMIO through `(base + off) as *const u32` integers, not
+  `IoMem` (rule 8 / rule 2 wrapper).
 
 ## Smaller, optional
 

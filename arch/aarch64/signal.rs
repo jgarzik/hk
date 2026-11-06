@@ -22,8 +22,6 @@
 //! The FP/SIMD registers come from (and rt_sigreturn writes them back to)
 //! the task's EL0 trap frame, where they live while it is in the kernel.
 
-#![allow(dead_code)]
-
 use crate::arch::Uaccess;
 use crate::signal::{KSigInfo, SigAction, SigHandler, SigSet, sa_flags};
 use crate::uaccess::{UaccessArch, copy_to_user};
@@ -429,7 +427,7 @@ pub fn setup_rt_frame(
     // The handler is not entered by an indirect branch (Linux
     // setup_return clears BTYPE)
     regs.spsr &= !PSTATE_BTYPE;
-    regs.x[0] = sig as u64; // x0 = signal number
+    regs.x[0] = u64::from(sig); // x0 = signal number
     regs.x[1] = info_addr; // x1 = &siginfo
     regs.x[2] = uc_addr; // x2 = &ucontext
     regs.x[29] = record_addr; // x29 = frame record

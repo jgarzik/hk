@@ -131,7 +131,7 @@ impl HrTimer {
         }
         let cpu = crate::cpu::try_this_id().unwrap_or(0);
         let want = base_of(cpu, self.flags);
-        let p = want as *const HrBase as *mut HrBase;
+        let p = core::ptr::from_ref::<HrBase>(want).cast_mut();
         match self.base.compare_exchange(
             core::ptr::null_mut(),
             p,
@@ -168,10 +168,12 @@ impl HrTimer {
         // callback is running on the old one (cancel_sync waits there)
         if let Some(cpu) = crate::cpu::try_this_id() {
             let here = base_of(cpu, self.flags);
-            let me = &*self as *const HrTimer as *mut HrTimer;
+            let me = (&raw const *self).cast_mut();
             if !core::ptr::eq(base, here) && base.running.load(Ordering::Acquire) != me {
-                self.base
-                    .store(here as *const HrBase as *mut HrBase, Ordering::Release);
+                self.base.store(
+                    core::ptr::from_ref::<HrBase>(here).cast_mut(),
+                    Ordering::Release,
+                );
                 drop(q);
                 base = here;
                 q = here.q.lock();
@@ -198,7 +200,7 @@ impl HrTimer {
     /// Stop it and wait out a running callback (Linux hrtimer_cancel);
     /// thread context unless HARD, never from its own callback
     pub fn cancel_sync(&self) -> bool {
-        let me = self as *const HrTimer as *mut HrTimer;
+        let me = core::ptr::from_ref::<HrTimer>(self).cast_mut();
         let mut was = false;
         loop {
             let Some((base, mut q)) = self.lock_base() else {
@@ -250,7 +252,7 @@ impl HrQueues {
             if x.expires.load(Ordering::Relaxed) > e {
                 break;
             }
-            after = Some(x as *const HrTimer);
+            after = Some(core::ptr::from_ref::<HrTimer>(x));
         }
         // SAFETY: pinned (callers take Pin), on no list
         unsafe {
@@ -294,7 +296,7 @@ impl HrQueues {
                 // SAFETY: queued timers are live
                 .map(|t| unsafe { (*t).expires.load(Ordering::Relaxed) })
         };
-        let real = head(&self.real).map(|e| (e as i128 - off).max(0) as u64);
+        let real = head(&self.real).map(|e| (i128::from(e) - off).max(0) as u64);
         match (head(&self.mono), real) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
@@ -328,7 +330,7 @@ impl HrBase {
             let Some(p) = q.pop_due(mono, real) else {
                 break;
             };
-            self.running.store(p as *mut HrTimer, Ordering::Release);
+            self.running.store(p.cast_mut(), Ordering::Release);
             drop(q);
             // SAFETY: a queued timer is live (its drop unlinks it), and
             // stays so while `running` names it (cancel_sync)
@@ -365,7 +367,8 @@ static SOFT_ACTIVATED: PerCpu<AtomicBool> = crate::percpu![AtomicBool::new(false
 /// The CPU whose base `b` is
 fn base_cpu(b: &HrBase) -> u32 {
     let first = BASES.get(0).as_ptr() as usize;
-    ((b as *const HrBase as usize - first) / core::mem::size_of::<[HrBase; 2]>()) as u32
+    ((core::ptr::from_ref::<HrBase>(b) as usize - first) / core::mem::size_of::<[HrBase; 2]>())
+        as u32
 }
 
 fn base_of(cpu: u32, flags: u8) -> &'static HrBase {
@@ -376,7 +379,7 @@ fn base_of(cpu: u32, flags: u8) -> &'static HrBase {
 /// (interrupts off)
 fn reprogram(cpu: u32) {
     let mono = crate::time::monotonic_ns();
-    let off = crate::time::realtime_ns() as i128 - mono as i128;
+    let off = i128::from(crate::time::realtime_ns()) - i128::from(mono);
     let [hard, soft] = BASES.get(cpu);
     // SOFT timers handed to ktimers/N are its to run (SOFT_ACTIVATED)
     let bases: &[&HrBase] = match SOFT_ACTIVATED.get(cpu).load(Ordering::Relaxed) {
@@ -472,7 +475,7 @@ pub fn schedule_hrtimeout(deadline: Option<u64>, clock: HrClock) -> bool {
         return true;
     }
     let t = core::pin::pin!(HrTimer::new(wakeup_fire, HRTIMER_HARD));
-    t.set_data(&*crate::task::percpu::current() as *const _ as usize);
+    t.set_data(&raw const *crate::task::percpu::current() as usize);
     t.as_ref().start(d, clock);
     crate::task::percpu::schedule();
     t.cancel_sync();

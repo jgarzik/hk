@@ -164,7 +164,11 @@ pub fn check_change(tty: &Tty, sig: u32) -> Result<(), KernelError> {
     };
     let fg = {
         let c = tty.ctrl.lock();
-        if !c.session.as_deref().is_some_and(|t| core::ptr::eq(t, &*s)) {
+        if !c
+            .session
+            .as_deref()
+            .is_some_and(|t| core::ptr::eq(t, &raw const *s))
+        {
             return Ok(());
         }
         c.pgrp.clone()
@@ -217,7 +221,11 @@ pub fn tiocspgrp(tty: &Tty, pgrp: i32) -> Result<(), KernelError> {
     let table = TASKLIST.read();
     let (_, s) = pids(&table).ok_or(KernelError::NotTty)?;
     let mut c = tty.ctrl.lock();
-    if !c.session.as_deref().is_some_and(|t| core::ptr::eq(t, &*s)) {
+    if !c
+        .session
+        .as_deref()
+        .is_some_and(|t| core::ptr::eq(t, &raw const *s))
+    {
         return Err(KernelError::NotTty);
     }
     let pg = pg.ok_or(KernelError::NoProcess)?;

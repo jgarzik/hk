@@ -3,7 +3,7 @@
 //! Provides a text console that renders to a DRM scanout surface.
 //! This console implements the ConsoleDriver trait and can be registered
 //! as a kernel console alongside serial.
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use core::ptr;
 
@@ -52,7 +52,7 @@ impl ScanoutSurface {
         // writes past the mapping)
         let bpp = fb_info.format.bytes_per_pixel().max(1);
         let pitch = fb_info.pitch.max(1);
-        let rows = (fb_info.size / pitch as u64).min(u32::MAX as u64) as u32;
+        let rows = (fb_info.size / u64::from(pitch)).min(u64::from(u32::MAX)) as u32;
         Self {
             buffer,
             width: fb_info.width.min(pitch / bpp),
@@ -90,14 +90,14 @@ impl ScanoutSurface {
             PixelFormat::Xrgb8888 | PixelFormat::Xbgr8888 => {
                 let pixel = color.to_pixel(self.format);
                 unsafe {
-                    let ptr = self.buffer.add(offset) as *mut u32;
+                    let ptr = self.buffer.add(offset).cast::<u32>();
                     ptr::write_volatile(ptr, pixel);
                 }
             }
             PixelFormat::Rgb565 => {
                 let pixel = color.to_pixel(self.format) as u16;
                 unsafe {
-                    let ptr = self.buffer.add(offset) as *mut u16;
+                    let ptr = self.buffer.add(offset).cast::<u16>();
                     ptr::write_volatile(ptr, pixel);
                 }
             }
@@ -115,11 +115,11 @@ impl ScanoutSurface {
                 let offset = row_offset + (col * bpp) as usize;
                 match self.format {
                     PixelFormat::Xrgb8888 | PixelFormat::Xbgr8888 => unsafe {
-                        let ptr = self.buffer.add(offset) as *mut u32;
+                        let ptr = self.buffer.add(offset).cast::<u32>();
                         ptr::write_volatile(ptr, pixel);
                     },
                     PixelFormat::Rgb565 => unsafe {
-                        let ptr = self.buffer.add(offset) as *mut u16;
+                        let ptr = self.buffer.add(offset).cast::<u16>();
                         ptr::write_volatile(ptr, pixel as u16);
                     },
                 }
@@ -140,8 +140,8 @@ impl ScanoutSurface {
         fg: Color,
         bg: Color,
     ) {
-        let start_x = char_x * font.width as u32;
-        let start_y = char_y * font.height as u32;
+        let start_x = char_x * u32::from(font.width);
+        let start_y = char_y * u32::from(font.height);
         let fg_pixel = fg.to_pixel(self.format);
         let bg_pixel = bg.to_pixel(self.format);
         let bpp = self.bytes_per_pixel();
@@ -155,7 +155,7 @@ impl ScanoutSurface {
             let row_offset = (y * self.pitch) as usize;
 
             for bit_idx in 0..font.width {
-                let x = start_x + bit_idx as u32;
+                let x = start_x + u32::from(bit_idx);
                 if x >= self.width {
                     break;
                 }
@@ -167,11 +167,11 @@ impl ScanoutSurface {
 
                 match self.format {
                     PixelFormat::Xrgb8888 | PixelFormat::Xbgr8888 => unsafe {
-                        let ptr = self.buffer.add(offset) as *mut u32;
+                        let ptr = self.buffer.add(offset).cast::<u32>();
                         ptr::write_volatile(ptr, pixel);
                     },
                     PixelFormat::Rgb565 => unsafe {
-                        let ptr = self.buffer.add(offset) as *mut u16;
+                        let ptr = self.buffer.add(offset).cast::<u16>();
                         ptr::write_volatile(ptr, pixel as u16);
                     },
                 }
@@ -250,8 +250,8 @@ pub struct GfxConsole {
 impl GfxConsole {
     /// Create a new DRM console on `surface` (its invariant holds)
     pub fn new(name: &'static str, surface: ScanoutSurface, font: &'static Font) -> Self {
-        let cols = surface.width() / font.width as u32;
-        let rows = surface.height() / font.height as u32;
+        let cols = surface.width() / u32::from(font.width);
+        let rows = surface.height() / u32::from(font.height);
 
         Self {
             name,
@@ -306,7 +306,7 @@ impl GfxConsole {
         if state.cursor_y >= self.rows {
             state
                 .surface
-                .scroll_up(self.font.height as u32, self.bg_color);
+                .scroll_up(u32::from(self.font.height), self.bg_color);
             state.cursor_y = self.rows - 1;
         }
     }
@@ -321,7 +321,7 @@ impl GfxConsole {
         if state.cursor_y >= self.rows {
             state
                 .surface
-                .scroll_up(self.font.height as u32, self.bg_color);
+                .scroll_up(u32::from(self.font.height), self.bg_color);
             state.cursor_y = self.rows - 1;
         }
     }

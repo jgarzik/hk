@@ -185,6 +185,13 @@ pub trait InodeOps: Send + Sync {
         Ok(())
     }
 
+    /// Attributes changed (chmod, chown, utimes), under i_rwsem: a file
+    /// system that keeps them outside the inode saves them (Linux
+    /// kernfs_iop_setattr into kn->iattr). Default nothing.
+    fn setattr_done(&self, inode: &Inode) {
+        let _ = inode;
+    }
+
     /// Create a new file in a directory
     fn create(&self, dir: &Inode, name: &[u8], mode: InodeMode) -> Result<Arc<Inode>, KernelError> {
         let _ = (dir, name, mode);
@@ -298,6 +305,14 @@ pub trait InodeOps: Send + Sync {
     /// must not sleep (defer I/O to a workqueue).
     fn evict_inode(&self, inode: &Inode) {
         let _ = inode;
+    }
+
+    /// Whether stat may report on the inode at all (the error a Linux
+    /// ->getattr returns before filling anything). Default yes; procfs
+    /// hides a hidepid=invisible process (ENOENT).
+    fn getattr_ok(&self, inode: &Inode) -> Result<(), KernelError> {
+        let _ = inode;
+        Ok(())
     }
 
     /// Get file size (may be dynamically computed for procfs)
@@ -527,7 +542,7 @@ impl Inode {
     ///
     /// # Arguments
     /// * `mtime` - Modification time (atime and ctime are initialized to same value)
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn new(
         ino: InodeId,
         mode: InodeMode,
@@ -571,7 +586,7 @@ impl Inode {
     /// # Arguments
     /// * `rdev` - Device ID (major/minor numbers)
     /// * `mtime` - Modification time
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn new_device(
         ino: InodeId,
         mode: InodeMode,
@@ -708,6 +723,49 @@ impl Inode {
     /// Writers hold `i_rwsem` exclusive (Linux notify_change / inode_set_*time)
     pub fn set_ctime(&self, time: Timespec) {
         self.ctime.set(time);
+    }
+
+    /// mtime and ctime become the current time (Linux
+    /// inode_set_mtime_to_ts(inode, inode_set_ctime_current(inode))).
+    /// Callers normally hold `i_rwsem` (else a reader may see a mix of
+    /// two updates, as on Linux).
+    pub fn touch_mc(&self) {
+        let now = crate::time::TIMEKEEPER.current_time();
+        self.ctime.set(now);
+        self.mtime.set(now);
+    }
+
+    /// An access through `mnt` (Linux touch_atime): atime becomes the
+    /// current time unless the mount is read-only, noatime (nodiratime
+    /// for a directory), or relatime and the atime is newer than mtime
+    /// and ctime and under a day old. Unlocked, as Linux.
+    pub fn touch_atime(&self, mnt: &super::mount::Mount) {
+        use super::mount::{MNT_NOATIME, MNT_NODIRATIME, MNT_RELATIME};
+        let f = mnt.flags();
+        if f & MNT_NOATIME != 0
+            || (f & MNT_NODIRATIME != 0 && self.mode().is_dir())
+            || mnt.is_readonly()
+        {
+            return;
+        }
+        let now = crate::time::TIMEKEEPER.current_time();
+        let atime = self.atime();
+        let stale = |t: Timespec| (t.sec, t.nsec) >= (atime.sec, atime.nsec);
+        let relatime_ok = stale(self.mtime())
+            || stale(self.ctime())
+            || now.sec.wrapping_sub(atime.sec) >= 24 * 60 * 60;
+        if (f & MNT_RELATIME != 0 && !relatime_ok) || (now.sec, now.nsec) == (atime.sec, atime.nsec)
+        {
+            return;
+        }
+        self.atime.set(now);
+    }
+
+    /// ctime becomes the current time (Linux inode_set_ctime_current).
+    /// Callers normally hold `i_rwsem` (else a reader may see a mix of
+    /// two updates, as on Linux).
+    pub fn touch_c(&self) {
+        self.ctime.set(crate::time::TIMEKEEPER.current_time());
     }
 
     /// Get the superblock this inode belongs to

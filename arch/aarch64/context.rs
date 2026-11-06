@@ -8,7 +8,7 @@
 //!
 //! TLS (Thread Local Storage) handling follows the Linux kernel pattern:
 //! save/restore TPIDR_EL0 in Rust before calling the pure-asm switch.
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use super::percpu::write_tpidr_el0;
 
@@ -32,6 +32,27 @@ unsafe extern "C" {
     ///   next_ctx - Pointer to next task's TaskContext (to restore from)
     ///   new_kstack - new kernel stack top (unused on aarch64)
     fn __switch_to_asm_first(next_ctx: *const Aarch64TaskContext, new_kstack: u64);
+}
+
+/// Host tests link the scheduler without switch_to.S (build.rs
+/// assembles it for the kernel only); nothing switches there
+#[cfg(test)]
+mod host_stubs {
+    use super::Aarch64TaskContext;
+
+    #[unsafe(no_mangle)]
+    extern "C" fn __switch_to_asm(
+        _prev_ctx: *mut Aarch64TaskContext,
+        _next_ctx: *const Aarch64TaskContext,
+        _new_kstack: u64,
+    ) {
+        unreachable!("context switch in a host test");
+    }
+
+    #[unsafe(no_mangle)]
+    extern "C" fn __switch_to_asm_first(_next_ctx: *const Aarch64TaskContext, _new_kstack: u64) {
+        unreachable!("context switch in a host test");
+    }
 }
 
 /// AArch64 task context for context switching

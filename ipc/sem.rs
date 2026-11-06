@@ -6,6 +6,7 @@
 //! - Blocking with optional timeout
 //! - Automatic undo on process exit (SEM_UNDO)
 
+use crate::util::kalloc::try_arc;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
 use alloc::vec;
@@ -236,7 +237,7 @@ impl Drop for SemLock<'_> {
 /// or past the adjustment range). A SEM_UNDO operation also changes the
 /// `undo` list's adjustment by its negative. Undone on anything but 0.
 fn perform_atomic_semop(
-    l: &mut SemLock,
+    l: &mut SemLock<'_>,
     sops: &[Sembuf],
     pid: i32,
     undo: Option<u64>,
@@ -246,7 +247,7 @@ fn perform_atomic_semop(
     for (n, sop) in sops.iter().enumerate() {
         let s = l.sem(sop.sem_num as usize);
         let cur = s.val;
-        let result = cur + sop.sem_op as i32;
+        let result = cur + i32::from(sop.sem_op);
         let r = if (sop.sem_op == 0 && cur != 0) || result < 0 {
             *blocking = n;
             if sop.sem_flg & IPC_NOWAIT as i16 != 0 {
@@ -258,7 +259,7 @@ fn perform_atomic_semop(
             KernelError::Range.to_errno_neg()
         } else if let (true, Some(u)) = (sop.sem_flg & SEM_UNDO != 0, undo) {
             // The adjustment must stay in -SEMAEM-1..=SEMAEM
-            match i16::try_from(adj_of(s) as i32 - sop.sem_op as i32) {
+            match i16::try_from(i32::from(adj_of(s)) - i32::from(sop.sem_op)) {
                 Ok(v) => {
                     set_adj(s, u, v);
                     s.val = result;
@@ -272,7 +273,7 @@ fn perform_atomic_semop(
         };
         for done in sops[..n].iter().rev() {
             let s = l.sem(done.sem_num as usize);
-            s.val -= done.sem_op as i32;
+            s.val -= i32::from(done.sem_op);
             if let (true, Some(u)) = (done.sem_flg & SEM_UNDO != 0, undo) {
                 let v = adj_of(s) + done.sem_op;
                 set_adj(s, u, v);
@@ -302,7 +303,7 @@ fn set_adj(s: &mut PerSem, undo: u64, v: i16) {
 /// restarts the scan. Returns whether any was completed and whether one
 /// changed values; `done` collects the semaphores the completed alter
 /// operations changed.
-fn retry(l: &mut SemLock, q: &mut VecDeque<Waiter>, done: &mut Vec<usize>) -> (bool, bool) {
+fn retry(l: &mut SemLock<'_>, q: &mut VecDeque<Waiter>, done: &mut Vec<usize>) -> (bool, bool) {
     let (mut woke, mut altered) = (false, false);
     let mut i = 0;
     while i < q.len() {
@@ -336,7 +337,7 @@ fn retry(l: &mut SemLock, q: &mut VecDeque<Waiter>, done: &mut Vec<usize>) -> (b
 /// to try; in complex mode the array's waiters and those of every
 /// semaphore that changed, until nothing more completes. True if a
 /// sleeper must be woken after the unlock.
-fn update_queue(l: &mut SemLock, changed: impl IntoIterator<Item = usize>) -> bool {
+fn update_queue(l: &mut SemLock<'_>, changed: impl IntoIterator<Item = usize>) -> bool {
     let mut woke = false;
     let mut dirty: Vec<usize> = changed.into_iter().collect();
     loop {
@@ -384,7 +385,7 @@ impl SemArray {
                 }),
             })
             .collect();
-        Ok(Arc::new(Self {
+        try_arc(Self {
             perm: KernIpcPerm::new(key, mode),
             nsems,
             sems,
@@ -396,7 +397,8 @@ impl SemArray {
             use_global_lock: AtomicU32::new(0),
             waitq: WaitQueue::new(),
             ns,
-        }))
+        })
+        .map_err(KernelError::errno)
     }
 
     /// The whole array, in complex mode (Linux sem_lock for nsops != 1
@@ -469,14 +471,14 @@ impl SemArray {
     }
 
     /// Fill semid64_ds structure for IPC_STAT (complex mode)
-    fn fill_semid64_ds(&self, l: &mut SemLock, ds: &mut Semid64Ds) {
+    fn fill_semid64_ds(&self, l: &mut SemLock<'_>, ds: &mut Semid64Ds) {
         self.perm.fill_ipc64_perm(&mut ds.sem_perm);
         ds.sem_otime = (0..self.nsems as usize)
             .map(|i| l.sem(i).otime)
             .max()
             .unwrap_or(0);
         ds.sem_ctime = l.global().map_or(0, |g| g.ctime);
-        ds.sem_nsems = self.nsems as u64;
+        ds.sem_nsems = u64::from(self.nsems);
         ds.__unused3 = 0;
         ds.__unused4 = 0;
     }
@@ -516,8 +518,8 @@ impl IpcObject for SemArray {
 /// Convert Result to syscall return value
 fn result_to_i64(res: Result<i32, i32>) -> i64 {
     match res {
-        Ok(v) => v as i64,
-        Err(e) => -(e as i64),
+        Ok(v) => i64::from(v),
+        Err(e) => -i64::from(e),
     }
 }
 
@@ -548,8 +550,8 @@ fn do_semget(key: i32, nsems: i32, semflg: i32) -> Result<i32, i32> {
             if nsems_u32 == 0 {
                 return Err(KernelError::InvalidArgument.errno());
             }
-            let used = ns_clone.used_sems.load(Ordering::Relaxed) as u64;
-            if used + nsems_u32 as u64 > ns_clone.sem_ctls[1] as u64 {
+            let used = u64::from(ns_clone.used_sems.load(Ordering::Relaxed));
+            if used + u64::from(nsems_u32) > ns_clone.sem_ctls[1] as u64 {
                 return Err(KernelError::NoSpace.errno());
             }
             SemArray::new(k, nsems_u32, mode, ns_clone.clone())
@@ -633,7 +635,7 @@ fn do_semtimedop(semid: i32, sops_ptr: u64, nsops: usize, timeout_ptr: u64) -> R
         None => None,
     };
 
-    let max = sops.iter().map(|s| s.sem_num as u32).max().unwrap_or(0);
+    let max = sops.iter().map(|s| u32::from(s.sem_num)).max().unwrap_or(0);
     let has_undo = sops.iter().any(|s| s.sem_flg & SEM_UNDO != 0);
     let alter = sops.iter().any(|s| s.sem_op != 0);
 
@@ -647,11 +649,13 @@ fn do_semtimedop(semid: i32, sops_ptr: u64, nsops: usize, timeout_ptr: u64) -> R
 
     // The undo list knows the array before the array knows the list
     // (Linux find_alloc_undo), so exit finds every adjustment
-    let undo = has_undo.then(|| {
-        let ul = get_or_create_undo_list(current_tid());
+    let undo = if has_undo {
+        let ul = get_or_create_undo_list(current_tid()).map_err(KernelError::errno)?;
         ul.register(semid, &sem_array_ref);
-        ul.id
-    });
+        Some(ul.id)
+    } else {
+        None
+    };
     let pid = current_pid() as i32;
     let mut l = sem_array.lock_for(&sops);
     if sem_array.perm.is_deleted() {
@@ -675,13 +679,14 @@ fn do_semtimedop(semid: i32, sops_ptr: u64, nsops: usize, timeout_ptr: u64) -> R
     // a waker completes the operation). A single operation waits on its
     // semaphore, unless it alters while multi-operation waiters exist;
     // those, and multi-operation ones, wait on the array.
-    let queue = Arc::new(SemQueue {
+    let queue = try_arc(SemQueue {
         pid,
         sops,
         alter,
         undo,
         status: AtomicI32::new(SEM_WAITING),
-    });
+    })
+    .map_err(KernelError::errno)?;
     let w = (queue.clone(), blocking);
     if queue.sops.len() == 1 {
         let n = queue.sops[0].sem_num as usize;
@@ -747,7 +752,7 @@ fn do_semtimedop(semid: i32, sops_ptr: u64, nsops: usize, timeout_ptr: u64) -> R
 }
 
 /// Take a waiter that gave up off its queue (Linux unlink_queue)
-fn unlink(l: &mut SemLock, q: &Arc<SemQueue>) {
+fn unlink(l: &mut SemLock<'_>, q: &Arc<SemQueue>) {
     let mine = |(w, _): &Waiter| Arc::ptr_eq(w, q);
     if let Some(g) = l.global()
         && let Some(i) = g.pending.iter().position(mine)
@@ -937,7 +942,7 @@ fn do_semctl(semid: i32, semnum: i32, cmd: i32, arg: u64) -> Result<i32, i32> {
                 let offset = arg + (i * 2) as u64;
                 let val: u16 = get_user::<Uaccess, u16>(offset)
                     .map_err(|_| KernelError::BadAddress.errno())?;
-                *v = val as i32;
+                *v = i32::from(val);
             }
             if vals.iter().any(|&v| v > SEMVMX) {
                 return Err(KernelError::Range.errno());
@@ -992,7 +997,7 @@ fn do_semctl(semid: i32, semnum: i32, cmd: i32, arg: u64) -> Result<i32, i32> {
             let zero = cmd_only == GETZCNT;
             let counts = |(q, b): &Waiter| {
                 let op = &q.sops[*b];
-                op.sem_num as i32 == semnum && if zero { op.sem_op == 0 } else { op.sem_op < 0 }
+                i32::from(op.sem_num) == semnum && if zero { op.sem_op == 0 } else { op.sem_op < 0 }
             };
             let mut l = sem_array.lock_valid()?;
             let mut n = l
@@ -1069,16 +1074,18 @@ impl Default for SemUndoList {
 use crate::task::percpu::TASKLIST;
 
 /// Get the undo list for a task, creating if necessary
-pub fn get_or_create_undo_list(tid: Tid) -> Arc<SemUndoList> {
+pub fn get_or_create_undo_list(tid: Tid) -> Result<Arc<SemUndoList>, KernelError> {
     let mut table = TASKLIST.write();
     if let Some(mut task) = table.get_mut(tid) {
-        if task.sysvsem.is_none() {
-            task.sysvsem = Some(Arc::new(SemUndoList::new()));
+        if let Some(ul) = &task.sysvsem {
+            return Ok(ul.clone());
         }
-        task.sysvsem.clone().unwrap()
+        let ul = try_arc(SemUndoList::new())?;
+        task.sysvsem = Some(ul.clone());
+        Ok(ul)
     } else {
         // Task not found - shouldn't happen but return a new list
-        Arc::new(SemUndoList::new())
+        try_arc(SemUndoList::new())
     }
 }
 
@@ -1138,7 +1145,7 @@ pub fn exit_sem(tid: Tid) {
         for i in 0..sem_array.nsems as usize {
             let s = l.sem(i);
             if let Some(a) = s.undo.remove(&undo_list.id) {
-                s.val = (s.val + a as i32).clamp(0, SEMVMX);
+                s.val = (s.val + i32::from(a)).clamp(0, SEMVMX);
                 s.pid = pid;
                 changed.push(i);
             }

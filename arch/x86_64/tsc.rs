@@ -3,7 +3,7 @@
 //! The TSC is a 64-bit register present in all x86-64 processors that counts
 //! CPU cycles. On modern processors with invariant TSC, it runs at a constant
 //! rate regardless of CPU frequency changes, making it ideal for timekeeping.
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use super::io;
 use crate::printkln;
@@ -13,7 +13,7 @@ pub struct TscClockSource {
     /// Calibrated TSC frequency in Hz
     frequency_hz: u64,
     /// Whether this TSC has invariant flag (reliable across power states)
-    #[allow(dead_code)] // Used via TimekeeperOps trait (future API)
+    #[expect(dead_code)] // Used via TimekeeperOps trait (future API)
     invariant: bool,
 }
 
@@ -39,7 +39,7 @@ impl TscClockSource {
     }
 
     /// Returns true if this TSC has the invariant flag
-    #[allow(dead_code)] // Used via TimekeeperOps::clock_is_reliable
+    #[expect(dead_code)] // Used via TimekeeperOps::clock_is_reliable
     pub fn is_invariant(&self) -> bool {
         self.invariant
     }
@@ -65,7 +65,7 @@ impl TscClockSource {
                 options(nostack, preserves_flags)
             );
         }
-        ((high as u64) << 32) | (low as u64)
+        (u64::from(high) << 32) | u64::from(low)
     }
 }
 

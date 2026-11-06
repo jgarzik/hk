@@ -15,7 +15,7 @@
 //! - `Offline` - Device offline, I/O fails
 //! - `TransportOffline` - Transport layer reports offline
 //! - `Block` - Device blocked for I/O
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
@@ -29,6 +29,7 @@ use super::blkdev::{
 use super::genhd::{add_disk, del_gendisk, disk_name};
 
 use crate::util::error::KernelError;
+use crate::util::kalloc::try_arc;
 
 use super::scsi::{
     Cdb, ScsiCommand, ScsiError, ScsiHost, ScsiResult, inquiry, read_capacity, test_unit_ready,
@@ -103,10 +104,10 @@ pub struct ScsiDisk {
     /// Sector size in bytes (typically 512)
     sector_size: u32,
     /// Vendor identification
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     vendor: [u8; 8],
     /// Product identification
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     product: [u8; 16],
 }
 
@@ -202,7 +203,7 @@ impl ScsiDisk {
     /// Every command 16-byte: the disk passes READ(10)'s 32-bit LBA
     /// (Linux use_16_for_rw)
     fn use_16(&self) -> bool {
-        self.capacity_sectors > u32::MAX as u64
+        self.capacity_sectors > u64::from(u32::MAX)
     }
 
     /// Get sector size
@@ -212,7 +213,7 @@ impl ScsiDisk {
 
     /// Get capacity in bytes
     pub fn capacity_bytes(&self) -> u64 {
-        self.capacity_sectors * self.sector_size as u64
+        self.capacity_sectors * u64::from(self.sector_size)
     }
 
     /// Read sectors from disk
@@ -257,7 +258,7 @@ impl ScsiDisk {
 
         let cmd = ScsiCommand::write(
             Cdb::rw(true, lba, count, self.use_16()),
-            buf.as_ptr() as *mut u8,
+            buf.as_ptr().cast_mut(),
             expected_len,
             30000,
         );
@@ -289,7 +290,7 @@ pub struct ScsiDiskDriver {
 impl ScsiDiskDriver {
     /// Run one bio; segments are consecutive on the disk
     fn do_bio(&self, bio: &Bio) -> Result<(), KernelError> {
-        let ss = self.disk.sector_size() as u64;
+        let ss = u64::from(self.disk.sector_size());
         if bio.op == BioOp::Flush {
             return self.disk.sync_cache().map_err(|_| KernelError::Io);
         }
@@ -301,7 +302,7 @@ impl ScsiDiskDriver {
             let (lba, n) = (pos / ss, (seg.len as u64 / ss) as u32);
             let p = unsafe { crate::arch::phys_to_virt(seg.frame).add(seg.offset) };
             let r = if bio.op == BioOp::Write {
-                let buf = unsafe { core::slice::from_raw_parts(p as *const u8, seg.len) };
+                let buf = unsafe { core::slice::from_raw_parts(p.cast_const(), seg.len) };
                 self.disk.write_sectors(lba, n, buf)
             } else {
                 let buf = unsafe { core::slice::from_raw_parts_mut(p, seg.len) };
@@ -395,8 +396,10 @@ pub fn create_scsi_disk(
     target: u8,
     lun: u8,
 ) -> Result<SdDisk, KernelError> {
-    let scsi_disk =
-        Arc::new(ScsiDisk::probe(host, target, lun).map_err(|_| KernelError::NotFound)?);
+    let scsi_disk = try_arc(ScsiDisk::probe(host, target, lun).map_err(|e| match e {
+        ScsiError::NoMemory => KernelError::OutOfMemory,
+        _ => KernelError::NotFound,
+    })?)?;
     let index = SdIndex::alloc()?;
     let i = index.0;
     register_blkdev(major::SCSI_DISK, "sd")?;
@@ -407,10 +410,10 @@ pub fn create_scsi_disk(
         ..QueueLimits::default()
     };
     let q = RequestQueue::new_bio(
-        Arc::new(ScsiDiskDriver {
+        try_arc(ScsiDiskDriver {
             disk: scsi_disk.clone(),
             _index: index,
-        }),
+        })?,
         limits,
         true,
     );
@@ -423,7 +426,7 @@ pub fn create_scsi_disk(
         scsi_disk.capacity_bytes() >> SECTOR_SHIFT,
         q,
         false,
-    );
+    )?;
     let bdev = add_disk(disk, None)?;
     crate::printkln!(
         "SCSI: {} ({} MB, {} byte sectors)",

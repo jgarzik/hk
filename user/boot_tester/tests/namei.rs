@@ -33,6 +33,7 @@ pub fn run_tests() {
     report(b"PATH_TOOLONG", check_toolong());
     report(b"PATH_TRAILING_SLASH", trailing());
     report(b"DOTDOT_LAST_NAME", dots());
+    report(b"CREAT_DANGLING_LINK", creat_dangling());
     report(b"NEG_DENTRY_CREATE", negative());
 }
 
@@ -306,4 +307,36 @@ fn negative() -> R {
     sys_unlink(p);
     sys_unlink(b"/tmp/nd_y\0".as_ptr());
     r
+}
+
+/// open(O_CREAT) through a dangling symlink creates its target (Linux
+/// open_last_lookups follows the link); with O_EXCL it is EEXIST
+fn creat_dangling() -> R {
+    let link = b"/tmp/dangle\0";
+    let target = b"/tmp/dangle_target\0";
+    sys_unlink(target.as_ptr());
+    sys_symlink(target.as_ptr(), link.as_ptr());
+    let ex = sys_open(
+        link.as_ptr(),
+        O_CREAT | hk_syscall::O_EXCL | O_WRONLY,
+        0o644,
+    );
+    let fd = sys_open(link.as_ptr(), O_CREAT | O_WRONLY, 0o644);
+    if fd >= 0 {
+        sys_close(fd as u64);
+    }
+    let mut st: Stat = unsafe { core::mem::zeroed() };
+    let made = sys_stat(target.as_ptr(), &mut st);
+    sys_unlink(link.as_ptr());
+    sys_unlink(target.as_ptr());
+    if ex != -17 {
+        return Err((b"O_EXCL", ex));
+    }
+    if fd < 0 {
+        return Err((b"O_CREAT", fd));
+    }
+    if made != 0 {
+        return Err((b"target made", made));
+    }
+    Ok(())
 }

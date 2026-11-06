@@ -13,35 +13,22 @@
 //! Locking: `IRQ_TABLE` is an `IrqSpinlock` (taken by `dispatch_irq` in IRQ
 //! context, by register/unregister in process context). Handlers run with it
 //! held and must not register/unregister.
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use super::gic::{self, Trigger};
 use crate::arch::IrqSpinlock;
+use crate::irq::IrqHandler;
 
 /// Maximum number of SPI interrupts supported
 const MAX_SPI: usize = 256;
 
-/// IRQ handler function signature (same on all arches)
-///
-/// Arguments:
-/// - `irq`: The IRQ number (GIC INTID)
-/// - `data`: Opaque pointer to driver instance state
-///
-/// Returns `true` if the interrupt was handled by this driver
-pub type IrqHandler = fn(irq: u32, data: *mut ()) -> bool;
-
 /// Entry in the IRQ handler table
 struct IrqEntry {
-    handler: IrqHandler,
-    data: *mut (),
+    handler: Arc<dyn IrqHandler>,
     id: usize,
 }
-
-// SAFETY: IrqEntry is only accessed under the IRQ_TABLE lock
-unsafe impl Send for IrqEntry {}
-unsafe impl Sync for IrqEntry {}
 
 /// One SPI line
 struct IrqLine {
@@ -84,13 +71,11 @@ fn spi_index(irq: u32) -> Result<usize, &'static str> {
 ///
 /// # Arguments
 /// - `irq`: GIC INTID (32-287)
-/// - `handler`: Handler function
-/// - `data`: Opaque pointer to driver state (passed to handler)
+/// - `handler`: the handler and its device state
 /// - `id`: Unique identifier for unregistration (typically device address)
 pub fn register_irq_handler(
     irq: u32,
-    handler: IrqHandler,
-    data: *mut (),
+    handler: Arc<dyn IrqHandler>,
     id: usize,
 ) -> Result<(), &'static str> {
     let index = spi_index(irq)?;
@@ -100,7 +85,7 @@ pub fn register_irq_handler(
         if line.handlers.iter().any(|e| e.id == id) {
             return Err("Handler with this ID already registered");
         }
-        line.handlers.push(IrqEntry { handler, data, id });
+        line.handlers.push(IrqEntry { handler, id });
         line.spurious.reset();
         line.handlers.len() == 1
     };
@@ -111,7 +96,7 @@ pub fn register_irq_handler(
 }
 
 /// Unregister a handler; the SPI is masked when its last handler goes
-pub fn unregister_irq_handler(irq: u32, id: usize) -> Result<(), &'static str> {
+pub fn unregister_irq_handler(irq: u32, id: usize) -> Result<Arc<dyn IrqHandler>, &'static str> {
     let index = spi_index(irq)?;
     let mut table = IRQ_TABLE.lock();
     let line = &mut table.lines[index];
@@ -120,11 +105,11 @@ pub fn unregister_irq_handler(irq: u32, id: usize) -> Result<(), &'static str> {
         .iter()
         .position(|e| e.id == id)
         .ok_or("Handler not found")?;
-    line.handlers.remove(pos);
+    let e = line.handlers.remove(pos);
     if line.handlers.is_empty() {
         gic::disable_spi(irq);
     }
-    Ok(())
+    Ok(e.handler)
 }
 
 /// Dispatch an SPI to registered handlers (IRQ context)
@@ -142,7 +127,7 @@ pub fn dispatch_irq(irq: u32) -> bool {
     let mut handled = false;
     for entry in &line.handlers {
         crate::sync::lockdep::irq_enter();
-        handled |= (entry.handler)(irq, entry.data);
+        handled |= entry.handler.handle(irq);
         crate::sync::lockdep::irq_exit();
     }
     let bad = !line.handlers.is_empty() && line.spurious.note(handled, crate::time::monotonic_ns);

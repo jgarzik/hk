@@ -273,14 +273,14 @@ impl<'a> Node<'a> {
             let size = if data.len() >= 16 {
                 Some(read_be64(data, 8))
             } else if data.len() >= 12 {
-                Some(read_be32(data, 8) as u64)
+                Some(u64::from(read_be32(data, 8)))
             } else {
                 None
             };
             Some((addr, size))
         } else if data.len() >= 4 {
             // Simple case: 32-bit address only
-            Some((Some(read_be32(data, 0) as u64), None))
+            Some((Some(u64::from(read_be32(data, 0))), None))
         } else {
             None
         }
@@ -595,7 +595,7 @@ fn read_cells(data: &[u8], offset: usize, cells: usize) -> u64 {
     if cells == 2 {
         read_be64(data, offset)
     } else {
-        read_be32(data, offset) as u64
+        u64::from(read_be32(data, offset))
     }
 }
 

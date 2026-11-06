@@ -13,6 +13,7 @@
 
 extern crate alloc;
 
+use crate::util::kalloc::arc_nofail;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -48,7 +49,8 @@ pub struct BdiWriteback {
 
 impl BdiWriteback {
     fn new(dev_id: DevId) -> Self {
-        let dwork = Arc::new(Mutex::new(DelayedWork::new(move || {
+        // `bdi_register`'s: not plumbed
+        let dwork = arc_nofail(Mutex::new(DelayedWork::new(move || {
             do_device_writeback(dev_id);
         })));
         Self {
@@ -207,7 +209,7 @@ pub static WB_CTLS: &[crate::sysctl::Ctl] = &[
         mode: 0o644,
         show: || alloc::vec![EXPIRE_CS.load(Ordering::Relaxed) as i64],
         store: |v| {
-            crate::sysctl::range(v[0], 0, i32::MAX as i64)?;
+            crate::sysctl::range(v[0], 0, i64::from(i32::MAX))?;
             EXPIRE_CS.store(v[0] as u64, Ordering::Relaxed);
             Ok(())
         },
@@ -218,7 +220,7 @@ pub static WB_CTLS: &[crate::sysctl::Ctl] = &[
         mode: 0o644,
         show: || alloc::vec![WRITEBACK_CS.load(Ordering::Relaxed) as i64],
         store: |v| {
-            crate::sysctl::range(v[0], 0, i32::MAX as i64)?;
+            crate::sysctl::range(v[0], 0, i64::from(i32::MAX))?;
             WRITEBACK_CS.store(v[0] as u64, Ordering::Relaxed);
             Ok(())
         },
@@ -235,7 +237,8 @@ pub fn sync_all() {
 
 /// Register a disk's writeback state (Linux bdi_register)
 pub fn bdi_register(dev_id: DevId) -> Arc<BdiWriteback> {
-    let bdi = Arc::new(BdiWriteback::new(dev_id));
+    // Not plumbed: its caller, Disk::new, has no error path
+    let bdi = arc_nofail(BdiWriteback::new(dev_id));
     BDI_REGISTRY.write().insert(dev_id, bdi.clone());
     bdi
 }

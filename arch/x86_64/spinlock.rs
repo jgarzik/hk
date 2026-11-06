@@ -14,7 +14,7 @@
 //! Lock ordering: IrqSpinlock should be the innermost lock when combining
 //! with non-IRQ-safe locks (Mutex, RwLock). Never acquire a non-IRQ-safe
 //! lock from interrupt context.
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use ::core::cell::UnsafeCell;
 use ::core::marker::PhantomData;
@@ -194,6 +194,25 @@ impl<'a, T> IrqSpinlockGuard<'a, T> {
     }
 }
 
+impl<T> crate::sync::waitqueue::Relock for IrqSpinlockGuard<'_, T> {
+    fn unlocked<R>(&mut self, f: impl FnOnce() -> R) -> R {
+        let lock = self.lock;
+        let me: *mut Self = self;
+        // SAFETY: the guard is dropped (unlock, IRQ state restored) and
+        // rewritten by `relock` before anything reads it
+        unsafe { core::ptr::drop_in_place(me) };
+        // Taken again however `f` ends, unwinding included (host tests
+        // unwind), so the caller's guard is never dropped twice
+        let relock = crate::util::scope::ScopeGuard::new(|()| {
+            // SAFETY: `*me` was dropped above, so writing it leaks nothing
+            unsafe { core::ptr::write(me, lock.lock()) };
+        });
+        let r = f();
+        drop(relock);
+        r
+    }
+}
+
 impl<T> Drop for IrqSpinlockGuard<'_, T> {
     fn drop(&mut self) {
         // Release the lock
@@ -202,7 +221,7 @@ impl<T> Drop for IrqSpinlockGuard<'_, T> {
         // Re-enable preemption (decrement preempt_count)
         percpu::preempt_enable();
         crate::sync::lockdep::irqsafe_release(
-            self.lock as *const _ as *const u8 as usize,
+            core::ptr::from_ref(self.lock).cast::<u8>() as usize,
             self.irq_state,
         );
 
@@ -256,7 +275,6 @@ fn restore_irq(_was_enabled: bool) {}
 /// might_sleep check)
 #[cfg(not(test))]
 #[inline]
-#[allow(dead_code)]
 pub fn irqs_disabled() -> bool {
     let flags: u64;
     unsafe {
@@ -266,7 +284,7 @@ pub fn irqs_disabled() -> bool {
 }
 
 #[cfg(test)]
-#[allow(dead_code)]
+#[allow(dead_code, reason = "host-test stub")]
 pub fn irqs_disabled() -> bool {
     false
 }

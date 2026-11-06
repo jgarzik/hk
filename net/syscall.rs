@@ -4,6 +4,7 @@
 //! arguments in with uaccess, call the protocol, copy results out. The
 //! file's O_NONBLOCK is read at every call.
 
+use crate::util::scope::ScopeGuard;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
@@ -51,7 +52,7 @@ pub fn fd_install(file: Arc<File>, cloexec: bool) -> Result<i64, KernelError> {
         .lock()
         .alloc_with_flags(file, fl, nofile())
         .map_err(|_| KernelError::ProcessFileLimit)?;
-    Ok(fd as i64)
+    Ok(i64::from(fd))
 }
 
 /// SOCK_NONBLOCK / SOCK_CLOEXEC of a type or accept4 flags argument
@@ -67,7 +68,7 @@ pub fn sys_socket(domain: i32, stype: i32, protocol: i32) -> i64 {
     ret((|| {
         let (nb, cloexec) = type_flags(stype & !SOCK_TYPE_MASK)?;
         let s = sock_create(domain, stype & SOCK_TYPE_MASK, protocol)?;
-        fd_install(sock_alloc_file(s, nb), cloexec)
+        fd_install(sock_alloc_file(s, nb)?, cloexec)
     })())
 }
 
@@ -80,20 +81,15 @@ pub fn sys_socketpair(domain: i32, stype: i32, protocol: i32, sv: u64) -> i64 {
         let (nb, cloexec) = type_flags(stype & !SOCK_TYPE_MASK)?;
         let cur = get_user::<Uaccess, [i32; 2]>(sv).map_err(|_| KernelError::BadAddress)?;
         put_user::<Uaccess, [i32; 2]>(sv, cur).map_err(|_| KernelError::BadAddress)?;
-        let a = sock_create(domain, stype & SOCK_TYPE_MASK, protocol)?;
-        let b = match sock_create(domain, stype & SOCK_TYPE_MASK, protocol) {
-            Ok(b) => b,
-            Err(e) => {
-                a.release();
-                return Err(e);
-            }
-        };
-        if let Err(e) = a.socketpair(&*b) {
-            a.release();
-            b.release();
-            return Err(e);
-        }
-        let fds = install_pair(sock_alloc_file(a, nb), sock_alloc_file(b, nb), cloexec)?;
+        let create = || sock_create(domain, stype & SOCK_TYPE_MASK, protocol);
+        let a = ScopeGuard::new_with_data(create()?, |s| s.release());
+        let b = ScopeGuard::new_with_data(create()?, |s| s.release());
+        a.socketpair(&**b)?;
+        // Each socket stays guarded until its file owns it: a failed
+        // file for `a` must still release `b`
+        let fa = sock_alloc_file(a.dismiss(), nb)?;
+        let fb = sock_alloc_file(b.dismiss(), nb)?;
+        let fds = install_pair(fa, fb, cloexec)?;
         put_user::<Uaccess, [i32; 2]>(sv, fds).map_err(|_| KernelError::BadAddress)?;
         Ok(0)
     })())
@@ -171,7 +167,7 @@ pub fn sys_accept4(fd: i32, addr: u64, lenp: u64, flags: i32) -> i64 {
         let nb = file_nb(&file, 0) & MSG_DONTWAIT != 0;
         let child = s.accept(nb)?;
         let peer = child.getname(true);
-        let newfile = sock_alloc_file(child, nb_new);
+        let newfile = sock_alloc_file(child, nb_new)?;
         if addr != 0 {
             let a = peer.map_err(|_| KernelError::ConnectionAborted)?;
             addr_out(addr, lenp, &a)?;
@@ -345,7 +341,7 @@ pub fn sys_sendmmsg(fd: i32, vec: u64, vlen: u32, flags: i32) -> i64 {
     ret((|| {
         let (file, s) = sockfd(fd)?;
         let mut n = 0u64;
-        for i in 0..(vlen as u64).min(msg::UIO_MAXIOV as u64) {
+        for i in 0..u64::from(vlen).min(msg::UIO_MAXIOV as u64) {
             let at = vec.wrapping_add(i * MMSG_SIZE);
             match sendmsg_one(&file, &*s, at, flags) {
                 Ok(k) => {
@@ -370,7 +366,7 @@ pub fn sys_recvmmsg(fd: i32, vec: u64, vlen: u32, flags: i32, timeout: u64) -> i
         let deadline = mmsg_deadline(timeout)?;
         let mut flags = flags;
         let mut n = 0u64;
-        for i in 0..(vlen as u64).min(msg::UIO_MAXIOV as u64) {
+        for i in 0..u64::from(vlen).min(msg::UIO_MAXIOV as u64) {
             let at = vec.wrapping_add(i * MMSG_SIZE);
             match recvmsg_one(&file, &*s, at, flags) {
                 Ok(k) => {

@@ -8,10 +8,12 @@ use alloc::sync::Arc;
 
 use crate::sync::Mutex;
 use core::any::Any;
+use core::mem::MaybeUninit;
 
 use crate::block::{DataDirection, ScsiCommand, ScsiError, ScsiHost, ScsiResult, SdDisk};
 use crate::printkln;
 use crate::util::error::KernelError;
+use crate::util::kalloc::{try_arc, try_box};
 
 use super::{UsbDeviceId, UsbError, UsbIds, usb_bulk_in, usb_bulk_out};
 
@@ -116,7 +118,7 @@ impl Csw {
 }
 
 /// CSW status values
-#[allow(dead_code)]
+#[expect(dead_code)]
 mod csw_status {
     pub const PASSED: u8 = 0;
     pub const FAILED: u8 = 1;
@@ -196,7 +198,7 @@ impl UsbMscDevice {
         // controller DMAs them, never from a kernel stack; Linux
         // us->iobuf)
         let cbw = Cbw::new(tag, data_len, direction, lun, cdb);
-        let cbw_bytes = Box::new(cbw.as_bytes());
+        let cbw_bytes = try_box(cbw.as_bytes()).map_err(|_| ScsiError::NoMemory)?;
 
         usb_bulk_out(slot_id, bulk_out, &cbw_bytes[..]).map_err(usb_to_scsi_error)?;
 
@@ -216,7 +218,7 @@ impl UsbMscDevice {
         }
 
         // Phase 3: Receive CSW
-        let mut csw_bytes = Box::new([0u8; Csw::SIZE]);
+        let mut csw_bytes = try_box([0u8; Csw::SIZE]).map_err(|_| ScsiError::NoMemory)?;
         usb_bulk_in(slot_id, bulk_in, &mut csw_bytes[..]).map_err(usb_to_scsi_error)?;
 
         let csw = Csw::from_bytes(&csw_bytes);
@@ -325,6 +327,8 @@ fn usb_storage_probe(
     dev: &Arc<crate::base::Device>,
 ) -> Result<Box<dyn crate::base::Bound>, KernelError> {
     let (usb_dev, intf) = super::usb_intf(dev).ok_or(KernelError::NoDevice)?;
+    // The binding's memory first: nothing to undo should it fail
+    let slot = try_box(MaybeUninit::<UsbStorage>::uninit())?;
     let Some((bulk_in_ep, bulk_out_ep)) = intf.bulk_eps() else {
         printkln!("usb-storage {}: no bulk endpoints", dev.name());
         return Err(KernelError::NoDevice);
@@ -336,14 +340,17 @@ fn usb_storage_probe(
         bulk_in_ep,
         bulk_out_ep
     );
-    let msc_dev = Arc::new(UsbMscDevice::new(usb_dev.slot_id, bulk_in_ep, bulk_out_ep));
+    let msc_dev = try_arc(UsbMscDevice::new(usb_dev.slot_id, bulk_in_ep, bulk_out_ep))?;
     let disk = crate::block::create_scsi_disk(msc_dev.clone(), 0, 0).inspect_err(|e| {
         printkln!("usb-storage {}: no disk: {:?}", dev.name(), e);
     })?;
-    Ok(Box::new(UsbStorage {
-        device: msc_dev,
-        disk,
-    }))
+    Ok(Box::write(
+        slot,
+        UsbStorage {
+            device: msc_dev,
+            disk,
+        },
+    ))
 }
 
 /// A bound mass-storage interface (Linux struct us_data): its

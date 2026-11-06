@@ -1,7 +1,9 @@
 #!/bin/bash
 #
 # The full per-commit gate (CLAUDE.md), boots in parallel:
-#   1. fmt-check, clippy and clippy-arm (-D warnings), test: fail fast
+#   1. fmt-check, clippy, clippy-arm and clippy with lockdep (-D
+#      warnings), test and test-arm (host unit tests, x86-64 and
+#      arm64): fail fast
 #   2. build everything the boots need, serially (shared target dirs)
 #   3. check, check-arm, check-linux, check-linux-arm concurrently
 #      (NOBUILD=1; each boot has its own serial log in $QEMU_LOG_DIR)
@@ -41,7 +43,10 @@ serial() {
 serial fmt-check fmt-check
 serial clippy clippy "CLIPPY_FLAGS=-D warnings"
 serial clippy-arm clippy-arm "CLIPPY_FLAGS=-D warnings"
+# The LOCKDEP build's code (lockdep, mmcheck, their selftests)
+serial clippy-lockdep clippy "CLIPPY_FLAGS=-D warnings" "CLIPPY_FEATURES=--features lockdep"
 serial test test
+serial test-arm test-arm
 serial build iso build-arm disk-image
 serial build-host-x86_64 -C user host ARCH=x86_64
 serial build-host-aarch64 -C user host ARCH=aarch64

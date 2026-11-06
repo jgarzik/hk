@@ -12,7 +12,7 @@
 //! the heap is IRQ-safe; vmalloc frees from interrupts are deferred.
 //! A vmalloc block is not physically contiguous: heap memory handed to
 //! a device must come from the DMA API (`hw::dma` asserts).
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use crate::arch::IrqSpinlock;
 use ::core::alloc::{GlobalAlloc, Layout};
@@ -278,6 +278,11 @@ fn kvmalloc(layout: Layout) -> *mut u8 {
 
 unsafe impl GlobalAlloc for KernelAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        // A block `util::kalloc` reserved for this allocation
+        if let Some(p) = crate::util::kalloc::take_reserved(layout) {
+            return p;
+        }
+        crate::sync::lockdep::atomic_alloc();
         if self.slab.load(core::sync::atomic::Ordering::Acquire) {
             kvmalloc(layout)
         } else {

@@ -3,7 +3,7 @@
 //! A File represents an open file handle. Multiple file descriptors
 //! can point to the same file (e.g., after dup()).
 //!
-//! Page-cache file I/O is `mm::filemap` (read, perform_write).
+//! Page-cache file I/O is `mm::filemap` (read_iter, write_iter).
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -16,11 +16,12 @@ use crate::sync;
 use super::KernelError;
 use super::dentry::Dentry;
 use super::inode::{FileType, Inode, InodeId};
+use super::iov_iter::{IovDest, IovSource};
 use super::mount::Mount;
 use crate::io::poll::{DEFAULT_POLLMASK, POLLERR, POLLHUP, PollTable};
 
-/// Largest kernel bounce buffer one read/write call uses: transfers
-/// bigger than this go through it in steps
+/// Largest kernel buffer a pseudo-file write (sysctl, cgroup attribute)
+/// copies in for one store
 pub const WRITE_CHUNK: usize = 64 * 1024;
 
 /// Open file flags (Linux O_* flags)
@@ -46,6 +47,8 @@ pub mod flags {
     pub const O_APPEND: u32 = 0o2000;
     /// Non-blocking mode
     pub const O_NONBLOCK: u32 = 0o4000;
+    /// Writes reach storage before returning (O_SYNC includes it)
+    pub const O_DSYNC: u32 = 0o10000;
     /// Asynchronous I/O (generate SIGIO)
     pub const O_ASYNC: u32 = 0o20000;
     /// Must be a directory / don't follow symlinks (values differ per arch)
@@ -193,6 +196,38 @@ pub fn generic_llseek(
     Ok(pos)
 }
 
+/// For `read_iter`/`write_iter` of a file with neither a position nor
+/// RWF_NOWAIT support (eventfd, sockets, ...): positioned I/O or
+/// RWF_NOWAIT is EOPNOTSUPP, which the syscalls report as ESPIPE resp.
+/// EOPNOTSUPP
+pub fn stream_rw(at: Option<u64>, flags: RwFlags) -> Result<(), KernelError> {
+    if at.is_some() || flags.nowait {
+        return Err(KernelError::OperationNotSupported);
+    }
+    Ok(())
+}
+
+/// The default `read_iter`/`write_iter`: no such operation is EINVAL
+/// (Linux vfs_read without read_iter), and positioned I/O or RWF_NOWAIT
+/// EOPNOTSUPP (the syscalls report ESPIPE resp. EOPNOTSUPP)
+fn no_rw(at: Option<u64>, flags: RwFlags) -> Result<usize, KernelError> {
+    if at.is_some() || flags.nowait {
+        return Err(KernelError::OperationNotSupported);
+    }
+    Err(KernelError::InvalidArgument)
+}
+
+/// For `read_iter`/`write_iter` of a stream that Linux marks
+/// FMODE_NOWAIT (eventfd, signalfd, timerfd, sockets): positioned I/O
+/// is EOPNOTSUPP (ESPIPE at the syscall); RWF_NOWAIT makes this call
+/// nonblocking. True if the call must not block.
+pub fn nowait_rw(file: &File, at: Option<u64>, flags: RwFlags) -> Result<bool, KernelError> {
+    if at.is_some() {
+        return Err(KernelError::OperationNotSupported);
+    }
+    Ok(flags.nowait || file.get_flags() & self::flags::O_NONBLOCK != 0)
+}
+
 /// File operations trait - filesystem-specific behavior for open files
 pub trait FileOps: Send + Sync {
     /// Returns self as Any for downcasting to concrete types
@@ -205,31 +240,34 @@ pub trait FileOps: Send + Sync {
         Ok(())
     }
 
-    /// Read from file at current position
-    fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, KernelError>;
-
-    /// Write to file at current position
-    fn write(&self, file: &File, buf: &[u8]) -> Result<usize, KernelError> {
-        let _ = (file, buf);
-        Err(KernelError::OperationNotSupported)
+    /// Read into `to` at `at`, or at the file position (advancing it)
+    /// when None (Linux f_op->read_iter). Data already copied wins over
+    /// a later error. Default: EINVAL from read(2) (no read), ESPIPE
+    /// positioned.
+    fn read_iter(
+        &self,
+        file: &File,
+        to: &mut IovDest<'_>,
+        at: Option<u64>,
+        flags: RwFlags,
+    ) -> Result<usize, KernelError> {
+        let _ = (file, to);
+        no_rw(at, flags)
     }
 
-    /// Positioned read - read from file at given offset without modifying file position
-    ///
-    /// Unlike read(), this does NOT advance the file position.
-    /// Returns NotSupported for files that don't support positioned I/O (pipes, sockets).
-    fn pread(&self, file: &File, buf: &mut [u8], offset: u64) -> Result<usize, KernelError> {
-        let _ = (file, buf, offset);
-        Err(KernelError::OperationNotSupported)
-    }
-
-    /// Positioned write - write to file at given offset without modifying file position
-    ///
-    /// Unlike write(), this does NOT advance the file position.
-    /// Returns NotSupported for files that don't support positioned I/O (pipes, sockets).
-    fn pwrite(&self, file: &File, buf: &[u8], offset: u64) -> Result<usize, KernelError> {
-        let _ = (file, buf, offset);
-        Err(KernelError::OperationNotSupported)
+    /// Write from `from` at `at`, or at the file position (advancing it)
+    /// when None (Linux f_op->write_iter); `File::write_iter` has taken
+    /// i_rwsem, applied O_APPEND and the size limits. Default: EINVAL
+    /// (no write), ESPIPE positioned.
+    fn write_iter(
+        &self,
+        file: &File,
+        from: &mut IovSource<'_>,
+        at: Option<u64>,
+        flags: RwFlags,
+    ) -> Result<usize, KernelError> {
+        let _ = (file, from);
+        no_rw(at, flags)
     }
 
     /// Seek to a position
@@ -239,7 +277,7 @@ pub trait FileOps: Send + Sync {
     }
 
     /// Read directory entries from `ctx.pos` on (Linux iterate_shared)
-    fn readdir(&self, file: &File, ctx: &mut DirContext) -> Result<(), KernelError> {
+    fn readdir(&self, file: &File, ctx: &mut DirContext<'_>) -> Result<(), KernelError> {
         let _ = (file, ctx);
         Err(KernelError::NotDirectory)
     }
@@ -280,75 +318,9 @@ pub trait FileOps: Send + Sync {
     /// 2. Return current ready events mask
     ///
     /// Default: regular files are always readable and writable.
-    fn poll(&self, _file: &File, _pt: Option<&mut PollTable>) -> u16 {
+    fn poll(&self, _file: &File, _pt: Option<&mut PollTable<'_>>) -> u16 {
         // Default for regular files - always ready
         DEFAULT_POLLMASK
-    }
-
-    /// Read with RWF flags (for preadv2/pwritev2)
-    ///
-    /// Supports RWF_NOWAIT: if set and operation would block, return WouldBlock.
-    /// Default implementation rejects NOWAIT (returns NotSupported).
-    fn read_with_flags(
-        &self,
-        file: &File,
-        buf: &mut [u8],
-        flags: RwFlags,
-    ) -> Result<usize, KernelError> {
-        if flags.nowait {
-            return Err(KernelError::OperationNotSupported);
-        }
-        self.read(file, buf)
-    }
-
-    /// Positioned read with RWF flags
-    ///
-    /// Supports RWF_NOWAIT: if set and operation would block, return WouldBlock.
-    /// Default implementation rejects NOWAIT (returns NotSupported).
-    fn pread_with_flags(
-        &self,
-        file: &File,
-        buf: &mut [u8],
-        offset: u64,
-        flags: RwFlags,
-    ) -> Result<usize, KernelError> {
-        if flags.nowait {
-            return Err(KernelError::OperationNotSupported);
-        }
-        self.pread(file, buf, offset)
-    }
-
-    /// Write with RWF flags (for preadv2/pwritev2)
-    ///
-    /// Supports RWF_NOWAIT: if set and operation would block, return WouldBlock.
-    /// Default implementation rejects NOWAIT (returns NotSupported).
-    fn write_with_flags(
-        &self,
-        file: &File,
-        buf: &[u8],
-        flags: RwFlags,
-    ) -> Result<usize, KernelError> {
-        if flags.nowait {
-            return Err(KernelError::OperationNotSupported);
-        }
-        self.write(file, buf)
-    }
-
-    /// Positioned write with RWF flags
-    ///
-    /// Supports RWF_NOWAIT: if set and operation would block, return WouldBlock.
-    /// Default implementation rejects NOWAIT (returns NotSupported).
-    fn pwrite_with_flags(
-        &self,
-        file: &File,
-        buf: &[u8],
-        offset: u64,
-        flags: RwFlags,
-    ) -> Result<usize, KernelError> {
-        if flags.nowait {
-            return Err(KernelError::OperationNotSupported);
-        }
-        self.pwrite(file, buf, offset)
     }
 }
 
@@ -535,9 +507,10 @@ impl File {
 
     /// Set status flags (for F_SETFL)
     ///
-    /// Only O_APPEND, O_NONBLOCK can be modified. Access mode is preserved.
+    /// Only O_APPEND, O_NONBLOCK and O_NOATIME can be modified. Access
+    /// mode is preserved.
     pub fn set_status_flags(&self, new_status: u32) {
-        const SETTABLE_FLAGS: u32 = flags::O_APPEND | flags::O_NONBLOCK;
+        const SETTABLE_FLAGS: u32 = flags::O_APPEND | flags::O_NONBLOCK | super::dac::O_NOATIME;
         let mut guard = self.f_lock.lock();
         *guard = (*guard & !SETTABLE_FLAGS) | (new_status & SETTABLE_FLAGS);
     }
@@ -594,10 +567,38 @@ impl File {
 
     /// Read from file
     pub fn read(&self, buf: &mut [u8]) -> Result<usize, KernelError> {
+        self.read_iter(&mut IovDest::kernel(buf), None, RwFlags::empty())
+    }
+
+    /// Read into `to` at `at` (None: the file position, which advances)
+    /// (Linux vfs_read / vfs_iter_read)
+    pub fn read_iter(
+        &self,
+        to: &mut IovDest<'_>,
+        at: Option<u64>,
+        flags: RwFlags,
+    ) -> Result<usize, KernelError> {
         if !self.is_readable() {
             return Err(KernelError::PermissionDenied);
         }
-        self.f_op.read(self, buf)
+        let want = !to.is_empty();
+        let r = self.f_op.read_iter(self, to, at, flags);
+        // A regular file read asking for data (Linux filemap_read)
+        if want && let Some(i) = self.get_inode().filter(|i| i.mode().is_file()) {
+            self.accessed(&i);
+        }
+        r
+    }
+
+    /// An access of the file's data (Linux file_accessed): its atime,
+    /// unless opened O_NOATIME or reached without a mount
+    pub fn accessed(&self, inode: &Inode) {
+        if self.get_flags() & super::dac::O_NOATIME != 0 {
+            return;
+        }
+        if let Some(m) = &self.mnt {
+            inode.touch_atime(m);
+        }
     }
 
     /// Write at the file position
@@ -607,10 +608,7 @@ impl File {
 
     /// Positioned read - read at given offset without modifying file position
     pub fn pread(&self, buf: &mut [u8], offset: u64) -> Result<usize, KernelError> {
-        if !self.is_readable() {
-            return Err(KernelError::PermissionDenied);
-        }
-        self.f_op.pread(self, buf, offset)
+        self.read_iter(&mut IovDest::kernel(buf), Some(offset), RwFlags::empty())
     }
 
     /// Positioned write (the file position is not used or changed)
@@ -620,10 +618,7 @@ impl File {
 
     /// Read with RWF flags (for preadv2/pwritev2 with RWF_NOWAIT support)
     pub fn read_with_flags(&self, buf: &mut [u8], flags: RwFlags) -> Result<usize, KernelError> {
-        if !self.is_readable() {
-            return Err(KernelError::PermissionDenied);
-        }
-        self.f_op.read_with_flags(self, buf, flags)
+        self.read_iter(&mut IovDest::kernel(buf), None, flags)
     }
 
     /// Positioned read with RWF flags
@@ -633,14 +628,11 @@ impl File {
         offset: u64,
         flags: RwFlags,
     ) -> Result<usize, KernelError> {
-        if !self.is_readable() {
-            return Err(KernelError::PermissionDenied);
-        }
-        self.f_op.pread_with_flags(self, buf, offset, flags)
+        self.read_iter(&mut IovDest::kernel(buf), Some(offset), flags)
     }
 
     /// Write `buf` at `at` (None: the file position, which advances);
-    /// see [`File::write_from`]
+    /// see [`File::write_iter`]
     pub fn write_at(
         &self,
         buf: &[u8],
@@ -648,43 +640,35 @@ impl File {
         flags: RwFlags,
         append: Option<bool>,
     ) -> Result<usize, KernelError> {
-        let mut off = 0;
-        self.write_from(buf.len(), at, flags, append, &mut |dst| {
-            dst.copy_from_slice(&buf[off..off + dst.len()]);
-            off += dst.len();
-            Ok(())
-        })
+        self.write_iter(&mut IovSource::kernel(buf), at, flags, append)
     }
 
-    /// Write `len` bytes produced in order by `src` at `at` (None: the
-    /// file position, which advances) (Linux vfs_write +
-    /// generic_file_write_iter). The data passes through a kernel buffer
-    /// of at most `WRITE_CHUNK` bytes, so a call never pins more kernel
-    /// memory than that. Regular files are written under the inode's
+    /// Write `from` at `at` (None: the file position, which advances)
+    /// (Linux vfs_write + generic_file_write_iter). Regular files are
+    /// written under the inode's
     /// i_rwsem, held across all chunks: in append mode (`append`:
     /// RWF_APPEND / RWF_NOAPPEND, None = the file's O_APPEND) the data
     /// goes to the current end of file, also for pwrite (Linux), and
     /// position, data and new size change atomically with respect to
     /// other writers and truncate. A short chunk ends the write; an
     /// error after some bytes were written returns their count (Linux).
-    pub fn write_from(
+    pub fn write_iter(
         &self,
-        len: usize,
+        from: &mut IovSource<'_>,
         at: Option<u64>,
         flags: RwFlags,
         append: Option<bool>,
-        src: &mut dyn FnMut(&mut [u8]) -> Result<(), KernelError>,
     ) -> Result<usize, KernelError> {
         if !self.is_writable() {
             return Err(KernelError::PermissionDenied);
         }
         let inode = match self.get_inode() {
             Some(i) if i.mode().is_file() => i,
-            _ => return self.write_chunks(len, at, flags, src),
+            _ => return self.f_op.write_iter(self, from, at, flags),
         };
         let append = append.unwrap_or(self.get_flags() & flags::O_APPEND != 0);
-        let _lock = inode.lock();
-        (|| {
+        let lock = inode.lock();
+        let n = (|| {
             // An active swap file (Linux generic_write_checks:
             // IS_SWAPFILE), checked under i_rwsem: swapon sets it there
             if inode.i_swapfile.load(Ordering::Acquire) {
@@ -701,48 +685,29 @@ impl File {
             let pos = at.unwrap_or_else(|| self.get_pos());
             // A zero-length write checks nothing (Linux: count 0 returns
             // before generic_write_checks)
-            if len == 0 {
+            if from.is_empty() {
                 return Ok(0);
             }
-            let len = inode.write_limit(pos, len)?;
-            // file_remove_privs: set-id bits go unless CAP_FSETID
+            from.truncate(inode.write_limit(pos, from.len())?);
+            // file_modified: set-id bits go unless CAP_FSETID, then
+            // mtime and ctime, before the data
             super::dac::remove_privs(&inode);
-            self.write_chunks(len, at, flags, src)
-        })()
-    }
-
-    /// The chunk loop of `write_from`
-    fn write_chunks(
-        &self,
-        len: usize,
-        at: Option<u64>,
-        flags: RwFlags,
-        src: &mut dyn FnMut(&mut [u8]) -> Result<(), KernelError>,
-    ) -> Result<usize, KernelError> {
-        let mut buf = alloc::vec![0u8; len.min(WRITE_CHUNK)];
-        let mut done = 0;
-        loop {
-            let n = (len - done).min(WRITE_CHUNK);
-            let r = src(&mut buf[..n])
-                .and_then(|()| self.do_write(&buf[..n], at.map(|o| o + done as u64), flags));
-            match r {
-                Ok(w) => {
-                    done += w;
-                    if w < n || done >= len {
-                        return Ok(done);
-                    }
-                }
-                Err(_) if done > 0 => return Ok(done),
-                Err(e) => return Err(e),
-            }
+            inode.touch_mc();
+            self.f_op.write_iter(self, from, at, flags)
+        })()?;
+        drop(lock);
+        // O_DSYNC/O_SYNC or a synchronous mount: the data reaches the
+        // storage before the write returns (Linux generic_write_sync,
+        // after i_rwsem is released)
+        // Only a write that wrote, and the superblock only without O_DSYNC
+        let sync = || {
+            self.get_flags() & flags::O_DSYNC != 0
+                || inode.superblock().is_some_and(|sb| sb.synchronous())
+        };
+        if n > 0 && sync() {
+            self.f_op.fsync(self)?;
         }
-    }
-
-    fn do_write(&self, buf: &[u8], at: Option<u64>, flags: RwFlags) -> Result<usize, KernelError> {
-        match at {
-            None => self.f_op.write_with_flags(self, buf, flags),
-            Some(o) => self.f_op.pwrite_with_flags(self, buf, o, flags),
-        }
+        Ok(n)
     }
 
     /// Seek
@@ -751,17 +716,22 @@ impl File {
     }
 
     /// Read directory entries
-    pub fn readdir(&self, ctx: &mut DirContext) -> Result<(), KernelError> {
+    pub fn readdir(&self, ctx: &mut DirContext<'_>) -> Result<(), KernelError> {
         if !self.is_dir() {
             return Err(KernelError::NotDirectory);
         }
-        self.f_op.readdir(self, ctx)
+        let r = self.f_op.readdir(self, ctx);
+        // Linux iterate_dir: a directory not yet removed
+        if let Some(i) = self.get_inode().filter(|i| !i.is_dead()) {
+            self.accessed(&i);
+        }
+        r
     }
 
     /// Poll for events
     ///
     /// Returns mask of ready events (POLLIN, POLLOUT, etc.)
-    pub fn poll(&self, pt: Option<&mut PollTable>) -> u16 {
+    pub fn poll(&self, pt: Option<&mut PollTable<'_>>) -> u16 {
         self.f_op.poll(self, pt)
     }
 }
@@ -798,11 +768,27 @@ impl FileOps for NullFileOps {
         self
     }
 
-    fn read(&self, _file: &File, _buf: &mut [u8]) -> Result<usize, KernelError> {
+    fn read_iter(
+        &self,
+        _file: &File,
+        _to: &mut IovDest<'_>,
+        _at: Option<u64>,
+        _flags: RwFlags,
+    ) -> Result<usize, KernelError> {
         Err(KernelError::OperationNotSupported)
     }
 
-    fn poll(&self, _file: &File, _pt: Option<&mut PollTable>) -> u16 {
+    fn write_iter(
+        &self,
+        _file: &File,
+        _from: &mut IovSource<'_>,
+        _at: Option<u64>,
+        _flags: RwFlags,
+    ) -> Result<usize, KernelError> {
+        Err(KernelError::OperationNotSupported)
+    }
+
+    fn poll(&self, _file: &File, _pt: Option<&mut PollTable<'_>>) -> u16 {
         POLLERR
     }
 }
@@ -853,24 +839,47 @@ impl FileOps for CharDevFileOps {
         }
     }
 
-    fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {
-        Self::dev(file)?.read(file, buf)
+    /// Positioned I/O only for a positional device (else ESPIPE from
+    /// pread), no RWF_NOWAIT
+    fn read_iter(
+        &self,
+        file: &File,
+        to: &mut IovDest<'_>,
+        at: Option<u64>,
+        flags: RwFlags,
+    ) -> Result<usize, KernelError> {
+        let dev = Self::dev(file)?;
+        if (at.is_some() && !dev.positional()) || flags.nowait {
+            return Err(KernelError::OperationNotSupported);
+        }
+        dev.read(file, to)
     }
 
-    fn write(&self, file: &File, buf: &[u8]) -> Result<usize, KernelError> {
-        Self::dev(file)?.write(file, buf)
+    /// As read_iter (ESPIPE from pwrite for a stream)
+    fn write_iter(
+        &self,
+        file: &File,
+        from: &mut IovSource<'_>,
+        at: Option<u64>,
+        flags: RwFlags,
+    ) -> Result<usize, KernelError> {
+        let dev = Self::dev(file)?;
+        if (at.is_some() && !dev.positional()) || flags.nowait {
+            return Err(KernelError::OperationNotSupported);
+        }
+        dev.write(file, from)
     }
 
-    fn llseek(&self, _file: &File, _offset: i64, _whence: i32) -> Result<u64, KernelError> {
-        // Most character devices don't support seeking
-        Err(KernelError::InvalidArgument)
+    /// The device's (Linux: ESPIPE without f_op->llseek)
+    fn llseek(&self, file: &File, offset: i64, whence: i32) -> Result<u64, KernelError> {
+        Self::dev(file)?.llseek(file, offset, whence)
     }
 
     fn ioctl(&self, file: &File, cmd: u32, arg: u64) -> Result<i64, KernelError> {
         Self::dev(file)?.ioctl(file, cmd, arg)
     }
 
-    fn poll(&self, file: &File, pt: Option<&mut PollTable>) -> u16 {
+    fn poll(&self, file: &File, pt: Option<&mut PollTable<'_>>) -> u16 {
         match Self::dev(file) {
             Ok(d) => d.poll(file, pt),
             Err(_) => POLLHUP | POLLERR,
@@ -885,10 +894,10 @@ pub static CHAR_FILE_OPS: CharDevFileOps = CharDevFileOps;
 // Generic Page-Cache File Operations
 // ============================================================================
 
-/// A descriptor of `file` was closed by the current task (Linux
-/// filp_flush): its POSIX locks on the inode go, then the file's own
-/// flush
-pub fn filp_flush(file: &File) {
-    crate::fs::posix_lock::release_posix_locks_on_close(file);
+/// A descriptor of `file` in the table whose lock-owner identity is
+/// `owner` was closed (Linux filp_flush): that owner's POSIX locks on
+/// the inode go, then the file's own flush
+pub fn filp_flush(file: &File, owner: u64) {
+    crate::fs::posix_lock::release_posix_locks_on_close(file, owner);
     file.f_op.flush(file);
 }

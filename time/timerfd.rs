@@ -24,12 +24,14 @@
 //! - poll() support for integration with select/poll/epoll
 //! - CLOCK_REALTIME, CLOCK_MONOTONIC, CLOCK_BOOTTIME and the alarm clocks
 
+use crate::util::kalloc::try_arc;
 use alloc::sync::{Arc, Weak};
 use core::pin::Pin;
 
 use crate::arch::IrqSpinlock;
 use crate::fs::KernelError;
-use crate::fs::file::{File, FileOps, flags};
+use crate::fs::file::{File, FileOps, RwFlags, flags, nowait_rw};
+use crate::fs::iov_iter::IovDest;
 use crate::io::poll::{POLLIN, POLLRDNORM, PollTable};
 use crate::sync::waitqueue::WaitQueue;
 use crate::time::hrtimer::{HRTIMER_HARD, HrClock, HrTimer};
@@ -159,15 +161,15 @@ pub struct Timerfd {
 }
 
 impl Timerfd {
-    /// Create a new timerfd
-    pub fn new(clockid: i32) -> Arc<Self> {
-        let timerfd = Arc::new(Self {
+    /// Create a new timerfd, or ENOMEM
+    pub fn new(clockid: i32) -> Result<Arc<Self>, KernelError> {
+        let timerfd = try_arc(Self {
             inner: IrqSpinlock::new(TimerfdInner::new(clockid)),
             wait_queue: WaitQueue::new(),
             timer: HrTimer::new(timerfd_fire, HRTIMER_HARD),
-        });
+        })?;
         timerfd.timer.set_data(Arc::as_ptr(&timerfd) as usize);
-        timerfd
+        Ok(timerfd)
     }
 
     /// Its timer (pinned: the timerfd lives in an Arc)
@@ -281,7 +283,7 @@ impl Timerfd {
     }
 
     /// Poll for readiness
-    pub fn poll(&self, pt: Option<&mut PollTable>) -> u16 {
+    pub fn poll(&self, pt: Option<&mut PollTable<'_>>) -> u16 {
         if let Some(poll_table) = pt {
             poll_table.poll_wait(&self.wait_queue);
         }
@@ -418,27 +420,26 @@ impl FileOps for TimerfdFileOps {
         self
     }
 
-    fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {
+    /// The expiration count, 8 bytes; a smaller buffer is EINVAL. The
+    /// ticks are taken under the lock and copied out after it.
+    fn read_iter(
+        &self,
+        file: &File,
+        to: &mut IovDest<'_>,
+        at: Option<u64>,
+        flags: RwFlags,
+    ) -> Result<usize, KernelError> {
+        let nb = nowait_rw(file, at, flags)?;
         let timerfd = file.private_ref::<Timerfd>().ok_or(KernelError::BadFd)?;
-        // timerfd read always returns 8 bytes (u64)
-        if buf.len() < 8 {
+        if to.len() < 8 {
             return Err(KernelError::InvalidArgument);
         }
-
-        let nonblock = file.get_flags() & flags::O_NONBLOCK != 0;
-        let count = timerfd.read(nonblock)?;
-
-        // Write u64 to buffer (little-endian)
-        buf[0..8].copy_from_slice(&count.to_le_bytes());
+        let count = timerfd.read(nb)?;
+        to.copy_to_full(&count.to_le_bytes())?;
         Ok(8)
     }
 
-    fn write(&self, _file: &File, _buf: &[u8]) -> Result<usize, KernelError> {
-        // timerfd doesn't support write
-        Err(KernelError::InvalidArgument)
-    }
-
-    fn poll(&self, file: &File, pt: Option<&mut PollTable>) -> u16 {
+    fn poll(&self, file: &File, pt: Option<&mut PollTable<'_>>) -> u16 {
         let Some(timerfd) = file.private_ref::<Timerfd>() else {
             return crate::io::poll::POLLERR;
         };
@@ -461,7 +462,7 @@ impl FileOps for TimerfdFileOps {
 /// # Returns
 /// Arc<File> for the new timerfd
 pub fn create_timerfd(clockid: i32, tfd_flags: i32) -> Result<Arc<File>, KernelError> {
-    let timerfd = Timerfd::new(clockid);
+    let timerfd = Timerfd::new(clockid)?;
 
     // Create dummy dentry for timerfd
 
@@ -471,8 +472,12 @@ pub fn create_timerfd(clockid: i32, tfd_flags: i32) -> Result<Arc<File>, KernelE
         file_flags |= flags::O_NONBLOCK;
     }
 
-    let file =
-        crate::fs::anon_inodes::anon_inode_getfile("[timerfd]", &TIMERFD_FOPS, timerfd, file_flags);
+    let file = crate::fs::anon_inodes::anon_inode_getfile(
+        "[timerfd]",
+        &TIMERFD_FOPS,
+        timerfd,
+        file_flags,
+    )?;
     Ok(file)
 }
 

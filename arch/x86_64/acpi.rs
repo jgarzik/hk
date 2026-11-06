@@ -10,7 +10,7 @@
 //! NOTE: ACPI tables can be located anywhere in physical memory, including
 //! above the identity-mapped region. We use ioremap to map tables before
 //! accessing them.
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use super::ioremap::{ioremap, iounmap};
 use crate::arch::PowerInfo;
@@ -65,7 +65,7 @@ pub struct CpuInfo {
 
 /// Information about an I/O APIC found in MADT
 #[derive(Debug, Clone, Copy)]
-#[allow(dead_code)] // Fields used for future I/O APIC configuration
+#[expect(dead_code)] // Fields used for future I/O APIC configuration
 pub struct IoApicInfo {
     /// I/O APIC ID
     pub id: u8,
@@ -157,12 +157,12 @@ fn map_acpi_table(phys_addr: u64) -> Result<*mut u8, &'static str> {
         let ptr = ioremap(phys_addr, header_size).map_err(|_| "Failed to ioremap SDT header")?;
 
         // Read length field using read_unaligned (packed struct)
-        let length_ptr = (ptr as *const u8).add(4) as *const u32; // offset of length field
+        let length_ptr = ptr.cast_const().add(4).cast::<u32>(); // offset of length field
         let length = core::ptr::read_unaligned(length_ptr);
         iounmap(ptr, header_size);
 
         // Now map the full table
-        ioremap(phys_addr, length as u64).map_err(|_| "Failed to ioremap ACPI table")
+        ioremap(phys_addr, u64::from(length)).map_err(|_| "Failed to ioremap ACPI table")
     }
 }
 
@@ -174,14 +174,14 @@ pub fn parse_acpi() -> Result<AcpiInfo, &'static str> {
     // Get RSDT or XSDT address (physical address, may be above 512MB!)
     let (sdt_phys, is_xsdt) = unsafe {
         if (*rsdp).revision >= 2 {
-            let rsdp2 = rsdp as *const Rsdp2;
+            let rsdp2 = rsdp.cast::<Rsdp2>();
             if (*rsdp2).xsdt_address != 0 {
                 ((*rsdp2).xsdt_address, true)
             } else {
-                ((*rsdp).rsdt_address as u64, false)
+                (u64::from((*rsdp).rsdt_address), false)
             }
         } else {
-            ((*rsdp).rsdt_address as u64, false)
+            (u64::from((*rsdp).rsdt_address), false)
         }
     };
 
@@ -242,10 +242,10 @@ fn search_rsdp(start: usize, length: usize) -> Option<*const Rsdp> {
         if signature == *RSDP_SIGNATURE {
             let ptr = virt(addr) as *const Rsdp;
             // Verify basic checksum (first 20 bytes)
-            if checksum_valid(ptr as *const u8, core::mem::size_of::<Rsdp>()) {
+            if checksum_valid(ptr.cast::<u8>(), core::mem::size_of::<Rsdp>()) {
                 // For ACPI 2.0+, also verify extended checksum (full 36 bytes)
                 let revision = unsafe { core::ptr::read_volatile(virt(addr + 15) as *const u8) };
-                if revision >= 2 && !checksum_valid(ptr as *const u8, core::mem::size_of::<Rsdp2>())
+                if revision >= 2 && !checksum_valid(ptr.cast::<u8>(), core::mem::size_of::<Rsdp2>())
                 {
                     // Extended checksum failed, keep searching
                     addr += 16;
@@ -318,12 +318,12 @@ fn for_each_table(
         let sdt_ptr = map_acpi_table(sdt_phys)?;
 
         // Read length using offset (packed struct)
-        let length_ptr = (sdt_ptr as *const u8).add(4) as *const u32;
+        let length_ptr = sdt_ptr.cast_const().add(4).cast::<u32>();
         let total_length = core::ptr::read_unaligned(length_ptr) as usize;
 
         // Validate RSDT/XSDT checksum (warn but continue per Linux behavior)
         let table_name = if is_xsdt { "XSDT" } else { "RSDT" };
-        validate_table_checksum(sdt_ptr as *const u8, total_length, table_name);
+        validate_table_checksum(sdt_ptr.cast_const(), total_length, table_name);
 
         let header_size = core::mem::size_of::<SdtHeader>();
         let entry_size = if is_xsdt { 8 } else { 4 };
@@ -336,7 +336,7 @@ fn for_each_table(
             let entry_phys = if is_xsdt {
                 core::ptr::read_unaligned(entry_ptr as *const u64)
             } else {
-                core::ptr::read_unaligned(entry_ptr as *const u32) as u64
+                u64::from(core::ptr::read_unaligned(entry_ptr as *const u32))
             };
 
             if table_signature(entry_phys).as_ref() == Some(signature) && !f(entry_phys) {
@@ -372,12 +372,12 @@ fn parse_madt_mapped(madt_phys: u64) -> Result<AcpiInfo, &'static str> {
         let madt_length = core::ptr::read_unaligned(length_ptr) as usize;
 
         // Validate MADT checksum (warn but continue per Linux behavior)
-        validate_table_checksum(madt_ptr as *const u8, madt_length, "MADT");
+        validate_table_checksum(madt_ptr.cast_const(), madt_length, "MADT");
 
         // Read fields using offsets (packed struct)
         // MadtHeader layout: SdtHeader (36 bytes) + lapic_address (4) + flags (4)
         let lapic_addr_ptr = madt_ptr.add(36) as *const u32;
-        let lapic_base = core::ptr::read_unaligned(lapic_addr_ptr) as u64;
+        let lapic_base = u64::from(core::ptr::read_unaligned(lapic_addr_ptr));
 
         let mut info = AcpiInfo {
             lapic_base,
@@ -413,7 +413,7 @@ fn parse_madt_mapped(madt_phys: u64) -> Result<AcpiInfo, &'static str> {
 
                     if enabled {
                         has_lapic_cpus = true;
-                        let apic_id = core::ptr::read_unaligned(ptr.add(3)) as u32;
+                        let apic_id = u32::from(core::ptr::read_unaligned(ptr.add(3)));
                         info.cpus.push(CpuInfo {
                             apic_id,
                             enabled,
@@ -530,7 +530,7 @@ impl Table {
         let mut b = [0; N];
         if off + N <= self.len {
             // SAFETY: in bounds of the mapped table
-            b = unsafe { core::ptr::read_unaligned(self.ptr.add(off) as *const [u8; N]) };
+            b = unsafe { core::ptr::read_unaligned(self.ptr.add(off).cast::<[u8; N]>()) };
         }
         b
     }
@@ -575,7 +575,7 @@ fn parse_fadt_mapped(fadt_phys: u64) -> Result<(PowerInfo, u64), &'static str> {
         acpi_enable: t.u8(fadt::ACPI_ENABLE),
     };
     let dsdt = match t.u64(fadt::X_DSDT) {
-        0 => t.u32(fadt::DSDT) as u64,
+        0 => u64::from(t.u32(fadt::DSDT)),
         x => x,
     };
 
@@ -658,6 +658,46 @@ fn table_s5(phys: u64, sig: &[u8; 4]) -> Option<SleepType> {
     s5
 }
 
+/// The SRAT entries in `entries` (the table past its header), each
+/// `[type, length, ...]`; a zero or overrunning length ends them
+fn srat_entries(mut entries: &[u8]) -> impl Iterator<Item = &[u8]> {
+    core::iter::from_fn(move || {
+        let len = usize::from(*entries.get(1)?);
+        if len < 2 || len > entries.len() {
+            return None;
+        }
+        let (e, rest) = entries.split_at(len);
+        entries = rest;
+        Some(e)
+    })
+}
+
+/// Call `f` with the proximity domain of each enabled SRAT entry, in the
+/// order Linux numbers them (acpi_numa_init): the CPU affinity entries
+/// (local APIC and x2APIC alike) in table order, then the memory ones
+fn srat_pxm_order(entries: &[u8], mut f: impl FnMut(u32)) {
+    let cpu = |e: &&[u8]| e[0] == SRAT_ENTRY_LAPIC_AFFINITY || e[0] == SRAT_ENTRY_X2APIC_AFFINITY;
+    let cpus = srat_entries(entries).filter(cpu);
+    let mem = srat_entries(entries).filter(|e| e[0] == SRAT_ENTRY_MEMORY_AFFINITY);
+    for pxm in cpus.chain(mem).filter_map(srat_entry_pxm) {
+        f(pxm);
+    }
+}
+
+/// The proximity domain of an enabled SRAT CPU or memory affinity entry
+fn srat_entry_pxm(e: &[u8]) -> Option<u32> {
+    let rd = |o: usize| Some(u32::from_le_bytes(e.get(o..o + 4)?.try_into().ok()?));
+    let b = |o: usize| e.get(o).copied().map(u32::from);
+    match e[0] {
+        SRAT_ENTRY_LAPIC_AFFINITY if rd(4)? & 1 != 0 => {
+            Some(b(2)? | (b(9)? << 8) | (b(10)? << 16) | (b(11)? << 24))
+        }
+        SRAT_ENTRY_X2APIC_AFFINITY if rd(12)? & 1 != 0 => rd(4),
+        SRAT_ENTRY_MEMORY_AFFINITY if rd(28)? & 1 != 0 => rd(2),
+        _ => None,
+    }
+}
+
 /// Initialize NUMA topology from ACPI SRAT/SLIT tables
 ///
 /// Called early in boot to discover NUMA topology. If SRAT is not found,
@@ -671,14 +711,14 @@ pub fn init_numa_topology() -> Result<bool, &'static str> {
     // Get RSDT or XSDT address
     let (sdt_phys, is_xsdt) = unsafe {
         if (*rsdp).revision >= 2 {
-            let rsdp2 = rsdp as *const Rsdp2;
+            let rsdp2 = rsdp.cast::<Rsdp2>();
             if (*rsdp2).xsdt_address != 0 {
                 ((*rsdp2).xsdt_address, true)
             } else {
-                ((*rsdp).rsdt_address as u64, false)
+                (u64::from((*rsdp).rsdt_address), false)
             }
         } else {
-            ((*rsdp).rsdt_address as u64, false)
+            (u64::from((*rsdp).rsdt_address), false)
         }
     };
 
@@ -735,13 +775,22 @@ fn parse_srat_mapped(srat_phys: u64) -> Result<(), &'static str> {
         let srat_length = core::ptr::read_unaligned(length_ptr) as usize;
 
         // Validate SRAT checksum
-        validate_table_checksum(srat_ptr as *const u8, srat_length, "SRAT");
+        validate_table_checksum(srat_ptr.cast_const(), srat_length, "SRAT");
 
         // SRAT header: SdtHeader (36) + Reserved (4) + Reserved (8) = 48 bytes
         let entries_start = srat_ptr.add(48);
         let entries_end = srat_ptr.add(srat_length);
 
         let mut topology = NUMA_TOPOLOGY.lock();
+
+        // Number the proximity domains first, in Linux's order
+        let entries = core::slice::from_raw_parts(
+            entries_start,
+            entries_end.offset_from(entries_start) as usize,
+        );
+        srat_pxm_order(entries, |pxm| {
+            let _ = topology.acpi_map_pxm(pxm);
+        });
 
         // First pass: collect memory affinity entries to build nodes
         let mut ptr = entries_start;
@@ -760,10 +809,10 @@ fn parse_srat_mapped(srat_phys: u64) -> Result<(), &'static str> {
                 // 16: length_lo (4), 20: length_hi (4), 24: reserved (4)
                 // 28: flags (4), 32: reserved (8)
                 let prox_domain_lo = core::ptr::read_unaligned(ptr.add(2) as *const u32);
-                let base_lo = core::ptr::read_unaligned(ptr.add(8) as *const u32) as u64;
-                let base_hi = core::ptr::read_unaligned(ptr.add(12) as *const u32) as u64;
-                let len_lo = core::ptr::read_unaligned(ptr.add(16) as *const u32) as u64;
-                let len_hi = core::ptr::read_unaligned(ptr.add(20) as *const u32) as u64;
+                let base_lo = u64::from(core::ptr::read_unaligned(ptr.add(8) as *const u32));
+                let base_hi = u64::from(core::ptr::read_unaligned(ptr.add(12) as *const u32));
+                let len_lo = u64::from(core::ptr::read_unaligned(ptr.add(16) as *const u32));
+                let len_hi = u64::from(core::ptr::read_unaligned(ptr.add(20) as *const u32));
                 let flags = core::ptr::read_unaligned(ptr.add(28) as *const u32);
 
                 // Bit 0: Enabled
@@ -772,7 +821,9 @@ fn parse_srat_mapped(srat_phys: u64) -> Result<(), &'static str> {
                 if enabled {
                     let base_addr = base_lo | (base_hi << 32);
                     let length = len_lo | (len_hi << 32);
-                    let node_id = prox_domain_lo as usize;
+                    let node_id = topology
+                        .pxm_to_node(prox_domain_lo)
+                        .unwrap_or(MAX_NUMA_NODES);
 
                     if node_id < MAX_NUMA_NODES && length > 0 {
                         let start_pfn = base_addr / 4096;
@@ -818,25 +869,27 @@ fn parse_srat_mapped(srat_phys: u64) -> Result<(), &'static str> {
                     // 0: type (1), 1: length (1), 2: proximity_domain_lo (1)
                     // 3: apic_id (1), 4: flags (4), 8: sapic_eid (1)
                     // 9: proximity_domain_hi (3), 12: clock_domain (4)
-                    let prox_domain_lo = core::ptr::read_unaligned(ptr.add(2)) as u32;
-                    let apic_id = core::ptr::read_unaligned(ptr.add(3)) as u32;
+                    let prox_domain_lo = u32::from(core::ptr::read_unaligned(ptr.add(2)));
+                    let apic_id = u32::from(core::ptr::read_unaligned(ptr.add(3)));
                     let flags = core::ptr::read_unaligned(ptr.add(4) as *const u32);
                     let prox_hi_bytes: [u8; 3] = [
                         core::ptr::read_unaligned(ptr.add(9)),
                         core::ptr::read_unaligned(ptr.add(10)),
                         core::ptr::read_unaligned(ptr.add(11)),
                     ];
-                    let prox_domain_hi = (prox_hi_bytes[0] as u32)
-                        | ((prox_hi_bytes[1] as u32) << 8)
-                        | ((prox_hi_bytes[2] as u32) << 16);
+                    let prox_domain_hi = u32::from(prox_hi_bytes[0])
+                        | (u32::from(prox_hi_bytes[1]) << 8)
+                        | (u32::from(prox_hi_bytes[2]) << 16);
 
                     let enabled = (flags & 0x1) != 0;
 
                     if enabled {
-                        let node_id = (prox_domain_lo | (prox_domain_hi << 8)) as usize;
+                        let node_id = topology
+                            .pxm_to_node(prox_domain_lo | (prox_domain_hi << 8))
+                            .unwrap_or(MAX_NUMA_NODES);
                         // By APIC id: the logical CPU joins at bring-up
                         if node_id < MAX_NUMA_NODES {
-                            topology.set_hwid_node(apic_id as u64, node_id as u32);
+                            topology.set_hwid_node(u64::from(apic_id), node_id as u32);
                         }
                     }
                 }
@@ -853,10 +906,10 @@ fn parse_srat_mapped(srat_phys: u64) -> Result<(), &'static str> {
                     let enabled = (flags & 0x1) != 0;
 
                     if enabled {
-                        let node_id = prox_domain as usize;
+                        let node_id = topology.pxm_to_node(prox_domain).unwrap_or(MAX_NUMA_NODES);
                         // By x2APIC id: the logical CPU joins at bring-up
                         if node_id < MAX_NUMA_NODES {
-                            topology.set_hwid_node(x2apic_id as u64, node_id as u32);
+                            topology.set_hwid_node(u64::from(x2apic_id), node_id as u32);
                         }
                     }
                 }
@@ -883,7 +936,7 @@ fn parse_srat_mapped(srat_phys: u64) -> Result<(), &'static str> {
 
 /// Parse SLIT table for inter-node distance matrix
 fn parse_slit_mapped(slit_phys: u64) -> Result<(), &'static str> {
-    use crate::mm::numa::{MAX_NUMA_NODES, NUMA_TOPOLOGY};
+    use crate::mm::numa::NUMA_TOPOLOGY;
 
     unsafe {
         // Map the SLIT
@@ -894,26 +947,37 @@ fn parse_slit_mapped(slit_phys: u64) -> Result<(), &'static str> {
         let slit_length = core::ptr::read_unaligned(length_ptr) as usize;
 
         // Validate SLIT checksum
-        validate_table_checksum(slit_ptr as *const u8, slit_length, "SLIT");
+        validate_table_checksum(slit_ptr.cast_const(), slit_length, "SLIT");
 
         // SLIT header: SdtHeader (36) + Number of System Localities (8)
         let num_localities = core::ptr::read_unaligned(slit_ptr.add(36) as *const u64) as usize;
 
-        if num_localities > MAX_NUMA_NODES {
-            iounmap(slit_ptr, slit_length as u64);
-            return Err("SLIT has too many localities");
-        }
-
         // Distance matrix starts at offset 44, stored as 1D array [from][to]
+        if num_localities
+            .checked_mul(num_localities)
+            .and_then(|m| m.checked_add(44))
+            .is_none_or(|end| end > slit_length)
+        {
+            iounmap(slit_ptr, slit_length as u64);
+            return Err("SLIT shorter than its matrix");
+        }
         let matrix_start = slit_ptr.add(44);
 
         let mut topology = NUMA_TOPOLOGY.lock();
 
+        // Localities are proximity domains: only those SRAT numbered
+        // have nodes (Linux acpi_parse_slit -> pxm_to_node)
         for from in 0..num_localities {
             for to in 0..num_localities {
+                let (Some(f), Some(t)) = (
+                    topology.pxm_to_node(from as u32),
+                    topology.pxm_to_node(to as u32),
+                ) else {
+                    continue;
+                };
                 let offset = from * num_localities + to;
                 let distance = core::ptr::read_unaligned(matrix_start.add(offset));
-                topology.set_distance(from, to, distance);
+                topology.set_distance(f, t, distance);
             }
         }
 
@@ -921,5 +985,62 @@ fn parse_slit_mapped(slit_phys: u64) -> Result<(), &'static str> {
         iounmap(slit_ptr, slit_length as u64);
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lapic(pxm: u8) -> [u8; 16] {
+        let mut e = [0u8; 16];
+        e[0] = SRAT_ENTRY_LAPIC_AFFINITY;
+        e[1] = 16;
+        e[2] = pxm;
+        e[4] = 1; // enabled
+        e
+    }
+
+    fn x2apic(pxm: u32) -> [u8; 24] {
+        let mut e = [0u8; 24];
+        e[0] = SRAT_ENTRY_X2APIC_AFFINITY;
+        e[1] = 24;
+        e[4..8].copy_from_slice(&pxm.to_le_bytes());
+        e[12] = 1;
+        e
+    }
+
+    fn mem(pxm: u32, enabled: bool) -> [u8; 40] {
+        let mut e = [0u8; 40];
+        e[0] = SRAT_ENTRY_MEMORY_AFFINITY;
+        e[1] = 40;
+        e[2..6].copy_from_slice(&pxm.to_le_bytes());
+        e[28] = u8::from(enabled);
+        e
+    }
+
+    fn order(parts: &[&[u8]]) -> alloc::vec::Vec<u32> {
+        let table: alloc::vec::Vec<u8> = parts.iter().flat_map(|p| p.iter().copied()).collect();
+        let mut out = alloc::vec::Vec::new();
+        srat_pxm_order(&table, |p| out.push(p));
+        out
+    }
+
+    /// CPU entries of both kinds in table order, then memory (Linux
+    /// acpi_numa_init); disabled entries skipped
+    #[test]
+    fn pxm_order_is_linux() {
+        let got = order(&[
+            &mem(9, true),
+            &lapic(0),
+            &x2apic(7),
+            &mem(3, false),
+            &lapic(4),
+        ]);
+        assert_eq!(got, [0, 7, 4, 9]);
+        // A zero length ends the walk
+        let mut bad = lapic(1);
+        bad[1] = 0;
+        assert_eq!(order(&[&lapic(2), &bad, &lapic(3)]), [2]);
     }
 }

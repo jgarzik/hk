@@ -97,7 +97,7 @@ pub fn check_syscall(
 fn verdict(result: u32) -> Verdict {
     match result & SECCOMP_RET_ACTION_FULL {
         SECCOMP_RET_ALLOW | SECCOMP_RET_LOG => Verdict::Allow,
-        SECCOMP_RET_ERRNO => Verdict::Ret(-((result & SECCOMP_RET_DATA).min(MAX_ERRNO) as i64)),
+        SECCOMP_RET_ERRNO => Verdict::Ret(-i64::from((result & SECCOMP_RET_DATA).min(MAX_ERRNO))),
         SECCOMP_RET_TRAP => Verdict::Trap,
         // No tracer (hk has no PTRACE_EVENT_SECCOMP) and no listener:
         // ENOSYS, the syscall skipped

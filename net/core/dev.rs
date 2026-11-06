@@ -34,6 +34,7 @@
 //!   `dev_queue_xmit` callers, with no lock held by this module.
 //! - `NAPI_LIST`: `crate::sync::spin::Mutex`, thread context only, leaf.
 
+use crate::util::kalloc::arc_nofail;
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::sync::{Arc, Weak};
@@ -80,7 +81,7 @@ pub struct Tap<'a> {
 
 /// Tap handler (Linux ptype_all, for AF_PACKET): sees every frame
 /// without consuming it
-pub type PacketTap = fn(&Tap);
+pub type PacketTap = fn(&Tap<'_>);
 
 /// Most taps (each address family registers one)
 const MAX_TAPS: usize = 4;
@@ -105,7 +106,7 @@ pub fn dev_add_tap(tap: PacketTap) {
 }
 
 /// Show a frame to the taps (copied out: called without the lock)
-fn deliver_taps(t: &Tap) {
+fn deliver_taps(t: &Tap<'_>) {
     let taps = *PTYPE_ALL.read();
     for tap in taps.iter().flatten() {
         tap(t);
@@ -152,7 +153,8 @@ pub struct Napi {
 impl Napi {
     /// Create a NAPI context; attach the driver with [`netif_napi_add`]
     pub fn new(weight: usize) -> Arc<Self> {
-        Arc::new(Self {
+        // Driver probe has no failure path
+        arc_nofail(Self {
             sched: AtomicBool::new(false),
             disable: AtomicBool::new(false),
             weight: weight.clamp(1, NAPI_POLL_WEIGHT),

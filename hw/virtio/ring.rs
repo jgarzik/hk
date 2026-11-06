@@ -18,7 +18,7 @@
 //! The free list and descriptor chains are tracked in a driver-private
 //! shadow (`next`, Linux `desc_extra`): the driver never trusts link
 //! fields in memory the device can write.
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -172,15 +172,15 @@ impl Vring {
     }
 
     fn desc(&self, i: u16) -> *mut Desc {
-        unsafe { (self.base as *mut Desc).add(i as usize) }
+        unsafe { self.base.cast::<Desc>().add(i as usize) }
     }
 
     fn avail16(&self, i: usize) -> *mut u16 {
-        unsafe { (self.base.add(self.lay.avail) as *mut u16).add(i) }
+        unsafe { self.base.add(self.lay.avail).cast::<u16>().add(i) }
     }
 
     fn used16(&self, i: usize) -> *mut u16 {
-        unsafe { (self.base.add(self.lay.used) as *mut u16).add(i) }
+        unsafe { self.base.add(self.lay.used).cast::<u16>().add(i) }
     }
 
     fn used_elem(&self, slot: u16) -> *const u32 {
@@ -260,7 +260,7 @@ impl Vring {
         let e = self.used_elem(self.last_used & (self.num - 1));
         let id = u32::from_le(unsafe { read_volatile(e) });
         let len = u32::from_le(unsafe { read_volatile(e.add(1)) });
-        if id >= self.num as u32 || self.chain[id as usize] == 0 {
+        if id >= u32::from(self.num) || self.chain[id as usize] == 0 {
             // Linux BAD_RING: stop using the queue
             self.broken = true;
             return None;

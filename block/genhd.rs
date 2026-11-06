@@ -19,6 +19,7 @@ use spin::Once;
 use crate::base::{Class, Device, DeviceInfo, device_create};
 use crate::fs::kernfs::{self, KNode};
 use crate::util::error::KernelError;
+use crate::util::kalloc::try_arc;
 
 use super::blkdev::{
     BLKDEV_REGISTRY, BioOp, BlockDevice, Disk, bdev_rw_bytes, disk_bdevs, disk_release,
@@ -109,7 +110,7 @@ type BAttr = (&'static [u8], fn(&BlockDevice) -> String);
 /// Attributes both disks and partitions have
 const COMMON_ATTRS: [BAttr; 4] = [
     (b"size", |b| format!("{}\n", b.nr_sects())),
-    (b"ro", |b| format!("{}\n", b.ro() as u8)),
+    (b"ro", |b| format!("{}\n", u8::from(b.ro()))),
     (b"alignment_offset", |_| String::from("0\n")),
     (b"discard_alignment", |_| String::from("0\n")),
 ];
@@ -148,7 +149,7 @@ fn disk_attrs(dev: &Arc<Device>) -> Result<(), KernelError> {
         }),
         (b"optimal_io_size", |_| String::from("0\n")),
         (b"rotational", |b| {
-            format!("{}\n", b.disk.queue.limits.rotational as u8)
+            format!("{}\n", u8::from(b.disk.queue.limits.rotational))
         }),
         (b"max_sectors_kb", |b| {
             format!("{}\n", b.disk.queue.limits.max_sectors / 2)
@@ -226,13 +227,13 @@ pub fn add_disk(
     disk: Arc<Disk>,
     parent: Option<&Arc<Device>>,
 ) -> Result<Arc<BlockDevice>, KernelError> {
-    let whole = Arc::new(BlockDevice::new(
+    let whole = try_arc(BlockDevice::new(
         disk.clone(),
         0,
         0,
         disk.capacity(),
         disk.name.clone(),
-    ));
+    ))?;
     register_bdev(whole.clone())?;
     bdev_device_add(&whole, parent);
     if disk.minors > 1 {
@@ -250,13 +251,17 @@ fn scan_partitions(whole: &BlockDevice) {
     let mut rd = |s: u64, b: &mut [u8; 512]| bdev_rw_bytes(whole, BioOp::Read, s << 9, b);
     let parts = part::scan(&mut rd, whole.nr_sects(), disk.minors as usize);
     for (no, p) in parts {
-        let b = Arc::new(BlockDevice::new(
+        // A partition that cannot be had is skipped (Linux
+        // blk_add_partition)
+        let Ok(b) = try_arc(BlockDevice::new(
             disk.clone(),
             no,
             p.start,
             p.size,
             part_name(&disk.name, no),
-        ));
+        )) else {
+            continue;
+        };
         if register_bdev(b.clone()).is_ok() {
             bdev_device_add(&b, parent.as_ref());
         }

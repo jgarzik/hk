@@ -20,6 +20,8 @@
 pub mod syscall;
 
 use crate::sync::spin::Mutex;
+use crate::util::error::KernelError;
+use crate::util::kalloc::{arc_nofail, try_arc};
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -526,11 +528,11 @@ impl SigHand {
     /// Deep clone for fork (without CLONE_SIGHAND)
     ///
     /// Creates a new SigHand with copies of all signal actions.
-    pub fn deep_clone(self: &Arc<Self>) -> Arc<Self> {
+    pub fn deep_clone(self: &Arc<Self>) -> Result<Arc<Self>, KernelError> {
         // Allocated before the lock is taken: SigHand.action stays a leaf
         let mut actions = default_actions();
         actions.clone_from_slice(&self.action.lock());
-        Arc::new(Self {
+        try_arc(Self {
             action: IrqSpinlock::new(actions),
             signalfd_wq: crate::sync::waitqueue::WaitQueue::new(),
         })
@@ -663,8 +665,15 @@ pub struct SharedPending(Option<Arc<Mutex<SigPending>>>);
 static NO_SHARED: Mutex<SigPending> = Mutex::new(SigPending::new());
 
 impl SharedPending {
+    /// A new set where failure cannot be reported (the boot-time init
+    /// task, and the exiting task's state handed back by `mem::take`)
     pub fn new() -> Self {
-        Self(Some(Arc::new(Mutex::new(SigPending::new()))))
+        Self(Some(arc_nofail(Mutex::new(SigPending::new()))))
+    }
+
+    /// A new set, or ENOMEM
+    pub fn try_new() -> Result<Self, KernelError> {
+        Ok(Self(Some(try_arc(Mutex::new(SigPending::new()))?)))
     }
 
     pub fn lock(&self) -> crate::sync::spin::MutexGuard<'_, SigPending> {
@@ -692,13 +701,22 @@ impl TaskSignalState {
         }
     }
 
-    /// Create new task signal state
+    /// Create new task signal state (infallible: see `SharedPending::new`)
     pub fn new() -> Self {
+        Self::with_shared(SharedPending::new())
+    }
+
+    /// Create new task signal state, or ENOMEM
+    pub fn try_new() -> Result<Self, KernelError> {
+        Ok(Self::with_shared(SharedPending::try_new()?))
+    }
+
+    fn with_shared(shared_pending: SharedPending) -> Self {
         Self {
             blocked: SigSet::EMPTY,
             saved_sigmask: SigSet::EMPTY,
             pending: SigPending::new(),
-            shared_pending: SharedPending::new(),
+            shared_pending,
             altstack: AltStack::new(),
             real_blocked: SigSet::EMPTY,
             fault: None,
@@ -735,15 +753,16 @@ use crate::task::percpu::TASKLIST;
 
 /// Initialize signal state for a new task
 ///
-/// Called when creating a new process (init, fork without CLONE_SIGHAND).
-/// Also initializes the SignalStruct (which contains rlimits).
+/// Called when creating the init process at boot (failure cannot be
+/// reported). Also initializes the SignalStruct (which contains rlimits).
 pub fn init_task_signal(tid: Tid, sighand: Arc<SigHand>) {
+    // Built before TASKLIST is taken
+    let s = arc_nofail(SignalStruct::new());
     let mut table = TASKLIST.write();
     if let Some(mut task) = table.get_mut(tid) {
         task.sighand = Some(sighand);
         *task.task.sig.lock() = TaskSignalState::new();
         task.task.set_sigpending(false);
-        let s = Arc::new(SignalStruct::new());
         task.task.set_cpu_group(&s);
         task.signal = Some(s);
     }
@@ -805,7 +824,20 @@ where
     Some(r)
 }
 
-/// Clone signal state for fork/clone
+/// A child's shared signal objects, built by `fork_signal` before the
+/// child exists and attached by `install_fork_signal`
+pub struct ForkSignal {
+    sighand: Arc<SigHand>,
+    signal: Arc<SignalStruct>,
+    /// CLONE_THREAD
+    share_signal: bool,
+    /// `signal` is the parent's: the child is one more live thread
+    joined: bool,
+}
+
+/// Build a child's signal state for fork/clone, or ENOMEM (Linux
+/// copy_sighand, copy_signal): its per-task state (for `Task::new`) and
+/// its shared objects
 ///
 /// If `share_sighand` is true (CLONE_SIGHAND), share the Arc<SigHand>.
 /// Otherwise, deep clone the signal handlers.
@@ -814,13 +846,12 @@ where
 ///
 /// If `clear_sighand` is true (CLONE_CLEAR_SIGHAND), reset all handlers to default
 /// after cloning (except SIG_IGN handlers which are preserved).
-pub fn clone_task_signal(
+pub fn fork_signal(
     parent_tid: Tid,
-    child_tid: Tid,
     share_sighand: bool,
     share_pending: bool,
     clear_sighand: bool,
-) {
+) -> Result<(TaskSignalState, ForkSignal), KernelError> {
     // Get parent's sighand and signal_state
     let (parent_sighand, parent_state) = {
         let table = TASKLIST.read();
@@ -833,13 +864,16 @@ pub fn clone_task_signal(
 
     let child_sighand = if share_sighand {
         // CLONE_SIGHAND: share the same SigHand
-        parent_sighand.unwrap_or_else(|| Arc::new(SigHand::new()))
+        match parent_sighand {
+            Some(sh) => sh,
+            None => try_arc(SigHand::new())?,
+        }
     } else {
         // Fork: deep clone handlers
-        let sighand = parent_sighand
-            .as_ref()
-            .map(|sh| sh.deep_clone())
-            .unwrap_or_else(|| Arc::new(SigHand::new()));
+        let sighand = match parent_sighand {
+            Some(sh) => sh.deep_clone()?,
+            None => try_arc(SigHand::new())?,
+        };
 
         // CLONE_CLEAR_SIGHAND: reset handlers to default (except SIG_IGN)
         if clear_sighand {
@@ -859,29 +893,45 @@ pub fn clone_task_signal(
                 // CLONE_THREAD: share thread-group pending
                 parent_state.shared_pending.clone()
             } else {
-                SharedPending::new()
+                SharedPending::try_new()?
             },
             altstack: AltStack::new(), // Child starts with no altstack
             real_blocked: SigSet::EMPTY,
             fault: None,
         }
     } else {
-        TaskSignalState::new()
+        TaskSignalState::try_new()?
     };
-
-    // Update child task
-    {
-        let mut table = TASKLIST.write();
-        if let Some(mut child) = table.get_mut(child_tid) {
-            child.sighand = Some(child_sighand);
-            *child.task.sig.lock() = child_state;
-            child.task.set_sigpending(false);
-        }
-    }
 
     // Clone or share SignalStruct (contains rlimits)
     // CLONE_THREAD (share_pending) implies threads share SignalStruct
-    clone_task_signal_struct(parent_tid, child_tid, share_pending);
+    let (signal, joined) = fork_signal_struct(parent_tid, share_pending)?;
+    let fork = ForkSignal {
+        sighand: child_sighand,
+        signal,
+        share_signal: share_pending,
+        joined,
+    };
+    Ok((child_state, fork))
+}
+
+/// Attach a new task's shared signal objects, once it is in TASKLIST
+pub fn install_fork_signal(child_tid: Tid, f: ForkSignal) {
+    if f.joined {
+        // CLONE_THREAD: one more live thread
+        f.signal.thread_added();
+    }
+    if !f.share_signal {
+        // An inherited finite RLIMIT_CPU is watched from the start (Linux
+        // posix_cpu_timers_init_group)
+        crate::time::cpu_timer::rlimit_cpu_changed(&f.signal, child_tid);
+    }
+    let mut table = TASKLIST.write();
+    if let Some(mut child) = table.get_mut(child_tid) {
+        child.sighand = Some(f.sighand);
+        child.task.set_cpu_group(&f.signal);
+        child.signal = Some(f.signal);
+    }
 }
 
 /// Clean up signal state on task exit
@@ -1610,7 +1660,7 @@ impl SignalStruct {
             if cur & GROUP_EXIT != 0 || (cur & GROUP_EXEC != 0 && !over_exec) {
                 return false;
             }
-            let new = GROUP_EXIT | code as u32 as u64;
+            let new = GROUP_EXIT | u64::from(code as u32);
             match self
                 .group_exit
                 .compare_exchange(cur, new, Ordering::AcqRel, Ordering::Acquire)
@@ -1685,11 +1735,11 @@ impl SignalStruct {
     }
 
     /// Deep clone for fork (without CLONE_THREAD)
-    pub fn deep_clone(self: &Arc<Self>) -> Arc<Self> {
+    pub fn deep_clone(self: &Arc<Self>) -> Result<Arc<Self>, KernelError> {
         let rlim = self.rlim.lock();
         let mut new_rlim = [RLimit::default(); RLIM_NLIMITS];
         new_rlim.copy_from_slice(&*rlim);
-        Arc::new(Self {
+        try_arc(Self {
             rlim: IrqSpinlock::new(new_rlim),
             cred_guard: crate::sync::Mutex::new(()),
             exec_update: crate::sync::RwSem::new(()),
@@ -1722,39 +1772,22 @@ pub fn get_task_signal_struct(tid: Tid) -> Option<Arc<SignalStruct>> {
     table.get(tid).and_then(|t| t.signal.clone())
 }
 
-/// Clone signal struct for fork/clone
+/// A new task's signal struct for fork/clone, and whether it is the
+/// parent's; ENOMEM
 ///
-/// If `share_signal` is true (CLONE_THREAD), share the Arc<SignalStruct>.
-/// Otherwise, deep clone the signal struct.
-fn clone_task_signal_struct(parent_tid: Tid, child_tid: Tid, share_signal: bool) {
-    let parent_signal = get_task_signal_struct(parent_tid);
-
-    let child_signal = if share_signal {
-        // CLONE_THREAD: share the same SignalStruct, one more live thread
-        match parent_signal {
-            Some(s) => {
-                s.thread_added();
-                s
-            }
-            None => Arc::new(SignalStruct::new()),
-        }
-    } else {
+/// If `share_signal` is true (CLONE_THREAD), share the Arc<SignalStruct>
+/// (`install_fork_signal` counts the new thread live). Otherwise, deep
+/// clone the signal struct.
+fn fork_signal_struct(
+    parent_tid: Tid,
+    share_signal: bool,
+) -> Result<(Arc<SignalStruct>, bool), KernelError> {
+    match get_task_signal_struct(parent_tid) {
+        // CLONE_THREAD: share the same SignalStruct
+        Some(s) if share_signal => Ok((s, true)),
         // Fork: deep clone
-        parent_signal
-            .as_ref()
-            .map(|s| s.deep_clone())
-            .unwrap_or_else(|| Arc::new(SignalStruct::new()))
-    };
-
-    // An inherited finite RLIMIT_CPU is watched from the start (Linux
-    // posix_cpu_timers_init_group)
-    if !share_signal {
-        crate::time::cpu_timer::rlimit_cpu_changed(&child_signal, child_tid);
-    }
-    let mut table = TASKLIST.write();
-    if let Some(mut child) = table.get_mut(child_tid) {
-        child.task.set_cpu_group(&child_signal);
-        child.signal = Some(child_signal);
+        Some(s) => Ok((s.deep_clone()?, false)),
+        None => Ok((try_arc(SignalStruct::new())?, false)),
     }
 }
 

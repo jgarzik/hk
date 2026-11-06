@@ -15,6 +15,7 @@
 //! (uname is called frequently, sethostname/setdomainname are rare).
 
 use crate::sync::spin::RwLock;
+use crate::util::kalloc::{arc_nofail, try_arc};
 use alloc::sync::Arc;
 use spin::Lazy;
 
@@ -113,7 +114,6 @@ pub struct UtsNamespace {
     ///
     /// None = init user namespace (root always has CAP_SYS_ADMIN)
     /// Future: proper user namespace with capability checking
-    #[allow(dead_code)]
     user_ns: Option<Arc<super::UserNamespace>>,
 }
 
@@ -151,10 +151,11 @@ impl UtsNamespace {
         // Copy current name values
         let name_copy = *self.name.read();
 
-        Ok(Arc::new(Self {
+        try_arc(Self {
             name: RwLock::new(name_copy),
             user_ns: self.user_ns.clone(),
-        }))
+        })
+        .map_err(|e| e.errno())
     }
 }
 
@@ -162,7 +163,8 @@ impl UtsNamespace {
 ///
 /// The root UTS namespace used by all tasks unless they create
 /// a new one via clone(CLONE_NEWUTS) or unshare(CLONE_NEWUTS).
-pub static INIT_UTS_NS: Lazy<Arc<UtsNamespace>> = Lazy::new(|| Arc::new(UtsNamespace::new_init()));
+pub static INIT_UTS_NS: Lazy<Arc<UtsNamespace>> =
+    Lazy::new(|| arc_nofail(UtsNamespace::new_init()));
 
 // ============================================================================
 // Helper Functions
@@ -207,7 +209,7 @@ pub fn sys_uname(buf: u64) -> i64 {
     // SAFETY: NewUtsname is repr(C) plain bytes with no padding
     let bytes = unsafe {
         core::slice::from_raw_parts(
-            &tmp as *const NewUtsname as *const u8,
+            (&raw const tmp).cast::<u8>(),
             core::mem::size_of::<NewUtsname>(),
         )
     };

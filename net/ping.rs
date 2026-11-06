@@ -16,6 +16,7 @@
 //! separate leaves. Receive takes the table read lock, clones the `Arc`
 //! and queues after dropping it.
 
+use crate::util::kalloc::try_arc_cyclic;
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
@@ -71,9 +72,9 @@ pub fn create() -> Result<Arc<dyn ProtoOps>, KernelError> {
     }
     // INET_PROTOSW_REUSE: identifiers are shared unless a socket clears
     // SO_REUSEADDR
-    let sk = Sock::new(net, AF_INET, SOCK_DGRAM, IPPROTO_ICMP as i32);
+    let sk = Sock::new(net, AF_INET, SOCK_DGRAM, i32::from(IPPROTO_ICMP));
     sk.set_flag(sf::REUSEADDR, true);
-    Ok(Arc::new_cyclic(|me| PingSock {
+    Ok(try_arc_cyclic(|me| PingSock {
         sk,
         inet: Inet::default(),
         op: Mutex::new(()),
@@ -81,7 +82,7 @@ pub fn create() -> Result<Arc<dyn ProtoOps>, KernelError> {
         hashed: AtomicBool::new(false),
         rxq: RxQueue::default(),
         me: me.clone(),
-    }))
+    })?)
 }
 
 impl PingSock {
@@ -153,7 +154,7 @@ impl PingSock {
     }
 
     /// Destination of a send (Linux ping_v4_sendmsg; no port)
-    fn dest(&self, m: &SendMsg) -> Result<Ipv4Addr, KernelError> {
+    fn dest(&self, m: &SendMsg<'_>) -> Result<Ipv4Addr, KernelError> {
         match &m.addr {
             Some(a) => Ok(af_inet::sin_parse(a, false)?.0),
             None if self.connected.load(Ordering::Acquire) => Ok(self.inet.get().daddr),
@@ -312,7 +313,7 @@ impl ProtoOps for PingSock {
     }
 
     /// Linux ping_v4_sendmsg (after inet_sendmsg's autobind)
-    fn sendmsg(&self, m: &mut SendMsg, flags: i32) -> Result<usize, KernelError> {
+    fn sendmsg(&self, m: &mut SendMsg<'_>, flags: i32) -> Result<usize, KernelError> {
         self.autobind()?;
         let len = m.data.len();
         if len > 0xffff {
@@ -363,7 +364,7 @@ impl ProtoOps for PingSock {
 
     /// Linux ping_recvmsg: ICMP header + payload, source address with
     /// port 0
-    fn recvmsg(&self, m: &mut RecvMsg, flags: i32) -> Result<usize, KernelError> {
+    fn recvmsg(&self, m: &mut RecvMsg<'_>, flags: i32) -> Result<usize, KernelError> {
         if flags & MSG_OOB != 0 {
             return Err(KernelError::OperationNotSupported);
         }
@@ -458,7 +459,7 @@ pub fn ping_rcv(net: &NetNamespace, skb: &SkBuff) {
 }
 
 /// An ICMP error about one of our echo requests (Linux ping_err)
-pub fn ping_err(net: &NetNamespace, e: &IcmpErr) {
+pub fn ping_err(net: &NetNamespace, e: &IcmpErr<'_>) {
     let l4 = e.l4();
     if l4[0] != icmp_type::ECHO || l4[1] != 0 {
         return;

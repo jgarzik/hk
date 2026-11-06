@@ -9,6 +9,7 @@ pub mod numa;
 
 extern crate alloc;
 
+use crate::util::kalloc::{arc_cyclic_nofail, box_nofail};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU8, AtomicU32, AtomicUsize, Ordering};
@@ -25,6 +26,7 @@ pub mod asid;
 #[cfg(feature = "mmcheck")]
 pub mod check;
 pub mod fault;
+pub mod fault_inject;
 pub mod filemap;
 pub mod gather;
 pub mod huge_page;
@@ -145,7 +147,7 @@ pub static MM_CTLS: &[crate::sysctl::Ctl] = &[crate::sysctl::Ctl {
     mode: 0o644,
     show: || alloc::vec![max_map_count() as i64],
     store: |v| {
-        crate::sysctl::range(v[0], 0, i32::MAX as i64)?;
+        crate::sysctl::range(v[0], 0, i64::from(i32::MAX))?;
         MAX_MAP_COUNT.store(v[0] as usize, Ordering::Relaxed);
         Ok(())
     },
@@ -162,7 +164,7 @@ pub const STACK_GUARD_GAP: u64 = 256 * 1024;
 pub struct MmStruct {
     /// List of VMAs, sorted by start address; each its own allocation
     /// (Linux vm_area_cachep: the VMA slab cache)
-    #[allow(clippy::vec_box)]
+    #[expect(clippy::vec_box)]
     vmas: Vec<alloc::boxed::Box<Vma>>,
     /// Top of the mmap region: allocations grow down from here
     mmap_base: u64,
@@ -419,7 +421,9 @@ impl MmStruct {
             .position(|v| v.start > vma.start)
             .unwrap_or(self.vmas.len());
         self.link(&vma);
-        self.vmas.insert(pos, alloc::boxed::Box::new(vma));
+        // VMA allocation failure is not plumbed to the ~20 callers (the
+        // Vec growth beside it cannot fail gracefully either)
+        self.vmas.insert(pos, box_nofail(vma));
         pos
     }
 
@@ -765,7 +769,8 @@ impl MmStruct {
         }
 
         // Clone VMA for the second half
-        let mut new_vma = alloc::boxed::Box::new((**vma).clone());
+        // Not plumbed: see `insert_vma`
+        let mut new_vma = box_nofail((**vma).clone());
         new_vma.start = split_addr;
         // Bounded: pgoff + pages fits (pgoff <= TASK_SIZE / 4KB at
         // creation and only ever lowered by growth)
@@ -969,7 +974,10 @@ impl MmRef {
     /// A new address space rooted at `pgd`, with one user, whose VMAs
     /// `build` makes knowing the address space (for rmap chains)
     fn new_cyclic(pgd: u64, build: impl FnOnce(&Weak<Mm>) -> MmStruct) -> Self {
-        MmRef(Arc::new_cyclic(|me| Mm {
+        // Not try_arc_cyclic: that runs `build` with preemption off, and
+        // dup_mm's copies the page tables under the parent's mmap_lock.
+        // The failure is not plumbed (fork, exec and boot callers)
+        MmRef(arc_cyclic_nofail(|me| Mm {
             users: AtomicUsize::new(1),
             pgd,
             map: RwSem::new(build(me)),
@@ -1068,6 +1076,27 @@ pub fn exit_task_mm(tid: Tid) -> Option<Arc<Mm>> {
 /// is left out and a VM_WIPEONFORK one starts empty. Memory locks are not
 /// inherited (VM_LOCKED cleared, locked_vm and MCL_FUTURE reset). On
 /// error the partial copy is torn down with the child mm.
+/// Fork copies the parent's entries of `v` (Linux vma_needs_copy): not
+/// for a wipe-on-fork range, nor for a shared mapping whose pages the
+/// child faults back in from a shared object or the page cache.
+/// Copying those would race a truncate: one that already passed the
+/// child's i_mmap entry would miss what fork copies after it. A private
+/// mapping is copied (its copy-on-write pages exist only in its
+/// entries), and so is a shared mapping of a file without a page cache,
+/// whose faults would read a private copy (Linux copies VM_PFNMAP and
+/// VM_MIXEDMAP mappings likewise).
+fn vma_needs_copy(v: &Vma) -> bool {
+    if v.flags & VM_WIPEONFORK != 0 {
+        return false;
+    }
+    let refaults = v.shmem.is_some()
+        || v.file
+            .as_ref()
+            .and_then(|f| f.mapping_inode())
+            .is_some_and(|i| i.i_op.maps_cache());
+    !(v.is_shared() && refaults)
+}
+
 pub fn dup_mm(parent: &MmRef, pgd: u64) -> Result<MmRef, i32> {
     let Ok(guard) = parent.mmap_write_killable() else {
         // The child mm was never built: its table is ours to free
@@ -1091,20 +1120,28 @@ pub fn dup_mm(parent: &MmRef, pgd: u64) -> Result<MmRef, i32> {
             }
             let mut v = vma.clone();
             v.flags &= !VM_LOCKED_MASK;
-            if v.flags & VM_WIPEONFORK != 0 {
-                v.anon_vma = v.anon_vma.as_ref().map(|_| anon_vma::AnonVma::new());
+            if v.flags & VM_WIPEONFORK != 0 && v.anon_vma.is_some() {
+                match anon_vma::AnonVma::new() {
+                    Ok(av) => v.anon_vma = Some(av),
+                    Err(e) => {
+                        // Not linked: the child is torn down below
+                        res = Err(e.errno());
+                        break;
+                    }
+                }
             }
             // In the chain before its pages are copied (Linux
             // anon_vma_fork before copy_page_range)
             map.link(&v);
-            if v.flags & VM_WIPEONFORK == 0 {
+            if vma_needs_copy(&v) {
                 res = memory::copy_page_range(pgd, parent, &v).map(|wp| {
                     if wp {
                         tlb::flush_tlb_mm_range(parent, v.start, v.end, tlb::PAGE_SHIFT, false);
                     }
                 });
             }
-            map.vmas.push(alloc::boxed::Box::new(v));
+            // Not plumbed: see `insert_vma`
+            map.vmas.push(box_nofail(v));
             if res.is_err() {
                 break;
             }
@@ -1121,7 +1158,7 @@ pub fn dup_mm(parent: &MmRef, pgd: u64) -> Result<MmRef, i32> {
         .membarrier
         .store(parent.membarrier.load(Ordering::Relaxed), Ordering::Relaxed);
     // On error `child` goes with its partial copy (outside the lock)
-    res.map(|_| child)
+    res.map(|()| child)
 }
 
 /// A fresh, empty address space for exec / the first task, rooted at
@@ -1144,6 +1181,50 @@ mod tests {
 
     fn spans(m: &MmStruct) -> Vec<(u64, u64)> {
         m.iter().map(|v| (v.start, v.end)).collect()
+    }
+
+    #[test]
+    fn free_area_top_down() {
+        // Empty: just below mmap_base
+        let m = map(&[]);
+        assert_eq!(m.find_free_area(0x1000), Some(0x6fff_f000));
+        // A VMA straddling mmap_base: below its start
+        let m = map(&[(0x6fff_0000, 0x7001_0000)]);
+        assert_eq!(m.find_free_area(0x1000), Some(0x6ffe_f000));
+        // An exact-fit gap is taken, the highest one first
+        let m = map(&[(0x5000_0000, 0x6000_0000), (0x6000_1000, 0x7000_0000)]);
+        assert_eq!(m.find_free_area(0x1000), Some(0x6000_0000));
+        assert_eq!(m.find_free_area(0x2000), Some(0x4fff_e000));
+        // Nothing fits above MMAP_MIN_ADDR
+        let m = map(&[]);
+        assert_eq!(m.find_free_area(0x7000_0000 - MMAP_MIN_ADDR + 0x1000), None);
+    }
+
+    #[test]
+    fn gap_around_bounds() {
+        let m = map(&[]);
+        let (floor, ceiling) = m.gap_around(0x1000_0000, 0x1000_1000);
+        assert_eq!(floor, 0);
+        assert!(ceiling >= 0x1000_1000);
+        let m = map(&[(0x1000, 0x2000), (0x9000, 0xa000)]);
+        assert_eq!(m.gap_around(0x4000, 0x5000), (0x2000, 0x9000));
+    }
+
+    #[test]
+    fn split_then_merge_back() {
+        let mut m = map(&[(0x10000, 0x20000)]);
+        m.split_at(0x14000);
+        assert_eq!(spans(&m), [(0x10000, 0x14000), (0x14000, 0x20000)]);
+        let i = m.find_vma_exact(0x14000).unwrap();
+        m.merge_adjacent(i);
+        assert_eq!(spans(&m), [(0x10000, 0x20000)]);
+        // Different protections do not merge
+        let mut m = map(&[(0x10000, 0x20000)]);
+        m.split_at(0x14000);
+        let i = m.find_vma_exact(0x14000).unwrap();
+        m.vmas[i].prot = PROT_READ | super::PROT_WRITE;
+        m.merge_adjacent(i);
+        assert_eq!(m.iter().count(), 2);
     }
 
     #[test]
@@ -1180,7 +1261,7 @@ mod tests {
     fn chain_follows_vma_changes() {
         let mut m = MmStruct::new(0x7000_0000);
         m.set_owner(&Weak::new(), 7);
-        let av = anon_vma::AnonVma::new();
+        let av = anon_vma::AnonVma::new().unwrap();
         let rw = PROT_READ | PROT_WRITE;
         let flags = MAP_PRIVATE | MAP_ANONYMOUS;
         m.insert_vma(Vma::new_anon(0x10000, 0x20000, rw, flags, av.clone()));

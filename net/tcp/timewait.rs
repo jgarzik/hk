@@ -15,6 +15,8 @@
 //! Locking: `inner` is a `crate::sync::spin::Mutex` leaf like `TcpSock.cb` (thread
 //! context only; table and timer locks may be taken under it).
 
+use crate::util::error::KernelError;
+use crate::util::kalloc::try_arc_cyclic;
 use alloc::sync::{Arc, Weak};
 
 use crate::sync::spin::Mutex;
@@ -46,8 +48,8 @@ impl TimeWait {
         params: IpParams,
         oif: u32,
         cb: TwCb,
-    ) -> Arc<Self> {
-        Arc::new_cyclic(|me| Self {
+    ) -> Result<Arc<Self>, KernelError> {
+        try_arc_cyclic(|me| Self {
             tuple,
             bind,
             net,
@@ -73,7 +75,7 @@ impl TimeWait {
 
     /// A segment for this tuple. False: it is a new connection's SYN,
     /// this entry is gone and the caller hands it to a listener.
-    pub fn rcv(self: &Arc<Self>, s: &SegIn, now: u64) -> bool {
+    pub fn rcv(self: &Arc<Self>, s: &SegIn<'_>, now: u64) -> bool {
         let mut out = Out::default();
         {
             let mut g = self.inner.lock();

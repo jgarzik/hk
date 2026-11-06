@@ -17,7 +17,7 @@ use crate::signal::{
     send_signal_to_process, with_task_signal_state,
 };
 use crate::task::percpu::{current_pgid, current_tid, get_all_pids};
-use crate::uaccess::{get_user, put_user};
+use crate::uaccess::{UserPtr, get_user, put_user};
 use crate::util::error::KernelError;
 
 /// SIG_BLOCK - Add signals to blocked mask
@@ -42,6 +42,13 @@ pub struct UserSigAction {
     /// Signals to block during handler
     pub sa_mask: u64, // sigset_t is 64-bit
 }
+
+crate::pod!(UserSigAction {
+    sa_handler,
+    sa_flags,
+    sa_restorer,
+    sa_mask,
+});
 
 impl From<&SigAction> for UserSigAction {
     fn from(action: &SigAction) -> Self {
@@ -86,71 +93,46 @@ pub fn sys_rt_sigaction(sig: u32, act_ptr: u64, oact_ptr: u64, sigsetsize: u64) 
         return -22; // EINVAL
     }
 
-    // Cannot change SIGKILL or SIGSTOP
-    if sig == SIGKILL || sig == SIGSTOP {
+    // SIGKILL and SIGSTOP can be queried, not changed (Linux
+    // do_sigaction: `act && sig_kernel_only(sig)`)
+    if act_ptr != 0 && (sig == SIGKILL || sig == SIGSTOP) {
         return -22; // EINVAL
     }
 
-    let tid = current_tid();
-    let sighand = match get_task_sighand(tid) {
-        Some(sh) => sh,
-        None => return -3, // ESRCH
+    // The new action is read before the old one is written (Linux
+    // copy_from_user, do_sigaction, copy_to_user): act and oact may be
+    // one buffer
+    let new = if act_ptr != 0 {
+        match UserPtr::<UserSigAction>::new(act_ptr).read() {
+            Ok(a) => Some(SigAction::from(a)),
+            Err(_) => return -14, // EFAULT
+        }
+    } else {
+        None
     };
 
-    // Get old action if requested
-    if oact_ptr != 0 && sighand.get_action(sig).is_some() {
-        let old_action = sighand.get_action(sig).unwrap();
-        let user_action: UserSigAction = (&old_action).into();
-
-        // Write to user space as raw bytes
-        if put_user::<Uaccess, u64>(oact_ptr, user_action.sa_handler).is_err() {
-            return -14; // EFAULT
-        }
-        if put_user::<Uaccess, u64>(oact_ptr + 8, user_action.sa_flags).is_err() {
-            return -14; // EFAULT
-        }
-        if put_user::<Uaccess, u64>(oact_ptr + 16, user_action.sa_restorer).is_err() {
-            return -14; // EFAULT
-        }
-        if put_user::<Uaccess, u64>(oact_ptr + 24, user_action.sa_mask).is_err() {
-            return -14; // EFAULT
-        }
+    let tid = current_tid();
+    let Some(sighand) = get_task_sighand(tid) else {
+        return -3; // ESRCH
+    };
+    // The old action and the swap in one hold of the action lock
+    let old = match new {
+        Some(a) => match sighand.set_action(sig, a) {
+            Ok(old) => old,
+            Err(e) => return i64::from(e),
+        },
+        None => match sighand.get_action(sig) {
+            Some(a) => a,
+            None => return -22, // EINVAL
+        },
+    };
+    if oact_ptr != 0
+        && UserPtr::<UserSigAction>::new(oact_ptr)
+            .write(&UserSigAction::from(&old))
+            .is_err()
+    {
+        return -14; // EFAULT
     }
-
-    // Set new action if provided
-    if act_ptr != 0 {
-        // Read from user space
-        let sa_handler = match get_user::<Uaccess, u64>(act_ptr) {
-            Ok(v) => v,
-            Err(_) => return -14, // EFAULT
-        };
-        let sa_flags = match get_user::<Uaccess, u64>(act_ptr + 8) {
-            Ok(v) => v,
-            Err(_) => return -14, // EFAULT
-        };
-        let sa_restorer = match get_user::<Uaccess, u64>(act_ptr + 16) {
-            Ok(v) => v,
-            Err(_) => return -14, // EFAULT
-        };
-        let sa_mask = match get_user::<Uaccess, u64>(act_ptr + 24) {
-            Ok(v) => v,
-            Err(_) => return -14, // EFAULT
-        };
-
-        let user_action = UserSigAction {
-            sa_handler,
-            sa_flags,
-            sa_restorer,
-            sa_mask,
-        };
-
-        let new_action: SigAction = user_action.into();
-
-        if let Err(e) = sighand.set_action(sig, new_action) {
-            return e as i64;
-        }
-    }
-
     0
 }
 
@@ -374,10 +356,12 @@ pub fn sys_kill(pid: i64, sig: u32) -> i64 {
     }
 
     if pid > 0 {
-        user_group_send(pid as u64, sig) as i64
+        i64::from(user_group_send(pid as u64, sig))
     } else if pid == 0 {
         // Every process in the caller's process group, once each
-        kill_pgrp(current_pgid(), sig, |p| check_kill_permission(p, sig)) as i64
+        i64::from(kill_pgrp(current_pgid(), sig, |p| {
+            check_kill_permission(p, sig)
+        }))
     } else if pid == -1 {
         // Send to all processes (except init)
         // Signal 0 is a validity check, don't actually send
@@ -409,7 +393,7 @@ pub fn sys_kill(pid: i64, sig: u32) -> i64 {
         // pid < -1: every process in group -pid, once each (signal 0:
         // does the group exist, may we signal it)
         let pgid = pid.unsigned_abs();
-        kill_pgrp(pgid, sig, |p| check_kill_permission(p, sig)) as i64
+        i64::from(kill_pgrp(pgid, sig, |p| check_kill_permission(p, sig)))
     }
 }
 
@@ -427,7 +411,7 @@ pub fn sys_tgkill(tgid: i64, tid: i64, sig: u32) -> i64 {
         return -22; // EINVAL
     }
 
-    user_thread_send(Some(tgid as u64), tid as u64, sig) as i64
+    i64::from(user_thread_send(Some(tgid as u64), tid as u64, sig))
 }
 
 /// tkill(tid, sig) - send signal to thread (deprecated)
@@ -438,7 +422,7 @@ pub fn sys_tkill(tid: i64, sig: u32) -> i64 {
     if sig > 64 || tid <= 0 {
         return -22; // EINVAL
     }
-    user_thread_send(None, tid as u64, sig) as i64
+    i64::from(user_thread_send(None, tid as u64, sig))
 }
 
 /// rt_sigqueueinfo(pid, sig, uinfo) - send signal with info to a process
@@ -465,7 +449,7 @@ pub fn sys_rt_sigqueueinfo(pid: i64, sig: u32, uinfo: u64) -> i64 {
     // Read siginfo from user space
     let info = match SigInfo::read_from_user(uinfo, sig) {
         Ok(i) => i,
-        Err(e) => return -(e as i64),
+        Err(e) => return -i64::from(e),
     };
 
     // Security check (Linux kernel/signal.c do_rt_sigqueueinfo): si_code
@@ -476,7 +460,7 @@ pub fn sys_rt_sigqueueinfo(pid: i64, sig: u32, uinfo: u64) -> i64 {
         return -1; // EPERM
     }
 
-    user_group_send(pid as u64, sig) as i64
+    i64::from(user_group_send(pid as u64, sig))
 }
 
 /// rt_tgsigqueueinfo(tgid, tid, sig, uinfo) - send signal with info to a thread
@@ -506,7 +490,7 @@ pub fn sys_rt_tgsigqueueinfo(tgid: i64, tid: i64, sig: u32, uinfo: u64) -> i64 {
     // Read siginfo from user space
     let info = match SigInfo::read_from_user(uinfo, sig) {
         Ok(i) => i,
-        Err(e) => return -(e as i64),
+        Err(e) => return -i64::from(e),
     };
 
     // Security check (Linux do_rt_tgsigqueueinfo): kernel-reserved si_code
@@ -516,7 +500,7 @@ pub fn sys_rt_tgsigqueueinfo(tgid: i64, tid: i64, sig: u32, uinfo: u64) -> i64 {
         return -1; // EPERM
     }
 
-    user_thread_send(Some(tgid as u64), tid as u64, sig) as i64
+    i64::from(user_thread_send(Some(tgid as u64), tid as u64, sig))
 }
 
 /// rt_sigsuspend(mask, sigsetsize) - wait for signal with temporary mask
@@ -856,7 +840,7 @@ pub fn sys_rt_sigtimedwait(set_ptr: u64, info_ptr: u64, ts_ptr: u64, sigsetsize:
             return KernelError::BadAddress.sysret();
         }
     }
-    sig as i64
+    i64::from(sig)
 }
 
 /// Dequeue the lowest pending signal of `mask` (private, then shared)
@@ -1064,8 +1048,8 @@ pub fn sys_signalfd4(fd: i32, mask_ptr: u64, sizemask: u64, flags: i32) -> i64 {
         };
 
         match table.alloc_with_flags(file, fd_flags, nofile_limit) {
-            Ok(new_fd) => new_fd as i64,
-            Err(e) => -(e as i64),
+            Ok(new_fd) => i64::from(new_fd),
+            Err(e) => -i64::from(e),
         }
     } else {
         // Update existing signalfd mask
@@ -1083,7 +1067,7 @@ pub fn sys_signalfd4(fd: i32, mask_ptr: u64, sizemask: u64, flags: i32) -> i64 {
         match get_signalfd(&file) {
             Some(signalfd) => {
                 signalfd.update_mask(mask);
-                fd as i64
+                i64::from(fd)
             }
             None => -22, // EINVAL - not a signalfd
         }

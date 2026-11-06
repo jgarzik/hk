@@ -7,7 +7,7 @@
 //!
 //! The SYS_* constants are x86-64 Linux ABI specific. Other architectures
 //! (e.g., aarch64) have different syscall numbers.
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use crate::syscall::Sys;
 
@@ -723,7 +723,8 @@ pub fn init() {
     // sysret loads: CS = STAR[63:48] + 16, SS = STAR[63:48] + 8
     // So we put (USER_DATA_SELECTOR - 8) in bits 63:48
 
-    let star = ((KERNEL_CODE_SELECTOR as u64) << 32) | (((USER_DATA_SELECTOR as u64) - 8) << 48);
+    let star =
+        (u64::from(KERNEL_CODE_SELECTOR) << 32) | ((u64::from(USER_DATA_SELECTOR) - 8) << 48);
 
     // LSTAR: target RIP for syscall
     let lstar = super::entry::syscall_entry as *const () as u64;

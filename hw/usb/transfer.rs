@@ -5,7 +5,7 @@
 //!
 //! Unlike the Command Ring which is shared across all devices, each endpoint
 //! has a dedicated Transfer Ring for submitting transfer TRBs.
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{Ordering, fence};
@@ -38,7 +38,7 @@ impl Trb {
 
     /// Set TRB type (bits 15:10)
     pub fn set_type(&mut self, trb_type: u8) {
-        self.control = (self.control & !0xFC00) | ((trb_type as u32) << 10);
+        self.control = (self.control & !0xFC00) | (u32::from(trb_type) << 10);
     }
 
     /// Get TRB type
@@ -104,12 +104,12 @@ impl Trb {
 
     /// Set TD Size field (bits 21:17) - number of remaining packets
     pub fn set_td_size(&mut self, td_size: u8) {
-        self.status = (self.status & !(0x1F << 17)) | (((td_size as u32) & 0x1F) << 17);
+        self.status = (self.status & !(0x1F << 17)) | ((u32::from(td_size) & 0x1F) << 17);
     }
 
     /// Set Interrupter Target (bits 31:22)
     pub fn set_interrupter_target(&mut self, target: u16) {
-        self.status = (self.status & !(0x3FF << 22)) | (((target as u32) & 0x3FF) << 22);
+        self.status = (self.status & !(0x3FF << 22)) | ((u32::from(target) & 0x3FF) << 22);
     }
 
     /// Create a Normal TRB for data transfer
@@ -143,7 +143,7 @@ impl Trb {
         trb.set_transfer_length(8);
         trb.set_idt(true); // Immediate Data
         // Transfer type: 0=No Data, 2=OUT Data, 3=IN Data
-        trb.control |= (transfer_type as u32) << 16;
+        trb.control |= u32::from(transfer_type) << 16;
         trb
     }
 
@@ -174,7 +174,7 @@ impl Trb {
 }
 
 /// TRB types
-#[allow(non_snake_case)]
+#[expect(non_snake_case)]
 pub mod TrbType {
     /// Normal TRB - used for bulk/interrupt data transfers
     pub const NORMAL: u8 = 1;
@@ -233,7 +233,7 @@ pub mod TrbType {
 }
 
 /// TRB completion codes
-#[allow(non_snake_case)]
+#[expect(non_snake_case)]
 pub mod CompletionCode {
     pub const INVALID: u8 = 0;
     pub const SUCCESS: u8 = 1;
@@ -298,7 +298,7 @@ impl TransferRing {
             core::ptr::write_bytes(dma.cpu_addr(), 0, FRAME_SIZE);
         }
 
-        let trbs = dma.cpu_addr() as *mut Trb;
+        let trbs = dma.cpu_addr().cast::<Trb>();
         let size = Self::DEFAULT_SIZE;
 
         // Set up Link TRB at the end
@@ -336,7 +336,7 @@ impl TransferRing {
     /// Set TR Dequeue Pointer command moves a halted endpoint
     pub fn enqueue_ptr(&self) -> u64 {
         let addr = self.dma.dma_addr().as_u64() + (self.enqueue * 16) as u64;
-        addr | self.cycle as u64
+        addr | u64::from(self.cycle)
     }
 
     /// Enqueue the TRBs of one TD and return their DMA addresses. The
@@ -352,7 +352,7 @@ impl TransferRing {
         }
         if !trbs.is_empty() {
             // SAFETY: `first` < size: a TRB slot of this ring's page
-            let p = unsafe { (self.dma.cpu_addr() as *mut Trb).add(first) };
+            let p = unsafe { self.dma.cpu_addr().cast::<Trb>().add(first) };
             // SAFETY: as above; the ring is only touched under its owner's
             // lock
             unsafe {
@@ -375,7 +375,7 @@ impl TransferRing {
     /// advance it
     fn write(&mut self, mut trb: Trb, cycle: bool) -> u64 {
         let index = self.enqueue;
-        let trbs = self.dma.cpu_addr() as *mut Trb;
+        let trbs = self.dma.cpu_addr().cast::<Trb>();
         let trb_ptr = unsafe { trbs.add(index) };
 
         trb.set_cycle(cycle);
@@ -447,7 +447,7 @@ impl TransferRing {
                 first_addr = addr;
             }
 
-            offset += chunk as u64;
+            offset += u64::from(chunk);
             remaining -= chunk;
         }
 

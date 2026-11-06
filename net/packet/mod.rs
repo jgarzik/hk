@@ -31,6 +31,7 @@
 mod opts;
 mod rcv;
 
+use crate::util::kalloc::try_arc;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
@@ -154,7 +155,7 @@ pub fn create(stype: i32, protocol: i32) -> Result<Arc<dyn ProtoOps>, KernelErro
     }
     let proto = u16::from_be(protocol as u16);
     let net = crate::net::current_net_ns();
-    let s = Arc::new(PacketSock {
+    let s = try_arc(PacketSock {
         sk: Sock::new(net.clone(), AF_PACKET, stype, protocol),
         bind: AtomicU64::new(pack(proto, 0)),
         flags: AtomicU32::new(0),
@@ -163,7 +164,7 @@ pub fn create(stype: i32, protocol: i32) -> Result<Arc<dyn ProtoOps>, KernelErro
         packets: AtomicU32::new(0),
         drops: AtomicU32::new(0),
         mclist: Mutex::new(Vec::new()),
-    });
+    })?;
     net.packet.insert(&s);
     Ok(s)
 }
@@ -216,7 +217,7 @@ pub fn netdev_unregister(
 
 /// The `bind` word of (protocol, ifindex)
 fn pack(proto: u16, ifindex: i32) -> u64 {
-    ((proto as u64) << 32) | ifindex as u32 as u64
+    (u64::from(proto) << 32) | u64::from(ifindex as u32)
 }
 
 fn unpack(w: u64) -> (u16, i32) {
@@ -243,7 +244,7 @@ impl PacketSock {
 
     /// Identity for skipping our own outgoing frames
     fn id(&self) -> usize {
-        self as *const Self as usize
+        core::ptr::from_ref::<Self>(self) as usize
     }
 
     fn dev(&self, ifindex: i32) -> Option<Arc<NetDevice>> {
@@ -255,7 +256,7 @@ impl PacketSock {
 
     /// Destination of a send, from msg_name or the binding (Linux
     /// packet_snd)
-    fn dest(&self, m: &SendMsg) -> Result<Dest, KernelError> {
+    fn dest(&self, m: &SendMsg<'_>) -> Result<Dest, KernelError> {
         let Some(a) = &m.addr else {
             let (proto, ifindex) = self.bound();
             let dev = self.dev(ifindex).ok_or(KernelError::NoDeviceOrAddress)?;
@@ -470,7 +471,7 @@ impl ProtoOps for PacketSock {
     }
 
     /// Linux packet_snd
-    fn sendmsg(&self, m: &mut SendMsg, _flags: i32) -> Result<usize, KernelError> {
+    fn sendmsg(&self, m: &mut SendMsg<'_>, _flags: i32) -> Result<usize, KernelError> {
         let Dest { dev, proto, addr } = self.dest(m)?;
         if !dev.is_up() {
             return Err(KernelError::NetworkDown);
@@ -490,7 +491,7 @@ impl ProtoOps for PacketSock {
     }
 
     /// Linux packet_recvmsg
-    fn recvmsg(&self, m: &mut RecvMsg, flags: i32) -> Result<usize, KernelError> {
+    fn recvmsg(&self, m: &mut RecvMsg<'_>, flags: i32) -> Result<usize, KernelError> {
         let ok = MSG_PEEK | MSG_DONTWAIT | MSG_TRUNC | MSG_ERRQUEUE;
         if flags & !ok != 0 {
             return Err(KernelError::InvalidArgument);

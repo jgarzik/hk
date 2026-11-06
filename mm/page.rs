@@ -422,7 +422,7 @@ const _: () = assert!(SECTION_MAP == 2 << 20 && core::mem::size_of::<Page>() == 
 
 /// Fill the `len` bytes of fresh boot memory at `pa` with struct pages
 fn init_pages(pa: u64, len: u64) {
-    let p = crate::arch::phys_to_virt(pa) as *mut Page;
+    let p = crate::arch::phys_to_virt(pa).cast::<Page>();
     for i in 0..(len as usize / core::mem::size_of::<Page>()) {
         // SAFETY: fresh memory for that many struct pages
         unsafe { p.add(i).write(Page::new()) };
@@ -588,7 +588,7 @@ mod tests {
 
     #[test]
     fn anon_mapping_holds_a_reference() {
-        let av = AnonVma::new();
+        let av = AnonVma::new().unwrap();
         let page = Page::new();
         page.set_anon_mapping(&av);
         assert_eq!(Arc::strong_count(&av), 2);
@@ -607,7 +607,7 @@ mod tests {
 
     #[test]
     fn free_prepare_resets() {
-        let av = AnonVma::new();
+        let av = AnonVma::new().unwrap();
         let page = Page::new();
         page.set_anon_mapping(&av);
         page.inc_mapcount();

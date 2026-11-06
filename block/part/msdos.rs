@@ -19,8 +19,8 @@ fn entry(s: &[u8; 512], i: usize) -> (u8, u8, u64, u64) {
     (
         s[o],
         s[o + 4],
-        le32(s, o + 8) as u64,
-        le32(s, o + 12) as u64,
+        u64::from(le32(s, o + 8)),
+        u64::from(le32(s, o + 12)),
     )
 }
 

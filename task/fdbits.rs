@@ -19,7 +19,7 @@ const NR_OPEN_MIN: i64 = BITS as i64;
 const NR_OPEN_MAX: i64 = i32::MAX as i64 & -(BITS as i64);
 
 pub fn nr_open() -> u64 {
-    NR_OPEN.load(Ordering::Relaxed) as u64
+    u64::from(NR_OPEN.load(Ordering::Relaxed))
 }
 
 /// /proc/sys/fs files of the descriptor table

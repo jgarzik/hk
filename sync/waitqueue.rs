@@ -57,7 +57,15 @@
 //! else nests inside it, but what an entry's wake function takes (an
 //! IrqSpinlock leaf). Never call a `wait*` function while holding a
 //! spinlock, and never wake while holding this CPU's run-queue lock.
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+
+/// A lock guard that can let its lock go for a while (the waits that
+/// take a guard: [`WaitQueue::wait_event_interruptible_locked`])
+pub trait Relock {
+    /// Release the lock, run `f`, take the lock again, also when `f`
+    /// unwinds (host tests), so the guard is never released twice
+    fn unlocked<R>(&mut self, f: impl FnOnce() -> R) -> R;
+}
 
 use core::marker::PhantomPinned;
 use core::pin::Pin;
@@ -86,6 +94,11 @@ pub type WakeFn = fn(&WaitEntry, WakeMode, usize) -> bool;
 /// A task's registration on one wait queue (Linux `wait_queue_entry`)
 ///
 /// Pin it (on the stack: `pin!(WaitEntry::new())`) before linking it.
+///
+/// # Invariants
+/// `wq` is the queue the entry is linked on, or null when unlinked; it
+/// and `link` change only under that queue's lock, and a waker clears
+/// `wq` last (Release). `task` outlives the entry's time on a queue.
 pub struct WaitEntry {
     link: Link,
     /// The waiting task (the entry is unlinked before it can go away)
@@ -102,7 +115,7 @@ pub struct WaitEntry {
 }
 
 // SAFETY: the links and `task` are only followed under the owning
-// queue's lock (see the module docs)
+// queue's lock (type invariant)
 unsafe impl Sync for WaitEntry {}
 unsafe impl Send for WaitEntry {}
 
@@ -118,7 +131,7 @@ impl WaitEntry {
     pub fn with_func(func: Option<WakeFn>, private: usize) -> Self {
         Self {
             link: Link::new(),
-            task: &*current() as *const Task,
+            task: &raw const *current(),
             flags: AtomicU8::new(0),
             func,
             private,
@@ -189,7 +202,7 @@ impl WaitQueue {
             return;
         }
         w.flags.store(flags, Ordering::Relaxed);
-        let p = &*w as *const WaitEntry;
+        let p = &raw const *w;
         // SAFETY: pinned, on no list, unlinked before it goes (Drop)
         unsafe {
             if flags & WQ_EXCLUSIVE != 0 {
@@ -198,7 +211,10 @@ impl WaitQueue {
                 list.push_front(p);
             }
         }
-        w.wq.store(self as *const Self as *mut Self, Ordering::Release);
+        w.wq.store(
+            core::ptr::from_ref::<Self>(self).cast_mut(),
+            Ordering::Release,
+        );
     }
 
     /// Register `w` (if not registered) and set the current task's state
@@ -231,7 +247,7 @@ impl WaitQueue {
         let mut list = self.head.lock();
         if core::ptr::eq(w.wq.load(Ordering::Relaxed), self) {
             // SAFETY: on this list (its queue pointer says so)
-            unsafe { list.remove(&*w) };
+            unsafe { list.remove(&raw const *w) };
             w.wq.store(core::ptr::null_mut(), Ordering::Release);
         }
     }
@@ -409,7 +425,51 @@ impl WaitQueue {
         exclusive: bool,
     ) -> Result<u64, KernelError> {
         crate::sync::might_sleep();
-        if cond() {
+        self.wait_ctx(
+            &mut (),
+            |()| cond(),
+            |(), t| schedule_timeout(t),
+            timeout,
+            state,
+            exclusive,
+        )
+    }
+
+    /// Sleep until `cond(guard)` is true or a signal is pending, with
+    /// the lock `guard` holds taken around every check and let go only
+    /// while asleep (Linux wait_event_interruptible_locked, Rust-for-Linux
+    /// CondVar::wait). Returns with the lock held, `Ok` with the
+    /// condition true or `Err(KernelError::RestartSys)` on a signal.
+    /// A waker makes the condition true under the lock and wakes after.
+    /// Lock order: the guard's lock, then this queue's.
+    pub fn wait_event_interruptible_locked<G: Relock>(
+        &self,
+        guard: &mut G,
+        cond: impl FnMut(&mut G) -> bool,
+    ) -> Result<(), KernelError> {
+        self.wait_ctx(
+            guard,
+            cond,
+            |g, t| g.unlocked(|| schedule_timeout(t)),
+            MAX_SCHEDULE_TIMEOUT,
+            SleepState::Interruptible,
+            false,
+        )
+        .map(|_| ())
+    }
+
+    /// The wait loop: `cond(ctx)` is checked after queueing, `sleep(ctx,
+    /// ticks)` sleeps and returns the ticks left
+    fn wait_ctx<C>(
+        &self,
+        ctx: &mut C,
+        mut cond: impl FnMut(&mut C) -> bool,
+        mut sleep: impl FnMut(&mut C, u64) -> u64,
+        timeout: u64,
+        state: SleepState,
+        exclusive: bool,
+    ) -> Result<u64, KernelError> {
+        if cond(ctx) {
             return Ok(timeout.max(1));
         }
         let w = core::pin::pin!(WaitEntry::new());
@@ -423,7 +483,7 @@ impl WaitQueue {
         let mut left = timeout;
         let result = loop {
             prepare(w.as_ref());
-            if cond() {
+            if cond(ctx) {
                 break Ok(left.max(1));
             }
             if interrupted(state) {
@@ -435,11 +495,11 @@ impl WaitQueue {
             if left == 0 {
                 break Ok(0);
             }
-            left = schedule_timeout(left);
+            left = sleep(ctx, left);
             if left == 0 {
                 // Timed out: one last look (Linux __wait_event_timeout)
                 prepare(w.as_ref());
-                break Ok(if cond() { 1 } else { 0 });
+                break Ok(if cond(ctx) { 1 } else { 0 });
             }
         };
         // A waker that picked this exclusive entry (it is no longer
@@ -667,9 +727,9 @@ fn test_page_wait_table_hash() {
 
     // These should be different wait queues (different bucket indices)
     // We test by checking their addresses are different
-    let addr1 = wq1 as *const WaitQueue as usize;
-    let addr2 = wq2 as *const WaitQueue as usize;
-    let addr3 = wq3 as *const WaitQueue as usize;
+    let addr1 = core::ptr::from_ref::<WaitQueue>(wq1) as usize;
+    let addr2 = core::ptr::from_ref::<WaitQueue>(wq2) as usize;
+    let addr3 = core::ptr::from_ref::<WaitQueue>(wq3) as usize;
 
     // At least 2 of 3 should be different (with good hash)
     let different_count = (if addr1 != addr2 { 1 } else { 0 })
@@ -688,4 +748,35 @@ fn test_page_wait_table_hash() {
     );
 
     printkln!("  page wait table hash: OK");
+}
+
+#[cfg(test)]
+mod relock_tests {
+    extern crate std;
+    use super::Relock;
+    use crate::arch::IrqSpinlock;
+    use core::panic::AssertUnwindSafe;
+
+    /// A closure that unwinds out of `unlocked` leaves the lock held
+    /// again, so the guard still owns it (no double release)
+    #[test]
+    fn irqspinlock_relocks_on_unwind() {
+        let l = IrqSpinlock::new(0u32);
+        let mut g = l.lock();
+        let r = std::panic::catch_unwind(AssertUnwindSafe(|| g.unlocked(|| panic!("boom"))));
+        assert!(r.is_err());
+        assert!(l.try_lock().is_none(), "lock released by the unwind");
+        *g += 1;
+        drop(g);
+        assert_eq!(*l.lock(), 1);
+    }
+
+    #[test]
+    fn relock_after_normal_return() {
+        let l = IrqSpinlock::new(5u32);
+        let mut g = l.lock();
+        assert_eq!(g.unlocked(|| 7), 7);
+        assert!(l.try_lock().is_none());
+        drop(g);
+    }
 }

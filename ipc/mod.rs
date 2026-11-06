@@ -31,6 +31,8 @@ pub mod sem;
 pub mod shm;
 mod util;
 
+use crate::util::error::KernelError;
+use crate::util::kalloc::{arc_nofail, try_arc};
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU32, AtomicU64};
 use spin::Lazy;
@@ -142,7 +144,7 @@ impl IpcNamespace {
     /// Creates a new empty namespace with same limits.
     /// IPC objects are NOT copied - new namespace starts empty.
     pub fn clone_ns(&self) -> Result<Arc<Self>, i32> {
-        Ok(Arc::new(Self {
+        try_arc(Self {
             sem_ids: IpcIds::new(),
             msg_ids: IpcIds::new(),
             shm_ids: IpcIds::new(),
@@ -157,7 +159,8 @@ impl IpcNamespace {
             shm_ctlall: self.shm_ctlall,
             shm_tot: AtomicU64::new(0),
             shm_ctlmni: self.shm_ctlmni,
-        }))
+        })
+        .map_err(KernelError::errno)
     }
 
     /// Get semaphore IDs table
@@ -186,7 +189,7 @@ impl Default for IpcNamespace {
 }
 
 /// Initial (root) IPC namespace
-pub static INIT_IPC_NS: Lazy<Arc<IpcNamespace>> = Lazy::new(|| Arc::new(IpcNamespace::new()));
+pub static INIT_IPC_NS: Lazy<Arc<IpcNamespace>> = Lazy::new(|| arc_nofail(IpcNamespace::new()));
 
 // ============================================================================
 // User-space ABI structures (must match Linux exactly)

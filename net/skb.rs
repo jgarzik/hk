@@ -22,6 +22,7 @@
 //! Tailroom: tail..end  (for appending data)
 //! ```
 
+use crate::util::kalloc::try_box;
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 
@@ -98,7 +99,7 @@ impl SkBuff {
         v.try_reserve_exact(total_size).ok()?;
         v.resize(total_size, 0u8);
 
-        Some(Box::new(Self {
+        try_box(Self {
             buf: v.into_boxed_slice(),
             data: headroom,
             tail: headroom,
@@ -114,7 +115,8 @@ impl SkBuff {
             owner: 0,
             mac: None,
             nh: None,
-        }))
+        })
+        .ok()
     }
 
     /// Allocate a new SkBuff for receiving packets

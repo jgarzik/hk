@@ -30,6 +30,7 @@ pub mod fs_writeback;
 pub mod icache;
 pub mod io;
 pub mod iov;
+pub mod iov_iter;
 pub mod link;
 pub mod locks;
 pub mod misc;
@@ -80,6 +81,8 @@ pub use vfat::{VFAT_FILE_OPS, VFAT_TYPE};
 
 use alloc::sync::Arc;
 
+use crate::util::kalloc::try_arc;
+
 /// Open a file for execve (Linux do_open_execat): the walk's search
 /// checks, then may_open for MAY_EXEC (x permission; CAP_DAC_OVERRIDE
 /// only if some x bit is set; directories and devices EACCES) and a
@@ -117,12 +120,13 @@ pub fn open_exec(path: Path) -> Result<Arc<File>, i32> {
         .superblock()
         .map(|sb| sb.fs_type.file_ops)
         .unwrap_or(&ramfs::RAMFS_FILE_OPS);
-    Ok(Arc::new(File::new(
+    try_arc(File::new(
         dentry,
-        Some(path.mnt),
+        Some(path.mnt.clone()),
         flags::O_RDONLY,
         f_op,
-    )))
+    ))
+    .map_err(|e| e as i32)
 }
 
 // ============================================================================

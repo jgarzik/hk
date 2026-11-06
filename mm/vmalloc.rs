@@ -288,7 +288,7 @@ pub fn free(ptr: *mut u8, size: usize) {
         return;
     }
     // Interrupt handler: KTABLES is thread-context only
-    let d = ptr as *mut Deferred;
+    let d = ptr.cast::<Deferred>();
     let mut head = DEFERRED.load(Ordering::Relaxed);
     loop {
         // SAFETY: the area is still mapped and ours (freed by the caller)

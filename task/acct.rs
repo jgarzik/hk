@@ -14,8 +14,9 @@
 //!
 //! Uses Linux acct_v3 format (64 bytes per record).
 //! Records are written when processes exit (group leader exits).
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
+use crate::util::kalloc::try_arc;
 use alloc::sync::Arc;
 
 use crate::fs::KernelError;
@@ -34,7 +35,6 @@ pub const AFORK: u8 = 0x01;
 /// Used superuser privileges
 pub const ASU: u8 = 0x02;
 /// Compatibility mode (unused)
-#[allow(dead_code)]
 pub const ACOMPAT: u8 = 0x04;
 /// Dumped core
 pub const ACORE: u8 = 0x08;
@@ -101,7 +101,12 @@ const _: () = assert!(ACCT_V3_SIZE == 64);
 impl AcctV3 {
     /// Get the record as a byte slice
     pub fn as_bytes(&self) -> &[u8] {
-        unsafe { core::slice::from_raw_parts(self as *const AcctV3 as *const u8, ACCT_V3_SIZE) }
+        unsafe {
+            core::slice::from_raw_parts(
+                core::ptr::from_ref::<AcctV3>(self).cast::<u8>(),
+                ACCT_V3_SIZE,
+            )
+        }
     }
 }
 
@@ -136,10 +141,10 @@ pub fn encode_comp_t(mut value: u64) -> u16 {
             exp += 1;
         }
     }
-    if exp > (u16::MAX >> MANTSIZE) as u32 {
+    if exp > u32::from(u16::MAX >> MANTSIZE) {
         return u16::MAX;
     }
-    ((exp << MANTSIZE) as u64 + value) as u16
+    (u64::from(exp << MANTSIZE) + value) as u16
 }
 
 /// An IEEE single of `value` with its mantissa truncated, as Linux
@@ -221,12 +226,12 @@ fn open_acct_file(path: &[u8]) -> Result<Arc<File>, i64> {
     use crate::fs::{LookupFlags, dac};
 
     // Lookup the file
-    let crate::fs::Path { mnt, dentry } = match crate::fs::namei::path_lookupat(
+    let (mnt, dentry) = match crate::fs::namei::path_lookupat(
         crate::task::percpu::current_cwd(),
         path,
         LookupFlags::open(),
     ) {
-        Ok(p) => p,
+        Ok(p) => p.into_parts(),
         // Any lookup error as is (Linux filp_open)
         Err(e) => return Err(e.sysret()),
     };
@@ -254,7 +259,7 @@ fn open_acct_file(path: &[u8]) -> Result<Arc<File>, i64> {
         .unwrap_or(&crate::fs::ramfs::RAMFS_FILE_OPS);
     let mut file = File::new(dentry, Some(mnt), flags::O_WRONLY | flags::O_APPEND, f_op);
     file.write_access = w;
-    Ok(Arc::new(file))
+    try_arc(file).map_err(|e| e.sysret())
 }
 
 // =============================================================================

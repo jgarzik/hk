@@ -7,7 +7,6 @@
 //! - readahead (file readahead)
 
 use alloc::sync::Arc;
-use alloc::vec;
 
 use crate::arch::Uaccess;
 use crate::fs::{KernelError, LookupFlags, lookup_path_flags};
@@ -34,7 +33,10 @@ mod ms {
     pub const NOSUID: u64 = 2;
     pub const NODEV: u64 = 4;
     pub const NOEXEC: u64 = 8;
+    pub const SYNCHRONOUS: u64 = 16;
     pub const REMOUNT: u64 = 32;
+    pub const DIRSYNC: u64 = 128;
+    pub const NOSYMFOLLOW: u64 = 256;
     pub const BIND: u64 = 4096;
     pub const MOVE: u64 = 8192;
     pub const MANDLOCK: u64 = 64;
@@ -56,10 +58,12 @@ mod ms {
     pub const MGC_MSK: u64 = 0xffff_0000;
 
     /// Flags hk honors, or may accept without effect because hk
-    /// already behaves that way (no atime updates, no mandatory locks);
-    /// everything else (MS_SYNCHRONOUS, MS_DIRSYNC, MS_NOSYMFOLLOW, ...)
+    /// already behaves that way (no mandatory locks); everything else
     /// is EINVAL instead of being ignored
     pub const KNOWN: u64 = RDONLY
+        | SYNCHRONOUS
+        | DIRSYNC
+        | NOSYMFOLLOW
         | BIND
         | MOVE
         | NOSUID
@@ -82,10 +86,26 @@ mod ms {
         | LAZYTIME;
 }
 
-/// Per-mount MNT_* flags of mount(2) flags
+/// Per-mount MNT_* flags of mount(2) flags (Linux path_mount): relatime
+/// unless noatime or strictatime
 fn mnt_flags(flags: u64) -> u32 {
-    use super::mount::{MNT_NODEV, MNT_NOEXEC, MNT_NOSUID, MNT_READONLY};
+    use super::mount::{
+        MNT_NOATIME, MNT_NODEV, MNT_NODIRATIME, MNT_NOEXEC, MNT_NOSUID, MNT_NOSYMFOLLOW,
+        MNT_READONLY, MNT_RELATIME,
+    };
     let mut f = 0;
+    if flags & ms::NOATIME == 0 {
+        f |= MNT_RELATIME;
+    }
+    if flags & ms::NOATIME != 0 {
+        f |= MNT_NOATIME;
+    }
+    if flags & ms::NODIRATIME != 0 {
+        f |= MNT_NODIRATIME;
+    }
+    if flags & ms::STRICTATIME != 0 {
+        f &= !(MNT_RELATIME | MNT_NOATIME);
+    }
     if flags & ms::RDONLY != 0 {
         f |= MNT_READONLY;
     }
@@ -98,6 +118,34 @@ fn mnt_flags(flags: u64) -> u32 {
     if flags & ms::NOEXEC != 0 {
         f |= MNT_NOEXEC;
     }
+    if flags & ms::NOSYMFOLLOW != 0 {
+        f |= MNT_NOSYMFOLLOW;
+    }
+    f
+}
+
+/// A remount's MNT_* flags: with no atime flag given, `old`'s atime
+/// flags are kept (Linux path_mount)
+fn remount_flags(flags: u64, old: u32) -> u32 {
+    use super::mount::MNT_ATIME_MASK;
+    let f = mnt_flags(flags);
+    let atime = ms::NOATIME | ms::NODIRATIME | ms::RELATIME | ms::STRICTATIME;
+    if flags & atime != 0 {
+        return f;
+    }
+    (f & !MNT_ATIME_MASK) | (old & MNT_ATIME_MASK)
+}
+
+/// SB_SYNCHRONOUS / SB_DIRSYNC of mount(2) flags
+fn sb_sync_flags(flags: u64) -> u32 {
+    use super::superblock::{SB_DIRSYNC, SB_SYNCHRONOUS};
+    let mut f = 0;
+    if flags & ms::SYNCHRONOUS != 0 {
+        f |= SB_SYNCHRONOUS;
+    }
+    if flags & ms::DIRSYNC != 0 {
+        f |= SB_DIRSYNC;
+    }
     f
 }
 
@@ -105,14 +153,26 @@ fn mnt_flags(flags: u64) -> u32 {
 /// requested set. The read-only switch goes first and is all-or-nothing
 /// (EBUSY while files are open for writing or changes are in progress,
 /// with nothing changed); only then the per-mount flags are replaced.
-fn remount(m: &Arc<super::mount::Mount>, flags: u64) -> Result<(), KernelError> {
+fn remount(m: &Arc<super::mount::Mount>, flags: u64, data: &[u8]) -> Result<(), KernelError> {
     let _s = m.sb.s_umount.write();
+    // Read-only first (EBUSY changes nothing), then the filesystem's
+    // options; their error undoes the switch (Linux reconfigure_super:
+    // sb_prepare_remount_readonly, ->reconfigure, cancel on error)
+    let was_ro = m.sb.rdonly();
     if flags & ms::RDONLY != 0 {
         m.sb.make_rdonly()?;
-    } else {
+    }
+    if let Err(e) = m.sb.s_op.remount(&m.sb, data) {
+        if !was_ro && m.sb.rdonly() {
+            m.sb.make_rdwr();
+        }
+        return Err(e);
+    }
+    if flags & ms::RDONLY == 0 {
         m.sb.make_rdwr();
     }
-    m.set_flags(mnt_flags(flags))
+    m.sb.set_sync_flags(sb_sync_flags(flags));
+    m.set_flags(remount_flags(flags, m.flags()))
 }
 
 /// MS_REMOUNT|MS_BIND (Linux do_reconfigure_mnt): this mount's flags
@@ -121,7 +181,7 @@ fn reconfigure_mnt(m: &Arc<super::mount::Mount>, flags: u64) -> Result<(), Kerne
     // s_umount shared, as Linux do_reconfigure_mnt: the superblock does
     // not change, MOUNT_LOCK serializes the flag writers
     let _s = m.sb.s_umount.read();
-    m.set_flags(mnt_flags(flags))
+    m.set_flags(remount_flags(flags, m.flags()))
 }
 
 /// MS_SHARED / MS_SLAVE / MS_PRIVATE / MS_UNBINDABLE (Linux
@@ -231,7 +291,7 @@ fn path_mount(
         return reconfigure_mnt(&mount_at(&mp)?, flags);
     }
     if flags & ms::REMOUNT != 0 {
-        return remount(&mount_at(&mp)?, flags);
+        return remount(&mount_at(&mp)?, flags, &data);
     }
     if flags & ms::BIND != 0 {
         let old = crate::fs::namei::path_lookupat(
@@ -286,6 +346,11 @@ fn new_mount(
         (fs_type.mount)(fs_type, data)
     };
     let r = sb.and_then(|sb| {
+        // A superblock already mounted elsewhere (sysfs of a namespace)
+        // keeps its flags (Linux: only a new one gets the mount's)
+        if !sb.is_mounted() {
+            sb.set_sync_flags(sb_sync_flags(flags));
+        }
         // Linux: no source is "none"
         let devname = if source.is_empty() {
             b"none".as_slice()
@@ -306,7 +371,9 @@ fn new_mount(
             e @ (KernelError::NotBlockDevice
             | KernelError::NoDevice
             | KernelError::Busy
-            | KernelError::NotFound),
+            | KernelError::NotFound
+            | KernelError::Io
+            | KernelError::OutOfMemory),
         ) => Err(e),
         Err(_) => Err(KernelError::InvalidArgument),
     }
@@ -331,7 +398,11 @@ pub fn sys_umount2(target_ptr: u64, flags: i32) -> i64 {
         if !crate::task::capable(crate::task::CAP_SYS_ADMIN) {
             return Err(KernelError::NotPermitted);
         }
-        super::mount::do_umount(mount_at(&target)?, flags)
+        // The lookup is not a use that clears an MNT_EXPIRE mark (Linux
+        // path_umount: mntput_no_expire)
+        let m = mount_at(&target)?;
+        drop(target.into_mnt_noexpire());
+        super::mount::do_umount(m, flags)
     })();
     match r {
         Ok(()) => 0,
@@ -519,8 +590,8 @@ fn copy_xattr_value_from_user(value_ptr: u64, size: u64) -> Result<alloc::vec::V
         return Err(KernelError::BadAddress.sysret());
     }
 
-    // Allocate and copy value from user space
-    let mut value = vec![0u8; size as usize];
+    // Allocate (ENOMEM, Linux kvmalloc) and copy value from user space
+    let mut value = crate::util::kmem::try_vec(size as usize, 0u8).map_err(|e| e.sysret())?;
     if copy_from_user::<Uaccess>(&mut value, value_ptr, size as usize).is_err() {
         return Err(KernelError::BadAddress.sysret());
     }
@@ -761,8 +832,11 @@ fn do_getxattr(
         return KernelError::BadAddress.sysret();
     }
 
-    // Allocate kernel buffer
-    let mut value = vec![0u8; size as usize];
+    // Allocate kernel buffer (ENOMEM, Linux kvmalloc)
+    let mut value = match crate::util::kmem::try_vec(size as usize, 0u8) {
+        Ok(v) => v,
+        Err(e) => return e.sysret(),
+    };
 
     // Get the attribute
     match inode.i_op.getxattr(&inode, &name, &mut value) {
@@ -822,8 +896,11 @@ pub fn sys_fgetxattr(fd: i32, name_ptr: u64, value_ptr: u64, size: u64) -> i64 {
         return KernelError::BadAddress.sysret();
     }
 
-    // Allocate kernel buffer
-    let mut value = vec![0u8; size as usize];
+    // Allocate kernel buffer (ENOMEM, Linux kvmalloc)
+    let mut value = match crate::util::kmem::try_vec(size as usize, 0u8) {
+        Ok(v) => v,
+        Err(e) => return e.sysret(),
+    };
 
     // Get the attribute
     match inode.i_op.getxattr(&inode, &name, &mut value) {
@@ -1095,7 +1172,6 @@ pub mod falloc_mode {
     /// Deallocate range (punch hole) - must be combined with KEEP_SIZE
     pub const FALLOC_FL_PUNCH_HOLE: i32 = 0x02;
     /// Reserved for future use
-    #[allow(dead_code)]
     pub const FALLOC_FL_NO_HIDE_STALE: i32 = 0x04;
     /// Collapse range, removing a hole
     pub const FALLOC_FL_COLLAPSE_RANGE: i32 = 0x08;
@@ -1106,7 +1182,6 @@ pub mod falloc_mode {
     /// Write zeroes to the range, allocating it (Linux 6.17+)
     pub const FALLOC_FL_WRITE_ZEROES: i32 = 0x80;
     /// Unshare shared blocks (for reflinked files)
-    #[allow(dead_code)]
     pub const FALLOC_FL_UNSHARE_RANGE: i32 = 0x40;
 }
 

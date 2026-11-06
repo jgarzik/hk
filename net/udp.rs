@@ -19,6 +19,7 @@
 //! and then each candidate's `Inet.addr`; it never holds the table lock
 //! while queueing. No lock is held across a sleep or a transmit.
 
+use crate::util::kalloc::try_arc_cyclic;
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
@@ -65,9 +66,9 @@ pub struct UdpSock {
 }
 
 /// socket(AF_INET, SOCK_DGRAM, 0)
-pub fn create() -> Arc<dyn ProtoOps> {
+pub fn create() -> Result<Arc<dyn ProtoOps>, KernelError> {
     let net = crate::net::current_net_ns();
-    Arc::new_cyclic(|me| UdpSock {
+    Ok(try_arc_cyclic(|me| UdpSock {
         sk: Sock::new(net, AF_INET, SOCK_DGRAM, IPPROTO_UDP),
         inet: Inet::default(),
         op: Mutex::new(()),
@@ -75,7 +76,7 @@ pub fn create() -> Arc<dyn ProtoOps> {
         hashed: AtomicBool::new(false),
         rxq: RxQueue::default(),
         me: me.clone(),
-    })
+    })?)
 }
 
 impl UdpSock {
@@ -159,7 +160,7 @@ impl UdpSock {
     // --- send ------------------------------------------------------------
 
     /// Destination of a send: msg_name or the connected peer
-    fn dest(&self, m: &SendMsg) -> Result<(Ipv4Addr, u16, bool), KernelError> {
+    fn dest(&self, m: &SendMsg<'_>) -> Result<(Ipv4Addr, u16, bool), KernelError> {
         if let Some(a) = &m.addr {
             let (addr, port) = af_inet::sin_parse(a, true)?;
             if port == 0 {
@@ -259,7 +260,7 @@ pub fn tx_cmsgs(c: &[u8]) -> Result<TxCmsg, KernelError> {
         let int = || -> Result<i32, KernelError> {
             match d.len() {
                 4 => Ok(i32::from_ne_bytes([d[0], d[1], d[2], d[3]])),
-                1 => Ok(d[0] as i32),
+                1 => Ok(i32::from(d[0])),
                 _ => Err(KernelError::InvalidArgument),
             }
         };
@@ -439,7 +440,7 @@ impl ProtoOps for UdpSock {
     }
 
     /// Linux udp_sendmsg
-    fn sendmsg(&self, m: &mut SendMsg, flags: i32) -> Result<usize, KernelError> {
+    fn sendmsg(&self, m: &mut SendMsg<'_>, flags: i32) -> Result<usize, KernelError> {
         if flags & MSG_OOB != 0 {
             return Err(KernelError::OperationNotSupported);
         }
@@ -483,7 +484,7 @@ impl ProtoOps for UdpSock {
     }
 
     /// Linux udp_recvmsg
-    fn recvmsg(&self, m: &mut RecvMsg, flags: i32) -> Result<usize, KernelError> {
+    fn recvmsg(&self, m: &mut RecvMsg<'_>, flags: i32) -> Result<usize, KernelError> {
         if flags & MSG_ERRQUEUE != 0 {
             return af_inet::ip_recv_error(&self.sk, &self.inet, m);
         }
@@ -626,8 +627,8 @@ fn lookup(t: &UdpTable, k: &Key) -> Option<Arc<UdpSock>> {
     let h = port::siphash(
         [0x9e37_79b9, 0x7f4a_7c15],
         &[
-            ((k.saddr.0 as u64) << 32) | k.daddr.0 as u64,
-            ((k.sport as u64) << 16) | k.dport as u64,
+            (u64::from(k.saddr.0) << 32) | u64::from(k.daddr.0),
+            (u64::from(k.sport) << 16) | u64::from(k.dport),
         ],
     );
     Some((*group[(h as usize) % group.len()]).clone())
@@ -691,7 +692,7 @@ pub fn udp_rcv(skb: SkBuff) {
 /// An ICMP error about a datagram we sent (Linux udp_err): the socket
 /// that sent it gets the error queued (IP_RECVERR) and/or as its pending
 /// error; without IP_RECVERR only hard errors on connected sockets count
-pub fn udp_err(net: &crate::net::NetNamespace, e: &crate::net::icmp::IcmpErr) {
+pub fn udp_err(net: &crate::net::NetNamespace, e: &crate::net::icmp::IcmpErr<'_>) {
     let l4 = e.l4();
     let (sport, dport) = (
         u16::from_be_bytes([l4[0], l4[1]]),
@@ -729,7 +730,7 @@ fn csum_ok(saddr: Ipv4Addr, daddr: Ipv4Addr, pkt: &[u8]) -> bool {
 fn add_words(mut sum: u32, d: &[u8]) -> u32 {
     let mut i = 0;
     while i + 1 < d.len() {
-        sum = sum.wrapping_add(u16::from_be_bytes([d[i], d[i + 1]]) as u32);
+        sum = sum.wrapping_add(u32::from(u16::from_be_bytes([d[i], d[i + 1]])));
         // Fold early so long datagrams cannot overflow
         if sum & 0x8000_0000 != 0 {
             sum = (sum & 0xffff) + (sum >> 16);
@@ -737,7 +738,7 @@ fn add_words(mut sum: u32, d: &[u8]) -> u32 {
         i += 2;
     }
     if i < d.len() {
-        sum = sum.wrapping_add((d[i] as u32) << 8);
+        sum = sum.wrapping_add(u32::from(d[i]) << 8);
     }
     sum
 }

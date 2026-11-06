@@ -2,7 +2,7 @@
 //!
 //! Implements the PageTable trait for x86-64 4-level paging:
 //! PML4 -> PDPT -> PD -> PT -> Physical Page
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
+#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -79,7 +79,7 @@ pub fn virt_to_phys(virt: u64) -> u64 {
 /// Convert physical address to page table pointer
 #[inline]
 pub fn phys_to_virt_table(phys: u64) -> *mut RawPageTable {
-    phys_to_virt(phys) as *mut RawPageTable
+    phys_to_virt(phys).cast::<RawPageTable>()
 }
 
 /// Convert physical address to const page table pointer
@@ -114,8 +114,10 @@ pub fn pte_ptr(root: u64, va: u64) -> Option<*mut u64> {
         table = phys_to_virt_table(e.addr());
     }
     Some(
-        unsafe { (*table).entry_mut(((va >> 12) & 511) as usize) } as *mut PageTableEntry
-            as *mut u64,
+        core::ptr::from_mut::<PageTableEntry>(unsafe {
+            (*table).entry_mut(((va >> 12) & 511) as usize)
+        })
+        .cast::<u64>(),
     )
 }
 
@@ -164,7 +166,11 @@ const USER_TABLE: u64 = PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER;
 /// The entry at `idx` (mod 512) of `table`, as an atomic
 fn entry_atomic(table: *mut RawPageTable, idx: u64) -> &'static AtomicU64 {
     // SAFETY: a live table frame reached through the direct map
-    unsafe { AtomicU64::from_ptr((*table).entry_mut((idx & 511) as usize) as *mut _ as *mut u64) }
+    unsafe {
+        AtomicU64::from_ptr(
+            core::ptr::from_mut((*table).entry_mut((idx & 511) as usize)).cast::<u64>(),
+        )
+    }
 }
 
 /// The entry at `p` in a live table, as an atomic
@@ -391,6 +397,10 @@ fn free_level(phys: u64, level: u32, put: &mut dyn FnMut(Leaf)) {
             2 if e.is_present() => free_level(e.addr(), 1, put),
             _ => {}
         }
+    }
+    // A PMD table: the page tables its 2MB pages kept for a split
+    if level == 2 {
+        crate::mm::huge_page::free_deposits(phys);
     }
     crate::FRAME_ALLOCATOR.free(phys);
 }
@@ -639,7 +649,6 @@ impl X86_64PageTable {
 
     /// Translate a virtual address to physical address
     /// Returns None if the address is not mapped
-    #[allow(dead_code)]
     pub fn virt_to_phys(&self, vaddr: u64) -> Option<u64> {
         let (pml4_idx, pdpt_idx, pd_idx, pt_idx) = page_indices(vaddr);
 

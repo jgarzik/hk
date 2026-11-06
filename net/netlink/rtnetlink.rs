@@ -10,7 +10,7 @@
 //! Dumps are resumable cursors (`RtDump`): parts of at most `DUMP_SIZE`
 //! bytes are produced as the reader drains its queue, NLMSG_DONE last.
 
-use alloc::boxed::Box;
+use crate::util::kalloc::try_box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
@@ -241,7 +241,7 @@ fn rcv_msg(sk: &Arc<NlSock>, h: &Hdr, p: &[u8], explicit: bool) -> Result<Done, 
             return Err(KernelError::OperationNotSupported);
         }
         let cb = RtDump::new(sk, h, family, p);
-        sk.dump_start(Box::new(cb), h.seq)?;
+        sk.dump_start(try_box(cb)?, h.seq)?;
         return Ok(Done::Dump);
     }
     let nl = NlInfo {
@@ -412,7 +412,7 @@ fn ifinfo(p: &[u8]) -> Result<IfInfo, KernelError> {
 fn link_dev(
     net: &NetNamespace,
     ifm: &IfInfo,
-    a: &Attrs,
+    a: &Attrs<'_>,
 ) -> Result<Option<Arc<NetDevice>>, KernelError> {
     if ifm.index > 0 {
         return Ok(net.dev_get_by_index(ifm.index));
@@ -493,7 +493,7 @@ pub fn fill_link(dev: &NetDevice, ty: u16, flags: u16, seq: u32, pid: u32, chang
     h[8..12].copy_from_slice(&dev.get_flags().to_ne_bytes());
     h[12..16].copy_from_slice(&change.to_ne_bytes());
     let (min_mtu, max_mtu) = dev.mtu_range();
-    let promisc = (dev.admin_flags() & dflags::IFF_PROMISC != 0) as u32;
+    let promisc = u32::from(dev.admin_flags() & dflags::IFF_PROMISC != 0);
     m.put(&h)
         .str(IFLA_IFNAME, dev.name())
         .u32(IFLA_TXQLEN, dev.link().txqlen)
@@ -506,7 +506,7 @@ pub fn fill_link(dev: &NetDevice, ty: u16, flags: u16, seq: u32, pid: u32, chang
         .u32(IFLA_PROMISCUITY, promisc)
         .u32(IFLA_NUM_TX_QUEUES, 1)
         .u32(IFLA_NUM_RX_QUEUES, 1)
-        .u8(IFLA_CARRIER, dev.carrier_ok() as u8)
+        .u8(IFLA_CARRIER, u8::from(dev.carrier_ok()))
         .str(IFLA_QDISC, "noqueue")
         .u32(IFLA_CARRIER_CHANGES, dev.carrier_changes())
         .u8(IFLA_PROTO_DOWN, 0)
@@ -688,7 +688,7 @@ fn newaddr(sk: &NlSock, h: &Hdr, p: &[u8], nl: NlInfo) -> Result<Done, KernelErr
         .ok_or(KernelError::NoDevice)?;
     let mut ifa = InIfaddr::new(local, ifm.prefixlen, dev.name());
     ifa.address = a.in_addr(IFA_ADDRESS)?.unwrap_or(local);
-    ifa.flags = a.u32(IFA_FLAGS)?.unwrap_or(ifm.flags as u32) | IFA_F_PERMANENT;
+    ifa.flags = a.u32(IFA_FLAGS)?.unwrap_or(u32::from(ifm.flags)) | IFA_F_PERMANENT;
     ifa.scope = ifm.scope;
     if let Some(b) = a.in_addr(IFA_BROADCAST)? {
         ifa.broadcast = b;
@@ -775,7 +775,7 @@ fn fib_config(h: &Hdr, p: &[u8], nl: NlInfo) -> Result<FibConfig, KernelError> {
         return Err(KernelError::OperationNotSupported);
     }
     Ok(FibConfig {
-        table: a.u32(RTA_TABLE)?.unwrap_or(rtm.table as u32),
+        table: a.u32(RTA_TABLE)?.unwrap_or(u32::from(rtm.table)),
         dst: a.in_addr(RTA_DST)?.unwrap_or_default(),
         dst_len: rtm.dst_len,
         tos: rtm.tos,
@@ -818,7 +818,7 @@ fn route_dump_kind(p: &[u8], strict: bool, flags: &mut u16) -> DumpKind {
             return Ok(DumpKind::Empty);
         }
         Ok(DumpKind::Route(
-            a.u32(RTA_TABLE)?.unwrap_or(rtm.table as u32),
+            a.u32(RTA_TABLE)?.unwrap_or(u32::from(rtm.table)),
         ))
     };
     match parse() {
@@ -953,7 +953,7 @@ fn fill_neigh(e: &NeighInfo, ty: u16, flags: u16, seq: u32, pid: u32) -> Vec<u8>
     let mut h = [0u8; NDMSG_LEN];
     h[0] = AF_INET;
     h[4..8].copy_from_slice(&e.ifindex.to_ne_bytes());
-    h[8..10].copy_from_slice(&(e.state as u16).to_ne_bytes());
+    h[8..10].copy_from_slice(&u16::from(e.state).to_ne_bytes());
     h[11] = RouteType::Unicast as u8;
     m.put(&h).attr(NDA_DST, &e.key[..4]);
     if e.state & nud::VALID != 0 {
@@ -991,7 +991,10 @@ fn ndmsg(p: &[u8]) -> Result<NdReq<'_>, KernelError> {
 /// Device and key of a neighbour request (Linux neigh_add/neigh_delete
 /// checks, in their order): EINVAL without NDA_DST or a device,
 /// ENODEV for an unknown device, EAFNOSUPPORT for other families
-fn nd_target(net: &NetNamespace, r: &NdReq) -> Result<(Arc<NetDevice>, neigh::Key), KernelError> {
+fn nd_target(
+    net: &NetNamespace,
+    r: &NdReq<'_>,
+) -> Result<(Arc<NetDevice>, neigh::Key), KernelError> {
     let dst = r.attrs.get(NDA_DST).ok_or(KernelError::InvalidArgument)?;
     let dev = match r.ifindex {
         0 => None,
