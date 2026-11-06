@@ -9,8 +9,8 @@ use alloc::vec::Vec;
 use super::super::Path;
 use super::super::dentry::{d_path, dentry_path};
 use super::super::mount::{
-    MNT_NOATIME, MNT_NODEV, MNT_NODIRATIME, MNT_NOEXEC, MNT_NOSUID, MNT_NOSYMFOLLOW,
-    MNT_READONLY, MNT_RELATIME, Mount, NAMESPACE_SEM,
+    MNT_NOATIME, MNT_NODEV, MNT_NODIRATIME, MNT_NOEXEC, MNT_NOSUID, MNT_NOSYMFOLLOW, MNT_READONLY,
+    MNT_RELATIME, Mount, NAMESPACE_SEM,
 };
 use super::super::name::mangle;
 use super::get_tid_for_pid;

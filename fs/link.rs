@@ -159,7 +159,9 @@ fn link_locked(dir: &Arc<Inode>, name: &[u8], inode: &Arc<Inode>) -> Result<(), 
     if inode.get_nlink() == 0 {
         Err(KernelError::NotFound)
     } else {
-        dir.i_op.link(dir, name, inode).inspect(|()| inode.touch_c())
+        dir.i_op
+            .link(dir, name, inode)
+            .inspect(|()| inode.touch_c())
     }
 }
 
