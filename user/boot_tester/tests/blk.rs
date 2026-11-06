@@ -27,6 +27,7 @@ const BLKGETSIZE64: u64 = 0x8008_1272;
 const BLKPBSZGET: u64 = 0x127b;
 
 const EINVAL: i64 = -22;
+const EIO: i64 = -5;
 const EBUSY: i64 = -16;
 const ENOSPC: i64 = -28;
 const S_IFMT: u32 = 0o170000;
@@ -409,6 +410,7 @@ fn vfat(d: &Disk) {
     vfat_neg_case(p1);
     vfat_mount_alias(p1);
     vfat_sync(p1);
+    vfat_corrupt_chain(p1);
 }
 
 /// What was written through the page cache (write() and a shared
@@ -1006,5 +1008,43 @@ fn vfat_sync(p1: &BlkDev) {
         b"VFAT_SYNC_WRITE",
         plain >= 1024 && sync < 512 && osync < 512,
         plain * 1_000_000 + sync * 1000 + osync,
+    );
+}
+
+/// A corrupt cluster chain is EIO (Linux fat_get_cluster / fat_ent_read):
+/// the root directory's FAT entry set free, then pointing at itself
+/// (a loop), fails the mount; the entry put back, it mounts again
+fn vfat_corrupt_chain(p1: &BlkDev) {
+    let fd = open_dev(p1, O_RDWR);
+    let mut bpb = [0u8; 512];
+    sys_pread64(fd, bpb.as_mut_ptr(), 512, 0);
+    let bps = u64::from(u16::from_le_bytes([bpb[11], bpb[12]]));
+    let reserved = u64::from(u16::from_le_bytes([bpb[14], bpb[15]]));
+    let root = u32::from_le_bytes([bpb[44], bpb[45], bpb[46], bpb[47]]);
+    let at = (reserved * bps + u64::from(root) * 4) as i64;
+    let mut old = [0u8; 4];
+    sys_pread64(fd, old.as_mut_ptr(), 4, at);
+    let put = |v: &[u8; 4]| {
+        sys_pwrite64(fd, v.as_ptr(), 4, at);
+        sys_fsync(fd);
+        mount_vd1(p1, b"iocharset=cp437\0")
+    };
+    let free = put(&[0; 4]);
+    if free == 0 {
+        sys_umount2(b"/mnt/vd1\0".as_ptr(), 0);
+    }
+    let lp = put(&root.to_le_bytes());
+    if lp == 0 {
+        sys_umount2(b"/mnt/vd1\0".as_ptr(), 0);
+    }
+    let back = put(&old);
+    if back == 0 {
+        sys_umount2(b"/mnt/vd1\0".as_ptr(), 0);
+    }
+    sys_close(fd as u64);
+    verdict(
+        b"VFAT_CORRUPT_CHAIN",
+        free == EIO && lp == EIO && back == 0,
+        free * 10000 + lp * 100 + back,
     );
 }

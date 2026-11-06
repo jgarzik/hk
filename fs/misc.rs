@@ -357,7 +357,9 @@ fn new_mount(
             e @ (KernelError::NotBlockDevice
             | KernelError::NoDevice
             | KernelError::Busy
-            | KernelError::NotFound),
+            | KernelError::NotFound
+            | KernelError::Io
+            | KernelError::OutOfMemory),
         ) => Err(e),
         Err(_) => Err(KernelError::InvalidArgument),
     }

@@ -517,6 +517,9 @@ pub struct VfatSbData {
     pub data_start_sector: u64,
     /// Root directory cluster
     pub root_cluster: u32,
+    /// One past the last data cluster (Linux msdos_sb_info.max_cluster):
+    /// data clusters are 2..max_cluster
+    pub max_cluster: u32,
     /// Cluster size in bytes
     pub cluster_size: u32,
     /// Mount options
@@ -785,6 +788,10 @@ fn get_inode_data(inode: &Inode) -> Result<VfatInodeData, KernelError> {
 
 /// Read a FAT entry for a cluster
 fn get_fat_entry(sb_data: &VfatSbData, cluster: u32) -> Result<u32, KernelError> {
+    // Linux fat_ent_read: "invalid access to FAT" is EIO
+    if !(2..sb_data.max_cluster).contains(&cluster) {
+        return Err(KernelError::Io);
+    }
     let fat_offset = u64::from(cluster) * 4;
     let fat_sector = sb_data.fat_start_sector + fat_offset / u64::from(sb_data.bytes_per_sector);
     let offset_in_sector = (fat_offset % u64::from(sb_data.bytes_per_sector)) as usize;
@@ -801,6 +808,10 @@ fn is_end_of_chain(cluster: u32) -> bool {
     cluster >= 0x0FFF_FFF8
 }
 
+/// The bad-cluster mark: cluster numbers stay below it (Linux
+/// BAD_FAT32)
+const FAT_BAD: u32 = 0x0FFF_FFF7;
+
 /// Check if cluster is valid (not reserved, free, or bad)
 fn is_valid_cluster(cluster: u32) -> bool {
     (2..0x0FFF_FFF0).contains(&cluster)
@@ -813,24 +824,29 @@ fn cluster_to_offset(sb_data: &VfatSbData, cluster: u32) -> u64 {
 }
 
 /// Read a cluster chain starting from a cluster
+/// The clusters of the chain at `start_cluster` (0: none). As Linux
+/// fat_get_cluster, a corrupt chain is EIO: an entry that is free, bad
+/// or past the last cluster, or a chain longer than the filesystem has
+/// clusters (a cycle)
 fn read_cluster_chain(sb_data: &VfatSbData, start_cluster: u32) -> Result<Vec<u32>, KernelError> {
     let mut chain = Vec::new();
+    if start_cluster == 0 {
+        return Ok(chain);
+    }
     let mut cluster = start_cluster;
-
-    while is_valid_cluster(cluster) {
+    loop {
+        if !(2..sb_data.max_cluster).contains(&cluster)
+            || chain.len() >= sb_data.max_cluster as usize
+        {
+            return Err(KernelError::Io);
+        }
         chain.try_reserve(1).map_err(|_| KernelError::OutOfMemory)?;
         chain.push(cluster);
         cluster = get_fat_entry(sb_data, cluster)?;
         if is_end_of_chain(cluster) {
-            break;
-        }
-        // Safety check against infinite loops
-        if chain.len() > 1_000_000 {
-            return Err(KernelError::Io);
+            return Ok(chain);
         }
     }
-
-    Ok(chain)
 }
 
 // ============================================================================
@@ -869,15 +885,9 @@ fn set_fat_entry(sb_data: &VfatSbData, cluster: u32, value: u32) -> Result<(), K
 /// Searches the FAT for a free cluster (value 0), marks it as end-of-chain,
 /// and returns the cluster number.
 fn allocate_cluster(sb_data: &VfatSbData) -> Result<u32, KernelError> {
-    // Calculate total data clusters
-    // Total sectors = fat_start + fat_sectors * num_fats + data_sectors
-    // data_clusters = data_sectors / sectors_per_cluster
-    let total_sectors = sb_data.bdev.capacity() / u64::from(sb_data.bytes_per_sector);
-    let data_sectors = total_sectors.saturating_sub(sb_data.data_start_sector);
-    let total_clusters = (data_sectors / u64::from(sb_data.sectors_per_cluster)) as u32;
-
-    // Search for free cluster (start from cluster 2, which is first data cluster)
-    for cluster in 2..total_clusters + 2 {
+    // Search for free cluster among the data clusters (the BPB's size,
+    // not the device's)
+    for cluster in 2..sb_data.max_cluster {
         let entry = get_fat_entry(sb_data, cluster)?;
         if entry == FAT_FREE {
             // Found free cluster, mark as end-of-chain
@@ -957,28 +967,6 @@ fn extend_cluster_chain(
         prev = cluster;
     }
     Ok(first.dismiss())
-}
-
-/// Get the last cluster in a chain
-#[expect(dead_code)]
-fn get_last_cluster(sb_data: &VfatSbData, start_cluster: u32) -> Result<u32, KernelError> {
-    let mut cluster = start_cluster;
-    let mut count = 0;
-
-    while is_valid_cluster(cluster) {
-        let next = get_fat_entry(sb_data, cluster)?;
-        if is_end_of_chain(next) {
-            return Ok(cluster);
-        }
-        cluster = next;
-        count += 1;
-        if count > 1_000_000 {
-            return Err(KernelError::Io);
-        }
-    }
-
-    // If start_cluster is 0 or invalid, return 0
-    Ok(start_cluster)
 }
 
 // ============================================================================
@@ -2527,6 +2515,11 @@ fn vfat_mount_dev(
     if total_clusters == 0 || total_clusters + 2 > fat_entries {
         return Err(KernelError::InvalidArgument);
     }
+    // FAT32 numbers clusters in 28 bits (Linux MAX_FAT32: "count of
+    // clusters too big")
+    if total_clusters + 2 > u64::from(FAT_BAD) {
+        return Err(KernelError::InvalidArgument);
+    }
 
     // Create superblock data
     let sb_data = try_arc(VfatSbData {
@@ -2537,9 +2530,14 @@ fn vfat_mount_dev(
         fat_sectors,
         data_start_sector,
         root_cluster: boot_sector.root_cluster,
+        max_cluster: (total_clusters + 2) as u32,
         cluster_size,
         opts,
     })?;
+
+    // The root directory's chain must be sound (Linux fat_read_root ->
+    // fat_calc_dir_size walks it: EIO)
+    read_cluster_chain(&sb_data, sb_data.root_cluster)?;
 
     // Create superblock
     let sb = SuperBlock::new(fs_type, &VFAT_SUPER_OPS, 0)?;
