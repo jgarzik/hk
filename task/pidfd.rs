@@ -24,8 +24,8 @@
 //! - Signal sending via pidfd
 //! - Integration with waitid(P_PIDFD)
 //! - CLONE_PIDFD support for automatic pidfd creation
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
+use crate::util::kalloc::try_arc;
 use alloc::sync::Arc;
 
 use crate::fs::KernelError;
@@ -117,7 +117,7 @@ pub fn create_pidfd(pid: Pid, file_flags: u32) -> Result<Arc<File>, KernelError>
     let nr = u32::try_from(pid).map_err(|_| KernelError::NoProcess)?;
     let pid =
         crate::task::pid::find_pid(&crate::ns::INIT_PID_NS, nr).ok_or(KernelError::NoProcess)?;
-    let pidfd = Arc::new(Pidfd { pid });
+    let pidfd = try_arc(Pidfd { pid })?;
 
     // Create dummy dentry for pidfd
 

@@ -21,7 +21,6 @@
 //! ## Lock Ordering
 //!
 //! VFS locks → Namespace locks → Filesystem context → Per-CPU scheduler → TASKLIST
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 pub mod cgroup;
 pub mod net;
@@ -30,6 +29,8 @@ pub mod user;
 pub mod uts;
 
 use crate::sync::spin::RwLock;
+use crate::util::error::KernelError;
+use crate::util::kalloc::{arc_nofail, try_arc};
 use alloc::sync::Arc;
 use spin::Lazy;
 
@@ -92,16 +93,18 @@ pub struct MntNamespace {
 }
 
 impl MntNamespace {
-    /// Create a new empty mount namespace
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self {
+    /// Create a new empty mount namespace, or ENOMEM
+    pub fn new() -> Result<Arc<Self>, KernelError> {
+        try_arc(Self {
             root: RwLock::new(None),
         })
     }
 
-    /// Create initial mount namespace
+    /// Create initial mount namespace (boot: failure cannot be reported)
     fn new_init() -> Arc<Self> {
-        Self::new()
+        arc_nofail(Self {
+            root: RwLock::new(None),
+        })
     }
 
     /// Clone this namespace (for CLONE_NEWNS)
@@ -111,7 +114,7 @@ impl MntNamespace {
     /// `fs` (the new task's, or the unsharer's own) moves its root and
     /// pwd to the copies of their mounts (Linux copy_mnt_ns)
     pub fn clone_ns(&self, fs: Option<&crate::fs::FsStruct>) -> Result<Arc<Self>, i32> {
-        let new_ns = Self::new();
+        let new_ns = Self::new().map_err(|e| e.errno())?;
         let old_root = self.root.read().clone();
         if let Some(old_root) = old_root {
             let (new_root, map) = Mount::clone_tree(&old_root)?;
@@ -275,7 +278,7 @@ impl NsProxy {
             self.cgroup_ns.clone()
         };
 
-        Ok(Arc::new(Self {
+        try_arc(Self {
             uts_ns,
             mnt_ns,
             pid_ns,
@@ -283,14 +286,15 @@ impl NsProxy {
             ipc_ns,
             net_ns,
             cgroup_ns,
-        }))
+        })
+        .map_err(|e| e.errno())
     }
 }
 
 /// Initial (root) namespace proxy
 ///
 /// All tasks inherit from this unless they create new namespaces.
-pub static INIT_NSPROXY: Lazy<Arc<NsProxy>> = Lazy::new(|| Arc::new(NsProxy::new_init()));
+pub static INIT_NSPROXY: Lazy<Arc<NsProxy>> = Lazy::new(|| arc_nofail(NsProxy::new_init()));
 
 // ============================================================================
 // Task-NsProxy Mapping (following FsStruct pattern)
@@ -626,7 +630,7 @@ pub fn sys_setns(fd: i32, nstype: i32) -> i64 {
 
     // Create new nsproxy with the target namespace for the specified type
     let new_ns = match ns_type {
-        NamespaceType::Uts => Arc::new(NsProxy {
+        NamespaceType::Uts => NsProxy {
             uts_ns: target_ns.uts_ns.clone(),
             mnt_ns: current_ns.mnt_ns.clone(),
             pid_ns: current_ns.pid_ns.clone(),
@@ -634,8 +638,8 @@ pub fn sys_setns(fd: i32, nstype: i32) -> i64 {
             ipc_ns: current_ns.ipc_ns.clone(),
             net_ns: current_ns.net_ns.clone(),
             cgroup_ns: current_ns.cgroup_ns.clone(),
-        }),
-        NamespaceType::Mnt => Arc::new(NsProxy {
+        },
+        NamespaceType::Mnt => NsProxy {
             uts_ns: current_ns.uts_ns.clone(),
             mnt_ns: target_ns.mnt_ns.clone(),
             pid_ns: current_ns.pid_ns.clone(),
@@ -643,8 +647,8 @@ pub fn sys_setns(fd: i32, nstype: i32) -> i64 {
             ipc_ns: current_ns.ipc_ns.clone(),
             net_ns: current_ns.net_ns.clone(),
             cgroup_ns: current_ns.cgroup_ns.clone(),
-        }),
-        NamespaceType::Pid => Arc::new(NsProxy {
+        },
+        NamespaceType::Pid => NsProxy {
             uts_ns: current_ns.uts_ns.clone(),
             mnt_ns: current_ns.mnt_ns.clone(),
             pid_ns: target_ns.pid_ns.clone(),
@@ -652,8 +656,8 @@ pub fn sys_setns(fd: i32, nstype: i32) -> i64 {
             ipc_ns: current_ns.ipc_ns.clone(),
             net_ns: current_ns.net_ns.clone(),
             cgroup_ns: current_ns.cgroup_ns.clone(),
-        }),
-        NamespaceType::User => Arc::new(NsProxy {
+        },
+        NamespaceType::User => NsProxy {
             uts_ns: current_ns.uts_ns.clone(),
             mnt_ns: current_ns.mnt_ns.clone(),
             pid_ns: current_ns.pid_ns.clone(),
@@ -661,8 +665,8 @@ pub fn sys_setns(fd: i32, nstype: i32) -> i64 {
             ipc_ns: current_ns.ipc_ns.clone(),
             net_ns: current_ns.net_ns.clone(),
             cgroup_ns: current_ns.cgroup_ns.clone(),
-        }),
-        NamespaceType::Ipc => Arc::new(NsProxy {
+        },
+        NamespaceType::Ipc => NsProxy {
             uts_ns: current_ns.uts_ns.clone(),
             mnt_ns: current_ns.mnt_ns.clone(),
             pid_ns: current_ns.pid_ns.clone(),
@@ -670,8 +674,8 @@ pub fn sys_setns(fd: i32, nstype: i32) -> i64 {
             ipc_ns: target_ns.ipc_ns.clone(),
             net_ns: current_ns.net_ns.clone(),
             cgroup_ns: current_ns.cgroup_ns.clone(),
-        }),
-        NamespaceType::Net => Arc::new(NsProxy {
+        },
+        NamespaceType::Net => NsProxy {
             uts_ns: current_ns.uts_ns.clone(),
             mnt_ns: current_ns.mnt_ns.clone(),
             pid_ns: current_ns.pid_ns.clone(),
@@ -679,7 +683,11 @@ pub fn sys_setns(fd: i32, nstype: i32) -> i64 {
             ipc_ns: current_ns.ipc_ns.clone(),
             net_ns: target_ns.net_ns.clone(),
             cgroup_ns: current_ns.cgroup_ns.clone(),
-        }),
+        },
+    };
+    let new_ns = match try_arc(new_ns) {
+        Ok(n) => n,
+        Err(e) => return e.sysret(),
     };
 
     let mnt_root = matches!(ns_type, NamespaceType::Mnt)

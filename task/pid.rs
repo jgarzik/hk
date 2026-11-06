@@ -16,8 +16,9 @@
 //! it). The hash holds a weak reference per number: a lookup takes a
 //! strong one only while the `Pid` is alive, and the last drop unhashes
 //! it and frees its numbers.
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
+use crate::util::error::KernelError;
+use crate::util::kalloc::{arc_nofail, box_nofail, try_arc, try_box};
 use alloc::boxed::Box;
 use alloc::sync::{Arc, Weak};
 use core::sync::atomic::{AtomicI64, AtomicPtr, AtomicU32, AtomicU64, Ordering};
@@ -163,12 +164,15 @@ impl PidMap {
         }
     }
 
-    /// The bitmap page of `nr`, allocated if missing (no lock held)
-    fn page(&self, nr: u32) -> Option<&[AtomicU64; 512]> {
-        let slot = self.pages.get((nr / PER_PAGE) as usize)?;
+    /// The bitmap page of `nr`, allocated if missing (no lock held):
+    /// None past the end, ENOMEM
+    fn page(&self, nr: u32) -> Result<Option<&[AtomicU64; 512]>, KernelError> {
+        let Some(slot) = self.pages.get((nr / PER_PAGE) as usize) else {
+            return Ok(None);
+        };
         let mut p = slot.load(Ordering::Acquire);
         if p.is_null() {
-            let new = Box::into_raw(Box::new([const { AtomicU64::new(0) }; 512]));
+            let new = Box::into_raw(try_box([const { AtomicU64::new(0) }; 512])?);
             match slot.compare_exchange(
                 core::ptr::null_mut(),
                 new,
@@ -184,30 +188,41 @@ impl PidMap {
             }
         }
         // SAFETY: installed pages live as long as the map
-        Some(unsafe { &*p })
+        Ok(Some(unsafe { &*p }))
     }
 
-    /// Take `nr` if it is free
-    fn take(&self, nr: u32) -> bool {
-        let Some(page) = self.page(nr) else {
-            return false;
+    /// The bitmap page of `nr` if it is installed
+    fn page_if(&self, nr: u32) -> Option<&[AtomicU64; 512]> {
+        let p = self
+            .pages
+            .get((nr / PER_PAGE) as usize)?
+            .load(Ordering::Acquire);
+        // SAFETY: installed pages live as long as the map
+        (!p.is_null()).then(|| unsafe { &*p })
+    }
+
+    /// Take `nr` if it is free; ENOMEM
+    fn take(&self, nr: u32) -> Result<bool, KernelError> {
+        let Some(page) = self.page(nr)? else {
+            return Ok(false);
         };
         let off = nr % PER_PAGE;
         let bit = 1u64 << (off % 64);
-        page[(off / 64) as usize].fetch_or(bit, Ordering::AcqRel) & bit == 0
+        Ok(page[(off / 64) as usize].fetch_or(bit, Ordering::AcqRel) & bit == 0)
     }
 
-    /// Give `nr` back
+    /// Give `nr` back (a taken number's page is installed)
     fn free(&self, nr: u32) {
-        if let Some(page) = self.page(nr) {
+        if let Some(page) = self.page_if(nr) {
             let off = nr % PER_PAGE;
             page[(off / 64) as usize].fetch_and(!(1u64 << (off % 64)), Ordering::AcqRel);
         }
     }
 
     /// The next free number after the last one handed out, wrapping to
-    /// RESERVED_PIDS (Linux alloc_pidmap); None if every one is taken
-    fn alloc(&self) -> Option<u32> {
+    /// RESERVED_PIDS (Linux alloc_pidmap); None if every one is taken,
+    /// ENOMEM
+    fn alloc(&self) -> Result<Option<u32>, KernelError> {
         let start = self.last.load(Ordering::Relaxed);
         let mut nr = start;
         for _ in 0..self.max {
@@ -215,12 +230,12 @@ impl PidMap {
             if nr >= self.max {
                 nr = RESERVED_PIDS.min(self.max - 1);
             }
-            if self.take(nr) {
+            if self.take(nr)? {
                 self.last.store(nr, Ordering::Relaxed);
-                return Some(nr);
+                return Ok(Some(nr));
             }
         }
-        None
+        Ok(None)
     }
 }
 
@@ -260,13 +275,20 @@ fn bucket(ns: &PidNamespace, nr: u32) -> &'static AtomicPtr<UPid> {
 }
 
 /// A new `Pid` in `ns` and each ancestor namespace (Linux alloc_pid);
-/// None if a namespace has no number left (EAGAIN)
-pub fn alloc_pid(ns: &Arc<PidNamespace>) -> Option<Arc<Pid>> {
+/// EAGAIN if a namespace has no number left, ENOMEM
+pub fn alloc_pid(ns: &Arc<PidNamespace>) -> Result<Arc<Pid>, KernelError> {
     alloc_pid_nr(ns, None)
 }
 
-/// `alloc_pid` with the root number chosen (init: 1)
-pub fn alloc_pid_nr(ns: &Arc<PidNamespace>, root_nr: Option<u32>) -> Option<Arc<Pid>> {
+/// The numbers taken so far, given back on an error
+fn free_numbers(numbers: &[UPid]) {
+    for u in numbers {
+        u.ns.map.free(u.nr);
+    }
+}
+
+/// `alloc_pid` with the root number chosen (init: 1; EAGAIN if taken)
+pub fn alloc_pid_nr(ns: &Arc<PidNamespace>, root_nr: Option<u32>) -> Result<Arc<Pid>, KernelError> {
     let mut chain = alloc::vec::Vec::new();
     let mut n = Some(ns.clone());
     while let Some(cur) = n {
@@ -277,15 +299,19 @@ pub fn alloc_pid_nr(ns: &Arc<PidNamespace>, root_nr: Option<u32>) -> Option<Arc<
     let mut numbers = alloc::vec::Vec::with_capacity(chain.len());
     for (level, ns) in chain.into_iter().enumerate() {
         let nr = match root_nr {
-            Some(nr) if level == 0 => ns.map.take(nr).then_some(nr),
+            Some(nr) if level == 0 => ns.map.take(nr).map(|t| t.then_some(nr)),
             _ => ns.map.alloc(),
         };
-        let Some(nr) = nr else {
-            for u in &numbers {
-                let u: &UPid = u;
-                u.ns.map.free(u.nr);
+        let nr = match nr {
+            Ok(Some(nr)) => nr,
+            Ok(None) => {
+                free_numbers(&numbers);
+                return Err(KernelError::WouldBlock);
             }
-            return None;
+            Err(e) => {
+                free_numbers(&numbers);
+                return Err(e);
+            }
         };
         numbers.push(UPid {
             nr,
@@ -294,7 +320,9 @@ pub fn alloc_pid_nr(ns: &Arc<PidNamespace>, root_nr: Option<u32>) -> Option<Arc<
             pid: AtomicPtr::new(core::ptr::null_mut()),
         });
     }
-    let pid = Arc::new(Pid {
+    // On failure the unbuilt Pid's Drop gives its numbers back (it was
+    // never hashed)
+    let pid = try_arc(Pid {
         level: numbers.len() as u32 - 1,
         numbers: numbers.into_boxed_slice(),
         task: AtomicPtr::new(core::ptr::null_mut()),
@@ -303,7 +331,7 @@ pub fn alloc_pid_nr(ns: &Arc<PidNamespace>, root_nr: Option<u32>) -> Option<Arc<
         wait_pidfd: crate::sync::waitqueue::WaitQueue::new(),
         exit: AtomicI64::new(ALIVE),
         exec_gen: AtomicU64::new(0),
-    });
+    })?;
     let _g = PIDMAP_LOCK.lock();
     for u in pid.numbers.iter() {
         let weak = Weak::into_raw(Arc::downgrade(&pid)).cast_mut();
@@ -312,15 +340,16 @@ pub fn alloc_pid_nr(ns: &Arc<PidNamespace>, root_nr: Option<u32>) -> Option<Arc<
         u.next.store(b.load(Ordering::Relaxed), Ordering::Relaxed);
         b.store(core::ptr::from_ref::<UPid>(u).cast_mut(), Ordering::Release);
     }
-    Some(pid)
+    Ok(pid)
 }
 
 /// The process group and session of the boot task, number 0 (Linux
 /// init_struct_pid): never hashed, never freed; init starts in it
 pub static INIT_STRUCT_PID: spin::Lazy<Arc<Pid>> = spin::Lazy::new(|| {
-    Arc::new(Pid {
+    // Boot-time static: failure cannot be reported
+    arc_nofail(Pid {
         level: 0,
-        numbers: Box::new([UPid {
+        numbers: box_nofail([UPid {
             nr: 0,
             ns: crate::ns::INIT_PID_NS.clone(),
             next: AtomicPtr::new(core::ptr::null_mut()),
@@ -406,15 +435,15 @@ mod tests {
     #[test]
     fn map_cyclic_and_reserved() {
         let m = PidMap::new();
-        assert!(m.take(1));
-        assert!(!m.take(1));
+        assert_eq!(m.take(1), Ok(true));
+        assert_eq!(m.take(1), Ok(false));
         // Cyclic: after the last one handed out (0), 1 is taken, so 2
-        assert_eq!(m.alloc(), Some(2));
-        assert_eq!(m.alloc(), Some(3));
+        assert_eq!(m.alloc(), Ok(Some(2)));
+        assert_eq!(m.alloc(), Ok(Some(3)));
         m.free(1);
-        assert!(m.take(1));
+        assert_eq!(m.take(1), Ok(true));
         // Wraps past the end to RESERVED_PIDS
         m.last.store(m.max - 1, Ordering::Relaxed);
-        assert_eq!(m.alloc(), Some(RESERVED_PIDS));
+        assert_eq!(m.alloc(), Ok(Some(RESERVED_PIDS)));
     }
 }

@@ -2,7 +2,6 @@
 //!
 //! Handles virtual memory areas (VMAs), mmap/munmap syscalls, and
 //! demand paging for user processes.
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 pub(crate) mod frame_alloc;
 pub(crate) mod heap;
@@ -10,6 +9,7 @@ pub mod numa;
 
 extern crate alloc;
 
+use crate::util::kalloc::{arc_cyclic_nofail, box_nofail};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU8, AtomicU32, AtomicUsize, Ordering};
@@ -420,7 +420,9 @@ impl MmStruct {
             .position(|v| v.start > vma.start)
             .unwrap_or(self.vmas.len());
         self.link(&vma);
-        self.vmas.insert(pos, alloc::boxed::Box::new(vma));
+        // VMA allocation failure is not plumbed to the ~20 callers (the
+        // Vec growth beside it cannot fail gracefully either)
+        self.vmas.insert(pos, box_nofail(vma));
         pos
     }
 
@@ -766,7 +768,8 @@ impl MmStruct {
         }
 
         // Clone VMA for the second half
-        let mut new_vma = alloc::boxed::Box::new((**vma).clone());
+        // Not plumbed: see `insert_vma`
+        let mut new_vma = box_nofail((**vma).clone());
         new_vma.start = split_addr;
         // Bounded: pgoff + pages fits (pgoff <= TASK_SIZE / 4KB at
         // creation and only ever lowered by growth)
@@ -970,7 +973,10 @@ impl MmRef {
     /// A new address space rooted at `pgd`, with one user, whose VMAs
     /// `build` makes knowing the address space (for rmap chains)
     fn new_cyclic(pgd: u64, build: impl FnOnce(&Weak<Mm>) -> MmStruct) -> Self {
-        MmRef(Arc::new_cyclic(|me| Mm {
+        // Not try_arc_cyclic: that runs `build` with preemption off, and
+        // dup_mm's copies the page tables under the parent's mmap_lock.
+        // The failure is not plumbed (fork, exec and boot callers)
+        MmRef(arc_cyclic_nofail(|me| Mm {
             users: AtomicUsize::new(1),
             pgd,
             map: RwSem::new(build(me)),
@@ -1092,8 +1098,15 @@ pub fn dup_mm(parent: &MmRef, pgd: u64) -> Result<MmRef, i32> {
             }
             let mut v = vma.clone();
             v.flags &= !VM_LOCKED_MASK;
-            if v.flags & VM_WIPEONFORK != 0 {
-                v.anon_vma = v.anon_vma.as_ref().map(|_| anon_vma::AnonVma::new());
+            if v.flags & VM_WIPEONFORK != 0 && v.anon_vma.is_some() {
+                match anon_vma::AnonVma::new() {
+                    Ok(av) => v.anon_vma = Some(av),
+                    Err(e) => {
+                        // Not linked: the child is torn down below
+                        res = Err(e.errno());
+                        break;
+                    }
+                }
             }
             // In the chain before its pages are copied (Linux
             // anon_vma_fork before copy_page_range)
@@ -1105,7 +1118,8 @@ pub fn dup_mm(parent: &MmRef, pgd: u64) -> Result<MmRef, i32> {
                     }
                 });
             }
-            map.vmas.push(alloc::boxed::Box::new(v));
+            // Not plumbed: see `insert_vma`
+            map.vmas.push(box_nofail(v));
             if res.is_err() {
                 break;
             }
@@ -1181,7 +1195,7 @@ mod tests {
     fn chain_follows_vma_changes() {
         let mut m = MmStruct::new(0x7000_0000);
         m.set_owner(&Weak::new(), 7);
-        let av = anon_vma::AnonVma::new();
+        let av = anon_vma::AnonVma::new().unwrap();
         let rw = PROT_READ | PROT_WRITE;
         let flags = MAP_PRIVATE | MAP_ANONYMOUS;
         m.insert_vma(Vma::new_anon(0x10000, 0x20000, rw, flags, av.clone()));

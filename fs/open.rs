@@ -251,8 +251,8 @@ pub fn sys_close_range(fd: u32, max_fd: u32, flags: u32) -> i64 {
     }
     let files = if flags & CLOSE_RANGE_UNSHARE != 0 {
         match crate::task::fdtable::unshare_task_fd(crate::task::percpu::current_tid()) {
-            Some(f) => f,
-            None => return KernelError::BadFd.sysret(),
+            Ok(f) => f,
+            Err(e) => return e.sysret(),
         }
     } else {
         current_fd_table()

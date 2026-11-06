@@ -21,8 +21,8 @@
 //! Locking: `TimerBase.wheel` is an IrqSpinlock leaf (only the wheel's
 //! lists and the timers' `expires`/`pending` under it); callbacks run
 //! with no timer lock held.
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
+use crate::util::kalloc::box_nofail;
 use alloc::boxed::Box;
 use core::marker::PhantomPinned;
 use core::pin::Pin;
@@ -346,7 +346,8 @@ fn base_of(cpu: u32, flags: u8) -> &'static TimerBase {
 /// Give `cpu` its wheels (bring-up, thread context)
 pub fn init_cpu(cpu: u32) {
     for b in BASES.get(cpu) {
-        let slots = Box::new([const { List::new() }; WHEEL]);
+        // CPU bring-up: failure cannot be reported
+        let slots = box_nofail([const { List::new() }; WHEEL]);
         let mut w = b.wheel.lock();
         if w.slots.is_none() {
             w.slots = Some(slots);

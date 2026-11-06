@@ -13,8 +13,8 @@
 //! - New namespaces start with only a loopback device
 //! - Physical devices belong to the init namespace by default
 //! - Sockets, routes, and ARP entries are namespace-local
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
+use crate::util::kalloc::{arc_nofail, try_arc};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -107,9 +107,24 @@ pub struct NetNamespace {
 }
 
 impl NetNamespace {
-    /// Create a new network namespace with loopback device
-    pub fn new() -> Arc<Self> {
-        let ns = Arc::new(Self {
+    /// Create a new network namespace with loopback device, or ENOMEM
+    pub fn new() -> Result<Arc<Self>, KernelError> {
+        // The device first: nothing to undo but itself
+        let lo = try_arc(loopback_device(try_arc(LoopbackOps)?))?;
+        let ns = try_arc(Self::fresh())?;
+        Ok(Self::attach(ns, lo))
+    }
+
+    /// The initial namespace (boot: failure cannot be reported)
+    fn new_init() -> Arc<Self> {
+        let ns = arc_nofail(Self::fresh());
+        let lo = arc_nofail(loopback_device(arc_nofail(LoopbackOps)));
+        Self::attach(ns, lo)
+    }
+
+    /// A namespace's state, before it is listed and has its loopback
+    fn fresh() -> Self {
+        Self {
             id: NEXT_NET_ID.fetch_add(1, Ordering::Relaxed),
             devices: RwLock::new(Vec::new()),
             next_ifindex: AtomicU32::new(1),
@@ -134,13 +149,15 @@ impl NetNamespace {
             ],
             arp: crate::net::neigh::NeighTable::new(&crate::net::arp::ARP_OPS),
             loopback: RwLock::new(None),
-        });
+        }
+    }
 
+    /// List `ns` and give it its loopback device `lo`
+    fn attach(ns: Arc<Self>, lo: Arc<NetDevice>) -> Arc<Self> {
         NET_NAMESPACE_LIST.lock().push(Arc::downgrade(&ns));
 
         // Loopback device: ifindex 1, down and without addresses until
         // brought up (then 127.0.0.1/8, like Linux)
-        let lo = create_loopback_device();
         ns.register_device(Arc::clone(&lo));
         *ns.loopback.write() = Some(lo);
 
@@ -152,7 +169,7 @@ impl NetNamespace {
     /// Network namespaces don't copy state - new namespace starts fresh
     /// with only loopback device (unlike mount namespace which clones tree).
     pub fn clone_ns(&self) -> Result<Arc<Self>, i32> {
-        Ok(Self::new())
+        Self::new().map_err(|e| e.errno())
     }
 
     // ========================================================================
@@ -263,15 +280,10 @@ impl NetDeviceOps for LoopbackOps {
     }
 }
 
-/// Create a loopback device (down, no addresses)
-fn create_loopback_device() -> Arc<NetDevice> {
+/// A loopback device (down, no addresses)
+fn loopback_device(ops: Arc<LoopbackOps>) -> NetDevice {
     use alloc::string::String;
-    Arc::new(NetDevice::new(
-        String::from("lo"),
-        [0; 6],
-        LinkInfo::LOOPBACK,
-        Arc::new(LoopbackOps),
-    ))
+    NetDevice::new(String::from("lo"), [0; 6], LinkInfo::LOOPBACK, ops)
 }
 
 // ============================================================================
@@ -281,7 +293,7 @@ fn create_loopback_device() -> Arc<NetDevice> {
 /// Initial (root) network namespace
 ///
 /// Physical network devices are registered here. Created lazily on first access.
-pub static INIT_NET_NS: Lazy<Arc<NetNamespace>> = Lazy::new(NetNamespace::new);
+pub static INIT_NET_NS: Lazy<Arc<NetNamespace>> = Lazy::new(NetNamespace::new_init);
 
 /// Every network namespace (Linux net_namespace_list; spin leaf)
 static NET_NAMESPACE_LIST: Mutex<Vec<Weak<NetNamespace>>> = Mutex::new(Vec::new());

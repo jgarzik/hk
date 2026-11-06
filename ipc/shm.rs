@@ -109,7 +109,7 @@ impl ShmidKernel {
             ctim: AtomicI64::new(now),
             cpid: pid,
             lpid: AtomicI32::new(pid),
-            shmem: Shmem::new(size.div_ceil(PAGE_SIZE) as u64),
+            shmem: Shmem::new(size.div_ceil(PAGE_SIZE) as u64).map_err(|e| e.errno())?,
             destroyed: AtomicBool::new(false),
             ns,
         })

@@ -588,7 +588,7 @@ mod tests {
 
     #[test]
     fn anon_mapping_holds_a_reference() {
-        let av = AnonVma::new();
+        let av = AnonVma::new().unwrap();
         let page = Page::new();
         page.set_anon_mapping(&av);
         assert_eq!(Arc::strong_count(&av), 2);
@@ -607,7 +607,7 @@ mod tests {
 
     #[test]
     fn free_prepare_resets() {
-        let av = AnonVma::new();
+        let av = AnonVma::new().unwrap();
         let page = Page::new();
         page.set_anon_mapping(&av);
         page.inc_mapcount();

@@ -24,10 +24,11 @@
 //! Deviation from Linux: one AnonVma per family of VMAs (fork shares
 //! the parent's instead of chaining a child one under it), and the chain
 //! is a vector, not an interval tree.
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 extern crate alloc;
 
+use crate::util::error::KernelError;
+use crate::util::kalloc::try_arc;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 
@@ -72,8 +73,9 @@ pub struct AnonVma {
 }
 
 impl AnonVma {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self::default())
+    /// A new, empty reverse map, or ENOMEM
+    pub fn new() -> Result<Arc<Self>, KernelError> {
+        try_arc(Self::default())
     }
 
     /// Add a VMA's entry (Linux anon_vma_chain_link)
@@ -171,7 +173,7 @@ mod tests {
 
     #[test]
     fn link_update_unlink() {
-        let av = AnonVma::new();
+        let av = AnonVma::new().unwrap();
         av.link(avc(1, 0x10000, 0x20000, 0x10));
         av.link(avc(2, 0x10000, 0x20000, 0x10));
         // Split at 0x18000

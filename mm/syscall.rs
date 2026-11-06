@@ -233,10 +233,13 @@ pub fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: 
         // Set up anon_vma for private anonymous mappings (for swap-out
         // reverse mapping); shared ones get a shared object for their
         // pages (Linux shmem_zero_setup)
-        if is_private {
-            v.set_anon_vma(AnonVma::new());
+        let made = if is_private {
+            AnonVma::new().map(|av| v.set_anon_vma(av))
         } else {
-            v.shmem = Some(super::shmem::Shmem::new(length / PAGE_SIZE));
+            super::shmem::Shmem::new(length / PAGE_SIZE).map(|s| v.shmem = Some(s))
+        };
+        if let Err(e) = made {
+            return e.sysret();
         }
         v
     };
@@ -452,7 +455,10 @@ pub fn sys_brk(brk: u64) -> i64 {
     if !brk_fits(&map, old, new) || !map.may_map() {
         return cur as i64;
     }
-    brk_grow(&mut map, old, new);
+    // Without memory the break stays (Linux brk: the old one returned)
+    if brk_grow(&mut map, old, new).is_err() {
+        return cur as i64;
+    }
     map.update_brk(brk);
     brk as i64
 }
@@ -488,8 +494,9 @@ fn brk_fits(mm: &super::MmStruct, old: u64, new: u64) -> bool {
 }
 
 /// Map [old, new) for the heap: the heap VMA ending at `old` grows, or a
-/// new one is made (merged with its neighbours); pages come on demand
-fn brk_grow(mm: &mut super::MmStruct, old: u64, new: u64) {
+/// new one is made (merged with its neighbours); pages come on demand.
+/// ENOMEM
+fn brk_grow(mm: &mut super::MmStruct, old: u64, new: u64) -> Result<(), KernelError> {
     match mm.find_vma_index(old - 1) {
         Some(i) if mm.get_vma(i).is_some_and(|v| v.end == old && is_heap(v)) => {
             mm.set_end(i, new);
@@ -501,13 +508,14 @@ fn brk_grow(mm: &mut super::MmStruct, old: u64, new: u64) {
                 new,
                 PROT_READ | PROT_WRITE,
                 MAP_PRIVATE | MAP_ANONYMOUS,
-                AnonVma::new(),
+                AnonVma::new()?,
             );
             let i = mm.insert_vma(heap);
             mm.merge_adjacent(i);
         }
     }
     mm.add_total_vm((new - old) / PAGE_SIZE);
+    Ok(())
 }
 
 /// A VMA the heap can grow into: private anonymous memory, no file

@@ -23,8 +23,8 @@
 //! - Blocking and non-blocking reads
 //! - poll() support for integration with select/poll/epoll
 //! - CLOCK_REALTIME, CLOCK_MONOTONIC, CLOCK_BOOTTIME and the alarm clocks
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
+use crate::util::kalloc::try_arc;
 use alloc::sync::{Arc, Weak};
 use core::pin::Pin;
 
@@ -160,15 +160,15 @@ pub struct Timerfd {
 }
 
 impl Timerfd {
-    /// Create a new timerfd
-    pub fn new(clockid: i32) -> Arc<Self> {
-        let timerfd = Arc::new(Self {
+    /// Create a new timerfd, or ENOMEM
+    pub fn new(clockid: i32) -> Result<Arc<Self>, KernelError> {
+        let timerfd = try_arc(Self {
             inner: IrqSpinlock::new(TimerfdInner::new(clockid)),
             wait_queue: WaitQueue::new(),
             timer: HrTimer::new(timerfd_fire, HRTIMER_HARD),
-        });
+        })?;
         timerfd.timer.set_data(Arc::as_ptr(&timerfd) as usize);
-        timerfd
+        Ok(timerfd)
     }
 
     /// Its timer (pinned: the timerfd lives in an Arc)
@@ -462,7 +462,7 @@ impl FileOps for TimerfdFileOps {
 /// # Returns
 /// Arc<File> for the new timerfd
 pub fn create_timerfd(clockid: i32, tfd_flags: i32) -> Result<Arc<File>, KernelError> {
-    let timerfd = Timerfd::new(clockid);
+    let timerfd = Timerfd::new(clockid)?;
 
     // Create dummy dentry for timerfd
 

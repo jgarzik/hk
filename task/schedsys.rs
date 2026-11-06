@@ -754,8 +754,10 @@ pub fn sys_ioprio_set(which: i32, who: i32, ioprio: i32) -> i64 {
                 return KernelError::NotPermitted.sysret();
             }
             // Get or create IoContext for the target
-            let Some(ctx) = super::task_io_context(tid) else {
-                return KernelError::NoProcess.sysret();
+            let ctx = match super::task_io_context(tid) {
+                Ok(Some(c)) => c,
+                Ok(None) => return KernelError::NoProcess.sysret(),
+                Err(e) => return e.sysret(),
             };
 
             ctx.set_ioprio(ioprio);
@@ -778,8 +780,10 @@ pub fn sys_ioprio_set(which: i32, who: i32, ioprio: i32) -> i64 {
                 if !ioprio_owner_ok(tid) {
                     return KernelError::NotPermitted.sysret();
                 }
-                if let Some(ctx) = super::task_io_context(tid) {
-                    ctx.set_ioprio(ioprio);
+                match super::task_io_context(tid) {
+                    Ok(Some(ctx)) => ctx.set_ioprio(ioprio),
+                    Ok(None) => {}
+                    Err(e) => return e.sysret(),
                 }
             }
             0

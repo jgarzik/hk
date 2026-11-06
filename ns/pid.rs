@@ -5,8 +5,8 @@
 //! ancestor). Each namespace has its number bitmap (`task::pid`), and a
 //! task gets a number in each level of its parent's namespace chain;
 //! syscalls still report the root number (BUGS.md).
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
+use crate::util::kalloc::{arc_nofail, try_arc};
 use alloc::sync::Arc;
 use spin::Lazy;
 
@@ -28,7 +28,8 @@ pub struct PidNamespace {
 impl PidNamespace {
     /// Create the initial (root) PID namespace
     fn new_init() -> Arc<Self> {
-        Arc::new(Self {
+        // Boot: failure cannot be reported
+        arc_nofail(Self {
             level: 0,
             parent: None,
             map: crate::task::pid::PidMap::new(),
@@ -42,11 +43,12 @@ impl PidNamespace {
         if parent.level >= MAX_PID_NS_LEVEL {
             return Err(11); // EAGAIN - max nesting exceeded
         }
-        Ok(Arc::new(Self {
+        try_arc(Self {
             level: parent.level + 1,
             parent: Some(parent.clone()),
             map: crate::task::pid::PidMap::new(),
-        }))
+        })
+        .map_err(|e| e.errno())
     }
 }
 

@@ -12,8 +12,9 @@
 //!
 //! For example, if a process in `/docker/container1` creates a cgroup namespace,
 //! it will see its cgroup as `/` in `/proc/self/cgroup`.
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
+use crate::util::error::KernelError;
+use crate::util::kalloc::{arc_nofail, try_arc};
 use alloc::string::String;
 use alloc::sync::Arc;
 use spin::Lazy;
@@ -31,17 +32,17 @@ pub struct CgroupNamespace {
 }
 
 impl CgroupNamespace {
-    /// Create a new cgroup namespace rooted at the given cgroup
-    pub fn new(root: Arc<Cgroup>) -> Arc<Self> {
-        Arc::new(Self { root })
+    /// Create a new cgroup namespace rooted at the given cgroup, or ENOMEM
+    pub fn new(root: Arc<Cgroup>) -> Result<Arc<Self>, KernelError> {
+        try_arc(Self { root })
     }
 
     /// Create the initial cgroup namespace (rooted at the real root cgroup)
     fn new_init() -> Arc<Self> {
         // The initial namespace uses the real root cgroup
         // We'll get it lazily when first accessed since cgroup_init()
-        // might not have been called yet
-        Arc::new(Self {
+        // might not have been called yet (boot: failure cannot be reported)
+        arc_nofail(Self {
             root: CGROUP_ROOT
                 .root_cgroup()
                 .unwrap_or_else(create_placeholder_root),
@@ -58,7 +59,7 @@ impl CgroupNamespace {
     /// Creates a new cgroup namespace rooted at the given cgroup.
     /// Typically called with the current task's cgroup.
     pub fn clone_ns(&self, new_root: Arc<Cgroup>) -> Result<Arc<Self>, i32> {
-        Ok(Arc::new(Self { root: new_root }))
+        Self::new(new_root).map_err(|e| e.errno())
     }
 
     /// Translate an absolute cgroup path to a namespace-relative path
@@ -107,11 +108,10 @@ impl CgroupNamespace {
 fn create_placeholder_root() -> Arc<Cgroup> {
     // This is called before cgroup_init(), so we create a minimal placeholder
     // It will be replaced when the real root is created
-    Cgroup::new(
+    Cgroup::new_root(
         0,
         String::new(),
-        None,
-        &Arc::new(crate::cgroup::CgroupRoot::new()),
+        &arc_nofail(crate::cgroup::CgroupRoot::new()),
     )
 }
 

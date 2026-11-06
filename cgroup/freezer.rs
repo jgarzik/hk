@@ -8,8 +8,8 @@
 //!
 //! - `cgroup.freeze`: Write 1 to freeze, 0 to thaw
 //! - `cgroup.events` (core): shows whether it is frozen
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
+use crate::util::kalloc::try_arc;
 use alloc::format;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -50,7 +50,7 @@ impl CgroupSubsysOps for FreezerController {
         parent_css: Option<&Arc<CgroupSubsysState>>,
     ) -> Result<Arc<dyn CssPrivate>, KernelError> {
         let _ = parent_css;
-        Ok(Arc::new(FreezerState))
+        Ok(try_arc(FreezerState)?)
     }
 
     fn css_free(&self, _css: &CgroupSubsysState) {

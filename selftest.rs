@@ -4,9 +4,8 @@
 //! cross-CPU wakeups) in parallel with user space, and prints one line:
 //! `KSELFTEST:OK`, or `KSELFTEST:FAIL ...` per failed check (make check
 //! fails on any FAIL in the serial log).
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
-use alloc::sync::Arc;
+use crate::util::kalloc::arc_nofail;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::sync::spin::Mutex;
@@ -56,7 +55,7 @@ fn selftest_thread(_arg: usize) {
     check("tick_rate", dk >= want * 3 / 4 && dk <= want * 3 / 2, dk);
 
     // 2. queue_work runs on the system workqueue worker
-    let work = Arc::new(Mutex::new(Work::new(|| {
+    let work = arc_nofail(Mutex::new(Work::new(|| {
         WORK_RAN.store(true, Ordering::Release);
         EVENT_WQ.wake_all();
     })));
@@ -66,7 +65,7 @@ fn selftest_thread(_arg: usize) {
 
     // 3. Delayed work runs no earlier than its delay
     let t0 = get_ticks();
-    let dwork = Arc::new(Mutex::new(DelayedWork::new(|| {
+    let dwork = arc_nofail(Mutex::new(DelayedWork::new(|| {
         DELAYED_RAN_TICK.store(get_ticks(), Ordering::Release);
         EVENT_WQ.wake_all();
     })));
@@ -79,7 +78,7 @@ fn selftest_thread(_arg: usize) {
     // 3b. mod_delayed_work (Linux semantics): an idle item is queued
     // (false); a timed one is re-timed to now (true) and runs once; a
     // cancelled one does not run
-    let mw = Arc::new(Mutex::new(DelayedWork::new(|| {
+    let mw = arc_nofail(Mutex::new(DelayedWork::new(|| {
         MOD_RUNS.fetch_add(1, Ordering::AcqRel);
         EVENT_WQ.wake_all();
     })));
@@ -154,30 +153,39 @@ fn selftest_thread(_arg: usize) {
     use crate::net::inet::ifaddr::{InIfaddr, inet_insert_ifa};
     use crate::net::netlink::NlInfo;
     use crate::net::{Ipv4Addr, device::flags::IFF_UP, rtnl};
-    let net = crate::net::NetNamespace::new();
-    let extra = Ipv4Addr::new(192, 0, 2, 1);
-    if let Some(lo) = net.loopback() {
-        let r = rtnl::lock();
-        let up =
-            rtnl::dev_change_flags(&r, &net, &lo, lo.admin_flags() | IFF_UP, NlInfo::default());
-        check("netns_lo_up", up.is_ok(), 0);
-        let ifa = InIfaddr::new(extra, 24, lo.name());
-        check(
-            "netns_lo_addr",
-            inet_insert_ifa(&r, &net, &lo, ifa, NlInfo::default()).is_ok(),
-            0,
-        );
-    }
-    let targets = [Ipv4Addr::new(127, 0, 0, 1), extra];
-    for (i, &dst) in targets.iter().enumerate() {
-        let before = icmp::ICMP_IN_ECHO_REPS.load(Ordering::Acquire);
-        let sent = icmp::icmp_send_echo(&net, dst, 0x6b6b, i as u16, b"hk-selftest");
-        check("icmp_lo_send", sent.is_ok(), i as u64);
-        let left = icmp::ICMP_ECHO_REPLY_WQ.wait_event_timeout(
-            || icmp::ICMP_IN_ECHO_REPS.load(Ordering::Acquire) > before,
-            200,
-        );
-        check("icmp_lo_reply", left > 0, u64::from(dst.to_u32()));
+    match crate::net::NetNamespace::new() {
+        Ok(net) => {
+            let extra = Ipv4Addr::new(192, 0, 2, 1);
+            if let Some(lo) = net.loopback() {
+                let r = rtnl::lock();
+                let up = rtnl::dev_change_flags(
+                    &r,
+                    &net,
+                    &lo,
+                    lo.admin_flags() | IFF_UP,
+                    NlInfo::default(),
+                );
+                check("netns_lo_up", up.is_ok(), 0);
+                let ifa = InIfaddr::new(extra, 24, lo.name());
+                check(
+                    "netns_lo_addr",
+                    inet_insert_ifa(&r, &net, &lo, ifa, NlInfo::default()).is_ok(),
+                    0,
+                );
+            }
+            let targets = [Ipv4Addr::new(127, 0, 0, 1), extra];
+            for (i, &dst) in targets.iter().enumerate() {
+                let before = icmp::ICMP_IN_ECHO_REPS.load(Ordering::Acquire);
+                let sent = icmp::icmp_send_echo(&net, dst, 0x6b6b, i as u16, b"hk-selftest");
+                check("icmp_lo_send", sent.is_ok(), i as u64);
+                let left = icmp::ICMP_ECHO_REPLY_WQ.wait_event_timeout(
+                    || icmp::ICMP_IN_ECHO_REPS.load(Ordering::Acquire) > before,
+                    200,
+                );
+                check("icmp_lo_reply", left > 0, u64::from(dst.to_u32()));
+            }
+        }
+        Err(e) => check("netns_new", false, e.errno() as u64),
     }
 
     // 6. mremap's move allocates first: ENOMEM loses no page

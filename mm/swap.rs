@@ -13,10 +13,10 @@
 //! swap-in), never with the swap cache's lock held. `SWAP_INFO` (a
 //! spin `RwLock`, read mostly) holds the devices; `SWAPON` (a sleeping
 //! `Mutex`) serializes swapon and swapoff.
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 extern crate alloc;
 
+use crate::util::kalloc::try_arc;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
@@ -539,14 +539,14 @@ fn swapon(path_ptr: u64, swap_flags: i32) -> Result<(), KernelError> {
         Some(b) => (None, Some(b)),
         None => (Some(inode), None),
     };
-    let si = SwapInfo::new(backing, path, swap_type, max, priority)?;
+    let si = try_arc(SwapInfo::new(backing, path, swap_type, max, priority)?)?;
     // S_SWAPFILE under i_rwsem (Linux claim_swapfile under inode_lock):
     // a write or truncate in flight finishes first, later ones see it
     let si_inode = si.swapfile_inode();
     let lock = si_inode.lock();
     si_inode.i_swapfile.store(true, Ordering::Release);
     drop(lock);
-    SWAP_INFO.write()[swap_type as usize] = Some(Arc::new(si));
+    SWAP_INFO.write()[swap_type as usize] = Some(si);
     TOTAL_SWAP_PAGES.fetch_add(max - 1, Ordering::Relaxed);
     Ok(())
 }

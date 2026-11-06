@@ -378,12 +378,13 @@ pub fn image_vmas(
 
 fn anon_vma(start: u64, end: u64, prot: u32) -> crate::mm::Vma {
     use crate::mm::{MAP_ANONYMOUS, MAP_PRIVATE, Vma, anon_vma::AnonVma};
+    // Past exec's point of no return: failure cannot be reported
     Vma::new_anon(
         start,
         end,
         prot,
         MAP_PRIVATE | MAP_ANONYMOUS,
-        AnonVma::new(),
+        crate::util::kalloc::arc_nofail(AnonVma::default()),
     )
 }
 

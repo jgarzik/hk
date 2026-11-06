@@ -6,9 +6,9 @@
 //! - syslog (kernel logging)
 //! - capget, capset (capabilities)
 //! - pidfd_open, pidfd_send_signal, pidfd_getfd (pidfd operations)
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use crate::util::error::KernelError;
+use crate::util::kalloc::try_arc;
 
 use super::Pid;
 
@@ -1202,7 +1202,10 @@ pub fn sys_capset<A: crate::uaccess::UaccessArch>(header_addr: u64, data_addr: u
     // Note: bset and ambient are not modified by capset
 
     // Commit the new credentials
-    super::commit_creds(alloc::sync::Arc::new(new_cred));
+    match try_arc(new_cred) {
+        Ok(c) => super::commit_creds(c),
+        Err(e) => return e.sysret(),
+    }
 
     0
 }

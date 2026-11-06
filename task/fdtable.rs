@@ -15,9 +15,9 @@
 //! file_close_fd_locked, then filp_close/fput after spin_unlock).
 //! Likewise a task's last reference to its table is dropped after its
 //! alloc_lock is released, never under it.
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use crate::sync::spin::{Mutex, MutexGuard};
+use crate::util::kalloc::{arc_nofail, try_arc};
 use alloc::sync::Arc;
 use core::mem::ManuallyDrop;
 use core::ops::{Deref, DerefMut};
@@ -25,6 +25,7 @@ use core::ops::{Deref, DerefMut};
 use super::percpu::with_task_lock;
 use super::{FdTable, Tid};
 use crate::fs::File;
+use crate::util::error::KernelError;
 
 /// A descriptor table (Linux files_struct)
 pub struct Files(Mutex<FdTable<File>>);
@@ -127,7 +128,8 @@ pub fn exec_task_fd(tid: Tid) {
             .filter(|&&fd| t.get_fd_flags(fd) & super::FD_CLOEXEC != 0)
             .filter_map(|&fd| t.get(fd))
             .collect();
-        (Arc::new(Files::new(t.exec_copy())), cloexec)
+        // Past exec's point of no return: failure cannot be reported
+        (arc_nofail(Files::new(t.exec_copy())), cloexec)
     };
     init_task_fd(tid, new);
     // Linux do_close_on_exec closes them (filp_close): their POSIX locks
@@ -141,28 +143,28 @@ pub fn exec_task_fd(tid: Tid) {
 
 /// Give `tid` a private copy of its table (Linux unshare_fd): the new
 /// table is installed and returned, while tasks still sharing the old
-/// one through CLONE_FILES keep it.
-pub fn unshare_task_fd(tid: Tid) -> Option<Arc<Files>> {
-    let old = get_task_fd(tid)?;
-    let new = Arc::new(Files::new(old.lock().deep_clone()));
+/// one through CLONE_FILES keep it. EBADF if it has none, ENOMEM.
+pub fn unshare_task_fd(tid: Tid) -> Result<Arc<Files>, KernelError> {
+    let old = get_task_fd(tid).ok_or(KernelError::BadFd)?;
+    let new = try_arc(Files::new(old.lock().deep_clone()))?;
     init_task_fd(tid, new.clone());
     drop(old);
-    Some(new)
+    Ok(new)
 }
 
-/// Clone the table for fork/clone: shared with CLONE_FILES (`share`),
-/// else a copy
-pub fn clone_task_fd(parent_tid: Tid, child_tid: Tid, share: bool) {
-    let parent = get_task_fd(parent_tid);
-    let child = match parent {
-        Some(p) if share => p,
-        Some(p) => Arc::new(Files::new(p.lock().deep_clone())),
-        None => create_empty_fd_table(),
-    };
-    init_task_fd(child_tid, child);
+/// The table for a new task, built before it exists (Linux copy_files;
+/// installed with `init_task_fd`): shared with CLONE_FILES (`share`),
+/// else a copy; ENOMEM
+pub fn fork_task_fd(parent_tid: Tid, share: bool) -> Result<Arc<Files>, KernelError> {
+    match get_task_fd(parent_tid) {
+        Some(p) if share => Ok(p),
+        Some(p) => try_arc(Files::new(p.lock().deep_clone())),
+        None => try_arc(Files::new(FdTable::new())),
+    }
 }
 
-/// A new empty table (init opens its console descriptors itself)
+/// A new empty table for the boot-time init task (init opens its
+/// console descriptors itself; failure cannot be reported)
 pub fn create_empty_fd_table() -> Arc<Files> {
-    Arc::new(Files::new(FdTable::new()))
+    arc_nofail(Files::new(FdTable::new()))
 }

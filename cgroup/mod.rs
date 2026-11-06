@@ -22,9 +22,9 @@
 //! - `cpu`: CPU bandwidth limits and weights
 //! - `memory`: Memory usage limits and accounting
 //! - `io`: Block I/O bandwidth limits
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use crate::sync::spin::{Mutex, RwLock};
+use crate::util::kalloc::{arc_nofail, try_arc};
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
@@ -109,17 +109,41 @@ pub struct Cgroup {
 }
 
 impl Cgroup {
-    /// Create a new cgroup as a child of parent
+    /// Create a new cgroup as a child of parent, or ENOMEM
     pub fn new(
         id: CgroupId,
         name: String,
         parent: Option<&Arc<Cgroup>>,
         root: &Arc<CgroupRoot>,
-    ) -> Arc<Self> {
+    ) -> Result<Arc<Self>, KernelError> {
+        let cg = try_arc(Self::fresh(id, name, parent, root))?;
+
+        // Build ancestor chain
+        if let Some(p) = parent {
+            let mut ancestors = p.ancestors.read().clone();
+            ancestors.push(Arc::downgrade(p));
+            *cg.ancestors.write() = ancestors;
+        }
+
+        Ok(cg)
+    }
+
+    /// A root cgroup made at boot (failure cannot be reported)
+    pub fn new_root(id: CgroupId, name: String, root: &Arc<CgroupRoot>) -> Arc<Self> {
+        arc_nofail(Self::fresh(id, name, None, root))
+    }
+
+    /// A cgroup's state, before its ancestor chain is built
+    fn fresh(
+        id: CgroupId,
+        name: String,
+        parent: Option<&Arc<Cgroup>>,
+        root: &Arc<CgroupRoot>,
+    ) -> Self {
         let level = parent.map(|p| p.level + 1).unwrap_or(0);
         let ino = root.alloc_ino();
 
-        let cg = Arc::new(Self {
+        Self {
             id,
             name,
             parent: RwLock::new(parent.map(Arc::downgrade)),
@@ -133,16 +157,7 @@ impl Cgroup {
             subtree_control: AtomicU64::new(0),
             frozen: AtomicBool::new(false),
             ino,
-        });
-
-        // Build ancestor chain
-        if let Some(p) = parent {
-            let mut ancestors = p.ancestors.read().clone();
-            ancestors.push(Arc::downgrade(p));
-            *cg.ancestors.write() = ancestors;
         }
-
-        cg
     }
 
     /// Get parent cgroup
@@ -353,8 +368,8 @@ impl CgroupSubsysState {
         controller: ControllerType,
         id: u64,
         parent_css: Option<&Arc<CgroupSubsysState>>,
-    ) -> Arc<Self> {
-        Arc::new(Self {
+    ) -> Result<Arc<Self>, KernelError> {
+        try_arc(Self {
             cgroup: Arc::downgrade(cgroup),
             controller,
             id,
@@ -411,9 +426,9 @@ impl CssSet {
     pub fn new(
         css_map: BTreeMap<ControllerType, Arc<CgroupSubsysState>>,
         default: &Arc<Cgroup>,
-    ) -> Arc<Self> {
+    ) -> Result<Arc<Self>, KernelError> {
         let hash = Self::compute_hash(&css_map);
-        Arc::new(Self {
+        try_arc(Self {
             hash,
             subsys: RwLock::new(css_map),
             default_cgroup: Arc::downgrade(default),
@@ -456,7 +471,7 @@ pub static CSS_SET_CACHE: Mutex<BTreeMap<u64, Weak<CssSet>>> = Mutex::new(BTreeM
 pub fn find_css_set(
     css_map: BTreeMap<ControllerType, Arc<CgroupSubsysState>>,
     default: &Arc<Cgroup>,
-) -> Arc<CssSet> {
+) -> Result<Arc<CssSet>, KernelError> {
     let hash = CssSet::compute_hash(&css_map);
 
     let mut cache = CSS_SET_CACHE.lock();
@@ -465,13 +480,13 @@ pub fn find_css_set(
     if let Some(weak) = cache.get(&hash)
         && let Some(css_set) = weak.upgrade()
     {
-        return css_set;
+        return Ok(css_set);
     }
 
     // Create new CssSet
-    let css_set = CssSet::new(css_map, default);
+    let css_set = CssSet::new(css_map, default)?;
     cache.insert(hash, Arc::downgrade(&css_set));
-    css_set
+    Ok(css_set)
 }
 
 /// Cgroup Root - The unified hierarchy root
@@ -553,7 +568,7 @@ impl CgroupRoot {
 }
 
 /// Global unified cgroup hierarchy root
-pub static CGROUP_ROOT: Lazy<Arc<CgroupRoot>> = Lazy::new(|| Arc::new(CgroupRoot::new()));
+pub static CGROUP_ROOT: Lazy<Arc<CgroupRoot>> = Lazy::new(|| arc_nofail(CgroupRoot::new()));
 
 /// Task `tid` (its cgroup is `Task.cgroup`, Linux task->cgroups)
 fn task(tid: Pid) -> Option<crate::task::percpu::TaskRef> {
@@ -585,7 +600,7 @@ pub fn cgroup_init() {
     let root = CGROUP_ROOT.clone();
 
     // Create root cgroup
-    let root_cg = Cgroup::new(root.alloc_cg_id(), String::new(), None, &root);
+    let root_cg = Cgroup::new_root(root.alloc_cg_id(), String::new(), &root);
 
     root.set_root_cgroup(root_cg.clone());
 
@@ -600,8 +615,8 @@ pub fn cgroup_init() {
     for controller in root.registered_controllers() {
         if let Some(ops) = root.get_controller(controller)
             && let Ok(private) = ops.css_alloc(None)
+            && let Ok(css) = CgroupSubsysState::new(&root_cg, controller, 1, None)
         {
-            let css = CgroupSubsysState::new(&root_cg, controller, 1, None);
             css.set_private(private);
             root_cg.set_css(controller, css);
         }
@@ -730,7 +745,7 @@ pub fn cgroup_mkdir(parent: &Arc<Cgroup>, name: &str) -> Result<Arc<Cgroup>, Ker
     }
 
     // Create new cgroup
-    let new_cg = Cgroup::new(root.alloc_cg_id(), String::from(name), Some(parent), &root);
+    let new_cg = Cgroup::new(root.alloc_cg_id(), String::from(name), Some(parent), &root)?;
 
     // Initialize CSS for controllers enabled in parent's subtree_control
     for controller in root.registered_controllers() {
@@ -738,12 +753,13 @@ pub fn cgroup_mkdir(parent: &Arc<Cgroup>, name: &str) -> Result<Arc<Cgroup>, Ker
             && let Some(ops) = root.get_controller(controller)
         {
             let parent_css = parent.css(controller);
-            if let Ok(private) = ops.css_alloc(parent_css.as_ref()) {
-                let css_id = root.alloc_cg_id(); // Reuse cg_id allocator for css_id
-                let css = CgroupSubsysState::new(&new_cg, controller, css_id, parent_css.as_ref());
-                css.set_private(private);
-                new_cg.set_css(controller, css);
-            }
+            // ENOMEM fails the mkdir (Linux css_create); the new cgroup
+            // is not linked yet, and css_free has nothing to undo
+            let private = ops.css_alloc(parent_css.as_ref())?;
+            let css_id = root.alloc_cg_id(); // Reuse cg_id allocator for css_id
+            let css = CgroupSubsysState::new(&new_cg, controller, css_id, parent_css.as_ref())?;
+            css.set_private(private);
+            new_cg.set_css(controller, css);
         }
     }
 

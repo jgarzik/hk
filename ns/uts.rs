@@ -13,9 +13,9 @@
 //!
 //! `UtsNamespace.name` is protected by `RwLock` for read-heavy access
 //! (uname is called frequently, sethostname/setdomainname are rare).
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use crate::sync::spin::RwLock;
+use crate::util::kalloc::{arc_nofail, try_arc};
 use alloc::sync::Arc;
 use spin::Lazy;
 
@@ -151,10 +151,11 @@ impl UtsNamespace {
         // Copy current name values
         let name_copy = *self.name.read();
 
-        Ok(Arc::new(Self {
+        try_arc(Self {
             name: RwLock::new(name_copy),
             user_ns: self.user_ns.clone(),
-        }))
+        })
+        .map_err(|e| e.errno())
     }
 }
 
@@ -162,7 +163,8 @@ impl UtsNamespace {
 ///
 /// The root UTS namespace used by all tasks unless they create
 /// a new one via clone(CLONE_NEWUTS) or unshare(CLONE_NEWUTS).
-pub static INIT_UTS_NS: Lazy<Arc<UtsNamespace>> = Lazy::new(|| Arc::new(UtsNamespace::new_init()));
+pub static INIT_UTS_NS: Lazy<Arc<UtsNamespace>> =
+    Lazy::new(|| arc_nofail(UtsNamespace::new_init()));
 
 // ============================================================================
 // Helper Functions

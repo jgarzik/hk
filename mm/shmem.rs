@@ -18,8 +18,9 @@
 //! the mm lock (mm lock -> Shmem.root) and by MADV_REMOVE with no lock
 //! held; under it only `FRAME_ALLOCATOR` and the heap are taken. The drop takes no
 //! lock (doc/LOCKING.md, Address Spaces).
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
+use crate::util::error::KernelError;
+use crate::util::kalloc::try_arc;
 use alloc::sync::Arc;
 
 use super::fault::VmFault;
@@ -46,9 +47,9 @@ fn zeroed() -> Option<u64> {
 }
 
 impl Shmem {
-    /// A new, empty object of `size` pages
-    pub fn new(size: u64) -> Arc<Self> {
-        Arc::new(Self {
+    /// A new, empty object of `size` pages, or ENOMEM
+    pub fn new(size: u64) -> Result<Arc<Self>, KernelError> {
+        try_arc(Self {
             size,
             root: Mutex::new(XArray::new()),
             seq: crate::task::futex::KeySeq::new(),

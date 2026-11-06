@@ -1,5 +1,4 @@
 //! Task management
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 pub mod acct;
 pub(crate) mod binfmt_script;
@@ -112,6 +111,8 @@ pub mod wait_options {
     pub const P_PIDFD: i32 = 3;
 }
 
+use crate::util::error::KernelError;
+use crate::util::kalloc::{arc_nofail, try_arc};
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -315,7 +316,7 @@ pub fn current_cred() -> Cred {
 /// let mut new_cred = prepare_creds();
 /// new_cred.uid = new_uid;
 /// new_cred.euid = new_uid;
-/// commit_creds(Arc::new(new_cred));
+/// commit_creds(try_arc(new_cred)?);
 /// ```
 pub fn prepare_creds() -> Cred {
     current_cred()
@@ -361,15 +362,15 @@ pub fn nproc_exec_check() -> Result<(), i32> {
 /// - Otherwise (fork): Deep copy credentials (new Arc with copied data)
 ///
 /// This follows Linux's pattern from kernel/cred.c:copy_creds().
-pub fn copy_creds(clone_flags: u64, parent_cred: &Arc<Cred>) -> Arc<Cred> {
+pub fn copy_creds(clone_flags: u64, parent_cred: &Arc<Cred>) -> Result<Arc<Cred>, KernelError> {
     use clone_flags::CLONE_THREAD;
 
     if clone_flags & CLONE_THREAD != 0 {
         // Threads share credentials - just clone the Arc (bump refcount)
-        parent_cred.clone()
+        Ok(parent_cred.clone())
     } else {
         // Fork: deep copy credentials (child gets independent copy)
-        Arc::new((**parent_cred).clone())
+        try_arc((**parent_cred).clone())
     }
 }
 
@@ -1361,7 +1362,8 @@ impl TaskCred {
     unsafe fn arc(&self) -> Arc<Cred> {
         let p = self.0.load(Ordering::Acquire);
         if Self::is_static(p) {
-            return Arc::new(INIT_CRED.clone());
+            // The boot task's static set: no caller can fail here
+            return arc_nofail(INIT_CRED.clone());
         }
         // SAFETY: `p` came from Arc::into_raw and holds a count
         unsafe {
@@ -1541,6 +1543,7 @@ impl Task {
         cred: Arc<Cred>,
         mm: Option<crate::mm::MmRef>,
         alloc: TaskAlloc,
+        sig: TaskSignalState,
         inner: TaskInner,
     ) -> Self {
         let now = crate::time::monotonic_ns();
@@ -1570,7 +1573,7 @@ impl Task {
             tls: AtomicU64::new(0),
             gsbase: AtomicU64::new(0),
             seccomp_mode: AtomicU8::new(ids.seccomp_mode),
-            sig: crate::sync::spin::Mutex::new(TaskSignalState::new()),
+            sig: crate::sync::spin::Mutex::new(sig),
             keyrings: crate::sync::spin::Mutex::new(crate::keys::keyring::TaskKeyrings::new()),
             cgroup: crate::sync::spin::Mutex::new(None),
             fput_defer: crate::sync::spin::Mutex::new(None),
@@ -2472,16 +2475,16 @@ pub fn set_task_io_context(tid: Tid, ctx: Arc<IoContext>) {
 
 /// The I/O context of a task, a new one if it has none (Linux
 /// set_task_ioprio's alloc_io_context under task_lock); None if there
-/// is no such task
-pub fn task_io_context(tid: Tid) -> Option<Arc<IoContext>> {
-    let new = Arc::new(IoContext::new());
-    percpu::with_task_lock(tid, |a| match a.io_context() {
+/// is no such task, ENOMEM if one cannot be made
+pub fn task_io_context(tid: Tid) -> Result<Option<Arc<IoContext>>, KernelError> {
+    let new = try_arc(IoContext::new())?;
+    Ok(percpu::with_task_lock(tid, |a| match a.io_context() {
         Some(c) => c.clone(),
         None => {
             a.set_io_context(Some(new.clone()));
             new
         }
-    })
+    }))
 }
 
 /// Remove the I/O context for a task (on exit)
@@ -2489,27 +2492,20 @@ pub fn remove_task_io_context(tid: Tid) {
     drop(percpu::with_task_lock(tid, |a| a.set_io_context(None)));
 }
 
-/// Clone I/O context for a new task
+/// The I/O context for a new task, built before it exists (installed
+/// with `set_task_io_context`)
 ///
 /// If `share` is true (CLONE_IO set), child shares parent's Arc<IoContext>.
 /// Otherwise, child gets a new IoContext inheriting parent's ioprio value.
-pub fn clone_task_io(parent_tid: Tid, child_tid: Tid, share: bool) {
-    let parent_ctx = get_task_io_context(parent_tid);
-
-    let child_ctx = if let Some(parent_ctx) = parent_ctx {
-        if share {
-            // CLONE_IO: share the same context
-            parent_ctx
-        } else {
-            // No CLONE_IO: create new context with inherited ioprio
-            Arc::new(IoContext::with_ioprio(parent_ctx.get_ioprio()))
-        }
-    } else {
+pub fn fork_io(parent_tid: Tid, share: bool) -> Result<Arc<IoContext>, KernelError> {
+    match get_task_io_context(parent_tid) {
+        // CLONE_IO: share the same context
+        Some(parent_ctx) if share => Ok(parent_ctx),
+        // No CLONE_IO: create new context with inherited ioprio
+        Some(parent_ctx) => try_arc(IoContext::with_ioprio(parent_ctx.get_ioprio())),
         // Parent has no context, create default for child
-        Arc::new(IoContext::new())
-    };
-
-    set_task_io_context(child_tid, child_ctx);
+        None => try_arc(IoContext::new()),
+    }
 }
 
 // =============================================================================

@@ -23,8 +23,9 @@
 //! - Signal notification (SIGEV_SIGNAL, SIGEV_NONE)
 //! - Overrun counting for missed expirations
 //! - One-shot and periodic timers
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
+use crate::util::error::KernelError;
+use crate::util::kalloc::{arc_nofail, try_arc};
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use core::pin::Pin;
@@ -153,12 +154,22 @@ pub struct PosixTimer {
 }
 
 impl PosixTimer {
-    /// Create a new POSIX timer
-    fn new(timer_id: TimerT, clockid: i32, owner_tid: Tid, sigevent: SigEvent) -> Arc<Self> {
-        Self::with_cpu(timer_id, clockid, owner_tid, sigevent, None, false)
+    /// An itimer, made on first use (Linux keeps them in signal_struct:
+    /// getitimer, setitimer and alarm cannot fail)
+    fn itimer(
+        timer_id: TimerT,
+        clockid: i32,
+        owner_tid: Tid,
+        sigevent: SigEvent,
+        cpu: Option<crate::time::cpu_timer::CpuClock>,
+    ) -> Arc<Self> {
+        Self::own_data(arc_nofail(Self::fresh(
+            timer_id, clockid, owner_tid, sigevent, cpu, false,
+        )))
     }
 
-    /// A timer on CPU clock `cpu` (if any); `sleeper`: clock_nanosleep's
+    /// A timer on CPU clock `cpu` (if any); `sleeper`: clock_nanosleep's.
+    /// ENOMEM
     fn with_cpu(
         timer_id: TimerT,
         clockid: i32,
@@ -166,8 +177,22 @@ impl PosixTimer {
         sigevent: SigEvent,
         cpu: Option<crate::time::cpu_timer::CpuClock>,
         sleeper: bool,
-    ) -> Arc<Self> {
-        let timer = Arc::new(Self {
+    ) -> Result<Arc<Self>, KernelError> {
+        Ok(Self::own_data(try_arc(Self::fresh(
+            timer_id, clockid, owner_tid, sigevent, cpu, sleeper,
+        ))?))
+    }
+
+    /// Its state, before it is in its Arc
+    fn fresh(
+        timer_id: TimerT,
+        clockid: i32,
+        owner_tid: Tid,
+        sigevent: SigEvent,
+        cpu: Option<crate::time::cpu_timer::CpuClock>,
+        sleeper: bool,
+    ) -> Self {
+        Self {
             timer_id,
             clockid,
             owner_tid: AtomicU64::new(owner_tid),
@@ -177,7 +202,11 @@ impl PosixTimer {
             cpu,
             sleeper,
             wq: crate::sync::waitqueue::WaitQueue::new(),
-        });
+        }
+    }
+
+    /// Point its timer at it, in its Arc
+    fn own_data(timer: Arc<Self>) -> Arc<Self> {
         timer.timer.set_data(Arc::as_ptr(&timer) as usize);
         timer
     }
@@ -579,10 +608,12 @@ pub fn create_posix_timer(
     {
         timer_id = with_timers(tid, |registry| {
             let id = registry.alloc_id();
-            registry.add(PosixTimer::with_cpu(id, clockid, tid, sev, cpu, false));
-            id
+            let t = PosixTimer::with_cpu(id, clockid, tid, sev, cpu, false)
+                .map_err(|e| e.to_errno_neg())?;
+            registry.add(t);
+            Ok::<_, i32>(id)
         })
-        .ok_or(-11)?; // EAGAIN: no thread group
+        .ok_or(-11)??; // EAGAIN: no thread group; ENOMEM
     }
 
     Ok(timer_id)
@@ -632,13 +663,15 @@ pub fn cpu_nanosleep(clockid: i32, abs: bool, value_ns: u64) -> Result<(), (Kern
         sigev_notify: sigev_notify::SIGEV_NONE,
         ..SigEvent::default()
     };
-    let Some(t) = with_timers(tid, |reg| {
+    let t = match with_timers(tid, |reg| {
         let id = reg.alloc_id();
-        let t = PosixTimer::with_cpu(id, clockid, tid, sev, Some(c), true);
+        let t = PosixTimer::with_cpu(id, clockid, tid, sev, Some(c), true)?;
         reg.add(t.clone());
-        t
-    }) else {
-        return Err((crate::util::error::KernelError::InvalidArgument, 0));
+        Ok(t)
+    }) {
+        Some(Ok(t)) => t,
+        Some(Err(e)) => return Err((e, 0)),
+        None => return Err((crate::util::error::KernelError::InvalidArgument, 0)),
     };
     let spec = ITimerSpec::from_ns(value_ns, 0);
     let r = if value_ns == 0 && !abs {
@@ -919,11 +952,11 @@ fn itimer_real() -> Arc<PosixTimer> {
         if let Some(t) = reg.get(ITIMER_REAL_ID) {
             return t;
         }
-        let t = PosixTimer::new(ITIMER_REAL_ID, 1, tid, SigEvent::default());
+        let t = PosixTimer::itimer(ITIMER_REAL_ID, 1, tid, SigEvent::default(), None);
         reg.add(Arc::clone(&t));
         t
     })
-    .unwrap_or_else(|| PosixTimer::new(ITIMER_REAL_ID, 1, tid, SigEvent::default()))
+    .unwrap_or_else(|| PosixTimer::itimer(ITIMER_REAL_ID, 1, tid, SigEvent::default(), None))
 }
 
 /// The current process's itimer `which`, created on first use
@@ -946,7 +979,7 @@ fn itimer(which: i32) -> Arc<PosixTimer> {
             sample,
         };
         // CLOCK_PROCESS_CPUTIME_ID
-        PosixTimer::with_cpu(id, 2, tid, sev, Some(clock), false)
+        PosixTimer::itimer(id, 2, tid, sev, Some(clock))
     };
     with_timers(tid, |reg| {
         if let Some(t) = reg.get(id) {

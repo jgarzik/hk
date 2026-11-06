@@ -8,9 +8,9 @@
 //!
 //! - `io.max`: Per-device limits ("$MAJ:$MIN rbps=$N wbps=$N riops=$N wiops=$N")
 //! - `io.stat`: Per-device I/O statistics
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use crate::sync::spin::Mutex;
+use crate::util::kalloc::try_arc;
 use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::String;
@@ -128,7 +128,7 @@ impl CgroupSubsysOps for IoController {
         parent_css: Option<&Arc<CgroupSubsysState>>,
     ) -> Result<Arc<dyn CssPrivate>, KernelError> {
         let _ = parent_css;
-        Ok(Arc::new(IoState::new()))
+        Ok(try_arc(IoState::new())?)
     }
 
     fn css_free(&self, _css: &CgroupSubsysState) {

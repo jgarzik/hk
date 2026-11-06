@@ -36,10 +36,10 @@
 //! re-queue itself. Queueing, `mod_delayed_work` and
 //! `cancel_delayed_work` are process-context only (they take the item's
 //! Mutex, under `inner` for delayed work).
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 extern crate alloc;
 
+use crate::util::kalloc::{arc_nofail, box_nofail};
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
@@ -104,7 +104,9 @@ impl Work {
     /// Create a new work item with the given callback
     pub fn new<F: FnMut() + Send + 'static>(func: F) -> Self {
         Self {
-            func: Some(Box::new(func)),
+            // Like INIT_WORK, a work item cannot fail to be made: its
+            // callers (and DelayedWork's) have no error path
+            func: Some(box_nofail(func)),
             state: 0,
         }
     }
@@ -386,7 +388,8 @@ impl Workqueue {
                 let mut work = Work::new(move || Work::run_delayed(&dw, seq));
                 // The wrapper is fresh: mark it pending like queue_work
                 work.try_set_pending();
-                inner.pending.push_back(Arc::new(Mutex::new(work)));
+                // The worker thread: failure cannot be reported
+                inner.pending.push_back(arc_nofail(Mutex::new(work)));
                 inner.has_work = true;
             } else {
                 drop(g);

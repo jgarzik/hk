@@ -15,8 +15,8 @@
 //! Uses Linux acct_v3 format (64 bytes per record).
 //! Records are written when processes exit (group leader exits).
 #![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
+use crate::util::kalloc::try_arc;
 use alloc::sync::Arc;
 
 use crate::fs::KernelError;
@@ -259,7 +259,7 @@ fn open_acct_file(path: &[u8]) -> Result<Arc<File>, i64> {
         .unwrap_or(&crate::fs::ramfs::RAMFS_FILE_OPS);
     let mut file = File::new(dentry, Some(mnt), flags::O_WRONLY | flags::O_APPEND, f_op);
     file.write_access = w;
-    Ok(Arc::new(file))
+    try_arc(file).map_err(|e| e.sysret())
 }
 
 // =============================================================================
