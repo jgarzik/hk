@@ -4,14 +4,20 @@
 //! straight between its pages and the caller's memory (no bounce
 //! buffer) and in-kernel readers (exec, splice) use the same path.
 //!
-//! Both move forward only. A user copy may fault and sleep: never copy
-//! under a spin lock (`might_fault` reports it). A write source copies
-//! with page faults disabled and faults pages in between tries
-//! (`copy_from_user_atomic`, Linux generic_perform_write), so it may be
-//! used under i_rwsem or a page lock.
+//! Both move forward (a write source can step back over what a failed
+//! page took, Linux iov_iter_revert). A user copy may fault and sleep:
+//! never copy under a spin lock (`might_fault` reports it). A write
+//! source copies with page faults disabled and faults pages in between
+//! tries (`copy_from_user_atomic`), so it may be used under i_rwsem.
+//! Under a page lock a fault-in may need that very page's lock: fault
+//! the source in first (`fault_in`), then copy with `copy_from_nofault`
+//! (Linux generic_perform_write).
 
 use crate::arch::Uaccess;
-use crate::uaccess::{copy_from_user_atomic, copy_to_user};
+use crate::uaccess::{
+    copy_from_user, copy_from_user_atomic, copy_to_user, fault_in_readable, pagefault_disable,
+    pagefault_enable,
+};
 use crate::util::error::KernelError;
 
 use super::iov::IoVec;
@@ -67,6 +73,42 @@ impl<'a> Segs<'a> {
         }
         done
     }
+
+    /// Fault in the next `len` bytes for reading; the bytes that could
+    /// not be (0: all)
+    fn fault_in(&self, len: usize) -> usize {
+        let mut want = len.min(self.left);
+        let (mut i, mut off) = (self.i, self.off);
+        while want > 0 {
+            let Some(s) = self.segs.get(i) else {
+                break;
+            };
+            let n = (s.iov_len as usize - off).min(want);
+            let left = fault_in_readable::<Uaccess>(s.iov_base + off as u64, n);
+            if left > 0 {
+                return want - n + left;
+            }
+            want -= n;
+            i += 1;
+            off = 0;
+        }
+        want
+    }
+
+    /// Step back over the last `n` bytes moved
+    fn revert(&mut self, mut n: usize) {
+        self.left += n;
+        while n > 0 {
+            if self.off == 0 {
+                self.i -= 1;
+                self.off = self.segs[self.i].iov_len as usize;
+                continue;
+            }
+            let k = self.off.min(n);
+            self.off -= k;
+            n -= k;
+        }
+    }
 }
 
 enum Dest<'a> {
@@ -98,6 +140,17 @@ impl<'a> IovDest<'a> {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Take at most `n` more bytes (a read limit: the end of a device)
+    pub fn truncate(&mut self, n: usize) {
+        match &mut self.0 {
+            Dest::User(s) => s.left = s.left.min(n),
+            Dest::Kernel(b) => {
+                let k = n.min(b.len());
+                *b = &mut core::mem::take(b)[..k];
+            }
+        }
     }
 
     /// Copy as much of `data` as fits (Linux copy_to_iter); the bytes
@@ -134,13 +187,18 @@ impl<'a> IovDest<'a> {
         }
     }
 
-    /// `n` zero bytes (a hole): as many as fit
+    /// `n` zero bytes (a hole): as many as fit; EFAULT only if a fault
+    /// stopped it before the first byte
     pub fn zero(&mut self, n: usize) -> Result<usize, KernelError> {
         const Z: [u8; 256] = [0; 256];
         let mut done = 0;
         while done < n {
             let k = (n - done).min(Z.len());
-            let c = self.copy_to(&Z[..k])?;
+            let c = match self.copy_to(&Z[..k]) {
+                Ok(c) => c,
+                Err(e) if done == 0 => return Err(e),
+                Err(_) => break,
+            };
             done += c;
             if c < k {
                 break;
@@ -152,7 +210,8 @@ impl<'a> IovDest<'a> {
 
 enum Source<'a> {
     User(Segs<'a>),
-    Kernel(&'a [u8]),
+    /// The buffer and the bytes taken from it
+    Kernel(&'a [u8], usize),
 }
 
 /// Where a write takes its data from (Linux ITER_SOURCE)
@@ -166,14 +225,14 @@ impl<'a> IovSource<'a> {
 
     /// A kernel buffer
     pub fn kernel(buf: &'a [u8]) -> Self {
-        Self(Source::Kernel(buf))
+        Self(Source::Kernel(buf, 0))
     }
 
     /// Bytes left
     pub fn len(&self) -> usize {
         match &self.0 {
             Source::User(s) => s.left,
-            Source::Kernel(b) => b.len(),
+            Source::Kernel(b, at) => b.len() - at,
         }
     }
 
@@ -186,7 +245,40 @@ impl<'a> IovSource<'a> {
     pub fn truncate(&mut self, n: usize) {
         match &mut self.0 {
             Source::User(s) => s.left = s.left.min(n),
-            Source::Kernel(b) => *b = &b[..n.min(b.len())],
+            Source::Kernel(b, at) => *b = &b[..at.saturating_add(n).min(b.len())],
+        }
+    }
+
+    /// Fault in the next `n` bytes (Linux fault_in_iov_iter_readable);
+    /// the bytes that could not be (0: all)
+    pub fn fault_in(&self, n: usize) -> usize {
+        match &self.0 {
+            Source::User(s) => s.fault_in(n),
+            Source::Kernel(..) => 0,
+        }
+    }
+
+    /// Step back over the last `n` bytes copied (Linux iov_iter_revert)
+    pub fn revert(&mut self, n: usize) {
+        match &mut self.0 {
+            Source::User(s) => s.revert(n),
+            Source::Kernel(_, at) => *at -= n,
+        }
+    }
+
+    /// Fill as much of `buf` as there is data for with page faults
+    /// disabled and nothing faulted in (Linux
+    /// copy_folio_from_iter_atomic): for a copy under a page lock, after
+    /// `fault_in`. The bytes copied, maybe short or none.
+    pub fn copy_from_nofault(&mut self, buf: &mut [u8]) -> usize {
+        match &mut self.0 {
+            Source::User(s) => s.step(buf.len(), &mut |a, n, at| {
+                pagefault_disable();
+                let r = copy_from_user::<Uaccess>(&mut buf[at..at + n], a, n);
+                pagefault_enable();
+                if r.is_ok() { n } else { 0 }
+            }),
+            Source::Kernel(..) => self.copy_from(buf).unwrap_or(0),
         }
     }
 
@@ -203,10 +295,10 @@ impl<'a> IovSource<'a> {
                     Err(_) => 0,
                 },
             ),
-            Source::Kernel(b) => {
-                let n = want.min(b.len());
-                buf[..n].copy_from_slice(&b[..n]);
-                *b = &b[n..];
+            Source::Kernel(b, at) => {
+                let n = want.min(b.len() - *at);
+                buf[..n].copy_from_slice(&b[*at..*at + n]);
+                *at += n;
                 n
             }
         };
@@ -244,6 +336,47 @@ mod tests {
         assert_eq!(s.copy_from(&mut b).unwrap(), 4);
         assert_eq!(&b[..4], b"hell");
         assert!(s.is_empty());
+        s.revert(2);
+        assert_eq!(s.copy_from_nofault(&mut b), 2);
+        assert_eq!(&b[..2], b"ll");
+    }
+
+    #[test]
+    fn user_revert() {
+        let segs = [
+            IoVec {
+                iov_base: 0x1000,
+                iov_len: 3,
+            },
+            IoVec {
+                iov_base: 0x2000,
+                iov_len: 0,
+            },
+            IoVec {
+                iov_base: 0x3000,
+                iov_len: 5,
+            },
+        ];
+        let mut s = Segs::new(&segs, usize::MAX);
+        assert_eq!(s.step(6, &mut |_, n, _| n), 6);
+        assert_eq!((s.i, s.off, s.left), (2, 3, 2));
+        s.revert(4);
+        assert_eq!((s.i, s.off, s.left), (0, 2, 6));
+        let mut runs = alloc::vec::Vec::new();
+        s.step(8, &mut |a, n, _| {
+            runs.push((a, n));
+            n
+        });
+        assert_eq!(runs, [(0x1002, 1), (0x3000, 5)]);
+    }
+
+    #[test]
+    fn truncated_dest() {
+        let mut out = [0u8; 8];
+        let mut d = IovDest::kernel(&mut out);
+        d.truncate(3);
+        assert_eq!(d.copy_to(b"abcdef").unwrap(), 3);
+        assert!(d.is_empty());
     }
 
     #[test]

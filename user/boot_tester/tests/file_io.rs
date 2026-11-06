@@ -25,14 +25,18 @@
 //! - Test 42: pwritev2() with RWF_APPEND appends to file
 //! - Test 43: preadv2() with invalid flags returns -EOPNOTSUPP
 //! - Test 44: preadv2() with RWF_NOWAIT on ramfs returns -EOPNOTSUPP
+//! - WRITE_OWN_MAP: a write sourced from a mapping of the page it writes
+//! - IOV_PARTIAL_FAULT: writev/readv stop at a bad segment with the
+//!   bytes done
 
 use super::helpers::{host_mode, print, print_num, println};
 use hk_syscall::{
-    AT_EMPTY_PATH, AT_FDCWD, FIOCLEX, FIONBIO, FIONCLEX, IoVec, LinuxStatFs, O_CREAT, O_NONBLOCK,
-    O_RDONLY, O_RDWR, O_TRUNC, PROC_SUPER_MAGIC, RAMFS_MAGIC, STATX_BASIC_STATS, Statx, sys_close,
-    sys_fcntl, sys_fstatfs, sys_ftruncate, sys_getrandom, sys_ioctl, sys_lseek, sys_open,
-    sys_pipe2, sys_pread64, sys_preadv, sys_preadv2, sys_pwrite64, sys_pwritev, sys_pwritev2,
-    sys_read, sys_readv, sys_statfs, sys_statx, sys_unlink, sys_write, sys_writev,
+    AT_EMPTY_PATH, AT_FDCWD, FIOCLEX, FIONBIO, FIONCLEX, IoVec, LinuxStatFs, MAP_ANONYMOUS,
+    MAP_PRIVATE, MAP_SHARED, O_CREAT, O_NONBLOCK, O_RDONLY, O_RDWR, O_TRUNC, PROC_SUPER_MAGIC,
+    PROT_READ, RAMFS_MAGIC, STATX_BASIC_STATS, Statx, sys_close, sys_fcntl, sys_fstatfs,
+    sys_ftruncate, sys_getrandom, sys_ioctl, sys_lseek, sys_mmap, sys_munmap, sys_open, sys_pipe2,
+    sys_pread64, sys_preadv, sys_preadv2, sys_pwrite64, sys_pwritev, sys_pwritev2, sys_read,
+    sys_readv, sys_statfs, sys_statx, sys_unlink, sys_write, sys_writev,
 };
 
 // RWF flags for preadv2/pwritev2
@@ -65,6 +69,8 @@ pub fn run_tests() {
     test_fcntl_dupfd_cloexec();
     test_fcntl_ebadf();
     test_trunc_tail();
+    test_write_own_map();
+    test_iov_partial_fault();
     test_getrandom();
     test_getrandom_einval();
     test_getrandom_stream();
@@ -1655,6 +1661,99 @@ fn test_trunc_tail() {
         print_num(n);
         print(b" byte100=");
         print_num(buf[100] as i64);
+        println(b"");
+    }
+}
+
+/// A write whose source is a not yet faulted-in shared mapping of the
+/// very page it writes (and then of another page of the file): the
+/// source fault must not wait on the page lock the write holds (Linux
+/// generic_perform_write faults the source in before locking)
+fn test_write_own_map() {
+    let path = b"/tmp/write_own_map\0";
+    let fd = sys_open(path.as_ptr(), O_CREAT | O_RDWR | O_TRUNC, 0o644) as i32;
+    let mut buf = [b'a'; 8192];
+    buf[4096..].fill(b'b');
+    let w = sys_pwrite64(fd, buf.as_ptr(), 8192, 0);
+    let map = sys_mmap(0, 8192, PROT_READ, MAP_SHARED, fd, 0);
+    let (w1, w2) = if map > 0 {
+        let m = map as u64;
+        let w1 = sys_pwrite64(fd, m as *const u8, 4096, 0);
+        let w2 = sys_pwrite64(fd, (m + 4096) as *const u8, 4096, 0);
+        sys_munmap(m, 8192);
+        (w1, w2)
+    } else {
+        (map, map)
+    };
+    buf.fill(0);
+    let n = sys_pread64(fd, buf.as_mut_ptr(), 8192, 0);
+    sys_close(fd as u64);
+    sys_unlink(path.as_ptr());
+    if w == 8192 && w1 == 4096 && w2 == 4096 && n == 8192 && buf.iter().all(|&c| c == b'b') {
+        println(b"WRITE_OWN_MAP:OK");
+    } else {
+        print(b"WRITE_OWN_MAP:FAIL w1=");
+        print_num(w1);
+        print(b" w2=");
+        print_num(w2);
+        print(b" n=");
+        print_num(n);
+        println(b"");
+    }
+}
+
+/// writev/readv whose second segment is unreadable/unwritable memory
+/// move the first segment and return its length; readv advances the
+/// position by just that
+fn test_iov_partial_fault() {
+    let path = b"/tmp/iov_partial\0";
+    let fd = sys_open(path.as_ptr(), O_CREAT | O_RDWR | O_TRUNC, 0o644) as i32;
+    let bad = sys_mmap(0, 4096, 0, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    let data = [b'c'; 10];
+    let mut back = [0u8; 10];
+    let mut w = -1;
+    let mut r = -1;
+    let mut pos = -1;
+    if bad > 0 {
+        let iov = [
+            IoVec {
+                iov_base: data.as_ptr(),
+                iov_len: data.len(),
+            },
+            IoVec {
+                iov_base: bad as *const u8,
+                iov_len: 100,
+            },
+        ];
+        w = sys_writev(fd as u64, iov.as_ptr(), 2);
+        let pad = [b'd'; 100];
+        sys_write(fd as u64, pad.as_ptr(), pad.len() as u64);
+        sys_lseek(fd, 0, 0);
+        let iov = [
+            IoVec {
+                iov_base: back.as_mut_ptr(),
+                iov_len: back.len(),
+            },
+            IoVec {
+                iov_base: bad as *const u8,
+                iov_len: 100,
+            },
+        ];
+        r = sys_readv(fd as u64, iov.as_ptr(), 2);
+        pos = sys_lseek(fd, 0, 1);
+        sys_munmap(bad as u64, 4096);
+    }
+    sys_close(fd as u64);
+    sys_unlink(path.as_ptr());
+    if w == 10 && r == 10 && pos == 10 && back == data {
+        println(b"IOV_PARTIAL_FAULT:OK");
+    } else {
+        print(b"IOV_PARTIAL_FAULT:FAIL w=");
+        print_num(w);
+        print(b" r=");
+        print_num(r);
+        print(b" pos=");
+        print_num(pos);
         println(b"");
     }
 }

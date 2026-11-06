@@ -19,8 +19,9 @@ use alloc::sync::Arc;
 use super::KernelError;
 use super::dac::MAY_WRITE;
 use super::dentry::Dentry;
-use super::file::{DirContext, DirEntry, File, FileOps};
+use super::file::{DirContext, DirEntry, File, FileOps, RwFlags};
 use super::inode::{FileType, Inode, InodeMode, InodeOps};
+use super::iov_iter::{IovDest, IovSource};
 use super::superblock::{FileSystemType, StatFs, SuperBlock, SuperOps};
 use crate::task::Cred;
 use crate::util::kalloc::try_arc;
@@ -84,8 +85,26 @@ impl FileOps for NullfsFileOps {
         self
     }
 
-    fn read(&self, _file: &File, _buf: &mut [u8]) -> Result<usize, KernelError> {
+    /// A directory (Linux generic_read_dir)
+    fn read_iter(
+        &self,
+        _file: &File,
+        _to: &mut IovDest<'_>,
+        _at: Option<u64>,
+        _flags: RwFlags,
+    ) -> Result<usize, KernelError> {
         Err(KernelError::IsDirectory)
+    }
+
+    /// No write op
+    fn write_iter(
+        &self,
+        _file: &File,
+        _from: &mut IovSource<'_>,
+        _at: Option<u64>,
+        _flags: RwFlags,
+    ) -> Result<usize, KernelError> {
+        Err(KernelError::OperationNotSupported)
     }
 
     /// "." and ".." only, both the root (Linux empty_dir_readdir)

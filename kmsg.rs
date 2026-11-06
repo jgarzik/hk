@@ -30,6 +30,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use alloc::vec::Vec;
 
 use crate::arch::IrqSpinlock;
+use crate::fs::iov_iter::{IovDest, IovSource};
 use crate::sync::waitqueue::WaitQueue;
 use crate::util::error::KernelError;
 use crate::util::kalloc::try_arc;
@@ -553,6 +554,54 @@ fn user(file: &crate::fs::File) -> Result<&KmsgUser, KernelError> {
         .ok_or(KernelError::BadFd)
 }
 
+/// The record of a /dev/kmsg write: an optional "<N>" prefix gives the
+/// facility and level; one trailing newline goes
+fn devkmsg_emit(buf: &[u8]) {
+    let (mut fac, mut level, mut text) = (u16::from(LOG_USER), u16::from(DEFAULT_LEVEL), buf);
+    if let [b'<', rest @ ..] = buf
+        && let Some(end) = rest.iter().position(|&c| c == b'>')
+        && end > 0
+        && let Some(n) = core::str::from_utf8(&rest[..end])
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+    {
+        // Linux LOG_LEVEL / LOG_FACILITY (LOG_FACMASK 0x3f8): the
+        // facility is 0..127, and 0 (the kernel) becomes LOG_USER
+        level = (n & 7) as u16;
+        fac = ((n & 0x3f8) >> 3) as u16;
+        if fac == 0 {
+            fac = u16::from(LOG_USER);
+        }
+        text = &rest[end + 1..];
+    }
+    let text = text.strip_suffix(b"\n").unwrap_or(text);
+    emit(fac << 3 | level, text);
+}
+
+/// Format the record at `u`'s cursor into `out` and move the cursor
+/// past it, unless it is longer than `room` (EINVAL); records dropped
+/// under the cursor are EPIPE once. Some(seq): no record yet, wait for
+/// one past `seq`. The cursor lock is a spinlock: never held across the
+/// wait or the copy out.
+fn next_record(u: &KmsgUser, room: usize, out: &mut Vec<u8>) -> Result<Option<u64>, KernelError> {
+    let mut cur = u.cur.lock();
+    let log = LOG.lock();
+    if cur.0 < log.buf.first_seq() {
+        *cur = (log.buf.first_seq(), log.buf.first_idx());
+        return Err(KernelError::BrokenPipe);
+    }
+    let Some((r, next)) = log.buf.read(cur.0, cur.1) else {
+        return Ok(Some(cur.0));
+    };
+    format_kmsg(&r, out);
+    drop(log);
+    if out.len() > room {
+        return Err(KernelError::InvalidArgument);
+    }
+    *cur = (cur.0 + 1, next);
+    Ok(None)
+}
+
 /// /dev/kmsg file operations (Linux devkmsg_fops)
 pub struct KmsgFileOps;
 
@@ -582,41 +631,53 @@ impl crate::fs::FileOps for KmsgFileOps {
         Ok(())
     }
 
-    fn read(&self, file: &crate::fs::File, buf: &mut [u8]) -> Result<usize, KernelError> {
+    /// One record per read (Linux devkmsg_read): formatted and the
+    /// cursor moved under the locks, copied out after them; a fault
+    /// loses the record (EFAULT). No pread or RWF_NOWAIT.
+    fn read_iter(
+        &self,
+        file: &crate::fs::File,
+        to: &mut IovDest<'_>,
+        at: Option<u64>,
+        flags: crate::fs::RwFlags,
+    ) -> Result<usize, KernelError> {
+        if at.is_some() || flags.nowait {
+            return Err(KernelError::OperationNotSupported);
+        }
         let u = user(file)?;
         let mut out = Vec::with_capacity(MAX_FMT);
         loop {
-            // The cursor lock is a spinlock: never held across the wait
-            let seq = {
-                let mut cur = u.cur.lock();
-                let log = LOG.lock();
-                if cur.0 < log.buf.first_seq() {
-                    // Records dropped under the cursor: say so once
-                    *cur = (log.buf.first_seq(), log.buf.first_idx());
-                    return Err(KernelError::BrokenPipe);
-                }
-                if let Some((r, next)) = log.buf.read(cur.0, cur.1) {
-                    format_kmsg(&r, &mut out);
-                    drop(log);
-                    if out.len() > buf.len() {
-                        return Err(KernelError::InvalidArgument);
+            match next_record(u, to.len(), &mut out)? {
+                None => break,
+                Some(seq) => {
+                    if file.get_flags() & crate::fs::flags::O_NONBLOCK != 0 {
+                        return Err(KernelError::WouldBlock);
                     }
-                    buf[..out.len()].copy_from_slice(&out);
-                    *cur = (cur.0 + 1, next);
-                    return Ok(out.len());
+                    WAITERS.wait_event_interruptible(|| LOG.lock().buf.next_seq() > seq)?;
                 }
-                cur.0
-            };
-            if file.get_flags() & crate::fs::flags::O_NONBLOCK != 0 {
-                return Err(KernelError::WouldBlock);
             }
-            WAITERS.wait_event_interruptible(|| LOG.lock().buf.next_seq() > seq)?;
+        }
+        match to.copy_to(&out)? {
+            n if n == out.len() => Ok(n),
+            _ => Err(KernelError::BadAddress),
         }
     }
 
-    fn write(&self, file: &crate::fs::File, buf: &[u8]) -> Result<usize, KernelError> {
+    /// One record per write (Linux devkmsg_write); no pwrite or
+    /// RWF_NOWAIT
+    fn write_iter(
+        &self,
+        file: &crate::fs::File,
+        from: &mut IovSource<'_>,
+        at: Option<u64>,
+        flags: crate::fs::RwFlags,
+    ) -> Result<usize, KernelError> {
+        if at.is_some() || flags.nowait {
+            return Err(KernelError::OperationNotSupported);
+        }
         let u = user(file)?;
-        if buf.len() > LOG_LINE_MAX {
+        let len = from.len();
+        if len > LOG_LINE_MAX {
             return Err(KernelError::InvalidArgument);
         }
         // Linux printk.devkmsg=ratelimit: 10 records per 5 s per open,
@@ -629,29 +690,15 @@ impl crate::fs::FileOps for KmsgFileOps {
             }
             r.0 += 1;
             if r.0 > 10 {
-                return Ok(buf.len());
+                return Ok(len);
             }
         }
-        let (mut fac, mut level, mut text) = (u16::from(LOG_USER), u16::from(DEFAULT_LEVEL), buf);
-        if let [b'<', rest @ ..] = buf
-            && let Some(end) = rest.iter().position(|&c| c == b'>')
-            && end > 0
-            && let Some(n) = core::str::from_utf8(&rest[..end])
-                .ok()
-                .and_then(|s| s.parse::<u32>().ok())
-        {
-            // Linux LOG_LEVEL / LOG_FACILITY (LOG_FACMASK 0x3f8): the
-            // facility is 0..127, and 0 (the kernel) becomes LOG_USER
-            level = (n & 7) as u16;
-            fac = ((n & 0x3f8) >> 3) as u16;
-            if fac == 0 {
-                fac = u16::from(LOG_USER);
-            }
-            text = &rest[end + 1..];
+        let mut buf = crate::util::kmem::try_vec(len, 0u8)?;
+        if from.copy_from(&mut buf)? != len {
+            return Err(KernelError::BadAddress);
         }
-        let text = text.strip_suffix(b"\n").unwrap_or(text);
-        emit(fac << 3 | level, text);
-        Ok(buf.len())
+        devkmsg_emit(&buf);
+        Ok(len)
     }
 
     fn llseek(&self, file: &crate::fs::File, offset: i64, whence: i32) -> Result<u64, KernelError> {
@@ -702,20 +749,17 @@ impl crate::fs::chardev::CharDevice for KmsgCharDevice {
         "kmsg"
     }
 
-    fn read(
-        &self,
-        _file: &crate::fs::File,
-        _buf: &mut [u8],
-    ) -> Result<usize, crate::util::error::KernelError> {
-        Err(crate::util::error::KernelError::OperationNotSupported)
+    /// Not reached: the file uses `KMSG_FILE_OPS`
+    fn read(&self, _file: &crate::fs::File, _to: &mut IovDest<'_>) -> Result<usize, KernelError> {
+        Err(KernelError::OperationNotSupported)
     }
 
     fn write(
         &self,
         _file: &crate::fs::File,
-        _buf: &[u8],
-    ) -> Result<usize, crate::util::error::KernelError> {
-        Err(crate::util::error::KernelError::OperationNotSupported)
+        _from: &mut IovSource<'_>,
+    ) -> Result<usize, KernelError> {
+        Err(KernelError::OperationNotSupported)
     }
 
     fn fops(&self) -> Option<&'static dyn crate::fs::FileOps> {

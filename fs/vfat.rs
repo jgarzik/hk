@@ -25,9 +25,10 @@ use crate::mm::page::frame_bytes;
 use crate::util::pod::{FromBytes, IntoBytes};
 
 use super::dentry::Dentry;
-use super::file::{DirContext, DirEntry as VfsDirEntry, File, FileOps};
+use super::file::{DirContext, DirEntry as VfsDirEntry, File, FileOps, RwFlags};
 use super::icache;
 use super::inode::{AsAny, FileType, Inode, InodeData, InodeMode, InodeOps, Timespec};
+use super::iov_iter::{IovDest, IovSource};
 use super::superblock::{
     FileSystemType, MSDOS_SUPER_MAGIC, StatFs, SuperBlock, SuperBlockData, SuperOps, fs_flags,
 };
@@ -215,13 +216,18 @@ fn update_size(inode: &Inode, sb_data: &VfatSbData) -> Result<(), KernelError> {
 /// generic_perform_write): clusters first, a gap past the old end
 /// zeroed, the data through the page cache (written back later), then
 /// the new size in the directory entry. The VFS holds i_rwsem.
-fn vfat_write(inode: &Arc<Inode>, buf: &[u8], pos: u64) -> Result<usize, KernelError> {
-    if buf.is_empty() {
+fn vfat_write(
+    inode: &Arc<Inode>,
+    from: &mut IovSource<'_>,
+    pos: u64,
+) -> Result<usize, KernelError> {
+    if from.is_empty() {
         return Ok(0);
     }
     let sb = inode.superblock().ok_or(KernelError::Io)?;
     let sb_data = get_sb_data(&sb)?;
-    let end = pos + buf.len() as u64;
+    let len = from.len();
+    let end = pos + len as u64;
     if end > u64::from(u32::MAX) {
         return Err(KernelError::FileTooLarge);
     }
@@ -230,13 +236,54 @@ fn vfat_write(inode: &Arc<Inode>, buf: &[u8], pos: u64) -> Result<usize, KernelE
     if pos > old {
         cont_expand(inode, u64::from(sb_data.cluster_size), old, pos)?;
     }
-    let n = filemap::perform_write(inode, buf, pos)?;
+    let r = filemap::write_iter(inode, from, pos);
+    if !matches!(r, Ok(n) if n == len) {
+        // Linux fat_write_failed: best effort, like its void return
+        let _ = write_failed(inode, &sb_data);
+    }
+    let n = r?;
     super::fs_writeback::mark_inode_dirty(inode);
     crate::mm::writeback::balance_dirty_pages(inode);
     if inode.get_size() != old {
         update_size(inode, &sb_data)?;
     }
     Ok(n)
+}
+
+/// A write that came up short (a fault in the caller's buffer, no
+/// memory): the clusters past the end go again (Linux fat_write_failed
+/// -> fat_truncate_blocks)
+fn write_failed(inode: &Inode, sb_data: &VfatSbData) -> Result<(), KernelError> {
+    let d = get_inode_data(inode)?;
+    let keep = inode.get_size().div_ceil(u64::from(sb_data.cluster_size)) as usize;
+    let start = free_past(sb_data, d.start_cluster, keep)?;
+    if start != d.start_cluster {
+        inode.set_private(arc_nofail(VfatInodeData {
+            start_cluster: start,
+            ..d
+        }));
+        update_size(inode, sb_data)?;
+    }
+    Ok(())
+}
+
+/// Free the clusters of the chain at `start` past its first `keep`
+/// (Linux fat_free_clusters from fat_truncate_blocks); the chain's new
+/// first cluster (0: none left)
+fn free_past(sb_data: &VfatSbData, start: u32, keep: usize) -> Result<u32, KernelError> {
+    if start == 0 {
+        return Ok(0);
+    }
+    if keep == 0 {
+        free_cluster_chain(sb_data, start)?;
+        return Ok(0);
+    }
+    let chain = read_cluster_chain(sb_data, start)?;
+    if keep < chain.len() {
+        set_fat_entry(sb_data, chain[keep - 1], FAT_EOC)?;
+        free_cluster_chain(sb_data, chain[keep])?;
+    }
+    Ok(start)
 }
 
 // ============================================================================
@@ -1950,20 +1997,7 @@ impl InodeOps for VfatInodeOps {
         let cs = u64::from(sb_data.cluster_size);
         if length < old {
             filemap::truncate_setsize(inode, length);
-            let keep = length.div_ceil(cs) as usize;
-            let mut start = d.start_cluster;
-            if d.start_cluster != 0 {
-                if keep == 0 {
-                    free_cluster_chain(&sb_data, d.start_cluster)?;
-                    start = 0;
-                } else {
-                    let chain = read_cluster_chain(&sb_data, d.start_cluster)?;
-                    if keep < chain.len() {
-                        set_fat_entry(&sb_data, chain[keep - 1], FAT_EOC)?;
-                        free_cluster_chain(&sb_data, chain[keep])?;
-                    }
-                }
-            }
+            let start = free_past(&sb_data, d.start_cluster, length.div_ceil(cs) as usize)?;
             // The clusters are freed on disk: the inode must follow
             // (Linux keeps this in the inode and allocates nothing here)
             inode.set_private(arc_nofail(VfatInodeData {
@@ -2223,26 +2257,43 @@ impl FileOps for VfatFileOps {
         }
     }
 
-    fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {
-        let n = self.pread(file, buf, file.get_pos())?;
-        file.advance_pos(n as u64);
+    /// Straight from the page cache (Linux filemap_read); no
+    /// RWF_NOWAIT (EOPNOTSUPP)
+    fn read_iter(
+        &self,
+        file: &File,
+        to: &mut IovDest<'_>,
+        at: Option<u64>,
+        flags: RwFlags,
+    ) -> Result<usize, KernelError> {
+        if flags.nowait {
+            return Err(KernelError::OperationNotSupported);
+        }
+        let inode = file.get_inode().ok_or(KernelError::BadFd)?;
+        let n = filemap::read_iter(&inode, to, at.unwrap_or_else(|| file.get_pos()))?;
+        if at.is_none() {
+            file.advance_pos(n as u64);
+        }
         Ok(n)
     }
 
-    fn write(&self, file: &File, buf: &[u8]) -> Result<usize, KernelError> {
-        let n = self.pwrite(file, buf, file.get_pos())?;
-        file.advance_pos(n as u64);
+    /// See `vfat_write`; no RWF_NOWAIT (EOPNOTSUPP)
+    fn write_iter(
+        &self,
+        file: &File,
+        from: &mut IovSource<'_>,
+        at: Option<u64>,
+        flags: RwFlags,
+    ) -> Result<usize, KernelError> {
+        if flags.nowait {
+            return Err(KernelError::OperationNotSupported);
+        }
+        let inode = file.get_inode().ok_or(KernelError::BadFd)?;
+        let n = vfat_write(&inode, from, at.unwrap_or_else(|| file.get_pos()))?;
+        if at.is_none() {
+            file.advance_pos(n as u64);
+        }
         Ok(n)
-    }
-
-    fn pread(&self, file: &File, buf: &mut [u8], offset: u64) -> Result<usize, KernelError> {
-        let inode = file.get_inode().ok_or(KernelError::BadFd)?;
-        filemap::read(&inode, buf, offset)
-    }
-
-    fn pwrite(&self, file: &File, buf: &[u8], offset: u64) -> Result<usize, KernelError> {
-        let inode = file.get_inode().ok_or(KernelError::BadFd)?;
-        vfat_write(&inode, buf, offset)
     }
 
     /// Write the file's pages, the FAT and directory blocks, then flush

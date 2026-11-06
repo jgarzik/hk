@@ -30,8 +30,9 @@ use crate::mm::filemap::{self, Aops};
 
 use super::KernelError;
 use super::dentry::Dentry;
-use super::file::{DirContext, DirEntry, File, FileOps};
+use super::file::{DirContext, DirEntry, File, FileOps, RwFlags};
 use super::inode::{AsAny, DevId, FileType, Inode, InodeData, InodeMode, InodeOps, Timespec};
+use super::iov_iter::{IovDest, IovSource};
 use super::superblock::{
     FileSystemType, RAMFS_MAGIC, StatFs, SuperBlock, SuperBlockData, SuperOps,
 };
@@ -59,18 +60,22 @@ impl Aops for RamfsAops {
 }
 
 /// Page-cache errors of ramfs writes: no memory for a new page is
-/// ENOSPC (like a full tmpfs; the frame reserve is kept for the kernel)
+/// ENOSPC (like a full tmpfs; the frame reserve is kept for the kernel);
+/// a fault on the caller's buffer stays EFAULT
 fn page_err(e: KernelError) -> KernelError {
     match e {
         KernelError::OutOfMemory | KernelError::NoSpace => KernelError::NoSpace,
+        KernelError::BadAddress => KernelError::BadAddress,
         _ => KernelError::Io,
     }
 }
 
-/// Page-cache errors of ramfs reads (a hole needs a zeroed page): ENOMEM
+/// Page-cache errors of ramfs reads (a hole needs a zeroed page): ENOMEM;
+/// a fault on the caller's buffer stays EFAULT
 fn read_err(e: KernelError) -> KernelError {
     match e {
         KernelError::OutOfMemory | KernelError::NoSpace => KernelError::OutOfMemory,
+        KernelError::BadAddress => KernelError::BadAddress,
         _ => KernelError::Io,
     }
 }
@@ -918,28 +923,46 @@ impl FileOps for RamfsFileOps {
         }
     }
 
-    fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {
-        let n = self.pread(file, buf, file.get_pos())?;
-        file.advance_pos(n as u64);
-        Ok(n)
-    }
-
-    fn write(&self, file: &File, buf: &[u8]) -> Result<usize, KernelError> {
-        let n = self.pwrite(file, buf, file.get_pos())?;
-        file.advance_pos(n as u64);
-        Ok(n)
-    }
-
-    fn pread(&self, file: &File, buf: &mut [u8], offset: u64) -> Result<usize, KernelError> {
+    /// Straight from the page cache (Linux filemap_read). No RWF_NOWAIT
+    /// (EOPNOTSUPP): like Linux ramfs/tmpfs, no FMODE_NOWAIT.
+    fn read_iter(
+        &self,
+        file: &File,
+        to: &mut IovDest<'_>,
+        at: Option<u64>,
+        flags: RwFlags,
+    ) -> Result<usize, KernelError> {
+        if flags.nowait {
+            return Err(KernelError::OperationNotSupported);
+        }
         let inode = file.get_inode().ok_or(KernelError::BadFd)?;
-        filemap::read(&inode, buf, offset).map_err(read_err)
+        let pos = at.unwrap_or_else(|| file.get_pos());
+        let n = filemap::read_iter(&inode, to, pos).map_err(read_err)?;
+        if at.is_none() {
+            file.advance_pos(n as u64);
+        }
+        Ok(n)
     }
 
     /// Linux generic_perform_write; the VFS holds i_rwsem. Out of
-    /// memory after some bytes is a short write.
-    fn pwrite(&self, file: &File, buf: &[u8], offset: u64) -> Result<usize, KernelError> {
+    /// memory after some bytes is a short write. No RWF_NOWAIT.
+    fn write_iter(
+        &self,
+        file: &File,
+        from: &mut IovSource<'_>,
+        at: Option<u64>,
+        flags: RwFlags,
+    ) -> Result<usize, KernelError> {
+        if flags.nowait {
+            return Err(KernelError::OperationNotSupported);
+        }
         let inode = file.get_inode().ok_or(KernelError::BadFd)?;
-        filemap::perform_write(&inode, buf, offset).map_err(page_err)
+        let pos = at.unwrap_or_else(|| file.get_pos());
+        let n = filemap::write_iter(&inode, from, pos).map_err(page_err)?;
+        if at.is_none() {
+            file.advance_pos(n as u64);
+        }
+        Ok(n)
     }
 
     fn readdir(&self, file: &File, ctx: &mut DirContext<'_>) -> Result<(), KernelError> {
@@ -979,9 +1002,6 @@ impl FileOps for RamfsFileOps {
         }
         Ok(())
     }
-
-    // No RWF_NOWAIT overrides: like Linux ramfs/tmpfs (no FMODE_NOWAIT),
-    // the default *_with_flags methods reject NOWAIT with EOPNOTSUPP
 }
 
 /// "." or ".." directory entry

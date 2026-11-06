@@ -47,6 +47,7 @@ use crate::console::ConsoleDriver;
 use crate::fs::File;
 use crate::fs::chardev::{CharDevice, DevId};
 use crate::fs::flags::O_NOCTTY;
+use crate::fs::iov_iter::{IovDest, IovSource};
 use crate::io::poll::{POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM, PollTable};
 use crate::task::pid::Pid;
 use crate::util::error::KernelError;
@@ -302,17 +303,17 @@ impl CharDevice for Tty {
     }
 
     /// A background reader gets SIGTTIN (Linux job_control)
-    fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {
+    fn read(&self, file: &File, to: &mut IovDest<'_>) -> Result<usize, KernelError> {
         jobctrl::check_change(self, crate::signal::SIGTTIN)?;
-        n_tty::read(self, file, buf)
+        n_tty::read(self, file, to)
     }
 
     /// With TOSTOP a background writer gets SIGTTOU (Linux n_tty_write)
-    fn write(&self, _file: &File, buf: &[u8]) -> Result<usize, KernelError> {
+    fn write(&self, _file: &File, from: &mut IovSource<'_>) -> Result<usize, KernelError> {
         if self.get_termios().c_lflag & TOSTOP != 0 {
             jobctrl::check_change(self, crate::signal::SIGTTOU)?;
         }
-        n_tty::write(self, buf)
+        n_tty::write(self, from)
     }
 
     fn ioctl(&self, file: &File, cmd: u32, arg: u64) -> Result<i64, KernelError> {
@@ -397,12 +398,12 @@ impl CharDevice for TtyChar {
         CharDevice::open(self.0, file)
     }
 
-    fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {
-        CharDevice::read(self.0, file, buf)
+    fn read(&self, file: &File, to: &mut IovDest<'_>) -> Result<usize, KernelError> {
+        CharDevice::read(self.0, file, to)
     }
 
-    fn write(&self, file: &File, buf: &[u8]) -> Result<usize, KernelError> {
-        CharDevice::write(self.0, file, buf)
+    fn write(&self, file: &File, from: &mut IovSource<'_>) -> Result<usize, KernelError> {
+        CharDevice::write(self.0, file, from)
     }
 
     fn ioctl(&self, file: &File, cmd: u32, arg: u64) -> Result<i64, KernelError> {

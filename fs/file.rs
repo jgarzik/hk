@@ -3,7 +3,7 @@
 //! A File represents an open file handle. Multiple file descriptors
 //! can point to the same file (e.g., after dup()).
 //!
-//! Page-cache file I/O is `mm::filemap` (read, perform_write).
+//! Page-cache file I/O is `mm::filemap` (read_iter, write_iter).
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -766,7 +766,7 @@ impl File {
     }
 
     /// Write `buf` at `at` (None: the file position, which advances);
-    /// see [`File::write_from`]
+    /// see [`File::write_iter`]
     pub fn write_at(
         &self,
         buf: &[u8],
@@ -882,7 +882,23 @@ impl FileOps for NullFileOps {
         self
     }
 
-    fn read(&self, _file: &File, _buf: &mut [u8]) -> Result<usize, KernelError> {
+    fn read_iter(
+        &self,
+        _file: &File,
+        _to: &mut IovDest<'_>,
+        _at: Option<u64>,
+        _flags: RwFlags,
+    ) -> Result<usize, KernelError> {
+        Err(KernelError::OperationNotSupported)
+    }
+
+    fn write_iter(
+        &self,
+        _file: &File,
+        _from: &mut IovSource<'_>,
+        _at: Option<u64>,
+        _flags: RwFlags,
+    ) -> Result<usize, KernelError> {
         Err(KernelError::OperationNotSupported)
     }
 
@@ -937,12 +953,32 @@ impl FileOps for CharDevFileOps {
         }
     }
 
-    fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {
-        Self::dev(file)?.read(file, buf)
+    /// No positioned I/O (ESPIPE from pread) and no RWF_NOWAIT
+    fn read_iter(
+        &self,
+        file: &File,
+        to: &mut IovDest<'_>,
+        at: Option<u64>,
+        flags: RwFlags,
+    ) -> Result<usize, KernelError> {
+        if at.is_some() || flags.nowait {
+            return Err(KernelError::OperationNotSupported);
+        }
+        Self::dev(file)?.read(file, to)
     }
 
-    fn write(&self, file: &File, buf: &[u8]) -> Result<usize, KernelError> {
-        Self::dev(file)?.write(file, buf)
+    /// No positioned I/O (ESPIPE from pwrite) and no RWF_NOWAIT
+    fn write_iter(
+        &self,
+        file: &File,
+        from: &mut IovSource<'_>,
+        at: Option<u64>,
+        flags: RwFlags,
+    ) -> Result<usize, KernelError> {
+        if at.is_some() || flags.nowait {
+            return Err(KernelError::OperationNotSupported);
+        }
+        Self::dev(file)?.write(file, from)
     }
 
     fn llseek(&self, _file: &File, _offset: i64, _whence: i32) -> Result<u64, KernelError> {

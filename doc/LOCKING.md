@@ -421,7 +421,8 @@ Printk locks (ALL IRQ-safe - can be acquired from interrupt context):
     CONSOLE_REGISTRY (IrqSpinlock, console dispatch)
 
 /dev/kmsg (kmsg.rs):
-    KmsgUser.cur (spin, per open; never held across a wait) → LOG
+    KmsgUser.cur (spin, per open; never held across a wait or the
+    copy to the reader) → LOG
     KmsgUser.rate (spin leaf)
 
 TTYs (3.9): jobctrl CTTY_LOCK (spin) → TASKLIST (read) → Tty.ctrl
@@ -2132,7 +2133,7 @@ to stay locked between calls. The call holds the file's `f_pos_lock`
 
 #### File Writes and Positions (Linux i_rwsem / f_pos_lock)
 
-**Location:** `fs/file.rs` (`File::write_from`, `File::pos_lock`),
+**Location:** `fs/file.rs` (`File::write_iter`, `File::pos_lock`),
 `fs/io.rs` (`file_readv`, `file_writev`, `sys_lseek`), `fs/fd.rs`
 (`do_truncate`)
 
@@ -2144,28 +2145,38 @@ to stay locked between calls. The call holds the file's `f_pos_lock`
   position. Pipes, sockets and devices are not position-based and skip
   it, as in Linux.
 - `Inode.i_rwsem` is held across every write to a regular file
-  (`File::write_from`, i.e. write/writev/pwrite/pwritev*/io_uring/splice
+  (`File::write_iter`, i.e. write/writev/pwrite/pwritev*/io_uring/splice
   users of `File::write`/`pwrite`): with O_APPEND (or RWF_APPEND) the
   position is set to `i_size` under the lock, so appends from separate
   open files never overlap, and the data copy, the size update,
   RLIMIT_FSIZE check and set-id stripping are atomic with respect to
   other writers. `truncate`/`ftruncate`/O_TRUNC take it too (Linux
   do_truncate). Reads do not take it (Linux generic_file_read_iter).
-- Data moves between user memory and the file through a kernel buffer
-  of at most 64 KiB (`file::WRITE_CHUNK`) per step, so one call never
-  pins more kernel memory than that (a full-size buffer per blocked
-  reader exhausted the heap). As in Linux, the user copies (and their
-  page faults) happen under `f_pos_lock` and, for writes, `i_rwsem`
-  (held across all chunks, which keeps a large O_APPEND write
-  contiguous); the fault path takes neither lock, and both are sleeping
-  locks, so a fault may sleep. Order `i_rwsem` -> mmap_lock: the fault
-  path never takes `i_rwsem`. The write's user copy runs with page
-  faults disabled (`uaccess::copy_from_user_atomic`, Linux
-  generic_perform_write): a missing page is faulted in first
-  (`fault_in_readable`, with `i_rwsem` but no spinlock or page lock
-  held) and the copy retried, so the copy itself never nests a fault
-  (and the mmap_lock) under the locks taken for it (later the page
-  lock).
+- Data moves between user memory and the file through an iov_iter
+  (`fs/iov_iter.rs`). Page-cache files (ramfs, vfat, block devices:
+  `filemap::read_iter`/`write_iter`) copy straight between the
+  caller's memory and the cache pages; file types not converted yet go
+  through a kernel buffer of at most 64 KiB (`file::WRITE_CHUNK`) per
+  step, so one call never pins more kernel memory than that. As in
+  Linux, the user copies (and their page faults) happen under
+  `f_pos_lock` and, for writes, `i_rwsem` (held across the whole
+  write, which keeps a large O_APPEND write contiguous); the fault
+  path takes neither lock, and both are sleeping locks, so a fault may
+  sleep. Order `i_rwsem` -> mmap_lock: the fault path never takes
+  `i_rwsem`. A read copies each page out holding only a reference to
+  it, no page lock (Linux filemap_read), so a fault on the destination
+  (even a mapping of the same page) can lock it. A write faults each
+  page's source bytes in first (`IovSource::fault_in`, with `i_rwsem`
+  but no page lock held), then copies under the page lock with page
+  faults disabled and nothing faulted in (`copy_from_nofault`, Linux
+  generic_perform_write + copy_folio_from_iter_atomic): a fault there
+  could need that very page's lock (a source mapping the file) or
+  another page's (ABBA). A copy that comes up short is retried after
+  the page is unlocked.
+- Character devices copy to the reader with no spin lock held: N_TTY
+  takes input out of `Tty.ldata` into a 64-byte kernel buffer and
+  copies it after dropping the lock (Linux tty_read); /dev/kmsg formats
+  its record under `KmsgUser.cur` and `LOG` and copies it after.
 - Order: `f_pos_lock` -> file `i_rwsem` -> page cache / page locks ->
   fs-internal locks. A file's `i_rwsem` is taken under a directory's
   only by link, unlink and rename (above), never the reverse: no

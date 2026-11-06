@@ -13,6 +13,7 @@
 
 use crate::base::{Class, DevNode, Device, DeviceInfo, device_create};
 use crate::fs::File;
+use crate::fs::iov_iter::{IovDest, IovSource};
 use crate::io::poll::{POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM, PollTable};
 use crate::sync::spin::RwLock;
 use crate::util::error::KernelError;
@@ -139,12 +140,13 @@ pub trait CharDevice: Send + Sync {
     /// Last close of `file` (Linux f_op->release)
     fn release(&self, _file: &File) {}
 
-    /// Read bytes from the device (`file`'s O_NONBLOCK says whether it
-    /// may sleep)
-    fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, KernelError>;
+    /// Read from the device into `to` (Linux f_op->read_iter; `file`'s
+    /// O_NONBLOCK says whether it may sleep). Never copy to `to` under a
+    /// spin lock. Data already copied wins over a later error.
+    fn read(&self, file: &File, to: &mut IovDest<'_>) -> Result<usize, KernelError>;
 
-    /// Write bytes to the device
-    fn write(&self, file: &File, buf: &[u8]) -> Result<usize, KernelError>;
+    /// Write `from` to the device (Linux f_op->write_iter)
+    fn write(&self, file: &File, from: &mut IovSource<'_>) -> Result<usize, KernelError>;
 
     /// The device can be mapped (Linux: its fops have mmap)
     fn mmap_ok(&self) -> bool {
@@ -251,13 +253,35 @@ impl CharDevice for NullCharDevice {
         "null"
     }
 
-    fn read(&self, _file: &File, _buf: &mut [u8]) -> Result<usize, KernelError> {
+    fn read(&self, _file: &File, _to: &mut IovDest<'_>) -> Result<usize, KernelError> {
         Ok(0) // EOF
     }
 
-    fn write(&self, _file: &File, buf: &[u8]) -> Result<usize, KernelError> {
-        Ok(buf.len()) // Discard
+    fn write(&self, _file: &File, from: &mut IovSource<'_>) -> Result<usize, KernelError> {
+        Ok(from.len()) // Discard
     }
+}
+
+/// Zeros to fill `to` (Linux read_iter_zero): a page at a time, ending
+/// early at a signal
+fn read_zero(to: &mut IovDest<'_>) -> Result<usize, KernelError> {
+    let mut done = 0;
+    while !to.is_empty() {
+        if done > 0 {
+            if crate::sync::waitqueue::signal_pending() {
+                break;
+            }
+            crate::task::percpu::cond_resched();
+        }
+        let n = to.len().min(4096);
+        match to.zero(n) {
+            Ok(c) if c == n => done += c,
+            Ok(c) => return Ok(done + c),
+            Err(e) if done == 0 => return Err(e),
+            Err(_) => break,
+        }
+    }
+    Ok(done)
 }
 
 /// Zero character device - returns zeros on read, discards writes
@@ -273,13 +297,12 @@ impl CharDevice for ZeroCharDevice {
         true
     }
 
-    fn read(&self, _file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {
-        buf.fill(0);
-        Ok(buf.len())
+    fn read(&self, _file: &File, to: &mut IovDest<'_>) -> Result<usize, KernelError> {
+        read_zero(to)
     }
 
-    fn write(&self, _file: &File, buf: &[u8]) -> Result<usize, KernelError> {
-        Ok(buf.len()) // Discard
+    fn write(&self, _file: &File, from: &mut IovSource<'_>) -> Result<usize, KernelError> {
+        Ok(from.len()) // Discard
     }
 }
 
@@ -292,12 +315,11 @@ impl CharDevice for FullCharDevice {
         "full"
     }
 
-    fn read(&self, _file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {
-        buf.fill(0);
-        Ok(buf.len())
+    fn read(&self, _file: &File, to: &mut IovDest<'_>) -> Result<usize, KernelError> {
+        read_zero(to)
     }
 
-    fn write(&self, _file: &File, _buf: &[u8]) -> Result<usize, KernelError> {
+    fn write(&self, _file: &File, _from: &mut IovSource<'_>) -> Result<usize, KernelError> {
         Err(KernelError::NoSpace)
     }
 }
@@ -312,17 +334,41 @@ impl CharDevice for RandomCharDevice {
         self.0
     }
 
-    fn read(&self, _file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {
-        let n = crate::random::stream(buf.len(), |off, b| {
-            buf[off..off + b.len()].copy_from_slice(b);
-            true
+    /// Straight from the CRNG stream (no lock held) to `to`
+    fn read(&self, _file: &File, to: &mut IovDest<'_>) -> Result<usize, KernelError> {
+        let mut got = 0;
+        let mut fault = None;
+        crate::random::stream(to.len(), |_, b| match to.copy_to(b) {
+            Ok(c) => {
+                got += c;
+                c == b.len()
+            }
+            Err(e) => {
+                fault = Some(e);
+                false
+            }
         });
-        Ok(n)
+        match fault {
+            Some(e) if got == 0 => Err(e),
+            _ => Ok(got),
+        }
     }
 
-    fn write(&self, _file: &File, buf: &[u8]) -> Result<usize, KernelError> {
-        crate::random::add_device_randomness(buf);
-        Ok(buf.len())
+    /// Mixed in a block at a time (Linux write_pool_user)
+    fn write(&self, _file: &File, from: &mut IovSource<'_>) -> Result<usize, KernelError> {
+        let mut block = [0u8; 64];
+        let mut done = 0;
+        while !from.is_empty() {
+            let c = match from.copy_from(&mut block) {
+                Ok(c) => c,
+                Err(e) if done == 0 => return Err(e),
+                Err(_) => break,
+            };
+            crate::random::add_device_randomness(&block[..c]);
+            done += c;
+        }
+        block.fill(0);
+        Ok(done)
     }
 }
 

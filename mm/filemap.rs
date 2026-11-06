@@ -34,6 +34,7 @@ use super::page::{
 use super::xarray::{MARK_DIRTY, MARK_WRITEBACK, Preload, XArray, node_alloc};
 use crate::FRAME_ALLOCATOR;
 use crate::fs::inode::Inode;
+use crate::fs::iov_iter::{IovDest, IovSource};
 use crate::sync::spin::Mutex;
 use crate::util::error::KernelError;
 
@@ -731,63 +732,115 @@ pub fn simple_write_end(inode: &Inode, pos: u64, copied: usize, phys: u64) -> us
     copied
 }
 
+/// Data already moved wins over a later error
+fn short(done: usize, e: KernelError) -> Result<usize, KernelError> {
+    if done > 0 { Ok(done) } else { Err(e) }
+}
+
 /// Read file data at `pos` into `buf` (Linux filemap_read): up to EOF
 pub fn read(inode: &Inode, buf: &mut [u8], pos: u64) -> Result<usize, KernelError> {
+    read_iter(inode, &mut IovDest::kernel(buf), pos)
+}
+
+/// Read file data at `pos` into `to` up to EOF (Linux filemap_read):
+/// page by page, each uptodate and held by a reference, not locked,
+/// while it is copied out
+pub fn read_iter(inode: &Inode, to: &mut IovDest<'_>, pos: u64) -> Result<usize, KernelError> {
     let mut done = 0;
-    while done < buf.len() {
+    while !to.is_empty() {
         let at = pos + done as u64;
-        let size = inode.get_size();
-        if at >= size {
+        if at >= inode.get_size() {
             break;
         }
         let phys = match read_page(inode, at / PAGE_SIZE as u64) {
             Ok(p) => p,
-            Err(_) if done > 0 => break,
-            Err(e) => return Err(e),
+            Err(e) => return short(done, e),
         };
         // i_size again after the page was read (a truncate may have
         // raced the read)
         let size = inode.get_size();
         let off = (at % PAGE_SIZE as u64) as usize;
         let n = (PAGE_SIZE - off)
-            .min(buf.len() - done)
+            .min(to.len())
             .min(size.saturating_sub(at) as usize);
-        // An uptodate page with our reference
         // SAFETY: an uptodate page with our reference; writers hold its
         // lock, a racing one gives torn data as on Linux, never UB here
         // beyond the byte copy
-        buf[done..done + n].copy_from_slice(&unsafe { frame_bytes(phys) }[off..off + n]);
+        let bytes: &[u8] = unsafe { frame_bytes(phys) };
+        let r = to.copy_to(&bytes[off..off + n]);
         put_page(phys);
-        if n == 0 {
-            break;
+        match r {
+            Ok(c) if c == n && n > 0 => done += c,
+            Ok(c) => return Ok(done + c),
+            Err(e) => return short(done, e),
         }
-        done += n;
     }
     Ok(done)
 }
 
-/// Write `buf` at `pos` through the page cache (Linux
-/// generic_perform_write); the caller holds i_rwsem. A failure after
-/// some bytes reports those.
+/// Write `buf` at `pos` through the page cache; see [`write_iter`]
 pub fn perform_write(inode: &Inode, buf: &[u8], pos: u64) -> Result<usize, KernelError> {
+    write_iter(inode, &mut IovSource::kernel(buf), pos)
+}
+
+/// Write `from` at `pos` through the page cache (Linux
+/// generic_perform_write); the caller holds i_rwsem. Each page's source
+/// bytes are faulted in before the page is locked and copied with
+/// faults disabled under the lock (a fault there could need that very
+/// page); a rejected copy is retried, for just the bytes it got if
+/// some. A failure after some bytes reports those; a source that
+/// cannot be faulted in is EFAULT.
+pub fn write_iter(inode: &Inode, from: &mut IovSource<'_>, pos: u64) -> Result<usize, KernelError> {
     let a = inode.i_data.aops();
     let mut done = 0;
-    while done < buf.len() {
+    let mut limit = PAGE_SIZE;
+    while !from.is_empty() {
         let at = pos + done as u64;
         let off = (at % PAGE_SIZE as u64) as usize;
-        let n = (PAGE_SIZE - off).min(buf.len() - done);
+        let n = (PAGE_SIZE - off).min(from.len()).min(limit);
+        if from.fault_in(n) == n {
+            return short(done, KernelError::BadAddress);
+        }
         let phys = match a.write_begin(inode, at, n) {
             Ok(p) => p,
-            Err(_) if done > 0 => break,
-            Err(e) => return Err(e),
+            Err(e) => return short(done, e),
         };
-        // The locked page with our reference
-        // SAFETY: the locked page with our reference
-        let bytes = unsafe { frame_bytes(phys) };
-        bytes[off..off + n].copy_from_slice(&buf[done..done + n]);
-        done += a.write_end(inode, at, n, phys);
+        match copy_page(inode, a, from, phys, at, n) {
+            Ok(w) => {
+                done += w;
+                limit = PAGE_SIZE;
+            }
+            Err(0) => {}
+            Err(c) => limit = c,
+        }
     }
     Ok(done)
+}
+
+/// Copy up to `n` bytes of `from` into the locked page `phys` for a
+/// write at `at` and release it; the bytes accepted. A copy that comes
+/// up empty, or short into a page that was not read in (Linux
+/// block_write_end), is rejected with the bytes it got: the source
+/// steps back over them and the page stays as it was.
+fn copy_page(
+    inode: &Inode,
+    a: &dyn Aops,
+    from: &mut IovSource<'_>,
+    phys: u64,
+    at: u64,
+    n: usize,
+) -> Result<usize, usize> {
+    let off = (at % PAGE_SIZE as u64) as usize;
+    // SAFETY: the locked page with our reference
+    let bytes = unsafe { frame_bytes(phys) };
+    let c = from.copy_from_nofault(&mut bytes[off..off + n]);
+    if c == 0 || (c < n && !uptodate(phys)) {
+        from.revert(c);
+        unlock_page(phys);
+        put_page(phys);
+        return Err(c);
+    }
+    Ok(a.write_end(inode, at, c, phys))
 }
 
 /// Unmap the file's pages from index `from` on in every mapping of it

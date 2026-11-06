@@ -47,6 +47,7 @@ use alloc::vec::Vec;
 
 use crate::fs::File;
 use crate::fs::chardev::{CharDevice, DevId};
+use crate::fs::iov_iter::{IovDest, IovSource};
 use crate::util::error::KernelError;
 use crate::util::kalloc::try_arc;
 
@@ -211,12 +212,12 @@ impl CharDevice for GfxCharDevice {
         true
     }
 
-    fn read(&self, _file: &File, _buf: &mut [u8]) -> Result<usize, KernelError> {
+    fn read(&self, _file: &File, _to: &mut IovDest<'_>) -> Result<usize, KernelError> {
         // DRM devices don't support read
         Err(KernelError::OperationNotSupported)
     }
 
-    fn write(&self, _file: &File, _buf: &[u8]) -> Result<usize, KernelError> {
+    fn write(&self, _file: &File, _from: &mut IovSource<'_>) -> Result<usize, KernelError> {
         // DRM devices don't support write
         Err(KernelError::OperationNotSupported)
     }

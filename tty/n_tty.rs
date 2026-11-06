@@ -17,6 +17,7 @@ use super::Tty;
 use super::termios::*;
 use crate::fs::File;
 use crate::fs::flags::O_NONBLOCK;
+use crate::fs::iov_iter::{IovDest, IovSource};
 use crate::task::percpu::MAX_SCHEDULE_TIMEOUT;
 use crate::util::error::KernelError;
 
@@ -169,9 +170,10 @@ impl NTtyData {
         n
     }
 
-    /// Copy input out: canonical mode one line (None if there is none),
-    /// else what there is (None if nothing); with the mode it used
-    fn copy(&mut self, out: &mut [u8]) -> Option<(usize, bool)> {
+    /// Copy input out: canonical mode (up to the rest of) one line
+    /// (None if there is none), else what there is (None if nothing);
+    /// with the mode it used and whether a line ended
+    fn copy(&mut self, out: &mut [u8]) -> Option<(usize, bool, bool)> {
         let canon = self.icanon;
         if !self.available(1) {
             return None;
@@ -185,7 +187,7 @@ impl NTtyData {
                 self.tail = self.tail.wrapping_add(1);
                 self.lines -= 1;
                 if canon {
-                    break;
+                    return Some((n, canon, true));
                 }
                 continue;
             }
@@ -198,11 +200,11 @@ impl NTtyData {
             if eol {
                 self.lines -= 1;
                 if canon {
-                    break;
+                    return Some((n, canon, true));
                 }
             }
         }
-        Some((n, canon))
+        Some((n, canon, false))
     }
 }
 
@@ -371,12 +373,47 @@ fn canon_char(ld: &mut NTtyData, t: &Termios, c: u8, echo: &mut Vec<u8>) {
     }
 }
 
+/// Input moved out by one `copy_out`
+struct Got {
+    /// Bytes that reached the reader
+    n: usize,
+    /// Canonical mode
+    canon: bool,
+    /// A canonical line ended
+    end: bool,
+    /// The kernel buffer was filled: there may be more
+    full: bool,
+    /// The reader's buffer faulted: the rest of the copy is lost
+    fault: bool,
+}
+
+/// Bytes moved per `copy_out` (Linux tty_read's kernel_buf)
+const KBUF: usize = 64;
+
+/// Move input to `to` through a small kernel buffer, so nothing is
+/// copied to the reader under `ldata` (Linux tty_read); None if there
+/// is none
+fn copy_out(tty: &Tty, to: &mut IovDest<'_>) -> Option<Got> {
+    let mut kbuf = [0u8; KBUF];
+    let want = to.len().min(KBUF);
+    let (k, canon, end) = tty.ldata.lock().copy(&mut kbuf[..want])?;
+    let n = to.copy_to(&kbuf[..k]).unwrap_or(0);
+    Some(Got {
+        n,
+        canon,
+        end,
+        full: k == KBUF,
+        fault: n < k,
+    })
+}
+
 /// Read (Linux n_tty_read): canonical mode returns one line; otherwise
 /// VMIN bytes, VTIME the timeout (both 0: what there is). Sleeps unless
 /// O_NONBLOCK (EAGAIN); a signal ends the sleep (ERESTARTSYS, or the
-/// bytes read so far)
-pub fn read(tty: &Tty, file: &File, out: &mut [u8]) -> Result<usize, KernelError> {
-    if out.is_empty() {
+/// bytes read so far). A fault on the reader's buffer ends the read
+/// (EFAULT if nothing reached it); the input taken is lost (Linux).
+pub fn read(tty: &Tty, file: &File, to: &mut IovDest<'_>) -> Result<usize, KernelError> {
+    if to.is_empty() {
         return Ok(0);
     }
     let t = tty.get_termios();
@@ -396,19 +433,29 @@ pub fn read(tty: &Tty, file: &File, out: &mut [u8]) -> Result<usize, KernelError
     let ready = || tty.ldata.lock().available(1);
     let mut n = 0;
     loop {
-        let got = tty.ldata.lock().copy(&mut out[n..]);
-        if let Some((k, canon)) = got {
-            n += k;
+        if let Some(g) = copy_out(tty, to) {
+            n += g.n;
             // Room was made: input held in the flip buffer may go on
             // (Linux n_tty_kick_worker)
             super::flip::kick(tty);
-            if canon || n >= min || n == out.len() {
+            if g.fault {
+                return if n > 0 {
+                    Ok(n)
+                } else {
+                    Err(KernelError::BadAddress)
+                };
+            }
+            if g.end || to.is_empty() || (!g.full && (g.canon || n >= min)) {
                 break;
             }
             if time != 0 {
                 timeout = time;
             }
             continue;
+        }
+        // What was there is out (a full kernel buffer went on)
+        if n > 0 && n >= min {
+            break;
         }
         if timeout == 0 {
             break;
@@ -447,8 +494,32 @@ pub fn poll_in(tty: &Tty) -> bool {
     ld.available(min)
 }
 
-/// Write (Linux n_tty_write): OPOST with ONLCR maps NL to CR-NL
-pub fn write(tty: &Tty, buf: &[u8]) -> Result<usize, KernelError> {
+/// Write (Linux tty_write + n_tty_write): through a kernel buffer a
+/// chunk at a time; a short chunk ends it, an error after some bytes
+/// returns their count
+pub fn write(tty: &Tty, from: &mut IovSource<'_>) -> Result<usize, KernelError> {
+    let mut chunk = [0u8; 512];
+    let mut done = 0;
+    while !from.is_empty() {
+        let r = from
+            .copy_from(&mut chunk)
+            .and_then(|c| Ok((write_chunk(tty, &chunk[..c])?, c)));
+        match r {
+            Ok((n, c)) => {
+                done += n;
+                if n < c {
+                    break;
+                }
+            }
+            Err(e) if done == 0 => return Err(e),
+            Err(_) => break,
+        }
+    }
+    Ok(done)
+}
+
+/// Write one chunk: OPOST with ONLCR maps NL to CR-NL
+fn write_chunk(tty: &Tty, buf: &[u8]) -> Result<usize, KernelError> {
     let t = tty.get_termios();
     if t.c_oflag & OPOST == 0 || t.c_oflag & ONLCR == 0 {
         return tty.driver_write(buf);
