@@ -270,7 +270,14 @@ fn test_sigaction_sigkill() {
     // Try to set a handler for SIGKILL (should fail)
     let new_action: [u64; 4] = [SIG_IGN, 0, 0, 0];
     let ret = sys_rt_sigaction(SIGKILL, new_action.as_ptr() as u64, 0, 8);
-    if ret == -22 {
+    // Querying it is allowed (Linux rejects only a new action)
+    let mut old: [u64; 4] = [9; 4];
+    let q = sys_rt_sigaction(SIGKILL, 0, old.as_mut_ptr() as u64, 8);
+    if q != 0 || old[0] != SIG_DFL {
+        print(b"SIGACTION_SIGKILL:FAIL: query returned ");
+        print_num(q);
+        println(b"");
+    } else if ret == -22 {
         // EINVAL - can't change SIGKILL
         println(b"SIGACTION_SIGKILL:OK");
     } else {

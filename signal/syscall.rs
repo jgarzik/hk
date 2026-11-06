@@ -93,8 +93,9 @@ pub fn sys_rt_sigaction(sig: u32, act_ptr: u64, oact_ptr: u64, sigsetsize: u64) 
         return -22; // EINVAL
     }
 
-    // Cannot change SIGKILL or SIGSTOP
-    if sig == SIGKILL || sig == SIGSTOP {
+    // SIGKILL and SIGSTOP can be queried, not changed (Linux
+    // do_sigaction: `act && sig_kernel_only(sig)`)
+    if act_ptr != 0 && (sig == SIGKILL || sig == SIGSTOP) {
         return -22; // EINVAL
     }
 
