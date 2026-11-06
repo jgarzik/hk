@@ -1817,7 +1817,7 @@ impl InodeOps for VfatInodeOps {
             short_name,
         })?);
         icache::insert_inode_hash(&inode, ikey(parent_cluster, &short_name));
-
+        dir_sync(&sb, &sb_data)?;
         Ok(inode)
     }
 
@@ -1902,7 +1902,7 @@ impl InodeOps for VfatInodeOps {
             short_name,
         })?);
         icache::insert_inode_hash(&inode, ikey(parent_cluster, &short_name));
-
+        dir_sync(&sb, &sb_data)?;
         Ok(inode)
     }
 
@@ -1936,7 +1936,8 @@ impl InodeOps for VfatInodeOps {
             dir_inode_data.start_cluster,
             entry,
             start_cluster,
-        )
+        )?;
+        dir_sync(&sb, &sb_data)
     }
 
     fn rmdir(&self, dir: &Inode, name: &[u8]) -> Result<(), KernelError> {
@@ -1976,7 +1977,8 @@ impl InodeOps for VfatInodeOps {
             dir_inode_data.start_cluster,
             entry,
             start_cluster,
-        )
+        )?;
+        dir_sync(&sb, &sb_data)
     }
 
     /// Linux fat_setattr(ATTR_SIZE): shrinking drops the pages past
@@ -2132,11 +2134,21 @@ impl InodeOps for VfatInodeOps {
             inode.set_private(arc_nofail(d));
             icache::rehash(&inode, ikey(new_dir_data.start_cluster, &new_short));
         }
-        Ok(())
+        dir_sync(&sb, &sb_data)
     }
 }
 
 pub static VFAT_INODE_OPS: VfatInodeOps = VfatInodeOps;
+
+/// A directory change on a dirsync or sync mount reaches the disk
+/// before the call returns (Linux fat: IS_DIRSYNC, sync_dirty_buffer of
+/// the entry and FAT blocks)
+fn dir_sync(sb: &SuperBlock, sb_data: &VfatSbData) -> Result<(), KernelError> {
+    if !sb.dirsync() {
+        return Ok(());
+    }
+    crate::block::blkdev::sync_blockdev(&sb_data.bdev)
+}
 
 /// Inode cache key of the entry `short` in the directory at `parent`
 /// (Linux fat i_pos: the entry's place on disk)

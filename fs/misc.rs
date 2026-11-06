@@ -34,7 +34,10 @@ mod ms {
     pub const NOSUID: u64 = 2;
     pub const NODEV: u64 = 4;
     pub const NOEXEC: u64 = 8;
+    pub const SYNCHRONOUS: u64 = 16;
     pub const REMOUNT: u64 = 32;
+    pub const DIRSYNC: u64 = 128;
+    pub const NOSYMFOLLOW: u64 = 256;
     pub const BIND: u64 = 4096;
     pub const MOVE: u64 = 8192;
     pub const MANDLOCK: u64 = 64;
@@ -57,9 +60,11 @@ mod ms {
 
     /// Flags hk honors, or may accept without effect because hk
     /// already behaves that way (no atime updates, no mandatory locks);
-    /// everything else (MS_SYNCHRONOUS, MS_DIRSYNC, MS_NOSYMFOLLOW, ...)
-    /// is EINVAL instead of being ignored
+    /// everything else is EINVAL instead of being ignored
     pub const KNOWN: u64 = RDONLY
+        | SYNCHRONOUS
+        | DIRSYNC
+        | NOSYMFOLLOW
         | BIND
         | MOVE
         | NOSUID
@@ -84,7 +89,7 @@ mod ms {
 
 /// Per-mount MNT_* flags of mount(2) flags
 fn mnt_flags(flags: u64) -> u32 {
-    use super::mount::{MNT_NODEV, MNT_NOEXEC, MNT_NOSUID, MNT_READONLY};
+    use super::mount::{MNT_NODEV, MNT_NOEXEC, MNT_NOSUID, MNT_NOSYMFOLLOW, MNT_READONLY};
     let mut f = 0;
     if flags & ms::RDONLY != 0 {
         f |= MNT_READONLY;
@@ -97,6 +102,22 @@ fn mnt_flags(flags: u64) -> u32 {
     }
     if flags & ms::NOEXEC != 0 {
         f |= MNT_NOEXEC;
+    }
+    if flags & ms::NOSYMFOLLOW != 0 {
+        f |= MNT_NOSYMFOLLOW;
+    }
+    f
+}
+
+/// SB_SYNCHRONOUS / SB_DIRSYNC of mount(2) flags
+fn sb_sync_flags(flags: u64) -> u32 {
+    use super::superblock::{SB_DIRSYNC, SB_SYNCHRONOUS};
+    let mut f = 0;
+    if flags & ms::SYNCHRONOUS != 0 {
+        f |= SB_SYNCHRONOUS;
+    }
+    if flags & ms::DIRSYNC != 0 {
+        f |= SB_DIRSYNC;
     }
     f
 }
@@ -112,6 +133,7 @@ fn remount(m: &Arc<super::mount::Mount>, flags: u64) -> Result<(), KernelError> 
     } else {
         m.sb.make_rdwr();
     }
+    m.sb.set_sync_flags(sb_sync_flags(flags));
     m.set_flags(mnt_flags(flags))
 }
 
@@ -286,6 +308,7 @@ fn new_mount(
         (fs_type.mount)(fs_type, data)
     };
     let r = sb.and_then(|sb| {
+        sb.set_sync_flags(sb_sync_flags(flags));
         // Linux: no source is "none"
         let devname = if source.is_empty() {
             b"none".as_slice()

@@ -8,7 +8,9 @@ use alloc::vec::Vec;
 
 use super::super::Path;
 use super::super::dentry::{d_path, dentry_path};
-use super::super::mount::{MNT_NODEV, MNT_NOEXEC, MNT_NOSUID, MNT_READONLY, Mount, NAMESPACE_SEM};
+use super::super::mount::{
+    MNT_NODEV, MNT_NOEXEC, MNT_NOSUID, MNT_NOSYMFOLLOW, MNT_READONLY, Mount, NAMESPACE_SEM,
+};
 use super::super::name::mangle;
 use super::get_tid_for_pid;
 use crate::task::Pid;
@@ -44,15 +46,25 @@ fn visible(pid: Pid) -> Vec<(Arc<Mount>, Vec<u8>)> {
         .collect()
 }
 
-/// The per-mount options: rw/ro (`ro`: shown read-only), then
-/// nosuid/nodev/noexec
-fn mnt_opts(out: &mut Vec<u8>, m: &Mount, ro: bool) {
-    out.extend_from_slice(if ro { b"ro" } else { b"rw" });
+/// The superblock's options after rw/ro (Linux show_sb_opts)
+fn sb_opts(out: &mut Vec<u8>, m: &Mount) {
+    use super::super::superblock::{SB_DIRSYNC, SB_SYNCHRONOUS};
+    let f = m.sb.flags();
+    for (bit, name) in [(SB_SYNCHRONOUS, &b",sync"[..]), (SB_DIRSYNC, b",dirsync")] {
+        if f & bit != 0 {
+            out.extend_from_slice(name);
+        }
+    }
+}
+
+/// The per-mount options after rw/ro (Linux show_mnt_opts)
+fn mnt_opts(out: &mut Vec<u8>, m: &Mount) {
     let f = m.flags();
     for (bit, name) in [
         (MNT_NOSUID, &b",nosuid"[..]),
         (MNT_NODEV, b",nodev"),
         (MNT_NOEXEC, b",noexec"),
+        (MNT_NOSYMFOLLOW, b",nosymfollow"),
     ] {
         if f & bit != 0 {
             out.extend_from_slice(name);
@@ -73,7 +85,9 @@ pub fn show_mounts(pid: Pid) -> Vec<u8> {
         out.push(b' ');
         // Read-only through the mount or its superblock (Linux
         // __mnt_is_readonly)
-        mnt_opts(&mut out, &m, m.is_readonly());
+        out.extend_from_slice(if m.is_readonly() { b"ro" } else { b"rw" });
+        sb_opts(&mut out, &m);
+        mnt_opts(&mut out, &m);
         out.extend_from_slice(b" 0 0\n");
     }
     out
@@ -104,7 +118,12 @@ pub fn show_mountinfo(pid: Pid) -> Vec<u8> {
         mangle(&mut out, &mp, ESC);
         out.push(b' ');
         // The mount's own read-only flag (Linux show_mountinfo)
-        mnt_opts(&mut out, &m, m.flags() & MNT_READONLY != 0);
+        out.extend_from_slice(if m.flags() & MNT_READONLY != 0 {
+            b"ro"
+        } else {
+            b"rw"
+        });
+        mnt_opts(&mut out, &m);
         // A group has a member the reader sees (propagate_from)
         let sees = |g: u32| {
             super::super::pnode::peers(g)
@@ -118,6 +137,7 @@ pub fn show_mountinfo(pid: Pid) -> Vec<u8> {
         mangle(&mut out, &m.devname, ESC_HASH);
         out.push(b' ');
         out.extend_from_slice(if m.sb.rdonly() { b"ro" } else { b"rw" });
+        sb_opts(&mut out, &m);
         out.push(b'\n');
     }
     out

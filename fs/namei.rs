@@ -283,6 +283,10 @@ fn follow_link(
     depth: usize,
 ) -> Result<Path, KernelError> {
     let inode = link.get_inode().ok_or(KernelError::NotFound)?;
+    // A nosymfollow mount (Linux pick_link: the link's mount)
+    if dir.mnt.flags() & super::mount::MNT_NOSYMFOLLOW != 0 {
+        return Err(KernelError::TooManySymlinks);
+    }
     if let Some(d) = dir.dentry.get_inode() {
         super::dac::may_follow_link(c, &d, &inode)?;
     }

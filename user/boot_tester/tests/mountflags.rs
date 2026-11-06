@@ -3,7 +3,7 @@
 //! MS_NOEXEC (execve EACCES), MS_NODEV (device open EACCES), statfs
 //! f_flags
 
-use super::helpers::{host_mode, print, print_num, println};
+use super::helpers::{print, print_num, println};
 use hk_syscall::{
     AT_FDCWD, LinuxStatFs, MAP_PRIVATE, O_CREAT, O_RDONLY, O_TRUNC, O_WRONLY, PROT_READ, sys_chmod,
     sys_chown, sys_close, sys_execve, sys_exit, sys_fork, sys_link, sys_mkdir, sys_mknod, sys_mmap,
@@ -14,7 +14,6 @@ use hk_syscall::{
 
 const EPERM: i64 = -1;
 const EACCES: i64 = -13;
-const EINVAL: i64 = -22;
 const EROFS: i64 = -30;
 const EBUSY: i64 = -16;
 const PROT_EXEC: u32 = 4;
@@ -34,7 +33,7 @@ pub fn run_tests() {
     test_rdonly();
     test_noexec();
     test_nodev();
-    test_unsupported();
+    test_sync_nosymfollow();
     test_ro_ops();
     test_remount_busy();
     test_noexec_mmap();
@@ -532,33 +531,87 @@ fn test_nodev() {
     done(n, f);
 }
 
-/// hk rejects flags it cannot honor instead of ignoring them (Linux
-/// implements them, so this is hk-only); a rejected remount changes
-/// nothing
-fn test_unsupported() {
-    if host_mode() {
-        return;
-    }
+/// MOUNT_SYNC_NOSYMFOLLOW: MS_SYNCHRONOUS, MS_DIRSYNC and MS_NOSYMFOLLOW
+/// mount (Linux SB_SYNCHRONOUS, SB_DIRSYNC, MNT_NOSYMFOLLOW) and show in
+/// statfs (ST_SYNCHRONOUS, ST_NOSYMFOLLOW) and /proc/self/mounts; a
+/// symlink on a nosymfollow mount is ELOOP to follow but still readable
+fn test_sync_nosymfollow() {
     const MS_SYNCHRONOUS: u64 = 16;
+    const MS_DIRSYNC: u64 = 128;
     const MS_NOSYMFOLLOW: u64 = 256;
-    let n = b"MOUNT_UNSUPPORTED";
+    const ST_SYNCHRONOUS: i64 = 16;
+    const ST_NOSYMFOLLOW: i64 = 0x2000;
+    const ELOOP: i64 = -40;
+    let n = b"MOUNT_SYNC_NOSYMFOLLOW";
     let mp = b"/tmp/mnt_uns\0";
     sys_mkdir(mp.as_ptr(), 0o755);
-    let mut f = chk(n, b"MS_SYNCHRONOUS", ramfs(mp, MS_SYNCHRONOUS), EINVAL);
-    f += chk(n, b"mount", ramfs(mp, MS_RDONLY | MS_NOEXEC), 0);
+    let mut f = chk(n, b"MS_SYNCHRONOUS", ramfs(mp, MS_SYNCHRONOUS), 0);
     f += chk(
         n,
-        b"remount nosymfollow",
-        remount(mp, MS_NOSYMFOLLOW),
-        EINVAL,
+        b"statfs sync",
+        st_flags(mp) & ST_SYNCHRONOUS,
+        ST_SYNCHRONOUS,
+    );
+    f += chk(n, b"mounts sync", mounts_opt(b"/tmp/mnt_uns", b",sync"), 1);
+    sys_umount2(mp.as_ptr(), 0);
+    f += chk(n, b"MS_DIRSYNC", ramfs(mp, MS_DIRSYNC), 0);
+    f += chk(
+        n,
+        b"mounts dirsync",
+        mounts_opt(b"/tmp/mnt_uns", b",dirsync"),
+        1,
+    );
+    sys_umount2(mp.as_ptr(), 0);
+    f += chk(n, b"MS_NOSYMFOLLOW", ramfs(mp, MS_NOSYMFOLLOW), 0);
+    f += chk(
+        n,
+        b"mounts nosymfollow",
+        mounts_opt(b"/tmp/mnt_uns", b",nosymfollow"),
+        1,
     );
     f += chk(
         n,
-        b"flags kept",
-        st_flags(mp) & (ST_RDONLY | ST_NOEXEC),
-        ST_RDONLY | ST_NOEXEC,
+        b"statfs nosymfollow",
+        st_flags(mp) & ST_NOSYMFOLLOW,
+        ST_NOSYMFOLLOW,
     );
+    let target = b"/tmp/mnt_uns/t\0";
+    let fd = sys_open(target.as_ptr(), O_CREAT | O_WRONLY, 0o644);
+    sys_close(fd as u64);
+    sys_symlink(target.as_ptr(), b"/tmp/mnt_uns/l\0".as_ptr());
+    let o = sys_open(b"/tmp/mnt_uns/l\0".as_ptr(), O_RDONLY, 0);
+    if o >= 0 {
+        sys_close(o as u64);
+    }
+    f += chk(n, b"follow", o, ELOOP);
+    let mut buf = [0u8; 64];
+    let r = hk_syscall::sys_readlink(b"/tmp/mnt_uns/l\0".as_ptr(), buf.as_mut_ptr(), 64);
+    f += chk(n, b"readlink", r, target.len() as i64 - 1);
+    // Remount without it: following works again
+    f += chk(n, b"remount", remount(mp, 0), 0);
+    let o = sys_open(b"/tmp/mnt_uns/l\0".as_ptr(), O_RDONLY, 0);
+    if o >= 0 {
+        sys_close(o as u64);
+    }
+    f += chk(n, b"follow after remount", i64::from(o >= 0), 1);
     sys_umount2(mp.as_ptr(), 0);
     sys_rmdir(mp.as_ptr());
     done(n, f);
+}
+
+/// 1 if the /proc/self/mounts line of mount point `mp` has `opt` in its
+/// options, 0 if not, -1 if there is no such line
+fn mounts_opt(mp: &[u8], opt: &[u8]) -> i64 {
+    let mut b = [0u8; 8192];
+    let len = super::helpers::read_file(b"/proc/self/mounts\0", &mut b);
+    let mut r = -1;
+    for line in b[..len.max(0) as usize].split(|&c| c == b'\n') {
+        let mut fields = line.split(|&c| c == b' ');
+        if fields.nth(1) != Some(mp) {
+            continue;
+        }
+        let opts = fields.nth(1).unwrap_or(&[]);
+        r = i64::from(opts.windows(opt.len()).any(|w| w == opt));
+    }
+    r
 }

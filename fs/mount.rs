@@ -25,6 +25,8 @@ pub const MNT_NODEV: u32 = 0x2;
 pub const MNT_NOEXEC: u32 = 0x4;
 /// This mount is read-only, whatever its superblock (Linux MNT_READONLY)
 pub const MNT_READONLY: u32 = 0x40;
+/// Symlinks on this mount are not followed (Linux MNT_NOSYMFOLLOW)
+pub const MNT_NOSYMFOLLOW: u32 = 0x80;
 /// Cannot be bind-mounted (Linux T_UNBINDABLE, in `t_flags`)
 pub const T_UNBINDABLE: u32 = 0x1;
 /// Cannot be unmounted, moved or pivoted away (Linux MNT_LOCKED: a mount

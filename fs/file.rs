@@ -47,6 +47,8 @@ pub mod flags {
     pub const O_APPEND: u32 = 0o2000;
     /// Non-blocking mode
     pub const O_NONBLOCK: u32 = 0o4000;
+    /// Writes reach storage before returning (O_SYNC includes it)
+    pub const O_DSYNC: u32 = 0o10000;
     /// Asynchronous I/O (generate SIGIO)
     pub const O_ASYNC: u32 = 0o20000;
     /// Must be a directory / don't follow symlinks (values differ per arch)
@@ -647,8 +649,8 @@ impl File {
             _ => return self.f_op.write_iter(self, from, at, flags),
         };
         let append = append.unwrap_or(self.get_flags() & flags::O_APPEND != 0);
-        let _lock = inode.lock();
-        (|| {
+        let lock = inode.lock();
+        let n = (|| {
             // An active swap file (Linux generic_write_checks:
             // IS_SWAPFILE), checked under i_rwsem: swapon sets it there
             if inode.i_swapfile.load(Ordering::Acquire) {
@@ -672,7 +674,17 @@ impl File {
             // file_remove_privs: set-id bits go unless CAP_FSETID
             super::dac::remove_privs(&inode);
             self.f_op.write_iter(self, from, at, flags)
-        })()
+        })()?;
+        drop(lock);
+        // O_DSYNC/O_SYNC or a synchronous mount: the data reaches the
+        // storage before the write returns (Linux generic_write_sync,
+        // after i_rwsem is released)
+        let sync = self.get_flags() & flags::O_DSYNC != 0
+            || inode.superblock().is_some_and(|sb| sb.synchronous());
+        if n > 0 && sync {
+            self.f_op.fsync(self)?;
+        }
+        Ok(n)
     }
 
     /// Seek

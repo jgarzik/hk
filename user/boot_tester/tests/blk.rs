@@ -408,6 +408,7 @@ fn vfat(d: &Disk) {
     vfat_opts(p1);
     vfat_neg_case(p1);
     vfat_mount_alias(p1);
+    vfat_sync(p1);
 }
 
 /// What was written through the page cache (write() and a shared
@@ -961,4 +962,49 @@ fn vfat_mount_alias(p1: &BlkDev) {
     sys_umount2(b"/mnt/vd1\0".as_ptr(), 0);
     let ok = r == 0 && fd >= 0 && m == 0 && lower == -2 && upper == -2;
     verdict(b"VFAT_MOUNT_ALIAS", ok, lower * 100 + upper);
+}
+
+/// Dirty kB after writing 2 MiB to a new file on vda1 mounted with
+/// `flags`, opened with `oflags` (Linux generic_write_sync)
+fn dirty_after_write(p1: &BlkDev, flags: u64, oflags: u32) -> i64 {
+    use super::helpers::proc_kb;
+    let mut p = [0u8; 48];
+    let r = sys_mount(
+        p1.path(&mut p).as_ptr(),
+        b"/mnt/vd1\0".as_ptr(),
+        b"vfat\0".as_ptr(),
+        flags,
+        b"iocharset=cp437\0".as_ptr() as u64,
+    );
+    if r != 0 {
+        return r * 1_000_000;
+    }
+    let f = b"/mnt/vd1/SYNC.BIN\0";
+    let fd = sys_open(f.as_ptr(), O_CREAT | O_WRONLY | oflags, 0o644) as i32;
+    let buf = [b's'; 4096];
+    let before = proc_kb(b"/proc/meminfo\0", b"Dirty:");
+    for i in 0..512 {
+        sys_pwrite64(fd, buf.as_ptr(), 4096, i * 4096);
+    }
+    let after = proc_kb(b"/proc/meminfo\0", b"Dirty:");
+    sys_close(fd as u64);
+    sys_unlink(f.as_ptr());
+    sys_umount2(b"/mnt/vd1\0".as_ptr(), 0);
+    after - before
+}
+
+/// A write on an MS_SYNCHRONOUS mount, or through an O_SYNC descriptor,
+/// reaches the disk before it returns: 2 MiB written leaves (almost)
+/// nothing dirty, where a plain write leaves it dirty
+fn vfat_sync(p1: &BlkDev) {
+    const MS_SYNCHRONOUS: u64 = 16;
+    const O_SYNC: u32 = 0o4010000;
+    let plain = dirty_after_write(p1, 0, 0);
+    let sync = dirty_after_write(p1, MS_SYNCHRONOUS, 0);
+    let osync = dirty_after_write(p1, 0, O_SYNC);
+    verdict(
+        b"VFAT_SYNC_WRITE",
+        plain >= 1024 && sync < 512 && osync < 512,
+        plain * 1_000_000 + sync * 1000 + osync,
+    );
 }

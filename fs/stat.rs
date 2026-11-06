@@ -302,13 +302,24 @@ pub fn sys_statfs(path_ptr: u64, buf: u64) -> i64 {
     ret(r)
 }
 
-/// statfs f_flags (Linux calculate_f_flags): ST_VALID, ST_RDONLY from
-/// the superblock, ST_NOSUID/NODEV/NOEXEC from the mount
+/// statfs f_flags (Linux calculate_f_flags): ST_VALID, ST_RDONLY and
+/// ST_SYNCHRONOUS from the superblock, ST_NOSUID/NODEV/NOEXEC and
+/// ST_NOSYMFOLLOW from the mount
 fn st_flags(mnt_flags: u32, sb: &super::SuperBlock) -> u64 {
+    use super::mount::MNT_NOSYMFOLLOW;
+    const ST_SYNCHRONOUS: u64 = 0x10;
     const ST_VALID: u64 = 0x20;
+    const ST_NOSYMFOLLOW: u64 = 0x2000;
     // MNT_NOSUID/NODEV/NOEXEC (1, 2, 4) map to ST_NOSUID/NODEV/NOEXEC (2, 4, 8)
     let mnt = u64::from(mnt_flags);
-    ST_VALID | u64::from(sb.rdonly()) | (mnt & 7) << 1
+    let mut f = ST_VALID | u64::from(sb.rdonly()) | (mnt & 7) << 1;
+    if sb.synchronous() {
+        f |= ST_SYNCHRONOUS;
+    }
+    if mnt_flags & MNT_NOSYMFOLLOW != 0 {
+        f |= ST_NOSYMFOLLOW;
+    }
+    f
 }
 
 /// sys_fstatfs - get filesystem statistics by file descriptor

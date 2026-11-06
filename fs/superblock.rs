@@ -196,6 +196,10 @@ static NEXT_DEV_ID: AtomicU64 = AtomicU64::new(1);
 /// The superblock structure - represents a mounted filesystem instance
 /// Read-only file system (Linux SB_RDONLY)
 pub const SB_RDONLY: u32 = 1;
+/// Writes are synchronous (Linux SB_SYNCHRONOUS)
+pub const SB_SYNCHRONOUS: u32 = 16;
+/// Directory changes are synchronous (Linux SB_DIRSYNC)
+pub const SB_DIRSYNC: u32 = 128;
 
 /// The hold bit of a writer count (Linux WRITE_HOLD): while set, new
 /// writers wait; it shares the count's word, so one atomic operation
@@ -301,7 +305,7 @@ pub struct SuperBlock {
     /// Superblock operations
     pub s_op: &'static dyn SuperOps,
 
-    /// SB_* flags (Linux s_flags): SB_RDONLY
+    /// SB_* flags (Linux s_flags): SB_RDONLY, SB_SYNCHRONOUS, SB_DIRSYNC
     s_flags: AtomicU32,
 
     /// Holders of write access to objects without a mount (internal
@@ -423,6 +427,32 @@ impl SuperBlock {
     /// True if mounted read-only (Linux sb_rdonly)
     pub fn rdonly(&self) -> bool {
         self.s_flags.load(Ordering::SeqCst) & SB_RDONLY != 0
+    }
+
+    /// The SB_* flags
+    pub fn flags(&self) -> u32 {
+        self.s_flags.load(Ordering::Relaxed)
+    }
+
+    /// True if writes are synchronous (Linux IS_SYNC of the superblock)
+    pub fn synchronous(&self) -> bool {
+        self.s_flags.load(Ordering::Relaxed) & SB_SYNCHRONOUS != 0
+    }
+
+    /// True if directory changes are synchronous (Linux IS_DIRSYNC of
+    /// the superblock: SB_SYNCHRONOUS implies it)
+    pub fn dirsync(&self) -> bool {
+        self.s_flags.load(Ordering::Relaxed) & (SB_SYNCHRONOUS | SB_DIRSYNC) != 0
+    }
+
+    /// Replace SB_SYNCHRONOUS and SB_DIRSYNC with `f` (mount, remount)
+    pub fn set_sync_flags(&self, f: u32) {
+        let mask = SB_SYNCHRONOUS | SB_DIRSYNC;
+        let _ = self
+            .s_flags
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
+                Some((v & !mask) | (f & mask))
+            });
     }
 
     /// Take write access to an object reached without a mount (internal
