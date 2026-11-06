@@ -442,6 +442,15 @@ so a pipe or FIFO with data reports 0. Linux do_vfs_ioctl handles
 FIONREAD only for regular files and passes the rest to f_op->ioctl
 (pipe_ioctl returns the buffered bytes).
 
+## O_ASYNC: no SIGIO
+
+**Location:** `fs/fd.rs` (F_SETFL), `fs/misc.rs` (FIOASYNC)
+
+No file raises SIGIO: there is no fasync list (Linux fasync_helper,
+kill_fasync). F_SETFL drops O_ASYNC and FIOASYNC's set is a no-op
+(O_ASYNC is not a settable flag); F_SETOWN and F_SETSIG are stored
+but unused.
+
 ## Mount flag gaps
 
 **Location**: `fs/misc.rs` sys_mount/sys_umount2, `fs/mount.rs`
