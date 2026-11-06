@@ -137,6 +137,21 @@ impl AttrNode {
     }
 }
 
+/// A binary attribute node's operations (Linux kernfs_ops of a bin
+/// attribute): revoked at removal, so a node a dentry or open file
+/// keeps holds no device object
+pub struct BinNode {
+    /// None once the node is removed
+    ops: RwLock<Option<Arc<dyn BinAttr>>>,
+}
+
+impl BinNode {
+    /// The operations, while the node is not removed
+    pub fn ops(&self) -> Option<Arc<dyn BinAttr>> {
+        self.ops.read().clone()
+    }
+}
+
 /// A child's key: (name hash, namespace tag, name)
 type Key = (u32, u64, Vec<u8>);
 
@@ -146,7 +161,7 @@ pub type Children = RwLock<BTreeMap<Key, Arc<KNode>>>;
 pub enum Kind {
     Dir(Children),
     Attr(AttrNode),
-    Bin(Arc<dyn BinAttr>),
+    Bin(BinNode),
     /// Symlink to a node (Linux holds a reference; a link outliving its
     /// target reads as ENOENT)
     Link(Weak<KNode>),
@@ -382,7 +397,10 @@ impl KNode {
         mode: u16,
         ops: Arc<dyn BinAttr>,
     ) -> Result<Arc<KNode>, KernelError> {
-        self.add(try_arc(Self::new(name, mode, Kind::Bin(ops)))?)
+        let b = BinNode {
+            ops: RwLock::new(Some(ops)),
+        };
+        self.add(try_arc(Self::new(name, mode, Kind::Bin(b)))?)
     }
 
     /// New symlink `name` -> `target`
@@ -439,10 +457,11 @@ impl KNode {
         for n in &nodes {
             n.drain
                 .wait_event(|| n.active.load(Ordering::Acquire) == DEACTIVATED);
-            if let Kind::Attr(a) = &n.kind {
-                // Dropped outside the lock: it may own the object
-                let ops = a.ops.write().take();
-                drop(ops);
+            // Dropped outside the lock: they may own the object
+            match &n.kind {
+                Kind::Attr(a) => drop(a.ops.write().take()),
+                Kind::Bin(b) => drop(b.ops.write().take()),
+                _ => {}
             }
         }
         let _w = KERNFS_RWSEM.write();

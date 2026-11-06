@@ -815,9 +815,6 @@ fat_get_cluster keeps a per-inode cache of chain positions
   device config): `IoMem` windows are copyable and never unmapped, so
   each transport rebind leaks the ioremap space of one device (Linux
   vp_modern_remove iounmaps them).
-- A removed kernfs binary attribute (`Kind::Bin`, e.g. PCI `config`)
-  keeps its operations, and so the object behind them, while a stale
-  dentry or open file holds the node (text attributes drop theirs).
 - No /proc/devices block section; the first disk
   registered decides the dynamic major (254 down, like Linux, but Linux
   usually has other dynamic majors registered first).

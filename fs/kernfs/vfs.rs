@@ -81,7 +81,7 @@ pub fn inode(sb: &Arc<SuperBlock>, kn: &Arc<KNode>) -> Result<Arc<Inode>, Kernel
     let (mode, size) = match &kn.kind {
         Kind::Dir(_) => (InodeMode::directory(kn.mode), 0),
         Kind::Attr(_) => (InodeMode::regular(kn.mode), ATTR_MAX as u64),
-        Kind::Bin(b) => (InodeMode::regular(kn.mode), b.size()),
+        Kind::Bin(b) => (InodeMode::regular(kn.mode), b.ops().map_or(0, |o| o.size())),
         Kind::Link(_) => (InodeMode::symlink(), 0),
     };
     let now = crate::time::TIMEKEEPER.current_time();
@@ -225,16 +225,18 @@ impl OpenAttr {
 
 pub struct KernfsFops;
 
-/// The node of an open binary attribute
-fn bin_of(file: &File) -> Option<(Arc<KNode>, Arc<dyn BinAttr>)> {
+/// An open binary attribute: its node and operations
+type BinFile = (Arc<KNode>, Arc<dyn BinAttr>);
+
+/// The node of an open binary attribute and its operations (ENODEV
+/// once it is removed); None for any other file
+fn bin_of(file: &File) -> Option<Result<BinFile, KernelError>> {
     let kn = knode(&*file.get_inode()?)?;
-    match &kn.kind {
-        Kind::Bin(b) => {
-            let b = b.clone();
-            Some((kn, b))
-        }
-        _ => None,
-    }
+    let b = match &kn.kind {
+        Kind::Bin(b) => b.ops().ok_or(KernelError::NoDevice),
+        _ => return None,
+    };
+    Some(b.map(|b| (kn, b)))
 }
 
 /// Linux sysfs_kf_bin_read/write: clipped to the size, EOF past it
@@ -287,7 +289,8 @@ impl KernfsFops {
     /// unless this read continues the last; the copy runs under
     /// `OpenAttr.buf` (Linux seq_read_iter under m->lock)
     fn read_at(&self, file: &File, to: &mut IovDest<'_>, off: u64) -> Result<usize, KernelError> {
-        if let Some((kn, b)) = bin_of(file) {
+        if let Some(r) = bin_of(file) {
+            let (kn, b) = r?;
             return bin_read(&kn, &*b, to, off);
         }
         let (kn, of) = attr_of(file)?;
@@ -321,7 +324,8 @@ impl KernfsFops {
         from: &mut IovSource<'_>,
         off: u64,
     ) -> Result<usize, KernelError> {
-        if let Some((kn, b)) = bin_of(file) {
+        if let Some(r) = bin_of(file) {
+            let (kn, b) = r?;
             return bin_write(&kn, &*b, from, off);
         }
         let (kn, of) = attr_of(file)?;
