@@ -7,7 +7,6 @@
 //! which also drops it (Linux blkdev_flush_mapping). mmap maps it.
 //! The open file holds its block device (`File.private`), counted as an
 //! opener (BLKRRPART, BLKBSZGET's initial value).
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::sync::Arc;
 
@@ -25,6 +24,7 @@ use crate::util::error::KernelError;
 use core::sync::atomic::Ordering;
 
 use super::file::{File, FileOps, seek};
+use crate::util::kalloc::arc_nofail;
 
 /// Block device ioctls (Linux include/uapi/linux/fs.h)
 pub mod ioc {
@@ -231,7 +231,7 @@ static BDEV_AOPS: BdevAops = BdevAops;
 /// The bdev pseudo filesystem's inode of device `dev` with `size`
 /// bytes (Linux bdev_alloc): unhashed, no superblock
 pub fn bdev_inode(dev: DevId, size: u64) -> Arc<Inode> {
-    let inode = Arc::new(Inode::new_device(
+    let inode = arc_nofail(Inode::new_device(
         0,
         InodeMode::blockdev(0o600),
         0,

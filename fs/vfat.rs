@@ -12,7 +12,6 @@
 //! - Boot sector with BIOS Parameter Block (BPB)
 //! - File Allocation Table (FAT) for cluster chains
 //! - 32-byte directory entries with optional long filename entries
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use crate::util::scope::ScopeGuard;
 use alloc::string::String;
@@ -33,6 +32,7 @@ use super::superblock::{
     FileSystemType, MSDOS_SUPER_MAGIC, StatFs, SuperBlock, SuperBlockData, SuperOps, fs_flags,
 };
 use crate::util::error::KernelError;
+use crate::util::kalloc::{arc_nofail, try_arc};
 
 // ============================================================================
 // VFAT file pages (Linux fat_aops: fat_read_folio, fat_writepages)
@@ -186,7 +186,9 @@ fn ensure_clusters(inode: &Inode, sb_data: &VfatSbData, size: u64) -> Result<(),
                 inode.get_size() as u32,
             )?;
         }
-        inode.set_private(Arc::new(VfatInodeData {
+        // The clusters are on disk now: the inode must follow (Linux
+        // keeps this in the inode and allocates nothing here)
+        inode.set_private(arc_nofail(VfatInodeData {
             start_cluster: first,
             ..d
         }));
@@ -1708,7 +1710,8 @@ impl InodeOps for VfatInodeOps {
                 let _ = free_cluster_chain(&sb_data, start);
             }
         });
-        crate::task::workqueue::SYSTEM_WQ.queue_work(Arc::new(crate::sync::spin::Mutex::new(work)));
+        crate::task::workqueue::SYSTEM_WQ
+            .queue_work(arc_nofail(crate::sync::spin::Mutex::new(work)));
     }
 
     fn create(&self, dir: &Inode, name: &[u8], mode: InodeMode) -> Result<Arc<Inode>, KernelError> {
@@ -1747,7 +1750,7 @@ impl InodeOps for VfatInodeOps {
 
         // Create and return the new inode
         let ino = sb.alloc_ino();
-        let inode = Arc::new(Inode::new(
+        let inode = try_arc(Inode::new(
             ino,
             sb_data.opts.file_mode(),
             sb_data.opts.uid,
@@ -1756,16 +1759,16 @@ impl InodeOps for VfatInodeOps {
             Timespec::ZERO,
             Arc::downgrade(&sb),
             &VFAT_INODE_OPS,
-        ));
+        ))?;
         inode.i_data.set_aops(&VFAT_FILE_AOPS);
 
-        inode.set_private(Arc::new(VfatInodeData {
+        inode.set_private(try_arc(VfatInodeData {
             start_cluster,
             file_size,
             is_dir: false,
             parent_cluster,
             short_name,
-        }));
+        })?);
         icache::insert_inode_hash(&inode, ikey(parent_cluster, &short_name));
 
         Ok(inode)
@@ -1832,7 +1835,7 @@ impl InodeOps for VfatInodeOps {
 
         // Create and return the new inode
         let ino = sb.alloc_ino();
-        let inode = Arc::new(Inode::new(
+        let inode = try_arc(Inode::new(
             ino,
             sb_data.opts.dir_mode(),
             sb_data.opts.uid,
@@ -1841,16 +1844,16 @@ impl InodeOps for VfatInodeOps {
             Timespec::ZERO,
             Arc::downgrade(&sb),
             &VFAT_INODE_OPS,
-        ));
+        ))?;
         inode.i_data.set_aops(&VFAT_FILE_AOPS);
 
-        inode.set_private(Arc::new(VfatInodeData {
+        inode.set_private(try_arc(VfatInodeData {
             start_cluster: new_cluster,
             file_size: 0,
             is_dir: true,
             parent_cluster,
             short_name,
-        }));
+        })?);
         icache::insert_inode_hash(&inode, ikey(parent_cluster, &short_name));
 
         Ok(inode)
@@ -1961,7 +1964,9 @@ impl InodeOps for VfatInodeOps {
                     }
                 }
             }
-            inode.set_private(Arc::new(VfatInodeData {
+            // The clusters are freed on disk: the inode must follow
+            // (Linux keeps this in the inode and allocates nothing here)
+            inode.set_private(arc_nofail(VfatInodeData {
                 start_cluster: start,
                 file_size: length as u32,
                 ..d
@@ -2088,7 +2093,9 @@ impl InodeOps for VfatInodeOps {
             let mut d = get_inode_data(&inode)?;
             d.parent_cluster = new_dir_data.start_cluster;
             d.short_name = new_short;
-            inode.set_private(Arc::new(d));
+            // The entry has moved on disk: the inode must follow (Linux
+            // fat_attach allocates nothing)
+            inode.set_private(arc_nofail(d));
             icache::rehash(&inode, ikey(new_dir_data.start_cluster, &new_short));
         }
         Ok(())
@@ -2172,7 +2179,7 @@ fn create_inode_for_entry(
     };
 
     let ino = sb.alloc_ino();
-    let inode = Arc::new(Inode::new(
+    let inode = try_arc(Inode::new(
         ino,
         mode,
         o.uid,
@@ -2181,16 +2188,16 @@ fn create_inode_for_entry(
         Timespec::ZERO,
         Arc::downgrade(sb),
         &VFAT_INODE_OPS,
-    ));
+    ))?;
     inode.i_data.set_aops(&VFAT_FILE_AOPS);
 
-    inode.set_private(Arc::new(VfatInodeData {
+    inode.set_private(try_arc(VfatInodeData {
         start_cluster: entry.start_cluster,
         file_size: entry.file_size,
         is_dir: entry.is_dir(),
         parent_cluster,
         short_name: entry.short_name,
-    }));
+    })?);
 
     Ok(inode)
 }
@@ -2330,7 +2337,7 @@ impl SuperOps for VfatSuperOps {
         mode: InodeMode,
         i_op: &'static dyn InodeOps,
     ) -> Result<Arc<Inode>, KernelError> {
-        Ok(Arc::new(Inode::new(
+        try_arc(Inode::new(
             sb.alloc_ino(),
             mode,
             0,
@@ -2339,7 +2346,7 @@ impl SuperOps for VfatSuperOps {
             Timespec::ZERO,
             Arc::downgrade(sb),
             i_op,
-        )))
+        ))
     }
 }
 
@@ -2436,7 +2443,7 @@ fn vfat_mount_dev(
     }
 
     // Create superblock data
-    let sb_data = Arc::new(VfatSbData {
+    let sb_data = try_arc(VfatSbData {
         bdev: bdev.clone(),
         bytes_per_sector: u32::from(bytes_per_sector),
         sectors_per_cluster: u32::from(boot_sector.sectors_per_cluster),
@@ -2446,17 +2453,17 @@ fn vfat_mount_dev(
         root_cluster: boot_sector.root_cluster,
         cluster_size,
         opts,
-    });
+    })?;
 
     // Create superblock
-    let sb = SuperBlock::new(fs_type, &VFAT_SUPER_OPS, 0);
+    let sb = SuperBlock::new(fs_type, &VFAT_SUPER_OPS, 0)?;
     // FAT sizes are 32-bit (Linux fat_fill_super: s_maxbytes 0xffffffff)
     sb.set_maxbytes(0xffff_ffff);
     sb.set_private(sb_data.clone());
 
     // Create root inode
     let root_ino = sb.alloc_ino();
-    let root_inode = Arc::new(Inode::new(
+    let root_inode = try_arc(Inode::new(
         root_ino,
         sb_data.opts.dir_mode(),
         sb_data.opts.uid,
@@ -2465,19 +2472,19 @@ fn vfat_mount_dev(
         Timespec::ZERO,
         Arc::downgrade(&sb),
         &VFAT_INODE_OPS,
-    ));
+    ))?;
     root_inode.i_data.set_aops(&VFAT_FILE_AOPS);
 
-    root_inode.set_private(Arc::new(VfatInodeData {
+    root_inode.set_private(try_arc(VfatInodeData {
         start_cluster: boot_sector.root_cluster,
         file_size: 0,
         is_dir: true,
         parent_cluster: 0,      // Root has no parent
         short_name: [b' '; 11], // Root has no short name
-    }));
+    })?);
 
     // Create root dentry
-    let root_dentry = Arc::new(Dentry::new_root(root_inode, Arc::downgrade(&sb)));
+    let root_dentry = try_arc(Dentry::new_root(root_inode, Arc::downgrade(&sb)))?;
     sb.set_root(root_dentry);
 
     Ok(sb)

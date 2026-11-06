@@ -16,7 +16,6 @@
 //! - `cpu.max`, `cpu.weight`, `cpu.stat` - CPU controller files
 //! - `memory.max`, `memory.current`, `memory.stat` - Memory controller files
 //! - `io.max`, `io.stat` - IO controller files
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::format;
 use alloc::string::String;
@@ -34,6 +33,7 @@ use super::superblock::{FileSystemType, StatFs, SuperBlock, SuperOps};
 
 use crate::cgroup::{CGROUP_ROOT, Cgroup, ControllerType, cgroup_init, cgroup_mkdir, cgroup_rmdir};
 use crate::task::Pid;
+use crate::util::kalloc::try_arc;
 
 /// Cgroup2 superblock magic
 pub const CGROUP2_SUPER_MAGIC: u64 = 0x63677270;
@@ -184,12 +184,12 @@ impl InodeOps for CgroupfsInodeOps {
 
                 // First check for child cgroups
                 if let Some(child) = cg.lookup_child(name) {
-                    return Ok(create_cgroup_dir_inode(dir, &child));
+                    return create_cgroup_dir_inode(dir, &child);
                 }
 
                 // Check for built-in control files
                 if let Some(file_type) = CgroupControlFileType::from_name(name) {
-                    return Ok(create_control_file_inode(dir, &cg, file_type));
+                    return create_control_file_inode(dir, &cg, file_type);
                 }
 
                 // Check for controller-specific files
@@ -197,7 +197,7 @@ impl InodeOps for CgroupfsInodeOps {
                     if let Some(ops) = CGROUP_ROOT.get_controller(controller) {
                         for cf in ops.control_files() {
                             if cf.name == name {
-                                return Ok(create_subsys_file_inode(dir, &cg, controller, cf.name));
+                                return create_subsys_file_inode(dir, &cg, controller, cf.name);
                             }
                         }
                     }
@@ -227,7 +227,7 @@ impl InodeOps for CgroupfsInodeOps {
         };
         let parent_cg = parent.upgrade().ok_or(KernelError::NoDevice)?;
         let new_cg = cgroup_mkdir(&parent_cg, name)?;
-        Ok(create_cgroup_dir_inode(dir, &new_cg))
+        create_cgroup_dir_inode(dir, &new_cg)
     }
 
     fn rmdir(&self, dir: &Inode, name: &[u8]) -> Result<(), KernelError> {
@@ -258,9 +258,12 @@ pub static CGROUPFS_INODE_OPS: CgroupfsInodeOps = CgroupfsInodeOps;
 // ============================================================================
 
 /// Create a cgroup directory inode
-fn create_cgroup_dir_inode(parent: &Inode, cgroup: &Arc<Cgroup>) -> Arc<Inode> {
+fn create_cgroup_dir_inode(
+    parent: &Inode,
+    cgroup: &Arc<Cgroup>,
+) -> Result<Arc<Inode>, KernelError> {
     let sb = parent.superblock().expect("superblock dropped");
-    let inode = Arc::new(Inode::new(
+    let inode = try_arc(Inode::new(
         cgroup.ino,
         InodeMode::directory(0o755),
         0,
@@ -269,13 +272,13 @@ fn create_cgroup_dir_inode(parent: &Inode, cgroup: &Arc<Cgroup>) -> Arc<Inode> {
         current_time(),
         Arc::downgrade(&sb),
         &CGROUPFS_INODE_OPS,
-    ));
-    inode.set_private(Arc::new(CgroupfsInodeWrapper(RwLock::new(
+    ))?;
+    inode.set_private(try_arc(CgroupfsInodeWrapper(RwLock::new(
         CgroupfsInodeData::Directory {
             cgroup: Arc::downgrade(cgroup),
         },
-    ))));
-    inode
+    )))?);
+    Ok(inode)
 }
 
 /// Create a control file inode
@@ -283,14 +286,14 @@ fn create_control_file_inode(
     parent: &Inode,
     cgroup: &Arc<Cgroup>,
     file_type: CgroupControlFileType,
-) -> Arc<Inode> {
+) -> Result<Arc<Inode>, KernelError> {
     let sb = parent.superblock().expect("superblock dropped");
     let mode = if file_type.is_writable() {
         0o644
     } else {
         0o444
     };
-    let inode = Arc::new(Inode::new(
+    let inode = try_arc(Inode::new(
         sb.alloc_ino(),
         InodeMode::regular(mode),
         0,
@@ -299,14 +302,14 @@ fn create_control_file_inode(
         current_time(),
         Arc::downgrade(&sb),
         &CGROUPFS_INODE_OPS,
-    ));
-    inode.set_private(Arc::new(CgroupfsInodeWrapper(RwLock::new(
+    ))?;
+    inode.set_private(try_arc(CgroupfsInodeWrapper(RwLock::new(
         CgroupfsInodeData::ControlFile {
             cgroup: Arc::downgrade(cgroup),
             file_type,
         },
-    ))));
-    inode
+    )))?);
+    Ok(inode)
 }
 
 /// Create a controller-specific file inode
@@ -315,7 +318,7 @@ fn create_subsys_file_inode(
     cgroup: &Arc<Cgroup>,
     controller: ControllerType,
     file_name: &'static str,
-) -> Arc<Inode> {
+) -> Result<Arc<Inode>, KernelError> {
     let sb = parent.superblock().expect("superblock dropped");
 
     // Determine mode from controller's control file definition
@@ -329,7 +332,7 @@ fn create_subsys_file_inode(
         0o444
     };
 
-    let inode = Arc::new(Inode::new(
+    let inode = try_arc(Inode::new(
         sb.alloc_ino(),
         InodeMode::regular(mode),
         0,
@@ -338,15 +341,15 @@ fn create_subsys_file_inode(
         current_time(),
         Arc::downgrade(&sb),
         &CGROUPFS_INODE_OPS,
-    ));
-    inode.set_private(Arc::new(CgroupfsInodeWrapper(RwLock::new(
+    ))?;
+    inode.set_private(try_arc(CgroupfsInodeWrapper(RwLock::new(
         CgroupfsInodeData::SubsysFile {
             cgroup: Arc::downgrade(cgroup),
             controller,
             file_name,
         },
-    ))));
-    inode
+    )))?);
+    Ok(inode)
 }
 
 // ============================================================================
@@ -727,7 +730,7 @@ impl SuperOps for CgroupfsSuperOps {
         mode: InodeMode,
         i_op: &'static dyn InodeOps,
     ) -> Result<Arc<Inode>, KernelError> {
-        let inode = Arc::new(Inode::new(
+        let inode = try_arc(Inode::new(
             sb.alloc_ino(),
             mode,
             0,
@@ -736,12 +739,12 @@ impl SuperOps for CgroupfsSuperOps {
             current_time(),
             Arc::downgrade(sb),
             i_op,
-        ));
-        inode.set_private(Arc::new(CgroupfsInodeWrapper(RwLock::new(
+        ))?;
+        inode.set_private(try_arc(CgroupfsInodeWrapper(RwLock::new(
             CgroupfsInodeData::Directory {
                 cgroup: Weak::new(),
             },
-        ))));
+        )))?);
         Ok(inode)
     }
 }
@@ -762,7 +765,7 @@ fn cgroupfs_mount(
     cgroup_init();
 
     // Create superblock
-    let sb = SuperBlock::new(fs_type, &CGROUPFS_SUPER_OPS, 0);
+    let sb = SuperBlock::new(fs_type, &CGROUPFS_SUPER_OPS, 0)?;
 
     // Get root cgroup
     let root_cg = CGROUP_ROOT
@@ -770,7 +773,7 @@ fn cgroupfs_mount(
         .ok_or(KernelError::InvalidArgument)?;
 
     // Create root inode
-    let root_inode = Arc::new(Inode::new(
+    let root_inode = try_arc(Inode::new(
         root_cg.ino,
         InodeMode::directory(0o755),
         0,
@@ -779,15 +782,15 @@ fn cgroupfs_mount(
         current_time(),
         Arc::downgrade(&sb),
         &CGROUPFS_INODE_OPS,
-    ));
-    root_inode.set_private(Arc::new(CgroupfsInodeWrapper(RwLock::new(
+    ))?;
+    root_inode.set_private(try_arc(CgroupfsInodeWrapper(RwLock::new(
         CgroupfsInodeData::Directory {
             cgroup: Arc::downgrade(&root_cg),
         },
-    ))));
+    )))?);
 
     // Create root dentry
-    let root_dentry = Arc::new(Dentry::new_root(root_inode, Arc::downgrade(&sb)));
+    let root_dentry = try_arc(Dentry::new_root(root_inode, Arc::downgrade(&sb)))?;
 
     // Set root in superblock
     sb.set_root(root_dentry);

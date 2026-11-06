@@ -1281,12 +1281,7 @@ pub fn get_io_uring(file: &File) -> Option<Arc<IoUring>> {
 
 /// Create an io_uring file
 fn create_io_uring_file(ring: Arc<IoUring>) -> Result<Arc<File>, KernelError> {
-    Ok(crate::fs::anon_inodes::anon_inode_getfile(
-        "[io_uring]",
-        &IO_URING_FOPS,
-        ring,
-        flags::O_RDWR,
-    ))
+    crate::fs::anon_inodes::anon_inode_getfile("[io_uring]", &IO_URING_FOPS, ring, flags::O_RDWR)
 }
 
 // ============================================================================

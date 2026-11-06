@@ -127,7 +127,7 @@ pub fn create_pidfd(pid: Pid, file_flags: u32) -> Result<Arc<File>, KernelError>
         f_flags |= flags::O_NONBLOCK;
     }
 
-    let file = crate::fs::anon_inodes::anon_inode_getfile("[pidfd]", &PIDFD_FOPS, pidfd, f_flags);
+    let file = crate::fs::anon_inodes::anon_inode_getfile("[pidfd]", &PIDFD_FOPS, pidfd, f_flags)?;
     Ok(file)
 }
 

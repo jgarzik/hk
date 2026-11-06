@@ -238,8 +238,12 @@ pub fn create_eventfd(initval: u64, efd_flags: i32) -> Result<Arc<File>, KernelE
         file_flags |= flags::O_NONBLOCK;
     }
 
-    let file =
-        crate::fs::anon_inodes::anon_inode_getfile("[eventfd]", &EVENTFD_FOPS, eventfd, file_flags);
+    let file = crate::fs::anon_inodes::anon_inode_getfile(
+        "[eventfd]",
+        &EVENTFD_FOPS,
+        eventfd,
+        file_flags,
+    )?;
     Ok(file)
 }
 

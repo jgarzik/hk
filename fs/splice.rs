@@ -24,7 +24,6 @@
 //! - Linux include/linux/pipe_fs_i.h
 //! - Linux include/linux/splice.h
 #![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::sync::Arc;
 
@@ -39,6 +38,7 @@ use crate::mm::filemap::PAGE_SIZE;
 use crate::task::fdtable::get_task_fd;
 use crate::task::percpu::current_tid;
 use crate::uaccess::{copy_from_user, get_user, put_user};
+use crate::util::kalloc::try_arc;
 
 // =============================================================================
 // Splice flags (from include/linux/splice.h)
@@ -643,8 +643,7 @@ fn allocate_pipe_page() -> Option<Arc<PipePage>> {
     // User data (Linux GFP_HIGHUSER | __GFP_ACCOUNT): stops at the low
     // watermark like the user pages it was copied from
     let frame = FRAME_ALLOCATOR.alloc_gfp(crate::mm::page_alloc::Gfp::HIGHUSER_MOVABLE)?;
-    let page = Arc::new(PipePage::new(frame));
-    Some(page)
+    try_arc(PipePage::new(frame)).ok()
 }
 
 /// sys_tee - duplicate pipe content

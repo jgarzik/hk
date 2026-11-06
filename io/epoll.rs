@@ -720,7 +720,7 @@ pub fn create_epoll_file(eflags: i32) -> Result<Arc<File>, KernelError> {
         &EPOLL_FOPS,
         ep.clone(),
         file_flags,
-    );
+    )?;
     ep.file.call_once(|| Arc::downgrade(&file));
     Ok(file)
 }

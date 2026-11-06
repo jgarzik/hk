@@ -298,7 +298,7 @@ pub fn create_signalfd(mask: SigSet, sfd_flags: i32) -> Result<Arc<File>, Kernel
         &SIGNALFD_FOPS,
         signalfd,
         file_flags,
-    );
+    )?;
     Ok(file)
 }
 

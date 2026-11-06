@@ -472,8 +472,12 @@ pub fn create_timerfd(clockid: i32, tfd_flags: i32) -> Result<Arc<File>, KernelE
         file_flags |= flags::O_NONBLOCK;
     }
 
-    let file =
-        crate::fs::anon_inodes::anon_inode_getfile("[timerfd]", &TIMERFD_FOPS, timerfd, file_flags);
+    let file = crate::fs::anon_inodes::anon_inode_getfile(
+        "[timerfd]",
+        &TIMERFD_FOPS,
+        timerfd,
+        file_flags,
+    )?;
     Ok(file)
 }
 

@@ -565,7 +565,7 @@ pub fn create_fanotify(init_flags: u32, event_f_flags: u32) -> Result<Arc<File>,
         &FANOTIFY_FOPS,
         fanotify,
         file_flags,
-    );
+    )?;
     Ok(file)
 }
 

@@ -1,7 +1,6 @@
 //! Mount - filesystem mount infrastructure
 //!
 //! Manages the mount tree that connects filesystems into a unified namespace.
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
@@ -14,6 +13,7 @@ use super::dentry::Dentry;
 use super::inode::FileType;
 use super::path_ref::Path;
 use super::superblock::{FileSystemType, SuperBlock};
+use crate::util::kalloc::{arc_nofail, try_arc};
 
 use crate::block::get_blkdev;
 
@@ -135,14 +135,38 @@ pub struct Mount {
 }
 
 impl Mount {
-    /// Create a new mount
+    /// Create a new mount, or ENOMEM
     pub fn new(
         sb: Arc<SuperBlock>,
         root: Arc<Dentry>,
         flags: u32,
         devname: super::name::FileName,
+    ) -> Result<Arc<Self>, KernelError> {
+        let m = try_arc(Self::init(sb, root, flags, devname))?;
+        m.sb.add_mount(&m);
+        Ok(m)
+    }
+
+    /// [`Mount::new`] for a tree copy, which cannot unwind a partial
+    /// copy (its peer groups and attachments) on failure
+    fn new_nofail(
+        sb: Arc<SuperBlock>,
+        root: Arc<Dentry>,
+        flags: u32,
+        devname: super::name::FileName,
     ) -> Arc<Self> {
-        let m = Arc::new(Self {
+        let m = arc_nofail(Self::init(sb, root, flags, devname));
+        m.sb.add_mount(&m);
+        m
+    }
+
+    fn init(
+        sb: Arc<SuperBlock>,
+        root: Arc<Dentry>,
+        flags: u32,
+        devname: super::name::FileName,
+    ) -> Self {
+        Self {
             sb,
             root,
             mountpoint: RwLock::new(None),
@@ -158,15 +182,13 @@ impl Mount {
             mnt_id_unique: MNT_ID_UNIQUE.fetch_add(1, Ordering::Relaxed),
             devname,
             mnt_count: AtomicU64::new(0),
-        });
-        m.sb.add_mount(&m);
-        m
+        }
     }
 
     /// A copy of `self` for a namespace copy: same filesystem, root,
     /// flags and source, new ids, not attached
     fn copy(&self) -> Arc<Self> {
-        let c = Self::new(
+        let c = Self::new_nofail(
             self.sb.clone(),
             self.root.clone(),
             self.flags(),
@@ -409,7 +431,7 @@ pub fn init_mount_tree() -> Result<Arc<Mount>, KernelError> {
         root,
         MNT_READONLY,
         b"nullfs".as_slice().into(),
-    ));
+    )?);
     Ok(rootfs)
 }
 
@@ -428,7 +450,7 @@ pub fn attach(
     if ro {
         sb.make_rdonly()?;
     }
-    let mount = Mount::new(sb, root, mnt_flags, devname);
+    let mount = Mount::new(sb, root, mnt_flags, devname)?;
     let mnt_ns = crate::ns::current_mnt_ns();
     if let Some(mp) = mountpoint {
         // Under the mountpoint's i_rwsem (Linux lock_mount), which rmdir
@@ -451,7 +473,7 @@ pub fn attach(
 /// A new mount of `m`'s filesystem rooted at `root`, with its flags
 /// and source (Linux clone_mnt); not attached
 pub fn clone_mnt(m: &Mount, root: Arc<Dentry>) -> Arc<Mount> {
-    let c = Mount::new(
+    let c = Mount::new_nofail(
         m.sb.clone(),
         root,
         m.flags() & !MNT_LOCKED,

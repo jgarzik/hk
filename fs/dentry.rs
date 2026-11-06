@@ -8,7 +8,6 @@
 //! Following Linux's `d_lock` pattern, each dentry has a single RwLock (`d_lock`)
 //! that protects all mutable state. This simplifies lock ordering and matches
 //! the proven Linux design.
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
@@ -20,6 +19,8 @@ use super::inode::Inode;
 use super::name::FileName;
 use super::path_ref::Path;
 use super::superblock::SuperBlock;
+use crate::util::error::KernelError;
+use crate::util::kalloc::try_arc;
 
 /// Dentry flags
 #[derive(Debug, Clone, Copy, Default)]
@@ -105,13 +106,17 @@ impl Dentry {
     /// The child `name` of `parent` with `inode` (Linux d_alloc +
     /// d_add): the cached one if there is one (a negative one gets
     /// `inode`), so a name never has two dentries
-    pub fn alloc(parent: &Arc<Dentry>, name: &[u8], inode: Option<Arc<Inode>>) -> Arc<Dentry> {
+    pub fn alloc(
+        parent: &Arc<Dentry>,
+        name: &[u8],
+        inode: Option<Arc<Inode>>,
+    ) -> Result<Arc<Dentry>, KernelError> {
         let mut p = parent.d_lock.write();
         if let Some(c) = p.children.get(name) {
             let mut ci = c.d_lock.write();
             if ci.inode.is_some() {
                 drop(ci);
-                return c.clone();
+                return Ok(c.clone());
             }
             // A negative one is filled only if no one else holds it
             // (lookups take their reference under the parent's d_lock);
@@ -120,14 +125,14 @@ impl Dentry {
             if Arc::strong_count(c) == 1 {
                 ci.inode = inode;
                 drop(ci);
-                return c.clone();
+                return Ok(c.clone());
             }
             ci.flags.unhashed = true;
         }
-        let d = Arc::new(Self::with(name.into(), inode, parent.sb.clone()));
+        let d = try_arc(Self::with(name.into(), inode, parent.sb.clone()))?;
         d.d_lock.write().parent = Some(parent.clone());
         p.children.insert(name.into(), d.clone());
-        d
+        Ok(d)
     }
 
     /// Name in the parent (a copy: d_move may change it)

@@ -16,7 +16,6 @@
 //!
 //! File data (`RamfsInodeData.data`) uses RwLock independently for concurrent
 //! read access and exclusive write access during file I/O.
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -36,6 +35,7 @@ use super::inode::{AsAny, DevId, FileType, Inode, InodeData, InodeMode, InodeOps
 use super::superblock::{
     FileSystemType, RAMFS_MAGIC, StatFs, SuperBlock, SuperBlockData, SuperOps,
 };
+use crate::util::kalloc::try_arc;
 
 // ============================================================================
 // Ramfs Address Space Operations
@@ -334,7 +334,7 @@ impl InodeOps for RamfsInodeOps {
         let ino = sb.alloc_ino();
         let (uid, gid, mode) = super::dac::init_owner(dir, mode);
 
-        let new_inode = Arc::new(Inode::new(
+        let new_inode = try_arc(Inode::new(
             ino,
             mode,
             uid,
@@ -343,8 +343,8 @@ impl InodeOps for RamfsInodeOps {
             current_time(),
             Arc::downgrade(&sb),
             &RAMFS_INODE_OPS,
-        ));
-        new_inode.set_private(Arc::new(RamfsInodeData::new_file()));
+        ))?;
+        new_inode.set_private(try_arc(RamfsInodeData::new_file())?);
         file_mapping(&new_inode);
 
         // Add to directory
@@ -374,7 +374,7 @@ impl InodeOps for RamfsInodeOps {
             return Err(KernelError::AlreadyExists);
         }
         let (uid, gid, mode) = super::dac::init_owner(dir, mode);
-        let inode = Arc::new(Inode::new_device(
+        let inode = try_arc(Inode::new_device(
             sb.alloc_ino(),
             mode,
             uid,
@@ -383,7 +383,7 @@ impl InodeOps for RamfsInodeOps {
             current_time(),
             Arc::downgrade(&sb),
             &RAMFS_INODE_OPS,
-        ));
+        ))?;
         dir_data
             .children
             .write()
@@ -407,7 +407,7 @@ impl InodeOps for RamfsInodeOps {
 
         // Owner from the caller's fs ids (inode_init_owner)
         let (uid, gid, mode) = super::dac::init_owner(dir, mode);
-        let new_inode = Arc::new(Inode::new(
+        let new_inode = try_arc(Inode::new(
             sb.alloc_ino(),
             mode,
             uid,
@@ -416,8 +416,8 @@ impl InodeOps for RamfsInodeOps {
             current_time(),
             Arc::downgrade(&sb),
             &RAMFS_INODE_OPS,
-        ));
-        new_inode.set_private(Arc::new(RamfsInodeData::new_dir()));
+        ))?;
+        new_inode.set_private(try_arc(RamfsInodeData::new_dir())?);
 
         // Add to parent directory
         dir_data
@@ -469,7 +469,7 @@ impl InodeOps for RamfsInodeOps {
 
         // Create symlink inode (mode = S_IFLNK | 0777)
         let (uid, gid, mode) = super::dac::init_owner(dir, InodeMode::symlink());
-        let new_inode = Arc::new(Inode::new(
+        let new_inode = try_arc(Inode::new(
             sb.alloc_ino(),
             mode,
             uid,
@@ -478,12 +478,12 @@ impl InodeOps for RamfsInodeOps {
             current_time(),
             Arc::downgrade(&sb),
             &RAMFS_INODE_OPS,
-        ));
+        ))?;
 
         // Store target inline (not in page cache)
-        new_inode.set_private(Arc::new(RamfsInodeData::new_symlink(FileName::from(
+        new_inode.set_private(try_arc(RamfsInodeData::new_symlink(FileName::from(
             target,
-        ))));
+        )))?);
 
         // Add to directory
         dir_data
@@ -1021,7 +1021,7 @@ impl SuperOps for RamfsSuperOps {
     ) -> Result<Arc<Inode>, KernelError> {
         let ino = sb.alloc_ino();
 
-        let inode = Arc::new(Inode::new(
+        let inode = try_arc(Inode::new(
             ino,
             mode,
             0, // uid: default to root
@@ -1030,16 +1030,16 @@ impl SuperOps for RamfsSuperOps {
             current_time(),
             Arc::downgrade(sb),
             i_op,
-        ));
+        ))?;
 
         // Set up private data based on file type
         if mode.is_dir() {
-            inode.set_private(Arc::new(RamfsInodeData::new_dir()));
+            inode.set_private(try_arc(RamfsInodeData::new_dir())?);
         } else if mode.is_symlink() {
             // Symlinks need to be set up with a target later
-            inode.set_private(Arc::new(RamfsInodeData::new_symlink(FileName::default())));
+            inode.set_private(try_arc(RamfsInodeData::new_symlink(FileName::default()))?);
         } else {
-            inode.set_private(Arc::new(RamfsInodeData::new_file()));
+            inode.set_private(try_arc(RamfsInodeData::new_file())?);
             file_mapping(&inode);
         }
 
@@ -1057,10 +1057,10 @@ pub(crate) fn ramfs_mount(
 ) -> Result<Arc<SuperBlock>, KernelError> {
     let mode = root_mode(opts)?;
     // Create superblock
-    let sb = SuperBlock::new(fs_type, &RAMFS_SUPER_OPS, 0);
+    let sb = SuperBlock::new(fs_type, &RAMFS_SUPER_OPS, 0)?;
 
     // Create root inode (directory)
-    let root_inode = Arc::new(Inode::new(
+    let root_inode = try_arc(Inode::new(
         sb.alloc_ino(),
         InodeMode::directory(mode),
         0, // uid: root
@@ -1069,11 +1069,11 @@ pub(crate) fn ramfs_mount(
         current_time(),
         Arc::downgrade(&sb),
         &RAMFS_INODE_OPS,
-    ));
-    root_inode.set_private(Arc::new(RamfsInodeData::new_dir()));
+    ))?;
+    root_inode.set_private(try_arc(RamfsInodeData::new_dir())?);
 
     // Create root dentry
-    let root_dentry = Arc::new(Dentry::new_root(root_inode, Arc::downgrade(&sb)));
+    let root_dentry = try_arc(Dentry::new_root(root_inode, Arc::downgrade(&sb)))?;
 
     // Set root in superblock
     sb.set_root(root_dentry);
@@ -1130,7 +1130,7 @@ pub fn ramfs_create_dir_with_owner(
     }
 
     // Create new directory inode
-    let new_inode = Arc::new(Inode::new(
+    let new_inode = try_arc(Inode::new(
         sb.alloc_ino(),
         mode,
         uid,
@@ -1139,8 +1139,8 @@ pub fn ramfs_create_dir_with_owner(
         current_time(),
         Arc::downgrade(&sb),
         &RAMFS_INODE_OPS,
-    ));
-    new_inode.set_private(Arc::new(RamfsInodeData::new_dir()));
+    ))?;
+    new_inode.set_private(try_arc(RamfsInodeData::new_dir())?);
 
     // Add to parent directory
     parent_data
@@ -1149,7 +1149,7 @@ pub fn ramfs_create_dir_with_owner(
         .insert(FileName::from(name), new_inode.clone());
 
     // Create dentry
-    let new_dentry = Dentry::alloc(parent, name, Some(new_inode));
+    let new_dentry = Dentry::alloc(parent, name, Some(new_inode))?;
 
     Ok(new_dentry)
 }
@@ -1212,7 +1212,7 @@ pub fn ramfs_create_file_with_timestamp(
     // Create new file inode with content and explicit timestamp
     let ino = sb.alloc_ino();
 
-    let new_inode = Arc::new(Inode::new(
+    let new_inode = try_arc(Inode::new(
         ino,
         mode,
         uid,
@@ -1221,8 +1221,8 @@ pub fn ramfs_create_file_with_timestamp(
         mtime,
         Arc::downgrade(&sb),
         &RAMFS_INODE_OPS,
-    ));
-    new_inode.set_private(Arc::new(RamfsInodeData::new_file()));
+    ))?;
+    new_inode.set_private(try_arc(RamfsInodeData::new_file())?);
     file_mapping(&new_inode);
     fill_pages(&new_inode, content)?;
 
@@ -1233,7 +1233,7 @@ pub fn ramfs_create_file_with_timestamp(
         .insert(FileName::from(name), new_inode.clone());
 
     // Create dentry
-    let new_dentry = Dentry::alloc(parent, name, Some(new_inode));
+    let new_dentry = Dentry::alloc(parent, name, Some(new_inode))?;
 
     Ok(new_dentry)
 }
@@ -1290,7 +1290,7 @@ pub fn ramfs_create_dir_with_timestamp(
     }
 
     // Create new directory inode with explicit timestamp
-    let new_inode = Arc::new(Inode::new(
+    let new_inode = try_arc(Inode::new(
         sb.alloc_ino(),
         mode,
         uid,
@@ -1299,8 +1299,8 @@ pub fn ramfs_create_dir_with_timestamp(
         mtime,
         Arc::downgrade(&sb),
         &RAMFS_INODE_OPS,
-    ));
-    new_inode.set_private(Arc::new(RamfsInodeData::new_dir()));
+    ))?;
+    new_inode.set_private(try_arc(RamfsInodeData::new_dir())?);
 
     // Add to parent directory
     parent_data
@@ -1309,7 +1309,7 @@ pub fn ramfs_create_dir_with_timestamp(
         .insert(FileName::from(name), new_inode.clone());
 
     // Create dentry
-    let new_dentry = Dentry::alloc(parent, name, Some(new_inode));
+    let new_dentry = Dentry::alloc(parent, name, Some(new_inode))?;
 
     Ok(new_dentry)
 }
@@ -1374,7 +1374,7 @@ pub fn ramfs_create_symlink_with_timestamp(
     }
 
     // Create symlink inode (mode = S_IFLNK | 0777)
-    let new_inode = Arc::new(Inode::new(
+    let new_inode = try_arc(Inode::new(
         sb.alloc_ino(),
         InodeMode::symlink(),
         uid,
@@ -1383,12 +1383,12 @@ pub fn ramfs_create_symlink_with_timestamp(
         mtime,
         Arc::downgrade(&sb),
         &RAMFS_INODE_OPS,
-    ));
+    ))?;
 
     // Store target inline (not in page cache)
-    new_inode.set_private(Arc::new(RamfsInodeData::new_symlink(FileName::from(
+    new_inode.set_private(try_arc(RamfsInodeData::new_symlink(FileName::from(
         target,
-    ))));
+    )))?);
 
     // Add to parent directory
     parent_data
@@ -1397,7 +1397,7 @@ pub fn ramfs_create_symlink_with_timestamp(
         .insert(FileName::from(name), new_inode.clone());
 
     // Create dentry
-    let new_dentry = Dentry::alloc(parent, name, Some(new_inode));
+    let new_dentry = Dentry::alloc(parent, name, Some(new_inode))?;
 
     Ok(new_dentry)
 }
@@ -1437,7 +1437,7 @@ pub fn ramfs_create_blkdev(
     }
 
     // Create new block device inode
-    let new_inode = Arc::new(Inode::new_device(
+    let new_inode = try_arc(Inode::new_device(
         sb.alloc_ino(),
         InodeMode::blockdev(mode),
         0, // uid = root
@@ -1446,7 +1446,7 @@ pub fn ramfs_create_blkdev(
         current_time(),
         Arc::downgrade(&sb),
         &RAMFS_INODE_OPS,
-    ));
+    ))?;
     // Block devices don't need RamfsInodeData - they use the block layer
 
     // Add to parent directory
@@ -1456,7 +1456,7 @@ pub fn ramfs_create_blkdev(
         .insert(FileName::from(name), new_inode.clone());
 
     // Create dentry
-    let new_dentry = Dentry::alloc(parent, name, Some(new_inode));
+    let new_dentry = Dentry::alloc(parent, name, Some(new_inode))?;
 
     Ok(new_dentry)
 }
@@ -1496,7 +1496,7 @@ pub fn ramfs_create_chrdev(
     }
 
     // Create new character device inode
-    let new_inode = Arc::new(Inode::new_device(
+    let new_inode = try_arc(Inode::new_device(
         sb.alloc_ino(),
         InodeMode::chardev(mode),
         0, // uid = root
@@ -1505,7 +1505,7 @@ pub fn ramfs_create_chrdev(
         current_time(),
         Arc::downgrade(&sb),
         &RAMFS_INODE_OPS,
-    ));
+    ))?;
     // Character devices don't need RamfsInodeData - they use the chardev layer
 
     // Add to parent directory
@@ -1515,7 +1515,7 @@ pub fn ramfs_create_chrdev(
         .insert(FileName::from(name), new_inode.clone());
 
     // Create dentry
-    let new_dentry = Dentry::alloc(parent, name, Some(new_inode));
+    let new_dentry = Dentry::alloc(parent, name, Some(new_inode))?;
 
     Ok(new_dentry)
 }

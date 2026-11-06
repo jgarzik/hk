@@ -2,7 +2,6 @@
 //!
 //! Each mounted filesystem has a superblock that holds filesystem-wide
 //! state and provides operations for managing inodes.
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::sync::Arc;
 
@@ -14,6 +13,7 @@ use crate::sync;
 use super::KernelError;
 use super::dentry::Dentry;
 use super::inode::{Inode, InodeId, InodeMode, InodeOps};
+use crate::util::kalloc::try_arc;
 
 /// Superblock operations trait - filesystem-specific behavior
 pub trait SuperOps: Send + Sync {
@@ -384,8 +384,8 @@ impl SuperBlock {
         fs_type: &'static FileSystemType,
         s_op: &'static dyn SuperOps,
         flags: u32,
-    ) -> Arc<Self> {
-        let sb = Arc::new(Self {
+    ) -> Result<Arc<Self>, KernelError> {
+        let sb = try_arc(Self {
             fs_type,
             root: RwLock::new(None),
             s_op,
@@ -402,12 +402,12 @@ impl SuperBlock {
             s_wb_lock: crate::sync::Mutex::new(()),
             s_vfs_rename_mutex: sync::Mutex::new(()),
             s_umount: sync::RwSem::new(()),
-        });
+        })?;
         let mut all = ALL_SBS.lock();
         all.retain(|w| w.strong_count() != 0);
         all.push(Arc::downgrade(&sb));
         drop(all);
-        sb
+        Ok(sb)
     }
 
     /// Largest file size on this filesystem (Linux s_maxbytes)

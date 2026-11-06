@@ -126,13 +126,14 @@ pub fn lookup_one(parent: &Arc<Dentry>, name: &[u8]) -> Result<Arc<Dentry>, Kern
     }
     let dir = parent.get_inode().ok_or(KernelError::NotFound)?;
     match dir.i_op.lookup(&dir, name) {
-        Ok(inode) => Ok(Dentry::alloc(parent, name, Some(inode))),
+        Ok(inode) => Dentry::alloc(parent, name, Some(inode)),
         Err(KernelError::NotFound) => {
             let in_memory = dir
                 .superblock()
                 .is_some_and(|sb| sb.fs_type.fs_flags == super::superblock::fs_flags::FS_IN_MEMORY);
             if in_memory {
-                Dentry::alloc(parent, name, None);
+                // A negative dentry is only a cache: none on ENOMEM
+                let _ = Dentry::alloc(parent, name, None);
             }
             Err(KernelError::NotFound)
         }
@@ -319,8 +320,7 @@ pub fn create_entry(
         let _w = w?;
         super::dac::may_create(&c, &dir)?;
         let inode = make(&dir, &c)?;
-        let d = Dentry::alloc(parent, name, Some(inode));
-        Ok(d)
+        Dentry::alloc(parent, name, Some(inode))
     })()
 }
 

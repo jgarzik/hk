@@ -98,7 +98,7 @@ impl FileOps for BpfProgFileOps {
 
 /// Create a file descriptor for a BPF map
 pub fn create_bpf_map_fd(map: Arc<BpfMap>) -> Result<i32, KernelError> {
-    let file = anon_inode_getfile("bpf-map", &BPF_MAP_FOPS, map, flags::O_RDWR);
+    let file = anon_inode_getfile("bpf-map", &BPF_MAP_FOPS, map, flags::O_RDWR)?;
 
     // Allocate file descriptor using the fd table
     let fd_table = current_fd_table();
@@ -114,7 +114,7 @@ pub fn create_bpf_map_fd(map: Arc<BpfMap>) -> Result<i32, KernelError> {
 pub fn create_bpf_prog_fd(prog: Arc<BpfProg>, prog_type: u32) -> Result<i32, KernelError> {
     let private = try_arc(BpfProgFile { prog, prog_type })?;
 
-    let file = anon_inode_getfile("bpf-prog", &BPF_PROG_FOPS, private, flags::O_RDWR);
+    let file = anon_inode_getfile("bpf-prog", &BPF_PROG_FOPS, private, flags::O_RDWR)?;
 
     // Allocate file descriptor using the fd table
     let fd_table = current_fd_table();

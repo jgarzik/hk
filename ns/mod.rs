@@ -486,7 +486,13 @@ pub fn sys_unshare(unshare_flags: u64) -> i64 {
     // CLONE_NEWNS implies CLONE_FS (Linux unshare): a private fs
     // struct, moved to the copies of its mounts
     let fs = if ns_flags & CLONE_NEWNS != 0 {
-        let fs = crate::task::percpu::current_fs().map(|f| f.copy());
+        let fs = match crate::task::percpu::current_fs()
+            .map(|f| f.copy())
+            .transpose()
+        {
+            Ok(fs) => fs,
+            Err(e) => return e.sysret(),
+        };
         if let Some(f) = &fs {
             crate::fs::init_task_fs(tid, f.clone());
         }

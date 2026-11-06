@@ -10,13 +10,13 @@
 //! Middle:       tty framework (interactive terminals implemented as chrdevs).
 //! Top:          console framework (kernel log + active console(s)).
 //! ```
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use crate::base::{Class, DevNode, Device, DeviceInfo, device_create};
 use crate::fs::File;
 use crate::io::poll::{POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM, PollTable};
 use crate::sync::spin::RwLock;
 use crate::util::error::KernelError;
+use crate::util::kalloc::arc_nofail;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 
@@ -358,21 +358,21 @@ fn mem_devnode(d: &Device) -> Option<DevNode> {
 /// drivers, the class and its devices
 pub fn register_builtin_chardevs() {
     // /dev/null = major 1 (MEM), minor 3 (Linux convention)
-    let null_dev = Arc::new(NullCharDevice);
+    let null_dev = arc_nofail(NullCharDevice);
     let _ = register_chardev(DevId::new(major::MEM, 3), null_dev);
 
     // /dev/zero = major 1 (MEM), minor 5 (Linux convention)
-    let zero_dev = Arc::new(ZeroCharDevice);
+    let zero_dev = arc_nofail(ZeroCharDevice);
     let _ = register_chardev(DevId::new(major::MEM, 5), zero_dev);
 
     // /dev/full (1,7), /dev/random (1,8), /dev/urandom (1,9)
-    let _ = register_chardev(DevId::new(major::MEM, 7), Arc::new(FullCharDevice));
-    let random = Arc::new(RandomCharDevice("random"));
+    let _ = register_chardev(DevId::new(major::MEM, 7), arc_nofail(FullCharDevice));
+    let random = arc_nofail(RandomCharDevice("random"));
     let _ = register_chardev(DevId::new(major::MEM, 8), random);
-    let urandom = Arc::new(RandomCharDevice("urandom"));
+    let urandom = arc_nofail(RandomCharDevice("urandom"));
     let _ = register_chardev(DevId::new(major::MEM, 9), urandom);
     // /dev/kmsg (1,11)
-    let kmsg = Arc::new(crate::kmsg::KmsgCharDevice);
+    let kmsg = arc_nofail(crate::kmsg::KmsgCharDevice);
     let _ = register_chardev(DevId::new(major::MEM, 11), kmsg);
 
     MEM_CLASS.register();

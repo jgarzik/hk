@@ -14,7 +14,6 @@
 //!
 //! `OpenAttr.buf` (sleeping `Mutex`, Linux kernfs_open_file.mutex) is
 //! held across show()/store(), under an active reference.
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -28,6 +27,7 @@ use crate::fs::superblock::SuperBlock;
 use crate::io::poll::{DEFAULT_POLLMASK, POLLERR, POLLPRI, PollTable};
 use crate::sync::Mutex;
 use crate::sync::spin::Mutex as SpinMutex;
+use crate::util::kalloc::try_arc;
 
 /// Inode private data: the node
 pub struct KfInode(pub Arc<KNode>);
@@ -70,7 +70,7 @@ pub fn knode(inode: &Inode) -> Option<Arc<KNode>> {
 }
 
 /// A new inode for `kn` on `sb` (Linux kernfs_init_inode)
-pub fn inode(sb: &Arc<SuperBlock>, kn: &Arc<KNode>) -> Arc<Inode> {
+pub fn inode(sb: &Arc<SuperBlock>, kn: &Arc<KNode>) -> Result<Arc<Inode>, KernelError> {
     let (mode, size) = match &kn.kind {
         Kind::Dir(_) => (InodeMode::directory(kn.mode), 0),
         Kind::Attr(_) => (InodeMode::regular(kn.mode), ATTR_MAX as u64),
@@ -78,7 +78,7 @@ pub fn inode(sb: &Arc<SuperBlock>, kn: &Arc<KNode>) -> Arc<Inode> {
         Kind::Link(_) => (InodeMode::symlink(), 0),
     };
     let now = crate::time::TIMEKEEPER.current_time();
-    let i = Arc::new(Inode::new(
+    let i = try_arc(Inode::new(
         kn.ino,
         mode,
         0,
@@ -87,9 +87,9 @@ pub fn inode(sb: &Arc<SuperBlock>, kn: &Arc<KNode>) -> Arc<Inode> {
         now,
         Arc::downgrade(sb),
         &KERNFS_IOPS,
-    ));
-    i.set_private(Arc::new(KfInode(kn.clone())));
-    i
+    ))?;
+    i.set_private(try_arc(KfInode(kn.clone()))?);
+    Ok(i)
 }
 
 pub struct KernfsIops;
@@ -102,7 +102,7 @@ impl InodeOps for KernfsIops {
             return Err(KernelError::NotFound);
         }
         let sb = dir.superblock().ok_or(KernelError::Io)?;
-        Ok(inode(&sb, &kn))
+        inode(&sb, &kn)
     }
 
     /// Linux kernfs_dop_revalidate: a removed node's dentry is stale
@@ -279,11 +279,10 @@ impl FileOps for KernfsFops {
         let inode = file.get_inode().ok_or(KernelError::BadFd)?;
         let kn = knode(&inode).ok_or(KernelError::Io)?;
         if kn.is_dir() {
-            file.private.call_once(|| {
-                Arc::new(OpenDir {
-                    last: SpinMutex::new(None),
-                })
-            });
+            let od = try_arc(OpenDir {
+                last: SpinMutex::new(None),
+            })?;
+            file.private.call_once(|| od);
             return Ok(());
         }
         if !matches!(kn.kind, Kind::Attr(_) | Kind::Bin(_)) {
@@ -302,7 +301,8 @@ impl FileOps for KernfsFops {
             buf: Mutex::new(None),
             event: AtomicU32::new(attr_node(&kn).event.load(Ordering::Acquire)),
         };
-        file.private.call_once(|| Arc::new(of));
+        let of = try_arc(of)?;
+        file.private.call_once(|| of);
         Ok(())
     }
 

@@ -34,7 +34,6 @@
 //!   once negative); the deactivation bias is added only under the
 //!   rwsem (write), once per node. Drain waits on `KNode.drain` with no
 //!   lock held, woken when the count reaches the bias.
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 pub mod vfs;
 
@@ -48,6 +47,7 @@ use crate::sync::RwSem;
 use crate::sync::spin::RwLock;
 use crate::sync::waitqueue::WaitQueue;
 use crate::util::error::KernelError;
+use crate::util::kalloc::{arc_nofail, try_arc};
 
 /// Serializes changes to the tree's shape
 static KERNFS_RWSEM: RwSem<()> = RwSem::new(());
@@ -116,7 +116,7 @@ impl<F: Fn(&mut SysBuf) + Send + Sync> Attr for ShowFn<F> {
 
 /// Read-only attribute showing `f()`
 pub fn show(f: impl Fn(&mut SysBuf) + Send + Sync + 'static) -> Arc<dyn Attr> {
-    Arc::new(ShowFn(f))
+    arc_nofail(ShowFn(f))
 }
 
 /// An attribute node's state
@@ -201,12 +201,12 @@ impl Drop for Active<'_> {
 }
 
 impl KNode {
-    fn new(name: &[u8], mode: u16, kind: Kind) -> Arc<Self> {
+    fn new(name: &[u8], mode: u16, kind: Kind) -> Self {
         Self::new_ns(name, mode, kind, 0)
     }
 
-    fn new_ns(name: &[u8], mode: u16, kind: Kind, ns: u64) -> Arc<Self> {
-        Arc::new(Self {
+    fn new_ns(name: &[u8], mode: u16, kind: Kind, ns: u64) -> Self {
+        Self {
             name: RwLock::new(name.to_vec()),
             parent: RwLock::new(Weak::new()),
             mode,
@@ -215,12 +215,16 @@ impl KNode {
             kind,
             active: AtomicI32::new(0),
             drain: WaitQueue::new(),
-        })
+        }
     }
 
     /// A new root directory
     pub fn new_root() -> Arc<Self> {
-        Self::new(b"", 0o755, Kind::Dir(RwLock::new(BTreeMap::new())))
+        arc_nofail(Self::new(
+            b"",
+            0o755,
+            Kind::Dir(RwLock::new(BTreeMap::new())),
+        ))
     }
 
     pub fn name(&self) -> Vec<u8> {
@@ -338,7 +342,7 @@ impl KNode {
         ns: u64,
     ) -> Result<Arc<KNode>, KernelError> {
         let kind = Kind::Dir(RwLock::new(BTreeMap::new()));
-        self.add(Self::new_ns(name, mode, kind, ns))
+        self.add(try_arc(Self::new_ns(name, mode, kind, ns))?)
     }
 
     /// New attribute `name` with permission bits `mode`
@@ -353,7 +357,7 @@ impl KNode {
             event: AtomicU32::new(0),
             poll: WaitQueue::new(),
         };
-        self.add(Self::new(name, mode, Kind::Attr(a)))
+        self.add(try_arc(Self::new(name, mode, Kind::Attr(a)))?)
     }
 
     /// New binary attribute `name`
@@ -363,7 +367,7 @@ impl KNode {
         mode: u16,
         ops: Arc<dyn BinAttr>,
     ) -> Result<Arc<KNode>, KernelError> {
-        self.add(Self::new(name, mode, Kind::Bin(ops)))
+        self.add(try_arc(Self::new(name, mode, Kind::Bin(ops)))?)
     }
 
     /// New symlink `name` -> `target`
@@ -383,7 +387,7 @@ impl KNode {
         ns: u64,
     ) -> Result<Arc<KNode>, KernelError> {
         let kind = Kind::Link(Arc::downgrade(target));
-        self.add(Self::new_ns(name, 0o777, kind, ns))
+        self.add(try_arc(Self::new_ns(name, 0o777, kind, ns))?)
     }
 
     /// The subtree rooted here, parents first

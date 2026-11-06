@@ -494,7 +494,7 @@ pub fn create_inotify(in_flags: i32) -> Result<Arc<File>, KernelError> {
     }
 
     let file =
-        crate::fs::anon_inodes::anon_inode_getfile("inotify", &INOTIFY_FOPS, inotify, file_flags);
+        crate::fs::anon_inodes::anon_inode_getfile("inotify", &INOTIFY_FOPS, inotify, file_flags)?;
     Ok(file)
 }
 

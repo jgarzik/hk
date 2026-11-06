@@ -13,7 +13,6 @@
 //! - `/proc/<pid>/ns/user` - User namespace
 //!
 //! These files can be opened and passed to `setns(2)` to join namespaces.
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 mod array;
 mod mounts;
@@ -33,6 +32,7 @@ use super::inode::{AsAny, FileType, Inode, InodeData, InodeMode, InodeOps, Times
 use super::superblock::{FileSystemType, PROC_SUPER_MAGIC, StatFs, SuperBlock, SuperOps};
 use crate::task::Cred;
 use crate::task::Pid;
+use crate::util::kalloc::try_arc;
 
 /// Get current timestamp for new inodes
 /// Returns current wall-clock time from TIMEKEEPER if available, otherwise zero
@@ -466,13 +466,13 @@ impl InodeOps for ProcfsInodeOps {
                 // We detect root by checking if it's the procfs root (has static entries like "version")
                 if children.contains_key("version") {
                     if name == "self" {
-                        return Ok(create_self_link(dir));
+                        return create_self_link(dir);
                     }
                     // This is /proc root - check for numeric PID lookup
                     if let Ok(pid) = name.parse::<u64>()
                         && task_exists(pid)
                     {
-                        return Ok(create_pid_dir_inode(dir, pid));
+                        return create_pid_dir_inode(dir, pid);
                     }
                 }
 
@@ -493,11 +493,7 @@ impl InodeOps for ProcfsInodeOps {
             ProcfsInodeData::PidTaskDirectory { pid } => {
                 let tid: crate::task::Tid = name.parse().map_err(|_| KernelError::NotFound)?;
                 if group_threads(*pid).contains(&tid) {
-                    Ok(create_dir_inode(
-                        dir,
-                        pid_ino(tid, 0),
-                        ProcfsInodeData::new_pid_dir(*pid),
-                    ))
+                    create_dir_inode(dir, pid_ino(tid, 0), ProcfsInodeData::new_pid_dir(*pid))
                 } else {
                     Err(KernelError::NotFound)
                 }
@@ -536,9 +532,13 @@ fn group_threads(pid: Pid) -> alloc::vec::Vec<crate::task::Tid> {
 }
 
 /// A procfs directory inode (r-xr-xr-x, root) with `data`
-fn create_dir_inode(parent: &Inode, ino: u64, data: ProcfsInodeData) -> Arc<Inode> {
+fn create_dir_inode(
+    parent: &Inode,
+    ino: u64,
+    data: ProcfsInodeData,
+) -> Result<Arc<Inode>, KernelError> {
     let sb = parent.superblock().expect("superblock dropped");
-    let inode = Arc::new(Inode::new(
+    let inode = try_arc(Inode::new(
         ino,
         InodeMode::directory(0o555),
         0,
@@ -547,14 +547,14 @@ fn create_dir_inode(parent: &Inode, ino: u64, data: ProcfsInodeData) -> Arc<Inod
         current_time(),
         Arc::downgrade(&sb),
         &PROCFS_INODE_OPS,
-    ));
-    inode.set_private(Arc::new(ProcfsInodeWrapper(RwLock::new(data))));
-    inode
+    ))?;
+    inode.set_private(try_arc(ProcfsInodeWrapper(RwLock::new(data)))?);
+    Ok(inode)
 }
 
-fn create_pid_dir_inode(parent: &Inode, pid: Pid) -> Arc<Inode> {
+fn create_pid_dir_inode(parent: &Inode, pid: Pid) -> Result<Arc<Inode>, KernelError> {
     let sb = parent.superblock().expect("superblock dropped");
-    let inode = Arc::new(Inode::new(
+    let inode = try_arc(Inode::new(
         pid_ino(pid, 0),
         InodeMode::directory(0o555), // r-xr-xr-x
         0,                           // uid: root
@@ -563,11 +563,11 @@ fn create_pid_dir_inode(parent: &Inode, pid: Pid) -> Arc<Inode> {
         current_time(),
         Arc::downgrade(&sb),
         &PROCFS_INODE_OPS,
-    ));
-    inode.set_private(Arc::new(ProcfsInodeWrapper(RwLock::new(
+    ))?;
+    inode.set_private(try_arc(ProcfsInodeWrapper(RwLock::new(
         ProcfsInodeData::new_pid_dir(pid),
-    ))));
-    inode
+    )))?);
+    Ok(inode)
 }
 
 /// Look up entries in /proc/<pid>/
@@ -581,7 +581,7 @@ fn lookup_pid_entry(dir: &Inode, pid: Pid, name: &str) -> Result<Arc<Inode>, Ker
         "ns" => {
             // Create /proc/<pid>/ns directory
             let sb = dir.superblock().ok_or(KernelError::Io)?;
-            let inode = Arc::new(Inode::new(
+            let inode = try_arc(Inode::new(
                 pid_ino(pid, 1),
                 InodeMode::directory(0o555), // r-xr-xr-x
                 0,
@@ -590,16 +590,16 @@ fn lookup_pid_entry(dir: &Inode, pid: Pid, name: &str) -> Result<Arc<Inode>, Ker
                 current_time(),
                 Arc::downgrade(&sb),
                 &PROCFS_INODE_OPS,
-            ));
-            inode.set_private(Arc::new(ProcfsInodeWrapper(RwLock::new(
+            ))?;
+            inode.set_private(try_arc(ProcfsInodeWrapper(RwLock::new(
                 ProcfsInodeData::new_pid_ns_dir(pid),
-            ))));
+            )))?);
             Ok(inode)
         }
         "fd" => {
             // Create /proc/<pid>/fd directory
             let sb = dir.superblock().ok_or(KernelError::Io)?;
-            let inode = Arc::new(Inode::new(
+            let inode = try_arc(Inode::new(
                 pid_ino(pid, 100),           // offset 100 for fd dir
                 InodeMode::directory(0o500), // dr-x------ (only owner can read)
                 0,
@@ -608,21 +608,21 @@ fn lookup_pid_entry(dir: &Inode, pid: Pid, name: &str) -> Result<Arc<Inode>, Ker
                 current_time(),
                 Arc::downgrade(&sb),
                 &PROCFS_INODE_OPS,
-            ));
-            inode.set_private(Arc::new(ProcfsInodeWrapper(RwLock::new(
+            ))?;
+            inode.set_private(try_arc(ProcfsInodeWrapper(RwLock::new(
                 ProcfsInodeData::new_pid_fd_dir(pid),
-            ))));
+            )))?);
             Ok(inode)
         }
-        "task" => Ok(create_dir_inode(
+        "task" => create_dir_inode(
             dir,
             pid_ino(pid, 120),
             ProcfsInodeData::PidTaskDirectory { pid },
-        )),
+        ),
         "fdinfo" => {
             // Create /proc/<pid>/fdinfo directory
             let sb = dir.superblock().ok_or(KernelError::Io)?;
-            let inode = Arc::new(Inode::new(
+            let inode = try_arc(Inode::new(
                 pid_ino(pid, 101),           // offset 101 for fdinfo dir
                 InodeMode::directory(0o500), // dr-x------ (only owner can read)
                 0,
@@ -631,10 +631,10 @@ fn lookup_pid_entry(dir: &Inode, pid: Pid, name: &str) -> Result<Arc<Inode>, Ker
                 current_time(),
                 Arc::downgrade(&sb),
                 &PROCFS_INODE_OPS,
-            ));
-            inode.set_private(Arc::new(ProcfsInodeWrapper(RwLock::new(
+            ))?;
+            inode.set_private(try_arc(ProcfsInodeWrapper(RwLock::new(
                 ProcfsInodeData::new_pid_fdinfo_dir(pid),
-            ))));
+            )))?);
             Ok(inode)
         }
         name if PID_LINKS.iter().any(|(n, _, _)| *n == name) => {
@@ -643,7 +643,7 @@ fn lookup_pid_entry(dir: &Inode, pid: Pid, name: &str) -> Result<Arc<Inode>, Ker
                 .find(|(n, _, _)| *n == name)
                 .ok_or(KernelError::NotFound)?;
             let sb = dir.superblock().ok_or(KernelError::Io)?;
-            let inode = Arc::new(Inode::new(
+            let inode = try_arc(Inode::new(
                 pid_ino(pid, off),
                 InodeMode::symlink(),
                 0,
@@ -652,17 +652,17 @@ fn lookup_pid_entry(dir: &Inode, pid: Pid, name: &str) -> Result<Arc<Inode>, Ker
                 current_time(),
                 Arc::downgrade(&sb),
                 &PROCFS_INODE_OPS,
-            ));
-            inode.set_private(Arc::new(ProcfsInodeWrapper(RwLock::new(
+            ))?;
+            inode.set_private(try_arc(ProcfsInodeWrapper(RwLock::new(
                 ProcfsInodeData::PidLink { pid, target },
-            ))));
+            )))?);
             Ok(inode)
         }
         name if pid_file(name).is_some() => {
             let (off, mode, generator) = pid_file(name).ok_or(KernelError::NotFound)?;
             let sb = dir.superblock().ok_or(KernelError::Io)?;
             let (uid, gid) = dump_owner(pid);
-            let inode = Arc::new(Inode::new(
+            let inode = try_arc(Inode::new(
                 pid_ino(pid, off),
                 InodeMode::regular(mode),
                 uid,
@@ -671,10 +671,10 @@ fn lookup_pid_entry(dir: &Inode, pid: Pid, name: &str) -> Result<Arc<Inode>, Ker
                 current_time(),
                 Arc::downgrade(&sb),
                 &PROCFS_INODE_OPS,
-            ));
-            inode.set_private(Arc::new(ProcfsInodeWrapper(RwLock::new(
+            ))?;
+            inode.set_private(try_arc(ProcfsInodeWrapper(RwLock::new(
                 ProcfsInodeData::new_pid_file(pid, generator),
-            ))));
+            )))?);
             Ok(inode)
         }
         _ => Err(KernelError::NotFound),
@@ -702,7 +702,7 @@ fn lookup_pid_ns_entry(dir: &Inode, pid: Pid, name: &str) -> Result<Arc<Inode>, 
         NamespaceType::Net => 7,
     };
 
-    let inode = Arc::new(Inode::new(
+    let inode = try_arc(Inode::new(
         pid_ino(pid, offset),
         InodeMode::regular(0o444), // r--r--r--
         0,
@@ -711,17 +711,17 @@ fn lookup_pid_ns_entry(dir: &Inode, pid: Pid, name: &str) -> Result<Arc<Inode>, 
         current_time(),
         Arc::downgrade(&sb),
         &PROCFS_INODE_OPS,
-    ));
-    inode.set_private(Arc::new(ProcfsInodeWrapper(RwLock::new(
+    ))?;
+    inode.set_private(try_arc(ProcfsInodeWrapper(RwLock::new(
         ProcfsInodeData::new_ns_file(pid, ns_type),
-    ))));
+    )))?);
     Ok(inode)
 }
 
 /// /proc/self (resolved at readlink time to the reader's pid)
-fn create_self_link(parent: &Inode) -> Arc<Inode> {
+fn create_self_link(parent: &Inode) -> Result<Arc<Inode>, KernelError> {
     let sb = parent.superblock().expect("superblock dropped");
-    let inode = Arc::new(Inode::new(
+    let inode = try_arc(Inode::new(
         pid_ino(0, 999),
         InodeMode::symlink(),
         0,
@@ -730,11 +730,11 @@ fn create_self_link(parent: &Inode) -> Arc<Inode> {
         current_time(),
         Arc::downgrade(&sb),
         &PROCFS_INODE_OPS,
-    ));
-    inode.set_private(Arc::new(ProcfsInodeWrapper(RwLock::new(
+    ))?;
+    inode.set_private(try_arc(ProcfsInodeWrapper(RwLock::new(
         ProcfsInodeData::SelfLink,
-    ))));
-    inode
+    )))?);
+    Ok(inode)
 }
 
 /// Target of /proc/<pid>/fd/<fd>: `socket:[ino]` / `pipe:[ino]` for
@@ -790,7 +790,7 @@ fn lookup_pid_fd_entry(dir: &Inode, pid: Pid, name: &str) -> Result<Arc<Inode>, 
 
     // Create symlink inode for /proc/<pid>/fd/<n>
     let sb = dir.superblock().ok_or(KernelError::Io)?;
-    let inode = Arc::new(Inode::new(
+    let inode = try_arc(Inode::new(
         pid_ino(pid, FD_INO + fd as u64), // fd symlinks
         InodeMode::symlink(),             // lrwxrwxrwx
         0,
@@ -799,10 +799,10 @@ fn lookup_pid_fd_entry(dir: &Inode, pid: Pid, name: &str) -> Result<Arc<Inode>, 
         current_time(),
         Arc::downgrade(&sb),
         &PROCFS_INODE_OPS,
-    ));
-    inode.set_private(Arc::new(ProcfsInodeWrapper(RwLock::new(
+    ))?;
+    inode.set_private(try_arc(ProcfsInodeWrapper(RwLock::new(
         ProcfsInodeData::new_fd_symlink(pid, fd),
-    ))));
+    )))?);
     Ok(inode)
 }
 
@@ -835,7 +835,7 @@ fn lookup_pid_fdinfo_entry(dir: &Inode, pid: Pid, name: &str) -> Result<Arc<Inod
 
     // Create regular file inode for /proc/<pid>/fdinfo/<n>
     let sb = dir.superblock().ok_or(KernelError::Io)?;
-    let inode = Arc::new(Inode::new(
+    let inode = try_arc(Inode::new(
         pid_ino(pid, FDINFO_INO + fd as u64), // fdinfo files
         InodeMode::regular(0o444),            // r--r--r--
         0,
@@ -844,10 +844,10 @@ fn lookup_pid_fdinfo_entry(dir: &Inode, pid: Pid, name: &str) -> Result<Arc<Inod
         current_time(),
         Arc::downgrade(&sb),
         &PROCFS_INODE_OPS,
-    ));
-    inode.set_private(Arc::new(ProcfsInodeWrapper(RwLock::new(
+    ))?;
+    inode.set_private(try_arc(ProcfsInodeWrapper(RwLock::new(
         ProcfsInodeData::new_fdinfo_file(pid, fd),
-    ))));
+    )))?);
     Ok(inode)
 }
 
@@ -1734,7 +1734,7 @@ impl SuperOps for ProcfsSuperOps {
         mode: InodeMode,
         i_op: &'static dyn InodeOps,
     ) -> Result<Arc<Inode>, KernelError> {
-        let inode = Arc::new(Inode::new(
+        let inode = try_arc(Inode::new(
             sb.alloc_ino(),
             mode,
             0, // uid: root owns all procfs entries
@@ -1743,12 +1743,12 @@ impl SuperOps for ProcfsSuperOps {
             current_time(),
             Arc::downgrade(sb),
             i_op,
-        ));
+        ))?;
 
         // Default to empty directory
-        inode.set_private(Arc::new(ProcfsInodeWrapper(RwLock::new(
+        inode.set_private(try_arc(ProcfsInodeWrapper(RwLock::new(
             ProcfsInodeData::new_dir(),
-        ))));
+        )))?);
 
         Ok(inode)
     }
@@ -1827,8 +1827,12 @@ fn sysctl_of(inode: &Inode) -> Option<&'static crate::sysctl::Ctl> {
 }
 
 /// A new procfs inode with `data`
-fn mk_inode(sb: &Arc<SuperBlock>, mode: InodeMode, data: ProcfsInodeData) -> Arc<Inode> {
-    let inode = Arc::new(Inode::new(
+fn mk_inode(
+    sb: &Arc<SuperBlock>,
+    mode: InodeMode,
+    data: ProcfsInodeData,
+) -> Result<Arc<Inode>, KernelError> {
+    let inode = try_arc(Inode::new(
         sb.alloc_ino(),
         mode,
         0,
@@ -1837,13 +1841,13 @@ fn mk_inode(sb: &Arc<SuperBlock>, mode: InodeMode, data: ProcfsInodeData) -> Arc
         current_time(),
         Arc::downgrade(sb),
         &PROCFS_INODE_OPS,
-    ));
-    inode.set_private(Arc::new(ProcfsInodeWrapper(RwLock::new(data))));
-    inode
+    ))?;
+    inode.set_private(try_arc(ProcfsInodeWrapper(RwLock::new(data)))?);
+    Ok(inode)
 }
 
 /// Child directory `name` of `dir`, created if missing
-fn subdir(sb: &Arc<SuperBlock>, dir: &Arc<Inode>, name: &str) -> Arc<Inode> {
+fn subdir(sb: &Arc<SuperBlock>, dir: &Arc<Inode>, name: &str) -> Result<Arc<Inode>, KernelError> {
     let private = dir.get_private().expect("procfs dir");
     let w = private
         .as_ref()
@@ -1853,27 +1857,27 @@ fn subdir(sb: &Arc<SuperBlock>, dir: &Arc<Inode>, name: &str) -> Arc<Inode> {
     let mut data = w.0.write();
     let children = data.children_mut().expect("procfs dir");
     if let Some(c) = children.get(name) {
-        return c.clone();
+        return Ok(c.clone());
     }
-    let d = mk_inode(sb, InodeMode::directory(0o555), ProcfsInodeData::new_dir());
+    let d = mk_inode(sb, InodeMode::directory(0o555), ProcfsInodeData::new_dir())?;
     children.insert(String::from(name), d.clone());
-    d
+    Ok(d)
 }
 
 /// /proc/sys from the sysctl tables
-fn build_sys(sb: &Arc<SuperBlock>, root: &Arc<Inode>) {
-    let sys = subdir(sb, root, "sys");
+fn build_sys(sb: &Arc<SuperBlock>, root: &Arc<Inode>) -> Result<(), KernelError> {
+    let sys = subdir(sb, root, "sys")?;
     for ctl in crate::sysctl::tables().iter().flat_map(|t| t.iter()) {
         let (dirs, name) = ctl.path.rsplit_once('/').unwrap_or(("", ctl.path));
         let mut d = sys.clone();
         for part in dirs.split('/').filter(|p| !p.is_empty()) {
-            d = subdir(sb, &d, part);
+            d = subdir(sb, &d, part)?;
         }
         let f = mk_inode(
             sb,
             InodeMode::regular(ctl.mode),
             ProcfsInodeData::Sysctl { ctl },
-        );
+        )?;
         let private = d.get_private().expect("procfs dir");
         let w = private
             .as_ref()
@@ -1884,6 +1888,7 @@ fn build_sys(sb: &Arc<SuperBlock>, root: &Arc<Inode>) {
             c.insert(String::from(name), f);
         }
     }
+    Ok(())
 }
 
 /// Mount function for procfs
@@ -1921,11 +1926,11 @@ fn procfs_mount(
     _opts: &[u8],
 ) -> Result<Arc<SuperBlock>, KernelError> {
     // Create superblock
-    let sb = SuperBlock::new(fs_type, &PROCFS_SUPER_OPS, 0);
+    let sb = SuperBlock::new(fs_type, &PROCFS_SUPER_OPS, 0)?;
     PROC_SBS.lock().push(Arc::downgrade(&sb));
 
     // Create root inode (directory)
-    let root_inode = Arc::new(Inode::new(
+    let root_inode = try_arc(Inode::new(
         sb.alloc_ino(),
         InodeMode::directory(0o555),
         0, // uid: root
@@ -1934,13 +1939,13 @@ fn procfs_mount(
         current_time(),
         Arc::downgrade(&sb),
         &PROCFS_INODE_OPS,
-    ));
-    root_inode.set_private(Arc::new(ProcfsInodeWrapper(RwLock::new(
+    ))?;
+    root_inode.set_private(try_arc(ProcfsInodeWrapper(RwLock::new(
         ProcfsInodeData::new_dir(),
-    ))));
+    )))?);
 
     // Create /proc/version
-    let version_inode = Arc::new(Inode::new(
+    let version_inode = try_arc(Inode::new(
         sb.alloc_ino(),
         InodeMode::regular(0o444),
         0, // uid: root
@@ -1949,32 +1954,32 @@ fn procfs_mount(
         current_time(),
         Arc::downgrade(&sb),
         &PROCFS_INODE_OPS,
-    ));
-    version_inode.set_private(Arc::new(ProcfsInodeWrapper(RwLock::new(
+    ))?;
+    version_inode.set_private(try_arc(ProcfsInodeWrapper(RwLock::new(
         ProcfsInodeData::new_file(gen_version),
-    ))));
+    )))?);
 
     // /proc/mounts -> self/mounts (Linux proc_symlink)
     let mounts_inode = mk_inode(
         &sb,
         InodeMode::symlink(),
         ProcfsInodeData::FixedLink(b"self/mounts"),
-    );
+    )?;
 
     let meminfo_inode = mk_inode(
         &sb,
         InodeMode::regular(0o444),
         ProcfsInodeData::new_file(gen_meminfo),
-    );
+    )?;
     let loadavg_inode = mk_inode(
         &sb,
         InodeMode::regular(0o444),
         ProcfsInodeData::new_file(crate::task::loadavg::proc_loadavg),
-    );
+    )?;
 
     // Create /proc/net (directory) with /proc/net/{dev,route}; contents follow
     // the reader's network namespace
-    let net_dir_inode = Arc::new(Inode::new(
+    let net_dir_inode = try_arc(Inode::new(
         sb.alloc_ino(),
         InodeMode::directory(0o555),
         0,
@@ -1983,9 +1988,9 @@ fn procfs_mount(
         current_time(),
         Arc::downgrade(&sb),
         &PROCFS_INODE_OPS,
-    ));
+    ))?;
     let mut net_dir = ProcfsInodeData::new_dir();
-    let net_dev_inode = Arc::new(Inode::new(
+    let net_dev_inode = try_arc(Inode::new(
         sb.alloc_ino(),
         InodeMode::regular(0o444),
         0,
@@ -1994,11 +1999,11 @@ fn procfs_mount(
         current_time(),
         Arc::downgrade(&sb),
         &PROCFS_INODE_OPS,
-    ));
-    net_dev_inode.set_private(Arc::new(ProcfsInodeWrapper(RwLock::new(
+    ))?;
+    net_dev_inode.set_private(try_arc(ProcfsInodeWrapper(RwLock::new(
         ProcfsInodeData::new_file(crate::net::proc::proc_net_dev),
-    ))));
-    let net_route_inode = Arc::new(Inode::new(
+    )))?);
+    let net_route_inode = try_arc(Inode::new(
         sb.alloc_ino(),
         InodeMode::regular(0o444),
         0,
@@ -2007,15 +2012,15 @@ fn procfs_mount(
         current_time(),
         Arc::downgrade(&sb),
         &PROCFS_INODE_OPS,
-    ));
-    net_route_inode.set_private(Arc::new(ProcfsInodeWrapper(RwLock::new(
+    ))?;
+    net_route_inode.set_private(try_arc(ProcfsInodeWrapper(RwLock::new(
         ProcfsInodeData::new_file(crate::net::proc::proc_net_route),
-    ))));
+    )))?);
     let net_arp_inode = mk_inode(
         &sb,
         InodeMode::regular(0o444),
         ProcfsInodeData::new_file(crate::net::arp::proc_net_arp),
-    );
+    )?;
     if let ProcfsInodeData::Directory { children } = &mut net_dir {
         children.insert(String::from("dev"), net_dev_inode);
         children.insert(String::from("route"), net_route_inode);
@@ -2024,28 +2029,28 @@ fn procfs_mount(
             &sb,
             InodeMode::regular(0o444),
             ProcfsInodeData::new_file(crate::net::udp::proc_net_udp),
-        );
+        )?;
         children.insert(String::from("udp"), udp);
         let tcp = mk_inode(
             &sb,
             InodeMode::regular(0o444),
             ProcfsInodeData::new_file(crate::net::tcp::info::proc_net_tcp),
-        );
+        )?;
         children.insert(String::from("tcp"), tcp);
         let unix = mk_inode(
             &sb,
             InodeMode::regular(0o444),
             ProcfsInodeData::new_file(crate::net::unix::proc_net_unix),
-        );
+        )?;
         children.insert(String::from("unix"), unix);
         let packet = mk_inode(
             &sb,
             InodeMode::regular(0o444),
             ProcfsInodeData::new_file(crate::net::packet::proc_net_packet),
-        );
+        )?;
         children.insert(String::from("packet"), packet);
     }
-    net_dir_inode.set_private(Arc::new(ProcfsInodeWrapper(RwLock::new(net_dir))));
+    net_dir_inode.set_private(try_arc(ProcfsInodeWrapper(RwLock::new(net_dir)))?);
 
     // Add files to root directory
     {
@@ -2065,22 +2070,22 @@ fn procfs_mount(
                 &sb,
                 InodeMode::regular(0o400),
                 ProcfsInodeData::new_file(crate::mm::slab::slabinfo),
-            );
+            )?;
             children.insert(String::from("slabinfo"), slabinfo);
             children.insert(String::from("net"), net_dir_inode);
             let parts = mk_inode(
                 &sb,
                 InodeMode::regular(0o444),
                 ProcfsInodeData::new_file(crate::block::genhd::proc_partitions),
-            );
+            )?;
             children.insert(String::from("partitions"), parts);
         }
     }
 
-    build_sys(&sb, &root_inode);
+    build_sys(&sb, &root_inode)?;
 
     // Create root dentry
-    let root_dentry = Arc::new(Dentry::new_root(root_inode, Arc::downgrade(&sb)));
+    let root_dentry = try_arc(Dentry::new_root(root_inode, Arc::downgrade(&sb)))?;
 
     // Set root in superblock
     sb.set_root(root_dentry);

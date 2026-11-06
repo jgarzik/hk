@@ -13,7 +13,6 @@
 //! One inode, a directory with no entries that nothing can change
 //! (Linux make_empty_dir_inode plus S_IMMUTABLE): lookups find nothing,
 //! creating or changing anything is EPERM.
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::sync::Arc;
 
@@ -24,6 +23,7 @@ use super::file::{DirContext, DirEntry, File, FileOps};
 use super::inode::{FileType, Inode, InodeMode, InodeOps};
 use super::superblock::{FileSystemType, StatFs, SuperBlock, SuperOps};
 use crate::task::Cred;
+use crate::util::kalloc::try_arc;
 
 /// statfs f_type (Linux NULL_FS_MAGIC, "NULL")
 pub const NULL_FS_MAGIC: u64 = 0x4E55_4C4C;
@@ -110,8 +110,8 @@ static NULLFS_FILE_OPS: NullfsFileOps = NullfsFileOps;
 /// A new instance (Linux nullfs_fs_fill_super): the root is inode 1,
 /// mode 0555, owned by root
 fn mount(fs_type: &'static FileSystemType, _opts: &[u8]) -> Result<Arc<SuperBlock>, KernelError> {
-    let sb = SuperBlock::new(fs_type, &NULLFS_SUPER_OPS, 0);
-    let root = Arc::new(Inode::new(
+    let sb = SuperBlock::new(fs_type, &NULLFS_SUPER_OPS, 0)?;
+    let root = try_arc(Inode::new(
         1,
         InodeMode::directory(0o555),
         0,
@@ -120,8 +120,8 @@ fn mount(fs_type: &'static FileSystemType, _opts: &[u8]) -> Result<Arc<SuperBloc
         crate::time::TIMEKEEPER.current_time(),
         Arc::downgrade(&sb),
         &NULLFS_INODE_OPS,
-    ));
-    sb.set_root(Arc::new(Dentry::new_root(root, Arc::downgrade(&sb))));
+    ))?;
+    sb.set_root(try_arc(Dentry::new_root(root, Arc::downgrade(&sb)))?);
     Ok(sb)
 }
 

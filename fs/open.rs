@@ -1,5 +1,4 @@
 //! File open/close syscalls
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::sync::Arc;
 
@@ -15,6 +14,7 @@ use super::flags::{
 use super::mount::MNT_NODEV;
 use super::syscall::{current_fd_table, get_nofile_limit};
 use crate::task::FD_CLOEXEC;
+use crate::util::kalloc::try_arc;
 
 /// Create regular file `name` in `parent` for O_CREAT (Linux
 /// lookup_open + may_o_create) under the parent's lock: an entry that
@@ -43,7 +43,7 @@ fn create_in(
         dac::may_create(&c, &dir)?;
         let perm = dac::create_mode(&c, &dir, (mode & 0o7777) as u16);
         let inode = dir.i_op.create(&dir, name, InodeMode::regular(perm))?;
-        let d = Dentry::alloc(parent, name, Some(inode));
+        let d = Dentry::alloc(parent, name, Some(inode))?;
         Ok((d, true))
     })()
 }
@@ -206,7 +206,7 @@ fn filp_open(dirfd: i32, path: &[u8], flags: u32, mode: u32) -> Result<Arc<File>
         file.i_write = iw;
     }
     f_op.open(&file)?;
-    Ok(Arc::new(file))
+    try_arc(file)
 }
 
 /// Give init /dev/console as stdin, stdout and stderr (Linux

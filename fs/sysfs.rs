@@ -4,7 +4,6 @@
 //! shows the nodes tagged with that namespace (net devices) besides the
 //! untagged ones (Linux sysfs_get_tree: kobj_ns_grab_current(NET)).
 //! Subsystems hang their directories off `root()` as they initialize.
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
@@ -17,6 +16,7 @@ use super::inode::{Inode, InodeMode, InodeOps};
 use super::kernfs::{self, KNode};
 use super::superblock::{FileSystemType, StatFs, SuperBlock, SuperOps, fs_flags};
 use crate::sync::spin::Mutex;
+use crate::util::kalloc::try_arc;
 
 /// Linux SYSFS_MAGIC
 pub const SYSFS_MAGIC: u64 = 0x6265_6572;
@@ -76,10 +76,10 @@ fn mount(t: &'static FileSystemType, _opts: &[u8]) -> Result<Arc<SuperBlock>, Ke
     {
         return Ok(sb);
     }
-    let sb = SuperBlock::new(t, &SYSFS_SOPS, 0);
-    sb.set_private(Arc::new(kernfs::vfs::KfSuper { ns }));
-    let ri = kernfs::vfs::inode(&sb, root());
-    sb.set_root(Arc::new(Dentry::new_root(ri, Arc::downgrade(&sb))));
+    let sb = SuperBlock::new(t, &SYSFS_SOPS, 0)?;
+    sb.set_private(try_arc(kernfs::vfs::KfSuper { ns })?);
+    let ri = kernfs::vfs::inode(&sb, root())?;
+    sb.set_root(try_arc(Dentry::new_root(ri, Arc::downgrade(&sb)))?);
     sbs.push((ns, Arc::downgrade(&sb)));
     Ok(sb)
 }
