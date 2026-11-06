@@ -24,7 +24,7 @@ use crate::util::kalloc::try_arc;
 use alloc::sync::Arc;
 
 use super::fault::VmFault;
-use super::xarray::{XArray, node_alloc};
+use super::xarray::{Preload, XArray};
 use crate::FRAME_ALLOCATOR;
 use crate::sync::spin::Mutex;
 
@@ -64,16 +64,36 @@ impl Shmem {
         if idx >= self.size {
             return Err(VmFault::Bus);
         }
+        {
+            let root = self.root.lock();
+            let page = root.load(idx);
+            if page != 0 {
+                // The object holds a reference until `root` is unlocked
+                let held = FRAME_ALLOCATOR.incref(page);
+                debug_assert!(held);
+                return Ok(page);
+            }
+        }
+        // A new page and the tree nodes to store it are allocated with
+        // no spin lock held (both may reclaim), then stored unless a
+        // racing fault stored one first (Linux shmem_alloc_and_add_folio)
+        let new = zeroed().ok_or(VmFault::Oom)?;
+        let Some(mut pre) = Preload::new() else {
+            FRAME_ALLOCATOR.free(new);
+            return Err(VmFault::Oom);
+        };
         let mut root = self.root.lock();
         let mut page = root.load(idx);
         if page == 0 {
-            page = zeroed().ok_or(VmFault::Oom)?;
-            if root.store(idx, page, &mut node_alloc).is_none() {
-                FRAME_ALLOCATOR.free(page);
+            if root.store(idx, new, &mut || pre.take()).is_none() {
+                drop(root);
+                FRAME_ALLOCATOR.free(new);
                 return Err(VmFault::Oom);
             }
+            page = new;
+        } else {
+            FRAME_ALLOCATOR.free(new);
         }
-        // The object holds a reference until `root` is unlocked
         let held = FRAME_ALLOCATOR.incref(page);
         debug_assert!(held);
         Ok(page)

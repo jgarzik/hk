@@ -641,7 +641,7 @@ The heap picks GFP_ATOMIC by itself under a spin lock, so an allocation
 there takes the atomic reserve silently (Linux needs it named, and
 might_alloc reports a GFP_KERNEL one in atomic context). A LOCKDEP boot
 lists each lock allocated under once (`LOCKDEP:ATOMIC_ALLOC ... under
-<lock> (taken at ...)`; the shutdown summary counts them): 127 locks,
+<lock> (taken at ...)`; the shutdown summary counts them): 125 locks,
 about 45 in fs, 31 in net, 7 each in task and ipc, mostly collections
 grown under spin mutexes. Each wants its allocation moved out of the
 lock (preallocate, or a sleeping lock as in Linux).

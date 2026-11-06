@@ -296,14 +296,29 @@ fn find_swap_by_path(path: &[u8]) -> Option<u8> {
 /// blocks at swapon and bypasses the filesystem)
 pub fn get_swap_page() -> Option<SwapEntry> {
     let reclaiming = crate::task::percpu::current().has_flag(crate::task::pf::MEMALLOC);
-    let devs: Vec<Arc<SwapInfo>> = SWAP_INFO.read().iter().flatten().cloned().collect();
-    let mut devs: Vec<_> = devs
-        .into_iter()
-        .filter(|s| s.writeok() && !(reclaiming && s.inode.is_some()))
-        .collect();
-    devs.sort_by_key(|s| core::cmp::Reverse(s.priority));
-    devs.iter()
-        .find_map(|si| si.alloc_slot().map(|off| SwapEntry::new(si.swap_type, off)))
+    // A copy of the table (no allocation under its lock), then the
+    // usable devices in priority order
+    let mut devs = SWAP_INFO.read().clone();
+    for d in devs.iter_mut() {
+        if d.as_ref()
+            .is_some_and(|s| !s.writeok() || (reclaiming && s.inode.is_some()))
+        {
+            *d = None;
+        }
+    }
+    loop {
+        let best = devs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, d)| d.as_ref().map(|s| (i, s.priority)))
+            // Equal priorities: the lower type first, as before
+            .max_by_key(|&(i, p)| (p, core::cmp::Reverse(i)))?
+            .0;
+        let si = devs[best].take()?;
+        if let Some(off) = si.alloc_slot() {
+            return Some(SwapEntry::new(si.swap_type, off));
+        }
+    }
 }
 
 /// One more swap PTE references `e` (Linux swap_duplicate: fork, and
