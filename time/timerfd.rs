@@ -30,8 +30,8 @@ use core::pin::Pin;
 
 use crate::arch::IrqSpinlock;
 use crate::fs::KernelError;
-use crate::fs::file::{File, FileOps, RwFlags, flags, stream_rw};
-use crate::fs::iov_iter::{IovDest, IovSource};
+use crate::fs::file::{File, FileOps, RwFlags, flags, nowait_rw};
+use crate::fs::iov_iter::IovDest;
 use crate::io::poll::{POLLIN, POLLRDNORM, PollTable};
 use crate::sync::waitqueue::WaitQueue;
 use crate::time::hrtimer::{HRTIMER_HARD, HrClock, HrTimer};
@@ -429,27 +429,14 @@ impl FileOps for TimerfdFileOps {
         at: Option<u64>,
         flags: RwFlags,
     ) -> Result<usize, KernelError> {
-        stream_rw(at, flags)?;
+        let nb = nowait_rw(file, at, flags)?;
         let timerfd = file.private_ref::<Timerfd>().ok_or(KernelError::BadFd)?;
         if to.len() < 8 {
             return Err(KernelError::InvalidArgument);
         }
-        let nonblock = file.get_flags() & flags::O_NONBLOCK != 0;
-        let count = timerfd.read(nonblock)?;
+        let count = timerfd.read(nb)?;
         to.copy_to_full(&count.to_le_bytes())?;
         Ok(8)
-    }
-
-    /// Not writable
-    fn write_iter(
-        &self,
-        _file: &File,
-        _from: &mut IovSource<'_>,
-        at: Option<u64>,
-        flags: RwFlags,
-    ) -> Result<usize, KernelError> {
-        stream_rw(at, flags)?;
-        Err(KernelError::InvalidArgument)
     }
 
     fn poll(&self, file: &File, pt: Option<&mut PollTable<'_>>) -> u16 {

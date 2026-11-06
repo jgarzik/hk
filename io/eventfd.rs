@@ -28,7 +28,7 @@ use alloc::sync::Arc;
 
 use crate::arch::IrqSpinlock;
 use crate::fs::KernelError;
-use crate::fs::file::{File, FileOps, RwFlags, flags, stream_rw};
+use crate::fs::file::{File, FileOps, RwFlags, flags, nowait_rw};
 use crate::fs::iov_iter::{IovDest, IovSource};
 use crate::io::poll::{POLLERR, POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM, PollTable};
 use crate::sync::waitqueue::WaitQueue;
@@ -174,10 +174,6 @@ impl Eventfd {
 /// File operations for eventfd
 pub struct EventfdFileOps;
 
-fn nonblock(file: &File) -> bool {
-    file.get_flags() & flags::O_NONBLOCK != 0
-}
-
 static EVENTFD_FOPS: EventfdFileOps = EventfdFileOps;
 
 impl FileOps for EventfdFileOps {
@@ -194,12 +190,12 @@ impl FileOps for EventfdFileOps {
         at: Option<u64>,
         flags: RwFlags,
     ) -> Result<usize, KernelError> {
-        stream_rw(at, flags)?;
+        let nb = nowait_rw(file, at, flags)?;
         let eventfd = file.private_ref::<Eventfd>().ok_or(KernelError::BadFd)?;
         if to.len() < 8 {
             return Err(KernelError::InvalidArgument);
         }
-        let count = eventfd.read(nonblock(file))?;
+        let count = eventfd.read(nb)?;
         to.copy_to_full(&count.to_le_bytes())?;
         Ok(8)
     }
@@ -212,14 +208,14 @@ impl FileOps for EventfdFileOps {
         at: Option<u64>,
         flags: RwFlags,
     ) -> Result<usize, KernelError> {
-        stream_rw(at, flags)?;
+        let nb = nowait_rw(file, at, flags)?;
         let eventfd = file.private_ref::<Eventfd>().ok_or(KernelError::BadFd)?;
         if from.len() < 8 {
             return Err(KernelError::InvalidArgument);
         }
         let mut v = [0u8; 8];
         from.copy_from_full(&mut v)?;
-        eventfd.write(u64::from_le_bytes(v), nonblock(file))
+        eventfd.write(u64::from_le_bytes(v), nb)
     }
 
     fn poll(&self, file: &File, pt: Option<&mut PollTable<'_>>) -> u16 {

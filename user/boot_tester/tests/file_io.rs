@@ -30,6 +30,8 @@
 //!   bytes done
 //! - SYSCTL_PARTIAL_FAULT: a sysctl write whose data faults partway is
 //!   EFAULT and stores nothing
+//! - RWF_NOWAIT_STREAMS: preadv2 RWF_NOWAIT on an empty eventfd, timerfd
+//!   or socket is EAGAIN (Linux FMODE_NOWAIT), not EOPNOTSUPP
 //! - RW_STRADDLE: read/write with one buffer running off mapped memory
 //!   mid-page move the mapped part and return its length
 
@@ -76,6 +78,7 @@ pub fn run_tests() {
     test_write_own_map();
     test_iov_partial_fault();
     test_rw_straddle();
+    test_rwf_nowait_streams();
     test_sysctl_partial_fault();
     test_getrandom();
     test_getrandom_einval();
@@ -1851,6 +1854,38 @@ fn test_sysctl_partial_fault() {
         print_num(nb);
         print(b" ");
         print_num(na);
+        println(b"");
+    }
+}
+
+/// RWF_NOWAIT on files Linux marks FMODE_NOWAIT (eventfd, timerfd,
+/// sockets): an empty one is EAGAIN without blocking
+fn test_rwf_nowait_streams() {
+    let mut buf = [0u8; 8];
+    let iov = [IoVec {
+        iov_base: buf.as_mut_ptr(),
+        iov_len: 8,
+    }];
+    let efd = hk_syscall::sys_eventfd2(0, 0);
+    let e = sys_preadv2(efd as i32, iov.as_ptr(), 1, -1, RWF_NOWAIT);
+    sys_close(efd as u64);
+    let tfd = hk_syscall::sys_timerfd_create(1, 0);
+    let t = sys_preadv2(tfd as i32, iov.as_ptr(), 1, -1, RWF_NOWAIT);
+    sys_close(tfd as u64);
+    let mut sv = [0i32; 2];
+    hk_syscall::sys_socketpair(1, 1, 0, &mut sv);
+    let k = sys_preadv2(sv[0], iov.as_ptr(), 1, -1, RWF_NOWAIT);
+    sys_close(sv[0] as u64);
+    sys_close(sv[1] as u64);
+    if e == -11 && t == -11 && k == -11 {
+        println(b"RWF_NOWAIT_STREAMS:OK");
+    } else {
+        print(b"RWF_NOWAIT_STREAMS:FAIL eventfd ");
+        print_num(e);
+        print(b" timerfd ");
+        print_num(t);
+        print(b" socket ");
+        print_num(k);
         println(b"");
     }
 }

@@ -22,7 +22,7 @@ use core::sync::atomic::Ordering;
 
 use crate::arch::Uaccess;
 use crate::fs::dentry::Dentry;
-use crate::fs::file::{File, FileOps, RwFlags, flags as fflags, stream_rw};
+use crate::fs::file::{File, FileOps, RwFlags, flags as fflags, nowait_rw};
 use crate::fs::inode::{AsAny, Inode, InodeData, InodeMode, NULL_INODE_OPS};
 use crate::fs::iov_iter::{IovDest, IovSource};
 use crate::io::poll::PollTable;
@@ -289,10 +289,10 @@ impl FileOps for SockFile {
         at: Option<u64>,
         flags: RwFlags,
     ) -> Result<usize, KernelError> {
-        stream_rw(at, flags)?;
+        let nb = nowait_rw(file, at, flags)?;
         let s = sock_of(file).ok_or(KernelError::NotSocket)?;
         let mut m = RecvMsg::new(Dst::iter(to), false, 0);
-        let r = s.recvmsg(&mut m, file_nb(file, 0));
+        let r = s.recvmsg(&mut m, if nb { MSG_DONTWAIT } else { 0 });
         m.data.restore(to);
         r
     }
@@ -306,14 +306,14 @@ impl FileOps for SockFile {
         at: Option<u64>,
         flags: RwFlags,
     ) -> Result<usize, KernelError> {
-        stream_rw(at, flags)?;
+        let nb = nowait_rw(file, at, flags)?;
         let s = sock_of(file).ok_or(KernelError::NotSocket)?;
         let mut m = SendMsg {
             addr: None,
             data: Src::iter(from),
             control: Vec::new(),
         };
-        let r = sock_sendmsg(&*s, &mut m, file_nb(file, 0));
+        let r = sock_sendmsg(&*s, &mut m, if nb { MSG_DONTWAIT } else { 0 });
         m.data.restore(from);
         crate::net::dev::netif_rx_flush_local();
         r

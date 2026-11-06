@@ -27,8 +27,8 @@ use alloc::sync::Arc;
 
 use crate::arch::IrqSpinlock;
 use crate::fs::KernelError;
-use crate::fs::file::{File, FileOps, RwFlags, flags, stream_rw};
-use crate::fs::iov_iter::{IovDest, IovSource};
+use crate::fs::file::{File, FileOps, RwFlags, flags, nowait_rw};
+use crate::fs::iov_iter::IovDest;
 use crate::io::poll::{POLLIN, POLLRDNORM, PollTable};
 use crate::signal::{SigSet, UNMASKABLE_SIGNALS, with_task_signal_state};
 use crate::task::percpu::current_tid;
@@ -280,22 +280,9 @@ impl FileOps for SignalfdFileOps {
         at: Option<u64>,
         flags: RwFlags,
     ) -> Result<usize, KernelError> {
-        stream_rw(at, flags)?;
+        let nb = nowait_rw(file, at, flags)?;
         let signalfd = file.private_ref::<Signalfd>().ok_or(KernelError::BadFd)?;
-        let nonblock = file.get_flags() & flags::O_NONBLOCK != 0;
-        signalfd.read(to, nonblock)
-    }
-
-    /// A signalfd is not writable
-    fn write_iter(
-        &self,
-        _file: &File,
-        _from: &mut IovSource<'_>,
-        at: Option<u64>,
-        flags: RwFlags,
-    ) -> Result<usize, KernelError> {
-        stream_rw(at, flags)?;
-        Err(KernelError::InvalidArgument)
+        signalfd.read(to, nb)
     }
 
     fn poll(&self, file: &File, pt: Option<&mut PollTable<'_>>) -> u16 {
