@@ -68,6 +68,7 @@ pub fn run_tests() {
     test_tgkill_wrong_tgid();
     test_tkill_sig0();
     test_sigaction();
+    test_sigaction_same_buffer();
     test_sigaction_einval();
     test_sigaction_sigkill();
     test_clone_clear_sighand();
@@ -226,6 +227,29 @@ fn test_sigaction() {
     } else {
         print(b"SIGACTION:FAIL: ret = ");
         print_num(ret);
+    }
+}
+
+/// rt_sigaction with one buffer for act and oact (Linux reads act
+/// before writing oact): the new action is installed, the old returned
+fn test_sigaction_same_buffer() {
+    const SIGUSR2: u32 = 12;
+    let mut sa: [u64; 4] = [1, 0, 0, 0]; // SIG_IGN
+    let p = sa.as_mut_ptr() as u64;
+    let r = sys_rt_sigaction(SIGUSR2, p, p, 8);
+    let old = sa[0];
+    let mut now: [u64; 4] = [0; 4];
+    sys_rt_sigaction(SIGUSR2, 0, now.as_mut_ptr() as u64, 8);
+    let dfl: [u64; 4] = [0; 4];
+    sys_rt_sigaction(SIGUSR2, dfl.as_ptr() as u64, 0, 8);
+    if r == 0 && old == 0 && now[0] == 1 {
+        println(b"SIGACTION_SAME_BUF:OK");
+    } else {
+        print(b"SIGACTION_SAME_BUF:FAIL: old ");
+        print_num(old as i64);
+        print(b" installed ");
+        print_num(now[0] as i64);
+        println(b"");
     }
 }
 

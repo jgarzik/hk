@@ -17,7 +17,7 @@ use crate::signal::{
     send_signal_to_process, with_task_signal_state,
 };
 use crate::task::percpu::{current_pgid, current_tid, get_all_pids};
-use crate::uaccess::{get_user, put_user};
+use crate::uaccess::{UserPtr, get_user, put_user};
 use crate::util::error::KernelError;
 
 /// SIG_BLOCK - Add signals to blocked mask
@@ -42,6 +42,13 @@ pub struct UserSigAction {
     /// Signals to block during handler
     pub sa_mask: u64, // sigset_t is 64-bit
 }
+
+crate::pod!(UserSigAction {
+    sa_handler,
+    sa_flags,
+    sa_restorer,
+    sa_mask,
+});
 
 impl From<&SigAction> for UserSigAction {
     fn from(action: &SigAction) -> Self {
@@ -91,66 +98,40 @@ pub fn sys_rt_sigaction(sig: u32, act_ptr: u64, oact_ptr: u64, sigsetsize: u64) 
         return -22; // EINVAL
     }
 
-    let tid = current_tid();
-    let sighand = match get_task_sighand(tid) {
-        Some(sh) => sh,
-        None => return -3, // ESRCH
+    // The new action is read before the old one is written (Linux
+    // copy_from_user, do_sigaction, copy_to_user): act and oact may be
+    // one buffer
+    let new = if act_ptr != 0 {
+        match UserPtr::<UserSigAction>::new(act_ptr).read() {
+            Ok(a) => Some(SigAction::from(a)),
+            Err(_) => return -14, // EFAULT
+        }
+    } else {
+        None
     };
 
-    // Get old action if requested
-    if oact_ptr != 0 && sighand.get_action(sig).is_some() {
-        let old_action = sighand.get_action(sig).unwrap();
-        let user_action: UserSigAction = (&old_action).into();
-
-        // Write to user space as raw bytes
-        if put_user::<Uaccess, u64>(oact_ptr, user_action.sa_handler).is_err() {
-            return -14; // EFAULT
-        }
-        if put_user::<Uaccess, u64>(oact_ptr + 8, user_action.sa_flags).is_err() {
-            return -14; // EFAULT
-        }
-        if put_user::<Uaccess, u64>(oact_ptr + 16, user_action.sa_restorer).is_err() {
-            return -14; // EFAULT
-        }
-        if put_user::<Uaccess, u64>(oact_ptr + 24, user_action.sa_mask).is_err() {
-            return -14; // EFAULT
-        }
+    let tid = current_tid();
+    let Some(sighand) = get_task_sighand(tid) else {
+        return -3; // ESRCH
+    };
+    // The old action and the swap in one hold of the action lock
+    let old = match new {
+        Some(a) => match sighand.set_action(sig, a) {
+            Ok(old) => old,
+            Err(e) => return i64::from(e),
+        },
+        None => match sighand.get_action(sig) {
+            Some(a) => a,
+            None => return -22, // EINVAL
+        },
+    };
+    if oact_ptr != 0
+        && UserPtr::<UserSigAction>::new(oact_ptr)
+            .write(&UserSigAction::from(&old))
+            .is_err()
+    {
+        return -14; // EFAULT
     }
-
-    // Set new action if provided
-    if act_ptr != 0 {
-        // Read from user space
-        let sa_handler = match get_user::<Uaccess, u64>(act_ptr) {
-            Ok(v) => v,
-            Err(_) => return -14, // EFAULT
-        };
-        let sa_flags = match get_user::<Uaccess, u64>(act_ptr + 8) {
-            Ok(v) => v,
-            Err(_) => return -14, // EFAULT
-        };
-        let sa_restorer = match get_user::<Uaccess, u64>(act_ptr + 16) {
-            Ok(v) => v,
-            Err(_) => return -14, // EFAULT
-        };
-        let sa_mask = match get_user::<Uaccess, u64>(act_ptr + 24) {
-            Ok(v) => v,
-            Err(_) => return -14, // EFAULT
-        };
-
-        let user_action = UserSigAction {
-            sa_handler,
-            sa_flags,
-            sa_restorer,
-            sa_mask,
-        };
-
-        let new_action: SigAction = user_action.into();
-
-        if let Err(e) = sighand.set_action(sig, new_action) {
-            return i64::from(e);
-        }
-    }
-
     0
 }
 
