@@ -30,12 +30,12 @@
 //! thread context or, restarting, in the IRQ handler; `complete` in the
 //! IRQ handler or a polling submitter. Neither allocates nor sleeps.
 #![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
+use core::mem::MaybeUninit;
 
 use spin::Once;
 
@@ -49,6 +49,7 @@ use crate::hw::virtio::{self, VirtioDevice, VirtioDriver, VirtioIrq, Virtqueue};
 use crate::printkln;
 use crate::util::error::KernelError;
 use crate::util::ida::Ida;
+use crate::util::kalloc::{try_arc, try_box};
 
 /// Device-specific feature bits
 mod feature {
@@ -408,7 +409,7 @@ fn setup_queues(vdev: &Arc<VirtioDevice>) -> Result<(BlkMq, u16), KernelError> {
     for i in 0..nr_queues(vdev) {
         let vq = vdev.setup_vq(i)?;
         ring = ring.min(vq.num());
-        ops.push(Box::new(VbQueue::new(vdev, vq)?));
+        ops.push(try_box(VbQueue::new(vdev, vq)?)?);
     }
     if ring < 3 {
         return Err(KernelError::NoDevice);
@@ -421,9 +422,11 @@ fn new_disk(vdev: &Arc<VirtioDevice>) -> Result<Arc<Disk>, KernelError> {
         .try_call_once(|| register_blkdev(0, "virtblk"))
         .map_err(|_| KernelError::Io)?;
     let index = VdIndex(INDEX.alloc());
-    if index.0 as usize * VD_MINORS as usize > u16::MAX as usize - VD_MINORS as usize {
+    let i = index.0;
+    if i as usize * VD_MINORS as usize > u16::MAX as usize - VD_MINORS as usize {
         return Err(KernelError::Io);
     }
+    let private = try_box(index)?;
     let (mq, ring) = setup_queues(vdev)?;
     let nq = mq.nr_hw_queues();
     let lim = limits(vdev, ring);
@@ -431,14 +434,14 @@ fn new_disk(vdev: &Arc<VirtioDevice>) -> Result<Arc<Disk>, KernelError> {
     let cap = vdev.read_config(|d| d.cfg64(cfg::CAPACITY));
     let disk = Disk::new(
         major,
-        index.0 as u16 * VD_MINORS,
+        i as u16 * VD_MINORS,
         VD_MINORS,
-        disk_name("vd", index.0),
+        disk_name("vd", i),
         cap,
         RequestQueue::new_mq(mq, lim, wc),
         vdev.has_feature(feature::RO),
-    );
-    disk.private.call_once(|| Box::new(index));
+    )?;
+    disk.private.call_once(|| private);
     printkln!(
         "virtio-blk: {} {} sectors, {}/{} bytes, {} queues{}{}",
         disk.name,
@@ -472,11 +475,14 @@ impl VirtioDriver for VirtioBlkDriver {
         dev: &Arc<crate::base::Device>,
         vdev: Arc<VirtioDevice>,
     ) -> Result<Box<dyn crate::base::Bound>, KernelError> {
+        // The binding's memory first: nothing to undo should it fail
+        let slot = try_box(MaybeUninit::<VirtioBlkDev>::uninit())?;
         let disk = new_disk(&vdev)?;
-        let blk = Arc::new(VirtioBlk {
+        let blk = try_arc(VirtioBlk {
             vdev: vdev.clone(),
             disk: disk.clone(),
-        });
+        })
+        .inspect_err(|_| stop(&vdev, disk.queue.mq().map_or(Vec::new(), |m| m.release())))?;
         let fail = |e| {
             vdev.free_irq();
             stop(&vdev, disk.queue.mq().map_or(Vec::new(), |m| m.release()));
@@ -490,7 +496,7 @@ impl VirtioDriver for VirtioBlkDriver {
         if add_disk(disk.clone(), Some(dev)).is_err() {
             return Err(fail(KernelError::Io));
         }
-        Ok(Box::new(VirtioBlkDev(blk)))
+        Ok(Box::write(slot, VirtioBlkDev(blk)))
     }
 }
 

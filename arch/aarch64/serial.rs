@@ -3,13 +3,13 @@
 //! A polled driver for the ARM PL011 UART found in QEMU's virt machine
 //! and many real ARM platforms: the early console, and the tty ttyAMA0
 //! (Linux amba-pl011).
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use core::fmt;
 
 use crate::fs::chardev::{DevId, major};
 use crate::tty::{Tty, TtyDriver};
 use crate::util::error::KernelError;
+use crate::util::kalloc::{try_arc, try_box};
 use core::ptr::{read_volatile, write_volatile};
 
 /// PL011 UART base address on QEMU virt machine
@@ -210,7 +210,9 @@ fn pl011_irq(_irq: u32) -> bool {
 /// Take input by interrupt (Linux pl011_startup); `irq` is the GIC
 /// INTID. False without it
 fn rx_irq_init(irq: u32) -> bool {
-    let h = alloc::sync::Arc::new(crate::irq::IrqFn(pl011_irq));
+    let Ok(h) = try_arc(crate::irq::IrqFn(pl011_irq)) else {
+        return false;
+    };
     if let Err(e) = crate::arch::irq::register_irq_handler(irq, h, PL011_BASE) {
         crate::printkln!("ttyAMA0: no IRQ {}: {}", irq, e);
         return false;
@@ -320,9 +322,14 @@ impl crate::base::Bound for Pl011Port {
 fn pl011_probe(
     dev: &alloc::sync::Arc<crate::base::Device>,
 ) -> Result<alloc::boxed::Box<dyn crate::base::Bound>, crate::util::error::KernelError> {
+    // Allocated first, so ENOMEM leaves nothing registered
+    let mut port = try_box(Pl011Port {
+        irq: None,
+        tty: None,
+    })?;
     register_console();
     let irq = crate::base::platform::pdev(dev).and_then(|p| p.irq);
-    let irq = irq.filter(|&irq| rx_irq_init(irq));
-    let tty = crate::tty::tty_register_device(&TTY_AMA0, dev);
-    Ok(alloc::boxed::Box::new(Pl011Port { irq, tty }))
+    port.irq = irq.filter(|&irq| rx_irq_init(irq));
+    port.tty = crate::tty::tty_register_device(&TTY_AMA0, dev);
+    Ok(port)
 }

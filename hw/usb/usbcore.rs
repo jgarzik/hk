@@ -4,7 +4,6 @@
 //! usb_device driver "usb", whose probe adds the active
 //! configuration's interfaces `N-<port>:C.I` (DEVTYPE=usb_interface;
 //! Linux usb_set_configuration), and their attributes.
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::boxed::Box;
 use alloc::format;
@@ -19,6 +18,7 @@ use crate::base::{Bound, Device, DeviceInfo, Driver, device_create};
 use crate::fs::kernfs;
 use crate::printkln;
 use crate::util::error::KernelError;
+use crate::util::kalloc::{arc_nofail, try_arc, try_box};
 
 pub static USB_BUS: BusType =
     BusType::with_drv_attrs("usb", usb_match, Some(usb_uevent), Some(usb_drv_attrs));
@@ -88,8 +88,8 @@ impl crate::fs::kernfs::Attr for RemoveId {
 /// usb_create_newid_files)
 fn usb_drv_attrs(drv: &'static Driver, dir: &Arc<crate::fs::kernfs::KNode>) {
     if matches!(drv.ids.downcast_ref::<UsbIds>(), Some(UsbIds::Interface(_))) {
-        let _ = dir.create_file(b"new_id", 0o200, Arc::new(NewId(drv)));
-        let _ = dir.create_file(b"remove_id", 0o200, Arc::new(RemoveId(drv)));
+        let _ = dir.create_file(b"new_id", 0o200, arc_nofail(NewId(drv)));
+        let _ = dir.create_file(b"remove_id", 0o200, arc_nofail(RemoveId(drv)));
     }
 }
 
@@ -306,7 +306,7 @@ fn usb_new_device(
         parent: Some(parent),
         bus: Some(&USB_BUS),
         devtype: Some("usb_device"),
-        data: Some(Arc::new(node)),
+        data: Some(try_arc(node)?),
         attrs: Some(usb_dev_attrs),
         ..DeviceInfo::named(name)
     })
@@ -396,28 +396,31 @@ impl Bound for UsbGeneric {
 /// configuration itself was set at enumeration), each probed in turn
 fn generic_probe(dev: &Arc<Device>) -> Result<Box<dyn Bound>, KernelError> {
     let n = dev.data::<UsbDevNode>().ok_or(KernelError::NoDevice)?;
-    let mut intfs = Vec::new();
+    // Allocated first, so ENOMEM leaves nothing registered
+    let mut g = try_box(UsbGeneric { intfs: Vec::new() })?;
     if n.dev.config.value != 0 {
         for f in cur_altsettings(&n.dev.interfaces) {
             let name = format!(
                 "{}-{}:{}.{}",
                 n.busnum, n.devpath, n.dev.config.value, f.number
             );
-            let r = device_create(DeviceInfo {
-                parent: Some(dev),
-                bus: Some(&USB_BUS),
-                devtype: Some("usb_interface"),
-                data: Some(Arc::new(UsbIntfNode { intf: f.clone() })),
-                attrs: Some(usb_intf_attrs),
-                ..DeviceInfo::named(&name)
+            let r = try_arc(UsbIntfNode { intf: f.clone() }).and_then(|data| {
+                device_create(DeviceInfo {
+                    parent: Some(dev),
+                    bus: Some(&USB_BUS),
+                    devtype: Some("usb_interface"),
+                    data: Some(data),
+                    attrs: Some(usb_intf_attrs),
+                    ..DeviceInfo::named(&name)
+                })
             });
             match r {
-                Ok(i) => intfs.push(i),
+                Ok(i) => g.intfs.push(i),
                 Err(e) => printkln!("usb {}: interface add failed: {:?}", name, e),
             }
         }
     }
-    Ok(Box::new(UsbGeneric { intfs }))
+    Ok(g)
 }
 
 #[cfg(test)]

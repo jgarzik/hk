@@ -19,10 +19,10 @@
 //! (`VirtioDevice.irq`) are an `IrqSpinlock` leaf: set by
 //! `request_irq`, cleared by `free_irq` after the handler is
 //! unregistered, read (cloned) by the handler under `IRQ_TABLE`.
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
+use core::mem::MaybeUninit;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -35,6 +35,7 @@ use crate::hw::mmio::IoMem;
 use crate::hw::pci::{PciDevice, cap_id};
 use crate::printkln;
 use crate::util::error::KernelError;
+use crate::util::kalloc::{try_arc, try_box};
 
 /// Red Hat / virtio vendor ID
 const VENDOR_VIRTIO: u16 = 0x1AF4;
@@ -605,12 +606,17 @@ fn virtio_pci_probe(
 ) -> Result<Box<dyn crate::base::Bound>, KernelError> {
     let pci = crate::hw::pci::driver::pci_dev(dev).ok_or(KernelError::NoDevice)?;
     let id = virtio_id(pci).ok_or(KernelError::NoDevice)?;
-    let vdev = Arc::new(vp_init(pci, id)?);
+    // The binding's memory first: nothing to undo should it fail
+    let slot = try_box(MaybeUninit::<VirtioPciDev>::uninit())?;
+    let vdev = try_arc(vp_init(pci, id)?)?;
     let (v, index) = super::register_virtio_device(dev, vdev.clone())?;
-    Ok(Box::new(VirtioPciDev {
-        pci: pci.clone(),
-        dev: v,
-        vdev,
-        index,
-    }))
+    Ok(Box::write(
+        slot,
+        VirtioPciDev {
+            pci: pci.clone(),
+            dev: v,
+            vdev,
+            index,
+        },
+    ))
 }

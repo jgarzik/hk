@@ -3,9 +3,8 @@
 //! Provides SCSI command structures, CDB builders, and the ScsiHost trait
 //! that transport drivers (SAT, USB Mass Storage) implement.
 #![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
-use alloc::boxed::Box;
+use crate::util::kalloc::try_box;
 use alloc::sync::Arc;
 
 /// SCSI operation codes
@@ -273,6 +272,8 @@ pub enum ScsiError {
     NotSupported,
     /// Device not present
     NoDevice,
+    /// No memory for the command's buffer
+    NoMemory,
 }
 
 /// Result type for SCSI operations
@@ -418,7 +419,7 @@ pub fn test_unit_ready(host: &Arc<dyn ScsiHost>, target: u8, lun: u8) -> ScsiRes
 /// Execute INQUIRY and return response data (read into the heap: the
 /// transport may DMA it, never from a kernel stack)
 pub fn inquiry(host: &Arc<dyn ScsiHost>, target: u8, lun: u8) -> ScsiResult<InquiryData> {
-    let mut data = Box::new(InquiryData {
+    let mut data = try_box(InquiryData {
         peripheral: 0,
         rmb: 0,
         version: 0,
@@ -428,7 +429,8 @@ pub fn inquiry(host: &Arc<dyn ScsiHost>, target: u8, lun: u8) -> ScsiResult<Inqu
         vendor: [0; 8],
         product: [0; 16],
         revision: [0; 4],
-    });
+    })
+    .map_err(|_| ScsiError::NoMemory)?;
 
     let cmd = ScsiCommand::read(Cdb::inquiry(36), (&raw mut *data).cast::<u8>(), 36, 5000);
 
@@ -446,10 +448,11 @@ pub struct Capacity {
 /// READ CAPACITY(10), and READ CAPACITY(16) when the last LBA does not
 /// fit its 32 bits (it reports 0xffffffff: Linux sd_read_capacity)
 pub fn read_capacity(host: &Arc<dyn ScsiHost>, target: u8, lun: u8) -> ScsiResult<Capacity> {
-    let mut data = Box::new(ReadCapacityData {
+    let mut data = try_box(ReadCapacityData {
         last_lba: [0; 4],
         block_length: [0; 4],
-    });
+    })
+    .map_err(|_| ScsiError::NoMemory)?;
     let cmd = ScsiCommand::read(
         Cdb::read_capacity_10(),
         (&raw mut *data).cast::<u8>(),
@@ -463,7 +466,7 @@ pub fn read_capacity(host: &Arc<dyn ScsiHost>, target: u8, lun: u8) -> ScsiResul
             block_size: data.block_length(),
         });
     }
-    let mut d16 = Box::new([0u8; 32]);
+    let mut d16 = try_box([0u8; 32]).map_err(|_| ScsiError::NoMemory)?;
     let cmd = ScsiCommand::read(Cdb::read_capacity_16(), d16.as_mut_ptr(), 32, 5000);
     host.execute(target, lun, &cmd)?;
     Ok(capacity_16(&d16))

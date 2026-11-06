@@ -26,7 +26,6 @@
 //! - Controlling ttys and job control (`jobctrl`), ioctls (`ioctl`)
 //! - Serial ttys: 16550 ttyS* on x86, PL011 ttyAMA0 on arm64
 //! - /dev/tty, /dev/console, and a Tty as a kernel console
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 pub mod console_dev;
 pub mod flip;
@@ -51,6 +50,7 @@ use crate::fs::flags::O_NOCTTY;
 use crate::io::poll::{POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM, PollTable};
 use crate::task::pid::Pid;
 use crate::util::error::KernelError;
+use crate::util::kalloc::{arc_nofail, try_arc};
 
 // Re-export commonly used types
 pub use termios::{
@@ -371,8 +371,10 @@ struct Redirect(&'static Tty);
 
 impl Redirect {
     /// Point `file` at `tty` (at open)
-    fn set(file: &File, tty: &'static Tty) {
-        file.private.call_once(|| Arc::new(Redirect(tty)));
+    fn set(file: &File, tty: &'static Tty) -> Result<(), KernelError> {
+        let r = try_arc(Redirect(tty))?;
+        file.private.call_once(|| r);
+        Ok(())
     }
 
     /// The tty `file` was pointed at
@@ -424,15 +426,15 @@ pub fn init_tty_chardevs() {
     // thread
     flip::init();
     for &tty in crate::arch::serial_ttys() {
-        let _ = register_chardev(tty.dev, Arc::new(TtyChar(tty)));
+        let _ = register_chardev(tty.dev, arc_nofail(TtyChar(tty)));
     }
 
     // Register /dev/tty (major 5, minor 0) - controlling terminal
-    let tty_dev = Arc::new(tty_dev::TtyCharDevice);
+    let tty_dev = arc_nofail(tty_dev::TtyCharDevice);
     let _ = register_chardev(DevId::new(major::TTYAUX, 0), tty_dev);
 
     // Register /dev/console (major 5, minor 1) - kernel console
-    let console_dev = Arc::new(console_dev::ConsoleCharDevice);
+    let console_dev = arc_nofail(console_dev::ConsoleCharDevice);
     let _ = register_chardev(DevId::new(major::TTYAUX, 1), console_dev);
 
     TTY_CLASS.register();

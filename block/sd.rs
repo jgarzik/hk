@@ -16,7 +16,6 @@
 //! - `TransportOffline` - Transport layer reports offline
 //! - `Block` - Device blocked for I/O
 #![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
@@ -30,6 +29,7 @@ use super::blkdev::{
 use super::genhd::{add_disk, del_gendisk, disk_name};
 
 use crate::util::error::KernelError;
+use crate::util::kalloc::try_arc;
 
 use super::scsi::{
     Cdb, ScsiCommand, ScsiError, ScsiHost, ScsiResult, inquiry, read_capacity, test_unit_ready,
@@ -396,8 +396,10 @@ pub fn create_scsi_disk(
     target: u8,
     lun: u8,
 ) -> Result<SdDisk, KernelError> {
-    let scsi_disk =
-        Arc::new(ScsiDisk::probe(host, target, lun).map_err(|_| KernelError::NotFound)?);
+    let scsi_disk = try_arc(ScsiDisk::probe(host, target, lun).map_err(|e| match e {
+        ScsiError::NoMemory => KernelError::OutOfMemory,
+        _ => KernelError::NotFound,
+    })?)?;
     let index = SdIndex::alloc()?;
     let i = index.0;
     register_blkdev(major::SCSI_DISK, "sd")?;
@@ -408,10 +410,10 @@ pub fn create_scsi_disk(
         ..QueueLimits::default()
     };
     let q = RequestQueue::new_bio(
-        Arc::new(ScsiDiskDriver {
+        try_arc(ScsiDiskDriver {
             disk: scsi_disk.clone(),
             _index: index,
-        }),
+        })?,
         limits,
         true,
     );
@@ -424,7 +426,7 @@ pub fn create_scsi_disk(
         scsi_disk.capacity_bytes() >> SECTOR_SHIFT,
         q,
         false,
-    );
+    )?;
     let bdev = add_disk(disk, None)?;
     crate::printkln!(
         "SCSI: {} ({} MB, {} byte sectors)",

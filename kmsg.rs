@@ -24,16 +24,15 @@
 //! printk takes it under its OUTPUT_LOCK. Readers are woken from the
 //! scheduler tick (printk may hold run-queue locks; Linux defers the
 //! klogd wakeup through irq_work).
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::arch::IrqSpinlock;
 use crate::sync::waitqueue::WaitQueue;
 use crate::util::error::KernelError;
+use crate::util::kalloc::try_arc;
 
 /// Ring size in bytes
 pub const LOG_BUF_LEN: usize = 1 << 17;
@@ -575,11 +574,11 @@ impl crate::fs::FileOps for KmsgFileOps {
             let log = LOG.lock();
             (log.buf.first_seq(), log.buf.first_idx())
         };
-        let u = KmsgUser {
+        let u = try_arc(KmsgUser {
             cur: crate::sync::spin::Mutex::new(first),
             rate: crate::sync::spin::Mutex::new((0, 0)),
-        };
-        file.private.call_once(|| Arc::new(u));
+        })?;
+        file.private.call_once(|| u);
         Ok(())
     }
 

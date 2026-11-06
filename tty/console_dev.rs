@@ -23,8 +23,7 @@ impl CharDevice for ConsoleCharDevice {
 
     fn open(&self, file: &File) -> Result<(), KernelError> {
         let tty = console_tty().ok_or(KernelError::NoDevice)?;
-        Redirect::set(file, tty);
-        Ok(())
+        Redirect::set(file, tty)
     }
 
     fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {

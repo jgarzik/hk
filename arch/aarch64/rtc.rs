@@ -13,7 +13,6 @@
 //! - RTCMIS (0x018): Masked Interrupt Status
 //! - RTCICR (0x01C): Interrupt Clear Register
 #![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use core::ptr;
 
@@ -77,5 +76,5 @@ impl crate::base::Bound for Pl031 {
 fn pl031_probe(
     _dev: &alloc::sync::Arc<crate::base::Device>,
 ) -> Result<alloc::boxed::Box<dyn crate::base::Bound>, crate::util::error::KernelError> {
-    Ok(alloc::boxed::Box::new(Pl031))
+    Ok(crate::util::kalloc::try_box(Pl031)?)
 }

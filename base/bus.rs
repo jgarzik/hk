@@ -2,7 +2,6 @@
 //! drivers_autoprobe,drivers_probe,uevent}; a device added to a bus is
 //! matched against the bus's drivers, a registered driver against its
 //! unbound devices (Linux bus_probe_device, driver_attach).
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -17,6 +16,7 @@ use crate::fs::KernelError;
 use crate::fs::kernfs::{Attr, KNode, SysBuf};
 use crate::fs::sysfs;
 use crate::sync::spin::Mutex;
+use crate::util::kalloc::arc_nofail;
 
 static BUS_DIR: Once<Arc<KNode>> = Once::new();
 static SYSTEM_DIR: Once<Arc<KNode>> = Once::new();
@@ -203,11 +203,11 @@ impl BusType {
             let dir = root
                 .create_dir(self.name.as_bytes(), 0o755)
                 .expect("bus directory");
-            let _ = dir.create_file(b"uevent", 0o200, Arc::new(BusUevent(self)));
+            let _ = dir.create_file(b"uevent", 0o200, arc_nofail(BusUevent(self)));
             let devices_dir = dir.create_dir(b"devices", 0o755).expect("bus devices");
             let drivers_dir = dir.create_dir(b"drivers", 0o755).expect("bus drivers");
-            let _ = dir.create_file(b"drivers_probe", 0o200, Arc::new(DriversProbe(self)));
-            let _ = dir.create_file(b"drivers_autoprobe", 0o644, Arc::new(Autoprobe(self)));
+            let _ = dir.create_file(b"drivers_probe", 0o200, arc_nofail(DriversProbe(self)));
+            let _ = dir.create_file(b"drivers_autoprobe", 0o644, arc_nofail(Autoprobe(self)));
             BusPriv {
                 dir,
                 devices_dir,

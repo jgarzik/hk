@@ -10,7 +10,6 @@
 //! the interrupt (`free_irq`) and drops their queues; the bus then
 //! acknowledges the device again for the next bind. Queues are split rings (`ring`) in coherent DMA
 //! memory, addressed only through the DMA API.
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 pub mod blk;
 pub mod pci;
@@ -23,6 +22,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
 use core::fmt::Write;
+use core::mem::MaybeUninit;
 
 use crate::base::bus::BusType;
 use crate::base::{Device, DeviceInfo, Driver, device_create};
@@ -30,6 +30,7 @@ use crate::fs::kernfs;
 use crate::printkln;
 use crate::util::error::KernelError;
 use crate::util::ida::Ida;
+use crate::util::kalloc::try_box;
 
 pub use pci::{VIRTIO_PCI_DRIVER, VirtioDevice, Virtqueue};
 
@@ -144,6 +145,8 @@ pub fn virtio_dev_probe(dev: &Arc<Device>) -> Result<Box<dyn crate::base::Bound>
         .data_arc::<VirtioDevice>()
         .ok_or(KernelError::NoDevice)?;
     let ids = dev.driver().and_then(ids_of).ok_or(KernelError::NoDevice)?;
+    // The binding's memory first: nothing to undo should it fail
+    let slot = try_box(MaybeUninit::<VirtioBound>::uninit())?;
     vdev.add_status(status::DRIVER);
     if let Err(e) = vdev.negotiate(ids.drv.features()) {
         vdev.add_status(status::FAILED);
@@ -157,7 +160,7 @@ pub fn virtio_dev_probe(dev: &Arc<Device>) -> Result<Box<dyn crate::base::Bound>
         vdev.features()
     );
     match ids.drv.probe(dev, vdev.clone()) {
-        Ok(inner) => Ok(Box::new(VirtioBound { inner, vdev })),
+        Ok(inner) => Ok(Box::write(slot, VirtioBound { inner, vdev })),
         Err(e) => {
             vdev.add_status(status::FAILED);
             Err(e)

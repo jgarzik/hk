@@ -4,13 +4,13 @@
 //!
 //! `XHCI_PCI_DRIVER` binds the controller on the PCI bus.
 #![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 use core::any::Any;
+use core::mem::MaybeUninit;
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering, fence};
 
@@ -22,6 +22,7 @@ use crate::hw::pci::PciDevice;
 use crate::printkln;
 use crate::time::delay::{poll_timeout, udelay};
 use crate::util::error::KernelError;
+use crate::util::kalloc::{try_arc, try_box};
 
 /// Halt and start handshakes (Linux XHCI_MAX_HALT_USEC)
 pub(super) const XHCI_MAX_HALT_US: u64 = 32_000;
@@ -248,6 +249,8 @@ fn xhci_probe(
 ) -> Result<Box<dyn crate::base::Bound>, KernelError> {
     let pci_dev = crate::hw::pci::driver::pci_dev(dev).ok_or(KernelError::NoDevice)?;
     let mmio_base = pci_dev.bar_address(0).ok_or(KernelError::NoDevice)?;
+    // The binding's memory first: nothing to undo should it fail
+    let slot = try_box(MaybeUninit::<XhciDeviceHandle>::uninit())?;
     pci_dev.enable_memory_space();
     pci_dev.enable_bus_master();
     printkln!(
@@ -270,10 +273,13 @@ fn xhci_probe(
     // Stored for global access (the USB drivers' transfers)
     store_usb_host(controller);
     let usb = super::usb_register_devices(dev, usb_devices);
-    Ok(Box::new(XhciDeviceHandle {
-        usb,
-        bus_id: pci_dev.bus_id(),
-    }))
+    Ok(Box::write(
+        slot,
+        XhciDeviceHandle {
+            usb,
+            bus_id: pci_dev.bus_id(),
+        },
+    ))
 }
 
 /// A bound xHCI: its USB devices (the root hub last)
@@ -989,10 +995,8 @@ impl XhciController {
             .store(self.rt_regs, Ordering::Release);
 
         // Register IRQ handler with PCI device
-        match self
-            .pci_dev
-            .register_irq_handler(alloc::sync::Arc::new(crate::irq::IrqFn(xhci_irq_handler)))
-        {
+        let h = try_arc(crate::irq::IrqFn(xhci_irq_handler)).map_err(|_| "out of memory");
+        match h.and_then(|h| self.pci_dev.register_irq_handler(h)) {
             Ok(irq) => {
                 self.irq = Some(irq);
                 printkln!("xHCI: Registered IRQ {}", irq);

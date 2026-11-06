@@ -30,12 +30,12 @@
 //!   Taken under socket/ARP locks (end of the network lock order). Leaf.
 //!   Empty once removed.
 #![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::boxed::Box;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::any::Any;
+use core::mem::MaybeUninit;
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
@@ -54,6 +54,7 @@ use crate::net::device::{LinkInfo, NetDevice, NetDeviceOps};
 use crate::net::skb::{NET_SKB_PAD, SkBuff};
 use crate::printkln;
 use crate::util::error::KernelError;
+use crate::util::kalloc::{try_arc, try_box};
 
 // ============================================================================
 // Hardware Constants
@@ -706,6 +707,8 @@ fn e1000_probe(
     pdev: &Arc<crate::base::Device>,
 ) -> Result<Box<dyn crate::base::Bound>, KernelError> {
     let pci = crate::hw::pci::driver::pci_dev(pdev).ok_or(KernelError::NoDevice)?;
+    // The binding's memory first: nothing to undo should it fail
+    let slot = try_box(MaybeUninit::<E1000DeviceWrapper>::uninit())?;
 
     printkln!(
         "e1000: probing {:04x}:{:04x} at {}",
@@ -772,17 +775,20 @@ fn e1000_probe(
         mac[4],
         mac[5]
     );
-    dev.set_mac_filter();
-    dev.init_rx();
-    dev.init_tx();
 
-    let device = Arc::new(dev);
+    // Allocated while the chip is reset and its rings unprogrammed:
+    // ENOMEM leaves no DMA running
+    let device = try_arc(dev)?;
+    let ops: Arc<dyn NetDeviceOps> = try_arc(E1000Ops {
+        device: Arc::clone(&device),
+    })
+    .inspect_err(|_| device.free_rings())?;
+
+    device.set_mac_filter();
+    device.init_rx();
+    device.init_tx();
     let poller: Weak<dyn NapiPoll> = Arc::downgrade(&device) as Weak<dyn NapiPoll>;
     net::dev::netif_napi_add(&device.napi, poller);
-
-    let ops: Arc<dyn NetDeviceOps> = Arc::new(E1000Ops {
-        device: Arc::clone(&device),
-    });
     // RTNL from naming to registration (Linux register_netdev)
     let (rtnl, netdev) = net::alloc_netdev("eth%d", mac, LinkInfo::ETHER, ops);
     device.netdev.call_once(|| Arc::downgrade(&netdev));
@@ -814,5 +820,5 @@ fn e1000_probe(
     netdev.parent.call_once(|| pdev.clone());
     net::register_netdev(rtnl, Arc::clone(&netdev));
 
-    Ok(Box::new(E1000DeviceWrapper { netdev, device }))
+    Ok(Box::write(slot, E1000DeviceWrapper { netdev, device }))
 }

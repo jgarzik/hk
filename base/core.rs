@@ -15,7 +15,6 @@
 //! probe and release; the driver and its state are spin leaves read
 //! without it. Bus, class and `DEVICES_LIST` are spin leaves; sysfs
 //! changes take kernfs's locks (doc/LOCKING.md 3.3).
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
@@ -35,6 +34,7 @@ use crate::fs::kernfs::{self, Attr, KNode, SysBuf};
 use crate::fs::sysfs;
 use crate::sync::Mutex;
 use crate::sync::spin::{Mutex as SpinMutex, RwLock};
+use crate::util::kalloc::{try_arc, try_arc_cyclic};
 
 static DEVICES: Once<Arc<KNode>> = Once::new();
 static DEV_CHAR: Once<Arc<KNode>> = Once::new();
@@ -336,7 +336,7 @@ impl Device {
         };
         self.kobj.call_once(|| dir.clone());
         self.added.lock().dir = true;
-        dir.create_file(b"uevent", 0o644, Arc::new(UeventAttr(self.me.clone())))?;
+        dir.create_file(b"uevent", 0o644, try_arc(UeventAttr(self.me.clone()))?)?;
         let me = self.me.upgrade().expect("device alive");
         if let Some(c) = self.class {
             let cdir = c.dir();
@@ -447,7 +447,7 @@ impl Device {
 
 /// Create and register a device (Linux device_create)
 pub fn device_create(info: DeviceInfo<'_>) -> Result<Arc<Device>, KernelError> {
-    let d = Arc::new_cyclic(|me| Device {
+    let d = try_arc_cyclic(|me| Device {
         name: info.name,
         parent: info.parent.cloned(),
         bus: info.bus,
@@ -464,7 +464,7 @@ pub fn device_create(info: DeviceInfo<'_>) -> Result<Arc<Device>, KernelError> {
         driver: RwLock::new(None),
         bound: SpinMutex::new(None),
         me: me.clone(),
-    });
+    })?;
     if let Err(e) = d.add() {
         d.undo();
         return Err(e);

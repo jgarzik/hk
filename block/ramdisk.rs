@@ -10,7 +10,6 @@
 //! xarray lock): held only to find or insert a frame, never across a
 //! copy into user memory (copies use kernel bounce buffers).
 #![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
@@ -25,6 +24,7 @@ use super::genhd::add_disk;
 use crate::arch::phys_to_virt;
 use crate::sync::spin::Mutex;
 use crate::util::error::KernelError;
+use crate::util::kalloc::try_arc;
 
 const PAGE: u64 = 4096;
 
@@ -100,9 +100,9 @@ impl BlockDriver for RamDisk {
 /// Create RAM disk `rd<minor>` of `bytes` bytes holding `data`
 fn create(minor: u16, bytes: u64, data: &[u8]) -> Result<Arc<BlockDevice>, KernelError> {
     register_blkdev(major::RAMDISK, "ramdisk")?;
-    let rd = Arc::new(RamDisk {
+    let rd = try_arc(RamDisk {
         pages: Mutex::new(BTreeMap::new()),
-    });
+    })?;
     rd.copy(true, 0, data.as_ptr().cast_mut(), data.len())?;
     // brd: no seek cost (Linux QUEUE_FLAG_NONROT)
     let limits = QueueLimits {
@@ -118,7 +118,7 @@ fn create(minor: u16, bytes: u64, data: &[u8]) -> Result<Arc<BlockDevice>, Kerne
         bytes >> SECTOR_SHIFT,
         q,
         false,
-    );
+    )?;
     add_disk(disk, None)
 }
 

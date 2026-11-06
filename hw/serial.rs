@@ -4,10 +4,10 @@
 //!
 //! This provides the hardware interface for serial ports like /dev/ttyS0.
 #![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use crate::console::{ConsolePriority, register_console};
 use crate::util::error::KernelError;
+use crate::util::kalloc::{try_arc, try_box};
 
 use crate::fs::chardev::{DevId, major};
 use crate::tty::{Tty, TtyDriver};
@@ -317,7 +317,9 @@ fn com1_irq(_irq: u32) -> bool {
 /// its PIC line. False without it
 fn rx_irq_init(irq: u32) -> bool {
     let id = usize::from(ports::COM1);
-    let h = alloc::sync::Arc::new(crate::irq::IrqFn(com1_irq));
+    let Ok(h) = try_arc(crate::irq::IrqFn(com1_irq)) else {
+        return false;
+    };
     if let Err(e) = crate::arch::irq::register_irq_handler(irq, h, id) {
         crate::printkln!("ttyS0: no IRQ {}: {}", irq, e);
         return false;
@@ -378,6 +380,11 @@ impl crate::base::Bound for Serial8250 {
 fn serial8250_probe(
     dev: &alloc::sync::Arc<crate::base::Device>,
 ) -> Result<alloc::boxed::Box<dyn crate::base::Bound>, crate::util::error::KernelError> {
+    // Allocated first, so ENOMEM leaves nothing registered
+    let mut port = try_box(Serial8250 {
+        irq: None,
+        ttys: alloc::vec::Vec::new(),
+    })?;
     // Registered at boot already, or again after an unbind (Linux
     // uart_add_one_port's uart_configure_port -> register_console)
     register_console(
@@ -386,10 +393,10 @@ fn serial8250_probe(
         crate::console::ConsoleFlags::BOOT,
     );
     let irq = crate::base::platform::pdev(dev).and_then(|p| p.irq);
-    let irq = irq.filter(|&irq| rx_irq_init(irq));
-    let ttys = serial_ttys()
+    port.irq = irq.filter(|&irq| rx_irq_init(irq));
+    port.ttys = serial_ttys()
         .iter()
         .filter_map(|t| crate::tty::tty_register_device(t, dev))
         .collect();
-    Ok(alloc::boxed::Box::new(Serial8250 { irq, ttys }))
+    Ok(port)
 }

@@ -21,8 +21,7 @@ impl CharDevice for TtyCharDevice {
 
     fn open(&self, file: &File) -> Result<(), KernelError> {
         let tty = jobctrl::current_tty().ok_or(KernelError::NoDeviceOrAddress)?;
-        Redirect::set(file, tty);
-        Ok(())
+        Redirect::set(file, tty)
     }
 
     fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {

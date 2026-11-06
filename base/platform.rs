@@ -1,7 +1,6 @@
 //! The platform bus (Linux drivers/base/platform.c): devices with fixed
 //! resources, below /sys/devices/platform, matched by name or DT
 //! compatible string.
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::format;
 use alloc::string::String;
@@ -14,6 +13,7 @@ use super::bus::BusType;
 use super::core::{Device, DeviceInfo, device_create};
 use super::driver::Driver;
 use crate::fs::KernelError;
+use crate::util::kalloc::try_arc;
 
 pub static PLATFORM_BUS: BusType = BusType::new("platform", platform_match, Some(platform_uevent));
 
@@ -85,7 +85,7 @@ pub fn platform_device_register(p: PlatformDevice) -> Result<Arc<Device>, Kernel
     device_create(DeviceInfo {
         parent: Some(root),
         bus: Some(&PLATFORM_BUS),
-        data: Some(Arc::new(p)),
+        data: Some(try_arc(p)?),
         ..DeviceInfo::named(&name)
     })
 }

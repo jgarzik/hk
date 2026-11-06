@@ -32,7 +32,6 @@
 //! - GFX_IOCTL_MODE_CREATE_DUMB
 //! - GFX_IOCTL_MODE_MAP_DUMB
 //! - GFX_IOCTL_MODE_DESTROY_DUMB
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 extern crate alloc;
 
@@ -49,6 +48,7 @@ use alloc::vec::Vec;
 use crate::fs::File;
 use crate::fs::chardev::{CharDevice, DevId};
 use crate::util::error::KernelError;
+use crate::util::kalloc::try_arc;
 
 /// DRM major device number (Linux convention)
 pub const GFX_MAJOR: u16 = 226;
@@ -243,7 +243,7 @@ pub fn register_gfx_device(driver: Arc<dyn GfxDriver>) -> Result<u32, GfxError> 
         m
     };
 
-    let chardev = Arc::new(GfxCharDevice::new(driver, minor));
+    let chardev = try_arc(GfxCharDevice::new(driver, minor)).map_err(|_| GfxError::NoMemory)?;
     let dev_id = DevId::new(GFX_MAJOR, minor as u16);
 
     // Register with character device subsystem

@@ -4,7 +4,6 @@
 //! and bus enumeration for device discovery.
 //!
 //! Functions are registered on the device core (`driver.rs`).
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 pub mod driver;
 pub mod intx;
@@ -18,6 +17,7 @@ use spin::Once;
 
 use crate::hw::dma::{DmaConfig, DmaDevice};
 use crate::printkln;
+use crate::util::kalloc::box_nofail;
 
 // ============================================================================
 // PCI BAR Allocator (for platforms without firmware BAR assignment)
@@ -335,8 +335,8 @@ pub unsafe fn init_ecam(base_addr: *mut u8, len: usize) {
     let base = core::ptr::NonNull::new(base_addr).expect("ECAM base");
     // SAFETY: the caller's mapping, per this fn's contract
     let regs = unsafe { crate::hw::mmio::IoMem::new(base, len) };
-    // Leak a box to get 'static lifetime
-    let accessor = Box::leak(Box::new(EcamConfigAccess::new(regs)));
+    // Leak a box to get 'static lifetime (boot-time setup)
+    let accessor = Box::leak(box_nofail(EcamConfigAccess::new(regs)));
     PCI_CONFIG.call_once(|| accessor as &dyn PciConfigAccess);
 }
 

@@ -2,7 +2,6 @@
 //! /sys/bus/<bus>/drivers/<drv>/{bind,unbind,uevent,module}, and the
 //! built-in module's /sys/module/<mod>/drivers/<bus>:<drv> link (when
 //! the bus names the module).
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::boxed::Box;
 use alloc::format;
@@ -16,6 +15,7 @@ use super::core::Device;
 use crate::fs::KernelError;
 use crate::fs::kernfs::{Attr, KNode, SysBuf};
 use crate::fs::sysfs;
+use crate::util::kalloc::arc_nofail;
 
 /// A driver's id table, of its bus's type (`platform::Names`,
 /// `pci::PciIds`, ...); the bus's match downcasts it
@@ -146,9 +146,9 @@ impl Driver {
                 .drivers_dir()
                 .create_dir(self.name.as_bytes(), 0o755)
                 .expect("driver directory");
-            let _ = d.create_file(b"uevent", 0o200, Arc::new(DriverUevent(self)));
-            let _ = d.create_file(b"bind", 0o200, Arc::new(BindAttr(self)));
-            let _ = d.create_file(b"unbind", 0o200, Arc::new(UnbindAttr(self)));
+            let _ = d.create_file(b"uevent", 0o200, arc_nofail(DriverUevent(self)));
+            let _ = d.create_file(b"bind", 0o200, arc_nofail(BindAttr(self)));
+            let _ = d.create_file(b"unbind", 0o200, arc_nofail(UnbindAttr(self)));
             if let Some(f) = self.bus.drv_attrs {
                 f(self, &d);
             }

@@ -7,7 +7,6 @@
 //! the disk; `rescan` (BLKRRPART) replaces the partitions;
 //! `/proc/partitions` lists every block device. Partition scans and
 //! rescans run under the disk's `open_mutex`.
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use alloc::format;
 use alloc::string::String;
@@ -20,6 +19,7 @@ use spin::Once;
 use crate::base::{Class, Device, DeviceInfo, device_create};
 use crate::fs::kernfs::{self, KNode};
 use crate::util::error::KernelError;
+use crate::util::kalloc::try_arc;
 
 use super::blkdev::{
     BLKDEV_REGISTRY, BioOp, BlockDevice, Disk, bdev_rw_bytes, disk_bdevs, disk_release,
@@ -227,13 +227,13 @@ pub fn add_disk(
     disk: Arc<Disk>,
     parent: Option<&Arc<Device>>,
 ) -> Result<Arc<BlockDevice>, KernelError> {
-    let whole = Arc::new(BlockDevice::new(
+    let whole = try_arc(BlockDevice::new(
         disk.clone(),
         0,
         0,
         disk.capacity(),
         disk.name.clone(),
-    ));
+    ))?;
     register_bdev(whole.clone())?;
     bdev_device_add(&whole, parent);
     if disk.minors > 1 {
@@ -251,13 +251,17 @@ fn scan_partitions(whole: &BlockDevice) {
     let mut rd = |s: u64, b: &mut [u8; 512]| bdev_rw_bytes(whole, BioOp::Read, s << 9, b);
     let parts = part::scan(&mut rd, whole.nr_sects(), disk.minors as usize);
     for (no, p) in parts {
-        let b = Arc::new(BlockDevice::new(
+        // A partition that cannot be had is skipped (Linux
+        // blk_add_partition)
+        let Ok(b) = try_arc(BlockDevice::new(
             disk.clone(),
             no,
             p.start,
             p.size,
             part_name(&disk.name, no),
-        ));
+        )) else {
+            continue;
+        };
         if register_bdev(b.clone()).is_ok() {
             bdev_device_add(&b, parent.as_ref());
         }

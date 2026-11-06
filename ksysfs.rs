@@ -1,7 +1,5 @@
 //! /sys/kernel (Linux kernel/ksysfs.c, mm/mm_init.c mm_sysfs_init)
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt::Write;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -10,6 +8,7 @@ use crate::fs::kernfs::{self, Attr, SysBuf};
 use crate::fs::sysfs;
 use crate::sync::spin::Mutex;
 use crate::util::error::KernelError;
+use crate::util::kalloc::arc_nofail;
 
 /// Sequence number of the last uevent (Linux uevent_seqnum)
 pub static UEVENT_SEQNUM: AtomicU64 = AtomicU64::new(0);
@@ -52,6 +51,6 @@ pub fn init() {
             let _ = writeln!(o, "{}", UEVENT_SEQNUM.load(Ordering::Acquire));
         }),
     );
-    let _ = k.create_file(b"uevent_helper", 0o644, Arc::new(UeventHelper));
+    let _ = k.create_file(b"uevent_helper", 0o644, arc_nofail(UeventHelper));
     let _ = k.create_dir(b"mm", 0o755);
 }
