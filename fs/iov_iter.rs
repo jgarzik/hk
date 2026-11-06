@@ -186,7 +186,8 @@ impl<'a> IovDest<'a> {
     /// `n` zero bytes (a hole): as many as fit; EFAULT only if a fault
     /// stopped it before the first byte
     pub fn zero(&mut self, n: usize) -> Result<usize, KernelError> {
-        const Z: [u8; 256] = [0; 256];
+        // One user copy per page (Linux iov_iter_zero uses clear_user)
+        static Z: [u8; 4096] = [0; 4096];
         let mut done = 0;
         while done < n {
             let k = (n - done).min(Z.len());
