@@ -138,6 +138,24 @@ mod imp {
     static NREPORTS: AtomicU32 = AtomicU32::new(0);
     /// Distinct locks heap allocations were made under
     static NATOMIC: AtomicU32 = AtomicU32::new(0);
+    /// Their keys, apart from the report table (`Graph.reported`): the
+    /// audit list cannot use up the room real reports need
+    static ATOMIC_SEEN: [core::sync::atomic::AtomicU64; 512] =
+        [const { core::sync::atomic::AtomicU64::new(0) }; 512];
+
+    /// First time `k` (nonzero) is seen in ATOMIC_SEEN; false once full
+    fn atomic_first(k: u64) -> bool {
+        let n = ATOMIC_SEEN.len();
+        for i in 0..n {
+            let slot = &ATOMIC_SEEN[(k as usize + i) % n];
+            match slot.compare_exchange(0, k, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => return true,
+                Err(v) if v == k => return false,
+                Err(_) => {}
+            }
+        }
+        false
+    }
 
     fn cpu() -> Option<&'static Cpu> {
         Some(&CPUS.this().0)
@@ -423,7 +441,7 @@ mod imp {
         let Some(h) = c.held[depth - 1].get() else {
             return;
         };
-        if !GRAPH.lock().first(key(h.class) ^ 0x4) {
+        if !atomic_first(key(h.class) | 1) {
             return;
         }
         c.busy.set(true);
