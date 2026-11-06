@@ -74,24 +74,37 @@ impl Shmem {
                 return Ok(page);
             }
         }
-        // A new page and the tree nodes to store it are allocated with
-        // no spin lock held (both may reclaim), then stored unless a
-        // racing fault stored one first (Linux shmem_alloc_and_add_folio)
+        // A new page is allocated with no spin lock held (it may
+        // reclaim), then stored unless a racing fault stored one first
+        // (Linux shmem_alloc_and_add_folio). The store needs tree nodes
+        // only now and then: without them it is retried with nodes
+        // allocated unlocked too (Linux xas_nomem)
         let new = zeroed().ok_or(VmFault::Oom)?;
-        let Some(mut pre) = Preload::new() else {
-            FRAME_ALLOCATOR.free(new);
-            return Err(VmFault::Oom);
-        };
-        let mut root = self.root.lock();
-        let mut page = root.load(idx);
-        if page == 0 {
-            if root.store(idx, new, &mut || pre.take()).is_none() {
-                drop(root);
+        let mut pre: Option<Preload> = None;
+        let root = loop {
+            let mut root = self.root.lock();
+            if root.load(idx) != 0 {
+                break root;
+            }
+            let stored = match pre.as_mut() {
+                Some(p) => root.store(idx, new, &mut || p.take()),
+                None => root.store(idx, new, &mut || None),
+            };
+            if stored.is_some() {
+                break root;
+            }
+            drop(root);
+            if pre.is_some() {
                 FRAME_ALLOCATOR.free(new);
                 return Err(VmFault::Oom);
             }
-            page = new;
-        } else {
+            pre = Some(Preload::new().ok_or_else(|| {
+                FRAME_ALLOCATOR.free(new);
+                VmFault::Oom
+            })?);
+        };
+        let page = root.load(idx);
+        if page != new {
             FRAME_ALLOCATOR.free(new);
         }
         let held = FRAME_ALLOCATOR.incref(page);
