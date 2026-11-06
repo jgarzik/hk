@@ -584,6 +584,12 @@ fn test_sync_nosymfollow() {
         sys_close(o as u64);
     }
     f += chk(n, b"follow", o, ELOOP);
+    // fs.protected_symlinks decides before nosymfollow (Linux pick_link):
+    // another user's link in a sticky directory is EACCES, not ELOOP
+    sys_chmod(mp.as_ptr(), 0o1777);
+    hk_syscall::sys_lchown(b"/tmp/mnt_uns/l\0".as_ptr(), 3000, 3000);
+    f += chk(n, b"protected before nosymfollow", protected_follow(), -13);
+    hk_syscall::sys_lchown(b"/tmp/mnt_uns/l\0".as_ptr(), 0, 0);
     let mut buf = [0u8; 64];
     let r = hk_syscall::sys_readlink(b"/tmp/mnt_uns/l\0".as_ptr(), buf.as_mut_ptr(), 64);
     f += chk(n, b"readlink", r, target.len() as i64 - 1);
@@ -614,4 +620,27 @@ fn mounts_opt(mp: &[u8], opt: &[u8]) -> i64 {
         r = i64::from(opts.windows(opt.len()).any(|w| w == opt));
     }
     r
+}
+
+/// With fs.protected_symlinks=1, uid 1000 follows /tmp/mnt_uns/l: the
+/// errno
+fn protected_follow() -> i64 {
+    let knob = b"/proc/sys/fs/protected_symlinks\0";
+    let set = |v: &[u8]| {
+        let fd = sys_open(knob.as_ptr(), O_WRONLY, 0);
+        sys_write(fd as u64, v.as_ptr(), 1);
+        sys_close(fd as u64);
+    };
+    set(b"1");
+    let pid = sys_fork();
+    if pid == 0 {
+        sys_setresgid(1000, 1000, 1000);
+        sys_setresuid(1000, 1000, 1000);
+        let o = sys_open(b"/tmp/mnt_uns/l\0".as_ptr(), O_RDONLY, 0);
+        sys_exit(o.unsigned_abs() & 0xff);
+    }
+    let mut st = 0;
+    sys_wait4(pid, &mut st, 0, 0);
+    set(b"0");
+    -i64::from((st >> 8) & 0xff)
 }
