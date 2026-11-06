@@ -17,6 +17,8 @@
 //!   kernel default) opening /dev/kmsg to read and every syslog action
 //!   (READ_ALL, SIZE_UNREAD, SIZE_BUFFER) are EPERM (a write-only open
 //!   is EACCES only by the node's 0644 mode)
+//! - KMSG_NUMA_CPUS (hk): the boot topology line lists node 0 with every
+//!   online CPU (printed after the CPUs came up)
 
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
@@ -51,6 +53,7 @@ pub fn run_tests() {
     syslog();
     syslog_partial();
     restrict();
+    numa_cpus();
 }
 
 fn syslog_partial() {
@@ -232,4 +235,51 @@ fn syslog() {
         return report(n, b"content", r);
     }
     report(n, b"", 0);
+}
+
+/// hk's boot log has `  node 0: <n> MB, <c> CPUs (...)`: c is the CPUs
+/// this task may run on (all of them at boot)
+fn numa_cpus() {
+    const NAME: &[u8] = b"KMSG_NUMA_CPUS";
+    if super::helpers::host_mode() {
+        super::helpers::skip(NAME, b"hk's boot message");
+        return;
+    }
+    let mut mask = [0u64; 4];
+    let n = hk_syscall::sys_sched_getaffinity(0, 32, mask.as_mut_ptr().cast());
+    let online: i64 = if n > 0 {
+        mask.iter().map(|m| i64::from(m.count_ones())).sum()
+    } else {
+        -1
+    };
+    let fd = sys_open(b"/dev/kmsg\0".as_ptr(), O_RDONLY | O_NONBLOCK, 0) as i32;
+    let mut cpus = -1;
+    let mut rec = [0u8; 1024];
+    loop {
+        let r = sys_read(fd as u64, rec.as_mut_ptr(), rec.len() as u64);
+        if r <= 0 {
+            break;
+        }
+        let line = &rec[..r as usize];
+        if let Some(i) = line.windows(9).position(|w| w == b"  node 0:") {
+            // "... MB, <c> CPUs"
+            let rest = &line[i..];
+            if let Some(j) = rest.windows(6).position(|w| w == b" CPUs ") {
+                let digits = rest[..j]
+                    .iter()
+                    .rev()
+                    .take_while(|c| c.is_ascii_digit())
+                    .count();
+                cpus = rest[j - digits..j]
+                    .iter()
+                    .fold(0i64, |v, c| v * 10 + i64::from(c - b'0'));
+            }
+        }
+    }
+    sys_close(fd as u64);
+    if cpus > 0 && cpus == online {
+        report(NAME, b"", 0);
+    } else {
+        report(NAME, b"cpus", cpus * 1000 + online);
+    }
 }

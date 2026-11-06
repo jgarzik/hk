@@ -197,8 +197,6 @@ getcpu reports it; nothing else uses it. Missing (Linux
   `numa-node-id`) used as is: sparse or large domains leave holes or
   are dropped (>= 64), and node 0 may not exist (Linux pxm_to_node
   numbers the domains from 0).
-- The boot topology dump (`print_topology`) runs before any CPU has
-  come up (`cpu_up`), so with real NUMA tables every node shows 0 CPUs.
 
 ## arm64 SMP assumes one-cell, Aff0-only CPU ids
 

@@ -207,10 +207,7 @@ fn init_numa_topology() {
     #[cfg(target_arch = "x86_64")]
     {
         match arch::x86_64::acpi::init_numa_topology() {
-            Ok(true) => {
-                mm::numa::print_topology();
-                return;
-            }
+            Ok(true) => return,
             Ok(false) => {
                 // No SRAT table, use single-node fallback
             }
@@ -223,10 +220,7 @@ fn init_numa_topology() {
     #[cfg(target_arch = "aarch64")]
     {
         match arch::aarch64::dtb::init_numa_topology() {
-            Ok(true) => {
-                mm::numa::print_topology();
-                return;
-            }
+            Ok(true) => return,
             Ok(false) => {
                 // No numa-node-id properties, use single-node fallback
             }
@@ -358,6 +352,8 @@ fn kmain() -> ! {
 
                 let online = CurrentArch::smp_init(&acpi_info, &mut frame_alloc);
                 smp::init(online as u32);
+                // Every CPU has recorded its node (numa::cpu_up) by now
+                mm::numa::print_topology();
 
                 // Calibrate and start local timer (10ms interval)
                 let ticks_per_ms = CurrentArch::calibrate_and_start_timer(
