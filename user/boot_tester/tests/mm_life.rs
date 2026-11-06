@@ -30,6 +30,7 @@ pub fn run_tests() {
     leak(b"MM_LIFE_EXEC_CHAIN", 10, exec_chain);
     leak(b"MM_LIFE_PROTNONE_MUNMAP", 200, protnone_munmap);
     leak(b"MM_LIFE_PROTNONE_EXIT", 200, protnone_exit);
+    leak(b"MM_LIFE_THP_CYCLE", 200, thp_cycle);
     fork_exec_objects();
     maps_after_exit();
     munmap_partial();
@@ -642,4 +643,32 @@ fn fork_exec_objects() {
         println(b" fork+exec");
     }
     report(NAME, ok, s1 - s0);
+}
+
+/// Two 2MB-aligned MADV_HUGEPAGE pages are touched (2MB pages where
+/// THP is on); the first is split by unmapping 4KB in its middle, then
+/// all is unmapped (the second whole): each 2MB page's spare page table
+/// must come back too
+fn thp_cycle() -> bool {
+    const HUGE: u64 = 2 << 20;
+    const MADV_HUGEPAGE: i32 = 14;
+    let raw = sys_mmap(
+        0,
+        3 * HUGE,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS,
+        -1,
+        0,
+    );
+    if raw < 0 {
+        return false;
+    }
+    let raw = raw as u64;
+    let p = (raw + HUGE - 1) & !(HUGE - 1);
+    sys_madvise(p, 2 * HUGE, MADV_HUGEPAGE);
+    unsafe { core::ptr::write_volatile(p as *mut u8, 1) };
+    unsafe { core::ptr::write_volatile((p + HUGE) as *mut u8, 1) };
+    sys_munmap(p + HUGE / 2, PAGE);
+    unsafe { core::ptr::write_volatile((p + HUGE - 8) as *mut u8, 2) };
+    sys_munmap(raw, 3 * HUGE) == 0
 }

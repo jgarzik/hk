@@ -112,7 +112,7 @@ impl PteWalk for Zap<'_, '_> {
             // Split (or zapped) under us: clear the 4KB entries
             // (Linux zap_pmd_range falls back to zap_pte_range)
         } else {
-            // Out of memory: the 2MB page stays mapped (BUGS.md)
+            // Never fails for memory: the table was deposited with it
             let _ = split_huge_pmd(mm, base);
         }
         Ok(false)

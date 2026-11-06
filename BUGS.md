@@ -171,9 +171,7 @@ Missing:
 - MADV_REMOVE of a file mapping is EOPNOTSUPP (no filesystem punches
   holes); shmdt needs the address an attachment starts at (Linux also
   finds a piece moved by mremap); SHM_EXEC is ignored.
-- munmap or MADV_DONTNEED of part of a 2MB page that cannot be split
-  (out of memory) leaves the whole page mapped (Linux preallocates the
-  page table); shmat checks RLIMIT_AS before SHM_REMAP unmaps the old
+- shmat checks RLIMIT_AS before SHM_REMAP unmaps the old
   range, and an address that SHM_RND rounds to 0 is EPERM (Linux picks
   an address).
 - vm.max_map_count is enforced for mmap, brk, munmap and MAP_FIXED

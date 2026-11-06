@@ -316,6 +316,12 @@ fn do_huge_anon(mm: &Mm, addr: u64, area: &Area) -> bool {
     let Some(frame) = FRAME_ALLOCATOR.alloc_huge() else {
         return false;
     };
+    // The table its split will need, kept with it (Linux
+    // pte_alloc_one + pgtable_trans_huge_deposit)
+    let Some(pt) = FRAME_ALLOCATOR.alloc() else {
+        FRAME_ALLOCATOR.free_huge(frame);
+        return false;
+    };
     // SAFETY: a fresh 2MB frame, reached through the direct map
     unsafe { core::ptr::write_bytes(phys_to_virt(frame), 0, HUGE_PAGE_SIZE as usize) };
     if area.prot & PROT_EXEC != 0 {
@@ -332,7 +338,11 @@ fn do_huge_anon(mm: &Mm, addr: u64, area: &Area) -> bool {
     let _l = super::ptl::pt_lock(mm);
     if ArchPageTable::map_huge_page(mm.pgd(), base, frame, flags, &mut &FRAME_ALLOCATOR).is_err() {
         FRAME_ALLOCATOR.free_huge(frame);
+        FRAME_ALLOCATOR.free(pt);
         return false;
+    }
+    if let Some(pmdp) = paging::pmd_ptr(mm.pgd(), base) {
+        super::huge_page::deposit(pmdp, pt);
     }
     add_anon(frame, area, base);
     increment_min_flt();
