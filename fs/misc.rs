@@ -7,7 +7,6 @@
 //! - readahead (file readahead)
 
 use alloc::sync::Arc;
-use alloc::vec;
 
 use crate::arch::Uaccess;
 use crate::fs::{KernelError, LookupFlags, lookup_path_flags};
@@ -575,8 +574,8 @@ fn copy_xattr_value_from_user(value_ptr: u64, size: u64) -> Result<alloc::vec::V
         return Err(KernelError::BadAddress.sysret());
     }
 
-    // Allocate and copy value from user space
-    let mut value = vec![0u8; size as usize];
+    // Allocate (ENOMEM, Linux kvmalloc) and copy value from user space
+    let mut value = crate::util::kmem::try_vec(size as usize, 0u8).map_err(|e| e.sysret())?;
     if copy_from_user::<Uaccess>(&mut value, value_ptr, size as usize).is_err() {
         return Err(KernelError::BadAddress.sysret());
     }
@@ -817,8 +816,11 @@ fn do_getxattr(
         return KernelError::BadAddress.sysret();
     }
 
-    // Allocate kernel buffer
-    let mut value = vec![0u8; size as usize];
+    // Allocate kernel buffer (ENOMEM, Linux kvmalloc)
+    let mut value = match crate::util::kmem::try_vec(size as usize, 0u8) {
+        Ok(v) => v,
+        Err(e) => return e.sysret(),
+    };
 
     // Get the attribute
     match inode.i_op.getxattr(&inode, &name, &mut value) {
@@ -878,8 +880,11 @@ pub fn sys_fgetxattr(fd: i32, name_ptr: u64, value_ptr: u64, size: u64) -> i64 {
         return KernelError::BadAddress.sysret();
     }
 
-    // Allocate kernel buffer
-    let mut value = vec![0u8; size as usize];
+    // Allocate kernel buffer (ENOMEM, Linux kvmalloc)
+    let mut value = match crate::util::kmem::try_vec(size as usize, 0u8) {
+        Ok(v) => v,
+        Err(e) => return e.sysret(),
+    };
 
     // Get the attribute
     match inode.i_op.getxattr(&inode, &name, &mut value) {

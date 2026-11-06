@@ -7,6 +7,8 @@
 //! fail-nth (a Linux build without fault injection).
 //!
 //! - FAULT_INJECT_<CALL>: one line per syscall, with the paths it ran
+//! - FAULT_INJECT_XATTR: setxattr/getxattr value buffers fail with
+//!   ENOMEM (Linux kvmalloc), no panic
 //! - FAULT_INJECT_CGROUP_MKDIR: after each failed mkdir of a cgroup the
 //!   name is still free (nothing half made)
 
@@ -29,7 +31,7 @@ pub fn run_tests() {
         return;
     }
     let fd = fd as i32;
-    let calls: [(&[u8], fn() -> i64, fn(i64)); 9] = [
+    let calls: [(&[u8], fn() -> i64, fn(i64)); 10] = [
         (b"SOCKETPAIR", socketpair, close_pair),
         (b"SOCKET_INET", || sys_socket(2, 1, 0), close_one),
         (b"PIPE2", pipe2, close_pair),
@@ -39,6 +41,7 @@ pub fn run_tests() {
         (b"SIGNALFD", signalfd, close_one),
         (b"INOTIFY", || sys_inotify_init1(0), close_one),
         (b"CREAT", creat, close_one),
+        (b"XATTR", xattr, |_| {}),
     ];
     for (name, call, undo) in calls {
         run(fd, name, call, undo);
@@ -262,4 +265,17 @@ fn fork() -> i64 {
         sys_wait4(pid, &mut st, 0, 0);
     }
     pid
+}
+
+/// setxattr then getxattr of a 64-byte user.* value on a scratch file
+fn xattr() -> i64 {
+    let p = b"/tmp/fault_xattr\0";
+    let fd = sys_open(p.as_ptr(), O_CREAT | O_RDWR, 0o600);
+    sys_close(fd as u64);
+    let v = [b'v'; 64];
+    let r = hk_syscall::sys_setxattr(p.as_ptr(), b"user.t\0".as_ptr(), v.as_ptr(), 64, 0);
+    let mut b = [0u8; 64];
+    let g = hk_syscall::sys_getxattr(p.as_ptr(), b"user.t\0".as_ptr(), b.as_mut_ptr(), 64);
+    sys_unlink(p.as_ptr());
+    if r < 0 { r } else { g.min(0) }
 }
