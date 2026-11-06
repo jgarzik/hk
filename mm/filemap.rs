@@ -31,7 +31,7 @@ use super::fault::VmFault;
 use super::page::{
     PG_DIRTY, PG_LOCKED, PG_UPTODATE, Page, frame_bytes, lock_page, phys_to_page, unlock_page,
 };
-use super::xarray::{MARK_DIRTY, MARK_WRITEBACK, Preload, XArray, node_alloc};
+use super::xarray::{MARK_DIRTY, MARK_WRITEBACK, Preload, XArray};
 use crate::FRAME_ALLOCATOR;
 use crate::fs::inode::Inode;
 use crate::fs::iov_iter::{IovDest, IovSource};
@@ -295,9 +295,11 @@ fn add(m: &AddressSpace, phys: u64, index: u64) -> Result<(), KernelError> {
             put_page(phys);
             return Err(KernelError::AlreadyExists);
         }
+        // Nothing allocated under the spin lock: the first try takes
+        // only nodes already there, a retry the preload's
         let stored = match pre.as_mut() {
             Some(p) => pages.store(index, phys, &mut || p.take()),
-            None => pages.store(index, phys, &mut node_alloc),
+            None => pages.store(index, phys, &mut || None),
         };
         if stored.is_some() {
             m.nrpages.fetch_add(1, Ordering::Relaxed);
