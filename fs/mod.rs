@@ -30,6 +30,7 @@ pub mod fs_writeback;
 pub mod icache;
 pub mod io;
 pub mod iov;
+pub mod iov_iter;
 pub mod link;
 pub mod locks;
 pub mod misc;

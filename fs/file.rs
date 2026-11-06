@@ -16,6 +16,7 @@ use crate::sync;
 use super::KernelError;
 use super::dentry::Dentry;
 use super::inode::{FileType, Inode, InodeId};
+use super::iov_iter::{IovDest, IovSource};
 use super::mount::Mount;
 use crate::io::poll::{DEFAULT_POLLMASK, POLLERR, POLLHUP, PollTable};
 
@@ -193,6 +194,86 @@ pub fn generic_llseek(
     Ok(pos)
 }
 
+/// Files whose reads return everything asked for unless at EOF (more
+/// chunks are read); for others (pipes, sockets, terminals) one chunk is
+/// one read, since a second could block although data was returned
+fn reads_fully(file: &File) -> bool {
+    file.get_inode()
+        .is_some_and(|i| i.mode().is_file() || i.mode().is_blkdev())
+}
+
+/// `read_iter` through a kernel buffer of at most `WRITE_CHUNK` bytes,
+/// for file types that read into slices
+fn bounce_read<F: FileOps + ?Sized>(
+    ops: &F,
+    file: &File,
+    to: &mut IovDest<'_>,
+    at: Option<u64>,
+    flags: RwFlags,
+) -> Result<usize, KernelError> {
+    let total = to.len();
+    let mut buf = crate::util::kmem::try_vec(total.min(WRITE_CHUNK), 0u8)?;
+    let mut done = 0;
+    loop {
+        let n = (total - done).min(WRITE_CHUNK);
+        let r = match at {
+            None => ops.read_with_flags(file, &mut buf[..n], flags),
+            Some(o) => ops.pread_with_flags(file, &mut buf[..n], o + done as u64, flags),
+        };
+        let r = match r {
+            Ok(r) => r,
+            Err(_) if done > 0 => return Ok(done),
+            Err(e) => return Err(e),
+        };
+        match to.copy_to(&buf[..r]) {
+            Ok(c) if c == r => {}
+            Ok(c) => return Ok(done + c),
+            Err(_) if done > 0 => return Ok(done),
+            Err(e) => return Err(e),
+        }
+        done += r;
+        if r < n || done >= total || !reads_fully(file) {
+            return Ok(done);
+        }
+    }
+}
+
+/// `write_iter` through a kernel buffer of at most `WRITE_CHUNK` bytes,
+/// for file types that write from slices. A short chunk ends the write;
+/// an error after some bytes returns their count (Linux).
+fn bounce_write<F: FileOps + ?Sized>(
+    ops: &F,
+    file: &File,
+    from: &mut IovSource<'_>,
+    at: Option<u64>,
+    flags: RwFlags,
+) -> Result<usize, KernelError> {
+    let len = from.len();
+    let mut buf = crate::util::kmem::try_vec(len.min(WRITE_CHUNK), 0u8)?;
+    let mut done = 0;
+    loop {
+        let n = (len - done).min(WRITE_CHUNK);
+        let r = from.copy_from(&mut buf[..n]).and_then(|c| {
+            let w = &buf[..c];
+            match at {
+                None => ops.write_with_flags(file, w, flags),
+                Some(o) => ops.pwrite_with_flags(file, w, o + done as u64, flags),
+            }
+            .map(|w| (w, c))
+        });
+        match r {
+            Ok((w, c)) => {
+                done += w;
+                if w < c || c < n || done >= len {
+                    return Ok(done);
+                }
+            }
+            Err(_) if done > 0 => return Ok(done),
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 /// File operations trait - filesystem-specific behavior for open files
 pub trait FileOps: Send + Sync {
     /// Returns self as Any for downcasting to concrete types
@@ -203,6 +284,34 @@ pub trait FileOps: Send + Sync {
     /// `file.private`
     fn open(&self, _file: &File) -> Result<(), KernelError> {
         Ok(())
+    }
+
+    /// Read into `to` at `at`, or at the file position (advancing it)
+    /// when None (Linux f_op->read_iter). Data already copied wins over
+    /// a later error. Default: through `read_with_flags`/
+    /// `pread_with_flags` and a kernel buffer.
+    fn read_iter(
+        &self,
+        file: &File,
+        to: &mut IovDest<'_>,
+        at: Option<u64>,
+        flags: RwFlags,
+    ) -> Result<usize, KernelError> {
+        bounce_read(self, file, to, at, flags)
+    }
+
+    /// Write from `from` at `at`, or at the file position (advancing it)
+    /// when None (Linux f_op->write_iter); `File::write_iter` has taken
+    /// i_rwsem, applied O_APPEND and the size limits. Default: through
+    /// `write_with_flags`/`pwrite_with_flags` and a kernel buffer.
+    fn write_iter(
+        &self,
+        file: &File,
+        from: &mut IovSource<'_>,
+        at: Option<u64>,
+        flags: RwFlags,
+    ) -> Result<usize, KernelError> {
+        bounce_write(self, file, from, at, flags)
     }
 
     /// Read from file at current position
@@ -594,10 +703,21 @@ impl File {
 
     /// Read from file
     pub fn read(&self, buf: &mut [u8]) -> Result<usize, KernelError> {
+        self.read_iter(&mut IovDest::kernel(buf), None, RwFlags::empty())
+    }
+
+    /// Read into `to` at `at` (None: the file position, which advances)
+    /// (Linux vfs_read / vfs_iter_read)
+    pub fn read_iter(
+        &self,
+        to: &mut IovDest<'_>,
+        at: Option<u64>,
+        flags: RwFlags,
+    ) -> Result<usize, KernelError> {
         if !self.is_readable() {
             return Err(KernelError::PermissionDenied);
         }
-        self.f_op.read(self, buf)
+        self.f_op.read_iter(self, to, at, flags)
     }
 
     /// Write at the file position
@@ -607,10 +727,7 @@ impl File {
 
     /// Positioned read - read at given offset without modifying file position
     pub fn pread(&self, buf: &mut [u8], offset: u64) -> Result<usize, KernelError> {
-        if !self.is_readable() {
-            return Err(KernelError::PermissionDenied);
-        }
-        self.f_op.pread(self, buf, offset)
+        self.read_iter(&mut IovDest::kernel(buf), Some(offset), RwFlags::empty())
     }
 
     /// Positioned write (the file position is not used or changed)
@@ -620,10 +737,7 @@ impl File {
 
     /// Read with RWF flags (for preadv2/pwritev2 with RWF_NOWAIT support)
     pub fn read_with_flags(&self, buf: &mut [u8], flags: RwFlags) -> Result<usize, KernelError> {
-        if !self.is_readable() {
-            return Err(KernelError::PermissionDenied);
-        }
-        self.f_op.read_with_flags(self, buf, flags)
+        self.read_iter(&mut IovDest::kernel(buf), None, flags)
     }
 
     /// Positioned read with RWF flags
@@ -633,10 +747,7 @@ impl File {
         offset: u64,
         flags: RwFlags,
     ) -> Result<usize, KernelError> {
-        if !self.is_readable() {
-            return Err(KernelError::PermissionDenied);
-        }
-        self.f_op.pread_with_flags(self, buf, offset, flags)
+        self.read_iter(&mut IovDest::kernel(buf), Some(offset), flags)
     }
 
     /// Write `buf` at `at` (None: the file position, which advances);
@@ -648,39 +759,31 @@ impl File {
         flags: RwFlags,
         append: Option<bool>,
     ) -> Result<usize, KernelError> {
-        let mut off = 0;
-        self.write_from(buf.len(), at, flags, append, &mut |dst| {
-            dst.copy_from_slice(&buf[off..off + dst.len()]);
-            off += dst.len();
-            Ok(())
-        })
+        self.write_iter(&mut IovSource::kernel(buf), at, flags, append)
     }
 
-    /// Write `len` bytes produced in order by `src` at `at` (None: the
-    /// file position, which advances) (Linux vfs_write +
-    /// generic_file_write_iter). The data passes through a kernel buffer
-    /// of at most `WRITE_CHUNK` bytes, so a call never pins more kernel
-    /// memory than that. Regular files are written under the inode's
+    /// Write `from` at `at` (None: the file position, which advances)
+    /// (Linux vfs_write + generic_file_write_iter). Regular files are
+    /// written under the inode's
     /// i_rwsem, held across all chunks: in append mode (`append`:
     /// RWF_APPEND / RWF_NOAPPEND, None = the file's O_APPEND) the data
     /// goes to the current end of file, also for pwrite (Linux), and
     /// position, data and new size change atomically with respect to
     /// other writers and truncate. A short chunk ends the write; an
     /// error after some bytes were written returns their count (Linux).
-    pub fn write_from(
+    pub fn write_iter(
         &self,
-        len: usize,
+        from: &mut IovSource<'_>,
         at: Option<u64>,
         flags: RwFlags,
         append: Option<bool>,
-        src: &mut dyn FnMut(&mut [u8]) -> Result<(), KernelError>,
     ) -> Result<usize, KernelError> {
         if !self.is_writable() {
             return Err(KernelError::PermissionDenied);
         }
         let inode = match self.get_inode() {
             Some(i) if i.mode().is_file() => i,
-            _ => return self.write_chunks(len, at, flags, src),
+            _ => return self.f_op.write_iter(self, from, at, flags),
         };
         let append = append.unwrap_or(self.get_flags() & flags::O_APPEND != 0);
         let _lock = inode.lock();
@@ -701,48 +804,14 @@ impl File {
             let pos = at.unwrap_or_else(|| self.get_pos());
             // A zero-length write checks nothing (Linux: count 0 returns
             // before generic_write_checks)
-            if len == 0 {
+            if from.is_empty() {
                 return Ok(0);
             }
-            let len = inode.write_limit(pos, len)?;
+            from.truncate(inode.write_limit(pos, from.len())?);
             // file_remove_privs: set-id bits go unless CAP_FSETID
             super::dac::remove_privs(&inode);
-            self.write_chunks(len, at, flags, src)
+            self.f_op.write_iter(self, from, at, flags)
         })()
-    }
-
-    /// The chunk loop of `write_from`
-    fn write_chunks(
-        &self,
-        len: usize,
-        at: Option<u64>,
-        flags: RwFlags,
-        src: &mut dyn FnMut(&mut [u8]) -> Result<(), KernelError>,
-    ) -> Result<usize, KernelError> {
-        let mut buf = alloc::vec![0u8; len.min(WRITE_CHUNK)];
-        let mut done = 0;
-        loop {
-            let n = (len - done).min(WRITE_CHUNK);
-            let r = src(&mut buf[..n])
-                .and_then(|()| self.do_write(&buf[..n], at.map(|o| o + done as u64), flags));
-            match r {
-                Ok(w) => {
-                    done += w;
-                    if w < n || done >= len {
-                        return Ok(done);
-                    }
-                }
-                Err(_) if done > 0 => return Ok(done),
-                Err(e) => return Err(e),
-            }
-        }
-    }
-
-    fn do_write(&self, buf: &[u8], at: Option<u64>, flags: RwFlags) -> Result<usize, KernelError> {
-        match at {
-            None => self.f_op.write_with_flags(self, buf, flags),
-            Some(o) => self.f_op.pwrite_with_flags(self, buf, o, flags),
-        }
     }
 
     /// Seek
