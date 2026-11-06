@@ -38,9 +38,9 @@ use spin::Lazy;
 
 use crate::arch::Uaccess;
 use crate::fs::dentry::Dentry;
-use crate::fs::file::{File, FileOps, RwFlags, flags, stream_rw};
+use crate::fs::file::{File, FileOps, RwFlags, flags};
 use crate::fs::inode::{Inode, InodeMode, NULL_INODE_OPS, Timespec as InodeTimespec};
-use crate::fs::iov_iter::{IovDest, IovSource};
+use crate::fs::iov_iter::IovDest;
 use crate::io::pipe::FD_CLOEXEC;
 use crate::io::poll::{POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM, PollTable};
 use crate::sync::waitqueue::WaitQueue;
@@ -186,6 +186,27 @@ pub struct MqQueue {
 }
 
 impl MqQueue {
+    /// "QSIZE:... NOTIFY:... SIGNO:... NOTIFY_PID:...\n" (Linux
+    /// mqueue_read_file's format)
+    fn status(&self) -> alloc::string::String {
+        let qsize: usize = self.messages.lock().iter().map(|m| m.data.len()).sum();
+        let (notify, signo, pid) = match self.notify.lock().as_ref() {
+            Some(n) => (
+                n.sigev_notify,
+                if n.sigev_notify == SIGEV_SIGNAL {
+                    n.sigev_signo
+                } else {
+                    0
+                },
+                n.owner.nr(),
+            ),
+            None => (0, 0, 0),
+        };
+        alloc::format!(
+            "QSIZE:{qsize:<10} NOTIFY:{notify:<5} SIGNO:{signo:<5} NOTIFY_PID:{pid:<6}\n"
+        )
+    }
+
     fn new(name: FileName, mode: u32, maxmsg: i64, msgsize: i64) -> Self {
         // Get current task's effective uid/gid as owner
         let cred = crate::task::percpu::current_cred();
@@ -391,49 +412,24 @@ impl FileOps for MqFileOps {
         self
     }
 
-    /// Receive the next message (blocking), as much of it as fits;
-    /// the message is copied out after it left the queue
+    /// The queue's status line (Linux mqueue_read_file): bytes queued
+    /// and the notification registered; no message is consumed. The
+    /// file position moves through the line.
     fn read_iter(
         &self,
         file: &File,
         to: &mut IovDest<'_>,
         at: Option<u64>,
-        flags: RwFlags,
+        _flags: RwFlags,
     ) -> Result<usize, KernelError> {
-        stream_rw(at, flags)?;
         let mq = mq_of(file).ok_or(KernelError::BadFd)?;
-        if mq.access_mode == O_WRONLY {
-            return Err(KernelError::PermissionDenied);
+        let line = mq.queue.status();
+        let pos = at.unwrap_or_else(|| file.get_pos()) as usize;
+        let n = to.copy_to(line.as_bytes().get(pos..).unwrap_or(&[]))?;
+        if at.is_none() {
+            file.advance_pos(n as u64);
         }
-        let Ok((data, _prio)) = mq.queue.receive(false, None) else {
-            return Err(KernelError::Io);
-        };
-        to.copy_to(&data)
-    }
-
-    /// Send the data as one message of priority 0 (blocking)
-    fn write_iter(
-        &self,
-        file: &File,
-        from: &mut IovSource<'_>,
-        at: Option<u64>,
-        flags: RwFlags,
-    ) -> Result<usize, KernelError> {
-        stream_rw(at, flags)?;
-        let mq = mq_of(file).ok_or(KernelError::BadFd)?;
-        if mq.access_mode == O_RDONLY {
-            return Err(KernelError::PermissionDenied);
-        }
-        let len = from.len();
-        if len as i64 > mq.queue.msgsize {
-            return Err(KernelError::MessageTooLong);
-        }
-        let mut data = crate::util::kmem::try_vec(len, 0u8)?;
-        from.copy_from_full(&mut data)?;
-        match mq.queue.send(data, 0, false, None) {
-            Ok(()) => Ok(len),
-            Err(_) => Err(KernelError::Io),
-        }
+        Ok(n)
     }
 
     fn poll(&self, file: &File, table: Option<&mut PollTable<'_>>) -> u16 {

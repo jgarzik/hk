@@ -19,7 +19,7 @@
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
     MqAttr, O_CREAT, O_EXCL, O_NONBLOCK, O_RDWR, sys_close, sys_mq_getsetattr, sys_mq_open,
-    sys_mq_timedreceive, sys_mq_timedsend, sys_mq_unlink,
+    sys_mq_timedreceive, sys_mq_timedsend, sys_mq_unlink, sys_read, sys_write,
 };
 
 // Error codes
@@ -54,6 +54,7 @@ pub fn run_tests() {
     test_mq_name_toolong();
     test_mq_attr_limits();
     test_mq_notify_owner_exit();
+    test_mq_read_status();
 }
 
 /// SIGEV_NONE on `fd`: mq_notify's result
@@ -592,6 +593,41 @@ fn test_mq_name_toolong() {
         print_num(o);
         print(b" unlink=");
         print_num(u);
+        println(b"");
+    }
+}
+
+/// read() on a queue descriptor returns its status line (Linux
+/// mqueue_read_file: "QSIZE:<bytes queued> NOTIFY:..."), leaving the
+/// messages queued; write() is EINVAL
+fn test_mq_read_status() {
+    let name = b"hk_mq_status\0";
+    let fd = sys_mq_open(
+        name.as_ptr(),
+        (O_CREAT | O_RDWR) as i32,
+        0o600,
+        core::ptr::null(),
+    ) as i32;
+    let msg = *b"hello";
+    sys_mq_timedsend(fd, msg.as_ptr(), msg.len(), 0, core::ptr::null());
+    let mut buf = [0u8; 128];
+    let n = sys_read(fd as u64, buf.as_mut_ptr(), buf.len() as u64);
+    let w = sys_write(fd as u64, msg.as_ptr(), msg.len() as u64);
+    let mut attr = MqAttr::default();
+    sys_mq_getsetattr(fd, core::ptr::null(), &mut attr);
+    sys_close(fd as u64);
+    sys_mq_unlink(name.as_ptr());
+    let line = &buf[..n.max(0) as usize];
+    if line.starts_with(b"QSIZE:5 ") && line.ends_with(b"\n") && w == EINVAL && attr.mq_curmsgs == 1
+    {
+        println(b"MQ_READ_STATUS:OK");
+    } else {
+        print(b"MQ_READ_STATUS:FAIL read ");
+        print_num(n);
+        print(b" write ");
+        print_num(w);
+        print(b" curmsgs ");
+        print_num(attr.mq_curmsgs);
         println(b"");
     }
 }
