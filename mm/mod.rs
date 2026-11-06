@@ -1077,14 +1077,24 @@ pub fn exit_task_mm(tid: Tid) -> Option<Arc<Mm>> {
 /// inherited (VM_LOCKED cleared, locked_vm and MCL_FUTURE reset). On
 /// error the partial copy is torn down with the child mm.
 /// Fork copies the parent's entries of `v` (Linux vma_needs_copy): not
-/// for a wipe-on-fork range, nor for a shared mapping, whose pages the
-/// child faults in from the file or shared object instead. Copying
-/// those would race a truncate: one that already passed the child's
-/// i_mmap entry would miss what fork copies after it. A private mapping
-/// is copied: its copy-on-write pages exist only in its entries. (hk has
-/// no VM_PFNMAP mappings, which Linux also copies.)
+/// for a wipe-on-fork range, nor for a shared mapping whose pages the
+/// child faults back in from a shared object or the page cache.
+/// Copying those would race a truncate: one that already passed the
+/// child's i_mmap entry would miss what fork copies after it. A private
+/// mapping is copied (its copy-on-write pages exist only in its
+/// entries), and so is a shared mapping of a file without a page cache,
+/// whose faults would read a private copy (Linux copies VM_PFNMAP and
+/// VM_MIXEDMAP mappings likewise).
 fn vma_needs_copy(v: &Vma) -> bool {
-    v.flags & VM_WIPEONFORK == 0 && !v.is_shared()
+    if v.flags & VM_WIPEONFORK != 0 {
+        return false;
+    }
+    let refaults = v.shmem.is_some()
+        || v.file
+            .as_ref()
+            .and_then(|f| f.mapping_inode())
+            .is_some_and(|i| i.i_op.maps_cache());
+    !(v.is_shared() && refaults)
 }
 
 pub fn dup_mm(parent: &MmRef, pgd: u64) -> Result<MmRef, i32> {
