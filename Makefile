@@ -25,7 +25,7 @@ KERNEL_FEATURES = $(if $(LOCKDEP),--features lockdep)
 MACHINE ?=
 
 .PHONY: all build debug user iso iso-debug run run-debug test check clean info help vfat-image disk-image
-.PHONY: build-arm run-arm check-arm check-linux check-linux-arm user-arm clippy clippy-arm fmt list-machines gate check-stress unsafe-stats check-bigmem
+.PHONY: test-arm build-arm run-arm check-arm check-linux check-linux-arm user-arm clippy clippy-arm fmt list-machines gate check-stress unsafe-stats check-bigmem
 
 # Default: build everything (kernel, user binaries, ISO)
 all: iso
@@ -156,6 +156,14 @@ run-debug: iso-debug disk-image
 
 test:
 	cargo test -p hk-kernel
+
+# Host unit tests built for arm64 (on an x86-64 host they run under
+# qemu-user: packages qemu-user, qemu-user-binfmt, libc6-dev-arm64-cross)
+# (QEMU_CPU, meant for qemu-system, would also steer qemu-user)
+test-arm:
+	env -u QEMU_CPU CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
+	QEMU_LD_PREFIX=/usr/aarch64-linux-gnu \
+	cargo test -p hk-kernel --target aarch64-unknown-linux-gnu
 
 # QEMU boot test timeout in seconds (TCG on CI hosts without KVM is slow)
 # Bounds hangs only; the full suite takes ~1 min locally, longer on CI
