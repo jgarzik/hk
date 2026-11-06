@@ -658,6 +658,27 @@ fn table_s5(phys: u64, sig: &[u8; 4]) -> Option<SleepType> {
     s5
 }
 
+/// The proximity domain of an enabled SRAT CPU or memory affinity entry
+/// at `ptr` of type `kind`
+///
+/// # Safety
+/// `ptr` points at a whole mapped SRAT entry of that type.
+unsafe fn srat_entry_pxm(ptr: *const u8, kind: u8) -> Option<u32> {
+    // SAFETY: offsets inside the entry (caller), read unaligned
+    unsafe {
+        let rd = |o: usize| core::ptr::read_unaligned(ptr.add(o).cast::<u32>());
+        let b = |o: usize| u32::from(core::ptr::read_unaligned(ptr.add(o)));
+        match kind {
+            SRAT_ENTRY_LAPIC_AFFINITY if rd(4) & 1 != 0 => {
+                Some(b(2) | (b(9) << 8) | (b(10) << 16) | (b(11) << 24))
+            }
+            SRAT_ENTRY_X2APIC_AFFINITY if rd(12) & 1 != 0 => Some(rd(4)),
+            SRAT_ENTRY_MEMORY_AFFINITY if rd(28) & 1 != 0 => Some(rd(2)),
+            _ => None,
+        }
+    }
+}
+
 /// Initialize NUMA topology from ACPI SRAT/SLIT tables
 ///
 /// Called early in boot to discover NUMA topology. If SRAT is not found,
@@ -743,6 +764,30 @@ fn parse_srat_mapped(srat_phys: u64) -> Result<(), &'static str> {
 
         let mut topology = NUMA_TOPOLOGY.lock();
 
+        // Number the proximity domains first, in Linux's order
+        // (acpi_numa_init: x2APIC, then local APIC, then memory
+        // affinity): nodes run from 0 whatever the domain numbers
+        for kind in [
+            SRAT_ENTRY_X2APIC_AFFINITY,
+            SRAT_ENTRY_LAPIC_AFFINITY,
+            SRAT_ENTRY_MEMORY_AFFINITY,
+        ] {
+            let mut ptr = entries_start;
+            while ptr < entries_end {
+                let entry_type = core::ptr::read_unaligned(ptr);
+                let entry_len = core::ptr::read_unaligned(ptr.add(1)) as usize;
+                if entry_len == 0 {
+                    break;
+                }
+                if entry_type == kind
+                    && let Some(pxm) = srat_entry_pxm(ptr, entry_type)
+                {
+                    let _ = topology.acpi_map_pxm(pxm);
+                }
+                ptr = ptr.add(entry_len);
+            }
+        }
+
         // First pass: collect memory affinity entries to build nodes
         let mut ptr = entries_start;
         while ptr < entries_end {
@@ -772,7 +817,9 @@ fn parse_srat_mapped(srat_phys: u64) -> Result<(), &'static str> {
                 if enabled {
                     let base_addr = base_lo | (base_hi << 32);
                     let length = len_lo | (len_hi << 32);
-                    let node_id = prox_domain_lo as usize;
+                    let node_id = topology
+                        .pxm_to_node(prox_domain_lo)
+                        .unwrap_or(MAX_NUMA_NODES);
 
                     if node_id < MAX_NUMA_NODES && length > 0 {
                         let start_pfn = base_addr / 4096;
@@ -833,7 +880,9 @@ fn parse_srat_mapped(srat_phys: u64) -> Result<(), &'static str> {
                     let enabled = (flags & 0x1) != 0;
 
                     if enabled {
-                        let node_id = (prox_domain_lo | (prox_domain_hi << 8)) as usize;
+                        let node_id = topology
+                            .pxm_to_node(prox_domain_lo | (prox_domain_hi << 8))
+                            .unwrap_or(MAX_NUMA_NODES);
                         // By APIC id: the logical CPU joins at bring-up
                         if node_id < MAX_NUMA_NODES {
                             topology.set_hwid_node(u64::from(apic_id), node_id as u32);
@@ -853,7 +902,7 @@ fn parse_srat_mapped(srat_phys: u64) -> Result<(), &'static str> {
                     let enabled = (flags & 0x1) != 0;
 
                     if enabled {
-                        let node_id = prox_domain as usize;
+                        let node_id = topology.pxm_to_node(prox_domain).unwrap_or(MAX_NUMA_NODES);
                         // By x2APIC id: the logical CPU joins at bring-up
                         if node_id < MAX_NUMA_NODES {
                             topology.set_hwid_node(u64::from(x2apic_id), node_id as u32);
@@ -883,7 +932,7 @@ fn parse_srat_mapped(srat_phys: u64) -> Result<(), &'static str> {
 
 /// Parse SLIT table for inter-node distance matrix
 fn parse_slit_mapped(slit_phys: u64) -> Result<(), &'static str> {
-    use crate::mm::numa::{MAX_NUMA_NODES, NUMA_TOPOLOGY};
+    use crate::mm::numa::NUMA_TOPOLOGY;
 
     unsafe {
         // Map the SLIT
@@ -899,21 +948,32 @@ fn parse_slit_mapped(slit_phys: u64) -> Result<(), &'static str> {
         // SLIT header: SdtHeader (36) + Number of System Localities (8)
         let num_localities = core::ptr::read_unaligned(slit_ptr.add(36) as *const u64) as usize;
 
-        if num_localities > MAX_NUMA_NODES {
-            iounmap(slit_ptr, slit_length as u64);
-            return Err("SLIT has too many localities");
-        }
-
         // Distance matrix starts at offset 44, stored as 1D array [from][to]
+        if num_localities
+            .checked_mul(num_localities)
+            .and_then(|m| m.checked_add(44))
+            .is_none_or(|end| end > slit_length)
+        {
+            iounmap(slit_ptr, slit_length as u64);
+            return Err("SLIT shorter than its matrix");
+        }
         let matrix_start = slit_ptr.add(44);
 
         let mut topology = NUMA_TOPOLOGY.lock();
 
+        // Localities are proximity domains: only those SRAT numbered
+        // have nodes (Linux acpi_parse_slit -> pxm_to_node)
         for from in 0..num_localities {
             for to in 0..num_localities {
+                let (Some(f), Some(t)) = (
+                    topology.pxm_to_node(from as u32),
+                    topology.pxm_to_node(to as u32),
+                ) else {
+                    continue;
+                };
                 let offset = from * num_localities + to;
                 let distance = core::ptr::read_unaligned(matrix_start.add(offset));
-                topology.set_distance(from, to, distance);
+                topology.set_distance(f, t, distance);
             }
         }
 
