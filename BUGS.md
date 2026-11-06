@@ -887,10 +887,10 @@ Tag = roadmap phase (doc/ROADMAP.md).
 2. **arm64 /reserved-memory no-map regions are linear-mapped** (D;
    real HW). `arch/aarch64/dtb.rs:192`: Linux memblock_mark_nomap
    removes them (speculative access to secure carve-outs).
-3. **memblock holds at most 128 ranges** (J). `mm/memblock.rs:18`: a
-   firmware map with more RAM or reserved ranges panics at boot
-   (asserts in add/remove/reserve); Linux grows the array
-   (memblock_double_array).
+3. **memblock does not grow its arrays** (J). `mm/memblock.rs`: 512
+   ranges per set; RAM ranges past that are dropped with a warning (as
+   Linux before memblock_allow_resize), but a reservation past it still
+   panics; Linux doubles the arrays then (memblock_double_array).
 4. **LRU batch refs defeat exclusivity checks** (J). `mm/fault.rs:504`
    / `:596`: refcount==1 tests fail while a page sits in the per-CPU
    add batch, so swap-in makes needless COW copies. Linux drains and
