@@ -85,8 +85,11 @@ pub fn sys_socketpair(domain: i32, stype: i32, protocol: i32, sv: u64) -> i64 {
         let a = ScopeGuard::new_with_data(create()?, |s| s.release());
         let b = ScopeGuard::new_with_data(create()?, |s| s.release());
         a.socketpair(&**b)?;
-        let (a, b) = (a.dismiss(), b.dismiss());
-        let fds = install_pair(sock_alloc_file(a, nb)?, sock_alloc_file(b, nb)?, cloexec)?;
+        // Each socket stays guarded until its file owns it: a failed
+        // file for `a` must still release `b`
+        let fa = sock_alloc_file(a.dismiss(), nb)?;
+        let fb = sock_alloc_file(b.dismiss(), nb)?;
+        let fds = install_pair(fa, fb, cloexec)?;
         put_user::<Uaccess, [i32; 2]>(sv, fds).map_err(|_| KernelError::BadAddress)?;
         Ok(0)
     })())
