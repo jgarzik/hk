@@ -507,9 +507,10 @@ impl File {
 
     /// Set status flags (for F_SETFL)
     ///
-    /// Only O_APPEND, O_NONBLOCK can be modified. Access mode is preserved.
+    /// Only O_APPEND, O_NONBLOCK and O_NOATIME can be modified. Access
+    /// mode is preserved.
     pub fn set_status_flags(&self, new_status: u32) {
-        const SETTABLE_FLAGS: u32 = flags::O_APPEND | flags::O_NONBLOCK;
+        const SETTABLE_FLAGS: u32 = flags::O_APPEND | flags::O_NONBLOCK | super::dac::O_NOATIME;
         let mut guard = self.f_lock.lock();
         *guard = (*guard & !SETTABLE_FLAGS) | (new_status & SETTABLE_FLAGS);
     }
@@ -580,7 +581,24 @@ impl File {
         if !self.is_readable() {
             return Err(KernelError::PermissionDenied);
         }
-        self.f_op.read_iter(self, to, at, flags)
+        let want = !to.is_empty();
+        let r = self.f_op.read_iter(self, to, at, flags);
+        // A regular file read asking for data (Linux filemap_read)
+        if want && let Some(i) = self.get_inode().filter(|i| i.mode().is_file()) {
+            self.accessed(&i);
+        }
+        r
+    }
+
+    /// An access of the file's data (Linux file_accessed): its atime,
+    /// unless opened O_NOATIME or reached without a mount
+    pub fn accessed(&self, inode: &Inode) {
+        if self.get_flags() & super::dac::O_NOATIME != 0 {
+            return;
+        }
+        if let Some(m) = &self.mnt {
+            inode.touch_atime(m);
+        }
     }
 
     /// Write at the file position
@@ -699,7 +717,12 @@ impl File {
         if !self.is_dir() {
             return Err(KernelError::NotDirectory);
         }
-        self.f_op.readdir(self, ctx)
+        let r = self.f_op.readdir(self, ctx);
+        // Linux iterate_dir: a directory not yet removed
+        if let Some(i) = self.get_inode().filter(|i| !i.is_dead()) {
+            self.accessed(&i);
+        }
+        r
     }
 
     /// Poll for events

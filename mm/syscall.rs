@@ -182,6 +182,13 @@ pub fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: 
     if noexec && prot & super::PROT_EXEC != 0 {
         return KernelError::NotPermitted.sysret();
     }
+    // A regular file's mmap is an access (Linux generic_file_mmap:
+    // file_accessed)
+    if let Some(f) = &file
+        && let Some(i) = f.get_inode().filter(|i| i.mode().is_file())
+    {
+        f.accessed(&i);
+    }
 
     // Every user task has an address space; kernel threads have none
     let tid = current_tid();

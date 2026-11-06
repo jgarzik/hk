@@ -303,8 +303,8 @@ pub fn sys_statfs(path_ptr: u64, buf: u64) -> i64 {
 }
 
 /// statfs f_flags (Linux calculate_f_flags): ST_VALID, ST_RDONLY and
-/// ST_SYNCHRONOUS from the superblock, ST_NOSUID/NODEV/NOEXEC and
-/// ST_NOSYMFOLLOW from the mount
+/// ST_SYNCHRONOUS from the superblock, ST_NOSUID/NODEV/NOEXEC, the
+/// atime flags and ST_NOSYMFOLLOW from the mount
 fn st_flags(mnt_flags: u32, sb: &super::SuperBlock) -> u64 {
     use super::mount::MNT_NOSYMFOLLOW;
     const ST_SYNCHRONOUS: u64 = 0x10;
@@ -316,6 +316,9 @@ fn st_flags(mnt_flags: u32, sb: &super::SuperBlock) -> u64 {
     if sb.synchronous() {
         f |= ST_SYNCHRONOUS;
     }
+    // MNT_NOATIME/NODIRATIME/RELATIME (8, 0x10, 0x20) map to
+    // ST_NOATIME/NODIRATIME/RELATIME (0x400, 0x800, 0x1000)
+    f |= (mnt & 0x38) << 7;
     if mnt_flags & MNT_NOSYMFOLLOW != 0 {
         f |= ST_NOSYMFOLLOW;
     }

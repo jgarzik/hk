@@ -23,6 +23,15 @@ pub const MNT_NOSUID: u32 = 0x1;
 pub const MNT_NODEV: u32 = 0x2;
 /// No program execution (Linux MNT_NOEXEC)
 pub const MNT_NOEXEC: u32 = 0x4;
+/// No atime updates (Linux MNT_NOATIME)
+pub const MNT_NOATIME: u32 = 0x8;
+/// No atime updates on directories (Linux MNT_NODIRATIME)
+pub const MNT_NODIRATIME: u32 = 0x10;
+/// atime updated only when older than mtime/ctime or a day (Linux
+/// MNT_RELATIME, the default)
+pub const MNT_RELATIME: u32 = 0x20;
+/// The atime flags (Linux MNT_ATIME_MASK)
+pub const MNT_ATIME_MASK: u32 = MNT_NOATIME | MNT_NODIRATIME | MNT_RELATIME;
 /// This mount is read-only, whatever its superblock (Linux MNT_READONLY)
 pub const MNT_READONLY: u32 = 0x40;
 /// Symlinks on this mount are not followed (Linux MNT_NOSYMFOLLOW)

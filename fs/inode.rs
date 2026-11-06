@@ -720,6 +720,32 @@ impl Inode {
         self.mtime.set(now);
     }
 
+    /// An access through `mnt` (Linux touch_atime): atime becomes the
+    /// current time unless the mount is read-only, noatime (nodiratime
+    /// for a directory), or relatime and the atime is newer than mtime
+    /// and ctime and under a day old. Unlocked, as Linux.
+    pub fn touch_atime(&self, mnt: &super::mount::Mount) {
+        use super::mount::{MNT_NOATIME, MNT_NODIRATIME, MNT_RELATIME};
+        let f = mnt.flags();
+        if f & MNT_NOATIME != 0
+            || (f & MNT_NODIRATIME != 0 && self.mode().is_dir())
+            || mnt.is_readonly()
+        {
+            return;
+        }
+        let now = crate::time::TIMEKEEPER.current_time();
+        let atime = self.atime();
+        let stale = |t: Timespec| (t.sec, t.nsec) >= (atime.sec, atime.nsec);
+        let relatime_ok = stale(self.mtime())
+            || stale(self.ctime())
+            || now.sec.wrapping_sub(atime.sec) >= 24 * 60 * 60;
+        if (f & MNT_RELATIME != 0 && !relatime_ok) || (now.sec, now.nsec) == (atime.sec, atime.nsec)
+        {
+            return;
+        }
+        self.atime.set(now);
+    }
+
     /// ctime becomes the current time (Linux inode_set_ctime_current).
     /// Callers normally hold `i_rwsem` (else a reader may see a mix of
     /// two updates, as on Linux).

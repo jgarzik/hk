@@ -59,8 +59,8 @@ mod ms {
     pub const MGC_MSK: u64 = 0xffff_0000;
 
     /// Flags hk honors, or may accept without effect because hk
-    /// already behaves that way (no atime updates, no mandatory locks);
-    /// everything else is EINVAL instead of being ignored
+    /// already behaves that way (no mandatory locks); everything else
+    /// is EINVAL instead of being ignored
     pub const KNOWN: u64 = RDONLY
         | SYNCHRONOUS
         | DIRSYNC
@@ -87,10 +87,26 @@ mod ms {
         | LAZYTIME;
 }
 
-/// Per-mount MNT_* flags of mount(2) flags
+/// Per-mount MNT_* flags of mount(2) flags (Linux path_mount): relatime
+/// unless noatime or strictatime
 fn mnt_flags(flags: u64) -> u32 {
-    use super::mount::{MNT_NODEV, MNT_NOEXEC, MNT_NOSUID, MNT_NOSYMFOLLOW, MNT_READONLY};
+    use super::mount::{
+        MNT_NOATIME, MNT_NODEV, MNT_NODIRATIME, MNT_NOEXEC, MNT_NOSUID, MNT_NOSYMFOLLOW,
+        MNT_READONLY, MNT_RELATIME,
+    };
     let mut f = 0;
+    if flags & ms::NOATIME == 0 {
+        f |= MNT_RELATIME;
+    }
+    if flags & ms::NOATIME != 0 {
+        f |= MNT_NOATIME;
+    }
+    if flags & ms::NODIRATIME != 0 {
+        f |= MNT_NODIRATIME;
+    }
+    if flags & ms::STRICTATIME != 0 {
+        f &= !(MNT_RELATIME | MNT_NOATIME);
+    }
     if flags & ms::RDONLY != 0 {
         f |= MNT_READONLY;
     }
@@ -107,6 +123,18 @@ fn mnt_flags(flags: u64) -> u32 {
         f |= MNT_NOSYMFOLLOW;
     }
     f
+}
+
+/// A remount's MNT_* flags: with no atime flag given, `old`'s atime
+/// flags are kept (Linux path_mount)
+fn remount_flags(flags: u64, old: u32) -> u32 {
+    use super::mount::MNT_ATIME_MASK;
+    let f = mnt_flags(flags);
+    let atime = ms::NOATIME | ms::NODIRATIME | ms::RELATIME | ms::STRICTATIME;
+    if flags & atime != 0 {
+        return f;
+    }
+    (f & !MNT_ATIME_MASK) | (old & MNT_ATIME_MASK)
 }
 
 /// SB_SYNCHRONOUS / SB_DIRSYNC of mount(2) flags
@@ -134,7 +162,7 @@ fn remount(m: &Arc<super::mount::Mount>, flags: u64) -> Result<(), KernelError> 
         m.sb.make_rdwr();
     }
     m.sb.set_sync_flags(sb_sync_flags(flags));
-    m.set_flags(mnt_flags(flags))
+    m.set_flags(remount_flags(flags, m.flags()))
 }
 
 /// MS_REMOUNT|MS_BIND (Linux do_reconfigure_mnt): this mount's flags
@@ -143,7 +171,7 @@ fn reconfigure_mnt(m: &Arc<super::mount::Mount>, flags: u64) -> Result<(), Kerne
     // s_umount shared, as Linux do_reconfigure_mnt: the superblock does
     // not change, MOUNT_LOCK serializes the flag writers
     let _s = m.sb.s_umount.read();
-    m.set_flags(mnt_flags(flags))
+    m.set_flags(remount_flags(flags, m.flags()))
 }
 
 /// MS_SHARED / MS_SLAVE / MS_PRIVATE / MS_UNBINDABLE (Linux

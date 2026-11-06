@@ -517,11 +517,22 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> i64 {
         }
 
         F_SETFL => {
-            // Set file status flags (only O_APPEND, O_NONBLOCK can be changed)
+            // Set file status flags (O_APPEND, O_NONBLOCK, O_NOATIME)
             let file = match table.get(fd) {
                 Some(f) => f,
                 None => return KernelError::BadFd.sysret(),
             };
+            // Linux setfl: setting O_NOATIME needs the owner or
+            // CAP_FOWNER
+            let noatime = super::dac::O_NOATIME;
+            if arg as u32 & noatime != 0
+                && file.get_flags() & noatime == 0
+                && !file
+                    .get_inode()
+                    .is_some_and(|i| super::dac::owner_or_capable(&super::dac::cred(), &i))
+            {
+                return KernelError::NotPermitted.sysret();
+            }
             file.set_status_flags(arg as u32);
             0
         }

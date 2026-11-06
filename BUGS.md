@@ -446,8 +446,8 @@ FIONREAD only for regular files and passes the rest to f_op->ioctl
 
 **Location**: `fs/misc.rs` sys_mount/sys_umount2, `fs/mount.rs`
 
-Accepted without effect: atime flags (no atime updates), MS_SILENT,
-MS_MANDLOCK, MS_POSIXACL, MS_I_VERSION, MS_LAZYTIME. Propagation (`fs/pnode.rs`): a propagated copy lands
+Accepted without effect: MS_SILENT, MS_MANDLOCK, MS_POSIXACL,
+MS_I_VERSION, MS_LAZYTIME. Propagation (`fs/pnode.rs`): a propagated copy lands
 on top of what is already mounted at the target (Linux tucks it
 under); a slave's master is its master's peer group, not one mount;
 copies of a namespace are always peers and not locked (Linux

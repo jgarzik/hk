@@ -112,7 +112,7 @@ fn do_readlinkat(dirfd: i32, path_ptr: u64, buf: u64, bufsiz: i32) -> Result<usi
         &path,
         LookupFlags::at(super::file::flags::AT_SYMLINK_NOFOLLOW),
     )?;
-    let inode = dentry.get_inode().ok_or(KernelError::NotFound)?;
+    let inode = dentry.dentry.get_inode().ok_or(KernelError::NotFound)?;
     if !inode.mode().is_symlink() {
         return Err(if path.is_empty() {
             KernelError::NotFound
@@ -128,6 +128,7 @@ fn do_readlinkat(dirfd: i32, path_ptr: u64, buf: u64, bufsiz: i32) -> Result<usi
     };
     let n = target.len().min(bufsiz as usize);
     copy_to_user::<Uaccess>(buf, &target[..n]).map_err(|_| KernelError::BadAddress)?;
+    inode.touch_atime(&dentry.mnt);
     Ok(n)
 }
 

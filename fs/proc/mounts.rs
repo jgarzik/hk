@@ -9,7 +9,8 @@ use alloc::vec::Vec;
 use super::super::Path;
 use super::super::dentry::{d_path, dentry_path};
 use super::super::mount::{
-    MNT_NODEV, MNT_NOEXEC, MNT_NOSUID, MNT_NOSYMFOLLOW, MNT_READONLY, Mount, NAMESPACE_SEM,
+    MNT_NOATIME, MNT_NODEV, MNT_NODIRATIME, MNT_NOEXEC, MNT_NOSUID, MNT_NOSYMFOLLOW,
+    MNT_READONLY, MNT_RELATIME, Mount, NAMESPACE_SEM,
 };
 use super::super::name::mangle;
 use super::get_tid_for_pid;
@@ -64,6 +65,9 @@ fn mnt_opts(out: &mut Vec<u8>, m: &Mount) {
         (MNT_NOSUID, &b",nosuid"[..]),
         (MNT_NODEV, b",nodev"),
         (MNT_NOEXEC, b",noexec"),
+        (MNT_NOATIME, b",noatime"),
+        (MNT_NODIRATIME, b",nodiratime"),
+        (MNT_RELATIME, b",relatime"),
         (MNT_NOSYMFOLLOW, b",nosymfollow"),
     ] {
         if f & bit != 0 {

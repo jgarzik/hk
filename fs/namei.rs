@@ -291,6 +291,7 @@ fn follow_link(
         super::dac::may_follow_link(c, &d, &inode)?;
     }
     let target = inode.i_op.readlink(&inode)?;
+    inode.touch_atime(&dir.mnt);
     let mut path = target;
     for comp in rest {
         path.push(b'/');
