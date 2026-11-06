@@ -144,6 +144,15 @@ fn outer(base: u64, size: u64) -> (u64, u64) {
     (base.min(PHYS_LIMIT) & !(PAGE - 1), end)
 }
 
+/// RAM at [b, e) did not fit the memory map (Linux memblock_add's
+/// error). Host tests do not print: printk needs the kernel's per-CPU
+/// state, which an arm64 host cannot read from user mode.
+fn warn_dropped(b: u64, e: u64) {
+    if !cfg!(test) {
+        crate::printkln!("memblock: memory map full, ignoring RAM {b:#x}-{e:#x}");
+    }
+}
+
 /// RAM and reserved ranges, plus the highest address early allocations
 /// may use (Linux memblock.current_limit)
 pub struct Memblock {
@@ -169,7 +178,7 @@ impl Memblock {
     pub fn add(&mut self, base: u64, size: u64) {
         let (b, e) = inner(base, size);
         if !self.memory.add(b, e) {
-            crate::printkln!("memblock: memory map full, ignoring RAM {b:#x}-{e:#x}");
+            warn_dropped(b, e);
         }
     }
 
@@ -193,11 +202,7 @@ impl Memblock {
                 m.r[kept] = x;
                 kept += 1;
             } else {
-                crate::printkln!(
-                    "memblock: memory map full, ignoring RAM {:#x}-{:#x}",
-                    x.base,
-                    x.end
-                );
+                warn_dropped(x.base, x.end);
             }
         }
         m.n = kept;
