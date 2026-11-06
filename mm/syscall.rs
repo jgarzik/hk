@@ -50,25 +50,25 @@ pub const MCL_ONFAULT: i32 = 4;
 /// Address of mapping on success, negative errno on failure
 /// mprotect's file checks (Linux VM_MAYWRITE, decided at mmap): the
 /// file must be readable, and a shared writable mapping needs it open
-/// for writing and not append-only (EACCES)
+/// for writing (EACCES); O_APPEND does not matter (Linux refuses only
+/// an append-only inode, which hk does not have)
 fn file_prot_ok(f: &File, prot: u32, shared: bool) -> Result<(), KernelError> {
-    use crate::fs::flags::O_APPEND;
     if !f.is_readable() {
         return Err(KernelError::PermissionDenied);
     }
-    if shared && prot & PROT_WRITE != 0 && (!f.is_writable() || f.get_flags() & O_APPEND != 0) {
+    if shared && prot & PROT_WRITE != 0 && !f.is_writable() {
         return Err(KernelError::PermissionDenied);
     }
     Ok(())
 }
 
 /// mmap's file checks in Linux's order (do_mmap): a shared writable
-/// mapping needs the file open for writing (EACCES), not an active swap
-/// file (ETXTBSY; mprotect does not check that, a write fault is SIGBUS
-/// instead) and not append-only (EACCES); then any mapping needs it
-/// readable (EACCES)
+/// mapping needs the file open for writing (EACCES) and not an active
+/// swap file (ETXTBSY; mprotect does not check that, a write fault is
+/// SIGBUS instead); then any mapping needs it readable (EACCES). An
+/// O_APPEND descriptor may be mapped (Linux refuses an append-only
+/// inode, IS_APPEND, which hk does not have).
 fn mmap_file_ok(f: &File, prot: u32, shared: bool) -> Result<(), KernelError> {
-    use crate::fs::flags::O_APPEND;
     if shared && prot & PROT_WRITE != 0 {
         if !f.is_writable() {
             return Err(KernelError::PermissionDenied);
@@ -77,9 +77,6 @@ fn mmap_file_ok(f: &File, prot: u32, shared: bool) -> Result<(), KernelError> {
             .is_some_and(|i| i.i_swapfile.load(core::sync::atomic::Ordering::Acquire))
         {
             return Err(KernelError::TextBusy);
-        }
-        if f.get_flags() & O_APPEND != 0 {
-            return Err(KernelError::PermissionDenied);
         }
     }
     if !f.is_readable() {
