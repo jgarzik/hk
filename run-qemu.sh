@@ -183,6 +183,17 @@ setup_x86_config() {
     # (tools/qemu-net.sh)
     qemu_net_args "${NIC:-virtio}"
     QEMU_ARGS+=("${QEMU_NET[@]}")
+    qemu_extra_args
+}
+
+# Extra arguments for one-off configurations (e.g. NUMA nodes), split
+# on spaces
+qemu_extra_args() {
+    if [ -n "${QEMU_EXTRA:-}" ]; then
+        local extra
+        read -r -a extra <<< "$QEMU_EXTRA"
+        QEMU_ARGS+=("${extra[@]}")
+    fi
 }
 
 setup_arm_config() {
@@ -255,6 +266,7 @@ setup_arm_config() {
     # (tools/qemu-net.sh)
     qemu_net_args "${NIC:-virtio}"
     QEMU_ARGS+=("${QEMU_NET[@]}")
+    qemu_extra_args
 }
 
 # Check QEMU availability

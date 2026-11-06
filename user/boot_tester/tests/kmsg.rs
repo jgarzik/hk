@@ -17,8 +17,8 @@
 //!   kernel default) opening /dev/kmsg to read and every syslog action
 //!   (READ_ALL, SIZE_UNREAD, SIZE_BUFFER) are EPERM (a write-only open
 //!   is EACCES only by the node's 0644 mode)
-//! - KMSG_NUMA_CPUS (hk): the boot topology line lists node 0 with every
-//!   online CPU (printed after the CPUs came up)
+//! - KMSG_NUMA_CPUS (hk): the boot topology lines list every online CPU
+//!   in some node (printed after the CPUs came up)
 
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
@@ -237,8 +237,8 @@ fn syslog() {
     report(n, b"", 0);
 }
 
-/// hk's boot log has `  node 0: <n> MB, <c> CPUs (...)`: c is the CPUs
-/// this task may run on (all of them at boot)
+/// hk's boot log has a `  node <n>: <m> MB, <c> CPUs (...)` line per
+/// node: the c add up to the CPUs this task may run on (all at boot)
 fn numa_cpus() {
     const NAME: &[u8] = b"KMSG_NUMA_CPUS";
     if super::helpers::host_mode() {
@@ -253,7 +253,8 @@ fn numa_cpus() {
         -1
     };
     let fd = sys_open(b"/dev/kmsg\0".as_ptr(), O_RDONLY | O_NONBLOCK, 0) as i32;
-    let mut cpus = -1;
+    let mut cpus = 0;
+    let mut nodes = 0;
     let mut rec = [0u8; 1024];
     loop {
         let r = sys_read(fd as u64, rec.as_mut_ptr(), rec.len() as u64);
@@ -261,23 +262,24 @@ fn numa_cpus() {
             break;
         }
         let line = &rec[..r as usize];
-        if let Some(i) = line.windows(9).position(|w| w == b"  node 0:") {
-            // "... MB, <c> CPUs"
-            let rest = &line[i..];
-            if let Some(j) = rest.windows(6).position(|w| w == b" CPUs ") {
-                let digits = rest[..j]
-                    .iter()
-                    .rev()
-                    .take_while(|c| c.is_ascii_digit())
-                    .count();
-                cpus = rest[j - digits..j]
-                    .iter()
-                    .fold(0i64, |v, c| v * 10 + i64::from(c - b'0'));
-            }
+        let Some(i) = line.windows(7).position(|w| w == b"  node ") else {
+            continue;
+        };
+        let rest = &line[i..];
+        if let Some(j) = rest.windows(6).position(|w| w == b" CPUs ") {
+            let digits = rest[..j]
+                .iter()
+                .rev()
+                .take_while(|c| c.is_ascii_digit())
+                .count();
+            cpus += rest[j - digits..j]
+                .iter()
+                .fold(0i64, |v, c| v * 10 + i64::from(c - b'0'));
+            nodes += 1;
         }
     }
     sys_close(fd as u64);
-    if cpus > 0 && cpus == online {
+    if nodes > 0 && cpus == online {
         report(NAME, b"", 0);
     } else {
         report(NAME, b"cpus", cpus * 1000 + online);

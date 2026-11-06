@@ -192,11 +192,11 @@ getcpu reports it; nothing else uses it. Missing (Linux
   local) affects where pages come from.
 - No page migration: migrate_pages and move_pages validate and move
   nothing; move_pages query mode reports node 0 for every page.
-- Nodemasks are one `u64` (64 nodes); no multi-node QEMU test config.
-- Node numbers are the firmware's (SRAT proximity domain, DT
-  `numa-node-id`) used as is: sparse or large domains leave holes or
-  are dropped (>= 64), and node 0 may not exist (Linux pxm_to_node
-  numbers the domains from 0).
+- Nodemasks are one `u64` (64 nodes); the gate has no multi-node QEMU
+  run (by hand: `QEMU_EXTRA="-object memory-backend-ram,id=m0,size=256M
+  -object memory-backend-ram,id=m1,size=256M -numa
+  node,nodeid=0,memdev=m0,cpus=0-1 -numa node,nodeid=1,memdev=m1,cpus=2-3"
+  make check`).
 
 ## arm64 SMP assumes one-cell, Aff0-only CPU ids
 
