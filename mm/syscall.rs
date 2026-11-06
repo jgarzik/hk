@@ -250,6 +250,9 @@ pub fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: 
         }
     }
 
+    // A shared mapping of /dev/zero is shared anonymous memory (Linux
+    // mmap_zero -> shmem_zero_setup)
+    let file = file.filter(|f| !(is_shared && crate::fs::chardev::maps_shared_anon(f)));
     // Create VMA
     let mut vma = if let Some(f) = file {
         Vma::new_file(map_addr, map_addr + length, prot, flags, f, offset)

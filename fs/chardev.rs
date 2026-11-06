@@ -153,6 +153,12 @@ pub trait CharDevice: Send + Sync {
         false
     }
 
+    /// A shared mapping of it is shared anonymous memory (Linux
+    /// mmap_zero -> shmem_zero_setup)
+    fn shared_anon(&self) -> bool {
+        false
+    }
+
     /// Device-specific control operations
     fn ioctl(&self, _file: &File, _cmd: u32, _arg: u64) -> Result<i64, KernelError> {
         Err(KernelError::NotTty)
@@ -240,6 +246,15 @@ pub fn unregister_chardev(id: DevId) -> Option<Arc<dyn CharDevice>> {
     CHARDEV_REGISTRY.write().unregister(id)
 }
 
+/// A shared mapping of `file` is shared anonymous memory instead (a
+/// character device such as /dev/zero; Linux shmem_zero_setup)
+pub fn maps_shared_anon(file: &crate::fs::File) -> bool {
+    file.get_inode()
+        .filter(|i| i.mode().is_chrdev())
+        .and_then(|i| get_chardev(i.rdev))
+        .is_some_and(|d| d.shared_anon())
+}
+
 /// Look up a character device by ID
 pub fn get_chardev(id: DevId) -> Option<Arc<dyn CharDevice>> {
     CHARDEV_REGISTRY.read().get(id)
@@ -292,8 +307,12 @@ impl CharDevice for ZeroCharDevice {
         "zero"
     }
 
-    /// Linux mmap_zero: private zero pages
+    /// Linux mmap_zero: private zero pages, or shared anonymous memory
     fn mmap_ok(&self) -> bool {
+        true
+    }
+
+    fn shared_anon(&self) -> bool {
         true
     }
 

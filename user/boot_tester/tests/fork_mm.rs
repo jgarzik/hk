@@ -8,6 +8,8 @@
 //!   memory keeps the data (it lives in the shared object); MADV_REMOVE
 //!   frees it (reads zero)
 //! - FILE_SHARED_FORK: the same for a MAP_SHARED mapping of a file
+//! - ZERO_SHARED_FORK: a MAP_SHARED mapping of /dev/zero is shared
+//!   memory (Linux shmem_zero_setup): parent and child see each other
 //! - FILE_SHARED_COHERENT: a shared file mapping, another mapping of the
 //!   file and read()/write() all see the same data
 //! - FILE_PRIVATE_RDONLY: a MAP_PRIVATE mapping of a read-only fd made
@@ -116,6 +118,7 @@ pub fn run_tests() {
     mprotect_cow();
     rdonly_cow();
     cow_race();
+    zero_shared_fork();
     trunc_fork_race();
     mremap_trunc_race();
     mprotect_race();
@@ -1403,6 +1406,37 @@ fn cow_race() {
     }
     report(NAME, code);
     sys_munmap(base, RACE_PAGES * PAGE);
+}
+
+/// A page of /dev/zero mapped MAP_SHARED, written before fork: the child
+/// reads the parent's value and its own write shows in the parent
+fn zero_shared_fork() {
+    const NAME: &[u8] = b"ZERO_SHARED_FORK";
+    let fd = sys_open(b"/dev/zero\0".as_ptr(), O_RDWR, 0) as i32;
+    let p = sys_mmap(0, PAGE, RW, MAP_SHARED, fd, 0);
+    sys_close(fd as u64);
+    if p < 0 {
+        report(NAME, -1);
+        return;
+    }
+    let p = p as u64;
+    put(p + 8, PARENT);
+    let pid = sys_fork();
+    if pid == 0 {
+        let saw = get(p + 8);
+        put(p + 16, CHILD);
+        sys_exit(if saw == PARENT { 0 } else { 3 });
+    }
+    let r = reap(pid);
+    let code = if r != 0 {
+        r
+    } else if get(p + 16) != CHILD {
+        4
+    } else {
+        0
+    };
+    sys_munmap(p, PAGE);
+    report(NAME, code);
 }
 
 // ---------------------------------------------------------------------
