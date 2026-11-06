@@ -551,20 +551,23 @@ pub fn may_linkat(c: &Cred, inode: &Inode) -> Result<(), KernelError> {
 pub fn may_create_in_sticky(c: &Cred, dir: &Inode, inode: &Inode) -> Result<(), KernelError> {
     let dmode = dir.mode().raw();
     let mode = inode.mode();
+    // A regular file or FIFO only when its knob is on; any other type
+    // is checked whatever the knobs (Linux may_create_in_sticky)
     let level = if mode.is_file() {
-        knob(&PROTECTED_REGULAR)
+        Some(knob(&PROTECTED_REGULAR))
     } else if mode.is_fifo() {
-        knob(&PROTECTED_FIFOS)
+        Some(knob(&PROTECTED_FIFOS))
     } else {
-        return Ok(());
+        None
     };
-    if dmode & S_ISVTX == 0 || level == 0 {
+    if dmode & S_ISVTX == 0 || level == Some(0) {
         return Ok(());
     }
     if inode.uid() == dir.uid() || inode.uid() == c.fsuid {
         return Ok(());
     }
-    if dmode & S_IWOTH != 0 || (dmode & S_IWGRP != 0 && level >= 2) {
+    // World-writable: refused; group-writable: only at level 2
+    if dmode & S_IWOTH != 0 || (dmode & S_IWGRP != 0 && level.is_some_and(|l| l >= 2)) {
         return Err(KernelError::PermissionDenied);
     }
     Ok(())

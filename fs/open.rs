@@ -101,7 +101,10 @@ fn open_target(
     }
     // An existing file opened O_CREAT in a sticky directory (Linux
     // may_create_in_sticky: fs.protected_fifos / _regular)
-    if !created && let (Some(dir), Some(inode)) = (p.dir.get_inode(), d.get_inode()) {
+    // The directory is the one holding the file the walk ended on, after
+    // a final symlink (Linux nd->dir_mode after the follow)
+    let parent = d.dentry.get_parent().unwrap_or_else(|| p.dir.clone());
+    if !created && let (Some(dir), Some(inode)) = (parent.get_inode(), d.get_inode()) {
         super::dac::may_create_in_sticky(&crate::task::current_cred(), &dir, &inode)?;
     }
     Ok((d, created))

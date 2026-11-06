@@ -709,6 +709,17 @@ fn protected() {
     sys_chown(b"/tmp/dac/prot/p\0".as_ptr(), OTHER, OTHER);
     sys_symlink(b"/tmp/dac/prot/f\0".as_ptr(), b"/tmp/dac/prot/l\0".as_ptr());
     hk_syscall::sys_lchown(b"/tmp/dac/prot/l\0".as_ptr(), OTHER, OTHER);
+    // A third user's device node there (checked whatever the knobs), and
+    // a link to the regular file from a plain directory (the file's own
+    // directory decides)
+    hk_syscall::sys_mknod(b"/tmp/dac/prot/c\0".as_ptr(), 0o020666, (1 << 8) | 3);
+    sys_chmod(b"/tmp/dac/prot/c\0".as_ptr(), 0o666);
+    sys_chown(b"/tmp/dac/prot/c\0".as_ptr(), OTHER, OTHER);
+    mkdirm(b"/tmp/dac/plain\0", 0o777, 0);
+    sys_symlink(
+        b"/tmp/dac/prot/f\0".as_ptr(),
+        b"/tmp/dac/plain/lnk\0".as_ptr(),
+    );
     mkfile(b"/tmp/dac/hl_src\0", b"y", 0o600, 0);
     for (v, name) in [(0u8, &b"DAC_PROTECTED_OFF"[..]), (1, b"DAC_PROTECTED_ON")] {
         if !set_protected(v) {
@@ -755,5 +766,17 @@ fn t_protected(name: &[u8]) -> u64 {
         0o666,
     ));
     bad += chk(name, b"O_CREAT fifo", r, if on { EACCES } else { 0 });
+    let r = closed(sys_open(
+        b"/tmp/dac/prot/c\0".as_ptr(),
+        O_CREAT | O_RDONLY,
+        0o666,
+    ));
+    bad += chk(name, b"O_CREAT device", r, EACCES);
+    let r = closed(sys_open(
+        b"/tmp/dac/plain/lnk\0".as_ptr(),
+        O_CREAT | O_RDWR,
+        0o666,
+    ));
+    bad += chk(name, b"O_CREAT via link", r, if on { EACCES } else { 0 });
     bad
 }
