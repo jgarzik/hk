@@ -551,3 +551,39 @@ impl KNode {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Probe;
+
+    impl BinAttr for Probe {
+        fn size(&self) -> u64 {
+            4
+        }
+
+        fn read(&self, _off: u64, _buf: &mut [u8]) -> Result<usize, KernelError> {
+            Ok(0)
+        }
+    }
+
+    /// Linux kernfs_drain, then the ops are gone: a removed binary
+    /// attribute no longer holds its object, though the node lives on
+    #[test]
+    // The kernfs locks reach aarch64 per-CPU and IRQ-state registers,
+    // which a host (EL0) test cannot read
+    #[cfg_attr(target_arch = "aarch64", ignore)]
+    fn removed_bin_drops_ops() {
+        let root = KNode::new_root();
+        let ops: Arc<dyn BinAttr> = Arc::new(Probe);
+        let kn = root.create_bin(b"config", 0o644, ops.clone()).unwrap();
+        assert_eq!(Arc::strong_count(&ops), 2);
+        kn.remove();
+        assert_eq!(Arc::strong_count(&ops), 1);
+        match &kn.kind {
+            Kind::Bin(b) => assert!(b.ops().is_none()),
+            _ => panic!("not a bin attribute"),
+        }
+    }
+}
