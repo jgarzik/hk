@@ -42,10 +42,11 @@ fn create_in(
         let _w = w?;
         dac::may_create(&c, &dir)?;
         let perm = dac::create_mode(&c, &dir, (mode & 0o7777) as u16);
+        // The dentry first, so an ENOMEM leaves no file made
+        let d = Dentry::prealloc(parent, name)?;
         let inode = dir.i_op.create(&dir, name, InodeMode::regular(perm))?;
         dir.touch_mc();
-        let d = Dentry::alloc(parent, name, Some(inode))?;
-        Ok((d, true))
+        Ok((Dentry::add(parent, d, Some(inode)), true))
     })()
 }
 

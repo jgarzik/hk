@@ -7,13 +7,15 @@
 //! fail-nth (a Linux build without fault injection).
 //!
 //! - FAULT_INJECT_<CALL>: one line per syscall, with the paths it ran
+//! - FAULT_INJECT_CGROUP_MKDIR: after each failed mkdir of a cgroup the
+//!   name is still free (nothing half made)
 
 use super::helpers::{print, print_num, println, skip};
 use hk_syscall::{
     EpollEvent, O_CREAT, O_RDONLY, O_RDWR, sys_close, sys_epoll_create1, sys_epoll_ctl,
-    sys_eventfd2, sys_exit, sys_fork, sys_inotify_init1, sys_lseek, sys_open, sys_pipe2, sys_read,
-    sys_signalfd4, sys_socket, sys_socketpair, sys_timerfd_create, sys_unlink, sys_wait4,
-    sys_write,
+    sys_eventfd2, sys_exit, sys_fork, sys_inotify_init1, sys_lseek, sys_mkdir, sys_mount, sys_open,
+    sys_pipe2, sys_read, sys_rmdir, sys_signalfd4, sys_socket, sys_socketpair, sys_timerfd_create,
+    sys_umount2, sys_unlink, sys_wait4, sys_write,
 };
 
 /// Most failure points one call is tried with
@@ -42,8 +44,52 @@ pub fn run_tests() {
         run(fd, name, call, undo);
     }
     run(fd, b"FORK", fork, |_| {});
+    cgroup_mkdir(fd);
     set(fd, 0);
     sys_close(fd as u64);
+}
+
+/// mkdir in a cgroup2 mount with the 1st, 2nd, ... allocation failing:
+/// after a failure, the same mkdir without injection succeeds (a leaked
+/// cgroup would make it EEXIST)
+fn cgroup_mkdir(fd: i32) {
+    let mp = b"/tmp/cgfi\0";
+    let d = b"/tmp/cgfi/x\0";
+    sys_mkdir(b"/tmp\0".as_ptr(), 0o1777);
+    sys_mkdir(mp.as_ptr(), 0o755);
+    sys_mount(b"none\0".as_ptr(), mp.as_ptr(), b"cgroup2\0".as_ptr(), 0, 0);
+    let mut nth = 1;
+    let mut done = false;
+    let mut leaked = 0;
+    while nth <= MAX_NTH {
+        set(fd, nth);
+        let r = sys_mkdir(d.as_ptr(), 0o755);
+        let left = get(fd);
+        set(fd, 0);
+        if r != 0 && sys_mkdir(d.as_ptr(), 0o755) != 0 {
+            leaked = nth;
+        }
+        sys_rmdir(d.as_ptr());
+        if left != 0 {
+            done = true;
+            break;
+        }
+        nth += 1;
+    }
+    sys_umount2(mp.as_ptr(), 0);
+    sys_rmdir(mp.as_ptr());
+    print(b"FAULT_INJECT_CGROUP_MKDIR");
+    if done && leaked == 0 {
+        print(b":OK (");
+        print_num(i64::from(nth - 1));
+        println(b" failure points)");
+    } else {
+        print(b":FAIL done=");
+        print_num(i64::from(done));
+        print(b" leaked at ");
+        print_num(i64::from(leaked));
+        println(b"");
+    }
 }
 
 /// Inject the 1st, 2nd, ... allocation failure into `call` until it gets

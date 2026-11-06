@@ -227,7 +227,11 @@ impl InodeOps for CgroupfsInodeOps {
         };
         let parent_cg = parent.upgrade().ok_or(KernelError::NoDevice)?;
         let new_cg = cgroup_mkdir(&parent_cg, name)?;
-        create_cgroup_dir_inode(dir, &new_cg)
+        // No inode, no cgroup: a failed mkdir leaves the name free
+        // (Linux cgroup_mkdir destroys what it built on an error)
+        create_cgroup_dir_inode(dir, &new_cg).inspect_err(|_| {
+            let _ = cgroup_rmdir(&parent_cg, name);
+        })
     }
 
     fn rmdir(&self, dir: &Inode, name: &[u8]) -> Result<(), KernelError> {

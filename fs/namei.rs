@@ -327,9 +327,11 @@ pub fn create_entry(
         }
         let _w = w?;
         super::dac::may_create(&c, &dir)?;
+        // The dentry first, so an ENOMEM leaves no entry made
+        let d = Dentry::prealloc(parent, name)?;
         let inode = make(&dir, &c)?;
         dir.touch_mc();
-        Dentry::alloc(parent, name, Some(inode))
+        Ok(Dentry::add(parent, d, Some(inode)))
     })()
 }
 
