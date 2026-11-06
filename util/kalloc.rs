@@ -21,7 +21,8 @@
 //!
 //! Interrupt handlers never take the reserve, and preemption is off
 //! while it is set, so the next allocation of that layout on this CPU
-//! is `Arc::new`'s.
+//! is `Arc::new`'s. Taking it turns preemption back on: `new_cyclic`
+//! allocates before calling its closure, which may then sleep.
 
 use alloc::boxed::Box;
 use alloc::sync::{Arc, Weak};
@@ -126,11 +127,17 @@ fn reserved<R>(layout: Layout, make: impl FnOnce() -> R) -> Result<R, KernelErro
     r.align.store(layout.align(), Relaxed);
     r.ptr.store(p, Relaxed);
     let out = make();
-    let left = r.ptr.swap(core::ptr::null_mut(), Relaxed);
-    crate::arch::preempt_enable();
-    if !left.is_null() {
+    // Still there only if not taken, and then preemption is still off
+    // and this is the same CPU. Once taken (preemption on again, maybe
+    // another CPU now) `r` may hold another task's block, never ours:
+    // ours lives on in the Arc.
+    if r.ptr
+        .compare_exchange(p, core::ptr::null_mut(), Relaxed, Relaxed)
+        .is_ok()
+    {
+        crate::arch::preempt_enable();
         // SAFETY: our block, untaken
-        unsafe { alloc::alloc::dealloc(left, layout) };
+        unsafe { alloc::alloc::dealloc(p, layout) };
         debug_assert!(false, "kalloc: Arc did not allocate ArcInner's layout");
     }
     Ok(out)
@@ -149,7 +156,10 @@ pub fn take_reserved(layout: Layout) -> Option<*mut u8> {
     {
         return None;
     }
-    Some(r.ptr.swap(core::ptr::null_mut(), Relaxed))
+    let p = r.ptr.swap(core::ptr::null_mut(), Relaxed);
+    // `reserved` turned preemption off when it set the block
+    crate::arch::preempt_enable();
+    Some(p)
 }
 
 /// Boot check that `Arc` takes the reserved block for a few layouts
@@ -160,7 +170,13 @@ pub fn selftest() -> bool {
         && try_arc(7u64).is_ok()
         && try_arc([0u8; 3000]).is_ok()
         && try_arc(Big([0; 200])).is_ok()
-        && try_arc_cyclic(|w: &Weak<u32>| w.strong_count() as u32).is_ok();
+        && try_arc_cyclic(|w: &Weak<u32>| w.strong_count() as u32).is_ok()
+        // The closure runs preemptible: it may sleep
+        && try_arc_cyclic(|_: &Weak<u32>| {
+            crate::sync::might_sleep();
+            1
+        })
+        .is_ok();
     // Nothing left over (a leftover panics in debug builds already)
     ok && Big([1; 200]).0[0] == 1 && RESERVE.this().ptr.load(Relaxed).is_null()
 }
