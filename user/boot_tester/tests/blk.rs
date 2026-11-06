@@ -710,6 +710,26 @@ fn vfat_swapfile() {
     );
 }
 
+/// How a child writing a byte at `p` (after reading it first with
+/// `read_first`) ends: 0x100 + signal, or its exit status
+fn writer_ends(p: i64, read_first: bool) -> i64 {
+    let pid = hk_syscall::sys_fork();
+    if pid == 0 {
+        if read_first {
+            unsafe { core::ptr::read_volatile(p as *const u8) };
+        }
+        unsafe { core::ptr::write_volatile(p as *mut u8, 1) };
+        hk_syscall::sys_exit(0);
+    }
+    let mut st = 0i32;
+    hk_syscall::sys_wait4(pid, &mut st, 0, 0);
+    if st & 0x7f != 0 {
+        0x100 + i64::from(st & 0x7f)
+    } else {
+        i64::from(st >> 8)
+    }
+}
+
 /// On an active swap file open read-write as `rw` with `early` mapped
 /// shared writable and `early_ro` shared read-only before swapon:
 /// [mmap shared writable, copy_file_range into it, how a child writing
@@ -728,18 +748,11 @@ fn swapfile_map(rw: i32, early: i64, early_ro: i64) -> [i64; 4] {
     sys_unlink(b"/mnt/vd1/CFR.SRC\0".as_ptr());
     let mut child = -1;
     if early > 0 {
-        let pid = hk_syscall::sys_fork();
-        if pid == 0 {
-            unsafe { core::ptr::write_volatile(early as *mut u8, 1) };
-            hk_syscall::sys_exit(0);
-        }
-        let mut st = 0i32;
-        hk_syscall::sys_wait4(pid, &mut st, 0, 0);
-        child = if st & 0x7f != 0 {
-            0x100 + i64::from(st & 0x7f)
-        } else {
-            i64::from(st >> 8)
-        };
+        // A plain write, then a write after a read (the read maps the
+        // page read-only; the write-protect fault must refuse it too)
+        let w = writer_ends(early, false);
+        let rw = writer_ends(early, true);
+        child = if w == rw { w } else { w * 1000 + rw };
     }
     let mp = if early_ro > 0 {
         hk_syscall::sys_mprotect(

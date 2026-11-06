@@ -570,6 +570,11 @@ fn do_wp_page(mm: &Mm, ptep: *mut u64, pte: u64, addr: u64, area: &Area) -> Resu
         && let Some(inode) = area.file.as_ref().and_then(|f| f.mapping_inode())
         && inode.i_op.maps_cache()
     {
+        // An active swap file is written only by swap (Linux
+        // do_page_mkwrite: SIGBUS), also after a read mapped it
+        if inode.i_swapfile.load(Ordering::Acquire) {
+            return Err(VmFault::Bus);
+        }
         let phys = paging::pte_addr(pte);
         if !FRAME_ALLOCATOR.incref(phys) {
             return Ok(());
