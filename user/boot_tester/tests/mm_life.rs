@@ -600,9 +600,9 @@ fn live_dentries() -> i64 {
 }
 
 /// MM_LIFE_FORK_EXEC_OBJS: fork+exec keeps no kernel object behind:
-/// once the processes are gone and the caches dropped, the dentries and
-/// the slab come back to where they were (300 rounds: a leak of even
-/// 300 bytes each would show as 90 kB)
+/// once the processes are gone and the caches dropped, the dentries come
+/// back to where they were, and on hk the slab too (300 rounds: a leak
+/// of even 300 bytes each would show as 90 kB)
 fn fork_exec_objects() {
     const NAME: &[u8] = b"MM_LIFE_FORK_EXEC_OBJS";
     const N: i64 = 300;
@@ -623,7 +623,10 @@ fn fork_exec_objects() {
     for _ in 0..20 {
         settle();
         (d1, s1) = (live_dentries(), meminfo(b"Slab:"));
-        ok = d0 > 0 && s0 > 0 && d1 - d0 <= 5 && s1 - s0 <= 64;
+        // Linux keeps freed slab objects cached (per-CPU and per-cache
+        // free lists), so its Slab need not come back: that bound is hk's
+        let slab_ok = host_mode() || s1 - s0 <= 64;
+        ok = d0 > 0 && s0 > 0 && d1 - d0 <= 5 && slab_ok;
         if ok {
             break;
         }
