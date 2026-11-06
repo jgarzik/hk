@@ -658,24 +658,43 @@ fn table_s5(phys: u64, sig: &[u8; 4]) -> Option<SleepType> {
     s5
 }
 
-/// The proximity domain of an enabled SRAT CPU or memory affinity entry
-/// at `ptr` of type `kind`
-///
-/// # Safety
-/// `ptr` points at a whole mapped SRAT entry of that type.
-unsafe fn srat_entry_pxm(ptr: *const u8, kind: u8) -> Option<u32> {
-    // SAFETY: offsets inside the entry (caller), read unaligned
-    unsafe {
-        let rd = |o: usize| core::ptr::read_unaligned(ptr.add(o).cast::<u32>());
-        let b = |o: usize| u32::from(core::ptr::read_unaligned(ptr.add(o)));
-        match kind {
-            SRAT_ENTRY_LAPIC_AFFINITY if rd(4) & 1 != 0 => {
-                Some(b(2) | (b(9) << 8) | (b(10) << 16) | (b(11) << 24))
-            }
-            SRAT_ENTRY_X2APIC_AFFINITY if rd(12) & 1 != 0 => Some(rd(4)),
-            SRAT_ENTRY_MEMORY_AFFINITY if rd(28) & 1 != 0 => Some(rd(2)),
-            _ => None,
+/// The SRAT entries in `entries` (the table past its header), each
+/// `[type, length, ...]`; a zero or overrunning length ends them
+fn srat_entries(mut entries: &[u8]) -> impl Iterator<Item = &[u8]> {
+    core::iter::from_fn(move || {
+        let len = usize::from(*entries.get(1)?);
+        if len < 2 || len > entries.len() {
+            return None;
         }
+        let (e, rest) = entries.split_at(len);
+        entries = rest;
+        Some(e)
+    })
+}
+
+/// Call `f` with the proximity domain of each enabled SRAT entry, in the
+/// order Linux numbers them (acpi_numa_init): the CPU affinity entries
+/// (local APIC and x2APIC alike) in table order, then the memory ones
+fn srat_pxm_order(entries: &[u8], mut f: impl FnMut(u32)) {
+    let cpu = |e: &&[u8]| e[0] == SRAT_ENTRY_LAPIC_AFFINITY || e[0] == SRAT_ENTRY_X2APIC_AFFINITY;
+    let cpus = srat_entries(entries).filter(cpu);
+    let mem = srat_entries(entries).filter(|e| e[0] == SRAT_ENTRY_MEMORY_AFFINITY);
+    for pxm in cpus.chain(mem).filter_map(srat_entry_pxm) {
+        f(pxm);
+    }
+}
+
+/// The proximity domain of an enabled SRAT CPU or memory affinity entry
+fn srat_entry_pxm(e: &[u8]) -> Option<u32> {
+    let rd = |o: usize| Some(u32::from_le_bytes(e.get(o..o + 4)?.try_into().ok()?));
+    let b = |o: usize| e.get(o).copied().map(u32::from);
+    match e[0] {
+        SRAT_ENTRY_LAPIC_AFFINITY if rd(4)? & 1 != 0 => {
+            Some(b(2)? | (b(9)? << 8) | (b(10)? << 16) | (b(11)? << 24))
+        }
+        SRAT_ENTRY_X2APIC_AFFINITY if rd(12)? & 1 != 0 => rd(4),
+        SRAT_ENTRY_MEMORY_AFFINITY if rd(28)? & 1 != 0 => rd(2),
+        _ => None,
     }
 }
 
@@ -765,28 +784,13 @@ fn parse_srat_mapped(srat_phys: u64) -> Result<(), &'static str> {
         let mut topology = NUMA_TOPOLOGY.lock();
 
         // Number the proximity domains first, in Linux's order
-        // (acpi_numa_init: x2APIC, then local APIC, then memory
-        // affinity): nodes run from 0 whatever the domain numbers
-        for kind in [
-            SRAT_ENTRY_X2APIC_AFFINITY,
-            SRAT_ENTRY_LAPIC_AFFINITY,
-            SRAT_ENTRY_MEMORY_AFFINITY,
-        ] {
-            let mut ptr = entries_start;
-            while ptr < entries_end {
-                let entry_type = core::ptr::read_unaligned(ptr);
-                let entry_len = core::ptr::read_unaligned(ptr.add(1)) as usize;
-                if entry_len == 0 {
-                    break;
-                }
-                if entry_type == kind
-                    && let Some(pxm) = srat_entry_pxm(ptr, entry_type)
-                {
-                    let _ = topology.acpi_map_pxm(pxm);
-                }
-                ptr = ptr.add(entry_len);
-            }
-        }
+        let entries = core::slice::from_raw_parts(
+            entries_start,
+            entries_end.offset_from(entries_start) as usize,
+        );
+        srat_pxm_order(entries, |pxm| {
+            let _ = topology.acpi_map_pxm(pxm);
+        });
 
         // First pass: collect memory affinity entries to build nodes
         let mut ptr = entries_start;
@@ -981,5 +985,62 @@ fn parse_slit_mapped(slit_phys: u64) -> Result<(), &'static str> {
         iounmap(slit_ptr, slit_length as u64);
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lapic(pxm: u8) -> [u8; 16] {
+        let mut e = [0u8; 16];
+        e[0] = SRAT_ENTRY_LAPIC_AFFINITY;
+        e[1] = 16;
+        e[2] = pxm;
+        e[4] = 1; // enabled
+        e
+    }
+
+    fn x2apic(pxm: u32) -> [u8; 24] {
+        let mut e = [0u8; 24];
+        e[0] = SRAT_ENTRY_X2APIC_AFFINITY;
+        e[1] = 24;
+        e[4..8].copy_from_slice(&pxm.to_le_bytes());
+        e[12] = 1;
+        e
+    }
+
+    fn mem(pxm: u32, enabled: bool) -> [u8; 40] {
+        let mut e = [0u8; 40];
+        e[0] = SRAT_ENTRY_MEMORY_AFFINITY;
+        e[1] = 40;
+        e[2..6].copy_from_slice(&pxm.to_le_bytes());
+        e[28] = u8::from(enabled);
+        e
+    }
+
+    fn order(parts: &[&[u8]]) -> alloc::vec::Vec<u32> {
+        let table: alloc::vec::Vec<u8> = parts.iter().flat_map(|p| p.iter().copied()).collect();
+        let mut out = alloc::vec::Vec::new();
+        srat_pxm_order(&table, |p| out.push(p));
+        out
+    }
+
+    /// CPU entries of both kinds in table order, then memory (Linux
+    /// acpi_numa_init); disabled entries skipped
+    #[test]
+    fn pxm_order_is_linux() {
+        let got = order(&[
+            &mem(9, true),
+            &lapic(0),
+            &x2apic(7),
+            &mem(3, false),
+            &lapic(4),
+        ]);
+        assert_eq!(got, [0, 7, 4, 9]);
+        // A zero length ends the walk
+        let mut bad = lapic(1);
+        bad[1] = 0;
+        assert_eq!(order(&[&lapic(2), &bad, &lapic(3)]), [2]);
     }
 }
