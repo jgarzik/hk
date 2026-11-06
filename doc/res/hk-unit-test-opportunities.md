@@ -143,16 +143,6 @@ instance; "medium" = needs a small fixture or cfg(test) shim.
   the end, an unterminated name, a strings offset out of range.
 - Value: medium (boot input, trusted), easy.
 
-### 9. Address-space bookkeeping: `mm/mod.rs:456` `find_free_area`, `:473` `gap_around`, `overlaps`, `:757` `split_vma`, `:837` `merge_adjacent`; `mm/vma.rs:418` `Vma::can_merge_with`; `mm/madvise.rs:123` `check_range`, `:335` `new_flags`
-- Coverage: partial (`mm/mod.rs` tests cover `remove_range` and anon chains, with a
-  `map()` helper ready to reuse).
-- Cases: top-down search skipping a VMA straddling `mmap_base`, exact-fit gap, nothing
-  fits / below MMAP_MIN_ADDR -> None, size 0; `gap_around` with no neighbours;
-  merge rules (prot, flags, anon_vma identity and contiguous pgoff, file offsets,
-  shm never); madvise range: unaligned start EINVAL, len wrapping on page round-up
-  EINVAL, len 0 -> None; WIPEONFORK on file/shared EINVAL, RANDOM/SEQUENTIAL exclusive.
-- Value: medium-high (memory corruption if wrong), easy.
-
 ### 10. SysV message selection: `ipc/msg.rs:62` `Search`, `:155` `take_msg`, `try_send`, `:211` `fits`
 - Coverage: none.
 - Cases (Linux `convert_mode`/`find_msg`/`msg_fits_inqueue`): msgtyp 0 first message;

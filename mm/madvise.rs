@@ -374,3 +374,47 @@ fn update_flags(
     mm.merge_adjacent(idx);
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn range_checks() {
+        assert!(matches!(
+            check_range(1, 10),
+            Err(KernelError::InvalidArgument)
+        ));
+        assert!(matches!(
+            check_range(0, u64::MAX),
+            Err(KernelError::InvalidArgument)
+        ));
+        assert_eq!(check_range(0x1000, 0).ok(), Some(None));
+        assert_eq!(check_range(0x1000, 1).ok(), Some(Some(0x2000)));
+        assert!(check_range(u64::MAX & !0xfff, 0x2000).is_err());
+    }
+
+    #[test]
+    fn flag_changes() {
+        let v = Vma::new(
+            0x10000,
+            0x20000,
+            1,
+            super::super::MAP_PRIVATE | super::super::MAP_ANONYMOUS,
+        );
+        let r = new_flags(&v, MADV_RANDOM).unwrap();
+        assert!(r & VM_RAND_READ != 0 && r & VM_SEQ_READ == 0);
+        let mut v2 = v.clone();
+        v2.flags = r;
+        let s = new_flags(&v2, MADV_SEQUENTIAL).unwrap();
+        assert!(s & VM_SEQ_READ != 0 && s & VM_RAND_READ == 0);
+        assert!(new_flags(&v, MADV_WIPEONFORK).unwrap() & VM_WIPEONFORK != 0);
+        let shared = Vma::new(
+            0x10000,
+            0x20000,
+            1,
+            super::super::MAP_SHARED | super::super::MAP_ANONYMOUS,
+        );
+        assert!(new_flags(&shared, MADV_WIPEONFORK).is_err());
+    }
+}

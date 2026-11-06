@@ -1174,6 +1174,50 @@ mod tests {
     }
 
     #[test]
+    fn free_area_top_down() {
+        // Empty: just below mmap_base
+        let m = map(&[]);
+        assert_eq!(m.find_free_area(0x1000), Some(0x6fff_f000));
+        // A VMA straddling mmap_base: below its start
+        let m = map(&[(0x6fff_0000, 0x7001_0000)]);
+        assert_eq!(m.find_free_area(0x1000), Some(0x6ffe_f000));
+        // An exact-fit gap is taken, the highest one first
+        let m = map(&[(0x5000_0000, 0x6000_0000), (0x6000_1000, 0x7000_0000)]);
+        assert_eq!(m.find_free_area(0x1000), Some(0x6000_0000));
+        assert_eq!(m.find_free_area(0x2000), Some(0x4fff_e000));
+        // Nothing fits above MMAP_MIN_ADDR
+        let m = map(&[]);
+        assert_eq!(m.find_free_area(0x7000_0000 - MMAP_MIN_ADDR + 0x1000), None);
+    }
+
+    #[test]
+    fn gap_around_bounds() {
+        let m = map(&[]);
+        let (floor, ceiling) = m.gap_around(0x1000_0000, 0x1000_1000);
+        assert_eq!(floor, 0);
+        assert!(ceiling >= 0x1000_1000);
+        let m = map(&[(0x1000, 0x2000), (0x9000, 0xa000)]);
+        assert_eq!(m.gap_around(0x4000, 0x5000), (0x2000, 0x9000));
+    }
+
+    #[test]
+    fn split_then_merge_back() {
+        let mut m = map(&[(0x10000, 0x20000)]);
+        m.split_at(0x14000);
+        assert_eq!(spans(&m), [(0x10000, 0x14000), (0x14000, 0x20000)]);
+        let i = m.find_vma_exact(0x14000).unwrap();
+        m.merge_adjacent(i);
+        assert_eq!(spans(&m), [(0x10000, 0x20000)]);
+        // Different protections do not merge
+        let mut m = map(&[(0x10000, 0x20000)]);
+        m.split_at(0x14000);
+        let i = m.find_vma_exact(0x14000).unwrap();
+        m.vmas[i].prot = PROT_READ | super::PROT_WRITE;
+        m.merge_adjacent(i);
+        assert_eq!(m.iter().count(), 2);
+    }
+
+    #[test]
     fn remove_range_splits_edges() {
         let mut m = map(&[(0x10000, 0x20000), (0x30000, 0x40000)]);
         let gone = m.remove_range(0x18000, 0x34000);
