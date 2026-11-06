@@ -33,7 +33,7 @@ None is known to fail today, but each is a soundness bug:
 
 ## unsafe not yet wrapped or documented (doc/UNSAFE.md)
 
-There are 71 files with `#![allow(clippy::undocumented_unsafe_blocks)]
+There are 63 files with `#![expect(clippy::undocumented_unsafe_blocks)]
 // TODO(unsafe)` (`git grep -l 'TODO(unsafe)' -- '*.rs' ':!user'`). Most of their
 blocks belong in a missing wrapper:
 
@@ -605,12 +605,10 @@ with RAM; what is missing: no shrinker (caches give back empty slabs
 beyond two each, but nothing asks them under pressure), no slab
 merging, poisoning or red zones.
 
-Heap allocations cannot fail gracefully (Rust's global allocator): one
-neither the slab nor the vmalloc fallback can meet panics. Buffers
-sized by a syscall argument, the network or a disk use `kmem` (`try_vec`,
-`KVec`, `KDeque`: ENOMEM); the many sites bounded by a sysctl or a
-constant still allocate infallibly, as do `Box::new`/`Arc::new` (see
-doc/res/hk-rust-for-linux-idioms.md item 1). The heap goes down to the min
+Objects are built fallibly (`util/kalloc.rs` try_box/try_arc, ENOMEM) and
+buffers sized from outside through `kmem`; the `*_nofail` calls (boot
+setup, NOFAIL paths) and plain `Vec`/`String` growth bounded by a sysctl
+or a constant still panic when the heap cannot meet them. The heap goes down to the min
 watermark while user data stops at low (also after direct reclaim:
 user allocations stop at low until the OOM killer (J); then Linux's
 min), so only kernel objects can get there (no memcg or OOM killer bounds what a process pins in pipes,
@@ -882,8 +880,8 @@ Designs that grew one commit at a time. Tag = roadmap phase
   reading or writing, not the one the file was opened in (Linux binds
   the file to the opener's namespace): an fd passed across namespaces
   reads and writes the other one's values.
-- **Stale comments and dead code** (as touched): over a hundred
-  `#[allow(dead_code)]` and as many "for now"/TODO markers; comments that
+- **Stale comments and dead code** (as touched): 56 `#[expect(dead_code)]`
+  and over a hundred "for now"/TODO markers; comments that
   contradict the code in `ns/mod.rs` (setns) and `task/misc.rs`.
 
 ## Review gaps, by phase
