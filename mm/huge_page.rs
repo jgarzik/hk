@@ -170,6 +170,22 @@ pub fn withdraw(pmdp: *mut u64) -> Option<u64> {
     Some(pt)
 }
 
+/// Free every table deposited on the PMD table `table`, which is being
+/// freed with its address space (Linux zap_deposited_table at exit)
+pub fn free_deposits(table: u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let Some(tp) = crate::mm::page::phys_to_page(table) else {
+        return;
+    };
+    let mut v = tp.private.swap(0, Relaxed);
+    while v != 0 {
+        let pt = (v - 1) << 12;
+        let ptp = crate::mm::page::phys_to_page(pt).expect("page table outside RAM");
+        v = ptp.next.swap(0, Relaxed);
+        crate::FRAME_ALLOCATOR.free(pt);
+    }
+}
+
 /// The 2MB-level entry at `p`, as an atomic
 fn pmd_entry(p: *mut u64) -> &'static core::sync::atomic::AtomicU64 {
     // SAFETY: `p` points into a live page table of the locked mm

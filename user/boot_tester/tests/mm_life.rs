@@ -31,6 +31,7 @@ pub fn run_tests() {
     leak(b"MM_LIFE_PROTNONE_MUNMAP", 200, protnone_munmap);
     leak(b"MM_LIFE_PROTNONE_EXIT", 200, protnone_exit);
     leak(b"MM_LIFE_THP_CYCLE", 200, thp_cycle);
+    leak(b"MM_LIFE_THP_EXIT", 200, thp_exit);
     fork_exec_objects();
     maps_after_exit();
     munmap_partial();
@@ -674,4 +675,25 @@ fn thp_cycle() -> bool {
     sys_munmap(p + HUGE / 2, PAGE);
     unsafe { core::ptr::write_volatile((p + HUGE - 8) as *mut u8, 2) };
     sys_munmap(raw, 3 * HUGE) == 0
+}
+
+/// A child faults in two 2MB pages (where THP is on) and exits with them
+/// mapped: exit frees each one's spare page table too
+fn thp_exit() -> bool {
+    let pid = sys_fork();
+    if pid == 0 {
+        const HUGE: u64 = 2 << 20;
+        const MADV_HUGEPAGE: i32 = 14;
+        let flags = MAP_PRIVATE | MAP_ANONYMOUS;
+        let raw = sys_mmap(0, 3 * HUGE, PROT_READ | PROT_WRITE, flags, -1, 0);
+        if raw < 0 {
+            sys_exit(1);
+        }
+        let p = (raw as u64 + HUGE - 1) & !(HUGE - 1);
+        sys_madvise(p, 2 * HUGE, MADV_HUGEPAGE);
+        unsafe { core::ptr::write_volatile(p as *mut u8, 1) };
+        unsafe { core::ptr::write_volatile((p + HUGE) as *mut u8, 1) };
+        sys_exit(0);
+    }
+    reap_ok(pid)
 }

@@ -493,6 +493,10 @@ fn free_level(phys: u64, level: u32, put: &mut dyn FnMut(Leaf)) {
             _ => {}
         }
     }
+    // A PMD table: the page tables its 2MB pages kept for a split
+    if level == 2 {
+        crate::mm::huge_page::free_deposits(phys);
+    }
     crate::FRAME_ALLOCATOR.free(phys);
 }
 
