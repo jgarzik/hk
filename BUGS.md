@@ -456,18 +456,17 @@ but unused.
 **Location**: `fs/misc.rs` sys_mount/sys_umount2, `fs/mount.rs`
 
 Accepted without effect: MS_SILENT, MS_MANDLOCK, MS_POSIXACL,
-MS_I_VERSION, MS_LAZYTIME. Propagation (`fs/pnode.rs`): a propagated copy lands
-on top of what is already mounted at the target (Linux tucks it
-under); a slave's master is its master's peer group, not one mount;
-copies of a namespace are always peers and not locked (Linux
+MS_I_VERSION, MS_LAZYTIME. Propagation (`fs/pnode.rs`): a propagated
+copy lands on top of what is already mounted at the target (Linux
+tucks it under); a slave's master is its master's peer group, not one
+mount; copies of a namespace are always peers and not locked (Linux
 copy_mnt_ns for a less privileged user namespace makes shared mounts
 slaves, CL_SHARED_TO_SLAVE, and locks them, lock_mnt_tree): harmless
 while CLONE_NEWNS needs root and mounts ignore user namespaces, but
-required before mounts become user-namespace aware.
-Unlike Linux (MNT_WRITE_HOLD), a write access racing a read-only remount
-that then fails with EBUSY can see a spurious EROFS. Mount options are parsed by vfat (Linux's set; long names
-UTF-16 in UTF-8, iso8859-1 or cp437 only) and ramfs (mode=); procfs,
-devtmpfs and cgroupfs ignore theirs; mounts are not user-namespace aware (plain capable()).
+required before mounts become user-namespace aware. Mount options are
+parsed by vfat (Linux's set; long names UTF-16 in UTF-8, iso8859-1 or
+cp437 only) and ramfs (mode=); procfs, devtmpfs and cgroupfs ignore
+theirs; mounts are not user-namespace aware (plain capable()).
 Crossing into a mount scans the current mount's children (Linux hashes
 (parent, mountpoint): mount_hashtable).
 
