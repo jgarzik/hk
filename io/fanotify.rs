@@ -27,8 +27,8 @@
 //! - Support for permission events (blocking operations pending user decision)
 //! - Multiple marks per fanotify instance
 #![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
+use crate::util::kalloc::try_arc;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -318,8 +318,8 @@ pub struct Fanotify {
 
 impl Fanotify {
     /// Create a new fanotify instance
-    pub fn new(init_flags: u32, event_f_flags: u32) -> Arc<Self> {
-        Arc::new(Self {
+    pub fn new(init_flags: u32, event_f_flags: u32) -> Result<Arc<Self>, KernelError> {
+        try_arc(Self {
             inner: IrqSpinlock::new(FanotifyInner {
                 inode_marks: BTreeMap::new(),
                 mount_marks: BTreeMap::new(),
@@ -550,7 +550,7 @@ impl FileOps for FanotifyFileOps {
 
 /// Create a new fanotify instance
 pub fn create_fanotify(init_flags: u32, event_f_flags: u32) -> Result<Arc<File>, KernelError> {
-    let fanotify = Fanotify::new(init_flags, event_f_flags);
+    let fanotify = Fanotify::new(init_flags, event_f_flags)?;
 
     // Create dummy dentry for fanotify
 

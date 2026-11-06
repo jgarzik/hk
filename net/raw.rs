@@ -15,8 +15,8 @@
 //! `RawTable.socks` (`crate::sync::spin::RwLock`, per namespace) -> `Inet.addr`;
 //! delivery clones the matching `Arc`s and queues (`RxQueue`, leaf)
 //! after dropping the table lock. `RawSock.filter` is an atomic.
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
+use crate::util::kalloc::try_arc;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -76,14 +76,14 @@ pub fn create(protocol: i32) -> Result<Arc<dyn ProtoOps>, KernelError> {
     let sk = Sock::new(net.clone(), AF_INET, SOCK_RAW, protocol);
     // INET_PROTOSW_REUSE
     sk.set_flag(sf::REUSEADDR, true);
-    let s = Arc::new(RawSock {
+    let s = try_arc(RawSock {
         sk,
         inet: Inet::default(),
         num: protocol as u16,
         connected: AtomicBool::new(false),
         filter: AtomicU32::new(0),
         rxq: RxQueue::default(),
-    });
+    })?;
     if protocol == IPPROTO_RAW {
         s.inet.set_hdrincl(true);
     }

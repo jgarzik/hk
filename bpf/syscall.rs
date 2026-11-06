@@ -539,7 +539,10 @@ fn bpf_prog_load(attr_buf: &[u8]) -> i64 {
     }
 
     // Create BPF program
-    let prog = BpfProg::new(insns);
+    let prog = match BpfProg::new(insns) {
+        Ok(p) => p,
+        Err(e) => return e.sysret(),
+    };
 
     // Create file descriptor
     match create_bpf_prog_fd(prog, attr.prog_type) {

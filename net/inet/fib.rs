@@ -20,8 +20,8 @@
 //! clones, so no guard escapes (RCU-ready, plan 3a). Order: RTNL ->
 //! device address lists -> `Fib.tables` (leaf; never held while calling
 //! out, notifications are sent after it is dropped).
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
+use crate::util::kalloc::try_arc;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -289,7 +289,7 @@ impl Fib {
             .filter(|(_, x)| x.same_key(&e) && x.priority == e.priority)
             .map(|(i, _)| i)
             .collect();
-        let new = Arc::new(e);
+        let new = try_arc(e)?;
         if let Some(&first) = same_key.first() {
             if nlflags & NLM_F_EXCL != 0 {
                 return Err(KernelError::AlreadyExists);

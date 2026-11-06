@@ -43,8 +43,8 @@
 //! gets 127.0.0.1/8 when brought up). Userspace configures links,
 //! addresses and routes with NETLINK_ROUTE (`netlink/`) or SIOC* ioctls
 //! (`devioctl.rs`); all changes serialize on RTNL (`rtnl.rs`).
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
+use crate::util::kalloc::arc_nofail;
 use alloc::sync::Arc;
 
 // Re-export namespace access
@@ -119,7 +119,8 @@ pub fn alloc_netdev(
 ) -> (rtnl::RtnlGuard, Arc<NetDevice>) {
     let r = rtnl::lock();
     let name = init_net_ns().dev_alloc_name(template);
-    (r, Arc::new(NetDevice::new(name, mac, link, ops)))
+    // Device probe has no failure path (boot-time driver init)
+    (r, arc_nofail(NetDevice::new(name, mac, link, ops)))
 }
 
 /// Register a device from `alloc_netdev` in the init namespace and drop

@@ -22,8 +22,8 @@
 //! - Blocking and non-blocking reads/writes
 //! - poll() support for integration with select/poll/epoll
 //! - Semaphore mode (EFD_SEMAPHORE) for decrement-by-1 semantics
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
+use crate::util::kalloc::try_arc;
 use alloc::sync::Arc;
 
 use crate::arch::IrqSpinlock;
@@ -77,8 +77,8 @@ pub struct Eventfd {
 
 impl Eventfd {
     /// Create a new eventfd
-    pub fn new(initval: u64, flags: i32) -> Arc<Self> {
-        Arc::new(Self {
+    pub fn new(initval: u64, flags: i32) -> Result<Arc<Self>, KernelError> {
+        try_arc(Self {
             inner: IrqSpinlock::new(EventfdInner::new(initval, flags)),
             wait_queue: WaitQueue::new(),
         })
@@ -228,7 +228,7 @@ impl FileOps for EventfdFileOps {
 /// # Returns
 /// Arc<File> for the new eventfd
 pub fn create_eventfd(initval: u64, efd_flags: i32) -> Result<Arc<File>, KernelError> {
-    let eventfd = Eventfd::new(initval, efd_flags);
+    let eventfd = Eventfd::new(initval, efd_flags)?;
 
     // Create dummy dentry for eventfd
 

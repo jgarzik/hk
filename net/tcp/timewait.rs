@@ -14,8 +14,9 @@
 //!
 //! Locking: `inner` is a `crate::sync::spin::Mutex` leaf like `TcpSock.cb` (thread
 //! context only; table and timer locks may be taken under it).
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
+use crate::util::error::KernelError;
+use crate::util::kalloc::try_arc_cyclic;
 use alloc::sync::{Arc, Weak};
 
 use crate::sync::spin::Mutex;
@@ -47,8 +48,8 @@ impl TimeWait {
         params: IpParams,
         oif: u32,
         cb: TwCb,
-    ) -> Arc<Self> {
-        Arc::new_cyclic(|me| Self {
+    ) -> Result<Arc<Self>, KernelError> {
+        try_arc_cyclic(|me| Self {
             tuple,
             bind,
             net,

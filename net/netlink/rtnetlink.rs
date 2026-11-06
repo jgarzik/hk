@@ -9,9 +9,8 @@
 //!
 //! Dumps are resumable cursors (`RtDump`): parts of at most `DUMP_SIZE`
 //! bytes are produced as the reader drains its queue, NLMSG_DONE last.
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
-use alloc::boxed::Box;
+use crate::util::kalloc::try_box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
@@ -242,7 +241,7 @@ fn rcv_msg(sk: &Arc<NlSock>, h: &Hdr, p: &[u8], explicit: bool) -> Result<Done, 
             return Err(KernelError::OperationNotSupported);
         }
         let cb = RtDump::new(sk, h, family, p);
-        sk.dump_start(Box::new(cb), h.seq)?;
+        sk.dump_start(try_box(cb)?, h.seq)?;
         return Ok(Done::Dump);
     }
     let nl = NlInfo {

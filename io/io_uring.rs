@@ -38,8 +38,8 @@
 //! - Batched submissions and completions
 //! - Optional kernel-side polling (SQPOLL)
 //! - Registered buffers and files for performance
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
+use crate::util::kalloc::try_arc;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
@@ -474,14 +474,14 @@ impl IoUring {
         let rings_size = Self::calc_rings_size(sq_entries, cq_entries);
         let sqes_size = (sq_entries as usize) * core::mem::size_of::<IoUringSqe>();
 
-        Ok(Arc::new(Self {
+        try_arc(Self {
             inner: IrqSpinlock::new(IoUringInner::new(sq_entries, cq_entries)?),
             wq: WaitQueue::new(),
             sq_entries,
             cq_entries,
             rings_size,
             sqes_size,
-        }))
+        })
     }
 
     /// Calculate total ring buffer size

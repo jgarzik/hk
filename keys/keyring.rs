@@ -10,6 +10,7 @@
 //! functions to resolve special keyring IDs to actual key serials.
 
 use crate::sync::spin::RwLock;
+use crate::util::kalloc::{arc_nofail, try_arc};
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -87,8 +88,12 @@ pub fn fork_keyrings(parent: &TaskKeyrings, thread: bool, uid: u32, gid: u32) ->
     TaskKeyrings {
         session_keyring: parent.session_keyring.clone(),
         process_keyring: parent.process_keyring.clone().filter(|_| thread),
-        thread_keyring: (thread && parent.thread_keyring.is_some())
-            .then(|| create_keyring("_tid", uid, gid)),
+        // Linux copy_creds can fail here; do_clone cannot yet
+        thread_keyring: (thread && parent.thread_keyring.is_some()).then(|| {
+            let k = arc_nofail(keyring_key("_tid", uid, gid));
+            publish_keyring(&k);
+            k
+        }),
     }
 }
 
@@ -102,20 +107,29 @@ pub fn exec_keyrings(tid: u64) {
 }
 
 /// Create a new keyring with the given description
-pub fn create_keyring(description: &str, uid: u32, gid: u32) -> Arc<Key> {
-    let serial = alloc_serial();
-    let key = Key::new(
-        serial,
+pub fn create_keyring(description: &str, uid: u32, gid: u32) -> Result<Arc<Key>, KernelError> {
+    let key = try_arc(keyring_key(description, uid, gid))?;
+    publish_keyring(&key);
+    Ok(key)
+}
+
+/// A new keyring, not yet registered
+fn keyring_key(description: &str, uid: u32, gid: u32) -> Key {
+    Key::new(
+        alloc_serial(),
         keyring_key_type(),
         String::from(description),
         uid,
         gid,
         KEYRING_DEFAULT_PERM,
-    );
+    )
+}
+
+/// Instantiate and register a new keyring
+fn publish_keyring(key: &Arc<Key>) {
     // Mark as instantiated since keyrings don't need payload
     let _ = key.instantiate(alloc::vec![]);
-    register_key(&key);
-    key
+    register_key(key);
 }
 
 /// The keyring in `slot`, made (as `name`) if `create` and none is there
@@ -132,7 +146,7 @@ fn slot_keyring(
     if !create {
         return Err(KernelError::NoKey.sysret());
     }
-    let k = create_keyring(name, uid, gid);
+    let k = create_keyring(name, uid, gid).map_err(KernelError::sysret)?;
     // An invalidated keyring the slot held is dropped after the caller's
     // lock (returned to it below by replace)
     let _old = slot.replace(k.clone());

@@ -54,11 +54,11 @@ pub const SIN_LEN: usize = 16;
 pub fn create(stype: i32, protocol: i32) -> Result<Arc<dyn ProtoOps>, KernelError> {
     match stype {
         SOCK_STREAM => match protocol {
-            IPPROTO_IP | IPPROTO_TCP => Ok(crate::net::tcp::create()),
+            IPPROTO_IP | IPPROTO_TCP => crate::net::tcp::create(),
             _ => Err(KernelError::ProtocolNotSupported),
         },
         SOCK_DGRAM => match protocol {
-            IPPROTO_IP | IPPROTO_UDP => Ok(crate::net::udp::create()),
+            IPPROTO_IP | IPPROTO_UDP => crate::net::udp::create(),
             IPPROTO_ICMP => crate::net::ping::create(),
             _ => Err(KernelError::ProtocolNotSupported),
         },

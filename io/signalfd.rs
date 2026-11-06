@@ -22,8 +22,8 @@
 //! - poll() support for integration with select/poll/epoll
 //! - Mask can be updated by calling signalfd4 with existing fd
 #![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
+use crate::util::kalloc::try_arc;
 use alloc::sync::Arc;
 
 use crate::arch::IrqSpinlock;
@@ -110,10 +110,10 @@ pub struct Signalfd {
 
 impl Signalfd {
     /// Create a new signalfd
-    pub fn new(mask: SigSet) -> Arc<Self> {
+    pub fn new(mask: SigSet) -> Result<Arc<Self>, KernelError> {
         // Cannot monitor SIGKILL or SIGSTOP
         let filtered_mask = mask.subtract(&UNMASKABLE_SIGNALS);
-        Arc::new(Self {
+        try_arc(Self {
             inner: IrqSpinlock::new(SignalfdInner {
                 mask: filtered_mask,
             }),
@@ -283,7 +283,7 @@ impl FileOps for SignalfdFileOps {
 /// # Returns
 /// Arc<File> for the new signalfd
 pub fn create_signalfd(mask: SigSet, sfd_flags: i32) -> Result<Arc<File>, KernelError> {
-    let signalfd = Signalfd::new(mask);
+    let signalfd = Signalfd::new(mask)?;
 
     // Create dummy dentry for signalfd
 

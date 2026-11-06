@@ -10,8 +10,8 @@
 //! their removal by munmap, shmdt, exit or exec all keep it right, and the
 //! last detach of a segment removed with IPC_RMID destroys it. The pages
 //! go when the segment and its last VMA are gone.
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
+use crate::util::kalloc::try_arc;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, Ordering};
@@ -100,7 +100,7 @@ impl ShmidKernel {
         let now = current_time_secs();
         let pid = current_pid() as i32;
 
-        Ok(Arc::new(Self {
+        try_arc(Self {
             perm: KernIpcPerm::new(key, mode),
             segsz: size,
             nattch: AtomicU32::new(0),
@@ -112,7 +112,8 @@ impl ShmidKernel {
             shmem: Shmem::new(size.div_ceil(PAGE_SIZE) as u64),
             destroyed: AtomicBool::new(false),
             ns,
-        }))
+        })
+        .map_err(KernelError::errno)
     }
 
     /// Fill shmid64_ds structure for IPC_STAT

@@ -28,8 +28,8 @@
 //! - `File.f_ep` (spin leaf): the items watching the file.
 //! - `EPNESTED` (sleeping): the loop check and insert of an epoll target
 //!   (Linux epnested_mutex), with no spin lock held.
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
+use crate::util::kalloc::{try_arc, try_arc_cyclic};
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
@@ -260,8 +260,8 @@ fn key(file: &Arc<File>, fd: Fd) -> (usize, Fd) {
 
 impl Eventpoll {
     /// Create a new epoll instance
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self {
+    pub fn new() -> Result<Arc<Self>, KernelError> {
+        try_arc(Self {
             lock: IrqSpinlock::new(EpInner {
                 items: BTreeMap::new(),
                 rdl: ArcList::new(),
@@ -299,7 +299,7 @@ impl Eventpoll {
         ev: &EpollEvent,
     ) -> Result<(), KernelError> {
         let k = key(file, fd);
-        let item = Arc::new_cyclic(|w: &Weak<EpItem>| EpItem {
+        let item = try_arc_cyclic(|w: &Weak<EpItem>| EpItem {
             rdlink: Link::new(),
             fd,
             file: Arc::downgrade(file),
@@ -313,7 +313,7 @@ impl Eventpoll {
                 owners: Vec::new(),
                 item: w.as_ptr(),
             }),
-        });
+        })?;
         {
             let mut inner = self.lock.lock();
             if inner.items.contains_key(&k) {
@@ -710,7 +710,7 @@ impl FileOps for EpollFileOps {
 
 /// Create an epoll file
 pub fn create_epoll_file(eflags: i32) -> Result<Arc<File>, KernelError> {
-    let ep = Eventpoll::new();
+    let ep = Eventpoll::new()?;
     let mut file_flags = flags::O_RDWR;
     if eflags & EPOLL_CLOEXEC != 0 {
         file_flags |= flags::O_CLOEXEC;

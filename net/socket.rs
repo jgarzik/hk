@@ -13,8 +13,8 @@
 //! Blocking follows the file's O_NONBLOCK at every call (fcntl/FIONBIO
 //! take effect immediately) plus MSG_DONTWAIT; timeouts and signal
 //! rules are in `Sock::wait`.
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
+use crate::util::kalloc::try_arc;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
@@ -180,13 +180,22 @@ pub fn sock_of(file: &File) -> Option<Arc<dyn ProtoOps>> {
     Some(p.as_any().downcast_ref::<SockInode>()?.0.clone())
 }
 
-/// Wrap a protocol socket in a new sockfs file (Linux sock_alloc_file)
-pub fn sock_alloc_file(sock: Arc<dyn ProtoOps>, nonblock: bool) -> Arc<File> {
+/// Wrap a protocol socket in a new sockfs file (Linux sock_alloc_file:
+/// on failure the socket is released)
+pub fn sock_alloc_file(sock: Arc<dyn ProtoOps>, nonblock: bool) -> Result<Arc<File>, KernelError> {
+    let r = sock_file(sock.clone(), nonblock);
+    if r.is_err() {
+        sock.release();
+    }
+    r
+}
+
+fn sock_file(sock: Arc<dyn ProtoOps>, nonblock: bool) -> Result<Arc<File>, KernelError> {
     let ino = crate::fs::anon_inodes::get_next_ino();
     sock.sk().ino.store(ino, Ordering::Release);
     let cred = &sock.sk().cred;
     let now = crate::time::TIMEKEEPER.current_time();
-    let inode = Arc::new(Inode::new(
+    let inode = try_arc(Inode::new(
         ino,
         InodeMode::socket(0o777),
         cred.fsuid,
@@ -195,15 +204,15 @@ pub fn sock_alloc_file(sock: Arc<dyn ProtoOps>, nonblock: bool) -> Arc<File> {
         now,
         alloc::sync::Weak::new(),
         &NULL_INODE_OPS,
-    ));
-    inode.set_private(Arc::new(SockInode(sock)));
+    ))?;
+    inode.set_private(try_arc(SockInode(sock))?);
     let name = alloc::format!("socket:[{}]", ino);
-    let dentry = Arc::new(Dentry::new_anonymous(name.as_str().into(), Some(inode)));
+    let dentry = try_arc(Dentry::new_anonymous(name.as_str().into(), Some(inode)))?;
     let mut flags = fflags::O_RDWR;
     if nonblock {
         flags |= fflags::O_NONBLOCK;
     }
-    Arc::new(File::new(dentry, None, flags, &SOCK_FOPS))
+    try_arc(File::new(dentry, None, flags, &SOCK_FOPS))
 }
 
 /// Create a protocol socket (Linux __sock_create)

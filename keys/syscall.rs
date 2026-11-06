@@ -9,6 +9,7 @@ use crate::arch::Uaccess;
 use crate::task::percpu;
 use crate::uaccess::{copy_from_user, strncpy_from_user_str};
 use crate::util::error::KernelError;
+use crate::util::kalloc::try_arc;
 
 use super::key::{KEY_DEFAULT_PERM, Key};
 use super::keyring::{keyring_link, resolve_special_keyring, search_process_keyrings};
@@ -118,6 +119,10 @@ pub fn sys_add_key(type_ptr: u64, desc_ptr: u64, payload_ptr: u64, plen: u64, ke
     );
     // Record the charge so a later failure (or invalidate) returns it
     key.set_quota(cred.fsuid, charge);
+    let key = match try_arc(key) {
+        Ok(k) => k,
+        Err(e) => return e.sysret(),
+    };
 
     // Instantiate the key with payload
     if let Err(e) = key_type.instantiate(&key, &payload) {

@@ -3,8 +3,8 @@
 //! This module provides file descriptor support for BPF objects (maps and programs).
 //! BPF objects are exposed as file descriptors to userspace, allowing them to be
 //! managed with standard fd operations (close, dup, etc.).
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
+use crate::util::kalloc::try_arc;
 use alloc::sync::Arc;
 
 use super::map::BpfMap;
@@ -112,7 +112,7 @@ pub fn create_bpf_map_fd(map: Arc<BpfMap>) -> Result<i32, KernelError> {
 
 /// Create a file descriptor for a BPF program
 pub fn create_bpf_prog_fd(prog: Arc<BpfProg>, prog_type: u32) -> Result<i32, KernelError> {
-    let private = Arc::new(BpfProgFile { prog, prog_type });
+    let private = try_arc(BpfProgFile { prog, prog_type })?;
 
     let file = anon_inode_getfile("bpf-prog", &BPF_PROG_FOPS, private, flags::O_RDWR);
 

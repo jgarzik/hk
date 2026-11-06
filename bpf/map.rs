@@ -8,8 +8,8 @@
 //!
 //! - `BPF_MAP_TYPE_HASH`: Hash table with arbitrary keys
 //! - `BPF_MAP_TYPE_ARRAY`: Fixed-size array indexed by u32
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
+use crate::util::kalloc::try_arc;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -139,12 +139,12 @@ impl BpfHashMap {
             return Err(KernelError::InvalidArgument);
         }
 
-        Ok(Arc::new(Self {
+        try_arc(Self {
             data: IrqSpinlock::new(BTreeMap::new()),
             key_size,
             value_size,
             max_entries,
-        }))
+        })
     }
 }
 
@@ -295,11 +295,11 @@ impl BpfArrayMap {
             )?));
         }
 
-        Ok(Arc::new(Self {
+        try_arc(Self {
             data,
             value_size,
             max_entries,
-        }))
+        })
     }
 
     /// Convert key bytes to index
@@ -403,9 +403,9 @@ pub struct BpfMap {
 
 impl BpfMap {
     /// Create a new map container
-    pub fn new(ops: Arc<dyn BpfMapOps>, flags: u32) -> Arc<Self> {
+    pub fn new(ops: Arc<dyn BpfMapOps>, flags: u32) -> Result<Arc<Self>, KernelError> {
         let id = NEXT_MAP_ID.fetch_add(1, Ordering::Relaxed);
-        Arc::new(Self { id, ops, flags })
+        try_arc(Self { id, ops, flags })
     }
 
     /// Get the underlying map operations
@@ -473,7 +473,7 @@ pub fn create_map(
         _ => return Err(KernelError::InvalidArgument),
     };
 
-    Ok(BpfMap::new(ops, flags))
+    BpfMap::new(ops, flags)
 }
 
 #[cfg(test)]

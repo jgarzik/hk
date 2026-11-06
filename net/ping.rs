@@ -15,8 +15,8 @@
 //! (`crate::sync::spin::RwLock`) -> `Inet.addr`; `RxQueue` and `Sock.errq` are
 //! separate leaves. Receive takes the table read lock, clones the `Arc`
 //! and queues after dropping it.
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
+use crate::util::kalloc::try_arc_cyclic;
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
@@ -74,7 +74,7 @@ pub fn create() -> Result<Arc<dyn ProtoOps>, KernelError> {
     // SO_REUSEADDR
     let sk = Sock::new(net, AF_INET, SOCK_DGRAM, i32::from(IPPROTO_ICMP));
     sk.set_flag(sf::REUSEADDR, true);
-    Ok(Arc::new_cyclic(|me| PingSock {
+    Ok(try_arc_cyclic(|me| PingSock {
         sk,
         inet: Inet::default(),
         op: Mutex::new(()),
@@ -82,7 +82,7 @@ pub fn create() -> Result<Arc<dyn ProtoOps>, KernelError> {
         hashed: AtomicBool::new(false),
         rxq: RxQueue::default(),
         me: me.clone(),
-    }))
+    })?)
 }
 
 impl PingSock {

@@ -67,7 +67,7 @@ pub fn connect(s: &UnixSock, a: &[u8], nonblock: bool) -> Result<(), KernelError
     s.passcred_autobind()?;
     let mut timeo = s.sk.snd_timeo(nonblock);
     let cred = PeerCred::current();
-    let newsk = UnixSock::new(s.sk.net.clone(), s.sk.stype);
+    let newsk = UnixSock::new(s.sk.net.clone(), s.sk.stype)?;
     let r = connect_to(s, a, &newsk, cred, &mut timeo);
     if r.is_err() {
         newsk.release_sock(false);

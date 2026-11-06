@@ -33,8 +33,8 @@
 //!   run in the receive path (softnet or an inline backlog flush) and in
 //!   `dev_queue_xmit` callers, with no lock held by this module.
 //! - `NAPI_LIST`: `crate::sync::spin::Mutex`, thread context only, leaf.
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
+use crate::util::kalloc::arc_nofail;
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::sync::{Arc, Weak};
@@ -153,7 +153,8 @@ pub struct Napi {
 impl Napi {
     /// Create a NAPI context; attach the driver with [`netif_napi_add`]
     pub fn new(weight: usize) -> Arc<Self> {
-        Arc::new(Self {
+        // Driver probe has no failure path
+        arc_nofail(Self {
             sched: AtomicBool::new(false),
             disable: AtomicBool::new(false),
             weight: weight.clamp(1, NAPI_POLL_WEIGHT),

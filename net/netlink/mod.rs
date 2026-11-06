@@ -34,12 +34,12 @@
 //! - Order: RTNL -> FIB/addresses -> `NlTable.socks` -> `NlSock.rxq`;
 //!   `NlSock.dump` -> devices/FIB/ARP snapshots -> `NlSock.rxq`. RTNL is
 //!   never taken under `NlSock.dump`.
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 pub mod attr;
 pub mod ops;
 pub mod rtnetlink;
 
+use crate::util::kalloc::try_arc_cyclic;
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::{Arc, Weak};
@@ -232,9 +232,9 @@ static ROVER: AtomicI32 = AtomicI32::new(-4097);
 
 impl NlSock {
     /// New socket in the current task's namespace
-    fn new(proto: &'static NlProto, protocol: i32, stype: i32) -> Arc<Self> {
+    fn new(proto: &'static NlProto, protocol: i32, stype: i32) -> Result<Arc<Self>, KernelError> {
         let net = crate::net::current_net_ns();
-        Arc::new_cyclic(|me| Self {
+        try_arc_cyclic(|me| Self {
             sk: Sock::new(net, AF_NETLINK as u16, stype, protocol),
             proto,
             portid: AtomicU32::new(0),
@@ -732,5 +732,5 @@ pub fn create(stype: i32, protocol: i32) -> Result<Arc<dyn ProtoOps>, KernelErro
         return Err(KernelError::SocketTypeNotSupported);
     }
     let p = proto(protocol).ok_or(KernelError::ProtocolNotSupported)?;
-    Ok(NlSock::new(p, protocol, stype))
+    Ok(NlSock::new(p, protocol, stype)?)
 }

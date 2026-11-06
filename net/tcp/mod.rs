@@ -30,7 +30,6 @@
 //! takes its listener's `cb`) -> tables (`bhash` -> `ehash`, `lhash`) ->
 //! `Inet.addr` -> `TcpSock.queue` (listener SYN/accept queues, leaf) ->
 //! timer `TIMERS`; and `cb` -> FIB / neighbour / device TX (transmit).
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 pub mod ack;
 pub mod cb;
@@ -52,6 +51,7 @@ use core::any::Any;
 use core::sync::atomic::Ordering;
 
 use crate::sync::spin::{Mutex, MutexGuard};
+use crate::util::kalloc::try_arc_cyclic;
 
 use self::cb::{Cfg, Open, Out, Seg, SegIn, TcpCb, flags};
 use self::output::Tuple;
@@ -150,13 +150,13 @@ pub struct TcpSock {
 }
 
 /// socket(AF_INET, SOCK_STREAM, 0)
-pub fn create() -> Arc<dyn ProtoOps> {
-    TcpSock::new(Sock::new(
+pub fn create() -> Result<Arc<dyn ProtoOps>, KernelError> {
+    Ok(TcpSock::new(Sock::new(
         crate::net::current_net_ns(),
         AF_INET,
         SOCK_STREAM,
         PROTO_TCP,
-    ))
+    ))?)
 }
 
 /// Connection knobs from the namespace's sysctls
@@ -226,10 +226,10 @@ fn route_mss(net: &NetNamespace, daddr: Ipv4Addr, saddr: Ipv4Addr, oif: u32) -> 
 }
 
 impl TcpSock {
-    pub fn new(sk: Sock) -> Arc<Self> {
+    pub fn new(sk: Sock) -> Result<Arc<Self>, KernelError> {
         let mut cb = TcpCb::new(cfg(&sk.net));
         cb.opts.ca = sk.net.sysctl.tcp_ca.load(Ordering::Relaxed) as usize;
-        Arc::new_cyclic(|me| Self {
+        try_arc_cyclic(|me| Self {
             sk,
             inet: Inet::default(),
             cb: Mutex::new(Inner {
@@ -322,14 +322,21 @@ impl TcpSock {
         bind.addr = self.inet.get().rcv_saddr;
         bind.tw = true;
         bind.listen = false;
-        let tw = TimeWait::new(
+        let Ok(tw) = TimeWait::new(
             self.sk.net.clone(),
             t,
             bind,
             self.inet.params(),
             self.oif(),
             g.cb.tw_clone(),
-        );
+        ) else {
+            // Out of memory: close without TIME_WAIT (Linux tcp_time_wait
+            // falls back to tcp_done); `post` leaves the tables
+            g.tuple = Some(t);
+            g.cb.tw_done(out);
+            out.done = true;
+            return;
+        };
         self.sk.net.tcp.tw_hashdance(&self.arc(), &tw);
         g.bound = false;
         tw.start();
@@ -474,7 +481,10 @@ impl TcpSock {
     /// (listener locked, then the child's lock; `opts` are the
     /// listener's)
     fn child(&self, s: &SegIn<'_>, t: Tuple, opts: cb::Opts, now: u64) {
-        let c = TcpSock::new(Sock::clone_from(&self.sk));
+        // Out of memory: drop the SYN (Linux inet_csk_clone_lock)
+        let Ok(c) = TcpSock::new(Sock::clone_from(&self.sk)) else {
+            return;
+        };
         c.inet.clone_opts(&self.inet);
         {
             let mut a = c.inet.addr.lock();

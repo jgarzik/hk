@@ -29,8 +29,8 @@
 //! - Multiple watches per inotify instance
 //! - Watch descriptors (wd) are unique per instance
 #![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
+use crate::util::kalloc::try_arc;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -224,8 +224,8 @@ static NEXT_RENAME_COOKIE: AtomicI32 = AtomicI32::new(1);
 
 impl Inotify {
     /// Create a new inotify instance
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self {
+    pub fn new() -> Result<Arc<Self>, KernelError> {
+        try_arc(Self {
             inner: IrqSpinlock::new(InotifyInner {
                 next_wd: 1,
                 watches: BTreeMap::new(),
@@ -483,7 +483,7 @@ impl FileOps for InotifyFileOps {
 /// # Returns
 /// Arc<File> for the new inotify fd
 pub fn create_inotify(in_flags: i32) -> Result<Arc<File>, KernelError> {
-    let inotify = Inotify::new();
+    let inotify = Inotify::new()?;
 
     // Create dummy dentry for inotify
 

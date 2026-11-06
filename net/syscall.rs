@@ -68,7 +68,7 @@ pub fn sys_socket(domain: i32, stype: i32, protocol: i32) -> i64 {
     ret((|| {
         let (nb, cloexec) = type_flags(stype & !SOCK_TYPE_MASK)?;
         let s = sock_create(domain, stype & SOCK_TYPE_MASK, protocol)?;
-        fd_install(sock_alloc_file(s, nb), cloexec)
+        fd_install(sock_alloc_file(s, nb)?, cloexec)
     })())
 }
 
@@ -86,7 +86,7 @@ pub fn sys_socketpair(domain: i32, stype: i32, protocol: i32, sv: u64) -> i64 {
         let b = ScopeGuard::new_with_data(create()?, |s| s.release());
         a.socketpair(&**b)?;
         let (a, b) = (a.dismiss(), b.dismiss());
-        let fds = install_pair(sock_alloc_file(a, nb), sock_alloc_file(b, nb), cloexec)?;
+        let fds = install_pair(sock_alloc_file(a, nb)?, sock_alloc_file(b, nb)?, cloexec)?;
         put_user::<Uaccess, [i32; 2]>(sv, fds).map_err(|_| KernelError::BadAddress)?;
         Ok(0)
     })())
@@ -164,7 +164,7 @@ pub fn sys_accept4(fd: i32, addr: u64, lenp: u64, flags: i32) -> i64 {
         let nb = file_nb(&file, 0) & MSG_DONTWAIT != 0;
         let child = s.accept(nb)?;
         let peer = child.getname(true);
-        let newfile = sock_alloc_file(child, nb_new);
+        let newfile = sock_alloc_file(child, nb_new)?;
         if addr != 0 {
             let a = peer.map_err(|_| KernelError::ConnectionAborted)?;
             addr_out(addr, lenp, &a)?;

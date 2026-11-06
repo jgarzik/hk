@@ -5,8 +5,8 @@
 //! - Atomic multi-semaphore operations
 //! - Blocking with optional timeout
 //! - Automatic undo on process exit (SEM_UNDO)
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
+use crate::util::kalloc::try_arc;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
 use alloc::vec;
@@ -385,7 +385,7 @@ impl SemArray {
                 }),
             })
             .collect();
-        Ok(Arc::new(Self {
+        try_arc(Self {
             perm: KernIpcPerm::new(key, mode),
             nsems,
             sems,
@@ -397,7 +397,8 @@ impl SemArray {
             use_global_lock: AtomicU32::new(0),
             waitq: WaitQueue::new(),
             ns,
-        }))
+        })
+        .map_err(KernelError::errno)
     }
 
     /// The whole array, in complex mode (Linux sem_lock for nsops != 1
@@ -648,11 +649,13 @@ fn do_semtimedop(semid: i32, sops_ptr: u64, nsops: usize, timeout_ptr: u64) -> R
 
     // The undo list knows the array before the array knows the list
     // (Linux find_alloc_undo), so exit finds every adjustment
-    let undo = has_undo.then(|| {
-        let ul = get_or_create_undo_list(current_tid());
+    let undo = if has_undo {
+        let ul = get_or_create_undo_list(current_tid()).map_err(KernelError::errno)?;
         ul.register(semid, &sem_array_ref);
-        ul.id
-    });
+        Some(ul.id)
+    } else {
+        None
+    };
     let pid = current_pid() as i32;
     let mut l = sem_array.lock_for(&sops);
     if sem_array.perm.is_deleted() {
@@ -676,13 +679,14 @@ fn do_semtimedop(semid: i32, sops_ptr: u64, nsops: usize, timeout_ptr: u64) -> R
     // a waker completes the operation). A single operation waits on its
     // semaphore, unless it alters while multi-operation waiters exist;
     // those, and multi-operation ones, wait on the array.
-    let queue = Arc::new(SemQueue {
+    let queue = try_arc(SemQueue {
         pid,
         sops,
         alter,
         undo,
         status: AtomicI32::new(SEM_WAITING),
-    });
+    })
+    .map_err(KernelError::errno)?;
     let w = (queue.clone(), blocking);
     if queue.sops.len() == 1 {
         let n = queue.sops[0].sem_num as usize;
@@ -1070,16 +1074,18 @@ impl Default for SemUndoList {
 use crate::task::percpu::TASKLIST;
 
 /// Get the undo list for a task, creating if necessary
-pub fn get_or_create_undo_list(tid: Tid) -> Arc<SemUndoList> {
+pub fn get_or_create_undo_list(tid: Tid) -> Result<Arc<SemUndoList>, KernelError> {
     let mut table = TASKLIST.write();
     if let Some(mut task) = table.get_mut(tid) {
-        if task.sysvsem.is_none() {
-            task.sysvsem = Some(Arc::new(SemUndoList::new()));
+        if let Some(ul) = &task.sysvsem {
+            return Ok(ul.clone());
         }
-        task.sysvsem.clone().unwrap()
+        let ul = try_arc(SemUndoList::new())?;
+        task.sysvsem = Some(ul.clone());
+        Ok(ul)
     } else {
         // Task not found - shouldn't happen but return a new list
-        Arc::new(SemUndoList::new())
+        try_arc(SemUndoList::new())
     }
 }
 

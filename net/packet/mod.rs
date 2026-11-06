@@ -27,11 +27,11 @@
 //! (`crate::sync::spin::RwLock` leaf, the `Arc` is cloned out before running it).
 //! `mclist` (`crate::sync::spin::Mutex` leaf) is changed under RTNL, which device
 //! promiscuity changes need: RTNL -> `mclist`.
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 mod opts;
 mod rcv;
 
+use crate::util::kalloc::try_arc;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
@@ -155,7 +155,7 @@ pub fn create(stype: i32, protocol: i32) -> Result<Arc<dyn ProtoOps>, KernelErro
     }
     let proto = u16::from_be(protocol as u16);
     let net = crate::net::current_net_ns();
-    let s = Arc::new(PacketSock {
+    let s = try_arc(PacketSock {
         sk: Sock::new(net.clone(), AF_PACKET, stype, protocol),
         bind: AtomicU64::new(pack(proto, 0)),
         flags: AtomicU32::new(0),
@@ -164,7 +164,7 @@ pub fn create(stype: i32, protocol: i32) -> Result<Arc<dyn ProtoOps>, KernelErro
         packets: AtomicU32::new(0),
         drops: AtomicU32::new(0),
         mclist: Mutex::new(Vec::new()),
-    });
+    })?;
     net.packet.insert(&s);
     Ok(s)
 }

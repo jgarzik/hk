@@ -42,9 +42,9 @@
 //! - `./select-poll.md` - Implementation guide
 //! - Linux pipe(7) man page
 //! - Linux fs/pipe.c
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use crate::sync::{Mutex, MutexGuard};
+use crate::util::kalloc::try_arc;
 use alloc::sync::Arc;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
@@ -433,9 +433,7 @@ fn allocate_pipe_page() -> Option<Arc<PipePage>> {
     // watermark like the user pages it was copied from
     let frame = FRAME_ALLOCATOR.alloc_gfp(crate::mm::page_alloc::Gfp::HIGHUSER_MOVABLE)?;
 
-    let page = Arc::new(PipePage::new(frame));
-
-    Some(page)
+    try_arc(PipePage::new(frame)).ok()
 }
 
 /// Shared pipe structure
@@ -461,8 +459,8 @@ pub struct Pipe {
 
 impl Pipe {
     /// Create a new pipe
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self::default())
+    pub fn new() -> Result<Arc<Self>, KernelError> {
+        try_arc(Self::default())
     }
 
     /// Lock the buffer (Linux pipe_lock); may sleep. Wake waiters only
@@ -941,12 +939,15 @@ impl FileOps for FifoFileOps {
         let mode = file.get_flags() & flags::O_ACCMODE;
         let pipe = {
             let mut slot = inode.i_pipe.lock();
-            let (p, files) = slot.get_or_insert_with(|| {
-                let p = Pipe::new();
-                p.readers.store(0, Ordering::Relaxed);
-                p.writers.store(0, Ordering::Relaxed);
-                (p, 0)
-            });
+            let (p, files) = match slot.take() {
+                Some(s) => slot.insert(s),
+                None => {
+                    let p = Pipe::new()?;
+                    p.readers.store(0, Ordering::Relaxed);
+                    p.writers.store(0, Ordering::Relaxed);
+                    slot.insert((p, 0))
+                }
+            };
             if mode == flags::O_WRONLY && nonblock && !p.has_readers() {
                 if *files == 0 {
                     *slot = None;
@@ -1005,8 +1006,17 @@ impl FileOps for FifoFileOps {
             fifo_put(&inode, &pipe, mode);
             return Err(e);
         }
-        file.private
-            .call_once(|| Arc::new(FifoFile { pipe, w_version }));
+        let f = match try_arc(FifoFile {
+            pipe: pipe.clone(),
+            w_version,
+        }) {
+            Ok(f) => f,
+            Err(e) => {
+                fifo_put(&inode, &pipe, mode);
+                return Err(e);
+            }
+        };
+        file.private.call_once(|| f);
         Ok(())
     }
 
@@ -1112,7 +1122,7 @@ fn fifo_put(inode: &crate::fs::inode::Inode, pipe: &Pipe, mode: u32) {
 ///
 /// The returned files should be added to the process's fd table.
 pub fn create_pipe(pipe_flags: u32) -> Result<(Arc<File>, Arc<File>), KernelError> {
-    let pipe = Pipe::new();
+    let pipe = Pipe::new()?;
 
     // We need a dummy dentry for pipe files
     // Pipes don't have a filesystem path, but File requires a dentry
@@ -1122,18 +1132,18 @@ pub fn create_pipe(pipe_flags: u32) -> Result<(Arc<File>, Arc<File>), KernelErro
     let read_flags = flags::O_RDONLY | (pipe_flags & flags::O_NONBLOCK);
     let write_flags = flags::O_WRONLY | (pipe_flags & flags::O_NONBLOCK);
 
-    let read_file = Arc::new(File::new_anon(
+    let read_file = try_arc(File::new_anon(
         Arc::clone(&dummy_dentry),
         read_flags,
         &PIPE_READ_FOPS,
         pipe.clone(),
-    ));
-    let write_file = Arc::new(File::new_anon(
+    ))?;
+    let write_file = try_arc(File::new_anon(
         dummy_dentry,
         write_flags,
         &PIPE_WRITE_FOPS,
         pipe,
-    ));
+    ))?;
 
     Ok((read_file, write_file))
 }
@@ -1150,7 +1160,7 @@ fn create_pipe_dentry() -> Result<Arc<Dentry>, KernelError> {
     // A pipefs inode (Linux get_pipe_inode): its own number, the
     // creator's fsuid/fsgid, the current time
     let cred = crate::task::percpu::current_cred();
-    let inode = Arc::new(Inode::new(
+    let inode = try_arc(Inode::new(
         crate::fs::anon_inodes::get_next_ino(),
         InodeMode::fifo(0o600),
         cred.fsuid,
@@ -1159,10 +1169,10 @@ fn create_pipe_dentry() -> Result<Arc<Dentry>, KernelError> {
         crate::time::TIMEKEEPER.current_time(),
         Weak::new(),
         &NULL_INODE_OPS,
-    ));
+    ))?;
 
     // Create anonymous dentry
-    let dentry = Arc::new(Dentry::new_anonymous("pipe".into(), Some(inode)));
+    let dentry = try_arc(Dentry::new_anonymous("pipe".into(), Some(inode)))?;
 
     Ok(dentry)
 }

@@ -25,8 +25,8 @@
 //! `inner` is held: state changes return actions that run after the
 //! unlock. `TABLES` and `TIMER` (`crate::sync::spin::Mutex`) are leaves except that
 //! `TIMER` is held across arming (-> the timer base IrqSpinlock).
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
+use crate::util::kalloc::{arc_nofail, try_arc};
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::{Arc, Weak};
@@ -457,7 +457,8 @@ fn rand_reach(base: u64) -> u64 {
 impl NeighTable {
     /// A new table, registered with the neighbour timer
     pub fn new(ops: &'static NeighOps) -> Arc<Self> {
-        let t = Arc::new(Self {
+        // NetNamespace::new cannot fail yet
+        let t = arc_nofail(Self {
             ops,
             parms: Parms::DEFAULT,
             hash: RwLock::new(BTreeMap::new()),
@@ -489,7 +490,7 @@ impl NeighTable {
         }
         let now = now_ms();
         self.maybe_forced_gc(now)?;
-        let n = Arc::new(Neighbour {
+        let n = try_arc(Neighbour {
             key: *key,
             dev: dev.clone(),
             inner: Mutex::new(Inner {
@@ -498,7 +499,7 @@ impl NeighTable {
                 qbytes: 0,
                 dead: false,
             }),
-        });
+        })?;
         let n = {
             let mut h = self.hash.write();
             // An unregistered device's entries were flushed after it was

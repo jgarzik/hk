@@ -2,7 +2,6 @@
 //!
 //! This module defines the Key struct which represents a security key
 //! in the Linux keyring subsystem.
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use crate::sync::spin::RwLock;
 use alloc::string::String;
@@ -187,7 +186,7 @@ pub struct Key {
 }
 
 impl Key {
-    /// Create a new key
+    /// A new key, to be placed in an `Arc` (fallibly or not)
     pub fn new(
         serial: KeySerial,
         key_type: Arc<dyn KeyType>,
@@ -195,8 +194,8 @@ impl Key {
         uid: u32,
         gid: u32,
         perm: KeyPerm,
-    ) -> Arc<Self> {
-        Arc::new(Self {
+    ) -> Self {
+        Self {
             serial,
             type_name: String::from(key_type.name()),
             description,
@@ -209,7 +208,7 @@ impl Key {
             key_type,
             quota_uid: AtomicU32::new(0),
             quota_bytes: core::sync::atomic::AtomicUsize::new(0),
-        })
+        }
     }
 
     /// Record that `bytes` were charged to `uid`'s key quota, so the
@@ -620,7 +619,16 @@ mod tests {
     #[test]
     fn deep_keyring_chain_drops() {
         let ty = super::super::types::keyring_key_type();
-        let make = |n: i32| Key::new(n, ty.clone(), alloc::string::String::from("k"), 0, 0, 0);
+        let make = |n: i32| {
+            Arc::new(Key::new(
+                n,
+                ty.clone(),
+                alloc::string::String::from("k"),
+                0,
+                0,
+                0,
+            ))
+        };
         let top = make(1);
         let mut cur = top.clone();
         for n in 2..200_000 {

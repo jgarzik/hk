@@ -1,9 +1,8 @@
 //! AF_PACKET socket options (Linux packet_setsockopt/getsockopt,
 //! packet_mc_add/drop) and the SO_ATTACH_FILTER family
 //! (net/core/sock.c, net/core/filter.c sk_attach_filter)
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
-use alloc::sync::Arc;
+use crate::util::kalloc::try_arc;
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 
@@ -218,7 +217,7 @@ fn set_filter(s: &PacketSock, opt: i32, v: OptIn) -> Result<(), KernelError> {
     match opt {
         SO_ATTACH_FILTER => {
             let f = read_fprog(v, locked)?;
-            *s.filter.write() = Some(Arc::new(f));
+            *s.filter.write() = Some(try_arc(f)?);
         }
         SO_DETACH_FILTER => {
             if locked {

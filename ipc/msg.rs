@@ -4,8 +4,8 @@
 //! - Multiple message types for selective receiving
 //! - Blocking send/receive with optional timeout
 //! - Per-queue byte limits
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
+use crate::util::kalloc::try_arc;
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec;
@@ -126,7 +126,7 @@ pub struct MsgQueue {
 impl MsgQueue {
     /// Create a new message queue
     pub fn new(key: i32, mode: u16, ns: Arc<IpcNamespace>) -> Result<Arc<Self>, i32> {
-        Ok(Arc::new(Self {
+        try_arc(Self {
             perm: KernIpcPerm::new(key, mode),
             q: Mutex::new(MsgState {
                 list: VecDeque::new(),
@@ -141,7 +141,8 @@ impl MsgQueue {
             }),
             waitq: WaitQueue::new(),
             ns,
-        }))
+        })
+        .map_err(KernelError::errno)
     }
 
     /// A message matching `search` is queued

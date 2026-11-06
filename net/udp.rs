@@ -18,8 +18,8 @@
 //! `UdpSock.rxq` is a separate leaf. Receive takes the table read lock
 //! and then each candidate's `Inet.addr`; it never holds the table lock
 //! while queueing. No lock is held across a sleep or a transmit.
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
+use crate::util::kalloc::try_arc_cyclic;
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
@@ -66,9 +66,9 @@ pub struct UdpSock {
 }
 
 /// socket(AF_INET, SOCK_DGRAM, 0)
-pub fn create() -> Arc<dyn ProtoOps> {
+pub fn create() -> Result<Arc<dyn ProtoOps>, KernelError> {
     let net = crate::net::current_net_ns();
-    Arc::new_cyclic(|me| UdpSock {
+    Ok(try_arc_cyclic(|me| UdpSock {
         sk: Sock::new(net, AF_INET, SOCK_DGRAM, IPPROTO_UDP),
         inet: Inet::default(),
         op: Mutex::new(()),
@@ -76,7 +76,7 @@ pub fn create() -> Arc<dyn ProtoOps> {
         hashed: AtomicBool::new(false),
         rxq: RxQueue::default(),
         me: me.clone(),
-    })
+    })?)
 }
 
 impl UdpSock {

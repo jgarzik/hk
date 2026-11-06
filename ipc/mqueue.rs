@@ -22,10 +22,10 @@
 //!
 //! - Linux kernel ipc/mqueue.c
 //! - POSIX.1-2017 mq_overview(7)
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 use crate::fs::name::FileName;
 use crate::time::hrtimer::HrClock;
+use crate::util::kalloc::try_arc;
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
@@ -486,7 +486,7 @@ fn get_nofile_limit() -> u64 {
 fn create_mq_file(queue: Arc<MqQueue>, access_mode: i32, oflag: i32) -> Result<Arc<File>, i64> {
     // Create anonymous inode
     let mode = InodeMode::regular(0o644);
-    let inode = Arc::new(Inode::new(
+    let inode = try_arc(Inode::new(
         MQ_NEXT_ID.fetch_add(1, AtomicOrdering::SeqCst),
         mode,
         0,                           // uid
@@ -495,9 +495,11 @@ fn create_mq_file(queue: Arc<MqQueue>, access_mode: i32, oflag: i32) -> Result<A
         InodeTimespec::from_secs(0), // mtime
         Weak::new(),                 // no superblock
         &NULL_INODE_OPS,
-    ));
+    ))
+    .map_err(KernelError::sysret)?;
 
-    let dentry = Arc::new(Dentry::new_anonymous("mqueue".into(), Some(inode)));
+    let dentry = try_arc(Dentry::new_anonymous("mqueue".into(), Some(inode)))
+        .map_err(KernelError::sysret)?;
 
     let mut file_flags = match access_mode {
         O_RDONLY => flags::O_RDONLY,
@@ -510,9 +512,8 @@ fn create_mq_file(queue: Arc<MqQueue>, access_mode: i32, oflag: i32) -> Result<A
         file_flags |= flags::O_NONBLOCK;
     }
 
-    let private = Arc::new(MqFile { queue, access_mode });
-    let file = Arc::new(File::new_anon(dentry, file_flags, &MQ_FOPS, private));
-    Ok(file)
+    let private = try_arc(MqFile { queue, access_mode }).map_err(KernelError::sysret)?;
+    try_arc(File::new_anon(dentry, file_flags, &MQ_FOPS, private)).map_err(KernelError::sysret)
 }
 
 // ============================================================================
@@ -619,12 +620,15 @@ pub fn sys_mq_open(name_ptr: u64, oflag: i32, mode: u32, attr_ptr: u64) -> i64 {
                 None => (DFLT_MSGMAX, DFLT_MSGSIZEMAX),
             };
 
-            let queue = Arc::new(MqQueue::new(
+            let queue = match try_arc(MqQueue::new(
                 queue_name.clone().into(),
                 mode,
                 maxmsg,
                 msgsize,
-            ));
+            )) {
+                Ok(q) => q,
+                Err(e) => return e.sysret(),
+            };
 
             // Set initial flags
             if oflag & O_NONBLOCK != 0 {

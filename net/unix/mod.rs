@@ -46,12 +46,12 @@
 //!   `peercred` (leaf, Linux sk_peer_lock).
 //! - Wakeups (`Sock.wq`, `peer_wait`) happen after unlocking; queued
 //!   messages and their files are always dropped with no lock held.
-#![expect(clippy::disallowed_methods)] // TODO(alloc): util::kalloc
 
 pub mod dgram;
 pub mod scm;
 pub mod stream;
 
+use crate::util::kalloc::{try_arc, try_arc_cyclic};
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
@@ -283,10 +283,10 @@ impl UnixTable {
         if t.names.get(&key).is_some_and(|w| w.strong_count() > 0) {
             return Err(KernelError::AddressInUse);
         }
-        *s.addr.write() = Some(Arc::new(UnixAddr {
+        *s.addr.write() = Some(try_arc(UnixAddr {
             name: key.1.clone(),
             path: None,
-        }));
+        })?);
         t.names.insert(key, Arc::downgrade(s));
         Ok(())
     }
@@ -312,9 +312,9 @@ fn inode_key(d: &Dentry) -> Option<usize> {
 
 impl UnixSock {
     /// A new socket in `net` (Linux unix_create1)
-    fn new(net: Arc<NetNamespace>, stype: i32) -> Arc<Self> {
+    fn new(net: Arc<NetNamespace>, stype: i32) -> Result<Arc<Self>, KernelError> {
         let qlen = net.sysctl.unix_max_dgram_qlen.load(Ordering::Relaxed) as u32;
-        let s = Arc::new_cyclic(|me| Self {
+        let s = try_arc_cyclic(|me| Self {
             sk: Sock::new(net, AF_UNIX, stype, 0),
             me: me.clone(),
             st: Mutex::new(None),
@@ -330,9 +330,9 @@ impl UnixSock {
             dead: AtomicBool::new(false),
             backlog: AtomicU32::new(qlen),
             peercred: Mutex::new(None),
-        });
+        })?;
         s.sk.net.unix.insert(&s);
-        s
+        Ok(s)
     }
 
     fn arc(&self) -> Arc<Self> {
@@ -460,6 +460,17 @@ impl UnixSock {
             KernelError::AlreadyExists => KernelError::AddressInUse,
             e => e,
         })?;
+        let key = inode_key(&d);
+        let addr = match try_arc(UnixAddr {
+            name,
+            path: Some(d),
+        }) {
+            Ok(a) => a,
+            Err(e) => {
+                crate::fs::dir::unlink_sock(&path);
+                return Err(e);
+            }
+        };
         let b = self.bindlock.lock();
         if self.addr().is_some() {
             // Unlinked after bindlock is dropped (Linux out_unlink: the
@@ -468,12 +479,9 @@ impl UnixSock {
             crate::fs::dir::unlink_sock(&path);
             return Err(KernelError::InvalidArgument);
         }
-        let key = inode_key(&d).ok_or(KernelError::NotFound)?;
+        let key = key.ok_or(KernelError::NotFound)?;
         let mut t = BSD.write();
-        *self.addr.write() = Some(Arc::new(UnixAddr {
-            name,
-            path: Some(d),
-        }));
+        *self.addr.write() = Some(addr);
         t.insert(key, self.me.clone());
         Ok(())
     }
@@ -685,7 +693,7 @@ pub fn create(stype: i32, protocol: i32) -> Result<Arc<dyn ProtoOps>, KernelErro
         SOCK_RAW => SOCK_DGRAM,
         _ => return Err(KernelError::SocketTypeNotSupported),
     };
-    Ok(UnixSock::new(crate::net::current_net_ns(), stype))
+    Ok(UnixSock::new(crate::net::current_net_ns(), stype)?)
 }
 
 impl ProtoOps for UnixSock {
