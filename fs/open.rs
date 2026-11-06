@@ -43,6 +43,7 @@ fn create_in(
         dac::may_create(&c, &dir)?;
         let perm = dac::create_mode(&c, &dir, (mode & 0o7777) as u16);
         let inode = dir.i_op.create(&dir, name, InodeMode::regular(perm))?;
+        dir.touch_mc();
         let d = Dentry::alloc(parent, name, Some(inode))?;
         Ok((d, true))
     })()

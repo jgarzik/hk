@@ -158,7 +158,7 @@ fn link_locked(dir: &Arc<Inode>, name: &[u8], inode: &Arc<Inode>) -> Result<(), 
     if inode.get_nlink() == 0 {
         Err(KernelError::NotFound)
     } else {
-        dir.i_op.link(dir, name, inode)
+        dir.i_op.link(dir, name, inode).inspect(|()| inode.touch_c())
     }
 }
 
@@ -487,6 +487,16 @@ fn rename_locked(old: Side<'_>, new: Side<'_>, flags: u32) -> Result<(), KernelE
         && r.is_ok()
     {
         d.set_dead();
+    }
+    // Both parents' mtime and ctime, both inodes' ctime (Linux
+    // simple_rename_timestamp)
+    if r.is_ok() {
+        odir.touch_mc();
+        ndir.touch_mc();
+        sinode.touch_c();
+        if let Some(d) = &dinode {
+            d.touch_c();
+        }
     }
     drop(dead_lock);
     drop(nondirs);

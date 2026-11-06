@@ -712,7 +712,8 @@ impl Inode {
 
     /// mtime and ctime become the current time (Linux
     /// inode_set_mtime_to_ts(inode, inode_set_ctime_current(inode))).
-    /// Callers hold `i_rwsem`.
+    /// Callers normally hold `i_rwsem` (else a reader may see a mix of
+    /// two updates, as on Linux).
     pub fn touch_mc(&self) {
         let now = crate::time::TIMEKEEPER.current_time();
         self.ctime.set(now);
@@ -720,7 +721,8 @@ impl Inode {
     }
 
     /// ctime becomes the current time (Linux inode_set_ctime_current).
-    /// Callers hold `i_rwsem`.
+    /// Callers normally hold `i_rwsem` (else a reader may see a mix of
+    /// two updates, as on Linux).
     pub fn touch_c(&self) {
         self.ctime.set(crate::time::TIMEKEEPER.current_time());
     }

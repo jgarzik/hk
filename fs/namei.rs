@@ -327,6 +327,7 @@ pub fn create_entry(
         let _w = w?;
         super::dac::may_create(&c, &dir)?;
         let inode = make(&dir, &c)?;
+        dir.touch_mc();
         Dentry::alloc(parent, name, Some(inode))
     })()
 }
@@ -365,6 +366,12 @@ pub fn delete_entry(p: &Parent, isdir: bool) -> Result<(), KernelError> {
         } else {
             dir.i_op.unlink(&dir, name)
         };
+        // The parent's mtime and ctime, the victim's ctime
+        // (simple_unlink)
+        if r.is_ok() {
+            dir.touch_mc();
+            inode.touch_c();
+        }
         drop(victim_lock);
         r?;
         // A dentry no one else holds becomes negative in place; a held
