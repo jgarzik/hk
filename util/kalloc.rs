@@ -7,6 +7,8 @@
 //! `Box::new`/`Arc::new` (clippy's `disallowed_methods` enforces it):
 //!
 //! - [`try_box`] allocates fallibly, then hands the block to `Box`.
+//! - `*_nofail` are the explicit infallible forms, for boot-time setup
+//!   and paths Linux cannot fail either.
 //! - [`try_arc`] and [`try_arc_cyclic`] keep std's `Arc` (its `Weak`,
 //!   `new_cyclic` and `dyn` coercion are needed and nightly-only to
 //!   replicate): the `ArcInner` block is allocated fallibly first and
@@ -80,6 +82,29 @@ pub fn try_arc<T>(v: T) -> Result<Arc<T>, KernelError> {
 pub fn try_arc_cyclic<T>(f: impl FnOnce(&Weak<T>) -> T) -> Result<Arc<T>, KernelError> {
     #[expect(clippy::disallowed_methods)]
     reserved(arc_layout::<T>(), || Arc::new_cyclic(f))
+}
+
+/// `Box::new` where a failure cannot be reported: boot-time setup, or a
+/// path Linux cannot fail either (`__GFP_NOFAIL`). Panics on failure; the
+/// `_nofail` calls list the kernel's infallible allocations.
+#[track_caller]
+pub fn box_nofail<T>(v: T) -> Box<T> {
+    #[expect(clippy::disallowed_methods)]
+    Box::new(v)
+}
+
+/// `Arc::new`, infallible: see [`box_nofail`]
+#[track_caller]
+pub fn arc_nofail<T>(v: T) -> Arc<T> {
+    #[expect(clippy::disallowed_methods)]
+    Arc::new(v)
+}
+
+/// `Arc::new_cyclic`, infallible: see [`box_nofail`]
+#[track_caller]
+pub fn arc_cyclic_nofail<T>(f: impl FnOnce(&Weak<T>) -> T) -> Arc<T> {
+    #[expect(clippy::disallowed_methods)]
+    Arc::new_cyclic(f)
 }
 
 /// Run `make`, whose first allocation is of `layout`, with a block of it
