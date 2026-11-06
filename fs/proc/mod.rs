@@ -206,6 +206,9 @@ pub enum ProcfsInodeData {
     PidLink { pid: Pid, target: LinkFn },
     /// /proc/sys file (readable, maybe writable)
     Sysctl { ctl: &'static crate::sysctl::Ctl },
+    /// /proc/<pid>/fail-nth: the task's fault-injection countdown
+    /// (Linux proc_fail_nth_operations, `mm::fault_inject`)
+    FailNth { pid: Pid },
 }
 
 impl ProcfsInodeData {
@@ -510,6 +513,7 @@ impl InodeOps for ProcfsInodeOps {
             | ProcfsInodeData::FixedLink(_)
             | ProcfsInodeData::FdinfoFile { .. }
             | ProcfsInodeData::PidFile { .. }
+            | ProcfsInodeData::FailNth { .. }
             | ProcfsInodeData::Sysctl { .. } => Err(KernelError::NotDirectory),
         }
     }
@@ -655,6 +659,24 @@ fn lookup_pid_entry(dir: &Inode, pid: Pid, name: &str) -> Result<Arc<Inode>, Ker
             ))?;
             inode.set_private(try_arc(ProcfsInodeWrapper(RwLock::new(
                 ProcfsInodeData::PidLink { pid, target },
+            )))?);
+            Ok(inode)
+        }
+        "fail-nth" => {
+            let sb = dir.superblock().ok_or(KernelError::Io)?;
+            let (uid, gid) = dump_owner(pid);
+            let inode = try_arc(Inode::new(
+                pid_ino(pid, FAIL_NTH_INO),
+                InodeMode::regular(0o644),
+                uid,
+                gid,
+                0,
+                current_time(),
+                Arc::downgrade(&sb),
+                &PROCFS_INODE_OPS,
+            ))?;
+            inode.set_private(try_arc(ProcfsInodeWrapper(RwLock::new(
+                ProcfsInodeData::FailNth { pid },
             )))?);
             Ok(inode)
         }
@@ -1026,6 +1048,52 @@ const PID_FILES: &[(&str, u64, u16, PidGen)] = &[
     ("mountinfo", 110, 0o444, PidGen::Pub(mounts::show_mountinfo)),
 ];
 
+/// The process of a /proc/<pid>/fail-nth inode
+fn fail_nth_of(inode: &Inode) -> Option<Pid> {
+    let private = inode.get_private()?;
+    let w = private
+        .as_ref()
+        .as_any()
+        .downcast_ref::<ProcfsInodeWrapper>()?;
+    match &*w.0.read() {
+        ProcfsInodeData::FailNth { pid } => Some(*pid),
+        _ => None,
+    }
+}
+
+/// Set task `pid`'s countdown from a decimal (or 0x/0 prefixed) number
+/// (Linux proc_fail_nth_write: kstrtouint, any task the file names)
+fn write_fail_nth(pid: Pid, from: &mut IovSource<'_>) -> Result<usize, KernelError> {
+    let mut buf = [0u8; 24];
+    let len = from.len();
+    if len > buf.len() {
+        return Err(KernelError::InvalidArgument);
+    }
+    from.copy_from_full(&mut buf[..len])?;
+    let text = core::str::from_utf8(&buf[..len]).map_err(|_| KernelError::InvalidArgument)?;
+    let text = text.strip_suffix('\n').unwrap_or(text);
+    let n = match text.strip_prefix("0x") {
+        Some(h) => u32::from_str_radix(h, 16),
+        None => text.parse::<u32>(),
+    }
+    .map_err(|_| KernelError::InvalidArgument)?;
+    fail_nth_task(pid)?
+        .fail_nth
+        .store(n, core::sync::atomic::Ordering::Relaxed);
+    Ok(len)
+}
+
+/// Inode offset of /proc/<pid>/fail-nth
+const FAIL_NTH_INO: u64 = 113;
+
+/// Task `pid`, for its fault-injection countdown
+fn fail_nth_task(pid: Pid) -> Result<crate::task::percpu::TaskRef, KernelError> {
+    crate::task::percpu::TASKLIST
+        .read()
+        .task(pid)
+        .ok_or(KernelError::NoProcess)
+}
+
 /// Per-process symlinks: name, inode offset, target (Linux
 /// proc_exe_link, proc_cwd_link, proc_root_link)
 /// The target of a per-process symlink
@@ -1232,6 +1300,12 @@ fn proc_content(file: &File) -> Result<Vec<u8>, KernelError> {
         ProcfsInodeData::NamespaceFile { pid, ns_type } => gen_namespace_content(*pid, *ns_type),
         ProcfsInodeData::FdinfoFile { pid, fd } => gen_fdinfo_content(*pid, *fd),
         ProcfsInodeData::Sysctl { ctl } => crate::sysctl::read(ctl),
+        ProcfsInodeData::FailNth { pid } => {
+            let n = fail_nth_task(*pid)?
+                .fail_nth
+                .load(core::sync::atomic::Ordering::Relaxed);
+            alloc::format!("{n}\n").into_bytes()
+        }
         ProcfsInodeData::PidFile { .. }
         | ProcfsInodeData::FdSymlink { .. }
         | ProcfsInodeData::PidLink { .. }
@@ -1334,6 +1408,9 @@ impl FileOps for ProcfsFileOps {
             return Err(KernelError::OperationNotSupported);
         }
         let inode = file.get_inode().ok_or(KernelError::BadFd)?;
+        if let Some(pid) = fail_nth_of(&inode) {
+            return write_fail_nth(pid, from);
+        }
         let ctl = sysctl_of(&inode).ok_or(KernelError::Io)?;
         crate::sysctl::permission(ctl, &crate::task::current_cred(), crate::fs::MAY_WRITE)?;
         let mut buf = crate::util::kmem::try_vec(from.len().min(WRITE_CHUNK), 0u8)?;
@@ -1454,6 +1531,7 @@ impl FileOps for ProcfsFileOps {
             | ProcfsInodeData::FixedLink(_)
             | ProcfsInodeData::FdinfoFile { .. }
             | ProcfsInodeData::PidFile { .. }
+            | ProcfsInodeData::FailNth { .. }
             | ProcfsInodeData::Sysctl { .. } => {
                 return Err(KernelError::NotDirectory);
             }
@@ -1538,6 +1616,14 @@ fn readdir_emit_pid_entries(pid: Pid, ctx: &mut DirContext<'_>) -> Result<(), Ke
     });
 
     if !should_continue {
+        return Ok(());
+    }
+
+    if !ctx.emit(DirEntry {
+        ino: pid_ino(pid, FAIL_NTH_INO),
+        file_type: FileType::Regular,
+        name: Vec::from(&b"fail-nth"[..]),
+    }) {
         return Ok(());
     }
 

@@ -55,6 +55,9 @@ pub fn arc_layout<T>() -> Layout {
 
 /// `Box::new(v)`, or ENOMEM
 pub fn try_box<T>(v: T) -> Result<Box<T>, KernelError> {
+    if crate::mm::fault_inject::should_fail() {
+        return Err(KernelError::OutOfMemory);
+    }
     let layout = Layout::new::<T>();
     if layout.size() == 0 {
         // No allocation to fail
@@ -111,6 +114,9 @@ pub fn arc_cyclic_nofail<T>(f: impl FnOnce(&Weak<T>) -> T) -> Arc<T> {
 /// Run `make`, whose first allocation is of `layout`, with a block of it
 /// reserved: ENOMEM if the block cannot be had
 fn reserved<R>(layout: Layout, make: impl FnOnce() -> R) -> Result<R, KernelError> {
+    if crate::mm::fault_inject::should_fail() {
+        return Err(KernelError::OutOfMemory);
+    }
     // Host tests (std's allocator) and CPUs without per-CPU data yet
     // (early boot) allocate directly
     if cfg!(test) || crate::cpu::try_this_id().is_none() {

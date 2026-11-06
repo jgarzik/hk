@@ -38,6 +38,7 @@ pub mod exec_at;
 pub mod exec_identity;
 pub mod exec_race;
 pub mod fanotify;
+pub mod fault_inject;
 pub mod fault_signals;
 pub mod fcntl_owner;
 pub mod fd_leak;
@@ -229,6 +230,7 @@ pub fn run_all_tests() {
     mmap::run_tests();
     isolated(b"MM_LIFE", mm_life::run_tests);
     isolated(b"MM_OOM", mm_oom::run_tests);
+    isolated(b"FAULT_INJECT", fault_inject::run_tests);
     isolated(b"FORK_MM", fork_mm::run_tests);
     isolated(b"MPROTECT", mprotect::run_tests);
     isolated(b"TLB", tlb::run_tests);

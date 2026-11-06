@@ -26,6 +26,7 @@ pub mod asid;
 #[cfg(feature = "mmcheck")]
 pub mod check;
 pub mod fault;
+pub mod fault_inject;
 pub mod filemap;
 pub mod gather;
 pub mod huge_page;

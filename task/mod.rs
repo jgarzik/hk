@@ -980,6 +980,10 @@ pub struct Task {
     /// Page-fault-disable depth (Linux p->pagefault_disabled), written
     /// by the task itself (`uaccess::pagefault_disable`)
     pub pagefault_disabled: AtomicU32,
+    /// Fault-injection countdown (Linux p->fail_nth): the allocation
+    /// that takes it to 0 fails (`mm::fault_inject`); written by the
+    /// task itself through /proc/thread-self/fail-nth
+    pub fail_nth: AtomicU32,
     /// CPU whose network backlog this task last queued a packet to
     /// (`netif_rx`; u32::MAX: none), written by the task itself: its
     /// loopback flush covers that backlog even if it moved since
@@ -1563,6 +1567,7 @@ impl Task {
             wake_cpu: AtomicU32::new(cpu),
             cpus_mask: crate::util::cpumask::CpuMask::from_set(cpus),
             pagefault_disabled: AtomicU32::new(0),
+            fail_nth: AtomicU32::new(0),
             rx_cpu: AtomicU32::new(u32::MAX),
             se: sched::SchedEntity::new(0),
             started: AtomicBool::new(false),
@@ -1626,6 +1631,7 @@ impl Task {
             wake_cpu: AtomicU32::new(0),
             cpus_mask: crate::util::cpumask::CpuMask::new(),
             pagefault_disabled: AtomicU32::new(0),
+            fail_nth: AtomicU32::new(0),
             rx_cpu: AtomicU32::new(u32::MAX),
             se: sched::SchedEntity::new(0),
             started: AtomicBool::new(true),
