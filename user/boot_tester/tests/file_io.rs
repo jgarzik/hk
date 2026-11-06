@@ -31,7 +31,7 @@
 //! - SYSCTL_PARTIAL_FAULT: a sysctl write whose data faults partway is
 //!   EFAULT and stores nothing
 //! - RWF_NOWAIT_STREAMS: preadv2 RWF_NOWAIT on an empty eventfd, timerfd
-//!   or socket is EAGAIN (Linux FMODE_NOWAIT), not EOPNOTSUPP
+//!   (Linux 6.10+) or socket is EAGAIN (Linux FMODE_NOWAIT), not EOPNOTSUPP
 //! - RW_STRADDLE: read/write with one buffer running off mapped memory
 //!   mid-page move the mapped part and return its length
 
@@ -1877,7 +1877,14 @@ fn test_rwf_nowait_streams() {
     let k = sys_preadv2(sv[0], iov.as_ptr(), 1, -1, RWF_NOWAIT);
     sys_close(sv[0] as u64);
     sys_close(sv[1] as u64);
-    if e == -11 && t == -11 && k == -11 {
+    // timerfd took RWF_NOWAIT in Linux 6.10 (read_iter); before, the
+    // flag is EOPNOTSUPP there (hk follows current Linux)
+    let t_want = if super::helpers::linux_at_least(6, 10) {
+        -11
+    } else {
+        -95
+    };
+    if e == -11 && t == t_want && k == -11 {
         println(b"RWF_NOWAIT_STREAMS:OK");
     } else {
         print(b"RWF_NOWAIT_STREAMS:FAIL eventfd ");
