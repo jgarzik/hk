@@ -304,8 +304,10 @@ VFS locks (detailed order):
         ↓
     Inode.private
         ↓
-Filesystem-internal locks (ramfs children/data, procfs data;
-    kernfs `KNode.{children,name,parent,iattr}` spin leaves, 3.3 kernfs)
+Filesystem-internal locks (ramfs children/data; procfs data, a leaf:
+    held only to copy out what a lookup, readdir, readlink or read
+    acts on, which then runs unlocked; kernfs
+    `KNode.{children,name,parent,iattr}` spin leaves, 3.3 kernfs)
     ↓
 Leaves taken with no task lock held (their Arc is cloned out of the
 Task first, under its alloc_lock or lock-free by the task itself):
@@ -2124,7 +2126,8 @@ Does not acquire `s_vfs_rename_mutex` - only the directory's `i_rwsem`.
 Linux holds the directory's `i_rwsem` shared across `iterate_shared` and
 `filldir64` copies each record straight to user memory. hk file systems
 emit entries while holding spinlocks (ramfs `RamfsInodeData.children`
-read lock, procfs/cgroupfs inode-data read locks), so user memory must
+read lock, cgroupfs inode-data read locks; procfs emits unlocked), so
+user memory must
 not be touched from the emit callback (a fault could sleep under a
 spinlock). `sys_getdents64` holds the directory's `i_rwsem` shared
 across `readdir` (Linux iterate_dir) and gathers records into a

@@ -652,9 +652,9 @@ The heap picks GFP_ATOMIC by itself under a spin lock, so an allocation
 there takes the atomic reserve silently (Linux needs it named, and
 might_alloc reports a GFP_KERNEL one in atomic context). A LOCKDEP boot
 lists each lock allocated under once (`LOCKDEP:ATOMIC_ALLOC ... under
-<lock> (taken at ...)`; the shutdown summary counts them): 125 locks,
-about 45 in fs, 31 in net, 7 each in task and ipc, mostly collections
-grown under spin mutexes. Each wants its allocation moved out of the
+<lock> (taken at ...)`; the shutdown summary counts them): 111 locks,
+mostly collections grown under spin mutexes, in fs, net, task and
+ipc (procfs: only its mount-time tree building). Each wants its allocation moved out of the
 lock (preallocate, or a sleeping lock as in Linux).
 
 ## Scheduler gaps (deviations from Linux)
@@ -865,9 +865,7 @@ Designs that grew one commit at a time. Tag = roadmap phase
   (bpf, keys, mqueue, posix timers, which wrap with no collision
   check): one IDR/IDA.
 - **procfs** (H): every read regenerates the whole file and slices it
-  (no seq_file records, so chunked reads of /proc/net/* can tear);
-  global generators run under the procfs inode's read lock and take
-  TASKLIST and network locks inside it (not in LOCKING.md).
+  (no seq_file records, so chunked reads of /proc/net/* can tear).
   /proc/sys is one static tree: the sysctls Linux registers for the
   initial network namespace only (net/ipv4/tcp_mem,
   net/core/mem_pcpu_rsv) appear in every
