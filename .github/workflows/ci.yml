@@ -11,7 +11,7 @@ jobs:
   lint-build:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install packages
         run: |
@@ -43,7 +43,7 @@ jobs:
   boot-x86:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # /dev/kvm is not writable by the runner user, so QEMU uses TCG
       - name: Install packages
@@ -63,7 +63,7 @@ jobs:
 
       - name: Upload serial log
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: qemu-serial-x86
           path: target/qemu/serial.log
@@ -77,7 +77,7 @@ jobs:
 
       - name: Upload Linux serial log
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: qemu-serial-linux-x86
           path: target/qemu/serial_linux_x86_64.log
@@ -86,7 +86,7 @@ jobs:
   boot-arm:
     runs-on: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Native arm64: the host gcc/binutils provide the aarch64-linux-gnu-*
       # names used by build.rs and user/.cargo/config.toml
@@ -129,7 +129,7 @@ jobs:
 
       - name: Upload serial log
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: qemu-serial-arm
           path: target/qemu/serial_arm.log
@@ -144,7 +144,7 @@ jobs:
 
       - name: Upload Linux serial log
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: qemu-serial-linux-arm
           path: target/qemu/serial_linux_aarch64.log
