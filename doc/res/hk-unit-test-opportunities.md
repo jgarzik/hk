@@ -69,23 +69,6 @@ instance; "medium" = needs a small fixture or cfg(test) shim.
   CAP_NET_ADMIN only for `net/` paths, no DAC override for 0444 files. Pure (takes `&Cred`).
 - Value: high (ABI, scripts write hex), easy.
 
-### 2. DAC permission core: `fs/dac.rs:111` `permission_ids`, `:308` `kill_bits`, `:271` `create_mode`, `:176` `access_cred`, `:189` `acc_mode`, `:236` `sticky`, `:206` `may_open`
-- Coverage: none.
-- `permission_ids` takes `&Cred` + ids + mode bits: pure. Cases: owner class only (a
-  0o077 file is unreadable by its owner), group via fsgid and via supplementary
-  `groups`, other; CAP_DAC_READ_SEARCH reads files and reads/searches dirs but never
-  writes; CAP_DAC_OVERRIDE on dirs for everything, on files except exec with no x bit
-  at all (0o600 + MAY_EXEC denied, 0o601 allowed); MAY_APPEND/MAY_OPEN bits ignored.
-- `acc_mode`: O_RDONLY|O_TRUNC needs write, O_ACCMODE==3 is RW, O_APPEND sets MAY_APPEND.
-- `access_cred`: root keeps permitted caps, non-root real uid gets none.
-- `kill_bits` / `create_mode` / `sticky` / `may_open` need an `Inode`: construct one
-  with `Inode::new`-style ctor (check what ramfs uses) or refactor to take
-  `(InodeMode, Uid, Gid)`. Cases: SUID always cleared, SGID only if group-exec or
-  caller outside group, none with CAP_FSETID; SGID dir strips SGID from new
-  group-exec files of non-members; sticky dir delete by non-owner = EPERM.
-- Note: header comment ("hk has no supplementary groups") is stale; `in_group` uses `groups`.
-- Value: high (security), easy for `permission_ids`/`acc_mode`/`access_cred`, medium for inode ones.
-
 ### 3. Capability fixups on uid change: `task/mod.rs:2210` `cap_fix_setuid`, `:2243` `cap_fix_setfsuid`
 - Coverage: none. Pure on two `Cred`s.
 - Cases (Linux `cap_emulate_setxuid`, `cap_task_fix_setuid(LSM_SETID_FS)`): leaving
@@ -118,14 +101,6 @@ instance; "medium" = needs a small fixture or cfg(test) shim.
   queued bytes one line); `inq` counting with EOF marks; VMIN in raw mode.
 - Value: high (every shell, getty), easy.
 
-### 6. POSIX record locks: `fs/posix_lock.rs:137` `InodeLocks` (`try_lock`, `unlock_range`, `coalesce_locks`, `find_conflict`)
-- Coverage: none.
-- Cases: split by middle unlock; partial overlaps at each end; same-owner type change
-  (write [0,100) then read [25,50) -> W/R/W); merge of adjacent same-type; different
-  owners never merge; read/read no conflict; EOF (`u64::MAX`) ranges.
-- (The range math, `lock_range`, is tested: `lock_ranges`.)
-- Value: high (data integrity for databases), easy for InodeLocks.
-
 ### 7. IPv4 receive validation and checksums: `net/ipv4.rs:373` `ip_options_ok`, `:346` `ip_check`, `:246` `ip_checksum`, `:278` `pseudo_header_checksum`; `net/udp.rs:723-756` `csum_ok`/`add_words`/`fold`/`udp_checksum`; `net/tcp/output.rs:340` `checksum`
 - Coverage: none for these (TCP option parsing is well tested).
 - Cases: RFC 1071 example vector; odd length; all-0xFF data (fold carries); UDP 0 ->
@@ -152,26 +127,6 @@ instance; "medium" = needs a small fixture or cfg(test) shim.
 - Needs `MsgQueue::new(key, mode, Arc<IpcNamespace>)` (namespace ctor) and
   `current_time_secs` (0 on host): medium.
 - Value: medium (ABI), easy-medium.
-
-### 11. VFAT name handling: `fs/vfat.rs:933` `lfn_checksum`, `:1195` `short_name_checksum`, `:1109` `generate_short_name`, `:1206` `create_lfn_entries` / `:970` `lfn_entry_chars` / `:983` `lfn_name`, `:942` `short_name_to_string`, `Charset::to_text`/`to_bytes`, `:552` `VfatOpts::parse`
-- Coverage: none.
-- Cases: checksum known vectors (from a mkfs.vfat image or the FAT spec example);
-  LFN round trip for 1, 12, 13, 14, 26, 255 UTF-16 units and astral chars split across
-  entries (surrogate pair spanning entries); entry order bytes (0x40 on last);
-  short-name generation: `README.TXT` kept, `Long File.txt` -> `LONGFI~1TXT`, collision
-  numbering past ~9 and ~99, extension truncated to 3 (empty bases are tested:
-  `short_names`); KANJI 0x05 -> 0xE5; CP437 round trip of
-  all 128 high bytes; mount options (umask splits to fmask/dmask, unknown option
-  EINVAL, `utf8` overrides iocharset).
-- Value: medium (on-disk names), easy.
-
-### 12. initramfs cpio parser: `fs/cpio.rs:68` `parse`, `:249` `parse_hex`
-- Coverage: none.
-- Cases: newc and crc magics; header + name + body alignment to 4; namesize 0
-  (InvalidHeader); truncated header/name/body (BufferTooSmall, no panic); non-hex
-  field; `next` offset for zero/odd sizes; TRAILER!!! name. (`unpack_cpio` needs a
-  ramfs root: near-miss.)
-- Value: medium (boot input), trivial.
 
 ### 13. EEVDF fair-class math: `task/fair.rs:41` `weight`, `:57` `calc_delta_fair`, `:85` `avg_vruntime`, `pick`, `save_lag`, `:123` `place`, `update_curr`
 - Coverage: none (`task/sched.rs` tests only the RT `PrioQueue`).
