@@ -39,7 +39,7 @@ use core::sync::atomic::{AtomicI32, Ordering};
 use crate::arch::IrqSpinlock;
 use crate::fs::KernelError;
 use crate::fs::file::{File, FileOps, RwFlags, flags, stream_rw};
-use crate::fs::iov_iter::{IovDest, IovSource};
+use crate::fs::iov_iter::IovDest;
 use crate::io::poll::{POLLIN, POLLRDNORM, PollTable};
 use crate::sync::waitqueue::WaitQueue;
 use crate::util::pod::IntoBytes;
@@ -451,18 +451,6 @@ impl FileOps for InotifyFileOps {
         let inotify = file.private_ref::<Inotify>().ok_or(KernelError::BadFd)?;
         let nonblock = file.get_flags() & flags::O_NONBLOCK != 0;
         inotify.read(to, nonblock)
-    }
-
-    /// An inotify fd is not writable
-    fn write_iter(
-        &self,
-        _file: &File,
-        _from: &mut IovSource<'_>,
-        at: Option<u64>,
-        flags: RwFlags,
-    ) -> Result<usize, KernelError> {
-        stream_rw(at, flags)?;
-        Err(KernelError::InvalidArgument)
     }
 
     fn poll(&self, file: &File, pt: Option<&mut PollTable<'_>>) -> u16 {

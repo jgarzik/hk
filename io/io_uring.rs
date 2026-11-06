@@ -45,9 +45,8 @@ use alloc::vec::Vec;
 
 use crate::arch::{IrqSpinlock, Uaccess};
 use crate::fs::KernelError;
-use crate::fs::file::{File, FileOps, RwFlags, flags, stream_rw};
+use crate::fs::file::{File, FileOps, flags};
 use crate::fs::iov::IoVec;
-use crate::fs::iov_iter::{IovDest, IovSource};
 use crate::io::pipe::FD_CLOEXEC;
 use crate::io::poll::PollTable;
 use crate::mm::PAGE_SIZE;
@@ -1245,30 +1244,6 @@ static IO_URING_FOPS: IoUringFileOps = IoUringFileOps;
 impl FileOps for IoUringFileOps {
     fn as_any(&self) -> &dyn core::any::Any {
         self
-    }
-
-    /// An io_uring fd is not readable
-    fn read_iter(
-        &self,
-        _file: &File,
-        _to: &mut IovDest<'_>,
-        at: Option<u64>,
-        flags: RwFlags,
-    ) -> Result<usize, KernelError> {
-        stream_rw(at, flags)?;
-        Err(KernelError::InvalidArgument)
-    }
-
-    /// An io_uring fd is not writable
-    fn write_iter(
-        &self,
-        _file: &File,
-        _from: &mut IovSource<'_>,
-        at: Option<u64>,
-        flags: RwFlags,
-    ) -> Result<usize, KernelError> {
-        stream_rw(at, flags)?;
-        Err(KernelError::InvalidArgument)
     }
 
     fn poll(&self, file: &File, pt: Option<&mut PollTable<'_>>) -> u16 {

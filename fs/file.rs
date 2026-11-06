@@ -205,6 +205,27 @@ pub fn stream_rw(at: Option<u64>, flags: RwFlags) -> Result<(), KernelError> {
     Ok(())
 }
 
+/// The default `read_iter`/`write_iter`: no such operation is EINVAL
+/// (Linux vfs_read without read_iter), and positioned I/O or RWF_NOWAIT
+/// EOPNOTSUPP (the syscalls report ESPIPE resp. EOPNOTSUPP)
+fn no_rw(at: Option<u64>, flags: RwFlags) -> Result<usize, KernelError> {
+    if at.is_some() || flags.nowait {
+        return Err(KernelError::OperationNotSupported);
+    }
+    Err(KernelError::InvalidArgument)
+}
+
+/// For `read_iter`/`write_iter` of a stream that Linux marks
+/// FMODE_NOWAIT (eventfd, signalfd, timerfd, sockets): positioned I/O
+/// is EOPNOTSUPP (ESPIPE at the syscall); RWF_NOWAIT makes this call
+/// nonblocking. True if the call must not block.
+pub fn nowait_rw(file: &File, at: Option<u64>, flags: RwFlags) -> Result<bool, KernelError> {
+    if at.is_some() {
+        return Err(KernelError::OperationNotSupported);
+    }
+    Ok(flags.nowait || file.get_flags() & self::flags::O_NONBLOCK != 0)
+}
+
 /// File operations trait - filesystem-specific behavior for open files
 pub trait FileOps: Send + Sync {
     /// Returns self as Any for downcasting to concrete types
@@ -228,8 +249,8 @@ pub trait FileOps: Send + Sync {
         at: Option<u64>,
         flags: RwFlags,
     ) -> Result<usize, KernelError> {
-        let _ = (file, to, at, flags);
-        Err(KernelError::OperationNotSupported)
+        let _ = (file, to);
+        no_rw(at, flags)
     }
 
     /// Write from `from` at `at`, or at the file position (advancing it)
@@ -243,8 +264,8 @@ pub trait FileOps: Send + Sync {
         at: Option<u64>,
         flags: RwFlags,
     ) -> Result<usize, KernelError> {
-        let _ = (file, from, at, flags);
-        Err(KernelError::OperationNotSupported)
+        let _ = (file, from);
+        no_rw(at, flags)
     }
 
     /// Seek to a position

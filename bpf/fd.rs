@@ -10,8 +10,7 @@ use alloc::sync::Arc;
 use super::map::BpfMap;
 use super::prog::BpfProg;
 use crate::fs::anon_inodes::anon_inode_getfile;
-use crate::fs::file::{File, FileOps, RwFlags, flags, stream_rw};
-use crate::fs::iov_iter::{IovDest, IovSource};
+use crate::fs::file::{File, FileOps, flags};
 use crate::fs::syscall::{current_fd_table, get_nofile_limit};
 use crate::io::poll::PollTable;
 use crate::util::error::KernelError;
@@ -28,30 +27,6 @@ static BPF_MAP_FOPS: BpfMapFileOps = BpfMapFileOps;
 impl FileOps for BpfMapFileOps {
     fn as_any(&self) -> &dyn core::any::Any {
         self
-    }
-
-    /// A BPF map fd is not readable
-    fn read_iter(
-        &self,
-        _file: &File,
-        _to: &mut IovDest<'_>,
-        at: Option<u64>,
-        flags: RwFlags,
-    ) -> Result<usize, KernelError> {
-        stream_rw(at, flags)?;
-        Err(KernelError::InvalidArgument)
-    }
-
-    /// A BPF map fd is not writable
-    fn write_iter(
-        &self,
-        _file: &File,
-        _from: &mut IovSource<'_>,
-        at: Option<u64>,
-        flags: RwFlags,
-    ) -> Result<usize, KernelError> {
-        stream_rw(at, flags)?;
-        Err(KernelError::InvalidArgument)
     }
 
     fn poll(&self, _file: &File, _pt: Option<&mut PollTable<'_>>) -> u16 {
@@ -85,30 +60,6 @@ static BPF_PROG_FOPS: BpfProgFileOps = BpfProgFileOps;
 impl FileOps for BpfProgFileOps {
     fn as_any(&self) -> &dyn core::any::Any {
         self
-    }
-
-    /// A BPF program fd is not readable
-    fn read_iter(
-        &self,
-        _file: &File,
-        _to: &mut IovDest<'_>,
-        at: Option<u64>,
-        flags: RwFlags,
-    ) -> Result<usize, KernelError> {
-        stream_rw(at, flags)?;
-        Err(KernelError::InvalidArgument)
-    }
-
-    /// A BPF program fd is not writable
-    fn write_iter(
-        &self,
-        _file: &File,
-        _from: &mut IovSource<'_>,
-        at: Option<u64>,
-        flags: RwFlags,
-    ) -> Result<usize, KernelError> {
-        stream_rw(at, flags)?;
-        Err(KernelError::InvalidArgument)
     }
 
     fn poll(&self, _file: &File, _pt: Option<&mut PollTable<'_>>) -> u16 {
