@@ -314,8 +314,12 @@ pub trait FileOps: Send + Sync {
         bounce_write(self, file, from, at, flags)
     }
 
-    /// Read from file at current position
-    fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, KernelError>;
+    /// Read from file at current position (legacy slice form behind the
+    /// default `read_iter`; going away)
+    fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {
+        let _ = (file, buf);
+        Err(KernelError::InvalidArgument)
+    }
 
     /// Write to file at current position
     fn write(&self, file: &File, buf: &[u8]) -> Result<usize, KernelError> {
