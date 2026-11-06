@@ -25,7 +25,8 @@
 
 #[cfg(feature = "lockdep")]
 pub use imp::{
-    acquire, irq_enter, irq_exit, irqsafe_acquire, irqsafe_release, might_sleep, release,
+    acquire, atomic_alloc, irq_enter, irq_exit, irqsafe_acquire, irqsafe_release, might_sleep,
+    release,
 };
 
 /// Interrupt handler entry/exit (no-ops without `lockdep`)
@@ -51,6 +52,11 @@ pub fn irqsafe_release(_lock: usize, _enables: bool) {}
 #[cfg(not(feature = "lockdep"))]
 #[inline(always)]
 pub fn might_sleep() {}
+
+/// The heap is about to allocate (no-op without `lockdep`)
+#[cfg(not(feature = "lockdep"))]
+#[inline(always)]
+pub fn atomic_alloc() {}
 
 #[cfg(feature = "lockdep")]
 mod imp {
@@ -130,6 +136,8 @@ mod imp {
     static FULL: AtomicBool = AtomicBool::new(false);
     /// Reports printed (for the summary line)
     static NREPORTS: AtomicU32 = AtomicU32::new(0);
+    /// Distinct locks heap allocations were made under
+    static NATOMIC: AtomicU32 = AtomicU32::new(0);
 
     fn cpu() -> Option<&'static Cpu> {
         Some(&CPUS.this().0)
@@ -398,15 +406,47 @@ mod imp {
         });
     }
 
+    /// The heap is about to allocate: under a spin lock (outside an
+    /// interrupt handler) that takes the atomic reserve silently (the
+    /// heap picks GFP_ATOMIC by itself; Linux needs it named and
+    /// might_alloc reports a GFP_KERNEL one there). Listed once per
+    /// innermost lock as `LOCKDEP:ATOMIC_ALLOC`, an audit list, not a
+    /// failure.
+    pub fn atomic_alloc() {
+        let Some(c) = cpu() else {
+            return;
+        };
+        let depth = c.depth.get().min(DEPTH);
+        if c.busy.get() || c.irq.get() != 0 || depth == 0 {
+            return;
+        }
+        let Some(h) = c.held[depth - 1].get() else {
+            return;
+        };
+        if !GRAPH.lock().first(key(h.class) ^ 0x4) {
+            return;
+        }
+        c.busy.set(true);
+        NATOMIC.fetch_add(1, Ordering::Relaxed);
+        crate::printkln!(
+            "LOCKDEP:ATOMIC_ALLOC heap allocation under {} (taken at {}), tid {}",
+            h.class,
+            h.at,
+            crate::task::percpu::current_tid()
+        );
+        c.busy.set(false);
+    }
+
     /// Summary (shutdown): reports and edge-table use
     pub fn summary() {
         // Read under the graph lock, print after (printing may take
         // tracked locks, which take the graph lock)
         let used = GRAPH.lock().used;
         crate::printkln!(
-            "lockdep: {} reports, {} order edges{}",
+            "lockdep: {} reports, {} order edges, {} locks allocated under{}",
             NREPORTS.load(Ordering::Relaxed),
             used,
+            NATOMIC.load(Ordering::Relaxed),
             if FULL.load(Ordering::Relaxed) {
                 " (table full)"
             } else {

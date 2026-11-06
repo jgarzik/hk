@@ -282,6 +282,7 @@ unsafe impl GlobalAlloc for KernelAlloc {
         if let Some(p) = crate::util::kalloc::take_reserved(layout) {
             return p;
         }
+        crate::sync::lockdep::atomic_alloc();
         if self.slab.load(core::sync::atomic::Ordering::Acquire) {
             kvmalloc(layout)
         } else {
