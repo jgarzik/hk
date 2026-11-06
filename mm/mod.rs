@@ -1076,6 +1076,17 @@ pub fn exit_task_mm(tid: Tid) -> Option<Arc<Mm>> {
 /// is left out and a VM_WIPEONFORK one starts empty. Memory locks are not
 /// inherited (VM_LOCKED cleared, locked_vm and MCL_FUTURE reset). On
 /// error the partial copy is torn down with the child mm.
+/// Fork copies the parent's entries of `v` (Linux vma_needs_copy): not
+/// for a wipe-on-fork range, nor for a shared mapping, whose pages the
+/// child faults in from the file or shared object instead. Copying
+/// those would race a truncate: one that already passed the child's
+/// i_mmap entry would miss what fork copies after it. A private mapping
+/// is copied: its copy-on-write pages exist only in its entries. (hk has
+/// no VM_PFNMAP mappings, which Linux also copies.)
+fn vma_needs_copy(v: &Vma) -> bool {
+    v.flags & VM_WIPEONFORK == 0 && !v.is_shared()
+}
+
 pub fn dup_mm(parent: &MmRef, pgd: u64) -> Result<MmRef, i32> {
     let Ok(guard) = parent.mmap_write_killable() else {
         // The child mm was never built: its table is ours to free
@@ -1112,7 +1123,7 @@ pub fn dup_mm(parent: &MmRef, pgd: u64) -> Result<MmRef, i32> {
             // In the chain before its pages are copied (Linux
             // anon_vma_fork before copy_page_range)
             map.link(&v);
-            if v.flags & VM_WIPEONFORK == 0 {
+            if vma_needs_copy(&v) {
                 res = memory::copy_page_range(pgd, parent, &v).map(|wp| {
                     if wp {
                         tlb::flush_tlb_mm_range(parent, v.start, v.end, tlb::PAGE_SHIFT, false);

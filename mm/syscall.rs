@@ -1487,9 +1487,9 @@ fn move_vma_out(mm: &mut super::MmStruct, old_addr: u64, dontunmap: bool, gone: 
 /// in one VMA and the new one unmapped. What the move needs is
 /// allocated first (`mremap::move_prep`): ENOMEM leaves the old mapping
 /// as it was. Then, under the same mm lock hold, the old range is split
-/// into a VMA of its own, retired (kept empty with MREMAP_DONTUNMAP),
-/// its copy inserted at the new address, and the entries moved into it
-/// (each page once, with its reference).
+/// into a VMA of its own, its copy inserted at the new address, the
+/// entries moved into it (each page once, with its reference), and the
+/// old VMA retired (kept empty with MREMAP_DONTUNMAP).
 fn move_mapping(
     mm: &mut super::MmStruct,
     owner: &super::Mm,
@@ -1509,7 +1509,6 @@ fn move_mapping(
         .and_then(|i| mm.get_vma(i))
         .ok_or(KernelError::BadAddress)?
         .clone();
-    move_vma_out(mm, old_addr, dontunmap, gone);
     new_vma.start = new_addr;
     new_vma.end = new_addr + new_len;
     // The lock moves with the mapping (Linux: locked_vm charged to the
@@ -1518,14 +1517,20 @@ fn move_mapping(
         mm.add_locked_vm(new_len / PAGE_SIZE);
     }
     let inode = new_vma.inode();
-    let idx = mm.insert_vma(new_vma);
+    // The copy is linked first and the old VMA retired only after the
+    // entries moved, with a file's i_mmap held across the move (Linux
+    // move_vma: copy_vma, move_page_tables under take_rmap_locks, then
+    // the old range unmapped): a truncate walking i_mmap always finds
+    // the entries, at the old address or the new
+    mm.insert_vma(new_vma);
     mm.add_total_vm(new_len / PAGE_SIZE);
-    mm.merge_adjacent(idx);
-    // A file's i_mmap held across the move (Linux take_rmap_locks): a
-    // truncate walking it sees the entries at the old address or the new
     {
         let _rmap = inode.as_ref().map(|i| i.i_data.i_mmap.lock_write());
         super::mremap::move_ptes(owner, old_addr, new_addr, old_len);
+    }
+    move_vma_out(mm, old_addr, dontunmap, gone);
+    if let Some(idx) = mm.find_vma_exact(new_addr) {
+        mm.merge_adjacent(idx);
     }
     if !dontunmap {
         // The old range's tables, now empty (Linux move_vma unmaps it)
