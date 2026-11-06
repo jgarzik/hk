@@ -16,6 +16,7 @@ use hk_syscall::{
     sys_semtimedop, sys_sendfile, sys_shmat, sys_shmctl, sys_shmdt, sys_shmget, sys_splice,
     sys_tee, sys_vmsplice, sys_write,
 };
+use hk_syscall::{O_CREAT, O_RDWR, O_TRUNC, sys_pread64, sys_unlink};
 
 /// Run all IPC tests
 pub fn run_tests() {
@@ -38,6 +39,7 @@ pub fn run_tests() {
     println(b"--- Splice / Tee / Vmsplice / Sendfile ---");
     test_splice_pipe_to_pipe();
     test_splice_invalid_no_pipe();
+    test_splice_provenance();
     test_tee_pipe_to_pipe();
     test_tee_invalid_same_pipe();
     test_vmsplice_to_pipe();
@@ -836,6 +838,44 @@ fn test_splice_pipe_to_pipe() {
 }
 
 /// Test that splice returns EINVAL when neither fd is a pipe
+/// Dirty Pipe (CVE-2022-0847): data spliced from a file into a pipe,
+/// then written after into the same pipe, must not land in the file's
+/// page cache (a page from a file is never merged into)
+fn test_splice_provenance() {
+    let path = b"/tmp/splice_prov\0";
+    let f = sys_open(path.as_ptr(), O_CREAT | O_RDWR | O_TRUNC, 0o644) as i32;
+    sys_write(f as u64, [b'A'; 64].as_ptr(), 64);
+    let mut p = [0i32; 2];
+    sys_pipe(p.as_mut_ptr());
+    let mut off: i64 = 0;
+    let s = sys_splice(f, &mut off, p[1], core::ptr::null_mut(), 8, 0);
+    let w = sys_write(p[1] as u64, b"XXXXXXXX".as_ptr(), 8);
+    let mut b = [0u8; 64];
+    let r = sys_pread64(f, b.as_mut_ptr(), 64, 0);
+    let mut q = [0u8; 16];
+    let n = sys_read(p[0] as u64, q.as_mut_ptr(), 16);
+    for fd in [f, p[0], p[1]] {
+        sys_close(fd as u64);
+    }
+    sys_unlink(path.as_ptr());
+    let ok = s == 8
+        && w == 8
+        && r == 64
+        && b.iter().all(|&c| c == b'A')
+        && n == 16
+        && &q == b"AAAAAAAAXXXXXXXX";
+    print(b"SPLICE_PROVENANCE");
+    if ok {
+        println(b":OK");
+    } else {
+        print(b":FAIL file ");
+        print_num(r);
+        print(b" pipe ");
+        print_num(n);
+        println(b"");
+    }
+}
+
 fn test_splice_invalid_no_pipe() {
     // splice with invalid fd should fail
     let ret = sys_splice(

@@ -528,6 +528,9 @@ fn do_splice_file_to_pipe(
     };
 
     // Copy data to page
+    // SAFETY: `page` is a fresh, kernel-mapped frame of PAGE_SIZE bytes
+    // owned by this call; `bytes_read <= to_read <= PAGE_SIZE` bytes of
+    // `buf` are copied in
     unsafe {
         core::ptr::copy_nonoverlapping(
             buf.as_ptr(),
@@ -598,6 +601,9 @@ fn do_splice_pipe_to_file(
 
         // Copy data from page to temporary buffer
         let mut buf = [0u8; PAGE_SIZE];
+        // SAFETY: the pipe buffer holds `page` (kernel-mapped, PAGE_SIZE)
+        // with valid data at `offset..offset + buf_len` inside it, and
+        // `to_write <= buf_len` bytes of it are copied out
         unsafe {
             let src = crate::arch::phys_to_virt(page.frame)
                 .cast_const()
