@@ -381,22 +381,25 @@ impl PipeInner {
                 continue;
             };
             let (off, len) = (buf.offset as usize, buf.len as usize);
+            let want = len.min(to.len());
             // SAFETY: read under Pipe.inner
-            let r = to.copy_to(unsafe { &page.bytes()[off..off + len] });
-            let c = match r {
-                Ok(c) => c,
-                Err(_) if read > 0 => break,
-                Err(e) => return Err(e),
-            };
+            let c = to
+                .copy_to(unsafe { &page.bytes()[off..off + want] })
+                .unwrap_or(0);
+            // A short copy (a fault) consumes nothing of this buffer;
+            // EFAULT if nothing was read (Linux pipe_read)
+            if c < want {
+                if read == 0 {
+                    return Err(KernelError::BadAddress);
+                }
+                break;
+            }
             buf.offset += c as u32;
             buf.len -= c as u32;
             read += c;
             if buf.len == 0 {
                 buf.release();
                 self.tail = (tail + 1) % PIPE_RING;
-            }
-            if c < len && !to.is_empty() {
-                break;
             }
         }
         self.total_len = self.total_len.saturating_sub(read);

@@ -28,6 +28,8 @@
 //! - WRITE_OWN_MAP: a write sourced from a mapping of the page it writes
 //! - IOV_PARTIAL_FAULT: writev/readv stop at a bad segment with the
 //!   bytes done
+//! - RW_STRADDLE: read/write with one buffer running off mapped memory
+//!   mid-page move the mapped part and return its length
 
 use super::helpers::{host_mode, print, print_num, println};
 use hk_syscall::{
@@ -71,6 +73,7 @@ pub fn run_tests() {
     test_trunc_tail();
     test_write_own_map();
     test_iov_partial_fault();
+    test_rw_straddle();
     test_getrandom();
     test_getrandom_einval();
     test_getrandom_stream();
@@ -1754,6 +1757,58 @@ fn test_iov_partial_fault() {
         print_num(r);
         print(b" pos=");
         print_num(pos);
+        println(b"");
+    }
+}
+
+/// read and write whose single buffer starts 2048 bytes before an
+/// unmapped page: the mapped 2048 bytes move and that count returns
+/// (Linux copy_to_iter / copy_page_from_iter_atomic report partial
+/// copies). A pipe read is EFAULT instead and consumes nothing (Linux
+/// pipe_read): the data is still there for a good buffer
+fn test_rw_straddle() {
+    let path = b"/tmp/rw_straddle\0";
+    let fd = sys_open(path.as_ptr(), O_CREAT | O_RDWR | O_TRUNC, 0o644) as i32;
+    let fill = [b'x'; 8192];
+    sys_write(fd as u64, fill.as_ptr(), fill.len() as u64);
+    let base = sys_mmap(0, 8192, 3, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    let (mut r, mut w, mut pr) = (-1, -1, -1);
+    if base > 0 {
+        sys_munmap(base as u64 + 4096, 4096);
+        let p = (base as u64 + 2048) as *mut u8;
+        sys_lseek(fd, 0, 0);
+        r = sys_read(fd as u64, p, 4096);
+        // SAFETY: p..p+2048 is mapped
+        let got = unsafe { core::slice::from_raw_parts(p, 2048) };
+        if !got.iter().all(|&b| b == b'x') {
+            r = -100;
+        }
+        sys_lseek(fd, 0, 0);
+        w = sys_write(fd as u64, p, 4096);
+        let mut pfd = [0i32; 2];
+        if sys_pipe2(pfd.as_mut_ptr(), 0) == 0 {
+            sys_write(pfd[1] as u64, fill.as_ptr(), 4096);
+            pr = sys_read(pfd[0] as u64, p, 4096);
+            let mut good = [0u8; 4096];
+            if sys_read(pfd[0] as u64, good.as_mut_ptr(), 4096) != 4096 {
+                pr = -200;
+            }
+            sys_close(pfd[0] as u64);
+            sys_close(pfd[1] as u64);
+        }
+        sys_munmap(base as u64, 4096);
+    }
+    sys_close(fd as u64);
+    sys_unlink(path.as_ptr());
+    if r == 2048 && w == 2048 && pr == -14 {
+        println(b"RW_STRADDLE:OK");
+    } else {
+        print(b"RW_STRADDLE:FAIL read=");
+        print_num(r);
+        print(b" write=");
+        print_num(w);
+        print(b" pipe read=");
+        print_num(pr);
         println(b"");
     }
 }

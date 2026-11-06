@@ -813,6 +813,12 @@ pub fn write_iter(inode: &Inode, from: &mut IovSource<'_>, pos: u64) -> Result<u
             Err(0) => {}
             Err(c) => limit = c,
         }
+        // After each page, so a short write still lands (an exiting
+        // task's acct record), but a copy the source keeps refusing
+        // cannot hold i_rwsem forever (Linux generic_perform_write)
+        if crate::signal::fatal_signal_pending() {
+            return short(done, KernelError::Interrupted);
+        }
     }
     Ok(done)
 }

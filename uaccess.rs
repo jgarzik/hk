@@ -225,6 +225,64 @@ pub fn copy_from_user<A: UaccessArch>(
     Ok(0)
 }
 
+/// `copy_to_user` that reports progress (Linux raw_copy_to_user, which
+/// returns the bytes not copied): the bytes copied before a fault
+/// stopped it, all of `from` on success, 0 for an address outside user
+/// space
+#[track_caller]
+pub fn copy_to_user_some<A: UaccessArch>(to: u64, from: &[u8]) -> usize {
+    might_fault();
+    if !A::access_ok(to, from.len()) {
+        return 0;
+    }
+    // SAFETY: `to` passed access_ok for the length (a fault is caught by
+    // the fixup and counted); `from` is a kernel slice; begin/end paired
+    let left = unsafe {
+        A::user_access_begin();
+        let left = A::copy_user_raw(to as *mut u8, from.as_ptr(), from.len());
+        A::user_access_end();
+        left
+    };
+    from.len() - left
+}
+
+/// `copy_from_user` that reports progress: the bytes copied into the
+/// front of `to` before a fault stopped it (see [`copy_to_user_some`])
+#[track_caller]
+pub fn copy_from_user_some<A: UaccessArch>(to: &mut [u8], from: u64) -> usize {
+    might_fault();
+    if !A::access_ok(from, to.len()) {
+        return 0;
+    }
+    // SAFETY: as in copy_to_user_some, the other way
+    let left = unsafe {
+        A::user_access_begin();
+        let left = A::copy_user_raw(to.as_mut_ptr(), from as *const u8, to.len());
+        A::user_access_end();
+        left
+    };
+    to.len() - left
+}
+
+/// [`copy_from_user_some`] for a copy under a lock a fault must not nest
+/// under: faults disabled for the copy, missing pages faulted in
+/// between tries (as `copy_from_user_atomic`); the bytes copied
+#[track_caller]
+pub fn copy_from_user_atomic_some<A: UaccessArch>(to: &mut [u8], from: u64) -> usize {
+    let mut done = 0;
+    while done < to.len() {
+        pagefault_disable();
+        let c = copy_from_user_some::<A>(&mut to[done..], from + done as u64);
+        pagefault_enable();
+        done += c;
+        let rest = to.len() - done;
+        if done < to.len() && c == 0 && fault_in_readable::<A>(from + done as u64, rest) == rest {
+            break;
+        }
+    }
+    done
+}
+
 /// Linux fault_in_readable: fault in every page of [addr, addr + len)
 /// for reading (one byte read per page, faults resolved as usual).
 /// Returns the bytes from the first page that could not be faulted in

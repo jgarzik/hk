@@ -15,8 +15,8 @@
 
 use crate::arch::Uaccess;
 use crate::uaccess::{
-    copy_from_user, copy_from_user_atomic, copy_to_user, fault_in_readable, pagefault_disable,
-    pagefault_enable,
+    copy_from_user_atomic_some, copy_from_user_some, copy_to_user_some, fault_in_readable,
+    pagefault_disable, pagefault_enable,
 };
 use crate::util::error::KernelError;
 
@@ -157,12 +157,8 @@ impl<'a> IovDest<'a> {
     /// copied, EFAULT if a fault stopped it before the first byte
     pub fn copy_to(&mut self, data: &[u8]) -> Result<usize, KernelError> {
         let n = match &mut self.0 {
-            Dest::User(s) => s.step(data.len(), &mut |a, n, at| match copy_to_user::<Uaccess>(
-                a,
-                &data[at..at + n],
-            ) {
-                Ok(_) => n,
-                Err(_) => 0,
+            Dest::User(s) => s.step(data.len(), &mut |a, n, at| {
+                copy_to_user_some::<Uaccess>(a, &data[at..at + n])
             }),
             Dest::Kernel(b) => {
                 let n = data.len().min(b.len());
@@ -274,9 +270,9 @@ impl<'a> IovSource<'a> {
         match &mut self.0 {
             Source::User(s) => s.step(buf.len(), &mut |a, n, at| {
                 pagefault_disable();
-                let r = copy_from_user::<Uaccess>(&mut buf[at..at + n], a, n);
+                let c = copy_from_user_some::<Uaccess>(&mut buf[at..at + n], a);
                 pagefault_enable();
-                if r.is_ok() { n } else { 0 }
+                c
             }),
             Source::Kernel(..) => self.copy_from(buf).unwrap_or(0),
         }
@@ -288,13 +284,9 @@ impl<'a> IovSource<'a> {
     pub fn copy_from(&mut self, buf: &mut [u8]) -> Result<usize, KernelError> {
         let want = buf.len();
         let n = match &mut self.0 {
-            Source::User(s) => s.step(
-                want,
-                &mut |a, n, at| match copy_from_user_atomic::<Uaccess>(&mut buf[at..at + n], a, n) {
-                    Ok(_) => n,
-                    Err(_) => 0,
-                },
-            ),
+            Source::User(s) => s.step(want, &mut |a, n, at| {
+                copy_from_user_atomic_some::<Uaccess>(&mut buf[at..at + n], a)
+            }),
             Source::Kernel(b, at) => {
                 let n = want.min(b.len() - *at);
                 buf[..n].copy_from_slice(&b[*at..*at + n]);
