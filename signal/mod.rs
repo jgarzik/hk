@@ -728,8 +728,15 @@ use crate::task::percpu::TASKLIST;
 /// Called when creating the init process at boot (failure cannot be
 /// reported). Also initializes the SignalStruct (which contains rlimits).
 pub fn init_task_signal(tid: Tid, sighand: Arc<SigHand>) {
-    // Built before TASKLIST is taken
-    let s = arc_nofail(SignalStruct::new());
+    // Built before TASKLIST is taken; Linux fork_init gives init_task
+    // RLIMIT_NPROC and RLIMIT_SIGPENDING of half max_threads, which
+    // every task inherits
+    let s = SignalStruct::new();
+    let half = crate::task::rlimit::max_threads() / 2;
+    for r in [RLIMIT_NPROC, RLIMIT_SIGPENDING] {
+        s.rlim.lock()[r as usize] = RLimit::new(half, half);
+    }
+    let s = arc_nofail(s);
     let mut table = TASKLIST.write();
     if let Some(mut task) = table.get_mut(tid) {
         task.sighand = Some(sighand);
@@ -1413,7 +1420,7 @@ const SIGPOLL: u32 = SIGIO;
 // SignalStruct - Per-Process Structure (mirrors Linux signal_struct)
 // =============================================================================
 
-use crate::task::rlimit::{RLIM_NLIMITS, RLimit, default_rlimits};
+use crate::task::rlimit::{RLIM_NLIMITS, RLIMIT_NPROC, RLIMIT_SIGPENDING, RLimit, default_rlimits};
 
 /// Per-process signal structure (mirrors Linux signal_struct)
 ///

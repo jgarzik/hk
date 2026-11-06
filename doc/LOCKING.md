@@ -329,7 +329,7 @@ Global subsystem locks (TASKLIST, fd table `Files`)  ← NOT IRQ-safe;
     (IrqSpinlock); SignalStruct.rlim (IrqSpinlock leaf, also under
     `Files`; setrlimit/prlimit64 read the old limit, decide (with the
     lock-free capable()) and store in one hold, as Linux do_prlimit
-    under task_lock); NPROC;
+    under task_lock); UCOUNTS;
     wait queue heads
     ↓
 Address space: mmap_lock (sleeping RwSem; under i_rwsem: a write's user
@@ -3797,7 +3797,7 @@ this is the interrupt-safety invariant:
 | `TaskSignalState.shared_pending` | signal/mod.rs | `Mutex` | Thread-group pending signals (under TASKLIST) |
 | `Task.alloc_lock` | task/mod.rs | `Mutex` | A task's mm, files, fs, nsproxy, comm, mempolicy, io_context (Linux task_lock; under TASKLIST, over `Task.sig`) |
 | `FsStruct.inner` | fs/fsstruct.rs | `Mutex` | Root, cwd, umask (leaf) |
-| `NPROC` | task/mod.rs | `Mutex` | RLIMIT_NPROC tasks per real uid (leaf: may be taken under TASKLIST, takes no lock) |
+| `UCOUNTS` | task/mod.rs | `Mutex` | Per-real-uid counts: RLIMIT_NPROC tasks, RLIMIT_SIGPENDING queued signals (leaf: may be taken under TASKLIST, takes no lock) |
 | `MEMBLOCK` | mm/memblock.rs | `Mutex` | Boot memory map (boot CPU, before SMP) |
 | `ACCT_FILE` | task/acct.rs | `Mutex` | Process accounting file (leaf: cloned out, the record written and an old file released with no lock held) |
 | All VFS locks | fs/*.rs | `RwLock` | Inodes, dentries, mounts |

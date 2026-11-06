@@ -124,17 +124,28 @@ pub fn default_rlimits() -> [RLimit; RLIM_NLIMITS] {
         RLimit::new(8 * 1024 * 1024, RLIM_INFINITY),   // RLIMIT_STACK (8MB soft)
         RLimit::new(0, RLIM_INFINITY),                 // RLIMIT_CORE (0 = no core)
         RLimit::INFINITY,                              // RLIMIT_RSS
-        RLimit::INFINITY,                              // RLIMIT_NPROC
+        RLimit::INFINITY,                              // RLIMIT_NPROC (init_task_signal)
         RLimit::new(1024, 4096),                       // RLIMIT_NOFILE (INR_OPEN_CUR, INR_OPEN_MAX)
         RLimit::new(8 * 1024 * 1024, 8 * 1024 * 1024), // RLIMIT_MEMLOCK (8MB)
         RLimit::INFINITY,                              // RLIMIT_AS
         RLimit::INFINITY,                              // RLIMIT_LOCKS
-        RLimit::new(0, 0),                             // RLIMIT_SIGPENDING
+        RLimit::new(0, 0),                             // RLIMIT_SIGPENDING (init_task_signal)
         RLimit::new(819200, 819200),                   // RLIMIT_MSGQUEUE
         RLimit::new(0, 0),                             // RLIMIT_NICE
         RLimit::new(0, 0),                             // RLIMIT_RTPRIO
         RLimit::INFINITY,                              // RLIMIT_RTTIME
     ]
+}
+
+/// Linux set_max_threads (fork_init): as many threads as kernel stacks
+/// fit in an eighth of free memory, clamped to [MIN_THREADS,
+/// MAX_THREADS (FUTEX_TID_MASK)]
+pub fn max_threads() -> u64 {
+    const MIN_THREADS: u64 = 20;
+    const MAX_THREADS: u64 = 0x3fff_ffff;
+    let free = crate::FRAME_ALLOCATOR.stats().free_bytes;
+    let stack = crate::mm::vmstack::THREAD_SIZE as u64;
+    (free / (stack * 8)).clamp(MIN_THREADS, MAX_THREADS)
 }
 
 // =============================================================================

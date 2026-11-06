@@ -135,6 +135,7 @@ pub mod settime;
 pub mod sigmask;
 pub mod signalfd;
 pub mod signals;
+pub mod sigqueue;
 pub mod sk;
 pub mod sockcore;
 pub mod sockets;
@@ -230,6 +231,7 @@ pub fn run_all_tests() {
     etxtbsy::run_tests();
     cpio_nodes::run_tests();
     signals::run_tests();
+    sigqueue::run_tests();
     sigmask::run_tests();
     fpu::run_tests();
     preempt::run_tests();
