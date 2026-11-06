@@ -1711,6 +1711,13 @@ The VFS uses fine-grained locking with `RwLock` for concurrent read access.
 
 **Location:** `task/fdtable.rs`, `task/mod.rs` (`FdTable`)
 
+The last `Arc<Files>` closes every descriptor, whoever drops it (a
+/proc reader too; Linux put_files_struct): its drop flushes and may
+sleep, so a `Files` reference is never dropped under a spin lock
+(the task's is swapped out under alloc_lock and dropped after it).
+`Files.users` counts the tasks using the table (Linux
+files_struct.count) and decides sharing for exec and unshare.
+
 `Files` (one per task, shared by CLONE_FILES) wraps the table's
 `spin::Mutex` (Linux `files->file_lock`), thread context only, a leaf
 apart from the heap. Releasing a file can sleep (a TCP socket with

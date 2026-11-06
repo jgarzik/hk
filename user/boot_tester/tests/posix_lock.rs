@@ -9,6 +9,9 @@
 //! - POSIX_LOCK_CLONE_FILES: a CLONE_FILES child (another process) owns
 //!   its parent's locks too (Linux fl_owner is the files table): it may
 //!   take the same lock, and F_GETLK elsewhere reports the parent's pid
+//! - POSIX_LOCK_UNSHARE: close_range(CLOSE_RANGE_UNSHARE) on a table no
+//!   one shares keeps it (Linux unshare_fd: count > 1), so its locks
+//!   stay the caller's: it unlocks them, and they go at its exit
 
 use super::helpers::{print, print_num, println};
 use hk_syscall::{O_CREAT, O_RDWR, O_TRUNC, sys_close, sys_fcntl, sys_mkdir, sys_open, sys_write};
@@ -58,6 +61,7 @@ pub fn run_tests() {
     test_contended_waiters();
     test_flock_upgrade();
     test_lock_clone_files();
+    test_lock_unshare();
 }
 
 /// Test F_SETLK with F_WRLCK (write lock) and F_UNLCK
@@ -648,6 +652,60 @@ fn test_lock_clone_files() {
         print_num(i64::from(st));
         print(b" getlk ");
         print_num(i64::from(st2));
+        println(b"");
+    }
+}
+
+/// A child locks, unshares its private table with close_range, then
+/// unlocks: the parent gets the lock; a second child locks and exits
+/// without unlocking: the parent gets it too
+fn test_lock_unshare() {
+    use hk_syscall::{sys_close_range, sys_exit, sys_fork, sys_wait4};
+    const CLOSE_RANGE_UNSHARE: u32 = 2;
+    let path = b"/tmp/posix_unshare\0";
+    let fd = sys_open(path.as_ptr(), O_CREAT | O_RDWR | O_TRUNC, 0o644);
+    let child = |unlock: bool| {
+        let pid = sys_fork();
+        if pid == 0 {
+            let l = wrlock(fd);
+            let u = sys_close_range(10, !0, CLOSE_RANGE_UNSHARE);
+            if unlock {
+                let mut fl = Flock {
+                    l_type: F_UNLCK,
+                    l_whence: SEEK_SET,
+                    l_start: 0,
+                    l_len: 0,
+                    l_pid: 0,
+                };
+                sys_fcntl(fd as i32, F_SETLK, &mut fl as *mut Flock as u64);
+            }
+            sys_exit(if l == 0 && u == 0 { 0 } else { 1 });
+        }
+        let mut st = 0i32;
+        sys_wait4(pid, &mut st, 0, 0);
+        st
+    };
+    let a = child(true);
+    let after_unlock = wrlock(fd);
+    let mut fl = Flock {
+        l_type: F_UNLCK,
+        l_whence: SEEK_SET,
+        l_start: 0,
+        l_len: 0,
+        l_pid: 0,
+    };
+    sys_fcntl(fd as i32, F_SETLK, &mut fl as *mut Flock as u64);
+    let b = child(false);
+    let after_exit = wrlock(fd);
+    sys_close(fd as u64);
+    hk_syscall::sys_unlink(path.as_ptr());
+    if a == 0 && b == 0 && after_unlock == 0 && after_exit == 0 {
+        println(b"POSIX_LOCK_UNSHARE:OK");
+    } else {
+        print(b"POSIX_LOCK_UNSHARE:FAIL child ");
+        print_num(i64::from(a) * 1000 + i64::from(b));
+        print(b" parent ");
+        print_num(after_unlock * 100 + after_exit);
         println(b"");
     }
 }
