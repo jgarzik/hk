@@ -483,7 +483,8 @@ fn kmain() -> ! {
     let root_dentry = crate::ns::init_mnt_ns()
         .root_path()
         .expect("VFS root not initialized")
-        .dentry;
+        .dentry
+        .clone();
     match fs::unpack_cpio(initramfs_data, &root_dentry) {
         Ok(n) => printkln!("initramfs: {} files", n),
         Err(e) => {

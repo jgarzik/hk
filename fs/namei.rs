@@ -92,7 +92,7 @@ pub fn lookup_path_at(
     path: &[u8],
     flags: LookupFlags,
 ) -> Result<Arc<Dentry>, KernelError> {
-    path_lookupat(start, path, flags).map(|p| p.dentry)
+    path_lookupat(start, path, flags).map(|p| p.dentry.clone())
 }
 
 /// As [`lookup_path_at`], the mount too (Linux path_lookupat)
@@ -267,7 +267,7 @@ fn follow_dotdot(p: Path, root: &Path) -> Path {
         }
     }
     match p.dentry.get_parent() {
-        Some(parent) => follow_mount(Path::new(p.mnt, parent)),
+        Some(parent) => follow_mount(Path::new(p.mnt.clone(), parent)),
         None => p,
     }
 }
@@ -507,10 +507,10 @@ pub fn filename_parentat(dirfd: i32, path: &[u8]) -> Result<Parent, KernelError>
     let trimmed = &path[..end];
     if trimmed.is_empty() {
         // Only slashes: the root, no last component
-        let root = nd_root()?;
+        let (mnt, dir) = nd_root()?.into_parts();
         return Ok(Parent {
-            dir: root.dentry,
-            mnt: root.mnt,
+            dir,
+            mnt,
             name: Vec::new(),
             last: Last::Root,
             slash: false,
@@ -520,10 +520,11 @@ pub fn filename_parentat(dirfd: i32, path: &[u8]) -> Result<Parent, KernelError>
         Some(i) => (&path[..=i], &trimmed[i + 1..]),
         None => (b"", trimmed),
     };
-    let Path { mnt, dentry: dir } = match (dir_path.is_empty(), start) {
+    let (mnt, dir) = match (dir_path.is_empty(), start) {
         (true, Some(p)) => p,
         (_, start) => path_lookupat(start, dir_path, LookupFlags::opendir())?,
-    };
+    }
+    .into_parts();
     // link_path_walk: search permission before the last component too
     may_lookup(&cred(), &dir)?;
     let last = match name {

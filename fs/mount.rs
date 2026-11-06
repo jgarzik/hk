@@ -310,6 +310,14 @@ impl Mount {
         self.expiry.store(false, Ordering::Relaxed);
     }
 
+    /// A use of the mount ended (Linux mntput): an MNT_EXPIRE mark
+    /// goes; read first, so the common case writes nothing
+    pub fn clear_expiry(&self) {
+        if self.expiry.load(Ordering::Relaxed) {
+            self.expiry.store(false, Ordering::Relaxed);
+        }
+    }
+
     /// Decrement mount reference count (like Linux mntput)
     ///
     /// Called when a file is closed.

@@ -43,7 +43,7 @@ impl Path {
     /// A dentry of the mount "/" lands on (the rootfs) as a Path
     /// (boot-time objects, internal files)
     pub fn from_dentry(dentry: Arc<Dentry>) -> Option<Self> {
-        let mnt = crate::ns::current_mnt_ns().root_path()?.mnt;
+        let mnt = crate::ns::current_mnt_ns().root_path()?.mnt.clone();
         Some(Self { mnt, dentry })
     }
 
@@ -70,6 +70,28 @@ impl Path {
         &self.mnt
     }
 
+    /// The mount and dentry (path_get of both, then path_put of this)
+    pub fn into_parts(self) -> (Arc<Mount>, Arc<Dentry>) {
+        (self.mnt.clone(), self.dentry.clone())
+    }
+
+    /// The mount, dropping the rest without counting as a use of it: an
+    /// MNT_EXPIRE mark stays (Linux mntput_no_expire, for umount's own
+    /// lookup)
+    pub fn into_mnt_noexpire(self) -> Arc<Mount> {
+        let p = core::mem::ManuallyDrop::new(self);
+        // SAFETY: `p` is never dropped or used again, so each field is
+        // read out exactly once and its reference moves to the copy
+        let (mnt, dentry) = unsafe {
+            (
+                core::ptr::read(&raw const p.mnt),
+                core::ptr::read(&raw const p.dentry),
+            )
+        };
+        drop(dentry);
+        mnt
+    }
+
     /// Get the inode (if any)
     pub fn get_inode(&self) -> Option<Arc<super::inode::Inode>> {
         self.dentry.get_inode()
@@ -79,3 +101,10 @@ impl Path {
 // Note: Arc already handles refcounting via Clone/Drop
 // path_get() equivalent = path.clone()
 // path_put() equivalent = drop(path)
+
+/// path_put: a use of the mount clears its MNT_EXPIRE mark (Linux mntput)
+impl Drop for Path {
+    fn drop(&mut self) {
+        self.mnt.clear_expiry();
+    }
+}

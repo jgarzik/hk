@@ -209,7 +209,7 @@ fn filp_open(dirfd: i32, path: &[u8], flags: u32, mode: u32) -> Result<Arc<File>
             .unwrap_or(&RAMFS_FILE_OPS)
     };
 
-    let mut file = File::new(dentry, Some(path.mnt), flags, f_op);
+    let mut file = File::new(dentry, Some(path.mnt.clone()), flags, f_op);
     if flags & O_ACCMODE != O_RDONLY {
         file.write_access = w;
         file.i_write = iw;

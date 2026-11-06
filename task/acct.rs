@@ -226,12 +226,12 @@ fn open_acct_file(path: &[u8]) -> Result<Arc<File>, i64> {
     use crate::fs::{LookupFlags, dac};
 
     // Lookup the file
-    let crate::fs::Path { mnt, dentry } = match crate::fs::namei::path_lookupat(
+    let (mnt, dentry) = match crate::fs::namei::path_lookupat(
         crate::task::percpu::current_cwd(),
         path,
         LookupFlags::open(),
     ) {
-        Ok(p) => p,
+        Ok(p) => p.into_parts(),
         // Any lookup error as is (Linux filp_open)
         Err(e) => return Err(e.sysret()),
     };

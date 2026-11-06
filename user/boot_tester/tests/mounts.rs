@@ -759,7 +759,8 @@ fn busy_cwd() -> R {
 }
 
 /// MNT_EXPIRE: a busy mount is EBUSY (not marked); use between the two
-/// calls clears the mark (Linux mntput), so the next one marks again
+/// calls (an open, a lookup) clears the mark (Linux mntput), so the
+/// next one marks again
 fn expire_busy() -> R {
     let d = b"/tmp/exb\0";
     sys_mkdir(d.as_ptr(), 0o755);
@@ -778,6 +779,12 @@ fn expire_busy() -> R {
         sys_close(fd as u64);
         let r = sys_umount2(d.as_ptr(), MNT_EXPIRE);
         check(b"used: marked again", r == EAGAIN, r)?;
+        // A path lookup is a use too (path_put), not only an open file
+        // SAFETY: Stat is plain integers
+        let mut st: Stat = unsafe { core::mem::zeroed() };
+        sys_stat(b"/tmp/exb/f\0".as_ptr(), &mut st);
+        let r = sys_umount2(d.as_ptr(), MNT_EXPIRE);
+        check(b"stat: marked again", r == EAGAIN, r)?;
         let r = sys_umount2(d.as_ptr(), MNT_EXPIRE);
         check(b"expire", r == 0, r)
     })();

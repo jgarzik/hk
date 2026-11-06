@@ -120,7 +120,13 @@ pub fn open_exec(path: Path) -> Result<Arc<File>, i32> {
         .superblock()
         .map(|sb| sb.fs_type.file_ops)
         .unwrap_or(&ramfs::RAMFS_FILE_OPS);
-    try_arc(File::new(dentry, Some(path.mnt), flags::O_RDONLY, f_op)).map_err(|e| e as i32)
+    try_arc(File::new(
+        dentry,
+        Some(path.mnt.clone()),
+        flags::O_RDONLY,
+        f_op,
+    ))
+    .map_err(|e| e as i32)
 }
 
 // ============================================================================

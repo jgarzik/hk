@@ -382,7 +382,11 @@ pub fn sys_umount2(target_ptr: u64, flags: i32) -> i64 {
         if !crate::task::capable(crate::task::CAP_SYS_ADMIN) {
             return Err(KernelError::NotPermitted);
         }
-        super::mount::do_umount(mount_at(&target)?, flags)
+        // The lookup is not a use that clears an MNT_EXPIRE mark (Linux
+        // path_umount: mntput_no_expire)
+        let m = mount_at(&target)?;
+        drop(target.into_mnt_noexpire());
+        super::mount::do_umount(m, flags)
     })();
     match r {
         Ok(()) => 0,
