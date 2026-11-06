@@ -1737,7 +1737,9 @@ pub struct Inode {
 (by directory-entry position) are hashed so each on-disk object has one
 `Inode`. One `IrqSpinlock` per bucket (a RAM-sized table), a leaf:
 under it only the bucket vector, `Weak` counts and the filesystem's
-`test` (which may take `Inode.private`, a spin RwLock). IRQ-safe
+`test` (which may take `Inode.private`, a spin RwLock, then vfat's
+`VfatInode` data, a spin Mutex leaf held only to copy the data in or
+out; never taken from an interrupt). IRQ-safe
 because a last reference could go anywhere. The hash holds `Weak`s;
 an inode upgraded under a bucket lock is never dropped there (its last
 reference's eviction takes the same lock): lookups keep them in a

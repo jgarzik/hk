@@ -187,12 +187,14 @@ fn ensure_clusters(inode: &Inode, sb_data: &VfatSbData, size: u64) -> Result<(),
                 inode.get_size() as u32,
             )?;
         }
-        // The clusters are on disk now: the inode must follow (Linux
-        // keeps this in the inode and allocates nothing here)
-        inode.set_private(arc_nofail(VfatInodeData {
-            start_cluster: first,
-            ..d
-        }));
+        // The clusters are on disk now: the inode follows
+        set_inode_data(
+            inode,
+            VfatInodeData {
+                start_cluster: first,
+                ..d
+            },
+        )?;
     }
     Ok(())
 }
@@ -258,10 +260,13 @@ fn write_failed(inode: &Inode, sb_data: &VfatSbData) -> Result<(), KernelError> 
     let keep = inode.get_size().div_ceil(u64::from(sb_data.cluster_size)) as usize;
     let start = free_past(sb_data, d.start_cluster, keep)?;
     if start != d.start_cluster {
-        inode.set_private(arc_nofail(VfatInodeData {
-            start_cluster: start,
-            ..d
-        }));
+        set_inode_data(
+            inode,
+            VfatInodeData {
+                start_cluster: start,
+                ..d
+            },
+        )?;
         update_size(inode, sb_data)?;
     }
     Ok(())
@@ -689,7 +694,9 @@ impl AsAny for VfatSbData {
     }
 }
 
-/// VFAT inode data (stored in Inode.private)
+/// VFAT inode data (Linux msdos_inode_info): copied in and out of
+/// `VfatInode`
+#[derive(Clone, Copy)]
 pub struct VfatInodeData {
     /// Starting cluster number (0 for root with fixed location)
     pub start_cluster: u32,
@@ -703,12 +710,33 @@ pub struct VfatInodeData {
     pub short_name: [u8; 11],
 }
 
-impl InodeData for VfatInodeData {}
+/// A vfat inode's `Inode.private`: its data, changed in place (a
+/// cluster allocated or freed, a rename) so those paths allocate
+/// nothing; a leaf lock, held only to copy the data
+pub struct VfatInode(crate::sync::spin::Mutex<VfatInodeData>);
 
-impl AsAny for VfatInodeData {
+impl InodeData for VfatInode {}
+
+impl AsAny for VfatInode {
     fn as_any(&self) -> &dyn core::any::Any {
         self
     }
+}
+
+/// A new inode's private data
+fn new_private(d: VfatInodeData) -> Result<Arc<VfatInode>, KernelError> {
+    try_arc(VfatInode(crate::sync::spin::Mutex::new(d)))
+}
+
+/// Replace `inode`'s data (Linux updates msdos_inode_info in place)
+fn set_inode_data(inode: &Inode, d: VfatInodeData) -> Result<(), KernelError> {
+    let private = inode.get_private().ok_or(KernelError::Io)?;
+    let v = private
+        .as_any()
+        .downcast_ref::<VfatInode>()
+        .ok_or(KernelError::Io)?;
+    *v.0.lock() = d;
+    Ok(())
 }
 
 // ============================================================================
@@ -745,20 +773,14 @@ fn get_sb_data(sb: &Arc<SuperBlock>) -> Result<VfatSbData, KernelError> {
         .ok_or(KernelError::Io)
 }
 
-/// Get VFAT inode data from inode (cloned to avoid lifetime issues)
+/// A copy of `inode`'s VFAT data
 fn get_inode_data(inode: &Inode) -> Result<VfatInodeData, KernelError> {
     let private = inode.get_private().ok_or(KernelError::Io)?;
-    let data = private
+    let v = private
         .as_any()
-        .downcast_ref::<VfatInodeData>()
+        .downcast_ref::<VfatInode>()
         .ok_or(KernelError::Io)?;
-    Ok(VfatInodeData {
-        start_cluster: data.start_cluster,
-        file_size: data.file_size,
-        is_dir: data.is_dir,
-        parent_cluster: data.parent_cluster,
-        short_name: data.short_name,
-    })
+    Ok(*v.0.lock())
 }
 
 /// Read a FAT entry for a cluster
@@ -1809,7 +1831,7 @@ impl InodeOps for VfatInodeOps {
         ))?;
         inode.i_data.set_aops(&VFAT_FILE_AOPS);
 
-        inode.set_private(try_arc(VfatInodeData {
+        inode.set_private(new_private(VfatInodeData {
             start_cluster,
             file_size,
             is_dir: false,
@@ -1894,7 +1916,7 @@ impl InodeOps for VfatInodeOps {
         ))?;
         inode.i_data.set_aops(&VFAT_FILE_AOPS);
 
-        inode.set_private(try_arc(VfatInodeData {
+        inode.set_private(new_private(VfatInodeData {
             start_cluster: new_cluster,
             file_size: 0,
             is_dir: true,
@@ -2000,13 +2022,15 @@ impl InodeOps for VfatInodeOps {
         if length < old {
             filemap::truncate_setsize(inode, length);
             let start = free_past(&sb_data, d.start_cluster, length.div_ceil(cs) as usize)?;
-            // The clusters are freed on disk: the inode must follow
-            // (Linux keeps this in the inode and allocates nothing here)
-            inode.set_private(arc_nofail(VfatInodeData {
-                start_cluster: start,
-                file_size: length as u32,
-                ..d
-            }));
+            // The clusters are freed on disk: the inode follows
+            set_inode_data(
+                inode,
+                VfatInodeData {
+                    start_cluster: start,
+                    file_size: length as u32,
+                    ..d
+                },
+            )?;
         } else if length > old {
             ensure_clusters(inode, &sb_data, length)?;
             cont_expand(inode, cs, old, length)?;
@@ -2129,9 +2153,8 @@ impl InodeOps for VfatInodeOps {
             let mut d = get_inode_data(&inode)?;
             d.parent_cluster = new_dir_data.start_cluster;
             d.short_name = new_short;
-            // The entry has moved on disk: the inode must follow (Linux
-            // fat_attach allocates nothing)
-            inode.set_private(arc_nofail(d));
+            // The entry has moved on disk: the inode follows
+            set_inode_data(&inode, d)?;
             icache::rehash(&inode, ikey(new_dir_data.start_cluster, &new_short));
         }
         dir_sync(&sb, &sb_data)
@@ -2237,7 +2260,7 @@ fn create_inode_for_entry(
     ))?;
     inode.i_data.set_aops(&VFAT_FILE_AOPS);
 
-    inode.set_private(try_arc(VfatInodeData {
+    inode.set_private(new_private(VfatInodeData {
         start_cluster: entry.start_cluster,
         file_size: entry.file_size,
         is_dir: entry.is_dir(),
@@ -2538,7 +2561,7 @@ fn vfat_mount_dev(
     ))?;
     root_inode.i_data.set_aops(&VFAT_FILE_AOPS);
 
-    root_inode.set_private(try_arc(VfatInodeData {
+    root_inode.set_private(new_private(VfatInodeData {
         start_cluster: boot_sector.root_cluster,
         file_size: 0,
         is_dir: true,
