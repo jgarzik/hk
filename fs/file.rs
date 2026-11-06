@@ -20,8 +20,8 @@ use super::iov_iter::{IovDest, IovSource};
 use super::mount::Mount;
 use crate::io::poll::{DEFAULT_POLLMASK, POLLERR, POLLHUP, PollTable};
 
-/// Largest kernel bounce buffer one read/write call uses: transfers
-/// bigger than this go through it in steps
+/// Largest kernel buffer a pseudo-file write (sysctl, cgroup attribute)
+/// copies in for one store
 pub const WRITE_CHUNK: usize = 64 * 1024;
 
 /// Open file flags (Linux O_* flags)
@@ -194,86 +194,6 @@ pub fn generic_llseek(
     Ok(pos)
 }
 
-/// Files whose reads return everything asked for unless at EOF (more
-/// chunks are read); for others (pipes, sockets, terminals) one chunk is
-/// one read, since a second could block although data was returned
-fn reads_fully(file: &File) -> bool {
-    file.get_inode()
-        .is_some_and(|i| i.mode().is_file() || i.mode().is_blkdev())
-}
-
-/// `read_iter` through a kernel buffer of at most `WRITE_CHUNK` bytes,
-/// for file types that read into slices
-fn bounce_read<F: FileOps + ?Sized>(
-    ops: &F,
-    file: &File,
-    to: &mut IovDest<'_>,
-    at: Option<u64>,
-    flags: RwFlags,
-) -> Result<usize, KernelError> {
-    let total = to.len();
-    let mut buf = crate::util::kmem::try_vec(total.min(WRITE_CHUNK), 0u8)?;
-    let mut done = 0;
-    loop {
-        let n = (total - done).min(WRITE_CHUNK);
-        let r = match at {
-            None => ops.read_with_flags(file, &mut buf[..n], flags),
-            Some(o) => ops.pread_with_flags(file, &mut buf[..n], o + done as u64, flags),
-        };
-        let r = match r {
-            Ok(r) => r,
-            Err(_) if done > 0 => return Ok(done),
-            Err(e) => return Err(e),
-        };
-        match to.copy_to(&buf[..r]) {
-            Ok(c) if c == r => {}
-            Ok(c) => return Ok(done + c),
-            Err(_) if done > 0 => return Ok(done),
-            Err(e) => return Err(e),
-        }
-        done += r;
-        if r < n || done >= total || !reads_fully(file) {
-            return Ok(done);
-        }
-    }
-}
-
-/// `write_iter` through a kernel buffer of at most `WRITE_CHUNK` bytes,
-/// for file types that write from slices. A short chunk ends the write;
-/// an error after some bytes returns their count (Linux).
-fn bounce_write<F: FileOps + ?Sized>(
-    ops: &F,
-    file: &File,
-    from: &mut IovSource<'_>,
-    at: Option<u64>,
-    flags: RwFlags,
-) -> Result<usize, KernelError> {
-    let len = from.len();
-    let mut buf = crate::util::kmem::try_vec(len.min(WRITE_CHUNK), 0u8)?;
-    let mut done = 0;
-    loop {
-        let n = (len - done).min(WRITE_CHUNK);
-        let r = from.copy_from(&mut buf[..n]).and_then(|c| {
-            let w = &buf[..c];
-            match at {
-                None => ops.write_with_flags(file, w, flags),
-                Some(o) => ops.pwrite_with_flags(file, w, o + done as u64, flags),
-            }
-            .map(|w| (w, c))
-        });
-        match r {
-            Ok((w, c)) => {
-                done += w;
-                if w < c || c < n || done >= len {
-                    return Ok(done);
-                }
-            }
-            Err(_) if done > 0 => return Ok(done),
-            Err(e) => return Err(e),
-        }
-    }
-}
-
 /// For `read_iter`/`write_iter` of a file with neither a position nor
 /// RWF_NOWAIT support (eventfd, sockets, ...): positioned I/O or
 /// RWF_NOWAIT is EOPNOTSUPP, which the syscalls report as ESPIPE resp.
@@ -299,8 +219,8 @@ pub trait FileOps: Send + Sync {
 
     /// Read into `to` at `at`, or at the file position (advancing it)
     /// when None (Linux f_op->read_iter). Data already copied wins over
-    /// a later error. Default: through `read_with_flags`/
-    /// `pread_with_flags` and a kernel buffer.
+    /// a later error. Default: EINVAL from read(2) (no read), ESPIPE
+    /// positioned.
     fn read_iter(
         &self,
         file: &File,
@@ -308,13 +228,14 @@ pub trait FileOps: Send + Sync {
         at: Option<u64>,
         flags: RwFlags,
     ) -> Result<usize, KernelError> {
-        bounce_read(self, file, to, at, flags)
+        let _ = (file, to, at, flags);
+        Err(KernelError::OperationNotSupported)
     }
 
     /// Write from `from` at `at`, or at the file position (advancing it)
     /// when None (Linux f_op->write_iter); `File::write_iter` has taken
-    /// i_rwsem, applied O_APPEND and the size limits. Default: through
-    /// `write_with_flags`/`pwrite_with_flags` and a kernel buffer.
+    /// i_rwsem, applied O_APPEND and the size limits. Default: EINVAL
+    /// (no write), ESPIPE positioned.
     fn write_iter(
         &self,
         file: &File,
@@ -322,37 +243,7 @@ pub trait FileOps: Send + Sync {
         at: Option<u64>,
         flags: RwFlags,
     ) -> Result<usize, KernelError> {
-        bounce_write(self, file, from, at, flags)
-    }
-
-    /// Read from file at current position (legacy slice form behind the
-    /// default `read_iter`; going away)
-    fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {
-        let _ = (file, buf);
-        Err(KernelError::InvalidArgument)
-    }
-
-    /// Write to file at current position
-    fn write(&self, file: &File, buf: &[u8]) -> Result<usize, KernelError> {
-        let _ = (file, buf);
-        Err(KernelError::OperationNotSupported)
-    }
-
-    /// Positioned read - read from file at given offset without modifying file position
-    ///
-    /// Unlike read(), this does NOT advance the file position.
-    /// Returns NotSupported for files that don't support positioned I/O (pipes, sockets).
-    fn pread(&self, file: &File, buf: &mut [u8], offset: u64) -> Result<usize, KernelError> {
-        let _ = (file, buf, offset);
-        Err(KernelError::OperationNotSupported)
-    }
-
-    /// Positioned write - write to file at given offset without modifying file position
-    ///
-    /// Unlike write(), this does NOT advance the file position.
-    /// Returns NotSupported for files that don't support positioned I/O (pipes, sockets).
-    fn pwrite(&self, file: &File, buf: &[u8], offset: u64) -> Result<usize, KernelError> {
-        let _ = (file, buf, offset);
+        let _ = (file, from, at, flags);
         Err(KernelError::OperationNotSupported)
     }
 
@@ -407,72 +298,6 @@ pub trait FileOps: Send + Sync {
     fn poll(&self, _file: &File, _pt: Option<&mut PollTable<'_>>) -> u16 {
         // Default for regular files - always ready
         DEFAULT_POLLMASK
-    }
-
-    /// Read with RWF flags (for preadv2/pwritev2)
-    ///
-    /// Supports RWF_NOWAIT: if set and operation would block, return WouldBlock.
-    /// Default implementation rejects NOWAIT (returns NotSupported).
-    fn read_with_flags(
-        &self,
-        file: &File,
-        buf: &mut [u8],
-        flags: RwFlags,
-    ) -> Result<usize, KernelError> {
-        if flags.nowait {
-            return Err(KernelError::OperationNotSupported);
-        }
-        self.read(file, buf)
-    }
-
-    /// Positioned read with RWF flags
-    ///
-    /// Supports RWF_NOWAIT: if set and operation would block, return WouldBlock.
-    /// Default implementation rejects NOWAIT (returns NotSupported).
-    fn pread_with_flags(
-        &self,
-        file: &File,
-        buf: &mut [u8],
-        offset: u64,
-        flags: RwFlags,
-    ) -> Result<usize, KernelError> {
-        if flags.nowait {
-            return Err(KernelError::OperationNotSupported);
-        }
-        self.pread(file, buf, offset)
-    }
-
-    /// Write with RWF flags (for preadv2/pwritev2)
-    ///
-    /// Supports RWF_NOWAIT: if set and operation would block, return WouldBlock.
-    /// Default implementation rejects NOWAIT (returns NotSupported).
-    fn write_with_flags(
-        &self,
-        file: &File,
-        buf: &[u8],
-        flags: RwFlags,
-    ) -> Result<usize, KernelError> {
-        if flags.nowait {
-            return Err(KernelError::OperationNotSupported);
-        }
-        self.write(file, buf)
-    }
-
-    /// Positioned write with RWF flags
-    ///
-    /// Supports RWF_NOWAIT: if set and operation would block, return WouldBlock.
-    /// Default implementation rejects NOWAIT (returns NotSupported).
-    fn pwrite_with_flags(
-        &self,
-        file: &File,
-        buf: &[u8],
-        offset: u64,
-        flags: RwFlags,
-    ) -> Result<usize, KernelError> {
-        if flags.nowait {
-            return Err(KernelError::OperationNotSupported);
-        }
-        self.pwrite(file, buf, offset)
     }
 }
 
