@@ -505,7 +505,12 @@ pub struct Parent {
 /// the parent must be a searchable directory; the last name is not
 /// looked up, only classified
 pub fn filename_parentat(dirfd: i32, path: &[u8]) -> Result<Parent, KernelError> {
-    let start = path_start(dirfd, path, false)?;
+    path_parentat(path_start(dirfd, path, false)?, path)
+}
+
+/// `filename_parentat` from `start` (None: the root, as for an absolute
+/// path)
+fn path_parentat(start: Option<Path>, path: &[u8]) -> Result<Parent, KernelError> {
     let end = path.iter().rposition(|&c| c != b'/').map_or(0, |i| i + 1);
     let slash = end < path.len();
     let trimmed = &path[..end];
@@ -543,6 +548,49 @@ pub fn filename_parentat(dirfd: i32, path: &[u8]) -> Result<Parent, KernelError>
         last,
         slash,
     })
+}
+
+/// Where an O_CREAT open of `p` lands (Linux open_last_lookups +
+/// step_into on the last component): while the last name is a
+/// symlink, its target's parent and last name, each link checked as a
+/// walk checks it (fs.protected_symlinks, then nosymfollow); ELOOP past
+/// MAX_SYMLINKS. A target ending in '/', "." or ".." is EISDIR.
+pub fn resolve_last_links(mut p: Parent) -> Result<Parent, KernelError> {
+    const MAX_SYMLINKS: usize = 40;
+    let c = cred();
+    for _ in 0..MAX_SYMLINKS {
+        let dir = Path::new(p.mnt.clone(), p.dir.clone());
+        let nofollow = LookupFlags {
+            follow: false,
+            ..LookupFlags::open()
+        };
+        let found = match path_lookupat(Some(dir.clone()), &p.name, nofollow) {
+            Ok(f) => f,
+            Err(KernelError::NotFound) => return Ok(p),
+            Err(e) => return Err(e),
+        };
+        let Some(inode) = found.get_inode().filter(|i| i.mode().is_symlink()) else {
+            return Ok(p);
+        };
+        if let Some(d) = p.dir.get_inode() {
+            super::dac::may_follow_link(&c, &d, &inode)?;
+        }
+        if p.mnt.flags() & super::mount::MNT_NOSYMFOLLOW != 0 {
+            return Err(KernelError::TooManySymlinks);
+        }
+        let target = inode.i_op.readlink(&inode)?;
+        inode.touch_atime(&found.mnt);
+        let start = if target.starts_with(b"/") {
+            None
+        } else {
+            Some(dir)
+        };
+        p = path_parentat(start, &target)?;
+        if p.last != Last::Norm || p.slash {
+            return Err(KernelError::IsDirectory);
+        }
+    }
+    Err(KernelError::TooManySymlinks)
 }
 
 /// The parent and new name for mkdir/mknod/symlink/link/bind (Linux

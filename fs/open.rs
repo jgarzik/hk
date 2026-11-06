@@ -84,6 +84,13 @@ fn open_target(
     if p.last != Last::Norm || p.slash {
         return Err(KernelError::IsDirectory);
     }
+    // A final symlink is followed to where the file is (or is made),
+    // a dangling one included
+    let p = if lf.follow {
+        super::namei::resolve_last_links(p)?
+    } else {
+        p
+    };
     let dir = Path::new(p.mnt.clone(), p.dir.clone());
     let (d, created) = match path_lookupat(Some(dir), &p.name, lf) {
         Ok(d) => (d, false),
