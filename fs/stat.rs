@@ -14,7 +14,8 @@ use super::syscall::current_fd_table;
 // =============================================================================
 
 /// Fill a Stat structure from an inode
-fn fill_stat(inode: &Inode) -> Stat {
+fn fill_stat(inode: &Inode) -> Result<Stat, KernelError> {
+    inode.i_op.getattr_ok(inode)?;
     let attr = inode.i_op.getattr(inode);
 
     // Get device ID from superblock (filesystem device)
@@ -28,7 +29,7 @@ fn fill_stat(inode: &Inode) -> Stat {
     };
 
     // Field widths differ per arch (st_nlink, st_*time_nsec)
-    Stat {
+    Ok(Stat {
         st_dev,
         st_ino: attr.ino,
         st_nlink: st_nlink(attr.nlink),
@@ -46,7 +47,7 @@ fn fill_stat(inode: &Inode) -> Stat {
         st_ctime: attr.ctime.sec,
         st_ctime_nsec: attr.ctime.nsec.into(),
         ..Default::default()
-    }
+    })
 }
 
 // =============================================================================
@@ -67,7 +68,7 @@ fn stat_path(dirfd: i32, path_ptr: u64, flags: i32, statbuf: u64) -> Result<(), 
     let path = getname_maybe_null(path_ptr, flags)?;
     let p = filename_lookup(dirfd, &path, LookupFlags::at(flags))?;
     let inode = p.get_inode().ok_or(KernelError::NotFound)?;
-    put_user::<Uaccess, Stat>(statbuf, fill_stat(&inode)).map_err(|_| KernelError::BadAddress)
+    put_user::<Uaccess, Stat>(statbuf, fill_stat(&inode)?).map_err(|_| KernelError::BadAddress)
 }
 
 fn ret(r: Result<(), KernelError>) -> i64 {
@@ -99,7 +100,10 @@ pub fn sys_fstat(fd: i32, statbuf: u64) -> i64 {
     };
 
     // Fill the stat structure
-    let stat = fill_stat(&inode);
+    let stat = match fill_stat(&inode) {
+        Ok(s) => s,
+        Err(e) => return e.sysret(),
+    };
 
     // Copy to user space using put_user for the entire structure
     if put_user::<Uaccess, Stat>(statbuf, stat).is_err() {
@@ -371,7 +375,12 @@ pub fn sys_fstatfs(fd: i32, buf: u64) -> i64 {
 // =============================================================================
 
 /// Fill a Statx structure from an inode
-fn fill_statx(inode: &Inode, mask: u32, mnt: Option<&super::mount::Mount>) -> Statx {
+fn fill_statx(
+    inode: &Inode,
+    mask: u32,
+    mnt: Option<&super::mount::Mount>,
+) -> Result<Statx, KernelError> {
+    inode.i_op.getattr_ok(inode)?;
     let attr = inode.i_op.getattr(inode);
     let st_dev = inode.superblock().map(|sb| sb.dev_id).unwrap_or(0);
 
@@ -381,7 +390,7 @@ fn fill_statx(inode: &Inode, mask: u32, mnt: Option<&super::mount::Mount>) -> St
         0
     };
 
-    Statx {
+    Ok(Statx {
         // Basic stats, and the mount id: the unique one if asked for
         // (Linux vfs_getattr: STATX_MNT_ID_UNIQUE), else the reused one
         stx_mask: STATX_BASIC_STATS
@@ -440,7 +449,7 @@ fn fill_statx(inode: &Inode, mask: u32, mnt: Option<&super::mount::Mount>) -> St
         stx_atomic_write_unit_max_opt: 0,
         __spare2: [0],
         __spare3: [0; 8],
-    }
+    })
 }
 
 /// sys_statx - get extended file status (Linux do_statx + vfs_statx)
@@ -458,7 +467,7 @@ pub fn sys_statx(dirfd: i32, path_ptr: u64, flags: i32, mask: u32, buf: u64) -> 
         let path = getname_maybe_null(path_ptr, flags)?;
         let p = filename_lookup(dirfd, &path, LookupFlags::at(flags))?;
         let inode = p.dentry.get_inode().ok_or(KernelError::NotFound)?;
-        put_user::<Uaccess, Statx>(buf, fill_statx(&inode, mask, Some(&p.mnt)))
+        put_user::<Uaccess, Statx>(buf, fill_statx(&inode, mask, Some(&p.mnt))?)
             .map_err(|_| KernelError::BadAddress)
     })();
     ret(r)

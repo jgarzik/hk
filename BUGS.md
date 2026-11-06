@@ -463,8 +463,9 @@ slaves, CL_SHARED_TO_SLAVE, and locks them, lock_mnt_tree): harmless
 while CLONE_NEWNS needs root and mounts ignore user namespaces, but
 required before mounts become user-namespace aware. Mount options are
 parsed by vfat (Linux's set; long names UTF-16 in UTF-8, iso8859-1 or
-cp437 only) and ramfs (mode=); procfs, devtmpfs and cgroupfs ignore
-theirs; mounts are not user-namespace aware (plain capable()).
+cp437 only), ramfs (mode=) and procfs (hidepid=, gid=, subset=pid);
+devtmpfs and cgroupfs ignore theirs, and only procfs applies options
+on a remount or shows them in /proc/mounts; mounts are not user-namespace aware (plain capable()).
 Crossing into a mount scans the current mount's children (Linux hashes
 (parent, mountpoint): mount_hashtable).
 

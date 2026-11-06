@@ -16,6 +16,7 @@
 
 mod array;
 mod mounts;
+mod opts;
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -381,7 +382,23 @@ impl InodeOps for ProcfsInodeOps {
     /// /proc/sys files: Linux proc_sys_permission (never executable,
     /// then sysctl_perm: no capability override of the mode); fd/ and
     /// fdinfo/ need ptrace-read access
+    /// Linux proc_pid_getattr: a process hidepid=invisible hides is
+    /// ENOENT to stat too (a dentry looked up by someone else stays
+    /// cached), consistent with readdir
+    fn getattr_ok(&self, inode: &Inode) -> Result<(), KernelError> {
+        match pid_dir_pid(inode) {
+            Some(pid) if !opts::with(inode, |o| o.visible(pid)).unwrap_or(true) => {
+                Err(KernelError::NotFound)
+            }
+            _ => Ok(()),
+        }
+    }
+
     fn permission(&self, inode: &Inode, cred: &Cred, mask: u32) -> Result<(), KernelError> {
+        // A process directory hidepid= hides (Linux proc_pid_permission)
+        if let Some(pid) = pid_dir_pid(inode) {
+            opts::with(inode, |o| o.pid_permission(pid)).unwrap_or(Ok(()))?;
+        }
         // fd/ and fdinfo/: ptrace-read access (Linux proc_fd_permission)
         if let Some(OpenCheck::Fds(pid)) = open_check(inode)
             && !crate::task::ptrace::may_read_proc(pid)
@@ -459,8 +476,11 @@ impl InodeOps for ProcfsInodeOps {
         let data = wrapper.0.read();
         match &*data {
             ProcfsInodeData::Directory { children } => {
+                // subset=pid: the root has only "self" and the processes
+                let pidonly = children.contains_key("version")
+                    && opts::with(dir, |o| o.pidonly()).unwrap_or(false);
                 // First check static children
-                if let Some(child) = children.get(name) {
+                if let Some(child) = children.get(name).filter(|_| !pidonly) {
                     return Ok(child.clone());
                 }
 
@@ -472,8 +492,10 @@ impl InodeOps for ProcfsInodeOps {
                         return create_self_link(dir);
                     }
                     // This is /proc root - check for numeric PID lookup
+                    // hidepid=invisible: another user's process is not there
                     if let Ok(pid) = name.parse::<u64>()
                         && task_exists(pid)
+                        && opts::with(dir, |o| o.visible(pid)).unwrap_or(true)
                     {
                         return create_pid_dir_inode(dir, pid);
                     }
@@ -1467,8 +1489,10 @@ impl FileOps for ProcfsFileOps {
 
         match &*data {
             ProcfsInodeData::Directory { children } => {
+                let pidonly = children.contains_key("version")
+                    && opts::with(&inode, |o| o.pidonly()).unwrap_or(false);
                 // Emit static children
-                for (name, child_inode) in children.iter() {
+                for (name, child_inode) in children.iter().filter(|_| !pidonly) {
                     let file_type = child_inode.mode().file_type().unwrap_or(FileType::Regular);
 
                     let should_continue = ctx.emit(DirEntry {
@@ -1492,7 +1516,7 @@ impl FileOps for ProcfsFileOps {
                     if !ctx.emit(me) {
                         return Ok(());
                     }
-                    readdir_emit_pids(inode.ino, ctx)?;
+                    readdir_emit_pids(&inode, ctx)?;
                 }
             }
             ProcfsInodeData::PidDirectory { pid } => {
@@ -1547,7 +1571,7 @@ const PID_POS: u64 = 256;
 
 /// Emit PID directory entries for /proc readdir; a PID's position is
 /// PID_POS + pid (Linux proc_pid_readdir), stable while others exit
-fn readdir_emit_pids(proc_ino: u64, ctx: &mut DirContext<'_>) -> Result<(), KernelError> {
+fn readdir_emit_pids(root: &Inode, ctx: &mut DirContext<'_>) -> Result<(), KernelError> {
     use crate::task::percpu::TASKLIST;
 
     // Collect PIDs first to release lock quickly (sorted, unique)
@@ -1560,7 +1584,11 @@ fn readdir_emit_pids(proc_ino: u64, ctx: &mut DirContext<'_>) -> Result<(), Kern
             .collect()
     };
 
-    for pid in pids {
+    // hidepid=invisible: other users' processes are left out
+    for pid in pids
+        .into_iter()
+        .filter(|&p| opts::with(root, |o| o.visible(p)).unwrap_or(true))
+    {
         let name = alloc::format!("{}", pid);
         let e = DirEntry {
             ino: pid_ino(pid, 0),
@@ -1572,7 +1600,6 @@ fn readdir_emit_pids(proc_ino: u64, ctx: &mut DirContext<'_>) -> Result<(), Kern
         }
     }
 
-    let _ = proc_ino; // Silence unused warning
     Ok(())
 }
 
@@ -1754,6 +1781,15 @@ pub static PROCFS_FILE_OPS: ProcfsFileOps = ProcfsFileOps;
 pub struct ProcfsSuperOps;
 
 impl SuperOps for ProcfsSuperOps {
+    /// Linux proc_reconfigure: hidepid=, gid=, subset=
+    fn remount(&self, sb: &SuperBlock, data: &[u8]) -> Result<(), KernelError> {
+        opts::with_sb(sb, |o| o.apply(data)).unwrap_or(Ok(()))
+    }
+
+    fn show_options(&self, sb: &SuperBlock, out: &mut Vec<u8>) {
+        opts::with_sb(sb, |o| o.show(out));
+    }
+
     fn statfs(&self) -> StatFs {
         StatFs {
             f_type: PROC_SUPER_MAGIC,
@@ -1790,6 +1826,16 @@ impl SuperOps for ProcfsSuperOps {
         )))?);
 
         Ok(inode)
+    }
+}
+
+/// The process of a /proc/<pid> or /proc/<pid>/task/<tid> directory
+fn pid_dir_pid(inode: &Inode) -> Option<Pid> {
+    let p = inode.get_private()?;
+    let w = p.as_ref().as_any().downcast_ref::<ProcfsInodeWrapper>()?;
+    match &*w.0.read() {
+        ProcfsInodeData::PidDirectory { pid } => Some(*pid),
+        _ => None,
     }
 }
 
@@ -1962,10 +2008,12 @@ pub fn proc_flush_pid(pid: Pid, tid: Pid) {
 
 fn procfs_mount(
     fs_type: &'static FileSystemType,
-    _opts: &[u8],
+    data: &[u8],
 ) -> Result<Arc<SuperBlock>, KernelError> {
+    let opts = try_arc(opts::ProcOpts::new(data)?)?;
     // Create superblock
     let sb = SuperBlock::new(fs_type, &PROCFS_SUPER_OPS, 0)?;
+    sb.set_private(opts);
     PROC_SBS.lock().push(Arc::downgrade(&sb));
 
     // Create root inode (directory)

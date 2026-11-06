@@ -92,6 +92,7 @@ pub fn show_mounts(pid: Pid) -> Vec<u8> {
         out.extend_from_slice(if m.is_readonly() { b"ro" } else { b"rw" });
         sb_opts(&mut out, &m);
         mnt_opts(&mut out, &m);
+        m.sb.s_op.show_options(&m.sb, &mut out);
         out.extend_from_slice(b" 0 0\n");
     }
     out
@@ -142,6 +143,7 @@ pub fn show_mountinfo(pid: Pid) -> Vec<u8> {
         out.push(b' ');
         out.extend_from_slice(if m.sb.rdonly() { b"ro" } else { b"rw" });
         sb_opts(&mut out, &m);
+        m.sb.s_op.show_options(&m.sb, &mut out);
         out.push(b'\n');
     }
     out

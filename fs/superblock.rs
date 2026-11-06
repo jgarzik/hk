@@ -37,6 +37,19 @@ pub trait SuperOps: Send + Sync {
     fn statfs(&self) -> StatFs {
         StatFs::default()
     }
+
+    /// The options string of a remount (Linux ->reconfigure), before
+    /// the flags change; an error changes nothing. Default: ignored.
+    fn remount(&self, sb: &SuperBlock, data: &[u8]) -> Result<(), KernelError> {
+        let _ = (sb, data);
+        Ok(())
+    }
+
+    /// This filesystem's own options in /proc/mounts, each as ",name"
+    /// (Linux ->show_options). Default none.
+    fn show_options(&self, sb: &SuperBlock, out: &mut alloc::vec::Vec<u8>) {
+        let _ = (sb, out);
+    }
 }
 
 /// Filesystem statistics (like Linux statfs)

@@ -154,8 +154,9 @@ fn sb_sync_flags(flags: u64) -> u32 {
 /// requested set. The read-only switch goes first and is all-or-nothing
 /// (EBUSY while files are open for writing or changes are in progress,
 /// with nothing changed); only then the per-mount flags are replaced.
-fn remount(m: &Arc<super::mount::Mount>, flags: u64) -> Result<(), KernelError> {
+fn remount(m: &Arc<super::mount::Mount>, flags: u64, data: &[u8]) -> Result<(), KernelError> {
     let _s = m.sb.s_umount.write();
+    m.sb.s_op.remount(&m.sb, data)?;
     if flags & ms::RDONLY != 0 {
         m.sb.make_rdonly()?;
     } else {
@@ -281,7 +282,7 @@ fn path_mount(
         return reconfigure_mnt(&mount_at(&mp)?, flags);
     }
     if flags & ms::REMOUNT != 0 {
-        return remount(&mount_at(&mp)?, flags);
+        return remount(&mount_at(&mp)?, flags, &data);
     }
     if flags & ms::BIND != 0 {
         let old = crate::fs::namei::path_lookupat(

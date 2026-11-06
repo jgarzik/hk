@@ -307,6 +307,14 @@ pub trait InodeOps: Send + Sync {
         let _ = inode;
     }
 
+    /// Whether stat may report on the inode at all (the error a Linux
+    /// ->getattr returns before filling anything). Default yes; procfs
+    /// hides a hidepid=invisible process (ENOENT).
+    fn getattr_ok(&self, inode: &Inode) -> Result<(), KernelError> {
+        let _ = inode;
+        Ok(())
+    }
+
     /// Get file size (may be dynamically computed for procfs)
     ///
     /// Timestamps are read lock-free (Linux generic_fillattr).
