@@ -48,23 +48,29 @@ pub const MCL_ONFAULT: i32 = 4;
 ///
 /// # Returns
 /// Address of mapping on success, negative errno on failure
-/// File checks of do_mmap (Linux): the file must be readable, and a
-/// shared writable mapping needs it open for writing and not
-/// append-only (EACCES), and not an active swap file (ETXTBSY)
+/// File checks of do_mmap and mprotect (Linux VM_MAYWRITE): the file
+/// must be readable, and a shared writable mapping needs it open for
+/// writing and not append-only (EACCES)
 fn file_prot_ok(f: &File, prot: u32, shared: bool) -> Result<(), KernelError> {
     use crate::fs::flags::O_APPEND;
     if !f.is_readable() {
         return Err(KernelError::PermissionDenied);
     }
-    if shared && prot & PROT_WRITE != 0 {
-        if !f.is_writable() || f.get_flags() & O_APPEND != 0 {
-            return Err(KernelError::PermissionDenied);
-        }
-        if f.mapping_inode()
-            .is_some_and(|i| i.i_swapfile.load(core::sync::atomic::Ordering::Acquire))
-        {
-            return Err(KernelError::TextBusy);
-        }
+    if shared && prot & PROT_WRITE != 0 && (!f.is_writable() || f.get_flags() & O_APPEND != 0) {
+        return Err(KernelError::PermissionDenied);
+    }
+    Ok(())
+}
+
+/// mmap only (Linux do_mmap; mprotect does not check it, a write fault
+/// is SIGBUS instead): a shared writable mapping of an active swap file
+/// is ETXTBSY
+fn swapfile_map_ok(f: &File, prot: u32, shared: bool) -> Result<(), KernelError> {
+    let swap = f
+        .mapping_inode()
+        .is_some_and(|i| i.i_swapfile.load(core::sync::atomic::Ordering::Acquire));
+    if shared && prot & PROT_WRITE != 0 && swap {
+        return Err(KernelError::TextBusy);
     }
     Ok(())
 }
@@ -153,7 +159,9 @@ pub fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: 
         return KernelError::Overflow.sysret();
     }
     if let Some(f) = &file
-        && let Err(e) = file_prot_ok(f, prot, is_shared).and_then(|()| f.f_op.mmap(f, is_shared))
+        && let Err(e) = file_prot_ok(f, prot, is_shared)
+            .and_then(|()| swapfile_map_ok(f, prot, is_shared))
+            .and_then(|()| f.f_op.mmap(f, is_shared))
     {
         return e.sysret();
     }

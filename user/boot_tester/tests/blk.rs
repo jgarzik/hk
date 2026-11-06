@@ -631,7 +631,7 @@ fn vfat_swapfile() {
     let path = b"/mnt/vd1/SWAP.BIN\0";
     let mut got = [0i64; 3];
     let mut busy = [0i64; 4];
-    let mut map = [0i64; 3];
+    let mut map = [0i64; 4];
     for (i, last) in [0u32, 0x7fff_ffff, 255].into_iter().enumerate() {
         let fd = sys_open(path.as_ptr(), O_RDWR | O_CREAT, 0o600) as i32;
         let mut hdr = [0u8; 4096];
@@ -652,16 +652,26 @@ fn vfat_swapfile() {
             rw,
             4096,
         );
+        let early_ro = hk_syscall::sys_mmap(
+            0,
+            4096,
+            hk_syscall::PROT_READ,
+            hk_syscall::MAP_SHARED,
+            rw,
+            0,
+        );
         got[i] = if ok {
             sys_swapon(path.as_ptr(), 0)
         } else {
             -1000
         };
         if got[i] == 0 {
-            map = swapfile_map(rw, early);
+            map = swapfile_map(rw, early, early_ro);
         }
-        if early > 0 {
-            hk_syscall::sys_munmap(early as u64, 4096);
+        for m in [early, early_ro] {
+            if m > 0 {
+                hk_syscall::sys_munmap(m as u64, 4096);
+            }
         }
         sys_close(rw as u64);
         if got[i] == 0 {
@@ -690,18 +700,21 @@ fn vfat_swapfile() {
     );
     // mmap shared writable and copy_file_range into it are ETXTBSY; a
     // write through a mapping made before swapon is SIGBUS (Linux
-    // do_mmap, generic_copy_file_checks, do_page_mkwrite)
+    // do_mmap, generic_copy_file_checks, do_page_mkwrite), and mprotect
+    // may still make such a mapping writable (VM_MAYWRITE was decided
+    // at mmap)
     verdict(
         b"VFAT_SWAPFILE_MAP",
-        map == [-26, -26, 0x100 + 7],
-        map[0] * 1_000_000 + map[1] * 1000 + map[2],
+        map == [-26, -26, 0x100 + 7, 0],
+        map[0] * 1_000_000 + map[1] * 1000 + map[2] + map[3] * 10_000_000,
     );
 }
 
 /// On an active swap file open read-write as `rw` with `early` mapped
-/// shared writable before swapon: [mmap shared writable, copy_file_range
-/// into it, how a child writing `early` ends (0x100 + signal)]
-fn swapfile_map(rw: i32, early: i64) -> [i64; 3] {
+/// shared writable and `early_ro` shared read-only before swapon:
+/// [mmap shared writable, copy_file_range into it, how a child writing
+/// `early` ends (0x100 + signal), mprotect of `early_ro` writable]
+fn swapfile_map(rw: i32, early: i64, early_ro: i64) -> [i64; 4] {
     use hk_syscall::{MAP_SHARED, PROT_READ, PROT_WRITE};
     let m = hk_syscall::sys_mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, rw, 0);
     if m > 0 {
@@ -728,7 +741,16 @@ fn swapfile_map(rw: i32, early: i64) -> [i64; 3] {
             i64::from(st >> 8)
         };
     }
-    [if m > 0 { 0 } else { m }, c, child]
+    let mp = if early_ro > 0 {
+        hk_syscall::sys_mprotect(
+            early_ro as u64,
+            4096,
+            hk_syscall::PROT_READ | hk_syscall::PROT_WRITE,
+        )
+    } else {
+        -1000
+    };
+    [if m > 0 { 0 } else { m }, c, child, mp]
 }
 
 /// A shared mapping of a vfat file is its page cache (Linux
