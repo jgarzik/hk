@@ -6,7 +6,6 @@
 //! - exit (process termination)
 //! - wait4, waitid (child process waiting)
 //! - set_tid_address (thread exit notification)
-#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use crate::util::error::KernelError;
 
@@ -533,6 +532,20 @@ pub struct CloneArgs {
     pub cgroup: u64,
 }
 
+crate::pod!(CloneArgs {
+    flags,
+    pidfd,
+    child_tid,
+    parent_tid,
+    exit_signal,
+    stack,
+    stack_size,
+    tls,
+    set_tid,
+    set_tid_size,
+    cgroup,
+});
+
 /// Size of clone_args version 0 (flags through tls)
 pub const CLONE_ARGS_SIZE_VER0: usize = 64;
 /// Size of clone_args version 1 (adds set_tid, set_tid_size)
@@ -562,26 +575,21 @@ const CSIGNAL: u64 = 0x000000ff;
 pub fn sys_clone3(uargs: u64, size: u64) -> i64 {
     use super::percpu::CloneConfig;
     use crate::arch::Uaccess;
-    use crate::uaccess::{UaccessArch, copy_from_user};
+    use crate::uaccess::copy_struct_from_user;
 
-    // Validate size - must be at least VER0 and not too large
-    if size < CLONE_ARGS_SIZE_VER0 as u64 || size > 4096 {
+    // Linux clone3: more than a page is E2BIG, less than VER0 EINVAL
+    if size > 4096 {
+        return KernelError::ArgListTooLong.sysret();
+    }
+    if size < CLONE_ARGS_SIZE_VER0 as u64 {
         return KernelError::InvalidArgument.sysret();
     }
-
-    // Validate user pointer
-    if !Uaccess::access_ok(uargs, size as usize) {
-        return KernelError::BadAddress.sysret();
-    }
-
-    // Copy clone_args from userspace (zero-fill any missing fields)
-    let mut args = CloneArgs::default();
-    let copy_size = core::cmp::min(size as usize, core::mem::size_of::<CloneArgs>());
-    let args_bytes =
-        unsafe { core::slice::from_raw_parts_mut((&raw mut args).cast::<u8>(), copy_size) };
-    if copy_from_user::<Uaccess>(args_bytes, uargs, copy_size).is_err() {
-        return KernelError::BadAddress.sysret();
-    }
+    // A larger struct than this kernel's must be zero past it (E2BIG)
+    let args = match copy_struct_from_user::<Uaccess, CloneArgs>(uargs, size as usize) {
+        Ok(a) => a,
+        Err(None) => return KernelError::ArgListTooLong.sysret(),
+        Err(Some(_)) => return KernelError::BadAddress.sysret(),
+    };
 
     // Validate clone3-specific constraints
 
