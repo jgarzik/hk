@@ -372,8 +372,6 @@ unreachable today.
 - net: no queues/, phys_port_*, speed/duplex, ifalias or gro files;
   interfaces cannot be renamed or moved between namespaces, so no
   "move" uevents.
-- chmod/chown on sysfs files change the inode only: a later lookup of a
-  dropped dentry shows the original mode (Linux keeps kernfs iattrs).
 - /sys/module lists built-in modules with drivers only; no parameters
   or version files (hk has no module parameters).
 

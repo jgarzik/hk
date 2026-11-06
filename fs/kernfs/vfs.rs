@@ -96,6 +96,15 @@ pub fn inode(sb: &Arc<SuperBlock>, kn: &Arc<KNode>) -> Result<Arc<Inode>, Kernel
         &KERNFS_IOPS,
     ))?;
     i.set_private(try_arc(KfInode(kn.clone()))?);
+    let saved = *kn.iattr.lock();
+    if let Some(a) = saved {
+        i.set_mode_perm(a.perm);
+        i.set_uid(a.uid);
+        i.set_gid(a.gid);
+        i.set_atime(a.atime);
+        i.set_mtime(a.mtime);
+        i.set_ctime(a.ctime);
+    }
     Ok(i)
 }
 
@@ -110,6 +119,20 @@ impl InodeOps for KernfsIops {
         }
         let sb = dir.superblock().ok_or(KernelError::Io)?;
         inode(&sb, &kn)
+    }
+
+    /// Linux kernfs_iop_setattr: the node keeps the attributes, so an
+    /// inode made after this one is dropped shows them too
+    fn setattr_done(&self, inode: &Inode) {
+        let Some(kn) = knode(inode) else { return };
+        *kn.iattr.lock() = Some(super::Iattr {
+            perm: inode.mode().perm(),
+            uid: inode.uid(),
+            gid: inode.gid(),
+            atime: inode.atime(),
+            mtime: inode.mtime(),
+            ctime: inode.ctime(),
+        });
     }
 
     /// Linux kernfs_dop_revalidate: a removed node's dentry is stale
@@ -340,9 +363,12 @@ impl FileOps for KernfsFops {
         if !matches!(kn.kind, Kind::Attr(_) | Kind::Bin(_)) {
             return Ok(());
         }
-        if (file.is_writable() && kn.mode & 0o222 == 0)
-            || (file.is_readable() && kn.mode & 0o444 == 0)
-        {
+        // The inode's mode as chmod left it, and the node's own (its
+        // creation mode stands for has_read/has_write: no write bit, no
+        // store)
+        let (im, km) = (inode.mode().perm(), kn.mode);
+        let refused = |bits: u16| im & bits == 0 || km & bits == 0;
+        if (file.is_writable() && refused(0o222)) || (file.is_readable() && refused(0o444)) {
             return Err(KernelError::PermissionDenied);
         }
         if matches!(kn.kind, Kind::Bin(_)) {

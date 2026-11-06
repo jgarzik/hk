@@ -275,6 +275,7 @@ fn do_utimes(dirfd: i32, pathname: u64, times: Option<[UserTimespec; 2]>, flags:
         inode.set_mtime(t);
     }
     inode.set_ctime(now);
+    inode.i_op.setattr_done(&inode);
     drop(lock);
     0
 }

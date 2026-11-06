@@ -152,6 +152,18 @@ pub enum Kind {
     Link(Weak<KNode>),
 }
 
+/// Attributes set on a node by chmod, chown or utimes (Linux struct
+/// kernfs_iattrs): every inode made for it starts from them
+#[derive(Clone, Copy)]
+pub struct Iattr {
+    pub perm: u16,
+    pub uid: crate::task::Uid,
+    pub gid: crate::task::Gid,
+    pub atime: crate::time::Timespec,
+    pub mtime: crate::time::Timespec,
+    pub ctime: crate::time::Timespec,
+}
+
 /// A kernfs node (Linux struct kernfs_node)
 pub struct KNode {
     name: RwLock<Vec<u8>>,
@@ -166,6 +178,8 @@ pub struct KNode {
     active: AtomicI32,
     /// Removal waits here for `active` to drain
     drain: WaitQueue,
+    /// What chmod/chown/utimes set (None: the defaults)
+    pub iattr: crate::sync::spin::Mutex<Option<Iattr>>,
 }
 
 /// Linux kernfs_name_hash: positions 0, 1 and i32::MAX are reserved
@@ -215,6 +229,7 @@ impl KNode {
             kind,
             active: AtomicI32::new(0),
             drain: WaitQueue::new(),
+            iattr: crate::sync::spin::Mutex::new(None),
         }
     }
 

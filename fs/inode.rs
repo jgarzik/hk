@@ -185,6 +185,13 @@ pub trait InodeOps: Send + Sync {
         Ok(())
     }
 
+    /// Attributes changed (chmod, chown, utimes), under i_rwsem: a file
+    /// system that keeps them outside the inode saves them (Linux
+    /// kernfs_iop_setattr into kn->iattr). Default nothing.
+    fn setattr_done(&self, inode: &Inode) {
+        let _ = inode;
+    }
+
     /// Create a new file in a directory
     fn create(&self, dir: &Inode, name: &[u8], mode: InodeMode) -> Result<Arc<Inode>, KernelError> {
         let _ = (dir, name, mode);

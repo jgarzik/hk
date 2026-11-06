@@ -350,6 +350,7 @@ pub fn chmod(p: &super::Path, perm: u16) -> Result<(), KernelError> {
     }
     inode.set_mode_perm(perm);
     inode.set_ctime(crate::time::TIMEKEEPER.current_time());
+    inode.i_op.setattr_done(inode);
     Ok(())
 }
 
@@ -403,6 +404,7 @@ pub fn chown(p: &super::Path, uid: Option<Uid>, gid: Option<Gid>) -> Result<(), 
     }
     // chown_common: ATTR_CTIME even when no id changes
     inode.set_ctime(crate::time::TIMEKEEPER.current_time());
+    inode.i_op.setattr_done(inode);
     Ok(())
 }
 

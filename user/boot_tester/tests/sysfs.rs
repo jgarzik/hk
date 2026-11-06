@@ -5,8 +5,8 @@
 //! what both have.
 
 use hk_syscall::{
-    LinuxStatFs, O_DIRECTORY, O_RDONLY, O_WRONLY, Stat, sys_close, sys_getdents64, sys_lseek,
-    sys_open, sys_read, sys_readlink, sys_stat, sys_statfs,
+    LinuxStatFs, O_DIRECTORY, O_RDONLY, O_WRONLY, Stat, sys_chmod, sys_chown, sys_close,
+    sys_getdents64, sys_lseek, sys_open, sys_read, sys_readlink, sys_stat, sys_statfs, sys_write,
 };
 
 use super::helpers::{host_mode, linux_at_least, print, print_num, println, read_file, skip};
@@ -36,6 +36,36 @@ pub fn run_tests() {
     test_unbind_usb();
     test_unbind_blk();
     test_unbind_net();
+    test_chmod_keep();
+}
+
+/// chmod/chown of an attribute outlive its dentry (Linux kernfs
+/// iattrs): after drop_caches 2 the file still has them; open for
+/// writing follows the inode's mode (EACCES once no write bit is left,
+/// even for root)
+fn test_chmod_keep() {
+    let n = b"SYSFS_CHMOD_KEEP";
+    let p = b"/sys/class/net/lo/mtu\0";
+    let c = sys_chmod(p.as_ptr(), 0o444);
+    let o = sys_chown(p.as_ptr(), 1000, 1000);
+    let w = sys_open(p.as_ptr(), O_WRONLY, 0);
+    if w >= 0 {
+        sys_close(w as u64);
+    }
+    let fd = sys_open(b"/proc/sys/vm/drop_caches\0".as_ptr(), O_WRONLY, 0);
+    sys_write(fd as u64, b"2\n".as_ptr(), 2);
+    sys_close(fd as u64);
+    let st = stat(p);
+    sys_chmod(p.as_ptr(), 0o644);
+    sys_chown(p.as_ptr(), 0, 0);
+    match st {
+        _ if c != 0 || o != 0 => fail(n, b"chmod/chown", c * 100 + o),
+        _ if w != EACCES => fail(n, b"open for write", w),
+        Err(e) => fail(n, b"stat", e),
+        Ok(st) if st.st_mode & 0o7777 != 0o444 => fail(n, b"mode", i64::from(st.st_mode)),
+        Ok(st) if st.st_uid != 1000 || st.st_gid != 1000 => fail(n, b"owner", i64::from(st.st_uid)),
+        Ok(_) => ok(n),
+    }
 }
 
 fn fail(name: &[u8], why: &[u8], v: i64) {
