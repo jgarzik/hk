@@ -1279,13 +1279,13 @@ fn short_name_checksum(short_name: &[u8; 11]) -> u8 {
 fn create_lfn_entries(name: &str, short_name: &[u8; 11]) -> Vec<VfatLfnEntry> {
     let checksum = short_name_checksum(short_name);
 
-    // UTF-16, NUL-terminated, then padded with 0xFFFF
-    let ucs2_chars: Vec<u16> = name.encode_utf16().chain(core::iter::once(0u16)).collect();
-
-    // Pad to multiple of 13 with 0xFFFF
-    let padded_len = ucs2_chars.len().div_ceil(13) * 13;
-    let mut padded: Vec<u16> = ucs2_chars;
-    padded.resize(padded_len, 0xFFFF);
+    // UTF-16; unless it fills its last entry exactly, NUL-terminated
+    // and padded with 0xFFFF (Linux xlate_to_uni)
+    let mut padded: Vec<u16> = name.encode_utf16().collect();
+    if !padded.len().is_multiple_of(13) {
+        padded.push(0);
+        padded.resize(padded.len().div_ceil(13) * 13, 0xFFFF);
+    }
 
     let num_entries = padded.len() / 13;
     let mut entries = Vec::with_capacity(num_entries);
@@ -2601,5 +2601,84 @@ mod tests {
         assert_eq!(g("..."), None);
         let taken = [*b"A       B  "];
         assert_eq!(generate_short_name("a.b", &taken), Some(*b"A~1     B  "));
+    }
+
+    /// The names of `entries` read back as the directory reader does
+    fn read_back(entries: &[VfatLfnEntry]) -> String {
+        let mut parts: Vec<(u8, Vec<u16>)> = entries
+            .iter()
+            .map(|e| (e.order & 0x3f, lfn_entry_chars(e)))
+            .collect();
+        lfn_name(&mut parts)
+    }
+
+    /// LFN entries: highest order first with 0x40 on it, every one
+    /// carrying the short name's checksum; a name filling its last
+    /// entry exactly has no terminator (Linux xlate_to_uni); a
+    /// surrogate pair may span two entries
+    #[test]
+    fn long_name_entries() {
+        let short = *b"LONGFI~1TXT";
+        let sum = short_name_checksum(&short);
+        let e = create_lfn_entries("a.txt", &short);
+        assert_eq!(e.len(), 1);
+        assert_eq!(e[0].order, 0x41);
+        let n1 = e[0].name1;
+        assert_eq!(n1, [0x61, 0x2e, 0x74, 0x78, 0x74]);
+        let n2 = e[0].name2;
+        assert_eq!(n2, [0, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff]);
+        let thirteen = "abcdefghijklm";
+        let e = create_lfn_entries(thirteen, &short);
+        assert_eq!(e.len(), 1);
+        let n3 = e[0].name3;
+        assert_eq!(n3, [0x6c, 0x6d]);
+        assert_eq!(read_back(&e), thirteen);
+        let long = "a name that needs three entries.txt";
+        let e = create_lfn_entries(long, &short);
+        assert_eq!(e.len(), 3);
+        assert_eq!(e.iter().map(|x| x.order).collect::<Vec<_>>(), [0x43, 2, 1]);
+        assert!(e.iter().all(|x| x.checksum == sum));
+        assert_eq!(read_back(&e), long);
+        // U+1F600 is a pair at units 12 and 13: split between entries
+        let pair = "abcdefghijkl\u{1F600}x";
+        assert_eq!(read_back(&create_lfn_entries(pair, &short)), pair);
+    }
+
+    /// The short-name checksum (Microsoft FAT spec, Linux fat_checksum):
+    /// both forms agree
+    #[test]
+    fn checksums() {
+        let s = *b"README  TXT";
+        assert_eq!(short_name_checksum(&s), 0x73);
+        let (n, e) = s.split_at(8);
+        assert_eq!(
+            lfn_checksum(n.try_into().unwrap(), e.try_into().unwrap()),
+            0x73
+        );
+    }
+
+    /// 8.3 names as text: the dot only with an extension, 0x05 is 0xE5
+    #[test]
+    fn short_name_text() {
+        assert_eq!(short_name_to_string(b"README  ", b"TXT"), "README.TXT");
+        assert_eq!(short_name_to_string(b"MAKEFILE", b"   "), "MAKEFILE");
+        assert_eq!(short_name_to_string(b"\x05BC     ", b"   "), "\u{e5}BC");
+    }
+
+    /// cp437 and iso8859-1 both ways; what a charset lacks is '?'
+    #[test]
+    fn charsets() {
+        assert_eq!(Charset::Cp437.to_bytes("\u{e9}t\u{e9}"), [0x82, b't', 0x82]);
+        assert_eq!(
+            Charset::Cp437.to_text(&[0x82, 0xe1]).unwrap(),
+            "\u{e9}\u{df}"
+        );
+        assert_eq!(Charset::Latin1.to_bytes("\u{e9}\u{20ac}"), [0xe9, b'?']);
+        assert_eq!(Charset::Latin1.to_text(&[0xe9]).unwrap(), "\u{e9}");
+        assert!(Charset::Utf8.to_text(&[0xff]).is_none());
+        for b in 0x80..=0xffu8 {
+            let t = Charset::Cp437.to_text(&[b]).unwrap();
+            assert_eq!(Charset::Cp437.to_bytes(&t), [b]);
+        }
     }
 }
