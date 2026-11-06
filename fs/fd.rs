@@ -22,8 +22,11 @@ use super::syscall::{current_fd_table, get_nofile_limit};
 // truncate, ftruncate syscalls
 // =============================================================================
 
-/// Helper to perform truncate on an inode with RLIMIT and error handling
-fn do_truncate(inode: &Arc<super::Inode>, length: u64) -> i64 {
+/// Helper to perform truncate on an inode with RLIMIT and error handling.
+/// `times` (ftruncate: Linux ATTR_MTIME | ATTR_CTIME): mtime and ctime
+/// are set even when the size stays; without it only a size change
+/// sets them (the file system's setattr, as ext4, tmpfs and vfat).
+fn do_truncate(inode: &Arc<super::Inode>, length: u64, times: bool) -> i64 {
     // Check RLIMIT_FSIZE when extending the file
     let current_size = inode.get_size();
     // RLIMIT_FSIZE (SIGXFSZ), then the filesystem's largest file (Linux
@@ -55,7 +58,12 @@ fn do_truncate(inode: &Arc<super::Inode>, length: u64) -> i64 {
         // The set-id kill with the size change (Linux do_truncate:
         // ATTR_KILL_* in the same notify_change)
         super::dac::remove_privs(inode);
-        inode.i_op.truncate(inode, length)
+        let changed = inode.get_size() != length;
+        inode.i_op.truncate(inode, length).inspect(|()| {
+            if times || changed {
+                inode.touch_mc();
+            }
+        })
     };
     drop(lock);
     match r {
@@ -103,7 +111,7 @@ pub fn sys_ftruncate(fd: i32, length: i64) -> i64 {
         return KernelError::InvalidArgument.sysret();
     }
 
-    do_truncate(&inode, length as u64)
+    do_truncate(&inode, length as u64, true)
 }
 
 /// sys_truncate - truncate a file to a specified length by path
@@ -162,7 +170,7 @@ pub fn sys_truncate(path_ptr: u64, length: i64) -> i64 {
     if let Err(e) = super::dac::may_truncate(&inode) {
         return e.sysret();
     }
-    do_truncate(&inode, length as u64)
+    do_truncate(&inode, length as u64, false)
 }
 
 // =============================================================================

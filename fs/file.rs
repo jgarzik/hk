@@ -671,8 +671,10 @@ impl File {
                 return Ok(0);
             }
             from.truncate(inode.write_limit(pos, from.len())?);
-            // file_remove_privs: set-id bits go unless CAP_FSETID
+            // file_modified: set-id bits go unless CAP_FSETID, then
+            // mtime and ctime, before the data
             super::dac::remove_privs(&inode);
+            inode.touch_mc();
             self.f_op.write_iter(self, from, at, flags)
         })()?;
         drop(lock);

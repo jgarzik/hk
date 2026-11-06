@@ -51,6 +51,7 @@ pub mod fpu;
 pub mod frag;
 pub mod fs_common;
 pub mod fs_ops;
+pub mod fs_times;
 pub mod futex;
 pub mod futex_requeue;
 pub mod futex_shared;
@@ -193,6 +194,7 @@ pub fn run_all_tests() {
     close_range::run_tests();
     append::run_tests();
     mountflags::run_tests();
+    fs_times::run_tests();
     mounts::run_tests();
     mountinfo::run_tests();
     sysfs::run_tests();

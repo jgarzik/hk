@@ -710,6 +710,21 @@ impl Inode {
         self.ctime.set(time);
     }
 
+    /// mtime and ctime become the current time (Linux
+    /// inode_set_mtime_to_ts(inode, inode_set_ctime_current(inode))).
+    /// Callers hold `i_rwsem`.
+    pub fn touch_mc(&self) {
+        let now = crate::time::TIMEKEEPER.current_time();
+        self.ctime.set(now);
+        self.mtime.set(now);
+    }
+
+    /// ctime becomes the current time (Linux inode_set_ctime_current).
+    /// Callers hold `i_rwsem`.
+    pub fn touch_c(&self) {
+        self.ctime.set(crate::time::TIMEKEEPER.current_time());
+    }
+
     /// Get the superblock this inode belongs to
     pub fn superblock(&self) -> Option<Arc<SuperBlock>> {
         self.sb.upgrade()
