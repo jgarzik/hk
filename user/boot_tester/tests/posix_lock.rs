@@ -6,6 +6,9 @@
 //! - Test F_GETLK returns F_UNLCK when no conflict
 //! - Test partial unlock (range splitting)
 //! - Test F_SETLK returns EBADF for invalid fd
+//! - POSIX_LOCK_CLONE_FILES: a CLONE_FILES child (another process) owns
+//!   its parent's locks too (Linux fl_owner is the files table): it may
+//!   take the same lock, and F_GETLK elsewhere reports the parent's pid
 
 use super::helpers::{print, print_num, println};
 use hk_syscall::{O_CREAT, O_RDWR, O_TRUNC, sys_close, sys_fcntl, sys_mkdir, sys_open, sys_write};
@@ -54,6 +57,7 @@ pub fn run_tests() {
     test_blocking();
     test_contended_waiters();
     test_flock_upgrade();
+    test_lock_clone_files();
 }
 
 /// Test F_SETLK with F_WRLCK (write lock) and F_UNLCK
@@ -600,6 +604,50 @@ fn test_setlk_range_limits() {
     } else {
         print(b":FAIL step ");
         print_num(step);
+        println(b"");
+    }
+}
+
+/// A parent locks a file; a child cloned with CLONE_FILES (a process of
+/// its own, sharing the descriptor table) takes the same write lock
+/// without conflict, since both are one lock owner; a forked process
+/// sees the lock held, by the parent's pid
+fn test_lock_clone_files() {
+    use hk_syscall::{sys_clone, sys_exit, sys_fork, sys_getpid, sys_wait4};
+    const CLONE_FILES: u64 = 0x400;
+    const SIGCHLD: u64 = 17;
+    let path = b"/tmp/posix_clone_files\0";
+    let fd = sys_open(path.as_ptr(), O_CREAT | O_RDWR | O_TRUNC, 0o644);
+    let mut ok = wrlock(fd) == 0;
+    let pid = sys_clone(CLONE_FILES | SIGCHLD, 0, 0, 0, 0);
+    if pid == 0 {
+        sys_exit(if wrlock(fd) == 0 { 0 } else { 1 });
+    }
+    let mut st = 0i32;
+    sys_wait4(pid, &mut st, 0, 0);
+    ok &= st == 0;
+    let me = sys_getpid();
+    let other = sys_fork();
+    if other == 0 {
+        let (t, p) = getlk(path);
+        sys_exit(if t == F_WRLCK && i64::from(p) == me {
+            0
+        } else {
+            2
+        });
+    }
+    let mut st2 = 0i32;
+    sys_wait4(other, &mut st2, 0, 0);
+    ok &= st2 == 0;
+    sys_close(fd as u64);
+    hk_syscall::sys_unlink(path.as_ptr());
+    if ok {
+        println(b"POSIX_LOCK_CLONE_FILES:OK");
+    } else {
+        print(b"POSIX_LOCK_CLONE_FILES:FAIL child ");
+        print_num(i64::from(st));
+        print(b" getlk ");
+        print_num(i64::from(st2));
         println(b"");
     }
 }

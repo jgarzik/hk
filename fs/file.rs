@@ -851,10 +851,10 @@ pub static CHAR_FILE_OPS: CharDevFileOps = CharDevFileOps;
 // Generic Page-Cache File Operations
 // ============================================================================
 
-/// A descriptor of `file` was closed by the current task (Linux
-/// filp_flush): its POSIX locks on the inode go, then the file's own
-/// flush
-pub fn filp_flush(file: &File) {
-    crate::fs::posix_lock::release_posix_locks_on_close(file);
+/// A descriptor of `file` in the table whose lock-owner identity is
+/// `owner` was closed (Linux filp_flush): that owner's POSIX locks on
+/// the inode go, then the file's own flush
+pub fn filp_flush(file: &File, owner: u64) {
+    crate::fs::posix_lock::release_posix_locks_on_close(file, owner);
     file.f_op.flush(file);
 }

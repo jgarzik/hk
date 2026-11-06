@@ -28,19 +28,41 @@ use crate::fs::File;
 use crate::util::error::KernelError;
 
 /// A descriptor table (Linux files_struct)
-pub struct Files(Mutex<FdTable<File>>);
+pub struct Files {
+    table: Mutex<FdTable<File>>,
+    /// Its identity as a POSIX lock owner (Linux fl_owner): unique, never
+    /// reused, kept across an exec that did not have to copy the table
+    id: u64,
+}
 
 /// The locked table; files it detached are released after the unlock
-pub struct FilesGuard<'a>(ManuallyDrop<MutexGuard<'a, FdTable<File>>>);
+pub struct FilesGuard<'a>(ManuallyDrop<MutexGuard<'a, FdTable<File>>>, u64);
+
+/// Source of `Files::id`
+static NEXT_FILES_ID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
 
 impl Files {
     pub fn new(t: FdTable<File>) -> Self {
-        Self(Mutex::new(t))
+        let id = NEXT_FILES_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        Self::with_id(t, id)
+    }
+
+    /// A table keeping lock-owner identity `id`
+    fn with_id(t: FdTable<File>, id: u64) -> Self {
+        Self {
+            table: Mutex::new(t),
+            id,
+        }
+    }
+
+    /// Its POSIX lock-owner identity
+    pub fn id(&self) -> u64 {
+        self.id
     }
 
     /// Lock the table (Linux spin_lock(&files->file_lock))
     pub fn lock(&self) -> FilesGuard<'_> {
-        FilesGuard(ManuallyDrop::new(self.0.lock()))
+        FilesGuard(ManuallyDrop::new(self.table.lock()), self.id)
     }
 }
 
@@ -68,7 +90,7 @@ impl Drop for FilesGuard<'_> {
         // (Linux filp_flush), however many other descriptors it has.
         // Files refused an install (`dead`) were never the caller's.
         for f in &closed {
-            crate::fs::file::filp_flush(f);
+            crate::fs::file::filp_flush(f, self.1);
         }
         drop(closed);
         drop(dead);
@@ -105,7 +127,7 @@ pub fn exit_task_fd(tid: Tid) {
             t.fds().filter_map(|&fd| t.get(fd)).collect()
         };
         for f in &open {
-            crate::fs::file::filp_flush(f);
+            crate::fs::file::filp_flush(f, files.id());
         }
         drop(open);
         drop(files);
@@ -121,6 +143,9 @@ pub fn exec_task_fd(tid: Tid) {
     let Some(old) = get_task_fd(tid) else {
         return;
     };
+    // Not shared (only the task and `old` here hold it): the copy stays
+    // the same lock owner, as Linux keeps an unshared files_struct
+    let shared = Arc::strong_count(&old) > 2;
     let (new, cloexec) = {
         let t = old.lock();
         let cloexec: alloc::vec::Vec<_> = t
@@ -129,13 +154,20 @@ pub fn exec_task_fd(tid: Tid) {
             .filter_map(|&fd| t.get(fd))
             .collect();
         // Past exec's point of no return: failure cannot be reported
-        (arc_nofail(Files::new(t.exec_copy())), cloexec)
+        let copy = t.exec_copy();
+        let files = if shared {
+            Files::new(copy)
+        } else {
+            Files::with_id(copy, old.id())
+        };
+        (arc_nofail(files), cloexec)
     };
     init_task_fd(tid, new);
     // Linux do_close_on_exec closes them (filp_close): their POSIX locks
     // go and they are flushed; every other lock stays across the exec
+    let owner = get_task_fd(tid).map_or(0, |f| f.id());
     for f in &cloexec {
-        crate::fs::file::filp_flush(f);
+        crate::fs::file::filp_flush(f, owner);
     }
     drop(cloexec);
     drop(old);

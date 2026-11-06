@@ -2553,10 +2553,10 @@ pub fn exit_current(status: Option<i32>) -> ! {
 
         // Clean up FD table for exiting task
         crate::task::fdtable::exit_task_fd(tid);
-        // The process's descriptors are all closed now: its POSIX locks
-        // go (Linux close_files -> filp_flush -> locks_remove_posix)
+        // POSIX locks went as the last user of the descriptor table
+        // closed its descriptors (exit_task_fd; Linux close_files ->
+        // filp_flush -> locks_remove_posix)
         if group_dead {
-            crate::fs::posix_lock::release_all_posix_locks_for_pid(current_pid());
             // A session leader's session loses its controlling tty
             // (Linux do_exit -> disassociate_ctty(1))
             crate::tty::jobctrl::disassociate_ctty();

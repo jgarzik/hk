@@ -272,12 +272,7 @@ lo (hk has no checksum offload states).
 
 **Location**: `fs/locks.rs`, `fs/posix_lock.rs`
 
-POSIX lock owners are pids, not the files_struct (Linux fl_owner):
-threads of one process share them, but a CLONE_FILES child that is
-another process has its own (Linux: one owner), and a process's locks
-are released at its exit through a global list of the inodes with
-POSIX locks (searched on each F_SETLK, scanned at each exit). No
-leases (F_SETLEASE) and no OFD locks (F_OFD_*).
+No leases (F_SETLEASE) and no OFD locks (F_OFD_*).
 
 ## seccomp gaps
 
