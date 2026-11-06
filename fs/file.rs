@@ -699,9 +699,12 @@ impl File {
         // O_DSYNC/O_SYNC or a synchronous mount: the data reaches the
         // storage before the write returns (Linux generic_write_sync,
         // after i_rwsem is released)
-        let sync = self.get_flags() & flags::O_DSYNC != 0
-            || inode.superblock().is_some_and(|sb| sb.synchronous());
-        if n > 0 && sync {
+        // Only a write that wrote, and the superblock only without O_DSYNC
+        let sync = || {
+            self.get_flags() & flags::O_DSYNC != 0
+                || inode.superblock().is_some_and(|sb| sb.synchronous())
+        };
+        if n > 0 && sync() {
             self.f_op.fsync(self)?;
         }
         Ok(n)
