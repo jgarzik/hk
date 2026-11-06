@@ -1413,6 +1413,12 @@ pub fn sys_mremap(old_addr: u64, old_len: u64, new_len: u64, flags: u32, new_add
         return KernelError::OutOfMemory.sysret();
     }
     let locked = mm_guard.get_vma(vma_idx).is_some_and(|v| v.is_locked());
+    // What grows is faulted in, unless locked on fault (Linux
+    // populate_vma_page_range skips VM_LOCKONFAULT)
+    let populate = locked
+        && mm_guard
+            .get_vma(vma_idx)
+            .is_some_and(|v| v.flags & super::vma::VM_LOCKONFAULT == 0);
     if locked && new_len_aligned > old_len && !memlock_ok(&mm_guard, new_len_aligned - old_len) {
         return KernelError::WouldBlock.sysret();
     }
@@ -1429,7 +1435,7 @@ pub fn sys_mremap(old_addr: u64, old_len: u64, new_len: u64, flags: u32, new_add
             #[cfg(feature = "mmcheck")]
             super::check::verify(&mm_guard, mm.pgd(), "mremap expand");
             drop(mm_guard);
-            if locked {
+            if populate {
                 populate_grown(old_addr, old_len, new_len_aligned);
             }
             return old_addr as i64;
@@ -1472,7 +1478,7 @@ pub fn sys_mremap(old_addr: u64, old_len: u64, new_len: u64, flags: u32, new_add
     super::check::verify(&mm_guard, mm.pgd(), "mremap move");
     drop(mm_guard);
     drop(gone);
-    if locked {
+    if populate {
         populate_grown(target, old_len, new_len_aligned);
     }
     target as i64

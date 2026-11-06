@@ -680,7 +680,33 @@ fn mremap_grow_locked() {
     }
     sys_munlock(b, 4 * P);
     sys_munmap(b, 4 * P);
+    if code == 0 {
+        code = mremap_grow_onfault();
+    }
     report(NAME, code);
+}
+
+/// The same with MLOCK_ONFAULT: the added pages stay unpopulated (Linux
+/// populate_vma_page_range skips VM_LOCKONFAULT); 0 if none is resident
+fn mremap_grow_onfault() -> i64 {
+    let Some(a) = area(2) else {
+        return -1;
+    };
+    if sys_mlock2(a, 2 * P, MLOCK_ONFAULT) != 0 {
+        sys_munmap(a, 2 * P);
+        return 20;
+    }
+    let r = hk_syscall::sys_mremap(a, 2 * P, 4 * P, hk_syscall::MREMAP_MAYMOVE, 0);
+    if r < 0 {
+        sys_munmap(a, 2 * P);
+        return 21;
+    }
+    let b = r as u64;
+    let mut v = [0u8; 2];
+    sys_mincore(b + 2 * P, 2 * P, v.as_mut_ptr());
+    sys_munlock(b, 4 * P);
+    sys_munmap(b, 4 * P);
+    v.iter().filter(|&&x| x & 1 != 0).count() as i64
 }
 
 fn mlock_holes() {
