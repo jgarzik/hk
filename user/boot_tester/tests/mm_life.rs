@@ -30,6 +30,7 @@ pub fn run_tests() {
     leak(b"MM_LIFE_EXEC_CHAIN", 10, exec_chain);
     leak(b"MM_LIFE_PROTNONE_MUNMAP", 200, protnone_munmap);
     leak(b"MM_LIFE_PROTNONE_EXIT", 200, protnone_exit);
+    fork_exec_objects();
     maps_after_exit();
     munmap_partial();
     map_fixed_replace();
@@ -577,4 +578,68 @@ fn mremap_fixed_replace() {
         _ => 0,
     };
     report(b"MM_LIFE_MREMAP_FIXED", bad == 0, bad);
+}
+
+/// nr_dentry of /proc/sys/fs/dentry-state once unused dentries and
+/// inodes are dropped (drop_caches 2): what is still referenced
+fn live_dentries() -> i64 {
+    let fd = sys_open(b"/proc/sys/vm/drop_caches\0".as_ptr(), 1, 0); // O_WRONLY
+    if fd >= 0 {
+        hk_syscall::sys_write(fd as u64, b"2".as_ptr(), 1);
+        sys_close(fd as u64);
+    }
+    let mut b = [0u8; 128];
+    let n = super::helpers::read_file(b"/proc/sys/fs/dentry-state\0", &mut b);
+    if n <= 0 {
+        return -1;
+    }
+    b.iter()
+        .take_while(|c| c.is_ascii_digit())
+        .fold(0i64, |v, c| v * 10 + i64::from(c - b'0'))
+}
+
+/// MM_LIFE_FORK_EXEC_OBJS: fork+exec keeps no kernel object behind:
+/// once the processes are gone and the caches dropped, the dentries and
+/// the slab come back to where they were (300 rounds: a leak of even
+/// 300 bytes each would show as 90 kB)
+fn fork_exec_objects() {
+    const NAME: &[u8] = b"MM_LIFE_FORK_EXEC_OBJS";
+    const N: i64 = 300;
+    for _ in 0..20 {
+        fork_exec();
+    }
+    settle();
+    let (d0, s0) = (live_dentries(), meminfo(b"Slab:"));
+    for _ in 0..N {
+        if !fork_exec() {
+            report(NAME, false, -2);
+            return;
+        }
+    }
+    let mut ok = false;
+    let (mut d1, mut s1) = (0, 0);
+    // Deferred frees (exited tasks' stacks, Linux RCU) may lag a little
+    for _ in 0..20 {
+        settle();
+        (d1, s1) = (live_dentries(), meminfo(b"Slab:"));
+        ok = d0 > 0 && s0 > 0 && d1 - d0 <= 5 && s1 - s0 <= 64;
+        if ok {
+            break;
+        }
+    }
+    if !ok {
+        print(NAME);
+        print(b": dentries ");
+        print_num(d0);
+        print(b" -> ");
+        print_num(d1);
+        print(b", Slab kB ");
+        print_num(s0);
+        print(b" -> ");
+        print_num(s1);
+        print(b" over ");
+        print_num(N);
+        println(b" fork+exec");
+    }
+    report(NAME, ok, s1 - s0);
 }

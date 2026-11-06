@@ -615,10 +615,7 @@ free memory is near the low watermark).
 exec maps PT_LOAD segments from the page cache, except a static PIE
 with no interpreter (hk relocates it in the kernel, so its pages are
 private copies; Linux applies no relocations at all) and the partial
-last page and bss of each segment (copied). Kernel object leaks cost free
-memory: each fork+exec keeps two dentries and two inodes plus ~900
-bytes of kmalloc. The MM_LIFE tests count MemFree + Slab so they check user memory only; these leaks
-are listed here instead.
+last page and bss of each segment (copied).
 
 ## The memory cgroup's memory.max is not enforced
 
