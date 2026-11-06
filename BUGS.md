@@ -174,10 +174,8 @@ Missing:
 - shmat checks RLIMIT_AS before SHM_REMAP unmaps the old
   range, and an address that SHM_RND rounds to 0 is EPERM (Linux picks
   an address).
-- vm.max_map_count is enforced for mmap, brk, munmap and MAP_FIXED
-  holes, mprotect, madvise and mremap, not for the splits of mlock
-  (Linux mlock_fixup fails with ENOMEM there). A locked mapping grown
-  by mremap is not faulted in (Linux populates it).
+- A locked mapping grown by mremap is not faulted in (Linux populates
+  it).
 
 ## NUMA gaps
 

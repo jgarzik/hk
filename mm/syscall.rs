@@ -765,7 +765,7 @@ fn mlock_vmas(
     while addr < end {
         let i = mm.find_vma_index(addr).ok_or(KernelError::OutOfMemory)?;
         let e = mm.get_vma(i).map_or(end, |v| v.end.min(end));
-        mlock_fixup(mm, i, addr, e, vm_flags);
+        mlock_fixup(mm, i, addr, e, vm_flags)?;
         addr = e;
     }
     Ok(())
@@ -773,19 +773,26 @@ fn mlock_vmas(
 
 /// [start, end) of the VMA at `idx` takes the lock flags `vm_flags`
 /// (Linux mlock_fixup): split off at the range edges, locked_vm
-/// counted, and merged with its neighbours. No change: no split.
-fn mlock_fixup(mm: &mut super::MmStruct, idx: usize, start: u64, end: u64, vm_flags: u32) {
+/// counted, and merged with its neighbours. No change: no split. A
+/// split at vm.max_map_count is ENOMEM (Linux vma_modify_flags).
+fn mlock_fixup(
+    mm: &mut super::MmStruct,
+    idx: usize,
+    start: u64,
+    end: u64,
+    vm_flags: u32,
+) -> Result<(), KernelError> {
     let Some(old) = mm.get_vma(idx).map(|v| v.flags) else {
-        return;
+        return Ok(());
     };
     let new = (old & !VM_LOCKED_MASK) | vm_flags;
     if new == old {
-        return;
+        return Ok(());
     }
-    mm.split_at(start);
-    mm.split_at(end);
+    mm.split_at_checked(start)?;
+    mm.split_at_checked(end)?;
     let Some(i) = mm.find_vma_exact(start) else {
-        return;
+        return Ok(());
     };
     mm.set_flags(i, new);
     let pages = (end - start) / PAGE_SIZE;
@@ -795,6 +802,7 @@ fn mlock_fixup(mm: &mut super::MmStruct, idx: usize, start: u64, end: u64, vm_fl
         _ => {}
     }
     mm.merge_adjacent(i);
+    Ok(())
 }
 
 /// munlock syscall - Unlock pages (Linux munlock): the range as mlock
