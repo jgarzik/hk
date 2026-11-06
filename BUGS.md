@@ -21,6 +21,19 @@ infallible, so each one is investigated, not written off.
   MADV_PAGEOUT of 16 MiB (beyond the test's tolerance), passing on the
   rerun. Linux's swap accounting after pageout is not exact (swap
   cache); the tolerance may need to grow on Linux.
+- **RLIMIT_CPU_XCPU flaky on the x86 Linux reference**: one uncached
+  `check-linux` run, run alongside `check-arm`, got `RLIMIT_CPU_XCPU:FAIL
+  got 9` (SIGKILL where SIGXCPU was expected first); passed on rerun.
+  Likely CPU-time accounting under a loaded host.
+
+## Seen on hk only
+
+- **MM_FAULT_STORM once under LOCKDEP**: one x86 `make check LOCKDEP=1`
+  run reported `MM_FAULT_STORM:FAIL got 0` (no wrong value: a thread did
+  not finish within the 60 s join); three later LOCKDEP runs (x86 twice,
+  arm64) passed. Either LOCKDEP slowness against the join timeout or a
+  missed wakeup on the contended mmap_lock; a recurrence should dump
+  the stuck threads' state.
 
 ## Safe kernel code that can cause UB (doc/UNSAFE.md)
 
