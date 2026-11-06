@@ -147,9 +147,9 @@ mod imp {
     fn key(l: Loc) -> u64 {
         let mut h = 0xcbf2_9ce4_8422_2325u64;
         for b in l.file().bytes() {
-            h = (h ^ b as u64).wrapping_mul(0x100_0000_01b3);
+            h = (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3);
         }
-        h ^ ((l.line() as u64) << 20) ^ l.column() as u64
+        h ^ (u64::from(l.line()) << 20) ^ u64::from(l.column())
     }
 
     fn slot(a: u64, b: u64) -> usize {

@@ -349,8 +349,8 @@ fn tlb_canary() -> Result<(), (&'static str, u64)> {
     };
     // SAFETY: fresh frames, through the direct map
     unsafe {
-        *(crate::arch::phys_to_virt(f1) as *mut u64) = OLD;
-        *(crate::arch::phys_to_virt(f2) as *mut u64) = NEW;
+        *crate::arch::phys_to_virt(f1).cast::<u64>() = OLD;
+        *crate::arch::phys_to_virt(f2).cast::<u64>() = NEW;
     }
     let r = canary_run(f1, f2, other);
     fa.free(f1);

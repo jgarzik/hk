@@ -270,16 +270,18 @@ info-arm: build-arm
 # Code quality targets
 # ============================================================================
 
-# Extra clippy args, e.g. CLIPPY_FLAGS="-D warnings" (CI)
+# Extra clippy args, e.g. CLIPPY_FLAGS="-D warnings" (CI); kernel
+# features to lint with, e.g. CLIPPY_FEATURES="--features lockdep"
 CLIPPY_FLAGS ?=
+CLIPPY_FEATURES ?=
 
 # Run clippy for x86-64 kernel (must specify target for no_std)
 clippy:
-	cargo clippy --target $(TARGET) -p hk-kernel -- $(CLIPPY_FLAGS)
+	cargo clippy --target $(TARGET) -p hk-kernel $(CLIPPY_FEATURES) -- $(CLIPPY_FLAGS)
 
 # Run clippy for aarch64 kernel
 clippy-arm: user-arm
-	cargo clippy --target $(TARGET_ARM) -p hk-kernel -- $(CLIPPY_FLAGS)
+	cargo clippy --target $(TARGET_ARM) -p hk-kernel $(CLIPPY_FEATURES) -- $(CLIPPY_FLAGS)
 
 # Format all code
 fmt:
