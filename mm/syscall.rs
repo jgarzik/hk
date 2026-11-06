@@ -1420,6 +1420,10 @@ pub fn sys_mremap(old_addr: u64, old_len: u64, new_len: u64, flags: u32, new_add
         {
             #[cfg(feature = "mmcheck")]
             super::check::verify(&mm_guard, mm.pgd(), "mremap expand");
+            drop(mm_guard);
+            if locked {
+                populate_grown(old_addr, old_len, new_len_aligned);
+            }
             return old_addr as i64;
         }
         if !may_move {
@@ -1460,7 +1464,19 @@ pub fn sys_mremap(old_addr: u64, old_len: u64, new_len: u64, flags: u32, new_add
     super::check::verify(&mm_guard, mm.pgd(), "mremap move");
     drop(mm_guard);
     drop(gone);
+    if locked {
+        populate_grown(target, old_len, new_len_aligned);
+    }
     target as i64
+}
+
+/// A locked mapping that mremap grew at `addr` from `old_len` to
+/// `new_len` has its added part faulted in, mm lock dropped (Linux
+/// mremap: mm_populate of the new range; a failure is not reported)
+fn populate_grown(addr: u64, old_len: u64, new_len: u64) {
+    if new_len > old_len {
+        let _ = populate_range(addr + old_len, new_len - old_len, true);
+    }
 }
 
 /// `bytes` more of locked memory fit RLIMIT_MEMLOCK (or the task has

@@ -174,8 +174,6 @@ Missing:
 - shmat checks RLIMIT_AS before SHM_REMAP unmaps the old
   range, and an address that SHM_RND rounds to 0 is EPERM (Linux picks
   an address).
-- A locked mapping grown by mremap is not faulted in (Linux populates
-  it).
 
 ## NUMA gaps
 
