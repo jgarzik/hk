@@ -50,14 +50,21 @@ pub const MCL_ONFAULT: i32 = 4;
 /// Address of mapping on success, negative errno on failure
 /// File checks of do_mmap (Linux): the file must be readable, and a
 /// shared writable mapping needs it open for writing and not
-/// append-only (EACCES)
+/// append-only (EACCES), and not an active swap file (ETXTBSY)
 fn file_prot_ok(f: &File, prot: u32, shared: bool) -> Result<(), KernelError> {
     use crate::fs::flags::O_APPEND;
     if !f.is_readable() {
         return Err(KernelError::PermissionDenied);
     }
-    if shared && prot & PROT_WRITE != 0 && (!f.is_writable() || f.get_flags() & O_APPEND != 0) {
-        return Err(KernelError::PermissionDenied);
+    if shared && prot & PROT_WRITE != 0 {
+        if !f.is_writable() || f.get_flags() & O_APPEND != 0 {
+            return Err(KernelError::PermissionDenied);
+        }
+        if f.mapping_inode()
+            .is_some_and(|i| i.i_swapfile.load(core::sync::atomic::Ordering::Acquire))
+        {
+            return Err(KernelError::TextBusy);
+        }
     }
     Ok(())
 }

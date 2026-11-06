@@ -400,6 +400,17 @@ fn file_page(
         Err(e) => return Some(Err(e)),
     };
     paging::sync_page(page, exec);
+    if area.shared && area.prot & PROT_WRITE != 0 && inode.i_swapfile.load(Ordering::Acquire) {
+        // An active swap file is written only by swap: a write through
+        // a mapping made before swapon is SIGBUS (Linux
+        // do_page_mkwrite), a read maps the page read-only
+        if access == Access::Write {
+            super::page::unlock_page(page);
+            super::filemap::put_page(page);
+            return Some(Err(VmFault::Bus));
+        }
+        return Some(Ok((page, true, true)));
+    }
     if area.shared {
         if area.prot & PROT_WRITE != 0 {
             super::filemap::dirty_page(&inode.i_data, page);

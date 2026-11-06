@@ -631,6 +631,7 @@ fn vfat_swapfile() {
     let path = b"/mnt/vd1/SWAP.BIN\0";
     let mut got = [0i64; 3];
     let mut busy = [0i64; 4];
+    let mut map = [0i64; 3];
     for (i, last) in [0u32, 0x7fff_ffff, 255].into_iter().enumerate() {
         let fd = sys_open(path.as_ptr(), O_RDWR | O_CREAT, 0o600) as i32;
         let mut hdr = [0u8; 4096];
@@ -641,11 +642,28 @@ fn vfat_swapfile() {
             sys_pwrite64(fd, hdr.as_ptr(), 4096, 0) == 4096 && sys_ftruncate(fd, 256 * 4096) == 0;
         sys_fsync(fd);
         sys_close(fd as u64);
+        // A shared writable mapping made before swapon
+        let rw = sys_open(path.as_ptr(), O_RDWR, 0) as i32;
+        let early = hk_syscall::sys_mmap(
+            0,
+            4096,
+            hk_syscall::PROT_READ | hk_syscall::PROT_WRITE,
+            hk_syscall::MAP_SHARED,
+            rw,
+            4096,
+        );
         got[i] = if ok {
             sys_swapon(path.as_ptr(), 0)
         } else {
             -1000
         };
+        if got[i] == 0 {
+            map = swapfile_map(rw, early);
+        }
+        if early > 0 {
+            hk_syscall::sys_munmap(early as u64, 4096);
+        }
+        sys_close(rw as u64);
         if got[i] == 0 {
             // Active: no write, truncate (also by O_TRUNC) or unlink
             // (Linux IS_SWAPFILE: ETXTBSY, EPERM for unlink)
@@ -670,6 +688,47 @@ fn vfat_swapfile() {
         busy == [-26, -26, -26, -1],
         busy[0] * 1000 + busy[1] * 100 + busy[2] * 10 + busy[3],
     );
+    // mmap shared writable and copy_file_range into it are ETXTBSY; a
+    // write through a mapping made before swapon is SIGBUS (Linux
+    // do_mmap, generic_copy_file_checks, do_page_mkwrite)
+    verdict(
+        b"VFAT_SWAPFILE_MAP",
+        map == [-26, -26, 0x100 + 7],
+        map[0] * 1_000_000 + map[1] * 1000 + map[2],
+    );
+}
+
+/// On an active swap file open read-write as `rw` with `early` mapped
+/// shared writable before swapon: [mmap shared writable, copy_file_range
+/// into it, how a child writing `early` ends (0x100 + signal)]
+fn swapfile_map(rw: i32, early: i64) -> [i64; 3] {
+    use hk_syscall::{MAP_SHARED, PROT_READ, PROT_WRITE};
+    let m = hk_syscall::sys_mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, rw, 0);
+    if m > 0 {
+        hk_syscall::sys_munmap(m as u64, 4096);
+    }
+    let src = sys_open(b"/mnt/vd1/CFR.SRC\0".as_ptr(), O_RDWR | O_CREAT, 0o600) as i32;
+    sys_pwrite64(src, b"y".as_ptr(), 1, 0);
+    let mut off: u64 = 8192;
+    let c = hk_syscall::sys_copy_file_range(src, core::ptr::null_mut(), rw, &mut off, 1, 0);
+    sys_close(src as u64);
+    sys_unlink(b"/mnt/vd1/CFR.SRC\0".as_ptr());
+    let mut child = -1;
+    if early > 0 {
+        let pid = hk_syscall::sys_fork();
+        if pid == 0 {
+            unsafe { core::ptr::write_volatile(early as *mut u8, 1) };
+            hk_syscall::sys_exit(0);
+        }
+        let mut st = 0i32;
+        hk_syscall::sys_wait4(pid, &mut st, 0, 0);
+        child = if st & 0x7f != 0 {
+            0x100 + i64::from(st & 0x7f)
+        } else {
+            i64::from(st >> 8)
+        };
+    }
+    [if m > 0 { 0 } else { m }, c, child]
 }
 
 /// A shared mapping of a vfat file is its page cache (Linux
