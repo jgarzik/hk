@@ -18,8 +18,10 @@ use hk_syscall::{
 };
 
 const MP: &[u8] = b"/tmp/fst\0";
-/// The time every case starts from: 1000 s after the epoch
-const OLD: i64 = 1000;
+/// The time every case starts from: 1 s after the epoch (a guest
+/// without an RTC starts its clock at the epoch, so "now" may be only
+/// seconds past it)
+const OLD: i64 = 1;
 
 pub fn run_tests() {
     sys_mkdir(b"/tmp\0".as_ptr(), 0o1777);
@@ -118,7 +120,7 @@ fn data() {
 /// ctime of `p` as (seconds, nanoseconds)
 fn ctime(p: &[u8]) -> (i64, i64) {
     let st = lstat(p);
-    (st.st_ctime, st.st_ctime_nsec)
+    (st.st_ctime, st.st_ctime_nsec as i64)
 }
 
 /// Sleep 20 ms: more than a coarse clock tick, so a new ctime differs
