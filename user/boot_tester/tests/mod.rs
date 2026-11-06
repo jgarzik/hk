@@ -111,6 +111,7 @@ pub mod posix_lock;
 pub mod posix_timer;
 pub mod prctl;
 pub mod prctl_extra;
+pub mod pread_special;
 pub mod preempt;
 pub mod proc_dcache;
 pub mod proc_hidepid;
@@ -245,6 +246,7 @@ pub fn run_all_tests() {
     isolated(b"EXEC_RACE", exec_race::run_tests);
     isolated(b"PROCFS_ACCESS", procfs_access::run_tests);
     proc_hidepid::run_tests();
+    pread_special::run_tests();
     isolated(b"PTRACE_ACCESS", ptrace_access::run_tests);
     isolated(b"PROC_PID", proc_pid::run_tests);
     isolated(b"NPROC", nproc::run_tests);

@@ -1405,8 +1405,17 @@ impl FileOps for ProcfsFileOps {
         if rw.nowait {
             return Err(KernelError::OperationNotSupported);
         }
-        let content = proc_content(file)?;
         let pos = at.unwrap_or_else(|| file.get_pos());
+        // A numeric sysctl reads only from offset 0 (Linux
+        // do_proc_dointvec: *ppos on a read is EOF); a text one from
+        // any (proc_dostring)
+        if pos != 0
+            && let Some(inode) = file.get_inode()
+            && sysctl_of(&inode).is_some_and(|c| c.text.is_none())
+        {
+            return Ok(0);
+        }
+        let content = proc_content(file)?;
         let n = match usize::try_from(pos).ok().and_then(|p| content.get(p..)) {
             Some(rest) if !rest.is_empty() => to.copy_to(rest)?,
             _ => 0,
@@ -1417,8 +1426,9 @@ impl FileOps for ProcfsFileOps {
         Ok(n)
     }
 
-    /// Writes reach /proc/sys files only, at the file position: one
-    /// store of at most `WRITE_CHUNK` bytes
+    /// Writes reach /proc/sys files only, at `at` or the file position
+    /// (Linux proc_sys_write: iocb->ki_pos): one store of at most
+    /// `WRITE_CHUNK` bytes
     fn write_iter(
         &self,
         file: &File,
@@ -1426,7 +1436,7 @@ impl FileOps for ProcfsFileOps {
         at: Option<u64>,
         rw: RwFlags,
     ) -> Result<usize, KernelError> {
-        if rw.nowait || at.is_some() {
+        if rw.nowait {
             return Err(KernelError::OperationNotSupported);
         }
         let inode = file.get_inode().ok_or(KernelError::BadFd)?;
@@ -1438,8 +1448,10 @@ impl FileOps for ProcfsFileOps {
         let mut buf = crate::util::kmem::try_vec(from.len().min(WRITE_CHUNK), 0u8)?;
         // Whole or EFAULT (Linux proc_sys_call_handler)
         from.copy_from_full(&mut buf)?;
-        let n = crate::sysctl::write(ctl, &buf, file.get_pos())?;
-        file.advance_pos(n as u64);
+        let n = crate::sysctl::write(ctl, &buf, at.unwrap_or_else(|| file.get_pos()))?;
+        if at.is_none() {
+            file.advance_pos(n as u64);
+        }
         Ok(n)
     }
 

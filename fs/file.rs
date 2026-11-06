@@ -836,7 +836,8 @@ impl FileOps for CharDevFileOps {
         }
     }
 
-    /// No positioned I/O (ESPIPE from pread) and no RWF_NOWAIT
+    /// Positioned I/O only for a positional device (else ESPIPE from
+    /// pread), no RWF_NOWAIT
     fn read_iter(
         &self,
         file: &File,
@@ -844,13 +845,14 @@ impl FileOps for CharDevFileOps {
         at: Option<u64>,
         flags: RwFlags,
     ) -> Result<usize, KernelError> {
-        if at.is_some() || flags.nowait {
+        let dev = Self::dev(file)?;
+        if (at.is_some() && !dev.positional()) || flags.nowait {
             return Err(KernelError::OperationNotSupported);
         }
-        Self::dev(file)?.read(file, to)
+        dev.read(file, to)
     }
 
-    /// No positioned I/O (ESPIPE from pwrite) and no RWF_NOWAIT
+    /// As read_iter (ESPIPE from pwrite for a stream)
     fn write_iter(
         &self,
         file: &File,
@@ -858,15 +860,16 @@ impl FileOps for CharDevFileOps {
         at: Option<u64>,
         flags: RwFlags,
     ) -> Result<usize, KernelError> {
-        if at.is_some() || flags.nowait {
+        let dev = Self::dev(file)?;
+        if (at.is_some() && !dev.positional()) || flags.nowait {
             return Err(KernelError::OperationNotSupported);
         }
-        Self::dev(file)?.write(file, from)
+        dev.write(file, from)
     }
 
-    fn llseek(&self, _file: &File, _offset: i64, _whence: i32) -> Result<u64, KernelError> {
-        // Most character devices don't support seeking
-        Err(KernelError::InvalidArgument)
+    /// The device's (Linux: ESPIPE without f_op->llseek)
+    fn llseek(&self, file: &File, offset: i64, whence: i32) -> Result<u64, KernelError> {
+        Self::dev(file)?.llseek(file, offset, whence)
     }
 
     fn ioctl(&self, file: &File, cmd: u32, arg: u64) -> Result<i64, KernelError> {

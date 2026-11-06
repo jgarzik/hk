@@ -148,6 +148,19 @@ pub trait CharDevice: Send + Sync {
     /// Write `from` to the device (Linux f_op->write_iter)
     fn write(&self, file: &File, from: &mut IovSource<'_>) -> Result<usize, KernelError>;
 
+    /// pread/pwrite reach `read`/`write`, which ignore the position
+    /// (Linux: FMODE_PREAD/PWRITE kept, no stream_open). Default no:
+    /// ESPIPE, as a stream.
+    fn positional(&self) -> bool {
+        false
+    }
+
+    /// lseek (Linux f_op->llseek). Default none: ESPIPE.
+    fn llseek(&self, file: &File, offset: i64, whence: i32) -> Result<u64, KernelError> {
+        let _ = (file, offset, whence);
+        Err(KernelError::OperationNotSupported)
+    }
+
     /// The device can be mapped (Linux: its fops have mmap)
     fn mmap_ok(&self) -> bool {
         false
@@ -268,6 +281,16 @@ impl CharDevice for NullCharDevice {
         "null"
     }
 
+    fn positional(&self) -> bool {
+        true
+    }
+
+    /// Linux null_lseek: the position is always 0
+    fn llseek(&self, file: &File, _offset: i64, _whence: i32) -> Result<u64, KernelError> {
+        file.set_pos(0);
+        Ok(0)
+    }
+
     fn read(&self, _file: &File, _to: &mut IovDest<'_>) -> Result<usize, KernelError> {
         Ok(0) // EOF
     }
@@ -307,6 +330,16 @@ impl CharDevice for ZeroCharDevice {
         "zero"
     }
 
+    fn positional(&self) -> bool {
+        true
+    }
+
+    /// Linux null_lseek: the position is always 0
+    fn llseek(&self, file: &File, _offset: i64, _whence: i32) -> Result<u64, KernelError> {
+        file.set_pos(0);
+        Ok(0)
+    }
+
     /// Linux mmap_zero: private zero pages, or shared anonymous memory
     fn mmap_ok(&self) -> bool {
         true
@@ -334,6 +367,16 @@ impl CharDevice for FullCharDevice {
         "full"
     }
 
+    fn positional(&self) -> bool {
+        true
+    }
+
+    /// Linux null_lseek: the position is always 0
+    fn llseek(&self, file: &File, _offset: i64, _whence: i32) -> Result<u64, KernelError> {
+        file.set_pos(0);
+        Ok(0)
+    }
+
     fn read(&self, _file: &File, to: &mut IovDest<'_>) -> Result<usize, KernelError> {
         read_zero(to)
     }
@@ -351,6 +394,15 @@ pub struct RandomCharDevice(&'static str);
 impl CharDevice for RandomCharDevice {
     fn name(&self) -> &str {
         self.0
+    }
+
+    fn positional(&self) -> bool {
+        true
+    }
+
+    /// Linux noop_llseek: the position stays
+    fn llseek(&self, file: &File, _offset: i64, _whence: i32) -> Result<u64, KernelError> {
+        Ok(file.get_pos())
     }
 
     /// Straight from the CRNG stream (no lock held) to `to`

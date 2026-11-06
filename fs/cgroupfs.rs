@@ -613,8 +613,9 @@ impl FileOps for CgroupfsFileOps {
         self
     }
 
-    /// Generate the content and copy it from the file position on; no
-    /// positioned reads, no FMODE_NOWAIT (EOPNOTSUPP)
+    /// Generate the content and copy it from `at` or the file position
+    /// on (Linux kernfs_fop_read_iter: iocb->ki_pos); no FMODE_NOWAIT
+    /// (EOPNOTSUPP)
     fn read_iter(
         &self,
         file: &File,
@@ -622,31 +623,33 @@ impl FileOps for CgroupfsFileOps {
         at: Option<u64>,
         rw: RwFlags,
     ) -> Result<usize, KernelError> {
-        if rw.nowait || at.is_some() {
+        if rw.nowait {
             return Err(KernelError::OperationNotSupported);
         }
         let content = cgroupfs_content(file)?;
-        let rest = usize::try_from(file.get_pos())
-            .ok()
-            .and_then(|p| content.get(p..));
+        let pos = at.unwrap_or_else(|| file.get_pos());
+        let rest = usize::try_from(pos).ok().and_then(|p| content.get(p..));
         let n = match rest {
             Some(rest) if !rest.is_empty() => to.copy_to(rest)?,
             _ => 0,
         };
-        file.advance_pos(n as u64);
+        if at.is_none() {
+            file.advance_pos(n as u64);
+        }
         Ok(n)
     }
 
     /// One write handler call on at most `WRITE_CHUNK` bytes, copied in
-    /// before `CGROUP_MUTEX` is taken
+    /// before `CGROUP_MUTEX` is taken; the offset of a pwrite is ignored
+    /// (Linux cgroup_file_write)
     fn write_iter(
         &self,
         file: &File,
         from: &mut IovSource<'_>,
-        at: Option<u64>,
+        _at: Option<u64>,
         rw: RwFlags,
     ) -> Result<usize, KernelError> {
-        if rw.nowait || at.is_some() {
+        if rw.nowait {
             return Err(KernelError::OperationNotSupported);
         }
         let mut buf = crate::util::kmem::try_vec(from.len().min(WRITE_CHUNK), 0u8)?;
