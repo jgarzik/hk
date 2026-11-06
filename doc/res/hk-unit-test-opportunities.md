@@ -265,9 +265,6 @@ instance; "medium" = needs a small fixture or cfg(test) shim.
 - **cgroup knob writers** (`cgroup/cpu.rs:289`, `cgroup/pids.rs:241`, memory.max): parse
   inline on a `CgroupSubsysState`; a `parse_max_u64(&str) -> Result<Option<u64>>`
   shared helper is both testable and removes duplication.
-- **/proc/pid/stat and status** (`fs/proc/array.rs:271,378`): gathering (`snap`) and
-  formatting are interleaved; format from a `Snap` value so field order/count (52 stat
-  fields, `State:` strings, `Sig*` hex masks) is pinned against Linux.
 - **ramfs fixture**: a test helper that builds a ramfs superblock and root dentry would
   unlock `fs/cpio.rs` `unpack_cpio` (hard links, overwrite rules), `fs/dac.rs` inode
   checks, and parts of namei (`walk`, `follow_dotdot`) if `FsStruct` root can be

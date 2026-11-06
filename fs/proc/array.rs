@@ -386,7 +386,19 @@ pub fn gen_stat(pid: Pid) -> Vec<u8> {
     let permitted = crate::task::ptrace::may_read_task(s.tid);
     let v = task_vm(s.tid);
     drop(guard);
-    let (ign, cgt) = ign_cgt(&s);
+    fmt_stat(&s, v.as_ref(), permitted, ign_cgt(&s), rss_lim(&s))
+}
+
+/// The /proc/<pid>/stat line from what `gen_stat` gathered: 52 fields
+/// in Linux do_task_stat's order; without ptrace-read access the code,
+/// stack and argument addresses read as 0 (start/end_code 1)
+fn fmt_stat(
+    s: &Snap,
+    v: Option<&VmStat>,
+    permitted: bool,
+    (ign, cgt): (u64, u64),
+    rlim: u64,
+) -> Vec<u8> {
     let ticks = crate::time::ns_to_clock_t;
     let rt = s.policy == crate::task::SCHED_FIFO || s.policy == crate::task::SCHED_RR;
     let prio = if rt { -1 - s.rt_priority } else { 20 + s.nice };
@@ -395,8 +407,8 @@ pub fn gen_stat(pid: Pid) -> Vec<u8> {
     let wchan = u8::from(permitted && s.threads < 2 && !running);
     let mut o = Out(Vec::new());
     let _ = write!(o, "{} (", s.pid);
-    o.0.extend_from_slice(&comm(&s, false));
-    let _ = write!(o, ") {} ", state(&s).0);
+    o.0.extend_from_slice(&comm(s, false));
+    let _ = write!(o, ") {} ", state(s).0);
     let _ = write!(o, "{} {} {} 0 -1 {} ", s.ppid, s.pgid, s.sid, flags);
     let _ = write!(o, "{} 0 {} 0 ", s.min_flt, s.maj_flt);
     let _ = write!(
@@ -408,10 +420,10 @@ pub fn gen_stat(pid: Pid) -> Vec<u8> {
         ticks(s.cstime)
     );
     let _ = write!(o, "{} {} {} 0 {} ", prio, s.nice, s.threads, ticks(s.start));
-    let (vsize, rss) = v.as_ref().map_or((0, 0), |v| (v.total * 4096, v.rss));
-    let _ = write!(o, "{} {} {} ", vsize, rss, rss_lim(&s));
+    let (vsize, rss) = v.map_or((0, 0), |v| (v.total * 4096, v.rss));
+    let _ = write!(o, "{vsize} {rss} {rlim} ");
     let code = |x: u64| if permitted { x } else { 1 };
-    let (sc, ec, ss) = match &v {
+    let (sc, ec, ss) = match v {
         Some(v) => (
             code(v.lay.start_code),
             code(v.lay.end_code),
@@ -431,7 +443,7 @@ pub fn gen_stat(pid: Pid) -> Vec<u8> {
     );
     let _ = write!(o, "{wchan} 0 0 {} {} ", s.exit_signal, s.cpu);
     let _ = write!(o, "{} {} 0 0 0", s.rt_priority, s.policy);
-    match &v {
+    match v {
         Some(v) if permitted => {
             let a = &v.lay;
             let _ = write!(
@@ -507,4 +519,110 @@ pub fn gen_environ(mm: &Mm) -> Result<Vec<u8>, KernelError> {
         return Ok(Vec::new());
     }
     Ok(read_remote(mm, a.env_start, a.env_end))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A test task (its Arc fields None); never dropped, so the host
+    /// test does not link the drop paths of the signal and fd tables
+    fn snap_of(comm: &[u8]) -> core::mem::ManuallyDrop<Snap> {
+        let mut c = [0u8; 16];
+        c[..comm.len()].copy_from_slice(comm);
+        core::mem::ManuallyDrop::new(Snap {
+            pid: 42,
+            tid: 42,
+            tgid: 42,
+            ppid: 1,
+            pgid: 40,
+            sid: 30,
+            comm: c,
+            state: TaskState::Sleeping,
+            cred: Cred::ROOT,
+            kthread: false,
+            exiting: false,
+            utime: 2_000_000_000,
+            stime: 1_000_000_000,
+            cutime: 0,
+            cstime: 0,
+            start: 5_000_000_000,
+            nvcsw: 0,
+            nivcsw: 0,
+            min_flt: 7,
+            maj_flt: 3,
+            nice: 5,
+            policy: 0,
+            rt_priority: 0,
+            cpus: crate::util::cpumask::CpuSet::new(),
+            cpu: 2,
+            exit_signal: 17,
+            exit_code: 0,
+            threads: 1,
+            tracer: 0,
+            no_new_privs: false,
+            seccomp: 0,
+            blocked: 1 << 1,
+            pending: 0,
+            shared: None,
+            sighand: None,
+            signal: None,
+            fs: None,
+            files: None,
+        })
+    }
+
+    /// The fields after the comm's closing ')', 1-based from field 3
+    fn fields(line: &[u8]) -> Vec<&[u8]> {
+        let close = line.iter().rposition(|&b| b == b')').unwrap();
+        line[close + 2..]
+            .strip_suffix(b"\n")
+            .unwrap()
+            .split(|&b| b == b' ')
+            .collect()
+    }
+
+    /// 52 fields in Linux do_task_stat's order; a comm with spaces and
+    /// parentheses stays one field, found by the last ')'
+    #[test]
+    fn stat_fields() {
+        let s = snap_of(b"a) (b c");
+        let mut v = VmStat {
+            total: 10,
+            rss: 4,
+            ..VmStat::default()
+        };
+        v.lay.start_code = 0x40_0000;
+        let line = fmt_stat(&s, Some(&v), true, (1 << 12, 1 << 14), 99);
+        assert!(line.starts_with(b"42 (a) (b c) S "));
+        let f = fields(&line);
+        assert_eq!(f.len(), 52 - 2);
+        let at = |n: usize| core::str::from_utf8(f[n - 3]).unwrap();
+        assert_eq!((at(4), at(5), at(6)), ("1", "40", "30"));
+        assert_eq!((at(10), at(12)), ("7", "3"));
+        assert_eq!((at(14), at(15)), ("200", "100"));
+        assert_eq!((at(18), at(19), at(20)), ("25", "5", "1"));
+        assert_eq!(at(22), "500");
+        assert_eq!((at(23), at(24), at(25)), ("40960", "4", "99"));
+        assert_eq!(at(26), "4194304");
+        assert_eq!((at(32), at(33), at(34)), ("2", "4096", "16384"));
+        assert_eq!((at(38), at(39)), ("17", "2"));
+        assert_eq!(at(52), "0");
+    }
+
+    /// Without ptrace-read access the code range reads as 1, the stack
+    /// and argument addresses as 0 (Linux do_task_stat !permitted)
+    #[test]
+    fn stat_hides_addresses() {
+        let mut v = VmStat::default();
+        v.lay.start_code = 0x40_0000;
+        v.lay.start_stack = 0x7fff_0000;
+        v.lay.arg_start = 0x7fff_1000;
+        let line = fmt_stat(&snap_of(b"x"), Some(&v), false, (0, 0), 0);
+        let f = fields(&line);
+        assert_eq!(f.len(), 50);
+        let at = |n: usize| f[n - 3];
+        assert_eq!((at(26), at(27), at(28)), (&b"1"[..], &b"1"[..], &b"0"[..]));
+        assert!((45..=51).all(|n| at(n) == b"0"));
+    }
 }
