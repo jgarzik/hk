@@ -28,7 +28,8 @@ use alloc::sync::Arc;
 
 use crate::arch::IrqSpinlock;
 use crate::fs::KernelError;
-use crate::fs::file::{File, FileOps, flags};
+use crate::fs::file::{File, FileOps, RwFlags, flags, stream_rw};
+use crate::fs::iov_iter::{IovDest, IovSource};
 use crate::io::poll::{POLLERR, POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM, PollTable};
 use crate::sync::waitqueue::WaitQueue;
 
@@ -173,6 +174,10 @@ impl Eventfd {
 /// File operations for eventfd
 pub struct EventfdFileOps;
 
+fn nonblock(file: &File) -> bool {
+    file.get_flags() & flags::O_NONBLOCK != 0
+}
+
 static EVENTFD_FOPS: EventfdFileOps = EventfdFileOps;
 
 impl FileOps for EventfdFileOps {
@@ -180,35 +185,41 @@ impl FileOps for EventfdFileOps {
         self
     }
 
-    fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {
+    /// One counter read, 8 bytes; a smaller buffer is EINVAL. The
+    /// counter is taken under the lock and copied out after it.
+    fn read_iter(
+        &self,
+        file: &File,
+        to: &mut IovDest<'_>,
+        at: Option<u64>,
+        flags: RwFlags,
+    ) -> Result<usize, KernelError> {
+        stream_rw(at, flags)?;
         let eventfd = file.private_ref::<Eventfd>().ok_or(KernelError::BadFd)?;
-        // eventfd read always returns 8 bytes (u64)
-        if buf.len() < 8 {
+        if to.len() < 8 {
             return Err(KernelError::InvalidArgument);
         }
-
-        let nonblock = file.get_flags() & flags::O_NONBLOCK != 0;
-        let count = eventfd.read(nonblock)?;
-
-        // Write u64 to buffer (little-endian)
-        buf[0..8].copy_from_slice(&count.to_le_bytes());
+        let count = eventfd.read(nonblock(file))?;
+        to.copy_to_full(&count.to_le_bytes())?;
         Ok(8)
     }
 
-    fn write(&self, file: &File, buf: &[u8]) -> Result<usize, KernelError> {
+    /// Add the first 8 bytes to the counter; fewer is EINVAL
+    fn write_iter(
+        &self,
+        file: &File,
+        from: &mut IovSource<'_>,
+        at: Option<u64>,
+        flags: RwFlags,
+    ) -> Result<usize, KernelError> {
+        stream_rw(at, flags)?;
         let eventfd = file.private_ref::<Eventfd>().ok_or(KernelError::BadFd)?;
-        // eventfd write requires exactly 8 bytes (u64)
-        if buf.len() < 8 {
+        if from.len() < 8 {
             return Err(KernelError::InvalidArgument);
         }
-
-        // Read u64 from buffer (little-endian)
-        let value = u64::from_le_bytes([
-            buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
-        ]);
-
-        let nonblock = file.get_flags() & flags::O_NONBLOCK != 0;
-        eventfd.write(value, nonblock)
+        let mut v = [0u8; 8];
+        from.copy_from_full(&mut v)?;
+        eventfd.write(u64::from_le_bytes(v), nonblock(file))
     }
 
     fn poll(&self, file: &File, pt: Option<&mut PollTable<'_>>) -> u16 {

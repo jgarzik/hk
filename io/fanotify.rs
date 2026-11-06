@@ -26,7 +26,6 @@
 //! - Events can include fd to the affected file
 //! - Support for permission events (blocking operations pending user decision)
 //! - Multiple marks per fanotify instance
-#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use crate::util::kalloc::try_arc;
 use alloc::collections::BTreeMap;
@@ -36,9 +35,11 @@ use alloc::vec::Vec;
 
 use crate::arch::IrqSpinlock;
 use crate::fs::KernelError;
-use crate::fs::file::{File, FileOps, flags};
+use crate::fs::file::{File, FileOps, RwFlags, flags, stream_rw};
+use crate::fs::iov_iter::{IovDest, IovSource};
 use crate::io::poll::{POLLIN, POLLRDNORM, PollTable};
 use crate::sync::waitqueue::WaitQueue;
+use crate::util::pod::IntoBytes;
 
 // =============================================================================
 // Fanotify Init Flags (Linux ABI)
@@ -223,6 +224,16 @@ pub struct FanotifyEventMetadata {
     /// PID of process causing the event
     pub pid: i32,
 }
+
+crate::pod!(FanotifyEventMetadata {
+    event_len,
+    vers,
+    reserved,
+    metadata_len,
+    mask,
+    fd,
+    pid
+});
 
 /// Metadata version
 pub const FANOTIFY_METADATA_VERSION: u8 = 3;
@@ -424,13 +435,9 @@ impl Fanotify {
         !self.inner.lock().events.is_empty()
     }
 
-    /// Read events from the fanotify instance
-    pub fn read(&self, buf: &mut [u8], nonblock: bool) -> Result<usize, KernelError> {
-        // Buffer must be at least big enough for one event
-        if buf.len() < FANOTIFY_METADATA_SIZE {
-            return Err(KernelError::InvalidArgument);
-        }
-
+    /// The oldest event if it fits in `room` bytes (EINVAL if not),
+    /// waiting for one unless `nonblock` (Linux get_one_event)
+    fn get_event(&self, room: usize, nonblock: bool) -> Result<FanotifyEvent, KernelError> {
         let mut inner = self.inner.lock();
         if inner.events.is_empty() {
             if nonblock {
@@ -440,25 +447,29 @@ impl Fanotify {
             self.wait_queue
                 .wait_event_interruptible_locked(&mut inner, |i| !i.events.is_empty())?;
         }
-        let mut bytes_written = 0;
+        if inner.events[0].serialized_size() > room {
+            return Err(KernelError::InvalidArgument);
+        }
+        Ok(inner.events.remove(0))
+    }
 
-        // Copy as many events as will fit
-        while !inner.events.is_empty() {
-            let event = &inner.events[0];
-            let event_size = event.serialized_size();
-
-            if bytes_written + event_size > buf.len() {
-                if bytes_written == 0 {
-                    // First event doesn't fit
-                    return Err(KernelError::InvalidArgument);
-                }
-                break;
-            }
-
-            // Remove event from queue
-            let event = inner.events.remove(0);
-
-            // Create metadata structure
+    /// Read events into `to` (Linux fanotify_read): each is taken off
+    /// the queue under the lock and copied out after it. Blocks only
+    /// while nothing was read; a first event too big for the buffer is
+    /// EINVAL. A fault loses the event and is EFAULT even after earlier
+    /// events were copied (Linux).
+    pub fn read(&self, to: &mut IovDest<'_>, nonblock: bool) -> Result<usize, KernelError> {
+        // Buffer must be at least big enough for one event
+        if to.len() < FANOTIFY_METADATA_SIZE {
+            return Err(KernelError::InvalidArgument);
+        }
+        let mut done = 0;
+        loop {
+            let event = match self.get_event(to.len(), nonblock || done > 0) {
+                Ok(e) => e,
+                Err(_) if done > 0 => return Ok(done),
+                Err(e) => return Err(e),
+            };
             // Note: In a full implementation, we would open the file here
             // and pass the fd. For now, we pass -1 (FAN_NOFD equivalent).
             let metadata = FanotifyEventMetadata {
@@ -470,20 +481,9 @@ impl Fanotify {
                 fd: -1, // FAN_NOFD - file descriptor not provided
                 pid: event.pid,
             };
-
-            // Copy metadata to buffer
-            let metadata_bytes = unsafe {
-                core::slice::from_raw_parts(
-                    (&raw const metadata).cast::<u8>(),
-                    FANOTIFY_METADATA_SIZE,
-                )
-            };
-            buf[bytes_written..bytes_written + FANOTIFY_METADATA_SIZE]
-                .copy_from_slice(metadata_bytes);
-            bytes_written += FANOTIFY_METADATA_SIZE;
+            to.copy_to_full(metadata.as_bytes())?;
+            done += FANOTIFY_METADATA_SIZE;
         }
-
-        Ok(bytes_written)
     }
 
     /// Poll for readiness
@@ -525,14 +525,29 @@ impl FileOps for FanotifyFileOps {
         self
     }
 
-    fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {
+    fn read_iter(
+        &self,
+        file: &File,
+        to: &mut IovDest<'_>,
+        at: Option<u64>,
+        flags: RwFlags,
+    ) -> Result<usize, KernelError> {
+        stream_rw(at, flags)?;
         let fanotify = file.private_ref::<Fanotify>().ok_or(KernelError::BadFd)?;
         let nonblock = file.get_flags() & flags::O_NONBLOCK != 0;
-        fanotify.read(buf, nonblock)
+        fanotify.read(to, nonblock)
     }
 
-    fn write(&self, _file: &File, _buf: &[u8]) -> Result<usize, KernelError> {
-        // TODO: Write is used for responding to permission events
+    /// A fanotify fd is not writable (TODO: write answers permission
+    /// events)
+    fn write_iter(
+        &self,
+        _file: &File,
+        _from: &mut IovSource<'_>,
+        at: Option<u64>,
+        flags: RwFlags,
+    ) -> Result<usize, KernelError> {
+        stream_rw(at, flags)?;
         Err(KernelError::InvalidArgument)
     }
 

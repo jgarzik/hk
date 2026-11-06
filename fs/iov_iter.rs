@@ -125,6 +125,15 @@ impl<'a> IovDest<'a> {
         Ok(n)
     }
 
+    /// Copy all of `data`, EFAULT if it does not fit or a fault cuts it
+    /// short (a record that must arrive whole: an event, a counter)
+    pub fn copy_to_full(&mut self, data: &[u8]) -> Result<(), KernelError> {
+        match self.copy_to(data)? {
+            n if n == data.len() => Ok(()),
+            _ => Err(KernelError::BadAddress),
+        }
+    }
+
     /// `n` zero bytes (a hole): as many as fit
     pub fn zero(&mut self, n: usize) -> Result<usize, KernelError> {
         const Z: [u8; 256] = [0; 256];
@@ -205,6 +214,15 @@ impl<'a> IovSource<'a> {
             return Err(KernelError::BadAddress);
         }
         Ok(n)
+    }
+
+    /// Fill all of `buf`, EFAULT if there is less data or a fault cuts
+    /// it short (Linux copy_from_iter_full)
+    pub fn copy_from_full(&mut self, buf: &mut [u8]) -> Result<(), KernelError> {
+        match self.copy_from(buf)? {
+            n if n == buf.len() => Ok(()),
+            _ => Err(KernelError::BadAddress),
+        }
     }
 }
 

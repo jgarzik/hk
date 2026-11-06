@@ -22,8 +22,9 @@ use core::sync::atomic::Ordering;
 
 use crate::arch::Uaccess;
 use crate::fs::dentry::Dentry;
-use crate::fs::file::{File, FileOps, flags as fflags};
+use crate::fs::file::{File, FileOps, RwFlags, flags as fflags, stream_rw};
 use crate::fs::inode::{AsAny, Inode, InodeData, InodeMode, NULL_INODE_OPS};
+use crate::fs::iov_iter::{IovDest, IovSource};
 use crate::io::poll::PollTable;
 use crate::net::msg::{Dst, MSG_DONTWAIT, MSG_NOSIGNAL, RecvMsg, SendMsg, Src};
 use crate::net::sock::{Sock, TIMEO_FOREVER, sf};
@@ -279,20 +280,41 @@ impl FileOps for SockFile {
         self
     }
 
-    fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {
+    /// recv(fd, buf, len, 0), the protocol copying straight into `to`
+    /// (Linux sock_read_iter)
+    fn read_iter(
+        &self,
+        file: &File,
+        to: &mut IovDest<'_>,
+        at: Option<u64>,
+        flags: RwFlags,
+    ) -> Result<usize, KernelError> {
+        stream_rw(at, flags)?;
         let s = sock_of(file).ok_or(KernelError::NotSocket)?;
-        let mut m = RecvMsg::new(Dst::Kern(buf), false, 0);
-        s.recvmsg(&mut m, file_nb(file, 0))
+        let mut m = RecvMsg::new(Dst::iter(to), false, 0);
+        let r = s.recvmsg(&mut m, file_nb(file, 0));
+        m.data.restore(to);
+        r
     }
 
-    fn write(&self, file: &File, buf: &[u8]) -> Result<usize, KernelError> {
+    /// send(fd, buf, len, 0), SIGPIPE included, the protocol copying
+    /// straight from `from` (Linux sock_write_iter)
+    fn write_iter(
+        &self,
+        file: &File,
+        from: &mut IovSource<'_>,
+        at: Option<u64>,
+        flags: RwFlags,
+    ) -> Result<usize, KernelError> {
+        stream_rw(at, flags)?;
         let s = sock_of(file).ok_or(KernelError::NotSocket)?;
         let mut m = SendMsg {
             addr: None,
-            data: Src::Kern(buf),
+            data: Src::iter(from),
             control: Vec::new(),
         };
         let r = sock_sendmsg(&*s, &mut m, file_nb(file, 0));
+        m.data.restore(from);
         crate::net::dev::netif_rx_flush_local();
         r
     }

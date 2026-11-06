@@ -45,8 +45,9 @@ use alloc::vec::Vec;
 
 use crate::arch::{IrqSpinlock, Uaccess};
 use crate::fs::KernelError;
-use crate::fs::file::{File, FileOps, flags};
+use crate::fs::file::{File, FileOps, RwFlags, flags, stream_rw};
 use crate::fs::iov::IoVec;
+use crate::fs::iov_iter::{IovDest, IovSource};
 use crate::io::pipe::FD_CLOEXEC;
 use crate::io::poll::PollTable;
 use crate::mm::PAGE_SIZE;
@@ -1246,13 +1247,27 @@ impl FileOps for IoUringFileOps {
         self
     }
 
-    fn read(&self, _file: &File, _buf: &mut [u8]) -> Result<usize, KernelError> {
-        // io_uring fds are not directly readable
+    /// An io_uring fd is not readable
+    fn read_iter(
+        &self,
+        _file: &File,
+        _to: &mut IovDest<'_>,
+        at: Option<u64>,
+        flags: RwFlags,
+    ) -> Result<usize, KernelError> {
+        stream_rw(at, flags)?;
         Err(KernelError::InvalidArgument)
     }
 
-    fn write(&self, _file: &File, _buf: &[u8]) -> Result<usize, KernelError> {
-        // io_uring fds are not directly writable
+    /// An io_uring fd is not writable
+    fn write_iter(
+        &self,
+        _file: &File,
+        _from: &mut IovSource<'_>,
+        at: Option<u64>,
+        flags: RwFlags,
+    ) -> Result<usize, KernelError> {
+        stream_rw(at, flags)?;
         Err(KernelError::InvalidArgument)
     }
 

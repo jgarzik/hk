@@ -30,7 +30,8 @@ use core::pin::Pin;
 
 use crate::arch::IrqSpinlock;
 use crate::fs::KernelError;
-use crate::fs::file::{File, FileOps, flags};
+use crate::fs::file::{File, FileOps, RwFlags, flags, stream_rw};
+use crate::fs::iov_iter::{IovDest, IovSource};
 use crate::io::poll::{POLLIN, POLLRDNORM, PollTable};
 use crate::sync::waitqueue::WaitQueue;
 use crate::time::hrtimer::{HRTIMER_HARD, HrClock, HrTimer};
@@ -419,23 +420,35 @@ impl FileOps for TimerfdFileOps {
         self
     }
 
-    fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {
+    /// The expiration count, 8 bytes; a smaller buffer is EINVAL. The
+    /// ticks are taken under the lock and copied out after it.
+    fn read_iter(
+        &self,
+        file: &File,
+        to: &mut IovDest<'_>,
+        at: Option<u64>,
+        flags: RwFlags,
+    ) -> Result<usize, KernelError> {
+        stream_rw(at, flags)?;
         let timerfd = file.private_ref::<Timerfd>().ok_or(KernelError::BadFd)?;
-        // timerfd read always returns 8 bytes (u64)
-        if buf.len() < 8 {
+        if to.len() < 8 {
             return Err(KernelError::InvalidArgument);
         }
-
         let nonblock = file.get_flags() & flags::O_NONBLOCK != 0;
         let count = timerfd.read(nonblock)?;
-
-        // Write u64 to buffer (little-endian)
-        buf[0..8].copy_from_slice(&count.to_le_bytes());
+        to.copy_to_full(&count.to_le_bytes())?;
         Ok(8)
     }
 
-    fn write(&self, _file: &File, _buf: &[u8]) -> Result<usize, KernelError> {
-        // timerfd doesn't support write
+    /// Not writable
+    fn write_iter(
+        &self,
+        _file: &File,
+        _from: &mut IovSource<'_>,
+        at: Option<u64>,
+        flags: RwFlags,
+    ) -> Result<usize, KernelError> {
+        stream_rw(at, flags)?;
         Err(KernelError::InvalidArgument)
     }
 

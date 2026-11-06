@@ -232,7 +232,7 @@ pub fn sendmsg(s: &UnixSock, m: &mut SendMsg<'_>, flags: i32) -> Result<usize, K
 fn send_chunk(
     s: &UnixSock,
     other: &Arc<UnixSock>,
-    m: &SendMsg<'_>,
+    m: &mut SendMsg<'_>,
     off: usize,
     scm: &mut Scm,
     timeo: &mut u64,

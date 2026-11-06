@@ -38,8 +38,9 @@ use spin::Lazy;
 
 use crate::arch::Uaccess;
 use crate::fs::dentry::Dentry;
-use crate::fs::file::{File, FileOps, flags};
+use crate::fs::file::{File, FileOps, RwFlags, flags, stream_rw};
 use crate::fs::inode::{Inode, InodeMode, NULL_INODE_OPS, Timespec as InodeTimespec};
+use crate::fs::iov_iter::{IovDest, IovSource};
 use crate::io::pipe::FD_CLOEXEC;
 use crate::io::poll::{POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM, PollTable};
 use crate::sync::waitqueue::WaitQueue;
@@ -390,36 +391,47 @@ impl FileOps for MqFileOps {
         self
     }
 
-    fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {
+    /// Receive the next message (blocking), as much of it as fits;
+    /// the message is copied out after it left the queue
+    fn read_iter(
+        &self,
+        file: &File,
+        to: &mut IovDest<'_>,
+        at: Option<u64>,
+        flags: RwFlags,
+    ) -> Result<usize, KernelError> {
+        stream_rw(at, flags)?;
         let mq = mq_of(file).ok_or(KernelError::BadFd)?;
         if mq.access_mode == O_WRONLY {
             return Err(KernelError::PermissionDenied);
         }
-
-        match mq.queue.receive(false, None) {
-            Ok((data, _prio)) => {
-                let len = data.len().min(buf.len());
-                buf[..len].copy_from_slice(&data[..len]);
-                Ok(len)
-            }
-            Err(_) => Err(KernelError::Io),
-        }
+        let Ok((data, _prio)) = mq.queue.receive(false, None) else {
+            return Err(KernelError::Io);
+        };
+        to.copy_to(&data)
     }
 
-    fn write(&self, file: &File, buf: &[u8]) -> Result<usize, KernelError> {
+    /// Send the data as one message of priority 0 (blocking)
+    fn write_iter(
+        &self,
+        file: &File,
+        from: &mut IovSource<'_>,
+        at: Option<u64>,
+        flags: RwFlags,
+    ) -> Result<usize, KernelError> {
+        stream_rw(at, flags)?;
         let mq = mq_of(file).ok_or(KernelError::BadFd)?;
         if mq.access_mode == O_RDONLY {
             return Err(KernelError::PermissionDenied);
         }
-
-        if buf.len() as i64 > mq.queue.msgsize {
+        let len = from.len();
+        if len as i64 > mq.queue.msgsize {
             return Err(KernelError::MessageTooLong);
         }
-        let mut data = crate::util::kmem::try_vec(buf.len(), 0u8)?;
-        data.copy_from_slice(buf);
-        // Write with priority 0 (default)
+        let mut data = crate::util::kmem::try_vec(len, 0u8)?;
+        from.copy_from_full(&mut data)?;
         match mq.queue.send(data, 0, false, None) {
-            Ok(()) => Ok(buf.len()),
+            Ok(()) => Ok(len),
             Err(_) => Err(KernelError::Io),
         }
     }

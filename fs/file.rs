@@ -274,6 +274,17 @@ fn bounce_write<F: FileOps + ?Sized>(
     }
 }
 
+/// For `read_iter`/`write_iter` of a file with neither a position nor
+/// RWF_NOWAIT support (eventfd, sockets, ...): positioned I/O or
+/// RWF_NOWAIT is EOPNOTSUPP, which the syscalls report as ESPIPE resp.
+/// EOPNOTSUPP
+pub fn stream_rw(at: Option<u64>, flags: RwFlags) -> Result<(), KernelError> {
+    if at.is_some() || flags.nowait {
+        return Err(KernelError::OperationNotSupported);
+    }
+    Ok(())
+}
+
 /// File operations trait - filesystem-specific behavior for open files
 pub trait FileOps: Send + Sync {
     /// Returns self as Any for downcasting to concrete types

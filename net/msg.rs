@@ -9,6 +9,7 @@
 use alloc::vec::Vec;
 
 use crate::arch::Uaccess;
+use crate::fs::iov_iter::{IovDest, IovSource};
 use crate::uaccess::{UaccessArch, copy_from_user, copy_to_user, get_user, put_user};
 use crate::util::error::KernelError;
 
@@ -266,17 +267,33 @@ pub fn addr_out(addr: u64, lenp: u64, a: &[u8]) -> Result<(), KernelError> {
     put_user::<Uaccess, u32>(lenp, a.len() as u32).map_err(|_| KernelError::BadAddress)
 }
 
-/// Data source of a send: user vector or kernel buffer (write())
+/// Data source of a send: a user vector (the send calls) or the
+/// iterator of a write(), which moves forward only: its bytes are taken
+/// in order
 pub enum Src<'a> {
     User(Iov),
-    Kern(&'a [u8]),
+    Iter { from: IovSource<'a>, total: usize },
 }
 
-impl Src<'_> {
+impl<'a> Src<'a> {
+    /// Take over `from` until [`Src::restore`]
+    pub fn iter(from: &mut IovSource<'a>) -> Self {
+        let from = core::mem::replace(from, IovSource::kernel(&[]));
+        let total = from.len();
+        Self::Iter { from, total }
+    }
+
+    /// Put a taken-over iterator back, advanced past the bytes taken
+    pub fn restore(self, from: &mut IovSource<'a>) {
+        if let Src::Iter { from: f, .. } = self {
+            *from = f;
+        }
+    }
+
     pub fn len(&self) -> usize {
         match self {
             Src::User(v) => v.total,
-            Src::Kern(b) => b.len(),
+            Src::Iter { total, .. } => *total,
         }
     }
 
@@ -285,33 +302,52 @@ impl Src<'_> {
     }
 
     /// Copy in the first `n` bytes
-    pub fn take(&self, n: usize) -> Result<Vec<u8>, KernelError> {
+    pub fn take(&mut self, n: usize) -> Result<Vec<u8>, KernelError> {
         self.take_at(0, n)
     }
 
-    /// Copy in `n` bytes starting at `off`
-    pub fn take_at(&self, off: usize, n: usize) -> Result<Vec<u8>, KernelError> {
+    /// Copy in up to `n` bytes starting at `off` (for an iterator, `off`
+    /// is the bytes already taken); EFAULT if a fault cuts it short
+    pub fn take_at(&mut self, off: usize, n: usize) -> Result<Vec<u8>, KernelError> {
         match self {
             Src::User(v) => v.gather_at(off, n),
-            Src::Kern(b) => {
-                let off = off.min(b.len());
-                Ok(b[off..(off + n).min(b.len())].to_vec())
+            Src::Iter { from, total } => {
+                debug_assert_eq!(off, *total - from.len());
+                let mut out = crate::util::kmem::try_vec(n.min(from.len()), 0u8)?;
+                from.copy_from_full(&mut out)?;
+                Ok(out)
             }
         }
     }
 }
 
-/// Data destination of a receive: user vector or kernel buffer (read())
+/// Data destination of a receive: a user vector (the recv calls) or the
+/// iterator of a read(), which moves forward only: its bytes are put in
+/// order
 pub enum Dst<'a> {
     User(Iov),
-    Kern(&'a mut [u8]),
+    Iter { to: IovDest<'a>, total: usize },
 }
 
-impl Dst<'_> {
+impl<'a> Dst<'a> {
+    /// Take over `to` until [`Dst::restore`]
+    pub fn iter(to: &mut IovDest<'a>) -> Self {
+        let to = core::mem::replace(to, IovDest::kernel(&mut []));
+        let total = to.len();
+        Self::Iter { to, total }
+    }
+
+    /// Put a taken-over iterator back, advanced past the bytes put
+    pub fn restore(self, to: &mut IovDest<'a>) {
+        if let Dst::Iter { to: t, .. } = self {
+            *to = t;
+        }
+    }
+
     pub fn len(&self) -> usize {
         match self {
             Dst::User(v) => v.total,
-            Dst::Kern(b) => b.len(),
+            Dst::Iter { total, .. } => *total,
         }
     }
 
@@ -319,16 +355,16 @@ impl Dst<'_> {
         self.len() == 0
     }
 
-    /// Copy `data` out at offset `off`; returns the bytes stored
+    /// Copy `data` out at offset `off` (for an iterator, `off` is the
+    /// bytes already put); returns the bytes stored (up to the end),
+    /// EFAULT if a fault cuts it short
     pub fn put(&mut self, off: usize, data: &[u8]) -> Result<usize, KernelError> {
         match self {
             Dst::User(v) => v.scatter(off, data),
-            Dst::Kern(b) => {
-                if off >= b.len() {
-                    return Ok(0);
-                }
-                let n = data.len().min(b.len() - off);
-                b[off..off + n].copy_from_slice(&data[..n]);
+            Dst::Iter { to, total } => {
+                debug_assert_eq!(off, *total - to.len());
+                let n = data.len().min(to.len());
+                to.copy_to_full(&data[..n])?;
                 Ok(n)
             }
         }
