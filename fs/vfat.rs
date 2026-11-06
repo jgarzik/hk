@@ -833,11 +833,14 @@ fn read_cluster_chain(sb_data: &VfatSbData, start_cluster: u32) -> Result<Vec<u3
     if start_cluster == 0 {
         return Ok(chain);
     }
+    // No file or directory is longer than 4 GiB (s_maxbytes): a longer
+    // chain is a loop (Linux bounds the walk by s_maxbytes >>
+    // cluster_bits), and the vector never outgrows that
+    let max_len =
+        (sb_data.max_cluster as usize).min((1usize << 32) / sb_data.cluster_size as usize + 1);
     let mut cluster = start_cluster;
     loop {
-        if !(2..sb_data.max_cluster).contains(&cluster)
-            || chain.len() >= sb_data.max_cluster as usize
-        {
+        if !(2..sb_data.max_cluster).contains(&cluster) || chain.len() >= max_len {
             return Err(KernelError::Io);
         }
         chain.try_reserve(1).map_err(|_| KernelError::OutOfMemory)?;
