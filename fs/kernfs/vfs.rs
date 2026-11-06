@@ -254,8 +254,9 @@ fn bin_write(
 ) -> Result<usize, KernelError> {
     let room = usize::try_from(b.size().saturating_sub(off)).unwrap_or(usize::MAX);
     let mut buf = try_vec(from.len().min(PAGE_SIZE).min(room), 0u8)?;
-    let c = from.copy_from(&mut buf)?;
-    bin_io(kn, b, off, c, |n| b.write(off, &buf[..n]))
+    // Whole or EFAULT (Linux kernfs_fop_write_iter)
+    from.copy_from_full(&mut buf)?;
+    bin_io(kn, b, off, buf.len(), |n| b.write(off, &buf[..n]))
 }
 
 impl KernfsFops {
@@ -308,13 +309,14 @@ impl KernfsFops {
             return Ok(0);
         }
         let mut data = try_vec(from.len(), 0u8)?;
-        let c = from.copy_from(&mut data)?;
+        // Whole or EFAULT (Linux kernfs_fop_write_iter)
+        from.copy_from_full(&mut data)?;
         let _b = of.buf.lock();
         let _act = kn.get_active().ok_or(KernelError::NoDevice)?;
         attr_node(&kn)
             .ops()
             .ok_or(KernelError::NoDevice)?
-            .store(&data[..c])
+            .store(&data)
     }
 }
 

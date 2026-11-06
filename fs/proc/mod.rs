@@ -1337,8 +1337,9 @@ impl FileOps for ProcfsFileOps {
         let ctl = sysctl_of(&inode).ok_or(KernelError::Io)?;
         crate::sysctl::permission(ctl, &crate::task::current_cred(), crate::fs::MAY_WRITE)?;
         let mut buf = crate::util::kmem::try_vec(from.len().min(WRITE_CHUNK), 0u8)?;
-        let c = from.copy_from(&mut buf)?;
-        let n = crate::sysctl::write(ctl, &buf[..c], file.get_pos())?;
+        // Whole or EFAULT (Linux proc_sys_call_handler)
+        from.copy_from_full(&mut buf)?;
+        let n = crate::sysctl::write(ctl, &buf, file.get_pos())?;
         file.advance_pos(n as u64);
         Ok(n)
     }

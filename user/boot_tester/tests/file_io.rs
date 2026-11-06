@@ -28,6 +28,8 @@
 //! - WRITE_OWN_MAP: a write sourced from a mapping of the page it writes
 //! - IOV_PARTIAL_FAULT: writev/readv stop at a bad segment with the
 //!   bytes done
+//! - SYSCTL_PARTIAL_FAULT: a sysctl write whose data faults partway is
+//!   EFAULT and stores nothing
 //! - RW_STRADDLE: read/write with one buffer running off mapped memory
 //!   mid-page move the mapped part and return its length
 
@@ -74,6 +76,7 @@ pub fn run_tests() {
     test_write_own_map();
     test_iov_partial_fault();
     test_rw_straddle();
+    test_sysctl_partial_fault();
     test_getrandom();
     test_getrandom_einval();
     test_getrandom_stream();
@@ -1809,6 +1812,45 @@ fn test_rw_straddle() {
         print_num(w);
         print(b" pipe read=");
         print_num(pr);
+        println(b"");
+    }
+}
+
+/// writev to a sysctl whose second segment is unmapped: Linux copies a
+/// store's data whole or not at all (EFAULT), so "12" alone is never
+/// stored
+fn test_sysctl_partial_fault() {
+    let path = b"/proc/sys/vm/dirty_expire_centisecs\0";
+    let fd = sys_open(path.as_ptr(), O_RDWR, 0) as i32;
+    let mut before = [0u8; 32];
+    let nb = sys_read(fd as u64, before.as_mut_ptr(), 32);
+    let bad = sys_mmap(0, 4096, 0, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    let head = *b"12";
+    let iov = [
+        IoVec {
+            iov_base: head.as_ptr(),
+            iov_len: 2,
+        },
+        IoVec {
+            iov_base: bad as *const u8,
+            iov_len: 3,
+        },
+    ];
+    let w = sys_writev(fd as u64, iov.as_ptr(), 2);
+    let mut after = [0u8; 32];
+    sys_lseek(fd, 0, 0);
+    let na = sys_read(fd as u64, after.as_mut_ptr(), 32);
+    sys_munmap(bad as u64, 4096);
+    sys_close(fd as u64);
+    if fd >= 0 && w == -14 && nb > 0 && na == nb && before == after {
+        println(b"SYSCTL_PARTIAL_FAULT:OK");
+    } else {
+        print(b"SYSCTL_PARTIAL_FAULT:FAIL writev=");
+        print_num(w);
+        print(b" before/after len ");
+        print_num(nb);
+        print(b" ");
+        print_num(na);
         println(b"");
     }
 }

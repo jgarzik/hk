@@ -650,8 +650,9 @@ impl FileOps for CgroupfsFileOps {
             return Err(KernelError::OperationNotSupported);
         }
         let mut buf = crate::util::kmem::try_vec(from.len().min(WRITE_CHUNK), 0u8)?;
-        let c = from.copy_from(&mut buf)?;
-        cgroupfs_write(file, &buf[..c])
+        // Whole or EFAULT (Linux kernfs_fop_write_iter)
+        from.copy_from_full(&mut buf)?;
+        cgroupfs_write(file, &buf)
     }
 
     fn readdir(&self, file: &File, ctx: &mut DirContext<'_>) -> Result<(), KernelError> {
