@@ -861,8 +861,10 @@ Designs that grew one commit at a time. Tag = roadmap phase
 - **ID allocators** (J): PidMap, fdbits, IPC ids, and plain counters
   (bpf, keys, mqueue, posix timers, which wrap with no collision
   check): one IDR/IDA.
-- **procfs** (H): every read regenerates the whole file and slices it
-  (no seq_file records, so chunked reads of /proc/net/* can tear).
+- **procfs** (H): a file is generated whole (no seq_file records): an
+  open file's reads continuing one another see one generation, where
+  Linux generates record by record, so a long file's later chunks are
+  as old as its first.
   /proc/sys is one static tree: the sysctls Linux registers for the
   initial network namespace only (net/ipv4/tcp_mem,
   net/core/mem_pcpu_rsv) appear in every

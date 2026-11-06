@@ -1044,14 +1044,34 @@ fn mm_access(pid: Pid) -> Result<Option<Arc<crate::mm::Mm>>, KernelError> {
     Ok(crate::mm::get_task_mm(tid))
 }
 
+/// An open /proc file (Linux seq_file and the proc private data): the
+/// address space it was opened on (maps), and what the last read
+/// generated
+struct ProcOpen {
+    mm: Option<Arc<crate::mm::Mm>>,
+    /// Held across generation and the copy out, which may fault (Linux
+    /// seq_file m->lock); under f_pos_lock for read()
+    seq: crate::sync::Mutex<Option<SeqBuf>>,
+}
+
+/// One generation of a file and where the last read of it ended
+struct SeqBuf {
+    data: Vec<u8>,
+    end: u64,
+}
+
+fn proc_open(file: &File) -> Option<Arc<ProcOpen>> {
+    file.private.get()?.clone().downcast::<ProcOpen>().ok()
+}
+
 /// Content of a per-process file for this open file (or, with none,
 /// checked afresh)
 fn pid_content(file: Option<&File>, pid: Pid, g: PidGen) -> Result<Vec<u8>, KernelError> {
     match g {
         PidGen::Pub(f) => Ok(f(pid)),
         PidGen::Mm(f) => {
-            let mm = match file.and_then(|fl| fl.private.get()) {
-                Some(p) => p.clone().downcast::<crate::mm::Mm>().ok(),
+            let mm = match file.and_then(proc_open) {
+                Some(p) => p.mm.clone(),
                 None => mm_access(pid)?,
             };
             // The open file pins only the struct (mm_count); a read uses
@@ -1405,19 +1425,23 @@ impl FileOps for ProcfsFileOps {
     /// (Linux proc_mem_open, proc_fd_permission); maps keeps the address
     /// space it was opened on, so a later setuid exec cannot leak
     fn open(&self, file: &File) -> Result<(), KernelError> {
-        let Some(check) = file.get_inode().and_then(|i| open_check(&i)) else {
-            return Ok(());
-        };
-        match check {
-            OpenCheck::Mm(pid) => {
-                if let Some(mm) = mm_access(pid)? {
-                    file.private.call_once(|| mm);
-                }
-                Ok(())
+        let inode = file.get_inode().ok_or(KernelError::BadFd)?;
+        let mm = match open_check(&inode) {
+            Some(OpenCheck::Mm(pid)) => mm_access(pid)?,
+            Some(OpenCheck::Fds(pid)) if !crate::task::ptrace::may_read_proc(pid) => {
+                return Err(KernelError::PermissionDenied);
             }
-            OpenCheck::Fds(pid) if crate::task::ptrace::may_read_proc(pid) => Ok(()),
-            OpenCheck::Fds(_) => Err(KernelError::PermissionDenied),
+            _ => None,
+        };
+        // A generated file keeps its last generation (seq_file)
+        if inode.mode().is_file() && sysctl_of(&inode).is_none() && fail_nth_of(&inode).is_none() {
+            let po = try_arc(ProcOpen {
+                mm,
+                seq: crate::sync::Mutex::new(None),
+            })?;
+            file.private.call_once(|| po);
         }
+        Ok(())
     }
 
     /// Generate the content and copy it from the offset on (Linux
@@ -1443,10 +1467,12 @@ impl FileOps for ProcfsFileOps {
         {
             return Ok(0);
         }
-        let content = proc_content(file)?;
-        let n = match usize::try_from(pos).ok().and_then(|p| content.get(p..)) {
-            Some(rest) if !rest.is_empty() => to.copy_to(rest)?,
-            _ => 0,
+        let n = match proc_open(file) {
+            Some(po) => seq_read(file, &po, to, pos)?,
+            None => {
+                let content = proc_content(file)?;
+                copy_from(&content, to, pos)?
+            }
         };
         if at.is_none() {
             file.advance_pos(n as u64);
@@ -1881,6 +1907,38 @@ fn pid_dir_pid(inode: &Inode) -> Option<Pid> {
         ProcfsInodeData::PidDirectory { pid } => Some(*pid),
         _ => None,
     }
+}
+
+/// `data` from offset `pos` on into `to`
+fn copy_from(data: &[u8], to: &mut IovDest<'_>, pos: u64) -> Result<usize, KernelError> {
+    match usize::try_from(pos).ok().and_then(|p| data.get(p..)) {
+        Some(rest) if !rest.is_empty() => to.copy_to(rest),
+        _ => Ok(0),
+    }
+}
+
+/// Linux seq_read_iter of a single_open file: a read that continues
+/// where the last one ended reads the same generation, so chunked reads
+/// never mix two (a record torn between them); any other offset, 0
+/// included, generates afresh
+fn seq_read(
+    file: &File,
+    po: &ProcOpen,
+    to: &mut IovDest<'_>,
+    pos: u64,
+) -> Result<usize, KernelError> {
+    let mut seq = po.seq.lock();
+    let stale = !matches!(&*seq, Some(b) if pos != 0 && b.end == pos);
+    if stale {
+        *seq = Some(SeqBuf {
+            data: proc_content(file)?,
+            end: pos,
+        });
+    }
+    let b = seq.as_mut().ok_or(KernelError::Io)?;
+    let n = copy_from(&b.data, to, pos)?;
+    b.end = pos + n as u64;
+    Ok(n)
 }
 
 /// Static procfs super ops

@@ -1793,6 +1793,11 @@ lock. `proc::proc_flush_pid` runs after a task leaves TASKLIST: it
 collects the procfs superblocks under `PROC_SBS` (spin Mutex, leaf),
 releases it, then drops dentries (d_lock).
 
+An open procfs file's `ProcOpen.seq` (sync::Mutex, Linux seq_file
+m->lock) is held across generating its content (which takes
+TASKLIST, mmap_lock, network and mount locks) and the copy to the
+caller (may fault: -> mmap_lock); under f_pos_lock for read().
+
 The dcache shrinker (`dentry::shrink_dcache`: drop_caches 2, direct
 reclaim) takes `superblock::ALL_SBS` (spin Mutex, leaf) only to pick the
 next superblock, then per dentry the parent's d_lock (write) and the
