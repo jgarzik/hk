@@ -617,6 +617,12 @@ impl FileOps for CgroupfsFileOps {
         self
     }
 
+    /// Control files are kernfs attributes, which poll; directories do
+    /// not (Linux kernfs_dir_fops)
+    fn can_poll(&self, file: &File) -> bool {
+        file.get_inode().is_some_and(|i| !i.mode().is_dir())
+    }
+
     /// Generate the content and copy it from `at` or the file position
     /// on (Linux kernfs_fop_read_iter: iocb->ki_pos); no FMODE_NOWAIT
     /// (EOPNOTSUPP)

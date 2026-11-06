@@ -512,6 +512,12 @@ impl FileOps for KernfsFops {
             DEFAULT_POLLMASK
         }
     }
+
+    /// Attributes poll (kernfs_file_fops), directories do not
+    /// (kernfs_dir_fops)
+    fn can_poll(&self, file: &File) -> bool {
+        file.get_inode().is_some_and(|i| !i.mode().is_dir())
+    }
 }
 
 pub static KERNFS_FOPS: KernfsFops = KernfsFops;

@@ -31,6 +31,7 @@ use super::file::{DirContext, DirEntry, File, FileOps, RwFlags, WRITE_CHUNK};
 use super::inode::{AsAny, FileType, Inode, InodeData, InodeMode, InodeOps, Timespec};
 use super::iov_iter::{IovDest, IovSource};
 use super::superblock::{FileSystemType, PROC_SUPER_MAGIC, StatFs, SuperBlock, SuperOps};
+use crate::io::poll::{DEFAULT_POLLMASK, POLLIN, POLLRDNORM, PollTable};
 use crate::task::Cred;
 use crate::task::Pid;
 use crate::util::kalloc::try_arc;
@@ -1016,6 +1017,9 @@ fn open_check(inode: &Inode) -> Option<OpenCheck> {
 pub enum PidGen {
     /// World-readable content of the process
     Pub(fn(Pid) -> Vec<u8>),
+    /// A mount table of the process (mounts, mountinfo): as `Pub`, and
+    /// pollable (Linux mounts_poll)
+    Mnt(fn(Pid) -> Vec<u8>),
     /// Private content of the address space: open needs ptrace-read
     /// access and pins the mm it reads from (Linux proc_mem_open: an
     /// mm_count reference)
@@ -1068,7 +1072,7 @@ fn proc_open(file: &File) -> Option<Arc<ProcOpen>> {
 /// checked afresh)
 fn pid_content(file: Option<&File>, pid: Pid, g: PidGen) -> Result<Vec<u8>, KernelError> {
     match g {
-        PidGen::Pub(f) => Ok(f(pid)),
+        PidGen::Pub(f) | PidGen::Mnt(f) => Ok(f(pid)),
         PidGen::Mm(f) => {
             let mm = match file.and_then(proc_open) {
                 Some(p) => p.mm.clone(),
@@ -1101,9 +1105,42 @@ const PID_FILES: &[(&str, u64, u16, PidGen)] = &[
     ("stat", 106, 0o444, PidGen::Pub(array::gen_stat)),
     ("cmdline", 107, 0o444, PidGen::Pub(array::gen_cmdline)),
     ("environ", 108, 0o400, PidGen::Mm(array::gen_environ)),
-    ("mounts", 109, 0o444, PidGen::Pub(mounts::show_mounts)),
-    ("mountinfo", 110, 0o444, PidGen::Pub(mounts::show_mountinfo)),
+    ("mounts", 109, 0o444, PidGen::Mnt(mounts::show_mounts)),
+    ("mountinfo", 110, 0o444, PidGen::Mnt(mounts::show_mountinfo)),
 ];
+
+/// How a /proc file polls (Linux: which fops it has)
+#[derive(PartialEq)]
+enum ProcPoll {
+    /// No poll: proc dirs, per-process files, fdinfo, ns, fail-nth
+    None,
+    /// DEFAULT_POLLMASK: proc_dir_entry files (proc_reg_poll), sysctls
+    /// (proc_sys_poll)
+    Default,
+    /// mounts, mountinfo (mounts_poll)
+    Mounts,
+}
+
+fn proc_poll(file: &File) -> ProcPoll {
+    let Some(private) = file.get_inode().and_then(|i| i.get_private()) else {
+        return ProcPoll::None;
+    };
+    let Some(w) = private
+        .as_ref()
+        .as_any()
+        .downcast_ref::<ProcfsInodeWrapper>()
+    else {
+        return ProcPoll::None;
+    };
+    match &*w.0.read() {
+        ProcfsInodeData::File { .. } | ProcfsInodeData::Sysctl { .. } => ProcPoll::Default,
+        ProcfsInodeData::PidFile {
+            generator: PidGen::Mnt(_),
+            ..
+        } => ProcPoll::Mounts,
+        _ => ProcPoll::None,
+    }
+}
 
 /// The process of a /proc/<pid>/fail-nth inode
 fn fail_nth_of(inode: &Inode) -> Option<Pid> {
@@ -1419,6 +1456,19 @@ impl FileOps for ProcfsFileOps {
         } else {
             KernelError::NoDevice
         })
+    }
+
+    /// A mount table is readable (Linux mounts_poll; no POLLERR|POLLPRI
+    /// on a change of it yet); the rest DEFAULT_POLLMASK (vfs_poll)
+    fn poll(&self, file: &File, _pt: Option<&mut PollTable<'_>>) -> u16 {
+        match proc_poll(file) {
+            ProcPoll::Mounts => POLLIN | POLLRDNORM,
+            _ => DEFAULT_POLLMASK,
+        }
+    }
+
+    fn can_poll(&self, file: &File) -> bool {
+        proc_poll(file) != ProcPoll::None
     }
 
     /// Private per-process files check ptrace-read access at open

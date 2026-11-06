@@ -300,6 +300,11 @@ impl CharDevice for Tty {
         self.name
     }
 
+    /// tty_fops has tty_poll
+    fn can_poll(&self) -> bool {
+        true
+    }
+
     fn open(&self, file: &File) -> Result<(), KernelError> {
         if file.get_flags() & O_NOCTTY == 0 {
             jobctrl::open_set_tty(self, file);
@@ -397,6 +402,10 @@ struct TtyChar(&'static Tty);
 impl CharDevice for TtyChar {
     fn name(&self) -> &str {
         self.0.name
+    }
+
+    fn can_poll(&self) -> bool {
+        true
     }
 
     fn open(&self, file: &File) -> Result<(), KernelError> {

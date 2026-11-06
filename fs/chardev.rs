@@ -188,6 +188,12 @@ pub trait CharDevice: Send + Sync {
     fn poll(&self, _file: &File, _pt: Option<&mut PollTable<'_>>) -> u16 {
         POLLIN | POLLRDNORM | POLLOUT | POLLWRNORM
     }
+
+    /// Its fops have a poll (Linux file_can_poll): epoll accepts it.
+    /// Default no (/dev/null, /dev/zero: EPERM from epoll_ctl)
+    fn can_poll(&self) -> bool {
+        false
+    }
 }
 
 /// Global character device registry
@@ -394,6 +400,11 @@ pub struct RandomCharDevice(&'static str);
 impl CharDevice for RandomCharDevice {
     fn name(&self) -> &str {
         self.0
+    }
+
+    /// random_fops has random_poll, urandom_fops none
+    fn can_poll(&self) -> bool {
+        self.0 == "random"
     }
 
     fn positional(&self) -> bool {

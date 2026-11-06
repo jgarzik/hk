@@ -208,6 +208,11 @@ impl CharDevice for GfxCharDevice {
         &self.name
     }
 
+    /// drm_fops has drm_poll
+    fn can_poll(&self) -> bool {
+        true
+    }
+
     fn mmap_ok(&self) -> bool {
         true
     }
@@ -224,6 +229,12 @@ impl CharDevice for GfxCharDevice {
 
     fn ioctl(&self, _file: &File, cmd: u32, arg: u64) -> Result<i64, KernelError> {
         self.handle_ioctl(cmd, arg).map_err(|e| e.into())
+    }
+
+    /// Readable only with a DRM event queued (Linux drm_poll); no
+    /// driver queues one
+    fn poll(&self, _file: &File, _pt: Option<&mut crate::io::poll::PollTable<'_>>) -> u16 {
+        0
     }
 }
 

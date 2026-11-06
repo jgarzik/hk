@@ -921,22 +921,24 @@ Tag = roadmap phase (doc/ROADMAP.md).
    by key (removals check the entry). The test prints the lines with
    either port when it fails.
 
-## epoll accepts files Linux cannot poll
+## epoll edge-triggered items wake on unkeyed wakeups
 
-**Location**: `io/epoll.rs`, `fs/file.rs` (`FileOps::poll`)
-
-EPOLL_CTL_ADD of a regular file or directory is EPERM on Linux
-(file_can_poll: no f_op->poll), but every hk `FileOps` has a default
-poll, so hk accepts it and reports it always ready. Needs a
-`FileOps::can_poll` (false for the regular-file and directory ops of
-ramfs/tmpfs/vfat and most procfs files) checked at add.
-
+**Location**: `io/epoll.rs`, `sync/waitqueue.rs` (`wake_poll`)
 
 Only pipes wake with the poll events that happened (Linux passes them
 to every wake_up_poll): other files (sockets, eventfd, ttys) wake with
 none, so an edge-triggered item there is queued on any wakeup of its
 queue and reported again while it stays ready, where Linux reports it
 once per matching event.
+
+## /proc/<pid>/mounts: no POLLERR|POLLPRI on a mount change
+
+**Location**: `fs/proc/mod.rs` (`ProcfsFileOps::poll`)
+
+mounts and mountinfo poll readable only: a change of the mount table
+never reports POLLERR|POLLPRI (Linux mounts_poll: the namespace's
+event count against the reader's).
+
 ## adjtimex does not steer the clock
 
 **Location**: `time/time_syscall.rs`, `time/mod.rs`

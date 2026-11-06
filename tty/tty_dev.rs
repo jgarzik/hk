@@ -20,6 +20,11 @@ impl CharDevice for TtyCharDevice {
         "tty"
     }
 
+    /// tty_fops has tty_poll
+    fn can_poll(&self) -> bool {
+        true
+    }
+
     fn open(&self, file: &File) -> Result<(), KernelError> {
         let tty = jobctrl::current_tty().ok_or(KernelError::NoDeviceOrAddress)?;
         Redirect::set(file, tty)

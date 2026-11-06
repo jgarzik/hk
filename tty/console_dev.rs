@@ -22,6 +22,11 @@ impl CharDevice for ConsoleCharDevice {
         "console"
     }
 
+    /// console_fops has tty_poll
+    fn can_poll(&self) -> bool {
+        true
+    }
+
     fn open(&self, file: &File) -> Result<(), KernelError> {
         let tty = console_tty().ok_or(KernelError::NoDevice)?;
         Redirect::set(file, tty)

@@ -318,6 +318,11 @@ impl FileOps for BlockFileOps {
         self
     }
 
+    /// No poll (Linux def_blk_fops)
+    fn can_poll(&self, _file: &File) -> bool {
+        false
+    }
+
     /// The device's page cache maps (Linux blkdev_mmap); a read-only
     /// device only privately or through a read-only file (Linux
     /// generic_file_readonly_mmap: no shared mapping that may write)

@@ -322,6 +322,13 @@ pub trait FileOps: Send + Sync {
         // Default for regular files - always ready
         DEFAULT_POLLMASK
     }
+
+    /// The file has a poll of its own (Linux file_can_poll: f_op->poll
+    /// set): epoll accepts only these (EPERM otherwise); poll and select
+    /// see `poll`'s DEFAULT_POLLMASK either way (Linux vfs_poll)
+    fn can_poll(&self, _file: &File) -> bool {
+        true
+    }
 }
 
 /// Open file description
@@ -884,6 +891,10 @@ impl FileOps for CharDevFileOps {
             Ok(d) => d.poll(file, pt),
             Err(_) => POLLHUP | POLLERR,
         }
+    }
+
+    fn can_poll(&self, file: &File) -> bool {
+        Self::dev(file).is_ok_and(|d| d.can_poll())
     }
 }
 

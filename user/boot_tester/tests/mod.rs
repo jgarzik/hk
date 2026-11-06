@@ -107,6 +107,7 @@ pub mod pid_tid;
 pub mod pidfd;
 pub mod pnode;
 pub mod poll;
+pub mod pollperm;
 pub mod posix_lock;
 pub mod posix_timer;
 pub mod prctl;
@@ -279,6 +280,7 @@ pub fn run_all_tests() {
     capabilities::run_tests();
     eventfd::run_tests();
     epoll::run_tests();
+    pollperm::run_tests();
     signalfd::run_tests();
     prctl::run_tests();
     inotify::run_tests();
