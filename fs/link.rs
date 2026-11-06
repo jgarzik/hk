@@ -214,8 +214,11 @@ pub fn sys_linkat(
         return KernelError::CrossDevice.sysret();
     }
 
+    // Linux do_linkat: may_linkat (fs.protected_hardlinks), then
     // vfs_link: may_create on the new parent, then no directories
-    // (fs.protected_hardlinks is not implemented: its kernel default is 0)
+    if let Err(e) = crate::fs::dac::may_linkat(&crate::task::current_cred(), &old_inode) {
+        return e.sysret();
+    }
     let r = create_entry(&p, |dir, _| {
         if old_inode.mode().is_dir() {
             return Err(KernelError::NotPermitted);

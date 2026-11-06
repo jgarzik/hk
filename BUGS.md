@@ -325,9 +325,8 @@ SIOCUNIXFILE, SO_PEERSEC (ENOPROTOOPT, as on Linux without an LSM).
 
 **Location**: `fs/dac.rs`, `task/exec.rs`
 
-Missing: fs.protected_hardlinks/symlinks/fifos/regular do not exist
-(behave as their kernel default 0); no
-immutable/append-only inodes (no IS_APPEND/IS_IMMUTABLE EPERM).
+Missing: immutable/append-only inodes (no IS_APPEND/IS_IMMUTABLE
+EPERM).
 
 ## Credentials have no identity
 

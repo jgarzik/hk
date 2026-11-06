@@ -283,6 +283,9 @@ fn follow_link(
     depth: usize,
 ) -> Result<Path, KernelError> {
     let inode = link.get_inode().ok_or(KernelError::NotFound)?;
+    if let Some(d) = dir.dentry.get_inode() {
+        super::dac::may_follow_link(c, &d, &inode)?;
+    }
     let target = inode.i_op.readlink(&inode)?;
     let mut path = target;
     for comp in rest {

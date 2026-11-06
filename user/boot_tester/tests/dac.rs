@@ -3,6 +3,13 @@
 //!
 //! Root sets up a tree under /tmp/dac; most checks run in a forked child
 //! that switched to uid/gid 2000 (setresuid drops every capability).
+//!
+//! DAC_PROTECTED_OFF / DAC_PROTECTED_ON: fs.protected_symlinks,
+//! _hardlinks, _fifos and _regular at 0 allow, at 1 refuse: following
+//! another user's symlink in a sticky world-writable directory
+//! (EACCES), hard-linking a file one may not read and write (EPERM), an
+//! O_CREAT open of another user's existing FIFO or regular file there
+//! (EACCES)
 
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
@@ -46,6 +53,7 @@ pub fn run_tests() {
     run_root(b"DAC_FSUID", t_fsuid);
     run_root(b"DAC_CHOWN_KILL_SUID", t_root_chown);
     creat_race();
+    protected();
 }
 
 // ---------------------------------------------------------------------------
@@ -661,4 +669,91 @@ fn creat_race() {
     }
     wait_ok(b"DAC_CREAT_RACE", pid);
     sys_unlink(p.as_ptr());
+}
+
+// ---------------------------------------------------------------------------
+// fs.protected_* (Linux may_follow_link, may_linkat, may_create_in_sticky)
+// ---------------------------------------------------------------------------
+
+/// The fs.protected_* values the child expects (0 or 1)
+static PROTECTED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+const PROT_KNOBS: [&[u8]; 4] = [
+    b"/proc/sys/fs/protected_symlinks\0",
+    b"/proc/sys/fs/protected_hardlinks\0",
+    b"/proc/sys/fs/protected_fifos\0",
+    b"/proc/sys/fs/protected_regular\0",
+];
+
+fn set_protected(v: u8) -> bool {
+    PROT_KNOBS.iter().all(|k| {
+        let fd = sys_open(k.as_ptr(), O_WRONLY, 0);
+        let ok = fd >= 0 && sys_write(fd as u64, [b'0' + v].as_ptr(), 1) == 1;
+        if fd >= 0 {
+            sys_close(fd as u64);
+        }
+        ok
+    })
+}
+
+fn protected() {
+    // Root's sticky world-writable directory holding a third user's
+    // symlink, file and FIFO (owned by neither the directory's owner nor
+    // the caller: what the knobs guard), and a root file elsewhere to
+    // hard-link
+    const OTHER: u32 = 3000;
+    mkdirm(b"/tmp/dac/prot\0", 0o1777, 0);
+    mkfile(b"/tmp/dac/prot/f\0", b"x", 0o666, OTHER);
+    hk_syscall::sys_mknod(b"/tmp/dac/prot/p\0".as_ptr(), 0o010666, 0);
+    sys_chmod(b"/tmp/dac/prot/p\0".as_ptr(), 0o666);
+    sys_chown(b"/tmp/dac/prot/p\0".as_ptr(), OTHER, OTHER);
+    sys_symlink(b"/tmp/dac/prot/f\0".as_ptr(), b"/tmp/dac/prot/l\0".as_ptr());
+    hk_syscall::sys_lchown(b"/tmp/dac/prot/l\0".as_ptr(), OTHER, OTHER);
+    mkfile(b"/tmp/dac/hl_src\0", b"y", 0o600, 0);
+    for (v, name) in [(0u8, &b"DAC_PROTECTED_OFF"[..]), (1, b"DAC_PROTECTED_ON")] {
+        if !set_protected(v) {
+            print(name);
+            println(b":FAIL cannot set fs.protected_*");
+            continue;
+        }
+        PROTECTED.store(u32::from(v), core::sync::atomic::Ordering::Relaxed);
+        run(name, t_protected);
+        // The child cannot unlink root's link in the sticky directory
+        sys_unlink(b"/tmp/dac/prot/hl\0".as_ptr());
+    }
+    set_protected(0);
+}
+
+fn t_protected(name: &[u8]) -> u64 {
+    let on = PROTECTED.load(core::sync::atomic::Ordering::Relaxed) == 1;
+    let closed = |r: i64| {
+        if r >= 0 {
+            sys_close(r as u64);
+            0
+        } else {
+            r
+        }
+    };
+    let mut bad = 0;
+    let r = closed(sys_open(b"/tmp/dac/prot/l\0".as_ptr(), O_RDONLY, 0));
+    bad += chk(name, b"follow symlink", r, if on { EACCES } else { 0 });
+    let r = sys_link(
+        b"/tmp/dac/hl_src\0".as_ptr(),
+        b"/tmp/dac/prot/hl\0".as_ptr(),
+    );
+    bad += chk(name, b"hard link", r, if on { EPERM } else { 0 });
+    let r = closed(sys_open(
+        b"/tmp/dac/prot/f\0".as_ptr(),
+        O_CREAT | O_RDWR,
+        0o666,
+    ));
+    bad += chk(name, b"O_CREAT regular", r, if on { EACCES } else { 0 });
+    let nb = hk_syscall::O_NONBLOCK;
+    let r = closed(sys_open(
+        b"/tmp/dac/prot/p\0".as_ptr(),
+        O_CREAT | O_RDONLY | nb,
+        0o666,
+    ));
+    bad += chk(name, b"O_CREAT fifo", r, if on { EACCES } else { 0 });
+    bad
 }

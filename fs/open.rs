@@ -97,6 +97,11 @@ fn open_target(
     if !created && d.get_inode().is_some_and(|i| i.mode().is_dir()) {
         return Err(KernelError::IsDirectory);
     }
+    // An existing file opened O_CREAT in a sticky directory (Linux
+    // may_create_in_sticky: fs.protected_fifos / _regular)
+    if !created && let (Some(dir), Some(inode)) = (p.dir.get_inode(), d.get_inode()) {
+        super::dac::may_create_in_sticky(&crate::task::current_cred(), &dir, &inode)?;
+    }
     Ok((d, created))
 }
 

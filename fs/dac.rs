@@ -466,3 +466,104 @@ pub fn xattr_permission(inode: &Inode, name: &str, mask: u32) -> Result<(), Kern
     }
     permission_as(&c, inode, mask)
 }
+
+// fs.protected_* (Linux fs/namei.c sysctl_protected_*): kernel defaults
+// 0, as on Linux (distributions raise them at boot)
+static PROTECTED_SYMLINKS: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+static PROTECTED_HARDLINKS: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+static PROTECTED_FIFOS: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+static PROTECTED_REGULAR: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+fn knob(k: &core::sync::atomic::AtomicU8) -> u8 {
+    k.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+macro_rules! protected_ctl {
+    ($path:literal, $k:ident, $max:literal) => {
+        crate::sysctl::Ctl {
+            path: $path,
+            mode: 0o600,
+            show: || alloc::vec![i64::from(knob(&$k))],
+            store: |v| {
+                crate::sysctl::range(v[0], 0, $max)?;
+                $k.store(v[0] as u8, core::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            },
+            text: None,
+        }
+    };
+}
+
+/// /proc/sys/fs/protected_* (mode 0600, as Linux)
+pub static PROTECTED_CTLS: &[crate::sysctl::Ctl] = &[
+    protected_ctl!("fs/protected_symlinks", PROTECTED_SYMLINKS, 1),
+    protected_ctl!("fs/protected_hardlinks", PROTECTED_HARDLINKS, 1),
+    protected_ctl!("fs/protected_fifos", PROTECTED_FIFOS, 2),
+    protected_ctl!("fs/protected_regular", PROTECTED_REGULAR, 2),
+];
+
+const S_IWOTH: u16 = 0o002;
+const S_IWGRP: u16 = 0o020;
+
+/// Following symlink `link` found in `dir` (Linux may_follow_link): with
+/// fs.protected_symlinks, a link in a sticky world-writable directory
+/// is followed only by its owner or when the directory's owner owns it
+/// (EACCES)
+pub fn may_follow_link(c: &Cred, dir: &Inode, link: &Inode) -> Result<(), KernelError> {
+    if knob(&PROTECTED_SYMLINKS) == 0 || link.uid() == c.fsuid {
+        return Ok(());
+    }
+    let mode = dir.mode().raw();
+    if mode & (S_ISVTX | S_IWOTH) != S_ISVTX | S_IWOTH || dir.uid() == link.uid() {
+        return Ok(());
+    }
+    Err(KernelError::PermissionDenied)
+}
+
+/// Hard-linking `inode` (Linux may_linkat): with fs.protected_hardlinks
+/// only its owner (or CAP_FOWNER) may, unless it is a safe source: a
+/// regular file, not set-user-ID, not set-group-ID-executable, that the
+/// caller may read and write (EPERM)
+pub fn may_linkat(c: &Cred, inode: &Inode) -> Result<(), KernelError> {
+    if knob(&PROTECTED_HARDLINKS) == 0 || owner_or_capable(c, inode) {
+        return Ok(());
+    }
+    let mode = inode.mode();
+    let raw = mode.raw();
+    let safe = mode.is_file()
+        && raw & S_ISUID == 0
+        && raw & (S_ISGID | S_IXGRP) != S_ISGID | S_IXGRP
+        && permission_as(c, inode, MAY_READ | MAY_WRITE).is_ok();
+    if safe {
+        Ok(())
+    } else {
+        Err(KernelError::NotPermitted)
+    }
+}
+
+/// An O_CREAT open of the existing `inode` in `dir` (Linux
+/// may_create_in_sticky): with fs.protected_fifos / _regular, a FIFO or
+/// regular file in a sticky directory owned by neither the directory's
+/// owner nor the caller is refused if the directory is world-writable
+/// (level 1), or group-writable (level 2) (EACCES)
+pub fn may_create_in_sticky(c: &Cred, dir: &Inode, inode: &Inode) -> Result<(), KernelError> {
+    let dmode = dir.mode().raw();
+    let mode = inode.mode();
+    let level = if mode.is_file() {
+        knob(&PROTECTED_REGULAR)
+    } else if mode.is_fifo() {
+        knob(&PROTECTED_FIFOS)
+    } else {
+        return Ok(());
+    };
+    if dmode & S_ISVTX == 0 || level == 0 {
+        return Ok(());
+    }
+    if inode.uid() == dir.uid() || inode.uid() == c.fsuid {
+        return Ok(());
+    }
+    if dmode & S_IWOTH != 0 || (dmode & S_IWGRP != 0 && level >= 2) {
+        return Err(KernelError::PermissionDenied);
+    }
+    Ok(())
+}
