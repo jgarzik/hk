@@ -34,6 +34,27 @@ unsafe extern "C" {
     fn __switch_to_asm_first(next_ctx: *const Aarch64TaskContext, new_kstack: u64);
 }
 
+/// Host tests link the scheduler without switch_to.S (build.rs
+/// assembles it for the kernel only); nothing switches there
+#[cfg(test)]
+mod host_stubs {
+    use super::Aarch64TaskContext;
+
+    #[unsafe(no_mangle)]
+    extern "C" fn __switch_to_asm(
+        _prev_ctx: *mut Aarch64TaskContext,
+        _next_ctx: *const Aarch64TaskContext,
+        _new_kstack: u64,
+    ) {
+        unreachable!("context switch in a host test");
+    }
+
+    #[unsafe(no_mangle)]
+    extern "C" fn __switch_to_asm_first(_next_ctx: *const Aarch64TaskContext, _new_kstack: u64) {
+        unreachable!("context switch in a host test");
+    }
+}
+
 /// AArch64 task context for context switching
 ///
 /// Contains callee-saved registers that must be preserved across function calls.

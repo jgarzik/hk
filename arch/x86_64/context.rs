@@ -33,6 +33,21 @@ unsafe extern "C" {
     fn __switch_to_asm_first(next_sp: u64, new_kstack: u64);
 }
 
+/// Host tests link the scheduler without switch_to.S (build.rs
+/// assembles it for the kernel only); nothing switches there
+#[cfg(test)]
+mod host_stubs {
+    #[unsafe(no_mangle)]
+    extern "C" fn __switch_to_asm(_prev_sp_ptr: *mut u64, _next_sp: u64, _new_kstack: u64) {
+        unreachable!("context switch in a host test");
+    }
+
+    #[unsafe(no_mangle)]
+    extern "C" fn __switch_to_asm_first(_next_sp: u64, _new_kstack: u64) {
+        unreachable!("context switch in a host test");
+    }
+}
+
 /// Kernel thread context (callee-saved registers only)
 ///
 /// This is a minimal context structure for kernel thread switching.
