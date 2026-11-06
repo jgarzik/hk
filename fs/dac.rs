@@ -569,3 +569,76 @@ pub fn may_create_in_sticky(c: &Cred, dir: &Inode, inode: &Inode) -> Result<(), 
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::task::GroupInfo;
+
+    const R: u32 = MAY_READ;
+    const W: u32 = MAY_WRITE;
+    const X: u32 = MAY_EXEC;
+
+    fn ok(c: &Cred, uid: Uid, gid: Gid, perm: u16, dir: bool, mask: u32) -> bool {
+        permission_ids(c, uid, gid, perm, dir, mask).is_ok()
+    }
+
+    /// Linux acl_permission_check: only the caller's class counts; an
+    /// owner denied by the owner bits is not let in by group or other
+    #[test]
+    fn class_bits_only() {
+        let u = Cred::new(1000, 1000);
+        assert!(ok(&u, 1000, 0, 0o600, false, R | W));
+        assert!(!ok(&u, 1000, 0, 0o066, false, R));
+        assert!(ok(&u, 0, 1000, 0o040, false, R));
+        assert!(!ok(&u, 0, 1000, 0o404, false, R));
+        assert!(ok(&u, 0, 0, 0o004, false, R));
+        assert!(!ok(&u, 0, 0, 0o770, false, R));
+        assert!(!ok(&u, 1000, 1000, 0o600, false, X));
+    }
+
+    /// The fsuid and fsgid decide, and a supplementary group is a group
+    #[test]
+    fn fs_ids_and_groups() {
+        let mut u = Cred::new(1000, 1000);
+        u.fsuid = 2000;
+        assert!(!ok(&u, 1000, 0, 0o600, false, R));
+        assert!(ok(&u, 2000, 0, 0o600, false, R));
+        u.groups = GroupInfo::new(alloc::vec![27, 5]);
+        assert!(ok(&u, 0, 27, 0o060, false, R | W));
+        assert!(!ok(&u, 0, 28, 0o060, false, R));
+    }
+
+    /// MAY_OPEN and MAY_APPEND are not mode bits: they never refuse
+    #[test]
+    fn extra_mask_bits_ignored() {
+        let u = Cred::new(1000, 1000);
+        assert!(ok(&u, 1000, 1000, 0o200, false, W | MAY_APPEND | MAY_OPEN));
+    }
+
+    /// Linux ACC_MODE plus O_TRUNC (write) and O_APPEND (MAY_APPEND)
+    #[test]
+    fn open_access_mode() {
+        assert_eq!(acc_mode(0), R);
+        assert_eq!(acc_mode(1), W);
+        assert_eq!(acc_mode(2), R | W);
+        assert_eq!(acc_mode(3), R | W);
+        assert_eq!(acc_mode(O_TRUNC), R | W);
+        assert_eq!(acc_mode(1 | O_APPEND), W | MAY_APPEND);
+    }
+
+    /// access(2) checks with the real ids, and keeps capabilities only
+    /// for a real root (Linux access_override_creds)
+    #[test]
+    fn access_uses_real_ids() {
+        let mut c = Cred::new(1000, 1000);
+        c.euid = 0;
+        c.fsuid = 0;
+        c.cap_permitted = crate::task::KernelCap::full();
+        let a = access_cred(&c);
+        assert_eq!((a.fsuid, a.fsgid), (1000, 1000));
+        assert!(!a.cap_effective.has(CAP_DAC_OVERRIDE));
+        let r = access_cred(&Cred::ROOT);
+        assert!(r.cap_effective.has(CAP_DAC_OVERRIDE));
+    }
+}

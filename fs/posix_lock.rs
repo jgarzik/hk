@@ -520,4 +520,85 @@ mod tests {
         // Ending exactly at OFFSET_MAX is the same as "to EOF"
         assert_eq!(r(0, i64::MAX, 1), Ok((i64::MAX as u64, u64::MAX)));
     }
+
+    use PosixLockType::{Read, Write};
+
+    fn ranges(l: &InodeLocks, owner: u64) -> Vec<(u64, u64, PosixLockType)> {
+        let mut v: Vec<_> = l
+            .locks
+            .iter()
+            .filter(|k| k.owner == owner)
+            .map(|k| (k.start, k.end, k.lock_type))
+            .collect();
+        v.sort_by_key(|k| k.0);
+        v
+    }
+
+    /// Reads share, a write excludes; an owner never conflicts with
+    /// itself (Linux posix_locks_conflict)
+    #[test]
+    fn conflicts() {
+        let mut l = InodeLocks::default();
+        l.try_lock((1, 1), 0, 10, Read).unwrap();
+        assert!(l.try_lock((2, 2), 5, 15, Read).is_ok());
+        assert_eq!(
+            l.try_lock((3, 3), 9, 20, Write),
+            Err(KernelError::WouldBlock)
+        );
+        assert!(l.try_lock((3, 3), 15, 20, Write).is_ok());
+        assert!(l.find_conflict(0, 1, Write, 9).is_some());
+        assert!(l.find_conflict(10, 15, Write, 2).is_none());
+        assert!(l.try_lock((1, 1), 0, 10, Write).is_err());
+        // End is exclusive: [0, 10) and [10, ..) do not touch
+        assert!(l.find_conflict(20, u64::MAX, Write, 9).is_none());
+    }
+
+    /// Unlocking the middle splits a lock; the ends shrink it
+    #[test]
+    fn unlock_splits() {
+        let mut l = InodeLocks::default();
+        l.try_lock((1, 1), 0, 100, Write).unwrap();
+        l.unlock_range(1, 40, 60);
+        assert_eq!(ranges(&l, 1), [(0, 40, Write), (60, 100, Write)]);
+        l.unlock_range(1, 0, 10);
+        l.unlock_range(1, 90, u64::MAX);
+        assert_eq!(ranges(&l, 1), [(10, 40, Write), (60, 90, Write)]);
+        l.unlock_range(1, 0, u64::MAX);
+        assert!(ranges(&l, 1).is_empty());
+    }
+
+    /// A new lock replaces the owner's overlap, changing its type in
+    /// the overlap only; touching locks of one type merge (Linux
+    /// posix_lock_inode)
+    #[test]
+    fn replace_and_merge() {
+        let mut l = InodeLocks::default();
+        l.try_lock((1, 1), 0, 10, Read).unwrap();
+        l.try_lock((1, 1), 10, 20, Read).unwrap();
+        assert_eq!(ranges(&l, 1), [(0, 20, Read)]);
+        l.try_lock((1, 1), 5, 15, Write).unwrap();
+        assert_eq!(
+            ranges(&l, 1),
+            [(0, 5, Read), (5, 15, Write), (15, 20, Read)]
+        );
+        l.try_lock((1, 1), 0, 20, Read).unwrap();
+        assert_eq!(ranges(&l, 1), [(0, 20, Read)]);
+        // Another owner's locks are untouched
+        l.try_lock((2, 2), 30, 40, Write).unwrap();
+        l.try_lock((1, 1), 20, 30, Read).unwrap();
+        assert_eq!(ranges(&l, 1), [(0, 30, Read)]);
+        assert_eq!(ranges(&l, 2), [(30, 40, Write)]);
+        assert!(l.remove_all_for_owner(1));
+        assert!(!l.remove_all_for_owner(1));
+        assert_eq!(ranges(&l, 2), [(30, 40, Write)]);
+    }
+
+    /// A lock already held as asked keeps its pid (F_GETLK's l_pid)
+    #[test]
+    fn same_lock_keeps_pid() {
+        let mut l = InodeLocks::default();
+        l.try_lock((1, 100), 0, 10, Write).unwrap();
+        l.try_lock((1, 200), 2, 8, Write).unwrap();
+        assert_eq!(l.find_conflict(0, 10, Read, 2).map(|k| k.pid), Some(100));
+    }
 }
