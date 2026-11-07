@@ -123,7 +123,7 @@ pub fn create_pidfd(pid: Pid, file_flags: u32) -> Result<Arc<File>, KernelError>
 
 /// Notify all pidfds for the given PID that the process has exited
 ///
-/// Called from mark_zombie() when a process transitions to zombie state.
+/// Called from exit_notify() when a process transitions to zombie state.
 /// Process `pid` has exited with wait `status` (its last thread): its
 /// pidfds become readable
 pub fn notify_process_exit(pid: Pid, status: i32) {

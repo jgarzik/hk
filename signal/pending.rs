@@ -62,6 +62,11 @@ impl SigQueue {
         Some(q)
     }
 
+    /// Fill in its info (an entry made before the info was known)
+    pub fn set_info(&mut self, info: SigInfo) {
+        self.info = info;
+    }
+
     /// Its info
     pub fn info(&self) -> &SigInfo {
         &self.info

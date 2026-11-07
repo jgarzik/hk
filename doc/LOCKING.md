@@ -877,7 +877,7 @@ link `Task.sibling`, one strong reference each; Linux only lists
 leaders); `link_child` at fork and exec's leader change, unlinked at
 reap. An exiting task first hands its children to another live thread
 of its group, else the nearest child subreaper, else init
-(`forget_original_parent`, `reparent`); an exited non-leader thread
+(`forget_original_parent`, `adopt`); an exited non-leader thread
 leaves the task list at once (Linux release_task), unless traced.
 A group leader's `threads` (intrusive `ArcList`, link
 `Task.thread_node`, the leader included; Linux signal->thread_head)
@@ -2901,10 +2901,28 @@ de_thread, exit_group does not.
   after dropping it.
 - A leader is reported to its parent once (Linux exit_notify /
   release_task under tasklist_lock): the leader decides in the TASKLIST
-  write section that makes it a zombie (`mark_zombie`), each untraced
+  write section that makes it a zombie (`exit_notify`), each untraced
   thread in the one that removes it (`release_thread`); a thread still
   listed counts as left to report it, so exactly the last section
-  finds the group empty. The signal is sent after TASKLIST is dropped.
+  finds the group empty.
+- A zombie's notice (Linux do_notify_parent) is queued in the TASKLIST
+  write section that makes it reapable: the one that makes it a zombie
+  (`exit_notify`), removes its group's last thread (`release_thread`)
+  or moves it to a parent in another process (`reparent_children`,
+  Linux reparent_leader). So no wait reaps it before its signal is
+  pending, and a parent the signal wakes finds it. Under the write
+  lock: the receiver and signal, the autoreap decision (the parent's
+  `SigHand.action`) and the queueing (`signal::send_held`: TASKLIST →
+  Task.sig → SignalStruct.shared → SigHand.action, the order above);
+  an autoreaped zombie leaves the task list there too (Linux
+  EXIT_DEAD). Its `SigQueue` entry is made and charged before the lock
+  (`notify::Entry`, for the receiver's user found under the read lock);
+  if the receiver's user or the signal changed by the time the write
+  lock is held (`Entry::fits`), the lock is dropped and a new entry made
+  before anything changes. After the lock: the unused entry is freed,
+  signalfd readers and the receiving thread are woken
+  (`Posted::finish`: complete_signal takes TASKLIST itself), the
+  autoreaped Task released.
 - de_thread (exec) holds cred_guard (sleeping, outermost) while it waits
   for the other threads on CHILD_EXIT_WQ (killable); it holds no
   spinlock. A thread blocked on that cred_guard (its own exec, or an

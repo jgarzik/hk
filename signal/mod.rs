@@ -1262,7 +1262,11 @@ struct Target {
 }
 
 fn target(t: &TaskRef) -> Option<Target> {
-    let table = TASKLIST.read();
+    target_in(&TASKLIST.read(), t)
+}
+
+/// [`target`] under TASKLIST held by the caller
+fn target_in(table: &crate::task::percpu::GlobalTaskTable, t: &TaskRef) -> Option<Target> {
     let v = table
         .get(t.tid())
         .filter(|v| core::ptr::eq(v.task, Arc::as_ptr(t)))?;
@@ -1384,6 +1388,72 @@ fn send_task(t: &TaskRef, sig: u32, info: SendInfo, ty: PidType, force: bool) ->
     }
     complete_signal(t, sig, ty, wants, sighand);
     0
+}
+
+/// Group signal `sig` with `info` to task `t`, queued under TASKLIST
+/// held by the caller (Linux do_notify_parent's __group_send_sig_info
+/// under tasklist_lock): `q` is its entry, made before TASKLIST was
+/// taken, which it takes if queued; an unused one is the caller's to
+/// free after unlocking. Signalfd readers and the thread that takes it
+/// are woken by [`Posted::finish`], after TASKLIST is dropped.
+fn send_held(
+    table: &crate::task::percpu::GlobalTaskTable,
+    t: &TaskRef,
+    sig: u32,
+    info: SigInfo,
+    q: &mut Option<Box<SigQueue>>,
+) -> Option<Posted> {
+    check_send_context();
+    let tg = target_in(table, t)?;
+    if sig == 0 || sig > 64 || tg.kthread || tg.group_exit {
+        return None;
+    }
+    let info = SendInfo::Info(info);
+    let to = Send {
+        sig,
+        init: tg.init && !INIT_KILLABLE.load(core::sync::atomic::Ordering::Acquire),
+        info: &info,
+        ty: PidType::Tgid,
+        stopped: tg.stopped,
+    };
+    if let Some(e) = q.as_mut() {
+        e.set_info(info.resolve(sig));
+    }
+    // A send changes no blocked mask: with_sig retargets nothing (which
+    // would take TASKLIST)
+    let sighand = tg.sighand.as_ref();
+    let sent = with_sig(t, |t, state| send_locked(t, state, sighand, &to, q));
+    let Sent::Queued(wants) = sent else {
+        return None;
+    };
+    Some(Posted {
+        t: t.clone(),
+        sig,
+        wants,
+        sighand: tg.sighand,
+    })
+}
+
+/// A group signal [`send_held`] queued, whose wakeups wait for TASKLIST
+/// to be dropped
+#[must_use]
+pub struct Posted {
+    t: TaskRef,
+    sig: u32,
+    wants: bool,
+    sighand: Option<Arc<SigHand>>,
+}
+
+impl Posted {
+    /// Wake its signalfd readers and the thread that takes it (Linux
+    /// signalfd_notify, complete_signal); TASKLIST not held
+    pub fn finish(self) {
+        let sighand = self.sighand.as_ref();
+        if let Some(h) = sighand {
+            h.signalfd_wq.wake_all();
+        }
+        complete_signal(&self.t, self.sig, PidType::Tgid, self.wants, sighand);
+    }
 }
 
 /// What a send is, for its locked part
