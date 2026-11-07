@@ -393,20 +393,28 @@ fn limits(vdev: &VirtioDevice, ring: u16) -> QueueLimits {
     }
 }
 
-fn nr_queues(vdev: &VirtioDevice) -> u16 {
+/// Request queues to set up: EINVAL if MQ reports none (Linux init_vq),
+/// ENOENT if the transport has none (vp_find_vqs: no such queue)
+fn nr_queues(vdev: &VirtioDevice) -> Result<u16, KernelError> {
     let n = if vdev.has_feature(feature::MQ) {
-        vdev.read_config(|d| d.cfg16(cfg::NUM_QUEUES)).max(1)
+        vdev.read_config(|d| d.cfg16(cfg::NUM_QUEUES))
     } else {
         1
     };
-    n.min(vdev.num_queues()).min(MAX_QUEUES)
+    if n == 0 {
+        return Err(KernelError::InvalidArgument);
+    }
+    match n.min(vdev.num_queues()).min(MAX_QUEUES) {
+        0 => Err(KernelError::NotFound),
+        n => Ok(n),
+    }
 }
 
 /// Virtqueues and their hardware queues; also the smallest ring
 fn setup_queues(vdev: &Arc<VirtioDevice>) -> Result<(BlkMq, u16), KernelError> {
     let mut ops: Vec<Box<dyn MqOps>> = Vec::new();
     let mut ring = u16::MAX;
-    for i in 0..nr_queues(vdev) {
+    for i in 0..nr_queues(vdev)? {
         let vq = vdev.setup_vq(i)?;
         ring = ring.min(vq.num());
         ops.push(try_box(VbQueue::new(vdev, vq)?)?);
@@ -414,7 +422,7 @@ fn setup_queues(vdev: &Arc<VirtioDevice>) -> Result<(BlkMq, u16), KernelError> {
     if ring < 3 {
         return Err(KernelError::NoDevice);
     }
-    Ok((BlkMq::new(ops), ring))
+    Ok((BlkMq::new(ops)?, ring))
 }
 
 fn new_disk(vdev: &Arc<VirtioDevice>) -> Result<Arc<Disk>, KernelError> {
