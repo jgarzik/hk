@@ -1674,10 +1674,6 @@ pub fn mark_zombie(tid: Tid, status: i32, group_dead: bool) {
         }
     }
 
-    // Detach from cgroup and decrement task counters
-    // This must be done after releasing TASKLIST lock to avoid lock ordering issues
-    crate::cgroup::detach_task(tid);
-
     // The process's pidfds once its last thread is gone (Linux
     // do_notify_pidfd; after TASKLIST)
     if let Some(p) = pid
@@ -2857,6 +2853,10 @@ pub fn exit_current(status: Option<i32>) -> ! {
     if tid != 0 {
         forget_original_parent();
         crate::task::ptrace::exit_ptrace();
+        // Out of its cgroup while still running, before it is a zombie
+        // a waiting parent may reap at once (Linux do_exit: cgroup_exit
+        // before exit_notify); TASKLIST is not held
+        crate::cgroup::detach_task(tid);
     }
     if let Some(st) = status {
         mark_zombie(tid, st, group_dead);

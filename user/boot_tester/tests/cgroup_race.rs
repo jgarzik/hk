@@ -8,7 +8,12 @@
 //!   and leaves pids.current at 0.
 //! - PIDS_MAX_RACE: two members fork concurrently into pids.max=8 with
 //!   three members already there: exactly five forks succeed (the charge
-//!   is added and checked in one step; nothing passes the limit).
+//!   is added and checked in one step; nothing passes the limit). The
+//!   forkers start together once both exist; afterwards the cgroup is
+//!   empty (rmdir works).
+//! - PIDS_EXIT_REAP: children reaped the moment they exit leave their
+//!   cgroup: pids.current is back to 0 and rmdir works (Linux
+//!   cgroup_exit runs before exit_notify makes a task reapable).
 //!
 //!
 //! cgroup_mutex and dead cgroups (Linux cgroup_kn_lock_live,
@@ -60,6 +65,7 @@ pub fn run_tests() {
     report(b"PIDS_MAX_FORK", pids_max_fork());
     report(b"PIDS_INTO_CGROUP", pids_into_cgroup());
     report(b"PIDS_MAX_RACE", pids_max_race());
+    report(b"PIDS_EXIT_REAP", pids_exit_reap());
     report(b"CGROUP_DEAD_ENODEV", cgroup_dead_enodev());
     report(b"CGROUP_RMDIR_RACE", cgroup_rmdir_race());
     report(b"CGROUP_PROCS_TGID", in_child(cgroup_procs_tgid));
@@ -426,10 +432,15 @@ fn pids_into_cgroup() -> i64 {
 }
 
 const RACE_MAX: i64 = 8;
+const WNOHANG: i32 = 1;
 
 /// Fork sleepers until EAGAIN, then wait for the other forker to be
 /// done too (so no slot frees early), then reap: the count in `out[1+i]`
 fn forker(i: usize, out: &[AtomicI32]) -> ! {
+    // Both forkers exist before either forks (out[0]: go)
+    while out[0].load(Ordering::Acquire) == 0 {
+        sys_sched_yield();
+    }
     let mut kids = [0i64; RACE_MAX as usize];
     let mut n = 0;
     loop {
@@ -484,9 +495,13 @@ fn pids_max_race() -> i64 {
             }
             pid
         });
+        sh[0].store(1, Ordering::Release);
         for pid in f {
             let mut ws = 0;
             sys_wait4(pid, &mut ws, 0, 0);
+        }
+        if f.iter().any(|&p| p <= 0) {
+            return 2;
         }
         let total = sh[1].load(Ordering::Acquire) as i64 + sh[2].load(Ordering::Acquire) as i64;
         if total != RACE_MAX - 3 {
@@ -495,8 +510,51 @@ fn pids_max_race() -> i64 {
         0
     });
     sys_munmap(p as u64, 4096);
-    remove_cgroup(cg);
+    let mut b = [0u8; 96];
+    if sys_rmdir(path(&mut b, cg, b"").as_ptr()) != 0 && r == 0 {
+        return 3;
+    }
     r
+}
+
+/// In a child that joined a fresh cgroup: children each exit at
+/// once while the child polls wait4 for them (1000 times); then pids.current is 0 and the
+/// cgroup can be removed
+fn pids_exit_reap() -> i64 {
+    let cg = b"pl_reap";
+    if !make_cgroup(cg, b"max") {
+        return 90;
+    }
+    let r = in_child(|| {
+        if !join(cg) {
+            return 1;
+        }
+        for _ in 0..1000 {
+            let pid = sys_fork();
+            if pid == 0 {
+                sys_exit(0);
+            }
+            if pid < 0 {
+                return 2;
+            }
+            // Polled, so a reap can come the moment it is a zombie
+            let mut ws = 0;
+            while sys_wait4(pid, &mut ws, WNOHANG, 0) == 0 {}
+        }
+        0
+    });
+    let cur = read_num(cg, b"pids.current");
+    let mut b = [0u8; 96];
+    let rm = sys_rmdir(path(&mut b, cg, b"").as_ptr());
+    if r != 0 {
+        r
+    } else if cur != 0 {
+        10 + cur
+    } else if rm != 0 {
+        rm
+    } else {
+        0
+    }
 }
 
 fn clone3_into(fd: i64) -> i64 {

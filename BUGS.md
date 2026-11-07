@@ -76,7 +76,9 @@ the existing children and migrates their tasks), and disabling it
 removes nothing. A task in a cgroup without a controller is charged
 nowhere; Linux charges the nearest ancestor that has it (the effective
 css). The no-internal-processes rule (EBUSY when enabling in a cgroup
-with tasks) is not enforced.
+with tasks) is not enforced. A pids charge goes back when the task
+exits; Linux keeps a zombie charged until it is reaped (pids_release
+from release_task).
 
 No controller but pids is applied: CPU bandwidth, memory and IO
 limits, and cgroup.freeze are stored (and read back) but nothing is
