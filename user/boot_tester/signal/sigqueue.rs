@@ -60,7 +60,7 @@ use hk_syscall::{
 };
 use hk_syscall::{
     RLIMIT_SIGPENDING, RLimit, SA_RESTORER, SA_SIGINFO, SFD_NONBLOCK, SIG_DFL, SigInfo, sys_close,
-    sys_exit, sys_fork, sys_getpid, sys_getrlimit, sys_kill, sys_read, sys_rt_sigaction,
+    sys_exit, sys_fork, sys_getpid, sys_getrlimit, sys_kill, sys_pause, sys_read, sys_rt_sigaction,
     sys_rt_sigpending, sys_rt_sigprocmask, sys_rt_sigqueueinfo, sys_rt_sigtimedwait, sys_setrlimit,
     sys_signalfd4, sys_wait4,
 };
@@ -86,6 +86,7 @@ pub fn run_tests() {
     test_handler_info();
     test_mq_info();
     test_trapped_info();
+    test_sigchld_at_reap();
     test_ignore_flush();
     test_ignore_flush_no_leader();
     test_group_thread();
@@ -573,6 +574,58 @@ fn test_trapped_info() {
         print_num(info.si_pid as i64);
         print(b" status=");
         print_num(info.si_status as i64);
+        println(b"");
+    }
+}
+
+/// A child's SIGCHLD is queued by the time wait4 can reap it (Linux
+/// exit_notify: do_notify_parent and EXIT_ZOMBIE in one tasklist_lock
+/// section): SIGKILL a pausing child, or a traced one in its stop, then
+/// wait4; SIGCHLD is pending at once, every round
+fn test_sigchld_at_reap() {
+    const PTRACE_TRACEME: i64 = 0;
+    const SIGSTOP: u32 = 19;
+    const SIGKILL: u32 = 9;
+    const ROUNDS: i64 = 40;
+    let old = block(bit(SIGCHLD));
+    let mut missed = [0i64; 2];
+    for traced in [false, true] {
+        for _ in 0..ROUNDS {
+            let child = sys_fork();
+            if child == 0 {
+                if traced {
+                    sys_ptrace(PTRACE_TRACEME, 0, 0, 0);
+                    sys_kill(sys_getpid(), SIGSTOP);
+                }
+                loop {
+                    sys_pause();
+                }
+            }
+            let mut info = zeroed();
+            if traced {
+                // Its CLD_TRAPPED stop
+                wait_sig(bit(SIGCHLD), 10, &mut info);
+            }
+            sys_kill(child, SIGKILL);
+            let mut st = 0i32;
+            sys_wait4(child, &mut st, 0, 0);
+            if wait_sig(bit(SIGCHLD), 0, &mut info) != SIGCHLD as i64 {
+                missed[traced as usize] += 1;
+            }
+            // Nothing of this round stays pending for the next
+            while wait_sig(bit(SIGCHLD), 0, &mut info) == SIGCHLD as i64 {}
+        }
+    }
+    setmask(old);
+    if missed == [0, 0] {
+        pass(b"SIGQUEUE_SIGCHLD_AT_REAP");
+    } else {
+        print(b"SIGQUEUE_SIGCHLD_AT_REAP:FAIL missed plain=");
+        print_num(missed[0]);
+        print(b" traced=");
+        print_num(missed[1]);
+        print(b" of ");
+        print_num(ROUNDS);
         println(b"");
     }
 }
