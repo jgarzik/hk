@@ -857,9 +857,12 @@ compare-and-swap; bits set and cleared atomically). `PIDMAP_LOCK`
 (spin leaf, thread context only, nothing allocates under it) protects
 the global hash chains of every live `Pid`'s numbers: `alloc_pid`
 links them, `find_pid` walks them (taking a strong reference only
-while the `Pid` lives: the hash holds weak ones), and the last drop of
-a `Pid` unlinks them. It is taken under nothing but may be taken
-under TASKLIST (a reaped task's `Pid` is dropped after TASKLIST).
+while the `Pid` lives: the hash holds weak ones), and they are
+unlinked and given back when the last task leaves the `Pid`
+(`release_numbers` from `GlobalTaskTable::remove`, `change_pids` and
+`take_leadership`, under TASKLIST's write lock: Linux free_pid from
+detach_pid), or at its last drop if no task ever left it. It is taken
+under nothing but may be taken under TASKLIST.
 A process's pid is its leader's tid; an exec from a non-leader takes
 the leader's tid and `Pid` (`take_leadership`, Linux exchange_tids)
 under TASKLIST (the run queue knows tasks by reference, not by

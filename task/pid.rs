@@ -21,7 +21,7 @@ use crate::util::error::KernelError;
 use crate::util::kalloc::{arc_nofail, box_nofail, try_arc, try_box};
 use alloc::boxed::Box;
 use alloc::sync::{Arc, Weak};
-use core::sync::atomic::{AtomicI64, AtomicPtr, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI64, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
 use crate::ns::PidNamespace;
 use crate::sync::spin::Mutex;
@@ -79,6 +79,10 @@ pub struct Pid {
     /// the leader carries): what it registered before an exec is not
     /// delivered after it
     exec_gen: AtomicU64,
+    /// Its numbers are hashed and taken: from alloc until the last task
+    /// leaves it (`release_numbers`, Linux free_pid) or it is dropped;
+    /// changed under PIDMAP_LOCK, which orders it
+    hashed: AtomicBool,
 }
 
 /// `Pid.exit` of a process that still runs
@@ -333,6 +337,7 @@ pub fn alloc_pid_nr(ns: &Arc<PidNamespace>, root_nr: Option<u32>) -> Result<Arc<
         wait_pidfd: crate::sync::waitqueue::WaitQueue::new(),
         exit: AtomicI64::new(ALIVE),
         exec_gen: AtomicU64::new(0),
+        hashed: AtomicBool::new(true),
     })?;
     let _g = PIDMAP_LOCK.lock();
     for u in pid.numbers.iter() {
@@ -363,6 +368,7 @@ pub static INIT_STRUCT_PID: spin::Lazy<Arc<Pid>> = spin::Lazy::new(|| {
         wait_pidfd: crate::sync::waitqueue::WaitQueue::new(),
         exit: AtomicI64::new(ALIVE),
         exec_gen: AtomicU64::new(0),
+        hashed: AtomicBool::new(false),
     })
 });
 
@@ -393,12 +399,19 @@ pub fn find_pid(ns: &PidNamespace, nr: u32) -> Option<Arc<Pid>> {
     None
 }
 
-impl Drop for Pid {
-    /// Unhash every number and free it (Linux free_pid)
-    fn drop(&mut self) {
+impl Pid {
+    /// No task uses it any more (Linux free_pid, from the last
+    /// detach_pid): its numbers leave the hash and are given back, so
+    /// find_pid no longer finds it and they can name a new task, while
+    /// the struct lives on for its holders (a pidfd, a timer, an F_SETOWN
+    /// owner, a tty's session), naming no task. Once.
+    pub fn release_numbers(&self) {
         let mut weaks = [core::ptr::null_mut::<Pid>(); 33];
         {
             let _g = PIDMAP_LOCK.lock();
+            if !self.hashed.swap(false, Ordering::Relaxed) {
+                return;
+            }
             for (i, u) in self.numbers.iter().enumerate() {
                 let b = bucket(&u.ns, u.nr);
                 let me = core::ptr::from_ref::<UPid>(u).cast_mut();
@@ -416,7 +429,7 @@ impl Drop for Pid {
                     link = unsafe { &(*cur).next };
                 }
                 if let Some(w) = weaks.get_mut(i) {
-                    *w = u.pid.load(Ordering::Relaxed);
+                    *w = u.pid.swap(core::ptr::null_mut(), Ordering::Relaxed);
                 }
             }
         }
@@ -425,8 +438,17 @@ impl Drop for Pid {
         }
         for w in weaks.into_iter().filter(|w| !w.is_null()) {
             // SAFETY: the hash's weak references, released once here
+            // (the Pid itself is alive: the caller holds it)
             drop(unsafe { Weak::from_raw(w) });
         }
+    }
+}
+
+impl Drop for Pid {
+    /// Unhash every number and free it (Linux free_pid), unless the last
+    /// task's detach did
+    fn drop(&mut self) {
+        self.release_numbers();
     }
 }
 
@@ -447,5 +469,22 @@ mod tests {
         // Wraps past the end to RESERVED_PIDS
         m.last.store(m.max - 1, Ordering::Relaxed);
         assert_eq!(m.alloc(), Ok(Some(RESERVED_PIDS)));
+    }
+
+    /// A struct pid no task uses gives its number back while it is held:
+    /// not found, free to take again, not given back twice
+    #[test]
+    fn release_while_held() {
+        let ns = &crate::ns::INIT_PID_NS;
+        let p = alloc_pid(ns).unwrap();
+        let nr = p.nr();
+        assert!(find_pid(ns, nr).is_some());
+        p.release_numbers();
+        assert!(find_pid(ns, nr).is_none());
+        assert_eq!(ns.map.take(nr), Ok(true));
+        drop(p);
+        // The number is the new owner's still
+        assert_eq!(ns.map.take(nr), Ok(false));
+        ns.map.free(nr);
     }
 }
