@@ -6,7 +6,7 @@ dependencies, then the Debian goal (boot Debian trixie from a tmpfs
 initramfs: sysvinit now, systemd next). Every phase follows CLAUDE.md:
 Linux semantics binding, each commit gated alone, LOCKING.md with each
 lock change, a boot test on hk and Linux for new behavior, /code-review
-and the heavy gate (uncached gate, LOCKDEP x86+arm, TCG, stress) at
+and the heavy gate (uncached gate, LOCKDEP x86+arm, TCG, stress with OVERFLOW=1) at
 phase end. Gaps a phase leaves go to BUGS.md.
 
 | # | Phase | Why here |

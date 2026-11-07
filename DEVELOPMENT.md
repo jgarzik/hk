@@ -54,6 +54,13 @@ make check-arm      # Build + boot test in QEMU
 make check LOCKDEP=1
 make check-arm LOCKDEP=1
 
+# Integer overflow debug: the kernel (not user/) built with overflow
+# checks, so an unintended wrap is a KERNEL PANIC instead of silent
+# (release builds wrap); intended wraps use wrapping_*/overflowing_*.
+# Part of the phase-end heavy gate; combines with LOCKDEP=1
+make check OVERFLOW=1
+make check-arm OVERFLOW=1
+
 # Run interactively
 make run            # x86-64 in QEMU
 make run-arm        # aarch64 in QEMU
@@ -141,7 +148,8 @@ builds once, then repeats the hk boot tests: `STRESS_N` boots (10) of
 each arch in `STRESS_ARCHS` ("x86 arm"), at most `STRESS_JOBS` (3)
 at a time, each with its own serial log in `target/qemu/stress/`. It
 prints the failed boots with their `FAIL` lines and `STRESS-OK` or
-`STRESS-FAILED`; make variables pass through (`NO_KVM=1`, `LOCKDEP=1`).
+`STRESS-FAILED`; make variables pass through (`NO_KVM=1`, `LOCKDEP=1`, `OVERFLOW=1`);
+the phase-end sweep is `make check-stress OVERFLOW=1`.
 
 `make gate` (`tools/gate.sh`) runs `fmt-check`, `clippy` and `clippy-arm`
 (`-D warnings`) and `test`, stopping at the first failure, then builds
