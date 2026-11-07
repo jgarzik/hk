@@ -502,11 +502,6 @@ detaches it, its real parent is not told nor can wait for it (Linux
 wait_task_zombie / __ptrace_detach: do_notify_parent to the real
 parent).
 
-A traced zombie thread is never released: neither its tracer's wait
-nor `exit_ptrace` frees it (Linux wait_task_zombie, __ptrace_detach
-release_task). wait4 therefore still tests `group_alive` (zombie
-threads ignored), not the `group_pending` the notice paths use.
-
 A subreaper is found only if its ancestor task itself is alive; Linux
 find_new_reaper takes any live thread of a subreaper process.
 
@@ -529,10 +524,9 @@ clone and exit event stops (PTRACE_O_TRACEEXEC and friends,
 PTRACE_EVENT_*), PTRACE_INTERRUPT/LISTEN, group-stop interaction (SIGSTOP
 to an untraced task is ignored: stop/continue are not implemented),
 and the tracee's exit being
-reported to a tracer that is not its parent. A traced non-leader
-thread's zombie cannot be waited for by its tracer, and a sibling's
-exec removes it at once (Linux: the tracer reaps it, and de_thread
-waits for that).
+reported to a tracer that is not its parent. A sibling's exec removes
+a traced zombie thread at once (Linux de_thread waits for its tracer
+to reap it).
 
 ## NETLINK_ROUTE / SIOC* subset gaps
 

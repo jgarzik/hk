@@ -384,6 +384,7 @@ pub fn run_all_tests() {
     time::timer_accuracy::run_tests();
     time::timer_rt::run_tests();
     signal::ptrace_stop::run_tests();
+    signal::ptrace_exit::run_tests();
     process::wake_storm::run_tests();
     io::enomem::run_tests();
     io::uaccess::run_tests();

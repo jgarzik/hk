@@ -2,6 +2,7 @@
 
 pub mod fault_signals;
 pub mod ptrace_access;
+pub mod ptrace_exit;
 pub mod ptrace_stop;
 pub mod seccomp;
 pub mod sigmask;

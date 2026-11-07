@@ -878,7 +878,9 @@ leaders); `link_child` at fork and exec's leader change, unlinked at
 reap. An exiting task first hands its children to another live thread
 of its group, else the nearest child subreaper, else init
 (`forget_original_parent`, `adopt`); an exited non-leader thread
-leaves the task list at once (Linux release_task), unless traced.
+leaves the task list at once (Linux release_task), unless traced:
+then when its tracer reaps it or exits (Linux wait_task_zombie,
+exit_ptrace).
 A group leader's `threads` (intrusive `ArcList`, link
 `Task.thread_node`, the leader included; Linux signal->thread_head)
 lists its group: joined at insert, left at removal, handed to the
@@ -2918,6 +2920,13 @@ de_thread, exit_group does not.
   as left to report it (`group_pending`, also for a reparent), so
   exactly the last section finds the group empty, and no wait reaps the
   leader before that section.
+- A traced zombie thread is released by its tracer: by its wait
+  (`wait_zombie`, Linux wait_task_zombie) or at its exit, after the
+  live tracees are detached, one TASKLIST write section per thread
+  (`detach_zombies`, Linux exit_ptrace). The section that takes it out
+  of the list also queues its zombie leader's notice if it was the last
+  thread (`unhash_thread`, Linux release_task), with an entry made
+  before the lock as below; the Task is released after it.
 - A zombie's notice (Linux do_notify_parent) is queued in the TASKLIST
   write section that makes it reapable: the one that makes it a zombie
   (`exit_notify`), removes its group's last thread (`exit_notify` of
