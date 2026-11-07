@@ -1316,6 +1316,21 @@ fn send_task(t: &TaskRef, sig: u32, info: SendInfo, ty: PidType, force: bool) ->
         tg.init && !INIT_KILLABLE.load(core::sync::atomic::Ordering::Acquire)
     };
 
+    let sighand = tg.sighand.as_ref();
+    let to = Send {
+        sig,
+        init,
+        info: &info,
+        ty,
+        stopped: tg.stopped,
+    };
+    // A signal that would be dropped makes and charges no entry (Linux
+    // prepare_signal and legacy_queue come before __sigqueue_alloc);
+    // send_locked decides again under the lock
+    if sig != SIGKILL && drops(t, &t.sig.lock(), sighand, &to) {
+        return 0;
+    }
+
     // The info's entry, made before the receiver's lock is taken; SIGKILL
     // needs none (Linux __send_signal_locked). Unused, it is freed after
     // the lock is dropped.
@@ -1329,18 +1344,7 @@ fn send_task(t: &TaskRef, sig: u32, info: SendInfo, ty: PidType, force: bool) ->
             info.override_rlimit(sig),
         )
     };
-    let sighand = tg.sighand.as_ref();
-    let stopped = tg.stopped;
-    let sent = with_sig(t, |t, state| {
-        let to = Send {
-            sig,
-            init,
-            info: &info,
-            ty,
-            stopped,
-        };
-        send_locked(t, state, sighand, &to, &mut q)
-    });
+    let sent = with_sig(t, |t, state| send_locked(t, state, sighand, &to, &mut q));
     drop(q);
 
     let wants = match sent {
@@ -1384,13 +1388,10 @@ fn send_locked(
     q: &mut Option<Box<SigQueue>>,
 ) -> Sent {
     let sig = to.sig;
+    if drops(t, state, sighand, to) {
+        return Sent::Dropped;
+    }
     let exiting = t.has_flag(crate::task::pf::EXITING);
-    if exiting && to.ty == PidType::Pid {
-        return Sent::Dropped;
-    }
-    if sig_ignored(state, sighand, sig) || (to.init && init_ignores(state, sighand, sig)) {
-        return Sent::Dropped;
-    }
     // Linux wants_signal, before this signal marks it
     let wants = !state.blocked.contains(sig)
         && !exiting
@@ -1411,9 +1412,6 @@ fn send_locked(
             None => return Sent::Dropped,
         },
     };
-    if pending.legacy(sig) {
-        return Sent::Dropped;
-    }
     match q.take() {
         Some(e) => pending.queue(e),
         None if to.info.must_queue(sig) => return Sent::Overflow,
@@ -1421,6 +1419,32 @@ fn send_locked(
     }
     pending.add(sig);
     Sent::Queued(wants)
+}
+
+/// `to.sig` for task `t` is dropped, `state` its Task.sig's: its own
+/// signal while it exits, ignored, a non-RT signal already pending
+/// where it would go, or a group signal for a task with no group
+/// (Linux task_can_queue_signal, prepare_signal, legacy_queue)
+fn drops(
+    t: &crate::task::Task,
+    state: &TaskSignalState,
+    sighand: Option<&Arc<SigHand>>,
+    to: &Send<'_>,
+) -> bool {
+    let sig = to.sig;
+    if to.ty == PidType::Pid && t.has_flag(crate::task::pf::EXITING) {
+        return true;
+    }
+    if sig_ignored(state, sighand, sig) || (to.init && init_ignores(state, sighand, sig)) {
+        return true;
+    }
+    match to.ty {
+        PidType::Pid => state.pending.legacy(sig),
+        PidType::Tgid => state
+            .shared_pending
+            .group()
+            .is_none_or(|g| g.pending.legacy(sig)),
+    }
 }
 
 /// Find a thread to take `sig` just queued for `p` (Linux
