@@ -656,7 +656,7 @@ over the limit reclaims, then OOM-kills a task in the cgroup
 Once enforced, OOM_FAULT_KILL and OOM_SHARED_KILL can run in a small
 cgroup (say memory.max 64MB) at any RAM size, and on Linux too,
 instead of filling all of RAM and being skipped above 4GB
-(`user/boot_tester/tests/mm_oom.rs`).
+(`user/boot_tester/tests/mm/mm_oom.rs`).
 
 ## BPF map memory is not charged
 

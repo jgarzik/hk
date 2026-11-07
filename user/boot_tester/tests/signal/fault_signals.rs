@@ -1,0 +1,754 @@
+//! Synchronous fault signals (Linux force_sig_fault semantics)
+//!
+//! Tests (each runs in a forked child so a broken kernel cannot take down
+//! the test runner with a stray SIGSEGV):
+//! - FAULT_SEGV_MAPERR: load from an unmapped page -> SIGSEGV handler with
+//!   si_code SEGV_MAPERR, si_addr = fault address, ucontext PC = faulting
+//!   instruction; the handler moves the PC past it and edits a register, and
+//!   every other register (x86: including RCX/R11) survives rt_sigreturn
+//! - FAULT_SEGV_ACCERR: store to a read-only page -> SEGV_ACCERR
+//! - FAULT_PROT_NONE: load from a never-touched PROT_NONE page ->
+//!   SEGV_ACCERR (the fault must not map a page there)
+//! - FAULT_SIGILL: ud2 / udf -> SIGILL (ILL_ILLOPN on x86, ILL_ILLOPC on arm64)
+//! - FAULT_SIGFPE: x86 integer divide by zero -> SIGFPE FPE_INTDIV
+//! - FAULT_SIGTRAP: int3 / brk -> SIGTRAP
+//! - FAULT_BLOCKED_KILL: fault with SIGSEGV blocked (handler installed) kills
+//!   the task with SIGSEGV
+//! - FAULT_IGNORED_KILL: fault with SIGSEGV ignored kills the task
+//! - DF_ENTRY (x86): a breakpoint trap taken with DF set (`std`) delivers
+//!   an intact signal frame (the kernel's string copies must run forward:
+//!   entries clear DF) and sigreturn gives DF back
+//! - FAULT_LAST_TRAP: a later SIGUSR1's sigcontext still shows the last
+//!   fault (Linux thread.trap_nr/error_code/cr2; arm64 fault_address
+//!   and an esr_context record)
+//! - FAULT_KERNEL_ADDR: a load from a kernel address reports no kernel
+//!   page-table detail: x86 err has PROT (and USER) set, arm64's ESR is
+//!   a level 0 translation fault (Linux sanitize_error_code,
+//!   set_thread_esr)
+//! - BAD_IRET (x86): rt_sigreturn to a non-canonical RIP (Linux takes
+//!   it; the return's IRET faults in kernel mode with the user GS base
+//!   live) kills the task with SIGSEGV, the kernel survives
+
+use crate::tests::helpers::{print, print_num, println};
+use hk_syscall::{
+    MAP_ANONYMOUS, MAP_PRIVATE, PROT_NONE, PROT_READ, SA_RESTORER, SA_SIGINFO, SIG_BLOCK, SIG_IGN,
+    SIGILL, SIGSEGV, SIGTRAP, sys_exit, sys_fork, sys_mmap, sys_munmap, sys_rt_sigaction,
+    sys_rt_sigprocmask, sys_wait4,
+};
+
+const SEGV_MAPERR: i32 = 1;
+const SEGV_ACCERR: i32 = 2;
+#[cfg(target_arch = "x86_64")]
+const ILL_ILLOPN: i32 = 2;
+#[cfg(target_arch = "aarch64")]
+const ILL_ILLOPC: i32 = 1;
+#[cfg(target_arch = "x86_64")]
+const FPE_INTDIV: i32 = 1;
+#[cfg(target_arch = "x86_64")]
+const SI_KERNEL: i32 = 0x80;
+#[cfg(target_arch = "aarch64")]
+const TRAP_BRKPT: i32 = 1;
+
+/// Value the handler stores in the result register
+const HANDLER_MARK: u64 = 0x5a5a_1234;
+pub(crate) const MAGIC1: u64 = 0x1122_3344_5566_7788;
+pub(crate) const MAGIC2: u64 = 0x0246_8ace_1357_9bdf;
+
+/// What the handler saw
+#[derive(Clone, Copy)]
+struct Seen {
+    count: u64,
+    signo: i32,
+    code: i32,
+    addr: u64,
+    pc: u64,
+}
+
+static mut SEEN: Seen = Seen {
+    count: 0,
+    signo: 0,
+    code: 0,
+    addr: 0,
+    pc: 0,
+};
+
+// ucontext offsets (Linux): x86-64 uc_mcontext at 40; arm64 at 176
+#[cfg(target_arch = "x86_64")]
+mod uc {
+    pub const R12: usize = 40 + 4 * 8;
+    pub const RAX: usize = 40 + 13 * 8;
+    pub const RIP: usize = 40 + 16 * 8;
+}
+#[cfg(target_arch = "aarch64")]
+mod uc {
+    pub const fn x(n: usize) -> usize {
+        176 + 8 + n * 8
+    }
+    pub const PC: usize = 176 + 8 + 31 * 8 + 8;
+}
+
+extern "C" fn fault_handler(signo: i32, info: *const u8, ucp: *mut u8) {
+    unsafe {
+        let code = *(info.add(8) as *const i32);
+        let addr = *(info.add(16) as *const u64);
+        #[cfg(target_arch = "x86_64")]
+        {
+            let pc = *(ucp.add(uc::RIP) as *const u64);
+            SEEN = Seen {
+                count: SEEN.count + 1,
+                signo,
+                code,
+                addr,
+                pc,
+            };
+            // Resume at the address the test left in R12; mark RAX
+            *(ucp.add(uc::RIP) as *mut u64) = *(ucp.add(uc::R12) as *const u64);
+            *(ucp.add(uc::RAX) as *mut u64) = HANDLER_MARK;
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            let pc = *(ucp.add(uc::PC) as *const u64);
+            SEEN = Seen {
+                count: SEEN.count + 1,
+                signo,
+                code,
+                addr,
+                pc,
+            };
+            // Resume at the address the test left in x9; mark x12
+            *(ucp.add(uc::PC) as *mut u64) = *(ucp.add(uc::x(9)) as *const u64);
+            *(ucp.add(uc::x(12)) as *mut u64) = HANDLER_MARK;
+        }
+    }
+}
+
+/// Registers observed after the faulting instruction was skipped
+pub(crate) struct After {
+    /// Result register (x86 RAX / arm64 x12): must be HANDLER_MARK
+    pub(crate) result: u64,
+    /// Preserved registers (x86 RCX, R11 / arm64 x10, x11)
+    pub(crate) keep1: u64,
+    pub(crate) keep2: u64,
+    /// Address of the faulting instruction
+    pub(crate) fault_pc: u64,
+    /// Address after it (where the handler resumes)
+    pub(crate) resume_pc: u64,
+}
+
+/// Execute `$insn` (with the operand register x86 RDI / arm64 x0 = `$arg`
+/// and x86 RSI = 0) after loading the preserved registers; return `After`.
+#[cfg(target_arch = "x86_64")]
+macro_rules! run_fault {
+    ($insn:literal, $arg:expr) => {{
+        let (result, keep1, keep2, fault_pc, resume_pc): (u64, u64, u64, u64, u64);
+        unsafe {
+            core::arch::asm!(
+                "lea r12, [rip + 4f]",
+                "lea r13, [rip + 3f]",
+                "movabs rcx, {m1}",
+                "movabs r11, {m2}",
+                "xor eax, eax",
+                "xor edx, edx",
+                "3:",
+                $insn,
+                "4:",
+                m1 = const MAGIC1,
+                m2 = const MAGIC2,
+                in("rdi") $arg,
+                in("rsi") 0u64,
+                out("rax") result,
+                out("rcx") keep1,
+                out("r11") keep2,
+                out("rdx") _,
+                out("r12") resume_pc,
+                out("r13") fault_pc,
+            );
+        }
+        After { result, keep1, keep2, fault_pc, resume_pc }
+    }};
+}
+
+#[cfg(target_arch = "aarch64")]
+macro_rules! run_fault {
+    ($insn:literal, $arg:expr) => {{
+        let (result, keep1, keep2, fault_pc, resume_pc): (u64, u64, u64, u64, u64);
+        unsafe {
+            core::arch::asm!(
+                "adr x9, 4f",
+                "adr x13, 3f",
+                "mov x10, {m1}",
+                "mov x11, {m2}",
+                "mov x12, #0",
+                "3:",
+                $insn,
+                "4:",
+                m1 = in(reg) MAGIC1,
+                m2 = in(reg) MAGIC2,
+                in("x0") $arg,
+                out("x9") resume_pc,
+                out("x10") keep1,
+                out("x11") keep2,
+                out("x12") result,
+                out("x13") fault_pc,
+            );
+        }
+        After { result, keep1, keep2, fault_pc, resume_pc }
+    }};
+}
+
+pub(crate) use run_fault;
+
+/// The SIGSEGV of the last `run_fault!` since `reset`, if it faulted:
+/// (si_code, si_addr)
+pub(crate) fn fault_seen() -> Option<(i32, u64)> {
+    let s = unsafe { core::ptr::read_volatile(&raw const SEEN) };
+    (s.count > 0).then_some((s.code, s.addr))
+}
+
+/// Forget the faults seen so far
+pub(crate) fn reset() {
+    unsafe {
+        core::ptr::write_volatile(
+            &raw mut SEEN,
+            Seen {
+                count: 0,
+                signo: 0,
+                code: 0,
+                addr: 0,
+                pc: 0,
+            },
+        )
+    };
+}
+
+pub(crate) fn install(sig: u32) -> bool {
+    let action: [u64; 4] = [
+        fault_handler as *const () as u64,
+        SA_SIGINFO | SA_RESTORER,
+        crate::tests::signal::signals::restorer_addr(),
+        0,
+    ];
+    sys_rt_sigaction(sig, action.as_ptr() as u64, 0, 8) == 0
+}
+
+/// Check what the handler saw and the state after resuming. Prints the
+/// result line; returns the child exit code.
+fn verify(name: &[u8], after: &After, signo: u32, code: i32, addr: u64, pc: u64) -> u64 {
+    let s = unsafe { core::ptr::read_volatile(&raw const SEEN) };
+    let mut err: i64 = 0;
+    if s.count != 1 {
+        err = 1;
+    } else if s.signo != signo as i32 {
+        err = 2;
+    } else if s.code != code {
+        err = 3;
+    } else if s.addr != addr {
+        err = 4;
+    } else if s.pc != pc {
+        err = 5;
+    } else if after.result != HANDLER_MARK {
+        err = 6;
+    } else if after.keep1 != MAGIC1 || after.keep2 != MAGIC2 {
+        err = 7;
+    } else if after.resume_pc <= after.fault_pc {
+        err = 8;
+    }
+    print(name);
+    if err == 0 {
+        println(b":OK");
+        return 0;
+    }
+    print(b":FAIL: check ");
+    print_num(err);
+    print(b" count=");
+    print_num(s.count as i64);
+    print(b" signo=");
+    print_num(s.signo as i64);
+    print(b" code=");
+    print_num(s.code as i64);
+    print(b" addr=");
+    print_num(s.addr as i64);
+    print(b" want ");
+    print_num(addr as i64);
+    print(b" pc=");
+    print_num(s.pc as i64);
+    print(b" want ");
+    print_num(pc as i64);
+    println(b"");
+    1
+}
+
+/// Run `f` in a forked child; FAIL if the child did not exit normally
+fn in_child(name: &[u8], f: fn() -> u64) {
+    let pid = sys_fork();
+    if pid == 0 {
+        sys_exit(f());
+    }
+    if pid < 0 {
+        print(name);
+        println(b":FAIL: fork");
+        return;
+    }
+    let mut status: i32 = 0;
+    sys_wait4(pid, &mut status, 0, 0);
+    if status & 0x7f != 0 {
+        print(name);
+        print(b":FAIL: child killed by signal ");
+        print_num((status & 0x7f) as i64);
+        println(b"");
+    } else if (status >> 8) & 0xff == 9 {
+        print(name);
+        println(b":FAIL: sigaction");
+    }
+}
+
+/// As `in_child`, the child traced by its parent: the parent passes on
+/// each signal-delivery stop's signal (a fault's SIGSEGV), so the
+/// child's handler still gets the fault's details (Linux keeps the
+/// siginfo across the ptrace stop)
+fn in_traced_child(name: &[u8], f: fn() -> u64) {
+    const PTRACE_TRACEME: i64 = 0;
+    const PTRACE_CONT: i64 = 7;
+    let pid = sys_fork();
+    if pid == 0 {
+        hk_syscall::sys_ptrace(PTRACE_TRACEME, 0, 0, 0);
+        hk_syscall::sys_kill(hk_syscall::sys_getpid(), 19); // SIGSTOP
+        sys_exit(f());
+    }
+    if pid < 0 {
+        print(name);
+        println(b":FAIL: fork");
+        return;
+    }
+    let mut status: i32 = 0;
+    loop {
+        sys_wait4(pid, &mut status, 0, 0);
+        if status & 0xff != 0x7f {
+            break;
+        }
+        // A stop: SIGSTOP is swallowed, anything else passed on
+        let sig = (status >> 8) & 0xff;
+        let pass = if sig == 19 { 0 } else { sig as u64 };
+        hk_syscall::sys_ptrace(PTRACE_CONT, pid, 0, pass);
+    }
+    if status & 0x7f != 0 {
+        print(name);
+        print(b":FAIL: child killed by signal ");
+        print_num((status & 0x7f) as i64);
+        println(b"");
+    }
+}
+
+/// segv_maperr under a tracer
+fn segv_traced() -> u64 {
+    if !install(SIGSEGV) {
+        return 9;
+    }
+    let addr = unmapped_page() + 0x30;
+    #[cfg(target_arch = "x86_64")]
+    let a = run_fault!("mov rax, [rdi]", addr);
+    #[cfg(target_arch = "aarch64")]
+    let a = run_fault!("ldr x12, [x0]", addr);
+    verify(
+        b"FAULT_SEGV_TRACED",
+        &a,
+        SIGSEGV,
+        SEGV_MAPERR,
+        addr,
+        a.fault_pc,
+    )
+}
+
+fn unmapped_page() -> u64 {
+    let a = sys_mmap(0, 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    sys_munmap(a as u64, 4096);
+    a as u64
+}
+
+fn segv_maperr() -> u64 {
+    if !install(SIGSEGV) {
+        return 9;
+    }
+    let addr = unmapped_page() + 0x28;
+    #[cfg(target_arch = "x86_64")]
+    let a = run_fault!("mov rax, [rdi]", addr);
+    #[cfg(target_arch = "aarch64")]
+    let a = run_fault!("ldr x12, [x0]", addr);
+    verify(
+        b"FAULT_SEGV_MAPERR",
+        &a,
+        SIGSEGV,
+        SEGV_MAPERR,
+        addr,
+        a.fault_pc,
+    )
+}
+
+fn segv_accerr() -> u64 {
+    if !install(SIGSEGV) {
+        return 9;
+    }
+    let page = sys_mmap(0, 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) as u64;
+    let addr = page + 0x100;
+    // Populate it first: the store then hits a present read-only page
+    unsafe { core::ptr::read_volatile(addr as *const u64) };
+    #[cfg(target_arch = "x86_64")]
+    let a = run_fault!("mov qword ptr [rdi], rdx", addr);
+    #[cfg(target_arch = "aarch64")]
+    let a = run_fault!("str x10, [x0]", addr);
+    sys_munmap(page, 4096);
+    verify(
+        b"FAULT_SEGV_ACCERR",
+        &a,
+        SIGSEGV,
+        SEGV_ACCERR,
+        addr,
+        a.fault_pc,
+    )
+}
+
+fn segv_prot_none() -> u64 {
+    if !install(SIGSEGV) {
+        return 9;
+    }
+    let page = sys_mmap(0, 4096, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) as u64;
+    let addr = page + 0x40;
+    #[cfg(target_arch = "x86_64")]
+    let a = run_fault!("mov rax, [rdi]", addr);
+    #[cfg(target_arch = "aarch64")]
+    let a = run_fault!("ldr x12, [x0]", addr);
+    sys_munmap(page, 4096);
+    verify(
+        b"FAULT_PROT_NONE",
+        &a,
+        SIGSEGV,
+        SEGV_ACCERR,
+        addr,
+        a.fault_pc,
+    )
+}
+
+fn sigill() -> u64 {
+    if !install(SIGILL) {
+        return 9;
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        let a = run_fault!("ud2", 0u64);
+        verify(
+            b"FAULT_SIGILL",
+            &a,
+            SIGILL,
+            ILL_ILLOPN,
+            a.fault_pc,
+            a.fault_pc,
+        )
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        let a = run_fault!("udf #0", 0u64);
+        verify(
+            b"FAULT_SIGILL",
+            &a,
+            SIGILL,
+            ILL_ILLOPC,
+            a.fault_pc,
+            a.fault_pc,
+        )
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn sigfpe() -> u64 {
+    if !install(hk_syscall::SIGFPE) {
+        return 9;
+    }
+    // RDX:RAX = 0, divisor RSI = 0
+    let a = run_fault!("div rsi", 0u64);
+    verify(
+        b"FAULT_SIGFPE",
+        &a,
+        hk_syscall::SIGFPE,
+        FPE_INTDIV,
+        a.fault_pc,
+        a.fault_pc,
+    )
+}
+
+fn sigtrap() -> u64 {
+    if !install(SIGTRAP) {
+        return 9;
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        // int3 is a trap: the PC already points past it; no fault address
+        let a = run_fault!("int3", 0u64);
+        verify(b"FAULT_SIGTRAP", &a, SIGTRAP, SI_KERNEL, 0, a.resume_pc)
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        let a = run_fault!("brk #0", 0u64);
+        verify(
+            b"FAULT_SIGTRAP",
+            &a,
+            SIGTRAP,
+            TRAP_BRKPT,
+            a.fault_pc,
+            a.fault_pc,
+        )
+    }
+}
+
+/// Fault in a child set up by `prep`; the child must die by SIGSEGV
+fn expect_killed(name: &[u8], prep: fn() -> bool) {
+    let pid = sys_fork();
+    if pid == 0 {
+        if !prep() {
+            sys_exit(9);
+        }
+        let addr = unmapped_page();
+        unsafe { core::ptr::read_volatile(addr as *const u64) };
+        sys_exit(0);
+    }
+    if pid < 0 {
+        print(name);
+        println(b":FAIL: fork");
+        return;
+    }
+    let mut status: i32 = 0;
+    sys_wait4(pid, &mut status, 0, 0);
+    print(name);
+    if status & 0x7f == SIGSEGV as i32 {
+        println(b":OK");
+    } else {
+        print(b":FAIL: wait status ");
+        print_num(status as i64);
+        println(b"");
+    }
+}
+
+fn prep_blocked() -> bool {
+    let set: u64 = 1 << (SIGSEGV - 1);
+    install(SIGSEGV) && sys_rt_sigprocmask(SIG_BLOCK, &set as *const u64 as u64, 0, 8) == 0
+}
+
+fn prep_ignored() -> bool {
+    let action: [u64; 4] = [SIG_IGN, 0, 0, 0];
+    sys_rt_sigaction(SIGSEGV, action.as_ptr() as u64, 0, 8) == 0
+}
+
+/// Run all fault-signal tests
+pub fn run_tests() {
+    in_child(b"FAULT_SEGV_MAPERR", segv_maperr);
+    in_traced_child(b"FAULT_SEGV_TRACED", segv_traced);
+    in_child(b"FAULT_SEGV_ACCERR", segv_accerr);
+    in_child(b"FAULT_PROT_NONE", segv_prot_none);
+    in_child(b"FAULT_SIGILL", sigill);
+    #[cfg(target_arch = "x86_64")]
+    in_child(b"FAULT_SIGFPE", sigfpe);
+    in_child(b"FAULT_SIGTRAP", sigtrap);
+    in_child(b"FAULT_LAST_TRAP", last_trap);
+    in_child(b"FAULT_KERNEL_ADDR", kernel_addr);
+    expect_killed(b"FAULT_BLOCKED_KILL", prep_blocked);
+    expect_killed(b"FAULT_IGNORED_KILL", prep_ignored);
+    #[cfg(target_arch = "x86_64")]
+    df_entry();
+    #[cfg(target_arch = "x86_64")]
+    bad_iret();
+}
+
+/// x86 ucontext: uc_mcontext.rip (uc_flags, uc_link, uc_stack, then
+/// gregs r8 .. rsp, rip)
+#[cfg(target_arch = "x86_64")]
+const UC_RIP: usize = 40 + 16 * 8;
+
+/// SIGUSR1 handler: return to a non-canonical RIP
+#[cfg(target_arch = "x86_64")]
+extern "C" fn bad_rip_handler(_sig: i32, _info: *const u8, uc: *mut u8) {
+    // SAFETY: the kernel's ucontext for this handler
+    unsafe { (uc.add(UC_RIP) as *mut u64).write_volatile(0x8000_0000_0000_0000) };
+}
+
+/// BAD_IRET: a sigreturn to a non-canonical RIP dies of SIGSEGV
+#[cfg(target_arch = "x86_64")]
+fn bad_iret() {
+    use hk_syscall::{SIGUSR1, sys_getpid, sys_kill};
+    let pid = sys_fork();
+    if pid == 0 {
+        let action: [u64; 4] = [
+            bad_rip_handler as *const () as u64,
+            SA_SIGINFO | SA_RESTORER,
+            crate::tests::signal::signals::restorer_addr(),
+            0,
+        ];
+        if sys_rt_sigaction(SIGUSR1, action.as_ptr() as u64, 0, 8) != 0 {
+            sys_exit(100);
+        }
+        sys_kill(sys_getpid(), SIGUSR1);
+        sys_exit(1); // not reached: the sigreturn goes to the bad RIP
+    }
+    let mut status: i32 = 0;
+    let r = sys_wait4(pid, &mut status, 0, 0);
+    if r == pid && status & 0x7f == SIGSEGV as i32 {
+        println(b"BAD_IRET:OK");
+    } else {
+        print(b"BAD_IRET:FAIL status ");
+        print_num(status as i64);
+        println(b"");
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+extern "C" fn trap_handler(_sig: i32) {}
+
+/// DF_ENTRY: `std; int3` in a child with a SIGTRAP handler; the child
+/// gets past the trap with its registers and DF intact
+#[cfg(target_arch = "x86_64")]
+fn df_entry() {
+    let pid = sys_fork();
+    if pid == 0 {
+        let action: [u64; 4] = [
+            trap_handler as *const () as u64,
+            SA_RESTORER,
+            crate::tests::signal::signals::restorer_addr(),
+            0,
+        ];
+        if sys_rt_sigaction(SIGTRAP, action.as_ptr() as u64, 0, 8) != 0 {
+            sys_exit(100);
+        }
+        let (flags, kept): (u64, u64);
+        // SAFETY: DF set only around the trap
+        unsafe {
+            core::arch::asm!(
+                "mov {k}, 0x1234",
+                "std",
+                "int3",
+                "pushfq",
+                "pop {f}",
+                "cld",
+                f = out(reg) flags,
+                k = out(reg) kept,
+            );
+        }
+        let ok = flags & 0x400 != 0 && kept == 0x1234;
+        sys_exit(if ok { 0 } else { 1 });
+    }
+    let mut status: i32 = 0;
+    let r = sys_wait4(pid, &mut status, 0, 0);
+    if r == pid && status == 0 {
+        println(b"DF_ENTRY:OK");
+    } else {
+        print(b"DF_ENTRY:FAIL status ");
+        print_num(status as i64);
+        println(b"");
+    }
+}
+
+/// The SIGUSR1 handler's view of its sigcontext: (trapno or 0, error /
+/// ESR, cr2 / fault_address)
+static mut LAST: [u64; 3] = [0; 3];
+
+extern "C" fn last_handler(_sig: i32, _info: *const u8, uc: *mut u8) {
+    // SAFETY: the kernel's ucontext for this handler (Linux layouts)
+    unsafe {
+        #[cfg(target_arch = "x86_64")]
+        let seen = {
+            let r = |at: usize| core::ptr::read_unaligned(uc.add(40 + at) as *const u64);
+            // sigcontext err 152, trapno 160, cr2 176
+            [r(160), r(152), r(176)]
+        };
+        #[cfg(target_arch = "aarch64")]
+        let seen = {
+            let r = |at: usize| core::ptr::read_unaligned(uc.add(at) as *const u64);
+            // __reserved records from uc + 176 + 288: the esr_context's
+            let mut at = 176 + 288;
+            let mut esr = 0;
+            loop {
+                let head = r(at);
+                let (magic, size) = (head as u32, (head >> 32) as usize);
+                if magic == 0 || size == 0 {
+                    break;
+                }
+                if magic == 0x4553_5201 {
+                    esr = r(at + 8);
+                }
+                at += size;
+            }
+            [0, esr, r(176)]
+        };
+        core::ptr::write_volatile(&raw mut LAST, seen);
+    }
+}
+
+/// Fault on a load from `addr`, then read the last-fault details a
+/// SIGUSR1 frame reports: (trapno, err / ESR, cr2 / fault_address)
+fn fault_details(addr: u64) -> [u64; 3] {
+    #[cfg(target_arch = "x86_64")]
+    let _ = run_fault!("mov rax, [rdi]", addr);
+    #[cfg(target_arch = "aarch64")]
+    let _ = run_fault!("ldr x12, [x0]", addr);
+    let act: [u64; 4] = [
+        last_handler as *const () as u64,
+        SA_SIGINFO | SA_RESTORER,
+        crate::tests::signal::signals::restorer_addr(),
+        0,
+    ];
+    sys_rt_sigaction(10, act.as_ptr() as u64, 0, 8);
+    hk_syscall::sys_kill(hk_syscall::sys_getpid(), 10);
+    // SAFETY: written by the handler, which has run
+    unsafe { core::ptr::read_volatile(&raw const LAST) }
+}
+
+fn kernel_addr() -> u64 {
+    if !install(SIGSEGV) {
+        return 9;
+    }
+    #[cfg(target_arch = "x86_64")]
+    let addr = 0xffff_c900_dead_0000u64;
+    #[cfg(target_arch = "aarch64")]
+    let addr = 0xffff_0000_dead_0000u64;
+    let [trapno, err, fault] = fault_details(addr);
+    // x86: PROT | USER, page fault; arm64: data abort, FSC 0x04
+    #[cfg(target_arch = "x86_64")]
+    let ok = trapno == 14 && err & 5 == 5 && fault == addr;
+    #[cfg(target_arch = "aarch64")]
+    let ok = trapno == 0 && err >> 26 == 0x24 && err & 0x3f == 4 && fault == addr;
+    if ok {
+        println(b"FAULT_KERNEL_ADDR:OK");
+        0
+    } else {
+        print(b"FAULT_KERNEL_ADDR:FAIL trapno=");
+        print_num(trapno as i64);
+        print(b" err=");
+        print_num(err as i64);
+        print(b" fault=");
+        print_num(fault as i64);
+        println(b"");
+        1
+    }
+}
+
+fn last_trap() -> u64 {
+    if !install(SIGSEGV) {
+        return 9;
+    }
+    let addr = unmapped_page() + 0x18;
+    let [trapno, err, fault] = fault_details(addr);
+    #[cfg(target_arch = "x86_64")]
+    let ok = trapno == 14 && err & 4 != 0 && fault == addr;
+    #[cfg(target_arch = "aarch64")]
+    let ok = trapno == 0 && err != 0 && fault == addr;
+    if ok {
+        println(b"FAULT_LAST_TRAP:OK");
+        0
+    } else {
+        print(b"FAULT_LAST_TRAP:FAIL trapno=");
+        print_num(trapno as i64);
+        print(b" err=");
+        print_num(err as i64);
+        print(b" fault=");
+        print_num(fault as i64);
+        println(b"");
+        1
+    }
+}

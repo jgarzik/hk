@@ -15,7 +15,7 @@ hk: stable-Rust (no nightly) no_std SMP kernel, x86-64 + aarch64, Linux syscall 
 
 ## Rules
 - Generic code + arch callbacks in `arch/{x86_64,aarch64}/`; no scattered `#[cfg(target_arch)]`. aarch64: modern syscalls only; numbers are per-arch.
-- New syscall: boot test in `user/boot_tester/tests/`, register in `tests/mod.rs::run_all_tests`, update `doc/SYSCALLS.md`.
+- New syscall: boot test in `user/boot_tester/tests/<subsys>/` (declared in its `mod.rs`), called from `tests/mod.rs::run_all_tests`, update `doc/SYSCALLS.md`.
 - Locking is top priority. Read `doc/LOCKING.md` first. Mimic Linux lock order/semantics (i_rwsem, mmap_lock, rename_lock, sk_lock, RTNL…); document any deviation there. IRQ-reachable state → `IrqSpinlock`; no `Mutex`/`RwLock` in IRQ context; never sleep under a spinlock. Each new/changed lock: IRQ class + order position, `doc/LOCKING.md` updated in the SAME commit. Cycles and sleep-under-spin are critical bugs.
 - Prefer per-CPU structures (state, queues, caches, counters, allocators); justify globals. Per-CPU still needs IRQ/preempt discipline and barriers for cross-CPU reads.
 - Small functions, short Linux-style names (`tcp_rcv`, `fib::lookup`). Design/style: `doc/STYLE.md`.

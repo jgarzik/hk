@@ -232,12 +232,11 @@ make check          # Build x86-64 + run boot tests
 make check-arm      # Build aarch64 + run boot tests
 ```
 
-Tests are defined in `user/boot_tester/tests/*.rs` and cover:
-- Process management (fork, exec, clone, signals)
-- Memory management (mmap, mlock, munmap)
-- File system operations
-- Timers and scheduling
-- And more...
+Tests live in `user/boot_tester/tests/<subsys>/*.rs`, one directory per
+subsystem (`arch`, `exec`, `fs`, `io`, `ipc`, `mm`, `net`, `proc`,
+`process`, `signal`, `time`), each declaring its suites in its `mod.rs`;
+`tests/mod.rs::run_all_tests` calls every suite, in order. Shared
+helpers are in `tests/helpers.rs`.
 
 A successful boot shows all tests passing and ends with `BOOT_COMPLETE`.
 

@@ -103,7 +103,7 @@ DRM: simplegfx shares fb with fbcon; fbcon draws only while fg VC KD_TEXT; KD_TE
 ## 8. Unsafe / MMIO
 fb = IoMem from ioremap_wc; vgacon IoMem over 0xB8000 (ioremap) instead of phys_to_virt raw pointers → FbSurface and vgacon unsafe-free, TODO(unsafe) allows removed. Bulk ops in hw/mmio.rs with SAFETY. Port I/O via arch wrappers. No refs into device memory.
 
-## 9. Testing (tests/vt.rs, input.rs; hk + Linux reference; geometry from vcsa header)
+## 9. Testing (tests/io/vt.rs, input.rs; hk + Linux reference; geometry from vcsa header)
 - VT_NODES: stat tty0 (4,0), tty1, tty63, vcs/vcsa/vcsu, vcs1 (7,x) + modes; vcs2 appears after opening tty2, gone after VT_DISALLOCATE.
 - VT_IOCTLS: KDGKBTYPE = KB_101 on tty0, ENOTTY on ttyS0/ttyAMA0 (confirm on Linux); VT_GETSTATE (v_active=1, v_state); VT_OPENQRY; TIOCL_GETFGCONSOLE; KDGKBMODE = K_UNICODE, KDSKBMODE round trip, EINVAL bad; KD(G/S)ETMODE; KD(G/S)ETLED, KD(G/S)KBLED; KDGKBENT defaults + KDSKBENT round trip; KDGKBSENT F1 = "\e[[A"; VT_DISALLOCATE EBUSY while open, 0 when free, VC1 never freed; TIOCGWINSZ on tty2 = vcsa header.
 - VT_SWITCH: VT_ACTIVATE 2 + VT_WAITACTIVE; /dev/vcs (minor 0) follows fg; back. VT_PROCESS: child VT_SETMODE relsig=SIGUSR1 acqsig=SIGUSR2 on tty2, activates; parent activates 1; child gets SIGUSR1, VT_RELDISP 1; parent WAITACTIVE returns; refusal (VT_RELDISP 0), VT_ACKACQ.
