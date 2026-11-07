@@ -1549,7 +1549,7 @@ pub fn kill_proc_info(pid: Pid, sig: u32, info: SendInfo) -> i32 {
 /// against: the leader, or a thread still running once it has exited
 /// (Linux takes the leader; its zombie keeps the group's handlers,
 /// hk's does not)
-fn group_task(
+pub fn group_task(
     table: &crate::task::percpu::GlobalTaskTable,
     leader: Option<crate::task::percpu::TaskView<'_>>,
 ) -> Option<TaskRef> {
@@ -1569,6 +1569,12 @@ fn group_task(
 /// group_send_sig_info, PIDTYPE_TGID, with no permission check)
 pub fn send_group_signal(t: &TaskRef, sig: u32, info: SendInfo) -> i32 {
     send_task(t, sig, info, PidType::Tgid, false)
+}
+
+/// `sig` with `info` to task `t` alone (Linux do_send_sig_info,
+/// PIDTYPE_PID, with no permission check)
+pub fn send_thread_signal(t: &TaskRef, sig: u32, info: SendInfo) -> i32 {
+    send_task(t, sig, info, PidType::Pid, false)
 }
 
 /// `sig` with `info` to the process struct pid `pid` names, after
@@ -1616,8 +1622,11 @@ pub fn send_signal_to_pgrp(pgid: Pid, sig: u32) -> i32 {
 /// kill_pgrp(struct pid *)): unlike a number, the reference cannot come
 /// to name another group
 pub fn kill_pgrp_pid(pg: &crate::task::pid::Pid, sig: u32) {
-    for pid in crate::task::percpu::pgrp_members(pg) {
-        kill_proc_info(pid, sig, SendInfo::Kernel);
+    let procs = crate::task::percpu::GlobalTaskTable::collect_pgrp(pg, |table, t| {
+        group_task(table, Some(*t))
+    });
+    for t in &procs {
+        send_group_signal(t, sig, SendInfo::Kernel);
     }
 }
 

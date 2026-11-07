@@ -772,23 +772,64 @@ impl GlobalTaskTable {
         pid: Pid,
         f: impl Fn(&GlobalTaskTable, &TaskView<'_>) -> Option<T>,
     ) -> Vec<T> {
-        let mut cap = TASKLIST.read().threads(pid).count() + 1;
-        loop {
-            let mut v = Vec::with_capacity(cap);
-            let full = {
-                let table = TASKLIST.read();
-                let mut full = false;
+        Self::collect(
+            |table, visit| {
                 for t in table.threads(pid) {
-                    if v.len() == v.capacity() {
-                        full = true;
+                    if !visit(&t) {
                         break;
                     }
-                    if let Some(x) = f(&table, &t) {
-                        v.push(x);
+                }
+            },
+            f,
+        )
+    }
+
+    /// What `f` picks of each process of group `pg` (its leaders on the
+    /// group's list), gathered as `collect_threads` does
+    pub fn collect_pgrp<T>(
+        pg: &crate::task::pid::Pid,
+        f: impl Fn(&GlobalTaskTable, &TaskView<'_>) -> Option<T>,
+    ) -> Vec<T> {
+        Self::collect(
+            |table, visit| {
+                for t in table.pgrp(pg) {
+                    if !visit(&t) {
+                        break;
                     }
                 }
-                full
-            };
+            },
+            f,
+        )
+    }
+
+    /// What `f` picks of the tasks `walk` visits (until a visit returns
+    /// false), with no allocation under TASKLIST: sized under one read
+    /// hold, filled under another, again if the set grew between
+    fn collect<T>(
+        walk: impl Fn(&GlobalTaskTable, &mut dyn FnMut(&TaskView<'_>) -> bool),
+        f: impl Fn(&GlobalTaskTable, &TaskView<'_>) -> Option<T>,
+    ) -> Vec<T> {
+        let mut cap = 1;
+        walk(&TASKLIST.read(), &mut |_| {
+            cap += 1;
+            true
+        });
+        loop {
+            let mut v = Vec::with_capacity(cap);
+            let mut full = false;
+            {
+                let table = TASKLIST.read();
+                walk(&table, &mut |t| {
+                    if v.len() == v.capacity() {
+                        full = true;
+                        return false;
+                    }
+                    if let Some(x) = f(&table, t) {
+                        v.push(x);
+                    }
+                    true
+                });
+            }
             if !full {
                 return v;
             }
@@ -3990,8 +4031,7 @@ pub fn pgrp_orphaned(pg: &crate::task::pid::Pid) -> bool {
 
 /// The processes of group `pg`, by pid
 pub fn pgrp_members(pg: &crate::task::pid::Pid) -> alloc::vec::Vec<Pid> {
-    let table = TASKLIST.read();
-    table.pgrp(pg).map(|t| t.task.pid).collect()
+    GlobalTaskTable::collect_pgrp(pg, |_, t| Some(t.task.pid))
 }
 
 /// Get all unique PIDs in the system

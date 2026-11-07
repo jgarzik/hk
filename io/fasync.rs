@@ -32,11 +32,11 @@ use crate::io::poll::{
     POLLWRNORM,
 };
 use crate::signal::siginfo::{SigFields, SigInfo, si_code};
-use crate::signal::{SIGIO, SIGURG, SendInfo, kill_proc_info, send_sig_info};
+use crate::signal::{SIGIO, SIGURG, SendInfo, group_task, send_group_signal, send_thread_signal};
 use crate::sync::spin::Mutex;
-use crate::task::percpu::TASKLIST;
+use crate::task::Uid;
+use crate::task::percpu::{GlobalTaskTable, TASKLIST, TaskRef, TaskView};
 use crate::task::pid::Pid;
-use crate::task::{Tid, Uid};
 use crate::uaccess::{get_user, put_user};
 use crate::util::error::KernelError;
 use crate::util::kalloc::try_arc;
@@ -387,33 +387,37 @@ fn band(reason: i32) -> i64 {
     i64::from(b)
 }
 
-/// The thread group of task `tid`, if the owner's setter may signal it
-/// (Linux sigio_perm: setter root, or its uid or euid is the target's
-/// uid or saved uid)
-fn sigio_perm(o: &Owner, tid: Tid) -> Option<crate::task::Pid> {
-    let (tgid, cred) = {
-        let table = TASKLIST.read();
-        let t = table.get(tid)?;
-        (t.task.pid, t.cred_arc())
-    };
-    let ok = o.euid == 0
+/// The owner's setter may signal task `t` (Linux sigio_perm: setter
+/// root, or its uid or euid is the target's uid or saved uid)
+fn sigio_perm(o: &Owner, t: &TaskView<'_>) -> bool {
+    let cred = t.cred();
+    o.euid == 0
         || o.euid == cred.suid
         || o.euid == cred.uid
         || o.uid == cred.suid
-        || o.uid == cred.uid;
-    ok.then_some(tgid)
+        || o.uid == cred.uid
+}
+
+/// What a SIGIO to task `t` reaches, if the setter may signal it: the
+/// thread itself for a thread owner, else its process (Linux
+/// send_sigio_to_task's do_send_sig_info to the task, by reference)
+fn sigio_target(table: &GlobalTaskTable, o: &Owner, t: &TaskView<'_>) -> Option<TaskRef> {
+    if !sigio_perm(o, t) {
+        return None;
+    }
+    match o.kind {
+        PidType::Tid => table.task(t.task.tid()),
+        _ => group_task(table, Some(*t)),
+    }
 }
 
 /// Linux send_sigio_to_task: the chosen signal with its POLL info, or
 /// plain SIGIO (SI_KERNEL) when none was chosen or it could not be
 /// queued; thread-directed for a thread owner, else to its process
-fn sigio_to_task(o: &Owner, tid: Tid, kind: PidType, fd: i32, reason: i32) {
-    let Some(tgid) = sigio_perm(o, tid) else {
-        return;
-    };
-    let send = |sig, info| match kind {
-        PidType::Tid => send_sig_info(tid, sig, info),
-        _ => kill_proc_info(tgid, sig, info),
+fn sigio_to_task(o: &Owner, t: &TaskRef, fd: i32, reason: i32) {
+    let send = |sig, info| match o.kind {
+        PidType::Tid => send_thread_signal(t, sig, info),
+        _ => send_group_signal(t, sig, info),
     };
     let sig = o.signum;
     if sig != 0 {
@@ -436,22 +440,24 @@ fn sigio_to_task(o: &Owner, tid: Tid, kind: PidType, fd: i32, reason: i32) {
 }
 
 /// Linux send_sigio: to the owner's thread or process, or once to each
-/// process of its group
+/// process of its group, each found through the owner's struct pid
+/// (never by a number its process may have freed for reuse)
 fn send_sigio(o: &Owner, fd: i32, reason: i32) {
     let Some(pid) = &o.pid else {
         return;
     };
-    match o.kind {
+    let targets = match o.kind {
         PidType::Tid | PidType::Tgid => {
-            let tid = TASKLIST.read().pid_tid(pid);
-            if let Some(tid) = tid {
-                sigio_to_task(o, tid, o.kind, fd, reason);
-            }
+            let t = {
+                let table = TASKLIST.read();
+                let v = table.pid_tid(pid).and_then(|tid| table.get(tid));
+                v.and_then(|v| sigio_target(&table, o, &v))
+            };
+            t.into_iter().collect()
         }
-        PidType::Pgrp => {
-            for p in crate::task::percpu::pgrp_members(pid) {
-                sigio_to_task(o, p, PidType::Pgrp, fd, reason);
-            }
-        }
+        PidType::Pgrp => GlobalTaskTable::collect_pgrp(pid, |table, t| sigio_target(table, o, t)),
+    };
+    for t in &targets {
+        sigio_to_task(o, t, fd, reason);
     }
 }
