@@ -13,8 +13,11 @@ mod tests;
 
 use hk_syscall::{
     LINUX_REBOOT_CMD_POWER_OFF, LINUX_REBOOT_MAGIC1, LINUX_REBOOT_MAGIC2, sys_exit, sys_exit_group,
-    sys_getpid, sys_reboot,
+    sys_getpid, sys_ioctl, sys_reboot,
 };
+
+/// tcdrain is TCSBRK with a nonzero argument
+const TCSBRK: u64 = 0x5409;
 use tests::helpers::{
     dev_setup, fail_count, fs_setup, host_mode, init_host_mode, loopback_up, print, print_num,
     println,
@@ -77,8 +80,11 @@ extern "C" fn rust_start() -> ! {
         }
     }
 
-    // Shutdown the system via ACPI S5
+    // Shutdown the system via ACPI S5, the console drained first
+    // (tcdrain): the kernel's power-off message must not land inside
+    // the output still queued for the serial port
     println(b"Powering off...");
+    sys_ioctl(1, TCSBRK, 1);
     sys_reboot(
         LINUX_REBOOT_MAGIC1,
         LINUX_REBOOT_MAGIC2,
