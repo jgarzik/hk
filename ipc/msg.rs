@@ -242,8 +242,9 @@ impl MsgQueue {
         ds.msg_cbytes = q.cbytes;
         ds.msg_qnum = q.qnum;
         ds.msg_qbytes = q.qbytes;
-        ds.msg_lspid = q.lspid;
-        ds.msg_lrpid = q.lrpid;
+        // In the caller's namespace (Linux msg: pid_vnr)
+        ds.msg_lspid = crate::task::pid::vnr(q.lspid as u64) as i32;
+        ds.msg_lrpid = crate::task::pid::vnr(q.lrpid as u64) as i32;
         ds.__unused4 = 0;
         ds.__unused5 = 0;
     }

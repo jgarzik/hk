@@ -985,8 +985,10 @@ fn handle_futex_death(entry: u64, futex_offset: i64, tid: Tid, pi: bool, pending
         let Ok(uval) = read_user_u32(futex_addr) else {
             return;
         };
+        // The word holds the owner's tid as it numbers itself (Linux
+        // handle_futex_death: task_pid_vnr(curr))
         let owner = uval & futex_op::FUTEX_TID_MASK;
-        if owner != tid as u32 {
+        if owner != crate::task::pid::vnr(tid) {
             let waiters = uval & futex_op::FUTEX_WAITERS != 0;
             if pending_op && !pi && (owner == 0 || !waiters) {
                 futex_wake(futex_addr, 1, any, false);

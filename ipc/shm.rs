@@ -123,8 +123,9 @@ impl ShmidKernel {
         ds.shm_atime = self.atim.load(Ordering::Relaxed);
         ds.shm_dtime = self.dtim.load(Ordering::Relaxed);
         ds.shm_ctime = self.ctim.load(Ordering::Relaxed);
-        ds.shm_cpid = self.cpid;
-        ds.shm_lpid = self.lpid.load(Ordering::Relaxed);
+        // In the caller's namespace (Linux shm: pid_vnr)
+        ds.shm_cpid = crate::task::pid::vnr(self.cpid as u64) as i32;
+        ds.shm_lpid = crate::task::pid::vnr(self.lpid.load(Ordering::Relaxed) as u64) as i32;
         ds.shm_nattch = u64::from(self.nattch.load(Ordering::Relaxed));
         ds.__unused4 = 0;
         ds.__unused5 = 0;
