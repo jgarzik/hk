@@ -2,7 +2,8 @@
 //! delay_group_leader, de_thread): exit_group and a fatal signal to any
 //! thread end every thread, blocked ones included; the leader is reaped
 //! only once all threads are gone; execve from any thread ends the
-//! others. Each child's threads hold the write end of a pipe (in their
+//! others, and keeps the process's pid when it leads its own process
+//! group and a traced sibling is left a zombie. Each child's threads hold the write end of a pipe (in their
 //! shared descriptor table): EOF on it after the reap shows that none
 //! is left.
 
@@ -27,6 +28,7 @@ pub fn run_tests() {
     test_kill_dead_group();
     test_exec_leader();
     test_exec_thread();
+    test_exec_traced_sibling();
 }
 
 fn report(name: &[u8], ok: bool, v: i64) {
@@ -320,4 +322,67 @@ fn test_exec_thread() {
         st == Some(5 << 8) && gone,
         st.unwrap_or(-1) as i64 * if gone { 1 } else { -1 },
     );
+}
+
+/// Read one byte from fd `go`, then exec `busybox sh -c "sleep 1; exit 7"`
+extern "C" fn exec_on_go(go: u64) -> ! {
+    let mut c = [0u8; 1];
+    sys_read(go, c.as_mut_ptr(), 1);
+    exec_exit(b"sleep 1; exit 7\0")
+}
+
+/// A process leading its own process group (its pgid is its pid): a
+/// thread traced by the parent is ended by a sibling's execve and left
+/// a zombie for its tracer, which reaps it. The new image keeps the pid: kill(pid, 0)
+/// finds it and /proc/<pid>/stat shows its new name (Linux de_thread: exchange_tids
+/// and transfer_pid before the old leader is released; a pid is freed
+/// only when no task uses it in any role)
+fn test_exec_traced_sibling() {
+    const PTRACE_SEIZE: i64 = 0x4206;
+    const WALL: i32 = 0x4000_0000;
+    let p = pipes();
+    let pid = sys_fork();
+    if pid == 0 {
+        hk_syscall::sys_setpgid(0, 0);
+        let traced = start(0, sleeper, 0);
+        send_tids(&p, [traced, start(1, exec_on_go, p.block[0] as u64)]);
+        reader(p.hold[0] as u64);
+    }
+    let tids = parent_side(&p);
+    let seized = hk_syscall::sys_ptrace(PTRACE_SEIZE, tids[0], 0, 0);
+    sys_write(p.block[1] as u64, b"x".as_ptr(), 1);
+    // The killed sibling is the tracer's zombie: Linux de_thread waits
+    // until it is reaped (hk cannot wait for a traced thread; it gives
+    // up after a second)
+    let mut st = 0i32;
+    for _ in 0..100 {
+        if sys_wait4(tids[0], &mut st, WNOHANG | WALL, 0) != 0 {
+            break;
+        }
+        sleep_ms(10);
+    }
+    let stat = super::exec_identity::proc_path(pid, b"stat\0");
+    let mut buf = [0u8; 64];
+    let mut execd = false;
+    for _ in 0..200 {
+        let n = super::helpers::read_file(&stat, &mut buf);
+        if n > 0 && buf[..n as usize].windows(9).any(|w| w == b"(busybox)") {
+            execd = true;
+            break;
+        }
+        sleep_ms(10);
+    }
+    let alive = sys_kill(pid, 0);
+    let (st, gone) = reap(pid, &p);
+    let ok = seized == 0 && execd && alive == 0 && st == Some(7 << 8) && gone;
+    let v = if seized != 0 {
+        seized
+    } else if !execd {
+        -1000
+    } else if alive != 0 {
+        alive
+    } else {
+        st.unwrap_or(-1) as i64
+    };
+    report(b"GROUP_EXEC_TRACED_SIBLING", ok, v);
 }

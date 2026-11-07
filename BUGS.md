@@ -516,7 +516,10 @@ clone and exit event stops (PTRACE_O_TRACEEXEC and friends,
 PTRACE_EVENT_*), PTRACE_INTERRUPT/LISTEN, group-stop interaction (SIGSTOP
 to an untraced task is ignored: stop/continue are not implemented),
 and the tracee's exit being
-reported to a tracer that is not its parent.
+reported to a tracer that is not its parent. A traced non-leader
+thread's zombie cannot be waited for by its tracer, and a sibling's
+exec removes it at once (Linux: the tracer reaps it, and de_thread
+waits for that).
 
 ## NETLINK_ROUTE / SIOC* subset gaps
 

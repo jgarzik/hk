@@ -978,8 +978,18 @@ impl GlobalTaskTable {
         {
             p.set_task(core::ptr::null());
         }
-        // Numbers no task uses any more go back (Linux free_pid)
-        if release && let Some(ti) = t.inner().access(self) {
+        if release {
+            self.release_pids(&t);
+        }
+        // SAFETY: found through the hash, so on this list
+        drop(unsafe { self.tasks.remove(&t) });
+        Some(t)
+    }
+
+    /// The numbers of removed task `t` that no task uses any more go
+    /// back (Linux free_pid)
+    fn release_pids(&self, t: &Task) {
+        if let Some(ti) = t.inner().access(self) {
             for p in [&ti.thread_pid, &ti.pgrp, &ti.session]
                 .into_iter()
                 .flatten()
@@ -987,9 +997,6 @@ impl GlobalTaskTable {
                 self.release_unused(p);
             }
         }
-        // SAFETY: found through the hash, so on this list
-        drop(unsafe { self.tasks.remove(&t) });
-        Some(t)
     }
 
     /// The group leaders in process group `pg` (Linux
@@ -1817,19 +1824,26 @@ pub fn take_leadership(tgid: Pid, tid: Tid) -> Vec<TaskRef> {
     while let Some(t) = old_threads.pop_front() {
         dead.push(t);
     }
-    // The old leader's pid passes to the caller: not given back
+    // Their numbers go back only once the caller holds the leader's
+    // pid and heads its group and session (Linux de_thread:
+    // exchange_tids and transfer_pid first, free_pid when no task uses
+    // a pid in any role): the leader's pid may be the group's or the
+    // session's, which a removed thread still names
     let mut gone: Vec<TaskRef> = gone
         .into_iter()
-        .filter_map(|t| table.remove_task(t, t != ltid))
+        .filter_map(|t| table.remove_task(t, false))
         .collect();
+    let removed = gone.len();
     gone.extend(dead);
     let Some(me) = table.task(tid) else {
+        for t in &gone[..removed] {
+            table.release_pids(t);
+        }
         return gone;
     };
     // exchange_tids: the caller takes the leader's tid and pid (Linux
     // de_thread), the old leader (released here) its own
-    let mut freed = None;
-    if let Some(l) = gone.iter().find(|t| t.tid() == ltid) {
+    if let Some(l) = gone[..removed].iter().find(|t| t.tid() == ltid) {
         let (mi, li) = me.inner().access_pair_mut(l.inner(), &mut *table);
         if let (Some(mi), Some(li)) = (mi.as_mut(), li.as_mut()) {
             // The old leader's CPU time stays the group's (Linux
@@ -1845,7 +1859,6 @@ pub fn take_leadership(tgid: Pid, tid: Tid) -> Vec<TaskRef> {
             if let Some(p) = &li.thread_pid {
                 p.set_task(core::ptr::null());
             }
-            freed = li.thread_pid.clone();
             // Its real parent is the old leader's (threads share it)
             mi.real_parent = li.real_parent.clone();
         }
@@ -1853,10 +1866,6 @@ pub fn take_leadership(tgid: Pid, tid: Tid) -> Vec<TaskRef> {
         // The old leader's RLIMIT_NPROC charge goes with it; the caller
         // keeps its own as the process's
         crate::task::nproc_uncharge(uid);
-    }
-    // The caller's old number, now the released old leader's, goes back
-    if let Some(p) = &freed {
-        table.release_unused(p);
     }
     me.set_tid(ltid);
     // The new leader takes the old one's place among its parent's
@@ -1876,6 +1885,11 @@ pub fn take_leadership(tgid: Pid, tid: Tid) -> Vec<TaskRef> {
     // ... and its place on the group's and session's lists (Linux
     // de_thread: transfer_pid PIDTYPE_PGID, PIDTYPE_SID)
     table.attach_pids(&me);
+    // Then the removed threads' numbers no task uses go back: the
+    // caller's old one, now the old leader's, and exited threads' own
+    for t in &gone[..removed] {
+        table.release_pids(t);
+    }
     drop(table);
     gone
 }
