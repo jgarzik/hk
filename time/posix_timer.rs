@@ -726,11 +726,10 @@ impl PosixTimerRegistry {
         }
     }
 
-    /// Allocate a new timer ID
-    fn alloc_id(&mut self) -> TimerT {
-        let id = self.next_id;
-        self.next_id = self.next_id.wrapping_add(1);
-        id
+    /// A free timer id, or None (EAGAIN) (Linux posix_timer_add)
+    fn alloc_id(&mut self) -> Option<TimerT> {
+        let timers = &self.timers;
+        next_free(&mut self.next_id, |id| timers.contains_key(&id))
     }
 
     /// Add a timer to the registry
@@ -753,6 +752,21 @@ impl PosixTimerRegistry {
     pub fn iter(&self) -> impl Iterator<Item = &Arc<PosixTimer>> {
         self.timers.values()
     }
+}
+
+/// The next id from counter `next` that is not `taken`, clamped to
+/// 0..=INT_MAX (negative ids are the itimers'); None once every id was
+/// tried (Linux posix_timer_add: next_posix_timer_id & INT_MAX, skipping
+/// hashed ids)
+fn next_free(next: &mut TimerT, taken: impl Fn(TimerT) -> bool) -> Option<TimerT> {
+    for _ in 0..=TimerT::MAX as u32 {
+        let id = *next & TimerT::MAX;
+        *next = next.wrapping_add(1);
+        if !taken(id) {
+            return Some(id);
+        }
+    }
+    None
 }
 
 /// A group's timers that were not deleted at its last exit (two last
@@ -840,7 +854,9 @@ pub fn create_posix_timer(
     // The id, then the timer and its signal entry outside the registry
     // lock (Linux posixtimer_init_sigqueue: EAGAIN past
     // RLIMIT_SIGPENDING), then the timer in the registry
-    let id = with_timers(tid, |reg| reg.alloc_id()).ok_or(-11)?;
+    let id = with_timers(tid, |reg| reg.alloc_id())
+        .flatten()
+        .ok_or(-11)?;
     if default_value {
         // Linux: sival_int = the timer id
         sev.sigev_value = u64::from(id as u32);
@@ -913,7 +929,7 @@ pub fn cpu_nanosleep(clockid: i32, abs: bool, value_ns: u64) -> Result<(), (Kern
         ..SigEvent::default()
     };
     let t = match with_timers(tid, |reg| {
-        let id = reg.alloc_id();
+        let id = reg.alloc_id().ok_or(KernelError::WouldBlock)?;
         let t = PosixTimer::with_cpu(id, clockid, tid, sev, Some(c), true)?;
         reg.add(t.clone());
         Ok(t)
@@ -1356,4 +1372,25 @@ pub fn sys_alarm(seconds: u32) -> i64 {
         secs += 1;
     }
     secs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Ids count up from the counter, skip ones in use, and wrap from
+    /// INT_MAX to 0, never negative (the itimers' ids)
+    #[test]
+    fn ids_clamp_and_skip() {
+        let mut next = 0;
+        assert_eq!(next_free(&mut next, |id| id == 0 || id == 1), Some(2));
+        assert_eq!(next, 3);
+        let mut next = TimerT::MAX;
+        assert_eq!(next_free(&mut next, |_| false), Some(TimerT::MAX));
+        assert_eq!(next, TimerT::MIN);
+        assert_eq!(next_free(&mut next, |id| id == 0), Some(1));
+        let mut next = -5;
+        let id = next_free(&mut next, |_| false);
+        assert!(id.is_some_and(|id| id >= 0));
+    }
 }

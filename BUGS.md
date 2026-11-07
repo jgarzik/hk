@@ -241,7 +241,10 @@ timer_create and clock_nanosleep take only the caller's own process
 CPU clock (and its threads' for timer_create): another process's is
 EINVAL (Linux runs those too, checked when that process runs). The
 SCHED CPU clock counts utime + stime like PROF (Linux: exact runtime).
-rseq is ENOSYS (glibc runs without it).
+A CPU-clock clock_nanosleep's hidden timer takes a timer id from the
+process's registry (Linux posix_cpu_nsleep's timer is not hashed: the
+next timer_create id does not move). rseq is ENOSYS (glibc runs
+without it).
 
 ## AF_PACKET gaps
 
@@ -862,8 +865,8 @@ Designs that grew one commit at a time. Tag = roadmap phase
 - **Globals where per-CPU fits** (I/C/E): TCP timers in one map run on
   softnet/0 only; CHILD_EXIT_WQ.
 - **ID allocators** (J): PidMap, fdbits, IPC ids, and plain counters
-  (bpf, keys, mqueue, posix timers, which wrap with no collision
-  check): one IDR/IDA.
+  (bpf, keys, mqueue, which wrap with no collision check): one
+  IDR/IDA.
 - **procfs** (H): a file is generated whole (no seq_file records): an
   open file's reads continuing one another see one generation, where
   Linux generates record by record, so a long file's later chunks are
