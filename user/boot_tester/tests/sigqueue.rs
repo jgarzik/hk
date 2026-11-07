@@ -30,6 +30,8 @@
 //!   (wait is ECHILD); with SA_NOCLDWAIT SIGCHLD still comes
 //! - a child's pdeath_signal comes when its parent exits, from it
 //! - a SIGEV_THREAD_ID timer whose thread has exited sends nothing
+//! - a child's custom exit signal becomes SIGCHLD once its parent
+//!   exec'd (parent_exec_id) or it is reparented (reparent_leader)
 //! - arm64: a handler set without SA_RESTORER returns through the
 //!   kernel's trampoline (Linux: the vDSO sigtramp), a mapping of its
 //!   own in /proc/self/maps ([sigpage]; Linux [vdso])
@@ -76,6 +78,8 @@ pub fn run_tests() {
     test_autoreap();
     test_pdeath();
     test_timer_gone();
+    test_exit_signal_exec();
+    test_exit_signal_reparent();
     #[cfg(target_arch = "aarch64")]
     test_no_restorer();
 }
@@ -1028,6 +1032,89 @@ fn test_timer_gone() {
     } else {
         print(b"SIGQUEUE_TIMER_GONE:FAIL status=");
         print_num(st as i64);
+        println(b"");
+    }
+}
+
+/// clone(SIGUSR1): a child whose exit signal is SIGUSR1; it exits after
+/// `ms`
+fn usr1_child(ms: i64) -> i64 {
+    let c = hk_syscall::sys_clone(SIGUSR1 as u64, 0, 0, 0, 0);
+    if c == 0 {
+        sleep_ms(ms);
+        sys_exit(0);
+    }
+    c
+}
+
+/// In a child: make a SIGUSR1-exit child, then exec boot_tester2, which
+/// waits for the signal it sends: SIGCHLD, not SIGUSR1
+fn test_exit_signal_exec() {
+    let p = sys_fork();
+    if p == 0 {
+        block(bit(SIGCHLD) | bit(SIGUSR1));
+        usr1_child(300);
+        let argv: [*const u8; 3] = [
+            b"boot_tester2\0".as_ptr(),
+            b"chldsig\0".as_ptr(),
+            core::ptr::null(),
+        ];
+        let envp: [*const u8; 1] = [core::ptr::null()];
+        hk_syscall::sys_execve(b"/bin/boot_tester2\0".as_ptr(), argv.as_ptr(), envp.as_ptr());
+        sys_exit(99);
+    }
+    let mut st = 0i32;
+    sys_wait4(p, &mut st, 0, 0);
+    let got = (st >> 8) & 0xff;
+    if st & 0x7f == 0 && got == SIGCHLD as i32 {
+        println(b"SIGQUEUE_EXIT_SIGNAL_EXEC:OK");
+    } else {
+        print(b"SIGQUEUE_EXIT_SIGNAL_EXEC:FAIL status=");
+        print_num(st as i64);
+        println(b"");
+    }
+}
+
+/// A SIGUSR1-exit child whose parent exits is this (init) process's
+/// now: its exit sends SIGCHLD, not SIGUSR1
+fn test_exit_signal_reparent() {
+    let old = block(bit(SIGCHLD) | bit(SIGUSR1));
+    let mut fds = [0i32; 2];
+    hk_syscall::sys_pipe(fds.as_mut_ptr());
+    let p = sys_fork();
+    if p == 0 {
+        let c = usr1_child(300);
+        let b = (c as u32).to_ne_bytes();
+        hk_syscall::sys_write(fds[1] as u64, b.as_ptr(), 4);
+        sys_exit(0);
+    }
+    let mut st = 0i32;
+    sys_wait4(p, &mut st, 0, 0);
+    let mut buf = [0u8; 4];
+    hk_syscall::sys_read(fds[0] as u64, buf.as_mut_ptr(), 4);
+    let c = i64::from(u32::from_ne_bytes(buf));
+    // SIGCHLDs of others may come first: wait for the child's
+    let mut got = 0i64;
+    for _ in 0..20 {
+        let mut info = zeroed();
+        let r = wait_sig(bit(SIGCHLD) | bit(SIGUSR1), 2, &mut info);
+        if r < 0 || info.si_pid as i64 == c {
+            got = r;
+            break;
+        }
+    }
+    let mut sc = 0i32;
+    sys_wait4(c, &mut sc, 0x4000_0000, 0);
+    let mut rest = zeroed();
+    while wait_sig(bit(SIGCHLD) | bit(SIGUSR1), 0, &mut rest) > 0 {}
+    sys_close(fds[0] as u64);
+    sys_close(fds[1] as u64);
+    setmask(old);
+    if got == SIGCHLD as i64 {
+        println(b"SIGQUEUE_EXIT_SIGNAL_REPARENT:OK");
+    } else {
+        print(b"SIGQUEUE_EXIT_SIGNAL_REPARENT:FAIL sig=");
+        print_num(got);
         println(b"");
     }
 }

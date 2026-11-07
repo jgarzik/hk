@@ -827,6 +827,7 @@ impl GlobalTaskTable {
     /// Move every child of `task` to `reaper` (Linux forget_original_parent
     /// + reparent_leader); true if one was a zombie
     pub fn reparent(&mut self, task: &Task, reaper: &TaskRef, moved: &mut Vec<TaskRef>) {
+        let other_group = reaper.pid != task.pid;
         loop {
             let Some(child) = self.inner_mut_of(task).children.pop_front() else {
                 break;
@@ -834,6 +835,11 @@ impl GlobalTaskTable {
             let ci = self.inner_mut_of(&child);
             ci.in_children = false;
             ci.real_parent = Some(Arc::downgrade(reaper));
+            // Linux reparent_leader: no custom exit signal to a new
+            // parent process ("we don't want people slaying init")
+            if other_group {
+                ci.exit_signal = crate::signal::SIGCHLD as i32;
+            }
             child.ppid.store(reaper.pid, Ordering::Relaxed);
             self.link_child(&child);
             moved.push(child);
@@ -1232,6 +1238,7 @@ fn create_kernel_task(
         pids_linked: false,
         exit_code: 0,
         exit_signal: 0, // Kernel threads don't send exit signals
+        parent_exec_id: 0,
         pdeath_signal: 0,
         state: TaskState::Ready,
         page_table: ArchPageTable::kernel_identity(),
@@ -1443,6 +1450,7 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<Tid, &'static str> {
         pids_linked: false,
         exit_code: 0,
         exit_signal: crate::signal::SIGCHLD as i32, // Default: notify parent with SIGCHLD
+        parent_exec_id: 0,
         pdeath_signal: 0,
         state: TaskState::Running, // Will be running immediately
         page_table: config.page_table,
@@ -1750,7 +1758,9 @@ pub fn take_leadership(tgid: Pid, tid: Tid) -> Vec<TaskRef> {
         m.task
             .ppid
             .store(ppid, core::sync::atomic::Ordering::Relaxed);
-        m.exit_signal = exit_signal;
+        // Linux de_thread: the new leader's exit signal is SIGCHLD
+        let _ = exit_signal;
+        m.exit_signal = crate::signal::SIGCHLD as i32;
         m.task.start_time.store(start, Ordering::Relaxed);
     }
     // ... and its place on the group's and session's lists (Linux
@@ -1949,9 +1959,12 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         parent_ptrace,
         parent_ptracer,
         parent_real_parent,
+        parent_parent_exec_id,
+        parent_leader_exit_signal,
     ) = {
         let table = TASKLIST.read();
         let parent = table.get(current_tid).ok_or(3)?; // ESRCH - no such process
+        let leader_exit = table.get(parent.task.pid).map_or(0, |l| l.exit_signal);
         (
             parent.task.pid,
             parent.task.ppid(),
@@ -1973,6 +1986,8 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
             parent.ptrace,
             parent.ptracer.clone(),
             parent.real_parent.clone(),
+            parent.parent_exec_id,
+            leader_exit,
         )
     };
     // Its own alloc_lock fields (lock-free but the memory policy)
@@ -2122,8 +2137,22 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         session: None,
         pids_linked: false,
         exit_code: 0,
-        exit_signal: config.exit_signal, // From clone3 args (SIGCHLD for fork, 0 for threads)
-        pdeath_signal: 0,                // Never inherited, must be set explicitly via prctl
+        // Linux copy_process: a thread -1, a CLONE_PARENT child the
+        // group leader's; their parent_exec_id the caller's, else the
+        // caller's exec count
+        exit_signal: if config.flags & CLONE_THREAD != 0 {
+            -1
+        } else if config.flags & CLONE_PARENT != 0 {
+            parent_leader_exit_signal
+        } else {
+            config.exit_signal
+        },
+        parent_exec_id: if config.flags & (CLONE_PARENT | CLONE_THREAD) != 0 {
+            parent_parent_exec_id
+        } else {
+            crate::task::self_exec_id(parent_pid)
+        },
+        pdeath_signal: 0, // Never inherited, must be set explicitly via prctl
         state: TaskState::Ready,
         page_table: child_pt,
         // TLS fields - will be set based on clone flags below
@@ -2466,7 +2495,8 @@ fn forget_original_parent() {
         for (t, sig) in deaths {
             crate::signal::send_group_signal(&t, sig, crate::signal::SendInfo::User);
         }
-        if leader_waits(c.pid) && crate::signal::notify::do_notify_parent(c.pid) {
+        let to_other = c.ppid() != me.pid;
+        if to_other && leader_waits(c.pid) && crate::signal::notify::do_notify_parent(c.pid) {
             release_zombie(c.pid);
         }
     }
@@ -4337,10 +4367,12 @@ pub fn commit_creds_impl(new: alloc::sync::Arc<Cred>) {
     // (suid_dumpable, default 0), so a less-privileged identity can't ptrace
     // or core-dump state obtained under the old one (Linux kernel/cred.c
     // commit_creds)
+    let gains_caps = new.cap_permitted.0 & !old.cap_permitted.0 != 0;
     let ids_changed = old.euid != new.euid
         || old.egid != new.egid
         || old.fsuid != new.fsuid
-        || old.fsgid != new.fsgid;
+        || old.fsgid != new.fsgid
+        || gains_caps;
 
     // Under TASKLIST: other tasks read our credentials under it; the
     // old ones are freed after it (only memory)
@@ -4352,6 +4384,11 @@ pub fn commit_creds_impl(new: alloc::sync::Arc<Cred>) {
                 // On the mm: every thread sharing it (Linux set_dumpable(
                 // task->mm))
                 mm.set_dumpable(crate::task::dumpable::SUID_DUMP_DISABLE);
+            }
+            // Its parent no longer signals it at death (Linux
+            // commit_creds)
+            if ids_changed {
+                t.pdeath_signal = 0;
             }
             t.set_cred(new)
         })
@@ -4624,6 +4661,12 @@ pub fn exec_replace_image(
         let mut task = task.expect("exec: current task not in the task table");
         task.page_table = ArchPageTable::new(new.pgd());
         new.set_dumpable(ident.dumpable);
+        // A new execution domain (Linux de_thread): SIGCHLD; a secure
+        // exec is not signalled at its parent's death (begin_new_exec)
+        task.exit_signal = crate::signal::SIGCHLD as i32;
+        if ident.secure {
+            task.pdeath_signal = 0;
+        }
         // The mm and name change as one under task_lock (Linux
         // exec_mmap, __set_task_comm): a reader sees both or neither
         let mut a = task.task.task_lock();

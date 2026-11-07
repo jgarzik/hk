@@ -782,6 +782,8 @@ fn secureexec(c: &crate::task::Cred) -> bool {
 pub struct ExecIdentity {
     pub name: [u8; 16],
     pub dumpable: u8,
+    /// A secure exec (set-id: Linux bprm->secureexec)
+    pub secure: bool,
 }
 
 /// The new image's identity, decided before the point of no return and
@@ -805,7 +807,11 @@ fn exec_identity(path: &[u8], file: &File) -> ExecIdentity {
     } else {
         SUID_DUMP_DISABLE
     };
-    ExecIdentity { name, dumpable }
+    ExecIdentity {
+        name,
+        dumpable,
+        secure: secureexec(&c),
+    }
 }
 
 /// End the other threads of the caller's group and wait until they

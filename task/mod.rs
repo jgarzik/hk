@@ -1130,8 +1130,12 @@ pub struct TaskInner {
     // =========================================================================
     /// Exit status code (set when task becomes zombie)
     pub exit_code: i32,
-    /// Signal to send to parent on exit (default SIGCHLD, from clone3 exit_signal)
+    /// Signal to send to parent on exit (default SIGCHLD, from clone3
+    /// exit_signal; -1 for a thread, Linux)
     pub exit_signal: i32,
+    /// Its parent's exec count when it was made (Linux parent_exec_id):
+    /// a non-SIGCHLD exit signal is sent only to the image that set it
+    pub parent_exec_id: u64,
     /// Signal to send when parent dies (set via prctl PR_SET_PDEATHSIG)
     pub pdeath_signal: i32,
 
@@ -2219,6 +2223,15 @@ pub fn cap_fix_setuid(old: &Cred, new: &mut Cred, keep_caps: bool) {
     if old.euid != 0 && new.euid == 0 {
         new.cap_effective = new.cap_permitted;
     }
+}
+
+/// How many times process `pid` has exec'd (Linux self_exec_id: its
+/// struct pid's count, which an exec bumps), 0 if it is gone
+pub fn self_exec_id(pid: Pid) -> u64 {
+    u32::try_from(pid)
+        .ok()
+        .and_then(|n| crate::task::pid::find_pid(&crate::ns::INIT_PID_NS, n))
+        .map_or(0, |p| p.exec_gen())
 }
 
 /// Capabilities that fsuid 0 historically implied (Linux CAP_FS_SET)

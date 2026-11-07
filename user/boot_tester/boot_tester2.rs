@@ -275,6 +275,23 @@ fn comm_check() -> ! {
     });
 }
 
+/// chldsig mode: SIGCHLD and SIGUSR1 blocked across the exec, the
+/// signal a child made before the exec sends at its exit; exit with it
+fn chldsig() -> ! {
+    let mask: u64 = (1 << (17 - 1)) | (1 << (10 - 1));
+    let ts = [10i64, 0];
+    let r = hk_syscall::sys_rt_sigtimedwait(
+        &mask as *const u64 as u64,
+        0,
+        ts.as_ptr() as u64,
+        8,
+    );
+    let mut st = 0i32;
+    // __WALL: a non-SIGCHLD child too
+    hk_syscall::sys_wait4(-1, &mut st, 0x4000_0000, 0);
+    sys_exit(r.max(0) as u64)
+}
+
 extern "C" fn rust_start(sp: *const u64) -> ! {
     const PR_GET_DUMPABLE: i32 = 3;
     match arg1(sp) {
@@ -291,6 +308,7 @@ extern "C" fn rust_start(sp: *const u64) -> ! {
             sys_write(3, ids.as_ptr() as *const u8, 16);
             sys_exit(0);
         }
+        b"chldsig" => chldsig(),
         b"sleep" => {
             sys_write(3, b"r".as_ptr(), 1);
             loop {

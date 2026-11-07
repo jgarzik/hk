@@ -110,11 +110,16 @@ fn notice(tid: Tid) -> Option<(TaskRef, u32, bool, SigInfo)> {
         && !real
             .as_ref()
             .is_some_and(|r| alloc::sync::Arc::ptr_eq(r, &parent));
-    let sig = if t.leader && !reparented {
+    let mut sig = if t.leader && !reparented {
         t.exit_signal as u32
     } else {
         SIGCHLD
     };
+    // A custom exit signal only to the image that asked for it (Linux:
+    // parent_exec_id != parent->self_exec_id makes it SIGCHLD)
+    if sig != SIGCHLD && t.parent_exec_id != crate::task::self_exec_id(parent.pid) {
+        sig = SIGCHLD;
+    }
     if sig > 64 {
         return None;
     }
