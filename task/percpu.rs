@@ -1667,27 +1667,38 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<Tid, &'static str> {
     Ok(tid)
 }
 
-/// Mark a task as zombie with exit status
-pub fn mark_zombie(tid: Tid, status: i32, group_dead: bool) {
-    let pid: Option<Pid>;
-    {
+/// Mark a task as zombie with exit status; true if it is a group
+/// leader with no other thread left to report it, decided in the same
+/// TASKLIST write section (Linux exit_notify: thread_group_empty under
+/// tasklist_lock), so it and its last thread's release never both
+/// report it
+fn mark_zombie(tid: Tid, status: i32, group_dead: bool) -> bool {
+    let (pid, last) = {
         let mut table = TASKLIST.write();
-        if let Some(mut task) = table.get_mut(tid) {
+        let Some((pid, leader)) = table.get_mut(tid).map(|mut task| {
             task.exit_code = status;
             task.state = TaskState::Zombie(status);
-            pid = Some(task.task.pid);
-        } else {
-            pid = None;
-        }
-    }
-
+            (task.task.pid, task.leader)
+        }) else {
+            return false;
+        };
+        (pid, leader && !group_pending(&table, pid, tid))
+    };
     // The process's pidfds once its last thread is gone (Linux
     // do_notify_pidfd; after TASKLIST)
-    if let Some(p) = pid
-        && group_dead
-    {
-        crate::task::pidfd::notify_process_exit(p, status);
+    if group_dead {
+        crate::task::pidfd::notify_process_exit(pid, status);
     }
+    last
+}
+
+/// A thread of group `tgid` other than `tid` will still report its
+/// leader when it leaves (Linux thread_group_empty is false): any
+/// listed thread but a traced zombie, whose tracer releases it
+fn group_pending(table: &GlobalTaskTable, tgid: Pid, tid: Tid) -> bool {
+    table
+        .threads(tgid)
+        .any(|u| u.task.tid() != tid && !(matches!(u.state, TaskState::Zombie(_)) && u.ptrace != 0))
 }
 
 /// Reap a zombie child of the given parent
@@ -2672,21 +2683,20 @@ fn reparent_children(me: &TaskRef, moved: &mut Vec<TaskRef>) -> bool {
 // Not inlined: its send path's stack is used only for the call, not
 // added to exit_current's frame for the rest of the exit
 #[inline(never)]
-fn exit_notify(tid: Tid) {
-    let (pid, leader, traced) = {
+fn exit_notify(tid: Tid, last: bool) {
+    let (pid, traced) = {
         let table = TASKLIST.read();
         let Some(t) = table.get(tid) else {
             return;
         };
-        (t.task.pid, t.leader, t.ptrace != 0)
+        (t.task.pid, t.ptrace != 0)
     };
     if traced {
         crate::signal::notify::do_notify_parent(tid);
-    } else if leader && !group_others(pid, tid) && crate::signal::notify::do_notify_parent(tid) {
+    } else if last && crate::signal::notify::do_notify_parent(tid) {
         release_zombie(tid);
     }
-    release_thread(tid);
-    if !leader && !traced && leader_waits(pid) && crate::signal::notify::do_notify_parent(pid) {
+    if release_thread(tid) && crate::signal::notify::do_notify_parent(pid) {
         release_zombie(pid);
     }
 }
@@ -2726,19 +2736,34 @@ fn release_zombie(tid: Tid) {
 /// An exited non-leader thread leaves the task list at once (Linux
 /// release_task for an autoreaped thread); its run queue keeps it
 /// until it has switched away for good
-fn release_thread(tid: Tid) {
-    let gone = {
+///
+/// True if that left its group's zombie leader with no thread to wait
+/// for: this release reports it, decided under the same TASKLIST write
+/// section as the removal (Linux release_task: thread_group_empty and
+/// the leader's EXIT_ZOMBIE under tasklist_lock), so the leader's own
+/// exit and its threads' releases report it once
+fn release_thread(tid: Tid) -> bool {
+    let (gone, last) = {
         let mut table = TASKLIST.write();
-        match table.get(tid) {
+        let gone = match table.get(tid) {
             // A traced thread stays for its tracer's wait
             Some(t) if !t.leader && t.ptrace == 0 => table.remove(tid),
             _ => None,
-        }
+        };
+        let last = gone.as_ref().is_some_and(|t| {
+            table.get(t.pid).is_some_and(|l| {
+                l.leader
+                    && matches!(l.state, TaskState::Zombie(_))
+                    && !group_pending(&table, t.pid, t.pid)
+            })
+        });
+        (gone, last)
     };
     if let Some(t) = &gone {
         crate::fs::proc::proc_flush_pid(t.pid, tid);
     }
     drop(gone);
+    last
 }
 
 /// Exit the current task and switch to another
@@ -2867,8 +2892,8 @@ pub fn exit_current(status: Option<i32>) -> ! {
         crate::cgroup::detach_task(tid);
     }
     if let Some(st) = status {
-        mark_zombie(tid, st, group_dead);
-        exit_notify(tid);
+        let last = mark_zombie(tid, st, group_dead);
+        exit_notify(tid, last);
     }
 
     // Let a parent sleeping in wait4/waitid re-check for zombies

@@ -3,7 +3,8 @@
 //! thread end every thread, blocked ones included; the leader is reaped
 //! only once all threads are gone; execve from any thread ends the
 //! others, and keeps the process's pid when it leads its own process
-//! group and a traced sibling is left a zombie. Each child's threads hold the write end of a pipe (in their
+//! group and a traced sibling is left a zombie. A process whose
+//! threads all exit at once tells its parent once. Each child's threads hold the write end of a pipe (in their
 //! shared descriptor table): EOF on it after the reap shows that none
 //! is left.
 
@@ -29,6 +30,7 @@ pub fn run_tests() {
     test_exec_leader();
     test_exec_thread();
     test_exec_traced_sibling();
+    test_notify_once();
 }
 
 fn report(name: &[u8], ok: bool, v: i64) {
@@ -385,4 +387,47 @@ fn test_exec_traced_sibling() {
         st.unwrap_or(-1) as i64
     };
     report(b"GROUP_EXEC_TRACED_SIBLING", ok, v);
+}
+
+/// 100 times: a child (exit signal SIGRTMIN+6, which queues every
+/// instance) starts three threads and calls exit_group; after its reap
+/// one exit signal is pending, never two (Linux exit_notify and
+/// release_task decide "group empty" under tasklist_lock: the leader's
+/// exit or its last thread's release reports it, never both)
+fn test_notify_once() {
+    const SIGRT: u32 = 40;
+    const WALL: i32 = 0x4000_0000;
+    let mask: u64 = 1 << (SIGRT - 1);
+    let mut old = 0u64;
+    hk_syscall::sys_rt_sigprocmask(0, &mask as *const u64 as u64, &mut old as *mut u64 as u64, 8);
+    let mut bad = (0, 0i64);
+    for i in 0..100 {
+        let c = hk_syscall::sys_clone(SIGRT as u64, 0, 0, 0, 0);
+        if c == 0 {
+            for k in 0..3 {
+                start(k, sleeper, 0);
+            }
+            sys_exit_group(0);
+        }
+        let mut st = 0i32;
+        sys_wait4(c, &mut st, WALL, 0);
+        let mut n = 0;
+        let ts = [0i64, 0];
+        while hk_syscall::sys_rt_sigtimedwait(
+            &mask as *const u64 as u64,
+            0,
+            ts.as_ptr() as u64,
+            8,
+        ) == SIGRT as i64
+        {
+            n += 1;
+        }
+        // hk may lose it to a reap racing the send (BUGS.md); never two
+        if n > 1 || (n == 0 && super::helpers::host_mode()) {
+            bad = (i + 1, n);
+            break;
+        }
+    }
+    hk_syscall::sys_rt_sigprocmask(2, &old as *const u64 as u64, 0, 8);
+    report(b"GROUP_NOTIFY_ONCE", bad.0 == 0, bad.1);
 }

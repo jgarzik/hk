@@ -492,6 +492,11 @@ de_thread
 
 **Location**: `signal/notify.rs`, `task/percpu.rs` (exit_notify)
 
+A child's exit signal can be lost: it becomes reapable (a zombie)
+before its parent is told, which happens after TASKLIST is dropped,
+and a parent that reaps it in between gets no signal (Linux
+exit_notify sends under tasklist_lock, so wait cannot reap first).
+
 A traced child's exit tells its tracer only; once the tracer reaps or
 detaches it, its real parent is not told nor can wait for it (Linux
 wait_task_zombie / __ptrace_detach: do_notify_parent to the real

@@ -2891,6 +2891,12 @@ de_thread, exit_group does not.
 - The zombie leader keeps its `SignalStruct` until reaped (the group's
   status); the reaper reads it under TASKLIST and releases the Task
   after dropping it.
+- A leader is reported to its parent once (Linux exit_notify /
+  release_task under tasklist_lock): the leader decides in the TASKLIST
+  write section that makes it a zombie (`mark_zombie`), each untraced
+  thread in the one that removes it (`release_thread`); a thread still
+  listed counts as left to report it, so exactly the last section
+  finds the group empty. The signal is sent after TASKLIST is dropped.
 - de_thread (exec) holds cred_guard (sleeping, outermost) while it waits
   for the other threads on CHILD_EXIT_WQ (killable); it holds no
   spinlock. A thread blocked on that cred_guard (its own exec, or an
