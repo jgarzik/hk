@@ -41,6 +41,7 @@ pub mod fanotify;
 pub mod fault_inject;
 pub mod fault_signals;
 pub mod fcntl_owner;
+pub mod sigio;
 pub mod fd_leak;
 pub mod fd_scale;
 pub mod fifo;
@@ -337,6 +338,7 @@ pub fn run_all_tests() {
     flock::run_tests();
     posix_lock::run_tests();
     fcntl_owner::run_tests();
+    sigio::run_tests();
     prctl_extra::run_tests();
     tls::run_tests();
     poll::run_tests();

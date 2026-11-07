@@ -179,6 +179,11 @@ fn sig_sicodes(sig: u32) -> Option<(i32, Layout)> {
     })
 }
 
+/// `sig` has positive codes of its own (Linux sig_specific_sicodes)
+pub fn specific_codes(sig: u32) -> bool {
+    sig_sicodes(sig).is_some()
+}
+
 /// The union member `sig` with `code` carries (Linux siginfo_layout)
 pub fn layout(sig: u32, code: i32) -> Layout {
     use super::{SIGBUS, SIGSEGV, SIGTRAP};

@@ -361,11 +361,12 @@ fn sock_ioctl(s: &dyn ProtoOps, file: &File, cmd: u32, arg: u64) -> Result<i64, 
     match cmd {
         FIOSETOWN | SIOCSPGRP => {
             let who = get_user::<Uaccess, i32>(arg).map_err(|_| KernelError::BadAddress)?;
-            crate::fs::fd::f_setown(file, who)?;
+            crate::io::fasync::f_setown(file, who, true)?;
             return Ok(0);
         }
         FIOGETOWN | SIOCGPGRP => {
-            put_user::<Uaccess, i32>(arg, file.get_owner()).map_err(|_| KernelError::BadAddress)?;
+            put_user::<Uaccess, i32>(arg, crate::io::fasync::f_getown(file))
+                .map_err(|_| KernelError::BadAddress)?;
             return Ok(0);
         }
         _ => {}

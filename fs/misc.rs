@@ -488,22 +488,23 @@ pub fn sys_ioctl(fd: i32, cmd: u32, arg: u64) -> i64 {
             }
             return 0;
         }
+        // Linux ioctl_fioasync: a change of O_ASYNC goes through
+        // ->fasync, ENOTTY without one
         FIOASYNC => {
-            // Set/clear O_ASYNC flag
-            if arg == 0 {
-                return KernelError::BadAddress.sysret();
-            }
-            let enable: i32 = match get_user::<Uaccess, i32>(arg) {
+            let on: i32 = match get_user::<Uaccess, i32>(arg) {
                 Ok(v) => v,
                 Err(_) => return KernelError::BadAddress.sysret(),
             };
-            let current_flags = file.get_flags();
-            if enable != 0 {
-                file.set_status_flags(current_flags | crate::fs::flags::O_ASYNC);
-            } else {
-                file.set_status_flags(current_flags & !crate::fs::flags::O_ASYNC);
+            let on = on != 0;
+            let async_now = file.get_flags() & crate::fs::flags::O_ASYNC != 0;
+            if on == async_now {
+                return 0;
             }
-            return 0;
+            return match file.fasync(fd, on) {
+                Some(Ok(())) => 0,
+                Some(Err(e)) => e.sysret(),
+                None => KernelError::NotTty.sysret(),
+            };
         }
         FIOCLEX => {
             // Set close-on-exec flag

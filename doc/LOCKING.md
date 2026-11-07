@@ -360,8 +360,15 @@ Kernel mappings (3.2 Kernel Page Tables): vmalloc FLUSH (sleeping;
 Pipes (3.11): Pipe.inner (sleeping; two in address order) → frame
     allocator, and the mmap_lock of a faulting user copy (read and
     write copy between pipe pages and the caller's memory under it,
-    Linux pipe_read/pipe_write); no other lock under it, none of these
-    above it
+    Linux pipe_read/pipe_write), and `FasyncList.list` (pipe_fasync);
+    no other lock under it, none of these above it
+
+SIGIO (3.11, io/fasync.rs; Linux fasync_lock, f_lock, fown->lock):
+    FasyncList.list (sleeping, per object) → File.f_lock (fasync_helper
+    sets O_ASYNC with the list change) | FOwner.st (spin leaf, copied
+    and released before a send); kill_fasync sends under
+    FasyncList.list → TASKLIST (read) → Task.sig → shared_pending, so
+    its callers hold no spin lock (no Inode.i_pipe, no Pipe.inner)
 
 Block locks (3.10 Block Device Subsystem):
     Disk.open_mutex (sleeping) → devtmpfs root i_rwsem → BLKDEV_REGISTRY,
@@ -2707,7 +2714,8 @@ the signal handler table must use an IRQ-safe lock. The `IrqSpinlock` ensures th
    Deviation: Linux siglock is IRQ-safe and per thread group; hk's is
    per task, thread context only. Audit (T0): no interrupt handler
    sends a signal (the tty receive path is not driven from the UART
-   IRQ, no SIGIO/SIGURG generation, POSIX timer/itimer expiry runs in
+   IRQ, SIGIO comes from `kill_fasync` in thread context with no spin
+   lock held, no SIGURG generation, POSIX timer/itimer expiry runs in
    `ktimers/N`, no tick-based SIGXCPU/SIGPROF, fault signals are sent by
    the faulting task with interrupts on). `send_signal` reports
    `SIGNAL:FAIL` if called with a nonzero interrupt depth (arm64 IRQ
@@ -3480,12 +3488,13 @@ else is taken under it) unless an order is given. "spin" is the
 | `cmdline::SAVED` | cmdline.rs | spin Mutex | the saved kernel command line (Linux saved_command_line): written once while parsing, before SMP; read in thread context (init's arguments); a leaf |
 | `signal::NO_SHARED` | signal/mod.rs | spin Mutex | the empty shared pending set the boot task (no SignalStruct) reads; locked where a thread group's `shared_pending` would be, same position (Task.sig -> shared_pending) |
 | `FS_TYPES`, `CHARDEV_REGISTRY` | fs/superblock.rs, fs/chardev.rs | spin | filesystem types, character device registry |
-| `File.f_lock` | fs/file.rs | spin Mutex | file status flags (Linux f_lock) |
+| `File.f_lock` | fs/file.rs | spin Mutex | file status flags (Linux f_lock); a leaf, also under `FasyncList.list` (O_ASYNC is set or cleared only with the file's fasync entry) |
+| `FasyncList.list` → `File.f_lock`, `FOwner.st` | io/fasync.rs | sleeping `sync::Mutex` (per object: a pipe's readers and writers); `FOwner.st` spin leaf | SIGIO (Linux fasync_lock and RCU readers, fown->lock): a list's entries (a file's `FOwner` reference and the armed fd), changed by `fasync_helper` (from `->fasync`; a pipe's under `Pipe.inner`, Linux pipe_fasync) and walked by `kill_fasync`, which sends each entry's signal under it: thread context, no spin lock held (3.7 rule 1). `FOwner.st` (a file's owner pid, type, setter uids and F_SETSIG signal; allocated once per file) is copied under it and released before the send. A file's last close takes it off its lists (`->fasync(-1, off)`) before `->release` |
 | `SuperBlock.{root, private}`, `DentryCache.root` | fs/superblock.rs, fs/dentry.rs | spin RwLock | superblock root and private data, the dcache root |
 | `RamfsInodeData.xattrs`, `RamfsSbData.sb` | fs/ramfs.rs | spin | ramfs xattrs and superblock back-pointer (under VFS locks) |
 | membarrier `GLOBAL_MUTEX` → `IPI_MUTEX` | task/membarrier.rs | sleeping (`sync::Mutex`; `IPI_MUTEX` is Linux membarrier_ipi_mutex) | `IPI_MUTEX` serializes the membarrier commands that interrupt other CPUs, so callers cannot multiply the IPIs; held only across `smp_call_function_many` (waited); nothing is taken under it. `GLOBAL_MUTEX` (killable) paces MEMBARRIER_CMD_GLOBAL to one call per tick: held across its IPIs and its one-tick sleep, so GLOBAL callers never delay the expedited ones. The targets are chosen from each CPU's `PerCpuScheduler.curr_mm` / `membarrier_state` (atomics written at every switch in `make_current`: `curr_mm` SeqCst, then a full fence, then the registrations read, so a registration either sees the CPU in its mm and refreshes it by IPI or is seen by the switch; Linux rq->curr->mm and rq->membarrier_state), compared, never dereferenced |
 | `Inode.i_pipe` | fs/inode.rs, io/pipe.rs (FIFOs) | spin Mutex leaf (Linux inode->i_lock around i_pipe) | a FIFO's pipe and its open-file count: attached by the first open, dropped by the last release; every change of the pipe's reader/writer counts and open counters happens under it (so a blocking open decides, and samples the counter it waits on, before unlocking; the release wakes the other side under it: -> `Pipe.wait_queue`); never held across a wait (a blocking open waits on `Pipe.wait_queue` after unlocking) or under `Pipe.inner` |
-| `Pipe.inner` | io/pipe.rs | sleeping (`sync::Mutex`, Linux pipe->mutex) | the pipe's buffer ring; held across page allocation and across read/write's copy to or from the caller's memory (may fault: -> mmap_lock, as Linux pipe->mutex), never under a spin lock; two pipes (splice, tee) in address order (Linux pipe_double_lock); -> frame allocator. `Pipe.head`/`tail` (atomics) are published as the guard unlocks and read locklessly by wait conditions and poll (poll runs under `Eventpoll.inner`, an IrqSpinlock); wakeups follow the unlock |
+| `Pipe.inner` | io/pipe.rs | sleeping (`sync::Mutex`, Linux pipe->mutex) | the pipe's buffer ring; held across page allocation and across read/write's copy to or from the caller's memory (may fault: -> mmap_lock, as Linux pipe->mutex), never under a spin lock; two pipes (splice, tee) in address order (Linux pipe_double_lock); -> frame allocator; -> `FasyncList.list` (pipe_fasync changes both lists under it, Linux too). SIGIO is sent after it is dropped (Linux sends under pipe->mutex) and after `Inode.i_pipe`. `Pipe.head`/`tail` (atomics) are published as the guard unlocks and read locklessly by wait conditions and poll (poll runs under `Eventpoll.inner`, an IrqSpinlock); wakeups follow the unlock |
 | `NTtyLdisc.data` | tty/n_tty.rs | spin Mutex | line discipline buffer (input is polled, not IRQ-fed) |
 | `VgaCon.state` | arch/x86_64/vgacon.rs | IrqSpinlock | VGA text console state, under `CONSOLE_REGISTRY` (3.9) |
 | `SimpleGfxDevice.state`, `GFX_DEVICES`, `NEXT_MINOR` | gfx/ | spin | framebuffer device state and registry |

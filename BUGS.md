@@ -450,14 +450,14 @@ unreachable today.
   cache (not yet COW'd) by inode and offset, so a MAP_SHARED mapping
   of the same file wakes it.
 
-## O_ASYNC: no SIGIO
+## O_ASYNC: no SIGIO from sockets, ttys, inotify, fanotify
 
-**Location:** `fs/fd.rs` (F_SETFL), `fs/misc.rs` (FIOASYNC)
+**Location:** `net/`, `tty/`, `io/inotify.rs`, `io/fanotify.rs`
 
-No file raises SIGIO: there is no fasync list (Linux fasync_helper,
-kill_fasync). F_SETFL drops O_ASYNC and FIOASYNC's set is a no-op
-(O_ASYNC is not a settable flag); F_SETOWN and F_SETSIG are stored
-but unused.
+Only pipes and FIFOs have `->fasync` (`io/fasync.rs`): sockets
+(Linux sock_fasync, sock_wake_async), ttys (tty_fasync) and
+inotify/fanotify (fsnotify_fasync) keep O_ASYNC clear and raise no
+SIGIO.
 
 ## Mount flag gaps
 

@@ -37,6 +37,11 @@
 //! it (poll runs under epoll's spin lock): like Linux pipe_readable /
 //! pipe_writable they read the ring indices `Pipe.head`/`Pipe.tail`,
 //! which the guard publishes as it unlocks. Wakeups follow the unlock.
+//! O_ASYNC files are on `fasync_readers`/`fasync_writers` (by access
+//! mode; changed under `Pipe.inner`, Linux pipe_fasync); their SIGIO is
+//! sent after the unlock too, never under `Pipe.inner` or `Inode.i_pipe`
+//! (Linux sends under pipe->mutex; hk's senders hold no spin lock and
+//! nothing but the frame allocator and user faults nests in the mutex).
 //! splice/tee lock two pipes in address order (Linux pipe_double_lock).
 //!
 //! ## Reference
@@ -54,6 +59,7 @@ use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use crate::fs::KernelError;
 use crate::fs::file::{File, FileOps, RwFlags, flags};
 use crate::fs::iov_iter::{IovDest, IovSource};
+use crate::io::fasync::{FasyncList, POLL_IN, POLL_OUT, fasync_helper, kill_fasync};
 use crate::io::poll::{POLLERR, POLLHUP, POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM, PollTable};
 use crate::mm::filemap::PAGE_SIZE;
 use crate::sync::waitqueue::WaitQueue;
@@ -440,6 +446,10 @@ pub struct Pipe {
     w_counter: AtomicU32,
     /// Number of write end references
     writers: AtomicU32,
+    /// O_ASYNC files open for reading / writing (Linux
+    /// fasync_readers / fasync_writers)
+    fasync_readers: FasyncList,
+    fasync_writers: FasyncList,
 }
 
 impl Pipe {
@@ -522,17 +532,68 @@ impl Pipe {
         }
     }
 
-    /// Data for readers (Linux wakeup_pipe_readers: rd_wait with
-    /// EPOLLIN | EPOLLRDNORM)
-    pub fn wake_readers(&self) {
+    /// Wake readers' waits and polls (rd_wait with EPOLLIN | EPOLLRDNORM)
+    fn wake_rd(&self) {
         self.wait_queue.wake_poll(u32::from(POLLIN | POLLRDNORM));
     }
 
-    /// Room for writers (Linux wakeup_pipe_writers: wr_wait with
-    /// EPOLLOUT | EPOLLWRNORM)
-    pub fn wake_writers(&self) {
+    /// Wake writers' waits and polls (wr_wait with EPOLLOUT | EPOLLWRNORM)
+    fn wake_wr(&self) {
         self.wait_queue.wake_poll(u32::from(POLLOUT | POLLWRNORM));
     }
+
+    /// SIGIO to the O_ASYNC readers (Linux kill_fasync(fasync_readers,
+    /// SIGIO, POLL_IN)); `Pipe.inner` not held
+    fn kill_readers(&self) {
+        kill_fasync(&self.fasync_readers, crate::signal::SIGIO, POLL_IN);
+    }
+
+    /// SIGIO to the O_ASYNC writers (POLL_OUT)
+    fn kill_writers(&self) {
+        kill_fasync(&self.fasync_writers, crate::signal::SIGIO, POLL_OUT);
+    }
+
+    /// Data for readers (Linux splice's wakeup_pipe_readers)
+    pub fn wake_readers(&self) {
+        self.wake_rd();
+        self.kill_readers();
+    }
+
+    /// Room for writers (Linux splice's wakeup_pipe_writers)
+    pub fn wake_writers(&self) {
+        self.wake_wr();
+        self.kill_writers();
+    }
+
+    /// A file of the pipe was released: if that was the last reader or
+    /// writer but not both, the O_ASYNC files of both sides learn it
+    /// (Linux pipe_release); `Pipe.inner` and `Inode.i_pipe` not held
+    fn release_notify(&self) {
+        if self.has_readers() != self.has_writers() {
+            self.kill_readers();
+            self.kill_writers();
+        }
+    }
+}
+
+/// Linux pipe_fasync: a reader on the readers' list, a writer on the
+/// writers', O_RDWR on both (a failed second add undoes the first);
+/// under `Pipe.inner` like Linux pipe->mutex
+fn pipe_fasync(pipe: &Pipe, file: &File, fd: i32, on: bool) -> Result<(), KernelError> {
+    let _g = pipe.lock();
+    let rd = file.is_readable();
+    if rd {
+        fasync_helper(&pipe.fasync_readers, file, fd, on)?;
+    }
+    if file.is_writable()
+        && let Err(e) = fasync_helper(&pipe.fasync_writers, file, fd, on)
+    {
+        if rd {
+            let _ = fasync_helper(&pipe.fasync_readers, file, -1, false);
+        }
+        return Err(e);
+    }
+    Ok(())
 }
 
 impl Default for Pipe {
@@ -546,6 +607,8 @@ impl Default for Pipe {
             writers: AtomicU32::new(1),
             r_counter: AtomicU32::new(0),
             w_counter: AtomicU32::new(0),
+            fasync_readers: FasyncList::new(),
+            fasync_writers: FasyncList::new(),
         }
     }
 }
@@ -580,18 +643,27 @@ impl Drop for PipeGuard<'_> {
 
 /// Linux pipe_read: wait for data unless `nonblock`; a read takes what
 /// is there (at most `to`'s room) and returns, 0 at EOF (no writers).
-/// The copy runs under the sleeping `Pipe.inner` (it may fault).
+/// The copy runs under the sleeping `Pipe.inner` (it may fault). Every
+/// read that gets that far, whatever its result, then signals the
+/// O_ASYNC writers (Linux pipe_read's kill_fasync).
 fn pipe_read(pipe: &Pipe, to: &mut IovDest<'_>, nonblock: bool) -> Result<usize, KernelError> {
     if to.is_empty() {
         return Ok(0);
     }
+    let r = pipe_read_wait(pipe, to, nonblock);
+    pipe.kill_writers();
+    r
+}
+
+/// pipe_read's wait and copy
+fn pipe_read_wait(pipe: &Pipe, to: &mut IovDest<'_>, nonblock: bool) -> Result<usize, KernelError> {
     loop {
         let mut inner = pipe.lock();
         if !inner.is_empty() {
             let r = inner.read_to(to);
             drop(inner);
             // Room for writers (Linux pipe_read)
-            pipe.wake_writers();
+            pipe.wake_wr();
             return r;
         }
         drop(inner);
@@ -618,10 +690,23 @@ fn sigpipe() {
 /// returning the bytes written so far if any. Writes of at most PIPE_BUF
 /// bytes are never split (any free slot takes them whole). No reader:
 /// SIGPIPE and EPIPE. The copy runs under the sleeping `Pipe.inner`.
+/// The O_ASYNC readers are signalled before each sleep and at the end,
+/// whatever the result (Linux pipe_write's kill_fasync).
 fn pipe_write(pipe: &Pipe, from: &mut IovSource<'_>, nonblock: bool) -> Result<usize, KernelError> {
     if from.is_empty() {
         return Ok(0);
     }
+    let r = pipe_write_wait(pipe, from, nonblock);
+    pipe.kill_readers();
+    r
+}
+
+/// pipe_write's copy and waits for room
+fn pipe_write_wait(
+    pipe: &Pipe,
+    from: &mut IovSource<'_>,
+    nonblock: bool,
+) -> Result<usize, KernelError> {
     let partial = |done: usize, e| if done > 0 { Ok(done) } else { Err(e) };
     let mut done = 0;
     loop {
@@ -636,7 +721,7 @@ fn pipe_write(pipe: &Pipe, from: &mut IovSource<'_>, nonblock: bool) -> Result<u
             done += n;
             if n > 0 {
                 // Data for readers (Linux pipe_write)
-                pipe.wake_readers();
+                pipe.wake_rd();
             }
             if let Some(e) = err {
                 return partial(done, e);
@@ -651,6 +736,7 @@ fn pipe_write(pipe: &Pipe, from: &mut IovSource<'_>, nonblock: bool) -> Result<u
             return partial(done, KernelError::WouldBlock);
         }
         // Block until space or no readers; a signal ends the wait
+        pipe.kill_readers();
         if let Err(e) = pipe.wait_queue.wait_event_interruptible(|| pipe.writable()) {
             return partial(done, e);
         }
@@ -742,7 +828,12 @@ impl FileOps for PipeReadFileOps {
         let pipe = pipe_of(file)?;
         // Decrement reader count when file is closed
         pipe.remove_reader();
+        pipe.release_notify();
         Ok(())
+    }
+
+    fn fasync(&self, file: &File, fd: i32, on: bool) -> Option<Result<(), KernelError>> {
+        Some(pipe_of(file).and_then(|p| pipe_fasync(p, file, fd, on)))
     }
 }
 
@@ -832,7 +923,12 @@ impl FileOps for PipeWriteFileOps {
         let pipe = pipe_of(file)?;
         // Decrement writer count when file is closed
         pipe.remove_writer();
+        pipe.release_notify();
         Ok(())
+    }
+
+    fn fasync(&self, file: &File, fd: i32, on: bool) -> Option<Result<(), KernelError>> {
+        Some(pipe_of(file).and_then(|p| pipe_fasync(p, file, fd, on)))
     }
 }
 
@@ -1068,7 +1164,12 @@ impl FileOps for FifoFileOps {
         let inode = file.get_inode().ok_or(KernelError::BadFd)?;
         let f = fifo_of(file)?;
         fifo_put(&inode, &f.pipe, file.get_flags() & flags::O_ACCMODE);
+        f.pipe.release_notify();
         Ok(())
+    }
+
+    fn fasync(&self, file: &File, fd: i32, on: bool) -> Option<Result<(), KernelError>> {
+        Some(pipe_of(file).and_then(|p| pipe_fasync(p, file, fd, on)))
     }
 }
 

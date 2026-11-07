@@ -60,7 +60,7 @@
 - [x] dup
 - [x] dup2 (x86-64 only, legacy; use dup3)
 - [x] dup3
-- [x] fcntl (F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_SETFD, F_GETFL, F_SETFL, F_GETLK, F_SETLK, F_SETLKW, F_GETOWN, F_SETOWN, F_GETSIG, F_SETSIG)
+- [x] fcntl (F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_SETFD, F_GETFL, F_SETFL, F_GETLK, F_SETLK, F_SETLKW, F_GETOWN, F_SETOWN, F_GETOWN_EX, F_SETOWN_EX, F_GETSIG, F_SETSIG; O_ASYNC raises SIGIO, or the F_SETSIG signal with POLL_* info, on pipes and FIFOs)
 
 2.2 Read/write + position
 

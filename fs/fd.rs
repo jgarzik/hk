@@ -406,6 +406,8 @@ mod fcntl_cmd {
     pub const F_GETOWN: i32 = 9;
     pub const F_SETSIG: i32 = 10;
     pub const F_GETSIG: i32 = 11;
+    pub const F_SETOWN_EX: i32 = 15;
+    pub const F_GETOWN_EX: i32 = 16;
     pub const F_DUPFD_CLOEXEC: i32 = 1030;
 }
 
@@ -517,24 +519,15 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> i64 {
         }
 
         F_SETFL => {
-            // Set file status flags (O_APPEND, O_NONBLOCK, O_NOATIME)
-            let file = match table.get(fd) {
-                Some(f) => f,
-                None => return KernelError::BadFd.sysret(),
+            let Some(file) = table.get(fd) else {
+                return KernelError::BadFd.sysret();
             };
-            // Linux setfl: setting O_NOATIME needs the owner or
-            // CAP_FOWNER
-            let noatime = super::dac::O_NOATIME;
-            if arg as u32 & noatime != 0
-                && file.get_flags() & noatime == 0
-                && !file
-                    .get_inode()
-                    .is_some_and(|i| super::dac::owner_or_capable(&super::dac::cred(), &i))
-            {
-                return KernelError::NotPermitted.sysret();
+            // ->fasync takes sleeping locks
+            drop(table);
+            match setfl(fd, &file, arg as u32) {
+                Ok(()) => 0,
+                Err(e) => e.sysret(),
             }
-            file.set_status_flags(arg as u32);
-            0
         }
 
         F_GETLK => {
@@ -624,69 +617,57 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> i64 {
             }
         }
 
-        F_SETOWN => {
-            let file = match table.get(fd) {
-                Some(f) => f,
-                None => return KernelError::BadFd.sysret(),
+        F_SETOWN | F_GETOWN | F_SETOWN_EX | F_GETOWN_EX | F_SETSIG | F_GETSIG => {
+            let Some(file) = table.get(fd) else {
+                return KernelError::BadFd.sysret();
             };
-            match f_setown(&file, arg as i32) {
-                Ok(()) => 0,
-                Err(e) => e.sysret(),
-            }
-        }
-
-        F_GETOWN => {
-            // Get owner PID/PGID for async I/O signals
-            let file = match table.get(fd) {
-                Some(f) => f,
-                None => return KernelError::BadFd.sysret(),
-            };
-            i64::from(file.get_owner())
-        }
-
-        F_SETSIG => {
-            // Set signal for async I/O
-            let file = match table.get(fd) {
-                Some(f) => f,
-                None => return KernelError::BadFd.sysret(),
-            };
-            let sig = arg as i32;
-            // Validate signal number (0 is valid - means use SIGIO)
-            if !(0..=64).contains(&sig) {
-                return KernelError::InvalidArgument.sysret();
-            }
-            file.set_sig(sig);
-            0
-        }
-
-        F_GETSIG => {
-            // Get signal for async I/O
-            let file = match table.get(fd) {
-                Some(f) => f,
-                None => return KernelError::BadFd.sysret(),
-            };
-            i64::from(file.get_sig())
+            // They allocate and copy to and from the user
+            drop(table);
+            fcntl_owner(&file, cmd, arg)
         }
 
         _ => KernelError::InvalidArgument.sysret(),
     }
 }
 
-/// Set the SIGIO owner of `file` (Linux f_setown): `who` > 0 is a
-/// process, < 0 a process group, 0 clears; ESRCH if none exists,
-/// EINVAL for INT_MIN
-pub fn f_setown(file: &File, who: i32) -> Result<(), KernelError> {
-    if who == i32::MIN {
-        return Err(KernelError::InvalidArgument);
+/// Linux setfl: O_NOATIME needs the owner or CAP_FOWNER; a change of
+/// O_ASYNC goes through ->fasync, which sets the bit (a file without one
+/// keeps it clear), before the other flags change
+fn setfl(fd: i32, file: &File, arg: u32) -> Result<(), KernelError> {
+    use crate::fs::flags::O_ASYNC;
+    let noatime = super::dac::O_NOATIME;
+    if arg & noatime != 0
+        && file.get_flags() & noatime == 0
+        && !file
+            .get_inode()
+            .is_some_and(|i| super::dac::owner_or_capable(&super::dac::cred(), &i))
+    {
+        return Err(KernelError::NotPermitted);
     }
-    let exists = match who {
-        0 => true,
-        w if w > 0 => crate::task::percpu::lookup_task_pgid(w as u64).is_some(),
-        w => crate::task::percpu::pgrp_exists(u64::from(w.unsigned_abs())),
-    };
-    if !exists {
-        return Err(KernelError::NoProcess);
+    if (arg ^ file.get_flags()) & O_ASYNC != 0
+        && let Some(r) = file.fasync(fd, arg & O_ASYNC != 0)
+    {
+        r?;
     }
-    file.set_owner(who);
+    file.set_status_flags(arg);
     Ok(())
+}
+
+/// The SIGIO owner commands (Linux do_fcntl); F_GETOWN of a process
+/// group is negative, returned as a value, not an error
+fn fcntl_owner(file: &File, cmd: i32, arg: u64) -> i64 {
+    use crate::io::fasync;
+    use fcntl_cmd::*;
+    let r = match cmd {
+        F_SETOWN => fasync::f_setown(file, arg as i32, true),
+        F_GETOWN => return i64::from(fasync::f_getown(file)),
+        F_SETOWN_EX => fasync::f_setown_ex(file, arg),
+        F_GETOWN_EX => fasync::f_getown_ex(file, arg),
+        F_SETSIG => fasync::f_setsig(file, arg),
+        _ => return i64::from(fasync::f_getsig(file)),
+    };
+    match r {
+        Ok(()) => 0,
+        Err(e) => e.sysret(),
+    }
 }
