@@ -51,3 +51,9 @@ handler state (`irq::IrqHandler`), RfL's cast and pointer lints and `#[expect]`,
 intrusive list with adapters and `ArcList`, `XArray` (`mm/xarray.rs`), `Once`, const
 asserts, `unsafe_op_in_unsafe_fn` and the safety-doc clippy lints, per-arch callback
 traits, in-kernel selftests plus host tests (no in-kernel doctests).
+
+Page tables (`mm/pgtable.rs`, RfL `MmapReadGuard::vma_lookup`): a `PgTables<'a>`
+borrows the mmap_lock guard (or a held rmap chain), and its typestate handles
+(`Pte`, `Pmd`, `Dir`, `#[must_use]` `PteTable` holding the PTE lock) cannot outlive
+it; tables leave the tree only through `PgPrune`, made from `&mut MmStruct`; the
+arch walkers are `unsafe fn`s reached only from there. vmalloc pages: `VmArea`.

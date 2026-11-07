@@ -17,7 +17,6 @@
 //! the vmalloc PDPT is preallocated, so ioremap's PD/PT changes are seen by
 //! every address space (Linux: preallocate_vmalloc_pages). Boot-time
 //! tables come from a static pool (the frame allocator does not exist yet).
-#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -95,6 +94,9 @@ fn pool_page() -> (*mut RawPageTable, u64) {
 /// `table` is a boot page table (swapper or pool page), during
 /// single-CPU early boot.
 unsafe fn next(table: *mut RawPageTable, idx: usize) -> *mut RawPageTable {
+    // SAFETY: `table` is a boot table no other CPU or reference reaches
+    // (the caller's guarantee); a missing entry gets a zeroed pool
+    // page, itself a boot table, reached through the direct map
     unsafe {
         let e = (*table).entry_mut(idx);
         if !e.is_present() {
@@ -195,6 +197,8 @@ unsafe fn map_direct(pml4: *mut RawPageTable, ram: &dyn RamMap) {
     let mut end = 0;
     direct_pages(ram, gbpages(), cap, |p, huge_gb| {
         let va = PAGE_OFFSET + p;
+        // SAFETY: `pml4` and the tables `next` returns are boot tables
+        // (this fn's contract, `next`'s), single CPU
         unsafe {
             let pdpt = next(pml4, idx(va, 39));
             if huge_gb {
@@ -231,6 +235,7 @@ unsafe fn map_image(pml4: *mut RawPageTable) {
             debug_assert!(va < erodata || va >= sdata);
             PAGE_PRESENT | PAGE_NO_EXECUTE
         };
+        // SAFETY: as in `map_direct`
         unsafe {
             let pdpt = next(pml4, idx(va, 39));
             let pd = next(pdpt, idx(va, 30));
@@ -247,6 +252,10 @@ unsafe fn map_image(pml4: *mut RawPageTable) {
 /// # Safety
 /// Once, on the BSP, before anything uses the direct map past 4GB.
 pub unsafe fn init() {
+    // SAFETY: once on the BSP (this fn's contract): the swapper is a
+    // boot table nothing else reaches yet. The CR3 write switches to
+    // it: it maps the running image and the direct map the boot code
+    // uses (nostack: no stack use; memory ordering kept, no nomem)
     unsafe {
         let pml4 = SWAPPER.get();
         map_direct(pml4, &BootRam);
@@ -266,6 +275,8 @@ pub unsafe fn init() {
 /// # Safety
 /// Boot CPU, before SMP; `va` is unmapped and not in use.
 pub unsafe fn map_page(va: u64, pa: u64, table: &mut dyn FnMut() -> u64) {
+    // SAFETY: `walk`'s contract is this fn's; `va`'s entry, unmapped
+    // and unused, in a live swapper table
     unsafe {
         let t = walk(va, &[39, 30, 21], table);
         let flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_NO_EXECUTE;
@@ -279,6 +290,7 @@ pub unsafe fn map_page(va: u64, pa: u64, table: &mut dyn FnMut() -> u64) {
 /// # Safety
 /// As for `map_page`.
 pub unsafe fn map_pmd(va: u64, pa: u64, table: &mut dyn FnMut() -> u64) {
+    // SAFETY: as in `map_page`
     unsafe {
         let t = walk(va, &[39, 30], table);
         let flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_NO_EXECUTE | PAGE_HUGE;
@@ -292,6 +304,9 @@ pub unsafe fn map_pmd(va: u64, pa: u64, table: &mut dyn FnMut() -> u64) {
 /// # Safety
 /// As for `map_page`.
 unsafe fn walk(va: u64, shifts: &[u32], table: &mut dyn FnMut() -> u64) -> *mut RawPageTable {
+    // SAFETY: the swapper and the kernel tables under it are live and,
+    // before SMP (the caller's guarantee), changed by this CPU only;
+    // `table` gives zeroed frames, reached through the direct map
     unsafe {
         let mut t = SWAPPER.get();
         assert!(
@@ -314,6 +329,9 @@ unsafe fn walk(va: u64, shifts: &[u32], table: &mut dyn FnMut() -> u64) -> *mut 
 /// its low physical address, then jumps to the high-half entry)
 pub fn trampoline_pgd() -> u64 {
     let phys = &raw const boot_pml4 as u64;
+    // SAFETY: the boot PML4 (a linker symbol, reached through the
+    // direct map) is used only by AP startup, which this precedes; the
+    // swapper's kernel half is read only
     unsafe {
         let boot = phys_to_virt_table(phys);
         let swapper = SWAPPER.get().cast_const();

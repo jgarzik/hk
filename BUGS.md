@@ -31,31 +31,24 @@ These are safe fns or patterns whose use leads to undefined behaviour.
 None is known to fail today, but each is a soundness bug:
 
 - **Safe fns that take addresses:**
-  - Page tables: `mm::pgtable` (`PgTables`, `Pte`, `Pmd`, `PteTable`)
-    ties the entries of the fault path, the reverse map, mkclean,
-    remote access, THP, mremap and the range walker to the lock that
-    keeps their tables; the arch walkers are `unsafe fn`s reached only
-    from there. Still raw, safe fns that dereference a caller's root:
-    `ArchPageTable::new(root)` (its `translate` and `map_with_alloc`
-    walk that root; callers in task/ exec and fork).
-  - Kernel mappings: the vmalloc-area walkers are `unsafe fn`s reached
-    through the owner's `vmalloc::VmArea`, but `vmstack::free(base)`
-    (callers in task/) and `iounmap(addr, size)` (acpi, xhci,
-    pci_quirks, selftest) are safe fns that unmap whatever range they
-    are given; they should be `unsafe fn`s or take the owning handle.
+  - `ArchPageTable::new(root)` is safe, and its `translate` and
+    `map_with_alloc` walk that root (callers in task/: exec, fork): it
+    should be an `unsafe fn`, or the table built only from an owned
+    root.
+  - `vmstack::free(base)` (callers in task/) and `iounmap(addr, size)`
+    (acpi, xhci, pci_quirks, selftest) unmap whatever range they are
+    given: they should be `unsafe fn`s or take the owning handle
+    (`vmalloc::VmArea`, an ioremap mapping).
 
 ## unsafe not yet wrapped or documented (doc/UNSAFE.md)
 
-There are 63 files with `#![expect(clippy::undocumented_unsafe_blocks)]
+There are 56 files with `#![expect(clippy::undocumented_unsafe_blocks)]
 // TODO(unsafe)` (`git grep -l 'TODO(unsafe)' -- '*.rs' ':!user'`). Most of their
 blocks belong in a missing wrapper:
 
 - **Frames:** an owned / page-locked / PTL-held frame borrow type in
   place of the `frame_bytes` unsafe fn (17 callers: vfat, pipe, splice,
   exec, fault, filemap, swap).
-- **Page tables:** `mm::pgtable` exists; the walker, its users and
-  the arch walkers still to move onto it (the soundness item above),
-  and the boot kmap and ioremap walkers.
 - **DMA:** an owned `DmaBox<T: Pod>` with volatile field access, never
   `&T` into device-written memory: xhci rings and contexts, virtio
   rings and blk, e1000 descriptors, virtio-net buffers.

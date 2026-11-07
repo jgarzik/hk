@@ -1357,7 +1357,8 @@ pub struct Zone {
   borrow of the `MmStruct` (an mm lock guard) or of a held chain
   (`ChainRead::entries`, limited to the VMA's range), and the `Pte`,
   `Pmd`, `Dir` and `PteTable` (PTE lock held) handles it gives, and
-  the range walker that takes it, cannot outlive it.
+  the range walker that takes it, cannot outlive it (the arch walkers
+  are `unsafe fn`s reached only through it).
   Order: mm lock -> page_table_lock -> PTE lock ->
   `FRAME_ALLOCATOR` (the TLB is flushed under them); never in
   interrupt context; no sleeping under them. Both disable preemption

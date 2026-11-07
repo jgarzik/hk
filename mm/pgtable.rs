@@ -40,7 +40,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use super::huge_page::{HUGE_PAGE_MASK, pmd_settled};
 use super::page::{Page, phys_to_page};
 use super::ptl::{PtLock, PteLock, table_lock};
-use super::{Mm, MmStruct};
+use super::{Mm, MmStruct, PAGE_SIZE};
 use crate::arch::{paging, phys_to_virt, virt_to_phys};
 
 /// The page tables of one address space, pinned for `'a`
@@ -676,8 +676,48 @@ pub fn selftest() -> Option<&'static str> {
         let map = mm.mmap_read();
         selftest_in(&mm, PgTables::new(&mm, &map))
     };
+    let r = r.or_else(|| prune_selftest(&mm));
     drop(mm);
     r
+}
+
+/// The PTE table of `addr` in `p`'s tables, taken out if possible
+fn prune_pte_table(p: &mut PgPrune<'_>, addr: u64) -> Option<u64> {
+    let mut top = p.top();
+    let mut l2 = top.child(addr >> 39)?;
+    let mut l1 = l2.child(addr >> 30)?;
+    l1.take_child(addr >> 21)
+}
+
+/// A PTE table of `mm` (VMA-free, never loaded on a CPU) is taken out
+/// by a `PgPrune` only once empty, and is gone from the tree after
+fn prune_selftest(mm: &Mm) -> Option<&'static str> {
+    const A: u64 = 0x8000_0000;
+    const V: u64 = 7 << 12;
+    {
+        let map = mm.mmap_read();
+        let t = PgTables::new(mm, &map);
+        let Some(p) = t.pte_alloc(mm, A) else {
+            return Some("pgtable_prune_alloc");
+        };
+        p.lock().store(A, V);
+    }
+    let mut map = mm.mmap_write();
+    let busy = prune_pte_table(&mut PgPrune::new(mm, &mut map, A, A + PAGE_SIZE), A).is_none();
+    if let Some(p) = PgTables::new(mm, &map).pte(A) {
+        p.lock().store(A, 0);
+    }
+    let taken = prune_pte_table(&mut PgPrune::new(mm, &mut map, A, A + PAGE_SIZE), A);
+    if let Some(pt) = taken {
+        // Never loaded on a CPU: nothing to flush
+        crate::FRAME_ALLOCATOR.free(pt);
+    }
+    let gone = PgTables::new(mm, &map).pte(A).is_none();
+    match (busy, taken.is_some() && gone) {
+        (true, true) => None,
+        (false, _) => Some("pgtable_prune_busy"),
+        (_, false) => Some("pgtable_prune_empty"),
+    }
 }
 
 /// `selftest` on the tables `t` of `mm`
