@@ -2115,6 +2115,11 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         return Err(22); // EINVAL
     }
 
+    // CLONE_DETACHED is refused with CLONE_PIDFD (Linux copy_process)
+    if config.flags & CLONE_PIDFD != 0 && config.flags & CLONE_DETACHED != 0 {
+        return Err(22); // EINVAL
+    }
+
     // Validate: CLONE_SIGHAND and CLONE_CLEAR_SIGHAND are mutually exclusive
     // (can't share handlers AND reset them at the same time)
     if config.flags & CLONE_SIGHAND != 0 && config.flags & CLONE_CLEAR_SIGHAND != 0 {

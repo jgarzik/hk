@@ -55,7 +55,8 @@ pub fn do_exit(wait_status: i32) -> ! {
 /// # Arguments
 /// * `flags` - Clone flags (CLONE_VM, CLONE_THREAD, etc.)
 /// * `child_stack` - Stack pointer for child (required for CLONE_VM)
-/// * `_parent_tidptr` - Where to store parent TID (if CLONE_PARENT_SETTID)
+/// * `parent_tidptr` - Where to store parent TID (if CLONE_PARENT_SETTID),
+///   or the child's pidfd (if CLONE_PIDFD)
 /// * `_child_tidptr` - Where to store child TID (if CLONE_CHILD_SETTID)
 /// * `_tls` - TLS pointer for child (if CLONE_SETTLS)
 ///
@@ -80,13 +81,26 @@ pub fn sys_clone(
     // Extract exit_signal from low 8 bits of flags (CSIGNAL mask = 0xff)
     let exit_signal = (flags & 0xff) as i32;
 
+    // CLONE_PIDFD stores the pidfd at parent_tid (Linux sys_clone: one
+    // pointer for both), so CLONE_PARENT_SETTID with it is EINVAL
+    // (kernel_clone)
+    use super::clone_flags::{CLONE_PARENT_SETTID, CLONE_PIDFD};
+    let pidfd_ptr = if flags & CLONE_PIDFD != 0 {
+        if flags & CLONE_PARENT_SETTID != 0 {
+            return KernelError::InvalidArgument.sysret();
+        }
+        parent_tidptr
+    } else {
+        0
+    };
+
     clone(super::percpu::CloneConfig {
         flags: flags & !0xff, // Remove signal bits from flags
         child_stack,
         parent_tidptr,
         child_tidptr,
         tls,
-        pidfd_ptr: 0, // CLONE_PIDFD only supported via clone3
+        pidfd_ptr,
         exit_signal,
         cgroup_fd: -1, // CLONE_INTO_CGROUP only supported via clone3
     })
@@ -583,6 +597,13 @@ pub fn sys_clone3(uargs: u64, size: u64) -> i64 {
         return KernelError::InvalidArgument.sysret();
     }
     if args.stack == 0 && args.stack_size != 0 {
+        return KernelError::InvalidArgument.sysret();
+    }
+
+    // The pidfd and the parent's tid cannot share one place (Linux
+    // kernel_clone)
+    let both = super::clone_flags::CLONE_PIDFD | super::clone_flags::CLONE_PARENT_SETTID;
+    if args.flags & both == both && args.pidfd == args.parent_tid {
         return KernelError::InvalidArgument.sysret();
     }
 

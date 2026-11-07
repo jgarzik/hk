@@ -35,6 +35,8 @@ pub mod syscall;
 pub mod clone_flags {
     /// Return a pidfd for the child process
     pub const CLONE_PIDFD: u64 = 0x00001000;
+    /// Unused, refused with CLONE_PIDFD (kept for a later use of it)
+    pub const CLONE_DETACHED: u64 = 0x00400000;
     /// Share virtual memory (address space) - creates a thread
     pub const CLONE_VM: u64 = 0x00000100;
     /// Share filesystem info (root, cwd, umask)

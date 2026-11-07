@@ -12,6 +12,8 @@
 //! - Test waitid with P_PIDFD
 //! - WAITID_PIDFD_NONBLOCK: waitid(P_PIDFD) of an O_NONBLOCK pidfd is
 //!   EAGAIN while the child runs (Linux kernel_waitid adds WNOHANG)
+//! - CLONE_PIDFD_LEGACY: clone(2) with CLONE_PIDFD stores the pidfd at
+//!   parent_tid; with CLONE_PARENT_SETTID too it is EINVAL
 //! - Test pidfd_getfd to get own fd via pidfd
 //! - Test pidfd_getfd with invalid flags returns EINVAL
 //! - PIDFD_POLL_GROUP: a process whose leader exits first is not
@@ -26,8 +28,8 @@ use crate::harness::{fail_num, pass, verdict};
 use crate::helpers::{linux_at_least, msleep, print, print_num, println};
 use crate::mm::fork_mm::{join, spawn_thread};
 use hk_syscall::{
-    O_NONBLOCK, P_PIDFD, POLLHUP, POLLIN, PollFd, SIGKILL, SigInfo, WEXITED, sys_close, sys_exit,
-    sys_exit_group, sys_fcntl, sys_fork, sys_getpid, sys_kill, sys_open, sys_pidfd_getfd,
+    O_NONBLOCK, P_PIDFD, POLLHUP, POLLIN, PollFd, SIGKILL, SigInfo, WEXITED, sys_clone, sys_close,
+    sys_exit, sys_exit_group, sys_fcntl, sys_fork, sys_getpid, sys_kill, sys_open, sys_pidfd_getfd,
     sys_pidfd_open, sys_pidfd_send_signal, sys_pipe2, sys_poll, sys_ptrace, sys_read,
     sys_rt_sigaction, sys_wait4, sys_waitid, sys_write,
 };
@@ -43,6 +45,7 @@ pub fn run_tests() {
     test_pidfd_fdinfo();
     test_waitid_p_pidfd();
     test_waitid_pidfd_nonblock();
+    test_clone_pidfd_legacy();
     test_pidfd_getfd_self();
     test_pidfd_getfd_invalid_flags();
     test_pidfd_poll_group();
@@ -576,6 +579,66 @@ fn test_waitid_pidfd_nonblock() {
         fail_num(b"WAITID_PIDFD_NONBLOCK:FAIL dead: waitid ", dead);
     } else {
         pass(NAME);
+    }
+}
+
+/// Legacy clone(2) with CLONE_PIDFD (Linux 5.2) stores a close-on-exec
+/// pidfd of the child at parent_tid, the one place for both, so
+/// CLONE_PARENT_SETTID with it is EINVAL (kernel_clone)
+fn test_clone_pidfd_legacy() {
+    const CLONE_PIDFD: u64 = 0x1000;
+    const CLONE_PARENT_SETTID: u64 = 0x0010_0000;
+    const SIGCHLD: u64 = 17;
+    const F_GETFD: i32 = 1;
+    const FD_CLOEXEC: i64 = 1;
+    let mut both: i32 = -1;
+    let flags = CLONE_PIDFD | CLONE_PARENT_SETTID | SIGCHLD;
+    let r = sys_clone(flags, 0, (&raw mut both) as u64, 0, 0);
+    if r == 0 {
+        sys_exit(0);
+    }
+    if r > 0 {
+        sys_wait4(r, core::ptr::null_mut(), 0, 0);
+    }
+    let mut pidfd: i32 = -1;
+    let pid = sys_clone(CLONE_PIDFD | SIGCHLD, 0, (&raw mut pidfd) as u64, 0, 0);
+    if pid == 0 {
+        sys_exit(7);
+    }
+    if pid < 0 {
+        fail_num(b"CLONE_PIDFD_LEGACY:FAIL clone ", pid);
+        return;
+    }
+    let fdflags = if pidfd >= 0 {
+        sys_fcntl(pidfd, F_GETFD, 0)
+    } else {
+        -1
+    };
+    let mut info = siginfo();
+    let w = if pidfd >= 0 {
+        sys_waitid(P_PIDFD, pidfd as u64, &mut info, WEXITED, 0)
+    } else {
+        sys_wait4(pid, core::ptr::null_mut(), 0, 0)
+    };
+    if pidfd >= 0 {
+        sys_close(pidfd as u64);
+    }
+    if r != -22 || both != -1 {
+        fail_num(
+            b"CLONE_PIDFD_LEGACY:FAIL with CLONE_PARENT_SETTID: clone ",
+            r,
+        );
+    } else if pidfd < 0 {
+        fail_num(
+            b"CLONE_PIDFD_LEGACY:FAIL no pidfd at parent_tid: ",
+            i64::from(pidfd),
+        );
+    } else if fdflags != FD_CLOEXEC {
+        fail_num(b"CLONE_PIDFD_LEGACY:FAIL F_GETFD ", fdflags);
+    } else if w != 0 || info.si_pid != pid as i32 || info.si_status != 7 {
+        fail_num(b"CLONE_PIDFD_LEGACY:FAIL waitid(P_PIDFD) ", w);
+    } else {
+        pass(b"CLONE_PIDFD_LEGACY");
     }
 }
 
