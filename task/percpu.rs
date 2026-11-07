@@ -730,11 +730,22 @@ impl GlobalTaskTable {
     /// Task `tid`, found through the pid hash (root namespace)
     fn lookup(&self, tid: Tid) -> Option<&Task> {
         let pid = crate::task::pid::find_pid(&crate::ns::INIT_PID_NS, u32::try_from(tid).ok()?)?;
+        self.pid_task(&pid)
+    }
+
+    /// The task `pid` names (Linux pid_task)
+    fn pid_task(&self, pid: &crate::task::pid::Pid) -> Option<&Task> {
         let t = pid.task().cast::<Task>();
         // SAFETY: a nonzero `task` is in this list (set by `insert`,
         // cleared by `remove` under the write lock), which holds a
         // reference; the caller borrows the locked list
         unsafe { t.as_ref() }
+    }
+
+    /// The tid of the task `pid` names: that struct pid's, not its
+    /// number's, which a reaped process frees for reuse
+    pub fn pid_tid(&self, pid: &crate::task::pid::Pid) -> Option<Tid> {
+        self.pid_task(pid).map(Task::tid)
     }
 
     /// Task `tid`

@@ -488,6 +488,10 @@ de_thread
   leader, or a live thread once it has exited), not the shared queue
   with Linux's thread choice at delivery; a pidfd polls readable when
   the leader exits, not when the whole group is gone.
+- pidfd_send_signal checks the pidfd's process under TASKLIST, then
+  signals it by number (`user_group_send`): reaped and its number
+  reused in between, another process gets the signal. Linux signals the
+  struct pid (kill_pid_info); pidfd_getfd already resolves it so.
 
 ## ptrace stop gaps
 

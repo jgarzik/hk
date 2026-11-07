@@ -148,8 +148,8 @@ pub fn get_pidfd_pid(file: &File) -> Option<Pid> {
 }
 
 /// The pid of a pidfd's process while it is still in the task list
-/// (not yet reaped): EBADF for another file, ESRCH once it is gone, so
-/// a number reused later never reaches another process
+/// (not yet reaped): EBADF for another file, ESRCH once it is gone. The
+/// number is checked under TASKLIST only: a later use races its reuse
 pub fn pidfd_live_pid(file: &File) -> Result<Pid, KernelError> {
     let pidfd = get_pidfd(file).ok_or(KernelError::BadFd)?;
     let _list = crate::task::percpu::TASKLIST.read();
@@ -157,6 +157,17 @@ pub fn pidfd_live_pid(file: &File) -> Result<Pid, KernelError> {
         return Err(KernelError::NoProcess);
     }
     Ok(pidfd.pid())
+}
+
+/// The tid of a pidfd's process (Linux pidfd_get_task): from its struct
+/// pid under TASKLIST, never by number, so a reused number never
+/// reaches another process; EBADF for another file, ESRCH once gone
+pub fn pidfd_tid(file: &File) -> Result<crate::task::Tid, KernelError> {
+    let pidfd = get_pidfd(file).ok_or(KernelError::BadFd)?;
+    crate::task::percpu::TASKLIST
+        .read()
+        .pid_tid(&pidfd.pid)
+        .ok_or(KernelError::NoProcess)
 }
 
 /// Check if a file is a pidfd

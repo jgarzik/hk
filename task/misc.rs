@@ -1376,16 +1376,10 @@ pub fn sys_pidfd_getfd(pidfd: i32, targetfd: i32, flags: u32) -> i64 {
         }
     };
 
-    // A pidfd whose process is still there
-    let target_pid = match crate::task::pidfd::pidfd_live_pid(&pidfd_file) {
-        Ok(pid) => pid,
+    // The pidfd's process itself, while it is still there
+    let target_tid = match crate::task::pidfd::pidfd_tid(&pidfd_file) {
+        Ok(tid) => tid,
         Err(e) => return e.sysret(),
-    };
-
-    // Find the target task by PID and check permissions
-    let target_tid = match find_task_by_pid(target_pid) {
-        Some(tid) => tid,
-        None => return KernelError::NoProcess.sysret(),
     };
 
     // Linux __pidfd_fget: under the target's exec_update_lock,
@@ -1400,6 +1394,12 @@ pub fn sys_pidfd_getfd(pidfd: i32, targetfd: i32, flags: u32) -> i64 {
         Some(t) => t,
         None => return KernelError::NoProcess.sysret(), // Process exiting
     };
+    // Its process still being that task, every lookup by tid above
+    // found it (the tid is not freed while it is listed); else its
+    // files are gone (Linux fget_task: EBADF)
+    if crate::task::pidfd::pidfd_tid(&pidfd_file) != Ok(target_tid) {
+        return KernelError::BadFd.sysret();
+    }
 
     // Get the file from target's fd table
     let target_file = {
@@ -1421,12 +1421,6 @@ pub fn sys_pidfd_getfd(pidfd: i32, targetfd: i32, flags: u32) -> i64 {
     };
 
     i64::from(new_fd)
-}
-
-/// Find a task by PID (returns TID of the main thread)
-fn find_task_by_pid(pid: super::Pid) -> Option<super::Tid> {
-    let table = super::percpu::TASKLIST.read();
-    table.get(pid).map(|t| t.task.tid())
 }
 
 // =============================================================================
