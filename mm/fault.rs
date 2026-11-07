@@ -209,9 +209,11 @@ fn fault(mm: &Mm, addr: u64, access: Access) -> Result<(), VmFault> {
         // allows this access): restore it, read-only, and retry (a
         // write then goes through do_wp_page; write implies read)
         let prot = (area.prot & !PROT_WRITE) | PROT_READ;
-        if ptep.lock().set(addr, pte, paging::pte_modify(pte, prot)) {
+        let l = ptep.lock();
+        if l.set(addr, pte, paging::pte_modify(pte, prot)) {
             flush_tlb_page(mm, addr);
         }
+        drop(l);
         return Ok(());
     }
     if paging::pte_present(pte) {
@@ -453,7 +455,12 @@ fn do_fault(
     } else {
         area.prot
     };
-    if !ptep.lock().set(addr, old, paging::mk_pte(page, prot)) {
+    // Held across the rmap add and the flush (Linux do_anonymous_page
+    // / finish_fault under the PTL): a reverse-map walk never sees the
+    // entry without its page's rmap
+    let l = ptep.lock();
+    if !l.set(addr, old, paging::mk_pte(page, prot)) {
+        drop(l);
         // A racing fault mapped the page first
         super::memory::put_page(page);
         return Ok(());
@@ -462,6 +469,7 @@ fn do_fault(
         add_anon(page, area, addr);
     }
     flush_tlb_page(mm, addr);
+    drop(l);
     increment_min_flt();
     Ok(())
 }

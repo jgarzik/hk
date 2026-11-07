@@ -188,7 +188,10 @@ impl<'a> Pte<'a> {
         virt_to_phys(core::ptr::from_ref(self.slot).addr() as u64 & !0xfff)
     }
 
-    /// Its PTE table, locked (Linux pte_offset_map_lock)
+    /// Its PTE table, locked (Linux pte_offset_map_lock). Bind the
+    /// result for a critical section of more than one step: a
+    /// temporary (`p.lock().set(..)`) unlocks at the end of its
+    /// statement, before what follows.
     #[track_caller]
     #[inline]
     pub fn lock(&self) -> PteTable<'a> {
