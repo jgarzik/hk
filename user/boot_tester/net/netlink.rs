@@ -65,6 +65,7 @@ pub fn run_tests() {
     test_overflow();
     test_dump_resume();
     test_overrun();
+    test_mtu_negative();
     test_deputy();
     test_dead_receiver();
     test_passcred();
@@ -1086,6 +1087,33 @@ fn test_overrun() {
         return fail_why(N, b"NO_ENOBUFS msgs", m2 as i64);
     }
     pass(N);
+}
+
+/// IFLA_MTU is a u32 the kernel takes as an int: above INT_MAX it is a
+/// negative MTU, EINVAL even on lo, which has no maximum (Linux
+/// dev_validate_mtu); the MTU stays as it was
+fn test_mtu_negative() {
+    const N: &[u8] = b"RTNL_MTU_NEGATIVE";
+    const RTM_SETLINK: u16 = 19;
+    let Some(mut nl) = Nl::open() else {
+        return fail_why(N, b"open", 0);
+    };
+    let Some(before) = get_link(&mut nl, 1) else {
+        return fail_why(N, b"getlink", 0);
+    };
+    for mtu in [0x8000_0000u32, u32::MAX] {
+        let mut r = Req::new(RTM_SETLINK, 0, &ifinfo(1, 0, 0));
+        r.u32(IFLA_MTU, mtu);
+        let e = nl.ack(&mut r);
+        if e != EINVAL {
+            lo_mtu(&mut nl, before.mtu);
+            return fail_why(N, b"mtu > INT_MAX", e as i64);
+        }
+    }
+    match get_link(&mut nl, 1) {
+        Some(l) if l.mtu == before.mtu => pass(N),
+        l => fail_why(N, b"mtu changed", l.map_or(-1, |l| l.mtu as i64)),
+    }
 }
 
 /// NEWADDR of TEST_IP on lo through `fd`, sent with write() (no

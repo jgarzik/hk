@@ -471,7 +471,9 @@ fn setlink(sk: &NlSock, h: &Hdr, p: &[u8], nl: NlInfo) -> Result<Done, KernelErr
         return Err(KernelError::OperationNotSupported);
     }
     if let Some(mtu) = a.u32(IFLA_MTU)? {
-        rtnl::dev_set_mtu(&r, net, &dev, mtu, nl)?;
+        // Linux do_setlink hands the u32 to an int parameter: above
+        // INT_MAX it is negative and dev_set_mtu refuses it
+        rtnl::dev_set_mtu(&r, net, &dev, mtu.cast_signed(), nl)?;
     }
     if ifm.flags != 0 || ifm.change != 0 {
         let mut f = ifm.flags;

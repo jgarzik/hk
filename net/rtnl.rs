@@ -102,15 +102,18 @@ pub fn unregister_netdevice(rtnl: &RtnlGuard, dev: &Arc<NetDevice>) {
     crate::net::sysfs::netdev_unregister_kobject(dev);
 }
 
-/// Change a device's MTU (Linux dev_set_mtu): EINVAL outside the
-/// device's range
+/// Change a device's MTU (Linux dev_set_mtu): EINVAL if negative or
+/// outside the device's range. The MTU is an int as in Linux
+/// (dev_validate_mtu): both ioctl's ifr_mtu and IFLA_MTU's u32 arrive
+/// here as one, so a value above INT_MAX is negative.
 pub fn dev_set_mtu(
     _rtnl: &RtnlGuard,
     net: &NetNamespace,
     dev: &NetDevice,
-    mtu: u32,
+    mtu: i32,
     nl: NlInfo,
 ) -> Result<(), KernelError> {
+    let mtu = u32::try_from(mtu).map_err(|_| KernelError::InvalidArgument)?;
     let (min, max) = dev.mtu_range();
     if mtu < min || (max != 0 && mtu > max) {
         return Err(KernelError::InvalidArgument);
