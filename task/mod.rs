@@ -1708,11 +1708,10 @@ impl Task {
     }
 
     /// The pid namespace the numbers it passes and gets through
-    /// syscalls are in: the root one until every boundary translates
-    /// (BUGS.md, review gap 7), so no syscall ever mixes the two
+    /// syscalls are in ([`pid::view`])
     #[inline]
     pub fn view_pid_ns(&self) -> &crate::ns::PidNamespace {
-        &crate::ns::INIT_PID_NS
+        pid::view(self.pid_ns())
     }
 
     /// Take over thread ID `tid` (exec's exchange_tids, TASKLIST and

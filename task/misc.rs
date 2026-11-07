@@ -1361,7 +1361,7 @@ fn pidfd_info(
         if scope != Scope::Thread {
             return Ok(SendInfo::User);
         }
-        let me = super::percpu::current_pid() as i32;
+        let me = super::pid::vnr(super::percpu::current_pid()) as i32;
         let uid = crate::task::current_cred().uid;
         return Ok(SendInfo::Info(SigInfo::kill(
             sig,

@@ -361,7 +361,7 @@ fn user_thread_send(tgid: Option<u64>, tid: u64, sig: u32, info: SendInfo) -> i3
 /// What tkill and tgkill send: SI_TKILL from the caller's process and
 /// real uid (Linux prepare_kill_siginfo, PIDTYPE_PID)
 fn tkill_info(sig: u32) -> SendInfo {
-    let pid = crate::task::percpu::current_pid() as i32;
+    let pid = crate::task::pid::vnr(crate::task::percpu::current_pid()) as i32;
     let uid = crate::task::current_cred().uid;
     SendInfo::Info(SigInfo::kill(sig, si_code::SI_TKILL, pid, uid))
 }

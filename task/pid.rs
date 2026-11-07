@@ -380,6 +380,13 @@ pub fn find_pgrp(ns: &PidNamespace, nr: u64) -> Option<Arc<Pid>> {
     find_pid(ns, u32::try_from(nr).ok()?)
 }
 
+/// The namespace numbers seen through syscalls are in for a task of
+/// `ns`: the root one until every boundary translates (BUGS.md, review
+/// gap 7), so no syscall mixes the two
+pub fn view(_ns: &PidNamespace) -> &'static PidNamespace {
+    &crate::ns::INIT_PID_NS
+}
+
 /// The caller's pid namespace (Linux task_active_pid_ns(current)):
 /// lock-free, it cannot change while the task runs
 pub fn current_pid_ns() -> &'static PidNamespace {

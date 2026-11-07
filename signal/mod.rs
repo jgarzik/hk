@@ -1196,17 +1196,33 @@ pub enum SendInfo {
 }
 
 impl SendInfo {
-    /// The info queued for `sig` (Linux __send_signal_locked's switch);
-    /// pids are root-namespace numbers
-    fn resolve(&self, sig: u32) -> SigInfo {
+    /// The info queued for `sig` at a receiver in pid namespace `ns`
+    /// (Linux __send_signal_locked's switch: SEND_SIG_NOINFO names the
+    /// sender's process as `ns` numbers it)
+    fn resolve(&self, sig: u32, ns: &crate::ns::PidNamespace) -> SigInfo {
         match self {
             Self::User => {
-                let pid = crate::task::percpu::current_pid() as i32;
+                let me = crate::task::percpu::current_pid();
+                let pid = crate::task::pid::nr_ns(me, ns) as i32;
                 SigInfo::kill(sig, si_code::SI_USER, pid, crate::task::current_cred().uid)
             }
             Self::Kernel => SigInfo::kill(sig, si_code::SI_KERNEL, 0, 0),
             Self::Info(i) => *i,
         }
+    }
+
+    /// [`resolve`](Self::resolve) for a send that checks its sender
+    /// (Linux send_signal_locked): an info whose sender `ns` does not
+    /// see names none
+    fn resolve_checked(&self, sig: u32, ns: &crate::ns::PidNamespace) -> SigInfo {
+        let mut i = self.resolve(sig, ns);
+        if matches!(self, Self::Info(_))
+            && ns.level != 0
+            && crate::task::pid::nr_ns(crate::task::percpu::current_tid(), ns) == 0
+        {
+            i.hide_sender();
+        }
+        i
     }
 
     /// A non-RT signal's entry may pass RLIMIT_SIGPENDING unless a user
@@ -1371,7 +1387,7 @@ fn send_task(t: &TaskRef, sig: u32, info: SendInfo, ty: PidType, force: bool) ->
         None
     } else {
         SigQueue::alloc(
-            info.resolve(sig),
+            info.resolve_checked(sig, t.view_pid_ns()),
             tg.uid,
             tg.limit,
             info.override_rlimit(sig),
@@ -1423,7 +1439,9 @@ fn send_held(
         stopped: tg.stopped,
     };
     if let Some(e) = q.as_mut() {
-        e.set_info(info.resolve(sig));
+        // Numbered in the receiver's namespace by the sender already
+        // (Linux do_notify_parent: __send_signal_locked, no check)
+        e.set_info(info.resolve(sig, t.view_pid_ns()));
     }
     // A send changes no blocked mask: with_sig retargets nothing (which
     // would take TASKLIST)
@@ -2633,7 +2651,11 @@ fn tracer_info(tid: Tid, sig: u32) -> SigInfo {
         let table = TASKLIST.read();
         table.get(tr.tid()).map(|v| v.cred_arc().uid)
     });
-    let pid = tracer.as_ref().map_or(0, |tr| tr.pid as i32);
+    // The tracer as the tracee numbers it (Linux ptrace_signal:
+    // task_pid_vnr(current->parent))
+    let pid = tracer
+        .as_ref()
+        .map_or(0, |tr| crate::task::pid::vnr(tr.pid) as i32);
     SigInfo::kill(sig, si_code::SI_USER, pid, uid.unwrap_or(0))
 }
 

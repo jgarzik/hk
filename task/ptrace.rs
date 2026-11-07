@@ -1022,7 +1022,7 @@ pub fn ptrace_report_syscall(entry: bool) {
     let info = crate::signal::SigInfo::kill(
         SIGTRAP,
         code as i32,
-        tid as i32,
+        crate::task::pid::vnr(tid) as i32,
         crate::task::current_cred().uid,
     );
     // Linux send_sig(exit_code, current, 1): SEND_SIG_PRIV

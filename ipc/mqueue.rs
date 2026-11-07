@@ -384,7 +384,7 @@ impl MqQueue {
             let live = n.owner.exec_gen() == n.exec_gen;
             let sig = n.sigev_signo as u32;
             if n.sigev_notify == SIGEV_SIGNAL && live && sig != 0 {
-                let info = mesgq_info(sig, n.sigev_value);
+                let info = mesgq_info(sig, n.sigev_value, &n.owner);
                 // To the registrant's struct pid, never its number
                 crate::signal::kill_pid_info(&n.owner, sig, info, |_| 0);
             }
@@ -393,11 +393,14 @@ impl MqQueue {
 }
 
 /// SI_MESGQ info from the current task, the process that made the queue
-/// non-empty, with the registrant's sigev_value (Linux __do_notify)
-fn mesgq_info(sig: u32, value: u64) -> crate::signal::SendInfo {
+/// non-empty, as the registrant `owner`'s namespace numbers it, with its
+/// sigev_value (Linux __do_notify: task_tgid_nr_ns(current,
+/// ns_of_pid(notify_owner)))
+fn mesgq_info(sig: u32, value: u64, owner: &crate::task::pid::Pid) -> crate::signal::SendInfo {
     use crate::signal::{SendInfo, SigFields, SigInfo, si_code};
+    let me = crate::task::percpu::current_pid();
     let fields = SigFields::Rt {
-        pid: crate::task::percpu::current_pid() as i32,
+        pid: crate::task::pid::nr_ns(me, crate::task::pid::view(owner.ns())) as i32,
         uid: crate::task::current_cred().uid,
         value,
     };
