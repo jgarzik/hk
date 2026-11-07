@@ -1297,6 +1297,7 @@ fn maps_of(mm: &crate::mm::MmStruct) -> Vec<u8> {
                 (ino, "00:00", p)
             }
             None if v.flags & VM_GROWSDOWN != 0 => (0, "00:00", b"[stack]".to_vec()),
+            None if v.flags & crate::mm::VM_SIGPAGE != 0 => (0, "00:00", b"[sigpage]".to_vec()),
             None if v.start >= start_brk
                 && v.end <= brk.next_multiple_of(4096)
                 && brk > start_brk =>

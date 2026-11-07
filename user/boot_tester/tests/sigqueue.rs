@@ -31,7 +31,8 @@
 //! - a child's pdeath_signal comes when its parent exits, from it
 //! - a SIGEV_THREAD_ID timer whose thread has exited sends nothing
 //! - arm64: a handler set without SA_RESTORER returns through the
-//!   kernel's trampoline (Linux: the vDSO sigtramp)
+//!   kernel's trampoline (Linux: the vDSO sigtramp), a mapping of its
+//!   own in /proc/self/maps ([sigpage]; Linux [vdso])
 
 use super::helpers::{print, print_num, println, read_file, skip};
 use hk_syscall::{
@@ -966,7 +967,17 @@ fn test_no_restorer() {
         sys_rt_sigaction(SIGUSR1, act.as_ptr() as u64, 0, 8);
         sys_kill(sys_getpid(), SIGUSR1);
         sys_kill(sys_getpid(), SIGUSR1);
-        sys_exit(if NR_HIT.load(Ordering::Relaxed) == 2 { 0 } else { 1 });
+        // The trampoline's mapping: hk's [sigpage], Linux's [vdso]
+        let mut buf = [0u8; 4096];
+        let n = read_file(b"/proc/self/maps\0", &mut buf).max(0) as usize;
+        let name: &[u8] = if super::helpers::host_mode() {
+            b"[vdso]"
+        } else {
+            b"[sigpage]"
+        };
+        let shown = buf[..n].windows(name.len()).any(|w| w == name);
+        let ok = NR_HIT.load(Ordering::Relaxed) == 2 && shown;
+        sys_exit(if ok { 0 } else { 1 });
     }
     let mut st = 0i32;
     sys_wait4(c, &mut st, 0, 0);

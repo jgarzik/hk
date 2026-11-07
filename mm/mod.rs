@@ -887,6 +887,16 @@ pub struct Mm {
 }
 
 impl Mm {
+    /// Where its signal return trampoline is (arm64: Linux
+    /// mm->context.vdso's sigtramp): its [sigpage] VMA, wherever mremap
+    /// moved it; 0 if there is none (unmapped, or another arch)
+    pub fn sigpage(&self) -> u64 {
+        self.mmap_read()
+            .iter()
+            .find(|v| v.flags & VM_SIGPAGE != 0)
+            .map_or(0, |v| v.start)
+    }
+
     /// Top-level page table (CR3 / TTBR0 value)
     pub fn pgd(&self) -> u64 {
         self.pgd

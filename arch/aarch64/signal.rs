@@ -228,14 +228,12 @@ pub const fn signal_frame_size() -> usize {
 // Signal Frame Setup
 // =============================================================================
 
-/// The page every process gets at exec with the signal return
-/// trampoline (Linux: the vDSO's __kernel_rt_sigreturn, `sigtramp`),
-/// where a handler without SA_RESTORER returns: its address and code
-/// (`mov x8, #__NR_rt_sigreturn; svc #0`)
-pub const SIGPAGE: Option<(u64, [u32; 2])> = Some((
-    super::paging::TASK_SIZE - (1 << 32),
-    [0xd280_1168, 0xd400_0001],
-));
+/// The code of the page every process gets at exec with the signal
+/// return trampoline (Linux: the vDSO's __kernel_rt_sigreturn,
+/// `sigtramp`), where a handler without SA_RESTORER returns: `mov x8,
+/// #__NR_rt_sigreturn; svc #0`. Its address is the mm's
+/// (`Mm::sigpage`), placed in free space at exec.
+pub const SIGPAGE: Option<[u32; 2]> = Some([0xd280_1168, 0xd400_0001]);
 
 /// SS_DISABLE flag for stack_t
 const SS_DISABLE: i32 = 2;
@@ -294,10 +292,15 @@ pub fn setup_rt_frame(
 
     // The trampoline that calls rt_sigreturn: the handler's own, else
     // the exec-time signal page's (Linux setup_return: the vDSO sigtramp)
-    let restorer = match (action.flags & sa_flags::SA_RESTORER != 0, SIGPAGE) {
-        (true, _) => action.restorer,
-        (false, Some((page, _))) => page,
-        (false, None) => return Err(-22),
+    let restorer = if action.flags & sa_flags::SA_RESTORER != 0 {
+        action.restorer
+    } else {
+        let page =
+            crate::mm::get_task_mm(crate::task::percpu::current_tid()).map_or(0, |mm| mm.sigpage());
+        if page == 0 {
+            return Err(-22);
+        }
+        page
     };
 
     // Frame record, then the frame below it, both 16-byte aligned.
