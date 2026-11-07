@@ -127,8 +127,12 @@ pub fn sys_rt_sigaction(sig: u32, act_ptr: u64, oact_ptr: u64, sigsetsize: u64) 
             None => return -22, // EINVAL
         },
     };
+    // Ignored now: discarded pending; no longer ignored: interval timers
+    // whose signal it ignored queue it (Linux do_sigaction)
     if changed && handler_ignored(&sighand, sig) {
         crate::signal::flush_group_signal(sig);
+    } else if changed && old.handler == crate::signal::SigHandler::Ignore {
+        crate::time::posix_timer::sig_unignore(sig);
     }
     if oact_ptr != 0
         && UserPtr::<UserSigAction>::new(oact_ptr)

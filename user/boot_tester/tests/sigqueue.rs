@@ -21,6 +21,11 @@
 //!   discards it pending, blocked or not, queued instances included
 //! - a process-directed signal the leader blocks is taken by another
 //!   thread (Linux shared_pending, complete_signal's thread choice)
+//! - a POSIX timer's signal is SI_TIMER with si_tid and si_value; an
+//!   interval timer's one queued signal counts the periods it missed in
+//!   si_overrun (= timer_getoverrun); settime and delete drop a queued
+//!   one; SIGEV_THREAD_ID signals that thread; ITIMER_REAL's SIGALRM is
+//!   SI_KERNEL and the interval rearms when it is taken
 
 use super::helpers::{host_mode, print, print_num, println, read_file, skip};
 use hk_syscall::{
@@ -57,6 +62,10 @@ pub fn run_tests() {
     test_trapped_info();
     test_ignore_flush();
     test_group_thread();
+    test_timer_info();
+    test_timer_overrun();
+    test_timer_drop();
+    test_itimer_real();
 }
 
 fn bit(sig: u32) -> u64 {
@@ -640,6 +649,192 @@ fn test_group_thread() {
     } else {
         print(b"SIGQUEUE_GROUP_THREAD:FAIL status=");
         print_num(st as i64);
+        println(b"");
+    }
+}
+
+fn ts(sec: i64, nsec: i64) -> hk_syscall::Timespec {
+    hk_syscall::Timespec {
+        tv_sec: sec,
+        tv_nsec: nsec,
+    }
+}
+
+fn sleep_ms(ms: i64) {
+    let t = ts(ms / 1000, (ms % 1000) * 1_000_000);
+    hk_syscall::sys_nanosleep(&t, core::ptr::null_mut());
+}
+
+/// timer_create on CLOCK_MONOTONIC signalling `sig` with `value` (as
+/// `notify`, to thread `tid`): its id, or -errno
+fn timer(sig: u32, value: i32, notify: i32, tid: i32) -> i32 {
+    let sev = SigEvent {
+        sigev_value: SigVal { sival_int: value },
+        sigev_signo: sig as i32,
+        sigev_notify: notify,
+        sigev_notify_thread_id: tid,
+        ..SigEvent::default()
+    };
+    let mut id = -1i32;
+    let r = hk_syscall::sys_timer_create(1, &sev, &mut id);
+    if r < 0 { r as i32 } else { id }
+}
+
+fn arm(id: i32, value_ms: i64, interval_ms: i64) {
+    let spec = hk_syscall::ITimerSpec {
+        it_interval: ts(0, interval_ms * 1_000_000),
+        it_value: ts(0, value_ms * 1_000_000),
+    };
+    hk_syscall::sys_timer_settime(id, 0, &spec, core::ptr::null_mut());
+}
+
+/// si_tid (offset 16) and si_overrun (20) of a timer's siginfo
+fn tid_overrun(i: &SigInfo) -> (i32, i32) {
+    (i.si_pid, i.si_uid as i32)
+}
+
+/// A one-shot timer: SI_TIMER, its id, overrun 0, its value; a
+/// SIGEV_THREAD_ID one reaches this thread the same way
+fn test_timer_info() {
+    const SI_TIMER: i32 = -2;
+    let old = block(bit(SIGRT) | bit(SIGRT + 1));
+    let a = timer(SIGRT, 4242, 0, 0);
+    let me = hk_syscall::sys_gettid() as i32;
+    let b = timer(SIGRT + 1, 77, 4, me); // SIGEV_THREAD_ID
+    arm(a, 10, 0);
+    arm(b, 10, 0);
+    let mut ia = zeroed();
+    let ra = wait_sig(bit(SIGRT), 2, &mut ia);
+    let mut ib = zeroed();
+    let rb = wait_sig(bit(SIGRT + 1), 2, &mut ib);
+    hk_syscall::sys_timer_delete(a);
+    hk_syscall::sys_timer_delete(b);
+    setmask(old);
+    let ok_a = ra == SIGRT as i64
+        && ia.si_code == SI_TIMER
+        && tid_overrun(&ia) == (a, 0)
+        && ia.si_status == 4242;
+    let ok_b = rb == (SIGRT + 1) as i64 && ib.si_code == SI_TIMER && ib.si_status == 77;
+    if a >= 0 && b >= 0 && ok_a && ok_b {
+        println(b"SIGQUEUE_TIMER_INFO:OK");
+    } else {
+        print(b"SIGQUEUE_TIMER_INFO:FAIL ids=");
+        print_num(a as i64);
+        print(b",");
+        print_num(b as i64);
+        print(b" r=");
+        print_num(ra);
+        print(b",");
+        print_num(rb);
+        print(b" code=");
+        print_num(ia.si_code as i64);
+        print(b" tid=");
+        print_num(tid_overrun(&ia).0 as i64);
+        print(b" value=");
+        print_num(ia.si_status as i64);
+        println(b"");
+    }
+}
+
+/// A 10 ms interval timer left 105 ms with its signal blocked: one
+/// signal, si_overrun the periods after the first (about 9),
+/// timer_getoverrun the same; then nothing more is pending
+fn test_timer_overrun() {
+    let old = block(bit(SIGRT));
+    let id = timer(SIGRT, 1, 0, 0);
+    arm(id, 10, 10);
+    sleep_ms(105);
+    let mut i = zeroed();
+    let r = wait_sig(bit(SIGRT), 1, &mut i);
+    let over = tid_overrun(&i).1;
+    let get = hk_syscall::sys_timer_getoverrun(id);
+    let mut j = zeroed();
+    let again = wait_sig(bit(SIGRT), 0, &mut j);
+    hk_syscall::sys_timer_delete(id);
+    let mut k = zeroed();
+    wait_sig(bit(SIGRT), 0, &mut k);
+    setmask(old);
+    if r == SIGRT as i64 && (5..=20).contains(&over) && get == over as i64 && again == EAGAIN {
+        println(b"SIGQUEUE_TIMER_OVERRUN:OK");
+    } else {
+        print(b"SIGQUEUE_TIMER_OVERRUN:FAIL r=");
+        print_num(r);
+        print(b" overrun=");
+        print_num(over as i64);
+        print(b" getoverrun=");
+        print_num(get);
+        print(b" again=");
+        print_num(again);
+        println(b"");
+    }
+}
+
+/// A queued timer signal is dropped by timer_settime and timer_delete
+/// (Linux 6.13 on: it_signal_seq; before, it was still delivered)
+fn test_timer_drop() {
+    if !super::helpers::linux_at_least(6, 13) {
+        skip(b"SIGQUEUE_TIMER_DROP", b"host Linux before 6.13 delivers it");
+        return;
+    }
+    let old = block(bit(SIGRT));
+    let a = timer(SIGRT, 1, 0, 0);
+    arm(a, 1, 0);
+    sleep_ms(20);
+    arm(a, 0, 0); // disarm: the queued signal goes
+    let mut i = zeroed();
+    let ra = wait_sig(bit(SIGRT), 0, &mut i);
+    arm(a, 1, 0);
+    sleep_ms(20);
+    hk_syscall::sys_timer_delete(a);
+    let rb = wait_sig(bit(SIGRT), 0, &mut i);
+    setmask(old);
+    if ra == EAGAIN && rb == EAGAIN {
+        println(b"SIGQUEUE_TIMER_DROP:OK");
+    } else {
+        print(b"SIGQUEUE_TIMER_DROP:FAIL settime=");
+        print_num(ra);
+        print(b" delete=");
+        print_num(rb);
+        println(b"");
+    }
+}
+
+/// ITIMER_REAL every 10 ms: SIGALRM is SI_KERNEL; taking it rearms the
+/// timer, so a second one comes
+fn test_itimer_real() {
+    const SIGALRM: u32 = 14;
+    const SI_KERNEL: i32 = 0x80;
+    let old = block(bit(SIGALRM));
+    let tv = |us| hk_syscall::Timeval {
+        tv_sec: 0,
+        tv_usec: us,
+    };
+    let it = hk_syscall::ITimerVal {
+        it_interval: tv(10_000),
+        it_value: tv(10_000),
+    };
+    hk_syscall::sys_setitimer(0, &it, core::ptr::null_mut());
+    let mut a = zeroed();
+    let ra = wait_sig(bit(SIGALRM), 2, &mut a);
+    let mut b = zeroed();
+    let rb = wait_sig(bit(SIGALRM), 2, &mut b);
+    let off = hk_syscall::ITimerVal {
+        it_interval: tv(0),
+        it_value: tv(0),
+    };
+    hk_syscall::sys_setitimer(0, &off, core::ptr::null_mut());
+    let mut c = zeroed();
+    wait_sig(bit(SIGALRM), 0, &mut c);
+    setmask(old);
+    if ra == SIGALRM as i64 && a.si_code == SI_KERNEL && rb == SIGALRM as i64 {
+        println(b"SIGQUEUE_ITIMER_REAL:OK");
+    } else {
+        print(b"SIGQUEUE_ITIMER_REAL:FAIL r=");
+        print_num(ra);
+        print(b",");
+        print_num(rb);
+        print(b" code=");
+        print_num(a.si_code as i64);
         println(b"");
     }
 }

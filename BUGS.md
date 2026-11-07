@@ -246,8 +246,7 @@ timer_create and clock_nanosleep take only the caller's own process
 CPU clock (and its threads' for timer_create): another process's is
 EINVAL (Linux runs those too, checked when that process runs). The
 SCHED CPU clock counts utime + stime like PROF (Linux: exact runtime).
-CPU timer signals carry no siginfo (no si_timerid/si_overrun). rseq is
-ENOSYS (glibc runs without it).
+rseq is ENOSYS (glibc runs without it).
 
 ## AF_PACKET gaps
 

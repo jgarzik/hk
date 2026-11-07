@@ -1757,25 +1757,34 @@ pub fn do_group_exit(status: i32) -> ! {
 /// its own, then the thread group's
 pub fn get_signal_to_deliver(tid: Tid) -> Option<(SigAction, SigInfo)> {
     let sighand = get_task_sighand(tid)?;
-    let d = with_task_signal_state(tid, |state| {
-        let blocked = state.blocked;
-        state
-            .pending
-            .dequeue_sync(&blocked)
-            .or_else(|| dequeue_locked(state, &blocked))
-    })??;
-    // The entry is freed here, with Task.sig dropped
-    let info = d.info();
-    Some((sighand.get_action(info.sig()).unwrap_or_default(), info))
+    loop {
+        let (d, alrm) = with_task_signal_state(tid, |state| {
+            let blocked = state.blocked;
+            match state.pending.dequeue_sync(&blocked) {
+                Some(d) => Some((d, false)),
+                None => dequeue_locked(state, &blocked),
+            }
+        })??;
+        // With Task.sig dropped: the entry is freed (or a timer's goes
+        // back to it), ITIMER_REAL rearms on a group SIGALRM
+        if alrm {
+            crate::time::posix_timer::rearm_itimer_real();
+        }
+        if let Some(info) = d.info() {
+            return Some((sighand.get_action(info.sig()).unwrap_or_default(), info));
+        }
+    }
 }
 
 /// The next signal not in `skip`, the task's own first, then its
-/// group's (Linux dequeue_signal)
-fn dequeue_locked(state: &mut TaskSignalState, skip: &SigSet) -> Option<pending::Dequeued> {
+/// group's (Linux dequeue_signal); true if that was the group's SIGALRM
+fn dequeue_locked(state: &mut TaskSignalState, skip: &SigSet) -> Option<(pending::Dequeued, bool)> {
     if let Some(d) = state.pending.dequeue(skip) {
-        return Some(d);
+        return Some((d, false));
     }
-    state.shared_pending.lock().dequeue(skip)
+    let d = state.shared_pending.lock().dequeue(skip)?;
+    let alrm = d.sig() == SIGALRM;
+    Some((d, alrm))
 }
 
 /// Dequeue the current task's next pending signal of `wanted`, with its
@@ -1784,8 +1793,88 @@ fn dequeue_locked(state: &mut TaskSignalState, skip: &SigSet) -> Option<pending:
 pub fn dequeue_signal(wanted: &SigSet) -> Option<SigInfo> {
     let skip = SigSet(!wanted.0);
     let tid = crate::task::percpu::current_tid();
-    let d = with_task_signal_state(tid, |state| dequeue_locked(state, &skip))??;
-    Some(d.info())
+    loop {
+        let (d, alrm) = with_task_signal_state(tid, |state| dequeue_locked(state, &skip))??;
+        if alrm {
+            crate::time::posix_timer::rearm_itimer_real();
+        }
+        if let Some(info) = d.info() {
+            return Some(info);
+        }
+    }
+}
+
+/// Queue POSIX timer entry `q` for task `tid` or its group (Linux
+/// posixtimer_send_sigqueue): no legacy check (the entry is the
+/// timer's one instance), `ty` Pid not on an exiting thread; then the
+/// thread choice of any group signal. The entry comes back if it was
+/// not queued, with whether the signal was ignored.
+pub fn send_timer_sigqueue(
+    tid: Tid,
+    ty: PidType,
+    q: Box<SigQueue>,
+) -> Result<(), (Box<SigQueue>, bool)> {
+    let sig = q.info().sig();
+    let me = crate::task::percpu::current();
+    // A group signal is taken by the current thread if it is in the
+    // group (Linux posixtimer_get_target)
+    let t = if ty == PidType::Tgid && me.pid == tid && !me.has_flag(crate::task::pf::EXITING) {
+        Some(crate::task::percpu::task_ref(&me))
+    } else if ty == PidType::Tgid {
+        let table = TASKLIST.read();
+        group_task(&table, table.get(tid))
+    } else {
+        TASKLIST.read().task(tid)
+    };
+    let Some(t) = t else {
+        return Err((q, false));
+    };
+    let Some(tg) = target(&t) else {
+        return Err((q, false));
+    };
+    if tg.kthread || tg.group_exit {
+        return Err((q, true));
+    }
+    let sighand = tg.sighand.as_ref();
+    let stopped = tg.stopped;
+    let mut q = Some(q);
+    let r = with_sig(&t, |task, state| {
+        let exiting = task.has_flag(crate::task::pf::EXITING);
+        if exiting && ty == PidType::Pid {
+            return Err(false);
+        }
+        if sig_ignored(state, sighand, sig) {
+            return Err(true);
+        }
+        let wants = !state.blocked.contains(sig)
+            && !exiting
+            && !stopped
+            && (task.se.on_cpu() || !task.sigpending());
+        let Some(e) = q.take() else {
+            return Err(false);
+        };
+        match ty {
+            PidType::Pid => state.pending.queue(e),
+            PidType::Tgid => match state.shared_pending.group() {
+                Some(mut g) => g.queue(e),
+                None => {
+                    q = Some(e);
+                    return Err(false);
+                }
+            },
+        }
+        Ok(wants)
+    });
+    match r {
+        Ok(wants) => {
+            if let Some(h) = sighand {
+                h.signalfd_wq.wake_all();
+            }
+            complete_signal(&t, sig, ty, wants, sighand);
+            Ok(())
+        }
+        Err(ignored) => Err((q.expect("an unqueued entry comes back"), ignored)),
+    }
 }
 
 /// Default action for a signal

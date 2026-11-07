@@ -7,11 +7,19 @@
 //! one after unlocking; a dequeue returns its entry inside a
 //! [`Dequeued`], which the caller drops (`Dequeued::info`) after
 //! unlocking, and a flushed set is dropped the same way.
+//!
+//! A POSIX timer's entry is made with the timer (Linux
+//! SIGQUEUE_PREALLOC) and is never freed while it lives: dequeued,
+//! flushed or refused, it goes back to its timer
+//! (`posix_timer::reclaim`), which also decides at dequeue whether the
+//! signal still counts and rearms an interval timer.
 
 use super::{SIGRTMIN, SYNCHRONOUS_MASK, SigInfo, SigSet, si_code};
 use crate::task::{Ucount, Uid, ucount_dec, ucount_inc};
+use crate::time::posix_timer::PosixTimer;
 use crate::util::kalloc::try_box;
 use alloc::boxed::Box;
+use alloc::sync::Weak;
 
 /// One queued signal (Linux struct sigqueue): its info, charged to the
 /// receiving user's RLIMIT_SIGPENDING count until freed
@@ -19,6 +27,8 @@ pub struct SigQueue {
     info: SigInfo,
     /// The user charged (Linux sigqueue.ucounts)
     uid: Uid,
+    /// The POSIX timer whose entry this is (Linux SIGQUEUE_PREALLOC)
+    timer: Option<Weak<PosixTimer>>,
     next: Option<Box<SigQueue>>,
 }
 
@@ -33,12 +43,41 @@ impl SigQueue {
         let q = Self {
             info,
             uid,
+            timer: None,
             next: None,
         };
         if !override_rlimit && n > limit {
             return None;
         }
         try_box(q).ok()
+    }
+
+    /// POSIX timer `timer`'s entry, charged to the current task's user
+    /// within its RLIMIT_SIGPENDING (Linux posixtimer_init_sigqueue)
+    pub fn alloc_timer(info: SigInfo, timer: Weak<PosixTimer>) -> Option<Box<Self>> {
+        let uid = crate::task::current_cred().uid;
+        let limit = crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_SIGPENDING);
+        let mut q = Self::alloc(info, uid, limit, false)?;
+        q.timer = Some(timer);
+        Some(q)
+    }
+
+    /// Its info
+    pub fn info(&self) -> &SigInfo {
+        &self.info
+    }
+
+    /// The timer it belongs to, if any
+    pub fn timer(&self) -> Option<&Weak<PosixTimer>> {
+        self.timer.as_ref()
+    }
+}
+
+/// Free an unlinked entry, or give a timer's back to it (no spin lock
+/// held)
+fn release(q: Box<SigQueue>) {
+    if q.timer.is_some() {
+        crate::time::posix_timer::reclaim(q);
     }
 }
 
@@ -53,7 +92,7 @@ impl Drop for SigQueue {
 #[must_use]
 pub struct Dequeued {
     info: SigInfo,
-    _q: Option<Box<SigQueue>>,
+    q: Option<Box<SigQueue>>,
 }
 
 impl Dequeued {
@@ -62,9 +101,22 @@ impl Dequeued {
         self.info.sig()
     }
 
-    /// The info, freeing the entry (call with no spin lock held)
-    pub fn info(self) -> SigInfo {
-        self.info
+    /// The info, freeing the entry (call with no spin lock held); None
+    /// for a timer's signal its timer no longer wants delivered (Linux
+    /// posixtimer_deliver_signal: dequeue again)
+    pub fn info(mut self) -> Option<SigInfo> {
+        match self.q.take() {
+            Some(q) if q.timer.is_some() => crate::time::posix_timer::deliver(q),
+            _ => Some(self.info),
+        }
+    }
+}
+
+impl Drop for Dequeued {
+    fn drop(&mut self) {
+        if let Some(q) = self.q.take() {
+            release(q);
+        }
     }
 }
 
@@ -145,7 +197,7 @@ impl SigPending {
             Some(q) => q.info,
             None => SigInfo::kill(sig, si_code::SI_USER, 0, 0),
         };
-        Dequeued { info, _q: q }
+        Dequeued { info, q }
     }
 
     /// The next signal not in `skip` (Linux next_signal): a
@@ -198,11 +250,13 @@ impl SigPending {
 }
 
 impl Drop for SigPending {
-    /// One entry at a time: a long queue must not recurse
+    /// One entry at a time: a long queue must not recurse; a timer's
+    /// goes back to it
     fn drop(&mut self) {
         let mut cur = self.list.take();
         while let Some(mut q) = cur {
             cur = q.next.take();
+            release(q);
         }
     }
 }
@@ -225,7 +279,7 @@ mod tests {
     }
 
     fn value(d: Dequeued) -> u64 {
-        match d.info().fields() {
+        match d.info().unwrap().fields() {
             SigFields::Rt { value, .. } => value,
             _ => 0,
         }
@@ -296,7 +350,7 @@ mod tests {
         p.queue(SigQueue::alloc(segv, 4243, 1, false).unwrap());
         assert!(SigQueue::alloc(segv, 4243, 1, false).is_none());
         let d = p.dequeue_sync(&NONE).unwrap();
-        assert_eq!(d.info(), segv);
+        assert_eq!(d.info(), Some(segv));
         assert!(p.dequeue_sync(&NONE).is_none());
         assert_eq!(crate::task::ucount(4243, Ucount::Sigpending), 0);
     }

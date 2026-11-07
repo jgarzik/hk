@@ -32,12 +32,13 @@ use core::pin::Pin;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::arch::IrqSpinlock;
-use crate::signal::{SIGALRM, send_signal};
+use crate::signal::{PidType, SIGALRM, SigQueue};
+use crate::sync::spin::Mutex;
 use crate::task::Tid;
-use crate::task::percpu::TICK_NS;
 use crate::time::hrtimer::{HrClock, HrTimer};
 use crate::time::time_syscall::CLOCK_REALTIME;
 use crate::time::timerfd::ITimerSpec;
+use alloc::boxed::Box;
 
 /// POSIX timer notification types (matches Linux)
 pub mod sigev_notify {
@@ -109,10 +110,26 @@ struct PosixTimerInner {
     clock: HrClock,
     /// Interval for periodic timers (0 = one-shot)
     interval_ns: u64,
-    /// Overrun count (expirations since last signal delivery)
-    overrun: i32,
-    /// Whether timer is currently armed
+    /// Periods missed while the signal waited, counted at its rearm
+    /// (Linux it_overrun; -1 until the first)
+    overrun: i64,
+    /// What the last delivered signal's si_overrun said (Linux
+    /// it_overrun_last: timer_getoverrun)
+    overrun_last: i64,
+    /// Expiry pending (Linux POSIX_TIMER_ARMED)
     armed: bool,
+    /// An interval timer that fired and rearms when its signal is
+    /// dequeued (Linux POSIX_TIMER_REQUEUE_PENDING)
+    requeue: bool,
+    /// Bumped by settime and delete; a queued signal from before is
+    /// dropped at dequeue (Linux it_signal_seq, it_sigqueue_seq)
+    signal_seq: u64,
+    sigqueue_seq: u64,
+    /// The signal was sent as an interval timer's (Linux it_sig_periodic)
+    sig_periodic: bool,
+    /// Its signal was ignored on expiry: queued once the action stops
+    /// ignoring it (Linux ignored_posix_timers)
+    ignored: bool,
 }
 
 impl PosixTimerInner {
@@ -121,8 +138,14 @@ impl PosixTimerInner {
             expires_ns: 0,
             clock: HrClock::Monotonic,
             interval_ns: 0,
-            overrun: 0,
+            overrun: -1,
+            overrun_last: 0,
             armed: false,
+            requeue: false,
+            signal_seq: 0,
+            sigqueue_seq: 0,
+            sig_periodic: false,
+            ignored: false,
         }
     }
 }
@@ -133,9 +156,17 @@ pub struct PosixTimer {
     timer_id: TimerT,
     /// Clock ID (CLOCK_REALTIME or CLOCK_MONOTONIC)
     clockid: i32,
-    /// Owning task's TID (for signal delivery; retargeted when a
-    /// non-leader exec takes the leader's tid)
+    /// The thread a SIGEV_THREAD_ID timer signals (retargeted when a
+    /// non-leader exec takes the leader's tid); else its creator
     owner_tid: AtomicU64,
+    /// The process it belongs to
+    pid: Tid,
+    /// Its signal is for the thread (SIGEV_THREAD_ID) or the process
+    /// (Linux it_pid_type)
+    pid_type: PidType,
+    /// Its preallocated signal entry while not queued (Linux sigq,
+    /// SIGQUEUE_PREALLOC): spin leaf, thread context
+    sigq: Mutex<Option<Box<SigQueue>>>,
     /// Notification settings
     sigevent: SigEvent,
     /// Inner state protected by IRQ spinlock
@@ -192,10 +223,18 @@ impl PosixTimer {
         cpu: Option<crate::time::cpu_timer::CpuClock>,
         sleeper: bool,
     ) -> Self {
+        let pid_type = if sigevent.sigev_notify == sigev_notify::SIGEV_THREAD_ID {
+            PidType::Pid
+        } else {
+            PidType::Tgid
+        };
         Self {
             timer_id,
             clockid,
             owner_tid: AtomicU64::new(owner_tid),
+            pid: crate::task::percpu::current_pid(),
+            pid_type,
+            sigq: Mutex::new(None),
             sigevent,
             inner: IrqSpinlock::new(PosixTimerInner::new()),
             timer: HrTimer::new(posix_timer_fire, 0),
@@ -235,10 +274,11 @@ impl PosixTimer {
         let mut inner = self.inner.lock();
 
         // Save old value
-        let old_value = self.get_current_value_locked(&inner);
+        let old_value = self.get_current_value_locked(&mut inner);
 
-        // Reset overrun count on re-arm
-        inner.overrun = 0;
+        // A queued signal from before is dropped; overruns start over
+        // (Linux do_timer_settime, posix_timer_set_common)
+        reset_signal(&mut inner);
 
         // Check if disarming
         if new_value.is_disarmed() {
@@ -287,11 +327,11 @@ impl PosixTimer {
     pub fn gettime(&self) -> ITimerSpec {
         if let Some(c) = self.cpu {
             let now = crate::time::cpu_timer::sample_now(c, crate::task::percpu::current_pid());
-            let inner = self.inner.lock();
-            return cpu_value(&inner, now.unwrap_or(0));
+            let mut inner = self.inner.lock();
+            return cpu_value(&mut inner, now.unwrap_or(0));
         }
-        let inner = self.inner.lock();
-        self.get_current_value_locked(&inner)
+        let mut inner = self.inner.lock();
+        self.get_current_value_locked(&mut inner)
     }
 
     /// settime of a CPU-time timer: its expiry in that clock's ns
@@ -307,8 +347,8 @@ impl PosixTimer {
         let now =
             crate::time::cpu_timer::sample_now(c, crate::task::percpu::current_pid()).unwrap_or(0);
         let mut inner = self.inner.lock();
-        let old_value = cpu_value(&inner, now);
-        inner.overrun = 0;
+        let old_value = cpu_value(&mut inner, now);
+        reset_signal(&mut inner);
         if new_value.is_disarmed() {
             inner.expires_ns = 0;
             inner.interval_ns = 0;
@@ -345,40 +385,123 @@ impl PosixTimer {
         i.armed.then_some(i.expires_ns)
     }
 
-    /// The CPU timer at clock value `now`: if due, rearm it a whole
-    /// number of periods on (overruns counted) or disarm it, and say
-    /// what it does (Linux cpu_timer_fire, bump_cpu_timer)
+    /// The CPU timer at clock value `now`: if due, what it does (Linux
+    /// cpu_timer_fire). A timer_create timer's signal is queued and an
+    /// interval one rearmed when it is dequeued; an itimer
+    /// (ITIMER_VIRTUAL/PROF) rearms a whole number of periods on at once
+    /// and signals its process (Linux check_cpu_itimer).
     pub fn cpu_expire(&self, now: u64) -> Option<crate::time::cpu_timer::Expired> {
+        use crate::time::cpu_timer::Expired;
         let mut i = self.inner.lock();
         if !i.armed || now < i.expires_ns {
             return None;
         }
-        if let Some(late) = (now - i.expires_ns).checked_div(i.interval_ns) {
-            let missed = late + 1;
-            i.expires_ns = i
-                .expires_ns
-                .saturating_add(missed.saturating_mul(i.interval_ns));
-            let extra = i32::try_from(missed - 1).unwrap_or(i32::MAX);
-            i.overrun = i.overrun.saturating_add(extra);
-        } else {
-            i.armed = false;
-            i.expires_ns = 0;
+        let itimer = self.timer_id < 0 && !self.sleeper;
+        match (now - i.expires_ns).checked_div(i.interval_ns) {
+            Some(late) if itimer => {
+                i.expires_ns = i
+                    .expires_ns
+                    .saturating_add((late + 1).saturating_mul(i.interval_ns));
+            }
+            interval => {
+                i.armed = false;
+                i.requeue = interval.is_some();
+            }
         }
         drop(i);
         if self.sleeper {
-            return Some(crate::time::cpu_timer::Expired::Wake);
+            return Some(Expired::Wake);
         }
-        if self.sigevent.sigev_notify != sigev_notify::SIGEV_SIGNAL {
+        if !self.signals() {
             return None;
         }
-        let sig = self.sigevent.sigev_signo as u32;
-        if sig == 0 || sig > 64 {
-            return None;
+        Some(if itimer {
+            Expired::Signal(self.sigevent.sigev_signo as u32)
+        } else {
+            Expired::Queue
+        })
+    }
+
+    /// Its expiry sends a signal
+    fn signals(&self) -> bool {
+        let n = self.sigevent.sigev_notify;
+        n != sigev_notify::SIGEV_NONE && !self.sleeper
+    }
+
+    /// Queue its signal entry (Linux posix_timer_queue_signal ->
+    /// posixtimer_send_sigqueue): nothing while it is still queued; an
+    /// ignored interval timer's waits to be unignored. No lock held.
+    pub fn queue_signal(&self) {
+        let Some(q) = self.sigq.lock().take() else {
+            return;
+        };
+        let periodic = {
+            let mut i = self.inner.lock();
+            i.sigqueue_seq = i.signal_seq;
+            i.sig_periodic = i.requeue;
+            i.sig_periodic
+        };
+        let target = match self.pid_type {
+            PidType::Pid => self.owner_tid.load(Ordering::Relaxed),
+            PidType::Tgid => self.pid,
+        };
+        let ignored = match crate::signal::send_timer_sigqueue(target, self.pid_type, q) {
+            Ok(()) => false,
+            Err((q, ignored)) => {
+                *self.sigq.lock() = Some(q);
+                ignored && periodic
+            }
+        };
+        self.inner.lock().ignored = ignored;
+    }
+
+    /// Its signal was dequeued, the info in `info` (Linux
+    /// __posixtimer_deliver_signal): false if settime or delete came
+    /// since it was queued; an interval timer rearms here, its missed
+    /// periods into si_overrun
+    fn deliver_locked(&self, info: &mut crate::signal::SigInfo) -> bool {
+        let (rearm, value) = {
+            let mut i = self.inner.lock();
+            if i.signal_seq != i.sigqueue_seq {
+                return false;
+            }
+            if i.interval_ns == 0 || !i.requeue {
+                return true;
+            }
+            let now = match self.cpu {
+                Some(c) => {
+                    crate::time::cpu_timer::sample_now(c, crate::task::percpu::current_pid())
+                        .unwrap_or(i.expires_ns)
+                }
+                None => i.clock.now(),
+            };
+            let (missed, next) = forward_now(i.expires_ns, i.interval_ns, now);
+            i.overrun = i.overrun.saturating_add(missed as i64);
+            i.overrun_last = i.overrun;
+            i.overrun = -1;
+            i.signal_seq += 1;
+            i.requeue = false;
+            if let Some(n) = next {
+                i.expires_ns = n;
+                i.armed = true;
+                if self.cpu.is_none() {
+                    self.timer().start(n, i.clock);
+                }
+            }
+            (
+                next.filter(|_| self.cpu.is_some()),
+                overrun_int(i.overrun_last),
+            )
+        };
+        if let (Some(at), Some(c)) = (rearm, self.cpu) {
+            crate::time::cpu_timer::arm(c, at);
         }
-        // ITIMER_VIRTUAL/PROF signal the process; timer_create timers
-        // their owner, like the other clocks' here
-        let thread = (self.timer_id >= 0).then(|| self.owner_tid.load(Ordering::Relaxed));
-        Some(crate::time::cpu_timer::Expired::Signal { sig, thread })
+        let mut f = info.fields();
+        if let crate::signal::SigFields::Timer { overrun, .. } = &mut f {
+            *overrun = value;
+        }
+        *info = crate::signal::SigInfo::new(info.sig(), info.code, f);
+        true
     }
 
     /// clock_nanosleep's timer expired: wake its sleeper
@@ -386,91 +509,169 @@ impl PosixTimer {
         self.wq.wake_all();
     }
 
-    /// Get current value while holding the lock
-    fn get_current_value_locked(&self, inner: &PosixTimerInner) -> ITimerSpec {
-        if !inner.armed || inner.expires_ns == 0 {
+    /// Get current value while holding the lock: an interval timer
+    /// waiting for its signal's dequeue, or a SIGEV_NONE one, is moved
+    /// forward past now, its periods counted (Linux common_timer_get)
+    fn get_current_value_locked(&self, inner: &mut PosixTimerInner) -> ITimerSpec {
+        let now = inner.clock.now();
+        forward_waiting(inner, now);
+        if !inner.armed && !inner.requeue {
             return ITimerSpec::default();
         }
-
-        let remaining = inner.expires_ns.saturating_sub(inner.clock.now());
-
+        let remaining = inner.expires_ns.saturating_sub(now).max(1);
         ITimerSpec::from_ns(remaining, inner.interval_ns)
     }
 
-    /// Get and reset overrun count
+    /// The last delivered signal's overrun count (Linux
+    /// timer_getoverrun: it_overrun_last)
     pub fn getoverrun(&self) -> i32 {
-        let inner = self.inner.lock();
-        inner.overrun
+        overrun_int(self.inner.lock().overrun_last)
     }
 
-    /// Called when timer expires (from timer callback)
+    /// Called when timer expires (from timer callback): its signal is
+    /// queued; an interval timer is rearmed when that is dequeued
+    /// (Linux posix_timer_fn), ITIMER_REAL's when its SIGALRM is
     fn on_expire(&self) {
-        let should_signal;
         {
             let mut inner = self.inner.lock();
-
             if !inner.armed {
                 return;
             }
-            // A one-shot timer is done; a periodic one re-arms for the
-            // first period end after now (Linux hrtimer_forward)
-            if inner.interval_ns == 0 {
-                inner.armed = false;
-                inner.expires_ns = 0;
-            } else {
-                let now = inner.clock.now();
-                let (missed, next) =
-                    crate::time::timer::forward(inner.expires_ns, inner.interval_ns, now);
-                // Periods missed beyond the one this expiry delivers
-                // (Linux: hrtimer_forward's count, into it_overrun)
-                let extra = i32::try_from(missed - 1).unwrap_or(i32::MAX);
-                inner.overrun = inner.overrun.saturating_add(extra);
-                match next {
-                    Some(n) => {
-                        // The expiry stays on the period grid, so the
-                        // next forward counts every missed period; a
-                        // period under a tick fires a tick away at the
-                        // soonest, or it would keep ktimers/N busy (Linux
-                        // re-arms when the signal is dequeued instead)
-                        inner.expires_ns = n;
-                        let fire = match inner.interval_ns < TICK_NS {
-                            true => n.max(now.saturating_add(TICK_NS)),
-                            false => n,
-                        };
-                        self.timer().start(fire, inner.clock);
-                    }
-                    None => {
-                        inner.armed = false;
-                        inner.expires_ns = 0;
-                    }
-                }
-            }
-
-            // Determine notification action
-            should_signal = self.sigevent.sigev_notify == sigev_notify::SIGEV_SIGNAL;
+            inner.armed = false;
+            inner.requeue = inner.interval_ns != 0;
         }
-
-        // Send signal if configured
-        if should_signal {
-            let sig = self.sigevent.sigev_signo as u32;
-            if sig > 0 && sig <= 64 {
-                send_signal(self.owner_tid.load(Ordering::Relaxed), sig);
-            }
+        if self.timer_id == ITIMER_REAL_ID {
+            // Linux it_real_fn: SEND_SIG_PRIV to the process
+            let info = crate::signal::SendInfo::Kernel;
+            crate::signal::kill_proc_info(self.pid, SIGALRM, info);
+        } else if self.signals() {
+            self.queue_signal();
         }
     }
 
     /// Delete the timer (cancel, waiting out its callback; thread
-    /// context)
+    /// context): a queued signal of it is dropped at dequeue
     fn delete(&self) {
-        self.inner.lock().armed = false;
+        {
+            let mut i = self.inner.lock();
+            i.armed = false;
+            i.requeue = false;
+            i.signal_seq += 1;
+        }
         self.timer.cancel_sync();
         self.wq.wake_all();
     }
 }
 
+/// A settime: a queued signal from before is dropped, overruns start
+/// over (Linux it_signal_seq++, posix_timer_set_common)
+fn reset_signal(i: &mut PosixTimerInner) {
+    i.signal_seq += 1;
+    i.requeue = false;
+    i.overrun = -1;
+    i.overrun_last = 0;
+}
+
+/// An interval timer not armed (waiting for its signal's dequeue, or
+/// SIGEV_NONE) moved past `now`, its periods counted (Linux
+/// common_timer_get: timer_forward)
+fn forward_waiting(i: &mut PosixTimerInner, now: u64) {
+    if i.interval_ns == 0 || i.armed || !i.requeue || i.expires_ns > now {
+        return;
+    }
+    let (missed, next) = crate::time::timer::forward(i.expires_ns, i.interval_ns, now);
+    i.overrun = i.overrun.saturating_add(missed as i64);
+    if let Some(n) = next {
+        i.expires_ns = n;
+    }
+}
+
+/// `expires` moved whole `interval`s past `now`, and how many (Linux
+/// hrtimer_forward: none if it is still ahead)
+fn forward_now(expires: u64, interval: u64, now: u64) -> (u64, Option<u64>) {
+    if expires > now {
+        return (0, Some(expires));
+    }
+    crate::time::timer::forward(expires, interval, now)
+}
+
+/// si_overrun and timer_getoverrun are int: clamped (Linux
+/// timer_overrun_to_int)
+fn overrun_int(v: i64) -> i32 {
+    i32::try_from(v.max(0)).unwrap_or(i32::MAX)
+}
+
+/// Timer `q`'s signal was dequeued (Linux posixtimer_deliver_signal):
+/// its info, or None if the timer no longer wants it delivered (deleted,
+/// or set again since); the entry goes back to a live timer
+pub fn deliver(q: Box<SigQueue>) -> Option<crate::signal::SigInfo> {
+    let t = q.timer()?.upgrade()?;
+    let mut info = *q.info();
+    let ok = t.deliver_locked(&mut info);
+    *t.sigq.lock() = Some(q);
+    ok.then_some(info)
+}
+
+/// Timer `q`'s entry was flushed or not queued: back to its timer; an
+/// interval timer's signal discarded as ignored waits to be unignored
+/// (Linux posixtimer_sig_ignore)
+pub fn reclaim(q: Box<SigQueue>) {
+    let Some(t) = q.timer().and_then(alloc::sync::Weak::upgrade) else {
+        return;
+    };
+    {
+        let mut i = t.inner.lock();
+        if i.sig_periodic && i.signal_seq == i.sigqueue_seq {
+            i.ignored = true;
+        }
+    }
+    *t.sigq.lock() = Some(q);
+}
+
+/// `sig`'s action no longer ignores it: the current process's interval
+/// timers whose signal it ignored queue it now (Linux
+/// posixtimer_sig_unignore)
+pub fn sig_unignore(sig: u32) {
+    let tid = current_tid();
+    let waiting: alloc::vec::Vec<Arc<PosixTimer>> = with_timers(tid, |reg| {
+        reg.iter()
+            .filter(|t| t.sigevent.sigev_signo as u32 == sig && t.inner.lock().ignored)
+            .cloned()
+            .collect()
+    })
+    .unwrap_or_default();
+    for t in waiting {
+        t.inner.lock().ignored = false;
+        t.queue_signal();
+    }
+}
+
+/// A SIGALRM of the current process was dequeued: an interval
+/// ITIMER_REAL that is not running rearms a whole number of periods
+/// on (Linux posixtimer_rearm_itimer)
+pub fn rearm_itimer_real() {
+    let tid = current_tid();
+    let Some(t) = with_timers(tid, |reg| reg.get(ITIMER_REAL_ID)).flatten() else {
+        return;
+    };
+    let mut i = t.inner.lock();
+    if i.interval_ns == 0 || i.armed {
+        return;
+    }
+    let now = i.clock.now();
+    let (_, next) = forward_now(i.expires_ns, i.interval_ns, now);
+    i.requeue = false;
+    if let Some(n) = next {
+        i.expires_ns = n;
+        i.armed = true;
+        t.timer().start(n, i.clock);
+    }
+}
+
 /// A CPU timer's remaining time and interval at clock value `now`
-fn cpu_value(inner: &PosixTimerInner, now: u64) -> ITimerSpec {
-    if !inner.armed {
+fn cpu_value(inner: &mut PosixTimerInner, now: u64) -> ITimerSpec {
+    forward_waiting(inner, now);
+    if !inner.armed && !inner.requeue {
         return ITimerSpec::default();
     }
     // A due timer not yet run reads as 1 ns left (Linux: never 0)
@@ -590,33 +791,64 @@ pub fn create_posix_timer(
         _ => cpu = Some(own_cpu_clock(clockid).ok_or(-22)?), // EINVAL
     }
 
-    let sev = sigevent.unwrap_or_default();
-
-    // Validate sigevent
+    // Linux good_sigevent: SIGEV_THREAD_ID names a thread of the
+    // caller's group; a signalling timer a valid signal (SIGEV_THREAD
+    // signals like SIGEV_SIGNAL: glibc runs its threads itself)
+    use sigev_notify::{SIGEV_NONE, SIGEV_SIGNAL, SIGEV_THREAD, SIGEV_THREAD_ID};
+    let mut sev = sigevent.unwrap_or(SigEvent {
+        sigev_signo: SIGALRM as i32,
+        ..SigEvent::default()
+    });
+    let default_value = sigevent.is_none();
     match sev.sigev_notify {
-        sigev_notify::SIGEV_SIGNAL | sigev_notify::SIGEV_NONE => {}
-        sigev_notify::SIGEV_THREAD => return Err(-22), // EINVAL - not supported
-        sigev_notify::SIGEV_THREAD_ID => {
-            // SIGEV_THREAD_ID requires a valid thread ID
-            // For now, allow it but the signal goes to owner_tid
+        SIGEV_THREAD_ID => {
+            let t = sev.sigev_notify_thread_id as Tid;
+            let same = crate::task::percpu::TASKLIST
+                .read()
+                .get(t)
+                .is_some_and(|v| v.task.pid == crate::task::percpu::current_pid());
+            if !same {
+                return Err(-22);
+            }
         }
+        SIGEV_SIGNAL | SIGEV_THREAD => sev.sigev_notify = SIGEV_SIGNAL,
+        SIGEV_NONE => {}
         _ => return Err(-22), // EINVAL
     }
-
-    // Allocate timer ID and create timer
-    let timer_id;
-    {
-        timer_id = with_timers(tid, |registry| {
-            let id = registry.alloc_id();
-            let t = PosixTimer::with_cpu(id, clockid, tid, sev, cpu, false)
-                .map_err(|e| e.to_errno_neg())?;
-            registry.add(t);
-            Ok::<_, i32>(id)
-        })
-        .ok_or(-11)??; // EAGAIN: no thread group; ENOMEM
+    if sev.sigev_notify != SIGEV_NONE && !(1..=64).contains(&sev.sigev_signo) {
+        return Err(-22);
     }
+    let owner = match sev.sigev_notify {
+        SIGEV_THREAD_ID => sev.sigev_notify_thread_id as Tid,
+        _ => tid,
+    };
 
-    Ok(timer_id)
+    // The id, then the timer and its signal entry outside the registry
+    // lock (Linux posixtimer_init_sigqueue: EAGAIN past
+    // RLIMIT_SIGPENDING), then the timer in the registry
+    let id = with_timers(tid, |reg| reg.alloc_id()).ok_or(-11)?;
+    if default_value {
+        // Linux: sival_int = the timer id
+        sev.sigev_value = u64::from(id as u32);
+    }
+    let t =
+        PosixTimer::with_cpu(id, clockid, owner, sev, cpu, false).map_err(|e| e.to_errno_neg())?;
+    if sev.sigev_notify != SIGEV_NONE {
+        let fields = crate::signal::SigFields::Timer {
+            tid: id,
+            overrun: 0,
+            value: sev.sigev_value,
+        };
+        let info = crate::signal::SigInfo::new(
+            sev.sigev_signo as u32,
+            crate::signal::si_code::SI_TIMER,
+            fields,
+        );
+        let q = SigQueue::alloc_timer(info, Arc::downgrade(&t)).ok_or(-11)?;
+        *t.sigq.lock() = Some(q);
+    }
+    with_timers(tid, |reg| reg.add(t)).ok_or(-11)?;
+    Ok(id)
 }
 
 /// CPU clock `clockid` if it is the caller's own process or one of its
