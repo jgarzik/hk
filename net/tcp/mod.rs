@@ -653,6 +653,9 @@ impl TcpSock {
                 ad.dport = dport;
             }
             self.sk.clear_shutdown();
+            // A new connection starts with no pending error (Linux
+            // tcp_connect_init)
+            self.sk.store_err(0);
             let mut c = cfg(&self.sk.net);
             c.syn_retries = self.syncnt(&g.cb.opts);
             let mut cb = TcpCb::new(c);
