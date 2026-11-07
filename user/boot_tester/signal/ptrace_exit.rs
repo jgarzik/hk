@@ -11,6 +11,8 @@
 //!   gives 0, not ECHILD) until its tracer reaps it (Linux
 //!   wait_task_zombie: EXIT_TRACE) or exits (__ptrace_detach); then the
 //!   real parent gets SIGCHLD and reaps it
+//! - PTRACE_EXITKILL: a tracee seized with PTRACE_O_EXITKILL dies of
+//!   SIGKILL when its tracer exits (Linux exit_ptrace)
 
 use crate::harness::verdict;
 use crate::helpers::{read_file, sleep_ms};
@@ -31,6 +33,45 @@ const ESRCH: i64 = -3;
 pub fn run_tests() {
     test_zombie_reap();
     test_real_parent_notify();
+    in_child(b"PTRACE_EXITKILL", exitkill);
+}
+
+/// PTRACE_EXITKILL: a middle process seizes its sleeping child with
+/// PTRACE_O_EXITKILL and exits; the child, reparented to this
+/// subreaper, is reaped killed by SIGKILL; 0, else the failed step
+fn exitkill() -> i32 {
+    const PTRACE_O_EXITKILL: u64 = 1 << 20;
+    sys_prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0);
+    let up = pipe();
+    let h = sys_fork();
+    if h == 0 {
+        let c = sys_fork();
+        if c == 0 {
+            loop {
+                sleep_ms(1000);
+            }
+        }
+        let r = sys_ptrace(PTRACE_SEIZE, c, 0, PTRACE_O_EXITKILL);
+        put(up[1], if r == 0 { c } else { -c });
+        sys_exit_group(0);
+    }
+    let c = get(up[0]);
+    let mut st = 0i32;
+    sys_wait4(h, &mut st, 0, 0);
+    close(&[up]);
+    if c <= 0 {
+        // -1: no word came; else the seize failed for child -c
+        if c < -1 {
+            kill_reap(-c);
+        }
+        return 1;
+    }
+    let (r, st) = reap_within(c, 0);
+    if r != c {
+        kill_reap(c);
+        return 2;
+    }
+    if st != SIGKILL as i32 { 3 } else { 0 }
 }
 
 #[repr(C, align(16))]
