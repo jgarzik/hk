@@ -229,7 +229,11 @@ impl Drop for Frozen {
     fn drop(&mut self) {
         let killed = {
             let mut table = TASKLIST.write();
-            let Some(mut t) = table.get_mut(self.0.tid()) else {
+            // The same task, not another that took its reused tid
+            let Some(mut t) = table
+                .get_mut(self.0.tid())
+                .filter(|t| core::ptr::eq(t.task, alloc::sync::Arc::as_ptr(&self.0)))
+            else {
                 return;
             };
             t.ptrace_frozen = false;
@@ -445,6 +449,7 @@ fn ptrace_detach(target_pid: Pid, signal: u32) -> i64 {
 
         // Clear tracing state
         target.ptrace = 0;
+        target.ptrace_frozen = false;
         target.ptracer = None;
         target.ptrace_options = 0;
         target.task.clear_tif(crate::task::tif::SYSCALL_TRACE);
@@ -473,6 +478,7 @@ fn ptrace_wake(tid: Tid, sig: u32) {
             return;
         }
         t.state = TaskState::Ready;
+        t.ptrace_frozen = false;
         t.ptrace_code = sig;
         table.task(tid)
     };
@@ -937,6 +943,7 @@ pub fn ptrace_stop(
             return (code, info);
         }
         t.state = TaskState::Traced(code as i32);
+        t.ptrace_frozen = false;
         t.ptrace_code = code;
         t.last_siginfo = info;
         // Asleep before the tracer can see the stop (Linux
@@ -981,6 +988,9 @@ pub fn ptrace_stop(
     // The stop's siginfo, as the tracer left it (Linux: last_siginfo
     // cleared after the stop)
     let info = t.last_siginfo.take();
+    // Out of the stop: nothing holds it (Linux clears
+    // JOBCTL_PTRACE_FROZEN with the stop)
+    t.ptrace_frozen = false;
     // Killed while stopped: no longer reported, nothing delivered
     if matches!(t.state, TaskState::Traced(_)) {
         t.state = TaskState::Ready;
@@ -1075,6 +1085,7 @@ pub fn exit_ptrace() {
             };
             let kill = t.ptrace_options & PTRACE_O_EXITKILL != 0;
             t.ptrace = 0;
+            t.ptrace_frozen = false;
             t.ptracer = None;
             t.ptrace_options = 0;
             t.task.clear_tif(crate::task::tif::SYSCALL_TRACE);

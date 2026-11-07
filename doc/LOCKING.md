@@ -1089,7 +1089,10 @@ signal_wake_up(fatal) clearing JOBCTL_TRACED), so a wait after the
 kill never reports the stop. A tracer's request holds the stop while it
 runs (`TaskInner.ptrace_frozen`, Linux JOBCTL_PTRACE_FROZEN): set under
 the write lock by `ptrace_check_attach` (in the stop, no SIGKILL
-pending), cleared under it when the request's `Frozen` guard drops;
+pending), cleared under it when the request's `Frozen` guard drops (if the
+listed task is still the same `Task`, not one that reused its tid),
+and whenever a stop begins or ends (resume, detach, the tracer's exit,
+the tracee leaving `ptrace_stop`), so no stale flag outlives a stop;
 while it is set, SIGKILL leaves the stop alone (`sigkill_task`, and the
 tracee, woken, sleeps `Uninterruptible` once it reads frozen with
 SIGKILL pending), and the guard's drop ends a stop with SIGKILL pending
