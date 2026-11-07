@@ -301,8 +301,7 @@ pub fn swap_off(path: &[u8]) -> i64 {
 }
 
 /// SwapFree comes within `tol` kB of `want` kB, waiting up to 2 s for
-/// writeback and deferred frees (Linux frees swap-cache slots after
-/// async writeback); the last value seen
+/// frees still in flight; the last value seen
 pub fn freeswap_within(want: i64, tol: i64) -> Result<i64, i64> {
     let ts = hk_syscall::Timespec {
         tv_sec: 0,

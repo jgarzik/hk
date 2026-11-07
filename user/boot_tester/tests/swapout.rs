@@ -8,6 +8,7 @@
 use super::helpers::{
     find_blkdev, freeswap_within, host_mode, print, print_num, println, proc_kb, swap_off, swap_on,
 };
+use super::preempt::ncpus_allowed;
 use hk_syscall::{
     MADV_COLD, MADV_PAGEOUT, MAP_ANONYMOUS, MAP_PRIVATE, MREMAP_FIXED, MREMAP_MAYMOVE, PROT_READ,
     PROT_WRITE, sys_exit, sys_fork, sys_madvise, sys_mmap, sys_mprotect, sys_mremap, sys_munmap,
@@ -19,6 +20,41 @@ const MIB: u64 = 1024 * 1024;
 const LEN: u64 = 16 * MIB;
 /// Slack in kB for SwapFree/VmSwap comparisons (a few pages)
 const TOL: i64 = 256;
+
+/// Linux's per-CPU swap slot caches in kB (mm/swap_slots.c, 64-slot
+/// SWAP_SLOTS_CACHE_SIZE): `slots` holds allocated-but-unused slots,
+/// already out of SwapFree (refill_swap_slots_cache takes 64 at a
+/// time), and `slots_ret` holds up to 64 freed slots before
+/// free_swap_slot hands them back. `caches` of them per CPU; hk keeps
+/// none
+fn slot_slack(caches: i64) -> i64 {
+    if host_mode() {
+        caches * 64 * 4 * ncpus_allowed() as i64
+    } else {
+        0
+    }
+}
+
+/// Wait up to 10 s for /proc/meminfo Writeback to drain. MADV_PAGEOUT
+/// only starts the writes: reclaim keeps a folio under writeback in
+/// the swap cache (Linux shrink_folio_list, PAGE_SUCCESS: `goto keep`),
+/// and while it stays there unmapping it cannot free its slot
+/// (folio_free_swap refuses a folio under writeback; free_swap_cache
+/// and free_swap_and_cache only try once). Nothing retries when the
+/// write ends: the slot stays taken by an orphan swap-cache folio until
+/// memory reclaim or swapoff. hk reports Writeback 0
+fn writeback_settle() {
+    let ts = hk_syscall::Timespec {
+        tv_sec: 0,
+        tv_nsec: 10_000_000,
+    };
+    for _ in 0..1000 {
+        if proc_kb(b"/proc/meminfo\0", b"Writeback:") <= 0 {
+            return;
+        }
+        hk_syscall::sys_nanosleep(&ts, core::ptr::null_mut());
+    }
+}
 
 fn verdict(name: &[u8], ok: bool, got: i64) {
     print(name);
@@ -112,7 +148,11 @@ fn pageout_cycle(base: i64) {
     let cold = sys_madvise(p, LEN, MADV_COLD);
     let r = sys_madvise(p, LEN, MADV_PAGEOUT);
     let want = base - (LEN / 1024) as i64;
-    let free = freeswap_within(want, TOL);
+    // SwapFree drops when a slot is allocated, before any write. Linux
+    // may hold up to 63 more per CPU in its slot caches, and skips a
+    // page still in another CPU's lru_add batch (madvise_cold_or_pageout
+    // _pte_range: !folio_test_lru; its lru_add_drain is local only)
+    let free = freeswap_within(want, slot_slack(1) + TOL);
     verdict(
         b"SWAPOUT_PAGEOUT",
         cold == 0 && r == 0 && free.is_ok(),
@@ -129,15 +169,15 @@ fn pageout_cycle(base: i64) {
     if q != 0 {
         let bad = check(q, LEN, 1);
         verdict(b"SWAPOUT_DATA", bad.is_none(), bad.map_or(0, |i| i as i64));
+        // The first MADV_PAGEOUT's writes done: the pages faulted back
+        // since are swap-cache pages that may still be under writeback
+        writeback_settle();
         // Partly out again (swap PTEs and swap-cache pages), then gone:
         // every slot comes back
         sys_madvise(q, MIB, MADV_PAGEOUT);
         sys_munmap(q, LEN);
     }
-    // Linux keeps up to 64 slots per CPU reserved in its swap slot
-    // caches (mm/swap_slots.c); hk gives every slot back
-    let tol = if host_mode() { 64 * 4 * 4 + TOL } else { TOL };
-    let free = freeswap_within(base, tol);
+    let free = freeswap_within(base, slot_slack(2) + TOL);
     verdict(
         b"SWAPOUT_MUNMAP_FREES",
         free.is_ok(),

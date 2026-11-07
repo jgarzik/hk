@@ -11,11 +11,6 @@ infallible, so each one is investigated, not written off.
   `check-linux-arm` run had two adjacent-nice spinners' CPU share off
   (`share a:b tenths got 26`); passed on the uncached rerun. Likely
   TCG timing noise in a ratio test; widen the tolerance if it recurs.
-- **SWAPOUT_PAGEOUT flaky on the Linux reference** (J): one x86
-  `check-linux` run had free swap 364 kB off the expected value after
-  MADV_PAGEOUT of 16 MiB (beyond the test's tolerance), passing on the
-  rerun. Linux's swap accounting after pageout is not exact (swap
-  cache); the tolerance may need to grow on Linux.
 - **RLIMIT_CPU_XCPU flaky on the x86 Linux reference**: one uncached
   `check-linux` run, run alongside `check-arm`, got `RLIMIT_CPU_XCPU:FAIL
   got 9` (SIGKILL where SIGXCPU was expected first); passed on rerun.
