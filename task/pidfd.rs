@@ -57,19 +57,16 @@ impl Pidfd {
         &self.pid
     }
 
-    pub fn is_exited(&self) -> bool {
-        self.pid.exited().is_some()
-    }
-
+    /// Readable once its task exited, its whole group if it leads one;
+    /// hung up too once it is released (Linux pidfd_poll)
     pub fn poll(&self, pt: Option<&mut PollTable<'_>>) -> u16 {
         if let Some(poll_table) = pt {
             poll_table.poll_wait(&self.pid.wait_pidfd);
         }
-        if self.is_exited() {
-            // Process has exited - return readable + hangup
-            POLLIN | POLLRDNORM | POLLHUP
-        } else {
-            0
+        match crate::task::percpu::pidfd_exited(&self.pid) {
+            None => POLLIN | POLLRDNORM | POLLHUP,
+            Some(true) => POLLIN | POLLRDNORM,
+            Some(false) => 0,
         }
     }
 }

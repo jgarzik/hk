@@ -967,6 +967,9 @@ impl GlobalTaskTable {
             && let Some(p) = &inner.thread_pid
         {
             p.set_task(core::ptr::null());
+            // Its pidfd pollers see it gone (Linux __unhash_process:
+            // wake_up_all under tasklist_lock)
+            p.wait_pidfd.wake_all();
         }
         if release {
             self.release_pids(&t);
@@ -2853,36 +2856,20 @@ fn with_entry<R>(mut f: impl FnMut(&mut GlobalTaskTable, &mut Entry) -> Result<R
 // Not inlined: its send path's stack is used only for the call, not
 // added to exit_current's frame for the rest of the exit
 #[inline(never)]
-fn exit_notify(tid: Tid, status: i32, group_dead: bool) {
-    let r = with_entry(|table, entry| exit_locked(table, entry, tid, status, group_dead));
-    let Some(Exited { pidfd, done }) = r else {
-        return;
-    };
-    // Pidfd pollers first, then whoever takes the signal (Linux
-    // do_notify_parent: do_notify_pidfd before the send)
-    if let Some(p) = pidfd {
-        p.exit_wake();
+fn exit_notify(tid: Tid, status: i32) {
+    if let Some(done) = with_entry(|table, entry| exit_locked(table, entry, tid, status)) {
+        done.finish();
     }
-    done.finish();
 }
 
-/// What [`exit_locked`] leaves for after TASKLIST: the `Pid` whose
-/// pidfd pollers are to wake, and what it released
-struct Exited {
-    pidfd: Option<Arc<crate::task::pid::Pid>>,
-    done: Unhashed,
-}
-
-/// [`exit_notify`]'s TASKLIST write section for task `tid`, the last
-/// of its process if `group_dead`; `Err(z)`: an entry for zombie `z`'s
-/// notice is needed first
+/// [`exit_notify`]'s TASKLIST write section for task `tid`; `Err(z)`:
+/// an entry for zombie `z`'s notice is needed first
 fn exit_locked(
     table: &mut GlobalTaskTable,
     entry: &mut Entry,
     tid: Tid,
     status: i32,
-    group_dead: bool,
-) -> Result<Option<Exited>, Zombie> {
+) -> Result<Option<Unhashed>, Zombie> {
     let Some(t) = table.get(tid) else {
         return Ok(None);
     };
@@ -2904,22 +2891,19 @@ fn exit_locked(
         t.exit_code = status;
         t.state = TaskState::Zombie(status);
     }
-    let pidfd = if group_dead {
-        mark_pidfd(table, pid, status)
-    } else {
-        None
-    };
-    let done = if stays {
-        let (told, gone) = tell(table, teller, entry);
-        Unhashed {
-            thread: None,
-            told,
-            gone,
-        }
-    } else {
-        unhash_thread(table, tid, teller, entry)
-    };
-    Ok(Some(Exited { pidfd, done }))
+    if !stays {
+        // An untraced thread's pidfd pollers (Linux exit_notify:
+        // do_notify_pidfd for an untraced sub-thread); its removal
+        // wakes them again
+        notify_pidfd(table, tid);
+        return Ok(Some(unhash_thread(table, tid, teller, entry)));
+    }
+    let (told, gone) = tell(table, teller, entry);
+    Ok(Some(Unhashed {
+        thread: None,
+        told,
+        gone,
+    }))
 }
 
 /// What a TASKLIST write section that released zombies leaves for
@@ -3056,19 +3040,29 @@ fn traced_zombie(table: &GlobalTaskTable, me: &Task) -> Option<(Tid, Pid, bool, 
         .map(|t| (t.task.tid(), t.task.pid, t.leader, t.task.ppid()))
 }
 
-/// Process `pid` exited with `status` (its last thread): its pidfds see
-/// it before its parent is told (Linux do_notify_pidfd in
-/// do_notify_parent), marked on its leader's `Pid` while the leader is
-/// listed, never found by a number an autoreap may unhash or reuse;
-/// that `Pid`, for its pollers' wakeup after TASKLIST
-fn mark_pidfd(
-    table: &GlobalTaskTable,
-    pid: Pid,
-    status: i32,
-) -> Option<Arc<crate::task::pid::Pid>> {
-    let p = table.get(pid)?.thread_pid.clone()?;
-    p.set_exited(status);
-    Some(p)
+/// Wake the pidfd pollers of zombie `tid` (Linux do_notify_pidfd,
+/// under tasklist_lock): it exited, so a poll may now see it readable
+/// ([`pidfd_exited`])
+pub fn notify_pidfd(table: &GlobalTaskTable, tid: Tid) {
+    if let Some(p) = table.get(tid).and_then(|t| t.thread_pid.clone()) {
+        p.wait_pidfd.wake_poll(u32::from(
+            crate::io::poll::POLLIN | crate::io::poll::POLLRDNORM,
+        ));
+    }
+}
+
+/// What a pidfd poll sees of the task `pid` names (Linux pidfd_poll,
+/// with TASKLIST's read lock for its RCU read side): None once it is
+/// released; Some(true) once it is a zombie, unless it leads a group
+/// with another thread still listed (delay_group_leader: a thread
+/// still running or exiting, or a traced zombie its tracer has not
+/// reaped)
+pub fn pidfd_exited(pid: &crate::task::pid::Pid) -> Option<bool> {
+    let table = TASKLIST.read();
+    let tid = table.pid_tid(pid)?;
+    let t = table.get(tid)?;
+    let delayed = t.leader && group_pending(&table, t.task.pid, &[tid]);
+    Some(matches!(t.state, TaskState::Zombie(_)) && !delayed)
 }
 
 /// Thread `tid` of process `pid` is the last but its zombie leader:
@@ -3136,7 +3130,6 @@ fn release(gone: Option<Reaped>) {
 /// runs on its resources.
 pub fn exit_current(status: Option<i32>) -> ! {
     let tid = current_tid();
-    let mut group_dead = true;
 
     // Release the task's resources first, without the rq lock: these paths
     // take sleeping-context locks and may wake other tasks (futex CLEARTID,
@@ -3150,7 +3143,7 @@ pub fn exit_current(status: Option<i32>) -> ! {
         // Exactly one thread, the one taking the group's live count to
         // zero, does the group-level exit work (Linux do_exit:
         // group_dead = atomic_dec_and_test(&signal->live))
-        group_dead =
+        let group_dead =
             crate::signal::get_task_signal_struct(tid).is_none_or(|s| s.thread_exiting(status));
 
         // Nothing reaps orphans or keeps userspace going without the
@@ -3250,7 +3243,7 @@ pub fn exit_current(status: Option<i32>) -> ! {
         crate::cgroup::detach_task(tid);
     }
     if let Some(st) = status {
-        exit_notify(tid, st, group_dead);
+        exit_notify(tid, st);
     }
 
     // Let a parent sleeping in wait4/waitid re-check for zombies

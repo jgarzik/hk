@@ -303,6 +303,8 @@ impl Told {
 /// is pending, and a parent its signal wakes finds it.
 pub fn notify(table: &GlobalTaskTable, z: Zombie, mut entry: Entry) -> Told {
     let tid = z.tid();
+    // Its pidfd pollers first (Linux do_notify_parent: do_notify_pidfd)
+    crate::task::percpu::notify_pidfd(table, tid);
     let Some(r) = receiver(table, z) else {
         return Told {
             entry,

@@ -12,13 +12,18 @@
 //! - Test waitid with P_PIDFD
 //! - Test pidfd_getfd to get own fd via pidfd
 //! - Test pidfd_getfd with invalid flags returns EINVAL
+//! - PIDFD_POLL_GROUP: a process whose leader exits first is not
+//!   readable while another thread (here a traced zombie) is listed;
+//!   readable once that one is reaped, POLLHUP once the process is
+//!   (Linux pidfd_poll: delay_group_leader, no task)
 
 use crate::harness::{fail_num, pass, verdict};
-use crate::helpers::{print, print_num, println};
+use crate::helpers::{linux_at_least, print, print_num, println};
+use crate::mm::fork_mm::spawn_thread;
 use hk_syscall::{
-    P_PIDFD, POLLIN, PollFd, SigInfo, WEXITED, sys_close, sys_exit, sys_exit_group, sys_fork,
-    sys_getpid, sys_open, sys_pidfd_getfd, sys_pidfd_open, sys_pidfd_send_signal, sys_pipe2,
-    sys_poll, sys_read, sys_rt_sigaction, sys_wait4, sys_waitid,
+    P_PIDFD, POLLHUP, POLLIN, PollFd, SigInfo, WEXITED, sys_close, sys_exit, sys_exit_group,
+    sys_fork, sys_getpid, sys_open, sys_pidfd_getfd, sys_pidfd_open, sys_pidfd_send_signal,
+    sys_pipe2, sys_poll, sys_ptrace, sys_read, sys_rt_sigaction, sys_wait4, sys_waitid, sys_write,
 };
 
 /// Run all pidfd tests
@@ -33,6 +38,110 @@ pub fn run_tests() {
     test_waitid_p_pidfd();
     test_pidfd_getfd_self();
     test_pidfd_getfd_invalid_flags();
+    test_pidfd_poll_group();
+}
+
+#[repr(C, align(16))]
+struct Stack([u8; 16384]);
+static mut STACK: Stack = Stack([0; 16384]);
+static mut CTID: u32 = 0;
+
+/// Start `f(arg)` as a second thread of this process: its tid
+fn start(f: extern "C" fn(u64) -> !, arg: u64) -> i64 {
+    let top = unsafe { (&raw mut STACK as *mut u8).add(16384) as u64 };
+    // Nonzero until the thread's exit clears it (no CLONE_CHILD_SETTID)
+    unsafe { core::ptr::write_volatile(&raw mut CTID, 1) };
+    unsafe { spawn_thread(top, f, arg, &raw mut CTID) }
+}
+
+/// Read a byte from `fd`, then exit the thread with status 3
+extern "C" fn exit3_after(fd: u64) -> ! {
+    let mut c = [0u8; 1];
+    sys_read(fd, c.as_mut_ptr(), 1);
+    sys_exit(3)
+}
+
+/// The events of `fd` within `ms` (0 on timeout)
+fn poll_in(fd: i64, ms: i32) -> i16 {
+    let mut fds = [PollFd {
+        fd: fd as i32,
+        events: POLLIN,
+        revents: 0,
+    }];
+    if sys_poll(fds.as_mut_ptr(), 1, ms) == 1 {
+        fds[0].revents
+    } else {
+        0
+    }
+}
+
+/// PIDFD_POLL_GROUP, in a helper process (it traces its child's thread)
+fn test_pidfd_poll_group() {
+    let h = sys_fork();
+    if h == 0 {
+        sys_exit_group(poll_group() as u64);
+    }
+    let mut st = 0i32;
+    sys_wait4(h, &mut st, 0, 0);
+    verdict(b"PIDFD_POLL_GROUP", st == 0, i64::from(st));
+}
+
+/// [`test_pidfd_poll_group`]'s helper: its child's second thread,
+/// traced from here, exits, then the child's leader; 0 if the pidfd
+/// becomes readable only once the thread is reaped, and hangs up once
+/// the child is; else the failed step
+fn poll_group() -> i32 {
+    const PTRACE_SEIZE: i64 = 0x4206;
+    const WALL: i32 = 0x4000_0000;
+    let mut tids = [0i32; 2];
+    let mut block = [0i32; 2];
+    let mut lead = [0i32; 2];
+    sys_pipe2(tids.as_mut_ptr(), 0);
+    sys_pipe2(block.as_mut_ptr(), 0);
+    sys_pipe2(lead.as_mut_ptr(), 0);
+    let c = sys_fork();
+    if c == 0 {
+        let t = [start(exit3_after, block[0] as u64)];
+        sys_write(tids[1] as u64, t.as_ptr() as *const u8, 8);
+        let mut b = [0u8; 1];
+        sys_read(lead[0] as u64, b.as_mut_ptr(), 1);
+        // The leader alone: the thread is still listed
+        sys_exit(0);
+    }
+    let pidfd = sys_pidfd_open(c as i32, 0);
+    let mut t = [0i64; 1];
+    sys_read(tids[0] as u64, t.as_mut_ptr() as *mut u8, 8);
+    let seized = sys_ptrace(PTRACE_SEIZE, t[0], 0, 0);
+    sys_write(block[1] as u64, b"t".as_ptr(), 1);
+    sys_write(lead[1] as u64, b"l".as_ptr(), 1);
+    let r = if pidfd < 0 || t[0] <= 0 || seized != 0 {
+        1
+    } else if poll_in(pidfd, 300) != 0 {
+        // Leader exited, traced zombie thread still listed
+        2
+    } else {
+        let mut st = 0i32;
+        let w = sys_wait4(t[0], &mut st, WALL, 0);
+        let ev = poll_in(pidfd, 2000);
+        if w != t[0] {
+            3
+        } else if ev & POLLIN == 0 || ev & POLLHUP != 0 {
+            4
+        } else {
+            sys_wait4(c, &mut st, 0, 0);
+            let ev = poll_in(pidfd, 0);
+            // POLLHUP for a reaped process since Linux 6.9
+            let hup = !linux_at_least(6, 9) || ev & POLLHUP != 0;
+            if ev & POLLIN == 0 || !hup { 5 } else { 0 }
+        }
+    };
+    if r != 0 {
+        // The traced thread first: the child is not reaped before it
+        hk_syscall::sys_kill(c, 9);
+        sys_wait4(t[0], core::ptr::null_mut(), WALL, 0);
+        sys_wait4(c, core::ptr::null_mut(), 0, 0);
+    }
+    r
 }
 
 /// Test pidfd_open for current process

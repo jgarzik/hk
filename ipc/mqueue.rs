@@ -378,8 +378,10 @@ impl MqQueue {
             // The registrant's authority, not the sender's (Linux
             // __do_notify sends without the kill permission check), and
             // only to the process that registered: not after it exited
-            // or exec'd; signal 0 sends nothing
-            let live = n.owner.exited().is_none() && n.owner.exec_gen() == n.exec_gen;
+            // or exec'd (Linux __do_notify: pid_task and self_exec_id;
+            // a released process has no task to send to); signal 0
+            // sends nothing
+            let live = n.owner.exec_gen() == n.exec_gen;
             let sig = n.sigev_signo as u32;
             if n.sigev_notify == SIGEV_SIGNAL && live && sig != 0 {
                 let info = mesgq_info(sig, n.sigev_value);

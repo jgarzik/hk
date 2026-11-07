@@ -21,7 +21,7 @@ use crate::util::error::KernelError;
 use crate::util::kalloc::{arc_nofail, box_nofail, try_arc, try_box};
 use alloc::boxed::Box;
 use alloc::sync::{Arc, Weak};
-use core::sync::atomic::{AtomicBool, AtomicI64, AtomicPtr, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
 use crate::ns::PidNamespace;
 use crate::sync::spin::Mutex;
@@ -70,11 +70,9 @@ pub struct Pid {
     /// The session whose id this is, likewise (Linux
     /// pid->tasks[PIDTYPE_SID]; links `Task.session_link`)
     pub(crate) session: TableCell<List<SessionLink>>,
-    /// pidfd pollers of the process this pid leads (Linux wait_pidfd)
+    /// pidfd pollers of the task it names (Linux wait_pidfd): woken
+    /// under TASKLIST when it exits and when it is released
     pub wait_pidfd: crate::sync::waitqueue::WaitQueue,
-    /// The process's wait status once all its threads have exited;
-    /// ALIVE before
-    exit: AtomicI64,
     /// Execs the process it leads has done (Linux self_exec_id, which
     /// the leader carries): what it registered before an exec is not
     /// delivered after it
@@ -84,9 +82,6 @@ pub struct Pid {
     /// changed under PIDMAP_LOCK, which orders it
     hashed: AtomicBool,
 }
-
-/// `Pid.exit` of a process that still runs
-const ALIVE: i64 = i64::MIN;
 
 impl Pid {
     /// The global number (root namespace): the tid
@@ -100,12 +95,6 @@ impl Pid {
         core::ptr::eq(Arc::as_ptr(&u.ns), ns).then_some(u.nr)
     }
 
-    /// The process it leads has exited: its wait status
-    pub fn exited(&self) -> Option<i32> {
-        let v = self.exit.load(Ordering::Acquire);
-        (v != ALIVE).then_some(v as i32)
-    }
-
     /// Execs of the process it leads
     pub fn exec_gen(&self) -> u64 {
         self.exec_gen.load(Ordering::Acquire)
@@ -114,21 +103,6 @@ impl Pid {
     /// The process it leads exec'd (its point of no return)
     pub fn exec_done(&self) {
         self.exec_gen.fetch_add(1, Ordering::AcqRel);
-    }
-
-    /// Its process has exited with `status` (the last thread's exit):
-    /// a pidfd poll sees it from now on. Marked under TASKLIST before
-    /// the exit's signal is queued (Linux do_notify_pidfd from
-    /// do_notify_parent); [`Pid::exit_wake`] wakes the pollers after.
-    pub fn set_exited(&self, status: i32) {
-        self.exit.store(i64::from(status), Ordering::Release);
-    }
-
-    /// Wake the pidfd pollers of a process [`Pid::set_exited`] marked
-    pub fn exit_wake(&self) {
-        self.wait_pidfd.wake_poll(u32::from(
-            crate::io::poll::POLLIN | crate::io::poll::POLLRDNORM,
-        ));
     }
 
     /// The task it names (null if none: not yet attached, or released)
@@ -341,7 +315,6 @@ pub fn alloc_pid_nr(ns: &Arc<PidNamespace>, root_nr: Option<u32>) -> Result<Arc<
         pgrp: TableCell::new(List::new()),
         session: TableCell::new(List::new()),
         wait_pidfd: crate::sync::waitqueue::WaitQueue::new(),
-        exit: AtomicI64::new(ALIVE),
         exec_gen: AtomicU64::new(0),
         hashed: AtomicBool::new(true),
     })?;
@@ -372,7 +345,6 @@ pub static INIT_STRUCT_PID: spin::Lazy<Arc<Pid>> = spin::Lazy::new(|| {
         pgrp: TableCell::new(List::new()),
         session: TableCell::new(List::new()),
         wait_pidfd: crate::sync::waitqueue::WaitQueue::new(),
-        exit: AtomicI64::new(ALIVE),
         exec_gen: AtomicU64::new(0),
         hashed: AtomicBool::new(false),
     })

@@ -482,14 +482,6 @@ tmpfs (doc/ROADMAP.md phase 6). Kernel code that resolves a path from a kernel t
 (knullfs); hk has none today, and has no scoped_with_init_fs for one
 that would need init's root.
 
-## Thread-group exit gaps
-
-**Location**: `signal/mod.rs` (group exit), `task/exec.rs`
-de_thread
-
-- A pidfd polls readable when the leader exits, not when the whole
-  group is gone.
-
 ## No vDSO
 
 **Location**: `task/exec.rs`, `arch/aarch64/signal.rs`
