@@ -2511,6 +2511,7 @@ pub fn current_exiting() -> bool {
 /// Hand the current task's children to a new parent before it dies
 /// (Linux forget_original_parent): another live thread of its group,
 /// else the nearest PR_SET_CHILD_SUBREAPER ancestor, else init
+#[inline(never)]
 fn forget_original_parent() {
     let me = task_ref(&current());
     // Room for every child first: nothing allocates under TASKLIST
@@ -2579,6 +2580,9 @@ fn reparent_children(me: &TaskRef, moved: &mut Vec<TaskRef>) -> bool {
 /// non-leader thread is released, and if it was the last of a group
 /// whose leader is a zombie, the leader tells. A child the parent does
 /// not wait for is released at once (autoreap).
+// Not inlined: its send path's stack is used only for the call, not
+// added to exit_current's frame for the rest of the exit
+#[inline(never)]
 fn exit_notify(tid: Tid) {
     let (pid, leader, traced) = {
         let table = TASKLIST.read();

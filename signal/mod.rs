@@ -859,6 +859,7 @@ fn retarget(t: &TaskRef, which: SigSet) {
 
 /// The current thread starts its exit: group signals it would have
 /// taken go to another thread (Linux exit_signals)
+#[inline(never)]
 pub fn exit_signals() {
     let me = crate::task::percpu::current();
     if !me.sigpending() {
