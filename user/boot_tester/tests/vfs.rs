@@ -17,7 +17,7 @@ pub fn run_tests() {
     println(b"=== VFS Test Complete ===");
 }
 
-/// Test 1: Read /test.txt from ramfs
+/// Read /test.txt from ramfs
 fn test_read_file() {
     let path = b"/test.txt\0";
     let fd = sys_open(path.as_ptr(), O_RDONLY, 0);
@@ -43,7 +43,7 @@ fn test_read_file() {
     }
 }
 
-/// Test 2: Read /proc/version from procfs
+/// Read /proc/version from procfs
 fn test_read_proc_version() {
     let path = b"/proc/version\0";
     let fd = sys_open(path.as_ptr(), O_RDONLY, 0);
@@ -69,7 +69,7 @@ fn test_read_proc_version() {
     }
 }
 
-/// Test 3: List /proc directory
+/// List /proc directory
 fn test_list_proc_dir() {
     let path = b"/proc\0";
     let fd = sys_open(path.as_ptr(), O_RDONLY | O_DIRECTORY, 0);

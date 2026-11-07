@@ -1,13 +1,13 @@
 //! Sync tests
 //!
 //! Tests:
-//! - Test 63: sync() - synchronize all filesystems
-//! - Test 64: fsync() - synchronize a file's state to storage
-//! - Test 65: fsync() on invalid fd
-//! - Test 66: fdatasync() - synchronize file data to storage
-//! - Test 67: fdatasync() on invalid fd
-//! - Test 68: syncfs() - synchronize filesystem containing a file
-//! - Test 69: syncfs() on invalid fd
+//! - sync() - synchronize all filesystems
+//! - fsync() - synchronize a file's state to storage
+//! - fsync() on invalid fd
+//! - fdatasync() - synchronize file data to storage
+//! - fdatasync() on invalid fd
+//! - syncfs() - synchronize filesystem containing a file
+//! - syncfs() on invalid fd
 //! - Test: membarrier() - memory barrier syscall
 //! - Test: readahead() - file readahead syscall
 
@@ -197,7 +197,7 @@ fn test_dirty_sysctls() {
     }
 }
 
-/// Test 63: sync() - synchronize all filesystems
+/// sync() - synchronize all filesystems
 fn test_sync() {
     let ret = sys_sync();
     if ret == 0 {
@@ -208,7 +208,7 @@ fn test_sync() {
     }
 }
 
-/// Test 64: fsync() - synchronize a file's state to storage
+/// fsync() - synchronize a file's state to storage
 fn test_fsync() {
     let fsync_file = b"/fsync_test.txt\0";
     let fd = sys_open(fsync_file.as_ptr(), O_CREAT | O_WRONLY, 0o644);
@@ -232,7 +232,7 @@ fn test_fsync() {
     }
 }
 
-/// Test 65: fsync() on invalid fd should fail with EBADF
+/// fsync() on invalid fd should fail with EBADF
 fn test_fsync_ebadf() {
     let ret = sys_fsync(999);
     if ret == -9 {
@@ -244,7 +244,7 @@ fn test_fsync_ebadf() {
     }
 }
 
-/// Test 66: fdatasync() - synchronize file data to storage
+/// fdatasync() - synchronize file data to storage
 fn test_fdatasync() {
     let fdatasync_file = b"/fdatasync_test.txt\0";
     let fd = sys_open(fdatasync_file.as_ptr(), O_CREAT | O_WRONLY, 0o644);
@@ -268,7 +268,7 @@ fn test_fdatasync() {
     }
 }
 
-/// Test 67: fdatasync() on invalid fd should fail with EBADF
+/// fdatasync() on invalid fd should fail with EBADF
 fn test_fdatasync_ebadf() {
     let ret = sys_fdatasync(999);
     if ret == -9 {
@@ -280,7 +280,7 @@ fn test_fdatasync_ebadf() {
     }
 }
 
-/// Test 68: syncfs() - synchronize filesystem containing a file
+/// syncfs() - synchronize filesystem containing a file
 fn test_syncfs() {
     let syncfs_file = b"/syncfs_test.txt\0";
     let fd = sys_open(syncfs_file.as_ptr(), O_CREAT | O_WRONLY, 0o644);
@@ -304,7 +304,7 @@ fn test_syncfs() {
     }
 }
 
-/// Test 69: syncfs() on invalid fd should fail with EBADF
+/// syncfs() on invalid fd should fail with EBADF
 fn test_syncfs_ebadf() {
     let ret = sys_syncfs(999);
     if ret == -9 {

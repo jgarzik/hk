@@ -1,16 +1,16 @@
 //! Signal tests
 //!
 //! Tests:
-//! - Test 74: rt_sigprocmask() - get and set signal mask
-//! - Test 75: rt_sigpending() - get pending signals
-//! - Test 76: kill() signal 0 - check process exists
-//! - Test 77: kill() ESRCH - non-existent process
-//! - Test 78: tgkill() signal 0
+//! - rt_sigprocmask() - get and set signal mask
+//! - rt_sigpending() - get pending signals
+//! - kill() signal 0 - check process exists
+//! - kill() ESRCH - non-existent process
+//! - tgkill() signal 0
 //! - Test: tgkill() wrong tgid - thread group validation (ESRCH)
-//! - Test 79: tkill() signal 0
-//! - Test 80: rt_sigaction() - get default action
-//! - Test 81: rt_sigaction() EINVAL - invalid signal
-//! - Test 82: rt_sigaction() SIGKILL - can't change
+//! - tkill() signal 0
+//! - rt_sigaction() - get default action
+//! - rt_sigaction() EINVAL - invalid signal
+//! - rt_sigaction() SIGKILL - can't change
 //! - Test: CLONE_CLEAR_SIGHAND - reset handlers after clone
 //! - Test: rt_sigtimedwait() - wait for signal with timeout
 //! - Test: sigaltstack() - alternate signal stack
@@ -86,7 +86,7 @@ pub fn run_tests() {
     test_signal_handler_invocation();
 }
 
-/// Test 74: rt_sigprocmask() - get and set signal mask
+/// rt_sigprocmask() - get and set signal mask
 fn test_sigprocmask() {
     // Get current blocked mask
     let mut old_mask: u64 = 0;
@@ -124,7 +124,7 @@ fn test_sigprocmask() {
     }
 }
 
-/// Test 75: rt_sigpending() - get pending signals
+/// rt_sigpending() - get pending signals
 fn test_sigpending() {
     let mut pending: u64 = 0xFFFFFFFF; // Initialize to non-zero
     let ret = sys_rt_sigpending(&mut pending as *mut u64 as u64, 8);
@@ -139,7 +139,7 @@ fn test_sigpending() {
     }
 }
 
-/// Test 76: kill() with signal 0 - check process exists
+/// kill() with signal 0 - check process exists
 fn test_kill_sig0() {
     let pid = sys_getpid();
     let ret = sys_kill(pid, 0); // Signal 0 = check if process exists
@@ -151,7 +151,7 @@ fn test_kill_sig0() {
     }
 }
 
-/// Test 77: kill() to non-existent process should fail with ESRCH
+/// kill() to non-existent process should fail with ESRCH
 fn test_kill_esrch() {
     let ret = sys_kill(99999, 0); // Non-existent PID
     if ret == -3 {
@@ -163,7 +163,7 @@ fn test_kill_esrch() {
     }
 }
 
-/// Test 78: tgkill() with signal 0
+/// tgkill() with signal 0
 fn test_tgkill_sig0() {
     let pid = sys_getpid();
     let tid = sys_gettid();
@@ -197,7 +197,7 @@ fn test_tgkill_wrong_tgid() {
     }
 }
 
-/// Test 79: tkill() with signal 0
+/// tkill() with signal 0
 fn test_tkill_sig0() {
     let tid = sys_gettid();
     let ret = sys_tkill(tid, 0);
@@ -209,7 +209,7 @@ fn test_tkill_sig0() {
     }
 }
 
-/// Test 80: rt_sigaction() - get default action for SIGUSR1
+/// rt_sigaction() - get default action for SIGUSR1
 fn test_sigaction() {
     // Define a simple sigaction structure for testing
     // struct sigaction { u64 handler, u64 flags, u64 restorer, u64 mask }
@@ -253,7 +253,7 @@ fn test_sigaction_same_buffer() {
     }
 }
 
-/// Test 81: rt_sigaction() with invalid signal should fail
+/// rt_sigaction() with invalid signal should fail
 fn test_sigaction_einval() {
     let ret = sys_rt_sigaction(0, 0, 0, 8); // Signal 0 is invalid
     if ret == -22 {
@@ -265,7 +265,7 @@ fn test_sigaction_einval() {
     }
 }
 
-/// Test 82: rt_sigaction() on SIGKILL should fail
+/// rt_sigaction() on SIGKILL should fail
 fn test_sigaction_sigkill() {
     // Try to set a handler for SIGKILL (should fail)
     let new_action: [u64; 4] = [SIG_IGN, 0, 0, 0];

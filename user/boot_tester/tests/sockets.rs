@@ -844,7 +844,7 @@ fn test_sockopt_broadcast() {
 fn test_sockopt_linger() {
     let fd = sys_socket(AF_INET, SOCK_STREAM, 0);
     if fd < 0 {
-        println(b"SOCKOPT_LINGER:FAIL (socket)");
+        println(b"SOCKET_LINGER:FAIL (socket)");
         return;
     }
 
@@ -865,7 +865,7 @@ fn test_sockopt_linger() {
         print(b"setsockopt(SO_LINGER) failed: ");
         print_num(ret1);
         sys_close(fd as u64);
-        println(b"SOCKOPT_LINGER:FAIL");
+        println(b"SOCKET_LINGER:FAIL");
         return;
     }
 
@@ -891,9 +891,9 @@ fn test_sockopt_linger() {
     sys_close(fd as u64);
 
     if ret2 == 0 && get_linger.l_onoff == 1 && get_linger.l_linger == 5 {
-        println(b"SOCKOPT_LINGER:OK");
+        println(b"SOCKET_LINGER:OK");
     } else {
-        println(b"SOCKOPT_LINGER:FAIL");
+        println(b"SOCKET_LINGER:FAIL");
     }
 }
 

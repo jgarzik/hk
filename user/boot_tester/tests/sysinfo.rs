@@ -1,17 +1,17 @@
 //! System information tests
 //!
 //! Tests:
-//! - Test 70: uname() - get system identification
+//! - uname() - get system identification
 //! - TIMES_BASIC: times() - clock ticks and process times
-//! - Test 71: sethostname() - set hostname
-//! - Test 72: setdomainname() - set domain name
-//! - Test 73: sethostname() EINVAL - too long name
-//! - Test 74: clock_settime() - set realtime clock
-//! - Test 75: clock_settime() EINVAL - cannot set CLOCK_MONOTONIC
-//! - Test 76: clock_settime() EINVAL - invalid nsec value
+//! - sethostname() - set hostname
+//! - setdomainname() - set domain name
+//! - sethostname() EINVAL - too long name
+//! - clock_settime() - set realtime clock
+//! - clock_settime() EINVAL - cannot set CLOCK_MONOTONIC
+//! - clock_settime() EINVAL - invalid nsec value
 //! - CLOCK_SETTIME_STORM: clock_settime() racing the timer tick on CPU 0
-//! - Test 77: settimeofday() - set time
-//! - Test 78: settimeofday() EINVAL - invalid usec
+//! - settimeofday() - set time
+//! - settimeofday() EINVAL - invalid usec
 
 use super::helpers::{host_mode, print, print_cstr, print_num, println, starts_with};
 use super::sk::T;
@@ -41,7 +41,7 @@ pub fn run_tests() {
     test_settimeofday_invalid_usec();
 }
 
-/// Test 70: uname() - get system identification
+/// uname() - get system identification
 fn test_uname() {
     let mut uts = UtsName::default();
     let ret = sys_uname(&mut uts as *mut UtsName);
@@ -69,7 +69,7 @@ fn test_uname() {
     }
 }
 
-/// Test 71: sethostname() - set hostname
+/// sethostname() - set hostname
 fn test_sethostname() {
     let hostname = b"testhost";
     let ret = sys_sethostname(hostname.as_ptr(), hostname.len() as u64);
@@ -95,7 +95,7 @@ fn test_sethostname() {
     }
 }
 
-/// Test 72: setdomainname() - set domain name
+/// setdomainname() - set domain name
 fn test_setdomainname() {
     let domain = b"testdomain";
     let ret = sys_setdomainname(domain.as_ptr(), domain.len() as u64);
@@ -121,7 +121,7 @@ fn test_setdomainname() {
     }
 }
 
-/// Test 73: sethostname() with too-long name (should fail with EINVAL)
+/// sethostname() with too-long name (should fail with EINVAL)
 fn test_sethostname_einval() {
     // 65 bytes is > 64 (max length)
     let long_name = [b'x'; 65];
@@ -135,7 +135,7 @@ fn test_sethostname_einval() {
     }
 }
 
-/// Test 74: clock_settime() - set realtime clock
+/// clock_settime() - set realtime clock
 fn test_clock_settime_basic() {
     // Get current time
     let mut ts_before = Timespec {
@@ -183,7 +183,7 @@ fn test_clock_settime_basic() {
     }
 }
 
-/// Test 75: clock_settime() EINVAL - cannot set CLOCK_MONOTONIC
+/// clock_settime() EINVAL - cannot set CLOCK_MONOTONIC
 fn test_clock_settime_monotonic_fails() {
     let ts = Timespec {
         tv_sec: 1000,
@@ -199,7 +199,7 @@ fn test_clock_settime_monotonic_fails() {
     }
 }
 
-/// Test 76: clock_settime() EINVAL - invalid nsec value
+/// clock_settime() EINVAL - invalid nsec value
 fn test_clock_settime_invalid_nsec() {
     let ts = Timespec {
         tv_sec: 1000,
@@ -329,7 +329,7 @@ fn test_loadavg() {
     t.done();
 }
 
-/// Test 77: settimeofday() - set time
+/// settimeofday() - set time
 fn test_settimeofday_basic() {
     // Get current time
     let mut tv_before = Timeval {
@@ -377,7 +377,7 @@ fn test_settimeofday_basic() {
     }
 }
 
-/// Test 78: settimeofday() EINVAL - invalid usec
+/// settimeofday() EINVAL - invalid usec
 fn test_settimeofday_invalid_usec() {
     let tv = Timeval {
         tv_sec: 1000,

@@ -1,19 +1,19 @@
 //! Permission tests
 //!
 //! Tests:
-//! - Test 51: chmod() - change file permissions by path
-//! - Test 52: fchmod() - change file permissions by fd
-//! - Test 53: fchmod() on invalid fd
-//! - Test 54: chown() - change file ownership by path
-//! - Test 55: fchown() - change file ownership by fd
-//! - Test 56: fchown() on invalid fd
-//! - Test 57: lchown() - change symlink ownership
-//! - Test 58: chown() with -1 to keep existing value
-//! - Test 59: umask() - set file creation mask
-//! - Test 60: utimensat() - update file timestamps
-//! - Test 61: fchmodat2() - change file permissions with flags
-//! - Test 62: fchmodat2() with invalid flags
-//! - Test 63: chroot() - change root directory
+//! - chmod() - change file permissions by path
+//! - fchmod() - change file permissions by fd
+//! - fchmod() on invalid fd
+//! - chown() - change file ownership by path
+//! - fchown() - change file ownership by fd
+//! - fchown() on invalid fd
+//! - lchown() - change symlink ownership
+//! - chown() with -1 to keep existing value
+//! - umask() - set file creation mask
+//! - utimensat() - update file timestamps
+//! - fchmodat2() - change file permissions with flags
+//! - fchmodat2() with invalid flags
+//! - chroot() - change root directory
 
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
@@ -40,7 +40,7 @@ pub fn run_tests() {
     test_chroot();
 }
 
-/// Test 51: chmod() - change file permissions by path
+/// chmod() - change file permissions by path
 fn test_chmod() {
     let chmod_test_file = b"/chmod_test_file\0";
     // Create file with 0644 permissions using O_CREAT
@@ -78,7 +78,7 @@ fn test_chmod() {
     }
 }
 
-/// Test 52: fchmod() - change file permissions by fd
+/// fchmod() - change file permissions by fd
 fn test_fchmod() {
     let fchmod_test_file = b"/fchmod_test_file\0";
     // Create file with 0644 permissions
@@ -115,7 +115,7 @@ fn test_fchmod() {
     }
 }
 
-/// Test 53: fchmod() on invalid fd should fail with EBADF
+/// fchmod() on invalid fd should fail with EBADF
 fn test_fchmod_ebadf() {
     let ret = sys_fchmod(999, 0o755);
     if ret == -9 {
@@ -127,7 +127,7 @@ fn test_fchmod_ebadf() {
     }
 }
 
-/// Test 54: chown() - change file ownership by path
+/// chown() - change file ownership by path
 fn test_chown() {
     let chown_test_file = b"/chown_test_file\0";
     // Create test file
@@ -160,7 +160,7 @@ fn test_chown() {
     }
 }
 
-/// Test 55: fchown() - change file ownership by fd
+/// fchown() - change file ownership by fd
 fn test_fchown() {
     let fchown_test_file = b"/fchown_test_file\0";
     let fd = sys_open(fchown_test_file.as_ptr(), O_CREAT | O_RDWR, 0o644);
@@ -191,7 +191,7 @@ fn test_fchown() {
     }
 }
 
-/// Test 56: fchown() on invalid fd should fail with EBADF
+/// fchown() on invalid fd should fail with EBADF
 fn test_fchown_ebadf() {
     let ret = sys_fchown(999, 1000, 1000);
     if ret == -9 {
@@ -203,7 +203,7 @@ fn test_fchown_ebadf() {
     }
 }
 
-/// Test 57: lchown() - change symlink ownership (not target)
+/// lchown() - change symlink ownership (not target)
 fn test_lchown() {
     let lchown_target = b"/lchown_target\0";
     let lchown_link = b"/lchown_link\0";
@@ -243,7 +243,7 @@ fn test_lchown() {
     }
 }
 
-/// Test 58: chown() with -1 to keep existing value
+/// chown() with -1 to keep existing value
 fn test_chown_minus1() {
     let chown_minus1_file = b"/chown_minus1_test\0";
     let fd = sys_open(chown_minus1_file.as_ptr(), O_CREAT | O_WRONLY, 0o644);
@@ -277,7 +277,7 @@ fn test_chown_minus1() {
     }
 }
 
-/// Test 59: umask() - set file creation mask
+/// umask() - set file creation mask
 fn test_umask() {
     // Get the current umask (default should be 0o022)
     let old_mask = sys_umask(0o077);
@@ -296,7 +296,7 @@ fn test_umask() {
     }
 }
 
-/// Test 60: utimensat() - update file timestamps
+/// utimensat() - update file timestamps
 fn test_utimensat() {
     // Create a test file
     let utimensat_file = b"/utimensat_test.txt\0";
@@ -307,7 +307,7 @@ fn test_utimensat() {
     } else {
         sys_close(fd as u64);
 
-        // Test 1: Set specific timestamps
+        // Set specific timestamps
         let times: [Timespec; 2] = [
             Timespec {
                 tv_sec: 1000,
@@ -323,7 +323,7 @@ fn test_utimensat() {
             print(b"UTIMENSAT:FAIL: set times failed: ");
             print_num(ret);
         } else {
-            // Test 2: Use UTIME_NOW for atime, UTIME_OMIT for mtime
+            // Use UTIME_NOW for atime, UTIME_OMIT for mtime
             let times_now: [Timespec; 2] = [
                 Timespec {
                     tv_sec: 0,
@@ -339,7 +339,7 @@ fn test_utimensat() {
                 print(b"UTIMENSAT:FAIL: UTIME_NOW failed: ");
                 print_num(ret2);
             } else {
-                // Test 3: NULL times should set both to current time
+                // NULL times should set both to current time
                 let ret3 = sys_utimensat(-100, utimensat_file.as_ptr(), core::ptr::null(), 0);
                 if ret3 < 0 {
                     print(b"UTIMENSAT:FAIL: NULL times failed: ");
@@ -356,7 +356,7 @@ fn test_utimensat() {
 /// AT_FDCWD constant for *at syscalls
 const AT_FDCWD: i32 = -100;
 
-/// Test 61: fchmodat2() - change file permissions with flags
+/// fchmodat2() - change file permissions with flags
 fn test_fchmodat2() {
     let fchmodat2_file = b"/fchmodat2_test.txt\0";
 
@@ -396,7 +396,7 @@ fn test_fchmodat2() {
     sys_unlink(fchmodat2_file.as_ptr());
 }
 
-/// Test 62: fchmodat2() with invalid flags should return EINVAL
+/// fchmodat2() with invalid flags should return EINVAL
 fn test_fchmodat2_invalid_flags() {
     let fchmodat2_inv_file = b"/fchmodat2_inv_test.txt\0";
 
@@ -421,7 +421,7 @@ fn test_fchmodat2_invalid_flags() {
     sys_unlink(fchmodat2_inv_file.as_ptr());
 }
 
-/// Test 63: chroot() - change root directory
+/// chroot() - change root directory
 fn test_chroot() {
     // Note: chroot requires CAP_SYS_CHROOT (or root), which we have in boot_tester
     let chroot_dir = b"/chroot_test_dir\0";

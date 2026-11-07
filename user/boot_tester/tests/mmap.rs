@@ -1996,7 +1996,7 @@ fn test_mremap_einval() {
         return;
     }
 
-    // Test 1: new_len = 0 should fail
+    // new_len = 0 should fail
     let ret = sys_mremap(ptr as u64, 4096, 0, 0, 0);
     if ret != -22 {
         // EINVAL
@@ -2007,7 +2007,7 @@ fn test_mremap_einval() {
         return;
     }
 
-    // Test 2: MREMAP_FIXED without MREMAP_MAYMOVE should fail
+    // MREMAP_FIXED without MREMAP_MAYMOVE should fail
     let ret = sys_mremap(ptr as u64, 4096, 4096, MREMAP_FIXED, 0x100000);
     if ret != -22 {
         // EINVAL
@@ -2018,7 +2018,7 @@ fn test_mremap_einval() {
         return;
     }
 
-    // Test 3: unaligned old_addr should fail
+    // unaligned old_addr should fail
     let ret = sys_mremap(ptr as u64 + 1, 4096, 4096, 0, 0);
     if ret != -22 {
         // EINVAL

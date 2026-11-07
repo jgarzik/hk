@@ -25,7 +25,7 @@ pub fn run_tests() {
     println(b"=== Cgroup Test Complete ===");
 }
 
-/// Test 1: Mount cgroupfs at /sys/fs/cgroup (sysfs's mount point)
+/// Mount cgroupfs at /sys/fs/cgroup (sysfs's mount point)
 fn test_mount_cgroupfs() {
     let cgroup_path = b"/sys/fs/cgroup\0";
 
@@ -42,7 +42,7 @@ fn test_mount_cgroupfs() {
     }
 }
 
-/// Test 2: Read /proc/self/cgroup
+/// Read /proc/self/cgroup
 fn test_proc_self_cgroup() {
     let path = b"/proc/self/cgroup\0";
     let fd = sys_open(path.as_ptr(), O_RDONLY, 0);
@@ -69,7 +69,7 @@ fn test_proc_self_cgroup() {
     sys_close(fd as u64);
 }
 
-/// Test 3: Create a child cgroup via mkdir
+/// Create a child cgroup via mkdir
 fn test_create_cgroup() {
     let test_cgroup = b"/sys/fs/cgroup/test_cgroup\0";
     let ret = sys_mkdir(test_cgroup.as_ptr(), 0o755);
@@ -82,7 +82,7 @@ fn test_create_cgroup() {
     }
 }
 
-/// Test 4: Read control files
+/// Read control files
 fn test_read_control_files() {
     // Read cgroup.controllers
     let controllers_path = b"/sys/fs/cgroup/cgroup.controllers\0";
@@ -137,7 +137,7 @@ fn test_read_control_files() {
     }
 }
 
-/// Test 5: Write to pids.max
+/// Write to pids.max
 fn test_write_pids_max() {
     // First enable pids controller in subtree_control
     let subtree_control_path = b"/sys/fs/cgroup/cgroup.subtree_control\0";
@@ -187,7 +187,7 @@ fn test_write_pids_max() {
     }
 }
 
-/// Test 6: Cleanup - remove test cgroup
+/// Cleanup - remove test cgroup
 fn test_cleanup_cgroup() {
     let test_cgroup = b"/sys/fs/cgroup/test_cgroup\0";
     let ret = sys_rmdir(test_cgroup.as_ptr());

@@ -1,30 +1,30 @@
 //! File I/O tests
 //!
 //! Tests:
-//! - Test 22: writev() - gather write to stdout
-//! - Test 23: readv() - scatter read from file
-//! - Test 24: writev() with zero-length iovec
-//! - Test 25: readv() with invalid iovcnt
-//! - Test 26: pread64() - positioned read without changing file position
-//! - Test 27: pwrite64() - positioned write without changing file position
-//! - Test 28: preadv() - positioned scatter read without changing file position
-//! - Test 29: pwritev() - positioned gather write without changing file position
-//! - Test 30: fcntl(F_DUPFD) - duplicate fd to lowest available >= arg
-//! - Test 31: fcntl(F_GETFD/F_SETFD) - get/set fd flags (FD_CLOEXEC)
-//! - Test 32: fcntl(F_DUPFD_CLOEXEC) - duplicate with cloexec
-//! - Test 33: fcntl() with invalid fd returns -EBADF
-//! - Test 34: getrandom() - get random bytes
+//! - writev() - gather write to stdout
+//! - readv() - scatter read from file
+//! - writev() with zero-length iovec
+//! - readv() with invalid iovcnt
+//! - pread64() - positioned read without changing file position
+//! - pwrite64() - positioned write without changing file position
+//! - preadv() - positioned scatter read without changing file position
+//! - pwritev() - positioned gather write without changing file position
+//! - fcntl(F_DUPFD) - duplicate fd to lowest available >= arg
+//! - fcntl(F_GETFD/F_SETFD) - get/set fd flags (FD_CLOEXEC)
+//! - fcntl(F_DUPFD_CLOEXEC) - duplicate with cloexec
+//! - fcntl() with invalid fd returns -EBADF
+//! - getrandom() - get random bytes
 //! - GETRANDOM_STREAM: a 64KB read is whole and evenly spread
-//! - Test 35: getrandom() with invalid flags returns -EINVAL
-//! - Test 36: ioctl() with invalid fd returns -EBADF
-//! - Test 37: ioctl() on regular file returns -ENOTTY
-//! - Test 38: preadv2() - basic positioned scatter read with flags=0
-//! - Test 39: pwritev2() - basic positioned gather write with flags=0
-//! - Test 40: preadv2() with offset=-1 uses current file position
-//! - Test 41: pwritev2() with offset=-1 uses current file position
-//! - Test 42: pwritev2() with RWF_APPEND appends to file
-//! - Test 43: preadv2() with invalid flags returns -EOPNOTSUPP
-//! - Test 44: preadv2() with RWF_NOWAIT on ramfs returns -EOPNOTSUPP
+//! - getrandom() with invalid flags returns -EINVAL
+//! - ioctl() with invalid fd returns -EBADF
+//! - ioctl() on regular file returns -ENOTTY
+//! - preadv2() - basic positioned scatter read with flags=0
+//! - pwritev2() - basic positioned gather write with flags=0
+//! - preadv2() with offset=-1 uses current file position
+//! - pwritev2() with offset=-1 uses current file position
+//! - pwritev2() with RWF_APPEND appends to file
+//! - preadv2() with invalid flags returns -EOPNOTSUPP
+//! - preadv2() with RWF_NOWAIT on ramfs returns -EOPNOTSUPP
 //! - WRITE_OWN_MAP: a write sourced from a mapping of the page it writes
 //! - IOV_PARTIAL_FAULT: writev/readv stop at a bad segment with the
 //!   bytes done
@@ -106,7 +106,7 @@ pub fn run_tests() {
     test_ioctl_fioclex();
 }
 
-/// Test 22: writev() - gather write to stdout
+/// writev() - gather write to stdout
 fn test_writev() {
     let msg1 = b"Hello, ";
     let msg2 = b"writev ";
@@ -139,7 +139,7 @@ fn test_writev() {
     }
 }
 
-/// Test 23: readv() - scatter read from file
+/// readv() - scatter read from file
 fn test_readv() {
     let path = b"/test.txt\0";
     let fd = sys_open(path.as_ptr(), O_RDONLY, 0);
@@ -194,7 +194,7 @@ fn test_readv() {
     }
 }
 
-/// Test 24: writev() with zero-length iovec
+/// writev() with zero-length iovec
 fn test_writev_zero_len() {
     let msg_before = b"Before";
     let msg_after = b"After\n";
@@ -226,7 +226,7 @@ fn test_writev_zero_len() {
     }
 }
 
-/// Test 25: readv() with invalid iovcnt
+/// readv() with invalid iovcnt
 fn test_readv_invalid_iovcnt() {
     let ret_neg = sys_readv(0, core::ptr::null(), (-1i64) as u64);
     if ret_neg == -22 {
@@ -238,7 +238,7 @@ fn test_readv_invalid_iovcnt() {
     }
 }
 
-/// Test 26: pread64() - positioned read without changing file position
+/// pread64() - positioned read without changing file position
 fn test_pread64() {
     // Open /test.txt which contains "Hello from ramfs!" (17 bytes)
     let path = b"/test.txt\0";
@@ -305,7 +305,7 @@ fn test_pread64() {
     println(b"PREAD64:OK");
 }
 
-/// Test 27: pwrite64() - positioned write without changing file position
+/// pwrite64() - positioned write without changing file position
 fn test_pwrite64() {
     // Create a test file in root (ramfs)
     let path = b"/pwrite_test.txt\0";
@@ -395,7 +395,7 @@ fn test_pwrite64() {
     println(b"PWRITE64:OK");
 }
 
-/// Test 28: preadv() - positioned scatter read without changing file position
+/// preadv() - positioned scatter read without changing file position
 fn test_preadv() {
     // Open /test.txt which contains "Hello from ramfs!" (17 bytes)
     let path = b"/test.txt\0";
@@ -499,7 +499,7 @@ fn test_preadv() {
     println(b"PREADV:OK");
 }
 
-/// Test 29: pwritev() - positioned gather write without changing file position
+/// pwritev() - positioned gather write without changing file position
 fn test_pwritev() {
     // Create a test file
     let path = b"/pwritev_test.txt\0";
@@ -610,7 +610,7 @@ fn test_pwritev() {
     println(b"PWRITEV:OK");
 }
 
-/// Test 30: fcntl(F_DUPFD) - duplicate fd to lowest available >= arg
+/// fcntl(F_DUPFD) - duplicate fd to lowest available >= arg
 fn test_fcntl_dupfd() {
     // Open /test.txt
     let path = b"/test.txt\0";
@@ -669,7 +669,7 @@ fn test_fcntl_dupfd() {
     println(b"FCNTL_DUPFD:OK");
 }
 
-/// Test 31: fcntl(F_GETFD/F_SETFD) - get/set fd flags (FD_CLOEXEC)
+/// fcntl(F_GETFD/F_SETFD) - get/set fd flags (FD_CLOEXEC)
 fn test_fcntl_cloexec() {
     // Open /test.txt
     let path = b"/test.txt\0";
@@ -731,7 +731,7 @@ fn test_fcntl_cloexec() {
     println(b"FCNTL_CLOEXEC:OK");
 }
 
-/// Test 32: fcntl(F_DUPFD_CLOEXEC) - duplicate with cloexec
+/// fcntl(F_DUPFD_CLOEXEC) - duplicate with cloexec
 fn test_fcntl_dupfd_cloexec() {
     // Open /test.txt
     let path = b"/test.txt\0";
@@ -789,7 +789,7 @@ fn test_fcntl_dupfd_cloexec() {
     println(b"FCNTL_DUPFD_CLOEXEC:OK");
 }
 
-/// Test 33: fcntl() with invalid fd returns -EBADF
+/// fcntl() with invalid fd returns -EBADF
 fn test_fcntl_ebadf() {
     // Use a clearly invalid fd
     let ret = sys_fcntl(9999, F_GETFD, 0);
@@ -803,7 +803,7 @@ fn test_fcntl_ebadf() {
     }
 }
 
-/// Test 34: getrandom() - get random bytes
+/// getrandom() - get random bytes
 fn test_getrandom() {
     let mut buf = [0u8; 32];
 
@@ -855,7 +855,7 @@ fn test_getrandom() {
     println(b"GETRANDOM:OK");
 }
 
-/// Test 35: getrandom() with invalid flags returns -EINVAL
+/// getrandom() with invalid flags returns -EINVAL
 fn test_getrandom_einval() {
     let mut buf = [0u8; 8];
 
@@ -913,7 +913,7 @@ fn test_getrandom_stream() {
     }
 }
 
-/// Test 36: ioctl() with invalid fd returns -EBADF
+/// ioctl() with invalid fd returns -EBADF
 fn test_ioctl_ebadf() {
     // Use a clearly invalid fd
     let ret = sys_ioctl(9999, 0, 0);
@@ -927,7 +927,7 @@ fn test_ioctl_ebadf() {
     }
 }
 
-/// Test 37: ioctl() on regular file returns -ENOTTY
+/// ioctl() on regular file returns -ENOTTY
 fn test_ioctl_enotty() {
     // Open a regular file
     let path = b"/test.txt\0";
@@ -957,7 +957,7 @@ fn test_ioctl_enotty() {
 // preadv2/pwritev2 tests
 // =============================================================================
 
-/// Test 38: preadv2() - basic positioned scatter read with flags=0
+/// preadv2() - basic positioned scatter read with flags=0
 fn test_preadv2_basic() {
     // Open /test.txt which should contain "Hello from ramfs!"
     let path = b"/test.txt\0";
@@ -998,7 +998,7 @@ fn test_preadv2_basic() {
     println(b"PREADV2_BASIC:OK");
 }
 
-/// Test 39: pwritev2() - basic positioned gather write with flags=0
+/// pwritev2() - basic positioned gather write with flags=0
 fn test_pwritev2_basic() {
     // Create a test file
     let path = b"/pwritev2_test.txt\0";
@@ -1040,7 +1040,7 @@ fn test_pwritev2_basic() {
     println(b"PWRITEV2_BASIC:OK");
 }
 
-/// Test 40: preadv2() with offset=-1 uses current file position
+/// preadv2() with offset=-1 uses current file position
 fn test_preadv2_offset_minus_one() {
     let path = b"/test.txt\0";
     let fd = sys_open(path.as_ptr(), O_RDONLY, 0);
@@ -1090,7 +1090,7 @@ fn test_preadv2_offset_minus_one() {
     println(b"PREADV2_OFFSET_NEG1:OK");
 }
 
-/// Test 41: pwritev2() with offset=-1 uses current file position
+/// pwritev2() with offset=-1 uses current file position
 fn test_pwritev2_offset_minus_one() {
     let path = b"/pwritev2_neg1.txt\0";
     let fd = sys_open(path.as_ptr(), O_RDWR | O_CREAT | O_TRUNC, 0o644);
@@ -1146,7 +1146,7 @@ fn test_pwritev2_offset_minus_one() {
     println(b"PWRITEV2_OFFSET_NEG1:OK");
 }
 
-/// Test 42: pwritev2() with RWF_APPEND appends to file
+/// pwritev2() with RWF_APPEND appends to file
 fn test_pwritev2_rwf_append() {
     let path = b"/pwritev2_append.txt\0";
     let fd = sys_open(path.as_ptr(), O_RDWR | O_CREAT | O_TRUNC, 0o644);
@@ -1202,7 +1202,7 @@ fn test_pwritev2_rwf_append() {
     println(b"PWRITEV2_RWF_APPEND:OK");
 }
 
-/// Test 43: preadv2() with invalid flags returns -EOPNOTSUPP
+/// preadv2() with invalid flags returns -EOPNOTSUPP
 fn test_preadv2_invalid_flags() {
     let path = b"/test.txt\0";
     let fd = sys_open(path.as_ptr(), O_RDONLY, 0);
@@ -1235,7 +1235,7 @@ fn test_preadv2_invalid_flags() {
     }
 }
 
-/// Test 44: preadv2() with RWF_NOWAIT on a ramfs file is EOPNOTSUPP:
+/// preadv2() with RWF_NOWAIT on a ramfs file is EOPNOTSUPP:
 /// ramfs/tmpfs files lack FMODE_NOWAIT (Linux kiocb_set_rw_flags)
 fn test_preadv2_rwf_nowait() {
     let path = b"/test.txt\0";
@@ -1264,7 +1264,7 @@ fn test_preadv2_rwf_nowait() {
     }
 }
 
-/// Test 45: preadv2() with RWF_NOWAIT on empty pipe returns EAGAIN
+/// preadv2() with RWF_NOWAIT on empty pipe returns EAGAIN
 fn test_preadv2_rwf_nowait_pipe_eagain() {
     // Create a pipe
     let mut pipefds = [0i32; 2];
@@ -1309,7 +1309,7 @@ fn test_preadv2_rwf_nowait_pipe_eagain() {
 // statfs/fstatfs/statx tests
 // =============================================================================
 
-/// Test 46: statfs() on root filesystem
+/// statfs() on root filesystem
 fn test_statfs_root() {
     let mut buf: LinuxStatFs = unsafe { core::mem::zeroed() };
     let path = b"/\0";
@@ -1351,7 +1351,7 @@ fn test_statfs_root() {
     println(b"STATFS_ROOT:OK");
 }
 
-/// Test 47: statfs() on /proc filesystem
+/// statfs() on /proc filesystem
 fn test_statfs_proc() {
     let mut buf: LinuxStatFs = unsafe { core::mem::zeroed() };
     let path = b"/proc\0";
@@ -1377,7 +1377,7 @@ fn test_statfs_proc() {
     println(b"STATFS_PROC:OK");
 }
 
-/// Test 48: statfs() on nonexistent path returns -ENOENT
+/// statfs() on nonexistent path returns -ENOENT
 fn test_statfs_enoent() {
     let mut buf: LinuxStatFs = unsafe { core::mem::zeroed() };
     let path = b"/nonexistent_path_12345\0";
@@ -1393,7 +1393,7 @@ fn test_statfs_enoent() {
     }
 }
 
-/// Test 49: fstatfs() on open file descriptor
+/// fstatfs() on open file descriptor
 fn test_fstatfs() {
     // Open a file
     let path = b"/test.txt\0";
@@ -1427,7 +1427,7 @@ fn test_fstatfs() {
     println(b"FSTATFS:OK");
 }
 
-/// Test 50: statx() basic usage
+/// statx() basic usage
 fn test_statx_basic() {
     let mut buf: Statx = unsafe { core::mem::zeroed() };
     let path = b"/test.txt\0";
@@ -1472,7 +1472,7 @@ fn test_statx_basic() {
     println(b"STATX_BASIC:OK");
 }
 
-/// Test 51: statx() with AT_EMPTY_PATH on fd
+/// statx() with AT_EMPTY_PATH on fd
 fn test_statx_at_empty_path() {
     // Open a file
     let path = b"/test.txt\0";

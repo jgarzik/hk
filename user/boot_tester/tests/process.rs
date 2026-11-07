@@ -1,6 +1,6 @@
 //! Process tests
 //!
-//! Tests 4-21 covering:
+//! Covers:
 //! - getpid, nanosleep, clock_nanosleep
 //! - getppid, getpgid, getsid, setsid
 //! - clone, fork, vfork
@@ -94,7 +94,7 @@ pub fn run_tests() {
     test_set_tid_address();
 }
 
-/// Test 4: getpid syscall
+/// getpid syscall
 fn test_getpid() {
     let pid = sys_getpid();
     print(b"getpid() = ");
@@ -106,7 +106,7 @@ fn test_getpid() {
     }
 }
 
-/// Test 5: nanosleep syscall
+/// nanosleep syscall
 fn test_nanosleep() {
     let req = Timespec {
         tv_sec: 0,
@@ -121,7 +121,7 @@ fn test_nanosleep() {
     }
 }
 
-/// Test 6: clock_nanosleep syscall
+/// clock_nanosleep syscall
 fn test_clock_nanosleep() {
     let req = Timespec {
         tv_sec: 0,
@@ -136,7 +136,7 @@ fn test_clock_nanosleep() {
     }
 }
 
-/// Test 7: getppid syscall
+/// getppid syscall
 fn test_getppid() {
     let ppid = sys_getppid();
     print(b"getppid() = ");
@@ -149,7 +149,7 @@ fn test_getppid() {
     }
 }
 
-/// Test 8: getpgid syscall
+/// getpgid syscall
 fn test_getpgid() {
     let pgid = sys_getpgid(0);
     print(b"getpgid(0) = ");
@@ -162,7 +162,7 @@ fn test_getpgid() {
     }
 }
 
-/// Test 9: getsid syscall
+/// getsid syscall
 fn test_getsid() {
     let sid = sys_getsid(0);
     print(b"getsid(0) = ");
@@ -175,7 +175,7 @@ fn test_getsid() {
     }
 }
 
-/// Test 10: getpgid with explicit PID
+/// getpgid with explicit PID
 fn test_getpgid_explicit() {
     let pgid_explicit = sys_getpgid(1);
     print(b"getpgid(1) = ");
@@ -187,7 +187,7 @@ fn test_getpgid_explicit() {
     }
 }
 
-/// Test 11: getsid with explicit PID
+/// getsid with explicit PID
 fn test_getsid_explicit() {
     let sid_explicit = sys_getsid(1);
     print(b"getsid(1) = ");
@@ -199,7 +199,7 @@ fn test_getsid_explicit() {
     }
 }
 
-/// Test 12: getpgid with invalid PID
+/// getpgid with invalid PID
 fn test_getpgid_esrch() {
     let pgid_invalid = sys_getpgid(999);
     print(b"getpgid(999) = ");
@@ -212,7 +212,7 @@ fn test_getpgid_esrch() {
     }
 }
 
-/// Test 13: getsid with invalid PID
+/// getsid with invalid PID
 fn test_getsid_esrch() {
     let sid_invalid = sys_getsid(999);
     print(b"getsid(999) = ");
@@ -225,7 +225,7 @@ fn test_getsid_esrch() {
     }
 }
 
-/// Test 14: setsid: init (pgid 0) may create its own session once; after
+/// setsid: init (pgid 0) may create its own session once; after
 /// that it is a process group leader and a second setsid() fails EPERM
 fn test_setsid_eperm() {
     let first = sys_setsid();
@@ -241,7 +241,7 @@ fn test_setsid_eperm() {
     }
 }
 
-/// Test 15: clone(CLONE_VM) - thread creation
+/// clone(CLONE_VM) - thread creation
 fn test_clone() {
     const WNOHANG: i32 = 1;
     const WALL: i32 = 0x4000_0000; // __WALL
@@ -360,7 +360,7 @@ fn test_clone_settid() {
     }
 }
 
-/// Test 16: fork() - process creation with separate address space
+/// fork() - process creation with separate address space
 fn test_fork() {
     let fork_ret = sys_fork();
     if fork_ret < 0 {
@@ -398,7 +398,7 @@ fn test_fork() {
     }
 }
 
-/// Test 17: fork() memory isolation
+/// fork() memory isolation
 fn test_fork_memory_isolation() {
     static mut FORK_TEST_VAR: i32 = 100;
     let fork_test_var_ptr = core::ptr::addr_of_mut!(FORK_TEST_VAR);
@@ -433,7 +433,7 @@ fn test_fork_memory_isolation() {
     }
 }
 
-/// Test 18: vfork() - process creation with shared address space until exec/exit
+/// vfork() - process creation with shared address space until exec/exit
 fn test_vfork() {
     let vfork_ret = sys_vfork();
     if vfork_ret < 0 {
@@ -464,7 +464,7 @@ fn test_vfork() {
     }
 }
 
-/// Test 19: waitid() - alternative wait interface
+/// waitid() - alternative wait interface
 fn test_waitid() {
     let fork_ret3 = sys_fork();
     if fork_ret3 < 0 {
@@ -533,7 +533,7 @@ fn test_waitid() {
     }
 }
 
-/// Test 20: waitid with P_ALL - wait for any child
+/// waitid with P_ALL - wait for any child
 fn test_waitid_pall() {
     let fork_ret4 = sys_fork();
     if fork_ret4 < 0 {
@@ -609,7 +609,7 @@ fn test_wait4_wnowait_einval() {
     });
 }
 
-/// Test 21: execve() - execute a new program
+/// execve() - execute a new program
 fn test_execve() {
     let fork_ret5 = sys_fork();
     if fork_ret5 < 0 {
@@ -655,7 +655,7 @@ fn test_execve() {
     }
 }
 
-/// Test 22: getuid syscall
+/// getuid syscall
 fn test_getuid() {
     let uid = sys_getuid();
     print(b"getuid() = ");
@@ -668,7 +668,7 @@ fn test_getuid() {
     }
 }
 
-/// Test 23: geteuid syscall
+/// geteuid syscall
 fn test_geteuid() {
     let euid = sys_geteuid();
     print(b"geteuid() = ");
@@ -681,7 +681,7 @@ fn test_geteuid() {
     }
 }
 
-/// Test 24: getgid syscall
+/// getgid syscall
 fn test_getgid() {
     let gid = sys_getgid();
     print(b"getgid() = ");
@@ -694,7 +694,7 @@ fn test_getgid() {
     }
 }
 
-/// Test 25: getegid syscall
+/// getegid syscall
 fn test_getegid() {
     let egid = sys_getegid();
     print(b"getegid() = ");
@@ -707,7 +707,7 @@ fn test_getegid() {
     }
 }
 
-/// Test 26: clock_getres syscall
+/// clock_getres syscall
 fn test_clock_getres() {
     let mut ts = Timespec {
         tv_sec: 0,
@@ -748,7 +748,7 @@ fn test_clock_getres() {
     }
 }
 
-/// Test 27: time() syscall (x86_64 only)
+/// time() syscall (x86_64 only)
 #[cfg(target_arch = "x86_64")]
 fn test_time() {
     // Test with NULL pointer (just returns time)
@@ -763,7 +763,7 @@ fn test_time() {
     }
 }
 
-/// Test 28: getcpu syscall - get CPU and NUMA node
+/// getcpu syscall - get CPU and NUMA node
 fn test_getcpu() {
     let mut cpu: u32 = 0xFFFFFFFF;
     let mut node: u32 = 0xFFFFFFFF;
@@ -820,7 +820,7 @@ fn cpu_in_node(cpu: u32, node: u32) -> bool {
         })
 }
 
-/// Test 29: getcpu syscall with NULL pointers
+/// getcpu syscall with NULL pointers
 fn test_getcpu_null() {
     // Test with NULL pointers (should succeed per Linux API)
     let ret = sys_getcpu(core::ptr::null_mut(), core::ptr::null_mut());
@@ -833,7 +833,7 @@ fn test_getcpu_null() {
     }
 }
 
-/// Test 30: getpriority syscall - get current process priority
+/// getpriority syscall - get current process priority
 fn test_getpriority() {
     // Get priority of current process (who=0 means self)
     let prio = sys_getpriority(PRIO_PROCESS, 0);
@@ -850,7 +850,7 @@ fn test_getpriority() {
     }
 }
 
-/// Test 31: setpriority syscall - lower process priority (should succeed)
+/// setpriority syscall - lower process priority (should succeed)
 fn test_setpriority() {
     // First get current priority
     let old_prio = sys_getpriority(PRIO_PROCESS, 0);
@@ -913,7 +913,7 @@ fn test_setpriority_perm() {
     }
 }
 
-/// Test 32: getpriority with invalid PID returns ESRCH
+/// getpriority with invalid PID returns ESRCH
 fn test_getpriority_esrch() {
     // Try to get priority of non-existent process
     let prio = sys_getpriority(PRIO_PROCESS, 99999);
@@ -928,7 +928,7 @@ fn test_getpriority_esrch() {
     }
 }
 
-/// Test 33: setuid syscall - set user identity (as root, can change to any UID)
+/// setuid syscall - set user identity (as root, can change to any UID)
 fn test_setuid() {
     // Fork to avoid dropping privileges in the parent
     let pid = sys_fork();
@@ -977,7 +977,7 @@ fn test_setuid() {
     }
 }
 
-/// Test 34: setgid syscall - set group identity (as root, can change to any GID)
+/// setgid syscall - set group identity (as root, can change to any GID)
 fn test_setgid() {
     // Fork to avoid dropping privileges in the parent
     let pid = sys_fork();
@@ -1026,7 +1026,7 @@ fn test_setgid() {
     }
 }
 
-/// Test 35: getresuid syscall - get real, effective, and saved user IDs
+/// getresuid syscall - get real, effective, and saved user IDs
 fn test_getresuid() {
     let mut ruid: u32 = 0xdeadbeef;
     let mut euid: u32 = 0xdeadbeef;
@@ -1051,7 +1051,7 @@ fn test_getresuid() {
     }
 }
 
-/// Test 36: getresgid syscall - get real, effective, and saved group IDs
+/// getresgid syscall - get real, effective, and saved group IDs
 fn test_getresgid() {
     let mut rgid: u32 = 0xdeadbeef;
     let mut egid: u32 = 0xdeadbeef;
@@ -1076,7 +1076,7 @@ fn test_getresgid() {
     }
 }
 
-/// Test 37: setresuid syscall - set real, effective, and saved user IDs
+/// setresuid syscall - set real, effective, and saved user IDs
 fn test_setresuid() {
     // Fork to avoid dropping privileges in the parent
     let pid = sys_fork();
@@ -1126,7 +1126,7 @@ fn test_setresuid() {
     }
 }
 
-/// Test 38: setresgid syscall - set real, effective, and saved group IDs
+/// setresgid syscall - set real, effective, and saved group IDs
 fn test_setresgid() {
     // Fork to avoid dropping privileges in the parent
     let pid = sys_fork();
@@ -1176,7 +1176,7 @@ fn test_setresgid() {
     }
 }
 
-/// Test 39: setreuid syscall - set real and effective user IDs
+/// setreuid syscall - set real and effective user IDs
 fn test_setreuid() {
     // Fork to avoid dropping privileges in the parent
     let pid = sys_fork();
@@ -1227,7 +1227,7 @@ fn test_setreuid() {
     }
 }
 
-/// Test 40: setregid syscall - set real and effective group IDs
+/// setregid syscall - set real and effective group IDs
 fn test_setregid() {
     // Fork to avoid dropping privileges in the parent
     let pid = sys_fork();
@@ -1290,7 +1290,7 @@ fn in_child(f: fn()) {
     sys_wait4(pid, &mut status, 0, 0);
 }
 
-/// Test 41: setfsuid syscall - set filesystem UID
+/// setfsuid syscall - set filesystem UID
 fn test_setfsuid() {
     in_child(setfsuid_body);
 }
@@ -1336,7 +1336,7 @@ fn setfsuid_body() {
     println(b"SETFSUID:OK");
 }
 
-/// Test 42: setfsgid syscall - set filesystem GID
+/// setfsgid syscall - set filesystem GID
 fn test_setfsgid() {
     in_child(setfsgid_body);
 }
@@ -1373,7 +1373,7 @@ fn setfsgid_body() {
     println(b"SETFSGID:OK");
 }
 
-/// Test 43: sysinfo syscall - get system information
+/// sysinfo syscall - get system information
 ///
 /// Linux sysinfo struct layout (112 bytes):
 /// - offset 0: uptime (i64)
@@ -1400,7 +1400,7 @@ fn test_sysinfo() {
         return;
     }
 
-    // Test 1: Read uptime
+    // Read uptime
     let uptime = i64::from_ne_bytes([
         buffer[0], buffer[1], buffer[2], buffer[3], buffer[4], buffer[5], buffer[6], buffer[7],
     ]);
@@ -1409,14 +1409,14 @@ fn test_sysinfo() {
         return;
     }
 
-    // Test 2: Read procs (u16 at offset 80)
+    // Read procs (u16 at offset 80)
     let procs = u16::from_ne_bytes([buffer[80], buffer[81]]);
     if procs == 0 {
         println(b"SYSINFO:FAIL procs");
         return;
     }
 
-    // Test 3: Read mem_unit (u32 at offset 104)
+    // Read mem_unit (u32 at offset 104)
     let mem_unit = u32::from_ne_bytes([buffer[104], buffer[105], buffer[106], buffer[107]]);
     if mem_unit != 1 {
         println(b"SYSINFO:FAIL mem_unit");
@@ -1428,7 +1428,7 @@ fn test_sysinfo() {
 
 const RUSAGE_SELF: i32 = 0;
 
-/// Test 44: getrusage syscall - get resource usage (RUSAGE_SELF)
+/// getrusage syscall - get resource usage (RUSAGE_SELF)
 ///
 /// Linux rusage struct layout (144 bytes):
 /// - offset 0: ru_utime.tv_sec (i64)
@@ -1461,7 +1461,7 @@ fn test_getrusage() {
     println(b"GETRUSAGE:OK");
 }
 
-/// Test 45: getrusage syscall - test EINVAL for invalid who
+/// getrusage syscall - test EINVAL for invalid who
 #[inline(never)]
 fn test_getrusage_einval() {
     let mut buffer: [u8; 160] = [0; 160];
@@ -1545,7 +1545,7 @@ fn test_getrusage_times() {
 // Scheduling syscall tests
 // =============================================================================
 
-/// Test 46: sched_getscheduler syscall - get scheduling policy
+/// sched_getscheduler syscall - get scheduling policy
 #[inline(never)]
 fn test_sched_getscheduler() {
     // Get policy of current process (pid=0 means self)
@@ -1565,7 +1565,7 @@ fn test_sched_getscheduler() {
     }
 }
 
-/// Test 47: sched_getparam syscall - get scheduling parameters
+/// sched_getparam syscall - get scheduling parameters
 #[inline(never)]
 fn test_sched_getparam() {
     let mut param = SchedParam { sched_priority: -1 };
@@ -1589,7 +1589,7 @@ fn test_sched_getparam() {
     }
 }
 
-/// Test 48: sched_getaffinity syscall - get CPU affinity mask
+/// sched_getaffinity syscall - get CPU affinity mask
 #[inline(never)]
 fn test_sched_getaffinity() {
     let mut mask: u64 = 0;
@@ -1613,7 +1613,7 @@ fn test_sched_getaffinity() {
     }
 }
 
-/// Test 49: sched_setaffinity syscall - set CPU affinity mask
+/// sched_setaffinity syscall - set CPU affinity mask
 #[inline(never)]
 fn test_sched_setaffinity() {
     // First get current affinity
@@ -1651,7 +1651,7 @@ fn test_sched_setaffinity() {
     println(b"SCHED_SETAFFINITY:OK");
 }
 
-/// Test 50: sched_rr_get_interval syscall - get round-robin time quantum
+/// sched_rr_get_interval syscall - get round-robin time quantum
 #[inline(never)]
 fn test_sched_rr_get_interval() {
     let mut ts = Timespec {
@@ -1681,7 +1681,7 @@ fn test_sched_rr_get_interval() {
     }
 }
 
-/// Test 51: sched_getscheduler with invalid PID returns ESRCH
+/// sched_getscheduler with invalid PID returns ESRCH
 #[inline(never)]
 fn test_sched_getscheduler_esrch() {
     // Try to get scheduler of non-existent process
@@ -1701,7 +1701,7 @@ fn test_sched_getscheduler_esrch() {
 // Memory management syscall tests
 // =============================================================================
 
-/// Test 52: brk syscall - query current program break
+/// brk syscall - query current program break
 #[inline(never)]
 fn test_brk_query() {
     // brk(0) returns current program break
@@ -1717,7 +1717,7 @@ fn test_brk_query() {
     }
 }
 
-/// Test 53: brk syscall - expand heap
+/// brk syscall - expand heap
 #[inline(never)]
 fn test_brk_expand() {
     // Get current brk
@@ -1750,7 +1750,7 @@ fn test_brk_expand() {
     }
 }
 
-/// Test 54: brk syscall - shrink heap
+/// brk syscall - shrink heap
 #[inline(never)]
 fn test_brk_shrink() {
     // Get current brk
@@ -1783,7 +1783,7 @@ fn test_brk_shrink() {
 // I/O priority syscall tests
 // =============================================================================
 
-/// Test 55: ioprio_get/ioprio_set syscalls
+/// ioprio_get/ioprio_set syscalls
 #[inline(never)]
 fn test_ioprio_get_set() {
     // Set I/O priority to IOPRIO_CLASS_BE with level 4
@@ -1821,7 +1821,7 @@ fn test_ioprio_get_set() {
 // TLS syscall tests
 // =============================================================================
 
-/// Test 56: arch_prctl syscall (x86_64 only) - set/get FS base
+/// arch_prctl syscall (x86_64 only) - set/get FS base
 #[cfg(target_arch = "x86_64")]
 #[inline(never)]
 fn test_arch_prctl() {
@@ -1861,7 +1861,7 @@ fn test_arch_prctl() {
     sys_arch_prctl(ARCH_SET_FS, 0);
 }
 
-/// Test 57: set_tid_address syscall - set clear_child_tid pointer
+/// set_tid_address syscall - set clear_child_tid pointer
 ///
 /// This syscall sets the address that will receive 0 when the thread exits,
 /// and returns the caller's TID.
