@@ -882,11 +882,11 @@ Tag = roadmap phase (doc/ROADMAP.md).
 6. **One AnonVma per fork family, Vec chain** (J).
    `mm/anon_vma.rs:85`: O(N×VMAs) under one family write lock.
 7. **Syscalls report root-namespace pids** (C). A CLONE_NEWPID child
-   is numbered in its namespace; getpid, gettid, getppid and every pid
-   argument go through the caller's namespace (`pid::vnr`,
-   `from_vnr`, `find_task_by_vpid`), but they read
-   `Task::view_pid_ns`, the root namespace, until the reports
-   translate too (clone, wait, process groups, siginfo, SCM
+   is numbered in its namespace (clone3 set_tid too); getpid, gettid,
+   getppid, clone's results and every pid argument go through the
+   caller's namespace (`pid::vnr`, `from_vnr`, `find_task_by_vpid`),
+   but they read `Task::view_pid_ns`, the root namespace, until the
+   reports translate too (wait, process groups, siginfo, SCM
    credentials, /proc): a task must never get a number in one
    namespace that an argument reads in another.
 8. **MM_LIFE_EXEC_CHAIN flake** (arm64 CI, TCG, NIC=e1000):

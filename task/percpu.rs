@@ -1564,7 +1564,7 @@ pub fn can_sleep() -> bool {
 pub fn create_user_task(config: UserTaskConfig) -> Result<Tid, &'static str> {
     let cpu_id = crate::cpu::this_id();
     // init is pid 1 (Linux: the first pid of the root namespace)
-    let thread_pid = crate::task::pid::alloc_pid_nr(&crate::ns::INIT_PID_NS, Some(1))
+    let thread_pid = crate::task::pid::alloc_pid_nr(&crate::ns::INIT_PID_NS, &[1])
         .map_err(|_| "init: pid 1 taken")?;
     let (tid, pid): (Tid, Pid) = (1, 1);
     // The first address space owns the boot-built tables
@@ -2109,6 +2109,37 @@ pub struct CloneConfig {
     pub exit_signal: i32,
     /// Cgroup file descriptor (CLONE_INTO_CGROUP, clone3 only)
     pub cgroup_fd: i32,
+    /// clone3 set_tid: the child's number in the innermost
+    /// `set_tid_size` levels of its pid namespace, its own first
+    pub set_tid: [u32; crate::ns::pid::MAX_PID_NS_LEVEL as usize],
+    pub set_tid_size: usize,
+}
+
+impl CloneConfig {
+    /// No set_tid
+    pub const NO_SET_TID: [u32; crate::ns::pid::MAX_PID_NS_LEVEL as usize] =
+        [0; crate::ns::pid::MAX_PID_NS_LEVEL as usize];
+}
+
+/// clone3's set_tid numbers for a child in `ns` (Linux alloc_pid): no
+/// more than its levels and each a valid number (EINVAL), and the
+/// right to choose them (EPERM: CAP_CHECKPOINT_RESTORE or
+/// CAP_SYS_ADMIN, checkpoint_restore_ns_capable)
+fn check_set_tid(ns: &crate::ns::PidNamespace, set_tid: &[u32]) -> Result<(), i32> {
+    if set_tid.len() > ns.level as usize + 1 {
+        return Err(22); // EINVAL
+    }
+    for &nr in set_tid {
+        if !(1..crate::task::pid::PID_MAX_LIMIT).contains(&nr) {
+            return Err(22);
+        }
+        if !crate::task::capable(crate::task::CAP_CHECKPOINT_RESTORE)
+            && !crate::task::capable(crate::task::CAP_SYS_ADMIN)
+        {
+            return Err(1); // EPERM
+        }
+    }
+    Ok(())
 }
 
 /// Create a new thread/process via clone()
@@ -2303,7 +2334,10 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     // (Linux alloc_pid(p->nsproxy->pid_ns_for_children)); a new
     // process's pid is its tid (leader pid == tid), a thread keeps its
     // group's. EAGAIN with no number left, ENOMEM
-    let child_thread_pid = crate::task::pid::alloc_pid(&child_ns.pid_ns).map_err(|e| e.errno())?;
+    let set_tid = &config.set_tid[..config.set_tid_size];
+    check_set_tid(&child_ns.pid_ns, set_tid)?;
+    let child_thread_pid =
+        crate::task::pid::alloc_pid_nr(&child_ns.pid_ns, set_tid).map_err(|e| e.errno())?;
     let child_tid = Tid::from(child_thread_pid.nr());
     let child_pid = if config.flags & CLONE_THREAD != 0 {
         parent_pid
@@ -2575,11 +2609,16 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         .gsbase
         .store(crate::arch::read_user_gsbase(), Ordering::Relaxed);
 
+    // The child's number as the caller sees it, for the return value
+    // and CLONE_PARENT_SETTID, taken before it can run and be reaped
+    // (Linux kernel_clone: pid_vnr before wake_up_new_task)
+    let child_vnr = crate::task::pid::vnr(child_tid);
+
     // Handle CLONE_PARENT_SETTID: write child TID to parent's address space
     if config.flags & CLONE_PARENT_SETTID != 0 && config.parent_tidptr != 0 {
         use crate::arch::Uaccess;
         use crate::uaccess::put_user;
-        if put_user::<Uaccess, i32>(config.parent_tidptr, child_tid as i32).is_err() {
+        if put_user::<Uaccess, i32>(config.parent_tidptr, child_vnr as i32).is_err() {
             // Continue even if write fails - Linux does the same
             printkln!("CLONE: CLONE_PARENT_SETTID write failed");
         }
@@ -2590,10 +2629,12 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     // For fork (CLONE_VM not set), store for clone_child_entry to write in child's context.
     if config.flags & CLONE_CHILD_SETTID != 0 && config.child_tidptr != 0 {
         if config.flags & CLONE_VM != 0 {
-            // Shared address space - write directly
+            // Shared address space - write directly, the child's own
+            // number in its namespace (Linux schedule_tail writes it)
             use crate::arch::Uaccess;
             use crate::uaccess::put_user;
-            if put_user::<Uaccess, i32>(config.child_tidptr, child_tid as i32).is_err() {
+            let own = crate::task::pid::nr_ns(child_tid, child_task.view_pid_ns()) as i32;
+            if put_user::<Uaccess, i32>(config.child_tidptr, own).is_err() {
                 printkln!("CLONE: CLONE_CHILD_SETTID write failed");
             }
         } else {
@@ -2608,12 +2649,9 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         crate::task::set_clear_child_tid(child_tid, config.child_tidptr);
     }
 
-    // Determine return value before potential blocking
-    let return_value = if config.flags & CLONE_THREAD != 0 {
-        child_tid
-    } else {
-        child_pid
-    };
+    // The return value: the child's pid (a new process's pid is its
+    // tid), as the caller numbers it
+    let return_value = Tid::from(child_vnr);
 
     // CLONE_VFORK: the completion must be in place before the child can
     // run (it may exec or exit at once on another CPU; Linux
@@ -4249,7 +4287,10 @@ pub extern "C" fn write_child_tid_if_needed() {
     if let Some(addr) = crate::task::get_set_child_tid(tid) {
         use crate::arch::Uaccess;
         use crate::uaccess::put_user;
-        if put_user::<Uaccess, i32>(addr, tid as i32).is_err() {
+        // Its own number, in its namespace (Linux schedule_tail:
+        // task_pid_vnr(current))
+        let nr = crate::task::pid::vnr(tid) as i32;
+        if put_user::<Uaccess, i32>(addr, nr).is_err() {
             printkln!("CLONE: CLONE_CHILD_SETTID write failed in child");
         }
     }

@@ -35,7 +35,7 @@ const PER_PAGE: u32 = 4096 * 8;
 /// they wrap, so a freed number is not reused soon (raw tids still name
 /// tasks in places: ptrace and parent links until the tasklist
 /// conversion)
-const PID_MAX_LIMIT: u32 = 4 * 1024 * 1024;
+pub const PID_MAX_LIMIT: u32 = 4 * 1024 * 1024;
 /// After a wrap, numbers restart above these (Linux RESERVED_PIDS)
 const RESERVED_PIDS: u32 = 300;
 
@@ -275,7 +275,7 @@ fn bucket(ns: &PidNamespace, nr: u32) -> &'static AtomicPtr<UPid> {
 /// A new `Pid` in `ns` and each ancestor namespace (Linux alloc_pid);
 /// EAGAIN if a namespace has no number left, ENOMEM
 pub fn alloc_pid(ns: &Arc<PidNamespace>) -> Result<Arc<Pid>, KernelError> {
-    alloc_pid_nr(ns, None)
+    alloc_pid_nr(ns, &[])
 }
 
 /// The numbers taken so far, given back on an error
@@ -285,8 +285,11 @@ fn free_numbers(numbers: &[UPid]) {
     }
 }
 
-/// `alloc_pid` with the root number chosen (init: 1; EAGAIN if taken)
-pub fn alloc_pid_nr(ns: &Arc<PidNamespace>, root_nr: Option<u32>) -> Result<Arc<Pid>, KernelError> {
+/// `alloc_pid` with the numbers of the innermost `set_tid.len()`
+/// levels chosen, `ns`'s first (Linux alloc_pid's set_tid: clone3,
+/// init's 1): EEXIST if one is taken. The caller checked them (at most
+/// one per level, each in 1..PID_MAX_LIMIT).
+pub fn alloc_pid_nr(ns: &Arc<PidNamespace>, set_tid: &[u32]) -> Result<Arc<Pid>, KernelError> {
     let mut chain = alloc::vec::Vec::new();
     let mut n = Some(ns.clone());
     while let Some(cur) = n {
@@ -295,16 +298,22 @@ pub fn alloc_pid_nr(ns: &Arc<PidNamespace>, root_nr: Option<u32>) -> Result<Arc<
     }
     chain.reverse(); // root first
     let mut numbers = alloc::vec::Vec::with_capacity(chain.len());
+    let top = chain.len() - 1;
     for (level, ns) in chain.into_iter().enumerate() {
-        let nr = match root_nr {
-            Some(nr) if level == 0 => ns.map.take(nr).map(|t| t.then_some(nr)),
-            _ => ns.map.alloc(),
+        let chosen = set_tid.get(top - level).copied();
+        let nr = match chosen {
+            Some(nr) => ns.map.take(nr).map(|t| t.then_some(nr)),
+            None => ns.map.alloc(),
         };
         let nr = match nr {
             Ok(Some(nr)) => nr,
             Ok(None) => {
                 free_numbers(&numbers);
-                return Err(KernelError::WouldBlock);
+                return Err(if chosen.is_some() {
+                    KernelError::AlreadyExists
+                } else {
+                    KernelError::WouldBlock
+                });
             }
             Err(e) => {
                 free_numbers(&numbers);

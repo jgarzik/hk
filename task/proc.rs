@@ -103,6 +103,8 @@ pub fn sys_clone(
         pidfd_ptr,
         exit_signal,
         cgroup_fd: -1, // CLONE_INTO_CGROUP only supported via clone3
+        set_tid: super::percpu::CloneConfig::NO_SET_TID,
+        set_tid_size: 0,
     })
 }
 
@@ -136,6 +138,8 @@ pub fn sys_fork() -> i64 {
         pidfd_ptr: 0,
         exit_signal: crate::signal::SIGCHLD as i32, // fork sends SIGCHLD on exit
         cgroup_fd: -1,
+        set_tid: super::percpu::CloneConfig::NO_SET_TID,
+        set_tid_size: 0,
     })
 }
 
@@ -171,6 +175,8 @@ pub fn sys_vfork() -> i64 {
         pidfd_ptr: 0,
         exit_signal: crate::signal::SIGCHLD as i32, // vfork sends SIGCHLD on exit
         cgroup_fd: -1,
+        set_tid: super::percpu::CloneConfig::NO_SET_TID,
+        set_tid_size: 0,
     })
 }
 
@@ -529,7 +535,7 @@ pub struct CloneArgs {
     pub stack_size: u64,
     /// TLS pointer for child (CLONE_SETTLS)
     pub tls: u64,
-    /// Array of PIDs for set_tid feature (CLONE_SET_TID, not implemented)
+    /// The child's pid in each innermost level (an array of pid_t)
     pub set_tid: u64,
     /// Size of set_tid array
     pub set_tid_size: u64,
@@ -613,9 +619,24 @@ pub fn sys_clone3(uargs: u64, size: u64) -> i64 {
         -1
     };
 
-    // set_tid feature not supported
-    if args.set_tid != 0 || args.set_tid_size != 0 {
+    // set_tid: at most MAX_PID_NS_LEVEL numbers, a pointer exactly
+    // when a size (EINVAL), copied in now (EFAULT); checked against the
+    // child's namespace at clone (Linux copy_clone_args_from_user)
+    let size_ok = args.set_tid_size <= u64::from(crate::ns::pid::MAX_PID_NS_LEVEL);
+    if !size_ok || (args.set_tid == 0) != (args.set_tid_size == 0) {
         return KernelError::InvalidArgument.sysret();
+    }
+    let n = args.set_tid_size as usize;
+    let mut set_tid = CloneConfig::NO_SET_TID;
+    if n > 0 {
+        let mut b = [0u8; 4 * crate::ns::pid::MAX_PID_NS_LEVEL as usize];
+        if crate::uaccess::copy_from_user::<Uaccess>(&mut b[..n * 4], args.set_tid, n * 4).is_err()
+        {
+            return KernelError::BadAddress.sysret();
+        }
+        for (t, c) in set_tid.iter_mut().zip(b[..n * 4].as_chunks::<4>().0) {
+            *t = u32::from_ne_bytes(*c);
+        }
     }
 
     // Validate stack - if stack is provided, stack_size must also be provided
@@ -658,5 +679,7 @@ pub fn sys_clone3(uargs: u64, size: u64) -> i64 {
         pidfd_ptr: args.pidfd,
         exit_signal: args.exit_signal as i32,
         cgroup_fd,
+        set_tid,
+        set_tid_size: n,
     })
 }
