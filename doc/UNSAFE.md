@@ -42,6 +42,7 @@ abstraction instead, and the callers stay safe. The usual wrapper shapes are:
 | `IoMem` registers | checked volatile |
 | `DmaBox` | owned device memory |
 | page-table `PgTables` / `Pte` / `PteTable` / `Pmd` / `Dir`, `PgPrune` (`mm/pgtable.rs`) | typed handle borrowing the lock |
+| vmalloc-area range `VmArea` (`mm/vmalloc.rs`, Linux vm_struct) | ownership token |
 
 Make each wrapper `#[inline]`: it must compile to the same code as the
 open-coded `unsafe` it replaces.

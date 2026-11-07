@@ -382,7 +382,9 @@ fn canary_run(f1: u64, f2: u64, cpu: u32) -> Result<(u64, u64), (&'static str, u
         if !canary_wait(1) {
             return Err(("tlb_canary_hang", 1));
         }
-        crate::arch::ioremap_retarget(va, f2).map_err(|_| ("tlb_canary_remap", 0))?;
+        // SAFETY: `va` is this test's ioremap page; `f2` a frame it owns
+        // and touches through no other mapping meanwhile
+        unsafe { crate::arch::ioremap_retarget(va, f2) }.map_err(|_| ("tlb_canary_remap", 0))?;
         CANARY_PHASE.store(2, Ordering::Release);
         if !canary_wait(3) {
             return Err(("tlb_canary_hang", 3));

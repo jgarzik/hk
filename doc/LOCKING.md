@@ -1614,7 +1614,10 @@ layout in `doc/MEMORY.md`
   tables under `KTABLES` (`spin::Mutex` leaf, thread context, one per
   arch in ioremap.rs; `FRAME_ALLOCATOR` is taken under it for table
   frames). Linux: `vmap_area_lock` + `init_mm.page_table_lock`. A PTE
-  of a range one owns is set or cleared without a lock.
+  of a range one owns is set or cleared without a lock: only the
+  holder of the range's `vmalloc::VmArea` (Linux vm_struct; a vmalloc
+  block, a kernel stack) or of an ioremap mapping changes it, and these
+  kernel tables are never freed.
 - TLB: iounmap clears the entries and flushes every CPU
   (`flush_tlb_kernel_range`, with `IOREMAP` not held) before the range
   is freed; arm64 broadcasts, x86 sends IPIs.

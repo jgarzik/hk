@@ -24,6 +24,7 @@
 //! run with interrupts off; no interrupt handler takes it); frames are
 //! allocated, mapped and freed outside it.
 
+use super::vmalloc::VmArea;
 use crate::arch::paging::VMSTACK_START;
 use crate::sync::spin::Mutex;
 
@@ -43,6 +44,9 @@ const DIRTY_MAX: usize = 64;
 
 const PAGE_SIZE: u64 = 4096;
 const WORDS: usize = NR_SLOTS / 64;
+
+/// Pages of one stack
+const STACK_PAGES: usize = THREAD_SIZE / PAGE_SIZE as usize;
 
 /// End of the stack area
 const VMSTACK_END: u64 = VMSTACK_START + NR_SLOTS as u64 * SLOT_SIZE;
@@ -143,12 +147,17 @@ fn try_clean_slot() -> Option<usize> {
 pub fn alloc() -> Option<u64> {
     let slot = take_slot()?;
     let base = slot_base(slot);
-    for off in (0..THREAD_SIZE as u64).step_by(PAGE_SIZE as usize) {
+    // SAFETY: the stack pages of the slot just taken, ours alone until
+    // released
+    let mut area = unsafe { VmArea::new(base, STACK_PAGES) };
+    for i in 0..STACK_PAGES {
+        // SAFETY: a fresh frame, ours, handed to the area (`filter`
+        // drops it only if mapped: `unmap` frees those)
         let mapped = crate::FRAME_ALLOCATOR
             .alloc()
-            .filter(|&pa| crate::arch::vmap_page(base + off, pa).is_ok());
+            .filter(|&pa| unsafe { area.map(i, pa) });
         if mapped.is_none() {
-            unmap(base, off);
+            unmap(&mut area, i);
             release(slot);
             return None;
         }
@@ -161,16 +170,19 @@ pub fn alloc() -> Option<u64> {
 /// Free the stack at `base` (from `alloc`): nothing runs on it any more
 pub fn free(base: u64) {
     debug_assert!(contains(base) && (base - VMSTACK_START).is_multiple_of(SLOT_SIZE));
-    unmap(base, THREAD_SIZE as u64);
+    // SAFETY: the stack pages of `base`'s slot, from `alloc`, which
+    // nothing runs on any more (this fn's contract; not checked:
+    // BUGS.md, safe fns that take addresses)
+    let mut area = unsafe { VmArea::new(base, STACK_PAGES) };
+    unmap(&mut area, STACK_PAGES);
     release(((base - VMSTACK_START) / SLOT_SIZE) as usize);
 }
 
-/// Unmap and free the first `len` bytes of the stack at `base`; this
+/// Unmap and free the first `pages` pages of the stack `area`; this
 /// CPU's stale entries go now, the other CPUs' before the slot is reused
-fn unmap(base: u64, len: u64) {
-    for off in (0..len).step_by(PAGE_SIZE as usize) {
-        if let Some(pa) = crate::arch::vunmap_page(base + off) {
-            crate::arch::tlb::local_flush_one(base + off);
+fn unmap(area: &mut VmArea, pages: usize) {
+    for i in 0..pages {
+        if let Some(pa) = area.unmap(i) {
             crate::FRAME_ALLOCATOR.free(pa);
         }
     }

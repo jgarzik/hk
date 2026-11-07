@@ -37,8 +37,12 @@ None is known to fail today, but each is a soundness bug:
     keeps their tables; the arch walkers are `unsafe fn`s reached only
     from there. Still raw, safe fns that dereference a caller's root:
     `ArchPageTable::new(root)` (its `translate` and `map_with_alloc`
-    walk that root; callers in task/ exec and fork), the ioremap and
-    vmap walkers.
+    walk that root; callers in task/ exec and fork).
+  - Kernel mappings: the vmalloc-area walkers are `unsafe fn`s reached
+    through the owner's `vmalloc::VmArea`, but `vmstack::free(base)`
+    (callers in task/) and `iounmap(addr, size)` (acpi, xhci,
+    pci_quirks, selftest) are safe fns that unmap whatever range they
+    are given; they should be `unsafe fn`s or take the owning handle.
 
 ## unsafe not yet wrapped or documented (doc/UNSAFE.md)
 
