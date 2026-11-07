@@ -141,6 +141,16 @@ impl ScsiDisk {
             return Err(ScsiError::NotSupported);
         }
         let capacity_sectors = cap.blocks;
+        // A size in bytes past 2^64 is too big to address (Linux
+        // sd_read_capacity / sd_addressable_capacity: "Too big for this
+        // kernel")
+        if capacity_sectors
+            .checked_mul(u64::from(sector_size))
+            .is_none()
+        {
+            crate::printkln!("SCSI: capacity of {} blocks too big", capacity_sectors);
+            return Err(ScsiError::NotSupported);
+        }
 
         Ok(Self {
             host,
@@ -211,9 +221,21 @@ impl ScsiDisk {
         self.sector_size
     }
 
-    /// Get capacity in bytes
+    /// Get capacity in bytes (probe refused a disk whose bytes overflow)
     pub fn capacity_bytes(&self) -> u64 {
-        self.capacity_sectors * u64::from(self.sector_size)
+        self.capacity_sectors
+            .saturating_mul(u64::from(self.sector_size))
+    }
+
+    /// Run a read or write of `len` bytes: a transfer the device ended
+    /// short (residue, no error status) is an I/O error, not success
+    /// (Linux scsi_io_completion: only good_bytes complete)
+    fn rw(&self, cmd: &ScsiCommand, len: usize) -> ScsiResult<usize> {
+        let n = self.host.execute(self.target, self.lun, cmd)?;
+        if n < len {
+            return Err(ScsiError::IoError);
+        }
+        Ok(n)
     }
 
     /// Read sectors from disk
@@ -238,7 +260,7 @@ impl ScsiDisk {
             30000, // 30 second timeout for I/O
         );
 
-        self.host.execute(self.target, self.lun, &cmd)
+        self.rw(&cmd, expected_len)
     }
 
     /// Write sectors to disk
@@ -263,7 +285,7 @@ impl ScsiDisk {
             30000,
         );
 
-        self.host.execute(self.target, self.lun, &cmd)
+        self.rw(&cmd, expected_len)
     }
 
     /// Flush disk cache
