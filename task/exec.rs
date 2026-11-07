@@ -854,6 +854,16 @@ fn de_thread(tid: crate::task::Tid) -> Result<(), i32> {
     Ok(())
 }
 
+/// Exec failed past its point of no return: the old image's other
+/// threads may be gone, so the caller dies on its way out (Linux
+/// bprm_execve: force_fatal_sig(SIGSEGV) unless a fatal signal is
+/// already pending)
+fn exec_fatal() {
+    if !crate::signal::fatal_signal_pending() {
+        crate::signal::force_sigsegv(percpu::current_tid());
+    }
+}
+
 /// Execute a new program, replacing the current process image
 ///
 /// This is the core of execve. It:
@@ -1078,18 +1088,23 @@ where
 
     let tid = percpu::current_tid();
 
+    // The point of no return (Linux begin_new_exec sets
+    // point_of_no_return before de_thread): from here a failure kills
+    // the process instead of returning to the old image
+
     // The other threads end before the new image starts (Linux
     // begin_new_exec -> de_thread)
     if let Err(e) = de_thread(tid) {
+        exec_fatal();
         return -e;
     }
     // Handlers, alternate stack and timers of the old image go
     if let Err(e) = crate::signal::exec_signals() {
+        exec_fatal();
         return -e.errno();
     }
 
     // Now we need to update the current task and switch to the new address space
-    // This is the point of no return
 
     // The thread and process keyrings are not for the new image (Linux
     // prepare_exec_creds)
