@@ -282,8 +282,15 @@ impl PacketSock {
             addr: [0; 8],
         };
         sll.addr[..ETH_ALEN].copy_from_slice(&t.frame[6..12]);
+        // No memory for the copy: dropped and counted (Linux packet_rcv's
+        // failed skb_clone goes to drop_n_acct)
+        let Ok(copy) = crate::util::kmem::try_to_vec(&data[..snap]) else {
+            self.sk.drops.fetch_add(1, Ordering::Relaxed);
+            self.drops.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
         let f = Frame {
-            data: data[..snap].to_vec(),
+            data: copy,
             origlen: data.len(),
             sll,
             net_off: if raw { ETH_HLEN as u16 } else { 0 },

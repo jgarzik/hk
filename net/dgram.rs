@@ -54,6 +54,14 @@ impl Dgram {
             drops: 0,
         }
     }
+
+    /// A datagram of a copy of `data`, or None if that cannot be
+    /// allocated: the caller drops the packet (Linux: skb_clone under
+    /// GFP_ATOMIC failed)
+    pub fn copy(src: Ipv4Addr, sport: u16, data: &[u8], info: RxInfo) -> Option<Self> {
+        let data = crate::util::kmem::try_to_vec(data).ok()?;
+        Some(Self::new(src, sport, data, info))
+    }
 }
 
 /// Bytes charged to rcvbuf per datagram (payload + skb overhead)

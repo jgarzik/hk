@@ -454,8 +454,11 @@ pub fn ping_rcv(net: &NetNamespace, skb: &SkBuff) {
         return;
     };
     let info = RxInfo::of(net, skb);
-    let dg = Dgram::new(skb.saddr.unwrap_or_default(), 0, d.to_vec(), info);
-    s.rxq.enqueue(&s.sk, dg);
+    // A copy that cannot be allocated drops the reply (Linux ping_rcv:
+    // skb_clone failure)
+    if let Some(dg) = Dgram::copy(skb.saddr.unwrap_or_default(), 0, d, info) {
+        s.rxq.enqueue(&s.sk, dg);
+    }
 }
 
 /// An ICMP error about one of our echo requests (Linux ping_err)

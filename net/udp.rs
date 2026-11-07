@@ -681,7 +681,14 @@ pub fn udp_rcv(skb: SkBuff) {
         dif,
     };
     let info = RxInfo::of(&net, &skb);
-    let d = Dgram::new(saddr, k.sport, pkt[UDP_HLEN..].to_vec(), info);
+    // Each socket's copy may fail to allocate: that socket counts a drop
+    // (Linux __udp4_lib_mcast_deliver when skb_clone fails)
+    let deliver = |s: &UdpSock| match Dgram::copy(saddr, k.sport, &pkt[UDP_HLEN..], info) {
+        Some(d) => s.rxq.enqueue(&s.sk, d),
+        None => {
+            s.sk.drops.fetch_add(1, Ordering::Relaxed);
+        }
+    };
     if skb.ip_bcast || daddr.is_multicast() {
         for s in net
             .udp
@@ -689,12 +696,12 @@ pub fn udp_rcv(skb: SkBuff) {
             .iter()
             .filter(|s| bcast_match(s, &k))
         {
-            s.rxq.enqueue(&s.sk, d.clone());
+            deliver(s);
         }
         return;
     }
     match lookup(&net.udp, &k) {
-        Some(s) => s.rxq.enqueue(&s.sk, d),
+        Some(s) => deliver(&s),
         None => crate::net::icmp::port_unreach(&net, &skb),
     }
 }

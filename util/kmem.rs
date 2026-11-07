@@ -59,6 +59,15 @@ pub fn try_vec<T: Clone>(n: usize, v: T) -> Result<Vec<T>, KernelError> {
     Ok(x)
 }
 
+/// A copy of `s`, or ENOMEM. For buffers made from a packet on a
+/// receive path: where Linux's GFP_ATOMIC allocation (skb_clone,
+/// alloc_skb) fails and the packet is dropped, the caller drops it too.
+pub fn try_to_vec<T: Copy>(s: &[T]) -> Result<Vec<T>, KernelError> {
+    let mut v = KVec::try_with_capacity(s.len())?;
+    v.try_extend_from_slice(s)?;
+    Ok(v.into_vec())
+}
+
 /// A `Vec` whose every growth is fallible (ENOMEM, capped at
 /// [`MAX_KMALLOC`]): hand an untrusted length to one of these and the
 /// worst case is an error, not a kernel panic.
@@ -253,6 +262,13 @@ mod tests {
         assert!(try_vec::<u8>(16, 7).unwrap().iter().all(|&b| b == 7));
         // count * size_of overflow is caught, not wrapped
         assert!(try_vec::<u64>(usize::MAX, 0).is_err());
+    }
+
+    #[test]
+    fn try_to_vec_copies() {
+        assert_eq!(try_to_vec(&[1u8, 2, 3]).unwrap(), [1, 2, 3]);
+        assert!(try_to_vec::<u8>(&[]).unwrap().is_empty());
+        assert!(try_to_vec(&alloc::vec![0u8; MAX_KMALLOC + 1]).is_err());
     }
 
     #[test]
