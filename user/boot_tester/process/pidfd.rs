@@ -14,6 +14,9 @@
 //!   EAGAIN while the child runs (Linux kernel_waitid adds WNOHANG)
 //! - CLONE_PIDFD_LEGACY: clone(2) with CLONE_PIDFD stores the pidfd at
 //!   parent_tid; with CLONE_PARENT_SETTID too it is EINVAL
+//! - CLONE_PIDFD_EFAULT: a pidfd pointer the kernel cannot write
+//!   (legacy clone's parent_tid, clone3's pidfd, null included) fails
+//!   the clone with EFAULT: no child, no descriptor left
 //! - Test pidfd_getfd to get own fd via pidfd
 //! - Test pidfd_getfd with invalid flags returns EINVAL
 //! - PIDFD_POLL_GROUP: a process whose leader exits first is not
@@ -28,10 +31,10 @@ use crate::harness::{fail_num, pass, verdict};
 use crate::helpers::{linux_at_least, msleep, print, print_num, println};
 use crate::mm::fork_mm::{join, spawn_thread};
 use hk_syscall::{
-    O_NONBLOCK, P_PIDFD, POLLHUP, POLLIN, PollFd, SIGKILL, SigInfo, WEXITED, sys_clone, sys_close,
-    sys_exit, sys_exit_group, sys_fcntl, sys_fork, sys_getpid, sys_kill, sys_open, sys_pidfd_getfd,
-    sys_pidfd_open, sys_pidfd_send_signal, sys_pipe2, sys_poll, sys_ptrace, sys_read,
-    sys_rt_sigaction, sys_wait4, sys_waitid, sys_write,
+    CloneArgs, O_NONBLOCK, P_PIDFD, POLLHUP, POLLIN, PollFd, SIGKILL, SigInfo, WEXITED, sys_clone,
+    sys_clone3, sys_close, sys_exit, sys_exit_group, sys_fcntl, sys_fork, sys_getpid, sys_kill,
+    sys_open, sys_pidfd_getfd, sys_pidfd_open, sys_pidfd_send_signal, sys_pipe2, sys_poll,
+    sys_ptrace, sys_read, sys_rt_sigaction, sys_wait4, sys_waitid, sys_write,
 };
 
 /// Run all pidfd tests
@@ -46,6 +49,7 @@ pub fn run_tests() {
     test_waitid_p_pidfd();
     test_waitid_pidfd_nonblock();
     test_clone_pidfd_legacy();
+    test_clone_pidfd_efault();
     test_pidfd_getfd_self();
     test_pidfd_getfd_invalid_flags();
     test_pidfd_poll_group();
@@ -639,6 +643,70 @@ fn test_clone_pidfd_legacy() {
         fail_num(b"CLONE_PIDFD_LEGACY:FAIL waitid(P_PIDFD) ", w);
     } else {
         pass(b"CLONE_PIDFD_LEGACY");
+    }
+}
+
+/// CLONE_PIDFD stores the pidfd before the child exists, so a pointer
+/// the kernel cannot write fails the clone with EFAULT and leaves no
+/// child or descriptor (Linux copy_process: put_user, then
+/// bad_fork_put_pidfd); clone3's null pidfd pointer too
+fn test_clone_pidfd_efault() {
+    const NAME: &[u8] = b"CLONE_PIDFD_EFAULT";
+    let pid = sys_fork();
+    if pid == 0 {
+        sys_exit(clone_pidfd_efault() as u64);
+    }
+    let mut st = 0;
+    sys_wait4(pid, &mut st, 0, 0);
+    let step = if st & 0x7f != 0 {
+        100
+    } else {
+        (st >> 8) & 0xff
+    };
+    verdict(NAME, step == 0, i64::from(step));
+}
+
+/// [`test_clone_pidfd_efault`]'s steps in a process with no children:
+/// the failing step, 0 if none
+fn clone_pidfd_efault() -> i32 {
+    const CLONE_PIDFD: u64 = 0x1000;
+    const SIGCHLD: u64 = 17;
+    const F_DUPFD: i32 = 0;
+    const WNOHANG: i32 = 1;
+    const EFAULT: i64 = -14;
+    const ECHILD: i64 = -10;
+    let lowest = || {
+        let fd = sys_fcntl(0, F_DUPFD, 0);
+        sys_close(fd as u64);
+        fd
+    };
+    let free = lowest();
+    // An address no mapping covers
+    let bad = sys_clone(CLONE_PIDFD | SIGCHLD, 0, 8, 0, 0);
+    if bad == 0 {
+        sys_exit(0);
+    }
+    let args = CloneArgs {
+        flags: CLONE_PIDFD,
+        exit_signal: SIGCHLD,
+        ..CloneArgs::default()
+    };
+    let null = sys_clone3(&args, core::mem::size_of::<CloneArgs>());
+    if null == 0 {
+        sys_exit(0);
+    }
+    let none = sys_wait4(-1, core::ptr::null_mut(), WNOHANG, 0);
+    while sys_wait4(-1, core::ptr::null_mut(), 0, 0) > 0 {}
+    if bad != EFAULT {
+        1
+    } else if null != EFAULT {
+        2
+    } else if none != ECHILD {
+        3
+    } else if lowest() != free {
+        4
+    } else {
+        0
     }
 }
 

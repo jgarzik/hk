@@ -2417,7 +2417,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
 
     // Create child task
     let child_task_inner = crate::task::TaskInner {
-        thread_pid: Some(child_thread_pid),
+        thread_pid: Some(child_thread_pid.clone()),
         // Set from the creator's under TASKLIST (`inherit_pids`)
         pgrp: None,
         session: None,
@@ -2550,6 +2550,18 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         .set_params(policy_class(c_policy), c_policy, c_static, c_rt);
     // SAFETY: not on a run queue yet
     unsafe { *child_task.se.ctx() = context };
+
+    // CLONE_PIDFD: the child's pidfd is in the caller's table and its
+    // number stored before the child exists, so a failure leaves
+    // neither (Linux copy_process: pidfd_prepare and put_user, EFAULT
+    // through bad_fork_put_pidfd)
+    if config.flags & CLONE_PIDFD != 0 {
+        clone_pidfd(
+            child_thread_pid,
+            config.flags & CLONE_THREAD != 0,
+            config.pidfd_ptr,
+        )?;
+    }
 
     // Add to global task table
     {
@@ -2700,61 +2712,30 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         vfork.wait();
     }
 
-    // Handle CLONE_PIDFD: create a pidfd for the child and write it to parent's address space
-    if config.flags & CLONE_PIDFD != 0 && config.pidfd_ptr != 0 {
-        use crate::arch::Uaccess;
-        use crate::uaccess::put_user;
-
-        // Create pidfd for the child: a thread pidfd for a new thread
-        // (Linux copy_process: CLONE_THREAD adds PIDFD_THREAD)
-        let (target, pflags) = if config.flags & CLONE_THREAD != 0 {
-            (child_tid, crate::task::pidfd::pidfd_flags::PIDFD_THREAD)
-        } else {
-            (child_pid, 0)
-        };
-        let pidfd_file = match crate::task::pidfd::create_pidfd(target, pflags) {
-            Ok(file) => file,
-            Err(_) => {
-                // Pidfd creation failed - this is not critical, just don't set it
-                // Return success anyway as the child is already created
-                return Ok(return_value);
-            }
-        };
-
-        // Allocate FD in parent's FD table
-        let fd_table = match crate::task::fdtable::get_task_fd(current_tid) {
-            Some(table) => table,
-            None => return Ok(return_value), // No FD table - shouldn't happen
-        };
-
-        // Get NOFILE limit
-        let nofile = {
-            let limit = crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_NOFILE);
-            if limit == crate::task::rlimit::RLIM_INFINITY {
-                u64::MAX
-            } else {
-                limit
-            }
-        };
-
-        let pidfd_num = {
-            let mut table = fd_table.lock();
-            // Allocate with O_CLOEXEC by default for pidfds
-            match table.alloc_with_flags(pidfd_file, crate::task::FD_CLOEXEC, nofile) {
-                Ok(fd) => fd,
-                Err(_) => return Ok(return_value), // FD allocation failed
-            }
-        };
-
-        // Write the pidfd number to parent's address space
-        let _ = put_user::<Uaccess, i32>(config.pidfd_ptr, pidfd_num as i32);
-    }
-
-    // Return value depends on CLONE_THREAD flag:
-    // - CLONE_THREAD: return child TID (thread in same process)
-    // - No CLONE_THREAD: return child PID (new process)
-    // This matches Linux behavior.
     Ok(return_value)
+}
+
+/// CLONE_PIDFD: a close-on-exec pidfd of the child `pid` (a thread
+/// pidfd for a new thread: Linux PIDFD_THREAD) in the caller's table,
+/// its number stored at `ptr`: EMFILE, ENOMEM, or EFAULT (the
+/// descriptor closed again). The child does not exist yet: nothing
+/// but the caller's threads can see the descriptor before clone
+/// returns (Linux reserves it and installs it at the end).
+fn clone_pidfd(pid: Arc<crate::task::pid::Pid>, thread: bool, ptr: u64) -> Result<(), i32> {
+    use crate::task::pidfd::pidfd_flags::PIDFD_THREAD;
+    let flags = if thread { PIDFD_THREAD } else { 0 };
+    let file = crate::task::pidfd::pidfd_file(pid, flags).map_err(|e| e.errno())?;
+    let files = crate::task::fdtable::get_task_fd(current_tid()).ok_or(9)?; // EBADF
+    let nofile = crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_NOFILE);
+    let fd = files
+        .lock()
+        .alloc_with_flags(file, crate::task::FD_CLOEXEC, nofile)?;
+    if crate::uaccess::put_user::<crate::arch::Uaccess, i32>(ptr, fd).is_err() {
+        // Released after the table lock (FilesGuard)
+        files.lock().close(fd);
+        return Err(14); // EFAULT
+    }
+    Ok(())
 }
 
 /// Mark the current task exiting (Linux PF_EXITING)

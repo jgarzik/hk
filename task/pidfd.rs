@@ -103,24 +103,6 @@ impl FileOps for PidfdFileOps {
     }
 }
 
-/// Create a pidfd file for the given process
-///
-/// # Arguments
-/// * `pid` - Process ID to create pidfd for
-/// * `file_flags` - File flags (O_NONBLOCK, O_CLOEXEC via FD_CLOEXEC)
-///
-/// # Returns
-/// Arc<File> for the new pidfd
-pub fn create_pidfd(pid: Pid, file_flags: u32) -> Result<Arc<File>, KernelError> {
-    pidfd_file(find(pid)?, file_flags)
-}
-
-/// The `Pid` numbered `pid` (root namespace); ESRCH
-fn find(pid: Pid) -> Result<Arc<crate::task::pid::Pid>, KernelError> {
-    let nr = u32::try_from(pid).map_err(|_| KernelError::NoProcess)?;
-    crate::task::pid::find_pid(&crate::ns::INIT_PID_NS, nr).ok_or(KernelError::NoProcess)
-}
-
 /// pidfd_open's pidfd for task `pid` (Linux pidfd_prepare): ESRCH
 /// once its task is released, ENOENT for a thread that does not lead
 /// its group unless PIDFD_THREAD asks for a thread's
@@ -139,8 +121,12 @@ pub fn open_pidfd(pid: Pid, file_flags: u32) -> Result<Arc<File>, KernelError> {
     pidfd_file(p, file_flags)
 }
 
-/// A pidfd file for `pid`
-fn pidfd_file(pid: Arc<crate::task::pid::Pid>, file_flags: u32) -> Result<Arc<File>, KernelError> {
+/// A pidfd file for `pid` (no check that it names a task: clone's
+/// child is not listed yet, Linux PIDFD_STALE)
+pub fn pidfd_file(
+    pid: Arc<crate::task::pid::Pid>,
+    file_flags: u32,
+) -> Result<Arc<File>, KernelError> {
     let thread = file_flags & pidfd_flags::PIDFD_THREAD != 0;
     let pidfd = try_arc(Pidfd { pid, thread })?;
     let mut f_flags = flags::O_RDONLY;
