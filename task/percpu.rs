@@ -749,6 +749,11 @@ impl GlobalTaskTable {
         self.pid_task(pid).map(Task::tid)
     }
 
+    /// A reference to the task `pid` names
+    pub fn pid_task_ref(&self, pid: &crate::task::pid::Pid) -> Option<TaskRef> {
+        self.pid_task(pid).map(task_ref)
+    }
+
     /// Task `tid`
     pub fn get(&self, tid: Tid) -> Option<TaskView<'_>> {
         self.lookup(tid).map(|t| view(self, t))
@@ -1121,6 +1126,21 @@ pub static TASKLIST: RwLock<GlobalTaskTable> = RwLock::new(GlobalTaskTable::new(
 /// A reference to task `tid` (TASKLIST only for the lookup)
 pub fn find_task(tid: Tid) -> Option<TaskRef> {
     TASKLIST.read().task(tid)
+}
+
+/// The task `ns` numbers `nr` (Linux find_task_by_pid_ns; TASKLIST
+/// only for the lookup)
+pub fn find_task_by_pid_ns(nr: u64, ns: &crate::ns::PidNamespace) -> Option<TaskRef> {
+    let pid = crate::task::pid::find_pid(ns, u32::try_from(nr).ok()?)?;
+    let t = TASKLIST.read().pid_task_ref(&pid);
+    drop(pid);
+    t
+}
+
+/// The task the caller numbers `nr` (Linux find_task_by_vpid): what a
+/// pid argument names, None (ESRCH) if not visible in its namespace
+pub fn find_task_by_vpid(nr: u64) -> Option<TaskRef> {
+    find_task_by_pid_ns(nr, crate::task::pid::current_pid_ns())
 }
 
 /// Run `f` with task `tid`'s `alloc_lock` held (Linux task_lock(p));

@@ -290,7 +290,8 @@ fn check_creds(data: &[u8]) -> Result<Creds, KernelError> {
         return Err(KernelError::InvalidArgument);
     }
     let c = crate::task::current_cred();
-    let me = crate::task::percpu::current_pid() as i32;
+    // The caller's numbers (Linux scm_check_creds: task_tgid_vnr)
+    let me = crate::task::pid::vnr(crate::task::percpu::current_pid()) as i32;
     let cap = crate::task::capable;
     let pid_ok = pid == me || cap(crate::task::CAP_SYS_ADMIN);
     let uid_ok = [c.uid, c.euid, c.suid].contains(&uid) || cap(crate::task::CAP_SETUID);
@@ -298,7 +299,7 @@ fn check_creds(data: &[u8]) -> Result<Creds, KernelError> {
     if !(pid_ok && uid_ok && gid_ok) {
         return Err(KernelError::NotPermitted);
     }
-    if pid != me && (pid <= 0 || crate::fs::proc::get_tid_for_pid(pid as u64).is_none()) {
+    if pid != me && (pid <= 0 || crate::task::percpu::find_task_by_vpid(pid as u64).is_none()) {
         return Err(KernelError::NoProcess);
     }
     Ok(Creds { pid, uid, gid })

@@ -21,8 +21,11 @@ pub fn sys_getpgid(pid: i32, caller_pid: Pid, caller_pgid: Pid) -> i64 {
     if pid < 0 {
         return KernelError::NoProcess.sysret();
     }
-    let pid = pid as Pid;
-    if pid == 0 || pid == caller_pid {
+    // The caller's number (Linux find_task_by_vpid)
+    let Some(pid) = super::pid::from_vnr_or(pid as Pid, caller_pid) else {
+        return KernelError::NoProcess.sysret();
+    };
+    if pid == caller_pid {
         caller_pgid as i64
     } else {
         match super::percpu::lookup_task_pgid(pid) {
@@ -47,8 +50,10 @@ pub fn sys_getsid(pid: i32, caller_pid: Pid, caller_sid: Pid) -> i64 {
     if pid < 0 {
         return KernelError::NoProcess.sysret();
     }
-    let pid = pid as Pid;
-    if pid == 0 || pid == caller_pid {
+    let Some(pid) = super::pid::from_vnr_or(pid as Pid, caller_pid) else {
+        return KernelError::NoProcess.sysret();
+    };
+    if pid == caller_pid {
         caller_sid as i64
     } else {
         match super::percpu::lookup_task_sid(pid) {
@@ -90,8 +95,20 @@ pub fn sys_setpgid(
     if pid < 0 {
         return KernelError::NoProcess.sysret();
     }
-    let target_pid = if pid == 0 { caller_pid } else { pid as Pid };
-    let new_pgid = if pgid == 0 { target_pid } else { pgid as Pid };
+    // The caller's numbers (Linux find_task_by_vpid, find_vpid): a
+    // process it does not see is ESRCH, a group EPERM (none of its
+    // session)
+    let Some(target_pid) = super::pid::from_vnr_or(pid as Pid, caller_pid) else {
+        return KernelError::NoProcess.sysret();
+    };
+    let new_pgid = if pgid == 0 || pgid == pid {
+        target_pid
+    } else {
+        match super::pid::from_vnr(pgid as Pid) {
+            Some(g) => g,
+            None => return KernelError::NotPermitted.sysret(),
+        }
+    };
 
     match super::percpu::set_task_pgid(caller_pid, target_pid, new_pgid, caller_sid) {
         Ok(()) => 0,

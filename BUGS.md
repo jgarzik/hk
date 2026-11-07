@@ -819,8 +819,7 @@ Designs that grew one commit at a time. Tag = roadmap phase
   queue an event (no fsnotify hooks in the VFS); waitid without
   WEXITED is EINVAL (C).
 - **Copied helpers** (J, or as touched): `get_nofile_limit` in five
-  places; `find_task_by_pid` in four (all root-namespace pids); four
-  `current_time`s; about ten user-timespec readers each validating
+  places; four `current_time`s; about ten user-timespec readers each validating
   (Linux get_timespec64); three iovec structs and five
   importers; three Timeval, two Timespec types.
 - **Error conventions** (M1): Result<_, KernelError> about a thousand
@@ -883,11 +882,12 @@ Tag = roadmap phase (doc/ROADMAP.md).
 6. **One AnonVma per fork family, Vec chain** (J).
    `mm/anon_vma.rs:85`: O(N×VMAs) under one family write lock.
 7. **Syscalls report root-namespace pids** (C). A CLONE_NEWPID child
-   is numbered in its namespace and getpid, gettid and getppid go
-   through `pid::vnr`, but every boundary reads `Task::view_pid_ns`,
-   the root namespace, until the rest translate too (clone, wait, kill
-   and the other pid arguments, process groups, siginfo, SCM
-   credentials, /proc); a task must never get a number in one
+   is numbered in its namespace; getpid, gettid, getppid and every pid
+   argument go through the caller's namespace (`pid::vnr`,
+   `from_vnr`, `find_task_by_vpid`), but they read
+   `Task::view_pid_ns`, the root namespace, until the reports
+   translate too (clone, wait, process groups, siginfo, SCM
+   credentials, /proc): a task must never get a number in one
    namespace that an argument reads in another.
 8. **MM_LIFE_EXEC_CHAIN flake** (arm64 CI, TCG, NIC=e1000):
    `MM_LIFE_EXEC_CHAIN:FAIL -2`, a measured chain's child (busybox

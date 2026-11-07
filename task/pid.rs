@@ -101,6 +101,12 @@ impl Pid {
         self.nr_in(ns).unwrap_or(0)
     }
 
+    /// Its number in the caller's namespace, 0 if not visible (Linux
+    /// pid_vnr)
+    pub fn vnr(&self) -> u32 {
+        self.nr_ns(current_pid_ns())
+    }
+
     /// Execs of the process it leads
     pub fn exec_gen(&self) -> u64 {
         self.exec_gen.load(Ordering::Acquire)
@@ -371,6 +377,12 @@ pub fn current_pid_ns() -> &'static PidNamespace {
     crate::task::percpu::current_pid_ns()
 }
 
+/// The live `Pid` numbered `nr` in the caller's namespace (Linux
+/// find_vpid)
+pub fn find_vpid(nr: u32) -> Option<Arc<Pid>> {
+    find_pid(current_pid_ns(), nr)
+}
+
 /// Root number `nr` (a tid, tgid, process group or session id) as `ns`
 /// numbers it, 0 if not visible there (Linux pid_nr_ns of its struct
 /// pid). The caller keeps its owner alive (it is the caller's own, or
@@ -388,6 +400,25 @@ pub fn nr_ns(nr: u64, ns: &PidNamespace) -> u32 {
 /// Root number `nr` in the caller's namespace (Linux pid_vnr)
 pub fn vnr(nr: u64) -> u32 {
     nr_ns(nr, current_pid_ns())
+}
+
+/// The root number of the caller's number `nr` (a syscall argument:
+/// a tid, tgid, process group or session id), so lookups by root
+/// number find what the caller names: None if no live pid has it in
+/// the caller's namespace (ESRCH); in the root namespace `nr` itself
+/// (Linux find_vpid, by number)
+pub fn from_vnr(nr: u64) -> Option<u64> {
+    let ns = current_pid_ns();
+    if ns.level == 0 {
+        return Some(nr);
+    }
+    find_pid(ns, u32::try_from(nr).ok()?).map(|p| u64::from(p.nr()))
+}
+
+/// [`from_vnr`] with 0 naming the caller (`me`), as most pid
+/// arguments do
+pub fn from_vnr_or(nr: u64, me: u64) -> Option<u64> {
+    if nr == 0 { Some(me) } else { from_vnr(nr) }
 }
 
 /// The live `Pid` numbered `nr` in `ns` (Linux find_pid_ns)

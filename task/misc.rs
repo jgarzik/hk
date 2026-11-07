@@ -1088,7 +1088,7 @@ pub fn sys_capget<A: crate::uaccess::UaccessArch>(header_addr: u64, data_addr: u
     }
 
     // Get current pid
-    let current_pid = super::percpu::current_pid() as i32;
+    let current_pid = super::pid::vnr(super::percpu::current_pid()) as i32;
 
     // Determine which credentials to read
     let cred = if pid == 0 || pid == current_pid {
@@ -1143,7 +1143,7 @@ pub fn sys_capset<A: crate::uaccess::UaccessArch>(header_addr: u64, data_addr: u
     };
 
     // Get current pid
-    let current_pid = super::percpu::current_pid() as i32;
+    let current_pid = super::pid::vnr(super::percpu::current_pid()) as i32;
 
     // May only affect current process (Linux restriction since kernel 2.6.27)
     if pid != 0 && pid != current_pid {

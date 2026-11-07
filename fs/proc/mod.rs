@@ -43,13 +43,16 @@ fn current_time() -> Timespec {
     TIMEKEEPER.current_time()
 }
 
+/// The task procfs numbers `pid`: in the namespace of the mount, which
+/// is the root one (Linux proc_pid_lookup: find_task_by_pid_ns with
+/// the mount's pid namespace)
+fn find_task(pid: Pid) -> Option<crate::task::percpu::TaskRef> {
+    crate::task::percpu::find_task_by_pid_ns(pid, &crate::ns::INIT_PID_NS)
+}
+
 /// Check if a task with the given PID exists
-///
-/// Looks up the PID in the global task table.
 fn task_exists(pid: Pid) -> bool {
-    use crate::task::percpu::TASKLIST;
-    let table = TASKLIST.read();
-    table.get(pid).is_some()
+    find_task(pid).is_some()
 }
 
 /// Public version of task_exists for use by setns
@@ -62,9 +65,7 @@ pub fn task_exists_pub(pid: Pid) -> bool {
 /// Looks up the PID in the global task table and returns the TID.
 /// Returns None if no task with the given PID exists.
 pub fn get_tid_for_pid(pid: Pid) -> Option<crate::task::Tid> {
-    use crate::task::percpu::TASKLIST;
-    let table = TASKLIST.read();
-    table.get(pid).map(|t| t.task.tid())
+    find_task(pid).map(|t| t.tid())
 }
 
 /// Inode number for per-PID directories

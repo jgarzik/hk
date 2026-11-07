@@ -10,7 +10,7 @@ use alloc::vec::Vec;
 use crate::arch::Uaccess;
 use crate::fs::iov::IoVec;
 use crate::mm::remote::{access_remote_vm_read, access_remote_vm_write};
-use crate::task::percpu::{TASKLIST, current_tid};
+use crate::task::percpu::current_tid;
 use crate::task::{Pid, Tid};
 use crate::uaccess::{UaccessArch, copy_from_user, copy_to_user};
 use crate::util::error::KernelError;
@@ -56,7 +56,7 @@ pub fn sys_process_vm_readv(
     }
 
     // Find target task
-    let target_tid = match find_task_by_pid(pid as Pid) {
+    let target_tid = match crate::task::percpu::find_task_by_vpid(pid as Pid).map(|t| t.tid()) {
         Some(tid) => tid,
         None => return KernelError::NoProcess.sysret(),
     };
@@ -191,7 +191,7 @@ pub fn sys_process_vm_writev(
     }
 
     // Find target task
-    let target_tid = match find_task_by_pid(pid as Pid) {
+    let target_tid = match crate::task::percpu::find_task_by_vpid(pid as Pid).map(|t| t.tid()) {
         Some(tid) => tid,
         None => return KernelError::NoProcess.sysret(),
     };
@@ -294,12 +294,6 @@ pub fn sys_process_vm_writev(
 // ============================================================================
 // Helper functions
 // ============================================================================
-
-/// Find a task by PID (returns TID of the main thread)
-fn find_task_by_pid(pid: Pid) -> Option<Tid> {
-    let table = TASKLIST.read();
-    table.get(pid).map(|t| t.task.tid())
-}
 
 /// May the caller access the target's memory (Linux process_vm_rw_core
 /// -> mm_access, PTRACE_MODE_ATTACH_REALCREDS): its own address space

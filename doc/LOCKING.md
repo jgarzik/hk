@@ -884,8 +884,12 @@ translated only at the user boundary: out, a root number to a
 namespace's (`pid::nr_ns`, `vnr`: 0 if not visible) through the hash
 (PIDMAP_LOCK), its owner kept listed by the caller meanwhile (the
 caller's own ids, or TASKLIST held for reading: getppid); in, a
-caller's number to the root one (`find_pgrp(ns, nr)`: ESRCH if not
-visible), through the hash before TASKLIST is taken. The boundary reads
+caller's number to its `Pid` or root number (`pid::find_vpid`,
+`from_vnr`, `find_pgrp(ns, nr)`: ESRCH if not visible) through the
+hash before TASKLIST is taken, or to its task
+(`percpu::find_task_by_vpid`, `find_task_by_pid_ns`: the hash, then
+TASKLIST's read lock only to take a reference from `Pid.task`, the
+`Arc<Pid>` dropped after it). Every pid argument is looked up so. The boundary reads
 `Task::view_pid_ns`, the root namespace, until every syscall translates
 (BUGS.md).
 

@@ -80,7 +80,9 @@ pub fn sys_getpriority(which: i32, who: i32) -> i64 {
     match which {
         PRIO_PROCESS => {
             // 0 is the calling thread (Linux: current)
-            let target_pid = if who == 0 { current_tid() } else { who };
+            let Some(target_pid) = super::pid::from_vnr_or(who, current_tid()) else {
+                return KernelError::NoProcess.sysret();
+            };
             match super::percpu::lookup_task_nice(target_pid) {
                 // 20 - nice (range 1-40) to avoid negative return values
                 Some(nice) => i64::from(20 - nice),
@@ -90,10 +92,8 @@ pub fn sys_getpriority(which: i32, who: i32) -> i64 {
         PRIO_PGRP => {
             // The highest priority of any thread in the group (Linux:
             // the largest 20 - nice)
-            let pgid = if who == 0 {
-                super::percpu::current_pgid()
-            } else {
-                who
+            let Some(pgid) = super::pid::from_vnr_or(who, super::percpu::current_pgid()) else {
+                return KernelError::NoProcess.sysret();
             };
             super::percpu::get_tids_by_pgid(pgid)
                 .into_iter()
@@ -188,7 +188,9 @@ pub fn sys_setpriority(which: i32, who: i32, niceval: i32) -> i64 {
 
     match which {
         PRIO_PROCESS => {
-            let target_pid = if who == 0 { current_tid() } else { who };
+            let Some(target_pid) = super::pid::from_vnr_or(who, current_tid()) else {
+                return KernelError::NoProcess.sysret();
+            };
             set_one_prio(
                 target_pid,
                 niceval,
@@ -199,10 +201,8 @@ pub fn sys_setpriority(which: i32, who: i32, niceval: i32) -> i64 {
         PRIO_PGRP => {
             // Every thread of the group (Linux set_one_prio each): the
             // first success clears ESRCH, an error stays
-            let pgid = if who == 0 {
-                super::percpu::current_pgid()
-            } else {
-                who
+            let Some(pgid) = super::pid::from_vnr_or(who, super::percpu::current_pgid()) else {
+                return KernelError::NoProcess.sysret();
             };
             let mut ret = KernelError::NoProcess.sysret();
             for tid in super::percpu::get_tids_by_pgid(pgid) {
@@ -241,7 +241,9 @@ pub fn sys_sched_getscheduler(pid: i64) -> i64 {
         return KernelError::InvalidArgument.sysret();
     }
 
-    let target_pid = if pid == 0 { current_tid() } else { pid as u64 };
+    let Some(target_pid) = super::pid::from_vnr_or(pid as u64, current_tid()) else {
+        return KernelError::NoProcess.sysret();
+    };
 
     match super::percpu::lookup_task_policy(target_pid) {
         Some(policy) => i64::from(policy),
@@ -301,7 +303,9 @@ pub fn sys_sched_setscheduler<A: crate::uaccess::UaccessArch>(
         return KernelError::InvalidArgument.sysret();
     }
 
-    let target_pid = if pid == 0 { current_tid() } else { pid as u64 };
+    let Some(target_pid) = super::pid::from_vnr_or(pid as u64, current_tid()) else {
+        return KernelError::NoProcess.sysret();
+    };
     let euid = super::percpu::current_cred().euid;
     if let Err(e) = check_setscheduler(target_pid, policy, param.sched_priority, euid) {
         return e.sysret();
@@ -407,7 +411,9 @@ pub fn sys_sched_getparam<A: crate::uaccess::UaccessArch>(pid: i64, param_ptr: u
         return KernelError::BadAddress.sysret();
     }
 
-    let target_pid = if pid == 0 { current_tid() } else { pid as u64 };
+    let Some(target_pid) = super::pid::from_vnr_or(pid as u64, current_tid()) else {
+        return KernelError::NoProcess.sysret();
+    };
 
     // Get the RT priority (0 for non-RT tasks)
     let rt_prio = match super::percpu::lookup_task_rt_priority(target_pid) {
@@ -470,7 +476,9 @@ pub fn sys_sched_setparam<A: crate::uaccess::UaccessArch>(pid: i64, param_ptr: u
         Err(_) => return KernelError::BadAddress.sysret(),
     };
 
-    let target_pid = if pid == 0 { current_tid() } else { pid as u64 };
+    let Some(target_pid) = super::pid::from_vnr_or(pid as u64, current_tid()) else {
+        return KernelError::NoProcess.sysret();
+    };
 
     // Get current policy to preserve it
     let current_policy = match super::percpu::lookup_task_policy(target_pid) {
@@ -529,7 +537,9 @@ pub fn sys_sched_getaffinity<A: crate::uaccess::UaccessArch>(
         return KernelError::InvalidArgument.sysret();
     }
 
-    let target_pid = if pid == 0 { current_tid() } else { pid as u64 };
+    let Some(target_pid) = super::pid::from_vnr_or(pid as u64, current_tid()) else {
+        return KernelError::NoProcess.sysret();
+    };
 
     // The allowed CPUs that are up (Linux: & cpu_active_mask)
     let mask = match super::percpu::lookup_task_cpus_allowed(target_pid) {
@@ -602,7 +612,9 @@ pub fn sys_sched_setaffinity<A: crate::uaccess::UaccessArch>(
         .collect();
     let mask = crate::util::cpumask::CpuSet::from_words(&words);
 
-    let target_pid = if pid == 0 { current_tid() } else { pid as u64 };
+    let Some(target_pid) = super::pid::from_vnr_or(pid as u64, current_tid()) else {
+        return KernelError::NoProcess.sysret();
+    };
 
     // Linux sched_setaffinity: the caller's own tasks (check_same_owner:
     // its euid is their uid or euid) or CAP_SYS_NICE
@@ -669,7 +681,9 @@ pub fn sys_sched_rr_get_interval<A: crate::uaccess::UaccessArch>(pid: i64, tp_pt
         return KernelError::BadAddress.sysret();
     }
 
-    let target_pid = if pid == 0 { current_tid() } else { pid as u64 };
+    let Some(target_pid) = super::pid::from_vnr_or(pid as u64, current_tid()) else {
+        return KernelError::NoProcess.sysret();
+    };
 
     // Get the scheduling policy
     let policy = match super::percpu::lookup_task_policy(target_pid) {
@@ -741,10 +755,8 @@ pub fn sys_ioprio_set(which: i32, who: i32, ioprio: i32) -> i64 {
 
     match which {
         IOPRIO_WHO_PROCESS => {
-            let tid = if who == 0 {
-                super::percpu::current_tid()
-            } else {
-                who as u64
+            let Some(tid) = super::pid::from_vnr_or(who as u64, current_tid()) else {
+                return KernelError::NoProcess.sysret();
             };
 
             if !super::percpu::task_exists(tid) {
@@ -765,10 +777,9 @@ pub fn sys_ioprio_set(which: i32, who: i32, ioprio: i32) -> i64 {
         }
         IOPRIO_WHO_PGRP => {
             // Set ioprio for all processes in a process group
-            let pgid = if who == 0 {
-                super::percpu::current_pgid()
-            } else {
-                who as u64
+            let Some(pgid) = super::pid::from_vnr_or(who as u64, super::percpu::current_pgid())
+            else {
+                return KernelError::NoProcess.sysret();
             };
 
             let tids = super::percpu::get_tids_by_pgid(pgid);
@@ -826,10 +837,8 @@ pub fn sys_ioprio_get(which: i32, who: i32) -> i64 {
 
     match which {
         IOPRIO_WHO_PROCESS => {
-            let tid = if who == 0 {
-                super::percpu::current_tid()
-            } else {
-                who as u64
+            let Some(tid) = super::pid::from_vnr_or(who as u64, current_tid()) else {
+                return KernelError::NoProcess.sysret();
             };
 
             // Check if task exists
@@ -843,10 +852,9 @@ pub fn sys_ioprio_get(which: i32, who: i32) -> i64 {
             }
         }
         IOPRIO_WHO_PGRP => {
-            let pgid = if who == 0 {
-                super::percpu::current_pgid()
-            } else {
-                who as u64
+            let Some(pgid) = super::pid::from_vnr_or(who as u64, super::percpu::current_pgid())
+            else {
+                return KernelError::NoProcess.sysret();
             };
 
             let tids = super::percpu::get_tids_by_pgid(pgid);

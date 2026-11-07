@@ -870,10 +870,10 @@ pub fn sys_get_robust_list(pid: i32, head_ptr: u64, len_ptr: u64) -> i32 {
     } else {
         // For non-zero pid, we'd need to look up the task
         // For now, only support current task
-        if pid as Tid != current_tid {
+        if pid as Tid != u64::from(crate::task::pid::vnr(current_tid)) {
             return KernelError::NoProcess.to_errno_neg();
         }
-        pid as Tid
+        current_tid
     };
 
     let head = TASKLIST

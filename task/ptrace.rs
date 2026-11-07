@@ -252,12 +252,6 @@ impl Drop for Frozen {
     }
 }
 
-/// Find a task by PID (thread group leader)
-fn find_task_by_pid(pid: Pid) -> Option<Tid> {
-    let table = TASKLIST.read();
-    table.get(pid).map(|t| t.task.tid())
-}
-
 /// Check if a task is being traced
 pub fn is_traced(tid: Tid) -> bool {
     let table = TASKLIST.read();
@@ -318,7 +312,7 @@ fn ptrace_traceme() -> i64 {
 ///
 /// This sends SIGSTOP to the target and makes the caller the tracer.
 fn ptrace_attach(target_pid: Pid) -> i64 {
-    let target_tid = match find_task_by_pid(target_pid) {
+    let target_tid = match crate::task::percpu::find_task_by_vpid(target_pid).map(|t| t.tid()) {
         Some(tid) => tid,
         None => return -ESRCH,
     };
@@ -377,7 +371,7 @@ fn ptrace_seize(target_pid: Pid, options: u32) -> i64 {
         return -EINVAL;
     }
 
-    let target_tid = match find_task_by_pid(target_pid) {
+    let target_tid = match crate::task::percpu::find_task_by_vpid(target_pid).map(|t| t.tid()) {
         Some(tid) => tid,
         None => return -ESRCH,
     };
@@ -429,7 +423,7 @@ fn ptrace_seize(target_pid: Pid, options: u32) -> i64 {
 ///
 /// The tracee is continued with an optional signal.
 fn ptrace_detach(target_pid: Pid, signal: u32) -> i64 {
-    let target_tid = match find_task_by_pid(target_pid) {
+    let target_tid = match crate::task::percpu::find_task_by_vpid(target_pid).map(|t| t.tid()) {
         Some(tid) => tid,
         None => return -ESRCH,
     };
@@ -491,7 +485,7 @@ fn ptrace_wake(tid: Tid, sig: u32) {
 /// * `request` - PTRACE_CONT, PTRACE_SYSCALL, or PTRACE_SINGLESTEP
 /// * `signal` - Signal to inject (0 for none)
 fn ptrace_resume(target_pid: Pid, request: i64, signal: u32) -> i64 {
-    let target_tid = match find_task_by_pid(target_pid) {
+    let target_tid = match crate::task::percpu::find_task_by_vpid(target_pid).map(|t| t.tid()) {
         Some(tid) => tid,
         None => return -ESRCH,
     };
@@ -547,7 +541,7 @@ fn ptrace_resume(target_pid: Pid, request: i64, signal: u32) -> i64 {
 
 /// PTRACE_KILL - kill a traced process (deprecated, use PTRACE_CONT with SIGKILL).
 fn ptrace_kill(target_pid: Pid) -> i64 {
-    let target_tid = match find_task_by_pid(target_pid) {
+    let target_tid = match crate::task::percpu::find_task_by_vpid(target_pid).map(|t| t.tid()) {
         Some(tid) => tid,
         None => return -ESRCH,
     };
@@ -595,7 +589,7 @@ fn get_target_mm_and_pt(target_tid: Tid) -> Option<(crate::mm::MmRef, u64)> {
 
 /// Read a word from tracee's memory.
 fn ptrace_peek_data(target_pid: Pid, addr: u64, data: u64) -> i64 {
-    let target_tid = match find_task_by_pid(target_pid) {
+    let target_tid = match crate::task::percpu::find_task_by_vpid(target_pid).map(|t| t.tid()) {
         Some(tid) => tid,
         None => return -ESRCH,
     };
@@ -635,7 +629,7 @@ fn ptrace_peek_data(target_pid: Pid, addr: u64, data: u64) -> i64 {
 
 /// Write a word to tracee's memory.
 fn ptrace_poke_data(target_pid: Pid, addr: u64, data: u64) -> i64 {
-    let target_tid = match find_task_by_pid(target_pid) {
+    let target_tid = match crate::task::percpu::find_task_by_vpid(target_pid).map(|t| t.tid()) {
         Some(tid) => tid,
         None => return -ESRCH,
     };
@@ -675,7 +669,7 @@ fn ptrace_setoptions(target_pid: Pid, options: u32) -> i64 {
         return -EINVAL;
     }
 
-    let target_tid = match find_task_by_pid(target_pid) {
+    let target_tid = match crate::task::percpu::find_task_by_vpid(target_pid).map(|t| t.tid()) {
         Some(tid) => tid,
         None => return -ESRCH,
     };
@@ -707,7 +701,7 @@ fn ptrace_setoptions(target_pid: Pid, options: u32) -> i64 {
 /// PTRACE_GETSIGINFO: the stopped tracee's stop siginfo to `data`
 /// (Linux ptrace_getsiginfo): EINVAL if the stop has none
 fn ptrace_getsiginfo(target_pid: Pid, data: u64) -> i64 {
-    let Some(tid) = find_task_by_pid(target_pid) else {
+    let Some(tid) = crate::task::percpu::find_task_by_vpid(target_pid).map(|t| t.tid()) else {
         return -ESRCH;
     };
     let _frozen = match ptrace_check_attach(tid) {
@@ -728,7 +722,7 @@ fn ptrace_getsiginfo(target_pid: Pid, data: u64) -> i64 {
 /// the one at `data` (Linux ptrace_setsiginfo): what it delivers if the
 /// tracer resumes it with that signal; EINVAL if the stop has none
 fn ptrace_setsiginfo(target_pid: Pid, data: u64) -> i64 {
-    let Some(tid) = find_task_by_pid(target_pid) else {
+    let Some(tid) = crate::task::percpu::find_task_by_vpid(target_pid).map(|t| t.tid()) else {
         return -ESRCH;
     };
     let _frozen = match ptrace_check_attach(tid) {
@@ -754,7 +748,7 @@ fn ptrace_setsiginfo(target_pid: Pid, data: u64) -> i64 {
 /// its group's, to `data` (Linux ptrace_peek_siginfo): how many
 fn ptrace_peeksiginfo(target_pid: Pid, addr: u64, data: u64) -> i64 {
     const PTRACE_PEEKSIGINFO_SHARED: u32 = 1;
-    let Some(tid) = find_task_by_pid(target_pid) else {
+    let Some(tid) = crate::task::percpu::find_task_by_vpid(target_pid).map(|t| t.tid()) else {
         return -ESRCH;
     };
     let _frozen = match ptrace_check_attach(tid) {
@@ -802,7 +796,7 @@ fn ptrace_peeksiginfo(target_pid: Pid, addr: u64, data: u64) -> i64 {
 }
 
 fn ptrace_geteventmsg(target_pid: Pid, data: u64) -> i64 {
-    let target_tid = match find_task_by_pid(target_pid) {
+    let target_tid = match crate::task::percpu::find_task_by_vpid(target_pid).map(|t| t.tid()) {
         Some(tid) => tid,
         None => return -ESRCH,
     };
@@ -833,7 +827,7 @@ fn ptrace_geteventmsg(target_pid: Pid, data: u64) -> i64 {
 
 /// Get all general-purpose registers from tracee.
 fn ptrace_getregs(target_pid: Pid, data: u64) -> i64 {
-    let target_tid = match find_task_by_pid(target_pid) {
+    let target_tid = match crate::task::percpu::find_task_by_vpid(target_pid).map(|t| t.tid()) {
         Some(tid) => tid,
         None => return -ESRCH,
     };
@@ -864,7 +858,7 @@ fn ptrace_getregs(target_pid: Pid, data: u64) -> i64 {
 
 /// Set all general-purpose registers for tracee.
 fn ptrace_setregs(target_pid: Pid, data: u64) -> i64 {
-    let target_tid = match find_task_by_pid(target_pid) {
+    let target_tid = match crate::task::percpu::find_task_by_vpid(target_pid).map(|t| t.tid()) {
         Some(tid) => tid,
         None => return -ESRCH,
     };

@@ -382,14 +382,14 @@ pub fn sys_migrate_pages(pid: i64, maxnode: u64, old_nodes_ptr: u64, new_nodes_p
     }
 
     // Permission check for operating on other processes
-    let current_pid = crate::task::percpu::current_pid();
-    if pid != 0 && pid != current_pid as i64 {
+    let current_pid = crate::task::pid::vnr(crate::task::percpu::current_pid());
+    if pid != 0 && pid != i64::from(current_pid) {
         // Operating on another process requires CAP_SYS_NICE
         if !crate::task::capable(crate::task::CAP_SYS_NICE) {
             return KernelError::NotPermitted.sysret();
         }
         // Check if target process exists
-        if !crate::task::percpu::task_exists(pid as u64) {
+        if crate::task::percpu::find_task_by_vpid(pid as u64).is_none() {
             return KernelError::NoProcess.sysret();
         }
     }
@@ -484,12 +484,12 @@ pub fn sys_move_pages(
     }
 
     // Permission check for operating on other processes
-    let current_pid = crate::task::percpu::current_pid();
-    if pid != 0 && pid != current_pid as i64 {
+    let current_pid = crate::task::pid::vnr(crate::task::percpu::current_pid());
+    if pid != 0 && pid != i64::from(current_pid) {
         if !crate::task::capable(crate::task::CAP_SYS_NICE) {
             return KernelError::NotPermitted.sysret();
         }
-        if !crate::task::percpu::task_exists(pid as u64) {
+        if crate::task::percpu::find_task_by_vpid(pid as u64).is_none() {
             return KernelError::NoProcess.sysret();
         }
     }

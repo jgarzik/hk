@@ -207,6 +207,9 @@ pub fn sys_wait4(pid: i64, wstatus: u64, options: i32, rusage: u64) -> i64 {
     }
 
     let current_pid = super::percpu::current_pid();
+    let Some(pid) = wait_target(pid) else {
+        return KernelError::NoChild.sysret();
+    };
 
     use super::percpu::{SleepState, schedule};
     use crate::sync::waitqueue::{WaitEntry, signal_pending};
@@ -267,6 +270,20 @@ pub fn sys_wait4(pid: i64, wstatus: u64, options: i32, rusage: u64) -> i64 {
     };
     CHILD_EXIT_WQ.finish_wait(w.as_ref());
     result
+}
+
+/// wait4's `pid` (> 0 a child, < -1 a group, 0 the caller's group, -1
+/// any) with the caller's numbers made root ones: None if it names a
+/// pid the caller does not see, which no child matches (Linux
+/// find_get_pid: NULL, so ECHILD)
+fn wait_target(pid: i64) -> Option<i64> {
+    use crate::task::pid::from_vnr;
+    let root = |nr: u64| from_vnr(nr).and_then(|r| i64::try_from(r).ok());
+    match pid {
+        -1 | 0 => Some(pid),
+        p if p > 0 => root(p as u64),
+        p => root(p.unsigned_abs()).map(|r| -r),
+    }
 }
 
 /// The siginfo bytes waitid writes: si_signo through si_status
@@ -376,6 +393,15 @@ pub fn sys_waitid(idtype: i32, id: u64, infop: u64, options: i32, rusage: u64) -
             pid as i64
         }
         _ => return KernelError::InvalidArgument.sysret(),
+    };
+    // A pidfd names its pid by root number already
+    let wait_pid = if idtype == P_PIDFD {
+        wait_pid
+    } else {
+        match wait_target(wait_pid) {
+            Some(p) => p,
+            None => return KernelError::NoChild.sysret(),
+        }
     };
 
     use super::percpu::{SleepState, schedule};

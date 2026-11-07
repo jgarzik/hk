@@ -133,10 +133,11 @@ impl File {
     }
 }
 
-/// The `Pid` numbered `nr` while a task uses it as its pid or process
-/// group (Linux find_vpid; numbers are the root namespace's)
-fn find_vpid(nr: u32) -> Option<Arc<Pid>> {
-    let pid = crate::task::pid::find_pid(&crate::ns::INIT_PID_NS, nr)?;
+/// The `Pid` the caller numbers `nr` while a task uses it as its pid
+/// or process group (Linux find_vpid with pid_task / the group's list
+/// checked, as f_setown's callers do)
+fn find_owner(nr: u32) -> Option<Arc<Pid>> {
+    let pid = crate::task::pid::find_vpid(nr)?;
     let used = {
         let table = TASKLIST.read();
         table.pid_tid(&pid).is_some() || table.pgrp(&pid).next().is_some()
@@ -159,7 +160,7 @@ pub fn f_setown(file: &File, who: i32, force: bool) -> Result<(), KernelError> {
     let own = file.f_owner_alloc()?;
     let pid = match who.unsigned_abs() {
         0 => None,
-        nr => Some(find_vpid(nr).ok_or(KernelError::NoProcess)?),
+        nr => Some(find_owner(nr).ok_or(KernelError::NoProcess)?),
     };
     own.set(pid, kind, force);
     Ok(())
@@ -230,7 +231,7 @@ pub fn f_setown_ex(file: &File, arg: u64) -> Result<(), KernelError> {
         nr => Some(
             u32::try_from(nr)
                 .ok()
-                .and_then(find_vpid)
+                .and_then(find_owner)
                 .ok_or(KernelError::NoProcess)?,
         ),
     };
