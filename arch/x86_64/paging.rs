@@ -580,11 +580,6 @@ impl PageTableEntry {
     pub fn set(&mut self, phys_addr: u64, flags: u64) {
         self.0 = (phys_addr & ADDR_MASK) | flags;
     }
-
-    /// Clear the entry
-    pub fn clear(&mut self) {
-        self.0 = 0;
-    }
 }
 
 /// A page table (PML4, PDPT, PD, or PT)

@@ -700,12 +700,6 @@ impl PageTableEntry {
     pub fn set_block(&mut self, phys_addr: u64, attrs: u64) {
         self.0 = (phys_addr & ADDR_MASK) | attrs | DESC_BLOCK;
     }
-
-    /// Clear the entry
-    #[inline]
-    pub fn clear(&mut self) {
-        self.0 = 0;
-    }
 }
 
 // ============================================================================

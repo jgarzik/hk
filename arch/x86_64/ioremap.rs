@@ -6,7 +6,12 @@
 //!
 //! The walkers here change the swapper's kernel half only, whose tables
 //! are never freed; a page is mapped or unmapped only by the holder of
-//! its range (an ioremap caller, `mm::vmalloc::VmArea`).
+//! its range (an ioremap caller, `mm::vmalloc::VmArea`). Entries are
+//! only accessed atomically: a missing table is added under `KTABLES`
+//! (a release store), and read without it (an acquire load) by any
+//! walker, which may race with that add in a neighbouring range.
+
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::sync::spin::Mutex;
 use crate::util::scope::ScopeGuard;
@@ -14,7 +19,7 @@ use crate::util::scope::ScopeGuard;
 use super::kmap::swapper_phys;
 use super::paging::{
     PAGE_CACHE_DISABLE, PAGE_NO_EXECUTE, PAGE_PRESENT, PAGE_SIZE, PAGE_WRITABLE,
-    PAGE_WRITE_THROUGH, PageTableEntry, VMALLOC_START, phys_to_virt, phys_to_virt_table,
+    PAGE_WRITE_THROUGH, PTE_ADDR_MASK, VMALLOC_START, phys_to_virt,
 };
 use crate::mm::tlb::flush_tlb_kernel_range;
 
@@ -345,16 +350,18 @@ pub(crate) unsafe fn vunmap_page(va: u64) -> Option<u64> {
     unsafe { unmap_page(va) }
 }
 
-/// The swapper's entry `idx` of the table frame `table`
+/// The swapper's entry `idx` (mod 512) of the kernel table frame
+/// `table`
 ///
 /// # Safety
 ///
-/// `table` is a live kernel table frame, and the caller holds KTABLES
-/// or changes only an entry of a range it holds.
-unsafe fn entry<'a>(table: u64, idx: usize) -> &'a mut PageTableEntry {
-    // SAFETY: a live kernel table frame (the caller's guarantee),
-    // reached through the direct map; `idx` < 512
-    unsafe { (*phys_to_virt_table(table)).entry_mut(idx) }
+/// `table` is a kernel table frame under the swapper (never freed).
+unsafe fn entry(table: u64, idx: usize) -> &'static AtomicU64 {
+    let p = phys_to_virt(table).cast::<u64>().wrapping_add(idx & 511);
+    // SAFETY: an entry of a table frame that stays (the caller's
+    // guarantee), through the direct map; page-table entries are only
+    // accessed atomically
+    unsafe { AtomicU64::from_ptr(p) }
 }
 
 /// Map a single 4KB page in the vmalloc window of the swapper's kernel
@@ -368,31 +375,36 @@ unsafe fn entry<'a>(table: u64, idx: usize) -> &'a mut PageTableEntry {
 unsafe fn map_page(va: u64, pa: u64, flags: u64) -> Result<(), IoremapError> {
     let (pml4_idx, pdpt_idx, pd_idx, pt_idx) = page_indices(va);
     let _tables = KTABLES.lock();
-    // SAFETY: the swapper root, live forever; KTABLES held
-    let pml4e = unsafe { entry(swapper_phys(), pml4_idx) };
+    // SAFETY: the swapper root, live forever
+    let pml4e = unsafe { entry(swapper_phys(), pml4_idx) }.load(Ordering::Acquire);
     // The window's PML4 entry is preallocated (kmap::init)
-    assert!(pml4e.is_present(), "ioremap: no vmalloc PDPT");
+    assert!(pml4e & PAGE_PRESENT != 0, "ioremap: no vmalloc PDPT");
     // SAFETY: the kernel tables under the swapper are never freed;
     // KTABLES held while missing ones are added
-    let pd = unsafe { table(entry(pml4e.addr(), pdpt_idx)) }?;
+    let pd = unsafe { table(entry(pml4e & PTE_ADDR_MASK, pdpt_idx)) }?;
     // SAFETY: as above
     let pt = unsafe { table(entry(pd, pd_idx)) }?;
-    // SAFETY: the caller's page in a live kernel table; no one else
-    // changes it (the caller's guarantee)
-    unsafe { entry(pt, pt_idx) }.set(pa, flags);
+    // SAFETY: a kernel table, never freed; the entry is the caller's
+    // page, which no one else changes (the caller's guarantee)
+    unsafe { entry(pt, pt_idx) }.store((pa & PTE_ADDR_MASK) | flags, Ordering::Release);
     Ok(())
 }
 
-/// Table frame under a PDPT or PD entry, allocated if absent
+/// Table frame under a PDPT or PD entry, added if absent
 ///
 /// # Safety
 ///
-/// `e` is an entry of a live kernel page table, KTABLES held.
-unsafe fn table(e: &mut PageTableEntry) -> Result<u64, IoremapError> {
-    if !e.is_present() {
-        e.set(alloc_zeroed_frame()?, INTERMEDIATE_FLAGS);
+/// `e` is an upper entry of a kernel page table under the swapper,
+/// KTABLES held.
+unsafe fn table(e: &AtomicU64) -> Result<u64, IoremapError> {
+    let v = e.load(Ordering::Acquire);
+    if v & PAGE_PRESENT != 0 {
+        return Ok(v & PTE_ADDR_MASK);
     }
-    Ok(e.addr())
+    let t = alloc_zeroed_frame()?;
+    // Release: lock-free walkers that see the entry see the zeroed table
+    e.store(t | INTERMEDIATE_FLAGS, Ordering::Release);
+    Ok(t)
 }
 
 /// Unmap a single page (clear PTE, don't free intermediate tables);
@@ -407,19 +419,18 @@ unsafe fn unmap_page(va: u64) -> Option<u64> {
     let mut table = swapper_phys();
     for idx in [pml4_idx, pdpt_idx, pd_idx] {
         // SAFETY: the swapper root or a kernel table under it, never
-        // freed; only read here
-        let e = unsafe { entry(table, idx) };
-        if !e.is_present() {
+        // freed; read atomically (KTABLES not needed: an upper entry is
+        // only ever added, under it)
+        let e = unsafe { entry(table, idx) }.load(Ordering::Acquire);
+        if e & PAGE_PRESENT == 0 {
             return None;
         }
-        table = e.addr();
+        table = e & PTE_ADDR_MASK;
     }
-    // SAFETY: the caller's page in a live kernel table; no one else
-    // changes it (the caller's guarantee)
-    let e = unsafe { entry(table, pt_idx) };
-    let pa = e.is_present().then(|| e.addr());
-    e.clear();
-    pa
+    // SAFETY: a kernel table, never freed; the entry is the caller's
+    // page, which no one else changes (the caller's guarantee)
+    let e = unsafe { entry(table, pt_idx) }.swap(0, Ordering::AcqRel);
+    (e & PAGE_PRESENT != 0).then_some(e & PTE_ADDR_MASK)
 }
 
 /// Allocate a zeroed frame for page tables

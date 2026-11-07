@@ -1626,7 +1626,11 @@ layout in `doc/MEMORY.md`
   `spin::Mutex` leaves, thread context only; a mapping adds missing
   tables under `KTABLES` (`spin::Mutex` leaf, thread context, one per
   arch in ioremap.rs; `FRAME_ALLOCATOR` is taken under it for table
-  frames). Linux: `vmap_area_lock` + `init_mm.page_table_lock`. A PTE
+  frames). Linux: `vmap_area_lock` + `init_mm.page_table_lock`. Their
+  entries are only accessed atomically: an upper entry is only ever
+  added (a release store under `KTABLES`), so a walker that does not
+  add (iounmap, a `VmArea` unmap) reads them with acquire loads and no
+  lock, as Linux vunmap walks without init_mm's lock. A PTE
   of a range one owns is set or cleared without a lock: only the
   holder of the range's `vmalloc::VmArea` (Linux vm_struct; a vmalloc
   block, a kernel stack) or of an ioremap mapping changes it, and these
