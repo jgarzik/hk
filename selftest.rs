@@ -195,6 +195,9 @@ fn selftest_thread(_arg: usize) {
     if let Some(what) = crate::mm::pagewalk::selftest() {
         check(what, false, 0);
     }
+    if let Some(what) = crate::mm::pgtable::selftest() {
+        check(what, false, 0);
+    }
 
     // 6b. Fallible Arc: std's Arc takes the block kalloc reserved
     check("kalloc_arc_reserve", crate::util::kalloc::selftest(), 0);

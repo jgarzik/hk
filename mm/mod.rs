@@ -40,6 +40,7 @@ pub mod mremap;
 pub mod page;
 pub mod page_alloc;
 pub mod pagewalk;
+pub mod pgtable;
 pub mod ptl;
 pub mod remote;
 pub mod rmap;
@@ -936,6 +937,13 @@ impl Mm {
     #[track_caller]
     pub fn mmap_write_killable(&self) -> Result<RwSemWriteGuard<'_, MmStruct>, KernelError> {
         self.map.write_killable()
+    }
+
+    /// `map` is this address space's VMA tree (the one under its
+    /// mmap_lock), so a borrow of it pins this address space's page
+    /// tables (`pgtable::PgTables`)
+    pub fn holds(&self, map: &MmStruct) -> bool {
+        core::ptr::eq(map, self.map.data_ptr())
     }
 
     /// The page_table_lock (taken through `ptl::pt_lock`)

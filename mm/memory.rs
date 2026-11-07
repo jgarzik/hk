@@ -12,7 +12,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use super::gather::Gather;
 use super::huge_page::{HUGE_PAGE_SIZE, split_huge_pmd, take_huge_pmd};
 use super::pagewalk::{PteRange, PteWalk, entry, table_slot, walk_pte_range};
-use super::{Mm, PAGE_SIZE, SwapEntry, Vma};
+use super::{Mm, MmStruct, PAGE_SIZE, SwapEntry, Vma};
 use crate::FRAME_ALLOCATOR;
 use crate::arch::{Leaf, paging};
 use crate::mm::page::phys_to_page;
@@ -67,11 +67,14 @@ pub(super) fn zap_leaf(leaf: Leaf) {
 pub(super) fn exit_mmap(mm: &Mm) {
     // Out of their reverse-map chains first (Linux free_pgtables
     // unlinks each VMA): a walk holding a chain never meets the tables
-    // freed below
-    let vmas: Vec<_> = mm.mmap_write().take_vmas();
+    // freed below. The tables go with the mmap_lock held for writing
+    // (Linux exit_mmap), so no `PgTables` of this mm lives meanwhile.
+    let mut map = mm.mmap_write();
+    let vmas: Vec<_> = map.take_vmas();
     let mut tlb = Gather::new_full(mm);
     tlb.free_tables(paging::detach_user(mm.pgd()));
     drop(tlb);
+    drop(map);
     // VMAs go last, outside any lock: they may hold the last reference
     // to a mapped file
     drop(vmas);
@@ -131,14 +134,19 @@ impl PteWalk for Zap<'_, '_> {
 }
 
 /// Free the page tables of [start, end) that no VMA needs any more
-/// (Linux free_pgtables / free_pgd_range), mm lock held for writing,
-/// after the range was zapped and its VMAs left their reverse-map
-/// chains: a table is freed when the whole span it maps lies in
-/// [floor, ceiling) (the gap between the neighbouring VMAs) and it is
-/// empty. Its parent entry is cleared at once; the frame goes to `tlb`,
-/// freed after the flush that drops the paging-structure caches. The
+/// (Linux free_pgtables / free_pgd_range), after the range was zapped
+/// and its VMAs removed from `map` (which unlinks them from their
+/// reverse-map chains). `map` is the gather's address space's VMA tree,
+/// borrowed mutably: the mmap_lock held for writing, and no
+/// `PgTables` of the address space alive. A table is freed when the
+/// whole span it maps lies in the gap between the VMAs around the range
+/// (so outside every VMA left, and every chain entry) and it is empty.
+/// Its parent entry is cleared at once; the frame goes to `tlb`, freed
+/// after the flush that drops the paging-structure caches. The
 /// top-level table stays.
-pub fn free_pgtables(tlb: &mut Gather<'_>, start: u64, end: u64, floor: u64, ceiling: u64) {
+pub fn free_pgtables(map: &mut MmStruct, tlb: &mut Gather<'_>, start: u64, end: u64) {
+    assert!(tlb.mm().holds(map), "free_pgtables: VMAs of another mm");
+    let (floor, ceiling) = map.gap_around(start, end);
     if start < end {
         let r = PtRange {
             start,

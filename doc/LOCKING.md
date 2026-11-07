@@ -1211,9 +1211,9 @@ pub struct Zone {
 - `Mm.users` (`AtomicUsize`, Linux mm_users) counts the tasks running in
   the address space and pinned users (`MmRef`: ptrace PEEK/POKE,
   process_vm_*, a /proc/<pid>/maps read). The last `MmRef` drop runs
-  `exit_mmap`, which takes the VMAs under the mm lock, drops the rmap
-  chains, then tears down the user half (`paging::detach_user`, a
-  TLB flush, `UserTables::free`) and drops
+  `exit_mmap`, which, under the mm lock held for writing, takes the
+  VMAs (dropping the rmap chains) and tears down the user half
+  (`paging::detach_user`, a TLB flush, `UserTables::free`), then drops
   the VMAs (file references) with no lock held. **Never drop an `MmRef`
   under a spinlock** (TASKLIST included): take it out (`Option::take`,
   `replace`) and drop it after unlocking. `mmget_not_zero` refuses an
@@ -1340,12 +1340,18 @@ pub struct Zone {
   then the child's) and mremap's `move_ptes` (the old table, then each
   new one; Linux move_ptes), both with the mmap_lock held for writing,
   so no other path holds two and the pair cannot invert. Tables
-  are freed while the address space is live only with the mm lock held
-  for writing (munmap, mremap: `memory::free_pgtables`, Linux
-  free_pgtables), after the VMAs of their range left the reverse-map
-  chains, and only once empty and outside every remaining VMA's span:
-  an entry pointer stays valid under any mm lock hold, or under the
-  AnonVma.chain lock of a VMA it lies in (the reverse map). Order: mm lock -> page_table_lock -> PTE lock ->
+  are freed only with the mm lock held for writing: munmap and mremap
+  (`memory::free_pgtables`, Linux free_pgtables, which takes the
+  `&mut MmStruct`) after the VMAs of their range left the reverse-map
+  chains, and only once empty and outside every remaining VMA's span;
+  exit (`exit_mmap`) after unlinking every VMA. So an entry stays valid
+  under any mm lock hold, or under the chain lock (AnonVma.chain, a
+  file's i_mmap) of a VMA it lies in (the reverse map), and
+  `mm::pgtable` makes that a borrow: a `PgTables` is made from a
+  borrow of the `MmStruct` (an mm lock guard) or of a held chain
+  (`ChainRead::entries`, limited to the VMA's range), and the `Pte`
+  and `PteTable` (PTE lock held) handles it gives cannot outlive it.
+  Order: mm lock -> page_table_lock -> PTE lock ->
   `FRAME_ALLOCATOR` (the TLB is flushed under them); never in
   interrupt context; no sleeping under them. Both disable preemption
   (in_atomic), so an allocation under them never enters direct reclaim:

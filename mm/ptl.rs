@@ -18,10 +18,12 @@
 //! Under the PTE lock the MMU still sets accessed/dirty bits, so
 //! entries change by compare-and-swap, retried only for those bits.
 //! Only fork (parent, then child) and mremap (old table, then new)
-//! nest two PTE locks, under the mmap_lock held for writing. Tables are freed only with the mmap_lock held for
-//! writing (munmap, mremap: `memory::free_pgtables`), after their
-//! VMAs left the reverse-map chains, so a pointer to an entry stays
-//! valid under any mmap_lock hold, or the AnonVma lock of a VMA there.
+//! nest two PTE locks, under the mmap_lock held for writing. Tables
+//! are freed only with the mmap_lock held for writing (munmap, mremap:
+//! `memory::free_pgtables`; exit), after their VMAs left the
+//! reverse-map chains, so an entry stays valid under any mmap_lock
+//! hold, or the chain lock of a VMA there: `pgtable::PgTables` and its
+//! handles borrow one of those.
 //!
 //! Order: mmap_lock -> page_table_lock -> PTE lock -> allocator, never
 //! the reverse. Both are spin locks with preemption off: an allocation

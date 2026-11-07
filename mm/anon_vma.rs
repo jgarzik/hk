@@ -33,6 +33,7 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 
 use super::Mm;
+use super::pgtable::PgTables;
 
 /// The chain's lock: a sleeping RwSem; host tests, which cannot
 /// schedule, use a spinning one with the same interface
@@ -40,6 +41,47 @@ use super::Mm;
 type ChainLock = crate::sync::RwSem<Vec<Avc>>;
 #[cfg(test)]
 type ChainLock = crate::sync::spin::RwLock<Vec<Avc>>;
+
+#[cfg(not(test))]
+type ChainReadGuard<'a> = crate::sync::RwSemReadGuard<'a, Vec<Avc>>;
+#[cfg(test)]
+type ChainReadGuard<'a> = crate::sync::spin::RwLockReadGuard<'a, Vec<Avc>>;
+
+/// A chain held for reading (Linux anon_vma_lock_read): its entries,
+/// and the page tables of each entry's VMA, pinned while it is held
+///
+/// # Invariants
+///
+/// The guard holds the chain's lock for reading: no entry leaves it
+/// meanwhile.
+#[must_use]
+pub struct ChainRead<'a>(ChainReadGuard<'a>);
+
+impl core::ops::Deref for ChainRead<'_> {
+    type Target = Vec<Avc>;
+    fn deref(&self) -> &Vec<Avc> {
+        &self.0
+    }
+}
+
+impl ChainRead<'_> {
+    /// Each entry with the page tables of its VMA's range in its
+    /// address space, pinned while the chain is held (Linux
+    /// rmap_walk_anon's vma and its page_vma_mapped_walk)
+    pub fn entries(&self) -> impl Iterator<Item = (&Avc, PgTables<'_>)> {
+        self.0.iter().map(|c| {
+            // SAFETY: the chain is held for reading (type invariant), so
+            // `c` stays in it; a VMA leaves its chains (under the chain
+            // held for writing) before the tables of its range are freed
+            // (munmap and mremap free only outside every VMA left,
+            // `free_pgtables`; exit unlinks every VMA first) and before
+            // its address space's top-level table goes (`exit_mmap`
+            // runs before `Mm::drop`)
+            let t = unsafe { PgTables::from_raw(c.pgd, c.start, c.end) };
+            (c, t)
+        })
+    }
+}
 
 /// One VMA that may map pages of an AnonVma (Linux anon_vma_chain)
 #[derive(Clone, Debug)]
@@ -108,20 +150,21 @@ impl AnonVma {
     }
 
     /// The chain, for a reverse-map walk (Linux anon_vma_lock_read)
-    pub fn read(&self) -> impl core::ops::Deref<Target = Vec<Avc>> + '_ {
-        self.chain.read()
+    #[track_caller]
+    pub fn read(&self) -> ChainRead<'_> {
+        // INVARIANT: the chain's read lock, held by the guard
+        ChainRead(self.chain.read())
     }
 
     /// The chain for a walk; with `try_only` (reclaim), none if it is
     /// held for writing (Linux anon_vma_trylock_read)
-    pub fn read_for(
-        &self,
-        try_only: bool,
-    ) -> Option<impl core::ops::Deref<Target = Vec<Avc>> + '_> {
+    #[track_caller]
+    pub fn read_for(&self, try_only: bool) -> Option<ChainRead<'_>> {
         if try_only {
-            self.chain.try_read()
+            // INVARIANT: as in `read`
+            self.chain.try_read().map(ChainRead)
         } else {
-            Some(self.chain.read())
+            Some(self.read())
         }
     }
 

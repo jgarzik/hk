@@ -478,16 +478,15 @@ pub fn dirty_folio(m: &AddressSpace, phys: u64) {
 fn mkclean(m: &AddressSpace, index: u64, phys: u64) {
     use crate::arch::paging;
     let chain = m.i_mmap.read();
-    for avc in chain.iter() {
+    for (avc, tables) in chain.entries() {
         let (Some(addr), Some(mm)) = (avc.address(index), avc.mm.upgrade()) else {
             continue;
         };
-        let Some(ptep) = paging::pte_ptr(avc.pgd, addr) else {
+        let Some(ptep) = tables.pte(addr) else {
             continue;
         };
-        let _l = super::ptl::pte_lock(ptep);
-        // SAFETY: a live table of a VMA in the chain, under its PTE lock
-        let e = unsafe { AtomicU64::from_ptr(ptep) };
+        let t = ptep.lock();
+        let e = t.entry(addr);
         // The MMU may set accessed/dirty meanwhile (under the PTE lock
         // only it changes the entry): a compare-exchange keeps those
         // bits, where a load then store could drop a dirty bit set by a

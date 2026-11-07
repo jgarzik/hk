@@ -444,8 +444,7 @@ pub(crate) fn munmap_locked(
     for vma in &removed {
         super::memory::zap_range(&mut tlb, vma.start.max(start), vma.end.min(end));
     }
-    let (floor, ceiling) = mm.gap_around(start, end);
-    super::memory::free_pgtables(&mut tlb, start, end, floor, ceiling);
+    super::memory::free_pgtables(mm, &mut tlb, start, end);
     drop(tlb);
     #[cfg(feature = "mmcheck")]
     super::check::verify(mm, owner.pgd(), "munmap");
@@ -1602,9 +1601,8 @@ fn move_mapping(
     }
     if !dontunmap {
         // The old range's tables, now empty (Linux move_vma unmaps it)
-        let (floor, ceiling) = mm.gap_around(old_addr, old_addr + old_len);
         let mut tlb = super::gather::Gather::new(owner);
-        super::memory::free_pgtables(&mut tlb, old_addr, old_addr + old_len, floor, ceiling);
+        super::memory::free_pgtables(mm, &mut tlb, old_addr, old_addr + old_len);
     }
     Ok(())
 }
