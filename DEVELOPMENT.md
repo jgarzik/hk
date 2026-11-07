@@ -232,11 +232,11 @@ make check          # Build x86-64 + run boot tests
 make check-arm      # Build aarch64 + run boot tests
 ```
 
-Tests live in `user/boot_tester/tests/<subsys>/*.rs`, one directory per
+Tests live in `user/boot_tester/<subsys>/*.rs`, one directory per
 subsystem (`arch`, `exec`, `fs`, `io`, `ipc`, `mm`, `net`, `proc`,
 `process`, `signal`, `time`), each declaring its suites in its `mod.rs`;
-`tests/mod.rs::run_all_tests` calls every suite, in order. Shared
-helpers are in `tests/helpers.rs`.
+`main.rs::run_all_tests` calls every suite, in order. Shared helpers
+are in `helpers.rs`, the verdict printers in `harness.rs`.
 
 A successful boot shows all tests passing and ends with `BOOT_COMPLETE`.
 

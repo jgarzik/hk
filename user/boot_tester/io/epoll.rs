@@ -1,0 +1,825 @@
+//! epoll tests
+//!
+//! Tests:
+//! - Test epoll_create/epoll_create1
+//! - Test epoll_ctl ADD/DEL/MOD
+//! - Test epoll_wait with pipes
+//! - Test epoll_wait with eventfd
+//! - Test epoll_event layout: 64-bit data, multiple events
+//! - Test epoll_wait timeout behavior
+//! - Test EPOLLONESHOT mode
+//! - EPOLL_CLOSE_EOF: a watched pipe end closed is released (EOF)
+//! - EPOLL_LOOP_ELOOP / EPOLL_NEST_DEPTH: ep_loop_check
+//! - EPOLL_ET_REARM: edge-triggered reports each new event
+//! - EPOLL_MAXEVENTS: Linux's maxevents range
+
+use crate::harness::{fail_num, pass};
+use crate::helpers::{host_mode, print, print_num, println, skip};
+use hk_syscall::{
+    EPOLL_CLOEXEC, EPOLL_CTL_ADD, EPOLL_CTL_DEL, EPOLL_CTL_MOD, EPOLLET, EPOLLIN, EPOLLONESHOT,
+    EPOLLOUT, EpollEvent, O_NONBLOCK, Timespec, sys_close, sys_epoll_create, sys_epoll_create1,
+    sys_epoll_ctl, sys_epoll_pwait2, sys_epoll_wait, sys_eventfd2, sys_pipe2, sys_write,
+};
+
+/// Run all epoll tests
+pub fn run_tests() {
+    test_epoll_create();
+    test_epoll_create1();
+    test_epoll_add_del();
+    test_epoll_wait_pipe();
+    test_epoll_wait_eventfd();
+    test_epoll_wait_multi_data64();
+    test_epoll_event_pad_zero();
+    test_epoll_timeout();
+    test_epoll_modify();
+    test_epoll_oneshot();
+    test_epoll_pwait2_null_timeout();
+    test_epoll_pwait2_zero_timeout();
+    test_epoll_pwait2_with_data();
+    test_epoll_close_eof();
+    test_epoll_loop();
+    test_epoll_nest_depth();
+    test_epoll_et_rearm();
+    test_epoll_maxevents();
+    test_epoll_hup_events0();
+    test_epoll_et_partial_read();
+}
+
+const ELOOP: i64 = -40;
+const EINVAL: i64 = -22;
+
+/// Test epoll_create (legacy API)
+fn test_epoll_create() {
+    let epfd = sys_epoll_create(1);
+    if epfd < 0 {
+        print(b"EPOLL_CREATE:FAIL: returned ");
+        print_num(epfd);
+        return;
+    }
+
+    let close_ret = sys_close(epfd as u64);
+    if close_ret != 0 {
+        print(b"EPOLL_CREATE:FAIL: close returned ");
+        print_num(close_ret);
+        return;
+    }
+
+    pass(b"EPOLL_CREATE");
+}
+
+/// Test epoll_create1 with EPOLL_CLOEXEC
+fn test_epoll_create1() {
+    let epfd = sys_epoll_create1(EPOLL_CLOEXEC);
+    if epfd < 0 {
+        print(b"EPOLL_CREATE1:FAIL: returned ");
+        print_num(epfd);
+        return;
+    }
+
+    let close_ret = sys_close(epfd as u64);
+    if close_ret != 0 {
+        print(b"EPOLL_CREATE1:FAIL: close returned ");
+        print_num(close_ret);
+        return;
+    }
+
+    pass(b"EPOLL_CREATE1");
+}
+
+/// Test epoll_ctl ADD and DEL operations
+fn test_epoll_add_del() {
+    // Create epoll instance
+    let epfd = sys_epoll_create1(0);
+    if epfd < 0 {
+        print(b"EPOLL_ADD_DEL:FAIL: epoll_create1 returned ");
+        print_num(epfd);
+        return;
+    }
+
+    // Create a pipe
+    let mut pipefd = [0i32; 2];
+    let ret = sys_pipe2(pipefd.as_mut_ptr(), 0);
+    if ret < 0 {
+        print(b"EPOLL_ADD_DEL:FAIL: pipe2 returned ");
+        print_num(ret);
+        sys_close(epfd as u64);
+        return;
+    }
+
+    // Add read end to epoll
+    let event = EpollEvent::new(EPOLLIN, 42);
+    let ret = sys_epoll_ctl(epfd as i32, EPOLL_CTL_ADD, pipefd[0], &event);
+    if ret != 0 {
+        print(b"EPOLL_ADD_DEL:FAIL: add returned ");
+        print_num(ret);
+        sys_close(epfd as u64);
+        sys_close(pipefd[0] as u64);
+        sys_close(pipefd[1] as u64);
+        return;
+    }
+
+    // Delete it
+    let ret = sys_epoll_ctl(epfd as i32, EPOLL_CTL_DEL, pipefd[0], core::ptr::null());
+    if ret != 0 {
+        print(b"EPOLL_ADD_DEL:FAIL: del returned ");
+        print_num(ret);
+        sys_close(epfd as u64);
+        sys_close(pipefd[0] as u64);
+        sys_close(pipefd[1] as u64);
+        return;
+    }
+
+    // Cleanup
+    sys_close(epfd as u64);
+    sys_close(pipefd[0] as u64);
+    sys_close(pipefd[1] as u64);
+    pass(b"EPOLL_ADD_DEL");
+}
+
+/// Test epoll_wait with a pipe
+fn test_epoll_wait_pipe() {
+    let epfd = sys_epoll_create1(0);
+    if epfd < 0 {
+        print(b"EPOLL_WAIT_PIPE:FAIL: epoll_create1 returned ");
+        print_num(epfd);
+        return;
+    }
+
+    let mut pipefd = [0i32; 2];
+    let ret = sys_pipe2(pipefd.as_mut_ptr(), 0);
+    if ret < 0 {
+        print(b"EPOLL_WAIT_PIPE:FAIL: pipe2 returned ");
+        print_num(ret);
+        sys_close(epfd as u64);
+        return;
+    }
+
+    // Add read end with user data 123
+    let event = EpollEvent::new(EPOLLIN, 123);
+    sys_epoll_ctl(epfd as i32, EPOLL_CTL_ADD, pipefd[0], &event);
+
+    // Write to pipe to make read end ready
+    let data = b"X";
+    sys_write(pipefd[1] as u64, data.as_ptr(), 1);
+
+    // Wait should return 1 event
+    let mut events = [EpollEvent::empty(); 4];
+    let ret = sys_epoll_wait(epfd as i32, events.as_mut_ptr(), 4, 0);
+    if ret != 1 {
+        print(b"EPOLL_WAIT_PIPE:FAIL: expected 1, got ");
+        print_num(ret);
+        sys_close(epfd as u64);
+        sys_close(pipefd[0] as u64);
+        sys_close(pipefd[1] as u64);
+        return;
+    }
+
+    // Check user data was returned correctly
+    if events[0].data != 123 {
+        print(b"EPOLL_WAIT_PIPE:FAIL: wrong data ");
+        print_num(events[0].data as i64);
+        sys_close(epfd as u64);
+        sys_close(pipefd[0] as u64);
+        sys_close(pipefd[1] as u64);
+        return;
+    }
+
+    // Check EPOLLIN is set
+    if events[0].events & EPOLLIN == 0 {
+        print(b"EPOLL_WAIT_PIPE:FAIL: EPOLLIN not set, events=");
+        print_num(events[0].events as i64);
+        sys_close(epfd as u64);
+        sys_close(pipefd[0] as u64);
+        sys_close(pipefd[1] as u64);
+        return;
+    }
+
+    // Cleanup
+    sys_close(epfd as u64);
+    sys_close(pipefd[0] as u64);
+    sys_close(pipefd[1] as u64);
+    pass(b"EPOLL_WAIT_PIPE");
+}
+
+/// Test epoll_wait with eventfd
+fn test_epoll_wait_eventfd() {
+    let epfd = sys_epoll_create1(0);
+    if epfd < 0 {
+        print(b"EPOLL_WAIT_EVENTFD:FAIL: epoll_create1 returned ");
+        print_num(epfd);
+        return;
+    }
+
+    // Create eventfd with initial value 1 (immediately readable)
+    let efd = sys_eventfd2(1, 0);
+    if efd < 0 {
+        print(b"EPOLL_WAIT_EVENTFD:FAIL: eventfd2 returned ");
+        print_num(efd);
+        sys_close(epfd as u64);
+        return;
+    }
+
+    // Add eventfd with user data 456
+    let event = EpollEvent::new(EPOLLIN, 456);
+    sys_epoll_ctl(epfd as i32, EPOLL_CTL_ADD, efd as i32, &event);
+
+    // Wait should return 1 event since counter > 0
+    let mut events = [EpollEvent::empty(); 4];
+    let ret = sys_epoll_wait(epfd as i32, events.as_mut_ptr(), 4, 0);
+    if ret != 1 {
+        print(b"EPOLL_WAIT_EVENTFD:FAIL: expected 1, got ");
+        print_num(ret);
+        sys_close(epfd as u64);
+        sys_close(efd as u64);
+        return;
+    }
+
+    if events[0].data != 456 {
+        print(b"EPOLL_WAIT_EVENTFD:FAIL: wrong data ");
+        print_num(events[0].data as i64);
+        sys_close(epfd as u64);
+        sys_close(efd as u64);
+        return;
+    }
+
+    sys_close(epfd as u64);
+    sys_close(efd as u64);
+    pass(b"EPOLL_WAIT_EVENTFD");
+}
+
+/// Test epoll_event ABI layout: full 64-bit data, two events returned
+///
+/// epoll_event is packed (12 bytes) only on x86_64; on arm64 it is 16 bytes
+/// with data at offset 8 (include/uapi/linux/eventpoll.h EPOLL_PACKED).
+fn test_epoll_wait_multi_data64() {
+    const D1: u64 = 0xA1B2_C3D4_0000_0001;
+    const D2: u64 = 0x0102_0304_0506_0708;
+    let epfd = sys_epoll_create1(0);
+    let efd1 = sys_eventfd2(1, 0);
+    let efd2 = sys_eventfd2(1, 0);
+    if epfd < 0 || efd1 < 0 || efd2 < 0 {
+        println(b"EPOLL_WAIT_MULTI_DATA64:FAIL: setup failed");
+        return;
+    }
+    sys_epoll_ctl(
+        epfd as i32,
+        EPOLL_CTL_ADD,
+        efd1 as i32,
+        &EpollEvent::new(EPOLLIN, D1),
+    );
+    sys_epoll_ctl(
+        epfd as i32,
+        EPOLL_CTL_ADD,
+        efd2 as i32,
+        &EpollEvent::new(EPOLLIN, D2),
+    );
+
+    let mut events = [EpollEvent::empty(); 4];
+    let ret = sys_epoll_wait(epfd as i32, events.as_mut_ptr(), 4, 0);
+    let (e0, e1) = (events[0], events[1]);
+    let (d0, d1, ev0, ev1) = (e0.data, e1.data, e0.events, e1.events);
+    sys_close(epfd as u64);
+    sys_close(efd1 as u64);
+    sys_close(efd2 as u64);
+
+    let data_ok = (d0 == D1 && d1 == D2) || (d0 == D2 && d1 == D1);
+    if ret == 2 && data_ok && ev0 & EPOLLIN != 0 && ev1 & EPOLLIN != 0 {
+        pass(b"EPOLL_WAIT_MULTI_DATA64");
+    } else {
+        print(b"EPOLL_WAIT_MULTI_DATA64:FAIL: ret=");
+        print_num(ret);
+        print(b" data0=");
+        print_num(d0 as i64);
+        print(b" data1=");
+        print_num(d1 as i64);
+        println(b"");
+    }
+}
+
+/// Test: kernel zeroes epoll_event padding (bytes 4..8 on arm64) instead of
+/// leaking kernel memory. Linux never writes the padding (ep_send_events
+/// stores events/data separately), so the check is hk-only.
+fn test_epoll_event_pad_zero() {
+    let size = core::mem::size_of::<EpollEvent>();
+    if size == 12 {
+        pass(b"EPOLL_EVENT_PAD_ZERO"); // packed (x86_64): no padding
+        return;
+    }
+    if host_mode() {
+        skip(
+            b"EPOLL_EVENT_PAD_ZERO",
+            b"Linux leaves user padding untouched",
+        );
+        return;
+    }
+    let epfd = sys_epoll_create1(0);
+    let efd = sys_eventfd2(1, 0);
+    if epfd < 0 || efd < 0 {
+        println(b"EPOLL_EVENT_PAD_ZERO:FAIL: setup failed");
+        return;
+    }
+    sys_epoll_ctl(
+        epfd as i32,
+        EPOLL_CTL_ADD,
+        efd as i32,
+        &EpollEvent::new(EPOLLIN, 7),
+    );
+    let mut buf = [0xAAAA_AAAA_AAAA_AAAAu64; 8];
+    let ret = sys_epoll_wait(epfd as i32, buf.as_mut_ptr() as *mut EpollEvent, 4, 0);
+    sys_close(epfd as u64);
+    sys_close(efd as u64);
+    let pad = (buf[0] >> 32) as u32;
+    if ret == 1 && pad == 0 {
+        pass(b"EPOLL_EVENT_PAD_ZERO");
+    } else {
+        print(b"EPOLL_EVENT_PAD_ZERO:FAIL: ret=");
+        print_num(ret);
+        print(b" pad=");
+        print_num(pad as i64);
+        println(b"");
+    }
+}
+
+/// Test epoll_wait timeout behavior
+fn test_epoll_timeout() {
+    let epfd = sys_epoll_create1(0);
+    if epfd < 0 {
+        print(b"EPOLL_TIMEOUT:FAIL: epoll_create1 returned ");
+        print_num(epfd);
+        return;
+    }
+
+    // Empty epoll, timeout=0 should return 0 immediately
+    let mut events = [EpollEvent::empty(); 4];
+    let ret = sys_epoll_wait(epfd as i32, events.as_mut_ptr(), 4, 0);
+    if ret != 0 {
+        print(b"EPOLL_TIMEOUT:FAIL: expected 0, got ");
+        print_num(ret);
+        sys_close(epfd as u64);
+        return;
+    }
+
+    sys_close(epfd as u64);
+    pass(b"EPOLL_TIMEOUT");
+}
+
+/// Test epoll_ctl MOD operation
+fn test_epoll_modify() {
+    let epfd = sys_epoll_create1(0);
+    if epfd < 0 {
+        print(b"EPOLL_MODIFY:FAIL: epoll_create1 returned ");
+        print_num(epfd);
+        return;
+    }
+
+    let mut pipefd = [0i32; 2];
+    let ret = sys_pipe2(pipefd.as_mut_ptr(), 0);
+    if ret < 0 {
+        print(b"EPOLL_MODIFY:FAIL: pipe2 returned ");
+        print_num(ret);
+        sys_close(epfd as u64);
+        return;
+    }
+
+    // Add read end with EPOLLIN
+    let event = EpollEvent::new(EPOLLIN, 100);
+    sys_epoll_ctl(epfd as i32, EPOLL_CTL_ADD, pipefd[0], &event);
+
+    // Modify to watch for EPOLLOUT with different user data
+    let event2 = EpollEvent::new(EPOLLOUT, 200);
+    let ret = sys_epoll_ctl(epfd as i32, EPOLL_CTL_MOD, pipefd[0], &event2);
+    if ret != 0 {
+        print(b"EPOLL_MODIFY:FAIL: mod returned ");
+        print_num(ret);
+        sys_close(epfd as u64);
+        sys_close(pipefd[0] as u64);
+        sys_close(pipefd[1] as u64);
+        return;
+    }
+
+    // Cleanup
+    sys_close(epfd as u64);
+    sys_close(pipefd[0] as u64);
+    sys_close(pipefd[1] as u64);
+    pass(b"EPOLL_MODIFY");
+}
+
+/// Test EPOLLONESHOT mode
+fn test_epoll_oneshot() {
+    let epfd = sys_epoll_create1(0);
+    if epfd < 0 {
+        print(b"EPOLL_ONESHOT:FAIL: epoll_create1 returned ");
+        print_num(epfd);
+        return;
+    }
+
+    // Create eventfd with initial value 5
+    let efd = sys_eventfd2(5, 0);
+    if efd < 0 {
+        print(b"EPOLL_ONESHOT:FAIL: eventfd2 returned ");
+        print_num(efd);
+        sys_close(epfd as u64);
+        return;
+    }
+
+    // Add with EPOLLONESHOT
+    let event = EpollEvent::new(EPOLLIN | EPOLLONESHOT, 789);
+    sys_epoll_ctl(epfd as i32, EPOLL_CTL_ADD, efd as i32, &event);
+
+    // First wait should succeed
+    let mut events = [EpollEvent::empty(); 4];
+    let ret = sys_epoll_wait(epfd as i32, events.as_mut_ptr(), 4, 0);
+    if ret != 1 {
+        print(b"EPOLL_ONESHOT:FAIL: first wait expected 1, got ");
+        print_num(ret);
+        sys_close(epfd as u64);
+        sys_close(efd as u64);
+        return;
+    }
+
+    // Second wait should return 0 (oneshot disabled the fd)
+    let ret = sys_epoll_wait(epfd as i32, events.as_mut_ptr(), 4, 0);
+    if ret != 0 {
+        print(b"EPOLL_ONESHOT:FAIL: second wait expected 0, got ");
+        print_num(ret);
+        sys_close(epfd as u64);
+        sys_close(efd as u64);
+        return;
+    }
+
+    // Re-arm with MOD
+    let event2 = EpollEvent::new(EPOLLIN | EPOLLONESHOT, 789);
+    sys_epoll_ctl(epfd as i32, EPOLL_CTL_MOD, efd as i32, &event2);
+
+    // Now wait should succeed again
+    let ret = sys_epoll_wait(epfd as i32, events.as_mut_ptr(), 4, 0);
+    if ret != 1 {
+        print(b"EPOLL_ONESHOT:FAIL: third wait expected 1, got ");
+        print_num(ret);
+        sys_close(epfd as u64);
+        sys_close(efd as u64);
+        return;
+    }
+
+    sys_close(epfd as u64);
+    sys_close(efd as u64);
+    pass(b"EPOLL_ONESHOT");
+}
+
+/// Test epoll_pwait2 with NULL timeout (indefinite wait, but with ready fd)
+fn test_epoll_pwait2_null_timeout() {
+    let epfd = sys_epoll_create1(0);
+    if epfd < 0 {
+        fail_num(b"EPOLL_PWAIT2_NULL:FAIL: epoll_create1 returned ", epfd);
+        return;
+    }
+
+    // Create eventfd with initial value 1 (immediately readable)
+    let efd = sys_eventfd2(1, 0);
+    if efd < 0 {
+        fail_num(b"EPOLL_PWAIT2_NULL:FAIL: eventfd2 returned ", efd);
+        sys_close(epfd as u64);
+        return;
+    }
+
+    let event = EpollEvent::new(EPOLLIN, 100);
+    sys_epoll_ctl(epfd as i32, EPOLL_CTL_ADD, efd as i32, &event);
+
+    // NULL timeout with ready fd should return immediately
+    let mut events = [EpollEvent::empty(); 4];
+    let ret = sys_epoll_pwait2(
+        epfd as i32,
+        events.as_mut_ptr(),
+        4,
+        core::ptr::null(),
+        core::ptr::null(),
+        0,
+    );
+    if ret != 1 {
+        fail_num(b"EPOLL_PWAIT2_NULL:FAIL: expected 1, got ", ret);
+        sys_close(epfd as u64);
+        sys_close(efd as u64);
+        return;
+    }
+
+    if events[0].data != 100 {
+        fail_num(
+            b"EPOLL_PWAIT2_NULL:FAIL: wrong data ",
+            events[0].data as i64,
+        );
+        sys_close(epfd as u64);
+        sys_close(efd as u64);
+        return;
+    }
+
+    sys_close(epfd as u64);
+    sys_close(efd as u64);
+    pass(b"EPOLL_PWAIT2_NULL");
+}
+
+/// Test epoll_pwait2 with zero timeout (non-blocking)
+fn test_epoll_pwait2_zero_timeout() {
+    let epfd = sys_epoll_create1(0);
+    if epfd < 0 {
+        fail_num(b"EPOLL_PWAIT2_ZERO:FAIL: epoll_create1 returned ", epfd);
+        return;
+    }
+
+    // Empty epoll, zero timeout should return 0 immediately
+    let mut events = [EpollEvent::empty(); 4];
+    let timeout = Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    let ret = sys_epoll_pwait2(
+        epfd as i32,
+        events.as_mut_ptr(),
+        4,
+        &timeout,
+        core::ptr::null(),
+        0,
+    );
+    if ret != 0 {
+        fail_num(b"EPOLL_PWAIT2_ZERO:FAIL: expected 0, got ", ret);
+        sys_close(epfd as u64);
+        return;
+    }
+
+    sys_close(epfd as u64);
+    pass(b"EPOLL_PWAIT2_ZERO");
+}
+
+/// Test epoll_pwait2 with data ready and small timeout
+fn test_epoll_pwait2_with_data() {
+    let epfd = sys_epoll_create1(0);
+    if epfd < 0 {
+        fail_num(b"EPOLL_PWAIT2_DATA:FAIL: epoll_create1 returned ", epfd);
+        return;
+    }
+
+    let mut pipefd = [0i32; 2];
+    let ret = sys_pipe2(pipefd.as_mut_ptr(), 0);
+    if ret < 0 {
+        fail_num(b"EPOLL_PWAIT2_DATA:FAIL: pipe2 returned ", ret);
+        sys_close(epfd as u64);
+        return;
+    }
+
+    // Add read end
+    let event = EpollEvent::new(EPOLLIN, 200);
+    sys_epoll_ctl(epfd as i32, EPOLL_CTL_ADD, pipefd[0], &event);
+
+    // Write to pipe
+    let data = b"Y";
+    sys_write(pipefd[1] as u64, data.as_ptr(), 1);
+
+    // Use 100ms timeout (in nanoseconds)
+    let timeout = Timespec {
+        tv_sec: 0,
+        tv_nsec: 100_000_000,
+    };
+    let mut events = [EpollEvent::empty(); 4];
+    let ret = sys_epoll_pwait2(
+        epfd as i32,
+        events.as_mut_ptr(),
+        4,
+        &timeout,
+        core::ptr::null(),
+        0,
+    );
+    if ret != 1 {
+        fail_num(b"EPOLL_PWAIT2_DATA:FAIL: expected 1, got ", ret);
+        sys_close(epfd as u64);
+        sys_close(pipefd[0] as u64);
+        sys_close(pipefd[1] as u64);
+        return;
+    }
+
+    if events[0].data != 200 {
+        fail_num(
+            b"EPOLL_PWAIT2_DATA:FAIL: wrong data ",
+            events[0].data as i64,
+        );
+        sys_close(epfd as u64);
+        sys_close(pipefd[0] as u64);
+        sys_close(pipefd[1] as u64);
+        return;
+    }
+
+    sys_close(epfd as u64);
+    sys_close(pipefd[0] as u64);
+    sys_close(pipefd[1] as u64);
+    pass(b"EPOLL_PWAIT2_DATA");
+}
+
+fn ok_or_fail(name: &[u8], step: i64) {
+    print(name);
+    if step == 0 {
+        println(b":OK");
+    } else {
+        fail_num(b":FAIL step ", step);
+    }
+}
+
+/// A watched file holds no reference: closing the write end of a pipe
+/// that an epoll watches gives the reader EOF (Linux epitems pin
+/// nothing; the file's last close removes them)
+fn test_epoll_close_eof() {
+    let step = (|| {
+        let epfd = sys_epoll_create1(0) as i32;
+        let mut p = [0i32; 2];
+        if epfd < 0 || sys_pipe2(p.as_mut_ptr(), O_NONBLOCK) < 0 {
+            return 1;
+        }
+        let ev = EpollEvent::new(EPOLLOUT, 1);
+        if sys_epoll_ctl(epfd, EPOLL_CTL_ADD, p[1], &ev) != 0 {
+            return 2;
+        }
+        sys_close(p[1] as u64);
+        let mut b = [0u8; 1];
+        let r = hk_syscall::sys_read(p[0] as u64, b.as_mut_ptr(), 1);
+        sys_close(p[0] as u64);
+        sys_close(epfd as u64);
+        if r != 0 { 3 } else { 0 }
+    })();
+    ok_or_fail(b"EPOLL_CLOSE_EOF", step);
+}
+
+/// Watching an epoll from one it watches is ELOOP (Linux ep_loop_check)
+fn test_epoll_loop() {
+    let step = (|| {
+        let a = sys_epoll_create1(0) as i32;
+        let b = sys_epoll_create1(0) as i32;
+        if a < 0 || b < 0 {
+            return 1;
+        }
+        let ev = EpollEvent::new(EPOLLIN, 0);
+        if sys_epoll_ctl(a, EPOLL_CTL_ADD, b, &ev) != 0 {
+            return 2;
+        }
+        let r = sys_epoll_ctl(b, EPOLL_CTL_ADD, a, &ev);
+        sys_close(a as u64);
+        sys_close(b as u64);
+        if r != ELOOP { 3 } else { 0 }
+    })();
+    ok_or_fail(b"EPOLL_LOOP_ELOOP", step);
+}
+
+/// Five epolls chain (four nesting levels, EP_MAX_NESTS); a sixth is
+/// ELOOP
+fn test_epoll_nest_depth() {
+    let step = (|| {
+        let mut e = [0i32; 6];
+        for x in e.iter_mut() {
+            *x = sys_epoll_create1(0) as i32;
+            if *x < 0 {
+                return 1;
+            }
+        }
+        let ev = EpollEvent::new(EPOLLIN, 0);
+        let mut r = 0;
+        for i in 0..4 {
+            if sys_epoll_ctl(e[i + 1], EPOLL_CTL_ADD, e[i], &ev) != 0 {
+                r = 2;
+            }
+        }
+        if r == 0 && sys_epoll_ctl(e[5], EPOLL_CTL_ADD, e[4], &ev) != ELOOP {
+            r = 3;
+        }
+        for x in e {
+            sys_close(x as u64);
+        }
+        r
+    })();
+    ok_or_fail(b"EPOLL_NEST_DEPTH", step);
+}
+
+/// Edge-triggered: each new write is a new event even if the earlier
+/// data is still unread (Linux reports per wakeup, not per mask change)
+fn test_epoll_et_rearm() {
+    let step = (|| {
+        let epfd = sys_epoll_create1(0) as i32;
+        let mut p = [0i32; 2];
+        if epfd < 0 || sys_pipe2(p.as_mut_ptr(), 0) < 0 {
+            return 1;
+        }
+        let ev = EpollEvent::new(EPOLLIN | EPOLLET, 7);
+        if sys_epoll_ctl(epfd, EPOLL_CTL_ADD, p[0], &ev) != 0 {
+            return 2;
+        }
+        let mut out = [EpollEvent::empty(); 2];
+        sys_write(p[1] as u64, b"a".as_ptr(), 1);
+        let r = (|| {
+            if sys_epoll_wait(epfd, out.as_mut_ptr(), 2, 0) != 1 {
+                return 3;
+            }
+            // Nothing new: no event
+            if sys_epoll_wait(epfd, out.as_mut_ptr(), 2, 0) != 0 {
+                return 4;
+            }
+            // New data, old data unread: a new event
+            sys_write(p[1] as u64, b"b".as_ptr(), 1);
+            if sys_epoll_wait(epfd, out.as_mut_ptr(), 2, 0) != 1 {
+                return 5;
+            }
+            0
+        })();
+        sys_close(p[0] as u64);
+        sys_close(p[1] as u64);
+        sys_close(epfd as u64);
+        r
+    })();
+    ok_or_fail(b"EPOLL_ET_REARM", step);
+}
+
+/// maxevents past the old 4096 cap works (Linux EP_MAX_EVENTS is
+/// INT_MAX / sizeof(epoll_event)); more than that is EINVAL
+fn test_epoll_maxevents() {
+    let step = (|| {
+        const N: usize = 8192;
+        let size = core::mem::size_of::<EpollEvent>();
+        let buf = hk_syscall::sys_mmap(0, (N * size) as u64, 3, 0x22, -1, 0);
+        let epfd = sys_epoll_create1(0) as i32;
+        let efd = sys_eventfd2(1, 0) as i32;
+        if buf < 0 || epfd < 0 || efd < 0 {
+            return 1;
+        }
+        let ev = EpollEvent::new(EPOLLIN, 9);
+        sys_epoll_ctl(epfd, EPOLL_CTL_ADD, efd, &ev);
+        let out = buf as *mut EpollEvent;
+        let n = sys_epoll_wait(epfd, out, N as i32, 0);
+        let max = (i32::MAX as usize / size) as i32;
+        let over = sys_epoll_wait(epfd, out, max + 1, 0);
+        sys_close(efd as u64);
+        sys_close(epfd as u64);
+        hk_syscall::sys_munmap(buf as u64, (N * size) as u64);
+        if n != 1 {
+            2
+        } else if over != EINVAL {
+            3
+        } else {
+            0
+        }
+    })();
+    ok_or_fail(b"EPOLL_MAXEVENTS", step);
+}
+
+/// An item added with no events still reports a hangup: EPOLLERR and
+/// EPOLLHUP are always watched (Linux do_epoll_ctl)
+fn test_epoll_hup_events0() {
+    let step = (|| {
+        let epfd = sys_epoll_create1(0) as i32;
+        let mut p = [0i32; 2];
+        if epfd < 0 || sys_pipe2(p.as_mut_ptr(), 0) < 0 {
+            return 1;
+        }
+        let ev = EpollEvent::new(0, 5);
+        if sys_epoll_ctl(epfd, EPOLL_CTL_ADD, p[0], &ev) != 0 {
+            return 2;
+        }
+        sys_close(p[1] as u64);
+        let mut out = [EpollEvent::empty(); 2];
+        let n = sys_epoll_wait(epfd, out.as_mut_ptr(), 2, 0);
+        sys_close(p[0] as u64);
+        sys_close(epfd as u64);
+        if n != 1 || out[0].events & hk_syscall::EPOLLHUP == 0 {
+            3
+        } else {
+            0
+        }
+    })();
+    ok_or_fail(b"EPOLL_HUP_EVENTS0", step);
+}
+
+/// Edge-triggered: a partial read is no new event (the pipe wakes its
+/// writers with POLLOUT, which a reader's EPOLLIN item ignores)
+fn test_epoll_et_partial_read() {
+    let step = (|| {
+        let epfd = sys_epoll_create1(0) as i32;
+        let mut p = [0i32; 2];
+        if epfd < 0 || sys_pipe2(p.as_mut_ptr(), 0) < 0 {
+            return 1;
+        }
+        let ev = EpollEvent::new(EPOLLIN | EPOLLET, 6);
+        if sys_epoll_ctl(epfd, EPOLL_CTL_ADD, p[0], &ev) != 0 {
+            return 2;
+        }
+        sys_write(p[1] as u64, b"ab".as_ptr(), 2);
+        let mut out = [EpollEvent::empty(); 2];
+        let first = sys_epoll_wait(epfd, out.as_mut_ptr(), 2, 0);
+        let mut b = [0u8; 1];
+        hk_syscall::sys_read(p[0] as u64, b.as_mut_ptr(), 1);
+        let second = sys_epoll_wait(epfd, out.as_mut_ptr(), 2, 0);
+        sys_close(p[0] as u64);
+        sys_close(p[1] as u64);
+        sys_close(epfd as u64);
+        if first != 1 {
+            3
+        } else if second != 0 {
+            4
+        } else {
+            0
+        }
+    })();
+    ok_or_fail(b"EPOLL_ET_PARTIAL_READ", step);
+}

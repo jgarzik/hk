@@ -10,7 +10,7 @@ The suite works (about 1420 checks on x86, 1402 on arm64, 1384 on Linux, 0
 FAIL), but it is 156 flat files and 66k lines of copies of one print-and-grep
 pattern.
 
-1. **No assertion API.** `tests/harness.rs` has the shared verdict printers
+1. **No assertion API.** `harness.rs` has the shared verdict printers
    (`verdict`, `verdict_detail`, `report_r`/`check`, `report_step`,
    `report_code`, `pass`, `fail_why`, `T`), but no assertions, no per-check
    numbering, no plan. 15 files still define their own `fn report(`, 6
