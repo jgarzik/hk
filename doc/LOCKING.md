@@ -1090,7 +1090,13 @@ sleeps `Killable` until its TASKLIST state is no longer `Traced` (read
 lock, rechecked after each wakeup) or SIGKILL. The tracer's wait clears
 `ptrace_code` under the write lock; resume, detach and the tracer's exit
 (`exit_ptrace`) set the state and the code to deliver under it, then
-`try_to_wake_up` the tracee with it dropped. SIGKILL ends the stop in
+`try_to_wake_up` the tracee with it dropped. The tracer's exit detaches
+one tracee per write section; a PTRACE_O_EXITKILL tracee's SIGKILL is
+queued in that section before the detach (`sigkill_held`, Linux
+exit_ptrace under tasklist_lock: SIGKILL takes no queue entry, so
+nothing allocates), so a tracee woken by anything between the section
+and its wakeup still dies before user code; the kill's group effects
+and wakeups follow the lock (`Posted::finish`). SIGKILL ends the stop in
 the section that queues it (`sigkill_task` from `zap_threads`, Linux
 signal_wake_up(fatal) clearing JOBCTL_TRACED), so a wait after the
 kill never reports the stop. A tracer's request holds the stop while it

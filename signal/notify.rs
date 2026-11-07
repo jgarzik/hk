@@ -315,7 +315,8 @@ pub fn notify(table: &GlobalTaskTable, z: Zombie, mut entry: Entry) -> Told {
     let posted = match chld_notice(table, tid) {
         Some(mut info) if sig != 0 => {
             info.signo = sig as i32;
-            super::send_held(table, &r.to, sig, info, &mut entry.q)
+            let info = SendInfo::Info(info);
+            super::send_held(table, &r.to, sig, info, super::PidType::Tgid, &mut entry.q)
         }
         _ => None,
     };

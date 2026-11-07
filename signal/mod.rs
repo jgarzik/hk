@@ -1394,17 +1394,20 @@ fn send_task(t: &TaskRef, sig: u32, info: SendInfo, ty: PidType, force: bool) ->
     0
 }
 
-/// Group signal `sig` with `info` to task `t`, queued under TASKLIST
-/// held by the caller (Linux do_notify_parent's __group_send_sig_info
-/// under tasklist_lock): `q` is its entry, made before TASKLIST was
-/// taken, which it takes if queued; an unused one is the caller's to
-/// free after unlocking. Signalfd readers and the thread that takes it
-/// are woken by [`Posted::finish`], after TASKLIST is dropped.
+/// Signal `sig` with `info` to task `t` or its group (`ty`), queued
+/// under TASKLIST held by the caller (Linux do_notify_parent's
+/// __group_send_sig_info, exit_ptrace's send_sig_info, under
+/// tasklist_lock): `q` is its entry, made before TASKLIST was taken
+/// (SIGKILL needs none), which it takes if queued; an unused one is the
+/// caller's to free after unlocking. Signalfd readers and the thread
+/// that takes it are woken by [`Posted::finish`], after TASKLIST is
+/// dropped.
 fn send_held(
     table: &crate::task::percpu::GlobalTaskTable,
     t: &TaskRef,
     sig: u32,
-    info: SigInfo,
+    info: SendInfo,
+    ty: PidType,
     q: &mut Option<Box<SigQueue>>,
 ) -> Option<Posted> {
     check_send_context();
@@ -1412,12 +1415,11 @@ fn send_held(
     if sig == 0 || sig > 64 || tg.kthread || tg.group_exit {
         return None;
     }
-    let info = SendInfo::Info(info);
     let to = Send {
         sig,
         init: tg.init && !INIT_KILLABLE.load(core::sync::atomic::Ordering::Acquire),
         info: &info,
-        ty: PidType::Tgid,
+        ty,
         stopped: tg.stopped,
     };
     if let Some(e) = q.as_mut() {
@@ -1433,17 +1435,27 @@ fn send_held(
     Some(Posted {
         t: t.clone(),
         sig,
+        ty,
         wants,
         sighand: tg.sighand,
     })
 }
 
-/// A group signal [`send_held`] queued, whose wakeups wait for TASKLIST
-/// to be dropped
+/// SIGKILL from the kernel to thread `t`, under TASKLIST held by the
+/// caller (Linux exit_ptrace: send_sig_info(SIGKILL, SEND_SIG_PRIV)
+/// under tasklist_lock); SIGKILL needs no queue entry, so nothing
+/// allocates. Its wakeups wait for [`Posted::finish`].
+pub fn sigkill_held(table: &crate::task::percpu::GlobalTaskTable, t: &TaskRef) -> Option<Posted> {
+    send_held(table, t, SIGKILL, SendInfo::Kernel, PidType::Pid, &mut None)
+}
+
+/// A signal [`send_held`] queued, whose wakeups wait for TASKLIST to be
+/// dropped
 #[must_use]
 pub struct Posted {
     t: TaskRef,
     sig: u32,
+    ty: PidType,
     wants: bool,
     sighand: Option<Arc<SigHand>>,
 }
@@ -1456,7 +1468,7 @@ impl Posted {
         if let Some(h) = sighand {
             h.signalfd_wq.wake_all();
         }
-        complete_signal(&self.t, self.sig, PidType::Tgid, self.wants, sighand);
+        complete_signal(&self.t, self.sig, self.ty, self.wants, sighand);
     }
 }
 

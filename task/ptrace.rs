@@ -1065,9 +1065,9 @@ pub(crate) fn ptrace_unlink(table: &mut percpu::GlobalTaskTable, tid: Tid) {
     t.task.clear_tif(crate::task::tif::SYSCALL_TRACE);
 }
 
-/// The exiting task's tracees are detached (Linux exit_ptrace): stopped
-/// ones go on, and PTRACE_O_EXITKILL ones are killed; then the zombies
-/// ([`percpu::detach_zombies`])
+/// The exiting task's tracees are detached (Linux exit_ptrace), one per
+/// TASKLIST write section: stopped ones go on, and PTRACE_O_EXITKILL
+/// ones are killed; then the zombies ([`percpu::detach_zombies`])
 pub fn exit_ptrace() {
     let me = percpu::current();
     // Most tasks trace nothing: look under the read lock first
@@ -1078,39 +1078,39 @@ pub fn exit_ptrace() {
     if !traces {
         return;
     }
-    let mut gone = alloc::vec::Vec::new();
-    {
-        let mut table = TASKLIST.write();
-        let tids: alloc::vec::Vec<Tid> = table
-            .iter()
-            .filter(|t| {
-                t.ptrace != 0 && t.traced_by(&me) && !matches!(t.state, TaskState::Zombie(_))
-            })
-            .map(|t| t.task.tid())
-            .collect();
-        for tid in tids {
-            let kill = table
-                .get(tid)
-                .is_some_and(|t| t.ptrace_options & PTRACE_O_EXITKILL != 0);
-            ptrace_unlink(&mut table, tid);
-            if let Some(mut t) = table.get_mut(tid)
-                && matches!(t.state, TaskState::Traced(_))
-            {
-                t.state = TaskState::Ready;
-                t.ptrace_code = 0;
-            }
-            if let Some(task) = table.task(tid) {
-                gone.push((task, kill));
-            }
-        }
-    }
-    for (t, kill) in gone {
-        if kill {
-            signal::send_signal(t.tid(), SIGKILL);
+    while let Some((t, kill)) = detach_live(&me) {
+        if let Some(k) = kill {
+            k.finish();
         }
         percpu::try_to_wake_up(&t, percpu::WakeMode::Any);
     }
     percpu::detach_zombies(&me);
+}
+
+/// [`exit_ptrace`]'s write section for one live tracee of `me`: an
+/// EXITKILL one gets SIGKILL before it is detached and resumed (Linux
+/// exit_ptrace: send_sig_info under tasklist_lock, then
+/// __ptrace_detach), so it never runs untraced code first; the tracee
+/// and the kill's wakeups, for after the lock
+fn detach_live(me: &crate::task::Task) -> Option<(percpu::TaskRef, Option<signal::Posted>)> {
+    let mut table = TASKLIST.write();
+    let v = table
+        .find(|t| t.ptrace != 0 && t.traced_by(me) && !matches!(t.state, TaskState::Zombie(_)))?;
+    let (tid, exitkill) = (v.task.tid(), v.ptrace_options & PTRACE_O_EXITKILL != 0);
+    let t = table.task(tid)?;
+    let kill = if exitkill {
+        signal::sigkill_held(&table, &t)
+    } else {
+        None
+    };
+    ptrace_unlink(&mut table, tid);
+    if let Some(mut v) = table.get_mut(tid)
+        && matches!(v.state, TaskState::Traced(_))
+    {
+        v.state = TaskState::Ready;
+        v.ptrace_code = 0;
+    }
+    Some((t, kill))
 }
 
 // =============================================================================
