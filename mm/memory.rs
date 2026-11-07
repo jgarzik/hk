@@ -12,7 +12,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use super::gather::Gather;
 use super::huge_page::{HUGE_PAGE_SIZE, split_huge_pmd, take_huge_pmd};
 use super::pagewalk::{PteRange, PteWalk, entry, table_slot, walk_pte_range};
-use super::pgtable::Pmd;
+use super::pgtable::{PgTables, Pmd};
 use super::{Mm, MmStruct, PAGE_SIZE, SwapEntry, Vma};
 use crate::FRAME_ALLOCATOR;
 use crate::arch::{Leaf, paging};
@@ -264,6 +264,11 @@ pub fn next_swap_pte(pgd: u64, addr: u64, end: u64, ty: u8) -> Option<u64> {
 /// Returns whether a parent PTE lost write permission (its TLB needs a
 /// flush).
 pub fn copy_page_range(dst: u64, src_mm: &Mm, vma: &Vma) -> Result<bool, i32> {
+    // SAFETY: `dst` is the child's top-level table (the caller,
+    // dup_mm, builds it): no one else reaches the child's tables until
+    // dup_mm returns it, and nothing frees them meanwhile. Not yet
+    // checked (BUGS.md: fork should borrow the child's MmStruct)
+    let dst = unsafe { PgTables::from_raw(dst, vma.start, vma.end) };
     let mut c = CopyRange {
         dst,
         src_mm,
@@ -276,7 +281,7 @@ pub fn copy_page_range(dst: u64, src_mm: &Mm, vma: &Vma) -> Result<bool, i32> {
 
 /// `copy_page_range`'s walk
 struct CopyRange<'a> {
-    dst: u64,
+    dst: PgTables<'a>,
     src_mm: &'a Mm,
     cow: bool,
     wp: bool,
@@ -299,16 +304,16 @@ impl PteWalk for CopyRange<'_> {
     /// taken (Linux copy_pte_range: pte_alloc_map_lock of the child
     /// first): the allocation may reclaim
     fn prepare(&mut self, addr: u64, _end: u64) -> Result<(), i32> {
-        paging::pte_alloc(self.dst, addr).map(|_| ()).ok_or(ENOMEM)
+        paging::pte_alloc(self.dst.pgd(), addr)
+            .map(|_| ())
+            .ok_or(ENOMEM)
     }
 
     fn ptes(&mut self, r: &PteRange) -> Result<(), i32> {
         if r.iter().all(|(_, e)| e.load(Ordering::Acquire) == 0) {
             return Ok(());
         }
-        let dp = paging::pte_ptr(self.dst, r.start).ok_or(ENOMEM)?;
-        let _l = super::ptl::pte_lock(dp);
-        let d = PteRange::at(dp, r.start, r.end);
+        let d = self.dst.pte(r.start).ok_or(ENOMEM)?.lock();
         for (a, se) in r.iter() {
             self.wp |= copy_pte(d.entry(a), se, self.cow)?;
         }

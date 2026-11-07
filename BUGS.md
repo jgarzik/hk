@@ -31,8 +31,19 @@ These are safe fns or patterns whose use leads to undefined behaviour.
 None is known to fail today, but each is a soundness bug:
 
 - **Safe fns that take addresses:**
-  - aarch64/x86 paging `entry_atomic` returns `&'static AtomicU64` into
-    a table that can be freed; the mm `pte` helpers take `*mut u64`.
+  - Page tables: `mm::pgtable` (`PgTables`, `Pte`, `Pmd`, `PteTable`)
+    ties the entries of the fault path, the reverse map, mkclean,
+    remote access, THP and mremap to the lock that keeps their tables.
+    Still raw, safe fns that dereference a caller's root or entry: the
+    arch walkers (`paging::pte_ptr`, `pmd_ptr`, `pte_alloc`,
+    `pmd_populate`, `split_table`, `translate_with_root`,
+    `map_huge_page`, `update_huge_page_protection`; private
+    `entry_atomic` / `entry_ptr` return `&'static AtomicU64`);
+    `pagewalk::entry` / `table_slot` and `walk_pte_range(pgd)`, whose
+    `PgTables::from_raw` trusts its caller, and so the walks of zap,
+    fork (`copy_page_range(dst)`, also from_raw), mprotect, madvise,
+    the RSS and swap scans (`count_ptes`, `next_swap_pte`) and mmcheck;
+    `memory::free_level` and `resident`; the ioremap and vmap walkers.
 
 ## unsafe not yet wrapped or documented (doc/UNSAFE.md)
 
@@ -43,10 +54,9 @@ blocks belong in a missing wrapper:
 - **Frames:** an owned / page-locked / PTL-held frame borrow type in
   place of the `frame_bytes` unsafe fn (17 callers: vfat, pipe, splice,
   exec, fault, filemap, swap).
-- **Page tables:** a table / `Pte` reference type made only by the
-  walker and tied to the mmap_lock / PTL. It replaces `entry_atomic`,
-  `pagewalk::entry` and the `*mut u64` PTE helpers (the soundness item
-  above), and the boot kmap and ioremap walkers.
+- **Page tables:** `mm::pgtable` exists; the walker, its users and
+  the arch walkers still to move onto it (the soundness item above),
+  and the boot kmap and ioremap walkers.
 - **DMA:** an owned `DmaBox<T: Pod>` with volatile field access, never
   `&T` into device-written memory: xhci rings and contexts, virtio
   rings and blk, e1000 descriptors, virtio-net buffers.

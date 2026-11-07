@@ -8,7 +8,7 @@
 //! - `Mm.page_table_lock` ([`pt_lock`]): the table structure -- a missing
 //!   table installed (`PgTables::pte_alloc`), a 2MB entry mapped, split or
 //!   cleared (Linux pmd_lock without split PMD locks).
-//! - the PTE lock ([`pte_lock`], [`table_lock`]) of each PTE table
+//! - the PTE lock ([`table_lock`]; `pgtable::PteTable` holds it) of each PTE table
 //!   page, a lock word in its struct page (`Page.ptl`, Linux ptdesc
 //!   ptl): every software change of a 4KB entry, whatever the mmap_lock
 //!   mode, from reading the entry to the last change that depends on it
@@ -40,7 +40,6 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use super::Mm;
 use super::page::{Page, phys_to_page};
-use crate::arch::virt_to_phys;
 
 /// The PTE lock of a page-table page, held until dropped
 pub struct PteLock {
@@ -52,19 +51,6 @@ pub struct PteLock {
 #[cfg(feature = "lockdep")]
 fn class() -> &'static core::panic::Location<'static> {
     core::panic::Location::caller()
-}
-
-/// Lock the PTE table holding the entry at `ptep` (Linux
-/// pte_offset_map_lock); the entry must lie in a live user table
-#[track_caller]
-pub fn pte_lock(ptep: *mut u64) -> PteLock {
-    table_lock(table_of_ptep(ptep))
-}
-
-/// The physical frame of the page table holding the entry at `ptep`
-#[inline]
-pub fn table_of_ptep(ptep: *mut u64) -> u64 {
-    virt_to_phys(ptep as u64 & !0xfff)
 }
 
 /// Lock the PTE table frame `table` (a live user table)

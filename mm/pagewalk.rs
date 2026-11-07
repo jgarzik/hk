@@ -51,29 +51,23 @@ pub struct PteRange {
 }
 
 impl PteRange {
-    /// The entries of [start, end) of the table holding the entry `ptep`
-    /// (the caller holds its PTE lock)
-    pub fn at(ptep: *mut u64, start: u64, end: u64) -> Self {
-        Self {
-            table: crate::mm::ptl::table_of_ptep(ptep),
-            start,
-            end,
-        }
-    }
-
     /// The table frame
     pub fn table(&self) -> u64 {
         self.table
     }
 
-    /// The entry for `addr` (inside the range)
-    pub fn entry(&self, addr: u64) -> &'static AtomicU64 {
-        debug_assert!(self.start <= addr && addr < self.end);
-        entry(table_slot(self.table, (addr >> 12) & 511))
+    /// The entry for `addr`, in the range or elsewhere in its table
+    /// (whose lock the walk holds for all of it), borrowed while the
+    /// walk is on this table
+    pub fn entry(&self, addr: u64) -> &AtomicU64 {
+        debug_assert!(addr >> 21 == self.start >> 21, "entry outside the table");
+        // SAFETY: the walk's table, kept while it visits it (module
+        // doc); the entry is borrowed no longer than `self`
+        unsafe { AtomicU64::from_ptr(table_slot(self.table, (addr >> 12) & 511)) }
     }
 
     /// (address, entry) for each 4KB page of the range
-    pub fn iter(&self) -> impl Iterator<Item = (u64, &'static AtomicU64)> + '_ {
+    pub fn iter(&self) -> impl Iterator<Item = (u64, &AtomicU64)> + '_ {
         (self.start..self.end)
             .step_by(PAGE_SIZE as usize)
             .map(|a| (a, self.entry(a)))
@@ -205,13 +199,15 @@ pub fn selftest() -> Option<&'static str> {
     unsafe { core::ptr::write_bytes(phys_to_virt(root), 0, PAGE_SIZE as usize) };
     // Owns `root`: dropping it frees the tables
     let mm = super::mm_alloc(root);
+    let map = mm.mmap_read();
+    let tables = PgTables::new(&mm, &map);
     let addrs = [A, A + PAGE_SIZE, B, B + 5 * PAGE_SIZE];
     for (i, &a) in addrs.iter().enumerate() {
-        let Some(p) = paging::pte_alloc(root, a) else {
+        let Some(p) = tables.pte_alloc(&mm, a) else {
             return Some("pagewalk_alloc");
         };
         // Swap-like values: no frame behind them, nothing to free
-        entry(p).store((i as u64 + 1) << 12, Ordering::Release);
+        p.lock().store(a, (i as u64 + 1) << 12);
     }
     struct Seen {
         tables: u32,
@@ -251,10 +247,11 @@ pub fn selftest() -> Option<&'static str> {
         && t.n == 1
         && t.found[0] == B + 5 * PAGE_SIZE;
     for &a in &addrs {
-        if let Some(p) = paging::pte_ptr(root, a) {
-            entry(p).store(0, Ordering::Release);
+        if let Some(p) = tables.pte(a) {
+            p.lock().store(a, 0);
         }
     }
+    drop(map);
     drop(mm);
     match (ok, part) {
         (true, true) => None,

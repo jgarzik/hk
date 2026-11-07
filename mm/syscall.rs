@@ -1561,9 +1561,9 @@ fn move_mapping(
     gone: &mut Vec<Vma>,
 ) -> Result<(), KernelError> {
     let ((old_addr, old_len), (new_addr, new_len)) = (from, to);
-    let pgd = owner.pgd();
-    let mut alloc = |va| crate::arch::paging::pte_alloc(pgd, va);
-    super::mremap::move_prep(owner, old_addr, new_addr, old_len, &mut alloc)?;
+    let t = super::pgtable::PgTables::new(owner, mm);
+    let mut alloc = |va| t.pte_alloc(owner, va).is_some();
+    super::mremap::move_prep(owner, t, old_addr, new_addr, old_len, &mut alloc)?;
     mm.split_at(old_addr);
     mm.split_at(old_addr + old_len);
     let mut new_vma = mm
@@ -1593,7 +1593,8 @@ fn move_mapping(
     mm.add_total_vm(new_len / PAGE_SIZE);
     {
         let _rmap = inode.as_ref().map(|i| i.i_data.i_mmap.lock_write());
-        super::mremap::move_ptes(owner, old_addr, new_addr, old_len);
+        let t = super::pgtable::PgTables::new(owner, mm);
+        super::mremap::move_ptes(owner, t, old_addr, new_addr, old_len);
     }
     move_vma_out(mm, old_addr, dontunmap, gone);
     if let Some(idx) = mm.find_vma_exact(new_addr) {

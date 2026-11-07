@@ -41,7 +41,7 @@ abstraction instead, and the callers stay safe. The usual wrapper shapes are:
 | `Pod` byte views | marker trait |
 | `IoMem` registers | checked volatile |
 | `DmaBox` | owned device memory |
-| page-table `Pte` | typed handle |
+| page-table `PgTables` / `Pte` / `PteTable` (`mm/pgtable.rs`) | typed handle borrowing the lock |
 
 Make each wrapper `#[inline]`: it must compile to the same code as the
 open-coded `unsafe` it replaces.
