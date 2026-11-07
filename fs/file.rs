@@ -767,6 +767,17 @@ impl Drop for File {
     }
 }
 
+/// FIONREAD (Linux ioctl number): bytes ready to read
+pub const FIONREAD: u32 = 0x541B;
+
+/// Answer FIONREAD with `n` as the user's int (Linux put_user to an
+/// `int __user *`, truncating)
+pub fn put_fionread(arg: u64, n: i64) -> Result<i64, KernelError> {
+    crate::uaccess::put_user::<crate::arch::Uaccess, i32>(arg, n as i32)
+        .map_err(|_| KernelError::BadAddress)?;
+    Ok(0)
+}
+
 /// Null file ops - returns errors for all operations
 pub struct NullFileOps;
 

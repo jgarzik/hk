@@ -1,4 +1,4 @@
-//! epoll on files Linux cannot poll, edge-triggered wake keys
+//! epoll on files Linux cannot poll, edge-triggered wake keys, FIONREAD
 //!
 //! - EPOLL_CTL_ADD of a regular file, a directory, /dev/null, a block
 //!   device, a sysfs directory or a per-process /proc file is EPERM
@@ -8,17 +8,21 @@
 //!   a regular file ready
 //! - an edge-triggered item is not reported again by a wakeup of an
 //!   event it does not wait for (eventfd read, SO_SNDBUF)
+//! - FIONREAD: a pipe's or FIFO's buffered bytes, a regular file's
+//!   size - pos, inotify's queued bytes (IN_IGNORED), ENOTTY on an eventfd
 
 use super::helpers::{find_blkdev, print, print_num, println};
 use hk_syscall::{
     AF_UNIX, EFD_NONBLOCK, EFD_SEMAPHORE, EPOLL_CTL_ADD, EPOLL_CTL_DEL, EPOLLET, EPOLLIN,
-    EpollEvent, FdSet, O_CREAT, O_DIRECTORY, O_NONBLOCK, O_RDONLY, O_RDWR, POLLIN, POLLOUT, PollFd,
-    SOCK_STREAM, Timeval, sys_close, sys_epoll_create1, sys_epoll_ctl, sys_epoll_wait,
-    sys_eventfd2, sys_open, sys_poll, sys_read, sys_select, sys_setsockopt, sys_socketpair,
-    sys_unlink, sys_write,
+    EpollEvent, FIONREAD, FdSet, IN_CREATE, IN_NONBLOCK, O_CREAT, O_DIRECTORY, O_NONBLOCK,
+    O_RDONLY, O_RDWR, POLLIN, POLLOUT, PollFd, SOCK_STREAM, Timeval, sys_close, sys_epoll_create1,
+    sys_epoll_ctl, sys_epoll_wait, sys_eventfd2, sys_inotify_add_watch, sys_inotify_init1,
+    sys_inotify_rm_watch, sys_ioctl, sys_lseek, sys_mknod, sys_open, sys_pipe2, sys_poll, sys_read,
+    sys_select, sys_setsockopt, sys_socketpair, sys_unlink, sys_write,
 };
 
 const EPERM: i64 = -1;
+const ENOTTY: i64 = -25;
 const SOL_SOCKET: i32 = 1;
 const SO_SNDBUF: i32 = 7;
 
@@ -27,6 +31,7 @@ pub fn run_tests() {
     test_eperm_order();
     test_poll_regular();
     test_epoll_et_key();
+    test_fionread();
 }
 
 fn add(ep: i32, fd: i32, events: u32) -> i64 {
@@ -209,6 +214,82 @@ fn test_epoll_et_key() {
         print_num(sk1);
         print(b",");
         print_num(sk2);
+        println(b"");
+    }
+}
+
+fn fionread(fd: i32) -> i64 {
+    let mut n = -1i32;
+    let r = sys_ioctl(fd, FIONREAD as u64, &mut n as *mut i32 as u64);
+    if r < 0 { r } else { n as i64 }
+}
+
+fn fionread_pipe() -> i64 {
+    let mut p = [0i32; 2];
+    sys_pipe2(p.as_mut_ptr(), 0);
+    sys_write(p[1] as u64, b"hello".as_ptr(), 5);
+    let n = fionread(p[0]);
+    sys_close(p[0] as u64);
+    sys_close(p[1] as u64);
+    n
+}
+
+fn fionread_fifo() -> i64 {
+    let path = b"/tmp/pollperm_fifo\0";
+    sys_mknod(path.as_ptr(), 0o010644, 0);
+    let fd = sys_open(path.as_ptr(), O_RDWR | O_NONBLOCK, 0) as i32;
+    sys_write(fd as u64, b"abc".as_ptr(), 3);
+    let n = fionread(fd);
+    sys_close(fd as u64);
+    sys_unlink(path.as_ptr());
+    n
+}
+
+fn fionread_file() -> i64 {
+    let path = b"/tmp/pollperm_size\0";
+    let fd = sys_open(path.as_ptr(), O_RDWR | O_CREAT, 0o644) as i32;
+    let buf = [0u8; 100];
+    sys_write(fd as u64, buf.as_ptr(), 100);
+    sys_lseek(fd, 30, 0);
+    let n = fionread(fd);
+    sys_close(fd as u64);
+    sys_unlink(path.as_ptr());
+    n
+}
+
+/// The IN_IGNORED event of a removed watch (a bare 16-byte header;
+/// hk queues no file events yet)
+fn fionread_inotify() -> i64 {
+    let ifd = sys_inotify_init1(IN_NONBLOCK) as i32;
+    let wd = sys_inotify_add_watch(ifd, b"/tmp\0".as_ptr(), IN_CREATE) as i32;
+    let empty = fionread(ifd);
+    sys_inotify_rm_watch(ifd, wd);
+    let n = fionread(ifd);
+    sys_close(ifd as u64);
+    if empty == 0 { n } else { 1000 + empty }
+}
+
+fn test_fionread() {
+    let pipe = fionread_pipe();
+    let fifo = fionread_fifo();
+    let file = fionread_file();
+    let ino = fionread_inotify();
+    let efd = sys_eventfd2(0, 0) as i32;
+    let ev = fionread(efd);
+    sys_close(efd as u64);
+    if (pipe, fifo, file, ino, ev) == (5, 3, 70, 16, ENOTTY) {
+        println(b"FIONREAD_KINDS:OK");
+    } else {
+        print(b"FIONREAD_KINDS:FAIL pipe=");
+        print_num(pipe);
+        print(b" fifo=");
+        print_num(fifo);
+        print(b" file=");
+        print_num(file);
+        print(b" inotify=");
+        print_num(ino);
+        print(b" eventfd=");
+        print_num(ev);
         println(b"");
     }
 }

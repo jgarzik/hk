@@ -431,15 +431,6 @@ unreachable today.
   cache (not yet COW'd) by inode and offset, so a MAP_SHARED mapping
   of the same file wakes it.
 
-## FIONREAD on pipes is 0
-
-**Location:** `fs/misc.rs` (sys_ioctl)
-
-The generic FIONREAD arm answers every file except chardevs with 0,
-so a pipe or FIFO with data reports 0. Linux do_vfs_ioctl handles
-FIONREAD only for regular files and passes the rest to f_op->ioctl
-(pipe_ioctl returns the buffered bytes).
-
 ## O_ASYNC: no SIGIO
 
 **Location:** `fs/fd.rs` (F_SETFL), `fs/misc.rs` (FIOASYNC)

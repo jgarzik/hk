@@ -699,6 +699,10 @@ impl FileOps for PipeReadFileOps {
         self
     }
 
+    fn ioctl(&self, file: &File, cmd: u32, arg: u64) -> Result<i64, KernelError> {
+        pipe_ioctl(file, cmd, arg)
+    }
+
     fn read_iter(
         &self,
         file: &File,
@@ -783,6 +787,10 @@ impl FileOps for PipeWriteFileOps {
         self
     }
 
+    fn ioctl(&self, file: &File, cmd: u32, arg: u64) -> Result<i64, KernelError> {
+        pipe_ioctl(file, cmd, arg)
+    }
+
     fn write_iter(
         &self,
         file: &File,
@@ -834,6 +842,16 @@ impl FileOps for PipeWriteFileOps {
 
 use crate::fs::dentry::Dentry;
 
+/// FIONREAD: the bytes buffered, under the pipe's lock (Linux
+/// pipe_ioctl); anything else ENOTTY
+fn pipe_ioctl(file: &File, cmd: u32, arg: u64) -> Result<i64, KernelError> {
+    if cmd != crate::fs::file::FIONREAD {
+        return Err(KernelError::NotTty);
+    }
+    let n = pipe_of(file)?.lock().bytes_available();
+    crate::fs::file::put_fionread(arg, n as i64)
+}
+
 /// The pipe behind a pipe file or an open FIFO
 pub fn pipe_of(file: &File) -> Result<&Pipe, KernelError> {
     file.private_ref::<Pipe>()
@@ -878,6 +896,10 @@ fn wait_for_partner(pipe: &Pipe, counter: &AtomicU32, seen: u32) -> Result<(), K
 impl FileOps for FifoFileOps {
     fn as_any(&self) -> &dyn core::any::Any {
         self
+    }
+
+    fn ioctl(&self, file: &File, cmd: u32, arg: u64) -> Result<i64, KernelError> {
+        pipe_ioctl(file, cmd, arg)
     }
 
     /// Linux fifo_open: a reader waits for a writer and a writer for a
