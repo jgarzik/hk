@@ -343,11 +343,10 @@ pub trait PageTable: Sized {
     /// - aarch64: TTBR0/TTBR1 (translation table base)
     fn root_table_phys(&self) -> Self::PhysAddr;
 
-    /// Create a page table representing the current kernel identity mapping
-    ///
-    /// This uses the currently active page table (e.g., CR3 on x86-64).
-    /// No new allocation is performed.
-    fn kernel_identity() -> Self;
+    /// The root of the table kernel threads run on (x86 swapper, arm64
+    /// empty TTBR0), to load only: the shared kernel table is never a
+    /// page-table value, so nothing can map into it through one
+    fn kernel_root() -> Self::PhysAddr;
 }
 
 /// Frame allocator trait

@@ -1369,7 +1369,7 @@ fn create_kernel_task(
         parent_exec_id: 0,
         pdeath_signal: 0,
         state: TaskState::Ready,
-        pgd: ArchPageTable::kernel_identity().root_table_phys(),
+        pgd: ArchPageTable::kernel_root(),
         // TLS fields (not used for idle task)
         clear_child_tid: 0,
         set_child_tid: 0,

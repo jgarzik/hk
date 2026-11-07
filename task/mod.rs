@@ -1146,7 +1146,7 @@ pub struct TaskInner {
     pub state: TaskState,
     /// CPU affinity mask (bit N = CPU N is allowed)
     /// Top-level page table it runs on: its mm's, else the kernel's
-    /// (`ArchPageTable::kernel_identity`)
+    /// (`ArchPageTable::kernel_root`)
     pub pgd: u64,
 
     // =========================================================================

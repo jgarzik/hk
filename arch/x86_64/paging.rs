@@ -621,8 +621,9 @@ impl RawPageTable {
 /// # Invariants
 ///
 /// `pml4_phys` is a live top-level table its holder owns: a fresh one
-/// (`new_user`) or the swapper (`kernel_identity`), the only ways to
-/// make one.
+/// (`new_user`), the only way to make one. The shared swapper is never
+/// one (`kernel_root` gives only its address), so a safe map cannot
+/// write into it.
 pub struct X86_64PageTable {
     /// Physical address of PML4
     pml4_phys: u64,
@@ -648,10 +649,10 @@ impl X86_64PageTable {
         self.pml4_phys
     }
 
-    /// The kernel page table (swapper): kernel threads run on it
-    pub fn kernel_identity() -> Self {
-        // SAFETY: the swapper, live forever
-        unsafe { Self::from_root(super::kmap::swapper_phys()) }
+    /// The kernel page table's (swapper's) root: kernel threads run on
+    /// it. Only its address: a value of this type could map into it
+    pub fn kernel_root() -> u64 {
+        super::kmap::swapper_phys()
     }
 
     /// Create a new user page table (allocates PML4)
@@ -892,9 +893,8 @@ impl PageTable for X86_64PageTable {
         self.pml4_phys
     }
 
-    fn kernel_identity() -> Self {
-        // Delegate to the inherent method
-        X86_64PageTable::kernel_identity()
+    fn kernel_root() -> u64 {
+        X86_64PageTable::kernel_root()
     }
 }
 

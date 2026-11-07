@@ -776,8 +776,9 @@ fn page_indices(vaddr: u64) -> (usize, usize, usize, usize) {
 /// # Invariants
 ///
 /// `root_phys` is a live top-level table its holder owns: a fresh one
-/// (`new_user`) or the reserved empty table (`kernel_identity`), the
-/// only ways to make one.
+/// (`new_user`), the only way to make one. The shared reserved empty
+/// table is never one (`kernel_root` gives only its address), so a safe
+/// map cannot write into it.
 pub struct Aarch64PageTable {
     /// Physical address of the root table (L0)
     root_phys: u64,
@@ -801,11 +802,11 @@ impl Aarch64PageTable {
         self.root_phys
     }
 
-    /// TTBR0 table for kernel threads: empty (the kernel is in TTBR1;
-    /// Linux reserved_pg_dir)
-    pub fn kernel_identity() -> Self {
-        // SAFETY: the reserved empty table, live forever
-        unsafe { Self::from_root(super::kmap::reserved_phys()) }
+    /// The TTBR0 root for kernel threads: an empty table (the kernel is
+    /// in TTBR1; Linux reserved_pg_dir). Only its address: a value of
+    /// this type could map into it
+    pub fn kernel_root() -> u64 {
+        super::kmap::reserved_phys()
     }
 
     /// Create a new user page table (allocates L0)
@@ -977,7 +978,7 @@ impl PageTable for Aarch64PageTable {
         self.root_phys
     }
 
-    fn kernel_identity() -> Self {
-        Aarch64PageTable::kernel_identity()
+    fn kernel_root() -> u64 {
+        Aarch64PageTable::kernel_root()
     }
 }

@@ -280,5 +280,5 @@ fn switch_mm_irqs_off(next: Option<&Mm>) {
 /// The table kernel threads run on (x86 swapper, arm64 empty TTBR0)
 fn kernel_root() -> u64 {
     use crate::arch::SchedArch;
-    <CurrentArch as SchedArch>::SchedPageTable::kernel_identity().root_table_phys()
+    <CurrentArch as SchedArch>::SchedPageTable::kernel_root()
 }
