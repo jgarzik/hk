@@ -11,7 +11,7 @@
 - [x] set_tid_address
 - [x] exit_group
 - [x] wait4
-- [x] waitid
+- [x] waitid (P_PIDFD; an O_NONBLOCK pidfd waits as WNOHANG, EAGAIN)
 
 1.2 Process IDs & basic info
 

@@ -323,6 +323,10 @@ pub fn sys_waitid(idtype: i32, id: u64, infop: u64, options: i32, rusage: u64) -
         return KernelError::InvalidArgument.sysret();
     }
 
+    // An O_NONBLOCK pidfd waits as with WNOHANG, EAGAIN where WNOHANG
+    // itself would return 0 (Linux kernel_waitid_prepare, kernel_waitid)
+    let mut nohang = options & WNOHANG != 0;
+
     // Convert idtype/id to the pid format used by wait4/reap_zombie_child:
     // pid > 0: specific child
     // pid == -1: any child (P_ALL)
@@ -351,10 +355,11 @@ pub fn sys_waitid(idtype: i32, id: u64, infop: u64, options: i32, rusage: u64) -
                     None => return KernelError::BadFd.sysret(),
                 }
             };
-            match crate::task::pidfd::get_pidfd_pid(&file) {
-                Some(pid) => pid as i64,
-                None => return KernelError::BadFd.sysret(), // not a pidfd
-            }
+            let Some(pid) = crate::task::pidfd::get_pidfd_pid(&file) else {
+                return KernelError::BadFd.sysret(); // not a pidfd
+            };
+            nohang |= file.get_flags() & crate::fs::file::flags::O_NONBLOCK != 0;
+            pid as i64
         }
         _ => return KernelError::InvalidArgument.sysret(),
     };
@@ -414,13 +419,17 @@ pub fn sys_waitid(idtype: i32, id: u64, infop: u64, options: i32, rusage: u64) -
             break KernelError::NoChild.sysret();
         }
 
-        // If WNOHANG, return 0 but leave infop->si_pid as 0 to indicate no child
-        if options & WNOHANG != 0 {
+        // If WNOHANG, return 0 but leave infop->si_pid as 0 to indicate
+        // no child (EAGAIN for a non-blocking pidfd without WNOHANG)
+        if nohang {
             if infop != 0 {
                 // Zero out siginfo to indicate no child was available
                 if put_waitid_info(infop, &crate::signal::SigInfo::default()).is_err() {
                     break KernelError::BadAddress.sysret();
                 }
+            }
+            if options & WNOHANG == 0 {
+                break KernelError::WouldBlock.sysret();
             }
             break 0;
         }

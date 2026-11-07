@@ -10,6 +10,8 @@
 //!   ignored)
 //! - Test procfs /proc/<pid>/fdinfo/<pidfd> shows Pid line
 //! - Test waitid with P_PIDFD
+//! - WAITID_PIDFD_NONBLOCK: waitid(P_PIDFD) of an O_NONBLOCK pidfd is
+//!   EAGAIN while the child runs (Linux kernel_waitid adds WNOHANG)
 //! - Test pidfd_getfd to get own fd via pidfd
 //! - Test pidfd_getfd with invalid flags returns EINVAL
 //! - PIDFD_POLL_GROUP: a process whose leader exits first is not
@@ -21,13 +23,13 @@
 //! - PIDFD_OPEN_CLOEXEC: the new descriptor is close-on-exec
 
 use crate::harness::{fail_num, pass, verdict};
-use crate::helpers::{linux_at_least, print, print_num, println};
+use crate::helpers::{linux_at_least, msleep, print, print_num, println};
 use crate::mm::fork_mm::{join, spawn_thread};
 use hk_syscall::{
-    P_PIDFD, POLLHUP, POLLIN, PollFd, SigInfo, WEXITED, sys_close, sys_exit, sys_exit_group,
-    sys_fcntl, sys_fork, sys_getpid, sys_open, sys_pidfd_getfd, sys_pidfd_open,
-    sys_pidfd_send_signal, sys_pipe2, sys_poll, sys_ptrace, sys_read, sys_rt_sigaction, sys_wait4,
-    sys_waitid, sys_write,
+    O_NONBLOCK, P_PIDFD, POLLHUP, POLLIN, PollFd, SIGKILL, SigInfo, WEXITED, sys_close, sys_exit,
+    sys_exit_group, sys_fcntl, sys_fork, sys_getpid, sys_kill, sys_open, sys_pidfd_getfd,
+    sys_pidfd_open, sys_pidfd_send_signal, sys_pipe2, sys_poll, sys_ptrace, sys_read,
+    sys_rt_sigaction, sys_wait4, sys_waitid, sys_write,
 };
 
 /// Run all pidfd tests
@@ -40,6 +42,7 @@ pub fn run_tests() {
     test_pidfd_poll_autoreap();
     test_pidfd_fdinfo();
     test_waitid_p_pidfd();
+    test_waitid_pidfd_nonblock();
     test_pidfd_getfd_self();
     test_pidfd_getfd_invalid_flags();
     test_pidfd_poll_group();
@@ -500,6 +503,80 @@ fn test_waitid_p_pidfd() {
     }
 
     pass(b"WAITID_PIDFD");
+}
+
+/// An empty siginfo for waitid
+fn siginfo() -> SigInfo {
+    SigInfo {
+        si_signo: 0,
+        si_errno: 0,
+        si_code: 0,
+        _pad0: 0,
+        si_pid: 0,
+        si_uid: 0,
+        si_status: 0,
+        _pad: [0u8; 128 - 28],
+    }
+}
+
+/// waitid(P_PIDFD) of an O_NONBLOCK pidfd (PIDFD_NONBLOCK) waits as
+/// with WNOHANG (Linux kernel_waitid_prepare): EAGAIN while the child
+/// runs and WNOHANG was not asked, 0 with an empty siginfo when it was,
+/// and the child once it is dead
+fn test_waitid_pidfd_nonblock() {
+    const NAME: &[u8] = b"WAITID_PIDFD_NONBLOCK";
+    const WNOHANG: i32 = 1;
+    const EAGAIN: i64 = -11;
+    let pid = sys_fork();
+    if pid < 0 {
+        fail_num(b"WAITID_PIDFD_NONBLOCK:FAIL fork ", pid);
+        return;
+    }
+    if pid == 0 {
+        // Bounded, so a kernel that blocks still finishes the test
+        msleep(2000);
+        sys_exit(0);
+    }
+    let fd = sys_pidfd_open(pid as i32, O_NONBLOCK);
+    if fd < 0 {
+        sys_kill(pid, SIGKILL);
+        sys_wait4(pid, core::ptr::null_mut(), 0, 0);
+        fail_num(b"WAITID_PIDFD_NONBLOCK:FAIL pidfd_open ", fd);
+        return;
+    }
+    let mut info = siginfo();
+    let busy = sys_waitid(P_PIDFD, fd as u64, &mut info, WEXITED, 0);
+    let mut nohang_info = siginfo();
+    nohang_info.si_pid = -1;
+    let nohang = sys_waitid(P_PIDFD, fd as u64, &mut nohang_info, WEXITED | WNOHANG, 0);
+    sys_kill(pid, SIGKILL);
+    // EAGAIN until it is a zombie
+    let mut dead_info = siginfo();
+    let mut dead = EAGAIN;
+    for _ in 0..1000 {
+        dead = sys_waitid(P_PIDFD, fd as u64, &mut dead_info, WEXITED, 0);
+        if dead != EAGAIN {
+            break;
+        }
+        msleep(1);
+    }
+    sys_close(fd as u64);
+    if busy == 0 {
+        // Reaped by the blocking wait (a kernel without the rule)
+        dead = 0;
+        dead_info.si_pid = pid as i32;
+    } else if dead == EAGAIN {
+        sys_wait4(pid, core::ptr::null_mut(), 0, 0);
+    }
+    if busy != EAGAIN {
+        fail_num(b"WAITID_PIDFD_NONBLOCK:FAIL running: waitid ", busy);
+    } else if nohang != 0 || nohang_info.si_pid != 0 {
+        fail_num(b"WAITID_PIDFD_NONBLOCK:FAIL WNOHANG: waitid ", nohang);
+    } else if dead != 0 || dead_info.si_pid != pid as i32 {
+        fail_num(b"WAITID_PIDFD_NONBLOCK:FAIL dead: waitid ", dead);
+    } else {
+        pass(NAME);
+    }
 }
 
 // Helper: write a number to a buffer as ASCII digits, return new position
