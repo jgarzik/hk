@@ -255,33 +255,37 @@ pub fn next_swap_pte(pgd: u64, addr: u64, end: u64, ty: u8) -> Option<u64> {
     walk_pte_range(pgd, addr, end, &mut Find(ty)).err()
 }
 
-/// Copy the page tables of the parent's `vma` from the address space
-/// `src` into the child's tables at `dst` (Linux copy_page_range), under
-/// the parent's mm lock. A shared mapping keeps sharing its pages; a private
-/// one shares them copy-on-write, read-only in both; a swap PTE is
-/// copied with another slot reference (`swap::swap_duplicate`). A 2MB
-/// page is split first so that its 4KB pages are copied one by one.
-/// Returns whether a parent PTE lost write permission (its TLB needs a
-/// flush).
-pub fn copy_page_range(dst: u64, src_mm: &Mm, vma: &Vma) -> Result<bool, i32> {
-    // SAFETY: `dst` is the child's top-level table (the caller,
-    // dup_mm, builds it): no one else reaches the child's tables until
-    // dup_mm returns it, and nothing frees them meanwhile. Not yet
-    // checked (BUGS.md: fork should borrow the child's MmStruct)
-    let dst = unsafe { PgTables::from_raw(dst, vma.start, vma.end) };
+/// Copy the page tables of the parent's `vma` from `src`, the tables of
+/// `src_mm`, into the child's tables `dst`, those of `dst_mm` (Linux
+/// copy_page_range), under both mm locks (dup_mm). A shared mapping
+/// keeps sharing its pages; a private one shares them copy-on-write,
+/// read-only in both; a swap PTE is copied with another slot reference
+/// (`swap::swap_duplicate`). A 2MB page is split first so that its 4KB
+/// pages are copied one by one. Returns whether a parent PTE lost write
+/// permission (its TLB needs a flush).
+pub fn copy_page_range(
+    dst: PgTables<'_>,
+    dst_mm: &Mm,
+    src: PgTables<'_>,
+    src_mm: &Mm,
+    vma: &Vma,
+) -> Result<bool, i32> {
+    assert_eq!(src_mm.pgd(), src.pgd(), "tables of another mm");
     let mut c = CopyRange {
         dst,
+        dst_mm,
         src_mm,
         cow: !vma.is_shared(),
         wp: false,
     };
-    walk_pte_range(src_mm.pgd(), vma.start, vma.end, &mut c)?;
+    walk_pte_range(src.pgd(), vma.start, vma.end, &mut c)?;
     Ok(c.wp)
 }
 
 /// `copy_page_range`'s walk
 struct CopyRange<'a> {
     dst: PgTables<'a>,
+    dst_mm: &'a Mm,
     src_mm: &'a Mm,
     cow: bool,
     wp: bool,
@@ -302,9 +306,10 @@ impl PteWalk for CopyRange<'_> {
     /// chains). Parent, then child: only fork nests these two.
     /// The child's table, allocated before the parent's PTE lock is
     /// taken (Linux copy_pte_range: pte_alloc_map_lock of the child
-    /// first): the allocation may reclaim
+    /// first)
     fn prepare(&mut self, addr: u64, _end: u64) -> Result<(), i32> {
-        paging::pte_alloc(self.dst.pgd(), addr)
+        self.dst
+            .pte_alloc(self.dst_mm, addr)
             .map(|_| ())
             .ok_or(ENOMEM)
     }

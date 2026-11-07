@@ -41,7 +41,7 @@ None is known to fail today, but each is a soundness bug:
     `entry_atomic` / `entry_ptr` return `&'static AtomicU64`);
     `pagewalk::entry` / `table_slot` and `walk_pte_range(pgd)`, whose
     `PgTables::from_raw` trusts its caller, and so the walks of zap,
-    fork (`copy_page_range(dst)`, also from_raw), mprotect, madvise,
+    fork, mprotect, madvise,
     the RSS and swap scans (`count_ptes`, `next_swap_pte`) and mmcheck;
     `memory::free_level` and `resident`; the ioremap and vmap walkers.
 

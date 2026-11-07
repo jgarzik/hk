@@ -1246,8 +1246,11 @@ pub struct Zone {
   them). Readers: /proc (maps, cmdline, environ, status figures),
   mincore, msync, populate, remote reads (ptrace PEEK,
   process_vm_readv), `segv_code`; every other user, the fault path
-  included, takes it for writing. `dup_mm` holds the parent's mm lock while
-  it copies VMAs and page tables (`memory::copy_page_range`: it
+  included, takes it for writing. `dup_mm` holds the parent's mm lock for writing while
+  it copies VMAs and page tables, and the child's for writing nested
+  in it (Linux dup_mmap's mmap_write_lock_nested: the child is
+  reachable by no one else, so it never waits; its tables are borrowed
+  from that guard) (`memory::copy_page_range`: it
   write-protects the parent's private PTEs with a compare-and-swap, since
   the parent's other threads may be faulting, splits 2MB pages and takes
   frame references). munmap / MAP_FIXED / brk shrink / shmdt
