@@ -763,7 +763,14 @@ spinning in user mode is preempted and killable. Therefore a
 `spin::Mutex`/`RwLock` holder is never involuntarily preempted, and the only
 same-CPU hazard is an IRQ handler taking a lock the interrupted code holds
 (hence the IRQ rules). Every spin lock raises `preempt_count` (6.3), so a
-preemption point added later can honor it. A signal for a task running
+preemption point added later can honor it. `preempt_disable` and
+`preempt_enable` (`arch/*/percpu.rs`) find this CPU's block, then do an
+atomic RMW on its `preempt_count`: two steps, not Linux's single
+this-CPU instruction. That is sound only because the task cannot be
+switched (and so cannot migrate) between them; an IRQ in between makes
+a balanced increment and decrement of the same CPU's count. Kernel
+preemption would first need a this-CPU RMW (or a per-task count, as
+Linux arm64's `thread_info.preempt_count`). A signal for a task running
 on another CPU kicks it (`kick_process`: the reschedule IPI), so its
 return to user mode delivers the signal.
 
