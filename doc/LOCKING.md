@@ -2915,12 +2915,14 @@ de_thread, exit_group does not.
   pending, and a parent the signal wakes finds it. The process's
   pidfds see its exit in the section of its last thread's exit, before
   any notice (`mark_pidfd`). Under the write
-  lock: the receiver and signal, the autoreap decision (the parent's
-  `SigHand.action`) and the queueing (`signal::send_held`: TASKLIST →
+  lock: the receiver and signal, the autoreap decision (the parent
+  process's SIGCHLD action, in the `SigHand` of the thread the signal
+  goes to) and the queueing (`signal::send_held`: TASKLIST →
   Task.sig → SignalStruct.shared → SigHand.action, the order above);
   an autoreaped zombie leaves the task list there too (Linux
   EXIT_DEAD). Its `SigQueue` entry is made and charged before the lock
-  (`notify::Entry`, for the receiver's user found under the read lock);
+  (`notify::Entry`, for the receiver's user found under the read lock;
+  none when no signal is sent: a parent that ignores SIGCHLD);
   if the receiver's user or the signal changed by the time the write
   lock is held (`Entry::fits`), the lock is dropped and a new entry made
   before anything changes. After the lock: the unused entry is freed,

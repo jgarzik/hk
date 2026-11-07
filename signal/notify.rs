@@ -61,15 +61,18 @@ fn chld_code(status: i32) -> (i32, i32) {
 }
 
 /// Who is told of zombie `tid`: its tracer, else its real parent
-/// (`parent`), through `to`, the thread of that process a group signal
+/// (`_parent`), through `to`, the thread of that process a group signal
 /// is checked against; the signal (its exit signal, or SIGCHLD to a
 /// tracer that is not the parent, to a thread, or to an image that did
-/// not ask for it) and whether it is traced
+/// not ask for it; 0: none) and whether it is released at once
+/// (autoreap)
 struct Rcv {
-    parent: TaskRef,
+    /// Kept only so its last reference, if this is it, goes after
+    /// TASKLIST
+    _parent: TaskRef,
     to: TaskRef,
     sig: u32,
-    traced: bool,
+    autoreap: bool,
 }
 
 /// [`Rcv`] of `tid`, read under TASKLIST
@@ -95,18 +98,44 @@ fn receiver(table: &GlobalTaskTable, tid: Tid) -> Option<Rcv> {
         return None;
     }
     let to = super::group_task(table, table.get(parent.pid))?;
+    let (sig, autoreap) = if traced {
+        (sig, false)
+    } else {
+        disposition(table, &to, sig)
+    };
     Some(Rcv {
-        parent,
+        _parent: parent,
         to,
         sig,
-        traced,
+        autoreap,
     })
+}
+
+/// What untraced child notice `sig` to the process `to` is a thread of
+/// does, by that process's SIGCHLD action (Linux do_notify_parent:
+/// psig, the handlers its threads share; not a thread's own, which an
+/// exited one no longer has): the signal sent (0: none) and autoreap.
+/// A parent that ignores SIGCHLD or set SA_NOCLDWAIT does not wait for
+/// the child; one that ignores it gets no signal.
+fn disposition(table: &GlobalTaskTable, to: &TaskRef, sig: u32) -> (u32, bool) {
+    if sig != SIGCHLD {
+        return (sig, false);
+    }
+    let action = table
+        .get(to.tid())
+        .and_then(|v| v.sighand.as_ref().and_then(|h| h.get_action(SIGCHLD)));
+    match action {
+        Some(a) if a.handler == SigHandler::Ignore => (0, true),
+        Some(a) if a.flags & sa_flags::SA_NOCLDWAIT != 0 => (sig, true),
+        _ => (sig, false),
+    }
 }
 
 /// The entry a zombie's notice is queued with, made before TASKLIST is
 /// taken (nothing allocates under it) and charged to the user it would
-/// go to then; under the lock, [`Entry::fits`] tells whether that is
-/// still so, else the caller drops the lock and makes another
+/// go to then, none if no signal would be sent; under the lock,
+/// [`Entry::fits`] tells whether that is still so, else the caller
+/// drops the lock and makes another
 #[derive(Default)]
 pub struct Entry {
     /// The receiver's real uid and the signal it was made for
@@ -118,18 +147,25 @@ impl Entry {
     /// For zombie (or soon zombie) `tid`'s notice
     pub fn child(tid: Tid) -> Self {
         let table = TASKLIST.read();
-        let pre =
-            receiver(&table, tid).and_then(|r| Some((super::target_in(&table, &r.to)?, r.sig)));
+        let r = receiver(&table, tid).filter(|r| r.sig != 0);
+        let pre = r
+            .as_ref()
+            .and_then(|r| Some((super::target_in(&table, &r.to)?, r.sig)));
         drop(table);
+        drop(r);
         Self::make(pre)
     }
 
-    /// For SIGCHLD to `parent`'s process (a zombie reparented to it)
+    /// For SIGCHLD to `parent`'s process (an untraced zombie reparented
+    /// to it)
     pub fn parent(parent: &TaskRef) -> Self {
         let table = TASKLIST.read();
-        let pre = super::group_task(&table, table.get(parent.pid))
-            .and_then(|to| Some((super::target_in(&table, &to)?, SIGCHLD)));
+        let to = adopter(&table, parent);
+        let pre = to
+            .as_ref()
+            .and_then(|to| Some((super::target_in(&table, to)?, SIGCHLD)));
         drop(table);
+        drop(to);
         Self::make(pre)
     }
 
@@ -162,25 +198,29 @@ impl Entry {
     /// Under TASKLIST: zombie `tid`'s notice would go where this entry
     /// was made for (or needs none)
     pub fn fits(&self, table: &GlobalTaskTable, tid: Tid) -> bool {
-        let Some(r) = receiver(table, tid) else {
-            return true;
-        };
-        self.matches(table, &r.to, r.sig)
+        match receiver(table, tid) {
+            Some(r) if r.sig != 0 => self.matches(table, &r.to, r.sig),
+            _ => true,
+        }
     }
 
     /// Under TASKLIST: SIGCHLD to `parent`'s process would go where this
     /// entry was made for (or needs none)
     pub fn fits_parent(&self, table: &GlobalTaskTable, parent: &TaskRef) -> bool {
-        let Some(to) = super::group_task(table, table.get(parent.pid)) else {
-            return true;
-        };
-        self.matches(table, &to, SIGCHLD)
+        adopter(table, parent).is_none_or(|to| self.matches(table, &to, SIGCHLD))
     }
 
     /// Made for `to`'s user and `sig`, or `to` takes no signal
     fn matches(&self, table: &GlobalTaskTable, to: &TaskRef, sig: u32) -> bool {
         super::target_in(table, to).is_none_or(|tg| self.key == Some((tg.uid, sig)))
     }
+}
+
+/// The thread of `parent`'s process an untraced zombie reparented to it
+/// signals, if the signal is sent (SIGCHLD, as [`disposition`] decides)
+fn adopter(table: &GlobalTaskTable, parent: &TaskRef) -> Option<TaskRef> {
+    super::group_task(table, table.get(parent.pid))
+        .filter(|to| disposition(table, to, SIGCHLD).0 != 0)
 }
 
 /// What [`notify`] did: the parent is to release the zombie now
@@ -226,25 +266,7 @@ pub fn notify(table: &GlobalTaskTable, tid: Tid, mut entry: Entry) -> Told {
             ..Told::default()
         };
     };
-    let action = table
-        .get(r.parent.tid())
-        .and_then(|p| p.sighand.as_ref().and_then(|h| h.get_action(SIGCHLD)));
-    let mut sig = r.sig;
-    let mut autoreap = false;
-    if !r.traced && sig == SIGCHLD {
-        let ign = action
-            .as_ref()
-            .is_some_and(|a| a.handler == SigHandler::Ignore);
-        let nocldwait = action
-            .as_ref()
-            .is_some_and(|a| a.flags & sa_flags::SA_NOCLDWAIT != 0);
-        if ign || nocldwait {
-            autoreap = true;
-            if ign {
-                sig = 0;
-            }
-        }
-    }
+    let (sig, autoreap) = (r.sig, r.autoreap);
     let posted = match chld_notice(table, tid) {
         Some(mut info) if sig != 0 => {
             info.signo = sig as i32;
