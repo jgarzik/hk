@@ -40,7 +40,8 @@
 //! - exec resets caught handlers to SIG_DFL (ignored stay ignored),
 //!   forgets the alternate stack, deletes timer_create timers with their
 //!   pending signals; the blocked mask, other pending signals and
-//!   ITIMER_REAL stay
+//!   ITIMER_REAL stay; a handler table shared (CLONE_SIGHAND) with
+//!   the exec'ing process is copied first, the other keeps its handlers
 //! - rt_sigqueueinfo judges the siginfo layout by the signal queued,
 //!   not by the caller's si_signo: an unknown one with a nonzero tail
 //!   is E2BIG
@@ -95,6 +96,7 @@ pub fn run_tests() {
     test_exit_signal_reparent();
     test_ptrace_siginfo();
     test_exec_signals();
+    test_exec_shared_sighand();
     test_queue_layout();
     #[cfg(target_arch = "aarch64")]
     test_no_restorer();
@@ -1335,6 +1337,49 @@ fn test_queue_layout() {
         print_num(r);
         print(b" queued=");
         print_num(n);
+        println(b"");
+    }
+}
+
+/// A CLONE_VM|CLONE_SIGHAND|CLONE_VFORK child execs: it gets its own
+/// copy of the handler table (Linux unshare_sighand), so the parent's
+/// SIGUSR1 handler is still installed
+fn test_exec_shared_sighand() {
+    const CLONE_VM: u64 = 0x100;
+    const CLONE_SIGHAND: u64 = 0x800;
+    const CLONE_VFORK: u64 = 0x4000;
+    let act: [u64; 4] = [
+        group_handler as *const () as u64,
+        SA_RESTORER,
+        super::signals::restorer_addr(),
+        0,
+    ];
+    let mut old = [0u64; 4];
+    sys_rt_sigaction(SIGUSR1, act.as_ptr() as u64, old.as_mut_ptr() as u64, 8);
+    let flags = CLONE_VM | CLONE_SIGHAND | CLONE_VFORK | SIGCHLD as u64;
+    let c = hk_syscall::sys_clone(flags, 0, 0, 0, 0);
+    if c == 0 {
+        let argv: [*const u8; 2] = [b"true\0".as_ptr(), core::ptr::null()];
+        let envp: [*const u8; 1] = [core::ptr::null()];
+        hk_syscall::sys_execve(b"/bin/busybox\0".as_ptr(), argv.as_ptr(), envp.as_ptr());
+        sys_exit(127);
+    }
+    let mut now = [0u64; 4];
+    sys_rt_sigaction(SIGUSR1, core::ptr::null::<u64>() as u64, now.as_mut_ptr() as u64, 8);
+    let mut st = -1i32;
+    if c > 0 {
+        sys_wait4(c, &mut st, 0, 0);
+    }
+    sys_rt_sigaction(SIGUSR1, old.as_ptr() as u64, 0, 8);
+    if c > 0 && st == 0 && now[0] == act[0] {
+        println(b"SIGQUEUE_EXEC_SHARED_SIGHAND:OK");
+    } else {
+        print(b"SIGQUEUE_EXEC_SHARED_SIGHAND:FAIL c=");
+        print_num(c);
+        print(b" status=");
+        print_num(st as i64);
+        print(b" handler_kept=");
+        print_num((now[0] == act[0]) as i64);
         println(b"");
     }
 }

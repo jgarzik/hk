@@ -438,6 +438,9 @@ pub struct SigHand {
     /// table (Linux sighand->signalfd_wqh): woken by every signal sent
     /// to one of them
     pub signalfd_wq: crate::sync::waitqueue::WaitQueue,
+    /// Tasks whose `Task.sighand` it is (Linux sighand->count), changed
+    /// and read under TASKLIST with that field
+    users: crate::task::TableCell<u32>,
 }
 
 /// A handler table with every action at its default
@@ -451,7 +454,19 @@ impl SigHand {
         Self {
             action: IrqSpinlock::new(default_actions()),
             signalfd_wq: crate::sync::waitqueue::WaitQueue::new(),
+            users: crate::task::TableCell::new(0),
         }
+    }
+
+    /// One more task uses it (under TASKLIST's write lock)
+    fn get(&self, table: &mut crate::task::percpu::GlobalTaskTable) {
+        *self.users.access_mut(table) += 1;
+    }
+
+    /// One task fewer uses it (under TASKLIST's write lock)
+    fn put(&self, table: &mut crate::task::percpu::GlobalTaskTable) {
+        let n = self.users.access_mut(table);
+        *n = n.saturating_sub(1);
     }
 
     /// Get action for a signal
@@ -491,6 +506,7 @@ impl SigHand {
         try_arc(Self {
             action: IrqSpinlock::new(actions),
             signalfd_wq: crate::sync::waitqueue::WaitQueue::new(),
+            users: crate::task::TableCell::new(0),
         })
     }
 
@@ -724,17 +740,13 @@ use crate::task::percpu::{TASKLIST, TaskRef};
 /// Called when creating the init process at boot (failure cannot be
 /// reported). Also initializes the SignalStruct (which contains rlimits).
 pub fn init_task_signal(tid: Tid, sighand: Arc<SigHand>) {
-    // Built before TASKLIST is taken; Linux fork_init gives init_task
-    // RLIMIT_NPROC and RLIMIT_SIGPENDING of half max_threads, which
-    // every task inherits
-    let s = SignalStruct::new();
-    let half = crate::task::rlimit::max_threads() / 2;
-    for r in [RLIMIT_NPROC, RLIMIT_SIGPENDING] {
-        s.rlim.lock()[r as usize] = RLimit::new(half, half);
-    }
-    let s = arc_nofail(s);
+    // Built before TASKLIST is taken, with init's limits (init_rlimits)
+    let s = arc_nofail(SignalStruct::new());
     let state = TaskSignalState::with_shared(SharedPending(Some(s.clone())));
     let mut table = TASKLIST.write();
+    if table.get(tid).is_some() {
+        sighand.get(&mut table);
+    }
     if let Some(mut task) = table.get_mut(tid) {
         task.sighand = Some(sighand);
         *task.task.sig.lock() = state;
@@ -980,6 +992,9 @@ pub fn install_fork_signal(child_tid: Tid, f: ForkSignal) {
         crate::time::cpu_timer::rlimit_cpu_changed(&f.signal, child_tid);
     }
     let mut table = TASKLIST.write();
+    if table.get(child_tid).is_some() {
+        f.sighand.get(&mut table);
+    }
     if let Some(mut child) = table.get_mut(child_tid) {
         child.sighand = Some(f.sighand);
         child.task.set_cpu_group(&f.signal);
@@ -994,7 +1009,7 @@ pub fn exit_task_signal(tid: Tid) {
     // __exit_signal); an exiting task gets no more queued (send_locked)
     let _old = {
         let mut table = TASKLIST.write();
-        table.get_mut(tid).map(|mut task| {
+        let old = table.get_mut(tid).map(|mut task| {
             let old = core::mem::replace(&mut *task.task.sig.lock(), TaskSignalState::boot());
             task.task.set_sigpending(false);
             // A zombie leader keeps the group's SignalStruct (its exit
@@ -1010,7 +1025,11 @@ pub fn exit_task_signal(tid: Tid) {
                 task.signal.take()
             };
             (task.sighand.take(), signal, old)
-        })
+        });
+        if let Some((Some(h), _, _)) = &old {
+            h.put(&mut table);
+        }
+        old
     };
 }
 
@@ -1031,17 +1050,23 @@ pub fn exec_signals() -> Result<(), KernelError> {
     let Some(old) = get_task_sighand(me) else {
         return Ok(());
     };
-    let shared = TASKLIST
-        .read()
-        .iter()
-        .any(|t| t.task.tid() != me && t.sighand.as_ref().is_some_and(|h| Arc::ptr_eq(h, &old)));
+    // Shared with another task (Linux unshare_sighand: sighand->count
+    // above one)
+    let shared = *old.users.access(&TASKLIST.read()) > 1;
     if shared {
         let new = old.deep_clone()?;
         // The old reference goes after TASKLIST
-        let _old = TASKLIST
-            .write()
-            .get_mut(me)
-            .and_then(|mut t| t.sighand.replace(new));
+        let _old = {
+            let mut table = TASKLIST.write();
+            if table.get(me).is_some() {
+                new.get(&mut table);
+            }
+            let prev = table.get_mut(me).and_then(|mut t| t.sighand.replace(new));
+            if let Some(p) = &prev {
+                p.put(&mut table);
+            }
+            prev
+        };
     }
     if let Some(h) = get_task_sighand(me) {
         h.flush_handlers();
@@ -1997,7 +2022,7 @@ const SIGPOLL: u32 = SIGIO;
 // SignalStruct - Per-Process Structure (mirrors Linux signal_struct)
 // =============================================================================
 
-use crate::task::rlimit::{RLIM_NLIMITS, RLIMIT_NPROC, RLIMIT_SIGPENDING, RLimit, default_rlimits};
+use crate::task::rlimit::{RLIM_NLIMITS, RLIMIT_SIGPENDING, RLimit};
 
 /// Per-process signal structure (mirrors Linux signal_struct)
 ///
@@ -2134,10 +2159,11 @@ impl Drop for CredGuard {
 }
 
 impl SignalStruct {
-    /// Create new SignalStruct with default rlimits
+    /// A new SignalStruct with the global init's rlimits (Linux
+    /// INIT_RLIMITS as fork_init leaves them)
     pub fn new() -> Self {
         Self {
-            rlim: IrqSpinlock::new(default_rlimits()),
+            rlim: IrqSpinlock::new(crate::task::rlimit::init_rlimits()),
             cred_guard: crate::sync::Mutex::new(()),
             exec_update: crate::sync::RwSem::new(()),
             group_exit: AtomicU64::new(0),

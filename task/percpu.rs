@@ -1799,12 +1799,7 @@ pub fn take_leadership(tgid: Pid, tid: Tid) -> Vec<TaskRef> {
     if ltid == tid {
         return Vec::new();
     }
-    let (ppid, exit_signal, start, uid) = (
-        l.task.ppid(),
-        l.exit_signal,
-        l.task.start_time(),
-        l.cred().uid,
-    );
+    let (ppid, start, uid) = (l.task.ppid(), l.task.start_time(), l.cred().uid);
     let gone: Vec<Tid> = table
         .threads(tgid)
         .filter(|t| t.task.tid() != tid && matches!(t.state, TaskState::Zombie(_)))
@@ -1875,7 +1870,6 @@ pub fn take_leadership(tgid: Pid, tid: Tid) -> Vec<TaskRef> {
             .ppid
             .store(ppid, core::sync::atomic::Ordering::Relaxed);
         // Linux de_thread: the new leader's exit signal is SIGCHLD
-        let _ = exit_signal;
         m.exit_signal = crate::signal::SIGCHLD as i32;
         m.task.start_time.store(start, Ordering::Relaxed);
     }
