@@ -33,6 +33,8 @@
 //! - a SIGEV_THREAD_ID timer whose thread has exited sends nothing
 //! - a child's custom exit signal becomes SIGCHLD once its parent
 //!   exec'd (parent_exec_id) or it is reparented (reparent_leader)
+//! - a traced zombie reparented to its tracer (a subreaper) is not
+//!   reported to it again; it waits for the tracer's wait
 //! - a tracer reads a signal-delivery stop's siginfo
 //!   (PTRACE_GETSIGINFO), its tracee's queued ones
 //!   (PTRACE_PEEKSIGINFO, shared), and changes what is delivered
@@ -94,6 +96,7 @@ pub fn run_tests() {
     test_timer_gone();
     test_exit_signal_exec();
     test_exit_signal_reparent();
+    test_reparent_traced_zombie();
     test_ptrace_siginfo();
     test_exec_signals();
     test_exec_shared_sighand();
@@ -1380,6 +1383,94 @@ fn test_exec_shared_sighand() {
         print_num(st as i64);
         print(b" handler_kept=");
         print_num((now[0] == act[0]) as i64);
+        println(b"");
+    }
+}
+
+/// The state letter in /proc/<pid>/stat, or 0
+fn stat_state(pid: i64) -> u8 {
+    let path = super::exec_identity::proc_path(pid, b"stat\0");
+    let mut b = [0u8; 128];
+    let n = read_file(&path, &mut b);
+    if n <= 0 {
+        return 0;
+    }
+    let b = &b[..n as usize];
+    match b.iter().rposition(|&c| c == b')') {
+        Some(i) if i + 2 < b.len() => b[i + 2],
+        _ => 0,
+    }
+}
+
+/// In a child subreaper that traces its grandchild, SIGCHLD blocked:
+/// the grandchild exits (a zombie for its tracer, which takes that
+/// SIGCHLD), then its parent exits; the traced zombie reparented to the
+/// subreaper is not reported again: the next SIGCHLD is the parent's
+/// own, and the subreaper then waits for the grandchild (Linux
+/// reparent_leader: only an untraced zombie is reported)
+fn test_reparent_traced_zombie() {
+    const PR_SET_CHILD_SUBREAPER: i32 = 36;
+    const PTRACE_SEIZE: i64 = 0x4206;
+    const WALL: i32 = 0x4000_0000;
+    const WNOHANG: i32 = 1;
+    let s = sys_fork();
+    if s == 0 {
+        hk_syscall::sys_prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0);
+        block(bit(SIGCHLD));
+        let mut up = [0i32; 2];
+        let mut go = [0i32; 2];
+        let mut cgo = [0i32; 2];
+        hk_syscall::sys_pipe2(up.as_mut_ptr(), 0);
+        hk_syscall::sys_pipe2(go.as_mut_ptr(), 0);
+        hk_syscall::sys_pipe2(cgo.as_mut_ptr(), 0);
+        let c = sys_fork();
+        if c == 0 {
+            let g = sys_fork();
+            if g == 0 {
+                let mut b = [0u8; 1];
+                sys_read(go[0] as u64, b.as_mut_ptr(), 1);
+                sys_exit(5);
+            }
+            hk_syscall::sys_write(up[1] as u64, (&g as *const i64).cast(), 8);
+            let mut b = [0u8; 1];
+            sys_read(cgo[0] as u64, b.as_mut_ptr(), 1);
+            sys_exit(0);
+        }
+        let mut g = 0i64;
+        sys_read(up[0] as u64, (&mut g as *mut i64).cast(), 8);
+        if hk_syscall::sys_ptrace(PTRACE_SEIZE, g, 0, 0) != 0 {
+            hk_syscall::sys_exit_group(1);
+        }
+        hk_syscall::sys_write(go[1] as u64, b"x".as_ptr(), 1);
+        let t0 = super::sk::now_ms();
+        while stat_state(g) != b'Z' {
+            if super::sk::now_ms() - t0 > 5000 {
+                hk_syscall::sys_exit_group(2);
+            }
+            sleep_ms(5);
+        }
+        // The tracee's exit notice
+        let mut i = zeroed();
+        wait_sig(bit(SIGCHLD), 1, &mut i);
+        hk_syscall::sys_write(cgo[1] as u64, b"x".as_ptr(), 1);
+        let mut st = 0i32;
+        sys_wait4(c, &mut st, 0, 0);
+        let mut i = zeroed();
+        let r = wait_sig(bit(SIGCHLD), 1, &mut i);
+        if r != SIGCHLD as i64 || i.si_pid as i64 != c {
+            hk_syscall::sys_exit_group(3);
+        }
+        let r = sys_wait4(g, &mut st, WNOHANG | WALL, 0);
+        let code = if r == g && st == 5 << 8 { 0 } else { 4 };
+        hk_syscall::sys_exit_group(code);
+    }
+    let mut st = 0i32;
+    sys_wait4(s, &mut st, 0, 0);
+    if st == 0 {
+        println(b"SIGQUEUE_REPARENT_TRACED_ZOMBIE:OK");
+    } else {
+        print(b"SIGQUEUE_REPARENT_TRACED_ZOMBIE:FAIL status=");
+        print_num(st as i64);
         println(b"");
     }
 }

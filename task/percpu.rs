@@ -2701,13 +2701,16 @@ fn exit_notify(tid: Tid, last: bool) {
     }
 }
 
-/// Process `pid`'s leader is a zombie with no other thread left: it
-/// waits only for its parent now (Linux release_task: the group's
-/// last thread notifies for it)
+/// Process `pid`'s leader is an untraced zombie with no other thread
+/// left: a new parent is told of it (Linux reparent_leader: !ptrace,
+/// EXIT_ZOMBIE, thread_group_empty); a traced one is its tracer's
 fn leader_waits(pid: Pid) -> bool {
     let table = TASKLIST.read();
     table.get(pid).is_some_and(|l| {
-        l.leader && matches!(l.state, TaskState::Zombie(_)) && !group_alive(&table, pid, pid)
+        l.leader
+            && l.ptrace == 0
+            && matches!(l.state, TaskState::Zombie(_))
+            && !group_alive(&table, pid, pid)
     })
 }
 
