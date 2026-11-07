@@ -235,6 +235,11 @@ impl SigPending {
 }
 
 impl SigPending {
+    /// The info of its `n`th queued entry (PTRACE_PEEKSIGINFO)
+    pub fn nth(&self, n: u64) -> Option<SigInfo> {
+        self.iter().nth(usize::try_from(n).ok()?).map(|q| q.info)
+    }
+
     /// Take the signals of `mask` out, their queued info with them
     /// (Linux flush_sigqueue_mask): returned to be dropped after the
     /// lock is released
@@ -269,13 +274,19 @@ mod tests {
     const NONE: SigSet = SigSet::EMPTY;
 
     fn rt(sig: u32, value: u64) -> Box<SigQueue> {
+        rt_as(4242, sig, value)
+    }
+
+    /// An RT entry charged to `uid` (each test its own uid: they run in
+    /// parallel on one count table)
+    fn rt_as(uid: Uid, sig: u32, value: u64) -> Box<SigQueue> {
         let f = SigFields::Rt {
             pid: 1,
             uid: 0,
             value,
         };
         let info = SigInfo::new(sig, si_code::SI_QUEUE, f);
-        SigQueue::alloc(info, 4242, u64::MAX, false).unwrap()
+        SigQueue::alloc(info, uid, u64::MAX, false).unwrap()
     }
 
     fn value(d: Dequeued) -> u64 {
@@ -329,9 +340,9 @@ mod tests {
     fn flush() {
         let sig = SIGRTMIN + 5;
         let mut p = SigPending::new();
-        p.queue(rt(sig, 1));
-        p.queue(rt(SIGRTMIN + 6, 2));
-        p.queue(rt(sig, 3));
+        p.queue(rt_as(4244, sig, 1));
+        p.queue(rt_as(4244, SIGRTMIN + 6, 2));
+        p.queue(rt_as(4244, sig, 3));
         let mut m = SigSet::EMPTY;
         m.add(sig);
         let gone = p.flush_mask(&m);

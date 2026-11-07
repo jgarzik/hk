@@ -1307,6 +1307,7 @@ fn create_kernel_task(
         ptrace_message: 0,
         ptrace_options: 0,
         ptrace_code: 0,
+        last_siginfo: None,
     };
     let task = Task::new(
         tid,
@@ -1518,6 +1519,7 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<Tid, &'static str> {
         ptrace_message: 0,
         ptrace_options: 0,
         ptrace_code: 0,
+        last_siginfo: None,
     };
     // The boot-time init task: failure cannot be reported
     let task = arc_nofail(Task::new(
@@ -2254,6 +2256,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         ptrace_message: 0,
         ptrace_options: 0,
         ptrace_code: 0,
+        last_siginfo: None,
     };
     let child_task = try_arc(Task::new(
         child_tid,

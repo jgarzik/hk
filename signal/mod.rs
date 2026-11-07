@@ -2292,15 +2292,21 @@ fn traced_signal(tid: Tid, info: SigInfo, action: SigAction) -> Option<(SigInfo,
     if sig == SIGKILL {
         return Some((info, action));
     }
-    let new = crate::task::ptrace::ptrace_signal(sig);
-    if new == sig {
-        return Some((info, action));
-    }
+    // The tracer may change the info too (PTRACE_SETSIGINFO)
+    let mut info = info;
+    let new = crate::task::ptrace::ptrace_signal(&mut info);
     if new == 0 {
         return None;
     }
-    // A changed signal is the tracer's (Linux ptrace_signal)
-    let info = tracer_info(tid, new);
+    if new == sig && info.sig() == sig {
+        let action = get_task_sighand(tid)?.get_action(new).unwrap_or_default();
+        return Some((info, action));
+    }
+    // A signal other than the info's is the tracer's (Linux
+    // ptrace_signal: signr != info->si_signo)
+    if new != info.sig() {
+        info = tracer_info(tid, new);
+    }
     let blocked = with_task_signal_state(tid, |state| state.blocked.contains(new)).unwrap_or(false);
     if blocked {
         send_sig_info(tid, new, SendInfo::Info(info));

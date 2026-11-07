@@ -1253,6 +1253,10 @@ pub struct TaskInner {
     /// the tracer's wait reports it (then 0), then the signal the
     /// tracer's resume leaves to deliver (0: none)
     pub ptrace_code: u32,
+    /// The siginfo of the stop it is in, which PTRACE_GETSIGINFO reads
+    /// and PTRACE_SETSIGINFO replaces (Linux task->last_siginfo); none
+    /// outside a ptrace stop
+    pub last_siginfo: Option<crate::signal::SigInfo>,
 }
 
 /// Data owned by the TASKLIST lock: reached through a borrow of the

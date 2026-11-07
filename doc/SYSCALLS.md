@@ -534,7 +534,7 @@ There are very few direct "cgroup_*" syscalls; the cgroup v1/v2 APIs are primari
 
 13. Debugging, perf, BPF
 
-- [x] ptrace (TRACEME, ATTACH, SEIZE, DETACH, PEEKTEXT/PEEKDATA, POKETEXT/POKEDATA, GETREGS, SETREGS, CONT, SYSCALL, SINGLESTEP, KILL, SETOPTIONS, GETEVENTMSG)
+- [x] ptrace (TRACEME, ATTACH, SEIZE, DETACH, PEEKTEXT/PEEKDATA, POKETEXT/POKEDATA, GETREGS, SETREGS, CONT, SYSCALL, SINGLESTEP, KILL, SETOPTIONS, GETEVENTMSG, GETSIGINFO, SETSIGINFO, PEEKSIGINFO)
 - [x] perf_event_open (stub, returns -EOPNOTSUPP)
 - [x] bpf (BPF_MAP_CREATE, BPF_MAP_LOOKUP/UPDATE/DELETE_ELEM, BPF_MAP_GET_NEXT_KEY, BPF_PROG_LOAD, BPF_OBJ_GET_INFO_BY_FD; map types: HASH, ARRAY; program type: SOCKET_FILTER, verified but not attachable; CAP_BPF or CAP_SYS_ADMIN unless kernel.unprivileged_bpf_disabled is 0, default 2)
 - [x] membarrier

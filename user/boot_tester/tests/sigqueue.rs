@@ -32,6 +32,10 @@
 //! - a SIGEV_THREAD_ID timer whose thread has exited sends nothing
 //! - a child's custom exit signal becomes SIGCHLD once its parent
 //!   exec'd (parent_exec_id) or it is reparented (reparent_leader)
+//! - a tracer reads a signal-delivery stop's siginfo
+//!   (PTRACE_GETSIGINFO), its tracee's queued ones
+//!   (PTRACE_PEEKSIGINFO, shared), and changes what is delivered
+//!   (PTRACE_SETSIGINFO)
 //! - arm64: a handler set without SA_RESTORER returns through the
 //!   kernel's trampoline (Linux: the vDSO sigtramp), a mapping of its
 //!   own in /proc/self/maps ([sigpage]; Linux [vdso])
@@ -80,6 +84,7 @@ pub fn run_tests() {
     test_timer_gone();
     test_exit_signal_exec();
     test_exit_signal_reparent();
+    test_ptrace_siginfo();
     #[cfg(target_arch = "aarch64")]
     test_no_restorer();
 }
@@ -1115,6 +1120,76 @@ fn test_exit_signal_reparent() {
     } else {
         print(b"SIGQUEUE_EXIT_SIGNAL_REPARENT:FAIL sig=");
         print_num(got);
+        println(b"");
+    }
+}
+
+static PT_SEEN: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
+
+extern "C" fn pt_handler(_: i32, info: *const SigInfo, _: *const u8) {
+    // SAFETY: the kernel's siginfo for this handler
+    let v = unsafe { (*info).si_status };
+    PT_SEEN.store(i64::from(v), core::sync::atomic::Ordering::Relaxed);
+}
+
+/// A traced child queues two SIGRT (blocked, the group's) and SIGUSR1
+/// with value 55: at its signal-delivery stop the tracer reads SIGUSR1's
+/// info, peeks the two SIGRT, sets the value to 99 and resumes with
+/// SIGUSR1; the child's handler sees 99
+fn test_ptrace_siginfo() {
+    use core::sync::atomic::Ordering;
+    const PTRACE_TRACEME: i64 = 0;
+    const PTRACE_CONT: i64 = 7;
+    const PTRACE_GETSIGINFO: i64 = 0x4202;
+    const PTRACE_SETSIGINFO: i64 = 0x4203;
+    const PTRACE_PEEKSIGINFO: i64 = 0x4209;
+    let c = sys_fork();
+    if c == 0 {
+        let act: [u64; 4] = [
+            pt_handler as *const () as u64,
+            SA_SIGINFO | SA_RESTORER,
+            super::signals::restorer_addr(),
+            0,
+        ];
+        sys_rt_sigaction(SIGUSR1, act.as_ptr() as u64, 0, 8);
+        block(bit(SIGRT));
+        sys_ptrace(PTRACE_TRACEME, 0, 0, 0);
+        queue_self(SIGRT, 1);
+        queue_self(SIGRT, 2);
+        queue_self(SIGUSR1, 55);
+        sys_exit(if PT_SEEN.load(Ordering::Relaxed) == 99 { 0 } else { 1 });
+    }
+    let mut st = 0i32;
+    sys_wait4(c, &mut st, 0, 0);
+    let stopped = st & 0xff == 0x7f && (st >> 8) & 0xff == SIGUSR1 as i32;
+    let mut info = zeroed();
+    let g = sys_ptrace(PTRACE_GETSIGINFO, c, 0, &mut info as *mut SigInfo as u64);
+    let got = g == 0 && info.si_signo == SIGUSR1 as i32 && info.si_code == SI_QUEUE && info.si_status == 55;
+    // struct ptrace_peeksiginfo_args: off 0, flags SHARED, nr 4
+    let args: [u32; 4] = [0, 0, 1, 4];
+    let mut peek = [zeroed(), zeroed(), zeroed(), zeroed()];
+    let n = sys_ptrace(PTRACE_PEEKSIGINFO, c, args.as_ptr() as u64, peek.as_mut_ptr() as u64);
+    let peeked = n == 2 && peek[0].si_status == 1 && peek[1].si_status == 2;
+    info.si_status = 99;
+    let s = sys_ptrace(PTRACE_SETSIGINFO, c, 0, &info as *const SigInfo as u64);
+    sys_ptrace(PTRACE_CONT, c, 0, SIGUSR1 as u64);
+    let mut st2 = 0i32;
+    sys_wait4(c, &mut st2, 0, 0);
+    if stopped && got && peeked && s == 0 && st2 == 0 {
+        println(b"SIGQUEUE_PTRACE_SIGINFO:OK");
+    } else {
+        print(b"SIGQUEUE_PTRACE_SIGINFO:FAIL stop=");
+        print_num(st as i64);
+        print(b" get=");
+        print_num(g);
+        print(b",");
+        print_num(info.si_code as i64);
+        print(b" peek=");
+        print_num(n);
+        print(b" set=");
+        print_num(s);
+        print(b" exit=");
+        print_num(st2 as i64);
         println(b"");
     }
 }
