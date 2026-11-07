@@ -444,6 +444,13 @@ fn cap(c: u32) -> bool {
     crate::task::capable(c)
 }
 
+/// SO_PRIORITY `val`: TC_PRIO_BESTEFFORT..=TC_PRIO_INTERACTIVE for
+/// anyone, others with CAP_NET_RAW or CAP_NET_ADMIN (Linux
+/// sk_set_prio_allowed)
+fn prio_allowed(val: i32) -> bool {
+    (0..=6).contains(&val) || cap(crate::task::CAP_NET_RAW) || cap(crate::task::CAP_NET_ADMIN)
+}
+
 /// setsockopt(SOL_SOCKET)
 pub fn sock_setsockopt(s: &dyn ProtoOps, opt: i32, v: OptIn) -> Result<(), KernelError> {
     let sk = s.sk();
@@ -476,7 +483,7 @@ pub fn sock_setsockopt(s: &dyn ProtoOps, opt: i32, v: OptIn) -> Result<(), Kerne
             }
         }
         SO_PRIORITY => {
-            if !(0..=6).contains(&val) && !cap(crate::task::CAP_NET_ADMIN) {
+            if !prio_allowed(val) {
                 return Err(KernelError::NotPermitted);
             }
             sk.priority.store(val as u32, Ordering::Release);
