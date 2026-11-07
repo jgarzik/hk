@@ -298,19 +298,29 @@ fn setup_user_stack<FA: FrameAlloc<PhysAddr = u64>>(
 /// get_unmapped_area, top-down)
 fn free_page(vmas: &[crate::mm::Vma]) -> Option<u64> {
     let mut spans: Vec<(u64, u64)> = vmas.iter().map(|v| (v.start, v.end)).collect();
+    highest_gap(&mut spans, crate::mm::mmap_base(), crate::mm::MMAP_MIN_ADDR)
+}
+
+/// The highest page in `[low, top)` that no span `[start, end)` of
+/// `spans` overlaps (page-aligned bounds; spans may overlap or nest):
+/// walked by start with the highest end so far, each gap below the
+/// next start is free (Linux unmapped_area_topdown's gap search)
+fn highest_gap(spans: &mut [(u64, u64)], top: u64, low: u64) -> Option<u64> {
     spans.sort_unstable();
-    let mut top = crate::mm::mmap_base();
-    for &(start, end) in spans.iter().rev() {
-        if start >= top {
-            continue;
+    let mut reach = low;
+    let mut best = None;
+    let ends = spans.iter().copied().chain(core::iter::once((top, top)));
+    for (start, end) in ends {
+        let hi = start.min(top);
+        if hi > reach && hi - reach >= PAGE_SIZE {
+            best = Some(hi - PAGE_SIZE);
         }
-        if end <= top && top - end >= PAGE_SIZE {
+        reach = reach.max(end);
+        if reach >= top {
             break;
         }
-        top = top.min(start);
     }
-    top.checked_sub(PAGE_SIZE)
-        .filter(|&a| a >= crate::mm::MMAP_MIN_ADDR)
+    best
 }
 
 /// The arch's signal return page, if it has one (arm64: Linux's vDSO
@@ -1289,4 +1299,43 @@ fn exec_name(dirfd: i32, path: &[u8]) -> Vec<u8> {
 fn exec_lookup(dirfd: i32, path: &[u8], flags: i32) -> Result<crate::fs::Path, i32> {
     use crate::fs::namei::{LookupFlags, filename_lookup};
     filename_lookup(dirfd, path, LookupFlags::at(flags)).map_err(|e| e as i32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PAGE_SIZE, highest_gap};
+
+    const P: u64 = PAGE_SIZE;
+
+    #[test]
+    fn gap_below_nested() {
+        // B nests in A: the page under the top is inside A
+        let mut s = [(P, 11 * P), (2 * P, 3 * P)];
+        assert_eq!(highest_gap(&mut s, 11 * P, 0), Some(0));
+    }
+
+    #[test]
+    fn gap_at_top() {
+        let mut s = [(P, 2 * P), (4 * P, 5 * P)];
+        assert_eq!(highest_gap(&mut s, 8 * P, 0), Some(7 * P));
+    }
+
+    #[test]
+    fn gap_between() {
+        let mut s = [(P, 2 * P), (3 * P, 9 * P), (4 * P, 5 * P)];
+        assert_eq!(highest_gap(&mut s, 9 * P, P), Some(2 * P));
+    }
+
+    #[test]
+    fn gap_none() {
+        let mut s = [(P, 4 * P), (2 * P, 9 * P)];
+        assert_eq!(highest_gap(&mut s, 9 * P, P), None);
+        assert_eq!(highest_gap(&mut [], P, P), None);
+    }
+
+    #[test]
+    fn gap_span_above_top() {
+        let mut s = [(2 * P, 3 * P), (10 * P, 12 * P)];
+        assert_eq!(highest_gap(&mut s, 8 * P, 0), Some(7 * P));
+    }
 }
