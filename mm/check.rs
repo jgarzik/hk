@@ -90,8 +90,8 @@ impl<'a, I: Iterator<Item = &'a super::Vma>> Leaves<'a, I> {
 impl<'a, I: Iterator<Item = &'a super::Vma>> super::pagewalk::PteWalk for Leaves<'a, I> {
     type Err = core::convert::Infallible;
 
-    fn huge(&mut self, pmd: &AtomicU64, addr: u64, _: u64) -> Result<bool, Self::Err> {
-        self.leaf(addr, pmd.load(Ordering::Acquire));
+    fn huge(&mut self, pmd: super::pgtable::Pmd<'_>, addr: u64, _: u64) -> Result<bool, Self::Err> {
+        self.leaf(addr, pmd.get());
         Ok(true)
     }
 

@@ -21,6 +21,9 @@
 //!   without the PTE lock is a hint.
 //! - [`PteTable`]: a PTE table with its PTE lock held, the only handle
 //!   that writes 4KB entries (outside the range walker, `pagewalk`).
+//! - [`Pmd`]: one 2MB-level entry of pinned tables; a 2MB page in it
+//!   changes only with the page_table_lock held (`ptl::PtLock`), which
+//!   its writes take as an argument.
 //!
 //! Each is a pointer-sized copy of what the open-coded `*mut u64` was;
 //! the walk itself stays in `arch::paging`.
@@ -28,7 +31,9 @@
 use core::marker::PhantomData;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use super::ptl::{PteLock, table_lock};
+use super::huge_page::{HUGE_PAGE_MASK, pmd_settled};
+use super::page::{Page, phys_to_page};
+use super::ptl::{PtLock, PteLock, table_lock};
 use super::{Mm, MmStruct};
 use crate::arch::{paging, phys_to_virt, virt_to_phys};
 
@@ -110,6 +115,25 @@ impl<'a> PgTables<'a> {
         Some(Pte { slot, addr })
     }
 
+    /// The 2MB-level entry of `addr`'s 2MB region (Linux pmd_offset);
+    /// None outside the pinned range or if an upper table is missing
+    #[inline]
+    pub fn pmd(&self, addr: u64) -> Option<Pmd<'a>> {
+        if !self.covers(addr) {
+            return None;
+        }
+        let p = paging::pmd_ptr(self.pgd, addr)?;
+        // SAFETY: as in `pte`: the 2MB-level entry of `addr`, in a
+        // table under `pgd` kept for 'a
+        let slot = unsafe { AtomicU64::from_ptr(p) };
+        // INVARIANT: that entry, in a table kept for 'a
+        Some(Pmd {
+            slot,
+            pgd: self.pgd,
+            addr: addr & !HUGE_PAGE_MASK,
+        })
+    }
+
     /// `pte`, installing missing tables under `mm`'s page_table_lock
     /// (Linux pte_alloc); `mm` is the owner of the tables. None outside
     /// the pinned range, out of memory, or if a 2MB page maps `addr`.
@@ -176,6 +200,77 @@ impl<'a> Pte<'a> {
             _lock: table_lock(table),
             _pin: PhantomData,
         }
+    }
+}
+
+/// One 2MB-level entry of pinned page tables (Linux the `pmd_t *` of
+/// pmd_offset): a 2MB page, a PTE table or nothing. Read without a
+/// lock; a 2MB page in it is replaced only with the page_table_lock
+/// held (`PtLock`), which a split keeps from writing `PMD_SPLITTING`
+/// until the PTE table is in.
+///
+/// # Invariants
+///
+/// `slot` is the 2MB-level entry for the 2MB region at `addr` in the
+/// tables under `pgd`, in a table that stays for `'a`.
+#[derive(Clone, Copy)]
+pub struct Pmd<'a> {
+    slot: &'a AtomicU64,
+    pgd: u64,
+    addr: u64,
+}
+
+impl Pmd<'_> {
+    /// The entry's value
+    #[inline]
+    pub fn get(&self) -> u64 {
+        self.slot.load(Ordering::Acquire)
+    }
+
+    /// The value once no split is under way (`huge_page::pmd_settled`)
+    #[inline]
+    pub fn settled(&self) -> u64 {
+        pmd_settled(self.slot)
+    }
+
+    /// It maps a 2MB page
+    #[inline]
+    pub fn huge(&self) -> bool {
+        paging::pmd_huge(self.get())
+    }
+
+    /// The first address of its 2MB region
+    #[inline]
+    pub fn addr(&self) -> u64 {
+        self.addr
+    }
+
+    /// The top-level table it lies under
+    #[inline]
+    pub fn pgd(&self) -> u64 {
+        self.pgd
+    }
+
+    /// The page of the table holding it (deposits: `huge_page`)
+    pub(super) fn table_page(&self) -> &'static Page {
+        let table = virt_to_phys(core::ptr::from_ref(self.slot).addr() as u64 & !0xfff);
+        phys_to_page(table).expect("page table outside RAM")
+    }
+
+    /// Replace the value by `v`, the page_table_lock of its address
+    /// space held (Linux pmdp_huge_get_and_clear): the value replaced
+    #[inline]
+    pub(super) fn swap(&self, l: &PtLock<'_>, v: u64) -> u64 {
+        assert_eq!(l.pgd(), self.pgd, "page_table_lock of another mm");
+        self.slot.swap(v, Ordering::AcqRel)
+    }
+
+    /// Install the filled PTE table `pt` in the entry, emptied (and
+    /// flushed) under the page_table_lock `l` (Linux pmd_populate)
+    #[inline]
+    pub(super) fn populate(&self, l: &PtLock<'_>, pt: u64) {
+        assert_eq!(l.pgd(), self.pgd, "page_table_lock of another mm");
+        paging::pmd_populate(self.slot.as_ptr(), pt);
     }
 }
 

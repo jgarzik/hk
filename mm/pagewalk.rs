@@ -21,6 +21,7 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::PAGE_SIZE;
+use super::pgtable::{PgTables, Pmd};
 use crate::arch::paging;
 
 /// The page table entry at `p`, as an atomic
@@ -99,10 +100,10 @@ pub trait PteWalk {
         Ok(())
     }
 
-    /// A 2MB page maps [addr, end) (inside its 2MB region; no PTE lock
-    /// held): true if done with the region, false to walk its PTE table
-    /// if it has one now (it was split)
-    fn huge(&mut self, _pmd: &AtomicU64, _addr: u64, _end: u64) -> Result<bool, Self::Err> {
+    /// A 2MB page, in the entry `pmd`, maps [addr, end) (inside its 2MB
+    /// region; no PTE lock held): true if done with the region, false
+    /// to walk its PTE table if it has one now (it was split)
+    fn huge(&mut self, _pmd: Pmd<'_>, _addr: u64, _end: u64) -> Result<bool, Self::Err> {
         Ok(true)
     }
 
@@ -129,8 +130,12 @@ pub fn walk_pte_range<W: PteWalk>(pgd: u64, start: u64, end: u64, w: &mut W) -> 
         "walk {start:#x}..{end:#x}"
     );
     let end = end.min(super::TASK_SIZE);
+    // SAFETY: the caller holds the mmap_lock or the chain of a VMA over
+    // [start, end) (module doc), so no table there is freed during the
+    // walk. Not yet checked (BUGS.md: the walk should take a `PgTables`)
+    let t = unsafe { PgTables::from_raw(pgd, start, end) };
     if start < end {
-        walk_level(pgd, 3, start, end, w)?;
+        walk_level(t, pgd, 3, start, end, w)?;
     }
     Ok(())
 }
@@ -138,6 +143,7 @@ pub fn walk_pte_range<W: PteWalk>(pgd: u64, start: u64, end: u64, w: &mut W) -> 
 /// The entries of the table `table` at `level` (3: top, 1: the 2MB
 /// level) for [start, end)
 fn walk_level<W: PteWalk>(
+    t: PgTables<'_>,
     table: u64,
     level: u32,
     start: u64,
@@ -148,11 +154,14 @@ fn walk_level<W: PteWalk>(
     let mut addr = start;
     while addr < end {
         let next = ((addr | ((1u64 << shift) - 1)) + 1).min(end);
-        let slot = entry(table_slot(table, (addr >> shift) & 511));
         if level == 1 {
-            walk_pmd(slot, addr, next, w)?;
-        } else if let Some(child) = paging::table_of(slot.load(Ordering::Acquire)) {
-            walk_level(child, level - 1, addr, next, w)?;
+            if let Some(pmd) = t.pmd(addr) {
+                walk_pmd(pmd, addr, next, w)?;
+            }
+        } else if let Some(child) = paging::table_of(
+            entry(table_slot(table, (addr >> shift) & 511)).load(Ordering::Acquire),
+        ) {
+            walk_level(t, child, level - 1, addr, next, w)?;
         }
         addr = next;
     }
@@ -161,16 +170,16 @@ fn walk_level<W: PteWalk>(
 
 /// One 2MB-level entry for [addr, end): its 2MB page, then its PTE
 /// table under the table's PTE lock
-fn walk_pmd<W: PteWalk>(pmd: &AtomicU64, addr: u64, end: u64, w: &mut W) -> Result<(), W::Err> {
+fn walk_pmd<W: PteWalk>(pmd: Pmd<'_>, addr: u64, end: u64, w: &mut W) -> Result<(), W::Err> {
     // A split under way is waited out: its slot is about to hold a PTE
     // table (huge_page::PMD_SPLITTING)
-    if paging::pmd_huge(super::huge_page::pmd_settled(pmd)) && w.huge(pmd, addr, end)? {
+    if paging::pmd_huge(pmd.settled()) && w.huge(pmd, addr, end)? {
         return Ok(());
     }
     if !W::PTES {
         return Ok(());
     }
-    let Some(table) = paging::table_of(super::huge_page::pmd_settled(pmd)) else {
+    let Some(table) = paging::table_of(pmd.settled()) else {
         return Ok(());
     };
     w.prepare(addr, end)?;

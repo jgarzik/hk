@@ -4,6 +4,8 @@
 //! This module contains cross-platform utilities used by both x86-64 and aarch64
 //! page fault handlers.
 
+use super::pgtable::Pmd;
+use super::ptl::PtLock;
 use super::vma::Vma;
 
 /// 2MB huge page size
@@ -136,30 +138,27 @@ pub fn pmd_settled(pmd: &core::sync::atomic::AtomicU64) -> u64 {
     }
 }
 
-/// The page of the PMD table holding `pmdp`
-fn pmd_table_page(pmdp: *mut u64) -> &'static crate::mm::page::Page {
-    let table = super::ptl::table_of_ptep(pmdp);
-    crate::mm::page::phys_to_page(table).expect("page table outside RAM")
-}
-
-/// Keep the page table `pt` for the split of the 2MB entry at `pmdp`
-/// (Linux pgtable_trans_huge_deposit), page_table_lock held: a split
-/// then never needs memory. The deposits of one PMD table are a list
-/// headed in its page's `private` (pfn + 1), linked through the
+/// Keep the page table `pt` for the split of the 2MB entry `pmd`
+/// (Linux pgtable_trans_huge_deposit), its page_table_lock `l` held: a
+/// split then never needs memory. The deposits of one PMD table are a
+/// list headed in its page's `private` (pfn + 1), linked through the
 /// deposited pages' `next`.
-pub fn deposit(pmdp: *mut u64, pt: u64) {
+pub fn deposit(pmd: &Pmd<'_>, l: &PtLock<'_>, pt: u64) {
     use core::sync::atomic::Ordering::Relaxed;
-    let head = &pmd_table_page(pmdp).private;
+    assert_eq!(l.pgd(), pmd.pgd(), "page_table_lock of another mm");
+    let head = &pmd.table_page().private;
     let ptp = crate::mm::page::phys_to_page(pt).expect("page table outside RAM");
     ptp.next.store(head.load(Relaxed), Relaxed);
     head.store((pt >> 12) + 1, Relaxed);
 }
 
 /// Take back a table deposited for a 2MB entry of the PMD table holding
-/// `pmdp` (Linux pgtable_trans_huge_withdraw), page_table_lock held
-pub fn withdraw(pmdp: *mut u64) -> Option<u64> {
+/// `pmd` (Linux pgtable_trans_huge_withdraw), its page_table_lock `l`
+/// held
+pub fn withdraw(pmd: &Pmd<'_>, l: &PtLock<'_>) -> Option<u64> {
     use core::sync::atomic::Ordering::Relaxed;
-    let head = &pmd_table_page(pmdp).private;
+    assert_eq!(l.pgd(), pmd.pgd(), "page_table_lock of another mm");
+    let head = &pmd.table_page().private;
     let v = head.load(Relaxed);
     if v == 0 {
         return None;
@@ -186,13 +185,7 @@ pub fn free_deposits(table: u64) {
     }
 }
 
-/// The 2MB-level entry at `p`, as an atomic
-fn pmd_entry(p: *mut u64) -> &'static core::sync::atomic::AtomicU64 {
-    // SAFETY: `p` points into a live page table of the locked mm
-    unsafe { core::sync::atomic::AtomicU64::from_ptr(p) }
-}
-
-/// Split the 2MB page mapping `va` in `mm` into 512 4KB entries (Linux
+/// Split the 2MB page of the entry `pmd` of `mm` into 512 4KB entries (Linux
 /// __split_huge_pmd_locked), mm lock held; takes the page_table_lock
 /// (a racing fault may split or map at the same time). The page table
 /// is the one deposited when the page was mapped (`deposit`), so the
@@ -203,29 +196,28 @@ fn pmd_entry(p: *mut u64) -> &'static core::sync::atomic::AtomicU64 {
 /// D8.16, Intel SDM 4.10.2.3); accessed/dirty bits set until then are
 /// kept. Each 4KB frame gets the head's reference count.
 ///
-/// Returns the physical base of the split page; None if `va` is not
-/// mapped by a 2MB page.
-pub fn split_huge_pmd(mm: &super::Mm, va: u64) -> Option<u64> {
+/// Returns the physical base of the split page; None if `pmd` maps no
+/// 2MB page.
+pub fn split_huge_pmd(mm: &super::Mm, pmd: Pmd<'_>) -> Option<u64> {
     use crate::arch::paging;
-    use core::sync::atomic::Ordering;
-    let pmdp = paging::pmd_ptr(mm.pgd(), va)?;
-    if !paging::pmd_huge(pmd_entry(pmdp).load(Ordering::Acquire)) {
+    assert_eq!(mm.pgd(), pmd.pgd(), "2MB entry of another mm");
+    if !pmd.huge() {
         return None;
     }
     // The table deposited when the 2MB page was mapped: a split never
     // fails for memory (Linux __split_huge_pmd). Without one, one is
     // allocated with no spin lock held (the allocation may reclaim)
     let mut spare = None;
-    let (_l, pt) = loop {
+    let (l, pt) = loop {
         let l = super::ptl::pt_lock(mm);
-        if !paging::pmd_huge(pmd_entry(pmdp).load(Ordering::Acquire)) {
+        if !pmd.huge() {
             drop(l);
             if let Some(p) = spare {
                 crate::FRAME_ALLOCATOR.free(p);
             }
             return None;
         }
-        if let Some(pt) = withdraw(pmdp).or_else(|| spare.take()) {
+        if let Some(pt) = withdraw(&pmd, &l).or_else(|| spare.take()) {
             break (l, pt);
         }
         drop(l);
@@ -234,12 +226,12 @@ pub fn split_huge_pmd(mm: &super::Mm, va: u64) -> Option<u64> {
     if let Some(p) = spare {
         crate::FRAME_ALLOCATOR.free(p);
     }
-    let Some(old) = clear_huge(pmd_entry(pmdp), PMD_SPLITTING) else {
-        deposit(pmdp, pt);
+    let Some(old) = clear_huge(&pmd, &l, PMD_SPLITTING) else {
+        deposit(&pmd, &l, pt);
         return None;
     };
     // All levels (Linux flush_pmd_tlb_range): a table replaces the block
-    flush_huge(mm, va);
+    flush_huge(mm, pmd.addr());
     // The hardware may have set accessed/dirty until the clear: `old`
     // is the value cleared
     let base = paging::split_table(pt, old);
@@ -249,7 +241,7 @@ pub fn split_huge_pmd(mm: &super::Mm, va: u64) -> Option<u64> {
     // pmd_populate last)
     crate::FRAME_ALLOCATOR.split_huge(base);
     split_rmap(base);
-    paging::pmd_populate(pmdp, pt);
+    pmd.populate(&l, pt);
     Some(base)
 }
 
@@ -281,34 +273,33 @@ fn split_rmap(base: u64) {
     }
 }
 
-/// Clear the 2MB page entry for `base` in `mm` (Linux zap_huge_pmd), mm
-/// lock held, under the page_table_lock; the caller flushes it (`Gather`) before releasing the
-/// returned frame, which still holds the mapping's reference.
-pub fn take_huge_pmd(mm: &super::Mm, base: u64) -> Option<u64> {
+/// Clear the 2MB page entry `pmd` of `mm` (Linux zap_huge_pmd), under
+/// the page_table_lock; the caller flushes it (`Gather`) before
+/// releasing the returned frame, which still holds the mapping's
+/// reference.
+pub fn take_huge_pmd(mm: &super::Mm, pmd: Pmd<'_>) -> Option<u64> {
     use crate::arch::paging;
-    let pmdp = paging::pmd_ptr(mm.pgd(), base)?;
-    let _l = super::ptl::pt_lock(mm);
-    let old = clear_huge(pmd_entry(pmdp), 0)?;
+    let l = super::ptl::pt_lock(mm);
+    let old = clear_huge(&pmd, &l, 0)?;
     // Its deposited table goes too (Linux zap_deposited_table)
-    if let Some(pt) = withdraw(pmdp) {
+    if let Some(pt) = withdraw(&pmd, &l) {
         crate::FRAME_ALLOCATOR.free(pt);
     }
     Some(paging::pte_addr(old) & !HUGE_PAGE_MASK)
 }
 
 /// Replace a 2MB page entry with `with` (0, or `PMD_SPLITTING`),
-/// page_table_lock held (Linux pmdp_huge_get_and_clear,
+/// its page_table_lock `l` held (Linux pmdp_huge_get_and_clear,
 /// pmdp_invalidate): the value replaced, None if it maps no 2MB page.
 /// An exchange, not a compare-and-swap: the MMU may set the
 /// accessed/dirty bits at any time, but only software turns a 2MB entry
 /// into something else, and every software writer of one holds the
 /// page_table_lock or the mmap_lock for writing (excluding the caller).
-fn clear_huge(pmd: &core::sync::atomic::AtomicU64, with: u64) -> Option<u64> {
-    use core::sync::atomic::Ordering;
-    if !crate::arch::paging::pmd_huge(pmd.load(Ordering::Acquire)) {
+fn clear_huge(pmd: &Pmd<'_>, l: &PtLock<'_>, with: u64) -> Option<u64> {
+    if !pmd.huge() {
         return None;
     }
-    let old = pmd.swap(with, Ordering::AcqRel);
+    let old = pmd.swap(l, with);
     debug_assert!(crate::arch::paging::pmd_huge(old));
     Some(old)
 }

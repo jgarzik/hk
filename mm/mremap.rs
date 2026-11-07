@@ -14,6 +14,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::huge_page::split_huge_pmd;
 use super::pagewalk::{PteRange, PteWalk, entry, walk_pte_range};
+use super::pgtable::Pmd;
 use super::ptl::{self, PteLock};
 use super::{Mm, PAGE_SIZE, tlb};
 use crate::FRAME_ALLOCATOR;
@@ -45,8 +46,8 @@ pub fn move_prep(
     }
     impl PteWalk for Prep<'_> {
         type Err = KernelError;
-        fn huge(&mut self, _: &AtomicU64, addr: u64, _: u64) -> Result<bool, KernelError> {
-            split_huge_pmd(self.mm, addr).ok_or(KernelError::OutOfMemory)?;
+        fn huge(&mut self, pmd: Pmd<'_>, _: u64, _: u64) -> Result<bool, KernelError> {
+            split_huge_pmd(self.mm, pmd).ok_or(KernelError::OutOfMemory)?;
             Ok(false)
         }
         /// Entries are read without the old table's PTE lock, so the

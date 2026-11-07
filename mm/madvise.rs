@@ -253,8 +253,8 @@ struct Cold<'a> {
 impl super::pagewalk::PteWalk for Cold<'_> {
     type Err = core::convert::Infallible;
 
-    fn huge(&mut self, _: &AtomicU64, addr: u64, _: u64) -> Result<bool, Self::Err> {
-        let _ = super::huge_page::split_huge_pmd(self.mm, addr);
+    fn huge(&mut self, pmd: super::pgtable::Pmd<'_>, _: u64, _: u64) -> Result<bool, Self::Err> {
+        let _ = super::huge_page::split_huge_pmd(self.mm, pmd);
         Ok(false)
     }
 

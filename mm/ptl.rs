@@ -111,10 +111,36 @@ fn preempt_disable() {}
 #[cfg(test)]
 fn preempt_enable() {}
 
+/// An address space's page_table_lock, held until dropped (Linux
+/// pmd_lock, without split PMD locks): what writes to a 2MB-level
+/// entry (`pgtable::Pmd`) take as proof
+///
+/// # Invariants
+///
+/// `_g` holds the page_table_lock of the address space whose top-level
+/// table is `pgd`.
+#[must_use]
+pub struct PtLock<'m> {
+    pgd: u64,
+    _g: crate::sync::spin::MutexGuard<'m, ()>,
+}
+
+impl PtLock<'_> {
+    /// The top-level table of the address space it locks
+    #[inline]
+    pub fn pgd(&self) -> u64 {
+        self.pgd
+    }
+}
+
 /// `mm`'s page_table_lock (Linux mm->page_table_lock)
 #[track_caller]
-pub fn pt_lock(mm: &Mm) -> crate::sync::spin::MutexGuard<'_, ()> {
-    mm.page_table_lock().lock()
+pub fn pt_lock(mm: &Mm) -> PtLock<'_> {
+    // INVARIANT: `mm`'s lock and top-level table
+    PtLock {
+        pgd: mm.pgd(),
+        _g: mm.page_table_lock().lock(),
+    }
 }
 
 /// The 4KB entry for `addr` in `mm`, installing missing tables under

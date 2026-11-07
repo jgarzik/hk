@@ -18,6 +18,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::anon_vma::AnonVma;
 use super::huge_page::{HUGE_PAGE_SIZE, split_huge_pmd};
+use super::pgtable::PgTables;
 use super::ptl::pte_lock;
 use super::shmem::Shmem;
 use super::tlb::flush_tlb_page;
@@ -212,10 +213,11 @@ type MmRead<'a> = crate::sync::RwSemReadGuard<'a, MmStruct>;
 
 fn fault(mm: &Mm, addr: u64, access: Access) -> Result<(), VmFault> {
     let (map, area) = lock_area(mm, addr, access)?;
-    if let Some(r) = huge_fault(mm, addr, &area, access) {
+    let t = PgTables::new(mm, &map);
+    if let Some(r) = huge_fault(mm, t, addr, &area, access) {
         return r;
     }
-    let ptep = leaf(mm, addr)?;
+    let ptep = leaf(mm, t, addr)?;
     let pte = get_pte(ptep);
     if paging::pte_protnone(pte) {
         // Only mprotect makes protnone entries, with the VMA (which
@@ -260,13 +262,13 @@ fn fault(mm: &Mm, addr: u64, access: Access) -> Result<(), VmFault> {
 /// pages are reclaimed (with no spinlock held: the tables are allocated
 /// under the page_table_lock) and the allocation tried again while that
 /// frees some, a bounded number of times
-fn leaf(mm: &Mm, addr: u64) -> Result<*mut u64, VmFault> {
+fn leaf(mm: &Mm, t: PgTables<'_>, addr: u64) -> Result<*mut u64, VmFault> {
     for _ in 0..16 {
         if let Some(p) = super::ptl::pte_alloc(mm, addr) {
             return Ok(p);
         }
         // A huge page mapped there: the access is retried
-        if paging::pmd_ptr(mm.pgd(), addr).is_some_and(|p| paging::pmd_huge(get_pte(p))) {
+        if still_huge(t, addr) {
             return Err(VmFault::Retry);
         }
         if super::vmscan::try_to_free_pages(super::vmscan::SWAP_CLUSTER_MAX) == 0 {
@@ -277,13 +279,20 @@ fn leaf(mm: &Mm, addr: u64) -> Result<*mut u64, VmFault> {
 }
 
 /// A fault in a 2MB region: None to continue at the 4KB level
-fn huge_fault(mm: &Mm, addr: u64, area: &Area, access: Access) -> Option<Result<(), VmFault>> {
-    let pmd = get_pte(paging::pmd_ptr(mm.pgd(), addr)?);
+fn huge_fault(
+    mm: &Mm,
+    t: PgTables<'_>,
+    addr: u64,
+    area: &Area,
+    access: Access,
+) -> Option<Result<(), VmFault>> {
+    let pmdp = t.pmd(addr)?;
+    let pmd = pmdp.get();
     if paging::pmd_huge(pmd) {
         if access == Access::Write && !paging::pte_write(pmd) {
             // Write-protected huge page: split, then fault on the 4KB
             // page; a racing fault may have split (or unmapped) it first
-            if split_huge_pmd(mm, addr).is_none() && still_huge(mm, addr) {
+            if split_huge_pmd(mm, pmdp).is_none() && still_huge(t, addr) {
                 return Some(Err(VmFault::Oom));
             }
             return None;
@@ -295,20 +304,20 @@ fn huge_fault(mm: &Mm, addr: u64, area: &Area, access: Access) -> Option<Result<
         return Some(Ok(()));
     }
     if pmd == 0 && area.thp {
-        return do_huge_anon(mm, addr, area).then_some(Ok(()));
+        return do_huge_anon(mm, t, addr, area).then_some(Ok(()));
     }
     None
 }
 
 /// A 2MB page still maps `addr`
-fn still_huge(mm: &Mm, addr: u64) -> bool {
-    paging::pmd_ptr(mm.pgd(), addr).is_some_and(|p| paging::pmd_huge(get_pte(p)))
+fn still_huge(t: PgTables<'_>, addr: u64) -> bool {
+    t.pmd(addr).is_some_and(|p| p.huge())
 }
 
 /// Map a zeroed 2MB page for a THP-eligible area if it covers the whole
 /// aligned 2MB around `addr` (Linux do_huge_pmd_anonymous_page); false
 /// to fall back to a 4KB page
-fn do_huge_anon(mm: &Mm, addr: u64, area: &Area) -> bool {
+fn do_huge_anon(mm: &Mm, t: PgTables<'_>, addr: u64, area: &Area) -> bool {
     let base = addr & !(HUGE_PAGE_SIZE - 1);
     if base < area.start || base + HUGE_PAGE_SIZE > area.end {
         return false;
@@ -335,14 +344,14 @@ fn do_huge_anon(mm: &Mm, addr: u64, area: &Area) -> bool {
         flags |= PageFlags::EXECUTE;
     }
     // Fails if a racing fault installed a table or a page first
-    let _l = super::ptl::pt_lock(mm);
+    let l = super::ptl::pt_lock(mm);
     if ArchPageTable::map_huge_page(mm.pgd(), base, frame, flags, &mut &FRAME_ALLOCATOR).is_err() {
         FRAME_ALLOCATOR.free_huge(frame);
         FRAME_ALLOCATOR.free(pt);
         return false;
     }
-    if let Some(pmdp) = paging::pmd_ptr(mm.pgd(), base) {
-        super::huge_page::deposit(pmdp, pt);
+    if let Some(pmd) = t.pmd(base) {
+        super::huge_page::deposit(&pmd, &l, pt);
     }
     add_anon(frame, area, base);
     increment_min_flt();

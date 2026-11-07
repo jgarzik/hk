@@ -12,6 +12,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::huge_page::{HUGE_PAGE_SIZE, split_huge_pmd};
 use super::pagewalk::{PteWalk, walk_pte_range};
+use super::pgtable::Pmd;
 use super::{Mm, PROT_EXEC, PROT_READ, PROT_WRITE};
 use crate::FRAME_ALLOCATOR;
 use crate::arch::{ArchPageTable, paging};
@@ -32,10 +33,10 @@ pub fn split_huge(mm: &Mm, start: u64, end: u64, prot: u32) -> Result<(), Kernel
     impl PteWalk for Split<'_> {
         type Err = KernelError;
         const PTES: bool = false;
-        fn huge(&mut self, _: &AtomicU64, addr: u64, end: u64) -> Result<bool, KernelError> {
+        fn huge(&mut self, pmd: Pmd<'_>, addr: u64, end: u64) -> Result<bool, KernelError> {
             let base = addr & !(HUGE_PAGE_SIZE - 1);
             if addr != base || end != base + HUGE_PAGE_SIZE || prot_none(self.1) {
-                split_huge_pmd(self.0, addr).ok_or(KernelError::OutOfMemory)?;
+                split_huge_pmd(self.0, pmd).ok_or(KernelError::OutOfMemory)?;
             }
             Ok(true)
         }
@@ -56,9 +57,9 @@ pub fn change_protection(pgd: u64, start: u64, end: u64, prot: u32, shared: bool
     }
     impl PteWalk for Change {
         type Err = core::convert::Infallible;
-        fn huge(&mut self, pmd: &AtomicU64, addr: u64, _: u64) -> Result<bool, Self::Err> {
+        fn huge(&mut self, pmd: Pmd<'_>, addr: u64, _: u64) -> Result<bool, Self::Err> {
             // Wholly inside and accessible (`split_huge`); never shared
-            let pmdval = pmd.load(Ordering::Acquire);
+            let pmdval = pmd.get();
             let base = addr & !(HUGE_PAGE_SIZE - 1);
             let (w, x) = (self.prot & PROT_WRITE != 0, self.prot & PROT_EXEC != 0);
             if x && !paging::pte_exec(pmdval) {

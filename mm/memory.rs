@@ -12,6 +12,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use super::gather::Gather;
 use super::huge_page::{HUGE_PAGE_SIZE, split_huge_pmd, take_huge_pmd};
 use super::pagewalk::{PteRange, PteWalk, entry, table_slot, walk_pte_range};
+use super::pgtable::Pmd;
 use super::{Mm, MmStruct, PAGE_SIZE, SwapEntry, Vma};
 use crate::FRAME_ALLOCATOR;
 use crate::arch::{Leaf, paging};
@@ -104,11 +105,11 @@ struct Zap<'g, 'a> {
 impl PteWalk for Zap<'_, '_> {
     type Err = core::convert::Infallible;
 
-    fn huge(&mut self, _: &AtomicU64, addr: u64, end: u64) -> Result<bool, Self::Err> {
+    fn huge(&mut self, pmd: Pmd<'_>, addr: u64, end: u64) -> Result<bool, Self::Err> {
         let base = addr & !(HUGE_PAGE_SIZE - 1);
         let mm = self.tlb.mm();
         if addr == base && end == base + HUGE_PAGE_SIZE {
-            if let Some(phys) = take_huge_pmd(mm, base) {
+            if let Some(phys) = take_huge_pmd(mm, pmd) {
                 self.tlb.remove_huge(base, phys);
                 return Ok(true);
             }
@@ -116,7 +117,7 @@ impl PteWalk for Zap<'_, '_> {
             // (Linux zap_pmd_range falls back to zap_pte_range)
         } else {
             // Never fails for memory: the table was deposited with it
-            let _ = split_huge_pmd(mm, base);
+            let _ = split_huge_pmd(mm, pmd);
         }
         Ok(false)
     }
@@ -217,7 +218,7 @@ pub fn count_ptes(pgd: u64, start: u64, end: u64) -> (u64, u64) {
     struct Count(u64, u64);
     impl PteWalk for Count {
         type Err = core::convert::Infallible;
-        fn huge(&mut self, _: &AtomicU64, addr: u64, end: u64) -> Result<bool, Self::Err> {
+        fn huge(&mut self, _: Pmd<'_>, addr: u64, end: u64) -> Result<bool, Self::Err> {
             self.0 += (end - addr) / PAGE_SIZE;
             Ok(true)
         }
@@ -284,8 +285,8 @@ struct CopyRange<'a> {
 impl PteWalk for CopyRange<'_> {
     type Err = i32;
 
-    fn huge(&mut self, _: &AtomicU64, addr: u64, _: u64) -> Result<bool, i32> {
-        split_huge_pmd(self.src_mm, addr).ok_or(ENOMEM)?;
+    fn huge(&mut self, pmd: Pmd<'_>, _: u64, _: u64) -> Result<bool, i32> {
+        split_huge_pmd(self.src_mm, pmd).ok_or(ENOMEM)?;
         Ok(false)
     }
 
