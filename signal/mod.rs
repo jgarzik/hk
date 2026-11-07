@@ -1816,21 +1816,26 @@ pub fn dequeue_signal(wanted: &SigSet) -> Option<SigInfo> {
 /// thread choice of any group signal. The entry comes back if it was
 /// not queued, with whether the signal was ignored.
 pub fn send_timer_sigqueue(
-    tid: Tid,
+    pid: &crate::task::pid::Pid,
     ty: PidType,
     q: Box<SigQueue>,
 ) -> Result<(), (Box<SigQueue>, bool)> {
     let sig = q.info().sig();
     let me = crate::task::percpu::current();
-    // A group signal is taken by the current thread if it is in the
-    // group (Linux posixtimer_get_target)
-    let t = if ty == PidType::Tgid && me.pid == tid && !me.has_flag(crate::task::pf::EXITING) {
-        Some(crate::task::percpu::task_ref(&me))
-    } else if ty == PidType::Tgid {
+    // The task its struct pid names now, if any (Linux pid_task); a
+    // group signal is taken by the current thread if it is in the
+    // group (posixtimer_get_target)
+    let t = {
         let table = TASKLIST.read();
-        group_task(&table, table.get(tid))
-    } else {
-        TASKLIST.read().task(tid)
+        let tid = table.pid_tid(pid);
+        match tid {
+            None => None,
+            Some(tid) if ty == PidType::Pid => table.task(tid),
+            Some(tid) if me.pid == tid && !me.has_flag(crate::task::pf::EXITING) => {
+                Some(crate::task::percpu::task_ref(&me))
+            }
+            Some(tid) => group_task(&table, table.get(tid)),
+        }
     };
     let Some(t) = t else {
         return Err((q, false));

@@ -29,7 +29,6 @@ use crate::util::kalloc::{arc_nofail, try_arc};
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::arch::IrqSpinlock;
 use crate::signal::{PidType, SIGALRM, SigQueue};
@@ -156,11 +155,11 @@ pub struct PosixTimer {
     timer_id: TimerT,
     /// Clock ID (CLOCK_REALTIME or CLOCK_MONOTONIC)
     clockid: i32,
-    /// The thread a SIGEV_THREAD_ID timer signals (retargeted when a
-    /// non-leader exec takes the leader's tid); else its creator
-    owner_tid: AtomicU64,
-    /// The process it belongs to
-    pid: Tid,
+    /// Whom it signals (Linux it_pid, a counted struct pid): the
+    /// thread for SIGEV_THREAD_ID, else its process's leader; a struct
+    /// pid, never a number, so a reaped target's reused number never
+    /// gets it, and an exec that takes the leader's pid keeps it
+    target: Option<Arc<crate::task::pid::Pid>>,
     /// Its signal is for the thread (SIGEV_THREAD_ID) or the process
     /// (Linux it_pid_type)
     pid_type: PidType,
@@ -228,11 +227,17 @@ impl PosixTimer {
         } else {
             PidType::Tgid
         };
+        let nr = match pid_type {
+            PidType::Pid => owner_tid,
+            PidType::Tgid => crate::task::percpu::current_pid(),
+        };
+        let target = u32::try_from(nr)
+            .ok()
+            .and_then(|n| crate::task::pid::find_pid(&crate::ns::INIT_PID_NS, n));
         Self {
             timer_id,
             clockid,
-            owner_tid: AtomicU64::new(owner_tid),
-            pid: crate::task::percpu::current_pid(),
+            target,
             pid_type,
             sigq: Mutex::new(None),
             sigevent,
@@ -422,6 +427,17 @@ impl PosixTimer {
         })
     }
 
+    /// Its target is a thread of the caller's process (Linux
+    /// good_sigevent: same_thread_group)
+    fn target_in_group(&self) -> bool {
+        let table = crate::task::percpu::TASKLIST.read();
+        self.target
+            .as_ref()
+            .and_then(|p| table.pid_tid(p))
+            .and_then(|t| table.get(t))
+            .is_some_and(|v| v.task.pid == crate::task::percpu::current_pid())
+    }
+
     /// Its expiry sends a signal
     fn signals(&self) -> bool {
         let n = self.sigevent.sigev_notify;
@@ -441,9 +457,9 @@ impl PosixTimer {
             i.sig_periodic = i.requeue;
             i.sig_periodic
         };
-        let target = match self.pid_type {
-            PidType::Pid => self.owner_tid.load(Ordering::Relaxed),
-            PidType::Tgid => self.pid,
+        let Some(target) = &self.target else {
+            *self.sigq.lock() = Some(q);
+            return;
         };
         let ignored = match crate::signal::send_timer_sigqueue(target, self.pid_type, q) {
             Ok(()) => false,
@@ -543,7 +559,9 @@ impl PosixTimer {
         if self.timer_id == ITIMER_REAL_ID {
             // Linux it_real_fn: SEND_SIG_PRIV to the process
             let info = crate::signal::SendInfo::Kernel;
-            crate::signal::kill_proc_info(self.pid, SIGALRM, info);
+            if let Some(pid) = &self.target {
+                crate::signal::kill_pid_info(pid, SIGALRM, info, |_| 0);
+            }
         } else if self.signals() {
             self.queue_signal();
         }
@@ -801,16 +819,8 @@ pub fn create_posix_timer(
     });
     let default_value = sigevent.is_none();
     match sev.sigev_notify {
-        SIGEV_THREAD_ID => {
-            let t = sev.sigev_notify_thread_id as Tid;
-            let same = crate::task::percpu::TASKLIST
-                .read()
-                .get(t)
-                .is_some_and(|v| v.task.pid == crate::task::percpu::current_pid());
-            if !same {
-                return Err(-22);
-            }
-        }
+        // Checked on its struct pid once the timer holds it
+        SIGEV_THREAD_ID => {}
         SIGEV_SIGNAL | SIGEV_THREAD => sev.sigev_notify = SIGEV_SIGNAL,
         SIGEV_NONE => {}
         _ => return Err(-22), // EINVAL
@@ -833,6 +843,9 @@ pub fn create_posix_timer(
     }
     let t =
         PosixTimer::with_cpu(id, clockid, owner, sev, cpu, false).map_err(|e| e.to_errno_neg())?;
+    if sev.sigev_notify == SIGEV_THREAD_ID && !t.target_in_group() {
+        return Err(-22);
+    }
     if sev.sigev_notify != SIGEV_NONE {
         let fields = crate::signal::SigFields::Timer {
             tid: id,
@@ -949,16 +962,6 @@ pub fn delete_posix_timer(tid: Tid, timer_id: TimerT) -> Result<(), i32> {
             Ok(())
         }
         None => Err(-22), // EINVAL - timer not found
-    }
-}
-
-/// A non-leader exec took tid `new` from `old` (exchange_tids): the
-/// group's timers owned by `old` now signal `new`
-pub fn retarget(sig: &crate::signal::SignalStruct, old: Tid, new: Tid) {
-    for t in sig.posix_timers.lock().timers.values() {
-        let _ = t
-            .owner_tid
-            .compare_exchange(old, new, Ordering::Relaxed, Ordering::Relaxed);
     }
 }
 

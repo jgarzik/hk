@@ -1745,7 +1745,6 @@ pub fn take_leadership(tgid: Pid, tid: Tid) -> Vec<TaskRef> {
     // else names the old tid) and leads the group
     table.link_child(&me);
     table.inner_mut_of(&me).threads.push_back(me.clone());
-    let sig = table.get(ltid).and_then(|t| t.signal.clone());
     if let Some(mut m) = table.get_mut(ltid) {
         m.leader = true;
         m.task
@@ -1758,11 +1757,6 @@ pub fn take_leadership(tgid: Pid, tid: Tid) -> Vec<TaskRef> {
     // de_thread: transfer_pid PIDTYPE_PGID, PIDTYPE_SID)
     table.attach_pids(&me);
     drop(table);
-    // The group's timers owned by the caller follow (after TASKLIST:
-    // their locks are leaves taken under nothing)
-    if let Some(sig) = sig {
-        crate::time::posix_timer::retarget(&sig, tid, ltid);
-    }
     gone
 }
 

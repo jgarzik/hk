@@ -29,6 +29,7 @@
 //! - SIGCHLD SIG_IGN or SA_NOCLDWAIT: a child is reaped at its exit
 //!   (wait is ECHILD); with SA_NOCLDWAIT SIGCHLD still comes
 //! - a child's pdeath_signal comes when its parent exits, from it
+//! - a SIGEV_THREAD_ID timer whose thread has exited sends nothing
 //! - arm64: a handler set without SA_RESTORER returns through the
 //!   kernel's trampoline (Linux: the vDSO sigtramp)
 
@@ -73,6 +74,7 @@ pub fn run_tests() {
     test_itimer_real();
     test_autoreap();
     test_pdeath();
+    test_timer_gone();
     #[cfg(target_arch = "aarch64")]
     test_no_restorer();
 }
@@ -972,6 +974,48 @@ fn test_no_restorer() {
         println(b"SIGQUEUE_NO_RESTORER:OK");
     } else {
         print(b"SIGQUEUE_NO_RESTORER:FAIL status=");
+        print_num(st as i64);
+        println(b"");
+    }
+}
+
+static mut GONE_CTID: u32 = 0;
+static mut GONE_STACK: GroupStack = GroupStack([0; 16384]);
+
+extern "C" fn gone_thread(_: u64) -> ! {
+    sys_exit(0)
+}
+
+/// In a child: a timer for a thread that then exits fires into
+/// nothing: no signal pending for the process or the caller
+fn test_timer_gone() {
+    let c = sys_fork();
+    if c == 0 {
+        let old = block(bit(SIGRT));
+        // SAFETY: the thread's own stack and tid word
+        let tid = unsafe {
+            let top = (&raw mut GONE_STACK as *mut u8).add(16384) as u64;
+            let ctid = &raw mut GONE_CTID;
+            core::ptr::write_volatile(ctid, 1);
+            super::fork_mm::spawn_thread(top, gone_thread, 0, ctid)
+        };
+        let id = timer(SIGRT, 5, 4, tid as i32);
+        let joined = super::fork_mm::join(&raw mut GONE_CTID);
+        arm(id, 5, 0);
+        sleep_ms(50);
+        let mut info = zeroed();
+        let r = wait_sig(bit(SIGRT), 0, &mut info);
+        let p = pending() & bit(SIGRT);
+        setmask(old);
+        let ok = id >= 0 && joined && r == EAGAIN && p == 0;
+        hk_syscall::sys_exit_group(if ok { 0 } else { 1 });
+    }
+    let mut st = 0i32;
+    sys_wait4(c, &mut st, 0, 0);
+    if st == 0 {
+        println(b"SIGQUEUE_TIMER_GONE:OK");
+    } else {
+        print(b"SIGQUEUE_TIMER_GONE:FAIL status=");
         print_num(st as i64);
         println(b"");
     }
