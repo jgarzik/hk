@@ -551,7 +551,7 @@ struct CopyEnt {
 
 /// What copy_tree copies of `m` at `root`, parents first: the mounts
 /// below `root`; an unbindable submount is left out with whatever is
-/// under it
+/// under it, EPERM if it is also locked (it hides what is under it)
 fn copy_plan(m: &Arc<Mount>, root: &Arc<Dentry>) -> Result<Vec<CopyEnt>, KernelError> {
     let mut plan = alloc::vec![CopyEnt {
         src: m.clone(),
@@ -569,6 +569,9 @@ fn copy_plan(m: &Arc<Mount>, root: &Arc<Dentry>) -> Result<Vec<CopyEnt>, KernelE
                 continue;
             }
             if c.is_unbindable() {
+                if c.flags() & MNT_LOCKED != 0 {
+                    return Err(KernelError::NotPermitted);
+                }
                 continue;
             }
             plan.push(CopyEnt {
@@ -582,7 +585,9 @@ fn copy_plan(m: &Arc<Mount>, root: &Arc<Dentry>) -> Result<Vec<CopyEnt>, KernelE
     Ok(plan)
 }
 
-/// The copies of `plan` (Linux copy_tree); under NAMESPACE_SEM write
+/// The copies of `plan` (Linux copy_tree): the top loses MNT_LOCKED
+/// (clone_mnt), a submount keeps it (it still hides what is under
+/// it); under NAMESPACE_SEM write
 fn copy_tree(plan: &[CopyEnt]) -> Arc<Mount> {
     let mut out: Vec<Arc<Mount>> = Vec::new();
     for (k, e) in plan.iter().enumerate() {
@@ -590,6 +595,9 @@ fn copy_tree(plan: &[CopyEnt]) -> Arc<Mount> {
         let n = clone_mnt(&e.src, root.clone());
         super::pnode::clone_prop(&e.src, &n);
         if k > 0 {
+            if e.src.flags() & MNT_LOCKED != 0 {
+                n.mark(MNT_LOCKED, true);
+            }
             attach_mnt(&n, &Path::new(out[e.parent].clone(), e.at.clone()));
         }
         out.push(n);
@@ -597,15 +605,30 @@ fn copy_tree(plan: &[CopyEnt]) -> Arc<Mount> {
     out.swap_remove(0)
 }
 
+/// A mount under `d` in `m` is locked (Linux has_locked_children): a
+/// bind of `d` alone would uncover what it hides
+fn has_locked_children(m: &Mount, d: &Arc<Dentry>) -> bool {
+    let children: Vec<Arc<Mount>> = m.children.read().clone();
+    children.iter().any(|c| {
+        c.get_mountpoint()
+            .is_some_and(|mp| super::is_subdir(&mp, d))
+            && c.flags() & MNT_LOCKED != 0
+    })
+}
+
 /// Bind `old` (with its submounts if `rec`) on `mp` (Linux do_loopback,
 /// __do_loopback and graft_tree), in Linux's order: the target must be
 /// in the caller's namespace, the source bindable and in it too
-/// (EINVAL); a directory goes only on a directory and a file on a file
-/// (ENOTDIR)
+/// (EINVAL), a lone bind must not uncover a locked submount (EINVAL),
+/// a recursive one not leave out a locked unbindable one (EPERM); a
+/// directory goes only on a directory and a file on a file (ENOTDIR)
 pub fn do_loopback(old: &Path, mp: &Path, rec: bool) -> Result<(), KernelError> {
     let _l = lock_mountpoint(mp)?;
     let _ns = NAMESPACE_SEM.write();
     if !check_mnt(&mp.mnt) || old.mnt.is_unbindable() || !check_mnt(&old.mnt) {
+        return Err(KernelError::InvalidArgument);
+    }
+    if !rec && has_locked_children(&old.mnt, &old.dentry) {
         return Err(KernelError::InvalidArgument);
     }
     let plan = if rec {
@@ -1036,4 +1059,67 @@ fn may_be_mountpoint(d: &Dentry) -> bool {
         || d.get_inode().is_some_and(|i| {
             !exact_names(&i) && i.sb.upgrade().is_some_and(|sb| sb.has_mounts_on())
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An unattached nullfs mount
+    fn mnt() -> Arc<Mount> {
+        let t = &super::super::nullfs::NULLFS_TYPE;
+        let sb = (t.mount)(t, b"").unwrap();
+        let root = sb.get_root().unwrap();
+        Mount::new(sb, root, 0, b"t".as_slice().into()).unwrap()
+    }
+
+    /// A new mount on `parent`'s root
+    fn hang(parent: &Arc<Mount>) -> Arc<Mount> {
+        let c = mnt();
+        attach_mnt(&c, &Path::new(parent.clone(), parent.root.clone()));
+        c
+    }
+
+    fn locked(m: &Mount) -> bool {
+        m.flags() & MNT_LOCKED != 0
+    }
+
+    #[test]
+    fn copy_tree_locks_submounts_not_top() {
+        let top = mnt();
+        top.mark(MNT_LOCKED, true);
+        let c = hang(&top);
+        c.mark(MNT_LOCKED, true);
+        let g = hang(&c);
+        let t = copy_tree(&copy_plan(&top, &top.root).unwrap());
+        assert!(!locked(&t));
+        let kids = t.children.read().clone();
+        assert_eq!(kids.len(), 1);
+        assert!(locked(&kids[0]));
+        let grand = kids[0].children.read().clone();
+        assert_eq!(grand.len(), 1);
+        assert!(!locked(&grand[0]));
+        drop(g);
+    }
+
+    #[test]
+    fn copy_plan_locked_unbindable_is_eperm() {
+        let top = mnt();
+        let c = hang(&top);
+        c.set_unbindable(true);
+        let plan = copy_plan(&top, &top.root).unwrap();
+        assert_eq!(plan.len(), 1);
+        c.mark(MNT_LOCKED, true);
+        let r = copy_plan(&top, &top.root);
+        assert!(matches!(r, Err(KernelError::NotPermitted)));
+    }
+
+    #[test]
+    fn locked_child_blocks_lone_bind() {
+        let top = mnt();
+        let c = hang(&top);
+        assert!(!has_locked_children(&top, &top.root));
+        c.mark(MNT_LOCKED, true);
+        assert!(has_locked_children(&top, &top.root));
+    }
 }

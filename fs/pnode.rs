@@ -196,6 +196,10 @@ fn copy_prop(src: &Arc<Mount>, prop: &dyn Fn(&Mount, &Arc<Mount>)) -> Arc<Mount>
             };
             let n = clone_mnt(&k, k.root.clone());
             prop(&k, &n);
+            // A submount keeps hiding what is under it (Linux copy_tree)
+            if k.flags() & super::mount::MNT_LOCKED != 0 {
+                n.mark(super::mount::MNT_LOCKED, true);
+            }
             attach_mnt(&n, &Path::new(c.clone(), mp));
             todo.push((k, n));
         }
