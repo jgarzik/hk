@@ -1390,7 +1390,7 @@ fn send_task(t: &TaskRef, sig: u32, info: SendInfo, ty: PidType, force: bool) ->
     if let Some(h) = sighand {
         h.signalfd_wq.wake_all();
     }
-    complete_signal(t, sig, ty, wants, sighand);
+    complete_signal(t, sig, ty, wants, sighand, to.init);
     0
 }
 
@@ -1432,11 +1432,15 @@ fn send_held(
     let Sent::Queued(wants) = sent else {
         return None;
     };
+    // The thread that takes it, and whether it ends the group, are
+    // decided now, as it is queued (Linux complete_signal under
+    // siglock): a mask changed after this, or the signal taken, by the
+    // time the wakeup runs changes nothing
+    let chosen = choose(table, t, sig, ty, wants, sighand, to.init);
     Some(Posted {
         t: t.clone(),
         sig,
-        ty,
-        wants,
+        chosen,
         sighand: tg.sighand,
     })
 }
@@ -1455,20 +1459,19 @@ pub fn sigkill_held(table: &crate::task::percpu::GlobalTaskTable, t: &TaskRef) -
 pub struct Posted {
     t: TaskRef,
     sig: u32,
-    ty: PidType,
-    wants: bool,
+    chosen: Option<Chosen>,
     sighand: Option<Arc<SigHand>>,
 }
 
 impl Posted {
-    /// Wake its signalfd readers and the thread that takes it (Linux
-    /// signalfd_notify, complete_signal); TASKLIST not held
+    /// Wake its signalfd readers and the thread chosen to take it,
+    /// ending the group if that was decided (Linux signalfd_notify,
+    /// complete_signal); TASKLIST not held
     pub fn finish(self) {
-        let sighand = self.sighand.as_ref();
-        if let Some(h) = sighand {
+        if let Some(h) = self.sighand.as_ref() {
             h.signalfd_wq.wake_all();
         }
-        complete_signal(&self.t, self.sig, self.ty, self.wants, sighand);
+        deliver(&self.t, self.sig, self.chosen);
     }
 }
 
@@ -1558,29 +1561,63 @@ fn drops(
     }
 }
 
-/// Find a thread to take `sig` just queued for `p` (Linux
-/// complete_signal): `p` if it wants it, else for a group signal the
-/// next thread from the group's curr_target that does; a fatal one
-/// ends the group, else the chosen thread is woken
+/// Find a thread to take `sig` just queued for `p` and wake it (Linux
+/// complete_signal), the choice made under TASKLIST's read lock
+/// ([`choose`]); `init`: the global init's protection applied to the
+/// send
 fn complete_signal(
     p: &TaskRef,
     sig: u32,
     ty: PidType,
     p_wants: bool,
     sighand: Option<&Arc<SigHand>>,
+    init: bool,
 ) {
-    let chosen = if p_wants {
-        Some(p.clone())
+    let chosen = choose(&TASKLIST.read(), p, sig, ty, p_wants, sighand, init);
+    deliver(p, sig, chosen);
+}
+
+/// The thread [`choose`] picked for a signal, and whether the signal
+/// ends its group
+struct Chosen {
+    t: TaskRef,
+    kill: bool,
+}
+
+/// Under TASKLIST: the thread to take `sig` just queued for `p` (Linux
+/// complete_signal): `p` if it wanted it when queued (`p_wants`), else
+/// for a group signal the next thread from the group's curr_target
+/// that does; a fatal one ends the group, never the global init's
+/// while protected (`init`: Linux queues it a fatal signal only while
+/// blocked, which no thread wants)
+fn choose(
+    table: &crate::task::percpu::GlobalTaskTable,
+    p: &TaskRef,
+    sig: u32,
+    ty: PidType,
+    p_wants: bool,
+    sighand: Option<&Arc<SigHand>>,
+    init: bool,
+) -> Option<Chosen> {
+    let t = if p_wants {
+        p.clone()
     } else if ty == PidType::Pid {
-        None
+        return None;
     } else {
-        pick_thread(p, sig)
+        pick_thread(table, p, sig)?
     };
-    let Some(c) = chosen else {
+    let awaited = t.sig.lock().real_blocked.contains(sig);
+    let kill = !init && fatal(sighand, sig) && !awaited;
+    Some(Chosen { t, kill })
+}
+
+/// Act on [`choose`]'s choice for `sig` queued for `p` (TASKLIST not
+/// held): end the group if decided, mark and wake the chosen thread
+fn deliver(p: &TaskRef, sig: u32, chosen: Option<Chosen>) {
+    let Some(Chosen { t: c, kill }) = chosen else {
         return;
     };
-    let awaited = c.sig.lock().real_blocked.contains(sig);
-    if fatal(sighand, sig) && !awaited {
+    if kill {
         group_kill(p.tid(), sig);
     }
     if !Arc::ptr_eq(&c, p) {
@@ -1595,27 +1632,36 @@ fn complete_signal(
     signal_wake_task(&c, mode);
 }
 
-/// The thread of `p`'s group, from its curr_target on, that wants
-/// `sig` (Linux complete_signal's loop): it becomes curr_target
-fn pick_thread(p: &TaskRef, sig: u32) -> Option<TaskRef> {
-    let threads = crate::task::percpu::GlobalTaskTable::collect_threads(p.pid, |table, v| {
-        let stopped = matches!(v.state, crate::task::TaskState::Traced(_));
-        table.task(v.task.tid()).map(|t| (t, stopped))
-    });
-    if threads.len() < 2 {
-        return None;
-    }
+/// Under TASKLIST: the thread of `p`'s group, from its curr_target on,
+/// that wants `sig` (Linux complete_signal's loop): it becomes
+/// curr_target
+fn pick_thread(
+    table: &crate::task::percpu::GlobalTaskTable,
+    p: &TaskRef,
+    sig: u32,
+) -> Option<TaskRef> {
+    table.threads(p.pid).nth(1)?;
     let cur = p.sig.lock().shared_pending.lock().curr_target;
-    let start = threads
-        .iter()
-        .position(|(t, _)| t.tid() == cur)
-        .unwrap_or(0);
-    let n = threads.len();
-    let (t, _) = (0..n)
-        .map(|i| &threads[(start + i) % n])
-        .find(|(t, stopped)| wants_signal(t, *stopped, sig))?;
+    let wants = |v: &crate::task::percpu::TaskView<'_>| {
+        wants_signal(
+            v.task,
+            matches!(v.state, crate::task::TaskState::Traced(_)),
+            sig,
+        )
+    };
+    let v = table
+        .threads(p.pid)
+        .skip_while(|v| v.task.tid() != cur)
+        .find(wants)
+        .or_else(|| {
+            table
+                .threads(p.pid)
+                .take_while(|v| v.task.tid() != cur)
+                .find(wants)
+        })?;
+    let t = table.task(v.task.tid())?;
     p.sig.lock().shared_pending.lock().curr_target = t.tid();
-    Some(t.clone())
+    Some(t)
 }
 
 /// `t` should be woken for `sig` (Linux wants_signal)
@@ -2107,7 +2153,8 @@ pub fn send_timer_sigqueue(
             if let Some(h) = sighand {
                 h.signalfd_wq.wake_all();
             }
-            complete_signal(&t, sig, ty, wants, sighand);
+            let init = tg.init && !INIT_KILLABLE.load(core::sync::atomic::Ordering::Acquire);
+            complete_signal(&t, sig, ty, wants, sighand, init);
             Ok(())
         }
         Err(ignored) => Err((q.expect("an unqueued entry comes back"), ignored)),

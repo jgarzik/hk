@@ -2833,16 +2833,20 @@ the signal handler table must use an IRQ-safe lock. The `IrqSpinlock` ensures th
    a node for a new user, under it; the window is one locked section
    and matters only at the limit.
 
-6. **A group signal's thread is chosen with no lock held** (Linux
-   complete_signal under siglock): after the signal is queued on the
-   group set under the receiver's `Task.sig`, the threads are listed
-   under TASKLIST (read) and dropped, then each candidate's `Task.sig`
-   is taken alone to test wants_signal, and the chosen one's
-   TIF_SIGPENDING is recomputed under it before the wakeup. A thread
-   that blocks a group signal or starts exiting hands it on the same
-   way after dropping its own lock (retarget_shared_pending). A thread
-   that changes its mask between the test and the wakeup sees the
-   signal when it recomputes TIF_SIGPENDING.
+6. **A group signal's thread is chosen under TASKLIST, not siglock**
+   (Linux complete_signal under siglock): after the signal is queued
+   on the group set under the receiver's `Task.sig`, the threads are
+   walked under TASKLIST (`signal::choose`: read lock; a send under the
+   write lock, a child's notice, chooses in that section), each
+   candidate's `Task.sig` taken alone to test wants_signal, and whether
+   it ends the group decided there, never for the protected global
+   init. The lock is dropped before the chosen thread's TIF_SIGPENDING
+   is recomputed under its `Task.sig` and it is woken (a decided group
+   kill done then too). A thread that blocks a group signal or starts
+   exiting hands it on the same way after dropping its own lock
+   (retarget_shared_pending). A thread that changes its mask between
+   the test and the wakeup sees the signal when it recomputes
+   TIF_SIGPENDING.
 
 #### Lock Order for Signal Operations
 
@@ -2993,10 +2997,13 @@ de_thread, exit_group does not.
   none when no signal is sent: a parent that ignores SIGCHLD);
   if the receiver's user or the signal changed by the time the write
   lock is held (`Entry::fits`), the lock is dropped and a new entry made
-  before anything changes. After the lock: the unused entry is freed,
-  signalfd readers and the receiving thread are woken
-  (`Posted::finish`: complete_signal takes TASKLIST itself), the
-  autoreaped Task released.
+  before anything changes. The thread that takes the signal, and
+  whether it ends the parent's group, are chosen there too, as it is
+  queued (`signal::choose`, Linux complete_signal under siglock: a mask
+  changed or the signal dequeued by the time the wakeup runs changes
+  nothing). After the lock: the unused entry is freed, signalfd readers
+  and the chosen thread are woken and a decided group kill is done
+  (`Posted::finish`), the autoreaped Task released.
 - de_thread (exec) holds cred_guard (sleeping, outermost) while it waits
   on CHILD_EXIT_WQ (killable) until every other thread is released and
   the leader is a zombie (`exec_waits`, Linux notify_count: a traced

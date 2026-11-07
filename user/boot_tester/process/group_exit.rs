@@ -412,46 +412,155 @@ fn test_exec_traced_sibling() {
     verdict(b"GROUP_EXEC_TRACED_SIBLING", ok, v);
 }
 
-/// 100 times: a child (exit signal SIGRTMIN+6, which queues every
-/// instance) starts three threads and calls exit_group; after its reap
-/// one exit signal is pending, never two (Linux exit_notify and
-/// release_task decide "group empty" under tasklist_lock: the leader's
-/// exit or its last thread's release reports it, never both)
-fn test_notify_once() {
-    const SIGRT: u32 = 40;
+const SIGRT: u32 = 40;
+const RTMASK: u64 = 1 << (SIGRT - 1);
+const SIG_BLOCK: i32 = 0;
+const SIG_UNBLOCK: i32 = 1;
+static mut NSTACKS: [Stack; 6] = [const { Stack([0; 16384]) }; 6];
+static mut NCTIDS: [u32; 6] = [0; 6];
+/// The helper thread's step: 0 idle, 1 open the window, 2 a long
+/// window, 3 exit
+static PHASE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Start `f(arg)` on notice-test stack `i`; the tid
+fn nstart(i: usize, f: extern "C" fn(u64) -> !, arg: u64) -> i64 {
+    unsafe {
+        let top = (&raw mut NSTACKS[i] as *mut u8).add(16384) as u64;
+        spawn_thread(top, f, arg, &raw mut NCTIDS[i])
+    }
+}
+
+/// Block (`how` 0) or unblock (1) SIGRTMIN+6 in this thread
+fn rt_mask(how: i32) {
+    hk_syscall::sys_rt_sigprocmask(how, &RTMASK as *const u64 as u64, 0, 8);
+}
+
+/// Pending SIGRTMIN+6 instances taken now
+fn rt_drain() -> i64 {
+    let ts = [0i64, 0];
+    let mut n = 0;
+    while hk_syscall::sys_rt_sigtimedwait(&RTMASK as *const u64 as u64, 0, ts.as_ptr() as u64, 8)
+        == SIGRT as i64
+    {
+        n += 1;
+    }
+    n
+}
+
+/// Yield `n` times, then exit_group(0)
+extern "C" fn quitter(n: u64) -> ! {
+    for _ in 0..n {
+        hk_syscall::sys_sched_yield();
+    }
+    sys_exit_group(0)
+}
+
+/// The window thread: SIGRTMIN+6 is blocked but while the main thread
+/// asks (PHASE 1: a few yields, 2: 100 ms), when its child is reaped
+/// and its notice taken, so a notice sent late (or its wakeup done
+/// late) finds a thread that takes it and the process dies of it
+extern "C" fn window(_: u64) -> ! {
+    use core::sync::atomic::Ordering::SeqCst;
+    loop {
+        match PHASE.load(SeqCst) {
+            1 | 2 => {
+                rt_mask(SIG_UNBLOCK);
+                if PHASE.load(SeqCst) == 2 {
+                    sleep_ms(100);
+                } else {
+                    for _ in 0..20 {
+                        hk_syscall::sys_sched_yield();
+                    }
+                }
+                rt_mask(SIG_BLOCK);
+                PHASE.store(0, SeqCst);
+            }
+            3 => sys_exit(0),
+            _ => {
+                hk_syscall::sys_sched_yield();
+            }
+        }
+    }
+}
+
+/// Have the window thread open `phase` and wait until it closes
+fn open_window(phase: u32) {
+    use core::sync::atomic::Ordering::SeqCst;
+    PHASE.store(phase, SeqCst);
+    while PHASE.load(SeqCst) != 0 {
+        hk_syscall::sys_sched_yield();
+    }
+}
+
+/// Child `i` of the notice loop: 0..=4 sleeping threads; the leader
+/// calls exit_group, or a thread does while the leader sleeps, or the
+/// leader exits first and a thread ends the group later
+fn notice_child(i: usize) -> ! {
+    for k in 0..i % 5 {
+        nstart(k, sleeper, 0);
+    }
+    match i % 3 {
+        0 => sys_exit_group(0),
+        1 => {
+            nstart(4, quitter, 0);
+            sleep_ms(60_000);
+            sys_exit(0)
+        }
+        _ => {
+            nstart(4, quitter, 20);
+            sys_exit(0)
+        }
+    }
+}
+
+/// The notice loop, in a process of its own: 0, or 1 + 2 * iteration
+/// for a reap without exactly one notice (+1: more than one), or 255
+/// for a notice left once all are reaped
+fn notice_loop() -> u64 {
     const WALL: i32 = 0x4000_0000;
-    let mask: u64 = 1 << (SIGRT - 1);
-    let mut old = 0u64;
-    hk_syscall::sys_rt_sigprocmask(
-        0,
-        &mask as *const u64 as u64,
-        &mut old as *mut u64 as u64,
-        8,
-    );
-    let mut bad = (0, 0i64);
-    for i in 0..100 {
+    const N: usize = 300;
+    rt_mask(SIG_BLOCK);
+    nstart(5, window, 0);
+    let mut code = 0;
+    for i in 0..N {
         let c = hk_syscall::sys_clone(SIGRT as u64, 0, 0, 0, 0);
         if c == 0 {
-            for k in 0..3 {
-                start(k, sleeper, 0);
-            }
-            sys_exit_group(0);
+            notice_child(i);
         }
         let mut st = 0i32;
         sys_wait4(c, &mut st, WALL, 0);
-        let mut n = 0;
-        let ts = [0i64, 0];
-        while hk_syscall::sys_rt_sigtimedwait(&mask as *const u64 as u64, 0, ts.as_ptr() as u64, 8)
-            == SIGRT as i64
-        {
-            n += 1;
-        }
-        // hk may lose it to a reap racing the send (BUGS.md); never two
-        if n > 1 || (n == 0 && crate::helpers::host_mode()) {
-            bad = (i + 1, n);
+        let n = rt_drain();
+        if n != 1 {
+            code = 1 + 2 * (i as u64 % 120) + u64::from(n > 1);
             break;
         }
+        open_window(1);
     }
-    hk_syscall::sys_rt_sigprocmask(2, &old as *const u64 as u64, 0, 8);
-    verdict(b"GROUP_NOTIFY_ONCE", bad.0 == 0, bad.1);
+    if code == 0 {
+        open_window(2);
+        if rt_drain() != 0 {
+            code = 255;
+        }
+    }
+    PHASE.store(3, core::sync::atomic::Ordering::SeqCst);
+    code
+}
+
+/// 300 times: a child (exit signal SIGRTMIN+6, which queues every
+/// instance; 0 to 5 threads, ended by exit_group from the leader or a
+/// thread, the leader first or not) is reaped and exactly one exit
+/// signal is pending then (Linux exit_notify and release_task decide
+/// "group empty" under tasklist_lock and queue it there: the leader's
+/// exit or its last thread's release reports it, once, before the wait
+/// can reap it); none comes later, nor does a late wakeup find a thread
+/// of the parent that now takes it. In a process of its own, so a
+/// stray one kills that process, not init.
+fn test_notify_once() {
+    let p = sys_fork();
+    if p == 0 {
+        sys_exit_group(notice_loop());
+    }
+    let mut st = -1i32;
+    sys_wait4(p, &mut st, 0, 0);
+    verdict(b"GROUP_NOTIFY_ONCE", st == 0, st as i64);
 }
