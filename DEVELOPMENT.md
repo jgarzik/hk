@@ -298,8 +298,8 @@ hk/                      # The kernel crate (no_std, no_main) is the repo root
 ├── dt/                  # Device tree parsing
 ├── *.rs                 # Core: entry, cpu/smp, irq, printk/kmsg, console, uaccess, ...
 ├── user/                # Userspace test binaries (separate workspace)
-│   ├── boot_tester/     # Test harness (main.rs, boot_tester2.rs)
-│   │   └── tests/       # Test modules (mmap.rs, process.rs, etc.)
+│   ├── boot_tester/     # Boot tests: main.rs (run_all_tests), harness.rs, helpers.rs,
+│   │                    #   boot_tester2.rs; one dir per subsystem (fs/, mm/, net/, ...)
 │   ├── syscall/         # Syscall wrappers (x86_64.rs, aarch64.rs)
 │   └── rootfs/          # /etc files for the initramfs
 ├── tools/               # gate, disk image, busybox, Linux reference scripts

@@ -15,7 +15,9 @@ pattern.
    `report_code`, `pass`, `fail_why`, `T`), but no assertions, no per-check
    numbering, no plan. 15 files still define their own `fn report(`, 6
    `fn verdict(`, 6 `fn check(` (bodies that differ), 5 a sleep helper, 6 a
-   reap helper, 22 a thread-stack struct.
+   reap helper, 22 a thread-stack struct; helpers.rs's `msleep(u64)` and
+   `sleep_ms(i64)` and net/nl.rs's `msleep(i64)` are one sleep under three
+   names (their callers pass different integer types).
    1399 `:FAIL` literals, 480 of them through `fail_num`, the rest hand-printed;
    564 verdicts pass through `pass()`, 113 `:OK` literals remain. Near-identical tests
    (`process.rs` `test_getuid`/`geteuid`/`getgid`/`getegid`).
