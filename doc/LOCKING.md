@@ -2927,6 +2927,13 @@ de_thread, exit_group does not.
   of the list also queues its zombie leader's notice if it was the last
   thread (`unhash_thread`, Linux release_task), with an entry made
   before the lock as below; the Task is released after it.
+- A traced zombie leader whose tracer is outside its real parent's
+  process is its tracer's alone (the parent's wait skips it) until the
+  tracer reaps it (`wait_zombie`) or exits (`detach_zombies`): the
+  TASKLIST write section that does so unlinks it and queues the real
+  parent's notice (`Zombie::Detached`, Linux wait_task_zombie
+  EXIT_TRACE, __ptrace_detach), autoreaping it if that parent does not
+  wait. One write section covers both, so hk has no EXIT_TRACE state.
 - A zombie's notice (Linux do_notify_parent) is queued in the TASKLIST
   write section that makes it reapable: the one that makes it a zombie
   (`exit_notify`), removes its group's last thread (`exit_notify` of

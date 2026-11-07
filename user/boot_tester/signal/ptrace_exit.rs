@@ -6,6 +6,11 @@
 //!   (delay_group_leader); its release tells the leader's parent
 //!   (release_task). A tracer that exits without waiting releases it
 //!   (exit_ptrace), and the leader's parent, now a subreaper, is told
+//! - PTRACE_REAL_PARENT_NOTIFY: a child traced by another process is,
+//!   once a zombie, hidden from its real parent (no SIGCHLD; WNOHANG
+//!   gives 0, not ECHILD) until its tracer reaps it (Linux
+//!   wait_task_zombie: EXIT_TRACE) or exits (__ptrace_detach); then the
+//!   real parent gets SIGCHLD and reaps it
 
 use crate::harness::verdict;
 use crate::helpers::{read_file, sleep_ms};
@@ -25,6 +30,7 @@ const ESRCH: i64 = -3;
 
 pub fn run_tests() {
     test_zombie_reap();
+    test_real_parent_notify();
 }
 
 #[repr(C, align(16))]
@@ -111,6 +117,15 @@ fn chld_from(pid: i64) -> bool {
     false
 }
 
+/// A SIGCHLD from `pid` is pending (every pending one is taken)
+fn chld_pending(pid: i64) -> bool {
+    let mut seen = false;
+    while let Some(p) = take_chld(0) {
+        seen |= p == pid;
+    }
+    seen
+}
+
 /// The state letter in /proc/<pid>/stat, or 0
 fn stat_state(pid: i64) -> u8 {
     let path = crate::exec::exec_identity::proc_path(pid, b"stat\0");
@@ -135,6 +150,21 @@ fn zombie(pid: i64) -> bool {
         sleep_ms(10);
     }
     false
+}
+
+/// wait4(`pid`, WNOHANG | `flags`) until it reaps, within 5 s: the
+/// result and status
+fn reap_within(pid: i64, flags: i32) -> (i64, i32) {
+    let mut st = 0i32;
+    let mut r = 0;
+    for _ in 0..500 {
+        r = sys_wait4(pid, &mut st, WNOHANG | flags, 0);
+        if r != 0 {
+            break;
+        }
+        sleep_ms(10);
+    }
+    (r, st)
 }
 
 /// A failed step's leftovers: `pid` killed, its threads reaped as far
@@ -289,4 +319,85 @@ fn trace_and_leave(c: i64, t: i64, a: [i32; 2], b: [i32; 2]) -> i32 {
         return 3;
     }
     0
+}
+
+fn test_real_parent_notify() {
+    in_child(b"PTRACE_REAL_PARENT_NOTIFY", || match hidden_until(false) {
+        0 => hidden_until(true),
+        r => r,
+    });
+}
+
+/// A child traced by a sibling process is hidden from this, its real
+/// parent, until the tracer reaps it (`exits`: exits without waiting)
+fn hidden_until(exits: bool) -> i32 {
+    let base = if exits { 20 } else { 0 };
+    let (gc, cmd, up) = (pipe(), pipe(), pipe());
+    let c = sys_fork();
+    if c == 0 {
+        wait_go(gc[0]);
+        sys_exit_group(7);
+    }
+    let r = quiet_fork();
+    if r == 0 {
+        sys_exit_group(tracer(c, exits, cmd, up) as u64);
+    }
+    let res = hidden_steps(c, gc, cmd, up);
+    let mut st = 0i32;
+    if res != 0 {
+        kill_reap(c);
+        sys_kill(r, SIGKILL);
+    }
+    sys_wait4(r, &mut st, WALL, 0);
+    close(&[gc, cmd, up]);
+    match (res, st) {
+        (0, 0) => 0,
+        (0, st) => base + 10 + (st >> 8),
+        (res, _) => base + res,
+    }
+}
+
+fn hidden_steps(c: i64, gc: [i32; 2], cmd: [i32; 2], up: [i32; 2]) -> i32 {
+    let mut st = 0i32;
+    if get(up[0]) != 0 {
+        return 1;
+    }
+    go(gc[1]);
+    if !zombie(c) {
+        return 2;
+    }
+    // The tracer's zombie: no notice here, and not reapable yet
+    sleep_ms(20);
+    if sys_wait4(c, &mut st, WNOHANG, 0) != 0 {
+        return 3;
+    }
+    if chld_pending(c) {
+        return 4;
+    }
+    go(cmd[1]);
+    if !chld_from(c) {
+        return 5;
+    }
+    if sys_wait4(c, &mut st, WNOHANG, 0) != c || st != 7 << 8 {
+        return 6;
+    }
+    0
+}
+
+/// The tracer: seize `c` (the result sent on `up`), then on `cmd` reap
+/// it, or exit at once if `exits`
+fn tracer(c: i64, exits: bool, cmd: [i32; 2], up: [i32; 2]) -> i32 {
+    let s = sys_ptrace(PTRACE_SEIZE, c, 0, 0);
+    put(up[1], s);
+    if s != 0 {
+        return 1;
+    }
+    wait_go(cmd[0]);
+    if exits {
+        return 0;
+    }
+    match reap_within(c, 0) {
+        (r, st) if r == c && st == 7 << 8 => 0,
+        _ => 2,
+    }
 }

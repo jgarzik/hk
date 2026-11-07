@@ -1729,19 +1729,53 @@ struct Wait {
 }
 
 /// Zombie `t` is one `w` reaps (Linux wait_consider_task): never a
-/// leader with threads left (delay_group_leader); its tracer any thread
+/// leader with threads left (delay_group_leader); its tracer any task
 /// it traces, __WCLONE or not (eligible_child: traced by us); its real
-/// parent a leader by the __WALL/__WCLONE rule
+/// parent an untraced leader by the __WALL/__WCLONE rule (a zombie
+/// ptracee is visible only to its ptracer)
 fn reapable(table: &GlobalTaskTable, t: &TaskView<'_>, w: &Wait) -> bool {
     if !matches!(t.state, TaskState::Zombie(_)) || !wait_match(t, w.target_pid, w.pgid) {
         return false;
     }
-    if t.leader {
-        return t.task.ppid() == w.parent_pid
-            && !group_pending(table, t.task.pid, &[t.task.tid()])
-            && wait_eligible(t.exit_signal, w.wflags);
+    if t.leader && group_pending(table, t.task.pid, &[t.task.tid()]) {
+        return false;
     }
-    tracee_of(t, w.parent_pid)
+    if tracee_of(t, w.parent_pid) {
+        return true;
+    }
+    t.leader
+        && t.ptrace == 0
+        && t.task.ppid() == w.parent_pid
+        && wait_eligible(t.exit_signal, w.wflags)
+}
+
+/// How [`wait_zombie`] releases the zombie it reaps
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Reap {
+    /// A traced thread (Linux EXIT_DEAD, release_task)
+    Thread,
+    /// A leader traced from outside its real parent's process: its
+    /// tracer is done, its real parent told (Linux EXIT_TRACE)
+    Traced,
+    /// A leader its real parent's process reaps (Linux EXIT_DEAD)
+    Child,
+}
+
+/// [`Reap`] of zombie `z`
+fn reap_kind(z: &TaskView<'_>) -> Reap {
+    if !z.leader {
+        Reap::Thread
+    } else if ptrace_reparented(z) {
+        Reap::Traced
+    } else {
+        Reap::Child
+    }
+}
+
+/// `t` is traced by a task outside its real parent's process (Linux
+/// ptrace_reparented)
+fn ptrace_reparented(t: &TaskView<'_>) -> bool {
+    t.tracer().is_some_and(|tr| tr.pid != t.task.ppid())
 }
 
 /// [`reap_zombie_child_times`]'s TASKLIST write section: the zombie
@@ -1756,9 +1790,9 @@ fn wait_zombie(
     let found = {
         let tb: &GlobalTaskTable = table;
         tb.find(|t| reapable(tb, t, w))
-            .map(|z| zombie_report(tb, &z))
+            .map(|z| (zombie_report(tb, &z), reap_kind(&z)))
     };
-    let Some((report, leader)) = found else {
+    let Some((report, kind)) = found else {
         return Ok(None);
     };
     // WNOWAIT (waitid): report the zombie, leave it waitable
@@ -1766,7 +1800,24 @@ fn wait_zombie(
         return Ok(Some((report, Unhashed::default())));
     }
     let tid = report.0;
-    if !leader {
+    if kind == Reap::Traced {
+        // Its real parent is told now, as if it had never been traced
+        // (Linux wait_task_zombie: EXIT_TRACE, ptrace_unlink,
+        // do_notify_parent); the tracer's process gets no child times
+        let z = Zombie::Detached(tid);
+        if !entry.fits(table, z) {
+            return Err(z);
+        }
+        crate::task::ptrace::ptrace_unlink(table, tid);
+        let (told, gone) = tell(table, Some(z), entry);
+        let done = Unhashed {
+            thread: None,
+            told,
+            gone,
+        };
+        return Ok(Some((report, done)));
+    }
+    if kind == Reap::Thread {
         // A traced thread: its tracer releases it (Linux
         // wait_task_zombie: EXIT_DEAD, then release_task)
         let z = table
@@ -1793,11 +1844,10 @@ fn wait_zombie(
     )))
 }
 
-/// Zombie `z`'s wait report `(tid, status, utime, stime)` and whether
-/// it leads its group: a leader's time is its group's (every thread
-/// gone) and its children's (wait's rusage, Linux RUSAGE_BOTH); a
-/// thread's its own
-fn zombie_report(table: &GlobalTaskTable, z: &TaskView<'_>) -> (WaitReport, bool) {
+/// Zombie `z`'s wait report `(tid, status, utime, stime)`: a leader's
+/// time is its group's (every thread gone) and its children's (wait's
+/// rusage, Linux RUSAGE_BOTH); a thread's its own
+fn zombie_report(table: &GlobalTaskTable, z: &TaskView<'_>) -> WaitReport {
     let own = match z.state {
         TaskState::Zombie(s) => s,
         _ => 0,
@@ -1814,7 +1864,7 @@ fn zombie_report(table: &GlobalTaskTable, z: &TaskView<'_>) -> (WaitReport, bool
         utime = utime.saturating_add(cu);
         stime = stime.saturating_add(cs);
     }
-    ((z.task.tid(), group_status(z, own), utime, stime), z.leader)
+    (z.task.tid(), group_status(z, own), utime, stime)
 }
 
 /// A thread of group `tgid` other than `tid` has not exited yet
@@ -2911,41 +2961,71 @@ fn thread_teller(table: &GlobalTaskTable, pid: Pid, tid: Tid) -> Option<Zombie> 
     last_thread(table, pid, tid).then_some(Zombie::Leader(pid))
 }
 
-/// The exiting tracer `me`'s zombie threads (not leaders) are
-/// released, one per TASKLIST write section (Linux exit_ptrace:
-/// __ptrace_detach marks a traced zombie thread EXIT_DEAD, released
-/// after the lock); the last of a group tells its zombie leader's
-/// parent (release_task)
+/// The exiting tracer `me`'s zombie tracees are detached, one per
+/// TASKLIST write section, leaders first (Linux exit_ptrace ->
+/// __ptrace_detach, its dead list released after the lock): a thread
+/// is released, the last of its group telling its zombie leader's
+/// parent (release_task); a leader with no thread left tells its real
+/// parent as if never traced, or, if that is `me`'s own process, is
+/// released if that process does not wait for children
 pub fn detach_zombies(me: &Task) {
     while let Some(done) = with_entry(|table, entry| detach_zombie(table, entry, me)) {
         done.finish();
     }
 }
 
-/// [`detach_zombies`]'s TASKLIST write section: one zombie thread
-/// `me` traces is detached and released; `Err(z)`: an entry for zombie
-/// `z`'s notice is needed first
+/// [`detach_zombies`]'s TASKLIST write section for one zombie `me`
+/// traces; `Err(z)`: an entry for zombie `z`'s notice is needed first
 fn detach_zombie(
     table: &mut GlobalTaskTable,
     entry: &mut Entry,
     me: &Task,
 ) -> Result<Option<Unhashed>, Zombie> {
-    let found = table
-        .find(|t| {
-            t.ptrace != 0 && t.traced_by(me) && !t.leader && matches!(t.state, TaskState::Zombie(_))
-        })
-        .map(|t| (t.task.tid(), t.task.pid));
-    let Some((tid, pid)) = found else {
+    let Some((tid, pid, leader, ppid)) = traced_zombie(table, me) else {
         return Ok(None);
     };
-    let z = thread_teller(table, pid, tid);
+    let (z, dead) = if !leader {
+        (thread_teller(table, pid, tid), true)
+    } else if group_pending(table, pid, &[pid]) {
+        (None, false)
+    } else if ppid != me.pid {
+        (Some(Zombie::Detached(tid)), false)
+    } else {
+        (
+            None,
+            crate::signal::notify::ignoring_children(table, me.pid),
+        )
+    };
     if let Some(z) = z
         && !entry.fits(table, z)
     {
         return Err(z);
     }
     crate::task::ptrace::ptrace_unlink(table, tid);
-    Ok(Some(unhash_thread(table, tid, z, entry)))
+    if !leader {
+        return Ok(Some(unhash_thread(table, tid, z, entry)));
+    }
+    let (told, mut gone) = tell(table, z, entry);
+    if dead {
+        gone = reap_locked(table, tid);
+    }
+    Ok(Some(Unhashed {
+        thread: None,
+        told,
+        gone,
+    }))
+}
+
+/// A zombie `me` traces, a leader first: its tid, pid, whether it
+/// leads, its real parent's pid
+fn traced_zombie(table: &GlobalTaskTable, me: &Task) -> Option<(Tid, Pid, bool, Pid)> {
+    let mine = |t: &TaskView<'_>| {
+        t.ptrace != 0 && t.traced_by(me) && matches!(t.state, TaskState::Zombie(_))
+    };
+    table
+        .find(|t| mine(t) && t.leader)
+        .or_else(|| table.find(|t| mine(t)))
+        .map(|t| (t.task.tid(), t.task.pid, t.leader, t.task.ppid()))
 }
 
 /// Process `pid` exited with `status` (its last thread): its pidfds see

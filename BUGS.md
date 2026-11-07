@@ -497,11 +497,6 @@ de_thread
 
 **Location**: `signal/notify.rs`, `task/percpu.rs` (exit_notify)
 
-A traced child's exit tells its tracer only; once the tracer reaps or
-detaches it, its real parent is not told nor can wait for it (Linux
-wait_task_zombie / __ptrace_detach: do_notify_parent to the real
-parent).
-
 A subreaper is found only if its ancestor task itself is alive; Linux
 find_new_reaper takes any live thread of a subreaper process.
 
@@ -522,11 +517,9 @@ return trampoline stands in for the vDSO's sigtramp, shown as
 Signal-delivery and PTRACE_SYSCALL stops work. Missing: exec, fork,
 clone and exit event stops (PTRACE_O_TRACEEXEC and friends,
 PTRACE_EVENT_*), PTRACE_INTERRUPT/LISTEN, group-stop interaction (SIGSTOP
-to an untraced task is ignored: stop/continue are not implemented),
-and the tracee's exit being
-reported to a tracer that is not its parent. A sibling's exec removes
-a traced zombie thread at once (Linux de_thread waits for its tracer
-to reap it).
+to an untraced task is ignored: stop/continue are not implemented).
+A sibling's exec removes a traced zombie thread at once (Linux
+de_thread waits for its tracer to reap it).
 
 ## NETLINK_ROUTE / SIOC* subset gaps
 

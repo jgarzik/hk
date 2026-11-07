@@ -86,13 +86,17 @@ pub enum Zombie {
     /// A zombie leader whose group just emptied, or moved to a new
     /// parent (Linux release_task, reparent_leader): its exit signal
     Leader(Tid),
+    /// A traced zombie leader whose tracer is done with it (reaped it,
+    /// or exited), told to its real parent as if never traced (Linux
+    /// wait_task_zombie EXIT_TRACE, __ptrace_detach): its exit signal
+    Detached(Tid),
 }
 
 impl Zombie {
     /// Its tid
     pub fn tid(self) -> Tid {
         match self {
-            Self::Exiting(t) | Self::Leader(t) => t,
+            Self::Exiting(t) | Self::Leader(t) | Self::Detached(t) => t,
         }
     }
 }
@@ -102,7 +106,10 @@ fn receiver(table: &GlobalTaskTable, z: Zombie) -> Option<Rcv> {
     let tid = z.tid();
     let t = table.get(tid)?;
     let real = t.real_parent.as_ref().and_then(|w| w.upgrade());
-    let tracer = t.tracer();
+    let tracer = match z {
+        Zombie::Detached(_) => None,
+        _ => t.tracer(),
+    };
     let traced = tracer.is_some();
     let parent = tracer.or(real.clone())?;
     let own = match z {
@@ -114,7 +121,7 @@ fn receiver(table: &GlobalTaskTable, z: Zombie) -> Option<Rcv> {
                 && !reparented
                 && !crate::task::percpu::group_pending(table, t.task.pid, &[tid])
         }
-        Zombie::Leader(_) => true,
+        Zombie::Leader(_) | Zombie::Detached(_) => true,
     };
     let mut sig = if own { t.exit_signal as u32 } else { SIGCHLD };
     // A custom exit signal only to the image that asked for it (Linux:
@@ -157,6 +164,13 @@ fn disposition(table: &GlobalTaskTable, to: &TaskRef, sig: u32) -> (u32, bool) {
         Some(a) if a.flags & sa_flags::SA_NOCLDWAIT != 0 => (sig, true),
         _ => (sig, false),
     }
+}
+
+/// The process `pid` reaps its children itself: it ignores SIGCHLD or
+/// set SA_NOCLDWAIT (Linux ignoring_children, by its SIGCHLD action as
+/// [`disposition`] reads it)
+pub fn ignoring_children(table: &GlobalTaskTable, pid: crate::task::Pid) -> bool {
+    super::group_task(table, table.get(pid)).is_some_and(|to| disposition(table, &to, SIGCHLD).1)
 }
 
 /// The entry a zombie's notice is queued with, made before TASKLIST is

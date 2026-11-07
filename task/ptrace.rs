@@ -1066,8 +1066,8 @@ pub(crate) fn ptrace_unlink(table: &mut percpu::GlobalTaskTable, tid: Tid) {
 }
 
 /// The exiting task's tracees are detached (Linux exit_ptrace): stopped
-/// ones go on, and PTRACE_O_EXITKILL ones are killed; zombie threads
-/// are released ([`percpu::detach_zombies`])
+/// ones go on, and PTRACE_O_EXITKILL ones are killed; then the zombies
+/// ([`percpu::detach_zombies`])
 pub fn exit_ptrace() {
     let me = percpu::current();
     // Most tasks trace nothing: look under the read lock first
@@ -1083,7 +1083,9 @@ pub fn exit_ptrace() {
         let mut table = TASKLIST.write();
         let tids: alloc::vec::Vec<Tid> = table
             .iter()
-            .filter(|t| t.ptrace != 0 && t.traced_by(&me) && !zombie_thread(t))
+            .filter(|t| {
+                t.ptrace != 0 && t.traced_by(&me) && !matches!(t.state, TaskState::Zombie(_))
+            })
             .map(|t| t.task.tid())
             .collect();
         for tid in tids {
@@ -1109,11 +1111,6 @@ pub fn exit_ptrace() {
         percpu::try_to_wake_up(&t, percpu::WakeMode::Any);
     }
     percpu::detach_zombies(&me);
-}
-
-/// `t` is a zombie thread, not a leader
-fn zombie_thread(t: &percpu::TaskView<'_>) -> bool {
-    !t.leader && matches!(t.state, TaskState::Zombie(_))
 }
 
 // =============================================================================
