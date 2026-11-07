@@ -1316,7 +1316,7 @@ pub struct Zone {
   PTE locks): `Mm.page_table_lock` (`spin::Mutex<()>`, not IRQ-safe;
   held as a `ptl::PtLock`, which the writes of a 2MB-level entry,
   `pgtable::Pmd`, take as proof) covers table-structure changes: a missing table installed
-  (`ptl::pte_alloc`), a 2MB entry mapped (`do_huge_anon`), split
+  (`PgTables::pte_alloc`), a 2MB entry mapped (`do_huge_anon`), split
   (`split_huge_pmd`) or cleared (`take_huge_pmd`). The PTE lock of each
   PTE table page (a word in its struct page, `Page.ptl`; one lockdep
   class) covers a table's 4KB entries. One rule, whatever mm lock

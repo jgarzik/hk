@@ -6,7 +6,7 @@
 //! remote write). Two spin locks order them:
 //!
 //! - `Mm.page_table_lock` ([`pt_lock`]): the table structure -- a missing
-//!   table installed ([`pte_alloc`]), a 2MB entry mapped, split or
+//!   table installed (`PgTables::pte_alloc`), a 2MB entry mapped, split or
 //!   cleared (Linux pmd_lock without split PMD locks).
 //! - the PTE lock ([`pte_lock`], [`table_lock`]) of each PTE table
 //!   page, a lock word in its struct page (`Page.ptl`, Linux ptdesc
@@ -40,7 +40,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use super::Mm;
 use super::page::{Page, phys_to_page};
-use crate::arch::{paging, virt_to_phys};
+use crate::arch::virt_to_phys;
 
 /// The PTE lock of a page-table page, held until dropped
 pub struct PteLock {
@@ -141,15 +141,4 @@ pub fn pt_lock(mm: &Mm) -> PtLock<'_> {
         pgd: mm.pgd(),
         _g: mm.page_table_lock().lock(),
     }
-}
-
-/// The 4KB entry for `addr` in `mm`, installing missing tables under
-/// the page_table_lock (Linux pte_alloc). None if out of memory or a
-/// 2MB page maps `addr`.
-pub fn pte_alloc(mm: &Mm, addr: u64) -> Option<*mut u64> {
-    if let Some(p) = paging::pte_ptr(mm.pgd(), addr) {
-        return Some(p);
-    }
-    let _l = pt_lock(mm);
-    paging::pte_alloc(mm.pgd(), addr)
 }
