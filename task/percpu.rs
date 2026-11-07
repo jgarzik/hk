@@ -2684,7 +2684,9 @@ fn find_reaper(table: &GlobalTaskTable, me: &TaskRef) -> Option<TaskRef> {
     }
     let mut p = table.get(me.tid()).and_then(|t| t.real_parent.clone());
     while let Some(t) = p.and_then(|w| w.upgrade()) {
-        let v = table.get(t.tid())?;
+        // An ancestor gone from the list ends the walk: init adopts
+        // (Linux find_new_reaper ends at the child_reaper)
+        let Some(v) = table.get(t.tid()) else { break };
         if v.prctl.child_subreaper && live(&v) {
             return Some(t.clone());
         }
