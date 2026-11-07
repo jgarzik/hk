@@ -512,6 +512,14 @@ de_thread
   reused in between, another process gets the signal. Linux signals the
   struct pid (kill_pid_info); pidfd_getfd already resolves it so.
 
+## Signal queue gaps
+
+**Location**: `signal/`
+
+A signal made ignored by sigaction stays pending, its queued instances
+with it, until delivery discards them (Linux do_sigaction flushes them:
+flush_sigqueue_mask).
+
 ## ptrace stop gaps
 
 **Location**: `task/ptrace.rs`, `task/exec.rs`,
@@ -847,10 +855,9 @@ Designs that grew one commit at a time. Tag = roadmap phase
 (doc/ROADMAP.md).
 
 - **Syscalls that do not deliver** (H/C): inotify and fanotify never
-  queue an event (no fsnotify hooks in the VFS); there is no siginfo
-  queue (signals are a bitmask: rt_sigqueueinfo's data, si_pid/si_uid
-  and RT signal queueing are lost); waitid without WEXITED is EINVAL
-  (C).
+  queue an event (no fsnotify hooks in the VFS); queued siginfo is
+  not delivered (handlers, sigtimedwait and signalfd see SI_USER from
+  pid 0); waitid without WEXITED is EINVAL (C).
 - **Copied helpers** (J, or as touched): `get_nofile_limit` in five
   places; `find_task_by_pid` in four (all root-namespace pids); four
   `current_time`s; about ten user-timespec readers each validating

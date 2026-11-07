@@ -372,8 +372,9 @@ impl MqQueue {
     }
 
     fn fire_notification(&self) {
-        let mut notify = self.notify.lock();
-        if let Some(n) = notify.take() {
+        // Taken out of the lock: the send allocates its queue entry
+        let n = self.notify.lock().take();
+        if let Some(n) = n {
             // TODO: siginfo SI_MESGQ with sigev_value once hk queues siginfo
             let _sigev_value = n.sigev_value;
             // The registrant's authority, not the sender's (Linux

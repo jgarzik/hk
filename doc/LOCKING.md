@@ -2666,7 +2666,7 @@ bitflags! {
 
 ### 3.7 Signal Infrastructure
 
-**Location:** `signal/mod.rs`, `signal/syscall.rs`
+**Location:** `signal/mod.rs`, `signal/pending.rs`, `signal/syscall.rs`
 
 The signal subsystem manages signal handlers (SigHand) and per-task signal state
 (blocked masks, pending signals). It follows Linux's `sighand_struct` and signal
@@ -2680,6 +2680,7 @@ state patterns.
 | `Task.sig` | `spin::Mutex<TaskSignalState>` (per task) | Blocked mask, private pending set, altstack (Linux siglock's per-task part) |
 | `Task.thread_flags` TIF_SIGPENDING | atomic, recomputed under `Task.sig` | Pending-signal flag |
 | `TaskSignalState.shared_pending` | `SharedPending` (`Arc<spin::Mutex<SigPending>>`) | Thread-group pending set |
+| `SigPending` list | `Option<Box<SigQueue>>` under the set's lock | Queued siginfo (Linux sigpending.list of struct sigqueue) |
 | `SigHand.action` | `IrqSpinlock<Box<[SigAction]>>` (65 entries) | Signal handler table |
 | `SignalStruct.rlim` | `IrqSpinlock<[RLimit; N]>` | Resource limits (leaf) |
 
@@ -2715,10 +2716,23 @@ the signal handler table must use an IRQ-safe lock. The `IrqSpinlock` ensures th
 2. **SigHand.action uses IrqSpinlock** - Can be safely accessed from synchronous
    exception handlers (page faults, etc.) and process context; a leaf.
 
-3. **shared_pending before action** - Dequeueing takes
-   `shared_pending` and then reads the action (`get_action`) under it.
+3. **shared_pending before action** - `SigHand.action` may be read
+   under `Task.sig` and `shared_pending` (a send's `sig_ignored`);
+   dequeueing reads the action after both are dropped.
 
 4. **Never hold IrqSpinlock while acquiring Mutex** - Would violate lock ordering.
+
+5. **Queue entries are made and freed outside the locks** (Linux
+   allocates its sigqueue GFP_ATOMIC under siglock; hk allocates under
+   no spin lock): a sender allocates its `SigQueue` and charges the
+   receiver's user (`UCOUNTS`) before taking `Task.sig`, the locked
+   section only links it in, and an unused one is dropped after the
+   lock is released. A dequeue unlinks its entry under the lock and the
+   caller frees it (`Dequeued::info`) after; an exiting task's sets are
+   swapped out under TASKLIST and `Task.sig` and freed after both, and
+   an exiting task (PF_EXITING, read under `Task.sig`) gets no entries,
+   so none outlives that flush. Senders run in thread context with no
+   spin lock held (mqueue drops its notify lock before sending).
 
 #### Lock Order for Signal Operations
 

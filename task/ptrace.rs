@@ -319,8 +319,9 @@ fn ptrace_attach(target_pid: Pid) -> i64 {
         )));
     }
 
-    // Send SIGSTOP to the target to stop it
-    signal::send_signal(target_tid, SIGSTOP);
+    // Send SIGSTOP to the target to stop it (Linux ptrace_attach:
+    // SEND_SIG_PRIV)
+    signal::send_sig_info(target_tid, SIGSTOP, signal::SendInfo::Kernel);
 
     0
 }

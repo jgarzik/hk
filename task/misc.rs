@@ -1289,7 +1289,7 @@ pub fn sys_pidfd_open(pid: i64, flags: u32) -> i64 {
 /// # Arguments
 /// * `pidfd` - File descriptor referring to the target process
 /// * `sig` - Signal number to send
-/// * `info` - Optional siginfo_t pointer (not used currently)
+/// * `info` - Optional siginfo_t to send (else kill's)
 /// * `flags` - Flags (must be 0)
 ///
 /// # Returns
@@ -1297,7 +1297,7 @@ pub fn sys_pidfd_open(pid: i64, flags: u32) -> i64 {
 /// * -EBADF: Invalid file descriptor
 /// * -EINVAL: Invalid signal number or flags
 /// * -ESRCH: Process no longer exists
-pub fn sys_pidfd_send_signal(pidfd: i32, sig: i32, _info: u64, flags: u32) -> i64 {
+pub fn sys_pidfd_send_signal(pidfd: i32, sig: i32, info: u64, flags: u32) -> i64 {
     // Flags must be 0
     if flags != 0 {
         return KernelError::InvalidArgument.sysret();
@@ -1329,10 +1329,34 @@ pub fn sys_pidfd_send_signal(pidfd: i32, sig: i32, _info: u64, flags: u32) -> i6
         Err(e) => return e.sysret(),
     };
 
+    let info = match pidfd_info(info, sig as u32, target_pid) {
+        Ok(i) => i,
+        Err(e) => return e.sysret(),
+    };
     // Permission check and send (Linux pidfd_send_signal ->
     // kill_pid_info). Signal 0 is a permission/existence probe.
-    let perm = crate::signal::syscall::user_group_send(target_pid, sig as u32);
+    let perm = crate::signal::syscall::user_group_send(target_pid, sig as u32, info);
     i64::from(perm)
+}
+
+/// The info pidfd_send_signal sends to process `pid` (Linux
+/// do_pidfd_send_signal): kill's without `uinfo`; else that siginfo,
+/// which must be for `sig` (EINVAL), with a code reserved to the kernel
+/// only from the process's own leader thread (EPERM)
+fn pidfd_info(uinfo: u64, sig: u32, pid: u64) -> Result<crate::signal::SendInfo, KernelError> {
+    use crate::signal::{SendInfo, SigInfo};
+    if uinfo == 0 {
+        return Ok(SendInfo::User);
+    }
+    let info = SigInfo::copy_from_user(uinfo)?;
+    if info.sig() != sig {
+        return Err(KernelError::InvalidArgument);
+    }
+    let me = super::percpu::current_tid();
+    if me != pid && crate::signal::syscall::reserved_to_kernel(info.code) {
+        return Err(KernelError::NotPermitted);
+    }
+    Ok(SendInfo::Info(info))
 }
 
 /// sys_pidfd_getfd - obtain a duplicate of another process's file descriptor

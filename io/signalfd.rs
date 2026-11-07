@@ -30,7 +30,7 @@ use crate::fs::KernelError;
 use crate::fs::file::{File, FileOps, RwFlags, flags, nowait_rw};
 use crate::fs::iov_iter::IovDest;
 use crate::io::poll::{POLLIN, POLLRDNORM, PollTable};
-use crate::signal::{SigSet, UNMASKABLE_SIGNALS, with_task_signal_state};
+use crate::signal::{SigInfo, SigSet, UNMASKABLE_SIGNALS, with_task_signal_state};
 use crate::task::percpu::current_tid;
 use crate::util::pod::IntoBytes;
 
@@ -168,27 +168,10 @@ impl Signalfd {
         .unwrap_or(false)
     }
 
-    /// Dequeue a pending signal that matches our mask
-    fn dequeue_signal(&self) -> Option<u32> {
+    /// Dequeue a pending signal that matches our mask, with its info
+    fn dequeue_signal(&self) -> Option<SigInfo> {
         let mask = self.inner.lock().mask;
-        with_task_signal_state(current_tid(), |state| {
-            // First check private pending
-            let deliverable = state.pending.signal.intersect(&mask);
-            if let Some(sig) = deliverable.first() {
-                state.pending.signal.remove(sig);
-                return Some(sig);
-            }
-
-            // Then check shared pending
-            let mut shared = state.shared_pending.lock();
-            let deliverable = shared.signal.intersect(&mask);
-            if let Some(sig) = deliverable.first() {
-                shared.signal.remove(sig);
-                drop(shared);
-                return Some(sig);
-            }
-            None
-        })?
+        crate::signal::dequeue_signal(&mask)
     }
 
     /// Read signals from the signalfd into `to` (Linux signalfd_read)
@@ -207,10 +190,10 @@ impl Signalfd {
         let mut done = 0;
         loop {
             while to.len() >= SIGINFO_SIZE {
-                let Some(sig) = self.dequeue_signal() else {
+                let Some(info) = self.dequeue_signal() else {
                     break;
                 };
-                match to.copy_to_full(self.build_siginfo(sig).as_bytes()) {
+                match to.copy_to_full(self.build_siginfo(info.sig()).as_bytes()) {
                     Ok(()) => done += SIGINFO_SIZE,
                     Err(_) if done > 0 => return Ok(done),
                     Err(e) => return Err(e),
