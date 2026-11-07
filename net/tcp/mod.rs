@@ -405,21 +405,28 @@ impl TcpSock {
         r
     }
 
-    /// The wakeups `w` (`cb::wake`) asked for
+    /// The wakeups `w` (`cb::wake`) asked for, each of them, in Linux's
+    /// order within one segment: an establishing state change before the
+    /// data it carried (tcp_finish_connect, then tcp_data_queue), the
+    /// data before the FIN behind it (tcp_data_queue, then tcp_fin)
     fn wake(&self, w: u8) {
         if w & cb::wake::ERR != 0 {
             self.sk.wake_async(WakeHow::Io, POLL_ERR);
         }
-        if w & cb::wake::STATE != 0 {
+        let fin = w & cb::wake::FIN != 0;
+        if w & cb::wake::STATE != 0 && !fin {
             self.sk.state_change();
             self.state_async(w);
-            return;
         }
         if w & cb::wake::DATA != 0 {
             self.sk.data_ready();
         }
         if w & cb::wake::SPACE != 0 {
             self.sk.stream_write_space();
+        }
+        if fin {
+            self.sk.state_change();
+            self.state_async(w);
         }
     }
 
