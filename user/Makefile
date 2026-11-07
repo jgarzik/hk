@@ -31,7 +31,13 @@ all: $(INITRAMFS)
 
 boot_tester: $(BOOT_TESTER) $(BOOT_TESTER2)
 
-$(BOOT_TESTER) $(BOOT_TESTER2): boot_tester/main.rs boot_tester/boot_tester2.rs boot_tester/tests/*.rs syscall/lib.rs syscall/types.rs syscall/$(ARCH).rs Cargo.toml
+# Every input of the two binaries: sources at any depth (suites live in
+# subdirectories), manifests, lock file, rustflags and the toolchain pin
+BOOT_TESTER_SRCS = $(shell find boot_tester syscall -name '*.rs') Cargo.toml \
+	boot_tester/Cargo.toml syscall/Cargo.toml Cargo.lock .cargo/config.toml \
+	../rust-toolchain.toml
+
+$(BOOT_TESTER) $(BOOT_TESTER2): $(BOOT_TESTER_SRCS)
 	$(CARGO) build --release --target $(TARGET)
 
 # busybox + /etc (shared with the Linux harness)

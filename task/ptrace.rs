@@ -193,26 +193,63 @@ fn attach_refused(target_tid: Tid) -> bool {
 /// Most ptrace operations require the tracee to be in a ptrace-stop,
 /// and switched out: its CPU may still be on its way out of it, with
 /// its TLS and GS base not yet saved (Linux wait_task_inactive)
-fn ptrace_check_attach(target_tid: Tid) -> Result<(), i64> {
+fn ptrace_check_attach(target_tid: Tid) -> Result<Frozen, i64> {
     let task = {
-        let table = TASKLIST.read();
-        let target = table.get(target_tid).ok_or(-ESRCH)?;
+        let mut table = TASKLIST.write();
+        let task = table.task(target_tid).ok_or(-ESRCH)?;
+        let mut target = table.get_mut(target_tid).ok_or(-ESRCH)?;
 
         // Check if we are the tracer
         if !target.traced_by(&percpu::current()) {
             return Err(-ESRCH);
         }
 
-        // Check if target is in ptrace stop
-        if !matches!(target.state, TaskState::Traced(_)) {
+        // In a ptrace stop, and not killed (Linux ptrace_freeze_traced):
+        // the stop then stays until the request ends
+        if !matches!(target.state, TaskState::Traced(_)) || signal::task_fatal_pending(&task) {
             return Err(-ESRCH);
         }
-        table.task(target_tid).ok_or(-ESRCH)?
+        target.ptrace_frozen = true;
+        task
     };
-    if !percpu::wait_task_inactive(&task) {
+    let frozen = Frozen(task);
+    if !percpu::wait_task_inactive(&frozen.0) {
         return Err(-ESRCH);
     }
-    Ok(())
+    Ok(frozen)
+}
+
+/// A tracee its tracer's request holds in its ptrace stop (Linux
+/// JOBCTL_PTRACE_FROZEN, set by ptrace_check_attach); dropped at the
+/// end of the request, it lets go (Linux ptrace_unfreeze_traced): a
+/// SIGKILL that came meanwhile ends the stop and wakes it
+struct Frozen(percpu::TaskRef);
+
+impl Drop for Frozen {
+    fn drop(&mut self) {
+        let killed = {
+            let mut table = TASKLIST.write();
+            // The same task, not another that took its reused tid
+            let Some(mut t) = table
+                .get_mut(self.0.tid())
+                .filter(|t| core::ptr::eq(t.task, alloc::sync::Arc::as_ptr(&self.0)))
+            else {
+                return;
+            };
+            t.ptrace_frozen = false;
+            let killed = signal::task_fatal_pending(&self.0);
+            if killed && matches!(t.state, TaskState::Traced(_)) {
+                t.state = TaskState::Ready;
+                t.ptrace_code = 0;
+            }
+            killed
+        };
+        // Also ends a sleep a SIGKILL could not (ptrace_stop sleeps
+        // uninterruptibly while frozen with one pending)
+        if killed {
+            percpu::try_to_wake_up(&self.0, percpu::WakeMode::Any);
+        }
+    }
 }
 
 /// Find a task by PID (thread group leader)
@@ -319,8 +356,9 @@ fn ptrace_attach(target_pid: Pid) -> i64 {
         )));
     }
 
-    // Send SIGSTOP to the target to stop it
-    signal::send_signal(target_tid, SIGSTOP);
+    // Send SIGSTOP to the target to stop it (Linux ptrace_attach:
+    // SEND_SIG_PRIV)
+    signal::send_sig_info(target_tid, SIGSTOP, signal::SendInfo::Kernel);
 
     0
 }
@@ -397,9 +435,10 @@ fn ptrace_detach(target_pid: Pid, signal: u32) -> i64 {
     };
 
     // Verify we are the tracer
-    if let Err(e) = ptrace_check_attach(target_tid) {
-        return e;
-    }
+    let _frozen = match ptrace_check_attach(target_tid) {
+        Ok(f) => f,
+        Err(e) => return e,
+    };
 
     {
         let mut table = TASKLIST.write();
@@ -410,6 +449,7 @@ fn ptrace_detach(target_pid: Pid, signal: u32) -> i64 {
 
         // Clear tracing state
         target.ptrace = 0;
+        target.ptrace_frozen = false;
         target.ptracer = None;
         target.ptrace_options = 0;
         target.task.clear_tif(crate::task::tif::SYSCALL_TRACE);
@@ -438,6 +478,7 @@ fn ptrace_wake(tid: Tid, sig: u32) {
             return;
         }
         t.state = TaskState::Ready;
+        t.ptrace_frozen = false;
         t.ptrace_code = sig;
         table.task(tid)
     };
@@ -463,9 +504,10 @@ fn ptrace_resume(target_pid: Pid, request: i64, signal: u32) -> i64 {
     };
 
     // Verify we are the tracer and tracee is stopped
-    if let Err(e) = ptrace_check_attach(target_tid) {
-        return e;
-    }
+    let _frozen = match ptrace_check_attach(target_tid) {
+        Ok(f) => f,
+        Err(e) => return e,
+    };
 
     {
         let mut table = TASKLIST.write();
@@ -566,9 +608,10 @@ fn ptrace_peek_data(target_pid: Pid, addr: u64, data: u64) -> i64 {
     };
 
     // Verify we are the tracer
-    if let Err(e) = ptrace_check_attach(target_tid) {
-        return e;
-    }
+    let _frozen = match ptrace_check_attach(target_tid) {
+        Ok(f) => f,
+        Err(e) => return e,
+    };
 
     // Get target's mm and page table
     let (target_mm, _) = match get_target_mm_and_pt(target_tid) {
@@ -605,9 +648,10 @@ fn ptrace_poke_data(target_pid: Pid, addr: u64, data: u64) -> i64 {
     };
 
     // Verify we are the tracer
-    if let Err(e) = ptrace_check_attach(target_tid) {
-        return e;
-    }
+    let _frozen = match ptrace_check_attach(target_tid) {
+        Ok(f) => f,
+        Err(e) => return e,
+    };
 
     // Get target's mm and page table
     let (target_mm, _) = match get_target_mm_and_pt(target_tid) {
@@ -644,9 +688,10 @@ fn ptrace_setoptions(target_pid: Pid, options: u32) -> i64 {
     };
 
     // Verify we are the tracer
-    if let Err(e) = ptrace_check_attach(target_tid) {
-        return e;
-    }
+    let _frozen = match ptrace_check_attach(target_tid) {
+        Ok(f) => f,
+        Err(e) => return e,
+    };
 
     {
         let mut table = TASKLIST.write();
@@ -666,6 +711,103 @@ fn ptrace_setoptions(target_pid: Pid, options: u32) -> i64 {
 // =============================================================================
 
 /// Get the event message for the last ptrace event.
+/// PTRACE_GETSIGINFO: the stopped tracee's stop siginfo to `data`
+/// (Linux ptrace_getsiginfo): EINVAL if the stop has none
+fn ptrace_getsiginfo(target_pid: Pid, data: u64) -> i64 {
+    let Some(tid) = find_task_by_pid(target_pid) else {
+        return -ESRCH;
+    };
+    let _frozen = match ptrace_check_attach(tid) {
+        Ok(f) => f,
+        Err(e) => return e,
+    };
+    let info = TASKLIST.read().get(tid).and_then(|t| t.last_siginfo);
+    match info {
+        Some(i) => match i.copy_to_user(data) {
+            Ok(()) => 0,
+            Err(e) => e.sysret(),
+        },
+        None => -EINVAL,
+    }
+}
+
+/// PTRACE_SETSIGINFO: replace the stopped tracee's stop siginfo with
+/// the one at `data` (Linux ptrace_setsiginfo): what it delivers if the
+/// tracer resumes it with that signal; EINVAL if the stop has none
+fn ptrace_setsiginfo(target_pid: Pid, data: u64) -> i64 {
+    let Some(tid) = find_task_by_pid(target_pid) else {
+        return -ESRCH;
+    };
+    let _frozen = match ptrace_check_attach(tid) {
+        Ok(f) => f,
+        Err(e) => return e,
+    };
+    let info = match crate::signal::SigInfo::copy_from_user(data) {
+        Ok(i) => i,
+        Err(e) => return e.sysret(),
+    };
+    let mut table = TASKLIST.write();
+    match table.get_mut(tid) {
+        Some(mut t) if t.last_siginfo.is_some() => {
+            t.last_siginfo = Some(info);
+            0
+        }
+        _ => -EINVAL,
+    }
+}
+
+/// PTRACE_PEEKSIGINFO: copy up to `nr` siginfo of the stopped tracee's
+/// queued signals, from the `off`th, its own or (PTRACE_PEEKSIGINFO_SHARED)
+/// its group's, to `data` (Linux ptrace_peek_siginfo): how many
+fn ptrace_peeksiginfo(target_pid: Pid, addr: u64, data: u64) -> i64 {
+    const PTRACE_PEEKSIGINFO_SHARED: u32 = 1;
+    let Some(tid) = find_task_by_pid(target_pid) else {
+        return -ESRCH;
+    };
+    let _frozen = match ptrace_check_attach(tid) {
+        Ok(f) => f,
+        Err(e) => return e,
+    };
+    // struct ptrace_peeksiginfo_args { u64 off; u32 flags; s32 nr; }
+    let mut args = [0u8; 16];
+    if crate::uaccess::copy_from_user::<crate::arch::Uaccess>(&mut args, addr, 16).is_err() {
+        return -EFAULT;
+    }
+    let off = u64::from_ne_bytes(args[..8].try_into().unwrap_or([0; 8]));
+    let flags = u32::from_ne_bytes(args[8..12].try_into().unwrap_or([0; 4]));
+    let nr = i32::from_ne_bytes(args[12..].try_into().unwrap_or([0; 4]));
+    if flags & !PTRACE_PEEKSIGINFO_SHARED != 0 || nr < 0 {
+        return -EINVAL;
+    }
+    let shared = flags & PTRACE_PEEKSIGINFO_SHARED != 0;
+    let mut copied = 0i64;
+    for i in 0..u64::from(nr.unsigned_abs()) {
+        let Some(n) = off.checked_add(i) else {
+            break;
+        };
+        let info = signal::with_task_signal_state(tid, |s| {
+            if shared {
+                s.shared_pending.lock().nth(n)
+            } else {
+                s.pending.nth(n)
+            }
+        })
+        .flatten();
+        let Some(info) = info else {
+            break;
+        };
+        let to = data.wrapping_add(i * 128);
+        if info.copy_to_user(to).is_err() {
+            return if copied > 0 { copied } else { -EFAULT };
+        }
+        copied += 1;
+        if crate::sync::waitqueue::signal_pending() {
+            break;
+        }
+    }
+    copied
+}
+
 fn ptrace_geteventmsg(target_pid: Pid, data: u64) -> i64 {
     let target_tid = match find_task_by_pid(target_pid) {
         Some(tid) => tid,
@@ -673,9 +815,10 @@ fn ptrace_geteventmsg(target_pid: Pid, data: u64) -> i64 {
     };
 
     // Verify we are the tracer
-    if let Err(e) = ptrace_check_attach(target_tid) {
-        return e;
-    }
+    let _frozen = match ptrace_check_attach(target_tid) {
+        Ok(f) => f,
+        Err(e) => return e,
+    };
 
     let message = {
         let table = TASKLIST.read();
@@ -703,9 +846,10 @@ fn ptrace_getregs(target_pid: Pid, data: u64) -> i64 {
     };
 
     // Verify we are the tracer
-    if let Err(e) = ptrace_check_attach(target_tid) {
-        return e;
-    }
+    let _frozen = match ptrace_check_attach(target_tid) {
+        Ok(f) => f,
+        Err(e) => return e,
+    };
 
     // Architecture-specific implementation
     match crate::arch::ptrace::get_user_regs(target_tid) {
@@ -733,9 +877,10 @@ fn ptrace_setregs(target_pid: Pid, data: u64) -> i64 {
     };
 
     // Verify we are the tracer
-    if let Err(e) = ptrace_check_attach(target_tid) {
-        return e;
-    }
+    let _frozen = match ptrace_check_attach(target_tid) {
+        Ok(f) => f,
+        Err(e) => return e,
+    };
 
     // Architecture-specific implementation
     #[cfg(target_arch = "x86_64")]
@@ -783,19 +928,24 @@ fn ptrace_setregs(target_pid: Pid, data: u64) -> i64 {
 /// wait with `code`, and the task sleeps until the tracer resumes it,
 /// detaches or exits, or SIGKILL. Returns the signal the tracer left to
 /// deliver (0: none; always 0 when killed).
-pub fn ptrace_stop(code: u32) -> u32 {
+pub fn ptrace_stop(
+    code: u32,
+    info: Option<crate::signal::SigInfo>,
+) -> (u32, Option<crate::signal::SigInfo>) {
     use percpu::{SleepState, schedule, set_current_state};
     let tid = percpu::current_tid();
     let tracer = {
         let mut table = TASKLIST.write();
         let Some(mut t) = table.get_mut(tid) else {
-            return 0;
+            return (0, info);
         };
         if t.ptrace == 0 {
-            return code;
+            return (code, info);
         }
         t.state = TaskState::Traced(code as i32);
+        t.ptrace_frozen = false;
         t.ptrace_code = code;
+        t.last_siginfo = info;
         // Asleep before the tracer can see the stop (Linux
         // set_special_state(TASK_TRACED) before notifying it): a tracer
         // on another CPU waits for us to switch out
@@ -807,35 +957,56 @@ pub fn ptrace_stop(code: u32) -> u32 {
     // do_notify_parent_cldstop, CLD_TRAPPED)
     super::proc::CHILD_EXIT_WQ.wake_all();
     if let Some(tr) = tracer {
-        signal::send_signal_to_process(tr.pid, signal::SIGCHLD);
+        signal::notify::notify_tracer_trapped(tid, &tr, code);
     }
     loop {
         set_current_state(SleepState::Killable);
-        if !stopped(tid) || signal::fatal_signal_pending() {
+        let (st, frozen) = stop_state(tid);
+        if !st {
             break;
+        }
+        if signal::fatal_signal_pending() {
+            if !frozen {
+                break;
+            }
+            // Killed inside a tracer's request: the stop stays until
+            // the request ends, which wakes us (Linux: SIGKILL does not
+            // wake a JOBCTL_PTRACE_FROZEN tracee); asleep first, then
+            // checked, so that wakeup is never lost
+            set_current_state(SleepState::Uninterruptible);
+            if stop_state(tid) != (true, true) {
+                continue;
+            }
         }
         schedule();
     }
     set_current_state(SleepState::Running);
     let mut table = TASKLIST.write();
     let Some(mut t) = table.get_mut(tid) else {
-        return 0;
+        return (0, None);
     };
+    // The stop's siginfo, as the tracer left it (Linux: last_siginfo
+    // cleared after the stop)
+    let info = t.last_siginfo.take();
+    // Out of the stop: nothing holds it (Linux clears
+    // JOBCTL_PTRACE_FROZEN with the stop)
+    t.ptrace_frozen = false;
     // Killed while stopped: no longer reported, nothing delivered
     if matches!(t.state, TaskState::Traced(_)) {
         t.state = TaskState::Ready;
         t.ptrace_code = 0;
-        return 0;
+        return (0, info);
     }
-    core::mem::take(&mut t.ptrace_code)
+    (core::mem::take(&mut t.ptrace_code), info)
 }
 
-/// The current task is in a ptrace stop
-fn stopped(tid: Tid) -> bool {
+/// The current task is in a ptrace stop, and its tracer inside a
+/// request on it (frozen)
+fn stop_state(tid: Tid) -> (bool, bool) {
     let table = TASKLIST.read();
-    table
-        .get(tid)
-        .is_some_and(|t| matches!(t.state, TaskState::Traced(_)))
+    table.get(tid).map_or((false, false), |t| {
+        (matches!(t.state, TaskState::Traced(_)), t.ptrace_frozen)
+    })
 }
 
 /// A PTRACE_SYSCALL stop at syscall entry or exit (Linux
@@ -859,19 +1030,33 @@ pub fn ptrace_report_syscall(entry: bool) {
     } else {
         SIGTRAP
     };
-    let sig = ptrace_stop(code);
+    // The stop's siginfo (Linux ptrace_do_notify): SIGTRAP, si_code the
+    // stop code, from this thread
+    let info = crate::signal::SigInfo::kill(
+        SIGTRAP,
+        code as i32,
+        tid as i32,
+        crate::task::current_cred().uid,
+    );
+    // Linux send_sig(exit_code, current, 1): SEND_SIG_PRIV
+    let (sig, _) = ptrace_stop(code, Some(info));
     if sig != 0 {
-        signal::send_signal(tid, sig);
+        signal::send_sig_info(tid, sig, signal::SendInfo::Kernel);
     }
 }
 
 /// A traced task dequeued `sig` (not SIGKILL): the tracer sees it first
 /// (Linux ptrace_signal) and may cancel it (0) or change it
-pub fn ptrace_signal(sig: u32) -> u32 {
+pub fn ptrace_signal(info: &mut crate::signal::SigInfo) -> u32 {
+    let sig = info.sig();
     if !is_traced(percpu::current_tid()) {
         return sig;
     }
-    ptrace_stop(sig)
+    let (new, left) = ptrace_stop(sig, Some(*info));
+    if let Some(i) = left {
+        *info = i;
+    }
+    new
 }
 
 /// The exiting task's tracees are detached (Linux exit_ptrace): stopped
@@ -900,6 +1085,7 @@ pub fn exit_ptrace() {
             };
             let kill = t.ptrace_options & PTRACE_O_EXITKILL != 0;
             t.ptrace = 0;
+            t.ptrace_frozen = false;
             t.ptracer = None;
             t.ptrace_options = 0;
             t.task.clear_tif(crate::task::tif::SYSCALL_TRACE);
@@ -954,13 +1140,16 @@ pub fn sys_ptrace(request: i64, pid: i64, addr: u64, data: u64) -> i64 {
         PTRACE_SETOPTIONS => ptrace_setoptions(pid as Pid, data as u32),
         PTRACE_GETEVENTMSG => ptrace_geteventmsg(pid as Pid, data),
 
+        PTRACE_GETSIGINFO => ptrace_getsiginfo(pid as Pid, data),
+        PTRACE_SETSIGINFO => ptrace_setsiginfo(pid as Pid, data),
+        PTRACE_PEEKSIGINFO => ptrace_peeksiginfo(pid as Pid, addr, data),
+
         PTRACE_GETREGS => ptrace_getregs(pid as Pid, data),
         PTRACE_SETREGS => ptrace_setregs(pid as Pid, data),
 
         // Not yet implemented
         PTRACE_PEEKUSER | PTRACE_POKEUSER | PTRACE_GETFPREGS | PTRACE_SETFPREGS
-        | PTRACE_GETREGSET | PTRACE_SETREGSET | PTRACE_GETSIGINFO | PTRACE_SETSIGINFO
-        | PTRACE_INTERRUPT | PTRACE_LISTEN => {
+        | PTRACE_GETREGSET | PTRACE_SETREGSET | PTRACE_INTERRUPT | PTRACE_LISTEN => {
             crate::printkln!("ptrace: unimplemented request {}", request);
             -EINVAL
         }

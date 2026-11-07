@@ -262,14 +262,32 @@ pub struct Out {
     pub err: Option<KernelError>,
     /// Socket shutdown bits to set (Linux sk_shutdown)
     pub shut: u8,
-    /// Wake readers, writers and pollers
-    pub wake: bool,
+    /// Wakeups to make after the lock (`wake::*`)
+    pub wake: u8,
     /// The connection is over (CLOSED): leave the tables
     pub done: bool,
     /// Entered TIME_WAIT: hand over to a timewait entry
     pub timewait: bool,
     /// The handshake completed (SYN_RECEIVED/SYN_SENT -> ESTABLISHED)
     pub established: bool,
+}
+
+/// What an `Out` wakes the socket for
+pub mod wake {
+    /// State change: everyone (Linux sk_state_change)
+    pub const STATE: u8 = 1;
+    /// Data to read (Linux tcp_data_ready)
+    pub const DATA: u8 = 2;
+    /// Room to write (Linux tcp_new_space)
+    pub const SPACE: u8 = 4;
+    /// With STATE: the connection is established (Linux
+    /// tcp_finish_connect / tcp_rcv_state_process: SIGIO POLL_OUT)
+    pub const EST: u8 = 8;
+    /// With STATE: the peer's FIN arrived (Linux tcp_fin: SIGIO POLL_IN,
+    /// POLL_HUP once both directions are shut)
+    pub const FIN: u8 = 16;
+    /// An error was posted under the lock (SIGIO POLL_ERR after it)
+    pub const ERR: u8 = 32;
 }
 
 /// Socket shutdown bits (same values as `net::sock`)
@@ -665,6 +683,9 @@ pub struct TcpCb {
     /// Karn: (sequence that must be acknowledged, send time)
     pub(super) rtt_seq: Option<(u32, u64)>,
     pub(super) syn_rtx: bool,
+    /// A listener's child: in SYN_RECEIVED it is Linux's request sock
+    /// (tcp_check_req rules), not a simultaneous open
+    pub(super) passive: bool,
     pub(super) tmr: Option<(Tmr, u64)>,
     /// TIME_WAIT 2MSL or orphan FIN_WAIT_2 deadline
     pub(super) wait_at: Option<u64>,
@@ -769,6 +790,7 @@ impl TcpCb {
             probes: 0,
             rtt_seq: None,
             syn_rtx: false,
+            passive: false,
             tmr: None,
             wait_at: None,
             keep_at: None,
@@ -839,6 +861,7 @@ impl TcpCb {
         self.ts_ok = self.cfg.ts != 0 && syn.ts.is_some();
         self.syn_rcvd(syn, now);
         self.state = TcpState::SynReceived;
+        self.passive = true;
         out.segs.push(self.syn_seg());
         self.arm_rtx(now);
     }
@@ -1135,7 +1158,7 @@ impl TcpCb {
         self.stop_timers();
         self.mem_settle();
         out.shut |= SHUTDOWN_MASK;
-        out.wake = true;
+        out.wake |= wake::STATE;
         out.done = true;
     }
 
@@ -1147,7 +1170,7 @@ impl TcpCb {
         self.mem_settle();
         self.wait_at = Some(now + TIMEWAIT_LEN);
         out.timewait = true;
-        out.wake = true;
+        out.wake |= wake::STATE;
     }
 
     /// The TIME_WAIT part of this control block: what a timewait
@@ -1162,7 +1185,7 @@ impl TcpCb {
         self.state = TcpState::Closed;
         self.stop_timers();
         out.shut |= SHUTDOWN_MASK;
-        out.wake = true;
+        out.wake |= wake::STATE;
     }
 
     /// Orphan in FIN_WAIT_2: give up after tcp_fin_timeout

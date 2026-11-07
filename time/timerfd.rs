@@ -314,7 +314,7 @@ impl Timerfd {
         }
 
         // Wake any waiting readers
-        self.wait_queue.wake_all();
+        self.wait_queue.wake_poll(u32::from(POLLIN));
     }
 
     /// Re-arm an expired periodic timer for the first period end after
@@ -375,7 +375,7 @@ impl Timerfd {
             inner.moffs = None;
             inner.ticks = inner.ticks.saturating_add(1);
         }
-        self.wait_queue.wake_all();
+        self.wait_queue.wake_poll(u32::from(POLLIN));
     }
 }
 

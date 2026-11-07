@@ -1,0 +1,1278 @@
+//! IPC Tests - pipe, poll, select, splice, and SysV IPC
+//!
+//! Tests for inter-process communication primitives including:
+//! - Pipes and poll/select
+//! - Splice, tee, vmsplice (zero-copy data transfer)
+//! - SysV shared memory (shmget, shmat, shmdt, shmctl)
+//! - SysV semaphores (semget, semop, semctl)
+//! - SysV message queues (msgget, msgsnd, msgrcv, msgctl)
+
+use crate::harness::pass;
+use crate::helpers::{print, print_num, println};
+use hk_syscall::{
+    FdSet, GETALL, GETVAL, IPC_CREAT, IPC_PRIVATE, IPC_RMID, IPC_STAT, IoVec, O_NONBLOCK, O_RDONLY,
+    POLLIN, POLLNVAL, POLLOUT, PollFd, SETALL, SETVAL, Sembuf, Semid64Ds, Timespec, Timeval,
+    sys_clock_gettime, sys_close, sys_msgctl, sys_msgget, sys_msgrcv, sys_msgsnd, sys_open,
+    sys_pipe, sys_pipe2, sys_poll, sys_read, sys_select, sys_semctl, sys_semget, sys_semop,
+    sys_semtimedop, sys_sendfile, sys_shmat, sys_shmctl, sys_shmdt, sys_shmget, sys_splice,
+    sys_tee, sys_vmsplice, sys_write,
+};
+use hk_syscall::{O_CREAT, O_RDWR, O_TRUNC, sys_pread64, sys_unlink};
+
+/// Run all IPC tests
+pub fn run_tests() {
+    println(b"=== IPC Tests ===");
+
+    // Pipe tests
+    test_pipe_basic();
+    test_pipe_read_write();
+    test_pipe_read_edges();
+    test_poll_data_ready();
+    test_poll_no_data();
+    test_poll_invalid_fd();
+    test_poll_write_ready();
+    test_select_data_ready();
+    test_select_no_data();
+    test_poll_empty_timeout();
+    test_select_empty_timeout();
+
+    // Splice tests
+    println(b"--- Splice / Tee / Vmsplice / Sendfile ---");
+    test_splice_pipe_to_pipe();
+    test_splice_invalid_no_pipe();
+    test_splice_provenance();
+    test_tee_pipe_to_pipe();
+    test_tee_invalid_same_pipe();
+    test_vmsplice_to_pipe();
+    test_sendfile_to_pipe();
+    test_sendfile_invalid_pipe_input();
+
+    // SysV IPC tests
+    println(b"--- SysV Shared Memory ---");
+    test_shmget_create();
+    test_shmat_write_read();
+    test_shmctl_rmid();
+
+    println(b"--- SysV Semaphores ---");
+    test_semget_create();
+    test_semctl_setval_getval();
+    test_semctl_ipc_stat();
+    test_semop_increment();
+    test_semtimedop_timeout();
+    test_semctl_all_efault();
+
+    println(b"--- SysV Message Queues ---");
+    test_msgget_create();
+    test_msgsnd_msgrcv();
+    test_msgctl_rmid();
+    test_msgrcv_long_min();
+    test_msgrcv_e2big_order();
+}
+
+/// Test basic pipe creation
+fn test_pipe_basic() {
+    let mut pipefd: [i32; 2] = [0, 0];
+    let ret = sys_pipe(pipefd.as_mut_ptr());
+
+    print(b"pipe() returned ");
+    print_num(ret);
+    print(b", fds=[");
+    print_num(pipefd[0] as i64);
+    print(b", ");
+    print_num(pipefd[1] as i64);
+    println(b"]");
+
+    if ret == 0 && pipefd[0] > 0 && pipefd[1] > 0 {
+        // Clean up
+        sys_close(pipefd[0] as u64);
+        sys_close(pipefd[1] as u64);
+        pass(b"PIPE_CREATE");
+    } else {
+        println(b"PIPE_CREATE:FAIL");
+    }
+}
+
+/// Test pipe read/write
+fn test_pipe_read_write() {
+    let mut pipefd: [i32; 2] = [0, 0];
+    let ret = sys_pipe(pipefd.as_mut_ptr());
+    if ret != 0 {
+        print(b"pipe() failed with ");
+        print_num(ret);
+        println(b"PIPE_RW:FAIL");
+        return;
+    }
+
+    let read_fd = pipefd[0];
+    let write_fd = pipefd[1];
+
+    // Write "hello" to the pipe
+    let msg = b"hello";
+    let written = sys_write(write_fd as u64, msg.as_ptr(), msg.len() as u64);
+
+    print(b"write() returned ");
+    print_num(written);
+
+    if written != 5 {
+        println(b"PIPE_RW:FAIL");
+        sys_close(read_fd as u64);
+        sys_close(write_fd as u64);
+        return;
+    }
+
+    // Read it back
+    let mut buf: [u8; 16] = [0; 16];
+    let read_bytes = sys_read(read_fd as u64, buf.as_mut_ptr(), 16);
+
+    print(b"read() returned ");
+    print_num(read_bytes);
+
+    if read_bytes != 5 {
+        println(b"PIPE_RW:FAIL");
+        sys_close(read_fd as u64);
+        sys_close(write_fd as u64);
+        return;
+    }
+
+    // Verify data matches
+    let matches =
+        buf[0] == b'h' && buf[1] == b'e' && buf[2] == b'l' && buf[3] == b'l' && buf[4] == b'o';
+
+    sys_close(read_fd as u64);
+    sys_close(write_fd as u64);
+
+    if matches {
+        pass(b"PIPE_RW");
+    } else {
+        println(b"PIPE_RW:FAIL");
+    }
+}
+
+/// Linux pipe_read: a zero-length read returns 0 at once (even on an
+/// empty nonblocking pipe), and a read whose copy faults is EFAULT and
+/// leaves the data in the pipe
+fn test_pipe_read_edges() {
+    let mut fds: [i32; 2] = [0, 0];
+    if sys_pipe2(fds.as_mut_ptr(), O_NONBLOCK) != 0 {
+        println(b"PIPE_READ_EDGES:FAIL");
+        return;
+    }
+    let (r, w) = (fds[0] as u64, fds[1] as u64);
+    let mut buf = [0u8; 8];
+    let zero = sys_read(r, buf.as_mut_ptr(), 0);
+    let wrote = sys_write(w, b"abc".as_ptr(), 3);
+    let fault = sys_read(r, 8 as *mut u8, 3);
+    let got = sys_read(r, buf.as_mut_ptr(), 8);
+    sys_close(r);
+    sys_close(w);
+    print(b"zero-read=");
+    print_num(zero);
+    print(b" fault-read=");
+    print_num(fault);
+    print(b" then=");
+    print_num(got);
+    println(b"");
+    if zero == 0 && wrote == 3 && fault == -14 && got == 3 && &buf[..3] == b"abc" {
+        pass(b"PIPE_READ_EDGES");
+    } else {
+        println(b"PIPE_READ_EDGES:FAIL");
+    }
+}
+
+/// Test poll with data ready
+fn test_poll_data_ready() {
+    let mut pipefd: [i32; 2] = [0, 0];
+    if sys_pipe(pipefd.as_mut_ptr()) != 0 {
+        println(b"pipe() failed");
+        println(b"POLL_DATA:FAIL");
+        return;
+    }
+
+    let read_fd = pipefd[0];
+    let write_fd = pipefd[1];
+
+    // Write data to pipe
+    let msg = b"x";
+    sys_write(write_fd as u64, msg.as_ptr(), 1);
+
+    // Poll for read readiness with timeout 0 (immediate)
+    let mut fds = [PollFd::new(read_fd, POLLIN)];
+    let ret = sys_poll(fds.as_mut_ptr(), 1, 0);
+
+    print(b"poll() returned ");
+    print_num(ret);
+    print(b", revents=");
+    print_num(fds[0].revents as i64);
+
+    sys_close(read_fd as u64);
+    sys_close(write_fd as u64);
+
+    // Should return 1 (one fd ready) with POLLIN set
+    if ret == 1 && (fds[0].revents & POLLIN) != 0 {
+        pass(b"POLL_DATA");
+    } else {
+        println(b"POLL_DATA:FAIL");
+    }
+}
+
+/// Test poll with no data (should timeout)
+fn test_poll_no_data() {
+    let mut pipefd: [i32; 2] = [0, 0];
+    if sys_pipe(pipefd.as_mut_ptr()) != 0 {
+        println(b"pipe() failed");
+        println(b"POLL_TIMEOUT:FAIL");
+        return;
+    }
+
+    let read_fd = pipefd[0];
+    let write_fd = pipefd[1];
+
+    // Don't write any data
+    // Poll with timeout 0 (immediate return)
+    let mut fds = [PollFd::new(read_fd, POLLIN)];
+    let ret = sys_poll(fds.as_mut_ptr(), 1, 0);
+
+    print(b"poll() returned ");
+    print_num(ret);
+    print(b", revents=");
+    print_num(fds[0].revents as i64);
+
+    sys_close(read_fd as u64);
+    sys_close(write_fd as u64);
+
+    // Should return 0 (no fds ready, timeout)
+    if ret == 0 {
+        pass(b"POLL_TIMEOUT");
+    } else {
+        println(b"POLL_TIMEOUT:FAIL");
+    }
+}
+
+/// Test poll with invalid fd
+fn test_poll_invalid_fd() {
+    // Poll a clearly invalid fd
+    let mut fds = [PollFd::new(9999, POLLIN)];
+    let ret = sys_poll(fds.as_mut_ptr(), 1, 0);
+
+    print(b"poll() returned ");
+    print_num(ret);
+    print(b", revents=");
+    print_num(fds[0].revents as i64);
+
+    // poll() should return 1 with POLLNVAL set in revents (not EBADF)
+    if ret == 1 && (fds[0].revents & POLLNVAL) != 0 {
+        pass(b"POLL_INVALID");
+    } else {
+        println(b"POLL_INVALID:FAIL");
+    }
+}
+
+/// Test poll for write readiness on pipe
+fn test_poll_write_ready() {
+    let mut pipefd: [i32; 2] = [0, 0];
+    if sys_pipe(pipefd.as_mut_ptr()) != 0 {
+        println(b"pipe() failed");
+        println(b"POLL_WRITE:FAIL");
+        return;
+    }
+
+    let read_fd = pipefd[0];
+    let write_fd = pipefd[1];
+
+    // Poll write end - should be ready (buffer empty)
+    let mut fds = [PollFd::new(write_fd, POLLOUT)];
+    let ret = sys_poll(fds.as_mut_ptr(), 1, 0);
+
+    print(b"poll() returned ");
+    print_num(ret);
+    print(b", revents=");
+    print_num(fds[0].revents as i64);
+
+    sys_close(read_fd as u64);
+    sys_close(write_fd as u64);
+
+    // Should return 1 (write fd ready) with POLLOUT set
+    if ret == 1 && (fds[0].revents & POLLOUT) != 0 {
+        pass(b"POLL_WRITE");
+    } else {
+        println(b"POLL_WRITE:FAIL");
+    }
+}
+
+/// Test select with data ready
+fn test_select_data_ready() {
+    let mut pipefd: [i32; 2] = [0, 0];
+    if sys_pipe(pipefd.as_mut_ptr()) != 0 {
+        println(b"pipe() failed");
+        println(b"SELECT_DATA:FAIL");
+        return;
+    }
+
+    let read_fd = pipefd[0];
+    let write_fd = pipefd[1];
+
+    // Write data to pipe
+    let msg = b"x";
+    sys_write(write_fd as u64, msg.as_ptr(), 1);
+
+    // Set up fd_set for read_fd
+    let mut readfds = FdSet::new();
+    readfds.zero(); // Ensure proper zeroing (volatile writes)
+    readfds.set(read_fd);
+
+    // Timeout 0 (immediate)
+    let mut tv = Timeval {
+        tv_sec: 0,
+        tv_usec: 0,
+    };
+
+    let ret = sys_select(
+        read_fd + 1,
+        &mut readfds,
+        core::ptr::null_mut(),
+        core::ptr::null_mut(),
+        &mut tv,
+    );
+
+    print(b"select() returned ");
+    print_num(ret);
+    print(b", is_set=");
+    print_num(if readfds.is_set(read_fd) { 1 } else { 0 });
+
+    sys_close(read_fd as u64);
+    sys_close(write_fd as u64);
+
+    // Should return 1 (one fd ready) with read_fd still set
+    if ret == 1 && readfds.is_set(read_fd) {
+        pass(b"SELECT_DATA");
+    } else {
+        println(b"SELECT_DATA:FAIL");
+    }
+}
+
+/// Test select with no data
+fn test_select_no_data() {
+    let mut pipefd: [i32; 2] = [0, 0];
+    if sys_pipe(pipefd.as_mut_ptr()) != 0 {
+        println(b"pipe() failed");
+        println(b"SELECT_TIMEOUT:FAIL");
+        return;
+    }
+
+    let read_fd = pipefd[0];
+    let write_fd = pipefd[1];
+
+    // Don't write data
+    let mut readfds = FdSet::new();
+    readfds.zero(); // Ensure proper zeroing (volatile writes)
+    readfds.set(read_fd);
+
+    // Timeout 0 (immediate)
+    let mut tv = Timeval {
+        tv_sec: 0,
+        tv_usec: 0,
+    };
+
+    let ret = sys_select(
+        read_fd + 1,
+        &mut readfds,
+        core::ptr::null_mut(),
+        core::ptr::null_mut(),
+        &mut tv,
+    );
+
+    print(b"select() returned ");
+    print_num(ret);
+
+    sys_close(read_fd as u64);
+    sys_close(write_fd as u64);
+
+    // Should return 0 (timeout, no fds ready)
+    // Note: select clears the fd_set on timeout
+    if ret == 0 {
+        pass(b"SELECT_TIMEOUT");
+    } else {
+        println(b"SELECT_TIMEOUT:FAIL");
+    }
+}
+
+// ============================================================================
+// SysV Shared Memory Tests
+// ============================================================================
+
+/// Test shmget() to create a shared memory segment
+fn test_shmget_create() {
+    // Create a 4KB shared memory segment
+    let shmid = sys_shmget(IPC_PRIVATE, 4096, IPC_CREAT | 0o666);
+
+    print(b"shmget(IPC_PRIVATE, 4096) returned ");
+    print_num(shmid);
+
+    if shmid >= 0 {
+        // Clean up
+        sys_shmctl(shmid as i32, IPC_RMID, 0);
+        println(b" SHMGET_CREATE:OK");
+    } else {
+        println(b" SHMGET_CREATE:FAIL");
+    }
+}
+
+/// Test shmat() to attach and write/read from shared memory
+fn test_shmat_write_read() {
+    // Create a 4KB shared memory segment
+    let shmid = sys_shmget(IPC_PRIVATE, 4096, IPC_CREAT | 0o666);
+    if shmid < 0 {
+        print(b"shmget failed: ");
+        print_num(shmid);
+        println(b" SHMAT_RW:FAIL");
+        return;
+    }
+
+    // Attach the segment (kernel chooses address)
+    let addr = sys_shmat(shmid as i32, 0, 0);
+
+    print(b"shmat() returned 0x");
+    // Print address in hex
+    let addr_val = addr as u64;
+    let hex_chars: [u8; 16] = *b"0123456789abcdef";
+    let mut hex_buf: [u8; 16] = [0; 16];
+    let mut val = addr_val;
+    for i in (0..16).rev() {
+        hex_buf[i] = hex_chars[(val & 0xf) as usize];
+        val >>= 4;
+    }
+    print(&hex_buf);
+
+    if addr < 0 {
+        println(b" SHMAT_RW:FAIL");
+        sys_shmctl(shmid as i32, IPC_RMID, 0);
+        return;
+    }
+
+    // Write a magic value to the shared memory
+    let ptr = addr as *mut u64;
+    unsafe {
+        core::ptr::write_volatile(ptr, 0xDEADBEEF_CAFEBABE);
+    }
+
+    // Read it back
+    let read_val = unsafe { core::ptr::read_volatile(ptr) };
+
+    print(b" wrote/read=0x");
+    let mut val2 = read_val;
+    let mut hex_buf2: [u8; 16] = [0; 16];
+    for i in (0..16).rev() {
+        hex_buf2[i] = hex_chars[(val2 & 0xf) as usize];
+        val2 >>= 4;
+    }
+    print(&hex_buf2);
+
+    // Detach
+    let dt_ret = sys_shmdt(addr as u64);
+
+    // Clean up
+    sys_shmctl(shmid as i32, IPC_RMID, 0);
+
+    if read_val == 0xDEADBEEF_CAFEBABE && dt_ret == 0 {
+        println(b" SHMAT_RW:OK");
+    } else {
+        println(b" SHMAT_RW:FAIL");
+    }
+}
+
+/// Test shmctl() IPC_RMID to remove a shared memory segment
+fn test_shmctl_rmid() {
+    // Create a segment
+    let shmid = sys_shmget(IPC_PRIVATE, 4096, IPC_CREAT | 0o666);
+    if shmid < 0 {
+        println(b"shmget failed SHMCTL_RMID:FAIL");
+        return;
+    }
+
+    // Remove it
+    let ret = sys_shmctl(shmid as i32, IPC_RMID, 0);
+
+    print(b"shmctl(IPC_RMID) returned ");
+    print_num(ret);
+
+    if ret == 0 {
+        println(b" SHMCTL_RMID:OK");
+    } else {
+        println(b" SHMCTL_RMID:FAIL");
+    }
+}
+
+// ============================================================================
+// SysV Semaphore Tests
+// ============================================================================
+
+/// Test semget() to create a semaphore set
+fn test_semget_create() {
+    // Create a semaphore set with 1 semaphore
+    let semid = sys_semget(IPC_PRIVATE, 1, IPC_CREAT | 0o666);
+
+    print(b"semget(IPC_PRIVATE, 1) returned ");
+    print_num(semid);
+
+    if semid >= 0 {
+        // Clean up
+        sys_semctl(semid as i32, 0, IPC_RMID, 0);
+        println(b" SEMGET_CREATE:OK");
+    } else {
+        println(b" SEMGET_CREATE:FAIL");
+    }
+}
+
+/// Test semctl() SETVAL/GETVAL
+fn test_semctl_setval_getval() {
+    // Create a semaphore set
+    let semid = sys_semget(IPC_PRIVATE, 1, IPC_CREAT | 0o666);
+    if semid < 0 {
+        println(b"semget failed SEMCTL_VAL:FAIL");
+        return;
+    }
+
+    // Set value to 42
+    let set_ret = sys_semctl(semid as i32, 0, SETVAL, 42);
+    print(b"semctl(SETVAL, 42) returned ");
+    print_num(set_ret);
+
+    if set_ret < 0 {
+        sys_semctl(semid as i32, 0, IPC_RMID, 0);
+        println(b" SEMCTL_VAL:FAIL");
+        return;
+    }
+
+    // Get value back
+    let val = sys_semctl(semid as i32, 0, GETVAL, 0);
+    print(b" semctl(GETVAL) returned ");
+    print_num(val);
+
+    // Clean up
+    sys_semctl(semid as i32, 0, IPC_RMID, 0);
+
+    if val == 42 {
+        println(b" SEMCTL_VAL:OK");
+    } else {
+        println(b" SEMCTL_VAL:FAIL");
+    }
+}
+
+/// Test semctl(IPC_STAT): semid64_ds layout (differs x86_64 vs asm-generic)
+fn test_semctl_ipc_stat() {
+    let semid = sys_semget(IPC_PRIVATE, 3, IPC_CREAT | 0o640);
+    if semid < 0 {
+        println(b"SEMCTL_IPC_STAT:FAIL: semget failed");
+        return;
+    }
+    let mut ds = Semid64Ds::default();
+    let ret = sys_semctl(semid as i32, 0, IPC_STAT, &mut ds as *mut Semid64Ds as u64);
+    sys_semctl(semid as i32, 0, IPC_RMID, 0);
+    let (nsems, mode, ctime) = (ds.sem_nsems, ds.sem_perm.mode, ds.sem_ctime);
+    if ret == 0 && nsems == 3 && mode & 0o777 == 0o640 && ctime > 0 {
+        pass(b"SEMCTL_IPC_STAT");
+    } else {
+        print(b"SEMCTL_IPC_STAT:FAIL: ret=");
+        print_num(ret);
+        print(b" nsems=");
+        print_num(nsems as i64);
+        print(b" mode=");
+        print_num((mode & 0o777) as i64);
+        print(b" ctime=");
+        print_num(ctime);
+        println(b"");
+    }
+}
+
+/// Test semop() to increment a semaphore
+fn test_semop_increment() {
+    // Create a semaphore set
+    let semid = sys_semget(IPC_PRIVATE, 1, IPC_CREAT | 0o666);
+    if semid < 0 {
+        println(b"semget failed SEMOP_INC:FAIL");
+        return;
+    }
+
+    // Set initial value to 5
+    sys_semctl(semid as i32, 0, SETVAL, 5);
+
+    // Increment by 3
+    let sop = Sembuf::new(0, 3, 0);
+    let ret = sys_semop(semid as i32, &sop, 1);
+
+    print(b"semop(+3) returned ");
+    print_num(ret);
+
+    // Get new value
+    let val = sys_semctl(semid as i32, 0, GETVAL, 0);
+    print(b" new value=");
+    print_num(val);
+
+    // Clean up
+    sys_semctl(semid as i32, 0, IPC_RMID, 0);
+
+    if ret == 0 && val == 8 {
+        println(b" SEMOP_INC:OK");
+    } else {
+        println(b" SEMOP_INC:FAIL");
+    }
+}
+
+/// Test semtimedop() with timeout - should return EAGAIN when operation can't complete in time
+fn test_semtimedop_timeout() {
+    // Create a semaphore set with 1 semaphore
+    let semid = sys_semget(IPC_PRIVATE, 1, IPC_CREAT | 0o666);
+    if semid < 0 {
+        println(b"semget failed SEMTIMEDOP_TIMEOUT:FAIL");
+        return;
+    }
+
+    // Set initial value to 0
+    sys_semctl(semid as i32, 0, SETVAL, 0);
+
+    // Try to decrement (which would block) with a very short timeout
+    // -1 means "decrement by 1" - this will block because value is 0
+    let sop = Sembuf::new(0, -1, 0);
+    let timeout = Timespec {
+        tv_sec: 0,
+        tv_nsec: 1_000_000,
+    }; // 1ms timeout
+
+    let ret = sys_semtimedop(semid as i32, &sop, 1, &timeout);
+
+    print(b"semtimedop(-1, 1ms timeout) returned ");
+    print_num(ret);
+
+    // Clean up
+    sys_semctl(semid as i32, 0, IPC_RMID, 0);
+
+    // Should return EAGAIN (-11) because operation couldn't complete in time
+    if ret == -11 {
+        println(b" SEMTIMEDOP_TIMEOUT:OK");
+    } else {
+        println(b" SEMTIMEDOP_TIMEOUT:FAIL");
+    }
+}
+
+// ============================================================================
+// SysV Message Queue Tests
+// ============================================================================
+
+/// Test msgget() to create a message queue
+fn test_msgget_create() {
+    // Create a message queue
+    let msqid = sys_msgget(IPC_PRIVATE, IPC_CREAT | 0o666);
+
+    print(b"msgget(IPC_PRIVATE) returned ");
+    print_num(msqid);
+
+    if msqid >= 0 {
+        // Clean up
+        sys_msgctl(msqid as i32, IPC_RMID, 0);
+        println(b" MSGGET_CREATE:OK");
+    } else {
+        println(b" MSGGET_CREATE:FAIL");
+    }
+}
+
+/// Message structure for testing
+#[repr(C)]
+struct TestMsg {
+    mtype: i64,
+    mtext: [u8; 32],
+}
+
+/// Test msgsnd/msgrcv
+fn test_msgsnd_msgrcv() {
+    // Create a message queue
+    let msqid = sys_msgget(IPC_PRIVATE, IPC_CREAT | 0o666);
+    if msqid < 0 {
+        println(b"msgget failed MSGSND_MSGRCV:FAIL");
+        return;
+    }
+
+    // Send a message
+    let mut send_msg = TestMsg {
+        mtype: 1,
+        mtext: [0; 32],
+    };
+    let text = b"Hello, MQ!";
+    send_msg.mtext[..text.len()].copy_from_slice(text);
+
+    let send_ret = sys_msgsnd(
+        msqid as i32,
+        &send_msg as *const TestMsg as *const u8,
+        text.len(),
+        0,
+    );
+
+    print(b"msgsnd() returned ");
+    print_num(send_ret);
+
+    if send_ret < 0 {
+        sys_msgctl(msqid as i32, IPC_RMID, 0);
+        println(b" MSGSND_MSGRCV:FAIL");
+        return;
+    }
+
+    // Receive the message
+    let mut recv_msg = TestMsg {
+        mtype: 0,
+        mtext: [0; 32],
+    };
+
+    let recv_ret = sys_msgrcv(
+        msqid as i32,
+        &mut recv_msg as *mut TestMsg as *mut u8,
+        32,
+        0, // Receive any message type
+        0,
+    );
+
+    print(b" msgrcv() returned ");
+    print_num(recv_ret);
+
+    // Clean up
+    sys_msgctl(msqid as i32, IPC_RMID, 0);
+
+    // Verify the message
+    let matches = recv_ret >= 0
+        && recv_msg.mtype == 1
+        && recv_msg.mtext[0] == b'H'
+        && recv_msg.mtext[1] == b'e'
+        && recv_msg.mtext[2] == b'l';
+
+    if matches {
+        println(b" MSGSND_MSGRCV:OK");
+    } else {
+        println(b" MSGSND_MSGRCV:FAIL");
+    }
+}
+
+/// Test msgctl() IPC_RMID
+fn test_msgctl_rmid() {
+    // Create a queue
+    let msqid = sys_msgget(IPC_PRIVATE, IPC_CREAT | 0o666);
+    if msqid < 0 {
+        println(b"msgget failed MSGCTL_RMID:FAIL");
+        return;
+    }
+
+    // Remove it
+    let ret = sys_msgctl(msqid as i32, IPC_RMID, 0);
+
+    print(b"msgctl(IPC_RMID) returned ");
+    print_num(ret);
+
+    if ret == 0 {
+        println(b" MSGCTL_RMID:OK");
+    } else {
+        println(b" MSGCTL_RMID:FAIL");
+    }
+}
+
+// =============================================================================
+// Splice / Tee / Vmsplice Tests
+// =============================================================================
+
+/// Test splice between two pipes
+fn test_splice_pipe_to_pipe() {
+    // Create source pipe
+    let mut src_pipe: [i32; 2] = [0, 0];
+    if sys_pipe(src_pipe.as_mut_ptr()) != 0 {
+        println(b"SPLICE_P2P:FAIL (src pipe)");
+        return;
+    }
+
+    // Create destination pipe
+    let mut dst_pipe: [i32; 2] = [0, 0];
+    if sys_pipe(dst_pipe.as_mut_ptr()) != 0 {
+        sys_close(src_pipe[0] as u64);
+        sys_close(src_pipe[1] as u64);
+        println(b"SPLICE_P2P:FAIL (dst pipe)");
+        return;
+    }
+
+    // Write data to source pipe
+    let msg = b"splice!";
+    let written = sys_write(src_pipe[1] as u64, msg.as_ptr(), msg.len() as u64);
+    if written != msg.len() as i64 {
+        sys_close(src_pipe[0] as u64);
+        sys_close(src_pipe[1] as u64);
+        sys_close(dst_pipe[0] as u64);
+        sys_close(dst_pipe[1] as u64);
+        println(b"SPLICE_P2P:FAIL (write)");
+        return;
+    }
+
+    // Splice from source to destination
+    let spliced = sys_splice(
+        src_pipe[0],
+        core::ptr::null_mut(),
+        dst_pipe[1],
+        core::ptr::null_mut(),
+        msg.len(),
+        0,
+    );
+
+    print(b"splice(p2p) returned ");
+    print_num(spliced);
+
+    if spliced == msg.len() as i64 {
+        // Read from destination and verify
+        let mut buf = [0u8; 16];
+        let read = sys_read(dst_pipe[0] as u64, buf.as_mut_ptr(), 16);
+        if read == msg.len() as i64 && &buf[..msg.len()] == msg {
+            println(b" SPLICE_P2P:OK");
+        } else {
+            println(b" SPLICE_P2P:FAIL (verify)");
+        }
+    } else {
+        println(b" SPLICE_P2P:FAIL");
+    }
+
+    // Cleanup
+    sys_close(src_pipe[0] as u64);
+    sys_close(src_pipe[1] as u64);
+    sys_close(dst_pipe[0] as u64);
+    sys_close(dst_pipe[1] as u64);
+}
+
+/// Test that splice returns EINVAL when neither fd is a pipe
+/// Dirty Pipe (CVE-2022-0847): data spliced from a file into a pipe,
+/// then written after into the same pipe, must not land in the file's
+/// page cache (a page from a file is never merged into)
+fn test_splice_provenance() {
+    let path = b"/tmp/splice_prov\0";
+    let f = sys_open(path.as_ptr(), O_CREAT | O_RDWR | O_TRUNC, 0o644) as i32;
+    sys_write(f as u64, [b'A'; 64].as_ptr(), 64);
+    let mut p = [0i32; 2];
+    sys_pipe(p.as_mut_ptr());
+    let mut off: i64 = 0;
+    let s = sys_splice(f, &mut off, p[1], core::ptr::null_mut(), 8, 0);
+    let w = sys_write(p[1] as u64, b"XXXXXXXX".as_ptr(), 8);
+    let mut b = [0u8; 64];
+    let r = sys_pread64(f, b.as_mut_ptr(), 64, 0);
+    let mut q = [0u8; 16];
+    let n = sys_read(p[0] as u64, q.as_mut_ptr(), 16);
+    for fd in [f, p[0], p[1]] {
+        sys_close(fd as u64);
+    }
+    sys_unlink(path.as_ptr());
+    let ok = s == 8
+        && w == 8
+        && r == 64
+        && b.iter().all(|&c| c == b'A')
+        && n == 16
+        && &q == b"AAAAAAAAXXXXXXXX";
+    print(b"SPLICE_PROVENANCE");
+    if ok {
+        println(b":OK");
+    } else {
+        print(b":FAIL file ");
+        print_num(r);
+        print(b" pipe ");
+        print_num(n);
+        println(b"");
+    }
+}
+
+fn test_splice_invalid_no_pipe() {
+    // splice with invalid fd should fail
+    let ret = sys_splice(
+        9999,
+        core::ptr::null_mut(),
+        9998,
+        core::ptr::null_mut(),
+        100,
+        0,
+    );
+
+    print(b"splice(no pipe) returned ");
+    print_num(ret);
+
+    // Should return EBADF (-9) or EINVAL (-22)
+    if ret < 0 {
+        println(b" SPLICE_NO_PIPE:OK");
+    } else {
+        println(b" SPLICE_NO_PIPE:FAIL");
+    }
+}
+
+/// Test tee between two pipes
+fn test_tee_pipe_to_pipe() {
+    // Create source pipe
+    let mut src_pipe: [i32; 2] = [0, 0];
+    if sys_pipe(src_pipe.as_mut_ptr()) != 0 {
+        println(b"TEE_P2P:FAIL (src pipe)");
+        return;
+    }
+
+    // Create destination pipe
+    let mut dst_pipe: [i32; 2] = [0, 0];
+    if sys_pipe(dst_pipe.as_mut_ptr()) != 0 {
+        sys_close(src_pipe[0] as u64);
+        sys_close(src_pipe[1] as u64);
+        println(b"TEE_P2P:FAIL (dst pipe)");
+        return;
+    }
+
+    // Write data to source pipe
+    let msg = b"tee!";
+    let written = sys_write(src_pipe[1] as u64, msg.as_ptr(), msg.len() as u64);
+    if written != msg.len() as i64 {
+        sys_close(src_pipe[0] as u64);
+        sys_close(src_pipe[1] as u64);
+        sys_close(dst_pipe[0] as u64);
+        sys_close(dst_pipe[1] as u64);
+        println(b"TEE_P2P:FAIL (write)");
+        return;
+    }
+
+    // Tee from source to destination (does not consume source)
+    let teed = sys_tee(src_pipe[0], dst_pipe[1], msg.len(), 0);
+
+    print(b"tee(p2p) returned ");
+    print_num(teed);
+
+    if teed == msg.len() as i64 {
+        // Read from destination
+        let mut buf = [0u8; 16];
+        let read = sys_read(dst_pipe[0] as u64, buf.as_mut_ptr(), 16);
+
+        // Also verify source still has data (tee doesn't consume)
+        let mut src_buf = [0u8; 16];
+        let src_read = sys_read(src_pipe[0] as u64, src_buf.as_mut_ptr(), 16);
+
+        if read == msg.len() as i64 && src_read == msg.len() as i64 {
+            println(b" TEE_P2P:OK");
+        } else {
+            println(b" TEE_P2P:FAIL (verify)");
+        }
+    } else {
+        println(b" TEE_P2P:FAIL");
+    }
+
+    // Cleanup
+    sys_close(src_pipe[0] as u64);
+    sys_close(src_pipe[1] as u64);
+    sys_close(dst_pipe[0] as u64);
+    sys_close(dst_pipe[1] as u64);
+}
+
+/// Test that tee to the same pipe returns EINVAL
+fn test_tee_invalid_same_pipe() {
+    let mut pipefd: [i32; 2] = [0, 0];
+    if sys_pipe(pipefd.as_mut_ptr()) != 0 {
+        println(b"TEE_SAME:FAIL (pipe)");
+        return;
+    }
+
+    // Write some data
+    let msg = b"x";
+    sys_write(pipefd[1] as u64, msg.as_ptr(), 1);
+
+    // Tee to same pipe should fail
+    let ret = sys_tee(pipefd[0], pipefd[1], 1, 0);
+
+    print(b"tee(same pipe) returned ");
+    print_num(ret);
+
+    // Should return EINVAL (-22)
+    if ret == -22 {
+        println(b" TEE_SAME:OK");
+    } else {
+        println(b" TEE_SAME:FAIL");
+    }
+
+    sys_close(pipefd[0] as u64);
+    sys_close(pipefd[1] as u64);
+}
+
+/// Test vmsplice to write user memory into pipe
+fn test_vmsplice_to_pipe() {
+    let mut pipefd: [i32; 2] = [0, 0];
+    if sys_pipe(pipefd.as_mut_ptr()) != 0 {
+        println(b"VMSPLICE:FAIL (pipe)");
+        return;
+    }
+
+    // Prepare user buffer
+    let msg = b"vmsplice!";
+    let iov = IoVec {
+        iov_base: msg.as_ptr(),
+        iov_len: msg.len(),
+    };
+
+    // vmsplice user memory into pipe
+    let spliced = sys_vmsplice(pipefd[1], &iov as *const IoVec, 1, 0);
+
+    print(b"vmsplice() returned ");
+    print_num(spliced);
+
+    if spliced == msg.len() as i64 {
+        // Read from pipe and verify
+        let mut buf = [0u8; 16];
+        let read = sys_read(pipefd[0] as u64, buf.as_mut_ptr(), 16);
+        if read == msg.len() as i64 && &buf[..msg.len()] == msg {
+            println(b" VMSPLICE:OK");
+        } else {
+            println(b" VMSPLICE:FAIL (verify)");
+        }
+    } else {
+        println(b" VMSPLICE:FAIL");
+    }
+
+    sys_close(pipefd[0] as u64);
+    sys_close(pipefd[1] as u64);
+}
+
+/// Test sendfile from file to pipe
+fn test_sendfile_to_pipe() {
+    // Open a test file (ramfs test.txt exists with "Hello from ramfs!")
+    let fd = sys_open(b"/test.txt\0".as_ptr(), O_RDONLY, 0);
+    if fd < 0 {
+        print(b"sendfile: open returned ");
+        print_num(fd);
+        println(b" SENDFILE_PIPE:SKIP (no test file)");
+        return;
+    }
+
+    // Create destination pipe
+    let mut pipefd: [i32; 2] = [0, 0];
+    if sys_pipe(pipefd.as_mut_ptr()) != 0 {
+        sys_close(fd as u64);
+        println(b"SENDFILE_PIPE:FAIL (pipe)");
+        return;
+    }
+
+    // Sendfile from file to pipe
+    let sent = sys_sendfile(pipefd[1], fd as i32, core::ptr::null_mut(), 17);
+
+    print(b"sendfile(file->pipe) returned ");
+    print_num(sent);
+
+    if sent > 0 {
+        // Read from pipe and verify
+        let mut buf = [0u8; 32];
+        let read = sys_read(pipefd[0] as u64, buf.as_mut_ptr(), 32);
+        if read == sent {
+            println(b" SENDFILE_PIPE:OK");
+        } else {
+            print(b" read=");
+            print_num(read);
+            println(b" SENDFILE_PIPE:FAIL (verify)");
+        }
+    } else {
+        println(b" SENDFILE_PIPE:FAIL");
+    }
+
+    sys_close(fd as u64);
+    sys_close(pipefd[0] as u64);
+    sys_close(pipefd[1] as u64);
+}
+
+/// Test that sendfile with pipe as input returns EINVAL
+fn test_sendfile_invalid_pipe_input() {
+    // Create a pipe
+    let mut pipefd: [i32; 2] = [0, 0];
+    if sys_pipe(pipefd.as_mut_ptr()) != 0 {
+        println(b"SENDFILE_INV:FAIL (pipe)");
+        return;
+    }
+
+    // Create another pipe as destination
+    let mut dst_pipe: [i32; 2] = [0, 0];
+    if sys_pipe(dst_pipe.as_mut_ptr()) != 0 {
+        sys_close(pipefd[0] as u64);
+        sys_close(pipefd[1] as u64);
+        println(b"SENDFILE_INV:FAIL (dst pipe)");
+        return;
+    }
+
+    // Write some data to source pipe
+    sys_write(pipefd[1] as u64, b"x".as_ptr(), 1);
+
+    // sendfile with pipe as input should return EINVAL
+    let ret = sys_sendfile(dst_pipe[1], pipefd[0], core::ptr::null_mut(), 1);
+
+    print(b"sendfile(pipe input) returned ");
+    print_num(ret);
+
+    // Should return EINVAL (-22)
+    if ret == -22 {
+        println(b" SENDFILE_INV:OK");
+    } else {
+        println(b" SENDFILE_INV:FAIL");
+    }
+
+    sys_close(pipefd[0] as u64);
+    sys_close(pipefd[1] as u64);
+    sys_close(dst_pipe[0] as u64);
+    sys_close(dst_pipe[1] as u64);
+}
+
+/// Test semctl() GETALL/SETALL error paths: a bad user pointer must yield
+/// -EFAULT and leave the set fully usable and removable afterwards.
+fn test_semctl_all_efault() {
+    const EFAULT: i64 = -14;
+    const BAD_ADDR: u64 = 0xffff_8000_0000_0000; // kernel half
+
+    let semid = sys_semget(IPC_PRIVATE, 3, IPC_CREAT | 0o666);
+    if semid < 0 {
+        println(b"semget failed SEMCTL_ALL_EFAULT:FAIL");
+        return;
+    }
+    let semid = semid as i32;
+
+    let get_bad = sys_semctl(semid, 0, GETALL, BAD_ADDR);
+    let set_bad = sys_semctl(semid, 0, SETALL, BAD_ADDR);
+
+    let vals: [u16; 3] = [7, 8, 9];
+    let set_ok = sys_semctl(semid, 0, SETALL, vals.as_ptr() as u64);
+    let mut out: [u16; 3] = [0; 3];
+    let get_ok = sys_semctl(semid, 0, GETALL, out.as_mut_ptr() as u64);
+    let rmid = sys_semctl(semid, 0, IPC_RMID, 0);
+    let after = sys_semctl(semid, 0, GETVAL, 0);
+
+    print(b"semctl GETALL(bad)=");
+    print_num(get_bad);
+    print(b" SETALL(bad)=");
+    print_num(set_bad);
+    print(b" SETALL=");
+    print_num(set_ok);
+    print(b" GETALL=");
+    print_num(get_ok);
+    print(b" RMID=");
+    print_num(rmid);
+    print(b" GETVAL(after rmid)=");
+    print_num(after);
+
+    if get_bad == EFAULT
+        && set_bad == EFAULT
+        && set_ok == 0
+        && get_ok == 0
+        && out == vals
+        && rmid == 0
+        && after < 0
+    {
+        println(b" SEMCTL_ALL_EFAULT:OK");
+    } else {
+        println(b" SEMCTL_ALL_EFAULT:FAIL");
+    }
+}
+
+/// Monotonic time in milliseconds
+fn mono_ms() -> i64 {
+    let mut ts = Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    sys_clock_gettime(1, &mut ts); // CLOCK_MONOTONIC
+    ts.tv_sec * 1000 + ts.tv_nsec / 1_000_000
+}
+
+/// Test: poll(NULL, 0, 30) is a plain 30ms sleep returning 0
+fn test_poll_empty_timeout() {
+    let t0 = mono_ms();
+    let ret = sys_poll(core::ptr::null_mut(), 0, 30);
+    let dt = mono_ms() - t0;
+    if ret == 0 && (20..2000).contains(&dt) {
+        pass(b"POLL_EMPTY_TIMEOUT");
+    } else {
+        print(b"POLL_EMPTY_TIMEOUT:FAIL: ret=");
+        print_num(ret);
+        print(b" elapsed_ms=");
+        print_num(dt);
+        println(b"");
+    }
+}
+
+/// Test: select(0, NULL, NULL, NULL, 30ms) is a plain sleep returning 0
+fn test_select_empty_timeout() {
+    let mut tv = Timeval {
+        tv_sec: 0,
+        tv_usec: 30_000,
+    };
+    let null = core::ptr::null_mut();
+    let t0 = mono_ms();
+    let ret = sys_select(0, null, null, null, &mut tv);
+    let dt = mono_ms() - t0;
+    if ret == 0 && (20..2000).contains(&dt) {
+        pass(b"SELECT_EMPTY_TIMEOUT");
+    } else {
+        print(b"SELECT_EMPTY_TIMEOUT:FAIL: ret=");
+        print_num(ret);
+        print(b" elapsed_ms=");
+        print_num(dt);
+        println(b"");
+    }
+}
+
+/// Send a `len`-byte message of type `mtype`
+fn msg_send(msqid: i32, mtype: i64, len: usize) -> i64 {
+    let m = TestMsg {
+        mtype,
+        mtext: [b'x'; 32],
+    };
+    sys_msgsnd(
+        msqid,
+        &m as *const TestMsg as *const u8,
+        len,
+        hk_syscall::IPC_NOWAIT,
+    )
+}
+
+/// msgrcv into a `size`-byte buffer; (result, type received)
+fn msg_recv(msqid: i32, size: usize, msgtyp: i64) -> (i64, i64) {
+    let mut m = TestMsg {
+        mtype: 0,
+        mtext: [0; 32],
+    };
+    let r = sys_msgrcv(
+        msqid,
+        &mut m as *mut TestMsg as *mut u8,
+        size,
+        msgtyp,
+        hk_syscall::IPC_NOWAIT,
+    );
+    (r, m.mtype)
+}
+
+/// msgtyp = LONG_MIN takes the lowest type (Linux: as LONG_MAX)
+fn test_msgrcv_long_min() {
+    let msqid = sys_msgget(IPC_PRIVATE, IPC_CREAT | 0o666) as i32;
+    let sent = msqid >= 0 && msg_send(msqid, 7, 4) == 0 && msg_send(msqid, 5, 4) == 0;
+    let (r, t) = msg_recv(msqid, 32, i64::MIN);
+    sys_msgctl(msqid, IPC_RMID, 0);
+    if sent && r == 4 && t == 5 {
+        pass(b"MSGRCV_LONG_MIN");
+    } else {
+        print(b"MSGRCV_LONG_MIN:FAIL: r=");
+        print_num(r);
+        print(b" type=");
+        print_num(t);
+        println(b"");
+    }
+}
+
+/// E2BIG leaves the message where it was in the queue
+fn test_msgrcv_e2big_order() {
+    let msqid = sys_msgget(IPC_PRIVATE, IPC_CREAT | 0o666) as i32;
+    let sent = msqid >= 0
+        && msg_send(msqid, 2, 4) == 0
+        && msg_send(msqid, 1, 16) == 0
+        && msg_send(msqid, 1, 4) == 0;
+    let (big, _) = msg_recv(msqid, 8, 1);
+    let (r, t) = msg_recv(msqid, 32, 0);
+    sys_msgctl(msqid, IPC_RMID, 0);
+    if sent && big == -7 && r == 4 && t == 2 {
+        pass(b"MSGRCV_E2BIG_ORDER");
+    } else {
+        print(b"MSGRCV_E2BIG_ORDER:FAIL: e2big=");
+        print_num(big);
+        print(b" next type=");
+        print_num(t);
+        println(b"");
+    }
+}

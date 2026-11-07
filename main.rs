@@ -4,6 +4,10 @@
 
 #![cfg_attr(not(test), no_std)]
 #![cfg_attr(not(test), no_main)]
+// Auto-trait (Send/Sync) proofs of the object graph nest past the
+// default 128 (a file's SIGIO owner holds a struct pid, which reaches
+// the task graph)
+#![recursion_limit = "256"]
 // Host unit tests (`make test`) build only a subset; skip dead-code noise
 #![cfg_attr(
     test,

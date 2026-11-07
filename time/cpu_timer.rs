@@ -254,9 +254,10 @@ pub fn tick(t: &crate::task::Task) {
 
 /// What expired timers do once the registry lock is dropped
 enum Fire {
-    /// Signal `sig` to thread `tid`
-    Thread(Tid, u32),
-    /// Signal `sig` to the process
+    /// Queue a timer_create timer's signal
+    Timer(Arc<crate::time::posix_timer::PosixTimer>),
+    /// Signal `sig` to the process from the kernel (an itimer,
+    /// RLIMIT_CPU: Linux SEND_SIG_PRIV)
     Process(u32),
     /// Wake a clock_nanosleep
     Wake(Arc<crate::time::posix_timer::PosixTimer>),
@@ -329,11 +330,9 @@ pub fn run() {
     drop(reg);
     for f in fire {
         match f {
-            Fire::Thread(t, s) => {
-                crate::signal::send_signal(t, s);
-            }
+            Fire::Timer(t) => t.queue_signal(),
             Fire::Process(s) => {
-                crate::signal::send_signal_to_process(pid, s);
+                crate::signal::kill_proc_info(pid, s, crate::signal::SendInfo::Kernel);
             }
             Fire::Wake(t) => t.wake_sleeper(),
         }
@@ -395,18 +394,18 @@ pub fn rlimit_cpu_changed(sig: &crate::signal::SignalStruct, pid: crate::task::P
 
 /// What an expired CPU timer asks for
 pub enum Expired {
-    Signal { sig: u32, thread: Option<Tid> },
+    /// An itimer's signal for the process
+    Signal(u32),
+    /// A timer_create timer's queued signal
+    Queue,
     Wake,
 }
 
 impl Expired {
     fn into_fire(self, t: &Arc<crate::time::posix_timer::PosixTimer>) -> Fire {
         match self {
-            Expired::Signal {
-                sig,
-                thread: Some(x),
-            } => Fire::Thread(x, sig),
-            Expired::Signal { sig, thread: None } => Fire::Process(sig),
+            Expired::Signal(sig) => Fire::Process(sig),
+            Expired::Queue => Fire::Timer(t.clone()),
             Expired::Wake => Fire::Wake(t.clone()),
         }
     }

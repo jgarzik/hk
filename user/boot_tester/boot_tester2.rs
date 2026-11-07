@@ -275,6 +275,66 @@ fn comm_check() -> ! {
     });
 }
 
+/// sigexec mode: what the exec kept and reset of the caller's signals
+/// (set up by SIGQUEUE_EXEC): exit 0, else a bit per difference
+fn sigexec() -> ! {
+    const SIGUSR1: u64 = 10;
+    const SIGUSR2: u64 = 12;
+    const SS_DISABLE: i32 = 2;
+    let mut bad = 0u64;
+    let mut act = [0u64; 4];
+    // A caught signal is SIG_DFL now, an ignored one still SIG_IGN
+    hk_syscall::sys_rt_sigaction(SIGUSR1 as u32, 0, act.as_mut_ptr() as u64, 8);
+    if act[0] != 0 {
+        bad |= 1;
+    }
+    hk_syscall::sys_rt_sigaction(SIGUSR2 as u32, 0, act.as_mut_ptr() as u64, 8);
+    if act[0] != 1 {
+        bad |= 2;
+    }
+    // No alternate stack
+    let mut ss = [0u64; 3];
+    hk_syscall::sys_sigaltstack(0, ss.as_mut_ptr() as u64);
+    if ss[1] as i32 & SS_DISABLE == 0 {
+        bad |= 4;
+    }
+    // The blocked mask stays (SIGRT 40 and 41 blocked)
+    let mut old = 0u64;
+    hk_syscall::sys_rt_sigprocmask(0, 0, &mut old as *mut u64 as u64, 8);
+    if old & (3 << 39) != 3 << 39 {
+        bad |= 8;
+    }
+    // The timer and its pending signal (41) are gone, kill()'s SIGRT
+    // (40) is still pending
+    let mut pend = 0u64;
+    hk_syscall::sys_rt_sigpending(&mut pend as *mut u64 as u64, 8);
+    if pend & (1 << 40) != 0 || pend & (1 << 39) == 0 {
+        bad |= 16;
+    }
+    if hk_syscall::sys_timer_delete(0) != -22 {
+        bad |= 32;
+    }
+    // ITIMER_REAL stays
+    let mut it = hk_syscall::ITimerVal::default();
+    hk_syscall::sys_getitimer(0, &mut it);
+    if it.it_value.tv_sec == 0 {
+        bad |= 64;
+    }
+    sys_exit(bad)
+}
+
+/// chldsig mode: SIGCHLD and SIGUSR1 blocked across the exec, the
+/// signal a child made before the exec sends at its exit; exit with it
+fn chldsig() -> ! {
+    let mask: u64 = (1 << (17 - 1)) | (1 << (10 - 1));
+    let ts = [10i64, 0];
+    let r = hk_syscall::sys_rt_sigtimedwait(&mask as *const u64 as u64, 0, ts.as_ptr() as u64, 8);
+    let mut st = 0i32;
+    // __WALL: a non-SIGCHLD child too
+    hk_syscall::sys_wait4(-1, &mut st, 0x4000_0000, 0);
+    sys_exit(r.max(0) as u64)
+}
+
 extern "C" fn rust_start(sp: *const u64) -> ! {
     const PR_GET_DUMPABLE: i32 = 3;
     match arg1(sp) {
@@ -291,6 +351,8 @@ extern "C" fn rust_start(sp: *const u64) -> ! {
             sys_write(3, ids.as_ptr() as *const u8, 16);
             sys_exit(0);
         }
+        b"chldsig" => chldsig(),
+        b"sigexec" => sigexec(),
         b"sleep" => {
             sys_write(3, b"r".as_ptr(), 1);
             loop {

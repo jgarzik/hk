@@ -344,6 +344,16 @@ impl FileOps for SockFile {
         }
         Ok(())
     }
+
+    /// Linux sock_fasync: the socket's list; an allocation failure is
+    /// not reported (Linux ignores fasync_helper's result)
+    fn fasync(&self, file: &File, fd: i32, on: bool) -> Option<Result<(), KernelError>> {
+        let Some(s) = sock_of(file) else {
+            return Some(Err(KernelError::InvalidArgument));
+        };
+        let _ = crate::io::fasync::fasync_helper(&s.sk().fasync, file, fd, on);
+        Some(Ok(()))
+    }
 }
 
 /// ioctl constants
@@ -361,11 +371,12 @@ fn sock_ioctl(s: &dyn ProtoOps, file: &File, cmd: u32, arg: u64) -> Result<i64, 
     match cmd {
         FIOSETOWN | SIOCSPGRP => {
             let who = get_user::<Uaccess, i32>(arg).map_err(|_| KernelError::BadAddress)?;
-            crate::fs::fd::f_setown(file, who)?;
+            crate::io::fasync::f_setown(file, who, true)?;
             return Ok(0);
         }
         FIOGETOWN | SIOCGPGRP => {
-            put_user::<Uaccess, i32>(arg, file.get_owner()).map_err(|_| KernelError::BadAddress)?;
+            put_user::<Uaccess, i32>(arg, crate::io::fasync::f_getown(file))
+                .map_err(|_| KernelError::BadAddress)?;
             return Ok(0);
         }
         _ => {}
@@ -444,6 +455,13 @@ fn cap(c: u32) -> bool {
     crate::task::capable(c)
 }
 
+/// SO_PRIORITY `val`: TC_PRIO_BESTEFFORT..=TC_PRIO_INTERACTIVE for
+/// anyone, others with CAP_NET_RAW or CAP_NET_ADMIN (Linux
+/// sk_set_prio_allowed)
+fn prio_allowed(val: i32) -> bool {
+    (0..=6).contains(&val) || cap(crate::task::CAP_NET_RAW) || cap(crate::task::CAP_NET_ADMIN)
+}
+
 /// setsockopt(SOL_SOCKET)
 pub fn sock_setsockopt(s: &dyn ProtoOps, opt: i32, v: OptIn) -> Result<(), KernelError> {
     let sk = s.sk();
@@ -476,7 +494,7 @@ pub fn sock_setsockopt(s: &dyn ProtoOps, opt: i32, v: OptIn) -> Result<(), Kerne
             }
         }
         SO_PRIORITY => {
-            if !(0..=6).contains(&val) && !cap(crate::task::CAP_NET_ADMIN) {
+            if !prio_allowed(val) {
                 return Err(KernelError::NotPermitted);
             }
             sk.priority.store(val as u32, Ordering::Release);

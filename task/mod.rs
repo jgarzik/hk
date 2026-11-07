@@ -1130,8 +1130,12 @@ pub struct TaskInner {
     // =========================================================================
     /// Exit status code (set when task becomes zombie)
     pub exit_code: i32,
-    /// Signal to send to parent on exit (default SIGCHLD, from clone3 exit_signal)
+    /// Signal to send to parent on exit (default SIGCHLD, from clone3
+    /// exit_signal; -1 for a thread, Linux)
     pub exit_signal: i32,
+    /// Its parent's exec count when it was made (Linux parent_exec_id):
+    /// a non-SIGCHLD exit signal is sent only to the image that set it
+    pub parent_exec_id: u64,
     /// Signal to send when parent dies (set via prctl PR_SET_PDEATHSIG)
     pub pdeath_signal: i32,
 
@@ -1249,6 +1253,14 @@ pub struct TaskInner {
     /// the tracer's wait reports it (then 0), then the signal the
     /// tracer's resume leaves to deliver (0: none)
     pub ptrace_code: u32,
+    /// The siginfo of the stop it is in, which PTRACE_GETSIGINFO reads
+    /// and PTRACE_SETSIGINFO replaces (Linux task->last_siginfo); none
+    /// outside a ptrace stop
+    pub last_siginfo: Option<crate::signal::SigInfo>,
+    /// Its tracer is inside a ptrace request on it (Linux
+    /// JOBCTL_PTRACE_FROZEN): a SIGKILL leaves its ptrace stop alone
+    /// until the request ends
+    pub ptrace_frozen: bool,
 }
 
 /// Data owned by the TASKLIST lock: reached through a borrow of the
@@ -2221,6 +2233,15 @@ pub fn cap_fix_setuid(old: &Cred, new: &mut Cred, keep_caps: bool) {
     }
 }
 
+/// How many times process `pid` has exec'd (Linux self_exec_id: its
+/// struct pid's count, which an exec bumps), 0 if it is gone
+pub fn self_exec_id(pid: Pid) -> u64 {
+    u32::try_from(pid)
+        .ok()
+        .and_then(|n| crate::task::pid::find_pid(&crate::ns::INIT_PID_NS, n))
+        .map_or(0, |p| p.exec_gen())
+}
+
 /// Capabilities that fsuid 0 historically implied (Linux CAP_FS_SET)
 pub const CAP_FS_SET: KernelCap = KernelCap(
     1 << CAP_CHOWN
@@ -2259,37 +2280,64 @@ pub fn capable(cap: u32) -> bool {
 }
 
 // =============================================================================
-// Per-UID process counting (for RLIMIT_NPROC)
+// Per-UID counts (RLIMIT_NPROC, RLIMIT_SIGPENDING)
 // =============================================================================
 
-/// Tasks per real uid for RLIMIT_NPROC (Linux ucounts
-/// UCOUNT_RLIMIT_NPROC): every task, threads included, is charged to its
-/// real uid from clone until it is released (reaped, or at exit for a
-/// non-leader thread); a real-uid change moves the charge
-static NPROC: Mutex<BTreeMap<Uid, u64>> = Mutex::new(BTreeMap::new());
-
-/// Charge one task to `uid`; the new count
-pub fn nproc_charge(uid: Uid) -> u64 {
-    let mut counts = NPROC.lock();
-    let count = counts.entry(uid).or_insert(0);
-    *count += 1;
-    *count
+/// What a user's count counts (Linux enum ucount_type, the rlimit ones)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ucount {
+    /// Tasks, threads included (UCOUNT_RLIMIT_NPROC): charged to a
+    /// task's real uid from clone until it is released (reaped, or at
+    /// exit for a non-leader thread); a real-uid change moves the charge
+    Nproc,
+    /// Queued signals (UCOUNT_RLIMIT_SIGPENDING): charged to the
+    /// receiver's real uid while queued
+    Sigpending,
 }
 
-/// Release one task's charge to `uid`
-pub fn nproc_uncharge(uid: Uid) {
-    let mut counts = NPROC.lock();
-    if let Some(count) = counts.get_mut(&uid) {
-        *count = count.saturating_sub(1);
-        if *count == 0 {
+/// Each real uid's counts (Linux ucounts, one per user in the initial
+/// user namespace), indexed by `Ucount`: an entry lives while any count
+/// is non-zero, so a user's signals find it made by its tasks
+static UCOUNTS: Mutex<BTreeMap<Uid, [u64; 2]>> = Mutex::new(BTreeMap::new());
+
+/// Charge one to `uid`'s `kind`; the new count (Linux
+/// inc_rlimit_ucounts)
+pub fn ucount_inc(uid: Uid, kind: Ucount) -> u64 {
+    let mut counts = UCOUNTS.lock();
+    let c = &mut counts.entry(uid).or_insert([0; 2])[kind as usize];
+    *c += 1;
+    *c
+}
+
+/// Release one of `uid`'s `kind` (Linux dec_rlimit_ucounts)
+pub fn ucount_dec(uid: Uid, kind: Ucount) {
+    let mut counts = UCOUNTS.lock();
+    if let Some(c) = counts.get_mut(&uid) {
+        c[kind as usize] = c[kind as usize].saturating_sub(1);
+        if *c == [0; 2] {
             counts.remove(&uid);
         }
     }
 }
 
+/// `uid`'s `kind` count (Linux get_rlimit_value)
+pub fn ucount(uid: Uid, kind: Ucount) -> u64 {
+    UCOUNTS.lock().get(&uid).map_or(0, |c| c[kind as usize])
+}
+
+/// Charge one task to `uid`; the new count
+pub fn nproc_charge(uid: Uid) -> u64 {
+    ucount_inc(uid, Ucount::Nproc)
+}
+
+/// Release one task's charge to `uid`
+pub fn nproc_uncharge(uid: Uid) {
+    ucount_dec(uid, Ucount::Nproc)
+}
+
 /// Tasks charged to `uid`
 pub fn nproc_count(uid: Uid) -> u64 {
-    NPROC.lock().get(&uid).copied().unwrap_or(0)
+    ucount(uid, Ucount::Nproc)
 }
 
 /// `count` tasks exceed the caller's RLIMIT_NPROC (Linux

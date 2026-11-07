@@ -49,9 +49,10 @@ use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsiz
 use crate::sync::spin::{Mutex, RwLock};
 
 use crate::net::NetNamespace;
-use crate::net::sock::Sock;
+use crate::net::sock::{Sock, wait_on};
 use crate::net::socket::{ProtoOps, SOCK_DGRAM, SOCK_RAW};
 use crate::net::unix::scm::Creds;
+use crate::sync::waitqueue::WaitQueue;
 use crate::util::error::KernelError;
 
 pub const AF_NETLINK: i32 = 16;
@@ -205,6 +206,9 @@ pub struct NlSock {
     /// Released (Linux SOCK_DEAD): senders waiting for room give up
     /// with ECONNREFUSED
     dead: AtomicBool,
+    /// User senders waiting for room in the receive queue (Linux
+    /// nlk->wait): not `sk.wq`, so a reader's dequeue wakes no poller
+    wait: WaitQueue,
     me: Weak<NlSock>,
 }
 
@@ -248,6 +252,7 @@ impl NlSock {
             drops: AtomicU32::new(0),
             dump: Mutex::new(None),
             dead: AtomicBool::new(false),
+            wait: WaitQueue::new(),
             me: me.clone(),
         })
     }
@@ -404,7 +409,7 @@ impl NlSock {
 
     fn push(&self, skb: NlSkb) {
         self.enqueue(skb);
-        self.sk.wq.wake_all();
+        self.sk.data_ready();
     }
 
     /// Queue without waking (the caller wakes after its locks)
@@ -448,7 +453,7 @@ impl NlSock {
                 return Ok(());
             }
             let ts = truesize(skb.data.len());
-            timeo = self.sk.wait(timeo, || {
+            timeo = wait_on(&self.wait, timeo, || {
                 self.has_room(ts) || self.dead.load(Ordering::Acquire)
             })?;
         }
@@ -511,7 +516,7 @@ impl NlSock {
         if empty {
             self.congested.store(false, Ordering::Release);
         }
-        self.sk.wq.wake_all();
+        self.wait.wake_all();
         Some(skb)
     }
 
@@ -573,7 +578,7 @@ impl NlSock {
         self.rmem.fetch_add(truesize(buf.len()), Ordering::AcqRel);
         self.enqueue(NlSkb::kernel(buf, 0));
         drop(d);
-        self.sk.wq.wake_all();
+        self.sk.data_ready();
         true
     }
 
@@ -643,7 +648,7 @@ impl NlSock {
         let q = core::mem::take(&mut *self.rxq.lock());
         self.rmem.store(0, Ordering::Release);
         drop(q);
-        self.sk.wq.wake_all();
+        self.wait.wake_all();
     }
 }
 

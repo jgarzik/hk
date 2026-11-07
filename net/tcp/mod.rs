@@ -58,6 +58,7 @@ use self::output::Tuple;
 use self::table::Ent;
 use self::timer::{Expire, Slot, now_ms};
 use self::timewait::TimeWait;
+use crate::io::fasync::{POLL_ERR, POLL_HUP, POLL_IN, POLL_OUT};
 use crate::io::poll::{
     POLLERR, POLLHUP, POLLIN, POLLOUT, POLLRDHUP, POLLRDNORM, POLLWRBAND, POLLWRNORM,
 };
@@ -73,10 +74,10 @@ use crate::net::msg::{
     SendMsg,
 };
 use crate::net::skb::SkBuff;
-use crate::net::sock::{RCV_SHUTDOWN, SEND_SHUTDOWN, SHUTDOWN_MASK, Sock, sf};
+use crate::net::sock::{RCV_SHUTDOWN, SEND_SHUTDOWN, SHUTDOWN_MASK, Sock, WakeHow, sf};
 use crate::net::socket::{
-    AF_INET, AF_UNSPEC, OptIn, OptOut, ProtoOps, SIOCINQ, SIOCOUTQ, SO_KEEPALIVE, SOCK_STREAM,
-    SOL_SOCKET, shut_bits,
+    AF_INET, AF_UNSPEC, OptIn, OptOut, ProtoOps, SIOCINQ, SIOCOUTQ, SO_KEEPALIVE, SO_RCVLOWAT,
+    SOCK_STREAM, SOL_SOCKET, shut_bits,
 };
 use crate::net::{NetNamespace, dev};
 
@@ -363,14 +364,14 @@ impl TcpSock {
 
     /// Apply `out` under the lock (Linux transmits and sets sk_err /
     /// sk_shutdown under the socket lock): publish the shutdown bits and
-    /// the error, then transmit to `t`. True: wake the socket after
-    /// unlocking.
-    fn emit(&self, out: &Out, t: Option<Tuple>) -> bool {
+    /// the error (reported at once), then transmit to `t`. Returns the
+    /// wakeups to make after unlocking.
+    fn emit(&self, out: &Out, t: Option<Tuple>) -> u8 {
         if out.shut != 0 {
             self.sk.set_shutdown(out.shut);
         }
         if let Some(e) = out.err {
-            self.sk.set_err(e);
+            self.sk.post_err(e);
         }
         if let Some(t) = t {
             let p = self.inet.params();
@@ -378,7 +379,11 @@ impl TcpSock {
                 xmit(&self.sk.net, &t, seg, p, self.oif());
             }
         }
-        out.wake || out.err.is_some()
+        if out.err.is_some() {
+            out.wake | cb::wake::ERR
+        } else {
+            out.wake
+        }
     }
 
     /// Lock, run `f` on the control block, post-process and apply the
@@ -393,13 +398,51 @@ impl TcpSock {
             let ready = self.post(&mut g, &mut out);
             (r, self.emit(&out, t), ready)
         };
-        if wake {
-            self.sk.state_change();
-        }
+        self.wake(wake);
         if let Some(l) = ready {
             l.sk.data_ready();
         }
         r
+    }
+
+    /// The wakeups `w` (`cb::wake`) asked for, each of them, in Linux's
+    /// order within one segment: an establishing state change before the
+    /// data it carried (tcp_finish_connect, then tcp_data_queue), the
+    /// data before the FIN behind it (tcp_data_queue, then tcp_fin)
+    fn wake(&self, w: u8) {
+        if w & cb::wake::ERR != 0 {
+            self.sk.wake_async(WakeHow::Io, POLL_ERR);
+        }
+        let fin = w & cb::wake::FIN != 0;
+        if w & cb::wake::STATE != 0 && !fin {
+            self.sk.state_change();
+            self.state_async(w);
+        }
+        if w & cb::wake::DATA != 0 {
+            self.sk.data_ready();
+        }
+        if w & cb::wake::SPACE != 0 {
+            self.sk.stream_write_space();
+        }
+        if fin {
+            self.sk.state_change();
+            self.state_async(w);
+        }
+    }
+
+    /// The SIGIO of a state change (Linux tcp_finish_connect, tcp_fin)
+    fn state_async(&self, w: u8) {
+        if w & cb::wake::EST != 0 {
+            self.sk.wake_async(WakeHow::Io, POLL_OUT);
+        }
+        if w & cb::wake::FIN != 0 {
+            let band = if self.sk.shutdown() == SHUTDOWN_MASK {
+                POLL_HUP
+            } else {
+                POLL_IN
+            };
+            self.sk.wake_async(WakeHow::WaitData, band);
+        }
     }
 
     /// The address part of the socket as a tuple (after the connection
@@ -467,6 +510,7 @@ impl TcpSock {
         if g.cb.state != TcpState::Listen {
             return;
         }
+        self.assert_owner();
         {
             let q = self.queue.lock();
             match q.as_ref() {
@@ -475,6 +519,19 @@ impl TcpSock {
             }
         }
         self.child(s, t, g.cb.opts, now);
+    }
+
+    /// Debug and LOCKDEP builds: a listener (locked, in LISTEN) owns
+    /// its port in bhash, or bind(0) could hand the port out while this
+    /// listener still answers on it
+    fn assert_owner(&self) {
+        if cfg!(any(debug_assertions, feature = "lockdep")) {
+            let port = self.inet.get().sport;
+            assert!(
+                self.sk.net.tcp.owns(port, &self.arc()),
+                "tcp: listener on port {port} is no bhash owner"
+            );
+        }
     }
 
     /// Create, hash and queue a SYN_RECEIVED child and send its SYN-ACK
@@ -603,6 +660,9 @@ impl TcpSock {
                 ad.dport = dport;
             }
             self.sk.clear_shutdown();
+            // A new connection starts with no pending error (Linux
+            // tcp_connect_init)
+            self.sk.store_err(0);
             let mut c = cfg(&self.sk.net);
             c.syn_retries = self.syncnt(&g.cb.opts);
             let mut cb = TcpCb::new(c);
@@ -788,8 +848,9 @@ impl TcpSock {
 impl Expire for TcpSock {
     fn expire(self: Arc<Self>, id: u64, now: u64) {
         self.step(|g, out| {
-            timer::fired(&mut g.slot, id);
-            g.cb.on_timer(now, out);
+            if timer::fired(&mut g.slot, id) {
+                g.cb.on_timer(now, out);
+            }
         });
     }
 }
@@ -948,7 +1009,7 @@ fn tcp_recvmsg(s: &TcpSock, m: &mut RecvMsg<'_>, flags: i32) -> Result<usize, Ke
             break;
         }
         let more = if flags & MSG_PEEK != 0 { copied } else { 0 };
-        match s.sk.wait(timeo, || s.rx_ready(more)) {
+        match s.sk.wait_data(timeo, || s.rx_ready(more)) {
             Ok(t) => timeo = t,
             Err(e)
                 if copied > 0
@@ -994,6 +1055,7 @@ fn wait_connected(s: &TcpSock, timeo: &mut u64) -> Result<(), KernelError> {
 /// whole send timeout if interrupted
 fn wait_memory(s: &TcpSock, timeo: &mut u64) -> Result<(), KernelError> {
     use crate::net::sock::TIMEO_FOREVER;
+    s.sk.send_nospace(*timeo);
     if *timeo == 0 {
         return Err(KernelError::WouldBlock);
     }
@@ -1055,10 +1117,12 @@ fn tcp_sendmsg(s: &TcpSock, m: &mut SendMsg<'_>, flags: i32) -> Result<usize, Ke
             if let Err(e) = wait_memory(s, &mut timeo) {
                 break Err(e);
             }
-        } else if n == 0
-            && let Err(e) = s.sk.wait(timeo, || s.tx_ready()).map(|t| timeo = t)
-        {
-            break Err(e);
+        } else if n == 0 {
+            // Linux sk_stream_wait_memory
+            s.sk.send_nospace(timeo);
+            if let Err(e) = s.sk.wait(timeo, || s.tx_ready()).map(|t| timeo = t) {
+                break Err(e);
+            }
         }
     };
     match r {
@@ -1322,6 +1386,9 @@ impl ProtoOps for TcpSock {
             }
             if sh & SEND_SHUTDOWN != 0 || g.cb.writable() {
                 mask |= POLLOUT | POLLWRNORM | POLLWRBAND;
+            } else {
+                // SIGIO once there is room (Linux tcp_poll)
+                self.sk.set_nospace();
             }
         }
         if self.sk.err_pending() {
@@ -1385,6 +1452,7 @@ impl ProtoOps for TcpSock {
     fn setsockopt(&self, level: i32, opt: i32, v: OptIn) -> Option<Result<(), KernelError>> {
         match level {
             SOL_SOCKET if opt == SO_KEEPALIVE => Some(self.set_keepalive(v)),
+            SOL_SOCKET if opt == SO_RCVLOWAT => Some(self.set_rcvlowat(v)),
             SOL_SOCKET => None,
             SOL_IP => Some(self.inet.setsockopt(&self.sk, opt, v)),
             PROTO_TCP => Some(self.set_tcp_opt(opt, v)),
@@ -1459,7 +1527,7 @@ impl TcpSock {
                 }
                 TCP_NOTSENT_LOWAT => {
                     g.cb.opts.notsent_lowat = val as u32;
-                    out.wake = true;
+                    out.wake |= cb::wake::SPACE;
                 }
                 _ => return Err(KernelError::NoProtocolOption),
             }
@@ -1528,6 +1596,14 @@ impl TcpSock {
         crate::net::socket::sock_setsockopt(self, SO_KEEPALIVE, v)?;
         let on = self.sk.flag(sf::KEEPALIVE);
         self.step(|g, _| g.cb.set_keepalive(on, now_ms()));
+        Ok(())
+    }
+
+    /// Readers may have enough now (Linux tcp_set_rcvlowat:
+    /// tcp_data_ready)
+    fn set_rcvlowat(&self, v: OptIn) -> Result<(), KernelError> {
+        crate::net::socket::sock_setsockopt(self, SO_RCVLOWAT, v)?;
+        self.sk.data_ready();
         Ok(())
     }
 }

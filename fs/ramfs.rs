@@ -914,6 +914,11 @@ impl FileOps for RamfsFileOps {
         self
     }
 
+    /// No poll (Linux ramfs/shmem file and dir operations)
+    fn can_poll(&self, _file: &File) -> bool {
+        false
+    }
+
     /// Regular files map their data (Linux generic_file_mmap);
     /// directories have no mmap
     fn mmap(&self, file: &File, _shared: bool) -> Result<(), KernelError> {

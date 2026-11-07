@@ -1,0 +1,1675 @@
+//! Address spaces across fork (Linux dup_mmap / copy_page_range)
+//!
+//! Tests (parent and child write a word in turn, in lock-step over pipes):
+//! - FORK_SHARED_ANON: a MAP_SHARED|MAP_ANONYMOUS page written before fork
+//!   stays shared: each side sees the other's write
+//! - FORK_SHARED_ANON_LATE: so do shared pages first touched after fork
+//! - SHMEM_DONTNEED / SHMEM_REMOVE: MADV_DONTNEED on shared anonymous
+//!   memory keeps the data (it lives in the shared object); MADV_REMOVE
+//!   frees it (reads zero)
+//! - FILE_SHARED_FORK: the same for a MAP_SHARED mapping of a file
+//! - ZERO_SHARED_FORK: a MAP_SHARED mapping of /dev/zero is shared
+//!   memory (Linux shmem_zero_setup): parent and child see each other
+//! - FILE_SHARED_COHERENT: a shared file mapping, another mapping of the
+//!   file and read()/write() all see the same data
+//! - FILE_PRIVATE_RDONLY: a MAP_PRIVATE mapping of a read-only fd made
+//!   writable by mprotect writes a private copy, never the file; a
+//!   MAP_SHARED one cannot be made writable (EACCES)
+//! - FILE_SHARED_EOF: a shared file mapping is SIGBUS past the page
+//!   holding the end of the file
+//! - TRUNC_SHARED_SIGBUS: truncating a shared-mapped file unmaps the
+//!   pages past the new end: touching one is SIGBUS, and after growing
+//!   the file again it reads zeros, not the old data
+//! - PRIVATE_SEES_WRITE: a MAP_PRIVATE page not written yet is the
+//!   page cache's: a write() to the file shows through it; after the
+//!   mapping writes it, its copy no longer changes
+//! - PRIVATE_EOF_SIGBUS: a private file mapping is SIGBUS past the
+//!   page holding the end of the file, like a shared one
+//! - TRUNC_PRIVATE_COW: truncate also unmaps a private mapping's
+//!   copies past the new end (SIGBUS)
+//! - SHMEM_REMOVE_SHARED: MADV_REMOVE by one process zeroes the page
+//!   for the other too, and the page stays shared
+//! - SHMEM_REMOVE_PAST_SIZE: MADV_REMOVE of a range past the object
+//!   (mapping grown by mremap) is harmless
+//! - SHMEM_MREMAP_DONTUNMAP: after mremap(MREMAP_DONTUNMAP) of shared
+//!   anonymous memory both ranges map the same pages
+//! - SHMEM_BEYOND_SIZE: shared anonymous memory keeps the size it was
+//!   mapped with: a page past it (mapping grown by mremap) is SIGBUS
+//! - FORK_PRIVATE_COW: a MAP_PRIVATE page is copy-on-write: neither side
+//!   sees the other's write
+//! - FORK_MPROTECT_COW: mprotect read-only then read-write after fork does
+//!   not make the shared copy-on-write page writable
+//! - FORK_RDONLY_COW: same for a page that was read-only at fork
+//! - FORK_COW_RACE: threads keep writing private pages while another
+//!   thread forks, and the parent writes right after each fork (hot TLB
+//!   entry): every child sees only its pre-fork snapshot
+//! - TRUNC_FORK_RACE: a thread truncates a shared-mapped file while the
+//!   process forks: a child that touches the cut page after the truncate
+//!   returned gets SIGBUS (fork copies no shared PTE that truncate missed)
+//! - MREMAP_TRUNC_RACE: the same thread truncates while mremap moves the
+//!   shared mapping: afterwards the cut page is not resident at the new
+//!   address (mincore), no stale entry moved with the mapping
+//! - FAULT_MPROTECT_RACE: a thread keeps read-faulting pages in while
+//!   the range is zapped and made read-only: afterwards no page has a
+//!   writable entry left (a kernel write into each is EFAULT)
+//! - FORK_REMOTE_WRITE_COW: process_vm_writev into the child's
+//!   copy-on-write page changes the child's copy only
+//! - REMOTE_WRITE_PERM: process_vm_writev into another user's process
+//!   is EPERM
+//! - REMOTE_WRITE_RDONLY: process_vm_writev into a read-only shared
+//!   mapping is EFAULT
+//! - REMOTE_ACCESS_BOUNDS: process_vm_readv/writev at a kernel-half or
+//!   unmapped target address is EFAULT; across a page boundary the
+//!   whole range is copied
+//! - FORK_DONTFORK: a MADV_DONTFORK region is not mapped in the child
+//!   (SIGSEGV), the parent keeps it
+//! - FORK_WIPEONFORK: a MADV_WIPEONFORK region reads zero in the child
+//! - FORK_THP: a MADV_HUGEPAGE (2MB page) region keeps its data in the
+//!   child and is copy-on-write
+//! - SHM_NATTCH_FORK: a SysV shm attachment is inherited: shm_nattch 1 ->
+//!   2 after fork, back to 1 when the child exits, 0 after shmdt; the
+//!   segment is shared both ways
+//! - SHM_RMID_EXIT: a segment removed with IPC_RMID while attached by a
+//!   process that exits without shmdt is destroyed: its id is gone and
+//!   its memory comes back
+//! - SHM_RDONLY_PERM: a SHM_RDONLY attachment cannot be made writable by
+//!   mprotect nor emptied by MADV_REMOVE (EACCES); MADV_REMOVE of private
+//!   anonymous memory is EINVAL
+//! - SHM_ATTACH_ADDR: shmat outside user space (kernel half: ENOMEM,
+//!   wrapping range: EINVAL) or SHM_REMAP without an address (EINVAL)
+//! - SHM_STRESS: four processes fork, shmdt and exit attached while one
+//!   removes the segment midway; at the end the id is gone and the
+//!   memory comes back
+
+use core::sync::atomic::{AtomicU64, Ordering};
+
+use crate::harness::report_code;
+use crate::helpers::{host_mode, print, print_num, println};
+use crate::mm::mm_life::meminfo;
+use hk_syscall::{
+    IPC_CREAT, IPC_PRIVATE, IPC_RMID, IPC_STAT, IoVec, MADV_DONTFORK, MADV_DONTNEED, MADV_REMOVE,
+    MADV_WIPEONFORK, MAP_ANONYMOUS, MAP_PRIVATE, MAP_SHARED, MREMAP_MAYMOVE, O_CREAT, O_RDONLY,
+    O_RDWR, O_TRUNC, PROT_READ, PROT_WRITE, Timespec, sys_close, sys_exit, sys_fork, sys_ftruncate,
+    sys_madvise, sys_mmap, sys_mprotect, sys_mremap, sys_munmap, sys_nanosleep, sys_open, sys_pipe,
+    sys_pread64, sys_process_vm_readv, sys_process_vm_writev, sys_pwrite64, sys_read,
+    sys_sched_yield, sys_setresuid, sys_shmat, sys_shmctl, sys_shmdt, sys_shmget, sys_unlink,
+    sys_wait4, sys_write,
+};
+
+const MADV_HUGEPAGE: i32 = 14;
+const PAGE: u64 = 4096;
+const HUGE: u64 = 2 << 20;
+const BEFORE: u64 = 0x1111_0000_0000_0001;
+const CHILD: u64 = 0x2222_0000_0000_0002;
+const PARENT: u64 = 0x3333_0000_0000_0003;
+const SIGSEGV: i32 = 11;
+const SIGBUS: i64 = 7;
+const RW: u32 = PROT_READ | PROT_WRITE;
+
+pub fn run_tests() {
+    shared_anon();
+    shared_anon_late();
+    file_shared();
+    shmem_dontneed();
+    shmem_beyond_size();
+    shmem_dontunmap();
+    shmem_remove_shared();
+    shmem_remove_past_size();
+    private_cow();
+    mprotect_cow();
+    rdonly_cow();
+    cow_race();
+    zero_shared_fork();
+    trunc_fork_race();
+    mremap_trunc_race();
+    mprotect_race();
+    remote_write_cow();
+    remote_write_perm();
+    remote_bounds();
+    dontfork();
+    wipeonfork();
+    thp();
+    shm_nattch_fork();
+    shm_rmid_exit();
+    shm_rdonly_perm();
+    shm_attach_addr();
+    shm_stress();
+}
+
+fn map(len: u64, flags: u32) -> u64 {
+    let p = sys_mmap(0, len, RW, flags | MAP_ANONYMOUS, -1, 0);
+    if p < 0 { 0 } else { p as u64 }
+}
+
+fn get(a: u64) -> u64 {
+    unsafe { core::ptr::read_volatile(a as *const u64) }
+}
+
+fn put(a: u64, v: u64) {
+    unsafe { core::ptr::write_volatile(a as *mut u64, v) }
+}
+
+/// A pipe: (read end, write end)
+fn pipe() -> (u64, u64) {
+    let mut fds = [0i32; 2];
+    sys_pipe(fds.as_mut_ptr());
+    (fds[0] as u64, fds[1] as u64)
+}
+
+fn send(fd: u64) {
+    sys_write(fd, b"x".as_ptr(), 1);
+}
+
+fn recv(fd: u64) {
+    let mut b = 0u8;
+    sys_read(fd, &mut b, 1);
+}
+
+/// Reap `pid`: its exit code, 0x100 + signal if killed, -1 on error
+fn reap(pid: i64) -> i64 {
+    let mut st = 0i32;
+    if pid <= 0 || sys_wait4(pid, &mut st, 0, 0) != pid {
+        return -1;
+    }
+    if st & 0x7f != 0 {
+        return 0x100 + (st & 0x7f) as i64;
+    }
+    ((st >> 8) & 0xff) as i64
+}
+
+/// The word at `a` holds BEFORE; fork. The child checks it, writes
+/// CHILD; then the parent checks for CHILD (`shared`) or BEFORE, writes
+/// PARENT; then the child checks for PARENT (`shared`) or CHILD. `prep`
+/// runs on each side before its write. 0, or the failed step.
+fn exchange(a: u64, shared: bool, prep: fn(u64)) -> i64 {
+    put(a, BEFORE);
+    let (to_child, from_parent) = pipe();
+    let (to_parent, from_child) = pipe();
+    let pid = sys_fork();
+    if pid == 0 {
+        let mut code = 0;
+        if get(a) != BEFORE {
+            code = 1;
+        }
+        prep(a);
+        put(a, CHILD);
+        send(from_child);
+        recv(to_child);
+        if get(a) != if shared { PARENT } else { CHILD } {
+            code = 2;
+        }
+        sys_exit(code);
+    }
+    let mut code = 0;
+    recv(to_parent);
+    if get(a) != if shared { CHILD } else { BEFORE } {
+        code = 3;
+    }
+    prep(a);
+    put(a, PARENT);
+    send(from_parent);
+    let r = reap(pid);
+    for fd in [to_child, from_parent, to_parent, from_child] {
+        sys_close(fd);
+    }
+    if r != 0 {
+        code = 10 + r;
+    }
+    code
+}
+
+fn nop(_: u64) {}
+
+/// mprotect read-only then read-write: must not undo copy-on-write
+fn ro_rw(a: u64) {
+    sys_mprotect(a & !(PAGE - 1), PAGE, PROT_READ);
+    sys_mprotect(a & !(PAGE - 1), PAGE, RW);
+}
+
+fn make_rw(a: u64) {
+    sys_mprotect(a & !(PAGE - 1), PAGE, RW);
+}
+
+fn one_page(name: &[u8], flags: u32, f: fn(u64) -> i64) {
+    let p = map(PAGE, flags);
+    if p == 0 {
+        report_code(name, -1);
+        return;
+    }
+    report_code(name, f(p));
+    sys_munmap(p, PAGE);
+}
+
+fn shared_anon() {
+    one_page(b"FORK_SHARED_ANON", MAP_SHARED, |p| {
+        exchange(p + 8, true, nop)
+    });
+}
+
+fn shared_anon_late() {
+    let p = map(2 * PAGE, MAP_SHARED);
+    if p == 0 {
+        report_code(b"FORK_SHARED_ANON_LATE", -1);
+        return;
+    }
+    report_code(b"FORK_SHARED_ANON_LATE", shared_late(p));
+    sys_munmap(p, 2 * PAGE);
+}
+
+/// Two shared pages at `p`, untouched before fork: page 1 first
+/// touched by the child, page 0 by the parent; each sees the other's
+fn shared_late(p: u64) -> i64 {
+    let (to_child, from_parent) = pipe();
+    let (to_parent, from_child) = pipe();
+    let pid = sys_fork();
+    if pid == 0 {
+        // Page 1 is first touched here, page 0 by the parent
+        put(p + PAGE, CHILD);
+        send(from_child);
+        recv(to_child);
+        sys_exit(if get(p) == PARENT { 0 } else { 1 });
+    }
+    recv(to_parent);
+    let mut code = if get(p + PAGE) == CHILD { 0 } else { 2 };
+    put(p, PARENT);
+    send(from_parent);
+    let r = reap(pid);
+    if r != 0 {
+        code = 10 + r;
+    }
+    for fd in [to_child, from_parent, to_parent, from_child] {
+        sys_close(fd);
+    }
+    code
+}
+
+const FILE: &[u8] = b"/tmp/fork_mm_shared\0";
+
+/// A file of `size` bytes, MAP_SHARED over `len`: (fd, address)
+fn map_file(size: i64, len: u64) -> Option<(i32, u64)> {
+    let fd = sys_open(FILE.as_ptr(), O_RDWR | O_CREAT | O_TRUNC, 0o600) as i32;
+    if fd < 0 || sys_ftruncate(fd, size) != 0 {
+        return None;
+    }
+    let p = sys_mmap(0, len, RW, MAP_SHARED, fd, 0);
+    if p < 0 {
+        sys_close(fd as u64);
+        return None;
+    }
+    Some((fd, p as u64))
+}
+
+fn unmap_file(fd: i32, p: u64, len: u64) {
+    sys_munmap(p, len);
+    sys_close(fd as u64);
+    sys_unlink(FILE.as_ptr());
+}
+
+fn file_shared() {
+    match map_file(2 * PAGE as i64, 2 * PAGE) {
+        Some((fd, p)) => {
+            report_code(b"FILE_SHARED_FORK", shared_late(p));
+            unmap_file(fd, p, 2 * PAGE);
+        }
+        None => report_code(b"FILE_SHARED_FORK", -1),
+    }
+    match map_file(2 * PAGE as i64, 2 * PAGE) {
+        Some((fd, p)) => {
+            report_code(b"FILE_SHARED_COHERENT", file_coherent(fd, p));
+            unmap_file(fd, p, 2 * PAGE);
+        }
+        None => report_code(b"FILE_SHARED_COHERENT", -1),
+    }
+    report_code(b"FILE_PRIVATE_RDONLY", file_private_rdonly());
+    match map_file(100, 2 * PAGE) {
+        Some((fd, p)) => {
+            report_code(b"FILE_SHARED_EOF", file_eof(p));
+            unmap_file(fd, p, 2 * PAGE);
+        }
+        None => report_code(b"FILE_SHARED_EOF", -1),
+    }
+    match map_file(2 * PAGE as i64, 2 * PAGE) {
+        Some((fd, p)) => {
+            report_code(b"TRUNC_SHARED_SIGBUS", trunc_shared(fd, p));
+            unmap_file(fd, p, 2 * PAGE);
+        }
+        None => report_code(b"TRUNC_SHARED_SIGBUS", -1),
+    }
+    report_code(b"PRIVATE_SEES_WRITE", private_sees_write());
+    report_code(b"PRIVATE_EOF_SIGBUS", private_eof());
+    report_code(b"TRUNC_PRIVATE_COW", trunc_private());
+}
+
+/// A file of `size` bytes mapped MAP_PRIVATE over `len`: (fd, address)
+fn map_private(size: i64, len: u64) -> Option<(i32, u64)> {
+    let (fd, p) = map_file(size, len)?;
+    sys_munmap(p, len);
+    let q = sys_mmap(0, len, RW, MAP_PRIVATE, fd, 0);
+    if q < 0 {
+        unmap_file(fd, 0, 0);
+        return None;
+    }
+    Some((fd, q as u64))
+}
+
+fn private_sees_write() -> i64 {
+    let Some((fd, p)) = map_private(2 * PAGE as i64, 2 * PAGE) else {
+        return -1;
+    };
+    let code = (|| {
+        if get(p + 8) != 0 {
+            return 1;
+        }
+        let v = PARENT;
+        sys_pwrite64(fd, (&v as *const u64).cast(), 8, 8);
+        if get(p + 8) != PARENT {
+            return 2;
+        }
+        put(p + 16, BEFORE);
+        let w = 0x5555u64;
+        sys_pwrite64(fd, (&w as *const u64).cast(), 8, 8);
+        let mut f = 0u64;
+        sys_pread64(fd, (&mut f as *mut u64).cast(), 8, 16);
+        if get(p + 8) != PARENT || f != 0 { 3 } else { 0 }
+    })();
+    unmap_file(fd, p, 2 * PAGE);
+    code
+}
+
+fn private_eof() -> i64 {
+    let Some((fd, p)) = map_private(100, 2 * PAGE) else {
+        return -1;
+    };
+    let code = file_eof(p);
+    unmap_file(fd, p, 2 * PAGE);
+    code
+}
+
+fn trunc_private() -> i64 {
+    let Some((fd, p)) = map_private(2 * PAGE as i64, 2 * PAGE) else {
+        return -1;
+    };
+    put(p + PAGE + 8, PARENT);
+    let code = if sys_ftruncate(fd, PAGE as i64) != 0 {
+        1
+    } else {
+        let pid = sys_fork();
+        if pid == 0 {
+            get(p + PAGE + 8);
+            sys_exit(0);
+        }
+        let r = reap(pid);
+        if r == 0x100 + SIGBUS { 0 } else { 10 + r }
+    };
+    unmap_file(fd, p, 2 * PAGE);
+    code
+}
+
+/// Truncate unmaps (Linux truncate_pagecache): SIGBUS past the new end
+/// in every process mapping the file, zeros once it grows back
+fn trunc_shared(fd: i32, p: u64) -> i64 {
+    put(p + PAGE + 8, PARENT);
+    if sys_ftruncate(fd, PAGE as i64) != 0 {
+        return 1;
+    }
+    let pid = sys_fork();
+    if pid == 0 {
+        get(p + PAGE + 8);
+        sys_exit(0);
+    }
+    let r = reap(pid);
+    if r != 0x100 + SIGBUS {
+        return 10 + r;
+    }
+    if sys_ftruncate(fd, 2 * PAGE as i64) != 0 {
+        return 2;
+    }
+    if get(p + PAGE + 8) != 0 { 3 } else { 0 }
+}
+
+/// Writes through the mapping, a second mapping and write() meet
+fn file_coherent(fd: i32, p: u64) -> i64 {
+    put(p + 16, BEFORE);
+    let mut v = 0u64;
+    sys_pread64(fd, (&mut v as *mut u64).cast(), 8, 16);
+    if v != BEFORE {
+        return 1;
+    }
+    let w = PARENT;
+    sys_pwrite64(fd, (&w as *const u64).cast(), 8, PAGE as i64 + 24);
+    if get(p + PAGE + 24) != PARENT {
+        return 2;
+    }
+    let q = sys_mmap(0, PAGE, RW, MAP_SHARED, fd, 0);
+    if q < 0 {
+        return 3;
+    }
+    let q = q as u64;
+    let code = if get(q + 16) != BEFORE {
+        4
+    } else {
+        put(q + 32, CHILD);
+        if get(p + 32) == CHILD { 0 } else { 5 }
+    };
+    sys_munmap(q, PAGE);
+    code
+}
+
+/// Read-only fd: private mappings write copies, shared ones stay read-only
+fn file_private_rdonly() -> i64 {
+    let Some((fd, p)) = map_file(PAGE as i64, PAGE) else {
+        return -1;
+    };
+    put(p + 40, BEFORE);
+    sys_munmap(p, PAGE);
+    sys_close(fd as u64);
+    let fd = sys_open(FILE.as_ptr(), O_RDONLY, 0) as i32;
+    let sh = sys_mmap(0, PAGE, PROT_READ, MAP_SHARED, fd, 0);
+    let pv = sys_mmap(0, PAGE, PROT_READ, MAP_PRIVATE, fd, 0);
+    let mut code = 0;
+    if fd < 0 || sh < 0 || pv < 0 {
+        code = 1;
+    } else if sys_mprotect(sh as u64, PAGE, RW) != -13 {
+        code = 2;
+    } else {
+        // Both read-faulted in before the mprotect: the private page must
+        // be (or become) a copy, never the shared one made writable
+        if get(sh as u64 + 40) != BEFORE
+            || get(pv as u64 + 40) != BEFORE
+            || sys_mprotect(pv as u64, PAGE, RW) != 0
+        {
+            code = 3;
+        } else {
+            put(pv as u64 + 40, CHILD);
+            let mut v = 0u64;
+            sys_pread64(fd, (&mut v as *mut u64).cast(), 8, 40);
+            if v != BEFORE || get(sh as u64 + 40) != BEFORE {
+                code = 4;
+            }
+        }
+    }
+    sys_munmap(sh as u64, PAGE);
+    sys_munmap(pv as u64, PAGE);
+    sys_close(fd as u64);
+    sys_unlink(FILE.as_ptr());
+    code
+}
+
+/// The page with the end of the file reads (zero past it), the next
+/// one is SIGBUS
+fn file_eof(p: u64) -> i64 {
+    if get(p + 200) != 0 {
+        return 1;
+    }
+    let pid = sys_fork();
+    if pid == 0 {
+        get(p + PAGE);
+        sys_exit(0);
+    }
+    let r = reap(pid);
+    if r == 0x100 + SIGBUS { 0 } else { 10 + r }
+}
+
+fn shmem_dontneed() {
+    one_page(b"SHMEM_DONTNEED", MAP_SHARED, |p| {
+        put(p, BEFORE);
+        if sys_madvise(p, PAGE, MADV_DONTNEED) != 0 || get(p) != BEFORE {
+            return 1;
+        }
+        0
+    });
+    one_page(b"SHMEM_REMOVE", MAP_SHARED, |p| {
+        put(p, BEFORE);
+        if sys_madvise(p, PAGE, MADV_REMOVE) != 0 || get(p) != 0 {
+            return 1;
+        }
+        0
+    });
+}
+
+fn shmem_dontunmap() {
+    const MREMAP_DONTUNMAP: u32 = 4;
+    one_page(b"SHMEM_MREMAP_DONTUNMAP", MAP_SHARED, |p| {
+        put(p, BEFORE);
+        let q = sys_mremap(p, PAGE, PAGE, MREMAP_MAYMOVE | MREMAP_DONTUNMAP, 0);
+        if q < 0 {
+            return 1000 + q;
+        }
+        let q = q as u64;
+        let mut code = if get(q) == BEFORE && get(p) == BEFORE {
+            0
+        } else {
+            1
+        };
+        put(q + 8, CHILD);
+        if code == 0 && get(p + 8) != CHILD {
+            code = 2;
+        }
+        sys_munmap(q, PAGE);
+        code
+    });
+}
+
+fn shmem_remove_shared() {
+    one_page(b"SHMEM_REMOVE_SHARED", MAP_SHARED, |p| {
+        put(p, BEFORE);
+        let (to_child, from_parent) = pipe();
+        let (to_parent, from_child) = pipe();
+        let pid = sys_fork();
+        if pid == 0 {
+            let r = sys_madvise(p, PAGE, MADV_REMOVE);
+            send(from_child);
+            recv(to_child);
+            sys_exit(if r == 0 && get(p) == PARENT { 0 } else { 1 });
+        }
+        recv(to_parent);
+        let mut code = if get(p) == 0 { 0 } else { 2 };
+        put(p, PARENT);
+        send(from_parent);
+        let r = reap(pid);
+        if code == 0 && r != 0 {
+            code = 10 + r;
+        }
+        for fd in [to_child, from_parent, to_parent, from_child] {
+            sys_close(fd);
+        }
+        code
+    });
+}
+
+fn shmem_remove_past_size() {
+    const NAME: &[u8] = b"SHMEM_REMOVE_PAST_SIZE";
+    let p = map(PAGE, MAP_SHARED);
+    let q = sys_mremap(p, PAGE, 1100 * PAGE, MREMAP_MAYMOVE, 0);
+    if p == 0 || q < 0 {
+        report_code(NAME, -1);
+        return;
+    }
+    let q = q as u64;
+    let r = sys_madvise(q + 1024 * PAGE, PAGE, MADV_REMOVE);
+    report_code(NAME, if r == 0 { 0 } else { 1000 - r });
+    sys_munmap(q, 1100 * PAGE);
+}
+
+fn shmem_beyond_size() {
+    const NAME: &[u8] = b"SHMEM_BEYOND_SIZE";
+    let p = map(PAGE, MAP_SHARED);
+    if p == 0 {
+        report_code(NAME, -1);
+        return;
+    }
+    put(p, BEFORE);
+    let q = sys_mremap(p, PAGE, 2 * PAGE, MREMAP_MAYMOVE, 0);
+    if q < 0 {
+        report_code(NAME, -2);
+        return;
+    }
+    let q = q as u64;
+    let mut code = if get(q) == BEFORE { 0 } else { 1 };
+    let pid = sys_fork();
+    if pid == 0 {
+        get(q + PAGE);
+        sys_exit(0);
+    }
+    let r = reap(pid);
+    if code == 0 && r != 0x100 + SIGBUS {
+        code = 10 + r;
+    }
+    report_code(NAME, code);
+    sys_munmap(q, 2 * PAGE);
+}
+
+fn private_cow() {
+    one_page(b"FORK_PRIVATE_COW", MAP_PRIVATE, |p| {
+        exchange(p + 8, false, nop)
+    });
+}
+
+fn mprotect_cow() {
+    one_page(b"FORK_MPROTECT_COW", MAP_PRIVATE, |p| {
+        exchange(p + 8, false, ro_rw)
+    });
+}
+
+fn rdonly_cow() {
+    one_page(b"FORK_RDONLY_COW", MAP_PRIVATE, |p| {
+        put(p + 8, BEFORE);
+        sys_mprotect(p, PAGE, PROT_READ);
+        let (to_child, from_parent) = pipe();
+        let pid = sys_fork();
+        if pid == 0 {
+            recv(to_child);
+            // The parent's write after fork must not show here
+            let code = if get(p + 8) == BEFORE { 0 } else { 1 };
+            make_rw(p);
+            put(p + 8, CHILD);
+            sys_exit(code);
+        }
+        make_rw(p);
+        put(p + 8, PARENT);
+        send(from_parent);
+        let r = reap(pid);
+        sys_close(to_child);
+        sys_close(from_parent);
+        if r != 0 {
+            10 + r
+        } else if get(p + 8) != PARENT {
+            2
+        } else {
+            0
+        }
+    });
+}
+
+fn remote_write_cow() {
+    one_page(b"FORK_REMOTE_WRITE_COW", MAP_PRIVATE, |p| {
+        put(p + 8, BEFORE);
+        let (to_child, from_parent) = pipe();
+        let pid = sys_fork();
+        if pid == 0 {
+            recv(to_child);
+            sys_exit(if get(p + 8) == CHILD { 0 } else { 1 });
+        }
+        let v = CHILD;
+        let local = IoVec {
+            iov_base: (&v as *const u64).cast(),
+            iov_len: 8,
+        };
+        let remote = IoVec {
+            iov_base: (p + 8) as *const u8,
+            iov_len: 8,
+        };
+        let n = sys_process_vm_writev(pid as i32, &local, 1, &remote, 1, 0);
+        send(from_parent);
+        let r = reap(pid);
+        sys_close(to_child);
+        sys_close(from_parent);
+        if n != 8 {
+            1000 + n
+        } else if r != 0 {
+            10 + r
+        } else if get(p + 8) != BEFORE {
+            2
+        } else {
+            0
+        }
+    });
+}
+
+/// A child that waits on a pipe with a page at a known address (one
+/// mmap with `prot`, `flags`); its pid, the page and the pipe to release
+/// it. The child exits 0 once released.
+fn parked_child(prot: u32, flags: u32) -> (i64, u64, u64) {
+    let p = sys_mmap(0, PAGE, prot, flags | MAP_ANONYMOUS, -1, 0) as u64;
+    let (to_child, from_parent) = pipe();
+    let pid = sys_fork();
+    if pid == 0 {
+        recv(to_child);
+        sys_exit(0);
+    }
+    sys_close(to_child);
+    (pid, p, from_parent)
+}
+
+fn remote_write_perm() {
+    let v = CHILD;
+    let local = IoVec {
+        iov_base: (&v as *const u64).cast(),
+        iov_len: 8,
+    };
+    // Another user's process: EPERM
+    let (pid, p, rel) = parked_child(RW, MAP_PRIVATE);
+    let w = sys_fork();
+    if w == 0 {
+        if sys_setresuid(65534, 65534, 65534) != 0 {
+            sys_exit(9);
+        }
+        let remote = IoVec {
+            iov_base: p as *const u8,
+            iov_len: 8,
+        };
+        let n = sys_process_vm_writev(pid as i32, &local, 1, &remote, 1, 0);
+        sys_exit(if n == -1 { 0 } else { 1 });
+    }
+    let r = reap(w);
+    send(rel);
+    sys_close(rel);
+    let r2 = reap(pid);
+    sys_munmap(p, PAGE);
+    report_code(
+        b"REMOTE_WRITE_PERM",
+        if r == 0 && r2 == 0 { 0 } else { r * 100 + r2 },
+    );
+    // A read-only shared mapping: EFAULT
+    let (pid, p, rel) = parked_child(PROT_READ, MAP_SHARED);
+    let remote = IoVec {
+        iov_base: p as *const u8,
+        iov_len: 8,
+    };
+    let n = sys_process_vm_writev(pid as i32, &local, 1, &remote, 1, 0);
+    send(rel);
+    sys_close(rel);
+    let r2 = reap(pid);
+    sys_munmap(p, PAGE);
+    report_code(
+        b"REMOTE_WRITE_RDONLY",
+        if n == -14 && r2 == 0 { 0 } else { 1000 - n },
+    );
+}
+
+fn remote_bounds() {
+    #[cfg(target_arch = "x86_64")]
+    const KERNEL: u64 = 0xffff_8880_0000_0000;
+    #[cfg(target_arch = "aarch64")]
+    const KERNEL: u64 = 0xffff_0000_0000_0000;
+    let (pid, p, rel) = parked_child(RW, MAP_PRIVATE);
+    // Mapped here only after the fork: unmapped in the child
+    let hole = map(PAGE, MAP_PRIVATE);
+    let mut buf = [0u8; 16];
+    let local = IoVec {
+        iov_base: buf.as_mut_ptr(),
+        iov_len: 16,
+    };
+    let rw = |addr: u64, write: bool| -> i64 {
+        let remote = IoVec {
+            iov_base: addr as *const u8,
+            iov_len: 16,
+        };
+        if write {
+            sys_process_vm_writev(pid as i32, &local, 1, &remote, 1, 0)
+        } else {
+            sys_process_vm_readv(pid as i32, &local, 1, &remote, 1, 0)
+        }
+    };
+    let mut code = 0;
+    for (i, a) in [KERNEL, hole].into_iter().enumerate() {
+        if rw(a, false) != -14 || rw(a, true) != -14 {
+            code = 1 + i as i64;
+        }
+    }
+    send(rel);
+    sys_close(rel);
+    let r = reap(pid);
+    sys_munmap(p, PAGE);
+    sys_munmap(hole, PAGE);
+    // Across a boundary: two pages of a child, 16 bytes over the seam
+    let q = map(2 * PAGE, MAP_PRIVATE);
+    for i in 0..16u64 {
+        unsafe { core::ptr::write_volatile((q + PAGE - 8 + i) as *mut u8, i as u8 + 1) };
+    }
+    let (to_child, from_parent) = pipe();
+    let pid2 = sys_fork();
+    if pid2 == 0 {
+        recv(to_child);
+        let ok = (0..16u64).all(|i| unsafe {
+            core::ptr::read_volatile((q + PAGE - 8 + i) as *const u8) == 0x40 + i as u8
+        });
+        sys_exit(if ok { 0 } else { 1 });
+    }
+    let mut got = [0u8; 16];
+    let lg = IoVec {
+        iov_base: got.as_mut_ptr(),
+        iov_len: 16,
+    };
+    let rem = IoVec {
+        iov_base: (q + PAGE - 8) as *const u8,
+        iov_len: 16,
+    };
+    let n = sys_process_vm_readv(pid2 as i32, &lg, 1, &rem, 1, 0);
+    if code == 0 && (n != 16 || (0..16).any(|i| got[i] != i as u8 + 1)) {
+        code = 10;
+    }
+    let put16: [u8; 16] = core::array::from_fn(|i| 0x40 + i as u8);
+    let lp = IoVec {
+        iov_base: put16.as_ptr(),
+        iov_len: 16,
+    };
+    if code == 0 && sys_process_vm_writev(pid2 as i32, &lp, 1, &rem, 1, 0) != 16 {
+        code = 11;
+    }
+    send(from_parent);
+    let r2 = reap(pid2);
+    sys_close(to_child);
+    sys_close(from_parent);
+    sys_munmap(q, 2 * PAGE);
+    if code == 0 && (r != 0 || r2 != 0) {
+        code = 100 + r * 10 + r2;
+    }
+    report_code(b"REMOTE_ACCESS_BOUNDS", code);
+}
+
+fn dontfork() {
+    one_page(b"FORK_DONTFORK", MAP_PRIVATE, |p| {
+        put(p, BEFORE);
+        if sys_madvise(p, PAGE, MADV_DONTFORK) != 0 {
+            return -2;
+        }
+        let pid = sys_fork();
+        if pid == 0 {
+            // Not mapped here: this read must kill the child
+            get(p);
+            sys_exit(0);
+        }
+        let r = reap(pid);
+        if r != 0x100 + SIGSEGV as i64 {
+            10 + r
+        } else if get(p) != BEFORE {
+            3
+        } else {
+            0
+        }
+    });
+}
+
+fn wipeonfork() {
+    one_page(b"FORK_WIPEONFORK", MAP_PRIVATE, |p| {
+        put(p, BEFORE);
+        if sys_madvise(p, PAGE, MADV_WIPEONFORK) != 0 {
+            return -2;
+        }
+        let pid = sys_fork();
+        if pid == 0 {
+            let code = if get(p) == 0 { 0 } else { 1 };
+            put(p, CHILD);
+            sys_exit(code);
+        }
+        let r = reap(pid);
+        if r != 0 {
+            10 + r
+        } else if get(p) != BEFORE {
+            3
+        } else {
+            0
+        }
+    });
+}
+
+/// Pattern word of the page at `a`
+fn pattern(a: u64) -> u64 {
+    a ^ 0x5a5a_5a5a_0000_0000
+}
+
+fn thp() {
+    const NAME: &[u8] = b"FORK_THP";
+    let p = map(2 * HUGE, MAP_PRIVATE);
+    if p == 0 {
+        report_code(NAME, -1);
+        return;
+    }
+    let base = (p + HUGE - 1) & !(HUGE - 1);
+    // EINVAL without THP support (Linux): still a valid fork test
+    sys_madvise(base, HUGE, MADV_HUGEPAGE);
+    for a in (base..base + HUGE).step_by(PAGE as usize) {
+        put(a, pattern(a));
+        put(a + PAGE - 8, pattern(a));
+    }
+    let pid = sys_fork();
+    if pid == 0 {
+        let ok = (base..base + HUGE)
+            .step_by(PAGE as usize)
+            .all(|a| get(a) == pattern(a) && get(a + PAGE - 8) == pattern(a));
+        sys_exit(if ok { 0 } else { 1 });
+    }
+    let mut code = reap(pid);
+    if code == 0 {
+        code = exchange(base + HUGE / 2 + 16, false, nop);
+    }
+    if code == 0
+        && !(base..base + HUGE)
+            .step_by(PAGE as usize)
+            .all(|a| get(a) == pattern(a))
+    {
+        code = 4;
+    }
+    report_code(NAME, code);
+    sys_munmap(p, 2 * HUGE);
+}
+
+/// shm_nattch of segment `id` (shmid64_ds: offset 88), -errno
+fn nattch(id: i32) -> i64 {
+    let mut ds = [0u64; 14];
+    let r = sys_shmctl(id, IPC_STAT, ds.as_mut_ptr() as u64);
+    if r < 0 { r } else { ds[11] as i64 }
+}
+
+fn shm_nattch_fork() {
+    const NAME: &[u8] = b"SHM_NATTCH_FORK";
+    let id = sys_shmget(IPC_PRIVATE, PAGE as usize, IPC_CREAT | 0o600) as i32;
+    let a = sys_shmat(id, 0, 0);
+    if id < 0 || a < 0 {
+        report_code(NAME, -1);
+        return;
+    }
+    let a = a as u64;
+    put(a, BEFORE);
+    let (to_child, from_parent) = pipe();
+    let (to_parent, from_child) = pipe();
+    let pid = sys_fork();
+    if pid == 0 {
+        let code = if get(a) == BEFORE { 0 } else { 1 };
+        put(a + 8, CHILD);
+        send(from_child);
+        recv(to_child);
+        sys_exit(code);
+    }
+    let mut code = 0;
+    recv(to_parent);
+    if nattch(id) != 2 {
+        code = 2;
+    } else if get(a + 8) != CHILD {
+        code = 3;
+    }
+    send(from_parent);
+    let r = reap(pid);
+    if code == 0 && r != 0 {
+        code = 10 + r;
+    }
+    if code == 0 && nattch(id) != 1 {
+        code = 4;
+    }
+    sys_shmdt(a);
+    if code == 0 && nattch(id) != 0 {
+        code = 5;
+    }
+    sys_shmctl(id, IPC_RMID, 0);
+    if code == 0 && nattch(id) != -22 {
+        code = 6;
+    }
+    for fd in [to_child, from_parent, to_parent, from_child] {
+        sys_close(fd);
+    }
+    report_code(NAME, code);
+}
+
+/// Let exited tasks' CPUs switch away
+fn settle() {
+    let ts = Timespec {
+        tv_sec: 0,
+        tv_nsec: 20_000_000,
+    };
+    sys_nanosleep(&ts, core::ptr::null_mut());
+}
+
+fn shm_rmid_exit() {
+    const NAME: &[u8] = b"SHM_RMID_EXIT";
+    // Larger than the Linux MemFree noise allowed below
+    const SIZE: u64 = 96 << 20;
+    let tol = if host_mode() { 64 * 1024 } else { 512 };
+    settle();
+    let before = meminfo(b"MemFree:");
+    let (to_parent, from_child) = pipe();
+    let pid = sys_fork();
+    if pid == 0 {
+        let id = sys_shmget(IPC_PRIVATE, SIZE as usize, IPC_CREAT | 0o600) as i32;
+        let a = sys_shmat(id, 0, 0);
+        if id < 0 || a < 0 {
+            sys_exit(1);
+        }
+        for p in (a as u64..a as u64 + SIZE).step_by(PAGE as usize) {
+            put(p, p);
+        }
+        let ok = meminfo(b"MemFree:") < before - (SIZE as i64 >> 10) + tol;
+        sys_shmctl(id, IPC_RMID, 0);
+        sys_write(from_child, (&id as *const i32).cast(), 4);
+        // Exit still attached: the exit's detach destroys it
+        sys_exit(if ok { 0 } else { 2 });
+    }
+    let mut id = -1i32;
+    sys_read(to_parent, (&mut id as *mut i32).cast(), 4);
+    let mut code = reap(pid);
+    if code == 0 && nattch(id) != -22 {
+        code = 3;
+    }
+    let mut after = 0;
+    for _ in 0..50 {
+        settle();
+        after = meminfo(b"MemFree:");
+        if before - after <= tol {
+            break;
+        }
+    }
+    if code == 0 && before - after > tol {
+        print(NAME);
+        print(b": MemFree before ");
+        print_num(before);
+        print(b" kB, after ");
+        print_num(after);
+        println(b" kB");
+        code = 4;
+    }
+    sys_close(to_parent);
+    sys_close(from_child);
+    report_code(NAME, code);
+}
+
+/// One stress worker: 20 rounds of forking a grandchild that touches
+/// the segment and exits attached or detaches first; worker 0 removes
+/// the segment after round 10; exits attached
+fn stress_worker(id: i32, a: u64, size: u64, w: u64) -> u64 {
+    for round in 0..20u64 {
+        let pid = sys_fork();
+        if pid == 0 {
+            let off = ((w * 20 + round) * PAGE * 7) % size;
+            put(a + off, off);
+            if round % 2 == 0 {
+                sys_shmdt(a);
+            }
+            sys_exit(0);
+        }
+        if reap(pid) != 0 {
+            return 1;
+        }
+        if w == 0 && round == 10 {
+            sys_shmctl(id, IPC_RMID, 0);
+        }
+    }
+    0
+}
+
+fn shm_stress() {
+    const NAME: &[u8] = b"SHM_STRESS";
+    const SIZE: u64 = 96 << 20;
+    let tol = if host_mode() { 64 * 1024 } else { 512 };
+    settle();
+    let before = meminfo(b"MemFree:");
+    let id = sys_shmget(IPC_PRIVATE, SIZE as usize, IPC_CREAT | 0o600) as i32;
+    let a = sys_shmat(id, 0, 0);
+    if id < 0 || a < 0 {
+        report_code(NAME, -1);
+        return;
+    }
+    let a = a as u64;
+    for p in (a..a + SIZE).step_by(PAGE as usize) {
+        put(p, p);
+    }
+    let mut pids = [0i64; 4];
+    for (w, pid) in pids.iter_mut().enumerate() {
+        *pid = sys_fork();
+        if *pid == 0 {
+            sys_exit(stress_worker(id, a, SIZE, w as u64));
+        }
+    }
+    let mut code = 0;
+    for pid in pids {
+        let r = reap(pid);
+        if code == 0 && r != 0 {
+            code = 10 + r;
+        }
+    }
+    // Still attached here: the removed segment lives until this detach
+    if code == 0 && get(a + 8 * PAGE) != a + 8 * PAGE {
+        code = 2;
+    }
+    sys_shmdt(a);
+    if code == 0 && nattch(id) != -22 {
+        code = 3;
+    }
+    let mut after = 0;
+    for _ in 0..50 {
+        settle();
+        after = meminfo(b"MemFree:");
+        if before - after <= tol {
+            break;
+        }
+    }
+    if code == 0 && before - after > tol {
+        print(NAME);
+        print(b": MemFree before ");
+        print_num(before);
+        print(b" kB, after ");
+        print_num(after);
+        println(b" kB");
+        code = 4;
+    }
+    report_code(NAME, code);
+}
+
+fn shm_rdonly_perm() {
+    const SHM_RDONLY: i32 = 0o10000;
+    const EACCES: i64 = -13;
+    const EINVAL: i64 = -22;
+    let id = sys_shmget(IPC_PRIVATE, PAGE as usize, IPC_CREAT | 0o600) as i32;
+    let a = sys_shmat(id, 0, SHM_RDONLY);
+    if id < 0 || a < 0 {
+        report_code(b"SHM_RDONLY_PERM", -1);
+        return;
+    }
+    let a = a as u64;
+    let mut code = 0;
+    let r = sys_mprotect(a, PAGE, RW);
+    if r != EACCES {
+        code = 1000 - r;
+    }
+    let r = sys_madvise(a, PAGE, MADV_REMOVE);
+    if code == 0 && r != EACCES {
+        code = 2000 - r;
+    }
+    sys_shmdt(a);
+    sys_shmctl(id, IPC_RMID, 0);
+    let p = map(PAGE, MAP_PRIVATE);
+    let r = sys_madvise(p, PAGE, MADV_REMOVE);
+    if code == 0 && r != EINVAL {
+        code = 3000 - r;
+    }
+    sys_munmap(p, PAGE);
+    report_code(b"SHM_RDONLY_PERM", code);
+}
+
+fn shm_attach_addr() {
+    const SHM_REMAP: i32 = 0o40000;
+    let id = sys_shmget(IPC_PRIVATE, PAGE as usize, IPC_CREAT | 0o600) as i32;
+    if id < 0 {
+        report_code(b"SHM_ATTACH_ADDR", -1);
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    let kernel: u64 = 0xffff_8880_0000_0000;
+    #[cfg(target_arch = "aarch64")]
+    let kernel: u64 = 0xffff_0000_0000_0000;
+    let mut code = 0;
+    let r = sys_shmat(id, kernel, 0);
+    if r != -12 {
+        code = 1000 - r;
+    }
+    let r = sys_shmat(id, 0u64.wrapping_sub(PAGE), 0);
+    if code == 0 && r != -22 {
+        code = 2000 - r;
+    }
+    let r = sys_shmat(id, 0, SHM_REMAP);
+    if code == 0 && r != -22 {
+        code = 3000 - r;
+    }
+    sys_shmctl(id, IPC_RMID, 0);
+    report_code(b"SHM_ATTACH_ADDR", code);
+}
+
+// ---------------------------------------------------------------------
+// FORK_COW_RACE: writer threads vs fork
+// ---------------------------------------------------------------------
+
+const CLONE_THREAD_FLAGS: u64 = 0x100 // CLONE_VM
+    | 0x200 // CLONE_FS
+    | 0x400 // CLONE_FILES
+    | 0x800 // CLONE_SIGHAND
+    | 0x1_0000 // CLONE_THREAD
+    | 0x4_0000 // CLONE_SYSVSEM
+    | 0x20_0000; // CLONE_CHILD_CLEARTID
+const RACE_PAGES: u64 = 8;
+const WRITERS: usize = 2;
+
+static RACE_BASE: AtomicU64 = AtomicU64::new(0);
+static RACE_STOP: AtomicU64 = AtomicU64::new(0);
+
+#[repr(C, align(16))]
+struct ThreadStack([u8; 16384]);
+static mut STACKS: [ThreadStack; WRITERS] = [const { ThreadStack([0; 16384]) }; WRITERS];
+static mut CTIDS: [u32; WRITERS] = [0; WRITERS];
+
+/// Writer thread `idx`: bump its word (idx) of every page until stopped
+/// (yielding now and then)
+extern "C" fn writer(idx: u64) -> ! {
+    let base = RACE_BASE.load(Ordering::Relaxed);
+    let mut n = 1u64;
+    while RACE_STOP.load(Ordering::Relaxed) == 0 {
+        for pg in 0..RACE_PAGES {
+            put(base + pg * PAGE + idx * 8, n);
+        }
+        n += 1;
+        // hk does not preempt user mode: a busy thread would keep its CPU
+        if n % 16 == 0 {
+            sys_sched_yield();
+        }
+    }
+    sys_exit(0)
+}
+
+/// Start a thread running `f(arg)` on `stack_top`; its tid word `ctid`
+/// is cleared (and woken) when it exits. The tid, or -errno.
+pub(crate) unsafe fn spawn_thread(
+    stack_top: u64,
+    f: extern "C" fn(u64) -> !,
+    arg: u64,
+    ctid: *mut u32,
+) -> i64 {
+    unsafe { spawn_thread_ptid(stack_top, f, arg, ctid, core::ptr::null_mut()) }
+}
+
+/// [`spawn_thread`], with the tid also stored at `ptid` in the caller's
+/// memory (CLONE_PARENT_SETTID) unless it is null
+pub(crate) unsafe fn spawn_thread_ptid(
+    stack_top: u64,
+    f: extern "C" fn(u64) -> !,
+    arg: u64,
+    ctid: *mut u32,
+    ptid: *mut u32,
+) -> i64 {
+    const CLONE_PARENT_SETTID: u64 = 0x10_0000;
+    let flags = if ptid.is_null() {
+        CLONE_THREAD_FLAGS
+    } else {
+        CLONE_THREAD_FLAGS | CLONE_PARENT_SETTID
+    };
+    let ret: i64;
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            "test rax, rax",
+            "jnz 2f",
+            "mov rdi, r12",
+            "call r13",
+            "ud2",
+            "2:",
+            inlateout("rax") 56i64 => ret,
+            in("rdi") flags,
+            in("rsi") stack_top,
+            in("rdx") ptid,
+            in("r10") ctid,
+            in("r8") 0u64,
+            in("r12") arg,
+            in("r13") f,
+            lateout("rcx") _,
+            lateout("r11") _,
+        );
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        core::arch::asm!(
+            "svc 0",
+            "cbnz x0, 2f",
+            "mov x0, x9",
+            "blr x10",
+            "brk #0",
+            "2:",
+            inlateout("x0") flags as i64 => ret,
+            in("x1") stack_top,
+            in("x2") ptid,
+            in("x3") 0u64,
+            in("x4") ctid,
+            in("x8") 220u64,
+            in("x9") arg,
+            in("x10") f,
+        );
+    }
+    ret
+}
+
+/// Wait (up to 60 s) for the thread whose tid word is `ctid` to exit:
+/// its exit clears the word and wakes a futex wait on it
+/// (CLONE_CHILD_CLEARTID). Bounded by time, not by a count of yields,
+/// which a waiter alone on its CPU runs through at once.
+pub(crate) fn join(ctid: *mut u32) -> bool {
+    let t0 = crate::net::sk::now_ms();
+    loop {
+        let v = unsafe { core::ptr::read_volatile(ctid) };
+        if v == 0 {
+            return true;
+        }
+        if crate::net::sk::now_ms() - t0 > 60_000 {
+            return false;
+        }
+        let ts = hk_syscall::Timespec {
+            tv_sec: 0,
+            tv_nsec: 100_000_000,
+        };
+        hk_syscall::sys_futex(
+            ctid,
+            hk_syscall::FUTEX_WAIT,
+            v,
+            &ts,
+            core::ptr::null_mut(),
+            0,
+        );
+    }
+}
+
+/// Child of one race round: its pages must not change (the writer
+/// threads and the parent's post-fork write live in the parent only)
+fn race_child(base: u64, round: u64) -> u64 {
+    let mut snap = [0u64; RACE_PAGES as usize * WRITERS];
+    for pg in 0..RACE_PAGES {
+        for w in 0..WRITERS as u64 {
+            snap[(pg * WRITERS as u64 + w) as usize] = get(base + pg * PAGE + w * 8);
+        }
+    }
+    for _ in 0..200 {
+        sys_sched_yield();
+    }
+    if get(base + 16 * 8) != round {
+        return 1;
+    }
+    for pg in 0..RACE_PAGES {
+        for w in 0..WRITERS as u64 {
+            if get(base + pg * PAGE + w * 8) != snap[(pg * WRITERS as u64 + w) as usize] {
+                return 2;
+            }
+        }
+    }
+    0
+}
+
+fn cow_race() {
+    const NAME: &[u8] = b"FORK_COW_RACE";
+    let base = map(RACE_PAGES * PAGE, MAP_PRIVATE);
+    if base == 0 {
+        report_code(NAME, -1);
+        return;
+    }
+    for pg in 0..RACE_PAGES {
+        put(base + pg * PAGE, 0);
+    }
+    RACE_BASE.store(base, Ordering::Relaxed);
+    RACE_STOP.store(0, Ordering::Relaxed);
+    let mut started = 0;
+    for i in 0..WRITERS {
+        let ctid = unsafe { &raw mut CTIDS[i] } as *mut u32;
+        let top = unsafe { (&raw mut STACKS[i] as *mut u8).add(16384) } as u64;
+        unsafe { core::ptr::write_volatile(ctid, 1) };
+        if unsafe { spawn_thread(top, writer, i as u64, ctid) } > 0 {
+            started += 1;
+        }
+    }
+    let mut code = if started == WRITERS { 0 } else { -2 };
+    let marker = base + 16 * 8;
+    for round in 1..=20u64 {
+        if code != 0 {
+            break;
+        }
+        put(marker, round);
+        let pid = sys_fork();
+        if pid == 0 {
+            sys_exit(race_child(base, round));
+        }
+        // Right after fork: the parent's TLB still holds the writable
+        // entry it just used
+        put(marker, round + 1000);
+        let r = reap(pid);
+        if r != 0 {
+            code = round as i64 * 100 + r;
+        }
+    }
+    RACE_STOP.store(1, Ordering::Relaxed);
+    for i in 0..WRITERS {
+        if !join(unsafe { &raw mut CTIDS[i] } as *mut u32) && code == 0 {
+            code = -3;
+        }
+    }
+    report_code(NAME, code);
+    sys_munmap(base, RACE_PAGES * PAGE);
+}
+
+/// A page of /dev/zero mapped MAP_SHARED, written before fork: the child
+/// reads the parent's value and its own write shows in the parent
+fn zero_shared_fork() {
+    const NAME: &[u8] = b"ZERO_SHARED_FORK";
+    let fd = sys_open(b"/dev/zero\0".as_ptr(), O_RDWR, 0) as i32;
+    let p = sys_mmap(0, PAGE, RW, MAP_SHARED, fd, 0);
+    sys_close(fd as u64);
+    if p < 0 {
+        report_code(NAME, -1);
+        return;
+    }
+    let p = p as u64;
+    put(p + 8, PARENT);
+    let pid = sys_fork();
+    if pid == 0 {
+        let saw = get(p + 8);
+        put(p + 16, CHILD);
+        sys_exit(if saw == PARENT { 0 } else { 3 });
+    }
+    let r = reap(pid);
+    let code = if r != 0 {
+        r
+    } else if get(p + 16) != CHILD {
+        4
+    } else {
+        0
+    };
+    sys_munmap(p, PAGE);
+    report_code(NAME, code);
+}
+
+// ---------------------------------------------------------------------
+// TRUNC_FORK_RACE: truncate vs fork of a shared file mapping
+// ---------------------------------------------------------------------
+
+static TRUNC_FD: AtomicU64 = AtomicU64::new(0);
+/// Round the truncating thread should do next; it stores it in
+/// TRUNC_DONE once its ftruncate returned (0: stop)
+static TRUNC_GO: AtomicU64 = AtomicU64::new(0);
+static TRUNC_DONE: AtomicU64 = AtomicU64::new(0);
+
+extern "C" fn truncater(_: u64) -> ! {
+    let mut last = 0;
+    loop {
+        let go = TRUNC_GO.load(Ordering::Acquire);
+        if go == u64::MAX {
+            sys_exit(0);
+        }
+        if go != last {
+            sys_ftruncate(TRUNC_FD.load(Ordering::Relaxed) as i32, PAGE as i64);
+            TRUNC_DONE.store(go, Ordering::Release);
+            last = go;
+        }
+    }
+}
+
+/// One round: grow the file, fault its second page in, then fork while
+/// the thread cuts the file back to one page. The child waits for the
+/// cut to finish and touches the page: SIGBUS is right, reading it
+/// means a stale entry survived the truncate.
+fn trunc_round(fd: i32, p: u64, round: u64, pipe: [i32; 2]) -> i64 {
+    sys_ftruncate(fd, 2 * PAGE as i64);
+    put(p + PAGE + 8, PARENT);
+    TRUNC_GO.store(round, Ordering::Release);
+    // A varying head start for the truncate
+    for _ in 0..(round % 7) * 50 {
+        core::hint::spin_loop();
+    }
+    let pid = sys_fork();
+    if pid == 0 {
+        let mut b = [0u8; 1];
+        sys_read(pipe[0] as u64, b.as_mut_ptr(), 1);
+        get(p + PAGE + 8);
+        sys_exit(0);
+    }
+    while TRUNC_DONE.load(Ordering::Acquire) != round {
+        core::hint::spin_loop();
+    }
+    sys_write(pipe[1] as u64, b"x".as_ptr(), 1);
+    let r = reap(pid);
+    if r == 0x100 + SIGBUS {
+        0
+    } else {
+        round as i64 * 1000 + r
+    }
+}
+
+fn trunc_fork_race() {
+    const NAME: &[u8] = b"TRUNC_FORK_RACE";
+    let Some((fd, p)) = map_file(2 * PAGE as i64, 2 * PAGE) else {
+        report_code(NAME, -1);
+        return;
+    };
+    let mut pipe = [0i32; 2];
+    sys_pipe(pipe.as_mut_ptr());
+    TRUNC_FD.store(fd as u64, Ordering::Relaxed);
+    TRUNC_GO.store(0, Ordering::Relaxed);
+    TRUNC_DONE.store(0, Ordering::Relaxed);
+    let ctid = unsafe { &raw mut CTIDS[0] } as *mut u32;
+    let top = unsafe { (&raw mut STACKS[0] as *mut u8).add(16384) } as u64;
+    unsafe { core::ptr::write_volatile(ctid, 1) };
+    let mut code = if unsafe { spawn_thread(top, truncater, 0, ctid) } > 0 {
+        0
+    } else {
+        -2
+    };
+    for round in 1..=300u64 {
+        if code != 0 {
+            break;
+        }
+        code = trunc_round(fd, p, round, pipe);
+    }
+    TRUNC_GO.store(u64::MAX, Ordering::Release);
+    if !join(ctid) && code == 0 {
+        code = -3;
+    }
+    sys_close(pipe[0] as u64);
+    sys_close(pipe[1] as u64);
+    unmap_file(fd, p, 2 * PAGE);
+    report_code(NAME, code);
+}
+
+/// One round: map the grown file, fault the second page in, then move
+/// the mapping while the thread cuts the file to one page. 0 if the cut
+/// page is not resident at the new address once both are done.
+fn mremap_trunc_round(fd: i32, round: u64, dst: u64) -> i64 {
+    // A placeholder keeps the file's mapping off `dst`; MREMAP_FIXED
+    // replaces it
+    const MAP_FIXED: u32 = 0x10;
+    sys_mmap(
+        dst,
+        2 * PAGE,
+        0,
+        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
+        -1,
+        0,
+    );
+    sys_ftruncate(fd, 2 * PAGE as i64);
+    let p = sys_mmap(0, 2 * PAGE, RW, MAP_SHARED, fd, 0);
+    if p < 0 {
+        return -4;
+    }
+    let p = p as u64;
+    put(p + PAGE + 8, PARENT);
+    TRUNC_GO.store(round, Ordering::Release);
+    for _ in 0..(round % 7) * 50 {
+        core::hint::spin_loop();
+    }
+    let flags = MREMAP_MAYMOVE | 2; // MREMAP_FIXED
+    let q = sys_mremap(p, 2 * PAGE, 2 * PAGE, flags, dst);
+    while TRUNC_DONE.load(Ordering::Acquire) != round {
+        core::hint::spin_loop();
+    }
+    let mut vec = [0u8; 1];
+    let r = hk_syscall::sys_mincore(dst + PAGE, PAGE, vec.as_mut_ptr());
+    sys_munmap(if q > 0 { dst } else { p }, 2 * PAGE);
+    if q < 0 || r != 0 {
+        return -5;
+    }
+    if vec[0] & 1 == 0 { 0 } else { round as i64 }
+}
+
+fn mremap_trunc_race() {
+    const NAME: &[u8] = b"MREMAP_TRUNC_RACE";
+    let Some((fd, p)) = map_file(2 * PAGE as i64, 2 * PAGE) else {
+        report_code(NAME, -1);
+        return;
+    };
+    sys_munmap(p, 2 * PAGE);
+    // A fixed destination: a range mapped and released
+    let dst = sys_mmap(0, 2 * PAGE, RW, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if dst < 0 {
+        report_code(NAME, -1);
+        return;
+    }
+    let dst = dst as u64;
+    TRUNC_FD.store(fd as u64, Ordering::Relaxed);
+    TRUNC_GO.store(0, Ordering::Relaxed);
+    TRUNC_DONE.store(0, Ordering::Relaxed);
+    let ctid = unsafe { &raw mut CTIDS[0] } as *mut u32;
+    let top = unsafe { (&raw mut STACKS[0] as *mut u8).add(16384) } as u64;
+    unsafe { core::ptr::write_volatile(ctid, 1) };
+    let mut code = if unsafe { spawn_thread(top, truncater, 0, ctid) } > 0 {
+        0
+    } else {
+        -2
+    };
+    for round in 1..=300u64 {
+        if code != 0 {
+            break;
+        }
+        code = mremap_trunc_round(fd, round, dst);
+    }
+    TRUNC_GO.store(u64::MAX, Ordering::Release);
+    if !join(ctid) && code == 0 {
+        code = -3;
+    }
+    unmap_file(fd, 0, 0);
+    report_code(NAME, code);
+}
+
+// ---------------------------------------------------------------------
+// FAULT_MPROTECT_RACE: read faults vs MADV_DONTNEED + mprotect
+// ---------------------------------------------------------------------
+
+const MP_PAGES: u64 = 64;
+
+/// Reader thread: read every page of the range until stopped
+extern "C" fn reader(_: u64) -> ! {
+    let base = RACE_BASE.load(Ordering::Relaxed);
+    while RACE_STOP.load(Ordering::Relaxed) == 0 {
+        for pg in 0..MP_PAGES {
+            get(base + pg * PAGE);
+        }
+        sys_sched_yield();
+    }
+    sys_exit(0)
+}
+
+/// Pages of [base, +MP_PAGES) the kernel can still write into (should
+/// be none: the range is read-only)
+fn writable_pages(base: u64) -> i64 {
+    let (r, w) = pipe();
+    let mut bad = 0;
+    for pg in 0..MP_PAGES {
+        // On EFAULT the byte stays in the pipe (at most MP_PAGES pile up)
+        send(w);
+        if sys_read(r, (base + pg * PAGE + 8) as *mut u8, 1) != -14 {
+            bad += 1;
+        }
+    }
+    sys_close(r);
+    sys_close(w);
+    bad
+}
+
+fn mprotect_race() {
+    const NAME: &[u8] = b"FAULT_MPROTECT_RACE";
+    let base = map(MP_PAGES * PAGE, MAP_PRIVATE);
+    if base == 0 {
+        report_code(NAME, -1);
+        return;
+    }
+    RACE_BASE.store(base, Ordering::Relaxed);
+    RACE_STOP.store(0, Ordering::Relaxed);
+    let ctid = unsafe { &raw mut CTIDS[0] } as *mut u32;
+    let top = unsafe { (&raw mut STACKS[0] as *mut u8).add(16384) } as u64;
+    unsafe { core::ptr::write_volatile(ctid, 1) };
+    let mut code = if unsafe { spawn_thread(top, reader, 0, ctid) } > 0 {
+        0
+    } else {
+        -2
+    };
+    for round in 0..20 {
+        if code != 0 {
+            break;
+        }
+        sys_mprotect(base, MP_PAGES * PAGE, RW);
+        sys_madvise(base, MP_PAGES * PAGE, MADV_DONTNEED);
+        for _ in 0..4 {
+            sys_sched_yield();
+        }
+        sys_mprotect(base, MP_PAGES * PAGE, PROT_READ);
+        let bad = writable_pages(base);
+        if bad != 0 {
+            code = round * 1000 + bad;
+        }
+    }
+    RACE_STOP.store(1, Ordering::Relaxed);
+    if !join(ctid) && code == 0 {
+        code = -3;
+    }
+    report_code(NAME, code);
+    sys_munmap(base, MP_PAGES * PAGE);
+}

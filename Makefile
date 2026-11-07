@@ -291,13 +291,15 @@ clippy:
 clippy-arm: user-arm
 	cargo clippy --target $(TARGET_ARM) -p hk-kernel $(CLIPPY_FEATURES) -- $(CLIPPY_FLAGS)
 
-# Format all code
+# Format all code (kernel crate and the user/ workspace)
 fmt:
 	cargo fmt
+	cd user && cargo fmt
 
 # Check formatting without modifying
 fmt-check:
 	cargo fmt --check
+	cd user && cargo fmt --check
 
 # x86 boot test with RAM above 4GB (DMA addressing); by hand, not in
 # the gate

@@ -445,6 +445,9 @@ pub fn poll(s: &UnixSock) -> u16 {
     }
     if writable {
         mask |= POLLOUT | POLLWRNORM | POLLWRBAND;
+    } else {
+        // SIGIO once there is room (Linux unix_dgram_poll)
+        s.sk.set_nospace();
     }
     mask
 }

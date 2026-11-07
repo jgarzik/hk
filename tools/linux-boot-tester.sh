@@ -210,23 +210,26 @@ timeout "$TIMEOUT" "$QEMU_BIN" "${KVM[@]}" "${QEMU_MACHINE[@]}" \
     -append "console=$CONSOLE rdinit=/bin/init panic=-1 quiet" \
     -serial file:"$SERIAL_LOG" </dev/null || true
 
-# BOOT_COMPLETE, not the "Host mode:" line after it: the kernel's
-# "reboot: Power down" can land in the middle of that one
-if ! grep -aq "^BOOT_COMPLETE" "$SERIAL_LOG"; then
+# Verdicts come from the log without kernel messages: a printk
+# ("[   66.926307] reboot: Power down") can land inside a line the
+# serial port was still sending ("BOOT_COMPLET[ ...] ...\nE")
+LOG=$WORK/serial.clean
+sed -zE 's/\[ *[0-9]+\.[0-9]+\] [^\n]*\n//g' "$SERIAL_LOG" > "$LOG"
+if ! grep -aq "^BOOT_COMPLETE" "$LOG"; then
     echo "Linux boot test FAILED - boot_tester did not finish:"
     tail -20 "$SERIAL_LOG"
     exit 1
 fi
-FAILS=$(grep -ac FAIL "$SERIAL_LOG" || true)
-echo "OK=$(grep -ac ':OK' "$SERIAL_LOG") FAIL=$FAILS SKIP=$(grep -ac ':SKIP' "$SERIAL_LOG")"
+FAILS=$(grep -ac FAIL "$LOG" || true)
+echo "OK=$(grep -ac ':OK' "$LOG") FAIL=$FAILS SKIP=$(grep -ac ':SKIP' "$LOG")"
 if [ "$FAILS" != 0 ]; then
     echo "Linux boot test FAILED - tests disagree with Linux:"
-    grep -a FAIL "$SERIAL_LOG"
+    grep -a FAIL "$LOG"
     exit 1
 fi
 echo "Linux boot test PASSED"
 if [ -n "$CACHE" ]; then
     mkdir -p "${CACHE%/*}"
-    grep -ac ':OK' "$SERIAL_LOG" > "$CACHE.$$"
+    grep -ac ':OK' "$LOG" > "$CACHE.$$"
     mv "$CACHE.$$" "$CACHE"
 fi

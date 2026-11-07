@@ -543,8 +543,10 @@ fn do_select_internal(
                     o[fd / 64] |= 1 << (fd % 64);
                 }
             }
-            if hits.iter().any(|&h| h) {
-                ready_count += 1;
+            // Each set bit counts (Linux do_select: retval per set)
+            let set = hits.iter().filter(|&&h| h).count() as i32;
+            if set > 0 {
+                ready_count += set;
                 poll_table.disable();
             }
         }

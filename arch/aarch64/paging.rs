@@ -728,8 +728,12 @@ impl Aarch64PageTable {
             let l3 = phys_to_virt_table(l2_entry.addr());
 
             // Set the L3 page entry (a fresh table, never loaded:
-            // nothing to flush; table walks are cache coherent)
+            // nothing to flush; table walks are cache coherent); a page
+            // already there stays
             let l3_entry = (*l3).entry_mut(l3_idx);
+            if l3_entry.is_valid() {
+                return Err(MapError::AlreadyMapped);
+            }
             l3_entry.set_page(pa, attrs);
         }
 

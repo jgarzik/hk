@@ -41,8 +41,9 @@ pub enum Verdict {
     Allow,
     /// Skip it, returning this (negative errno)
     Ret(i64),
-    /// SECCOMP_RET_TRAP: a forced SIGSYS, the syscall skipped (ENOSYS)
-    Trap,
+    /// SECCOMP_RET_TRAP: a forced SIGSYS carrying the filter's 16 bits
+    /// of data, the syscall skipped
+    Trap(u32),
     /// SECCOMP_RET_KILL_THREAD: the thread exits by SIGSYS (the process,
     /// if it is the last thread)
     KillThread,
@@ -98,7 +99,7 @@ fn verdict(result: u32) -> Verdict {
     match result & SECCOMP_RET_ACTION_FULL {
         SECCOMP_RET_ALLOW | SECCOMP_RET_LOG => Verdict::Allow,
         SECCOMP_RET_ERRNO => Verdict::Ret(-i64::from((result & SECCOMP_RET_DATA).min(MAX_ERRNO))),
-        SECCOMP_RET_TRAP => Verdict::Trap,
+        SECCOMP_RET_TRAP => Verdict::Trap(result & SECCOMP_RET_DATA),
         // No tracer (hk has no PTRACE_EVENT_SECCOMP) and no listener:
         // ENOSYS, the syscall skipped
         SECCOMP_RET_TRACE | SECCOMP_RET_USER_NOTIF => Verdict::Ret(-38),
@@ -124,14 +125,32 @@ pub fn secure_computing(regs: &crate::arch::UserFrame, nr: u64) -> Option<u64> {
     match check_syscall(mode, filter.as_ref(), nr, regs.ip(), regs.syscall_args()) {
         Verdict::Allow => None,
         Verdict::Ret(e) => Some(e as u64),
-        Verdict::Trap => {
-            crate::signal::force_sig(me.tid(), crate::signal::SIGSYS);
-            Some(-38i64 as u64)
+        Verdict::Trap(data) => {
+            // The handler sees the registers as at entry (Linux
+            // syscall_rollback), and the syscall returns what they hold
+            regs.syscall_rollback();
+            force_sigsys(me.tid(), regs, nr, data);
+            Some(regs.ret())
         }
         Verdict::KillThread => kill(crate::signal::SIGSYS, true),
         Verdict::KillProcess => kill(crate::signal::SIGSYS, false),
         Verdict::Strict => kill(crate::signal::SIGKILL, true),
     }
+}
+
+/// SIGSYS for syscall `nr` a filter trapped with `data` (Linux
+/// force_sig_seccomp): SYS_SECCOMP, the data in si_errno, the calling
+/// instruction, the syscall and its AUDIT_ARCH
+fn force_sigsys(tid: crate::task::Tid, regs: &crate::arch::UserFrame, nr: u64, data: u32) {
+    use crate::signal::{SIGSYS, SigFields, SigInfo, si_code};
+    let fields = SigFields::Sys {
+        call_addr: regs.ip(),
+        syscall: nr as i32,
+        arch: super::current_audit_arch(),
+    };
+    let mut info = SigInfo::new(SIGSYS, si_code::SYS_SECCOMP, fields);
+    info.errno = data as i32;
+    crate::signal::force_sig_info(tid, info);
 }
 
 /// End the thread by `sig` (`thread`, while others live) or the whole

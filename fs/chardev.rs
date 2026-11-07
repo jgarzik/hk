@@ -172,6 +172,12 @@ pub trait CharDevice: Send + Sync {
         false
     }
 
+    /// SIGIO list membership (Linux f_op->fasync; see
+    /// `FileOps::fasync`). Default none.
+    fn fasync(&self, _file: &File, _fd: i32, _on: bool) -> Option<Result<(), KernelError>> {
+        None
+    }
+
     /// Device-specific control operations
     fn ioctl(&self, _file: &File, _cmd: u32, _arg: u64) -> Result<i64, KernelError> {
         Err(KernelError::NotTty)
@@ -187,6 +193,12 @@ pub trait CharDevice: Send + Sync {
     /// queues through `pt`, then return the mask. Default: always ready
     fn poll(&self, _file: &File, _pt: Option<&mut PollTable<'_>>) -> u16 {
         POLLIN | POLLRDNORM | POLLOUT | POLLWRNORM
+    }
+
+    /// Its fops have a poll (Linux file_can_poll): epoll accepts it.
+    /// Default no (/dev/null, /dev/zero: EPERM from epoll_ctl)
+    fn can_poll(&self) -> bool {
+        false
     }
 }
 
@@ -394,6 +406,11 @@ pub struct RandomCharDevice(&'static str);
 impl CharDevice for RandomCharDevice {
     fn name(&self) -> &str {
         self.0
+    }
+
+    /// random_fops has random_poll, urandom_fops none
+    fn can_poll(&self) -> bool {
+        self.0 == "random"
     }
 
     fn positional(&self) -> bool {

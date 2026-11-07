@@ -140,6 +140,13 @@ impl<T: Clone + UserRegs> Frame<T> {
         unsafe { self.with(|r| r.restart_syscall()) }
     }
 
+    /// The syscall's registers as at entry
+    #[inline]
+    pub fn syscall_rollback(&self) {
+        // SAFETY: see above
+        unsafe { self.with(|r| r.syscall_rollback()) }
+    }
+
     /// The recorded arguments become the live ones (after a tracer stop)
     #[inline]
     pub fn sync_syscall_args(&self) {

@@ -113,10 +113,9 @@ impl Default for RLimit {
 // Default Limits
 // =============================================================================
 
-/// Create default resource limits (matching Linux defaults)
-///
-/// These defaults are used when creating a new process.
-pub fn default_rlimits() -> [RLimit; RLIM_NLIMITS] {
+/// Linux INIT_RLIMITS, before fork_init sizes RLIMIT_NPROC and
+/// RLIMIT_SIGPENDING (`init_rlimits`)
+fn default_rlimits() -> [RLimit; RLIM_NLIMITS] {
     [
         RLimit::INFINITY,                              // RLIMIT_CPU
         RLimit::INFINITY,                              // RLIMIT_FSIZE
@@ -124,17 +123,44 @@ pub fn default_rlimits() -> [RLimit; RLIM_NLIMITS] {
         RLimit::new(8 * 1024 * 1024, RLIM_INFINITY),   // RLIMIT_STACK (8MB soft)
         RLimit::new(0, RLIM_INFINITY),                 // RLIMIT_CORE (0 = no core)
         RLimit::INFINITY,                              // RLIMIT_RSS
-        RLimit::INFINITY,                              // RLIMIT_NPROC
+        RLimit::INFINITY,                              // RLIMIT_NPROC (init_rlimits)
         RLimit::new(1024, 4096),                       // RLIMIT_NOFILE (INR_OPEN_CUR, INR_OPEN_MAX)
         RLimit::new(8 * 1024 * 1024, 8 * 1024 * 1024), // RLIMIT_MEMLOCK (8MB)
         RLimit::INFINITY,                              // RLIMIT_AS
         RLimit::INFINITY,                              // RLIMIT_LOCKS
-        RLimit::new(0, 0),                             // RLIMIT_SIGPENDING
+        RLimit::new(0, 0),                             // RLIMIT_SIGPENDING (init_rlimits)
         RLimit::new(819200, 819200),                   // RLIMIT_MSGQUEUE
         RLimit::new(0, 0),                             // RLIMIT_NICE
         RLimit::new(0, 0),                             // RLIMIT_RTPRIO
         RLimit::INFINITY,                              // RLIMIT_RTTIME
     ]
+}
+
+/// Linux set_max_threads (fork_init): as many threads as kernel stacks
+/// fit in an eighth of free memory, clamped to [MIN_THREADS,
+/// MAX_THREADS (FUTEX_TID_MASK)], computed once, at the global init's
+/// signal setup at boot
+pub fn max_threads() -> u64 {
+    const MIN_THREADS: u64 = 20;
+    const MAX_THREADS: u64 = 0x3fff_ffff;
+    static N: spin::Once<u64> = spin::Once::new();
+    *N.call_once(|| {
+        let free = crate::FRAME_ALLOCATOR.stats().free_bytes;
+        let stack = crate::mm::vmstack::THREAD_SIZE as u64;
+        (free / (stack * 8)).clamp(MIN_THREADS, MAX_THREADS)
+    })
+}
+
+/// The global init's limits, which every task inherits (Linux
+/// INIT_RLIMITS, with RLIMIT_NPROC and RLIMIT_SIGPENDING set to half of
+/// max_threads by fork_init)
+pub fn init_rlimits() -> [RLimit; RLIM_NLIMITS] {
+    let mut r = default_rlimits();
+    let half = max_threads() / 2;
+    for l in [RLIMIT_NPROC, RLIMIT_SIGPENDING] {
+        r[l as usize] = RLimit::new(half, half);
+    }
+    r
 }
 
 // =============================================================================

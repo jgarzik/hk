@@ -1289,7 +1289,7 @@ pub fn sys_pidfd_open(pid: i64, flags: u32) -> i64 {
 /// # Arguments
 /// * `pidfd` - File descriptor referring to the target process
 /// * `sig` - Signal number to send
-/// * `info` - Optional siginfo_t pointer (not used currently)
+/// * `info` - Optional siginfo_t to send (else kill's)
 /// * `flags` - Flags (must be 0)
 ///
 /// # Returns
@@ -1297,7 +1297,7 @@ pub fn sys_pidfd_open(pid: i64, flags: u32) -> i64 {
 /// * -EBADF: Invalid file descriptor
 /// * -EINVAL: Invalid signal number or flags
 /// * -ESRCH: Process no longer exists
-pub fn sys_pidfd_send_signal(pidfd: i32, sig: i32, _info: u64, flags: u32) -> i64 {
+pub fn sys_pidfd_send_signal(pidfd: i32, sig: i32, info: u64, flags: u32) -> i64 {
     // Flags must be 0
     if flags != 0 {
         return KernelError::InvalidArgument.sysret();
@@ -1323,16 +1323,41 @@ pub fn sys_pidfd_send_signal(pidfd: i32, sig: i32, _info: u64, flags: u32) -> i6
         }
     };
 
-    // A pidfd whose process is still there
-    let target_pid = match crate::task::pidfd::pidfd_live_pid(&file) {
-        Ok(pid) => pid,
+    let Some(pidfd) = crate::task::pidfd::get_pidfd(&file) else {
+        return KernelError::BadFd.sysret();
+    };
+    let info = match pidfd_info(info, sig as u32, pidfd.pid()) {
+        Ok(i) => i,
         Err(e) => return e.sysret(),
     };
+    // Permission check and send to the pidfd's struct pid itself (Linux
+    // pidfd_send_signal -> kill_pid_info), so a reaped process's reused
+    // number never gets it. Signal 0 is a permission/existence probe.
+    let me = crate::signal::syscall::Sender::current();
+    let r = crate::signal::kill_pid_info(pidfd.pid_ref(), sig as u32, info, |t| {
+        me.may_kill(t, sig as u32)
+    });
+    i64::from(r)
+}
 
-    // Permission check and send (Linux pidfd_send_signal ->
-    // kill_pid_info). Signal 0 is a permission/existence probe.
-    let perm = crate::signal::syscall::user_group_send(target_pid, sig as u32);
-    i64::from(perm)
+/// The info pidfd_send_signal sends to process `pid` (Linux
+/// do_pidfd_send_signal): kill's without `uinfo`; else that siginfo,
+/// which must be for `sig` (EINVAL), with a code reserved to the kernel
+/// only from the process's own leader thread (EPERM)
+fn pidfd_info(uinfo: u64, sig: u32, pid: u64) -> Result<crate::signal::SendInfo, KernelError> {
+    use crate::signal::{SendInfo, SigInfo};
+    if uinfo == 0 {
+        return Ok(SendInfo::User);
+    }
+    let info = SigInfo::copy_from_user(uinfo)?;
+    if info.sig() != sig {
+        return Err(KernelError::InvalidArgument);
+    }
+    let me = super::percpu::current_tid();
+    if me != pid && crate::signal::syscall::reserved_to_kernel(info.code) {
+        return Err(KernelError::NotPermitted);
+    }
+    Ok(SendInfo::Info(info))
 }
 
 /// sys_pidfd_getfd - obtain a duplicate of another process's file descriptor
@@ -1376,16 +1401,10 @@ pub fn sys_pidfd_getfd(pidfd: i32, targetfd: i32, flags: u32) -> i64 {
         }
     };
 
-    // A pidfd whose process is still there
-    let target_pid = match crate::task::pidfd::pidfd_live_pid(&pidfd_file) {
-        Ok(pid) => pid,
+    // The pidfd's process itself, while it is still there
+    let target_tid = match crate::task::pidfd::pidfd_tid(&pidfd_file) {
+        Ok(tid) => tid,
         Err(e) => return e.sysret(),
-    };
-
-    // Find the target task by PID and check permissions
-    let target_tid = match find_task_by_pid(target_pid) {
-        Some(tid) => tid,
-        None => return KernelError::NoProcess.sysret(),
     };
 
     // Linux __pidfd_fget: under the target's exec_update_lock,
@@ -1400,6 +1419,12 @@ pub fn sys_pidfd_getfd(pidfd: i32, targetfd: i32, flags: u32) -> i64 {
         Some(t) => t,
         None => return KernelError::NoProcess.sysret(), // Process exiting
     };
+    // Its process still being that task, every lookup by tid above
+    // found it (the tid is not freed while it is listed); else its
+    // files are gone (Linux fget_task: EBADF)
+    if crate::task::pidfd::pidfd_tid(&pidfd_file) != Ok(target_tid) {
+        return KernelError::BadFd.sysret();
+    }
 
     // Get the file from target's fd table
     let target_file = {
@@ -1421,12 +1446,6 @@ pub fn sys_pidfd_getfd(pidfd: i32, targetfd: i32, flags: u32) -> i64 {
     };
 
     i64::from(new_fd)
-}
-
-/// Find a task by PID (returns TID of the main thread)
-fn find_task_by_pid(pid: super::Pid) -> Option<super::Tid> {
-    let table = super::percpu::TASKLIST.read();
-    table.get(pid).map(|t| t.task.tid())
 }
 
 // =============================================================================

@@ -13,7 +13,7 @@ use super::lapic;
 use super::pic;
 use crate::arch::UserFrame;
 use crate::mm::fault::{Access, VmFault};
-use crate::signal::{KSigInfo, si_code};
+use crate::signal::{SigInfo, Trap, TrapSet, si_code};
 use crate::uaccess::pagefault_disabled;
 use crate::{printk, printkln};
 
@@ -360,11 +360,27 @@ fn math_error_code(vector: u64) -> i32 {
     }
 }
 
+/// Page-fault error code bits (Linux X86_PF_PROT, X86_PF_USER)
+const PF_PROT: u64 = 1;
+const PF_USER: u64 = 4;
+
+/// The error code a user page fault at `addr` reports in sigcontext
+/// (Linux sanitize_error_code, set_signal_archinfo): a kernel address is
+/// always a protection fault, so the kernel's page tables do not show
+fn pf_signal_error(addr: u64, error: u64) -> u64 {
+    let prot = if addr >= super::paging::TASK_SIZE {
+        PF_PROT
+    } else {
+        0
+    };
+    error | prot | PF_USER
+}
+
 /// Deliver a synchronous fault signal (force_sig_fault) for the user
 /// context in `frame`: the task's pt_regs (an entry from user mode), so
 /// a handler's frame is set up there and IRETQ enters it
-fn user_fault(frame: &UserFrame, sig: u32, info: KSigInfo) {
-    crate::signal::force_sig_fault(sig, info, frame);
+fn user_fault(frame: &UserFrame, info: SigInfo, trap: TrapSet) {
+    crate::signal::force_sig_fault(info, trap, frame);
 }
 
 /// Rust exception handler (interrupts off: interrupt gates); it returns
@@ -410,13 +426,12 @@ fn handle_exception(uframe: &UserFrame, vector: u64) {
             } else {
                 (crate::signal::SIGSEGV, crate::signal::segv_code(cr2))
             };
-            let info = KSigInfo {
-                code,
-                addr: cr2,
+            let trap = TrapSet::All(Trap {
                 trapno: 14,
-                error: error_code,
-            };
-            user_fault(uframe, sig, info);
+                error: pf_signal_error(cr2, error_code),
+                addr: cr2,
+            });
+            user_fault(uframe, SigInfo::fault(sig, code, cr2), trap);
             return;
         }
         // Kernel-mode fault inside a user-copy routine (out of memory
@@ -460,13 +475,12 @@ fn handle_exception(uframe: &UserFrame, vector: u64) {
             _ => (SIGSEGV, si_code::SI_KERNEL, 0),  // #GP, #TS, ...
         };
         enable();
-        let info = KSigInfo {
-            code,
-            addr,
+        // Linux do_trap: CR2 stays the last page fault's
+        let trap = TrapSet::Code {
             trapno: vector,
             error: error_code,
         };
-        user_fault(uframe, sig, info);
+        user_fault(uframe, SigInfo::fault(sig, code, addr), trap);
         return;
     }
 

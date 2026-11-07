@@ -878,9 +878,9 @@ impl Drop for ForkCg {
     }
 }
 
-/// Detach a task from its cgroup on exit
-///
-/// Called from mark_zombie to cleanup cgroup membership.
+/// Detach the exiting task `tid` from its cgroup (Linux cgroup_exit):
+/// from exit_current while it still runs, before it is a zombie, so no
+/// reap can remove it from the task list first
 pub fn detach_task(tid: Tid) {
     // Use the existing cgroup_exit_task implementation
     cgroup_exit_task(tid);

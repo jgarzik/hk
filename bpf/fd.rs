@@ -12,7 +12,7 @@ use super::prog::BpfProg;
 use crate::fs::anon_inodes::anon_inode_getfile;
 use crate::fs::file::{File, FileOps, flags};
 use crate::fs::syscall::{current_fd_table, get_nofile_limit};
-use crate::io::poll::PollTable;
+use crate::io::poll::{POLLERR, PollTable};
 use crate::util::error::KernelError;
 
 // =============================================================================
@@ -29,9 +29,10 @@ impl FileOps for BpfMapFileOps {
         self
     }
 
+    /// No map type here has a map_poll (ring buffers do): EPOLLERR
+    /// (Linux bpf_map_poll)
     fn poll(&self, _file: &File, _pt: Option<&mut PollTable<'_>>) -> u16 {
-        // BPF map fds are always "ready" (operations never block)
-        0
+        POLLERR
     }
 
     fn release(&self, _file: &File) -> Result<(), KernelError> {
@@ -62,8 +63,9 @@ impl FileOps for BpfProgFileOps {
         self
     }
 
-    fn poll(&self, _file: &File, _pt: Option<&mut PollTable<'_>>) -> u16 {
-        0
+    /// No poll (Linux bpf_prog_fops): poll and select see it ready
+    fn can_poll(&self, _file: &File) -> bool {
+        false
     }
 
     fn release(&self, _file: &File) -> Result<(), KernelError> {

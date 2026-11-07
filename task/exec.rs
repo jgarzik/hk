@@ -294,6 +294,72 @@ fn setup_user_stack<FA: FrameAlloc<PhysAddr = u64>>(
     Ok((area, STACK_TOP - (stack_pages as u64 * PAGE_SIZE)))
 }
 
+/// The highest free page below mmap_base clear of `vmas` (Linux
+/// get_unmapped_area, top-down)
+fn free_page(vmas: &[crate::mm::Vma]) -> Option<u64> {
+    let mut spans: Vec<(u64, u64)> = vmas.iter().map(|v| (v.start, v.end)).collect();
+    highest_gap(&mut spans, crate::mm::mmap_base(), crate::mm::MMAP_MIN_ADDR)
+}
+
+/// The highest page in `[low, top)` that no span `[start, end)` of
+/// `spans` overlaps (page-aligned bounds; spans may overlap or nest):
+/// walked by start with the highest end so far, each gap below the
+/// next start is free (Linux unmapped_area_topdown's gap search)
+fn highest_gap(spans: &mut [(u64, u64)], top: u64, low: u64) -> Option<u64> {
+    spans.sort_unstable();
+    let mut reach = low;
+    let mut best = None;
+    let ends = spans.iter().copied().chain(core::iter::once((top, top)));
+    for (start, end) in ends {
+        let hi = start.min(top);
+        if hi > reach && hi - reach >= PAGE_SIZE {
+            best = Some(hi - PAGE_SIZE);
+        }
+        reach = reach.max(end);
+        if reach >= top {
+            break;
+        }
+    }
+    best
+}
+
+/// The arch's signal return page, if it has one (arm64: Linux's vDSO
+/// sigtramp), mapped read+exec in free space clear of the new image's
+/// `vmas`; its VMA
+fn map_sigpage<FA: FrameAlloc<PhysAddr = u64>>(
+    page_table: &mut ArchPageTable,
+    frame_alloc: &mut FA,
+    vmas: &[crate::mm::Vma],
+) -> Result<Option<crate::mm::Vma>, i32> {
+    use crate::mm::{PROT_EXEC, PROT_READ, VM_SIGPAGE};
+    let Some(code) = crate::arch::signal::SIGPAGE else {
+        return Ok(None);
+    };
+    let va = free_page(vmas).ok_or(ENOMEM)?;
+    let frame = user_frame()?;
+    let page = crate::arch::phys_to_virt(frame);
+    // SAFETY: a fresh frame of PAGE_SIZE bytes, ours alone, through the
+    // linear map
+    unsafe {
+        ::core::ptr::write_bytes(page, 0, PAGE_SIZE as usize);
+        for (i, w) in code.iter().enumerate() {
+            ::core::ptr::write_unaligned(page.add(i * 4).cast::<u32>(), w.to_le());
+        }
+    }
+    crate::arch::paging::sync_page(frame, true);
+    let flags = PageFlags::READ | PageFlags::EXECUTE | PageFlags::USER;
+    if page_table
+        .map_with_alloc(va, frame, flags, frame_alloc)
+        .is_err()
+    {
+        crate::FRAME_ALLOCATOR.free(frame);
+        return Err(ENOMEM);
+    }
+    let mut vma = anon_vma(va, va + PAGE_SIZE, PROT_READ | PROT_EXEC);
+    vma.flags |= VM_SIGPAGE;
+    Ok(Some(vma))
+}
+
 /// Every PT_LOAD segment and the entry point must land in mappable
 /// user space: past TASK_SIZE (or overflowing) is EINVAL (Linux
 /// BAD_ADDR), below mmap_min_addr EPERM (security_mmap_addr)
@@ -726,6 +792,8 @@ fn secureexec(c: &crate::task::Cred) -> bool {
 pub struct ExecIdentity {
     pub name: [u8; 16],
     pub dumpable: u8,
+    /// A secure exec (set-id: Linux bprm->secureexec)
+    pub secure: bool,
 }
 
 /// The new image's identity, decided before the point of no return and
@@ -749,7 +817,11 @@ fn exec_identity(path: &[u8], file: &File) -> ExecIdentity {
     } else {
         SUID_DUMP_DISABLE
     };
-    ExecIdentity { name, dumpable }
+    ExecIdentity {
+        name,
+        dumpable,
+        secure: secureexec(&c),
+    }
 }
 
 /// End the other threads of the caller's group and wait until they
@@ -790,6 +862,16 @@ fn de_thread(tid: crate::task::Tid) -> Result<(), i32> {
     // Released after TASKLIST: the old leader and exited threads
     drop(percpu::take_leadership(tgid, tid));
     Ok(())
+}
+
+/// Exec failed past its point of no return: the old image's other
+/// threads may be gone, so the caller dies on its way out (Linux
+/// bprm_execve: force_fatal_sig(SIGSEGV) unless a fatal signal is
+/// already pending)
+fn exec_fatal() {
+    if !crate::signal::fatal_signal_pending() {
+        crate::signal::force_sigsegv(percpu::current_tid());
+    }
 }
 
 /// Execute a new program, replacing the current process image
@@ -998,20 +1080,41 @@ where
             Ok(r) => r,
             Err(e) => return -e,
         };
+    // The new image's VMAs, then the signal page in the free space they
+    // leave (Linux arch_setup_additional_pages: get_unmapped_area and a
+    // special mapping once the image and stack are in place)
+    let mut vmas = image_vmas(&elf, base_addr, stack_bottom, exe_map);
+    if let Some(ie) = &interp {
+        vmas.extend(segment_vmas(ie, interp_base, interp_map));
+    }
+    match map_sigpage(&mut new_page_table, frame_alloc, &vmas) {
+        Ok(Some(v)) => vmas.push(v),
+        Ok(None) => {}
+        Err(e) => return -e,
+    }
     let user_sp = args.start_stack;
 
     let ident = exec_identity(pathname, &file);
 
     let tid = percpu::current_tid();
 
+    // The point of no return (Linux begin_new_exec sets
+    // point_of_no_return before de_thread): from here a failure kills
+    // the process instead of returning to the old image
+
     // The other threads end before the new image starts (Linux
     // begin_new_exec -> de_thread)
     if let Err(e) = de_thread(tid) {
+        exec_fatal();
         return -e;
+    }
+    // Handlers, alternate stack and timers of the old image go
+    if let Err(e) = crate::signal::exec_signals() {
+        exec_fatal();
+        return -e.errno();
     }
 
     // Now we need to update the current task and switch to the new address space
-    // This is the point of no return
 
     // The thread and process keyrings are not for the new image (Linux
     // prepare_exec_creds)
@@ -1059,13 +1162,11 @@ where
             end_data: code.end_data,
             ..args
         });
-        for vma in image_vmas(&elf, base_addr, stack_bottom, exe_map) {
-            m.insert_vma(vma);
-        }
-        if let Some(ie) = &interp {
-            for vma in segment_vmas(ie, interp_base, interp_map) {
-                m.insert_vma(vma);
+        for vma in vmas {
+            if vma.flags & crate::mm::VM_SIGPAGE != 0 {
+                mm.set_sigpage(vma.start);
             }
+            m.insert_vma(vma);
         }
     }
 
@@ -1198,4 +1299,43 @@ fn exec_name(dirfd: i32, path: &[u8]) -> Vec<u8> {
 fn exec_lookup(dirfd: i32, path: &[u8], flags: i32) -> Result<crate::fs::Path, i32> {
     use crate::fs::namei::{LookupFlags, filename_lookup};
     filename_lookup(dirfd, path, LookupFlags::at(flags)).map_err(|e| e as i32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PAGE_SIZE, highest_gap};
+
+    const P: u64 = PAGE_SIZE;
+
+    #[test]
+    fn gap_below_nested() {
+        // B nests in A: the page under the top is inside A
+        let mut s = [(P, 11 * P), (2 * P, 3 * P)];
+        assert_eq!(highest_gap(&mut s, 11 * P, 0), Some(0));
+    }
+
+    #[test]
+    fn gap_at_top() {
+        let mut s = [(P, 2 * P), (4 * P, 5 * P)];
+        assert_eq!(highest_gap(&mut s, 8 * P, 0), Some(7 * P));
+    }
+
+    #[test]
+    fn gap_between() {
+        let mut s = [(P, 2 * P), (3 * P, 9 * P), (4 * P, 5 * P)];
+        assert_eq!(highest_gap(&mut s, 9 * P, P), Some(2 * P));
+    }
+
+    #[test]
+    fn gap_none() {
+        let mut s = [(P, 4 * P), (2 * P, 9 * P)];
+        assert_eq!(highest_gap(&mut s, 9 * P, P), None);
+        assert_eq!(highest_gap(&mut [], P, P), None);
+    }
+
+    #[test]
+    fn gap_span_above_top() {
+        let mut s = [(2 * P, 3 * P), (10 * P, 12 * P)];
+        assert_eq!(highest_gap(&mut s, 8 * P, 0), Some(7 * P));
+    }
 }

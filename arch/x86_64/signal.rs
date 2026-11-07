@@ -15,7 +15,8 @@
 #![expect(dead_code)]
 
 use crate::arch::Uaccess;
-use crate::signal::{KSigInfo, SigAction, SigHandler, SigSet, sa_flags};
+use crate::signal::siginfo::UserSigInfo;
+use crate::signal::{SigAction, SigHandler, SigInfo, SigSet, Trap, sa_flags};
 use crate::uaccess::{UaccessArch, copy_from_user, copy_to_user};
 use crate::util::pod::IntoBytes;
 
@@ -165,48 +166,6 @@ impl Default for UContext {
 }
 
 // =============================================================================
-// Signal Info (siginfo_t)
-// =============================================================================
-
-/// siginfo_t structure (simplified)
-///
-/// Contains information about why a signal was raised.
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
-pub struct SigInfo {
-    /// Signal number
-    pub si_signo: i32,
-    /// Error number (if applicable)
-    pub si_errno: i32,
-    /// Signal code (SI_USER, SI_KERNEL, etc.)
-    pub si_code: i32,
-    /// Padding for alignment
-    pub _pad: i32,
-    /// Union of signal-specific fields
-    pub _fields: [u64; 14],
-}
-crate::pod!(SigInfo {
-    si_signo,
-    si_errno,
-    si_code,
-    _pad,
-    _fields
-});
-
-/// Signal sent by kill/sigsend/raise
-pub const SI_USER: i32 = 0;
-/// Signal sent by kernel
-pub const SI_KERNEL: i32 = 128;
-/// Signal sent by timer expiration
-pub const SI_TIMER: i32 = -2;
-/// Signal sent by sigqueue
-pub const SI_QUEUE: i32 = -1;
-/// Signal sent by async I/O completion
-pub const SI_ASYNCIO: i32 = -4;
-/// Signal sent by queued message arrival
-pub const SI_MESGQ: i32 = -3;
-
-// =============================================================================
 // RT Signal Frame
 // =============================================================================
 
@@ -224,7 +183,7 @@ pub struct RtSigFrame {
     /// User context for rt_sigreturn
     pub uc: UContext,
     /// Signal info (siginfo_t)
-    pub info: SigInfo,
+    pub info: UserSigInfo,
     // The FP image (sigcontext.fpstate) lives above the frame, 64-aligned
 }
 crate::pod!(RtSigFrame { pretcode, uc, info });
@@ -241,7 +200,6 @@ const _: () = assert!(core::mem::size_of::<SigSet>() == 8);
 const _: () = assert!(core::mem::offset_of!(UContext, uc_mcontext) == 40);
 const _: () = assert!(core::mem::offset_of!(UContext, uc_sigmask) == 296);
 const _: () = assert!(core::mem::size_of::<UContext>() == 304);
-const _: () = assert!(core::mem::size_of::<SigInfo>() == 128);
 const _: () = assert!(core::mem::offset_of!(RtSigFrame, uc) == 8);
 const _: () = assert!(core::mem::offset_of!(RtSigFrame, info) == 312);
 const _: () = assert!(core::mem::size_of::<RtSigFrame>() == 440);
@@ -265,6 +223,10 @@ const USER_ADDR_LIMIT: u64 = 0x0000_8000_0000_0000;
 // =============================================================================
 // Signal Frame Setup
 // =============================================================================
+
+/// No exec-time signal return page: x86-64 handlers need SA_RESTORER
+/// (Linux x86-64 too; glibc always sets it)
+pub const SIGPAGE: Option<[u32; 2]> = None;
 
 /// Calculate signal frame size
 pub const fn signal_frame_size() -> usize {
@@ -292,7 +254,8 @@ pub fn setup_rt_frame(
     sig: u32,
     action: &SigAction,
     blocked: SigSet,
-    info: &KSigInfo,
+    info: &SigInfo,
+    trap: &Trap,
     uframe: &crate::arch::UserFrame,
 ) -> Result<(), i32> {
     use super::fpu;
@@ -375,24 +338,12 @@ pub fn setup_rt_frame(
         gs: 0,
         fs: 0,
         ss: USER_SS,
-        err: info.error,
-        trapno: info.trapno,
+        err: trap.error,
+        trapno: trap.trapno,
         oldmask: blocked.bits(),
-        // CR2 is reported for page faults (vector 14)
-        cr2: if info.trapno == 14 { info.addr } else { 0 },
+        cr2: trap.addr,
         fpstate: fpstate_addr,
         reserved: [0; 8],
-    };
-
-    // Build SigInfo (si_addr is the first union field)
-    let mut fields = [0u64; 14];
-    fields[0] = info.addr;
-    let siginfo = SigInfo {
-        si_signo: sig as i32,
-        si_errno: 0,
-        si_code: info.code,
-        _pad: 0,
-        _fields: fields,
     };
 
     // Build StackT for ucontext (current stack info)
@@ -418,7 +369,7 @@ pub fn setup_rt_frame(
             uc_mcontext: sigctx,
             uc_sigmask: blocked,
         },
-        info: siginfo,
+        info: info.to_user(),
     };
 
     // Copy frame to user stack
