@@ -2159,6 +2159,11 @@ pub struct SignalStruct {
     /// The group's pending signals (Linux signal->shared_pending, and
     /// curr_target): spin, under the receiving thread's Task.sig
     shared: Mutex<GroupPending>,
+    /// PR_SET_CHILD_SUBREAPER (Linux signal->is_child_subreaper): the
+    /// process adopts its descendants' orphans; set by any thread,
+    /// under TASKLIST's write lock, read under its read lock by the
+    /// reparenting it decides (find_reaper). Not inherited by fork.
+    subreaper: crate::task::TableCell<bool>,
 }
 
 const GROUP_EXIT: u64 = 1 << 63;
@@ -2257,7 +2262,19 @@ impl SignalStruct {
             child_times: [AtomicU64::new(0), AtomicU64::new(0)],
             cputimer: crate::time::cpu_timer::GroupCputimer::new(),
             shared: Mutex::new(GroupPending::new()),
+            subreaper: crate::task::TableCell::new(false),
         }
+    }
+
+    /// The process is a child subreaper (TASKLIST held)
+    pub fn subreaper(&self, table: &crate::task::percpu::GlobalTaskTable) -> bool {
+        *self.subreaper.access(table)
+    }
+
+    /// Make the process a child subreaper or not (TASKLIST held for
+    /// writing; Linux PR_SET_CHILD_SUBREAPER)
+    pub fn set_subreaper(&self, table: &mut crate::task::percpu::GlobalTaskTable, on: bool) {
+        *self.subreaper.access_mut(table) = on;
     }
 
     /// A thread leaving the group takes its (utime, stime) here (Linux
@@ -2421,6 +2438,8 @@ impl SignalStruct {
             child_times: [AtomicU64::new(0), AtomicU64::new(0)],
             cputimer: crate::time::cpu_timer::GroupCputimer::new(),
             shared: Mutex::new(GroupPending::new()),
+            // Linux copy_signal: is_child_subreaper is not inherited
+            subreaper: crate::task::TableCell::new(false),
         })
     }
 }

@@ -490,13 +490,6 @@ de_thread
 - A pidfd polls readable when the leader exits, not when the whole
   group is gone.
 
-## Exit notification gaps
-
-**Location**: `signal/notify.rs`, `task/percpu.rs` (exit_notify)
-
-A subreaper is found only if its ancestor task itself is alive; Linux
-find_new_reaper takes any live thread of a subreaper process.
-
 ## No vDSO
 
 **Location**: `task/exec.rs`, `arch/aarch64/signal.rs`

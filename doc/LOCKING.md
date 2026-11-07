@@ -880,7 +880,8 @@ group leader is on its real parent's `children` (intrusive `ArcList`,
 link `Task.sibling`, one strong reference each; Linux only lists
 leaders); `link_child` at fork and exec's leader change, unlinked at
 reap. An exiting task first hands its children to another live thread
-of its group, else the nearest child subreaper, else init
+of its group, else a live thread of the nearest ancestor process
+that is a child subreaper (`SignalStruct.subreaper`), else init
 (`forget_original_parent`, `adopt`); an exited non-leader thread
 leaves the task list at once (Linux release_task), unless traced:
 then when its tracer reaps it or exits (Linux wait_task_zombie,
@@ -2752,6 +2753,7 @@ state patterns.
 | `SigPending` list | `Option<Box<SigQueue>>` under the set's lock | Queued siginfo (Linux sigpending.list of struct sigqueue) |
 | `SigHand.action` | `IrqSpinlock<Box<[SigAction]>>` (65 entries) | Signal handler table |
 | `SignalStruct.rlim` | `IrqSpinlock<[RLimit; N]>` | Resource limits (leaf) |
+| `SignalStruct.subreaper` | `TableCell<bool>` (TASKLIST) | PR_SET_CHILD_SUBREAPER (Linux signal->is_child_subreaper): set by any thread under the write lock, read under the read lock by prctl and by the reparenting it decides (`find_reaper`, in `forget_original_parent`'s write section) |
 
 #### Why SigHand.action Uses IrqSpinlock
 

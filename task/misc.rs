@@ -669,27 +669,21 @@ pub fn sys_prctl(option: i32, arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> 
         }
 
         PR_SET_CHILD_SUBREAPER => {
-            // Set child subreaper flag
-            // arg2: non-zero to set, zero to clear
-            let mut table = TASKLIST.write();
-            if let Some(mut task) = table.get_mut(tid) {
-                task.prctl.child_subreaper = arg2 != 0;
-                0
-            } else {
-                KernelError::NoProcess.sysret()
-            }
+            // The process's flag (Linux signal->is_child_subreaper),
+            // whichever thread sets it; arg2 nonzero sets it
+            let Some(sig) = crate::signal::get_task_signal_struct(tid) else {
+                return KernelError::NoProcess.sysret();
+            };
+            sig.set_subreaper(&mut TASKLIST.write(), arg2 != 0);
+            0
         }
 
         PR_GET_CHILD_SUBREAPER => {
-            // Get child subreaper flag
-            // Returns value via pointer (arg2 = int*)
-            let is_subreaper = {
-                let table = TASKLIST.read();
-                match table.get(tid) {
-                    Some(task) => task.prctl.child_subreaper,
-                    None => return KernelError::NoProcess.sysret(),
-                }
+            // The process's flag, stored at arg2 (int *)
+            let Some(sig) = crate::signal::get_task_signal_struct(tid) else {
+                return KernelError::NoProcess.sysret();
             };
+            let is_subreaper = sig.subreaper(&TASKLIST.read());
 
             // Write result to user-space pointer
             let value: i32 = if is_subreaper { 1 } else { 0 };

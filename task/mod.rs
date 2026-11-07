@@ -554,10 +554,6 @@ pub struct PrctlState {
     /// Keep capabilities across setuid (PR_SET_KEEPCAPS)
     /// When set, capabilities are preserved when changing UIDs
     pub keep_caps: bool,
-    /// Child subreaper flag (PR_SET_CHILD_SUBREAPER)
-    /// When set, this process becomes the parent of orphaned descendants
-    /// instead of init (PID 1)
-    pub child_subreaper: bool,
     /// TSC mode (x86-64 only): PR_TSC_ENABLE or PR_TSC_SIGSEGV
     /// Controls whether RDTSC instruction is allowed
     #[cfg(target_arch = "x86_64")]
@@ -572,7 +568,6 @@ impl Default for PrctlState {
             no_new_privs: false,
             timer_slack_ns: 50_000, // 50 microseconds default
             keep_caps: false,
-            child_subreaper: false,
             #[cfg(target_arch = "x86_64")]
             tsc_mode: prctl_ops::PR_TSC_ENABLE as u8, // RDTSC allowed by default
             thp_disable: false,

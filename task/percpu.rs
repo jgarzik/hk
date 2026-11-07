@@ -2385,7 +2385,6 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
             no_new_privs: parent_prctl.no_new_privs, // Inherited (irreversible)
             timer_slack_ns: parent_prctl.timer_slack_ns, // Inherited
             keep_caps: false,                        // Reset on fork
-            child_subreaper: false,                  // Not inherited
             #[cfg(target_arch = "x86_64")]
             tsc_mode: parent_prctl.tsc_mode, // Inherited
             thp_disable: parent_prctl.thp_disable,   // Inherited
@@ -2691,7 +2690,8 @@ pub fn current_exiting() -> bool {
 
 /// Hand the current task's children to a new parent before it dies
 /// (Linux forget_original_parent): another live thread of its group,
-/// else the nearest PR_SET_CHILD_SUBREAPER ancestor, else init
+/// else a live thread of the nearest PR_SET_CHILD_SUBREAPER ancestor
+/// process, else init
 #[inline(never)]
 fn forget_original_parent() {
     let me = task_ref(&current());
@@ -2741,8 +2741,7 @@ enum Moved {
     Told(Told, Option<Reaped>),
 }
 
-/// Hand `me`'s children to their new parent: another live thread of
-/// its group, else the nearest live subreaper ancestor, else init. A
+/// Hand `me`'s children to their new parent ([`find_reaper`]). A
 /// zombie whose group is gone moving to another process tells its new
 /// parent in the same TASKLIST write section (Linux reparent_leader),
 /// with `entry`; one such move ends the pass.
@@ -2786,28 +2785,45 @@ fn reparent_children(me: &TaskRef, moved: &mut Vec<TaskRef>, entry: &mut Entry) 
     }
 }
 
-/// `me`'s children's new parent: another live thread of its group,
-/// else the nearest live subreaper ancestor, else init
+/// `me`'s children's new parent (Linux find_new_reaper): another live
+/// thread of its group, else a live thread of the nearest ancestor
+/// process in its pid namespace that is a child subreaper, else init.
+/// Unlike Linux, every ancestor is checked, with no has_child_subreaper
+/// shortcut: that flag is set on every descendant of a subreaper (fork,
+/// walk_process_tree), and an orphan only moves up, so the walk finds
+/// the same reaper.
 fn find_reaper(table: &GlobalTaskTable, me: &TaskRef) -> Option<TaskRef> {
-    let live = crate::signal::task_live;
-    let thread = table
-        .threads(me.pid)
-        .find(|t| !core::ptr::eq(t.task, Arc::as_ptr(me)) && live(t))
-        .map(|t| task_ref(t.task));
-    if thread.is_some() {
-        return thread;
+    if let Some(t) = live_thread(table, me.pid) {
+        return Some(t);
     }
-    let mut p = table.get(me.tid()).and_then(|t| t.real_parent.clone());
+    let v = table.get(me.tid())?;
+    let level = v.thread_pid.as_ref().map(|p| p.level);
+    let mut p = v.real_parent.clone();
     while let Some(t) = p.and_then(|w| w.upgrade()) {
-        // An ancestor gone from the list ends the walk: init adopts
-        // (Linux find_new_reaper ends at the child_reaper)
+        // An ancestor gone from the list, or in another pid namespace,
+        // ends the walk: init adopts (Linux find_new_reaper ends at the
+        // child_reaper, by task_pid(reaper)->level)
         let Some(v) = table.get(t.tid()) else { break };
-        if v.prctl.child_subreaper && live(&v) {
-            return Some(t.clone());
+        if v.thread_pid.as_ref().map(|p| p.level) != level {
+            break;
+        }
+        if v.signal.as_ref().is_some_and(|s| s.subreaper(table))
+            && let Some(r) = live_thread(table, t.pid)
+        {
+            return Some(r);
         }
         p = v.real_parent.clone();
     }
     table.task(1)
+}
+
+/// A thread of process `pid` that has not started exiting (Linux
+/// find_alive_thread: !PF_EXITING)
+fn live_thread(table: &GlobalTaskTable, pid: Pid) -> Option<TaskRef> {
+    table
+        .threads(pid)
+        .find(crate::signal::task_live)
+        .map(|t| task_ref(t.task))
 }
 
 /// Run `f` under TASKLIST's write lock with a notice entry; while `f`
