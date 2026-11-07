@@ -13,8 +13,8 @@ use crate::harness::verdict;
 use crate::helpers::sleep_ms;
 use crate::mm::fork_mm::spawn_thread;
 use hk_syscall::{
-    sys_close, sys_execve, sys_exit, sys_exit_group, sys_fork, sys_kill, sys_pipe2, sys_read,
-    sys_tgkill, sys_wait4, sys_write,
+    P_PID, SigInfo, WEXITED, sys_close, sys_execve, sys_exit, sys_exit_group, sys_fork, sys_kill,
+    sys_pipe2, sys_read, sys_tgkill, sys_wait4, sys_waitid, sys_write,
 };
 
 const SIGKILL: u32 = 9;
@@ -316,6 +316,31 @@ extern "C" fn exec_on_go(go: u64) -> ! {
     exec_exit(b"sleep 1; exit 7\0")
 }
 
+/// Wait up to 5 s for traced thread `tid` to be a zombie, leaving it
+/// waitable (waitid WNOWAIT): whether it became one
+fn peek_zombie(tid: i64) -> bool {
+    const WNOWAIT: i32 = 0x0100_0000;
+    const WALL: i32 = 0x4000_0000;
+    for _ in 0..500 {
+        let mut info: SigInfo = unsafe { core::mem::zeroed() };
+        let r = sys_waitid(
+            P_PID,
+            tid as u64,
+            &mut info,
+            WEXITED | WNOWAIT | WNOHANG | WALL,
+            0,
+        );
+        if r < 0 {
+            return false;
+        }
+        if info.si_pid as i64 == tid {
+            return true;
+        }
+        sleep_ms(10);
+    }
+    false
+}
+
 /// A process leading its own process group (its pgid is its pid): a
 /// thread traced by the parent is ended by a sibling's execve and left
 /// a zombie for its tracer; the exec waits until the tracer reaps it
@@ -345,9 +370,11 @@ fn test_exec_traced_sibling() {
         n > 0 && buf[..n as usize].windows(9).any(|w| w == b"(busybox)")
     };
     // The killed sibling is the tracer's zombie: the exec is held until
-    // it is reaped (its exit status 0: a thread an exec ends)
+    // it is reaped (its exit status 0: a thread an exec ends). Wait for
+    // the zombie without reaping it, then the exec must still be held
+    let zombie = peek_zombie(tids[0]);
     sleep_ms(100);
-    let held = !execd(&mut buf);
+    let held = zombie && !execd(&mut buf);
     let mut st = -1i32;
     let mut r = 0;
     for _ in 0..500 {
