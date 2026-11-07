@@ -255,50 +255,30 @@ pub fn sys_wait4(pid: i64, wstatus: u64, options: i32, rusage: u64) -> i64 {
     result
 }
 
-/// Simplified siginfo_t structure for waitid
-///
-/// Linux siginfo_t is much larger and more complex, but for waitid we only
-/// need a subset of fields. This matches the layout at the start of siginfo_t.
-#[derive(Copy, Clone)]
-#[repr(C)]
-pub struct SigInfo {
-    /// Signal number (SIGCHLD for waitid)
-    pub si_signo: i32,
-    /// Error number (usually 0)
-    pub si_errno: i32,
-    /// Signal code (CLD_EXITED, CLD_KILLED, etc.)
-    pub si_code: i32,
-    /// Padding to align union
-    pub _pad0: i32,
-    /// Process ID of child
-    pub si_pid: i32,
-    /// User ID of child
-    pub si_uid: u32,
-    /// Exit status or signal number
-    pub si_status: i32,
+/// The siginfo bytes waitid writes: si_signo through si_status
+const WAITID_INFO: usize = 28;
+
+/// Write the siginfo fields waitid fills (Linux kernel_waitid's
+/// unsafe_put_user: si_signo through si_status, the rest untouched)
+fn put_waitid_info(infop: u64, info: &crate::signal::SigInfo) -> Result<(), KernelError> {
+    use crate::util::pod::IntoBytes;
+    let head = &info.as_bytes()[..WAITID_INFO];
+    crate::uaccess::copy_to_user::<crate::arch::Uaccess>(infop, head)
+        .map(|_| ())
+        .map_err(|_| KernelError::BadAddress)
 }
-crate::pod!(SigInfo {
-    si_signo,
-    si_errno,
-    si_code,
-    _pad0,
-    si_pid,
-    si_uid,
-    si_status
-});
 
-// Signal codes for SIGCHLD
-const CLD_EXITED: i32 = 1; // Child has exited
-const CLD_KILLED: i32 = 2; // Child was killed
-const CLD_DUMPED: i32 = 3; // Child terminated abnormally
-const CLD_TRAPPED: i32 = 4; // Traced child has trapped
-#[expect(dead_code)]
-const CLD_STOPPED: i32 = 5; // Child has stopped
-#[expect(dead_code)]
-const CLD_CONTINUED: i32 = 6; // Stopped child has continued
-
-// Signal number for SIGCHLD
-const SIGCHLD: i32 = 17;
+/// SIGCHLD info for waitid: `code` (CLD_*), the child and its status
+fn chld_info(code: i32, pid: i32, status: i32) -> crate::signal::SigInfo {
+    let fields = crate::signal::SigFields::Chld {
+        pid,
+        uid: 0,
+        status,
+        utime: 0,
+        stime: 0,
+    };
+    crate::signal::SigInfo::new(crate::signal::SIGCHLD, code, fields)
+}
 
 /// sys_waitid - wait for child process state change (extended interface)
 ///
@@ -320,13 +300,14 @@ const SIGCHLD: i32 = 17;
 pub fn sys_waitid(idtype: i32, id: u64, infop: u64, options: i32, rusage: u64) -> i64 {
     use super::wait_options::{P_ALL, P_PGID, P_PID, P_PIDFD, WEXITED, WNOHANG};
     use crate::arch::Uaccess;
-    use crate::uaccess::{UaccessArch, put_user};
+    use crate::signal::si_code;
+    use crate::uaccess::UaccessArch;
 
     let current_pid = super::percpu::current_pid();
     let current_tid = super::percpu::current_tid();
 
     // Validate infop pointer if non-null
-    if infop != 0 && !Uaccess::access_ok(infop, core::mem::size_of::<SigInfo>()) {
+    if infop != 0 && !Uaccess::access_ok(infop, WAITID_INFO) {
         return KernelError::BadAddress.sysret();
     }
 
@@ -390,16 +371,8 @@ pub fn sys_waitid(idtype: i32, id: u64, infop: u64, options: i32, rusage: u64) -
         let wnowait = options & super::wait_options::WNOWAIT != 0;
         if let Some((tid, code)) = super::percpu::wait_traced(current_pid, wait_pid, wnowait) {
             if infop != 0 {
-                let info = SigInfo {
-                    si_signo: SIGCHLD,
-                    si_errno: 0,
-                    si_code: CLD_TRAPPED,
-                    _pad0: 0,
-                    si_pid: tid as i32,
-                    si_uid: 0,
-                    si_status: code as i32,
-                };
-                if put_user::<Uaccess, SigInfo>(infop, info).is_err() {
+                let info = chld_info(si_code::CLD_TRAPPED, tid as i32, code as i32);
+                if put_waitid_info(infop, &info).is_err() {
                     break KernelError::BadAddress.sysret();
                 }
             }
@@ -419,23 +392,15 @@ pub fn sys_waitid(idtype: i32, id: u64, infop: u64, options: i32, rusage: u64) -
             if infop != 0 {
                 // Decode the wait status word (exit code vs. killing signal)
                 let termsig = wait_status & 0x7f;
-                let (si_code, si_status) = if termsig == 0 {
-                    (CLD_EXITED, (wait_status >> 8) & 0xff)
+                let (code, status) = if termsig == 0 {
+                    (si_code::CLD_EXITED, (wait_status >> 8) & 0xff)
                 } else if wait_status & 0x80 != 0 {
-                    (CLD_DUMPED, termsig)
+                    (si_code::CLD_DUMPED, termsig)
                 } else {
-                    (CLD_KILLED, termsig)
+                    (si_code::CLD_KILLED, termsig)
                 };
-                let info = SigInfo {
-                    si_signo: SIGCHLD,
-                    si_errno: 0,
-                    si_code,
-                    _pad0: 0,
-                    si_pid: child_pid as i32,
-                    si_uid: 0,
-                    si_status,
-                };
-                if put_user::<Uaccess, SigInfo>(infop, info).is_err() {
+                let info = chld_info(code, child_pid as i32, status);
+                if put_waitid_info(infop, &info).is_err() {
                     break KernelError::BadAddress.sysret();
                 }
             }
@@ -453,16 +418,7 @@ pub fn sys_waitid(idtype: i32, id: u64, infop: u64, options: i32, rusage: u64) -
         if options & WNOHANG != 0 {
             if infop != 0 {
                 // Zero out siginfo to indicate no child was available
-                let info = SigInfo {
-                    si_signo: 0,
-                    si_errno: 0,
-                    si_code: 0,
-                    _pad0: 0,
-                    si_pid: 0,
-                    si_uid: 0,
-                    si_status: 0,
-                };
-                if put_user::<Uaccess, SigInfo>(infop, info).is_err() {
+                if put_waitid_info(infop, &crate::signal::SigInfo::default()).is_err() {
                     break KernelError::BadAddress.sysret();
                 }
             }

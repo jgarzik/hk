@@ -855,7 +855,7 @@ Designs that grew one commit at a time. Tag = roadmap phase
   places; `find_task_by_pid` in four (all root-namespace pids); four
   `current_time`s; about ten user-timespec readers each validating
   (Linux get_timespec64); three iovec structs and five
-  importers; five SigInfo, three Timeval, two Timespec types.
+  importers; three Timeval, two Timespec types.
 - **Error conventions** (M1): Result<_, KernelError> about a thousand
   times beside Result<_, i32> (both signs used) and Result<_, i64>
   over a hundred and fifty; raw errno numbers and local errno

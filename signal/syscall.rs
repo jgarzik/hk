@@ -13,8 +13,8 @@
 
 use crate::arch::Uaccess;
 use crate::signal::{
-    SIGKILL, SIGSTOP, SigAction, SigSet, get_task_sighand, kill_pgrp, send_signal,
-    send_signal_to_process, with_task_signal_state,
+    SIGKILL, SIGSTOP, SigAction, SigInfo, SigSet, get_task_sighand, kill_pgrp, send_signal,
+    send_signal_to_process, si_code, with_task_signal_state,
 };
 use crate::task::percpu::{current_pgid, current_tid, get_all_pids};
 use crate::uaccess::{UserPtr, get_user, put_user};
@@ -446,17 +446,16 @@ pub fn sys_rt_sigqueueinfo(pid: i64, sig: u32, uinfo: u64) -> i64 {
         return -22; // EINVAL
     }
 
-    // Read siginfo from user space
-    let info = match SigInfo::read_from_user(uinfo, sig) {
+    let info = match read_info(uinfo, sig) {
         Ok(i) => i,
-        Err(e) => return -i64::from(e),
+        Err(e) => return e.sysret(),
     };
 
     // Security check (Linux kernel/signal.c do_rt_sigqueueinfo): si_code
     // values reserved to the kernel (>= 0, or SI_TKILL) may only be queued
     // to the caller itself, never used to forge signals to other processes
     let caller_pid = current_pid() as i64;
-    if (info.code() >= 0 || info.code() == si_code::SI_TKILL) && pid != caller_pid {
+    if reserved_to_kernel(info.code) && pid != caller_pid {
         return -1; // EPERM
     }
 
@@ -487,16 +486,15 @@ pub fn sys_rt_tgsigqueueinfo(tgid: i64, tid: i64, sig: u32, uinfo: u64) -> i64 {
         return -22; // EINVAL
     }
 
-    // Read siginfo from user space
-    let info = match SigInfo::read_from_user(uinfo, sig) {
+    let info = match read_info(uinfo, sig) {
         Ok(i) => i,
-        Err(e) => return -i64::from(e),
+        Err(e) => return e.sysret(),
     };
 
     // Security check (Linux do_rt_tgsigqueueinfo): kernel-reserved si_code
     // only when targeting the calling thread itself
     let caller_tid = crate::task::percpu::current_tid() as i64;
-    if (info.code() >= 0 || info.code() == si_code::SI_TKILL) && tid != caller_tid {
+    if reserved_to_kernel(info.code) && tid != caller_tid {
         return -1; // EPERM
     }
 
@@ -563,182 +561,20 @@ pub fn sys_pause() -> i64 {
     KernelError::RestartNoHand.sysret()
 }
 
-/// siginfo_t structure for user space (Linux ABI)
-///
-/// This is the 128-byte structure passed to user space signal handlers
-/// and returned by rt_sigtimedwait.
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
-pub struct SigInfo {
-    /// Signal number
-    pub si_signo: i32,
-    /// Error number (not used for most signals)
-    pub si_errno: i32,
-    /// Signal code (SI_USER, SI_KERNEL, etc.)
-    pub si_code: i32,
-    /// Padding for alignment
-    _pad0: i32,
-    /// Union of signal-specific data
-    _sifields: SigInfoFields,
+/// The siginfo rt_sigqueueinfo and rt_tgsigqueueinfo queue: EFAULT,
+/// E2BIG (`SigInfo::copy_from_user`), EINVAL if it is not for `sig`
+fn read_info(uinfo: u64, sig: u32) -> Result<SigInfo, KernelError> {
+    let info = SigInfo::copy_from_user(uinfo)?;
+    if info.sig() != sig {
+        return Err(KernelError::InvalidArgument);
+    }
+    Ok(info)
 }
 
-/// Signal-specific fields (128 bytes total for siginfo_t): hk fills
-/// only the kill variant (sender pid, uid); the rest is zero
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-struct SigInfoFields {
-    kill: SigInfoKill,
-    /// The rest of the 112-byte union
-    _rest: [u8; 104],
-}
-
-impl Default for SigInfoFields {
-    fn default() -> Self {
-        Self {
-            kill: SigInfoKill::default(),
-            _rest: [0; 104],
-        }
-    }
-}
-
-/// Kill signal info (SI_USER, SI_TKILL)
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
-struct SigInfoKill {
-    /// Sender's PID
-    si_pid: i32,
-    /// Sender's UID
-    si_uid: u32,
-}
-
-/// Signal codes
-pub mod si_code {
-    /// Sent by kill, sigsend, raise
-    pub const SI_USER: i32 = 0;
-    /// Sent by kernel
-    pub const SI_KERNEL: i32 = 128;
-    /// Sent by sigqueue
-    pub const SI_QUEUE: i32 = -1;
-    /// Sent by timer expiration
-    pub const SI_TIMER: i32 = -2;
-    /// Sent by real-time mesq state change
-    pub const SI_MESGQ: i32 = -3;
-    /// Sent by AIO completion
-    pub const SI_ASYNCIO: i32 = -4;
-    /// Sent by queued SIGIO
-    pub const SI_SIGIO: i32 = -5;
-    /// Sent by tkill/tgkill
-    pub const SI_TKILL: i32 = -6;
-}
-
-impl SigInfo {
-    /// Create siginfo for a user-sent signal
-    pub fn from_kill(sig: u32, pid: i32, uid: u32) -> Self {
-        Self {
-            si_signo: sig as i32,
-            si_errno: 0,
-            si_code: si_code::SI_USER,
-            _pad0: 0,
-            _sifields: SigInfoFields {
-                kill: SigInfoKill {
-                    si_pid: pid,
-                    si_uid: uid,
-                },
-                _rest: [0; 104],
-            },
-        }
-    }
-
-    /// Write siginfo to user space
-    pub fn write_to_user(&self, ptr: u64) -> Result<(), i32> {
-        // Write si_signo (offset 0)
-        if put_user::<Uaccess, i32>(ptr, self.si_signo).is_err() {
-            return Err(14); // EFAULT
-        }
-        // Write si_errno (offset 4)
-        if put_user::<Uaccess, i32>(ptr + 4, self.si_errno).is_err() {
-            return Err(14);
-        }
-        // Write si_code (offset 8)
-        if put_user::<Uaccess, i32>(ptr + 8, self.si_code).is_err() {
-            return Err(14);
-        }
-        // Write _pad0 (offset 12)
-        if put_user::<Uaccess, i32>(ptr + 12, self._pad0).is_err() {
-            return Err(14);
-        }
-        // Write kill fields (offset 16)
-        let kill = self._sifields.kill;
-        if put_user::<Uaccess, i32>(ptr + 16, kill.si_pid).is_err() {
-            return Err(14);
-        }
-        if put_user::<Uaccess, u32>(ptr + 20, kill.si_uid).is_err() {
-            return Err(14);
-        }
-        Ok(())
-    }
-
-    /// Read siginfo from user space
-    ///
-    /// # Arguments
-    /// * `ptr` - User-space pointer to siginfo_t (128 bytes)
-    /// * `sig` - Expected signal number for validation
-    ///
-    /// # Returns
-    /// Ok(SigInfo) on success, Err(errno) on error
-    pub fn read_from_user(ptr: u64, sig: u32) -> Result<Self, i32> {
-        // Read si_signo (offset 0)
-        let si_signo = match get_user::<Uaccess, i32>(ptr) {
-            Ok(v) => v,
-            Err(_) => return Err(14), // EFAULT
-        };
-        // Read si_errno (offset 4)
-        let si_errno = match get_user::<Uaccess, i32>(ptr + 4) {
-            Ok(v) => v,
-            Err(_) => return Err(14),
-        };
-        // Read si_code (offset 8)
-        let si_code = match get_user::<Uaccess, i32>(ptr + 8) {
-            Ok(v) => v,
-            Err(_) => return Err(14),
-        };
-        // Read si_pid (offset 16)
-        let si_pid = match get_user::<Uaccess, i32>(ptr + 16) {
-            Ok(v) => v,
-            Err(_) => return Err(14),
-        };
-        // Read si_uid (offset 20)
-        let si_uid = match get_user::<Uaccess, u32>(ptr + 20) {
-            Ok(v) => v,
-            Err(_) => return Err(14),
-        };
-
-        // Validate si_signo matches expected signal
-        if si_signo != sig as i32 {
-            return Err(22); // EINVAL
-        }
-
-        Ok(Self {
-            si_signo,
-            si_errno,
-            si_code,
-            _pad0: 0,
-            _sifields: SigInfoFields {
-                kill: SigInfoKill { si_pid, si_uid },
-                _rest: [0; 104],
-            },
-        })
-    }
-
-    /// Get si_code value
-    pub fn code(&self) -> i32 {
-        self.si_code
-    }
-
-    /// Get sender's PID from siginfo
-    pub fn pid(&self) -> i32 {
-        self._sifields.kill.si_pid
-    }
+/// Codes no user may queue to another task: the kernel's (> 0), and
+/// those kill and tkill fill in (Linux si_code_reserved_to_kernel)
+fn reserved_to_kernel(code: i32) -> bool {
+    code >= 0 || code == si_code::SI_TKILL
 }
 
 /// rt_sigtimedwait(uthese, uinfo, uts, sigsetsize) - wait for signal
@@ -835,9 +671,9 @@ pub fn sys_rt_sigtimedwait(set_ptr: u64, info_ptr: u64, ts_ptr: u64, sigsetsize:
     };
     if info_ptr != 0 {
         // Basic siginfo (SI_USER with pid/uid 0: senders are not tracked)
-        let siginfo = SigInfo::from_kill(sig, 0, 0);
-        if siginfo.write_to_user(info_ptr).is_err() {
-            return KernelError::BadAddress.sysret();
+        let siginfo = SigInfo::kill(sig, si_code::SI_USER, 0, 0);
+        if let Err(e) = siginfo.copy_to_user(info_ptr) {
+            return e.sysret();
         }
     }
     i64::from(sig)

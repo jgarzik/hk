@@ -23,7 +23,8 @@
 //! the task's EL0 trap frame, where they live while it is in the kernel.
 
 use crate::arch::Uaccess;
-use crate::signal::{KSigInfo, SigAction, SigHandler, SigSet, sa_flags};
+use crate::signal::siginfo::UserSigInfo;
+use crate::signal::{SigAction, SigFields, SigHandler, SigInfo, SigSet, Trap, sa_flags};
 use crate::uaccess::{UaccessArch, copy_to_user};
 use crate::util::pod::{FromBytes, IntoBytes};
 
@@ -133,33 +134,6 @@ impl Default for UContext {
 }
 
 // =============================================================================
-// Signal Info (siginfo_t)
-// =============================================================================
-
-/// siginfo_t structure (simplified, same as x86_64)
-#[repr(C)]
-#[derive(Debug, Clone, Default, Copy)]
-pub struct SigInfo {
-    /// Signal number
-    pub si_signo: i32,
-    /// Error number
-    pub si_errno: i32,
-    /// Signal code
-    pub si_code: i32,
-    /// Padding
-    pub _pad: i32,
-    /// Signal-specific fields
-    pub _fields: [u64; 14],
-}
-crate::pod!(SigInfo {
-    si_signo,
-    si_errno,
-    si_code,
-    _pad,
-    _fields
-});
-
-// =============================================================================
 // RT Signal Frame
 // =============================================================================
 
@@ -171,7 +145,7 @@ crate::pod!(SigInfo {
 #[derive(Clone, Copy)]
 pub struct RtSigFrame {
     /// Signal info
-    pub info: SigInfo,
+    pub info: UserSigInfo,
     /// User context
     pub uc: UContext,
 }
@@ -186,7 +160,6 @@ pub const RESERVED_OFFSET: usize = core::mem::size_of::<RtSigFrame>();
 const _: () = assert!(core::mem::size_of::<SigContext>() == 8 + 31 * 8 + 3 * 8 + 8);
 const _: () = assert!(core::mem::size_of::<StackT>() == 24);
 const _: () = assert!(core::mem::size_of::<SigSet>() == 8);
-const _: () = assert!(core::mem::size_of::<SigInfo>() == 128);
 const _: () = assert!(core::mem::offset_of!(UContext, uc_stack) == 16);
 const _: () = assert!(core::mem::offset_of!(UContext, uc_sigmask) == 40);
 const _: () = assert!(core::mem::offset_of!(UContext, _pad) == 48);
@@ -291,7 +264,8 @@ pub fn setup_rt_frame(
     sig: u32,
     action: &SigAction,
     blocked: SigSet,
-    info: &KSigInfo,
+    info: &SigInfo,
+    trap: &Trap,
     uframe: &crate::arch::UserFrame,
 ) -> Result<(), i32> {
     // A copy, written back once the handler frame is in place
@@ -355,13 +329,13 @@ pub fn setup_rt_frame(
     if copy_to_user::<Uaccess>(reserved_addr, fpsimd.as_bytes()).is_err() {
         return Err(-14);
     }
-    if info.error != 0 {
+    if trap.error != 0 {
         let esr = EsrContext {
             head: CtxHead {
                 magic: ESR_MAGIC,
                 size: core::mem::size_of::<EsrContext>() as u32,
             },
-            esr: info.error,
+            esr: trap.error,
         };
         if copy_to_user::<Uaccess>(end, esr.as_bytes()).is_err() {
             return Err(-14);
@@ -378,18 +352,13 @@ pub fn setup_rt_frame(
         return Err(-14);
     }
 
-    // Build the frame header (siginfo + ucontext up to __reserved);
-    // si_addr is the first union field
-    let mut fields = [0u64; 14];
-    fields[0] = info.addr;
+    // Build the frame header (siginfo + ucontext up to __reserved)
+    let fault_address = match info.fields() {
+        SigFields::Fault { addr, .. } if trap.error != 0 => addr,
+        _ => 0,
+    };
     let frame = RtSigFrame {
-        info: SigInfo {
-            si_signo: sig as i32,
-            si_errno: 0,
-            si_code: info.code,
-            _pad: 0,
-            _fields: fields,
-        },
+        info: info.to_user(),
         uc: UContext {
             uc_flags: 0,
             uc_link: 0,
@@ -403,7 +372,7 @@ pub fn setup_rt_frame(
             _pad: [0; 128],
             uc_mcontext: SigContext {
                 // FAR of a data/instruction abort
-                fault_address: if info.error != 0 { info.addr } else { 0 },
+                fault_address,
                 regs: user_regs,
                 sp: user_sp,
                 pc: user_elr,

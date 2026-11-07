@@ -17,6 +17,7 @@
 //!
 //! See doc/LOCKING.md for full lock ordering.
 
+pub mod siginfo;
 pub mod syscall;
 
 use crate::sync::spin::Mutex;
@@ -250,42 +251,13 @@ pub mod sa_flags {
 // Signal information (siginfo)
 // =============================================================================
 
-/// siginfo `si_code` values (include/uapi/asm-generic/siginfo.h)
-pub mod si_code {
-    /// Sent by kill/raise
-    pub const SI_USER: i32 = 0;
-    /// Sent by the kernel
-    pub const SI_KERNEL: i32 = 0x80;
-    /// SIGILL: illegal opcode / illegal operand
-    pub const ILL_ILLOPC: i32 = 1;
-    pub const ILL_ILLOPN: i32 = 2;
-    /// SIGFPE codes
-    pub const FPE_INTDIV: i32 = 1;
-    pub const FPE_INTOVF: i32 = 2;
-    pub const FPE_FLTDIV: i32 = 3;
-    pub const FPE_FLTOVF: i32 = 4;
-    pub const FPE_FLTUND: i32 = 5;
-    pub const FPE_FLTRES: i32 = 6;
-    pub const FPE_FLTINV: i32 = 7;
-    /// SIGSEGV: address not mapped / no permission for the mapping
-    pub const SEGV_MAPERR: i32 = 1;
-    pub const SEGV_ACCERR: i32 = 2;
-    /// SIGBUS: invalid alignment / nonexistent physical address
-    pub const BUS_ADRALN: i32 = 1;
-    pub const BUS_ADRERR: i32 = 2;
-    /// SIGTRAP: breakpoint / trace trap
-    pub const TRAP_BRKPT: i32 = 1;
-    pub const TRAP_TRACE: i32 = 2;
-}
+pub use siginfo::{SigFields, SigInfo, si_code};
 
-/// What the signal frame reports about a signal (Linux kernel_siginfo
-/// subset, plus the arch fault details of sigcontext)
+/// The arch details of a fault that go into the signal frame's
+/// sigcontext, not into siginfo (Linux thread.trap_nr and error_code on
+/// x86-64, thread.fault_code on arm64)
 #[derive(Debug, Clone, Copy, Default)]
-pub struct KSigInfo {
-    /// si_code
-    pub code: i32,
-    /// si_addr: faulting address or instruction (fault signals)
-    pub addr: u64,
+pub struct Trap {
     /// x86-64: sigcontext.trapno (exception vector)
     pub trapno: u64,
     /// x86-64: sigcontext.err (exception error code); arm64: ESR_EL1
@@ -653,7 +625,7 @@ pub struct TaskSignalState {
     /// A traced task's fault signal and its details, queued for normal
     /// delivery (the tracer's stop first): the handler gets them as
     /// force_sig_fault would have given (hk has no siginfo queue)
-    pub fault: Option<(u32, KSigInfo)>,
+    pub fault: Option<(SigInfo, Trap)>,
 }
 
 /// A thread group's shared pending set (Linux signal->shared_pending):
@@ -1892,12 +1864,11 @@ pub fn do_signal(regs: &UserFrame) {
                     }
                 }
                 // A traced task's fault keeps its details (force_sig_fault)
-                let info = with_task_signal_state(tid, |s| {
-                    s.fault.take_if(|(f, _)| *f == sig).map(|(_, i)| i)
-                })
-                .flatten()
-                .unwrap_or_default();
-                if deliver_to_handler(tid, sig, &action, &info, regs) {
+                let (info, trap) =
+                    with_task_signal_state(tid, |s| s.fault.take_if(|(f, _)| f.sig() == sig))
+                        .flatten()
+                        .unwrap_or((SigInfo::kill(sig, si_code::SI_USER, 0, 0), Trap::default()));
+                if deliver_to_handler(tid, sig, &action, &info, &trap, regs) {
                     return;
                 }
                 // Frame setup failed: SIGSEGV was forced; deliver it
@@ -1984,7 +1955,8 @@ fn deliver_to_handler(
     tid: Tid,
     sig: u32,
     action: &SigAction,
-    info: &KSigInfo,
+    info: &SigInfo,
+    trap: &Trap,
     regs: &UserFrame,
 ) -> bool {
     use crate::arch::signal;
@@ -2003,7 +1975,7 @@ fn deliver_to_handler(
     })
     .unwrap_or(SigSet::EMPTY);
 
-    match signal::setup_rt_frame(sig, action, frame_mask, info, regs) {
+    match signal::setup_rt_frame(sig, action, frame_mask, info, trap, regs) {
         Ok(()) => {
             // The saved mask now lives in the frame (Linux
             // signal_delivered -> clear_restore_sigmask)
@@ -2078,8 +2050,9 @@ pub fn force_sigsegv(tid: Tid) {
 ///   the task, as does SIG_DFL.
 ///
 /// Process context (the faulting task), interrupts enabled.
-pub fn force_sig_fault(sig: u32, info: KSigInfo, regs: &UserFrame) {
+pub fn force_sig_fault(info: SigInfo, trap: Trap, regs: &UserFrame) {
     let do_exit = do_group_exit;
+    let sig = info.sig();
 
     let tid = crate::task::percpu::current_tid();
     // A traced task's fault signal is queued like any other, so the
@@ -2087,7 +2060,7 @@ pub fn force_sig_fault(sig: u32, info: KSigInfo, regs: &UserFrame) {
     // -> get_signal -> ptrace_signal); delivered on the way back to user
     // space, it is unblocked and not ignored, as force_sig makes it
     if crate::task::ptrace::is_traced(tid) {
-        with_task_signal_state(tid, |s| s.fault = Some((sig, info)));
+        with_task_signal_state(tid, |s| s.fault = Some((info, trap)));
         force_sig(tid, sig);
         return;
     }
@@ -2101,7 +2074,7 @@ pub fn force_sig_fault(sig: u32, info: KSigInfo, regs: &UserFrame) {
     if let SigHandler::Handler(_) = action.handler
         && !blocked
     {
-        if deliver_to_handler(tid, sig, &action, &info, regs) {
+        if deliver_to_handler(tid, sig, &action, &info, &trap, regs) {
             return;
         }
         // No room for the frame: SIGSEGV was reset to SIG_DFL and queued
