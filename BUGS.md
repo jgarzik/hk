@@ -939,6 +939,11 @@ Tag = roadmap phase (doc/ROADMAP.md).
    its port in bhash (`TcpSock::assert_owner`). On failure the test
    prints the poll events, TCP state, local and peer ports, the port
    range and the /proc/net/tcp lines of the dead port.
+10. **STDIO_STDOUT_PIPE flake** (hk arm64, KVM-less local boot, once
+   in four): `STDIO_STDOUT_PIPE:FAIL got 0`, the parent read nothing
+   from the pipe its child dup3'd onto stdout (EOF or an error before
+   the child's write, or the child failed). Not reproduced in two
+   reruns; investigate when it repeats.
 
 ## /proc/<pid>/mounts: no POLLERR|POLLPRI on a mount change
 
