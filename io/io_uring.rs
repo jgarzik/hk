@@ -379,7 +379,8 @@ impl IoUringInner {
 
         // Check for overflow
         if cq_next.wrapping_sub(cq_head) > self.cq_entries {
-            self.cq_overflow += 1;
+            // Linux cq_overflow is a free-running u32 the reader diffs
+            self.cq_overflow = self.cq_overflow.wrapping_add(1);
             return false;
         }
 
@@ -513,7 +514,8 @@ impl IoUring {
             let sqe_idx = inner.sq_array.get(sq_idx as usize).copied().unwrap_or(0);
 
             if sqe_idx >= inner.sq_entries {
-                inner.sq_dropped += 1;
+                // Free-running, as Linux sq_dropped
+                inner.sq_dropped = inner.sq_dropped.wrapping_add(1);
                 inner.sq_head = inner.sq_head.wrapping_add(1);
                 continue;
             }

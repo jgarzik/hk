@@ -68,9 +68,9 @@ impl TcpCb {
         if fl & flags::ACK != 0 {
             self.ack_sent();
         }
-        self.stats.segs_out += 1;
+        self.stats.segs_out = self.stats.segs_out.wrapping_add(1);
         if !data.is_empty() {
-            self.stats.data_segs_out += 1;
+            self.stats.data_segs_out = self.stats.data_segs_out.wrapping_add(1);
         }
         Seg {
             seq,
@@ -239,7 +239,7 @@ impl TcpCb {
             self.lsndtime = now;
         }
         if before(seq, self.snd_max) {
-            self.stats.total_retrans += 1;
+            self.stats.total_retrans = self.stats.total_retrans.wrapping_add(1);
             self.stats.bytes_retrans += u64::from(n);
         }
         self.stats.bytes_sent += u64::from(n);
@@ -284,7 +284,7 @@ impl TcpCb {
         if n == 0 && fl & flags::FIN == 0 {
             return;
         }
-        self.stats.total_retrans += 1;
+        self.stats.total_retrans = self.stats.total_retrans.wrapping_add(1);
         self.stats.bytes_retrans += n as u64;
         let s = self.mk_seg(self.snd_una, fl, data);
         out.segs.push(s);

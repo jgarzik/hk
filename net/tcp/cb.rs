@@ -722,7 +722,7 @@ pub struct TcpCb {
     held: usize,
 }
 
-/// Counters for TCP_INFO
+/// Counters for TCP_INFO; the u32 ones wrap, as Linux tcp_info's
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Stats {
     pub total_retrans: u32,

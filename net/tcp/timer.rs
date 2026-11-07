@@ -172,10 +172,10 @@ impl TcpCb {
         self.cong.on_rto(flight);
         self.rtt_seq = None;
         self.backoff += 1;
-        self.stats.rto_count += 1;
+        self.stats.rto_count = self.stats.rto_count.wrapping_add(1);
         if handshake {
             self.syn_rtx = true;
-            self.stats.total_retrans += 1;
+            self.stats.total_retrans = self.stats.total_retrans.wrapping_add(1);
             let s = self.syn_seg();
             out.segs.push(s);
         } else {
@@ -190,7 +190,7 @@ impl TcpCb {
     /// request timer restart)
     pub(super) fn rtx_synack(&mut self, now: u64, out: &mut Out) {
         self.syn_rtx = true;
-        self.stats.total_retrans += 1;
+        self.stats.total_retrans = self.stats.total_retrans.wrapping_add(1);
         let s = self.syn_seg();
         out.segs.push(s);
         self.arm_rtx(now);
