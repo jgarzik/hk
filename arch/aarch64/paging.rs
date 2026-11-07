@@ -310,69 +310,96 @@ pub fn pmd_huge(pmd: u64) -> bool {
     pmd & 0b11 == DESC_BLOCK
 }
 
-/// The entry `p` of a user table, with the table under it allocated
-/// and installed if it is invalid (a compare and swap: racing callers
-/// share one). The table frame it holds, None if out of memory (down
-/// to the low watermark) or a block maps it.
+/// A zeroed frame for a user page table, not yet in any table (Linux
+/// pte_alloc_one, pmd_alloc_one): taken with no page-table lock held,
+/// so it may reclaim. User page tables stop at the low watermark like
+/// the user pages they map: a process touching sparse addresses cannot
+/// drain the kernel's reserve with tables. None if out of memory.
+pub fn table_alloc() -> Option<u64> {
+    let new = crate::FRAME_ALLOCATOR.alloc_gfp(crate::mm::page_alloc::Gfp::USER)?;
+    // SAFETY: a fresh frame, reached through the linear map
+    unsafe { core::ptr::write_bytes(phys_to_virt(new), 0, PAGE_SIZE as usize) };
+    Some(new)
+}
+
+/// Install the table `new` in the upper-level entry `slot` if it is
+/// still empty (Linux pmd_install, pud_populate); false if an entry is
+/// there, `new` then still the caller's
 ///
 /// # Safety
 ///
-/// `p` is an upper-level entry of a live user table.
-unsafe fn next_alloc(p: *mut u64) -> Option<u64> {
+/// `slot` is an upper-level entry of a live user table, its address
+/// space's page_table_lock held (no split under way); `new` is a zeroed
+/// table frame the caller owns, which the tables take over on success.
+pub(crate) unsafe fn table_install(slot: &AtomicU64, new: u64) -> bool {
+    slot.compare_exchange(0, new | DESC_TABLE, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+}
+
+/// The table under the upper-level entry `p` of a user table, `install`
+/// called to put one in while it is empty. None if `install` fails (out
+/// of memory) or a block maps it.
+///
+/// # Safety
+///
+/// `p` is an upper-level entry of a live user table; `install` changes
+/// the entry it is handed only through [`table_install`].
+unsafe fn next_alloc(p: *mut u64, install: &mut dyn FnMut(&AtomicU64) -> bool) -> Option<u64> {
     // SAFETY: a live entry (the caller's guarantee), only accessed
     // atomically
     let slot = unsafe { AtomicU64::from_ptr(p) };
-    let mut e = crate::mm::huge_page::pmd_settled(slot);
-    if e & 0b11 == DESC_INVALID {
-        // User page tables stop at the low watermark like the user
-        // pages they map: a process touching sparse addresses cannot
-        // drain the kernel's reserve with tables
-        let new = crate::FRAME_ALLOCATOR.alloc_gfp(crate::mm::page_alloc::Gfp::USER)?;
-        // SAFETY: a fresh frame, reached through the linear map
-        unsafe { core::ptr::write_bytes(phys_to_virt(new), 0, PAGE_SIZE as usize) };
-        let ent = new | DESC_TABLE;
-        e = match slot.compare_exchange(e, ent, Ordering::AcqRel, Ordering::Acquire) {
-            Ok(_) => ent,
-            Err(cur) => {
-                crate::FRAME_ALLOCATOR.free(new);
-                cur
-            }
-        };
+    loop {
+        let e = crate::mm::huge_page::pmd_settled(slot);
+        if e != 0 {
+            return table_of(e);
+        }
+        if !install(slot) {
+            return None;
+        }
     }
-    table_of(e)
 }
 
-/// Pointer to the 2MB-level (L2) entry for `va`, allocating the missing
-/// upper tables (Linux pmd_alloc); None if out of memory
+/// Pointer to the 2MB-level (L2) entry for `va`, missing upper tables
+/// put in by `install` (Linux pmd_alloc); None if out of memory
 ///
 /// # Safety
 ///
-/// As [`pte_ptr`].
-pub(crate) unsafe fn pmd_alloc(root: u64, va: u64) -> Option<*mut u64> {
+/// As [`pte_ptr`]; `install` changes the entry it is handed only
+/// through [`table_install`].
+pub(crate) unsafe fn pmd_alloc(
+    root: u64,
+    va: u64,
+    install: &mut dyn FnMut(&AtomicU64) -> bool,
+) -> Option<*mut u64> {
     if !user_va(va) {
         return None;
     }
     let mut table = root;
     for shift in [39, 30] {
         // SAFETY: an entry of `root` or of a table under it mapping
-        // `va`, kept (the caller's guarantee)
-        table = unsafe { next_alloc(slot(table, va >> shift)) }?;
+        // `va`, kept (the caller's guarantee); `install` as required
+        table = unsafe { next_alloc(slot(table, va >> shift), install) }?;
     }
     Some(slot(table, va >> 21))
 }
 
-/// Pointer to the 4KB leaf (L3) entry for `va`, allocating the missing
-/// tables (Linux pte_alloc). None if out of memory or a block maps
+/// Pointer to the 4KB leaf entry for `va`, missing tables put in by
+/// `install` (Linux pte_alloc). None if out of memory or a block maps
 /// `va`.
 ///
 /// # Safety
 ///
-/// As [`pte_ptr`].
-pub(crate) unsafe fn pte_alloc(root: u64, va: u64) -> Option<*mut u64> {
+/// As [`pmd_alloc`].
+pub(crate) unsafe fn pte_alloc(
+    root: u64,
+    va: u64,
+    install: &mut dyn FnMut(&AtomicU64) -> bool,
+) -> Option<*mut u64> {
     // SAFETY: the caller's guarantee
-    let pmd = unsafe { pmd_alloc(root, va) }?;
-    // SAFETY: the 2MB-level entry of `va` under `root`, kept
-    let l3 = unsafe { next_alloc(pmd) }?;
+    let pmd = unsafe { pmd_alloc(root, va, install) }?;
+    // SAFETY: the 2MB-level entry of `va` under `root`, kept; `install`
+    // as required
+    let l3 = unsafe { next_alloc(pmd, install) }?;
     Some(slot(l3, va >> 12))
 }
 

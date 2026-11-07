@@ -143,16 +143,20 @@ impl<'a> PgTables<'a> {
         })
     }
 
-    /// `pmd`, installing missing upper tables under the page_table_lock
-    /// `l` of the tables' address space (Linux pmd_alloc); None outside
-    /// the pinned range or out of memory
-    pub fn pmd_alloc(&self, l: &PtLock<'_>, addr: u64) -> Option<Pmd<'a>> {
-        assert_eq!(l.pgd(), self.pgd, "page_table_lock of another mm");
+    /// `pmd`, installing missing upper tables in `mm`, the owner of the
+    /// tables (Linux pmd_alloc; see [`install`]); None outside the
+    /// pinned range or out of memory
+    pub fn pmd_alloc(&self, mm: &Mm, addr: u64) -> Option<Pmd<'a>> {
+        assert_eq!(mm.pgd(), self.pgd, "page_table_lock of another mm");
         if !self.covers(addr) {
             return None;
         }
-        // SAFETY: as in `pte`
-        let p = unsafe { paging::pmd_alloc(self.pgd, addr) }?;
+        // SAFETY: the walker hands `install` only upper-level entries
+        // of `pgd`'s tables, `mm`'s (asserted)
+        let mut put = |slot: &AtomicU64| unsafe { install(mm, slot) };
+        // SAFETY: as in `pte`; `put` changes an entry only through
+        // `table_install`
+        let p = unsafe { paging::pmd_alloc(self.pgd, addr, &mut put) }?;
         // SAFETY: as in `pmd`
         let slot = unsafe { AtomicU64::from_ptr(p) };
         // INVARIANT: as in `pmd`
@@ -185,9 +189,9 @@ impl<'a> PgTables<'a> {
         }
     }
 
-    /// `pte`, installing missing tables under `mm`'s page_table_lock
-    /// (Linux pte_alloc); `mm` is the owner of the tables. None outside
-    /// the pinned range, out of memory, or if a 2MB page maps `addr`.
+    /// `pte`, installing missing tables in `mm`, the owner of the
+    /// tables (Linux pte_alloc; see [`install`]). None outside the
+    /// pinned range, out of memory, or if a 2MB page maps `addr`.
     #[track_caller]
     pub fn pte_alloc(&self, mm: &Mm, addr: u64) -> Option<Pte<'a>> {
         assert_eq!(mm.pgd(), self.pgd, "page_table_lock of another mm");
@@ -197,14 +201,41 @@ impl<'a> PgTables<'a> {
         if !self.covers(addr) {
             return None;
         }
-        let _l = super::ptl::pt_lock(mm);
-        // SAFETY: as in `pte`
-        let p = unsafe { paging::pte_alloc(self.pgd, addr) }?;
+        // SAFETY: as in `pmd_alloc`
+        let mut put = |slot: &AtomicU64| unsafe { install(mm, slot) };
+        // SAFETY: as in `pmd_alloc`
+        let p = unsafe { paging::pte_alloc(self.pgd, addr, &mut put) }?;
         // SAFETY: as in `pte`: the entry of `addr`, under `pgd`
         let slot = unsafe { AtomicU64::from_ptr(p) };
         // INVARIANT: as in `pte`
         Some(Pte { slot, addr })
     }
+}
+
+/// Put a new table in the empty upper-level entry `slot` of `mm`'s
+/// tables (Linux __pte_alloc, __pmd_alloc): the frame is allocated
+/// first, with no spin lock held, so it may reclaim; the
+/// page_table_lock covers only the install, made if the entry is still
+/// empty (a racing caller may have put one in), else the frame is
+/// freed after it. False if out of memory.
+///
+/// # Safety
+///
+/// `slot` is an upper-level entry of `mm`'s tables, kept for the call.
+unsafe fn install(mm: &Mm, slot: &AtomicU64) -> bool {
+    let Some(new) = paging::table_alloc() else {
+        return false;
+    };
+    let l = super::ptl::pt_lock(mm);
+    // SAFETY: an upper-level entry of `mm`'s live tables (the caller's
+    // guarantee), its page_table_lock `l` held; `new` is a zeroed table
+    // frame, ours
+    let put = unsafe { paging::table_install(slot, new) };
+    drop(l);
+    if !put {
+        crate::FRAME_ALLOCATOR.free(new);
+    }
+    true
 }
 
 /// One 4KB entry of pinned page tables (Linux the `pte_t *` of

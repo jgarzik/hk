@@ -1326,7 +1326,11 @@ pub struct Zone {
   PTE locks): `Mm.page_table_lock` (`spin::Mutex<()>`, not IRQ-safe;
   held as a `ptl::PtLock`, which the writes of a 2MB-level entry,
   `pgtable::Pmd`, take as proof) covers table-structure changes: a missing table installed
-  (`PgTables::pte_alloc`, `pmd_alloc`), a 2MB entry mapped (`do_huge_anon`), split
+  (`PgTables::pte_alloc`, `pmd_alloc`: the frame is allocated first,
+  with no lock held, and installed under the lock only if the entry is
+  still empty, else freed after it; Linux __pte_alloc + pmd_install,
+  __pmd_alloc), a 2MB entry mapped (`do_huge_anon`, its tables and
+  frames allocated before the lock), split
   (`split_huge_pmd`), cleared (`take_huge_pmd`) or given a new
   protection (`Pmd::set_prot`, mprotect). The PTE lock of each
   PTE table page (a word in its struct page, `Page.ptl`; one lockdep
@@ -1371,7 +1375,8 @@ pub struct Zone {
   interrupt context; no sleeping under them. Both disable preemption
   (in_atomic), so an allocation under them never enters direct reclaim:
   reclaim's reverse-map walk takes PTE locks, the held one included (a
-  self-deadlock). Allocations that must not fail are made first: fork
+  self-deadlock). No page table is allocated under the page_table_lock
+  (frees under it are fine). Allocations that must not fail are made first: fork
   and mremap allocate the destination tables before the source's PTE
   lock (`PteWalk::prepare`, mremap's prep walk reads entries unlocked
   under the write-held mmap_lock), a copy-on-write break retries its
@@ -1701,9 +1706,10 @@ layout in `doc/MEMORY.md`
   with try_lock): an allocating task may hold it for writing. Direct
   reclaim swaps only to block-device areas (`swap::get_swap_page`
   skips swap files under PF_MEMALLOC), since a file's swap_rw may
-  need filesystem locks the allocating task holds. A fault
-  whose page table cannot be allocated (under the page_table_lock)
-  reclaims after dropping it and retries.
+  need filesystem locks the allocating task holds. A page table
+  is allocated before the page_table_lock is taken (Linux
+  pte_alloc_one), so it may reclaim; a fault whose table still cannot
+  be allocated reclaims again and retries.
 
 #### Per-inode page cache (Linux i_pages)
 

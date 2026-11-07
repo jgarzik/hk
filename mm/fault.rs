@@ -245,9 +245,8 @@ fn fault(mm: &Mm, addr: u64, access: Access) -> Result<(), VmFault> {
 }
 
 /// The leaf entry for `addr`, allocating missing tables; out of memory,
-/// pages are reclaimed (with no spinlock held: the tables are allocated
-/// under the page_table_lock) and the allocation tried again while that
-/// frees some, a bounded number of times
+/// pages are reclaimed and the allocation tried again while that frees
+/// some, a bounded number of times
 fn leaf<'a>(mm: &Mm, t: PgTables<'a>, addr: u64) -> Result<Pte<'a>, VmFault> {
     for _ in 0..16 {
         if let Some(p) = t.pte_alloc(mm, addr) {
@@ -329,10 +328,13 @@ fn do_huge_anon(mm: &Mm, t: PgTables<'_>, addr: u64, area: &Area) -> bool {
     if area.prot & PROT_EXEC != 0 {
         flags |= PageFlags::EXECUTE;
     }
-    // Fails if a racing fault installed a table or a page first
+    // The upper tables first, outside the page_table_lock (Linux
+    // __handle_mm_fault's pmd_alloc); fails if a racing fault installed
+    // a table or a page first
+    let pmd = t.pmd_alloc(mm, base);
     let l = super::ptl::pt_lock(mm);
     let entry = crate::arch::paging::mk_pmd(frame, flags);
-    let Some(pmd) = t.pmd_alloc(&l, base).filter(|p| p.set_huge(&l, entry)) else {
+    let Some(pmd) = pmd.filter(|p| p.set_huge(&l, entry)) else {
         FRAME_ALLOCATOR.free_huge(frame);
         FRAME_ALLOCATOR.free(pt);
         return false;
