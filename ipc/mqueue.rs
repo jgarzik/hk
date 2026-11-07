@@ -402,7 +402,7 @@ fn mesgq_info(sig: u32, value: u64, owner: &crate::task::pid::Pid) -> crate::sig
     use crate::signal::{SendInfo, SigFields, SigInfo, si_code};
     let me = crate::task::percpu::current_pid();
     let fields = SigFields::Rt {
-        pid: crate::task::pid::nr_ns(me, crate::task::pid::view(owner.ns())) as i32,
+        pid: crate::task::pid::nr_ns(me, owner.ns()) as i32,
         uid: crate::task::current_cred().uid,
         value,
     };

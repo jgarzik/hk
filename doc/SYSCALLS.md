@@ -15,8 +15,8 @@
 
 1.2 Process IDs & basic info
 
-- [x] getpid
-- [x] getppid
+- [x] getpid (pids in the caller's pid namespace throughout)
+- [x] getppid (0 for a parent outside the caller's pid namespace)
 - [x] gettid
 - [x] getpgid
 - [x] setpgid

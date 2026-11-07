@@ -879,14 +879,13 @@ Tag = roadmap phase (doc/ROADMAP.md).
    allocator, cached sorted device list.
 6. **One AnonVma per fork family, Vec chain** (J).
    `mm/anon_vma.rs:85`: O(N×VMAs) under one family write lock.
-7. **Syscalls report root-namespace pids** (C). A CLONE_NEWPID child
-   is numbered in its namespace (clone3 set_tid too); getpid, gettid,
-   getppid, clone's and wait's results, siginfo senders and every pid
-   argument go through the caller's namespace (`pid::vnr`,
-   `from_vnr`, `find_task_by_vpid`), but they read `pid::view`, the
-   root namespace, until the reports translate too (/proc, acct
-   records, a netlink socket's autobound port id): a task must never get a number in one
-   namespace that an argument reads in another.
+7. **Pid namespace gaps** (B4/B5). Syscalls use the caller's pid
+   namespace, but /proc keeps the root one even when mounted inside a
+   namespace, and acct records and a netlink socket's autobound port
+   id use root numbers (B4). A namespace's init is not special: it
+   takes default-action signals from inside, its death does not kill
+   the namespace, orphans go to the global init, and clone3 set_tid
+   need not start a new namespace at 1 (B5).
 8. **MM_LIFE_EXEC_CHAIN flake** (arm64 CI, TCG, NIC=e1000):
    `MM_LIFE_EXEC_CHAIN:FAIL -2`, a measured chain's child (busybox
    `env` x40 then `true`: 41 execs in one process) exited nonzero: a

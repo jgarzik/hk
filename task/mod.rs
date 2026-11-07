@@ -1707,13 +1707,6 @@ impl Task {
         self.pid_ns.as_deref().unwrap_or(&crate::ns::INIT_PID_NS)
     }
 
-    /// The pid namespace the numbers it passes and gets through
-    /// syscalls are in ([`pid::view`])
-    #[inline]
-    pub fn view_pid_ns(&self) -> &crate::ns::PidNamespace {
-        pid::view(self.pid_ns())
-    }
-
     /// Take over thread ID `tid` (exec's exchange_tids, TASKLIST and
     /// the run-queue entry re-keyed by the caller)
     pub fn set_tid(&self, tid: Tid) {

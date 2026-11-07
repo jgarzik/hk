@@ -892,9 +892,7 @@ caller's number to its `Pid` or root number (`pid::find_vpid`,
 hash before TASKLIST is taken, or to its task
 (`percpu::find_task_by_vpid`, `find_task_by_pid_ns`: the hash, then
 TASKLIST's read lock only to take a reference from `Pid.task`, the
-`Arc<Pid>` dropped after it). Every pid argument is looked up so. The boundary reads
-`pid::view` (`Task::view_pid_ns`), the root namespace, until every
-syscall translates (BUGS.md).
+`Arc<Pid>` dropped after it). Every pid argument is looked up so.
 
 **Relations** (under TASKLIST's write lock to change, read lock to
 walk): `real_parent` and `ptracer` are task references (`Weak`), never

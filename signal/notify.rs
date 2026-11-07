@@ -42,7 +42,7 @@ pub fn notify_tracer_trapped(tid: Tid, tracer: &TaskRef, code: u32) {
     let status = (code & 0x7f) as i32;
     // The tracee as its tracer's namespace numbers it (Linux
     // do_notify_parent_cldstop: task_pid_nr_ns(tsk, ns of parent))
-    let ns = tracer.view_pid_ns();
+    let ns = tracer.pid_ns();
     if let Some(info) = chld_info(tid, super::si_code::CLD_TRAPPED, status, ns) {
         super::kill_proc_info(tracer.pid, SIGCHLD, SendInfo::Info(info));
     }
@@ -316,7 +316,7 @@ pub fn notify(table: &GlobalTaskTable, z: Zombie, mut entry: Entry) -> Told {
         };
     };
     let (sig, autoreap) = (r.sig, r.autoreap);
-    let posted = match chld_notice(table, tid, r.to.view_pid_ns()) {
+    let posted = match chld_notice(table, tid, r.to.pid_ns()) {
         Some(mut info) if sig != 0 => {
             info.signo = sig as i32;
             let info = SendInfo::Info(info);

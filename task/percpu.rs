@@ -2649,7 +2649,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
             // number in its namespace (Linux schedule_tail writes it)
             use crate::arch::Uaccess;
             use crate::uaccess::put_user;
-            let own = crate::task::pid::nr_ns(child_tid, child_task.view_pid_ns()) as i32;
+            let own = crate::task::pid::nr_ns(child_tid, child_task.pid_ns()) as i32;
             if put_user::<Uaccess, i32>(config.child_tidptr, own).is_err() {
                 printkln!("CLONE: CLONE_CHILD_SETTID write failed");
             }
@@ -4403,7 +4403,7 @@ pub fn current_pid() -> Pid {
 /// a creation-time field, read lock-free; it outlives the task's every
 /// syscall like `current()` itself
 pub fn current_pid_ns() -> &'static crate::ns::PidNamespace {
-    current().task.view_pid_ns()
+    current().task.pid_ns()
 }
 
 /// Get the current task's thread ID
@@ -4422,7 +4422,7 @@ pub fn current_ppid() -> Pid {
 /// translated
 pub fn current_ppid_vnr() -> u32 {
     let me = current();
-    let ns = me.task.view_pid_ns();
+    let ns = me.task.pid_ns();
     if ns.level == 0 {
         return crate::task::pid::nr_ns(me.ppid(), ns);
     }

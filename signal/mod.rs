@@ -1387,7 +1387,7 @@ fn send_task(t: &TaskRef, sig: u32, info: SendInfo, ty: PidType, force: bool) ->
         None
     } else {
         SigQueue::alloc(
-            info.resolve_checked(sig, t.view_pid_ns()),
+            info.resolve_checked(sig, t.pid_ns()),
             tg.uid,
             tg.limit,
             info.override_rlimit(sig),
@@ -1441,7 +1441,7 @@ fn send_held(
     if let Some(e) = q.as_mut() {
         // Numbered in the receiver's namespace by the sender already
         // (Linux do_notify_parent: __send_signal_locked, no check)
-        e.set_info(info.resolve(sig, t.view_pid_ns()));
+        e.set_info(info.resolve(sig, t.pid_ns()));
     }
     // A send changes no blocked mask: with_sig retargets nothing (which
     // would take TASKLIST)
