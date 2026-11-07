@@ -1536,6 +1536,12 @@ fn group_task(
     table.task(t)
 }
 
+/// `sig` with `info` to task `t`'s thread group (Linux
+/// group_send_sig_info, PIDTYPE_TGID, with no permission check)
+pub fn send_group_signal(t: &TaskRef, sig: u32, info: SendInfo) -> i32 {
+    send_task(t, sig, info, PidType::Tgid, false)
+}
+
 /// `sig` with `info` to the process struct pid `pid` names, after
 /// `check` of it allows it (Linux kill_pid_info: the struct pid, never
 /// a number a reaped process freed for reuse)

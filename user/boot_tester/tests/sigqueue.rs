@@ -26,10 +26,13 @@
 //!   si_overrun (= timer_getoverrun); settime and delete drop a queued
 //!   one; SIGEV_THREAD_ID signals that thread; ITIMER_REAL's SIGALRM is
 //!   SI_KERNEL and the interval rearms when it is taken
+//! - SIGCHLD SIG_IGN or SA_NOCLDWAIT: a child is reaped at its exit
+//!   (wait is ECHILD); with SA_NOCLDWAIT SIGCHLD still comes
+//! - a child's pdeath_signal comes when its parent exits, from it
 //! - arm64: a handler set without SA_RESTORER returns through the
 //!   kernel's trampoline (Linux: the vDSO sigtramp)
 
-use super::helpers::{host_mode, print, print_num, println, read_file, skip};
+use super::helpers::{print, print_num, println, read_file, skip};
 use hk_syscall::{
     MqAttr, O_CREAT, O_RDWR, SigEvent, SigVal, sys_mq_notify, sys_mq_open, sys_mq_timedsend,
     sys_mq_unlink, sys_ptrace,
@@ -68,6 +71,8 @@ pub fn run_tests() {
     test_timer_overrun();
     test_timer_drop();
     test_itimer_real();
+    test_autoreap();
+    test_pdeath();
     #[cfg(target_arch = "aarch64")]
     test_no_restorer();
 }
@@ -326,13 +331,6 @@ fn test_kill_info() {
 
 /// A child's exit: SIGCHLD with CLD_EXITED, its pid and exit status
 fn test_sigchld_exit() {
-    if !host_mode() {
-        skip(
-            b"SIGQUEUE_SIGCHLD",
-            b"no do_notify_parent: a child's exit sends no SIGCHLD",
-        );
-        return;
-    }
     let old = block(bit(SIGCHLD));
     let child = sys_fork();
     if child == 0 {
@@ -839,6 +837,108 @@ fn test_itimer_real() {
         print_num(rb);
         print(b" code=");
         print_num(a.si_code as i64);
+        println(b"");
+    }
+}
+
+/// Fork a child that exits 3 at once; the wait4 result for it
+fn child_exits_wait() -> (i64, i64) {
+    let c = sys_fork();
+    if c == 0 {
+        sys_exit(3);
+    }
+    let mut st = 0i32;
+    (c, sys_wait4(c, &mut st, 0, 0))
+}
+
+/// SIGCHLD ignored: the child is gone without a zombie (ECHILD); with
+/// SA_NOCLDWAIT and a handler, SIGCHLD (CLD_EXITED) still comes and the
+/// child is reaped too
+fn test_autoreap() {
+    const SIG_IGN: u64 = 1;
+    const SA_NOCLDWAIT: u64 = 2;
+    const ECHILD: i64 = -10;
+    let ign: [u64; 4] = [SIG_IGN, 0, 0, 0];
+    let dfl: [u64; 4] = [SIG_DFL, 0, 0, 0];
+    sys_rt_sigaction(SIGCHLD, ign.as_ptr() as u64, 0, 8);
+    let (_, w1) = child_exits_wait();
+    let old = block(bit(SIGCHLD));
+    let nowait: [u64; 4] = [
+        group_handler as *const () as u64,
+        SA_RESTORER | SA_NOCLDWAIT,
+        super::signals::restorer_addr(),
+        0,
+    ];
+    sys_rt_sigaction(SIGCHLD, nowait.as_ptr() as u64, 0, 8);
+    let (c2, w2) = child_exits_wait();
+    let mut info = zeroed();
+    let r = wait_sig(bit(SIGCHLD), 2, &mut info);
+    sys_rt_sigaction(SIGCHLD, dfl.as_ptr() as u64, 0, 8);
+    setmask(old);
+    if w1 == ECHILD
+        && w2 == ECHILD
+        && r == SIGCHLD as i64
+        && info.si_code == CLD_EXITED
+        && info.si_pid as i64 == c2
+        && info.si_status == 3
+    {
+        println(b"SIGQUEUE_AUTOREAP:OK");
+    } else {
+        print(b"SIGQUEUE_AUTOREAP:FAIL ign=");
+        print_num(w1);
+        print(b" nocldwait=");
+        print_num(w2);
+        print(b" sig=");
+        print_num(r);
+        print(b" code=");
+        print_num(info.si_code as i64);
+        println(b"");
+    }
+}
+
+/// A grandchild with PR_SET_PDEATHSIG SIGUSR1 gets it, from its parent's
+/// pid, when that parent exits; it is then this (init) process's child
+fn test_pdeath() {
+    const PR_SET_PDEATHSIG: i32 = 1;
+    let mut fds = [0i32; 2];
+    hk_syscall::sys_pipe(fds.as_mut_ptr());
+    let old = block(bit(SIGUSR1));
+    let a = sys_fork();
+    if a == 0 {
+        let b = sys_fork();
+        if b == 0 {
+            hk_syscall::sys_prctl(PR_SET_PDEATHSIG, SIGUSR1 as u64, 0, 0, 0);
+            let pid = (sys_getpid() as u32).to_ne_bytes();
+            hk_syscall::sys_write(fds[1] as u64, pid.as_ptr(), 4);
+            let mut info = zeroed();
+            let r = wait_sig(bit(SIGUSR1), 10, &mut info);
+            let parent = hk_syscall::sys_getppid();
+            let ok = r == SIGUSR1 as i64 && info.si_code == SI_USER && parent == 1;
+            sys_exit(if ok { 0 } else { 1 });
+        }
+        // Exit once the grandchild has set its pdeath signal
+        let mut buf = [0u8; 4];
+        hk_syscall::sys_read(fds[0] as u64, buf.as_mut_ptr(), 4);
+        hk_syscall::sys_write(fds[1] as u64, buf.as_ptr(), 4);
+        sys_exit(0);
+    }
+    let mut st = 0i32;
+    sys_wait4(a, &mut st, 0, 0);
+    let mut buf = [0u8; 4];
+    hk_syscall::sys_read(fds[0] as u64, buf.as_mut_ptr(), 4);
+    let b = i64::from(u32::from_ne_bytes(buf));
+    let mut sb = -1i32;
+    let w = sys_wait4(b, &mut sb, 0, 0);
+    sys_close(fds[0] as u64);
+    sys_close(fds[1] as u64);
+    setmask(old);
+    if w == b && sb == 0 {
+        println(b"SIGQUEUE_PDEATH:OK");
+    } else {
+        print(b"SIGQUEUE_PDEATH:FAIL wait=");
+        print_num(w);
+        print(b" status=");
+        print_num(sb as i64);
         println(b"");
     }
 }

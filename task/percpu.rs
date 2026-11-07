@@ -826,8 +826,7 @@ impl GlobalTaskTable {
 
     /// Move every child of `task` to `reaper` (Linux forget_original_parent
     /// + reparent_leader); true if one was a zombie
-    pub fn reparent(&mut self, task: &Task, reaper: &TaskRef) -> bool {
-        let mut zombie = false;
+    pub fn reparent(&mut self, task: &Task, reaper: &TaskRef, moved: &mut Vec<TaskRef>) {
         loop {
             let Some(child) = self.inner_mut_of(task).children.pop_front() else {
                 break;
@@ -835,11 +834,10 @@ impl GlobalTaskTable {
             let ci = self.inner_mut_of(&child);
             ci.in_children = false;
             ci.real_parent = Some(Arc::downgrade(reaper));
-            zombie |= matches!(ci.state, TaskState::Zombie(_));
             child.ppid.store(reaper.pid, Ordering::Relaxed);
             self.link_child(&child);
+            moved.push(child);
         }
-        zombie
     }
 
     /// Add a task (fork, kernel thread creation); it has a pid. It joins
@@ -2456,6 +2454,33 @@ pub fn current_exiting() -> bool {
 /// else the nearest PR_SET_CHILD_SUBREAPER ancestor, else init
 fn forget_original_parent() {
     let me = task_ref(&current());
+    let mut moved = Vec::new();
+    reparent_children(&me, &mut moved);
+    // Then, with TASKLIST dropped (Linux forget_original_parent,
+    // reparent_leader): each moved child's threads get their
+    // pdeath_signal, from this task; a zombie whose group is gone tells
+    // its new parent, which may release it at once
+    for c in &moved {
+        let deaths: Vec<(TaskRef, u32)> = {
+            let table = TASKLIST.read();
+            table
+                .threads(c.pid)
+                .filter(|t| t.pdeath_signal > 0)
+                .filter_map(|t| Some((table.task(t.task.tid())?, t.pdeath_signal as u32)))
+                .collect()
+        };
+        for (t, sig) in deaths {
+            crate::signal::send_group_signal(&t, sig, crate::signal::SendInfo::User);
+        }
+        if leader_waits(c.pid) && crate::signal::notify::do_notify_parent(c.pid) {
+            release_zombie(c.pid);
+        }
+    }
+}
+
+/// Hand `me`'s children to their new parent: another live thread of
+/// its group, else the nearest live subreaper ancestor, else init
+fn reparent_children(me: &TaskRef, moved: &mut Vec<TaskRef>) {
     let mut table = TASKLIST.write();
     if table.get(me.tid()).is_none_or(|t| t.children.is_empty()) {
         return;
@@ -2463,7 +2488,7 @@ fn forget_original_parent() {
     let live = crate::signal::task_live;
     let mut reaper = table
         .threads(me.pid)
-        .find(|t| !core::ptr::eq(t.task, &raw const *me) && live(t))
+        .find(|t| !core::ptr::eq(t.task, Arc::as_ptr(me)) && live(t))
         .map(|t| task_ref(t.task));
     if reaper.is_none() {
         let mut p = table.get(me.tid()).and_then(|t| t.real_parent.clone());
@@ -2479,9 +2504,66 @@ fn forget_original_parent() {
     let Some(reaper) = reaper.or_else(|| table.task(1)) else {
         return;
     };
-    if !Arc::ptr_eq(&reaper, &me) {
-        table.reparent(&me, &reaper);
+    if !Arc::ptr_eq(&reaper, me) {
+        table.reparent(me, &reaper, moved);
     }
+}
+
+/// The exiting task, now a zombie, tells its parent or tracer (Linux
+/// exit_notify, and release_task for a group's last thread): a traced
+/// task its tracer; a leader whose group is gone its parent; a
+/// non-leader thread is released, and if it was the last of a group
+/// whose leader is a zombie, the leader tells. A child the parent does
+/// not wait for is released at once (autoreap).
+fn exit_notify(tid: Tid) {
+    let (pid, leader, traced) = {
+        let table = TASKLIST.read();
+        let Some(t) = table.get(tid) else {
+            return;
+        };
+        (t.task.pid, t.leader, t.ptrace != 0)
+    };
+    if traced {
+        crate::signal::notify::do_notify_parent(tid);
+    } else if leader && !group_others(pid, tid) && crate::signal::notify::do_notify_parent(tid) {
+        release_zombie(tid);
+    }
+    release_thread(tid);
+    if !leader && !traced && leader_waits(pid) && crate::signal::notify::do_notify_parent(pid) {
+        release_zombie(pid);
+    }
+}
+
+/// Process `pid`'s leader is a zombie with no other thread left: it
+/// waits only for its parent now (Linux release_task: the group's
+/// last thread notifies for it)
+fn leader_waits(pid: Pid) -> bool {
+    let table = TASKLIST.read();
+    table.get(pid).is_some_and(|l| {
+        l.leader && matches!(l.state, TaskState::Zombie(_)) && !group_alive(&table, pid, pid)
+    })
+}
+
+/// Release zombie leader `tid` no one will wait for (Linux release_task
+/// of an autoreaped child): out of the task list, its RLIMIT_NPROC
+/// charge dropped; its run queue keeps it if it still runs
+fn release_zombie(tid: Tid) {
+    let gone = {
+        let mut table = TASKLIST.write();
+        match table.get(tid) {
+            Some(t) if matches!(t.state, TaskState::Zombie(_)) => {
+                let (uid, pid) = (t.cred().uid, t.task.pid);
+                table.remove(tid).map(|t| (t, uid, pid))
+            }
+            _ => None,
+        }
+    };
+    if let Some((t, uid, pid)) = gone {
+        crate::fs::proc::proc_flush_pid(pid, tid);
+        crate::task::nproc_uncharge(uid);
+        drop(t);
+    }
+    crate::task::proc::CHILD_EXIT_WQ.wake_all();
 }
 
 /// An exited non-leader thread leaves the task list at once (Linux
@@ -2625,7 +2707,7 @@ pub fn exit_current(status: Option<i32>) -> ! {
     }
     if let Some(st) = status {
         mark_zombie(tid, st, group_dead);
-        release_thread(tid);
+        exit_notify(tid);
     }
 
     // Let a parent sleeping in wait4/waitid re-check for zombies

@@ -488,6 +488,17 @@ de_thread
 - A pidfd polls readable when the leader exits, not when the whole
   group is gone.
 
+## Exit notification gaps
+
+**Location**: `signal/notify.rs`, `task/percpu.rs` (exit_notify)
+
+- A traced child's exit tells its tracer only; once the tracer reaps or
+  detaches it, its real parent is not told nor can wait for it (Linux
+  wait_task_zombie / __ptrace_detach: do_notify_parent to the real
+  parent).
+- A child's non-SIGCHLD exit signal is not turned into SIGCHLD when its
+  parent has exec'd since the fork (Linux parent_exec_id).
+
 ## ptrace stop gaps
 
 **Location**: `task/ptrace.rs`, `task/exec.rs`,
