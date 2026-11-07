@@ -451,12 +451,19 @@ impl PosixTimer {
         let Some(q) = self.sigq.lock().take() else {
             return;
         };
-        let periodic = {
+        {
             let mut i = self.inner.lock();
             i.sigqueue_seq = i.signal_seq;
             i.sig_periodic = i.requeue;
-            i.sig_periodic
-        };
+        }
+        self.send_sigq(q);
+    }
+
+    /// Send its entry `q` as stamped when it was first queued (Linux
+    /// posixtimer_queue_sigqueue): ignored, an interval timer's waits
+    /// to be unignored
+    fn send_sigq(&self, q: Box<SigQueue>) {
+        let periodic = self.inner.lock().sig_periodic;
         let Some(target) = &self.target else {
             *self.sigq.lock() = Some(q);
             return;
@@ -662,9 +669,14 @@ pub fn sig_unignore(sig: u32) {
             waiting.push(t.clone());
         }
     });
+    // Queued as first stamped: a settime or delete since then drops it
+    // at dequeue (Linux posixtimer_sig_unignore leaves it_sigqueue_seq)
     for t in waiting {
         t.inner.lock().ignored = false;
-        t.queue_signal();
+        let q = t.sigq.lock().take();
+        if let Some(q) = q {
+            t.send_sigq(q);
+        }
     }
 }
 

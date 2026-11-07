@@ -25,7 +25,8 @@
 //! - a POSIX timer's signal is SI_TIMER with si_tid and si_value; an
 //!   interval timer's one queued signal counts the periods it missed in
 //!   si_overrun (= timer_getoverrun); settime and delete drop a queued
-//!   one; SIGEV_THREAD_ID signals that thread; ITIMER_REAL's SIGALRM is
+//!   one, as do they a signal ignored then unignored after them;
+//!   SIGEV_THREAD_ID signals that thread; ITIMER_REAL's SIGALRM is
 //!   SI_KERNEL and the interval rearms when it is taken
 //! - SIGCHLD SIG_IGN or SA_NOCLDWAIT: a child is reaped at its exit
 //!   (wait is ECHILD); with SA_NOCLDWAIT SIGCHLD still comes
@@ -90,6 +91,7 @@ pub fn run_tests() {
     test_timer_info();
     test_timer_overrun();
     test_timer_drop();
+    test_timer_unignore();
     test_itimer_real();
     test_autoreap();
     test_pdeath();
@@ -870,6 +872,39 @@ fn test_timer_drop() {
         print_num(ra);
         print(b" delete=");
         print_num(rb);
+        println(b"");
+    }
+}
+
+/// An interval timer whose signal is ignored, disarmed, then the signal
+/// unignored (blocked): nothing is pending (Linux 6.13 on:
+/// posixtimer_sig_unignore queues it with its old it_sigqueue_seq and
+/// the dequeue drops it; before, settime cancelled the ignored timer)
+fn test_timer_unignore() {
+    const SIG_IGN: u64 = 1;
+    let ign: [u64; 4] = [SIG_IGN, 0, 0, 0];
+    let dfl: [u64; 4] = [SIG_DFL, 0, 0, 0];
+    let old = block(0);
+    setmask(old & !bit(SIGRT));
+    sys_rt_sigaction(SIGRT, ign.as_ptr() as u64, 0, 8);
+    let id = timer(SIGRT, 1, 0, 0);
+    arm(id, 5, 5);
+    sleep_ms(30);
+    arm(id, 0, 0);
+    block(bit(SIGRT));
+    sys_rt_sigaction(SIGRT, dfl.as_ptr() as u64, 0, 8);
+    let mut i = zeroed();
+    let r = wait_sig(bit(SIGRT), 0, &mut i);
+    hk_syscall::sys_timer_delete(id);
+    drain(SIGRT);
+    setmask(old);
+    if id >= 0 && r == EAGAIN {
+        println(b"SIGQUEUE_TIMER_UNIGNORE:OK");
+    } else {
+        print(b"SIGQUEUE_TIMER_UNIGNORE:FAIL id=");
+        print_num(id as i64);
+        print(b" r=");
+        print_num(r);
         println(b"");
     }
 }
