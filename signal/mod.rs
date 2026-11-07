@@ -904,6 +904,28 @@ pub fn exit_task_signal(tid: Tid) {
 // Signal Sending
 // =============================================================================
 
+/// The current thread group's pending `sig` is discarded, every queued
+/// instance with it (Linux do_sigaction once the action ignores it:
+/// POSIX, whether or not it is blocked)
+pub fn flush_group_signal(sig: u32) {
+    let mut mask = SigSet::EMPTY;
+    mask.add(sig);
+    let tids: alloc::vec::Vec<Tid> = TASKLIST
+        .read()
+        .threads(crate::task::percpu::current_pid())
+        .map(|t| t.task.tid())
+        .collect();
+    let mut shared_done = false;
+    for tid in tids {
+        // Freed here, after the thread's locks are dropped
+        let _gone = with_task_signal_state(tid, |s| {
+            let shared = (!shared_done).then(|| s.shared_pending.lock().flush_mask(&mask));
+            (s.pending.flush_mask(&mask), shared)
+        });
+        shared_done = true;
+    }
+}
+
 /// SIGKILL is pending for the current task (Linux
 /// fatal_signal_pending): killable sleeps end on it
 pub fn fatal_signal_pending() -> bool {

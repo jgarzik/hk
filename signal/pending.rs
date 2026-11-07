@@ -182,6 +182,21 @@ impl SigPending {
     }
 }
 
+impl SigPending {
+    /// Take the signals of `mask` out, their queued info with them
+    /// (Linux flush_sigqueue_mask): returned to be dropped after the
+    /// lock is released
+    pub fn flush_mask(&mut self, mask: &SigSet) -> SigPending {
+        let mut gone = SigPending::new();
+        gone.signal = self.signal.intersect(mask);
+        self.signal = self.signal.subtract(mask);
+        while let Some(q) = self.unlink(|q| mask.contains(q.info.sig())) {
+            gone.queue(q);
+        }
+        gone
+    }
+}
+
 impl Drop for SigPending {
     /// One entry at a time: a long queue must not recurse
     fn drop(&mut self) {
@@ -253,6 +268,22 @@ mod tests {
         assert!(!p.is_pending(sig));
         assert!(p.dequeue(&NONE).is_none());
         assert_eq!(crate::task::ucount(4242, Ucount::Sigpending), 0);
+    }
+
+    /// flush_mask takes the signal and every queued instance, nothing else
+    #[test]
+    fn flush() {
+        let sig = SIGRTMIN + 5;
+        let mut p = SigPending::new();
+        p.queue(rt(sig, 1));
+        p.queue(rt(SIGRTMIN + 6, 2));
+        p.queue(rt(sig, 3));
+        let mut m = SigSet::EMPTY;
+        m.add(sig);
+        let gone = p.flush_mask(&m);
+        assert!(gone.is_pending(sig) && !p.is_pending(sig));
+        assert_eq!(p.dequeue(&NONE).map(value), Some(2));
+        assert!(p.dequeue(&NONE).is_none());
     }
 
     /// A kernel fault is taken before an earlier-numbered pending one and

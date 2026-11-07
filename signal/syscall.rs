@@ -116,6 +116,7 @@ pub fn sys_rt_sigaction(sig: u32, act_ptr: u64, oact_ptr: u64, sigsetsize: u64) 
         return -3; // ESRCH
     };
     // The old action and the swap in one hold of the action lock
+    let changed = new.is_some();
     let old = match new {
         Some(a) => match sighand.set_action(sig, a) {
             Ok(old) => old,
@@ -126,6 +127,9 @@ pub fn sys_rt_sigaction(sig: u32, act_ptr: u64, oact_ptr: u64, sigsetsize: u64) 
             None => return -22, // EINVAL
         },
     };
+    if changed && handler_ignored(&sighand, sig) {
+        crate::signal::flush_group_signal(sig);
+    }
     if oact_ptr != 0
         && UserPtr::<UserSigAction>::new(oact_ptr)
             .write(&UserSigAction::from(&old))
@@ -134,6 +138,20 @@ pub fn sys_rt_sigaction(sig: u32, act_ptr: u64, oact_ptr: u64, sigsetsize: u64) 
         return -14; // EFAULT
     }
     0
+}
+
+/// `sig`'s action now discards it: SIG_IGN, or SIG_DFL for a signal
+/// whose default is to ignore it (Linux sig_handler_ignored)
+fn handler_ignored(sighand: &crate::signal::SigHand, sig: u32) -> bool {
+    use crate::signal::{DefaultAction, SigHandler, default_action};
+    match sighand.get_action(sig).map(|a| a.handler) {
+        Some(SigHandler::Ignore) => true,
+        Some(SigHandler::Default) => matches!(
+            default_action(sig),
+            DefaultAction::Ignore | DefaultAction::Continue
+        ),
+        _ => false,
+    }
 }
 
 /// rt_sigprocmask(how, set, oset, sigsetsize) - examine and change blocked signals

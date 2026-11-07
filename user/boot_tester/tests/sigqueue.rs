@@ -17,6 +17,8 @@
 //!   registrant's sigev_value
 //! - a tracee's ptrace stop sends its tracer SIGCHLD with CLD_TRAPPED,
 //!   its pid and the stop signal
+//! - sigaction to SIG_IGN, or SIG_DFL of an ignore-default signal,
+//!   discards it pending, blocked or not, queued instances included
 
 use super::helpers::{host_mode, print, print_num, println, read_file, skip};
 use hk_syscall::{
@@ -26,7 +28,7 @@ use hk_syscall::{
 use hk_syscall::{
     RLIMIT_SIGPENDING, RLimit, SA_RESTORER, SA_SIGINFO, SFD_NONBLOCK, SIG_DFL, SigInfo, sys_close,
     sys_exit, sys_fork, sys_getpid, sys_getrlimit, sys_kill, sys_read, sys_rt_sigaction,
-    sys_rt_sigprocmask, sys_rt_sigqueueinfo, sys_rt_sigtimedwait, sys_setrlimit, sys_signalfd4,
+    sys_rt_sigpending, sys_rt_sigprocmask, sys_rt_sigqueueinfo, sys_rt_sigtimedwait, sys_setrlimit, sys_signalfd4,
     sys_wait4,
 };
 
@@ -51,6 +53,7 @@ pub fn run_tests() {
     test_handler_info();
     test_mq_info();
     test_trapped_info();
+    test_ignore_flush();
 }
 
 fn bit(sig: u32) -> u64 {
@@ -524,6 +527,47 @@ fn test_trapped_info() {
         print_num(info.si_pid as i64);
         print(b" status=");
         print_num(info.si_status as i64);
+        println(b"");
+    }
+}
+
+fn pending() -> u64 {
+    let mut set = 0u64;
+    sys_rt_sigpending(&mut set as *mut u64 as u64, 8);
+    set
+}
+
+/// Two queued RT signals and a SIGCHLD, blocked: SIG_IGN on the RT one
+/// and SIG_DFL on SIGCHLD discard both (SigQ drops by the two), the
+/// blocked SIGUSR1 stays
+fn test_ignore_flush() {
+    const SIG_IGN: u64 = 1;
+    let mask = bit(SIGRT) | bit(SIGUSR1) | bit(SIGCHLD);
+    let old = block(mask);
+    let (q0, _) = sigq();
+    queue_self(SIGRT, 1);
+    queue_self(SIGRT, 2);
+    sys_kill(sys_getpid(), SIGUSR1);
+    sys_kill(sys_getpid(), SIGCHLD);
+    let before = pending() & mask;
+    let ign: [u64; 4] = [SIG_IGN, 0, 0, 0];
+    let dfl: [u64; 4] = [SIG_DFL, 0, 0, 0];
+    sys_rt_sigaction(SIGRT, ign.as_ptr() as u64, 0, 8);
+    sys_rt_sigaction(SIGRT, dfl.as_ptr() as u64, 0, 8);
+    sys_rt_sigaction(SIGCHLD, dfl.as_ptr() as u64, 0, 8);
+    let after = pending() & mask;
+    let q = sigq().0 - q0;
+    let usr1 = drain(SIGUSR1);
+    setmask(old);
+    if before == mask && after == bit(SIGUSR1) && q == 1 && usr1 == 1 {
+        println(b"SIGQUEUE_IGN_FLUSH:OK");
+    } else {
+        print(b"SIGQUEUE_IGN_FLUSH:FAIL before=");
+        print_num(before as i64);
+        print(b" after=");
+        print_num(after as i64);
+        print(b" sigq=");
+        print_num(q);
         println(b"");
     }
 }

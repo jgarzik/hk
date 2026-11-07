@@ -499,10 +499,6 @@ de_thread
 
 **Location**: `signal/`
 
-A signal made ignored by sigaction stays pending, its queued instances
-with it, until delivery discards them (Linux do_sigaction flushes them:
-flush_sigqueue_mask).
-
 A handler's sigcontext has the fault details (x86-64 trapno, err, cr2;
 arm64 fault_address, esr_context) only for the fault's own signal; other
 signals get zeros (Linux reports the thread's last fault: thread.trap_nr,
