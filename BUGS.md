@@ -925,7 +925,17 @@ Tag = roadmap phase (doc/ROADMAP.md).
 9. **SOCKCORE_CONNECT_REFUSED flake** (cause unknown):
    `SOCKCORE_CONNECT_REFUSED:FAIL SO_ERROR got 0` (hk arm64,
    `check-stress`): poll reported POLLOUT for a nonblocking connect to
-   a just-closed loopback port, but no ECONNREFUSED was pending.
+   a just-closed loopback port, but no ECONNREFUSED was pending. The
+   error is set under the socket lock with the move to CLOSED, so the
+   connect left SYN_SENT by a SYN-ACK or a SYN: something answered on
+   the dead port. Not a self-connect: bind(0) gives the dead port an
+   odd offset, connect takes even ones while any is free. Not
+   reproduced in 10000 looped runs (with SOCKCORE_PORT_PARITY before
+   each; x86 and arm64 LOCKDEP e1000, 8 CPUs, CPU spinners, TIME_WAIT
+   churn); LOCKDEP builds assert that a listener receiving a SYN owns
+   its port in bhash (`TcpSock::assert_owner`). On failure the test
+   prints the poll events, TCP state, local and peer ports, the port
+   range and the /proc/net/tcp lines of the dead port.
 10. **TCP_PROC_NET flake** (cause unknown): one end of a fresh,
    accepted loopback connection is missing from /proc/net/tcp as state
    01 (`client line got 0`, `server line got 0`; hk arm64, CI and

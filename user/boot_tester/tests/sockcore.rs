@@ -462,11 +462,10 @@ fn test_nonblock_refused() {
     if r == EINPROGRESS {
         let (pr, ev) = poll1(fd, 4 /* POLLOUT */, 5000);
         t.ok(b"poll", pr == 1 && ev & 4 != 0, ev as i64);
-        t.eq(
-            b"SO_ERROR",
-            getint(fd, SOL_SOCKET, SO_ERROR).1 as i64,
-            -ECONNREFUSED,
-        );
+        let err = getint(fd, SOL_SOCKET, SO_ERROR).1 as i64;
+        if !t.eq(b"SO_ERROR", err, -ECONNREFUSED) {
+            refused_diag(fd, dead, ev);
+        }
         t.eq(
             b"SO_ERROR cleared",
             getint(fd, SOL_SOCKET, SO_ERROR).1 as i64,
@@ -480,6 +479,62 @@ fn test_nonblock_refused() {
     let _ = sys_close;
     t.done();
 }
+
+/// Intermittent (BUGS.md): what a connect to a closed port reached
+/// instead of a reset: poll events (refused is POLLOUT|POLLERR|POLLHUP),
+/// TCP state, both names, the port range and /proc/net/tcp lines with
+/// the dead port
+fn refused_diag(fd: i32, dead: u16, ev: i16) {
+    use super::helpers::{print, print_num, println, read_file};
+    let num = |n: i64| {
+        print(b" ");
+        print_num(n);
+    };
+    let mut info = [0u8; 8];
+    let mut len = 8u32;
+    sys_getsockopt(
+        fd,
+        6,  /* IPPROTO_TCP */
+        11, /* TCP_INFO */
+        info.as_mut_ptr(),
+        &mut len,
+    );
+    let lp = port(fd);
+    let mut ra = sin(ANY, 0);
+    let mut rlen = 16u32;
+    sys_getpeername(fd, &mut ra as *mut SockAddrIn as *mut u8, &mut rlen);
+    print(b"  poll ev, tcp state, dead port, local port, peer port:");
+    for n in [
+        ev as i64,
+        info[0] as i64,
+        dead as i64,
+        lp as i64,
+        u16::from_be(ra.sin_port) as i64,
+    ] {
+        num(n);
+    }
+    println(b"");
+    let buf = unsafe { &mut *core::ptr::addr_of_mut!(DIAG) };
+    let n = read_file(b"/proc/sys/net/ipv4/ip_local_port_range\0", buf);
+    print(b"  range: ");
+    println(&buf[..n.max(0) as usize]);
+    let n = read_file(b"/proc/net/tcp\0", buf);
+    let mut want = *b":0000 ";
+    for i in 0..4 {
+        let d = ((dead >> (12 - 4 * i)) & 15) as u8;
+        want[1 + i] = if d < 10 { b'0' + d } else { b'A' + d - 10 };
+    }
+    print(b"  /proc/net/tcp bytes");
+    num(n);
+    println(b"");
+    for l in buf[..n.max(0) as usize].split(|&c| c == b'\n') {
+        if l.windows(6).any(|w| w == want) {
+            println(&l[..l.len().min(100)]);
+        }
+    }
+}
+
+static mut DIAG: [u8; 512 * 1024] = [0; 512 * 1024];
 
 /// Ports and table entries are released on every close path: a fixed
 /// local port is reusable after (a) a refused connect + close, (b)

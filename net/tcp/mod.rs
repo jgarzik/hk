@@ -503,6 +503,7 @@ impl TcpSock {
         if g.cb.state != TcpState::Listen {
             return;
         }
+        self.assert_owner();
         {
             let q = self.queue.lock();
             match q.as_ref() {
@@ -511,6 +512,19 @@ impl TcpSock {
             }
         }
         self.child(s, t, g.cb.opts, now);
+    }
+
+    /// Debug and LOCKDEP builds: a listener (locked, in LISTEN) owns
+    /// its port in bhash, or bind(0) could hand the port out while this
+    /// listener still answers on it
+    fn assert_owner(&self) {
+        if cfg!(any(debug_assertions, feature = "lockdep")) {
+            let port = self.inet.get().sport;
+            assert!(
+                self.sk.net.tcp.owns(port, &self.arc()),
+                "tcp: listener on port {port} is no bhash owner"
+            );
+        }
     }
 
     /// Create, hash and queue a SYN_RECEIVED child and send its SYN-ACK

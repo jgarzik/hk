@@ -147,6 +147,15 @@ impl TcpTables {
         }
     }
 
+    /// `s` is an owner of `port` in bhash
+    pub fn owns(&self, port: u16, s: &Arc<TcpSock>) -> bool {
+        let me = Ent::Sk(s.clone());
+        self.bhash
+            .read()
+            .get(&port)
+            .is_some_and(|v| v.iter().any(|o| o.ent.is(&me)))
+    }
+
     /// `s` releases `port`
     pub fn unbind(&self, s: &Arc<TcpSock>, port: u16) {
         self.unbind_ent(&Ent::Sk(s.clone()), port);
