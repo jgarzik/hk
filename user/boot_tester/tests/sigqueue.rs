@@ -26,6 +26,8 @@
 //!   si_overrun (= timer_getoverrun); settime and delete drop a queued
 //!   one; SIGEV_THREAD_ID signals that thread; ITIMER_REAL's SIGALRM is
 //!   SI_KERNEL and the interval rearms when it is taken
+//! - arm64: a handler set without SA_RESTORER returns through the
+//!   kernel's trampoline (Linux: the vDSO sigtramp)
 
 use super::helpers::{host_mode, print, print_num, println, read_file, skip};
 use hk_syscall::{
@@ -66,6 +68,8 @@ pub fn run_tests() {
     test_timer_overrun();
     test_timer_drop();
     test_itimer_real();
+    #[cfg(target_arch = "aarch64")]
+    test_no_restorer();
 }
 
 fn bit(sig: u32) -> u64 {
@@ -835,6 +839,40 @@ fn test_itimer_real() {
         print_num(rb);
         print(b" code=");
         print_num(a.si_code as i64);
+        println(b"");
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+static NR_HIT: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
+
+#[cfg(target_arch = "aarch64")]
+extern "C" fn nr_handler(_: i32) {
+    use core::sync::atomic::Ordering;
+    // load+store: RMW atomics on aarch64 need libc's getauxval
+    NR_HIT.store(NR_HIT.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
+}
+
+/// In a child: SIGUSR1 with a handler set without SA_RESTORER runs it
+/// and returns to the code it interrupted
+#[cfg(target_arch = "aarch64")]
+fn test_no_restorer() {
+    use core::sync::atomic::Ordering;
+    let c = sys_fork();
+    if c == 0 {
+        let act: [u64; 4] = [nr_handler as *const () as u64, 0, 0, 0];
+        sys_rt_sigaction(SIGUSR1, act.as_ptr() as u64, 0, 8);
+        sys_kill(sys_getpid(), SIGUSR1);
+        sys_kill(sys_getpid(), SIGUSR1);
+        sys_exit(if NR_HIT.load(Ordering::Relaxed) == 2 { 0 } else { 1 });
+    }
+    let mut st = 0i32;
+    sys_wait4(c, &mut st, 0, 0);
+    if st == 0 {
+        println(b"SIGQUEUE_NO_RESTORER:OK");
+    } else {
+        print(b"SIGQUEUE_NO_RESTORER:FAIL status=");
+        print_num(st as i64);
         println(b"");
     }
 }

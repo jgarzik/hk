@@ -224,6 +224,10 @@ const USER_ADDR_LIMIT: u64 = 0x0000_8000_0000_0000;
 // Signal Frame Setup
 // =============================================================================
 
+/// No exec-time signal return page: x86-64 handlers need SA_RESTORER
+/// (Linux x86-64 too; glibc always sets it)
+pub const SIGPAGE: Option<(u64, [u32; 2])> = None;
+
 /// Calculate signal frame size
 pub const fn signal_frame_size() -> usize {
     core::mem::size_of::<RtSigFrame>()

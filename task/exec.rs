@@ -294,6 +294,38 @@ fn setup_user_stack<FA: FrameAlloc<PhysAddr = u64>>(
     Ok((area, STACK_TOP - (stack_pages as u64 * PAGE_SIZE)))
 }
 
+/// The arch's signal return page, if it has one (arm64: Linux's vDSO
+/// sigtramp), mapped read+exec in the new image; its VMA
+fn map_sigpage<FA: FrameAlloc<PhysAddr = u64>>(
+    page_table: &mut ArchPageTable,
+    frame_alloc: &mut FA,
+) -> Result<Option<crate::mm::Vma>, i32> {
+    use crate::mm::{PROT_EXEC, PROT_READ};
+    let Some((va, code)) = crate::arch::signal::SIGPAGE else {
+        return Ok(None);
+    };
+    let frame = user_frame()?;
+    let page = crate::arch::phys_to_virt(frame);
+    // SAFETY: a fresh frame of PAGE_SIZE bytes, ours alone, through the
+    // linear map
+    unsafe {
+        ::core::ptr::write_bytes(page, 0, PAGE_SIZE as usize);
+        for (i, w) in code.iter().enumerate() {
+            ::core::ptr::write_unaligned(page.add(i * 4).cast::<u32>(), w.to_le());
+        }
+    }
+    crate::arch::paging::sync_page(frame, true);
+    let flags = PageFlags::READ | PageFlags::EXECUTE | PageFlags::USER;
+    if page_table
+        .map_with_alloc(va, frame, flags, frame_alloc)
+        .is_err()
+    {
+        crate::FRAME_ALLOCATOR.free(frame);
+        return Err(ENOMEM);
+    }
+    Ok(Some(anon_vma(va, va + PAGE_SIZE, PROT_READ | PROT_EXEC)))
+}
+
 /// Every PT_LOAD segment and the entry point must land in mappable
 /// user space: past TASK_SIZE (or overflowing) is EINVAL (Linux
 /// BAD_ADDR), below mmap_min_addr EPERM (security_mmap_addr)
@@ -998,6 +1030,10 @@ where
             Ok(r) => r,
             Err(e) => return -e,
         };
+    let sigpage = match map_sigpage(&mut new_page_table, frame_alloc) {
+        Ok(v) => v,
+        Err(e) => return -e,
+    };
     let user_sp = args.start_stack;
 
     let ident = exec_identity(pathname, &file);
@@ -1066,6 +1102,9 @@ where
             for vma in segment_vmas(ie, interp_base, interp_map) {
                 m.insert_vma(vma);
             }
+        }
+        if let Some(vma) = sigpage {
+            m.insert_vma(vma);
         }
     }
 
