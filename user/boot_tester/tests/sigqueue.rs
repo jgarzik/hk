@@ -60,8 +60,8 @@ use hk_syscall::{
 use hk_syscall::{
     RLIMIT_SIGPENDING, RLimit, SA_RESTORER, SA_SIGINFO, SFD_NONBLOCK, SIG_DFL, SigInfo, sys_close,
     sys_exit, sys_fork, sys_getpid, sys_getrlimit, sys_kill, sys_read, sys_rt_sigaction,
-    sys_rt_sigpending, sys_rt_sigprocmask, sys_rt_sigqueueinfo, sys_rt_sigtimedwait, sys_setrlimit, sys_signalfd4,
-    sys_wait4,
+    sys_rt_sigpending, sys_rt_sigprocmask, sys_rt_sigqueueinfo, sys_rt_sigtimedwait, sys_setrlimit,
+    sys_signalfd4, sys_wait4,
 };
 
 const SIG_BLOCK: i32 = 0;
@@ -206,8 +206,7 @@ fn test_sigq_limit() {
     };
     let rc = sys_getrlimit(RLIMIT_SIGPENDING, &mut r);
     let (q, lim) = sigq();
-    if rc == 0 && r.rlim_cur > 0 && r.rlim_cur == r.rlim_max && lim == r.rlim_cur as i64 && q >= 0
-    {
+    if rc == 0 && r.rlim_cur > 0 && r.rlim_cur == r.rlim_max && lim == r.rlim_cur as i64 && q >= 0 {
         println(b"SIGQUEUE_LIMIT:OK");
     } else {
         print(b"SIGQUEUE_LIMIT:FAIL rlim=");
@@ -238,7 +237,11 @@ fn test_eagain() {
         rlim_max: lim.rlim_max,
     };
     let set = sys_setrlimit(RLIMIT_SIGPENDING, &low);
-    let r = [queue_self(SIGRT, 1), queue_self(SIGRT, 2), queue_self(SIGRT, 3)];
+    let r = [
+        queue_self(SIGRT, 1),
+        queue_self(SIGRT, 2),
+        queue_self(SIGRT, 3),
+    ];
     let rk = sys_kill(sys_getpid(), SIGRT);
     let ru = queue_self(SIGUSR1, 4);
     let (q, _) = sigq();
@@ -669,7 +672,10 @@ struct GroupStack([u8; 16384]);
 static mut GROUP_STACK: GroupStack = GroupStack([0; 16384]);
 
 extern "C" fn group_handler(_: i32) {
-    GROUP_GOT.store(hk_syscall::sys_gettid(), core::sync::atomic::Ordering::Release);
+    GROUP_GOT.store(
+        hk_syscall::sys_gettid(),
+        core::sync::atomic::Ordering::Release,
+    );
 }
 
 /// The second thread: SIGUSR1 unblocked, it waits for a signal until
@@ -716,7 +722,8 @@ fn test_group_thread() {
             }
             hk_syscall::sys_sched_yield();
         }
-        let ok = GROUP_GOT.load(Ordering::Acquire) == tid && super::fork_mm::join(&raw mut GROUP_CTID);
+        let ok =
+            GROUP_GOT.load(Ordering::Acquire) == tid && super::fork_mm::join(&raw mut GROUP_CTID);
         hk_syscall::sys_exit_group(if ok { 0 } else { 1 });
     }
     let mut st = 0i32;
@@ -850,7 +857,10 @@ fn test_timer_overrun() {
 /// (Linux 6.13 on: it_signal_seq; before, it was still delivered)
 fn test_timer_drop() {
     if !super::helpers::linux_at_least(6, 13) {
-        skip(b"SIGQUEUE_TIMER_DROP", b"host Linux before 6.13 delivers it");
+        skip(
+            b"SIGQUEUE_TIMER_DROP",
+            b"host Linux before 6.13 delivers it",
+        );
         return;
     }
     let old = block(bit(SIGRT));
@@ -1168,7 +1178,11 @@ fn test_exit_signal_exec() {
             core::ptr::null(),
         ];
         let envp: [*const u8; 1] = [core::ptr::null()];
-        hk_syscall::sys_execve(b"/bin/boot_tester2\0".as_ptr(), argv.as_ptr(), envp.as_ptr());
+        hk_syscall::sys_execve(
+            b"/bin/boot_tester2\0".as_ptr(),
+            argv.as_ptr(),
+            envp.as_ptr(),
+        );
         sys_exit(99);
     }
     let mut st = 0i32;
@@ -1260,18 +1274,30 @@ fn test_ptrace_siginfo() {
         queue_self(SIGRT, 1);
         queue_self(SIGRT, 2);
         queue_self(SIGUSR1, 55);
-        sys_exit(if PT_SEEN.load(Ordering::Relaxed) == 99 { 0 } else { 1 });
+        sys_exit(if PT_SEEN.load(Ordering::Relaxed) == 99 {
+            0
+        } else {
+            1
+        });
     }
     let mut st = 0i32;
     sys_wait4(c, &mut st, 0, 0);
     let stopped = st & 0xff == 0x7f && (st >> 8) & 0xff == SIGUSR1 as i32;
     let mut info = zeroed();
     let g = sys_ptrace(PTRACE_GETSIGINFO, c, 0, &mut info as *mut SigInfo as u64);
-    let got = g == 0 && info.si_signo == SIGUSR1 as i32 && info.si_code == SI_QUEUE && info.si_status == 55;
+    let got = g == 0
+        && info.si_signo == SIGUSR1 as i32
+        && info.si_code == SI_QUEUE
+        && info.si_status == 55;
     // struct ptrace_peeksiginfo_args: off 0, flags SHARED, nr 4
     let args: [u32; 4] = [0, 0, 1, 4];
     let mut peek = [zeroed(), zeroed(), zeroed(), zeroed()];
-    let n = sys_ptrace(PTRACE_PEEKSIGINFO, c, args.as_ptr() as u64, peek.as_mut_ptr() as u64);
+    let n = sys_ptrace(
+        PTRACE_PEEKSIGINFO,
+        c,
+        args.as_ptr() as u64,
+        peek.as_mut_ptr() as u64,
+    );
     let peeked = n == 2 && peek[0].si_status == 1 && peek[1].si_status == 2;
     info.si_status = 99;
     let s = sys_ptrace(PTRACE_SETSIGINFO, c, 0, &info as *const SigInfo as u64);
@@ -1340,7 +1366,11 @@ fn test_exec_signals() {
             core::ptr::null(),
         ];
         let envp: [*const u8; 1] = [core::ptr::null()];
-        hk_syscall::sys_execve(b"/bin/boot_tester2\0".as_ptr(), argv.as_ptr(), envp.as_ptr());
+        hk_syscall::sys_execve(
+            b"/bin/boot_tester2\0".as_ptr(),
+            argv.as_ptr(),
+            envp.as_ptr(),
+        );
         sys_exit(99);
     }
     let mut st = 0i32;
@@ -1403,7 +1433,12 @@ fn test_exec_shared_sighand() {
         sys_exit(127);
     }
     let mut now = [0u64; 4];
-    sys_rt_sigaction(SIGUSR1, core::ptr::null::<u64>() as u64, now.as_mut_ptr() as u64, 8);
+    sys_rt_sigaction(
+        SIGUSR1,
+        core::ptr::null::<u64>() as u64,
+        now.as_mut_ptr() as u64,
+        8,
+    );
     let mut st = -1i32;
     if c > 0 {
         sys_wait4(c, &mut st, 0, 0);

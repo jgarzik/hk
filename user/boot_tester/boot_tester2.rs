@@ -328,12 +328,7 @@ fn sigexec() -> ! {
 fn chldsig() -> ! {
     let mask: u64 = (1 << (17 - 1)) | (1 << (10 - 1));
     let ts = [10i64, 0];
-    let r = hk_syscall::sys_rt_sigtimedwait(
-        &mask as *const u64 as u64,
-        0,
-        ts.as_ptr() as u64,
-        8,
-    );
+    let r = hk_syscall::sys_rt_sigtimedwait(&mask as *const u64 as u64, 0, ts.as_ptr() as u64, 8);
     let mut st = 0i32;
     // __WALL: a non-SIGCHLD child too
     hk_syscall::sys_wait4(-1, &mut st, 0x4000_0000, 0);

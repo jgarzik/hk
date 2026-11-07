@@ -252,8 +252,8 @@ make clippy         # Run clippy for x86-64
 make clippy-arm     # Run clippy for aarch64
 
 # Formatting
-make fmt            # Format code
-make fmt-check      # Check formatting without modifying
+make fmt            # Format code (kernel and user/)
+make fmt-check      # Check formatting (kernel and user/) without modifying
 ```
 
 **IMPORTANT**: Do NOT run bare `cargo clippy` - it will fail on this no_std kernel.

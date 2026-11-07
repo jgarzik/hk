@@ -399,7 +399,12 @@ fn test_notify_once() {
     const WALL: i32 = 0x4000_0000;
     let mask: u64 = 1 << (SIGRT - 1);
     let mut old = 0u64;
-    hk_syscall::sys_rt_sigprocmask(0, &mask as *const u64 as u64, &mut old as *mut u64 as u64, 8);
+    hk_syscall::sys_rt_sigprocmask(
+        0,
+        &mask as *const u64 as u64,
+        &mut old as *mut u64 as u64,
+        8,
+    );
     let mut bad = (0, 0i64);
     for i in 0..100 {
         let c = hk_syscall::sys_clone(SIGRT as u64, 0, 0, 0, 0);
@@ -413,12 +418,8 @@ fn test_notify_once() {
         sys_wait4(c, &mut st, WALL, 0);
         let mut n = 0;
         let ts = [0i64, 0];
-        while hk_syscall::sys_rt_sigtimedwait(
-            &mask as *const u64 as u64,
-            0,
-            ts.as_ptr() as u64,
-            8,
-        ) == SIGRT as i64
+        while hk_syscall::sys_rt_sigtimedwait(&mask as *const u64 as u64, 0, ts.as_ptr() as u64, 8)
+            == SIGRT as i64
         {
             n += 1;
         }

@@ -299,7 +299,13 @@ extern "C" fn on_sigsys_info(_: i32, info: *const u8, _: *const u8) {
     let b = unsafe { core::slice::from_raw_parts(info, 128) };
     let u = |at: usize| u32::from_ne_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]);
     // si_errno 4, si_code 8, si_call_addr 16, si_syscall 24, si_arch 28
-    let vals = [u(8), u(4), u(24), u(28), u32::from(u(16) != 0 || u(20) != 0)];
+    let vals = [
+        u(8),
+        u(4),
+        u(24),
+        u(28),
+        u32::from(u(16) != 0 || u(20) != 0),
+    ];
     for (s, v) in SEEN.iter().zip(vals) {
         s.store(v, Ordering::Release);
     }
