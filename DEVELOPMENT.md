@@ -158,6 +158,13 @@ a log: `serial.log` (x86-64), `serial_arm.log` (aarch64),
 (`check-linux*`). `NO_KVM=1` (e.g. `NO_KVM=1 make check`) runs x86
 under TCG, as CI does.
 
+`tools/bt-names.sh LOG` prints a serial log's verdict names
+(`NAME:OK|SKIP|FAIL`) in order; `tools/bt-names.sh OLD NEW` diffs two
+logs' sequences. A change to the boot tests that should not change
+what runs (a move, a refactor) keeps the Linux logs'
+(`target/linux-test-<arch>/serial.clean`) sequence identical; hk logs
+can show a verdict torn by a concurrent writer.
+
 `check-linux*` results do not depend on the kernel sources, so a PASS is cached
 in `~/.cache/hk-linux-check/<arch>/<hash>` (`LINUX_CACHE_DIR`), shared by
 all worktrees; a rerun with the same hash prints `check-linux: cached
