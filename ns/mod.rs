@@ -83,11 +83,17 @@ pub const CLONE_NS_FLAGS: u64 = CLONE_NEWNS
 
 use crate::fs::mount::Mount;
 
+/// Next mount namespace id (Linux ns_common.ns_id): never reused, so
+/// a mount that outlived its namespace matches no other
+static NEXT_MNT_NS_ID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+
 /// Mount namespace - per-namespace mount tree
 ///
 /// Each mount namespace has its own view of the filesystem hierarchy.
 /// When CLONE_NEWNS is used, the entire mount tree is cloned.
 pub struct MntNamespace {
+    /// Never-reused id, what `Mount::mnt_ns` names (Linux mnt_ns)
+    pub id: u64,
     /// Root mount of this namespace
     pub root: RwLock<Option<Arc<Mount>>>,
 }
@@ -95,16 +101,12 @@ pub struct MntNamespace {
 impl MntNamespace {
     /// Create a new empty mount namespace, or ENOMEM
     pub fn new() -> Result<Arc<Self>, KernelError> {
-        try_arc(Self {
-            root: RwLock::new(None),
-        })
+        try_arc(Self::default())
     }
 
     /// Create initial mount namespace (boot: failure cannot be reported)
     fn new_init() -> Arc<Self> {
-        arc_nofail(Self {
-            root: RwLock::new(None),
-        })
+        arc_nofail(Self::default())
     }
 
     /// Clone this namespace (for CLONE_NEWNS)
@@ -117,7 +119,7 @@ impl MntNamespace {
         let new_ns = Self::new().map_err(|e| e.errno())?;
         let old_root = self.root.read().clone();
         if let Some(old_root) = old_root {
-            let (new_root, map) = Mount::clone_tree(&old_root)?;
+            let (new_root, map) = Mount::clone_tree(&old_root, new_ns.id)?;
             *new_ns.root.write() = Some(new_root);
             if let Some(fs) = fs {
                 fs.repoint(&map);
@@ -156,6 +158,7 @@ impl MntNamespace {
 impl Default for MntNamespace {
     fn default() -> Self {
         Self {
+            id: NEXT_MNT_NS_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed),
             root: RwLock::new(None),
         }
     }

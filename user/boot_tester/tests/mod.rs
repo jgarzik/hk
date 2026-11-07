@@ -82,6 +82,7 @@ pub mod mm_oom;
 pub mod mm_populate;
 pub mod mmap;
 pub mod mmlock;
+pub mod mntns_check;
 pub mod mount_race;
 pub mod mountflags;
 pub mod mountinfo;
@@ -200,6 +201,7 @@ pub fn run_all_tests() {
     mountflags::run_tests();
     fs_times::run_tests();
     mounts::run_tests();
+    mntns_check::run_tests();
     mountinfo::run_tests();
     sysfs::run_tests();
     pnode::run_tests();

@@ -195,6 +195,11 @@ fn change_type(m: &Arc<super::mount::Mount>, flags: u64) -> Result<(), KernelErr
         _ => return Err(KernelError::InvalidArgument),
     };
     let _ns = super::mount::NAMESPACE_SEM.write();
+    // Mounted in some namespace (Linux may_change_propagation: not
+    // necessarily the caller's)
+    if m.ns() == 0 {
+        return Err(KernelError::InvalidArgument);
+    }
     let targets = if flags & ms::REC != 0 {
         subtree(m)
     } else {
@@ -204,6 +209,15 @@ fn change_type(m: &Arc<super::mount::Mount>, flags: u64) -> Result<(), KernelErr
         change_propagation(&t, p);
     }
     Ok(())
+}
+
+/// The caller's mount (Linux check_mnt) whose root `target` is (Linux
+/// path_mounted), else EINVAL: what remount works on
+fn own_mount_at(target: &super::Path) -> Result<Arc<super::mount::Mount>, KernelError> {
+    if !super::mount::check_mnt(&target.mnt) {
+        return Err(KernelError::InvalidArgument);
+    }
+    mount_at(target)
 }
 
 /// Mount whose root `target` is (Linux path_mounted), else EINVAL
@@ -286,10 +300,10 @@ fn path_mount(
     }
     // Linux path_mount's order
     if flags & (ms::REMOUNT | ms::BIND) == ms::REMOUNT | ms::BIND {
-        return reconfigure_mnt(&mount_at(&mp)?, flags);
+        return reconfigure_mnt(&own_mount_at(&mp)?, flags);
     }
     if flags & ms::REMOUNT != 0 {
-        return remount(&mount_at(&mp)?, flags, &data);
+        return remount(&own_mount_at(&mp)?, flags, &data);
     }
     if flags & ms::BIND != 0 {
         let old = crate::fs::namei::path_lookupat(
