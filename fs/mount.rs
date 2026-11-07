@@ -839,8 +839,8 @@ fn lock_mountpoint(mp: &Path) -> Result<super::inode::InodeLockArc, KernelError>
     Ok(lock)
 }
 
-/// MS_MOVE (Linux do_move_mount): `old` must be the root of a mount
-/// (EINVAL), a directory goes only on a directory (ENOTDIR); then, in
+/// MS_MOVE (Linux do_move_mount): `old` must be the root of a mount,
+/// a directory goes only on a directory (EINVAL); then, in
 /// Linux's order, `old` in the caller's namespace, attached, unlocked,
 /// not under a shared mount, and the target in the namespace too
 /// (EINVAL), and not into its own subtree (ELOOP)
@@ -850,7 +850,7 @@ pub fn do_move(old: &Path, mp: &Path) -> Result<(), KernelError> {
     }
     let is_dir = |d: &Dentry| d.get_inode().is_some_and(|i| i.mode().is_dir());
     if is_dir(&mp.dentry) != is_dir(&old.dentry) {
-        return Err(KernelError::NotDirectory);
+        return Err(KernelError::InvalidArgument);
     }
     let _l = lock_mountpoint(mp)?;
     let _ns = NAMESPACE_SEM.write();

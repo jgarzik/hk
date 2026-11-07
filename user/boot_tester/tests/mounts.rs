@@ -584,11 +584,13 @@ fn mv(src: &[u8], dst: &[u8]) -> i64 {
 }
 
 /// MS_MOVE takes a mount (with what is in it) to a new place; not into
-/// its own subtree (ELOOP), and only a mount's root moves (EINVAL)
+/// its own subtree (ELOOP), only a mount's root moves, and a directory
+/// only onto a directory (EINVAL, Linux do_move_mount)
 fn move_mount() -> R {
     for p in [&b"/tmp/mv_a\0"[..], b"/tmp/mv_b\0"] {
         sys_mkdir(p.as_ptr(), 0o755);
     }
+    touch(b"/tmp/mv_file\0");
     let r = (|| {
         check(b"mount", ramfs(b"/tmp/mv_a\0") == 0, -1)?;
         check(b"touch", touch(b"/tmp/mv_a/f\0") >= 0, -1)?;
@@ -596,6 +598,8 @@ fn move_mount() -> R {
         check(b"move", r == 0, r)?;
         check(b"there", dev(b"/tmp/mv_b/f\0").is_ok(), -1)?;
         check(b"gone here", dev(b"/tmp/mv_a/f\0") == Err(ENOENT), -1)?;
+        let r = mv(b"/tmp/mv_b\0", b"/tmp/mv_file\0");
+        check(b"dir onto file", r == EINVAL, r)?;
         sys_mkdir(b"/tmp/mv_b/in\0".as_ptr(), 0o755);
         let r = mv(b"/tmp/mv_b\0", b"/tmp/mv_b/in\0");
         check(b"into itself", r == ELOOP, r)?;
@@ -603,6 +607,7 @@ fn move_mount() -> R {
         check(b"not a mount root", r == EINVAL, r)
     })();
     sys_unlink(b"/tmp/mv_b/f\0".as_ptr());
+    sys_unlink(b"/tmp/mv_file\0".as_ptr());
     sys_rmdir(b"/tmp/mv_b/in\0".as_ptr());
     sys_umount2(b"/tmp/mv_b\0".as_ptr(), 0);
     sys_umount2(b"/tmp/mv_a\0".as_ptr(), 0);
