@@ -26,6 +26,11 @@ use super::cb::before;
 pub const DUPTHRESH: u32 = 3;
 /// Largest name of an algorithm with its NUL (Linux TCP_CA_NAME_MAX)
 pub const NAME_MAX: usize = 16;
+/// Largest congestion window, in bytes (Linux snd_cwnd_clamp, which is
+/// in packets): the largest window a peer can advertise (65535 << 14,
+/// RFC 7323). More could never be sent, and the cap keeps cwnd + a few
+/// MSS far from u32 overflow however long recovery inflates it.
+pub const CWND_CLAMP: u32 = 0xffff << 14;
 
 /// What differs between congestion algorithms
 pub trait CongOps: Sync {
@@ -167,8 +172,8 @@ impl Cong {
     /// bytes left for congestion avoidance
     pub fn slow_start(&mut self, acked: u32) -> u32 {
         let cwnd = self.cwnd.saturating_add(acked).min(self.ssthresh);
-        let left = acked - (cwnd - self.cwnd);
-        self.cwnd = cwnd;
+        let left = acked.saturating_sub(cwnd.saturating_sub(self.cwnd));
+        self.set_cwnd(cwnd);
         left
     }
 
@@ -179,8 +184,14 @@ impl Cong {
         if self.cnt >= w {
             let steps = self.cnt / w;
             self.cnt -= steps * w;
-            self.cwnd = self.cwnd.saturating_add(steps.saturating_mul(self.mss));
+            self.set_cwnd(self.cwnd.saturating_add(steps.saturating_mul(self.mss)));
         }
+    }
+
+    /// Linux tcp_snd_cwnd_set with the snd_cwnd_clamp bound its callers
+    /// apply: cwnd never passes [`CWND_CLAMP`]
+    fn set_cwnd(&mut self, v: u32) {
+        self.cwnd = v.min(CWND_CLAMP);
     }
 
     /// Linux tcp_is_cwnd_limited
@@ -211,7 +222,8 @@ impl Cong {
         if let Some(r) = self.recover {
             if before(ack, r) {
                 // Partial ACK: deflate by what it covered, stay
-                self.cwnd = self.cwnd.saturating_sub(acked).max(self.mss) + self.mss;
+                let w = self.cwnd.saturating_sub(acked).max(self.mss);
+                self.set_cwnd(w.saturating_add(self.mss));
                 return true;
             }
             self.recover = None;
@@ -227,16 +239,21 @@ impl Cong {
     /// A duplicate ACK with `flight` bytes outstanding up to `snd_max`.
     /// Returns true when the segment at snd_una must be retransmitted.
     pub fn on_dupack(&mut self, flight: u32, snd_max: u32) -> bool {
-        self.dupacks += 1;
+        self.dupacks = self.dupacks.saturating_add(1);
         if self.recover.is_some() {
-            self.cwnd = self.cwnd.saturating_add(self.mss);
+            // One MSS per dupack (RFC 6582 inflation): a peer can send
+            // any number, so the window stops at the clamp
+            self.set_cwnd(self.cwnd.saturating_add(self.mss));
             return false;
         }
         if self.dupacks != DUPTHRESH {
             return false;
         }
         self.ssthresh = self.ops().ssthresh(self, flight);
-        self.cwnd = self.ssthresh + DUPTHRESH * self.mss;
+        self.set_cwnd(
+            self.ssthresh
+                .saturating_add(DUPTHRESH.saturating_mul(self.mss)),
+        );
         self.cnt = 0;
         self.recover = Some(snd_max);
         true
@@ -350,6 +367,32 @@ mod tests {
         assert_eq!(c.cwnd, 5000);
         c.on_rto(4000);
         assert_eq!((c.cwnd, c.ssthresh), (1000, 2000));
+    }
+
+    #[test]
+    fn dupack_flood_stays_clamped() {
+        let mut c = Cong::default();
+        c.set_mss(1000);
+        for _ in 0..3 {
+            c.on_dupack(10_000, 500);
+        }
+        assert!(c.in_recovery());
+        // A peer repeating one ACK forever: cwnd stops at the clamp
+        c.cwnd = CWND_CLAMP - 500;
+        for _ in 0..4 {
+            assert!(!c.on_dupack(10_000, 500));
+        }
+        assert_eq!(c.cwnd, CWND_CLAMP);
+        // ...and a partial ACK on top of it neither overflows nor passes it
+        assert!(c.on_ack(0, 100));
+        assert_eq!(c.cwnd, CWND_CLAMP);
+        c.cwnd = u32::MAX;
+        assert!(c.on_ack(0, 100));
+        assert_eq!(c.cwnd, CWND_CLAMP);
+        // the dupack count saturates rather than wrapping back to DUPTHRESH
+        c.dupacks = u32::MAX;
+        assert!(!c.on_dupack(10_000, 500));
+        assert_eq!(c.dupacks, u32::MAX);
     }
 
     #[test]
