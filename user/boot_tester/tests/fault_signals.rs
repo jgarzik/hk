@@ -21,6 +21,10 @@
 //! - FAULT_LAST_TRAP: a later SIGUSR1's sigcontext still shows the last
 //!   fault (Linux thread.trap_nr/error_code/cr2; arm64 fault_address
 //!   and an esr_context record)
+//! - FAULT_KERNEL_ADDR: a load from a kernel address reports no kernel
+//!   page-table detail: x86 err has PROT (and USER) set, arm64's ESR is
+//!   a level 0 translation fault (Linux sanitize_error_code,
+//!   set_thread_esr)
 //! - BAD_IRET (x86): rt_sigreturn to a non-canonical RIP (Linux takes
 //!   it; the return's IRET faults in kernel mode with the user GS base
 //!   live) kills the task with SIGSEGV, the kernel survives
@@ -544,6 +548,7 @@ pub fn run_tests() {
     in_child(b"FAULT_SIGFPE", sigfpe);
     in_child(b"FAULT_SIGTRAP", sigtrap);
     in_child(b"FAULT_LAST_TRAP", last_trap);
+    in_child(b"FAULT_KERNEL_ADDR", kernel_addr);
     expect_killed(b"FAULT_BLOCKED_KILL", prep_blocked);
     expect_killed(b"FAULT_IGNORED_KILL", prep_ignored);
     #[cfg(target_arch = "x86_64")]
@@ -675,11 +680,9 @@ extern "C" fn last_handler(_sig: i32, _info: *const u8, uc: *mut u8) {
     }
 }
 
-fn last_trap() -> u64 {
-    if !install(SIGSEGV) {
-        return 9;
-    }
-    let addr = unmapped_page() + 0x18;
+/// Fault on a load from `addr`, then read the last-fault details a
+/// SIGUSR1 frame reports: (trapno, err / ESR, cr2 / fault_address)
+fn fault_details(addr: u64) -> [u64; 3] {
     #[cfg(target_arch = "x86_64")]
     let _ = run_fault!("mov rax, [rdi]", addr);
     #[cfg(target_arch = "aarch64")]
@@ -693,7 +696,44 @@ fn last_trap() -> u64 {
     sys_rt_sigaction(10, act.as_ptr() as u64, 0, 8);
     hk_syscall::sys_kill(hk_syscall::sys_getpid(), 10);
     // SAFETY: written by the handler, which has run
-    let [trapno, err, fault] = unsafe { core::ptr::read_volatile(&raw const LAST) };
+    unsafe { core::ptr::read_volatile(&raw const LAST) }
+}
+
+fn kernel_addr() -> u64 {
+    if !install(SIGSEGV) {
+        return 9;
+    }
+    #[cfg(target_arch = "x86_64")]
+    let addr = 0xffff_c900_dead_0000u64;
+    #[cfg(target_arch = "aarch64")]
+    let addr = 0xffff_0000_dead_0000u64;
+    let [trapno, err, fault] = fault_details(addr);
+    // x86: PROT | USER, page fault; arm64: data abort, FSC 0x04
+    #[cfg(target_arch = "x86_64")]
+    let ok = trapno == 14 && err & 5 == 5 && fault == addr;
+    #[cfg(target_arch = "aarch64")]
+    let ok = trapno == 0 && err >> 26 == 0x24 && err & 0x3f == 4 && fault == addr;
+    if ok {
+        println(b"FAULT_KERNEL_ADDR:OK");
+        0
+    } else {
+        print(b"FAULT_KERNEL_ADDR:FAIL trapno=");
+        print_num(trapno as i64);
+        print(b" err=");
+        print_num(err as i64);
+        print(b" fault=");
+        print_num(fault as i64);
+        println(b"");
+        1
+    }
+}
+
+fn last_trap() -> u64 {
+    if !install(SIGSEGV) {
+        return 9;
+    }
+    let addr = unmapped_page() + 0x18;
+    let [trapno, err, fault] = fault_details(addr);
     #[cfg(target_arch = "x86_64")]
     let ok = trapno == 14 && err & 4 != 0 && fault == addr;
     #[cfg(target_arch = "aarch64")]

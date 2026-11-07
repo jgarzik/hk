@@ -360,6 +360,22 @@ fn math_error_code(vector: u64) -> i32 {
     }
 }
 
+/// Page-fault error code bits (Linux X86_PF_PROT, X86_PF_USER)
+const PF_PROT: u64 = 1;
+const PF_USER: u64 = 4;
+
+/// The error code a user page fault at `addr` reports in sigcontext
+/// (Linux sanitize_error_code, set_signal_archinfo): a kernel address is
+/// always a protection fault, so the kernel's page tables do not show
+fn pf_signal_error(addr: u64, error: u64) -> u64 {
+    let prot = if addr >= super::paging::TASK_SIZE {
+        PF_PROT
+    } else {
+        0
+    };
+    error | prot | PF_USER
+}
+
 /// Deliver a synchronous fault signal (force_sig_fault) for the user
 /// context in `frame`: the task's pt_regs (an entry from user mode), so
 /// a handler's frame is set up there and IRETQ enters it
@@ -410,10 +426,9 @@ fn handle_exception(uframe: &UserFrame, vector: u64) {
             } else {
                 (crate::signal::SIGSEGV, crate::signal::segv_code(cr2))
             };
-            // Linux set_signal_archinfo
             let trap = TrapSet::All(Trap {
                 trapno: 14,
-                error: error_code,
+                error: pf_signal_error(cr2, error_code),
                 addr: cr2,
             });
             user_fault(uframe, SigInfo::fault(sig, code, cr2), trap);
