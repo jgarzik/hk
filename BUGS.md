@@ -204,7 +204,10 @@ getcpu reports it; nothing else uses it. Missing (Linux
   node-aware allocation, so no policy (BIND, PREFERRED, INTERLEAVE,
   local) affects where pages come from.
 - No page migration: migrate_pages and move_pages validate and move
-  nothing; move_pages query mode reports node 0 for every page.
+  nothing; move_pages query mode reports node 0 for every page. For
+  another process they take CAP_SYS_NICE instead of Linux's
+  ptrace_may_access(PTRACE_MODE_READ_REALCREDS) (move_pages: under its
+  exec_update_lock), which they need once pages move.
 - Nodemasks are one `u64` (64 nodes); the gate has no multi-node QEMU
   run (by hand: `QEMU_EXTRA="-object memory-backend-ram,id=m0,size=256M
   -object memory-backend-ram,id=m1,size=256M -numa
@@ -322,6 +325,22 @@ SIOCUNIXFILE, SO_PEERSEC (ENOPROTOOPT, as on Linux without an LSM).
 
 Missing: immutable/append-only inodes (no IS_APPEND/IS_IMMUTABLE
 EPERM).
+
+## Before user namespaces grant capabilities
+
+**Location**: `task/mod.rs` (`capable`), `fs/dac.rs`, `ns/mod.rs`,
+`fs/mount.rs`, `net/netlink/rtnetlink.rs`
+
+Safe today only because a user namespace grants no capabilities. First:
+- each `capable()` becomes Linux's `ns_capable(<owner>->user_ns)` (or
+  `capable`, where Linux keeps it); sockopt_ns_capable sites take the
+  socket netns's user_ns, but SO_DEBUG and SO_SNDBUFFORCE/RCVBUFFORCE
+  stay init-namespace (Linux sockopt_capable).
+- an unprivileged CLONE_NEWNS (new user_ns) locks the copied tree
+  (lock_mnt_tree: MNT_LOCKED plus MNT_LOCK_* flags) and turns shared
+  mounts into slaves (CL_SHARED_TO_SLAVE).
+- netlink newlink/setlink check CAP_NET_ADMIN in the target netns too
+  once IFLA_NET_NS_PID/FD are implemented (`7b735ef81286`).
 
 ## Credentials have no identity
 
@@ -518,6 +537,8 @@ NLM_F_ECHO (not echoed), extended-ACK message/offset TLVs (plain errors),
 RTM_GETRULE dumps nothing (Linux lists its three default IPv4 rules; there
 is no rule engine: lookups are local then main), address lifetimes are
 always infinite, promote_secondaries is off.
+RTM_NEWLINK/RTM_SETLINK ignore IFLA_NET_NS_PID/IFLA_NET_NS_FD: they
+return 0 without moving the device (Linux: moved, or an error).
 
 ## io_uring has no shared rings
 
