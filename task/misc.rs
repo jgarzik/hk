@@ -1215,35 +1215,19 @@ pub fn sys_capset<A: crate::uaccess::UaccessArch>(header_addr: u64, data_addr: u
 /// * `flags` - Flags (PIDFD_NONBLOCK only)
 ///
 /// # Returns
-/// * >= 0: File descriptor on success
+/// * A file descriptor on success, always close-on-exec (Linux
+///   pidfd_prepare's get_unused_fd_flags(O_CLOEXEC))
 /// * -EINVAL: Invalid flags or pid
 /// * -ESRCH: No such process
+/// * -ENOENT: `pid` is a thread that does not lead its process
 pub fn sys_pidfd_open(pid: i64, flags: u32) -> i64 {
-    // Validate flags - only O_NONBLOCK (0o4000) is allowed
-    const PIDFD_NONBLOCK: u32 = 0o4000;
-    if flags & !PIDFD_NONBLOCK != 0 {
+    use crate::task::pidfd::pidfd_flags::PIDFD_NONBLOCK;
+    if flags & !PIDFD_NONBLOCK != 0 || pid <= 0 {
         return KernelError::InvalidArgument.sysret();
     }
-
-    // Validate pid
-    if pid <= 0 {
-        return KernelError::InvalidArgument.sysret();
-    }
-
-    let target_pid = pid as Pid;
-
-    // Check if process exists
-    {
-        let table = super::percpu::TASKLIST.read();
-        if !table.get(target_pid).is_some() {
-            return KernelError::NoProcess.sysret();
-        }
-    }
-
-    // Create pidfd
-    let pidfd_file = match crate::task::pidfd::create_pidfd(target_pid, flags) {
+    let pidfd_file = match crate::task::pidfd::open_pidfd(pid as Pid, flags) {
         Ok(file) => file,
-        Err(_) => return KernelError::OutOfMemory.sysret(),
+        Err(e) => return e.sysret(),
     };
 
     // Allocate FD in current task's FD table
@@ -1265,14 +1249,7 @@ pub fn sys_pidfd_open(pid: i64, flags: u32) -> i64 {
         }
     };
 
-    // Check if we need FD_CLOEXEC (O_CLOEXEC is 0o2000000)
-    let fd_flags = if flags & 0o2000000 != 0 {
-        super::FD_CLOEXEC
-    } else {
-        0
-    };
-
-    match table.alloc_with_flags(pidfd_file, fd_flags, nofile) {
+    match table.alloc_with_flags(pidfd_file, super::FD_CLOEXEC, nofile) {
         Ok(fd) => i64::from(fd),
         Err(e) => i64::from(e),
     }

@@ -16,14 +16,18 @@
 //!   readable while another thread (here a traced zombie) is listed;
 //!   readable once that one is reaped, POLLHUP once the process is
 //!   (Linux pidfd_poll: delay_group_leader, no task)
+//! - PIDFD_OPEN_THREAD: pidfd_open of a non-leader thread without
+//!   PIDFD_THREAD fails (ENOENT since 6.16, EINVAL before)
+//! - PIDFD_OPEN_CLOEXEC: the new descriptor is close-on-exec
 
 use crate::harness::{fail_num, pass, verdict};
 use crate::helpers::{linux_at_least, print, print_num, println};
-use crate::mm::fork_mm::spawn_thread;
+use crate::mm::fork_mm::{join, spawn_thread};
 use hk_syscall::{
     P_PIDFD, POLLHUP, POLLIN, PollFd, SigInfo, WEXITED, sys_close, sys_exit, sys_exit_group,
-    sys_fork, sys_getpid, sys_open, sys_pidfd_getfd, sys_pidfd_open, sys_pidfd_send_signal,
-    sys_pipe2, sys_poll, sys_ptrace, sys_read, sys_rt_sigaction, sys_wait4, sys_waitid, sys_write,
+    sys_fcntl, sys_fork, sys_getpid, sys_open, sys_pidfd_getfd, sys_pidfd_open,
+    sys_pidfd_send_signal, sys_pipe2, sys_poll, sys_ptrace, sys_read, sys_rt_sigaction, sys_wait4,
+    sys_waitid, sys_write,
 };
 
 /// Run all pidfd tests
@@ -39,6 +43,8 @@ pub fn run_tests() {
     test_pidfd_getfd_self();
     test_pidfd_getfd_invalid_flags();
     test_pidfd_poll_group();
+    test_pidfd_open_thread();
+    test_pidfd_open_cloexec();
 }
 
 #[repr(C, align(16))]
@@ -142,6 +148,49 @@ fn poll_group() -> i32 {
         sys_wait4(c, core::ptr::null_mut(), 0, 0);
     }
     r
+}
+
+/// Read a byte from `fd`, then exit the thread
+extern "C" fn exit_after(fd: u64) -> ! {
+    let mut c = [0u8; 1];
+    sys_read(fd, c.as_mut_ptr(), 1);
+    sys_exit(0)
+}
+
+/// PIDFD_OPEN_THREAD: in a helper process, pidfd_open of its second
+/// thread without PIDFD_THREAD (Linux pidfd_prepare: not a thread-group
+/// leader's pid; ENOENT since 6.16, EINVAL before)
+fn test_pidfd_open_thread() {
+    let h = sys_fork();
+    if h == 0 {
+        let mut go = [0i32; 2];
+        sys_pipe2(go.as_mut_ptr(), 0);
+        let t = start(exit_after, go[0] as u64);
+        let r = sys_pidfd_open(t as i32, 0);
+        sys_write(go[1] as u64, b"x".as_ptr(), 1);
+        join(&raw mut CTID);
+        let want = if linux_at_least(6, 16) { -2 } else { -22 };
+        sys_exit_group(if t > 0 && r == want { 0 } else { 1 });
+    }
+    let mut st = 0i32;
+    sys_wait4(h, &mut st, 0, 0);
+    verdict(b"PIDFD_OPEN_THREAD", st == 0, i64::from(st));
+}
+
+/// PIDFD_OPEN_CLOEXEC: pidfd_open's descriptor is close-on-exec
+/// (Linux pidfd_prepare: get_unused_fd_flags(O_CLOEXEC))
+fn test_pidfd_open_cloexec() {
+    const F_GETFD: i32 = 1;
+    let fd = sys_pidfd_open(sys_getpid() as i32, 0);
+    let fl = if fd >= 0 {
+        sys_fcntl(fd as i32, F_GETFD, 0)
+    } else {
+        fd
+    };
+    if fd >= 0 {
+        sys_close(fd as u64);
+    }
+    verdict(b"PIDFD_OPEN_CLOEXEC", fl == 1, fl);
 }
 
 /// Test pidfd_open for current process

@@ -101,14 +101,33 @@ impl FileOps for PidfdFileOps {
 /// # Returns
 /// Arc<File> for the new pidfd
 pub fn create_pidfd(pid: Pid, file_flags: u32) -> Result<Arc<File>, KernelError> {
+    pidfd_file(find(pid)?, file_flags)
+}
+
+/// The `Pid` numbered `pid` (root namespace); ESRCH
+fn find(pid: Pid) -> Result<Arc<crate::task::pid::Pid>, KernelError> {
     let nr = u32::try_from(pid).map_err(|_| KernelError::NoProcess)?;
-    let pid =
-        crate::task::pid::find_pid(&crate::ns::INIT_PID_NS, nr).ok_or(KernelError::NoProcess)?;
+    crate::task::pid::find_pid(&crate::ns::INIT_PID_NS, nr).ok_or(KernelError::NoProcess)
+}
+
+/// pidfd_open's pidfd for process `pid` (Linux pidfd_prepare): ESRCH
+/// once its task is released, ENOENT for a thread that does not lead
+/// its group
+pub fn open_pidfd(pid: Pid, file_flags: u32) -> Result<Arc<File>, KernelError> {
+    let p = find(pid)?;
+    {
+        let table = crate::task::percpu::TASKLIST.read();
+        let tid = table.pid_tid(&p).ok_or(KernelError::NoProcess)?;
+        if !table.get(tid).is_some_and(|t| t.leader) {
+            return Err(KernelError::NotFound);
+        }
+    }
+    pidfd_file(p, file_flags)
+}
+
+/// A pidfd file for `pid`
+fn pidfd_file(pid: Arc<crate::task::pid::Pid>, file_flags: u32) -> Result<Arc<File>, KernelError> {
     let pidfd = try_arc(Pidfd { pid })?;
-
-    // Create dummy dentry for pidfd
-
-    // Determine file flags
     let mut f_flags = flags::O_RDONLY;
     if file_flags & pidfd_flags::PIDFD_NONBLOCK != 0 {
         f_flags |= flags::O_NONBLOCK;
