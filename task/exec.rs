@@ -1138,6 +1138,9 @@ where
             ..args
         });
         for vma in vmas {
+            if vma.flags & crate::mm::VM_SIGPAGE != 0 {
+                mm.set_sigpage(vma.start);
+            }
             m.insert_vma(vma);
         }
     }

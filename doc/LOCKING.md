@@ -1212,6 +1212,11 @@ pub struct Zone {
   CLEARTID writes that still need the mappings, Linux mm_release before
   exit_mm). A task becomes a zombie only after that, so a reaping parent
   never drops a task that still uses its mm.
+- `Mm.sigpage` (`AtomicU64`, Linux mm->context.vdso, arm64's signal
+  return page): stored by exec before the address space is used, by
+  `dup_mm` for the child, and by mremap of the page under the mmap_lock
+  for writing; loaded with no lock by signal delivery (a word, as Linux
+  reads its pointer).
 - The mmap_lock (`Mm.map`, a sleeping `RwSem<MmStruct>`, Linux
   mm->mmap_lock; "the mm lock" below) guards the VMA tree and VM
   counters. Taken through `Mm::mmap_read` / `mmap_write` and their
