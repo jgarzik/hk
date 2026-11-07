@@ -115,7 +115,7 @@ impl TcpCb {
         self.rcv_tstamp = now;
         self.arm_keepalive(now);
         out.established = true;
-        out.wake |= wake::STATE;
+        out.wake |= wake::STATE | wake::EST;
     }
 
     /// Linux tcp_sequence: the segment overlaps [RCV.NXT, RCV.NXT+WND]
@@ -578,7 +578,7 @@ impl TcpCb {
         self.rcv_nxt = self.rcv_nxt.wrapping_add(1);
         self.ack_now = true;
         out.shut |= RCV_SHUTDOWN;
-        out.wake |= wake::STATE;
+        out.wake |= wake::STATE | wake::FIN;
         match self.state {
             TcpState::Established => self.state = TcpState::CloseWait,
             TcpState::FinWait1 if self.fin_acked() => self.time_wait(now, out),

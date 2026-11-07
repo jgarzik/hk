@@ -450,13 +450,12 @@ unreachable today.
   cache (not yet COW'd) by inode and offset, so a MAP_SHARED mapping
   of the same file wakes it.
 
-## O_ASYNC: no SIGIO from sockets, ttys, inotify, fanotify
+## O_ASYNC: no SIGIO from ttys, inotify, fanotify
 
-**Location:** `net/`, `tty/`, `io/inotify.rs`, `io/fanotify.rs`
+**Location:** `tty/`, `io/inotify.rs`, `io/fanotify.rs`
 
-Only pipes and FIFOs have `->fasync` (`io/fasync.rs`): sockets
-(Linux sock_fasync, sock_wake_async), ttys (tty_fasync) and
-inotify/fanotify (fsnotify_fasync) keep O_ASYNC clear and raise no
+Ttys (Linux tty_fasync) and inotify/fanotify (fsnotify_fasync) have
+no `->fasync` (`io/fasync.rs`): they keep O_ASYNC clear and raise no
 SIGIO.
 
 ## Mount flag gaps

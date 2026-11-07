@@ -12,16 +12,22 @@
 //! - SIGIO_PGRP: F_SETOWN -pgrp signals every process of the group
 //! - SIGIO_PERM: an unprivileged owner setter cannot signal a root
 //!   process (sigio_perm), but can signal itself
+//! - SIGIO_SOCKET: a socketpair end raises SIGIO on input
+//! - SIGIO_SOCK_OUT: room in the send buffer signals POLL_OUT only after
+//!   a send found none (SOCKWQ_ASYNC_NOSPACE)
+//! - SIGIO_TCP: a listener gets POLL_IN for a connection, a nonblocking
+//!   connect POLL_OUT once established, the accepted socket POLL_IN
 //! - SIGIO_NO_FASYNC: a file without fasync: FIOASYNC is ENOTTY, F_SETFL
 //!   keeps no O_ASYNC
 //! - SIGIO_OWNER_EX: F_SETOWN_EX / F_GETOWN_EX round trip a thread owner
 
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
-    FIOASYNC, O_CREAT, O_NONBLOCK, O_RDWR, SigInfo, sys_close, sys_dup, sys_exit, sys_fcntl,
-    sys_fork, sys_getpid, sys_gettid, sys_ioctl, sys_mknod, sys_open, sys_pipe2, sys_read,
-    sys_rt_sigprocmask, sys_rt_sigtimedwait, sys_setpgid, sys_setresuid, sys_unlink, sys_wait4,
-    sys_write,
+    AF_INET, AF_UNIX, FIOASYNC, O_CREAT, O_NONBLOCK, O_RDWR, SOCK_STREAM, SigInfo, SockAddrIn,
+    htonl, make_ipv4, sys_accept, sys_bind, sys_close, sys_connect, sys_dup, sys_exit, sys_fcntl,
+    sys_fork, sys_getpid, sys_getsockname, sys_gettid, sys_ioctl, sys_listen, sys_mknod, sys_open,
+    sys_pipe2, sys_read, sys_rt_sigprocmask, sys_rt_sigtimedwait, sys_setpgid, sys_setresuid,
+    sys_socket, sys_socketpair, sys_unlink, sys_wait4, sys_write,
 };
 
 const F_GETFL: i32 = 3;
@@ -53,6 +59,9 @@ pub fn run_tests() {
     test_close();
     test_pgrp();
     test_perm();
+    test_socket_sigio();
+    test_sock_out();
+    test_tcp();
     test_no_fasync();
     test_owner_ex();
 }
@@ -414,6 +423,162 @@ fn perm_setter() -> i32 {
 fn test_perm() {
     let r = in_child(perm_setter);
     report(b"SIGIO_PERM", r == 0, &[(b"exit", r)]);
+}
+
+fn test_socket_sigio() {
+    let old = block(bit(SIGIO));
+    let mut sv = [0i32; 2];
+    sys_socketpair(AF_UNIX, SOCK_STREAM, 0, &mut sv);
+    let armed = arm(sv[0]);
+    sys_write(sv[1] as u64, b"x".as_ptr(), 1);
+    let got = take_wait(SIGIO, 2);
+    sys_close(sv[0] as u64);
+    sys_close(sv[1] as u64);
+    setmask(old);
+    report(
+        b"SIGIO_SOCKET",
+        armed == 0 && got == SIGIO as i64,
+        &[(b"armed", armed), (b"got", got)],
+    );
+}
+
+/// Every queued `sig` taken (0 left)
+fn drain_sig(sig: u32) {
+    while take(sig) == sig as i64 {}
+}
+
+fn set_nonblock(fd: i32) {
+    let fl = sys_fcntl(fd, F_GETFL, 0) as u64;
+    sys_fcntl(fd, F_SETFL, fl | O_NONBLOCK as u64);
+}
+
+/// A reader freeing room raises no POLL_OUT until a send hit a full
+/// buffer; then the drain does
+fn test_sock_out() {
+    let old = block(bit(SIGRT) | bit(SIGIO));
+    let mut sv = [0i32; 2];
+    sys_socketpair(AF_UNIX, SOCK_STREAM, 0, &mut sv);
+    arm(sv[0]);
+    sys_fcntl(sv[0], F_SETSIG, SIGRT as u64);
+    let mut buf = [0u8; 1024];
+    sys_write(sv[0] as u64, buf.as_ptr(), 1);
+    sys_read(sv[1] as u64, buf.as_mut_ptr(), 1);
+    let early = take(SIGRT);
+    set_nonblock(sv[0]);
+    set_nonblock(sv[1]);
+    let mut full = 0;
+    for _ in 0..4096 {
+        full = sys_write(sv[0] as u64, buf.as_ptr(), buf.len() as u64);
+        if full < 0 {
+            break;
+        }
+    }
+    while sys_read(sv[1] as u64, buf.as_mut_ptr(), buf.len() as u64) > 0 {}
+    let mut info = zeroed();
+    let got = wait_sig(bit(SIGRT), 2, &mut info);
+    drain_sig(SIGRT);
+    sys_close(sv[0] as u64);
+    sys_close(sv[1] as u64);
+    setmask(old);
+    let band = info.si_pid as i64;
+    let ok = early == EAGAIN
+        && full == EAGAIN
+        && got == SIGRT as i64
+        && info.si_code == POLL_OUT
+        && band == 0x304
+        && info.si_status == sv[0];
+    report(
+        b"SIGIO_SOCK_OUT",
+        ok,
+        &[
+            (b"early", early),
+            (b"full", full),
+            (b"got", got),
+            (b"code", info.si_code as i64),
+            (b"band", band),
+        ],
+    );
+}
+
+/// Wait up to 2 s for SIGRT with `code` from `fd`
+fn wait_from(fd: i32, code: i32) -> bool {
+    for _ in 0..8 {
+        let mut info = zeroed();
+        let ts = [0i64, 250_000_000];
+        let m = bit(SIGRT);
+        let r = sys_rt_sigtimedwait(
+            &m as *const u64 as u64,
+            &mut info as *mut SigInfo as u64,
+            ts.as_ptr() as u64,
+            8,
+        );
+        if r == SIGRT as i64 && info.si_status == fd && info.si_code == code {
+            return true;
+        }
+    }
+    false
+}
+
+/// O_ASYNC with SIGRT
+fn arm_rt(fd: i32) {
+    arm(fd);
+    sys_fcntl(fd, F_SETSIG, SIGRT as u64);
+}
+
+fn test_tcp() {
+    let old = block(bit(SIGRT) | bit(SIGIO));
+    let l = sys_socket(AF_INET, SOCK_STREAM, 0) as i32;
+    let mut a = SockAddrIn::new(AF_INET as u16, 0, htonl(make_ipv4(127, 0, 0, 1)));
+    let alen = core::mem::size_of::<SockAddrIn>() as u32;
+    sys_bind(l, &a as *const SockAddrIn as *const u8, alen);
+    sys_listen(l, 4);
+    let mut n = alen;
+    sys_getsockname(l, &mut a as *mut SockAddrIn as *mut u8, &mut n);
+    arm_rt(l);
+    let c = sys_socket(AF_INET, SOCK_STREAM, 0) as i32;
+    set_nonblock(c);
+    arm_rt(c);
+    sys_connect(c, &a as *const SockAddrIn as *const u8, alen);
+    // Either order: the listener's POLL_IN, the client's POLL_OUT
+    let mut lis = false;
+    let mut conn = false;
+    for _ in 0..16 {
+        let mut info = zeroed();
+        let ts = [0i64, 250_000_000];
+        let m = bit(SIGRT);
+        let r = sys_rt_sigtimedwait(
+            &m as *const u64 as u64,
+            &mut info as *mut SigInfo as u64,
+            ts.as_ptr() as u64,
+            8,
+        );
+        if r == SIGRT as i64 {
+            lis |= info.si_status == l && info.si_code == POLL_IN;
+            conn |= info.si_status == c && info.si_code == POLL_OUT;
+        }
+        if lis && conn {
+            break;
+        }
+    }
+    let s = sys_accept(l, core::ptr::null_mut(), core::ptr::null_mut()) as i32;
+    arm_rt(s);
+    sys_write(c as u64, b"x".as_ptr(), 1);
+    let data = wait_from(s, POLL_IN);
+    drain_sig(SIGRT);
+    sys_close(s as u64);
+    sys_close(c as u64);
+    sys_close(l as u64);
+    drain_sig(SIGRT);
+    setmask(old);
+    report(
+        b"SIGIO_TCP",
+        lis && conn && data,
+        &[
+            (b"listener", lis as i64),
+            (b"connect", conn as i64),
+            (b"data", data as i64),
+        ],
+    );
 }
 
 /// A regular tmpfs file has no fasync

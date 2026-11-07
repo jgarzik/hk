@@ -364,7 +364,7 @@ Pipes (3.11): Pipe.inner (sleeping; two in address order) → frame
     no other lock under it, none of these above it
 
 SIGIO (3.11, io/fasync.rs; Linux fasync_lock, f_lock, fown->lock):
-    FasyncList.list (sleeping, per object) → File.f_lock (fasync_helper
+    FasyncList.list (sleeping, per object: a pipe's two, a socket's) → File.f_lock (fasync_helper
     sets O_ASYNC with the list change) | FOwner.st (spin leaf, copied
     and released before a send); kill_fasync sends under
     FasyncList.list → TASKLIST (read) → Task.sig → shared_pending, so
@@ -386,6 +386,12 @@ Network locks (3.10 Network Subsystem has the full order):
     UnixSock.st) → protocol tables → Inet.addr → queues, timers
         ↓ (transmit under a socket lock)
     FIB / neighbour / device TX → Softnet.backlog
+    Socket wakeups (`Sock::data_ready`, `write_space`,
+    `error_report`, `wake_async`) send SIGIO (`Sock.fasync` ->
+    FasyncList.list), so they run after every network spin lock is
+    dropped (TCP posts an error under `TcpSock.cb` with `post_err` and
+    signals after unlocking). `Sock.wq_flags` (NOSPACE, WAITDATA) are
+    atomic bits, Linux socket_wq.flags.
     Network spin locks are taken in thread context only (softnet
     threads, socket calls); ISRs only touch atomics, `Softnet.poll_list`
     and wait queues (IrqSpinlocks). No socket is released under a
@@ -3489,7 +3495,7 @@ else is taken under it) unless an order is given. "spin" is the
 | `signal::NO_SHARED` | signal/mod.rs | spin Mutex | the empty shared pending set the boot task (no SignalStruct) reads; locked where a thread group's `shared_pending` would be, same position (Task.sig -> shared_pending) |
 | `FS_TYPES`, `CHARDEV_REGISTRY` | fs/superblock.rs, fs/chardev.rs | spin | filesystem types, character device registry |
 | `File.f_lock` | fs/file.rs | spin Mutex | file status flags (Linux f_lock); a leaf, also under `FasyncList.list` (O_ASYNC is set or cleared only with the file's fasync entry) |
-| `FasyncList.list` → `File.f_lock`, `FOwner.st` | io/fasync.rs | sleeping `sync::Mutex` (per object: a pipe's readers and writers); `FOwner.st` spin leaf | SIGIO (Linux fasync_lock and RCU readers, fown->lock): a list's entries (a file's `FOwner` reference and the armed fd), changed by `fasync_helper` (from `->fasync`; a pipe's under `Pipe.inner`, Linux pipe_fasync) and walked by `kill_fasync`, which sends each entry's signal under it: thread context, no spin lock held (3.7 rule 1). `FOwner.st` (a file's owner pid, type, setter uids and F_SETSIG signal; allocated once per file) is copied under it and released before the send. A file's last close takes it off its lists (`->fasync(-1, off)`) before `->release` |
+| `FasyncList.list` → `File.f_lock`, `FOwner.st` | io/fasync.rs | sleeping `sync::Mutex` (per object: a pipe's readers and writers, a socket's); `FOwner.st` spin leaf | SIGIO (Linux fasync_lock and RCU readers, fown->lock): `FasyncList.armed` (atomic, written under the lock, read lock-free: Linux kill_fasync's unlocked list test) lets a wakeup with no armed file skip the lock; a list's entries (a file's `FOwner` reference and the armed fd), changed by `fasync_helper` (from `->fasync`; a pipe's under `Pipe.inner`, Linux pipe_fasync) and walked by `kill_fasync`, which sends each entry's signal under it: thread context, no spin lock held (3.7 rule 1). `FOwner.st` (a file's owner pid, type, setter uids and F_SETSIG signal; allocated once per file) is copied under it and released before the send. A file's last close takes it off its lists (`->fasync(-1, off)`) before `->release` |
 | `SuperBlock.{root, private}`, `DentryCache.root` | fs/superblock.rs, fs/dentry.rs | spin RwLock | superblock root and private data, the dcache root |
 | `RamfsInodeData.xattrs`, `RamfsSbData.sb` | fs/ramfs.rs | spin | ramfs xattrs and superblock back-pointer (under VFS locks) |
 | membarrier `GLOBAL_MUTEX` → `IPI_MUTEX` | task/membarrier.rs | sleeping (`sync::Mutex`; `IPI_MUTEX` is Linux membarrier_ipi_mutex) | `IPI_MUTEX` serializes the membarrier commands that interrupt other CPUs, so callers cannot multiply the IPIs; held only across `smp_call_function_many` (waited); nothing is taken under it. `GLOBAL_MUTEX` (killable) paces MEMBARRIER_CMD_GLOBAL to one call per tick: held across its IPIs and its one-tick sleep, so GLOBAL callers never delay the expedited ones. The targets are chosen from each CPU's `PerCpuScheduler.curr_mm` / `membarrier_state` (atomics written at every switch in `make_current`: `curr_mm` SeqCst, then a full fence, then the registrations read, so a registration either sees the CPU in its mm and refreshes it by IPI or is seen by the switch; Linux rq->curr->mm and rq->membarrier_state), compared, never dereferenced |

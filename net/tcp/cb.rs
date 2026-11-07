@@ -280,6 +280,14 @@ pub mod wake {
     pub const DATA: u8 = 2;
     /// Room to write (Linux tcp_new_space)
     pub const SPACE: u8 = 4;
+    /// With STATE: the connection is established (Linux
+    /// tcp_finish_connect / tcp_rcv_state_process: SIGIO POLL_OUT)
+    pub const EST: u8 = 8;
+    /// With STATE: the peer's FIN arrived (Linux tcp_fin: SIGIO POLL_IN,
+    /// POLL_HUP once both directions are shut)
+    pub const FIN: u8 = 16;
+    /// An error was posted under the lock (SIGIO POLL_ERR after it)
+    pub const ERR: u8 = 32;
 }
 
 /// Socket shutdown bits (same values as `net::sock`)

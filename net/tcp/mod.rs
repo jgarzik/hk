@@ -58,6 +58,7 @@ use self::output::Tuple;
 use self::table::Ent;
 use self::timer::{Expire, Slot, now_ms};
 use self::timewait::TimeWait;
+use crate::io::fasync::{POLL_ERR, POLL_HUP, POLL_IN, POLL_OUT};
 use crate::io::poll::{
     POLLERR, POLLHUP, POLLIN, POLLOUT, POLLRDHUP, POLLRDNORM, POLLWRBAND, POLLWRNORM,
 };
@@ -73,7 +74,7 @@ use crate::net::msg::{
     SendMsg,
 };
 use crate::net::skb::SkBuff;
-use crate::net::sock::{RCV_SHUTDOWN, SEND_SHUTDOWN, SHUTDOWN_MASK, Sock, sf};
+use crate::net::sock::{RCV_SHUTDOWN, SEND_SHUTDOWN, SHUTDOWN_MASK, Sock, WakeHow, sf};
 use crate::net::socket::{
     AF_INET, AF_UNSPEC, OptIn, OptOut, ProtoOps, SIOCINQ, SIOCOUTQ, SO_KEEPALIVE, SO_RCVLOWAT,
     SOCK_STREAM, SOL_SOCKET, shut_bits,
@@ -370,7 +371,7 @@ impl TcpSock {
             self.sk.set_shutdown(out.shut);
         }
         if let Some(e) = out.err {
-            self.sk.set_err(e);
+            self.sk.post_err(e);
         }
         if let Some(t) = t {
             let p = self.inet.params();
@@ -378,7 +379,11 @@ impl TcpSock {
                 xmit(&self.sk.net, &t, seg, p, self.oif());
             }
         }
-        out.wake
+        if out.err.is_some() {
+            out.wake | cb::wake::ERR
+        } else {
+            out.wake
+        }
     }
 
     /// Lock, run `f` on the control block, post-process and apply the
@@ -402,15 +407,34 @@ impl TcpSock {
 
     /// The wakeups `w` (`cb::wake`) asked for
     fn wake(&self, w: u8) {
+        if w & cb::wake::ERR != 0 {
+            self.sk.wake_async(WakeHow::Io, POLL_ERR);
+        }
         if w & cb::wake::STATE != 0 {
             self.sk.state_change();
+            self.state_async(w);
             return;
         }
         if w & cb::wake::DATA != 0 {
             self.sk.data_ready();
         }
         if w & cb::wake::SPACE != 0 {
-            self.sk.write_space();
+            self.sk.stream_write_space();
+        }
+    }
+
+    /// The SIGIO of a state change (Linux tcp_finish_connect, tcp_fin)
+    fn state_async(&self, w: u8) {
+        if w & cb::wake::EST != 0 {
+            self.sk.wake_async(WakeHow::Io, POLL_OUT);
+        }
+        if w & cb::wake::FIN != 0 {
+            let band = if self.sk.shutdown() == SHUTDOWN_MASK {
+                POLL_HUP
+            } else {
+                POLL_IN
+            };
+            self.sk.wake_async(WakeHow::WaitData, band);
         }
     }
 
@@ -960,7 +984,7 @@ fn tcp_recvmsg(s: &TcpSock, m: &mut RecvMsg<'_>, flags: i32) -> Result<usize, Ke
             break;
         }
         let more = if flags & MSG_PEEK != 0 { copied } else { 0 };
-        match s.sk.wait(timeo, || s.rx_ready(more)) {
+        match s.sk.wait_data(timeo, || s.rx_ready(more)) {
             Ok(t) => timeo = t,
             Err(e)
                 if copied > 0
@@ -1006,6 +1030,7 @@ fn wait_connected(s: &TcpSock, timeo: &mut u64) -> Result<(), KernelError> {
 /// whole send timeout if interrupted
 fn wait_memory(s: &TcpSock, timeo: &mut u64) -> Result<(), KernelError> {
     use crate::net::sock::TIMEO_FOREVER;
+    s.sk.send_nospace(*timeo);
     if *timeo == 0 {
         return Err(KernelError::WouldBlock);
     }
@@ -1067,10 +1092,12 @@ fn tcp_sendmsg(s: &TcpSock, m: &mut SendMsg<'_>, flags: i32) -> Result<usize, Ke
             if let Err(e) = wait_memory(s, &mut timeo) {
                 break Err(e);
             }
-        } else if n == 0
-            && let Err(e) = s.sk.wait(timeo, || s.tx_ready()).map(|t| timeo = t)
-        {
-            break Err(e);
+        } else if n == 0 {
+            // Linux sk_stream_wait_memory
+            s.sk.send_nospace(timeo);
+            if let Err(e) = s.sk.wait(timeo, || s.tx_ready()).map(|t| timeo = t) {
+                break Err(e);
+            }
         }
     };
     match r {
@@ -1334,6 +1361,9 @@ impl ProtoOps for TcpSock {
             }
             if sh & SEND_SHUTDOWN != 0 || g.cb.writable() {
                 mask |= POLLOUT | POLLWRNORM | POLLWRBAND;
+            } else {
+                // SIGIO once there is room (Linux tcp_poll)
+                self.sk.set_nospace();
             }
         }
         if self.sk.err_pending() {

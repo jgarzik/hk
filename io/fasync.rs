@@ -24,6 +24,7 @@
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::fs::File;
 use crate::io::poll::{
@@ -271,13 +272,24 @@ struct Fasync {
 pub struct FasyncList {
     /// Sleeping lock, thread context; signals are sent under it
     list: crate::sync::Mutex<Vec<Fasync>>,
+    /// `list` is not empty: written under it, read lock-free so a wakeup
+    /// with nobody armed (nearly all) costs one load (Linux kill_fasync's
+    /// unlocked `*fp` test); a racing add may be missed, as in Linux
+    armed: AtomicBool,
 }
 
 impl FasyncList {
     pub const fn new() -> Self {
         Self {
             list: crate::sync::Mutex::new(Vec::new()),
+            armed: AtomicBool::new(false),
         }
+    }
+
+    /// Some file is on the list (Linux sock_flag(SOCK_FASYNC) for a
+    /// socket's)
+    pub fn armed(&self) -> bool {
+        self.armed.load(Ordering::Acquire)
     }
 }
 
@@ -302,6 +314,7 @@ pub fn fasync_helper(list: &FasyncList, file: &File, fd: i32, on: bool) -> Resul
     }
     l.try_reserve(1).map_err(|_| KernelError::OutOfMemory)?;
     l.push(Fasync { owner, fd });
+    list.armed.store(true, Ordering::Release);
     file.set_fasync_flag(true);
     Ok(())
 }
@@ -314,6 +327,7 @@ fn fasync_remove(list: &FasyncList, file: &File) {
     let mut l = list.list.lock();
     if let Some(i) = l.iter().position(|e| Arc::ptr_eq(&e.owner, owner)) {
         l.swap_remove(i);
+        list.armed.store(!l.is_empty(), Ordering::Release);
         file.set_fasync_flag(false);
     }
 }
@@ -323,6 +337,9 @@ fn fasync_remove(list: &FasyncList, file: &File) {
 /// that chose a signal (SIGURG has its own path). Thread context, no
 /// spin lock held.
 pub fn kill_fasync(list: &FasyncList, sig: u32, band: i32) {
+    if !list.armed() {
+        return;
+    }
     let l = list.list.lock();
     for e in l.iter() {
         let o = e.owner.get();

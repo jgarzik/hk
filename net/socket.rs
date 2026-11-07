@@ -344,6 +344,16 @@ impl FileOps for SockFile {
         }
         Ok(())
     }
+
+    /// Linux sock_fasync: the socket's list; an allocation failure is
+    /// not reported (Linux ignores fasync_helper's result)
+    fn fasync(&self, file: &File, fd: i32, on: bool) -> Option<Result<(), KernelError>> {
+        let Some(s) = sock_of(file) else {
+            return Some(Err(KernelError::InvalidArgument));
+        };
+        let _ = crate::io::fasync::fasync_helper(&s.sk().fasync, file, fd, on);
+        Some(Ok(()))
+    }
 }
 
 /// ioctl constants

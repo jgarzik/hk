@@ -11,7 +11,9 @@
 //! `Sock` holds atomics, its `WaitQueue` (IrqSpinlock leaf) and the
 //! error queue `errq` (`crate::sync::spin::Mutex` leaf, thread only). Wakeups
 //! (`data_ready`, `write_space`, `state_change`, `error_report`) are
-//! issued after the caller dropped its protocol locks.
+//! issued after the caller dropped its protocol locks, in thread context:
+//! they also send the O_ASYNC owners' SIGIO (`wake_async`, Linux
+//! sk_wake_async; `fasync`, a sleeping lock taken when a file is armed).
 
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
@@ -20,6 +22,7 @@ use core::sync::atomic::{AtomicI32, AtomicU8, AtomicU32, AtomicU64, AtomicUsize,
 
 use crate::sync::spin::Mutex;
 
+use crate::io::fasync::{FasyncList, POLL_ERR, POLL_IN, POLL_OUT, kill_fasync};
 use crate::io::poll::{
     POLLERR, POLLIN, POLLOUT, POLLPRI, POLLRDBAND, POLLRDNORM, POLLWRBAND, POLLWRNORM,
 };
@@ -94,6 +97,28 @@ impl ErrSkb {
     }
 }
 
+/// Async notification state (Linux socket_wq.flags bits, set and
+/// cleared atomically like Linux's bitops)
+mod wqf {
+    /// A send found no room: the next write_space raises SIGIO (Linux
+    /// SOCKWQ_ASYNC_NOSPACE)
+    pub const NOSPACE: u32 = 1;
+    /// A reader sleeps for data: data_ready raises no SIGIO (Linux
+    /// SOCKWQ_ASYNC_WAITDATA)
+    pub const WAITDATA: u32 = 2;
+}
+
+/// Which SIGIO rule a wakeup follows (Linux SOCK_WAKE_*)
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum WakeHow {
+    /// Always (SOCK_WAKE_IO)
+    Io,
+    /// Unless a reader waits for data (SOCK_WAKE_WAITD)
+    WaitData,
+    /// Only after a send found no room (SOCK_WAKE_SPACE)
+    Space,
+}
+
 /// Timeout "never" (MAX_SCHEDULE_TIMEOUT in ns)
 pub const TIMEO_FOREVER: u64 = u64::MAX;
 
@@ -135,6 +160,10 @@ pub struct Sock {
     /// Error queue (IP_RECVERR, MSG_ERRQUEUE) and its memory charge
     errq: Mutex<VecDeque<ErrSkb>>,
     errmem: AtomicUsize,
+    /// O_ASYNC files of the socket (Linux socket_wq.fasync_list)
+    pub fasync: FasyncList,
+    /// `wqf` bits
+    wq_flags: AtomicU32,
 }
 
 impl Sock {
@@ -163,6 +192,8 @@ impl Sock {
             ino: AtomicU64::new(0),
             errq: Mutex::new(VecDeque::new()),
             errmem: AtomicUsize::new(0),
+            fasync: FasyncList::new(),
+            wq_flags: AtomicU32::new(0),
         }
     }
 
@@ -211,6 +242,14 @@ impl Sock {
 
     pub fn has_err(&self) -> bool {
         self.err.load(Ordering::Acquire) != 0
+    }
+
+    /// Record an error under a protocol lock: waiters wake now, the
+    /// caller sends its SIGIO (`wake_async(Io, POLL_ERR)`) after
+    /// unlocking
+    pub fn post_err(&self, e: KernelError) {
+        self.err.store(e as i32, Ordering::Release);
+        self.wq.wake_poll(u32::from(POLLERR));
     }
 
     /// Set the pending error without a wakeup (callers report later)
@@ -401,12 +440,26 @@ impl Sock {
     pub fn data_ready(&self) {
         self.wq
             .wake_poll(u32::from(POLLIN | POLLPRI | POLLRDNORM | POLLRDBAND));
+        self.wake_async(WakeHow::WaitData, POLL_IN);
     }
 
-    /// Linux sock_def_write_space
+    /// Linux sock_def_write_space / unix_write_space (the caller found
+    /// the socket writable)
     pub fn write_space(&self) {
         self.wq
             .wake_poll(u32::from(POLLOUT | POLLWRNORM | POLLWRBAND));
+        self.wake_async(WakeHow::Space, POLL_OUT);
+    }
+
+    /// Linux sk_stream_write_space: as `write_space`, no SIGIO once
+    /// sending is shut down
+    pub fn stream_write_space(&self) {
+        if self.shutdown() & SEND_SHUTDOWN != 0 {
+            self.wq
+                .wake_poll(u32::from(POLLOUT | POLLWRNORM | POLLWRBAND));
+        } else {
+            self.write_space();
+        }
     }
 
     /// Linux sock_def_wakeup
@@ -417,6 +470,57 @@ impl Sock {
     /// Linux sock_def_error_report
     pub fn error_report(&self) {
         self.wq.wake_poll(u32::from(POLLERR));
+        self.wake_async(WakeHow::Io, POLL_ERR);
+    }
+
+    /// SIGIO to the O_ASYNC files for `band` (a POLL_* code) under rule
+    /// `how` (Linux sk_wake_async / sock_wake_async); thread context, no
+    /// spin lock held
+    pub fn wake_async(&self, how: WakeHow, band: i32) {
+        if !self.fasync.armed() {
+            return;
+        }
+        let skip = match how {
+            WakeHow::Io => false,
+            WakeHow::WaitData => self.wq_flags.load(Ordering::Acquire) & wqf::WAITDATA != 0,
+            WakeHow::Space => {
+                self.wq_flags.fetch_and(!wqf::NOSPACE, Ordering::AcqRel) & wqf::NOSPACE == 0
+            }
+        };
+        if !skip {
+            kill_fasync(&self.fasync, crate::signal::SIGIO, band);
+        }
+    }
+
+    /// Poll found the socket unwritable: the next `write_space` raises
+    /// SIGIO (Linux tcp_poll / unix_dgram_poll sk_set_bit(NOSPACE))
+    pub fn set_nospace(&self) {
+        self.wq_flags.fetch_or(wqf::NOSPACE, Ordering::AcqRel);
+    }
+
+    /// A sender found no room with `timeo` left: one that will not wait
+    /// (0) sets NOSPACE, one about to sleep clears it (Linux
+    /// sk_stream_wait_memory, sock_alloc_send_pskb / sock_wait_for_wmem)
+    pub fn send_nospace(&self, timeo: u64) {
+        if timeo == 0 {
+            self.set_nospace();
+        } else {
+            self.wq_flags.fetch_and(!wqf::NOSPACE, Ordering::AcqRel);
+        }
+    }
+
+    /// Wait for data until `cond()` with WAITDATA set (Linux sk_wait_data
+    /// / unix_stream_data_wait): no SIGIO for data a sleeping reader
+    /// takes
+    #[track_caller]
+    pub fn wait_data<F: FnMut() -> bool>(&self, timeo: u64, cond: F) -> Result<u64, KernelError> {
+        if timeo == 0 {
+            return self.wait(timeo, cond);
+        }
+        self.wq_flags.fetch_or(wqf::WAITDATA, Ordering::AcqRel);
+        let r = self.wait(timeo, cond);
+        self.wq_flags.fetch_and(!wqf::WAITDATA, Ordering::AcqRel);
+        r
     }
 
     /// Wait on this socket's queue until `cond()` (`wait_on`)
