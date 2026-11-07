@@ -492,12 +492,19 @@ de_thread
 
 **Location**: `signal/notify.rs`, `task/percpu.rs` (exit_notify)
 
-- A traced child's exit tells its tracer only; once the tracer reaps or
-  detaches it, its real parent is not told nor can wait for it (Linux
-  wait_task_zombie / __ptrace_detach: do_notify_parent to the real
-  parent).
-- A child's non-SIGCHLD exit signal is not turned into SIGCHLD when its
-  parent has exec'd since the fork (Linux parent_exec_id).
+A traced child's exit tells its tracer only; once the tracer reaps or
+detaches it, its real parent is not told nor can wait for it (Linux
+wait_task_zombie / __ptrace_detach: do_notify_parent to the real
+parent).
+
+## No vDSO
+
+**Location**: `task/exec.rs`, `arch/aarch64/signal.rs`
+
+No vDSO is mapped (no AT_SYSINFO_EHDR): libc makes real syscalls for
+clock_gettime and friends. On arm64 a page holding only the signal
+return trampoline stands in for the vDSO's sigtramp, shown as
+[sigpage] in /proc/<pid>/maps (Linux: [vdso], [vvar]).
 
 ## ptrace stop gaps
 
