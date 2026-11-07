@@ -189,12 +189,25 @@ fn isolated(name: &[u8], f: fn()) {
     use hk_syscall::{sys_exit, sys_fork, sys_wait4};
     let before = helpers::fail_count();
     let pid = sys_fork();
+    if pid < 0 {
+        group_fail(name, b"fork", pid);
+        return;
+    }
     if pid == 0 {
         f();
         sys_exit((helpers::fail_count() - before).min(255) as u64);
     }
     let mut st = 0i32;
-    sys_wait4(pid, &mut st, 0, 0);
+    let r = loop {
+        let r = sys_wait4(pid, &mut st, 0, 0);
+        if r != EINTR {
+            break r;
+        }
+    };
+    if r != pid {
+        group_fail(name, b"wait4", r);
+        return;
+    }
     helpers::add_fails(((st >> 8) & 0xff) as u32);
     if st & 0x7f != 0 {
         helpers::print(name);
@@ -203,6 +216,18 @@ fn isolated(name: &[u8], f: fn()) {
         helpers::println(b"");
     }
 }
+
+/// NAME_GROUP:FAIL what N: the group could not run or be waited for
+fn group_fail(name: &[u8], what: &[u8], r: i64) {
+    helpers::print(name);
+    helpers::print(b"_GROUP:FAIL ");
+    helpers::print(what);
+    helpers::print(b" ");
+    helpers::print_num(r);
+    helpers::println(b"");
+}
+
+const EINTR: i64 = -4;
 
 /// Run all test categories in order
 pub fn run_all_tests() {
