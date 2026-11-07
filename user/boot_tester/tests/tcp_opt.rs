@@ -319,7 +319,9 @@ fn test_cork_more() {
     t.done();
 }
 
-static mut PROC: [u8; 512 * 1024] = [0; 512 * 1024];
+/// /proc/net/tcp at this point of the suite: about 3200 TIME_WAIT
+/// entries of the earlier tests (as on Linux), 150 bytes each
+static mut PROC: [u8; 2 << 20] = [0; 2 << 20];
 
 /// Hex digits of `v` (`w` wide) into `out`
 fn hex(v: u32, w: usize, out: &mut [u8]) {
@@ -371,8 +373,8 @@ fn test_proc_net_tcp() {
     let server_ok = has_line(text, &[&est, b" 01 "]);
     t.ok(b"server line", server_ok, 0);
     if !(client_ok && server_ok) {
-        // Intermittent (BUGS flake list): show what was listed for the
-        // two ports, the first 60 columns of each line
+        // Show what was listed for the two ports, the first 60
+        // columns of each line
         super::helpers::print_num(n);
         super::helpers::println(b" bytes read; lines with either port:");
         for l in text.split(|&c| c == b'\n') {

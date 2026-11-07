@@ -936,13 +936,6 @@ Tag = roadmap phase (doc/ROADMAP.md).
    its port in bhash (`TcpSock::assert_owner`). On failure the test
    prints the poll events, TCP state, local and peer ports, the port
    range and the /proc/net/tcp lines of the dead port.
-10. **TCP_PROC_NET flake** (cause unknown): one end of a fresh,
-   accepted loopback connection is missing from /proc/net/tcp as state
-   01 (`client line got 0`, `server line got 0`; hk arm64, CI and
-   `check-stress`). Not a torn read: the file comes in one
-   regeneration (well under the 64 KiB read chunk). Not ehash removal
-   by key (removals check the entry). The test prints the lines with
-   either port when it fails.
 
 ## /proc/<pid>/mounts: no POLLERR|POLLPRI on a mount change
 
