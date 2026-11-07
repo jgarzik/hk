@@ -593,12 +593,10 @@ pub fn sys_pause() -> i64 {
 }
 
 /// The siginfo rt_sigqueueinfo and rt_tgsigqueueinfo queue, made for
-/// `sig` whatever its si_signo (Linux __copy_siginfo_from_user): EFAULT,
-/// E2BIG (`SigInfo::copy_from_user`)
+/// `sig` whatever its si_signo, its layout judged by `sig` (Linux
+/// __copy_siginfo_from_user): EFAULT, E2BIG
 fn read_info(uinfo: u64, sig: u32) -> Result<SigInfo, KernelError> {
-    let mut info = SigInfo::copy_from_user(uinfo)?;
-    info.signo = sig as i32;
-    Ok(info)
+    SigInfo::copy_from_user_sig(uinfo, sig as i32)
 }
 
 /// Codes no user may queue to another task: the kernel's (> 0), and

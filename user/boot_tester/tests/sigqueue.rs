@@ -40,6 +40,9 @@
 //!   forgets the alternate stack, deletes timer_create timers with their
 //!   pending signals; the blocked mask, other pending signals and
 //!   ITIMER_REAL stay
+//! - rt_sigqueueinfo judges the siginfo layout by the signal queued,
+//!   not by the caller's si_signo: an unknown one with a nonzero tail
+//!   is E2BIG
 //! - arm64: a handler set without SA_RESTORER returns through the
 //!   kernel's trampoline (Linux: the vDSO sigtramp), a mapping of its
 //!   own in /proc/self/maps ([sigpage]; Linux [vdso])
@@ -90,6 +93,7 @@ pub fn run_tests() {
     test_exit_signal_reparent();
     test_ptrace_siginfo();
     test_exec_signals();
+    test_queue_layout();
     #[cfg(target_arch = "aarch64")]
     test_no_restorer();
 }
@@ -1259,6 +1263,31 @@ fn test_exec_signals() {
     } else {
         print(b"SIGQUEUE_EXEC:FAIL status=");
         print_num(st as i64);
+        println(b"");
+    }
+}
+
+/// rt_sigqueueinfo of an RT signal with si_signo SIGSEGV and si_code 7
+/// (SEGV_ADIPERR, a fault layout; for an RT signal no known layout) and
+/// a nonzero tail: E2BIG, nothing queued (Linux __copy_siginfo_from_user
+/// sets si_signo before known_siginfo_layout)
+fn test_queue_layout() {
+    const E2BIG: i64 = -7;
+    let old = block(bit(SIGRT));
+    let mut u = [0u8; 128];
+    u[0..4].copy_from_slice(&11i32.to_ne_bytes()); // si_signo SIGSEGV
+    u[8..12].copy_from_slice(&7i32.to_ne_bytes()); // si_code
+    u[100] = 1;
+    let r = sys_rt_sigqueueinfo(sys_getpid(), SIGRT, u.as_ptr() as u64);
+    let n = drain(SIGRT);
+    setmask(old);
+    if r == E2BIG && n == 0 {
+        println(b"SIGQUEUE_LAYOUT:OK");
+    } else {
+        print(b"SIGQUEUE_LAYOUT:FAIL r=");
+        print_num(r);
+        print(b" queued=");
+        print_num(n);
         println(b"");
     }
 }

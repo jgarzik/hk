@@ -391,11 +391,25 @@ impl SigInfo {
     /// the kernel form as is; for a code of no known layout its other
     /// bytes must be zero (E2BIG), so it can be given back exactly
     pub fn copy_from_user(from: u64) -> Result<Self, KernelError> {
+        Self::read_user(from, None)
+    }
+
+    /// Read a user `siginfo_t` at `from` as one for `sig`, whatever its
+    /// si_signo, before its layout is checked (Linux
+    /// __copy_siginfo_from_user)
+    pub fn copy_from_user_sig(from: u64, sig: i32) -> Result<Self, KernelError> {
+        Self::read_user(from, Some(sig))
+    }
+
+    fn read_user(from: u64, sig: Option<i32>) -> Result<Self, KernelError> {
         let mut u = [0u8; 128];
         let k = core::mem::size_of::<SigInfo>();
         copy_from_user::<Uaccess>(&mut u[..k], from, k).map_err(|_| KernelError::BadAddress)?;
         let mut s = <Self as FromBytes>::read_from(&u[..k]).ok_or(KernelError::BadAddress)?;
         s._pad = 0;
+        if let Some(sig) = sig {
+            s.signo = sig;
+        }
         if !known_layout(s.sig(), s.code) {
             let rest = from.checked_add(k as u64).ok_or(KernelError::BadAddress)?;
             copy_from_user::<Uaccess>(&mut u[k..], rest, EXPANSION)
