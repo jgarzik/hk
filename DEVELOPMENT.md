@@ -162,8 +162,9 @@ under TCG, as CI does.
 (`NAME:OK|SKIP|FAIL`) in order; `tools/bt-names.sh OLD NEW` diffs two
 logs' sequences. A change to the boot tests that should not change
 what runs (a move, a refactor) keeps the Linux logs'
-(`target/linux-test-<arch>/serial.clean`) sequence identical; hk logs
-can show a verdict torn by a concurrent writer.
+(`target/linux-test-<arch>/serial.clean`) sequence identical; make them
+with `LINUX_NOCACHE=1`, since a cached PASS leaves the old log in place.
+hk logs can show a verdict torn by a concurrent writer.
 
 `check-linux*` results do not depend on the kernel sources, so a PASS is cached
 in `~/.cache/hk-linux-check/<arch>/<hash>` (`LINUX_CACHE_DIR`), shared by
