@@ -37,8 +37,8 @@ blocks belong in a missing wrapper:
 - **DMA:** an owned `DmaBox<T: Pod>` with volatile field access, never
   `&T` into device-written memory: xhci rings and contexts, virtio
   rings and blk, e1000 descriptors, virtio-net buffers.
-- **MMIO:** the remaining raw MMIO users move to `mmio::IoMem`: xhci
-  operational/runtime registers, gfx framebuffer, vgacon, rtc,
+- **MMIO:** the remaining raw MMIO users move to `mmio::IoMem`: xhci's
+  interrupt handler (USBSTS, IMAN), gfx framebuffer, vgacon, rtc,
   pci_quirks, aarch64 serial, x86 power.
 - **Lists:** an intrusive `CursorMut` for the walk-and-remove loops
   (futex, waitqueue, sched, percpu).
