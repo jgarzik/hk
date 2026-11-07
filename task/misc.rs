@@ -1323,20 +1323,21 @@ pub fn sys_pidfd_send_signal(pidfd: i32, sig: i32, info: u64, flags: u32) -> i64
         }
     };
 
-    // A pidfd whose process is still there
-    let target_pid = match crate::task::pidfd::pidfd_live_pid(&file) {
-        Ok(pid) => pid,
-        Err(e) => return e.sysret(),
+    let Some(pidfd) = crate::task::pidfd::get_pidfd(&file) else {
+        return KernelError::BadFd.sysret();
     };
-
-    let info = match pidfd_info(info, sig as u32, target_pid) {
+    let info = match pidfd_info(info, sig as u32, pidfd.pid()) {
         Ok(i) => i,
         Err(e) => return e.sysret(),
     };
-    // Permission check and send (Linux pidfd_send_signal ->
-    // kill_pid_info). Signal 0 is a permission/existence probe.
-    let perm = crate::signal::syscall::user_group_send(target_pid, sig as u32, info);
-    i64::from(perm)
+    // Permission check and send to the pidfd's struct pid itself (Linux
+    // pidfd_send_signal -> kill_pid_info), so a reaped process's reused
+    // number never gets it. Signal 0 is a permission/existence probe.
+    let me = crate::signal::syscall::Sender::current();
+    let r = crate::signal::kill_pid_info(pidfd.pid_ref(), sig as u32, info, |t| {
+        me.may_kill(t, sig as u32)
+    });
+    i64::from(r)
 }
 
 /// The info pidfd_send_signal sends to process `pid` (Linux

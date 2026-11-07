@@ -1222,7 +1222,7 @@ fn create_kernel_task(
 
     const NOMEM: &str = "Out of memory for kernel thread";
     let cred = try_arc(Cred::ROOT).map_err(|_| NOMEM)?;
-    let sig = crate::signal::TaskSignalState::try_new().map_err(|_| NOMEM)?;
+    let sig = crate::signal::TaskSignalState::new();
     let stack_base = crate::mm::vmstack::alloc().ok_or("Out of memory for kernel thread stack")?;
     let stack_top = stack_base + KERNEL_STACK_SIZE as u64;
 
@@ -2520,8 +2520,10 @@ pub fn exit_current(status: Option<i32>) -> ! {
     // take sleeping-context locks and may wake other tasks (futex CLEARTID,
     // robust futexes), which needs this CPU's rq lock.
     if tid != 0 {
-        // Linux exit_signals sets PF_EXITING first
+        // Linux exit_signals sets PF_EXITING first, then hands the
+        // group signals this thread would have taken to another
         set_exiting();
+        crate::signal::exit_signals();
 
         // Exactly one thread, the one taking the group's live count to
         // zero, does the group-level exit work (Linux do_exit:

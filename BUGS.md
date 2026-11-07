@@ -486,14 +486,8 @@ that would need init's root.
 **Location**: `signal/mod.rs` (group exit), `task/exec.rs`
 de_thread
 
-- Process-directed signals go to one thread's private queue (the
-  leader, or a live thread once it has exited), not the shared queue
-  with Linux's thread choice at delivery; a pidfd polls readable when
-  the leader exits, not when the whole group is gone.
-- pidfd_send_signal checks the pidfd's process under TASKLIST, then
-  signals it by number (`user_group_send`): reaped and its number
-  reused in between, another process gets the signal. Linux signals the
-  struct pid (kill_pid_info); pidfd_getfd already resolves it so.
+- A pidfd polls readable when the leader exits, not when the whole
+  group is gone.
 
 ## ptrace stop gaps
 
@@ -842,8 +836,8 @@ Designs that grew one commit at a time. Tag = roadmap phase
   over a hundred and fifty; raw errno numbers and local errno
   constants in the hundreds.
 - **Process-wide state per thread** (C): pgid/sid copied into every
-  thread; shared pending signals beside SignalStruct; one global
-  CHILD_EXIT_WQ wakes every waiting parent on every exit.
+  thread; one global CHILD_EXIT_WQ wakes every waiting parent on every
+  exit.
 - **`task/percpu.rs` is about 4,600 lines** (before C): scheduler core,
   do_clone (523 lines), exit, wait, credential setters, five sleep
   APIs. Split like Linux (sched/core, fork, exit, cred). Other giants:

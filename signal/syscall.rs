@@ -266,66 +266,57 @@ pub fn sys_rt_sigpending(set_ptr: u64, sigsetsize: u64) -> i64 {
 /// # Returns
 /// 0 if permitted, -1 (EPERM) if denied, -3 (ESRCH) if target not found
 fn check_kill_permission(target_pid: u64, sig: u32) -> i32 {
-    use crate::signal::SIGCONT;
-    use crate::task::percpu::{TASKLIST, current_sid, current_tid};
-    use crate::task::{CAP_KILL, capable, current_cred};
+    let me = Sender::current();
+    let table = crate::task::percpu::TASKLIST.read();
+    match table.get(target_pid) {
+        Some(t) => me.may_kill(&t, sig),
+        None => -3, // ESRCH - no such process
+    }
+}
 
-    let caller_tid = current_tid();
-    let caller_cred = current_cred();
+/// What the kill permission check needs of the caller, read before
+/// TASKLIST is taken
+pub(crate) struct Sender {
+    tgid: u64,
+    sid: u64,
+    cred: crate::task::Cred,
+}
 
-    // Get target task info
-    let target_info = {
-        let table = TASKLIST.read();
-        // Find the thread group leader for this pid
-        table
-            .get(target_pid)
-            .map(|t| (t.task.pid, t.task.sid(), t.cred_arc()))
-    };
-
-    let (target_tgid, target_sid, target_cred) = match target_info {
-        Some(info) => info,
-        None => return -3, // ESRCH - no such process
-    };
-
-    // Get caller's tgid
-    let caller_tgid = {
-        let table = TASKLIST.read();
-        table.get(caller_tid).map(|t| t.task.pid).unwrap_or(0)
-    };
-
-    // Same thread group - always allowed
-    if caller_tgid == target_tgid {
-        return 0;
+impl Sender {
+    pub(crate) fn current() -> Self {
+        Self {
+            tgid: crate::task::percpu::current_pid(),
+            sid: crate::task::percpu::current_sid(),
+            cred: crate::task::current_cred(),
+        }
     }
 
-    // CAP_KILL capability - always allowed
-    if capable(CAP_KILL) {
-        return 0;
+    /// May it send `sig` to `t` (Linux check_kill_permission): same
+    /// thread group, CAP_KILL, a real or effective uid matching the
+    /// target's real or saved one, or SIGCONT within the session; else
+    /// EPERM
+    pub(crate) fn may_kill(&self, t: &crate::task::percpu::TaskView<'_>, sig: u32) -> i32 {
+        use crate::signal::SIGCONT;
+        use crate::task::{CAP_KILL, capable};
+        if self.tgid == t.task.pid || capable(CAP_KILL) {
+            return 0;
+        }
+        let c = &self.cred;
+        let tc = t.cred_arc();
+        if c.euid == tc.suid || c.euid == tc.uid || c.uid == tc.suid || c.uid == tc.uid {
+            return 0;
+        }
+        if sig == SIGCONT && self.sid == t.task.sid() {
+            return 0;
+        }
+        -1 // EPERM
     }
-
-    // UID match check (like Linux kill_ok_by_cred)
-    // Caller's real or effective UID must match target's real or saved UID
-    let uid_ok = caller_cred.euid == target_cred.suid
-        || caller_cred.euid == target_cred.uid
-        || caller_cred.uid == target_cred.suid
-        || caller_cred.uid == target_cred.uid;
-
-    if uid_ok {
-        return 0;
-    }
-
-    // SIGCONT special case: same session allows SIGCONT
-    if sig == SIGCONT && current_sid() == target_sid {
-        return 0;
-    }
-
-    -1 // EPERM - permission denied
 }
 
 /// A user signal to the process `pid` names: the permission check, then
 /// the send (Linux group_send_sig_info). Every user-facing path goes
 /// through this or [`user_thread_send`], so none can forget the check.
-pub(crate) fn user_group_send(pid: u64, sig: u32, info: SendInfo) -> i32 {
+fn user_group_send(pid: u64, sig: u32, info: SendInfo) -> i32 {
     let perm = check_kill_permission(pid, sig);
     if perm != 0 {
         return perm;

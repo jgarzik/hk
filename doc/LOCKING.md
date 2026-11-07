@@ -325,7 +325,7 @@ Global subsystem locks (TASKLIST, fd table `Files`)  ← NOT IRQ-safe;
     fields of its `Task` read or changed under TASKLIST; its mm, fd
     table, fs context, namespaces, name, memory policy and I/O context
     under its alloc_lock (3.1.1); under them only leaves:
-    TaskSignalState.shared_pending (Mutex) → SigHand.action
+    SignalStruct.shared (Mutex) → SigHand.action
     (IrqSpinlock); SignalStruct.rlim (IrqSpinlock leaf, also under
     `Files`; setrlimit/prlimit64 read the old limit, decide (with the
     lock-free capable()) and store in one hold, as Linux do_prlimit
@@ -403,7 +403,7 @@ Tasks (3.1.1, 3.7; Linux tasklist_lock → pidmap_lock → task_lock →
     (spin, thread context; hash chains; in practice a leaf) →
     Task.alloc_lock (spin Mutex, per task, thread context, not
     IRQ-safe; Linux task_lock; one task's at a time) → Task.sig (spin
-    Mutex, per task) → TaskSignalState.shared_pending (spin Mutex) →
+    Mutex, per task) → SignalStruct.shared (spin Mutex) →
     SigHand.action (IrqSpinlock leaf); Task.keyrings, Task.cgroup,
     Task.fput_defer: per-task leaves reached through a TaskRef, never
     under TASKLIST; SignalStruct.posix_timers (never under TASKLIST)
@@ -510,7 +510,7 @@ Other CPUs cannot cause deadlock because:
   taken under them), so holding TASKLIST across a wakeup is allowed,
   though wakers drop it first where they can
 - Leaves may be taken under TASKLIST (a wait queue head,
-  `TaskSignalState.shared_pending` (spin Mutex) -> `SigHand.action`,
+  `SignalStruct.shared` (spin Mutex) -> `SigHand.action`,
   `SignalStruct.rlim`): they take nothing that leads back to it
 - TASKLIST is NEVER acquired from interrupt context (see Section 7.4)
 - Nothing is released under TASKLIST (3.1.1 rule 4): a release could
@@ -1059,7 +1059,7 @@ from `Task.se`.
 |------------|---------|---------------|
 | `alloc_lock` (task_lock) | mm, files, fs, nsproxy, comm, mempolicy, io_context | `Task.alloc_lock` (spin Mutex, per task) |
 | `pi_lock` | Wakeups, state | `Task.pi_lock` (IrqSpinlock, per task; 3.1) |
-| `sighand->siglock` | Signal state, handlers | `Task.sig`, `TaskSignalState.shared_pending` (spin Mutex), `SigHand.action` (IrqSpinlock; 3.7) |
+| `sighand->siglock` | Signal state, handlers | `Task.sig`, `SignalStruct.shared` (spin Mutex), `SigHand.action` (IrqSpinlock; 3.7) |
 | `tasklist_lock` | Task list, parent/child, ptrace links | `TASKLIST` (global spin RwLock) |
 | RCU (`cred`) | Credentials | lock-free for the task, TASKLIST for others |
 
@@ -2702,7 +2702,7 @@ state patterns.
 | `Task.sighand` | `Option<Arc<SigHand>>` under TASKLIST | The task's handler table |
 | `Task.sig` | `spin::Mutex<TaskSignalState>` (per task) | Blocked mask, private pending set, altstack (Linux siglock's per-task part) |
 | `Task.thread_flags` TIF_SIGPENDING | atomic, recomputed under `Task.sig` | Pending-signal flag |
-| `TaskSignalState.shared_pending` | `SharedPending` (`Arc<spin::Mutex<SigPending>>`) | Thread-group pending set |
+| `SignalStruct.shared` | `spin::Mutex<GroupPending>`, reached through `TaskSignalState.shared_pending` (the task's `Arc<SignalStruct>`) | Thread-group pending set and curr_target (Linux signal->shared_pending, curr_target) |
 | `SigPending` list | `Option<Box<SigQueue>>` under the set's lock | Queued siginfo (Linux sigpending.list of struct sigqueue) |
 | `SigHand.action` | `IrqSpinlock<Box<[SigAction]>>` (65 entries) | Signal handler table |
 | `SignalStruct.rlim` | `IrqSpinlock<[RLimit; N]>` | Resource limits (leaf) |
@@ -2740,8 +2740,8 @@ the signal handler table must use an IRQ-safe lock. The `IrqSpinlock` ensures th
 2. **SigHand.action uses IrqSpinlock** - Can be safely accessed from synchronous
    exception handlers (page faults, etc.) and process context; a leaf.
 
-3. **shared_pending before action** - `SigHand.action` may be read
-   under `Task.sig` and `shared_pending` (a send's `sig_ignored`);
+3. **The group set before action** - `SigHand.action` may be read
+   under `Task.sig` and `SignalStruct.shared` (a send's `sig_ignored`);
    dequeueing reads the action after both are dropped.
 
 4. **Never hold IrqSpinlock while acquiring Mutex** - Would violate lock ordering.
@@ -2765,6 +2765,17 @@ the signal handler table must use an IRQ-safe lock. The `IrqSpinlock` ensures th
    a node for a new user, under it; the window is one locked section
    and matters only at the limit.
 
+6. **A group signal's thread is chosen with no lock held** (Linux
+   complete_signal under siglock): after the signal is queued on the
+   group set under the receiver's `Task.sig`, the threads are listed
+   under TASKLIST (read) and dropped, then each candidate's `Task.sig`
+   is taken alone to test wants_signal, and the chosen one's
+   TIF_SIGPENDING is recomputed under it before the wakeup. A thread
+   that blocks a group signal or starts exiting hands it on the same
+   way after dropping its own lock (retarget_shared_pending). A thread
+   that changes its mask between the test and the wakeup sees the
+   signal when it recomputes TIF_SIGPENDING.
+
 #### Lock Order for Signal Operations
 
 ```
@@ -2772,7 +2783,7 @@ the signal handler table must use an IRQ-safe lock. The `IrqSpinlock` ensures th
    ↓
 2. Task.sig (spin Mutex, per task)
    ↓
-3. TaskSignalState.shared_pending (spin Mutex, thread-group pending)
+3. SignalStruct.shared (spin Mutex, thread-group pending)
    ↓
 4. SigHand.action (IrqSpinlock, handler table; leaf)
 ```
@@ -2798,7 +2809,8 @@ child_sighand = parent_sighand.clone();  // Same Arc<SigHand>
 **With CLONE_THREAD:**
 ```rust
 // Also share pending signals (thread group)
-child.shared_pending = parent.shared_pending.clone();  // Same Arc<Mutex<SigPending>>
+// Both reach the group's pending set through the same Arc<SignalStruct>
+child.shared_pending = SharedPending(Some(signal.clone()));
 ```
 
 #### Syscall Patterns
@@ -3511,7 +3523,7 @@ else is taken under it) unless an order is given. "spin" is the
 | `KEYRING_LINK` (sleeping) → `Key.keyring_keys`; `Task.keyrings`, `USER_KEYRINGS`, `Key.payload` → `KEY_DATABASE` → `KEY_USERS` | keys/ | spin (RwLock; `Task.keyrings` Mutex) | a task's thread/process/session keyrings (`Task.keyrings`, reached through a `TaskRef` cloned out of TASKLIST; creating a keyring registers it under it), the per-user keyrings, the key registry and keyrings. Links and keyring slots own keys (`Arc<Key>`); `KEY_DATABASE` holds weak entries (lookups upgrade after releasing it). A key's `Drop` (its last reference) takes `KEY_DATABASE`, then `KEY_USERS` (the per-user quota, a leaf), so no `Arc<Key>` is dropped under either; `Key.keyring_keys` is a leaf: unlinked keys are dropped after it is released, and replaced slots after `Task.keyrings`. `KEYRING_LINK` (Linux keyring_serialise_link_lock) is held by a keyring's link from its cycle check to the link, taken with no spin lock held. `Key.payload` also plays key->sem: instantiate (only from uninstantiated), update, revoke and invalidate change `Key.state` under its write lock, so a revoked key is never revived (the state is read lock-free); and KEYCTL_CHOWN / KEYCTL_SETPERM decide (owner, group, CAP_SYS_ADMIN) and store `Key.uid`/`gid`/`perm` in one write hold, as Linux keyctl_chown_key / keyctl_setperm_key under key->sem; those atomics are read lock-free by the permission checks and describe (Linux reads key->uid unlocked) |
 | `FileLockCtx.flc_lock` (per inode), `locks::BLOCKED` | fs/locks.rs | spin Mutex | an inode's flock and POSIX locks (Linux i_flctx flc_lock; a POSIX owner is a descriptor table's id), leaf but for BLOCKED (flc_lock -> BLOCKED, Linux blocked_lock_lock: each waiting POSIX owner and the owner it waits on, for EDEADLK). A blocked locker sleeps on the inode's wait queue with neither held, interruptibly, until the change count moves |
 | `cmdline::SAVED` | cmdline.rs | spin Mutex | the saved kernel command line (Linux saved_command_line): written once while parsing, before SMP; read in thread context (init's arguments); a leaf |
-| `signal::NO_SHARED` | signal/mod.rs | spin Mutex | the empty shared pending set the boot task (no SignalStruct) reads; locked where a thread group's `shared_pending` would be, same position (Task.sig -> shared_pending) |
+| `signal::NO_SHARED` | signal/mod.rs | spin Mutex | the empty group set a task with no SignalStruct (kernel thread, exited task) reads; nothing is queued on it; locked where `SignalStruct.shared` would be, same position (Task.sig -> shared) |
 | `FS_TYPES`, `CHARDEV_REGISTRY` | fs/superblock.rs, fs/chardev.rs | spin | filesystem types, character device registry |
 | `File.f_lock` | fs/file.rs | spin Mutex | file status flags (Linux f_lock); a leaf, also under `FasyncList.list` (O_ASYNC is set or cleared only with the file's fasync entry) |
 | `FasyncList.list` → `File.f_lock`, `FOwner.st` | io/fasync.rs | sleeping `sync::Mutex` (per object: a pipe's readers and writers, a socket's, a tty's, an inotify group's); `FOwner.st` spin leaf | SIGIO (Linux fasync_lock and RCU readers, fown->lock): `FasyncList.armed` (atomic, written under the lock, read lock-free: Linux kill_fasync's unlocked list test) lets a wakeup with no armed file skip the lock; a list's entries (a file's `FOwner` reference and the armed fd), changed by `fasync_helper` (from `->fasync`; a pipe's under `Pipe.inner`, Linux pipe_fasync) and walked by `kill_fasync`, which sends each entry's signal under it: thread context, no spin lock held (3.7 rule 1). `FOwner.st` (a file's owner pid, type, setter uids and F_SETSIG signal; allocated once per file) is copied under it and released before the send. A file's last close takes it off its lists (`->fasync(-1, off)`) before `->release` |
@@ -3842,7 +3854,7 @@ this is the interrupt-safety invariant:
 | Lock | Location | Type | Reason |
 |------|----------|------|--------|
 | `TASKLIST` | task/percpu.rs | `RwLock` | every task (Linux tasklist_lock) |
-| `TaskSignalState.shared_pending` | signal/mod.rs | `Mutex` | Thread-group pending signals (under TASKLIST) |
+| `SignalStruct.shared` | signal/mod.rs | `Mutex` | Thread-group pending signals and curr_target (under Task.sig) |
 | `Task.alloc_lock` | task/mod.rs | `Mutex` | A task's mm, files, fs, nsproxy, comm, mempolicy, io_context (Linux task_lock; under TASKLIST, over `Task.sig`) |
 | `FsStruct.inner` | fs/fsstruct.rs | `Mutex` | Root, cwd, umask (leaf) |
 | `UCOUNTS` | task/mod.rs | `Mutex` | Per-real-uid counts: RLIMIT_NPROC tasks, RLIMIT_SIGPENDING queued signals (leaf: may be taken under TASKLIST, takes no lock) |

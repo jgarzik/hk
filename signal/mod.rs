@@ -587,8 +587,8 @@ impl Default for AltStack {
 
 /// Per-task signal state (NOT shared via CLONE_SIGHAND)
 ///
-/// Each task has its own blocked mask and private pending signals.
-/// The shared_pending is shared with other threads in the same thread group.
+/// Each task has its own blocked mask and private pending signals;
+/// `shared_pending` reaches its thread group's (in its SignalStruct).
 pub struct TaskSignalState {
     /// Blocked signal mask
     pub blocked: SigSet,
@@ -598,7 +598,7 @@ pub struct TaskSignalState {
     pub saved_sigmask: SigSet,
     /// Pending signals for this task (private)
     pub pending: SigPending,
-    /// Shared pending signals (for thread group)
+    /// Its thread group's pending signals
     pub shared_pending: SharedPending,
     /// Alternate signal stack
     pub altstack: AltStack,
@@ -610,34 +610,52 @@ pub struct TaskSignalState {
     pub trap: Trap,
 }
 
-/// A thread group's shared pending set (Linux signal->shared_pending):
-/// shared by CLONE_THREAD; none for the boot task, which reads as empty
-#[derive(Clone)]
-pub struct SharedPending(Option<Arc<Mutex<SigPending>>>);
+/// A thread group's pending signals (Linux signal->shared_pending) and
+/// the thread that last took one (signal->curr_target)
+pub struct GroupPending {
+    pub pending: SigPending,
+    curr_target: Tid,
+}
 
-/// What the boot task's (absent) shared set reads as
-static NO_SHARED: Mutex<SigPending> = Mutex::new(SigPending::new());
-
-impl SharedPending {
-    /// A new set where failure cannot be reported (the boot-time init
-    /// task, and the exiting task's state handed back by `mem::take`)
-    pub fn new() -> Self {
-        Self(Some(arc_nofail(Mutex::new(SigPending::new()))))
-    }
-
-    /// A new set, or ENOMEM
-    pub fn try_new() -> Result<Self, KernelError> {
-        Ok(Self(Some(try_arc(Mutex::new(SigPending::new()))?)))
-    }
-
-    pub fn lock(&self) -> crate::sync::spin::MutexGuard<'_, SigPending> {
-        self.0.as_deref().unwrap_or(&NO_SHARED).lock()
+impl GroupPending {
+    const fn new() -> Self {
+        Self {
+            pending: SigPending::new(),
+            curr_target: 0,
+        }
     }
 }
 
-impl Default for SharedPending {
-    fn default() -> Self {
-        Self::new()
+impl core::ops::Deref for GroupPending {
+    type Target = SigPending;
+    fn deref(&self) -> &SigPending {
+        &self.pending
+    }
+}
+
+impl core::ops::DerefMut for GroupPending {
+    fn deref_mut(&mut self) -> &mut SigPending {
+        &mut self.pending
+    }
+}
+
+/// A task's thread group, for its shared pending set (Linux t->signal):
+/// none for a kernel thread or an exited task, which read as empty
+#[derive(Clone, Default)]
+pub struct SharedPending(Option<Arc<SignalStruct>>);
+
+/// What an absent group's set reads as; nothing is ever queued on it
+static NO_SHARED: Mutex<GroupPending> = Mutex::new(GroupPending::new());
+
+impl SharedPending {
+    /// The group's set
+    pub fn lock(&self) -> crate::sync::spin::MutexGuard<'_, GroupPending> {
+        self.0.as_ref().map_or(&NO_SHARED, |s| &s.shared).lock()
+    }
+
+    /// The group's set, if the task has a group
+    fn group(&self) -> Option<crate::sync::spin::MutexGuard<'_, GroupPending>> {
+        self.0.as_ref().map(|s| s.shared.lock())
     }
 }
 
@@ -655,14 +673,10 @@ impl TaskSignalState {
         }
     }
 
-    /// Create new task signal state (infallible: see `SharedPending::new`)
+    /// A task's state with no group yet (a kernel thread; a user task
+    /// gets its group from `fork_signal` or `init_task_signal`)
     pub fn new() -> Self {
-        Self::with_shared(SharedPending::new())
-    }
-
-    /// Create new task signal state, or ENOMEM
-    pub fn try_new() -> Result<Self, KernelError> {
-        Ok(Self::with_shared(SharedPending::try_new()?))
+        Self::with_shared(SharedPending(None))
     }
 
     fn with_shared(shared_pending: SharedPending) -> Self {
@@ -699,7 +713,7 @@ impl Default for TaskSignalState {
 // Task signal accessors - uses Task struct fields directly via TASKLIST
 // =============================================================================
 
-use crate::task::percpu::TASKLIST;
+use crate::task::percpu::{TASKLIST, TaskRef};
 
 // =============================================================================
 // Task Signal APIs
@@ -719,10 +733,11 @@ pub fn init_task_signal(tid: Tid, sighand: Arc<SigHand>) {
         s.rlim.lock()[r as usize] = RLimit::new(half, half);
     }
     let s = arc_nofail(s);
+    let state = TaskSignalState::with_shared(SharedPending(Some(s.clone())));
     let mut table = TASKLIST.write();
     if let Some(mut task) = table.get_mut(tid) {
         task.sighand = Some(sighand);
-        *task.task.sig.lock() = TaskSignalState::new();
+        *task.task.sig.lock() = state;
         task.task.set_sigpending(false);
         task.task.set_cpu_group(&s);
         task.signal = Some(s);
@@ -787,10 +802,81 @@ where
     } else {
         TASKLIST.read().task(tid)?
     };
+    Some(with_sig(&t, f))
+}
+
+/// Run `f` on task `t`'s signal state under its Task.sig, then
+/// recompute its TIF_SIGPENDING; group signals it newly blocked go to
+/// another thread (Linux __set_task_blocked: retarget_shared_pending)
+fn with_sig<F, R>(t: &TaskRef, f: F) -> R
+where
+    F: FnOnce(&crate::task::Task, &mut TaskSignalState) -> R,
+{
     let mut s = t.sig.lock();
-    let r = f(&t, &mut s);
+    let old = s.blocked;
+    let r = f(t, &mut s);
+    let newly = s.blocked.subtract(&old);
+    let moved = if newly.any() {
+        s.shared_pending.lock().signal.intersect(&newly)
+    } else {
+        SigSet::EMPTY
+    };
     t.set_sigpending(s.has_deliverable_signals());
-    Some(r)
+    drop(s);
+    if moved.any() {
+        retarget(t, moved);
+    }
+    r
+}
+
+/// Group signals `which` that `t` will not take (blocked, or exiting):
+/// wake other threads that will (Linux retarget_shared_pending)
+fn retarget(t: &TaskRef, which: SigSet) {
+    let others: alloc::vec::Vec<TaskRef> = {
+        let table = TASKLIST.read();
+        table
+            .threads(t.pid)
+            .filter(|u| u.task.tid() != t.tid())
+            .filter_map(|u| table.task(u.task.tid()))
+            .collect()
+    };
+    let mut left = which;
+    for u in others {
+        if u.has_flag(crate::task::pf::EXITING) {
+            continue;
+        }
+        let blocked = u.sig.lock().blocked;
+        if left.subtract(&blocked).is_empty() {
+            continue;
+        }
+        // It takes those it does not block
+        left = left.intersect(&blocked);
+        if !u.sigpending() {
+            with_sig(&u, |_, _| ());
+            signal_wake_task(&u, crate::task::percpu::WakeMode::Interruptible);
+        }
+        if left.is_empty() {
+            break;
+        }
+    }
+}
+
+/// The current thread starts its exit: group signals it would have
+/// taken go to another thread (Linux exit_signals)
+pub fn exit_signals() {
+    let me = crate::task::percpu::current();
+    if !me.sigpending() {
+        return;
+    }
+    let me = crate::task::percpu::task_ref(&me);
+    let which = {
+        let s = me.sig.lock();
+        let shared = s.shared_pending.lock().signal;
+        shared.subtract(&s.blocked)
+    };
+    if which.any() {
+        retarget(&me, which);
+    }
 }
 
 /// A child's shared signal objects, built by `fork_signal` before the
@@ -831,7 +917,7 @@ pub fn fork_signal(
             parent.and_then(|p| p.sighand.clone()),
             parent.map(|p| {
                 let s = p.task.sig.lock();
-                (s.blocked, s.shared_pending.clone(), s.trap)
+                (s.blocked, s.trap)
             }),
         )
     };
@@ -857,30 +943,25 @@ pub fn fork_signal(
         sighand
     };
 
+    // Clone or share SignalStruct (contains rlimits and the shared
+    // pending set): CLONE_THREAD shares it
+    let (signal, joined) = fork_signal_struct(parent_tid, share_pending)?;
+
     // Clone per-task signal state
-    let child_state = if let Some((blocked, shared, trap)) = parent_state {
-        TaskSignalState {
+    let shared_pending = SharedPending(Some(signal.clone()));
+    let child_state = match parent_state {
+        Some((blocked, trap)) => TaskSignalState {
             blocked, // Inherit blocked mask
             saved_sigmask: SigSet::EMPTY,
             pending: SigPending::new(), // Fresh private pending
-            shared_pending: if share_pending {
-                // CLONE_THREAD: share thread-group pending
-                shared
-            } else {
-                SharedPending::try_new()?
-            },
+            shared_pending,
             altstack: AltStack::new(), // Child starts with no altstack
             real_blocked: SigSet::EMPTY,
             // The thread struct is copied (Linux arch_dup_task_struct)
             trap,
-        }
-    } else {
-        TaskSignalState::try_new()?
+        },
+        None => TaskSignalState::with_shared(shared_pending),
     };
-
-    // Clone or share SignalStruct (contains rlimits)
-    // CLONE_THREAD (share_pending) implies threads share SignalStruct
-    let (signal, joined) = fork_signal_struct(parent_tid, share_pending)?;
     let fork = ForkSignal {
         sighand: child_sighand,
         signal,
@@ -1106,32 +1187,35 @@ pub enum PidType {
     Tgid,
 }
 
-/// The receiver of a send, read under TASKLIST: a kernel thread, the
-/// global init, its group exiting, its real uid and RLIMIT_SIGPENDING
+/// The receiver of a send, read under TASKLIST while it is still listed
+/// (a reaped task is gone, whatever reuses its number): a kernel
+/// thread, the global init, its group exiting, in a ptrace stop, its
+/// real uid, RLIMIT_SIGPENDING and handlers
 struct Target {
     kthread: bool,
     init: bool,
     group_exit: bool,
+    stopped: bool,
     uid: crate::task::Uid,
     limit: u64,
+    sighand: Option<Arc<SigHand>>,
 }
 
-fn target(tid: Tid) -> Option<Target> {
+fn target(t: &TaskRef) -> Option<Target> {
     let table = TASKLIST.read();
-    let t = table.get(tid)?;
-    let limit = t
-        .signal
-        .as_ref()
-        .and_then(|s| s.get_rlimit(RLIMIT_SIGPENDING));
+    let v = table
+        .get(t.tid())
+        .filter(|v| core::ptr::eq(v.task, Arc::as_ptr(t)))?;
+    let sig = v.signal.as_ref();
+    let limit = sig.and_then(|s| s.get_rlimit(RLIMIT_SIGPENDING));
     Some(Target {
-        kthread: t.task.has_flag(crate::task::pf::KTHREAD),
-        init: t.task.pid == 1,
-        group_exit: t
-            .signal
-            .as_ref()
-            .is_some_and(|s| matches!(s.group_exit(), GroupExit::Exit(_))),
-        uid: t.cred_arc().uid,
+        kthread: v.task.has_flag(crate::task::pf::KTHREAD),
+        init: v.task.pid == 1,
+        group_exit: sig.is_some_and(|s| matches!(s.group_exit(), GroupExit::Exit(_))),
+        stopped: matches!(v.state, crate::task::TaskState::Traced(_)),
+        uid: v.cred_arc().uid,
         limit: limit.map_or(0, |r| r.rlim_cur),
+        sighand: v.sighand.clone(),
     })
 }
 
@@ -1141,37 +1225,43 @@ enum Sent {
     Dropped,
     /// No entry for an RT signal that needed one
     Overflow,
-    /// Pending: (deliverable now, fatal on arrival unless awaited)
-    Queued(bool, bool),
+    /// Pending; the receiver itself wants it (Linux wants_signal)
+    Queued(bool),
 }
 
-/// send_sig_info; `force` (a kernel-forced signal, Linux force_sig) is
-/// delivered to the global init even with its action SIG_DFL
+/// send_sig_info by number
 fn send_signal_force(tid: Tid, sig: u32, info: SendInfo, ty: PidType, force: bool) -> i32 {
-    check_send_context();
-    if sig == 0 {
-        // Signal 0 is null signal - just check if task exists
-        let table = TASKLIST.read();
-        return if table.iter().any(|t| t.task.tid() == tid) {
-            0
-        } else {
-            -3 // ESRCH
-        };
+    let me = crate::task::percpu::current();
+    let t = if me.tid() == tid && tid != 0 {
+        Some(crate::task::percpu::task_ref(&me))
+    } else {
+        TASKLIST.read().task(tid)
+    };
+    match t {
+        Some(t) => send_task(&t, sig, info, ty, force),
+        None => -3, // ESRCH
     }
+}
 
+/// Send `sig` with `info` to task `t`, for it (`ty` Pid) or its thread
+/// group (Linux send_signal_locked, complete_signal); `force` (a
+/// kernel-forced signal, Linux force_sig) is delivered to the global
+/// init even with its action SIG_DFL
+fn send_task(t: &TaskRef, sig: u32, info: SendInfo, ty: PidType, force: bool) -> i32 {
+    check_send_context();
     if sig > 64 {
         return -22; // EINVAL
     }
-
     // Kernel threads ignore every signal (Linux ignore_signals in
     // kthreadd): they are processes now (pid == tid), reachable by
     // kill(-1) and kill(pid). One lookup also finds the global init.
-    let Some(tg) = target(tid) else {
+    let Some(tg) = target(t) else {
         return -3; // ESRCH
     };
-    // A dying group takes no more signals (Linux prepare_signal:
-    // SIGNAL_GROUP_EXIT; its threads have SIGKILL)
-    if tg.kthread || tg.group_exit {
+    // Signal 0 only checks the task is there; a dying group takes no
+    // more signals (Linux prepare_signal: SIGNAL_GROUP_EXIT; its threads
+    // have SIGKILL)
+    if sig == 0 || tg.kthread || tg.group_exit {
         return 0;
     }
     // A forced signal whose action is SIG_DFL (a blocked or ignored one
@@ -1179,7 +1269,8 @@ fn send_signal_force(tid: Tid, sig: u32, info: SendInfo, ty: PidType, force: boo
     // force_sig_info_to_task); one init handles leaves it protected. The
     // flag is read once here.
     let dfl = || {
-        get_task_sighand(tid)
+        tg.sighand
+            .as_ref()
             .and_then(|h| h.get_action(sig))
             .is_none_or(|a| a.handler == SigHandler::Default)
     };
@@ -1203,81 +1294,175 @@ fn send_signal_force(tid: Tid, sig: u32, info: SendInfo, ty: PidType, force: boo
             info.override_rlimit(sig),
         )
     };
-    let sighand = get_task_sighand(tid);
-    let sent = with_task_sig(tid, |t, state| {
-        send_locked(t, state, sighand.as_ref(), sig, init, &info, ty, &mut q)
+    let sighand = tg.sighand.as_ref();
+    let stopped = tg.stopped;
+    let sent = with_sig(t, |t, state| {
+        let to = Send {
+            sig,
+            init,
+            info: &info,
+            ty,
+            stopped,
+        };
+        send_locked(t, state, sighand, &to, &mut q)
     });
     drop(q);
 
-    let (deliverable, may_kill) = match sent {
-        None => return -3, // ESRCH
-        Some(Sent::Dropped) => return 0,
-        Some(Sent::Overflow) => return -11, // EAGAIN
-        Some(Sent::Queued(d, k)) => (d, k),
+    let wants = match sent {
+        Sent::Dropped => return 0,
+        Sent::Overflow => return -11, // EAGAIN
+        Sent::Queued(w) => w,
     };
-    if may_kill && fatal(sighand.as_ref(), sig) {
-        group_kill(tid, sig);
-    }
-
     // Signalfd readers of the target's handler table recheck (Linux
     // signalfd_notify)
-    if let Some(h) = &sighand {
+    if let Some(h) = sighand {
         h.signalfd_wq.wake_all();
     }
-
-    if deliverable {
-        use crate::task::percpu::WakeMode;
-        let mode = if sig == SIGKILL {
-            WakeMode::Fatal
-        } else {
-            WakeMode::Interruptible
-        };
-        signal_wake_up(tid, mode);
-    }
-
+    complete_signal(t, sig, ty, wants, sighand);
     0
 }
 
-/// Queue `sig` for task `t` under its Task.sig (Linux
-/// __send_signal_locked): dropped if ignored (`init`: the global init's
-/// protection applies) or a non-RT signal already pending, else marked
+/// What a send is, for its locked part
+struct Send<'a> {
+    sig: u32,
+    /// The global init's protection applies
+    init: bool,
+    info: &'a SendInfo,
+    ty: PidType,
+    /// The receiver is in a ptrace stop
+    stopped: bool,
+}
+
+/// Queue `to.sig` for task `t` under its Task.sig (Linux
+/// __send_signal_locked), on its own set or its group's: dropped if
+/// ignored or a non-RT signal already pending there, else marked
 /// pending with entry `q` queued, which it takes. A signal for an
 /// exiting thread itself is dropped (its queue was flushed: Linux
-/// task_can_queue_signal); one for its group gets no entry. A send
+/// task_can_queue_signal), as is one for a task with no group. A send
 /// whose entry could not be had goes on without; an RT signal a user
 /// queued then fails.
-#[expect(clippy::too_many_arguments)]
 fn send_locked(
     t: &crate::task::Task,
     state: &mut TaskSignalState,
     sighand: Option<&Arc<SigHand>>,
-    sig: u32,
-    init: bool,
-    info: &SendInfo,
-    ty: PidType,
+    to: &Send<'_>,
     q: &mut Option<Box<SigQueue>>,
 ) -> Sent {
+    let sig = to.sig;
     let exiting = t.has_flag(crate::task::pf::EXITING);
-    if exiting && ty == PidType::Pid {
+    if exiting && to.ty == PidType::Pid {
         return Sent::Dropped;
     }
-    if sig_ignored(state, sighand, sig) || (init && init_ignores(state, sighand, sig)) {
+    if sig_ignored(state, sighand, sig) || (to.init && init_ignores(state, sighand, sig)) {
         return Sent::Dropped;
     }
-    if state.pending.legacy(sig) {
+    // Linux wants_signal, before this signal marks it
+    let wants = !state.blocked.contains(sig)
+        && !exiting
+        && (sig == SIGKILL || (!to.stopped && (t.se.on_cpu() || !t.sigpending())));
+    let TaskSignalState {
+        pending,
+        shared_pending,
+        ..
+    } = state;
+    let mut group;
+    let pending = match to.ty {
+        PidType::Pid => pending,
+        PidType::Tgid => match shared_pending.group() {
+            Some(g) => {
+                group = g;
+                &mut group.pending
+            }
+            None => return Sent::Dropped,
+        },
+    };
+    if pending.legacy(sig) {
         return Sent::Dropped;
     }
-    if !exiting {
-        match q.take() {
-            Some(e) => state.pending.queue(e),
-            None if info.must_queue(sig) => return Sent::Overflow,
-            None => {}
-        }
+    match q.take() {
+        Some(e) => pending.queue(e),
+        None if to.info.must_queue(sig) => return Sent::Overflow,
+        None => {}
     }
-    state.pending.add(sig);
-    // Deliverable now; fatal on arrival unless awaited in sigtimedwait
-    let d = !state.blocked.contains(sig);
-    Sent::Queued(d, d && !state.real_blocked.contains(sig))
+    pending.add(sig);
+    Sent::Queued(wants)
+}
+
+/// Find a thread to take `sig` just queued for `p` (Linux
+/// complete_signal): `p` if it wants it, else for a group signal the
+/// next thread from the group's curr_target that does; a fatal one
+/// ends the group, else the chosen thread is woken
+fn complete_signal(
+    p: &TaskRef,
+    sig: u32,
+    ty: PidType,
+    p_wants: bool,
+    sighand: Option<&Arc<SigHand>>,
+) {
+    let chosen = if p_wants {
+        Some(p.clone())
+    } else if ty == PidType::Pid {
+        None
+    } else {
+        pick_thread(p, sig)
+    };
+    let Some(c) = chosen else {
+        return;
+    };
+    let awaited = c.sig.lock().real_blocked.contains(sig);
+    if fatal(sighand, sig) && !awaited {
+        group_kill(p.tid(), sig);
+    }
+    if !Arc::ptr_eq(&c, p) {
+        with_sig(&c, |_, _| ());
+    }
+    use crate::task::percpu::WakeMode;
+    let mode = if sig == SIGKILL {
+        WakeMode::Fatal
+    } else {
+        WakeMode::Interruptible
+    };
+    signal_wake_task(&c, mode);
+}
+
+/// The thread of `p`'s group, from its curr_target on, that wants
+/// `sig` (Linux complete_signal's loop): it becomes curr_target
+fn pick_thread(p: &TaskRef, sig: u32) -> Option<TaskRef> {
+    let threads: alloc::vec::Vec<(TaskRef, bool)> = {
+        let table = TASKLIST.read();
+        table
+            .threads(p.pid)
+            .filter_map(|v| {
+                let stopped = matches!(v.state, crate::task::TaskState::Traced(_));
+                table.task(v.task.tid()).map(|t| (t, stopped))
+            })
+            .collect()
+    };
+    if threads.len() < 2 {
+        return None;
+    }
+    let cur = p.sig.lock().shared_pending.lock().curr_target;
+    let start = threads
+        .iter()
+        .position(|(t, _)| t.tid() == cur)
+        .unwrap_or(0);
+    let n = threads.len();
+    let (t, _) = (0..n)
+        .map(|i| &threads[(start + i) % n])
+        .find(|(t, stopped)| wants_signal(t, *stopped, sig))?;
+    p.sig.lock().shared_pending.lock().curr_target = t.tid();
+    Some(t.clone())
+}
+
+/// `t` should be woken for `sig` (Linux wants_signal)
+fn wants_signal(t: &crate::task::Task, stopped: bool, sig: u32) -> bool {
+    if t.sig.lock().blocked.contains(sig) || t.has_flag(crate::task::pf::EXITING) {
+        return false;
+    }
+    if sig == SIGKILL {
+        return true;
+    }
+    !stopped && (t.se.on_cpu() || !t.sigpending())
 }
 
 /// A signal for `tid` is deliverable (Linux signal_wake_up_state): wake
@@ -1288,8 +1473,12 @@ fn signal_wake_up(tid: Tid, mode: crate::task::percpu::WakeMode) {
     let Some(t) = crate::task::percpu::TASKLIST.read().task(tid) else {
         return;
     };
-    if !crate::task::percpu::try_to_wake_up(&t, mode) {
-        crate::task::percpu::kick_process(&t);
+    signal_wake_task(&t, mode);
+}
+
+fn signal_wake_task(t: &TaskRef, mode: crate::task::percpu::WakeMode) {
+    if !crate::task::percpu::try_to_wake_up(t, mode) {
+        crate::task::percpu::kick_process(t);
     }
 }
 
@@ -1317,22 +1506,60 @@ pub fn send_signal_to_process(pid: Pid, sig: u32) -> i32 {
 
 /// [`send_signal_to_process`] with `info` (Linux kill_proc_info)
 pub fn kill_proc_info(pid: Pid, sig: u32, info: SendInfo) -> i32 {
-    let tid = {
-        let table = crate::task::percpu::TASKLIST.read();
-        let leader = table.get(pid);
-        match leader {
-            Some(l) if task_live(&l) => Some(l.task.tid()),
-            _ => table
-                .threads(pid)
-                .find(task_live)
-                .or(leader)
-                .map(|t| t.task.tid()),
-        }
+    let t = {
+        let table = TASKLIST.read();
+        group_task(&table, table.get(pid))
     };
-
-    match tid {
-        Some(tid) => send_signal_force(tid, sig, info, PidType::Tgid, false),
+    match t {
+        Some(t) => send_task(&t, sig, info, PidType::Tgid, false),
         None => -3, // ESRCH - no such process
+    }
+}
+
+/// The task a group signal to the process `leader` heads is checked
+/// against: the leader, or a thread still running once it has exited
+/// (Linux takes the leader; its zombie keeps the group's handlers,
+/// hk's does not)
+fn group_task(
+    table: &crate::task::percpu::GlobalTaskTable,
+    leader: Option<crate::task::percpu::TaskView<'_>>,
+) -> Option<TaskRef> {
+    let l = leader?;
+    let t = if task_live(&l) {
+        l.task.tid()
+    } else {
+        table
+            .threads(l.task.pid)
+            .find(task_live)
+            .map_or(l.task.tid(), |t| t.task.tid())
+    };
+    table.task(t)
+}
+
+/// `sig` with `info` to the process struct pid `pid` names, after
+/// `check` of it allows it (Linux kill_pid_info: the struct pid, never
+/// a number a reaped process freed for reuse)
+pub fn kill_pid_info(
+    pid: &crate::task::pid::Pid,
+    sig: u32,
+    info: SendInfo,
+    check: impl Fn(&crate::task::percpu::TaskView<'_>) -> i32,
+) -> i32 {
+    let t = {
+        let table = TASKLIST.read();
+        let leader = table.pid_tid(pid).and_then(|tid| table.get(tid));
+        let Some(l) = leader else {
+            return -3; // ESRCH
+        };
+        let e = check(&l);
+        if e != 0 {
+            return e;
+        }
+        group_task(&table, Some(l))
+    };
+    match t {
+        Some(t) => send_task(&t, sig, info, PidType::Tgid, false),
+        None => -3,
     }
 }
 
@@ -1658,6 +1885,9 @@ pub struct SignalStruct {
     child_times: [AtomicU64; 2],
     /// Process CPU timers' state (Linux signal->cputimer)
     pub cputimer: crate::time::cpu_timer::GroupCputimer,
+    /// The group's pending signals (Linux signal->shared_pending, and
+    /// curr_target): spin, under the receiving thread's Task.sig
+    shared: Mutex<GroupPending>,
 }
 
 const GROUP_EXIT: u64 = 1 << 63;
@@ -1754,6 +1984,7 @@ impl SignalStruct {
             dead_times: [AtomicU64::new(0), AtomicU64::new(0)],
             child_times: [AtomicU64::new(0), AtomicU64::new(0)],
             cputimer: crate::time::cpu_timer::GroupCputimer::new(),
+            shared: Mutex::new(GroupPending::new()),
         }
     }
 
@@ -1917,6 +2148,7 @@ impl SignalStruct {
             dead_times: [AtomicU64::new(0), AtomicU64::new(0)],
             child_times: [AtomicU64::new(0), AtomicU64::new(0)],
             cputimer: crate::time::cpu_timer::GroupCputimer::new(),
+            shared: Mutex::new(GroupPending::new()),
         })
     }
 }

@@ -19,6 +19,8 @@
 //!   its pid and the stop signal
 //! - sigaction to SIG_IGN, or SIG_DFL of an ignore-default signal,
 //!   discards it pending, blocked or not, queued instances included
+//! - a process-directed signal the leader blocks is taken by another
+//!   thread (Linux shared_pending, complete_signal's thread choice)
 
 use super::helpers::{host_mode, print, print_num, println, read_file, skip};
 use hk_syscall::{
@@ -54,6 +56,7 @@ pub fn run_tests() {
     test_mq_info();
     test_trapped_info();
     test_ignore_flush();
+    test_group_thread();
 }
 
 fn bit(sig: u32) -> u64 {
@@ -568,6 +571,75 @@ fn test_ignore_flush() {
         print_num(after as i64);
         print(b" sigq=");
         print_num(q);
+        println(b"");
+    }
+}
+
+static GROUP_GOT: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
+static GROUP_UP: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
+static mut GROUP_CTID: u32 = 0;
+#[repr(C, align(16))]
+struct GroupStack([u8; 16384]);
+static mut GROUP_STACK: GroupStack = GroupStack([0; 16384]);
+
+extern "C" fn group_handler(_: i32) {
+    GROUP_GOT.store(hk_syscall::sys_gettid(), core::sync::atomic::Ordering::Release);
+}
+
+/// The second thread: SIGUSR1 unblocked, it waits for a signal until
+/// the handler ran
+extern "C" fn group_waiter(_: u64) -> ! {
+    use core::sync::atomic::Ordering;
+    GROUP_UP.store(hk_syscall::sys_gettid(), Ordering::Release);
+    let none = 0u64;
+    while GROUP_GOT.load(Ordering::Acquire) == 0 {
+        hk_syscall::sys_rt_sigsuspend(&none as *const u64 as u64, 8);
+    }
+    sys_exit(0)
+}
+
+/// In a child: the leader blocks SIGUSR1, a second thread does not;
+/// kill() of the process runs the handler on that thread
+fn test_group_thread() {
+    use core::sync::atomic::Ordering;
+    let child = sys_fork();
+    if child == 0 {
+        let act: [u64; 4] = [
+            group_handler as *const () as u64,
+            SA_RESTORER,
+            super::signals::restorer_addr(),
+            0,
+        ];
+        sys_rt_sigaction(SIGUSR1, act.as_ptr() as u64, 0, 8);
+        // SAFETY: the thread's own stack and tid word, used by it alone
+        let tid = unsafe {
+            let top = (&raw mut GROUP_STACK as *mut u8).add(16384) as u64;
+            let ctid = &raw mut GROUP_CTID;
+            core::ptr::write_volatile(ctid, 1);
+            super::fork_mm::spawn_thread(top, group_waiter, 0, ctid)
+        };
+        block(bit(SIGUSR1));
+        while GROUP_UP.load(Ordering::Acquire) == 0 {
+            hk_syscall::sys_sched_yield();
+        }
+        sys_kill(sys_getpid(), SIGUSR1);
+        let t0 = super::sk::now_ms();
+        while GROUP_GOT.load(Ordering::Acquire) == 0 {
+            if super::sk::now_ms() - t0 > 5000 {
+                hk_syscall::sys_exit_group(2);
+            }
+            hk_syscall::sys_sched_yield();
+        }
+        let ok = GROUP_GOT.load(Ordering::Acquire) == tid && super::fork_mm::join(&raw mut GROUP_CTID);
+        hk_syscall::sys_exit_group(if ok { 0 } else { 1 });
+    }
+    let mut st = 0i32;
+    sys_wait4(child, &mut st, 0, 0);
+    if st == 0 {
+        println(b"SIGQUEUE_GROUP_THREAD:OK");
+    } else {
+        print(b"SIGQUEUE_GROUP_THREAD:FAIL status=");
+        print_num(st as i64);
         println(b"");
     }
 }
