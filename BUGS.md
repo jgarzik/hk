@@ -502,6 +502,14 @@ detaches it, its real parent is not told nor can wait for it (Linux
 wait_task_zombie / __ptrace_detach: do_notify_parent to the real
 parent).
 
+A traced zombie thread is never released: neither its tracer's wait
+nor `exit_ptrace` frees it (Linux wait_task_zombie, __ptrace_detach
+release_task). wait4 therefore still tests `group_alive` (zombie
+threads ignored), not the `group_pending` the notice paths use.
+
+A subreaper is found only if its ancestor task itself is alive; Linux
+find_new_reaper takes any live thread of a subreaper process.
+
 ## No vDSO
 
 **Location**: `task/exec.rs`, `arch/aarch64/signal.rs`
