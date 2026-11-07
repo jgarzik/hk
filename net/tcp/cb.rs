@@ -683,6 +683,9 @@ pub struct TcpCb {
     /// Karn: (sequence that must be acknowledged, send time)
     pub(super) rtt_seq: Option<(u32, u64)>,
     pub(super) syn_rtx: bool,
+    /// A listener's child: in SYN_RECEIVED it is Linux's request sock
+    /// (tcp_check_req rules), not a simultaneous open
+    pub(super) passive: bool,
     pub(super) tmr: Option<(Tmr, u64)>,
     /// TIME_WAIT 2MSL or orphan FIN_WAIT_2 deadline
     pub(super) wait_at: Option<u64>,
@@ -787,6 +790,7 @@ impl TcpCb {
             probes: 0,
             rtt_seq: None,
             syn_rtx: false,
+            passive: false,
             tmr: None,
             wait_at: None,
             keep_at: None,
@@ -857,6 +861,7 @@ impl TcpCb {
         self.ts_ok = self.cfg.ts != 0 && syn.ts.is_some();
         self.syn_rcvd(syn, now);
         self.state = TcpState::SynReceived;
+        self.passive = true;
         out.segs.push(self.syn_seg());
         self.arm_rtx(now);
     }

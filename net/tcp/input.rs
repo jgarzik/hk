@@ -185,14 +185,18 @@ impl TcpCb {
 
     /// Synchronized states and SYN_RECEIVED
     fn rcv_synced(&mut self, s: &SegIn<'_>, now: u64, out: &mut Out) {
-        if self.state == TcpState::SynReceived
+        let req = self.passive && self.state == TcpState::SynReceived;
+        if req
             && s.has(flags::SYN)
             && !s.has(flags::ACK | flags::RST)
             && s.seq == self.irs
+            && !self.paws_reject(s)
         {
-            // Duplicate SYN: the SYN-ACK was lost (Linux tcp_check_req)
-            let syn = self.syn_seg();
-            out.segs.push(syn);
+            // Retransmitted SYN: the SYN-ACK was lost (Linux
+            // tcp_check_req, rate limited)
+            if !self.oow_recent() {
+                self.rtx_synack(now, out);
+            }
             return;
         }
         if self.paws_reject(s) {
@@ -220,7 +224,14 @@ impl TcpCb {
             return;
         }
         if s.has(flags::SYN) {
-            self.challenge_ack(out); // RFC 5961 4.2
+            if req {
+                // A new SYN in window: reset, drop the request (Linux
+                // tcp_check_req embryonic_reset)
+                out.segs.extend(super::output::reset_for(s));
+                self.set_closed(out);
+            } else {
+                self.challenge_ack(out); // RFC 5961 4.2
+            }
             return;
         }
         if !s.has(flags::ACK) {

@@ -185,6 +185,17 @@ impl TcpCb {
         self.arm_rtx(now);
     }
 
+    /// Resend the SYN-ACK for a retransmitted SYN and restart the
+    /// retransmission timer (Linux tcp_rtx_synack, and tcp_check_req's
+    /// request timer restart)
+    pub(super) fn rtx_synack(&mut self, now: u64, out: &mut Out) {
+        self.syn_rtx = true;
+        self.stats.total_retrans += 1;
+        let s = self.syn_seg();
+        out.segs.push(s);
+        self.arm_rtx(now);
+    }
+
     /// An orphan holding send data while TCP memory is past its hard
     /// limit is dropped (Linux tcp_out_of_resources, its memory half):
     /// with a reset when `reset`, when it sent within TIME_WAIT's length,
