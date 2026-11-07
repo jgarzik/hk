@@ -18,7 +18,8 @@
 //! - a tracee's ptrace stop sends its tracer SIGCHLD with CLD_TRAPPED,
 //!   its pid and the stop signal
 //! - sigaction to SIG_IGN, or SIG_DFL of an ignore-default signal,
-//!   discards it pending, blocked or not, queued instances included
+//!   discards it pending, blocked or not, queued instances included,
+//!   also from the group's set once the main thread has exited
 //! - a process-directed signal the leader blocks is taken by another
 //!   thread (Linux shared_pending, complete_signal's thread choice)
 //! - a POSIX timer's signal is SI_TIMER with si_tid and si_value; an
@@ -81,6 +82,7 @@ pub fn run_tests() {
     test_mq_info();
     test_trapped_info();
     test_ignore_flush();
+    test_ignore_flush_no_leader();
     test_group_thread();
     test_timer_info();
     test_timer_overrun();
@@ -603,6 +605,51 @@ fn test_ignore_flush() {
         print_num(after as i64);
         print(b" sigq=");
         print_num(q);
+        println(b"");
+    }
+}
+
+/// The second thread once the main thread has exited: a blocked
+/// process-directed SIGUSR1 is pending, SIG_IGN discards it
+extern "C" fn ign_after_leader(_: u64) -> ! {
+    const SIG_IGN: u64 = 1;
+    sleep_ms(100);
+    block(bit(SIGUSR1));
+    sys_kill(sys_getpid(), SIGUSR1);
+    let before = pending() & bit(SIGUSR1);
+    let ign: [u64; 4] = [SIG_IGN, 0, 0, 0];
+    sys_rt_sigaction(SIGUSR1, ign.as_ptr() as u64, 0, 8);
+    let after = pending() & bit(SIGUSR1);
+    let code = match (before != 0, after == 0) {
+        (true, true) => 0,
+        (false, _) => 1,
+        (true, false) => 2,
+    };
+    hk_syscall::sys_exit_group(code)
+}
+
+/// In a child whose main thread exited (a raw thread exit): SIG_IGN
+/// flushes the group's pending set (Linux do_sigaction:
+/// flush_sigqueue_mask on signal->shared_pending)
+fn test_ignore_flush_no_leader() {
+    let child = sys_fork();
+    if child == 0 {
+        // SAFETY: the thread's own stack and tid word, used by it alone
+        unsafe {
+            let top = (&raw mut GROUP_STACK as *mut u8).add(16384) as u64;
+            let ctid = &raw mut GROUP_CTID;
+            core::ptr::write_volatile(ctid, 1);
+            super::fork_mm::spawn_thread(top, ign_after_leader, 0, ctid);
+        }
+        sys_exit(0);
+    }
+    let mut st = 0i32;
+    sys_wait4(child, &mut st, 0, 0);
+    if st == 0 {
+        println(b"SIGQUEUE_IGN_FLUSH_NO_LEADER:OK");
+    } else {
+        print(b"SIGQUEUE_IGN_FLUSH_NO_LEADER:FAIL status=");
+        print_num(st as i64);
         println(b"");
     }
 }

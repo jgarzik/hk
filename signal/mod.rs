@@ -1063,18 +1063,18 @@ pub fn exec_signals() -> Result<(), KernelError> {
 pub fn flush_group_signal(sig: u32) {
     let mut mask = SigSet::EMPTY;
     mask.add(sig);
+    // The group's set through its SignalStruct, not a thread's view of
+    // it (an exited leader's reads as empty); freed after the lock
+    if let Some(s) = get_task_signal_struct(crate::task::percpu::current_tid()) {
+        let _gone = s.shared.lock().flush_mask(&mask);
+    }
     let tids = crate::task::percpu::GlobalTaskTable::collect_threads(
         crate::task::percpu::current_pid(),
         |_, t| Some(t.task.tid()),
     );
-    let mut shared_done = false;
     for tid in tids {
-        // Freed here, after the thread's locks are dropped
-        let _gone = with_task_signal_state(tid, |s| {
-            let shared = (!shared_done).then(|| s.shared_pending.lock().flush_mask(&mask));
-            (s.pending.flush_mask(&mask), shared)
-        });
-        shared_done = true;
+        // Freed here, after the thread's lock is dropped
+        let _gone = with_task_signal_state(tid, |s| s.pending.flush_mask(&mask));
     }
 }
 
