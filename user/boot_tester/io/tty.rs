@@ -9,14 +9,17 @@
 //! - TTY_READ_NONBLOCK: O_NONBLOCK read of the idle serial tty is EAGAIN
 //! - TTY_POLL_IDLE: poll of the idle serial tty reports no input
 //! - TTY_READ_EINTR: a blocking read sleeps until a signal (EINTR)
+//! - TTY_WRITE_ATOMIC: a write holds the tty's write lock to its end
+//!   (an O_NONBLOCK writer meanwhile gets EAGAIN)
 
 use crate::harness::{fail_num, pass};
 use crate::helpers::{host_mode, print, println, skip};
 use crate::io::nonblock::{on_sig, sigaction};
 use hk_syscall::{
-    ITimerVal, O_NONBLOCK, O_RDWR, POLLIN, PollFd, SIG_DFL, Timeval, sys_close, sys_exit, sys_fork,
-    sys_ioctl, sys_open, sys_poll, sys_read, sys_rt_sigpending, sys_rt_sigprocmask, sys_setitimer,
-    sys_setsid, sys_vhangup, sys_wait4,
+    CLOCK_MONOTONIC, ITimerVal, O_NONBLOCK, O_RDWR, O_WRONLY, POLLIN, PollFd, SIG_DFL, Timespec,
+    Timeval, sys_clock_gettime, sys_close, sys_exit, sys_fork, sys_ioctl, sys_kill, sys_open,
+    sys_poll, sys_read, sys_rt_sigpending, sys_rt_sigprocmask, sys_setitimer, sys_setsid,
+    sys_vhangup, sys_wait4, sys_write,
 };
 
 const O_NOCTTY: u32 = 0o400;
@@ -29,6 +32,7 @@ const SIGHUP: u64 = 1;
 const SIGCONT: u64 = 18;
 const SIGWINCH: u64 = 28;
 const SIGALRM: u32 = 14;
+const SIGKILL: u32 = 9;
 const EINTR: i64 = -4;
 const EAGAIN: i64 = -11;
 const EIO: i64 = -5;
@@ -44,6 +48,7 @@ pub fn run_tests() {
     test_poll_idle();
     test_read_eintr();
     test_sigwinch();
+    test_write_atomic();
 }
 
 fn report(name: &[u8], ok: bool, got: i64) {
@@ -209,6 +214,55 @@ fn test_read_eintr() {
         return skip(b"TTY_READ_EINTR", b"host serial tty I/O error");
     }
     report(b"TTY_READ_EINTR", r == EINTR, r);
+}
+
+/// Monotonic seconds
+fn now_sec() -> i64 {
+    let mut ts = Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    sys_clock_gettime(CLOCK_MONOTONIC, &mut ts);
+    ts.tv_sec
+}
+
+/// A write of `fd` from an unmapped buffer: EFAULT once the tty's
+/// write lock is held, with nothing written to the console
+fn write_fault(fd: i64) -> i64 {
+    sys_write(fd as u64, 8 as *const u8, 4096)
+}
+
+/// A child loops writes to the console that fault inside the write
+/// lock (Linux tty_write_lock: trylock, EAGAIN under O_NDELAY); an
+/// O_NONBLOCK writer of the same tty sees it held at some point.
+/// Without the lock two writers interleave inside one write
+fn test_write_atomic() {
+    const NAME: &[u8] = b"TTY_WRITE_ATOMIC";
+    let flags = O_WRONLY | O_NOCTTY;
+    let fd = sys_open(b"/dev/console\0".as_ptr(), flags, 0);
+    let nb = sys_open(b"/dev/console\0".as_ptr(), flags | O_NONBLOCK, 0);
+    if fd < 0 || nb < 0 {
+        return report(NAME, false, fd.min(nb));
+    }
+    let pid = sys_fork();
+    if pid == 0 {
+        while write_fault(fd) == EFAULT {}
+        sys_exit(1);
+    }
+    let end = now_sec() + 10;
+    let mut r = EFAULT;
+    while pid > 0 && r == EFAULT && now_sec() < end {
+        r = write_fault(nb);
+    }
+    let mut st = 0i32;
+    if pid > 0 {
+        sys_kill(pid, SIGKILL);
+        sys_wait4(pid, &mut st, 0, 0);
+    }
+    sys_close(fd as u64);
+    sys_close(nb as u64);
+    let child_ok = pid > 0 && st & 0x7f == SIGKILL as i32;
+    report(NAME, child_ok && r == EAGAIN, if child_ok { r } else { -1 });
 }
 
 /// SIGALRM after `sec` seconds (0 cancels); arm64 has no alarm(2)

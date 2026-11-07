@@ -446,7 +446,11 @@ TTYs (3.9): jobctrl CTTY_LOCK (spin) → TASKLIST (read) → Tty.ctrl
     processing and swapped under it by set_termios, as Linux's
     termios_rwsem spans both); Tty.read_lock (sleeping Mutex, Linux
     atomic_read_lock) → Tty.ldata, Tty.flip: held by a reader across its
-    sleeps on read_wait; Tty.buf_lock (sleeping Mutex, Linux
+    sleeps on read_wait; Tty.write_lock (sleeping Mutex, Linux
+    atomic_write_lock) → Tty.termios, TASKLIST (read) → Tty.ctrl and
+    the SIGTTOU send (the TOSTOP check): held by a writer across the
+    whole write(2) and its driver writes; never nested with read_lock or
+    buf_lock; Tty.buf_lock (sleeping Mutex, Linux
     tty_bufhead.lock) → Tty.ldata: held by the flip thread across
     feeding input (including the echo's driver write) and by
     flush_input; Tty.flip (IrqSpinlock leaf,
@@ -3116,6 +3120,7 @@ Each `Tty` struct contains:
 | `flip` | `IrqSpinlock<Flip>` | Bytes from the UART interrupt handler (Linux `tty_bufhead`) |
 | `buf_lock` | `sync::Mutex<()>` (sleeping) | Feeding `flip` to N_TTY vs input flushes (Linux `tty_bufhead.lock`); outside `ldata` |
 | `read_lock` | `sync::Mutex<()>` (sleeping) | One N_TTY reader at a time, held across the whole read and its sleeps (Linux `atomic_read_lock`): a canonical line copied out in pieces goes to one reader; outermost tty lock, taken before `ldata` |
+| `write_lock` | `sync::Mutex<()>` (sleeping) | One writer at a time, held across the whole write(2) (Linux `atomic_write_lock`, tty_write_lock): another writer's bytes never land inside it; outermost on the write side, taken before the TOSTOP check (`termios`, TASKLIST → `ctrl`, SIGTTOU) and the driver writes; O_NONBLOCK try-locks (EAGAIN), else interruptible. Thread context only: printk's console write and N_TTY echo do not take it (as Linux). Not nested with `read_lock` or `buf_lock` |
 | `read_wait` | `WaitQueue` | Readers and pollers waiting for input |
 | `fasync` | `FasyncList` (sleeping, 3.11) | O_ASYNC files (Linux `tty->fasync`): N_TTY input sends their SIGIO after dropping `ldata`, under `buf_lock` |
 

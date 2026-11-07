@@ -171,6 +171,9 @@ pub struct Tty {
     /// reader though it is copied out in pieces (Linux
     /// n_tty_data.atomic_read_lock)
     read_lock: crate::sync::Mutex<()>,
+    /// One writer at a time, held across a whole write(2) so another's
+    /// bytes never land inside it (Linux tty->atomic_write_lock)
+    write_lock: crate::sync::Mutex<()>,
     /// Session, foreground group, window size
     ctrl: Mutex<TtyCtrl>,
     /// O_ASYNC files (Linux tty->fasync)
@@ -189,6 +192,7 @@ impl Tty {
             flip: IrqSpinlock::new(flip::Flip::new()),
             buf_lock: crate::sync::Mutex::new(()),
             read_lock: crate::sync::Mutex::new(()),
+            write_lock: crate::sync::Mutex::new(()),
             read_wait: WaitQueue::new(),
             ctrl: Mutex::new(TtyCtrl::new()),
             fasync: FasyncList::new(),
@@ -203,6 +207,16 @@ impl Tty {
     /// Device number
     pub fn dev(&self) -> DevId {
         self.dev
+    }
+
+    /// Take the write lock (Linux tty_write_lock): EAGAIN if taken and
+    /// O_NONBLOCK, else a signal ends the wait
+    fn lock_write(&self, file: &File) -> Result<crate::sync::MutexGuard<'_, ()>, KernelError> {
+        if file.get_flags() & crate::fs::flags::O_NONBLOCK != 0 {
+            self.write_lock.try_lock().ok_or(KernelError::WouldBlock)
+        } else {
+            self.write_lock.lock_interruptible()
+        }
     }
 
     /// Write directly to driver (bypassing line discipline)
@@ -348,8 +362,10 @@ impl CharDevice for Tty {
         n_tty::read(self, file, to)
     }
 
-    /// With TOSTOP a background writer gets SIGTTOU (Linux n_tty_write)
-    fn write(&self, _file: &File, from: &mut IovSource<'_>) -> Result<usize, KernelError> {
+    /// Under the write lock to the end (Linux iterate_tty_write); with
+    /// TOSTOP a background writer gets SIGTTOU (Linux n_tty_write)
+    fn write(&self, file: &File, from: &mut IovSource<'_>) -> Result<usize, KernelError> {
+        let _writer = self.lock_write(file)?;
         if self.get_termios().c_lflag & TOSTOP != 0 {
             jobctrl::check_change(self, crate::signal::SIGTTOU)?;
         }

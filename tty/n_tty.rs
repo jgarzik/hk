@@ -516,9 +516,9 @@ pub fn poll_in(tty: &Tty) -> bool {
     ld.available(min)
 }
 
-/// Write (Linux tty_write + n_tty_write): through a kernel buffer a
-/// chunk at a time; a short chunk ends it, an error after some bytes
-/// returns their count
+/// Write (Linux iterate_tty_write + n_tty_write), under the tty's
+/// write lock: through a kernel buffer a chunk at a time; a short chunk
+/// ends it, an error after some bytes returns their count
 pub fn write(tty: &Tty, from: &mut IovSource<'_>) -> Result<usize, KernelError> {
     let mut chunk = [0u8; 512];
     let mut done = 0;

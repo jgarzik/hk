@@ -400,11 +400,6 @@ unreachable today.
 
 **Location:** `tty/`, `hw/serial.rs`, `arch/aarch64/serial.rs`.
 
-- **write(2) is not atomic:** `n_tty::write` takes no per-tty write
-  lock, so two processes writing one tty interleave inside a single
-  write (boot logs show torn verdicts such as `MCELM_TOTAL:OK`). Linux
-  tty_write holds `tty->atomic_write_lock` (tty_write_lock) for the
-  whole call, chunk by chunk.
 - **No hangup:** nothing hangs a tty up (Linux __tty_hangup: vhangup,
   a session leader's exit, carrier loss), so open files stay usable.
   A leader's exit and TIOCNOTTY only send SIGHUP/SIGCONT to the
