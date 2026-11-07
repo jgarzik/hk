@@ -14,34 +14,9 @@ use super::nl::{
     RTM_NEWADDR, RTM_NEWROUTE, Req, addr as nl_addr, ifaddr, net_setup_eth0, rtmsg,
 };
 use hk_syscall::{
-    O_CLOEXEC, POLLIN, PollFd, SIG_IGN, SIGKILL, SIGPIPE, sys_close, sys_dup3, sys_execve,
-    sys_exit, sys_fork, sys_kill, sys_pipe2, sys_poll, sys_read, sys_rt_sigaction, sys_wait4,
-    sys_write,
+    O_CLOEXEC, POLLIN, PollFd, SIGKILL, sys_close, sys_dup3, sys_execve, sys_exit, sys_fork,
+    sys_kill, sys_pipe2, sys_poll, sys_read, sys_wait4, sys_write,
 };
-
-/// struct sigaction (kernel layout)
-#[repr(C)]
-#[derive(Default)]
-struct SigAction {
-    handler: u64,
-    flags: u64,
-    restorer: u64,
-    mask: u64,
-}
-
-/// Write `buf` to `fd` with SIGPIPE ignored: a child that exits before
-/// reading its input (EPIPE) must not kill the test process
-fn write_nopipe(fd: i32, buf: &[u8]) {
-    let ign = SigAction {
-        handler: SIG_IGN,
-        ..Default::default()
-    };
-    let mut old = SigAction::default();
-    let (a, o) = (&ign as *const _ as u64, &mut old as *mut _ as u64);
-    sys_rt_sigaction(SIGPIPE, a, o, 8);
-    sys_write(fd as u64, buf.as_ptr(), buf.len() as u64);
-    sys_rt_sigaction(SIGPIPE, o, 0, 8);
-}
 
 /// Captured output size
 const OUT_MAX: usize = 8192;
@@ -149,17 +124,20 @@ pub fn spawn_prog(prog: Prog, args: &[&[u8]], stdin: &[u8]) -> Option<Child> {
         sys_close(outp[1] as u64);
         return None;
     }
+    // The input is in the pipe before the child runs (small inputs
+    // fit the pipe buffer; the read end is open, so no EPIPE): `nc`
+    // exits on its peer's EOF, and a child that saw the EOF first
+    // would never send its input
+    if !stdin.is_empty() {
+        sys_write(inp[1] as u64, stdin.as_ptr(), stdin.len() as u64);
+    }
+    sys_close(inp[1] as u64);
     let pid = sys_fork();
     if pid == 0 {
         child(prog, args, inp[0], outp[1]);
     }
     sys_close(outp[1] as u64);
     sys_close(inp[0] as u64);
-    // Small inputs fit the pipe buffer: write all, then EOF
-    if pid > 0 && !stdin.is_empty() {
-        write_nopipe(inp[1], stdin);
-    }
-    sys_close(inp[1] as u64);
     if pid < 0 {
         sys_close(outp[0] as u64);
         return None;

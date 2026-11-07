@@ -7,11 +7,6 @@ Failures that also occur when the boot tester runs on real Linux
 real bug in Linux as well as hk: Linux is the reference, not
 infallible, so each one is investigated, not written off.
 
-- **BUSYBOX_NC_LO flaky, on hk and the Linux reference**:
-  `BUSYBOX_NC_LO:FAIL status=0` (nc over loopback) in about 1 of 5
-  uncached x86 `check-linux` runs and in hk x86 boots, one CPU
-  (`QEMU_SMP=1`) included; passes on rerun. Cause unknown: the test
-  waits for the listener (`wait_listen`) and retries the client.
 - **NICE_ADJACENT flaky on the arm64 Linux reference**: one emulated
   `check-linux-arm` run had two adjacent-nice spinners' CPU share off
   (`share a:b tenths got 26`); passed on the uncached rerun. Likely
