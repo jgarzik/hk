@@ -3,7 +3,8 @@
 //! thread end every thread, blocked ones included; the leader is reaped
 //! only once all threads are gone; execve from any thread ends the
 //! others, and keeps the process's pid when it leads its own process
-//! group and a traced sibling is left a zombie. A process whose
+//! group and a traced sibling is left a zombie (the exec waits for its
+//! tracer to reap it). A process whose
 //! threads all exit at once tells its parent once. Each child's threads hold the write end of a pipe (in their
 //! shared descriptor table): EOF on it after the reap shows that none
 //! is left.
@@ -317,10 +318,12 @@ extern "C" fn exec_on_go(go: u64) -> ! {
 
 /// A process leading its own process group (its pgid is its pid): a
 /// thread traced by the parent is ended by a sibling's execve and left
-/// a zombie for its tracer, which reaps it. The new image keeps the pid: kill(pid, 0)
-/// finds it and /proc/<pid>/stat shows its new name (Linux de_thread: exchange_tids
-/// and transfer_pid before the old leader is released; a pid is freed
-/// only when no task uses it in any role)
+/// a zombie for its tracer; the exec waits until the tracer reaps it
+/// (Linux de_thread: notify_count drops at release_task). The new
+/// image keeps the pid: kill(pid, 0) finds it and /proc/<pid>/stat
+/// shows its new name (Linux de_thread: exchange_tids and transfer_pid
+/// before the old leader is released; a pid is freed only when no task
+/// uses it in any role)
 fn test_exec_traced_sibling() {
     const PTRACE_SEIZE: i64 = 0x4206;
     const WALL: i32 = 0x4000_0000;
@@ -335,33 +338,44 @@ fn test_exec_traced_sibling() {
     let tids = parent_side(&p);
     let seized = hk_syscall::sys_ptrace(PTRACE_SEIZE, tids[0], 0, 0);
     sys_write(p.block[1] as u64, b"x".as_ptr(), 1);
-    // The killed sibling is the tracer's zombie: Linux de_thread waits
-    // until it is reaped (hk cannot wait for a traced thread; it gives
-    // up after a second)
-    let mut st = 0i32;
-    for _ in 0..100 {
-        if sys_wait4(tids[0], &mut st, WNOHANG | WALL, 0) != 0 {
+    let stat = crate::exec::exec_identity::proc_path(pid, b"stat\0");
+    let mut buf = [0u8; 64];
+    let execd = |buf: &mut [u8; 64]| {
+        let n = crate::helpers::read_file(&stat, buf);
+        n > 0 && buf[..n as usize].windows(9).any(|w| w == b"(busybox)")
+    };
+    // The killed sibling is the tracer's zombie: the exec is held until
+    // it is reaped (its exit status 0: a thread an exec ends)
+    sleep_ms(100);
+    let held = !execd(&mut buf);
+    let mut st = -1i32;
+    let mut r = 0;
+    for _ in 0..500 {
+        r = sys_wait4(tids[0], &mut st, WNOHANG | WALL, 0);
+        if r != 0 {
             break;
         }
         sleep_ms(10);
     }
-    let stat = crate::exec::exec_identity::proc_path(pid, b"stat\0");
-    let mut buf = [0u8; 64];
-    let mut execd = false;
+    let reaped = r == tids[0] && st == 0;
+    let mut done = false;
     for _ in 0..200 {
-        let n = crate::helpers::read_file(&stat, &mut buf);
-        if n > 0 && buf[..n as usize].windows(9).any(|w| w == b"(busybox)") {
-            execd = true;
+        if execd(&mut buf) {
+            done = true;
             break;
         }
         sleep_ms(10);
     }
     let alive = sys_kill(pid, 0);
     let (st, gone) = reap(pid, &p);
-    let ok = seized == 0 && execd && alive == 0 && st == Some(7 << 8) && gone;
+    let ok = seized == 0 && held && reaped && done && alive == 0 && st == Some(7 << 8) && gone;
     let v = if seized != 0 {
         seized
-    } else if !execd {
+    } else if !held {
+        -1001
+    } else if !reaped {
+        -2000 + r
+    } else if !done {
         -1000
     } else if alive != 0 {
         alive

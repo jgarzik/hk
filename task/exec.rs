@@ -825,8 +825,9 @@ fn exec_identity(path: &[u8], file: &File) -> ExecIdentity {
 }
 
 /// End the other threads of the caller's group and wait until they
-/// have exited (Linux de_thread); a non-leader caller then takes the
-/// leader's place. EAGAIN if the group is exiting, or a fatal signal
+/// have exited and, but for the leader, been released (Linux
+/// de_thread: a traced zombie waits for its tracer); a non-leader
+/// caller then takes the leader's place. EAGAIN if the group is exiting, or a fatal signal
 /// arrives meanwhile (the caller then dies on its way out). Threads
 /// running user code end at their next syscall or fault (P7: IRQ
 /// return).
@@ -838,7 +839,7 @@ fn de_thread(tid: crate::task::Tid) -> Result<(), i32> {
     let Some(sig) = crate::signal::get_task_signal_struct(tid) else {
         return Ok(());
     };
-    if percpu::group_others(tgid, tid) {
+    if percpu::exec_waits(tgid, tid) {
         if !sig.start_exec(tid) {
             return Err(EAGAIN);
         }
@@ -847,7 +848,7 @@ fn de_thread(tid: crate::task::Tid) -> Result<(), i32> {
         let w = core::pin::pin!(WaitEntry::new());
         let r = loop {
             wq.prepare_to_wait(w.as_ref(), SleepState::Killable);
-            if !percpu::group_others(tgid, tid) {
+            if !percpu::exec_waits(tgid, tid) {
                 break Ok(());
             }
             if crate::signal::fatal_signal_pending() {
@@ -859,8 +860,14 @@ fn de_thread(tid: crate::task::Tid) -> Result<(), i32> {
         sig.end_exec(tid);
         r?;
     }
-    // Released after TASKLIST: the old leader and exited threads
-    drop(percpu::take_leadership(tgid, tid));
+    // Released after TASKLIST: the old leader and exited threads; a
+    // tracer waiting for the old leader rechecks (Linux de_thread:
+    // __wake_up_parent before its silent release)
+    let gone = percpu::take_leadership(tgid, tid);
+    if !gone.is_empty() {
+        drop(gone);
+        crate::task::proc::CHILD_EXIT_WQ.wake_all();
+    }
     Ok(())
 }
 

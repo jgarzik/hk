@@ -2957,8 +2957,10 @@ de_thread, exit_group does not.
   (`Posted::finish`: complete_signal takes TASKLIST itself), the
   autoreaped Task released.
 - de_thread (exec) holds cred_guard (sleeping, outermost) while it waits
-  for the other threads on CHILD_EXIT_WQ (killable); it holds no
-  spinlock. A thread blocked on that cred_guard (its own exec, or an
+  on CHILD_EXIT_WQ (killable) until every other thread is released and
+  the leader is a zombie (`exec_waits`, Linux notify_count: a traced
+  zombie thread waits for its tracer's reap, whose release wakes the
+  queue); it holds no spinlock. A thread blocked on that cred_guard (its own exec, or an
   attach to the group) sleeps interruptibly, so the SIGKILL de_thread
   sends ends it. The old leader and exited threads are removed under
   TASKLIST and released after it.

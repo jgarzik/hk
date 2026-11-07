@@ -518,8 +518,6 @@ Signal-delivery and PTRACE_SYSCALL stops work. Missing: exec, fork,
 clone and exit event stops (PTRACE_O_TRACEEXEC and friends,
 PTRACE_EVENT_*), PTRACE_INTERRUPT/LISTEN, group-stop interaction (SIGSTOP
 to an untraced task is ignored: stop/continue are not implemented).
-A sibling's exec removes a traced zombie thread at once (Linux
-de_thread waits for its tracer to reap it).
 
 ## NETLINK_ROUTE / SIOC* subset gaps
 

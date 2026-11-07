@@ -1867,6 +1867,18 @@ fn zombie_report(table: &GlobalTaskTable, z: &TaskView<'_>) -> WaitReport {
     (z.task.tid(), group_status(z, own), utime, stime)
 }
 
+/// A thread of group `tgid` other than `tid` that an exec by `tid`
+/// still waits for (Linux de_thread: notify_count, dropped at each
+/// thread's release_task, then the leader's exit_state): any other
+/// thread still listed, a traced zombie until its tracer releases it,
+/// but the leader once it is a zombie
+pub fn exec_waits(tgid: Pid, tid: Tid) -> bool {
+    TASKLIST
+        .read()
+        .threads(tgid)
+        .any(|u| u.task.tid() != tid && !(u.leader && matches!(u.state, TaskState::Zombie(_))))
+}
+
 /// A thread of group `tgid` other than `tid` has not exited yet
 pub fn group_others(tgid: Pid, tid: Tid) -> bool {
     group_alive(&TASKLIST.read(), tgid, tid)
