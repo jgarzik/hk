@@ -654,8 +654,8 @@ pub fn sys_rt_sigtimedwait(set_ptr: u64, info_ptr: u64, ts_ptr: u64, sigsetsize:
     mask.remove(SIGKILL);
     mask.remove(SIGSTOP);
 
-    let mut sig = dequeue_signal(&mask).map(|i| i.sig());
-    if sig.is_none() && timeout_ns != Some(0) {
+    let mut info = dequeue_signal(&mask);
+    if info.is_none() && timeout_ns != Some(0) {
         // Linux do_sigtimedwait: unblock the awaited signals while
         // sleeping so their arrival wakes us, then restore the mask
         let saved = with_task_signal_state(tid, |st| {
@@ -672,8 +672,8 @@ pub fn sys_rt_sigtimedwait(set_ptr: u64, info_ptr: u64, ts_ptr: u64, sigsetsize:
                 st.real_blocked = SigSet::EMPTY;
             });
         }
-        sig = dequeue_signal(&mask).map(|i| i.sig());
-        if sig.is_none() {
+        info = dequeue_signal(&mask);
+        if info.is_none() {
             // Another signal (EINTR) or the timeout (EAGAIN)
             let timed_out = deadline.is_some_and(|d| crate::time::monotonic_ns() >= d);
             return if timed_out {
@@ -683,17 +683,16 @@ pub fn sys_rt_sigtimedwait(set_ptr: u64, info_ptr: u64, ts_ptr: u64, sigsetsize:
             };
         }
     }
-    let Some(sig) = sig else {
+    let Some(info) = info else {
         return KernelError::WouldBlock.sysret();
     };
-    if info_ptr != 0 {
-        // Basic siginfo (SI_USER with pid/uid 0: senders are not tracked)
-        let siginfo = SigInfo::kill(sig, si_code::SI_USER, 0, 0);
-        if let Err(e) = siginfo.copy_to_user(info_ptr) {
-            return e.sysret();
-        }
+    // The signal is taken even if its info cannot be written (Linux)
+    if info_ptr != 0
+        && let Err(e) = info.copy_to_user(info_ptr)
+    {
+        return e.sysret();
     }
-    i64::from(sig)
+    i64::from(info.sig())
 }
 
 /// Sleep interruptibly until a signal is deliverable or the

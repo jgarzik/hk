@@ -568,10 +568,10 @@ pub struct TaskSignalState {
     /// The mask before sigtimedwait unblocked the awaited signals
     /// (Linux real_blocked): such a signal does not kill on arrival
     pub real_blocked: SigSet,
-    /// A traced task's fault signal and its details, queued for normal
-    /// delivery (the tracer's stop first): the handler gets them as
-    /// force_sig_fault would have given (hk has no siginfo queue)
-    pub fault: Option<(SigInfo, Trap)>,
+    /// A traced task's queued fault: its signal and sigcontext details,
+    /// for the frame when that signal is delivered (Linux
+    /// thread.trap_nr, error_code; its siginfo rides in the queue)
+    pub trap: Option<(u32, Trap)>,
 }
 
 /// A thread group's shared pending set (Linux signal->shared_pending):
@@ -615,7 +615,7 @@ impl TaskSignalState {
             shared_pending: SharedPending(None),
             altstack: AltStack::new(),
             real_blocked: SigSet::EMPTY,
-            fault: None,
+            trap: None,
         }
     }
 
@@ -637,7 +637,7 @@ impl TaskSignalState {
             shared_pending,
             altstack: AltStack::new(),
             real_blocked: SigSet::EMPTY,
-            fault: None,
+            trap: None,
         }
     }
 
@@ -835,7 +835,7 @@ pub fn fork_signal(
             },
             altstack: AltStack::new(), // Child starts with no altstack
             real_blocked: SigSet::EMPTY,
-            fault: None,
+            trap: None,
         }
     } else {
         TaskSignalState::try_new()?
@@ -1881,24 +1881,39 @@ fn fork_signal_struct(
 /// Let the tracer of a traced task see `sig` before it is delivered:
 /// None if the tracer cancelled it, or if it changed it to one now
 /// blocked (queued again, as Linux ptrace_signal does)
-fn traced_signal(tid: Tid, sig: u32, action: SigAction) -> Option<(u32, SigAction)> {
+fn traced_signal(tid: Tid, info: SigInfo, action: SigAction) -> Option<(SigInfo, SigAction)> {
+    let sig = info.sig();
     if sig == SIGKILL {
-        return Some((sig, action));
+        return Some((info, action));
     }
     let new = crate::task::ptrace::ptrace_signal(sig);
     if new == sig {
-        return Some((sig, action));
+        return Some((info, action));
     }
     if new == 0 {
         return None;
     }
+    // A changed signal is the tracer's (Linux ptrace_signal)
+    let info = tracer_info(tid, new);
     let blocked = with_task_signal_state(tid, |state| state.blocked.contains(new)).unwrap_or(false);
     if blocked {
-        send_signal(tid, new);
+        send_sig_info(tid, new, SendInfo::Info(info));
         return None;
     }
     let action = get_task_sighand(tid)?.get_action(new).unwrap_or_default();
-    Some((new, action))
+    Some((info, action))
+}
+
+/// `sig` as the tracer of `tid` gives it: SI_USER from the tracer's
+/// process and uid (Linux ptrace_signal)
+fn tracer_info(tid: Tid, sig: u32) -> SigInfo {
+    let tracer = TASKLIST.read().get(tid).and_then(|t| t.tracer());
+    let uid = tracer.as_ref().and_then(|tr| {
+        let table = TASKLIST.read();
+        table.get(tr.tid()).map(|v| v.cred_arc().uid)
+    });
+    let pid = tracer.as_ref().map_or(0, |tr| tr.pid as i32);
+    SigInfo::kill(sig, si_code::SI_USER, pid, uid.unwrap_or(0))
 }
 
 /// Signal work on the way back to user mode (Linux
@@ -1942,12 +1957,12 @@ pub fn do_signal(regs: &UserFrame) {
         let Some((action, info)) = get_signal_to_deliver(tid) else {
             break;
         };
-        let sig = info.sig();
         // A tracee stops for its tracer first (Linux get_signal ->
         // ptrace_signal), which may cancel or change the signal
-        let Some((sig, action)) = traced_signal(tid, sig, action) else {
+        let Some((info, action)) = traced_signal(tid, info, action) else {
             continue;
         };
+        let sig = info.sig();
         match action.handler {
             SigHandler::Ignore => continue,
             SigHandler::Default => match default_action(sig) {
@@ -1975,11 +1990,10 @@ pub fn do_signal(regs: &UserFrame) {
                         regs.set_ret(EINTR);
                     }
                 }
-                // A traced task's fault keeps its details (force_sig_fault)
-                let (info, trap) =
-                    with_task_signal_state(tid, |s| s.fault.take_if(|(f, _)| f.sig() == sig))
-                        .flatten()
-                        .unwrap_or((SigInfo::kill(sig, si_code::SI_USER, 0, 0), Trap::default()));
+                // A traced task's fault keeps its frame details
+                let trap = with_task_signal_state(tid, |s| s.trap.take_if(|(t, _)| *t == sig))
+                    .flatten()
+                    .map_or(Trap::default(), |(_, t)| t);
                 if deliver_to_handler(tid, sig, &action, &info, &trap, regs) {
                     return;
                 }
@@ -2118,6 +2132,15 @@ fn deliver_to_handler(
 /// SIG_DFL and it is unblocked, so it cannot be dodged; a handler that
 /// is not blocked still runs. Delivered on the way back to user mode.
 pub fn force_sig(tid: Tid, sig: u32) {
+    force_send(tid, sig, SendInfo::Kernel);
+}
+
+/// [`force_sig`] with `info` (Linux force_sig_info)
+pub fn force_sig_info(tid: Tid, info: SigInfo) {
+    force_send(tid, info.sig(), SendInfo::Info(info));
+}
+
+fn force_send(tid: Tid, sig: u32, info: SendInfo) {
     let sighand = get_task_sighand(tid);
     let ignored = sighand
         .as_ref()
@@ -2130,7 +2153,7 @@ pub fn force_sig(tid: Tid, sig: u32) {
         }
         with_task_signal_state(tid, |s| s.blocked.remove(sig));
     }
-    send_signal_force(tid, sig, SendInfo::Kernel, true);
+    send_signal_force(tid, sig, info, true);
 }
 
 /// Force delivery of SIGSEGV (for stack errors during signal setup)
@@ -2172,8 +2195,8 @@ pub fn force_sig_fault(info: SigInfo, trap: Trap, regs: &UserFrame) {
     // -> get_signal -> ptrace_signal); delivered on the way back to user
     // space, it is unblocked and not ignored, as force_sig makes it
     if crate::task::ptrace::is_traced(tid) {
-        with_task_signal_state(tid, |s| s.fault = Some((info, trap)));
-        force_sig(tid, sig);
+        with_task_signal_state(tid, |s| s.trap = Some((sig, trap)));
+        force_sig_info(tid, info);
         return;
     }
     let sighand = get_task_sighand(tid);

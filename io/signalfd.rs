@@ -30,7 +30,8 @@ use crate::fs::KernelError;
 use crate::fs::file::{File, FileOps, RwFlags, flags, nowait_rw};
 use crate::fs::iov_iter::IovDest;
 use crate::io::poll::{POLLIN, POLLRDNORM, PollTable};
-use crate::signal::{SigInfo, SigSet, UNMASKABLE_SIGNALS, with_task_signal_state};
+use crate::signal::siginfo::Layout;
+use crate::signal::{SigFields, SigInfo, SigSet, UNMASKABLE_SIGNALS, with_task_signal_state};
 use crate::task::percpu::current_tid;
 use crate::util::pod::IntoBytes;
 
@@ -193,7 +194,7 @@ impl Signalfd {
                 let Some(info) = self.dequeue_signal() else {
                     break;
                 };
-                match to.copy_to_full(self.build_siginfo(info.sig()).as_bytes()) {
+                match to.copy_to_full(self.build_siginfo(&info).as_bytes()) {
                     Ok(()) => done += SIGINFO_SIZE,
                     Err(_) if done > 0 => return Ok(done),
                     Err(e) => return Err(e),
@@ -216,14 +217,71 @@ impl Signalfd {
         }
     }
 
-    /// Build signalfd_siginfo from signal number
-    fn build_siginfo(&self, sig: u32) -> SignalfdSiginfo {
-        // TODO: Fill in sender info from SigInfo when we have queued signals
-        // For now, just return the signal number
-        SignalfdSiginfo {
-            ssi_signo: sig,
+    /// The signalfd_siginfo of `info` (Linux signalfd_copyinfo): the
+    /// fields its layout carries, the rest zero
+    fn build_siginfo(&self, info: &SigInfo) -> SignalfdSiginfo {
+        let mut s = SignalfdSiginfo {
+            ssi_signo: info.sig(),
+            ssi_errno: info.errno,
+            ssi_code: info.code,
             ..Default::default()
+        };
+        // Each truncation below is Linux's (ssi_band, ssi_utime, ...)
+        match info.fields() {
+            SigFields::Kill { pid, uid } => {
+                s.ssi_pid = pid as u32;
+                s.ssi_uid = uid;
+            }
+            SigFields::Rt { pid, uid, value } => {
+                s.ssi_pid = pid as u32;
+                s.ssi_uid = uid;
+                s.ssi_ptr = value;
+                s.ssi_int = value as i32;
+            }
+            SigFields::Timer {
+                tid,
+                overrun,
+                value,
+            } => {
+                s.ssi_tid = tid as u32;
+                s.ssi_overrun = overrun as u32;
+                s.ssi_ptr = value;
+                s.ssi_int = value as i32;
+            }
+            SigFields::Chld {
+                pid,
+                uid,
+                status,
+                utime,
+                stime,
+            } => {
+                s.ssi_pid = pid as u32;
+                s.ssi_uid = uid;
+                s.ssi_status = status;
+                s.ssi_utime = utime as u64;
+                s.ssi_stime = stime as u64;
+            }
+            SigFields::Fault { addr, addr_lsb } => {
+                s.ssi_addr = addr;
+                if info.layout() == Layout::FaultMceerr {
+                    s.ssi_addr_lsb = addr_lsb as u16;
+                }
+            }
+            SigFields::Sys {
+                call_addr,
+                syscall,
+                arch,
+            } => {
+                s.ssi_call_addr = call_addr;
+                s.ssi_syscall = syscall;
+                s.ssi_arch = arch;
+            }
+            SigFields::Poll { band, fd } => {
+                s.ssi_band = band as u32;
+                s.ssi_fd = fd;
+            }
         }
+        s
     }
 
     /// Poll for readiness

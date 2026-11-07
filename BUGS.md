@@ -282,8 +282,8 @@ No leases (F_SETLEASE) and no OFD locks (F_OFD_*).
 **Location**: `seccomp/`
 
 SIGSYS from SECCOMP_RET_TRAP carries no siginfo (si_code SYS_SECCOMP,
-si_syscall, si_arch, si_errno, si_call_addr): hk has no siginfo queue
-(signals are a bitmask). No PTRACE_EVENT_SECCOMP (RET_TRACE is ENOSYS
+si_syscall, si_arch, si_errno, si_call_addr): it is sent SI_KERNEL. No
+PTRACE_EVENT_SECCOMP (RET_TRACE is ENOSYS
 as with no tracer), no user notification (SECCOMP_RET_USER_NOTIF,
 SECCOMP_GET_NOTIF_SIZES), no FLAG_TSYNC_ESRCH / FLAG_SPEC_ALLOW /
 FLAG_WAIT_KILLABLE_RECV, and nothing is logged for RET_LOG or
@@ -519,6 +519,11 @@ de_thread
 A signal made ignored by sigaction stays pending, its queued instances
 with it, until delivery discards them (Linux do_sigaction flushes them:
 flush_sigqueue_mask).
+
+A handler's sigcontext has the fault details (x86-64 trapno, err, cr2;
+arm64 fault_address, esr_context) only for the fault's own signal; other
+signals get zeros (Linux reports the thread's last fault: thread.trap_nr,
+error_code, cr2, fault_address, fault_code).
 
 ## ptrace stop gaps
 
@@ -855,9 +860,8 @@ Designs that grew one commit at a time. Tag = roadmap phase
 (doc/ROADMAP.md).
 
 - **Syscalls that do not deliver** (H/C): inotify and fanotify never
-  queue an event (no fsnotify hooks in the VFS); queued siginfo is
-  not delivered (handlers, sigtimedwait and signalfd see SI_USER from
-  pid 0); waitid without WEXITED is EINVAL (C).
+  queue an event (no fsnotify hooks in the VFS); waitid without
+  WEXITED is EINVAL (C).
 - **Copied helpers** (J, or as touched): `get_nofile_limit` in five
   places; `find_task_by_pid` in four (all root-namespace pids); four
   `current_time`s; about ten user-timespec readers each validating
