@@ -13,6 +13,7 @@ pub mod nproc;
 pub mod pgrp_links;
 pub mod pid_tid;
 pub mod pidfd;
+pub mod pidfd_thread;
 pub mod prctl;
 pub mod prctl_extra;
 pub mod preempt;

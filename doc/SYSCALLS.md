@@ -255,8 +255,8 @@ Linux has an "old" and a "rt_*" (real-time) signal set; modern userspace uses th
 - [x] pipe2
 - [x] eventfd (x86-64 only, legacy; use eventfd2)
 - [x] eventfd2
-- [x] pidfd_open
-- [x] pidfd_send_signal
+- [x] pidfd_open (PIDFD_NONBLOCK, PIDFD_THREAD)
+- [x] pidfd_send_signal (PIDFD_SIGNAL_THREAD, _THREAD_GROUP, _PROCESS_GROUP; no PIDFD_SELF_*)
 - [x] pidfd_getfd
 
 7.2 Futex (core for modern libs/threads)

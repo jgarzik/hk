@@ -331,6 +331,7 @@ pub fn run_all_tests() {
     proc::acct::run_tests();
     process::clone3_syslog::run_tests();
     process::pidfd::run_tests();
+    process::pidfd_thread::run_tests();
     mm::swap::run_tests();
     isolated(b"BLK", fs::blk::run_tests);
     isolated(b"SWAPOUT", mm::swapout::run_tests);

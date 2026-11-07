@@ -2635,8 +2635,14 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         use crate::arch::Uaccess;
         use crate::uaccess::put_user;
 
-        // Create pidfd for the child
-        let pidfd_file = match crate::task::pidfd::create_pidfd(child_pid, 0) {
+        // Create pidfd for the child: a thread pidfd for a new thread
+        // (Linux copy_process: CLONE_THREAD adds PIDFD_THREAD)
+        let (target, pflags) = if config.flags & CLONE_THREAD != 0 {
+            (child_tid, crate::task::pidfd::pidfd_flags::PIDFD_THREAD)
+        } else {
+            (child_pid, 0)
+        };
+        let pidfd_file = match crate::task::pidfd::create_pidfd(target, pflags) {
             Ok(file) => file,
             Err(_) => {
                 // Pidfd creation failed - this is not critical, just don't set it

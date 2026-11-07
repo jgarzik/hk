@@ -1212,17 +1212,18 @@ pub fn sys_capset<A: crate::uaccess::UaccessArch>(header_addr: u64, data_addr: u
 ///
 /// # Arguments
 /// * `pid` - Process ID to obtain pidfd for
-/// * `flags` - Flags (PIDFD_NONBLOCK only)
+/// * `flags` - PIDFD_NONBLOCK, PIDFD_THREAD (any thread, Linux 6.9)
 ///
 /// # Returns
 /// * A file descriptor on success, always close-on-exec (Linux
 ///   pidfd_prepare's get_unused_fd_flags(O_CLOEXEC))
 /// * -EINVAL: Invalid flags or pid
 /// * -ESRCH: No such process
-/// * -ENOENT: `pid` is a thread that does not lead its process
+/// * -ENOENT: `pid` is a thread that does not lead its process, and no
+///   PIDFD_THREAD
 pub fn sys_pidfd_open(pid: i64, flags: u32) -> i64 {
-    use crate::task::pidfd::pidfd_flags::PIDFD_NONBLOCK;
-    if flags & !PIDFD_NONBLOCK != 0 || pid <= 0 {
+    use crate::task::pidfd::pidfd_flags::{PIDFD_NONBLOCK, PIDFD_THREAD};
+    if flags & !(PIDFD_NONBLOCK | PIDFD_THREAD) != 0 || pid <= 0 {
         return KernelError::InvalidArgument.sysret();
     }
     let pidfd_file = match crate::task::pidfd::open_pidfd(pid as Pid, flags) {
@@ -1260,8 +1261,11 @@ pub fn sys_pidfd_open(pid: i64, flags: u32) -> i64 {
 /// # Arguments
 /// * `pidfd` - File descriptor referring to the target process
 /// * `sig` - Signal number to send
-/// * `info` - Optional siginfo_t to send (else kill's)
-/// * `flags` - Flags (must be 0)
+/// * `info` - Optional siginfo_t to send (else kill's, or tkill's to
+///   a thread)
+/// * `flags` - At most one scope: PIDFD_SIGNAL_THREAD, _THREAD_GROUP,
+///   _PROCESS_GROUP (the group whose id is the pidfd's pid); none: the
+///   pidfd's own (its thread for a PIDFD_THREAD pidfd, else its process)
 ///
 /// # Returns
 /// * 0 on success
@@ -1269,8 +1273,9 @@ pub fn sys_pidfd_open(pid: i64, flags: u32) -> i64 {
 /// * -EINVAL: Invalid signal number or flags
 /// * -ESRCH: Process no longer exists
 pub fn sys_pidfd_send_signal(pidfd: i32, sig: i32, info: u64, flags: u32) -> i64 {
-    // Flags must be 0
-    if flags != 0 {
+    const SCOPES: u32 =
+        PIDFD_SIGNAL_THREAD | PIDFD_SIGNAL_THREAD_GROUP | PIDFD_SIGNAL_PROCESS_GROUP;
+    if flags & !SCOPES != 0 || flags.count_ones() > 1 {
         return KernelError::InvalidArgument.sysret();
     }
 
@@ -1297,35 +1302,81 @@ pub fn sys_pidfd_send_signal(pidfd: i32, sig: i32, info: u64, flags: u32) -> i64
     let Some(pidfd) = crate::task::pidfd::get_pidfd(&file) else {
         return KernelError::BadFd.sysret();
     };
-    let info = match pidfd_info(info, sig as u32, pidfd.pid()) {
+    // The scope (Linux do_pidfd_send_signal's pid_type)
+    let scope = match flags {
+        PIDFD_SIGNAL_THREAD => Scope::Thread,
+        PIDFD_SIGNAL_THREAD_GROUP => Scope::Process,
+        PIDFD_SIGNAL_PROCESS_GROUP => Scope::Pgrp,
+        _ if pidfd.thread() => Scope::Thread,
+        _ => Scope::Process,
+    };
+    let info = match pidfd_info(info, sig as u32, pidfd.pid(), scope) {
         Ok(i) => i,
         Err(e) => return e.sysret(),
     };
     // Permission check and send to the pidfd's struct pid itself (Linux
-    // pidfd_send_signal -> kill_pid_info), so a reaped process's reused
+    // kill_pid_info_type, kill_pgrp_info), so a released task's reused
     // number never gets it. Signal 0 is a permission/existence probe.
     let me = crate::signal::syscall::Sender::current();
-    let r = crate::signal::kill_pid_info(pidfd.pid_ref(), sig as u32, info, |t| {
-        me.may_kill(t, sig as u32)
-    });
+    let check = |t: &super::percpu::TaskView<'_>| me.may_kill(t, sig as u32);
+    let (sig, pid) = (sig as u32, pidfd.pid_ref());
+    let r = match scope {
+        Scope::Thread => {
+            crate::signal::kill_pid_info_type(pid, sig, info, crate::signal::PidType::Pid, check)
+        }
+        Scope::Process => {
+            crate::signal::kill_pid_info_type(pid, sig, info, crate::signal::PidType::Tgid, check)
+        }
+        Scope::Pgrp => crate::signal::kill_pgrp_info(pid, sig, info, check),
+    };
     i64::from(r)
 }
 
-/// The info pidfd_send_signal sends to process `pid` (Linux
-/// do_pidfd_send_signal): kill's without `uinfo`; else that siginfo,
-/// which must be for `sig` (EINVAL), with a code reserved to the kernel
-/// only from the process's own leader thread (EPERM)
-fn pidfd_info(uinfo: u64, sig: u32, pid: u64) -> Result<crate::signal::SendInfo, KernelError> {
-    use crate::signal::{SendInfo, SigInfo};
+/// pidfd_send_signal's scope flags (include/uapi/linux/pidfd.h)
+const PIDFD_SIGNAL_THREAD: u32 = 1 << 0;
+const PIDFD_SIGNAL_THREAD_GROUP: u32 = 1 << 1;
+const PIDFD_SIGNAL_PROCESS_GROUP: u32 = 1 << 2;
+
+/// Whom pidfd_send_signal signals (Linux PIDTYPE_PID, _TGID, _PGID)
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Scope {
+    Thread,
+    Process,
+    Pgrp,
+}
+
+/// The info pidfd_send_signal sends to `pid`'s `scope` (Linux
+/// do_pidfd_send_signal): without `uinfo`, kill's (tkill's, SI_TKILL,
+/// to a thread: prepare_kill_siginfo); else that siginfo, which must be
+/// for `sig` (EINVAL), with a code reserved to the kernel only to the
+/// caller's own thread or process (EPERM)
+fn pidfd_info(
+    uinfo: u64,
+    sig: u32,
+    pid: u64,
+    scope: Scope,
+) -> Result<crate::signal::SendInfo, KernelError> {
+    use crate::signal::{SendInfo, SigInfo, si_code};
     if uinfo == 0 {
-        return Ok(SendInfo::User);
+        if scope != Scope::Thread {
+            return Ok(SendInfo::User);
+        }
+        let me = super::percpu::current_pid() as i32;
+        let uid = crate::task::current_cred().uid;
+        return Ok(SendInfo::Info(SigInfo::kill(
+            sig,
+            si_code::SI_TKILL,
+            me,
+            uid,
+        )));
     }
     let info = SigInfo::copy_from_user(uinfo)?;
     if info.sig() != sig {
         return Err(KernelError::InvalidArgument);
     }
     let me = super::percpu::current_tid();
-    if me != pid && crate::signal::syscall::reserved_to_kernel(info.code) {
+    if (me != pid || scope == Scope::Pgrp) && crate::signal::syscall::reserved_to_kernel(info.code)
+    {
         return Err(KernelError::NotPermitted);
     }
     Ok(SendInfo::Info(info))

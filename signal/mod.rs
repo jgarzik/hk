@@ -1709,22 +1709,65 @@ pub fn kill_pid_info(
     info: SendInfo,
     check: impl Fn(&crate::task::percpu::TaskView<'_>) -> i32,
 ) -> i32 {
+    kill_pid_info_type(pid, sig, info, PidType::Tgid, check)
+}
+
+/// `sig` with `info` to the task struct pid `pid` names (`ty` Pid) or
+/// its thread group (`ty` Tgid), after `check` of that task allows it
+/// (Linux kill_pid_info_type)
+pub fn kill_pid_info_type(
+    pid: &crate::task::pid::Pid,
+    sig: u32,
+    info: SendInfo,
+    ty: PidType,
+    check: impl Fn(&crate::task::percpu::TaskView<'_>) -> i32,
+) -> i32 {
     let t = {
         let table = TASKLIST.read();
-        let leader = table.pid_tid(pid).and_then(|tid| table.get(tid));
-        let Some(l) = leader else {
+        let found = table.pid_tid(pid).and_then(|tid| table.get(tid));
+        let Some(v) = found else {
             return -3; // ESRCH
         };
-        let e = check(&l);
+        let e = check(&v);
         if e != 0 {
             return e;
         }
-        group_task(&table, Some(l))
+        match ty {
+            PidType::Pid => table.task(v.task.tid()),
+            PidType::Tgid => group_task(&table, Some(v)),
+        }
     };
     match t {
-        Some(t) => send_task(&t, sig, info, PidType::Tgid, false),
+        Some(t) => send_task(&t, sig, info, ty, false),
         None => -3,
     }
+}
+
+/// `sig` with `info` once to each process of the group struct pid `pg`
+/// names, after `check` of its leader allows it (Linux kill_pgrp_info:
+/// the reference cannot come to name another group); signal 0 only
+/// checks. 0 if any process got it, else the last error (ESRCH for an
+/// empty group).
+pub fn kill_pgrp_info(
+    pg: &crate::task::pid::Pid,
+    sig: u32,
+    info: SendInfo,
+    check: impl Fn(&crate::task::percpu::TaskView<'_>) -> i32,
+) -> i32 {
+    let procs = crate::task::percpu::GlobalTaskTable::collect_pgrp(pg, |table, t| {
+        Some((check(t), group_task(table, Some(*t))))
+    });
+    let mut ret = -3; // ESRCH
+    let mut ok = false;
+    for (e, t) in &procs {
+        ret = match t {
+            Some(t) if *e == 0 => send_task(t, sig, info, PidType::Tgid, false),
+            Some(_) => *e,
+            None => -3,
+        };
+        ok |= ret == 0;
+    }
+    if ok { 0 } else { ret }
 }
 
 /// Send signal to all processes in a process group, from the kernel

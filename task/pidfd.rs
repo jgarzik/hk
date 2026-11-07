@@ -37,13 +37,19 @@ use crate::task::Pid;
 pub mod pidfd_flags {
     /// Non-blocking mode
     pub const PIDFD_NONBLOCK: u32 = 0o4000; // O_NONBLOCK
+    /// A thread's pidfd, any thread's (O_EXCL; Linux 6.9)
+    pub const PIDFD_THREAD: u32 = 0o200;
 }
 
 /// A pidfd (Linux: the file's private data is the struct pid): a
-/// reference to the process's leader `Pid`, so a recycled number never
-/// names another process
+/// reference to its task's `Pid` (a process's leader, or with
+/// PIDFD_THREAD any thread), so a recycled number never names another
+/// task
 pub struct Pidfd {
     pid: Arc<crate::task::pid::Pid>,
+    /// Opened with PIDFD_THREAD (Linux f_flags & PIDFD_THREAD): signals
+    /// go to the thread by default
+    thread: bool,
 }
 
 impl Pidfd {
@@ -55,6 +61,11 @@ impl Pidfd {
     /// Its `Pid`
     pub fn pid_ref(&self) -> &Arc<crate::task::pid::Pid> {
         &self.pid
+    }
+
+    /// A thread pidfd (PIDFD_THREAD)
+    pub fn thread(&self) -> bool {
+        self.thread
     }
 
     /// Readable once its task exited, its whole group if it leads one;
@@ -110,15 +121,16 @@ fn find(pid: Pid) -> Result<Arc<crate::task::pid::Pid>, KernelError> {
     crate::task::pid::find_pid(&crate::ns::INIT_PID_NS, nr).ok_or(KernelError::NoProcess)
 }
 
-/// pidfd_open's pidfd for process `pid` (Linux pidfd_prepare): ESRCH
+/// pidfd_open's pidfd for task `pid` (Linux pidfd_prepare): ESRCH
 /// once its task is released, ENOENT for a thread that does not lead
-/// its group
+/// its group unless PIDFD_THREAD asks for a thread's
 pub fn open_pidfd(pid: Pid, file_flags: u32) -> Result<Arc<File>, KernelError> {
     let p = find(pid)?;
+    let thread = file_flags & pidfd_flags::PIDFD_THREAD != 0;
     {
         let table = crate::task::percpu::TASKLIST.read();
         let tid = table.pid_tid(&p).ok_or(KernelError::NoProcess)?;
-        if !table.get(tid).is_some_and(|t| t.leader) {
+        if !thread && !table.get(tid).is_some_and(|t| t.leader) {
             return Err(KernelError::NotFound);
         }
     }
@@ -127,7 +139,8 @@ pub fn open_pidfd(pid: Pid, file_flags: u32) -> Result<Arc<File>, KernelError> {
 
 /// A pidfd file for `pid`
 fn pidfd_file(pid: Arc<crate::task::pid::Pid>, file_flags: u32) -> Result<Arc<File>, KernelError> {
-    let pidfd = try_arc(Pidfd { pid })?;
+    let thread = file_flags & pidfd_flags::PIDFD_THREAD != 0;
+    let pidfd = try_arc(Pidfd { pid, thread })?;
     let mut f_flags = flags::O_RDONLY;
     if file_flags & pidfd_flags::PIDFD_NONBLOCK != 0 {
         f_flags |= flags::O_NONBLOCK;
