@@ -136,7 +136,9 @@ fn mc_add(s: &PacketSock, m: Mreq) -> Result<(), KernelError> {
     {
         let mut l = s.mclist.lock();
         if let Some(e) = l.iter_mut().find(|e| e.same(&m)) {
-            e.count += 1;
+            // ENOBUFS, packet_mc_add's error for a membership it cannot
+            // take, rather than a count that wraps to 0
+            e.count = e.count.checked_add(1).ok_or(KernelError::NoBufferSpace)?;
             return Ok(());
         }
         l.push(m);

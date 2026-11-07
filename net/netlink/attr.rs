@@ -115,10 +115,16 @@ impl Msg {
         off
     }
 
-    /// Close a nest opened at `off`
-    pub fn nest_end(&mut self, off: usize) {
-        let len = (self.buf.len() - off) as u16;
+    /// Close a nest opened at `off`. A nest past nla_len's 16 bits is
+    /// cancelled (trimmed off) and EMSGSIZE (Linux nla_nest_end_safe,
+    /// then nla_nest_cancel), never written with a truncated length.
+    pub fn nest_end(&mut self, off: usize) -> Result<(), KernelError> {
+        let Ok(len) = u16::try_from(self.buf.len() - off) else {
+            self.buf.truncate(off);
+            return Err(KernelError::MessageTooLong);
+        };
         self.buf[off..off + 2].copy_from_slice(&len.to_ne_bytes());
+        Ok(())
     }
 
     /// Finish: set nlmsg_len and return the bytes (length 4-aligned)
@@ -226,7 +232,7 @@ mod tests {
         m.put(&[1, 2, 3]).u32(4, 1500).str(3, "eth0");
         let n = m.nest_start(26);
         m.u8(1, 5);
-        m.nest_end(n);
+        m.nest_end(n).unwrap();
         let b = m.finish();
         assert_eq!(b.len() % 4, 0);
         let h = Hdr::parse(&b).unwrap();
@@ -237,6 +243,22 @@ mod tests {
         assert_eq!(a.str(3, 16).unwrap(), Some("eth0"));
         let nest = Attrs::parse(a.get(26).unwrap(), 2).unwrap();
         assert_eq!(nest.u8(1).unwrap(), Some(5));
+    }
+
+    #[test]
+    fn nest_overflow_cancels() {
+        let mut m = Msg::new(16, 0, 0, 0);
+        m.u32(4, 1);
+        let before = m.buf.len();
+        let n = m.nest_start(26);
+        let big = alloc::vec![0u8; 60_000];
+        m.attr(1, &big).attr(2, &big);
+        assert_eq!(m.nest_end(n), Err(KernelError::MessageTooLong));
+        assert_eq!(m.buf.len(), before);
+        let b = m.finish();
+        let a = Attrs::parse(&b[NLMSG_HDRLEN..], 30).unwrap();
+        assert_eq!(a.u32(4).unwrap(), Some(1));
+        assert!(a.get(26).is_none());
     }
 
     #[test]

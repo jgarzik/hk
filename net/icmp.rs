@@ -534,7 +534,11 @@ pub fn icmp_send(net: &NetNamespace, o: &Offender<'_>, ty: u8, code: u8, rest: [
         }
         net.icmp.consume();
     }
-    let room = (rt.mtu as usize).min(576) - IP_HLEN_MIN - ICMP_HLEN;
+    // A route MTU below the headers leaves no room (no wrap to a huge
+    // quote; Linux __icmp_send's room is an int that goes negative)
+    let room = (rt.mtu as usize)
+        .min(576)
+        .saturating_sub(IP_HLEN_MIN + ICMP_HLEN);
     if room <= IP_HLEN_MIN {
         return;
     }
