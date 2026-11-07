@@ -39,6 +39,7 @@ struct Linger {
     l_onoff: i32,
     l_linger: i32,
 }
+use crate::tests::harness::pass;
 use crate::tests::helpers::{print, print_num, println};
 
 /// Run all socket tests
@@ -90,7 +91,7 @@ fn test_socket_create() {
     if fd >= 0 {
         // Clean up
         sys_close(fd as u64);
-        println(b"SOCKET_CREATE:OK");
+        pass(b"SOCKET_CREATE");
     } else {
         println(b"SOCKET_CREATE:FAIL");
     }
@@ -106,7 +107,7 @@ fn test_socket_create_nonblock() {
 
     if fd >= 0 {
         sys_close(fd as u64);
-        println(b"SOCKET_NONBLOCK:OK");
+        pass(b"SOCKET_NONBLOCK");
     } else {
         println(b"SOCKET_NONBLOCK:FAIL");
     }
@@ -120,7 +121,7 @@ fn test_socket_invalid_domain() {
     print_num(fd);
 
     if fd == -97 {
-        println(b"SOCKET_INVALID:OK");
+        pass(b"SOCKET_INVALID");
     } else {
         if fd >= 0 {
             sys_close(fd as u64);
@@ -153,7 +154,7 @@ fn test_bind_any() {
     sys_close(fd as u64);
 
     if ret == 0 {
-        println(b"SOCKET_BIND:OK");
+        pass(b"SOCKET_BIND");
     } else {
         println(b"SOCKET_BIND:FAIL");
     }
@@ -203,7 +204,7 @@ fn test_getsockname() {
 
     // Verify we got back the port we bound to
     if ret == 0 && u16::from_be(out_addr.sin_port) == port {
-        println(b"SOCKET_GETSOCKNAME:OK");
+        pass(b"SOCKET_GETSOCKNAME");
     } else {
         println(b"SOCKET_GETSOCKNAME:FAIL");
     }
@@ -242,7 +243,7 @@ fn test_listen() {
     sys_close(fd as u64);
 
     if ret == 0 {
-        println(b"SOCKET_LISTEN:OK");
+        pass(b"SOCKET_LISTEN");
     } else {
         println(b"SOCKET_LISTEN:FAIL");
     }
@@ -291,7 +292,7 @@ fn test_shutdown() {
 
     // Not connected: ENOTCONN for every direction (Linux inet_shutdown)
     if ret_rd == -107 && ret_wr == -107 && ret_rdwr == -107 {
-        println(b"SOCKET_SHUTDOWN:OK");
+        pass(b"SOCKET_SHUTDOWN");
     } else {
         println(b"SOCKET_SHUTDOWN:FAIL");
     }
@@ -316,7 +317,7 @@ fn test_socket_close() {
     print_num(ret2);
 
     if ret1 == 0 && ret2 == -9 {
-        println(b"SOCKET_CLOSE:OK");
+        pass(b"SOCKET_CLOSE");
     } else {
         println(b"SOCKET_CLOSE:FAIL");
     }
@@ -331,7 +332,7 @@ fn test_socket_dgram() {
 
     if fd >= 0 {
         sys_close(fd as u64);
-        println(b"SOCKET_DGRAM:OK");
+        pass(b"SOCKET_DGRAM");
     } else {
         println(b"SOCKET_DGRAM:FAIL");
     }
@@ -375,7 +376,7 @@ fn test_udp_bind() {
     sys_close(fd as u64);
 
     if ret == 0 && ret2 == 0 && bound_port == port {
-        println(b"UDP_BIND:OK");
+        pass(b"UDP_BIND");
     } else {
         println(b"UDP_BIND:FAIL");
     }
@@ -398,7 +399,7 @@ fn test_socketpair() {
     // AF_INET has no socket pairs (Linux sock_no_socketpair; Linux has
     // already stored descriptor numbers in sv, which it then releases)
     if ret == -95 {
-        println(b"SOCKETPAIR:OK");
+        pass(b"SOCKETPAIR");
     } else {
         println(b"SOCKETPAIR:FAIL");
     }
@@ -435,7 +436,7 @@ fn test_sendmsg_recvmsg() {
     sys_close(fd as u64);
 
     if ret == -32 {
-        println(b"SENDMSG_RECVMSG:OK");
+        pass(b"SENDMSG_RECVMSG");
     } else {
         println(b"SENDMSG_RECVMSG:FAIL");
     }
@@ -570,7 +571,7 @@ fn test_udp_loopback() {
         sys_wait4(-1, &mut status, 0, 0);
 
         if (status >> 8) == 0 {
-            println(b"UDP_LOOPBACK:OK");
+            pass(b"UDP_LOOPBACK");
         } else {
             println(b"UDP_LOOPBACK:FAIL");
         }
@@ -601,7 +602,7 @@ fn test_setsockopt_reuseaddr() {
     sys_close(fd as u64);
 
     if ret == 0 {
-        println(b"SOCKOPT_REUSEADDR:OK");
+        pass(b"SOCKOPT_REUSEADDR");
     } else {
         println(b"SOCKOPT_REUSEADDR:FAIL");
     }
@@ -631,7 +632,7 @@ fn test_setsockopt_tcp_nodelay() {
     sys_close(fd as u64);
 
     if ret == 0 {
-        println(b"SOCKOPT_NODELAY:OK");
+        pass(b"SOCKOPT_NODELAY");
     } else {
         println(b"SOCKOPT_NODELAY:FAIL");
     }
@@ -680,7 +681,7 @@ fn test_getsockopt_roundtrip() {
     sys_close(fd as u64);
 
     if ret2 == 0 && get_val == 1 {
-        println(b"SOCKOPT_ROUNDTRIP:OK");
+        pass(b"SOCKOPT_ROUNDTRIP");
     } else {
         println(b"SOCKOPT_ROUNDTRIP:FAIL");
     }
@@ -714,7 +715,7 @@ fn test_getsockopt_so_type() {
 
     // SOCK_STREAM = 1
     if ret == 0 && sock_type == 1 {
-        println(b"SOCKOPT_SO_TYPE:OK");
+        pass(b"SOCKOPT_SO_TYPE");
     } else {
         println(b"SOCKOPT_SO_TYPE:FAIL");
     }
@@ -747,7 +748,7 @@ fn test_getsockopt_so_domain() {
 
     // AF_INET = 2
     if ret == 0 && domain == 2 {
-        println(b"SOCKOPT_SO_DOMAIN:OK");
+        pass(b"SOCKOPT_SO_DOMAIN");
     } else {
         println(b"SOCKOPT_SO_DOMAIN:FAIL");
     }
@@ -780,7 +781,7 @@ fn test_getsockopt_so_protocol() {
 
     // IPPROTO_TCP = 6
     if ret == 0 && protocol == 6 {
-        println(b"SOCKOPT_SO_PROTOCOL:OK");
+        pass(b"SOCKOPT_SO_PROTOCOL");
     } else {
         println(b"SOCKOPT_SO_PROTOCOL:FAIL");
     }
@@ -834,7 +835,7 @@ fn test_sockopt_broadcast() {
     sys_close(fd as u64);
 
     if ret2 == 0 && get_val == 1 {
-        println(b"SOCKOPT_BROADCAST:OK");
+        pass(b"SOCKOPT_BROADCAST");
     } else {
         println(b"SOCKOPT_BROADCAST:FAIL");
     }
@@ -891,7 +892,7 @@ fn test_sockopt_linger() {
     sys_close(fd as u64);
 
     if ret2 == 0 && get_linger.l_onoff == 1 && get_linger.l_linger == 5 {
-        println(b"SOCKET_LINGER:OK");
+        pass(b"SOCKET_LINGER");
     } else {
         println(b"SOCKET_LINGER:FAIL");
     }
@@ -975,7 +976,7 @@ fn test_tcp_keepalive_options() {
     sys_close(fd as u64);
 
     if ret1 == 0 && ret2 == 0 && ret3 == 0 && get_idle == 60 && get_intvl == 10 && get_cnt == 5 {
-        println(b"TCP_KEEPALIVE:OK");
+        pass(b"TCP_KEEPALIVE");
     } else {
         println(b"TCP_KEEPALIVE:FAIL");
     }

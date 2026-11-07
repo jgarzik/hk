@@ -44,6 +44,13 @@ pub fn fail_why(name: &[u8], why: &[u8], v: i64) {
     println(b"");
 }
 
+/// The FAIL line `msg` N (msg holds NAME:FAIL and the why)
+pub fn fail_num(msg: &[u8], v: i64) {
+    print(msg);
+    print_num(v);
+    println(b"");
+}
+
 /// NAME:OK if `ok`, else NAME:FAIL got N
 pub fn verdict(name: &[u8], ok: bool, got: i64) {
     print(name);

@@ -19,6 +19,7 @@
 //! - Test copy_file_range with offset pointers
 //! - Test copy_file_range returns EBADF for invalid fd
 
+use crate::tests::harness::{fail_num, pass};
 use crate::tests::helpers::{print, print_num, println};
 use hk_syscall::{
     O_CREAT, O_RDWR, O_TRUNC, SEEK_END, SEEK_SET, sys_close, sys_copy_file_range, sys_fallocate,
@@ -88,7 +89,7 @@ fn test_flock_exclusive() {
     }
 
     sys_close(fd as u64);
-    println(b"FLOCK_EXCLUSIVE:OK");
+    pass(b"FLOCK_EXCLUSIVE");
 }
 
 /// Test flock with LOCK_SH
@@ -122,7 +123,7 @@ fn test_flock_shared() {
     }
 
     sys_close(fd as u64);
-    println(b"FLOCK_SHARED:OK");
+    pass(b"FLOCK_SHARED");
 }
 
 /// Test flock with LOCK_NB on locked file
@@ -158,14 +159,14 @@ fn test_flock_nonblock() {
     // Release lock
     let _ = sys_flock(fd as i32, LOCK_UN);
     sys_close(fd as u64);
-    println(b"FLOCK_NONBLOCK:OK");
+    pass(b"FLOCK_NONBLOCK");
 }
 
 /// Test flock returns EBADF for invalid fd
 fn test_flock_ebadf() {
     let ret = sys_flock(9999, LOCK_EX);
     if ret == EBADF {
-        println(b"FLOCK_EBADF:OK");
+        pass(b"FLOCK_EBADF");
     } else {
         print(b"FLOCK_EBADF:FAIL: expected -9, got ");
         print_num(ret);
@@ -203,7 +204,7 @@ fn test_fallocate_extend() {
     }
 
     if size == 1024 {
-        println(b"FALLOCATE_EXTEND:OK");
+        pass(b"FALLOCATE_EXTEND");
     } else {
         print(b"FALLOCATE_EXTEND:FAIL: expected size 1024, got ");
         print_num(size);
@@ -253,7 +254,7 @@ fn test_fallocate_keep_size() {
     }
 
     if size == 5 {
-        println(b"FALLOCATE_KEEP_SIZE:OK");
+        pass(b"FALLOCATE_KEEP_SIZE");
     } else {
         print(b"FALLOCATE_KEEP_SIZE:FAIL: expected size 5, got ");
         print_num(size);
@@ -266,7 +267,7 @@ fn test_fallocate_keep_size() {
 fn test_fallocate_ebadf() {
     let ret = sys_fallocate(9999, 0, 0, 1024);
     if ret == EBADF {
-        println(b"FALLOCATE_EBADF:OK");
+        pass(b"FALLOCATE_EBADF");
     } else {
         print(b"FALLOCATE_EBADF:FAIL: expected -9, got ");
         print_num(ret);
@@ -348,7 +349,7 @@ fn test_copy_file_range_basic() {
     }
 
     if ret as usize == test_data.len() && &buf[..test_data.len()] == test_data {
-        println(b"COPY_FILE_RANGE_BASIC:OK");
+        pass(b"COPY_FILE_RANGE_BASIC");
     } else {
         print(b"COPY_FILE_RANGE_BASIC:FAIL: data mismatch, read ");
         print_num(ret);
@@ -442,7 +443,7 @@ fn test_copy_file_range_with_offsets() {
     }
 
     if &buf[..8] == b"EFGHIJKL" {
-        println(b"COPY_FILE_RANGE_OFFSETS:OK");
+        pass(b"COPY_FILE_RANGE_OFFSETS");
     } else {
         print(b"COPY_FILE_RANGE_OFFSETS:FAIL: data mismatch\n");
     }
@@ -462,7 +463,7 @@ fn test_copy_file_range_ebadf() {
         0,
     );
     if ret == EBADF {
-        println(b"COPY_FILE_RANGE_EBADF:OK");
+        pass(b"COPY_FILE_RANGE_EBADF");
     } else {
         print(b"COPY_FILE_RANGE_EBADF:FAIL: expected -9, got ");
         print_num(ret);
@@ -487,11 +488,9 @@ fn test_flock_release_exit() {
     let r = sys_flock(fd as i32, LOCK_EX | LOCK_NB);
     sys_close(fd as u64);
     if st == 0 && r == 0 {
-        println(b"FLOCK_RELEASE_EXIT:OK");
+        pass(b"FLOCK_RELEASE_EXIT");
     } else {
-        print(b"FLOCK_RELEASE_EXIT:FAIL got ");
-        print_num(r);
-        println(b"");
+        fail_num(b"FLOCK_RELEASE_EXIT:FAIL got ", r);
     }
 }
 
@@ -523,11 +522,9 @@ fn test_flock_ofd() {
     sys_flock(fd as i32, LOCK_UN);
     sys_close(fd as u64);
     if st == 0 {
-        println(b"FLOCK_OFD:OK");
+        pass(b"FLOCK_OFD");
     } else {
-        print(b"FLOCK_OFD:FAIL status ");
-        print_num(st as i64);
-        println(b"");
+        fail_num(b"FLOCK_OFD:FAIL status ", st as i64);
     }
 }
 
@@ -548,10 +545,8 @@ fn test_flock_hardlink() {
     sys_unlink(a.as_ptr());
     sys_unlink(b.as_ptr());
     if linked == 0 && ex == 0 && other == EWOULDBLOCK {
-        println(b"FLOCK_HARDLINK:OK");
+        pass(b"FLOCK_HARDLINK");
     } else {
-        print(b"FLOCK_HARDLINK:FAIL got ");
-        print_num(other);
-        println(b"");
+        fail_num(b"FLOCK_HARDLINK:FAIL got ", other);
     }
 }

@@ -3,7 +3,8 @@
 //! with EAGAIN; exited and reaped tasks give their slot back, and failed
 //! clones never leak one.
 
-use crate::tests::helpers::{print, print_num, println};
+use crate::tests::harness::fail_num;
+use crate::tests::helpers::{print, println};
 use hk_syscall::{
     CLONE_SIGHAND, CLONE_VM, RLIMIT_NPROC, RLimit, Timespec, sys_clone, sys_execve, sys_exit,
     sys_fork, sys_kill, sys_nanosleep, sys_sched_yield, sys_setrlimit, sys_setuid, sys_wait4,
@@ -116,9 +117,7 @@ fn run(name: &[u8], f: fn() -> u64) {
     if st == 0 {
         println(b":OK");
     } else {
-        print(b":FAIL step ");
-        print_num((st >> 8) as i64);
-        println(b"");
+        fail_num(b":FAIL step ", (st >> 8) as i64);
     }
 }
 

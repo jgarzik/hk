@@ -7,6 +7,7 @@
 //! - Large anonymous mmap with demand paging
 //! - mlock/mlock2/munlock/mlockall/munlockall
 
+use crate::tests::harness::{fail_num, pass};
 use crate::tests::helpers::{print, print_num, println};
 use hk_syscall::{
     MADV_COLD, MADV_DONTNEED, MADV_KEEPONFORK, MADV_NORMAL, MADV_PAGEOUT, MADV_RANDOM,
@@ -119,7 +120,7 @@ fn test_anonymous_mmap() {
     // Clean up
     let ret = sys_munmap(ptr as u64, 4096);
     if ret == 0 {
-        println(b"MMAP_ANON:OK");
+        pass(b"MMAP_ANON");
     } else {
         print(b"MMAP_ANON:FAIL munmap errno=");
         print_num(-ret);
@@ -153,7 +154,7 @@ fn test_mmap_write_read() {
     let read_val = unsafe { core::ptr::read_volatile(ptr as *const u32) };
 
     if read_val == pattern {
-        println(b"MMAP_RW:OK");
+        pass(b"MMAP_RW");
     } else {
         print(b"MMAP_RW:FAIL expected 0xDEADBEEF got ");
         print_num(read_val as i64);
@@ -182,7 +183,7 @@ fn test_munmap() {
     // Unmap the memory
     let ret = sys_munmap(ptr as u64, 4096);
     if ret == 0 {
-        println(b"MUNMAP:OK");
+        pass(b"MUNMAP");
     } else {
         print(b"MUNMAP:FAIL errno=");
         print_num(-ret);
@@ -240,7 +241,7 @@ fn test_large_anonymous_mmap() {
     sys_munmap(base, size);
 
     if success {
-        println(b"MMAP_LARGE:OK");
+        pass(b"MMAP_LARGE");
     }
 }
 
@@ -257,9 +258,7 @@ fn test_mmap_locked() {
     );
 
     if ptr < 0 {
-        print(b"MMAP_LOCKED:FAIL mmap errno=");
-        print_num(-ptr);
-        println(b"");
+        fail_num(b"MMAP_LOCKED:FAIL mmap errno=", -ptr);
         return;
     }
 
@@ -270,15 +269,13 @@ fn test_mmap_locked() {
 
     let val = unsafe { core::ptr::read_volatile(ptr as *const u8) };
     if val != 42 {
-        print(b"MMAP_LOCKED:FAIL read mismatch got ");
-        print_num(val as i64);
-        println(b"");
+        fail_num(b"MMAP_LOCKED:FAIL read mismatch got ", val as i64);
         sys_munmap(ptr as u64, 4096);
         return;
     }
 
     sys_munmap(ptr as u64, 4096);
-    println(b"MMAP_LOCKED:OK");
+    pass(b"MMAP_LOCKED");
 }
 
 // ============================================================================
@@ -298,18 +295,14 @@ fn test_mlock_basic() {
     );
 
     if ptr < 0 {
-        print(b"MLOCK_BASIC:FAIL mmap errno=");
-        print_num(-ptr);
-        println(b"");
+        fail_num(b"MLOCK_BASIC:FAIL mmap errno=", -ptr);
         return;
     }
 
     // Lock it
     let ret = sys_mlock(ptr as u64, 4096);
     if ret != 0 {
-        print(b"MLOCK_BASIC:FAIL mlock errno=");
-        print_num(-ret);
-        println(b"");
+        fail_num(b"MLOCK_BASIC:FAIL mlock errno=", -ret);
         sys_munmap(ptr as u64, 4096);
         return;
     }
@@ -322,9 +315,7 @@ fn test_mlock_basic() {
     // Read it back
     let val = unsafe { core::ptr::read_volatile(ptr as *const u8) };
     if val != 42 {
-        print(b"MLOCK_BASIC:FAIL read mismatch got ");
-        print_num(val as i64);
-        println(b"");
+        fail_num(b"MLOCK_BASIC:FAIL read mismatch got ", val as i64);
         sys_munmap(ptr as u64, 4096);
         return;
     }
@@ -332,15 +323,13 @@ fn test_mlock_basic() {
     // Unlock
     let ret = sys_munlock(ptr as u64, 4096);
     if ret != 0 {
-        print(b"MLOCK_BASIC:FAIL munlock errno=");
-        print_num(-ret);
-        println(b"");
+        fail_num(b"MLOCK_BASIC:FAIL munlock errno=", -ret);
         sys_munmap(ptr as u64, 4096);
         return;
     }
 
     sys_munmap(ptr as u64, 4096);
-    println(b"MLOCK_BASIC:OK");
+    pass(b"MLOCK_BASIC");
 }
 
 /// Test: mlock2 with MLOCK_ONFAULT flag
@@ -355,18 +344,14 @@ fn test_mlock2_onfault() {
     );
 
     if ptr < 0 {
-        print(b"MLOCK2_ONFAULT:FAIL mmap errno=");
-        print_num(-ptr);
-        println(b"");
+        fail_num(b"MLOCK2_ONFAULT:FAIL mmap errno=", -ptr);
         return;
     }
 
     // Lock with MLOCK_ONFAULT - pages are locked on first access
     let ret = sys_mlock2(ptr as u64, 4096, MLOCK_ONFAULT);
     if ret != 0 {
-        print(b"MLOCK2_ONFAULT:FAIL mlock2 errno=");
-        print_num(-ret);
-        println(b"");
+        fail_num(b"MLOCK2_ONFAULT:FAIL mlock2 errno=", -ret);
         sys_munmap(ptr as u64, 4096);
         return;
     }
@@ -379,16 +364,14 @@ fn test_mlock2_onfault() {
     // Verify read
     let val = unsafe { core::ptr::read_volatile(ptr as *const u8) };
     if val != 42 {
-        print(b"MLOCK2_ONFAULT:FAIL read mismatch got ");
-        print_num(val as i64);
-        println(b"");
+        fail_num(b"MLOCK2_ONFAULT:FAIL read mismatch got ", val as i64);
         sys_munmap(ptr as u64, 4096);
         return;
     }
 
     sys_munlock(ptr as u64, 4096);
     sys_munmap(ptr as u64, 4096);
-    println(b"MLOCK2_ONFAULT:OK");
+    pass(b"MLOCK2_ONFAULT");
 }
 
 /// Test: mlock2 with invalid flags returns EINVAL
@@ -404,9 +387,7 @@ fn test_mlock2_invalid_flags() {
     );
 
     if ptr < 0 {
-        print(b"MLOCK2_EINVAL:FAIL mmap errno=");
-        print_num(-ptr);
-        println(b"");
+        fail_num(b"MLOCK2_EINVAL:FAIL mmap errno=", -ptr);
         return;
     }
 
@@ -415,11 +396,9 @@ fn test_mlock2_invalid_flags() {
     if ret == -22 {
         // EINVAL
         sys_munmap(ptr as u64, 4096);
-        println(b"MLOCK2_EINVAL:OK");
+        pass(b"MLOCK2_EINVAL");
     } else {
-        print(b"MLOCK2_EINVAL:FAIL expected -22, got ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"MLOCK2_EINVAL:FAIL expected -22, got ", ret);
         sys_munmap(ptr as u64, 4096);
     }
 }
@@ -437,18 +416,14 @@ fn test_mlockall_current() {
     );
 
     if ptr < 0 {
-        print(b"MLOCKALL_CURRENT:FAIL mmap errno=");
-        print_num(-ptr);
-        println(b"");
+        fail_num(b"MLOCKALL_CURRENT:FAIL mmap errno=", -ptr);
         return;
     }
 
     // Lock all current
     let ret = sys_mlockall(MCL_CURRENT);
     if ret != 0 {
-        print(b"MLOCKALL_CURRENT:FAIL mlockall errno=");
-        print_num(-ret);
-        println(b"");
+        fail_num(b"MLOCKALL_CURRENT:FAIL mlockall errno=", -ret);
         sys_munmap(ptr as u64, 4096);
         return;
     }
@@ -461,15 +436,13 @@ fn test_mlockall_current() {
     // Unlock all
     let ret = sys_munlockall();
     if ret != 0 {
-        print(b"MLOCKALL_CURRENT:FAIL munlockall errno=");
-        print_num(-ret);
-        println(b"");
+        fail_num(b"MLOCKALL_CURRENT:FAIL munlockall errno=", -ret);
         sys_munmap(ptr as u64, 4096);
         return;
     }
 
     sys_munmap(ptr as u64, 4096);
-    println(b"MLOCKALL_CURRENT:OK");
+    pass(b"MLOCKALL_CURRENT");
 }
 
 /// Test: mlockall with invalid flags returns EINVAL
@@ -477,22 +450,18 @@ fn test_mlockall_invalid_flags() {
     // 0 is invalid
     let ret = sys_mlockall(0);
     if ret != -22 {
-        print(b"MLOCKALL_EINVAL_ZERO:FAIL expected -22, got ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"MLOCKALL_EINVAL_ZERO:FAIL expected -22, got ", ret);
         return;
     }
 
     // MCL_ONFAULT alone is invalid (must be combined with MCL_CURRENT or MCL_FUTURE)
     let ret = sys_mlockall(MCL_ONFAULT);
     if ret != -22 {
-        print(b"MLOCKALL_EINVAL_ONFAULT:FAIL expected -22, got ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"MLOCKALL_EINVAL_ONFAULT:FAIL expected -22, got ", ret);
         return;
     }
 
-    println(b"MLOCKALL_EINVAL:OK");
+    pass(b"MLOCKALL_EINVAL");
 }
 
 /// Test: munlockall unlocks all mappings
@@ -500,11 +469,9 @@ fn test_munlockall() {
     // Just verify munlockall returns success
     let ret = sys_munlockall();
     if ret == 0 {
-        println(b"MUNLOCKALL:OK");
+        pass(b"MUNLOCKALL");
     } else {
-        print(b"MUNLOCKALL:FAIL errno=");
-        print_num(-ret);
-        println(b"");
+        fail_num(b"MUNLOCKALL:FAIL errno=", -ret);
     }
 }
 
@@ -525,18 +492,14 @@ fn test_mprotect_add_write() {
     );
 
     if ptr < 0 {
-        print(b"MPROTECT_ADD_WRITE:FAIL mmap errno=");
-        print_num(-ptr);
-        println(b"");
+        fail_num(b"MPROTECT_ADD_WRITE:FAIL mmap errno=", -ptr);
         return;
     }
 
     // Change to read-write
     let ret = sys_mprotect(ptr as u64, 4096, PROT_READ | PROT_WRITE);
     if ret != 0 {
-        print(b"MPROTECT_ADD_WRITE:FAIL mprotect errno=");
-        print_num(-ret);
-        println(b"");
+        fail_num(b"MPROTECT_ADD_WRITE:FAIL mprotect errno=", -ret);
         sys_munmap(ptr as u64, 4096);
         return;
     }
@@ -549,15 +512,13 @@ fn test_mprotect_add_write() {
     // Read it back
     let val = unsafe { core::ptr::read_volatile(ptr as *const u8) };
     if val != 42 {
-        print(b"MPROTECT_ADD_WRITE:FAIL read mismatch got ");
-        print_num(val as i64);
-        println(b"");
+        fail_num(b"MPROTECT_ADD_WRITE:FAIL read mismatch got ", val as i64);
         sys_munmap(ptr as u64, 4096);
         return;
     }
 
     sys_munmap(ptr as u64, 4096);
-    println(b"MPROTECT_ADD_WRITE:OK");
+    pass(b"MPROTECT_ADD_WRITE");
 }
 
 /// Test: mprotect with zero length is a no-op (success)
@@ -573,9 +534,7 @@ fn test_mprotect_zero_len() {
     );
 
     if ptr < 0 {
-        print(b"MPROTECT_ZERO_LEN:FAIL mmap errno=");
-        print_num(-ptr);
-        println(b"");
+        fail_num(b"MPROTECT_ZERO_LEN:FAIL mmap errno=", -ptr);
         return;
     }
 
@@ -583,11 +542,9 @@ fn test_mprotect_zero_len() {
     let ret = sys_mprotect(ptr as u64, 0, PROT_READ);
     if ret == 0 {
         sys_munmap(ptr as u64, 4096);
-        println(b"MPROTECT_ZERO_LEN:OK");
+        pass(b"MPROTECT_ZERO_LEN");
     } else {
-        print(b"MPROTECT_ZERO_LEN:FAIL expected 0, got ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"MPROTECT_ZERO_LEN:FAIL expected 0, got ", ret);
         sys_munmap(ptr as u64, 4096);
     }
 }
@@ -605,9 +562,7 @@ fn test_mprotect_invalid_addr() {
     );
 
     if ptr < 0 {
-        print(b"MPROTECT_EINVAL:FAIL mmap errno=");
-        print_num(-ptr);
-        println(b"");
+        fail_num(b"MPROTECT_EINVAL:FAIL mmap errno=", -ptr);
         return;
     }
 
@@ -616,11 +571,9 @@ fn test_mprotect_invalid_addr() {
     if ret == -22 {
         // EINVAL
         sys_munmap(ptr as u64, 4096);
-        println(b"MPROTECT_EINVAL:OK");
+        pass(b"MPROTECT_EINVAL");
     } else {
-        print(b"MPROTECT_EINVAL:FAIL expected -22, got ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"MPROTECT_EINVAL:FAIL expected -22, got ", ret);
         sys_munmap(ptr as u64, 4096);
     }
 }
@@ -642,9 +595,7 @@ fn test_mmap_shared_anon() {
     );
 
     if ptr < 0 {
-        print(b"MMAP_SHARED_ANON:FAIL mmap errno=");
-        print_num(-ptr);
-        println(b"");
+        fail_num(b"MMAP_SHARED_ANON:FAIL mmap errno=", -ptr);
         return;
     }
 
@@ -656,15 +607,13 @@ fn test_mmap_shared_anon() {
     // Read it back
     let val = unsafe { core::ptr::read_volatile(ptr as *const u32) };
     if val != 0xCAFEBABE {
-        print(b"MMAP_SHARED_ANON:FAIL read mismatch got ");
-        print_num(val as i64);
-        println(b"");
+        fail_num(b"MMAP_SHARED_ANON:FAIL read mismatch got ", val as i64);
         sys_munmap(ptr as u64, 4096);
         return;
     }
 
     sys_munmap(ptr as u64, 4096);
-    println(b"MMAP_SHARED_ANON:OK");
+    pass(b"MMAP_SHARED_ANON");
 }
 
 // ============================================================================
@@ -685,9 +634,7 @@ fn test_mmap_denywrite() {
     );
 
     if ptr < 0 {
-        print(b"MMAP_DENYWRITE:FAIL mmap errno=");
-        print_num(-ptr);
-        println(b"");
+        fail_num(b"MMAP_DENYWRITE:FAIL mmap errno=", -ptr);
         return;
     }
 
@@ -698,15 +645,13 @@ fn test_mmap_denywrite() {
 
     let val = unsafe { core::ptr::read_volatile(ptr as *const u32) };
     if val != 0xDEADC0DE {
-        print(b"MMAP_DENYWRITE:FAIL read mismatch got ");
-        print_num(val as i64);
-        println(b"");
+        fail_num(b"MMAP_DENYWRITE:FAIL read mismatch got ", val as i64);
         sys_munmap(ptr as u64, 4096);
         return;
     }
 
     sys_munmap(ptr as u64, 4096);
-    println(b"MMAP_DENYWRITE:OK");
+    pass(b"MMAP_DENYWRITE");
 }
 
 // ============================================================================
@@ -727,9 +672,7 @@ fn test_mmap_executable() {
     );
 
     if ptr < 0 {
-        print(b"MMAP_EXECUTABLE:FAIL mmap errno=");
-        print_num(-ptr);
-        println(b"");
+        fail_num(b"MMAP_EXECUTABLE:FAIL mmap errno=", -ptr);
         return;
     }
 
@@ -740,15 +683,13 @@ fn test_mmap_executable() {
 
     let val = unsafe { core::ptr::read_volatile(ptr as *const u32) };
     if val != 0xE0ECC0DE {
-        print(b"MMAP_EXECUTABLE:FAIL read mismatch got ");
-        print_num(val as i64);
-        println(b"");
+        fail_num(b"MMAP_EXECUTABLE:FAIL read mismatch got ", val as i64);
         sys_munmap(ptr as u64, 4096);
         return;
     }
 
     sys_munmap(ptr as u64, 4096);
-    println(b"MMAP_EXECUTABLE:OK");
+    pass(b"MMAP_EXECUTABLE");
 }
 
 // ============================================================================
@@ -767,9 +708,7 @@ fn test_mmap_growsdown_basic() {
     );
 
     if ptr < 0 {
-        print(b"MMAP_GROWSDOWN_BASIC:FAIL mmap errno=");
-        print_num(-ptr);
-        println(b"");
+        fail_num(b"MMAP_GROWSDOWN_BASIC:FAIL mmap errno=", -ptr);
         return;
     }
 
@@ -780,15 +719,13 @@ fn test_mmap_growsdown_basic() {
 
     let val = unsafe { core::ptr::read_volatile(ptr as *const u32) };
     if val != 0xDEADBEEF {
-        print(b"MMAP_GROWSDOWN_BASIC:FAIL value=");
-        print_num(val as i64);
-        println(b"");
+        fail_num(b"MMAP_GROWSDOWN_BASIC:FAIL value=", val as i64);
         sys_munmap(ptr as u64, 4096);
         return;
     }
 
     sys_munmap(ptr as u64, 4096);
-    println(b"MMAP_GROWSDOWN_BASIC:OK");
+    pass(b"MMAP_GROWSDOWN_BASIC");
 }
 
 /// Test: MAP_GROWSDOWN expansion - access below VMA expands it
@@ -803,9 +740,7 @@ fn test_mmap_growsdown_expand() {
     );
 
     if ptr < 0 {
-        print(b"MMAP_GROWSDOWN_EXPAND:FAIL mmap errno=");
-        print_num(-ptr);
-        println(b"");
+        fail_num(b"MMAP_GROWSDOWN_EXPAND:FAIL mmap errno=", -ptr);
         return;
     }
 
@@ -836,7 +771,7 @@ fn test_mmap_growsdown_expand() {
 
     // Unmap expanded region (start at the lower address)
     sys_munmap((ptr as u64).wrapping_sub(4096), 8192);
-    println(b"MMAP_GROWSDOWN_EXPAND:OK");
+    pass(b"MMAP_GROWSDOWN_EXPAND");
 }
 
 /// A growsdown VMA mremap moved up keeps its page offset (Linux
@@ -873,11 +808,9 @@ fn test_growsdown_moved_pgoff() {
     let mut st = 0i32;
     sys_wait4(pid, &mut st, 0, 0);
     if st & 0x7f == 11 {
-        println(b"MMAP_GROWSDOWN_MOVED_PGOFF:OK");
+        pass(b"MMAP_GROWSDOWN_MOVED_PGOFF");
     } else {
-        print(b"MMAP_GROWSDOWN_MOVED_PGOFF:FAIL status=");
-        print_num(st as i64);
-        println(b"");
+        fail_num(b"MMAP_GROWSDOWN_MOVED_PGOFF:FAIL status=", st as i64);
     }
 }
 
@@ -898,24 +831,20 @@ fn test_mprotect_growsdown() {
     );
 
     if ptr < 0 {
-        print(b"MPROTECT_GROWSDOWN:FAIL mmap errno=");
-        print_num(-ptr);
-        println(b"");
+        fail_num(b"MPROTECT_GROWSDOWN:FAIL mmap errno=", -ptr);
         return;
     }
 
     // mprotect upper page with PROT_GROWSDOWN - should extend to whole VMA
     let result = sys_mprotect(ptr as u64 + 4096, 4096, PROT_READ | PROT_GROWSDOWN);
     if result < 0 {
-        print(b"MPROTECT_GROWSDOWN:FAIL errno=");
-        print_num(-result);
-        println(b"");
+        fail_num(b"MPROTECT_GROWSDOWN:FAIL errno=", -result);
         sys_munmap(ptr as u64, 8192);
         return;
     }
 
     sys_munmap(ptr as u64, 8192);
-    println(b"MPROTECT_GROWSDOWN:OK");
+    pass(b"MPROTECT_GROWSDOWN");
 }
 
 /// Test: PROT_GROWSUP fails on non-growsup VMA (always on x86-64/aarch64)
@@ -930,9 +859,7 @@ fn test_mprotect_growsup_fails() {
     );
 
     if ptr < 0 {
-        print(b"MPROTECT_GROWSUP:FAIL mmap errno=");
-        print_num(-ptr);
-        println(b"");
+        fail_num(b"MPROTECT_GROWSUP:FAIL mmap errno=", -ptr);
         return;
     }
 
@@ -940,15 +867,13 @@ fn test_mprotect_growsup_fails() {
     let result = sys_mprotect(ptr as u64, 4096, PROT_READ | PROT_GROWSUP);
     if result != -22 {
         // EINVAL = 22
-        print(b"MPROTECT_GROWSUP:FAIL expected -22 got ");
-        print_num(result);
-        println(b"");
+        fail_num(b"MPROTECT_GROWSUP:FAIL expected -22 got ", result);
         sys_munmap(ptr as u64, 4096);
         return;
     }
 
     sys_munmap(ptr as u64, 4096);
-    println(b"MPROTECT_GROWSUP:OK");
+    pass(b"MPROTECT_GROWSUP");
 }
 
 /// Test: PROT_GROWSDOWN | PROT_GROWSUP together fails
@@ -963,9 +888,7 @@ fn test_mprotect_grows_both_fails() {
     );
 
     if ptr < 0 {
-        print(b"MPROTECT_GROWS_BOTH:FAIL mmap errno=");
-        print_num(-ptr);
-        println(b"");
+        fail_num(b"MPROTECT_GROWS_BOTH:FAIL mmap errno=", -ptr);
         return;
     }
 
@@ -973,15 +896,13 @@ fn test_mprotect_grows_both_fails() {
     let result = sys_mprotect(ptr as u64, 4096, PROT_READ | PROT_GROWSDOWN | PROT_GROWSUP);
     if result != -22 {
         // EINVAL
-        print(b"MPROTECT_GROWS_BOTH:FAIL expected -22 got ");
-        print_num(result);
-        println(b"");
+        fail_num(b"MPROTECT_GROWS_BOTH:FAIL expected -22 got ", result);
         sys_munmap(ptr as u64, 4096);
         return;
     }
 
     sys_munmap(ptr as u64, 4096);
-    println(b"MPROTECT_GROWS_BOTH:OK");
+    pass(b"MPROTECT_GROWS_BOTH");
 }
 
 // ============================================================================
@@ -1000,9 +921,7 @@ fn test_mmap_populate() {
     );
 
     if ptr < 0 {
-        print(b"MMAP_POPULATE:FAIL errno=");
-        print_num(-ptr);
-        println(b"");
+        fail_num(b"MMAP_POPULATE:FAIL errno=", -ptr);
         return;
     }
 
@@ -1013,15 +932,13 @@ fn test_mmap_populate() {
 
     let val = unsafe { core::ptr::read_volatile(ptr as *const u32) };
     if val != 0xDEADBEEF {
-        print(b"MMAP_POPULATE:FAIL value mismatch got ");
-        print_num(val as i64);
-        println(b"");
+        fail_num(b"MMAP_POPULATE:FAIL value mismatch got ", val as i64);
         sys_munmap(ptr as u64, 4096);
         return;
     }
 
     sys_munmap(ptr as u64, 4096);
-    println(b"MMAP_POPULATE:OK");
+    pass(b"MMAP_POPULATE");
 }
 
 /// Test: MAP_POPULATE | MAP_NONBLOCK - populate is skipped (non-blocking)
@@ -1038,9 +955,7 @@ fn test_mmap_populate_nonblock() {
     );
 
     if ptr < 0 {
-        print(b"MMAP_POPULATE_NONBLOCK:FAIL errno=");
-        print_num(-ptr);
-        println(b"");
+        fail_num(b"MMAP_POPULATE_NONBLOCK:FAIL errno=", -ptr);
         return;
     }
 
@@ -1051,15 +966,16 @@ fn test_mmap_populate_nonblock() {
 
     let val = unsafe { core::ptr::read_volatile(ptr as *const u32) };
     if val != 0xCAFEBABE {
-        print(b"MMAP_POPULATE_NONBLOCK:FAIL value mismatch got ");
-        print_num(val as i64);
-        println(b"");
+        fail_num(
+            b"MMAP_POPULATE_NONBLOCK:FAIL value mismatch got ",
+            val as i64,
+        );
         sys_munmap(ptr as u64, 4096);
         return;
     }
 
     sys_munmap(ptr as u64, 4096);
-    println(b"MMAP_POPULATE_NONBLOCK:OK");
+    pass(b"MMAP_POPULATE_NONBLOCK");
 }
 
 /// Test: MAP_NONBLOCK alone is accepted (no-op without MAP_POPULATE)
@@ -1075,9 +991,7 @@ fn test_mmap_nonblock_alone() {
     );
 
     if ptr < 0 {
-        print(b"MMAP_NONBLOCK_ALONE:FAIL errno=");
-        print_num(-ptr);
-        println(b"");
+        fail_num(b"MMAP_NONBLOCK_ALONE:FAIL errno=", -ptr);
         return;
     }
 
@@ -1088,15 +1002,13 @@ fn test_mmap_nonblock_alone() {
 
     let val = unsafe { core::ptr::read_volatile(ptr as *const u32) };
     if val != 0x12345678 {
-        print(b"MMAP_NONBLOCK_ALONE:FAIL value mismatch got ");
-        print_num(val as i64);
-        println(b"");
+        fail_num(b"MMAP_NONBLOCK_ALONE:FAIL value mismatch got ", val as i64);
         sys_munmap(ptr as u64, 4096);
         return;
     }
 
     sys_munmap(ptr as u64, 4096);
-    println(b"MMAP_NONBLOCK_ALONE:OK");
+    pass(b"MMAP_NONBLOCK_ALONE");
 }
 
 /// Test: MAP_STACK hint flag is accepted (no-op on systems without THP)
@@ -1111,9 +1023,7 @@ fn test_mmap_stack() {
     );
 
     if ptr < 0 {
-        print(b"MMAP_STACK:FAIL errno=");
-        print_num(-ptr);
-        println(b"");
+        fail_num(b"MMAP_STACK:FAIL errno=", -ptr);
         return;
     }
 
@@ -1124,15 +1034,13 @@ fn test_mmap_stack() {
 
     let val = unsafe { core::ptr::read_volatile(ptr as *const u32) };
     if val != 0x57ACE000 {
-        print(b"MMAP_STACK:FAIL value mismatch got ");
-        print_num(val as i64);
-        println(b"");
+        fail_num(b"MMAP_STACK:FAIL value mismatch got ", val as i64);
         sys_munmap(ptr as u64, 4096);
         return;
     }
 
     sys_munmap(ptr as u64, 4096);
-    println(b"MMAP_STACK:OK");
+    pass(b"MMAP_STACK");
 }
 
 // ============================================================================
@@ -1152,9 +1060,7 @@ fn test_mmap_fixed_noreplace_success() {
     );
 
     if ptr < 0 {
-        print(b"MMAP_FIXED_NOREPLACE_OK:FAIL initial mmap errno=");
-        print_num(-ptr);
-        println(b"");
+        fail_num(b"MMAP_FIXED_NOREPLACE_OK:FAIL initial mmap errno=", -ptr);
         return;
     }
 
@@ -1172,9 +1078,7 @@ fn test_mmap_fixed_noreplace_success() {
     );
 
     if ptr2 < 0 {
-        print(b"MMAP_FIXED_NOREPLACE_OK:FAIL errno=");
-        print_num(-ptr2);
-        println(b"");
+        fail_num(b"MMAP_FIXED_NOREPLACE_OK:FAIL errno=", -ptr2);
         return;
     }
 
@@ -1189,7 +1093,7 @@ fn test_mmap_fixed_noreplace_success() {
     }
 
     sys_munmap(ptr2 as u64, 4096);
-    println(b"MMAP_FIXED_NOREPLACE_OK:OK");
+    pass(b"MMAP_FIXED_NOREPLACE_OK");
 }
 
 /// Test: MAP_FIXED_NOREPLACE returns EEXIST on collision
@@ -1205,9 +1109,10 @@ fn test_mmap_fixed_noreplace_collision() {
     );
 
     if ptr < 0 {
-        print(b"MMAP_FIXED_NOREPLACE_EEXIST:FAIL initial mmap errno=");
-        print_num(-ptr);
-        println(b"");
+        fail_num(
+            b"MMAP_FIXED_NOREPLACE_EEXIST:FAIL initial mmap errno=",
+            -ptr,
+        );
         return;
     }
 
@@ -1223,9 +1128,7 @@ fn test_mmap_fixed_noreplace_collision() {
 
     if ptr2 != -17 {
         // EEXIST
-        print(b"MMAP_FIXED_NOREPLACE_EEXIST:FAIL expected -17 got ");
-        print_num(ptr2);
-        println(b"");
+        fail_num(b"MMAP_FIXED_NOREPLACE_EEXIST:FAIL expected -17 got ", ptr2);
         if ptr2 >= 0 {
             sys_munmap(ptr2 as u64, 4096);
         }
@@ -1234,7 +1137,7 @@ fn test_mmap_fixed_noreplace_collision() {
     }
 
     sys_munmap(ptr as u64, 4096);
-    println(b"MMAP_FIXED_NOREPLACE_EEXIST:OK");
+    pass(b"MMAP_FIXED_NOREPLACE_EEXIST");
 }
 
 /// Test: MAP_NORESERVE flag is accepted
@@ -1252,9 +1155,7 @@ fn test_mmap_noreserve() {
     );
 
     if ptr < 0 {
-        print(b"MMAP_NORESERVE:FAIL mmap errno=");
-        print_num(-ptr);
-        println(b"");
+        fail_num(b"MMAP_NORESERVE:FAIL mmap errno=", -ptr);
         return;
     }
 
@@ -1270,7 +1171,7 @@ fn test_mmap_noreserve() {
     }
 
     sys_munmap(ptr as u64, 4096);
-    println(b"MMAP_NORESERVE:OK");
+    pass(b"MMAP_NORESERVE");
 }
 
 // ============================================================================
@@ -1289,9 +1190,7 @@ fn test_msync_basic() {
     );
 
     if ptr < 0 {
-        print(b"MSYNC_BASIC:FAIL mmap errno=");
-        print_num(-ptr);
-        println(b"");
+        fail_num(b"MSYNC_BASIC:FAIL mmap errno=", -ptr);
         return;
     }
 
@@ -1303,15 +1202,13 @@ fn test_msync_basic() {
     // msync with MS_ASYNC (essentially a no-op but should succeed)
     let ret = sys_msync(ptr as u64, 4096, MS_ASYNC);
     if ret != 0 {
-        print(b"MSYNC_BASIC:FAIL msync errno=");
-        print_num(-ret);
-        println(b"");
+        fail_num(b"MSYNC_BASIC:FAIL msync errno=", -ret);
         sys_munmap(ptr as u64, 4096);
         return;
     }
 
     sys_munmap(ptr as u64, 4096);
-    println(b"MSYNC_BASIC:OK");
+    pass(b"MSYNC_BASIC");
 }
 
 /// Test: msync with invalid flags returns EINVAL
@@ -1326,9 +1223,7 @@ fn test_msync_invalid_flags() {
     );
 
     if ptr < 0 {
-        print(b"MSYNC_EINVAL:FAIL mmap errno=");
-        print_num(-ptr);
-        println(b"");
+        fail_num(b"MSYNC_EINVAL:FAIL mmap errno=", -ptr);
         return;
     }
 
@@ -1336,15 +1231,13 @@ fn test_msync_invalid_flags() {
     let ret = sys_msync(ptr as u64, 4096, MS_ASYNC | MS_SYNC);
     if ret != -22 {
         // EINVAL
-        print(b"MSYNC_EINVAL:FAIL expected -22 got ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"MSYNC_EINVAL:FAIL expected -22 got ", ret);
         sys_munmap(ptr as u64, 4096);
         return;
     }
 
     sys_munmap(ptr as u64, 4096);
-    println(b"MSYNC_EINVAL:OK");
+    pass(b"MSYNC_EINVAL");
 }
 
 // ============================================================================
@@ -1363,33 +1256,27 @@ fn test_madvise_normal() {
     );
 
     if ptr < 0 {
-        print(b"MADVISE_NORMAL:FAIL mmap errno=");
-        print_num(-ptr);
-        println(b"");
+        fail_num(b"MADVISE_NORMAL:FAIL mmap errno=", -ptr);
         return;
     }
 
     // First set to RANDOM, then back to NORMAL
     let ret = sys_madvise(ptr as u64, 4096, MADV_RANDOM);
     if ret != 0 {
-        print(b"MADVISE_NORMAL:FAIL madvise RANDOM errno=");
-        print_num(-ret);
-        println(b"");
+        fail_num(b"MADVISE_NORMAL:FAIL madvise RANDOM errno=", -ret);
         sys_munmap(ptr as u64, 4096);
         return;
     }
 
     let ret = sys_madvise(ptr as u64, 4096, MADV_NORMAL);
     if ret != 0 {
-        print(b"MADVISE_NORMAL:FAIL madvise NORMAL errno=");
-        print_num(-ret);
-        println(b"");
+        fail_num(b"MADVISE_NORMAL:FAIL madvise NORMAL errno=", -ret);
         sys_munmap(ptr as u64, 4096);
         return;
     }
 
     sys_munmap(ptr as u64, 4096);
-    println(b"MADVISE_NORMAL:OK");
+    pass(b"MADVISE_NORMAL");
 }
 
 /// Test: madvise with MADV_DONTNEED zaps pages
@@ -1404,9 +1291,7 @@ fn test_madvise_dontneed() {
     );
 
     if ptr < 0 {
-        print(b"MADVISE_DONTNEED:FAIL mmap errno=");
-        print_num(-ptr);
-        println(b"");
+        fail_num(b"MADVISE_DONTNEED:FAIL mmap errno=", -ptr);
         return;
     }
 
@@ -1418,9 +1303,7 @@ fn test_madvise_dontneed() {
     // MADV_DONTNEED - should zap the pages
     let ret = sys_madvise(ptr as u64, 4096, MADV_DONTNEED);
     if ret != 0 {
-        print(b"MADVISE_DONTNEED:FAIL madvise errno=");
-        print_num(-ret);
-        println(b"");
+        fail_num(b"MADVISE_DONTNEED:FAIL madvise errno=", -ret);
         sys_munmap(ptr as u64, 4096);
         return;
     }
@@ -1428,15 +1311,13 @@ fn test_madvise_dontneed() {
     // Re-read - page should be zeroed (new anonymous page)
     let val = unsafe { core::ptr::read_volatile(ptr as *const u32) };
     if val != 0 {
-        print(b"MADVISE_DONTNEED:FAIL expected 0 got ");
-        print_num(val as i64);
-        println(b"");
+        fail_num(b"MADVISE_DONTNEED:FAIL expected 0 got ", val as i64);
         sys_munmap(ptr as u64, 4096);
         return;
     }
 
     sys_munmap(ptr as u64, 4096);
-    println(b"MADVISE_DONTNEED:OK");
+    pass(b"MADVISE_DONTNEED");
 }
 
 /// Test: madvise with MADV_WILLNEED prefaults pages
@@ -1451,18 +1332,14 @@ fn test_madvise_willneed() {
     );
 
     if ptr < 0 {
-        print(b"MADVISE_WILLNEED:FAIL mmap errno=");
-        print_num(-ptr);
-        println(b"");
+        fail_num(b"MADVISE_WILLNEED:FAIL mmap errno=", -ptr);
         return;
     }
 
     // MADV_WILLNEED - should prefault pages
     let ret = sys_madvise(ptr as u64, 4096, MADV_WILLNEED);
     if ret != 0 {
-        print(b"MADVISE_WILLNEED:FAIL madvise errno=");
-        print_num(-ret);
-        println(b"");
+        fail_num(b"MADVISE_WILLNEED:FAIL madvise errno=", -ret);
         sys_munmap(ptr as u64, 4096);
         return;
     }
@@ -1471,15 +1348,13 @@ fn test_madvise_willneed() {
     let val = unsafe { core::ptr::read_volatile(ptr as *const u32) };
     // Anonymous pages are zeroed
     if val != 0 {
-        print(b"MADVISE_WILLNEED:FAIL expected 0 got ");
-        print_num(val as i64);
-        println(b"");
+        fail_num(b"MADVISE_WILLNEED:FAIL expected 0 got ", val as i64);
         sys_munmap(ptr as u64, 4096);
         return;
     }
 
     sys_munmap(ptr as u64, 4096);
-    println(b"MADVISE_WILLNEED:OK");
+    pass(b"MADVISE_WILLNEED");
 }
 
 /// Test: madvise with invalid advice returns EINVAL
@@ -1494,9 +1369,7 @@ fn test_madvise_invalid() {
     );
 
     if ptr < 0 {
-        print(b"MADVISE_EINVAL:FAIL mmap errno=");
-        print_num(-ptr);
-        println(b"");
+        fail_num(b"MADVISE_EINVAL:FAIL mmap errno=", -ptr);
         return;
     }
 
@@ -1504,15 +1377,13 @@ fn test_madvise_invalid() {
     let ret = sys_madvise(ptr as u64, 4096, 999);
     if ret != -22 {
         // EINVAL
-        print(b"MADVISE_EINVAL:FAIL expected -22 got ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"MADVISE_EINVAL:FAIL expected -22 got ", ret);
         sys_munmap(ptr as u64, 4096);
         return;
     }
 
     sys_munmap(ptr as u64, 4096);
-    println(b"MADVISE_EINVAL:OK");
+    pass(b"MADVISE_EINVAL");
 }
 
 // ============================================================================
@@ -1532,9 +1403,7 @@ fn test_mremap_shrink() {
     );
 
     if ptr < 0 {
-        print(b"MREMAP_SHRINK:FAIL mmap errno=");
-        print_num(-ptr);
-        println(b"");
+        fail_num(b"MREMAP_SHRINK:FAIL mmap errno=", -ptr);
         return;
     }
 
@@ -1547,9 +1416,7 @@ fn test_mremap_shrink() {
     // Shrink to 1 page
     let new_ptr = sys_mremap(ptr as u64, 8192, 4096, 0, 0);
     if new_ptr < 0 {
-        print(b"MREMAP_SHRINK:FAIL mremap errno=");
-        print_num(-new_ptr);
-        println(b"");
+        fail_num(b"MREMAP_SHRINK:FAIL mremap errno=", -new_ptr);
         sys_munmap(ptr as u64, 8192);
         return;
     }
@@ -1568,15 +1435,13 @@ fn test_mremap_shrink() {
     // First page data should be preserved
     let val = unsafe { core::ptr::read_volatile(new_ptr as *const u32) };
     if val != 0xAAAAAAAA {
-        print(b"MREMAP_SHRINK:FAIL data mismatch got ");
-        print_num(val as i64);
-        println(b"");
+        fail_num(b"MREMAP_SHRINK:FAIL data mismatch got ", val as i64);
         sys_munmap(new_ptr as u64, 4096);
         return;
     }
 
     sys_munmap(new_ptr as u64, 4096);
-    println(b"MREMAP_SHRINK:OK");
+    pass(b"MREMAP_SHRINK");
 }
 
 /// Test: mremap expand in-place
@@ -1592,9 +1457,7 @@ fn test_mremap_expand_inplace() {
     );
 
     if ptr < 0 {
-        print(b"MREMAP_EXPAND:FAIL mmap errno=");
-        print_num(-ptr);
-        println(b"");
+        fail_num(b"MREMAP_EXPAND:FAIL mmap errno=", -ptr);
         return;
     }
 
@@ -1606,9 +1469,7 @@ fn test_mremap_expand_inplace() {
     // Try to expand to 2 pages (may move if no room)
     let new_ptr = sys_mremap(ptr as u64, 4096, 8192, MREMAP_MAYMOVE, 0);
     if new_ptr < 0 {
-        print(b"MREMAP_EXPAND:FAIL mremap errno=");
-        print_num(-new_ptr);
-        println(b"");
+        fail_num(b"MREMAP_EXPAND:FAIL mremap errno=", -new_ptr);
         sys_munmap(ptr as u64, 4096);
         return;
     }
@@ -1616,9 +1477,7 @@ fn test_mremap_expand_inplace() {
     // Original data should be preserved
     let val = unsafe { core::ptr::read_volatile(new_ptr as *const u32) };
     if val != 0xDEADBEEF {
-        print(b"MREMAP_EXPAND:FAIL data mismatch got ");
-        print_num(val as i64);
-        println(b"");
+        fail_num(b"MREMAP_EXPAND:FAIL data mismatch got ", val as i64);
         sys_munmap(new_ptr as u64, 8192);
         return;
     }
@@ -1629,7 +1488,7 @@ fn test_mremap_expand_inplace() {
     let _ = val2; // Just verify it's accessible
 
     sys_munmap(new_ptr as u64, 8192);
-    println(b"MREMAP_EXPAND:OK");
+    pass(b"MREMAP_EXPAND");
 }
 
 /// Test: mremap expand with forced move (MREMAP_MAYMOVE)
@@ -1645,9 +1504,7 @@ fn test_mremap_expand_maymove() {
     );
 
     if ptr1 < 0 {
-        print(b"MREMAP_MAYMOVE:FAIL mmap1 errno=");
-        print_num(-ptr1);
-        println(b"");
+        fail_num(b"MREMAP_MAYMOVE:FAIL mmap1 errno=", -ptr1);
         return;
     }
 
@@ -1670,9 +1527,7 @@ fn test_mremap_expand_maymove() {
     // Now try to expand first mapping - if ptr2 succeeded, this should move
     let new_ptr = sys_mremap(ptr1 as u64, 4096, 8192, MREMAP_MAYMOVE, 0);
     if new_ptr < 0 {
-        print(b"MREMAP_MAYMOVE:FAIL mremap errno=");
-        print_num(-new_ptr);
-        println(b"");
+        fail_num(b"MREMAP_MAYMOVE:FAIL mremap errno=", -new_ptr);
         sys_munmap(ptr1 as u64, 4096);
         if ptr2 >= 0 {
             sys_munmap(ptr2 as u64, 4096);
@@ -1683,9 +1538,7 @@ fn test_mremap_expand_maymove() {
     // Data should be preserved regardless of whether it moved
     let val = unsafe { core::ptr::read_volatile(new_ptr as *const u32) };
     if val != 0xCAFEBABE {
-        print(b"MREMAP_MAYMOVE:FAIL data mismatch got ");
-        print_num(val as i64);
-        println(b"");
+        fail_num(b"MREMAP_MAYMOVE:FAIL data mismatch got ", val as i64);
         sys_munmap(new_ptr as u64, 8192);
         if ptr2 >= 0 {
             sys_munmap(ptr2 as u64, 4096);
@@ -1697,7 +1550,7 @@ fn test_mremap_expand_maymove() {
     if ptr2 >= 0 {
         sys_munmap(ptr2 as u64, 4096);
     }
-    println(b"MREMAP_MAYMOVE:OK");
+    pass(b"MREMAP_MAYMOVE");
 }
 
 // ============================================================================
@@ -1718,9 +1571,7 @@ fn test_vma_merge_adjacent_anonymous() {
     );
 
     if ptr1 < 0 {
-        print(b"VMA_MERGE_ADJACENT:FAIL mmap1 errno=");
-        print_num(-ptr1);
-        println(b"");
+        fail_num(b"VMA_MERGE_ADJACENT:FAIL mmap1 errno=", -ptr1);
         return;
     }
 
@@ -1765,7 +1616,7 @@ fn test_vma_merge_adjacent_anonymous() {
 
     // Unmap both (may be merged into single VMA internally)
     sys_munmap(ptr1 as u64, 8192);
-    println(b"VMA_MERGE_ADJACENT:OK");
+    pass(b"VMA_MERGE_ADJACENT");
 }
 
 /// Test: VMAs with different protection don't merge (verify isolation)
@@ -1781,9 +1632,7 @@ fn test_vma_no_merge_different_prot() {
     );
 
     if ptr1 < 0 {
-        print(b"VMA_NO_MERGE_PROT:FAIL mmap1 errno=");
-        print_num(-ptr1);
-        println(b"");
+        fail_num(b"VMA_NO_MERGE_PROT:FAIL mmap1 errno=", -ptr1);
         return;
     }
 
@@ -1814,9 +1663,7 @@ fn test_vma_no_merge_different_prot() {
     let val2 = unsafe { core::ptr::read_volatile(ptr2 as *const u32) };
 
     if val1 != 0xAAAAAAAA {
-        print(b"VMA_NO_MERGE_PROT:FAIL val1=");
-        print_num(val1 as i64);
-        println(b"");
+        fail_num(b"VMA_NO_MERGE_PROT:FAIL val1=", val1 as i64);
         sys_munmap(ptr1 as u64, 4096);
         sys_munmap(ptr2 as u64, 4096);
         return;
@@ -1827,7 +1674,7 @@ fn test_vma_no_merge_different_prot() {
 
     sys_munmap(ptr1 as u64, 4096);
     sys_munmap(ptr2 as u64, 4096);
-    println(b"VMA_NO_MERGE_PROT:OK");
+    pass(b"VMA_NO_MERGE_PROT");
 }
 
 /// Test: mprotect followed by merge opportunity
@@ -1843,9 +1690,7 @@ fn test_vma_merge_after_mprotect() {
     );
 
     if ptr1 < 0 {
-        print(b"VMA_MERGE_MPROTECT:FAIL mmap1 errno=");
-        print_num(-ptr1);
-        println(b"");
+        fail_num(b"VMA_MERGE_MPROTECT:FAIL mmap1 errno=", -ptr1);
         return;
     }
 
@@ -1873,9 +1718,7 @@ fn test_vma_merge_after_mprotect() {
     // Now mprotect second page to RW (same as first) - may trigger merge
     let ret = sys_mprotect(ptr2 as u64, 4096, PROT_READ | PROT_WRITE);
     if ret != 0 {
-        print(b"VMA_MERGE_MPROTECT:FAIL mprotect errno=");
-        print_num(-ret);
-        println(b"");
+        fail_num(b"VMA_MERGE_MPROTECT:FAIL mprotect errno=", -ret);
         sys_munmap(ptr1 as u64, 4096);
         sys_munmap(ptr2 as u64, 4096);
         return;
@@ -1900,7 +1743,7 @@ fn test_vma_merge_after_mprotect() {
     }
 
     sys_munmap(ptr1 as u64, 8192);
-    println(b"VMA_MERGE_MPROTECT:OK");
+    pass(b"VMA_MERGE_MPROTECT");
 }
 
 /// Test: Multiple consecutive mappings (stress test for merge cascade)
@@ -1919,9 +1762,7 @@ fn test_vma_merge_multiple() {
     );
 
     if base < 0 {
-        print(b"VMA_MERGE_MULTI:FAIL mmap base errno=");
-        print_num(-base);
-        println(b"");
+        fail_num(b"VMA_MERGE_MULTI:FAIL mmap base errno=", -base);
         return;
     }
 
@@ -1974,7 +1815,7 @@ fn test_vma_merge_multiple() {
     sys_munmap(base as u64, size);
 
     if success {
-        println(b"VMA_MERGE_MULTI:OK");
+        pass(b"VMA_MERGE_MULTI");
     }
 }
 
@@ -1990,9 +1831,7 @@ fn test_mremap_einval() {
     );
 
     if ptr < 0 {
-        print(b"MREMAP_EINVAL:FAIL mmap errno=");
-        print_num(-ptr);
-        println(b"");
+        fail_num(b"MREMAP_EINVAL:FAIL mmap errno=", -ptr);
         return;
     }
 
@@ -2000,9 +1839,7 @@ fn test_mremap_einval() {
     let ret = sys_mremap(ptr as u64, 4096, 0, 0, 0);
     if ret != -22 {
         // EINVAL
-        print(b"MREMAP_EINVAL:FAIL new_len=0 expected -22 got ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"MREMAP_EINVAL:FAIL new_len=0 expected -22 got ", ret);
         sys_munmap(ptr as u64, 4096);
         return;
     }
@@ -2011,9 +1848,10 @@ fn test_mremap_einval() {
     let ret = sys_mremap(ptr as u64, 4096, 4096, MREMAP_FIXED, 0x100000);
     if ret != -22 {
         // EINVAL
-        print(b"MREMAP_EINVAL:FAIL FIXED w/o MAYMOVE expected -22 got ");
-        print_num(ret);
-        println(b"");
+        fail_num(
+            b"MREMAP_EINVAL:FAIL FIXED w/o MAYMOVE expected -22 got ",
+            ret,
+        );
         sys_munmap(ptr as u64, 4096);
         return;
     }
@@ -2022,15 +1860,13 @@ fn test_mremap_einval() {
     let ret = sys_mremap(ptr as u64 + 1, 4096, 4096, 0, 0);
     if ret != -22 {
         // EINVAL
-        print(b"MREMAP_EINVAL:FAIL unaligned expected -22 got ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"MREMAP_EINVAL:FAIL unaligned expected -22 got ", ret);
         sys_munmap(ptr as u64, 4096);
         return;
     }
 
     sys_munmap(ptr as u64, 4096);
-    println(b"MREMAP_EINVAL:OK");
+    pass(b"MREMAP_EINVAL");
 }
 
 // ============================================================================
@@ -2050,9 +1886,7 @@ fn test_mincore_basic() {
     );
 
     if ptr < 0 {
-        print(b"MINCORE_BASIC:FAIL mmap errno=");
-        print_num(-ptr);
-        println(b"");
+        fail_num(b"MINCORE_BASIC:FAIL mmap errno=", -ptr);
         return;
     }
 
@@ -2066,24 +1900,23 @@ fn test_mincore_basic() {
     let ret = sys_mincore(ptr as u64, 4096, vec.as_mut_ptr());
 
     if ret != 0 {
-        print(b"MINCORE_BASIC:FAIL mincore errno=");
-        print_num(-ret);
-        println(b"");
+        fail_num(b"MINCORE_BASIC:FAIL mincore errno=", -ret);
         sys_munmap(ptr as u64, 4096);
         return;
     }
 
     // Check that the page is reported as resident (bit 0 set)
     if vec[0] & 1 == 0 {
-        print(b"MINCORE_BASIC:FAIL page not reported as resident, vec=");
-        print_num(vec[0] as i64);
-        println(b"");
+        fail_num(
+            b"MINCORE_BASIC:FAIL page not reported as resident, vec=",
+            vec[0] as i64,
+        );
         sys_munmap(ptr as u64, 4096);
         return;
     }
 
     sys_munmap(ptr as u64, 4096);
-    println(b"MINCORE_BASIC:OK");
+    pass(b"MINCORE_BASIC");
 }
 
 /// Test: mincore returns EINVAL for unaligned address
@@ -2099,9 +1932,7 @@ fn test_mincore_invalid_addr() {
     );
 
     if ptr < 0 {
-        print(b"MINCORE_INVALID:FAIL mmap errno=");
-        print_num(-ptr);
-        println(b"");
+        fail_num(b"MINCORE_INVALID:FAIL mmap errno=", -ptr);
         return;
     }
 
@@ -2111,15 +1942,13 @@ fn test_mincore_invalid_addr() {
 
     if ret != -22 {
         // EINVAL
-        print(b"MINCORE_INVALID:FAIL expected -22 got ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"MINCORE_INVALID:FAIL expected -22 got ", ret);
         sys_munmap(ptr as u64, 4096);
         return;
     }
 
     sys_munmap(ptr as u64, 4096);
-    println(b"MINCORE_INVALID:OK");
+    pass(b"MINCORE_INVALID");
 }
 
 // ============================================================================
@@ -2140,9 +1969,7 @@ fn test_mprotect_partial_vma() {
     );
 
     if ptr < 0 {
-        print(b"MPROTECT_PARTIAL:FAIL mmap errno=");
-        print_num(-ptr);
-        println(b"");
+        fail_num(b"MPROTECT_PARTIAL:FAIL mmap errno=", -ptr);
         return;
     }
 
@@ -2161,9 +1988,7 @@ fn test_mprotect_partial_vma() {
     let middle = ptr as u64 + 4096;
     let ret = sys_mprotect(middle, 4096, PROT_READ);
     if ret != 0 {
-        print(b"MPROTECT_PARTIAL:FAIL mprotect errno=");
-        print_num(-ret);
-        println(b"");
+        fail_num(b"MPROTECT_PARTIAL:FAIL mprotect errno=", -ret);
         sys_munmap(ptr as u64, size);
         return;
     }
@@ -2195,7 +2020,7 @@ fn test_mprotect_partial_vma() {
     // without handling SIGSEGV, so we just verify the API works
 
     sys_munmap(ptr as u64, size);
-    println(b"MPROTECT_PARTIAL:OK");
+    pass(b"MPROTECT_PARTIAL");
 }
 
 // ============================================================================
@@ -2214,19 +2039,15 @@ fn test_madvise_cold() {
     );
 
     if ptr < 0 {
-        print(b"MADVISE_COLD:FAIL mmap errno=");
-        print_num(-ptr);
-        println(b"");
+        fail_num(b"MADVISE_COLD:FAIL mmap errno=", -ptr);
         return;
     }
 
     let ret = sys_madvise(ptr as u64, 4096, MADV_COLD);
     if ret == 0 {
-        println(b"MADVISE_COLD:OK");
+        pass(b"MADVISE_COLD");
     } else {
-        print(b"MADVISE_COLD:FAIL expected 0, got ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"MADVISE_COLD:FAIL expected 0, got ", ret);
     }
 
     sys_munmap(ptr as u64, 4096);
@@ -2244,19 +2065,15 @@ fn test_madvise_pageout() {
     );
 
     if ptr < 0 {
-        print(b"MADVISE_PAGEOUT:FAIL mmap errno=");
-        print_num(-ptr);
-        println(b"");
+        fail_num(b"MADVISE_PAGEOUT:FAIL mmap errno=", -ptr);
         return;
     }
 
     let ret = sys_madvise(ptr as u64, 4096, MADV_PAGEOUT);
     if ret == 0 {
-        println(b"MADVISE_PAGEOUT:OK");
+        pass(b"MADVISE_PAGEOUT");
     } else {
-        print(b"MADVISE_PAGEOUT:FAIL expected 0, got ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"MADVISE_PAGEOUT:FAIL expected 0, got ", ret);
     }
 
     sys_munmap(ptr as u64, 4096);
@@ -2274,18 +2091,14 @@ fn test_madvise_wipeonfork() {
     );
 
     if ptr < 0 {
-        print(b"MADVISE_WIPEONFORK:FAIL mmap errno=");
-        print_num(-ptr);
-        println(b"");
+        fail_num(b"MADVISE_WIPEONFORK:FAIL mmap errno=", -ptr);
         return;
     }
 
     // Set WIPEONFORK
     let ret = sys_madvise(ptr as u64, 4096, MADV_WIPEONFORK);
     if ret != 0 {
-        print(b"MADVISE_WIPEONFORK:FAIL WIPEONFORK returned ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"MADVISE_WIPEONFORK:FAIL WIPEONFORK returned ", ret);
         sys_munmap(ptr as u64, 4096);
         return;
     }
@@ -2293,15 +2106,13 @@ fn test_madvise_wipeonfork() {
     // Clear with KEEPONFORK
     let ret = sys_madvise(ptr as u64, 4096, MADV_KEEPONFORK);
     if ret != 0 {
-        print(b"MADVISE_WIPEONFORK:FAIL KEEPONFORK returned ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"MADVISE_WIPEONFORK:FAIL KEEPONFORK returned ", ret);
         sys_munmap(ptr as u64, 4096);
         return;
     }
 
     sys_munmap(ptr as u64, 4096);
-    println(b"MADVISE_WIPEONFORK:OK");
+    pass(b"MADVISE_WIPEONFORK");
 }
 
 /// Map `pages` untouched anonymous pages; returns 0 on failure
@@ -2342,7 +2153,7 @@ fn test_uaccess_demand_fault() {
     let r2 = sys_uname(uts);
     let sysname_ok = unsafe { (*uts).sysname[0] != 0 };
     if n == 17 && got == b"Hello from ramfs!" && r1 == 0 && r2 == 0 && sysname_ok {
-        println(b"UACCESS_DEMAND_FAULT:OK");
+        pass(b"UACCESS_DEMAND_FAULT");
     } else {
         print(b"UACCESS_DEMAND_FAULT:FAIL read=");
         print_num(n);
@@ -2372,7 +2183,7 @@ fn test_uaccess_efault() {
     sys_close(fd as u64);
     let w = sys_write(1, base as *const u8, 4);
     if r == -14 && w == -14 {
-        println(b"UACCESS_EFAULT:OK");
+        pass(b"UACCESS_EFAULT");
     } else {
         print(b"UACCESS_EFAULT:FAIL read=");
         print_num(r);
@@ -2403,7 +2214,7 @@ fn test_uaccess_cow_child() {
     sys_wait4(pid, &mut status, 0, 0);
     let parent_ok = unsafe { *p == b'A' && *p.add(16) == b'A' };
     if pid > 0 && status == 0 && parent_ok {
-        println(b"UACCESS_COW:OK");
+        pass(b"UACCESS_COW");
     } else {
         print(b"UACCESS_COW:FAIL status=");
         print_num(status as i64);
@@ -2485,8 +2296,6 @@ fn test_mmap_offset_overflow() {
     if step == 0 {
         println(b":OK");
     } else {
-        print(b":FAIL step ");
-        print_num(step);
-        println(b"");
+        fail_num(b":FAIL step ", step);
     }
 }

@@ -8,7 +8,8 @@
 //!   winner holds while it waits for the other threads to die). The
 //!   process ends with the new image's exit status, every round.
 
-use crate::tests::helpers::{print, print_num, println};
+use crate::tests::harness::fail_num;
+use crate::tests::helpers::{print, println};
 use crate::tests::mm::fork_mm::spawn_thread;
 use crate::tests::net::sk::now_ms;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -36,9 +37,7 @@ pub fn run_tests() {
     if fail == 0 {
         println(b":OK");
     } else {
-        print(b":FAIL round*1000+step ");
-        print_num(fail);
-        println(b"");
+        fail_num(b":FAIL round*1000+step ", fail);
     }
 }
 

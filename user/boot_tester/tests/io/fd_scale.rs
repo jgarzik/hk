@@ -7,6 +7,7 @@
 //!   takes less than 4x what the same batch takes with ~2000 open (a
 //!   scan from fd 0 per allocation is ~16x)
 
+use crate::tests::harness::fail_num;
 use crate::tests::helpers::{print, print_num, println};
 use hk_syscall::{
     CLOCK_MONOTONIC, O_RDONLY, RLIMIT_NOFILE, RLimit, Timespec, sys_clock_gettime, sys_close_range,
@@ -24,9 +25,7 @@ pub fn run_tests() {
     if r == 0 {
         println(b":OK");
     } else {
-        print(b":FAIL ");
-        print_num(r);
-        println(b"");
+        fail_num(b":FAIL ", r);
     }
 }
 

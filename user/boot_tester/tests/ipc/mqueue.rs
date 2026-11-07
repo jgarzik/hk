@@ -16,6 +16,7 @@
 //!   descriptor ends when it exits (Linux mqueue_flush_file on its
 //!   close), so the parent may register (no EBUSY)
 
+use crate::tests::harness::{fail_num, pass};
 use crate::tests::helpers::{print, print_num, println};
 use hk_syscall::{
     MqAttr, O_CREAT, O_EXCL, O_NONBLOCK, O_RDWR, sys_close, sys_mq_getsetattr, sys_mq_open,
@@ -82,7 +83,7 @@ fn test_mq_notify_owner_exit() {
     hk_syscall::sys_wait4(pid, &mut st, 0, 0);
     let r = notify_none(fd);
     if st == 0 && r == 0 {
-        println(b"MQ_NOTIFY_OWNER_EXIT:OK");
+        pass(b"MQ_NOTIFY_OWNER_EXIT");
     } else {
         print(b"MQ_NOTIFY_OWNER_EXIT:FAIL child status ");
         print_num(st as i64);
@@ -113,11 +114,9 @@ fn test_mq_attr_limits() {
         sys_mq_unlink(name.as_ptr());
     }
     if r == EINVAL as i64 {
-        println(b"MQ_MSGSIZE_LIMIT:OK");
+        pass(b"MQ_MSGSIZE_LIMIT");
     } else {
-        print(b"MQ_MSGSIZE_LIMIT:FAIL r=");
-        print_num(r);
-        println(b"");
+        fail_num(b"MQ_MSGSIZE_LIMIT:FAIL r=", r);
     }
 }
 
@@ -139,7 +138,7 @@ fn test_mq_open_create() {
     sys_close(fd as u64);
     sys_mq_unlink(name.as_ptr());
 
-    println(b"MQ_OPEN_CREATE:OK");
+    pass(b"MQ_OPEN_CREATE");
 }
 
 /// Test mq_open opens existing queue
@@ -167,7 +166,7 @@ fn test_mq_open_existing() {
 
     // Both should be valid (different fds)
     if fd1 != fd2 && fd2 >= 0 {
-        println(b"MQ_OPEN_EXISTING:OK");
+        pass(b"MQ_OPEN_EXISTING");
     } else {
         print(b"MQ_OPEN_EXISTING:FAIL: fd1=");
         print_num(fd1);
@@ -201,7 +200,7 @@ fn test_mq_open_excl() {
         &attr,
     );
     if fd2 == EEXIST {
-        println(b"MQ_OPEN_EXCL:OK");
+        pass(b"MQ_OPEN_EXCL");
     } else {
         print(b"MQ_OPEN_EXCL:FAIL: expected -17, got ");
         print_num(fd2);
@@ -218,7 +217,7 @@ fn test_mq_open_enoent() {
     // Try to open non-existent queue without O_CREAT
     let fd = sys_mq_open(name.as_ptr(), O_RDWR as i32, 0, core::ptr::null());
     if fd == ENOENT {
-        println(b"MQ_OPEN_ENOENT:OK");
+        pass(b"MQ_OPEN_ENOENT");
     } else {
         print(b"MQ_OPEN_ENOENT:FAIL: expected -2, got ");
         print_num(fd);
@@ -254,7 +253,7 @@ fn test_mq_unlink() {
     // Try to open again - should fail with ENOENT
     let fd2 = sys_mq_open(name.as_ptr(), O_RDWR as i32, 0, core::ptr::null());
     if fd2 == ENOENT {
-        println(b"MQ_UNLINK:OK");
+        pass(b"MQ_UNLINK");
     } else {
         print(b"MQ_UNLINK:FAIL: reopen expected -2, got ");
         print_num(fd2);
@@ -309,7 +308,7 @@ fn test_mq_send_receive() {
 
     // Verify message
     if ret as usize == msg.len() && &buf[..msg.len()] == msg {
-        println(b"MQ_SEND_RECEIVE:OK");
+        pass(b"MQ_SEND_RECEIVE");
     } else {
         print(b"MQ_SEND_RECEIVE:FAIL: message mismatch, len=");
         print_num(ret);
@@ -386,7 +385,7 @@ fn test_mq_priority_ordering() {
 
     // Should be high priority message (prio=10)
     if prio == 10 && ret as usize == msg_hi.len() && &buf[..msg_hi.len()] == msg_hi {
-        println(b"MQ_PRIORITY:OK");
+        pass(b"MQ_PRIORITY");
     } else {
         print(b"MQ_PRIORITY:FAIL: expected prio=10, got ");
         print_num(prio as i64);
@@ -425,7 +424,7 @@ fn test_mq_nonblock_eagain() {
         core::ptr::null(),
     );
     if ret == EAGAIN {
-        println(b"MQ_NONBLOCK:OK");
+        pass(b"MQ_NONBLOCK");
     } else {
         print(b"MQ_NONBLOCK:FAIL: expected -11, got ");
         print_num(ret);
@@ -461,7 +460,7 @@ fn test_mq_getsetattr() {
 
     // Verify attributes match what we set
     if old_attr.mq_maxmsg == 10 && old_attr.mq_msgsize == 256 {
-        println(b"MQ_GETSETATTR:OK");
+        pass(b"MQ_GETSETATTR");
     } else {
         print(b"MQ_GETSETATTR:FAIL: maxmsg=");
         print_num(old_attr.mq_maxmsg);
@@ -498,7 +497,7 @@ fn test_mq_close_fd() {
         core::ptr::null(),
     );
     if ret == EBADF {
-        println(b"MQ_CLOSE_FD:OK");
+        pass(b"MQ_CLOSE_FD");
     } else {
         print(b"MQ_CLOSE_FD:FAIL: expected -9, got ");
         print_num(ret);
@@ -524,7 +523,7 @@ fn test_mq_emsgsize() {
     let msg = b"This message is way too long for the queue!";
     let ret = sys_mq_timedsend(fd as i32, msg.as_ptr(), msg.len(), 0, core::ptr::null());
     if ret == EMSGSIZE {
-        println(b"MQ_EMSGSIZE:OK");
+        pass(b"MQ_EMSGSIZE");
     } else {
         print(b"MQ_EMSGSIZE:FAIL: expected -90, got ");
         print_num(ret);
@@ -549,9 +548,7 @@ fn test_mq_name_slash() {
             core::ptr::null(),
         );
         if fd != EACCES {
-            print(b"MQ_NAME_SLASH:FAIL: mq_open expected -13, got ");
-            print_num(fd);
-            println(b"");
+            fail_num(b"MQ_NAME_SLASH:FAIL: mq_open expected -13, got ", fd);
             if fd >= 0 {
                 sys_close(fd as u64);
                 sys_mq_unlink(name.as_ptr());
@@ -561,12 +558,10 @@ fn test_mq_name_slash() {
     }
     let ret = sys_mq_unlink(b"/test_mq_slash\0".as_ptr());
     if ret != EACCES {
-        print(b"MQ_NAME_SLASH:FAIL: mq_unlink expected -13, got ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"MQ_NAME_SLASH:FAIL: mq_unlink expected -13, got ", ret);
         return;
     }
-    println(b"MQ_NAME_SLASH:OK");
+    pass(b"MQ_NAME_SLASH");
 }
 
 /// A name longer than NAME_MAX is ENAMETOOLONG for mq_open and
@@ -587,7 +582,7 @@ fn test_mq_name_toolong() {
         sys_close(o as u64);
     }
     if o == -36 && u == -36 {
-        println(b"MQ_NAME_TOOLONG:OK");
+        pass(b"MQ_NAME_TOOLONG");
     } else {
         print(b"MQ_NAME_TOOLONG:FAIL open=");
         print_num(o);
@@ -620,7 +615,7 @@ fn test_mq_read_status() {
     let line = &buf[..n.max(0) as usize];
     if line.starts_with(b"QSIZE:5 ") && line.ends_with(b"\n") && w == EINVAL && attr.mq_curmsgs == 1
     {
-        println(b"MQ_READ_STATUS:OK");
+        pass(b"MQ_READ_STATUS");
     } else {
         print(b"MQ_READ_STATUS:FAIL read ");
         print_num(n);

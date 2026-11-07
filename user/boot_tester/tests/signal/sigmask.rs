@@ -11,6 +11,7 @@
 //! - SIGSUSPEND_RESTORE: after rt_sigsuspend's handler the old mask is
 //!   back, and the handler ran under the suspend mask
 
+use crate::tests::harness::pass;
 use crate::tests::helpers::{print, print_num, println};
 use crate::tests::signal::signals::restorer_addr;
 use hk_syscall::{
@@ -85,7 +86,7 @@ fn test_sigkill_unblockable() {
     } else if m & bad != 0 {
         fail(T, b"KILL/STOP blocked, mask ", m as i64);
     } else {
-        println(b"SIGKILL_UNBLOCKABLE:OK");
+        pass(b"SIGKILL_UNBLOCKABLE");
     }
 }
 
@@ -200,7 +201,7 @@ fn test_epoll_pwait_sigmask() {
     } else if still & USR1 == 0 {
         fail(T, b"pending after ", still as i64);
     } else {
-        println(b"EPOLL_PWAIT_SIGMASK:OK");
+        pass(b"EPOLL_PWAIT_SIGMASK");
     }
 }
 
@@ -221,7 +222,7 @@ fn test_epoll_pwait_restore() {
     } else if after_bad != USR1 {
         fail(T, b"mask after EINVAL ", after_bad as i64);
     } else {
-        println(b"EPOLL_PWAIT_SIGMASK_RESTORE:OK");
+        pass(b"EPOLL_PWAIT_SIGMASK_RESTORE");
     }
 }
 
@@ -252,7 +253,7 @@ fn test_ppoll_restore() {
     } else if after != USR1 {
         fail(T, b"mask after ", after as i64);
     } else {
-        println(b"PPOLL_SIGMASK_RESTORE:OK");
+        pass(b"PPOLL_SIGMASK_RESTORE");
     }
 }
 
@@ -277,6 +278,6 @@ fn test_sigsuspend_restore() {
     } else if after != USR1 | USR2 {
         fail(T, b"mask after ", after as i64);
     } else {
-        println(b"SIGSUSPEND_RESTORE:OK");
+        pass(b"SIGSUSPEND_RESTORE");
     }
 }

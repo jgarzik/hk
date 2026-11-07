@@ -10,7 +10,8 @@
 //!   query (ADJ_OFFSET_SS_READ) is allowed but sets nothing else it
 //!   carries (Linux __do_adjtimex ignores the other bits there)
 
-use crate::tests::helpers::{print, print_num, println};
+use crate::tests::harness::fail_num;
+use crate::tests::helpers::{print, println};
 use hk_syscall::{
     CLOCK_MONOTONIC, CLOCK_REALTIME, Timespec, Timeval, Timex, sys_adjtimex, sys_clock_gettime,
     sys_clock_settime, sys_exit, sys_fork, sys_setresuid, sys_settimeofday, sys_wait4,
@@ -33,9 +34,7 @@ pub fn run_tests() {
     if st == 0 {
         println(b":OK");
     } else {
-        print(b":FAIL status ");
-        print_num(st as i64);
-        println(b"");
+        fail_num(b":FAIL status ", st as i64);
     }
 }
 

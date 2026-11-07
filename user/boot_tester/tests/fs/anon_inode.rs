@@ -12,6 +12,7 @@
 //!   predates it)
 //! - CHMOD_CTIME: chmod and chown (even of nothing) advance ctime
 
+use crate::tests::harness::{fail_num, pass};
 use crate::tests::helpers::{host_mode, print, print_num, println, skip};
 use hk_syscall::{
     O_CREAT, O_WRONLY, Stat, Timespec, sys_chmod, sys_chown, sys_close, sys_epoll_create1,
@@ -109,7 +110,7 @@ fn anon_link() {
     }
     close_all(&fds);
     if ok {
-        println(b"ANON_INODE_LINK:OK");
+        pass(b"ANON_INODE_LINK");
     }
 }
 
@@ -126,11 +127,9 @@ fn anon_shared() {
         }
     }
     if ok && first.st_mode == 0o600 {
-        println(b"ANON_INODE_SHARED:OK");
+        pass(b"ANON_INODE_SHARED");
     } else {
-        print(b"ANON_INODE_SHARED:FAIL mode ");
-        print_num(first.st_mode as i64);
-        println(b"");
+        fail_num(b"ANON_INODE_SHARED:FAIL mode ", first.st_mode as i64);
     }
     close_all(&fds);
 }
@@ -164,7 +163,7 @@ fn pipe_ino() {
         && got[..wl] == want[..wl];
     close_all(&[a[0] as i64, a[1] as i64, b[0] as i64, b[1] as i64]);
     if ok {
-        println(b"PIPE_INO:OK");
+        pass(b"PIPE_INO");
     } else {
         print(b"PIPE_INO:FAIL ino ");
         print_num(sa.st_ino as i64);
@@ -192,7 +191,7 @@ fn anon_setattr() {
     sys_fstat(fd as i32, &mut st);
     sys_close(fd as u64);
     if a == EOPNOTSUPP && b == EOPNOTSUPP && c == EOPNOTSUPP && st.st_mode == 0o600 {
-        println(b"ANON_INODE_SETATTR:OK");
+        pass(b"ANON_INODE_SETATTR");
     } else {
         print(b"ANON_INODE_SETATTR:FAIL ");
         print_num(a);
@@ -239,7 +238,7 @@ fn chmod_ctime() {
     let t2 = ctime_ns(path);
     sys_unlink(path.as_ptr());
     if r1 == 0 && r2 == 0 && t0 > 0 && t1 > t0 && t2 > t1 {
-        println(b"CHMOD_CTIME:OK");
+        pass(b"CHMOD_CTIME");
     } else {
         print(b"CHMOD_CTIME:FAIL ");
         print_num(t1 - t0);

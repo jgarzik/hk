@@ -12,7 +12,8 @@
 //! - Test keyctl CLEAR clears keyring
 //! - Test keyctl INVALIDATE removes key
 
-use crate::tests::helpers::{print, print_num, println};
+use crate::tests::harness::pass;
+use crate::tests::helpers::{print, print_num};
 use hk_syscall::{
     KEY_SPEC_PROCESS_KEYRING, KEY_SPEC_THREAD_KEYRING, KEYCTL_CLEAR, KEYCTL_DESCRIBE,
     KEYCTL_GET_KEYRING_ID, KEYCTL_INVALIDATE, KEYCTL_LINK, KEYCTL_READ, KEYCTL_REVOKE,
@@ -52,7 +53,7 @@ fn test_add_key_user() {
     );
 
     if serial > 0 {
-        println(b"ADD_KEY_USER:OK");
+        pass(b"ADD_KEY_USER");
     } else {
         print(b"ADD_KEY_USER:FAIL: add_key returned ");
         print_num(serial);
@@ -98,7 +99,7 @@ fn test_keyctl_read() {
 
     // Verify payload
     if ret as usize == payload.len() && &buf[..payload.len()] == payload {
-        println(b"KEYCTL_READ:OK");
+        pass(b"KEYCTL_READ");
     } else {
         print(b"KEYCTL_READ:FAIL: payload mismatch, got len ");
         print_num(ret);
@@ -145,7 +146,7 @@ fn test_keyctl_describe() {
     // Description should contain type and description
     // Format: "type;uid;gid;perm;description"
     if ret > 0 {
-        println(b"KEYCTL_DESCRIBE:OK");
+        pass(b"KEYCTL_DESCRIBE");
     } else {
         print(b"KEYCTL_DESCRIBE:FAIL: returned ");
         print_num(ret);
@@ -164,7 +165,7 @@ fn test_get_keyring_id() {
     );
 
     if ret > 0 {
-        println(b"KEYCTL_GET_KEYRING_ID:OK");
+        pass(b"KEYCTL_GET_KEYRING_ID");
     } else {
         print(b"KEYCTL_GET_KEYRING_ID:FAIL: returned ");
         print_num(ret);
@@ -219,7 +220,7 @@ fn test_keyctl_update() {
     );
 
     if ret as usize == payload2.len() && &buf[..payload2.len()] == payload2 {
-        println(b"KEYCTL_UPDATE:OK");
+        pass(b"KEYCTL_UPDATE");
     } else {
         print(b"KEYCTL_UPDATE:FAIL: updated payload mismatch, len ");
         print_num(ret);
@@ -275,7 +276,7 @@ fn test_keyctl_link_unlink() {
     let ret = sys_keyctl(KEYCTL_UNLINK, serial as u64, thread_keyring as u64, 0, 0);
 
     if ret == 0 {
-        println(b"KEYCTL_LINK_UNLINK:OK");
+        pass(b"KEYCTL_LINK_UNLINK");
     } else {
         print(b"KEYCTL_LINK_UNLINK:FAIL: UNLINK returned ");
         print_num(ret);
@@ -323,7 +324,7 @@ fn test_keyctl_revoke() {
     );
 
     if ret == EKEYREVOKED {
-        println(b"KEYCTL_REVOKE:OK");
+        pass(b"KEYCTL_REVOKE");
     } else {
         print(b"KEYCTL_REVOKE:FAIL: read after revoke returned ");
         print_num(ret);
@@ -360,10 +361,10 @@ fn test_request_key() {
     );
 
     if found == serial {
-        println(b"REQUEST_KEY:OK");
+        pass(b"REQUEST_KEY");
     } else if found > 0 {
         // Found a key but different serial (might be from previous run)
-        println(b"REQUEST_KEY:OK");
+        pass(b"REQUEST_KEY");
     } else {
         print(b"REQUEST_KEY:FAIL: request_key returned ");
         print_num(found);
@@ -410,7 +411,7 @@ fn test_keyctl_clear() {
     let ret = sys_keyctl(KEYCTL_CLEAR, thread_keyring as u64, 0, 0, 0);
 
     if ret == 0 {
-        println(b"KEYCTL_CLEAR:OK");
+        pass(b"KEYCTL_CLEAR");
     } else {
         print(b"KEYCTL_CLEAR:FAIL: CLEAR returned ");
         print_num(ret);
@@ -460,7 +461,7 @@ fn test_keyctl_invalidate() {
     // Linux: ENOKEY, or EACCES if the key GC already unlinked it from the
     // keyring so the lookup lost its possession permission (racy)
     if ret == ENOKEY || ret == -13 {
-        println(b"KEYCTL_INVALIDATE:OK");
+        pass(b"KEYCTL_INVALIDATE");
     } else {
         print(b"KEYCTL_INVALIDATE:FAIL: read after invalidate returned ");
         print_num(ret);

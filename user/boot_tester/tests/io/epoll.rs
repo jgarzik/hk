@@ -13,6 +13,7 @@
 //! - EPOLL_ET_REARM: edge-triggered reports each new event
 //! - EPOLL_MAXEVENTS: Linux's maxevents range
 
+use crate::tests::harness::{fail_num, pass};
 use crate::tests::helpers::{host_mode, print, print_num, println, skip};
 use hk_syscall::{
     EPOLL_CLOEXEC, EPOLL_CTL_ADD, EPOLL_CTL_DEL, EPOLL_CTL_MOD, EPOLLET, EPOLLIN, EPOLLONESHOT,
@@ -63,7 +64,7 @@ fn test_epoll_create() {
         return;
     }
 
-    println(b"EPOLL_CREATE:OK");
+    pass(b"EPOLL_CREATE");
 }
 
 /// Test epoll_create1 with EPOLL_CLOEXEC
@@ -82,7 +83,7 @@ fn test_epoll_create1() {
         return;
     }
 
-    println(b"EPOLL_CREATE1:OK");
+    pass(b"EPOLL_CREATE1");
 }
 
 /// Test epoll_ctl ADD and DEL operations
@@ -132,7 +133,7 @@ fn test_epoll_add_del() {
     sys_close(epfd as u64);
     sys_close(pipefd[0] as u64);
     sys_close(pipefd[1] as u64);
-    println(b"EPOLL_ADD_DEL:OK");
+    pass(b"EPOLL_ADD_DEL");
 }
 
 /// Test epoll_wait with a pipe
@@ -197,7 +198,7 @@ fn test_epoll_wait_pipe() {
     sys_close(epfd as u64);
     sys_close(pipefd[0] as u64);
     sys_close(pipefd[1] as u64);
-    println(b"EPOLL_WAIT_PIPE:OK");
+    pass(b"EPOLL_WAIT_PIPE");
 }
 
 /// Test epoll_wait with eventfd
@@ -243,7 +244,7 @@ fn test_epoll_wait_eventfd() {
 
     sys_close(epfd as u64);
     sys_close(efd as u64);
-    println(b"EPOLL_WAIT_EVENTFD:OK");
+    pass(b"EPOLL_WAIT_EVENTFD");
 }
 
 /// Test epoll_event ABI layout: full 64-bit data, two events returned
@@ -283,7 +284,7 @@ fn test_epoll_wait_multi_data64() {
 
     let data_ok = (d0 == D1 && d1 == D2) || (d0 == D2 && d1 == D1);
     if ret == 2 && data_ok && ev0 & EPOLLIN != 0 && ev1 & EPOLLIN != 0 {
-        println(b"EPOLL_WAIT_MULTI_DATA64:OK");
+        pass(b"EPOLL_WAIT_MULTI_DATA64");
     } else {
         print(b"EPOLL_WAIT_MULTI_DATA64:FAIL: ret=");
         print_num(ret);
@@ -301,7 +302,7 @@ fn test_epoll_wait_multi_data64() {
 fn test_epoll_event_pad_zero() {
     let size = core::mem::size_of::<EpollEvent>();
     if size == 12 {
-        println(b"EPOLL_EVENT_PAD_ZERO:OK"); // packed (x86_64): no padding
+        pass(b"EPOLL_EVENT_PAD_ZERO"); // packed (x86_64): no padding
         return;
     }
     if host_mode() {
@@ -329,7 +330,7 @@ fn test_epoll_event_pad_zero() {
     sys_close(efd as u64);
     let pad = (buf[0] >> 32) as u32;
     if ret == 1 && pad == 0 {
-        println(b"EPOLL_EVENT_PAD_ZERO:OK");
+        pass(b"EPOLL_EVENT_PAD_ZERO");
     } else {
         print(b"EPOLL_EVENT_PAD_ZERO:FAIL: ret=");
         print_num(ret);
@@ -359,7 +360,7 @@ fn test_epoll_timeout() {
     }
 
     sys_close(epfd as u64);
-    println(b"EPOLL_TIMEOUT:OK");
+    pass(b"EPOLL_TIMEOUT");
 }
 
 /// Test epoll_ctl MOD operation
@@ -400,7 +401,7 @@ fn test_epoll_modify() {
     sys_close(epfd as u64);
     sys_close(pipefd[0] as u64);
     sys_close(pipefd[1] as u64);
-    println(b"EPOLL_MODIFY:OK");
+    pass(b"EPOLL_MODIFY");
 }
 
 /// Test EPOLLONESHOT mode
@@ -462,25 +463,21 @@ fn test_epoll_oneshot() {
 
     sys_close(epfd as u64);
     sys_close(efd as u64);
-    println(b"EPOLL_ONESHOT:OK");
+    pass(b"EPOLL_ONESHOT");
 }
 
 /// Test epoll_pwait2 with NULL timeout (indefinite wait, but with ready fd)
 fn test_epoll_pwait2_null_timeout() {
     let epfd = sys_epoll_create1(0);
     if epfd < 0 {
-        print(b"EPOLL_PWAIT2_NULL:FAIL: epoll_create1 returned ");
-        print_num(epfd);
-        println(b"");
+        fail_num(b"EPOLL_PWAIT2_NULL:FAIL: epoll_create1 returned ", epfd);
         return;
     }
 
     // Create eventfd with initial value 1 (immediately readable)
     let efd = sys_eventfd2(1, 0);
     if efd < 0 {
-        print(b"EPOLL_PWAIT2_NULL:FAIL: eventfd2 returned ");
-        print_num(efd);
-        println(b"");
+        fail_num(b"EPOLL_PWAIT2_NULL:FAIL: eventfd2 returned ", efd);
         sys_close(epfd as u64);
         return;
     }
@@ -499,18 +496,17 @@ fn test_epoll_pwait2_null_timeout() {
         0,
     );
     if ret != 1 {
-        print(b"EPOLL_PWAIT2_NULL:FAIL: expected 1, got ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"EPOLL_PWAIT2_NULL:FAIL: expected 1, got ", ret);
         sys_close(epfd as u64);
         sys_close(efd as u64);
         return;
     }
 
     if events[0].data != 100 {
-        print(b"EPOLL_PWAIT2_NULL:FAIL: wrong data ");
-        print_num(events[0].data as i64);
-        println(b"");
+        fail_num(
+            b"EPOLL_PWAIT2_NULL:FAIL: wrong data ",
+            events[0].data as i64,
+        );
         sys_close(epfd as u64);
         sys_close(efd as u64);
         return;
@@ -518,16 +514,14 @@ fn test_epoll_pwait2_null_timeout() {
 
     sys_close(epfd as u64);
     sys_close(efd as u64);
-    println(b"EPOLL_PWAIT2_NULL:OK");
+    pass(b"EPOLL_PWAIT2_NULL");
 }
 
 /// Test epoll_pwait2 with zero timeout (non-blocking)
 fn test_epoll_pwait2_zero_timeout() {
     let epfd = sys_epoll_create1(0);
     if epfd < 0 {
-        print(b"EPOLL_PWAIT2_ZERO:FAIL: epoll_create1 returned ");
-        print_num(epfd);
-        println(b"");
+        fail_num(b"EPOLL_PWAIT2_ZERO:FAIL: epoll_create1 returned ", epfd);
         return;
     }
 
@@ -546,33 +540,27 @@ fn test_epoll_pwait2_zero_timeout() {
         0,
     );
     if ret != 0 {
-        print(b"EPOLL_PWAIT2_ZERO:FAIL: expected 0, got ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"EPOLL_PWAIT2_ZERO:FAIL: expected 0, got ", ret);
         sys_close(epfd as u64);
         return;
     }
 
     sys_close(epfd as u64);
-    println(b"EPOLL_PWAIT2_ZERO:OK");
+    pass(b"EPOLL_PWAIT2_ZERO");
 }
 
 /// Test epoll_pwait2 with data ready and small timeout
 fn test_epoll_pwait2_with_data() {
     let epfd = sys_epoll_create1(0);
     if epfd < 0 {
-        print(b"EPOLL_PWAIT2_DATA:FAIL: epoll_create1 returned ");
-        print_num(epfd);
-        println(b"");
+        fail_num(b"EPOLL_PWAIT2_DATA:FAIL: epoll_create1 returned ", epfd);
         return;
     }
 
     let mut pipefd = [0i32; 2];
     let ret = sys_pipe2(pipefd.as_mut_ptr(), 0);
     if ret < 0 {
-        print(b"EPOLL_PWAIT2_DATA:FAIL: pipe2 returned ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"EPOLL_PWAIT2_DATA:FAIL: pipe2 returned ", ret);
         sys_close(epfd as u64);
         return;
     }
@@ -600,9 +588,7 @@ fn test_epoll_pwait2_with_data() {
         0,
     );
     if ret != 1 {
-        print(b"EPOLL_PWAIT2_DATA:FAIL: expected 1, got ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"EPOLL_PWAIT2_DATA:FAIL: expected 1, got ", ret);
         sys_close(epfd as u64);
         sys_close(pipefd[0] as u64);
         sys_close(pipefd[1] as u64);
@@ -610,9 +596,10 @@ fn test_epoll_pwait2_with_data() {
     }
 
     if events[0].data != 200 {
-        print(b"EPOLL_PWAIT2_DATA:FAIL: wrong data ");
-        print_num(events[0].data as i64);
-        println(b"");
+        fail_num(
+            b"EPOLL_PWAIT2_DATA:FAIL: wrong data ",
+            events[0].data as i64,
+        );
         sys_close(epfd as u64);
         sys_close(pipefd[0] as u64);
         sys_close(pipefd[1] as u64);
@@ -622,7 +609,7 @@ fn test_epoll_pwait2_with_data() {
     sys_close(epfd as u64);
     sys_close(pipefd[0] as u64);
     sys_close(pipefd[1] as u64);
-    println(b"EPOLL_PWAIT2_DATA:OK");
+    pass(b"EPOLL_PWAIT2_DATA");
 }
 
 fn ok_or_fail(name: &[u8], step: i64) {
@@ -630,9 +617,7 @@ fn ok_or_fail(name: &[u8], step: i64) {
     if step == 0 {
         println(b":OK");
     } else {
-        print(b":FAIL step ");
-        print_num(step);
-        println(b"");
+        fail_num(b":FAIL step ", step);
     }
 }
 

@@ -3,6 +3,7 @@
 //! Tests for PR_SET/GET_KEEPCAPS, PR_SET/GET_CHILD_SUBREAPER, PR_SET/GET_THP_DISABLE,
 //! x86-64 specific PR_SET/GET_TSC, and x86-64 arch_prctl(ARCH_GET/SET_CPUID)
 
+use crate::tests::harness::{fail_num, pass};
 use crate::tests::helpers::{print, print_num, println};
 #[cfg(target_arch = "x86_64")]
 use hk_syscall::{
@@ -37,11 +38,9 @@ pub fn run_tests() {
 fn test_keepcaps_default() {
     let ret = sys_prctl(PR_GET_KEEPCAPS, 0, 0, 0, 0);
     if ret == 0 {
-        println(b"PRCTL_KEEPCAPS_DEFAULT:OK");
+        pass(b"PRCTL_KEEPCAPS_DEFAULT");
     } else {
-        print(b"PRCTL_KEEPCAPS_DEFAULT:FAIL: expected 0, got ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"PRCTL_KEEPCAPS_DEFAULT:FAIL: expected 0, got ", ret);
     }
 }
 
@@ -50,9 +49,7 @@ fn test_keepcaps_set_get() {
     // Set to 1
     let ret = sys_prctl(PR_SET_KEEPCAPS, 1, 0, 0, 0);
     if ret != 0 {
-        print(b"PRCTL_KEEPCAPS_SET:FAIL: set returned ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"PRCTL_KEEPCAPS_SET:FAIL: set returned ", ret);
         return;
     }
 
@@ -68,22 +65,18 @@ fn test_keepcaps_set_get() {
     // Set back to 0
     let ret = sys_prctl(PR_SET_KEEPCAPS, 0, 0, 0, 0);
     if ret != 0 {
-        print(b"PRCTL_KEEPCAPS_SET:FAIL: clear returned ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"PRCTL_KEEPCAPS_SET:FAIL: clear returned ", ret);
         return;
     }
 
     // Get - should be 0
     let ret = sys_prctl(PR_GET_KEEPCAPS, 0, 0, 0, 0);
     if ret != 0 {
-        print(b"PRCTL_KEEPCAPS_SET:FAIL: get after clear returned ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"PRCTL_KEEPCAPS_SET:FAIL: get after clear returned ", ret);
         return;
     }
 
-    println(b"PRCTL_KEEPCAPS_SET:OK");
+    pass(b"PRCTL_KEEPCAPS_SET");
 }
 
 /// Test: KEEPCAPS with invalid value returns EINVAL
@@ -92,11 +85,9 @@ fn test_keepcaps_invalid() {
     let ret = sys_prctl(PR_SET_KEEPCAPS, 2, 0, 0, 0);
     if ret == -22 {
         // EINVAL
-        println(b"PRCTL_KEEPCAPS_INVALID:OK");
+        pass(b"PRCTL_KEEPCAPS_INVALID");
     } else {
-        print(b"PRCTL_KEEPCAPS_INVALID:FAIL: expected -22, got ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"PRCTL_KEEPCAPS_INVALID:FAIL: expected -22, got ", ret);
     }
 }
 
@@ -112,17 +103,16 @@ fn test_child_subreaper_default() {
         0,
     );
     if ret != 0 {
-        print(b"PRCTL_SUBREAPER_DEFAULT:FAIL: get returned ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"PRCTL_SUBREAPER_DEFAULT:FAIL: get returned ", ret);
         return;
     }
     if value == 0 {
-        println(b"PRCTL_SUBREAPER_DEFAULT:OK");
+        pass(b"PRCTL_SUBREAPER_DEFAULT");
     } else {
-        print(b"PRCTL_SUBREAPER_DEFAULT:FAIL: expected 0, got ");
-        print_num(value as i64);
-        println(b"");
+        fail_num(
+            b"PRCTL_SUBREAPER_DEFAULT:FAIL: expected 0, got ",
+            value as i64,
+        );
     }
 }
 
@@ -131,9 +121,7 @@ fn test_child_subreaper_set_get() {
     // Set to 1
     let ret = sys_prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0);
     if ret != 0 {
-        print(b"PRCTL_SUBREAPER_SET:FAIL: set returned ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"PRCTL_SUBREAPER_SET:FAIL: set returned ", ret);
         return;
     }
 
@@ -147,24 +135,18 @@ fn test_child_subreaper_set_get() {
         0,
     );
     if ret != 0 {
-        print(b"PRCTL_SUBREAPER_SET:FAIL: get returned ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"PRCTL_SUBREAPER_SET:FAIL: get returned ", ret);
         return;
     }
     if value != 1 {
-        print(b"PRCTL_SUBREAPER_SET:FAIL: expected 1, got ");
-        print_num(value as i64);
-        println(b"");
+        fail_num(b"PRCTL_SUBREAPER_SET:FAIL: expected 1, got ", value as i64);
         return;
     }
 
     // Set back to 0
     let ret = sys_prctl(PR_SET_CHILD_SUBREAPER, 0, 0, 0, 0);
     if ret != 0 {
-        print(b"PRCTL_SUBREAPER_SET:FAIL: clear returned ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"PRCTL_SUBREAPER_SET:FAIL: clear returned ", ret);
         return;
     }
 
@@ -178,13 +160,11 @@ fn test_child_subreaper_set_get() {
         0,
     );
     if ret != 0 || value != 0 {
-        print(b"PRCTL_SUBREAPER_SET:FAIL: after clear, got ");
-        print_num(value as i64);
-        println(b"");
+        fail_num(b"PRCTL_SUBREAPER_SET:FAIL: after clear, got ", value as i64);
         return;
     }
 
-    println(b"PRCTL_SUBREAPER_SET:OK");
+    pass(b"PRCTL_SUBREAPER_SET");
 }
 
 /// Test: THP_DISABLE set and get
@@ -192,18 +172,14 @@ fn test_thp_disable() {
     // Get default (should be 0)
     let ret = sys_prctl(PR_GET_THP_DISABLE, 0, 0, 0, 0);
     if ret != 0 {
-        print(b"PRCTL_THP_DISABLE:FAIL: default not 0, got ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"PRCTL_THP_DISABLE:FAIL: default not 0, got ", ret);
         return;
     }
 
     // Set THP_DISABLE to 1
     let ret = sys_prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
     if ret != 0 {
-        print(b"PRCTL_THP_DISABLE:FAIL: set returned ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"PRCTL_THP_DISABLE:FAIL: set returned ", ret);
         return;
     }
 
@@ -219,22 +195,18 @@ fn test_thp_disable() {
     // Set back to 0
     let ret = sys_prctl(PR_SET_THP_DISABLE, 0, 0, 0, 0);
     if ret != 0 {
-        print(b"PRCTL_THP_DISABLE:FAIL: clear returned ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"PRCTL_THP_DISABLE:FAIL: clear returned ", ret);
         return;
     }
 
     // Get - should be 0
     let ret = sys_prctl(PR_GET_THP_DISABLE, 0, 0, 0, 0);
     if ret != 0 {
-        print(b"PRCTL_THP_DISABLE:FAIL: after clear returned ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"PRCTL_THP_DISABLE:FAIL: after clear returned ", ret);
         return;
     }
 
-    println(b"PRCTL_THP_DISABLE:OK");
+    pass(b"PRCTL_THP_DISABLE");
 }
 
 /// Test: TSC mode set and get (x86-64 only)
@@ -256,9 +228,7 @@ fn test_tsc_mode() {
     // Set TSC mode to SIGSEGV (disable RDTSC)
     let ret = sys_prctl(PR_SET_TSC, PR_TSC_SIGSEGV as u64, 0, 0, 0);
     if ret != 0 {
-        print(b"PRCTL_TSC:FAIL: set SIGSEGV returned ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"PRCTL_TSC:FAIL: set SIGSEGV returned ", ret);
         return;
     }
 
@@ -277,13 +247,11 @@ fn test_tsc_mode() {
     // Set back to ENABLE
     let ret = sys_prctl(PR_SET_TSC, PR_TSC_ENABLE as u64, 0, 0, 0);
     if ret != 0 {
-        print(b"PRCTL_TSC:FAIL: set ENABLE returned ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"PRCTL_TSC:FAIL: set ENABLE returned ", ret);
         return;
     }
 
-    println(b"PRCTL_TSC:OK");
+    pass(b"PRCTL_TSC");
 }
 
 /// Test: CPUID faulting via arch_prctl(ARCH_GET/SET_CPUID) (x86-64 only)
@@ -325,18 +293,14 @@ fn test_cpuid_fault() {
         // Without the feature, the mode must stay "enabled"
         let ret = sys_arch_prctl(ARCH_GET_CPUID, 0);
         if ret != 1 {
-            print(b"PRCTL_CPUID:FAIL: after ENODEV, get returned ");
-            print_num(ret);
-            println(b"");
+            fail_num(b"PRCTL_CPUID:FAIL: after ENODEV, get returned ", ret);
             return;
         }
-        println(b"PRCTL_CPUID:OK");
+        pass(b"PRCTL_CPUID");
         return;
     }
     if ret != 0 {
-        print(b"PRCTL_CPUID:FAIL: ARCH_SET_CPUID(0) returned ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"PRCTL_CPUID:FAIL: ARCH_SET_CPUID(0) returned ", ret);
         return;
     }
 
@@ -352,11 +316,9 @@ fn test_cpuid_fault() {
     // Re-enable CPUID
     let ret = sys_arch_prctl(ARCH_SET_CPUID, 1);
     if ret != 0 {
-        print(b"PRCTL_CPUID:FAIL: ARCH_SET_CPUID(1) returned ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"PRCTL_CPUID:FAIL: ARCH_SET_CPUID(1) returned ", ret);
         return;
     }
 
-    println(b"PRCTL_CPUID:OK");
+    pass(b"PRCTL_CPUID");
 }

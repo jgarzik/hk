@@ -9,6 +9,7 @@
 //!   once; realtime moves 2 s against monotonic (Linux
 //!   timekeeping_inject_offset adds inside the lock: no offset is lost)
 
+use crate::tests::harness::{fail_num, pass};
 use crate::tests::helpers::{print, print_num, println};
 use hk_syscall::{
     ADJ_ESTERROR, ADJ_MAXERROR, ADJ_TICK, STA_UNSYNC, TIME_ERROR, Timex, sys_adjtimex,
@@ -61,9 +62,7 @@ fn test_adjtimex_freq_constant() {
     if step == 0 {
         println(b":OK");
     } else {
-        print(b":FAIL step ");
-        print_num(step);
-        println(b"");
+        fail_num(b":FAIL step ", step);
     }
 }
 
@@ -73,20 +72,16 @@ fn test_adjtimex_query() {
     let ret = sys_adjtimex(&mut txc);
 
     if ret < 0 {
-        print(b"ADJTIMEX_QUERY:FAIL: returned ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"ADJTIMEX_QUERY:FAIL: returned ", ret);
         return;
     }
 
     // Check that time was returned (should be > 0 since kernel has been running)
     // Note: time.tv_sec could be 0 if RTC was not available, so check if it's >= 0
     if txc.time.tv_sec >= 0 {
-        println(b"ADJTIMEX_QUERY:OK");
+        pass(b"ADJTIMEX_QUERY");
     } else {
-        print(b"ADJTIMEX_QUERY:FAIL: time.tv_sec=");
-        print_num(txc.time.tv_sec);
-        println(b"");
+        fail_num(b"ADJTIMEX_QUERY:FAIL: time.tv_sec=", txc.time.tv_sec);
     }
 }
 
@@ -97,7 +92,7 @@ fn test_adjtimex_unsync() {
 
     // Initially clock should be unsynchronized
     if ret == TIME_ERROR as i64 && (txc.status & STA_UNSYNC != 0) {
-        println(b"ADJTIMEX_UNSYNC:OK");
+        pass(b"ADJTIMEX_UNSYNC");
     } else {
         print(b"ADJTIMEX_UNSYNC:FAIL: ret=");
         print_num(ret);
@@ -123,7 +118,7 @@ fn test_adjtimex_set_errors() {
         sys_adjtimex(&mut txc2);
 
         if txc2.maxerror == 100000 && txc2.esterror == 50000 {
-            println(b"ADJTIMEX_SET_ERRORS:OK");
+            pass(b"ADJTIMEX_SET_ERRORS");
         } else {
             print(b"ADJTIMEX_SET_ERRORS:FAIL: maxerror=");
             print_num(txc2.maxerror);
@@ -132,9 +127,7 @@ fn test_adjtimex_set_errors() {
             println(b"");
         }
     } else {
-        print(b"ADJTIMEX_SET_ERRORS:FAIL: ret=");
-        print_num(ret);
-        println(b"");
+        fail_num(b"ADJTIMEX_SET_ERRORS:FAIL: ret=", ret);
     }
 }
 
@@ -148,11 +141,12 @@ fn test_adjtimex_invalid_tick() {
 
     // Should return EINVAL (-22)
     if ret == -22 {
-        println(b"ADJTIMEX_INVALID_TICK:OK");
+        pass(b"ADJTIMEX_INVALID_TICK");
     } else {
-        print(b"ADJTIMEX_INVALID_TICK:FAIL: expected EINVAL(-22), got ");
-        print_num(ret);
-        println(b"");
+        fail_num(
+            b"ADJTIMEX_INVALID_TICK:FAIL: expected EINVAL(-22), got ",
+            ret,
+        );
     }
 }
 
@@ -197,10 +191,8 @@ fn test_adjtimex_offset() {
     set_offset(-2);
     let off = moved - 2_000_000_000;
     if ok && off.abs() < 50_000_000 {
-        println(b"ADJTIMEX_OFFSET:OK");
+        pass(b"ADJTIMEX_OFFSET");
     } else {
-        print(b"ADJTIMEX_OFFSET:FAIL moved ns ");
-        print_num(moved);
-        println(b"");
+        fail_num(b"ADJTIMEX_OFFSET:FAIL moved ns ", moved);
     }
 }

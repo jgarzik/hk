@@ -22,8 +22,9 @@
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
+use crate::tests::harness::fail_num;
 use crate::tests::helpers::sleep_ms;
-use crate::tests::helpers::{print, print_num, println};
+use crate::tests::helpers::{print, println};
 use crate::tests::mm::fork_mm::spawn_thread;
 use hk_syscall::{
     FUTEX_WAIT, FUTEX_WAKE, MAP_ANONYMOUS, MAP_PRIVATE, MAP_SHARED, MREMAP_FIXED, MREMAP_MAYMOVE,
@@ -52,9 +53,7 @@ fn report(name: &[u8], ok: bool, got: i64) {
     if ok {
         println(b":OK");
     } else {
-        print(b":FAIL: got ");
-        print_num(got);
-        println(b"");
+        fail_num(b":FAIL: got ", got);
     }
 }
 

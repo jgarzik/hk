@@ -20,6 +20,7 @@ use hk_syscall::{
 #[cfg(target_arch = "x86_64")]
 use hk_syscall::sys_signalfd4;
 
+use crate::tests::harness::pass;
 #[cfg(target_arch = "aarch64")]
 use hk_syscall::sys_signalfd4;
 
@@ -60,7 +61,7 @@ fn test_signalfd_fork() {
     let mine = sys_read(fd as u64, info.as_mut_ptr(), 128);
     sys_close(fd as u64);
     if st == 0 && mine == EAGAIN {
-        println(b"SIGNALFD_FORK:OK");
+        pass(b"SIGNALFD_FORK");
     } else {
         print(b"SIGNALFD_FORK:FAIL status ");
         print_num(st as i64);
@@ -102,7 +103,7 @@ fn test_signalfd_create() {
         return;
     }
 
-    println(b"SIGNALFD_CREATE:OK");
+    pass(b"SIGNALFD_CREATE");
 }
 
 /// Test signalfd nonblock - should return EAGAIN when no signals pending
@@ -131,7 +132,7 @@ fn test_signalfd_nonblock() {
 
     if ret == -11 {
         // EAGAIN
-        println(b"SIGNALFD_NONBLOCK:OK");
+        pass(b"SIGNALFD_NONBLOCK");
     } else {
         print(b"SIGNALFD_NONBLOCK:FAIL: expected -11 (EAGAIN), got ");
         print_num(ret);
@@ -189,7 +190,7 @@ fn test_signalfd_read() {
         return;
     }
 
-    println(b"SIGNALFD_READ:OK");
+    pass(b"SIGNALFD_READ");
 }
 
 /// Test signalfd poll - POLLIN when signal pending
@@ -260,7 +261,7 @@ fn test_signalfd_poll() {
     sys_read(fd as u64, buf.as_mut_ptr(), 128);
     sys_close(fd as u64);
 
-    println(b"SIGNALFD_POLL:OK");
+    pass(b"SIGNALFD_POLL");
 }
 
 /// Test signalfd mask update
@@ -306,7 +307,7 @@ fn test_signalfd_mask_update() {
 
     if ret == -11 {
         // EAGAIN - empty mask means no signals match
-        println(b"SIGNALFD_MASK_UPDATE:OK");
+        pass(b"SIGNALFD_MASK_UPDATE");
     } else {
         print(b"SIGNALFD_MASK_UPDATE:FAIL: expected -11 (EAGAIN), got ");
         print_num(ret);

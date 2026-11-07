@@ -9,6 +9,7 @@
 //! pointer (getsockopt's optlen, FIONREAD's result) works, as Linux's
 //! get_user/put_user on x86-64 and arm64.
 
+use crate::tests::harness::fail_num;
 use crate::tests::helpers::{print, print_num, println};
 use hk_syscall::{
     IoVec, MAP_ANONYMOUS, MAP_PRIVATE, PROT_READ, PROT_WRITE, sys_close, sys_getsockopt, sys_ioctl,
@@ -77,9 +78,7 @@ fn test_iov_negative_len(bad: u64) {
     if step == 0 {
         println(b":OK");
     } else {
-        print(b":FAIL step ");
-        print_num(step);
-        println(b"");
+        fail_num(b":FAIL step ", step);
     }
 }
 
@@ -132,9 +131,7 @@ fn test_unaligned() {
     if step == 0 {
         println(b":OK");
     } else {
-        print(b":FAIL step ");
-        print_num(step);
-        println(b"");
+        fail_num(b":FAIL step ", step);
     }
 }
 

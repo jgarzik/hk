@@ -12,6 +12,7 @@
 //! - FUTEX_UNALIGNED: a futex word not 4-byte aligned is EINVAL for
 //!   wait, wake and a requeue target (Linux get_futex_key)
 
+use crate::tests::harness::pass;
 use crate::tests::helpers::{print, print_num, println};
 use core::ptr;
 use hk_syscall::{
@@ -87,7 +88,7 @@ fn test_futex_wake_no_waiters() {
     );
 
     if ret == 0 {
-        println(b"FUTEX_WAKE_NONE:OK");
+        pass(b"FUTEX_WAKE_NONE");
     } else {
         print(b"FUTEX_WAKE_NONE:FAIL: expected 0, got ");
         print_num(ret);
@@ -108,7 +109,7 @@ fn test_futex_wait_wrong_value() {
 
     if ret == -11 {
         // EAGAIN
-        println(b"FUTEX_WAIT_EAGAIN:OK");
+        pass(b"FUTEX_WAIT_EAGAIN");
     } else {
         print(b"FUTEX_WAIT_EAGAIN:FAIL: expected -11 (EAGAIN), got ");
         print_num(ret);
@@ -126,7 +127,7 @@ fn test_set_robust_list() {
     let ret = sys_set_robust_list(&robust_head, RobustListHead::SIZE);
 
     if ret == 0 {
-        println(b"SET_ROBUST_LIST:OK");
+        pass(b"SET_ROBUST_LIST");
     } else {
         print(b"SET_ROBUST_LIST:FAIL: expected 0, got ");
         print_num(ret);
@@ -149,7 +150,7 @@ fn test_set_robust_list_einval() {
 
     if ret == -22 {
         // EINVAL
-        println(b"SET_ROBUST_LIST_EINVAL:OK");
+        pass(b"SET_ROBUST_LIST_EINVAL");
     } else {
         print(b"SET_ROBUST_LIST_EINVAL:FAIL: expected -22 (EINVAL), got ");
         print_num(ret);
@@ -177,7 +178,7 @@ fn test_get_robust_list() {
     );
 
     if ret == 0 {
-        println(b"GET_ROBUST_LIST:OK");
+        pass(b"GET_ROBUST_LIST");
     } else {
         print(b"GET_ROBUST_LIST:FAIL: expected 0, got ");
         print_num(ret);
@@ -210,7 +211,7 @@ fn test_futex_waitv_invalid_flags() {
 
     if ret == -22 {
         // EINVAL
-        println(b"FUTEX_WAITV_FLAGS:OK");
+        pass(b"FUTEX_WAITV_FLAGS");
     } else {
         print(b"FUTEX_WAITV_FLAGS:FAIL: expected -22 (EINVAL), got ");
         print_num(ret);
@@ -236,7 +237,7 @@ fn test_futex_waitv_invalid_count_zero() {
 
     if ret == -22 {
         // EINVAL
-        println(b"FUTEX_WAITV_COUNT_ZERO:OK");
+        pass(b"FUTEX_WAITV_COUNT_ZERO");
     } else {
         print(b"FUTEX_WAITV_COUNT_ZERO:FAIL: expected -22 (EINVAL), got ");
         print_num(ret);
@@ -262,7 +263,7 @@ fn test_futex_waitv_invalid_count_too_large() {
 
     if ret == -22 {
         // EINVAL
-        println(b"FUTEX_WAITV_COUNT_LARGE:OK");
+        pass(b"FUTEX_WAITV_COUNT_LARGE");
     } else {
         print(b"FUTEX_WAITV_COUNT_LARGE:FAIL: expected -22 (EINVAL), got ");
         print_num(ret);
@@ -281,7 +282,7 @@ fn test_futex_waitv_null_waiters() {
 
     if ret == -22 {
         // EINVAL
-        println(b"FUTEX_WAITV_NULL:OK");
+        pass(b"FUTEX_WAITV_NULL");
     } else {
         print(b"FUTEX_WAITV_NULL:FAIL: expected -22 (EINVAL), got ");
         print_num(ret);
@@ -303,7 +304,7 @@ fn test_futex_waitv_reserved_nonzero() {
 
     if ret == -22 {
         // EINVAL
-        println(b"FUTEX_WAITV_RESERVED:OK");
+        pass(b"FUTEX_WAITV_RESERVED");
     } else {
         print(b"FUTEX_WAITV_RESERVED:FAIL: expected -22 (EINVAL), got ");
         print_num(ret);
@@ -323,7 +324,7 @@ fn test_futex_waitv_wrong_value() {
 
     if ret == -11 {
         // EAGAIN
-        println(b"FUTEX_WAITV_WRONG_VAL:OK");
+        pass(b"FUTEX_WAITV_WRONG_VAL");
     } else {
         print(b"FUTEX_WAITV_WRONG_VAL:FAIL: expected -11 (EAGAIN), got ");
         print_num(ret);
@@ -344,7 +345,7 @@ fn test_futex_waitv_invalid_size() {
 
     if ret == -22 {
         // EINVAL
-        println(b"FUTEX_WAITV_SIZE:OK");
+        pass(b"FUTEX_WAITV_SIZE");
     } else {
         print(b"FUTEX_WAITV_SIZE:FAIL: expected -22 (EINVAL), got ");
         print_num(ret);

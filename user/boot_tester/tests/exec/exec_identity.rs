@@ -5,7 +5,8 @@
 //! (would_dump): an execute-only program cannot be attached to or read
 //! through /proc by its own uid
 
-use crate::tests::helpers::{print, print_num, println};
+use crate::tests::harness::fail_num;
+use crate::tests::helpers::{print, println};
 use hk_syscall::{
     O_CREAT, O_RDONLY, O_TRUNC, O_WRONLY, sys_chmod, sys_close, sys_dup3, sys_execve, sys_exit,
     sys_fork, sys_kill, sys_open, sys_pipe2, sys_prctl, sys_ptrace, sys_read, sys_setresgid,
@@ -186,9 +187,7 @@ fn report(name: &[u8], st: i32, want: i32) {
     if st & 0x7f == 0 && (st >> 8) & 0xff == want {
         println(b":OK");
     } else {
-        print(b":FAIL status ");
-        print_num(st as i64);
-        println(b"");
+        fail_num(b":FAIL status ", st as i64);
     }
 }
 

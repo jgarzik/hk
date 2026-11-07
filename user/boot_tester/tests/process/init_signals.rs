@@ -9,7 +9,8 @@
 //! - INIT_BLOCKED_DFL: SIGSEGV and SIGTERM sent while init blocks them
 //!   (action SIG_DFL) are queued, and discarded when it unblocks them
 
-use crate::tests::helpers::{print, print_num, println};
+use crate::tests::harness::fail_num;
+use crate::tests::helpers::{print, println};
 use core::sync::atomic::{AtomicU32, Ordering};
 use hk_syscall::{
     Timespec, sys_exit, sys_fork, sys_kill, sys_nanosleep, sys_rt_sigaction, sys_wait4,
@@ -51,9 +52,7 @@ fn blocked_dfl() {
     if st == 0 {
         println(b":OK");
     } else {
-        print(b":FAIL kill step ");
-        print_num((st >> 8) as i64);
-        println(b"");
+        fail_num(b":FAIL kill step ", (st >> 8) as i64);
     }
 }
 
@@ -90,9 +89,7 @@ fn unkillable() {
     if st == 0 {
         println(b":OK");
     } else {
-        print(b":FAIL kill step ");
-        print_num((st >> 8) as i64);
-        println(b"");
+        fail_num(b":FAIL kill step ", (st >> 8) as i64);
     }
 }
 
@@ -114,8 +111,6 @@ fn handled() {
     if st == 0 && got == 1 {
         println(b":OK");
     } else {
-        print(b":FAIL got ");
-        print_num(got as i64);
-        println(b"");
+        fail_num(b":FAIL got ", got as i64);
     }
 }

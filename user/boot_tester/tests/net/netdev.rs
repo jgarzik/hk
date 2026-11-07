@@ -19,6 +19,7 @@ use hk_syscall::{
     sys_sendto, sys_socket, sys_unshare, sys_wait4,
 };
 
+use crate::tests::harness::{fail_num, pass};
 use crate::tests::helpers::{host_mode, print, print_num, println, skip};
 use crate::tests::net::nl::net_setup_eth0;
 use hk_syscall::sys_ioctl;
@@ -106,9 +107,7 @@ fn test_proc_net_dev() {
     let mut buf = [0u8; 4096];
     let n = read_proc_net_dev(&mut buf);
     if n <= 0 {
-        print(b"PROC_NET_DEV:FAIL open/read ");
-        print_num(n);
-        println(b"");
+        fail_num(b"PROC_NET_DEV:FAIL open/read ", n);
         return;
     }
     let text = &buf[..n as usize];
@@ -124,7 +123,7 @@ fn test_proc_net_dev() {
         println(b"PROC_NET_DEV:FAIL no lo line");
         return;
     }
-    println(b"PROC_NET_DEV:OK");
+    pass(b"PROC_NET_DEV");
 }
 
 fn lo_counters() -> Option<[u64; 16]> {
@@ -208,7 +207,7 @@ fn test_lo_counters() {
         && after[0] > before[0]
         && after[8] > before[8];
     if grew {
-        println(b"LO_COUNTERS:OK");
+        pass(b"LO_COUNTERS");
     } else {
         print(b"LO_COUNTERS:FAIL rx_packets ");
         print_num(before[1] as i64);
@@ -250,7 +249,7 @@ fn test_netns_proc_net_dev() {
     sys_wait4(pid, &mut status, 0, 0);
     let code = (status >> 8) & 0xff;
     if status & 0x7f == 0 && code == 0 {
-        println(b"NETNS_PROC_NET_DEV:OK");
+        pass(b"NETNS_PROC_NET_DEV");
     } else if code == 2 && host_mode() {
         // Unprivileged harness without CAP_SYS_ADMIN
         skip(
@@ -258,9 +257,7 @@ fn test_netns_proc_net_dev() {
             b"unshare(CLONE_NEWNET) not permitted",
         );
     } else {
-        print(b"NETNS_PROC_NET_DEV:FAIL code=");
-        print_num(code as i64);
-        println(b"");
+        fail_num(b"NETNS_PROC_NET_DEV:FAIL code=", code as i64);
     }
 }
 
@@ -343,9 +340,7 @@ fn test_eth0_dns() {
             alen,
         );
         if s != qlen as i64 {
-            print(b"ETH0_DNS:FAIL sendto ");
-            print_num(s);
-            println(b"");
+            fail_num(b"ETH0_DNS:FAIL sendto ", s);
             sys_close(fd as u64);
             return;
         }
@@ -388,7 +383,7 @@ fn test_eth0_dns() {
         print(b" tx+");
         print_num(tx as i64);
         println(b"");
-        println(b"ETH0_DNS:OK");
+        pass(b"ETH0_DNS");
     } else {
         print(b"ETH0_DNS:FAIL no reply (recv=");
         print_num(got);
@@ -506,5 +501,5 @@ fn test_eth0_nic() {
     if c[2] != 0 || c[10] != 0 {
         return fail(b"errors", (c[2] + c[10]) as i64);
     }
-    println(b"ETH0_NIC:OK");
+    pass(b"ETH0_NIC");
 }

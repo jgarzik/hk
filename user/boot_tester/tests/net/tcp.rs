@@ -2,6 +2,7 @@
 //!
 //! Tests for the TCP protocol implementation using fork()-based server/client.
 
+use crate::tests::harness::pass;
 use crate::tests::helpers::{print, print_num, println};
 use hk_syscall::{
     AF_INET, SOCK_STREAM, SockAddrIn, htonl, htons, make_ipv4, sys_accept, sys_bind, sys_close,
@@ -78,7 +79,7 @@ fn test_tcp_loopback() {
         let mut status: i32 = 0;
         sys_wait4(-1, &mut status, 0, 0);
 
-        println(b"TCP_LOOPBACK:OK");
+        pass(b"TCP_LOOPBACK");
     }
 }
 
@@ -126,7 +127,7 @@ fn run_tcp_server(server_fd: i64) {
         // Check if it matches expected message
         let expected = b"Hello from client";
         if n as usize == expected.len() && &buf[..n as usize] == expected {
-            println(b"SERVER_RECV:OK");
+            pass(b"SERVER_RECV");
         } else {
             println(b"SERVER_RECV:FAIL");
         }
@@ -242,7 +243,7 @@ fn run_tcp_client(port: u16) {
         // Check if it matches expected response
         let expected = b"Hello from server";
         if n as usize == expected.len() && &buf[..n as usize] == expected {
-            println(b"CLIENT_RECV:OK");
+            pass(b"CLIENT_RECV");
         } else {
             println(b"CLIENT_RECV:FAIL");
         }

@@ -11,8 +11,9 @@
 //! pidfd_getfd (PTRACE_MODE_ATTACH_REALCREDS) of a root process are
 //! EPERM for nobody; kcmp of one's own process works
 
+use crate::tests::harness::fail_num;
 use crate::tests::helpers::reap;
-use crate::tests::helpers::{print, print_num, println};
+use crate::tests::helpers::{print, println};
 use crate::tests::mm::fork_mm::{join, spawn_thread};
 use core::sync::atomic::{AtomicI64, Ordering};
 use hk_syscall::{
@@ -84,9 +85,7 @@ fn kcmp_pidfd_perm() {
     if st == 0 {
         println(b":OK");
     } else {
-        print(b":FAIL status ");
-        print_num(st as i64);
-        println(b"");
+        fail_num(b":FAIL status ", st as i64);
     }
 }
 
@@ -130,9 +129,7 @@ fn report(name: &[u8], st: i32, want: i32) {
     if st & 0x7f == 0 && (st >> 8) & 0xff == want {
         println(b":OK");
     } else {
-        print(b":FAIL status ");
-        print_num(st as i64);
-        println(b"");
+        fail_num(b":FAIL status ", st as i64);
     }
 }
 

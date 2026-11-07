@@ -10,6 +10,7 @@
 //! - Test invalid map type
 //! - Test invalid fd
 
+use crate::tests::harness::{fail_num, pass};
 use crate::tests::helpers::{print, print_num, println};
 use core::mem::size_of;
 use hk_syscall::{
@@ -131,7 +132,7 @@ fn test_hash_map_create() {
         return;
     }
 
-    println(b"BPF_HASH_CREATE:OK");
+    pass(b"BPF_HASH_CREATE");
 }
 
 /// Test BPF array map creation
@@ -166,7 +167,7 @@ fn test_array_map_create() {
         return;
     }
 
-    println(b"BPF_ARRAY_CREATE:OK");
+    pass(b"BPF_ARRAY_CREATE");
 }
 
 /// Test hash map insert/lookup/delete operations
@@ -286,7 +287,7 @@ fn test_hash_map_ops() {
     }
 
     sys_close(map_fd as u64);
-    println(b"BPF_HASH_OPS:OK");
+    pass(b"BPF_HASH_OPS");
 }
 
 /// Test array map update/lookup operations
@@ -394,7 +395,7 @@ fn test_array_map_ops() {
     }
 
     sys_close(map_fd as u64);
-    println(b"BPF_ARRAY_OPS:OK");
+    pass(b"BPF_ARRAY_OPS");
 }
 
 /// Test map iteration with get_next_key
@@ -521,7 +522,7 @@ fn test_map_iteration() {
     }
 
     sys_close(map_fd as u64);
-    println(b"BPF_ITERATE:OK");
+    pass(b"BPF_ITERATE");
 }
 
 /// Test BPF program load
@@ -569,7 +570,7 @@ fn test_prog_load() {
         return;
     }
 
-    println(b"BPF_PROG_LOAD:OK");
+    pass(b"BPF_PROG_LOAD");
 }
 
 /// A 600,000-instruction program (4.8 MB) loads with CAP_BPF, as Linux
@@ -609,13 +610,11 @@ fn test_prog_load_big() {
     );
     hk_syscall::sys_munmap(p as u64, len);
     if fd < 0 {
-        print(b"BPF_PROG_LOAD_BIG:FAIL returned ");
-        print_num(fd);
-        println(b"");
+        fail_num(b"BPF_PROG_LOAD_BIG:FAIL returned ", fd);
         return;
     }
     sys_close(fd as u64);
-    println(b"BPF_PROG_LOAD_BIG:OK");
+    pass(b"BPF_PROG_LOAD_BIG");
 }
 
 /// Test invalid map type returns error
@@ -650,7 +649,7 @@ fn test_invalid_map_type() {
         return;
     }
 
-    println(b"BPF_INVALID_TYPE:OK");
+    pass(b"BPF_INVALID_TYPE");
 }
 
 /// Test operations on invalid fd
@@ -683,5 +682,5 @@ fn test_invalid_fd() {
         return;
     }
 
-    println(b"BPF_INVALID_FD:OK");
+    pass(b"BPF_INVALID_FD");
 }

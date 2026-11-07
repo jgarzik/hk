@@ -38,7 +38,8 @@
 //!   thread updating in a loop while the key is revoked never revives
 //!   it (Linux: key_update and key_revoke under key->sem).
 
-use crate::tests::helpers::{print, print_num, println};
+use crate::tests::harness::fail_num;
+use crate::tests::helpers::{print, println};
 use hk_syscall::{
     _LINUX_CAPABILITY_VERSION_3, CapUserData, CapUserHeader, PR_SET_KEEPCAPS, sys_capget,
     sys_capset, sys_exit, sys_fork, sys_getuid, sys_prctl, sys_setgid, sys_setresuid, sys_setreuid,
@@ -82,9 +83,7 @@ fn report(name: &[u8], step: u64) {
     if step == 0 {
         println(b":OK");
     } else {
-        print(b":FAIL step ");
-        print_num(step as i64);
-        println(b"");
+        fail_num(b":FAIL step ", step as i64);
     }
 }
 

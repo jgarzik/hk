@@ -8,6 +8,7 @@
 //! - Test: capset() - verify dropped capability can't be restored
 //! - Test: reboot() checks CAP_SYS_BOOT before its magic numbers
 
+use crate::tests::harness::{fail_num, pass};
 use crate::tests::helpers::{print, print_num, println};
 use hk_syscall::{
     _LINUX_CAPABILITY_VERSION_3, CAP_SYS_ADMIN, CAP_SYS_BOOT, CapUserData, CapUserHeader,
@@ -62,11 +63,9 @@ fn test_reboot_needs_cap() {
     if has_cap(CAP_SYS_BOOT) {
         let r = reboot();
         if r == EINVAL {
-            println(b"REBOOT_BAD_MAGIC:OK");
+            pass(b"REBOOT_BAD_MAGIC");
         } else {
-            print(b"REBOOT_BAD_MAGIC:FAIL: expected EINVAL, got ");
-            print_num(r);
-            println(b"");
+            fail_num(b"REBOOT_BAD_MAGIC:FAIL: expected EINVAL, got ", r);
         }
     }
     let pid = sys_fork();
@@ -77,11 +76,9 @@ fn test_reboot_needs_cap() {
     let mut status = 0;
     sys_wait4(pid, &mut status, 0, 0);
     if pid > 0 && status == 0 {
-        println(b"REBOOT_NEEDS_CAP:OK");
+        pass(b"REBOOT_NEEDS_CAP");
     } else {
-        print(b"REBOOT_NEEDS_CAP:FAIL: status ");
-        print_num(status as i64);
-        println(b"");
+        fail_num(b"REBOOT_NEEDS_CAP:FAIL: status ", status as i64);
     }
 }
 
@@ -96,9 +93,7 @@ fn test_capget_self() {
     let ret = sys_capget(&mut header as *mut _, data.as_mut_ptr());
 
     if ret != 0 {
-        print(b"CAPGET_SELF:FAIL: capget returned ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"CAPGET_SELF:FAIL: capget returned ", ret);
     } else {
         // As root, we should have full capabilities (all bits set in effective/permitted)
         // CAP_VALID_MASK for caps 0-40 = 0x1ffffffffff
@@ -110,7 +105,7 @@ fn test_capget_self() {
 
         // Check that at least the lower 32 capabilities are set
         if eff_low == 0xffffffff && perm_low == 0xffffffff {
-            println(b"CAPGET_SELF:OK");
+            pass(b"CAPGET_SELF");
         } else {
             print(b"CAPGET_SELF:FAIL: expected full caps, got eff=");
             print_num(eff_low as i64);
@@ -136,11 +131,9 @@ fn test_capget_pid_zero() {
     let ret = sys_capget(&mut header as *mut _, data.as_mut_ptr());
 
     if ret == 0 {
-        println(b"CAPGET_PID_ZERO:OK");
+        pass(b"CAPGET_PID_ZERO");
     } else {
-        print(b"CAPGET_PID_ZERO:FAIL: capget returned ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"CAPGET_PID_ZERO:FAIL: capget returned ", ret);
     }
 }
 
@@ -156,7 +149,7 @@ fn test_capget_invalid_version() {
 
     // After the call, header.version should be set to current version
     if ret == 0 && header.version == _LINUX_CAPABILITY_VERSION_3 {
-        println(b"CAPGET_INVALID_VERSION:OK");
+        pass(b"CAPGET_INVALID_VERSION");
     } else {
         print(b"CAPGET_INVALID_VERSION:FAIL: ret=");
         print_num(ret);
@@ -177,9 +170,7 @@ fn test_capset_drop_cap() {
 
     let ret = sys_capget(&mut header as *mut _, data.as_mut_ptr());
     if ret != 0 {
-        print(b"CAPSET_DROP:FAIL: initial capget returned ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"CAPSET_DROP:FAIL: initial capget returned ", ret);
         return;
     }
 
@@ -191,9 +182,7 @@ fn test_capset_drop_cap() {
     // Set the new capabilities
     let ret = sys_capset(&header as *const _, data.as_ptr());
     if ret != 0 {
-        print(b"CAPSET_DROP:FAIL: capset returned ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"CAPSET_DROP:FAIL: capset returned ", ret);
         return;
     }
 
@@ -201,15 +190,13 @@ fn test_capset_drop_cap() {
     let mut verify_data: [CapUserData; 2] = [CapUserData::default(); 2];
     let ret = sys_capget(&mut header as *mut _, verify_data.as_mut_ptr());
     if ret != 0 {
-        print(b"CAPSET_DROP:FAIL: verify capget returned ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"CAPSET_DROP:FAIL: verify capget returned ", ret);
         return;
     }
 
     // Check that CAP_SYS_ADMIN is no longer in effective set
     if (verify_data[0].effective & cap_mask) == 0 {
-        println(b"CAPSET_DROP:OK");
+        pass(b"CAPSET_DROP");
     } else {
         println(b"CAPSET_DROP:FAIL: cap still in effective set");
     }
@@ -227,9 +214,7 @@ fn test_capset_restore_fails() {
 
     let ret = sys_capget(&mut header as *mut _, data.as_mut_ptr());
     if ret != 0 {
-        print(b"CAPSET_RESTORE:FAIL: capget returned ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"CAPSET_RESTORE:FAIL: capget returned ", ret);
         return;
     }
 
@@ -240,10 +225,8 @@ fn test_capset_restore_fails() {
     // This should succeed because it's still in permitted
     let ret = sys_capset(&header as *const _, data.as_ptr());
     if ret == 0 {
-        println(b"CAPSET_RESTORE:OK");
+        pass(b"CAPSET_RESTORE");
     } else {
-        print(b"CAPSET_RESTORE:FAIL: capset returned ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"CAPSET_RESTORE:FAIL: capset returned ", ret);
     }
 }

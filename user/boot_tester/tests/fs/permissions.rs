@@ -15,6 +15,7 @@
 //! - fchmodat2() with invalid flags
 //! - chroot() - change root directory
 
+use crate::tests::harness::pass;
 use crate::tests::helpers::{print, print_num, println};
 use hk_syscall::{
     O_CREAT, O_RDWR, O_WRONLY, Stat, Timespec, UTIME_NOW, UTIME_OMIT, sys_chdir, sys_chmod,
@@ -67,7 +68,7 @@ fn test_chmod() {
                 // Check permission bits (lower 12 bits of st_mode)
                 let perm = statbuf.st_mode & 0o7777;
                 if perm == 0o755 {
-                    println(b"CHMOD:OK");
+                    pass(b"CHMOD");
                 } else {
                     print(b"CHMOD:FAIL: expected mode 0755, got ");
                     print_num(perm as i64);
@@ -103,7 +104,7 @@ fn test_fchmod() {
                 // Check permission bits
                 let perm = statbuf.st_mode & 0o7777;
                 if perm == 0o700 {
-                    println(b"FCHMOD:OK");
+                    pass(b"FCHMOD");
                 } else {
                     print(b"FCHMOD:FAIL: expected mode 0700, got ");
                     print_num(perm as i64);
@@ -120,7 +121,7 @@ fn test_fchmod_ebadf() {
     let ret = sys_fchmod(999, 0o755);
     if ret == -9 {
         // EBADF
-        println(b"FCHMOD_EBADF:OK");
+        pass(b"FCHMOD_EBADF");
     } else {
         print(b"FCHMOD_EBADF:FAIL: expected -9 (EBADF), got ");
         print_num(ret);
@@ -148,7 +149,7 @@ fn test_chown() {
                 print(b"CHOWN:FAIL: stat returned ");
                 print_num(ret);
             } else if stat_buf.st_uid == 1000 && stat_buf.st_gid == 1000 {
-                println(b"CHOWN:OK");
+                pass(b"CHOWN");
             } else {
                 print(b"CHOWN:FAIL: expected uid=1000 gid=1000, got uid=");
                 print_num(stat_buf.st_uid as i64);
@@ -178,7 +179,7 @@ fn test_fchown() {
                 print(b"FCHOWN:FAIL: stat returned ");
                 print_num(ret);
             } else if stat_buf.st_uid == 2000 && stat_buf.st_gid == 2000 {
-                println(b"FCHOWN:OK");
+                pass(b"FCHOWN");
             } else {
                 print(b"FCHOWN:FAIL: expected uid=2000 gid=2000, got uid=");
                 print_num(stat_buf.st_uid as i64);
@@ -196,7 +197,7 @@ fn test_fchown_ebadf() {
     let ret = sys_fchown(999, 1000, 1000);
     if ret == -9 {
         // EBADF
-        println(b"FCHOWN_EBADF:OK");
+        pass(b"FCHOWN_EBADF");
     } else {
         print(b"FCHOWN_EBADF:FAIL: expected -9 (EBADF), got ");
         print_num(ret);
@@ -229,7 +230,7 @@ fn test_lchown() {
                     print(b"LCHOWN:FAIL: lstat returned ");
                     print_num(ret);
                 } else if stat_buf.st_uid == 3000 && stat_buf.st_gid == 3000 {
-                    println(b"LCHOWN:OK");
+                    pass(b"LCHOWN");
                 } else {
                     print(b"LCHOWN:FAIL: expected uid=3000 gid=3000, got uid=");
                     print_num(stat_buf.st_uid as i64);
@@ -265,7 +266,7 @@ fn test_chown_minus1() {
                 print(b"CHOWN_MINUS1:FAIL: stat returned ");
                 print_num(ret);
             } else if stat_buf.st_uid == 150 && stat_buf.st_gid == 200 {
-                println(b"CHOWN_MINUS1:OK");
+                pass(b"CHOWN_MINUS1");
             } else {
                 print(b"CHOWN_MINUS1:FAIL: expected uid=150 gid=200, got uid=");
                 print_num(stat_buf.st_uid as i64);
@@ -288,7 +289,7 @@ fn test_umask() {
         // Set it back and verify we get 0o077 back
         let new_mask = sys_umask(old_mask as u32);
         if new_mask == 0o077 {
-            println(b"UMASK:OK");
+            pass(b"UMASK");
         } else {
             print(b"UMASK:FAIL: expected 0o077, got ");
             print_num(new_mask);
@@ -345,7 +346,7 @@ fn test_utimensat() {
                     print(b"UTIMENSAT:FAIL: NULL times failed: ");
                     print_num(ret3);
                 } else {
-                    println(b"UTIMENSAT:OK");
+                    pass(b"UTIMENSAT");
                 }
             }
         }
@@ -387,7 +388,7 @@ fn test_fchmodat2() {
     } else {
         let perm = statbuf.st_mode & 0o7777;
         if perm == 0o755 {
-            println(b"FCHMODAT2:OK");
+            pass(b"FCHMODAT2");
         } else {
             print(b"FCHMODAT2:FAIL: expected 0755, got ");
             print_num(perm as i64);
@@ -413,7 +414,7 @@ fn test_fchmodat2_invalid_flags() {
     let ret = sys_fchmodat2(AT_FDCWD, fchmodat2_inv_file.as_ptr(), 0o755, 0x12345678);
     if ret == -22 {
         // EINVAL = -22
-        println(b"FCHMODAT2_INV:OK");
+        pass(b"FCHMODAT2_INV");
     } else {
         print(b"FCHMODAT2_INV:FAIL: expected -22 (EINVAL), got ");
         print_num(ret);
@@ -478,7 +479,7 @@ fn test_chroot() {
     sys_wait4(pid, &mut status, 0, 0);
     let code = (status >> 8) & 0xff;
     if pid > 0 && status & 0x7f == 0 && code == 0 {
-        println(b"CHROOT:OK");
+        pass(b"CHROOT");
     } else {
         print(b"CHROOT:FAIL: child exit code ");
         print_num(code as i64);

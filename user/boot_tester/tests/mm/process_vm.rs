@@ -2,6 +2,7 @@
 //!
 //! Tests for cross-process memory access syscalls.
 
+use crate::tests::harness::fail_num;
 use crate::tests::helpers::{print, print_num, println};
 use crate::tests::mm::fork_mm::{join, spawn_thread};
 use core::sync::atomic::{AtomicI64, Ordering};
@@ -81,9 +82,7 @@ fn test_process_vm_sibling() {
     if st == 0 {
         println(b":OK");
     } else {
-        print(b":FAIL ");
-        print_num((st >> 8) as i64);
-        println(b"");
+        fail_num(b":FAIL ", (st >> 8) as i64);
     }
 }
 

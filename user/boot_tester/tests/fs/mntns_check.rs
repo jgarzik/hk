@@ -7,6 +7,7 @@
 //! on it; the parent's mount is untouched. A propagation change needs
 //! only a mount in some namespace (Linux may_change_propagation).
 
+use crate::tests::harness::{fail_num, pass};
 use crate::tests::helpers::{print, print_num, println};
 use hk_syscall::{
     _LINUX_CAPABILITY_VERSION_3, AF_INET, CLONE_NEWNS, CapUserData, CapUserHeader, O_CREAT,
@@ -85,9 +86,7 @@ fn test_foreign_mount() {
         0,
     );
     if r != 0 {
-        print(b"MNTNS_FOREIGN:FAIL mount ");
-        print_num(r);
-        println(b"");
+        fail_num(b"MNTNS_FOREIGN:FAIL mount ", r);
         return;
     }
     let marker = sys_open(b"/tmp/mntns_a/marker\0".as_ptr(), O_RDWR | O_CREAT, 0o644);
@@ -109,7 +108,7 @@ fn test_foreign_mount() {
     sys_rmdir(b"/tmp/mntns_a\0".as_ptr());
     sys_rmdir(b"/tmp/mntns_b\0".as_ptr());
     if status == 0 && still >= 0 && gone == 0 {
-        println(b"MNTNS_FOREIGN:OK");
+        pass(b"MNTNS_FOREIGN");
     } else {
         print(b"MNTNS_FOREIGN:FAIL status=");
         print_num(status as i64);
@@ -143,11 +142,9 @@ fn test_prio_net_raw() {
     let mut status = 0i32;
     sys_wait4(child, &mut status, 0, 0);
     if status == 0 {
-        println(b"SO_PRIORITY_NET_RAW:OK");
+        pass(b"SO_PRIORITY_NET_RAW");
     } else {
-        print(b"SO_PRIORITY_NET_RAW:FAIL status=");
-        print_num(status as i64);
-        println(b"");
+        fail_num(b"SO_PRIORITY_NET_RAW:FAIL status=", status as i64);
     }
 }
 

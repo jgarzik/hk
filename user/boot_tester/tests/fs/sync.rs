@@ -11,7 +11,7 @@
 //! - Test: membarrier() - memory barrier syscall
 //! - Test: readahead() - file readahead syscall
 
-use crate::tests::harness::T;
+use crate::tests::harness::{T, pass};
 use crate::tests::helpers::{add_fails, fail_count, print, print_num, println};
 use hk_syscall::{
     MEMBARRIER_CMD_FLAG_CPU, MEMBARRIER_CMD_GET_REGISTRATIONS, MEMBARRIER_CMD_GLOBAL,
@@ -174,7 +174,7 @@ fn test_dirty_sysctls() {
         && r2 == 20
         && y2 == 0;
     if ok {
-        println(b"VM_DIRTY_SYSCTLS:OK");
+        pass(b"VM_DIRTY_SYSCTLS");
     } else {
         // Each step's values: defaults, after dirty_bytes, after the ratio
         print(b"VM_DIRTY_SYSCTLS:FAIL ratio,bg=");
@@ -201,7 +201,7 @@ fn test_dirty_sysctls() {
 fn test_sync() {
     let ret = sys_sync();
     if ret == 0 {
-        println(b"SYNC:OK");
+        pass(b"SYNC");
     } else {
         print(b"SYNC:FAIL: expected 0, got ");
         print_num(ret);
@@ -222,7 +222,7 @@ fn test_fsync() {
         // Call fsync on the fd
         let ret = sys_fsync(fd as i32);
         if ret == 0 {
-            println(b"FSYNC:OK");
+            pass(b"FSYNC");
         } else {
             print(b"FSYNC:FAIL: expected 0, got ");
             print_num(ret);
@@ -237,7 +237,7 @@ fn test_fsync_ebadf() {
     let ret = sys_fsync(999);
     if ret == -9 {
         // EBADF
-        println(b"FSYNC_EBADF:OK");
+        pass(b"FSYNC_EBADF");
     } else {
         print(b"FSYNC_EBADF:FAIL: expected -9 (EBADF), got ");
         print_num(ret);
@@ -258,7 +258,7 @@ fn test_fdatasync() {
         // Call fdatasync on the fd
         let ret = sys_fdatasync(fd as i32);
         if ret == 0 {
-            println(b"FDATASYNC:OK");
+            pass(b"FDATASYNC");
         } else {
             print(b"FDATASYNC:FAIL: expected 0, got ");
             print_num(ret);
@@ -273,7 +273,7 @@ fn test_fdatasync_ebadf() {
     let ret = sys_fdatasync(999);
     if ret == -9 {
         // EBADF
-        println(b"FDATASYNC_EBADF:OK");
+        pass(b"FDATASYNC_EBADF");
     } else {
         print(b"FDATASYNC_EBADF:FAIL: expected -9 (EBADF), got ");
         print_num(ret);
@@ -294,7 +294,7 @@ fn test_syncfs() {
         // Call syncfs on the fd
         let ret = sys_syncfs(fd as i32);
         if ret == 0 {
-            println(b"SYNCFS:OK");
+            pass(b"SYNCFS");
         } else {
             print(b"SYNCFS:FAIL: expected 0, got ");
             print_num(ret);
@@ -309,7 +309,7 @@ fn test_syncfs_ebadf() {
     let ret = sys_syncfs(999);
     if ret == -9 {
         // EBADF
-        println(b"SYNCFS_EBADF:OK");
+        pass(b"SYNCFS_EBADF");
     } else {
         print(b"SYNCFS_EBADF:FAIL: expected -9 (EBADF), got ");
         print_num(ret);
@@ -468,7 +468,7 @@ fn test_membarrier() {
         return;
     }
 
-    println(b"MEMBARRIER:OK");
+    pass(b"MEMBARRIER");
 }
 
 /// Test: readahead() - file readahead syscall
@@ -519,5 +519,5 @@ fn test_readahead() {
 
     sys_close(fd as u64);
     sys_unlink(readahead_file.as_ptr());
-    println(b"READAHEAD:OK");
+    pass(b"READAHEAD");
 }

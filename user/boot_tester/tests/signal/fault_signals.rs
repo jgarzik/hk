@@ -29,6 +29,7 @@
 //!   it; the return's IRET faults in kernel mode with the user GS base
 //!   live) kills the task with SIGSEGV, the kernel survives
 
+use crate::tests::harness::{fail_num, pass};
 use crate::tests::helpers::{print, print_num, println};
 use hk_syscall::{
     MAP_ANONYMOUS, MAP_PRIVATE, PROT_NONE, PROT_READ, SA_RESTORER, SA_SIGINFO, SIG_BLOCK, SIG_IGN,
@@ -293,9 +294,7 @@ fn in_child(name: &[u8], f: fn() -> u64) {
     sys_wait4(pid, &mut status, 0, 0);
     if status & 0x7f != 0 {
         print(name);
-        print(b":FAIL: child killed by signal ");
-        print_num((status & 0x7f) as i64);
-        println(b"");
+        fail_num(b":FAIL: child killed by signal ", (status & 0x7f) as i64);
     } else if (status >> 8) & 0xff == 9 {
         print(name);
         println(b":FAIL: sigaction");
@@ -333,9 +332,7 @@ fn in_traced_child(name: &[u8], f: fn() -> u64) {
     }
     if status & 0x7f != 0 {
         print(name);
-        print(b":FAIL: child killed by signal ");
-        print_num((status & 0x7f) as i64);
-        println(b"");
+        fail_num(b":FAIL: child killed by signal ", (status & 0x7f) as i64);
     }
 }
 
@@ -521,9 +518,7 @@ fn expect_killed(name: &[u8], prep: fn() -> bool) {
     if status & 0x7f == SIGSEGV as i32 {
         println(b":OK");
     } else {
-        print(b":FAIL: wait status ");
-        print_num(status as i64);
-        println(b"");
+        fail_num(b":FAIL: wait status ", status as i64);
     }
 }
 
@@ -590,11 +585,9 @@ fn bad_iret() {
     let mut status: i32 = 0;
     let r = sys_wait4(pid, &mut status, 0, 0);
     if r == pid && status & 0x7f == SIGSEGV as i32 {
-        println(b"BAD_IRET:OK");
+        pass(b"BAD_IRET");
     } else {
-        print(b"BAD_IRET:FAIL status ");
-        print_num(status as i64);
-        println(b"");
+        fail_num(b"BAD_IRET:FAIL status ", status as i64);
     }
 }
 
@@ -636,11 +629,9 @@ fn df_entry() {
     let mut status: i32 = 0;
     let r = sys_wait4(pid, &mut status, 0, 0);
     if r == pid && status == 0 {
-        println(b"DF_ENTRY:OK");
+        pass(b"DF_ENTRY");
     } else {
-        print(b"DF_ENTRY:FAIL status ");
-        print_num(status as i64);
-        println(b"");
+        fail_num(b"DF_ENTRY:FAIL status ", status as i64);
     }
 }
 
@@ -714,7 +705,7 @@ fn kernel_addr() -> u64 {
     #[cfg(target_arch = "aarch64")]
     let ok = trapno == 0 && err >> 26 == 0x24 && err & 0x3f == 4 && fault == addr;
     if ok {
-        println(b"FAULT_KERNEL_ADDR:OK");
+        pass(b"FAULT_KERNEL_ADDR");
         0
     } else {
         print(b"FAULT_KERNEL_ADDR:FAIL trapno=");
@@ -739,7 +730,7 @@ fn last_trap() -> u64 {
     #[cfg(target_arch = "aarch64")]
     let ok = trapno == 0 && err != 0 && fault == addr;
     if ok {
-        println(b"FAULT_LAST_TRAP:OK");
+        pass(b"FAULT_LAST_TRAP");
         0
     } else {
         print(b"FAULT_LAST_TRAP:FAIL trapno=");

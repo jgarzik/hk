@@ -11,7 +11,8 @@
 //!   succeeds once it is gone, for every thread;
 //! - getpriority/setpriority(PRIO_PGRP) cover every thread of the group.
 
-use crate::tests::helpers::{print, print_num, println};
+use crate::tests::harness::fail_num;
+use crate::tests::helpers::{print, println};
 use crate::tests::mm::fork_mm::{join, spawn_thread};
 use crate::tests::signal::signals::restorer_addr;
 use core::sync::atomic::{AtomicI64, AtomicU32, Ordering};
@@ -80,9 +81,7 @@ pub fn run_tests() {
         if fails & (1 << i) == 0 {
             println(b":OK");
         } else {
-            print(b":FAIL status ");
-            print_num(st as i64);
-            println(b"");
+            fail_num(b":FAIL status ", st as i64);
         }
     }
 }

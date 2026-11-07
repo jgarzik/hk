@@ -14,6 +14,7 @@
 //! - Test xattr on directories
 //! - Test getxattr with buffer too small returns ERANGE
 
+use crate::tests::harness::{fail_num, pass};
 use crate::tests::helpers::{print, print_num, println};
 use hk_syscall::{
     O_CREAT, O_RDWR, XATTR_CREATE, XATTR_REPLACE, sys_close, sys_fgetxattr, sys_fsetxattr,
@@ -76,9 +77,7 @@ fn test_xattr_size_limits() {
     if step == 0 {
         println(b":OK");
     } else {
-        print(b":FAIL step ");
-        print_num(step);
-        println(b"");
+        fail_num(b":FAIL step ", step);
     }
 }
 
@@ -127,7 +126,7 @@ fn test_setxattr_getxattr() {
 
     // Verify value
     if ret as usize == attr_value.len() && &buf[..attr_value.len()] == attr_value {
-        println(b"SETXATTR_GETXATTR:OK");
+        pass(b"SETXATTR_GETXATTR");
     } else {
         print(b"SETXATTR_GETXATTR:FAIL: value mismatch, got len ");
         print_num(ret);
@@ -148,7 +147,7 @@ fn test_getxattr_enodata() {
     );
 
     if ret == ENODATA {
-        println(b"GETXATTR_ENODATA:OK");
+        pass(b"GETXATTR_ENODATA");
     } else {
         print(b"GETXATTR_ENODATA:FAIL: expected -61, got ");
         print_num(ret);
@@ -193,7 +192,7 @@ fn test_setxattr_create_flag() {
         XATTR_CREATE,
     );
     if ret == EEXIST {
-        println(b"SETXATTR_CREATE:OK");
+        pass(b"SETXATTR_CREATE");
     } else {
         print(b"SETXATTR_CREATE:FAIL: expected -17, got ");
         print_num(ret);
@@ -224,7 +223,7 @@ fn test_setxattr_replace_flag() {
         XATTR_REPLACE,
     );
     if ret == ENODATA {
-        println(b"SETXATTR_REPLACE:OK");
+        pass(b"SETXATTR_REPLACE");
     } else {
         print(b"SETXATTR_REPLACE:FAIL: expected -61, got ");
         print_num(ret);
@@ -274,7 +273,7 @@ fn test_fsetxattr_fgetxattr() {
 
     // Verify value
     if ret as usize == attr_value.len() && &buf[..attr_value.len()] == attr_value {
-        println(b"FSETXATTR_FGETXATTR:OK");
+        pass(b"FSETXATTR_FGETXATTR");
     } else {
         print(b"FSETXATTR_FGETXATTR:FAIL: value mismatch, got len ");
         print_num(ret);
@@ -288,7 +287,7 @@ fn test_fgetxattr_ebadf() {
 
     let ret = sys_fgetxattr(9999, attr_name.as_ptr(), buf.as_mut_ptr(), buf.len());
     if ret == EBADF {
-        println(b"FGETXATTR_EBADF:OK");
+        pass(b"FGETXATTR_EBADF");
     } else {
         print(b"FGETXATTR_EBADF:FAIL: expected -9, got ");
         print_num(ret);
@@ -339,7 +338,7 @@ fn test_listxattr() {
     // Should have at least 2 null-terminated strings totaling at least 22 bytes
     // "user.attr1\0user.attr2\0"
     if ret >= 22 {
-        println(b"LISTXATTR:OK");
+        pass(b"LISTXATTR");
     } else {
         print(b"LISTXATTR:FAIL: expected >= 22, got ");
         print_num(ret);
@@ -360,7 +359,7 @@ fn test_listxattr_size_query() {
 
     // Should return positive size indicating the list length
     if ret >= 22 {
-        println(b"LISTXATTR_SIZE_QUERY:OK");
+        pass(b"LISTXATTR_SIZE_QUERY");
     } else {
         print(b"LISTXATTR_SIZE_QUERY:FAIL: expected >= 22, got ");
         print_num(ret);
@@ -408,7 +407,7 @@ fn test_removexattr() {
         buf.len(),
     );
     if ret == ENODATA {
-        println(b"REMOVEXATTR:OK");
+        pass(b"REMOVEXATTR");
     } else {
         print(b"REMOVEXATTR:FAIL: getxattr after remove returned ");
         print_num(ret);
@@ -422,7 +421,7 @@ fn test_removexattr_enodata() {
 
     let ret = sys_removexattr(path.as_ptr(), attr_name.as_ptr());
     if ret == ENODATA {
-        println(b"REMOVEXATTR_ENODATA:OK");
+        pass(b"REMOVEXATTR_ENODATA");
     } else {
         print(b"REMOVEXATTR_ENODATA:FAIL: expected -61, got ");
         print_num(ret);
@@ -473,7 +472,7 @@ fn test_xattr_on_directory() {
     }
 
     if ret as usize == attr_value.len() && &buf[..attr_value.len()] == attr_value {
-        println(b"XATTR_DIR:OK");
+        pass(b"XATTR_DIR");
     } else {
         print(b"XATTR_DIR:FAIL: value mismatch, got len ");
         print_num(ret);
@@ -495,7 +494,7 @@ fn test_getxattr_erange() {
     );
 
     if ret == ERANGE {
-        println(b"GETXATTR_ERANGE:OK");
+        pass(b"GETXATTR_ERANGE");
     } else {
         print(b"GETXATTR_ERANGE:FAIL: expected -34, got ");
         print_num(ret);

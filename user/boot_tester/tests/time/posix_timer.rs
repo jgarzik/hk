@@ -10,7 +10,8 @@
 //! - Test timer_getoverrun (initial value is 0)
 //! - Test multiple timers
 
-use crate::tests::helpers::{print, print_num, println};
+use crate::tests::harness::pass;
+use crate::tests::helpers::{print, print_num};
 use hk_syscall::{
     CLOCK_MONOTONIC, CLOCK_REALTIME, ITimerSpec, Timespec, sys_timer_create, sys_timer_delete,
     sys_timer_getoverrun, sys_timer_gettime, sys_timer_settime,
@@ -53,7 +54,7 @@ fn test_timer_create_monotonic() {
         return;
     }
 
-    println(b"TIMER_CREATE_MONOTONIC:OK");
+    pass(b"TIMER_CREATE_MONOTONIC");
 }
 
 /// Test timer_create with CLOCK_REALTIME
@@ -67,7 +68,7 @@ fn test_timer_create_realtime() {
     }
 
     sys_timer_delete(timerid);
-    println(b"TIMER_CREATE_REALTIME:OK");
+    pass(b"TIMER_CREATE_REALTIME");
 }
 
 /// Test timer_create with invalid clockid returns EINVAL
@@ -76,7 +77,7 @@ fn test_timer_create_invalid_clock() {
     let ret = sys_timer_create(99, core::ptr::null(), &mut timerid); // Invalid clock ID
     if ret == -22 {
         // EINVAL
-        println(b"TIMER_CREATE_INVALID:OK");
+        pass(b"TIMER_CREATE_INVALID");
     } else {
         print(b"TIMER_CREATE_INVALID:FAIL: expected -22, got ");
         print_num(ret);
@@ -126,7 +127,7 @@ fn test_timer_settime_and_gettime() {
 
     // Remaining time should be > 0 and <= 1 second
     if curr_value.it_value.tv_sec >= 0 && curr_value.it_value.tv_sec <= 1 {
-        println(b"TIMER_SETTIME:OK");
+        pass(b"TIMER_SETTIME");
     } else {
         print(b"TIMER_SETTIME:FAIL: unexpected remaining time ");
         print_num(curr_value.it_value.tv_sec);
@@ -195,7 +196,7 @@ fn test_timer_disarm() {
             print(b"TIMER_DISARM:FAIL: gettime returned ");
             print_num(gettime_ret);
         } else if curr_value.it_value.tv_sec == 0 && curr_value.it_value.tv_nsec == 0 {
-            println(b"TIMER_DISARM:OK");
+            pass(b"TIMER_DISARM");
         } else {
             print(b"TIMER_DISARM:FAIL: curr_value.tv_sec=");
             print_num(curr_value.it_value.tv_sec);
@@ -246,7 +247,7 @@ fn test_timer_delete() {
     let get_ret = sys_timer_gettime(timerid, &mut curr_value);
     if get_ret == -22 {
         // EINVAL
-        println(b"TIMER_DELETE:OK");
+        pass(b"TIMER_DELETE");
     } else {
         print(b"TIMER_DELETE:FAIL: gettime after delete returned ");
         print_num(get_ret);
@@ -266,7 +267,7 @@ fn test_timer_getoverrun_initial() {
     // Check initial overrun count
     let overrun = sys_timer_getoverrun(timerid);
     if overrun == 0 {
-        println(b"TIMER_GETOVERRUN:OK");
+        pass(b"TIMER_GETOVERRUN");
     } else {
         print(b"TIMER_GETOVERRUN:FAIL: expected 0, got ");
         print_num(overrun);
@@ -297,7 +298,7 @@ fn test_timer_create_multiple() {
 
     // Each should have a unique timer ID
     if timerid1 != timerid2 && timerid2 != timerid3 && timerid1 != timerid3 {
-        println(b"TIMER_CREATE_MULTIPLE:OK");
+        pass(b"TIMER_CREATE_MULTIPLE");
     } else {
         print(b"TIMER_CREATE_MULTIPLE:FAIL: duplicate timer IDs ");
         print_num(timerid1 as i64);
@@ -358,7 +359,7 @@ fn test_timer_settime_old_value() {
 
     // Old value should have had ~5 seconds remaining
     if old_value.it_value.tv_sec >= 4 && old_value.it_value.tv_sec <= 5 {
-        println(b"TIMER_SETTIME_OLD:OK");
+        pass(b"TIMER_SETTIME_OLD");
     } else {
         print(b"TIMER_SETTIME_OLD:FAIL: old_value was ");
         print_num(old_value.it_value.tv_sec);

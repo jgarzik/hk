@@ -13,6 +13,7 @@
 //!   one shares keeps it (Linux unshare_fd: count > 1), so its locks
 //!   stay the caller's: it unlocks them, and they go at its exit
 
+use crate::tests::harness::{fail_num, pass};
 use crate::tests::helpers::{print, print_num, println};
 use hk_syscall::{O_CREAT, O_RDWR, O_TRUNC, sys_close, sys_fcntl, sys_mkdir, sys_open, sys_write};
 
@@ -71,9 +72,7 @@ fn test_setlk_wrlck() {
     // Create test file
     let fd = sys_open(path.as_ptr(), O_RDWR | O_CREAT | O_TRUNC, 0o644);
     if fd < 0 {
-        print(b"POSIX_SETLK_WRLCK:FAIL: open returned ");
-        print_num(fd);
-        println(b"");
+        fail_num(b"POSIX_SETLK_WRLCK:FAIL: open returned ", fd);
         return;
     }
 
@@ -91,9 +90,7 @@ fn test_setlk_wrlck() {
 
     let ret = sys_fcntl(fd as i32, F_SETLK, &mut flock as *mut Flock as u64);
     if ret != 0 {
-        print(b"POSIX_SETLK_WRLCK:FAIL: fcntl(F_SETLK) returned ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"POSIX_SETLK_WRLCK:FAIL: fcntl(F_SETLK) returned ", ret);
         sys_close(fd as u64);
         return;
     }
@@ -102,15 +99,13 @@ fn test_setlk_wrlck() {
     flock.l_type = F_UNLCK;
     let ret = sys_fcntl(fd as i32, F_SETLK, &mut flock as *mut Flock as u64);
     if ret != 0 {
-        print(b"POSIX_SETLK_WRLCK:FAIL: fcntl(F_UNLCK) returned ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"POSIX_SETLK_WRLCK:FAIL: fcntl(F_UNLCK) returned ", ret);
         sys_close(fd as u64);
         return;
     }
 
     sys_close(fd as u64);
-    println(b"POSIX_SETLK_WRLCK:OK");
+    pass(b"POSIX_SETLK_WRLCK");
 }
 
 /// Test F_SETLK with F_RDLCK (read lock)
@@ -119,9 +114,7 @@ fn test_setlk_rdlck() {
 
     let fd = sys_open(path.as_ptr(), O_RDWR | O_CREAT | O_TRUNC, 0o644);
     if fd < 0 {
-        print(b"POSIX_SETLK_RDLCK:FAIL: open returned ");
-        print_num(fd);
-        println(b"");
+        fail_num(b"POSIX_SETLK_RDLCK:FAIL: open returned ", fd);
         return;
     }
 
@@ -136,9 +129,7 @@ fn test_setlk_rdlck() {
 
     let ret = sys_fcntl(fd as i32, F_SETLK, &mut flock as *mut Flock as u64);
     if ret != 0 {
-        print(b"POSIX_SETLK_RDLCK:FAIL: fcntl(F_SETLK) returned ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"POSIX_SETLK_RDLCK:FAIL: fcntl(F_SETLK) returned ", ret);
         sys_close(fd as u64);
         return;
     }
@@ -148,7 +139,7 @@ fn test_setlk_rdlck() {
     let _ = sys_fcntl(fd as i32, F_SETLK, &mut flock as *mut Flock as u64);
 
     sys_close(fd as u64);
-    println(b"POSIX_SETLK_RDLCK:OK");
+    pass(b"POSIX_SETLK_RDLCK");
 }
 
 /// Test F_GETLK returns F_UNLCK when no conflict
@@ -157,9 +148,7 @@ fn test_getlk_no_conflict() {
 
     let fd = sys_open(path.as_ptr(), O_RDWR | O_CREAT | O_TRUNC, 0o644);
     if fd < 0 {
-        print(b"POSIX_GETLK:FAIL: open returned ");
-        print_num(fd);
-        println(b"");
+        fail_num(b"POSIX_GETLK:FAIL: open returned ", fd);
         return;
     }
 
@@ -174,24 +163,23 @@ fn test_getlk_no_conflict() {
 
     let ret = sys_fcntl(fd as i32, F_GETLK, &mut flock as *mut Flock as u64);
     if ret != 0 {
-        print(b"POSIX_GETLK:FAIL: fcntl(F_GETLK) returned ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"POSIX_GETLK:FAIL: fcntl(F_GETLK) returned ", ret);
         sys_close(fd as u64);
         return;
     }
 
     // l_type should be F_UNLCK (no conflict)
     if flock.l_type != F_UNLCK {
-        print(b"POSIX_GETLK:FAIL: expected l_type=F_UNLCK, got ");
-        print_num(flock.l_type as i64);
-        println(b"");
+        fail_num(
+            b"POSIX_GETLK:FAIL: expected l_type=F_UNLCK, got ",
+            flock.l_type as i64,
+        );
         sys_close(fd as u64);
         return;
     }
 
     sys_close(fd as u64);
-    println(b"POSIX_GETLK:OK");
+    pass(b"POSIX_GETLK");
 }
 
 /// Test partial unlock (range splitting)
@@ -200,9 +188,7 @@ fn test_setlk_unlock() {
 
     let fd = sys_open(path.as_ptr(), O_RDWR | O_CREAT | O_TRUNC, 0o644);
     if fd < 0 {
-        print(b"POSIX_UNLOCK:FAIL: open returned ");
-        print_num(fd);
-        println(b"");
+        fail_num(b"POSIX_UNLOCK:FAIL: open returned ", fd);
         return;
     }
 
@@ -222,15 +208,13 @@ fn test_setlk_unlock() {
     flock.l_len = 50;
     let ret = sys_fcntl(fd as i32, F_SETLK, &mut flock as *mut Flock as u64);
     if ret != 0 {
-        print(b"POSIX_UNLOCK:FAIL: partial unlock returned ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"POSIX_UNLOCK:FAIL: partial unlock returned ", ret);
         sys_close(fd as u64);
         return;
     }
 
     sys_close(fd as u64);
-    println(b"POSIX_UNLOCK:OK");
+    pass(b"POSIX_UNLOCK");
 }
 
 /// Test F_SETLK returns EBADF for invalid fd
@@ -245,11 +229,9 @@ fn test_setlk_ebadf() {
 
     let ret = sys_fcntl(9999, F_SETLK, &mut flock as *mut Flock as u64);
     if ret == EBADF {
-        println(b"POSIX_SETLK_EBADF:OK");
+        pass(b"POSIX_SETLK_EBADF");
     } else {
-        print(b"POSIX_SETLK_EBADF:FAIL: expected -9, got ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"POSIX_SETLK_EBADF:FAIL: expected -9, got ", ret);
     }
 }
 
@@ -315,11 +297,9 @@ fn test_lock_exec() {
     let mut st = 0i32;
     sys_wait4(pid, &mut st, 0, 0);
     if eof == 0 && ty == F_WRLCK && owner as i64 == pid {
-        println(b"POSIX_LOCK_EXEC:OK");
+        pass(b"POSIX_LOCK_EXEC");
     } else {
-        print(b"POSIX_LOCK_EXEC:FAIL l_type ");
-        print_num(ty as i64);
-        println(b"");
+        fail_num(b"POSIX_LOCK_EXEC:FAIL l_type ", ty as i64);
     }
 }
 
@@ -355,11 +335,9 @@ fn test_lock_close_any() {
         sys_close(f as u64);
     }
     if st == 0 && ty == F_UNLCK {
-        println(b"POSIX_LOCK_CLOSE_ANY:OK");
+        pass(b"POSIX_LOCK_CLOSE_ANY");
     } else {
-        print(b"POSIX_LOCK_CLOSE_ANY:FAIL l_type ");
-        print_num(ty as i64);
-        println(b"");
+        fail_num(b"POSIX_LOCK_CLOSE_ANY:FAIL l_type ", ty as i64);
     }
 }
 
@@ -606,9 +584,7 @@ fn test_setlk_range_limits() {
     if step == 0 {
         println(b":OK");
     } else {
-        print(b":FAIL step ");
-        print_num(step);
-        println(b"");
+        fail_num(b":FAIL step ", step);
     }
 }
 
@@ -646,7 +622,7 @@ fn test_lock_clone_files() {
     sys_close(fd as u64);
     hk_syscall::sys_unlink(path.as_ptr());
     if ok {
-        println(b"POSIX_LOCK_CLONE_FILES:OK");
+        pass(b"POSIX_LOCK_CLONE_FILES");
     } else {
         print(b"POSIX_LOCK_CLONE_FILES:FAIL child ");
         print_num(i64::from(st));
@@ -700,7 +676,7 @@ fn test_lock_unshare() {
     sys_close(fd as u64);
     hk_syscall::sys_unlink(path.as_ptr());
     if a == 0 && b == 0 && after_unlock == 0 && after_exit == 0 {
-        println(b"POSIX_LOCK_UNSHARE:OK");
+        pass(b"POSIX_LOCK_UNSHARE");
     } else {
         print(b"POSIX_LOCK_UNSHARE:FAIL child ");
         print_num(i64::from(a) * 1000 + i64::from(b));

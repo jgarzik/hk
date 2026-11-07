@@ -5,6 +5,7 @@
 //!   (ESRCH for a process or group that does not exist)
 //! - F_SETSIG/F_GETSIG: Set/get signal number for async I/O
 
+use crate::tests::harness::{fail_num, pass};
 use crate::tests::helpers::{print, print_num, println};
 use hk_syscall::{
     O_CREAT, O_RDWR, sys_close, sys_fcntl, sys_getpgid, sys_getpid, sys_mkdir, sys_open,
@@ -38,9 +39,7 @@ fn test_setown_getown() {
 
     let fd = sys_open(path.as_ptr(), O_RDWR | O_CREAT, 0o644);
     if fd < 0 {
-        print(b"FCNTL_OWNER_SETOWN:FAIL: open returned ");
-        print_num(fd);
-        println(b"");
+        fail_num(b"FCNTL_OWNER_SETOWN:FAIL: open returned ", fd);
         return;
     }
 
@@ -48,9 +47,7 @@ fn test_setown_getown() {
     let me = sys_getpid();
     let ret = sys_fcntl(fd as i32, F_SETOWN, me as u64);
     if ret != 0 {
-        print(b"FCNTL_OWNER_SETOWN:FAIL: F_SETOWN returned ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"FCNTL_OWNER_SETOWN:FAIL: F_SETOWN returned ", ret);
         sys_close(fd as u64);
         return;
     }
@@ -67,15 +64,13 @@ fn test_setown_getown() {
     // No such process: ESRCH, owner unchanged
     let ret = sys_fcntl(fd as i32, F_SETOWN, 0x3f_fff0);
     if ret != ESRCH || sys_fcntl(fd as i32, F_GETOWN, 0) != me {
-        print(b"FCNTL_OWNER_SETOWN:FAIL: unknown pid returned ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"FCNTL_OWNER_SETOWN:FAIL: unknown pid returned ", ret);
         sys_close(fd as u64);
         return;
     }
 
     sys_close(fd as u64);
-    println(b"FCNTL_OWNER_SETOWN:OK");
+    pass(b"FCNTL_OWNER_SETOWN");
 }
 
 /// Test F_SETOWN with negative value (PGID)
@@ -84,18 +79,14 @@ fn test_setown_negative() {
 
     let fd = sys_open(path.as_ptr(), O_RDWR | O_CREAT, 0o644);
     if fd < 0 {
-        print(b"FCNTL_OWNER_PGID:FAIL: open returned ");
-        print_num(fd);
-        println(b"");
+        fail_num(b"FCNTL_OWNER_PGID:FAIL: open returned ", fd);
         return;
     }
 
     // Unknown process group: ESRCH
     let ret = sys_fcntl(fd as i32, F_SETOWN, (-0x3f_fff0i32) as u64);
     if ret != ESRCH {
-        print(b"FCNTL_OWNER_PGID:FAIL: unknown pgid returned ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"FCNTL_OWNER_PGID:FAIL: unknown pgid returned ", ret);
         sys_close(fd as u64);
         return;
     }
@@ -103,9 +94,7 @@ fn test_setown_negative() {
     let pg = -(sys_getpgid(0) as i32);
     let ret = sys_fcntl(fd as i32, F_SETOWN, pg as u64);
     if ret != 0 {
-        print(b"FCNTL_OWNER_PGID:FAIL: F_SETOWN returned ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"FCNTL_OWNER_PGID:FAIL: F_SETOWN returned ", ret);
         sys_close(fd as u64);
         return;
     }
@@ -121,7 +110,7 @@ fn test_setown_negative() {
     }
 
     sys_close(fd as u64);
-    println(b"FCNTL_OWNER_PGID:OK");
+    pass(b"FCNTL_OWNER_PGID");
 }
 
 /// Test F_SETSIG and F_GETSIG
@@ -130,18 +119,14 @@ fn test_setsig_getsig() {
 
     let fd = sys_open(path.as_ptr(), O_RDWR | O_CREAT, 0o644);
     if fd < 0 {
-        print(b"FCNTL_OWNER_SIG:FAIL: open returned ");
-        print_num(fd);
-        println(b"");
+        fail_num(b"FCNTL_OWNER_SIG:FAIL: open returned ", fd);
         return;
     }
 
     // Set signal to SIGUSR1 (10)
     let ret = sys_fcntl(fd as i32, F_SETSIG, 10);
     if ret != 0 {
-        print(b"FCNTL_OWNER_SIG:FAIL: F_SETSIG returned ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"FCNTL_OWNER_SIG:FAIL: F_SETSIG returned ", ret);
         sys_close(fd as u64);
         return;
     }
@@ -157,7 +142,7 @@ fn test_setsig_getsig() {
     }
 
     sys_close(fd as u64);
-    println(b"FCNTL_OWNER_SIG:OK");
+    pass(b"FCNTL_OWNER_SIG");
 }
 
 /// Test F_GETOWN returns 0 for unset owner
@@ -166,9 +151,7 @@ fn test_getown_unset() {
 
     let fd = sys_open(path.as_ptr(), O_RDWR | O_CREAT, 0o644);
     if fd < 0 {
-        print(b"FCNTL_OWNER_UNSET:FAIL: open returned ");
-        print_num(fd);
-        println(b"");
+        fail_num(b"FCNTL_OWNER_UNSET:FAIL: open returned ", fd);
         return;
     }
 
@@ -193,17 +176,15 @@ fn test_getown_unset() {
     }
 
     sys_close(fd as u64);
-    println(b"FCNTL_OWNER_UNSET:OK");
+    pass(b"FCNTL_OWNER_UNSET");
 }
 
 /// Test F_SETOWN returns EBADF for invalid fd
 fn test_setown_ebadf() {
     let ret = sys_fcntl(9999, F_SETOWN, 42);
     if ret == EBADF {
-        println(b"FCNTL_OWNER_EBADF:OK");
+        pass(b"FCNTL_OWNER_EBADF");
     } else {
-        print(b"FCNTL_OWNER_EBADF:FAIL: expected -9, got ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"FCNTL_OWNER_EBADF:FAIL: expected -9, got ", ret);
     }
 }

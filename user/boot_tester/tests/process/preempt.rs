@@ -41,6 +41,7 @@
 //!   kernel must not inherit (backward string copies) and sigreturn
 //!   must give back.
 
+use crate::tests::harness::{fail_num, pass};
 use crate::tests::helpers::sleep_ms;
 use crate::tests::helpers::{print, print_num, println};
 use hk_syscall::{
@@ -502,9 +503,7 @@ fn test_balance() {
         0,
     );
     if page < 0 {
-        print(b"BALANCE:FAIL mmap ");
-        print_num(page);
-        println(b"");
+        fail_num(b"BALANCE:FAIL mmap ", page);
         return;
     }
     let slots = page as *mut u32;
@@ -551,11 +550,9 @@ fn test_balance() {
     }
     sys_munmap(page as u64, 4096);
     if seen.count_ones() >= 2 {
-        println(b"BALANCE:OK");
+        pass(b"BALANCE");
     } else {
-        print(b"BALANCE:FAIL spinners on cpus mask ");
-        print_num(seen as i64);
-        println(b"");
+        fail_num(b"BALANCE:FAIL spinners on cpus mask ", seen as i64);
     }
 }
 
@@ -642,9 +639,7 @@ fn test_smp_spread() {
         0,
     );
     if page < 0 {
-        print(b"SMP_SPREAD:FAIL mmap ");
-        print_num(page);
-        println(b"");
+        fail_num(b"SMP_SPREAD:FAIL mmap ", page);
         return;
     }
     let slots = page as *mut u32;
@@ -676,7 +671,7 @@ fn test_smp_spread() {
     }
     sys_munmap(page as u64, 4096);
     if seen.count_ones() >= 2 {
-        println(b"SMP_SPREAD:OK");
+        pass(b"SMP_SPREAD");
     } else {
         print(b"SMP_SPREAD:FAIL children on cpus mask ");
         print_num(seen as i64);
@@ -738,9 +733,7 @@ fn test_sigkill_spin() {
     match wait_for(pid, 2000) {
         Some(st) if st & 0x7f == SIGKILL as i32 => println(b"SIGKILL_SPIN:OK"),
         Some(st) => {
-            print(b"SIGKILL_SPIN:FAIL status ");
-            print_num(st as i64);
-            println(b"");
+            fail_num(b"SIGKILL_SPIN:FAIL status ", st as i64);
         }
         None => {
             print(b"SIGKILL_SPIN:FAIL still running after ");
@@ -777,9 +770,7 @@ fn test_timeslice() {
         0,
     );
     if page < 0 {
-        print(b"TIMESLICE:FAIL mmap ");
-        print_num(page);
-        println(b"");
+        fail_num(b"TIMESLICE:FAIL mmap ", page);
         return;
     }
     let counters = page as *mut u64;
@@ -809,7 +800,7 @@ fn test_timeslice() {
         print_num(slept);
         println(b" ms");
     } else {
-        println(b"TIMESLICE:OK");
+        pass(b"TIMESLICE");
     }
 }
 
@@ -1049,9 +1040,7 @@ fn test_async_sig_regs() {
         Some(0) => println(b"ASYNC_SIG_REGS:OK"),
         Some(st) => {
             // exit code i + 1: register i lost its value
-            print(b"ASYNC_SIG_REGS:FAIL status ");
-            print_num(st as i64);
-            println(b"");
+            fail_num(b"ASYNC_SIG_REGS:FAIL status ", st as i64);
         }
         None => {
             println(b"ASYNC_SIG_REGS:FAIL the handler never ran");

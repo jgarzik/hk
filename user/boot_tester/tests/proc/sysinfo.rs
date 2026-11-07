@@ -13,7 +13,7 @@
 //! - settimeofday() - set time
 //! - settimeofday() EINVAL - invalid usec
 
-use crate::tests::harness::T;
+use crate::tests::harness::{T, fail_num, pass};
 use crate::tests::helpers::{host_mode, print, print_cstr, print_num, println, starts_with};
 use hk_syscall::{
     Timespec, UtsName, sys_clock_gettime, sys_clock_settime, sys_sched_getaffinity,
@@ -62,7 +62,7 @@ fn test_uname() {
         // Verify sysname is "hk" (on a Linux host: any nonempty sysname)
         let is_hk = uts.sysname[0] == b'h' && uts.sysname[1] == b'k' && uts.sysname[2] == 0;
         if is_hk || (host_mode() && uts.sysname[0] != 0) {
-            println(b"UNAME:OK");
+            pass(b"UNAME");
         } else {
             println(b"UNAME:FAIL: sysname should be 'hk'");
         }
@@ -85,7 +85,7 @@ fn test_sethostname() {
             print_num(ret2);
         } else {
             if starts_with(&uts2.nodename, b"testhost") {
-                println(b"SETHOSTNAME:OK");
+                pass(b"SETHOSTNAME");
             } else {
                 print(b"SETHOSTNAME:FAIL: nodename is '");
                 print_cstr(&uts2.nodename);
@@ -111,7 +111,7 @@ fn test_setdomainname() {
             print_num(ret3);
         } else {
             if starts_with(&uts3.domainname, b"testdomain") {
-                println(b"SETDOMAINNAME:OK");
+                pass(b"SETDOMAINNAME");
             } else {
                 print(b"SETDOMAINNAME:FAIL: domainname is '");
                 print_cstr(&uts3.domainname);
@@ -128,7 +128,7 @@ fn test_sethostname_einval() {
     let ret = sys_sethostname(long_name.as_ptr(), 65);
     if ret == -22 {
         // EINVAL
-        println(b"SETHOSTNAME_EINVAL:OK");
+        pass(b"SETHOSTNAME_EINVAL");
     } else {
         print(b"SETHOSTNAME_EINVAL:FAIL: expected -22 (EINVAL), got ");
         print_num(ret);
@@ -176,7 +176,7 @@ fn test_clock_settime_basic() {
     // The new time should be close to what we set (within a few seconds)
     let diff = ts_after.tv_sec - new_time.tv_sec;
     if diff >= 0 && diff < 5 {
-        println(b"CLOCK_SETTIME:OK");
+        pass(b"CLOCK_SETTIME");
     } else {
         print(b"CLOCK_SETTIME:FAIL: time difference too large: ");
         print_num(diff);
@@ -192,7 +192,7 @@ fn test_clock_settime_monotonic_fails() {
     let ret = sys_clock_settime(CLOCK_MONOTONIC, &ts);
     if ret == -22 {
         // EINVAL
-        println(b"CLOCK_SETTIME_MONOTONIC:OK");
+        pass(b"CLOCK_SETTIME_MONOTONIC");
     } else {
         print(b"CLOCK_SETTIME_MONOTONIC:FAIL: expected -22 (EINVAL), got ");
         print_num(ret);
@@ -208,7 +208,7 @@ fn test_clock_settime_invalid_nsec() {
     let ret = sys_clock_settime(CLOCK_REALTIME, &ts);
     if ret == -22 {
         // EINVAL
-        println(b"CLOCK_SETTIME_INVALID_NSEC:OK");
+        pass(b"CLOCK_SETTIME_INVALID_NSEC");
     } else {
         print(b"CLOCK_SETTIME_INVALID_NSEC:FAIL: expected -22 (EINVAL), got ");
         print_num(ret);
@@ -370,7 +370,7 @@ fn test_settimeofday_basic() {
     // The new time should be close to what we set
     let diff = tv_after.tv_sec - new_time.tv_sec;
     if diff >= 0 && diff < 5 {
-        println(b"SETTIMEOFDAY:OK");
+        pass(b"SETTIMEOFDAY");
     } else {
         print(b"SETTIMEOFDAY:FAIL: time difference too large: ");
         print_num(diff);
@@ -386,7 +386,7 @@ fn test_settimeofday_invalid_usec() {
     let ret = sys_settimeofday(&tv, core::ptr::null());
     if ret == -22 {
         // EINVAL
-        println(b"SETTIMEOFDAY_INVALID_USEC:OK");
+        pass(b"SETTIMEOFDAY_INVALID_USEC");
     } else {
         print(b"SETTIMEOFDAY_INVALID_USEC:FAIL: expected -22 (EINVAL), got ");
         print_num(ret);
@@ -404,8 +404,6 @@ fn test_times() {
     if b >= a && tms.iter().all(|&t| t >= 0) && bad == -14 {
         println(b":OK");
     } else {
-        print(b":FAIL got ");
-        print_num(bad);
-        println(b"");
+        fail_num(b":FAIL got ", bad);
     }
 }

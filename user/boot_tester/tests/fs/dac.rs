@@ -11,6 +11,7 @@
 //! O_CREAT open of another user's existing FIFO or regular file there
 //! (EACCES)
 
+use crate::tests::harness::fail_num;
 use crate::tests::helpers::{print, print_num, println};
 use hk_syscall::{
     AT_FDCWD, O_CREAT, O_DIRECTORY, O_EXCL, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY, Stat, Timespec,
@@ -83,9 +84,7 @@ fn wait_ok(name: &[u8], pid: i64) {
     if st == 0 {
         println(b":OK");
     } else {
-        print(b":FAIL child status ");
-        print_num(st as i64);
-        println(b"");
+        fail_num(b":FAIL child status ", st as i64);
     }
 }
 

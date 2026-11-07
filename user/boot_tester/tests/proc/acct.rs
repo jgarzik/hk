@@ -12,6 +12,7 @@
 //!   PF_SUPERPRIV), not one that ran as root; AFORK one that forked and
 //!   never exec'd (PF_FORKNOEXEC)
 
+use crate::tests::harness::{fail_num, pass};
 use crate::tests::helpers::{print, print_num, println};
 use crate::tests::mm::fork_mm::spawn_thread;
 use core::ptr;
@@ -86,7 +87,7 @@ fn test_acct_group_once() {
     let child = recs.clone().filter(|r| pid_of(r) == pid).count();
     let me = recs.filter(|r| pid_of(r) == sys_getpid()).count();
     if n == 128 && child == 1 && me == 1 {
-        println(b"ACCT_GROUP_ONCE:OK");
+        pass(b"ACCT_GROUP_ONCE");
     } else {
         print(b"ACCT_GROUP_ONCE:FAIL bytes ");
         print_num(n as i64);
@@ -105,13 +106,11 @@ fn test_acct_disable() {
     // This might return EPERM (-1) if we don't have CAP_SYS_PACCT
     // or 0 if we have the capability
     if ret != 0 && ret != -1 {
-        print(b"ACCT_DISABLE:FAIL: expected 0 or -1 (EPERM), got ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"ACCT_DISABLE:FAIL: expected 0 or -1 (EPERM), got ", ret);
         return;
     }
 
-    println(b"ACCT_DISABLE:OK");
+    pass(b"ACCT_DISABLE");
 }
 
 /// Test acct with non-existent file (needs capability)
@@ -123,13 +122,14 @@ fn test_acct_invalid_path() {
     // -1 (EPERM) if we don't have CAP_SYS_PACCT
     // -2 (ENOENT) if file doesn't exist and we have capability
     if ret != -1 && ret != -2 {
-        print(b"ACCT_INVALID_PATH:FAIL: expected -1 (EPERM) or -2 (ENOENT), got ");
-        print_num(ret);
-        println(b"");
+        fail_num(
+            b"ACCT_INVALID_PATH:FAIL: expected -1 (EPERM) or -2 (ENOENT), got ",
+            ret,
+        );
         return;
     }
 
-    println(b"ACCT_INVALID_PATH:OK");
+    pass(b"ACCT_INVALID_PATH");
 }
 
 const AFORK: u8 = 0x01;
@@ -187,7 +187,7 @@ fn test_acct_asu() {
     let (p, q, u) = (flag_of(plain), flag_of(privileged), flag_of(unneeded));
     if p & (AFORK | ASU) == AFORK && q & (AFORK | ASU) == AFORK | ASU && u & (AFORK | ASU) == AFORK
     {
-        println(b"ACCT_ASU:OK");
+        pass(b"ACCT_ASU");
     } else {
         print(b"ACCT_ASU:FAIL plain ");
         print_num(p as i64);

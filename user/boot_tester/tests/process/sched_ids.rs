@@ -11,7 +11,8 @@
 //! - IOPRIO_IDLE_NONROOT: the idle I/O class needs no privilege
 //! - PRIO_USER: getpriority(PRIO_USER, 0) covers the caller's tasks
 
-use crate::tests::helpers::{print, print_num, println};
+use crate::tests::harness::fail_num;
+use crate::tests::helpers::{print, println};
 use crate::tests::mm::fork_mm::{join, spawn_thread};
 use core::sync::atomic::{AtomicI64, Ordering};
 use hk_syscall::{
@@ -72,9 +73,7 @@ pub fn run_tests() {
         if bits & (1 << i) == 0 && bits & 0x80 == 0 {
             println(b":OK");
         } else {
-            print(b":FAIL status ");
-            print_num(st as i64);
-            println(b"");
+            fail_num(b":FAIL status ", st as i64);
         }
     }
 }

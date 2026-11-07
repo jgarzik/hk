@@ -5,7 +5,8 @@
 //! runs as written (instruction caches synced, arm64). Each case runs
 //! in a child whose fate is checked.
 
-use crate::tests::helpers::{print, print_num, println};
+use crate::tests::harness::fail_num;
+use crate::tests::helpers::{print, println};
 use hk_syscall::{
     MAP_ANONYMOUS, MAP_PRIVATE, O_CREAT, O_RDWR, O_TRUNC, PROT_EXEC, PROT_READ, PROT_WRITE,
     sys_close, sys_exit, sys_fork, sys_madvise, sys_mmap, sys_mprotect, sys_munmap, sys_open,
@@ -57,9 +58,7 @@ fn expect(name: &[u8], f: fn() -> i64, want: i64) {
     if ok {
         println(b":OK");
     } else {
-        print(b":FAIL wstatus=");
-        print_num(st as i64);
-        println(b"");
+        fail_num(b":FAIL wstatus=", st as i64);
     }
 }
 

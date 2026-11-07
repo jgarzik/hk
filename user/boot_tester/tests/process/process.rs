@@ -6,6 +6,7 @@
 //! - clone, fork, vfork
 //! - waitid, execve
 
+use crate::tests::harness::{fail_num, pass};
 use crate::tests::helpers::{print, print_num, println};
 #[cfg(target_arch = "x86_64")]
 use hk_syscall::sys_time;
@@ -100,7 +101,7 @@ fn test_getpid() {
     print(b"getpid() = ");
     print_num(pid);
     if pid == 1 {
-        println(b"GETPID:OK");
+        pass(b"GETPID");
     } else {
         println(b"GETPID:FAIL");
     }
@@ -114,7 +115,7 @@ fn test_nanosleep() {
     };
     let ret = sys_nanosleep(&req, core::ptr::null_mut());
     if ret == 0 {
-        println(b"NANOSLEEP:OK");
+        pass(b"NANOSLEEP");
     } else {
         print(b"NANOSLEEP:FAIL ");
         print_num(ret);
@@ -129,7 +130,7 @@ fn test_clock_nanosleep() {
     };
     let ret = sys_clock_nanosleep(CLOCK_MONOTONIC, 0, &req, core::ptr::null_mut());
     if ret == 0 {
-        println(b"CLOCK_NANOSLEEP:OK");
+        pass(b"CLOCK_NANOSLEEP");
     } else {
         print(b"CLOCK_NANOSLEEP:FAIL ");
         print_num(ret);
@@ -143,7 +144,7 @@ fn test_getppid() {
     print_num(ppid);
     // Init process (PID 1) should have ppid=0 (no parent)
     if ppid == 0 {
-        println(b"GETPPID:OK");
+        pass(b"GETPPID");
     } else {
         println(b"GETPPID:FAIL");
     }
@@ -156,7 +157,7 @@ fn test_getpgid() {
     print_num(pgid);
     // Init starts in init_task's process group 0 (Linux init/init_task.c)
     if pgid == 0 {
-        println(b"GETPGID:OK");
+        pass(b"GETPGID");
     } else {
         println(b"GETPGID:FAIL");
     }
@@ -169,7 +170,7 @@ fn test_getsid() {
     print_num(sid);
     // Init starts in init_task's session 0 until it calls setsid()
     if sid == 0 {
-        println(b"GETSID:OK");
+        pass(b"GETSID");
     } else {
         println(b"GETSID:FAIL");
     }
@@ -181,7 +182,7 @@ fn test_getpgid_explicit() {
     print(b"getpgid(1) = ");
     print_num(pgid_explicit);
     if pgid_explicit == 0 {
-        println(b"GETPGID_EXPLICIT:OK");
+        pass(b"GETPGID_EXPLICIT");
     } else {
         println(b"GETPGID_EXPLICIT:FAIL");
     }
@@ -193,7 +194,7 @@ fn test_getsid_explicit() {
     print(b"getsid(1) = ");
     print_num(sid_explicit);
     if sid_explicit == 0 {
-        println(b"GETSID_EXPLICIT:OK");
+        pass(b"GETSID_EXPLICIT");
     } else {
         println(b"GETSID_EXPLICIT:FAIL");
     }
@@ -206,7 +207,7 @@ fn test_getpgid_esrch() {
     print_num(pgid_invalid);
     if pgid_invalid == -3 {
         // ESRCH
-        println(b"GETPGID_ESRCH:OK");
+        pass(b"GETPGID_ESRCH");
     } else {
         println(b"GETPGID_ESRCH:FAIL");
     }
@@ -219,7 +220,7 @@ fn test_getsid_esrch() {
     print_num(sid_invalid);
     if sid_invalid == -3 {
         // ESRCH
-        println(b"GETSID_ESRCH:OK");
+        pass(b"GETSID_ESRCH");
     } else {
         println(b"GETSID_ESRCH:FAIL");
     }
@@ -235,7 +236,7 @@ fn test_setsid_eperm() {
     print(b", again = ");
     print_num(second);
     if first == 1 && second == -1 && sys_getpgid(0) == 1 && sys_getsid(0) == 1 {
-        println(b"SETSID_EPERM:OK");
+        pass(b"SETSID_EPERM");
     } else {
         println(b"SETSID_EPERM:FAIL");
     }
@@ -300,7 +301,7 @@ fn test_clone() {
 
         let exit_status = (wstatus >> 8) & 0xff;
         if plain == -10 && wait_ret == clone_ret && exit_status == 42 && child_done == 42 {
-            println(b"CLONE:OK");
+            pass(b"CLONE");
         } else {
             println(b"CLONE:FAIL");
         }
@@ -327,9 +328,7 @@ fn test_clone_settid() {
     let flags = CLONE_PARENT_SETTID | CLONE_CHILD_SETTID | 17; // SIGCHLD
     let ret = sys_clone(flags, 0, ptid_ptr as u64, ctid_ptr as u64, 0);
     if ret < 0 {
-        print(b"CLONE_SETTID:FAIL: clone returned ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"CLONE_SETTID:FAIL: clone returned ", ret);
         return;
     }
     if ret == 0 {
@@ -343,20 +342,16 @@ fn test_clone_settid() {
     let ptid = unsafe { core::ptr::read_volatile(ptid_ptr) };
     let child_code = (wstatus >> 8) & 0xff;
     if wait_ret != ret {
-        print(b"CLONE_SETTID:FAIL: wait4 returned ");
-        print_num(wait_ret);
-        println(b"");
+        fail_num(b"CLONE_SETTID:FAIL: wait4 returned ", wait_ret);
     } else if ptid <= 0 {
         // Linux writes the child TID (== returned PID for a non-thread
         // clone). hk numbers PIDs and TIDs separately, so only check
         // that the parent TID was written.
-        print(b"CLONE_SETTID:FAIL: parent_tid not set: ");
-        print_num(ptid as i64);
-        println(b"");
+        fail_num(b"CLONE_SETTID:FAIL: parent_tid not set: ", ptid as i64);
     } else if child_code != 0 {
         println(b"CLONE_SETTID:FAIL: child_tid not set in child");
     } else {
-        println(b"CLONE_SETTID:OK");
+        pass(b"CLONE_SETTID");
     }
 }
 
@@ -391,7 +386,7 @@ fn test_fork() {
 
         let exit_status = (wstatus >> 8) & 0xff;
         if wait_ret == fork_ret && exit_status == 99 {
-            println(b"FORK:OK");
+            pass(b"FORK");
         } else {
             println(b"FORK:FAIL");
         }
@@ -457,7 +452,7 @@ fn test_vfork() {
 
         let exit_status = (wstatus >> 8) & 0xff;
         if wait_ret == vfork_ret && exit_status == 77 {
-            println(b"VFORK:OK");
+            pass(b"VFORK");
         } else {
             println(b"VFORK:FAIL");
         }
@@ -523,7 +518,7 @@ fn test_waitid() {
             }
 
             if info.si_pid == fork_ret3 as i32 && info.si_status == 55 && ru_ok {
-                println(b"WAITID:OK");
+                pass(b"WAITID");
             } else {
                 println(b"WAITID:FAIL");
             }
@@ -567,7 +562,7 @@ fn test_waitid_pall() {
             print_num(info.si_status as i64);
 
             if info.si_pid == fork_ret4 as i32 && info.si_status == 33 {
-                println(b"WAITID_PALL:OK");
+                pass(b"WAITID_PALL");
             } else {
                 println(b"WAITID_PALL:FAIL");
             }
@@ -646,7 +641,7 @@ fn test_execve() {
         let exit_status = (wstatus >> 8) & 0xff;
         // boot_tester2 exits with status 123
         if wait_ret == fork_ret5 && exit_status == 123 {
-            println(b"EXECVE:OK");
+            pass(b"EXECVE");
         } else {
             print(b"Expected exit status 123, got ");
             print_num(exit_status as i64);
@@ -662,7 +657,7 @@ fn test_getuid() {
     print_num(uid);
     // All tasks run as root (uid=0)
     if uid == 0 {
-        println(b"GETUID:OK");
+        pass(b"GETUID");
     } else {
         println(b"GETUID:FAIL");
     }
@@ -675,7 +670,7 @@ fn test_geteuid() {
     print_num(euid);
     // All tasks run as root (euid=0)
     if euid == 0 {
-        println(b"GETEUID:OK");
+        pass(b"GETEUID");
     } else {
         println(b"GETEUID:FAIL");
     }
@@ -688,7 +683,7 @@ fn test_getgid() {
     print_num(gid);
     // All tasks run as root (gid=0)
     if gid == 0 {
-        println(b"GETGID:OK");
+        pass(b"GETGID");
     } else {
         println(b"GETGID:FAIL");
     }
@@ -701,7 +696,7 @@ fn test_getegid() {
     print_num(egid);
     // All tasks run as root (egid=0)
     if egid == 0 {
-        println(b"GETEGID:OK");
+        pass(b"GETEGID");
     } else {
         println(b"GETEGID:FAIL");
     }
@@ -720,12 +715,12 @@ fn test_clock_getres() {
         println(b"CLOCK_GETRES_REALTIME:FAIL");
         return;
     }
-    println(b"CLOCK_GETRES_REALTIME:OK");
+    pass(b"CLOCK_GETRES_REALTIME");
 
     // Test CLOCK_MONOTONIC
     let ret = sys_clock_getres(CLOCK_MONOTONIC, &mut ts);
     if ret == 0 && ts.tv_sec == 0 && ts.tv_nsec == 1 {
-        println(b"CLOCK_GETRES_MONOTONIC:OK");
+        pass(b"CLOCK_GETRES_MONOTONIC");
     } else {
         println(b"CLOCK_GETRES_MONOTONIC:FAIL");
     }
@@ -733,7 +728,7 @@ fn test_clock_getres() {
     // Test NULL pointer (should succeed per POSIX - validates clock ID only)
     let ret = sys_clock_getres(CLOCK_REALTIME, core::ptr::null_mut());
     if ret == 0 {
-        println(b"CLOCK_GETRES_NULL:OK");
+        pass(b"CLOCK_GETRES_NULL");
     } else {
         println(b"CLOCK_GETRES_NULL:FAIL");
     }
@@ -742,7 +737,7 @@ fn test_clock_getres() {
     let ret = sys_clock_getres(999, &mut ts);
     if ret == -22 {
         // -EINVAL
-        println(b"CLOCK_GETRES_EINVAL:OK");
+        pass(b"CLOCK_GETRES_EINVAL");
     } else {
         println(b"CLOCK_GETRES_EINVAL:FAIL");
     }
@@ -755,11 +750,9 @@ fn test_time() {
     let ret = sys_time(core::ptr::null_mut());
     // Time should be positive and reasonable (after year 2020: > 1577836800)
     if ret > 1577836800 {
-        println(b"TIME:OK");
+        pass(b"TIME");
     } else {
-        print(b"TIME:FAIL: got ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"TIME:FAIL: got ", ret);
     }
 }
 
@@ -772,7 +765,7 @@ fn test_getcpu() {
     let ret = sys_getcpu(&mut cpu, &mut node);
     // The node is the one whose cpulist holds the cpu
     if ret == 0 && cpu_in_node(cpu, node) {
-        println(b"GETCPU:OK");
+        pass(b"GETCPU");
     } else {
         print(b"GETCPU:FAIL ret=");
         print_num(ret);
@@ -825,11 +818,9 @@ fn test_getcpu_null() {
     // Test with NULL pointers (should succeed per Linux API)
     let ret = sys_getcpu(core::ptr::null_mut(), core::ptr::null_mut());
     if ret == 0 {
-        println(b"GETCPU_NULL:OK");
+        pass(b"GETCPU_NULL");
     } else {
-        print(b"GETCPU_NULL:FAIL ret=");
-        print_num(ret);
-        println(b"");
+        fail_num(b"GETCPU_NULL:FAIL ret=", ret);
     }
 }
 
@@ -844,7 +835,7 @@ fn test_getpriority() {
     // So default priority returns 20
     // Allow range 1-40 which is valid for any nice value
     if prio > 0 && prio <= 40 {
-        println(b"GETPRIORITY:OK");
+        pass(b"GETPRIORITY");
     } else {
         println(b"GETPRIORITY:FAIL");
     }
@@ -873,7 +864,7 @@ fn test_setpriority() {
     print_num(new_prio);
 
     if new_prio == 15 {
-        println(b"SETPRIORITY:OK");
+        pass(b"SETPRIORITY");
     } else {
         print(b"Expected 15, got ");
         print_num(new_prio);
@@ -905,11 +896,9 @@ fn test_setpriority_perm() {
     let mut st = 0i32;
     sys_wait4(pid, &mut st, 0, 0);
     if st == 0 {
-        println(b"SETPRIORITY_PERM:OK");
+        pass(b"SETPRIORITY_PERM");
     } else {
-        print(b"SETPRIORITY_PERM:FAIL status ");
-        print_num(st as i64);
-        println(b"");
+        fail_num(b"SETPRIORITY_PERM:FAIL status ", st as i64);
     }
 }
 
@@ -922,7 +911,7 @@ fn test_getpriority_esrch() {
 
     if prio == -3 {
         // -ESRCH
-        println(b"GETPRIORITY_ESRCH:OK");
+        pass(b"GETPRIORITY_ESRCH");
     } else {
         println(b"GETPRIORITY_ESRCH:FAIL");
     }
@@ -933,9 +922,7 @@ fn test_setuid() {
     // Fork to avoid dropping privileges in the parent
     let pid = sys_fork();
     if pid < 0 {
-        print(b"SETUID:FAIL fork failed ");
-        print_num(pid);
-        println(b"");
+        fail_num(b"SETUID:FAIL fork failed ", pid);
         return;
     }
 
@@ -968,11 +955,9 @@ fn test_setuid() {
 
         let exit_status = (wstatus >> 8) & 0xff;
         if exit_status == 0 {
-            println(b"SETUID:OK");
+            pass(b"SETUID");
         } else {
-            print(b"SETUID:FAIL exit_status=");
-            print_num(exit_status as i64);
-            println(b"");
+            fail_num(b"SETUID:FAIL exit_status=", exit_status as i64);
         }
     }
 }
@@ -982,9 +967,7 @@ fn test_setgid() {
     // Fork to avoid dropping privileges in the parent
     let pid = sys_fork();
     if pid < 0 {
-        print(b"SETGID:FAIL fork failed ");
-        print_num(pid);
-        println(b"");
+        fail_num(b"SETGID:FAIL fork failed ", pid);
         return;
     }
 
@@ -1017,11 +1000,9 @@ fn test_setgid() {
 
         let exit_status = (wstatus >> 8) & 0xff;
         if exit_status == 0 {
-            println(b"SETGID:OK");
+            pass(b"SETGID");
         } else {
-            print(b"SETGID:FAIL exit_status=");
-            print_num(exit_status as i64);
-            println(b"");
+            fail_num(b"SETGID:FAIL exit_status=", exit_status as i64);
         }
     }
 }
@@ -1034,12 +1015,10 @@ fn test_getresuid() {
 
     let ret = sys_getresuid(&mut ruid, &mut euid, &mut suid);
     if ret != 0 {
-        print(b"GETRESUID:FAIL ret=");
-        print_num(ret);
-        println(b"");
+        fail_num(b"GETRESUID:FAIL ret=", ret);
     } else if ruid == 0 && euid == 0 && suid == 0 {
         // As root, all UIDs should be 0
-        println(b"GETRESUID:OK");
+        pass(b"GETRESUID");
     } else {
         print(b"GETRESUID:FAIL uid=");
         print_num(ruid as i64);
@@ -1059,12 +1038,10 @@ fn test_getresgid() {
 
     let ret = sys_getresgid(&mut rgid, &mut egid, &mut sgid);
     if ret != 0 {
-        print(b"GETRESGID:FAIL ret=");
-        print_num(ret);
-        println(b"");
+        fail_num(b"GETRESGID:FAIL ret=", ret);
     } else if rgid == 0 && egid == 0 && sgid == 0 {
         // As root, all GIDs should be 0
-        println(b"GETRESGID:OK");
+        pass(b"GETRESGID");
     } else {
         print(b"GETRESGID:FAIL gid=");
         print_num(rgid as i64);
@@ -1081,9 +1058,7 @@ fn test_setresuid() {
     // Fork to avoid dropping privileges in the parent
     let pid = sys_fork();
     if pid < 0 {
-        print(b"SETRESUID:FAIL fork failed ");
-        print_num(pid);
-        println(b"");
+        fail_num(b"SETRESUID:FAIL fork failed ", pid);
         return;
     }
 
@@ -1117,11 +1092,9 @@ fn test_setresuid() {
 
         let exit_status = (wstatus >> 8) & 0xff;
         if exit_status == 0 {
-            println(b"SETRESUID:OK");
+            pass(b"SETRESUID");
         } else {
-            print(b"SETRESUID:FAIL exit_status=");
-            print_num(exit_status as i64);
-            println(b"");
+            fail_num(b"SETRESUID:FAIL exit_status=", exit_status as i64);
         }
     }
 }
@@ -1131,9 +1104,7 @@ fn test_setresgid() {
     // Fork to avoid dropping privileges in the parent
     let pid = sys_fork();
     if pid < 0 {
-        print(b"SETRESGID:FAIL fork failed ");
-        print_num(pid);
-        println(b"");
+        fail_num(b"SETRESGID:FAIL fork failed ", pid);
         return;
     }
 
@@ -1167,11 +1138,9 @@ fn test_setresgid() {
 
         let exit_status = (wstatus >> 8) & 0xff;
         if exit_status == 0 {
-            println(b"SETRESGID:OK");
+            pass(b"SETRESGID");
         } else {
-            print(b"SETRESGID:FAIL exit_status=");
-            print_num(exit_status as i64);
-            println(b"");
+            fail_num(b"SETRESGID:FAIL exit_status=", exit_status as i64);
         }
     }
 }
@@ -1181,9 +1150,7 @@ fn test_setreuid() {
     // Fork to avoid dropping privileges in the parent
     let pid = sys_fork();
     if pid < 0 {
-        print(b"SETREUID:FAIL fork failed ");
-        print_num(pid);
-        println(b"");
+        fail_num(b"SETREUID:FAIL fork failed ", pid);
         return;
     }
 
@@ -1218,11 +1185,9 @@ fn test_setreuid() {
 
         let exit_status = (wstatus >> 8) & 0xff;
         if exit_status == 0 {
-            println(b"SETREUID:OK");
+            pass(b"SETREUID");
         } else {
-            print(b"SETREUID:FAIL exit_status=");
-            print_num(exit_status as i64);
-            println(b"");
+            fail_num(b"SETREUID:FAIL exit_status=", exit_status as i64);
         }
     }
 }
@@ -1232,9 +1197,7 @@ fn test_setregid() {
     // Fork to avoid dropping privileges in the parent
     let pid = sys_fork();
     if pid < 0 {
-        print(b"SETREGID:FAIL fork failed ");
-        print_num(pid);
-        println(b"");
+        fail_num(b"SETREGID:FAIL fork failed ", pid);
         return;
     }
 
@@ -1269,11 +1232,9 @@ fn test_setregid() {
 
         let exit_status = (wstatus >> 8) & 0xff;
         if exit_status == 0 {
-            println(b"SETREGID:OK");
+            pass(b"SETREGID");
         } else {
-            print(b"SETREGID:FAIL exit_status=");
-            print_num(exit_status as i64);
-            println(b"");
+            fail_num(b"SETREGID:FAIL exit_status=", exit_status as i64);
         }
     }
 }
@@ -1300,40 +1261,32 @@ fn setfsuid_body() {
     // Initial fsuid should be 0 (root)
     let old_fsuid = sys_setfsuid(1000);
     if old_fsuid != 0 {
-        print(b"SETFSUID:FAIL expected old=0 got=");
-        print_num(old_fsuid);
-        println(b"");
+        fail_num(b"SETFSUID:FAIL expected old=0 got=", old_fsuid);
         return;
     }
 
     // Changing fsuid resets dumpable to suid_dumpable (0) (kernel/cred.c)
     let dumpable = sys_prctl(hk_syscall::PR_GET_DUMPABLE, 0, 0, 0, 0);
     if dumpable != 0 {
-        print(b"SETFSUID:FAIL dumpable after fsuid change=");
-        print_num(dumpable);
-        println(b"");
+        fail_num(b"SETFSUID:FAIL dumpable after fsuid change=", dumpable);
         return;
     }
 
     // Now fsuid should be 1000, query returns 1000 (since we set it to 1000)
     let new_old = sys_setfsuid(0);
     if new_old != 1000 {
-        print(b"SETFSUID:FAIL expected old=1000 got=");
-        print_num(new_old);
-        println(b"");
+        fail_num(b"SETFSUID:FAIL expected old=1000 got=", new_old);
         return;
     }
 
     // Restore to 0 and verify
     let final_old = sys_setfsuid(0);
     if final_old != 0 {
-        print(b"SETFSUID:FAIL restore expected old=0 got=");
-        print_num(final_old);
-        println(b"");
+        fail_num(b"SETFSUID:FAIL restore expected old=0 got=", final_old);
         return;
     }
 
-    println(b"SETFSUID:OK");
+    pass(b"SETFSUID");
 }
 
 /// setfsgid syscall - set filesystem GID
@@ -1346,31 +1299,25 @@ fn setfsgid_body() {
     // Initial fsgid should be 0 (root)
     let old_fsgid = sys_setfsgid(2000);
     if old_fsgid != 0 {
-        print(b"SETFSGID:FAIL expected old=0 got=");
-        print_num(old_fsgid);
-        println(b"");
+        fail_num(b"SETFSGID:FAIL expected old=0 got=", old_fsgid);
         return;
     }
 
     // Now fsgid should be 2000, query returns 2000
     let new_old = sys_setfsgid(0);
     if new_old != 2000 {
-        print(b"SETFSGID:FAIL expected old=2000 got=");
-        print_num(new_old);
-        println(b"");
+        fail_num(b"SETFSGID:FAIL expected old=2000 got=", new_old);
         return;
     }
 
     // Restore to 0 and verify
     let final_old = sys_setfsgid(0);
     if final_old != 0 {
-        print(b"SETFSGID:FAIL restore expected old=0 got=");
-        print_num(final_old);
-        println(b"");
+        fail_num(b"SETFSGID:FAIL restore expected old=0 got=", final_old);
         return;
     }
 
-    println(b"SETFSGID:OK");
+    pass(b"SETFSGID");
 }
 
 /// sysinfo syscall - get system information
@@ -1423,7 +1370,7 @@ fn test_sysinfo() {
         return;
     }
 
-    println(b"SYSINFO:OK");
+    pass(b"SYSINFO");
 }
 
 const RUSAGE_SELF: i32 = 0;
@@ -1443,9 +1390,7 @@ fn test_getrusage() {
 
     let ret = sys_getrusage(RUSAGE_SELF, buffer.as_mut_ptr());
     if ret != 0 {
-        print(b"GETRUSAGE:FAIL ret=");
-        print_num(ret);
-        println(b"");
+        fail_num(b"GETRUSAGE:FAIL ret=", ret);
         return;
     }
 
@@ -1458,7 +1403,7 @@ fn test_getrusage() {
         return;
     }
 
-    println(b"GETRUSAGE:OK");
+    pass(b"GETRUSAGE");
 }
 
 /// getrusage syscall - test EINVAL for invalid who
@@ -1470,13 +1415,11 @@ fn test_getrusage_einval() {
     let ret = sys_getrusage(99, buffer.as_mut_ptr());
     if ret != -22 {
         // -22 = -EINVAL
-        print(b"GETRUSAGE_EINVAL:FAIL expected -22 got=");
-        print_num(ret);
-        println(b"");
+        fail_num(b"GETRUSAGE_EINVAL:FAIL expected -22 got=", ret);
         return;
     }
 
-    println(b"GETRUSAGE_EINVAL:OK");
+    pass(b"GETRUSAGE_EINVAL");
 }
 
 /// Test: getrusage CPU time tracking
@@ -1496,9 +1439,7 @@ fn test_getrusage_times() {
     let mut buffer: [u8; 160] = [0xff; 160];
     let ret = sys_getrusage(RUSAGE_SELF, buffer.as_mut_ptr());
     if ret != 0 {
-        print(b"GETRUSAGE_TIMES:FAIL ret=");
-        print_num(ret);
-        println(b"");
+        fail_num(b"GETRUSAGE_TIMES:FAIL ret=", ret);
         return;
     }
 
@@ -1533,11 +1474,9 @@ fn test_getrusage_times() {
         print(b"us stime=");
         print_num(stime_total);
         print(b"us");
-        println(b"GETRUSAGE_TIMES:OK");
+        pass(b"GETRUSAGE_TIMES");
     } else {
-        print(b"GETRUSAGE_TIMES:FAIL negative time total=");
-        print_num(total);
-        println(b"");
+        fail_num(b"GETRUSAGE_TIMES:FAIL negative time total=", total);
     }
 }
 
@@ -1555,11 +1494,9 @@ fn test_sched_getscheduler() {
 
     // Default policy should be SCHED_NORMAL (0)
     if policy == SCHED_NORMAL as i64 {
-        println(b"SCHED_GETSCHEDULER:OK");
+        pass(b"SCHED_GETSCHEDULER");
     } else if policy < 0 {
-        print(b"SCHED_GETSCHEDULER:FAIL errno=");
-        print_num(-policy);
-        println(b"");
+        fail_num(b"SCHED_GETSCHEDULER:FAIL errno=", -policy);
     } else {
         println(b"SCHED_GETSCHEDULER:FAIL unexpected policy");
     }
@@ -1579,11 +1516,9 @@ fn test_sched_getparam() {
 
     // For SCHED_NORMAL, priority should be 0
     if ret == 0 && param.sched_priority == 0 {
-        println(b"SCHED_GETPARAM:OK");
+        pass(b"SCHED_GETPARAM");
     } else if ret < 0 {
-        print(b"SCHED_GETPARAM:FAIL errno=");
-        print_num(-ret);
-        println(b"");
+        fail_num(b"SCHED_GETPARAM:FAIL errno=", -ret);
     } else {
         println(b"SCHED_GETPARAM:FAIL unexpected priority");
     }
@@ -1603,11 +1538,9 @@ fn test_sched_getaffinity() {
 
     // Should return 8 (size of mask) and mask should have at least one CPU
     if ret == 8 && mask != 0 {
-        println(b"SCHED_GETAFFINITY:OK");
+        pass(b"SCHED_GETAFFINITY");
     } else if ret < 0 {
-        print(b"SCHED_GETAFFINITY:FAIL errno=");
-        print_num(-ret);
-        println(b"");
+        fail_num(b"SCHED_GETAFFINITY:FAIL errno=", -ret);
     } else {
         println(b"SCHED_GETAFFINITY:FAIL");
     }
@@ -1620,9 +1553,7 @@ fn test_sched_setaffinity() {
     let mut original_mask: u64 = 0;
     let get_ret = sys_sched_getaffinity(0, 8, &mut original_mask);
     if get_ret < 0 {
-        print(b"SCHED_SETAFFINITY:FAIL getaffinity errno=");
-        print_num(-get_ret);
-        println(b"");
+        fail_num(b"SCHED_SETAFFINITY:FAIL getaffinity errno=", -get_ret);
         return;
     }
 
@@ -1630,9 +1561,7 @@ fn test_sched_setaffinity() {
     let new_mask: u64 = 1;
     let set_ret = sys_sched_setaffinity(0, 8, &new_mask);
     if set_ret != 0 {
-        print(b"SCHED_SETAFFINITY:FAIL setaffinity errno=");
-        print_num(-set_ret);
-        println(b"");
+        fail_num(b"SCHED_SETAFFINITY:FAIL setaffinity errno=", -set_ret);
         return;
     }
 
@@ -1648,7 +1577,7 @@ fn test_sched_setaffinity() {
 
     // Restore original affinity
     sys_sched_setaffinity(0, 8, &original_mask);
-    println(b"SCHED_SETAFFINITY:OK");
+    pass(b"SCHED_SETAFFINITY");
 }
 
 /// sched_rr_get_interval syscall - get round-robin time quantum
@@ -1671,11 +1600,9 @@ fn test_sched_rr_get_interval() {
     // For SCHED_NORMAL, the slice is 0 or the CFS/EEVDF slice
     // (Linux kernel/sched/fair.c get_rr_interval_fair), e.g. a few ms
     if ret == 0 && ts.tv_sec == 0 && (0..1_000_000_000).contains(&ts.tv_nsec) {
-        println(b"SCHED_RR_GET_INTERVAL:OK");
+        pass(b"SCHED_RR_GET_INTERVAL");
     } else if ret < 0 {
-        print(b"SCHED_RR_GET_INTERVAL:FAIL errno=");
-        print_num(-ret);
-        println(b"");
+        fail_num(b"SCHED_RR_GET_INTERVAL:FAIL errno=", -ret);
     } else {
         println(b"SCHED_RR_GET_INTERVAL:FAIL unexpected interval");
     }
@@ -1691,7 +1618,7 @@ fn test_sched_getscheduler_esrch() {
 
     if ret == -3 {
         // -ESRCH
-        println(b"SCHED_GETSCHEDULER_ESRCH:OK");
+        pass(b"SCHED_GETSCHEDULER_ESRCH");
     } else {
         println(b"SCHED_GETSCHEDULER_ESRCH:FAIL");
     }
@@ -1711,7 +1638,7 @@ fn test_brk_query() {
 
     // Should return non-zero (initial brk set by ELF loader, typically > 2GB for PIE)
     if current > 0 {
-        println(b"BRK_QUERY:OK");
+        pass(b"BRK_QUERY");
     } else {
         println(b"BRK_QUERY:FAIL");
     }
@@ -1740,7 +1667,7 @@ fn test_brk_expand() {
             core::ptr::write_volatile(test_addr, 42);
             let read_back = core::ptr::read_volatile(test_addr);
             if read_back == 42 {
-                println(b"BRK_EXPAND:OK");
+                pass(b"BRK_EXPAND");
             } else {
                 println(b"BRK_EXPAND:FAIL (write verification)");
             }
@@ -1773,7 +1700,7 @@ fn test_brk_shrink() {
     print_num(shrunk);
 
     if shrunk == original {
-        println(b"BRK_SHRINK:OK");
+        pass(b"BRK_SHRINK");
     } else {
         println(b"BRK_SHRINK:FAIL");
     }
@@ -1790,24 +1717,20 @@ fn test_ioprio_get_set() {
     let prio = ioprio_prio_value(IOPRIO_CLASS_BE, 4);
     let ret = sys_ioprio_set(IOPRIO_WHO_PROCESS, 0, prio as i32);
     if ret < 0 {
-        print(b"IOPRIO:FAIL set ret=");
-        print_num(ret);
-        println(b"");
+        fail_num(b"IOPRIO:FAIL set ret=", ret);
         return;
     }
 
     // Get I/O priority back
     let got = sys_ioprio_get(IOPRIO_WHO_PROCESS, 0);
     if got < 0 {
-        print(b"IOPRIO:FAIL get ret=");
-        print_num(got);
-        println(b"");
+        fail_num(b"IOPRIO:FAIL get ret=", got);
         return;
     }
 
     // Verify it matches
     if got == prio as i64 {
-        println(b"IOPRIO:OK");
+        pass(b"IOPRIO");
     } else {
         print(b"IOPRIO:FAIL expected ");
         print_num(prio as i64);
@@ -1830,25 +1753,21 @@ fn test_arch_prctl() {
     let test_addr: u64 = 0x0000_7FFF_ABCD_0000;
     let ret = sys_arch_prctl(ARCH_SET_FS, test_addr);
     if ret != 0 {
-        print(b"ARCH_PRCTL_SET:FAIL ret=");
-        print_num(ret);
-        println(b"");
+        fail_num(b"ARCH_PRCTL_SET:FAIL ret=", ret);
         return;
     }
-    println(b"ARCH_PRCTL_SET:OK");
+    pass(b"ARCH_PRCTL_SET");
 
     // Get FS base and verify
     let mut retrieved: u64 = 0;
     let ret = sys_arch_prctl(ARCH_GET_FS, &mut retrieved as *mut u64 as u64);
     if ret != 0 {
-        print(b"ARCH_PRCTL_GET:FAIL ret=");
-        print_num(ret);
-        println(b"");
+        fail_num(b"ARCH_PRCTL_GET:FAIL ret=", ret);
         return;
     }
 
     if retrieved == test_addr {
-        println(b"ARCH_PRCTL_GET:OK");
+        pass(b"ARCH_PRCTL_GET");
     } else {
         print(b"ARCH_PRCTL_GET:FAIL expected ");
         print_num(test_addr as i64);
@@ -1875,10 +1794,8 @@ fn test_set_tid_address() {
     if ret > 0 {
         print(b"set_tid_address() returned TID=");
         print_num(ret);
-        println(b"SET_TID_ADDRESS:OK");
+        pass(b"SET_TID_ADDRESS");
     } else {
-        print(b"SET_TID_ADDRESS:FAIL ret=");
-        print_num(ret);
-        println(b"");
+        fail_num(b"SET_TID_ADDRESS:FAIL ret=", ret);
     }
 }

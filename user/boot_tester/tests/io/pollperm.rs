@@ -11,6 +11,7 @@
 //! - FIONREAD: a pipe's or FIFO's buffered bytes, a regular file's
 //!   size - pos, inotify's queued bytes (IN_IGNORED), ENOTTY on an eventfd
 
+use crate::tests::harness::pass;
 use crate::tests::helpers::{find_blkdev, print, print_num, println};
 use hk_syscall::{
     AF_UNIX, EFD_NONBLOCK, EFD_SEMAPHORE, EPOLL_CTL_ADD, EPOLL_CTL_DEL, EPOLLET, EPOLLIN,
@@ -85,7 +86,7 @@ fn test_epoll_eperm() {
     sys_close(ep as u64);
     sys_unlink(b"/tmp/pollperm_file\0".as_ptr());
     if no.iter().all(|&r| r == EPERM) && yes.iter().all(|&r| r == 0) {
-        println(b"EPOLL_NOPOLL_EPERM:OK");
+        pass(b"EPOLL_NOPOLL_EPERM");
     } else {
         print(b"EPOLL_NOPOLL_EPERM:FAIL no=");
         for r in no {
@@ -113,7 +114,7 @@ fn test_eperm_order() {
     sys_close(fd as u64);
     sys_unlink(b"/tmp/pollperm_ord\0".as_ptr());
     if del == EPERM && selfadd == EPERM {
-        println(b"EPOLL_EPERM_FIRST:OK");
+        pass(b"EPOLL_EPERM_FIRST");
     } else {
         print(b"EPOLL_EPERM_FIRST:FAIL del=");
         print_num(del);
@@ -143,7 +144,7 @@ fn test_poll_regular() {
     sys_unlink(b"/tmp/pollperm_poll\0".as_ptr());
     let rev = pfd[0].revents;
     if p == 1 && rev == POLLIN | POLLOUT && s == 2 && r.is_set(fd) && w.is_set(fd) {
-        println(b"POLL_REGULAR_READY:OK");
+        pass(b"POLL_REGULAR_READY");
     } else {
         print(b"POLL_REGULAR_READY:FAIL poll=");
         print_num(p);
@@ -204,7 +205,7 @@ fn test_epoll_et_key() {
     let (ef1, ef2) = et_eventfd();
     let (sk1, sk2) = et_sndbuf();
     if (ef1, ef2, sk1, sk2) == (1, 0, 1, 0) {
-        println(b"EPOLL_ET_WAKE_KEY:OK");
+        pass(b"EPOLL_ET_WAKE_KEY");
     } else {
         print(b"EPOLL_ET_WAKE_KEY:FAIL eventfd=");
         print_num(ef1);
@@ -278,7 +279,7 @@ fn test_fionread() {
     let ev = fionread(efd);
     sys_close(efd as u64);
     if (pipe, fifo, file, ino, ev) == (5, 3, 70, 16, ENOTTY) {
-        println(b"FIONREAD_KINDS:OK");
+        pass(b"FIONREAD_KINDS");
     } else {
         print(b"FIONREAD_KINDS:FAIL pipe=");
         print_num(pipe);

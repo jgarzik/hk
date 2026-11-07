@@ -8,6 +8,7 @@
 //! - Test prctl timer slack
 //! - Test prctl invalid option returns EINVAL
 
+use crate::tests::harness::pass;
 use crate::tests::helpers::{print, print_num, println};
 use hk_syscall::{
     PR_GET_DUMPABLE, PR_GET_NAME, PR_GET_NO_NEW_PRIVS, PR_GET_TIMERSLACK, PR_SET_DUMPABLE,
@@ -60,7 +61,7 @@ fn test_prctl_set_get_name() {
         return;
     }
 
-    println(b"PRCTL_NAME:OK");
+    pass(b"PRCTL_NAME");
 }
 
 /// Test prctl name truncation at 16 bytes
@@ -105,7 +106,7 @@ fn test_prctl_name_truncation() {
         return;
     }
 
-    println(b"PRCTL_TRUNCATE:OK");
+    pass(b"PRCTL_TRUNCATE");
 }
 
 /// Test prctl dumpable flag
@@ -149,7 +150,7 @@ fn test_prctl_dumpable() {
     // Restore to SUID_DUMP_USER
     sys_prctl(PR_SET_DUMPABLE, SUID_DUMP_USER as u64, 0, 0, 0);
 
-    println(b"PRCTL_DUMPABLE:OK");
+    pass(b"PRCTL_DUMPABLE");
 }
 
 /// Test prctl no_new_privs (irreversible)
@@ -189,7 +190,7 @@ fn test_prctl_no_new_privs() {
         return;
     }
 
-    println(b"PRCTL_NO_NEW_PRIVS:OK");
+    pass(b"PRCTL_NO_NEW_PRIVS");
 }
 
 /// Test prctl timer slack
@@ -235,7 +236,7 @@ fn test_prctl_timerslack() {
         return;
     }
 
-    println(b"PRCTL_TIMERSLACK:OK");
+    pass(b"PRCTL_TIMERSLACK");
 }
 
 /// Test prctl with invalid option returns EINVAL
@@ -249,5 +250,5 @@ fn test_prctl_einval() {
         return;
     }
 
-    println(b"PRCTL_EINVAL:OK");
+    pass(b"PRCTL_EINVAL");
 }

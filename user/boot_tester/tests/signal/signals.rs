@@ -19,6 +19,7 @@
 //! - Test: rt_tgsigqueueinfo() wrong tgid - thread group validation (ESRCH)
 //! - Test: rt_sigsuspend() - wait for signal with temp mask
 
+use crate::tests::harness::{fail_num, pass};
 use crate::tests::helpers::{print, print_num, println};
 use hk_syscall::{
     CLONE_ARGS_SIZE_VER0, CLONE_CLEAR_SIGHAND, CloneArgs, SA_RESTORER, SA_SIGINFO, SIG_BLOCK,
@@ -109,7 +110,7 @@ fn test_sigprocmask() {
             let mut check_mask: u64 = 0;
             sys_rt_sigprocmask(SIG_BLOCK, 0, &mut check_mask as *mut u64 as u64, 8);
             if (check_mask & new_mask) != 0 {
-                println(b"SIGPROCMASK:OK");
+                pass(b"SIGPROCMASK");
             } else {
                 print(b"SIGPROCMASK:FAIL: SIGUSR1 not in blocked mask, got ");
                 print_num(check_mask as i64);
@@ -132,7 +133,7 @@ fn test_sigpending() {
         // Should be 0 or very low (no signals pending normally)
         print(b"rt_sigpending() = 0, pending = ");
         print_num(pending as i64);
-        println(b"SIGPENDING:OK");
+        pass(b"SIGPENDING");
     } else {
         print(b"SIGPENDING:FAIL: ret = ");
         print_num(ret);
@@ -144,7 +145,7 @@ fn test_kill_sig0() {
     let pid = sys_getpid();
     let ret = sys_kill(pid, 0); // Signal 0 = check if process exists
     if ret == 0 {
-        println(b"KILL_SIG0:OK");
+        pass(b"KILL_SIG0");
     } else {
         print(b"KILL_SIG0:FAIL: expected 0, got ");
         print_num(ret);
@@ -156,7 +157,7 @@ fn test_kill_esrch() {
     let ret = sys_kill(99999, 0); // Non-existent PID
     if ret == -3 {
         // ESRCH
-        println(b"KILL_ESRCH:OK");
+        pass(b"KILL_ESRCH");
     } else {
         print(b"KILL_ESRCH:FAIL: expected -3 (ESRCH), got ");
         print_num(ret);
@@ -169,7 +170,7 @@ fn test_tgkill_sig0() {
     let tid = sys_gettid();
     let ret = sys_tgkill(pid, tid, 0);
     if ret == 0 {
-        println(b"TGKILL_SIG0:OK");
+        pass(b"TGKILL_SIG0");
     } else {
         print(b"TGKILL_SIG0:FAIL: expected 0, got ");
         print_num(ret);
@@ -190,7 +191,7 @@ fn test_tgkill_wrong_tgid() {
 
     if ret == -3 {
         // ESRCH - thread not in specified thread group
-        println(b"TGKILL_WRONG_TGID:OK");
+        pass(b"TGKILL_WRONG_TGID");
     } else {
         print(b"TGKILL_WRONG_TGID:FAIL: expected -3 (ESRCH), got ");
         print_num(ret);
@@ -202,7 +203,7 @@ fn test_tkill_sig0() {
     let tid = sys_gettid();
     let ret = sys_tkill(tid, 0);
     if ret == 0 {
-        println(b"TKILL_SIG0:OK");
+        pass(b"TKILL_SIG0");
     } else {
         print(b"TKILL_SIG0:FAIL: expected 0, got ");
         print_num(ret);
@@ -220,7 +221,7 @@ fn test_sigaction() {
         print_num(old_action[0] as i64);
         // Handler should be SIG_DFL (0) for SIGUSR1 by default
         if old_action[0] == SIG_DFL {
-            println(b"SIGACTION:OK");
+            pass(b"SIGACTION");
         } else {
             println(b"SIGACTION:OK (handler not default but call succeeded)");
         }
@@ -243,7 +244,7 @@ fn test_sigaction_same_buffer() {
     let dfl: [u64; 4] = [0; 4];
     sys_rt_sigaction(SIGUSR2, dfl.as_ptr() as u64, 0, 8);
     if r == 0 && old == 0 && now[0] == 1 {
-        println(b"SIGACTION_SAME_BUF:OK");
+        pass(b"SIGACTION_SAME_BUF");
     } else {
         print(b"SIGACTION_SAME_BUF:FAIL: old ");
         print_num(old as i64);
@@ -258,7 +259,7 @@ fn test_sigaction_einval() {
     let ret = sys_rt_sigaction(0, 0, 0, 8); // Signal 0 is invalid
     if ret == -22 {
         // EINVAL
-        println(b"SIGACTION_EINVAL:OK");
+        pass(b"SIGACTION_EINVAL");
     } else {
         print(b"SIGACTION_EINVAL:FAIL: expected -22, got ");
         print_num(ret);
@@ -274,12 +275,10 @@ fn test_sigaction_sigkill() {
     let mut old: [u64; 4] = [9; 4];
     let q = sys_rt_sigaction(SIGKILL, 0, old.as_mut_ptr() as u64, 8);
     if q != 0 || old[0] != SIG_DFL {
-        print(b"SIGACTION_SIGKILL:FAIL: query returned ");
-        print_num(q);
-        println(b"");
+        fail_num(b"SIGACTION_SIGKILL:FAIL: query returned ", q);
     } else if ret == -22 {
         // EINVAL - can't change SIGKILL
-        println(b"SIGACTION_SIGKILL:OK");
+        pass(b"SIGACTION_SIGKILL");
     } else {
         print(b"SIGACTION_SIGKILL:FAIL: expected -22, got ");
         print_num(ret);
@@ -357,9 +356,10 @@ fn test_clone_clear_sighand() {
     }
     let code = wait_exit_code(ret);
     if code != 0 {
-        print(b"CLONE_CLEAR_SIGHAND:FAIL: legacy clone did not ignore bit 32, child code = ");
-        print_num(code);
-        println(b"");
+        fail_num(
+            b"CLONE_CLEAR_SIGHAND:FAIL: legacy clone did not ignore bit 32, child code = ",
+            code,
+        );
         sys_rt_sigaction(SIGUSR1, default_action.as_ptr() as u64, 0, 8);
         return;
     }
@@ -387,18 +387,14 @@ fn test_clone_clear_sighand() {
     sys_rt_sigaction(SIGUSR1, default_action.as_ptr() as u64, 0, 8);
 
     if ret < 0 {
-        print(b"CLONE_CLEAR_SIGHAND:FAIL: clone3 failed, ret = ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"CLONE_CLEAR_SIGHAND:FAIL: clone3 failed, ret = ", ret);
         return;
     }
     let code = wait_exit_code(ret);
     if code == 0 {
-        println(b"CLONE_CLEAR_SIGHAND:OK");
+        pass(b"CLONE_CLEAR_SIGHAND");
     } else {
-        print(b"CLONE_CLEAR_SIGHAND:FAIL: clone3 child exit code = ");
-        print_num(code);
-        println(b"");
+        fail_num(b"CLONE_CLEAR_SIGHAND:FAIL: clone3 child exit code = ", code);
     }
 }
 
@@ -417,7 +413,7 @@ fn test_sigtimedwait() {
 
     // With zero timeout and no pending signal, should return -EAGAIN (-11)
     if ret == -11 {
-        println(b"SIGTIMEDWAIT:OK");
+        pass(b"SIGTIMEDWAIT");
     } else {
         print(b"SIGTIMEDWAIT:FAIL: expected -11 (EAGAIN), got ");
         print_num(ret);
@@ -512,7 +508,7 @@ fn test_sigaltstack() {
     };
     sys_sigaltstack(&disable_stack as *const StackT as u64, 0);
 
-    println(b"SIGALTSTACK:OK");
+    pass(b"SIGALTSTACK");
 }
 
 /// Test: rt_sigqueueinfo() - send signal with info (should succeed to self)
@@ -538,7 +534,7 @@ fn test_sigqueueinfo() {
     sys_rt_sigprocmask(SIG_UNBLOCK, &mask as *const u64 as u64, 0, 8);
 
     if ret == 0 {
-        println(b"SIGQUEUEINFO:OK");
+        pass(b"SIGQUEUEINFO");
     } else {
         print(b"SIGQUEUEINFO:FAIL: expected 0, got ");
         print_num(ret);
@@ -577,7 +573,7 @@ fn test_sigqueueinfo_eperm() {
     sys_wait4(child, &mut status, 0, 0);
 
     if self_ret == 0 && other_ret == -1 {
-        println(b"SIGQUEUEINFO_EPERM:OK");
+        pass(b"SIGQUEUEINFO_EPERM");
     } else {
         print(b"SIGQUEUEINFO_EPERM:FAIL: self=");
         print_num(self_ret);
@@ -609,7 +605,7 @@ fn test_tgsigqueueinfo() {
     sys_rt_sigprocmask(SIG_UNBLOCK, &mask as *const u64 as u64, 0, 8);
 
     if ret == 0 {
-        println(b"TGSIGQUEUEINFO:OK");
+        pass(b"TGSIGQUEUEINFO");
     } else {
         print(b"TGSIGQUEUEINFO:FAIL: expected 0, got ");
         print_num(ret);
@@ -631,7 +627,7 @@ fn test_tgsigqueueinfo_wrong_tgid() {
 
     if ret == -3 {
         // ESRCH - thread not in specified thread group
-        println(b"TGSIGQUEUEINFO_WRONG_TGID:OK");
+        pass(b"TGSIGQUEUEINFO_WRONG_TGID");
     } else {
         print(b"TGSIGQUEUEINFO_WRONG_TGID:FAIL: expected -3 (ESRCH), got ");
         print_num(ret);
@@ -684,7 +680,7 @@ fn test_sigsuspend() {
     );
 
     if ret == -4 && invoked {
-        println(b"SIGSUSPEND:OK");
+        pass(b"SIGSUSPEND");
     } else {
         print(b"SIGSUSPEND:FAIL: expected -4 (EINTR) with handler run, got ");
         print_num(ret);
@@ -702,7 +698,7 @@ fn test_sigsuspend_einval() {
 
     if ret == -22 {
         // EINVAL
-        println(b"SIGSUSPEND_EINVAL:OK");
+        pass(b"SIGSUSPEND_EINVAL");
     } else {
         print(b"SIGSUSPEND_EINVAL:FAIL: expected -22, got ");
         print_num(ret);
@@ -717,7 +713,7 @@ fn test_kill_pgrp_zero() {
     // Signal 0 is a validity check - should succeed for our own pgrp
     let ret = sys_kill(0, 0);
     if ret == 0 {
-        println(b"KILL_PGRP_ZERO:OK");
+        pass(b"KILL_PGRP_ZERO");
     } else {
         print(b"KILL_PGRP_ZERO:FAIL: expected 0, got ");
         print_num(ret);
@@ -734,7 +730,7 @@ fn test_kill_pgrp_neg() {
     // Signal our own process group using -pid (we are the pgrp leader)
     let ret = sys_kill(-pid, 0); // Signal 0 = validity check
     if ret == 0 {
-        println(b"KILL_PGRP_NEG:OK");
+        pass(b"KILL_PGRP_NEG");
     } else {
         print(b"KILL_PGRP_NEG:FAIL: expected 0, got ");
         print_num(ret);
@@ -787,7 +783,7 @@ fn test_sigpipe_broken_pipe() {
     // Verify: write should return -32 (EPIPE) and SIGPIPE should have been pending
     let sigpipe_was_pending = (pending & sigpipe_mask) != 0;
     if write_ret == -32 && sigpipe_was_pending {
-        println(b"SIGPIPE_PIPE:OK");
+        pass(b"SIGPIPE_PIPE");
     } else if write_ret == -32 {
         print(b"SIGPIPE_PIPE:FAIL: write returned EPIPE but SIGPIPE not pending, pending=");
         print_num(pending as i64);
@@ -942,7 +938,7 @@ fn test_signal_handler_invocation() {
     );
 
     if invoked && signo == SIGUSR1 as i32 {
-        println(b"SIGHANDLER_INVOKE:OK");
+        pass(b"SIGHANDLER_INVOKE");
     } else if invoked {
         print(b"SIGHANDLER_INVOKE:FAIL: handler invoked but signo wrong, got ");
         print_num(signo as i64);

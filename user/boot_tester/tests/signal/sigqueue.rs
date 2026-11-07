@@ -52,6 +52,7 @@
 //!   kernel's trampoline (Linux: the vDSO sigtramp), a mapping of its
 //!   own in /proc/self/maps ([sigpage]; Linux [vdso])
 
+use crate::tests::harness::{fail_num, pass};
 use crate::tests::helpers::{print, print_num, println, read_file, skip};
 use hk_syscall::{
     MqAttr, O_CREAT, O_RDWR, SigEvent, SigVal, sys_mq_notify, sys_mq_open, sys_mq_timedsend,
@@ -207,7 +208,7 @@ fn test_sigq_limit() {
     let rc = sys_getrlimit(RLIMIT_SIGPENDING, &mut r);
     let (q, lim) = sigq();
     if rc == 0 && r.rlim_cur > 0 && r.rlim_cur == r.rlim_max && lim == r.rlim_cur as i64 && q >= 0 {
-        println(b"SIGQUEUE_LIMIT:OK");
+        pass(b"SIGQUEUE_LIMIT");
     } else {
         print(b"SIGQUEUE_LIMIT:FAIL rlim=");
         print_num(r.rlim_cur as i64);
@@ -250,7 +251,7 @@ fn test_eagain() {
     sys_setrlimit(RLIMIT_SIGPENDING, &lim);
     setmask(old);
     if set == 0 && r == [0, 0, EAGAIN] && rk == 0 && ru == 0 && q == q0 + 2 && n == 2 && nu == 1 {
-        println(b"SIGQUEUE_EAGAIN:OK");
+        pass(b"SIGQUEUE_EAGAIN");
     } else {
         print(b"SIGQUEUE_EAGAIN:FAIL set=");
         print_num(set);
@@ -295,7 +296,7 @@ fn test_rt_queue() {
     let fourth = wait_sig(bit(SIGRT), 0, &mut info);
     setmask(old);
     if fail == 0 && q == 3 && got == [11, 22, 33] && fourth == EAGAIN {
-        println(b"SIGQUEUE_RT_ORDER:OK");
+        pass(b"SIGQUEUE_RT_ORDER");
     } else {
         print(b"SIGQUEUE_RT_ORDER:FAIL sigq=");
         print_num(q);
@@ -322,7 +323,7 @@ fn test_legacy_collapse() {
     let second = wait_sig(bit(SIGUSR1), 0, &mut b);
     setmask(old);
     if first == SIGUSR1 as i64 && a.si_status == 5 && second == EAGAIN {
-        println(b"SIGQUEUE_LEGACY:OK");
+        pass(b"SIGQUEUE_LEGACY");
     } else {
         print(b"SIGQUEUE_LEGACY:FAIL first=");
         print_num(first);
@@ -354,11 +355,9 @@ fn test_kill_info() {
     sys_wait4(child, &mut status, 0, 0);
     setmask(old);
     if status == 0 {
-        println(b"SIGQUEUE_KILL_INFO:OK");
+        pass(b"SIGQUEUE_KILL_INFO");
     } else {
-        print(b"SIGQUEUE_KILL_INFO:FAIL status=");
-        print_num(status as i64);
-        println(b"");
+        fail_num(b"SIGQUEUE_KILL_INFO:FAIL status=", status as i64);
     }
 }
 
@@ -379,7 +378,7 @@ fn test_sigchld_exit() {
         && info.si_pid as i64 == child
         && info.si_status == 7
     {
-        println(b"SIGQUEUE_SIGCHLD:OK");
+        pass(b"SIGQUEUE_SIGCHLD");
     } else {
         print(b"SIGQUEUE_SIGCHLD:FAIL r=");
         print_num(r);
@@ -425,7 +424,7 @@ fn test_signalfd_info() {
         && ssi_u32(&b, 44) == 99
         && ssi_u32(&b, 48) == 99;
     if fd >= 0 && ra == 128 && rb == 128 && usr1 && rt {
-        println(b"SIGQUEUE_SIGNALFD:OK");
+        pass(b"SIGQUEUE_SIGNALFD");
     } else {
         print(b"SIGQUEUE_SIGNALFD:FAIL fd=");
         print_num(fd);
@@ -477,7 +476,7 @@ fn test_handler_info() {
     let seen = unsafe { core::ptr::read_volatile(&raw const SEEN) };
     let me = sys_getpid() as i32;
     if r == 0 && seen == [SI_QUEUE, me, 1234, 1] {
-        println(b"SIGQUEUE_HANDLER_INFO:OK");
+        pass(b"SIGQUEUE_HANDLER_INFO");
     } else {
         print(b"SIGQUEUE_HANDLER_INFO:FAIL seen=");
         for v in seen {
@@ -518,7 +517,7 @@ fn test_mq_info() {
         && info.si_pid as i64 == sys_getpid()
         && info.si_status == 777
     {
-        println(b"SIGQUEUE_MQ_INFO:OK");
+        pass(b"SIGQUEUE_MQ_INFO");
     } else {
         print(b"SIGQUEUE_MQ_INFO:FAIL fd=");
         print_num(fd as i64);
@@ -564,7 +563,7 @@ fn test_trapped_info() {
         && info.si_pid as i64 == child
         && info.si_status == SIGSTOP as i32
     {
-        println(b"SIGQUEUE_TRAPPED_INFO:OK");
+        pass(b"SIGQUEUE_TRAPPED_INFO");
     } else {
         print(b"SIGQUEUE_TRAPPED_INFO:FAIL r=");
         print_num(r);
@@ -607,7 +606,7 @@ fn test_ignore_flush() {
     let usr1 = drain(SIGUSR1);
     setmask(old);
     if before == mask && after == bit(SIGUSR1) && q == 1 && usr1 == 1 {
-        println(b"SIGQUEUE_IGN_FLUSH:OK");
+        pass(b"SIGQUEUE_IGN_FLUSH");
     } else {
         print(b"SIGQUEUE_IGN_FLUSH:FAIL before=");
         print_num(before as i64);
@@ -656,11 +655,9 @@ fn test_ignore_flush_no_leader() {
     let mut st = 0i32;
     sys_wait4(child, &mut st, 0, 0);
     if st == 0 {
-        println(b"SIGQUEUE_IGN_FLUSH_NO_LEADER:OK");
+        pass(b"SIGQUEUE_IGN_FLUSH_NO_LEADER");
     } else {
-        print(b"SIGQUEUE_IGN_FLUSH_NO_LEADER:FAIL status=");
-        print_num(st as i64);
-        println(b"");
+        fail_num(b"SIGQUEUE_IGN_FLUSH_NO_LEADER:FAIL status=", st as i64);
     }
 }
 
@@ -729,11 +726,9 @@ fn test_group_thread() {
     let mut st = 0i32;
     sys_wait4(child, &mut st, 0, 0);
     if st == 0 {
-        println(b"SIGQUEUE_GROUP_THREAD:OK");
+        pass(b"SIGQUEUE_GROUP_THREAD");
     } else {
-        print(b"SIGQUEUE_GROUP_THREAD:FAIL status=");
-        print_num(st as i64);
-        println(b"");
+        fail_num(b"SIGQUEUE_GROUP_THREAD:FAIL status=", st as i64);
     }
 }
 
@@ -800,7 +795,7 @@ fn test_timer_info() {
         && ia.si_status == 4242;
     let ok_b = rb == (SIGRT + 1) as i64 && ib.si_code == SI_TIMER && ib.si_status == 77;
     if a >= 0 && b >= 0 && ok_a && ok_b {
-        println(b"SIGQUEUE_TIMER_INFO:OK");
+        pass(b"SIGQUEUE_TIMER_INFO");
     } else {
         print(b"SIGQUEUE_TIMER_INFO:FAIL ids=");
         print_num(a as i64);
@@ -839,7 +834,7 @@ fn test_timer_overrun() {
     wait_sig(bit(SIGRT), 0, &mut k);
     setmask(old);
     if r == SIGRT as i64 && (5..=20).contains(&over) && get == over as i64 && again == EAGAIN {
-        println(b"SIGQUEUE_TIMER_OVERRUN:OK");
+        pass(b"SIGQUEUE_TIMER_OVERRUN");
     } else {
         print(b"SIGQUEUE_TIMER_OVERRUN:FAIL r=");
         print_num(r);
@@ -876,7 +871,7 @@ fn test_timer_drop() {
     let rb = wait_sig(bit(SIGRT), 0, &mut i);
     setmask(old);
     if ra == EAGAIN && rb == EAGAIN {
-        println(b"SIGQUEUE_TIMER_DROP:OK");
+        pass(b"SIGQUEUE_TIMER_DROP");
     } else {
         print(b"SIGQUEUE_TIMER_DROP:FAIL settime=");
         print_num(ra);
@@ -909,7 +904,7 @@ fn test_timer_unignore() {
     drain(SIGRT);
     setmask(old);
     if id >= 0 && r == EAGAIN {
-        println(b"SIGQUEUE_TIMER_UNIGNORE:OK");
+        pass(b"SIGQUEUE_TIMER_UNIGNORE");
     } else {
         print(b"SIGQUEUE_TIMER_UNIGNORE:FAIL id=");
         print_num(id as i64);
@@ -947,7 +942,7 @@ fn test_itimer_real() {
     wait_sig(bit(SIGALRM), 0, &mut c);
     setmask(old);
     if ra == SIGALRM as i64 && a.si_code == SI_KERNEL && rb == SIGALRM as i64 {
-        println(b"SIGQUEUE_ITIMER_REAL:OK");
+        pass(b"SIGQUEUE_ITIMER_REAL");
     } else {
         print(b"SIGQUEUE_ITIMER_REAL:FAIL r=");
         print_num(ra);
@@ -1000,7 +995,7 @@ fn test_autoreap() {
         && info.si_pid as i64 == c2
         && info.si_status == 3
     {
-        println(b"SIGQUEUE_AUTOREAP:OK");
+        pass(b"SIGQUEUE_AUTOREAP");
     } else {
         print(b"SIGQUEUE_AUTOREAP:FAIL ign=");
         print_num(w1);
@@ -1051,7 +1046,7 @@ fn test_pdeath() {
     sys_close(fds[1] as u64);
     setmask(old);
     if w == b && sb == 0 {
-        println(b"SIGQUEUE_PDEATH:OK");
+        pass(b"SIGQUEUE_PDEATH");
     } else {
         print(b"SIGQUEUE_PDEATH:FAIL wait=");
         print_num(w);
@@ -1097,11 +1092,9 @@ fn test_no_restorer() {
     let mut st = 0i32;
     sys_wait4(c, &mut st, 0, 0);
     if st == 0 {
-        println(b"SIGQUEUE_NO_RESTORER:OK");
+        pass(b"SIGQUEUE_NO_RESTORER");
     } else {
-        print(b"SIGQUEUE_NO_RESTORER:FAIL status=");
-        print_num(st as i64);
-        println(b"");
+        fail_num(b"SIGQUEUE_NO_RESTORER:FAIL status=", st as i64);
     }
 }
 
@@ -1146,11 +1139,9 @@ fn test_timer_gone() {
     let mut st = 0i32;
     sys_wait4(c, &mut st, 0, 0);
     if st == 0 {
-        println(b"SIGQUEUE_TIMER_GONE:OK");
+        pass(b"SIGQUEUE_TIMER_GONE");
     } else {
-        print(b"SIGQUEUE_TIMER_GONE:FAIL status=");
-        print_num(st as i64);
-        println(b"");
+        fail_num(b"SIGQUEUE_TIMER_GONE:FAIL status=", st as i64);
     }
 }
 
@@ -1189,11 +1180,9 @@ fn test_exit_signal_exec() {
     sys_wait4(p, &mut st, 0, 0);
     let got = (st >> 8) & 0xff;
     if st & 0x7f == 0 && got == SIGCHLD as i32 {
-        println(b"SIGQUEUE_EXIT_SIGNAL_EXEC:OK");
+        pass(b"SIGQUEUE_EXIT_SIGNAL_EXEC");
     } else {
-        print(b"SIGQUEUE_EXIT_SIGNAL_EXEC:FAIL status=");
-        print_num(st as i64);
-        println(b"");
+        fail_num(b"SIGQUEUE_EXIT_SIGNAL_EXEC:FAIL status=", st as i64);
     }
 }
 
@@ -1233,11 +1222,9 @@ fn test_exit_signal_reparent() {
     sys_close(fds[1] as u64);
     setmask(old);
     if got == SIGCHLD as i64 {
-        println(b"SIGQUEUE_EXIT_SIGNAL_REPARENT:OK");
+        pass(b"SIGQUEUE_EXIT_SIGNAL_REPARENT");
     } else {
-        print(b"SIGQUEUE_EXIT_SIGNAL_REPARENT:FAIL sig=");
-        print_num(got);
-        println(b"");
+        fail_num(b"SIGQUEUE_EXIT_SIGNAL_REPARENT:FAIL sig=", got);
     }
 }
 
@@ -1305,7 +1292,7 @@ fn test_ptrace_siginfo() {
     let mut st2 = 0i32;
     sys_wait4(c, &mut st2, 0, 0);
     if stopped && got && peeked && s == 0 && st2 == 0 {
-        println(b"SIGQUEUE_PTRACE_SIGINFO:OK");
+        pass(b"SIGQUEUE_PTRACE_SIGINFO");
     } else {
         print(b"SIGQUEUE_PTRACE_SIGINFO:FAIL stop=");
         print_num(st as i64);
@@ -1376,11 +1363,9 @@ fn test_exec_signals() {
     let mut st = 0i32;
     sys_wait4(c, &mut st, 0, 0);
     if st == 0 {
-        println(b"SIGQUEUE_EXEC:OK");
+        pass(b"SIGQUEUE_EXEC");
     } else {
-        print(b"SIGQUEUE_EXEC:FAIL status=");
-        print_num(st as i64);
-        println(b"");
+        fail_num(b"SIGQUEUE_EXEC:FAIL status=", st as i64);
     }
 }
 
@@ -1399,7 +1384,7 @@ fn test_queue_layout() {
     let n = drain(SIGRT);
     setmask(old);
     if r == E2BIG && n == 0 {
-        println(b"SIGQUEUE_LAYOUT:OK");
+        pass(b"SIGQUEUE_LAYOUT");
     } else {
         print(b"SIGQUEUE_LAYOUT:FAIL r=");
         print_num(r);
@@ -1445,7 +1430,7 @@ fn test_exec_shared_sighand() {
     }
     sys_rt_sigaction(SIGUSR1, old.as_ptr() as u64, 0, 8);
     if c > 0 && st == 0 && now[0] == act[0] {
-        println(b"SIGQUEUE_EXEC_SHARED_SIGHAND:OK");
+        pass(b"SIGQUEUE_EXEC_SHARED_SIGHAND");
     } else {
         print(b"SIGQUEUE_EXEC_SHARED_SIGHAND:FAIL c=");
         print_num(c);
@@ -1537,10 +1522,8 @@ fn test_reparent_traced_zombie() {
     let mut st = 0i32;
     sys_wait4(s, &mut st, 0, 0);
     if st == 0 {
-        println(b"SIGQUEUE_REPARENT_TRACED_ZOMBIE:OK");
+        pass(b"SIGQUEUE_REPARENT_TRACED_ZOMBIE");
     } else {
-        print(b"SIGQUEUE_REPARENT_TRACED_ZOMBIE:FAIL status=");
-        print_num(st as i64);
-        println(b"");
+        fail_num(b"SIGQUEUE_REPARENT_TRACED_ZOMBIE:FAIL status=", st as i64);
     }
 }

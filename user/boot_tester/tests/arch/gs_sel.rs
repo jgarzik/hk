@@ -5,6 +5,7 @@
 //! kernel swaps in its own GS base on entry); the kernel's per-CPU data
 //! and the caller's credentials must not depend on it.
 
+use crate::tests::harness::pass;
 use crate::tests::helpers::{print, print_num, println};
 use hk_syscall::{
     sys_close, sys_exit, sys_fork, sys_geteuid, sys_open, sys_read, sys_setresuid, sys_setuid,
@@ -67,7 +68,7 @@ fn test_gs_load_keeps_creds() {
     let mut status: i32 = 0;
     let r = sys_wait4(pid, &mut status, 0, 0);
     if r == pid && status == 0 {
-        println(b"GS_SELECTOR_CREDS:OK");
+        pass(b"GS_SELECTOR_CREDS");
     } else {
         print(b"GS_SELECTOR_CREDS:FAIL: wait ");
         print_num(r);

@@ -1,7 +1,8 @@
 //! execve of malformed ELF files written at runtime: the loader must
 //! reject them like Linux's binfmt_elf and the kernel must survive.
 
-use crate::tests::helpers::{print, print_num, println};
+use crate::tests::harness::fail_num;
+use crate::tests::helpers::{print, println};
 use hk_syscall::{
     O_CREAT, O_TRUNC, O_WRONLY, sys_close, sys_execve, sys_exit, sys_fork, sys_open, sys_unlink,
     sys_wait4, sys_write,
@@ -156,9 +157,7 @@ fn exec_still_works() {
     if st == 0 {
         println(b":OK");
     } else {
-        print(b":FAIL wstatus=");
-        print_num(st as i64);
-        println(b"");
+        fail_num(b":FAIL wstatus=", st as i64);
     }
 }
 
@@ -268,8 +267,6 @@ fn run(name: &[u8], want: Want) {
     if ok {
         println(b":OK");
     } else {
-        print(b":FAIL wstatus=");
-        print_num(st as i64);
-        println(b"");
+        fail_num(b":FAIL wstatus=", st as i64);
     }
 }

@@ -12,6 +12,7 @@
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
+use crate::tests::harness::{fail_num, pass};
 use crate::tests::helpers::{print, print_num, println};
 use hk_syscall::{
     CLOCK_MONOTONIC, CLONE_VM, FUTEX_WAIT, FUTEX_WAKE, P_PID, PollFd, SA_RESTART, SA_RESTORER,
@@ -175,9 +176,7 @@ fn report_child(name: &[u8], status: Option<i32>, codes: &[(i32, &[u8])]) {
     match status {
         None => println(b":FAIL child did not finish (blocked/lost wakeup)"),
         Some(st) if st & 0x7f != 0 => {
-            print(b":FAIL child killed by signal ");
-            print_num((st & 0x7f) as i64);
-            println(b"");
+            fail_num(b":FAIL child killed by signal ", (st & 0x7f) as i64);
         }
         Some(st) => {
             let code = (st >> 8) & 0xff;
@@ -534,7 +533,7 @@ fn test_pipe_wake_stress() {
         }
     }
     if failed_round < 0 && !bad_child {
-        println(b"WAKE_STRESS_PIPE:OK");
+        pass(b"WAKE_STRESS_PIPE");
     } else {
         print(b"WAKE_STRESS_PIPE:FAIL lost wakeup at round ");
         print_num(failed_round);
@@ -614,9 +613,7 @@ fn test_futex_wake_stress() {
         futex_child();
     }
     if pid < 0 {
-        print(b"WAKE_STRESS_FUTEX:FAIL clone ");
-        print_num(pid);
-        println(b"");
+        fail_num(b"WAKE_STRESS_FUTEX:FAIL clone ", pid);
         return;
     }
     let mut ok = true;
@@ -632,7 +629,7 @@ fn test_futex_wake_stress() {
         kill_and_reap(pid);
     }
     if ok && st == Some(0) && CHILD_FAILED.load(Ordering::Relaxed) == 0 {
-        println(b"WAKE_STRESS_FUTEX:OK");
+        pass(b"WAKE_STRESS_FUTEX");
     } else {
         print(b"WAKE_STRESS_FUTEX:FAIL");
         if !ok {
@@ -776,7 +773,7 @@ fn test_kernel_pointer_efault() {
     sys_close(fds[0] as u64);
     sys_close(fds[1] as u64);
     if r == -14 {
-        println(b"UACCESS_KERNEL_PTR_EFAULT:OK");
+        pass(b"UACCESS_KERNEL_PTR_EFAULT");
     } else {
         print(b"UACCESS_KERNEL_PTR_EFAULT:FAIL write returned ");
         print_num(r);
@@ -878,9 +875,7 @@ fn test_timerfd_huge_values() {
     if r == -22 {
         println(b":OK");
     } else {
-        print(b":FAIL got ");
-        print_num(r);
-        println(b"");
+        fail_num(b":FAIL got ", r);
     }
     sys_close(fd as u64);
 }
@@ -989,9 +984,7 @@ fn test_epoll_block() {
     if r == 1 {
         println(b":OK");
     } else {
-        print(b":FAIL ret=");
-        print_num(r);
-        println(b"");
+        fail_num(b":FAIL ret=", r);
     }
 }
 
@@ -1030,9 +1023,7 @@ fn test_sigtimedwait_block() {
     if r == SIGUSR1 as i64 {
         println(b":OK");
     } else {
-        print(b":FAIL ret=");
-        print_num(r);
-        println(b"");
+        fail_num(b":FAIL ret=", r);
     }
 }
 
@@ -1047,9 +1038,7 @@ fn test_mq_timeout() {
         core::ptr::null(),
     ) as i32;
     if fd < 0 {
-        print(b"TIMING_MQ_TIMEOUT:FAIL mq_open ");
-        print_num(fd as i64);
-        println(b"");
+        fail_num(b"TIMING_MQ_TIMEOUT:FAIL mq_open ", fd as i64);
         return;
     }
     let mut now = Timespec {
@@ -1091,9 +1080,7 @@ fn test_msgrcv_block() {
     if r == 2 && &m[8..10] == b"hi" {
         println(b":OK");
     } else {
-        print(b":FAIL ret=");
-        print_num(r);
-        println(b"");
+        fail_num(b":FAIL ret=", r);
     }
 }
 
@@ -1123,8 +1110,6 @@ fn test_semop_block() {
     if r == 0 {
         println(b":OK");
     } else {
-        print(b":FAIL ret=");
-        print_num(r);
-        println(b"");
+        fail_num(b":FAIL ret=", r);
     }
 }

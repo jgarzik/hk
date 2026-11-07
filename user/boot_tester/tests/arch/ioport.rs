@@ -7,7 +7,8 @@
 //! - Test iopl lower privilege (always allowed)
 //! - Test ioperm returns ENOSYS (not yet implemented)
 
-use crate::tests::helpers::{host_mode, print, print_num, println};
+use crate::tests::harness::{fail_num, pass};
+use crate::tests::helpers::host_mode;
 use hk_syscall::{sys_ioperm, sys_iopl};
 
 // Error codes
@@ -27,11 +28,9 @@ pub fn run_tests() {
 fn test_iopl_level_zero() {
     let ret = sys_iopl(0);
     if ret == 0 {
-        println(b"IOPL_LEVEL_ZERO:OK");
+        pass(b"IOPL_LEVEL_ZERO");
     } else {
-        print(b"IOPL_LEVEL_ZERO:FAIL: returned ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"IOPL_LEVEL_ZERO:FAIL: returned ", ret);
     }
 }
 
@@ -39,11 +38,9 @@ fn test_iopl_level_zero() {
 fn test_iopl_level_three() {
     let ret = sys_iopl(3);
     if ret == 0 {
-        println(b"IOPL_LEVEL_THREE:OK");
+        pass(b"IOPL_LEVEL_THREE");
     } else {
-        print(b"IOPL_LEVEL_THREE:FAIL: returned ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"IOPL_LEVEL_THREE:FAIL: returned ", ret);
     }
 }
 
@@ -51,11 +48,9 @@ fn test_iopl_level_three() {
 fn test_iopl_invalid_level() {
     let ret = sys_iopl(4);
     if ret == -EINVAL {
-        println(b"IOPL_INVALID_LEVEL:OK");
+        pass(b"IOPL_INVALID_LEVEL");
     } else {
-        print(b"IOPL_INVALID_LEVEL:FAIL: expected -22, got ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"IOPL_INVALID_LEVEL:FAIL: expected -22, got ", ret);
     }
 }
 
@@ -64,20 +59,16 @@ fn test_iopl_lower_privilege() {
     // First set to level 3 (should succeed)
     let ret = sys_iopl(3);
     if ret != 0 {
-        print(b"IOPL_LOWER:FAIL: setup to level 3 returned ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"IOPL_LOWER:FAIL: setup to level 3 returned ", ret);
         return;
     }
 
     // Now lower to level 0 (should always succeed)
     let ret = sys_iopl(0);
     if ret == 0 {
-        println(b"IOPL_LOWER:OK");
+        pass(b"IOPL_LOWER");
     } else {
-        print(b"IOPL_LOWER:FAIL: lowering returned ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"IOPL_LOWER:FAIL: lowering returned ", ret);
     }
 }
 
@@ -90,10 +81,8 @@ fn test_ioperm_enosys() {
         if ret == 0 {
             sys_ioperm(0x80, 1, 0);
         }
-        println(b"IOPERM_ENOSYS:OK");
+        pass(b"IOPERM_ENOSYS");
     } else {
-        print(b"IOPERM_ENOSYS:FAIL: expected -38, got ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"IOPERM_ENOSYS:FAIL: expected -38, got ", ret);
     }
 }

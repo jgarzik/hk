@@ -9,6 +9,7 @@
 //! - Test ppoll() with NULL sigmask
 //! - Test pselect6() with NULL sigmask
 
+use crate::tests::harness::{fail_num, pass};
 use crate::tests::helpers::{print, print_num, println};
 use hk_syscall::{
     FdSet, POLLIN, POLLNVAL, POLLOUT, PollFd, Timespec, Timeval, sys_close, sys_pipe2, sys_poll,
@@ -105,9 +106,7 @@ fn report_nfds(step: i64) {
     if step == 0 {
         println(b":OK");
     } else {
-        print(b":FAIL step ");
-        print_num(step);
-        println(b"");
+        fail_num(b":FAIL step ", step);
     }
 }
 
@@ -117,9 +116,7 @@ fn test_poll_pipe_readable() {
     let mut pipefd = [0i32; 2];
     let ret = sys_pipe2(pipefd.as_mut_ptr(), 0);
     if ret < 0 {
-        print(b"POLL_PIPE_READ:FAIL pipe2 returned ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"POLL_PIPE_READ:FAIL pipe2 returned ", ret);
         return;
     }
 
@@ -127,9 +124,7 @@ fn test_poll_pipe_readable() {
     let data = b"x";
     let wret = sys_write(pipefd[1] as u64, data.as_ptr(), 1);
     if wret != 1 {
-        print(b"POLL_PIPE_READ:FAIL write returned ");
-        print_num(wret);
-        println(b"");
+        fail_num(b"POLL_PIPE_READ:FAIL write returned ", wret);
         sys_close(pipefd[0] as u64);
         sys_close(pipefd[1] as u64);
         return;
@@ -140,7 +135,7 @@ fn test_poll_pipe_readable() {
     let ret = sys_poll(fds.as_mut_ptr(), 1, 0);
 
     if ret == 1 && (fds[0].revents & POLLIN) != 0 {
-        println(b"POLL_PIPE_READ:OK");
+        pass(b"POLL_PIPE_READ");
     } else {
         print(b"POLL_PIPE_READ:FAIL ret=");
         print_num(ret);
@@ -159,9 +154,7 @@ fn test_poll_timeout_zero() {
     let mut pipefd = [0i32; 2];
     let ret = sys_pipe2(pipefd.as_mut_ptr(), 0);
     if ret < 0 {
-        print(b"POLL_TIMEOUT_ZERO:FAIL pipe2 returned ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"POLL_TIMEOUT_ZERO:FAIL pipe2 returned ", ret);
         return;
     }
 
@@ -170,11 +163,9 @@ fn test_poll_timeout_zero() {
     let ret = sys_poll(fds.as_mut_ptr(), 1, 0);
 
     if ret == 0 {
-        println(b"POLL_TIMEOUT_ZERO:OK");
+        pass(b"POLL_TIMEOUT_ZERO");
     } else {
-        print(b"POLL_TIMEOUT_ZERO:FAIL expected 0, got ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"POLL_TIMEOUT_ZERO:FAIL expected 0, got ", ret);
     }
 
     sys_close(pipefd[0] as u64);
@@ -189,7 +180,7 @@ fn test_poll_bad_fd() {
 
     // poll returns 1 (one fd with events) and sets POLLNVAL
     if ret == 1 && (fds[0].revents & POLLNVAL) != 0 {
-        println(b"POLL_BAD_FD:OK");
+        pass(b"POLL_BAD_FD");
     } else {
         print(b"POLL_BAD_FD:FAIL ret=");
         print_num(ret);
@@ -205,9 +196,7 @@ fn test_poll_write_ready() {
     let mut pipefd = [0i32; 2];
     let ret = sys_pipe2(pipefd.as_mut_ptr(), 0);
     if ret < 0 {
-        print(b"POLL_WRITE_READY:FAIL pipe2 returned ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"POLL_WRITE_READY:FAIL pipe2 returned ", ret);
         return;
     }
 
@@ -216,7 +205,7 @@ fn test_poll_write_ready() {
     let ret = sys_poll(fds.as_mut_ptr(), 1, 0);
 
     if ret == 1 && (fds[0].revents & POLLOUT) != 0 {
-        println(b"POLL_WRITE_READY:OK");
+        pass(b"POLL_WRITE_READY");
     } else {
         print(b"POLL_WRITE_READY:FAIL ret=");
         print_num(ret);
@@ -235,9 +224,7 @@ fn test_select_pipe_readable() {
     let mut pipefd = [0i32; 2];
     let ret = sys_pipe2(pipefd.as_mut_ptr(), 0);
     if ret < 0 {
-        print(b"SELECT_PIPE_READ:FAIL pipe2 returned ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"SELECT_PIPE_READ:FAIL pipe2 returned ", ret);
         return;
     }
 
@@ -245,9 +232,7 @@ fn test_select_pipe_readable() {
     let data = b"y";
     let wret = sys_write(pipefd[1] as u64, data.as_ptr(), 1);
     if wret != 1 {
-        print(b"SELECT_PIPE_READ:FAIL write returned ");
-        print_num(wret);
-        println(b"");
+        fail_num(b"SELECT_PIPE_READ:FAIL write returned ", wret);
         sys_close(pipefd[0] as u64);
         sys_close(pipefd[1] as u64);
         return;
@@ -272,7 +257,7 @@ fn test_select_pipe_readable() {
     );
 
     if ret == 1 && readfds.is_set(pipefd[0]) {
-        println(b"SELECT_PIPE_READ:OK");
+        pass(b"SELECT_PIPE_READ");
     } else {
         print(b"SELECT_PIPE_READ:FAIL ret=");
         print_num(ret);
@@ -295,9 +280,7 @@ fn test_select_timeout_zero() {
     let mut pipefd = [0i32; 2];
     let ret = sys_pipe2(pipefd.as_mut_ptr(), 0);
     if ret < 0 {
-        print(b"SELECT_TIMEOUT_ZERO:FAIL pipe2 returned ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"SELECT_TIMEOUT_ZERO:FAIL pipe2 returned ", ret);
         return;
     }
 
@@ -319,11 +302,9 @@ fn test_select_timeout_zero() {
 
     // Should return 0 (no fds ready)
     if ret == 0 {
-        println(b"SELECT_TIMEOUT_ZERO:OK");
+        pass(b"SELECT_TIMEOUT_ZERO");
     } else {
-        print(b"SELECT_TIMEOUT_ZERO:FAIL expected 0, got ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"SELECT_TIMEOUT_ZERO:FAIL expected 0, got ", ret);
     }
 
     sys_close(pipefd[0] as u64);
@@ -336,9 +317,7 @@ fn test_ppoll_null_sigmask() {
     let mut pipefd = [0i32; 2];
     let ret = sys_pipe2(pipefd.as_mut_ptr(), 0);
     if ret < 0 {
-        print(b"PPOLL_NULL_SIGMASK:FAIL pipe2 returned ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"PPOLL_NULL_SIGMASK:FAIL pipe2 returned ", ret);
         return;
     }
 
@@ -354,7 +333,7 @@ fn test_ppoll_null_sigmask() {
     let ret = sys_ppoll(fds.as_mut_ptr(), 1, &timeout, 0, 0);
 
     if ret == 1 && (fds[0].revents & POLLIN) != 0 {
-        println(b"PPOLL_NULL_SIGMASK:OK");
+        pass(b"PPOLL_NULL_SIGMASK");
     } else {
         print(b"PPOLL_NULL_SIGMASK:FAIL ret=");
         print_num(ret);
@@ -373,9 +352,7 @@ fn test_ppoll_with_timeout() {
     let mut pipefd = [0i32; 2];
     let ret = sys_pipe2(pipefd.as_mut_ptr(), 0);
     if ret < 0 {
-        print(b"PPOLL_TIMEOUT:FAIL pipe2 returned ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"PPOLL_TIMEOUT:FAIL pipe2 returned ", ret);
         return;
     }
 
@@ -389,11 +366,9 @@ fn test_ppoll_with_timeout() {
 
     // Should return 0 (timeout, no fds ready)
     if ret == 0 {
-        println(b"PPOLL_TIMEOUT:OK");
+        pass(b"PPOLL_TIMEOUT");
     } else {
-        print(b"PPOLL_TIMEOUT:FAIL expected 0, got ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"PPOLL_TIMEOUT:FAIL expected 0, got ", ret);
     }
 
     sys_close(pipefd[0] as u64);
@@ -406,18 +381,14 @@ fn test_pselect6_null_sigmask() {
     let mut pipefd = [0i32; 2];
     let ret = sys_pipe2(pipefd.as_mut_ptr(), 0);
     if ret < 0 {
-        print(b"PSELECT6_NULL_SIGMASK:FAIL pipe2 returned ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"PSELECT6_NULL_SIGMASK:FAIL pipe2 returned ", ret);
         return;
     }
 
     let data = b"w";
     let w1 = sys_write(pipefd[1] as u64, data.as_ptr(), 1);
     if w1 != 1 {
-        print(b"PSELECT6_NULL_SIGMASK:FAIL write1 returned ");
-        print_num(w1);
-        println(b"");
+        fail_num(b"PSELECT6_NULL_SIGMASK:FAIL write1 returned ", w1);
         sys_close(pipefd[0] as u64);
         sys_close(pipefd[1] as u64);
         return;
@@ -427,9 +398,7 @@ fn test_pselect6_null_sigmask() {
     let mut buf = [0u8; 1];
     let r1 = sys_read(pipefd[0] as u64, buf.as_mut_ptr(), 1);
     if r1 != 1 {
-        print(b"PSELECT6_NULL_SIGMASK:FAIL read returned ");
-        print_num(r1);
-        println(b"");
+        fail_num(b"PSELECT6_NULL_SIGMASK:FAIL read returned ", r1);
         sys_close(pipefd[0] as u64);
         sys_close(pipefd[1] as u64);
         return;
@@ -438,9 +407,7 @@ fn test_pselect6_null_sigmask() {
     // Write again for the actual test
     let w2 = sys_write(pipefd[1] as u64, data.as_ptr(), 1);
     if w2 != 1 {
-        print(b"PSELECT6_NULL_SIGMASK:FAIL write2 returned ");
-        print_num(w2);
-        println(b"");
+        fail_num(b"PSELECT6_NULL_SIGMASK:FAIL write2 returned ", w2);
         sys_close(pipefd[0] as u64);
         sys_close(pipefd[1] as u64);
         return;
@@ -464,7 +431,7 @@ fn test_pselect6_null_sigmask() {
     );
 
     if ret == 1 && readfds.is_set(pipefd[0]) {
-        println(b"PSELECT6_NULL_SIGMASK:OK");
+        pass(b"PSELECT6_NULL_SIGMASK");
     } else {
         print(b"PSELECT6_NULL_SIGMASK:FAIL ret=");
         print_num(ret);

@@ -8,6 +8,7 @@
 //! 5. VFAT-specific tests
 
 use crate::tests::fs::fs_common;
+use crate::tests::harness::{fail_num, pass};
 use crate::tests::helpers::{host_mode, print, print_num, println, skip};
 use hk_syscall::{
     O_CREAT, O_NOFOLLOW, O_RDONLY, O_WRONLY, SEEK_SET, sys_close, sys_link, sys_lseek, sys_mkdir,
@@ -87,7 +88,7 @@ fn test_symlink() {
     let symlink_path = b"/link_to_test\0";
     let ret = sys_symlink(symlink_target.as_ptr(), symlink_path.as_ptr());
     if ret == 0 {
-        println(b"SYMLINK:OK");
+        pass(b"SYMLINK");
     } else {
         print(b"SYMLINK:FAIL: symlink returned ");
         print_num(ret);
@@ -101,7 +102,7 @@ fn test_readlink() {
     let ret = sys_readlink(symlink_path.as_ptr(), readlink_buf.as_mut_ptr(), 64);
     if ret == 9 {
         // "/test.txt" is 9 bytes
-        println(b"READLINK:OK");
+        pass(b"READLINK");
     } else {
         print(b"READLINK:FAIL: expected 9, got ");
         print_num(ret);
@@ -113,11 +114,9 @@ fn test_symlink_nofollow() {
     let symlink_path = b"/link_to_test\0";
     let ret = sys_open(symlink_path.as_ptr(), O_RDONLY | O_NOFOLLOW, 0);
     if ret == -40 {
-        println(b"SYMLINK_NOFOLLOW:OK");
+        pass(b"SYMLINK_NOFOLLOW");
     } else {
-        print(b"SYMLINK_NOFOLLOW:FAIL: expected -40 (ELOOP), got ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"SYMLINK_NOFOLLOW:FAIL: expected -40 (ELOOP), got ", ret);
         if ret >= 0 {
             sys_close(ret as u64);
         }
@@ -133,7 +132,7 @@ fn test_symlink_read() {
         let bytes_read = sys_read(fd as u64, buf.as_mut_ptr(), 64);
         sys_close(fd as u64);
         if bytes_read == 17 {
-            println(b"SYMLINK_READ:OK");
+            pass(b"SYMLINK_READ");
         } else {
             print(b"SYMLINK_READ:FAIL: expected 17 bytes, got ");
             print_num(bytes_read);
@@ -151,7 +150,7 @@ fn test_symlink_eexist() {
     let ret = sys_symlink(symlink_target.as_ptr(), existing_path.as_ptr());
     if ret == -17 {
         // EEXIST
-        println(b"SYMLINK_EEXIST:OK");
+        pass(b"SYMLINK_EEXIST");
     } else {
         print(b"SYMLINK_EEXIST:FAIL: expected -17 (EEXIST), got ");
         print_num(ret);
@@ -165,7 +164,7 @@ fn test_readlink_einval() {
     let ret = sys_readlink(regular_file.as_ptr(), buf.as_mut_ptr(), 64);
     if ret == -22 {
         // EINVAL
-        println(b"READLINK_EINVAL:OK");
+        pass(b"READLINK_EINVAL");
     } else {
         print(b"READLINK_EINVAL:FAIL: expected -22 (EINVAL), got ");
         print_num(ret);
@@ -184,7 +183,7 @@ fn test_link() {
             let bytes_read = sys_read(fd as u64, buf.as_mut_ptr(), 64);
             sys_close(fd as u64);
             if bytes_read == 17 {
-                println(b"LINK:OK");
+                pass(b"LINK");
             } else {
                 print(b"LINK:FAIL: read through hardlink got ");
                 print_num(bytes_read);
@@ -211,7 +210,7 @@ fn test_link_dir_eperm() {
     sys_rmdir(dir_path.as_ptr());
     if ret == -1 && xdev == -18 {
         // EPERM
-        println(b"LINK_DIR_EPERM:OK");
+        pass(b"LINK_DIR_EPERM");
     } else {
         print(b"LINK_DIR_EPERM:FAIL: expected -1 (EPERM), got ");
         print_num(ret);
@@ -249,7 +248,7 @@ fn test_unlink_hardlink_persistence() {
 
     let fd = sys_open(hardlink_link.as_ptr(), O_RDONLY, 0);
     if fd >= 0 {
-        println(b"UNLINK_HARDLINK_PERSISTENCE:OK");
+        pass(b"UNLINK_HARDLINK_PERSISTENCE");
         sys_close(fd as u64);
         sys_unlink(hardlink_link.as_ptr());
     } else {
@@ -271,7 +270,7 @@ fn test_unlink_eisdir() {
     let ret = sys_unlink(test_dir.as_ptr());
     if ret == -21 {
         // EISDIR
-        println(b"UNLINK_EISDIR:OK");
+        pass(b"UNLINK_EISDIR");
     } else {
         print(b"UNLINK_EISDIR:FAIL: expected -21 (EISDIR), got ");
         print_num(ret);
@@ -292,7 +291,7 @@ fn test_lseek_invalid_whence() {
     let pos = sys_lseek(fd as i32, 0, 99);
     if pos == -22 {
         // EINVAL
-        println(b"LSEEK_INVALID_WHENCE:OK");
+        pass(b"LSEEK_INVALID_WHENCE");
     } else {
         print(b"LSEEK_INVALID_WHENCE:FAIL: expected -22 (EINVAL), got ");
         print_num(pos);
@@ -313,7 +312,7 @@ fn test_lseek_negative_pos() {
     let pos = sys_lseek(fd as i32, -1, SEEK_SET);
     if pos == -22 {
         // EINVAL
-        println(b"LSEEK_NEGATIVE_POS:OK");
+        pass(b"LSEEK_NEGATIVE_POS");
     } else {
         print(b"LSEEK_NEGATIVE_POS:FAIL: expected -22 (EINVAL), got ");
         print_num(pos);
@@ -334,7 +333,7 @@ fn test_truncate_eisdir() {
     let ret = sys_truncate(test_dir.as_ptr(), 0);
     if ret == -21 {
         // EISDIR
-        println(b"TRUNCATE_EISDIR:OK");
+        pass(b"TRUNCATE_EISDIR");
     } else {
         print(b"TRUNCATE_EISDIR:FAIL: expected -21 (EISDIR), got ");
         print_num(ret);
@@ -367,7 +366,7 @@ fn test_rename_cycle() {
     let ret = sys_rename(cycle_a.as_ptr(), cycle_into.as_ptr());
     if ret == -22 {
         // EINVAL
-        println(b"CYCLE_DETECTION:OK");
+        pass(b"CYCLE_DETECTION");
     } else if ret == 0 {
         println(b"CYCLE_DETECTION:FAIL: rename succeeded (should have failed with EINVAL)");
     } else {
@@ -465,9 +464,7 @@ fn mount_vfat() -> bool {
     } else {
         println(b"");
         // The USB disk is always attached: not mounting it is a failure
-        print(b"VFAT_MOUNT:FAIL ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"VFAT_MOUNT:FAIL ", ret);
         return false;
     }
 
@@ -487,7 +484,7 @@ fn mount_vfat() -> bool {
         sys_close(fd as u64);
     }
 
-    println(b"VFAT_MOUNT:OK");
+    pass(b"VFAT_MOUNT");
     true
 }
 
@@ -496,7 +493,7 @@ fn unmount_vfat() {
     let target = b"/vfat_test\0";
     let ret = sys_umount2(target.as_ptr(), 0);
     if ret == 0 {
-        println(b"VFAT_UNMOUNT:OK");
+        pass(b"VFAT_UNMOUNT");
     } else {
         print(b"VFAT_UNMOUNT:FAIL (");
         print_num(ret);
@@ -529,7 +526,7 @@ fn test_vfat_case_insensitive() {
         let n = sys_read(fd as u64, buf.as_mut_ptr(), 20);
         sys_close(fd as u64);
         if n == 9 && &buf[..9] == b"case test" {
-            println(b"VFAT_CASE_INSENSITIVE:OK");
+            pass(b"VFAT_CASE_INSENSITIVE");
         } else {
             println(b"VFAT_CASE_INSENSITIVE:FAIL: data mismatch");
         }

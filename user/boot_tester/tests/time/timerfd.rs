@@ -9,7 +9,8 @@
 //! - Test timerfd_create with TFD_NONBLOCK
 //! - Test timerfd read on disarmed timer (EAGAIN with nonblock)
 
-use crate::tests::helpers::{print, print_num, println};
+use crate::tests::harness::pass;
+use crate::tests::helpers::{print, print_num};
 use hk_syscall::{
     CLOCK_MONOTONIC, CLOCK_REALTIME, ITimerSpec, TFD_NONBLOCK, Timespec, sys_close, sys_read,
     sys_timerfd_create, sys_timerfd_gettime, sys_timerfd_settime,
@@ -42,7 +43,7 @@ fn test_timerfd_create_monotonic() {
         return;
     }
 
-    println(b"TIMERFD_CREATE_MONOTONIC:OK");
+    pass(b"TIMERFD_CREATE_MONOTONIC");
 }
 
 /// Test timerfd_create with CLOCK_REALTIME
@@ -55,7 +56,7 @@ fn test_timerfd_create_realtime() {
     }
 
     sys_close(fd as u64);
-    println(b"TIMERFD_CREATE_REALTIME:OK");
+    pass(b"TIMERFD_CREATE_REALTIME");
 }
 
 /// Test timerfd_create with invalid clockid returns EINVAL
@@ -63,7 +64,7 @@ fn test_timerfd_create_invalid_clock() {
     let fd = sys_timerfd_create(99, 0); // Invalid clock ID
     if fd == -22 {
         // EINVAL
-        println(b"TIMERFD_CREATE_INVALID:OK");
+        pass(b"TIMERFD_CREATE_INVALID");
     } else {
         print(b"TIMERFD_CREATE_INVALID:FAIL: expected -22, got ");
         print_num(fd);
@@ -112,7 +113,7 @@ fn test_timerfd_settime_and_gettime() {
 
     // Remaining time should be > 0 and <= 1 second
     if curr_value.it_value.tv_sec >= 0 && curr_value.it_value.tv_sec <= 1 {
-        println(b"TIMERFD_SETTIME:OK");
+        pass(b"TIMERFD_SETTIME");
     } else {
         print(b"TIMERFD_SETTIME:FAIL: unexpected remaining time ");
         print_num(curr_value.it_value.tv_sec);
@@ -181,7 +182,7 @@ fn test_timerfd_disarm() {
             print(b"TIMERFD_DISARM:FAIL: gettime returned ");
             print_num(gettime_ret);
         } else if curr_value.it_value.tv_sec == 0 && curr_value.it_value.tv_nsec == 0 {
-            println(b"TIMERFD_DISARM:OK");
+            pass(b"TIMERFD_DISARM");
         } else {
             print(b"TIMERFD_DISARM:FAIL: curr_value.tv_sec=");
             print_num(curr_value.it_value.tv_sec);
@@ -224,7 +225,7 @@ fn test_timerfd_nonblock_eagain() {
 
     if ret == -11 {
         // EAGAIN
-        println(b"TIMERFD_NONBLOCK:OK");
+        pass(b"TIMERFD_NONBLOCK");
     } else {
         print(b"TIMERFD_NONBLOCK:FAIL: read returned ");
         print_num(ret);

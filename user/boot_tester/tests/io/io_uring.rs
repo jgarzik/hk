@@ -4,6 +4,7 @@
 //! - Phase 1: Core infrastructure
 //! - Phase 5: Poll and Timeout operations
 
+use crate::tests::harness::{fail_num, pass};
 use crate::tests::helpers::{print, print_num, println};
 use hk_syscall::{
     IORING_SETUP_CLAMP, IoUringParams, sys_close, sys_io_uring_enter, sys_io_uring_setup, sys_pipe2,
@@ -76,22 +77,18 @@ fn test_io_uring_setup_basic() {
     let mut params = IoUringParams::default();
     let fd = sys_io_uring_setup(8, &mut params as *mut IoUringParams);
     if fd < 0 {
-        print(b"IO_URING_SETUP:FAIL: returned ");
-        print_num(fd);
-        println(b"");
+        fail_num(b"IO_URING_SETUP:FAIL: returned ", fd);
         return;
     }
 
     // Close the fd
     let close_ret = sys_close(fd as u64);
     if close_ret != 0 {
-        print(b"IO_URING_SETUP:FAIL: close returned ");
-        print_num(close_ret);
-        println(b"");
+        fail_num(b"IO_URING_SETUP:FAIL: close returned ", close_ret);
         return;
     }
 
-    println(b"IO_URING_SETUP:OK");
+    pass(b"IO_URING_SETUP");
 }
 
 /// Test io_uring_setup rejects 0 entries
@@ -101,11 +98,9 @@ fn test_io_uring_setup_einval_zero() {
 
     // Should return -EINVAL (-22)
     if fd == -22 {
-        println(b"IO_URING_SETUP_EINVAL_ZERO:OK");
+        pass(b"IO_URING_SETUP_EINVAL_ZERO");
     } else {
-        print(b"IO_URING_SETUP_EINVAL_ZERO:FAIL: expected -22, got ");
-        print_num(fd);
-        println(b"");
+        fail_num(b"IO_URING_SETUP_EINVAL_ZERO:FAIL: expected -22, got ", fd);
         if fd >= 0 {
             sys_close(fd as u64);
         }
@@ -118,7 +113,7 @@ fn test_io_uring_setup_round_non_pow2() {
     let mut params = IoUringParams::default();
     let fd = sys_io_uring_setup(5, &mut params as *mut IoUringParams);
     if fd >= 0 && params.sq_entries == 8 && params.cq_entries == 16 {
-        println(b"IO_URING_SETUP_ROUND_POW2:OK");
+        pass(b"IO_URING_SETUP_ROUND_POW2");
     } else {
         print(b"IO_URING_SETUP_ROUND_POW2:FAIL: expected fd>=0 sq=8, got fd=");
         print_num(fd);
@@ -139,23 +134,22 @@ fn test_io_uring_setup_clamp() {
     // 5 should be rounded up to 8 with CLAMP flag
     let fd = sys_io_uring_setup(5, &mut params as *mut IoUringParams);
     if fd < 0 {
-        print(b"IO_URING_SETUP_CLAMP:FAIL: returned ");
-        print_num(fd);
-        println(b"");
+        fail_num(b"IO_URING_SETUP_CLAMP:FAIL: returned ", fd);
         return;
     }
 
     // Check that sq_entries was rounded up to 8
     if params.sq_entries != 8 {
-        print(b"IO_URING_SETUP_CLAMP:FAIL: sq_entries expected 8, got ");
-        print_num(params.sq_entries as i64);
-        println(b"");
+        fail_num(
+            b"IO_URING_SETUP_CLAMP:FAIL: sq_entries expected 8, got ",
+            params.sq_entries as i64,
+        );
         sys_close(fd as u64);
         return;
     }
 
     sys_close(fd as u64);
-    println(b"IO_URING_SETUP_CLAMP:OK");
+    pass(b"IO_URING_SETUP_CLAMP");
 }
 
 /// Test io_uring_setup fills in params correctly
@@ -163,26 +157,26 @@ fn test_io_uring_setup_params_filled() {
     let mut params = IoUringParams::default();
     let fd = sys_io_uring_setup(16, &mut params as *mut IoUringParams);
     if fd < 0 {
-        print(b"IO_URING_PARAMS:FAIL: setup returned ");
-        print_num(fd);
-        println(b"");
+        fail_num(b"IO_URING_PARAMS:FAIL: setup returned ", fd);
         return;
     }
 
     // Check sq_entries
     if params.sq_entries != 16 {
-        print(b"IO_URING_PARAMS:FAIL: sq_entries expected 16, got ");
-        print_num(params.sq_entries as i64);
-        println(b"");
+        fail_num(
+            b"IO_URING_PARAMS:FAIL: sq_entries expected 16, got ",
+            params.sq_entries as i64,
+        );
         sys_close(fd as u64);
         return;
     }
 
     // Check cq_entries (should be 2x sq_entries by default, capped at max)
     if params.cq_entries != 32 {
-        print(b"IO_URING_PARAMS:FAIL: cq_entries expected 32, got ");
-        print_num(params.cq_entries as i64);
-        println(b"");
+        fail_num(
+            b"IO_URING_PARAMS:FAIL: cq_entries expected 32, got ",
+            params.cq_entries as i64,
+        );
         sys_close(fd as u64);
         return;
     }
@@ -212,7 +206,7 @@ fn test_io_uring_setup_params_filled() {
     }
 
     sys_close(fd as u64);
-    println(b"IO_URING_PARAMS:OK");
+    pass(b"IO_URING_PARAMS");
 }
 
 // ===========================================================================
@@ -225,9 +219,7 @@ fn test_io_uring_poll_add() {
     let mut params = IoUringParams::default();
     let ring_fd = sys_io_uring_setup(8, &mut params as *mut IoUringParams);
     if ring_fd < 0 {
-        print(b"IO_URING_POLL_ADD:FAIL: setup returned ");
-        print_num(ring_fd);
-        println(b"");
+        fail_num(b"IO_URING_POLL_ADD:FAIL: setup returned ", ring_fd);
         return;
     }
 
@@ -235,9 +227,7 @@ fn test_io_uring_poll_add() {
     let mut pipefd = [0i32; 2];
     let pipe_ret = sys_pipe2(pipefd.as_mut_ptr(), 0);
     if pipe_ret < 0 {
-        print(b"IO_URING_POLL_ADD:FAIL: pipe2 returned ");
-        print_num(pipe_ret);
-        println(b"");
+        fail_num(b"IO_URING_POLL_ADD:FAIL: pipe2 returned ", pipe_ret);
         sys_close(ring_fd as u64);
         return;
     }
@@ -246,9 +236,7 @@ fn test_io_uring_poll_add() {
     let data = [b'X'; 1];
     let write_ret = hk_syscall::sys_write(pipefd[1] as u64, data.as_ptr(), 1);
     if write_ret != 1 {
-        print(b"IO_URING_POLL_ADD:FAIL: write returned ");
-        print_num(write_ret);
-        println(b"");
+        fail_num(b"IO_URING_POLL_ADD:FAIL: write returned ", write_ret);
         sys_close(pipefd[0] as u64);
         sys_close(pipefd[1] as u64);
         sys_close(ring_fd as u64);
@@ -260,9 +248,7 @@ fn test_io_uring_poll_add() {
     // This is a basic sanity test.
     let ret = sys_io_uring_enter(ring_fd as u32, 0, 0, 0, 0, 0);
     if ret < 0 {
-        print(b"IO_URING_POLL_ADD:FAIL: enter returned ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"IO_URING_POLL_ADD:FAIL: enter returned ", ret);
         sys_close(pipefd[0] as u64);
         sys_close(pipefd[1] as u64);
         sys_close(ring_fd as u64);
@@ -272,7 +258,7 @@ fn test_io_uring_poll_add() {
     sys_close(pipefd[0] as u64);
     sys_close(pipefd[1] as u64);
     sys_close(ring_fd as u64);
-    println(b"IO_URING_POLL_ADD:OK");
+    pass(b"IO_URING_POLL_ADD");
 }
 
 /// Test IORING_OP_TIMEOUT with zero timeout (immediate expiry)
@@ -281,24 +267,20 @@ fn test_io_uring_timeout() {
     let mut params = IoUringParams::default();
     let ring_fd = sys_io_uring_setup(8, &mut params as *mut IoUringParams);
     if ring_fd < 0 {
-        print(b"IO_URING_TIMEOUT:FAIL: setup returned ");
-        print_num(ring_fd);
-        println(b"");
+        fail_num(b"IO_URING_TIMEOUT:FAIL: setup returned ", ring_fd);
         return;
     }
 
     // Test basic enter call (we can't easily test actual timeout without mmap)
     let ret = sys_io_uring_enter(ring_fd as u32, 0, 0, 0, 0, 0);
     if ret < 0 {
-        print(b"IO_URING_TIMEOUT:FAIL: enter returned ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"IO_URING_TIMEOUT:FAIL: enter returned ", ret);
         sys_close(ring_fd as u64);
         return;
     }
 
     sys_close(ring_fd as u64);
-    println(b"IO_URING_TIMEOUT:OK");
+    pass(b"IO_URING_TIMEOUT");
 }
 
 /// Test IORING_OP_ASYNC_CANCEL (basic sanity test)
@@ -307,24 +289,20 @@ fn test_io_uring_async_cancel() {
     let mut params = IoUringParams::default();
     let ring_fd = sys_io_uring_setup(8, &mut params as *mut IoUringParams);
     if ring_fd < 0 {
-        print(b"IO_URING_ASYNC_CANCEL:FAIL: setup returned ");
-        print_num(ring_fd);
-        println(b"");
+        fail_num(b"IO_URING_ASYNC_CANCEL:FAIL: setup returned ", ring_fd);
         return;
     }
 
     // Test that io_uring_enter with no submissions works
     let ret = sys_io_uring_enter(ring_fd as u32, 0, 0, 0, 0, 0);
     if ret < 0 {
-        print(b"IO_URING_ASYNC_CANCEL:FAIL: enter returned ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"IO_URING_ASYNC_CANCEL:FAIL: enter returned ", ret);
         sys_close(ring_fd as u64);
         return;
     }
 
     sys_close(ring_fd as u64);
-    println(b"IO_URING_ASYNC_CANCEL:OK");
+    pass(b"IO_URING_ASYNC_CANCEL");
 }
 
 // ===========================================================================
@@ -337,9 +315,7 @@ fn test_io_uring_networking() {
     let mut params = IoUringParams::default();
     let ring_fd = sys_io_uring_setup(8, &mut params as *mut IoUringParams);
     if ring_fd < 0 {
-        print(b"IO_URING_NETWORKING:FAIL: setup returned ");
-        print_num(ring_fd);
-        println(b"");
+        fail_num(b"IO_URING_NETWORKING:FAIL: setup returned ", ring_fd);
         return;
     }
 
@@ -347,15 +323,13 @@ fn test_io_uring_networking() {
     // (Full networking tests would require mmap-based SQE submission with SEND/RECV/etc.)
     let ret = sys_io_uring_enter(ring_fd as u32, 0, 0, 0, 0, 0);
     if ret < 0 {
-        print(b"IO_URING_NETWORKING:FAIL: enter returned ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"IO_URING_NETWORKING:FAIL: enter returned ", ret);
         sys_close(ring_fd as u64);
         return;
     }
 
     sys_close(ring_fd as u64);
-    println(b"IO_URING_NETWORKING:OK");
+    pass(b"IO_URING_NETWORKING");
 }
 
 // ===========================================================================
@@ -368,9 +342,7 @@ fn test_io_uring_linking() {
     let mut params = IoUringParams::default();
     let ring_fd = sys_io_uring_setup(8, &mut params as *mut IoUringParams);
     if ring_fd < 0 {
-        print(b"IO_URING_LINKING:FAIL: setup returned ");
-        print_num(ring_fd);
-        println(b"");
+        fail_num(b"IO_URING_LINKING:FAIL: setup returned ", ring_fd);
         return;
     }
 
@@ -379,13 +351,11 @@ fn test_io_uring_linking() {
     // IOSQE_IO_LINK / IOSQE_IO_HARDLINK / IOSQE_IO_DRAIN flags)
     let ret = sys_io_uring_enter(ring_fd as u32, 0, 0, 0, 0, 0);
     if ret < 0 {
-        print(b"IO_URING_LINKING:FAIL: enter returned ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"IO_URING_LINKING:FAIL: enter returned ", ret);
         sys_close(ring_fd as u64);
         return;
     }
 
     sys_close(ring_fd as u64);
-    println(b"IO_URING_LINKING:OK");
+    pass(b"IO_URING_LINKING");
 }

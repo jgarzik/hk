@@ -12,6 +12,7 @@
 //!   restores it from the frame (an edit made by the handler takes effect).
 //!   On x86 the handler starts with the default MXCSR (0x1f80).
 
+use crate::tests::harness::{fail_num, pass};
 use crate::tests::helpers::{print, print_num, println};
 use hk_syscall::{
     SA_RESTORER, SA_SIGINFO, SIG_DFL, SIGUSR1, sys_close, sys_exit, sys_getpid, sys_pipe,
@@ -463,11 +464,11 @@ fn test_fpu_ctxsw() {
         255
     };
     if bad == 0 && child_bad == 0 {
-        println(b"FPU_CTXSW:OK");
+        pass(b"FPU_CTXSW");
         #[cfg(target_arch = "x86_64")]
         if avx_usable() {
             // The YMM upper halves were part of the round trips
-            println(b"FPU_CTXSW_AVX:OK");
+            pass(b"FPU_CTXSW_AVX");
         }
     } else {
         print(b"FPU_CTXSW:FAIL: parent reg ");
@@ -513,7 +514,7 @@ fn test_fpu_fork() {
         255
     };
     if bad.is_none() && child_bad == 0 {
-        println(b"FPU_FORK:OK");
+        pass(b"FPU_FORK");
     } else {
         print(b"FPU_FORK:FAIL: parent ");
         print_num(bad.map(|k| k as i64).unwrap_or(-1));
@@ -661,9 +662,7 @@ fn test_fpu_signal() {
         true
     };
     if r != 0 || seen != 1 {
-        print(b"FPU_SIGNAL:FAIL: handler not run, kill=");
-        print_num(r);
-        println(b"");
+        fail_num(b"FPU_SIGNAL:FAIL: handler not run, kill=", r);
     } else if let Some(k) = expect.diff(&out) {
         print(b"FPU_SIGNAL:FAIL: interrupted code reg ");
         print_num(k as i64);
@@ -671,14 +670,10 @@ fn test_fpu_signal() {
         print_num(ferr as i64);
         println(b"");
     } else if ferr != 0 {
-        print(b"FPU_SIGNAL:FAIL: frame FP record err ");
-        print_num(ferr as i64);
-        println(b"");
+        fail_num(b"FPU_SIGNAL:FAIL: frame FP record err ", ferr as i64);
     } else if !ctrl_ok {
-        print(b"FPU_SIGNAL:FAIL: handler MXCSR ");
-        print_num(hctrl as i64);
-        println(b"");
+        fail_num(b"FPU_SIGNAL:FAIL: handler MXCSR ", hctrl as i64);
     } else {
-        println(b"FPU_SIGNAL:OK");
+        pass(b"FPU_SIGNAL");
     }
 }

@@ -3,6 +3,7 @@
 //! MS_NOEXEC (execve EACCES), MS_NODEV (device open EACCES), statfs
 //! f_flags
 
+use crate::tests::harness::pass;
 use crate::tests::helpers::{print, print_num, println};
 use hk_syscall::{
     AT_FDCWD, LinuxStatFs, MAP_PRIVATE, O_CREAT, O_RDONLY, O_TRUNC, O_WRONLY, PROT_READ, sys_chmod,
@@ -376,7 +377,7 @@ fn test_eperm() {
     sys_wait4(pid, &mut st, 0, 0);
     sys_rmdir(b"/tmp/mnt_perm\0".as_ptr());
     if st == 0 {
-        println(b"MOUNT_EPERM:OK");
+        pass(b"MOUNT_EPERM");
     } else if st >> 8 == 90 {
         println(b"MOUNT_EPERM:FAIL setresuid");
     }

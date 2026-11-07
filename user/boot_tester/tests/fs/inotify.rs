@@ -6,6 +6,7 @@
 //! - Test inotify_rm_watch
 //! - Test inotify close
 
+use crate::tests::harness::pass;
 use crate::tests::helpers::{print, print_num, println};
 use hk_syscall::{IN_CLOEXEC, IN_CREATE, IN_DELETE, IN_MODIFY, IN_NONBLOCK};
 use hk_syscall::{sys_close, sys_inotify_add_watch, sys_inotify_init1, sys_inotify_rm_watch};
@@ -35,7 +36,7 @@ fn test_inotify_init1() {
         return;
     }
 
-    println(b"INOTIFY_INIT1:OK");
+    pass(b"INOTIFY_INIT1");
 }
 
 /// Test inotify_init1 with flags
@@ -75,7 +76,7 @@ fn test_inotify_init1_flags() {
         return;
     }
 
-    println(b"INOTIFY_INIT1_FLAGS:OK");
+    pass(b"INOTIFY_INIT1_FLAGS");
 }
 
 /// Test inotify_add_watch
@@ -106,7 +107,7 @@ fn test_inotify_add_watch() {
     }
 
     sys_close(fd as u64);
-    println(b"INOTIFY_ADD_WATCH:OK");
+    pass(b"INOTIFY_ADD_WATCH");
 }
 
 /// Test inotify_rm_watch
@@ -149,7 +150,7 @@ fn test_inotify_rm_watch() {
     }
 
     sys_close(fd as u64);
-    println(b"INOTIFY_RM_WATCH:OK");
+    pass(b"INOTIFY_RM_WATCH");
 }
 
 /// Test inotify operations with invalid fd
@@ -175,5 +176,5 @@ fn test_inotify_invalid_fd() {
         return;
     }
 
-    println(b"INOTIFY_INVALID_FD:OK");
+    pass(b"INOTIFY_INVALID_FD");
 }

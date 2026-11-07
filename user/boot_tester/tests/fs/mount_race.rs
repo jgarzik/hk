@@ -12,8 +12,7 @@
 
 use core::sync::atomic::{AtomicI32, Ordering};
 
-use crate::tests::harness::report_step;
-use crate::tests::helpers::{print, print_num, println};
+use crate::tests::harness::{fail_num, report_step};
 use hk_syscall::{
     LinuxStatFs, MAP_ANONYMOUS, MAP_SHARED, O_CREAT, O_WRONLY, PROT_READ, PROT_WRITE, sys_close,
     sys_exit, sys_fork, sys_mkdir, sys_mmap, sys_mount, sys_munmap, sys_open, sys_rmdir,
@@ -44,9 +43,7 @@ pub fn run_tests() {
         report_step(b"REMOUNT_RO_BUSY", remount_ro_busy());
         report_step(b"REMOUNT_RO_RACE", remount_ro_race());
     } else {
-        print(b"REMOUNT_RO_BUSY:FAIL mount got ");
-        print_num(m.min(b));
-        println(b"");
+        fail_num(b"REMOUNT_RO_BUSY:FAIL mount got ", m.min(b));
     }
     sys_umount2(B.as_ptr(), 0);
     sys_umount2(A.as_ptr(), 0);

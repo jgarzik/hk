@@ -31,7 +31,8 @@
 //! - SECCOMP_PATH_ENOMEM: 4096-instruction filters stack 7 deep; the
 //!   8th passes MAX_INSNS_PER_PATH and is ENOMEM
 
-use crate::tests::helpers::{print, print_num, println};
+use crate::tests::harness::fail_num;
+use crate::tests::helpers::{print, println};
 use crate::tests::mm::fork_mm::{join, spawn_thread};
 use crate::tests::signal::signals::restorer_addr;
 use core::sync::atomic::{AtomicI64, AtomicU32, Ordering};
@@ -131,9 +132,7 @@ fn report(name: &[u8], ok: bool, st: i32) {
     if ok {
         println(b":OK");
     } else {
-        print(b":FAIL status ");
-        print_num(st as i64);
-        println(b"");
+        fail_num(b":FAIL status ", st as i64);
     }
 }
 

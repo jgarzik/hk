@@ -16,7 +16,8 @@ pattern.
    numbering, no plan. 15 files still define their own `fn report(`, 6
    `fn verdict(`, 6 `fn check(` (bodies that differ), 5 a sleep helper, 6 a
    reap helper, 22 a thread-stack struct.
-   1373 hand-written `:FAIL` literals against 656 `:OK`. Near-identical tests
+   1399 `:FAIL` literals, 480 of them through `fail_num`, the rest hand-printed;
+   564 verdicts pass through `pass()`, 113 `:OK` literals remain. Near-identical tests
    (`process.rs` `test_getuid`/`geteuid`/`getgid`/`getegid`).
 2. **Pass/fail by substring.** `helpers.rs` counts a failure when printed bytes
    contain "FAIL"; the Makefile greps `FAIL|KERNEL PANIC`. No structured result, no
@@ -74,7 +75,7 @@ Not for long; diagnosis and iteration cost more than wall time.
 4. **Shards:** the full tier split across 2 to 4 parallel QEMU boots per arch,
    merged from KTAP (`tools/gate.sh` already runs boots in parallel).
 5. **Table-driven errno tests** (gVisor `test/syscalls`, LTP `*_errnos`): rows of
-   `(name, call, expected errno)` in place of most of the 1373 FAIL literals.
+   `(name, call, expected errno)` in place of most of the FAIL literals.
 6. **Keep the dual run**; with KTAP, `check-linux` can diff per-test results.
 7. **Complements, not more hand tests:** coverage (QEMU or kcov) to find dead and
    duplicate tests; later a syzkaller target for hk.

@@ -4,6 +4,7 @@
 //! - unshare(2) - create new namespace(s) for current process
 //! - setns(2) - join existing namespace via file descriptor
 
+use crate::tests::harness::{fail_num, pass};
 use crate::tests::helpers::{linux_at_least, print, print_num, println};
 use hk_syscall::{
     CLONE_NEWNET, CLONE_NEWNS, CLONE_NEWPID, CLONE_NEWUSER, CLONE_NEWUTS, O_CREAT, O_RDONLY,
@@ -46,9 +47,7 @@ fn in_child(name: &[u8], f: fn() -> i32) {
     }
     let mut ws: i32 = 0;
     if pid < 0 || sys_wait4(pid, &mut ws, 0, 0) != pid {
-        print(b":FAIL fork/wait ");
-        print_num(pid);
-        println(b"");
+        fail_num(b":FAIL fork/wait ", pid);
         return;
     }
     let st = (ws >> 8) & 0xff;
@@ -136,11 +135,9 @@ fn umount_rootfs() -> i32 {
 fn test_unshare_noop() {
     let ret = sys_unshare(0);
     if ret == 0 {
-        println(b"UNSHARE_NOOP:OK");
+        pass(b"UNSHARE_NOOP");
     } else {
-        print(b"UNSHARE_NOOP:FAIL ret=");
-        print_num(ret);
-        println(b"");
+        fail_num(b"UNSHARE_NOOP:FAIL ret=", ret);
     }
 }
 
@@ -148,9 +145,7 @@ fn test_unshare_noop() {
 fn test_unshare_newuts() {
     let pid = sys_fork();
     if pid < 0 {
-        print(b"UNSHARE_NEWUTS:FAIL fork failed ");
-        print_num(pid);
-        println(b"");
+        fail_num(b"UNSHARE_NEWUTS:FAIL fork failed ", pid);
         return;
     }
 
@@ -193,11 +188,9 @@ fn test_unshare_newuts() {
 
         let exit_status = (wstatus >> 8) & 0xff;
         if exit_status == 0 {
-            println(b"UNSHARE_NEWUTS:OK");
+            pass(b"UNSHARE_NEWUTS");
         } else {
-            print(b"UNSHARE_NEWUTS:FAIL exit_status=");
-            print_num(exit_status as i64);
-            println(b"");
+            fail_num(b"UNSHARE_NEWUTS:FAIL exit_status=", exit_status as i64);
         }
     }
 }
@@ -208,9 +201,7 @@ fn test_unshare_newnet() {
     // (otherwise subsequent tests lose network config)
     let pid = sys_fork();
     if pid < 0 {
-        print(b"UNSHARE_NEWNET:FAIL fork failed ");
-        print_num(pid);
-        println(b"");
+        fail_num(b"UNSHARE_NEWNET:FAIL fork failed ", pid);
         return;
     }
 
@@ -231,11 +222,9 @@ fn test_unshare_newnet() {
 
         let exit_status = (wstatus >> 8) & 0xff;
         if exit_status == 0 {
-            println(b"UNSHARE_NEWNET:OK");
+            pass(b"UNSHARE_NEWNET");
         } else {
-            print(b"UNSHARE_NEWNET:FAIL exit_status=");
-            print_num(exit_status as i64);
-            println(b"");
+            fail_num(b"UNSHARE_NEWNET:FAIL exit_status=", exit_status as i64);
         }
     }
 }
@@ -244,9 +233,7 @@ fn test_unshare_newnet() {
 fn test_unshare_newpid() {
     let pid = sys_fork();
     if pid < 0 {
-        print(b"UNSHARE_NEWPID:FAIL fork failed ");
-        print_num(pid);
-        println(b"");
+        fail_num(b"UNSHARE_NEWPID:FAIL fork failed ", pid);
         return;
     }
 
@@ -266,11 +253,9 @@ fn test_unshare_newpid() {
 
         let exit_status = (wstatus >> 8) & 0xff;
         if exit_status == 0 {
-            println(b"UNSHARE_NEWPID:OK");
+            pass(b"UNSHARE_NEWPID");
         } else {
-            print(b"UNSHARE_NEWPID:FAIL exit_status=");
-            print_num(exit_status as i64);
-            println(b"");
+            fail_num(b"UNSHARE_NEWPID:FAIL exit_status=", exit_status as i64);
         }
     }
 }
@@ -279,9 +264,7 @@ fn test_unshare_newpid() {
 fn test_unshare_newuser() {
     let pid = sys_fork();
     if pid < 0 {
-        print(b"UNSHARE_NEWUSER:FAIL fork failed ");
-        print_num(pid);
-        println(b"");
+        fail_num(b"UNSHARE_NEWUSER:FAIL fork failed ", pid);
         return;
     }
 
@@ -304,11 +287,9 @@ fn test_unshare_newuser() {
 
         let exit_status = (wstatus >> 8) & 0xff;
         if exit_status == 0 {
-            println(b"UNSHARE_NEWUSER:OK");
+            pass(b"UNSHARE_NEWUSER");
         } else {
-            print(b"UNSHARE_NEWUSER:FAIL exit_status=");
-            print_num(exit_status as i64);
-            println(b"");
+            fail_num(b"UNSHARE_NEWUSER:FAIL exit_status=", exit_status as i64);
         }
     }
 }
@@ -319,11 +300,9 @@ fn test_setns_ebadf() {
     let ret = sys_setns(9999, 0);
     if ret == -9 {
         // -EBADF
-        println(b"SETNS_EBADF:OK");
+        pass(b"SETNS_EBADF");
     } else {
-        print(b"SETNS_EBADF:FAIL ret=");
-        print_num(ret);
-        println(b"");
+        fail_num(b"SETNS_EBADF:FAIL ret=", ret);
     }
 }
 
@@ -405,9 +384,7 @@ fn test_setns_uts() {
     sys_close(fd as u64);
 
     if ret != 0 {
-        print(b"SETNS_UTS:FAIL setns ret=");
-        print_num(ret);
-        println(b"");
+        fail_num(b"SETNS_UTS:FAIL setns ret=", ret);
         return;
     }
 
@@ -424,7 +401,7 @@ fn test_setns_uts() {
     }
 
     if match_count == 10 {
-        println(b"SETNS_UTS:OK");
+        pass(b"SETNS_UTS");
     } else {
         print(b"SETNS_UTS:FAIL hostname changed after setns to self, before[0]=");
         print_num(uts_before.nodename[0] as i64);
@@ -438,9 +415,7 @@ fn test_setns_uts() {
 fn test_unshare_newns() {
     let pid = sys_fork();
     if pid < 0 {
-        print(b"UNSHARE_NEWNS:FAIL fork failed ");
-        print_num(pid);
-        println(b"");
+        fail_num(b"UNSHARE_NEWNS:FAIL fork failed ", pid);
         return;
     }
 
@@ -460,11 +435,9 @@ fn test_unshare_newns() {
 
         let exit_status = (wstatus >> 8) & 0xff;
         if exit_status == 0 {
-            println(b"UNSHARE_NEWNS:OK");
+            pass(b"UNSHARE_NEWNS");
         } else {
-            print(b"UNSHARE_NEWNS:FAIL exit_status=");
-            print_num(exit_status as i64);
-            println(b"");
+            fail_num(b"UNSHARE_NEWNS:FAIL exit_status=", exit_status as i64);
         }
     }
 }
@@ -477,11 +450,9 @@ fn test_pivot_root_enoent() {
     );
     if ret == -2 {
         // ENOENT
-        println(b"PIVOT_ROOT_ENOENT:OK");
+        pass(b"PIVOT_ROOT_ENOENT");
     } else {
-        print(b"PIVOT_ROOT_ENOENT:FAIL ret=");
-        print_num(ret);
-        println(b"");
+        fail_num(b"PIVOT_ROOT_ENOENT:FAIL ret=", ret);
     }
 }
 
@@ -491,11 +462,9 @@ fn test_pivot_root_enotdir() {
     let ret = sys_pivot_root(b"/dev/null\0".as_ptr(), b"/tmp\0".as_ptr());
     if ret == -20 {
         // ENOTDIR
-        println(b"PIVOT_ROOT_ENOTDIR:OK");
+        pass(b"PIVOT_ROOT_ENOTDIR");
     } else {
-        print(b"PIVOT_ROOT_ENOTDIR:FAIL ret=");
-        print_num(ret);
-        println(b"");
+        fail_num(b"PIVOT_ROOT_ENOTDIR:FAIL ret=", ret);
     }
 }
 
@@ -507,10 +476,8 @@ fn test_pivot_root_einval() {
     let ret = sys_pivot_root(b"/proc/sys\0".as_ptr(), b"/proc/sys\0".as_ptr());
     if ret == -22 {
         // EINVAL (not a mountpoint)
-        println(b"PIVOT_ROOT_EINVAL:OK");
+        pass(b"PIVOT_ROOT_EINVAL");
     } else {
-        print(b"PIVOT_ROOT_EINVAL:FAIL ret=");
-        print_num(ret);
-        println(b"");
+        fail_num(b"PIVOT_ROOT_EINVAL:FAIL ret=", ret);
     }
 }

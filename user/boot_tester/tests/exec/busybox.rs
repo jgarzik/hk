@@ -8,6 +8,7 @@
 //! unchanged on hk and on real Linux (tools/linux-boot-tester.sh), both
 //! architectures.
 
+use crate::tests::harness::fail_num;
 use crate::tests::helpers::{print, print_num, println, skip};
 use crate::tests::net::nl::{
     AF_INET, IFA_LOCAL, Nl, RT_TABLE_MAIN, RTA_GATEWAY, RTA_OIF, RTM_GETADDR, RTM_GETROUTE,
@@ -223,9 +224,7 @@ fn report(name: &[u8], pass: bool, r: &Run) {
         println(b":OK");
         return;
     }
-    print(b":FAIL status=");
-    print_num(r.status as i64);
-    println(b"");
+    fail_num(b":FAIL status=", r.status as i64);
     print(b"  output: ");
     println(r.output());
 }

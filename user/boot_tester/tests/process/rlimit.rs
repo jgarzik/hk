@@ -2,6 +2,7 @@
 //!
 //! Tests for getrlimit, setrlimit, and prlimit64 syscalls.
 
+use crate::tests::harness::{fail_num, pass};
 use crate::tests::helpers::{print, print_num, println};
 use core::ptr;
 use hk_syscall::{
@@ -34,9 +35,7 @@ fn test_getrlimit_basic() {
     let ret = sys_getrlimit(RLIMIT_NOFILE, &mut rlim);
 
     if ret != 0 {
-        print(b"GETRLIMIT_BASIC:FAIL ret=");
-        print_num(ret);
-        println(b"");
+        fail_num(b"GETRLIMIT_BASIC:FAIL ret=", ret);
         return;
     }
 
@@ -47,7 +46,7 @@ fn test_getrlimit_basic() {
         return;
     }
 
-    println(b"GETRLIMIT_BASIC:OK");
+    pass(b"GETRLIMIT_BASIC");
 }
 
 /// Test: getrlimit for all 16 resources should succeed
@@ -69,7 +68,7 @@ fn test_getrlimit_all_resources() {
         }
     }
 
-    println(b"GETRLIMIT_ALL:OK");
+    pass(b"GETRLIMIT_ALL");
 }
 
 /// Test: getrlimit with invalid resource returns EINVAL
@@ -84,11 +83,9 @@ fn test_getrlimit_einval() {
 
     if ret == -22 {
         // EINVAL
-        println(b"GETRLIMIT_EINVAL:OK");
+        pass(b"GETRLIMIT_EINVAL");
     } else {
-        print(b"GETRLIMIT_EINVAL:FAIL expected -22, got ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"GETRLIMIT_EINVAL:FAIL expected -22, got ", ret);
     }
 }
 
@@ -102,9 +99,7 @@ fn test_setrlimit_lower_soft() {
     // Get current limits
     let ret = sys_getrlimit(RLIMIT_NOFILE, &mut rlim);
     if ret != 0 {
-        print(b"SETRLIMIT_LOWER:FAIL getrlimit ret=");
-        print_num(ret);
-        println(b"");
+        fail_num(b"SETRLIMIT_LOWER:FAIL getrlimit ret=", ret);
         return;
     }
 
@@ -122,9 +117,7 @@ fn test_setrlimit_lower_soft() {
     let ret = sys_setrlimit(RLIMIT_NOFILE, &new_rlim);
 
     if ret != 0 {
-        print(b"SETRLIMIT_LOWER:FAIL setrlimit ret=");
-        print_num(ret);
-        println(b"");
+        fail_num(b"SETRLIMIT_LOWER:FAIL setrlimit ret=", ret);
         return;
     }
 
@@ -138,11 +131,9 @@ fn test_setrlimit_lower_soft() {
     if verify.rlim_cur == new_soft {
         // Restore original
         sys_setrlimit(RLIMIT_NOFILE, &rlim);
-        println(b"SETRLIMIT_LOWER:OK");
+        pass(b"SETRLIMIT_LOWER");
     } else {
-        print(b"SETRLIMIT_LOWER:FAIL verify cur=");
-        print_num(verify.rlim_cur as i64);
-        println(b"");
+        fail_num(b"SETRLIMIT_LOWER:FAIL verify cur=", verify.rlim_cur as i64);
     }
 }
 
@@ -156,9 +147,7 @@ fn test_setrlimit_raise_to_hard() {
     // Get current limits
     let ret = sys_getrlimit(RLIMIT_NOFILE, &mut rlim);
     if ret != 0 {
-        print(b"SETRLIMIT_RAISE:FAIL getrlimit ret=");
-        print_num(ret);
-        println(b"");
+        fail_num(b"SETRLIMIT_RAISE:FAIL getrlimit ret=", ret);
         return;
     }
 
@@ -172,9 +161,7 @@ fn test_setrlimit_raise_to_hard() {
     let ret = sys_setrlimit(RLIMIT_NOFILE, &new_rlim);
 
     if ret != 0 {
-        print(b"SETRLIMIT_RAISE:FAIL setrlimit ret=");
-        print_num(ret);
-        println(b"");
+        fail_num(b"SETRLIMIT_RAISE:FAIL setrlimit ret=", ret);
         return;
     }
 
@@ -185,7 +172,7 @@ fn test_setrlimit_raise_to_hard() {
     };
     sys_setrlimit(RLIMIT_NOFILE, &restore);
 
-    println(b"SETRLIMIT_RAISE:OK");
+    pass(b"SETRLIMIT_RAISE");
 }
 
 /// Test: setrlimit with cur > max returns EINVAL
@@ -198,11 +185,9 @@ fn test_setrlimit_einval_cur_gt_max() {
 
     if ret == -22 {
         // EINVAL
-        println(b"SETRLIMIT_EINVAL:OK");
+        pass(b"SETRLIMIT_EINVAL");
     } else {
-        print(b"SETRLIMIT_EINVAL:FAIL expected -22, got ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"SETRLIMIT_EINVAL:FAIL expected -22, got ", ret);
     }
 }
 
@@ -217,9 +202,7 @@ fn test_prlimit64_get_only() {
     let ret = sys_prlimit64(0, RLIMIT_STACK, ptr::null(), &mut old_rlim);
 
     if ret != 0 {
-        print(b"PRLIMIT64_GET:FAIL ret=");
-        print_num(ret);
-        println(b"");
+        fail_num(b"PRLIMIT64_GET:FAIL ret=", ret);
         return;
     }
 
@@ -230,7 +213,7 @@ fn test_prlimit64_get_only() {
         return;
     }
 
-    println(b"PRLIMIT64_GET:OK");
+    pass(b"PRLIMIT64_GET");
 }
 
 /// Test: prlimit64 with only new_rlim (set only)
@@ -257,9 +240,7 @@ fn test_prlimit64_set_only() {
     let ret = sys_prlimit64(0, RLIMIT_MEMLOCK, &new_rlim, ptr::null_mut());
 
     if ret != 0 {
-        print(b"PRLIMIT64_SET:FAIL ret=");
-        print_num(ret);
-        println(b"");
+        fail_num(b"PRLIMIT64_SET:FAIL ret=", ret);
         // Restore
         sys_prlimit64(0, RLIMIT_MEMLOCK, &old_rlim, ptr::null_mut());
         return;
@@ -275,11 +256,9 @@ fn test_prlimit64_set_only() {
     if verify.rlim_cur == new_soft {
         // Restore
         sys_prlimit64(0, RLIMIT_MEMLOCK, &old_rlim, ptr::null_mut());
-        println(b"PRLIMIT64_SET:OK");
+        pass(b"PRLIMIT64_SET");
     } else {
-        print(b"PRLIMIT64_SET:FAIL verify cur=");
-        print_num(verify.rlim_cur as i64);
-        println(b"");
+        fail_num(b"PRLIMIT64_SET:FAIL verify cur=", verify.rlim_cur as i64);
     }
 }
 
@@ -310,9 +289,7 @@ fn test_prlimit64_get_and_set() {
     let ret = sys_prlimit64(0, RLIMIT_NOFILE, &new_rlim, &mut old_rlim);
 
     if ret != 0 {
-        print(b"PRLIMIT64_BOTH:FAIL ret=");
-        print_num(ret);
-        println(b"");
+        fail_num(b"PRLIMIT64_BOTH:FAIL ret=", ret);
         return;
     }
 
@@ -327,7 +304,7 @@ fn test_prlimit64_get_and_set() {
 
     // Restore and verify
     sys_prlimit64(0, RLIMIT_NOFILE, &orig_rlim, ptr::null_mut());
-    println(b"PRLIMIT64_BOTH:OK");
+    pass(b"PRLIMIT64_BOTH");
 }
 
 /// Test: prlimit64 with pid=0 targets current process
@@ -358,7 +335,7 @@ fn test_prlimit64_self_pid_zero() {
 
     // Both should return the same values
     if rlim0.rlim_cur == rlim1.rlim_cur && rlim0.rlim_max == rlim1.rlim_max {
-        println(b"PRLIMIT64_SELF:OK");
+        pass(b"PRLIMIT64_SELF");
     } else {
         print(b"PRLIMIT64_SELF:FAIL values differ");
         println(b"");

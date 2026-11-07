@@ -9,6 +9,7 @@
 //! - Test eventfd poll
 //! - Blocking read woken by a write; blocking write woken by a read
 
+use crate::tests::harness::pass;
 use crate::tests::helpers::{print, print_num, println};
 use hk_syscall::{
     EFD_NONBLOCK, EFD_SEMAPHORE, POLLIN, PollFd, Timespec, sys_close, sys_eventfd2, sys_exit,
@@ -43,7 +44,7 @@ fn test_eventfd_create() {
         return;
     }
 
-    println(b"EVENTFD_CREATE:OK");
+    pass(b"EVENTFD_CREATE");
 }
 
 /// Test eventfd read/write with initial value
@@ -103,7 +104,7 @@ fn test_eventfd_read_write() {
     }
 
     sys_close(fd as u64);
-    println(b"EVENTFD_RW:OK");
+    pass(b"EVENTFD_RW");
 }
 
 /// Test eventfd counter accumulation (multiple writes add up)
@@ -147,7 +148,7 @@ fn test_eventfd_counter_add() {
     }
 
     sys_close(fd as u64);
-    println(b"EVENTFD_ADD:OK");
+    pass(b"EVENTFD_ADD");
 }
 
 /// Test eventfd semaphore mode (read returns 1, decrements by 1)
@@ -212,7 +213,7 @@ fn test_eventfd_semaphore() {
     }
 
     sys_close(fd as u64);
-    println(b"EVENTFD_SEM:OK");
+    pass(b"EVENTFD_SEM");
 }
 
 /// Test eventfd with EFD_NONBLOCK returns EAGAIN when empty
@@ -230,7 +231,7 @@ fn test_eventfd_nonblock() {
 
     if ret == -11 {
         // EAGAIN
-        println(b"EVENTFD_NONBLOCK:OK");
+        pass(b"EVENTFD_NONBLOCK");
     } else {
         print(b"EVENTFD_NONBLOCK:FAIL: read returned ");
         print_num(ret);
@@ -287,7 +288,7 @@ fn test_eventfd_poll() {
     }
 
     sys_close(fd as u64);
-    println(b"EVENTFD_POLL:OK");
+    pass(b"EVENTFD_POLL");
 }
 
 /// A child that sleeps 20 ms, then runs `f` on `fd` and exits 0 if it
@@ -321,7 +322,7 @@ fn test_eventfd_block_read() {
     let ok = reaped_ok(pid);
     sys_close(fd as u64);
     if ret == 8 && u64::from_ne_bytes(buf) == 5 && ok {
-        println(b"EVENTFD_BLOCK_READ:OK");
+        pass(b"EVENTFD_BLOCK_READ");
     } else {
         print(b"EVENTFD_BLOCK_READ:FAIL: read returned ");
         print_num(ret);
@@ -348,7 +349,7 @@ fn test_eventfd_block_write() {
     let got = sys_read(fd as u64, buf.as_mut_ptr(), 8);
     sys_close(fd as u64);
     if ret == 8 && ok && got == 8 && u64::from_ne_bytes(buf) == 3 {
-        println(b"EVENTFD_BLOCK_WRITE:OK");
+        pass(b"EVENTFD_BLOCK_WRITE");
     } else {
         print(b"EVENTFD_BLOCK_WRITE:FAIL: write returned ");
         print_num(ret);

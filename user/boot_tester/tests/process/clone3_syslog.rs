@@ -6,6 +6,7 @@
 //! - Test: clone3() - modern extensible clone (basic validation only)
 //! - Test: clone3() - a struct larger than the kernel's: zero tail ok, else E2BIG
 
+use crate::tests::harness::pass;
 use crate::tests::helpers::{print, print_num, println};
 use hk_syscall::{
     PER_LINUX, PERSONALITY_QUERY, SYSLOG_ACTION_CLOSE, SYSLOG_ACTION_CONSOLE_LEVEL,
@@ -30,7 +31,7 @@ fn test_personality_query() {
     let ret = sys_personality(PERSONALITY_QUERY);
 
     if ret >= 0 {
-        println(b"PERSONALITY_QUERY:OK");
+        pass(b"PERSONALITY_QUERY");
     } else {
         print(b"PERSONALITY_QUERY:FAIL: returned ");
         print_num(ret);
@@ -58,7 +59,7 @@ fn test_personality_set() {
     // Verify it's set
     let new = sys_personality(PERSONALITY_QUERY);
     if new == PER_LINUX as i64 {
-        println(b"PERSONALITY_SET:OK");
+        pass(b"PERSONALITY_SET");
     } else {
         print(b"PERSONALITY_SET:FAIL: new personality is ");
         print_num(new);
@@ -83,14 +84,14 @@ fn test_syslog_open_close() {
         return;
     }
 
-    println(b"SYSLOG_OPEN_CLOSE:OK");
+    pass(b"SYSLOG_OPEN_CLOSE");
 }
 
 /// Test: syslog() - get log buffer size
 fn test_syslog_size_buffer() {
     let ret = sys_syslog(SYSLOG_ACTION_SIZE_BUFFER, core::ptr::null_mut(), 0);
     if ret >= 0 {
-        println(b"SYSLOG_SIZE_BUFFER:OK");
+        pass(b"SYSLOG_SIZE_BUFFER");
     } else {
         print(b"SYSLOG_SIZE_BUFFER:FAIL: returned ");
         print_num(ret);
@@ -102,7 +103,7 @@ fn test_syslog_console_level() {
     // Set level to 4 (warning)
     let ret = sys_syslog(SYSLOG_ACTION_CONSOLE_LEVEL, core::ptr::null_mut(), 4);
     if ret >= 0 {
-        println(b"SYSLOG_CONSOLE_LEVEL:OK");
+        pass(b"SYSLOG_CONSOLE_LEVEL");
     } else {
         print(b"SYSLOG_CONSOLE_LEVEL:FAIL: returned ");
         print_num(ret);
@@ -114,7 +115,7 @@ fn test_syslog_invalid_type() {
     let ret = sys_syslog(99, core::ptr::null_mut(), 0);
     if ret == -22 {
         // EINVAL
-        println(b"SYSLOG_EINVAL:OK");
+        pass(b"SYSLOG_EINVAL");
     } else {
         print(b"SYSLOG_EINVAL:FAIL: expected -22 (EINVAL), got ");
         print_num(ret);
@@ -146,7 +147,7 @@ fn test_clone3_big_struct() {
         sys_exit(0);
     }
     if zero_tail_ok && tail == -7 && big == -7 {
-        println(b"CLONE3_BIG_STRUCT:OK");
+        pass(b"CLONE3_BIG_STRUCT");
     } else {
         print(b"CLONE3_BIG_STRUCT:FAIL: zero tail ");
         print_num(pid);

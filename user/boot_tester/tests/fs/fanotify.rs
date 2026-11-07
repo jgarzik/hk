@@ -6,7 +6,8 @@
 //! - Test fanotify_mark operations
 //! - Test invalid fd handling
 
-use crate::tests::helpers::{print, print_num, println};
+use crate::tests::harness::{fail_num, pass};
+use crate::tests::helpers::println;
 use hk_syscall::{
     FAN_CLOEXEC, FAN_MARK_ADD, FAN_NONBLOCK, FAN_OPEN, O_RDONLY, sys_close, sys_fanotify_init,
     sys_fanotify_mark,
@@ -28,21 +29,17 @@ pub fn run_tests() {
 fn test_fanotify_init() {
     let fd = sys_fanotify_init(0, O_RDONLY as u32);
     if fd < 0 {
-        print(b"FANOTIFY_INIT:FAIL: returned ");
-        print_num(fd);
-        println(b"");
+        fail_num(b"FANOTIFY_INIT:FAIL: returned ", fd);
         return;
     }
 
     let close_ret = sys_close(fd as u64);
     if close_ret != 0 {
-        print(b"FANOTIFY_INIT:FAIL: close returned ");
-        print_num(close_ret);
-        println(b"");
+        fail_num(b"FANOTIFY_INIT:FAIL: close returned ", close_ret);
         return;
     }
 
-    println(b"FANOTIFY_INIT:OK");
+    pass(b"FANOTIFY_INIT");
 }
 
 /// Test fanotify_init with flags
@@ -50,9 +47,7 @@ fn test_fanotify_init_flags() {
     // Test with FAN_NONBLOCK
     let fd = sys_fanotify_init(FAN_NONBLOCK, O_RDONLY as u32);
     if fd < 0 {
-        print(b"FANOTIFY_INIT_FLAGS:FAIL: NONBLOCK returned ");
-        print_num(fd);
-        println(b"");
+        fail_num(b"FANOTIFY_INIT_FLAGS:FAIL: NONBLOCK returned ", fd);
         return;
     }
     sys_close(fd as u64);
@@ -60,9 +55,7 @@ fn test_fanotify_init_flags() {
     // Test with FAN_CLOEXEC
     let fd = sys_fanotify_init(FAN_CLOEXEC, O_RDONLY as u32);
     if fd < 0 {
-        print(b"FANOTIFY_INIT_FLAGS:FAIL: CLOEXEC returned ");
-        print_num(fd);
-        println(b"");
+        fail_num(b"FANOTIFY_INIT_FLAGS:FAIL: CLOEXEC returned ", fd);
         return;
     }
     sys_close(fd as u64);
@@ -70,23 +63,19 @@ fn test_fanotify_init_flags() {
     // Test with both flags
     let fd = sys_fanotify_init(FAN_NONBLOCK | FAN_CLOEXEC, O_RDONLY as u32);
     if fd < 0 {
-        print(b"FANOTIFY_INIT_FLAGS:FAIL: both flags returned ");
-        print_num(fd);
-        println(b"");
+        fail_num(b"FANOTIFY_INIT_FLAGS:FAIL: both flags returned ", fd);
         return;
     }
     sys_close(fd as u64);
 
-    println(b"FANOTIFY_INIT_FLAGS:OK");
+    pass(b"FANOTIFY_INIT_FLAGS");
 }
 
 /// Test fanotify_mark on an inode
 fn test_fanotify_mark_inode() {
     let fd = sys_fanotify_init(0, O_RDONLY as u32);
     if fd < 0 {
-        print(b"FANOTIFY_MARK_INODE:FAIL: init returned ");
-        print_num(fd);
-        println(b"");
+        fail_num(b"FANOTIFY_MARK_INODE:FAIL: init returned ", fd);
         return;
     }
 
@@ -94,15 +83,13 @@ fn test_fanotify_mark_inode() {
     let path = b"/tmp\0";
     let ret = sys_fanotify_mark(fd as i32, FAN_MARK_ADD, FAN_OPEN, AT_FDCWD, path.as_ptr());
     if ret < 0 {
-        print(b"FANOTIFY_MARK_INODE:FAIL: mark returned ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"FANOTIFY_MARK_INODE:FAIL: mark returned ", ret);
         sys_close(fd as u64);
         return;
     }
 
     sys_close(fd as u64);
-    println(b"FANOTIFY_MARK_INODE:OK");
+    pass(b"FANOTIFY_MARK_INODE");
 }
 
 /// Test fanotify_mark with invalid fd
@@ -111,13 +98,14 @@ fn test_fanotify_mark_invalid_fd() {
     let ret = sys_fanotify_mark(9999, FAN_MARK_ADD, FAN_OPEN, AT_FDCWD, path.as_ptr());
     if ret != -9 {
         // EBADF
-        print(b"FANOTIFY_MARK_INVALID_FD:FAIL: expected -9 (EBADF), got ");
-        print_num(ret);
-        println(b"");
+        fail_num(
+            b"FANOTIFY_MARK_INVALID_FD:FAIL: expected -9 (EBADF), got ",
+            ret,
+        );
         return;
     }
 
-    println(b"FANOTIFY_MARK_INVALID_FD:OK");
+    pass(b"FANOTIFY_MARK_INVALID_FD");
 }
 
 /// Test fanotify_init with invalid flags
@@ -132,11 +120,12 @@ fn test_fanotify_init_invalid_flags() {
 
     // Should return EINVAL (-22)
     if fd != -22 {
-        print(b"FANOTIFY_INIT_INVALID:FAIL: expected -22 (EINVAL), got ");
-        print_num(fd);
-        println(b"");
+        fail_num(
+            b"FANOTIFY_INIT_INVALID:FAIL: expected -22 (EINVAL), got ",
+            fd,
+        );
         return;
     }
 
-    println(b"FANOTIFY_INIT_INVALID:OK");
+    pass(b"FANOTIFY_INIT_INVALID");
 }

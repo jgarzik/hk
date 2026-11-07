@@ -10,7 +10,8 @@
 //! - TTY_POLL_IDLE: poll of the idle serial tty reports no input
 //! - TTY_READ_EINTR: a blocking read sleeps until a signal (EINTR)
 
-use crate::tests::helpers::{host_mode, print, print_num, println, skip};
+use crate::tests::harness::{fail_num, pass};
+use crate::tests::helpers::{host_mode, print, println, skip};
 use crate::tests::io::nonblock::{on_sig, sigaction};
 use hk_syscall::{
     ITimerVal, O_NONBLOCK, O_RDWR, POLLIN, PollFd, SIG_DFL, Timeval, sys_close, sys_exit, sys_fork,
@@ -50,9 +51,7 @@ fn report(name: &[u8], ok: bool, got: i64) {
     if ok {
         println(b":OK");
     } else {
-        print(b":FAIL: got ");
-        print_num(got);
-        println(b"");
+        fail_num(b":FAIL: got ", got);
     }
 }
 
@@ -159,11 +158,9 @@ fn test_vhangup() {
     let ret = sys_vhangup();
 
     if ret == 0 {
-        println(b"VHANGUP:OK");
+        pass(b"VHANGUP");
     } else {
-        print(b"VHANGUP:FAIL: returned ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"VHANGUP:FAIL: returned ", ret);
     }
 }
 

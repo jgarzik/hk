@@ -11,6 +11,7 @@
 //! - Test pidfd_getfd to get own fd via pidfd
 //! - Test pidfd_getfd with invalid flags returns EINVAL
 
+use crate::tests::harness::{fail_num, pass};
 use crate::tests::helpers::{print, print_num, println};
 use hk_syscall::{
     P_PIDFD, POLLIN, PollFd, SigInfo, WEXITED, sys_close, sys_fork, sys_getpid, sys_open,
@@ -37,21 +38,17 @@ fn test_pidfd_open_self() {
     let fd = sys_pidfd_open(pid as i32, 0);
 
     if fd < 0 {
-        print(b"PIDFD_OPEN_SELF:FAIL: returned ");
-        print_num(fd);
-        println(b"");
+        fail_num(b"PIDFD_OPEN_SELF:FAIL: returned ", fd);
         return;
     }
 
     let close_ret = sys_close(fd as u64);
     if close_ret != 0 {
-        print(b"PIDFD_OPEN_SELF:FAIL: close returned ");
-        print_num(close_ret);
-        println(b"");
+        fail_num(b"PIDFD_OPEN_SELF:FAIL: close returned ", close_ret);
         return;
     }
 
-    println(b"PIDFD_OPEN_SELF:OK");
+    pass(b"PIDFD_OPEN_SELF");
 }
 
 /// Test pidfd_open with invalid (nonexistent) pid returns ESRCH (-3)
@@ -60,11 +57,9 @@ fn test_pidfd_open_invalid_pid() {
 
     if fd == -3 {
         // ESRCH
-        println(b"PIDFD_OPEN_INVALID:OK");
+        pass(b"PIDFD_OPEN_INVALID");
     } else {
-        print(b"PIDFD_OPEN_INVALID:FAIL: expected -3 (ESRCH), got ");
-        print_num(fd);
-        println(b"");
+        fail_num(b"PIDFD_OPEN_INVALID:FAIL: expected -3 (ESRCH), got ", fd);
         if fd >= 0 {
             sys_close(fd as u64);
         }
@@ -79,11 +74,9 @@ fn test_pidfd_open_invalid_flags() {
 
     if fd == -22 {
         // EINVAL
-        println(b"PIDFD_OPEN_FLAGS:OK");
+        pass(b"PIDFD_OPEN_FLAGS");
     } else {
-        print(b"PIDFD_OPEN_FLAGS:FAIL: expected -22 (EINVAL), got ");
-        print_num(fd);
-        println(b"");
+        fail_num(b"PIDFD_OPEN_FLAGS:FAIL: expected -22 (EINVAL), got ", fd);
         if fd >= 0 {
             sys_close(fd as u64);
         }
@@ -95,24 +88,20 @@ fn test_pidfd_send_signal() {
     let pid = sys_getpid();
     let fd = sys_pidfd_open(pid as i32, 0);
     if fd < 0 {
-        print(b"PIDFD_SIGNAL:FAIL: pidfd_open returned ");
-        print_num(fd);
-        println(b"");
+        fail_num(b"PIDFD_SIGNAL:FAIL: pidfd_open returned ", fd);
         return;
     }
 
     // Send signal 0 (null signal - just checks permissions)
     let ret = sys_pidfd_send_signal(fd as i32, 0, core::ptr::null(), 0);
     if ret != 0 {
-        print(b"PIDFD_SIGNAL:FAIL: pidfd_send_signal returned ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"PIDFD_SIGNAL:FAIL: pidfd_send_signal returned ", ret);
         sys_close(fd as u64);
         return;
     }
 
     sys_close(fd as u64);
-    println(b"PIDFD_SIGNAL:OK");
+    pass(b"PIDFD_SIGNAL");
 }
 
 /// Test pidfd poll returns POLLIN when process exits
@@ -120,9 +109,7 @@ fn test_pidfd_poll_exit() {
     // Fork a child that will exit immediately
     let fork_ret = sys_fork();
     if fork_ret < 0 {
-        print(b"PIDFD_POLL:FAIL: fork returned ");
-        print_num(fork_ret);
-        println(b"");
+        fail_num(b"PIDFD_POLL:FAIL: fork returned ", fork_ret);
         return;
     }
 
@@ -135,9 +122,7 @@ fn test_pidfd_poll_exit() {
     let child_pid = fork_ret;
     let pidfd = sys_pidfd_open(child_pid as i32, 0);
     if pidfd < 0 {
-        print(b"PIDFD_POLL:FAIL: pidfd_open returned ");
-        print_num(pidfd);
-        println(b"");
+        fail_num(b"PIDFD_POLL:FAIL: pidfd_open returned ", pidfd);
         // Reap the child
         sys_wait4(-1, core::ptr::null_mut(), 0, 0);
         return;
@@ -152,9 +137,7 @@ fn test_pidfd_poll_exit() {
 
     let ret = sys_poll(fds.as_mut_ptr(), 1, 1000); // 1 second timeout
     if ret < 0 {
-        print(b"PIDFD_POLL:FAIL: poll returned ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"PIDFD_POLL:FAIL: poll returned ", ret);
         sys_close(pidfd as u64);
         sys_wait4(-1, core::ptr::null_mut(), 0, 0);
         return;
@@ -168,9 +151,10 @@ fn test_pidfd_poll_exit() {
     }
 
     if fds[0].revents & POLLIN == 0 {
-        print(b"PIDFD_POLL:FAIL: POLLIN not set, revents=");
-        print_num(fds[0].revents as i64);
-        println(b"");
+        fail_num(
+            b"PIDFD_POLL:FAIL: POLLIN not set, revents=",
+            fds[0].revents as i64,
+        );
         sys_close(pidfd as u64);
         sys_wait4(-1, core::ptr::null_mut(), 0, 0);
         return;
@@ -179,7 +163,7 @@ fn test_pidfd_poll_exit() {
     sys_close(pidfd as u64);
     // Reap the child
     sys_wait4(-1, core::ptr::null_mut(), 0, 0);
-    println(b"PIDFD_POLL:OK");
+    pass(b"PIDFD_POLL");
 }
 
 /// Test that /proc/<pid>/fdinfo/<pidfd> contains "Pid:" line for pidfds
@@ -187,9 +171,7 @@ fn test_pidfd_fdinfo() {
     let pid = sys_getpid();
     let pidfd = sys_pidfd_open(pid as i32, 0);
     if pidfd < 0 {
-        print(b"PIDFD_FDINFO:FAIL: pidfd_open returned ");
-        print_num(pidfd);
-        println(b"");
+        fail_num(b"PIDFD_FDINFO:FAIL: pidfd_open returned ", pidfd);
         return;
     }
 
@@ -219,9 +201,7 @@ fn test_pidfd_fdinfo() {
     // Open and read the fdinfo file
     let fd = sys_open(path.as_ptr(), 0, 0);
     if fd < 0 {
-        print(b"PIDFD_FDINFO:FAIL: open returned ");
-        print_num(fd);
-        println(b"");
+        fail_num(b"PIDFD_FDINFO:FAIL: open returned ", fd);
         sys_close(pidfd as u64);
         return;
     }
@@ -231,9 +211,7 @@ fn test_pidfd_fdinfo() {
     sys_close(fd as u64);
 
     if bytes_read < 0 {
-        print(b"PIDFD_FDINFO:FAIL: read returned ");
-        print_num(bytes_read);
-        println(b"");
+        fail_num(b"PIDFD_FDINFO:FAIL: read returned ", bytes_read);
         sys_close(pidfd as u64);
         return;
     }
@@ -246,7 +224,7 @@ fn test_pidfd_fdinfo() {
     sys_close(pidfd as u64);
 
     if found {
-        println(b"PIDFD_FDINFO:OK");
+        pass(b"PIDFD_FDINFO");
     } else {
         println(b"PIDFD_FDINFO:FAIL: Pid: line not found in fdinfo");
     }
@@ -257,9 +235,7 @@ fn test_waitid_p_pidfd() {
     // Fork a child that will exit
     let fork_ret = sys_fork();
     if fork_ret < 0 {
-        print(b"WAITID_PIDFD:FAIL: fork returned ");
-        print_num(fork_ret);
-        println(b"");
+        fail_num(b"WAITID_PIDFD:FAIL: fork returned ", fork_ret);
         return;
     }
 
@@ -272,9 +248,7 @@ fn test_waitid_p_pidfd() {
     let child_pid = fork_ret;
     let pidfd = sys_pidfd_open(child_pid as i32, 0);
     if pidfd < 0 {
-        print(b"WAITID_PIDFD:FAIL: pidfd_open returned ");
-        print_num(pidfd);
-        println(b"");
+        fail_num(b"WAITID_PIDFD:FAIL: pidfd_open returned ", pidfd);
         // Reap the child with wait4 as fallback
         sys_wait4(-1, core::ptr::null_mut(), 0, 0);
         return;
@@ -296,9 +270,7 @@ fn test_waitid_p_pidfd() {
     sys_close(pidfd as u64);
 
     if ret < 0 {
-        print(b"WAITID_PIDFD:FAIL: waitid returned ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"WAITID_PIDFD:FAIL: waitid returned ", ret);
         // Try to reap with wait4 as fallback
         sys_wait4(-1, core::ptr::null_mut(), 0, 0);
         return;
@@ -314,7 +286,7 @@ fn test_waitid_p_pidfd() {
         return;
     }
 
-    println(b"WAITID_PIDFD:OK");
+    pass(b"WAITID_PIDFD");
 }
 
 // Helper: write a number to a buffer as ASCII digits, return new position
@@ -373,9 +345,7 @@ fn test_pidfd_getfd_self() {
     let pidfd = sys_pidfd_open(pid as i32, 0);
 
     if pidfd < 0 {
-        print(b"PIDFD_GETFD_SELF:FAIL: pidfd_open returned ");
-        print_num(pidfd);
-        println(b"");
+        fail_num(b"PIDFD_GETFD_SELF:FAIL: pidfd_open returned ", pidfd);
         return;
     }
 
@@ -386,16 +356,14 @@ fn test_pidfd_getfd_self() {
     let _ = sys_close(pidfd as u64);
 
     if new_fd < 0 {
-        print(b"PIDFD_GETFD_SELF:FAIL: pidfd_getfd returned ");
-        print_num(new_fd);
-        println(b"");
+        fail_num(b"PIDFD_GETFD_SELF:FAIL: pidfd_getfd returned ", new_fd);
         return;
     }
 
     // Close the duplicated fd
     let _ = sys_close(new_fd as u64);
 
-    println(b"PIDFD_GETFD_SELF:OK");
+    pass(b"PIDFD_GETFD_SELF");
 }
 
 /// Test pidfd_getfd with invalid flags returns EINVAL
@@ -415,10 +383,8 @@ fn test_pidfd_getfd_invalid_flags() {
 
     if ret == -22 {
         // EINVAL
-        println(b"PIDFD_GETFD_FLAGS:OK");
+        pass(b"PIDFD_GETFD_FLAGS");
     } else {
-        print(b"PIDFD_GETFD_FLAGS:FAIL: expected -22, got ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"PIDFD_GETFD_FLAGS:FAIL: expected -22, got ", ret);
     }
 }

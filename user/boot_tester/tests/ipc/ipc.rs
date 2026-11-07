@@ -7,6 +7,7 @@
 //! - SysV semaphores (semget, semop, semctl)
 //! - SysV message queues (msgget, msgsnd, msgrcv, msgctl)
 
+use crate::tests::harness::pass;
 use crate::tests::helpers::{print, print_num, println};
 use hk_syscall::{
     FdSet, GETALL, GETVAL, IPC_CREAT, IPC_PRIVATE, IPC_RMID, IPC_STAT, IoVec, O_NONBLOCK, O_RDONLY,
@@ -85,7 +86,7 @@ fn test_pipe_basic() {
         // Clean up
         sys_close(pipefd[0] as u64);
         sys_close(pipefd[1] as u64);
-        println(b"PIPE_CREATE:OK");
+        pass(b"PIPE_CREATE");
     } else {
         println(b"PIPE_CREATE:FAIL");
     }
@@ -141,7 +142,7 @@ fn test_pipe_read_write() {
     sys_close(write_fd as u64);
 
     if matches {
-        println(b"PIPE_RW:OK");
+        pass(b"PIPE_RW");
     } else {
         println(b"PIPE_RW:FAIL");
     }
@@ -172,7 +173,7 @@ fn test_pipe_read_edges() {
     print_num(got);
     println(b"");
     if zero == 0 && wrote == 3 && fault == -14 && got == 3 && &buf[..3] == b"abc" {
-        println(b"PIPE_READ_EDGES:OK");
+        pass(b"PIPE_READ_EDGES");
     } else {
         println(b"PIPE_READ_EDGES:FAIL");
     }
@@ -208,7 +209,7 @@ fn test_poll_data_ready() {
 
     // Should return 1 (one fd ready) with POLLIN set
     if ret == 1 && (fds[0].revents & POLLIN) != 0 {
-        println(b"POLL_DATA:OK");
+        pass(b"POLL_DATA");
     } else {
         println(b"POLL_DATA:FAIL");
     }
@@ -241,7 +242,7 @@ fn test_poll_no_data() {
 
     // Should return 0 (no fds ready, timeout)
     if ret == 0 {
-        println(b"POLL_TIMEOUT:OK");
+        pass(b"POLL_TIMEOUT");
     } else {
         println(b"POLL_TIMEOUT:FAIL");
     }
@@ -260,7 +261,7 @@ fn test_poll_invalid_fd() {
 
     // poll() should return 1 with POLLNVAL set in revents (not EBADF)
     if ret == 1 && (fds[0].revents & POLLNVAL) != 0 {
-        println(b"POLL_INVALID:OK");
+        pass(b"POLL_INVALID");
     } else {
         println(b"POLL_INVALID:FAIL");
     }
@@ -292,7 +293,7 @@ fn test_poll_write_ready() {
 
     // Should return 1 (write fd ready) with POLLOUT set
     if ret == 1 && (fds[0].revents & POLLOUT) != 0 {
-        println(b"POLL_WRITE:OK");
+        pass(b"POLL_WRITE");
     } else {
         println(b"POLL_WRITE:FAIL");
     }
@@ -343,7 +344,7 @@ fn test_select_data_ready() {
 
     // Should return 1 (one fd ready) with read_fd still set
     if ret == 1 && readfds.is_set(read_fd) {
-        println(b"SELECT_DATA:OK");
+        pass(b"SELECT_DATA");
     } else {
         println(b"SELECT_DATA:FAIL");
     }
@@ -389,7 +390,7 @@ fn test_select_no_data() {
     // Should return 0 (timeout, no fds ready)
     // Note: select clears the fd_set on timeout
     if ret == 0 {
-        println(b"SELECT_TIMEOUT:OK");
+        pass(b"SELECT_TIMEOUT");
     } else {
         println(b"SELECT_TIMEOUT:FAIL");
     }
@@ -569,7 +570,7 @@ fn test_semctl_ipc_stat() {
     sys_semctl(semid as i32, 0, IPC_RMID, 0);
     let (nsems, mode, ctime) = (ds.sem_nsems, ds.sem_perm.mode, ds.sem_ctime);
     if ret == 0 && nsems == 3 && mode & 0o777 == 0o640 && ctime > 0 {
-        println(b"SEMCTL_IPC_STAT:OK");
+        pass(b"SEMCTL_IPC_STAT");
     } else {
         print(b"SEMCTL_IPC_STAT:FAIL: ret=");
         print_num(ret);
@@ -1177,7 +1178,7 @@ fn test_poll_empty_timeout() {
     let ret = sys_poll(core::ptr::null_mut(), 0, 30);
     let dt = mono_ms() - t0;
     if ret == 0 && (20..2000).contains(&dt) {
-        println(b"POLL_EMPTY_TIMEOUT:OK");
+        pass(b"POLL_EMPTY_TIMEOUT");
     } else {
         print(b"POLL_EMPTY_TIMEOUT:FAIL: ret=");
         print_num(ret);
@@ -1198,7 +1199,7 @@ fn test_select_empty_timeout() {
     let ret = sys_select(0, null, null, null, &mut tv);
     let dt = mono_ms() - t0;
     if ret == 0 && (20..2000).contains(&dt) {
-        println(b"SELECT_EMPTY_TIMEOUT:OK");
+        pass(b"SELECT_EMPTY_TIMEOUT");
     } else {
         print(b"SELECT_EMPTY_TIMEOUT:FAIL: ret=");
         print_num(ret);
@@ -1245,7 +1246,7 @@ fn test_msgrcv_long_min() {
     let (r, t) = msg_recv(msqid, 32, i64::MIN);
     sys_msgctl(msqid, IPC_RMID, 0);
     if sent && r == 4 && t == 5 {
-        println(b"MSGRCV_LONG_MIN:OK");
+        pass(b"MSGRCV_LONG_MIN");
     } else {
         print(b"MSGRCV_LONG_MIN:FAIL: r=");
         print_num(r);
@@ -1266,7 +1267,7 @@ fn test_msgrcv_e2big_order() {
     let (r, t) = msg_recv(msqid, 32, 0);
     sys_msgctl(msqid, IPC_RMID, 0);
     if sent && big == -7 && r == 4 && t == 2 {
-        println(b"MSGRCV_E2BIG_ORDER:OK");
+        pass(b"MSGRCV_E2BIG_ORDER");
     } else {
         print(b"MSGRCV_E2BIG_ORDER:FAIL: e2big=");
         print_num(big);

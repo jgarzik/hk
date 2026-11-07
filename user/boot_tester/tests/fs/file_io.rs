@@ -35,6 +35,7 @@
 //! - RW_STRADDLE: read/write with one buffer running off mapped memory
 //!   mid-page move the mapped part and return its length
 
+use crate::tests::harness::{fail_num, pass};
 use crate::tests::helpers::{host_mode, print, print_num, println};
 use hk_syscall::{
     AT_EMPTY_PATH, AT_FDCWD, FIOCLEX, FIONBIO, FIONCLEX, IoVec, LinuxStatFs, MAP_ANONYMOUS,
@@ -130,7 +131,7 @@ fn test_writev() {
     let ret = sys_writev(1, iov.as_ptr(), 3);
     let expected_len = (msg1.len() + msg2.len() + msg3.len()) as i64;
     if ret == expected_len {
-        println(b"WRITEV:OK");
+        pass(b"WRITEV");
     } else {
         print(b"WRITEV:FAIL: expected ");
         print_num(expected_len);
@@ -182,7 +183,7 @@ fn test_readv() {
             // Check that we read the expected content
             // /test.txt contains "Hello from ramfs!" (17 bytes, no trailing newline)
             if ret == 17 && buf1[0] == b'H' && buf1[4] == b'o' {
-                println(b"READV:OK");
+                pass(b"READV");
             } else {
                 println(b"READV:FAIL");
             }
@@ -217,7 +218,7 @@ fn test_writev_zero_len() {
     let ret = sys_writev(1, iov_zero.as_ptr(), 3);
     let expected = (msg_before.len() + msg_after.len()) as i64;
     if ret == expected {
-        println(b"WRITEV_ZERO_LEN:OK");
+        pass(b"WRITEV_ZERO_LEN");
     } else {
         print(b"WRITEV_ZERO_LEN:FAIL: expected ");
         print_num(expected);
@@ -231,7 +232,7 @@ fn test_readv_invalid_iovcnt() {
     let ret_neg = sys_readv(0, core::ptr::null(), (-1i64) as u64);
     if ret_neg == -22 {
         // EINVAL
-        println(b"READV_INVALID_IOVCNT:OK");
+        pass(b"READV_INVALID_IOVCNT");
     } else {
         print(b"READV_INVALID_IOVCNT:FAIL: expected -22, got ");
         print_num(ret_neg);
@@ -244,9 +245,7 @@ fn test_pread64() {
     let path = b"/test.txt\0";
     let fd = sys_open(path.as_ptr(), O_RDONLY, 0);
     if fd < 0 {
-        print(b"PREAD64:FAIL: open failed: ");
-        print_num(fd);
-        println(b"");
+        fail_num(b"PREAD64:FAIL: open failed: ", fd);
         return;
     }
 
@@ -254,9 +253,7 @@ fn test_pread64() {
     let mut buf1 = [0u8; 5];
     let ret = sys_read(fd as u64, buf1.as_mut_ptr(), 5);
     if ret != 5 {
-        print(b"PREAD64:FAIL: initial read failed: ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"PREAD64:FAIL: initial read failed: ", ret);
         sys_close(fd as u64);
         return;
     }
@@ -264,9 +261,7 @@ fn test_pread64() {
     // Current position should be 5, verify with lseek
     let pos1 = sys_lseek(fd as i32, 0, 1); // SEEK_CUR=1
     if pos1 != 5 {
-        print(b"PREAD64:FAIL: position after read should be 5, got ");
-        print_num(pos1);
-        println(b"");
+        fail_num(b"PREAD64:FAIL: position after read should be 5, got ", pos1);
         sys_close(fd as u64);
         return;
     }
@@ -275,9 +270,7 @@ fn test_pread64() {
     let mut buf2 = [0u8; 4];
     let pret = sys_pread64(fd as i32, buf2.as_mut_ptr(), 4, 6);
     if pret != 4 {
-        print(b"PREAD64:FAIL: pread64 returned ");
-        print_num(pret);
-        println(b"");
+        fail_num(b"PREAD64:FAIL: pread64 returned ", pret);
         sys_close(fd as u64);
         return;
     }
@@ -294,15 +287,16 @@ fn test_pread64() {
     // Verify file position is UNCHANGED (still 5, not 10)
     let pos2 = sys_lseek(fd as i32, 0, 1); // SEEK_CUR=1
     if pos2 != 5 {
-        print(b"PREAD64:FAIL: position should still be 5 after pread64, got ");
-        print_num(pos2);
-        println(b"");
+        fail_num(
+            b"PREAD64:FAIL: position should still be 5 after pread64, got ",
+            pos2,
+        );
         sys_close(fd as u64);
         return;
     }
 
     sys_close(fd as u64);
-    println(b"PREAD64:OK");
+    pass(b"PREAD64");
 }
 
 /// pwrite64() - positioned write without changing file position
@@ -311,9 +305,7 @@ fn test_pwrite64() {
     let path = b"/pwrite_test.txt\0";
     let fd = sys_open(path.as_ptr(), O_RDWR | O_CREAT | O_TRUNC, 0o644);
     if fd < 0 {
-        print(b"PWRITE64:FAIL: open failed: ");
-        print_num(fd);
-        println(b"");
+        fail_num(b"PWRITE64:FAIL: open failed: ", fd);
         return;
     }
 
@@ -321,9 +313,7 @@ fn test_pwrite64() {
     let initial = b"AAAABBBBCCCC";
     let ret = sys_write(fd as u64, initial.as_ptr(), 12);
     if ret != 12 {
-        print(b"PWRITE64:FAIL: initial write failed: ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"PWRITE64:FAIL: initial write failed: ", ret);
         sys_close(fd as u64);
         return;
     }
@@ -334,9 +324,7 @@ fn test_pwrite64() {
     // Current position should be 4
     let pos1 = sys_lseek(fd as i32, 0, 1); // SEEK_CUR=1
     if pos1 != 4 {
-        print(b"PWRITE64:FAIL: position should be 4, got ");
-        print_num(pos1);
-        println(b"");
+        fail_num(b"PWRITE64:FAIL: position should be 4, got ", pos1);
         sys_close(fd as u64);
         return;
     }
@@ -345,9 +333,7 @@ fn test_pwrite64() {
     let new_data = b"XXXX";
     let pret = sys_pwrite64(fd as i32, new_data.as_ptr(), 4, 0);
     if pret != 4 {
-        print(b"PWRITE64:FAIL: pwrite64 returned ");
-        print_num(pret);
-        println(b"");
+        fail_num(b"PWRITE64:FAIL: pwrite64 returned ", pret);
         sys_close(fd as u64);
         return;
     }
@@ -355,9 +341,10 @@ fn test_pwrite64() {
     // Verify file position is UNCHANGED (still 4)
     let pos2 = sys_lseek(fd as i32, 0, 1); // SEEK_CUR=1
     if pos2 != 4 {
-        print(b"PWRITE64:FAIL: position should still be 4 after pwrite64, got ");
-        print_num(pos2);
-        println(b"");
+        fail_num(
+            b"PWRITE64:FAIL: position should still be 4 after pwrite64, got ",
+            pos2,
+        );
         sys_close(fd as u64);
         return;
     }
@@ -367,9 +354,7 @@ fn test_pwrite64() {
     let mut verify = [0u8; 12];
     let vret = sys_read(fd as u64, verify.as_mut_ptr(), 12);
     if vret != 12 {
-        print(b"PWRITE64:FAIL: verify read failed: ");
-        print_num(vret);
-        println(b"");
+        fail_num(b"PWRITE64:FAIL: verify read failed: ", vret);
         sys_close(fd as u64);
         return;
     }
@@ -392,7 +377,7 @@ fn test_pwrite64() {
     }
 
     sys_close(fd as u64);
-    println(b"PWRITE64:OK");
+    pass(b"PWRITE64");
 }
 
 /// preadv() - positioned scatter read without changing file position
@@ -401,9 +386,7 @@ fn test_preadv() {
     let path = b"/test.txt\0";
     let fd = sys_open(path.as_ptr(), O_RDONLY, 0);
     if fd < 0 {
-        print(b"PREADV:FAIL: open failed: ");
-        print_num(fd);
-        println(b"");
+        fail_num(b"PREADV:FAIL: open failed: ", fd);
         return;
     }
 
@@ -411,9 +394,7 @@ fn test_preadv() {
     let mut initial_buf = [0u8; 5];
     let ret = sys_read(fd as u64, initial_buf.as_mut_ptr(), 5);
     if ret != 5 {
-        print(b"PREADV:FAIL: initial read failed: ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"PREADV:FAIL: initial read failed: ", ret);
         sys_close(fd as u64);
         return;
     }
@@ -421,9 +402,7 @@ fn test_preadv() {
     // Current position should be 5
     let pos1 = sys_lseek(fd as i32, 0, 1); // SEEK_CUR=1
     if pos1 != 5 {
-        print(b"PREADV:FAIL: position after read should be 5, got ");
-        print_num(pos1);
-        println(b"");
+        fail_num(b"PREADV:FAIL: position after read should be 5, got ", pos1);
         sys_close(fd as u64);
         return;
     }
@@ -451,9 +430,7 @@ fn test_preadv() {
 
     let pret = sys_preadv(fd as i32, iov.as_ptr(), 3, 6);
     if pret != 11 {
-        print(b"PREADV:FAIL: preadv returned ");
-        print_num(pret);
-        println(b"");
+        fail_num(b"PREADV:FAIL: preadv returned ", pret);
         sys_close(fd as u64);
         return;
     }
@@ -488,15 +465,16 @@ fn test_preadv() {
     // Verify file position is UNCHANGED (still 5)
     let pos2 = sys_lseek(fd as i32, 0, 1); // SEEK_CUR=1
     if pos2 != 5 {
-        print(b"PREADV:FAIL: position should still be 5 after preadv, got ");
-        print_num(pos2);
-        println(b"");
+        fail_num(
+            b"PREADV:FAIL: position should still be 5 after preadv, got ",
+            pos2,
+        );
         sys_close(fd as u64);
         return;
     }
 
     sys_close(fd as u64);
-    println(b"PREADV:OK");
+    pass(b"PREADV");
 }
 
 /// pwritev() - positioned gather write without changing file position
@@ -505,9 +483,7 @@ fn test_pwritev() {
     let path = b"/pwritev_test.txt\0";
     let fd = sys_open(path.as_ptr(), O_RDWR | O_CREAT | O_TRUNC, 0o644);
     if fd < 0 {
-        print(b"PWRITEV:FAIL: open failed: ");
-        print_num(fd);
-        println(b"");
+        fail_num(b"PWRITEV:FAIL: open failed: ", fd);
         return;
     }
 
@@ -515,9 +491,7 @@ fn test_pwritev() {
     let initial = b"AAAA____CCCC";
     let ret = sys_write(fd as u64, initial.as_ptr(), 12);
     if ret != 12 {
-        print(b"PWRITEV:FAIL: initial write failed: ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"PWRITEV:FAIL: initial write failed: ", ret);
         sys_close(fd as u64);
         return;
     }
@@ -528,9 +502,7 @@ fn test_pwritev() {
     // Current position should be 2
     let pos1 = sys_lseek(fd as i32, 0, 1); // SEEK_CUR=1
     if pos1 != 2 {
-        print(b"PWRITEV:FAIL: position should be 2, got ");
-        print_num(pos1);
-        println(b"");
+        fail_num(b"PWRITEV:FAIL: position should be 2, got ", pos1);
         sys_close(fd as u64);
         return;
     }
@@ -552,9 +524,7 @@ fn test_pwritev() {
 
     let pret = sys_pwritev(fd as i32, iov.as_ptr(), 2, 4);
     if pret != 4 {
-        print(b"PWRITEV:FAIL: pwritev returned ");
-        print_num(pret);
-        println(b"");
+        fail_num(b"PWRITEV:FAIL: pwritev returned ", pret);
         sys_close(fd as u64);
         return;
     }
@@ -562,9 +532,10 @@ fn test_pwritev() {
     // Verify file position is UNCHANGED (still 2)
     let pos2 = sys_lseek(fd as i32, 0, 1); // SEEK_CUR=1
     if pos2 != 2 {
-        print(b"PWRITEV:FAIL: position should still be 2 after pwritev, got ");
-        print_num(pos2);
-        println(b"");
+        fail_num(
+            b"PWRITEV:FAIL: position should still be 2 after pwritev, got ",
+            pos2,
+        );
         sys_close(fd as u64);
         return;
     }
@@ -574,9 +545,7 @@ fn test_pwritev() {
     let mut verify = [0u8; 12];
     let vret = sys_read(fd as u64, verify.as_mut_ptr(), 12);
     if vret != 12 {
-        print(b"PWRITEV:FAIL: verify read failed: ");
-        print_num(vret);
-        println(b"");
+        fail_num(b"PWRITEV:FAIL: verify read failed: ", vret);
         sys_close(fd as u64);
         return;
     }
@@ -607,7 +576,7 @@ fn test_pwritev() {
     }
 
     sys_close(fd as u64);
-    println(b"PWRITEV:OK");
+    pass(b"PWRITEV");
 }
 
 /// fcntl(F_DUPFD) - duplicate fd to lowest available >= arg
@@ -616,27 +585,21 @@ fn test_fcntl_dupfd() {
     let path = b"/test.txt\0";
     let fd = sys_open(path.as_ptr(), O_RDONLY, 0);
     if fd < 0 {
-        print(b"FCNTL_DUPFD:FAIL: open failed: ");
-        print_num(fd);
-        println(b"");
+        fail_num(b"FCNTL_DUPFD:FAIL: open failed: ", fd);
         return;
     }
 
     // Duplicate fd to >= 10
     let new_fd = sys_fcntl(fd as i32, F_DUPFD, 10);
     if new_fd < 0 {
-        print(b"FCNTL_DUPFD:FAIL: fcntl returned ");
-        print_num(new_fd);
-        println(b"");
+        fail_num(b"FCNTL_DUPFD:FAIL: fcntl returned ", new_fd);
         sys_close(fd as u64);
         return;
     }
 
     // Verify new_fd >= 10
     if new_fd < 10 {
-        print(b"FCNTL_DUPFD:FAIL: expected new_fd >= 10, got ");
-        print_num(new_fd);
-        println(b"");
+        fail_num(b"FCNTL_DUPFD:FAIL: expected new_fd >= 10, got ", new_fd);
         sys_close(fd as u64);
         sys_close(new_fd as u64);
         return;
@@ -646,9 +609,7 @@ fn test_fcntl_dupfd() {
     let mut buf = [0u8; 5];
     let ret = sys_read(new_fd as u64, buf.as_mut_ptr(), 5);
     if ret != 5 {
-        print(b"FCNTL_DUPFD:FAIL: read from new_fd failed: ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"FCNTL_DUPFD:FAIL: read from new_fd failed: ", ret);
         sys_close(fd as u64);
         sys_close(new_fd as u64);
         return;
@@ -666,7 +627,7 @@ fn test_fcntl_dupfd() {
 
     sys_close(fd as u64);
     sys_close(new_fd as u64);
-    println(b"FCNTL_DUPFD:OK");
+    pass(b"FCNTL_DUPFD");
 }
 
 /// fcntl(F_GETFD/F_SETFD) - get/set fd flags (FD_CLOEXEC)
@@ -675,26 +636,23 @@ fn test_fcntl_cloexec() {
     let path = b"/test.txt\0";
     let fd = sys_open(path.as_ptr(), O_RDONLY, 0);
     if fd < 0 {
-        print(b"FCNTL_CLOEXEC:FAIL: open failed: ");
-        print_num(fd);
-        println(b"");
+        fail_num(b"FCNTL_CLOEXEC:FAIL: open failed: ", fd);
         return;
     }
 
     // Get initial fd flags (should be 0)
     let initial_flags = sys_fcntl(fd as i32, F_GETFD, 0);
     if initial_flags < 0 {
-        print(b"FCNTL_CLOEXEC:FAIL: F_GETFD returned ");
-        print_num(initial_flags);
-        println(b"");
+        fail_num(b"FCNTL_CLOEXEC:FAIL: F_GETFD returned ", initial_flags);
         sys_close(fd as u64);
         return;
     }
 
     if initial_flags != 0 {
-        print(b"FCNTL_CLOEXEC:FAIL: expected initial flags=0, got ");
-        print_num(initial_flags);
-        println(b"");
+        fail_num(
+            b"FCNTL_CLOEXEC:FAIL: expected initial flags=0, got ",
+            initial_flags,
+        );
         sys_close(fd as u64);
         return;
     }
@@ -702,9 +660,7 @@ fn test_fcntl_cloexec() {
     // Set FD_CLOEXEC
     let ret = sys_fcntl(fd as i32, F_SETFD, FD_CLOEXEC);
     if ret < 0 {
-        print(b"FCNTL_CLOEXEC:FAIL: F_SETFD returned ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"FCNTL_CLOEXEC:FAIL: F_SETFD returned ", ret);
         sys_close(fd as u64);
         return;
     }
@@ -712,23 +668,22 @@ fn test_fcntl_cloexec() {
     // Verify FD_CLOEXEC is set
     let new_flags = sys_fcntl(fd as i32, F_GETFD, 0);
     if new_flags < 0 {
-        print(b"FCNTL_CLOEXEC:FAIL: F_GETFD after set returned ");
-        print_num(new_flags);
-        println(b"");
+        fail_num(
+            b"FCNTL_CLOEXEC:FAIL: F_GETFD after set returned ",
+            new_flags,
+        );
         sys_close(fd as u64);
         return;
     }
 
     if (new_flags as u64) & FD_CLOEXEC == 0 {
-        print(b"FCNTL_CLOEXEC:FAIL: FD_CLOEXEC not set, flags=");
-        print_num(new_flags);
-        println(b"");
+        fail_num(b"FCNTL_CLOEXEC:FAIL: FD_CLOEXEC not set, flags=", new_flags);
         sys_close(fd as u64);
         return;
     }
 
     sys_close(fd as u64);
-    println(b"FCNTL_CLOEXEC:OK");
+    pass(b"FCNTL_CLOEXEC");
 }
 
 /// fcntl(F_DUPFD_CLOEXEC) - duplicate with cloexec
@@ -737,18 +692,14 @@ fn test_fcntl_dupfd_cloexec() {
     let path = b"/test.txt\0";
     let fd = sys_open(path.as_ptr(), O_RDONLY, 0);
     if fd < 0 {
-        print(b"FCNTL_DUPFD_CLOEXEC:FAIL: open failed: ");
-        print_num(fd);
-        println(b"");
+        fail_num(b"FCNTL_DUPFD_CLOEXEC:FAIL: open failed: ", fd);
         return;
     }
 
     // Duplicate fd with cloexec
     let new_fd = sys_fcntl(fd as i32, F_DUPFD_CLOEXEC, 0);
     if new_fd < 0 {
-        print(b"FCNTL_DUPFD_CLOEXEC:FAIL: fcntl returned ");
-        print_num(new_fd);
-        println(b"");
+        fail_num(b"FCNTL_DUPFD_CLOEXEC:FAIL: fcntl returned ", new_fd);
         sys_close(fd as u64);
         return;
     }
@@ -756,18 +707,17 @@ fn test_fcntl_dupfd_cloexec() {
     // Verify new_fd has FD_CLOEXEC set
     let flags = sys_fcntl(new_fd as i32, F_GETFD, 0);
     if flags < 0 {
-        print(b"FCNTL_DUPFD_CLOEXEC:FAIL: F_GETFD returned ");
-        print_num(flags);
-        println(b"");
+        fail_num(b"FCNTL_DUPFD_CLOEXEC:FAIL: F_GETFD returned ", flags);
         sys_close(fd as u64);
         sys_close(new_fd as u64);
         return;
     }
 
     if (flags as u64) & FD_CLOEXEC == 0 {
-        print(b"FCNTL_DUPFD_CLOEXEC:FAIL: FD_CLOEXEC not set on new_fd, flags=");
-        print_num(flags);
-        println(b"");
+        fail_num(
+            b"FCNTL_DUPFD_CLOEXEC:FAIL: FD_CLOEXEC not set on new_fd, flags=",
+            flags,
+        );
         sys_close(fd as u64);
         sys_close(new_fd as u64);
         return;
@@ -776,9 +726,10 @@ fn test_fcntl_dupfd_cloexec() {
     // Original fd should NOT have FD_CLOEXEC
     let orig_flags = sys_fcntl(fd as i32, F_GETFD, 0);
     if (orig_flags as u64) & FD_CLOEXEC != 0 {
-        print(b"FCNTL_DUPFD_CLOEXEC:FAIL: original fd has FD_CLOEXEC, flags=");
-        print_num(orig_flags);
-        println(b"");
+        fail_num(
+            b"FCNTL_DUPFD_CLOEXEC:FAIL: original fd has FD_CLOEXEC, flags=",
+            orig_flags,
+        );
         sys_close(fd as u64);
         sys_close(new_fd as u64);
         return;
@@ -786,7 +737,7 @@ fn test_fcntl_dupfd_cloexec() {
 
     sys_close(fd as u64);
     sys_close(new_fd as u64);
-    println(b"FCNTL_DUPFD_CLOEXEC:OK");
+    pass(b"FCNTL_DUPFD_CLOEXEC");
 }
 
 /// fcntl() with invalid fd returns -EBADF
@@ -795,11 +746,9 @@ fn test_fcntl_ebadf() {
     let ret = sys_fcntl(9999, F_GETFD, 0);
     if ret == -9 {
         // EBADF = 9
-        println(b"FCNTL_EBADF:OK");
+        pass(b"FCNTL_EBADF");
     } else {
-        print(b"FCNTL_EBADF:FAIL: expected -9 (EBADF), got ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"FCNTL_EBADF:FAIL: expected -9 (EBADF), got ", ret);
     }
 }
 
@@ -810,16 +759,12 @@ fn test_getrandom() {
     // Get random bytes
     let ret = sys_getrandom(buf.as_mut_ptr(), buf.len(), 0);
     if ret < 0 {
-        print(b"GETRANDOM:FAIL: returned ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"GETRANDOM:FAIL: returned ", ret);
         return;
     }
 
     if ret != 32 {
-        print(b"GETRANDOM:FAIL: expected 32 bytes, got ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"GETRANDOM:FAIL: expected 32 bytes, got ", ret);
         return;
     }
 
@@ -852,7 +797,7 @@ fn test_getrandom() {
         return;
     }
 
-    println(b"GETRANDOM:OK");
+    pass(b"GETRANDOM");
 }
 
 /// getrandom() with invalid flags returns -EINVAL
@@ -865,11 +810,9 @@ fn test_getrandom_einval() {
 
     if ret == -22 {
         // EINVAL = 22
-        println(b"GETRANDOM_EINVAL:OK");
+        pass(b"GETRANDOM_EINVAL");
     } else {
-        print(b"GETRANDOM_EINVAL:FAIL: expected -22 (EINVAL), got ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"GETRANDOM_EINVAL:FAIL: expected -22 (EINVAL), got ", ret);
     }
 }
 
@@ -906,7 +849,7 @@ fn test_getrandom_stream() {
         b""
     };
     if why.is_empty() {
-        println(b"GETRANDOM_STREAM:OK");
+        pass(b"GETRANDOM_STREAM");
     } else {
         print(b"GETRANDOM_STREAM:FAIL ");
         println(why);
@@ -919,11 +862,9 @@ fn test_ioctl_ebadf() {
     let ret = sys_ioctl(9999, 0, 0);
     if ret == -9 {
         // EBADF = 9
-        println(b"IOCTL_EBADF:OK");
+        pass(b"IOCTL_EBADF");
     } else {
-        print(b"IOCTL_EBADF:FAIL: expected -9 (EBADF), got ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"IOCTL_EBADF:FAIL: expected -9 (EBADF), got ", ret);
     }
 }
 
@@ -933,9 +874,7 @@ fn test_ioctl_enotty() {
     let path = b"/test.txt\0";
     let fd = sys_open(path.as_ptr(), O_RDONLY, 0);
     if fd < 0 {
-        print(b"IOCTL_ENOTTY:FAIL: open failed: ");
-        print_num(fd);
-        println(b"");
+        fail_num(b"IOCTL_ENOTTY:FAIL: open failed: ", fd);
         return;
     }
 
@@ -945,11 +884,9 @@ fn test_ioctl_enotty() {
 
     if ret == -25 {
         // ENOTTY = 25
-        println(b"IOCTL_ENOTTY:OK");
+        pass(b"IOCTL_ENOTTY");
     } else {
-        print(b"IOCTL_ENOTTY:FAIL: expected -25 (ENOTTY), got ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"IOCTL_ENOTTY:FAIL: expected -25 (ENOTTY), got ", ret);
     }
 }
 
@@ -963,9 +900,7 @@ fn test_preadv2_basic() {
     let path = b"/test.txt\0";
     let fd = sys_open(path.as_ptr(), O_RDONLY, 0);
     if fd < 0 {
-        print(b"PREADV2_BASIC:FAIL: open failed: ");
-        print_num(fd);
-        println(b"");
+        fail_num(b"PREADV2_BASIC:FAIL: open failed: ", fd);
         return;
     }
 
@@ -978,9 +913,7 @@ fn test_preadv2_basic() {
 
     let ret = sys_preadv2(fd as i32, iov.as_ptr(), 1, 6, 0);
     if ret != 4 {
-        print(b"PREADV2_BASIC:FAIL: expected 4 bytes, got ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"PREADV2_BASIC:FAIL: expected 4 bytes, got ", ret);
         sys_close(fd as u64);
         return;
     }
@@ -995,7 +928,7 @@ fn test_preadv2_basic() {
     }
 
     sys_close(fd as u64);
-    println(b"PREADV2_BASIC:OK");
+    pass(b"PREADV2_BASIC");
 }
 
 /// pwritev2() - basic positioned gather write with flags=0
@@ -1004,9 +937,7 @@ fn test_pwritev2_basic() {
     let path = b"/pwritev2_test.txt\0";
     let fd = sys_open(path.as_ptr(), O_RDWR | O_CREAT | O_TRUNC, 0o644);
     if fd < 0 {
-        print(b"PWRITEV2_BASIC:FAIL: open failed: ");
-        print_num(fd);
-        println(b"");
+        fail_num(b"PWRITEV2_BASIC:FAIL: open failed: ", fd);
         return;
     }
 
@@ -1019,9 +950,7 @@ fn test_pwritev2_basic() {
 
     let ret = sys_pwritev2(fd as i32, iov.as_ptr(), 1, 0, 0);
     if ret != 4 {
-        print(b"PWRITEV2_BASIC:FAIL: expected 4 bytes written, got ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"PWRITEV2_BASIC:FAIL: expected 4 bytes written, got ", ret);
         sys_close(fd as u64);
         return;
     }
@@ -1037,7 +966,7 @@ fn test_pwritev2_basic() {
     }
 
     sys_close(fd as u64);
-    println(b"PWRITEV2_BASIC:OK");
+    pass(b"PWRITEV2_BASIC");
 }
 
 /// preadv2() with offset=-1 uses current file position
@@ -1045,18 +974,14 @@ fn test_preadv2_offset_minus_one() {
     let path = b"/test.txt\0";
     let fd = sys_open(path.as_ptr(), O_RDONLY, 0);
     if fd < 0 {
-        print(b"PREADV2_OFFSET_NEG1:FAIL: open failed: ");
-        print_num(fd);
-        println(b"");
+        fail_num(b"PREADV2_OFFSET_NEG1:FAIL: open failed: ", fd);
         return;
     }
 
     // Seek to offset 6
     let pos = sys_lseek(fd as i32, 6, 0); // SEEK_SET=0
     if pos != 6 {
-        print(b"PREADV2_OFFSET_NEG1:FAIL: lseek failed: ");
-        print_num(pos);
-        println(b"");
+        fail_num(b"PREADV2_OFFSET_NEG1:FAIL: lseek failed: ", pos);
         sys_close(fd as u64);
         return;
     }
@@ -1070,9 +995,7 @@ fn test_preadv2_offset_minus_one() {
 
     let ret = sys_preadv2(fd as i32, iov.as_ptr(), 1, -1, 0);
     if ret != 4 {
-        print(b"PREADV2_OFFSET_NEG1:FAIL: expected 4 bytes, got ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"PREADV2_OFFSET_NEG1:FAIL: expected 4 bytes, got ", ret);
         sys_close(fd as u64);
         return;
     }
@@ -1087,7 +1010,7 @@ fn test_preadv2_offset_minus_one() {
     }
 
     sys_close(fd as u64);
-    println(b"PREADV2_OFFSET_NEG1:OK");
+    pass(b"PREADV2_OFFSET_NEG1");
 }
 
 /// pwritev2() with offset=-1 uses current file position
@@ -1095,9 +1018,7 @@ fn test_pwritev2_offset_minus_one() {
     let path = b"/pwritev2_neg1.txt\0";
     let fd = sys_open(path.as_ptr(), O_RDWR | O_CREAT | O_TRUNC, 0o644);
     if fd < 0 {
-        print(b"PWRITEV2_OFFSET_NEG1:FAIL: open failed: ");
-        print_num(fd);
-        println(b"");
+        fail_num(b"PWRITEV2_OFFSET_NEG1:FAIL: open failed: ", fd);
         return;
     }
 
@@ -1108,9 +1029,7 @@ fn test_pwritev2_offset_minus_one() {
     // Seek to position 2
     let pos = sys_lseek(fd as i32, 2, 0); // SEEK_SET=0
     if pos != 2 {
-        print(b"PWRITEV2_OFFSET_NEG1:FAIL: lseek failed: ");
-        print_num(pos);
-        println(b"");
+        fail_num(b"PWRITEV2_OFFSET_NEG1:FAIL: lseek failed: ", pos);
         sys_close(fd as u64);
         return;
     }
@@ -1124,9 +1043,10 @@ fn test_pwritev2_offset_minus_one() {
 
     let ret = sys_pwritev2(fd as i32, iov.as_ptr(), 1, -1, 0);
     if ret != 2 {
-        print(b"PWRITEV2_OFFSET_NEG1:FAIL: expected 2 bytes written, got ");
-        print_num(ret);
-        println(b"");
+        fail_num(
+            b"PWRITEV2_OFFSET_NEG1:FAIL: expected 2 bytes written, got ",
+            ret,
+        );
         sys_close(fd as u64);
         return;
     }
@@ -1143,7 +1063,7 @@ fn test_pwritev2_offset_minus_one() {
     }
 
     sys_close(fd as u64);
-    println(b"PWRITEV2_OFFSET_NEG1:OK");
+    pass(b"PWRITEV2_OFFSET_NEG1");
 }
 
 /// pwritev2() with RWF_APPEND appends to file
@@ -1151,9 +1071,7 @@ fn test_pwritev2_rwf_append() {
     let path = b"/pwritev2_append.txt\0";
     let fd = sys_open(path.as_ptr(), O_RDWR | O_CREAT | O_TRUNC, 0o644);
     if fd < 0 {
-        print(b"PWRITEV2_RWF_APPEND:FAIL: open failed: ");
-        print_num(fd);
-        println(b"");
+        fail_num(b"PWRITEV2_RWF_APPEND:FAIL: open failed: ", fd);
         return;
     }
 
@@ -1171,9 +1089,10 @@ fn test_pwritev2_rwf_append() {
 
     let ret = sys_pwritev2(fd as i32, iov.as_ptr(), 1, 0, RWF_APPEND);
     if ret != 5 {
-        print(b"PWRITEV2_RWF_APPEND:FAIL: expected 5 bytes written, got ");
-        print_num(ret);
-        println(b"");
+        fail_num(
+            b"PWRITEV2_RWF_APPEND:FAIL: expected 5 bytes written, got ",
+            ret,
+        );
         sys_close(fd as u64);
         return;
     }
@@ -1182,9 +1101,10 @@ fn test_pwritev2_rwf_append() {
     let mut buf = [0u8; 10];
     let read_ret = sys_pread64(fd as i32, buf.as_mut_ptr(), 10, 0);
     if read_ret != 10 {
-        print(b"PWRITEV2_RWF_APPEND:FAIL: expected 10 bytes, got ");
-        print_num(read_ret);
-        println(b"");
+        fail_num(
+            b"PWRITEV2_RWF_APPEND:FAIL: expected 10 bytes, got ",
+            read_ret,
+        );
         sys_close(fd as u64);
         return;
     }
@@ -1199,7 +1119,7 @@ fn test_pwritev2_rwf_append() {
     }
 
     sys_close(fd as u64);
-    println(b"PWRITEV2_RWF_APPEND:OK");
+    pass(b"PWRITEV2_RWF_APPEND");
 }
 
 /// preadv2() with invalid flags returns -EOPNOTSUPP
@@ -1207,9 +1127,7 @@ fn test_preadv2_invalid_flags() {
     let path = b"/test.txt\0";
     let fd = sys_open(path.as_ptr(), O_RDONLY, 0);
     if fd < 0 {
-        print(b"PREADV2_INVALID_FLAGS:FAIL: open failed: ");
-        print_num(fd);
-        println(b"");
+        fail_num(b"PREADV2_INVALID_FLAGS:FAIL: open failed: ", fd);
         return;
     }
 
@@ -1227,11 +1145,12 @@ fn test_preadv2_invalid_flags() {
 
     if ret == -95 {
         // EOPNOTSUPP = 95
-        println(b"PREADV2_INVALID_FLAGS:OK");
+        pass(b"PREADV2_INVALID_FLAGS");
     } else {
-        print(b"PREADV2_INVALID_FLAGS:FAIL: expected -95 (EOPNOTSUPP), got ");
-        print_num(ret);
-        println(b"");
+        fail_num(
+            b"PREADV2_INVALID_FLAGS:FAIL: expected -95 (EOPNOTSUPP), got ",
+            ret,
+        );
     }
 }
 
@@ -1241,9 +1160,7 @@ fn test_preadv2_rwf_nowait() {
     let path = b"/test.txt\0";
     let fd = sys_open(path.as_ptr(), O_RDONLY, 0);
     if fd < 0 {
-        print(b"PREADV2_RWF_NOWAIT:FAIL: open failed: ");
-        print_num(fd);
-        println(b"");
+        fail_num(b"PREADV2_RWF_NOWAIT:FAIL: open failed: ", fd);
         return;
     }
 
@@ -1256,11 +1173,12 @@ fn test_preadv2_rwf_nowait() {
     sys_close(fd as u64);
 
     if ret == -95 {
-        println(b"PREADV2_RWF_NOWAIT:OK");
+        pass(b"PREADV2_RWF_NOWAIT");
     } else {
-        print(b"PREADV2_RWF_NOWAIT:FAIL: expected -95 (EOPNOTSUPP), got ");
-        print_num(ret);
-        println(b"");
+        fail_num(
+            b"PREADV2_RWF_NOWAIT:FAIL: expected -95 (EOPNOTSUPP), got ",
+            ret,
+        );
     }
 }
 
@@ -1270,9 +1188,7 @@ fn test_preadv2_rwf_nowait_pipe_eagain() {
     let mut pipefds = [0i32; 2];
     let ret = sys_pipe2(pipefds.as_mut_ptr(), 0);
     if ret < 0 {
-        print(b"PREADV2_NOWAIT_PIPE:FAIL: pipe2 failed: ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"PREADV2_NOWAIT_PIPE:FAIL: pipe2 failed: ", ret);
         return;
     }
 
@@ -1294,14 +1210,15 @@ fn test_preadv2_rwf_nowait_pipe_eagain() {
 
     // Should return EAGAIN (-11) since pipe is empty
     if ret == -11 {
-        println(b"PREADV2_NOWAIT_PIPE:OK");
+        pass(b"PREADV2_NOWAIT_PIPE");
     } else if ret == -95 {
         print(b"PREADV2_NOWAIT_PIPE:FAIL: got EOPNOTSUPP, but pipe should support NOWAIT");
         println(b"");
     } else {
-        print(b"PREADV2_NOWAIT_PIPE:FAIL: expected -11 (EAGAIN), got ");
-        print_num(ret);
-        println(b"");
+        fail_num(
+            b"PREADV2_NOWAIT_PIPE:FAIL: expected -11 (EAGAIN), got ",
+            ret,
+        );
     }
 }
 
@@ -1316,9 +1233,7 @@ fn test_statfs_root() {
 
     let ret = sys_statfs(path.as_ptr(), &mut buf);
     if ret != 0 {
-        print(b"STATFS_ROOT:FAIL: statfs returned ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"STATFS_ROOT:FAIL: statfs returned ", ret);
         return;
     }
 
@@ -1334,21 +1249,17 @@ fn test_statfs_root() {
 
     // Block size should be positive
     if buf.f_bsize <= 0 {
-        print(b"STATFS_ROOT:FAIL: invalid block size ");
-        print_num(buf.f_bsize);
-        println(b"");
+        fail_num(b"STATFS_ROOT:FAIL: invalid block size ", buf.f_bsize);
         return;
     }
 
     // Max filename length should be positive
     if buf.f_namelen <= 0 {
-        print(b"STATFS_ROOT:FAIL: invalid namelen ");
-        print_num(buf.f_namelen);
-        println(b"");
+        fail_num(b"STATFS_ROOT:FAIL: invalid namelen ", buf.f_namelen);
         return;
     }
 
-    println(b"STATFS_ROOT:OK");
+    pass(b"STATFS_ROOT");
 }
 
 /// statfs() on /proc filesystem
@@ -1358,9 +1269,7 @@ fn test_statfs_proc() {
 
     let ret = sys_statfs(path.as_ptr(), &mut buf);
     if ret != 0 {
-        print(b"STATFS_PROC:FAIL: statfs returned ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"STATFS_PROC:FAIL: statfs returned ", ret);
         return;
     }
 
@@ -1374,7 +1283,7 @@ fn test_statfs_proc() {
         return;
     }
 
-    println(b"STATFS_PROC:OK");
+    pass(b"STATFS_PROC");
 }
 
 /// statfs() on nonexistent path returns -ENOENT
@@ -1385,11 +1294,9 @@ fn test_statfs_enoent() {
     let ret = sys_statfs(path.as_ptr(), &mut buf);
     if ret == -2 {
         // ENOENT = 2
-        println(b"STATFS_ENOENT:OK");
+        pass(b"STATFS_ENOENT");
     } else {
-        print(b"STATFS_ENOENT:FAIL: expected -2 (ENOENT), got ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"STATFS_ENOENT:FAIL: expected -2 (ENOENT), got ", ret);
     }
 }
 
@@ -1399,9 +1306,7 @@ fn test_fstatfs() {
     let path = b"/test.txt\0";
     let fd = sys_open(path.as_ptr(), O_RDONLY, 0);
     if fd < 0 {
-        print(b"FSTATFS:FAIL: open failed: ");
-        print_num(fd);
-        println(b"");
+        fail_num(b"FSTATFS:FAIL: open failed: ", fd);
         return;
     }
 
@@ -1410,21 +1315,17 @@ fn test_fstatfs() {
     sys_close(fd as u64);
 
     if ret != 0 {
-        print(b"FSTATFS:FAIL: fstatfs returned ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"FSTATFS:FAIL: fstatfs returned ", ret);
         return;
     }
 
     // Verify we got ramfs magic (root fs; tmpfs on a Linux host)
     if buf.f_type != RAMFS_MAGIC && !(host_mode() && buf.f_type == TMPFS_MAGIC) {
-        print(b"FSTATFS:FAIL: expected ramfs magic, got ");
-        print_num(buf.f_type);
-        println(b"");
+        fail_num(b"FSTATFS:FAIL: expected ramfs magic, got ", buf.f_type);
         return;
     }
 
-    println(b"FSTATFS:OK");
+    pass(b"FSTATFS");
 }
 
 /// statx() basic usage
@@ -1434,17 +1335,16 @@ fn test_statx_basic() {
 
     let ret = sys_statx(AT_FDCWD, path.as_ptr(), 0, STATX_BASIC_STATS, &mut buf);
     if ret != 0 {
-        print(b"STATX_BASIC:FAIL: statx returned ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"STATX_BASIC:FAIL: statx returned ", ret);
         return;
     }
 
     // Verify basic stats returned
     if buf.stx_mask & STATX_BASIC_STATS == 0 {
-        print(b"STATX_BASIC:FAIL: stx_mask missing BASIC_STATS: ");
-        print_num(buf.stx_mask as i64);
-        println(b"");
+        fail_num(
+            b"STATX_BASIC:FAIL: stx_mask missing BASIC_STATS: ",
+            buf.stx_mask as i64,
+        );
         return;
     }
 
@@ -1463,13 +1363,14 @@ fn test_statx_basic() {
     // Mode should indicate regular file (S_IFREG = 0o100000)
     let s_ifreg: u16 = 0o100000;
     if buf.stx_mode & s_ifreg != s_ifreg {
-        print(b"STATX_BASIC:FAIL: not a regular file, mode=");
-        print_num(buf.stx_mode as i64);
-        println(b"");
+        fail_num(
+            b"STATX_BASIC:FAIL: not a regular file, mode=",
+            buf.stx_mode as i64,
+        );
         return;
     }
 
-    println(b"STATX_BASIC:OK");
+    pass(b"STATX_BASIC");
 }
 
 /// statx() with AT_EMPTY_PATH on fd
@@ -1478,9 +1379,7 @@ fn test_statx_at_empty_path() {
     let path = b"/test.txt\0";
     let fd = sys_open(path.as_ptr(), O_RDONLY, 0);
     if fd < 0 {
-        print(b"STATX_EMPTY_PATH:FAIL: open failed: ");
-        print_num(fd);
-        println(b"");
+        fail_num(b"STATX_EMPTY_PATH:FAIL: open failed: ", fd);
         return;
     }
 
@@ -1498,17 +1397,16 @@ fn test_statx_at_empty_path() {
     sys_close(fd as u64);
 
     if ret != 0 {
-        print(b"STATX_EMPTY_PATH:FAIL: statx returned ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"STATX_EMPTY_PATH:FAIL: statx returned ", ret);
         return;
     }
 
     // Verify we got stats
     if buf.stx_mask & STATX_BASIC_STATS == 0 {
-        print(b"STATX_EMPTY_PATH:FAIL: stx_mask missing BASIC_STATS: ");
-        print_num(buf.stx_mask as i64);
-        println(b"");
+        fail_num(
+            b"STATX_EMPTY_PATH:FAIL: stx_mask missing BASIC_STATS: ",
+            buf.stx_mask as i64,
+        );
         return;
     }
 
@@ -1518,7 +1416,7 @@ fn test_statx_at_empty_path() {
         return;
     }
 
-    println(b"STATX_EMPTY_PATH:OK");
+    pass(b"STATX_EMPTY_PATH");
 }
 
 /// Test ioctl FIONBIO - set non-blocking mode
@@ -1527,9 +1425,7 @@ fn test_ioctl_fionbio() {
     let mut pipefd: [i32; 2] = [0; 2];
     let ret = sys_pipe2(pipefd.as_mut_ptr(), 0);
     if ret < 0 {
-        print(b"IOCTL_FIONBIO:FAIL: pipe2 returned ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"IOCTL_FIONBIO:FAIL: pipe2 returned ", ret);
         return;
     }
 
@@ -1538,9 +1434,7 @@ fn test_ioctl_fionbio() {
     if flags < 0 {
         sys_close(pipefd[0] as u64);
         sys_close(pipefd[1] as u64);
-        print(b"IOCTL_FIONBIO:FAIL: fcntl(F_GETFL) returned ");
-        print_num(flags);
-        println(b"");
+        fail_num(b"IOCTL_FIONBIO:FAIL: fcntl(F_GETFL) returned ", flags);
         return;
     }
 
@@ -1550,9 +1444,7 @@ fn test_ioctl_fionbio() {
     if ret != 0 {
         sys_close(pipefd[0] as u64);
         sys_close(pipefd[1] as u64);
-        print(b"IOCTL_FIONBIO:FAIL: ioctl(FIONBIO, 1) returned ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"IOCTL_FIONBIO:FAIL: ioctl(FIONBIO, 1) returned ", ret);
         return;
     }
 
@@ -1572,7 +1464,7 @@ fn test_ioctl_fionbio() {
     sys_close(pipefd[1] as u64);
 
     if has_nonblock && !still_has_nonblock && ret == 0 {
-        println(b"IOCTL_FIONBIO:OK");
+        pass(b"IOCTL_FIONBIO");
     } else {
         print(b"IOCTL_FIONBIO:FAIL: has_nb=");
         print_num(has_nonblock as i64);
@@ -1588,9 +1480,7 @@ fn test_ioctl_fioclex() {
     let mut pipefd: [i32; 2] = [0; 2];
     let ret = sys_pipe2(pipefd.as_mut_ptr(), 0);
     if ret < 0 {
-        print(b"IOCTL_FIOCLEX:FAIL: pipe2 returned ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"IOCTL_FIOCLEX:FAIL: pipe2 returned ", ret);
         return;
     }
     let fd = pipefd[0] as i64; // Use read end of pipe
@@ -1603,9 +1493,7 @@ fn test_ioctl_fioclex() {
     let ret = sys_ioctl(fd as i32, FIOCLEX as u64, 0);
     if ret != 0 {
         sys_close(fd as u64);
-        print(b"IOCTL_FIOCLEX:FAIL: ioctl(FIOCLEX) returned ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"IOCTL_FIOCLEX:FAIL: ioctl(FIOCLEX) returned ", ret);
         return;
     }
 
@@ -1617,9 +1505,7 @@ fn test_ioctl_fioclex() {
     let ret = sys_ioctl(fd as i32, FIONCLEX as u64, 0);
     if ret != 0 {
         sys_close(fd as u64);
-        print(b"IOCTL_FIOCLEX:FAIL: ioctl(FIONCLEX) returned ");
-        print_num(ret);
-        println(b"");
+        fail_num(b"IOCTL_FIOCLEX:FAIL: ioctl(FIONCLEX) returned ", ret);
         return;
     }
 
@@ -1631,7 +1517,7 @@ fn test_ioctl_fioclex() {
     sys_close(pipefd[1] as u64);
 
     if !initially_cloexec && has_cloexec && !still_cloexec {
-        println(b"IOCTL_FIOCLEX:OK");
+        pass(b"IOCTL_FIOCLEX");
     } else {
         print(b"IOCTL_FIOCLEX:FAIL: init=");
         print_num(initially_cloexec as i64);
@@ -1664,7 +1550,7 @@ fn test_trunc_tail() {
         && buf[..100].iter().all(|&c| c == b'a')
         && buf[100..].iter().all(|&c| c == 0);
     if ok {
-        println(b"TRUNC_TAIL_ZERO:OK");
+        pass(b"TRUNC_TAIL_ZERO");
     } else {
         print(b"TRUNC_TAIL_ZERO:FAIL n=");
         print_num(n);
@@ -1699,7 +1585,7 @@ fn test_write_own_map() {
     sys_close(fd as u64);
     sys_unlink(path.as_ptr());
     if w == 8192 && w1 == 4096 && w2 == 4096 && n == 8192 && buf.iter().all(|&c| c == b'b') {
-        println(b"WRITE_OWN_MAP:OK");
+        pass(b"WRITE_OWN_MAP");
     } else {
         print(b"WRITE_OWN_MAP:FAIL w1=");
         print_num(w1);
@@ -1755,7 +1641,7 @@ fn test_iov_partial_fault() {
     sys_close(fd as u64);
     sys_unlink(path.as_ptr());
     if w == 10 && r == 10 && pos == 10 && back == data {
-        println(b"IOV_PARTIAL_FAULT:OK");
+        pass(b"IOV_PARTIAL_FAULT");
     } else {
         print(b"IOV_PARTIAL_FAULT:FAIL w=");
         print_num(w);
@@ -1807,7 +1693,7 @@ fn test_rw_straddle() {
     sys_close(fd as u64);
     sys_unlink(path.as_ptr());
     if r == 2048 && w == 2048 && pr == -14 {
-        println(b"RW_STRADDLE:OK");
+        pass(b"RW_STRADDLE");
     } else {
         print(b"RW_STRADDLE:FAIL read=");
         print_num(r);
@@ -1846,7 +1732,7 @@ fn test_sysctl_partial_fault() {
     sys_munmap(bad as u64, 4096);
     sys_close(fd as u64);
     if fd >= 0 && w == -14 && nb > 0 && na == nb && before == after {
-        println(b"SYSCTL_PARTIAL_FAULT:OK");
+        pass(b"SYSCTL_PARTIAL_FAULT");
     } else {
         print(b"SYSCTL_PARTIAL_FAULT:FAIL writev=");
         print_num(w);
@@ -1885,7 +1771,7 @@ fn test_rwf_nowait_streams() {
         -95
     };
     if e == -11 && t == t_want && k == -11 {
-        println(b"RWF_NOWAIT_STREAMS:OK");
+        pass(b"RWF_NOWAIT_STREAMS");
     } else {
         print(b"RWF_NOWAIT_STREAMS:FAIL eventfd ");
         print_num(e);
