@@ -287,10 +287,12 @@ pub unsafe fn retarget(va: u64, pa: u64) -> Result<(), IoremapError> {
 
 /// Unmap a previously ioremap'd region
 ///
-/// # Arguments
-/// * `virt_addr` - Virtual address returned by ioremap
-/// * `size` - Size that was passed to ioremap
-pub fn iounmap(virt_addr: *mut u8, size: u64) {
+/// # Safety
+///
+/// `virt_addr` and `size` are a mapping `ioremap` returned (with that
+/// size) that the caller owns, and nothing uses it any more: no
+/// reference into it or accessor of it (`IoMem`) is left.
+pub unsafe fn iounmap(virt_addr: *mut u8, size: u64) {
     let virt = virt_addr as u64;
 
     // Validate address is in ioremap region
@@ -307,8 +309,7 @@ pub fn iounmap(virt_addr: *mut u8, size: u64) {
     // Unmap pages, then flush every CPU before the range can be reused
     for i in 0..num_pages {
         // SAFETY: the caller's mapping from `ioremap`, no longer used
-        // (iounmap's contract; not checked: BUGS.md, safe fns that take
-        // addresses); MMIO pages, nothing is freed
+        // (the caller's guarantee); MMIO pages, nothing is freed
         unsafe { unmap_page(aligned_virt + (i as u64) * PAGE_SIZE) };
     }
     flush_tlb_kernel_range(aligned_virt, aligned_virt + aligned_size);

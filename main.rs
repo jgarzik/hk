@@ -413,8 +413,10 @@ fn kmain() -> ! {
     user_pt.copy_kernel_mappings();
     // Its stack comes with the program exec loads into it (run_init)
     let user_stack_top = USER_STACK_TOP;
-    // Kernel stack for PID 1 (init process)
-    let kernel_stack = mm::vmstack::alloc().expect("Failed to allocate kernel stack for init")
+    // Kernel stack for PID 1 (init process), never freed
+    let kernel_stack = mm::vmstack::alloc()
+        .expect("Failed to allocate kernel stack for init")
+        .leak()
         + task::percpu::KERNEL_STACK_SIZE as u64;
 
     // The per-CPU scheduler with its idle task, then pid 1 (the idle

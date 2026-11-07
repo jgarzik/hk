@@ -781,16 +781,23 @@ fn page_indices(vaddr: u64) -> (usize, usize, usize, usize) {
 ///
 /// # Invariants
 ///
-/// `root_phys` is a live top-level table its holder owns. `new` does
-/// not check it (BUGS.md: safe fns that take addresses).
+/// `root_phys` is a live top-level table its holder owns: a fresh one
+/// (`new_user`) or the reserved empty table (`kernel_identity`), the
+/// only ways to make one.
 pub struct Aarch64PageTable {
     /// Physical address of the root table (L0)
     root_phys: u64,
 }
 
 impl Aarch64PageTable {
-    /// Create a page table from an existing root physical address
-    pub fn new(root_phys: u64) -> Self {
+    /// The table at `root_phys`
+    ///
+    /// # Safety
+    ///
+    /// `root_phys` is a live top-level table the result's holder owns
+    /// (type invariant).
+    unsafe fn from_root(root_phys: u64) -> Self {
+        // INVARIANT: the caller's guarantee
         Self { root_phys }
     }
 
@@ -803,7 +810,8 @@ impl Aarch64PageTable {
     /// TTBR0 table for kernel threads: empty (the kernel is in TTBR1;
     /// Linux reserved_pg_dir)
     pub fn kernel_identity() -> Self {
-        Self::new(super::kmap::reserved_phys())
+        // SAFETY: the reserved empty table, live forever
+        unsafe { Self::from_root(super::kmap::reserved_phys()) }
     }
 
     /// Create a new user page table (allocates L0)
@@ -811,7 +819,8 @@ impl Aarch64PageTable {
         let l0_phys = frame_alloc.alloc_frame()?;
         // SAFETY: a fresh frame, reached through the linear map
         unsafe { core::ptr::write_bytes(phys_to_virt(l0_phys), 0, PAGE_SIZE as usize) };
-        Some(Self::new(l0_phys))
+        // SAFETY: a fresh zeroed table frame, the result's
+        Some(unsafe { Self::from_root(l0_phys) })
     }
 
     /// Nothing to copy: the kernel lives in TTBR1, shared by all

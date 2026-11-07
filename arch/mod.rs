@@ -590,10 +590,12 @@ pub trait IoremapOps {
 
     /// Unmap a previously mapped device memory region
     ///
-    /// # Arguments
-    /// * `virt_addr` - Virtual address returned by ioremap
-    /// * `size` - Size of the region (must match ioremap call)
-    fn iounmap(virt_addr: *mut u8, size: u64);
+    /// # Safety
+    ///
+    /// `virt_addr` and `size` are a mapping `ioremap` returned (with that
+    /// size) that the caller owns, and nothing uses it any more: no
+    /// reference into it or accessor of it (`IoMem`) is left.
+    unsafe fn iounmap(virt_addr: *mut u8, size: u64);
 }
 
 // ============================================================================

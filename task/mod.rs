@@ -119,7 +119,6 @@ use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, Ordering};
 
-use crate::arch::ArchPageTable;
 use crate::fs::FsStruct;
 use crate::ipc::sem::SemUndoList;
 use crate::ns::NsProxy;
@@ -1140,8 +1139,9 @@ pub struct TaskInner {
     /// Current state
     pub state: TaskState,
     /// CPU affinity mask (bit N = CPU N is allowed)
-    /// Page table for this task
-    pub page_table: ArchPageTable,
+    /// Top-level page table it runs on: its mm's, else the kernel's
+    /// (`ArchPageTable::kernel_identity`)
+    pub pgd: u64,
 
     // =========================================================================
     // TLS and thread-exit fields (Linux: embedded in task_struct/thread_struct)

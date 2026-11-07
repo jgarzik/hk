@@ -1636,7 +1636,7 @@ layout in `doc/MEMORY.md`
   is freed; arm64 broadcasts, x86 sends IPIs.
 - Kernel stacks (`mm::vmstack`, Linux VMAP_STACK): 16KB of single
   pages at the start of a 64KB slot, the rest unmapped (the guard gap
-  the next stack's overflow faults in). `free` (from `DeadTask::drop`,
+  the next stack's overflow faults in). Freeing (a `VmStack` dropped, from `DeadTask::drop`,
   possibly with interrupts off) unmaps and frees the pages with a
   local flush and marks the slot dirty under `SLOTS`; `alloc` (thread
   context) flushes the whole area on every CPU once 64 slots are dirty,

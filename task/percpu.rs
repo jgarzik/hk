@@ -200,8 +200,8 @@ unsafe impl Send for CpuRunQueue {}
 /// What an exited task still holds while its CPU runs on its stack and
 /// its page tables: freed by the next task (`DeadTask::drop`)
 pub struct DeadTask {
-    /// Kernel stack (`mm::vmstack` base) and size; size 0 = not owned
-    stack: (u64, usize),
+    /// Its kernel stack, if it owned one
+    stack: Option<crate::mm::vmstack::VmStack>,
     /// mm_count reference on the address space it last ran in (mmdrop)
     mm: Option<alloc::sync::Arc<crate::mm::Mm>>,
     /// The run queue's reference (per-CPU `curr` pointed at it)
@@ -217,9 +217,11 @@ const STACK_MIN_LEFT: usize = 4096;
 /// zeroed, so the untouched bottom shows how deep the task ever went.
 /// An overflow faults in the guard gap below the stack (a "kernel stack
 /// overflow" panic); this reports a path that came close. Reported once.
-fn check_stack_usage(base: u64, size: usize) {
-    // SAFETY: the dead task's stack, still owned and no longer in use
-    let words = unsafe { core::slice::from_raw_parts(base as *const u64, size / 8) };
+fn check_stack_usage(stack: &crate::mm::vmstack::VmStack) {
+    let size = crate::mm::vmstack::THREAD_SIZE;
+    // SAFETY: the dead task's stack, mapped while `stack` lives and no
+    // longer in use
+    let words = unsafe { core::slice::from_raw_parts(stack.base() as *const u64, size / 8) };
     let left = words.iter().position(|&w| w != 0).unwrap_or(words.len()) * 8;
     if left < STACK_MIN_LEFT {
         static REPORTED: AtomicBool = AtomicBool::new(false);
@@ -236,10 +238,8 @@ fn check_stack_usage(base: u64, size: usize) {
 
 impl Drop for DeadTask {
     fn drop(&mut self) {
-        let (base, size) = self.stack;
-        if size != 0 {
-            check_stack_usage(base, size);
-            crate::mm::vmstack::free(base);
+        if let Some(stack) = self.stack.take() {
+            check_stack_usage(&stack);
         }
         // mmdrop: the last reference frees the top-level table
         drop(self.mm.take());
@@ -1335,8 +1335,8 @@ fn create_kernel_task(
     const NOMEM: &str = "Out of memory for kernel thread";
     let cred = try_arc(Cred::ROOT).map_err(|_| NOMEM)?;
     let sig = crate::signal::TaskSignalState::new();
-    let stack_base = crate::mm::vmstack::alloc().ok_or("Out of memory for kernel thread stack")?;
-    let stack_top = stack_base + KERNEL_STACK_SIZE as u64;
+    let stack = crate::mm::vmstack::alloc().ok_or("Out of memory for kernel thread stack")?;
+    let stack_top = stack.top();
 
     let task_inner = crate::task::TaskInner {
         thread_pid,
@@ -1349,7 +1349,7 @@ fn create_kernel_task(
         parent_exec_id: 0,
         pdeath_signal: 0,
         state: TaskState::Ready,
-        page_table: ArchPageTable::kernel_identity(),
+        pgd: ArchPageTable::kernel_identity().root_table_phys(),
         // TLS fields (not used for idle task)
         clear_child_tid: 0,
         set_child_tid: 0,
@@ -1405,10 +1405,9 @@ fn create_kernel_task(
     set_kthread_class(&task.se, priority);
     // SAFETY: not on a run queue yet
     unsafe { *task.se.ctx() = TaskContext::new_kernel_thread(entry, stack_top) };
-    let task = try_arc(task).map_err(|_| {
-        crate::mm::vmstack::free(stack_base);
-        NOMEM
-    })?;
+    task.se.stack.set(stack);
+    // On failure the stack goes with the task
+    let task = try_arc(task).map_err(|_| NOMEM)?;
     if idle {
         set_idle(cpu_id, &task);
     } else {
@@ -1563,7 +1562,7 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<Tid, &'static str> {
         parent_exec_id: 0,
         pdeath_signal: 0,
         state: TaskState::Running, // Will be running immediately
-        page_table: config.page_table,
+        pgd: config.page_table.root_table_phys(),
         // TLS fields (initialized to 0, set by syscalls)
         clear_child_tid: 0,
         set_child_tid: 0,
@@ -1621,9 +1620,8 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<Tid, &'static str> {
     // Add to global table
     TASKLIST.write().insert(task.clone());
 
-    // The boot-allocated stack of the first task is never freed; its
-    // switch frame is saved at its first switch out
-    task.se.disown_stack();
+    // The boot-allocated stack of the first task is not its own (never
+    // freed); its switch frame is saved at its first switch out
     task.se.set_state(RUNNING);
     task.se.set_on_rq(true);
     task.se.set_on_cpu(true);
@@ -2183,7 +2181,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
                 parent.task.se.reset_on_fork(),
             ),
             parent.task.cpus_mask.snapshot(),
-            parent.page_table.root_table_phys(),
+            parent.pgd,
             parent.cred_arc(),
             parent.prctl.clone(),
             parent.personality,
@@ -2292,11 +2290,11 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
             Some(crate::mm::dup_mm(&pm, pt.root_table_phys())?)
         }
     };
-    let child_pt = ArchPageTable::new(child_mm.as_ref().map_or(parent_pt_phys, |m| m.pgd()));
+    let child_pgd = child_mm.as_ref().map_or(parent_pt_phys, |m| m.pgd());
 
     // The child's kernel stack (zeroed, guard gap below)
-    let stack_base = crate::mm::vmstack::alloc().ok_or(12)?; // ENOMEM
-    let kstack_top = stack_base + KERNEL_STACK_SIZE as u64;
+    let stack = crate::mm::vmstack::alloc().ok_or(12)?; // ENOMEM
+    let kstack_top = stack.top();
 
     // Build child's TrapFrame at the top of the child's kernel stack (its
     // pt_regs), the inherited FP/SIMD state below it if the arch keeps
@@ -2360,7 +2358,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         },
         pdeath_signal: 0, // Never inherited, must be set explicitly via prctl
         state: TaskState::Ready,
-        page_table: child_pt,
+        pgd: child_pgd,
         // TLS fields - will be set based on clone flags below
         clear_child_tid: 0,
         set_child_tid: 0,
@@ -2426,7 +2424,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         ptrace_frozen: false,
         last_siginfo: None,
     };
-    let child_task = try_arc(Task::new(
+    let child_task = Task::new(
         child_tid,
         crate::task::TaskIds {
             pid: child_pid,
@@ -2445,13 +2443,11 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         parent_alloc,
         child_sig,
         child_task_inner,
-    ))
-    .map_err(|e| {
-        // Nothing else owns the stack yet (its pid and mm went with
-        // the unbuilt task)
-        crate::mm::vmstack::free(stack_base);
-        e.errno()
-    })?;
+    );
+    child_task.se.stack.set(stack);
+    // On failure the stack goes with the unbuilt task, like its pid
+    // and mm
+    let child_task = try_arc(child_task).map_err(|e| e.errno())?;
     if parent_nproc_exceeded {
         child_task.set_flag(crate::task::pf::NPROC_EXCEEDED);
     }
@@ -3258,11 +3254,7 @@ pub fn exit_current(status: Option<i32>) -> ! {
     // reference go once this CPU runs something else
     me.se.set_on_rq(false);
     rq.add_nr(-1);
-    let stack = if me.se.owns_stack() {
-        (me.kstack_top - KERNEL_STACK_SIZE as u64, KERNEL_STACK_SIZE)
-    } else {
-        (0, 0)
-    };
+    let stack = me.se.stack.take();
     // SAFETY: the run queue's reference to the running task
     let task = Some(unsafe { Arc::from_raw(rq.curr) });
     rq.dead = Some(DeadTask {
@@ -5164,7 +5156,7 @@ pub fn exec_replace_image(
         let mut table = TASKLIST.write();
         let task = table.get_mut(tid);
         let mut task = task.expect("exec: current task not in the task table");
-        task.page_table = ArchPageTable::new(new.pgd());
+        task.pgd = new.pgd();
         new.set_dumpable(ident.dumpable);
         // A new execution domain (Linux de_thread): SIGCHLD; a secure
         // exec is not signalled at its parent's death (begin_new_exec)

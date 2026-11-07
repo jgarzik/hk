@@ -25,21 +25,6 @@ infallible, so each one is investigated, not written off.
   missed wakeup on the contended mmap_lock; a recurrence should dump
   the stuck threads' state.
 
-## Safe kernel code that can cause UB (doc/UNSAFE.md)
-
-These are safe fns or patterns whose use leads to undefined behaviour.
-None is known to fail today, but each is a soundness bug:
-
-- **Safe fns that take addresses:**
-  - `ArchPageTable::new(root)` is safe, and its `translate` and
-    `map_with_alloc` walk that root (callers in task/: exec, fork): it
-    should be an `unsafe fn`, or the table built only from an owned
-    root.
-  - `vmstack::free(base)` (callers in task/) and `iounmap(addr, size)`
-    (acpi, xhci, pci_quirks, selftest) unmap whatever range they are
-    given: they should be `unsafe fn`s or take the owning handle
-    (`vmalloc::VmArea`, an ioremap mapping).
-
 ## unsafe not yet wrapped or documented (doc/UNSAFE.md)
 
 There are 56 files with `#![expect(clippy::undocumented_unsafe_blocks)]

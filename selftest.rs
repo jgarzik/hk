@@ -394,7 +394,9 @@ fn canary_run(f1: u64, f2: u64, cpu: u32) -> Result<(u64, u64), (&'static str, u
             CANARY_SEEN[1].load(Ordering::Relaxed),
         ))
     })();
-    CurrentArch::iounmap(va as *mut u8, 4096);
+    // SAFETY: this test's mapping, no longer used (the remote reader
+    // is done or gave up)
+    unsafe { CurrentArch::iounmap(va as *mut u8, 4096) };
     r
 }
 

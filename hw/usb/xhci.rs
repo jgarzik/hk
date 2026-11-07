@@ -2061,7 +2061,9 @@ impl XhciController {
             self.dcbaa_phys = 0;
         }
         if self.mmio_len != 0 {
-            CurrentArch::iounmap(self.mmio_base as *mut u8, self.mmio_len);
+            // SAFETY: the controller's registers, mapped at probe and
+            // no longer used (the device is stopped)
+            unsafe { CurrentArch::iounmap(self.mmio_base as *mut u8, self.mmio_len) };
             self.mmio_len = 0;
         }
     }

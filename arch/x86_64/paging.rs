@@ -625,16 +625,23 @@ impl RawPageTable {
 ///
 /// # Invariants
 ///
-/// `pml4_phys` is a live top-level table its holder owns. `new` does
-/// not check it (BUGS.md: safe fns that take addresses).
+/// `pml4_phys` is a live top-level table its holder owns: a fresh one
+/// (`new_user`) or the swapper (`kernel_identity`), the only ways to
+/// make one.
 pub struct X86_64PageTable {
     /// Physical address of PML4
     pml4_phys: u64,
 }
 
 impl X86_64PageTable {
-    /// Create a new page table with the given PML4 physical address
-    pub fn new(pml4_phys: u64) -> Self {
+    /// The table at `pml4_phys`
+    ///
+    /// # Safety
+    ///
+    /// `pml4_phys` is a live top-level table the result's holder owns
+    /// (type invariant).
+    unsafe fn from_root(pml4_phys: u64) -> Self {
+        // INVARIANT: the caller's guarantee
         Self { pml4_phys }
     }
 
@@ -648,7 +655,8 @@ impl X86_64PageTable {
 
     /// The kernel page table (swapper): kernel threads run on it
     pub fn kernel_identity() -> Self {
-        Self::new(super::kmap::swapper_phys())
+        // SAFETY: the swapper, live forever
+        unsafe { Self::from_root(super::kmap::swapper_phys()) }
     }
 
     /// Create a new user page table (allocates PML4)
@@ -656,7 +664,8 @@ impl X86_64PageTable {
         let pml4_phys = frame_alloc.alloc_frame()?;
         // SAFETY: a fresh frame, reached through the direct map
         unsafe { core::ptr::write_bytes(phys_to_virt(pml4_phys), 0, PAGE_SIZE as usize) };
-        Some(Self::new(pml4_phys))
+        // SAFETY: a fresh zeroed table frame, the result's
+        Some(unsafe { Self::from_root(pml4_phys) })
     }
 
     /// Map a virtual address to physical with on-demand page table allocation

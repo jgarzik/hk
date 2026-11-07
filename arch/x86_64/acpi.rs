@@ -357,7 +357,8 @@ fn table_signature(phys: u64) -> Option<[u8; 4]> {
     let ptr = unsafe { ioremap(phys, size) }.ok()?;
     // SAFETY: the header is mapped; the signature is its first 4 bytes
     let sig = unsafe { core::ptr::read_unaligned(ptr as *const [u8; 4]) };
-    iounmap(ptr, size);
+    // SAFETY: the mapping just made, no longer used
+    unsafe { iounmap(ptr, size) };
     Some(sig)
 }
 
@@ -581,7 +582,8 @@ fn parse_fadt_mapped(fadt_phys: u64) -> Result<(PowerInfo, u64), &'static str> {
 
     let reset = reset_reg(&t);
 
-    iounmap(ptr, len as u64);
+    // SAFETY: the table's mapping, no longer used (`t` is done)
+    unsafe { iounmap(ptr, len as u64) };
     let power = PowerInfo {
         pm,
         s5: SleepType::default(),
@@ -654,7 +656,8 @@ fn table_s5(phys: u64, sig: &[u8; 4]) -> Option<SleepType> {
     } else {
         None
     };
-    iounmap(ptr, len as u64);
+    // SAFETY: the table's mapping, no longer used (`body` is gone)
+    unsafe { iounmap(ptr, len as u64) };
     s5
 }
 
