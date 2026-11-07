@@ -2714,38 +2714,29 @@ fn with_entry<R>(mut f: impl FnMut(&mut GlobalTaskTable, &mut Entry) -> Result<R
 /// exit_notify: EXIT_ZOMBIE and do_notify_parent under tasklist_lock),
 /// so a wait never reaps it before its signal is pending: a traced task
 /// its tracer; a leader with no other thread left to report it
-/// (thread_group_empty) its parent; a non-leader thread is then
-/// released, and if it was the last of a group whose leader is a
-/// zombie, the leader tells. A child the parent does not wait for is
-/// released at once (autoreap).
+/// (thread_group_empty) its parent. An untraced non-leader thread
+/// leaves the task list in that section (Linux autoreaps it), and if it
+/// was the last of a group whose leader is a zombie, the leader tells
+/// there. A child the parent does not wait for is released at once
+/// (autoreap).
 // Not inlined: its send path's stack is used only for the call, not
 // added to exit_current's frame for the rest of the exit
 #[inline(never)]
 fn exit_notify(tid: Tid, status: i32, group_dead: bool) {
-    let r = with_entry(|table, entry| {
-        let Some(t) = table.get(tid) else {
-            return Ok(None);
-        };
-        let (pid, traced) = (t.task.pid, t.ptrace != 0);
-        let last = t.leader && !group_pending(table, pid, &[tid]);
-        let tells = traced || last;
-        if tells && !entry.fits(table, tid) {
-            return Err(tid);
-        }
-        if let Some(mut t) = table.get_mut(tid) {
-            t.exit_code = status;
-            t.state = TaskState::Zombie(status);
-        }
-        let told = tells.then(|| notify(table, tid, core::mem::take(entry)));
-        let gone = match &told {
-            Some(t) if t.autoreap && !traced => reap_locked(table, tid),
-            _ => None,
-        };
-        Ok(Some((pid, told, gone)))
-    });
-    let Some((pid, told, gone)) = r else {
+    let r = with_entry(|table, entry| exit_locked(table, entry, tid, status));
+    let Some(Exited {
+        pid,
+        thread,
+        told,
+        gone,
+    }) = r
+    else {
         return;
     };
+    if let Some(t) = &thread {
+        crate::fs::proc::proc_flush_pid(t.pid, tid);
+    }
+    drop(thread);
     if let Some(t) = told {
         t.finish();
     }
@@ -2755,7 +2746,70 @@ fn exit_notify(tid: Tid, status: i32, group_dead: bool) {
     if group_dead {
         crate::task::pidfd::notify_process_exit(pid, status);
     }
-    release_thread(tid);
+}
+
+/// What [`exit_locked`] leaves for after TASKLIST: the process, the
+/// thread it took out of the list, the notice's wakeups, the zombie
+/// leader it autoreaped
+struct Exited {
+    pid: Pid,
+    thread: Option<TaskRef>,
+    told: Option<Told>,
+    gone: Option<Reaped>,
+}
+
+/// [`exit_notify`]'s TASKLIST write section for task `tid`;
+/// `Err(z)`: an entry for zombie `z`'s notice is needed first
+fn exit_locked(
+    table: &mut GlobalTaskTable,
+    entry: &mut Entry,
+    tid: Tid,
+    status: i32,
+) -> Result<Option<Exited>, Tid> {
+    let Some(t) = table.get(tid) else {
+        return Ok(None);
+    };
+    let (pid, traced, leader) = (t.task.pid, t.ptrace != 0, t.leader);
+    // A traced task stays for its tracer, a leader for its parent; an
+    // untraced thread goes now
+    let stays = traced || leader;
+    let teller = if stays {
+        (traced || !group_pending(table, pid, &[tid])).then_some(tid)
+    } else {
+        last_thread(table, pid, tid).then_some(pid)
+    };
+    if let Some(z) = teller
+        && !entry.fits(table, z)
+    {
+        return Err(z);
+    }
+    if let Some(mut t) = table.get_mut(tid) {
+        t.exit_code = status;
+        t.state = TaskState::Zombie(status);
+    }
+    let thread = if stays { None } else { table.remove(tid) };
+    let told = teller.map(|z| notify(table, z, core::mem::take(entry)));
+    let gone = match (&told, teller) {
+        (Some(t), Some(z)) if t.autoreap => reap_locked(table, z),
+        _ => None,
+    };
+    Ok(Some(Exited {
+        pid,
+        thread,
+        told,
+        gone,
+    }))
+}
+
+/// Thread `tid` of process `pid` is the last but its zombie leader:
+/// its removal leaves the leader with no thread to wait for (Linux
+/// release_task: thread_group_empty and the leader's EXIT_ZOMBIE)
+fn last_thread(table: &GlobalTaskTable, pid: Pid, tid: Tid) -> bool {
+    table.get(pid).is_some_and(|l| {
+        l.leader
+            && matches!(l.state, TaskState::Zombie(_))
+            && !group_pending(table, pid, &[pid, tid])
+    })
 }
 
 /// Process `pid`'s leader is an untraced zombie with no other thread
@@ -2766,7 +2820,7 @@ fn leader_waits(table: &GlobalTaskTable, pid: Pid) -> bool {
         l.leader
             && l.ptrace == 0
             && matches!(l.state, TaskState::Zombie(_))
-            && !group_alive(table, pid, pid)
+            && !group_pending(table, pid, &[pid])
     })
 }
 
@@ -2798,49 +2852,6 @@ fn release(gone: Option<Reaped>) {
     crate::task::nproc_uncharge(uid);
     drop(t);
     crate::task::proc::CHILD_EXIT_WQ.wake_all();
-}
-
-/// An exited non-leader thread leaves the task list at once (Linux
-/// release_task for an autoreaped thread); its run queue keeps it
-/// until it has switched away for good
-///
-/// If that leaves its group's zombie leader with no thread to wait
-/// for, the leader tells its parent in the same TASKLIST write section
-/// as the removal (Linux release_task: thread_group_empty, EXIT_ZOMBIE
-/// and do_notify_parent under tasklist_lock), so the leader's own exit
-/// and its threads' releases report it once, and no wait reaps it
-/// before its signal is pending
-fn release_thread(tid: Tid) {
-    let (gone, told, reaped) = with_entry(|table, entry| {
-        let pid = match table.get(tid) {
-            // A traced thread stays for its tracer's wait
-            Some(t) if !t.leader && t.ptrace == 0 => t.task.pid,
-            _ => return Ok((None, None, None)),
-        };
-        let last = table.get(pid).is_some_and(|l| {
-            l.leader
-                && matches!(l.state, TaskState::Zombie(_))
-                && !group_pending(table, pid, &[pid, tid])
-        });
-        if last && !entry.fits(table, pid) {
-            return Err(pid);
-        }
-        let gone = table.remove(tid);
-        let told = last.then(|| notify(table, pid, core::mem::take(entry)));
-        let reaped = match &told {
-            Some(t) if t.autoreap => reap_locked(table, pid),
-            _ => None,
-        };
-        Ok((gone, told, reaped))
-    });
-    if let Some(t) = &gone {
-        crate::fs::proc::proc_flush_pid(t.pid, tid);
-    }
-    drop(gone);
-    if let Some(t) = told {
-        t.finish();
-    }
-    release(reaped);
 }
 
 /// Exit the current task and switch to another

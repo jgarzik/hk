@@ -2902,13 +2902,15 @@ de_thread, exit_group does not.
 - A leader is reported to its parent once (Linux exit_notify /
   release_task under tasklist_lock): the leader decides in the TASKLIST
   write section that makes it a zombie (`exit_notify`), each untraced
-  thread in the one that removes it (`release_thread`); a thread still
-  listed counts as left to report it, so exactly the last section
-  finds the group empty.
+  thread in the one that ends it, which also takes it out of the task
+  list (`exit_notify`, Linux autoreaps it); a thread still listed counts
+  as left to report it (`group_pending`, also for a reparent), so
+  exactly the last section finds the group empty, and no wait reaps the
+  leader before that section.
 - A zombie's notice (Linux do_notify_parent) is queued in the TASKLIST
   write section that makes it reapable: the one that makes it a zombie
-  (`exit_notify`), removes its group's last thread (`release_thread`)
-  or moves it to a parent in another process (`reparent_children`,
+  (`exit_notify`), removes its group's last thread (`exit_notify` of
+  that thread) or moves it to a parent in another process (`reparent_children`,
   Linux reparent_leader). So no wait reaps it before its signal is
   pending, and a parent the signal wakes finds it. Under the write
   lock: the receiver and signal, the autoreap decision (the parent's
