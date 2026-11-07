@@ -1730,14 +1730,15 @@ pub fn reap_zombie_child_times(
         target_pid,
         wflags,
         pgid,
+        ns: crate::task::pid::current_pid_ns(),
     };
     let (report, done) = with_entry(|table, entry| wait_zombie(table, entry, &w))?;
     done.finish();
     Some(report)
 }
 
-/// A reaped zombie's tid (a leader's: its pid), wait status, user and
-/// system time
+/// A reaped zombie's tid (a leader's: its pid; reported in the
+/// waiter's namespace), wait status, user and system time
 type WaitReport = (Pid, i32, u64, u64);
 
 /// What a wait4/waitid asks for: the waiting process, wait4's pid,
@@ -1747,6 +1748,8 @@ struct Wait {
     target_pid: i64,
     wflags: i32,
     pgid: Pid,
+    /// The waiter's pid namespace, which numbers the report
+    ns: &'static crate::ns::PidNamespace,
 }
 
 /// Zombie `t` is one `w` reaps (Linux wait_consider_task): never a
@@ -1816,11 +1819,19 @@ fn wait_zombie(
     let Some((report, kind)) = found else {
         return Ok(None);
     };
+    // Numbered for the waiter while the zombie is still listed (Linux
+    // wait_task_zombie: task_pid_vnr)
+    let tid = report.0;
+    let report = (
+        Pid::from(crate::task::pid::nr_ns(tid, w.ns)),
+        report.1,
+        report.2,
+        report.3,
+    );
     // WNOWAIT (waitid): report the zombie, leave it waitable
     if w.wflags & super::wait_options::WNOWAIT != 0 {
         return Ok(Some((report, Unhashed::default())));
     }
-    let tid = report.0;
     if kind == Reap::Traced {
         // Its real parent is told now, as if it had never been traced
         // (Linux wait_task_zombie: EXIT_TRACE, ptrace_unlink,
@@ -2013,8 +2024,8 @@ fn group_status(t: &TaskInner, own: i32) -> i32 {
 
 /// A ptrace stop of a task traced by the group `tracer_pid`, matching
 /// `target_pid` (wait4's pid: > 0 that tid, -1 any, 0 the caller's
-/// process group, < -1 that group), not yet reported: its tid and the
-/// stop's code. Reported once unless `wnowait` (Linux wait_task_stopped
+/// process group, < -1 that group), not yet reported: its tid (as the
+/// caller numbers it) and the stop's code. Reported once unless `wnowait` (Linux wait_task_stopped
 /// with ptrace: exit_code cleared). Found under the read lock; the write
 /// lock only to take the code.
 pub fn wait_traced(tracer_pid: Pid, target_pid: i64, wnowait: bool) -> Option<(Tid, u32)> {
@@ -2037,7 +2048,12 @@ pub fn wait_traced(tracer_pid: Pid, target_pid: i64, wnowait: bool) -> Option<(T
     if !wnowait {
         t.ptrace_code = 0;
     }
-    Some((tid, code))
+    // The tracee as the tracer numbers it (Linux wait_task_stopped:
+    // task_pid_vnr)
+    Some((
+        Tid::from(crate::task::pid::nr_ns(tid, current_pid_ns())),
+        code,
+    ))
 }
 
 /// `t` is what wait4's `target_pid` names (`pgid`: the caller's group)
