@@ -262,14 +262,24 @@ pub struct Out {
     pub err: Option<KernelError>,
     /// Socket shutdown bits to set (Linux sk_shutdown)
     pub shut: u8,
-    /// Wake readers, writers and pollers
-    pub wake: bool,
+    /// Wakeups to make after the lock (`wake::*`)
+    pub wake: u8,
     /// The connection is over (CLOSED): leave the tables
     pub done: bool,
     /// Entered TIME_WAIT: hand over to a timewait entry
     pub timewait: bool,
     /// The handshake completed (SYN_RECEIVED/SYN_SENT -> ESTABLISHED)
     pub established: bool,
+}
+
+/// What an `Out` wakes the socket for
+pub mod wake {
+    /// State change: everyone (Linux sk_state_change)
+    pub const STATE: u8 = 1;
+    /// Data to read (Linux tcp_data_ready)
+    pub const DATA: u8 = 2;
+    /// Room to write (Linux tcp_new_space)
+    pub const SPACE: u8 = 4;
 }
 
 /// Socket shutdown bits (same values as `net::sock`)
@@ -1135,7 +1145,7 @@ impl TcpCb {
         self.stop_timers();
         self.mem_settle();
         out.shut |= SHUTDOWN_MASK;
-        out.wake = true;
+        out.wake |= wake::STATE;
         out.done = true;
     }
 
@@ -1147,7 +1157,7 @@ impl TcpCb {
         self.mem_settle();
         self.wait_at = Some(now + TIMEWAIT_LEN);
         out.timewait = true;
-        out.wake = true;
+        out.wake |= wake::STATE;
     }
 
     /// The TIME_WAIT part of this control block: what a timewait
@@ -1162,7 +1172,7 @@ impl TcpCb {
         self.state = TcpState::Closed;
         self.stop_timers();
         out.shut |= SHUTDOWN_MASK;
-        out.wake = true;
+        out.wake |= wake::STATE;
     }
 
     /// Orphan in FIN_WAIT_2: give up after tcp_fin_timeout

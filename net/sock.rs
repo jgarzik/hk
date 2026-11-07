@@ -20,6 +20,9 @@ use core::sync::atomic::{AtomicI32, AtomicU8, AtomicU32, AtomicU64, AtomicUsize,
 
 use crate::sync::spin::Mutex;
 
+use crate::io::poll::{
+    POLLERR, POLLIN, POLLOUT, POLLPRI, POLLRDBAND, POLLRDNORM, POLLWRBAND, POLLWRNORM,
+};
 use crate::net::NetNamespace;
 use crate::sync::waitqueue::WaitQueue;
 use crate::task::Cred;
@@ -199,11 +202,11 @@ impl Sock {
 
     // --- errors ----------------------------------------------------------
 
-    /// Record an asynchronous error and wake everyone (Linux
+    /// Record an asynchronous error and report it (Linux
     /// sk_error_report)
     pub fn set_err(&self, e: KernelError) {
         self.err.store(e as i32, Ordering::Release);
-        self.wq.wake_all();
+        self.error_report();
     }
 
     pub fn has_err(&self) -> bool {
@@ -230,7 +233,7 @@ impl Sock {
         }
         self.errmem.fetch_add(ts, Ordering::AcqRel);
         self.errq.lock().push_back(e);
-        self.wq.wake_all();
+        self.error_report();
         true
     }
 
@@ -251,7 +254,7 @@ impl Sock {
             _ => {}
         }
         if next.is_some() {
-            self.wq.wake_all();
+            self.error_report();
         }
         Some(e)
     }
@@ -310,29 +313,31 @@ impl Sock {
     }
 
     /// SO_RCVBUF: Linux doubles the request (for bookkeeping overhead),
-    /// caps it at rmem_max unless `force`, floors it at SOCK_MIN_RCVBUF
+    /// caps it at rmem_max unless `force`, floors it at SOCK_MIN_RCVBUF;
+    /// no wakeup (Linux __sock_set_rcvbuf)
     pub fn set_rcvbuf(&self, v: i32, force: bool) {
         self.rcvbuf
             .store(buf_size(v, force, MIN_RCVBUF), Ordering::Release);
         self.set_flag(sf::RCVBUF_LOCK, true);
-        self.wq.wake_all();
     }
 
+    /// SO_SNDBUF: as SO_RCVBUF; writers may have room now (Linux
+    /// sk_write_space)
     pub fn set_sndbuf(&self, v: i32, force: bool) {
         self.sndbuf
             .store(buf_size(v, force, MIN_SNDBUF), Ordering::Release);
-        self.wq.wake_all();
+        self.write_space();
     }
 
     pub fn rcvlowat(&self) -> i32 {
         self.rcvlowat.load(Ordering::Acquire)
     }
 
-    /// SO_RCVLOWAT: negative = INT_MAX, 0 = 1 (Linux sk_setsockopt)
+    /// SO_RCVLOWAT: negative = INT_MAX, 0 = 1 (Linux sk_setsockopt); no
+    /// wakeup (TCP's own makes one)
     pub fn set_rcvlowat(&self, v: i32) {
         let v = if v < 0 { i32::MAX } else { v.max(1) };
         self.rcvlowat.store(v, Ordering::Release);
-        self.wq.wake_all();
     }
 
     /// SO_LINGER: the time in seconds when switched on (one atomic
@@ -388,18 +393,30 @@ impl Sock {
         if nonblock { 0 } else { self.sndtimeo() }
     }
 
-    // --- wakeups (Linux sk_data_ready / sk_write_space / sk_state_change)
+    // --- wakeups (Linux sk_data_ready / sk_write_space / sk_state_change
+    // / sk_error_report): everyone wakes; an epoll item only for the
+    // events named, the state change names none
 
+    /// Linux sock_def_readable
     pub fn data_ready(&self) {
-        self.wq.wake_all();
+        self.wq
+            .wake_poll(u32::from(POLLIN | POLLPRI | POLLRDNORM | POLLRDBAND));
     }
 
+    /// Linux sock_def_write_space
     pub fn write_space(&self) {
-        self.wq.wake_all();
+        self.wq
+            .wake_poll(u32::from(POLLOUT | POLLWRNORM | POLLWRBAND));
     }
 
+    /// Linux sock_def_wakeup
     pub fn state_change(&self) {
         self.wq.wake_all();
+    }
+
+    /// Linux sock_def_error_report
+    pub fn error_report(&self) {
+        self.wq.wake_poll(u32::from(POLLERR));
     }
 
     /// Wait on this socket's queue until `cond()` (`wait_on`)

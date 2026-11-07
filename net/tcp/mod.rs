@@ -75,8 +75,8 @@ use crate::net::msg::{
 use crate::net::skb::SkBuff;
 use crate::net::sock::{RCV_SHUTDOWN, SEND_SHUTDOWN, SHUTDOWN_MASK, Sock, sf};
 use crate::net::socket::{
-    AF_INET, AF_UNSPEC, OptIn, OptOut, ProtoOps, SIOCINQ, SIOCOUTQ, SO_KEEPALIVE, SOCK_STREAM,
-    SOL_SOCKET, shut_bits,
+    AF_INET, AF_UNSPEC, OptIn, OptOut, ProtoOps, SIOCINQ, SIOCOUTQ, SO_KEEPALIVE, SO_RCVLOWAT,
+    SOCK_STREAM, SOL_SOCKET, shut_bits,
 };
 use crate::net::{NetNamespace, dev};
 
@@ -363,9 +363,9 @@ impl TcpSock {
 
     /// Apply `out` under the lock (Linux transmits and sets sk_err /
     /// sk_shutdown under the socket lock): publish the shutdown bits and
-    /// the error, then transmit to `t`. True: wake the socket after
-    /// unlocking.
-    fn emit(&self, out: &Out, t: Option<Tuple>) -> bool {
+    /// the error (reported at once), then transmit to `t`. Returns the
+    /// wakeups to make after unlocking.
+    fn emit(&self, out: &Out, t: Option<Tuple>) -> u8 {
         if out.shut != 0 {
             self.sk.set_shutdown(out.shut);
         }
@@ -378,7 +378,7 @@ impl TcpSock {
                 xmit(&self.sk.net, &t, seg, p, self.oif());
             }
         }
-        out.wake || out.err.is_some()
+        out.wake
     }
 
     /// Lock, run `f` on the control block, post-process and apply the
@@ -393,13 +393,25 @@ impl TcpSock {
             let ready = self.post(&mut g, &mut out);
             (r, self.emit(&out, t), ready)
         };
-        if wake {
-            self.sk.state_change();
-        }
+        self.wake(wake);
         if let Some(l) = ready {
             l.sk.data_ready();
         }
         r
+    }
+
+    /// The wakeups `w` (`cb::wake`) asked for
+    fn wake(&self, w: u8) {
+        if w & cb::wake::STATE != 0 {
+            self.sk.state_change();
+            return;
+        }
+        if w & cb::wake::DATA != 0 {
+            self.sk.data_ready();
+        }
+        if w & cb::wake::SPACE != 0 {
+            self.sk.write_space();
+        }
     }
 
     /// The address part of the socket as a tuple (after the connection
@@ -1385,6 +1397,7 @@ impl ProtoOps for TcpSock {
     fn setsockopt(&self, level: i32, opt: i32, v: OptIn) -> Option<Result<(), KernelError>> {
         match level {
             SOL_SOCKET if opt == SO_KEEPALIVE => Some(self.set_keepalive(v)),
+            SOL_SOCKET if opt == SO_RCVLOWAT => Some(self.set_rcvlowat(v)),
             SOL_SOCKET => None,
             SOL_IP => Some(self.inet.setsockopt(&self.sk, opt, v)),
             PROTO_TCP => Some(self.set_tcp_opt(opt, v)),
@@ -1459,7 +1472,7 @@ impl TcpSock {
                 }
                 TCP_NOTSENT_LOWAT => {
                     g.cb.opts.notsent_lowat = val as u32;
-                    out.wake = true;
+                    out.wake |= cb::wake::SPACE;
                 }
                 _ => return Err(KernelError::NoProtocolOption),
             }
@@ -1528,6 +1541,14 @@ impl TcpSock {
         crate::net::socket::sock_setsockopt(self, SO_KEEPALIVE, v)?;
         let on = self.sk.flag(sf::KEEPALIVE);
         self.step(|g, _| g.cb.set_keepalive(on, now_ms()));
+        Ok(())
+    }
+
+    /// Readers may have enough now (Linux tcp_set_rcvlowat:
+    /// tcp_data_ready)
+    fn set_rcvlowat(&self, v: OptIn) -> Result<(), KernelError> {
+        crate::net::socket::sock_setsockopt(self, SO_RCVLOWAT, v)?;
+        self.sk.data_ready();
         Ok(())
     }
 }

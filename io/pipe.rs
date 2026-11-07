@@ -521,6 +521,18 @@ impl Pipe {
             self.wait_queue.wake_all();
         }
     }
+
+    /// Data for readers (Linux wakeup_pipe_readers: rd_wait with
+    /// EPOLLIN | EPOLLRDNORM)
+    pub fn wake_readers(&self) {
+        self.wait_queue.wake_poll(u32::from(POLLIN | POLLRDNORM));
+    }
+
+    /// Room for writers (Linux wakeup_pipe_writers: wr_wait with
+    /// EPOLLOUT | EPOLLWRNORM)
+    pub fn wake_writers(&self) {
+        self.wait_queue.wake_poll(u32::from(POLLOUT | POLLWRNORM));
+    }
 }
 
 impl Default for Pipe {
@@ -578,9 +590,8 @@ fn pipe_read(pipe: &Pipe, to: &mut IovDest<'_>, nonblock: bool) -> Result<usize,
         if !inner.is_empty() {
             let r = inner.read_to(to);
             drop(inner);
-            // Room for writers (Linux pipe_read wakes wr_wait with
-            // EPOLLOUT | EPOLLWRNORM)
-            pipe.wait_queue.wake_poll(u32::from(POLLOUT | POLLWRNORM));
+            // Room for writers (Linux pipe_read)
+            pipe.wake_writers();
             return r;
         }
         drop(inner);
@@ -624,9 +635,8 @@ fn pipe_write(pipe: &Pipe, from: &mut IovSource<'_>, nonblock: bool) -> Result<u
             drop(inner);
             done += n;
             if n > 0 {
-                // Data for readers (Linux pipe_write wakes rd_wait with
-                // EPOLLIN | EPOLLRDNORM)
-                pipe.wait_queue.wake_poll(u32::from(POLLIN | POLLRDNORM));
+                // Data for readers (Linux pipe_write)
+                pipe.wake_readers();
             }
             if let Some(e) = err {
                 return partial(done, e);

@@ -105,7 +105,7 @@ pub fn splice_to_pipe(
         Ok(()) => {
             // Wake readers - there's data
             drop(inner);
-            pipe.wait_queue.wake_all();
+            pipe.wake_readers();
             Ok(len as usize)
         }
         Err(_) => Err(KernelError::WouldBlock),
@@ -149,7 +149,7 @@ pub fn splice_from_pipe(pipe: &Pipe) -> Option<(Arc<PipePage>, u32, u32)> {
 
     // Wake writers - there's now space
     drop(inner);
-    pipe.wait_queue.wake_all();
+    pipe.wake_writers();
 
     Some((page, offset, len))
 }
@@ -230,7 +230,7 @@ pub fn link_pipe(src: &Pipe, dst: &Pipe, len: usize, _flags: u32) -> Result<usiz
     // Wake readers on destination
     drop(src_guard);
     drop(dst_guard);
-    dst.wait_queue.wake_all();
+    dst.wake_readers();
 
     Ok(copied)
 }
@@ -453,8 +453,8 @@ fn do_splice_pipe_to_pipe(src: &Pipe, dst: &Pipe, len: usize, flags: u32) -> i64
     drop(dst_guard);
 
     // Wake up waiters
-    src.wait_queue.wake_all();
-    dst.wait_queue.wake_all();
+    src.wake_writers();
+    dst.wake_readers();
 
     moved as i64
 }
@@ -556,7 +556,7 @@ fn do_splice_file_to_pipe(
     }
     drop(inner);
 
-    pipe.wait_queue.wake_all();
+    pipe.wake_readers();
 
     bytes_read as i64
 }
@@ -769,7 +769,7 @@ pub fn sys_vmsplice(fd: i32, iov: u64, nr_segs: usize, flags: u32) -> i64 {
         };
         if copy_from_user::<Uaccess>(dst, user_iov.base, to_copy).is_err() {
             // Bytes already queued count as success (Linux iov_iter)
-            pipe.wait_queue.wake_all();
+            pipe.wake_readers();
             return if total > 0 {
                 total as i64
             } else {
@@ -807,7 +807,7 @@ pub fn sys_vmsplice(fd: i32, iov: u64, nr_segs: usize, flags: u32) -> i64 {
         total += to_copy;
     }
 
-    pipe.wait_queue.wake_all();
+    pipe.wake_readers();
 
     total as i64
 }

@@ -223,7 +223,7 @@ fn ep_poll_callback(e: &WaitEntry, _mode: WakeMode, key: usize) -> bool {
     };
     if queued {
         ep.wq.wake_all();
-        ep.poll_wq.wake_all();
+        ep.poll_wq.wake_poll(u32::from(POLLIN));
     }
     true
 }
@@ -287,7 +287,7 @@ impl Eventpoll {
         };
         if queued {
             self.wq.wake_all();
-            self.poll_wq.wake_all();
+            self.poll_wq.wake_poll(u32::from(POLLIN));
         }
     }
 

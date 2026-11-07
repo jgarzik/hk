@@ -581,7 +581,7 @@ impl IoUring {
 
         // Wake up any waiters
         if submitted > 0 {
-            self.wq.wake_all();
+            self.wq.wake_poll(u32::from(crate::io::poll::POLLIN));
         }
 
         i64::from(submitted)

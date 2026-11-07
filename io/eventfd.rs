@@ -111,7 +111,7 @@ impl Eventfd {
         };
         // Wake any blocked writers since we freed up space
         drop(inner);
-        self.wait_queue.wake_all();
+        self.wait_queue.wake_poll(u32::from(POLLOUT));
         Ok(value)
     }
 
@@ -139,7 +139,7 @@ impl Eventfd {
         inner.count += value;
         // Wake any blocked readers
         drop(inner);
-        self.wait_queue.wake_all();
+        self.wait_queue.wake_poll(u32::from(POLLIN));
         Ok(8)
     }
 

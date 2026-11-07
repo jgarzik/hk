@@ -248,7 +248,9 @@ pub fn receive_buf(tty: &Tty, bytes: &[u8]) -> usize {
             crate::signal::kill_pgrp_pid(&pg, sig);
         }
     }
-    tty.read_wait.wake_all();
+    tty.read_wait.wake_poll(u32::from(
+        crate::io::poll::POLLIN | crate::io::poll::POLLRDNORM,
+    ));
     taken
 }
 

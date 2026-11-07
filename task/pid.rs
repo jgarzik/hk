@@ -116,7 +116,9 @@ impl Pid {
     /// pidfd pollers wake (Linux do_notify_pidfd)
     pub fn set_exited(&self, status: i32) {
         self.exit.store(i64::from(status), Ordering::Release);
-        self.wait_pidfd.wake_all();
+        self.wait_pidfd.wake_poll(u32::from(
+            crate::io::poll::POLLIN | crate::io::poll::POLLRDNORM,
+        ));
     }
 
     /// The task it names (null if none: not yet attached, or released)

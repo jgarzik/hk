@@ -17,7 +17,7 @@
 
 use super::cb::{
     MemKind, OOO_OVERHEAD, OOW_RATELIMIT, Out, PAWS_WRAP, RCV_SHUTDOWN, Seg, SegIn, TIMEWAIT_LEN,
-    TcpCb, TcpState, Tmr, after, before, between, flags,
+    TcpCb, TcpState, Tmr, after, before, between, flags, wake,
 };
 use crate::util::error::KernelError;
 
@@ -115,7 +115,7 @@ impl TcpCb {
         self.rcv_tstamp = now;
         self.arm_keepalive(now);
         out.established = true;
-        out.wake = true;
+        out.wake |= wake::STATE;
     }
 
     /// Linux tcp_sequence: the segment overlaps [RCV.NXT, RCV.NXT+WND]
@@ -300,7 +300,7 @@ impl TcpCb {
                 self.state = TcpState::FinWait2;
                 self.tmr = None;
                 self.arm_fw2(now);
-                out.wake = true;
+                out.wake |= wake::STATE;
                 true
             }
             TcpState::Closing => {
@@ -369,7 +369,7 @@ impl TcpCb {
                 self.tmr = None;
                 self.backoff = 0;
                 self.rtx_stamp = None;
-                out.wake = true;
+                out.wake |= wake::SPACE;
             }
         }
         true
@@ -414,7 +414,7 @@ impl TcpCb {
         } else {
             self.arm_rtx(now);
         }
-        out.wake = true;
+        out.wake |= wake::SPACE;
     }
 
     /// Segment text and FIN (Linux tcp_data_queue / tcp_fin)
@@ -523,7 +523,7 @@ impl TcpCb {
             }
         }
         self.mem_settle();
-        out.wake = true;
+        out.wake |= wake::DATA;
         if !in_order {
             return false;
         }
@@ -549,7 +549,7 @@ impl TcpCb {
             self.ack_nomem = true;
             self.ack_now = true;
             self.mem_settle();
-            out.wake = true;
+            out.wake |= wake::DATA;
             return;
         }
         let had_ooo = !self.ooo.is_empty();
@@ -569,7 +569,7 @@ impl TcpCb {
         if had_ooo {
             self.ack_now = true;
         }
-        out.wake = true;
+        out.wake |= wake::DATA;
         self.mem_settle();
     }
 
@@ -578,7 +578,7 @@ impl TcpCb {
         self.rcv_nxt = self.rcv_nxt.wrapping_add(1);
         self.ack_now = true;
         out.shut |= RCV_SHUTDOWN;
-        out.wake = true;
+        out.wake |= wake::STATE;
         match self.state {
             TcpState::Established => self.state = TcpState::CloseWait,
             TcpState::FinWait1 if self.fin_acked() => self.time_wait(now, out),

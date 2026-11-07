@@ -921,16 +921,6 @@ Tag = roadmap phase (doc/ROADMAP.md).
    by key (removals check the entry). The test prints the lines with
    either port when it fails.
 
-## epoll edge-triggered items wake on unkeyed wakeups
-
-**Location**: `io/epoll.rs`, `sync/waitqueue.rs` (`wake_poll`)
-
-Only pipes wake with the poll events that happened (Linux passes them
-to every wake_up_poll): other files (sockets, eventfd, ttys) wake with
-none, so an edge-triggered item there is queued on any wakeup of its
-queue and reported again while it stays ready, where Linux reports it
-once per matching event.
-
 ## /proc/<pid>/mounts: no POLLERR|POLLPRI on a mount change
 
 **Location**: `fs/proc/mod.rs` (`ProcfsFileOps::poll`)

@@ -1,4 +1,4 @@
-//! epoll on files Linux cannot poll
+//! epoll on files Linux cannot poll, edge-triggered wake keys
 //!
 //! - EPOLL_CTL_ADD of a regular file, a directory, /dev/null, a block
 //!   device, a sysfs directory or a per-process /proc file is EPERM
@@ -6,20 +6,27 @@
 //!   for every op; /proc/meminfo, /proc/self/mounts, a sysctl, a sysfs
 //!   attribute and /dev/random can be added; poll and select still see
 //!   a regular file ready
+//! - an edge-triggered item is not reported again by a wakeup of an
+//!   event it does not wait for (eventfd read, SO_SNDBUF)
 
 use super::helpers::{find_blkdev, print, print_num, println};
 use hk_syscall::{
-    EPOLL_CTL_ADD, EPOLL_CTL_DEL, EPOLLIN, EpollEvent, FdSet, O_CREAT, O_DIRECTORY, O_NONBLOCK,
-    O_RDONLY, O_RDWR, POLLIN, POLLOUT, PollFd, Timeval, sys_close, sys_epoll_create1,
-    sys_epoll_ctl, sys_open, sys_poll, sys_select, sys_unlink,
+    AF_UNIX, EFD_NONBLOCK, EFD_SEMAPHORE, EPOLL_CTL_ADD, EPOLL_CTL_DEL, EPOLLET, EPOLLIN,
+    EpollEvent, FdSet, O_CREAT, O_DIRECTORY, O_NONBLOCK, O_RDONLY, O_RDWR, POLLIN, POLLOUT, PollFd,
+    SOCK_STREAM, Timeval, sys_close, sys_epoll_create1, sys_epoll_ctl, sys_epoll_wait,
+    sys_eventfd2, sys_open, sys_poll, sys_read, sys_select, sys_setsockopt, sys_socketpair,
+    sys_unlink, sys_write,
 };
 
 const EPERM: i64 = -1;
+const SOL_SOCKET: i32 = 1;
+const SO_SNDBUF: i32 = 7;
 
 pub fn run_tests() {
     test_epoll_eperm();
     test_eperm_order();
     test_poll_regular();
+    test_epoll_et_key();
 }
 
 fn add(ep: i32, fd: i32, events: u32) -> i64 {
@@ -62,7 +69,11 @@ fn test_epoll_eperm() {
     let yes = [
         add_path(ep, b"/proc/meminfo\0", O_RDONLY),
         add_path(ep, b"/proc/self/mounts\0", O_RDONLY),
-        add_path(ep, b"/proc/sys/kernel/unprivileged_bpf_disabled\0", O_RDONLY),
+        add_path(
+            ep,
+            b"/proc/sys/kernel/unprivileged_bpf_disabled\0",
+            O_RDONLY,
+        ),
         add_path(ep, b"/sys/class/mem/null/dev\0", O_RDONLY),
         add_path(ep, b"/dev/random\0", O_RDONLY),
     ];
@@ -135,6 +146,69 @@ fn test_poll_regular() {
         print_num(rev as i64);
         print(b" select=");
         print_num(s);
+        println(b"");
+    }
+}
+
+/// Events reported by an immediate epoll_wait
+fn wait0(ep: i32) -> i64 {
+    let mut evs = [EpollEvent { events: 0, data: 0 }; 4];
+    sys_epoll_wait(ep, evs.as_mut_ptr(), 4, 0)
+}
+
+/// EPOLLIN|EPOLLET on a semaphore eventfd holding 2: one event; a read
+/// (count 1 left, a wakeup keyed POLLOUT) reports nothing new
+fn et_eventfd() -> (i64, i64) {
+    let efd = sys_eventfd2(2, EFD_SEMAPHORE | EFD_NONBLOCK) as i32;
+    let ep = sys_epoll_create1(0) as i32;
+    add(ep, efd, EPOLLIN | EPOLLET);
+    let first = wait0(ep);
+    let mut v = 0u64;
+    sys_read(efd as u64, &mut v as *mut u64 as *mut u8, 8);
+    let second = wait0(ep);
+    sys_close(ep as u64);
+    sys_close(efd as u64);
+    (first, second)
+}
+
+/// EPOLLIN|EPOLLET on a readable stream socket: one event; SO_SNDBUF
+/// (a write-space wakeup) reports nothing new
+fn et_sndbuf() -> (i64, i64) {
+    let mut sv = [0i32; 2];
+    sys_socketpair(AF_UNIX, SOCK_STREAM, 0, &mut sv);
+    sys_write(sv[1] as u64, b"x".as_ptr(), 1);
+    let ep = sys_epoll_create1(0) as i32;
+    add(ep, sv[0], EPOLLIN | EPOLLET);
+    let first = wait0(ep);
+    let v: i32 = 65536;
+    sys_setsockopt(
+        sv[0],
+        SOL_SOCKET,
+        SO_SNDBUF,
+        &v as *const i32 as *const u8,
+        4,
+    );
+    let second = wait0(ep);
+    sys_close(ep as u64);
+    sys_close(sv[0] as u64);
+    sys_close(sv[1] as u64);
+    (first, second)
+}
+
+fn test_epoll_et_key() {
+    let (ef1, ef2) = et_eventfd();
+    let (sk1, sk2) = et_sndbuf();
+    if (ef1, ef2, sk1, sk2) == (1, 0, 1, 0) {
+        println(b"EPOLL_ET_WAKE_KEY:OK");
+    } else {
+        print(b"EPOLL_ET_WAKE_KEY:FAIL eventfd=");
+        print_num(ef1);
+        print(b",");
+        print_num(ef2);
+        print(b" sndbuf=");
+        print_num(sk1);
+        print(b",");
+        print_num(sk2);
         println(b"");
     }
 }
