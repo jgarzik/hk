@@ -40,6 +40,7 @@ use crate::arch::IrqSpinlock;
 use crate::fs::KernelError;
 use crate::fs::file::{File, FileOps, RwFlags, flags, stream_rw};
 use crate::fs::iov_iter::IovDest;
+use crate::io::fasync::{FasyncList, POLL_IN, fasync_helper, kill_fasync};
 use crate::io::poll::{POLLIN, POLLRDNORM, PollTable};
 use crate::sync::waitqueue::WaitQueue;
 use crate::util::pod::IntoBytes;
@@ -245,6 +246,8 @@ pub struct Inotify {
     inner: IrqSpinlock<InotifyInner>,
     /// Wait queue for blocking readers
     wait_queue: WaitQueue,
+    /// O_ASYNC files (Linux group->fsn_fa)
+    fasync: FasyncList,
 }
 
 /// Global cookie counter for rename event pairing
@@ -261,6 +264,7 @@ impl Inotify {
                 next_cookie: 0,
             }),
             wait_queue: WaitQueue::new(),
+            fasync: FasyncList::new(),
         })
     }
 
@@ -331,6 +335,7 @@ impl Inotify {
 
     /// Queue an event for a specific watch
     pub fn queue_event(&self, wd: i32, mask: u32, cookie: u32, name: Option<String>) {
+        let mut queued = false;
         let mut inner = self.inner.lock();
 
         // Check if watch still exists
@@ -355,11 +360,16 @@ impl Inotify {
                         name: None,
                     });
                 }
+                queued = true;
             }
         }
 
         drop(inner);
         self.wait_queue.wake_all();
+        // Linux fsnotify_insert_event, with the queue lock dropped
+        if queued {
+            kill_fasync(&self.fasync, crate::signal::SIGIO, POLL_IN);
+        }
     }
 
     /// Check if any events are pending
@@ -438,6 +448,19 @@ static INOTIFY_FOPS: InotifyFileOps = InotifyFileOps;
 impl FileOps for InotifyFileOps {
     fn as_any(&self) -> &dyn core::any::Any {
         self
+    }
+
+    /// Linux fsnotify_fasync: the group's list; a failure is EIO
+    fn fasync(&self, file: &File, fd: i32, on: bool) -> Option<Result<(), KernelError>> {
+        let g = match file.private_ref::<Inotify>() {
+            Some(g) => g,
+            None => return Some(Err(KernelError::BadFd)),
+        };
+        Some(
+            fasync_helper(&g.fasync, file, fd, on)
+                .map(|_| ())
+                .map_err(|_| KernelError::Io),
+        )
     }
 
     /// FIONREAD: the bytes a read would return now (Linux inotify_ioctl)

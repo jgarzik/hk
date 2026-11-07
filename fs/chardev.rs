@@ -172,6 +172,12 @@ pub trait CharDevice: Send + Sync {
         false
     }
 
+    /// SIGIO list membership (Linux f_op->fasync; see
+    /// `FileOps::fasync`). Default none.
+    fn fasync(&self, _file: &File, _fd: i32, _on: bool) -> Option<Result<(), KernelError>> {
+        None
+    }
+
     /// Device-specific control operations
     fn ioctl(&self, _file: &File, _cmd: u32, _arg: u64) -> Result<i64, KernelError> {
         Err(KernelError::NotTty)

@@ -44,6 +44,13 @@ impl CharDevice for ConsoleCharDevice {
         CharDevice::ioctl(Redirect::tty(file)?, file, cmd, arg)
     }
 
+    fn fasync(&self, file: &File, fd: i32, on: bool) -> Option<Result<(), KernelError>> {
+        match Redirect::tty(file) {
+            Ok(t) => CharDevice::fasync(t, file, fd, on),
+            Err(e) => Some(Err(e)),
+        }
+    }
+
     fn poll(&self, file: &File, pt: Option<&mut PollTable<'_>>) -> u16 {
         match Redirect::tty(file) {
             Ok(t) => CharDevice::poll(t, file, pt),

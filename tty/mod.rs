@@ -48,6 +48,7 @@ use crate::fs::File;
 use crate::fs::chardev::{CharDevice, DevId};
 use crate::fs::flags::O_NOCTTY;
 use crate::fs::iov_iter::{IovDest, IovSource};
+use crate::io::fasync::{FasyncList, POLL_IN, PidType, f_setown_pid, fasync_helper, kill_fasync};
 use crate::io::poll::{POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM, PollTable};
 use crate::task::pid::Pid;
 use crate::util::error::KernelError;
@@ -172,6 +173,8 @@ pub struct Tty {
     read_lock: crate::sync::Mutex<()>,
     /// Session, foreground group, window size
     ctrl: Mutex<TtyCtrl>,
+    /// O_ASYNC files (Linux tty->fasync)
+    fasync: FasyncList,
 }
 
 impl Tty {
@@ -188,6 +191,7 @@ impl Tty {
             read_lock: crate::sync::Mutex::new(()),
             read_wait: WaitQueue::new(),
             ctrl: Mutex::new(TtyCtrl::new()),
+            fasync: FasyncList::new(),
         }
     }
 
@@ -267,6 +271,32 @@ impl Tty {
         self.ctrl.lock().pgrp.clone()
     }
 
+    /// Linux __tty_fasync: a newly armed file without an owner gets the
+    /// foreground group, or the caller's process when there is none
+    fn tty_fasync(&self, file: &File, fd: i32, on: bool) -> Result<(), KernelError> {
+        if !fasync_helper(&self.fasync, file, fd, on)? || !on {
+            return Ok(());
+        }
+        let (pid, kind) = match self.pgrp() {
+            Some(pg) => (pg, PidType::Pgrp),
+            None => {
+                let me = crate::task::percpu::current_tid();
+                let pid = u32::try_from(me)
+                    .ok()
+                    .and_then(|n| crate::task::pid::find_pid(&crate::ns::INIT_PID_NS, n))
+                    .ok_or(KernelError::NoProcess)?;
+                (pid, PidType::Tgid)
+            }
+        };
+        f_setown_pid(file, pid, kind, false)
+    }
+
+    /// SIGIO for input to the O_ASYNC files (Linux n_tty's kill_fasync
+    /// POLL_IN); no tty spin lock held
+    pub(crate) fn kill_input(&self) {
+        kill_fasync(&self.fasync, crate::signal::SIGIO, POLL_IN);
+    }
+
     /// Get the line discipline number
     pub fn get_line_discipline(&self) -> u8 {
         // Currently always N_TTY (0)
@@ -328,6 +358,10 @@ impl CharDevice for Tty {
 
     fn ioctl(&self, file: &File, cmd: u32, arg: u64) -> Result<i64, KernelError> {
         ioctl::tty_ioctl(self, file, cmd, arg)
+    }
+
+    fn fasync(&self, file: &File, fd: i32, on: bool) -> Option<Result<(), KernelError>> {
+        Some(self.tty_fasync(file, fd, on))
     }
 
     /// Output is written synchronously: always writable (Linux
@@ -422,6 +456,10 @@ impl CharDevice for TtyChar {
 
     fn ioctl(&self, file: &File, cmd: u32, arg: u64) -> Result<i64, KernelError> {
         CharDevice::ioctl(self.0, file, cmd, arg)
+    }
+
+    fn fasync(&self, file: &File, fd: i32, on: bool) -> Option<Result<(), KernelError>> {
+        CharDevice::fasync(self.0, file, fd, on)
     }
 
     fn poll(&self, file: &File, pt: Option<&mut PollTable<'_>>) -> u16 {

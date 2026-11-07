@@ -895,6 +895,13 @@ impl FileOps for CharDevFileOps {
         Self::dev(file)?.ioctl(file, cmd, arg)
     }
 
+    fn fasync(&self, file: &File, fd: i32, on: bool) -> Option<Result<(), KernelError>> {
+        match Self::dev(file) {
+            Ok(d) => d.fasync(file, fd, on),
+            Err(e) => Some(Err(e)),
+        }
+    }
+
     fn poll(&self, file: &File, pt: Option<&mut PollTable<'_>>) -> u16 {
         match Self::dev(file) {
             Ok(d) => d.poll(file, pt),

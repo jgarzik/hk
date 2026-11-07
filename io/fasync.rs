@@ -165,6 +165,18 @@ pub fn f_setown(file: &File, who: i32, force: bool) -> Result<(), KernelError> {
     Ok(())
 }
 
+/// Linux __f_setown with a struct pid (a tty's process group, the
+/// caller's own pid); `force` false keeps an owner already set
+pub fn f_setown_pid(
+    file: &File,
+    pid: Arc<Pid>,
+    kind: PidType,
+    force: bool,
+) -> Result<(), KernelError> {
+    file.f_owner_alloc()?.set(Some(pid), kind, force);
+    Ok(())
+}
+
 /// The owner's number while it names a task of its type (Linux
 /// pid_task(pid, type)), 0 otherwise
 fn owner_nr(o: &Owner) -> i32 {
@@ -300,36 +312,43 @@ impl Default for FasyncList {
 }
 
 /// Put `file` on `list` (`on`; an entry already there takes the new
-/// `fd`) or take it off (Linux fasync_helper); O_ASYNC follows
-pub fn fasync_helper(list: &FasyncList, file: &File, fd: i32, on: bool) -> Result<(), KernelError> {
+/// `fd`) or take it off (Linux fasync_helper); O_ASYNC follows. True if
+/// an entry was added or removed.
+pub fn fasync_helper(
+    list: &FasyncList,
+    file: &File,
+    fd: i32,
+    on: bool,
+) -> Result<bool, KernelError> {
     if !on {
-        fasync_remove(list, file);
-        return Ok(());
+        return Ok(fasync_remove(list, file));
     }
     let owner = file.f_owner_alloc()?.clone();
     let mut l = list.list.lock();
     if let Some(e) = l.iter_mut().find(|e| Arc::ptr_eq(&e.owner, &owner)) {
         e.fd = fd;
-        return Ok(());
+        return Ok(false);
     }
     l.try_reserve(1).map_err(|_| KernelError::OutOfMemory)?;
     l.push(Fasync { owner, fd });
     list.armed.store(true, Ordering::Release);
     file.set_fasync_flag(true);
-    Ok(())
+    Ok(true)
 }
 
 /// Linux fasync_remove_entry
-fn fasync_remove(list: &FasyncList, file: &File) {
+fn fasync_remove(list: &FasyncList, file: &File) -> bool {
     let Some(owner) = file.f_owner() else {
-        return;
+        return false;
     };
     let mut l = list.list.lock();
-    if let Some(i) = l.iter().position(|e| Arc::ptr_eq(&e.owner, owner)) {
-        l.swap_remove(i);
-        list.armed.store(!l.is_empty(), Ordering::Release);
-        file.set_fasync_flag(false);
-    }
+    let Some(i) = l.iter().position(|e| Arc::ptr_eq(&e.owner, owner)) else {
+        return false;
+    };
+    l.swap_remove(i);
+    list.armed.store(!l.is_empty(), Ordering::Release);
+    file.set_fasync_flag(false);
+    true
 }
 
 /// Signal every file on `list` that the object is ready for `band` (a

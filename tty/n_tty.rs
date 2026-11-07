@@ -219,6 +219,9 @@ impl Default for NTtyData {
 struct Effects {
     echo: Vec<u8>,
     sigs: Vec<u32>,
+    /// Input became readable: SIGIO POLL_IN (Linux kill_fasync at a
+    /// canonical line end, or after non-canonical input)
+    kill: bool,
 }
 
 /// Input bytes from the driver, in thread context (Linux
@@ -239,6 +242,10 @@ pub fn receive_buf(tty: &Tty, bytes: &[u8]) -> usize {
             receive_char(&mut ld, &t, c, &mut fx);
             taken += 1;
         }
+        // Linux n_tty_receive_buf_common: non-canonical input queued
+        if t.c_lflag & ICANON == 0 && ld.cnt() > 0 {
+            fx.kill = true;
+        }
     }
     if !fx.echo.is_empty() {
         let _ = tty.driver_write(&fx.echo);
@@ -247,6 +254,9 @@ pub fn receive_buf(tty: &Tty, bytes: &[u8]) -> usize {
         for &sig in &fx.sigs {
             crate::signal::kill_pgrp_pid(&pg, sig);
         }
+    }
+    if fx.kill {
+        tty.kill_input();
     }
     tty.read_wait.wake_poll(u32::from(
         crate::io::poll::POLLIN | crate::io::poll::POLLRDNORM,
@@ -292,7 +302,10 @@ fn receive_char(ld: &mut NTtyData, t: &Termios, c: u8, fx: &mut Effects) {
         return;
     }
     if t.c_lflag & ICANON != 0 {
+        let lines = ld.lines;
         canon_char(ld, t, c, &mut fx.echo);
+        // Linux n_tty_receive_handle_newline
+        fx.kill |= ld.lines != lines;
     } else {
         ld.push(c, false);
         if t.c_lflag & ECHO != 0 {

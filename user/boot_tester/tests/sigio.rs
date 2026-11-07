@@ -17,6 +17,10 @@
 //!   a send found none (SOCKWQ_ASYNC_NOSPACE)
 //! - SIGIO_TCP: a listener gets POLL_IN for a connection, a nonblocking
 //!   connect POLL_OUT once established, the accepted socket POLL_IN
+//! - SIGIO_TTY: FIOASYNC on a tty sets O_ASYNC and, with no owner,
+//!   makes the caller's process (or the tty's foreground group) owner
+//! - SIGIO_NOTIFY: an inotify file keeps O_ASYNC (fsnotify_fasync), a
+//!   fanotify file does not (no fasync)
 //! - SIGIO_NO_FASYNC: a file without fasync: FIOASYNC is ENOTTY, F_SETFL
 //!   keeps no O_ASYNC
 //! - SIGIO_OWNER_EX: F_SETOWN_EX / F_GETOWN_EX round trip a thread owner
@@ -24,10 +28,11 @@
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
     AF_INET, AF_UNIX, FIOASYNC, O_CREAT, O_NONBLOCK, O_RDWR, SOCK_STREAM, SigInfo, SockAddrIn,
-    htonl, make_ipv4, sys_accept, sys_bind, sys_close, sys_connect, sys_dup, sys_exit, sys_fcntl,
-    sys_fork, sys_getpid, sys_getsockname, sys_gettid, sys_ioctl, sys_listen, sys_mknod, sys_open,
-    sys_pipe2, sys_read, sys_rt_sigprocmask, sys_rt_sigtimedwait, sys_setpgid, sys_setresuid,
-    sys_socket, sys_socketpair, sys_unlink, sys_wait4, sys_write,
+    htonl, make_ipv4, sys_accept, sys_bind, sys_close, sys_connect, sys_dup, sys_exit,
+    sys_fanotify_init, sys_fcntl, sys_fork, sys_getpid, sys_getsockname, sys_gettid,
+    sys_inotify_init1, sys_ioctl, sys_listen, sys_mknod, sys_open, sys_pipe2, sys_read,
+    sys_rt_sigprocmask, sys_rt_sigtimedwait, sys_setpgid, sys_setresuid, sys_setsid, sys_socket,
+    sys_socketpair, sys_unlink, sys_wait4, sys_write,
 };
 
 const F_GETFL: i32 = 3;
@@ -39,6 +44,7 @@ const F_SETOWN_EX: i32 = 15;
 const F_GETOWN_EX: i32 = 16;
 const F_OWNER_TID: i32 = 0;
 const O_ASYNC: u64 = 0o20000;
+const O_NOCTTY: u32 = 0o400;
 const SIG_BLOCK: i32 = 0;
 const SIG_SETMASK: i32 = 2;
 const SIGPIPE: u32 = 13;
@@ -62,6 +68,8 @@ pub fn run_tests() {
     test_socket_sigio();
     test_sock_out();
     test_tcp();
+    test_tty();
+    test_notify();
     test_no_fasync();
     test_owner_ex();
 }
@@ -578,6 +586,68 @@ fn test_tcp() {
             (b"connect", conn as i64),
             (b"data", data as i64),
         ],
+    );
+}
+
+/// The serial tty (ttyS0 on x86, ttyAMA0 on arm64)
+fn open_serial() -> i32 {
+    let fl = O_RDWR | O_NOCTTY | O_NONBLOCK;
+    let fd = sys_open(b"/dev/ttyS0\0".as_ptr(), fl, 0);
+    if fd >= 0 {
+        return fd as i32;
+    }
+    sys_open(b"/dev/ttyAMA0\0".as_ptr(), fl, 0) as i32
+}
+
+/// In a new session (no controlling tty): exit 0 if FIOASYNC armed the
+/// tty with an owner, and disarming cleared the flag
+fn tty_child() -> i32 {
+    sys_setsid();
+    let fd = open_serial();
+    if fd < 0 {
+        return 30;
+    }
+    let on = 1i32;
+    if sys_ioctl(fd, FIOASYNC as u64, &on as *const i32 as u64) != 0 {
+        return 31;
+    }
+    if sys_fcntl(fd, F_GETFL, 0) as u64 & O_ASYNC == 0 {
+        return 32;
+    }
+    let own = sys_fcntl(fd, F_GETOWN, 0);
+    if own != sys_getpid() && own >= 0 {
+        return 33;
+    }
+    let off = 0i32;
+    sys_ioctl(fd, FIOASYNC as u64, &off as *const i32 as u64);
+    if sys_fcntl(fd, F_GETFL, 0) as u64 & O_ASYNC != 0 {
+        return 34;
+    }
+    sys_close(fd as u64);
+    0
+}
+
+fn test_tty() {
+    let r = in_child(tty_child);
+    report(b"SIGIO_TTY", r == 0, &[(b"exit", r)]);
+}
+
+/// F_SETFL O_ASYNC sticks on `fd` (it has fasync)
+fn keeps_async(fd: i32) -> bool {
+    let fl = sys_fcntl(fd, F_GETFL, 0) as u64;
+    sys_fcntl(fd, F_SETFL, fl | O_ASYNC);
+    let on = sys_fcntl(fd, F_GETFL, 0) as u64 & O_ASYNC != 0;
+    sys_close(fd as u64);
+    on
+}
+
+fn test_notify() {
+    let ino = keeps_async(sys_inotify_init1(0) as i32);
+    let fan = keeps_async(sys_fanotify_init(0, 0) as i32);
+    report(
+        b"SIGIO_NOTIFY",
+        ino && !fan,
+        &[(b"inotify", ino as i64), (b"fanotify", fan as i64)],
     );
 }
 
