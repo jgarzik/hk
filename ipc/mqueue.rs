@@ -198,7 +198,9 @@ impl MqQueue {
                 } else {
                     0
                 },
-                n.owner.nr(),
+                // In the reader's namespace (Linux mqueue_read_file:
+                // pid_vnr)
+                n.owner.vnr(),
             ),
             None => (0, 0, 0),
         };

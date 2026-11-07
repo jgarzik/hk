@@ -178,8 +178,8 @@ pub fn f_setown_pid(
     Ok(())
 }
 
-/// The owner's number while it names a task of its type (Linux
-/// pid_task(pid, type)), 0 otherwise
+/// The owner's number in the caller's namespace while it names a task
+/// of its type (Linux pid_task(pid, type), pid_vnr), 0 otherwise
 fn owner_nr(o: &Owner) -> i32 {
     let Some(pid) = &o.pid else {
         return 0;
@@ -193,7 +193,7 @@ fn owner_nr(o: &Owner) -> i32 {
             .is_some_and(|t| t.task.tid() == t.task.pid),
         PidType::Pgrp => table.pgrp(pid).next().is_some(),
     };
-    if live { pid.nr() as i32 } else { 0 }
+    if live { pid.vnr() as i32 } else { 0 }
 }
 
 /// F_GETOWN (Linux f_getown): a process group is negative

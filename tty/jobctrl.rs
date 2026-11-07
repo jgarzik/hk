@@ -201,7 +201,8 @@ pub fn tiocgpgrp(tty: &Tty) -> Result<u32, KernelError> {
     if !is_current(tty) {
         return Err(KernelError::NotTty);
     }
-    Ok(tty.ctrl.lock().pgrp.as_ref().map_or(0, |p| p.nr()))
+    // In the caller's namespace (Linux tiocgpgrp: pid_vnr)
+    Ok(tty.ctrl.lock().pgrp.as_ref().map_or(0, |p| p.vnr()))
 }
 
 /// TIOCSPGRP (Linux tiocspgrp): a group of the caller's session becomes
@@ -252,6 +253,6 @@ pub fn tiocgsid(tty: &Tty) -> Result<u32, KernelError> {
         .lock()
         .session
         .as_ref()
-        .map(|s| s.nr())
+        .map(|s| s.vnr())
         .ok_or(KernelError::NotTty)
 }

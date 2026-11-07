@@ -4549,12 +4549,12 @@ pub fn current_cred() -> crate::task::Cred {
     current().cred()
 }
 
-/// Look up a task's process group ID by PID
-///
-/// Returns None if the process is not found.
-pub fn lookup_task_pgid(pid: Pid) -> Option<Pid> {
+/// Process `pid`'s group as the caller numbers it, 0 if outside its
+/// namespace (Linux pid_vnr(task_pgrp(p))): None if not found
+pub fn lookup_task_pgid(pid: Pid) -> Option<u32> {
     let table = TASKLIST.read();
-    table.get(pid).map(|t| t.task.pgid())
+    let pg = table.get(pid)?.pgrp.as_ref().map_or(0, |p| p.vnr());
+    Some(pg)
 }
 
 /// True if some process is in group `pgid`
@@ -4566,12 +4566,12 @@ pub fn pgrp_exists(pgid: Pid) -> bool {
     table.pgrp(&pg).next().is_some()
 }
 
-/// Look up a task's session ID by PID
-///
-/// Returns None if the process is not found.
-pub fn lookup_task_sid(pid: Pid) -> Option<Pid> {
+/// Process `pid`'s session as the caller numbers it, 0 if outside its
+/// namespace (Linux pid_vnr(task_session(p))): None if not found
+pub fn lookup_task_sid(pid: Pid) -> Option<u32> {
     let table = TASKLIST.read();
-    table.get(pid).map(|t| t.task.sid())
+    let s = table.get(pid)?.session.as_ref().map_or(0, |p| p.vnr());
+    Some(s)
 }
 
 /// Look up a task's nice value by PID

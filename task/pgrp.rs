@@ -25,11 +25,13 @@ pub fn sys_getpgid(pid: i32, caller_pid: Pid, caller_pgid: Pid) -> i64 {
     let Some(pid) = super::pid::from_vnr_or(pid as Pid, caller_pid) else {
         return KernelError::NoProcess.sysret();
     };
+    // Reported in the caller's namespace, 0 for a group outside it
+    // (Linux pid_vnr(task_pgrp(p)))
     if pid == caller_pid {
-        caller_pgid as i64
+        i64::from(super::pid::vnr(caller_pgid))
     } else {
         match super::percpu::lookup_task_pgid(pid) {
-            Some(pgid) => pgid as i64,
+            Some(pgid) => i64::from(pgid),
             None => KernelError::NoProcess.sysret(),
         }
     }
@@ -54,10 +56,10 @@ pub fn sys_getsid(pid: i32, caller_pid: Pid, caller_sid: Pid) -> i64 {
         return KernelError::NoProcess.sysret();
     };
     if pid == caller_pid {
-        caller_sid as i64
+        i64::from(super::pid::vnr(caller_sid))
     } else {
         match super::percpu::lookup_task_sid(pid) {
-            Some(sid) => sid as i64,
+            Some(sid) => i64::from(sid),
             None => KernelError::NoProcess.sysret(),
         }
     }
@@ -129,7 +131,7 @@ pub fn sys_setpgid(
 /// - -EPERM if a session leader, or a process group with its id exists
 pub fn sys_setsid(caller_pid: Pid) -> i64 {
     match super::percpu::create_session(caller_pid) {
-        Ok(new_sid) => new_sid as i64,
+        Ok(new_sid) => i64::from(super::pid::vnr(new_sid)),
         Err(errno) => -i64::from(errno),
     }
 }
