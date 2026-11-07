@@ -15,7 +15,7 @@ use super::pagewalk::{PteWalk, walk_pte_range};
 use super::pgtable::{PgTables, Pmd};
 use super::{Mm, PROT_EXEC, PROT_READ, PROT_WRITE};
 use crate::FRAME_ALLOCATOR;
-use crate::arch::{ArchPageTable, paging};
+use crate::arch::paging;
 use crate::util::error::KernelError;
 
 /// `prot` grants no access at all
@@ -63,15 +63,14 @@ pub fn change_protection(mm: &Mm, t: PgTables<'_>, start: u64, end: u64, prot: u
     }
     impl PteWalk for Change<'_> {
         type Err = core::convert::Infallible;
-        fn huge(&mut self, pmd: Pmd<'_>, addr: u64, _: u64) -> Result<bool, Self::Err> {
+        fn huge(&mut self, pmd: Pmd<'_>, _: u64, _: u64) -> Result<bool, Self::Err> {
             // Wholly inside and accessible (`split_huge`); never shared
             let pmdval = pmd.get();
-            let base = addr & !(HUGE_PAGE_SIZE - 1);
             let (w, x) = (self.prot & PROT_WRITE != 0, self.prot & PROT_EXEC != 0);
             if x && !paging::pte_exec(pmdval) {
                 sync_huge(paging::pte_addr(pmdval) & !(HUGE_PAGE_SIZE - 1));
             }
-            ArchPageTable::update_huge_page_protection(self.mm.pgd(), base, w, x);
+            pmd.set_prot(&super::ptl::pt_lock(self.mm), w, x);
             Ok(true)
         }
         fn pte(&mut self, e: &AtomicU64, _: u64) -> Result<(), Self::Err> {

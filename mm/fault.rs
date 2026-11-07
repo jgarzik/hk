@@ -24,7 +24,7 @@ use super::shmem::Shmem;
 use super::tlb::flush_tlb_page;
 use super::{Mm, MmStruct, PAGE_SIZE, PROT_EXEC, PROT_READ, PROT_WRITE, SwapEntry};
 use crate::FRAME_ALLOCATOR;
-use crate::arch::{ArchPageTable, PageFlags, paging, phys_to_virt};
+use crate::arch::{PageFlags, paging, phys_to_virt};
 use crate::fs::File;
 use crate::mm::page_alloc::Gfp;
 use crate::task::percpu::{increment_maj_flt, increment_min_flt};
@@ -331,14 +331,13 @@ fn do_huge_anon(mm: &Mm, t: PgTables<'_>, addr: u64, area: &Area) -> bool {
     }
     // Fails if a racing fault installed a table or a page first
     let l = super::ptl::pt_lock(mm);
-    if ArchPageTable::map_huge_page(mm.pgd(), base, frame, flags, &mut &FRAME_ALLOCATOR).is_err() {
+    let entry = crate::arch::paging::mk_pmd(frame, flags);
+    let Some(pmd) = t.pmd_alloc(&l, base).filter(|p| p.set_huge(&l, entry)) else {
         FRAME_ALLOCATOR.free_huge(frame);
         FRAME_ALLOCATOR.free(pt);
         return false;
-    }
-    if let Some(pmd) = t.pmd(base) {
-        super::huge_page::deposit(&pmd, &l, pt);
-    }
+    };
+    super::huge_page::deposit(&pmd, &l, pt);
     add_anon(frame, area, base);
     increment_min_flt();
     true

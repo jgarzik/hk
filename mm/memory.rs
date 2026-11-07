@@ -73,7 +73,7 @@ pub(super) fn exit_mmap(mm: &Mm) {
     let mut map = mm.mmap_write();
     let vmas: Vec<_> = map.take_vmas();
     let mut tlb = Gather::new_full(mm);
-    tlb.free_tables(paging::detach_user(mm.pgd()));
+    tlb.free_tables(super::pgtable::detach_user(mm, &mut map));
     drop(tlb);
     drop(map);
     // VMAs go last, outside any lock: they may hold the last reference

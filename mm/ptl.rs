@@ -6,8 +6,9 @@
 //! remote write). Two spin locks order them:
 //!
 //! - `Mm.page_table_lock` ([`pt_lock`]): the table structure -- a missing
-//!   table installed (`PgTables::pte_alloc`), a 2MB entry mapped, split or
-//!   cleared (Linux pmd_lock without split PMD locks).
+//!   table installed (`PgTables::pte_alloc`, `pmd_alloc`), a 2MB entry
+//!   mapped, split, cleared or given a new protection (Linux pmd_lock
+//!   without split PMD locks).
 //! - the PTE lock ([`table_lock`]; `pgtable::PteTable` holds it) of each PTE table
 //!   page, a lock word in its struct page (`Page.ptl`, Linux ptdesc
 //!   ptl): every software change of a 4KB entry, whatever the mmap_lock

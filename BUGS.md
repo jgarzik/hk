@@ -34,12 +34,11 @@ None is known to fail today, but each is a soundness bug:
   - Page tables: `mm::pgtable` (`PgTables`, `Pte`, `Pmd`, `PteTable`)
     ties the entries of the fault path, the reverse map, mkclean,
     remote access, THP, mremap and the range walker to the lock that
-    keeps their tables. Still raw, safe fns that dereference a caller's
-    root or entry: the arch walkers (`paging::pte_ptr`, `pmd_ptr`,
-    `pte_alloc`, `pmd_populate`, `split_table`, `translate_with_root`,
-    `map_huge_page`, `update_huge_page_protection`; private
-    `entry_atomic` / `entry_ptr` return `&'static AtomicU64`); the
-    ioremap and vmap walkers.
+    keeps their tables; the arch walkers are `unsafe fn`s reached only
+    from there. Still raw, safe fns that dereference a caller's root:
+    `ArchPageTable::new(root)` (its `translate` and `map_with_alloc`
+    walk that root; callers in task/ exec and fork), the ioremap and
+    vmap walkers.
 
 ## unsafe not yet wrapped or documented (doc/UNSAFE.md)
 

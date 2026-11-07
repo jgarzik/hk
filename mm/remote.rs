@@ -17,25 +17,10 @@ use crate::mm::vma::{PROT_READ, PROT_WRITE};
 use crate::mm::{Mm, MmStruct, Vma};
 use crate::util::error::KernelError;
 
-#[cfg(target_arch = "x86_64")]
-use crate::arch::x86_64::paging::{X86_64PageTable, phys_to_virt};
-
-#[cfg(target_arch = "aarch64")]
-use crate::arch::aarch64::paging::{Aarch64PageTable, phys_to_virt};
+use crate::arch::phys_to_virt;
 
 /// Page size constant
 const PAGE_SIZE: u64 = 4096;
-
-/// Translate virtual address to physical using another process's page table
-#[cfg(target_arch = "x86_64")]
-fn translate_with_root(page_table_root: u64, va: u64) -> Option<u64> {
-    X86_64PageTable::translate_with_root(page_table_root, va)
-}
-
-#[cfg(target_arch = "aarch64")]
-fn translate_with_root(page_table_root: u64, va: u64) -> Option<u64> {
-    Aarch64PageTable::translate_with_root(page_table_root, va)
-}
 
 /// The VMA of `addr` in the target, if it may be accessed (Linux
 /// check_vma_flags): a user address with a VMA; without `force` the VMA
@@ -183,7 +168,7 @@ fn with_frame<R>(mm: &Mm, t: PgTables<'_>, addr: u64, f: impl FnOnce(u64) -> R) 
         // page_table_lock unless a split installed a table meanwhile
         let _l = pt_lock(mm);
         if t.pte(addr).is_none() {
-            return translate_with_root(t.pgd(), addr).map(f);
+            return t.translate(addr).map(f);
         }
     }
 }

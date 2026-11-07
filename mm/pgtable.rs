@@ -31,7 +31,8 @@
 //!   the tree (`memory::free_pgtables`).
 //!
 //! Each is a pointer-sized copy of what the open-coded `*mut u64` was;
-//! the walk itself stays in `arch::paging`.
+//! the walk itself stays in `arch::paging`, whose walkers are `unsafe
+//! fn`s on a raw root reached only from here.
 
 use core::marker::PhantomData;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -111,7 +112,9 @@ impl<'a> PgTables<'a> {
         if !self.covers(addr) {
             return None;
         }
-        let p = paging::pte_ptr(self.pgd, addr)?;
+        // SAFETY: `pgd` is live and no table under it mapping `addr`, an
+        // address of the pinned range, is freed for 'a (type invariant)
+        let p = unsafe { paging::pte_ptr(self.pgd, addr) }?;
         // SAFETY: `p` is the entry of `addr` in a table under `pgd`,
         // through the direct map, which stays for 'a (type invariant);
         // page-table entries are only accessed atomically
@@ -127,7 +130,8 @@ impl<'a> PgTables<'a> {
         if !self.covers(addr) {
             return None;
         }
-        let p = paging::pmd_ptr(self.pgd, addr)?;
+        // SAFETY: as in `pte`
+        let p = unsafe { paging::pmd_ptr(self.pgd, addr) }?;
         // SAFETY: as in `pte`: the 2MB-level entry of `addr`, in a
         // table under `pgd` kept for 'a
         let slot = unsafe { AtomicU64::from_ptr(p) };
@@ -137,6 +141,37 @@ impl<'a> PgTables<'a> {
             pgd: self.pgd,
             addr: addr & !HUGE_PAGE_MASK,
         })
+    }
+
+    /// `pmd`, installing missing upper tables under the page_table_lock
+    /// `l` of the tables' address space (Linux pmd_alloc); None outside
+    /// the pinned range or out of memory
+    pub fn pmd_alloc(&self, l: &PtLock<'_>, addr: u64) -> Option<Pmd<'a>> {
+        assert_eq!(l.pgd(), self.pgd, "page_table_lock of another mm");
+        if !self.covers(addr) {
+            return None;
+        }
+        // SAFETY: as in `pte`
+        let p = unsafe { paging::pmd_alloc(self.pgd, addr) }?;
+        // SAFETY: as in `pmd`
+        let slot = unsafe { AtomicU64::from_ptr(p) };
+        // INVARIANT: as in `pmd`
+        Some(Pmd {
+            slot,
+            pgd: self.pgd,
+            addr: addr & !HUGE_PAGE_MASK,
+        })
+    }
+
+    /// The physical address `addr` maps to (a 4KB or 2MB page); None
+    /// outside the pinned range or if not mapped. Without the lock of
+    /// its entry, a hint: the frame may go at once.
+    pub fn translate(&self, addr: u64) -> Option<u64> {
+        if !self.covers(addr) {
+            return None;
+        }
+        // SAFETY: as in `pte`
+        unsafe { paging::translate(self.pgd, addr) }
     }
 
     /// The top-level table, where a range walk starts
@@ -163,7 +198,8 @@ impl<'a> PgTables<'a> {
             return None;
         }
         let _l = super::ptl::pt_lock(mm);
-        let p = paging::pte_alloc(self.pgd, addr)?;
+        // SAFETY: as in `pte`
+        let p = unsafe { paging::pte_alloc(self.pgd, addr) }?;
         // SAFETY: as in `pte`: the entry of `addr`, under `pgd`
         let slot = unsafe { AtomicU64::from_ptr(p) };
         // INVARIANT: as in `pte`
@@ -288,16 +324,63 @@ impl Pmd<'_> {
     #[inline]
     pub(super) fn swap(&self, l: &PtLock<'_>, v: u64) -> u64 {
         assert_eq!(l.pgd(), self.pgd, "page_table_lock of another mm");
+        // A table is installed only by `populate`, which owns it
+        assert!(paging::table_of(v).is_none(), "table through Pmd::swap");
         self.slot.swap(v, Ordering::AcqRel)
+    }
+
+    /// Install the 2MB page entry `v` in the empty entry, under the
+    /// page_table_lock `l` (Linux set_pmd_at); false if not empty
+    #[inline]
+    pub(super) fn set_huge(&self, l: &PtLock<'_>, v: u64) -> bool {
+        assert_eq!(l.pgd(), self.pgd, "page_table_lock of another mm");
+        assert!(paging::pmd_huge(v), "not a 2MB entry");
+        paging::pmd_set_huge(self.slot, v)
+    }
+
+    /// Make its 2MB page writable or not and executable or not, under
+    /// the page_table_lock `l` (Linux change_huge_pmd); false if it maps
+    /// no 2MB page. A compare-and-swap: the MMU may set accessed/dirty
+    /// bits meanwhile. The caller flushes the TLB.
+    pub(super) fn set_prot(&self, l: &PtLock<'_>, writable: bool, executable: bool) -> bool {
+        assert_eq!(l.pgd(), self.pgd, "page_table_lock of another mm");
+        self.slot
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |v| {
+                paging::pmd_huge(v).then(|| paging::pmd_mkprot(v, writable, executable))
+            })
+            .is_ok()
     }
 
     /// Install the filled PTE table `pt` in the entry, emptied (and
     /// flushed) under the page_table_lock `l` (Linux pmd_populate)
+    ///
+    /// # Safety
+    ///
+    /// `pt` is a PTE table frame the caller owns, which the tables take
+    /// over.
     #[inline]
-    pub(super) fn populate(&self, l: &PtLock<'_>, pt: u64) {
+    pub(super) unsafe fn populate(&self, l: &PtLock<'_>, pt: u64) {
         assert_eq!(l.pgd(), self.pgd, "page_table_lock of another mm");
-        paging::pmd_populate(self.slot.as_ptr(), pt);
+        // SAFETY: `pt` is the caller's table, handed over (the
+        // caller's guarantee)
+        unsafe { paging::pmd_populate(self.slot, pt) };
     }
+}
+
+/// Detach the user tables of `mm` for exit (Linux exit_mmap): `map`,
+/// its VMA tree borrowed mutably, holds no VMA any more, so no chain
+/// entry of it is left and no `PgTables` of it can be made. The caller
+/// frees them only after flushing every CPU (`Gather::free_tables`).
+pub(super) fn detach_user(mm: &Mm, map: &mut MmStruct) -> paging::UserTables {
+    assert!(mm.holds(map), "tables detached under another mm's VMAs");
+    assert!(
+        map.iter().next().is_none(),
+        "tables detached under live VMAs"
+    );
+    // SAFETY: `mm`'s live top-level table; no VMA left means no chain
+    // entry and no table user, and `map` is borrowed mutably; the
+    // gather frees the tables after its full flush
+    unsafe { paging::detach_user(mm.pgd()) }
 }
 
 /// Slot `i` (mod 512) of the table frame `table`, through the direct map

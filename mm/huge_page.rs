@@ -234,14 +234,17 @@ pub fn split_huge_pmd(mm: &super::Mm, pmd: Pmd<'_>) -> Option<u64> {
     flush_huge(mm, pmd.addr());
     // The hardware may have set accessed/dirty until the clear: `old`
     // is the value cleared
-    let base = paging::split_table(pt, old);
+    // SAFETY: `pt` is the withdrawn deposit or the spare, ours and in
+    // no table yet
+    let base = unsafe { paging::split_table(pt, old) };
     // The 512 pages are separate pages (refcounts, rmap) before any walker
     // can see them: a zap waiting out PMD_SPLITTING frees them through
     // the table the moment it appears (Linux __split_huge_pmd_locked:
     // pmd_populate last)
     crate::FRAME_ALLOCATOR.split_huge(base);
     split_rmap(base);
-    pmd.populate(&l, pt);
+    // SAFETY: `pt`, ours, filled by `split_table`, handed to the tables
+    unsafe { pmd.populate(&l, pt) };
     Some(base)
 }
 

@@ -1213,7 +1213,7 @@ pub struct Zone {
   process_vm_*, a /proc/<pid>/maps read). The last `MmRef` drop runs
   `exit_mmap`, which, under the mm lock held for writing, takes the
   VMAs (dropping the rmap chains) and tears down the user half
-  (`paging::detach_user`, a TLB flush, `UserTables::free`), then drops
+  (`pgtable::detach_user`, a TLB flush, `UserTables::free`), then drops
   the VMAs (file references) with no lock held. **Never drop an `MmRef`
   under a spinlock** (TASKLIST included): take it out (`Option::take`,
   `replace`) and drop it after unlocking. `mmget_not_zero` refuses an
@@ -1319,8 +1319,9 @@ pub struct Zone {
   PTE locks): `Mm.page_table_lock` (`spin::Mutex<()>`, not IRQ-safe;
   held as a `ptl::PtLock`, which the writes of a 2MB-level entry,
   `pgtable::Pmd`, take as proof) covers table-structure changes: a missing table installed
-  (`PgTables::pte_alloc`), a 2MB entry mapped (`do_huge_anon`), split
-  (`split_huge_pmd`) or cleared (`take_huge_pmd`). The PTE lock of each
+  (`PgTables::pte_alloc`, `pmd_alloc`), a 2MB entry mapped (`do_huge_anon`), split
+  (`split_huge_pmd`), cleared (`take_huge_pmd`) or given a new
+  protection (`Pmd::set_prot`, mprotect). The PTE lock of each
   PTE table page (a word in its struct page, `Page.ptl`; one lockdep
   class) covers a table's 4KB entries. One rule, whatever mm lock
   mode: **every software write of a 4KB entry is made under its
@@ -1400,7 +1401,7 @@ pub struct Zone {
   MADV_DONTNEED of the whole 2MB would otherwise miss the 4KB entries
   the split then installs).
 - Teardown TLB: `exit_mmap` detaches the user half from the top-level
-  table (`paging::detach_user`) into a full-mm `Gather`, which flushes
+  table (`pgtable::detach_user`) into a full-mm `Gather`, which flushes
   the whole address space with its paging-structure caches
   (`flush_tlb_mm`), then frees pages and tables (`UserTables::free`). A CPU that last ran the address space
   (another thread still in `exit_current`) has it loaded until it
