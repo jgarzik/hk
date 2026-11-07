@@ -151,12 +151,15 @@ pub fn alloc() -> Option<u64> {
     // released
     let mut area = unsafe { VmArea::new(base, STACK_PAGES) };
     for i in 0..STACK_PAGES {
-        // SAFETY: a fresh frame, ours, handed to the area (`filter`
-        // drops it only if mapped: `unmap` frees those)
-        let mapped = crate::FRAME_ALLOCATOR
-            .alloc()
-            .filter(|&pa| unsafe { area.map(i, pa) });
-        if mapped.is_none() {
+        let mapped = crate::FRAME_ALLOCATOR.alloc().is_some_and(|pa| {
+            // SAFETY: a fresh frame, ours, handed to the area
+            let ok = unsafe { area.map(i, pa) };
+            if !ok {
+                crate::FRAME_ALLOCATOR.free(pa);
+            }
+            ok
+        });
+        if !mapped {
             unmap(&mut area, i);
             release(slot);
             return None;
