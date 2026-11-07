@@ -841,8 +841,9 @@ impl TcpSock {
 impl Expire for TcpSock {
     fn expire(self: Arc<Self>, id: u64, now: u64) {
         self.step(|g, out| {
-            timer::fired(&mut g.slot, id);
-            g.cb.on_timer(now, out);
+            if timer::fired(&mut g.slot, id) {
+                g.cb.on_timer(now, out);
+            }
         });
     }
 }

@@ -383,11 +383,17 @@ pub fn rearm(slot: &mut Slot, want: Option<u64>, me: Weak<dyn Expire>) {
 }
 
 /// Registration `id` fired (called under the owner's lock before it
-/// runs its timers): forget it unless it was re-armed meanwhile
-pub fn fired(slot: &mut Slot, id: u64) {
+/// runs its timers): true if it is the slot's current one, which is
+/// then forgotten; false if it was re-armed or cancelled meanwhile, so
+/// the owner runs nothing (Linux: a handler finding its event no longer
+/// pending in icsk_pending returns)
+#[must_use]
+pub fn fired(slot: &mut Slot, id: u64) -> bool {
     if slot.0.is_some_and(|k| k.1 == id) {
         slot.0 = None;
+        return true;
     }
+    false
 }
 
 /// Run due TCP timers (softnet/0, thread context, no locks held)
