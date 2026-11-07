@@ -31,10 +31,11 @@ all: $(INITRAMFS)
 
 boot_tester: $(BOOT_TESTER) $(BOOT_TESTER2)
 
-# Every source of the two binaries, at any depth (suites live in
-# subdirectories)
+# Every input of the two binaries: sources at any depth (suites live in
+# subdirectories), manifests, lock file, rustflags and the toolchain pin
 BOOT_TESTER_SRCS = $(shell find boot_tester syscall -name '*.rs') Cargo.toml \
-	boot_tester/Cargo.toml syscall/Cargo.toml
+	boot_tester/Cargo.toml syscall/Cargo.toml Cargo.lock .cargo/config.toml \
+	../rust-toolchain.toml
 
 $(BOOT_TESTER) $(BOOT_TESTER2): $(BOOT_TESTER_SRCS)
 	$(CARGO) build --release --target $(TARGET)
