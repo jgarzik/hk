@@ -832,14 +832,10 @@ where
 /// Group signals `which` that `t` will not take (blocked, or exiting):
 /// wake other threads that will (Linux retarget_shared_pending)
 fn retarget(t: &TaskRef, which: SigSet) {
-    let others: alloc::vec::Vec<TaskRef> = {
-        let table = TASKLIST.read();
-        table
-            .threads(t.pid)
-            .filter(|u| u.task.tid() != t.tid())
-            .filter_map(|u| table.task(u.task.tid()))
-            .collect()
-    };
+    let me = t.tid();
+    let others = crate::task::percpu::GlobalTaskTable::collect_threads(t.pid, |table, u| {
+        (u.task.tid() != me).then(|| table.task(u.task.tid()))?
+    });
     let mut left = which;
     for u in others {
         if u.has_flag(crate::task::pf::EXITING) {
@@ -1027,11 +1023,10 @@ pub fn exit_task_signal(tid: Tid) {
 pub fn flush_group_signal(sig: u32) {
     let mut mask = SigSet::EMPTY;
     mask.add(sig);
-    let tids: alloc::vec::Vec<Tid> = TASKLIST
-        .read()
-        .threads(crate::task::percpu::current_pid())
-        .map(|t| t.task.tid())
-        .collect();
+    let tids = crate::task::percpu::GlobalTaskTable::collect_threads(
+        crate::task::percpu::current_pid(),
+        |_, t| Some(t.task.tid()),
+    );
     let mut shared_done = false;
     for tid in tids {
         // Freed here, after the thread's locks are dropped
@@ -1428,16 +1423,10 @@ fn complete_signal(
 /// The thread of `p`'s group, from its curr_target on, that wants
 /// `sig` (Linux complete_signal's loop): it becomes curr_target
 fn pick_thread(p: &TaskRef, sig: u32) -> Option<TaskRef> {
-    let threads: alloc::vec::Vec<(TaskRef, bool)> = {
-        let table = TASKLIST.read();
-        table
-            .threads(p.pid)
-            .filter_map(|v| {
-                let stopped = matches!(v.state, crate::task::TaskState::Traced(_));
-                table.task(v.task.tid()).map(|t| (t, stopped))
-            })
-            .collect()
-    };
+    let threads = crate::task::percpu::GlobalTaskTable::collect_threads(p.pid, |table, v| {
+        let stopped = matches!(v.state, crate::task::TaskState::Traced(_));
+        table.task(v.task.tid()).map(|t| (t, stopped))
+    });
     if threads.len() < 2 {
         return None;
     }

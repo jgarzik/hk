@@ -765,6 +765,37 @@ impl GlobalTaskTable {
         self.lookup(tid).map(task_ref)
     }
 
+    /// What `f` picks of each thread of process `pid`, gathered with no
+    /// allocation under TASKLIST: the vector is sized under one read
+    /// hold and filled under another, again if the group grew between
+    pub fn collect_threads<T>(
+        pid: Pid,
+        f: impl Fn(&GlobalTaskTable, &TaskView<'_>) -> Option<T>,
+    ) -> Vec<T> {
+        let mut cap = TASKLIST.read().threads(pid).count() + 1;
+        loop {
+            let mut v = Vec::with_capacity(cap);
+            let full = {
+                let table = TASKLIST.read();
+                let mut full = false;
+                for t in table.threads(pid) {
+                    if v.len() == v.capacity() {
+                        full = true;
+                        break;
+                    }
+                    if let Some(x) = f(&table, &t) {
+                        v.push(x);
+                    }
+                }
+                full
+            };
+            if !full {
+                return v;
+            }
+            cap *= 2;
+        }
+    }
+
     /// Every task
     pub fn iter(&self) -> impl Iterator<Item = TaskView<'_>> {
         self.tasks.iter().map(|t| view(self, t))
@@ -824,13 +855,18 @@ impl GlobalTaskTable {
         drop(unsafe { pi.children.remove(child) });
     }
 
-    /// Move every child of `task` to `reaper` (Linux forget_original_parent
-    /// + reparent_leader); true if one was a zombie
-    pub fn reparent(&mut self, task: &Task, reaper: &TaskRef, moved: &mut Vec<TaskRef>) {
+    /// Move the children of `task` to `reaper` (Linux
+    /// forget_original_parent, reparent_leader), each pushed to `moved`
+    /// while it has room (no allocation here, under TASKLIST): false if
+    /// some are left
+    pub fn reparent(&mut self, task: &Task, reaper: &TaskRef, moved: &mut Vec<TaskRef>) -> bool {
         let other_group = reaper.pid != task.pid;
         loop {
+            if moved.len() == moved.capacity() {
+                return self.inner_mut_of(task).children.is_empty();
+            }
             let Some(child) = self.inner_mut_of(task).children.pop_front() else {
-                break;
+                return true;
             };
             let ci = self.inner_mut_of(&child);
             ci.in_children = false;
@@ -2477,21 +2513,27 @@ pub fn current_exiting() -> bool {
 /// else the nearest PR_SET_CHILD_SUBREAPER ancestor, else init
 fn forget_original_parent() {
     let me = task_ref(&current());
+    // Room for every child first: nothing allocates under TASKLIST
     let mut moved = Vec::new();
-    reparent_children(&me, &mut moved);
+    loop {
+        let n = TASKLIST
+            .read()
+            .get(me.tid())
+            .map_or(0, |t| t.children.len());
+        moved.reserve(n + 1);
+        if reparent_children(&me, &mut moved) {
+            break;
+        }
+    }
     // Then, with TASKLIST dropped (Linux forget_original_parent,
     // reparent_leader): each moved child's threads get their
     // pdeath_signal, from this task; a zombie whose group is gone tells
     // its new parent, which may release it at once
     for c in &moved {
-        let deaths: Vec<(TaskRef, u32)> = {
-            let table = TASKLIST.read();
-            table
-                .threads(c.pid)
-                .filter(|t| t.pdeath_signal > 0)
-                .filter_map(|t| Some((table.task(t.task.tid())?, t.pdeath_signal as u32)))
-                .collect()
-        };
+        let deaths = GlobalTaskTable::collect_threads(c.pid, |table, t| {
+            (t.pdeath_signal > 0).then_some(())?;
+            Some((table.task(t.task.tid())?, t.pdeath_signal as u32))
+        });
         for (t, sig) in deaths {
             crate::signal::send_group_signal(&t, sig, crate::signal::SendInfo::User);
         }
@@ -2504,10 +2546,10 @@ fn forget_original_parent() {
 
 /// Hand `me`'s children to their new parent: another live thread of
 /// its group, else the nearest live subreaper ancestor, else init
-fn reparent_children(me: &TaskRef, moved: &mut Vec<TaskRef>) {
+fn reparent_children(me: &TaskRef, moved: &mut Vec<TaskRef>) -> bool {
     let mut table = TASKLIST.write();
     if table.get(me.tid()).is_none_or(|t| t.children.is_empty()) {
-        return;
+        return true;
     }
     let live = crate::signal::task_live;
     let mut reaper = table
@@ -2526,11 +2568,9 @@ fn reparent_children(me: &TaskRef, moved: &mut Vec<TaskRef>) {
         }
     }
     let Some(reaper) = reaper.or_else(|| table.task(1)) else {
-        return;
+        return true;
     };
-    if !Arc::ptr_eq(&reaper, me) {
-        table.reparent(me, &reaper, moved);
-    }
+    Arc::ptr_eq(&reaper, me) || table.reparent(me, &reaper, moved)
 }
 
 /// The exiting task, now a zombie, tells its parent or tracer (Linux
