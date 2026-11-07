@@ -884,8 +884,8 @@ Tag = roadmap phase (doc/ROADMAP.md).
    getppid, clone's and wait's results, siginfo senders and every pid
    argument go through the caller's namespace (`pid::vnr`,
    `from_vnr`, `find_task_by_vpid`), but they read `pid::view`, the
-   root namespace, until the reports translate too (SCM credentials,
-   F_GETLK, SysV IPC, /proc): a task must never get a number in one
+   root namespace, until the reports translate too (F_GETLK, SysV
+   IPC, /proc): a task must never get a number in one
    namespace that an argument reads in another.
 8. **MM_LIFE_EXEC_CHAIN flake** (arm64 CI, TCG, NIC=e1000):
    `MM_LIFE_EXEC_CHAIN:FAIL -2`, a measured chain's child (busybox

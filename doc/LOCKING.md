@@ -866,7 +866,10 @@ unlinked and given back when the last task leaves the `Pid`
 (`release_numbers` from `GlobalTaskTable::remove`, `change_pids` and
 `take_leadership`, under TASKLIST's write lock: Linux free_pid from
 detach_pid), or at its last drop if no task ever left it. It is taken
-under nothing but may be taken under TASKLIST.
+under nothing but may be taken under TASKLIST and, being a leaf, under
+any thread-context lock where a last `Arc<Pid>` reference may go (an
+AF_UNIX queue's SCM credentials and SO_PEERCRED, a tty's group, an
+F_SETOWN owner).
 A process's pid is its leader's tid; an exec from a non-leader takes
 the leader's tid and `Pid` (`take_leadership`, Linux exchange_tids)
 under TASKLIST (the run queue knows tasks by reference, not by

@@ -134,7 +134,7 @@ impl NlSkb {
             portid: 0,
             group,
             creds: Creds {
-                pid: 0,
+                pid: None,
                 uid: 0,
                 gid: 0,
             },
@@ -607,7 +607,7 @@ impl NlSock {
                 data: data.to_vec(),
                 portid: me,
                 group,
-                creds,
+                creds: creds.clone(),
             };
             broadcast(&self.sk.net, self.sk.protocol, skb, me);
         }

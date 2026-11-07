@@ -109,10 +109,11 @@ impl UnixAddr {
     }
 }
 
-/// SO_PEERCRED values (Linux sk_peer_pid + sk_peer_cred as ucred)
-#[derive(Clone, Copy)]
+/// SO_PEERCRED values (Linux sk_peer_pid + sk_peer_cred): the peer's
+/// struct pid, numbered for each reader
+#[derive(Clone)]
 pub struct PeerCred {
-    pid: i32,
+    pid: Option<Arc<crate::task::pid::Pid>>,
     uid: u32,
     gid: u32,
 }
@@ -121,7 +122,10 @@ impl PeerCred {
     fn current() -> Self {
         let c = crate::task::current_cred();
         Self {
-            pid: crate::task::percpu::current_pid() as i32,
+            pid: crate::task::pid::find_pid(
+                &crate::ns::INIT_PID_NS,
+                crate::task::percpu::current_pid() as u32,
+            ),
             uid: c.euid,
             gid: c.egid,
         }
@@ -612,10 +616,13 @@ impl UnixSock {
     /// SO_PEERCRED: struct ucred of the peer captured at connect,
     /// listen or socketpair
     fn peercred_opt(&self) -> OptOut {
-        let c = *self.peercred.lock();
-        OptOut::Bytes(crate::net::socket::peercred_bytes(
-            c.map(|c| (c.pid, c.uid, c.gid)),
-        ))
+        let c = self.peercred.lock().clone();
+        // The pid in the reader's namespace, 0 if not visible (Linux
+        // cred_to_ucred: pid_vnr)
+        OptOut::Bytes(crate::net::socket::peercred_bytes(c.map(|c| {
+            let pid = c.pid.as_ref().map_or(0, |p| p.vnr()) as i32;
+            (pid, c.uid, c.gid)
+        })))
     }
 
     /// Linux unix_inq_len: EINVAL on a listener; a stream's unread
@@ -843,7 +850,7 @@ impl ProtoOps for UnixSock {
             .arc();
         let a = self.arc();
         let cred = PeerCred::current();
-        *a.peercred.lock() = Some(cred);
+        *a.peercred.lock() = Some(cred.clone());
         *b.peercred.lock() = Some(cred);
         let (mut ga, gb) = UnixSock::lock2(&a, &b);
         *ga = Some(b.clone());
