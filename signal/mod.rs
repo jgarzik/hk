@@ -17,6 +17,7 @@
 //!
 //! See doc/LOCKING.md for full lock ordering.
 
+pub mod notify;
 pub mod pending;
 pub mod siginfo;
 pub mod syscall;
@@ -929,9 +930,11 @@ pub fn has_pending_signals(tid: Tid) -> bool {
 /// Whether `sig` would be discarded on arrival (Linux sig_ignored): its
 /// handler is SIG_IGN, or SIG_DFL with an "ignore" default (SIGCHLD,
 /// SIGURG, SIGWINCH, and SIGCONT, which hk does not act on), and it is not
-/// blocked (a blocked signal stays queued: the handler may change)
+/// blocked (a blocked signal stays queued: the handler may change), nor
+/// awaited by sigtimedwait (blocked before it: real_blocked)
 fn sig_ignored(state: &TaskSignalState, sighand: Option<&Arc<SigHand>>, sig: u32) -> bool {
-    if state.blocked.contains(sig) || sig == SIGKILL || sig == SIGSTOP {
+    let held = state.blocked.contains(sig) || state.real_blocked.contains(sig);
+    if held || sig == SIGKILL || sig == SIGSTOP {
         return false;
     }
     let Some(action) = sighand.and_then(|h| h.get_action(sig)) else {
@@ -1033,14 +1036,24 @@ pub fn send_signal(tid: Tid, sig: u32) -> i32 {
 /// Send `sig` with `info` to thread `tid` (Linux send_sig_info): 0,
 /// ESRCH, EINVAL, or EAGAIN when an RT signal's info cannot be queued
 pub fn send_sig_info(tid: Tid, sig: u32, info: SendInfo) -> i32 {
-    send_signal_force(tid, sig, info, false)
+    send_signal_force(tid, sig, info, PidType::Pid, false)
+}
+
+/// Whom a signal is for (Linux enum pid_type, the two a send uses)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PidType {
+    /// The thread (PIDTYPE_PID)
+    Pid,
+    /// Its whole thread group (PIDTYPE_TGID)
+    Tgid,
 }
 
 /// The receiver of a send, read under TASKLIST: a kernel thread, the
-/// global init, its real uid and RLIMIT_SIGPENDING
+/// global init, its group exiting, its real uid and RLIMIT_SIGPENDING
 struct Target {
     kthread: bool,
     init: bool,
+    group_exit: bool,
     uid: crate::task::Uid,
     limit: u64,
 }
@@ -1055,6 +1068,10 @@ fn target(tid: Tid) -> Option<Target> {
     Some(Target {
         kthread: t.task.has_flag(crate::task::pf::KTHREAD),
         init: t.task.pid == 1,
+        group_exit: t
+            .signal
+            .as_ref()
+            .is_some_and(|s| matches!(s.group_exit(), GroupExit::Exit(_))),
         uid: t.cred_arc().uid,
         limit: limit.map_or(0, |r| r.rlim_cur),
     })
@@ -1072,7 +1089,7 @@ enum Sent {
 
 /// send_sig_info; `force` (a kernel-forced signal, Linux force_sig) is
 /// delivered to the global init even with its action SIG_DFL
-fn send_signal_force(tid: Tid, sig: u32, info: SendInfo, force: bool) -> i32 {
+fn send_signal_force(tid: Tid, sig: u32, info: SendInfo, ty: PidType, force: bool) -> i32 {
     check_send_context();
     if sig == 0 {
         // Signal 0 is null signal - just check if task exists
@@ -1094,7 +1111,9 @@ fn send_signal_force(tid: Tid, sig: u32, info: SendInfo, force: bool) -> i32 {
     let Some(tg) = target(tid) else {
         return -3; // ESRCH
     };
-    if tg.kthread {
+    // A dying group takes no more signals (Linux prepare_signal:
+    // SIGNAL_GROUP_EXIT; its threads have SIGKILL)
+    if tg.kthread || tg.group_exit {
         return 0;
     }
     // A forced signal whose action is SIG_DFL (a blocked or ignored one
@@ -1128,7 +1147,7 @@ fn send_signal_force(tid: Tid, sig: u32, info: SendInfo, force: bool) -> i32 {
     };
     let sighand = get_task_sighand(tid);
     let sent = with_task_sig(tid, |t, state| {
-        send_locked(t, state, sighand.as_ref(), sig, init, &info, &mut q)
+        send_locked(t, state, sighand.as_ref(), sig, init, &info, ty, &mut q)
     });
     drop(q);
 
@@ -1164,10 +1183,12 @@ fn send_signal_force(tid: Tid, sig: u32, info: SendInfo, force: bool) -> i32 {
 /// Queue `sig` for task `t` under its Task.sig (Linux
 /// __send_signal_locked): dropped if ignored (`init`: the global init's
 /// protection applies) or a non-RT signal already pending, else marked
-/// pending with entry `q` queued, which it takes. An exiting task gets
-/// none (its queue was flushed: Linux task_can_queue_signal), nor does
-/// a send whose entry could not be had; an RT signal a user queued
-/// then fails.
+/// pending with entry `q` queued, which it takes. A signal for an
+/// exiting thread itself is dropped (its queue was flushed: Linux
+/// task_can_queue_signal); one for its group gets no entry. A send
+/// whose entry could not be had goes on without; an RT signal a user
+/// queued then fails.
+#[expect(clippy::too_many_arguments)]
 fn send_locked(
     t: &crate::task::Task,
     state: &mut TaskSignalState,
@@ -1175,15 +1196,20 @@ fn send_locked(
     sig: u32,
     init: bool,
     info: &SendInfo,
+    ty: PidType,
     q: &mut Option<Box<SigQueue>>,
 ) -> Sent {
+    let exiting = t.has_flag(crate::task::pf::EXITING);
+    if exiting && ty == PidType::Pid {
+        return Sent::Dropped;
+    }
     if sig_ignored(state, sighand, sig) || (init && init_ignores(state, sighand, sig)) {
         return Sent::Dropped;
     }
     if state.pending.legacy(sig) {
         return Sent::Dropped;
     }
-    if !t.has_flag(crate::task::pf::EXITING) {
+    if !exiting {
         match q.take() {
             Some(e) => state.pending.queue(e),
             None if info.must_queue(sig) => return Sent::Overflow,
@@ -1247,7 +1273,7 @@ pub fn kill_proc_info(pid: Pid, sig: u32, info: SendInfo) -> i32 {
     };
 
     match tid {
-        Some(tid) => send_sig_info(tid, sig, info),
+        Some(tid) => send_signal_force(tid, sig, info, PidType::Tgid, false),
         None => -3, // ESRCH - no such process
     }
 }
@@ -2153,7 +2179,7 @@ fn force_send(tid: Tid, sig: u32, info: SendInfo) {
         }
         with_task_signal_state(tid, |s| s.blocked.remove(sig));
     }
-    send_signal_force(tid, sig, info, true);
+    send_signal_force(tid, sig, info, PidType::Pid, true);
 }
 
 /// Force delivery of SIGSEGV (for stack errors during signal setup)
@@ -2168,7 +2194,7 @@ pub fn force_sigsegv(tid: Tid) {
     with_task_signal_state(tid, |state| state.blocked.remove(SIGSEGV));
     // Send SIGSEGV to self, forced: it kills even the global init (Linux
     // force_sig_info_to_task clears SIGNAL_UNKILLABLE for SIG_DFL)
-    send_signal_force(tid, SIGSEGV, SendInfo::Kernel, true);
+    send_signal_force(tid, SIGSEGV, SendInfo::Kernel, PidType::Pid, true);
 }
 
 /// A synchronous fault in user mode (page fault, illegal instruction, ...)

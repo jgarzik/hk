@@ -9,6 +9,10 @@
 //!   siblings exits alone and the process goes on
 //! - SECCOMP_TRAP: a SIGSYS handler runs; with SIGSYS ignored the
 //!   (forced) signal kills the process
+//! - SECCOMP_TRAP_INFO: the SA_SIGINFO handler's siginfo is SYS_SECCOMP
+//!   with the filter's data in si_errno, si_syscall, si_arch and a user
+//!   si_call_addr; on x86-64 the syscall returns its number (Linux
+//!   syscall_rollback: RAX = orig_ax)
 //! - SECCOMP_TRACE: with no tracer, ENOSYS
 //! - SECCOMP_UNKNOWN: an action Linux does not know kills the process
 //! - SECCOMP_STRICT: in strict mode getppid kills by SIGKILL
@@ -138,6 +142,7 @@ pub fn run_tests() {
     kill_process();
     kill_thread();
     trap();
+    trap_info();
     trace();
     unknown();
     strict();
@@ -283,6 +288,48 @@ fn trap() {
             ignored
         },
     );
+}
+
+/// What the SA_SIGINFO SIGSYS handler saw: si_code, si_errno,
+/// si_syscall, si_arch, si_call_addr != 0
+static SEEN: [AtomicU32; 5] = [const { AtomicU32::new(0) }; 5];
+
+extern "C" fn on_sigsys_info(_: i32, info: *const u8, _: *const u8) {
+    // SAFETY: the kernel passes a 128-byte siginfo_t
+    let b = unsafe { core::slice::from_raw_parts(info, 128) };
+    let u = |at: usize| u32::from_ne_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]);
+    // si_errno 4, si_code 8, si_call_addr 16, si_syscall 24, si_arch 28
+    let vals = [u(8), u(4), u(24), u(28), u32::from(u(16) != 0 || u(20) != 0)];
+    for (s, v) in SEEN.iter().zip(vals) {
+        s.store(v, Ordering::Release);
+    }
+}
+
+fn trap_info() {
+    let st = child(|| {
+        let a = SigAction {
+            handler: on_sigsys_info as *const () as u64,
+            flags: SA_RESTORER | 4, // SA_SIGINFO
+            restorer: restorer_addr(),
+            mask: 0,
+        };
+        sys_rt_sigaction(SIGSYS, &a as *const SigAction as u64, 0, 8);
+        if install(RET_TRAP | 0x42, 0) != 0 {
+            return 1;
+        }
+        let r = sys_getppid();
+        let seen: [u32; 5] = core::array::from_fn(|i| SEEN[i].load(Ordering::Acquire));
+        if seen != [1, 0x42, SYS_GETPPID as u32, AUDIT_ARCH, 1] {
+            return 2;
+        }
+        #[cfg(target_arch = "x86_64")]
+        if r != SYS_GETPPID as i64 {
+            return 3;
+        }
+        let _ = r;
+        0
+    });
+    report(b"SECCOMP_TRAP_INFO", st == 0, st);
 }
 
 fn trace() {

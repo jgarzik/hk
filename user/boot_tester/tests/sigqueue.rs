@@ -13,8 +13,16 @@
 //! - a signalfd read gives the queued info (ssi_code, ssi_pid, ssi_int)
 //! - an SA_SIGINFO handler gets the queued info (si_code, si_pid,
 //!   si_value)
+//! - an mq_notify signal is SI_MESGQ from the sender with the
+//!   registrant's sigev_value
+//! - a tracee's ptrace stop sends its tracer SIGCHLD with CLD_TRAPPED,
+//!   its pid and the stop signal
 
 use super::helpers::{host_mode, print, print_num, println, read_file, skip};
+use hk_syscall::{
+    MqAttr, O_CREAT, O_RDWR, SigEvent, SigVal, sys_mq_notify, sys_mq_open, sys_mq_timedsend,
+    sys_mq_unlink, sys_ptrace,
+};
 use hk_syscall::{
     RLIMIT_SIGPENDING, RLimit, SA_RESTORER, SA_SIGINFO, SFD_NONBLOCK, SIG_DFL, SigInfo, sys_close,
     sys_exit, sys_fork, sys_getpid, sys_getrlimit, sys_kill, sys_read, sys_rt_sigaction,
@@ -41,6 +49,8 @@ pub fn run_tests() {
     test_sigchld_exit();
     test_signalfd_info();
     test_handler_info();
+    test_mq_info();
+    test_trapped_info();
 }
 
 fn bit(sig: u32) -> u64 {
@@ -424,6 +434,96 @@ fn test_handler_info() {
             print_num(v as i64);
             print(b",");
         }
+        println(b"");
+    }
+}
+
+/// mq_notify(SIGEV_SIGNAL, SIGRT, value 777), then a send: the signal's
+/// info is SI_MESGQ from this process with that value
+fn test_mq_info() {
+    const SI_MESGQ: i32 = -3;
+    let name = b"sigqueue_mq\0";
+    let attr = MqAttr::new(4, 16);
+    let fd = sys_mq_open(name.as_ptr(), O_RDWR as i32 | O_CREAT as i32, 0o600, &attr) as i32;
+    let old = block(bit(SIGRT));
+    let sev = SigEvent {
+        sigev_value: SigVal { sival_int: 777 },
+        sigev_signo: SIGRT as i32,
+        sigev_notify: 0, // SIGEV_SIGNAL
+        ..SigEvent::default()
+    };
+    let n = sys_mq_notify(fd, &sev);
+    let msg = *b"hi";
+    let snd = sys_mq_timedsend(fd, msg.as_ptr(), 2, 0, core::ptr::null());
+    let mut info = zeroed();
+    let r = wait_sig(bit(SIGRT), 1, &mut info);
+    setmask(old);
+    sys_close(fd as u64);
+    sys_mq_unlink(name.as_ptr());
+    if fd >= 0
+        && n == 0
+        && snd == 0
+        && r == SIGRT as i64
+        && info.si_code == SI_MESGQ
+        && info.si_pid as i64 == sys_getpid()
+        && info.si_status == 777
+    {
+        println(b"SIGQUEUE_MQ_INFO:OK");
+    } else {
+        print(b"SIGQUEUE_MQ_INFO:FAIL fd=");
+        print_num(fd as i64);
+        print(b" notify=");
+        print_num(n);
+        print(b" send=");
+        print_num(snd);
+        print(b" r=");
+        print_num(r);
+        print(b" code=");
+        print_num(info.si_code as i64);
+        print(b" value=");
+        print_num(info.si_status as i64);
+        println(b"");
+    }
+}
+
+/// A PTRACE_TRACEME child stops on its SIGSTOP: the tracer's SIGCHLD is
+/// CLD_TRAPPED with the child's pid and SIGSTOP as status
+fn test_trapped_info() {
+    const PTRACE_TRACEME: i64 = 0;
+    const SIGSTOP: u32 = 19;
+    const SIGKILL: u32 = 9;
+    const CLD_TRAPPED: i32 = 4;
+    let old = block(bit(SIGCHLD));
+    let child = sys_fork();
+    if child == 0 {
+        sys_ptrace(PTRACE_TRACEME, 0, 0, 0);
+        sys_kill(sys_getpid(), SIGSTOP);
+        sys_exit(0);
+    }
+    let mut info = zeroed();
+    let r = wait_sig(bit(SIGCHLD), 10, &mut info);
+    sys_kill(child, SIGKILL);
+    let mut st = 0i32;
+    sys_wait4(child, &mut st, 0, 0);
+    // The kill's SIGCHLD, if any, is not this test's
+    let mut rest = zeroed();
+    wait_sig(bit(SIGCHLD), 0, &mut rest);
+    setmask(old);
+    if r == SIGCHLD as i64
+        && info.si_code == CLD_TRAPPED
+        && info.si_pid as i64 == child
+        && info.si_status == SIGSTOP as i32
+    {
+        println(b"SIGQUEUE_TRAPPED_INFO:OK");
+    } else {
+        print(b"SIGQUEUE_TRAPPED_INFO:FAIL r=");
+        print_num(r);
+        print(b" code=");
+        print_num(info.si_code as i64);
+        print(b" pid=");
+        print_num(info.si_pid as i64);
+        print(b" status=");
+        print_num(info.si_status as i64);
         println(b"");
     }
 }

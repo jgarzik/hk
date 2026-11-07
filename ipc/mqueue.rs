@@ -375,21 +375,30 @@ impl MqQueue {
         // Taken out of the lock: the send allocates its queue entry
         let n = self.notify.lock().take();
         if let Some(n) = n {
-            // TODO: siginfo SI_MESGQ with sigev_value once hk queues siginfo
-            let _sigev_value = n.sigev_value;
             // The registrant's authority, not the sender's (Linux
             // __do_notify sends without the kill permission check), and
             // only to the process that registered: not after it exited
-            // or exec'd
+            // or exec'd; signal 0 sends nothing
             let live = n.owner.exited().is_none() && n.owner.exec_gen() == n.exec_gen;
-            if n.sigev_notify == SIGEV_SIGNAL && live {
-                crate::signal::send_signal_to_process(
-                    u64::from(n.owner.nr()),
-                    n.sigev_signo as u32,
-                );
+            let sig = n.sigev_signo as u32;
+            if n.sigev_notify == SIGEV_SIGNAL && live && sig != 0 {
+                let info = mesgq_info(sig, n.sigev_value);
+                crate::signal::kill_proc_info(u64::from(n.owner.nr()), sig, info);
             }
         }
     }
+}
+
+/// SI_MESGQ info from the current task, the process that made the queue
+/// non-empty, with the registrant's sigev_value (Linux __do_notify)
+fn mesgq_info(sig: u32, value: u64) -> crate::signal::SendInfo {
+    use crate::signal::{SendInfo, SigFields, SigInfo, si_code};
+    let fields = SigFields::Rt {
+        pid: crate::task::percpu::current_pid() as i32,
+        uid: crate::task::current_cred().uid,
+        value,
+    };
+    SendInfo::Info(SigInfo::new(sig, si_code::SI_MESGQ, fields))
 }
 
 /// A message queue descriptor's private data

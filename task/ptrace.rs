@@ -808,7 +808,7 @@ pub fn ptrace_stop(code: u32) -> u32 {
     // do_notify_parent_cldstop, CLD_TRAPPED)
     super::proc::CHILD_EXIT_WQ.wake_all();
     if let Some(tr) = tracer {
-        signal::send_signal_to_process(tr.pid, signal::SIGCHLD);
+        signal::notify::notify_tracer_trapped(tid, &tr, code);
     }
     loop {
         set_current_state(SleepState::Killable);
@@ -860,9 +860,10 @@ pub fn ptrace_report_syscall(entry: bool) {
     } else {
         SIGTRAP
     };
+    // Linux send_sig(exit_code, current, 1): SEND_SIG_PRIV
     let sig = ptrace_stop(code);
     if sig != 0 {
-        signal::send_signal(tid, sig);
+        signal::send_sig_info(tid, sig, signal::SendInfo::Kernel);
     }
 }
 

@@ -72,6 +72,7 @@ pub mod si_code {
     /// SIGPOLL codes
     pub const NSIGPOLL: i32 = 6;
     /// SIGSYS codes
+    pub const SYS_SECCOMP: i32 = 1;
     pub const NSIGSYS: i32 = 2;
 }
 

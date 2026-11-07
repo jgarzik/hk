@@ -276,13 +276,10 @@ No leases (F_SETLEASE) and no OFD locks (F_OFD_*).
 
 **Location**: `seccomp/`
 
-SIGSYS from SECCOMP_RET_TRAP carries no siginfo (si_code SYS_SECCOMP,
-si_syscall, si_arch, si_errno, si_call_addr): it is sent SI_KERNEL. No
-PTRACE_EVENT_SECCOMP (RET_TRACE is ENOSYS
-as with no tracer), no user notification (SECCOMP_RET_USER_NOTIF,
-SECCOMP_GET_NOTIF_SIZES), no FLAG_TSYNC_ESRCH / FLAG_SPEC_ALLOW /
-FLAG_WAIT_KILLABLE_RECV, and nothing is logged for RET_LOG or
-FLAG_LOG.
+No PTRACE_EVENT_SECCOMP (RET_TRACE is ENOSYS as with no tracer), no
+user notification (SECCOMP_RET_USER_NOTIF, SECCOMP_GET_NOTIF_SIZES), no
+FLAG_TSYNC_ESRCH / FLAG_SPEC_ALLOW / FLAG_WAIT_KILLABLE_RECV, and
+nothing is logged for RET_LOG or FLAG_LOG.
 
 ## vmsplice from a pipe is not done
 

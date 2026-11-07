@@ -2756,7 +2756,14 @@ the signal handler table must use an IRQ-safe lock. The `IrqSpinlock` ensures th
    swapped out under TASKLIST and `Task.sig` and freed after both, and
    an exiting task (PF_EXITING, read under `Task.sig`) gets no entries,
    so none outlives that flush. Senders run in thread context with no
-   spin lock held (mqueue drops its notify lock before sending).
+   spin lock held (mqueue drops its notify lock before sending). The
+   charge comes before the lock, not under it as in Linux, so while an
+   entry that turns out unused (the signal ignored, or non-RT and
+   already pending) is alive its user's count is one high: a racing
+   send for the same user at its RLIMIT_SIGPENDING can see EAGAIN.
+   Charging under `Task.sig` would put `UCOUNTS`, whose map allocates
+   a node for a new user, under it; the window is one locked section
+   and matters only at the limit.
 
 #### Lock Order for Signal Operations
 
