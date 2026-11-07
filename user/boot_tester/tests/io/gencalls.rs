@@ -12,7 +12,7 @@
 //!   the upper half zero (how glibc passes it) waits for any child, and
 //!   is EINVAL to sched_getscheduler
 
-use crate::tests::helpers::{print, print_num, println};
+use crate::tests::harness::verdict_detail;
 use hk_syscall::{
     O_RDONLY, sys_close, sys_dup, sys_execveat, sys_exit, sys_fork, sys_getcwd, sys_lseek,
     sys_open, sys_sched_getscheduler, sys_wait4,
@@ -41,28 +41,17 @@ fn int_args() {
     if w != pid {
         // Reap it anyway
         sys_wait4(pid, &mut st, 0, 0);
-        report(b"GEN_INT_ARGS", false, w);
+        verdict_detail(b"GEN_INT_ARGS", false, w);
         return;
     }
     let s = sys_sched_getscheduler(MINUS_ONE_32);
-    report(b"GEN_INT_ARGS", st == 3 << 8 && s == -22, s);
-}
-
-fn report(name: &[u8], ok: bool, detail: i64) {
-    print(name);
-    if ok {
-        println(b":OK");
-    } else {
-        print(b":FAIL ");
-        print_num(detail);
-        println(b"");
-    }
+    verdict_detail(b"GEN_INT_ARGS", st == 3 << 8 && s == -22, s);
 }
 
 fn dup() {
     let fd = sys_open(b"/test.txt\0".as_ptr(), O_RDONLY, 0);
     if fd < 0 {
-        report(b"GEN_DUP", false, fd);
+        verdict_detail(b"GEN_DUP", false, fd);
         return;
     }
     let d = sys_dup(fd as i32);
@@ -72,7 +61,7 @@ fn dup() {
     if d >= 0 {
         sys_close(d as u64);
     }
-    report(b"GEN_DUP", shared, d);
+    verdict_detail(b"GEN_DUP", shared, d);
 }
 
 fn getcwd() {
@@ -80,7 +69,7 @@ fn getcwd() {
     let n = sys_getcwd(buf.as_mut_ptr(), buf.len());
     let ok = n == 2 && &buf[..2] == b"/\0";
     let small = sys_getcwd(buf.as_mut_ptr(), 1);
-    report(
+    verdict_detail(
         b"GEN_GETCWD",
         ok && small == ERANGE,
         if ok { small } else { n },
@@ -103,8 +92,8 @@ fn execveat() {
     }
     let mut st = 0i32;
     if pid < 0 || sys_wait4(pid, &mut st, 0, 0) != pid {
-        report(b"GEN_EXECVEAT", false, pid);
+        verdict_detail(b"GEN_EXECVEAT", false, pid);
         return;
     }
-    report(b"GEN_EXECVEAT", st == 0, st as i64);
+    verdict_detail(b"GEN_EXECVEAT", st == 0, st as i64);
 }

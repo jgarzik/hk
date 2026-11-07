@@ -5,7 +5,7 @@
 //! absolute, a trailing slash asks for a directory, and a last name of
 //! "/", "." or ".." gets each call's own errno
 
-use crate::tests::helpers::{print, print_num, println};
+use crate::tests::harness::{R, report_r};
 use hk_syscall::{
     O_CREAT, O_RDONLY, O_WRONLY, Stat, sys_chdir, sys_close, sys_execve, sys_fstatat, sys_link,
     sys_lstat, sys_mkdir, sys_open, sys_rename, sys_renameat2, sys_rmdir, sys_stat, sys_symlink,
@@ -29,28 +29,12 @@ const S_IFDIR: u32 = 0o040000;
 
 pub fn run_tests() {
     sys_mkdir(b"/tmp\0".as_ptr(), 0o1777); // hk boots without /tmp
-    report(b"PATH_EMPTY", check_empty());
-    report(b"PATH_TOOLONG", check_toolong());
-    report(b"PATH_TRAILING_SLASH", trailing());
-    report(b"DOTDOT_LAST_NAME", dots());
-    report(b"CREAT_DANGLING_LINK", creat_dangling());
-    report(b"NEG_DENTRY_CREATE", negative());
-}
-
-type R = Result<(), (&'static [u8], i64)>;
-
-fn report(name: &[u8], r: R) {
-    print(name);
-    match r {
-        Ok(()) => println(b":OK"),
-        Err((why, got)) => {
-            print(b":FAIL ");
-            print(why);
-            print(b" got ");
-            print_num(got);
-            println(b"");
-        }
-    }
+    report_r(b"PATH_EMPTY", check_empty());
+    report_r(b"PATH_TOOLONG", check_toolong());
+    report_r(b"PATH_TRAILING_SLASH", trailing());
+    report_r(b"DOTDOT_LAST_NAME", dots());
+    report_r(b"CREAT_DANGLING_LINK", creat_dangling());
+    report_r(b"NEG_DENTRY_CREATE", negative());
 }
 
 /// `got` must be `want`

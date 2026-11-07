@@ -16,7 +16,7 @@
 //!   process_vm_writev there is EFAULT, and process_vm_readv of a page
 //!   never touched reads zeros (both fault pages in: Linux GUP)
 
-use crate::tests::net::sk::T;
+use crate::tests::harness::T;
 use hk_syscall::{
     sys_exit, sys_fork, sys_getpid, sys_getppid, sys_kill, sys_prctl, sys_ptrace, sys_setresgid,
     sys_setresuid, sys_wait4,

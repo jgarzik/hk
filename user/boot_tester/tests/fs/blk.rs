@@ -8,6 +8,7 @@
 //! swap, vda3 16 MiB of 32-bit LE words w(i) = i * 1103515245 + 12345.
 //! The disk is attached with snapshot=on: each boot sees it pristine.
 
+use crate::tests::harness::verdict;
 use crate::tests::helpers::{
     BlkDev, dev_major, dev_minor, find_blkdev, linux_at_least, print, print_num, println, read_file,
 };
@@ -37,17 +38,6 @@ const SEEK_END: i32 = 2;
 
 const MIB: u64 = 1024 * 1024;
 const P3_SIZE: u64 = 16 * MIB;
-
-fn verdict(name: &[u8], ok: bool, got: i64) {
-    print(name);
-    if ok {
-        println(b":OK");
-    } else {
-        print(b":FAIL got ");
-        print_num(got);
-        println(b"");
-    }
-}
 
 /// Pattern byte at offset `off` of vda3
 fn pat(off: u64) -> u8 {

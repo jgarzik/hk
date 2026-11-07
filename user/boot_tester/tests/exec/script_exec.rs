@@ -13,7 +13,7 @@
 //! - SCRIPT_FD: a script run through execveat(fd, "", AT_EMPTY_PATH)
 //!   gets /dev/fd/N as its path; through a close-on-exec fd it is ENOENT
 
-use crate::tests::helpers::{print, print_num, println};
+use crate::tests::harness::verdict_detail;
 use hk_syscall::{
     O_CLOEXEC, O_CREAT, O_RDONLY, O_TRUNC, O_WRONLY, sys_close, sys_dup3, sys_execve, sys_execveat,
     sys_exit, sys_fork, sys_open, sys_read, sys_unlink, sys_wait4, sys_write,
@@ -46,17 +46,6 @@ pub fn run_tests() {
         sys_unlink(p.as_ptr());
     }
     sys_unlink(OUT.as_ptr());
-}
-
-fn report(name: &[u8], ok: bool, detail: i64) {
-    print(name);
-    if ok {
-        println(b":OK");
-    } else {
-        print(b":FAIL ");
-        print_num(detail);
-        println(b"");
-    }
 }
 
 /// Write an executable file
@@ -105,7 +94,7 @@ fn exec() {
     script(b"/scr_a\0", b"#!/bin/echo -n\nignored\n");
     let st = run(b"/scr_a\0", -1);
     let mut b = [0u8; 64];
-    report(
+    verdict_detail(
         b"SCRIPT_EXEC",
         st == 0 && output(&mut b) == b"/scr_a x",
         st as i64,
@@ -116,7 +105,7 @@ fn arg_spaces() {
     script(b"/scr_b\0", b"#! /bin/echo  a  b \t\n");
     let st = run(b"/scr_b\0", -1);
     let mut b = [0u8; 64];
-    report(
+    verdict_detail(
         b"SCRIPT_ARG_SPACES",
         st == 0 && output(&mut b) == b"a  b /scr_b x\n",
         st as i64,
@@ -137,7 +126,7 @@ fn nested() {
     let ok5 = five == 0 && out == b"/scr_1 /scr_2 /scr_3 /scr_4 /scr_5 x";
     let six = run(b"/scr_6\0", -1);
     let ok6 = six == 0x80 | ELOOP as i32;
-    report(
+    verdict_detail(
         b"SCRIPT_NESTED",
         ok5 && ok6,
         if ok5 { six as i64 } else { five as i64 },
@@ -149,7 +138,7 @@ fn bad() {
     script(b"/scr_y\0", b"#!\n");
     let missing = run(b"/scr_x\0", -1);
     let empty = run(b"/scr_y\0", -1);
-    report(
+    verdict_detail(
         b"SCRIPT_BAD",
         missing == 0x80 | ENOENT as i32 && empty == 0x80 | ENOEXEC as i32,
         (missing << 8 | empty) as i64,
@@ -186,7 +175,7 @@ fn by_fd() {
     let cfd = sys_open(b"/scr_a\0".as_ptr(), O_RDONLY | O_CLOEXEC, 0) as i32;
     let cst = run(b"/scr_a\0", cfd);
     sys_close(cfd as u64);
-    report(
+    verdict_detail(
         b"SCRIPT_FD",
         ok && cst == 0x80 | ENOENT as i32,
         if ok { cst as i64 } else { st as i64 },

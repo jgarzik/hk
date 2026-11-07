@@ -4,10 +4,11 @@
 //! queued, and 50 concurrent connections.
 
 use hk_syscall::{
-    SHUT_WR, Timespec, sys_accept, sys_exit, sys_fork, sys_listen, sys_nanosleep, sys_setsockopt,
-    sys_shutdown, sys_wait4,
+    SHUT_WR, sys_accept, sys_exit, sys_fork, sys_listen, sys_setsockopt, sys_shutdown, sys_wait4,
 };
 
+use crate::tests::harness::T;
+use crate::tests::helpers::msleep;
 use crate::tests::net::sk::*;
 
 /// slirp guestfwd echo service (tools/qemu-net.sh)
@@ -21,14 +22,6 @@ pub fn run_tests() {
     test_waitall();
     test_many();
     test_echo_2mb();
-}
-
-fn msleep(ms: u64) {
-    let ts = Timespec {
-        tv_sec: (ms / 1000) as i64,
-        tv_nsec: ((ms % 1000) * 1_000_000) as i64,
-    };
-    sys_nanosleep(&ts, core::ptr::null_mut());
 }
 
 /// SO_RCVTIMEO / SO_SNDTIMEO of `ms`

@@ -3,10 +3,11 @@
 //! descriptor table (CLONE_FILES); an exiting process never lingers.
 
 use hk_syscall::{
-    Timespec, sys_clone, sys_close, sys_exit, sys_fcntl, sys_fork, sys_listen, sys_nanosleep,
-    sys_pipe, sys_read, sys_write,
+    sys_clone, sys_close, sys_exit, sys_fcntl, sys_fork, sys_listen, sys_pipe, sys_read, sys_write,
 };
 
+use crate::tests::harness::T;
+use crate::tests::helpers::msleep;
 use crate::tests::net::sk::*;
 use crate::tests::net::tcp_xfer::{accept, set_timeo, wait_child};
 
@@ -21,14 +22,6 @@ pub fn run_tests() {
     test_close_linger();
     test_dup2_linger();
     test_exit_linger();
-}
-
-fn msleep(ms: u64) {
-    let ts = Timespec {
-        tv_sec: (ms / 1000) as i64,
-        tv_nsec: ((ms % 1000) * 1_000_000) as i64,
-    };
-    sys_nanosleep(&ts, core::ptr::null_mut());
 }
 
 /// A listener whose connections get a small receive buffer

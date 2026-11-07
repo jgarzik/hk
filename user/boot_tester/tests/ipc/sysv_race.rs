@@ -45,7 +45,7 @@
 
 use core::sync::atomic::{AtomicI32, Ordering};
 
-use crate::tests::helpers::{print, print_num, println};
+use crate::tests::harness::{R, check, report_r};
 use hk_syscall::{
     GETALL, GETNCNT, GETVAL, GETZCNT, IPC_CREAT, IPC_EXCL, IPC_NOWAIT, IPC_PRIVATE, IPC_RMID,
     IPC_SET, IPC_STAT, MAP_ANONYMOUS, MAP_SHARED, PROT_READ, PROT_WRITE, SETVAL, Sembuf, Timespec,
@@ -63,41 +63,21 @@ const KEYS: usize = 100;
 const KEY_BASE: i32 = 0x4c00_0000;
 
 pub fn run_tests() {
-    report(b"IPC_GET_RACE", get_race());
-    report(b"IPC_MORE_CHECKS", more_checks());
-    report(b"IPC_SET_EFAULT", set_efault());
-    report(b"SEM_DUPSOP", sem_dupsop());
-    report(b"SEM_NOWAIT_PER_OP", sem_nowait_per_op());
-    report(b"SEM_ERRNO_ORDER", sem_errno_order());
-    report(b"SEM_MUTEX_STRESS", sem_mutex_stress());
-    report(b"SEM_GETALL_SUM", sem_getall_sum());
-    report(b"SEM_UNDO_EXIT", sem_undo(undo_exit_child, 0));
-    report(b"SEM_UNDO_SETVAL", sem_undo(undo_setval_child, 5));
-    report(b"SEM_UNDO_ERANGE", sem_undo(undo_erange_child, 0));
-    report(b"SEM_NCNT", sem_ncnt());
-    report(b"SEM_MIXED_STRESS", sem_mixed_stress());
-    report(b"MSGCTL_QBYTES", msgctl_qbytes());
-    report(b"MSG_STAT_STRESS", msg_stat_stress());
-}
-
-type R = Result<(), (&'static [u8], i64)>;
-
-fn report(name: &[u8], r: R) {
-    print(name);
-    match r {
-        Ok(()) => println(b":OK"),
-        Err((why, got)) => {
-            print(b":FAIL ");
-            print(why);
-            print(b" got ");
-            print_num(got);
-            println(b"");
-        }
-    }
-}
-
-fn check(what: &'static [u8], ok: bool, got: i64) -> R {
-    if ok { Ok(()) } else { Err((what, got)) }
+    report_r(b"IPC_GET_RACE", get_race());
+    report_r(b"IPC_MORE_CHECKS", more_checks());
+    report_r(b"IPC_SET_EFAULT", set_efault());
+    report_r(b"SEM_DUPSOP", sem_dupsop());
+    report_r(b"SEM_NOWAIT_PER_OP", sem_nowait_per_op());
+    report_r(b"SEM_ERRNO_ORDER", sem_errno_order());
+    report_r(b"SEM_MUTEX_STRESS", sem_mutex_stress());
+    report_r(b"SEM_GETALL_SUM", sem_getall_sum());
+    report_r(b"SEM_UNDO_EXIT", sem_undo(undo_exit_child, 0));
+    report_r(b"SEM_UNDO_SETVAL", sem_undo(undo_setval_child, 5));
+    report_r(b"SEM_UNDO_ERANGE", sem_undo(undo_erange_child, 0));
+    report_r(b"SEM_NCNT", sem_ncnt());
+    report_r(b"SEM_MIXED_STRESS", sem_mixed_stress());
+    report_r(b"MSGCTL_QBYTES", msgctl_qbytes());
+    report_r(b"MSG_STAT_STRESS", msg_stat_stress());
 }
 
 /// A shared anonymous array of `n` i32s, zeroed

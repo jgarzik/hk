@@ -11,7 +11,8 @@ use hk_syscall::{
     sys_unlink, sys_wait4, sys_write,
 };
 
-use crate::tests::helpers::{print, print_num, println};
+use crate::tests::harness::{fail_why, pass};
+use crate::tests::helpers::println;
 use crate::tests::net::netlink::drop_caps;
 use crate::tests::net::nl::{AF_NETLINK, NETLINK_ROUTE};
 
@@ -107,20 +108,6 @@ fn ioc(fd: i32, cmd: u64, r: &mut Ifr) -> i64 {
     sys_ioctl(fd, cmd, r.0.as_mut_ptr() as u64)
 }
 
-fn fail(name: &[u8], why: &[u8], v: i64) {
-    print(name);
-    print(b":FAIL ");
-    print(why);
-    print(b" ");
-    print_num(v);
-    println(b"");
-}
-
-fn ok(name: &[u8]) {
-    print(name);
-    println(b":OK");
-}
-
 /// The first Ethernet interface (SIOCGIFNAME over small indices +
 /// SIOCGIFHWADDR family ARPHRD_ETHER)
 fn find_ether(fd: i32) -> Ifr {
@@ -142,21 +129,21 @@ fn test_index_name(fd: i32) {
     const N: &[u8] = b"IOC_INDEX_NAME";
     let mut r = Ifr::named(b"lo");
     if ioc(fd, SIOCGIFINDEX, &mut r) != 0 || r.i32() != 1 {
-        return fail(N, b"lo index", r.i32() as i64);
+        return fail_why(N, b"lo index", r.i32() as i64);
     }
     let mut r = Ifr([0; 40]);
     r.set_i32(1);
     if ioc(fd, SIOCGIFNAME, &mut r) != 0 || r.name() != b"lo" {
-        return fail(N, b"index 1 name", 0);
+        return fail_why(N, b"index 1 name", 0);
     }
     r.set_i32(99999);
     let e1 = ioc(fd, SIOCGIFNAME, &mut r);
     let mut r = Ifr::named(b"nosuchif9");
     let e2 = ioc(fd, SIOCGIFINDEX, &mut r);
     if e1 != ENODEV || e2 != ENODEV {
-        return fail(N, b"missing device", e1 * 1000 + e2);
+        return fail_why(N, b"missing device", e1 * 1000 + e2);
     }
-    ok(N);
+    pass(N);
 }
 
 fn test_lo(fd: i32) {
@@ -165,25 +152,25 @@ fn test_lo(fd: i32) {
     ioc(fd, SIOCGIFFLAGS, &mut r);
     let want = IFF_UP | IFF_LOOPBACK | IFF_RUNNING;
     if r.short() & want != want {
-        return fail(N, b"flags", r.short() as i64);
+        return fail_why(N, b"flags", r.short() as i64);
     }
     let mut r = Ifr::named(b"lo");
     if ioc(fd, SIOCGIFADDR, &mut r) != 0 || r.sin() != [127, 0, 0, 1] {
-        return fail(N, b"address", 0);
+        return fail_why(N, b"address", 0);
     }
     let mut r = Ifr::named(b"lo");
     if ioc(fd, SIOCGIFNETMASK, &mut r) != 0 || r.sin() != [255, 0, 0, 0] {
-        return fail(N, b"netmask", 0);
+        return fail_why(N, b"netmask", 0);
     }
     let mut r = Ifr::named(b"lo");
     if ioc(fd, SIOCGIFHWADDR, &mut r) != 0 || r.short() != 772 {
-        return fail(N, b"hwaddr family", r.short() as i64);
+        return fail_why(N, b"hwaddr family", r.short() as i64);
     }
     let mut r = Ifr::named(b"lo");
     if ioc(fd, SIOCGIFMTU, &mut r) != 0 || r.i32() != 65536 {
-        return fail(N, b"mtu", r.i32() as i64);
+        return fail_why(N, b"mtu", r.i32() as i64);
     }
-    ok(N);
+    pass(N);
 }
 
 fn set_up(fd: i32, eth: &Ifr, up: bool) -> i64 {
@@ -201,18 +188,18 @@ fn set_up(fd: i32, eth: &Ifr, up: bool) -> i64 {
 fn test_eth_link(fd: i32, eth: &Ifr) {
     const N: &[u8] = b"IOC_ETH_LINK";
     if eth.name().is_empty() {
-        return fail(N, b"no ethernet link", 0);
+        return fail_why(N, b"no ethernet link", 0);
     }
     let mut r = *eth;
     if ioc(fd, SIOCGIFHWADDR, &mut r) != 0 || r.0[18..24] == [0; 6] {
-        return fail(N, b"hwaddr", 0);
+        return fail_why(N, b"hwaddr", 0);
     }
     let mut r = *eth;
     if ioc(fd, SIOCGIFFLAGS, &mut r) != 0 || r.short() & IFF_UP != 0 {
-        return fail(N, b"initially up", r.short() as i64);
+        return fail_why(N, b"initially up", r.short() as i64);
     }
     if set_up(fd, eth, true) != 0 {
-        return fail(N, b"set up", 0);
+        return fail_why(N, b"set up", 0);
     }
     let mut r = *eth;
     ioc(fd, SIOCGIFFLAGS, &mut r);
@@ -232,25 +219,25 @@ fn test_eth_link(fd: i32, eth: &Ifr) {
     let mut r = *eth;
     ioc(fd, SIOCGIFFLAGS, &mut r);
     if upf & IFF_UP == 0 || r.short() & IFF_UP != 0 {
-        return fail(N, b"up/down flags", upf as i64);
+        return fail_why(N, b"up/down flags", upf as i64);
     }
     if s1 != 0 || got != 1400 || s2 != EINVAL {
-        return fail(N, b"mtu", got as i64);
+        return fail_why(N, b"mtu", got as i64);
     }
-    ok(N);
+    pass(N);
 }
 
 fn test_eth_addr(fd: i32, eth: &Ifr) {
     const N: &[u8] = b"IOC_ETH_ADDR";
     let mut r = *eth;
     if ioc(fd, SIOCGIFADDR, &mut r) != EADDRNOTAVAIL {
-        return fail(N, b"unconfigured address", 0);
+        return fail_why(N, b"unconfigured address", 0);
     }
     // Classful default: 192.0.2.20 -> /24, broadcast .255
     let mut r = *eth;
     r.set_sin([192, 0, 2, 20]);
     if ioc(fd, SIOCSIFADDR, &mut r) != 0 {
-        return fail(N, b"SIOCSIFADDR", 0);
+        return fail_why(N, b"SIOCSIFADDR", 0);
     }
     let get = |cmd: u64| {
         let mut r = *eth;
@@ -291,12 +278,12 @@ fn test_eth_addr(fd: i32, eth: &Ifr) {
     z.set_sin([0, 0, 0, 0]);
     let ez = ioc(fd, SIOCSIFADDR, &mut z);
     if let Err((what, v)) = res {
-        return fail(N, what, v);
+        return fail_why(N, what, v);
     }
     if ez != 0 || get(SIOCGIFADDR).0 != EADDRNOTAVAIL {
-        return fail(N, b"remove with 0.0.0.0", ez);
+        return fail_why(N, b"remove with 0.0.0.0", ez);
     }
-    ok(N);
+    pass(N);
 }
 
 fn test_ifconf(fd: i32) {
@@ -304,11 +291,11 @@ fn test_ifconf(fd: i32) {
     // struct ifconf { int len; char *buf; }
     let mut ifc = [0u8; 16];
     if sys_ioctl(fd, SIOCGIFCONF, ifc.as_mut_ptr() as u64) != 0 {
-        return fail(N, b"size query", 0);
+        return fail_why(N, b"size query", 0);
     }
     let need = i32::from_ne_bytes([ifc[0], ifc[1], ifc[2], ifc[3]]);
     if need < 40 || need % 40 != 0 {
-        return fail(N, b"size", need as i64);
+        return fail_why(N, b"size", need as i64);
     }
     let mut buf = [0u8; 400];
     ifc[..4].copy_from_slice(&400i32.to_ne_bytes());
@@ -319,9 +306,9 @@ fn test_ifconf(fd: i32) {
         .chunks(40)
         .any(|e| &e[..3] == b"lo\0" && e[20..24] == [127, 0, 0, 1]);
     if got != need as usize || !lo {
-        return fail(N, b"entries", got as i64);
+        return fail_why(N, b"entries", got as i64);
     }
-    ok(N);
+    pass(N);
 }
 
 /// struct rtentry (64-bit): dst @8, gateway @24, genmask @40,
@@ -405,15 +392,15 @@ fn test_rt(fd: i32, eth: &Ifr) {
     ioc(fd, SIOCSIFADDR, &mut z);
     set_up(fd, eth, false);
     if add != 0 || dup != EEXIST {
-        return fail(N, b"add/dup", add * 1000 + dup);
+        return fail_why(N, b"add/dup", add * 1000 + dup);
     }
     if !line {
-        return fail(N, b"/proc/net/route line", n as i64);
+        return fail_why(N, b"/proc/net/route line", n as i64);
     }
     if del != 0 || del2 != ESRCH || eaf != EAFNOSUPPORT {
-        return fail(N, b"del/del2/eafnosupport", del);
+        return fail_why(N, b"del/del2/eafnosupport", del);
     }
-    ok(N);
+    pass(N);
 }
 
 /// SIOCADDRT/DELRT whose rt_dev name sits in a file page not faulted
@@ -428,7 +415,7 @@ fn test_rt_dev_fault(fd: i32) {
     sys_close(f as u64);
     sys_unlink(PATH.as_ptr());
     if m < 0 {
-        return fail(N, b"mmap", m);
+        return fail_why(N, b"mmap", m);
     }
     let mut rt = rtentry(
         [198, 51, 100, 0],
@@ -442,9 +429,9 @@ fn test_rt_dev_fault(fd: i32) {
     let del = sys_ioctl(fd, SIOCDELRT, p);
     sys_munmap(m as u64, 4096);
     if add != 0 || del != 0 {
-        return fail(N, b"add/del", add * 1000 + del);
+        return fail_why(N, b"add/del", add * 1000 + del);
     }
-    ok(N);
+    pass(N);
 }
 
 fn test_proc_route() {
@@ -454,14 +441,14 @@ fn test_proc_route() {
     let hdr =
         b"Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT";
     if n < hdr.len() || &text[..hdr.len()] != hdr {
-        return fail(N, b"header", n as i64);
+        return fail_why(N, b"header", n as i64);
     }
     // Every line is padded to 127 columns
     let first = text[..n].iter().position(|&c| c == b'\n').unwrap_or(0);
     if first != 127 {
-        return fail(N, b"line width", first as i64);
+        return fail_why(N, b"line width", first as i64);
     }
-    ok(N);
+    pass(N);
 }
 
 /// Link ioctls work on any socket family (Linux dev_ioctl fallback)
@@ -472,9 +459,9 @@ fn test_netlink_fd() {
     let e = ioc(fd, SIOCGIFINDEX, &mut r);
     sys_close(fd as u64);
     if e != 0 || r.i32() != 1 {
-        return fail(N, b"SIOCGIFINDEX", e);
+        return fail_why(N, b"SIOCGIFINDEX", e);
     }
-    ok(N);
+    pass(N);
 }
 
 fn test_errors(fd: i32, eth: &Ifr) {
@@ -482,7 +469,7 @@ fn test_errors(fd: i32, eth: &Ifr) {
     // Unmapped ifreq pointer
     let e = sys_ioctl(fd, SIOCGIFFLAGS, 8);
     if e != EFAULT {
-        return fail(N, b"EFAULT", e);
+        return fail_why(N, b"EFAULT", e);
     }
     let pid = sys_fork();
     if pid == 0 {
@@ -506,7 +493,7 @@ fn test_errors(fd: i32, eth: &Ifr) {
     let mut st = 0;
     sys_wait4(pid, &mut st, 0, 0);
     if st != 0 {
-        return fail(N, b"EPERM child status", st as i64);
+        return fail_why(N, b"EPERM child status", st as i64);
     }
-    ok(N);
+    pass(N);
 }

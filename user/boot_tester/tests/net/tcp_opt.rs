@@ -7,6 +7,7 @@
 
 use hk_syscall::{SHUT_WR, sys_exit, sys_fork, sys_getsockopt, sys_setsockopt, sys_shutdown};
 
+use crate::tests::harness::T;
 use crate::tests::net::nl::{self, Nl, Req};
 use crate::tests::net::sk::*;
 use crate::tests::net::tcp_xfer::{accept, listener, recv_pat, send_pat, set_timeo, wait_child};

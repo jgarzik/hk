@@ -41,12 +41,13 @@
 //!   kernel must not inherit (backward string copies) and sigreturn
 //!   must give back.
 
+use crate::tests::helpers::sleep_ms;
 use crate::tests::helpers::{print, print_num, println};
 use hk_syscall::{
     CLOCK_MONOTONIC, MAP_ANONYMOUS, MAP_SHARED, PROT_READ, PROT_WRITE, SA_RESTORER, SIG_DFL,
     SIGKILL, SIGUSR1, Timespec, sys_clock_gettime, sys_exit, sys_fork, sys_getcpu, sys_kill,
-    sys_mmap, sys_munmap, sys_nanosleep, sys_rt_sigaction, sys_sched_getaffinity,
-    sys_sched_setaffinity, sys_wait4,
+    sys_mmap, sys_munmap, sys_rt_sigaction, sys_sched_getaffinity, sys_sched_setaffinity,
+    sys_wait4,
 };
 
 const WNOHANG: i32 = 1;
@@ -72,7 +73,7 @@ pub fn run_tests() {
 /// RT_THROTTLE: see the module doc. The spinner gives up after 3 s, so
 /// a kernel without throttling fails the test instead of hanging
 fn test_rt_throttle() {
-    use crate::tests::net::sk::T;
+    use crate::tests::harness::T;
     let mut t = T::new(b"RT_THROTTLE");
     let cpu = getcpu();
     if !t.ok(b"getcpu", cpu >= 0, cpu) {
@@ -97,7 +98,7 @@ fn test_rt_throttle() {
 
 /// RT_PLACE: see the module doc (Linux select_task_rq_rt)
 fn test_rt_place() {
-    use crate::tests::net::sk::T;
+    use crate::tests::harness::T;
     use hk_syscall::{SchedParam, sys_sched_setscheduler};
     let mut t = T::new(b"RT_PLACE");
     let mut all = [0u64; 16];
@@ -217,7 +218,7 @@ fn fair_spinner(cpu: u32, nice: i32, policy: i32, counter: *mut u64) -> i64 {
 /// a's progress over b's, in tenths, within `range` (Linux EEVDF shares
 /// a CPU by weight)
 fn test_fair_share(name: &'static [u8], a: (i32, i32), b: (i32, i32), range: (u64, u64)) {
-    use crate::tests::net::sk::T;
+    use crate::tests::harness::T;
     let mut t = T::new(name);
     let page = sys_mmap(
         0,
@@ -297,7 +298,7 @@ fn stat_sched() -> [i64; 4] {
 /// SCHED_PRIO_FIELDS: see the module doc (in a child: it changes its own
 /// policy)
 fn test_sched_prio_fields() {
-    use crate::tests::net::sk::T;
+    use crate::tests::harness::T;
     use hk_syscall::{
         SchedParam, sys_getpriority, sys_sched_getparam, sys_sched_getscheduler,
         sys_sched_setscheduler, sys_setpriority,
@@ -360,7 +361,7 @@ fn test_sched_prio_fields() {
 /// RLIMIT_RTPRIO (0 by default: EPERM), and another user's task cannot
 /// be changed (EPERM, Linux check_same_owner); its own SCHED_OTHER is fine
 fn test_sched_perm() {
-    use crate::tests::net::sk::T;
+    use crate::tests::harness::T;
     use hk_syscall::{SchedParam, sys_sched_setscheduler, sys_setresgid, sys_setresuid};
     let pid = sys_fork();
     if pid == 0 {
@@ -417,7 +418,7 @@ fn spinner(cpu: u32, prio: i32, counter: *mut u64, ms: i64) -> i64 {
 /// throttles rt tasks to 95% of each second, so no throttling within
 /// the window)
 fn test_rt_fifo() {
-    use crate::tests::net::sk::T;
+    use crate::tests::harness::T;
     let mut t = T::new(b"RT_FIFO");
     let page = sys_mmap(
         0,
@@ -568,7 +569,7 @@ fn getcpu() -> i64 {
 /// AFFINITY_MIGRATE: sched_setaffinity moves a running task before it
 /// returns (Linux affine_move_task), and a sleeping one at its wakeup
 fn test_affinity_migrate() {
-    use crate::tests::net::sk::T;
+    use crate::tests::harness::T;
     use hk_syscall::{sys_close, sys_pipe2, sys_read, sys_write};
     let mut t = T::new(b"AFFINITY_MIGRATE");
     let mut orig = [0u64; 16];
@@ -693,14 +694,6 @@ fn now_ms() -> i64 {
     };
     sys_clock_gettime(CLOCK_MONOTONIC, &mut ts);
     ts.tv_sec * 1000 + ts.tv_nsec / 1_000_000
-}
-
-fn sleep_ms(ms: i64) {
-    let ts = Timespec {
-        tv_sec: ms / 1000,
-        tv_nsec: (ms % 1000) * 1_000_000,
-    };
-    sys_nanosleep(&ts, core::ptr::null_mut());
 }
 
 /// Spin in user mode forever

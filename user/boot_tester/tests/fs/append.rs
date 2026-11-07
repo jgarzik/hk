@@ -5,7 +5,7 @@
 //! - pwrite on an O_APPEND file appends (Linux quirk)
 //! - processes sharing one open file (fork) never read the same data
 
-use crate::tests::helpers::{print, print_num, println};
+use crate::tests::harness::verdict;
 use hk_syscall::{
     MAP_ANONYMOUS, MAP_PRIVATE, MAP_SHARED, O_APPEND, O_CREAT, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY,
     PROT_READ, PROT_WRITE, SEEK_CUR, Stat, sys_close, sys_exit, sys_fork, sys_fstat, sys_lseek,
@@ -46,17 +46,6 @@ fn test_append_mmap() {
     sys_close(fd as u64);
     sys_unlink(path.as_ptr());
     verdict(b"APPEND_MMAP_SHARED", m >= 0 && &buf == b"MAP!", m);
-}
-
-fn verdict(name: &[u8], ok: bool, got: i64) {
-    print(name);
-    if ok {
-        println(b":OK");
-    } else {
-        print(b":FAIL got ");
-        print_num(got);
-        println(b"");
-    }
 }
 
 fn size_of(fd: i64) -> i64 {

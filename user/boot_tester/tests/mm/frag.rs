@@ -5,6 +5,7 @@
 
 use hk_syscall::{AF_INET, SOCK_DGRAM, sys_ioctl, sys_socket};
 
+use crate::tests::harness::T;
 use crate::tests::net::sk::*;
 
 const SIOCSIFMTU: u64 = 0x8922;

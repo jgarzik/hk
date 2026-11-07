@@ -43,7 +43,7 @@
 //!   MREMAP_DONTUNMAP alone moves the pages and leaves the old range
 //!   mapped and empty; a shrink may unmap a tail crossing VMAs
 
-use crate::tests::helpers::{print, print_num, println};
+use crate::tests::harness::report_code;
 use crate::tests::signal::fault_signals::{
     After, MAGIC1, MAGIC2, fault_seen, install, reset, run_fault,
 };
@@ -73,7 +73,7 @@ pub fn run_tests() {
     thp_split_munmap();
     thp_mremap_move();
     if !install(SIGSEGV) {
-        return report(b"PROTNONE_SIGACTION", -1);
+        return report_code(b"PROTNONE_SIGACTION", -1);
     }
     protnone_present();
     protnone_readonly();
@@ -91,7 +91,7 @@ fn mremap_edges() {
     const NAME: &[u8] = b"MREMAP_EDGES";
     let p = sys_mmap(0, 8 * PAGE, RW, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if p < 0 {
-        return report(NAME, -1);
+        return report_code(NAME, -1);
     }
     let p = p as u64;
     fill(p, 8 * PAGE);
@@ -145,7 +145,7 @@ fn mremap_edges() {
     if code == 0 {
         code = mremap_shrink_across();
     }
-    report(NAME, code);
+    report_code(NAME, code);
 }
 
 /// Shrinking may unmap a tail that crosses VMAs: four pages, the third
@@ -235,7 +235,7 @@ fn protnone_reuse() {
     const LEN: u64 = 64 * PAGE;
     let p = sys_mmap(0, LEN, RW, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if p < 0 {
-        return report(NAME, -1);
+        return report_code(NAME, -1);
     }
     let p = p as u64;
     fill(p, LEN);
@@ -264,14 +264,14 @@ fn protnone_reuse() {
             sys_munmap(q, 4 * LEN);
         }
     }
-    report(NAME, code);
+    report_code(NAME, code);
 }
 
 fn maps_match_mprotect() {
     const NAME: &[u8] = b"MAPS_MATCH_MPROTECT";
     let p = sys_mmap(0, 4 * PAGE, RW, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if p < 0 {
-        return report(NAME, -1);
+        return report_code(NAME, -1);
     }
     let p = p as u64;
     fill(p, 4 * PAGE);
@@ -291,7 +291,7 @@ fn maps_match_mprotect() {
         0
     };
     sys_munmap(p, 4 * PAGE);
-    report(NAME, code);
+    report_code(NAME, code);
 }
 
 fn maps_match_mremap() {
@@ -299,7 +299,7 @@ fn maps_match_mremap() {
     let p = sys_mmap(0, 8 * PAGE, RW, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     let dst = free_range(2 * PAGE);
     if p < 0 || dst == 0 {
-        return report(NAME, -1);
+        return report_code(NAME, -1);
     }
     let p = p as u64;
     fill(p, 8 * PAGE);
@@ -326,7 +326,7 @@ fn maps_match_mremap() {
     };
     sys_munmap(dst, 2 * PAGE);
     sys_munmap(p, 8 * PAGE);
-    report(NAME, code);
+    report_code(NAME, code);
 }
 
 /// A free range of `len` bytes: mapped, then unmapped (0 if mmap fails)
@@ -342,7 +342,7 @@ fn free_range(len: u64) -> u64 {
 fn thp_mremap_move() {
     const NAME: &[u8] = b"THP_MREMAP_MOVE";
     let Some(base) = huge_area(2 * HUGE) else {
-        return report(NAME, -1);
+        return report_code(NAME, -1);
     };
     let dst = free_range(2 * HUGE);
     let mut vec = [0u8; 1];
@@ -360,7 +360,7 @@ fn thp_mremap_move() {
     };
     sys_munmap(dst, 2 * HUGE);
     sys_munmap(base, 2 * HUGE);
-    report(NAME, code);
+    report_code(NAME, code);
 }
 
 /// Load the word at `addr`: its value, or the (si_code, si_addr) of the
@@ -425,7 +425,7 @@ fn three_pages() -> Option<u64> {
 fn protnone_present() {
     const NAME: &[u8] = b"PROTNONE_PRESENT";
     let Some(p) = three_pages() else {
-        return report(NAME, -1);
+        return report_code(NAME, -1);
     };
     let mid = p + PAGE;
     let mut vec = [0u8; 1];
@@ -449,13 +449,13 @@ fn protnone_present() {
         0
     };
     sys_munmap(p, 3 * PAGE);
-    report(NAME, code);
+    report_code(NAME, code);
 }
 
 fn protnone_readonly() {
     const NAME: &[u8] = b"PROTNONE_READONLY";
     let Some(p) = three_pages() else {
-        return report(NAME, -1);
+        return report_code(NAME, -1);
     };
     let code = if sys_mprotect(p, 3 * PAGE, PROT_READ) != 0 {
         1
@@ -469,7 +469,7 @@ fn protnone_readonly() {
         0
     };
     sys_munmap(p, 3 * PAGE);
-    report(NAME, code);
+    report_code(NAME, code);
 }
 
 /// The forked child of PROTNONE_FORK: exit status 0 if right
@@ -487,7 +487,7 @@ fn protnone_child(p: u64) -> u64 {
 fn protnone_fork() {
     const NAME: &[u8] = b"PROTNONE_FORK";
     let Some(p) = three_pages() else {
-        return report(NAME, -1);
+        return report_code(NAME, -1);
     };
     let mut code = 0;
     if sys_mprotect(p, 3 * PAGE, PROT_NONE) != 0 {
@@ -507,17 +507,17 @@ fn protnone_fork() {
         }
     }
     sys_munmap(p, 3 * PAGE);
-    report(NAME, code);
+    report_code(NAME, code);
 }
 
 fn protnone_writeonly() {
     const NAME: &[u8] = b"PROTNONE_WRITEONLY";
     let Some(p) = three_pages() else {
-        return report(NAME, -1);
+        return report_code(NAME, -1);
     };
     let mut fds = [0i32; 2];
     if sys_pipe(fds.as_mut_ptr()) != 0 {
-        return report(NAME, -2);
+        return report_code(NAME, -2);
     }
     let (r, w) = (fds[0] as u64, fds[1] as u64);
     let pid = sys_fork();
@@ -548,13 +548,13 @@ fn protnone_writeonly() {
     sys_close(r);
     sys_close(w);
     sys_munmap(p, 3 * PAGE);
-    report(NAME, code);
+    report_code(NAME, code);
 }
 
 fn protnone_thp() {
     const NAME: &[u8] = b"PROTNONE_THP";
     let Some(base) = huge_area(2 * HUGE) else {
-        return report(NAME, -1);
+        return report_code(NAME, -1);
     };
     let one = base + HUGE + 3 * PAGE;
     let code = if sys_mprotect(base, HUGE, PROT_NONE) != 0 {
@@ -575,7 +575,7 @@ fn protnone_thp() {
         0
     };
     sys_munmap(base, 2 * HUGE);
-    report(NAME, code);
+    report_code(NAME, code);
 }
 
 fn protnone_mremap() {
@@ -584,7 +584,7 @@ fn protnone_mremap() {
     let p = sys_mmap(0, LEN, RW, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     let dst = free_range(LEN);
     if p < 0 || dst == 0 {
-        return report(NAME, -1);
+        return report_code(NAME, -1);
     }
     let p = p as u64;
     fill(p, LEN);
@@ -603,18 +603,7 @@ fn protnone_mremap() {
         0
     };
     sys_munmap(dst, LEN);
-    report(NAME, code);
-}
-
-fn report(name: &[u8], code: i64) {
-    print(name);
-    if code == 0 {
-        println(b":OK");
-    } else {
-        print(b":FAIL ");
-        print_num(code);
-        println(b"");
-    }
+    report_code(NAME, code);
 }
 
 fn get(a: u64) -> u64 {
@@ -671,7 +660,7 @@ fn huge_area(n: u64) -> Option<u64> {
 fn thp_split_mprotect() {
     const NAME: &[u8] = b"THP_SPLIT_MPROTECT";
     let Some(base) = huge_area(2 * HUGE) else {
-        return report(NAME, -1);
+        return report_code(NAME, -1);
     };
     let one = base + HUGE / 2;
     let mut code = 0;
@@ -688,13 +677,13 @@ fn thp_split_mprotect() {
         }
     }
     sys_munmap(base, 2 * HUGE);
-    report(NAME, code);
+    report_code(NAME, code);
 }
 
 fn thp_split_munmap() {
     const NAME: &[u8] = b"THP_SPLIT_MUNMAP";
     let Some(base) = huge_area(2 * HUGE) else {
-        return report(NAME, -1);
+        return report_code(NAME, -1);
     };
     let hole = base + HUGE + 5 * PAGE;
     let hole_end = hole + 3 * PAGE;
@@ -715,5 +704,5 @@ fn thp_split_munmap() {
         }
     }
     sys_munmap(base, 2 * HUGE);
-    report(NAME, code);
+    report_code(NAME, code);
 }

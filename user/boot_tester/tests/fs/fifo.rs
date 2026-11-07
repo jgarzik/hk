@@ -22,7 +22,7 @@
 //! - FIFO_RDONLY_INJECT: a FIFO open only for reading takes no data:
 //!   sendfile into it is EBADF, vmsplice on it puts nothing in the FIFO
 
-use crate::tests::helpers::{print, print_num, println};
+use crate::tests::harness::report_step;
 use hk_syscall::{
     O_NONBLOCK, O_RDONLY, O_RDWR, O_WRONLY, PollFd, Stat, Timespec, sys_close, sys_exit, sys_fork,
     sys_lseek, sys_mknod, sys_nanosleep, sys_open, sys_poll, sys_read, sys_stat, sys_unlink,
@@ -41,7 +41,7 @@ const POLLHUP: i16 = 0x10;
 pub fn run_tests() {
     sys_unlink(PATH.as_ptr());
     if sys_mknod(PATH.as_ptr(), S_IFIFO | 0o666, 0) != 0 {
-        report(b"FIFO_NODE", 1);
+        report_step(b"FIFO_NODE", 1);
         return;
     }
     node();
@@ -53,17 +53,6 @@ pub fn run_tests() {
     splice();
     rdonly_inject();
     sys_unlink(PATH.as_ptr());
-}
-
-fn report(name: &[u8], step: i64) {
-    print(name);
-    if step == 0 {
-        println(b":OK");
-    } else {
-        print(b":FAIL step ");
-        print_num(step);
-        println(b"");
-    }
 }
 
 fn open(flags: u32) -> i64 {
@@ -78,7 +67,7 @@ fn node() {
     // SAFETY: plain integers
     let mut st: Stat = unsafe { core::mem::zeroed() };
     let r = sys_stat(PATH.as_ptr(), &mut st);
-    report(
+    report_step(
         b"FIFO_NODE",
         if r == 0 && st.st_mode & S_IFMT == S_IFIFO {
             0
@@ -91,16 +80,16 @@ fn node() {
 fn nonblock() {
     let n = b"FIFO_NONBLOCK";
     if open(O_WRONLY | O_NONBLOCK) != ENXIO {
-        return report(n, 1);
+        return report_step(n, 1);
     }
     let r = open(O_RDONLY | O_NONBLOCK);
     if r < 0 {
-        return report(n, 2);
+        return report_step(n, 2);
     }
     let w = open(O_WRONLY | O_NONBLOCK);
     if w < 0 {
         close(r);
-        return report(n, 3);
+        return report_step(n, 3);
     }
     let mut buf = [0u8; 16];
     let ok = sys_write(w as u64, b"hello".as_ptr(), 5) == 5
@@ -119,7 +108,7 @@ fn nonblock() {
     } else {
         0
     };
-    report(n, step);
+    report_step(n, step);
 }
 
 fn blocking() {
@@ -142,7 +131,7 @@ fn blocking() {
     let mut st = 0i32;
     sys_wait4(pid, &mut st, 0, 0);
     close(w);
-    report(
+    report_step(
         n,
         if w < 0 || wrote != 1 {
             1
@@ -158,21 +147,21 @@ fn rdwr() {
     let n = b"FIFO_RDWR";
     let fd = open(O_RDWR | O_NONBLOCK);
     if fd < 0 || sys_write(fd as u64, b"abc".as_ptr(), 3) != 3 {
-        return report(n, 1);
+        return report_step(n, 1);
     }
     close(fd);
     let fd = open(O_RDWR | O_NONBLOCK);
     let mut b = [0u8; 4];
     let r = sys_read(fd as u64, b.as_mut_ptr(), 4);
     close(fd);
-    report(n, if r == EAGAIN { 0 } else { 2 });
+    report_step(n, if r == EAGAIN { 0 } else { 2 });
 }
 
 fn pollhup() {
     let n = b"FIFO_POLLHUP";
     let r = open(O_RDONLY | O_NONBLOCK);
     if r < 0 {
-        return report(n, 1);
+        return report_step(n, 1);
     }
     let mut p = PollFd::new(r as i32, POLLIN);
     let before = sys_poll(&mut p, 1, 0);
@@ -189,7 +178,7 @@ fn pollhup() {
     } else {
         0
     };
-    report(n, step);
+    report_step(n, step);
 }
 
 fn pollhup_present() {
@@ -201,14 +190,14 @@ fn pollhup_present() {
         close(r1);
         close(w);
         close(r2);
-        return report(n, 1);
+        return report_step(n, 1);
     }
     close(w);
     let mut p = PollFd::new(r2 as i32, POLLIN);
     sys_poll(&mut p, 1, 0);
     close(r1);
     close(r2);
-    report(n, if p.revents & POLLHUP != 0 { 0 } else { 2 });
+    report_step(n, if p.revents & POLLHUP != 0 { 0 } else { 2 });
 }
 
 fn splice() {
@@ -220,7 +209,7 @@ fn splice() {
     let mut p = [0i32; 2];
     if f < 0 || sys_pipe2(p.as_mut_ptr(), 0) != 0 {
         close(f);
-        return report(n, 1);
+        return report_step(n, 1);
     }
     let null = core::ptr::null_mut();
     let mut b = [0u8; 8];
@@ -276,7 +265,7 @@ fn splice() {
     } else if st != 0 && step == 0 {
         step = 6;
     }
-    report(n, step);
+    report_step(n, step);
 }
 
 fn rdonly_inject() {
@@ -291,7 +280,7 @@ fn rdonly_inject() {
         close(rw);
         close(r);
         close(src);
-        return report(n, 1);
+        return report_step(n, 1);
     }
     let sf = sys_sendfile(r as i32, src as i32, core::ptr::null_mut(), 4);
     let data = b"evil";
@@ -305,7 +294,7 @@ fn rdonly_inject() {
     close(src);
     close(r);
     close(rw);
-    report(
+    report_step(
         n,
         if sf != EBADF {
             2

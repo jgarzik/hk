@@ -11,8 +11,8 @@
 //! - Test: membarrier() - memory barrier syscall
 //! - Test: readahead() - file readahead syscall
 
+use crate::tests::harness::T;
 use crate::tests::helpers::{add_fails, fail_count, print, print_num, println};
-use crate::tests::net::sk::T;
 use hk_syscall::{
     MEMBARRIER_CMD_FLAG_CPU, MEMBARRIER_CMD_GET_REGISTRATIONS, MEMBARRIER_CMD_GLOBAL,
     MEMBARRIER_CMD_GLOBAL_EXPEDITED, MEMBARRIER_CMD_PRIVATE_EXPEDITED,

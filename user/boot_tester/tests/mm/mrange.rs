@@ -63,6 +63,7 @@
 //!   (MCL_CURRENT) and MAP_POPULATE fault in only what is mapped; all
 //!   quickly (the hole is jumped, not walked)
 
+use crate::tests::harness::report_code;
 use crate::tests::helpers::{print, print_num, println};
 use hk_syscall::{
     MADV_COLD, MADV_DODUMP, MADV_DOFORK, MADV_DONTDUMP, MADV_DONTFORK, MADV_DONTNEED, MADV_FREE,
@@ -109,17 +110,6 @@ pub fn run_tests() {
 // ============================================================================
 // Helpers
 // ============================================================================
-
-fn report(name: &[u8], code: i64) {
-    print(name);
-    if code == 0 {
-        println(b":OK");
-    } else {
-        print(b":FAIL ");
-        print_num(code);
-        println(b"");
-    }
-}
 
 /// Run `cases` (a, b, c, expected) through `f` in order: 0, or the
 /// 1-based index of the first case returning something else (printed)
@@ -311,7 +301,7 @@ fn madv(a: u64, len: u64, advice: i64) -> i64 {
 fn madv_args() {
     const NAME: &[u8] = b"MADV_ARGS";
     let Some(a) = area(4) else {
-        return report(NAME, -1);
+        return report_code(NAME, -1);
     };
     let t = top();
     let hi = t + (1 << 28);
@@ -351,18 +341,18 @@ fn madv_args() {
         code = 101;
     }
     sys_munmap(a, 4 * P);
-    report(NAME, code);
+    report_code(NAME, code);
 }
 
 fn madv_holes() {
     const NAME: &[u8] = b"MADV_HOLES";
     let Some(b) = area(5) else {
-        return report(NAME, -1);
+        return report_code(NAME, -1);
     };
     sys_munmap(b + 2 * P, P);
     let code = madv_holes_on(b);
     sys_munmap(b, 5 * P);
-    report(NAME, code);
+    report_code(NAME, code);
 }
 
 /// [b, b + 2P) and [b + 3P, b + 5P) mapped and filled
@@ -405,11 +395,11 @@ fn madv_holes_on(b: u64) -> i64 {
 fn madv_split() {
     const NAME: &[u8] = b"MADV_SPLIT";
     let Some(a) = area(4) else {
-        return report(NAME, -1);
+        return report_code(NAME, -1);
     };
     let code = madv_split_on(a);
     sys_munmap(a, 4 * P);
-    report(NAME, code);
+    report_code(NAME, code);
 }
 
 /// `a`: four filled pages, one VMA
@@ -473,7 +463,7 @@ fn locked_pair(locked: u64) -> Option<u64> {
 fn madv_locked() {
     const NAME: &[u8] = b"MADV_LOCKED";
     let Some(c) = locked_pair(1) else {
-        return report(NAME, -1);
+        return report_code(NAME, -1);
     };
     let l = c + P;
     let cases = [
@@ -511,14 +501,14 @@ fn madv_locked() {
             None => 103,
         };
     }
-    report(NAME, code);
+    report_code(NAME, code);
 }
 
 fn madv_shared() {
     const NAME: &[u8] = b"MADV_SHARED";
     let s = sys_mmap(0, 2 * P, RW, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
     if s < 0 {
-        return report(NAME, -1);
+        return report_code(NAME, -1);
     }
     let s = s as u64;
     let q = sys_mmap(s + P, P, RW, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
@@ -528,7 +518,7 @@ fn madv_shared() {
         madv_shared_on(s)
     };
     sys_munmap(s, 2 * P);
-    report(NAME, code);
+    report_code(NAME, code);
 }
 
 /// [s shared][s + P private], both anonymous
@@ -580,7 +570,7 @@ fn munlock(a: u64, len: u64, _: i64) -> i64 {
 fn mlock_args() {
     const NAME: &[u8] = b"MLOCK_ARGS";
     let Some(a) = area(4) else {
-        return report(NAME, -1);
+        return report_code(NAME, -1);
     };
     let t = top();
     let hi = t + (1 << 28);
@@ -614,17 +604,17 @@ fn mlock_args() {
         code = 102;
     }
     sys_munmap(a, 4 * P);
-    report(NAME, code);
+    report_code(NAME, code);
 }
 
 fn mlock_split() {
     const NAME: &[u8] = b"MLOCK_SPLIT";
     let Some(a) = area(4) else {
-        return report(NAME, -1);
+        return report_code(NAME, -1);
     };
     let code = mlock_split_on(a);
     sys_munmap(a, 4 * P);
-    report(NAME, code);
+    report_code(NAME, code);
 }
 
 fn mlock_split_on(a: u64) -> i64 {
@@ -661,7 +651,7 @@ fn mlock_split_on(a: u64) -> i64 {
 fn mremap_grow_locked() {
     const NAME: &[u8] = b"MREMAP_GROW_LOCKED";
     let Some(a) = area(2) else {
-        return report(NAME, -1);
+        return report_code(NAME, -1);
     };
     let mut code = if sys_mlock(a, 2 * P) == 0 { 0 } else { 1 };
     let mut b = a;
@@ -683,7 +673,7 @@ fn mremap_grow_locked() {
     if code == 0 {
         code = mremap_grow_onfault();
     }
-    report(NAME, code);
+    report_code(NAME, code);
 }
 
 /// The same with MLOCK_ONFAULT: the added pages stay unpopulated (Linux
@@ -712,17 +702,17 @@ fn mremap_grow_onfault() -> i64 {
 fn mlock_holes() {
     const NAME: &[u8] = b"MLOCK_HOLES";
     let Some(a) = area(4) else {
-        return report(NAME, -1);
+        return report_code(NAME, -1);
     };
     let Some(b) = area(5) else {
         sys_munmap(a, 4 * P);
-        return report(NAME, -1);
+        return report_code(NAME, -1);
     };
     sys_munmap(b + 2 * P, P);
     let code = mlock_holes_on(a, b);
     sys_munmap(a, 4 * P);
     sys_munmap(b, 5 * P);
-    report(NAME, code);
+    report_code(NAME, code);
 }
 
 /// `a`: four pages, one VMA; `b`: [b, b + 2P) hole [b + 3P, b + 5P)
@@ -755,7 +745,7 @@ fn mlock_holes_on(a: u64, b: u64) -> i64 {
 fn mlock_limit() {
     const NAME: &[u8] = b"MLOCK_LIMIT";
     let code = child(&|| mlock_limit_child() == 0);
-    report(NAME, code);
+    report_code(NAME, code);
 }
 
 /// In a child: no capabilities, RLIMIT_MEMLOCK four pages
@@ -798,7 +788,7 @@ fn munmap(a: u64, len: u64, _: i64) -> i64 {
 fn munmap_args() {
     const NAME: &[u8] = b"MUNMAP_ARGS";
     let Some(a) = area(4) else {
-        return report(NAME, -1);
+        return report_code(NAME, -1);
     };
     let t = top();
     let hi = t + (1 << 28);
@@ -831,12 +821,12 @@ fn munmap_args() {
         code = 102;
     }
     sys_munmap(a, 4 * P);
-    report(NAME, code);
+    report_code(NAME, code);
 }
 
 fn brk_args() {
     const NAME: &[u8] = b"BRK_ARGS";
-    report(NAME, child(&|| brk_child() == 0) as i64);
+    report_code(NAME, child(&|| brk_child() == 0) as i64);
 }
 
 /// `x` rounded up to a page
@@ -924,17 +914,17 @@ fn mprot(a: u64, len: u64, prot: i64) -> i64 {
 fn mprotect_args() {
     const NAME: &[u8] = b"MPROTECT_ARGS";
     let Some(a) = area(4) else {
-        return report(NAME, -1);
+        return report_code(NAME, -1);
     };
     let Some(b) = area(5) else {
         sys_munmap(a, 4 * P);
-        return report(NAME, -1);
+        return report_code(NAME, -1);
     };
     sys_munmap(b + 2 * P, P);
     let code = mprotect_on(a, b);
     sys_munmap(a, 4 * P);
     sys_munmap(b, 5 * P);
-    report(NAME, code);
+    report_code(NAME, code);
 }
 
 /// `a`: four pages, one VMA; `b`: [b, b + 2P) hole [b + 3P, b + 5P)
@@ -998,17 +988,17 @@ fn msync(a: u64, len: u64, flags: i64) -> i64 {
 fn msync_args() {
     const NAME: &[u8] = b"MSYNC_ARGS";
     let Some(a) = area(4) else {
-        return report(NAME, -1);
+        return report_code(NAME, -1);
     };
     let Some(b) = area(5) else {
         sys_munmap(a, 4 * P);
-        return report(NAME, -1);
+        return report_code(NAME, -1);
     };
     sys_munmap(b + 2 * P, P);
     let code = msync_on(a, b);
     sys_munmap(a, 4 * P);
     sys_munmap(b, 5 * P);
-    report(NAME, code);
+    report_code(NAME, code);
 }
 
 /// `a`: four pages, one VMA; `b`: [b, b + 2P) hole [b + 3P, b + 5P)
@@ -1072,14 +1062,14 @@ fn mincore(a: u64, len: u64, vec: i64) -> i64 {
 fn mincore_args() {
     const NAME: &[u8] = b"MINCORE_ARGS";
     let Some(a) = area(4) else {
-        return report(NAME, -1);
+        return report_code(NAME, -1);
     };
     let mut code = mincore_on(a);
     sys_munmap(a, 4 * P);
     if code == 0 {
         code = mincore_big();
     }
-    report(NAME, code);
+    report_code(NAME, code);
 }
 
 /// `a`: four filled pages, holes around
@@ -1154,7 +1144,7 @@ fn mincore_big() -> i64 {
 
 fn sparse_populate() {
     const NAME: &[u8] = b"SPARSE_POPULATE";
-    report(NAME, child(&|| sparse_child() == 0) as i64);
+    report_code(NAME, child(&|| sparse_child() == 0) as i64);
 }
 
 /// In a child (mlockall locks it all): [p] 64GB hole [q]

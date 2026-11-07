@@ -15,6 +15,7 @@
 
 use hk_syscall::{sys_exit, sys_fork};
 
+use crate::tests::harness::T;
 use crate::tests::net::sk::*;
 use crate::tests::net::tcp_xfer::{accept, listener, recv_pat, send_pat, set_timeo, wait_child};
 use crate::tests::proc::sysctl::{read_file, write_file};

@@ -3,6 +3,7 @@
 //! an unused address after three probes, administrative entries
 //! (RTM_NEWNEIGH / RTM_DELNEIGH errors and PERMANENT state).
 
+use crate::tests::harness::T;
 use crate::tests::helpers::skip;
 use crate::tests::net::nl::{
     AF_INET, Msg, NLM_F_CREATE, NLM_F_EXCL, Nl, RTM_GETNEIGH, RTM_NEWNEIGH, Req, each_msg, msleep,

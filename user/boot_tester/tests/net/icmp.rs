@@ -5,6 +5,7 @@
 
 use hk_syscall::POLLERR;
 
+use crate::tests::harness::T;
 use crate::tests::helpers::skip;
 use crate::tests::net::nl::net_setup_eth0;
 use crate::tests::net::sk::*;

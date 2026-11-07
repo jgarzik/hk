@@ -7,7 +7,7 @@
 //! a plain rename onto an ancestor). On arm64,
 //! renameat (38) stays wired, as in Linux (arm64 keeps it).
 
-use crate::tests::helpers::{print, print_num, println};
+use crate::tests::harness::verdict;
 use hk_syscall::{
     AT_FDCWD, O_CREAT, O_WRONLY, Stat, sys_close, sys_mkdir, sys_mount, sys_open, sys_renameat2,
     sys_rmdir, sys_stat, sys_umount2, sys_unlink,
@@ -46,17 +46,6 @@ pub fn run_tests() {
     exchange_dirs();
     sys_umount2(DIR.as_ptr(), 0);
     sys_rmdir(DIR.as_ptr());
-}
-
-fn verdict(name: &[u8], ok: bool, got: i64) {
-    print(name);
-    if ok {
-        println(b":OK");
-    } else {
-        print(b":FAIL got ");
-        print_num(got);
-        println(b"");
-    }
 }
 
 fn touch(p: &[u8]) {

@@ -29,6 +29,7 @@
 //! OOM_*_KILL, OOM_PIPE_RESERVE and OOM_MLOCK_EAGAIN fill all of RAM,
 //! sized from MemTotal; above 4GB they are skipped (mm_life::exhaust_ok)
 
+use crate::tests::harness::verdict_detail;
 use crate::tests::helpers::{host_mode, print, print_num, println, skip};
 use crate::tests::mm::mm_life::{exhaust_ok, meminfo};
 use hk_syscall::{
@@ -68,17 +69,6 @@ fn mlock_hog() -> u64 {
         0x80
     } else {
         3
-    }
-}
-
-fn report(name: &[u8], ok: bool, detail: i64) {
-    print(name);
-    if ok {
-        println(b":OK");
-    } else {
-        print(b":FAIL ");
-        print_num(detail);
-        println(b"");
     }
 }
 
@@ -218,12 +208,12 @@ fn rlimit_memlock_child() -> u64 {
 
 fn rlimit_memlock() {
     let r = in_child(rlimit_memlock_child);
-    report(b"OOM_RLIMIT_MEMLOCK", r == 0, r);
+    verdict_detail(b"OOM_RLIMIT_MEMLOCK", r == 0, r);
 }
 
 fn rlimit_as() {
     let r = in_child(rlimit_as_child);
-    report(b"OOM_RLIMIT_AS", r == 0, r);
+    verdict_detail(b"OOM_RLIMIT_AS", r == 0, r);
 }
 
 /// Child: fault in twice the machine's memory, one write per page; the
@@ -365,7 +355,7 @@ fn fault_kill(name: &[u8], f: fn() -> u64) {
     let before = meminfo(b"MemFree:");
     let r = in_child(f);
     if r != 0x100 + SIGKILL as i64 && r != 0x80 {
-        report(name, false, r);
+        verdict_detail(name, false, r);
         return;
     }
     // Exact accounting on hk: everything comes back (a few pages may
@@ -385,7 +375,7 @@ fn fault_kill(name: &[u8], f: fn() -> u64) {
         print(b" kB, after ");
         print_num(after);
         println(b" kB");
-        report(name, false, -2);
+        verdict_detail(name, false, -2);
         return;
     }
     // The kernel kept its reserve
@@ -397,9 +387,9 @@ fn fault_kill(name: &[u8], f: fn() -> u64) {
         print(b" kB, min_free_kbytes ");
         print_num(min);
         println(b"");
-        report(name, false, -4);
+        verdict_detail(name, false, -4);
         return;
     }
     let again = in_child(|| 0);
-    report(name, again == 0, -3);
+    verdict_detail(name, again == 0, -3);
 }

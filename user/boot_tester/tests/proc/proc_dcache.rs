@@ -4,6 +4,7 @@
 //! a process's files follows its dumpability, and inode numbers do not
 //! collide
 
+use crate::tests::harness::{R, check, report_r};
 use crate::tests::helpers::{host_mode, print, print_num, println};
 use hk_syscall::{
     O_RDONLY, PR_SET_DUMPABLE, Stat, sys_close, sys_exit, sys_fork, sys_kill, sys_open, sys_pipe2,
@@ -14,32 +15,12 @@ const ENOENT: i64 = -2;
 const SIGKILL: u32 = 9;
 
 pub fn run_tests() {
-    report(b"PROC_PID_GONE", pid_gone());
-    report(b"PROC_FD_CLOSED", fd_closed());
-    report(b"PROC_OWNER_REFRESH", owner_refresh());
-    report(b"PROC_INO_UNIQUE", ino_unique());
-    report(b"DROP_CACHES_DENTRIES", drop_dentries());
-    report(b"DCACHE_UMOUNT_FREED", umount_freed());
-}
-
-type R = Result<(), (&'static [u8], i64)>;
-
-fn report(name: &[u8], r: R) {
-    print(name);
-    match r {
-        Ok(()) => println(b":OK"),
-        Err((why, got)) => {
-            print(b":FAIL ");
-            print(why);
-            print(b" got ");
-            print_num(got);
-            println(b"");
-        }
-    }
-}
-
-fn check(what: &'static [u8], ok: bool, got: i64) -> R {
-    if ok { Ok(()) } else { Err((what, got)) }
+    report_r(b"PROC_PID_GONE", pid_gone());
+    report_r(b"PROC_FD_CLOSED", fd_closed());
+    report_r(b"PROC_OWNER_REFRESH", owner_refresh());
+    report_r(b"PROC_INO_UNIQUE", ino_unique());
+    report_r(b"DROP_CACHES_DENTRIES", drop_dentries());
+    report_r(b"DCACHE_UMOUNT_FREED", umount_freed());
 }
 
 fn stat(p: &[u8]) -> Result<Stat, i64> {

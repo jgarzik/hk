@@ -8,6 +8,7 @@ use hk_syscall::{
     sys_setresuid, sys_wait4, sys_write,
 };
 
+use crate::tests::harness::T;
 use crate::tests::net::sk::*;
 
 pub fn run_tests() {

@@ -21,7 +21,7 @@
 //!   a sibling thread has used the time; on a thread clock it is
 //!   EOPNOTSUPP (Linux: thread CPU clocks have no nsleep)
 
-use crate::tests::helpers::{print, print_num, println};
+use crate::tests::harness::verdict;
 use crate::tests::mm::fork_mm::{join, spawn_thread};
 use crate::tests::signal::signals::restorer_addr;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -65,17 +65,6 @@ fn catch(sig: u32) {
         mask: 0,
     };
     sys_rt_sigaction(sig, &a as *const SigAction as u64, 0, 8);
-}
-
-fn report(name: &[u8], ok: bool, v: i64) {
-    print(name);
-    if ok {
-        println(b":OK");
-    } else {
-        print(b":FAIL got ");
-        print_num(v);
-        println(b"");
-    }
 }
 
 fn clock_ms(clock: i32) -> i64 {
@@ -142,7 +131,7 @@ fn one_shot(name: &[u8], clock: i32) {
     HITS.store(0, Ordering::Relaxed);
     let id = timer(clock);
     if id < 0 {
-        return report(name, false, id);
+        return verdict(name, false, id);
     }
     let start = clock_ms(clock);
     sys_timer_settime(id as i32, 0, &spec(100, 0), core::ptr::null_mut());
@@ -150,7 +139,7 @@ fn one_shot(name: &[u8], clock: i32) {
     let at = clock_ms(clock) - start;
     sys_timer_delete(id as i32);
     // Fired, not before its 100 ms (and within the 2 s bound)
-    report(
+    verdict(
         name,
         HITS.load(Ordering::Relaxed) >= 1 && at >= 100 && used < 2000,
         at,
@@ -161,13 +150,13 @@ fn periodic() {
     HITS.store(0, Ordering::Relaxed);
     let id = timer(PROCESS_CLOCK);
     if id < 0 {
-        return report(b"CPU_TIMER_PERIODIC", false, id);
+        return verdict(b"CPU_TIMER_PERIODIC", false, id);
     }
     sys_timer_settime(id as i32, 0, &spec(20, 20), core::ptr::null_mut());
     burn_until(PROCESS_CLOCK, 4, 3000);
     sys_timer_delete(id as i32);
     let hits = HITS.load(Ordering::Relaxed) as i64;
-    report(b"CPU_TIMER_PERIODIC", hits >= 4, hits);
+    verdict(b"CPU_TIMER_PERIODIC", hits >= 4, hits);
 }
 
 fn tai() {
@@ -176,7 +165,7 @@ fn tai() {
     const TIMER_ABSTIME: i32 = 1;
     let id = timer(CLOCK_TAI);
     if id < 0 {
-        return report(b"TIMER_CREATE_TAI", false, id);
+        return verdict(b"TIMER_CREATE_TAI", false, id);
     }
     // SAFETY: plain integers
     let mut tx: Timex = unsafe { core::mem::zeroed() };
@@ -228,7 +217,7 @@ fn tai() {
     tx.constant = 0;
     sys_adjtimex(&mut tx);
     let hits = HITS.load(Ordering::Relaxed) as i64;
-    report(
+    verdict(
         b"TIMER_CREATE_TAI",
         hits >= 1 && (36..=38).contains(&ahead),
         hits * 1000 + ahead,
@@ -264,7 +253,7 @@ fn itimers() {
     let (virt, vleft) = itimer_hits(ITIMER_VIRTUAL, SIGVTALRM, PROCESS_CLOCK);
     // Linux adds a tick to a CPU itimer's value (set_cpu_itimer)
     let left_ok = |l: i64| l > 0 && l <= 100_000;
-    report(
+    verdict(
         b"ITIMER_CPU",
         prof >= 1 && virt >= 1 && left_ok(pleft) && left_ok(vleft),
         (prof * 10 + virt) as i64,
@@ -313,7 +302,7 @@ fn rlimit_cpu() {
     sys_wait4(pid, &mut st, 0, 0);
     // SIGXCPU seen, soft limit now 2, then killed by SIGKILL
     let ok = n == 2 && msg[0] >= 1 && msg[1] == 2 && st & 0x7f == 9;
-    report(b"RLIMIT_CPU_XCPU", ok, st as i64 + 1000 * msg[0] as i64);
+    verdict(b"RLIMIT_CPU_XCPU", ok, st as i64 + 1000 * msg[0] as i64);
 }
 
 static STOP: AtomicU32 = AtomicU32::new(0);
@@ -358,7 +347,7 @@ fn nsleep() {
     } else {
         used
     };
-    report(
+    verdict(
         b"CPU_NSLEEP",
         joined && r == 0 && used >= 100 && thread == EOPNOTSUPP,
         v,
@@ -373,7 +362,7 @@ fn dead_thread() {
         spawn_thread(top, spinner, 0, ctid)
     };
     if tid <= 0 {
-        return report(b"CPU_TIMER_DEAD_THREAD", false, tid);
+        return verdict(b"CPU_TIMER_DEAD_THREAD", false, tid);
     }
     // MAKE_THREAD_CPUCLOCK(tid, CPUCLOCK_SCHED), while it runs
     let clock = ((!(tid as i32)) << 3) | 4 | 2;
@@ -382,7 +371,7 @@ fn dead_thread() {
     let joined = join(&raw mut CTID);
     STOP.store(0, Ordering::Relaxed);
     if id < 0 || !joined {
-        return report(b"CPU_TIMER_DEAD_THREAD", false, id);
+        return verdict(b"CPU_TIMER_DEAD_THREAD", false, id);
     }
     // Its tid word clears before it is released (Linux too): let it go
     let ts = Timespec {
@@ -392,5 +381,5 @@ fn dead_thread() {
     hk_syscall::sys_nanosleep(&ts, core::ptr::null_mut());
     let r = sys_timer_settime(id as i32, 0, &spec(10, 0), core::ptr::null_mut());
     sys_timer_delete(id as i32);
-    report(b"CPU_TIMER_DEAD_THREAD", r == -3, r);
+    verdict(b"CPU_TIMER_DEAD_THREAD", r == -3, r);
 }

@@ -16,7 +16,7 @@
 //!
 //! fs.nr_open is global: every test puts 1048576 back.
 
-use crate::tests::helpers::{print, print_num, println};
+use crate::tests::harness::report_step;
 use crate::tests::proc::sysctl::{read_file, write_file};
 use core::ptr;
 use hk_syscall::{
@@ -34,22 +34,11 @@ const F_DUPFD: i32 = 0;
 const F_GETFD: i32 = 1;
 
 pub fn run_tests() {
-    report(b"NR_OPEN_DEFAULT", default());
-    report(b"NR_OPEN_SYSCTL", sysctl());
-    report(b"NR_OPEN_RLIMIT", rlimit());
-    report(b"NR_OPEN_ALLOC", alloc());
-    report(b"DUP3_RLIMIT", dup3_rlimit());
-}
-
-fn report(name: &[u8], step: i64) {
-    print(name);
-    if step == 0 {
-        println(b":OK");
-    } else {
-        print(b":FAIL step ");
-        print_num(step);
-        println(b"");
-    }
+    report_step(b"NR_OPEN_DEFAULT", default());
+    report_step(b"NR_OPEN_SYSCTL", sysctl());
+    report_step(b"NR_OPEN_RLIMIT", rlimit());
+    report_step(b"NR_OPEN_ALLOC", alloc());
+    report_step(b"DUP3_RLIMIT", dup3_rlimit());
 }
 
 /// fs.nr_open, or -1

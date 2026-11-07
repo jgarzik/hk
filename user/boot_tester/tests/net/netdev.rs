@@ -404,6 +404,7 @@ fn test_eth0_dns() {
 /// connected UDP socket, send(), poll(POLLIN), recv(MSG_DONTWAIT);
 /// the source is the interface address and IP_PKTINFO names eth0
 fn test_eth0_dns_connected() {
+    use crate::tests::harness::T;
     use crate::tests::net::sk::*;
     let mut t = T::new(b"ETH0_DNS_CONNECTED");
     let fd = udp();

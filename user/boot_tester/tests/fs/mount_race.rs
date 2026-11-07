@@ -12,6 +12,7 @@
 
 use core::sync::atomic::{AtomicI32, Ordering};
 
+use crate::tests::harness::report_step;
 use crate::tests::helpers::{print, print_num, println};
 use hk_syscall::{
     LinuxStatFs, MAP_ANONYMOUS, MAP_SHARED, O_CREAT, O_WRONLY, PROT_READ, PROT_WRITE, sys_close,
@@ -40,8 +41,8 @@ pub fn run_tests() {
     };
     let b = sys_mount(A.as_ptr(), B.as_ptr(), core::ptr::null(), MS_BIND, 0);
     if m == 0 && b == 0 {
-        report(b"REMOUNT_RO_BUSY", remount_ro_busy());
-        report(b"REMOUNT_RO_RACE", remount_ro_race());
+        report_step(b"REMOUNT_RO_BUSY", remount_ro_busy());
+        report_step(b"REMOUNT_RO_RACE", remount_ro_race());
     } else {
         print(b"REMOUNT_RO_BUSY:FAIL mount got ");
         print_num(m.min(b));
@@ -51,17 +52,6 @@ pub fn run_tests() {
     sys_umount2(A.as_ptr(), 0);
     sys_rmdir(B.as_ptr());
     sys_rmdir(A.as_ptr());
-}
-
-fn report(name: &[u8], step: i64) {
-    print(name);
-    if step == 0 {
-        println(b":OK");
-    } else {
-        print(b":FAIL step ");
-        print_num(step);
-        println(b"");
-    }
 }
 
 fn remount(target: &[u8], flags: u64) -> i64 {

@@ -9,8 +9,6 @@ use hk_syscall::{
     sys_recvfrom, sys_recvmsg, sys_sendto, sys_setsockopt, sys_socket,
 };
 
-use crate::tests::helpers::{print, print_num, println};
-
 pub const LO: [u8; 4] = [127, 0, 0, 1];
 pub const ANY: [u8; 4] = [0, 0, 0, 0];
 
@@ -232,45 +230,4 @@ pub fn udp_lo() -> (i32, u16) {
     let fd = udp();
     bind(fd, LO, 0);
     (fd, port(fd))
-}
-
-/// Print NAME:OK or NAME:FAIL why value
-pub struct T {
-    name: &'static [u8],
-    failed: bool,
-}
-
-impl T {
-    pub fn new(name: &'static [u8]) -> Self {
-        Self {
-            name,
-            failed: false,
-        }
-    }
-
-    /// Record `got == want` (first failure is printed)
-    pub fn eq(&mut self, why: &[u8], got: i64, want: i64) -> bool {
-        self.ok(why, got == want, got)
-    }
-
-    /// Record a condition; prints `got` on the first failure
-    pub fn ok(&mut self, why: &[u8], cond: bool, got: i64) -> bool {
-        if !cond && !self.failed {
-            self.failed = true;
-            print(self.name);
-            print(b":FAIL ");
-            print(why);
-            print(b" got ");
-            print_num(got);
-            println(b"");
-        }
-        cond
-    }
-
-    pub fn done(self) {
-        if !self.failed {
-            print(self.name);
-            println(b":OK");
-        }
-    }
 }

@@ -9,6 +9,7 @@ use hk_syscall::{
     sys_write,
 };
 
+use crate::tests::harness::T;
 use crate::tests::net::sk::*;
 
 pub fn run_tests() {

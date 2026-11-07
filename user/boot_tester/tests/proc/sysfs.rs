@@ -9,9 +9,8 @@ use hk_syscall::{
     sys_getdents64, sys_lseek, sys_open, sys_read, sys_readlink, sys_stat, sys_statfs, sys_write,
 };
 
-use crate::tests::helpers::{
-    host_mode, linux_at_least, print, print_num, println, read_file, skip,
-};
+use crate::tests::harness::{fail_why, pass};
+use crate::tests::helpers::{host_mode, linux_at_least, println, read_file, skip};
 use crate::tests::net::nl::{nladdr, recv_creds};
 
 const EACCES: i64 = -13;
@@ -61,27 +60,15 @@ fn test_chmod_keep() {
     sys_chmod(p.as_ptr(), 0o644);
     sys_chown(p.as_ptr(), 0, 0);
     match st {
-        _ if c != 0 || o != 0 => fail(n, b"chmod/chown", c * 100 + o),
-        _ if w != EACCES => fail(n, b"open for write", w),
-        Err(e) => fail(n, b"stat", e),
-        Ok(st) if st.st_mode & 0o7777 != 0o444 => fail(n, b"mode", i64::from(st.st_mode)),
-        Ok(st) if st.st_uid != 1000 || st.st_gid != 1000 => fail(n, b"owner", i64::from(st.st_uid)),
-        Ok(_) => ok(n),
+        _ if c != 0 || o != 0 => fail_why(n, b"chmod/chown", c * 100 + o),
+        _ if w != EACCES => fail_why(n, b"open for write", w),
+        Err(e) => fail_why(n, b"stat", e),
+        Ok(st) if st.st_mode & 0o7777 != 0o444 => fail_why(n, b"mode", i64::from(st.st_mode)),
+        Ok(st) if st.st_uid != 1000 || st.st_gid != 1000 => {
+            fail_why(n, b"owner", i64::from(st.st_uid))
+        }
+        Ok(_) => pass(n),
     }
-}
-
-fn fail(name: &[u8], why: &[u8], v: i64) {
-    print(name);
-    print(b":FAIL ");
-    print(why);
-    print(b" ");
-    print_num(v);
-    println(b"");
-}
-
-fn ok(name: &[u8]) {
-    print(name);
-    println(b":OK");
 }
 
 fn stat(path: &[u8]) -> Result<Stat, i64> {
@@ -129,7 +116,7 @@ fn test_basic() {
     let mut sf: LinuxStatFs = unsafe { core::mem::zeroed() };
     let r = sys_statfs(b"/sys\0".as_ptr(), &mut sf);
     if r != 0 || sf.f_type != SYSFS_MAGIC {
-        return fail(N, b"statfs magic", if r != 0 { r } else { sf.f_type });
+        return fail_why(N, b"statfs magic", if r != 0 { r } else { sf.f_type });
     }
     let mut kernel = false;
     let mut fs = false;
@@ -138,11 +125,11 @@ fn test_basic() {
         fs |= name == b"fs" && ty == DT_DIR;
     });
     if !kernel || !fs {
-        return fail(N, b"/sys lacks kernel or fs", 0);
+        return fail_why(N, b"/sys lacks kernel or fs", 0);
     }
     match stat(b"/sys/fs/cgroup\0") {
         Ok(st) if st.st_mode & S_IFMT == S_IFDIR => {}
-        _ => return fail(N, b"/sys/fs/cgroup", 0),
+        _ => return fail_why(N, b"/sys/fs/cgroup", 0),
     }
     // Directory link count: subdirectories + 2
     let mut subdirs = 0;
@@ -151,18 +138,18 @@ fn test_basic() {
     });
     match stat(b"/sys/kernel\0") {
         Ok(st) if st.st_nlink as i64 == subdirs + 2 => {}
-        Ok(st) => return fail(N, b"nlink", st.st_nlink as i64),
-        Err(e) => return fail(N, b"stat /sys/kernel", e),
+        Ok(st) => return fail_why(N, b"nlink", st.st_nlink as i64),
+        Err(e) => return fail_why(N, b"stat /sys/kernel", e),
     }
     // Attributes: regular, mode 0444, size 4096
     let path = b"/sys/kernel/uevent_seqnum\0";
     match stat(path) {
         Ok(st) if st.st_mode == S_IFREG | 0o444 && st.st_size == 4096 => {}
-        Ok(st) => return fail(N, b"attr mode", st.st_mode as i64),
-        Err(e) => return fail(N, b"stat attr", e),
+        Ok(st) => return fail_why(N, b"attr mode", st.st_mode as i64),
+        Err(e) => return fail_why(N, b"stat attr", e),
     }
     if let Err((why, v)) = attr_reads(path) {
-        return fail(N, why, v);
+        return fail_why(N, why, v);
     }
     // A read-only attribute refuses write opens, even to root
     let w = sys_open(path.as_ptr(), O_WRONLY, 0);
@@ -170,9 +157,9 @@ fn test_basic() {
         sys_close(w as u64);
     }
     if w != EACCES {
-        return fail(N, b"write open", w);
+        return fail_why(N, b"write open", w);
     }
-    ok(N);
+    pass(N);
 }
 
 /// Split reads, re-read after lseek(0), SEEK_END from the 4096 size
@@ -273,10 +260,10 @@ fn test_class_mem() {
     ];
     for (why, good) in checks {
         if !good {
-            return fail(N, why, 0);
+            return fail_why(N, why, 0);
         }
     }
-    ok(N);
+    pass(N);
 }
 
 const NETLINK_KOBJECT_UEVENT: i32 = 15;
@@ -355,7 +342,7 @@ fn exact_vars(m: &[u8], want: &[&[u8]]) -> Option<u64> {
 fn test_uevent_synth() {
     const N: &[u8] = b"UEVENT_SYNTH";
     let Some(fd) = uevent_sock() else {
-        return fail(N, b"socket", 0);
+        return fail_why(N, b"socket", 0);
     };
     let r = (|| {
         let ue = b"/sys/class/mem/null/uevent\0";
@@ -426,8 +413,8 @@ fn test_uevent_synth() {
     })();
     sys_close(fd as u64);
     match r {
-        Ok(()) => ok(N),
-        Err((why, v)) => fail(N, why, v),
+        Ok(()) => pass(N),
+        Err((why, v)) => fail_why(N, why, v),
     }
 }
 
@@ -483,12 +470,12 @@ fn test_bus_platform() {
     const N: &[u8] = b"SYSFS_BUS_PLATFORM";
     let base = b"/sys/bus/platform/";
     if !file_is(b"/sys/bus/platform/drivers_autoprobe\0", b"1\n") {
-        return fail(N, b"drivers_autoprobe", 0);
+        return fail_why(N, b"drivers_autoprobe", 0);
     }
     for f in [&b"drivers_probe\0"[..], b"uevent\0"] {
         let mut b = [0u8; 256];
         if mode_of(path(&mut b, &[base, f])) != S_IFREG | 0o200 {
-            return fail(N, b"bus write-only file", 0);
+            return fail_why(N, b"bus write-only file", 0);
         }
     }
     let drivers = Names::of(b"/sys/bus/platform/drivers\0", DT_DIR);
@@ -502,7 +489,7 @@ fn test_bus_platform() {
             m[k] = mode_of(path(&mut b, &[base, b"drivers/", d, f]));
         }
         if m[0] != m[1] || (m[0] != 0 && m[0] != S_IFREG | 0o200) {
-            return fail(N, b"driver bind/unbind mode", i as i64);
+            return fail_why(N, b"driver bind/unbind mode", i as i64);
         }
         let mut db = [0u8; 256];
         let devs = Names::of(path(&mut db, &[base, b"drivers/", d, b"\0"]), DT_LNK);
@@ -517,7 +504,7 @@ fn test_bus_platform() {
             let p = path(&mut lb, &[base, b"devices/", dev, b"/driver\0"]);
             let n = sys_readlink(p.as_ptr(), t.as_mut_ptr(), t.len() as u64);
             if n <= 0 || !t[..n as usize].ends_with(d) {
-                return fail(N, b"driver link", j as i64);
+                return fail_why(N, b"driver link", j as i64);
             }
             let mut ub = [0u8; 256];
             let mut u = [0u8; 1024];
@@ -533,16 +520,16 @@ fn test_bus_platform() {
                 has_alias |= line.starts_with(b"MODALIAS=");
             }
             if !has_drv || !has_alias {
-                return fail(N, b"uevent DRIVER/MODALIAS", j as i64);
+                return fail_why(N, b"uevent DRIVER/MODALIAS", j as i64);
             }
             bound += 1;
         }
     }
     // hk binds its console UART; the Linux reference may use other buses
     if bound == 0 && !host_mode() {
-        return fail(N, b"no bound device", 0);
+        return fail_why(N, b"no bound device", 0);
     }
-    ok(N);
+    pass(N);
 }
 
 /// Parse "0x<hex>\n" of exactly `digits` hex digits
@@ -568,7 +555,7 @@ fn test_bus_pci() {
     const N: &[u8] = b"SYSFS_BUS_PCI";
     let devs = Names::of(b"/sys/bus/pci/devices\0", DT_LNK);
     if devs.n == 0 {
-        return fail(N, b"no PCI devices", 0);
+        return fail_why(N, b"no PCI devices", 0);
     }
     let base: &[u8] = b"/sys/bus/pci/devices/";
     for i in 0..devs.n {
@@ -581,24 +568,24 @@ fn test_bus_pci() {
         let mut v = [0u8; 64];
         let n = attr(b"vendor", &mut v);
         let Some(vendor) = hex_attr(&v[..n], 4) else {
-            return fail(N, b"vendor format", i as i64);
+            return fail_why(N, b"vendor format", i as i64);
         };
         let n = attr(b"device", &mut v);
         let Some(device) = hex_attr(&v[..n], 4) else {
-            return fail(N, b"device format", i as i64);
+            return fail_why(N, b"device format", i as i64);
         };
         let n = attr(b"class", &mut v);
         if hex_attr(&v[..n], 6).is_none() {
-            return fail(N, b"class format", i as i64);
+            return fail_why(N, b"class format", i as i64);
         }
         let mut cfg = [0u8; 4];
         if attr(b"config", &mut cfg) != 4 || u32::from_le_bytes(cfg) != vendor | device << 16 {
-            return fail(N, b"config id", i as i64);
+            return fail_why(N, b"config id", i as i64);
         }
         let mut b = [0u8; 256];
         let sz = stat(path(&mut b, &[base, d, b"/config\0"])).map_or(0, |st| st.st_size);
         if sz != 256 && sz != 4096 {
-            return fail(N, b"config size", sz);
+            return fail_why(N, b"config size", sz);
         }
         // MODALIAS=pci:v0000VVVVd0000DDDD...
         let mut want = *b"pci:v0000XXXXd0000XXXX";
@@ -606,7 +593,7 @@ fn test_bus_pci() {
         upper_hex(device, 4, &mut want[18..22]);
         let n = attr(b"modalias", &mut v);
         if !v[..n].starts_with(&want) {
-            return fail(N, b"modalias", i as i64);
+            return fail_why(N, b"modalias", i as i64);
         }
         let mut id = *b"PCI_ID=XXXX:XXXX";
         upper_hex(vendor, 4, &mut id[7..11]);
@@ -619,10 +606,10 @@ fn test_bus_pci() {
             has_slot |= line.strip_prefix(b"PCI_SLOT_NAME=") == Some(d);
         }
         if !has_id || !has_slot {
-            return fail(N, b"uevent PCI_ID/PCI_SLOT_NAME", i as i64);
+            return fail_why(N, b"uevent PCI_ID/PCI_SLOT_NAME", i as i64);
         }
     }
-    ok(N);
+    pass(N);
 }
 
 /// Every virtio device: device/vendor formats agreeing with modalias
@@ -643,24 +630,24 @@ fn test_bus_virtio() {
         let mut v = [0u8; 256];
         let n = attr(b"device", &mut v);
         let Some(device) = hex_attr(&v[..n], 4) else {
-            return fail(N, b"device format", i as i64);
+            return fail_why(N, b"device format", i as i64);
         };
         let n = attr(b"vendor", &mut v);
         let Some(vendor) = hex_attr(&v[..n], 4) else {
-            return fail(N, b"vendor format", i as i64);
+            return fail_why(N, b"vendor format", i as i64);
         };
         let mut want = *b"virtio:dXXXXXXXXvXXXXXXXX\n";
         upper_hex(device, 8, &mut want[8..16]);
         upper_hex(vendor, 8, &mut want[17..25]);
         let n = attr(b"modalias", &mut v);
         if v[..n] != want {
-            return fail(N, b"modalias", i as i64);
+            return fail_why(N, b"modalias", i as i64);
         }
         // VIRTIO_FEATURES_BITS digits: 128 since Linux 6.17, 64 before
         let bits = if linux_at_least(6, 17) { 128 } else { 64 };
         let n = attr(b"features", &mut v);
         if n != bits + 1 || v[bits] != b'\n' || !v[..bits].iter().all(|&c| c == b'0' || c == b'1') {
-            return fail(N, b"features", n as i64);
+            return fail_why(N, b"features", n as i64);
         }
         let mut u = [0u8; 512];
         let n = attr(b"uevent", &mut u);
@@ -669,15 +656,15 @@ fn test_bus_virtio() {
             .split(|&c| c == b'\n')
             .any(|l| l.strip_prefix(b"MODALIAS=") == Some(line));
         if !has {
-            return fail(N, b"uevent MODALIAS", i as i64);
+            return fail_why(N, b"uevent MODALIAS", i as i64);
         }
         let mut b = [0u8; 256];
         bound += stat(path(&mut b, &[base, d, b"/driver\0"])).is_ok() as i64;
     }
     if bound == 0 && !host_mode() {
-        return fail(N, b"no bound virtio device", 0);
+        return fail_why(N, b"no bound virtio device", 0);
     }
-    ok(N);
+    pass(N);
 }
 
 /// "M:m\n" -> (M, m)
@@ -727,7 +714,7 @@ fn test_block() {
     const N: &[u8] = b"SYSFS_BLOCK";
     let disks = Names::of(b"/sys/block\0", DT_LNK);
     if disks.n == 0 {
-        return fail(N, b"no disks", 0);
+        return fail_why(N, b"no disks", 0);
     }
     let base: &[u8] = b"/sys/block/";
     for i in 0..disks.n {
@@ -739,19 +726,19 @@ fn test_block() {
         let mut v = [0u8; 64];
         let n = rd(&[base, d, b"/dev\0"], &mut v);
         let Some((ma, mi)) = majmin(&v[..n]) else {
-            return fail(N, b"dev format", i as i64);
+            return fail_why(N, b"dev format", i as i64);
         };
         let n = rd(&[base, d, b"/size\0"], &mut v);
         let size = num(&v[..n]);
         if size != 0 && !in_partitions(ma, mi, size / 2) {
-            return fail(N, b"size vs /proc/partitions", i as i64);
+            return fail_why(N, b"size vs /proc/partitions", i as i64);
         }
         if !uevent_has(&[base, d], &[b"DEVTYPE=disk", b"DISKSEQ="]) {
-            return fail(N, b"disk uevent", i as i64);
+            return fail_why(N, b"disk uevent", i as i64);
         }
         let n = rd(&[base, d, b"/queue/logical_block_size\0"], &mut v);
         if n < 2 || num(&v[..n]) < 512 {
-            return fail(N, b"logical_block_size", i as i64);
+            return fail_why(N, b"logical_block_size", i as i64);
         }
         // Partitions: subdirectories named after the disk
         let mut db = [0u8; 256];
@@ -768,11 +755,11 @@ fn test_block() {
             want[6..6 + no.len()].copy_from_slice(no);
             let w: &[u8] = &want[..6 + no.len()];
             if no.is_empty() || !uevent_has(&[base, d, b"/", p], &[b"DEVTYPE=partition", w]) {
-                return fail(N, b"partition", j as i64);
+                return fail_why(N, b"partition", j as i64);
             }
         }
     }
-    ok(N);
+    pass(N);
 }
 
 /// `%04x\n` (Linux idVendor/idProduct)
@@ -814,7 +801,7 @@ fn test_bus_usb() {
         if host_mode() {
             return skip(N, b"no /sys/bus/usb");
         }
-        return fail(N, b"no /sys/bus/usb", 0);
+        return fail_why(N, b"no /sys/bus/usb", 0);
     }
     let devs = Names::of(b"/sys/bus/usb/devices\0", DT_LNK);
     let attr = |d: &[u8], name: &[u8], out: &mut [u8]| -> usize {
@@ -832,11 +819,11 @@ fn test_bus_usb() {
             Some(b"usb_device") => {
                 let n = attr(d, b"idVendor", &mut v);
                 let Some(vendor) = hex4(&v[..n]) else {
-                    return fail(N, b"idVendor format", i as i64);
+                    return fail_why(N, b"idVendor format", i as i64);
                 };
                 let n = attr(d, b"idProduct", &mut v);
                 let Some(product) = hex4(&v[..n]) else {
-                    return fail(N, b"idProduct format", i as i64);
+                    return fail_why(N, b"idProduct format", i as i64);
                 };
                 // PRODUCT=%x/%x/%x
                 let mut want = [0u8; 18];
@@ -849,7 +836,7 @@ fn test_bus_usb() {
                 want[a + 1 + b] = b'/';
                 let p = uevent_var(u, b"PRODUCT=").unwrap_or(b"");
                 if !p.starts_with(&want[..a + b + 2]) {
-                    return fail(N, b"uevent PRODUCT", i as i64);
+                    return fail_why(N, b"uevent PRODUCT", i as i64);
                 }
                 for (key, name) in [(&b"BUSNUM="[..], &b"busnum"[..]), (b"DEVNUM=", b"devnum")] {
                     let n = attr(d, name, &mut v);
@@ -859,12 +846,12 @@ fn test_bus_usb() {
                         .or(num.strip_prefix(b"0"))
                         .unwrap_or(num);
                     if num.is_empty() || v[..n].strip_suffix(b"\n") != Some(num) {
-                        return fail(N, b"uevent BUSNUM/DEVNUM", i as i64);
+                        return fail_why(N, b"uevent BUSNUM/DEVNUM", i as i64);
                     }
                 }
                 let n = attr(d, b"version", &mut v);
                 if n != 6 || v[2] != b'.' {
-                    return fail(N, b"version format", n as i64);
+                    return fail_why(N, b"version format", n as i64);
                 }
                 root_hub |= d == b"usb1" && vendor == 0x1d6b && product == 2;
             }
@@ -874,17 +861,17 @@ fn test_bus_usb() {
                 let mut id = [0u8; 16];
                 let n = attr(d, b"../idVendor", &mut id);
                 let Some(vendor) = hex4(&id[..n]) else {
-                    return fail(N, b"interface's idVendor", i as i64);
+                    return fail_why(N, b"interface's idVendor", i as i64);
                 };
                 let mut want = *b"usb:vXXXX";
                 upper_hex(vendor, 4, &mut want[5..]);
                 let n = attr(d, b"modalias", &mut v);
                 if !v[..n].starts_with(&want) {
-                    return fail(N, b"modalias", i as i64);
+                    return fail_why(N, b"modalias", i as i64);
                 }
                 let m = uevent_var(u, b"MODALIAS=").unwrap_or(b"");
                 if v[..n].strip_suffix(b"\n") != Some(m) || uevent_var(u, b"INTERFACE=").is_none() {
-                    return fail(N, b"uevent MODALIAS/INTERFACE", i as i64);
+                    return fail_why(N, b"uevent MODALIAS/INTERFACE", i as i64);
                 }
                 let mut lb = [0u8; 256];
                 let mut t = [0u8; 256];
@@ -892,13 +879,13 @@ fn test_bus_usb() {
                 let n = sys_readlink(p.as_ptr(), t.as_mut_ptr(), t.len() as u64);
                 storage |= n > 0 && t[..n as usize].ends_with(b"/usb-storage");
             }
-            _ => return fail(N, b"uevent DEVTYPE", i as i64),
+            _ => return fail_why(N, b"uevent DEVTYPE", i as i64),
         }
     }
     if !host_mode() && !(root_hub && storage) {
-        return fail(N, b"hk: root hub or usb-storage interface", 0);
+        return fail_why(N, b"hk: root hub or usb-storage interface", 0);
     }
-    ok(N);
+    pass(N);
 }
 
 /// /sys/class/net/lo: its virtual device link, attributes and uevent;
@@ -911,7 +898,7 @@ fn test_net() {
         sys_unshare, sys_wait4,
     };
     if !link_is(b"/sys/class/net/lo\0", b"../../devices/virtual/net/lo") {
-        return fail(N, b"lo link", 0);
+        return fail_why(N, b"lo link", 0);
     }
     let checks: [(&[u8], &[u8]); 5] = [
         (b"/sys/class/net/lo/ifindex\0", b"1\n"),
@@ -922,7 +909,7 @@ fn test_net() {
     ];
     for (i, (p, want)) in checks.iter().enumerate() {
         if !file_is(p, want) {
-            return fail(N, b"lo attribute", i as i64);
+            return fail_why(N, b"lo attribute", i as i64);
         }
     }
     let mut f = [0u8; 32];
@@ -936,7 +923,7 @@ fn test_net() {
         });
     // IFF_UP | IFF_LOOPBACK (boot_tester brought lo up)
     if flags.is_none_or(|fl| fl & 0x9 != 0x9) {
-        return fail(N, b"lo flags", n as i64);
+        return fail_why(N, b"lo flags", n as i64);
     }
     let before = Names::of(b"/sys/class/net\0", DT_LNK).n;
     let pid = sys_fork();
@@ -971,9 +958,9 @@ fn test_net() {
     sys_wait4(pid, &mut st, 0, 0);
     let code = (st >> 8) & 0xff;
     if st & 0x7f != 0 || code != 0 {
-        return fail(N, b"netns child", code as i64);
+        return fail_why(N, b"netns child", code as i64);
     }
-    ok(N);
+    pass(N);
 }
 
 /// Parse a range list ("0-3,5\n") into a 256-bit mask; None if malformed
@@ -1019,41 +1006,41 @@ fn test_cpu() {
         list_of(b"/sys/devices/system/cpu/online\0"),
         list_of(b"/sys/devices/system/cpu/possible\0"),
     ) else {
-        return fail(N, b"online/possible format", 0);
+        return fail_why(N, b"online/possible format", 0);
     };
     let mut aff = [0u64; 16];
     let r = hk_syscall::sys_sched_getaffinity(0, 128, aff.as_mut_ptr());
     if r <= 0 {
-        return fail(N, b"sched_getaffinity", r);
+        return fail_why(N, b"sched_getaffinity", r);
     }
     let aff_n: u32 = aff.iter().map(|w| w.count_ones()).sum();
     let on_n: u32 = online.iter().map(|w| w.count_ones()).sum();
     if on_n != aff_n || (0..4).any(|i| online[i] & !possible[i] != 0) {
-        return fail(N, b"online vs affinity/possible", on_n as i64);
+        return fail_why(N, b"online vs affinity/possible", on_n as i64);
     }
     match stat(b"/sys/devices/system/cpu/cpu0\0") {
         Ok(st) if st.st_mode & S_IFMT == S_IFDIR => {}
-        _ => return fail(N, b"cpu0", 0),
+        _ => return fail_why(N, b"cpu0", 0),
     }
     if !link_is(
         b"/sys/bus/cpu/devices/cpu0\0",
         b"../../../devices/system/cpu/cpu0",
     ) {
-        return fail(N, b"bus link", 0);
+        return fail_why(N, b"bus link", 0);
     }
     let Some(nodes) = list_of(b"/sys/devices/system/node/online\0") else {
-        return fail(N, b"node online", 0);
+        return fail_why(N, b"node online", 0);
     };
     if nodes[0] & 1 == 0 {
-        return fail(N, b"node0 offline", 0);
+        return fail_why(N, b"node0 offline", 0);
     }
     let Some(n0) = list_of(b"/sys/devices/system/node/node0/cpulist\0") else {
-        return fail(N, b"node0 cpulist", 0);
+        return fail_why(N, b"node0 cpulist", 0);
     };
     if n0[0] & 1 != 0 && stat(b"/sys/devices/system/node/node0/cpu0\0").is_err() {
-        return fail(N, b"node0/cpu0 link", 0);
+        return fail_why(N, b"node0/cpu0 link", 0);
     }
-    ok(N);
+    pass(N);
 }
 
 /// Receive uevents until one with a header starting `act` and ending
@@ -1147,7 +1134,7 @@ fn test_unbind_blk() {
     }
     let disks = Names::of(b"/sys/block\0", DT_LNK);
     let Some(i) = (0..disks.n).find(|&i| disks.get(i).starts_with(b"vd")) else {
-        return fail(N, b"no virtio disk", 0);
+        return fail_why(N, b"no virtio disk", 0);
     };
     let d = disks.get(i);
     // The virtio device: the last part of the disk's device link
@@ -1156,20 +1143,20 @@ fn test_unbind_blk() {
     let p = path(&mut lb, &[b"/sys/block/", d, b"/device"]);
     let n = sys_readlink(p.as_ptr(), t.as_mut_ptr(), t.len() as u64);
     if n <= 0 {
-        return fail(N, b"device link", n);
+        return fail_why(N, b"device link", n);
     }
     let t = &t[..n as usize];
     let v = &t[t.iter().rposition(|&c| c == b'/').map_or(0, |k| k + 1)..];
     if !v.starts_with(b"virtio") {
-        return fail(N, b"not a virtio device", 0);
+        return fail_why(N, b"not a virtio device", 0);
     }
     let mut before = [0u8; 512];
     let r = sector0(d, &mut before);
     if r != 512 {
-        return fail(N, b"read before", r);
+        return fail_why(N, b"read before", r);
     }
     let Some(fd) = uevent_sock() else {
-        return fail(N, b"socket", 0);
+        return fail_why(N, b"socket", 0);
     };
     let r = (|| {
         let mut nb = [0u8; 256];
@@ -1226,8 +1213,8 @@ fn test_unbind_blk() {
     })();
     sys_close(fd as u64);
     match r {
-        Ok(()) => ok(N),
-        Err((why, v)) => fail(N, why, v),
+        Ok(()) => pass(N),
+        Err((why, v)) => fail_why(N, why, v),
     }
 }
 
@@ -1293,15 +1280,15 @@ fn test_unbind_net() {
         return if host_mode() {
             skip(N, b"no eth0")
         } else {
-            fail(N, b"no eth0", n)
+            fail_why(N, b"no eth0", n)
         };
     }
     // ../../devices/<parent>/net/eth0
     let Some(devpath) = lk[..n as usize].strip_prefix(b"../..") else {
-        return fail(N, b"class link", n);
+        return fail_why(N, b"class link", n);
     };
     let Some(parent) = devpath.strip_suffix(b"/net/eth0") else {
-        return fail(N, b"not below its device", n);
+        return fail_why(N, b"not below its device", n);
     };
     let name = parent.rsplit(|&c| c == b'/').next().unwrap_or(b"");
     let mut dl = [0u8; 256];
@@ -1313,34 +1300,34 @@ fn test_unbind_net() {
     // .../bus/<bus>/drivers/<drv>
     let drv = &dl[..k.max(0) as usize];
     let Some(at) = drv.windows(5).position(|w| w == b"/bus/") else {
-        return fail(N, b"driver link", k);
+        return fail_why(N, b"driver link", k);
     };
     let drv = &drv[at..];
     let old = eth0_ifindex();
     let flags = eth0_flags(None);
     if flags < 0 {
-        return fail(N, b"SIOCGIFFLAGS", flags);
+        return fail_why(N, b"SIOCGIFFLAGS", flags);
     }
     // Up, so unregistering closes it too
     let r = eth0_flags(Some(flags as u16 | 1));
     if r < 0 {
-        return fail(N, b"up", r);
+        return fail_why(N, b"up", r);
     }
     let Some(fd) = uevent_sock() else {
-        return fail(N, b"uevent socket", 0);
+        return fail_why(N, b"uevent socket", 0);
     };
     let r = unbind_rebind(fd, devpath, parent, name, drv);
     sys_close(fd as u64);
     if let Err((why, v)) = r {
-        return fail(N, why, v);
+        return fail_why(N, why, v);
     }
     let new = eth0_ifindex();
     if new <= old {
-        return fail(N, b"ifindex not new", new as i64);
+        return fail_why(N, b"ifindex not new", new as i64);
     }
     let r = eth0_flags(Some(flags as u16 | 1));
     if r < 0 {
-        return fail(N, b"up again", r);
+        return fail_why(N, b"up again", r);
     }
     let ts = hk_syscall::Timespec {
         tv_sec: 0,
@@ -1356,12 +1343,12 @@ fn test_unbind_net() {
     }
     let r = eth0_flags(Some(flags as u16));
     if !up {
-        return fail(N, b"no link after rebind", 0);
+        return fail_why(N, b"no link after rebind", 0);
     }
     if r < 0 {
-        return fail(N, b"restore flags", r);
+        return fail_why(N, b"restore flags", r);
     }
-    ok(N);
+    pass(N);
 }
 
 fn unbind_rebind(
@@ -1511,16 +1498,16 @@ fn test_unbind_usb() {
         if host_mode() {
             return skip(N, b"no USB storage on the reference VM");
         }
-        return fail(N, b"no usb-storage interface", 0);
+        return fail_why(N, b"no usb-storage interface", 0);
     };
     let Some((pb, pl)) = bound_dev(b"/sys/bus/pci/drivers/xhci_hcd\0") else {
-        return fail(N, b"no xhci_hcd device", 0);
+        return fail_why(N, b"no xhci_hcd device", 0);
     };
     let Some(sector) = sda_sector() else {
-        return fail(N, b"read sda", 0);
+        return fail_why(N, b"read sda", 0);
     };
     let Some(fd) = uevent_sock() else {
-        return fail(N, b"socket", 0);
+        return fail_why(N, b"socket", 0);
     };
     let r = usb_unbind_rebind(
         fd,
@@ -1555,8 +1542,8 @@ fn test_unbind_usb() {
     });
     sys_close(fd as u64);
     match r {
-        Ok(()) => ok(N),
-        Err((why, v)) => fail(N, why, v),
+        Ok(()) => pass(N),
+        Err((why, v)) => fail_why(N, why, v),
     }
 }
 
@@ -1567,17 +1554,17 @@ fn test_console() {
     let mut b = [0u8; 256];
     let n = read_file(b"/sys/class/tty/console/active\0", &mut b);
     if n < 2 || b[n as usize - 1] != b'\n' {
-        return fail(N, b"active format", n);
+        return fail_why(N, b"active format", n);
     }
     let mut count = 0;
     for name in b[..n as usize - 1].split(|&c| c == b' ') {
         let mut p = [0u8; 256];
         if name.is_empty() || stat(path(&mut p, &[b"/sys/class/tty/", name, b"/dev\0"])).is_err() {
-            return fail(N, b"console tty", count);
+            return fail_why(N, b"console tty", count);
         }
         count += 1;
     }
-    ok(N);
+    pass(N);
 }
 
 /// PCI and USB drivers' new_id/remove_id (Linux new_id_store,
@@ -1592,7 +1579,7 @@ fn test_new_id() {
         if host_mode() {
             return crate::tests::helpers::skip(N, b"no virtio-pci driver");
         }
-        return fail(N, b"virtio-pci new_id", 0);
+        return fail_why(N, b"virtio-pci new_id", 0);
     }
     let w = |f: &[u8], d: &[u8]| {
         let mut b = [0u8; 256];
@@ -1610,7 +1597,7 @@ fn test_new_id() {
     for (i, (f, d, want)) in steps.iter().enumerate() {
         let r = w(f, d);
         if r != *want {
-            return fail(N, b"pci step", (i as i64) * 1000 + r);
+            return fail_why(N, b"pci step", (i as i64) * 1000 + r);
         }
     }
     let usb = b"/sys/bus/usb/drivers/usb-storage/";
@@ -1620,13 +1607,13 @@ fn test_new_id() {
             || write_str(path(&mut p, &[usb, b"remove_id\0"]), b"1234 5678\n") != 10
             || write_str(path(&mut p, &[usb, b"remove_id\0"]), b"1234\n") != -22
         {
-            return fail(N, b"usb", 0);
+            return fail_why(N, b"usb", 0);
         }
     } else if !host_mode() {
-        return fail(N, b"usb-storage new_id", 0);
+        return fail_why(N, b"usb-storage new_id", 0);
     }
     if stat(b"/sys/bus/usb/drivers/usb/new_id\0").is_ok() {
-        return fail(N, b"usb generic new_id", 0);
+        return fail_why(N, b"usb generic new_id", 0);
     }
-    ok(N);
+    pass(N);
 }

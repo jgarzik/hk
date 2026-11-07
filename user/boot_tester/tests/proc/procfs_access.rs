@@ -3,7 +3,7 @@
 //! PTRACE_MODE_READ_FSCREDS): same uid/gid on all ids and dumpable, or
 //! CAP_SYS_PTRACE.
 
-use crate::tests::helpers::{print, print_num, println};
+use crate::tests::harness::verdict;
 use hk_syscall::{
     O_DIRECTORY, O_RDONLY, Timespec, sys_close, sys_execve, sys_exit, sys_fork, sys_kill,
     sys_nanosleep, sys_open, sys_pipe2, sys_prctl, sys_pread64, sys_read, sys_readlink,
@@ -24,17 +24,6 @@ pub fn run_tests() {
     test_maps_after_exec();
 }
 
-fn report(name: &[u8], ok: bool, v: i64) {
-    print(name);
-    if ok {
-        println(b":OK");
-    } else {
-        print(b":FAIL got ");
-        print_num(v);
-        println(b"");
-    }
-}
-
 /// Run `f` in a child; its exit code 0 is a pass, else the failed step
 fn in_child(name: &[u8], f: fn() -> u64) {
     let pid = sys_fork();
@@ -43,7 +32,7 @@ fn in_child(name: &[u8], f: fn() -> u64) {
     }
     let mut st = 0i32;
     sys_wait4(pid, &mut st, 0, 0);
-    report(name, st == 0, (st >> 8) as i64);
+    verdict(name, st == 0, (st >> 8) as i64);
 }
 
 /// "/proc/<pid>/<what>\0" in `buf`
@@ -106,7 +95,7 @@ fn test_root_reads_all() {
     sys_kill(child, SIGKILL);
     sys_wait4(child, core::ptr::null_mut(), 0, 0);
     let ok = maps >= 0 && exe > 0 && fd >= 0;
-    report(
+    verdict(
         b"PROC_ACCESS_ROOT",
         ok,
         if maps < 0 {
@@ -173,7 +162,7 @@ fn test_nondumpable() {
     sys_wait4(a, core::ptr::null_mut(), 0, 0);
     sys_close(p[0] as u64);
     sys_close(p[1] as u64);
-    report(b"PROC_ACCESS_NONDUMPABLE", st == 0, (st >> 8) as i64);
+    verdict(b"PROC_ACCESS_NONDUMPABLE", st == 0, (st >> 8) as i64);
 }
 
 #[repr(C, align(16))]
@@ -248,7 +237,7 @@ fn test_thread_nondumpable() {
     for fd in [p[0], p[1], q[0], q[1]] {
         sys_close(fd as u64);
     }
-    report(
+    verdict(
         b"PROC_ACCESS_THREAD_NONDUMPABLE",
         before == 0 && after == 1,
         (before * 10 + after) as i64,
@@ -288,7 +277,7 @@ fn test_suid_differs() {
     sys_wait4(a, core::ptr::null_mut(), 0, 0);
     sys_close(p[0] as u64);
     sys_close(p[1] as u64);
-    report(b"PROC_ACCESS_SUID_DIFFERS", st == 0, (st >> 8) as i64);
+    verdict(b"PROC_ACCESS_SUID_DIFFERS", st == 0, (st >> 8) as i64);
 }
 
 /// An open maps file keeps reading the address space it was opened on:
@@ -327,5 +316,5 @@ fn test_maps_after_exec() {
     // being torn down; hk keeps it alive and shows the old image
     const ESRCH: i64 = -3;
     let ok = fd >= 0 && n1 > 0 && (n2 == 0 || n2 == ESRCH || same) && (st >> 8) & 0xff == 123;
-    report(b"PROC_MAPS_AFTER_EXEC", ok, n2);
+    verdict(b"PROC_MAPS_AFTER_EXEC", ok, n2);
 }

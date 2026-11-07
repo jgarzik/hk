@@ -3,6 +3,7 @@
 //! out of kernel memory nor grow the kernel heap (hk reports it as
 //! meminfo Slab)
 
+use crate::tests::harness::verdict_detail;
 use crate::tests::helpers::{host_mode, print, print_num, println};
 use crate::tests::mm::mm_life::meminfo;
 use hk_syscall::{
@@ -56,17 +57,6 @@ fn mq_cycle() -> i64 {
     fd_cycle(fd)
 }
 
-fn report(name: &[u8], ok: bool, detail: i64) {
-    print(name);
-    if ok {
-        println(b":OK");
-    } else {
-        print(b":FAIL ");
-        print_num(detail);
-        println(b"");
-    }
-}
-
 /// One pipe, opened and closed; the errno on failure
 fn pipe_cycle() -> i64 {
     let mut fds = [0i32; 2];
@@ -101,9 +91,9 @@ fn leak(name: &[u8], n: u32, f: fn() -> i64) {
         }
     }
     if host_mode() {
-        report(name, true, 0);
+        verdict_detail(name, true, 0);
         return;
     }
     let grew = meminfo(b"Slab:") - before;
-    report(name, before >= 0 && grew <= 64, grew);
+    verdict_detail(name, before >= 0 && grew <= 64, grew);
 }

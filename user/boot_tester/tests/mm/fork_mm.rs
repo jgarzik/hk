@@ -83,6 +83,7 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use crate::tests::harness::report_code;
 use crate::tests::helpers::{host_mode, print, print_num, println};
 use crate::tests::mm::mm_life::meminfo;
 use hk_syscall::{
@@ -133,17 +134,6 @@ pub fn run_tests() {
     shm_rdonly_perm();
     shm_attach_addr();
     shm_stress();
-}
-
-fn report(name: &[u8], code: i64) {
-    print(name);
-    if code == 0 {
-        println(b":OK");
-    } else {
-        print(b":FAIL ");
-        print_num(code);
-        println(b"");
-    }
 }
 
 fn map(len: u64, flags: u32) -> u64 {
@@ -243,10 +233,10 @@ fn make_rw(a: u64) {
 fn one_page(name: &[u8], flags: u32, f: fn(u64) -> i64) {
     let p = map(PAGE, flags);
     if p == 0 {
-        report(name, -1);
+        report_code(name, -1);
         return;
     }
-    report(name, f(p));
+    report_code(name, f(p));
     sys_munmap(p, PAGE);
 }
 
@@ -259,10 +249,10 @@ fn shared_anon() {
 fn shared_anon_late() {
     let p = map(2 * PAGE, MAP_SHARED);
     if p == 0 {
-        report(b"FORK_SHARED_ANON_LATE", -1);
+        report_code(b"FORK_SHARED_ANON_LATE", -1);
         return;
     }
-    report(b"FORK_SHARED_ANON_LATE", shared_late(p));
+    report_code(b"FORK_SHARED_ANON_LATE", shared_late(p));
     sys_munmap(p, 2 * PAGE);
 }
 
@@ -318,36 +308,36 @@ fn unmap_file(fd: i32, p: u64, len: u64) {
 fn file_shared() {
     match map_file(2 * PAGE as i64, 2 * PAGE) {
         Some((fd, p)) => {
-            report(b"FILE_SHARED_FORK", shared_late(p));
+            report_code(b"FILE_SHARED_FORK", shared_late(p));
             unmap_file(fd, p, 2 * PAGE);
         }
-        None => report(b"FILE_SHARED_FORK", -1),
+        None => report_code(b"FILE_SHARED_FORK", -1),
     }
     match map_file(2 * PAGE as i64, 2 * PAGE) {
         Some((fd, p)) => {
-            report(b"FILE_SHARED_COHERENT", file_coherent(fd, p));
+            report_code(b"FILE_SHARED_COHERENT", file_coherent(fd, p));
             unmap_file(fd, p, 2 * PAGE);
         }
-        None => report(b"FILE_SHARED_COHERENT", -1),
+        None => report_code(b"FILE_SHARED_COHERENT", -1),
     }
-    report(b"FILE_PRIVATE_RDONLY", file_private_rdonly());
+    report_code(b"FILE_PRIVATE_RDONLY", file_private_rdonly());
     match map_file(100, 2 * PAGE) {
         Some((fd, p)) => {
-            report(b"FILE_SHARED_EOF", file_eof(p));
+            report_code(b"FILE_SHARED_EOF", file_eof(p));
             unmap_file(fd, p, 2 * PAGE);
         }
-        None => report(b"FILE_SHARED_EOF", -1),
+        None => report_code(b"FILE_SHARED_EOF", -1),
     }
     match map_file(2 * PAGE as i64, 2 * PAGE) {
         Some((fd, p)) => {
-            report(b"TRUNC_SHARED_SIGBUS", trunc_shared(fd, p));
+            report_code(b"TRUNC_SHARED_SIGBUS", trunc_shared(fd, p));
             unmap_file(fd, p, 2 * PAGE);
         }
-        None => report(b"TRUNC_SHARED_SIGBUS", -1),
+        None => report_code(b"TRUNC_SHARED_SIGBUS", -1),
     }
-    report(b"PRIVATE_SEES_WRITE", private_sees_write());
-    report(b"PRIVATE_EOF_SIGBUS", private_eof());
-    report(b"TRUNC_PRIVATE_COW", trunc_private());
+    report_code(b"PRIVATE_SEES_WRITE", private_sees_write());
+    report_code(b"PRIVATE_EOF_SIGBUS", private_eof());
+    report_code(b"TRUNC_PRIVATE_COW", trunc_private());
 }
 
 /// A file of `size` bytes mapped MAP_PRIVATE over `len`: (fd, address)
@@ -592,12 +582,12 @@ fn shmem_remove_past_size() {
     let p = map(PAGE, MAP_SHARED);
     let q = sys_mremap(p, PAGE, 1100 * PAGE, MREMAP_MAYMOVE, 0);
     if p == 0 || q < 0 {
-        report(NAME, -1);
+        report_code(NAME, -1);
         return;
     }
     let q = q as u64;
     let r = sys_madvise(q + 1024 * PAGE, PAGE, MADV_REMOVE);
-    report(NAME, if r == 0 { 0 } else { 1000 - r });
+    report_code(NAME, if r == 0 { 0 } else { 1000 - r });
     sys_munmap(q, 1100 * PAGE);
 }
 
@@ -605,13 +595,13 @@ fn shmem_beyond_size() {
     const NAME: &[u8] = b"SHMEM_BEYOND_SIZE";
     let p = map(PAGE, MAP_SHARED);
     if p == 0 {
-        report(NAME, -1);
+        report_code(NAME, -1);
         return;
     }
     put(p, BEFORE);
     let q = sys_mremap(p, PAGE, 2 * PAGE, MREMAP_MAYMOVE, 0);
     if q < 0 {
-        report(NAME, -2);
+        report_code(NAME, -2);
         return;
     }
     let q = q as u64;
@@ -625,7 +615,7 @@ fn shmem_beyond_size() {
     if code == 0 && r != 0x100 + SIGBUS {
         code = 10 + r;
     }
-    report(NAME, code);
+    report_code(NAME, code);
     sys_munmap(q, 2 * PAGE);
 }
 
@@ -746,7 +736,7 @@ fn remote_write_perm() {
     sys_close(rel);
     let r2 = reap(pid);
     sys_munmap(p, PAGE);
-    report(
+    report_code(
         b"REMOTE_WRITE_PERM",
         if r == 0 && r2 == 0 { 0 } else { r * 100 + r2 },
     );
@@ -761,7 +751,7 @@ fn remote_write_perm() {
     sys_close(rel);
     let r2 = reap(pid);
     sys_munmap(p, PAGE);
-    report(
+    report_code(
         b"REMOTE_WRITE_RDONLY",
         if n == -14 && r2 == 0 { 0 } else { 1000 - n },
     );
@@ -845,7 +835,7 @@ fn remote_bounds() {
     if code == 0 && (r != 0 || r2 != 0) {
         code = 100 + r * 10 + r2;
     }
-    report(b"REMOTE_ACCESS_BOUNDS", code);
+    report_code(b"REMOTE_ACCESS_BOUNDS", code);
 }
 
 fn dontfork() {
@@ -903,7 +893,7 @@ fn thp() {
     const NAME: &[u8] = b"FORK_THP";
     let p = map(2 * HUGE, MAP_PRIVATE);
     if p == 0 {
-        report(NAME, -1);
+        report_code(NAME, -1);
         return;
     }
     let base = (p + HUGE - 1) & !(HUGE - 1);
@@ -931,7 +921,7 @@ fn thp() {
     {
         code = 4;
     }
-    report(NAME, code);
+    report_code(NAME, code);
     sys_munmap(p, 2 * HUGE);
 }
 
@@ -947,7 +937,7 @@ fn shm_nattch_fork() {
     let id = sys_shmget(IPC_PRIVATE, PAGE as usize, IPC_CREAT | 0o600) as i32;
     let a = sys_shmat(id, 0, 0);
     if id < 0 || a < 0 {
-        report(NAME, -1);
+        report_code(NAME, -1);
         return;
     }
     let a = a as u64;
@@ -988,7 +978,7 @@ fn shm_nattch_fork() {
     for fd in [to_child, from_parent, to_parent, from_child] {
         sys_close(fd);
     }
-    report(NAME, code);
+    report_code(NAME, code);
 }
 
 /// Let exited tasks' CPUs switch away
@@ -1049,7 +1039,7 @@ fn shm_rmid_exit() {
     }
     sys_close(to_parent);
     sys_close(from_child);
-    report(NAME, code);
+    report_code(NAME, code);
 }
 
 /// One stress worker: 20 rounds of forking a grandchild that touches
@@ -1085,7 +1075,7 @@ fn shm_stress() {
     let id = sys_shmget(IPC_PRIVATE, SIZE as usize, IPC_CREAT | 0o600) as i32;
     let a = sys_shmat(id, 0, 0);
     if id < 0 || a < 0 {
-        report(NAME, -1);
+        report_code(NAME, -1);
         return;
     }
     let a = a as u64;
@@ -1131,7 +1121,7 @@ fn shm_stress() {
         println(b" kB");
         code = 4;
     }
-    report(NAME, code);
+    report_code(NAME, code);
 }
 
 fn shm_rdonly_perm() {
@@ -1141,7 +1131,7 @@ fn shm_rdonly_perm() {
     let id = sys_shmget(IPC_PRIVATE, PAGE as usize, IPC_CREAT | 0o600) as i32;
     let a = sys_shmat(id, 0, SHM_RDONLY);
     if id < 0 || a < 0 {
-        report(b"SHM_RDONLY_PERM", -1);
+        report_code(b"SHM_RDONLY_PERM", -1);
         return;
     }
     let a = a as u64;
@@ -1162,14 +1152,14 @@ fn shm_rdonly_perm() {
         code = 3000 - r;
     }
     sys_munmap(p, PAGE);
-    report(b"SHM_RDONLY_PERM", code);
+    report_code(b"SHM_RDONLY_PERM", code);
 }
 
 fn shm_attach_addr() {
     const SHM_REMAP: i32 = 0o40000;
     let id = sys_shmget(IPC_PRIVATE, PAGE as usize, IPC_CREAT | 0o600) as i32;
     if id < 0 {
-        report(b"SHM_ATTACH_ADDR", -1);
+        report_code(b"SHM_ATTACH_ADDR", -1);
         return;
     }
     #[cfg(target_arch = "x86_64")]
@@ -1190,7 +1180,7 @@ fn shm_attach_addr() {
         code = 3000 - r;
     }
     sys_shmctl(id, IPC_RMID, 0);
-    report(b"SHM_ATTACH_ADDR", code);
+    report_code(b"SHM_ATTACH_ADDR", code);
 }
 
 // ---------------------------------------------------------------------
@@ -1362,7 +1352,7 @@ fn cow_race() {
     const NAME: &[u8] = b"FORK_COW_RACE";
     let base = map(RACE_PAGES * PAGE, MAP_PRIVATE);
     if base == 0 {
-        report(NAME, -1);
+        report_code(NAME, -1);
         return;
     }
     for pg in 0..RACE_PAGES {
@@ -1404,7 +1394,7 @@ fn cow_race() {
             code = -3;
         }
     }
-    report(NAME, code);
+    report_code(NAME, code);
     sys_munmap(base, RACE_PAGES * PAGE);
 }
 
@@ -1416,7 +1406,7 @@ fn zero_shared_fork() {
     let p = sys_mmap(0, PAGE, RW, MAP_SHARED, fd, 0);
     sys_close(fd as u64);
     if p < 0 {
-        report(NAME, -1);
+        report_code(NAME, -1);
         return;
     }
     let p = p as u64;
@@ -1436,7 +1426,7 @@ fn zero_shared_fork() {
         0
     };
     sys_munmap(p, PAGE);
-    report(NAME, code);
+    report_code(NAME, code);
 }
 
 // ---------------------------------------------------------------------
@@ -1498,7 +1488,7 @@ fn trunc_round(fd: i32, p: u64, round: u64, pipe: [i32; 2]) -> i64 {
 fn trunc_fork_race() {
     const NAME: &[u8] = b"TRUNC_FORK_RACE";
     let Some((fd, p)) = map_file(2 * PAGE as i64, 2 * PAGE) else {
-        report(NAME, -1);
+        report_code(NAME, -1);
         return;
     };
     let mut pipe = [0i32; 2];
@@ -1527,7 +1517,7 @@ fn trunc_fork_race() {
     sys_close(pipe[0] as u64);
     sys_close(pipe[1] as u64);
     unmap_file(fd, p, 2 * PAGE);
-    report(NAME, code);
+    report_code(NAME, code);
 }
 
 /// One round: map the grown file, fault the second page in, then move
@@ -1573,14 +1563,14 @@ fn mremap_trunc_round(fd: i32, round: u64, dst: u64) -> i64 {
 fn mremap_trunc_race() {
     const NAME: &[u8] = b"MREMAP_TRUNC_RACE";
     let Some((fd, p)) = map_file(2 * PAGE as i64, 2 * PAGE) else {
-        report(NAME, -1);
+        report_code(NAME, -1);
         return;
     };
     sys_munmap(p, 2 * PAGE);
     // A fixed destination: a range mapped and released
     let dst = sys_mmap(0, 2 * PAGE, RW, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if dst < 0 {
-        report(NAME, -1);
+        report_code(NAME, -1);
         return;
     }
     let dst = dst as u64;
@@ -1606,7 +1596,7 @@ fn mremap_trunc_race() {
         code = -3;
     }
     unmap_file(fd, 0, 0);
-    report(NAME, code);
+    report_code(NAME, code);
 }
 
 // ---------------------------------------------------------------------
@@ -1648,7 +1638,7 @@ fn mprotect_race() {
     const NAME: &[u8] = b"FAULT_MPROTECT_RACE";
     let base = map(MP_PAGES * PAGE, MAP_PRIVATE);
     if base == 0 {
-        report(NAME, -1);
+        report_code(NAME, -1);
         return;
     }
     RACE_BASE.store(base, Ordering::Relaxed);
@@ -1680,6 +1670,6 @@ fn mprotect_race() {
     if !join(ctid) && code == 0 {
         code = -3;
     }
-    report(NAME, code);
+    report_code(NAME, code);
     sys_munmap(base, MP_PAGES * PAGE);
 }

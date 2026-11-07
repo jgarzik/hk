@@ -5,7 +5,7 @@
 //!   a small source (a short count), listxattr with a 1 GiB buffer (the
 //!   list's size or an error)
 
-use crate::tests::net::sk::T;
+use crate::tests::harness::T;
 use hk_syscall::{
     IoVec, MAP_ANONYMOUS, MAP_PRIVATE, PROT_READ, PROT_WRITE, sys_getpid, sys_listxattr, sys_mmap,
     sys_munmap, sys_process_vm_readv,

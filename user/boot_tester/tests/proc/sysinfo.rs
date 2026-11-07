@@ -13,8 +13,8 @@
 //! - settimeofday() - set time
 //! - settimeofday() EINVAL - invalid usec
 
+use crate::tests::harness::T;
 use crate::tests::helpers::{host_mode, print, print_cstr, print_num, println, starts_with};
-use crate::tests::net::sk::T;
 use hk_syscall::{
     Timespec, UtsName, sys_clock_gettime, sys_clock_settime, sys_sched_getaffinity,
     sys_sched_setaffinity, sys_setdomainname, sys_sethostname, sys_times, sys_uname,

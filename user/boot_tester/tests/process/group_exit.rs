@@ -8,11 +8,12 @@
 //! shared descriptor table): EOF on it after the reap shows that none
 //! is left.
 
-use crate::tests::helpers::{print, print_num, println};
+use crate::tests::harness::verdict;
+use crate::tests::helpers::sleep_ms;
 use crate::tests::mm::fork_mm::spawn_thread;
 use hk_syscall::{
-    Timespec, sys_close, sys_execve, sys_exit, sys_exit_group, sys_fork, sys_kill, sys_nanosleep,
-    sys_pipe2, sys_read, sys_tgkill, sys_wait4, sys_write,
+    sys_close, sys_execve, sys_exit, sys_exit_group, sys_fork, sys_kill, sys_pipe2, sys_read,
+    sys_tgkill, sys_wait4, sys_write,
 };
 
 const SIGKILL: u32 = 9;
@@ -31,25 +32,6 @@ pub fn run_tests() {
     test_exec_thread();
     test_exec_traced_sibling();
     test_notify_once();
-}
-
-fn report(name: &[u8], ok: bool, v: i64) {
-    print(name);
-    if ok {
-        println(b":OK");
-    } else {
-        print(b":FAIL got ");
-        print_num(v);
-        println(b"");
-    }
-}
-
-fn sleep_ms(ms: i64) {
-    let ts = Timespec {
-        tv_sec: ms / 1000,
-        tv_nsec: (ms % 1000) * 1_000_000,
-    };
-    sys_nanosleep(&ts, core::ptr::null_mut());
 }
 
 #[repr(C, align(16))]
@@ -162,7 +144,7 @@ fn test_exit_group() {
     }
     parent_side(&p);
     let (st, gone) = reap(pid, &p);
-    report(
+    verdict(
         b"GROUP_EXIT_ALL_THREADS",
         st == Some(7 << 8) && gone,
         st.unwrap_or(-1) as i64 * if gone { 1 } else { -1 },
@@ -182,7 +164,7 @@ fn test_fatal_signal() {
     sleep_ms(50);
     sys_tgkill(pid, tids[1], SIGTERM);
     let (st, gone) = reap(pid, &p);
-    report(
+    verdict(
         b"GROUP_FATAL_SIGNAL",
         st == Some(SIGTERM as i32) && gone,
         st.unwrap_or(-1) as i64 * if gone { 1 } else { -1 },
@@ -213,7 +195,7 @@ fn test_leader_delay() {
     let early = sys_wait4(pid, &mut st, WNOHANG, 0);
     sys_write(p.block[1] as u64, b"x".as_ptr(), 1);
     let (st, gone) = reap(pid, &p);
-    report(
+    verdict(
         b"GROUP_LEADER_DELAY",
         early == 0 && st == Some(9 << 8) && gone,
         if early != 0 {
@@ -238,7 +220,7 @@ fn test_kill_zombie_leader() {
     sleep_ms(100);
     sys_kill(pid, SIGKILL);
     let (st, gone) = reap(pid, &p);
-    report(
+    verdict(
         b"GROUP_KILL_ZOMBIE_LEADER",
         st == Some(SIGKILL as i32) && gone,
         st.unwrap_or(-1) as i64 * if gone { 1 } else { -1 },
@@ -269,8 +251,8 @@ fn test_kill_dead_group() {
         let w = sys_wait4(pid, &mut st, 0, 0);
         got[i] = if k != 0 || w != pid { -1 } else { st as i64 };
     }
-    report(b"GROUP_LAST_THREAD_STATUS", got[0] == 5 << 8, got[0]);
-    report(b"GROUP_KILL_DEAD_STATUS", got[1] == 5 << 8, got[1]);
+    verdict(b"GROUP_LAST_THREAD_STATUS", got[0] == 5 << 8, got[0]);
+    verdict(b"GROUP_KILL_DEAD_STATUS", got[1] == 5 << 8, got[1]);
 }
 
 /// exec `busybox sh -c "exit <code>"`
@@ -297,7 +279,7 @@ fn test_exec_leader() {
     }
     parent_side(&p);
     let (st, gone) = reap(pid, &p);
-    report(
+    verdict(
         b"GROUP_EXEC_LEADER",
         st == Some(3 << 8) && gone,
         st.unwrap_or(-1) as i64 * if gone { 1 } else { -1 },
@@ -319,7 +301,7 @@ fn test_exec_thread() {
     }
     parent_side(&p);
     let (st, gone) = reap(pid, &p);
-    report(
+    verdict(
         b"GROUP_EXEC_THREAD",
         st == Some(5 << 8) && gone,
         st.unwrap_or(-1) as i64 * if gone { 1 } else { -1 },
@@ -386,7 +368,7 @@ fn test_exec_traced_sibling() {
     } else {
         st.unwrap_or(-1) as i64
     };
-    report(b"GROUP_EXEC_TRACED_SIBLING", ok, v);
+    verdict(b"GROUP_EXEC_TRACED_SIBLING", ok, v);
 }
 
 /// 100 times: a child (exit signal SIGRTMIN+6, which queues every
@@ -430,5 +412,5 @@ fn test_notify_once() {
         }
     }
     hk_syscall::sys_rt_sigprocmask(2, &old as *const u64 as u64, 0, 8);
-    report(b"GROUP_NOTIFY_ONCE", bad.0 == 0, bad.1);
+    verdict(b"GROUP_NOTIFY_ONCE", bad.0 == 0, bad.1);
 }

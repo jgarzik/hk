@@ -9,15 +9,16 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use crate::tests::helpers::{print, print_num, println};
+use crate::tests::harness::verdict;
+use crate::tests::helpers::sleep_ms;
 use crate::tests::mm::fork_mm::{join, spawn_thread};
 use hk_syscall::{
     CLOCK_MONOTONIC, IoVec, MADV_DONTNEED, MAP_ANONYMOUS, MAP_PRIVATE, O_CREAT, O_RDONLY, O_RDWR,
     O_TRUNC, PROT_EXEC, PROT_READ, PROT_WRITE, SA_RESTART, SA_RESTORER, Timespec,
     sys_clock_gettime, sys_close, sys_exit, sys_fork, sys_getpid, sys_kill, sys_madvise, sys_mmap,
-    sys_mprotect, sys_munmap, sys_nanosleep, sys_open, sys_pipe2, sys_pread64,
-    sys_process_vm_writev, sys_pwrite64, sys_read, sys_rt_sigaction, sys_sched_yield, sys_tgkill,
-    sys_times, sys_unlink, sys_wait4, sys_write,
+    sys_mprotect, sys_munmap, sys_open, sys_pipe2, sys_pread64, sys_process_vm_writev,
+    sys_pwrite64, sys_read, sys_rt_sigaction, sys_sched_yield, sys_tgkill, sys_times, sys_unlink,
+    sys_wait4, sys_write,
 };
 
 const PAGE: u64 = 4096;
@@ -36,17 +37,6 @@ pub fn run_tests() {
     test_remote_cow_race();
     test_regs_survive();
     test_thp_zap_split();
-}
-
-fn report(name: &[u8], ok: bool, v: i64) {
-    print(name);
-    if ok {
-        println(b":OK");
-    } else {
-        print(b":FAIL got ");
-        print_num(v);
-        println(b"");
-    }
 }
 
 fn map(len: u64, prot: u32) -> u64 {
@@ -76,14 +66,6 @@ fn mono_ms() -> i64 {
     };
     sys_clock_gettime(CLOCK_MONOTONIC, &mut ts);
     ts.tv_sec * 1000 + ts.tv_nsec / 1_000_000
-}
-
-fn sleep_ms(ms: i64) {
-    let ts = Timespec {
-        tv_sec: ms / 1000,
-        tv_nsec: (ms % 1000) * 1_000_000,
-    };
-    sys_nanosleep(&ts, core::ptr::null_mut());
 }
 
 /// One thread's stack
@@ -116,7 +98,7 @@ fn test_ticks_long_syscall() {
     let buf = map(LEN, RW);
     let fd = sys_open(b"/dev/zero\0".as_ptr(), O_RDONLY, 0);
     if buf == 0 || fd < 0 {
-        report(b"IRQ_TICKS_LONG_SYSCALL", false, fd);
+        verdict(b"IRQ_TICKS_LONG_SYSCALL", false, fd);
         return;
     }
     for i in (0..LEN).step_by(PAGE as usize) {
@@ -139,7 +121,7 @@ fn test_ticks_long_syscall() {
     // Each end may be a tick (10 ms) off, and an emulator's timer may
     // drift from its TSC; lost ticks would leave about one per syscall
     let ok = ticks_ms * 2 + 30 >= mono;
-    report(b"IRQ_TICKS_LONG_SYSCALL", ok, ticks_ms - mono);
+    verdict(b"IRQ_TICKS_LONG_SYSCALL", ok, ticks_ms - mono);
 }
 
 // ---------------------------------------------------------------------
@@ -219,7 +201,7 @@ fn test_fault_storm() {
     if ok {
         sys_munmap(base, STORM_PAGES * PAGE);
     }
-    report(b"MM_FAULT_STORM", ok && bad == 0, bad as i64);
+    verdict(b"MM_FAULT_STORM", ok && bad == 0, bad as i64);
 }
 
 // ---------------------------------------------------------------------
@@ -263,7 +245,7 @@ fn test_shootdown_blocked_reader() {
     sys_wait4(pid, &mut st, 0, 0);
     // The reader died with the process (SIGSEGV kills the group)
     sys_close(p[1] as u64);
-    report(
+    verdict(
         b"TLB_SHOOTDOWN_BLOCKED_READER",
         st & 0x7f == SIGSEGV,
         st as i64,
@@ -345,7 +327,7 @@ fn test_kill_mmap_storm() {
         // Still alive: reap it anyway so the suite goes on
         sys_wait4(pid, &mut st, 0, 0);
     }
-    report(
+    verdict(
         b"MMLOCK_KILL",
         started && r == pid && st & 0x7f == SIGKILL as i32,
         st as i64,
@@ -378,7 +360,7 @@ extern "C" fn cow_dropper(_: u64) -> ! {
 fn test_remote_cow_race() {
     let fd = sys_open(COW_FILE.as_ptr(), O_CREAT | O_RDWR | O_TRUNC, 0o644);
     if fd < 0 {
-        report(b"MM_REMOTE_COW_RACE", false, fd);
+        verdict(b"MM_REMOTE_COW_RACE", false, fd);
         return;
     }
     let data = [b'A'; PAGE as usize];
@@ -396,7 +378,7 @@ fn test_remote_cow_race() {
     sys_close(fd as u64);
     sys_unlink(COW_FILE.as_ptr());
     let same = n == PAGE as i64 && back.iter().all(|&c| c == b'A');
-    report(b"MM_REMOTE_COW_RACE", st == 0 && same, (st >> 8) as i64);
+    verdict(b"MM_REMOTE_COW_RACE", st == 0 && same, (st >> 8) as i64);
 }
 
 fn cow_race_child() -> u64 {
@@ -748,7 +730,7 @@ fn test_regs_survive() {
     sys_rt_sigaction(SIGUSR1, old.as_ptr() as u64, 0, 8);
     let bad = REG_BAD.load(Ordering::Relaxed);
     let sigs = SIGNALS.load(Ordering::Relaxed);
-    report(
+    verdict(
         b"REGS_SURVIVE_SYSCALLS",
         ok && bad == 0 && sigs > 0,
         (bad * 100 + sigs.min(99)) as i64 * if ok { 1 } else { -1 },
@@ -830,5 +812,5 @@ fn test_thp_zap_split() {
     }
     THP_STOP.store(1, Ordering::Relaxed);
     ok &= wait_thread(0);
-    report(b"MM_THP_ZAP_SPLIT", ok && bad == 0, bad as i64);
+    verdict(b"MM_THP_ZAP_SPLIT", ok && bad == 0, bad as i64);
 }

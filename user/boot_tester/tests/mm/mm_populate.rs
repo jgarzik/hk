@@ -12,6 +12,7 @@
 //!   (timed against a full mlock of the same size; skipped when that
 //!   takes under 100 ms)
 
+use crate::tests::harness::verdict;
 use crate::tests::helpers::{print, print_num, println, skip};
 use crate::tests::mm::mm_life::meminfo;
 use crate::tests::net::sk::now_ms;
@@ -32,23 +33,12 @@ pub fn run_tests() {
     killable();
 }
 
-fn report(name: &[u8], ok: bool, v: i64) {
-    print(name);
-    if ok {
-        println(b":OK");
-    } else {
-        print(b":FAIL got ");
-        print_num(v);
-        println(b"");
-    }
-}
-
 fn beyond_eof() {
     let path = b"/mlock_eof\0";
     let fd = sys_open(path.as_ptr(), O_CREAT | O_RDWR, 0o600);
     if fd < 0 || sys_ftruncate(fd as i32, PAGE as i64) != 0 {
         sys_close(fd as u64);
-        return report(b"MLOCK_BEYOND_EOF", false, -1);
+        return verdict(b"MLOCK_BEYOND_EOF", false, -1);
     }
     let len = 16 * PAGE;
     let p = sys_mmap(0, len, PROT_READ, MAP_SHARED, fd as i32, 0);
@@ -63,7 +53,7 @@ fn beyond_eof() {
     }
     sys_close(fd as u64);
     sys_unlink(path.as_ptr());
-    report(
+    verdict(
         b"MLOCK_BEYOND_EOF",
         lock == ENOMEM && q >= 0,
         if lock != ENOMEM { lock } else { 1000 + q },
@@ -88,7 +78,7 @@ fn killable() {
     let name = b"MLOCK_KILLABLE";
     let free_kb = meminfo(b"MemFree:");
     if free_kb <= 0 {
-        return report(name, false, -1);
+        return verdict(name, false, -1);
     }
     let len = ((free_kb as u64 * 1024 / 2).min(1 << 30)) & !(PAGE - 1);
     let mut p = [0i32; 2];
@@ -106,7 +96,7 @@ fn killable() {
     if n != 8 || st != 0 {
         sys_close(p[0] as u64);
         sys_close(p[1] as u64);
-        return report(name, false, -2 - st as i64);
+        return verdict(name, false, -2 - st as i64);
     }
     if full < 100 {
         sys_close(p[0] as u64);
@@ -136,7 +126,7 @@ fn killable() {
         print(b", kill to reap ms ");
         print_num(took);
         println(b"");
-        return report(name, false, st as i64);
+        return verdict(name, false, st as i64);
     }
-    report(name, true, 0)
+    verdict(name, true, 0)
 }

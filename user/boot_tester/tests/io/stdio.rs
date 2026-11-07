@@ -2,7 +2,7 @@
 //! starts with /dev/console on 0/1/2 (console_on_rootfs); dup2/close
 //! on 0/1/2 behave like on any other descriptor
 
-use crate::tests::helpers::{print, print_num, println};
+use crate::tests::harness::verdict;
 use hk_syscall::{
     Stat, sys_close, sys_dup3, sys_exit, sys_fork, sys_fstat, sys_getpid, sys_pipe, sys_read,
     sys_wait4, sys_write,
@@ -17,17 +17,6 @@ pub fn run_tests() {
     test_stdout_pipe();
     test_stdin_pipe();
     test_close_stdout();
-}
-
-fn verdict(name: &[u8], ok: bool, got: i64) {
-    print(name);
-    if ok {
-        println(b":OK");
-    } else {
-        print(b":FAIL got ");
-        print_num(got);
-        println(b"");
-    }
 }
 
 /// Run `f` in a child and report its exit status (0 = pass)

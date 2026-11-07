@@ -18,14 +18,16 @@
 //!   Linux's tw_sock slab varies with its other caches, so there only
 //!   the entries are checked)
 
+use crate::tests::harness::verdict_detail;
+use crate::tests::helpers::sleep_ms;
 use crate::tests::helpers::{host_mode, print, print_num, println};
 use crate::tests::mm::mm_life::{SI_TOTALRAM, meminfo, sysinfo_ram};
 use crate::tests::net::sk::{bind, close, connect, now_ms, port, tcp};
 use crate::tests::net::tcp_xfer::accept;
 use crate::tests::proc::sysctl::{read_file, write_file};
 use hk_syscall::{
-    MAP_ANONYMOUS, MAP_PRIVATE, O_RDONLY, PROT_READ, PROT_WRITE, Timespec, sys_bind, sys_close,
-    sys_exit, sys_fork, sys_listen, sys_mmap, sys_nanosleep, sys_open, sys_read, sys_wait4,
+    MAP_ANONYMOUS, MAP_PRIVATE, O_RDONLY, PROT_READ, PROT_WRITE, sys_bind, sys_close, sys_exit,
+    sys_fork, sys_listen, sys_mmap, sys_open, sys_read, sys_wait4,
 };
 
 const MB: i64 = 1024;
@@ -36,25 +38,6 @@ pub fn run_tests() {
     mem_total();
     touch_free();
     slab_time_wait();
-}
-
-fn report(name: &[u8], ok: bool, detail: i64) {
-    print(name);
-    if ok {
-        println(b":OK");
-    } else {
-        print(b":FAIL ");
-        print_num(detail);
-        println(b"");
-    }
-}
-
-fn sleep_ms(ms: i64) {
-    let ts = Timespec {
-        tv_sec: ms / 1000,
-        tv_nsec: (ms % 1000) * 1_000_000,
-    };
-    sys_nanosleep(&ts, core::ptr::null_mut());
 }
 
 fn mem_total() {
@@ -77,7 +60,7 @@ fn mem_total() {
         print(b"MEM_TOTAL: ");
         println(why);
     }
-    report(b"MEM_TOTAL", why.is_empty(), t);
+    verdict_detail(b"MEM_TOTAL", why.is_empty(), t);
 }
 
 /// Child: touch TOUCH bytes; exit 0 if MemFree dropped by at least 90%
@@ -151,7 +134,7 @@ fn touch_free() {
         print_num(after);
         println(b" kB");
     }
-    report(
+    verdict_detail(
         b"MEM_TOUCH_FREE",
         st == 0 && before - after <= slack,
         st as i64,
@@ -258,7 +241,7 @@ fn slab_time_wait() {
             batch[(i / 100) as usize] = now_ms();
         }
         if !cycle(l, p, BASE + i as u16) {
-            report(b"MEM_SLAB_TIME_WAIT", false, -1000 - i);
+            verdict_detail(b"MEM_SLAB_TIME_WAIT", false, -1000 - i);
             close(l);
             return;
         }
@@ -276,12 +259,12 @@ fn slab_time_wait() {
     print_num(grew);
     println(b" kB");
     if tw < live {
-        report(b"MEM_SLAB_TIME_WAIT", false, tw);
+        verdict_detail(b"MEM_SLAB_TIME_WAIT", false, tw);
         return;
     }
     if host_mode() {
-        report(b"MEM_SLAB_TIME_WAIT", true, 0);
+        verdict_detail(b"MEM_SLAB_TIME_WAIT", true, 0);
         return;
     }
-    report(b"MEM_SLAB_TIME_WAIT", grew * 1024 <= N * 1024, grew);
+    verdict_detail(b"MEM_SLAB_TIME_WAIT", grew * 1024 <= N * 1024, grew);
 }

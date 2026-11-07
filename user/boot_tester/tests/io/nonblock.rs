@@ -8,11 +8,13 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use hk_syscall::{
     AF_INET, O_NONBLOCK, SA_RESTART, SA_RESTORER, SHUT_WR, SIG_DFL, SIG_IGN, SIGPIPE, SIGUSR1,
-    SOCK_CLOEXEC, SOCK_DGRAM, SOCK_NONBLOCK, SOCK_STREAM, Timespec, sys_accept, sys_accept4,
-    sys_exit, sys_fcntl, sys_fork, sys_getppid, sys_ioctl, sys_kill, sys_listen, sys_nanosleep,
-    sys_rt_sigaction, sys_setsockopt, sys_shutdown, sys_socket, sys_wait4,
+    SOCK_CLOEXEC, SOCK_DGRAM, SOCK_NONBLOCK, SOCK_STREAM, sys_accept, sys_accept4, sys_exit,
+    sys_fcntl, sys_fork, sys_getppid, sys_ioctl, sys_kill, sys_listen, sys_rt_sigaction,
+    sys_setsockopt, sys_shutdown, sys_socket, sys_wait4,
 };
 
+use crate::tests::harness::T;
+use crate::tests::helpers::msleep;
 use crate::tests::net::sk::*;
 
 const F_GETFD: i32 = 1;
@@ -38,14 +40,6 @@ pub fn run_tests() {
     test_tcp_recv_flags();
     test_tcp_rdhup();
     test_tcp_nb_connect();
-}
-
-fn msleep(ms: u64) {
-    let ts = Timespec {
-        tv_sec: (ms / 1000) as i64,
-        tv_nsec: ((ms % 1000) * 1_000_000) as i64,
-    };
-    sys_nanosleep(&ts, core::ptr::null_mut());
 }
 
 /// fcntl(O_NONBLOCK) on and off takes effect on the next call

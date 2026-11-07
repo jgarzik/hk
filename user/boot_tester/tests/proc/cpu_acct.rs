@@ -16,7 +16,7 @@
 //!   rusage, getrusage(RUSAGE_CHILDREN), times()'s tms_cutime/cstime and
 //!   /proc/self/stat's cutime/cstime
 
-use crate::tests::helpers::{print, print_num, println};
+use crate::tests::harness::verdict;
 use crate::tests::mm::fork_mm::{join, spawn_thread};
 use core::sync::atomic::{AtomicU32, Ordering};
 use hk_syscall::{Timespec, Timeval, sys_clock_gettime, sys_getrusage, sys_nanosleep};
@@ -75,7 +75,7 @@ fn exited() {
         spawn_thread(top, burn_and_exit, 0, ctid) > 0 && join(ctid)
     };
     let grew = own_cpu_ms(true) - before;
-    report(b"CPU_ACCT_EXITED", ok && grew >= 180, grew);
+    verdict(b"CPU_ACCT_EXITED", ok && grew >= 180, grew);
 }
 
 fn ms_of(t: &Timeval) -> i64 {
@@ -150,18 +150,7 @@ fn children() {
     } else {
         0
     };
-    report(b"CPU_ACCT_CHILDREN", step == 0, step * 100_000 + waited);
-}
-
-fn report(name: &[u8], ok: bool, v: i64) {
-    print(name);
-    if ok {
-        println(b":OK");
-    } else {
-        print(b":FAIL got ");
-        print_num(v);
-        println(b"");
-    }
+    verdict(b"CPU_ACCT_CHILDREN", step == 0, step * 100_000 + waited);
 }
 
 fn nap(ms: i64) {
@@ -184,7 +173,7 @@ fn sleep() {
     let before = stime_ms();
     nap(300);
     let grew = stime_ms() - before;
-    report(b"CPU_ACCT_SLEEP", grew < 100, grew);
+    verdict(b"CPU_ACCT_SLEEP", grew < 100, grew);
 }
 
 /// User time so far, in ms
@@ -207,7 +196,7 @@ fn user() {
         }
     }
     let du = utime_ms() - u0;
-    report(b"CPU_ACCT_USER", du >= 100, du);
+    verdict(b"CPU_ACCT_USER", du >= 100, du);
 }
 
 static STOP: AtomicU32 = AtomicU32::new(0);
@@ -248,12 +237,12 @@ fn spinner() {
         spawn_thread(top, spin, 0, ctid)
     };
     if tid <= 0 {
-        return report(b"CPU_ACCT_SPINNER", false, -1);
+        return verdict(b"CPU_ACCT_SPINNER", false, -1);
     }
     nap(300);
     // The spinner has had its CPU for most of the 300 ms
     let seen = thread_cpu_ms(tid);
     STOP.store(1, Ordering::Relaxed);
     let joined = join(&raw mut CTID);
-    report(b"CPU_ACCT_SPINNER", joined && seen >= 100, seen);
+    verdict(b"CPU_ACCT_SPINNER", joined && seen >= 100, seen);
 }

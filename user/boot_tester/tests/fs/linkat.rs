@@ -6,7 +6,8 @@
 //! before 6.10 always the capability) and never brings back an unlinked
 //! file (ENOENT), even racing with unlinks
 
-use crate::tests::helpers::{linux_at_least, print, print_num, println};
+use crate::tests::harness::verdict;
+use crate::tests::helpers::linux_at_least;
 use hk_syscall::{
     _LINUX_CAPABILITY_VERSION_3, AT_FDCWD, CapUserData, CapUserHeader, O_CREAT, O_RDONLY, O_WRONLY,
     Stat, sys_capget, sys_capset, sys_close, sys_exit, sys_fork, sys_fstat, sys_linkat, sys_lstat,
@@ -59,17 +60,6 @@ pub fn run_tests() {
     }
     sys_umount2(DIR.as_ptr(), 0);
     sys_rmdir(DIR.as_ptr());
-}
-
-fn verdict(name: &[u8], ok: bool, got: i64) {
-    print(name);
-    if ok {
-        println(b":OK");
-    } else {
-        print(b":FAIL got ");
-        print_num(got);
-        println(b"");
-    }
 }
 
 fn touch(p: &[u8]) {

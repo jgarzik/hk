@@ -3,8 +3,9 @@
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use hk_syscall::{
-    AF_INET, O_RDONLY, SOCK_DGRAM, UtsName, sys_close, sys_ioctl, sys_mkdir, sys_mount, sys_open,
-    sys_read, sys_socket, sys_uname, sys_write,
+    AF_INET, O_RDONLY, SIGKILL, SOCK_DGRAM, Timespec, UtsName, sys_close, sys_ioctl, sys_kill,
+    sys_mkdir, sys_mount, sys_nanosleep, sys_open, sys_read, sys_socket, sys_uname, sys_wait4,
+    sys_write,
 };
 
 pub const STDOUT: u64 = 1;
@@ -316,4 +317,29 @@ pub fn freeswap_within(want: i64, tol: i64) -> Result<i64, i64> {
         hk_syscall::sys_nanosleep(&ts, core::ptr::null_mut());
     }
     Err(got)
+}
+
+/// Sleep `ms` milliseconds
+pub fn msleep(ms: u64) {
+    let ts = Timespec {
+        tv_sec: (ms / 1000) as i64,
+        tv_nsec: ((ms % 1000) * 1_000_000) as i64,
+    };
+    sys_nanosleep(&ts, core::ptr::null_mut());
+}
+
+/// Sleep `ms` milliseconds
+pub fn sleep_ms(ms: i64) {
+    let ts = Timespec {
+        tv_sec: ms / 1000,
+        tv_nsec: (ms % 1000) * 1_000_000,
+    };
+    sys_nanosleep(&ts, core::ptr::null_mut());
+}
+
+/// SIGKILL `pid` and reap it
+pub fn reap(pid: i64) {
+    sys_kill(pid, SIGKILL);
+    let mut st = 0;
+    sys_wait4(pid, &mut st, 0, 0);
 }

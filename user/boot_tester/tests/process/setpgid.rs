@@ -13,7 +13,7 @@
 //!   register: -1 with the upper half zero is EINVAL as setpgid's pgid,
 //!   ESRCH as getpgid's, getsid's and kcmp's pid
 
-use crate::tests::helpers::{print, print_num, println};
+use crate::tests::harness::report_step;
 use hk_syscall::{
     sys_close, sys_execve, sys_exit, sys_fork, sys_getpgid, sys_getpid, sys_getppid, sys_getsid,
     sys_kcmp, sys_kill, sys_pipe2, sys_read, sys_setpgid, sys_wait4,
@@ -50,7 +50,7 @@ fn wait_pgrp() {
     let wa = sys_wait4(-a, &mut st, 0, 0);
     let sta = st;
     let none = sys_wait4(0, &mut st, 0, 0);
-    report(
+    report_step(
         b"WAIT_PGRP",
         if moved != 0 {
             1
@@ -64,17 +64,6 @@ fn wait_pgrp() {
             0
         },
     );
-}
-
-fn report(name: &[u8], step: i64) {
-    print(name);
-    if step == 0 {
-        println(b":OK");
-    } else {
-        print(b":FAIL step ");
-        print_num(step);
-        println(b"");
-    }
 }
 
 fn child() {
@@ -103,7 +92,7 @@ fn child() {
     sys_close(p[1] as u64);
     let mut st = 0i32;
     sys_wait4(pid, &mut st, 0, 0);
-    report(
+    report_step(
         b"SETPGID_CHILD",
         if step == 0 && st != 0 { 4 } else { step },
     );
@@ -134,7 +123,7 @@ fn child_exec() {
     sys_kill(pid, 9);
     let mut st = 0i32;
     sys_wait4(pid, &mut st, 0, 0);
-    report(
+    report_step(
         b"SETPGID_CHILD_EXEC",
         if eof != 0 {
             1
@@ -159,5 +148,5 @@ fn int_args() {
     } else {
         0
     };
-    report(b"SETPGID_INT_ARGS", step);
+    report_step(b"SETPGID_INT_ARGS", step);
 }

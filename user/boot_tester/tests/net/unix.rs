@@ -13,6 +13,7 @@ use hk_syscall::{
     sys_socketpair, sys_stat, sys_umask, sys_unlink, sys_wait4, sys_write,
 };
 
+use crate::tests::harness::T;
 use crate::tests::net::sk::*;
 
 const SOCK_SEQPACKET: i32 = 5;

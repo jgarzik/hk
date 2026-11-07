@@ -51,7 +51,7 @@
 
 use core::sync::atomic::{AtomicI32, Ordering};
 
-use crate::tests::helpers::{print, print_num, println};
+use crate::tests::harness::report_step;
 use hk_syscall::{
     CloneArgs, MAP_ANONYMOUS, MAP_SHARED, O_DIRECTORY, O_RDONLY, O_WRONLY, PROT_READ, PROT_WRITE,
     sys_clone3, sys_close, sys_exit, sys_fork, sys_getpid, sys_kill, sys_mkdir, sys_mmap,
@@ -62,23 +62,23 @@ const EAGAIN: i64 = -11;
 const EINVAL: i64 = -22;
 
 pub fn run_tests() {
-    report(b"PIDS_MAX_FORK", pids_max_fork());
-    report(b"PIDS_INTO_CGROUP", pids_into_cgroup());
-    report(b"PIDS_MAX_RACE", pids_max_race());
-    report(b"PIDS_EXIT_REAP", pids_exit_reap());
-    report(b"CGROUP_DEAD_ENODEV", cgroup_dead_enodev());
-    report(b"CGROUP_RMDIR_RACE", cgroup_rmdir_race());
-    report(b"CGROUP_PROCS_TGID", in_child(cgroup_procs_tgid));
-    report(b"CGROUP_PROCS_EXITED_LEADER", procs_exited_leader());
-    report(b"CGROUP_SUBTREE_CONTROL", subtree_control());
+    report_step(b"PIDS_MAX_FORK", pids_max_fork());
+    report_step(b"PIDS_INTO_CGROUP", pids_into_cgroup());
+    report_step(b"PIDS_MAX_RACE", pids_max_race());
+    report_step(b"PIDS_EXIT_REAP", pids_exit_reap());
+    report_step(b"CGROUP_DEAD_ENODEV", cgroup_dead_enodev());
+    report_step(b"CGROUP_RMDIR_RACE", cgroup_rmdir_race());
+    report_step(b"CGROUP_PROCS_TGID", in_child(cgroup_procs_tgid));
+    report_step(b"CGROUP_PROCS_EXITED_LEADER", procs_exited_leader());
+    report_step(b"CGROUP_SUBTREE_CONTROL", subtree_control());
     // Hierarchical pids.events and pids.events.local: Linux 6.11
     // (3f26a885a068); CI's reference kernel may be older
     if crate::tests::helpers::linux_at_least(6, 11) {
-        report(b"PIDS_EVENTS", pids_events());
+        report_step(b"PIDS_EVENTS", pids_events());
     } else {
         crate::tests::helpers::skip(b"PIDS_EVENTS", b"Linux 6.11 pids events");
     }
-    report(b"CPU_MAX_RW", cpu_max_rw());
+    report_step(b"CPU_MAX_RW", cpu_max_rw());
 }
 
 /// The count in "max N" of `file` of cgroup `name`, -1 if unreadable
@@ -241,17 +241,6 @@ fn cpu_max_rw() -> i64 {
     write_file(CG, b"cpu.max", b"max 100000");
     sys_rmdir(path(&mut b, CG, b"").as_ptr());
     step
-}
-
-fn report(name: &[u8], step: i64) {
-    print(name);
-    if step == 0 {
-        println(b":OK");
-    } else {
-        print(b":FAIL step ");
-        print_num(step);
-        println(b"");
-    }
 }
 
 /// "/sys/fs/cgroup/<name>/<file>\0" in `buf`

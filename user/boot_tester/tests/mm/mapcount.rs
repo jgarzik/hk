@@ -4,7 +4,8 @@
 //! VMA's middle) refused at it. Runs in an isolated child; the limit
 //! is restored.
 
-use crate::tests::helpers::{print, print_num, println, read_file};
+use crate::tests::harness::verdict;
+use crate::tests::helpers::{println, read_file};
 use hk_syscall::{
     MAP_ANONYMOUS, MAP_PRIVATE, O_WRONLY, PROT_NONE, PROT_READ, sys_close, sys_mmap, sys_mprotect,
     sys_munmap, sys_open, sys_write,
@@ -13,17 +14,6 @@ use hk_syscall::{
 const PAGE: u64 = 4096;
 const ENOMEM: i64 = -12;
 const PATH: &[u8] = b"/proc/sys/vm/max_map_count\0";
-
-fn verdict(name: &[u8], ok: bool, got: i64) {
-    print(name);
-    if ok {
-        println(b":OK");
-    } else {
-        print(b":FAIL got ");
-        print_num(got);
-        println(b"");
-    }
-}
 
 fn read_limit() -> i64 {
     let mut b = [0u8; 32];

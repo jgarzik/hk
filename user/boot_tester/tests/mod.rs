@@ -5,6 +5,7 @@
 pub mod arch;
 pub mod exec;
 pub mod fs;
+pub mod harness;
 pub mod helpers;
 pub mod io;
 pub mod ipc;

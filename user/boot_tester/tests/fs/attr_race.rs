@@ -24,7 +24,7 @@
 
 use core::sync::atomic::{AtomicI32, Ordering};
 
-use crate::tests::helpers::{print, print_num, println};
+use crate::tests::harness::{R, check, report_r};
 use hk_syscall::{
     MAP_ANONYMOUS, MAP_SHARED, O_CREAT, O_RDONLY, O_WRONLY, PROT_READ, PROT_WRITE, Stat, sys_chmod,
     sys_chown, sys_close, sys_exit, sys_fork, sys_fstat, sys_mkdir, sys_mmap, sys_munmap, sys_open,
@@ -35,31 +35,11 @@ const S_ISUID: u32 = 0o4000;
 const ROUNDS: i32 = 300;
 
 pub fn run_tests() {
-    report(b"CHMOD_CHOWN_RACE", chmod_chown_race());
-    report(b"SIZE_PUBLISH", size_publish());
-    report(b"FALLOCATE_MODES", fallocate_modes());
-    report(b"FALLOCATE_PUNCH", fallocate_punch());
-    report(b"FALLOCATE_RACE", fallocate_race());
-}
-
-type R = Result<(), (&'static [u8], i64)>;
-
-fn report(name: &[u8], r: R) {
-    print(name);
-    match r {
-        Ok(()) => println(b":OK"),
-        Err((why, got)) => {
-            print(b":FAIL ");
-            print(why);
-            print(b" got ");
-            print_num(got);
-            println(b"");
-        }
-    }
-}
-
-fn check(what: &'static [u8], ok: bool, got: i64) -> R {
-    if ok { Ok(()) } else { Err((what, got)) }
+    report_r(b"CHMOD_CHOWN_RACE", chmod_chown_race());
+    report_r(b"SIZE_PUBLISH", size_publish());
+    report_r(b"FALLOCATE_MODES", fallocate_modes());
+    report_r(b"FALLOCATE_PUNCH", fallocate_punch());
+    report_r(b"FALLOCATE_RACE", fallocate_race());
 }
 
 fn stat(path: &[u8]) -> Option<Stat> {

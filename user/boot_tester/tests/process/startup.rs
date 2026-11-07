@@ -2,7 +2,7 @@
 //! stack and auxiliary vector, /proc/self/exe, the TLS register across
 //! fork, newfstatat and interval timers.
 
-use crate::tests::helpers::{print, print_num, println};
+use crate::tests::harness::verdict;
 use hk_syscall::{
     ITIMER_REAL, ITimerVal, Stat, Timespec, Timeval, sys_execve, sys_exit, sys_fork, sys_fstatat,
     sys_getitimer, sys_rt_sigprocmask, sys_rt_sigtimedwait, sys_setitimer, sys_wait4,
@@ -24,17 +24,6 @@ pub fn run_tests() {
     test_itimer_real();
     #[cfg(target_arch = "x86_64")]
     test_alarm();
-}
-
-fn report(name: &[u8], ok: bool, v: i64) {
-    print(name);
-    if ok {
-        println(b":OK");
-    } else {
-        print(b":FAIL got ");
-        print_num(v);
-        println(b"");
-    }
 }
 
 /// Exit status of a child running `f`
@@ -66,7 +55,7 @@ fn test_exec_mode(name: &[u8], mode: &'static [u8]) {
         );
         sys_exit(99);
     });
-    report(name, st == 0, (st >> 8) as i64);
+    verdict(name, st == 0, (st >> 8) as i64);
 }
 
 /// The value the TLS register is set to before forking
@@ -112,7 +101,7 @@ fn test_fork_tls() {
         sys_wait4(pid, &mut st, 0, 0);
         sys_exit(if st == 0 { 0 } else { 2 });
     });
-    report(b"FORK_INHERITS_TLS", st == 0, (st >> 8) as i64);
+    verdict(b"FORK_INHERITS_TLS", st == 0, (st >> 8) as i64);
 }
 
 static mut TLS_B: [u64; 2] = [TLS_MAGIC ^ 1, 0];
@@ -163,7 +152,7 @@ fn test_tls_switch() {
     let (mut sa, mut sb) = (0i32, 0i32);
     sys_wait4(a, &mut sa, 0, 0);
     sys_wait4(b, &mut sb, 0, 0);
-    report(b"TLS_SURVIVES_SWITCH", sa == 0 && sb == 0, (sa | sb) as i64);
+    verdict(b"TLS_SURVIVES_SWITCH", sa == 0 && sb == 0, (sa | sb) as i64);
 }
 
 /// newfstatat (fstatat on arm64) on a directory and a missing path
@@ -173,7 +162,7 @@ fn test_newfstatat() {
     let dir = r == 0 && st.st_mode & 0o170000 == 0o040000;
     let r2 = sys_fstatat(AT_FDCWD, b"/\0".as_ptr(), &mut st, AT_SYMLINK_NOFOLLOW);
     let r3 = sys_fstatat(AT_FDCWD, b"/no/such/file\0".as_ptr(), &mut st, 0);
-    report(b"NEWFSTATAT", dir && r2 == 0 && r3 == -2, r3);
+    verdict(b"NEWFSTATAT", dir && r2 == 0 && r3 == -2, r3);
 }
 
 /// Block SIGALRM, then wait up to 2s for it; true if it arrived
@@ -219,7 +208,7 @@ fn test_itimer_real() {
     let bad = sys_setitimer(7, &it, core::ptr::null_mut());
     block_alrm(SIG_UNBLOCK);
     let ok = r == 0 && left > 0 && left <= 200_000 && fired && idle && bad == -22;
-    report(b"ITIMER_REAL", ok, left);
+    verdict(b"ITIMER_REAL", ok, left);
 }
 
 /// alarm returns the seconds left on the previous alarm and fires
@@ -234,5 +223,5 @@ fn test_alarm() {
     let c = sys_alarm(0);
     block_alrm(SIG_UNBLOCK);
     let ok = a == 0 && b == 5 && fired && c == 0;
-    report(b"ALARM", ok, b);
+    verdict(b"ALARM", ok, b);
 }

@@ -4,7 +4,7 @@
 //! their descriptors. `/bin/boot_tester2 fdcheck` checks the exec side:
 //! fd 10 (close-on-exec) must be gone, fd 11 must remain.
 
-use crate::tests::helpers::{print, print_num, println};
+use crate::tests::harness::verdict;
 use hk_syscall::{
     O_CLOEXEC, O_RDONLY, sys_clone, sys_close, sys_dup3, sys_execve, sys_exit, sys_fcntl, sys_fork,
     sys_open, sys_wait4,
@@ -19,17 +19,6 @@ pub fn run_tests() {
     test_open_flag();
     test_exec(b"CLOEXEC_EXEC", false);
     test_exec(b"CLOEXEC_SHARED_FILES", true);
-}
-
-fn verdict(name: &[u8], ok: bool, got: i64) {
-    print(name);
-    if ok {
-        println(b":OK");
-    } else {
-        print(b":FAIL got ");
-        print_num(got);
-        println(b"");
-    }
 }
 
 /// open(O_CLOEXEC) sets FD_CLOEXEC; a plain open does not

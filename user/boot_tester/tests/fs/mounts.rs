@@ -3,7 +3,7 @@
 //! a namespace copy's umount leaves the original namespace alone. Test
 //! mounts are ramfs on both kernels.
 
-use crate::tests::helpers::{print, print_num, println};
+use crate::tests::harness::{R, check, report_r};
 use hk_syscall::{
     CLONE_NEWNS, O_CREAT, O_RDONLY, O_RDWR, O_WRONLY, Stat, sys_chdir, sys_chroot, sys_close,
     sys_exit, sys_faccessat, sys_fork, sys_getcwd, sys_link, sys_mkdir, sys_mount, sys_open,
@@ -31,41 +31,25 @@ const MS_UNBINDABLE: u64 = 1 << 17;
 
 pub fn run_tests() {
     sys_mkdir(b"/tmp\0".as_ptr(), 0o1777); // hk boots without /tmp
-    report(b"MOUNT_NESTED", nested());
-    report(b"UNSHARE_UMOUNT_ISOLATED", unshare_umount());
-    report(b"RENAME_PINNED_TRAP", pinned_trap());
-    report(b"RENAME_ANCESTOR_MOUNT", ancestor_mount());
-    report(b"DOTDOT_MOUNT", dotdot_mount());
-    report(b"GETCWD_IN_MOUNT", getcwd_in_mount());
-    report(b"MOUNT_NESTED_BUSY", nested_busy());
-    report(b"EXDEV_SAME_SB", exdev_same_sb());
-    report(b"BIND_VIEW", bind_view());
-    report(b"RBIND", rbind());
-    report(b"BIND_RO_REMOUNT", bind_ro());
-    report(b"BIND_UNBINDABLE", bind_unbindable());
-    report(b"MOVE_MOUNT", move_mount());
-    report(b"LAZY_UMOUNT", lazy_umount());
-    report(b"PIVOT_ROOT_REAL", pivot_real());
-    report(b"RAMFS_MOUNT_MODE", ramfs_mode());
-    report(b"UMOUNT_BUSY_CWD", busy_cwd());
-    report(b"UMOUNT_EXPIRE_BUSY", expire_busy());
-    report(b"MOUNT_HARDLINK", hardlink());
-}
-
-type R = Result<(), (&'static [u8], i64)>;
-
-fn report(name: &[u8], r: R) {
-    print(name);
-    match r {
-        Ok(()) => println(b":OK"),
-        Err((why, got)) => {
-            print(b":FAIL ");
-            print(why);
-            print(b" got ");
-            print_num(got);
-            println(b"");
-        }
-    }
+    report_r(b"MOUNT_NESTED", nested());
+    report_r(b"UNSHARE_UMOUNT_ISOLATED", unshare_umount());
+    report_r(b"RENAME_PINNED_TRAP", pinned_trap());
+    report_r(b"RENAME_ANCESTOR_MOUNT", ancestor_mount());
+    report_r(b"DOTDOT_MOUNT", dotdot_mount());
+    report_r(b"GETCWD_IN_MOUNT", getcwd_in_mount());
+    report_r(b"MOUNT_NESTED_BUSY", nested_busy());
+    report_r(b"EXDEV_SAME_SB", exdev_same_sb());
+    report_r(b"BIND_VIEW", bind_view());
+    report_r(b"RBIND", rbind());
+    report_r(b"BIND_RO_REMOUNT", bind_ro());
+    report_r(b"BIND_UNBINDABLE", bind_unbindable());
+    report_r(b"MOVE_MOUNT", move_mount());
+    report_r(b"LAZY_UMOUNT", lazy_umount());
+    report_r(b"PIVOT_ROOT_REAL", pivot_real());
+    report_r(b"RAMFS_MOUNT_MODE", ramfs_mode());
+    report_r(b"UMOUNT_BUSY_CWD", busy_cwd());
+    report_r(b"UMOUNT_EXPIRE_BUSY", expire_busy());
+    report_r(b"MOUNT_HARDLINK", hardlink());
 }
 
 fn ramfs(target: &[u8]) -> i64 {
@@ -94,10 +78,6 @@ fn touch(p: &[u8]) -> i64 {
         sys_close(fd as u64);
     }
     fd
-}
-
-fn check(what: &'static [u8], ok: bool, got: i64) -> R {
-    if ok { Ok(()) } else { Err((what, got)) }
 }
 
 fn nested() -> R {

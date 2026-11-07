@@ -14,7 +14,7 @@
 //!   even when the fd came from another mount namespace (over
 //!   SCM_RIGHTS), where the caller cannot see that mount
 
-use crate::tests::helpers::{print, print_num, println};
+use crate::tests::harness::verdict_detail;
 use crate::tests::net::sk::recv_msg;
 use crate::tests::net::unix::{got_fds, send_fds};
 use hk_syscall::{
@@ -37,7 +37,7 @@ pub fn run_tests() {
     let bb = sys_open(b"/bin/busybox\0".as_ptr(), O_RDONLY, 0) as i32;
     let bin = sys_open(b"/bin\0".as_ptr(), O_RDONLY | O_DIRECTORY, 0) as i32;
     if bb < 0 || bin < 0 {
-        report(b"EXECVEAT_FEXECVE", false, bb.min(bin) as i64);
+        verdict_detail(b"EXECVEAT_FEXECVE", false, bb.min(bin) as i64);
         return;
     }
     check(b"EXECVEAT_FEXECVE", bb, b"\0", AT_EMPTY_PATH, 0);
@@ -63,7 +63,7 @@ fn noexec_fd() {
     let name = b"EXECVEAT_NOEXEC_FD";
     let mut sv = [0i32; 2];
     if sys_socketpair(AF_UNIX, SOCK_STREAM, 0, &mut sv) != 0 {
-        report(name, false, -1);
+        verdict_detail(name, false, -1);
         return;
     }
     let pid = sys_fork();
@@ -80,7 +80,7 @@ fn noexec_fd() {
     sys_wait4(pid, &mut st, 0, 0);
     sys_close(sv[0] as u64);
     if n != 1 || fd < 0 {
-        report(name, false, -100 - ((st >> 8) & 0xff) as i64);
+        verdict_detail(name, false, -100 - ((st >> 8) & 0xff) as i64);
         return;
     }
     check(name, fd, b"\0", AT_EMPTY_PATH, EACCES);
@@ -117,17 +117,6 @@ fn noexec_child(sock: i32) -> u64 {
     0
 }
 
-fn report(name: &[u8], ok: bool, detail: i64) {
-    print(name);
-    if ok {
-        println(b":OK");
-    } else {
-        print(b":FAIL ");
-        print_num(detail);
-        println(b"");
-    }
-}
-
 /// execveat(dirfd, path, flags) in a child; `errno` 0 means it must run
 /// `true` (exit 0), else fail with that errno (the child exits with it)
 fn check(name: &[u8], dirfd: i32, path: &[u8], flags: i32, errno: i64) {
@@ -140,9 +129,9 @@ fn check(name: &[u8], dirfd: i32, path: &[u8], flags: i32, errno: i64) {
     }
     let mut st = 0i32;
     if pid < 0 || sys_wait4(pid, &mut st, 0, 0) != pid {
-        report(name, false, pid);
+        verdict_detail(name, false, pid);
         return;
     }
     let code = if st & 0x7f == 0 { (st >> 8) & 0xff } else { -1 };
-    report(name, code as i64 == errno, code as i64);
+    verdict_detail(name, code as i64 == errno, code as i64);
 }

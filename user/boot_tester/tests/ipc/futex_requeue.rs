@@ -6,11 +6,11 @@
 
 use core::sync::atomic::{AtomicI64, AtomicU32, Ordering};
 
-use crate::tests::helpers::{print, print_num, println};
+use crate::tests::harness::report_code;
+use crate::tests::helpers::sleep_ms;
 use crate::tests::mm::fork_mm::spawn_thread;
 use hk_syscall::{
     FUTEX_CMP_REQUEUE, FUTEX_PRIVATE_FLAG, FUTEX_WAIT, FUTEX_WAKE, Timespec, sys_exit, sys_futex,
-    sys_nanosleep,
 };
 
 const N: usize = 4;
@@ -51,14 +51,6 @@ fn futex(
         word2.as_ptr(),
         val3,
     )
-}
-
-fn sleep_ms(ms: i64) {
-    let ts = Timespec {
-        tv_sec: ms / 1000,
-        tv_nsec: (ms % 1000) * 1_000_000,
-    };
-    sys_nanosleep(&ts, core::ptr::null_mut());
 }
 
 extern "C" fn waiter(i: u64) -> ! {
@@ -144,25 +136,14 @@ fn join_all() -> bool {
     false
 }
 
-fn report(name: &[u8], code: i64) {
-    print(name);
-    if code == 0 {
-        println(b":OK");
-    } else {
-        print(b":FAIL ");
-        print_num(code);
-        println(b"");
-    }
-}
-
 fn requeue_sleep() {
     const NAME: &[u8] = b"FUTEX_REQUEUE_SLEEP";
     if !start(0) {
-        return report(NAME, -1);
+        return report_code(NAME, -1);
     }
     let moved = requeue_all();
     if moved != N as i64 {
-        report(NAME, -100 - moved);
+        report_code(NAME, -100 - moved);
         futex(&B, FUTEX_WAKE, N as u32, core::ptr::null(), &B, 0);
         futex(&A, FUTEX_WAKE, N as u32, core::ptr::null(), &A, 0);
         join_all();
@@ -187,13 +168,13 @@ fn requeue_sleep() {
     } else {
         0
     };
-    report(NAME, code);
+    report_code(NAME, code);
 }
 
 fn requeue_exit() {
     const NAME: &[u8] = b"FUTEX_REQUEUE_EXIT";
     if !start(300) {
-        return report(NAME, -1);
+        return report_code(NAME, -1);
     }
     let moved = requeue_all();
     let joined = join_all();
@@ -211,5 +192,5 @@ fn requeue_exit() {
     } else {
         0
     };
-    report(NAME, code);
+    report_code(NAME, code);
 }

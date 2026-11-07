@@ -15,7 +15,7 @@
 //!
 //! Bounds are loose (TCG).
 
-use crate::tests::net::sk::T;
+use crate::tests::harness::T;
 use hk_syscall::{
     CLOCK_MONOTONIC, CLOCK_REALTIME, ITimerSpec, PollFd, SigEvent, TFD_NONBLOCK, TFD_TIMER_ABSTIME,
     TFD_TIMER_CANCEL_ON_SET, TIMER_ABSTIME, Timespec, sigev_notify, sys_clock_gettime,

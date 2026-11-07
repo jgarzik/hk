@@ -7,7 +7,7 @@
 //!
 //! Bounded by a deadline so a lost wakeup shows up as FAIL, not a hang.
 
-use crate::tests::net::sk::T;
+use crate::tests::harness::T;
 use hk_syscall::{
     CLOCK_MONOTONIC, FUTEX_WAIT, FUTEX_WAKE, MAP_ANONYMOUS, MAP_SHARED, PROT_READ, PROT_WRITE,
     Timespec, sys_clock_gettime, sys_close, sys_exit, sys_fork, sys_futex, sys_kill, sys_mmap,

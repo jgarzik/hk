@@ -15,6 +15,7 @@ use hk_syscall::{
     sys_write,
 };
 
+use crate::tests::harness::{fail_why, pass};
 use crate::tests::helpers::{print, print_num, println};
 use crate::tests::net::nl::*;
 
@@ -69,24 +70,10 @@ pub fn run_tests() {
     test_passcred();
 }
 
-fn fail(name: &[u8], why: &[u8], v: i64) {
-    print(name);
-    print(b":FAIL ");
-    print(why);
-    print(b" ");
-    print_num(v);
-    println(b"");
-}
-
-fn ok(name: &[u8]) {
-    print(name);
-    println(b":OK");
-}
-
 /// Check `got == want`, printing a failure; returns success
 fn expect(name: &[u8], why: &[u8], got: i32, want: i32) -> bool {
     if got != want {
-        fail(name, why, got as i64);
+        fail_why(name, why, got as i64);
         return false;
     }
     true
@@ -97,7 +84,7 @@ fn test_socket() {
     for t in [SOCK_RAW, SOCK_DGRAM] {
         let fd = sys_socket(AF_NETLINK, t, NETLINK_ROUTE);
         if fd < 0 {
-            return fail(N, b"socket", fd);
+            return fail_why(N, b"socket", fd);
         }
         sys_close(fd as u64);
     }
@@ -109,7 +96,7 @@ fn test_socket() {
     if !expect(N, b"SOCK_STREAM", r, ESOCKTNOSUPPORT) {
         return;
     }
-    ok(N);
+    pass(N);
 }
 
 /// getsockname: (family, pid, groups)
@@ -137,7 +124,7 @@ fn test_autobind() {
     let (fam, pid, _) = sockname(a);
     if fam != AF_NETLINK as u16 || pid != 0 {
         done();
-        return fail(N, b"unbound getsockname pid", pid as i64);
+        return fail_why(N, b"unbound getsockname pid", pid as i64);
     }
     let any = nladdr(0, 0);
     sys_bind(a, any.as_ptr(), 12);
@@ -146,11 +133,11 @@ fn test_autobind() {
     let pb = sockname(b).1;
     if pa != sys_getpid() as u32 {
         done();
-        return fail(N, b"first autobind pid != tgid", pa as i64);
+        return fail_why(N, b"first autobind pid != tgid", pa as i64);
     }
     if (pb as i32) >= 0 || pb == pa {
         done();
-        return fail(N, b"second autobind pid not negative", pb as i32 as i64);
+        return fail_why(N, b"second autobind pid not negative", pb as i32 as i64);
     }
     // Rebinding to another pid; taking a used pid; short address
     let other = nladdr(pa.wrapping_add(7777), 0);
@@ -163,14 +150,14 @@ fn test_autobind() {
         && expect(N, b"pid in use", r2, EADDRINUSE)
         && expect(N, b"short addr", r3, EINVAL)
     {
-        ok(N);
+        pass(N);
     }
 }
 
 fn test_link_dump() {
     const N: &[u8] = b"NL_LINK_DUMP";
     let Some(mut nl) = Nl::open() else {
-        return fail(N, b"open", 0);
+        return fail_why(N, b"open", 0);
     };
     let (mut lo_ok, mut eth_ok, mut bad) = (false, false, 0);
     let mut r = Req::new(RTM_GETLINK, 0, &ifinfo(0, 0, 0));
@@ -193,7 +180,7 @@ fn test_link_dump() {
         }
     });
     if n < 2 {
-        return fail(N, b"dump count/error", n as i64);
+        return fail_why(N, b"dump count/error", n as i64);
     }
     if bad != 0 || !lo_ok || !eth_ok {
         print(N);
@@ -206,7 +193,7 @@ fn test_link_dump() {
         println(b"");
         return;
     }
-    ok(N);
+    pass(N);
 }
 
 /// IPv4 addresses on link `index` (count) and whether `ip` is among them
@@ -228,39 +215,39 @@ fn addrs_on(nl: &mut Nl, index: u32, ip: [u8; 4]) -> (i32, bool) {
 fn test_unconfigured() {
     const N: &[u8] = b"NL_ETH_UNCONFIGURED";
     let Some(mut nl) = Nl::open() else {
-        return fail(N, b"open", 0);
+        return fail_why(N, b"open", 0);
     };
     let Some(eth) = first_ether(&mut nl) else {
-        return fail(N, b"no ethernet link", 0);
+        return fail_why(N, b"no ethernet link", 0);
     };
     if eth.flags & (IFF_UP | IFF_RUNNING) != 0 {
-        return fail(N, b"flags", eth.flags as i64);
+        return fail_why(N, b"flags", eth.flags as i64);
     }
     if eth.operstate != IF_OPER_DOWN {
-        return fail(N, b"operstate", eth.operstate as i64);
+        return fail_why(N, b"operstate", eth.operstate as i64);
     }
     let (cnt, _) = addrs_on(&mut nl, eth.index, [0; 4]);
     if cnt != 0 {
-        return fail(N, b"ipv4 addresses", cnt as i64);
+        return fail_why(N, b"ipv4 addresses", cnt as i64);
     }
     // lo has exactly 127.0.0.1/8
     let (cnt, has) = addrs_on(&mut nl, 1, [127, 0, 0, 1]);
     if cnt != 1 || !has {
-        return fail(N, b"lo addresses", cnt as i64);
+        return fail_why(N, b"lo addresses", cnt as i64);
     }
-    ok(N);
+    pass(N);
 }
 
 fn test_getlink() {
     const N: &[u8] = b"NL_GETLINK";
     let Some(mut nl) = Nl::open() else {
-        return fail(N, b"open", 0);
+        return fail_why(N, b"open", 0);
     };
     let Some(lo) = get_link(&mut nl, 1) else {
-        return fail(N, b"by index", 0);
+        return fail_why(N, b"by index", 0);
     };
     if lo.ltype != ARPHRD_LOOPBACK {
-        return fail(N, b"lo type", lo.ltype as i64);
+        return fail_why(N, b"lo type", lo.ltype as i64);
     }
     // By name
     let mut r = Req::new(RTM_GETLINK, 0, &ifinfo(0, 0, 0));
@@ -277,21 +264,21 @@ fn test_getlink() {
         });
     }
     if idx != 1 {
-        return fail(N, b"by name index", idx as i64);
+        return fail_why(N, b"by name index", idx as i64);
     }
     let e1 = nl.ack(&mut Req::new(RTM_GETLINK, 0, &ifinfo(99999, 0, 0)));
     let mut r = Req::new(RTM_GETLINK, 0, &ifinfo(0, 0, 0));
     r.attr(IFLA_IFNAME, b"nosuchif9\0");
     let e2 = nl.ack(&mut r);
     if expect(N, b"bad index", e1, ENODEV) && expect(N, b"bad name", e2, ENODEV) {
-        ok(N);
+        pass(N);
     }
 }
 
 fn test_ack() {
     const N: &[u8] = b"NL_ACK";
     let Some(mut nl) = Nl::open() else {
-        return fail(N, b"open", 0);
+        return fail_why(N, b"open", 0);
     };
     let (_, mypid, _) = sockname(nl.fd);
     // Success ACK: error 0, capped, our seq and portid
@@ -311,7 +298,7 @@ fn test_ack() {
         });
     }
     if !good {
-        return fail(N, b"success ack", n);
+        return fail_why(N, b"success ack", n);
     }
     // Error: whole request echoed (missing IFA_LOCAL -> EINVAL)
     let mut r = Req::new(
@@ -350,9 +337,9 @@ fn test_ack() {
     let mut r = Req::new(RTM_NEWLINK, 0, &ifinfo(1, 0, 0));
     nl.send(&mut r);
     if wait_readable(nl.fd, 200) {
-        return fail(N, b"unexpected reply without NLM_F_ACK", 0);
+        return fail_why(N, b"unexpected reply without NLM_F_ACK", 0);
     }
-    ok(N);
+    pass(N);
 }
 
 /// Wait up to 3 s for link `index` to satisfy `f`
@@ -371,13 +358,13 @@ fn link_wait(nl: &mut Nl, index: u32, f: &dyn Fn(&Link) -> bool) -> Option<Link>
 fn test_updown() {
     const N: &[u8] = b"NL_LINK_UPDOWN";
     let Some(mut nl) = Nl::open() else {
-        return fail(N, b"open", 0);
+        return fail_why(N, b"open", 0);
     };
     let Some(eth) = first_ether(&mut nl) else {
-        return fail(N, b"no ethernet link", 0);
+        return fail_why(N, b"no ethernet link", 0);
     };
     if set_link_up(&mut nl, eth.index, true) != 0 {
-        return fail(N, b"up", 0);
+        return fail_why(N, b"up", 0);
     }
     let up = link_wait(&mut nl, eth.index, &|l| {
         l.flags & (IFF_UP | IFF_RUNNING | IFF_LOWER_UP) == IFF_UP | IFF_RUNNING | IFF_LOWER_UP
@@ -387,16 +374,16 @@ fn test_updown() {
     let r = set_link_up(&mut nl, eth.index, false);
     let down = get_link(&mut nl, eth.index).unwrap_or_default();
     if !up_ok {
-        return fail(
+        return fail_why(
             N,
             b"not running after up, flags",
             up.map_or(-1, |l| l.flags as i64),
         );
     }
     if r != 0 || down.flags & (IFF_UP | IFF_RUNNING) != 0 || down.operstate != IF_OPER_DOWN {
-        return fail(N, b"after down, flags", down.flags as i64);
+        return fail_why(N, b"after down, flags", down.flags as i64);
     }
-    ok(N);
+    pass(N);
 }
 
 /// Route facts gathered from a dump
@@ -476,10 +463,10 @@ fn route_get(nl: &mut Nl, dst: [u8; 4]) -> Result<(u32, [u8; 4], [u8; 4], u8), i
 fn test_addr_route() {
     const N: &[u8] = b"NL_ADDR_ROUTE";
     let Some(mut nl) = Nl::open() else {
-        return fail(N, b"open", 0);
+        return fail_why(N, b"open", 0);
     };
     let Some(eth) = first_ether(&mut nl) else {
-        return fail(N, b"no ethernet link", 0);
+        return fail_why(N, b"no ethernet link", 0);
     };
     let i = eth.index;
     set_link_up(&mut nl, i, true);
@@ -572,18 +559,18 @@ fn test_addr_route() {
     addr(&mut nl, false, i, TEST_IP, 24, 0);
     set_link_up(&mut nl, i, false);
     match result {
-        Ok(()) => ok(N),
-        Err((what, v)) => fail(N, what, v),
+        Ok(()) => pass(N),
+        Err((what, v)) => fail_why(N, what, v),
     }
 }
 
 fn test_notify() {
     const N: &[u8] = b"NL_NOTIFY";
     let (Some(mut nl), Some(mon)) = (Nl::open(), Nl::open()) else {
-        return fail(N, b"open", 0);
+        return fail_why(N, b"open", 0);
     };
     let Some(eth) = first_ether(&mut nl) else {
-        return fail(N, b"no ethernet link", 0);
+        return fail_why(N, b"no ethernet link", 0);
     };
     // Groups by bind (IFADDR; rebinding a bound socket must name its own
     // port id) and by setsockopt (LINK)
@@ -598,7 +585,7 @@ fn test_notify() {
         4,
     );
     if r1 != 0 || r2 != 0 || sockname(mon.fd).2 & RTMGRP_IPV4_IFADDR == 0 {
-        return fail(N, b"subscribe", r1 | r2);
+        return fail_why(N, b"subscribe", r1 | r2);
     }
     let added = addr(
         &mut nl,
@@ -615,13 +602,13 @@ fn test_notify() {
     let seen_link = wait_notify(&mon, RTM_NEWLINK, eth.index);
     set_link_up(&mut nl, eth.index, false);
     if added != 0 || deleted != 0 {
-        return fail(N, b"addr add/del", (added | deleted) as i64);
+        return fail_why(N, b"addr add/del", (added | deleted) as i64);
     }
     if !seen_new || !seen_del || !seen_link {
         let v = seen_new as i64 | (seen_del as i64) << 1 | (seen_link as i64) << 2;
-        return fail(N, b"notifications seen (new|del|link bits)", v);
+        return fail_why(N, b"notifications seen (new|del|link bits)", v);
     }
-    ok(N);
+    pass(N);
 }
 
 /// Read notifications until one of type `ty` for link `index` (2 s)
@@ -665,23 +652,23 @@ fn recvmsg(fd: i32, buf: &mut [u8], flags: i32) -> (i64, i32) {
 fn test_peek_trunc() {
     const N: &[u8] = b"NL_PEEK_TRUNC";
     let Some(mut nl) = Nl::open() else {
-        return fail(N, b"open", 0);
+        return fail_why(N, b"open", 0);
     };
     let mut r = Req::new(RTM_GETLINK, NLM_F_DUMP, &ifinfo(0, 0, 0));
     nl.send(&mut r);
     if !wait_readable(nl.fd, 5000) {
-        return fail(N, b"no reply", 0);
+        return fail_why(N, b"no reply", 0);
     }
     let mut small = [0u8; 16];
     // Size the first datagram without consuming it
     let (full, f1) = recvmsg(nl.fd, &mut small, MSG_PEEK | MSG_TRUNC);
     if full <= 16 || f1 & MSG_TRUNC == 0 {
-        return fail(N, b"peek|trunc size", full);
+        return fail_why(N, b"peek|trunc size", full);
     }
     let buf = rxbuf();
     let (got, f2) = recvmsg(nl.fd, &mut buf[..full as usize], 0);
     if got != full || f2 & MSG_TRUNC != 0 {
-        return fail(N, b"full read", got);
+        return fail_why(N, b"full read", got);
     }
     // Next datagram (more links or DONE) read short: truncated, consumed
     let mut r = Req::new(RTM_GETLINK, NLM_F_DUMP, &ifinfo(0, 0, 0));
@@ -689,9 +676,9 @@ fn test_peek_trunc() {
     wait_readable(nl.fd, 5000);
     let (cut, f3) = recvmsg(nl.fd, &mut small, 0);
     if cut != 16 || f3 & MSG_TRUNC == 0 {
-        return fail(N, b"truncated read", cut);
+        return fail_why(N, b"truncated read", cut);
     }
-    ok(N);
+    pass(N);
 }
 
 fn getopt(fd: i32, level: i32, opt: i32) -> (i64, i32) {
@@ -704,7 +691,7 @@ fn getopt(fd: i32, level: i32, opt: i32) -> (i64, i32) {
 fn test_sockopt() {
     const N: &[u8] = b"NL_SOCKOPT";
     let Some(nl) = Nl::open() else {
-        return fail(N, b"open", 0);
+        return fail_why(N, b"open", 0);
     };
     let one: i32 = 1;
     let p1 = &one as *const i32 as *const u8;
@@ -718,14 +705,14 @@ fn test_sockopt() {
         let r = sys_setsockopt(nl.fd, SOL_NETLINK, o, p1, 4);
         let (g, v) = getopt(nl.fd, SOL_NETLINK, o);
         if r != 0 || g != 0 || v != 1 {
-            return fail(N, b"option", o as i64);
+            return fail_why(N, b"option", o as i64);
         }
     }
     let sz: i32 = 32768;
     sys_setsockopt(nl.fd, 1, 8, &sz as *const i32 as *const u8, 4); // SO_RCVBUF
     let (_, v) = getopt(nl.fd, 1, 8);
     if v != 65536 {
-        return fail(N, b"SO_RCVBUF doubled", v as i64);
+        return fail_why(N, b"SO_RCVBUF doubled", v as i64);
     }
     let zero: i32 = 0;
     let r = sys_setsockopt(
@@ -744,15 +731,15 @@ fn test_sockopt() {
     }
     let (_, ty) = getopt(nl.fd, 1, 3); // SO_TYPE
     if ty != SOCK_RAW {
-        return fail(N, b"SO_TYPE", ty as i64);
+        return fail_why(N, b"SO_TYPE", ty as i64);
     }
-    ok(N);
+    pass(N);
 }
 
 fn test_strict_dump() {
     const N: &[u8] = b"NL_STRICT_DUMP";
     let Some(mut nl) = Nl::open() else {
-        return fail(N, b"open", 0);
+        return fail_why(N, b"open", 0);
     };
     let one: i32 = 1;
     sys_setsockopt(
@@ -773,20 +760,20 @@ fn test_strict_dump() {
         filtered &= m.flags & NLM_F_DUMP_FILTERED != 0;
     });
     if n < 0 || lo != 1 || other != 0 || !filtered {
-        return fail(N, b"ifindex filter", n as i64);
+        return fail_why(N, b"ifindex filter", n as i64);
     }
     let mut r = Req::new(RTM_GETADDR, 0, &ifaddr(AF_INET, 8, 0));
     let n = nl.dump(&mut r, &mut |_| {});
     if !expect(N, b"bad header", n, EINVAL) {
         return;
     }
-    ok(N);
+    pass(N);
 }
 
 fn test_other_dumps() {
     const N: &[u8] = b"NL_DUMPS";
     let Some(mut nl) = Nl::open() else {
-        return fail(N, b"open", 0);
+        return fail_why(N, b"open", 0);
     };
     // Route dump: AF_INET messages; lo's 127.0.0.1 local route present
     let (mut bad, mut lo_local) = (0, false);
@@ -803,7 +790,7 @@ fn test_other_dumps() {
         }
     });
     if n < 1 || bad != 0 || !lo_local {
-        return fail(N, b"route dump", n as i64);
+        return fail_why(N, b"route dump", n as i64);
     }
     // IPv6 address dump: no IPv4 entries
     let mut v4 = 0;
@@ -814,22 +801,22 @@ fn test_other_dumps() {
         }
     });
     if n < 0 || v4 != 0 {
-        return fail(N, b"inet6 addr dump", n as i64);
+        return fail_why(N, b"inet6 addr dump", n as i64);
     }
     // Neighbours and rules: well-formed dumps
     let mut r = Req::new(RTM_GETNEIGH, 0, &[AF_INET, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
     let mut nbad = 0;
     let n = nl.dump(&mut r, &mut |m| nbad += (m.ty != RTM_NEWNEIGH) as i32);
     if n < 0 || nbad != 0 {
-        return fail(N, b"neigh dump", n as i64);
+        return fail_why(N, b"neigh dump", n as i64);
     }
     let mut r = Req::new(RTM_GETRULE, 0, &[AF_INET, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
     let mut rbad = 0;
     let n = nl.dump(&mut r, &mut |m| rbad += (m.ty != RTM_NEWRULE) as i32);
     if n < 0 || rbad != 0 {
-        return fail(N, b"rule dump", n as i64);
+        return fail_why(N, b"rule dump", n as i64);
     }
-    ok(N);
+    pass(N);
 }
 
 /// Drop all effective capabilities of this process
@@ -871,9 +858,9 @@ fn test_eperm() {
     sys_wait4(pid, &mut st, 0, 0);
     let code = (st >> 8) & 0xff;
     if st & 0x7f != 0 || code != 0 {
-        return fail(N, b"child code", code as i64);
+        return fail_why(N, b"child code", code as i64);
     }
-    ok(N);
+    pass(N);
 }
 
 fn sendmsg_iov(fd: i32, iov: &mut [IoVec]) -> i32 {
@@ -887,7 +874,7 @@ fn sendmsg_iov(fd: i32, iov: &mut [IoVec]) -> i32 {
 fn test_overflow() {
     const N: &[u8] = b"NL_OVERFLOW";
     let Some(nl) = Nl::open() else {
-        return fail(N, b"open", 0);
+        return fail_why(N, b"open", 0);
     };
     let buf = rxbuf();
     let p = buf.as_ptr();
@@ -928,7 +915,7 @@ fn test_overflow() {
     if !expect(N, b"iovlen 1025", sendmsg_iov(nl.fd, many), EMSGSIZE) {
         return;
     }
-    ok(N);
+    pass(N);
 }
 
 /// Smallest receive buffer (SO_RCVBUF 0 -> SOCK_MIN_RCVBUF)
@@ -982,7 +969,7 @@ fn test_dump_resume() {
     const N: &[u8] = b"NL_DUMP_RESUME";
     let (Some(mut cfg), Some(mut small), Some(mut nl)) = (Nl::open(), Nl::open(), Nl::open())
     else {
-        return fail(N, b"open", 0);
+        return fail_why(N, b"open", 0);
     };
     for i in 0..N_ROUTES {
         let r = route(
@@ -995,14 +982,14 @@ fn test_dump_resume() {
             NLM_F_CREATE | NLM_F_EXCL,
         );
         if r != 0 {
-            return fail(N, b"route add", r as i64);
+            return fail_why(N, b"route add", r as i64);
         }
     }
     tiny_rcvbuf(small.fd);
     // Link messages (~1 KB+) exceed half of the minimal buffer each
     let links = small.dump(&mut Req::new(RTM_GETLINK, 0, &ifinfo(0, 0, 0)), &mut |_| {});
     if links < 2 {
-        return fail(N, b"small rcvbuf: link dump", links as i64);
+        return fail_why(N, b"small rcvbuf: link dump", links as i64);
     }
     let (seen, done, err, parts) = route_dump(&mut small, false);
     let (seen2, done2, busy, _) = route_dump(&mut nl, true);
@@ -1013,15 +1000,15 @@ fn test_dump_resume() {
         print_num(err as i64);
         print(b" ");
         print_num(parts);
-        return fail(N, b"small rcvbuf: routes", seen as i64);
+        return fail_why(N, b"small rcvbuf: routes", seen as i64);
     }
     if seen2 != N_ROUTES || !done2 {
-        return fail(N, b"routes", seen2 as i64);
+        return fail_why(N, b"routes", seen2 as i64);
     }
     if !expect(N, b"second dump", busy, EBUSY) {
         return;
     }
-    ok(N);
+    pass(N);
 }
 
 /// Change lo's MTU (one RTM_NEWLINK notification each)
@@ -1063,7 +1050,7 @@ fn drain(fd: i32) -> (bool, i32) {
 fn test_overrun() {
     const N: &[u8] = b"NL_OVERRUN";
     let (Some(mut cfg), Some(mon), Some(quiet)) = (Nl::open(), Nl::open(), Nl::open()) else {
-        return fail(N, b"open", 0);
+        return fail_why(N, b"open", 0);
     };
     let one: i32 = 1;
     let g: i32 = RTNLGRP_LINK;
@@ -1087,18 +1074,18 @@ fn test_overrun() {
     for i in 0..10 {
         let r = lo_mtu(&mut cfg, if i % 2 == 0 { 65535 } else { 65536 });
         if r != 0 {
-            return fail(N, b"mtu", r as i64);
+            return fail_why(N, b"mtu", r as i64);
         }
     }
     let (e1, m1) = drain(mon.fd);
     let (e2, m2) = drain(quiet.fd);
     if !e1 || m1 < 1 || m1 >= 10 {
-        return fail(N, b"monitor msgs", m1 as i64);
+        return fail_why(N, b"monitor msgs", m1 as i64);
     }
     if e2 || m2 < 1 || m2 >= 10 {
-        return fail(N, b"NO_ENOBUFS msgs", m2 as i64);
+        return fail_why(N, b"NO_ENOBUFS msgs", m2 as i64);
     }
-    ok(N);
+    pass(N);
 }
 
 /// NEWADDR of TEST_IP on lo through `fd`, sent with write() (no
@@ -1139,7 +1126,7 @@ fn test_deputy() {
     let mut p = [0i32; 2];
     let mut q = [0i32; 2];
     if sys_pipe2(p.as_mut_ptr(), 0) != 0 || sys_pipe2(q.as_mut_ptr(), 0) != 0 {
-        return fail(N, b"pipe", 0);
+        return fail_why(N, b"pipe", 0);
     }
     let pid = sys_fork();
     if pid == 0 {
@@ -1192,9 +1179,9 @@ fn test_deputy() {
     sys_wait4(pid, &mut st, 0, 0);
     let code = (st >> 8) & 0xff;
     if st & 0x7f != 0 || code != 0 {
-        return fail(N, b"regained caps / sender, code", code as i64);
+        return fail_why(N, b"regained caps / sender, code", code as i64);
     }
-    ok(N);
+    pass(N);
 }
 
 /// A sender blocked on a full user socket is woken when the receiver's
@@ -1237,12 +1224,12 @@ fn test_dead_receiver() {
     sys_wait4(pid, &mut st, 0, 0);
     sys_close(tx as u64);
     if r != ECONNREFUSED {
-        return fail(N, b"send", r as i64);
+        return fail_why(N, b"send", r as i64);
     }
     if ms >= 4000 {
-        return fail(N, b"woken after ms", ms as i64);
+        return fail_why(N, b"woken after ms", ms as i64);
     }
-    ok(N);
+    pass(N);
 }
 
 /// SO_PASSCRED: kernel messages carry pid/uid/gid 0, a peer's carry its
@@ -1251,7 +1238,7 @@ fn test_passcred() {
     const N: &[u8] = b"NL_PASSCRED";
     const SO_PASSCRED: i32 = 16;
     let (Some(mut a), Some(b)) = (Nl::open(), Nl::open()) else {
-        return fail(N, b"open", 0);
+        return fail_why(N, b"open", 0);
     };
     let one: i32 = 1;
     let on = |fd: i32| {
@@ -1264,7 +1251,7 @@ fn test_passcred() {
         )
     };
     if on(a.fd) != 0 || on(b.fd) != 0 {
-        return fail(N, b"setsockopt", 0);
+        return fail_why(N, b"setsockopt", 0);
     }
     let mut r = Req::new(RTM_GETLINK, 0, &ifinfo(1, 0, 0));
     a.send(&mut r);
@@ -1272,7 +1259,7 @@ fn test_passcred() {
     let (n, c) = recv_creds(a.fd, buf);
     if n <= 0 || c != Some((0, 0, 0)) {
         let pid = c.map_or(-1, |c| c.0 as i64);
-        return fail(N, b"kernel creds pid", if n <= 0 { n } else { pid });
+        return fail_why(N, b"kernel creds pid", if n <= 0 { n } else { pid });
     }
     let dst = nladdr(sockname(b.fd).1, 0);
     let msg = [0u8; 16];
@@ -1280,7 +1267,7 @@ fn test_passcred() {
     let (n, c) = recv_creds(b.fd, buf);
     let me = sys_getpid() as i32;
     match c {
-        Some((pid, 0, 0)) if n == 16 && pid == me => ok(N),
-        _ => fail(N, b"peer creds pid", c.map_or(n, |c| c.0 as i64)),
+        Some((pid, 0, 0)) if n == 16 && pid == me => pass(N),
+        _ => fail_why(N, b"peer creds pid", c.map_or(n, |c| c.0 as i64)),
     }
 }

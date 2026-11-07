@@ -12,6 +12,7 @@ use hk_syscall::{
     sys_sendmsg, sys_sendto, sys_setresuid, sys_setsockopt, sys_socket, sys_socketpair, sys_wait4,
 };
 
+use crate::tests::harness::T;
 use crate::tests::net::sk::*;
 
 pub fn run_tests() {

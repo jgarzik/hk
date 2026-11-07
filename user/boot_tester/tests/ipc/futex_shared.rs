@@ -22,12 +22,13 @@
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
+use crate::tests::helpers::sleep_ms;
 use crate::tests::helpers::{print, print_num, println};
 use crate::tests::mm::fork_mm::spawn_thread;
 use hk_syscall::{
     FUTEX_WAIT, FUTEX_WAKE, MAP_ANONYMOUS, MAP_PRIVATE, MAP_SHARED, MREMAP_FIXED, MREMAP_MAYMOVE,
     O_CREAT, O_RDWR, PROT_READ, PROT_WRITE, RobustListHead, Timespec, sys_close, sys_exit,
-    sys_fork, sys_ftruncate, sys_futex, sys_mmap, sys_mremap, sys_munmap, sys_nanosleep, sys_open,
+    sys_fork, sys_ftruncate, sys_futex, sys_mmap, sys_mremap, sys_munmap, sys_open,
     sys_set_robust_list, sys_unlink, sys_wait4,
 };
 
@@ -55,14 +56,6 @@ fn report(name: &[u8], ok: bool, got: i64) {
         print_num(got);
         println(b"");
     }
-}
-
-fn sleep_ms(ms: i64) {
-    let ts = Timespec {
-        tv_sec: ms / 1000,
-        tv_nsec: (ms % 1000) * 1_000_000,
-    };
-    sys_nanosleep(&ts, core::ptr::null_mut());
 }
 
 /// Shared FUTEX_WAIT on `w` while it is 0, for at most `ms`

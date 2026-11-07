@@ -9,7 +9,7 @@
 //! - an orphan goes to the nearest child subreaper, which waits for it
 //!   (forget_original_parent).
 
-use crate::tests::helpers::{print, print_num, println};
+use crate::tests::harness::verdict;
 use crate::tests::mm::fork_mm::{join, spawn_thread_ptid};
 use hk_syscall::{
     sys_close, sys_dup3, sys_execve, sys_exit, sys_faccessat, sys_fork, sys_getpid, sys_getppid,
@@ -26,20 +26,9 @@ pub fn run_tests() {
     reparent();
 }
 
-fn report(name: &[u8], ok: bool, v: i64) {
-    print(name);
-    if ok {
-        println(b":OK");
-    } else {
-        print(b":FAIL got ");
-        print_num(v);
-        println(b"");
-    }
-}
-
 fn leader() {
     let (pid, tid) = (sys_getpid(), sys_gettid());
-    report(b"PID_TID_LEADER", pid == tid, tid - pid);
+    verdict(b"PID_TID_LEADER", pid == tid, tid - pid);
 }
 
 /// The child sends its getpid and gettid
@@ -58,7 +47,7 @@ fn fork_ids() {
     sys_close(p[1] as u64);
     let mut st = 0;
     sys_wait4(ret, &mut st, 0, 0);
-    report(
+    verdict(
         b"PID_TID_FORK",
         n == 16 && ids[0] == ret && ids[1] == ret,
         ids[1] - ret,
@@ -126,7 +115,7 @@ fn thread_ids() {
     let ptid = unsafe { core::ptr::read_volatile(&raw const PTID) } as i64;
     let seen = unsafe { core::ptr::read_volatile(&raw const SEEN) };
     let ok = tid > 0 && joined && ptid == tid && seen == tid && tid != sys_getpid() && listed;
-    report(b"PID_TID_THREAD", ok, tid);
+    verdict(b"PID_TID_THREAD", ok, tid);
 }
 
 extern "C" fn exec_ids(_: u64) -> ! {
@@ -170,7 +159,7 @@ fn exec_thread() {
     sys_close(p[0] as u64);
     let mut st = 0;
     let w = sys_wait4(pid, &mut st, 0, 0);
-    report(
+    verdict(
         b"PID_TID_EXEC_THREAD",
         n == 16 && ids[0] == pid && ids[1] == pid && w == pid,
         ids[1] - pid,
@@ -214,7 +203,7 @@ fn reparent() {
     for fd in [p[0], p[1], go[0], go[1]] {
         sys_close(fd as u64);
     }
-    report(
+    verdict(
         b"PID_TID_REPARENT",
         n == 8 && ppid[0] == me && w == gc[0] && (st >> 8) & 0xff == 7,
         ppid[0],

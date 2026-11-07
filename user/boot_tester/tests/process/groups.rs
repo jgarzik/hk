@@ -10,7 +10,7 @@
 //!   opens for a uid-1000 process holding 4242 as a supplementary group,
 //!   and is EACCES for one that does not
 
-use crate::tests::helpers::{print, print_num, println};
+use crate::tests::harness::report_step;
 use hk_syscall::{
     O_CREAT, O_RDONLY, O_WRONLY, sys_chmod, sys_chown, sys_close, sys_exit, sys_fork,
     sys_getgroups, sys_open, sys_read, sys_setgroups, sys_setresgid, sys_setresuid, sys_unlink,
@@ -28,17 +28,6 @@ pub fn run_tests() {
     dac();
 }
 
-fn report(name: &[u8], step: i64) {
-    print(name);
-    if step == 0 {
-        println(b":OK");
-    } else {
-        print(b":FAIL step ");
-        print_num(step);
-        println(b"");
-    }
-}
-
 /// Run `f` in a child; its exit status is the failed step (0: passed)
 fn in_child(name: &[u8], f: fn() -> u64) {
     let pid = sys_fork();
@@ -52,7 +41,7 @@ fn in_child(name: &[u8], f: fn() -> u64) {
     } else {
         100
     };
-    report(name, step as i64);
+    report_step(name, step as i64);
 }
 
 fn find(hay: &[u8], needle: &[u8]) -> bool {
@@ -136,7 +125,7 @@ fn dac() {
     let fd = sys_open(FILE.as_ptr(), O_CREAT | O_WRONLY, 0o640);
     sys_close(fd as u64);
     if fd < 0 || sys_chown(FILE.as_ptr(), 0, 4242) != 0 || sys_chmod(FILE.as_ptr(), 0o640) != 0 {
-        report(b"GROUPS_DAC", 90);
+        report_step(b"GROUPS_DAC", 90);
         return;
     }
     let with = run(|| open_as(&[4242]));
@@ -149,7 +138,7 @@ fn dac() {
     } else {
         0
     };
-    report(b"GROUPS_DAC", step);
+    report_step(b"GROUPS_DAC", step);
 }
 
 fn run(f: fn() -> u64) -> i64 {

@@ -2,12 +2,13 @@
 //! buffer (Linux MAX_RW_COUNT is INT_MAX & PAGE_MASK), and many tasks
 //! blocked in big reads at once must not exhaust kernel memory.
 
+use crate::tests::helpers::msleep;
 use crate::tests::helpers::{print, print_num, println};
 use crate::tests::mm::mm_life::{SI_FREERAM, SI_TOTALRAM, exhaust_ok, sysinfo_ram};
 use hk_syscall::{
-    MAP_ANONYMOUS, MAP_PRIVATE, O_CREAT, O_RDWR, O_TRUNC, PROT_READ, PROT_WRITE, Timespec,
-    sys_close, sys_exit, sys_fork, sys_mmap, sys_nanosleep, sys_open, sys_pipe, sys_pread64,
-    sys_read, sys_unlink, sys_wait4, sys_write,
+    MAP_ANONYMOUS, MAP_PRIVATE, O_CREAT, O_RDWR, O_TRUNC, PROT_READ, PROT_WRITE, sys_close,
+    sys_exit, sys_fork, sys_mmap, sys_open, sys_pipe, sys_pread64, sys_read, sys_unlink, sys_wait4,
+    sys_write,
 };
 
 const MB: usize = 1024 * 1024;
@@ -226,14 +227,6 @@ fn in_child(f: fn()) {
     }
     let mut st = 0i32;
     sys_wait4(pid, &mut st, 0, 0);
-}
-
-fn msleep(ms: u64) {
-    let ts = Timespec {
-        tv_sec: (ms / 1000) as i64,
-        tv_nsec: ((ms % 1000) * 1_000_000) as i64,
-    };
-    sys_nanosleep(&ts, core::ptr::null_mut());
 }
 
 /// Anonymous read-write mapping of `len` bytes (None on failure)

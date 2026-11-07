@@ -5,8 +5,9 @@
 //! slots back, swapoff reads everything in (Linux try_to_unuse).
 //! Expectations from Linux 6.8; both kernels run it.
 
+use crate::tests::harness::verdict;
 use crate::tests::helpers::{
-    find_blkdev, freeswap_within, host_mode, print, print_num, println, proc_kb, swap_off, swap_on,
+    find_blkdev, freeswap_within, host_mode, println, proc_kb, swap_off, swap_on,
 };
 use crate::tests::process::preempt::ncpus_allowed;
 use hk_syscall::{
@@ -53,17 +54,6 @@ fn writeback_settle() {
             return;
         }
         hk_syscall::sys_nanosleep(&ts, core::ptr::null_mut());
-    }
-}
-
-fn verdict(name: &[u8], ok: bool, got: i64) {
-    print(name);
-    if ok {
-        println(b":OK");
-    } else {
-        print(b":FAIL got ");
-        print_num(got);
-        println(b"");
     }
 }
 

@@ -2,7 +2,8 @@
 //! fs/proc/fd.c, vfs_getattr): mountinfo lines, the mount id statx and
 //! fdinfo report, /proc/self/{cwd,root}, /proc/mounts -> self/mounts
 
-use crate::tests::helpers::{linux_at_least, print, print_num, println};
+use crate::tests::harness::{R, check, report_r};
+use crate::tests::helpers::{linux_at_least, println};
 use hk_syscall::{
     O_CLOEXEC, O_CREAT, O_RDONLY, O_RDWR, Statx, sys_chdir, sys_close, sys_mkdir, sys_mount,
     sys_open, sys_read, sys_readlink, sys_rmdir, sys_statx, sys_umount2, sys_unlink, sys_write,
@@ -23,36 +24,16 @@ pub fn run_tests() {
         return;
     }
     let id = mountinfo_id(b"/tmp/mi");
-    report(b"MOUNTINFO", check_mountinfo(id));
-    report(b"MOUNTINFO_ROOTFS", check_rootfs());
-    report(b"STATX_MNT_ID", check_statx(id));
-    report(b"FDINFO_FIELDS", check_fdinfo(id));
-    report(b"PROC_CWD_ROOT", check_cwd_root());
-    report(b"KTHREAD_ROOT", check_kthread_root());
+    report_r(b"MOUNTINFO", check_mountinfo(id));
+    report_r(b"MOUNTINFO_ROOTFS", check_rootfs());
+    report_r(b"STATX_MNT_ID", check_statx(id));
+    report_r(b"FDINFO_FIELDS", check_fdinfo(id));
+    report_r(b"PROC_CWD_ROOT", check_cwd_root());
+    report_r(b"KTHREAD_ROOT", check_kthread_root());
     sys_chdir(b"/\0".as_ptr());
     sys_unlink(b"/tmp/mi/f\0".as_ptr());
     sys_umount2(mi.as_ptr(), 0);
     sys_rmdir(mi.as_ptr());
-}
-
-type R = Result<(), (&'static [u8], i64)>;
-
-fn report(name: &[u8], r: R) {
-    print(name);
-    match r {
-        Ok(()) => println(b":OK"),
-        Err((why, got)) => {
-            print(b":FAIL ");
-            print(why);
-            print(b" got ");
-            print_num(got);
-            println(b"");
-        }
-    }
-}
-
-fn check(what: &'static [u8], ok: bool, got: i64) -> R {
-    if ok { Ok(()) } else { Err((what, got)) }
 }
 
 /// Read a whole (small) file

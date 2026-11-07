@@ -11,18 +11,18 @@
 //! pidfd_getfd (PTRACE_MODE_ATTACH_REALCREDS) of a root process are
 //! EPERM for nobody; kcmp of one's own process works
 
+use crate::tests::helpers::reap;
 use crate::tests::helpers::{print, print_num, println};
 use crate::tests::mm::fork_mm::{join, spawn_thread};
 use core::sync::atomic::{AtomicI64, Ordering};
 use hk_syscall::{
-    IoVec, sys_close, sys_exit, sys_fork, sys_kill, sys_pause, sys_pipe2, sys_prctl,
-    sys_process_vm_readv, sys_ptrace, sys_read, sys_setresgid, sys_setresuid, sys_wait4, sys_write,
+    IoVec, sys_close, sys_exit, sys_fork, sys_pause, sys_pipe2, sys_prctl, sys_process_vm_readv,
+    sys_ptrace, sys_read, sys_setresgid, sys_setresuid, sys_wait4, sys_write,
 };
 
 const PTRACE_ATTACH: i64 = 16;
 const PTRACE_DETACH: i64 = 17;
 const PR_SET_DUMPABLE: i32 = 4;
-const SIGKILL: u32 = 9;
 const EPERM: i64 = -1;
 const UID: u32 = 1000;
 
@@ -173,12 +173,6 @@ fn target(uid: u32, dumpable: u64) -> i64 {
     sys_close(ready[0] as u64);
     sys_close(ready[1] as u64);
     pid
-}
-
-fn reap(pid: i64) {
-    sys_kill(pid, SIGKILL);
-    let mut st = 0;
-    sys_wait4(pid, &mut st, 0, 0);
 }
 
 /// Probe a same-uid child of the prober (a descendant, so Yama's

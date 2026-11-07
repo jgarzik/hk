@@ -10,9 +10,12 @@ The suite works (about 1420 checks on x86, 1402 on arm64, 1384 on Linux, 0
 FAIL), but it is 156 flat files and 66k lines of copies of one print-and-grep
 pattern.
 
-1. **No assertion API.** `tests/helpers.rs` has `print`, `skip`, `fail_count` and a
-   few parsers. 46 files define their own `fn report(`, 15 `fn verdict(`, 11
-   `fn check(`, 15 a sleep helper, 9 a wait/reap helper, 22 a thread-stack struct.
+1. **No assertion API.** `tests/harness.rs` has the shared verdict printers
+   (`verdict`, `verdict_detail`, `report_r`/`check`, `report_step`,
+   `report_code`, `pass`, `fail_why`, `T`), but no assertions, no per-check
+   numbering, no plan. 15 files still define their own `fn report(`, 6
+   `fn verdict(`, 6 `fn check(` (bodies that differ), 5 a sleep helper, 6 a
+   reap helper, 22 a thread-stack struct.
    1373 hand-written `:FAIL` literals against 656 `:OK`. Near-identical tests
    (`process.rs` `test_getuid`/`geteuid`/`getgid`/`getegid`).
 2. **Pass/fail by substring.** `helpers.rs` counts a failure when printed bytes

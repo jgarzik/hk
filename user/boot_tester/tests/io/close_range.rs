@@ -2,7 +2,7 @@
 //! the open descriptors of a range of any width; CLOSE_RANGE_UNSHARE
 //! leaves a table shared through CLONE_FILES intact for the others
 
-use crate::tests::helpers::{print, print_num, println};
+use crate::tests::harness::verdict;
 use hk_syscall::{
     O_RDONLY, sys_clone, sys_close_range, sys_dup3, sys_exit, sys_fcntl, sys_open, sys_wait4,
 };
@@ -29,17 +29,6 @@ pub fn run_tests() {
     unshare(base, true);
     unshare(base, false);
     sys_close_range(base as u32, base as u32, 0);
-}
-
-fn verdict(name: &[u8], ok: bool, got: i64) {
-    print(name);
-    if ok {
-        println(b":OK");
-    } else {
-        print(b":FAIL got ");
-        print_num(got);
-        println(b"");
-    }
 }
 
 /// Is `fd` open? (F_GETFD is EBADF on a closed one)

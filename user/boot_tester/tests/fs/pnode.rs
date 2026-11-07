@@ -4,7 +4,7 @@
 //! take no part, an unshared namespace's copies stay peers; mountinfo
 //! shows shared:N / master:N. Test mounts are ramfs on both kernels.
 
-use crate::tests::helpers::{print, print_num, println};
+use crate::tests::harness::{R, check, report_r};
 use hk_syscall::{
     CLONE_NEWNS, O_RDONLY, Stat, sys_chdir, sys_chroot, sys_close, sys_exit, sys_fork, sys_mkdir,
     sys_mount, sys_open, sys_pivot_root, sys_read, sys_rmdir, sys_stat, sys_umount2, sys_unshare,
@@ -23,40 +23,20 @@ const MNT_DETACH: u64 = 2;
 
 pub fn run_tests() {
     sys_mkdir(b"/tmp\0".as_ptr(), 0o1777); // hk boots without /tmp
-    report(b"PROPAG_SHARED_BIND", shared_bind());
-    report(b"PROPAG_SLAVE_ONEWAY", slave_oneway());
-    report(b"PROPAG_PRIVATE", private());
-    report(b"PROPAG_UNBINDABLE", unbindable());
-    report(b"PROPAG_UNSHARE_PEER", unshare_peer());
+    report_r(b"PROPAG_SHARED_BIND", shared_bind());
+    report_r(b"PROPAG_SLAVE_ONEWAY", slave_oneway());
+    report_r(b"PROPAG_PRIVATE", private());
+    report_r(b"PROPAG_UNBINDABLE", unbindable());
+    report_r(b"PROPAG_UNSHARE_PEER", unshare_peer());
     // Linux 6.17..7.2 lost it (406fea799925; fixed by 1ab8904ae61b)
     if crate::tests::helpers::linux_at_least(7, 3) {
-        report(b"PROPAG_UNSHARE_UNBINDABLE", unshare_unbindable());
+        report_r(b"PROPAG_UNSHARE_UNBINDABLE", unshare_unbindable());
     } else {
         crate::tests::helpers::skip(b"PROPAG_UNSHARE_UNBINDABLE", b"Linux 7.3 fix");
     }
-    report(b"PROPAG_SLAVE_GROUPS", slave_groups());
-    report(b"PROPAG_UNBIND_THEN_SHARED", unbind_then_shared());
-    report(b"PIVOT_ROOT_SHARED", pivot_shared());
-}
-
-type R = Result<(), (&'static [u8], i64)>;
-
-fn report(name: &[u8], r: R) {
-    print(name);
-    match r {
-        Ok(()) => println(b":OK"),
-        Err((why, got)) => {
-            print(b":FAIL ");
-            print(why);
-            print(b" got ");
-            print_num(got);
-            println(b"");
-        }
-    }
-}
-
-fn check(what: &'static [u8], ok: bool, got: i64) -> R {
-    if ok { Ok(()) } else { Err((what, got)) }
+    report_r(b"PROPAG_SLAVE_GROUPS", slave_groups());
+    report_r(b"PROPAG_UNBIND_THEN_SHARED", unbind_then_shared());
+    report_r(b"PIVOT_ROOT_SHARED", pivot_shared());
 }
 
 fn ramfs(t: &[u8]) -> i64 {

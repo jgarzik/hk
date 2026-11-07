@@ -3,9 +3,9 @@
 //! CLONE_SETTLS through set_new_tls; ptrace putreg: EIO); arm64 takes
 //! any TPIDR_EL0 value.
 
+use crate::tests::harness::verdict;
 #[cfg(target_arch = "x86_64")]
-use crate::tests::helpers::host_mode;
-use crate::tests::helpers::{print, print_num, println};
+use crate::tests::helpers::{host_mode, print_num};
 use hk_syscall::{sys_clone, sys_exit, sys_wait4};
 
 const SIGCHLD: u64 = 17;
@@ -34,17 +34,6 @@ pub fn run_tests() {
     test_clone_settls();
 }
 
-fn report(name: &[u8], ok: bool, v: i64) {
-    print(name);
-    if ok {
-        println(b":OK");
-    } else {
-        print(b":FAIL got ");
-        print_num(v);
-        println(b"");
-    }
-}
-
 /// ARCH_SET_FS of a bad base: EPERM, the old base kept
 #[cfg(target_arch = "x86_64")]
 fn test_set_fs() {
@@ -61,7 +50,7 @@ fn test_set_fs() {
     }
     let mut now = 0u64;
     sys_arch_prctl(ARCH_GET_FS, &raw mut now as u64);
-    report(b"TLS_SET_FS_RANGE", bad == 0 && now == old, bad);
+    verdict(b"TLS_SET_FS_RANGE", bad == 0 && now == old, bad);
 }
 
 /// SETREGS with a bad fs_base or gs_base: EIO; a valid one is taken
@@ -107,7 +96,7 @@ fn test_ptrace_regs() {
     }
     sys_kill(pid, 9);
     sys_wait4(pid, &mut st, 0, 0);
-    report(b"TLS_PTRACE_RANGE", bad == 0 && st & 0x7f == 9, bad);
+    verdict(b"TLS_PTRACE_RANGE", bad == 0 && st & 0x7f == 9, bad);
 }
 
 /// CLONE_SETTLS of a bad base: EPERM (x86-64); arm64 takes any value
@@ -128,7 +117,7 @@ fn test_clone_settls() {
                 bad += 1;
             }
         }
-        report(b"TLS_CLONE_RANGE", bad == 0, bad);
+        verdict(b"TLS_CLONE_RANGE", bad == 0, bad);
     }
     #[cfg(target_arch = "aarch64")]
     {
@@ -141,6 +130,6 @@ fn test_clone_settls() {
         }
         let mut st = 0i32;
         sys_wait4(pid, &mut st, 0, 0);
-        report(b"TLS_CLONE_RANGE", pid > 0 && st == 0, st as i64);
+        verdict(b"TLS_CLONE_RANGE", pid > 0 && st == 0, st as i64);
     }
 }

@@ -11,6 +11,7 @@ use hk_syscall::{
     sys_setsockopt, sys_shutdown, sys_socket, sys_wait4,
 };
 
+use crate::tests::harness::T;
 use crate::tests::helpers::{println, skip};
 use crate::tests::net::nl::{Nl, addr as nl_addr, msleep, net_setup_eth0};
 use crate::tests::net::sk::*;

@@ -7,6 +7,7 @@
 //!
 //! - PROC_HIDEPID: one line, the first failed step
 
+use crate::tests::harness::{R, check};
 use crate::tests::helpers::{print, print_num, println};
 use hk_syscall::{
     O_DIRECTORY, O_RDONLY, O_WRONLY, Stat, sys_close, sys_exit, sys_fork, sys_getdents64,
@@ -41,12 +42,6 @@ pub fn run_tests() {
             println(b"");
         }
     }
-}
-
-type R = Result<(), (&'static [u8], i64)>;
-
-fn check(what: &'static [u8], ok: bool, v: i64) -> R {
-    if ok { Ok(()) } else { Err((what, v)) }
 }
 
 fn mount(flags: u64, opts: &[u8]) -> i64 {

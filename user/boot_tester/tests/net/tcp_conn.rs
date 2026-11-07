@@ -3,10 +3,12 @@
 //! refused and unanswered connects on eth0.
 
 use hk_syscall::{
-    AF_INET, SHUT_WR, SOCK_NONBLOCK, SOCK_STREAM, Timespec, sys_exit, sys_fork, sys_listen,
-    sys_nanosleep, sys_setsockopt, sys_shutdown, sys_socket,
+    AF_INET, SHUT_WR, SOCK_NONBLOCK, SOCK_STREAM, sys_exit, sys_fork, sys_listen, sys_setsockopt,
+    sys_shutdown, sys_socket,
 };
 
+use crate::tests::harness::T;
+use crate::tests::helpers::msleep;
 use crate::tests::net::sk::*;
 use crate::tests::net::tcp_xfer::{accept, listener, set_timeo, wait_child};
 use crate::tests::proc::sysctl::{read_file, write_file};
@@ -31,14 +33,6 @@ pub fn run_tests() {
     test_ephemeral_owners();
     test_eth0_refused();
     test_connect_timeout();
-}
-
-fn msleep(ms: u64) {
-    let ts = Timespec {
-        tv_sec: (ms / 1000) as i64,
-        tv_nsec: ((ms % 1000) * 1_000_000) as i64,
-    };
-    sys_nanosleep(&ts, core::ptr::null_mut());
 }
 
 fn nb_tcp() -> i32 {

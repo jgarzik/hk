@@ -8,6 +8,7 @@ use hk_syscall::{
     sys_socket, sys_wait4,
 };
 
+use crate::tests::harness::T;
 use crate::tests::net::icmp::recv_wait;
 use crate::tests::net::sk::*;
 

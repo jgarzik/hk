@@ -1,6 +1,7 @@
 //! Address-space lifecycle: /proc/meminfo, and memory handed back when
 //! processes exit or exec (Linux mmput/exit_mmap, exec_mmap)
 
+use crate::tests::harness::verdict_detail;
 use crate::tests::helpers::{host_mode, print, print_num, println, skip};
 use hk_syscall::{
     CLONE_SIGHAND, CLONE_VM, MAP_ANONYMOUS, MAP_FIXED, MAP_PRIVATE, MREMAP_FIXED, MREMAP_MAYMOVE,
@@ -20,7 +21,7 @@ pub fn run_tests() {
     meminfo_format();
     // An exiting thread clears and wakes its CLONE_CHILD_CLEARTID word
     // (Linux mm_release), before it leaves the address space
-    report(b"MM_LIFE_CLEARTID", thread(), 0);
+    verdict_detail(b"MM_LIFE_CLEARTID", thread(), 0);
     leak(b"MM_LIFE_FORK_EXIT", 2000, fork_exit);
     leak(b"MM_LIFE_FORK_EXEC", 500, fork_exec);
     leak(b"MM_LIFE_VFORK_EXEC", 500, vfork_exec);
@@ -110,17 +111,6 @@ pub fn meminfo(key: &[u8]) -> i64 {
     v
 }
 
-fn report(name: &[u8], ok: bool, detail: i64) {
-    print(name);
-    if ok {
-        println(b":OK");
-    } else {
-        print(b":FAIL ");
-        print_num(detail);
-        println(b"");
-    }
-}
-
 /// Linux layout: a 16-column label, the value, " kB"; free <= total
 fn meminfo_format() {
     let mut buf = [0u8; 4096];
@@ -141,7 +131,7 @@ fn meminfo_format() {
     if bad == 0 && !(total > 0 && free > 0 && free <= total) {
         bad = 10;
     }
-    report(b"MEMINFO_FORMAT", bad == 0, bad);
+    verdict_detail(b"MEMINFO_FORMAT", bad == 0, bad);
 }
 
 /// Allowed MemFree drop over a batch: hk accounts exactly (a few pages
@@ -168,7 +158,7 @@ fn user_free() -> i64 {
 fn leak(name: &[u8], n: u32, f: fn() -> bool) {
     for _ in 0..(n / 10).max(2) {
         if !f() {
-            report(name, false, -1);
+            verdict_detail(name, false, -1);
             return;
         }
     }
@@ -176,7 +166,7 @@ fn leak(name: &[u8], n: u32, f: fn() -> bool) {
     let before = user_free();
     for i in 0..n {
         if !f() {
-            report(name, false, -2 - i as i64);
+            verdict_detail(name, false, -2 - i as i64);
             return;
         }
     }
@@ -199,7 +189,7 @@ fn leak(name: &[u8], n: u32, f: fn() -> bool) {
         print_num(after);
         println(b" kB");
     }
-    report(name, ok, lost);
+    verdict_detail(name, ok, lost);
 }
 
 /// Let exited tasks' CPUs switch away (their stacks are freed then),
@@ -462,7 +452,7 @@ fn maps_after_exit() {
         _ if reaped != ESRCH => 3,
         _ => 0,
     };
-    report(b"MM_LIFE_MAPS_AFTER_EXIT", bad == 0, bad);
+    verdict_detail(b"MM_LIFE_MAPS_AFTER_EXIT", bad == 0, bad);
 }
 
 /// "/proc/<pid>/<name>\0"
@@ -500,7 +490,7 @@ fn munmap_partial() {
         0,
     );
     if p <= 0 {
-        report(b"MM_LIFE_MUNMAP_PARTIAL", false, p);
+        verdict_detail(b"MM_LIFE_MUNMAP_PARTIAL", false, p);
         return;
     }
     let a = p as u64;
@@ -521,7 +511,7 @@ fn munmap_partial() {
         _ => 0,
     };
     sys_munmap(a, PAGE);
-    report(b"MM_LIFE_MUNMAP_PARTIAL", bad == 0, bad);
+    verdict_detail(b"MM_LIFE_MUNMAP_PARTIAL", bad == 0, bad);
 }
 
 /// MAP_FIXED over a written page gives a fresh zero page (the old one
@@ -530,7 +520,7 @@ fn map_fixed_replace() {
     let prot = PROT_READ | PROT_WRITE;
     let p = sys_mmap(0, PAGE, prot, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if p <= 0 {
-        report(b"MM_LIFE_MAP_FIXED_REPLACE", false, p);
+        verdict_detail(b"MM_LIFE_MAP_FIXED_REPLACE", false, p);
         return;
     }
     unsafe { core::ptr::write_volatile(p as *mut u8, 0xaa) };
@@ -544,7 +534,7 @@ fn map_fixed_replace() {
     );
     let v = unsafe { core::ptr::read_volatile(p as *const u8) };
     sys_munmap(p as u64, PAGE);
-    report(b"MM_LIFE_MAP_FIXED_REPLACE", q == p && v == 0, v as i64);
+    verdict_detail(b"MM_LIFE_MAP_FIXED_REPLACE", q == p && v == 0, v as i64);
 }
 
 /// mremap(MREMAP_FIXED) onto a written page replaces it with the moved
@@ -555,7 +545,7 @@ fn mremap_fixed_replace() {
     let a = sys_mmap(0, PAGE, prot, flags, -1, 0);
     let b = sys_mmap(0, PAGE, prot, flags, -1, 0);
     if a <= 0 || b <= 0 {
-        report(b"MM_LIFE_MREMAP_FIXED", false, -1);
+        verdict_detail(b"MM_LIFE_MREMAP_FIXED", false, -1);
         return;
     }
     unsafe {
@@ -579,7 +569,7 @@ fn mremap_fixed_replace() {
         _ if hole != ENOMEM => 3,
         _ => 0,
     };
-    report(b"MM_LIFE_MREMAP_FIXED", bad == 0, bad);
+    verdict_detail(b"MM_LIFE_MREMAP_FIXED", bad == 0, bad);
 }
 
 /// nr_dentry of /proc/sys/fs/dentry-state once unused dentries and
@@ -614,7 +604,7 @@ fn fork_exec_objects() {
     let (d0, s0) = (live_dentries(), meminfo(b"Slab:"));
     for _ in 0..N {
         if !fork_exec() {
-            report(NAME, false, -2);
+            verdict_detail(NAME, false, -2);
             return;
         }
     }
@@ -646,7 +636,7 @@ fn fork_exec_objects() {
         print_num(N);
         println(b" fork+exec");
     }
-    report(NAME, ok, s1 - s0);
+    verdict_detail(NAME, ok, s1 - s0);
 }
 
 /// Two 2MB-aligned MADV_HUGEPAGE pages are touched (2MB pages where

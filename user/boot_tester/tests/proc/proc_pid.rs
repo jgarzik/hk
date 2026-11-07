@@ -9,16 +9,16 @@
 //! proc_task_name), not re-encoded
 
 use crate::tests::exec::exec_identity::proc_path;
-use crate::tests::helpers::{print, print_num, println};
+use crate::tests::harness::verdict;
+use crate::tests::helpers::reap;
 use hk_syscall::{
     O_RDONLY, Timespec, sys_clock_gettime, sys_close, sys_dup3, sys_execve, sys_exit, sys_fork,
-    sys_getpgid, sys_getpid, sys_getppid, sys_getsid, sys_getuid, sys_kill, sys_open, sys_pipe2,
-    sys_prctl, sys_read, sys_setresgid, sys_setresuid, sys_wait4,
+    sys_getpgid, sys_getpid, sys_getppid, sys_getsid, sys_getuid, sys_open, sys_pipe2, sys_prctl,
+    sys_read, sys_setresgid, sys_setresuid, sys_wait4,
 };
 
 const PR_GET_NAME: i32 = 16;
 const CLOCK_MONOTONIC: i32 = 1;
-const SIGKILL: u32 = 9;
 const EACCES: i64 = -13;
 const UID: u32 = 1000;
 
@@ -52,17 +52,6 @@ fn comm_raw() {
     let mut st = 0i32;
     sys_wait4(pid, &mut st, 0, 0);
     verdict(b"PROC_COMM_RAW", st == 0, (st >> 8) as i64);
-}
-
-fn verdict(name: &[u8], ok: bool, got: i64) {
-    print(name);
-    if ok {
-        println(b":OK");
-    } else {
-        print(b":FAIL got ");
-        print_num(got);
-        println(b"");
-    }
 }
 
 /// Read a whole file into `buf`: its length, or the open/read errno
@@ -258,12 +247,6 @@ fn spawn_sleeper(uid: Option<u32>) -> i64 {
     sys_close(p[0] as u64);
     sys_close(p[1] as u64);
     pid
-}
-
-fn reap(pid: i64) {
-    sys_kill(pid, SIGKILL);
-    let mut st = 0;
-    sys_wait4(pid, &mut st, 0, 0);
 }
 
 const ARGS: &[u8] = b"boot_tester2\0sleep\0a b\0";
