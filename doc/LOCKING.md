@@ -1083,7 +1083,10 @@ sleeps `Killable` until its TASKLIST state is no longer `Traced` (read
 lock, rechecked after each wakeup) or SIGKILL. The tracer's wait clears
 `ptrace_code` under the write lock; resume, detach and the tracer's exit
 (`exit_ptrace`) set the state and the code to deliver under it, then
-`try_to_wake_up` the tracee with it dropped. The arch register and
+`try_to_wake_up` the tracee with it dropped. SIGKILL ends the stop in
+the section that queues it (`sigkill_task` from `zap_threads`, Linux
+signal_wake_up(fatal) clearing JOBCTL_TRACED), so a wait after the
+kill never reports the stop. The arch register and
 single-step helpers take the TASKLIST read lock themselves, so callers
 never hold it.
 

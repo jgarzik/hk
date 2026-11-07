@@ -1789,11 +1789,19 @@ pub fn zap_group_others(tgid: Pid, tid: Tid) {
     zap_threads(tgid, Some(tid));
 }
 
-/// Queue SIGKILL for `t` (TASKLIST held)
+/// Queue SIGKILL for `t` (TASKLIST held); a ptrace stop it is in ends
+/// here, no longer reported to its tracer's wait (Linux
+/// signal_wake_up(t, fatal) clears JOBCTL_TRACED with the signal
+/// queued), so a wait after the kill finds its exit, never the stop
 fn sigkill_task(t: &mut crate::task::percpu::TaskViewMut<'_>) {
     let mut s = t.task.sig.lock();
     s.pending.add(SIGKILL);
     t.task.set_sigpending(true);
+    drop(s);
+    if matches!(t.state, crate::task::TaskState::Traced(_)) {
+        t.state = crate::task::TaskState::Ready;
+        t.ptrace_code = 0;
+    }
 }
 
 /// A thread just cloned into `parent`'s group dies with it if the group
