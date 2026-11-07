@@ -5,7 +5,6 @@ use super::{SIGCHLD, SendInfo, SigFields, SigHandler, SigInfo, SigQueue, sa_flag
 use crate::task::Tid;
 use crate::task::percpu::{GlobalTaskTable, TASKLIST, TaskRef};
 use alloc::boxed::Box;
-use alloc::sync::Arc;
 
 /// SIGCHLD info for child `tid` with `code` (CLD_*) and `status`: its
 /// pid, real uid and CPU time in clock ticks (Linux
@@ -60,7 +59,7 @@ fn chld_code(status: i32) -> (i32, i32) {
     }
 }
 
-/// Who is told of zombie `tid`: its tracer, else its real parent
+/// Who is told of zombie `z`: its tracer, else its real parent
 /// (`_parent`), through `to`, the thread of that process a group signal
 /// is checked against; the signal (its exit signal, or SIGCHLD to a
 /// tracer that is not the parent, to a thread, or to an image that did
@@ -75,20 +74,49 @@ struct Rcv {
     autoreap: bool,
 }
 
-/// [`Rcv`] of `tid`, read under TASKLIST
-fn receiver(table: &GlobalTaskTable, tid: Tid) -> Option<Rcv> {
+/// A zombie whose notice is sent, by the rule its signal follows
+/// (Linux: the signal do_notify_parent's caller passes)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Zombie {
+    /// The exiting task itself (Linux exit_notify): its exit signal if
+    /// it is a leader with no other thread left (thread_group_empty)
+    /// and, if traced, its tracer is in its real parent's process
+    /// (!ptrace_reparented); else SIGCHLD
+    Exiting(Tid),
+    /// A zombie leader whose group just emptied, or moved to a new
+    /// parent (Linux release_task, reparent_leader): its exit signal
+    Leader(Tid),
+}
+
+impl Zombie {
+    /// Its tid
+    pub fn tid(self) -> Tid {
+        match self {
+            Self::Exiting(t) | Self::Leader(t) => t,
+        }
+    }
+}
+
+/// [`Rcv`] of `z`, read under TASKLIST
+fn receiver(table: &GlobalTaskTable, z: Zombie) -> Option<Rcv> {
+    let tid = z.tid();
     let t = table.get(tid)?;
     let real = t.real_parent.as_ref().and_then(|w| w.upgrade());
     let tracer = t.tracer();
     let traced = tracer.is_some();
     let parent = tracer.or(real.clone())?;
-    // A tracer that is not the parent, or a thread: SIGCHLD
-    let reparented = traced && !real.as_ref().is_some_and(|r| Arc::ptr_eq(r, &parent));
-    let mut sig = if t.leader && !reparented {
-        t.exit_signal as u32
-    } else {
-        SIGCHLD
+    let own = match z {
+        Zombie::Exiting(_) => {
+            // Linux ptrace_reparented: the tracer is not a thread of
+            // the real parent's process
+            let reparented = traced && real.as_ref().is_none_or(|r| r.pid != parent.pid);
+            t.leader
+                && !reparented
+                && !crate::task::percpu::group_pending(table, t.task.pid, &[tid])
+        }
+        Zombie::Leader(_) => true,
     };
+    let mut sig = if own { t.exit_signal as u32 } else { SIGCHLD };
     // A custom exit signal only to the image that asked for it (Linux:
     // parent_exec_id != parent->self_exec_id makes it SIGCHLD)
     if sig != SIGCHLD && t.parent_exec_id != crate::task::self_exec_id(parent.pid) {
@@ -144,10 +172,10 @@ pub struct Entry {
 }
 
 impl Entry {
-    /// For zombie (or soon zombie) `tid`'s notice
-    pub fn child(tid: Tid) -> Self {
+    /// For zombie (or soon zombie) `z`'s notice
+    pub fn child(z: Zombie) -> Self {
         let table = TASKLIST.read();
-        let r = receiver(&table, tid).filter(|r| r.sig != 0);
+        let r = receiver(&table, z).filter(|r| r.sig != 0);
         let pre = r
             .as_ref()
             .and_then(|r| Some((super::target_in(&table, &r.to)?, r.sig)));
@@ -195,10 +223,10 @@ impl Entry {
         }
     }
 
-    /// Under TASKLIST: zombie `tid`'s notice would go where this entry
+    /// Under TASKLIST: zombie `z`'s notice would go where this entry
     /// was made for (or needs none)
-    pub fn fits(&self, table: &GlobalTaskTable, tid: Tid) -> bool {
-        match receiver(table, tid) {
+    pub fn fits(&self, table: &GlobalTaskTable, z: Zombie) -> bool {
+        match receiver(table, z) {
             Some(r) if r.sig != 0 => self.matches(table, &r.to, r.sig),
             _ => true,
         }
@@ -247,10 +275,10 @@ impl Told {
     }
 }
 
-/// Zombie `tid` tells whoever waits for it that it is gone (Linux
+/// Zombie `z` tells whoever waits for it that it is gone (Linux
 /// do_notify_parent): its tracer, or for a leader whose group is gone
-/// its parent, gets its exit signal (SIGCHLD to a tracer that is not
-/// the parent) with CLD_EXITED/KILLED/DUMPED, its pid, uid, status and
+/// its parent, gets the signal [`Zombie`]'s rule gives it with
+/// CLD_EXITED/KILLED/DUMPED, its pid, uid, status and
 /// the group's CPU times. Autoreap: an untraced child whose parent
 /// ignores SIGCHLD (no signal then) or set SA_NOCLDWAIT.
 ///
@@ -259,8 +287,9 @@ impl Told {
 /// do_notify_parent under tasklist_lock), with `entry` checked by
 /// [`Entry::fits`] in that section: no wait reaps it before its signal
 /// is pending, and a parent its signal wakes finds it.
-pub fn notify(table: &GlobalTaskTable, tid: Tid, mut entry: Entry) -> Told {
-    let Some(r) = receiver(table, tid) else {
+pub fn notify(table: &GlobalTaskTable, z: Zombie, mut entry: Entry) -> Told {
+    let tid = z.tid();
+    let Some(r) = receiver(table, z) else {
         return Told {
             entry,
             ..Told::default()

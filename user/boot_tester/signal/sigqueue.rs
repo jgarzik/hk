@@ -100,6 +100,7 @@ pub fn run_tests() {
     test_timer_gone();
     test_exit_signal_exec();
     test_exit_signal_reparent();
+    test_exit_signal_traced();
     test_reparent_traced_zombie();
     test_ptrace_siginfo();
     test_exec_signals();
@@ -1279,6 +1280,88 @@ fn test_exit_signal_reparent() {
     } else {
         fail_num(b"SIGQUEUE_EXIT_SIGNAL_REPARENT:FAIL sig=", got);
     }
+}
+
+#[repr(C, align(16))]
+struct Stack([u8; 16384]);
+static mut TRACED_STACK: Stack = Stack([0; 16384]);
+static mut TRACED_CTID: u32 = 0;
+
+/// Block in read() on `fd`, then exit the thread
+extern "C" fn read_exit(fd: u64) -> ! {
+    let mut b = [0u8; 1];
+    sys_read(fd, b.as_mut_ptr(), 1);
+    sys_exit(0)
+}
+
+/// In a child, SIGCHLD and SIGUSR1 blocked: its SIGUSR1-exit child,
+/// which it traces (the tracer is the parent), ends its leader while a
+/// thread still runs: the notice is SIGCHLD (Linux exit_notify: the
+/// exit signal only once thread_group_empty); the thread's exit then
+/// reports the leader with SIGUSR1 (release_task), and the child is
+/// reaped
+fn test_exit_signal_traced() {
+    let s = sys_fork();
+    if s == 0 {
+        hk_syscall::sys_exit_group(exit_signal_traced() as u64);
+    }
+    let mut st = 0i32;
+    sys_wait4(s, &mut st, 0, 0);
+    if st == 0 {
+        pass(b"SIGQUEUE_EXIT_SIGNAL_TRACED");
+    } else {
+        fail_num(b"SIGQUEUE_EXIT_SIGNAL_TRACED:FAIL status=", st as i64);
+    }
+}
+
+/// [`test_exit_signal_traced`]'s child: 0, or the failed step << 6 |
+/// the signal it got
+fn exit_signal_traced() -> i32 {
+    const PTRACE_SEIZE: i64 = 0x4206;
+    const WALL: i32 = 0x4000_0000;
+    block(bit(SIGCHLD) | bit(SIGUSR1));
+    let mut seized = [0i32; 2];
+    let mut go = [0i32; 2];
+    hk_syscall::sys_pipe2(seized.as_mut_ptr(), 0);
+    hk_syscall::sys_pipe2(go.as_mut_ptr(), 0);
+    let c = hk_syscall::sys_clone(SIGUSR1 as u64, 0, 0, 0, 0);
+    if c == 0 {
+        let mut b = [0u8; 1];
+        sys_read(seized[0] as u64, b.as_mut_ptr(), 1);
+        // SAFETY: a stack of our own (this process's copy) for the thread
+        let top = unsafe { (&raw mut TRACED_STACK as *mut u8).add(16384) as u64 };
+        // SAFETY: read_exit only reads a pipe and exits
+        let t = unsafe {
+            crate::mm::fork_mm::spawn_thread(top, read_exit, go[0] as u64, &raw mut TRACED_CTID)
+        };
+        if t < 0 {
+            hk_syscall::sys_exit_group(1);
+        }
+        // The leader alone
+        sys_exit(0);
+    }
+    if sys_ptrace(PTRACE_SEIZE, c, 0, 0) != 0 {
+        sys_kill(c, 9);
+        return 1 << 6;
+    }
+    hk_syscall::sys_write(seized[1] as u64, b"x".as_ptr(), 1);
+    let mut i = zeroed();
+    let first = wait_sig(bit(SIGCHLD) | bit(SIGUSR1), 5, &mut i);
+    hk_syscall::sys_write(go[1] as u64, b"x".as_ptr(), 1);
+    let mut i2 = zeroed();
+    let second = wait_sig(bit(SIGCHLD) | bit(SIGUSR1), 5, &mut i2);
+    let mut st = 0i32;
+    let r = sys_wait4(c, &mut st, WALL, 0);
+    if first != SIGCHLD as i64 || i.si_pid as i64 != c {
+        return (2 << 6) | (first as i32 & 0x3f);
+    }
+    if second != SIGUSR1 as i64 || i2.si_pid as i64 != c {
+        return (3 << 6) | (second as i32 & 0x3f);
+    }
+    if r != c {
+        return 4 << 6;
+    }
+    0
 }
 
 static PT_SEEN: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
