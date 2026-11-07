@@ -1083,6 +1083,10 @@ where
     if let Err(e) = de_thread(tid) {
         return -e;
     }
+    // Handlers, alternate stack and timers of the old image go
+    if let Err(e) = crate::signal::exec_signals() {
+        return -e.errno();
+    }
 
     // Now we need to update the current task and switch to the new address space
     // This is the point of no return

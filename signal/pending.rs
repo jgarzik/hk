@@ -235,6 +235,22 @@ impl SigPending {
 }
 
 impl SigPending {
+    /// Take the POSIX timers' queued signals out (Linux
+    /// __flush_itimer_signals): their signals stay pending only while
+    /// another entry for them is queued; returned to be dropped after
+    /// the lock is released
+    pub fn flush_timers(&mut self) -> SigPending {
+        let mut gone = SigPending::new();
+        while let Some(q) = self.unlink(|q| q.info.code == si_code::SI_TIMER) {
+            self.signal.remove(q.info.sig());
+            gone.queue(q);
+        }
+        for q in core::iter::successors(self.list.as_deref(), |q| q.next.as_deref()) {
+            self.signal.add(q.info.sig());
+        }
+        gone
+    }
+
     /// The info of its `n`th queued entry (PTRACE_PEEKSIGINFO)
     pub fn nth(&self, n: u64) -> Option<SigInfo> {
         self.iter().nth(usize::try_from(n).ok()?).map(|q| q.info)

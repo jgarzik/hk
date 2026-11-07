@@ -36,6 +36,10 @@
 //!   (PTRACE_GETSIGINFO), its tracee's queued ones
 //!   (PTRACE_PEEKSIGINFO, shared), and changes what is delivered
 //!   (PTRACE_SETSIGINFO)
+//! - exec resets caught handlers to SIG_DFL (ignored stay ignored),
+//!   forgets the alternate stack, deletes timer_create timers with their
+//!   pending signals; the blocked mask, other pending signals and
+//!   ITIMER_REAL stay
 //! - arm64: a handler set without SA_RESTORER returns through the
 //!   kernel's trampoline (Linux: the vDSO sigtramp), a mapping of its
 //!   own in /proc/self/maps ([sigpage]; Linux [vdso])
@@ -85,6 +89,7 @@ pub fn run_tests() {
     test_exit_signal_exec();
     test_exit_signal_reparent();
     test_ptrace_siginfo();
+    test_exec_signals();
     #[cfg(target_arch = "aarch64")]
     test_no_restorer();
 }
@@ -1002,7 +1007,13 @@ fn test_no_restorer() {
 static mut GONE_CTID: u32 = 0;
 static mut GONE_STACK: GroupStack = GroupStack([0; 16384]);
 
+static GONE_GO: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
+
+/// Exits once its timer exists (made while it lives)
 extern "C" fn gone_thread(_: u64) -> ! {
+    while GONE_GO.load(core::sync::atomic::Ordering::Acquire) == 0 {
+        hk_syscall::sys_sched_yield();
+    }
     sys_exit(0)
 }
 
@@ -1020,6 +1031,7 @@ fn test_timer_gone() {
             super::fork_mm::spawn_thread(top, gone_thread, 0, ctid)
         };
         let id = timer(SIGRT, 5, 4, tid as i32);
+        GONE_GO.store(1, core::sync::atomic::Ordering::Release);
         let joined = super::fork_mm::join(&raw mut GONE_CTID);
         arm(id, 5, 0);
         sleep_ms(50);
@@ -1190,6 +1202,63 @@ fn test_ptrace_siginfo() {
         print_num(s);
         print(b" exit=");
         print_num(st2 as i64);
+        println(b"");
+    }
+}
+
+static mut EXEC_ALTSTACK: [u8; 16384] = [0; 16384];
+
+/// In a child: a handler for SIGUSR1, SIGUSR2 ignored, an alternate
+/// stack, SIGRT and SIGRT + 1 blocked with SIGRT pending (kill) and a
+/// timer's SIGRT + 1 pending, ITIMER_REAL armed; then exec
+/// boot_tester2 sigexec, which checks what is left
+fn test_exec_signals() {
+    let c = sys_fork();
+    if c == 0 {
+        let act: [u64; 4] = [
+            pt_handler as *const () as u64,
+            SA_SIGINFO | SA_RESTORER,
+            super::signals::restorer_addr(),
+            0,
+        ];
+        sys_rt_sigaction(SIGUSR1, act.as_ptr() as u64, 0, 8);
+        let ign: [u64; 4] = [1, 0, 0, 0];
+        sys_rt_sigaction(12, ign.as_ptr() as u64, 0, 8);
+        let ss: [u64; 3] = [(&raw mut EXEC_ALTSTACK) as u64, 0, 16384];
+        hk_syscall::sys_sigaltstack(ss.as_ptr() as u64, 0);
+        block(bit(SIGRT) | bit(SIGRT + 1));
+        sys_kill(sys_getpid(), SIGRT);
+        let id = timer(SIGRT + 1, 1, 0, 0);
+        arm(id, 1, 0);
+        sleep_ms(20);
+        let it = hk_syscall::ITimerVal {
+            it_interval: hk_syscall::Timeval {
+                tv_sec: 0,
+                tv_usec: 0,
+            },
+            it_value: hk_syscall::Timeval {
+                tv_sec: 100,
+                tv_usec: 0,
+            },
+        };
+        block(bit(14));
+        hk_syscall::sys_setitimer(0, &it, core::ptr::null_mut());
+        let argv: [*const u8; 3] = [
+            b"boot_tester2\0".as_ptr(),
+            b"sigexec\0".as_ptr(),
+            core::ptr::null(),
+        ];
+        let envp: [*const u8; 1] = [core::ptr::null()];
+        hk_syscall::sys_execve(b"/bin/boot_tester2\0".as_ptr(), argv.as_ptr(), envp.as_ptr());
+        sys_exit(99);
+    }
+    let mut st = 0i32;
+    sys_wait4(c, &mut st, 0, 0);
+    if st == 0 {
+        println(b"SIGQUEUE_EXEC:OK");
+    } else {
+        print(b"SIGQUEUE_EXEC:FAIL status=");
+        print_num(st as i64);
         println(b"");
     }
 }

@@ -1018,6 +1018,45 @@ pub fn exit_task_signal(tid: Tid) {
 // Signal Sending
 // =============================================================================
 
+/// What an exec does to the caller's signals (Linux begin_new_exec):
+/// a handler table shared with another process (CLONE_SIGHAND) is
+/// copied first (unshare_sighand: ENOMEM), then caught signals go back
+/// to SIG_DFL (flush_signal_handlers; ignored ones stay ignored), the
+/// alternate stack is forgotten (sas_ss_sp = 0), and the process's
+/// timer_create timers are deleted with their queued signals
+/// (posixtimer_exec). Blocked and pending signals stay. The caller is
+/// its process's only thread (after de_thread).
+pub fn exec_signals() -> Result<(), KernelError> {
+    let me = crate::task::percpu::current_tid();
+    let Some(old) = get_task_sighand(me) else {
+        return Ok(());
+    };
+    let shared = TASKLIST
+        .read()
+        .iter()
+        .any(|t| t.task.tid() != me && t.sighand.as_ref().is_some_and(|h| Arc::ptr_eq(h, &old)));
+    if shared {
+        let new = old.deep_clone()?;
+        // The old reference goes after TASKLIST
+        let _old = TASKLIST
+            .write()
+            .get_mut(me)
+            .and_then(|mut t| t.sighand.replace(new));
+    }
+    if let Some(h) = get_task_sighand(me) {
+        h.flush_handlers();
+    }
+    if let Some(sig) = get_task_signal_struct(me) {
+        crate::time::posix_timer::exec_timers(&sig);
+    }
+    let _gone = with_task_signal_state(me, |s| {
+        s.altstack = AltStack::new();
+        let shared = s.shared_pending.lock().flush_timers();
+        (s.pending.flush_timers(), shared)
+    });
+    Ok(())
+}
+
 /// The current thread group's pending `sig` is discarded, every queued
 /// instance with it (Linux do_sigaction once the action ignores it:
 /// POSIX, whether or not it is blocked)

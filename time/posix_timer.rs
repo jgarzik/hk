@@ -975,6 +975,30 @@ pub fn exit_itimers(sig: &crate::signal::SignalStruct) {
     }
 }
 
+/// An exec deletes the process's timer_create timers; its itimers stay
+/// (Linux posixtimer_exec: exit_itimers keeps signal->it, whose
+/// ITIMER_REAL survives exec as POSIX wants). The registry is taken out
+/// and the itimers' rebuilt outside its lock (nothing allocates or is
+/// released under it); the caller is the process's only thread.
+pub fn exec_timers(sig: &crate::signal::SignalStruct) {
+    let all = core::mem::take(&mut sig.posix_timers.lock().timers);
+    let mut keep = BTreeMap::new();
+    let mut gone = alloc::vec::Vec::new();
+    for (id, t) in all {
+        if id < 0 {
+            keep.insert(id, t);
+        } else {
+            gone.push(t);
+        }
+    }
+    core::mem::swap(&mut sig.posix_timers.lock().timers, &mut keep);
+    // Anything made meanwhile goes too (none: the caller is alone)
+    gone.extend(core::mem::take(&mut keep).into_values());
+    for t in gone {
+        t.delete();
+    }
+}
+
 // =============================================================================
 // Syscall implementations
 // =============================================================================
