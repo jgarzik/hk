@@ -931,7 +931,7 @@ pub mod tif {
 /// [`TaskRef`]: the task table, run queues and lookups hold references
 ///
 /// Three kinds of fields:
-/// - fixed at creation: `tid`, `pid`, `kind`, `kstack_top`;
+/// - fixed at creation: `tid`, `pid`, `pid_ns`, `kind`, `kstack_top`;
 /// - hot counters and flags: atomics written by the task itself (or
 ///   its creator before it first runs) or under TASKLIST, and read
 ///   lock-free by anyone (accounting, `flags`, `thread_flags`, `cpu`,
@@ -951,6 +951,10 @@ pub struct Task {
     tid: AtomicU64,
     /// Process (thread-group) ID: the leader's tid (Linux tgid)
     pub pid: Pid,
+    /// The pid namespace it was created in (Linux task_active_pid_ns;
+    /// None: the root one): fixed at creation, its threads' too
+    /// (CLONE_THREAD stays in the creator's), so read lock-free
+    pid_ns: Option<Arc<crate::ns::PidNamespace>>,
     /// Kind of task
     pub kind: TaskKind,
     /// Kernel stack top
@@ -1567,6 +1571,7 @@ impl Task {
         Self {
             tid: AtomicU64::new(tid),
             pid: ids.pid,
+            pid_ns: inner.thread_pid.as_ref().map(|p| p.ns().clone()),
             kind,
             kstack_top,
             start_time: AtomicU64::new(now),
@@ -1631,6 +1636,7 @@ impl Task {
         Self {
             tid: AtomicU64::new(0),
             pid: 0,
+            pid_ns: None,
             kind: TaskKind::KernelThread,
             kstack_top,
             start_time: AtomicU64::new(0),
@@ -1693,6 +1699,20 @@ impl Task {
     #[inline]
     pub fn tid(&self) -> Tid {
         self.tid.load(Ordering::Relaxed)
+    }
+
+    /// The pid namespace it was created in (Linux task_active_pid_ns)
+    #[inline]
+    pub fn pid_ns(&self) -> &crate::ns::PidNamespace {
+        self.pid_ns.as_deref().unwrap_or(&crate::ns::INIT_PID_NS)
+    }
+
+    /// The pid namespace the numbers it passes and gets through
+    /// syscalls are in: the root one until every boundary translates
+    /// (BUGS.md, review gap 7), so no syscall ever mixes the two
+    #[inline]
+    pub fn view_pid_ns(&self) -> &crate::ns::PidNamespace {
+        &crate::ns::INIT_PID_NS
     }
 
     /// Take over thread ID `tid` (exec's exchange_tids, TASKLIST and

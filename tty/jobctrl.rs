@@ -216,7 +216,7 @@ pub fn tiocspgrp(tty: &Tty, pgrp: i32) -> Result<(), KernelError> {
     // A group id names a live pid (Linux find_vpid); 0 never does
     let pg = match nr {
         0 => None,
-        n => crate::task::pid::find_pgrp(n),
+        n => crate::task::pid::find_pgrp(&crate::ns::INIT_PID_NS, n),
     };
     let table = TASKLIST.read();
     let (_, s) = pids(&table).ok_or(KernelError::NotTty)?;

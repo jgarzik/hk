@@ -10,24 +10,23 @@
 use crate::util::error::KernelError;
 use crate::util::kalloc::try_arc;
 
-use super::{Pid, Tid};
-
-/// sys_getpid - get current process ID
-pub fn sys_getpid(pid: Pid) -> i64 {
-    pid as i64
+/// sys_getpid: the caller's process id in its pid namespace (Linux
+/// task_tgid_vnr(current))
+pub fn sys_getpid() -> i64 {
+    i64::from(super::pid::vnr(super::percpu::current_pid()))
 }
 
-/// sys_gettid - get current thread ID
-pub fn sys_gettid(tid: Tid) -> i64 {
-    tid as i64
+/// sys_gettid: the caller's thread id in its pid namespace (Linux
+/// task_pid_vnr(current))
+pub fn sys_gettid() -> i64 {
+    i64::from(super::pid::vnr(super::percpu::current_tid()))
 }
 
-/// sys_getppid - get parent process ID
-///
-/// Returns the process ID of the parent of the calling process.
-/// For init (PID 1), returns 0.
-pub fn sys_getppid(ppid: Pid) -> i64 {
-    ppid as i64
+/// sys_getppid: the parent process's id in the caller's pid namespace,
+/// 0 for init or a parent outside it (Linux
+/// task_tgid_vnr(current->real_parent))
+pub fn sys_getppid() -> i64 {
+    i64::from(super::percpu::current_ppid_vnr())
 }
 
 /// sys_getuid - get real user ID

@@ -89,10 +89,16 @@ impl Pid {
         self.numbers[0].nr
     }
 
-    /// Its number in `ns`, if it is visible there (Linux pid_nr_ns)
+    /// Its number in `ns`, if it is visible there
     pub fn nr_in(&self, ns: &PidNamespace) -> Option<u32> {
         let u = self.numbers.get(ns.level as usize)?;
         core::ptr::eq(Arc::as_ptr(&u.ns), ns).then_some(u.nr)
+    }
+
+    /// Its number in `ns`, 0 if it is not visible there (Linux
+    /// pid_nr_ns)
+    pub fn nr_ns(&self, ns: &PidNamespace) -> u32 {
+        self.nr_in(ns).unwrap_or(0)
     }
 
     /// Execs of the process it leads
@@ -350,13 +356,38 @@ pub static INIT_STRUCT_PID: spin::Lazy<Arc<Pid>> = spin::Lazy::new(|| {
     })
 });
 
-/// The process group (or session) numbered `nr` in the root namespace:
-/// 0 is the boot one (`INIT_STRUCT_PID`)
-pub fn find_pgrp(nr: u64) -> Option<Arc<Pid>> {
+/// The process group (or session) numbered `nr` in `ns`: 0 in the root
+/// namespace is the boot one (`INIT_STRUCT_PID`)
+pub fn find_pgrp(ns: &PidNamespace, nr: u64) -> Option<Arc<Pid>> {
     if nr == 0 {
-        return Some(INIT_STRUCT_PID.clone());
+        return (ns.level == 0).then(|| INIT_STRUCT_PID.clone());
     }
-    find_pid(&crate::ns::INIT_PID_NS, u32::try_from(nr).ok()?)
+    find_pid(ns, u32::try_from(nr).ok()?)
+}
+
+/// The caller's pid namespace (Linux task_active_pid_ns(current)):
+/// lock-free, it cannot change while the task runs
+pub fn current_pid_ns() -> &'static PidNamespace {
+    crate::task::percpu::current_pid_ns()
+}
+
+/// Root number `nr` (a tid, tgid, process group or session id) as `ns`
+/// numbers it, 0 if not visible there (Linux pid_nr_ns of its struct
+/// pid). The caller keeps its owner alive (it is the caller's own, or
+/// TASKLIST is held), so the number is not reused meanwhile.
+pub fn nr_ns(nr: u64, ns: &PidNamespace) -> u32 {
+    let Ok(n) = u32::try_from(nr) else {
+        return 0;
+    };
+    if ns.level == 0 {
+        return n;
+    }
+    find_pid(&crate::ns::INIT_PID_NS, n).map_or(0, |p| p.nr_ns(ns))
+}
+
+/// Root number `nr` in the caller's namespace (Linux pid_vnr)
+pub fn vnr(nr: u64) -> u32 {
+    nr_ns(nr, current_pid_ns())
 }
 
 /// The live `Pid` numbered `nr` in `ns` (Linux find_pid_ns)

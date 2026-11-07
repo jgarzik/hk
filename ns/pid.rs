@@ -3,8 +3,9 @@
 //! PID namespaces isolate process IDs (Linux: each namespace numbers its
 //! tasks from 1, and a task has a PID in its own namespace and every
 //! ancestor). Each namespace has its number bitmap (`task::pid`), and a
-//! task gets a number in each level of its parent's namespace chain;
-//! syscalls still report the root number (BUGS.md).
+//! task gets a number in each level of its namespace chain; syscalls
+//! translate between the caller's numbers and the root ones
+//! (`task::pid::vnr`).
 
 use crate::util::kalloc::{arc_nofail, try_arc};
 use alloc::sync::Arc;

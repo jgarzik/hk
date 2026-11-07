@@ -1554,8 +1554,8 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<Tid, &'static str> {
     let task_inner = crate::task::TaskInner {
         thread_pid: Some(thread_pid),
         // The boot group and session, number 0 (Linux init_struct_pid)
-        pgrp: crate::task::pid::find_pgrp(config.pgid),
-        session: crate::task::pid::find_pgrp(config.sid),
+        pgrp: crate::task::pid::find_pgrp(&crate::ns::INIT_PID_NS, config.pgid),
+        session: crate::task::pid::find_pgrp(&crate::ns::INIT_PID_NS, config.sid),
         pids_linked: false,
         exit_code: 0,
         exit_signal: crate::signal::SIGCHLD as i32, // Default: notify parent with SIGCHLD
@@ -2205,9 +2205,6 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         comm: me.comm(),
         mempolicy: me.task_lock().mempolicy(),
     };
-    let parent_pid_ns = me
-        .nsproxy()
-        .map_or_else(|| crate::ns::INIT_PID_NS.clone(), |n| n.pid_ns.clone());
     let parent_mm = me.mm_ref();
 
     // Get parent iopl_emul (x86-64 only) - must be done in separate block
@@ -2244,6 +2241,15 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     let child_fs = crate::fs::fsstruct::fork_fs(current_tid, config.flags & CLONE_FS != 0)
         .map_err(|e| e.errno())?;
     let child_ns = crate::ns::fork_nsproxy(current_tid, config.flags, child_fs.as_deref())?;
+    // A thread stays in its group's pid namespace (Linux copy_process:
+    // CLONE_THREAD with CLONE_NEWPID or CLONE_NEWUSER, or after an
+    // unshare(CLONE_NEWPID), is EINVAL)
+    if config.flags & CLONE_THREAD != 0
+        && (config.flags & (CLONE_NEWPID | CLONE_NEWUSER) != 0
+            || !core::ptr::eq(Arc::as_ptr(&child_ns.pid_ns), me.task.pid_ns()))
+    {
+        return Err(22); // EINVAL
+    }
     let into_cgroup = if config.flags & CLONE_INTO_CGROUP != 0 {
         Some(crate::task::cgroup_from_fd(current_tid, config.cgroup_fd)?)
     } else {
@@ -2272,11 +2278,12 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         None
     };
 
-    // The child's pid, numbered in each level of the parent's pid
-    // namespace (Linux alloc_pid); a new process's pid is its tid
-    // (leader pid == tid), a thread keeps its group's
-    // EAGAIN with no number left, ENOMEM
-    let child_thread_pid = crate::task::pid::alloc_pid(&parent_pid_ns).map_err(|e| e.errno())?;
+    // The child's pid, numbered in each level of its pid namespace: the
+    // one its creator makes children in, a new one with CLONE_NEWPID
+    // (Linux alloc_pid(p->nsproxy->pid_ns_for_children)); a new
+    // process's pid is its tid (leader pid == tid), a thread keeps its
+    // group's. EAGAIN with no number left, ENOMEM
+    let child_thread_pid = crate::task::pid::alloc_pid(&child_ns.pid_ns).map_err(|e| e.errno())?;
     let child_tid = Tid::from(child_thread_pid.nr());
     let child_pid = if config.flags & CLONE_THREAD != 0 {
         parent_pid
@@ -4315,6 +4322,13 @@ pub fn current_pid() -> Pid {
     current().pid
 }
 
+/// The current task's pid namespace (Linux task_active_pid_ns(current)):
+/// a creation-time field, read lock-free; it outlives the task's every
+/// syscall like `current()` itself
+pub fn current_pid_ns() -> &'static crate::ns::PidNamespace {
+    current().task.view_pid_ns()
+}
+
 /// Get the current task's thread ID
 pub fn current_tid() -> Tid {
     current().tid()
@@ -4323,6 +4337,20 @@ pub fn current_tid() -> Tid {
 /// Get the current task's parent process ID
 pub fn current_ppid() -> Pid {
     current().ppid()
+}
+
+/// The current task's parent process as its pid namespace numbers it,
+/// 0 if outside it (Linux task_tgid_vnr(current->real_parent)):
+/// TASKLIST keeps the parent listed, and its number, while it is
+/// translated
+pub fn current_ppid_vnr() -> u32 {
+    let me = current();
+    let ns = me.task.view_pid_ns();
+    if ns.level == 0 {
+        return crate::task::pid::nr_ns(me.ppid(), ns);
+    }
+    let _table = TASKLIST.read();
+    crate::task::pid::nr_ns(me.ppid(), ns)
 }
 
 /// Get the current task's process group ID
@@ -4359,7 +4387,7 @@ pub fn increment_maj_flt() {
 
 /// Every thread of every process in group `pgid` (its pid links)
 pub fn get_tids_by_pgid(pgid: Pid) -> alloc::vec::Vec<Tid> {
-    let Some(pg) = crate::task::pid::find_pgrp(pgid) else {
+    let Some(pg) = crate::task::pid::find_pgrp(&crate::ns::INIT_PID_NS, pgid) else {
         return alloc::vec::Vec::new();
     };
     let table = TASKLIST.read();
@@ -4369,7 +4397,7 @@ pub fn get_tids_by_pgid(pgid: Pid) -> alloc::vec::Vec<Tid> {
 /// The processes of group `pgid`, by pid (their leaders on its list;
 /// Linux do_each_pid_task PIDTYPE_PGID)
 pub fn pgrp_pids(pgid: Pid) -> alloc::vec::Vec<Pid> {
-    match crate::task::pid::find_pgrp(pgid) {
+    match crate::task::pid::find_pgrp(&crate::ns::INIT_PID_NS, pgid) {
         Some(pg) => pgrp_members(&pg),
         None => alloc::vec::Vec::new(),
     }
@@ -4454,7 +4482,7 @@ pub fn lookup_task_pgid(pid: Pid) -> Option<Pid> {
 
 /// True if some process is in group `pgid`
 pub fn pgrp_exists(pgid: Pid) -> bool {
-    let Some(pg) = crate::task::pid::find_pgrp(pgid) else {
+    let Some(pg) = crate::task::pid::find_pgrp(&crate::ns::INIT_PID_NS, pgid) else {
         return false;
     };
     let table = TASKLIST.read();
@@ -4762,7 +4790,7 @@ pub fn set_task_pgid(
     caller_sid: Pid,
 ) -> Result<(), i32> {
     // Found before TASKLIST (the pid hash's lock is not nested in it)
-    let target = crate::task::pid::find_pgrp(new_pgid);
+    let target = crate::task::pid::find_pgrp(&crate::ns::INIT_PID_NS, new_pgid);
     let mut old = Vec::new();
     let mut table = TASKLIST.write();
     setpgid_who(&table, caller_pid, target_pid, caller_sid)?;

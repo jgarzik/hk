@@ -424,10 +424,8 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
             crate::task::percpu::current_pid(),
             crate::task::percpu::current_pgid(),
         ) as u64,
-        Sys::Getpid => crate::task::syscall::sys_getpid(crate::task::percpu::current_pid()) as u64,
-        Sys::Getppid => {
-            crate::task::syscall::sys_getppid(crate::task::percpu::current_ppid()) as u64
-        }
+        Sys::Getpid => crate::task::syscall::sys_getpid() as u64,
+        Sys::Getppid => crate::task::syscall::sys_getppid() as u64,
         Sys::Getpriority => crate::task::syscall::sys_getpriority(a[0] as i32, a[1] as i32) as u64,
         Sys::Getrandom => {
             crate::task::syscall::sys_getrandom::<Uaccess>(a[0], a[1] as usize, a[2] as u32) as u64
@@ -456,7 +454,7 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
             crate::net::syscall::sys_getsockopt(a[0] as i32, a[1] as i32, a[2] as i32, a[3], a[4])
                 as u64
         }
-        Sys::Gettid => crate::task::syscall::sys_gettid(crate::task::percpu::current_tid()) as u64,
+        Sys::Gettid => crate::task::syscall::sys_gettid() as u64,
         Sys::Gettimeofday => crate::time::time_syscall::sys_gettimeofday(a[0], a[1]) as u64,
         Sys::Getuid => {
             crate::task::syscall::sys_getuid(crate::task::percpu::current_cred().uid) as u64

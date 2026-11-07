@@ -18,6 +18,13 @@ infallible, so each one is investigated, not written off.
 
 ## Seen on hk only
 
+- **A process's wait status is its last thread's**: when every thread
+  ends with exit(2) (no exit_group), the thread taking the live count
+  to zero starts a group exit with its own code
+  (`SignalStruct::thread_exiting`), so wait4 reports that thread's
+  status. Linux sets no group exit there and reports the leader's
+  exit_code (wait_task_zombie).
+
 - **MM_FAULT_STORM once under LOCKDEP**: one x86 `make check LOCKDEP=1`
   run reported `MM_FAULT_STORM:FAIL got 0` (no wrong value: a thread did
   not finish within the 60 s join); three later LOCKDEP runs (x86 twice,
@@ -875,11 +882,13 @@ Tag = roadmap phase (doc/ROADMAP.md).
    allocator, cached sorted device list.
 6. **One AnonVma per fork family, Vec chain** (J).
    `mm/anon_vma.rs:85`: O(N×VMAs) under one family write lock.
-7. **Syscalls report root-namespace pids** (C). Tasks get a number in
-   every level of their pid namespace chain (`task/pid.rs`), but
-   getpid/gettid/kill/wait//proc use the root number; a CLONE_NEWPID
-   child is not pid 1 in its namespace. Use `Pid::nr_in(caller's ns)`
-   at the syscall boundary.
+7. **Syscalls report root-namespace pids** (C). A CLONE_NEWPID child
+   is numbered in its namespace and getpid, gettid and getppid go
+   through `pid::vnr`, but every boundary reads `Task::view_pid_ns`,
+   the root namespace, until the rest translate too (clone, wait, kill
+   and the other pid arguments, process groups, siginfo, SCM
+   credentials, /proc); a task must never get a number in one
+   namespace that an argument reads in another.
 8. **MM_LIFE_EXEC_CHAIN flake** (arm64 CI, TCG, NIC=e1000):
    `MM_LIFE_EXEC_CHAIN:FAIL -2`, a measured chain's child (busybox
    `env` x40 then `true`: 41 execs in one process) exited nonzero: a

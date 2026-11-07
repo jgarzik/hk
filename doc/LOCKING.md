@@ -873,6 +873,22 @@ under TASKLIST (the run queue knows tasks by reference, not by
 number). The idle tasks
 are tid 0 and, like the boot task, not in TASKLIST.
 
+**Pid namespaces** (Linux task_active_pid_ns, pid_nr_ns, pid_vnr,
+find_vpid): a task's namespace is `Task.pid_ns`, fixed at creation (a
+thread is made in its group's: CLONE_THREAD into another namespace is
+EINVAL), so the current task reads its own lock-free
+(`pid::current_pid_ns`), and a `Pid`'s numbers are immutable
+(`Pid::nr_ns`, `vnr`: no lock). Inside the kernel tasks, groups and
+sessions are named by root numbers or `Arc<Pid>`; numbers are
+translated only at the user boundary: out, a root number to a
+namespace's (`pid::nr_ns`, `vnr`: 0 if not visible) through the hash
+(PIDMAP_LOCK), its owner kept listed by the caller meanwhile (the
+caller's own ids, or TASKLIST held for reading: getppid); in, a
+caller's number to the root one (`find_pgrp(ns, nr)`: ESRCH if not
+visible), through the hash before TASKLIST is taken. The boundary reads
+`Task::view_pid_ns`, the root namespace, until every syscall translates
+(BUGS.md).
+
 **Relations** (under TASKLIST's write lock to change, read lock to
 walk): `real_parent` and `ptracer` are task references (`Weak`), never
 numbers, so a recycled tid cannot inherit a parent or tracer link. A
@@ -915,7 +931,7 @@ hashed). kill(-pgrp), kill(0), tty ISIG, F_SETOWN and PRIO_PGRP /
 IOPRIO_WHO_PGRP walk a group's list, never the whole task list.
 
 A `Task` has five kinds of fields: fixed at creation (`tid`, `pid`,
-`kind`, `kstack_top`); hot atomics written by the task itself (or its
+`pid_ns`, `kind`, `kstack_top`); hot atomics written by the task itself (or its
 creator before it first runs) or under TASKLIST, and read lock-free
 by anyone (`flags` = Linux PF_*, `thread_flags` = TIF_*, `cpu`,
 `start_time`, `ppid`/`pgid`/`sid`, `seccomp_mode`, `tls`, utime/stime
