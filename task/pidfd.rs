@@ -121,18 +121,6 @@ pub fn create_pidfd(pid: Pid, file_flags: u32) -> Result<Arc<File>, KernelError>
     Ok(file)
 }
 
-/// Notify all pidfds for the given PID that the process has exited
-///
-/// Called from exit_notify() when a process transitions to zombie state.
-/// Process `pid` has exited with wait `status` (its last thread): its
-/// pidfds become readable
-pub fn notify_process_exit(pid: Pid, status: i32) {
-    let Ok(nr) = u32::try_from(pid) else { return };
-    if let Some(p) = crate::task::pid::find_pid(&crate::ns::INIT_PID_NS, nr) {
-        p.set_exited(status);
-    }
-}
-
 /// Get the Pidfd from a File (for syscall implementations)
 ///
 /// Returns the Arc<Pidfd> if the file is a pidfd, None otherwise.

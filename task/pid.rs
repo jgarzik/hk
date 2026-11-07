@@ -117,9 +117,15 @@ impl Pid {
     }
 
     /// Its process has exited with `status` (the last thread's exit):
-    /// pidfd pollers wake (Linux do_notify_pidfd)
+    /// a pidfd poll sees it from now on. Marked under TASKLIST before
+    /// the exit's signal is queued (Linux do_notify_pidfd from
+    /// do_notify_parent); [`Pid::exit_wake`] wakes the pollers after.
     pub fn set_exited(&self, status: i32) {
         self.exit.store(i64::from(status), Ordering::Release);
+    }
+
+    /// Wake the pidfd pollers of a process [`Pid::set_exited`] marked
+    pub fn exit_wake(&self) {
         self.wait_pidfd.wake_poll(u32::from(
             crate::io::poll::POLLIN | crate::io::poll::POLLRDNORM,
         ));

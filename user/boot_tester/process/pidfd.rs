@@ -6,17 +6,19 @@
 //! - Test pidfd_open with invalid flags returns EINVAL
 //! - Test pidfd_send_signal
 //! - Test pidfd poll for exit
+//! - Test pidfd poll for the exit of a child reaped at once (SIGCHLD
+//!   ignored)
 //! - Test procfs /proc/<pid>/fdinfo/<pidfd> shows Pid line
 //! - Test waitid with P_PIDFD
 //! - Test pidfd_getfd to get own fd via pidfd
 //! - Test pidfd_getfd with invalid flags returns EINVAL
 
-use crate::harness::{fail_num, pass};
+use crate::harness::{fail_num, pass, verdict};
 use crate::helpers::{print, print_num, println};
 use hk_syscall::{
-    P_PIDFD, POLLIN, PollFd, SigInfo, WEXITED, sys_close, sys_fork, sys_getpid, sys_open,
-    sys_pidfd_getfd, sys_pidfd_open, sys_pidfd_send_signal, sys_poll, sys_read, sys_wait4,
-    sys_waitid,
+    P_PIDFD, POLLIN, PollFd, SigInfo, WEXITED, sys_close, sys_exit, sys_exit_group, sys_fork,
+    sys_getpid, sys_open, sys_pidfd_getfd, sys_pidfd_open, sys_pidfd_send_signal, sys_pipe2,
+    sys_poll, sys_read, sys_rt_sigaction, sys_wait4, sys_waitid,
 };
 
 /// Run all pidfd tests
@@ -26,6 +28,7 @@ pub fn run_tests() {
     test_pidfd_open_invalid_flags();
     test_pidfd_send_signal();
     test_pidfd_poll_exit();
+    test_pidfd_poll_autoreap();
     test_pidfd_fdinfo();
     test_waitid_p_pidfd();
     test_pidfd_getfd_self();
@@ -164,6 +167,58 @@ fn test_pidfd_poll_exit() {
     // Reap the child
     sys_wait4(-1, core::ptr::null_mut(), 0, 0);
     pass(b"PIDFD_POLL");
+}
+
+/// A child its parent does not wait for (SIGCHLD ignored) is reaped at
+/// its exit, and its pidfd still becomes readable (Linux: the pidfd is
+/// woken before the autoreap, and a pid with no task polls POLLIN). In
+/// a helper process, so no other child of ours is reaped at once.
+fn test_pidfd_poll_autoreap() {
+    let h = sys_fork();
+    if h == 0 {
+        sys_exit_group(autoreap_poll() as u64);
+    }
+    let mut st = 0i32;
+    sys_wait4(h, &mut st, 0, 0);
+    verdict(b"PIDFD_POLL_AUTOREAP", st == 0, i64::from(st));
+}
+
+/// [`test_pidfd_poll_autoreap`]'s helper: 0 if the pidfd of its child,
+/// reaped at its exit, is readable within 2 s; else a code
+fn autoreap_poll() -> i32 {
+    const SIGCHLD: u32 = 17;
+    const SIG_IGN: u64 = 1;
+    let ign: [u64; 4] = [SIG_IGN, 0, 0, 0];
+    sys_rt_sigaction(SIGCHLD, ign.as_ptr() as u64, 0, 8);
+    let mut go = [0i32; 2];
+    sys_pipe2(go.as_mut_ptr(), 0);
+    let c = sys_fork();
+    if c == 0 {
+        // Exit once the parent closes the pipe
+        sys_close(go[1] as u64);
+        let mut b = [0u8; 1];
+        sys_read(go[0] as u64, b.as_mut_ptr(), 1);
+        sys_exit(0);
+    }
+    let pidfd = sys_pidfd_open(c as i32, 0);
+    sys_close(go[0] as u64);
+    sys_close(go[1] as u64);
+    if pidfd < 0 {
+        return 1;
+    }
+    let mut fds = [PollFd {
+        fd: pidfd as i32,
+        events: POLLIN,
+        revents: 0,
+    }];
+    let r = sys_poll(fds.as_mut_ptr(), 1, 2000);
+    if r != 1 {
+        return 2;
+    }
+    if fds[0].revents & POLLIN == 0 {
+        return 3;
+    }
+    0
 }
 
 /// Test that /proc/<pid>/fdinfo/<pidfd> contains "Pid:" line for pidfds

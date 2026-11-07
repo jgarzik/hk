@@ -2723,9 +2723,9 @@ fn with_entry<R>(mut f: impl FnMut(&mut GlobalTaskTable, &mut Entry) -> Result<R
 // added to exit_current's frame for the rest of the exit
 #[inline(never)]
 fn exit_notify(tid: Tid, status: i32, group_dead: bool) {
-    let r = with_entry(|table, entry| exit_locked(table, entry, tid, status));
+    let r = with_entry(|table, entry| exit_locked(table, entry, tid, status, group_dead));
     let Some(Exited {
-        pid,
+        pidfd,
         thread,
         told,
         gone,
@@ -2737,34 +2737,36 @@ fn exit_notify(tid: Tid, status: i32, group_dead: bool) {
         crate::fs::proc::proc_flush_pid(t.pid, tid);
     }
     drop(thread);
+    // Pidfd pollers first, then whoever takes the signal (Linux
+    // do_notify_parent: do_notify_pidfd before the send)
+    if let Some(p) = pidfd {
+        p.exit_wake();
+    }
     if let Some(t) = told {
         t.finish();
     }
     release(gone);
-    // The process's pidfds once its last thread is gone (Linux
-    // do_notify_pidfd; after TASKLIST)
-    if group_dead {
-        crate::task::pidfd::notify_process_exit(pid, status);
-    }
 }
 
-/// What [`exit_locked`] leaves for after TASKLIST: the process, the
-/// thread it took out of the list, the notice's wakeups, the zombie
-/// leader it autoreaped
+/// What [`exit_locked`] leaves for after TASKLIST: the `Pid` whose
+/// pidfd pollers are to wake, the thread it took out of the list, the
+/// notice's wakeups, the zombie leader it autoreaped
 struct Exited {
-    pid: Pid,
+    pidfd: Option<Arc<crate::task::pid::Pid>>,
     thread: Option<TaskRef>,
     told: Option<Told>,
     gone: Option<Reaped>,
 }
 
-/// [`exit_notify`]'s TASKLIST write section for task `tid`;
-/// `Err(z)`: an entry for zombie `z`'s notice is needed first
+/// [`exit_notify`]'s TASKLIST write section for task `tid`, the last
+/// of its process if `group_dead`; `Err(z)`: an entry for zombie `z`'s
+/// notice is needed first
 fn exit_locked(
     table: &mut GlobalTaskTable,
     entry: &mut Entry,
     tid: Tid,
     status: i32,
+    group_dead: bool,
 ) -> Result<Option<Exited>, Tid> {
     let Some(t) = table.get(tid) else {
         return Ok(None);
@@ -2787,6 +2789,11 @@ fn exit_locked(
         t.exit_code = status;
         t.state = TaskState::Zombie(status);
     }
+    let pidfd = if group_dead {
+        mark_pidfd(table, pid, status)
+    } else {
+        None
+    };
     let thread = if stays { None } else { table.remove(tid) };
     let told = teller.map(|z| notify(table, z, core::mem::take(entry)));
     let gone = match (&told, teller) {
@@ -2794,11 +2801,26 @@ fn exit_locked(
         _ => None,
     };
     Ok(Some(Exited {
-        pid,
+        pidfd,
         thread,
         told,
         gone,
     }))
+}
+
+/// Process `pid` exited with `status` (its last thread): its pidfds see
+/// it before its parent is told (Linux do_notify_pidfd in
+/// do_notify_parent), marked on its leader's `Pid` while the leader is
+/// listed, never found by a number an autoreap may unhash or reuse;
+/// that `Pid`, for its pollers' wakeup after TASKLIST
+fn mark_pidfd(
+    table: &GlobalTaskTable,
+    pid: Pid,
+    status: i32,
+) -> Option<Arc<crate::task::pid::Pid>> {
+    let p = table.get(pid)?.thread_pid.clone()?;
+    p.set_exited(status);
+    Some(p)
 }
 
 /// Thread `tid` of process `pid` is the last but its zombie leader:
