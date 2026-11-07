@@ -9,7 +9,7 @@ use core::arch::asm;
 use super::Aarch64TrapFrame;
 use crate::arch::UserFrame;
 use crate::mm::fault::{Access, VmFault};
-use crate::signal::{SigInfo, Trap, si_code};
+use crate::signal::{SigInfo, Trap, TrapSet, si_code};
 
 // Exception classes (ESR_EL1[31:26])
 const EC_UNKNOWN: u64 = 0x00;
@@ -265,7 +265,7 @@ extern "C" fn handle_el0_sync(frame: &UserFrame, esr: u64) {
         EC_BRK => {
             // brk #imm: PC still points at it
             let info = SigInfo::fault(crate::signal::SIGTRAP, si_code::TRAP_BRKPT, frame.ip());
-            user_fault(frame, info, Trap::default());
+            user_fault(frame, info, TrapSet::Keep);
         }
         EC_PC_ALIGN | EC_SP_ALIGN => {
             let addr = if ec == EC_SP_ALIGN {
@@ -274,7 +274,7 @@ extern "C" fn handle_el0_sync(frame: &UserFrame, esr: u64) {
                 frame.ip()
             };
             let info = SigInfo::fault(crate::signal::SIGBUS, si_code::BUS_ADRALN, addr);
-            user_fault(frame, info, Trap::default());
+            user_fault(frame, info, notify_die(esr));
         }
         _ => {
             // Undefined instruction (EC 0, e.g. udf) or any other
@@ -285,8 +285,9 @@ extern "C" fn handle_el0_sync(frame: &UserFrame, esr: u64) {
                 iss,
                 frame.ip()
             );
+            // Linux do_el0_undef (no syndrome) / bad_el0_sync (its ESR)
             let info = SigInfo::fault(crate::signal::SIGILL, si_code::ILL_ILLOPC, frame.ip());
-            user_fault(frame, info, Trap::default());
+            user_fault(frame, info, notify_die(if ec == 0 { 0 } else { esr }));
         }
     }
     // Back to user mode: its pending work first (Linux
@@ -344,17 +345,28 @@ fn user_abort(frame: &UserFrame, esr: u64, far: u64, fsc: u64, res: Result<(), V
         esr,
         sig
     );
-    let trap = Trap {
+    // Linux set_thread_esr
+    let trap = TrapSet::All(Trap {
         trapno: 0,
         error: esr,
-    };
+        addr: far,
+    });
     user_fault(frame, SigInfo::fault(sig, code, far), trap);
 }
 
 /// Deliver a synchronous fault signal (force_sig_fault) for the user
 /// context in `frame`, the task's pt_regs: a handler runs when this
 /// exception returns
-fn user_fault(frame: &UserFrame, info: SigInfo, trap: Trap) {
+/// Linux arm64_notify_die: no fault address, syndrome `esr`
+fn notify_die(esr: u64) -> TrapSet {
+    TrapSet::All(Trap {
+        trapno: 0,
+        error: esr,
+        addr: 0,
+    })
+}
+
+fn user_fault(frame: &UserFrame, info: SigInfo, trap: TrapSet) {
     super::cpu::enable_interrupts();
     crate::signal::force_sig_fault(info, trap, frame);
 }

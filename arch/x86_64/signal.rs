@@ -16,7 +16,7 @@
 
 use crate::arch::Uaccess;
 use crate::signal::siginfo::UserSigInfo;
-use crate::signal::{SigAction, SigFields, SigHandler, SigInfo, SigSet, Trap, sa_flags};
+use crate::signal::{SigAction, SigHandler, SigInfo, SigSet, Trap, sa_flags};
 use crate::uaccess::{UaccessArch, copy_from_user, copy_to_user};
 use crate::util::pod::IntoBytes;
 
@@ -337,12 +337,7 @@ pub fn setup_rt_frame(
         err: trap.error,
         trapno: trap.trapno,
         oldmask: blocked.bits(),
-        // CR2 is reported for page faults (vector 14)
-        cr2: if trap.trapno == 14 {
-            fault_addr(info)
-        } else {
-            0
-        },
+        cr2: trap.addr,
         fpstate: fpstate_addr,
         reserved: [0; 8],
     };
@@ -403,14 +398,6 @@ pub fn setup_rt_frame(
     uframe.set(r);
 
     Ok(())
-}
-
-/// si_addr of a fault's info (Linux thread.cr2 for a page fault)
-fn fault_addr(info: &SigInfo) -> u64 {
-    match info.fields() {
-        SigFields::Fault { addr, .. } => addr,
-        _ => 0,
-    }
 }
 
 /// Load the FP state saved at `fpstate` by [`setup_rt_frame`] (0 = none:

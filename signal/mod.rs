@@ -257,16 +257,52 @@ pub mod sa_flags {
 
 pub use siginfo::{SigFields, SigInfo, si_code};
 
-/// The arch details of a fault that go into the signal frame's
-/// sigcontext, not into siginfo (Linux thread.trap_nr and error_code on
-/// x86-64, thread.fault_code on arm64)
-#[derive(Debug, Clone, Copy, Default)]
+/// A thread's last fault's arch details, which every signal frame's
+/// sigcontext reports, not siginfo (Linux thread.trap_nr, error_code
+/// and cr2 on x86-64, thread.fault_code and fault_address on arm64)
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Trap {
     /// x86-64: sigcontext.trapno (exception vector)
     pub trapno: u64,
     /// x86-64: sigcontext.err (exception error code); arm64: ESR_EL1
     /// (reported in an esr_context record when non-zero)
     pub error: u64,
+    /// x86-64: sigcontext.cr2; arm64: sigcontext.fault_address
+    pub addr: u64,
+}
+
+impl Trap {
+    /// No fault yet
+    pub const NONE: Self = Self {
+        trapno: 0,
+        error: 0,
+        addr: 0,
+    };
+}
+
+/// What a fault changes of its thread's [`Trap`]
+#[derive(Debug, Clone, Copy)]
+pub enum TrapSet {
+    /// Nothing (arm64 BRK: Linux arm64_force_sig_fault alone)
+    Keep,
+    /// The vector and error code, not the address (x86-64 do_trap)
+    Code { trapno: u64, error: u64 },
+    /// Everything (a page fault: set_signal_archinfo, set_thread_esr;
+    /// arm64_notify_die with address 0)
+    All(Trap),
+}
+
+impl TrapSet {
+    fn apply(self, t: &mut Trap) {
+        match self {
+            Self::Keep => {}
+            Self::Code { trapno, error } => {
+                t.trapno = trapno;
+                t.error = error;
+            }
+            Self::All(n) => *t = n,
+        }
+    }
 }
 
 /// si_code for a SIGSEGV at user address `addr` (Linux bad_area vs
@@ -569,10 +605,9 @@ pub struct TaskSignalState {
     /// The mask before sigtimedwait unblocked the awaited signals
     /// (Linux real_blocked): such a signal does not kill on arrival
     pub real_blocked: SigSet,
-    /// A traced task's queued fault: its signal and sigcontext details,
-    /// for the frame when that signal is delivered (Linux
-    /// thread.trap_nr, error_code; its siginfo rides in the queue)
-    pub trap: Option<(u32, Trap)>,
+    /// The last fault's sigcontext details (Linux thread.trap_nr,
+    /// error_code, cr2 / fault_code, fault_address)
+    pub trap: Trap,
 }
 
 /// A thread group's shared pending set (Linux signal->shared_pending):
@@ -616,7 +651,7 @@ impl TaskSignalState {
             shared_pending: SharedPending(None),
             altstack: AltStack::new(),
             real_blocked: SigSet::EMPTY,
-            trap: None,
+            trap: Trap::NONE,
         }
     }
 
@@ -638,7 +673,7 @@ impl TaskSignalState {
             shared_pending,
             altstack: AltStack::new(),
             real_blocked: SigSet::EMPTY,
-            trap: None,
+            trap: Trap::NONE,
         }
     }
 
@@ -796,7 +831,7 @@ pub fn fork_signal(
             parent.and_then(|p| p.sighand.clone()),
             parent.map(|p| {
                 let s = p.task.sig.lock();
-                (s.blocked, s.shared_pending.clone())
+                (s.blocked, s.shared_pending.clone(), s.trap)
             }),
         )
     };
@@ -823,7 +858,7 @@ pub fn fork_signal(
     };
 
     // Clone per-task signal state
-    let child_state = if let Some((blocked, shared)) = parent_state {
+    let child_state = if let Some((blocked, shared, trap)) = parent_state {
         TaskSignalState {
             blocked, // Inherit blocked mask
             saved_sigmask: SigSet::EMPTY,
@@ -836,7 +871,8 @@ pub fn fork_signal(
             },
             altstack: AltStack::new(), // Child starts with no altstack
             real_blocked: SigSet::EMPTY,
-            trap: None,
+            // The thread struct is copied (Linux arch_dup_task_struct)
+            trap,
         }
     } else {
         TaskSignalState::try_new()?
@@ -2039,10 +2075,7 @@ pub fn do_signal(regs: &UserFrame) {
                     }
                 }
                 // A traced task's fault keeps its frame details
-                let trap = with_task_signal_state(tid, |s| s.trap.take_if(|(t, _)| *t == sig))
-                    .flatten()
-                    .map_or(Trap::default(), |(_, t)| t);
-                if deliver_to_handler(tid, sig, &action, &info, &trap, regs) {
+                if deliver_to_handler(tid, sig, &action, &info, regs) {
                     return;
                 }
                 // Frame setup failed: SIGSEGV was forced; deliver it
@@ -2130,7 +2163,6 @@ fn deliver_to_handler(
     sig: u32,
     action: &SigAction,
     info: &SigInfo,
-    trap: &Trap,
     regs: &UserFrame,
 ) -> bool {
     use crate::arch::signal;
@@ -2140,16 +2172,17 @@ fn deliver_to_handler(
     // (Linux sigmask_to_save)
     let me = crate::task::percpu::current();
     let restore = me.has_tif(crate::task::tif::RESTORE_SIGMASK);
-    let frame_mask = with_task_signal_state(tid, |state| {
-        if restore {
+    let (frame_mask, trap) = with_task_signal_state(tid, |state| {
+        let mask = if restore {
             state.saved_sigmask
         } else {
             state.blocked
-        }
+        };
+        (mask, state.trap)
     })
-    .unwrap_or(SigSet::EMPTY);
+    .unwrap_or_default();
 
-    match signal::setup_rt_frame(sig, action, frame_mask, info, trap, regs) {
+    match signal::setup_rt_frame(sig, action, frame_mask, info, &trap, regs) {
         Ok(()) => {
             // The saved mask now lives in the frame (Linux
             // signal_delivered -> clear_restore_sigmask)
@@ -2233,17 +2266,17 @@ pub fn force_sigsegv(tid: Tid) {
 ///   the task, as does SIG_DFL.
 ///
 /// Process context (the faulting task), interrupts enabled.
-pub fn force_sig_fault(info: SigInfo, trap: Trap, regs: &UserFrame) {
+pub fn force_sig_fault(info: SigInfo, trap: TrapSet, regs: &UserFrame) {
     let do_exit = do_group_exit;
     let sig = info.sig();
 
     let tid = crate::task::percpu::current_tid();
+    with_task_signal_state(tid, |s| trap.apply(&mut s.trap));
     // A traced task's fault signal is queued like any other, so the
     // tracer sees its signal-delivery stop first (Linux force_sig_fault
     // -> get_signal -> ptrace_signal); delivered on the way back to user
     // space, it is unblocked and not ignored, as force_sig makes it
     if crate::task::ptrace::is_traced(tid) {
-        with_task_signal_state(tid, |s| s.trap = Some((sig, trap)));
         force_sig_info(tid, info);
         return;
     }
@@ -2257,7 +2290,7 @@ pub fn force_sig_fault(info: SigInfo, trap: Trap, regs: &UserFrame) {
     if let SigHandler::Handler(_) = action.handler
         && !blocked
     {
-        if deliver_to_handler(tid, sig, &action, &info, &trap, regs) {
+        if deliver_to_handler(tid, sig, &action, &info, regs) {
             return;
         }
         // No room for the frame: SIGSEGV was reset to SIG_DFL and queued

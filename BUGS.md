@@ -495,15 +495,6 @@ de_thread
   reused in between, another process gets the signal. Linux signals the
   struct pid (kill_pid_info); pidfd_getfd already resolves it so.
 
-## Signal queue gaps
-
-**Location**: `signal/`
-
-A handler's sigcontext has the fault details (x86-64 trapno, err, cr2;
-arm64 fault_address, esr_context) only for the fault's own signal; other
-signals get zeros (Linux reports the thread's last fault: thread.trap_nr,
-error_code, cr2, fault_address, fault_code).
-
 ## ptrace stop gaps
 
 **Location**: `task/ptrace.rs`, `task/exec.rs`,

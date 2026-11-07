@@ -18,6 +18,9 @@
 //! - DF_ENTRY (x86): a breakpoint trap taken with DF set (`std`) delivers
 //!   an intact signal frame (the kernel's string copies must run forward:
 //!   entries clear DF) and sigreturn gives DF back
+//! - FAULT_LAST_TRAP: a later SIGUSR1's sigcontext still shows the last
+//!   fault (Linux thread.trap_nr/error_code/cr2; arm64 fault_address
+//!   and an esr_context record)
 //! - BAD_IRET (x86): rt_sigreturn to a non-canonical RIP (Linux takes
 //!   it; the return's IRET faults in kernel mode with the user GS base
 //!   live) kills the task with SIGSEGV, the kernel survives
@@ -540,6 +543,7 @@ pub fn run_tests() {
     #[cfg(target_arch = "x86_64")]
     in_child(b"FAULT_SIGFPE", sigfpe);
     in_child(b"FAULT_SIGTRAP", sigtrap);
+    in_child(b"FAULT_LAST_TRAP", last_trap);
     expect_killed(b"FAULT_BLOCKED_KILL", prep_blocked);
     expect_killed(b"FAULT_IGNORED_KILL", prep_ignored);
     #[cfg(target_arch = "x86_64")]
@@ -632,5 +636,79 @@ fn df_entry() {
         print(b"DF_ENTRY:FAIL status ");
         print_num(status as i64);
         println(b"");
+    }
+}
+
+/// The SIGUSR1 handler's view of its sigcontext: (trapno or 0, error /
+/// ESR, cr2 / fault_address)
+static mut LAST: [u64; 3] = [0; 3];
+
+extern "C" fn last_handler(_sig: i32, _info: *const u8, uc: *mut u8) {
+    // SAFETY: the kernel's ucontext for this handler (Linux layouts)
+    unsafe {
+        #[cfg(target_arch = "x86_64")]
+        let seen = {
+            let r = |at: usize| core::ptr::read_unaligned(uc.add(40 + at) as *const u64);
+            // sigcontext err 152, trapno 160, cr2 176
+            [r(160), r(152), r(176)]
+        };
+        #[cfg(target_arch = "aarch64")]
+        let seen = {
+            let r = |at: usize| core::ptr::read_unaligned(uc.add(at) as *const u64);
+            // __reserved records from uc + 176 + 288: the esr_context's
+            let mut at = 176 + 288;
+            let mut esr = 0;
+            loop {
+                let head = r(at);
+                let (magic, size) = (head as u32, (head >> 32) as usize);
+                if magic == 0 || size == 0 {
+                    break;
+                }
+                if magic == 0x4553_5201 {
+                    esr = r(at + 8);
+                }
+                at += size;
+            }
+            [0, esr, r(176)]
+        };
+        core::ptr::write_volatile(&raw mut LAST, seen);
+    }
+}
+
+fn last_trap() -> u64 {
+    if !install(SIGSEGV) {
+        return 9;
+    }
+    let addr = unmapped_page() + 0x18;
+    #[cfg(target_arch = "x86_64")]
+    let _ = run_fault!("mov rax, [rdi]", addr);
+    #[cfg(target_arch = "aarch64")]
+    let _ = run_fault!("ldr x12, [x0]", addr);
+    let act: [u64; 4] = [
+        last_handler as *const () as u64,
+        SA_SIGINFO | SA_RESTORER,
+        super::signals::restorer_addr(),
+        0,
+    ];
+    sys_rt_sigaction(10, act.as_ptr() as u64, 0, 8);
+    hk_syscall::sys_kill(hk_syscall::sys_getpid(), 10);
+    // SAFETY: written by the handler, which has run
+    let [trapno, err, fault] = unsafe { core::ptr::read_volatile(&raw const LAST) };
+    #[cfg(target_arch = "x86_64")]
+    let ok = trapno == 14 && err & 4 != 0 && fault == addr;
+    #[cfg(target_arch = "aarch64")]
+    let ok = trapno == 0 && err != 0 && fault == addr;
+    if ok {
+        println(b"FAULT_LAST_TRAP:OK");
+        0
+    } else {
+        print(b"FAULT_LAST_TRAP:FAIL trapno=");
+        print_num(trapno as i64);
+        print(b" err=");
+        print_num(err as i64);
+        print(b" fault=");
+        print_num(fault as i64);
+        println(b"");
+        1
     }
 }

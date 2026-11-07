@@ -24,7 +24,7 @@
 
 use crate::arch::Uaccess;
 use crate::signal::siginfo::UserSigInfo;
-use crate::signal::{SigAction, SigFields, SigHandler, SigInfo, SigSet, Trap, sa_flags};
+use crate::signal::{SigAction, SigHandler, SigInfo, SigSet, Trap, sa_flags};
 use crate::uaccess::{UaccessArch, copy_to_user};
 use crate::util::pod::{FromBytes, IntoBytes};
 
@@ -353,10 +353,7 @@ pub fn setup_rt_frame(
     }
 
     // Build the frame header (siginfo + ucontext up to __reserved)
-    let fault_address = match info.fields() {
-        SigFields::Fault { addr, .. } if trap.error != 0 => addr,
-        _ => 0,
-    };
+    let fault_address = trap.addr;
     let frame = RtSigFrame {
         info: info.to_user(),
         uc: UContext {
@@ -371,7 +368,7 @@ pub fn setup_rt_frame(
             uc_sigmask: blocked,
             _pad: [0; 128],
             uc_mcontext: SigContext {
-                // FAR of a data/instruction abort
+                // The last fault's FAR (Linux thread.fault_address)
                 fault_address,
                 regs: user_regs,
                 sp: user_sp,
