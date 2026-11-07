@@ -651,13 +651,17 @@ pub fn reclaim(q: Box<SigQueue>) {
 /// posixtimer_sig_unignore)
 pub fn sig_unignore(sig: u32) {
     let tid = current_tid();
-    let waiting: alloc::vec::Vec<Arc<PosixTimer>> = with_timers(tid, |reg| {
-        reg.iter()
-            .filter(|t| t.sigevent.sigev_signo as u32 == sig && t.inner.lock().ignored)
-            .cloned()
-            .collect()
-    })
-    .unwrap_or_default();
+    let ignored =
+        |t: &&Arc<PosixTimer>| t.sigevent.sigev_signo as u32 == sig && t.inner.lock().ignored;
+    // Sized under one hold, filled under another: nothing allocates
+    // under posix_timers
+    let n = with_timers(tid, |reg| reg.iter().filter(ignored).count()).unwrap_or(0);
+    let mut waiting = alloc::vec::Vec::with_capacity(n);
+    with_timers(tid, |reg| {
+        for t in reg.iter().filter(ignored).take(n) {
+            waiting.push(t.clone());
+        }
+    });
     for t in waiting {
         t.inner.lock().ignored = false;
         t.queue_signal();
