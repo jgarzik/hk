@@ -1345,16 +1345,18 @@ pub struct Zone {
   new one; Linux move_ptes), both with the mmap_lock held for writing,
   so no other path holds two and the pair cannot invert. Tables
   are freed only with the mm lock held for writing: munmap and mremap
-  (`memory::free_pgtables`, Linux free_pgtables, which takes the
-  `&mut MmStruct`) after the VMAs of their range left the reverse-map
-  chains, and only once empty and outside every remaining VMA's span;
+  (`memory::free_pgtables`, Linux free_pgtables, through a
+  `pgtable::PgPrune` made from the `&mut MmStruct`) after the VMAs of
+  their range left the reverse-map chains, and only once empty and
+  outside every remaining VMA's span;
   exit (`exit_mmap`) after unlinking every VMA. So an entry stays valid
   under any mm lock hold, or under the chain lock (AnonVma.chain, a
   file's i_mmap) of a VMA it lies in (the reverse map), and
   `mm::pgtable` makes that a borrow: a `PgTables` is made from a
   borrow of the `MmStruct` (an mm lock guard) or of a held chain
-  (`ChainRead::entries`, limited to the VMA's range), and the `Pte`
-  and `PteTable` (PTE lock held) handles it gives cannot outlive it.
+  (`ChainRead::entries`, limited to the VMA's range), and the `Pte`,
+  `Pmd`, `Dir` and `PteTable` (PTE lock held) handles it gives, and
+  the range walker that takes it, cannot outlive it.
   Order: mm lock -> page_table_lock -> PTE lock ->
   `FRAME_ALLOCATOR` (the TLB is flushed under them); never in
   interrupt context; no sleeping under them. Both disable preemption

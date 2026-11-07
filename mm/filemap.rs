@@ -861,7 +861,7 @@ pub fn unmap_mapping_range(m: &AddressSpace, from: u64) {
 /// `unmap_mapping_range` of the pages with index in [from, last]
 pub fn unmap_pages(m: &AddressSpace, from: u64, last: u64) {
     let chain = m.i_mmap.read();
-    for avc in chain.iter() {
+    for (avc, t) in chain.entries() {
         let pages = (avc.end - avc.start) / PAGE_SIZE as u64;
         if avc.pgoff + pages <= from || avc.pgoff > last {
             continue;
@@ -876,7 +876,7 @@ pub fn unmap_pages(m: &AddressSpace, from: u64, last: u64) {
         let start = page_addr(from);
         let end = page_addr(last.saturating_add(1)).min(avc.end);
         let mut tlb = super::gather::Gather::new(&mm);
-        super::memory::zap_range(&mut tlb, start, end);
+        super::memory::zap_range(&mut tlb, t, start, end);
     }
 }
 

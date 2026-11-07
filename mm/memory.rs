@@ -11,8 +11,8 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::gather::Gather;
 use super::huge_page::{HUGE_PAGE_SIZE, split_huge_pmd, take_huge_pmd};
-use super::pagewalk::{PteRange, PteWalk, entry, table_slot, walk_pte_range};
-use super::pgtable::{PgTables, Pmd};
+use super::pagewalk::{PteRange, PteWalk, walk_pte_range};
+use super::pgtable::{PgPrune, PgTables, Pmd, PruneDir};
 use super::{Mm, MmStruct, PAGE_SIZE, SwapEntry, Vma};
 use crate::FRAME_ALLOCATOR;
 use crate::arch::{Leaf, paging};
@@ -81,9 +81,9 @@ pub(super) fn exit_mmap(mm: &Mm) {
     drop(vmas);
 }
 
-/// Clear the entries of [start, end) of the gather's address space
-/// (Linux zap_page_range / unmap_page_range), mm lock held (for reading
-/// is enough: 2MB entries change under the page_table_lock, 4KB ones
+/// Clear the entries of [start, end) of `t`, the tables of the gather's
+/// address space (Linux zap_page_range / unmap_page_range), under the
+/// mm lock (for reading is enough: 2MB entries change under the page_table_lock, 4KB ones
 /// under their table's PTE lock): each 4KB
 /// entry (a page, protnone included, or a swap slot) is cleared, a 2MB
 /// page wholly inside goes whole, one partly inside is split first. The
@@ -92,9 +92,9 @@ pub(super) fn exit_mmap(mm: &Mm) {
 /// them, `free_pgtables`). Only
 /// user addresses: callers pass ranges inside VMAs, a range past
 /// TASK_SIZE is a bug (clamped).
-pub fn zap_range(tlb: &mut Gather<'_>, start: u64, end: u64) {
-    let pgd = tlb.mm().pgd();
-    let _ = walk_pte_range(pgd, start, end, &mut Zap { tlb });
+pub fn zap_range(tlb: &mut Gather<'_>, t: PgTables<'_>, start: u64, end: u64) {
+    assert_eq!(tlb.mm().pgd(), t.pgd(), "zap: tables of another mm");
+    let _ = walk_pte_range(t, start, end, &mut Zap { tlb });
 }
 
 /// `zap_range`'s walk
@@ -141,58 +141,33 @@ impl PteWalk for Zap<'_, '_> {
 /// borrowed mutably: the mmap_lock held for writing, and no
 /// `PgTables` of the address space alive. A table is freed when the
 /// whole span it maps lies in the gap between the VMAs around the range
-/// (so outside every VMA left, and every chain entry) and it is empty.
-/// Its parent entry is cleared at once; the frame goes to `tlb`, freed
-/// after the flush that drops the paging-structure caches. The
-/// top-level table stays.
+/// (so outside every VMA left, and every chain entry) and it is empty
+/// (`PruneDir::take_child`). Its parent entry is cleared at once; the
+/// frame goes to `tlb`, freed after the flush that drops the
+/// paging-structure caches. The top-level table stays.
 pub fn free_pgtables(map: &mut MmStruct, tlb: &mut Gather<'_>, start: u64, end: u64) {
-    assert!(tlb.mm().holds(map), "free_pgtables: VMAs of another mm");
-    let (floor, ceiling) = map.gap_around(start, end);
-    if start < end {
-        let r = PtRange {
-            start,
-            end,
-            floor,
-            ceiling,
-        };
-        free_level(tlb, tlb.mm().pgd(), 3, 0, &r);
+    if start >= end {
+        return;
     }
+    let mm = tlb.mm();
+    let mut p = PgPrune::new(mm, map, start, end);
+    free_level(tlb, &mut p.top(), start, end);
 }
 
-/// The range `free_pgtables` works on
-struct PtRange {
-    start: u64,
-    end: u64,
-    floor: u64,
-    ceiling: u64,
-}
-
-/// The entries of the table `table` at `level` (3: top level, 1: the
-/// 2MB level) whose spans meet [r.start, r.end), `base` being the
-/// table's first address: each child table is freed bottom-up
-fn free_level(tlb: &mut Gather<'_>, table: u64, level: u32, base: u64, r: &PtRange) {
-    let span = 1u64 << (12 + 9 * level);
-    let first = (r.start.max(base) - base) / span;
-    let last = ((r.end - 1).min(base + 512 * span - 1) - base) / span;
+/// The entries of the table `d` whose spans meet [start, end): each
+/// child table is freed bottom-up
+fn free_level(tlb: &mut Gather<'_>, d: &mut PruneDir<'_>, start: u64, end: u64) {
+    let (base, span) = (d.base(), d.span());
+    let first = (start.max(base) - base) / span;
+    let last = ((end - 1).min(base + 512 * span - 1) - base) / span;
     for i in first..=last {
-        let lo = base + i * span;
-        let e = entry(table_slot(table, i));
-        let Some(child) = paging::table_of(e.load(Ordering::Acquire)) else {
-            continue;
-        };
-        if level > 1 {
-            free_level(tlb, child, level - 1, lo, r);
+        if let Some(mut c) = d.child(i) {
+            free_level(tlb, &mut c, start, end);
         }
-        if lo >= r.floor && lo + span <= r.ceiling && table_empty(child) {
-            e.store(0, Ordering::Release);
-            tlb.remove_table(lo, span, child);
+        if let Some(table) = d.take_child(i) {
+            tlb.remove_table(base + i * span, span, table);
         }
     }
-}
-
-/// Every entry of the table frame `table` is empty
-fn table_empty(table: u64) -> bool {
-    (0..512).all(|i| entry(table_slot(table, i)).load(Ordering::Acquire) == 0)
 }
 
 /// One past the last user address a top-level entry can map: the
@@ -202,19 +177,18 @@ pub fn pgtables_ceiling() -> u64 {
     super::TASK_SIZE.next_multiple_of(1 << 39)
 }
 
-/// A page is mapped at `addr` (protnone included), mm lock held
-pub fn resident(pgd: u64, addr: u64) -> bool {
-    match paging::pte_ptr(pgd, addr) {
-        Some(p) => paging::pte_present(entry(p).load(Ordering::Acquire)),
-        None => paging::pmd_ptr(pgd, addr)
-            .is_some_and(|p| paging::pmd_huge(entry(p).load(Ordering::Acquire))),
+/// A page is mapped at `addr` in `t` (protnone included)
+pub fn resident(t: PgTables<'_>, addr: u64) -> bool {
+    match t.pte(addr) {
+        Some(p) => paging::pte_present(p.get()),
+        None => t.pmd(addr).is_some_and(|p| p.huge()),
     }
 }
 
-/// (resident, swapped) 4KB pages of [start, end), mm lock held (Linux
+/// (resident, swapped) 4KB pages of [start, end) in `t` (Linux
 /// MM_*PAGES and MM_SWAPENTS, counted from the tables): a 2MB page
 /// counts its part inside; a 1GB range without tables is skipped whole
-pub fn count_ptes(pgd: u64, start: u64, end: u64) -> (u64, u64) {
+pub fn count_ptes(t: PgTables<'_>, start: u64, end: u64) -> (u64, u64) {
     struct Count(u64, u64);
     impl PteWalk for Count {
         type Err = core::convert::Infallible;
@@ -233,14 +207,14 @@ pub fn count_ptes(pgd: u64, start: u64, end: u64) -> (u64, u64) {
         }
     }
     let mut c = Count(0, 0);
-    let _ = walk_pte_range(pgd, start, end, &mut c);
+    let _ = walk_pte_range(t, start, end, &mut c);
     (c.0, c.1)
 }
 
 /// The first address in [addr, end) whose 4KB entry is a swap entry of
-/// device `ty`, mm lock held (swapoff); 1GB ranges without tables and
+/// device `ty` in `t` (swapoff); 1GB ranges without tables and
 /// 2MB pages are skipped
-pub fn next_swap_pte(pgd: u64, addr: u64, end: u64, ty: u8) -> Option<u64> {
+pub fn next_swap_pte(t: PgTables<'_>, addr: u64, end: u64, ty: u8) -> Option<u64> {
     struct Find(u8);
     impl PteWalk for Find {
         type Err = u64;
@@ -252,7 +226,7 @@ pub fn next_swap_pte(pgd: u64, addr: u64, end: u64, ty: u8) -> Option<u64> {
             Ok(())
         }
     }
-    walk_pte_range(pgd, addr, end, &mut Find(ty)).err()
+    walk_pte_range(t, addr, end, &mut Find(ty)).err()
 }
 
 /// Copy the page tables of the parent's `vma` from `src`, the tables of
@@ -278,7 +252,7 @@ pub fn copy_page_range(
         cow: !vma.is_shared(),
         wp: false,
     };
-    walk_pte_range(src.pgd(), vma.start, vma.end, &mut c)?;
+    walk_pte_range(src, vma.start, vma.end, &mut c)?;
     Ok(c.wp)
 }
 
@@ -314,7 +288,7 @@ impl PteWalk for CopyRange<'_> {
             .ok_or(ENOMEM)
     }
 
-    fn ptes(&mut self, r: &PteRange) -> Result<(), i32> {
+    fn ptes(&mut self, r: &PteRange<'_>) -> Result<(), i32> {
         if r.iter().all(|(_, e)| e.load(Ordering::Acquire) == 0) {
             return Ok(());
         }

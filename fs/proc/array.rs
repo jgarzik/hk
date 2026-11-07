@@ -245,7 +245,8 @@ fn vm_stat(mm: &Mm, m: &MmStruct) -> VmStat {
     let mut exec = 0;
     for vma in m.iter() {
         let pages = vma.size() / PAGE;
-        let (rss, swap) = crate::mm::memory::count_ptes(mm.pgd(), vma.start, vma.end);
+        let t = crate::mm::pgtable::PgTables::new(mm, m);
+        let (rss, swap) = crate::mm::memory::count_ptes(t, vma.start, vma.end);
         v.total += pages;
         v.rss += rss;
         v.swap += swap;

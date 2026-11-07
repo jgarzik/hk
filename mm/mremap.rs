@@ -66,7 +66,7 @@ pub fn move_prep(
     }
     assert_eq!(mm.pgd(), t.pgd(), "tables of another mm");
     let delta = new.wrapping_sub(old);
-    walk_pte_range(t.pgd(), old, old + len, &mut Prep { mm, delta, alloc })
+    walk_pte_range(t, old, old + len, &mut Prep { mm, delta, alloc })
 }
 
 /// Move the entries of [old, old + len) to `new` after `move_prep`
@@ -81,7 +81,7 @@ pub fn move_ptes(mm: &Mm, t: PgTables<'_>, old: u64, new: u64, len: u64) {
         t,
         delta: new.wrapping_sub(old),
     };
-    let _ = walk_pte_range(t.pgd(), old, old + len, &mut m);
+    let _ = walk_pte_range(t, old, old + len, &mut m);
     tlb::flush_tlb_mm_range(mm, old, old + len, tlb::PAGE_SHIFT, false);
 }
 
@@ -97,7 +97,7 @@ impl PteWalk for Move<'_> {
     /// The old table is locked by the walk; the destination entries of
     /// one old table lie in at most two new tables, each locked while
     /// its entries move (not again if it is the old table itself)
-    fn ptes(&mut self, r: &PteRange) -> Result<(), Self::Err> {
+    fn ptes(&mut self, r: &PteRange<'_>) -> Result<(), Self::Err> {
         let mut held: Option<PteTable<'_>> = None;
         for (a, src) in r.iter() {
             if src.load(Ordering::Acquire) == 0 {

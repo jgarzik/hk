@@ -48,8 +48,8 @@ fn excess(entry: u64, prot: u32) -> Option<&'static str> {
     }
 }
 
-/// Check the address space `map` with tables rooted at `pgd` after `op`
-pub fn verify(map: &MmStruct, pgd: u64, op: &str) {
+/// Check the address space `mm`, its VMA tree `map`, after `op`
+pub fn verify(mm: &super::Mm, map: &MmStruct, op: &str) {
     let mut prev_end = 0;
     for v in map.iter() {
         if v.start >= v.end || v.start < prev_end {
@@ -62,7 +62,8 @@ pub fn verify(map: &MmStruct, pgd: u64, op: &str) {
         vmas: map.iter().peekable(),
         op,
     };
-    let _ = super::pagewalk::walk_pte_range(pgd, 0, super::TASK_SIZE, &mut c);
+    let t = super::pgtable::PgTables::new(mm, map);
+    let _ = super::pagewalk::walk_pte_range(t, 0, super::TASK_SIZE, &mut c);
 }
 
 /// `verify`'s walk over every user leaf that maps a page

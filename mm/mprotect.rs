@@ -12,7 +12,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::huge_page::{HUGE_PAGE_SIZE, split_huge_pmd};
 use super::pagewalk::{PteWalk, walk_pte_range};
-use super::pgtable::Pmd;
+use super::pgtable::{PgTables, Pmd};
 use super::{Mm, PROT_EXEC, PROT_READ, PROT_WRITE};
 use crate::FRAME_ALLOCATOR;
 use crate::arch::{ArchPageTable, paging};
@@ -26,9 +26,15 @@ fn prot_none(prot: u32) -> bool {
 /// Split the 2MB pages of [start, end) that cannot keep a single entry
 /// with protection `prot`: partly inside the range, or made
 /// inaccessible (hk has no protnone 2MB entries). Called before any VMA
-/// changes, mm lock held: ENOMEM leaves the mapping as it was (a split
-/// page maps the same memory).
-pub fn split_huge(mm: &Mm, start: u64, end: u64, prot: u32) -> Result<(), KernelError> {
+/// changes, `t` the tables of `mm`: ENOMEM leaves the mapping as it was
+/// (a split page maps the same memory).
+pub fn split_huge(
+    mm: &Mm,
+    t: PgTables<'_>,
+    start: u64,
+    end: u64,
+    prot: u32,
+) -> Result<(), KernelError> {
     struct Split<'a>(&'a Mm, u32);
     impl PteWalk for Split<'_> {
         type Err = KernelError;
@@ -41,21 +47,21 @@ pub fn split_huge(mm: &Mm, start: u64, end: u64, prot: u32) -> Result<(), Kernel
             Ok(true)
         }
     }
-    walk_pte_range(mm.pgd(), start, end, &mut Split(mm, prot))
+    walk_pte_range(t, start, end, &mut Split(mm, prot))
 }
 
 /// Give the mapped pages of [start, end), part of one VMA, the
-/// protection `prot` (Linux change_protection), mm lock held, after
-/// `split_huge`: a 2MB page left whole is changed in place, every
-/// mapped 4KB entry rewritten under its table's PTE lock. The caller
-/// flushes the TLB of the range.
-pub fn change_protection(pgd: u64, start: u64, end: u64, prot: u32, shared: bool) {
-    struct Change {
-        pgd: u64,
+/// protection `prot` (Linux change_protection), in `t`, the tables of
+/// `mm`, after `split_huge`: a 2MB page left whole is changed in place,
+/// every mapped 4KB entry rewritten under its table's PTE lock. The
+/// caller flushes the TLB of the range.
+pub fn change_protection(mm: &Mm, t: PgTables<'_>, start: u64, end: u64, prot: u32, shared: bool) {
+    struct Change<'a> {
+        mm: &'a Mm,
         prot: u32,
         shared: bool,
     }
-    impl PteWalk for Change {
+    impl PteWalk for Change<'_> {
         type Err = core::convert::Infallible;
         fn huge(&mut self, pmd: Pmd<'_>, addr: u64, _: u64) -> Result<bool, Self::Err> {
             // Wholly inside and accessible (`split_huge`); never shared
@@ -65,7 +71,7 @@ pub fn change_protection(pgd: u64, start: u64, end: u64, prot: u32, shared: bool
             if x && !paging::pte_exec(pmdval) {
                 sync_huge(paging::pte_addr(pmdval) & !(HUGE_PAGE_SIZE - 1));
             }
-            ArchPageTable::update_huge_page_protection(self.pgd, base, w, x);
+            ArchPageTable::update_huge_page_protection(self.mm.pgd(), base, w, x);
             Ok(true)
         }
         fn pte(&mut self, e: &AtomicU64, _: u64) -> Result<(), Self::Err> {
@@ -73,7 +79,7 @@ pub fn change_protection(pgd: u64, start: u64, end: u64, prot: u32, shared: bool
             Ok(())
         }
     }
-    let _ = walk_pte_range(pgd, start, end, &mut Change { pgd, prot, shared });
+    let _ = walk_pte_range(t, start, end, &mut Change { mm, prot, shared });
 }
 
 /// A 2MB page at `phys` becomes executable: instruction caches see its

@@ -274,7 +274,7 @@ fn unuse_mm(mm: &super::Mm, ty: u8) -> Result<(), KernelError> {
     for vma in map.iter().filter(|v| v.anon_vma.is_some()) {
         let mut addr = vma.start;
         while addr < vma.end {
-            match super::memory::next_swap_pte(mm.pgd(), addr, vma.end, ty) {
+            match super::memory::next_swap_pte(t, addr, vma.end, ty) {
                 Some(a) => {
                     super::fault::unuse_pte(mm, t, vma, a).map_err(|_| KernelError::OutOfMemory)?;
                     addr = a + super::PAGE_SIZE;

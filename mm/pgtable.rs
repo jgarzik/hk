@@ -24,6 +24,11 @@
 //! - [`Pmd`]: one 2MB-level entry of pinned tables; a 2MB page in it
 //!   changes only with the page_table_lock held (`ptl::PtLock`), which
 //!   its writes take as an argument.
+//! - [`Dir`]: one upper-level table of pinned tables, for the range
+//!   walker (`pagewalk`), which descends them level by level.
+//! - [`PgPrune`] / [`PruneDir`]: the tables of a gap between VMAs, made
+//!   from `&mut MmStruct`, the only handles that take a table out of
+//!   the tree (`memory::free_pgtables`).
 //!
 //! Each is a pointer-sized copy of what the open-coded `*mut u64` was;
 //! the walk itself stays in `arch::paging`.
@@ -132,6 +137,17 @@ impl<'a> PgTables<'a> {
             pgd: self.pgd,
             addr: addr & !HUGE_PAGE_MASK,
         })
+    }
+
+    /// The top-level table, where a range walk starts
+    #[inline]
+    pub fn top(&self) -> Dir<'a> {
+        // INVARIANT: the top-level table, live for 'a (type invariant)
+        Dir {
+            t: *self,
+            table: self.pgd,
+            level: 3,
+        }
     }
 
     /// `pte`, installing missing tables under `mm`'s page_table_lock
@@ -254,6 +270,13 @@ impl Pmd<'_> {
         self.pgd
     }
 
+    /// The PTE table it points to once no split is under way, if any:
+    /// kept for `'a` like the entry (it maps the same addresses)
+    #[inline]
+    pub fn pte_table(&self) -> Option<u64> {
+        paging::table_of(self.settled())
+    }
+
     /// The page of the table holding it (deposits: `huge_page`)
     pub(super) fn table_page(&self) -> &'static Page {
         let table = virt_to_phys(core::ptr::from_ref(self.slot).addr() as u64 & !0xfff);
@@ -274,6 +297,226 @@ impl Pmd<'_> {
     pub(super) fn populate(&self, l: &PtLock<'_>, pt: u64) {
         assert_eq!(l.pgd(), self.pgd, "page_table_lock of another mm");
         paging::pmd_populate(self.slot.as_ptr(), pt);
+    }
+}
+
+/// Slot `i` (mod 512) of the table frame `table`, through the direct map
+#[inline]
+fn slot_ptr(table: u64, i: u64) -> *mut u64 {
+    phys_to_virt(table)
+        .cast::<u64>()
+        .wrapping_add((i & 511) as usize)
+}
+
+/// Bytes mapped by one entry of a table at `level` (1: 2MB ... 3: 512GB)
+#[inline]
+fn span(level: u32) -> u64 {
+    1 << (12 + 9 * level)
+}
+
+/// One upper-level table of pinned page tables: the top level (3), the
+/// 1GB level (2) or the table of 2MB entries (1) (Linux the pgd, pud and
+/// pmd pages walk_page_range descends)
+///
+/// # Invariants
+///
+/// `table` is a table frame at `level` under `t`'s tables that maps an
+/// address of `t`'s pinned range, so it stays for `'a`.
+#[derive(Clone, Copy)]
+pub struct Dir<'a> {
+    t: PgTables<'a>,
+    table: u64,
+    level: u32,
+}
+
+impl<'a> Dir<'a> {
+    /// Its level: 3 (top) to 1 (2MB entries)
+    #[inline]
+    pub fn level(&self) -> u32 {
+        self.level
+    }
+
+    /// The entry mapping `addr`
+    #[inline]
+    fn slot(&self, addr: u64) -> &'a AtomicU64 {
+        let p = slot_ptr(self.table, addr >> (12 + 9 * self.level));
+        // SAFETY: an entry of a table frame kept for 'a (type
+        // invariant); page-table entries are only accessed atomically
+        unsafe { AtomicU64::from_ptr(p) }
+    }
+
+    /// The table one level down that maps `addr` (Linux pud_offset,
+    /// pmd_offset); None at level 1, outside the pinned range, or if the
+    /// entry holds no table
+    #[inline]
+    pub fn child(&self, addr: u64) -> Option<Dir<'a>> {
+        if self.level < 2 || !self.t.covers(addr) {
+            return None;
+        }
+        let table = paging::table_of(self.slot(addr).load(Ordering::Acquire))?;
+        // INVARIANT: the table under this one that maps `addr`, an
+        // address of the pinned range
+        Some(Dir {
+            t: self.t,
+            table,
+            level: self.level - 1,
+        })
+    }
+
+    /// At level 1, the 2MB-level entry of `addr` (Linux pmd_offset);
+    /// None at another level or outside the pinned range
+    #[inline]
+    pub fn pmd(&self, addr: u64) -> Option<Pmd<'a>> {
+        if self.level != 1 || !self.t.covers(addr) {
+            return None;
+        }
+        // INVARIANT: the 2MB-level entry of `addr`, in a table kept for
+        // 'a (type invariant)
+        Some(Pmd {
+            slot: self.slot(addr),
+            pgd: self.t.pgd,
+            addr: addr & !HUGE_PAGE_MASK,
+        })
+    }
+}
+
+/// The page tables of one address space being pruned (Linux
+/// free_pgtables): made from `&mut MmStruct` (its mmap_lock held for
+/// writing, so no `PgTables::new` of it lives) for the gap [floor,
+/// ceiling) between the VMAs around a removed range. No VMA lies in the
+/// gap, and every reverse-map chain entry of the address space is a VMA
+/// of the tree (a removed VMA is unlinked first), so no `PgTables` of a
+/// chain pins it either. Only a table whose whole span lies in the gap
+/// is taken out.
+///
+/// # Invariants
+///
+/// For `'a`, `pgd` is a live top-level table, no `PgTables` of it pins
+/// an address of [floor, ceiling), and its tables are freed only
+/// through this handle.
+pub struct PgPrune<'a> {
+    pgd: u64,
+    floor: u64,
+    ceiling: u64,
+    _excl: PhantomData<&'a mut MmStruct>,
+}
+
+impl<'a> PgPrune<'a> {
+    /// The tables of `mm` around [start, end), whose VMAs are gone from
+    /// `map`, its VMA tree (Linux free_pgtables' floor and ceiling)
+    pub fn new(mm: &'a Mm, map: &'a mut MmStruct, start: u64, end: u64) -> Self {
+        assert!(mm.holds(map), "tables pruned under another mm's VMAs");
+        let (floor, ceiling) = map.gap_around(start, end);
+        // INVARIANT: `map` is borrowed mutably for 'a, so no `PgTables`
+        // of `mm` is made from it meanwhile; chain entries are VMAs of
+        // `map`, outside the gap; `pgd` goes with `mm`, borrowed for 'a
+        Self {
+            pgd: mm.pgd(),
+            floor,
+            ceiling,
+            _excl: PhantomData,
+        }
+    }
+
+    /// The top-level table
+    pub fn top(&mut self) -> PruneDir<'_> {
+        // INVARIANT: the live top-level table, mapping from 0
+        PruneDir {
+            table: self.pgd,
+            level: 3,
+            base: 0,
+            floor: self.floor,
+            ceiling: self.ceiling,
+            _p: PhantomData,
+        }
+    }
+}
+
+/// One upper-level table of a [`PgPrune`], borrowing it (or its parent
+/// `PruneDir`) mutably: a child table is taken out only while no handle
+/// to it lives
+///
+/// # Invariants
+///
+/// `table` is a live table frame at `level` (3: top, 1: 2MB entries)
+/// whose first entry maps `base`; for `'p`, no `PgTables` pins an
+/// address of [floor, ceiling) under it, and tables are freed only
+/// through this handle.
+pub struct PruneDir<'p> {
+    table: u64,
+    level: u32,
+    base: u64,
+    floor: u64,
+    ceiling: u64,
+    _p: PhantomData<&'p mut ()>,
+}
+
+impl PruneDir<'_> {
+    /// Its level: 3 (top) to 1 (2MB entries)
+    pub fn level(&self) -> u32 {
+        self.level
+    }
+
+    /// The first address it maps
+    pub fn base(&self) -> u64 {
+        self.base
+    }
+
+    /// Bytes one of its entries maps
+    pub fn span(&self) -> u64 {
+        span(self.level)
+    }
+
+    /// Entry `i` (mod 512)
+    fn slot(&self, i: u64) -> &AtomicU64 {
+        // SAFETY: an entry of a live table frame (type invariant),
+        // borrowed no longer than `self`; entries are only accessed
+        // atomically
+        unsafe { AtomicU64::from_ptr(slot_ptr(self.table, i)) }
+    }
+
+    /// The table under entry `i`, a level down; None at level 1 (its
+    /// children are PTE tables) or if the entry holds no table
+    pub fn child(&mut self, i: u64) -> Option<PruneDir<'_>> {
+        if self.level < 2 {
+            return None;
+        }
+        let table = paging::table_of(self.slot(i).load(Ordering::Acquire))?;
+        // INVARIANT: a live table under this one, mapping from its
+        // entry's first address; it borrows `self` mutably
+        Some(PruneDir {
+            table,
+            level: self.level - 1,
+            base: self.base + (i & 511) * self.span(),
+            floor: self.floor,
+            ceiling: self.ceiling,
+            _p: PhantomData,
+        })
+    }
+
+    /// Take out the table under entry `i` if the entry's whole span lies
+    /// in the gap and the table is empty: the entry is cleared and the
+    /// frame returned, for the caller to free once no CPU caches it (a
+    /// TLB flush with the paging-structure caches)
+    #[must_use]
+    pub fn take_child(&mut self, i: u64) -> Option<u64> {
+        let lo = self.base + (i & 511) * self.span();
+        if lo < self.floor || lo + self.span() > self.ceiling {
+            return None;
+        }
+        let e = self.slot(i);
+        let child = paging::table_of(e.load(Ordering::Acquire))?;
+        let empty = (0..512).all(|j| {
+            // SAFETY: an entry of a live table frame under this one,
+            // which nothing else pins (type invariant: its span lies in
+            // the gap); borrowed for this load only
+            unsafe { AtomicU64::from_ptr(slot_ptr(child, j)) }.load(Ordering::Acquire) == 0
+        });
+        if !empty {
+            return None;
+        }
+        e.store(0, Ordering::Release);
+        Some(child)
     }
 }
 

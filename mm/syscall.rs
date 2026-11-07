@@ -441,13 +441,14 @@ pub(crate) fn munmap_locked(
     // One gather for all the VMAs: one flush, then the pages and the
     // page tables no VMA needs any more go (Linux unmap_region)
     let mut tlb = super::gather::Gather::new(owner);
+    let t = super::pgtable::PgTables::new(owner, mm);
     for vma in &removed {
-        super::memory::zap_range(&mut tlb, vma.start.max(start), vma.end.min(end));
+        super::memory::zap_range(&mut tlb, t, vma.start.max(start), vma.end.min(end));
     }
     super::memory::free_pgtables(mm, &mut tlb, start, end);
     drop(tlb);
     #[cfg(feature = "mmcheck")]
-    super::check::verify(mm, owner.pgd(), "munmap");
+    super::check::verify(owner, mm, "munmap");
     removed
 }
 
@@ -1051,8 +1052,8 @@ pub fn sys_mprotect(addr: u64, len: u64, prot: u32) -> i64 {
 
     // 2MB pages that cannot keep one entry are split before anything
     // changes: ENOMEM leaves the range as it was
-    let pgd = mm.pgd();
-    if let Err(e) = super::mprotect::split_huge(&mm, start, mapped_end(&map, start, end), prot) {
+    let t = super::pgtable::PgTables::new(&mm, &map);
+    if let Err(e) = super::mprotect::split_huge(&mm, t, start, mapped_end(&map, start, end), prot) {
         return e.sysret();
     }
 
@@ -1061,10 +1062,10 @@ pub fn sys_mprotect(addr: u64, len: u64, prot: u32) -> i64 {
     // rewritten to match, all under this one mm lock hold (a fault or
     // fork never sees a VMA and its entries disagree). The TLB of the
     // range is flushed before the lock is dropped, also on an error.
-    let r = mprotect_vmas(&mut map, pgd, start, end, prot);
+    let r = mprotect_vmas(&mut map, &mm, start, end, prot);
     super::tlb::flush_tlb_mm_range(&mm, start, end, super::tlb::PAGE_SHIFT, false);
     #[cfg(feature = "mmcheck")]
-    super::check::verify(&map, pgd, "mprotect");
+    super::check::verify(&mm, &map, "mprotect");
     drop(map);
     match r {
         Ok(()) => 0,
@@ -1136,7 +1137,7 @@ fn prot_allowed(vma: &Vma, prot: u32) -> Result<(), KernelError> {
 /// untouched.
 fn mprotect_vmas(
     mm: &mut super::MmStruct,
-    pgd: u64,
+    owner: &super::Mm,
     start: u64,
     end: u64,
     prot: u32,
@@ -1149,7 +1150,7 @@ fn mprotect_vmas(
             r = Err(KernelError::OutOfMemory);
             break;
         };
-        match mprotect_fixup(mm, pgd, idx, addr, end, prot) {
+        match mprotect_fixup(mm, owner, idx, addr, end, prot) {
             Ok((i, e)) => {
                 modified.push(i);
                 addr = e;
@@ -1171,7 +1172,7 @@ fn mprotect_vmas(
 /// split off, its PTEs rewritten. Returns its index and end.
 fn mprotect_fixup(
     mm: &mut super::MmStruct,
-    pgd: u64,
+    owner: &super::Mm,
     mut idx: usize,
     addr: u64,
     end: u64,
@@ -1194,7 +1195,8 @@ fn mprotect_fixup(
         vma.end,
         vma.is_shared() && !vma.wants_writenotify(),
     );
-    super::mprotect::change_protection(pgd, s, e, prot, shared);
+    let t = super::pgtable::PgTables::new(owner, mm);
+    super::mprotect::change_protection(owner, t, s, e, prot, shared);
     Ok((idx, e))
 }
 
@@ -1408,7 +1410,7 @@ pub fn sys_mremap(old_addr: u64, old_len: u64, new_len: u64, flags: u32, new_add
         old_len = new_len_aligned;
         if !moves {
             #[cfg(feature = "mmcheck")]
-            super::check::verify(&mm_guard, mm.pgd(), "mremap shrink");
+            super::check::verify(&mm, &mm_guard, "mremap shrink");
             drop(mm_guard);
             drop(gone);
             return old_addr as i64;
@@ -1450,7 +1452,7 @@ pub fn sys_mremap(old_addr: u64, old_len: u64, new_len: u64, flags: u32, new_add
             && mm_guard.try_expand_vma(vma_idx, new_end)
         {
             #[cfg(feature = "mmcheck")]
-            super::check::verify(&mm_guard, mm.pgd(), "mremap expand");
+            super::check::verify(&mm, &mm_guard, "mremap expand");
             drop(mm_guard);
             if populate {
                 populate_grown(old_addr, old_len, new_len_aligned);
@@ -1492,7 +1494,7 @@ pub fn sys_mremap(old_addr: u64, old_len: u64, new_len: u64, flags: u32, new_add
         return e.sysret();
     }
     #[cfg(feature = "mmcheck")]
-    super::check::verify(&mm_guard, mm.pgd(), "mremap move");
+    super::check::verify(&mm, &mm_guard, "mremap move");
     drop(mm_guard);
     drop(gone);
     if populate {
@@ -1680,11 +1682,9 @@ fn mincore_chunk(
     let vma = map.find_vma(addr).ok_or(KernelError::OutOfMemory)?;
     let end = vma.end.min(addr + pages * PAGE_SIZE);
     let n = ((end - addr) / PAGE_SIZE) as usize;
+    let t = super::pgtable::PgTables::new(mm, &map);
     for (i, b) in buf[..n].iter_mut().enumerate() {
-        *b = u8::from(super::memory::resident(
-            mm.pgd(),
-            addr + i as u64 * PAGE_SIZE,
-        ));
+        *b = u8::from(super::memory::resident(t, addr + i as u64 * PAGE_SIZE));
     }
     Ok(n)
 }
