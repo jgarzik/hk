@@ -72,8 +72,7 @@ Tests TMPFS_LIMITS, MEMFD_SEALS, ROOTFS_TMPFS.
 Group stop and continue (SIGSTOP/TSTP/TTIN/TTOU defaults, SIGCONT,
 CLD_STOPPED/CLD_CONTINUED, orphaned process groups); wait4/waitid
 WUNTRACED/WCONTINUED/WSTOPPED; SIGTTIN/SIGTTOU on background tty I/O
-(tty_check_change stops instead of failing); shared pending queue with
-Linux's thread choice; ptrace_stop (signal-delivery, syscall, exec
+(tty_check_change stops instead of failing); ptrace_stop (signal-delivery, syscall, exec
 stops), FOLL_FORCE for POKE; reboot CAD_ON/CAD_OFF. Tests JOBCTL,
 WAIT_STOPPED, PTRACE_STOP.
 

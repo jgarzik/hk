@@ -294,6 +294,62 @@ fn setup_user_stack<FA: FrameAlloc<PhysAddr = u64>>(
     Ok((area, STACK_TOP - (stack_pages as u64 * PAGE_SIZE)))
 }
 
+/// The highest free page below mmap_base clear of `vmas` (Linux
+/// get_unmapped_area, top-down)
+fn free_page(vmas: &[crate::mm::Vma]) -> Option<u64> {
+    let mut spans: Vec<(u64, u64)> = vmas.iter().map(|v| (v.start, v.end)).collect();
+    spans.sort_unstable();
+    let mut top = crate::mm::mmap_base();
+    for &(start, end) in spans.iter().rev() {
+        if start >= top {
+            continue;
+        }
+        if end <= top && top - end >= PAGE_SIZE {
+            break;
+        }
+        top = top.min(start);
+    }
+    top.checked_sub(PAGE_SIZE)
+        .filter(|&a| a >= crate::mm::MMAP_MIN_ADDR)
+}
+
+/// The arch's signal return page, if it has one (arm64: Linux's vDSO
+/// sigtramp), mapped read+exec in free space clear of the new image's
+/// `vmas`; its VMA
+fn map_sigpage<FA: FrameAlloc<PhysAddr = u64>>(
+    page_table: &mut ArchPageTable,
+    frame_alloc: &mut FA,
+    vmas: &[crate::mm::Vma],
+) -> Result<Option<crate::mm::Vma>, i32> {
+    use crate::mm::{PROT_EXEC, PROT_READ, VM_SIGPAGE};
+    let Some(code) = crate::arch::signal::SIGPAGE else {
+        return Ok(None);
+    };
+    let va = free_page(vmas).ok_or(ENOMEM)?;
+    let frame = user_frame()?;
+    let page = crate::arch::phys_to_virt(frame);
+    // SAFETY: a fresh frame of PAGE_SIZE bytes, ours alone, through the
+    // linear map
+    unsafe {
+        ::core::ptr::write_bytes(page, 0, PAGE_SIZE as usize);
+        for (i, w) in code.iter().enumerate() {
+            ::core::ptr::write_unaligned(page.add(i * 4).cast::<u32>(), w.to_le());
+        }
+    }
+    crate::arch::paging::sync_page(frame, true);
+    let flags = PageFlags::READ | PageFlags::EXECUTE | PageFlags::USER;
+    if page_table
+        .map_with_alloc(va, frame, flags, frame_alloc)
+        .is_err()
+    {
+        crate::FRAME_ALLOCATOR.free(frame);
+        return Err(ENOMEM);
+    }
+    let mut vma = anon_vma(va, va + PAGE_SIZE, PROT_READ | PROT_EXEC);
+    vma.flags |= VM_SIGPAGE;
+    Ok(Some(vma))
+}
+
 /// Every PT_LOAD segment and the entry point must land in mappable
 /// user space: past TASK_SIZE (or overflowing) is EINVAL (Linux
 /// BAD_ADDR), below mmap_min_addr EPERM (security_mmap_addr)
@@ -726,6 +782,8 @@ fn secureexec(c: &crate::task::Cred) -> bool {
 pub struct ExecIdentity {
     pub name: [u8; 16],
     pub dumpable: u8,
+    /// A secure exec (set-id: Linux bprm->secureexec)
+    pub secure: bool,
 }
 
 /// The new image's identity, decided before the point of no return and
@@ -749,7 +807,11 @@ fn exec_identity(path: &[u8], file: &File) -> ExecIdentity {
     } else {
         SUID_DUMP_DISABLE
     };
-    ExecIdentity { name, dumpable }
+    ExecIdentity {
+        name,
+        dumpable,
+        secure: secureexec(&c),
+    }
 }
 
 /// End the other threads of the caller's group and wait until they
@@ -998,6 +1060,18 @@ where
             Ok(r) => r,
             Err(e) => return -e,
         };
+    // The new image's VMAs, then the signal page in the free space they
+    // leave (Linux arch_setup_additional_pages: get_unmapped_area and a
+    // special mapping once the image and stack are in place)
+    let mut vmas = image_vmas(&elf, base_addr, stack_bottom, exe_map);
+    if let Some(ie) = &interp {
+        vmas.extend(segment_vmas(ie, interp_base, interp_map));
+    }
+    match map_sigpage(&mut new_page_table, frame_alloc, &vmas) {
+        Ok(Some(v)) => vmas.push(v),
+        Ok(None) => {}
+        Err(e) => return -e,
+    }
     let user_sp = args.start_stack;
 
     let ident = exec_identity(pathname, &file);
@@ -1008,6 +1082,10 @@ where
     // begin_new_exec -> de_thread)
     if let Err(e) = de_thread(tid) {
         return -e;
+    }
+    // Handlers, alternate stack and timers of the old image go
+    if let Err(e) = crate::signal::exec_signals() {
+        return -e.errno();
     }
 
     // Now we need to update the current task and switch to the new address space
@@ -1059,13 +1137,11 @@ where
             end_data: code.end_data,
             ..args
         });
-        for vma in image_vmas(&elf, base_addr, stack_bottom, exe_map) {
-            m.insert_vma(vma);
-        }
-        if let Some(ie) = &interp {
-            for vma in segment_vmas(ie, interp_base, interp_map) {
-                m.insert_vma(vma);
+        for vma in vmas {
+            if vma.flags & crate::mm::VM_SIGPAGE != 0 {
+                mm.set_sigpage(vma.start);
             }
+            m.insert_vma(vma);
         }
     }
 

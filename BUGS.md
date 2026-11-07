@@ -7,20 +7,10 @@ Failures that also occur when the boot tester runs on real Linux
 real bug in Linux as well as hk: Linux is the reference, not
 infallible, so each one is investigated, not written off.
 
-- **BUSYBOX_NC_LO flaky, on hk and the Linux reference**:
-  `BUSYBOX_NC_LO:FAIL status=0` (nc over loopback) in about 1 of 5
-  uncached x86 `check-linux` runs and in hk x86 boots, one CPU
-  (`QEMU_SMP=1`) included; passes on rerun. Cause unknown: the test
-  waits for the listener (`wait_listen`) and retries the client.
 - **NICE_ADJACENT flaky on the arm64 Linux reference**: one emulated
   `check-linux-arm` run had two adjacent-nice spinners' CPU share off
   (`share a:b tenths got 26`); passed on the uncached rerun. Likely
   TCG timing noise in a ratio test; widen the tolerance if it recurs.
-- **SWAPOUT_PAGEOUT flaky on the Linux reference** (J): one x86
-  `check-linux` run had free swap 364 kB off the expected value after
-  MADV_PAGEOUT of 16 MiB (beyond the test's tolerance), passing on the
-  rerun. Linux's swap accounting after pageout is not exact (swap
-  cache); the tolerance may need to grow on Linux.
 - **RLIMIT_CPU_XCPU flaky on the x86 Linux reference**: one uncached
   `check-linux` run, run alongside `check-arm`, got `RLIMIT_CPU_XCPU:FAIL
   got 9` (SIGKILL where SIGXCPU was expected first); passed on rerun.
@@ -86,7 +76,9 @@ the existing children and migrates their tasks), and disabling it
 removes nothing. A task in a cgroup without a controller is charged
 nowhere; Linux charges the nearest ancestor that has it (the effective
 css). The no-internal-processes rule (EBUSY when enabling in a cgroup
-with tasks) is not enforced.
+with tasks) is not enforced. A pids charge goes back when the task
+exits; Linux keeps a zombie charged until it is reaped (pids_release
+from release_task).
 
 No controller but pids is applied: CPU bandwidth, memory and IO
 limits, and cgroup.freeze are stored (and read back) but nothing is
@@ -204,7 +196,10 @@ getcpu reports it; nothing else uses it. Missing (Linux
   node-aware allocation, so no policy (BIND, PREFERRED, INTERLEAVE,
   local) affects where pages come from.
 - No page migration: migrate_pages and move_pages validate and move
-  nothing; move_pages query mode reports node 0 for every page.
+  nothing; move_pages query mode reports node 0 for every page. For
+  another process they take CAP_SYS_NICE instead of Linux's
+  ptrace_may_access(PTRACE_MODE_READ_REALCREDS) (move_pages: under its
+  exec_update_lock), which they need once pages move.
 - Nodemasks are one `u64` (64 nodes); the gate has no multi-node QEMU
   run (by hand: `QEMU_EXTRA="-object memory-backend-ram,id=m0,size=256M
   -object memory-backend-ram,id=m1,size=256M -numa
@@ -248,8 +243,10 @@ timer_create and clock_nanosleep take only the caller's own process
 CPU clock (and its threads' for timer_create): another process's is
 EINVAL (Linux runs those too, checked when that process runs). The
 SCHED CPU clock counts utime + stime like PROF (Linux: exact runtime).
-CPU timer signals carry no siginfo (no si_timerid/si_overrun). rseq is
-ENOSYS (glibc runs without it).
+A CPU-clock clock_nanosleep's hidden timer takes a timer id from the
+process's registry (Linux posix_cpu_nsleep's timer is not hashed: the
+next timer_create id does not move). rseq is ENOSYS (glibc runs
+without it).
 
 ## AF_PACKET gaps
 
@@ -278,13 +275,10 @@ No leases (F_SETLEASE) and no OFD locks (F_OFD_*).
 
 **Location**: `seccomp/`
 
-SIGSYS from SECCOMP_RET_TRAP carries no siginfo (si_code SYS_SECCOMP,
-si_syscall, si_arch, si_errno, si_call_addr): hk has no siginfo queue
-(signals are a bitmask). No PTRACE_EVENT_SECCOMP (RET_TRACE is ENOSYS
-as with no tracer), no user notification (SECCOMP_RET_USER_NOTIF,
-SECCOMP_GET_NOTIF_SIZES), no FLAG_TSYNC_ESRCH / FLAG_SPEC_ALLOW /
-FLAG_WAIT_KILLABLE_RECV, and nothing is logged for RET_LOG or
-FLAG_LOG.
+No PTRACE_EVENT_SECCOMP (RET_TRACE is ENOSYS as with no tracer), no
+user notification (SECCOMP_RET_USER_NOTIF, SECCOMP_GET_NOTIF_SIZES), no
+FLAG_TSYNC_ESRCH / FLAG_SPEC_ALLOW / FLAG_WAIT_KILLABLE_RECV, and
+nothing is logged for RET_LOG or FLAG_LOG.
 
 ## vmsplice from a pipe is not done
 
@@ -322,6 +316,22 @@ SIOCUNIXFILE, SO_PEERSEC (ENOPROTOOPT, as on Linux without an LSM).
 
 Missing: immutable/append-only inodes (no IS_APPEND/IS_IMMUTABLE
 EPERM).
+
+## Before user namespaces grant capabilities
+
+**Location**: `task/mod.rs` (`capable`), `fs/dac.rs`, `ns/mod.rs`,
+`fs/mount.rs`, `net/netlink/rtnetlink.rs`
+
+Safe today only because a user namespace grants no capabilities. First:
+- each `capable()` becomes Linux's `ns_capable(<owner>->user_ns)` (or
+  `capable`, where Linux keeps it); sockopt_ns_capable sites take the
+  socket netns's user_ns, but SO_DEBUG and SO_SNDBUFFORCE/RCVBUFFORCE
+  stay init-namespace (Linux sockopt_capable).
+- an unprivileged CLONE_NEWNS (new user_ns) locks the copied tree
+  (lock_mnt_tree: MNT_LOCKED plus MNT_LOCK_* flags) and turns shared
+  mounts into slaves (CL_SHARED_TO_SLAVE).
+- netlink newlink/setlink check CAP_NET_ADMIN in the target netns too
+  once IFLA_NET_NS_PID/FD are implemented (`7b735ef81286`).
 
 ## Credentials have no identity
 
@@ -390,6 +400,11 @@ unreachable today.
 
 **Location:** `tty/`, `hw/serial.rs`, `arch/aarch64/serial.rs`.
 
+- **write(2) is not atomic:** `n_tty::write` takes no per-tty write
+  lock, so two processes writing one tty interleave inside a single
+  write (boot logs show torn verdicts such as `MCELM_TOTAL:OK`). Linux
+  tty_write holds `tty->atomic_write_lock` (tty_write_lock) for the
+  whole call, chunk by chunk.
 - **No hangup:** nothing hangs a tty up (Linux __tty_hangup: vhangup,
   a session leader's exit, carrier loss), so open files stay usable.
   A leader's exit and TIOCNOTTY only send SIGHUP/SIGCONT to the
@@ -430,24 +445,6 @@ unreachable today.
   (mm, address) from the VMA; Linux keys a page still in the page
   cache (not yet COW'd) by inode and offset, so a MAP_SHARED mapping
   of the same file wakes it.
-
-## FIONREAD on pipes is 0
-
-**Location:** `fs/misc.rs` (sys_ioctl)
-
-The generic FIONREAD arm answers every file except chardevs with 0,
-so a pipe or FIFO with data reports 0. Linux do_vfs_ioctl handles
-FIONREAD only for regular files and passes the rest to f_op->ioctl
-(pipe_ioctl returns the buffered bytes).
-
-## O_ASYNC: no SIGIO
-
-**Location:** `fs/fd.rs` (F_SETFL), `fs/misc.rs` (FIOASYNC)
-
-No file raises SIGIO: there is no fasync list (Linux fasync_helper,
-kill_fasync). F_SETFL drops O_ASYNC and FIOASYNC's set is a no-op
-(O_ASYNC is not a settable flag); F_SETOWN and F_SETSIG are stored
-but unused.
 
 ## Mount flag gaps
 
@@ -493,10 +490,31 @@ that would need init's root.
 **Location**: `signal/mod.rs` (group exit), `task/exec.rs`
 de_thread
 
-- Process-directed signals go to one thread's private queue (the
-  leader, or a live thread once it has exited), not the shared queue
-  with Linux's thread choice at delivery; a pidfd polls readable when
-  the leader exits, not when the whole group is gone.
+- A pidfd polls readable when the leader exits, not when the whole
+  group is gone.
+
+## Exit notification gaps
+
+**Location**: `signal/notify.rs`, `task/percpu.rs` (exit_notify)
+
+A child's exit signal can be lost: it becomes reapable (a zombie)
+before its parent is told, which happens after TASKLIST is dropped,
+and a parent that reaps it in between gets no signal (Linux
+exit_notify sends under tasklist_lock, so wait cannot reap first).
+
+A traced child's exit tells its tracer only; once the tracer reaps or
+detaches it, its real parent is not told nor can wait for it (Linux
+wait_task_zombie / __ptrace_detach: do_notify_parent to the real
+parent).
+
+## No vDSO
+
+**Location**: `task/exec.rs`, `arch/aarch64/signal.rs`
+
+No vDSO is mapped (no AT_SYSINFO_EHDR): libc makes real syscalls for
+clock_gettime and friends. On arm64 a page holding only the signal
+return trampoline stands in for the vDSO's sigtramp, shown as
+[sigpage] in /proc/<pid>/maps (Linux: [vdso], [vvar]).
 
 ## ptrace stop gaps
 
@@ -508,7 +526,10 @@ clone and exit event stops (PTRACE_O_TRACEEXEC and friends,
 PTRACE_EVENT_*), PTRACE_INTERRUPT/LISTEN, group-stop interaction (SIGSTOP
 to an untraced task is ignored: stop/continue are not implemented),
 and the tracee's exit being
-reported to a tracer that is not its parent.
+reported to a tracer that is not its parent. A traced non-leader
+thread's zombie cannot be waited for by its tracer, and a sibling's
+exec removes it at once (Linux: the tracer reaps it, and de_thread
+waits for that).
 
 ## NETLINK_ROUTE / SIOC* subset gaps
 
@@ -523,6 +544,8 @@ NLM_F_ECHO (not echoed), extended-ACK message/offset TLVs (plain errors),
 RTM_GETRULE dumps nothing (Linux lists its three default IPv4 rules; there
 is no rule engine: lookups are local then main), address lifetimes are
 always infinite, promote_secondaries is off.
+RTM_NEWLINK/RTM_SETLINK ignore IFLA_NET_NS_PID/IFLA_NET_NS_FD: they
+return 0 without moving the device (Linux: moved, or an error).
 
 ## io_uring has no shared rings
 
@@ -633,7 +656,7 @@ over the limit reclaims, then OOM-kills a task in the cgroup
 Once enforced, OOM_FAULT_KILL and OOM_SHARED_KILL can run in a small
 cgroup (say memory.max 64MB) at any RAM size, and on Linux too,
 instead of filling all of RAM and being skipped above 4GB
-(`user/boot_tester/tests/mm_oom.rs`).
+(`user/boot_tester/mm/mm_oom.rs`).
 
 ## BPF map memory is not charged
 
@@ -831,22 +854,20 @@ Designs that grew one commit at a time. Tag = roadmap phase
 (doc/ROADMAP.md).
 
 - **Syscalls that do not deliver** (H/C): inotify and fanotify never
-  queue an event (no fsnotify hooks in the VFS); there is no siginfo
-  queue (signals are a bitmask: rt_sigqueueinfo's data, si_pid/si_uid
-  and RT signal queueing are lost); waitid without WEXITED is EINVAL
-  (C).
+  queue an event (no fsnotify hooks in the VFS); waitid without
+  WEXITED is EINVAL (C).
 - **Copied helpers** (J, or as touched): `get_nofile_limit` in five
   places; `find_task_by_pid` in four (all root-namespace pids); four
   `current_time`s; about ten user-timespec readers each validating
   (Linux get_timespec64); three iovec structs and five
-  importers; five SigInfo, three Timeval, two Timespec types.
+  importers; three Timeval, two Timespec types.
 - **Error conventions** (M1): Result<_, KernelError> about a thousand
   times beside Result<_, i32> (both signs used) and Result<_, i64>
   over a hundred and fifty; raw errno numbers and local errno
   constants in the hundreds.
 - **Process-wide state per thread** (C): pgid/sid copied into every
-  thread; shared pending signals beside SignalStruct; one global
-  CHILD_EXIT_WQ wakes every waiting parent on every exit.
+  thread; one global CHILD_EXIT_WQ wakes every waiting parent on every
+  exit.
 - **`task/percpu.rs` is about 4,600 lines** (before C): scheduler core,
   do_clone (523 lines), exit, wait, credential setters, five sleep
   APIs. Split like Linux (sched/core, fork, exit, cred). Other giants:
@@ -859,8 +880,8 @@ Designs that grew one commit at a time. Tag = roadmap phase
 - **Globals where per-CPU fits** (I/C/E): TCP timers in one map run on
   softnet/0 only; CHILD_EXIT_WQ.
 - **ID allocators** (J): PidMap, fdbits, IPC ids, and plain counters
-  (bpf, keys, mqueue, posix timers, which wrap with no collision
-  check): one IDR/IDA.
+  (bpf, keys, mqueue, which wrap with no collision check): one
+  IDR/IDA.
 - **procfs** (H): a file is generated whole (no seq_file records): an
   open file's reads continuing one another see one generation, where
   Linux generates record by record, so a long file's later chunks are
@@ -912,31 +933,31 @@ Tag = roadmap phase (doc/ROADMAP.md).
 9. **SOCKCORE_CONNECT_REFUSED flake** (cause unknown):
    `SOCKCORE_CONNECT_REFUSED:FAIL SO_ERROR got 0` (hk arm64,
    `check-stress`): poll reported POLLOUT for a nonblocking connect to
-   a just-closed loopback port, but no ECONNREFUSED was pending.
-10. **TCP_PROC_NET flake** (cause unknown): one end of a fresh,
-   accepted loopback connection is missing from /proc/net/tcp as state
-   01 (`client line got 0`, `server line got 0`; hk arm64, CI and
-   `check-stress`). Not a torn read: the file comes in one
-   regeneration (well under the 64 KiB read chunk). Not ehash removal
-   by key (removals check the entry). The test prints the lines with
-   either port when it fails.
+   a just-closed loopback port, but no ECONNREFUSED was pending. The
+   error is set under the socket lock with the move to CLOSED, so the
+   connect left SYN_SENT by a SYN-ACK or a SYN: something answered on
+   the dead port. Not a self-connect: bind(0) gives the dead port an
+   odd offset, connect takes even ones while any is free. Not
+   reproduced in 10000 looped runs (with SOCKCORE_PORT_PARITY before
+   each; x86 and arm64 LOCKDEP e1000, 8 CPUs, CPU spinners, TIME_WAIT
+   churn); LOCKDEP builds assert that a listener receiving a SYN owns
+   its port in bhash (`TcpSock::assert_owner`). On failure the test
+   prints the poll events, TCP state, local and peer ports, the port
+   range and the /proc/net/tcp lines of the dead port.
+10. **STDIO_STDOUT_PIPE flake** (hk arm64, KVM-less local boot, once
+   in four): `STDIO_STDOUT_PIPE:FAIL got 0`, the parent read nothing
+   from the pipe its child dup3'd onto stdout (EOF or an error before
+   the child's write, or the child failed). Not reproduced in two
+   reruns; investigate when it repeats.
 
-## epoll accepts files Linux cannot poll
+## /proc/<pid>/mounts: no POLLERR|POLLPRI on a mount change
 
-**Location**: `io/epoll.rs`, `fs/file.rs` (`FileOps::poll`)
+**Location**: `fs/proc/mod.rs` (`ProcfsFileOps::poll`)
 
-EPOLL_CTL_ADD of a regular file or directory is EPERM on Linux
-(file_can_poll: no f_op->poll), but every hk `FileOps` has a default
-poll, so hk accepts it and reports it always ready. Needs a
-`FileOps::can_poll` (false for the regular-file and directory ops of
-ramfs/tmpfs/vfat and most procfs files) checked at add.
+mounts and mountinfo poll readable only: a change of the mount table
+never reports POLLERR|POLLPRI (Linux mounts_poll: the namespace's
+event count against the reader's).
 
-
-Only pipes wake with the poll events that happened (Linux passes them
-to every wake_up_poll): other files (sockets, eventfd, ttys) wake with
-none, so an edge-triggered item there is queued on any wakeup of its
-queue and reported again while it stays ready, where Linux reports it
-once per matching event.
 ## adjtimex does not steer the clock
 
 **Location**: `time/time_syscall.rs`, `time/mod.rs`

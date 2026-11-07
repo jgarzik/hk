@@ -525,6 +525,15 @@ impl FileOps for FanotifyFileOps {
         self
     }
 
+    /// FIONREAD: the bytes a read would return now (Linux fanotify_ioctl)
+    fn ioctl(&self, file: &File, cmd: u32, arg: u64) -> Result<i64, KernelError> {
+        let g = file.private_ref::<Fanotify>().ok_or(KernelError::BadFd)?;
+        match cmd {
+            crate::fs::file::FIONREAD => crate::fs::file::put_fionread(arg, g.queued_size() as i64),
+            _ => Err(KernelError::NotTty),
+        }
+    }
+
     fn read_iter(
         &self,
         file: &File,

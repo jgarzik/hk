@@ -614,8 +614,11 @@ impl X86_64PageTable {
             let pt = phys_to_virt_table(pd_entry.addr());
 
             // Set the final page table entry (a fresh table, never
-            // loaded: nothing to flush)
+            // loaded: nothing to flush); a page already there stays
             let pt_entry = (*pt).entry_mut(pt_idx);
+            if pt_entry.is_present() {
+                return Err(MapError::AlreadyMapped);
+            }
             pt_entry.set(pa, entry_flags);
         }
 

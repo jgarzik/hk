@@ -13,8 +13,8 @@
 
 use crate::arch::Uaccess;
 use crate::signal::{
-    SIGKILL, SIGSTOP, SigAction, SigSet, get_task_sighand, kill_pgrp, send_signal,
-    send_signal_to_process, with_task_signal_state,
+    SIGKILL, SIGSTOP, SendInfo, SigAction, SigInfo, SigSet, dequeue_signal, get_task_sighand,
+    kill_pgrp, kill_proc_info, send_sig_info, si_code, with_task_signal_state,
 };
 use crate::task::percpu::{current_pgid, current_tid, get_all_pids};
 use crate::uaccess::{UserPtr, get_user, put_user};
@@ -116,6 +116,7 @@ pub fn sys_rt_sigaction(sig: u32, act_ptr: u64, oact_ptr: u64, sigsetsize: u64) 
         return -3; // ESRCH
     };
     // The old action and the swap in one hold of the action lock
+    let changed = new.is_some();
     let old = match new {
         Some(a) => match sighand.set_action(sig, a) {
             Ok(old) => old,
@@ -126,6 +127,13 @@ pub fn sys_rt_sigaction(sig: u32, act_ptr: u64, oact_ptr: u64, sigsetsize: u64) 
             None => return -22, // EINVAL
         },
     };
+    // Ignored now: discarded pending; no longer ignored: interval timers
+    // whose signal it ignored queue it (Linux do_sigaction)
+    if changed && handler_ignored(&sighand, sig) {
+        crate::signal::flush_group_signal(sig);
+    } else if changed && old.handler == crate::signal::SigHandler::Ignore {
+        crate::time::posix_timer::sig_unignore(sig);
+    }
     if oact_ptr != 0
         && UserPtr::<UserSigAction>::new(oact_ptr)
             .write(&UserSigAction::from(&old))
@@ -134,6 +142,20 @@ pub fn sys_rt_sigaction(sig: u32, act_ptr: u64, oact_ptr: u64, sigsetsize: u64) 
         return -14; // EFAULT
     }
     0
+}
+
+/// `sig`'s action now discards it: SIG_IGN, or SIG_DFL for a signal
+/// whose default is to ignore it (Linux sig_handler_ignored)
+fn handler_ignored(sighand: &crate::signal::SigHand, sig: u32) -> bool {
+    use crate::signal::{DefaultAction, SigHandler, default_action};
+    match sighand.get_action(sig).map(|a| a.handler) {
+        Some(SigHandler::Ignore) => true,
+        Some(SigHandler::Default) => matches!(
+            default_action(sig),
+            DefaultAction::Ignore | DefaultAction::Continue
+        ),
+        _ => false,
+    }
 }
 
 /// rt_sigprocmask(how, set, oset, sigsetsize) - examine and change blocked signals
@@ -248,78 +270,69 @@ pub fn sys_rt_sigpending(set_ptr: u64, sigsetsize: u64) -> i64 {
 /// # Returns
 /// 0 if permitted, -1 (EPERM) if denied, -3 (ESRCH) if target not found
 fn check_kill_permission(target_pid: u64, sig: u32) -> i32 {
-    use crate::signal::SIGCONT;
-    use crate::task::percpu::{TASKLIST, current_sid, current_tid};
-    use crate::task::{CAP_KILL, capable, current_cred};
+    let me = Sender::current();
+    let table = crate::task::percpu::TASKLIST.read();
+    match table.get(target_pid) {
+        Some(t) => me.may_kill(&t, sig),
+        None => -3, // ESRCH - no such process
+    }
+}
 
-    let caller_tid = current_tid();
-    let caller_cred = current_cred();
+/// What the kill permission check needs of the caller, read before
+/// TASKLIST is taken
+pub(crate) struct Sender {
+    tgid: u64,
+    sid: u64,
+    cred: crate::task::Cred,
+}
 
-    // Get target task info
-    let target_info = {
-        let table = TASKLIST.read();
-        // Find the thread group leader for this pid
-        table
-            .get(target_pid)
-            .map(|t| (t.task.pid, t.task.sid(), t.cred_arc()))
-    };
-
-    let (target_tgid, target_sid, target_cred) = match target_info {
-        Some(info) => info,
-        None => return -3, // ESRCH - no such process
-    };
-
-    // Get caller's tgid
-    let caller_tgid = {
-        let table = TASKLIST.read();
-        table.get(caller_tid).map(|t| t.task.pid).unwrap_or(0)
-    };
-
-    // Same thread group - always allowed
-    if caller_tgid == target_tgid {
-        return 0;
+impl Sender {
+    pub(crate) fn current() -> Self {
+        Self {
+            tgid: crate::task::percpu::current_pid(),
+            sid: crate::task::percpu::current_sid(),
+            cred: crate::task::current_cred(),
+        }
     }
 
-    // CAP_KILL capability - always allowed
-    if capable(CAP_KILL) {
-        return 0;
+    /// May it send `sig` to `t` (Linux check_kill_permission): same
+    /// thread group, CAP_KILL, a real or effective uid matching the
+    /// target's real or saved one, or SIGCONT within the session; else
+    /// EPERM
+    pub(crate) fn may_kill(&self, t: &crate::task::percpu::TaskView<'_>, sig: u32) -> i32 {
+        use crate::signal::SIGCONT;
+        use crate::task::{CAP_KILL, capable};
+        if self.tgid == t.task.pid || capable(CAP_KILL) {
+            return 0;
+        }
+        let c = &self.cred;
+        let tc = t.cred_arc();
+        if c.euid == tc.suid || c.euid == tc.uid || c.uid == tc.suid || c.uid == tc.uid {
+            return 0;
+        }
+        if sig == SIGCONT && self.sid == t.task.sid() {
+            return 0;
+        }
+        -1 // EPERM
     }
-
-    // UID match check (like Linux kill_ok_by_cred)
-    // Caller's real or effective UID must match target's real or saved UID
-    let uid_ok = caller_cred.euid == target_cred.suid
-        || caller_cred.euid == target_cred.uid
-        || caller_cred.uid == target_cred.suid
-        || caller_cred.uid == target_cred.uid;
-
-    if uid_ok {
-        return 0;
-    }
-
-    // SIGCONT special case: same session allows SIGCONT
-    if sig == SIGCONT && current_sid() == target_sid {
-        return 0;
-    }
-
-    -1 // EPERM - permission denied
 }
 
 /// A user signal to the process `pid` names: the permission check, then
 /// the send (Linux group_send_sig_info). Every user-facing path goes
 /// through this or [`user_thread_send`], so none can forget the check.
-pub(crate) fn user_group_send(pid: u64, sig: u32) -> i32 {
+fn user_group_send(pid: u64, sig: u32, info: SendInfo) -> i32 {
     let perm = check_kill_permission(pid, sig);
     if perm != 0 {
         return perm;
     }
-    send_signal_to_process(pid, sig)
+    kill_proc_info(pid, sig, info)
 }
 
 /// A user signal to one thread `tid`, which must be in group `tgid`
 /// if one is given (Linux do_send_specific; tkill gives none): ESRCH
 /// if it is not, then the same
 /// permission check as a process-wide signal, then the send.
-fn user_thread_send(tgid: Option<u64>, tid: u64, sig: u32) -> i32 {
+fn user_thread_send(tgid: Option<u64>, tid: u64, sig: u32, info: SendInfo) -> i32 {
     use crate::task::percpu::TASKLIST;
     if let Some(tgid) = tgid {
         let in_group = TASKLIST
@@ -335,7 +348,15 @@ fn user_thread_send(tgid: Option<u64>, tid: u64, sig: u32) -> i32 {
     if perm != 0 {
         return perm;
     }
-    send_signal(tid, sig)
+    send_sig_info(tid, sig, info)
+}
+
+/// What tkill and tgkill send: SI_TKILL from the caller's process and
+/// real uid (Linux prepare_kill_siginfo, PIDTYPE_PID)
+fn tkill_info(sig: u32) -> SendInfo {
+    let pid = crate::task::percpu::current_pid() as i32;
+    let uid = crate::task::current_cred().uid;
+    SendInfo::Info(SigInfo::kill(sig, si_code::SI_TKILL, pid, uid))
 }
 
 /// kill(pid, sig) - send signal to process
@@ -356,10 +377,10 @@ pub fn sys_kill(pid: i64, sig: u32) -> i64 {
     }
 
     if pid > 0 {
-        i64::from(user_group_send(pid as u64, sig))
+        i64::from(user_group_send(pid as u64, sig, SendInfo::User))
     } else if pid == 0 {
         // Every process in the caller's process group, once each
-        i64::from(kill_pgrp(current_pgid(), sig, |p| {
+        i64::from(kill_pgrp(current_pgid(), sig, SendInfo::User, |p| {
             check_kill_permission(p, sig)
         }))
     } else if pid == -1 {
@@ -381,7 +402,7 @@ pub fn sys_kill(pid: i64, sig: u32) -> i64 {
                 0 => {
                     matched = true;
                     if sig != 0 {
-                        send_signal_to_process(target_pid, sig);
+                        kill_proc_info(target_pid, sig, SendInfo::User);
                     }
                 }
                 -1 => matched = true, // permission denied, but it exists
@@ -393,7 +414,9 @@ pub fn sys_kill(pid: i64, sig: u32) -> i64 {
         // pid < -1: every process in group -pid, once each (signal 0:
         // does the group exist, may we signal it)
         let pgid = pid.unsigned_abs();
-        i64::from(kill_pgrp(pgid, sig, |p| check_kill_permission(p, sig)))
+        i64::from(kill_pgrp(pgid, sig, SendInfo::User, |p| {
+            check_kill_permission(p, sig)
+        }))
     }
 }
 
@@ -411,7 +434,12 @@ pub fn sys_tgkill(tgid: i64, tid: i64, sig: u32) -> i64 {
         return -22; // EINVAL
     }
 
-    i64::from(user_thread_send(Some(tgid as u64), tid as u64, sig))
+    i64::from(user_thread_send(
+        Some(tgid as u64),
+        tid as u64,
+        sig,
+        tkill_info(sig),
+    ))
 }
 
 /// tkill(tid, sig) - send signal to thread (deprecated)
@@ -422,7 +450,7 @@ pub fn sys_tkill(tid: i64, sig: u32) -> i64 {
     if sig > 64 || tid <= 0 {
         return -22; // EINVAL
     }
-    i64::from(user_thread_send(None, tid as u64, sig))
+    i64::from(user_thread_send(None, tid as u64, sig, tkill_info(sig)))
 }
 
 /// rt_sigqueueinfo(pid, sig, uinfo) - send signal with info to a process
@@ -439,28 +467,25 @@ pub fn sys_tkill(tid: i64, sig: u32) -> i64 {
 /// * -ESRCH: No such process
 /// * -EFAULT: Bad uinfo pointer
 pub fn sys_rt_sigqueueinfo(pid: i64, sig: u32, uinfo: u64) -> i64 {
-    use crate::task::percpu::current_pid;
-
     // Validate signal number
     if sig == 0 || sig > 64 {
         return -22; // EINVAL
     }
 
-    // Read siginfo from user space
-    let info = match SigInfo::read_from_user(uinfo, sig) {
+    let info = match read_info(uinfo, sig) {
         Ok(i) => i,
-        Err(e) => return -i64::from(e),
+        Err(e) => return e.sysret(),
     };
 
     // Security check (Linux kernel/signal.c do_rt_sigqueueinfo): si_code
     // values reserved to the kernel (>= 0, or SI_TKILL) may only be queued
-    // to the caller itself, never used to forge signals to other processes
-    let caller_pid = current_pid() as i64;
-    if (info.code() >= 0 || info.code() == si_code::SI_TKILL) && pid != caller_pid {
+    // by a thread to its own number, never used to forge signals to
+    // other processes
+    if reserved_to_kernel(info.code) && pid != current_tid() as i64 {
         return -1; // EPERM
     }
 
-    i64::from(user_group_send(pid as u64, sig))
+    i64::from(user_group_send(pid as u64, sig, SendInfo::Info(info)))
 }
 
 /// rt_tgsigqueueinfo(tgid, tid, sig, uinfo) - send signal with info to a thread
@@ -487,20 +512,24 @@ pub fn sys_rt_tgsigqueueinfo(tgid: i64, tid: i64, sig: u32, uinfo: u64) -> i64 {
         return -22; // EINVAL
     }
 
-    // Read siginfo from user space
-    let info = match SigInfo::read_from_user(uinfo, sig) {
+    let info = match read_info(uinfo, sig) {
         Ok(i) => i,
-        Err(e) => return -i64::from(e),
+        Err(e) => return e.sysret(),
     };
 
     // Security check (Linux do_rt_tgsigqueueinfo): kernel-reserved si_code
     // only when targeting the calling thread itself
     let caller_tid = crate::task::percpu::current_tid() as i64;
-    if (info.code() >= 0 || info.code() == si_code::SI_TKILL) && tid != caller_tid {
+    if reserved_to_kernel(info.code) && tid != caller_tid {
         return -1; // EPERM
     }
 
-    i64::from(user_thread_send(Some(tgid as u64), tid as u64, sig))
+    i64::from(user_thread_send(
+        Some(tgid as u64),
+        tid as u64,
+        sig,
+        SendInfo::Info(info),
+    ))
 }
 
 /// rt_sigsuspend(mask, sigsetsize) - wait for signal with temporary mask
@@ -563,182 +592,17 @@ pub fn sys_pause() -> i64 {
     KernelError::RestartNoHand.sysret()
 }
 
-/// siginfo_t structure for user space (Linux ABI)
-///
-/// This is the 128-byte structure passed to user space signal handlers
-/// and returned by rt_sigtimedwait.
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
-pub struct SigInfo {
-    /// Signal number
-    pub si_signo: i32,
-    /// Error number (not used for most signals)
-    pub si_errno: i32,
-    /// Signal code (SI_USER, SI_KERNEL, etc.)
-    pub si_code: i32,
-    /// Padding for alignment
-    _pad0: i32,
-    /// Union of signal-specific data
-    _sifields: SigInfoFields,
+/// The siginfo rt_sigqueueinfo and rt_tgsigqueueinfo queue, made for
+/// `sig` whatever its si_signo, its layout judged by `sig` (Linux
+/// __copy_siginfo_from_user): EFAULT, E2BIG
+fn read_info(uinfo: u64, sig: u32) -> Result<SigInfo, KernelError> {
+    SigInfo::copy_from_user_sig(uinfo, sig as i32)
 }
 
-/// Signal-specific fields (128 bytes total for siginfo_t): hk fills
-/// only the kill variant (sender pid, uid); the rest is zero
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-struct SigInfoFields {
-    kill: SigInfoKill,
-    /// The rest of the 112-byte union
-    _rest: [u8; 104],
-}
-
-impl Default for SigInfoFields {
-    fn default() -> Self {
-        Self {
-            kill: SigInfoKill::default(),
-            _rest: [0; 104],
-        }
-    }
-}
-
-/// Kill signal info (SI_USER, SI_TKILL)
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
-struct SigInfoKill {
-    /// Sender's PID
-    si_pid: i32,
-    /// Sender's UID
-    si_uid: u32,
-}
-
-/// Signal codes
-pub mod si_code {
-    /// Sent by kill, sigsend, raise
-    pub const SI_USER: i32 = 0;
-    /// Sent by kernel
-    pub const SI_KERNEL: i32 = 128;
-    /// Sent by sigqueue
-    pub const SI_QUEUE: i32 = -1;
-    /// Sent by timer expiration
-    pub const SI_TIMER: i32 = -2;
-    /// Sent by real-time mesq state change
-    pub const SI_MESGQ: i32 = -3;
-    /// Sent by AIO completion
-    pub const SI_ASYNCIO: i32 = -4;
-    /// Sent by queued SIGIO
-    pub const SI_SIGIO: i32 = -5;
-    /// Sent by tkill/tgkill
-    pub const SI_TKILL: i32 = -6;
-}
-
-impl SigInfo {
-    /// Create siginfo for a user-sent signal
-    pub fn from_kill(sig: u32, pid: i32, uid: u32) -> Self {
-        Self {
-            si_signo: sig as i32,
-            si_errno: 0,
-            si_code: si_code::SI_USER,
-            _pad0: 0,
-            _sifields: SigInfoFields {
-                kill: SigInfoKill {
-                    si_pid: pid,
-                    si_uid: uid,
-                },
-                _rest: [0; 104],
-            },
-        }
-    }
-
-    /// Write siginfo to user space
-    pub fn write_to_user(&self, ptr: u64) -> Result<(), i32> {
-        // Write si_signo (offset 0)
-        if put_user::<Uaccess, i32>(ptr, self.si_signo).is_err() {
-            return Err(14); // EFAULT
-        }
-        // Write si_errno (offset 4)
-        if put_user::<Uaccess, i32>(ptr + 4, self.si_errno).is_err() {
-            return Err(14);
-        }
-        // Write si_code (offset 8)
-        if put_user::<Uaccess, i32>(ptr + 8, self.si_code).is_err() {
-            return Err(14);
-        }
-        // Write _pad0 (offset 12)
-        if put_user::<Uaccess, i32>(ptr + 12, self._pad0).is_err() {
-            return Err(14);
-        }
-        // Write kill fields (offset 16)
-        let kill = self._sifields.kill;
-        if put_user::<Uaccess, i32>(ptr + 16, kill.si_pid).is_err() {
-            return Err(14);
-        }
-        if put_user::<Uaccess, u32>(ptr + 20, kill.si_uid).is_err() {
-            return Err(14);
-        }
-        Ok(())
-    }
-
-    /// Read siginfo from user space
-    ///
-    /// # Arguments
-    /// * `ptr` - User-space pointer to siginfo_t (128 bytes)
-    /// * `sig` - Expected signal number for validation
-    ///
-    /// # Returns
-    /// Ok(SigInfo) on success, Err(errno) on error
-    pub fn read_from_user(ptr: u64, sig: u32) -> Result<Self, i32> {
-        // Read si_signo (offset 0)
-        let si_signo = match get_user::<Uaccess, i32>(ptr) {
-            Ok(v) => v,
-            Err(_) => return Err(14), // EFAULT
-        };
-        // Read si_errno (offset 4)
-        let si_errno = match get_user::<Uaccess, i32>(ptr + 4) {
-            Ok(v) => v,
-            Err(_) => return Err(14),
-        };
-        // Read si_code (offset 8)
-        let si_code = match get_user::<Uaccess, i32>(ptr + 8) {
-            Ok(v) => v,
-            Err(_) => return Err(14),
-        };
-        // Read si_pid (offset 16)
-        let si_pid = match get_user::<Uaccess, i32>(ptr + 16) {
-            Ok(v) => v,
-            Err(_) => return Err(14),
-        };
-        // Read si_uid (offset 20)
-        let si_uid = match get_user::<Uaccess, u32>(ptr + 20) {
-            Ok(v) => v,
-            Err(_) => return Err(14),
-        };
-
-        // Validate si_signo matches expected signal
-        if si_signo != sig as i32 {
-            return Err(22); // EINVAL
-        }
-
-        Ok(Self {
-            si_signo,
-            si_errno,
-            si_code,
-            _pad0: 0,
-            _sifields: SigInfoFields {
-                kill: SigInfoKill { si_pid, si_uid },
-                _rest: [0; 104],
-            },
-        })
-    }
-
-    /// Get si_code value
-    pub fn code(&self) -> i32 {
-        self.si_code
-    }
-
-    /// Get sender's PID from siginfo
-    pub fn pid(&self) -> i32 {
-        self._sifields.kill.si_pid
-    }
+/// Codes no user may queue to another task: the kernel's (> 0), and
+/// those kill and tkill fill in (Linux si_code_reserved_to_kernel)
+pub(crate) fn reserved_to_kernel(code: i32) -> bool {
+    code >= 0 || code == si_code::SI_TKILL
 }
 
 /// rt_sigtimedwait(uthese, uinfo, uts, sigsetsize) - wait for signal
@@ -801,8 +665,8 @@ pub fn sys_rt_sigtimedwait(set_ptr: u64, info_ptr: u64, ts_ptr: u64, sigsetsize:
     mask.remove(SIGKILL);
     mask.remove(SIGSTOP);
 
-    let mut sig = dequeue_in(tid, &mask);
-    if sig.is_none() && timeout_ns != Some(0) {
+    let mut info = dequeue_signal(&mask);
+    if info.is_none() && timeout_ns != Some(0) {
         // Linux do_sigtimedwait: unblock the awaited signals while
         // sleeping so their arrival wakes us, then restore the mask
         let saved = with_task_signal_state(tid, |st| {
@@ -819,8 +683,8 @@ pub fn sys_rt_sigtimedwait(set_ptr: u64, info_ptr: u64, ts_ptr: u64, sigsetsize:
                 st.real_blocked = SigSet::EMPTY;
             });
         }
-        sig = dequeue_in(tid, &mask);
-        if sig.is_none() {
+        info = dequeue_signal(&mask);
+        if info.is_none() {
             // Another signal (EINTR) or the timeout (EAGAIN)
             let timed_out = deadline.is_some_and(|d| crate::time::monotonic_ns() >= d);
             return if timed_out {
@@ -830,37 +694,16 @@ pub fn sys_rt_sigtimedwait(set_ptr: u64, info_ptr: u64, ts_ptr: u64, sigsetsize:
             };
         }
     }
-    let Some(sig) = sig else {
+    let Some(info) = info else {
         return KernelError::WouldBlock.sysret();
     };
-    if info_ptr != 0 {
-        // Basic siginfo (SI_USER with pid/uid 0: senders are not tracked)
-        let siginfo = SigInfo::from_kill(sig, 0, 0);
-        if siginfo.write_to_user(info_ptr).is_err() {
-            return KernelError::BadAddress.sysret();
-        }
+    // The signal is taken even if its info cannot be written (Linux)
+    if info_ptr != 0
+        && let Err(e) = info.copy_to_user(info_ptr)
+    {
+        return e.sysret();
     }
-    i64::from(sig)
-}
-
-/// Dequeue the lowest pending signal of `mask` (private, then shared)
-fn dequeue_in(tid: crate::task::Tid, mask: &SigSet) -> Option<u32> {
-    with_task_signal_state(tid, |state| {
-        let deliverable = state.pending.signal.intersect(mask);
-        if let Some(sig) = deliverable.first() {
-            state.pending.remove(sig);
-            return Some(sig);
-        }
-        let mut shared = state.shared_pending.lock();
-        let deliverable = shared.signal.intersect(mask);
-        if let Some(sig) = deliverable.first() {
-            shared.remove(sig);
-            drop(shared);
-            return Some(sig);
-        }
-        None
-    })
-    .flatten()
+    i64::from(info.sig())
 }
 
 /// Sleep interruptibly until a signal is deliverable or the

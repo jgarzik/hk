@@ -9,7 +9,7 @@ use core::arch::asm;
 use super::Aarch64TrapFrame;
 use crate::arch::UserFrame;
 use crate::mm::fault::{Access, VmFault};
-use crate::signal::{KSigInfo, si_code};
+use crate::signal::{SigInfo, Trap, TrapSet, si_code};
 
 // Exception classes (ESR_EL1[31:26])
 const EC_UNKNOWN: u64 = 0x00;
@@ -264,12 +264,8 @@ extern "C" fn handle_el0_sync(frame: &UserFrame, esr: u64) {
         }
         EC_BRK => {
             // brk #imm: PC still points at it
-            let info = KSigInfo {
-                code: si_code::TRAP_BRKPT,
-                addr: frame.ip(),
-                ..Default::default()
-            };
-            user_fault(frame, crate::signal::SIGTRAP, info);
+            let info = SigInfo::fault(crate::signal::SIGTRAP, si_code::TRAP_BRKPT, frame.ip());
+            user_fault(frame, info, TrapSet::Keep);
         }
         EC_PC_ALIGN | EC_SP_ALIGN => {
             let addr = if ec == EC_SP_ALIGN {
@@ -277,12 +273,8 @@ extern "C" fn handle_el0_sync(frame: &UserFrame, esr: u64) {
             } else {
                 frame.ip()
             };
-            let info = KSigInfo {
-                code: si_code::BUS_ADRALN,
-                addr,
-                ..Default::default()
-            };
-            user_fault(frame, crate::signal::SIGBUS, info);
+            let info = SigInfo::fault(crate::signal::SIGBUS, si_code::BUS_ADRALN, addr);
+            user_fault(frame, info, notify_die(esr));
         }
         _ => {
             // Undefined instruction (EC 0, e.g. udf) or any other
@@ -293,12 +285,9 @@ extern "C" fn handle_el0_sync(frame: &UserFrame, esr: u64) {
                 iss,
                 frame.ip()
             );
-            let info = KSigInfo {
-                code: si_code::ILL_ILLOPC,
-                addr: frame.ip(),
-                ..Default::default()
-            };
-            user_fault(frame, crate::signal::SIGILL, info);
+            // Linux do_el0_undef (no syndrome) / bad_el0_sync (its ESR)
+            let info = SigInfo::fault(crate::signal::SIGILL, si_code::ILL_ILLOPC, frame.ip());
+            user_fault(frame, info, notify_die(if ec == 0 { 0 } else { esr }));
         }
     }
     // Back to user mode: its pending work first (Linux
@@ -356,21 +345,52 @@ fn user_abort(frame: &UserFrame, esr: u64, far: u64, fsc: u64, res: Result<(), V
         esr,
         sig
     );
-    let info = KSigInfo {
-        code,
-        addr: far,
+    let trap = TrapSet::All(Trap {
         trapno: 0,
-        error: esr,
-    };
-    user_fault(frame, sig, info);
+        error: abort_signal_esr(far, esr),
+        addr: far,
+    });
+    user_fault(frame, SigInfo::fault(sig, code, far), trap);
 }
 
 /// Deliver a synchronous fault signal (force_sig_fault) for the user
 /// context in `frame`, the task's pt_regs: a handler runs when this
 /// exception returns
-fn user_fault(frame: &UserFrame, sig: u32, info: KSigInfo) {
+/// ESR fields (Linux ESR_ELx_EC_MASK, IL, CM, WNR, FSC_FAULT)
+const ESR_EC_MASK: u64 = 0x3F << 26;
+const ESR_IL: u64 = 1 << 25;
+const ESR_CM: u64 = 1 << 8;
+const ESR_WNR: u64 = 1 << 6;
+const ESR_FSC_FAULT: u64 = 0x04;
+
+/// The ESR a user abort at `far` reports in its esr_context (Linux
+/// set_thread_esr): for a kernel (TTBR1) address, a level 0
+/// translation fault keeping only what the instruction shows (data:
+/// EC, IL, CM, WnR; instruction: EC, IL), so kernel mappings do not show
+fn abort_signal_esr(far: u64, esr: u64) -> u64 {
+    if far < super::paging::TASK_SIZE {
+        return esr;
+    }
+    match esr >> 26 {
+        EC_DABORT_LOWER => esr & (ESR_EC_MASK | ESR_IL | ESR_CM | ESR_WNR) | ESR_FSC_FAULT,
+        EC_IABORT_LOWER => esr & (ESR_EC_MASK | ESR_IL) | ESR_FSC_FAULT,
+        // Not an abort from EL0: no esr_context (Linux warns)
+        _ => 0,
+    }
+}
+
+/// Linux arm64_notify_die: no fault address, syndrome `esr`
+fn notify_die(esr: u64) -> TrapSet {
+    TrapSet::All(Trap {
+        trapno: 0,
+        error: esr,
+        addr: 0,
+    })
+}
+
+fn user_fault(frame: &UserFrame, info: SigInfo, trap: TrapSet) {
     super::cpu::enable_interrupts();
-    crate::signal::force_sig_fault(sig, info, frame);
+    crate::signal::force_sig_fault(info, trap, frame);
 }
 
 /// Handle IRQ from EL0 (user mode)

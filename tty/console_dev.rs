@@ -22,6 +22,11 @@ impl CharDevice for ConsoleCharDevice {
         "console"
     }
 
+    /// console_fops has tty_poll
+    fn can_poll(&self) -> bool {
+        true
+    }
+
     fn open(&self, file: &File) -> Result<(), KernelError> {
         let tty = console_tty().ok_or(KernelError::NoDevice)?;
         Redirect::set(file, tty)
@@ -37,6 +42,13 @@ impl CharDevice for ConsoleCharDevice {
 
     fn ioctl(&self, file: &File, cmd: u32, arg: u64) -> Result<i64, KernelError> {
         CharDevice::ioctl(Redirect::tty(file)?, file, cmd, arg)
+    }
+
+    fn fasync(&self, file: &File, fd: i32, on: bool) -> Option<Result<(), KernelError>> {
+        match Redirect::tty(file) {
+            Ok(t) => CharDevice::fasync(t, file, fd, on),
+            Err(e) => Some(Err(e)),
+        }
     }
 
     fn poll(&self, file: &File, pt: Option<&mut PollTable<'_>>) -> u16 {

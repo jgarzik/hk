@@ -163,6 +163,10 @@ impl crate::arch::UserRegs for PtRegs {
     /// regs->ax = regs->orig_ax; regs->ip -= 2). A RIP the 2 bytes do not
     /// fit below (only a debugger could have put one there) is left alone
     /// and the syscall fails with EINTR: the result stays a user address.
+    fn syscall_rollback(&mut self) {
+        self.rax = self.orig_rax;
+    }
+
     fn restart_syscall(&mut self) {
         match self.rip.checked_sub(2) {
             Some(ip) if ip < paging::TASK_SIZE => {

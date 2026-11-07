@@ -85,6 +85,11 @@ impl FileOps for NullfsFileOps {
         self
     }
 
+    /// No poll (Linux nullfs_dir_operations)
+    fn can_poll(&self, _file: &File) -> bool {
+        false
+    }
+
     /// A directory (Linux generic_read_dir)
     fn read_iter(
         &self,

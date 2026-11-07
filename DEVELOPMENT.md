@@ -158,6 +158,14 @@ a log: `serial.log` (x86-64), `serial_arm.log` (aarch64),
 (`check-linux*`). `NO_KVM=1` (e.g. `NO_KVM=1 make check`) runs x86
 under TCG, as CI does.
 
+`tools/bt-names.sh LOG` prints a serial log's verdict names
+(`NAME:OK|SKIP|FAIL`) in order; `tools/bt-names.sh OLD NEW` diffs two
+logs' sequences. A change to the boot tests that should not change
+what runs (a move, a refactor) keeps the Linux logs'
+(`target/linux-test-<arch>/serial.clean`) sequence identical; make them
+with `LINUX_NOCACHE=1`, since a cached PASS leaves the old log in place.
+hk logs can show a verdict torn by a concurrent writer.
+
 `check-linux*` results do not depend on the kernel sources, so a PASS is cached
 in `~/.cache/hk-linux-check/<arch>/<hash>` (`LINUX_CACHE_DIR`), shared by
 all worktrees; a rerun with the same hash prints `check-linux: cached
@@ -225,12 +233,11 @@ make check          # Build x86-64 + run boot tests
 make check-arm      # Build aarch64 + run boot tests
 ```
 
-Tests are defined in `user/boot_tester/tests/*.rs` and cover:
-- Process management (fork, exec, clone, signals)
-- Memory management (mmap, mlock, munmap)
-- File system operations
-- Timers and scheduling
-- And more...
+Tests live in `user/boot_tester/<subsys>/*.rs`, one directory per
+subsystem (`arch`, `exec`, `fs`, `io`, `ipc`, `mm`, `net`, `proc`,
+`process`, `signal`, `time`), each declaring its suites in its `mod.rs`;
+`main.rs::run_all_tests` calls every suite, in order. Shared helpers
+are in `helpers.rs`, the verdict printers in `harness.rs`.
 
 A successful boot shows all tests passing and ends with `BOOT_COMPLETE`.
 
@@ -252,8 +259,8 @@ make clippy         # Run clippy for x86-64
 make clippy-arm     # Run clippy for aarch64
 
 # Formatting
-make fmt            # Format code
-make fmt-check      # Check formatting without modifying
+make fmt            # Format code (kernel and user/)
+make fmt-check      # Check formatting (kernel and user/) without modifying
 ```
 
 **IMPORTANT**: Do NOT run bare `cargo clippy` - it will fail on this no_std kernel.
@@ -291,8 +298,8 @@ hk/                      # The kernel crate (no_std, no_main) is the repo root
 ├── dt/                  # Device tree parsing
 ├── *.rs                 # Core: entry, cpu/smp, irq, printk/kmsg, console, uaccess, ...
 ├── user/                # Userspace test binaries (separate workspace)
-│   ├── boot_tester/     # Test harness (main.rs, boot_tester2.rs)
-│   │   └── tests/       # Test modules (mmap.rs, process.rs, etc.)
+│   ├── boot_tester/     # Boot tests: main.rs (run_all_tests), harness.rs, helpers.rs,
+│   │                    #   boot_tester2.rs; one dir per subsystem (fs/, mm/, net/, ...)
 │   ├── syscall/         # Syscall wrappers (x86_64.rs, aarch64.rs)
 │   └── rootfs/          # /etc files for the initramfs
 ├── tools/               # gate, disk image, busybox, Linux reference scripts

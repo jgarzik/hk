@@ -23,7 +23,8 @@
 //! the task's EL0 trap frame, where they live while it is in the kernel.
 
 use crate::arch::Uaccess;
-use crate::signal::{KSigInfo, SigAction, SigHandler, SigSet, sa_flags};
+use crate::signal::siginfo::UserSigInfo;
+use crate::signal::{SigAction, SigHandler, SigInfo, SigSet, Trap, sa_flags};
 use crate::uaccess::{UaccessArch, copy_to_user};
 use crate::util::pod::{FromBytes, IntoBytes};
 
@@ -133,33 +134,6 @@ impl Default for UContext {
 }
 
 // =============================================================================
-// Signal Info (siginfo_t)
-// =============================================================================
-
-/// siginfo_t structure (simplified, same as x86_64)
-#[repr(C)]
-#[derive(Debug, Clone, Default, Copy)]
-pub struct SigInfo {
-    /// Signal number
-    pub si_signo: i32,
-    /// Error number
-    pub si_errno: i32,
-    /// Signal code
-    pub si_code: i32,
-    /// Padding
-    pub _pad: i32,
-    /// Signal-specific fields
-    pub _fields: [u64; 14],
-}
-crate::pod!(SigInfo {
-    si_signo,
-    si_errno,
-    si_code,
-    _pad,
-    _fields
-});
-
-// =============================================================================
 // RT Signal Frame
 // =============================================================================
 
@@ -171,7 +145,7 @@ crate::pod!(SigInfo {
 #[derive(Clone, Copy)]
 pub struct RtSigFrame {
     /// Signal info
-    pub info: SigInfo,
+    pub info: UserSigInfo,
     /// User context
     pub uc: UContext,
 }
@@ -186,7 +160,6 @@ pub const RESERVED_OFFSET: usize = core::mem::size_of::<RtSigFrame>();
 const _: () = assert!(core::mem::size_of::<SigContext>() == 8 + 31 * 8 + 3 * 8 + 8);
 const _: () = assert!(core::mem::size_of::<StackT>() == 24);
 const _: () = assert!(core::mem::size_of::<SigSet>() == 8);
-const _: () = assert!(core::mem::size_of::<SigInfo>() == 128);
 const _: () = assert!(core::mem::offset_of!(UContext, uc_stack) == 16);
 const _: () = assert!(core::mem::offset_of!(UContext, uc_sigmask) == 40);
 const _: () = assert!(core::mem::offset_of!(UContext, _pad) == 48);
@@ -255,6 +228,13 @@ pub const fn signal_frame_size() -> usize {
 // Signal Frame Setup
 // =============================================================================
 
+/// The code of the page every process gets at exec with the signal
+/// return trampoline (Linux: the vDSO's __kernel_rt_sigreturn,
+/// `sigtramp`), where a handler without SA_RESTORER returns: `mov x8,
+/// #__NR_rt_sigreturn; svc #0`. Its address is the mm's
+/// (`Mm::sigpage`), placed in free space at exec.
+pub const SIGPAGE: Option<[u32; 2]> = Some([0xd280_1168, 0xd400_0001]);
+
 /// SS_DISABLE flag for stack_t
 const SS_DISABLE: i32 = 2;
 
@@ -291,7 +271,8 @@ pub fn setup_rt_frame(
     sig: u32,
     action: &SigAction,
     blocked: SigSet,
-    info: &KSigInfo,
+    info: &SigInfo,
+    trap: &Trap,
     uframe: &crate::arch::UserFrame,
 ) -> Result<(), i32> {
     // A copy, written back once the handler frame is in place
@@ -309,12 +290,17 @@ pub fn setup_rt_frame(
         _ => return Err(-22), // EINVAL - not a handler
     };
 
-    // Get restorer (trampoline that calls rt_sigreturn)
+    // The trampoline that calls rt_sigreturn: the handler's own, else
+    // the exec-time signal page's (Linux setup_return: the vDSO sigtramp)
     let restorer = if action.flags & sa_flags::SA_RESTORER != 0 {
         action.restorer
     } else {
-        // No restorer provided - signal delivery will fail
-        return Err(-22); // EINVAL
+        let page =
+            crate::mm::get_task_mm(crate::task::percpu::current_tid()).map_or(0, |mm| mm.sigpage());
+        if page == 0 {
+            return Err(-22);
+        }
+        page
     };
 
     // Frame record, then the frame below it, both 16-byte aligned.
@@ -355,13 +341,13 @@ pub fn setup_rt_frame(
     if copy_to_user::<Uaccess>(reserved_addr, fpsimd.as_bytes()).is_err() {
         return Err(-14);
     }
-    if info.error != 0 {
+    if trap.error != 0 {
         let esr = EsrContext {
             head: CtxHead {
                 magic: ESR_MAGIC,
                 size: core::mem::size_of::<EsrContext>() as u32,
             },
-            esr: info.error,
+            esr: trap.error,
         };
         if copy_to_user::<Uaccess>(end, esr.as_bytes()).is_err() {
             return Err(-14);
@@ -378,18 +364,10 @@ pub fn setup_rt_frame(
         return Err(-14);
     }
 
-    // Build the frame header (siginfo + ucontext up to __reserved);
-    // si_addr is the first union field
-    let mut fields = [0u64; 14];
-    fields[0] = info.addr;
+    // Build the frame header (siginfo + ucontext up to __reserved)
+    let fault_address = trap.addr;
     let frame = RtSigFrame {
-        info: SigInfo {
-            si_signo: sig as i32,
-            si_errno: 0,
-            si_code: info.code,
-            _pad: 0,
-            _fields: fields,
-        },
+        info: info.to_user(),
         uc: UContext {
             uc_flags: 0,
             uc_link: 0,
@@ -402,8 +380,8 @@ pub fn setup_rt_frame(
             uc_sigmask: blocked,
             _pad: [0; 128],
             uc_mcontext: SigContext {
-                // FAR of a data/instruction abort
-                fault_address: if info.error != 0 { info.addr } else { 0 },
+                // The last fault's FAR (Linux thread.fault_address)
+                fault_address,
                 regs: user_regs,
                 sp: user_sp,
                 pc: user_elr,

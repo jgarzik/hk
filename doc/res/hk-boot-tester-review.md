@@ -10,32 +10,36 @@ The suite works (about 1420 checks on x86, 1402 on arm64, 1384 on Linux, 0
 FAIL), but it is 156 flat files and 66k lines of copies of one print-and-grep
 pattern.
 
-1. **No assertion API.** `tests/helpers.rs` has `print`, `skip`, `fail_count` and a
-   few parsers. 46 files define their own `fn report(`, 15 `fn verdict(`, 11
-   `fn check(`, 15 a sleep helper, 9 a wait/reap helper, 22 a thread-stack struct.
-   1373 hand-written `:FAIL` literals against 656 `:OK`. Near-identical tests
+1. **No assertion API.** `harness.rs` has the shared verdict printers
+   (`verdict`, `verdict_detail`, `report_r`/`check`, `report_step`,
+   `report_code`, `pass`, `fail_why`, `T`), but no assertions, no per-check
+   numbering, no plan. 15 files still define their own `fn report(`, 6
+   `fn verdict(`, 6 `fn check(` (bodies that differ), 5 a sleep helper, 6 a
+   reap helper, 22 a thread-stack struct; helpers.rs's `msleep(u64)` and
+   `sleep_ms(i64)` and net/nl.rs's `msleep(i64)` are one sleep under three
+   names (their callers pass different integer types).
+   1399 `:FAIL` literals, 480 of them through `fail_num`, the rest hand-printed;
+   564 verdicts pass through `pass()`, 113 `:OK` literals remain. Near-identical tests
    (`process.rs` `test_getuid`/`geteuid`/`getgid`/`getegid`).
 2. **Pass/fail by substring.** `helpers.rs` counts a failure when printed bytes
    contain "FAIL"; the Makefile greps `FAIL|KERNEL PANIC`. No structured result, no
    per-test duration, no "never ran" versus "passed"; no test name may contain
    "FAIL".
-3. **Headers drift.** `process.rs` says "Tests 4-21" over 59 tests; `file_io.rs`
-   lists "Test 22..25"; 201 stale "Test N" comments.
-4. **Grown by bug and date, not subsystem.** TCP/socket tests in 10 files
+3. **Grown by bug and date, not subsystem.** TCP/socket tests in 10 files
    (`tcp`, `tcp_conn`, `tcp_xfer`, `tcp_close`, `tcp_opt`, `tcp_mem`, `sk`,
    `sockets`, `sockcore`, `sockopts`); mm in 11; `*_race` files beside their
    parents; one-check files (`errno_pass.rs`, 49 lines) next to 2500-line files
-   (`mmap.rs`). 156 files in one directory (the tree's rule is about 40).
-5. **Growth.** 48 files / 20k LOC (2025-12-29) to 156 / 66k (2026-11-05); 416 of
+   (`mmap.rs`).
+4. **Growth.** 48 files / 20k LOC (2025-12-29) to 156 / 66k (2026-11-05); 416 of
    466 commits and 108 new files since 2026-10-01; `mod.rs` touched in 108 commits.
-6. **Isolation is the exception.** 32 of 152 suites run under `isolated()`; 120 run
+5. **Isolation is the exception.** 32 of 152 suites run under `isolated()`; 120 run
    in pid 1, whose panic handler exits init, so one fault loses every later result.
    Tests assume pid 1 (`test_getpid`). No per-test timeout: a hang burns the 600 s
    boot timeout without naming the test.
-7. **Hygiene.** 91 `static mut` in 41 files; 427 `unsafe` blocks, 100 `SAFETY:`
+6. **Hygiene.** 91 `static mut` in 41 files; 427 `unsafe` blocks, 100 `SAFETY:`
    comments; 336 hard-coded `/tmp` paths and no per-test scratch directory; an
    implicit, load-bearing order in `mod.rs`.
-8. **Weak or timing-based checks.** About 118 verdicts only test "returned >= 0";
+7. **Weak or timing-based checks.** About 118 verdicts only test "returned >= 0";
    216 sleep call sites (about 72 s of literal sleeps) and 49 `sched_yield` spins.
    The known flakes (BUSYBOX_NC_LO, NICE_ADJACENT, SWAPOUT_PAGEOUT) are all timing or
    ratio tests.
@@ -73,7 +77,7 @@ Not for long; diagnosis and iteration cost more than wall time.
 4. **Shards:** the full tier split across 2 to 4 parallel QEMU boots per arch,
    merged from KTAP (`tools/gate.sh` already runs boots in parallel).
 5. **Table-driven errno tests** (gVisor `test/syscalls`, LTP `*_errnos`): rows of
-   `(name, call, expected errno)` in place of most of the 1373 FAIL literals.
+   `(name, call, expected errno)` in place of most of the FAIL literals.
 6. **Keep the dual run**; with KTAP, `check-linux` can diff per-test results.
 7. **Complements, not more hand tests:** coverage (QEMU or kcov) to find dead and
    duplicate tests; later a syzkaller target for hk.
@@ -91,7 +95,7 @@ Not for long; diagnosis and iteration cost more than wall time.
 5. Shard the full tier in `gate.sh`.
 6. Then file by file, as code is touched: table and macros, merge fragment files
    (`tcp*` into `net/tcp.rs`, `*_race` into their parents, `prctl_extra` into
-   `prctl`), subdirectories `tests/{fs,mm,net,proc,ipc,time}/`, drop `static mut`.
+   `prctl`), drop `static mut`.
 7. A coverage run to delete duplicate tests.
 
 ## Not to do

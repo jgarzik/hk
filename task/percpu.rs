@@ -730,11 +730,22 @@ impl GlobalTaskTable {
     /// Task `tid`, found through the pid hash (root namespace)
     fn lookup(&self, tid: Tid) -> Option<&Task> {
         let pid = crate::task::pid::find_pid(&crate::ns::INIT_PID_NS, u32::try_from(tid).ok()?)?;
+        self.pid_task(&pid)
+    }
+
+    /// The task `pid` names (Linux pid_task)
+    fn pid_task(&self, pid: &crate::task::pid::Pid) -> Option<&Task> {
         let t = pid.task().cast::<Task>();
         // SAFETY: a nonzero `task` is in this list (set by `insert`,
         // cleared by `remove` under the write lock), which holds a
         // reference; the caller borrows the locked list
         unsafe { t.as_ref() }
+    }
+
+    /// The tid of the task `pid` names: that struct pid's, not its
+    /// number's, which a reaped process frees for reuse
+    pub fn pid_tid(&self, pid: &crate::task::pid::Pid) -> Option<Tid> {
+        self.pid_task(pid).map(Task::tid)
     }
 
     /// Task `tid`
@@ -752,6 +763,78 @@ impl GlobalTaskTable {
     /// A reference to task `tid`
     pub fn task(&self, tid: Tid) -> Option<TaskRef> {
         self.lookup(tid).map(task_ref)
+    }
+
+    /// What `f` picks of each thread of process `pid`, gathered with no
+    /// allocation under TASKLIST: the vector is sized under one read
+    /// hold and filled under another, again if the group grew between
+    pub fn collect_threads<T>(
+        pid: Pid,
+        f: impl Fn(&GlobalTaskTable, &TaskView<'_>) -> Option<T>,
+    ) -> Vec<T> {
+        Self::collect(
+            |table, visit| {
+                for t in table.threads(pid) {
+                    if !visit(&t) {
+                        break;
+                    }
+                }
+            },
+            f,
+        )
+    }
+
+    /// What `f` picks of each process of group `pg` (its leaders on the
+    /// group's list), gathered as `collect_threads` does
+    pub fn collect_pgrp<T>(
+        pg: &crate::task::pid::Pid,
+        f: impl Fn(&GlobalTaskTable, &TaskView<'_>) -> Option<T>,
+    ) -> Vec<T> {
+        Self::collect(
+            |table, visit| {
+                for t in table.pgrp(pg) {
+                    if !visit(&t) {
+                        break;
+                    }
+                }
+            },
+            f,
+        )
+    }
+
+    /// What `f` picks of the tasks `walk` visits (until a visit returns
+    /// false), with no allocation under TASKLIST: sized under one read
+    /// hold, filled under another, again if the set grew between
+    fn collect<T>(
+        walk: impl Fn(&GlobalTaskTable, &mut dyn FnMut(&TaskView<'_>) -> bool),
+        f: impl Fn(&GlobalTaskTable, &TaskView<'_>) -> Option<T>,
+    ) -> Vec<T> {
+        let mut cap = 1;
+        walk(&TASKLIST.read(), &mut |_| {
+            cap += 1;
+            true
+        });
+        loop {
+            let mut v = Vec::with_capacity(cap);
+            let mut full = false;
+            {
+                let table = TASKLIST.read();
+                walk(&table, &mut |t| {
+                    if v.len() == v.capacity() {
+                        full = true;
+                        return false;
+                    }
+                    if let Some(x) = f(&table, t) {
+                        v.push(x);
+                    }
+                    true
+                });
+            }
+            if !full {
+                return v;
+            }
+            cap *= 2;
+        }
     }
 
     /// Every task
@@ -813,22 +896,31 @@ impl GlobalTaskTable {
         drop(unsafe { pi.children.remove(child) });
     }
 
-    /// Move every child of `task` to `reaper` (Linux forget_original_parent
-    /// + reparent_leader); true if one was a zombie
-    pub fn reparent(&mut self, task: &Task, reaper: &TaskRef) -> bool {
-        let mut zombie = false;
+    /// Move the children of `task` to `reaper` (Linux
+    /// forget_original_parent, reparent_leader), each pushed to `moved`
+    /// while it has room (no allocation here, under TASKLIST): false if
+    /// some are left
+    pub fn reparent(&mut self, task: &Task, reaper: &TaskRef, moved: &mut Vec<TaskRef>) -> bool {
+        let other_group = reaper.pid != task.pid;
         loop {
+            if moved.len() == moved.capacity() {
+                return self.inner_mut_of(task).children.is_empty();
+            }
             let Some(child) = self.inner_mut_of(task).children.pop_front() else {
-                break;
+                return true;
             };
             let ci = self.inner_mut_of(&child);
             ci.in_children = false;
             ci.real_parent = Some(Arc::downgrade(reaper));
-            zombie |= matches!(ci.state, TaskState::Zombie(_));
+            // Linux reparent_leader: no custom exit signal to a new
+            // parent process ("we don't want people slaying init")
+            if other_group {
+                ci.exit_signal = crate::signal::SIGCHLD as i32;
+            }
             child.ppid.store(reaper.pid, Ordering::Relaxed);
             self.link_child(&child);
+            moved.push(child);
         }
-        zombie
     }
 
     /// Add a task (fork, kernel thread creation); it has a pid. It joins
@@ -871,6 +963,12 @@ impl GlobalTaskTable {
     /// Remove task `tid`; the caller drops it after unlocking (nothing
     /// is released under TASKLIST)
     pub fn remove(&mut self, tid: Tid) -> Option<TaskRef> {
+        self.remove_task(tid, true)
+    }
+
+    /// [`remove`](Self::remove); `release`: its numbers no task uses go
+    /// back (not for an old leader whose pid an exec takes over)
+    fn remove_task(&mut self, tid: Tid, release: bool) -> Option<TaskRef> {
         let t = task_ref(self.lookup(tid)?);
         self.unlink_child(&t);
         self.unlink_thread(&t);
@@ -880,9 +978,25 @@ impl GlobalTaskTable {
         {
             p.set_task(core::ptr::null());
         }
+        if release {
+            self.release_pids(&t);
+        }
         // SAFETY: found through the hash, so on this list
         drop(unsafe { self.tasks.remove(&t) });
         Some(t)
+    }
+
+    /// The numbers of removed task `t` that no task uses any more go
+    /// back (Linux free_pid)
+    fn release_pids(&self, t: &Task) {
+        if let Some(ti) = t.inner().access(self) {
+            for p in [&ti.thread_pid, &ti.pgrp, &ti.session]
+                .into_iter()
+                .flatten()
+            {
+                self.release_unused(p);
+            }
+        }
     }
 
     /// The group leaders in process group `pg` (Linux
@@ -955,6 +1069,16 @@ impl GlobalTaskTable {
         }
     }
 
+    /// `p`'s numbers go back once no task uses it: none has it as its
+    /// pid, none heads or belongs to the group or session it names
+    /// (Linux detach_pid -> free_pid when every pid type's list is empty)
+    fn release_unused(&self, p: &crate::task::pid::Pid) {
+        if p.task().is_null() && p.pgrp.access(self).is_empty() && p.session.access(self).is_empty()
+        {
+            p.release_numbers();
+        }
+    }
+
     /// Move process `pid` (every thread; its leader on the lists) to
     /// group `pg` and, if given, session `s` (Linux change_pid); the
     /// references it held go to `old`, dropped after TASKLIST
@@ -966,6 +1090,8 @@ impl GlobalTaskTable {
         old: &mut Vec<Arc<crate::task::pid::Pid>>,
     ) {
         let Some(l) = self.task(pid) else { return };
+        let before = self.inner_mut_of(&l).pgrp.clone();
+        let before_s = self.inner_mut_of(&l).session.clone();
         self.detach_pids(&l);
         let threads: Vec<TaskRef> = self.threads(pid).map(|t| task_ref(t.task)).collect();
         for t in &threads {
@@ -978,6 +1104,10 @@ impl GlobalTaskTable {
             }
         }
         self.attach_pids(&l);
+        // The group or session it left may be gone (setpgid, setsid)
+        for p in [before, before_s].iter().flatten() {
+            self.release_unused(p);
+        }
     }
 
     /// Number of tasks, zombies included
@@ -1211,7 +1341,7 @@ fn create_kernel_task(
 
     const NOMEM: &str = "Out of memory for kernel thread";
     let cred = try_arc(Cred::ROOT).map_err(|_| NOMEM)?;
-    let sig = crate::signal::TaskSignalState::try_new().map_err(|_| NOMEM)?;
+    let sig = crate::signal::TaskSignalState::new();
     let stack_base = crate::mm::vmstack::alloc().ok_or("Out of memory for kernel thread stack")?;
     let stack_top = stack_base + KERNEL_STACK_SIZE as u64;
 
@@ -1223,6 +1353,7 @@ fn create_kernel_task(
         pids_linked: false,
         exit_code: 0,
         exit_signal: 0, // Kernel threads don't send exit signals
+        parent_exec_id: 0,
         pdeath_signal: 0,
         state: TaskState::Ready,
         page_table: ArchPageTable::kernel_identity(),
@@ -1255,6 +1386,7 @@ fn create_kernel_task(
         ptrace_message: 0,
         ptrace_options: 0,
         ptrace_code: 0,
+        last_siginfo: None,
     };
     let task = Task::new(
         tid,
@@ -1434,6 +1566,7 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<Tid, &'static str> {
         pids_linked: false,
         exit_code: 0,
         exit_signal: crate::signal::SIGCHLD as i32, // Default: notify parent with SIGCHLD
+        parent_exec_id: 0,
         pdeath_signal: 0,
         state: TaskState::Running, // Will be running immediately
         page_table: config.page_table,
@@ -1465,6 +1598,7 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<Tid, &'static str> {
         ptrace_message: 0,
         ptrace_options: 0,
         ptrace_code: 0,
+        last_siginfo: None,
     };
     // The boot-time init task: failure cannot be reported
     let task = arc_nofail(Task::new(
@@ -1533,31 +1667,38 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<Tid, &'static str> {
     Ok(tid)
 }
 
-/// Mark a task as zombie with exit status
-pub fn mark_zombie(tid: Tid, status: i32, group_dead: bool) {
-    let pid: Option<Pid>;
-    {
+/// Mark a task as zombie with exit status; true if it is a group
+/// leader with no other thread left to report it, decided in the same
+/// TASKLIST write section (Linux exit_notify: thread_group_empty under
+/// tasklist_lock), so it and its last thread's release never both
+/// report it
+fn mark_zombie(tid: Tid, status: i32, group_dead: bool) -> bool {
+    let (pid, last) = {
         let mut table = TASKLIST.write();
-        if let Some(mut task) = table.get_mut(tid) {
+        let Some((pid, leader)) = table.get_mut(tid).map(|mut task| {
             task.exit_code = status;
             task.state = TaskState::Zombie(status);
-            pid = Some(task.task.pid);
-        } else {
-            pid = None;
-        }
-    }
-
-    // Detach from cgroup and decrement task counters
-    // This must be done after releasing TASKLIST lock to avoid lock ordering issues
-    crate::cgroup::detach_task(tid);
-
+            (task.task.pid, task.leader)
+        }) else {
+            return false;
+        };
+        (pid, leader && !group_pending(&table, pid, tid))
+    };
     // The process's pidfds once its last thread is gone (Linux
     // do_notify_pidfd; after TASKLIST)
-    if let Some(p) = pid
-        && group_dead
-    {
-        crate::task::pidfd::notify_process_exit(p, status);
+    if group_dead {
+        crate::task::pidfd::notify_process_exit(pid, status);
     }
+    last
+}
+
+/// A thread of group `tgid` other than `tid` will still report its
+/// leader when it leaves (Linux thread_group_empty is false): any
+/// listed thread but a traced zombie, whose tracer releases it
+fn group_pending(table: &GlobalTaskTable, tgid: Pid, tid: Tid) -> bool {
+    table
+        .threads(tgid)
+        .any(|u| u.task.tid() != tid && !(matches!(u.state, TaskState::Zombie(_)) && u.ptrace != 0))
 }
 
 /// Reap a zombie child of the given parent
@@ -1676,12 +1817,7 @@ pub fn take_leadership(tgid: Pid, tid: Tid) -> Vec<TaskRef> {
     if ltid == tid {
         return Vec::new();
     }
-    let (ppid, exit_signal, start, uid) = (
-        l.task.ppid(),
-        l.exit_signal,
-        l.task.start_time(),
-        l.cred().uid,
-    );
+    let (ppid, start, uid) = (l.task.ppid(), l.task.start_time(), l.cred().uid);
     let gone: Vec<Tid> = table
         .threads(tgid)
         .filter(|t| t.task.tid() != tid && matches!(t.state, TaskState::Zombie(_)))
@@ -1699,14 +1835,26 @@ pub fn take_leadership(tgid: Pid, tid: Tid) -> Vec<TaskRef> {
     while let Some(t) = old_threads.pop_front() {
         dead.push(t);
     }
-    let mut gone: Vec<TaskRef> = gone.into_iter().filter_map(|t| table.remove(t)).collect();
+    // Their numbers go back only once the caller holds the leader's
+    // pid and heads its group and session (Linux de_thread:
+    // exchange_tids and transfer_pid first, free_pid when no task uses
+    // a pid in any role): the leader's pid may be the group's or the
+    // session's, which a removed thread still names
+    let mut gone: Vec<TaskRef> = gone
+        .into_iter()
+        .filter_map(|t| table.remove_task(t, false))
+        .collect();
+    let removed = gone.len();
     gone.extend(dead);
     let Some(me) = table.task(tid) else {
+        for t in &gone[..removed] {
+            table.release_pids(t);
+        }
         return gone;
     };
     // exchange_tids: the caller takes the leader's tid and pid (Linux
     // de_thread), the old leader (released here) its own
-    if let Some(l) = gone.iter().find(|t| t.tid() == ltid) {
+    if let Some(l) = gone[..removed].iter().find(|t| t.tid() == ltid) {
         let (mi, li) = me.inner().access_pair_mut(l.inner(), &mut *table);
         if let (Some(mi), Some(li)) = (mi.as_mut(), li.as_mut()) {
             // The old leader's CPU time stays the group's (Linux
@@ -1736,24 +1884,24 @@ pub fn take_leadership(tgid: Pid, tid: Tid) -> Vec<TaskRef> {
     // else names the old tid) and leads the group
     table.link_child(&me);
     table.inner_mut_of(&me).threads.push_back(me.clone());
-    let sig = table.get(ltid).and_then(|t| t.signal.clone());
     if let Some(mut m) = table.get_mut(ltid) {
         m.leader = true;
         m.task
             .ppid
             .store(ppid, core::sync::atomic::Ordering::Relaxed);
-        m.exit_signal = exit_signal;
+        // Linux de_thread: the new leader's exit signal is SIGCHLD
+        m.exit_signal = crate::signal::SIGCHLD as i32;
         m.task.start_time.store(start, Ordering::Relaxed);
     }
     // ... and its place on the group's and session's lists (Linux
     // de_thread: transfer_pid PIDTYPE_PGID, PIDTYPE_SID)
     table.attach_pids(&me);
-    drop(table);
-    // The group's timers owned by the caller follow (after TASKLIST:
-    // their locks are leaves taken under nothing)
-    if let Some(sig) = sig {
-        crate::time::posix_timer::retarget(&sig, tid, ltid);
+    // Then the removed threads' numbers no task uses go back: the
+    // caller's old one, now the old leader's, and exited threads' own
+    for t in &gone[..removed] {
+        table.release_pids(t);
     }
+    drop(table);
     gone
 }
 
@@ -1946,9 +2094,12 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         parent_ptrace,
         parent_ptracer,
         parent_real_parent,
+        parent_parent_exec_id,
+        parent_leader_exit_signal,
     ) = {
         let table = TASKLIST.read();
         let parent = table.get(current_tid).ok_or(3)?; // ESRCH - no such process
+        let leader_exit = table.get(parent.task.pid).map_or(0, |l| l.exit_signal);
         (
             parent.task.pid,
             parent.task.ppid(),
@@ -1970,6 +2121,8 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
             parent.ptrace,
             parent.ptracer.clone(),
             parent.real_parent.clone(),
+            parent.parent_exec_id,
+            leader_exit,
         )
     };
     // Its own alloc_lock fields (lock-free but the memory policy)
@@ -2119,8 +2272,22 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         session: None,
         pids_linked: false,
         exit_code: 0,
-        exit_signal: config.exit_signal, // From clone3 args (SIGCHLD for fork, 0 for threads)
-        pdeath_signal: 0,                // Never inherited, must be set explicitly via prctl
+        // Linux copy_process: a thread -1, a CLONE_PARENT child the
+        // group leader's; their parent_exec_id the caller's, else the
+        // caller's exec count
+        exit_signal: if config.flags & CLONE_THREAD != 0 {
+            -1
+        } else if config.flags & CLONE_PARENT != 0 {
+            parent_leader_exit_signal
+        } else {
+            config.exit_signal
+        },
+        parent_exec_id: if config.flags & (CLONE_PARENT | CLONE_THREAD) != 0 {
+            parent_parent_exec_id
+        } else {
+            crate::task::self_exec_id(parent_pid)
+        },
+        pdeath_signal: 0, // Never inherited, must be set explicitly via prctl
         state: TaskState::Ready,
         page_table: child_pt,
         // TLS fields - will be set based on clone flags below
@@ -2186,6 +2353,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         ptrace_message: 0,
         ptrace_options: 0,
         ptrace_code: 0,
+        last_siginfo: None,
     };
     let child_task = try_arc(Task::new(
         child_tid,
@@ -2443,16 +2611,51 @@ pub fn current_exiting() -> bool {
 /// Hand the current task's children to a new parent before it dies
 /// (Linux forget_original_parent): another live thread of its group,
 /// else the nearest PR_SET_CHILD_SUBREAPER ancestor, else init
+#[inline(never)]
 fn forget_original_parent() {
     let me = task_ref(&current());
+    // Room for every child first: nothing allocates under TASKLIST
+    let mut moved = Vec::new();
+    loop {
+        let n = TASKLIST
+            .read()
+            .get(me.tid())
+            .map_or(0, |t| t.children.len());
+        moved.reserve(n + 1);
+        if reparent_children(&me, &mut moved) {
+            break;
+        }
+    }
+    // Then, with TASKLIST dropped (Linux forget_original_parent,
+    // reparent_leader): each moved child's threads get their
+    // pdeath_signal, from this task; a zombie whose group is gone tells
+    // its new parent, which may release it at once
+    for c in &moved {
+        let deaths = GlobalTaskTable::collect_threads(c.pid, |table, t| {
+            (t.pdeath_signal > 0).then_some(())?;
+            Some((table.task(t.task.tid())?, t.pdeath_signal as u32))
+        });
+        for (t, sig) in deaths {
+            crate::signal::send_group_signal(&t, sig, crate::signal::SendInfo::User);
+        }
+        let to_other = c.ppid() != me.pid;
+        if to_other && leader_waits(c.pid) && crate::signal::notify::do_notify_parent(c.pid) {
+            release_zombie(c.pid);
+        }
+    }
+}
+
+/// Hand `me`'s children to their new parent: another live thread of
+/// its group, else the nearest live subreaper ancestor, else init
+fn reparent_children(me: &TaskRef, moved: &mut Vec<TaskRef>) -> bool {
     let mut table = TASKLIST.write();
     if table.get(me.tid()).is_none_or(|t| t.children.is_empty()) {
-        return;
+        return true;
     }
     let live = crate::signal::task_live;
     let mut reaper = table
         .threads(me.pid)
-        .find(|t| !core::ptr::eq(t.task, &raw const *me) && live(t))
+        .find(|t| !core::ptr::eq(t.task, Arc::as_ptr(me)) && live(t))
         .map(|t| task_ref(t.task));
     if reaper.is_none() {
         let mut p = table.get(me.tid()).and_then(|t| t.real_parent.clone());
@@ -2466,29 +2669,104 @@ fn forget_original_parent() {
         }
     }
     let Some(reaper) = reaper.or_else(|| table.task(1)) else {
-        return;
+        return true;
     };
-    if !Arc::ptr_eq(&reaper, &me) {
-        table.reparent(&me, &reaper);
+    Arc::ptr_eq(&reaper, me) || table.reparent(me, &reaper, moved)
+}
+
+/// The exiting task, now a zombie, tells its parent or tracer (Linux
+/// exit_notify, and release_task for a group's last thread): a traced
+/// task its tracer; a leader whose group is gone its parent; a
+/// non-leader thread is released, and if it was the last of a group
+/// whose leader is a zombie, the leader tells. A child the parent does
+/// not wait for is released at once (autoreap).
+// Not inlined: its send path's stack is used only for the call, not
+// added to exit_current's frame for the rest of the exit
+#[inline(never)]
+fn exit_notify(tid: Tid, last: bool) {
+    let (pid, traced) = {
+        let table = TASKLIST.read();
+        let Some(t) = table.get(tid) else {
+            return;
+        };
+        (t.task.pid, t.ptrace != 0)
+    };
+    if traced {
+        crate::signal::notify::do_notify_parent(tid);
+    } else if last && crate::signal::notify::do_notify_parent(tid) {
+        release_zombie(tid);
     }
+    if release_thread(tid) && crate::signal::notify::do_notify_parent(pid) {
+        release_zombie(pid);
+    }
+}
+
+/// Process `pid`'s leader is an untraced zombie with no other thread
+/// left: a new parent is told of it (Linux reparent_leader: !ptrace,
+/// EXIT_ZOMBIE, thread_group_empty); a traced one is its tracer's
+fn leader_waits(pid: Pid) -> bool {
+    let table = TASKLIST.read();
+    table.get(pid).is_some_and(|l| {
+        l.leader
+            && l.ptrace == 0
+            && matches!(l.state, TaskState::Zombie(_))
+            && !group_alive(&table, pid, pid)
+    })
+}
+
+/// Release zombie leader `tid` no one will wait for (Linux release_task
+/// of an autoreaped child): out of the task list, its RLIMIT_NPROC
+/// charge dropped; its run queue keeps it if it still runs
+fn release_zombie(tid: Tid) {
+    let gone = {
+        let mut table = TASKLIST.write();
+        match table.get(tid) {
+            Some(t) if matches!(t.state, TaskState::Zombie(_)) => {
+                let (uid, pid) = (t.cred().uid, t.task.pid);
+                table.remove(tid).map(|t| (t, uid, pid))
+            }
+            _ => None,
+        }
+    };
+    if let Some((t, uid, pid)) = gone {
+        crate::fs::proc::proc_flush_pid(pid, tid);
+        crate::task::nproc_uncharge(uid);
+        drop(t);
+    }
+    crate::task::proc::CHILD_EXIT_WQ.wake_all();
 }
 
 /// An exited non-leader thread leaves the task list at once (Linux
 /// release_task for an autoreaped thread); its run queue keeps it
 /// until it has switched away for good
-fn release_thread(tid: Tid) {
-    let gone = {
+///
+/// True if that left its group's zombie leader with no thread to wait
+/// for: this release reports it, decided under the same TASKLIST write
+/// section as the removal (Linux release_task: thread_group_empty and
+/// the leader's EXIT_ZOMBIE under tasklist_lock), so the leader's own
+/// exit and its threads' releases report it once
+fn release_thread(tid: Tid) -> bool {
+    let (gone, last) = {
         let mut table = TASKLIST.write();
-        match table.get(tid) {
+        let gone = match table.get(tid) {
             // A traced thread stays for its tracer's wait
             Some(t) if !t.leader && t.ptrace == 0 => table.remove(tid),
             _ => None,
-        }
+        };
+        let last = gone.as_ref().is_some_and(|t| {
+            table.get(t.pid).is_some_and(|l| {
+                l.leader
+                    && matches!(l.state, TaskState::Zombie(_))
+                    && !group_pending(&table, t.pid, t.pid)
+            })
+        });
+        (gone, last)
     };
     if let Some(t) = &gone {
         crate::fs::proc::proc_flush_pid(t.pid, tid);
     }
     drop(gone);
+    last
 }
 
 /// Exit the current task and switch to another
@@ -2509,8 +2787,10 @@ pub fn exit_current(status: Option<i32>) -> ! {
     // take sleeping-context locks and may wake other tasks (futex CLEARTID,
     // robust futexes), which needs this CPU's rq lock.
     if tid != 0 {
-        // Linux exit_signals sets PF_EXITING first
+        // Linux exit_signals sets PF_EXITING first, then hands the
+        // group signals this thread would have taken to another
         set_exiting();
+        crate::signal::exit_signals();
 
         // Exactly one thread, the one taking the group's live count to
         // zero, does the group-level exit work (Linux do_exit:
@@ -2609,10 +2889,14 @@ pub fn exit_current(status: Option<i32>) -> ! {
     if tid != 0 {
         forget_original_parent();
         crate::task::ptrace::exit_ptrace();
+        // Out of its cgroup while still running, before it is a zombie
+        // a waiting parent may reap at once (Linux do_exit: cgroup_exit
+        // before exit_notify); TASKLIST is not held
+        crate::cgroup::detach_task(tid);
     }
     if let Some(st) = status {
-        mark_zombie(tid, st, group_dead);
-        release_thread(tid);
+        let last = mark_zombie(tid, st, group_dead);
+        exit_notify(tid, last);
     }
 
     // Let a parent sleeping in wait4/waitid re-check for zombies
@@ -3783,8 +4067,7 @@ pub fn pgrp_orphaned(pg: &crate::task::pid::Pid) -> bool {
 
 /// The processes of group `pg`, by pid
 pub fn pgrp_members(pg: &crate::task::pid::Pid) -> alloc::vec::Vec<Pid> {
-    let table = TASKLIST.read();
-    table.pgrp(pg).map(|t| t.task.pid).collect()
+    GlobalTaskTable::collect_pgrp(pg, |_, t| Some(t.task.pid))
 }
 
 /// Get all unique PIDs in the system
@@ -4248,10 +4531,12 @@ pub fn commit_creds_impl(new: alloc::sync::Arc<Cred>) {
     // (suid_dumpable, default 0), so a less-privileged identity can't ptrace
     // or core-dump state obtained under the old one (Linux kernel/cred.c
     // commit_creds)
+    let gains_caps = new.cap_permitted.0 & !old.cap_permitted.0 != 0;
     let ids_changed = old.euid != new.euid
         || old.egid != new.egid
         || old.fsuid != new.fsuid
-        || old.fsgid != new.fsgid;
+        || old.fsgid != new.fsgid
+        || gains_caps;
 
     // Under TASKLIST: other tasks read our credentials under it; the
     // old ones are freed after it (only memory)
@@ -4263,6 +4548,11 @@ pub fn commit_creds_impl(new: alloc::sync::Arc<Cred>) {
                 // On the mm: every thread sharing it (Linux set_dumpable(
                 // task->mm))
                 mm.set_dumpable(crate::task::dumpable::SUID_DUMP_DISABLE);
+            }
+            // Its parent no longer signals it at death (Linux
+            // commit_creds)
+            if ids_changed {
+                t.pdeath_signal = 0;
             }
             t.set_cred(new)
         })
@@ -4535,6 +4825,12 @@ pub fn exec_replace_image(
         let mut task = task.expect("exec: current task not in the task table");
         task.page_table = ArchPageTable::new(new.pgd());
         new.set_dumpable(ident.dumpable);
+        // A new execution domain (Linux de_thread): SIGCHLD; a secure
+        // exec is not signalled at its parent's death (begin_new_exec)
+        task.exit_signal = crate::signal::SIGCHLD as i32;
+        if ident.secure {
+            task.pdeath_signal = 0;
+        }
         // The mm and name change as one under task_lock (Linux
         // exec_mmap, __set_task_comm): a reader sees both or neither
         let mut a = task.task.task_lock();

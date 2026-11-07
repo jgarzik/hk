@@ -250,6 +250,10 @@ pub trait UserRegs {
     /// syscall instruction, its number or first argument back in the
     /// return register)
     fn restart_syscall(&mut self);
+    /// Give the syscall's registers back as they were at entry, its
+    /// return register included (Linux syscall_rollback: x86 RAX =
+    /// orig_ax, arm64 x0 = orig_x0), for a skipped syscall's SIGSYS
+    fn syscall_rollback(&mut self);
     /// After the PTRACE_SYSCALL entry stop, before seccomp: make the
     /// recorded arguments the live ones, so seccomp filters exactly
     /// what the syscall receives (arm64: orig_x0 = x0; x86 reads rdi

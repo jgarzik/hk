@@ -297,10 +297,12 @@ impl Softnet {
 
     /// Separate statements: the poll_list IrqSpinlock guard of a
     /// `a.lock().x() || b.lock().y()` chain would live across the
-    /// backlog lock
+    /// backlog lock. A backlog held `busy` by an inline flush is not
+    /// this thread's work (it would only spin): the flusher wakes it
+    /// when it leaves packets behind.
     fn has_work(&self) -> bool {
         let napi = !self.poll_list.lock().is_empty();
-        let backlog = !self.backlog.lock().is_empty();
+        let backlog = !self.busy.load(Ordering::Acquire) && !self.backlog.lock().is_empty();
         napi || backlog
             || (core::ptr::eq(self, SOFTNET.get(0)) && TIMER_DUE.load(Ordering::Acquire))
     }

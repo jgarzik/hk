@@ -17,7 +17,7 @@
 
 use super::cb::{
     MemKind, OOO_OVERHEAD, OOW_RATELIMIT, Out, PAWS_WRAP, RCV_SHUTDOWN, Seg, SegIn, TIMEWAIT_LEN,
-    TcpCb, TcpState, Tmr, after, before, between, flags,
+    TcpCb, TcpState, Tmr, after, before, between, flags, wake,
 };
 use crate::util::error::KernelError;
 
@@ -115,7 +115,7 @@ impl TcpCb {
         self.rcv_tstamp = now;
         self.arm_keepalive(now);
         out.established = true;
-        out.wake = true;
+        out.wake |= wake::STATE | wake::EST;
     }
 
     /// Linux tcp_sequence: the segment overlaps [RCV.NXT, RCV.NXT+WND]
@@ -185,14 +185,18 @@ impl TcpCb {
 
     /// Synchronized states and SYN_RECEIVED
     fn rcv_synced(&mut self, s: &SegIn<'_>, now: u64, out: &mut Out) {
-        if self.state == TcpState::SynReceived
+        let req = self.passive && self.state == TcpState::SynReceived;
+        if req
             && s.has(flags::SYN)
             && !s.has(flags::ACK | flags::RST)
             && s.seq == self.irs
+            && !self.paws_reject(s)
         {
-            // Duplicate SYN: the SYN-ACK was lost (Linux tcp_check_req)
-            let syn = self.syn_seg();
-            out.segs.push(syn);
+            // Retransmitted SYN: the SYN-ACK was lost (Linux
+            // tcp_check_req, rate limited)
+            if !self.oow_recent() {
+                self.rtx_synack(now, out);
+            }
             return;
         }
         if self.paws_reject(s) {
@@ -220,7 +224,14 @@ impl TcpCb {
             return;
         }
         if s.has(flags::SYN) {
-            self.challenge_ack(out); // RFC 5961 4.2
+            if req {
+                // A new SYN in window: reset, drop the request (Linux
+                // tcp_check_req embryonic_reset)
+                out.segs.extend(super::output::reset_for(s));
+                self.set_closed(out);
+            } else {
+                self.challenge_ack(out); // RFC 5961 4.2
+            }
             return;
         }
         if !s.has(flags::ACK) {
@@ -300,7 +311,7 @@ impl TcpCb {
                 self.state = TcpState::FinWait2;
                 self.tmr = None;
                 self.arm_fw2(now);
-                out.wake = true;
+                out.wake |= wake::STATE;
                 true
             }
             TcpState::Closing => {
@@ -369,7 +380,7 @@ impl TcpCb {
                 self.tmr = None;
                 self.backoff = 0;
                 self.rtx_stamp = None;
-                out.wake = true;
+                out.wake |= wake::SPACE;
             }
         }
         true
@@ -414,7 +425,7 @@ impl TcpCb {
         } else {
             self.arm_rtx(now);
         }
-        out.wake = true;
+        out.wake |= wake::SPACE;
     }
 
     /// Segment text and FIN (Linux tcp_data_queue / tcp_fin)
@@ -523,7 +534,7 @@ impl TcpCb {
             }
         }
         self.mem_settle();
-        out.wake = true;
+        out.wake |= wake::DATA;
         if !in_order {
             return false;
         }
@@ -549,7 +560,7 @@ impl TcpCb {
             self.ack_nomem = true;
             self.ack_now = true;
             self.mem_settle();
-            out.wake = true;
+            out.wake |= wake::DATA;
             return;
         }
         let had_ooo = !self.ooo.is_empty();
@@ -569,7 +580,7 @@ impl TcpCb {
         if had_ooo {
             self.ack_now = true;
         }
-        out.wake = true;
+        out.wake |= wake::DATA;
         self.mem_settle();
     }
 
@@ -578,7 +589,7 @@ impl TcpCb {
         self.rcv_nxt = self.rcv_nxt.wrapping_add(1);
         self.ack_now = true;
         out.shut |= RCV_SHUTDOWN;
-        out.wake = true;
+        out.wake |= wake::STATE | wake::FIN;
         match self.state {
             TcpState::Established => self.state = TcpState::CloseWait,
             TcpState::FinWait1 if self.fin_acked() => self.time_wait(now, out),

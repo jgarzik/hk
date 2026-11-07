@@ -115,7 +115,9 @@ impl Expire for TimeWait {
         let mut out = Out::default();
         {
             let mut g = self.inner.lock();
-            timer::fired(&mut g.1, id);
+            if !timer::fired(&mut g.1, id) {
+                return;
+            }
             let mut cb = g.0.cb(super::cfg(&self.net));
             cb.on_timer(now, &mut out);
             g.0 = TwCb::from_cb(&cb);

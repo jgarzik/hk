@@ -1574,6 +1574,11 @@ fn move_mapping(
         .clone();
     new_vma.start = new_addr;
     new_vma.end = new_addr + new_len;
+    // The signal return page moved (Linux special_mapping_mremap ->
+    // vdso_mremap)
+    if new_vma.flags & super::VM_SIGPAGE != 0 {
+        owner.set_sigpage(new_addr);
+    }
     // The lock moves with the mapping (Linux: locked_vm charged to the
     // new VMA)
     if new_vma.is_locked() {

@@ -126,6 +126,10 @@ pub const VM_WIPEONFORK: u32 = 0x0800_0000;
 /// becomes)
 pub const VM_NOMAYEXEC: u32 = 0x1000_0000;
 
+/// The signal return trampoline's page (arm64; Linux: the vDSO special
+/// mapping), shown as [sigpage] in /proc/<pid>/maps
+pub const VM_SIGPAGE: u32 = 0x2000_0000;
+
 // ============================================================================
 // msync flags (MS_*)
 // ============================================================================

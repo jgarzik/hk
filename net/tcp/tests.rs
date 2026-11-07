@@ -837,6 +837,34 @@ fn duplicate_syn_resends_synack() {
     assert_eq!(out.segs.len(), 1);
     assert_eq!(again, synack);
     assert_eq!(b.state, TcpState::SynReceived);
+    assert_eq!(b.stats.total_retrans, 1);
+    // Rate limited (Linux tcp_oow_rate_limited), resent after that
+    let mut out = Out::default();
+    b.input(&seg_in(&syn), 100, &mut out);
+    assert!(out.segs.is_empty());
+    let mut out = Out::default();
+    b.input(&seg_in(&syn), 600, &mut out);
+    assert_eq!(out.segs.len(), 1);
+    assert!(out.segs[0].flags & flags::SYN != 0);
+}
+
+#[test]
+fn new_syn_resets_request() {
+    let mut a = TcpCb::new(cfg());
+    let mut out = Out::default();
+    a.connect(open(10, 1460), 0, &mut out);
+    let syn = out.segs[0].clone();
+    let mut out = Out::default();
+    let mut b = passive(&syn, 99, 1460, BUFS.0, 0, &mut out);
+    // A SYN at RCV.NXT (in window, another ISN): Linux tcp_check_req
+    // resets and drops the request
+    let syn2 = Seg { seq: 11, ..syn };
+    let mut out = Out::default();
+    b.input(&seg_in(&syn2), 1, &mut out);
+    assert_eq!(b.state, TcpState::Closed);
+    assert_eq!(out.segs.len(), 1);
+    assert_eq!(out.segs[0].flags, flags::RST | flags::ACK);
+    assert_eq!(out.segs[0].ack, 12);
 }
 
 #[test]

@@ -16,7 +16,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 
 use super::dentry::Dentry;
-use super::mount::{Mount, attach_mnt, clone_mnt};
+use super::mount::{Mount, attach_mnt, clone_mnt, commit_tree};
 use super::path_ref::Path;
 
 /// A peer group: its members, and the mounts it is master of
@@ -196,6 +196,10 @@ fn copy_prop(src: &Arc<Mount>, prop: &dyn Fn(&Mount, &Arc<Mount>)) -> Arc<Mount>
             };
             let n = clone_mnt(&k, k.root.clone());
             prop(&k, &n);
+            // A submount keeps hiding what is under it (Linux copy_tree)
+            if k.flags() & super::mount::MNT_LOCKED != 0 {
+                n.mark(super::mount::MNT_LOCKED, true);
+            }
             attach_mnt(&n, &Path::new(c.clone(), mp));
             todo.push((k, n));
         }
@@ -221,6 +225,7 @@ pub fn propagate_mnt(dest: &Arc<Mount>, d: &Arc<Dentry>, src: &Arc<Mount>) {
         if !Arc::ptr_eq(&p, dest) && visible(&p, d) {
             let c = copy_prop(src, &|o, c| clone_prop(o, c));
             attach_mnt(&c, &Path::new(p, d.clone()));
+            commit_tree(&c);
         }
     }
     let up: BTreeMap<usize, u32> = subtree(src)
@@ -253,6 +258,7 @@ fn to_slaves(g: u32, d: &Arc<Dentry>, src: &Arc<Mount>, up: &BTreeMap<usize, u32
                 }
             });
             attach_mnt(&c, &Path::new(m.clone(), d.clone()));
+            commit_tree(&c);
         }
         let new = new.into_inner();
         if !new.is_empty() {

@@ -124,6 +124,10 @@ impl crate::arch::UserRegs for Aarch64TrapFrame {
 
     /// ELR back over the `svc`, x0 back to its value at entry (x8 still
     /// holds the number; Linux regs[0] = orig_x0, pc -= 4)
+    fn syscall_rollback(&mut self) {
+        self.x[0] = self.orig_x0;
+    }
+
     fn restart_syscall(&mut self) {
         self.elr = self.elr.wrapping_sub(4);
         self.x[0] = self.orig_x0;

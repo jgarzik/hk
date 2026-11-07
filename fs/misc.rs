@@ -10,9 +10,7 @@ use alloc::sync::Arc;
 
 use crate::arch::Uaccess;
 use crate::fs::{KernelError, LookupFlags, lookup_path_flags};
-use crate::uaccess::{
-    UaccessArch, copy_to_user, put_user, strncpy_from_user, strncpy_from_user_str,
-};
+use crate::uaccess::{UaccessArch, copy_to_user, strncpy_from_user, strncpy_from_user_str};
 
 use super::syscall::{PATH_MAX, current_fd_table};
 
@@ -197,6 +195,11 @@ fn change_type(m: &Arc<super::mount::Mount>, flags: u64) -> Result<(), KernelErr
         _ => return Err(KernelError::InvalidArgument),
     };
     let _ns = super::mount::NAMESPACE_SEM.write();
+    // Mounted in some namespace (Linux may_change_propagation: not
+    // necessarily the caller's)
+    if m.ns() == 0 {
+        return Err(KernelError::InvalidArgument);
+    }
     let targets = if flags & ms::REC != 0 {
         subtree(m)
     } else {
@@ -206,6 +209,15 @@ fn change_type(m: &Arc<super::mount::Mount>, flags: u64) -> Result<(), KernelErr
         change_propagation(&t, p);
     }
     Ok(())
+}
+
+/// The caller's mount (Linux check_mnt) whose root `target` is (Linux
+/// path_mounted), else EINVAL: what remount works on
+fn own_mount_at(target: &super::Path) -> Result<Arc<super::mount::Mount>, KernelError> {
+    if !super::mount::check_mnt(&target.mnt) {
+        return Err(KernelError::InvalidArgument);
+    }
+    mount_at(target)
 }
 
 /// Mount whose root `target` is (Linux path_mounted), else EINVAL
@@ -288,10 +300,10 @@ fn path_mount(
     }
     // Linux path_mount's order
     if flags & (ms::REMOUNT | ms::BIND) == ms::REMOUNT | ms::BIND {
-        return reconfigure_mnt(&mount_at(&mp)?, flags);
+        return reconfigure_mnt(&own_mount_at(&mp)?, flags);
     }
     if flags & ms::REMOUNT != 0 {
-        return remount(&mount_at(&mp)?, flags, &data);
+        return remount(&own_mount_at(&mp)?, flags, &data);
     }
     if flags & ms::BIND != 0 {
         let old = crate::fs::namei::path_lookupat(
@@ -449,7 +461,7 @@ pub fn sys_ioctl(fd: i32, cmd: u32, arg: u64) -> i64 {
     const FIOASYNC: u32 = 0x5452; // Enable async I/O notification
     const FIOCLEX: u32 = 0x5451; // Set close-on-exec flag
     const FIONCLEX: u32 = 0x5450; // Clear close-on-exec flag
-    const FIONREAD: u32 = 0x541B; // Get bytes available for read
+    use crate::fs::file::FIONREAD;
 
     // Get file from fd
     let file = match current_fd_table().lock().get(fd) {
@@ -476,22 +488,23 @@ pub fn sys_ioctl(fd: i32, cmd: u32, arg: u64) -> i64 {
             }
             return 0;
         }
+        // Linux ioctl_fioasync: a change of O_ASYNC goes through
+        // ->fasync, ENOTTY without one
         FIOASYNC => {
-            // Set/clear O_ASYNC flag
-            if arg == 0 {
-                return KernelError::BadAddress.sysret();
-            }
-            let enable: i32 = match get_user::<Uaccess, i32>(arg) {
+            let on: i32 = match get_user::<Uaccess, i32>(arg) {
                 Ok(v) => v,
                 Err(_) => return KernelError::BadAddress.sysret(),
             };
-            let current_flags = file.get_flags();
-            if enable != 0 {
-                file.set_status_flags(current_flags | crate::fs::flags::O_ASYNC);
-            } else {
-                file.set_status_flags(current_flags & !crate::fs::flags::O_ASYNC);
+            let on = on != 0;
+            let async_now = file.get_flags() & crate::fs::flags::O_ASYNC != 0;
+            if on == async_now {
+                return 0;
             }
-            return 0;
+            return match file.fasync(fd, on) {
+                Some(Ok(())) => 0,
+                Some(Err(e)) => e.sysret(),
+                None => KernelError::NotTty.sysret(),
+            };
         }
         FIOCLEX => {
             // Set close-on-exec flag
@@ -505,31 +518,17 @@ pub fn sys_ioctl(fd: i32, cmd: u32, arg: u64) -> i64 {
             current_fd_table().lock().set_fd_flags(fd, 0);
             return 0;
         }
-        FIONREAD
-            if file
-                .get_inode()
-                .is_some_and(|i| i.mode().is_socket() || i.mode().is_chrdev()) =>
-        {
-            // Sockets (FIONREAD/SIOCINQ) and devices (ttys: TIOCINQ)
-            // answer it themselves (Linux: only regular files are
-            // do_vfs_ioctl's)
-            return match file.f_op.ioctl(&file, cmd, arg) {
-                Ok(v) => v,
-                Err(e) => e.sysret(),
-            };
-        }
+        // A regular file: size - position (Linux do_vfs_ioctl); the
+        // rest is the file's own (pipes, sockets, ttys, inotify), ENOTTY
+        // without
         FIONREAD => {
-            // Get bytes available for reading
-            if arg == 0 {
-                return KernelError::BadAddress.sysret();
+            if let Some(i) = file.get_inode().filter(|i| i.mode().is_file()) {
+                let n = i.get_size() as i64 - file.get_pos() as i64;
+                return match crate::fs::file::put_fionread(arg, n) {
+                    Ok(v) => v,
+                    Err(e) => e.sysret(),
+                };
             }
-            // For most file types, return 0 (would need file-type specific handling)
-            // Pipes, sockets, etc. would have buffered data
-            let available: i32 = 0;
-            if put_user::<Uaccess, i32>(arg, available).is_err() {
-                return KernelError::BadAddress.sysret();
-            }
-            return 0;
         }
         _ => {} // Fall through to device-specific handling
     }

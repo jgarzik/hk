@@ -9,7 +9,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::sync::spin::Mutex;
-use ::core::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use ::core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::sync;
 
@@ -303,6 +303,15 @@ pub trait FileOps: Send + Sync {
         Ok(())
     }
 
+    /// Put the file on (`on`) or take it off the object's SIGIO lists
+    /// for descriptor `fd` (-1 at the last close), with
+    /// `io::fasync::fasync_helper`, which keeps O_ASYNC (Linux
+    /// f_op->fasync). None: the file has no fasync (F_SETFL drops
+    /// O_ASYNC, FIOASYNC is ENOTTY).
+    fn fasync(&self, _file: &File, _fd: i32, _on: bool) -> Option<Result<(), KernelError>> {
+        None
+    }
+
     /// Device/file-specific ioctl (Linux f_op->unlocked_ioctl), reached
     /// by `sys_ioctl` after the generic FIO* commands for files that are
     /// not block or character devices (e.g. sockets). Default: ENOTTY.
@@ -321,6 +330,13 @@ pub trait FileOps: Send + Sync {
     fn poll(&self, _file: &File, _pt: Option<&mut PollTable<'_>>) -> u16 {
         // Default for regular files - always ready
         DEFAULT_POLLMASK
+    }
+
+    /// The file has a poll of its own (Linux file_can_poll: f_op->poll
+    /// set): epoll accepts only these (EPERM otherwise); poll and select
+    /// see `poll`'s DEFAULT_POLLMASK either way (Linux vfs_poll)
+    fn can_poll(&self, _file: &File) -> bool {
+        true
     }
 }
 
@@ -351,13 +367,9 @@ pub struct File {
     /// File operations
     pub f_op: &'static dyn FileOps,
 
-    /// Owner PID for SIGIO signal delivery (F_SETOWN/F_GETOWN)
-    /// 0 = unset, positive = PID, negative = PGID
-    owner_pid: AtomicI32,
-
-    /// Signal to send for async I/O (F_SETSIG/F_GETSIG)
-    /// 0 = use default SIGIO
-    owner_sig: AtomicI32,
+    /// SIGIO owner (Linux f_owner), allocated on first use
+    /// (`io::fasync`)
+    pub(crate) f_owner: spin::Once<Arc<crate::io::fasync::FOwner>>,
 
     /// Write access to the file system while open for writing (Linux
     /// FMODE_WRITER): a read-only remount is EBUSY until it is released
@@ -430,8 +442,7 @@ impl File {
             f_ep: Mutex::new(alloc::vec::Vec::new()),
             f_lock: Mutex::new(flags),
             f_op,
-            owner_pid: AtomicI32::new(0),
-            owner_sig: AtomicI32::new(0),
+            f_owner: spin::Once::new(),
             write_access: None,
             i_write: None,
             f_cred: crate::task::current_cred(),
@@ -537,32 +548,22 @@ impl File {
         self.f_op
     }
 
-    /// Set owner PID/PGID for async I/O signals (F_SETOWN)
-    ///
-    /// Positive value = process ID, negative = process group ID
-    pub fn set_owner(&self, pid: i32) {
-        self.owner_pid.store(pid, Ordering::Relaxed);
+    /// Set or clear O_ASYNC: only `io::fasync::fasync_helper`, with the
+    /// list change, so the flag means "on a fasync list" (Linux
+    /// fasync_insert_entry under f_lock)
+    pub(crate) fn set_fasync_flag(&self, on: bool) {
+        let mut fl = self.f_lock.lock();
+        if on {
+            *fl |= flags::O_ASYNC;
+        } else {
+            *fl &= !flags::O_ASYNC;
+        }
     }
 
-    /// Get owner PID/PGID for async I/O signals (F_GETOWN)
-    ///
-    /// Returns: positive = PID, negative = PGID, 0 = unset
-    pub fn get_owner(&self) -> i32 {
-        self.owner_pid.load(Ordering::Relaxed)
-    }
-
-    /// Set signal number for async I/O (F_SETSIG)
-    ///
-    /// 0 = use default SIGIO
-    pub fn set_sig(&self, sig: i32) {
-        self.owner_sig.store(sig, Ordering::Relaxed);
-    }
-
-    /// Get signal number for async I/O (F_GETSIG)
-    ///
-    /// Returns: signal number, 0 = use default SIGIO
-    pub fn get_sig(&self) -> i32 {
-        self.owner_sig.load(Ordering::Relaxed)
+    /// Turn O_ASYNC on or off for descriptor `fd` (F_SETFL, FIOASYNC)
+    /// through `->fasync`: None if the file has none
+    pub fn fasync(&self, fd: i32, on: bool) -> Option<Result<(), KernelError>> {
+        self.f_op.fasync(self, fd, on)
     }
 
     /// Read from file
@@ -743,6 +744,10 @@ impl Drop for File {
         if !self.f_ep.lock().is_empty() {
             crate::io::epoll::eventpoll_release(self);
         }
+        // Off every SIGIO list (Linux __fput: ->fasync(-1, file, 0))
+        if self.get_flags() & flags::O_ASYNC != 0 {
+            let _ = self.f_op.fasync(self, -1, false);
+        }
         // Call release on file operations to allow cleanup (e.g., decrement pipe reader/writer counts)
         let _ = self.f_op.release(self);
 
@@ -758,6 +763,17 @@ impl Drop for File {
             mnt.mntput();
         }
     }
+}
+
+/// FIONREAD (Linux ioctl number): bytes ready to read
+pub const FIONREAD: u32 = 0x541B;
+
+/// Answer FIONREAD with `n` as the user's int (Linux put_user to an
+/// `int __user *`, truncating)
+pub fn put_fionread(arg: u64, n: i64) -> Result<i64, KernelError> {
+    crate::uaccess::put_user::<crate::arch::Uaccess, i32>(arg, n as i32)
+        .map_err(|_| KernelError::BadAddress)?;
+    Ok(0)
 }
 
 /// Null file ops - returns errors for all operations
@@ -879,11 +895,22 @@ impl FileOps for CharDevFileOps {
         Self::dev(file)?.ioctl(file, cmd, arg)
     }
 
+    fn fasync(&self, file: &File, fd: i32, on: bool) -> Option<Result<(), KernelError>> {
+        match Self::dev(file) {
+            Ok(d) => d.fasync(file, fd, on),
+            Err(e) => Some(Err(e)),
+        }
+    }
+
     fn poll(&self, file: &File, pt: Option<&mut PollTable<'_>>) -> u16 {
         match Self::dev(file) {
             Ok(d) => d.poll(file, pt),
             Err(_) => POLLHUP | POLLERR,
         }
+    }
+
+    fn can_poll(&self, file: &File) -> bool {
+        Self::dev(file).is_ok_and(|d| d.can_poll())
     }
 }
 

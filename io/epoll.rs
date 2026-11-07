@@ -223,7 +223,7 @@ fn ep_poll_callback(e: &WaitEntry, _mode: WakeMode, key: usize) -> bool {
     };
     if queued {
         ep.wq.wake_all();
-        ep.poll_wq.wake_all();
+        ep.poll_wq.wake_poll(u32::from(POLLIN));
     }
     true
 }
@@ -287,7 +287,7 @@ impl Eventpoll {
         };
         if queued {
             self.wq.wake_all();
-            self.poll_wq.wake_all();
+            self.poll_wq.wake_poll(u32::from(POLLIN));
         }
     }
 
@@ -791,6 +791,10 @@ fn epoll_ctl(epfd: i32, op: i32, fd: i32, event_ptr: u64) -> Result<(), KernelEr
             t.get(fd).ok_or(KernelError::BadFd)?,
         )
     };
+    // The target must poll, before the epoll checks (Linux do_epoll_ctl)
+    if !tf.f_op.can_poll(&tf) {
+        return Err(KernelError::NotPermitted);
+    }
     let ep = get_eventpoll(&ep_file).ok_or(KernelError::InvalidArgument)?;
     if Arc::ptr_eq(&ep_file, &tf) {
         return Err(KernelError::InvalidArgument);

@@ -1,0 +1,34 @@
+//! Filesystem and VFS tests
+
+pub mod anon_inode;
+pub mod append;
+pub mod attr_race;
+pub mod bigio;
+pub mod blk;
+pub mod cpio_nodes;
+pub mod dac;
+pub mod dirents;
+pub mod etxtbsy;
+pub mod fanotify;
+pub mod fifo;
+pub mod file_io;
+pub mod flock;
+pub mod fs_common;
+pub mod fs_ops;
+pub mod fs_times;
+pub mod inotify;
+pub mod linkat;
+pub mod mntns_check;
+pub mod mount_race;
+pub mod mountflags;
+pub mod mountinfo;
+pub mod mounts;
+pub mod namei;
+pub mod permissions;
+pub mod pnode;
+pub mod posix_lock;
+pub mod pread_special;
+pub mod rename2;
+pub mod sync;
+pub mod vfs;
+pub mod xattr;

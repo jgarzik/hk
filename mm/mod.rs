@@ -12,7 +12,7 @@ extern crate alloc;
 use crate::util::kalloc::{arc_cyclic_nofail, box_nofail};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU8, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use crate::sync::spin::Mutex;
 use crate::sync::{RwSem, RwSemReadGuard, RwSemWriteGuard};
@@ -884,9 +884,28 @@ pub struct Mm {
     /// membarrier registrations (Linux mm->membarrier_state,
     /// MEMBARRIER_STATE_*); a new address space starts with none
     membarrier: AtomicU32,
+    /// Where its signal return trampoline page is, 0 for none (arm64:
+    /// Linux mm->context.vdso): set by exec before the address space is
+    /// used, moved by mremap of that page (Linux vdso_mremap) under the
+    /// mmap_lock for writing, copied by fork; read with no lock by the
+    /// signal delivery of a task using it, as Linux reads its word. An
+    /// unmapped page is not forgotten (Linux neither).
+    sigpage: AtomicU64,
 }
 
 impl Mm {
+    /// Where its signal return trampoline is (arm64: Linux
+    /// mm->context.vdso's sigtramp): its [sigpage] page, wherever mremap
+    /// moved it; 0 if there is none (another arch)
+    pub fn sigpage(&self) -> u64 {
+        self.sigpage.load(Ordering::Relaxed)
+    }
+
+    /// Its signal return page is now at `addr` (exec, mremap)
+    pub fn set_sigpage(&self, addr: u64) {
+        self.sigpage.store(addr, Ordering::Relaxed);
+    }
+
     /// Top-level page table (CR3 / TTBR0 value)
     pub fn pgd(&self) -> u64 {
         self.pgd
@@ -985,6 +1004,7 @@ impl MmRef {
             dumpable: AtomicU8::new(crate::task::dumpable::SUID_DUMP_USER),
             ctx: tlb::MmContext::new(),
             membarrier: AtomicU32::new(0),
+            sigpage: AtomicU64::new(0),
         }))
     }
 
@@ -1157,6 +1177,7 @@ pub fn dup_mm(parent: &MmRef, pgd: u64) -> Result<MmRef, i32> {
     child
         .membarrier
         .store(parent.membarrier.load(Ordering::Relaxed), Ordering::Relaxed);
+    child.set_sigpage(parent.sigpage());
     // On error `child` goes with its partial copy (outside the lock)
     res.map(|()| child)
 }

@@ -64,9 +64,10 @@ use crate::sync::spin::{Mutex, MutexGuard, RwLock};
 
 use crate::arch::Uaccess;
 use crate::fs::Dentry;
+use crate::io::fasync::{POLL_HUP, POLL_IN};
 use crate::net::NetNamespace;
 use crate::net::msg::{RecvMsg, SendMsg};
-use crate::net::sock::{RCV_SHUTDOWN, SEND_SHUTDOWN, SHUTDOWN_MASK, Sock, sf};
+use crate::net::sock::{RCV_SHUTDOWN, SEND_SHUTDOWN, SHUTDOWN_MASK, Sock, WakeHow, sf};
 use crate::net::socket::{
     AF_UNIX, OptIn, OptOut, ProtoOps, SIOCINQ, SIOCOUTQ, SO_PEERCRED, SOCK_DGRAM, SOCK_RAW,
     SOCK_SEQPACKET, SOCK_STREAM, SOL_SOCKET,
@@ -411,6 +412,7 @@ impl UnixSock {
             if self.wmem.load(Ordering::Acquire) < self.sk.sndbuf() as usize {
                 return Ok(());
             }
+            self.sk.send_nospace(*timeo);
             *timeo = self.sk.wait(*timeo, || {
                 self.wmem.load(Ordering::Acquire) < self.sk.sndbuf() as usize
                     || self.sk.has_err()
@@ -559,6 +561,7 @@ impl UnixSock {
                     }
                 }
                 p.sk.state_change();
+                p.sk.wake_async(WakeHow::WaitData, POLL_HUP);
             }
             dgram::peer_wake_disconnect(self, &p);
         }
@@ -791,6 +794,11 @@ impl ProtoOps for UnixSock {
                 p.sk.or_shutdown(pm);
             }
             p.sk.state_change();
+            if pm == SHUTDOWN_MASK {
+                p.sk.wake_async(WakeHow::WaitData, POLL_HUP);
+            } else if pm & RCV_SHUTDOWN != 0 {
+                p.sk.wake_async(WakeHow::WaitData, POLL_IN);
+            }
         }
         Ok(())
     }

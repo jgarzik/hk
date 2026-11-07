@@ -298,7 +298,7 @@ pub fn recvmsg(s: &UnixSock, m: &mut RecvMsg<'_>, flags: i32) -> Result<usize, K
         // Linux unix_stream_data_wait, with no lock held
         let seen = peek_at;
         let peek = flags & MSG_PEEK != 0;
-        match s.sk.wait(timeo, || {
+        match s.sk.wait_data(timeo, || {
             let q = s.rq.lock();
             let more = if peek {
                 q.q.len() > seen

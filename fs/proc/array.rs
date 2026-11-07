@@ -78,7 +78,10 @@ fn snap(pid: Pid) -> Option<Snap> {
         let a = t.task.task_lock();
         (a.comm(), a.fs().cloned(), a.files().cloned())
     };
-    let sig = t.task.sig.lock().clone();
+    let (blocked, pending, shared) = {
+        let s = t.task.sig.lock();
+        (s.blocked.0, s.pending.signal.0, s.shared_pending.clone())
+    };
     // The whole thread group's CPU time (Linux do_task_stat with whole)
     let (utime, stime) = crate::task::percpu::group_times(&table, pid);
     Some(Snap {
@@ -123,9 +126,9 @@ fn snap(pid: Pid) -> Option<Snap> {
         tracer,
         no_new_privs: t.prctl.no_new_privs,
         seccomp: t.task.seccomp_mode(),
-        blocked: sig.blocked.0,
-        pending: sig.pending.signal.0,
-        shared: Some(sig.shared_pending.clone()),
+        blocked,
+        pending,
+        shared: Some(shared),
         sighand: t.sighand.clone(),
         signal: t.signal.clone(),
         fs,
@@ -359,8 +362,10 @@ fn status_sig(o: &mut Out, s: &Snap) {
         .as_ref()
         .and_then(|sig| sig.get_rlimit(crate::task::rlimit::RLIMIT_SIGPENDING))
         .map_or(0, |r| r.rlim_cur);
+    // Signals queued for the task's user (Linux task_sig: its ucounts)
+    let queued = crate::task::ucount(s.cred.uid, crate::task::Ucount::Sigpending);
     let (ign, cgt) = ign_cgt(s);
-    let _ = writeln!(o, "Threads:\t{}\nSigQ:\t0/{}", s.threads, qlim);
+    let _ = writeln!(o, "Threads:\t{}\nSigQ:\t{}/{}", s.threads, queued, qlim);
     let sets = [
         ("SigPnd", s.pending),
         ("ShdPnd", shd_pnd(s)),
