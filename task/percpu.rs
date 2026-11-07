@@ -1882,11 +1882,6 @@ pub fn exec_waits(tgid: Pid, tid: Tid) -> bool {
         .any(|u| u.task.tid() != tid && !(u.leader && matches!(u.state, TaskState::Zombie(_))))
 }
 
-/// A thread of group `tgid` other than `tid` has not exited yet
-pub fn group_others(tgid: Pid, tid: Tid) -> bool {
-    group_alive(&TASKLIST.read(), tgid, tid)
-}
-
 /// After de_thread: `tid` is the only thread of `tgid` left running and
 /// becomes its leader, taking the old leader's place (Linux de_thread:
 /// its parent, exit signal and start time); the exited threads are
@@ -1987,13 +1982,6 @@ pub fn take_leadership(tgid: Pid, tid: Tid) -> Vec<TaskRef> {
     }
     drop(table);
     gone
-}
-
-/// A thread of group `tgid` other than `tid` has not exited yet
-fn group_alive(table: &GlobalTaskTable, tgid: Pid, tid: Tid) -> bool {
-    table
-        .threads(tgid)
-        .any(|u| u.task.tid() != tid && !matches!(u.state, TaskState::Zombie(_)))
 }
 
 /// The wait status a zombie leader reports (Linux wait_task_zombie):

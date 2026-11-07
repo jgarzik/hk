@@ -2350,6 +2350,12 @@ impl SignalStruct {
         )
     }
 
+    /// Its threads that have not started exiting, the caller included if
+    /// it has not (Linux atomic_read(&signal->live))
+    pub fn live(&self) -> u32 {
+        self.live.load(Ordering::Acquire)
+    }
+
     /// A thread joins the group (CLONE_THREAD)
     pub fn thread_added(&self) {
         self.live.fetch_add(1, Ordering::AcqRel);
