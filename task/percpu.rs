@@ -1376,6 +1376,7 @@ fn create_kernel_task(
         ptrace_message: 0,
         ptrace_options: 0,
         ptrace_code: 0,
+        ptrace_frozen: false,
         last_siginfo: None,
     };
     let task = Task::new(
@@ -1588,6 +1589,7 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<Tid, &'static str> {
         ptrace_message: 0,
         ptrace_options: 0,
         ptrace_code: 0,
+        ptrace_frozen: false,
         last_siginfo: None,
     };
     // The boot-time init task: failure cannot be reported
@@ -2319,6 +2321,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         ptrace_message: 0,
         ptrace_options: 0,
         ptrace_code: 0,
+        ptrace_frozen: false,
         last_siginfo: None,
     };
     let child_task = try_arc(Task::new(

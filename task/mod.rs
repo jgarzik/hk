@@ -1257,6 +1257,10 @@ pub struct TaskInner {
     /// and PTRACE_SETSIGINFO replaces (Linux task->last_siginfo); none
     /// outside a ptrace stop
     pub last_siginfo: Option<crate::signal::SigInfo>,
+    /// Its tracer is inside a ptrace request on it (Linux
+    /// JOBCTL_PTRACE_FROZEN): a SIGKILL leaves its ptrace stop alone
+    /// until the request ends
+    pub ptrace_frozen: bool,
 }
 
 /// Data owned by the TASKLIST lock: reached through a borrow of the

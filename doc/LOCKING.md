@@ -1086,7 +1086,15 @@ lock, rechecked after each wakeup) or SIGKILL. The tracer's wait clears
 `try_to_wake_up` the tracee with it dropped. SIGKILL ends the stop in
 the section that queues it (`sigkill_task` from `zap_threads`, Linux
 signal_wake_up(fatal) clearing JOBCTL_TRACED), so a wait after the
-kill never reports the stop. The arch register and
+kill never reports the stop. A tracer's request holds the stop while it
+runs (`TaskInner.ptrace_frozen`, Linux JOBCTL_PTRACE_FROZEN): set under
+the write lock by `ptrace_check_attach` (in the stop, no SIGKILL
+pending), cleared under it when the request's `Frozen` guard drops;
+while it is set, SIGKILL leaves the stop alone (`sigkill_task`, and the
+tracee, woken, sleeps `Uninterruptible` once it reads frozen with
+SIGKILL pending), and the guard's drop ends a stop with SIGKILL pending
+and wakes the tracee after the lock (Linux ptrace_unfreeze_traced). The
+arch register and
 single-step helpers take the TASKLIST read lock themselves, so callers
 never hold it.
 

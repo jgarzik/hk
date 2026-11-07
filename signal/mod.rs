@@ -1106,12 +1106,16 @@ pub fn flush_group_signal(sig: u32) {
 /// SIGKILL is pending for the current task (Linux
 /// fatal_signal_pending): killable sleeps end on it
 pub fn fatal_signal_pending() -> bool {
-    let me = crate::task::percpu::current();
+    task_fatal_pending(&crate::task::percpu::current())
+}
+
+/// SIGKILL is pending for task `t` (Linux __fatal_signal_pending)
+pub fn task_fatal_pending(t: &crate::task::Task) -> bool {
     // SIGKILL cannot be blocked: pending, it sets TIF_SIGPENDING
-    if !me.sigpending() {
+    if !t.sigpending() {
         return false;
     }
-    let s = me.sig.lock();
+    let s = t.sig.lock();
     s.pending.signal.contains(SIGKILL) || s.shared_pending.lock().signal.contains(SIGKILL)
 }
 
@@ -1862,13 +1866,15 @@ pub fn zap_group_others(tgid: Pid, tid: Tid) {
 /// Queue SIGKILL for `t` (TASKLIST held); a ptrace stop it is in ends
 /// here, no longer reported to its tracer's wait (Linux
 /// signal_wake_up(t, fatal) clears JOBCTL_TRACED with the signal
-/// queued), so a wait after the kill finds its exit, never the stop
+/// queued), so a wait after the kill finds its exit, never the stop;
+/// unless its tracer is inside a request on it (frozen), whose end
+/// does that
 fn sigkill_task(t: &mut crate::task::percpu::TaskViewMut<'_>) {
     let mut s = t.task.sig.lock();
     s.pending.add(SIGKILL);
     t.task.set_sigpending(true);
     drop(s);
-    if matches!(t.state, crate::task::TaskState::Traced(_)) {
+    if matches!(t.state, crate::task::TaskState::Traced(_)) && !t.ptrace_frozen {
         t.state = crate::task::TaskState::Ready;
         t.ptrace_code = 0;
     }
