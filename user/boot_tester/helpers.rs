@@ -2,7 +2,6 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-use crate::harness::fail_num;
 use hk_syscall::{
     AF_INET, O_RDONLY, SIGKILL, SOCK_DGRAM, Timespec, UtsName, sys_close, sys_ioctl, sys_kill,
     sys_mkdir, sys_mount, sys_nanosleep, sys_open, sys_read, sys_socket, sys_uname, sys_wait4,
@@ -54,7 +53,9 @@ pub fn dev_setup() {
         0,
     );
     if r != 0 {
-        fail_num(b"DEVTMPFS_MOUNT:FAIL ", r);
+        print(b"DEVTMPFS_MOUNT:FAIL ");
+        print_num(r);
+        println(b"");
     }
 }
 

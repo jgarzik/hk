@@ -28,10 +28,18 @@ pub fn report_r(name: &[u8], r: R) {
     }
 }
 
-/// NAME:OK
+/// NAME:OK, in one write(2) so a concurrent writer cannot split it
 pub fn pass(name: &[u8]) {
-    print(name);
-    println(b":OK");
+    let mut line = [0u8; 128];
+    let n = name.len();
+    if n + 4 > line.len() {
+        print(name);
+        println(b":OK");
+        return;
+    }
+    line[..n].copy_from_slice(name);
+    line[n..n + 4].copy_from_slice(b":OK\n");
+    print(&line[..n + 4]);
 }
 
 /// NAME:FAIL why N
