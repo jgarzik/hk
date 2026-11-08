@@ -47,10 +47,7 @@ loading); HADL itself waits for the owner's go-ahead.
   `exit_signal`/`pdeath_signal` become `Option<Signal>`; FutexKey
   fields private.
 - M1 non-generic `get_user`/`put_user`/`copy_*` (no `::<Uaccess,`
-  turbofish); `From<UaccessError> for KernelError`; IoremapError and
-  IRQ string errors become KernelError; a `SysRet` trait so `sys_*`
-  return `KernelResult` with `?`; one public `fget` for the open-coded
-  fd lookups; redundant `access_ok` checks dropped.
+  turbofish); IoremapError and IRQ string errors become KernelError.
 
 ## 4. M2 — arch dedup and the IRQ table
 

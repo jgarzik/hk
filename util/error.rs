@@ -342,14 +342,6 @@ impl SysRet for i64 {
     }
 }
 
-/// A raw -errno or value in an `i32` (sign-extended, as `as u64` did)
-impl SysRet for i32 {
-    #[inline]
-    fn ret(self) -> i64 {
-        i64::from(self)
-    }
-}
-
 impl SysRet for KernelResult<()> {
     #[inline]
     fn ret(self) -> i64 {

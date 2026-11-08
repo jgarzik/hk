@@ -8,25 +8,18 @@ LOC-saving idioms (including `#[expect]` over `#[allow]`) see
 
 ## Ranking
 
-1. **Typed user pointers at the syscall boundary** (`rust/kernel/uaccess.rs`).
-   `UserPtr<T>`, `UserSlice` reader/writer and `copy_struct_from_user` exist
-   (`uaccess.rs`); the `sys_*` functions still take user addresses as raw `u64`
-   (`fs/io.rs` `sys_read`). Convert their signatures, region by region, so
-   `dispatch` builds `UserPtr`s and field-by-field `get_user` sequences become
-   one reader. `Untrusted<T>` (https://lwn.net/Articles/1034603) is optional,
-   still in review upstream.
-2. **`ForeignOwnable`** (`rust/kernel/types.rs` `into_foreign`/`borrow`/
+1. **`ForeignOwnable`** (`rust/kernel/types.rs` `into_foreign`/`borrow`/
    `from_foreign`): one audited trait for the remaining hand-written
    `Arc::into_raw`/`from_raw` round trips (`util/list.rs` ArcList, `mm/page.rs`
    anon_vma tag, task refs). Few are left now that IRQ and cross-CPU call
    contexts are typed; worth it once a new user (an XArray of `Arc`s) appears.
-3. **`# Invariants` / `// INVARIANT:` adoption.** The rule is in
+2. **`# Invariants` / `// INVARIANT:` adoption.** The rule is in
    `doc/UNSAFE.md` and on the core types (`util/list.rs`, `sync/`); extend it
    to every type whose `unsafe` relies on its fields (mm/, hw/ DMA rings).
-4. **`Revocable`/`Devres`** (`rust/kernel/revocable.rs`, `devres.rs`): MMIO mappings
+3. **`Revocable`/`Devres`** (`rust/kernel/revocable.rs`, `devres.rs`): MMIO mappings
    and IRQs become safely unusable at unbind or unplug instead of dangling (`hw/`
    virtio, PCI). Only matters once hk does hot-unplug or driver unbind.
-5. **`pin_init!`/`PinInit`** (`rust/kernel/init.rs`, `rust/pin-init/`). Poor fit: hk
+4. **`pin_init!`/`PinInit`** (`rust/kernel/init.rs`, `rust/pin-init/`). Poor fit: hk
    heap-allocates through `Arc`/`Box` and its intrusive lists link boxed items, so
    in-place pinning buys little; the ergonomics wait on unstable language work
    (https://lwn.net/Articles/1039334).
@@ -42,7 +35,8 @@ later for page refcounts).
 
 errno `Result` (`util/error.rs`), `FromBytes`/`IntoBytes`/`pod!`, fallible
 `KVec`/`KDeque`, fallible `Box`/`Arc` (`util/kalloc.rs`, with `Box::new`/`Arc::new`
-banned by clippy), `UserPtr`/`UserSlice` (`uaccess.rs`), iov_iter file I/O
+banned by clippy), `UserPtr`/`UserSlice` (`uaccess.rs`; every `sys_*` takes its user
+pointers typed and returns `KernelResult`), iov_iter file I/O
 (`fs/iov_iter.rs`, `FileOps::read_iter`/`write_iter`), `LockedBy`
 (`sync/locked_by.rs`), the guard-taking wait (`WaitQueue::
 wait_event_interruptible_locked`), `ScopeGuard` (`util/scope.rs`), typed IRQ
