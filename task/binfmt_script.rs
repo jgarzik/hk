@@ -16,6 +16,9 @@ pub const MAX_DEPTH: usize = 5;
 
 const ENOEXEC: i32 = 8;
 
+use super::argstr::ArgStrings;
+use crate::util::error::KernelError;
+
 fn spacetab(c: u8) -> bool {
     c == b' ' || c == b'\t'
 }
@@ -83,19 +86,19 @@ fn parse_line(head: &[u8]) -> Result<Interp<'_>, i32> {
 /// argv for the interpreter (Linux load_script: remove_arg_zero, then
 /// the script's path, the argument and the interpreter in front)
 pub fn rewrite_argv(
-    argv: &[alloc::vec::Vec<u8>],
+    argv: &ArgStrings,
     interp: &[u8],
     arg: Option<&[u8]>,
     script: &[u8],
-) -> alloc::vec::Vec<alloc::vec::Vec<u8>> {
-    let mut out = alloc::vec::Vec::with_capacity(argv.len() + 2);
-    out.push(interp.to_vec());
+) -> Result<ArgStrings, KernelError> {
+    let mut out = ArgStrings::new();
+    out.push(interp)?;
     if let Some(a) = arg {
-        out.push(a.to_vec());
+        out.push(a)?;
     }
-    out.push(script.to_vec());
-    out.extend(argv.iter().skip(1).cloned());
-    out
+    out.push(script)?;
+    out.push_tail(argv)?;
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -138,16 +141,11 @@ mod tests {
 
     #[test]
     fn argv() {
-        let orig = [b"./s".to_vec(), b"one".to_vec()];
-        let v = rewrite_argv(&orig, b"/bin/sh", Some(b"-e"), b"/tmp/s");
-        assert_eq!(
-            v,
-            [
-                b"/bin/sh".to_vec(),
-                b"-e".to_vec(),
-                b"/tmp/s".to_vec(),
-                b"one".to_vec()
-            ]
-        );
+        let mut orig = ArgStrings::new();
+        orig.push(b"./s").unwrap();
+        orig.push(b"one").unwrap();
+        let v = rewrite_argv(&orig, b"/bin/sh", Some(b"-e"), b"/tmp/s").unwrap();
+        assert_eq!(v.bytes(), b"/bin/sh\0-e\0/tmp/s\0one\0");
+        assert_eq!(v.len(), 4);
     }
 }

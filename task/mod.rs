@@ -1,6 +1,7 @@
 //! Task management
 
 pub mod acct;
+pub(crate) mod argstr;
 pub(crate) mod binfmt_script;
 pub mod futex;
 pub mod kcmp;

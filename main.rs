@@ -565,11 +565,21 @@ fn run_init() -> ! {
 
 /// execve `path` as init; returns only on failure, with the errno
 fn try_init(path: &str, args: &cmdline::InitArgs) -> i32 {
-    use alloc::vec::Vec;
-    let mut argv: Vec<Vec<u8>> = alloc::vec![path.as_bytes().to_vec()];
-    argv.extend(args.argv.iter().map(|a| a.as_bytes().to_vec()));
-    let mut envp: Vec<Vec<u8>> = alloc::vec![b"HOME=/".to_vec(), b"TERM=linux".to_vec()];
-    envp.extend(args.envp.iter().map(|e| e.as_bytes().to_vec()));
+    use task::exec::ArgStrings;
+    let mut argv = ArgStrings::new();
+    let mut envp = ArgStrings::new();
+    let args_ok = core::iter::once(path)
+        .chain(args.argv.iter().map(|a| a.as_ref()))
+        .try_for_each(|a| argv.push(a.as_bytes()))
+        .and_then(|()| {
+            ["HOME=/", "TERM=linux"]
+                .into_iter()
+                .chain(args.envp.iter().map(|e| e.as_ref()))
+                .try_for_each(|e| envp.push(e.as_bytes()))
+        });
+    if let Err(e) = args_ok {
+        return -e.errno();
+    }
     let mut frame_alloc = mm::frame_alloc::FrameAllocRef(&FRAME_ALLOCATOR);
     task::exec::do_execve(path.as_bytes().to_vec(), argv, envp, &mut frame_alloc)
 }

@@ -17,6 +17,8 @@ use crate::fs::{File, kernel_open_exec};
 use crate::mm::{ELF_ET_DYN_BASE, MmLayout, STACK_TOP};
 use crate::util::elf::ElfExecutable;
 
+pub use super::argstr::ArgStrings;
+
 /// Page size constant
 const PAGE_SIZE: u64 = 4096;
 
@@ -59,19 +61,6 @@ pub const EAGAIN: i32 = 11; // Try again
 pub const EINVAL: i32 = 22; // Invalid argument
 pub const ELOOP: i32 = 40; // Too many levels of symbolic links
 pub const ELIBBAD: i32 = 80; // Accessing a corrupted shared library
-
-/// Copy a null-terminated string from user space (through uaccess, so
-/// SMAP/PAN stay enforced and a bad pointer is EFAULT, not a kernel fault)
-fn copy_string_from_user(ptr: u64, max_len: usize) -> Result<Vec<u8>, i32> {
-    use crate::uaccess::UaccessError;
-    crate::uaccess::strndup_user_bytes::<crate::arch::Uaccess>(ptr, max_len).map_err(|e| match e {
-        UaccessError::TooLong => E2BIG,
-        _ => EFAULT,
-    })
-}
-
-/// Argument or environment strings, without their NULs
-type Strings = Vec<Vec<u8>>;
 
 /// The user pointer `i` of a NULL-terminated array (Linux
 /// get_user_arg_ptr): EFAULT
@@ -119,20 +108,18 @@ fn arg_limit(argc: usize, envc: usize) -> Result<usize, i32> {
     limit.checked_sub(ptrs).filter(|&l| l > 0).ok_or(E2BIG)
 }
 
-/// Copy the `n` strings of user array `argv`, each charged with its
-/// NUL against `budget` (Linux copy_strings): one longer than
-/// MAX_ARG_STRLEN, or past the budget, is E2BIG; EFAULT
-fn copy_strings(argv: u64, n: usize, budget: &mut usize) -> Result<Strings, i32> {
-    let mut out = Vec::new();
-    out.try_reserve_exact(n).map_err(|_| ENOMEM)?;
+/// Copy the `n` strings of user array `argv`, packed, each charged
+/// with its NUL against `budget` (Linux copy_strings): one longer than
+/// MAX_ARG_STRLEN, or past the budget, is E2BIG; EFAULT; ENOMEM
+fn copy_strings(argv: u64, n: usize, budget: &mut usize) -> Result<ArgStrings, i32> {
+    let mut out = ArgStrings::new();
     for i in 0..n {
         let p = arg_ptr(argv, i)?;
         if p == 0 {
             return Err(EFAULT);
         }
-        let s = copy_string_from_user(p, MAX_ARG_STRLEN)?;
-        *budget = budget.checked_sub(s.len() + 1).ok_or(E2BIG)?;
-        out.push(s);
+        out.push_user::<crate::arch::Uaccess>(p, MAX_ARG_STRLEN, budget)
+            .map_err(|e| e.errno())?;
         if crate::signal::fatal_signal_pending() {
             return Err(crate::util::error::KernelError::RestartNoHand.errno());
         }
@@ -144,7 +131,7 @@ fn copy_strings(argv: u64, n: usize, budget: &mut usize) -> Result<Strings, i32>
 /// (Linux do_execveat_common): both arrays counted, the room for them
 /// worked out from RLIMIT_STACK, then the file name, the environment
 /// and the arguments copied against it
-fn copy_args(filename: &[u8], argv: u64, envp: u64) -> Result<(Strings, Strings), i32> {
+fn copy_args(filename: &[u8], argv: u64, envp: u64) -> Result<(ArgStrings, ArgStrings), i32> {
     let argc = count(argv)?;
     let envc = count(envp)?;
     let mut budget = arg_limit(argc, envc)?;
@@ -204,6 +191,42 @@ impl StackWriter<'_> {
     fn push_str(&mut self, s: &[u8]) -> Result<u64, i32> {
         self.push(&[0])?;
         self.push(s)
+    }
+}
+
+/// Stores consecutive words to the new stack through a small buffer
+struct WordWriter<'a, 'b> {
+    w: &'a StackWriter<'b>,
+    /// Where the buffered words go
+    at: u64,
+    buf: [u8; 512],
+    n: usize,
+}
+
+impl<'a, 'b> WordWriter<'a, 'b> {
+    fn new(w: &'a StackWriter<'b>, at: u64) -> Self {
+        Self {
+            w,
+            at,
+            buf: [0; 512],
+            n: 0,
+        }
+    }
+
+    fn put(&mut self, v: u64) -> Result<(), i32> {
+        if self.n == self.buf.len() {
+            self.flush()?;
+        }
+        self.buf[self.n..self.n + 8].copy_from_slice(&v.to_le_bytes());
+        self.n += 8;
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<(), i32> {
+        self.w.write(self.at, &self.buf[..self.n])?;
+        self.at += self.n as u64;
+        self.n = 0;
+        Ok(())
     }
 }
 
@@ -268,8 +291,8 @@ fn auxv(info: &ExecInfo<'_>, random: u64, execfn: u64, platform: u64) -> [(u64, 
 fn setup_user_stack<FA: FrameAlloc<PhysAddr = u64>>(
     page_table: &mut ArchPageTable,
     frame_alloc: &mut FA,
-    argv: &[Vec<u8>],
-    envp: &[Vec<u8>],
+    argv: &ArgStrings,
+    envp: &ArgStrings,
     info: &ExecInfo<'_>,
 ) -> Result<(MmLayout, u64), i32> {
     // Calculate stack pages based on RLIMIT_STACK
@@ -281,7 +304,7 @@ fn setup_user_stack<FA: FrameAlloc<PhysAddr = u64>>(
     };
     // What the initial stack holds: its strings were bounded by
     // copy_args (Linux bprm_stack_limits), plus a script's interpreter
-    let strings: usize = argv.iter().chain(envp).map(|s| s.len() + 1).sum();
+    let strings = argv.bytes().len() + envp.bytes().len();
     let words = 1 + argv.len() + 1 + envp.len() + 1 + 2 * AUXV_LEN;
     let need = strings + info.execfn.len() + 64 + 16 + words * 8 + 64;
 
@@ -314,38 +337,32 @@ fn setup_user_stack<FA: FrameAlloc<PhysAddr = u64>>(
     let execfn = w.push_str(info.execfn)?;
     // argv then envp strings, back to back (Linux arg_start..env_end)
     let env_end = w.top;
-    let mut envp_addrs = Vec::with_capacity(envp.len());
-    for e in envp.iter().rev() {
-        envp_addrs.push(w.push_str(e)?);
-    }
-    envp_addrs.reverse();
-    let env_start = w.top;
-    let mut argv_addrs = Vec::with_capacity(argv.len());
-    for a in argv.iter().rev() {
-        argv_addrs.push(w.push_str(a)?);
-    }
-    argv_addrs.reverse();
-    let arg_start = w.top;
+    let env_start = w.push(envp.bytes())?;
+    let arg_start = w.push(argv.bytes())?;
     let platform = w.push_str(crate::arch::ELF_PLATFORM)?;
     let mut rnd = [0u8; 16];
     let _ = crate::random::get_random_bytes(&mut rnd, 0);
     w.top &= !15;
     let random = w.push(&rnd)?;
 
-    // argc, argv[], NULL, envp[], NULL, auxv pairs
-    let mut v: Vec<u64> = Vec::with_capacity(words);
-    v.push(argv.len() as u64);
-    v.extend_from_slice(&argv_addrs);
-    v.push(0);
-    v.extend_from_slice(&envp_addrs);
-    v.push(0);
-    for (k, val) in auxv(info, random, execfn, platform) {
-        v.push(k);
-        v.push(val);
+    // argc, argv[], NULL, envp[], NULL, auxv pairs, streamed to the
+    // stack: each string's address found by walking the NULs
+    let sp = (w.top - words as u64 * 8) & !15;
+    let mut out = WordWriter::new(&w, sp);
+    out.put(argv.len() as u64)?;
+    for (strs, start) in [(argv, arg_start), (envp, env_start)] {
+        let mut at = start;
+        for s in strs.iter() {
+            out.put(at)?;
+            at += s.len() as u64 + 1;
+        }
+        out.put(0)?;
     }
-    let sp = (w.top - v.len() as u64 * 8) & !15;
-    let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
-    w.write(sp, &bytes)?;
+    for (k, val) in auxv(info, random, execfn, platform) {
+        out.put(k)?;
+        out.put(val)?;
+    }
+    out.flush()?;
 
     // The kernel wrote through the linear map (arm64: clean the data
     // cache for the user mapping)
@@ -778,10 +795,10 @@ fn apply_relocations(
 /// (execveat) cannot be reopened by its interpreter: ENOENT.
 fn resolve_scripts(
     mut file: Arc<File>,
-    mut argv: Vec<Vec<u8>>,
+    mut argv: ArgStrings,
     path: &[u8],
     path_inaccessible: bool,
-) -> Result<(Arc<File>, Vec<Vec<u8>>), i32> {
+) -> Result<(Arc<File>, ArgStrings), i32> {
     use crate::task::binfmt_script::{BINPRM_BUF_SIZE, MAX_DEPTH, parse, rewrite_argv};
     let mut name = path.to_vec();
     for depth in 0.. {
@@ -800,7 +817,7 @@ fn resolve_scripts(
         if path_inaccessible {
             return Err(ENOENT);
         }
-        argv = rewrite_argv(&argv, interp, arg, &name);
+        argv = rewrite_argv(&argv, interp, arg, &name).map_err(|e| e.errno())?;
         name = interp.to_vec();
         file = kernel_open_exec(interp)?;
     }
@@ -969,8 +986,8 @@ fn exec_fatal() {
 /// On error, it returns the error code and the process continues.
 pub fn do_execve<FA: FrameAlloc<PhysAddr = u64>>(
     path: Vec<u8>,
-    argv: Vec<Vec<u8>>,
-    envp: Vec<Vec<u8>>,
+    argv: ArgStrings,
+    envp: ArgStrings,
     frame_alloc: &mut FA,
 ) -> i32 {
     exec_file(path, kernel_open_exec, false, argv, envp, frame_alloc)
@@ -983,8 +1000,8 @@ fn exec_file<FA, F>(
     path: Vec<u8>,
     open: F,
     path_inaccessible: bool,
-    argv: Vec<Vec<u8>>,
-    envp: Vec<Vec<u8>>,
+    argv: ArgStrings,
+    envp: ArgStrings,
     frame_alloc: &mut FA,
 ) -> i32
 where
