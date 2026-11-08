@@ -397,14 +397,9 @@ pub fn sys_pselect6(
     // The sigmask parameter in pselect6 is a pointer to a struct:
     // struct { const sigset_t *ss; size_t ss_len; }
     let saved_mask = if sigmask != 0 {
-        // Read pointer to sigset_t
-        let ss_ptr = match get_user::<Uaccess, u64>(sigmask) {
+        // The pointer to the sigset_t and its size, read whole
+        let [ss_ptr, ss_len] = match get_user::<Uaccess, [u64; 2]>(sigmask) {
             Ok(v) => v,
-            Err(_) => return KernelError::BadAddress.sysret(),
-        };
-        // Read sigset size
-        let ss_len = match get_user::<Uaccess, u64>(sigmask + 8) {
-            Ok(v) => v as usize,
             Err(_) => return KernelError::BadAddress.sysret(),
         };
 

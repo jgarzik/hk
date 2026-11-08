@@ -728,8 +728,7 @@ fn mq_deadline(abs: u64) -> Result<Option<u64>, KernelError> {
     if abs == 0 {
         return Ok(None);
     }
-    let sec = get_user::<Uaccess, i64>(abs).map_err(|_| KernelError::BadAddress)?;
-    let nsec = get_user::<Uaccess, i64>(abs + 8).map_err(|_| KernelError::BadAddress)?;
+    let [sec, nsec] = get_user::<Uaccess, [i64; 2]>(abs).map_err(|_| KernelError::BadAddress)?;
     if !(0..1_000_000_000).contains(&nsec) || sec < 0 {
         return Err(KernelError::InvalidArgument);
     }
@@ -771,8 +770,8 @@ pub fn sys_mq_timedsend(
         return KernelError::BadFd.sysret();
     }
 
-    // Check message size
-    if msg_len as i64 > mq_ops.queue.msgsize {
+    // Check message size (msgsize is positive: mq_attr_ok)
+    if msg_len > mq_ops.queue.msgsize as usize {
         return KernelError::MessageTooLong.sysret();
     }
 
@@ -831,8 +830,8 @@ pub fn sys_mq_timedreceive(
         return KernelError::BadFd.sysret();
     }
 
-    // Check buffer size
-    if (msg_len as i64) < mq_ops.queue.msgsize {
+    // Check buffer size (msgsize is positive: mq_attr_ok)
+    if msg_len < mq_ops.queue.msgsize as usize {
         return KernelError::MessageTooLong.sysret();
     }
 

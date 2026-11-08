@@ -15,6 +15,8 @@
 //! - MQ_NOTIFY_OWNER_EXIT: a child's registration on an inherited
 //!   descriptor ends when it exits (Linux mqueue_flush_file on its
 //!   close), so the parent may register (no EBUSY)
+//! - MQ_LEN_UNSIGNED: message lengths compare as size_t: a send of
+//!   SIZE_MAX bytes is EMSGSIZE, a receive into SIZE_MAX bytes is not
 
 use crate::harness::{fail_num, pass};
 use crate::helpers::{print, print_num, println};
@@ -56,6 +58,31 @@ pub fn run_tests() {
     test_mq_attr_limits();
     test_mq_notify_owner_exit();
     test_mq_read_status();
+    test_mq_len_unsigned();
+}
+
+fn test_mq_len_unsigned() {
+    let name = b"mq_len_unsigned\0";
+    let attr = MqAttr::new(4, 64);
+    let flags = O_RDWR as i32 | O_CREAT as i32 | O_NONBLOCK as i32;
+    let fd = sys_mq_open(name.as_ptr(), flags, 0o600, &attr) as i32;
+    let b = [0u8; 8];
+    let s = sys_mq_timedsend(fd, b.as_ptr(), usize::MAX, 0, core::ptr::null());
+    let mut rb = [0u8; 64];
+    let r = sys_mq_timedreceive(
+        fd,
+        rb.as_mut_ptr(),
+        usize::MAX,
+        core::ptr::null_mut(),
+        core::ptr::null(),
+    );
+    sys_close(fd as u64);
+    sys_mq_unlink(name.as_ptr());
+    crate::harness::verdict(
+        b"MQ_LEN_UNSIGNED",
+        fd >= 0 && s == EMSGSIZE && r == EAGAIN,
+        s * 1000 + r,
+    );
 }
 
 /// SIGEV_NONE on `fd`: mq_notify's result
