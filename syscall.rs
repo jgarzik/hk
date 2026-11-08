@@ -403,7 +403,7 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
         .ret() as u64,
         Sys::Fadvise64 => {
             crate::fs::syscall::sys_fadvise64(a[0] as i32, a[1] as i64, a[2] as i64, a[3] as i32)
-                as u64
+                .ret() as u64
         }
         Sys::Fallocate => {
             crate::fs::misc::sys_fallocate(a[0] as i32, a[1] as i32, a[2] as i64, a[3] as i64).ret()

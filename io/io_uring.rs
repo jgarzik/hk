@@ -755,9 +755,9 @@ impl IoUring {
         let datasync = (sqe.op_flags & IORING_FSYNC_DATASYNC) != 0;
 
         if datasync {
-            crate::fs::syscall::sys_fdatasync(fd) as i32
+            crate::fs::syscall::sys_fdatasync(fd).ret() as i32
         } else {
-            crate::fs::syscall::sys_fsync(fd) as i32
+            crate::fs::syscall::sys_fsync(fd).ret() as i32
         }
     }
 

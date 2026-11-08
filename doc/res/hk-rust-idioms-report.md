@@ -30,7 +30,8 @@ Order: 2 goes per subsystem (M1); let-else is done and linted
   read/write, vectored I/O, splice/tee/vmsplice/sendfile/copy_file_range,
   open/close/dup/fcntl/pipe/truncate, stat/statx/statfs, access/chmod/chown/utimes,
   namei ops (mkdir/mknod/rmdir/unlink/link/symlink/readlink/rename), getdents,
-  chdir/fchdir/chroot/getcwd, xattr, mount/umount2/pivot_root, ioctl, fallocate.
+  chdir/fchdir/chroot/getcwd, xattr, mount/umount2/pivot_root, ioctl, fallocate,
+  sync/fsync/syncfs/sync_file_range/fadvise64/readahead, flock.
 - **Evidence (counts):**
   - 81 x `let v = match f() { Ok(v) => v, Err(e) => return e.sysret(), };` (4 lines)
   - 22 x `if let Err(e) = f() { return e.sysret(); }` (3 lines)
