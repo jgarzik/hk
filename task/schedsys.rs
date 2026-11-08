@@ -664,7 +664,7 @@ pub fn sys_ioprio_set(which: i32, who: i32, ioprio: i32) -> KernelResult<()> {
                 return Err(KernelError::NotPermitted);
             }
             // Get or create IoContext for the target
-            super::task_io_context(&t)?.set_ioprio(ioprio);
+            super::set_task_ioprio(&t, ioprio)?;
             Ok(())
         }
         IOPRIO_WHO_PGRP => {
@@ -682,7 +682,7 @@ pub fn sys_ioprio_set(which: i32, who: i32, ioprio: i32) -> KernelResult<()> {
                     return Err(KernelError::NotPermitted);
                 }
                 if let Some(t) = super::percpu::find_task(tid) {
-                    super::task_io_context(&t)?.set_ioprio(ioprio);
+                    super::set_task_ioprio(&t, ioprio)?;
                 }
             }
             Ok(())

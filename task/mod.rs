@@ -2577,19 +2577,19 @@ pub fn set_task_io_context(t: &Task, ctx: Arc<IoContext>) {
     drop(t.task_lock().set_io_context(Some(ctx)));
 }
 
-/// The I/O context of task `t`, a new one if it has none (Linux
-/// set_task_ioprio's alloc_io_context under task_lock); ENOMEM if one
-/// cannot be made
-pub fn task_io_context(t: &Task) -> Result<Arc<IoContext>, KernelError> {
+/// Set task `t`'s I/O priority (Linux set_task_ioprio), making it an
+/// I/O context if it has none, but not once it is exiting (its context
+/// would outlive exit_io_context); ENOMEM if one cannot be made
+pub fn set_task_ioprio(t: &Task, ioprio: IoPrio) -> Result<(), KernelError> {
     let new = try_arc(IoContext::new())?;
     let mut a = t.task_lock();
-    Ok(match a.io_context() {
-        Some(c) => c.clone(),
-        None => {
-            a.set_io_context(Some(new.clone()));
-            new
-        }
-    })
+    if let Some(c) = a.io_context() {
+        c.set_ioprio(ioprio);
+    } else if !t.has_flag(pf::EXITING) {
+        new.set_ioprio(ioprio);
+        a.set_io_context(Some(new));
+    }
+    Ok(())
 }
 
 /// Remove the I/O context of task `t` (on exit)
