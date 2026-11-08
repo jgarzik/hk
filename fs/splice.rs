@@ -29,7 +29,9 @@ use alloc::sync::Arc;
 use crate::arch::Uaccess;
 use crate::fs::KernelError;
 use crate::fs::file::File;
+use crate::fs::io::fget;
 use crate::fs::io::verify_area;
+use crate::fs::iov::IoVec;
 use crate::fs::superblock::MAX_LFS_FILESIZE;
 use crate::fs::syscall::MAX_RW_COUNT;
 use crate::io::pipe::PipePage;
@@ -37,9 +39,8 @@ use crate::io::pipe::{
     PIPE_RING, Pipe, PipeBuffer, PipeReadFileOps, PipeWriteFileOps, pipe_buf_flags,
 };
 use crate::mm::filemap::PAGE_SIZE;
-use crate::task::fdtable::get_task_fd;
-use crate::task::percpu::current_tid;
-use crate::uaccess::{copy_from_user, get_user, put_user};
+use crate::uaccess::{UserPtr, copy_from_user};
+use crate::util::error::KernelResult;
 use crate::util::kalloc::try_arc;
 
 // =============================================================================
@@ -219,19 +220,12 @@ fn pipe_of_file(file: &File) -> Option<Arc<Pipe>> {
     file.private_arc::<Pipe>()
 }
 
-/// Get file from fd
-fn get_file_from_fd(fd: i32) -> Option<Arc<File>> {
-    let tid = current_tid();
-    let fd_table = get_task_fd(tid)?;
-    fd_table.lock().get(fd)
-}
-
 /// Read a user `loff_t *` (NULL = use and advance the file position)
-fn read_user_offset(ptr: u64) -> Result<Option<u64>, KernelError> {
-    if ptr == 0 {
+fn read_user_offset(ptr: UserPtr<i64>) -> KernelResult<Option<u64>> {
+    if ptr.is_null() {
         return Ok(None);
     }
-    let off = get_user::<Uaccess, i64>(ptr).map_err(|_| KernelError::BadAddress)?;
+    let off = ptr.read()?;
     if off < 0 {
         return Err(KernelError::InvalidArgument);
     }
@@ -240,14 +234,18 @@ fn read_user_offset(ptr: u64) -> Result<Option<u64>, KernelError> {
 
 /// After a transfer that started at user offset `pos`, store the advanced
 /// offset back to `*ptr` (Linux updates `*off_in`/`*off_out`/`*offset`).
-fn write_back_offset(ptr: u64, pos: Option<u64>, ret: i64) -> i64 {
+fn write_back_offset(
+    ptr: UserPtr<i64>,
+    pos: Option<u64>,
+    ret: KernelResult<usize>,
+) -> KernelResult<usize> {
+    let n = ret?;
     if let Some(p) = pos
-        && ret > 0
-        && put_user::<Uaccess, u64>(ptr, p + ret as u64).is_err()
+        && n > 0
     {
-        return KernelError::BadAddress.sysret();
+        ptr.write(&((p + n as u64) as i64))?;
     }
-    ret
+    Ok(n)
 }
 
 // =============================================================================
@@ -270,30 +268,25 @@ fn write_back_offset(ptr: u64, pos: Option<u64>, ret: i64) -> i64 {
 /// Number of bytes transferred, or negative errno
 pub fn sys_splice(
     fd_in: i32,
-    off_in: u64,
+    off_in: UserPtr<i64>,
     fd_out: i32,
-    off_out: u64,
+    off_out: UserPtr<i64>,
     len: usize,
     flags: u32,
-) -> i64 {
+) -> KernelResult<usize> {
     if len == 0 {
-        return 0;
+        return Ok(0);
     }
     if flags & !SPLICE_F_ALL != 0 {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
 
-    // Get the files
-    let Some(in_file) = get_file_from_fd(fd_in) else {
-        return KernelError::BadFd.sysret();
-    };
-    let Some(out_file) = get_file_from_fd(fd_out) else {
-        return KernelError::BadFd.sysret();
-    };
+    let in_file = fget(fd_in)?;
+    let out_file = fget(fd_out)?;
     // Linux do_splice: read from a readable file, write to a writable
     // one (a FIFO is open one way or both)
     if !in_file.is_readable() || !out_file.is_writable() {
-        return KernelError::BadFd.sysret();
+        return Err(KernelError::BadFd);
     }
 
     // The pipes of the files just checked (one lookup per fd)
@@ -307,8 +300,8 @@ pub fn sys_splice(
 
     // Pipe-to-pipe splice: neither side has an offset
     if let (Some(in_pipe), Some(out_pipe)) = (&in_pipe, &out_pipe) {
-        if off_in != 0 || off_out != 0 {
-            return KernelError::IllegalSeek.sysret();
+        if !off_in.is_null() || !off_out.is_null() {
+            return Err(KernelError::IllegalSeek);
         }
         let flags = flags
             | if nb(&in_file) || nb(&out_file) {
@@ -322,17 +315,12 @@ pub fn sys_splice(
     // File-to-pipe splice
     if let Some(out_pipe) = out_pipe {
         // Pipes don't support offsets
-        if off_out != 0 {
-            return KernelError::IllegalSeek.sysret();
+        if !off_out.is_null() {
+            return Err(KernelError::IllegalSeek);
         }
 
-        let pos = match read_user_offset(off_in) {
-            Ok(p) => p,
-            Err(e) => return e.sysret(),
-        };
-        if let Err(e) = verify_area(&in_file, pos, len) {
-            return e.sysret();
-        }
+        let pos = read_user_offset(off_in)?;
+        verify_area(&in_file, pos, len)?;
         let flags = flags | if nb(&out_file) { SPLICE_F_NONBLOCK } else { 0 };
         let ret = do_splice_file_to_pipe(&in_file, pos, &out_pipe, len, flags);
         return write_back_offset(off_in, pos, ret);
@@ -341,36 +329,31 @@ pub fn sys_splice(
     // Pipe-to-file splice
     if let Some(in_pipe) = in_pipe {
         // Pipes don't support offsets
-        if off_in != 0 {
-            return KernelError::IllegalSeek.sysret();
+        if !off_in.is_null() {
+            return Err(KernelError::IllegalSeek);
         }
 
-        let pos = match read_user_offset(off_out) {
-            Ok(p) => p,
-            Err(e) => return e.sysret(),
-        };
+        let pos = read_user_offset(off_out)?;
         // Linux do_splice: an O_APPEND output is EINVAL
         if out_file.get_flags() & crate::fs::file::flags::O_APPEND != 0 {
-            return KernelError::InvalidArgument.sysret();
+            return Err(KernelError::InvalidArgument);
         }
-        if let Err(e) = verify_area(&out_file, pos, len) {
-            return e.sysret();
-        }
+        verify_area(&out_file, pos, len)?;
         let flags = flags | if nb(&in_file) { SPLICE_F_NONBLOCK } else { 0 };
         let ret = do_splice_pipe_to_file(&in_pipe, &out_file, pos, len, flags);
         return write_back_offset(off_out, pos, ret);
     }
 
-    KernelError::InvalidArgument.sysret()
+    Err(KernelError::InvalidArgument)
 }
 
 /// Splice from pipe to pipe (move buffers)
-fn do_splice_pipe_to_pipe(src: &Pipe, dst: &Pipe, len: usize, flags: u32) -> i64 {
+fn do_splice_pipe_to_pipe(src: &Pipe, dst: &Pipe, len: usize, flags: u32) -> KernelResult<usize> {
     let src_addr = core::ptr::from_ref::<Pipe>(src) as usize;
     let dst_addr = core::ptr::from_ref::<Pipe>(dst) as usize;
 
     if src_addr == dst_addr {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
 
     let nonblock = flags & SPLICE_F_NONBLOCK != 0;
@@ -384,18 +367,8 @@ fn do_splice_pipe_to_pipe(src: &Pipe, dst: &Pipe, len: usize, flags: u32) -> i64
         (s, d)
     };
 
-    if src_guard.is_empty() {
-        if nonblock {
-            return KernelError::WouldBlock.sysret();
-        }
-        return 0; // No data to move
-    }
-
-    if dst_guard.is_full() {
-        if nonblock {
-            return KernelError::WouldBlock.sysret();
-        }
-        return 0; // No space
+    if src_guard.is_empty() || dst_guard.is_full() {
+        return would_block(nonblock);
     }
 
     let mut moved = 0;
@@ -447,16 +420,25 @@ fn do_splice_pipe_to_pipe(src: &Pipe, dst: &Pipe, len: usize, flags: u32) -> i64
     src.wake_writers();
     dst.wake_readers();
 
-    moved as i64
+    Ok(moved)
 }
 
 /// errno of a failed read feeding a splice: the read's own, except that
 /// a file without a read is EINVAL (Linux do_splice_read: no
 /// ->splice_read)
-fn read_err(e: KernelError) -> i64 {
+fn read_err(e: KernelError) -> KernelError {
     match e {
-        KernelError::OperationNotSupported => KernelError::InvalidArgument.sysret(),
-        e => e.sysret(),
+        KernelError::OperationNotSupported => KernelError::InvalidArgument,
+        e => e,
+    }
+}
+
+/// Nothing to move: EAGAIN when nonblocking, else 0 bytes
+fn would_block(nonblock: bool) -> KernelResult<usize> {
+    if nonblock {
+        Err(KernelError::WouldBlock)
+    } else {
+        Ok(0)
     }
 }
 
@@ -467,19 +449,12 @@ fn do_splice_file_to_pipe(
     pipe: &Pipe,
     len: usize,
     flags: u32,
-) -> i64 {
+) -> KernelResult<usize> {
     let nonblock = flags & SPLICE_F_NONBLOCK != 0;
 
     // Check pipe has space
-    {
-        let inner = pipe.lock();
-        if inner.is_full() {
-            return if nonblock {
-                KernelError::WouldBlock.sysret()
-            } else {
-                0
-            };
-        }
+    if pipe.lock().is_full() {
+        return would_block(nonblock);
     }
 
     // For simplicity, we'll read into a temporary buffer and then copy to pipe
@@ -489,42 +464,23 @@ fn do_splice_file_to_pipe(
     let to_read = len.min(PAGE_SIZE);
 
     // Read from file
-    let bytes_read = if let Some(off_in) = off_in {
-        // Use pread at specified offset
-        match file.pread(&mut buf[..to_read], off_in) {
-            Ok(n) => n,
-            Err(KernelError::WouldBlock) => {
-                return if nonblock {
-                    KernelError::WouldBlock.sysret()
-                } else {
-                    0
-                };
-            }
-            Err(e) => return read_err(e),
-        }
-    } else {
-        // Use regular read (advances file position)
-        match file.read(&mut buf[..to_read]) {
-            Ok(n) => n,
-            Err(KernelError::WouldBlock) => {
-                return if nonblock {
-                    KernelError::WouldBlock.sysret()
-                } else {
-                    0
-                };
-            }
-            Err(e) => return read_err(e),
-        }
+    // pread at the offset, else read (advances the file position)
+    let r = match off_in {
+        Some(off_in) => file.pread(&mut buf[..to_read], off_in),
+        None => file.read(&mut buf[..to_read]),
+    };
+    let bytes_read = match r {
+        Ok(n) => n,
+        Err(KernelError::WouldBlock) => return would_block(nonblock),
+        Err(e) => return Err(read_err(e)),
     };
 
     if bytes_read == 0 {
-        return 0;
+        return Ok(0);
     }
 
     // Allocate a pipe page and copy data
-    let Some(page) = allocate_pipe_page() else {
-        return KernelError::OutOfMemory.sysret();
-    };
+    let page = allocate_pipe_page().ok_or(KernelError::OutOfMemory)?;
 
     // Copy data to page
     // SAFETY: `page` is a fresh, kernel-mapped frame of PAGE_SIZE bytes
@@ -548,17 +504,13 @@ fn do_splice_file_to_pipe(
 
     let mut inner = pipe.lock();
     if inner.push_buffer(pipe_buf).is_err() {
-        return if nonblock {
-            KernelError::WouldBlock.sysret()
-        } else {
-            0
-        };
+        return would_block(nonblock);
     }
     drop(inner);
 
     pipe.wake_readers();
 
-    bytes_read as i64
+    Ok(bytes_read)
 }
 
 /// Splice from pipe to file (write pipe contents to file)
@@ -568,22 +520,15 @@ fn do_splice_pipe_to_file(
     off_out: Option<u64>,
     len: usize,
     flags: u32,
-) -> i64 {
+) -> KernelResult<usize> {
     let nonblock = flags & SPLICE_F_NONBLOCK != 0;
 
     // Check if pipe has data
-    {
-        let inner = pipe.lock();
-        if inner.is_empty() {
-            if !pipe.has_writers() {
-                return 0; // EOF
-            }
-            return if nonblock {
-                KernelError::WouldBlock.sysret()
-            } else {
-                0
-            };
+    if pipe.lock().is_empty() {
+        if !pipe.has_writers() {
+            return Ok(0); // EOF
         }
+        return would_block(nonblock);
     }
 
     // The pipe stays locked across the writes, and each buffer gives up
@@ -647,14 +592,14 @@ fn do_splice_pipe_to_file(
     if written == 0
         && let Some(e) = err
     {
-        return e.sysret();
+        return Err(e);
     }
 
     if written == 0 && nonblock {
-        return KernelError::WouldBlock.sysret();
+        return Err(KernelError::WouldBlock);
     }
 
-    written as i64
+    Ok(written)
 }
 
 /// Allocate a page for pipe buffer
@@ -679,39 +624,31 @@ fn allocate_pipe_page() -> Option<Arc<PipePage>> {
 ///
 /// # Returns
 /// Number of bytes duplicated, or negative errno
-pub fn sys_tee(fd_in: i32, fd_out: i32, len: usize, flags: u32) -> i64 {
+pub fn sys_tee(fd_in: i32, fd_out: i32, len: usize, flags: u32) -> KernelResult<usize> {
     if len == 0 {
-        return 0;
+        return Ok(0);
     }
 
     // Linux do_tee: EBADF for a bad fd or the wrong direction first
-    let (in_file, out_file) = match (get_file_from_fd(fd_in), get_file_from_fd(fd_out)) {
-        (Some(i), Some(o)) if i.is_readable() && o.is_writable() => (i, o),
-        _ => return KernelError::BadFd.sysret(),
-    };
+    let in_file = fget(fd_in)?;
+    let out_file = fget(fd_out)?;
+    if !in_file.is_readable() || !out_file.is_writable() {
+        return Err(KernelError::BadFd);
+    }
 
     // Both must be pipes
     let (Some(in_pipe), Some(out_pipe)) = (pipe_of_file(&in_file), pipe_of_file(&out_file)) else {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     };
 
     // Cannot tee to same pipe
-    let in_addr = Arc::as_ptr(&in_pipe) as usize;
-    let out_addr = Arc::as_ptr(&out_pipe) as usize;
-    if in_addr == out_addr {
-        return KernelError::InvalidArgument.sysret();
+    if Arc::ptr_eq(&in_pipe, &out_pipe) {
+        return Err(KernelError::InvalidArgument);
     }
 
     match link_pipe(&in_pipe, &out_pipe, len, flags) {
-        Ok(n) => n as i64,
-        Err(KernelError::WouldBlock) => {
-            if flags & SPLICE_F_NONBLOCK != 0 {
-                KernelError::WouldBlock.sysret()
-            } else {
-                0
-            }
-        }
-        Err(_) => KernelError::InvalidArgument.sysret(),
+        Err(KernelError::WouldBlock) => would_block(flags & SPLICE_F_NONBLOCK != 0),
+        r => r,
     }
 }
 
@@ -725,30 +662,26 @@ pub fn sys_tee(fd_in: i32, fd_out: i32, len: usize, flags: u32) -> i64 {
 ///
 /// # Returns
 /// Number of bytes spliced, or negative errno
-pub fn sys_vmsplice(fd: i32, iov: u64, nr_segs: usize, flags: u32) -> i64 {
+pub fn sys_vmsplice(
+    fd: i32,
+    iov: UserPtr<IoVec>,
+    nr_segs: usize,
+    flags: u32,
+) -> KernelResult<usize> {
     if flags & !SPLICE_F_ALL != 0 {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
 
     // A pipe open for writing (Linux vmsplice_to_pipe); vmsplice from
     // a pipe open only for reading (vmsplice_to_user) is not done: EBADF
-    let Some(file) = get_file_from_fd(fd) else {
-        return KernelError::BadFd.sysret();
-    };
+    let file = fget(fd)?;
     // The segments as readv takes them (Linux import_iovec): EINVAL
     // past IOV_MAX or for a negative length, cut to MAX_RW_COUNT
-    let segs = match i32::try_from(nr_segs)
-        .map_err(|_| KernelError::InvalidArgument)
-        .and_then(|n| crate::fs::iov::import_iovec(iov, n))
-    {
-        Ok(v) => v,
-        Err(e) => return e.sysret(),
-    };
-    let Some(pipe) = pipe_of_file(&file) else {
-        return KernelError::InvalidArgument.sysret();
-    };
+    let n = i32::try_from(nr_segs).map_err(|_| KernelError::InvalidArgument)?;
+    let segs = crate::fs::iov::import_iovec(iov.addr(), n)?;
+    let pipe = pipe_of_file(&file).ok_or(KernelError::InvalidArgument)?;
     if !file.is_writable() {
-        return KernelError::BadFd.sysret();
+        return Err(KernelError::BadFd);
     }
 
     let nonblock = flags & SPLICE_F_NONBLOCK != 0;
@@ -760,9 +693,7 @@ pub fn sys_vmsplice(fd: i32, iov: u64, nr_segs: usize, flags: u32) -> i64 {
         }
 
         // Allocate a pipe page
-        let Some(page) = allocate_pipe_page() else {
-            return KernelError::OutOfMemory.sysret();
-        };
+        let page = allocate_pipe_page().ok_or(KernelError::OutOfMemory)?;
 
         // Copy user data to page (limited to PAGE_SIZE)
         let to_copy = (seg.iov_len as usize).min(PAGE_SIZE);
@@ -775,9 +706,9 @@ pub fn sys_vmsplice(fd: i32, iov: u64, nr_segs: usize, flags: u32) -> i64 {
             // Bytes already queued count as success (Linux iov_iter)
             pipe.wake_readers();
             return if total > 0 {
-                total as i64
+                Ok(total)
             } else {
-                KernelError::BadAddress.sysret()
+                Err(KernelError::BadAddress)
             };
         }
 
@@ -794,9 +725,9 @@ pub fn sys_vmsplice(fd: i32, iov: u64, nr_segs: usize, flags: u32) -> i64 {
             drop(inner);
             if nonblock {
                 return if total > 0 {
-                    total as i64
+                    Ok(total)
                 } else {
-                    KernelError::WouldBlock.sysret()
+                    Err(KernelError::WouldBlock)
                 };
             }
             break;
@@ -813,7 +744,7 @@ pub fn sys_vmsplice(fd: i32, iov: u64, nr_segs: usize, flags: u32) -> i64 {
 
     pipe.wake_readers();
 
-    total as i64
+    Ok(total)
 }
 
 /// sys_sendfile64 - send file data to socket/file
@@ -826,11 +757,13 @@ pub fn sys_vmsplice(fd: i32, iov: u64, nr_segs: usize, flags: u32) -> i64 {
 ///
 /// # Returns
 /// Number of bytes sent, or negative errno
-pub fn sys_sendfile64(out_fd: i32, in_fd: i32, offset: u64, count: usize) -> i64 {
-    let pos = match read_user_offset(offset) {
-        Ok(p) => p,
-        Err(e) => return e.sysret(),
-    };
+pub fn sys_sendfile64(
+    out_fd: i32,
+    in_fd: i32,
+    offset: UserPtr<i64>,
+    count: usize,
+) -> KernelResult<usize> {
+    let pos = read_user_offset(offset)?;
     let ret = do_sendfile(out_fd, in_fd, pos, count);
     write_back_offset(offset, pos, ret)
 }
@@ -838,51 +771,43 @@ pub fn sys_sendfile64(out_fd: i32, in_fd: i32, offset: u64, count: usize) -> i64
 /// Linux do_sendfile: `count` bytes of `in_fd` at `pos` (None: its
 /// position) to `out_fd`, cut to MAX_RW_COUNT and to the smaller
 /// s_maxbytes of the two files (EOVERFLOW at or past it)
-fn do_sendfile(out_fd: i32, in_fd: i32, pos: Option<u64>, count: usize) -> i64 {
-    let Some(in_file) = get_file_from_fd(in_fd) else {
-        return KernelError::BadFd.sysret();
-    };
+fn do_sendfile(out_fd: i32, in_fd: i32, pos: Option<u64>, count: usize) -> KernelResult<usize> {
+    let in_file = fget(in_fd)?;
     if !in_file.is_readable() {
-        return KernelError::BadFd.sysret();
+        return Err(KernelError::BadFd);
     }
     // A pipe has no position (ESPIPE) and no read to splice from
     if pipe_of_file(&in_file).is_some() {
-        return if pos.is_some() {
-            KernelError::IllegalSeek.sysret()
+        return Err(if pos.is_some() {
+            KernelError::IllegalSeek
         } else {
-            KernelError::InvalidArgument.sysret()
-        };
+            KernelError::InvalidArgument
+        });
     }
-    if let Err(e) = verify_area(&in_file, pos, count) {
-        return e.sysret();
-    }
+    verify_area(&in_file, pos, count)?;
     let mut count = count.min(MAX_RW_COUNT);
-    let Some(out_file) = get_file_from_fd(out_fd) else {
-        return KernelError::BadFd.sysret();
-    };
+    let out_file = fget(out_fd)?;
     if !out_file.is_writable() {
-        return KernelError::BadFd.sysret();
+        return Err(KernelError::BadFd);
     }
     let maxb = |f: &File| f.get_inode().map_or(MAX_LFS_FILESIZE, |i| i.maxbytes());
     let max = maxb(&in_file).min(maxb(&out_file));
     let start = pos.unwrap_or_else(|| in_file.get_pos());
     if start.saturating_add(count as u64) > max {
         if start >= max {
-            return KernelError::Overflow.sysret();
+            return Err(KernelError::Overflow);
         }
         count = (max - start) as usize;
     }
     if count == 0 {
-        return 0;
+        return Ok(0);
     }
     if let Some(out_pipe) = pipe_of_file(&out_file) {
         let nb = out_file.get_flags() & crate::fs::file::flags::O_NONBLOCK != 0;
         let flags = if nb { SPLICE_F_NONBLOCK } else { 0 };
         do_splice_file_to_pipe(&in_file, pos, &out_pipe, count, flags)
     } else {
-        if let Err(e) = verify_area(&out_file, None, count) {
-            return e.sysret();
-        }
+        verify_area(&out_file, None, count)?;
         do_sendfile_to_file(&in_file, pos, &out_file, count)
     }
 }
@@ -893,7 +818,7 @@ fn do_sendfile_to_file(
     offset: Option<u64>,
     out_file: &Arc<File>,
     count: usize,
-) -> i64 {
+) -> KernelResult<usize> {
     let mut buf = [0u8; PAGE_SIZE];
     let mut transferred = 0;
 
@@ -912,7 +837,7 @@ fn do_sendfile_to_file(
         // An error ends the transfer: the error if nothing moved yet
         let (got, put) = match r {
             Ok(r) => r,
-            Err(e) if transferred == 0 => return read_err(e),
+            Err(e) if transferred == 0 => return Err(read_err(e)),
             Err(_) => break,
         };
         transferred += put;
@@ -921,7 +846,7 @@ fn do_sendfile_to_file(
         }
     }
 
-    transferred as i64
+    Ok(transferred)
 }
 
 // =============================================================================
@@ -939,50 +864,43 @@ fn do_sendfile_to_file(
 /// EFBIG (output limits).
 pub fn sys_copy_file_range(
     fd_in: i32,
-    off_in_ptr: u64,
+    off_in: UserPtr<i64>,
     fd_out: i32,
-    off_out_ptr: u64,
+    off_out: UserPtr<i64>,
     len: u64,
     flags: u32,
-) -> i64 {
-    let Some(in_file) = get_file_from_fd(fd_in) else {
-        return KernelError::BadFd.sysret();
-    };
-    let Some(out_file) = get_file_from_fd(fd_out) else {
-        return KernelError::BadFd.sysret();
-    };
-    let at = |ptr: u64, f: &File| -> Result<i64, KernelError> {
-        if ptr == 0 {
+) -> KernelResult<u64> {
+    let in_file = fget(fd_in)?;
+    let out_file = fget(fd_out)?;
+    let at = |ptr: UserPtr<i64>, f: &File| -> KernelResult<i64> {
+        if ptr.is_null() {
             return Ok(f.get_pos() as i64);
         }
-        get_user::<Uaccess, i64>(ptr).map_err(|_| KernelError::BadAddress)
+        Ok(ptr.read()?)
     };
-    let (pos_in, pos_out) = match (at(off_in_ptr, &in_file), at(off_out_ptr, &out_file)) {
-        (Ok(i), Ok(o)) => (i, o),
-        (Err(e), _) | (_, Err(e)) => return e.sysret(),
-    };
+    let pos_in = at(off_in, &in_file)?;
+    let pos_out = at(off_out, &out_file)?;
     if flags != 0 {
-        return KernelError::InvalidArgument.sysret();
+        return Err(KernelError::InvalidArgument);
     }
-    let n = match copy_range(&in_file, pos_in, &out_file, pos_out, len) {
-        Ok(0) => return 0,
-        Ok(n) => n,
-        Err(e) => return e.sysret(),
-    };
-    // Both offsets were checked to stay valid past the copy
-    let (end_in, end_out) = (pos_in as u64 + n, pos_out as u64 + n);
-    let mut ret = n as i64;
-    if off_in_ptr == 0 {
-        in_file.set_pos(end_in);
-    } else if put_user::<Uaccess, u64>(off_in_ptr, end_in).is_err() {
-        ret = KernelError::BadAddress.sysret();
+    let n = copy_range(&in_file, pos_in, &out_file, pos_out, len)?;
+    if n == 0 {
+        return Ok(0);
     }
-    if off_out_ptr == 0 {
-        out_file.set_pos(end_out);
-    } else if put_user::<Uaccess, u64>(off_out_ptr, end_out).is_err() {
-        ret = KernelError::BadAddress.sysret();
+    // Both offsets were checked to stay valid past the copy; both are
+    // stored before a fault is returned (Linux copy_file_range)
+    let a = store_pos(off_in, &in_file, pos_in as u64 + n);
+    let b = store_pos(off_out, &out_file, pos_out as u64 + n);
+    a.and(b).map(|()| n)
+}
+
+/// After a copy: advance `*ptr`, or the file position when NULL
+fn store_pos(ptr: UserPtr<i64>, f: &File, end: u64) -> KernelResult<()> {
+    if ptr.is_null() {
+        f.set_pos(end);
+        return Ok(());
     }
-    ret
+    Ok(ptr.write(&(end as i64))?)
 }
 
 /// Linux generic_file_rw_checks: two regular files, readable and

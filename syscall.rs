@@ -344,9 +344,9 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
         }
         Sys::CopyFileRange => crate::fs::splice::sys_copy_file_range(
             a[0] as i32,
-            a[1],
+            UserPtr::new(a[1]),
             a[2] as i32,
-            a[3],
+            UserPtr::new(a[3]),
             a[4],
             a[5] as u32,
         )
@@ -747,14 +747,19 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
             crate::task::syscall::sys_prctl(a[0] as i32, a[1], a[2], a[3], a[4]).ret() as u64
         }
         Sys::Pread64 => {
-            crate::fs::syscall::sys_pread64(a[0] as i32, a[1], a[2], a[3] as i64).ret() as u64
+            crate::fs::syscall::sys_pread64(a[0] as i32, UserPtr::new(a[1]), a[2], a[3] as i64)
+                .ret() as u64
         }
-        Sys::Preadv => {
-            crate::fs::syscall::sys_preadv(a[0] as i32, a[1], a[2] as i32, a[3] as i64).ret() as u64
-        }
+        Sys::Preadv => crate::fs::syscall::sys_preadv(
+            a[0] as i32,
+            UserPtr::new(a[1]),
+            a[2] as i32,
+            a[3] as i64,
+        )
+        .ret() as u64,
         Sys::Preadv2 => crate::fs::syscall::sys_preadv2(
             a[0] as i32,
-            a[1],
+            UserPtr::new(a[1]),
             a[2] as i32,
             a[3] as i64,
             a[5] as i32,
@@ -784,28 +789,36 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
                 as u64
         }
         Sys::Pwrite64 => {
-            crate::fs::syscall::sys_pwrite64(a[0] as i32, a[1], a[2], a[3] as i64).ret() as u64
+            crate::fs::syscall::sys_pwrite64(a[0] as i32, UserPtr::new(a[1]), a[2], a[3] as i64)
+                .ret() as u64
         }
-        Sys::Pwritev => {
-            crate::fs::syscall::sys_pwritev(a[0] as i32, a[1], a[2] as i32, a[3] as i64).ret()
-                as u64
-        }
+        Sys::Pwritev => crate::fs::syscall::sys_pwritev(
+            a[0] as i32,
+            UserPtr::new(a[1]),
+            a[2] as i32,
+            a[3] as i64,
+        )
+        .ret() as u64,
         Sys::Pwritev2 => crate::fs::syscall::sys_pwritev2(
             a[0] as i32,
-            a[1],
+            UserPtr::new(a[1]),
             a[2] as i32,
             a[3] as i64,
             a[5] as i32,
         )
         .ret() as u64,
-        Sys::Read => crate::fs::syscall::sys_read(a[0] as i32, a[1], a[2]).ret() as u64,
+        Sys::Read => {
+            crate::fs::syscall::sys_read(a[0] as i32, UserPtr::new(a[1]), a[2]).ret() as u64
+        }
         Sys::Readahead => {
             crate::fs::syscall::sys_readahead(a[0] as i32, a[1] as i64, a[2] as usize).ret() as u64
         }
         Sys::Readlinkat => {
             crate::fs::syscall::sys_readlinkat(a[0] as i32, a[1], a[2], a[3]).ret() as u64
         }
-        Sys::Readv => crate::fs::syscall::sys_readv(a[0] as i32, a[1], a[2] as i32).ret() as u64,
+        Sys::Readv => {
+            crate::fs::syscall::sys_readv(a[0] as i32, UserPtr::new(a[1]), a[2] as i32).ret() as u64
+        }
         Sys::Reboot => {
             crate::power::sys_reboot(a[0] as u32, a[1] as u32, a[2] as u32, a[3]).ret() as u64
         }
@@ -938,10 +951,13 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
             UserPtr::new(a[3]),
         )
         .ret() as u64,
-        Sys::Sendfile => {
-            crate::fs::splice::sys_sendfile64(a[0] as i32, a[1] as i32, a[2], a[3] as usize).ret()
-                as u64
-        }
+        Sys::Sendfile => crate::fs::splice::sys_sendfile64(
+            a[0] as i32,
+            a[1] as i32,
+            UserPtr::new(a[2]),
+            a[3] as usize,
+        )
+        .ret() as u64,
         Sys::Sendmmsg => crate::net::syscall::sys_sendmmsg(
             a[0] as i32,
             UserPtr::new(a[1]),
@@ -1085,9 +1101,9 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
         .ret() as u64,
         Sys::Splice => crate::fs::splice::sys_splice(
             a[0] as i32,
-            a[1],
+            UserPtr::new(a[1]),
             a[2] as i32,
-            a[3],
+            UserPtr::new(a[3]),
             a[4] as usize,
             a[5] as u32,
         )
@@ -1174,17 +1190,23 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
             crate::fs::syscall::sys_utimensat(a[0] as i32, a[1], a[2], a[3] as i32).ret() as u64
         }
         Sys::Vhangup => crate::tty::sys_vhangup().ret() as u64,
-        Sys::Vmsplice => {
-            crate::fs::splice::sys_vmsplice(a[0] as i32, a[1], a[2] as usize, a[3] as u32).ret()
-                as u64
-        }
+        Sys::Vmsplice => crate::fs::splice::sys_vmsplice(
+            a[0] as i32,
+            UserPtr::new(a[1]),
+            a[2] as usize,
+            a[3] as u32,
+        )
+        .ret() as u64,
         Sys::Wait4 => {
             crate::task::syscall::sys_wait4(i64::from(a[0] as i32), a[1], a[2] as i32, a[3]).ret()
                 as u64
         }
         Sys::Waitid => crate::task::syscall::sys_waitid(a[0] as i32, a[1], a[2], a[3] as i32, a[4])
             .ret() as u64,
-        Sys::Write => crate::fs::syscall::sys_write(a[0] as i32, a[1], a[2]).ret() as u64,
-        Sys::Writev => crate::fs::syscall::sys_writev(a[0] as i32, a[1], a[2] as i32).ret() as u64,
+        Sys::Write => {
+            crate::fs::syscall::sys_write(a[0] as i32, UserPtr::new(a[1]), a[2]).ret() as u64
+        }
+        Sys::Writev => crate::fs::syscall::sys_writev(a[0] as i32, UserPtr::new(a[1]), a[2] as i32)
+            .ret() as u64,
     }
 }

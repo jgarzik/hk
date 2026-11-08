@@ -4,9 +4,10 @@ use alloc::vec;
 
 use crate::arch::Uaccess;
 use crate::fs::{KernelError, RwFlags};
-use crate::uaccess::{UaccessArch, copy_from_user};
+use crate::uaccess::{UaccessArch, UserPtr, copy_from_user};
+use crate::util::error::KernelResult;
 
-use super::io::{do_readv, do_writev};
+use super::io::{do_readv, do_writev, pos_arg};
 use super::syscall::{
     IOV_MAX, MAX_RW_COUNT, RWF_APPEND, RWF_ATOMIC, RWF_DONTCACHE, RWF_DSYNC, RWF_NOAPPEND,
     RWF_NOWAIT, RWF_SUPPORTED, RWF_SYNC, sys_fsync,
@@ -87,55 +88,56 @@ pub fn import_iovec(iov_ptr: u64, iovcnt: i32) -> Result<alloc::vec::Vec<IoVec>,
     Ok(iovecs)
 }
 
-/// Offset argument of preadv/pwritev: negative is EINVAL
-fn pos_arg(offset: i64) -> Result<u64, i64> {
-    u64::try_from(offset).map_err(|_| KernelError::InvalidArgument.sysret())
-}
-
 /// sys_readv - scatter read at the file position
-pub fn sys_readv(fd: i32, iov_ptr: u64, iovcnt: i32) -> i64 {
-    match import_iovec(iov_ptr, iovcnt) {
-        Ok(v) => do_readv(fd, &v, None, RwFlags::empty()),
-        Err(e) => e.sysret(),
-    }
+pub fn sys_readv(fd: i32, iov: UserPtr<IoVec>, iovcnt: i32) -> KernelResult<usize> {
+    do_readv(
+        fd,
+        &import_iovec(iov.addr(), iovcnt)?,
+        None,
+        RwFlags::empty(),
+    )
 }
 
 /// sys_writev - gather write at the file position (one write: atomic
 /// for regular files like Linux)
-pub fn sys_writev(fd: i32, iov_ptr: u64, iovcnt: i32) -> i64 {
-    match import_iovec(iov_ptr, iovcnt) {
-        Ok(v) => do_writev(fd, &v, None, RwFlags::empty(), None),
-        Err(e) => e.sysret(),
-    }
+pub fn sys_writev(fd: i32, iov: UserPtr<IoVec>, iovcnt: i32) -> KernelResult<usize> {
+    do_writev(
+        fd,
+        &import_iovec(iov.addr(), iovcnt)?,
+        None,
+        RwFlags::empty(),
+        None,
+    )
 }
 
 /// sys_preadv - scatter read at an offset
-pub fn sys_preadv(fd: i32, iov_ptr: u64, iovcnt: i32, offset: i64) -> i64 {
-    match (
-        pos_arg(offset),
-        import_iovec(iov_ptr, iovcnt).map_err(KernelError::sysret),
-    ) {
-        (Ok(o), Ok(v)) => do_readv(fd, &v, Some(o), RwFlags::empty()),
-        (Err(e), _) | (_, Err(e)) => e,
-    }
+pub fn sys_preadv(fd: i32, iov: UserPtr<IoVec>, iovcnt: i32, offset: i64) -> KernelResult<usize> {
+    let at = pos_arg(offset)?;
+    do_readv(
+        fd,
+        &import_iovec(iov.addr(), iovcnt)?,
+        Some(at),
+        RwFlags::empty(),
+    )
 }
 
 /// sys_pwritev - gather write at an offset (O_APPEND still appends)
-pub fn sys_pwritev(fd: i32, iov_ptr: u64, iovcnt: i32, offset: i64) -> i64 {
-    match (
-        pos_arg(offset),
-        import_iovec(iov_ptr, iovcnt).map_err(KernelError::sysret),
-    ) {
-        (Ok(o), Ok(v)) => do_writev(fd, &v, Some(o), RwFlags::empty(), None),
-        (Err(e), _) | (_, Err(e)) => e,
-    }
+pub fn sys_pwritev(fd: i32, iov: UserPtr<IoVec>, iovcnt: i32, offset: i64) -> KernelResult<usize> {
+    let at = pos_arg(offset)?;
+    do_writev(
+        fd,
+        &import_iovec(iov.addr(), iovcnt)?,
+        Some(at),
+        RwFlags::empty(),
+        None,
+    )
 }
 
 /// RWF_* validation shared by preadv2/pwritev2: unknown or unsupported
 /// flags are EOPNOTSUPP
-fn rwf_check(flags: i32) -> Result<RwFlags, i64> {
+fn rwf_check(flags: i32) -> KernelResult<RwFlags> {
     if flags & !RWF_SUPPORTED != 0 || flags & (RWF_ATOMIC | RWF_DONTCACHE) != 0 {
-        return Err(KernelError::OperationNotSupported.sysret());
+        return Err(KernelError::OperationNotSupported);
     }
     Ok(if flags & RWF_NOWAIT != 0 {
         RwFlags::with_nowait()
@@ -145,7 +147,7 @@ fn rwf_check(flags: i32) -> Result<RwFlags, i64> {
 }
 
 /// Offset of preadv2/pwritev2: -1 is the file position
-fn pos2(offset: i64) -> Result<Option<u64>, i64> {
+fn pos2(offset: i64) -> KernelResult<Option<u64>> {
     if offset == -1 {
         Ok(None)
     } else {
@@ -154,18 +156,27 @@ fn pos2(offset: i64) -> Result<Option<u64>, i64> {
 }
 
 /// sys_preadv2 - preadv with RWF_* flags (offset -1: file position)
-pub fn sys_preadv2(fd: i32, iov_ptr: u64, iovcnt: i32, offset: i64, flags: i32) -> i64 {
-    let r = rwf_check(flags).and_then(|f| {
-        let at = pos2(offset)?;
-        let v = import_iovec(iov_ptr, iovcnt).map_err(KernelError::sysret)?;
-        Ok(do_readv(fd, &v, at, f))
-    });
-    r.unwrap_or_else(|e| e)
+pub fn sys_preadv2(
+    fd: i32,
+    iov: UserPtr<IoVec>,
+    iovcnt: i32,
+    offset: i64,
+    flags: i32,
+) -> KernelResult<usize> {
+    let f = rwf_check(flags)?;
+    let at = pos2(offset)?;
+    do_readv(fd, &import_iovec(iov.addr(), iovcnt)?, at, f)
 }
 
 /// sys_pwritev2 - pwritev with RWF_* flags (offset -1: file position;
 /// RWF_APPEND / RWF_NOAPPEND override O_APPEND; RWF_SYNC/DSYNC sync)
-pub fn sys_pwritev2(fd: i32, iov_ptr: u64, iovcnt: i32, offset: i64, flags: i32) -> i64 {
+pub fn sys_pwritev2(
+    fd: i32,
+    iov: UserPtr<IoVec>,
+    iovcnt: i32,
+    offset: i64,
+    flags: i32,
+) -> KernelResult<usize> {
     let append = if flags & RWF_APPEND != 0 {
         Some(true)
     } else if flags & RWF_NOAPPEND != 0 {
@@ -173,14 +184,11 @@ pub fn sys_pwritev2(fd: i32, iov_ptr: u64, iovcnt: i32, offset: i64, flags: i32)
     } else {
         None
     };
-    let r = rwf_check(flags).and_then(|f| {
-        let at = pos2(offset)?;
-        let v = import_iovec(iov_ptr, iovcnt).map_err(KernelError::sysret)?;
-        Ok(do_writev(fd, &v, at, f, append))
-    });
-    let n = r.unwrap_or_else(|e| e);
+    let f = rwf_check(flags)?;
+    let at = pos2(offset)?;
+    let n = do_writev(fd, &import_iovec(iov.addr(), iovcnt)?, at, f, append)?;
     if n > 0 && flags & (RWF_SYNC | RWF_DSYNC) != 0 {
         let _ = sys_fsync(fd);
     }
-    n
+    Ok(n)
 }

@@ -5,7 +5,8 @@ use alloc::sync::Arc;
 
 use crate::arch::Uaccess;
 use crate::fs::{File, KernelError, RwFlags};
-use crate::uaccess::UaccessArch;
+use crate::uaccess::{UaccessArch, UserPtr};
+use crate::util::error::KernelResult;
 
 use super::iov_iter::{IovDest, IovSource};
 
@@ -81,35 +82,27 @@ pub fn verify_area(file: &File, at: Option<u64>, count: usize) -> Result<(), Ker
 /// errno for a failed read/write: no access is EBADF, a missing op is
 /// ESPIPE for positioned I/O and EINVAL otherwise (EOPNOTSUPP stays for
 /// RWF_NOWAIT)
-fn rw_err(e: KernelError, at: Option<u64>, flags: RwFlags) -> i64 {
+fn rw_err(e: KernelError, at: Option<u64>, flags: RwFlags) -> KernelError {
     match e {
-        KernelError::PermissionDenied => KernelError::BadFd.sysret(),
+        KernelError::PermissionDenied => KernelError::BadFd,
         KernelError::OperationNotSupported if !flags.nowait => match at {
-            Some(_) => KernelError::IllegalSeek.sysret(),
-            None => KernelError::InvalidArgument.sysret(),
+            Some(_) => KernelError::IllegalSeek,
+            None => KernelError::InvalidArgument,
         },
-        e => e.sysret(),
+        e => e,
     }
 }
 
 /// Read from `fd` into `segs` at `at`, or at the file position (under
 /// f_pos_lock, Linux fdget_pos) when None (Linux vfs_readv)
-pub fn do_readv(fd: i32, segs: &[IoVec], at: Option<u64>, flags: RwFlags) -> i64 {
-    let file = match fget(fd) {
-        Ok(f) => f,
-        Err(e) => return e.sysret(),
-    };
+pub fn do_readv(fd: i32, segs: &[IoVec], at: Option<u64>, flags: RwFlags) -> KernelResult<usize> {
+    let file = fget(fd)?;
     if file.is_dir() {
-        return KernelError::IsDirectory.sysret();
+        return Err(KernelError::IsDirectory);
     }
     let _pos = at.is_none().then(|| file.pos_lock());
-    if let Err(e) = verify_area(&file, at, seg_len(segs)) {
-        return e.sysret();
-    }
-    match file_readv(&file, segs, at, flags) {
-        Ok(n) => n as i64,
-        Err(e) => rw_err(e, at, flags),
-    }
+    verify_area(&file, at, seg_len(segs))?;
+    file_readv(&file, segs, at, flags).map_err(|e| rw_err(e, at, flags))
 }
 
 /// Write `segs` to `fd` as one write at `at`, or at the file position
@@ -121,22 +114,14 @@ pub fn do_writev(
     at: Option<u64>,
     flags: RwFlags,
     append: Option<bool>,
-) -> i64 {
-    let file = match fget(fd) {
-        Ok(f) => f,
-        Err(e) => return e.sysret(),
-    };
+) -> KernelResult<usize> {
+    let file = fget(fd)?;
     if file.is_dir() {
-        return KernelError::IsDirectory.sysret();
+        return Err(KernelError::IsDirectory);
     }
     let _pos = at.is_none().then(|| file.pos_lock());
-    if let Err(e) = verify_area(&file, at, seg_len(segs)) {
-        return e.sysret();
-    }
-    match file_writev(&file, segs, at, flags, append) {
-        Ok(n) => n as i64,
-        Err(e) => rw_err(e, at, flags),
-    }
+    verify_area(&file, at, seg_len(segs))?;
+    file_writev(&file, segs, at, flags, append).map_err(|e| rw_err(e, at, flags))
 }
 
 /// One user buffer as a segment, cut to MAX_RW_COUNT, after the EFAULT
@@ -152,59 +137,57 @@ pub fn import_ubuf(buf: u64, count: u64) -> Result<[IoVec; 1], KernelError> {
     }])
 }
 
-/// [`import_ubuf`] with the errno
-fn one_seg(buf: u64, count: u64) -> Result<[IoVec; 1], i64> {
-    import_ubuf(buf, count).map_err(KernelError::sysret)
-}
-
 /// Explicit offset of pread/pwrite: negative is EINVAL
-fn pos_arg(offset: i64) -> Result<u64, i64> {
-    u64::try_from(offset).map_err(|_| KernelError::InvalidArgument.sysret())
+pub(super) fn pos_arg(offset: i64) -> KernelResult<u64> {
+    u64::try_from(offset).map_err(|_| KernelError::InvalidArgument)
 }
 
 /// sys_read - read from a file descriptor
-pub fn sys_read(fd: i32, buf: u64, count: u64) -> i64 {
-    match one_seg(buf, count) {
-        Ok(s) => do_readv(fd, &s, None, RwFlags::empty()),
-        Err(e) => e,
-    }
+pub fn sys_read(fd: i32, buf: UserPtr<u8>, count: u64) -> KernelResult<usize> {
+    do_readv(fd, &import_ubuf(buf.addr(), count)?, None, RwFlags::empty())
 }
 
 /// sys_write - write to a file descriptor
-pub fn sys_write(fd: i32, buf: u64, count: u64) -> i64 {
-    match one_seg(buf, count) {
-        Ok(s) => do_writev(fd, &s, None, RwFlags::empty(), None),
-        Err(e) => e,
-    }
+pub fn sys_write(fd: i32, buf: UserPtr<u8>, count: u64) -> KernelResult<usize> {
+    do_writev(
+        fd,
+        &import_ubuf(buf.addr(), count)?,
+        None,
+        RwFlags::empty(),
+        None,
+    )
 }
 
 /// sys_pread64 - read at an offset without moving the file position
-pub fn sys_pread64(fd: i32, buf: u64, count: u64, offset: i64) -> i64 {
-    match (pos_arg(offset), one_seg(buf, count)) {
-        (Ok(o), Ok(s)) => do_readv(fd, &s, Some(o), RwFlags::empty()),
-        (Err(e), _) | (_, Err(e)) => e,
-    }
+pub fn sys_pread64(fd: i32, buf: UserPtr<u8>, count: u64, offset: i64) -> KernelResult<usize> {
+    let at = pos_arg(offset)?;
+    do_readv(
+        fd,
+        &import_ubuf(buf.addr(), count)?,
+        Some(at),
+        RwFlags::empty(),
+    )
 }
 
 /// sys_pwrite64 - write at an offset without moving the file position
 /// (an O_APPEND file still appends, like Linux)
-pub fn sys_pwrite64(fd: i32, buf: u64, count: u64, offset: i64) -> i64 {
-    match (pos_arg(offset), one_seg(buf, count)) {
-        (Ok(o), Ok(s)) => do_writev(fd, &s, Some(o), RwFlags::empty(), None),
-        (Err(e), _) | (_, Err(e)) => e,
-    }
+pub fn sys_pwrite64(fd: i32, buf: UserPtr<u8>, count: u64, offset: i64) -> KernelResult<usize> {
+    let at = pos_arg(offset)?;
+    do_writev(
+        fd,
+        &import_ubuf(buf.addr(), count)?,
+        Some(at),
+        RwFlags::empty(),
+        None,
+    )
 }
 
 /// sys_lseek - reposition the file offset (under f_pos_lock)
-pub fn sys_lseek(fd: i32, offset: i64, whence: i32) -> i64 {
-    let file = match fget(fd) {
-        Ok(f) => f,
-        Err(e) => return e.sysret(),
-    };
+pub fn sys_lseek(fd: i32, offset: i64, whence: i32) -> KernelResult<u64> {
+    let file = fget(fd)?;
     let _pos = file.pos_lock();
-    match file.lseek(offset, whence) {
-        Ok(new_pos) => new_pos as i64,
-        Err(KernelError::OperationNotSupported) => KernelError::IllegalSeek.sysret(),
-        Err(e) => e.sysret(),
-    }
+    file.lseek(offset, whence).map_err(|e| match e {
+        KernelError::OperationNotSupported => KernelError::IllegalSeek,
+        e => e,
+    })
 }
