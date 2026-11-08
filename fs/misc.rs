@@ -270,7 +270,7 @@ pub fn sys_mount(
     } else {
         Default::default()
     };
-    let target = crate::fs::namei::getname(target_ptr.addr(), false)?;
+    let target = crate::fs::namei::getname(target_ptr, false)?;
     // A mount may cover a file (bind): the target is only followed
     let mp = crate::fs::namei::path_lookupat(
         crate::task::percpu::current_cwd(),
@@ -391,7 +391,7 @@ pub fn sys_umount2(target_ptr: UserPtr<u8>, flags: i32) -> KernelResult<()> {
     if flags & !(MNT_FORCE | MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW) != 0 {
         return Err(KernelError::InvalidArgument);
     }
-    let target = crate::fs::namei::getname(target_ptr.addr(), false)?;
+    let target = crate::fs::namei::getname(target_ptr, false)?;
     let lf = LookupFlags {
         follow: flags & UMOUNT_NOFOLLOW == 0,
         ..LookupFlags::open()
@@ -414,7 +414,7 @@ pub fn sys_pivot_root(new_root_ptr: UserPtr<u8>, put_old_ptr: UserPtr<u8>) -> Ke
         return Err(KernelError::NotPermitted);
     }
     let dir = |p: UserPtr<u8>| {
-        let name = crate::fs::namei::getname(p.addr(), false)?;
+        let name = crate::fs::namei::getname(p, false)?;
         crate::fs::namei::path_lookupat(
             crate::task::percpu::current_cwd(),
             &name,
@@ -637,7 +637,7 @@ fn do_setxattr(
     follow: bool,
 ) -> KernelResult<()> {
     xattr_flags_ok(flags)?;
-    let path = crate::fs::namei::getname(path_ptr.addr(), false)?;
+    let path = crate::fs::namei::getname(path_ptr, false)?;
     let name = xattr_name(name_ptr)?;
     let value = copy_xattr_value_from_user(value_ptr, size)?;
     let fpath = crate::fs::namei::path_lookupat(
@@ -735,7 +735,7 @@ fn do_getxattr(
     size: u64,
     follow: bool,
 ) -> KernelResult<usize> {
-    let path = crate::fs::namei::getname(path_ptr.addr(), false)?;
+    let path = crate::fs::namei::getname(path_ptr, false)?;
     let name = xattr_name(name_ptr)?;
     let dentry = lookup_path_flags(&path, xattr_lookup(follow))?;
     let inode = dentry.get_inode().ok_or(KernelError::NotFound)?;
@@ -805,7 +805,7 @@ fn do_listxattr(
     size: u64,
     follow: bool,
 ) -> KernelResult<usize> {
-    let path = crate::fs::namei::getname(path_ptr.addr(), false)?;
+    let path = crate::fs::namei::getname(path_ptr, false)?;
     let dentry = lookup_path_flags(&path, xattr_lookup(follow))?;
     let inode = dentry.get_inode().ok_or(KernelError::NotFound)?;
     listxattr_inode(&inode, list_ptr, size)
@@ -839,7 +839,7 @@ pub fn sys_lremovexattr(path_ptr: UserPtr<u8>, name_ptr: UserPtr<u8>) -> KernelR
 
 /// Internal helper for removexattr/lremovexattr
 fn do_removexattr(path_ptr: UserPtr<u8>, name_ptr: UserPtr<u8>, follow: bool) -> KernelResult<()> {
-    let path = crate::fs::namei::getname(path_ptr.addr(), false)?;
+    let path = crate::fs::namei::getname(path_ptr, false)?;
     let name = xattr_name(name_ptr)?;
     let fpath = crate::fs::namei::path_lookupat(
         crate::task::percpu::current_cwd(),

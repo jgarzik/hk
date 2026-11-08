@@ -106,7 +106,7 @@ pub fn sys_truncate(path_ptr: UserPtr<u8>, length: i64) -> KernelResult<()> {
     if length < 0 {
         return Err(KernelError::InvalidArgument);
     }
-    let path = crate::fs::namei::getname(path_ptr.addr(), false)?;
+    let path = crate::fs::namei::getname(path_ptr, false)?;
 
     // Look up the file (follow symlinks for truncate)
     let fpath = crate::fs::namei::path_lookupat(

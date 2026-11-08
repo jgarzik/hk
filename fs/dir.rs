@@ -177,7 +177,7 @@ pub fn sys_mkdir(pathname_ptr: UserPtr<u8>, mode: u32) -> KernelResult<()> {
 /// * `mode` - Permission bits for the new directory
 ///
 pub fn sys_mkdirat(dirfd: i32, pathname_ptr: UserPtr<u8>, mode: u32) -> KernelResult<()> {
-    let p = filename_create(dirfd, &getname(pathname_ptr.addr(), false)?, true)?;
+    let p = filename_create(dirfd, &getname(pathname_ptr, false)?, true)?;
     // vfs_mkdir: permission and sticky bits only, then umask; init_owner
     // adds S_ISGID under a SGID parent
     create_entry(&p, |dir, c| {
@@ -190,7 +190,7 @@ pub fn sys_mkdirat(dirfd: i32, pathname_ptr: UserPtr<u8>, mode: u32) -> KernelRe
 
 /// sys_rmdir - remove an empty directory
 pub fn sys_rmdir(pathname_ptr: UserPtr<u8>) -> KernelResult<()> {
-    do_rmdir(AT_FDCWD, &getname(pathname_ptr.addr(), false)?)
+    do_rmdir(AT_FDCWD, &getname(pathname_ptr, false)?)
 }
 
 /// rmdir / unlinkat(AT_REMOVEDIR) (Linux do_rmdir): a last name of ".."
@@ -235,7 +235,7 @@ pub fn sys_mknodat(dirfd: i32, pathname_ptr: UserPtr<u8>, mode: u32, dev: u64) -
         _ => return Err(KernelError::InvalidArgument),
     };
 
-    let p = filename_create(dirfd, &getname(pathname_ptr.addr(), false)?, false)?;
+    let p = filename_create(dirfd, &getname(pathname_ptr, false)?, false)?;
     let name = p.name.as_slice();
     create_entry(&p, |dir, c| {
         if is_dev && !dac::capable(c, CAP_MKNOD) {

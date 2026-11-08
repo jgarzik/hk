@@ -932,7 +932,7 @@ pub fn sys_inotify_add_watch(fd: i32, pathname_ptr: UserPtr<u8>, mask: u32) -> K
     }
 
     let inotify = inotify_of(fd)?;
-    let pathname = crate::fs::namei::getname(pathname_ptr.addr(), false)?;
+    let pathname = crate::fs::namei::getname(pathname_ptr, false)?;
 
     // Resolve the path, held until the watch is on
     let path = resolve_path(&pathname, mask)?;

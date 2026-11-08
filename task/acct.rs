@@ -256,7 +256,7 @@ pub fn sys_acct(filename: UserPtr<u8>) -> KernelResult<()> {
     }
 
     // Copy filename from user, open the file for appending
-    let filename = crate::fs::namei::getname(filename.addr(), false)?;
+    let filename = crate::fs::namei::getname(filename, false)?;
     set_acct_file(Some(open_acct_file(&filename)?));
     Ok(())
 }

@@ -611,7 +611,7 @@ impl IoUring {
             return KernelError::InvalidArgument.to_errno_neg();
         }
 
-        match crate::fs::io::import_ubuf(buf_addr, len as u64) {
+        match crate::fs::io::import_ubuf(UserPtr::new(buf_addr), len as u64) {
             Ok(seg) => rw_one(&file, &seg, offset, false),
             Err(e) => e.to_errno_neg(),
         }
@@ -647,7 +647,7 @@ impl IoUring {
             return KernelError::InvalidArgument.to_errno_neg();
         }
 
-        match crate::fs::io::import_ubuf(buf_addr, len as u64) {
+        match crate::fs::io::import_ubuf(UserPtr::new(buf_addr), len as u64) {
             Ok(seg) => rw_one(&file, &seg, offset, true),
             Err(e) => e.to_errno_neg(),
         }
@@ -1228,7 +1228,7 @@ fn create_io_uring_file(ring: Arc<IoUring>) -> Result<Arc<File>, KernelError> {
 /// io_import_iovec -> __import_iovec)
 fn read_user_iovecs(iov_addr: u64, n: usize) -> Result<Vec<IoVec>, KernelError> {
     let n = i32::try_from(n).map_err(|_| KernelError::InvalidArgument)?;
-    crate::fs::iov::import_iovec(iov_addr, n)
+    crate::fs::iov::import_iovec(UserPtr::new(iov_addr), n)
 }
 
 /// Read or write `segs` at `offset` (u64::MAX: the file position, under

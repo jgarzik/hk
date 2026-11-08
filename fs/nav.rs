@@ -22,7 +22,7 @@ fn may_chdir(d: &Dentry) -> Result<(), KernelError> {
 
 /// The searchable directory `path_ptr` names, from the cwd
 fn chdir_target(path_ptr: UserPtr<u8>) -> KernelResult<Path> {
-    let name = getname(path_ptr.addr(), false)?;
+    let name = getname(path_ptr, false)?;
     let path = path_lookupat(current_cwd(), &name, LookupFlags::opendir())?;
     may_chdir(&path.dentry)?;
     Ok(path)

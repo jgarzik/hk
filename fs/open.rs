@@ -127,7 +127,7 @@ fn open_target(
 /// # Returns
 /// The new file descriptor
 pub fn sys_openat(dirfd: i32, path_ptr: UserPtr<u8>, flags: u32, mode: u32) -> KernelResult<i32> {
-    let path = getname(path_ptr.addr(), false)?;
+    let path = getname(path_ptr, false)?;
     let file = filp_open(dirfd, &path, flags, mode)?;
 
     // Allocate file descriptor (RLIMIT_NOFILE enforced inside alloc)

@@ -651,7 +651,7 @@ pub fn sys_fanotify_mark(
     if pathname.is_null() {
         return Err(KernelError::InvalidArgument);
     }
-    let pathname_str = crate::fs::namei::getname(pathname.addr(), false)?;
+    let pathname_str = crate::fs::namei::getname(pathname, false)?;
 
     // Get starting directory
     let start: Option<Path> = if pathname_str.starts_with(b"/") {

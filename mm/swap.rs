@@ -458,7 +458,7 @@ fn write_page(entry: SwapEntry, frame_phys: u64) -> KernelResult<()> {
 
 /// The path argument of swapon/swapoff
 fn user_path(p: UserPtr<u8>) -> KernelResult<alloc::vec::Vec<u8>> {
-    crate::fs::namei::getname(p.addr(), false)
+    crate::fs::namei::getname(p, false)
 }
 
 /// The slots of the area whose header page is `hdr` on a file or

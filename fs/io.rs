@@ -125,13 +125,13 @@ pub fn do_writev(
 
 /// One user buffer as a segment, cut to MAX_RW_COUNT, after the EFAULT
 /// check (Linux import_ubuf)
-pub fn import_ubuf(buf: u64, count: u64) -> Result<[IoVec; 1], KernelError> {
+pub fn import_ubuf(buf: UserPtr<u8>, count: u64) -> Result<[IoVec; 1], KernelError> {
     let count = (count as usize).min(MAX_RW_COUNT);
-    if !Uaccess::access_ok(buf, count) {
+    if !Uaccess::access_ok(buf.addr(), count) {
         return Err(KernelError::BadAddress);
     }
     Ok([IoVec {
-        iov_base: buf,
+        iov_base: buf.addr(),
         iov_len: count as u64,
     }])
 }
@@ -143,29 +143,18 @@ pub(super) fn pos_arg(offset: i64) -> KernelResult<u64> {
 
 /// sys_read - read from a file descriptor
 pub fn sys_read(fd: i32, buf: UserPtr<u8>, count: u64) -> KernelResult<usize> {
-    do_readv(fd, &import_ubuf(buf.addr(), count)?, None, RwFlags::empty())
+    do_readv(fd, &import_ubuf(buf, count)?, None, RwFlags::empty())
 }
 
 /// sys_write - write to a file descriptor
 pub fn sys_write(fd: i32, buf: UserPtr<u8>, count: u64) -> KernelResult<usize> {
-    do_writev(
-        fd,
-        &import_ubuf(buf.addr(), count)?,
-        None,
-        RwFlags::empty(),
-        None,
-    )
+    do_writev(fd, &import_ubuf(buf, count)?, None, RwFlags::empty(), None)
 }
 
 /// sys_pread64 - read at an offset without moving the file position
 pub fn sys_pread64(fd: i32, buf: UserPtr<u8>, count: u64, offset: i64) -> KernelResult<usize> {
     let at = pos_arg(offset)?;
-    do_readv(
-        fd,
-        &import_ubuf(buf.addr(), count)?,
-        Some(at),
-        RwFlags::empty(),
-    )
+    do_readv(fd, &import_ubuf(buf, count)?, Some(at), RwFlags::empty())
 }
 
 /// sys_pwrite64 - write at an offset without moving the file position
@@ -174,7 +163,7 @@ pub fn sys_pwrite64(fd: i32, buf: UserPtr<u8>, count: u64, offset: i64) -> Kerne
     let at = pos_arg(offset)?;
     do_writev(
         fd,
-        &import_ubuf(buf.addr(), count)?,
+        &import_ubuf(buf, count)?,
         Some(at),
         RwFlags::empty(),
         None,

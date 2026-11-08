@@ -51,8 +51,8 @@ pub fn sys_symlinkat(
     newdirfd: i32,
     linkpath_ptr: UserPtr<u8>,
 ) -> KernelResult<()> {
-    let target = getname(target_ptr.addr(), false)?;
-    let p = filename_create(newdirfd, &getname(linkpath_ptr.addr(), false)?, false)?;
+    let target = getname(target_ptr, false)?;
+    let p = filename_create(newdirfd, &getname(linkpath_ptr, false)?, false)?;
     create_entry(&p, |dir, _| dir.i_op.symlink(dir, &p.name, &target)).map_err(no_op_eperm)?;
     Ok(())
 }
@@ -113,7 +113,7 @@ pub fn sys_readlinkat(
     if bufsiz <= 0 {
         return Err(KernelError::InvalidArgument);
     }
-    let path = getname(path_ptr.addr(), true)?;
+    let path = getname(path_ptr, true)?;
     let dentry = filename_lookup(
         dirfd,
         &path,
@@ -177,7 +177,7 @@ fn link_locked(dir: &Arc<Inode>, name: &[u8], inode: &Arc<Inode>) -> Result<(), 
 /// the caller's (LookupFlags::linkat_empty); the final symlink is
 /// followed only with AT_SYMLINK_FOLLOW
 fn link_source(dirfd: i32, path_ptr: UserPtr<u8>, flags: i32) -> KernelResult<Path> {
-    let path = getname(path_ptr.addr(), flags & AT_EMPTY_PATH != 0)?;
+    let path = getname(path_ptr, flags & AT_EMPTY_PATH != 0)?;
     let lf = LookupFlags {
         follow: flags & AT_SYMLINK_FOLLOW != 0,
         linkat_empty: flags & AT_EMPTY_PATH != 0,
@@ -208,7 +208,7 @@ pub fn sys_linkat(
     }
     let old = link_source(olddirfd, oldpath_ptr, flags)?;
     let old_inode = old.dentry.get_inode().ok_or(KernelError::NotFound)?;
-    let p = filename_create(newdirfd, &getname(newpath_ptr.addr(), false)?, false)?;
+    let p = filename_create(newdirfd, &getname(newpath_ptr, false)?, false)?;
     // EXDEV across mounts, even of one superblock
     if !Arc::ptr_eq(&old.mnt, &p.mnt) {
         return Err(KernelError::CrossDevice);
@@ -260,7 +260,7 @@ pub fn sys_unlinkat(dirfd: i32, pathname_ptr: UserPtr<u8>, flags: i32) -> Kernel
     if flags & !AT_REMOVEDIR != 0 {
         return Err(KernelError::InvalidArgument);
     }
-    let path = getname(pathname_ptr.addr(), false)?;
+    let path = getname(pathname_ptr, false)?;
     if flags & AT_REMOVEDIR != 0 {
         return super::dir::do_rmdir(dirfd, &path);
     }
@@ -353,8 +353,8 @@ fn do_renameat2(
     if !rename_flags_ok(flags) {
         return Err(KernelError::InvalidArgument);
     }
-    let newpath = getname(newpath_ptr.addr(), false);
-    let old = filename_parentat(olddirfd, &getname(oldpath_ptr.addr(), false)?)?;
+    let newpath = getname(newpath_ptr, false);
+    let old = filename_parentat(olddirfd, &getname(oldpath_ptr, false)?)?;
     let new = filename_parentat(newdirfd, &newpath?)?;
     if !Arc::ptr_eq(&old.mnt, &new.mnt) {
         return Err(KernelError::CrossDevice);

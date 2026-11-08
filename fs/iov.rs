@@ -31,7 +31,11 @@ crate::pod!(IoVec { iov_base, iov_len });
 /// in total (Linux import_iovec): EINVAL for a count outside
 /// 0..=IOV_MAX or a length negative as ssize_t, EFAULT for a bad array
 /// or buffer
-pub fn import_iovec(iov_ptr: u64, iovcnt: i32) -> Result<alloc::vec::Vec<IoVec>, KernelError> {
+pub fn import_iovec(
+    iov: UserPtr<IoVec>,
+    iovcnt: i32,
+) -> Result<alloc::vec::Vec<IoVec>, KernelError> {
+    let iov_ptr = iov.addr();
     // Check iovcnt bounds
     if iovcnt < 0 {
         return Err(KernelError::InvalidArgument);
@@ -90,12 +94,7 @@ pub fn import_iovec(iov_ptr: u64, iovcnt: i32) -> Result<alloc::vec::Vec<IoVec>,
 
 /// sys_readv - scatter read at the file position
 pub fn sys_readv(fd: i32, iov: UserPtr<IoVec>, iovcnt: i32) -> KernelResult<usize> {
-    do_readv(
-        fd,
-        &import_iovec(iov.addr(), iovcnt)?,
-        None,
-        RwFlags::empty(),
-    )
+    do_readv(fd, &import_iovec(iov, iovcnt)?, None, RwFlags::empty())
 }
 
 /// sys_writev - gather write at the file position (one write: atomic
@@ -103,7 +102,7 @@ pub fn sys_readv(fd: i32, iov: UserPtr<IoVec>, iovcnt: i32) -> KernelResult<usiz
 pub fn sys_writev(fd: i32, iov: UserPtr<IoVec>, iovcnt: i32) -> KernelResult<usize> {
     do_writev(
         fd,
-        &import_iovec(iov.addr(), iovcnt)?,
+        &import_iovec(iov, iovcnt)?,
         None,
         RwFlags::empty(),
         None,
@@ -113,12 +112,7 @@ pub fn sys_writev(fd: i32, iov: UserPtr<IoVec>, iovcnt: i32) -> KernelResult<usi
 /// sys_preadv - scatter read at an offset
 pub fn sys_preadv(fd: i32, iov: UserPtr<IoVec>, iovcnt: i32, offset: i64) -> KernelResult<usize> {
     let at = pos_arg(offset)?;
-    do_readv(
-        fd,
-        &import_iovec(iov.addr(), iovcnt)?,
-        Some(at),
-        RwFlags::empty(),
-    )
+    do_readv(fd, &import_iovec(iov, iovcnt)?, Some(at), RwFlags::empty())
 }
 
 /// sys_pwritev - gather write at an offset (O_APPEND still appends)
@@ -126,7 +120,7 @@ pub fn sys_pwritev(fd: i32, iov: UserPtr<IoVec>, iovcnt: i32, offset: i64) -> Ke
     let at = pos_arg(offset)?;
     do_writev(
         fd,
-        &import_iovec(iov.addr(), iovcnt)?,
+        &import_iovec(iov, iovcnt)?,
         Some(at),
         RwFlags::empty(),
         None,
@@ -165,7 +159,7 @@ pub fn sys_preadv2(
 ) -> KernelResult<usize> {
     let f = rwf_check(flags)?;
     let at = pos2(offset)?;
-    do_readv(fd, &import_iovec(iov.addr(), iovcnt)?, at, f)
+    do_readv(fd, &import_iovec(iov, iovcnt)?, at, f)
 }
 
 /// sys_pwritev2 - pwritev with RWF_* flags (offset -1: file position;
@@ -186,7 +180,7 @@ pub fn sys_pwritev2(
     };
     let f = rwf_check(flags)?;
     let at = pos2(offset)?;
-    let n = do_writev(fd, &import_iovec(iov.addr(), iovcnt)?, at, f, append)?;
+    let n = do_writev(fd, &import_iovec(iov, iovcnt)?, at, f, append)?;
     if n > 0 && flags & (RWF_SYNC | RWF_DSYNC) != 0 {
         let _ = sys_fsync(fd);
     }

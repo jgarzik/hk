@@ -72,7 +72,7 @@ fn process_vm_rw(
     // import_iovec takes the count as an unsigned int: truncated on
     // purpose, as in Linux; above IOV_MAX it is EINVAL either way
     let lcnt = i32::try_from(liovcnt as u32).unwrap_or(-1);
-    let local = import_iovec(lvec.addr(), lcnt)?;
+    let local = import_iovec(lvec, lcnt)?;
     if local.iter().all(|v| v.iov_len == 0) {
         return Ok(0);
     }

@@ -678,7 +678,7 @@ pub fn sys_vmsplice(
     // The segments as readv takes them (Linux import_iovec): EINVAL
     // past IOV_MAX or for a negative length, cut to MAX_RW_COUNT
     let n = i32::try_from(nr_segs).map_err(|_| KernelError::InvalidArgument)?;
-    let segs = crate::fs::iov::import_iovec(iov.addr(), n)?;
+    let segs = crate::fs::iov::import_iovec(iov, n)?;
     let pipe = pipe_of_file(&file).ok_or(KernelError::InvalidArgument)?;
     if !file.is_writable() {
         return Err(KernelError::BadFd);

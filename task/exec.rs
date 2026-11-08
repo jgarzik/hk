@@ -1303,7 +1303,7 @@ pub fn sys_execve(
     argv: UserPtr<u64>,
     envp: UserPtr<u64>,
 ) -> KernelResult<i64> {
-    let path = crate::fs::namei::getname(pathname.addr(), false)?;
+    let path = crate::fs::namei::getname(pathname, false)?;
     let (argv, envp) = copy_args(&path, argv, envp)?;
     let mut frame_alloc = crate::mm::frame_alloc::FrameAllocRef(&crate::FRAME_ALLOCATOR);
     match do_execve(path, argv, envp, &mut frame_alloc)? {}
@@ -1330,7 +1330,7 @@ pub fn sys_execveat(
     if flags & !(AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW) != 0 {
         return Err(KernelError::InvalidArgument);
     }
-    let path = crate::fs::namei::getname(pathname.addr(), flags & AT_EMPTY_PATH != 0)?;
+    let path = crate::fs::namei::getname(pathname, flags & AT_EMPTY_PATH != 0)?;
     let name = exec_name(dirfd, &path);
     let (argv, envp) = copy_args(&name, argv, envp)?;
     // Linux BINPRM_FLAGS_PATH_INACCESSIBLE: the program came through a

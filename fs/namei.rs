@@ -406,12 +406,13 @@ pub fn delete_entry(p: &Parent, isdir: bool) -> Result<(), KernelError> {
 /// Copy a path name in (Linux getname_flags): EFAULT for a bad pointer,
 /// ENAMETOOLONG without a NUL in PATH_MAX bytes, ENOENT for an empty name
 /// unless `empty_ok` (AT_EMPTY_PATH)
-pub fn getname(ptr: u64, empty_ok: bool) -> Result<Vec<u8>, KernelError> {
+pub fn getname(ptr: UserPtr<u8>, empty_ok: bool) -> Result<Vec<u8>, KernelError> {
     use crate::uaccess::{UaccessError, strndup_user_bytes};
-    let name = strndup_user_bytes::<crate::arch::Uaccess>(ptr, PATH_MAX).map_err(|e| match e {
-        UaccessError::TooLong => KernelError::NameTooLong,
-        _ => KernelError::BadAddress,
-    })?;
+    let name =
+        strndup_user_bytes::<crate::arch::Uaccess>(ptr.addr(), PATH_MAX).map_err(|e| match e {
+            UaccessError::TooLong => KernelError::NameTooLong,
+            _ => KernelError::BadAddress,
+        })?;
     if name.is_empty() && !empty_ok {
         return Err(KernelError::NotFound);
     }
@@ -425,7 +426,7 @@ pub fn getname_maybe_null(ptr: UserPtr<u8>, at: i32) -> Result<Vec<u8>, KernelEr
     if ptr.is_null() && empty_ok {
         return Ok(Vec::new());
     }
-    getname(ptr.addr(), empty_ok)
+    getname(ptr, empty_ok)
 }
 
 /// Where a walk of `path` starts (Linux path_init): an absolute path at
@@ -488,7 +489,7 @@ pub fn user_path_at(
     flags: LookupFlags,
     empty_ok: bool,
 ) -> Result<Path, KernelError> {
-    filename_lookup(dirfd, &getname(ptr.addr(), empty_ok)?, flags)
+    filename_lookup(dirfd, &getname(ptr, empty_ok)?, flags)
 }
 
 /// What the last component of a path is (Linux enum last_type)
