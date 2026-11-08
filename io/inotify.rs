@@ -919,13 +919,13 @@ pub fn sys_inotify_init1(in_flags: i32) -> i64 {
     // Create inotify file
     let file = match create_inotify(in_flags) {
         Ok(f) => f,
-        Err(_) => return -12, // ENOMEM
+        Err(_) => return KernelError::OutOfMemory.sysret(),
     };
 
     // Allocate fd
     let fd_table = match get_task_fd(current_tid()) {
         Some(t) => t,
-        None => return -24, // EMFILE
+        None => return KernelError::ProcessFileLimit.sysret(),
     };
 
     let mut table = fd_table.lock();
@@ -969,19 +969,19 @@ pub fn sys_inotify_add_watch(fd: i32, pathname_ptr: u64, mask: u32) -> i64 {
     // Get fd table
     let fd_table = match get_task_fd(current_tid()) {
         Some(t) => t,
-        None => return -9, // EBADF
+        None => return KernelError::BadFd.sysret(),
     };
 
     // Get file
     let file = match fd_table.lock().get(fd) {
         Some(f) => f,
-        None => return -9, // EBADF
+        None => return KernelError::BadFd.sysret(),
     };
 
     // Verify it's an inotify fd
     let inotify = match get_inotify(&file) {
         Some(i) => i,
-        None => return -22, // EINVAL
+        None => return KernelError::InvalidArgument.sysret(),
     };
 
     // Copy pathname from user
@@ -1016,19 +1016,19 @@ pub fn sys_inotify_rm_watch(fd: i32, wd: i32) -> i64 {
     // Get fd table
     let fd_table = match get_task_fd(current_tid()) {
         Some(t) => t,
-        None => return -9, // EBADF
+        None => return KernelError::BadFd.sysret(),
     };
 
     // Get file
     let file = match fd_table.lock().get(fd) {
         Some(f) => f,
-        None => return -9, // EBADF
+        None => return KernelError::BadFd.sysret(),
     };
 
     // Verify it's an inotify fd
     let inotify = match get_inotify(&file) {
         Some(i) => i,
-        None => return -22, // EINVAL
+        None => return KernelError::InvalidArgument.sysret(),
     };
 
     // Remove watch

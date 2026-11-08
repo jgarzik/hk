@@ -105,7 +105,7 @@ pub fn sys_rt_sigaction(sig: u32, act_ptr: u64, oact_ptr: u64, sigsetsize: u64) 
     let new = if act_ptr != 0 {
         match UserPtr::<UserSigAction>::new(act_ptr).read() {
             Ok(a) => Some(SigAction::from(a)),
-            Err(_) => return -14, // EFAULT
+            Err(_) => return KernelError::BadAddress.sysret(),
         }
     } else {
         None
@@ -124,7 +124,7 @@ pub fn sys_rt_sigaction(sig: u32, act_ptr: u64, oact_ptr: u64, sigsetsize: u64) 
         },
         None => match sighand.get_action(sig) {
             Some(a) => a,
-            None => return -22, // EINVAL
+            None => return KernelError::InvalidArgument.sysret(),
         },
     };
     // Ignored now: discarded pending; no longer ignored: interval timers
@@ -180,7 +180,7 @@ pub fn sys_rt_sigprocmask(how: i32, set_ptr: u64, oset_ptr: u64, sigsetsize: u64
     let new_set = if set_ptr != 0 {
         match get_user::<Uaccess, u64>(set_ptr) {
             Ok(v) => Some(SigSet::from_bits(v)),
-            Err(_) => return -14, // EFAULT
+            Err(_) => return KernelError::BadAddress.sysret(),
         }
     } else {
         None
@@ -199,7 +199,7 @@ pub fn sys_rt_sigprocmask(how: i32, set_ptr: u64, oset_ptr: u64, sigsetsize: u64
                 SIG_SETMASK => {
                     state.blocked = new_set;
                 }
-                _ => return Err(-22i64), // EINVAL
+                _ => return Err(KernelError::InvalidArgument.sysret()),
             }
 
             // Never allow blocking SIGKILL/SIGSTOP
@@ -210,7 +210,7 @@ pub fn sys_rt_sigprocmask(how: i32, set_ptr: u64, oset_ptr: u64, sigsetsize: u64
     let old = match r {
         Some(Ok(old)) => old,
         Some(Err(e)) => return e,
-        None => return -3, // ESRCH
+        None => return KernelError::NoProcess.sysret(),
     };
 
     // Return old mask if requested
@@ -274,7 +274,7 @@ fn check_kill_permission(target_pid: u64, sig: u32) -> i32 {
     let table = crate::task::percpu::TASKLIST.read();
     match table.get(target_pid) {
         Some(t) => me.may_kill(&t, sig),
-        None => -3, // ESRCH - no such process
+        None => KernelError::NoProcess.to_errno_neg(), // no such process
     }
 }
 
@@ -424,7 +424,11 @@ pub fn sys_kill(pid: i64, sig: u32) -> i64 {
                 _ => {}               // ESRCH: gone between listing and now
             }
         }
-        if matched { 0 } else { -3 }
+        if matched {
+            0
+        } else {
+            KernelError::NoProcess.sysret()
+        }
     } else {
         // pid < -1: every process in group -pid, once each (signal 0:
         // does the group exist, may we signal it)
@@ -576,7 +580,7 @@ pub fn sys_rt_sigsuspend(mask_ptr: u64, sigsetsize: u64) -> i64 {
     // Read the new mask from user space
     let new_mask = match get_user::<Uaccess, u64>(mask_ptr) {
         Ok(v) => SigSet::from_bits(v),
-        Err(_) => return -14, // EFAULT
+        Err(_) => return KernelError::BadAddress.sysret(),
     };
 
     // Save old mask (restored on return to user) and install the new one
@@ -654,7 +658,7 @@ pub fn sys_rt_sigtimedwait(set_ptr: u64, info_ptr: u64, ts_ptr: u64, sigsetsize:
     // Read the signal set to wait for
     let wait_set = match get_user::<Uaccess, u64>(set_ptr) {
         Ok(v) => SigSet::from_bits(v),
-        Err(_) => return -14, // EFAULT
+        Err(_) => return KernelError::BadAddress.sysret(),
     };
 
     // Read timeout if provided
@@ -774,7 +778,7 @@ pub fn sys_sigaltstack(ss_ptr: u64, oss_ptr: u64) -> i64 {
         };
         match rd() {
             Some(v) => Some(v),
-            None => return -14, // EFAULT
+            None => return KernelError::BadAddress.sysret(),
         }
     } else {
         None
@@ -798,7 +802,7 @@ pub fn sys_sigaltstack(ss_ptr: u64, oss_ptr: u64) -> i64 {
         if let Some((ss_sp, ss_flags_val, ss_size)) = new {
             // Cannot change while on signal stack
             if on_stack {
-                return Err(-1i64); // EPERM
+                return Err(KernelError::NotPermitted.sysret());
             }
 
             // Validate flags - only SS_DISABLE and SS_FLAG_BITS are valid
@@ -832,7 +836,7 @@ pub fn sys_sigaltstack(ss_ptr: u64, oss_ptr: u64) -> i64 {
     let (old, old_flags) = match r {
         Some(Ok(v)) => v,
         Some(Err(e)) => return e,
-        None => return -3, // ESRCH
+        None => return KernelError::NoProcess.sysret(),
     };
 
     // Return old stack if requested: ss_sp @0, ss_flags @8, ss_size @16
@@ -875,7 +879,7 @@ pub fn sys_signalfd4(fd: i32, mask_ptr: u64, sizemask: u64, flags: i32) -> i64 {
     // Read mask from user space
     let mask_bits = match get_user::<Uaccess, u64>(mask_ptr) {
         Ok(v) => v,
-        Err(_) => return -14, // EFAULT
+        Err(_) => return KernelError::BadAddress.sysret(),
     };
     let mask = SigSet::from_bits(mask_bits);
 
@@ -883,13 +887,13 @@ pub fn sys_signalfd4(fd: i32, mask_ptr: u64, sizemask: u64, flags: i32) -> i64 {
         // Create new signalfd
         let file = match create_signalfd(mask, flags) {
             Ok(f) => f,
-            Err(_) => return -12, // ENOMEM
+            Err(_) => return KernelError::OutOfMemory.sysret(),
         };
 
         // Allocate fd and install file
         let fd_table = match get_task_fd(current_tid()) {
             Some(t) => t,
-            None => return -24, // EMFILE
+            None => return KernelError::ProcessFileLimit.sysret(),
         };
         let mut table = fd_table.lock();
         let fd_flags = if flags & sfd_flags::SFD_CLOEXEC != 0 {
@@ -916,12 +920,12 @@ pub fn sys_signalfd4(fd: i32, mask_ptr: u64, sizemask: u64, flags: i32) -> i64 {
         // Update existing signalfd mask
         let fd_table = match get_task_fd(current_tid()) {
             Some(t) => t,
-            None => return -9, // EBADF
+            None => return KernelError::BadFd.sysret(),
         };
 
         let file = match fd_table.lock().get(fd) {
             Some(f) => f,
-            None => return -9, // EBADF
+            None => return KernelError::BadFd.sysret(),
         };
 
         // Verify it's a signalfd
@@ -930,7 +934,7 @@ pub fn sys_signalfd4(fd: i32, mask_ptr: u64, sizemask: u64, flags: i32) -> i64 {
                 signalfd.update_mask(mask);
                 i64::from(fd)
             }
-            None => -22, // EINVAL - not a signalfd
+            None => KernelError::InvalidArgument.sysret(), // not a signalfd
         }
     }
 }

@@ -242,7 +242,7 @@ pub fn sys_getrlimit(resource: u32, rlim_ptr: u64) -> i64 {
     let tid = current_tid();
     let rlim = match get_task_rlimit(tid, resource) {
         Some(r) => r,
-        None => return -3, // ESRCH (shouldn't happen for current task)
+        None => return KernelError::NoProcess.sysret(), // (shouldn't happen for current task)
     };
 
     // Copy to user (16 bytes: cur + max)
@@ -265,7 +265,7 @@ pub fn sys_setrlimit(resource: u32, rlim_ptr: u64) -> i64 {
     // Linux sys_setrlimit: copied in first (EFAULT), then do_prlimit
     let new_rlim = match copy_val_from_user::<Uaccess, RLimit>(rlim_ptr) {
         Ok(r) => r,
-        Err(_) => return -14, // EFAULT
+        Err(_) => return KernelError::BadAddress.sysret(),
     };
     if resource as usize >= RLIM_NLIMITS {
         return KernelError::InvalidArgument.sysret();
@@ -317,7 +317,7 @@ pub fn sys_prlimit64(pid: i32, resource: u32, new_rlim_ptr: u64, old_rlim_ptr: u
     let new = if new_rlim_ptr != 0 {
         match copy_val_from_user::<Uaccess, RLimit>(new_rlim_ptr) {
             Ok(r) => Some(r),
-            Err(_) => return -14, // EFAULT
+            Err(_) => return KernelError::BadAddress.sysret(),
         }
     } else {
         None
@@ -327,7 +327,7 @@ pub fn sys_prlimit64(pid: i32, resource: u32, new_rlim_ptr: u64, old_rlim_ptr: u
     } else {
         match crate::task::percpu::find_task_by_vpid(pid as u64).map(|t| t.tid()) {
             Some(tid) => tid,
-            None => return -3, // ESRCH
+            None => return KernelError::NoProcess.sysret(),
         }
     };
     if let Err(e) = check_prlimit_permission(target_tid) {
@@ -350,7 +350,7 @@ pub fn sys_prlimit64(pid: i32, resource: u32, new_rlim_ptr: u64, old_rlim_ptr: u
         },
         None => match get_task_rlimit(target_tid, resource) {
             Some(r) => r,
-            None => return -3, // ESRCH
+            None => return KernelError::NoProcess.sysret(),
         },
     };
     if old_rlim_ptr != 0 && copy_val_to_user::<Uaccess, RLimit>(old_rlim_ptr, &old).is_err() {

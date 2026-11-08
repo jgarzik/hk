@@ -1054,7 +1054,7 @@ pub fn sys_timer_create(clockid: i32, sevp: u64, timerid: u64) -> i64 {
     let sigevent = if sevp != 0 {
         match copy_val_from_user::<Uaccess, SigEvent>(sevp) {
             Ok(sev) => Some(sev),
-            Err(_) => return -14, // EFAULT
+            Err(_) => return KernelError::BadAddress.sysret(),
         }
     } else {
         None
@@ -1096,7 +1096,7 @@ pub fn sys_timer_settime(timerid: TimerT, flags: i32, new_value: u64, old_value:
     // Get the timer
     let timer = match user_timer(tid, timerid) {
         Some(t) => t,
-        None => return -22, // EINVAL - timer not found
+        None => return KernelError::InvalidArgument.sysret(), // timer not found
     };
 
     // Read new value from user space
@@ -1105,7 +1105,7 @@ pub fn sys_timer_settime(timerid: TimerT, flags: i32, new_value: u64, old_value:
     }
     let new_spec: ITimerSpec = match get_user::<Uaccess, ITimerSpec>(new_value) {
         Ok(v) => v,
-        Err(_) => return -14, // EFAULT
+        Err(_) => return KernelError::BadAddress.sysret(),
     };
     // Linux itimerspec64_valid: negative or unnormalized values -> EINVAL
     if !new_spec.is_valid() {
@@ -1147,7 +1147,7 @@ pub fn sys_timer_gettime(timerid: TimerT, curr_value: u64) -> i64 {
     // Get the timer
     let timer = match user_timer(tid, timerid) {
         Some(t) => t,
-        None => return -22, // EINVAL - timer not found
+        None => return KernelError::InvalidArgument.sysret(), // timer not found
     };
 
     if curr_value == 0 {
@@ -1178,7 +1178,7 @@ pub fn sys_timer_getoverrun(timerid: TimerT) -> i64 {
     // Get the timer
     let timer = match user_timer(tid, timerid) {
         Some(t) => t,
-        None => return -22, // EINVAL - timer not found
+        None => return KernelError::InvalidArgument.sysret(), // timer not found
     };
 
     i64::from(timer.getoverrun())
@@ -1346,7 +1346,7 @@ pub fn sys_setitimer(which: i32, new: u64, old: u64) -> i64 {
     } else {
         match get_user::<Uaccess, ITimerVal>(new) {
             Ok(v) => v,
-            Err(_) => return -14,
+            Err(_) => return KernelError::BadAddress.sysret(),
         }
     };
     let (Some(interval), Some(value)) = (tv_to_ts(nv.it_interval), tv_to_ts(nv.it_value)) else {

@@ -1341,7 +1341,7 @@ fn send_signal_force(tid: Tid, sig: u32, info: SendInfo, ty: PidType, force: boo
     };
     match t {
         Some(t) => send_task(&t, sig, info, ty, force),
-        None => -3, // ESRCH
+        None => KernelError::NoProcess.to_errno_neg(),
     }
 }
 
@@ -1418,7 +1418,7 @@ fn send_task(t: &TaskRef, sig: u32, info: SendInfo, ty: PidType, force: bool) ->
 
     let wants = match sent {
         Sent::Dropped => return 0,
-        Sent::Overflow => return -11, // EAGAIN
+        Sent::Overflow => return KernelError::WouldBlock.to_errno_neg(),
         Sent::Queued(w) => w,
     };
     // Signalfd readers of the target's handler table recheck (Linux
@@ -1760,7 +1760,7 @@ pub fn kill_proc_info(pid: Pid, sig: u32, info: SendInfo) -> i32 {
     };
     match t {
         Some(t) => send_task(&t, sig, info, PidType::Tgid, false),
-        None => -3, // ESRCH - no such process
+        None => KernelError::NoProcess.to_errno_neg(), // no such process
     }
 }
 
@@ -1835,7 +1835,7 @@ pub fn kill_pid_info_type(
     };
     match t {
         Some(t) => send_task(&t, sig, info, ty, false),
-        None => -3,
+        None => KernelError::NoProcess.to_errno_neg(),
     }
 }
 
@@ -1859,7 +1859,7 @@ pub fn kill_pgrp_info(
         ret = match t {
             Some(t) if *e == 0 => send_task(t, sig, info, PidType::Tgid, false),
             Some(_) => *e,
-            None => -3,
+            None => KernelError::NoProcess.to_errno_neg(),
         };
         ok |= ret == 0;
     }
