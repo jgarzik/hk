@@ -8,28 +8,23 @@ use crate::util::scope::ScopeGuard;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use crate::arch::Uaccess;
 use crate::fs::file::File;
+use crate::fs::io::fget;
 use crate::net::msg::{
-    self, Dst, Iov, MSG_CMSG_CLOEXEC, MSG_CTRUNC, MSG_DONTWAIT, MSG_WAITFORONE, MsgHdr, RecvMsg,
-    SendMsg, Src, addr_in, addr_out,
+    self, Dst, Iov, MMsgHdr, MSG_CMSG_CLOEXEC, MSG_CTRUNC, MSG_DONTWAIT, MSG_WAITFORONE, MsgHdr,
+    RecvMsg, SendMsg, Src, UserMsgHdr, addr_in, addr_out,
 };
 use crate::net::socket::{
     OptIn, ProtoOps, SOCK_CLOEXEC, SOCK_NONBLOCK, SOCK_TYPE_MASK, SOL_SOCKET, file_nb, put_opt,
     sock_alloc_file, sock_create, sock_getsockopt, sock_of, sock_sendmsg, sock_setsockopt,
 };
-use crate::uaccess::{copy_to_user, get_user, put_user};
-use crate::util::error::KernelError;
-
-fn ret(r: Result<i64, KernelError>) -> i64 {
-    r.unwrap_or_else(|e| e.sysret())
-}
+use crate::time::time_syscall::LinuxTimespec;
+use crate::uaccess::{UserPtr, copy_to_user};
+use crate::util::error::{KernelError, KernelResult};
 
 /// The socket behind `fd`: EBADF, or ENOTSOCK for other files
-fn sockfd(fd: i32) -> Result<(Arc<File>, Arc<dyn ProtoOps>), KernelError> {
-    let table = crate::task::fdtable::get_task_fd(crate::task::percpu::current_tid())
-        .ok_or(KernelError::BadFd)?;
-    let file = table.lock().get(fd).ok_or(KernelError::BadFd)?;
+fn sockfd(fd: i32) -> KernelResult<(Arc<File>, Arc<dyn ProtoOps>)> {
+    let file = fget(fd)?;
     let s = sock_of(&file).ok_or(KernelError::NotSocket)?;
     Ok((file, s))
 }
@@ -44,19 +39,18 @@ fn nofile() -> u64 {
 }
 
 /// Install `file` in a new descriptor (EMFILE at the limit)
-pub fn fd_install(file: Arc<File>, cloexec: bool) -> Result<i64, KernelError> {
+pub fn fd_install(file: Arc<File>, cloexec: bool) -> KernelResult<i32> {
     let table = crate::task::fdtable::get_task_fd(crate::task::percpu::current_tid())
         .ok_or(KernelError::BadFd)?;
     let fl = if cloexec { crate::task::FD_CLOEXEC } else { 0 };
-    let fd = table
+    table
         .lock()
         .alloc_with_flags(file, fl, nofile())
-        .map_err(|_| KernelError::ProcessFileLimit)?;
-    Ok(i64::from(fd))
+        .map_err(|_| KernelError::ProcessFileLimit)
 }
 
 /// SOCK_NONBLOCK / SOCK_CLOEXEC of a type or accept4 flags argument
-fn type_flags(f: i32) -> Result<(bool, bool), KernelError> {
+fn type_flags(f: i32) -> KernelResult<(bool, bool)> {
     if f & !(SOCK_NONBLOCK | SOCK_CLOEXEC) != 0 {
         return Err(KernelError::InvalidArgument);
     }
@@ -64,40 +58,39 @@ fn type_flags(f: i32) -> Result<(bool, bool), KernelError> {
 }
 
 /// socket(domain, type, protocol)
-pub fn sys_socket(domain: i32, stype: i32, protocol: i32) -> i64 {
-    ret((|| {
-        let (nb, cloexec) = type_flags(stype & !SOCK_TYPE_MASK)?;
-        let s = sock_create(domain, stype & SOCK_TYPE_MASK, protocol)?;
-        fd_install(sock_alloc_file(s, nb)?, cloexec)
-    })())
+pub fn sys_socket(domain: i32, stype: i32, protocol: i32) -> KernelResult<i32> {
+    let (nb, cloexec) = type_flags(stype & !SOCK_TYPE_MASK)?;
+    let s = sock_create(domain, stype & SOCK_TYPE_MASK, protocol)?;
+    fd_install(sock_alloc_file(s, nb)?, cloexec)
 }
 
 /// socketpair(domain, type, protocol, sv) (Linux __sys_socketpair):
 /// `sv` is checked first (EFAULT), families without pairs (AF_INET,
 /// AF_NETLINK) are EOPNOTSUPP (sock_no_socketpair); both descriptors
 /// are installed or neither (EMFILE)
-pub fn sys_socketpair(domain: i32, stype: i32, protocol: i32, sv: u64) -> i64 {
-    ret((|| {
-        let (nb, cloexec) = type_flags(stype & !SOCK_TYPE_MASK)?;
-        let cur = get_user::<Uaccess, [i32; 2]>(sv).map_err(|_| KernelError::BadAddress)?;
-        put_user::<Uaccess, [i32; 2]>(sv, cur).map_err(|_| KernelError::BadAddress)?;
-        let create = || sock_create(domain, stype & SOCK_TYPE_MASK, protocol);
-        let a = ScopeGuard::new_with_data(create()?, |s| s.release());
-        let b = ScopeGuard::new_with_data(create()?, |s| s.release());
-        a.socketpair(&**b)?;
-        // Each socket stays guarded until its file owns it: a failed
-        // file for `a` must still release `b`
-        let fa = sock_alloc_file(a.dismiss(), nb)?;
-        let fb = sock_alloc_file(b.dismiss(), nb)?;
-        let fds = install_pair(fa, fb, cloexec)?;
-        put_user::<Uaccess, [i32; 2]>(sv, fds).map_err(|_| KernelError::BadAddress)?;
-        Ok(0)
-    })())
+pub fn sys_socketpair(
+    domain: i32,
+    stype: i32,
+    protocol: i32,
+    sv: UserPtr<[i32; 2]>,
+) -> KernelResult<()> {
+    let (nb, cloexec) = type_flags(stype & !SOCK_TYPE_MASK)?;
+    sv.write(&sv.read()?)?;
+    let create = || sock_create(domain, stype & SOCK_TYPE_MASK, protocol);
+    let a = ScopeGuard::new_with_data(create()?, |s| s.release());
+    let b = ScopeGuard::new_with_data(create()?, |s| s.release());
+    a.socketpair(&**b)?;
+    // Each socket stays guarded until its file owns it: a failed
+    // file for `a` must still release `b`
+    let fa = sock_alloc_file(a.dismiss(), nb)?;
+    let fb = sock_alloc_file(b.dismiss(), nb)?;
+    sv.write(&install_pair(fa, fb, cloexec)?)?;
+    Ok(())
 }
 
 /// Install two files in new descriptors, or neither (the table
 /// releases undone and refused files after its lock is dropped)
-fn install_pair(a: Arc<File>, b: Arc<File>, cloexec: bool) -> Result<[i32; 2], KernelError> {
+fn install_pair(a: Arc<File>, b: Arc<File>, cloexec: bool) -> KernelResult<[i32; 2]> {
     let table = crate::task::fdtable::get_task_fd(crate::task::percpu::current_tid())
         .ok_or(KernelError::BadFd)?;
     let fl = if cloexec { crate::task::FD_CLOEXEC } else { 0 };
@@ -115,7 +108,7 @@ fn install_pair(a: Arc<File>, b: Arc<File>, cloexec: bool) -> Result<[i32; 2], K
 }
 
 /// The address argument as bytes (empty when none)
-fn addr_arg(addr: u64, len: u64) -> Result<Vec<u8>, KernelError> {
+fn addr_arg(addr: UserPtr<u8>, len: u64) -> KernelResult<Vec<u8>> {
     if len > i32::MAX as u64 {
         return Err(KernelError::InvalidArgument);
     }
@@ -123,163 +116,166 @@ fn addr_arg(addr: u64, len: u64) -> Result<Vec<u8>, KernelError> {
 }
 
 /// bind(fd, addr, addrlen)
-pub fn sys_bind(fd: i32, addr: u64, len: u64) -> i64 {
-    ret((|| {
-        let (_, s) = sockfd(fd)?;
-        s.bind(&addr_arg(addr, len)?)?;
-        Ok(0)
-    })())
+pub fn sys_bind(fd: i32, addr: UserPtr<u8>, len: u64) -> KernelResult<()> {
+    let (_, s) = sockfd(fd)?;
+    s.bind(&addr_arg(addr, len)?)
 }
 
 /// connect(fd, addr, addrlen)
-pub fn sys_connect(fd: i32, addr: u64, len: u64) -> i64 {
-    ret((|| {
-        let (file, s) = sockfd(fd)?;
-        let a = addr_arg(addr, len)?;
-        let nb = file_nb(&file, 0) & MSG_DONTWAIT != 0;
-        let r = s.connect(&a, nb);
-        crate::net::dev::netif_rx_flush_local();
-        r?;
-        Ok(0)
-    })())
+pub fn sys_connect(fd: i32, addr: UserPtr<u8>, len: u64) -> KernelResult<()> {
+    let (file, s) = sockfd(fd)?;
+    let a = addr_arg(addr, len)?;
+    let nb = file_nb(&file, 0) & MSG_DONTWAIT != 0;
+    let r = s.connect(&a, nb);
+    crate::net::dev::netif_rx_flush_local();
+    r
 }
 
 /// listen(fd, backlog)
-pub fn sys_listen(fd: i32, backlog: i32) -> i64 {
-    ret((|| {
-        let (_, s) = sockfd(fd)?;
-        s.listen(backlog)?;
-        Ok(0)
-    })())
+pub fn sys_listen(fd: i32, backlog: i32) -> KernelResult<()> {
+    let (_, s) = sockfd(fd)?;
+    s.listen(backlog)
 }
 
 /// accept(fd, addr, addrlen)
-pub fn sys_accept(fd: i32, addr: u64, lenp: u64) -> i64 {
+pub fn sys_accept(fd: i32, addr: UserPtr<u8>, lenp: UserPtr<u32>) -> KernelResult<i32> {
     sys_accept4(fd, addr, lenp, 0)
 }
 
 /// accept4(fd, addr, addrlen, flags) (Linux do_accept: a fault copying
 /// the peer address drops the new connection and returns EFAULT)
-pub fn sys_accept4(fd: i32, addr: u64, lenp: u64, flags: i32) -> i64 {
-    ret((|| {
-        let (nb_new, cloexec) = type_flags(flags)?;
-        let (file, s) = sockfd(fd)?;
-        let nb = file_nb(&file, 0) & MSG_DONTWAIT != 0;
-        let child = s.accept(nb)?;
-        let peer = child.getname(true);
-        let newfile = sock_alloc_file(child, nb_new)?;
-        if addr != 0 {
-            let a = peer.map_err(|_| KernelError::ConnectionAborted)?;
-            addr_out(addr, lenp, &a)?;
-        }
-        fd_install(newfile, cloexec)
-    })())
+pub fn sys_accept4(
+    fd: i32,
+    addr: UserPtr<u8>,
+    lenp: UserPtr<u32>,
+    flags: i32,
+) -> KernelResult<i32> {
+    let (nb_new, cloexec) = type_flags(flags)?;
+    let (file, s) = sockfd(fd)?;
+    let nb = file_nb(&file, 0) & MSG_DONTWAIT != 0;
+    let child = s.accept(nb)?;
+    let peer = child.getname(true);
+    let newfile = sock_alloc_file(child, nb_new)?;
+    if !addr.is_null() {
+        let a = peer.map_err(|_| KernelError::ConnectionAborted)?;
+        addr_out(addr, lenp, &a)?;
+    }
+    fd_install(newfile, cloexec)
 }
 
 /// getsockname(fd, addr, addrlen)
-pub fn sys_getsockname(fd: i32, addr: u64, lenp: u64) -> i64 {
+pub fn sys_getsockname(fd: i32, addr: UserPtr<u8>, lenp: UserPtr<u32>) -> KernelResult<()> {
     getname(fd, addr, lenp, false)
 }
 
 /// getpeername(fd, addr, addrlen)
-pub fn sys_getpeername(fd: i32, addr: u64, lenp: u64) -> i64 {
+pub fn sys_getpeername(fd: i32, addr: UserPtr<u8>, lenp: UserPtr<u32>) -> KernelResult<()> {
     getname(fd, addr, lenp, true)
 }
 
-fn getname(fd: i32, addr: u64, lenp: u64, peer: bool) -> i64 {
-    ret((|| {
-        let (_, s) = sockfd(fd)?;
-        addr_out(addr, lenp, &s.getname(peer)?)?;
-        Ok(0)
-    })())
+fn getname(fd: i32, addr: UserPtr<u8>, lenp: UserPtr<u32>, peer: bool) -> KernelResult<()> {
+    let (_, s) = sockfd(fd)?;
+    addr_out(addr, lenp, &s.getname(peer)?)
 }
 
 /// shutdown(fd, how)
-pub fn sys_shutdown(fd: i32, how: i32) -> i64 {
-    ret((|| {
-        let (_, s) = sockfd(fd)?;
-        let r = s.shutdown(how);
-        crate::net::dev::netif_rx_flush_local();
-        r?;
-        Ok(0)
-    })())
+pub fn sys_shutdown(fd: i32, how: i32) -> KernelResult<()> {
+    let (_, s) = sockfd(fd)?;
+    let r = s.shutdown(how);
+    crate::net::dev::netif_rx_flush_local();
+    r
 }
 
 /// setsockopt(fd, level, optname, optval, optlen)
-pub fn sys_setsockopt(fd: i32, level: i32, opt: i32, val: u64, len: u64) -> i64 {
-    ret((|| {
-        let len = len as i32;
-        if len < 0 {
-            return Err(KernelError::InvalidArgument);
-        }
-        let (_, s) = sockfd(fd)?;
-        let v = OptIn {
-            ptr: val,
-            len: len as usize,
-        };
-        match s.setsockopt(level, opt, v) {
-            Some(r) => r?,
-            None if level == SOL_SOCKET => sock_setsockopt(&*s, opt, v)?,
-            None => return Err(KernelError::NoProtocolOption),
-        }
-        Ok(0)
-    })())
+pub fn sys_setsockopt(
+    fd: i32,
+    level: i32,
+    opt: i32,
+    val: UserPtr<u8>,
+    len: i32,
+) -> KernelResult<()> {
+    if len < 0 {
+        return Err(KernelError::InvalidArgument);
+    }
+    let (_, s) = sockfd(fd)?;
+    let v = OptIn {
+        ptr: val.addr(),
+        len: len as usize,
+    };
+    match s.setsockopt(level, opt, v) {
+        Some(r) => r,
+        None if level == SOL_SOCKET => sock_setsockopt(&*s, opt, v),
+        None => Err(KernelError::NoProtocolOption),
+    }
 }
 
 /// getsockopt(fd, level, optname, optval, optlen)
-pub fn sys_getsockopt(fd: i32, level: i32, opt: i32, val: u64, lenp: u64) -> i64 {
-    ret((|| {
-        let (_, s) = sockfd(fd)?;
-        let len = get_user::<Uaccess, i32>(lenp).map_err(|_| KernelError::BadAddress)?;
-        if len < 0 {
-            return Err(KernelError::InvalidArgument);
-        }
-        let out = match s.getsockopt(level, opt) {
-            Some(r) => r?,
-            None if level == SOL_SOCKET => sock_getsockopt(&*s, opt)?,
-            None => return Err(KernelError::NoProtocolOption),
-        };
-        put_opt(out, val, lenp, len)?;
-        Ok(0)
-    })())
+pub fn sys_getsockopt(
+    fd: i32,
+    level: i32,
+    opt: i32,
+    val: UserPtr<u8>,
+    lenp: UserPtr<u32>,
+) -> KernelResult<()> {
+    let (_, s) = sockfd(fd)?;
+    let len = lenp.read()? as i32;
+    if len < 0 {
+        return Err(KernelError::InvalidArgument);
+    }
+    let out = match s.getsockopt(level, opt) {
+        Some(r) => r?,
+        None if level == SOL_SOCKET => sock_getsockopt(&*s, opt)?,
+        None => return Err(KernelError::NoProtocolOption),
+    };
+    put_opt(out, val, lenp, len)
 }
 
 /// sendto(fd, buf, len, flags, addr, addrlen)
-pub fn sys_sendto(fd: i32, buf: u64, len: u64, flags: i32, addr: u64, alen: u64) -> i64 {
-    ret((|| {
-        let (file, s) = sockfd(fd)?;
-        let data = Src::User(Iov::single(buf, len)?);
-        let addr = if addr != 0 {
-            addr_in(addr, alen)?
-        } else {
-            None
-        };
-        let mut m = SendMsg {
-            addr,
-            data,
-            control: Vec::new(),
-        };
-        let r = sock_sendmsg(&*s, &mut m, file_nb(&file, flags));
-        crate::net::dev::netif_rx_flush_local();
-        Ok(r? as i64)
-    })())
+pub fn sys_sendto(
+    fd: i32,
+    buf: UserPtr<u8>,
+    len: u64,
+    flags: i32,
+    addr: UserPtr<u8>,
+    alen: u64,
+) -> KernelResult<usize> {
+    let (file, s) = sockfd(fd)?;
+    let data = Src::User(Iov::single(buf.addr(), len)?);
+    let mut m = SendMsg {
+        addr: addr_in(addr, alen)?,
+        data,
+        control: Vec::new(),
+    };
+    let r = sock_sendmsg(&*s, &mut m, file_nb(&file, flags));
+    crate::net::dev::netif_rx_flush_local();
+    r
 }
 
 /// recvfrom(fd, buf, len, flags, addr, addrlen)
-pub fn sys_recvfrom(fd: i32, buf: u64, len: u64, flags: i32, addr: u64, lenp: u64) -> i64 {
-    ret((|| {
-        let (file, s) = sockfd(fd)?;
-        let mut m = RecvMsg::new(Dst::User(Iov::single(buf, len)?), addr != 0, 0);
-        let n = s.recvmsg(&mut m, file_nb(&file, flags))?;
-        if addr != 0 {
-            addr_out(addr, lenp, m.name.as_deref().unwrap_or(&[]))?;
-        }
-        Ok(n as i64)
-    })())
+pub fn sys_recvfrom(
+    fd: i32,
+    buf: UserPtr<u8>,
+    len: u64,
+    flags: i32,
+    addr: UserPtr<u8>,
+    lenp: UserPtr<u32>,
+) -> KernelResult<usize> {
+    let (file, s) = sockfd(fd)?;
+    let mut m = RecvMsg::new(Dst::User(Iov::single(buf.addr(), len)?), !addr.is_null(), 0);
+    let n = s.recvmsg(&mut m, file_nb(&file, flags))?;
+    if !addr.is_null() {
+        addr_out(addr, lenp, m.name.as_deref().unwrap_or(&[]))?;
+    }
+    Ok(n)
 }
 
 /// One sendmsg on an already resolved socket
-fn sendmsg_one(file: &File, s: &dyn ProtoOps, msg: u64, flags: i32) -> Result<usize, KernelError> {
+fn sendmsg_one(
+    file: &File,
+    s: &dyn ProtoOps,
+    msg: UserPtr<UserMsgHdr>,
+    flags: i32,
+) -> KernelResult<usize> {
     let h = MsgHdr::read(msg)?;
     let data = Src::User(h.iov()?);
     let mut m = SendMsg {
@@ -293,27 +289,30 @@ fn sendmsg_one(file: &File, s: &dyn ProtoOps, msg: u64, flags: i32) -> Result<us
 }
 
 /// sendmsg(fd, msg, flags)
-pub fn sys_sendmsg(fd: i32, msg: u64, flags: i32) -> i64 {
-    ret((|| {
-        let (file, s) = sockfd(fd)?;
-        Ok(sendmsg_one(&file, &*s, msg, flags)? as i64)
-    })())
+pub fn sys_sendmsg(fd: i32, msg: UserPtr<UserMsgHdr>, flags: i32) -> KernelResult<usize> {
+    let (file, s) = sockfd(fd)?;
+    sendmsg_one(&file, &*s, msg, flags)
 }
 
 /// One recvmsg; writes msg_namelen/msg_controllen/msg_flags back
-fn recvmsg_one(file: &File, s: &dyn ProtoOps, msg: u64, flags: i32) -> Result<usize, KernelError> {
+fn recvmsg_one(
+    file: &File,
+    s: &dyn ProtoOps,
+    msg: UserPtr<UserMsgHdr>,
+    flags: i32,
+) -> KernelResult<usize> {
     let h = MsgHdr::read(msg)?;
-    let mut m = RecvMsg::new(Dst::User(h.iov()?), h.name != 0, h.controllen);
+    let mut m = RecvMsg::new(Dst::User(h.iov()?), !h.name.is_null(), h.controllen);
     m.flags = flags & MSG_CMSG_CLOEXEC;
     let n = s.recvmsg(&mut m, file_nb(file, flags))?;
     let mut namelen = 0;
-    if let (Some(a), true) = (&m.name, h.name != 0) {
+    if let (Some(a), false) = (&m.name, h.name.is_null()) {
         let k = (h.namelen as usize).min(a.len());
-        copy_to_user::<Uaccess>(h.name, &a[..k]).map_err(|_| KernelError::BadAddress)?;
+        copy_to_user::<crate::arch::Uaccess>(h.name.addr(), &a[..k])?;
         namelen = a.len() as u32;
     }
     if !m.cmsg.buf.is_empty() {
-        copy_to_user::<Uaccess>(h.control, &m.cmsg.buf).map_err(|_| KernelError::BadAddress)?;
+        copy_to_user::<crate::arch::Uaccess>(h.control.addr(), &m.cmsg.buf)?;
     }
     let mut fl = m.flags;
     if m.cmsg.trunc {
@@ -324,82 +323,75 @@ fn recvmsg_one(file: &File, s: &dyn ProtoOps, msg: u64, flags: i32) -> Result<us
 }
 
 /// recvmsg(fd, msg, flags)
-pub fn sys_recvmsg(fd: i32, msg: u64, flags: i32) -> i64 {
-    ret((|| {
-        let (file, s) = sockfd(fd)?;
-        Ok(recvmsg_one(&file, &*s, msg, flags)? as i64)
-    })())
+pub fn sys_recvmsg(fd: i32, msg: UserPtr<UserMsgHdr>, flags: i32) -> KernelResult<usize> {
+    let (file, s) = sockfd(fd)?;
+    recvmsg_one(&file, &*s, msg, flags)
 }
-
-/// sizeof(struct mmsghdr) and the offset of msg_len
-const MMSG_SIZE: u64 = 64;
-const MMSG_LEN_OFF: u64 = 56;
 
 /// sendmmsg(fd, msgvec, vlen, flags): the count sent, or the first
 /// error if none was (vlen clamped to UIO_MAXIOV like Linux)
-pub fn sys_sendmmsg(fd: i32, vec: u64, vlen: u32, flags: i32) -> i64 {
-    ret((|| {
-        let (file, s) = sockfd(fd)?;
-        let mut n = 0u64;
-        for i in 0..u64::from(vlen).min(msg::UIO_MAXIOV as u64) {
-            let at = vec.wrapping_add(i * MMSG_SIZE);
-            match sendmsg_one(&file, &*s, at, flags) {
-                Ok(k) => {
-                    put_user::<Uaccess, u32>(at + MMSG_LEN_OFF, k as u32)
-                        .map_err(|_| KernelError::BadAddress)?;
-                    n += 1;
-                }
-                Err(e) if n == 0 => return Err(e),
-                Err(_) => break,
+pub fn sys_sendmmsg(fd: i32, vec: UserPtr<MMsgHdr>, vlen: u32, flags: i32) -> KernelResult<usize> {
+    let (file, s) = sockfd(fd)?;
+    let mut n = 0;
+    for i in 0..(vlen as usize).min(msg::UIO_MAXIOV) {
+        let at = MMsgHdr::at(vec, i);
+        match sendmsg_one(&file, &*s, MMsgHdr::hdr(at), flags) {
+            Ok(k) => {
+                MMsgHdr::set_len(at, k as u32)?;
+                n += 1;
             }
+            Err(e) if n == 0 => return Err(e),
+            Err(_) => break,
         }
-        Ok(n as i64)
-    })())
+    }
+    Ok(n)
 }
 
 /// recvmmsg(fd, msgvec, vlen, flags, timeout): MSG_WAITFORONE makes all
 /// but the first non-blocking; the timeout is checked after each
 /// datagram (Linux do_recvmmsg)
-pub fn sys_recvmmsg(fd: i32, vec: u64, vlen: u32, flags: i32, timeout: u64) -> i64 {
-    ret((|| {
-        let (file, s) = sockfd(fd)?;
-        let deadline = mmsg_deadline(timeout)?;
-        let mut flags = flags;
-        let mut n = 0u64;
-        for i in 0..u64::from(vlen).min(msg::UIO_MAXIOV as u64) {
-            let at = vec.wrapping_add(i * MMSG_SIZE);
-            match recvmsg_one(&file, &*s, at, flags) {
-                Ok(k) => {
-                    put_user::<Uaccess, u32>(at + MMSG_LEN_OFF, k as u32)
-                        .map_err(|_| KernelError::BadAddress)?;
-                    n += 1;
-                }
-                Err(e) if n == 0 => return Err(e),
-                Err(_) => break,
+pub fn sys_recvmmsg(
+    fd: i32,
+    vec: UserPtr<MMsgHdr>,
+    vlen: u32,
+    flags: i32,
+    timeout: UserPtr<LinuxTimespec>,
+) -> KernelResult<usize> {
+    let (file, s) = sockfd(fd)?;
+    let deadline = mmsg_deadline(timeout)?;
+    let mut flags = flags;
+    let mut n = 0;
+    for i in 0..(vlen as usize).min(msg::UIO_MAXIOV) {
+        let at = MMsgHdr::at(vec, i);
+        match recvmsg_one(&file, &*s, MMsgHdr::hdr(at), flags) {
+            Ok(k) => {
+                MMsgHdr::set_len(at, k as u32)?;
+                n += 1;
             }
-            if flags & MSG_WAITFORONE != 0 {
-                flags |= MSG_DONTWAIT;
-            }
-            if deadline.is_some_and(|d| crate::time::monotonic_ns() >= d) {
-                break;
-            }
+            Err(e) if n == 0 => return Err(e),
+            Err(_) => break,
         }
-        Ok(n as i64)
-    })())
+        if flags & MSG_WAITFORONE != 0 {
+            flags |= MSG_DONTWAIT;
+        }
+        if deadline.is_some_and(|d| crate::time::monotonic_ns() >= d) {
+            break;
+        }
+    }
+    Ok(n)
 }
 
-/// CLOCK_MONOTONIC deadline of a recvmmsg timeout (struct timespec *)
-fn mmsg_deadline(ts: u64) -> Result<Option<u64>, KernelError> {
-    if ts == 0 {
+/// CLOCK_MONOTONIC deadline of a recvmmsg timeout
+fn mmsg_deadline(ts: UserPtr<LinuxTimespec>) -> KernelResult<Option<u64>> {
+    if ts.is_null() {
         return Ok(None);
     }
-    let sec = get_user::<Uaccess, i64>(ts).map_err(|_| KernelError::BadAddress)?;
-    let nsec = get_user::<Uaccess, i64>(ts + 8).map_err(|_| KernelError::BadAddress)?;
-    if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
+    let LinuxTimespec { tv_sec, tv_nsec } = ts.read()?;
+    if tv_sec < 0 || !(0..1_000_000_000).contains(&tv_nsec) {
         return Err(KernelError::InvalidArgument);
     }
-    let d = (sec as u64)
+    let d = (tv_sec as u64)
         .saturating_mul(1_000_000_000)
-        .saturating_add(nsec as u64);
+        .saturating_add(tv_nsec as u64);
     Ok(Some(crate::time::monotonic_ns().saturating_add(d)))
 }

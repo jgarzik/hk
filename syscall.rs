@@ -3,6 +3,7 @@
 //! to it (`arch::*::syscall::sys_of`).
 
 use crate::arch::Uaccess;
+use crate::uaccess::UserPtr;
 use crate::util::error::{KernelError, SysRet};
 
 /// A system call, independent of its per-arch number
@@ -276,14 +277,23 @@ pub enum Sys {
 /// Run `sys` with the raw argument registers `a`; the return register
 pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
     match sys {
-        Sys::Accept => crate::net::syscall::sys_accept(a[0] as i32, a[1], a[2]).ret() as u64,
-        Sys::Accept4 => {
-            crate::net::syscall::sys_accept4(a[0] as i32, a[1], a[2], a[3] as i32).ret() as u64
+        Sys::Accept => {
+            crate::net::syscall::sys_accept(a[0] as i32, UserPtr::new(a[1]), UserPtr::new(a[2]))
+                .ret() as u64
         }
+        Sys::Accept4 => crate::net::syscall::sys_accept4(
+            a[0] as i32,
+            UserPtr::new(a[1]),
+            UserPtr::new(a[2]),
+            a[3] as i32,
+        )
+        .ret() as u64,
         Sys::Acct => crate::task::acct::sys_acct(a[0]).ret() as u64,
         Sys::AddKey => crate::keys::sys_add_key(a[0], a[1], a[2], a[3], a[4] as i32).ret() as u64,
         Sys::Adjtimex => crate::time::time_syscall::sys_adjtimex(a[0]).ret() as u64,
-        Sys::Bind => crate::net::syscall::sys_bind(a[0] as i32, a[1], a[2]).ret() as u64,
+        Sys::Bind => {
+            crate::net::syscall::sys_bind(a[0] as i32, UserPtr::new(a[1]), a[2]).ret() as u64
+        }
         Sys::Bpf => crate::bpf::sys_bpf(a[0] as i32, a[1], a[2] as u32).ret() as u64,
         Sys::Brk => crate::mm::syscall::sys_brk(a[0]).ret() as u64,
         Sys::Capget => crate::task::syscall::sys_capget::<Uaccess>(a[0], a[1]).ret() as u64,
@@ -316,7 +326,9 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
         Sys::CloseRange => {
             crate::fs::syscall::sys_close_range(a[0] as u32, a[1] as u32, a[2] as u32).ret() as u64
         }
-        Sys::Connect => crate::net::syscall::sys_connect(a[0] as i32, a[1], a[2]).ret() as u64,
+        Sys::Connect => {
+            crate::net::syscall::sys_connect(a[0] as i32, UserPtr::new(a[1]), a[2]).ret() as u64
+        }
         Sys::CopyFileRange => crate::fs::splice::sys_copy_file_range(
             a[0] as i32,
             a[1],
@@ -447,9 +459,12 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
             crate::task::syscall::sys_getgroups::<Uaccess>(a[0] as i32, a[1]).ret() as u64
         }
         Sys::Getitimer => crate::time::posix_timer::sys_getitimer(a[0] as i32, a[1]).ret() as u64,
-        Sys::Getpeername => {
-            crate::net::syscall::sys_getpeername(a[0] as i32, a[1], a[2]).ret() as u64
-        }
+        Sys::Getpeername => crate::net::syscall::sys_getpeername(
+            a[0] as i32,
+            UserPtr::new(a[1]),
+            UserPtr::new(a[2]),
+        )
+        .ret() as u64,
         Sys::Getpgid => crate::task::syscall::sys_getpgid(
             a[0] as i32,
             crate::task::percpu::current_pid(),
@@ -489,13 +504,20 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
             crate::task::percpu::current_sid(),
         )
         .ret() as u64,
-        Sys::Getsockname => {
-            crate::net::syscall::sys_getsockname(a[0] as i32, a[1], a[2]).ret() as u64
-        }
-        Sys::Getsockopt => {
-            crate::net::syscall::sys_getsockopt(a[0] as i32, a[1] as i32, a[2] as i32, a[3], a[4])
-                as u64
-        }
+        Sys::Getsockname => crate::net::syscall::sys_getsockname(
+            a[0] as i32,
+            UserPtr::new(a[1]),
+            UserPtr::new(a[2]),
+        )
+        .ret() as u64,
+        Sys::Getsockopt => crate::net::syscall::sys_getsockopt(
+            a[0] as i32,
+            a[1] as i32,
+            a[2] as i32,
+            UserPtr::new(a[3]),
+            UserPtr::new(a[4]),
+        )
+        .ret() as u64,
         Sys::Gettid => crate::task::syscall::sys_gettid().ret() as u64,
         Sys::Gettimeofday => crate::time::time_syscall::sys_gettimeofday(a[0], a[1]).ret() as u64,
         Sys::Getuid => {
@@ -722,16 +744,26 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
         Sys::Reboot => {
             crate::power::sys_reboot(a[0] as u32, a[1] as u32, a[2] as u32, a[3]).ret() as u64
         }
-        Sys::Recvfrom => {
-            crate::net::syscall::sys_recvfrom(a[0] as i32, a[1], a[2], a[3] as i32, a[4], a[5])
-                as u64
-        }
-        Sys::Recvmmsg => {
-            crate::net::syscall::sys_recvmmsg(a[0] as i32, a[1], a[2] as u32, a[3] as i32, a[4])
-                as u64
-        }
+        Sys::Recvfrom => crate::net::syscall::sys_recvfrom(
+            a[0] as i32,
+            UserPtr::new(a[1]),
+            a[2],
+            a[3] as i32,
+            UserPtr::new(a[4]),
+            UserPtr::new(a[5]),
+        )
+        .ret() as u64,
+        Sys::Recvmmsg => crate::net::syscall::sys_recvmmsg(
+            a[0] as i32,
+            UserPtr::new(a[1]),
+            a[2] as u32,
+            a[3] as i32,
+            UserPtr::new(a[4]),
+        )
+        .ret() as u64,
         Sys::Recvmsg => {
-            crate::net::syscall::sys_recvmsg(a[0] as i32, a[1], a[2] as i32).ret() as u64
+            crate::net::syscall::sys_recvmsg(a[0] as i32, UserPtr::new(a[1]), a[2] as i32).ret()
+                as u64
         }
         Sys::Removexattr => crate::fs::syscall::sys_removexattr(a[0], a[1]).ret() as u64,
         Sys::Renameat => {
@@ -815,17 +847,26 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
             crate::fs::splice::sys_sendfile64(a[0] as i32, a[1] as i32, a[2], a[3] as usize).ret()
                 as u64
         }
-        Sys::Sendmmsg => {
-            crate::net::syscall::sys_sendmmsg(a[0] as i32, a[1], a[2] as u32, a[3] as i32).ret()
-                as u64
-        }
+        Sys::Sendmmsg => crate::net::syscall::sys_sendmmsg(
+            a[0] as i32,
+            UserPtr::new(a[1]),
+            a[2] as u32,
+            a[3] as i32,
+        )
+        .ret() as u64,
         Sys::Sendmsg => {
-            crate::net::syscall::sys_sendmsg(a[0] as i32, a[1], a[2] as i32).ret() as u64
-        }
-        Sys::Sendto => {
-            crate::net::syscall::sys_sendto(a[0] as i32, a[1], a[2], a[3] as i32, a[4], a[5]).ret()
+            crate::net::syscall::sys_sendmsg(a[0] as i32, UserPtr::new(a[1]), a[2] as i32).ret()
                 as u64
         }
+        Sys::Sendto => crate::net::syscall::sys_sendto(
+            a[0] as i32,
+            UserPtr::new(a[1]),
+            a[2],
+            a[3] as i32,
+            UserPtr::new(a[4]),
+            a[5],
+        )
+        .ret() as u64,
         Sys::Setdomainname => crate::ns::uts::sys_setdomainname(a[0], a[1]).ret() as u64,
         Sys::Setfsgid => {
             crate::task::syscall::sys_setfsgid(a[0] as u32, crate::task::percpu::current_cred())
@@ -889,10 +930,14 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
         Sys::Setsid => {
             crate::task::syscall::sys_setsid(crate::task::percpu::current_pid()).ret() as u64
         }
-        Sys::Setsockopt => {
-            crate::net::syscall::sys_setsockopt(a[0] as i32, a[1] as i32, a[2] as i32, a[3], a[4])
-                as u64
-        }
+        Sys::Setsockopt => crate::net::syscall::sys_setsockopt(
+            a[0] as i32,
+            a[1] as i32,
+            a[2] as i32,
+            UserPtr::new(a[3]),
+            a[4] as i32,
+        )
+        .ret() as u64,
         Sys::Settimeofday => crate::time::time_syscall::sys_settimeofday(a[0], a[1]).ret() as u64,
         Sys::Setuid => {
             crate::task::syscall::sys_setuid(a[0] as u32, crate::task::percpu::current_cred())
@@ -918,10 +963,13 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
         Sys::Socket => {
             crate::net::syscall::sys_socket(a[0] as i32, a[1] as i32, a[2] as i32).ret() as u64
         }
-        Sys::Socketpair => {
-            crate::net::syscall::sys_socketpair(a[0] as i32, a[1] as i32, a[2] as i32, a[3]).ret()
-                as u64
-        }
+        Sys::Socketpair => crate::net::syscall::sys_socketpair(
+            a[0] as i32,
+            a[1] as i32,
+            a[2] as i32,
+            UserPtr::new(a[3]),
+        )
+        .ret() as u64,
         Sys::Splice => crate::fs::splice::sys_splice(
             a[0] as i32,
             a[1],

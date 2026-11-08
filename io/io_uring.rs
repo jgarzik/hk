@@ -54,7 +54,8 @@ use crate::mm::PAGE_SIZE;
 use crate::sync::waitqueue::WaitQueue;
 use crate::task::fdtable::get_task_fd;
 use crate::task::percpu::current_tid;
-use crate::uaccess::{copy_from_user, copy_val_from_user, get_user, put_user};
+use crate::uaccess::{UserPtr, copy_from_user, copy_val_from_user, get_user, put_user};
+use crate::util::error::SysRet;
 
 // ============================================================================
 // io_uring constants
@@ -1107,9 +1108,11 @@ impl IoUring {
 
         // Use accept4 if flags are provided, otherwise accept
         if flags != 0 {
-            crate::net::syscall::sys_accept4(fd, addr, addrlen, flags) as i32
+            crate::net::syscall::sys_accept4(fd, UserPtr::new(addr), UserPtr::new(addrlen), flags)
+                .ret() as i32
         } else {
-            crate::net::syscall::sys_accept(fd, addr, addrlen) as i32
+            crate::net::syscall::sys_accept(fd, UserPtr::new(addr), UserPtr::new(addrlen)).ret()
+                as i32
         }
     }
 
@@ -1119,7 +1122,7 @@ impl IoUring {
         let addr = sqe.addr;
         let addrlen = sqe.off;
 
-        crate::net::syscall::sys_connect(fd, addr, addrlen) as i32
+        crate::net::syscall::sys_connect(fd, UserPtr::new(addr), addrlen).ret() as i32
     }
 
     /// Handle IORING_OP_SEND - send data on a socket
@@ -1130,7 +1133,8 @@ impl IoUring {
         let flags = sqe.op_flags as i32;
 
         // send is equivalent to sendto with NULL destination
-        crate::net::syscall::sys_sendto(fd, buf, len, flags, 0, 0) as i32
+        crate::net::syscall::sys_sendto(fd, UserPtr::new(buf), len, flags, UserPtr::new(0), 0).ret()
+            as i32
     }
 
     /// Handle IORING_OP_RECV - receive data from a socket
@@ -1141,7 +1145,15 @@ impl IoUring {
         let flags = sqe.op_flags as i32;
 
         // recv is equivalent to recvfrom with NULL source
-        crate::net::syscall::sys_recvfrom(fd, buf, len, flags, 0, 0) as i32
+        crate::net::syscall::sys_recvfrom(
+            fd,
+            UserPtr::new(buf),
+            len,
+            flags,
+            UserPtr::new(0),
+            UserPtr::new(0),
+        )
+        .ret() as i32
     }
 
     /// Handle IORING_OP_SENDMSG - send a message on a socket
@@ -1150,7 +1162,7 @@ impl IoUring {
         let msg = sqe.addr;
         let flags = sqe.op_flags as i32;
 
-        crate::net::syscall::sys_sendmsg(fd, msg, flags) as i32
+        crate::net::syscall::sys_sendmsg(fd, UserPtr::new(msg), flags).ret() as i32
     }
 
     /// Handle IORING_OP_RECVMSG - receive a message from a socket
@@ -1159,7 +1171,7 @@ impl IoUring {
         let msg = sqe.addr;
         let flags = sqe.op_flags as i32;
 
-        crate::net::syscall::sys_recvmsg(fd, msg, flags) as i32
+        crate::net::syscall::sys_recvmsg(fd, UserPtr::new(msg), flags).ret() as i32
     }
 
     /// Handle IORING_OP_SHUTDOWN - shutdown part of a socket
@@ -1167,7 +1179,7 @@ impl IoUring {
         let fd = sqe.fd;
         let how = sqe.len as i32; // how is in len field
 
-        crate::net::syscall::sys_shutdown(fd, how) as i32
+        crate::net::syscall::sys_shutdown(fd, how).ret() as i32
     }
 }
 

@@ -26,6 +26,7 @@ Order: 2 goes per subsystem (M1); let-else is done and linted
 - **Feature:** `?` / `From` conversion (old). The newer helpers used here are
   `Option::ok_or`, `is_none_or` (1.82) and let-else (1.65). The point is that 257+
   `sys_*` fns return a bare `i64`, so `?` can't be used in any of them.
+- **Done:** net/ (its 18 `sys_*` return `KernelResult` and take `UserPtr`).
 - **Evidence (counts):**
   - 81 x `let v = match f() { Ok(v) => v, Err(e) => return e.sysret(), };` (4 lines)
   - 22 x `if let Err(e) = f() { return e.sysret(); }` (3 lines)
@@ -35,7 +36,7 @@ Order: 2 goes per subsystem (M1); let-else is done and linted
   - 85 x `if put_user(..).is_err() { return KernelError::BadAddress.sysret(); }`
   - 61 x `.map_err(|_| KernelError::BadAddress)`. There is no
     `impl From<UaccessError> for KernelError` (uaccess.rs:67).
-  - 3 copies of a local `fn ret()` (fs/perm.rs:47, fs/stat.rs:73, net/syscall.rs:23)
+  - 2 copies of a local `fn ret()` (fs/perm.rs:47, fs/stat.rs:73)
   - 39 ad-hoc `Result<_, i64>` errno-as-error fns (fs/io.rs:198 `one_seg`, :210 `pos_arg`)
   - 739 `return KernelError::X.sysret();`. These become `return Err(KernelError::X)`
     (same LOC) and type-check against the error enum.

@@ -364,7 +364,7 @@ fn put_fds(m: &mut RecvMsg<'_>, fpl: FpList) {
     // reference under the table lock
     for f in files.iter().take(max) {
         match crate::net::syscall::fd_install(f.clone(), cloexec) {
-            Ok(fd) => fds.extend_from_slice(&(fd as i32).to_ne_bytes()),
+            Ok(fd) => fds.extend_from_slice(&fd.to_ne_bytes()),
             Err(_) => break,
         }
     }
