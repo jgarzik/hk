@@ -342,7 +342,7 @@ pub fn commit_creds(new: Arc<Cred>) {
 /// execve's RLIMIT_NPROC check (Linux do_execveat_common): EAGAIN if a
 /// real-uid change flagged the task and it is still over; else the flag
 /// is cleared
-pub fn nproc_exec_check() -> Result<(), i32> {
+pub fn nproc_exec_check() -> KernelResult<()> {
     let tid = percpu::current_tid();
     let uid = current_cred().uid;
     // rlimit() takes TASKLIST: decide before locking it
@@ -352,7 +352,7 @@ pub fn nproc_exec_check() -> Result<(), i32> {
         return Ok(());
     };
     if t.task.has_flag(crate::task::pf::NPROC_EXCEEDED) && over {
-        return Err(KernelError::WouldBlock.errno());
+        return Err(KernelError::WouldBlock);
     }
     t.task.clear_flag(crate::task::pf::NPROC_EXCEEDED);
     Ok(())

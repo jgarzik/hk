@@ -578,7 +578,10 @@ fn try_init(path: &str, args: &cmdline::InitArgs) -> i32 {
         return -e.errno();
     }
     let mut frame_alloc = mm::frame_alloc::FrameAllocRef(&FRAME_ALLOCATOR);
-    task::exec::do_execve(path.as_bytes().to_vec(), argv, envp, &mut frame_alloc)
+    match task::exec::do_execve(path.as_bytes().to_vec(), argv, envp, &mut frame_alloc) {
+        Ok(never) => match never {},
+        Err(e) => e.to_errno_neg(),
+    }
 }
 
 /// Default RAM disk size in MB

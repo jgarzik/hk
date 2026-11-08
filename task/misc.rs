@@ -7,7 +7,8 @@
 //! - capget, capset (capabilities)
 //! - pidfd_open, pidfd_send_signal, pidfd_getfd (pidfd operations)
 
-use crate::util::error::KernelError;
+use crate::uaccess::UserPtr;
+use crate::util::error::{KernelError, KernelResult};
 use crate::util::kalloc::try_arc;
 use crate::util::pod::FromBytes;
 
@@ -226,20 +227,13 @@ fn timeval_from_ns(ns: u64) -> Timeval {
 ///
 /// Used by waitid()/wait4() to report a reaped child's resource usage.
 /// Fields other than utime/stime are not tracked and are zeroed.
-pub fn put_rusage_times<A: crate::uaccess::UaccessArch>(
-    usage_ptr: u64,
-    utime_ns: u64,
-    stime_ns: u64,
-) -> Result<(), KernelError> {
-    let usage = Rusage {
+pub fn put_rusage_times(usage: UserPtr<Rusage>, utime_ns: u64, stime_ns: u64) -> KernelResult<()> {
+    let r = Rusage {
         ru_utime: timeval_from_ns(utime_ns),
         ru_stime: timeval_from_ns(stime_ns),
         ..Rusage::default()
     };
-    if !A::access_ok(usage_ptr, core::mem::size_of::<Rusage>()) {
-        return Err(KernelError::BadAddress);
-    }
-    crate::uaccess::put_user::<A, Rusage>(usage_ptr, usage).map_err(|_| KernelError::BadAddress)
+    Ok(usage.write(&r)?)
 }
 
 /// struct tms (Linux include/uapi/linux/times.h), in clock ticks

@@ -56,6 +56,7 @@ pub mod vfat;
 
 // Re-exports for convenience
 pub use crate::util::error::KernelError;
+use crate::util::error::KernelResult;
 pub use blkdev_ops::BLOCK_FILE_OPS;
 pub use cgroupfs::{CGROUPFS_FILE_OPS, CGROUPFS_TYPE};
 pub use cpio::unpack_cpio;
@@ -88,33 +89,32 @@ use crate::util::kalloc::try_arc;
 /// only if some x bit is set; directories and devices EACCES) and a
 /// regular file. Kernel-internal callers (init) have root credentials.
 ///
-/// Returns a read-only file, or a positive errno (ENOENT, EACCES, ...).
-pub fn kernel_open_exec(path: &[u8]) -> Result<Arc<File>, i32> {
+/// Returns a read-only file, or ENOENT, EACCES, ...
+pub fn kernel_open_exec(path: &[u8]) -> KernelResult<Arc<File>> {
     let p = namei::path_lookupat(
         crate::task::percpu::current_cwd(),
         path,
         LookupFlags::open(),
-    )
-    .map_err(|e| e as i32)?;
+    )?;
     open_exec(p)
 }
 
 /// The checks and open of kernel_open_exec on a dentry already looked up
 /// (execveat: relative to a dirfd, the dirfd's own file, or a final
 /// symlink not followed, which is ELOOP like Linux's may_open)
-pub fn open_exec(path: Path) -> Result<Arc<File>, i32> {
+pub fn open_exec(path: Path) -> KernelResult<Arc<File>> {
     let dentry = path.dentry.clone();
-    let inode = dentry.get_inode().ok_or(KernelError::NotFound as i32)?;
+    let inode = dentry.get_inode().ok_or(KernelError::NotFound)?;
     if inode.mode().is_symlink() {
-        return Err(KernelError::TooManySymlinks as i32);
+        return Err(KernelError::TooManySymlinks);
     }
     // may_open: no exec from a noexec mount (path_noexec)
     if inode.mode().is_file() && path.mnt.flags() & mount::MNT_NOEXEC != 0 {
-        return Err(KernelError::PermissionDenied as i32);
+        return Err(KernelError::PermissionDenied);
     }
-    dac::may_open(&dac::cred(), &inode, MAY_EXEC, flags::O_RDONLY).map_err(|e| e as i32)?;
+    dac::may_open(&dac::cred(), &inode, MAY_EXEC, flags::O_RDONLY)?;
     if !inode.mode().is_file() {
-        return Err(KernelError::PermissionDenied as i32);
+        return Err(KernelError::PermissionDenied);
     }
     let f_op: &'static dyn FileOps = dentry
         .superblock()
@@ -126,7 +126,6 @@ pub fn open_exec(path: Path) -> Result<Arc<File>, i32> {
         flags::O_RDONLY,
         f_op,
     ))
-    .map_err(|e| e as i32)
 }
 
 // ============================================================================

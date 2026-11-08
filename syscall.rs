@@ -332,9 +332,10 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
             } else {
                 (a[3], a[4])
             };
-            crate::task::syscall::sys_clone(a[0], a[1], a[2], ctid, tls).ret() as u64
+            crate::task::syscall::sys_clone(a[0], a[1], UserPtr::new(a[2]), UserPtr::new(ctid), tls)
+                .ret() as u64
         }
-        Sys::Clone3 => crate::task::syscall::sys_clone3(a[0], a[1]).ret() as u64,
+        Sys::Clone3 => crate::task::syscall::sys_clone3(UserPtr::new(a[0]), a[1]).ret() as u64,
         Sys::Close => crate::fs::syscall::sys_close(a[0] as i32).ret() as u64,
         Sys::CloseRange => {
             crate::fs::syscall::sys_close_range(a[0] as u32, a[1] as u32, a[2] as u32).ret() as u64
@@ -384,10 +385,20 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
         Sys::Eventfd2 => {
             crate::time::time_syscall::sys_eventfd2(a[0] as u32, a[1] as i32).ret() as u64
         }
-        Sys::Execve => crate::task::exec::sys_execve(a[0], a[1], a[2]).ret() as u64,
-        Sys::Execveat => {
-            crate::task::exec::sys_execveat(a[0] as i32, a[1], a[2], a[3], a[4] as i32).ret() as u64
-        }
+        Sys::Execve => crate::task::exec::sys_execve(
+            UserPtr::new(a[0]),
+            UserPtr::new(a[1]),
+            UserPtr::new(a[2]),
+        )
+        .ret() as u64,
+        Sys::Execveat => crate::task::exec::sys_execveat(
+            a[0] as i32,
+            UserPtr::new(a[1]),
+            UserPtr::new(a[2]),
+            UserPtr::new(a[3]),
+            a[4] as i32,
+        )
+        .ret() as u64,
         Sys::Exit => crate::task::syscall::sys_exit(a[0] as i32),
         Sys::ExitGroup => crate::task::proc::sys_exit_group(a[0] as i32),
         Sys::Faccessat => {
@@ -1175,7 +1186,9 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
                 as u64
         }
         Sys::SetRobustList => crate::task::futex::sys_set_robust_list(a[0], a[1]).ret() as u64,
-        Sys::SetTidAddress => crate::task::syscall::sys_set_tid_address(a[0]).ret() as u64,
+        Sys::SetTidAddress => {
+            crate::task::syscall::sys_set_tid_address(UserPtr::new(a[0])).ret() as u64
+        }
         Sys::Shmat => crate::ipc::sys_shmat(a[0] as i32, a[1], a[2] as i32).ret() as u64,
         Sys::Shmctl => {
             crate::ipc::sys_shmctl(a[0] as i32, a[1] as i32, UserPtr::new(a[2])).ret() as u64
@@ -1320,12 +1333,21 @@ pub fn dispatch(sys: Sys, a: [u64; 6]) -> u64 {
             a[3] as u32,
         )
         .ret() as u64,
-        Sys::Wait4 => {
-            crate::task::syscall::sys_wait4(i64::from(a[0] as i32), a[1], a[2] as i32, a[3]).ret()
-                as u64
-        }
-        Sys::Waitid => crate::task::syscall::sys_waitid(a[0] as i32, a[1], a[2], a[3] as i32, a[4])
-            .ret() as u64,
+        Sys::Wait4 => crate::task::syscall::sys_wait4(
+            i64::from(a[0] as i32),
+            UserPtr::new(a[1]),
+            a[2] as i32,
+            UserPtr::new(a[3]),
+        )
+        .ret() as u64,
+        Sys::Waitid => crate::task::syscall::sys_waitid(
+            a[0] as i32,
+            a[1],
+            UserPtr::new(a[2]),
+            a[3] as i32,
+            UserPtr::new(a[4]),
+        )
+        .ret() as u64,
         Sys::Write => {
             crate::fs::syscall::sys_write(a[0] as i32, UserPtr::new(a[1]), a[2]).ret() as u64
         }

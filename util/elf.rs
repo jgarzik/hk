@@ -247,15 +247,13 @@ pub enum ElfError {
     BadSegment,
 }
 
-impl ElfError {
-    /// Positive errno
-    pub fn errno(self) -> i32 {
-        let e = match self {
+impl From<ElfError> for KernelError {
+    fn from(e: ElfError) -> Self {
+        match e {
             ElfError::NotExecutable => KernelError::ExecFormat,
             ElfError::Truncated => KernelError::Io,
             ElfError::BadSegment => KernelError::InvalidArgument,
-        };
-        e.errno()
+        }
     }
 }
 
