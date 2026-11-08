@@ -2,15 +2,17 @@
 //! seen at every call, SOCK_NONBLOCK, SO_RCVTIMEO timeouts, signals
 //! (EINTR without SA_RESTART, restart with it, EINTR when a socket
 //! timeout is set), FIONREAD/SIOCOUTQ, EPIPE with and without SIGPIPE,
-//! TCP accept/poll/WAITALL/PEEK/RDHUP and non-blocking connect.
+//! TCP accept/poll/WAITALL/PEEK/RDHUP and non-blocking connect, and
+//! data written ahead of a close read before EOF.
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use hk_syscall::{
     AF_INET, O_NONBLOCK, SA_RESTART, SA_RESTORER, SHUT_WR, SIG_DFL, SIG_IGN, SIGPIPE, SIGUSR1,
     SOCK_CLOEXEC, SOCK_DGRAM, SOCK_NONBLOCK, SOCK_STREAM, sys_accept, sys_accept4, sys_exit,
-    sys_fcntl, sys_fork, sys_getppid, sys_ioctl, sys_kill, sys_listen, sys_rt_sigaction,
-    sys_setsockopt, sys_shutdown, sys_socket, sys_wait4,
+    sys_fcntl, sys_fork, sys_getppid, sys_ioctl, sys_kill, sys_listen, sys_pipe, sys_read,
+    sys_rt_sigaction, sys_setsockopt, sys_shutdown, sys_socket, sys_socketpair, sys_wait4,
+    sys_write,
 };
 
 use crate::harness::T;
@@ -40,6 +42,7 @@ pub fn run_tests() {
     test_tcp_recv_flags();
     test_tcp_rdhup();
     test_tcp_nb_connect();
+    test_eof_after_data();
 }
 
 /// fcntl(O_NONBLOCK) on and off takes effect on the next call
@@ -382,4 +385,96 @@ fn test_tcp_nb_connect() {
     close(c);
     close(l);
     t.done();
+}
+
+/// Rounds per channel kind of NONBLOCK_EOF_AFTER_DATA
+const EOF_ROUNDS: usize = 64;
+
+/// A reader spinning in non-blocking reads as the writer writes one
+/// byte and closes gets the byte, then EOF: never EOF first (pipe,
+/// AF_UNIX stream, TCP loopback). Linux decides EOF with the queue
+/// empty under one lock (pipe->mutex, unix_state_lock, lock_sock).
+fn test_eof_after_data() {
+    let mut t = T::new(b"NONBLOCK_EOF_AFTER_DATA");
+    let l = tcp();
+    bind(l, LO, 0);
+    sys_listen(l, 4);
+    let kinds: [&[u8]; 3] = [b"pipe", b"unix", b"tcp"];
+    for (k, why) in kinds.iter().enumerate() {
+        for _ in 0..EOF_ROUNDS {
+            let r = eof_round(k, l);
+            if !t.eq(why, r, 1) {
+                break;
+            }
+        }
+    }
+    close(l);
+    t.done();
+}
+
+/// A connected (reader, writer) pair of kind `k` (0 pipe, 1 AF_UNIX
+/// stream, 2 TCP through listener `l`)
+fn eof_pair(k: usize, l: i32) -> (i32, i32) {
+    let mut p = [0i32; 2];
+    match k {
+        0 => {
+            sys_pipe(p.as_mut_ptr());
+            (p[0], p[1])
+        }
+        1 => {
+            let mut sv = [0i32; 2];
+            sys_socketpair(hk_syscall::AF_UNIX, SOCK_STREAM, 0, &mut sv);
+            (sv[0], sv[1])
+        }
+        _ => {
+            let c = tcp();
+            connect(c, LO, port(l));
+            (
+                sys_accept(l, core::ptr::null_mut(), core::ptr::null_mut()) as i32,
+                c,
+            )
+        }
+    }
+}
+
+/// One round: 1 = the byte, then EOF; 0 = EOF first; else the error
+fn eof_round(k: usize, l: i32) -> i64 {
+    let (r, w) = eof_pair(k, l);
+    let mut go = [0i32; 2];
+    sys_pipe(go.as_mut_ptr());
+    let pid = sys_fork();
+    if pid == 0 {
+        close(r);
+        close(go[1]);
+        let mut b = [0u8; 1];
+        sys_read(go[0] as u64, b.as_mut_ptr(), 1);
+        sys_write(w as u64, b"x".as_ptr(), 1);
+        close(w);
+        sys_exit(0);
+    }
+    close(w);
+    close(go[0]);
+    let fl = sys_fcntl(r, F_GETFL, 0) as u64;
+    sys_fcntl(r, F_SETFL, fl | O_NONBLOCK as u64);
+    sys_write(go[1] as u64, b"g".as_ptr(), 1);
+    let mut b = [0u8; 2];
+    let t0 = now_ms();
+    let mut got = loop {
+        let n = sys_read(r as u64, b.as_mut_ptr(), 2);
+        if n != EAGAIN || now_ms() - t0 > 10_000 {
+            break n;
+        }
+    };
+    if got == 1 {
+        // EOF follows (the close may still be on its way)
+        sys_fcntl(r, F_SETFL, fl);
+        let n = sys_read(r as u64, b.as_mut_ptr(), 2);
+        if n != 0 {
+            got = if n < 0 { n } else { 100 + n };
+        }
+    }
+    close(go[1]);
+    close(r);
+    sys_wait4(pid as i64, core::ptr::null_mut(), 0, 0);
+    got
 }

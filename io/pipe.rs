@@ -666,10 +666,14 @@ fn pipe_read_wait(pipe: &Pipe, to: &mut IovDest<'_>, nonblock: bool) -> Result<u
             pipe.wake_wr();
             return r;
         }
-        drop(inner);
+        // EOF is decided under the lock that saw the ring empty (Linux
+        // pipe_read checks pipe->writers under pipe->mutex): a writer's
+        // last write unlocks before its close drops the count, so data
+        // written before the close is never mistaken for EOF
         if !pipe.has_writers() {
             return Ok(0);
         }
+        drop(inner);
         if nonblock {
             return Err(KernelError::WouldBlock);
         }

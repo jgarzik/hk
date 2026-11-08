@@ -349,10 +349,22 @@ fn read_some(
                 if g.copied >= target {
                     return Ok(None);
                 }
-                if let Some(e) = s.sk.take_err() {
+                // Linux tests the end conditions with the queue empty
+                // under unix_state_lock; here the peer may queue and
+                // then shut down after the queue looked empty, so an
+                // end counts only if nothing was queued ahead of it. The
+                // ends are sampled once: one that lands after the queue
+                // check is left for the next pass.
+                let seen = if peek { *peek_at } else { 0 };
+                let err = s.sk.has_err();
+                let shut = super::rcv_shut(s);
+                if (err || shut) && s.rq.lock().q.len() > seen {
+                    continue;
+                }
+                if err && let Some(e) = s.sk.take_err() {
                     return Err(e);
                 }
-                if super::rcv_shut(s) {
+                if shut {
                     return Ok(None);
                 }
                 if timeo == 0 {
