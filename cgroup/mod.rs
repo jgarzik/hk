@@ -698,22 +698,20 @@ pub static CGROUP_MUTEX: crate::sync::Mutex<()> = crate::sync::Mutex::new(());
 /// CGROUP_MUTEX; above TASKLIST and the cgroup spin locks.
 pub static CGROUP_THREADGROUP_RWSEM: crate::sync::RwSem<()> = crate::sync::RwSem::new(());
 
-/// The threads of the process `pid` names (any of its threads; 0: the
-/// caller's): ESRCH if none (Linux cgroup_procs_write_start finds the
-/// task, then its group leader's whole group)
+/// The threads of the process `pid` names in the caller's pid
+/// namespace (any of its threads; 0: the caller's): ESRCH if none
+/// (Linux cgroup_procs_write_start finds the task by find_task_by_vpid,
+/// then its group leader's whole group; exiting threads are skipped)
 pub fn thread_group(pid: Pid) -> Result<Vec<crate::task::percpu::TaskRef>, KernelError> {
-    let table = crate::task::percpu::TASKLIST.read();
-    let tid = if pid == 0 {
-        crate::task::percpu::current_tid()
+    use crate::task::percpu::{GlobalTaskTable, current, find_task_by_vpid, task_ref};
+    let t = if pid == 0 {
+        task_ref(&current())
     } else {
-        pid as Tid
+        find_task_by_vpid(pid).ok_or(KernelError::NoProcess)?
     };
-    let tgid = table.get(tid).ok_or(KernelError::NoProcess)?.task.pid;
-    Ok(table
-        .iter()
-        .filter(|t| t.task.pid == tgid && !t.task.has_flag(crate::task::pf::EXITING))
-        .map(|t| crate::task::percpu::task_ref(t.task))
-        .collect())
+    Ok(GlobalTaskTable::collect_group(&t, |_, x| {
+        (!x.task.has_flag(crate::task::pf::EXITING)).then(|| task_ref(x.task))
+    }))
 }
 
 /// Create a child cgroup (Linux cgroup_mkdir: ENODEV in a removed
@@ -787,8 +785,6 @@ pub fn cgroup_rmdir(parent: &Arc<Cgroup>, name: &str) -> Result<(), KernelError>
 // ============================================================================
 // Helper functions for task integration (clone/exit)
 // ============================================================================
-
-use crate::task::Tid;
 
 /// A child admitted into its cgroup before it exists (Linux
 /// cgroup_can_fork .. cgroup_post_fork / cgroup_cancel_fork): the
