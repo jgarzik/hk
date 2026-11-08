@@ -91,6 +91,24 @@ pub trait Pod: FromBytes + IntoBytes {
 
 impl<T: FromBytes + IntoBytes> Pod for T {}
 
+/// The bytes of a slice of plain values
+#[inline]
+pub fn slice_bytes<T: IntoBytes>(s: &[T]) -> &[u8] {
+    // SAFETY: the slice's own memory, all initialized (IntoBytes: no
+    // padding)
+    unsafe { core::slice::from_raw_parts(s.as_ptr().cast::<u8>(), core::mem::size_of_val(s)) }
+}
+
+/// The bytes of a slice of plain values, writable: any bytes written
+/// leave valid values
+#[inline]
+pub fn slice_bytes_mut<T: Pod>(s: &mut [T]) -> &mut [u8] {
+    let n = core::mem::size_of_val(s);
+    // SAFETY: the slice's own memory, initialized (IntoBytes); any bytes
+    // written are valid values (FromBytes)
+    unsafe { core::slice::from_raw_parts_mut(s.as_mut_ptr().cast::<u8>(), n) }
+}
+
 macro_rules! prim {
     ($($t:ty),*) => {$(
         // SAFETY: an integer: every bit pattern valid, no padding

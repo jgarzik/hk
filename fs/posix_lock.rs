@@ -55,6 +55,15 @@ pub struct Flock {
     /// Explicit tail padding (always zero)
     pub _pad1: u32,
 }
+crate::pod!(Flock {
+    l_type,
+    l_whence,
+    _pad0,
+    l_start,
+    l_len,
+    l_pid,
+    _pad1
+});
 
 const _: () = assert!(core::mem::size_of::<Flock>() == 32);
 

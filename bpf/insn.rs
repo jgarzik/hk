@@ -19,6 +19,12 @@ pub struct BpfInsn {
     /// Signed immediate constant
     pub imm: i32,
 }
+crate::pod!(BpfInsn {
+    code,
+    regs,
+    off,
+    imm
+});
 
 impl BpfInsn {
     /// Create a new eBPF instruction

@@ -5,14 +5,13 @@
 //! - fcntl (file control operations)
 //! - truncate, ftruncate (file size modification)
 //! - pipe, pipe2 (pipe creation)
-#![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use alloc::sync::Arc;
 
 use crate::arch::Uaccess;
 use crate::fs::{KernelError, LookupFlags};
 use crate::task::percpu::current_tid;
-use crate::uaccess::{copy_from_user, copy_to_user};
+use crate::uaccess::{copy_val_from_user, copy_val_to_user, put_user};
 
 use super::file::File;
 use super::posix_lock::{Flock, posix_getlk, posix_setlk, posix_setlkw};
@@ -320,7 +319,6 @@ pub fn sys_pipe(pipefd: u64) -> i64 {
 pub fn sys_pipe2(pipefd: u64, flags: u32) -> i64 {
     use crate::fs::file::flags::{O_CLOEXEC, O_NONBLOCK};
     use crate::io::pipe::{FD_CLOEXEC, create_pipe};
-    use crate::uaccess::copy_to_user;
 
     // Validate flags - only O_CLOEXEC and O_NONBLOCK are allowed
     const VALID_FLAGS: u32 = O_CLOEXEC | O_NONBLOCK;
@@ -369,13 +367,8 @@ pub fn sys_pipe2(pipefd: u64, flags: u32) -> i64 {
     drop(table);
 
     // Write file descriptors to user space
-    let fds: [i32; 2] = [read_fd, write_fd];
-    let fds_bytes = unsafe {
-        core::slice::from_raw_parts(fds.as_ptr().cast::<u8>(), core::mem::size_of::<[i32; 2]>())
-    };
-
-    match copy_to_user::<Uaccess>(pipefd, fds_bytes) {
-        Ok(_) => 0,
+    match put_user::<Uaccess, [i32; 2]>(pipefd, [read_fd, write_fd]) {
+        Ok(()) => 0,
         Err(_) => {
             // Clean up on error
             let mut table = fd_table.lock();
@@ -539,14 +532,9 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> i64 {
             drop(table); // Release FD table lock before copying
 
             // Copy flock from user
-            let mut flock = Flock::default();
-            let flock_size = core::mem::size_of::<Flock>();
-            let flock_bytes = unsafe {
-                core::slice::from_raw_parts_mut((&raw mut flock).cast::<u8>(), flock_size)
-            };
-            if copy_from_user::<Uaccess>(flock_bytes, arg, flock_size).is_err() {
+            let Ok(mut flock) = copy_val_from_user::<Uaccess, Flock>(arg) else {
                 return KernelError::BadAddress.sysret();
-            }
+            };
 
             // Do the getlk
             if let Err(e) = posix_getlk(&file, &mut flock) {
@@ -554,9 +542,7 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> i64 {
             }
 
             // Copy result back
-            let flock_bytes =
-                unsafe { core::slice::from_raw_parts((&raw const flock).cast::<u8>(), flock_size) };
-            if copy_to_user::<Uaccess>(arg, flock_bytes).is_err() {
+            if copy_val_to_user::<Uaccess, Flock>(arg, &flock).is_err() {
                 return KernelError::BadAddress.sysret();
             }
 
@@ -572,14 +558,9 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> i64 {
             drop(table);
 
             // Copy flock from user
-            let mut flock = Flock::default();
-            let flock_size = core::mem::size_of::<Flock>();
-            let flock_bytes = unsafe {
-                core::slice::from_raw_parts_mut((&raw mut flock).cast::<u8>(), flock_size)
-            };
-            if copy_from_user::<Uaccess>(flock_bytes, arg, flock_size).is_err() {
+            let Ok(flock) = copy_val_from_user::<Uaccess, Flock>(arg) else {
                 return KernelError::BadAddress.sysret();
-            }
+            };
 
             match posix_setlk(&file, &flock) {
                 Ok(range) => {
@@ -599,14 +580,9 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> i64 {
             drop(table);
 
             // Copy flock from user
-            let mut flock = Flock::default();
-            let flock_size = core::mem::size_of::<Flock>();
-            let flock_bytes = unsafe {
-                core::slice::from_raw_parts_mut((&raw mut flock).cast::<u8>(), flock_size)
-            };
-            if copy_from_user::<Uaccess>(flock_bytes, arg, flock_size).is_err() {
+            let Ok(flock) = copy_val_from_user::<Uaccess, Flock>(arg) else {
                 return KernelError::BadAddress.sysret();
-            }
+            };
 
             match posix_setlkw(&file, &flock) {
                 Ok(range) => {

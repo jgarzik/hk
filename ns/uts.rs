@@ -20,7 +20,7 @@ use alloc::sync::Arc;
 use spin::Lazy;
 
 use crate::arch::Uaccess;
-use crate::uaccess::{UaccessArch, copy_from_user, copy_to_user};
+use crate::uaccess::{UaccessArch, copy_from_user};
 use crate::util::error::KernelError;
 
 /// Maximum string length for UTS fields (not including NUL terminator)
@@ -65,6 +65,14 @@ pub struct NewUtsname {
     /// NIS domain name (set via setdomainname)
     pub domainname: [u8; UTS_FIELD_SIZE],
 }
+crate::pod!(NewUtsname {
+    sysname,
+    nodename,
+    release,
+    version,
+    machine,
+    domainname
+});
 
 impl Default for NewUtsname {
     fn default() -> Self {
@@ -206,14 +214,7 @@ pub fn sys_uname(buf: u64) -> i64 {
     let tmp: NewUtsname = *uts_ns.name.read();
 
     // Copy to user space
-    // SAFETY: NewUtsname is repr(C) plain bytes with no padding
-    let bytes = unsafe {
-        core::slice::from_raw_parts(
-            (&raw const tmp).cast::<u8>(),
-            core::mem::size_of::<NewUtsname>(),
-        )
-    };
-    if copy_to_user::<Uaccess>(buf, bytes).is_err() {
+    if crate::uaccess::copy_val_to_user::<Uaccess, NewUtsname>(buf, &tmp).is_err() {
         return KernelError::BadAddress.sysret();
     }
 

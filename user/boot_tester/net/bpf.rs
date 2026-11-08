@@ -9,6 +9,10 @@
 //! - Test BPF program load
 //! - Test invalid map type
 //! - Test invalid fd
+//! - BPF_MAP_INFO: BPF_OBJ_GET_INFO_BY_FD fills struct bpf_map_info,
+//!   writes the length it used back to attr.info.info_len, takes a
+//!   larger buffer whose extra bytes are zero, and is E2BIG when they
+//!   are not (bpf_check_uarg_tail_zero)
 
 use crate::harness::{fail_num, pass};
 use crate::helpers::{print, print_num, println};
@@ -98,6 +102,85 @@ pub fn run_tests() {
     test_prog_load_big();
     test_invalid_map_type();
     test_invalid_fd();
+    test_map_info();
+}
+
+fn hash_attr(key_size: u32, value_size: u32, max_entries: u32) -> MapCreateAttr {
+    MapCreateAttr {
+        map_type: BPF_MAP_TYPE_HASH,
+        key_size,
+        value_size,
+        max_entries,
+        map_flags: 0,
+        inner_map_fd: 0,
+        numa_node: 0,
+        map_name: [0; 16],
+    }
+}
+
+fn map_create(attr: &MapCreateAttr) -> i64 {
+    sys_bpf(
+        BPF_MAP_CREATE,
+        attr as *const _ as u64,
+        size_of::<MapCreateAttr>() as u32,
+    )
+}
+
+/// union bpf_attr's info member
+#[repr(C)]
+struct InfoAttr {
+    bpf_fd: u32,
+    info_len: u32,
+    info: u64,
+}
+
+/// BPF_OBJ_GET_INFO_BY_FD of `fd` into `buf` claiming `len` bytes:
+/// (result, info_len written back)
+fn get_info(fd: i64, buf: &mut [u8], len: u32) -> (i64, u32) {
+    use hk_syscall::BPF_OBJ_GET_INFO_BY_FD;
+    let mut a = InfoAttr {
+        bpf_fd: fd as u32,
+        info_len: len,
+        info: buf.as_mut_ptr() as u64,
+    };
+    let r = sys_bpf(
+        BPF_OBJ_GET_INFO_BY_FD,
+        &mut a as *mut _ as u64,
+        size_of::<InfoAttr>() as u32,
+    );
+    (r, a.info_len)
+}
+
+fn test_map_info() {
+    const E2BIG: i64 = -7;
+    let mut t = crate::harness::T::new(b"BPF_MAP_INFO");
+    let fd = map_create(&hash_attr(4, 8, 10));
+    let u32_at = |b: &[u8], o: usize| u32::from_ne_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+    let mut buf = [0u8; 256];
+    let (r, len) = get_info(fd, &mut buf, 24);
+    t.eq(b"short", r, 0);
+    t.eq(b"short len", i64::from(len), 24);
+    let fields = [
+        u32_at(&buf, 0),
+        u32_at(&buf, 8),
+        u32_at(&buf, 12),
+        u32_at(&buf, 16),
+    ];
+    t.ok(
+        b"fields",
+        fields == [BPF_MAP_TYPE_HASH, 4, 8, 10],
+        i64::from(fields[0]),
+    );
+    let mut buf = [0u8; 256];
+    let (r, len) = get_info(fd, &mut buf, 256);
+    t.eq(b"long", r, 0);
+    // struct bpf_map_info: 88 bytes (Linux 6.8), 104 with the map hash
+    t.ok(b"long len", len == 88 || len == 104, i64::from(len));
+    let mut buf = [0u8; 256];
+    buf[200] = 1;
+    t.eq(b"tail", get_info(fd, &mut buf, 256).0, E2BIG);
+    sys_close(fd as u64);
+    t.done();
 }
 
 /// Test BPF hash map creation
