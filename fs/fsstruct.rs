@@ -24,7 +24,6 @@ use alloc::sync::Arc;
 use crate::sync::spin::Mutex;
 
 use super::path_ref::Path;
-use crate::task::Tid;
 use crate::util::error::KernelError;
 use crate::util::kalloc::{arc_nofail, try_arc};
 
@@ -177,7 +176,7 @@ impl FsStruct {
 // Task FS accessors - Task.fs under its alloc_lock (Linux task_lock)
 // =============================================================================
 
-use crate::task::percpu::{current, with_task_lock};
+use crate::task::Task;
 
 /// The fs_struct every kernel thread shares (Linux init_task.fs, 7.3+):
 /// root and cwd on the private nullfs instance `knullfs`, in no mount
@@ -195,42 +194,29 @@ pub fn kthread_fs_init(knullfs: Arc<super::Mount>) {
     KTHREAD_FS.call_once(|| FsStruct::new(root.clone(), root));
 }
 
-/// Initialize filesystem context for a new task (the task itself, or
+/// Initialize filesystem context for task `t` (the task itself, or
 /// its creator before it runs); the old one is dropped after the lock
-pub fn init_task_fs(tid: Tid, fs: Arc<FsStruct>) {
-    let old = with_task_lock(tid, |a| a.set_fs(Some(fs))).flatten();
+pub fn init_task_fs(t: &Task, fs: Arc<FsStruct>) {
+    let old = t.task_lock().set_fs(Some(fs));
     if let Some(o) = &old {
         o.users.fetch_sub(1, core::sync::atomic::Ordering::SeqCst);
     }
     drop(old);
 }
 
-/// Get the FsStruct for a task (returns cloned Arc; lock-free for the
-/// current task, Linux current->fs); a kernel thread's is
-/// [`KTHREAD_FS`]
-pub fn get_task_fs(tid: Tid) -> Option<Arc<FsStruct>> {
-    let me = current();
-    let fs = if me.tid() == tid {
-        me.fs()
-    } else {
-        with_task_lock(tid, |a| a.fs().cloned()).flatten()
-    };
-    fs.or_else(|| {
-        crate::task::kthread::is_kthread_tid(tid)
-            .then(|| KTHREAD_FS.get().cloned())
-            .flatten()
-    })
+/// The fs context of task `t` (a cloned Arc, under its alloc_lock; the
+/// current task's is `percpu::current_fs()`, lock-free); a kernel
+/// thread's is [`KTHREAD_FS`]
+pub fn get_task_fs(t: &Task) -> Option<Arc<FsStruct>> {
+    let fs = t.task_lock().fs().cloned();
+    fs.or_else(|| kthread_fs(t))
 }
 
-/// [`get_task_fs`] of the pinned task `t` (under its task_lock; a
-/// kernel thread's is [`KTHREAD_FS`])
-pub fn task_fs(t: &crate::task::Task) -> Option<Arc<FsStruct>> {
-    let fs = t.task_lock().fs().cloned();
-    fs.or_else(|| {
-        matches!(t.kind, crate::task::TaskKind::KernelThread)
-            .then(|| KTHREAD_FS.get().cloned())
-            .flatten()
-    })
+/// [`KTHREAD_FS`] for a kernel thread `t`, which has no fs of its own
+pub fn kthread_fs(t: &Task) -> Option<Arc<FsStruct>> {
+    matches!(t.kind, crate::task::TaskKind::KernelThread)
+        .then(|| KTHREAD_FS.get().cloned())
+        .flatten()
 }
 
 /// Remove filesystem context when task exits
@@ -239,31 +225,31 @@ pub fn task_fs(t: &crate::task::Task) -> Option<Arc<FsStruct>> {
 /// (no other tasks sharing this FsStruct), the FsStruct is dropped,
 /// which in turn drops the Path references to pwd and root (after
 /// the task's alloc_lock is released: nothing is released under it).
-pub fn exit_task_fs(tid: Tid) {
-    let fs = with_task_lock(tid, |a| a.set_fs(None)).flatten();
+pub fn exit_task_fs(t: &Task) {
+    let fs = t.task_lock().set_fs(None);
     if let Some(o) = &fs {
         o.users.fetch_sub(1, core::sync::atomic::Ordering::SeqCst);
     }
     drop(fs);
 }
 
-/// The fs context a child of `parent_tid` gets (Linux copy_fs): the
+/// The fs context a child of `parent` gets (Linux copy_fs): the
 /// parent's own with CLONE_FS, else a copy (a parent without one: a new
 /// one at the root). Nothing is counted yet, so a fork that fails
 /// afterwards just drops it. ENOMEM if the copy cannot be made.
-pub fn fork_fs(parent_tid: Tid, share: bool) -> Result<Option<Arc<FsStruct>>, KernelError> {
-    Ok(match get_task_fs(parent_tid) {
+pub fn fork_fs(parent: &Task, share: bool) -> Result<Option<Arc<FsStruct>>, KernelError> {
+    Ok(match get_task_fs(parent) {
         Some(fs) if share => Some(fs),
         Some(fs) => Some(fs.copy()?),
         None => FsStruct::new_root(),
     })
 }
 
-/// Give the child its fork-time fs context, counting one more sharer
+/// Give `child` its fork-time fs context, counting one more sharer
 /// for CLONE_FS (Linux fs->users++)
-pub fn install_fork_fs(child_tid: Tid, fs: Arc<FsStruct>, shared: bool) {
+pub fn install_fork_fs(child: &Task, fs: Arc<FsStruct>, shared: bool) {
     if shared {
         fs.users.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
     }
-    init_task_fs(child_tid, fs);
+    init_task_fs(child, fs);
 }

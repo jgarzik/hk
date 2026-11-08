@@ -28,7 +28,7 @@ use crate::fs::file::File;
 use crate::ns::PidNamespace;
 use crate::sync::spin::Mutex;
 use crate::task::CAP_SYS_PACCT;
-use crate::task::Tid;
+use crate::task::{Task, Tid};
 use crate::uaccess::UserPtr;
 use crate::util::error::KernelResult;
 use crate::util::pod::IntoBytes;
@@ -220,10 +220,9 @@ fn set_acct_file(file: Option<Arc<File>>) {
 /// The record of the calling process into `old`, which is then
 /// released (Linux acct_pin_kill)
 fn close(old: &File, ns: &PidNamespace) {
-    let tid = crate::task::percpu::current_tid();
-    if let Some(info) = get_task_info(tid) {
-        write_record(old, ns, tid, &info, 0);
-    }
+    let me = crate::task::percpu::current();
+    let info = get_task_info(&me);
+    write_record(old, ns, me.tid(), &info, 0);
 }
 
 /// Namespace `ns` is ending (its init is past the zap): its accounting
@@ -303,24 +302,21 @@ fn open_acct_file(path: &[u8]) -> KernelResult<Arc<File>> {
 // Process Exit Hook
 // =============================================================================
 
-/// Write accounting record for an exiting process
+/// Write the accounting record of the calling, exiting process
 ///
 /// Called by a process's last exiting thread before it releases its
 /// mm and files (Linux acct_process from do_exit): into the accounting
 /// file of its pid namespace and of each one above it.
 /// It's best-effort - failures are silently ignored to not block the exit path.
-pub fn write_acct_record(tid: Tid, exit_status: i32) {
+pub fn write_acct_record(exit_status: i32) {
+    let me = crate::task::percpu::current();
     let mut info = None;
     let mut ns = Some(crate::task::pid::current_pid_ns());
     while let Some(n) = ns {
         // Accounting on there? (the file is used with no lock held)
         if let Some(file) = n.bacct.get() {
-            if info.is_none() {
-                info = get_task_info(tid);
-            }
-            if let Some(i) = &info {
-                write_record(&file, n, tid, i, exit_status);
-            }
+            let i = info.get_or_insert_with(|| get_task_info(&me));
+            write_record(&file, n, me.tid(), i, exit_status);
         }
         ns = n.parent.as_deref();
     }
@@ -412,23 +408,22 @@ struct TaskInfo {
     superpriv: bool,
 }
 
-/// Get task information for accounting
-fn get_task_info(tid: Tid) -> Option<TaskInfo> {
+/// Task `t`'s information for accounting
+fn get_task_info(t: &Task) -> TaskInfo {
     use crate::task::percpu::TASKLIST;
 
     let table = TASKLIST.read();
-    let task = table.get(tid)?;
 
     // Its name (NUL-terminated, Linux get_task_comm)
-    let comm = task.task.task_lock().comm();
+    let comm = t.task_lock().comm();
 
-    // Get credentials - Arc<Cred> can be dereferenced directly
-    let cred = &task.cred();
+    // SAFETY: TASKLIST is held
+    let cred = unsafe { t.cred() };
     let (uid, gid) = (cred.uid, cred.gid);
 
-    // Calculate elapsed time using task.start_time (monotonic ns since boot)
+    // Calculate elapsed time using t.start_time (monotonic ns since boot)
     let now_ns = crate::time::monotonic_ns();
-    let elapsed_ns = now_ns.saturating_sub(task.task.start_time());
+    let elapsed_ns = now_ns.saturating_sub(t.start_time());
 
     // Get start time as Unix timestamp (seconds since epoch)
     // Convert from monotonic start_time to wall clock using TIMEKEEPER
@@ -439,36 +434,30 @@ fn get_task_info(tid: Tid) -> Option<TaskInfo> {
     let mono_ns = mono_ts.to_nanos() as u64;
     // Calculate the realtime offset and apply it to start_time
     let realtime_start_ns = if realtime_ns >= mono_ns {
-        task.task.start_time().saturating_add(realtime_ns - mono_ns)
+        t.start_time().saturating_add(realtime_ns - mono_ns)
     } else {
-        task.task.start_time().saturating_sub(mono_ns - realtime_ns)
+        t.start_time().saturating_sub(mono_ns - realtime_ns)
     };
     let start_time = (realtime_start_ns / 1_000_000_000) as u32;
 
     // Taken under TASKLIST, released after it (3.1.1 rule 4)
-    let pid_of = |p| table.get(p).and_then(|t| t.thread_pid.clone());
-    Some(TaskInfo {
+    let pid_of = |p| table.get(p).and_then(|v| v.thread_pid.clone());
+    TaskInfo {
         uid,
         gid,
-        tgid: pid_of(task.task.pid),
-        parent: pid_of(task.task.ppid()),
+        tgid: pid_of(t.pid),
+        parent: pid_of(t.ppid()),
         tty: 0, // TODO: Get controlling terminal
         start_time,
         elapsed_ns,
-        utime_ns: task.task.utime.load(core::sync::atomic::Ordering::Relaxed),
-        stime_ns: task.task.stime.load(core::sync::atomic::Ordering::Relaxed),
-        minflt: task
-            .task
-            .min_flt
-            .load(core::sync::atomic::Ordering::Relaxed),
-        majflt: task
-            .task
-            .maj_flt
-            .load(core::sync::atomic::Ordering::Relaxed),
+        utime_ns: t.utime.load(core::sync::atomic::Ordering::Relaxed),
+        stime_ns: t.stime.load(core::sync::atomic::Ordering::Relaxed),
+        minflt: t.min_flt.load(core::sync::atomic::Ordering::Relaxed),
+        majflt: t.maj_flt.load(core::sync::atomic::Ordering::Relaxed),
         comm,
-        forknoexec: task.task.has_flag(crate::task::pf::FORKNOEXEC),
-        superpriv: task.task.has_flag(crate::task::pf::SUPERPRIV),
-    })
+        forknoexec: t.has_flag(crate::task::pf::FORKNOEXEC),
+        superpriv: t.has_flag(crate::task::pf::SUPERPRIV),
+    }
 }
 
 /// Write an accounting record to the file

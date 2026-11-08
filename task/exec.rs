@@ -1226,7 +1226,7 @@ where
 
     // The thread and process keyrings are not for the new image (Linux
     // prepare_exec_creds)
-    crate::keys::keyring::exec_keyrings(percpu::current_tid());
+    crate::keys::keyring::exec_keyrings(&percpu::current());
 
     // What the process registered before (an mq_notify) is not for the
     // new image (Linux setup_new_exec: self_exec_id++); after de_thread
@@ -1243,7 +1243,7 @@ where
     percpu::current().clear_flag(crate::task::pf::FORKNOEXEC);
 
     // Private fd table without the close-on-exec descriptors
-    crate::task::fdtable::exec_task_fd(percpu::current_tid());
+    crate::task::fdtable::exec_task_fd();
 
     // Signal vfork completion if parent is waiting
     // Must be done before we switch address spaces since parent may be blocked

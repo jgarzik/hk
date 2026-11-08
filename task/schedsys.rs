@@ -659,16 +659,12 @@ pub fn sys_ioprio_set(which: i32, who: i32, ioprio: i32) -> KernelResult<()> {
         IOPRIO_WHO_PROCESS => {
             let tid =
                 super::pid::from_vnr_or(who as u64, current_tid()).ok_or(KernelError::NoProcess)?;
-
-            if !super::percpu::task_exists(tid) {
-                return Err(KernelError::NoProcess);
-            }
+            let t = super::percpu::find_task(tid).ok_or(KernelError::NoProcess)?;
             if !ioprio_owner_ok(tid) {
                 return Err(KernelError::NotPermitted);
             }
             // Get or create IoContext for the target
-            let ctx = super::task_io_context(tid)?.ok_or(KernelError::NoProcess)?;
-            ctx.set_ioprio(ioprio);
+            super::task_io_context(&t)?.set_ioprio(ioprio);
             Ok(())
         }
         IOPRIO_WHO_PGRP => {
@@ -685,8 +681,8 @@ pub fn sys_ioprio_set(which: i32, who: i32, ioprio: i32) -> KernelResult<()> {
                 if !ioprio_owner_ok(tid) {
                     return Err(KernelError::NotPermitted);
                 }
-                if let Some(ctx) = super::task_io_context(tid)? {
-                    ctx.set_ioprio(ioprio);
+                if let Some(t) = super::percpu::find_task(tid) {
+                    super::task_io_context(&t)?.set_ioprio(ioprio);
                 }
             }
             Ok(())
@@ -731,13 +727,8 @@ pub fn sys_ioprio_get(which: i32, who: i32) -> KernelResult<i64> {
         IOPRIO_WHO_PROCESS => {
             let tid =
                 super::pid::from_vnr_or(who as u64, current_tid()).ok_or(KernelError::NoProcess)?;
-
-            // Check if task exists
-            if !super::percpu::task_exists(tid) {
-                return Err(KernelError::NoProcess);
-            }
-
-            let ioprio = get_task_io_context(tid).map_or(IOPRIO_DEFAULT, |c| c.get_ioprio());
+            let t = super::percpu::find_task(tid).ok_or(KernelError::NoProcess)?;
+            let ioprio = get_task_io_context(&t).map_or(IOPRIO_DEFAULT, |c| c.get_ioprio());
             Ok(i64::from(ioprio))
         }
         IOPRIO_WHO_PGRP => {
@@ -752,7 +743,10 @@ pub fn sys_ioprio_get(which: i32, who: i32) -> KernelResult<i64> {
             // Return the highest priority (lowest class value, then highest level)
             let mut best_ioprio = IOPRIO_DEFAULT;
             for tid in tids {
-                if let Some(ctx) = get_task_io_context(tid) {
+                if let Some(ctx) = super::percpu::find_task(tid)
+                    .as_deref()
+                    .and_then(get_task_io_context)
+                {
                     let ioprio = ctx.get_ioprio();
                     // Compare: lower class is higher priority
                     if ioprio < best_ioprio {

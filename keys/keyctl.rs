@@ -17,19 +17,18 @@ use super::keyring::{keyring_link, keyring_unlink, resolve_special_keyring};
 use super::syscall::{MAX_DESC_LEN, MAX_TYPE_LEN, user_str};
 use super::{lookup_key, remove_key};
 
-/// The caller's tid and real uid and gid (the user keyrings belong to
-/// the real uid, Linux cred->user)
-fn current_cred() -> (u64, u32, u32) {
+/// The caller's real uid and gid (the user keyrings belong to the real
+/// uid, Linux cred->user)
+fn current_cred() -> (u32, u32) {
     let cred = percpu::current_cred();
-    let tid = percpu::current_tid() as u64;
-    (tid, cred.uid, cred.gid)
+    (cred.uid, cred.gid)
 }
 
 /// The key `serial` names: a special keyring id (not created) or a
 /// key serial; ENOKEY
 fn find_key(serial: i32) -> KernelResult<Arc<Key>> {
-    let (tid, uid, gid) = current_cred();
-    resolve_special_keyring(serial, false, tid, uid, gid)
+    let (uid, gid) = current_cred();
+    resolve_special_keyring(serial, false, &percpu::current(), uid, gid)
         .or_else(|_| lookup_key(serial).ok_or(KernelError::NoKey))
 }
 
@@ -54,8 +53,8 @@ fn need(key: &Key, perm: u32) -> KernelResult<()> {
 /// KEYCTL_GET_KEYRING_ID: the serial of special keyring `special_id`,
 /// created first if `create`
 pub fn keyctl_get_keyring_id(special_id: i32, create: bool) -> KernelResult<i32> {
-    let (tid, uid, gid) = current_cred();
-    Ok(resolve_special_keyring(special_id, create, tid, uid, gid)?.serial)
+    let (uid, gid) = current_cred();
+    Ok(resolve_special_keyring(special_id, create, &percpu::current(), uid, gid)?.serial)
 }
 
 /// KEYCTL_UPDATE: a new payload of `plen` bytes for key `key_serial`
@@ -191,7 +190,7 @@ pub fn keyctl_search(
     desc_ptr: UserPtr<u8>,
     dest_keyring: i32,
 ) -> KernelResult<i32> {
-    let (tid, uid, gid) = current_cred();
+    let (uid, gid) = current_cred();
     let type_name = user_str(type_ptr, MAX_TYPE_LEN)?;
     let description = user_str(desc_ptr, MAX_DESC_LEN)?;
     let keyring = find_keyring(keyring_serial)?;
@@ -206,7 +205,8 @@ pub fn keyctl_search(
     // destination (Linux keyctl_keyring_search)
     if dest_keyring != 0 {
         need(&key, KEY_NEED_LINK)?;
-        if let Ok(dest) = resolve_special_keyring(dest_keyring, false, tid, uid, gid) {
+        if let Ok(dest) = resolve_special_keyring(dest_keyring, false, &percpu::current(), uid, gid)
+        {
             need(&dest, KEY_NEED_WRITE)?;
             let _ = keyring_link(&dest, &key);
         }

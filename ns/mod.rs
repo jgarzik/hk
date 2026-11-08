@@ -35,7 +35,6 @@ use crate::util::kalloc::{arc_nofail, try_arc};
 use alloc::sync::Arc;
 use spin::Lazy;
 
-use crate::task::Tid;
 pub use cgroup::{CgroupNamespace, INIT_CGROUP_NS};
 pub use pid::{INIT_PID_NS, PidNamespace};
 pub use user::{INIT_USER_NS, UidGidExtent, UidGidMap, UserNamespace};
@@ -309,27 +308,25 @@ pub static INIT_NSPROXY: Lazy<Arc<NsProxy>> = Lazy::new(|| arc_nofail(NsProxy::n
 // Task NS accessors - Task.nsproxy under its alloc_lock (Linux task_lock)
 // =============================================================================
 
-use crate::task::percpu::{current, with_task_lock};
+use crate::task::Task;
+use crate::task::percpu::current;
 
-/// Initialize nsproxy for a new task
+/// Initialize the nsproxy of task `t`
 ///
 /// Called when creating a new task to set up its namespace context, or
 /// by the task itself (unshare, setns; Linux switch_task_namespaces).
-pub fn init_task_ns(tid: Tid, nsproxy: Arc<NsProxy>) {
-    let old = with_task_lock(tid, |a| a.set_nsproxy(Some(nsproxy)));
+pub fn init_task_ns(t: &Task, nsproxy: Arc<NsProxy>) {
+    let old = t.task_lock().set_nsproxy(Some(nsproxy));
     drop(old);
 }
 
-/// Get the NsProxy for a task
+/// The NsProxy of task `t`
 ///
-/// Returns a cloned Arc (increments refcount); lock-free for the
-/// current task (Linux current->nsproxy).
-pub fn get_task_ns(tid: Tid) -> Option<Arc<NsProxy>> {
-    let me = current();
-    if me.tid() == tid {
-        return me.nsproxy();
-    }
-    with_task_lock(tid, |a| a.nsproxy().cloned()).flatten()
+/// Returns a cloned Arc (increments refcount), under its alloc_lock;
+/// the current task's is `current().nsproxy()`, lock-free (Linux
+/// current->nsproxy).
+pub fn get_task_ns(t: &Task) -> Option<Arc<NsProxy>> {
+    t.task_lock().nsproxy().cloned()
 }
 
 /// Remove nsproxy when task exits
@@ -338,8 +335,8 @@ pub fn get_task_ns(tid: Tid) -> Option<Arc<NsProxy>> {
 /// (no other tasks sharing this NsProxy), the NsProxy is dropped,
 /// which in turn drops the namespace references (after the task's
 /// alloc_lock is released: a network namespace's teardown takes RTNL).
-pub fn exit_task_ns(tid: Tid) {
-    let ns = with_task_lock(tid, |a| a.set_nsproxy(None)).flatten();
+pub fn exit_task_ns(t: &Task) {
+    let ns = t.task_lock().set_nsproxy(None);
     drop(ns);
 }
 
@@ -352,13 +349,13 @@ fn may_create_namespaces(ns_flags: u64) -> bool {
     ns_flags & !CLONE_NEWUSER == 0 || crate::task::capable(crate::task::CAP_SYS_ADMIN)
 }
 
-/// The namespaces a child of `parent_tid` gets (Linux copy_namespaces):
+/// The namespaces a child of `parent` gets (Linux copy_namespaces):
 /// new ones for the CLONE_NEW* flags, else the parent's. `child_fs` is
 /// the child's fs context, moved to the copies of its root's and cwd's
 /// mounts in a new mount namespace. Built before the child is visible,
 /// so a failure leaves nothing behind.
 pub fn fork_nsproxy(
-    parent_tid: Tid,
+    parent: &Task,
     flags: u64,
     child_fs: Option<&crate::fs::FsStruct>,
 ) -> KernelResult<Arc<NsProxy>> {
@@ -372,7 +369,7 @@ pub fn fork_nsproxy(
     if !may_create_namespaces(ns_flags) {
         return Err(KernelError::NotPermitted);
     }
-    let parent_ns = get_task_ns(parent_tid).unwrap_or_else(|| INIT_NSPROXY.clone());
+    let parent_ns = get_task_ns(parent).unwrap_or_else(|| INIT_NSPROXY.clone());
     if ns_flags == 0 {
         return Ok(parent_ns);
     }
@@ -388,8 +385,8 @@ pub fn fork_nsproxy(
 /// Returns the UTS namespace for the calling task, or the init
 /// namespace if no namespace context is set.
 pub fn current_uts_ns() -> Arc<UtsNamespace> {
-    let tid = crate::task::percpu::current_tid();
-    get_task_ns(tid)
+    current()
+        .nsproxy()
         .map(|ns| ns.uts_ns.clone())
         .unwrap_or_else(|| INIT_UTS_NS.clone())
 }
@@ -399,8 +396,8 @@ pub fn current_uts_ns() -> Arc<UtsNamespace> {
 /// Returns the mount namespace for the calling task, or the init
 /// namespace if no namespace context is set.
 pub fn current_mnt_ns() -> Arc<MntNamespace> {
-    let tid = crate::task::percpu::current_tid();
-    get_task_ns(tid)
+    current()
+        .nsproxy()
         .map(|ns| ns.mnt_ns.clone())
         .unwrap_or_else(|| INIT_MNT_NS.clone())
 }
@@ -410,8 +407,8 @@ pub fn current_mnt_ns() -> Arc<MntNamespace> {
 /// Returns the user namespace for the calling task, or the init
 /// namespace if no namespace context is set.
 pub fn current_user_ns() -> Arc<UserNamespace> {
-    let tid = crate::task::percpu::current_tid();
-    get_task_ns(tid)
+    current()
+        .nsproxy()
         .map(|ns| ns.user_ns.clone())
         .unwrap_or_else(|| INIT_USER_NS.clone())
 }
@@ -421,8 +418,8 @@ pub fn current_user_ns() -> Arc<UserNamespace> {
 /// Returns the network namespace for the calling task, or the init
 /// namespace if no namespace context is set.
 pub fn current_net_ns() -> Arc<NetNamespace> {
-    let tid = crate::task::percpu::current_tid();
-    get_task_ns(tid)
+    current()
+        .nsproxy()
         .map(|ns| ns.net_ns.clone())
         .unwrap_or_else(|| INIT_NET_NS.clone())
 }
@@ -483,7 +480,7 @@ pub fn sys_unshare(unshare_flags: u64) -> KernelResult<()> {
     }
 
     // Get current namespace proxy
-    let current_ns = get_task_ns(tid).unwrap_or_else(|| INIT_NSPROXY.clone());
+    let current_ns = current().nsproxy().unwrap_or_else(|| INIT_NSPROXY.clone());
 
     // Create new nsproxy with new namespace(s)
     // CLONE_NEWNS implies CLONE_FS (Linux unshare): a private fs
@@ -493,7 +490,7 @@ pub fn sys_unshare(unshare_flags: u64) -> KernelResult<()> {
             .map(|f| f.copy())
             .transpose()?;
         if let Some(f) = &fs {
-            crate::fs::init_task_fs(tid, f.clone());
+            crate::fs::init_task_fs(&current(), f.clone());
         }
         fs
     } else {
@@ -502,16 +499,16 @@ pub fn sys_unshare(unshare_flags: u64) -> KernelResult<()> {
     let new_ns = current_ns.copy(ns_flags, fs.as_deref())?;
 
     // Switch to new namespace (atomic via mutex)
-    switch_task_namespaces(tid, new_ns);
+    switch_task_namespaces(&current(), new_ns);
     Ok(())
 }
 
-/// Switch a task's namespace to a new nsproxy
+/// Switch task `t`'s namespaces to a new nsproxy
 ///
 /// This atomically replaces the task's nsproxy. Used by both
 /// unshare() and setns().
-pub fn switch_task_namespaces(tid: Tid, new_ns: Arc<NsProxy>) {
-    init_task_ns(tid, new_ns);
+pub fn switch_task_namespaces(t: &Task, new_ns: Arc<NsProxy>) {
+    init_task_ns(t, new_ns);
 }
 
 // ============================================================================
@@ -534,7 +531,6 @@ pub fn switch_task_namespaces(tid: Tid, new_ns: Arc<NsProxy>) {
 /// * -EPERM if permission denied
 pub fn sys_setns(fd: i32, nstype: i32) -> KernelResult<()> {
     use crate::fs::proc::{NamespaceType, ProcfsInodeData, ProcfsInodeWrapper};
-    let tid = crate::task::percpu::current_tid();
 
     let file = crate::fs::io::fget(fd)?;
     let inode = file.get_inode().ok_or(KernelError::BadFd)?;
@@ -569,7 +565,7 @@ pub fn sys_setns(fd: i32, nstype: i32) -> KernelResult<()> {
 
     // The target task's namespaces
     let target_ns = crate::fs::proc::task_nsproxy(&target).ok_or(KernelError::NoProcess)?;
-    let current_ns = get_task_ns(tid).unwrap_or_else(|| INIT_NSPROXY.clone());
+    let current_ns = current().nsproxy().unwrap_or_else(|| INIT_NSPROXY.clone());
 
     // A mount namespace moves root and cwd: not with an fs struct
     // shared with other tasks (Linux mntns_install: fs->users != 1)
@@ -642,7 +638,7 @@ pub fn sys_setns(fd: i32, nstype: i32) -> KernelResult<()> {
     let mnt_root = matches!(ns_type, NamespaceType::Mnt)
         .then(|| new_ns.mnt_ns.root_path())
         .flatten();
-    switch_task_namespaces(tid, new_ns);
+    switch_task_namespaces(&current(), new_ns);
     // Joining a mount namespace puts root and cwd at its root, past
     // what is mounted there (Linux mntns_install: LOOKUP_DOWN)
     if let (Some(root), Some(fs)) = (mnt_root, crate::task::percpu::current_fs()) {

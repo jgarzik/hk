@@ -63,7 +63,7 @@ pub use cpio::unpack_cpio;
 pub use dac::{MAY_EXEC, MAY_READ, MAY_WRITE};
 pub use dentry::{DCACHE, Dentry, DentryCache, is_subdir};
 pub use file::{CHAR_FILE_OPS, DirContext, DirEntry, File, FileOps, RwFlags, flags, seek};
-pub use fsstruct::{FsStruct, exit_task_fs, get_task_fs, init_task_fs, task_fs};
+pub use fsstruct::{FsStruct, exit_task_fs, get_task_fs, init_task_fs};
 pub use inode::{DevId, DeviceType, FileType, Gid, Inode, InodeAttr, InodeMode, InodeOps, Uid};
 pub use mount::{Mount, do_umount, follow_mount, umount_flags};
 pub use namei::{LookupFlags, lookup_one, lookup_path, lookup_path_at, lookup_path_flags};

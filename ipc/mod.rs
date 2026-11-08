@@ -314,7 +314,7 @@ crate::pod!(Sembuf {
 /// Get the current task's IPC namespace
 pub fn current_ipc_ns() -> Arc<IpcNamespace> {
     // Get from task's namespace proxy
-    if let Some(ns_proxy) = crate::ns::get_task_ns(crate::task::percpu::current_tid()) {
+    if let Some(ns_proxy) = crate::task::percpu::current().nsproxy() {
         ns_proxy.ipc_ns.clone()
     } else {
         INIT_IPC_NS.clone()

@@ -1205,7 +1205,10 @@ fn pidfd_fget(pidfd_file: &File, targetfd: i32) -> KernelResult<alloc::sync::Arc
     }
 
     // Get target's fd table (none: process exiting)
-    let target_fd_table = super::fdtable::get_task_fd(target_tid).ok_or(KernelError::NoProcess)?;
+    let target_fd_table = super::percpu::find_task(target_tid)
+        .as_deref()
+        .and_then(super::fdtable::get_task_fd)
+        .ok_or(KernelError::NoProcess)?;
     // Its process still being that task, every lookup by tid above
     // found it (the tid is not freed while it is listed); else its
     // files are gone (Linux fget_task: EBADF)

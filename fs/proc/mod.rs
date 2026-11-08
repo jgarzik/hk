@@ -1376,7 +1376,7 @@ fn fs_link(t: &TaskRef, root: bool) -> Result<Vec<u8>, KernelError> {
     if !crate::task::ptrace::may_read_ref(t) {
         return Err(KernelError::PermissionDenied);
     }
-    let fs = crate::fs::task_fs(t).ok_or(KernelError::NotFound)?;
+    let fs = crate::fs::get_task_fs(t).ok_or(KernelError::NotFound)?;
     let p = if root { fs.get_root() } else { fs.get_pwd() };
     super::dentry::d_path_link(&p)
 }

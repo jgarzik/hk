@@ -2567,42 +2567,43 @@ impl Clone for IoContext {
 // Task I/O context accessors - Task.io_context under its alloc_lock
 // =============================================================================
 
-/// Get the I/O context for a task
-pub fn get_task_io_context(tid: Tid) -> Option<Arc<IoContext>> {
-    percpu::with_task_lock(tid, |a| a.io_context().cloned()).flatten()
+/// The I/O context of task `t`
+pub fn get_task_io_context(t: &Task) -> Option<Arc<IoContext>> {
+    t.task_lock().io_context().cloned()
 }
 
-/// Set the I/O context for a task (its old one dropped after the lock)
-pub fn set_task_io_context(tid: Tid, ctx: Arc<IoContext>) {
-    drop(percpu::with_task_lock(tid, |a| a.set_io_context(Some(ctx))));
+/// Set the I/O context of task `t` (its old one dropped after the lock)
+pub fn set_task_io_context(t: &Task, ctx: Arc<IoContext>) {
+    drop(t.task_lock().set_io_context(Some(ctx)));
 }
 
-/// The I/O context of a task, a new one if it has none (Linux
-/// set_task_ioprio's alloc_io_context under task_lock); None if there
-/// is no such task, ENOMEM if one cannot be made
-pub fn task_io_context(tid: Tid) -> Result<Option<Arc<IoContext>>, KernelError> {
+/// The I/O context of task `t`, a new one if it has none (Linux
+/// set_task_ioprio's alloc_io_context under task_lock); ENOMEM if one
+/// cannot be made
+pub fn task_io_context(t: &Task) -> Result<Arc<IoContext>, KernelError> {
     let new = try_arc(IoContext::new())?;
-    Ok(percpu::with_task_lock(tid, |a| match a.io_context() {
+    let mut a = t.task_lock();
+    Ok(match a.io_context() {
         Some(c) => c.clone(),
         None => {
             a.set_io_context(Some(new.clone()));
             new
         }
-    }))
+    })
 }
 
-/// Remove the I/O context for a task (on exit)
-pub fn remove_task_io_context(tid: Tid) {
-    drop(percpu::with_task_lock(tid, |a| a.set_io_context(None)));
+/// Remove the I/O context of task `t` (on exit)
+pub fn remove_task_io_context(t: &Task) {
+    drop(t.task_lock().set_io_context(None));
 }
 
 /// The I/O context for a new task, built before it exists (installed
 /// with `set_task_io_context`)
 ///
-/// If `share` is true (CLONE_IO set), child shares parent's Arc<IoContext>.
+/// If `share` is true (CLONE_IO set), child shares `parent`'s Arc<IoContext>.
 /// Otherwise, child gets a new IoContext inheriting parent's ioprio value.
-pub fn fork_io(parent_tid: Tid, share: bool) -> Result<Arc<IoContext>, KernelError> {
-    match get_task_io_context(parent_tid) {
+pub fn fork_io(parent: &Task, share: bool) -> Result<Arc<IoContext>, KernelError> {
+    match get_task_io_context(parent) {
         // CLONE_IO: share the same context
         Some(parent_ctx) if share => Ok(parent_ctx),
         // No CLONE_IO: create new context with inherited ioprio
@@ -2697,12 +2698,14 @@ pub fn set_set_child_tid(tid: Tid, addr: u64) {
 // Cgroup file descriptor lookup (for CLONE_INTO_CGROUP)
 // =============================================================================
 
-/// The cgroup a CLONE_INTO_CGROUP fd names (Linux cgroup_get_from_file):
-/// EBADF for no file or a file that is not a cgroup directory, ENOENT
-/// for a removed one (css_tryget_online_from_dir)
-pub fn cgroup_from_fd(tid: Tid, fd: i32) -> KernelResult<Arc<crate::cgroup::Cgroup>> {
+/// The cgroup the caller's CLONE_INTO_CGROUP fd names (Linux
+/// cgroup_get_from_file): EBADF for no file or a file that is not a
+/// cgroup directory, ENOENT for a removed one
+/// (css_tryget_online_from_dir)
+pub fn cgroup_from_fd(fd: i32) -> KernelResult<Arc<crate::cgroup::Cgroup>> {
     use crate::fs::cgroupfs::{CgroupfsInodeData, CgroupfsInodeWrapper};
-    let file = fdtable::get_task_fd(tid)
+    let file = percpu::current()
+        .files()
         .and_then(|t| t.lock().get(fd))
         .ok_or(KernelError::BadFd)?;
     let private = file

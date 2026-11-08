@@ -52,8 +52,7 @@ use crate::io::pipe::FD_CLOEXEC;
 use crate::io::poll::PollTable;
 use crate::mm::PAGE_SIZE;
 use crate::sync::waitqueue::WaitQueue;
-use crate::task::fdtable::get_task_fd;
-use crate::task::percpu::current_tid;
+use crate::task::percpu::current;
 use crate::uaccess::{UserPtr, copy_from_user, copy_val_from_user};
 use crate::util::error::{KernelResult, SysRet};
 
@@ -827,7 +826,7 @@ impl IoUring {
         // Reserve the table before any lock, so the allocation never
         // runs under the inner IrqSpinlock (IRQs off)
         let mut files = crate::util::kmem::KVec::try_with_capacity(fds.len())?;
-        let fd_table = get_task_fd(current_tid()).ok_or(KernelError::BadFd)?;
+        let fd_table = current().files().ok_or(KernelError::BadFd)?;
 
         let mut inner = self.inner.lock();
 
@@ -879,7 +878,7 @@ impl IoUring {
         }
 
         // Resolve fds to File references
-        let fd_table = get_task_fd(current_tid()).ok_or(KernelError::BadFd)?;
+        let fd_table = current().files().ok_or(KernelError::BadFd)?;
 
         let fd_table_locked = fd_table.lock();
 

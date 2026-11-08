@@ -71,11 +71,6 @@ impl KThread {
 /// Registry of live kernel threads (process context only)
 static KTHREADS: Mutex<Vec<Arc<KThread>>> = Mutex::new(Vec::new());
 
-/// `tid` is a kernel thread started by [`kthread_run`]
-pub fn is_kthread_tid(tid: Tid) -> bool {
-    KTHREADS.lock().iter().any(|k| k.tid() == tid)
-}
-
 /// Round-robin cursor for unbound threads
 static NEXT_CPU: AtomicU32 = AtomicU32::new(0);
 

@@ -421,7 +421,7 @@ fn kmain() -> ! {
     // like Linux's init_task (init/init_task.c); init calls setsid()
     // itself if it wants a session
     task::percpu::init();
-    let init_tid = task::percpu::create_user_task(task::percpu::UserTaskConfig {
+    let init = task::percpu::create_user_task(task::percpu::UserTaskConfig {
         ppid: 0, // init has no parent
         pgid: 0, // inherited from init_task, not a group leader
         sid: 0,  // not a session leader until setsid()
@@ -473,7 +473,7 @@ fn kmain() -> ! {
 
     // pid 1's root and working directory: the VFS exists now
     if let Some(fs) = crate::fs::FsStruct::new_root() {
-        crate::fs::init_task_fs(init_tid, fs);
+        crate::fs::init_task_fs(&init, fs);
     }
 
     // Architecture-specific VFS extras (e.g., VFAT ramdisk from multiboot2 module on x86)

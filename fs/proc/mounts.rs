@@ -28,7 +28,7 @@ const MOUNTINFO_LINE: usize = 128;
 /// The mounts task `t` sees: (mount, mountpoint as seen from its root),
 /// by mount order; a mount its root does not reach is left out
 fn visible(t: &TaskRef) -> Vec<(Arc<Mount>, Vec<u8>)> {
-    let (Some(ns), Some(fs)) = (super::task_nsproxy(t), crate::fs::task_fs(t)) else {
+    let (Some(ns), Some(fs)) = (super::task_nsproxy(t), crate::fs::get_task_fs(t)) else {
         return Vec::new();
     };
     let root = fs.get_root();

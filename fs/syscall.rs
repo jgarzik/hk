@@ -20,9 +20,6 @@ pub use super::pollsys::*;
 pub use super::stat::*;
 pub use super::sync::*;
 
-use crate::task::fdtable::get_task_fd;
-use crate::task::percpu::current_tid;
-
 // =============================================================================
 // RWF flags for preadv2/pwritev2
 // =============================================================================
@@ -92,5 +89,7 @@ pub fn get_nofile_limit() -> u64 {
 /// Panics if the current task doesn't have an FD table registered,
 /// which would indicate a kernel bug.
 pub fn current_fd_table() -> alloc::sync::Arc<crate::task::fdtable::Files> {
-    get_task_fd(current_tid()).expect("current task has no FD table")
+    crate::task::percpu::current()
+        .files()
+        .expect("current task has no FD table")
 }

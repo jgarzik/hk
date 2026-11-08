@@ -11,7 +11,6 @@
 #![expect(clippy::undocumented_unsafe_blocks)] // TODO(unsafe): SAFETY comments (doc/UNSAFE.md)
 
 use crate::task::TaskInner;
-use crate::task::TaskLock;
 use crate::util::kalloc::{arc_nofail, box_nofail, try_arc};
 use ::core::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use alloc::sync::Arc;
@@ -1174,15 +1173,6 @@ pub fn find_task_by_vpid(nr: u64) -> Option<TaskRef> {
     find_task_by_pid_ns(nr, crate::task::pid::current_pid_ns())
 }
 
-/// Run `f` with task `tid`'s `alloc_lock` held (Linux task_lock(p));
-/// TASKLIST is taken only to find it. Whatever `f` takes out of the
-/// task is returned, to be dropped after the lock (3.1.1 rule 4).
-pub fn with_task_lock<R>(tid: Tid, f: impl FnOnce(&mut TaskLock<'_>) -> R) -> Option<R> {
-    let t = find_task(tid)?;
-    let r = f(&mut t.task_lock());
-    Some(r)
-}
-
 /// The boot CPU has per-CPU data (`init_bsp`); from then on every CPU
 /// running kernel code has its own
 pub static PERCPU_UP: AtomicBool = AtomicBool::new(false);
@@ -1557,7 +1547,7 @@ pub fn can_sleep() -> bool {
 ///
 /// # Arguments
 /// * `config` - User task configuration (pid, tid, ppid, pgid, sid, priority, stacks, page table)
-pub fn create_user_task(config: UserTaskConfig) -> Result<Tid, &'static str> {
+pub fn create_user_task(config: UserTaskConfig) -> Result<TaskRef, &'static str> {
     let cpu_id = crate::cpu::this_id();
     // init is pid 1 (Linux: the first pid of the root namespace)
     let thread_pid = crate::task::pid::alloc_pid_nr(&crate::ns::INIT_PID_NS, &[1])
@@ -1633,20 +1623,20 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<Tid, &'static str> {
 
     // Initialize filesystem context for the init task
     if let Some(fs) = crate::fs::FsStruct::new_root() {
-        crate::fs::init_task_fs(tid, fs);
+        crate::fs::init_task_fs(&task, fs);
     }
 
     // Initialize FD table for the init task
-    crate::task::fdtable::init_task_fd(tid, crate::task::fdtable::create_empty_fd_table());
+    crate::task::fdtable::init_task_fd(&task, crate::task::fdtable::create_empty_fd_table());
 
     // Initialize namespace context for the init task
-    crate::ns::init_task_ns(tid, crate::ns::INIT_NSPROXY.clone());
+    crate::ns::init_task_ns(&task, crate::ns::INIT_NSPROXY.clone());
 
     // Initialize signal handlers for the init task
     crate::signal::init_task_signal(tid, arc_nofail(crate::signal::SigHand::new()));
 
     printkln!("USER_TASK_CREATED: pid={} tid={}", pid, tid);
-    Ok(tid)
+    Ok(task)
 }
 
 /// A thread of group `tgid` other than those in `but` will still
@@ -2283,8 +2273,8 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     // child is attached): its fs context, its namespaces (a new mount
     // namespace moves that fs context) and the target cgroup (a bad fd
     // is EBADF)
-    let child_fs = crate::fs::fsstruct::fork_fs(current_tid, config.flags & CLONE_FS != 0)?;
-    let child_ns = crate::ns::fork_nsproxy(current_tid, config.flags, child_fs.as_deref())?;
+    let child_fs = crate::fs::fsstruct::fork_fs(&me, config.flags & CLONE_FS != 0)?;
+    let child_ns = crate::ns::fork_nsproxy(&me, config.flags, child_fs.as_deref())?;
     // A thread stays in its group's pid namespace (Linux copy_process:
     // CLONE_THREAD with CLONE_NEWPID or CLONE_NEWUSER, or after an
     // unshare(CLONE_NEWPID), is EINVAL)
@@ -2295,7 +2285,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         return Err(KernelError::InvalidArgument);
     }
     let into_cgroup = if config.flags & CLONE_INTO_CGROUP != 0 {
-        Some(crate::task::cgroup_from_fd(current_tid, config.cgroup_fd)?)
+        Some(crate::task::cgroup_from_fd(config.cgroup_fd)?)
     } else {
         None
     };
@@ -2306,8 +2296,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     // Its credentials, files, signal state and CLONE_IO context (Linux
     // copy_creds, copy_files, copy_sighand, copy_signal, copy_io): ENOMEM
     let child_cred = crate::task::copy_creds(config.flags, &parent_cred)?;
-    let child_files =
-        crate::task::fdtable::fork_task_fd(current_tid, config.flags & CLONE_FILES != 0)?;
+    let child_files = crate::task::fdtable::fork_task_fd(&me, config.flags & CLONE_FILES != 0)?;
     let (child_sig, child_signal) = crate::signal::fork_signal(
         current_tid,
         config.flags & CLONE_SIGHAND != 0,
@@ -2315,7 +2304,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         config.flags & CLONE_CLEAR_SIGHAND != 0,
     )?;
     let child_io = if config.flags & CLONE_IO != 0 {
-        Some(crate::task::fork_io(current_tid, true)?)
+        Some(crate::task::fork_io(&me, true)?)
     } else {
         None
     };
@@ -2551,21 +2540,21 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     // Its fs context (CLONE_FS: the parent's, cwd changes affect both;
     // else a copy)
     if let Some(fs) = child_fs {
-        crate::fs::fsstruct::install_fork_fs(child_tid, fs, config.flags & CLONE_FS != 0);
+        crate::fs::fsstruct::install_fork_fs(&child_task, fs, config.flags & CLONE_FS != 0);
     }
 
     // Handle FD table (CLONE_FILES)
     // If CLONE_FILES is set, child shares parent's FD table
     // Otherwise, child gets an independent deep copy
-    crate::task::fdtable::init_task_fd(child_tid, child_files);
+    crate::task::fdtable::init_task_fd(&child_task, child_files);
 
     // Its namespaces (CLONE_NEW* flags), built above
-    crate::ns::init_task_ns(child_tid, child_ns);
+    crate::ns::init_task_ns(&child_task, child_ns);
 
     // Its cgroup: the CLONE_INTO_CGROUP target, else the parent's,
     // charged above (Linux cgroup_post_fork)
     if let Some(fc) = fork_cg {
-        fc.post_fork(child_tid);
+        fc.post_fork(&child_task);
     }
 
     // Handle signal handlers (CLONE_SIGHAND, CLONE_CLEAR_SIGHAND)
@@ -2583,7 +2572,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     // Otherwise, child gets an independent copy with inherited ioprio value
     // NOTE: Only run when explicitly requested or basic fork
     if let Some(io) = child_io {
-        crate::task::set_task_io_context(child_tid, io);
+        crate::task::set_task_io_context(&child_task, io);
     }
 
     // Handle SysV semaphore undo list (CLONE_SYSVSEM)
@@ -2698,7 +2687,7 @@ fn clone_pidfd(pid: Arc<crate::task::pid::Pid>, thread: bool, ptr: u64) -> Kerne
     use crate::task::pidfd::pidfd_flags::PIDFD_THREAD;
     let flags = if thread { PIDFD_THREAD } else { 0 };
     let file = crate::task::pidfd::pidfd_file(pid, flags)?;
-    let files = crate::task::fdtable::get_task_fd(current_tid()).ok_or(KernelError::BadFd)?;
+    let files = current().files().ok_or(KernelError::BadFd)?;
     let nofile = crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_NOFILE);
     let fd = files
         .lock()
@@ -2714,7 +2703,7 @@ fn clone_pidfd(pid: Arc<crate::task::pid::Pid>, thread: bool, ptr: u64) -> Kerne
 /// A clone whose child was not made after all closes the pidfd
 /// [`clone_pidfd`] gave the caller (Linux bad_fork_put_pidfd)
 fn close_pidfd(fd: i32) {
-    if let Some(files) = crate::task::fdtable::get_task_fd(current_tid()) {
+    if let Some(files) = current().files() {
         // Released after the table lock (FilesGuard)
         files.lock().close(fd);
     }
@@ -3210,7 +3199,7 @@ pub fn exit_current(status: Option<i32>) -> ! {
         if let Some(st) = status
             && group_dead
         {
-            crate::task::acct::write_acct_record(tid, st);
+            crate::task::acct::write_acct_record(st);
         }
 
         // A non-leader thread is released at exit (Linux autoreaps it):
@@ -3225,10 +3214,10 @@ pub fn exit_current(status: Option<i32>) -> ! {
         }
 
         // Clean up filesystem context for exiting task
-        crate::fs::exit_task_fs(tid);
+        crate::fs::exit_task_fs(&current());
 
         // Clean up FD table for exiting task
-        crate::task::fdtable::exit_task_fd(tid);
+        crate::task::fdtable::exit_task_fd(&current());
         // POSIX locks went as the last user of the descriptor table
         // closed its descriptors (exit_task_fd; Linux close_files ->
         // filp_flush -> locks_remove_posix)
@@ -3244,10 +3233,10 @@ pub fn exit_current(status: Option<i32>) -> ! {
         crate::ipc::sem::exit_sem(tid);
 
         // Clean up I/O context for exiting task
-        crate::task::remove_task_io_context(tid);
+        crate::task::remove_task_io_context(&current());
 
         // Clean up namespace context for exiting task
-        crate::ns::exit_task_ns(tid);
+        crate::ns::exit_task_ns(&current());
 
         // Clean up seccomp state for exiting task
         crate::seccomp::exit_seccomp(tid);
@@ -3289,7 +3278,7 @@ pub fn exit_current(status: Option<i32>) -> ! {
         // Out of its cgroup while still running, before it is a zombie
         // a waiting parent may reap at once (Linux do_exit: cgroup_exit
         // before exit_notify); TASKLIST is not held
-        crate::cgroup::detach_task(tid);
+        crate::cgroup::detach_task(&current());
     }
     if let Some(st) = status {
         exit_notify(tid, st);
@@ -4407,12 +4396,6 @@ pub fn current_sid() -> Pid {
     current().sid()
 }
 
-/// Check if a task exists by TID
-pub fn task_exists(tid: Tid) -> bool {
-    let table = TASKLIST.read();
-    table.iter().any(|t| t.task.tid() == tid)
-}
-
 /// Increment minor page fault counter for current task
 ///
 /// Called after successfully handling a demand-paging or COW fault
@@ -4496,11 +4479,11 @@ pub fn get_all_pids() -> alloc::vec::Vec<Pid> {
 ///
 /// Returns None if there is no current task or no filesystem context.
 pub fn current_fs() -> Option<alloc::sync::Arc<crate::fs::FsStruct>> {
-    let tid = current_tid();
-    if tid == 0 {
+    let me = current();
+    if me.tid() == 0 {
         return None;
     }
-    crate::fs::get_task_fs(tid)
+    me.fs().or_else(|| crate::fs::fsstruct::kthread_fs(&me))
 }
 
 /// Get the current task's current working directory

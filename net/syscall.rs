@@ -77,7 +77,8 @@ pub fn sys_socketpair(
 /// Install two files in new descriptors, or neither (the table
 /// releases undone and refused files after its lock is dropped)
 fn install_pair(a: Arc<File>, b: Arc<File>, cloexec: bool) -> KernelResult<[i32; 2]> {
-    let table = crate::task::fdtable::get_task_fd(crate::task::percpu::current_tid())
+    let table = crate::task::percpu::current()
+        .files()
         .ok_or(KernelError::BadFd)?;
     let fl = if cloexec { crate::task::FD_CLOEXEC } else { 0 };
     let max = crate::fs::syscall::get_nofile_limit();

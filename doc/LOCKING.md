@@ -414,8 +414,8 @@ Tasks (3.1.1, 3.7; Linux tasklist_lock → pidmap_lock → task_lock →
     IRQ-safe; Linux task_lock; one task's at a time) → Task.sig (spin
     Mutex, per task) → SignalStruct.shared (spin Mutex) →
     SigHand.action (IrqSpinlock leaf); Task.keyrings, Task.cgroup,
-    Task.fput_defer: per-task leaves reached through a TaskRef, never
-    under TASKLIST; SignalStruct.posix_timers (never under TASKLIST)
+    Task.fput_defer: per-task leaves reached through the task (current
+    or a held TaskRef), never under TASKLIST; SignalStruct.posix_timers (never under TASKLIST)
     → PosixTimer.inner, SignalStruct.rlim (cpu_timer's expiry pass)
 
 Wakeups (3.1; any context, under any of the above):
@@ -798,10 +798,10 @@ CPU being idle) is a quiescent state for a future QSBR RCU.
 (`spin::Mutex<Vec<Arc<KThread>>>`, process context only, never held across
 a wakeup/sleep; order: may be taken while holding nothing else, or only
 sleeping locks such as a directory's `i_rwsem`) maps tid -> control
-block. `get_task_fs` takes it for a task with no fs of its own, to hand
-a kernel thread the shared knullfs fs_struct (fs/fsstruct.rs
-`KTHREAD_FS`; umask from create_mode runs under the directory's
-`i_rwsem`). `kthread_should_stop/should_park/parkme` and
+block. A kernel thread (`TaskKind::KernelThread`) with no fs of its
+own gets the shared knullfs fs_struct from `get_task_fs` and
+`current_fs` (fs/fsstruct.rs `KTHREAD_FS`; no lock).
+`kthread_should_stop/should_park/parkme` and
 `kthread_stop/park/unpark` use atomics + `try_to_wake_up` + the block's
 `ack` WaitQueue. A thread created without a CPU gets one round-robin;
 every kernel thread stays on its CPU (`cpus_mask` holds only it, Linux
@@ -999,9 +999,12 @@ before it first runs: fork attaches the child's fs, files, nsproxy
 and I/O context after inserting it), always under its alloc_lock; the
 task reads its own lock-free (`current().mm()`, `files()`, `fs()`,
 `nsproxy()`, `comm()`; Linux current->mm etc.); others read them under
-the lock (`Task::task_lock()`, `percpu::with_task_lock(tid, f)`: the
-pid lookup takes TASKLIST only to find the task; procfs, kcmp, acct,
-ptrace access checks, `get_task_mm`/`get_task_fs`/`get_task_ns`).
+the lock (`Task::task_lock()` on a `TaskRef` the caller holds: a pid
+lookup takes TASKLIST only to find the task; procfs, kcmp, acct,
+ptrace access checks, and the `&Task` helpers `get_task_mm`,
+`get_task_fd`, `get_task_fs`, `get_task_ns`, `get_task_io_context`;
+fork's `fork_fs`, `fork_task_fd`, `fork_nsproxy` and `fork_io` read
+the parent's, its own, through them too).
 `io_context` is the exception: ioprio_set installs one in another
 task, so it is read under the lock only. Exec swaps the mm and comm in
 one alloc_lock section (under `exec_update` and TASKLIST, which it
@@ -1113,11 +1116,12 @@ TASKLIST), so current is never missing. Read lock-free through it:
 under TASKLIST) and the alloc_lock fields but `io_context` (Linux
 current->mm/files/fs/nsproxy/comm: only the task itself changes them,
 or its creator before it first runs, under its alloc_lock; other tasks
-read them under it). `get_task_fd`, `get_task_fs`, `get_task_ns` and
-`has_pending_signals` take this lock-free path for the current task
-(fget, path walks, `signal_pending`); the current task's mm users (the
-page-fault lookup, mm syscalls) call `current().mm()`, and
-`get_task_mm(&Task)` is for another task (under its alloc_lock).
+read them under it). The current task's users call `current().mm()`,
+`files()`, `fs()` (`percpu::current_fs`), `nsproxy()` (fget, path
+walks, the page-fault lookup, mm syscalls, `current_*_ns`), and
+`has_pending_signals` takes this path for `signal_pending`; the
+`&Task` helpers (`get_task_mm`, `get_task_fd`, `get_task_fs`,
+`get_task_ns`) take the task's alloc_lock.
 
 The context switch takes no TASKLIST: `make_current` reads the next
 task's kernel stack, address space and TLS from the task (it is not
@@ -2564,8 +2568,9 @@ bitmap, are immutable after creation (no lock).
 
 #### Locking Rules
 
-1. **The NsProxy is a Task field** - `get_task_ns` clones the `Arc<NsProxy>`
-   out (lock-free for the task itself, else under its alloc_lock);
+1. **The NsProxy is a Task field** - `get_task_ns(&Task)` clones the
+   `Arc<NsProxy>` out under its alloc_lock (the task itself reads
+   `current().nsproxy()` lock-free);
    `init_task_ns` / `exit_task_ns` swap it under the alloc_lock (the
    task itself, or a fork child before it runs) and drop the old one
    after unlocking (a network namespace's teardown takes RTNL; nothing
@@ -3731,9 +3736,9 @@ else is taken under it) unless an order is given. "spin" is the
 | `SigHand.signalfd_wq` | signal/mod.rs | WaitQueue (its own IrqSpinlock) | signalfd readers and pollers of the tasks sharing a handler table (Linux sighand->signalfd_wqh); woken by send_signal after the target's signal state is unlocked; readers take `Signalfd.inner` and the caller's signal state only in its condition, after the queue's lock is dropped |
 | `Workqueue.inner` | task/workqueue.rs | IrqSpinlock | pending and delayed work lists (`SYSTEM_WQ`, `BDI_WORKQUEUE`); a work item's state is plain fields under its own `spin::Mutex` (pending/running bits; a delayed item's `wake_tick`, nonzero exactly while it is on the delayed list, and a `seq` that voids a promoted copy). `queue_work` takes the item lock and drops it before this lock; the delayed-work calls (queue, mod, cancel, promote) take the item lock under it, so list membership and `wake_tick` change together (order: `Workqueue.inner` → item, a leaf). Never from IRQ context |
 | `BDI_REGISTRY`, `BdiWriteback.dirty`, `BdiWriteback.dwork` | mm/writeback.rs | spin | per-disk writeback state: the devices with dirty data, the periodic work; leaves, writeback runs with none held |
-| `Task.cgroup`, `CSS_SET_CACHE`, `CgroupRoot.{root_cgrp, controllers}`, `Cgroup.{parent, children, ancestors, subsys, tasks}`, `CssSet.subsys`, `CgroupSubsysState.private`, `CpuState.bw`, `IoState.devices` | cgroup/ | spin (RwLock; `CSS_SET_CACHE`, `Task.cgroup`, `CpuState.bw` (weight, quota, period together), `IoState.devices` (each device's limits together) Mutex leaves) | cgroup hierarchy and membership (`Task.cgroup`: the task's cgroup, a leaf reached through a `TaskRef` cloned out of TASKLIST, Linux task->cgroups); parent before child; never under TASKLIST. `CGROUP_MUTEX` (sleeping, Linux cgroup_mutex; section 2) serializes mkdir, rmdir, cgroup.procs/subtree_control/freeze writes and a CLONE_INTO_CGROUP fork from admission to post_fork, so rmdir's emptiness check and its `dead` mark cannot interleave with an attach; it is taken before the cgroupfs inode's spin lock. `CGROUP_THREADGROUP_RWSEM` (sleeping, under `CGROUP_MUTEX`) keeps forks out while cgroup.procs moves a whole thread group. The pids counters are atomics charged add-then-check (Linux pids_try_charge): at fork, before the child exists, on the target cgroup (`cgroup::can_fork`, undone by `ForkCg` on failure); the root is never charged. memory.max is one atomic word (Linux page_counter max); a cgroup's frozen flag is written under `CGROUP_MUTEX`. |
+| `Task.cgroup`, `CSS_SET_CACHE`, `CgroupRoot.{root_cgrp, controllers}`, `Cgroup.{parent, children, ancestors, subsys, tasks}`, `CssSet.subsys`, `CgroupSubsysState.private`, `CpuState.bw`, `IoState.devices` | cgroup/ | spin (RwLock; `CSS_SET_CACHE`, `Task.cgroup`, `CpuState.bw` (weight, quota, period together), `IoState.devices` (each device's limits together) Mutex leaves) | cgroup hierarchy and membership (`Task.cgroup`: the task's cgroup, a leaf reached through the task the caller holds: current, a fork child, or a `TaskRef` cloned out of TASKLIST; Linux task->cgroups); parent before child; never under TASKLIST. `CGROUP_MUTEX` (sleeping, Linux cgroup_mutex; section 2) serializes mkdir, rmdir, cgroup.procs/subtree_control/freeze writes and a CLONE_INTO_CGROUP fork from admission to post_fork, so rmdir's emptiness check and its `dead` mark cannot interleave with an attach; it is taken before the cgroupfs inode's spin lock. `CGROUP_THREADGROUP_RWSEM` (sleeping, under `CGROUP_MUTEX`) keeps forks out while cgroup.procs moves a whole thread group. The pids counters are atomics charged add-then-check (Linux pids_try_charge): at fork, before the child exists, on the target cgroup (`cgroup::can_fork`, undone by `ForkCg` on failure); the root is never charged. memory.max is one atomic word (Linux page_counter max); a cgroup's frozen flag is written under `CGROUP_MUTEX`. |
 | `IpcIds.inner`, `KernIpcPerm.lock`, `MsgQueue.q`, `SemArray.global`, `SemSlot.lock`, `SemUndoList.arrays`, `MQ_ACCT`, `MqQueue.{messages, flags, notify}`; `MQ_REGISTRY` | ipc/ | spin; `MQ_REGISTRY` sleeping (`RwSem`) | SysV and POSIX IPC objects; `MQ_REGISTRY` (the POSIX queues by name, Linux the mqueue root's i_rwsem) is taken by mq_open and mq_unlink in thread context under no other lock, and a create charges and allocates the queue under it; `MQ_ACCT` (the POSIX queue count and each user's queue bytes against RLIMIT_MSGQUEUE, Linux mq_lock) is a leaf, taken under `MQ_REGISTRY` by a create and by a queue's Drop (which may run under it at unlink); nothing allocates under it (a user's first charge grows its list with it released, then checks again); `IpcIds.rwsem` (sleeping, section 2) -> `IpcIds.inner` -> the object's lock; the namespace totals (`used_sems`, `shm_tot`) grow only under `IpcIds.rwsem`, after the insert, and shrink lock-free at destroy. Semaphores use Linux sem_lock's two levels: a single-operation semop takes only that semaphore's `SemSlot.lock` (its value, sempid, otime, single-operation waiters and SEM_UNDO adjustments, reached through the `SemLock` guard); multi-operation semops, semctl, exit and removal take `SemArray.global` (multi-operation waiters, `complex_count`, ctime) in complex mode: `use_global_lock` (written under `global`, read lock-free) is set and every slot lock taken and dropped once, which waits out the single-operation holders; the fast path rechecks the flag with Acquire after its slot lock and falls back to `global` while it is set; it is cleared with Release after `USE_GLOBAL_LOCK_HYSTERESIS` global holds with no multi-operation waiter. Order `SemArray.global` -> `SemSlot.lock`. A waiter's status is set by its waker under the locks (Release) and read by the sleeper without them (Acquire, Linux q->status); wakeups happen after the unlock. SEM_UNDO adjustments live in each semaphore (`PerSem.undo`, by undo-list id); `SemUndoList.arrays` (a leaf, never held with the array's locks) names the arrays a list has adjusted and is filled before the array lock is taken (Linux find_alloc_undo). `MsgQueue.q` holds the queue's messages, counters, qbytes, times and last pids (Linux: the msq lock): msgsnd's limit and removal check, the enqueue and the sender's pid and time are one critical section, likewise msgrcv's dequeue, and IPC_STAT copies a snapshot under it; IPC_SET takes `KernIpcPerm.lock` (a leaf) under it. The namespace's message statistics are atomics changed under it |
-| `KEYRING_LINK` (sleeping) → `Key.keyring_keys`; `Task.keyrings`, `USER_KEYRINGS`, `Key.payload` → `KEY_DATABASE` → `KEY_USERS` | keys/ | spin (RwLock; `Task.keyrings` Mutex) | a task's thread/process/session keyrings (`Task.keyrings`, reached through a `TaskRef` cloned out of TASKLIST; creating a keyring registers it under it), the per-user keyrings, the key registry and keyrings. Links and keyring slots own keys (`Arc<Key>`); `KEY_DATABASE` holds weak entries (lookups upgrade after releasing it). A key's `Drop` (its last reference) takes `KEY_DATABASE`, then `KEY_USERS` (the per-user quota, a leaf), so no `Arc<Key>` is dropped under either; `Key.keyring_keys` is a leaf: unlinked keys are dropped after it is released, and replaced slots after `Task.keyrings`. `KEYRING_LINK` (Linux keyring_serialise_link_lock) is held by a keyring's link from its cycle check to the link, taken with no spin lock held. `Key.payload` also plays key->sem: instantiate (only from uninstantiated), update, revoke and invalidate change `Key.state` under its write lock, so a revoked key is never revived (the state is read lock-free); and KEYCTL_CHOWN / KEYCTL_SETPERM decide (owner, group, CAP_SYS_ADMIN) and store `Key.uid`/`gid`/`perm` in one write hold, as Linux keyctl_chown_key / keyctl_setperm_key under key->sem; those atomics are read lock-free by the permission checks and describe (Linux reads key->uid unlocked) |
+| `KEYRING_LINK` (sleeping) → `Key.keyring_keys`; `Task.keyrings`, `USER_KEYRINGS`, `Key.payload` → `KEY_DATABASE` → `KEY_USERS` | keys/ | spin (RwLock; `Task.keyrings` Mutex) | a task's thread/process/session keyrings (`Task.keyrings`, reached through the current task or a fork child; creating a keyring registers it under it), the per-user keyrings, the key registry and keyrings. Links and keyring slots own keys (`Arc<Key>`); `KEY_DATABASE` holds weak entries (lookups upgrade after releasing it). A key's `Drop` (its last reference) takes `KEY_DATABASE`, then `KEY_USERS` (the per-user quota, a leaf), so no `Arc<Key>` is dropped under either; `Key.keyring_keys` is a leaf: unlinked keys are dropped after it is released, and replaced slots after `Task.keyrings`. `KEYRING_LINK` (Linux keyring_serialise_link_lock) is held by a keyring's link from its cycle check to the link, taken with no spin lock held. `Key.payload` also plays key->sem: instantiate (only from uninstantiated), update, revoke and invalidate change `Key.state` under its write lock, so a revoked key is never revived (the state is read lock-free); and KEYCTL_CHOWN / KEYCTL_SETPERM decide (owner, group, CAP_SYS_ADMIN) and store `Key.uid`/`gid`/`perm` in one write hold, as Linux keyctl_chown_key / keyctl_setperm_key under key->sem; those atomics are read lock-free by the permission checks and describe (Linux reads key->uid unlocked) |
 | `FileLockCtx.flc_lock` (per inode), `locks::BLOCKED` | fs/locks.rs | spin Mutex | an inode's flock and POSIX locks (Linux i_flctx flc_lock; a POSIX owner is a descriptor table's id), leaf but for BLOCKED (flc_lock -> BLOCKED, Linux blocked_lock_lock: each waiting POSIX owner and the owner it waits on, for EDEADLK). A blocked locker sleeps on the inode's wait queue with neither held, interruptibly, until the change count moves |
 | `cmdline::SAVED` | cmdline.rs | spin Mutex | the saved kernel command line (Linux saved_command_line): written once while parsing, before SMP; read in thread context (init's arguments); a leaf |
 | `signal::NO_SHARED` | signal/mod.rs | spin Mutex | the empty group set a task with no SignalStruct (kernel thread, exited task) reads; nothing is queued on it; locked where `SignalStruct.shared` would be, same position (Task.sig -> shared) |
