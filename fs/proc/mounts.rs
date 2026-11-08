@@ -20,6 +20,11 @@ const ESC: &[u8] = b" \t\n\\";
 /// For source and type, '#' too (Linux mangle in proc_namespace.c)
 const ESC_HASH: &[u8] = b" \t\n\\#";
 
+/// Typical line lengths, to size a whole file in one allocation (a
+/// longer line only grows the buffer)
+const MOUNTS_LINE: usize = 96;
+const MOUNTINFO_LINE: usize = 128;
+
 /// The mounts task `t` sees: (mount, mountpoint as seen from its root),
 /// by mount order; a mount its root does not reach is left out
 fn visible(t: &TaskRef) -> Vec<(Arc<Mount>, Vec<u8>)> {
@@ -75,8 +80,9 @@ fn mnt_opts(out: &mut Vec<u8>, m: &Mount) {
 /// /proc/<pid>/mounts (Linux show_vfsmnt): source mountpoint type
 /// options 0 0
 pub fn show_mounts(t: &TaskRef) -> Vec<u8> {
-    let mut out = Vec::new();
-    for (m, mp) in visible(t) {
+    let vis = visible(t);
+    let mut out = Vec::with_capacity(vis.len() * MOUNTS_LINE);
+    for (m, mp) in vis {
         mangle(&mut out, &m.devname, ESC_HASH);
         out.push(b' ');
         mangle(&mut out, &mp, ESC);
@@ -98,8 +104,8 @@ pub fn show_mounts(t: &TaskRef) -> Vec<u8> {
 /// root mountpoint options [optional fields] - type source super-options
 pub fn show_mountinfo(t: &TaskRef) -> Vec<u8> {
     use alloc::fmt::Write;
-    let mut out = Vec::new();
     let vis = visible(t);
+    let mut out = Vec::with_capacity(vis.len() * MOUNTINFO_LINE);
     for (m, mp) in vis.iter().cloned() {
         // The namespace root's parent is itself (Linux: its mnt_parent)
         let parent = m.get_parent().map_or(m.mnt_id, |p| p.mnt_id);
