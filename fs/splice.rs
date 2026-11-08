@@ -112,48 +112,6 @@ pub fn splice_to_pipe(
     }
 }
 
-/// Extract a page reference from a pipe (for splice pipe->file)
-///
-/// Returns the next page buffer from the pipe without copying.
-///
-/// # Arguments
-/// * `pipe` - Source pipe to extract from
-///
-/// # Returns
-/// The pipe buffer containing page reference, or None if pipe is empty
-pub fn splice_from_pipe(pipe: &Pipe) -> Option<(Arc<PipePage>, u32, u32)> {
-    let mut inner = pipe.lock();
-
-    if inner.is_empty() {
-        return None;
-    }
-
-    // Get the tail buffer
-    let tail_idx = inner.tail;
-    let pipe_buf = &mut inner.bufs[tail_idx];
-
-    if pipe_buf.is_empty() {
-        inner.tail = (inner.tail + 1) % PIPE_RING;
-        return None;
-    }
-
-    // Extract page reference
-    let page = pipe_buf.page.clone()?;
-    let offset = pipe_buf.offset;
-    let len = pipe_buf.len;
-
-    // Consume the buffer
-    pipe_buf.release();
-    inner.tail = (inner.tail + 1) % PIPE_RING;
-    inner.total_len = inner.total_len.saturating_sub(len as usize);
-
-    // Wake writers - there's now space
-    drop(inner);
-    pipe.wake_writers();
-
-    Some((page, offset, len))
-}
-
 /// Link pipe buffers for tee() operation
 ///
 /// Duplicates data from source pipe to destination pipe without consuming
@@ -586,23 +544,27 @@ fn do_splice_pipe_to_file(
         }
     }
 
-    // Regular file path - extract data and write
+    // The pipe stays locked across the writes, and each buffer gives up
+    // only the bytes written (Linux iter_file_splice_write under
+    // pipe_lock): a short write or `len` leaves the rest in the pipe
+    let mut g = pipe.lock();
     let mut written = 0;
-
-    while written < len {
-        // Get data from pipe
-        let (page, offset, buf_len) = match splice_from_pipe(pipe) {
-            Some(data) => data,
-            None => break,
+    let mut err = None;
+    while written < len && !g.is_empty() {
+        let tail = g.tail;
+        let pb = &g.bufs[tail];
+        let Some(page) = pb.page.clone().filter(|_| !pb.is_empty()) else {
+            g.bufs[tail].release();
+            g.tail = (tail + 1) % PIPE_RING;
+            continue;
         };
+        let (offset, avail) = (pb.offset, pb.len as usize);
+        let to_write = (len - written).min(avail);
 
-        let to_write = (len - written).min(buf_len as usize);
-
-        // Copy data from page to temporary buffer
         let mut buf = [0u8; PAGE_SIZE];
         // SAFETY: the pipe buffer holds `page` (kernel-mapped, PAGE_SIZE)
-        // with valid data at `offset..offset + buf_len` inside it, and
-        // `to_write <= buf_len` bytes of it are copied out
+        // with valid data at `offset..offset + avail` inside it, and
+        // `to_write <= avail` bytes of it are copied out
         unsafe {
             let src = crate::arch::phys_to_virt(page.frame)
                 .cast_const()
@@ -610,28 +572,40 @@ fn do_splice_pipe_to_file(
             core::ptr::copy_nonoverlapping(src, buf.as_mut_ptr(), to_write);
         }
 
-        // Write to file
-        let bytes_written = if let Some(off_out) = off_out {
-            let actual_offset = off_out + written as u64;
-            match file.pwrite(&buf[..to_write], actual_offset) {
-                Ok(n) => n,
-                Err(_) => {
-                    // Put data back? For now, data is lost on error
-                    break;
-                }
-            }
-        } else {
-            match file.write(&buf[..to_write]) {
-                Ok(n) => n,
-                Err(_) => break,
+        let r = match off_out {
+            Some(o) => file.pwrite(&buf[..to_write], o + written as u64),
+            None => file.write(&buf[..to_write]),
+        };
+        let n = match r {
+            Ok(n) => n.min(to_write),
+            Err(e) => {
+                err = Some(e);
+                break;
             }
         };
-
-        written += bytes_written;
-
-        if bytes_written < to_write {
+        // Consume exactly what was written
+        let pb = &mut g.bufs[tail];
+        if n == avail {
+            pb.release();
+            g.tail = (tail + 1) % PIPE_RING;
+        } else {
+            pb.offset += n as u32;
+            pb.len -= n as u32;
+        }
+        g.total_len = g.total_len.saturating_sub(n);
+        written += n;
+        if n < to_write {
             break;
         }
+    }
+    drop(g);
+    if written > 0 {
+        pipe.wake_writers();
+    }
+    if written == 0
+        && let Some(e) = err
+    {
+        return e.sysret();
     }
 
     if written == 0 && nonblock {
