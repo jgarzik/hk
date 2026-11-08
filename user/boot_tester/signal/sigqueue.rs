@@ -724,14 +724,18 @@ extern "C" fn group_handler(_: i32) {
     );
 }
 
-/// The second thread: SIGUSR1 unblocked, it waits for a signal until
-/// the handler ran
+/// The second thread: SIGUSR1 unblocked, it polls until the handler
+/// ran. Not sigsuspend: the signal may land between the check and the
+/// call (it is unblocked), and the thread would then sleep for good.
 extern "C" fn group_waiter(_: u64) -> ! {
     use core::sync::atomic::Ordering;
     GROUP_UP.store(hk_syscall::sys_gettid(), Ordering::Release);
-    let none = 0u64;
     while GROUP_GOT.load(Ordering::Acquire) == 0 {
-        hk_syscall::sys_rt_sigsuspend(&none as *const u64 as u64, 8);
+        let ts = hk_syscall::Timespec {
+            tv_sec: 0,
+            tv_nsec: 10_000_000,
+        };
+        hk_syscall::sys_nanosleep(&ts, core::ptr::null_mut());
     }
     sys_exit(0)
 }
