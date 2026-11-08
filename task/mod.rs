@@ -20,6 +20,7 @@ pub mod misc;
 pub mod percpu;
 pub mod pgrp;
 pub mod pid;
+pub mod pidns;
 pub mod proc;
 pub mod process_vm;
 pub mod ptrace;

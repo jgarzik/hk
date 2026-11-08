@@ -508,7 +508,7 @@ goes down later.
 
 - [x] unshare
 - [x] setns
-- [x] clone with namespace flags
+- [x] clone with namespace flags (CLONE_NEWPID: the first process is pid 1 and its child reaper; its death kills the namespace, then fork into it is ENOMEM)
 
 11.3 Host identity
 
@@ -524,7 +524,7 @@ There are very few direct "cgroup_*" syscalls; the cgroup v1/v2 APIs are primari
 - [x] uname
 - [x] sysinfo
 - [x] getrandom (ChaCha20 CRNG, up to MAX_RW_COUNT per call)
-- [x] reboot
+- [x] reboot (inside a child pid namespace: RESTART/RESTART2 and POWER_OFF/HALT kill its init, reported as SIGHUP/SIGINT, other commands EINVAL)
 - [x] kexec_load (stub, returns -ENOSYS; requires CAP_SYS_BOOT)
 - [x] syslog (READ, READ_ALL, READ_CLEAR, CLEAR, SIZE_UNREAD, SIZE_BUFFER over the record log; console actions no-ops; CAP_SYSLOG for all, as with dmesg_restrict=1)
 - [x] acct

@@ -22,6 +22,9 @@ pub mod cmd {
     pub const RESTART: u32 = 0x01234567;
     /// Halt the system (stop CPUs but don't power off)
     pub const HALT: u32 = 0xcdef0123;
+    /// Restart with a command string (only inside a child pid
+    /// namespace here, where it is RESTART)
+    pub const RESTART2: u32 = 0xa1b2c3d4;
 }
 
 /// Serializes power-off, restart and halt (Linux system_transition_mutex)
@@ -59,6 +62,12 @@ pub fn sys_reboot(magic1: u32, magic2: u32, cmd: u32, _arg: u64) -> i64 {
         && magic2 != cmd::LINUX_REBOOT_MAGIC2C
     {
         return KernelError::InvalidArgument.sysret();
+    }
+
+    // Inside a child pid namespace the command ends the namespace, never
+    // the machine (Linux reboot_pid_ns, before system_transition_mutex)
+    if let Some(r) = crate::task::pidns::reboot_pid_ns(cmd) {
+        return r;
     }
 
     // One transition at a time (Linux system_transition_mutex): a second

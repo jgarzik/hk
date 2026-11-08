@@ -2386,6 +2386,13 @@ impl SignalStruct {
         }
     }
 
+    /// The group's wait status becomes `code` whatever ended it (Linux
+    /// zap_pid_ns_processes: group_exit_code = pid_ns->reboot)
+    pub fn set_exit_code(&self, code: i32) {
+        self.group_exit
+            .store(GROUP_EXIT | u64::from(code as u32), Ordering::Release);
+    }
+
     /// The process is a child subreaper (TASKLIST held)
     pub fn subreaper(&self, table: &crate::task::percpu::GlobalTaskTable) -> bool {
         *self.subreaper.access(table)

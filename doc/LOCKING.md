@@ -894,6 +894,31 @@ hash before TASKLIST is taken, or to its task
 TASKLIST's read lock only to take a reference from `Pid.task`, the
 `Arc<Pid>` dropped after it). Every pid argument is looked up so.
 
+**A pid namespace's init** (`task/pidns.rs`; Linux child_reaper,
+pid_allocated, find_child_reaper, zap_pid_ns_processes): no new lock.
+`PidNamespace.alloc` (atomic, changed under PIDMAP_LOCK: thread
+context, a leaf) counts the pids numbered there with a flag,
+NS_ADDING (pids may be made; cleared when its init dies).
+`alloc_pid` admits a new `Pid` under PIDMAP_LOCK before it is built
+(ENOMEM once NS_ADDING is clear) and `release_numbers` uncounts it; a
+dying namespace down to its init's pids wakes CHILD_EXIT_WQ after
+PIDMAP_LOCK is dropped (any lock may be held: a wakeup).
+`PidNamespace.reaper` (a `Weak<Task>`, Linux child_reaper) and
+`reboot` (Linux pid_ns->reboot: set by reboot(2) inside before it
+SIGKILLs the reaper, read by the zap) are TASKLIST's (`TableCell`):
+fork sets the reaper in the write section that lists a new process numbered 1, after checking
+under that lock that every level still takes pids (Linux
+copy_process: a fork racing the zap fails ENOMEM or is seen by it).
+An exiting task that is its namespace's reaper hands it to another
+live thread of its group in one write section; with none left
+(`find_child_reaper`) it disables allocation, collects the
+namespace's other live tasks under TASKLIST's read lock (room made
+before it), SIGKILLs them with no lock held, then sleeps on
+CHILD_EXIT_WQ (uninterruptible, no lock held) reaping its children
+until it has none and only its group's pids are left, all before its
+own children are handed on and it becomes a zombie, so its parent
+sees it exit only once the namespace is empty.
+
 **Relations** (under TASKLIST's write lock to change, read lock to
 walk): `real_parent` and `ptracer` are task references (`Weak`), never
 numbers, so a recycled tid cannot inherit a parent or tracer link. A
@@ -901,8 +926,9 @@ group leader is on its real parent's `children` (intrusive `ArcList`,
 link `Task.sibling`, one strong reference each; Linux only lists
 leaders); `link_child` at fork and exec's leader change, unlinked at
 reap. An exiting task first hands its children to another live thread
-of its group, else a live thread of the nearest ancestor process
-that is a child subreaper (`SignalStruct.subreaper`), else init
+of its group, else a live thread of the nearest ancestor process in
+its pid namespace that is a child subreaper
+(`SignalStruct.subreaper`), else its namespace's reaper
 (`forget_original_parent`, `adopt`); an exited non-leader thread
 leaves the task list at once (Linux release_task), unless traced:
 then when its tracer reaps it or exits (Linux wait_task_zombie,
@@ -2497,9 +2523,11 @@ tasks can share the same `NsProxy` (e.g., threads created without CLONE_NEW* fla
 | `MntNamespace.root` | `RwLock<Option<Arc<Mount>>>` | Mount tree root (3.3) |
 | `UserNamespace.uid_map.extents` | `RwLock<Vec<UidGidExtent>>` | UID mapping extents |
 | `UserNamespace.gid_map.extents` | `RwLock<Vec<UidGidExtent>>` | GID mapping extents |
+| `PidNamespace.alloc` | `AtomicU32` changed under PIDMAP_LOCK | Pid count, NS_ADDING (3.1.1, "A pid namespace's init") |
+| `PidNamespace.reaper`, `reboot` | `TableCell` (TASKLIST) | Child reaper, reboot(2) status (3.1.1) |
 
-`PidNamespace` and `CgroupNamespace` are immutable after creation (no
-lock).
+`CgroupNamespace`, and a `PidNamespace`'s level, parent and number
+bitmap, are immutable after creation (no lock).
 
 #### Locking Rules
 

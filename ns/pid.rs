@@ -7,14 +7,23 @@
 //! translate between the caller's numbers and the root ones
 //! (`task::pid::vnr`).
 
+use crate::task::TableCell;
 use crate::util::kalloc::{arc_nofail, try_arc};
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
+use core::sync::atomic::AtomicU32;
 use spin::Lazy;
 
 /// Maximum PID namespace nesting level (same as Linux)
 pub const MAX_PID_NS_LEVEL: u32 = 32;
 
-/// PID namespace (immutable after creation)
+/// `PidNamespace.alloc`: new pids may be made (Linux PIDNS_ADDING),
+/// until its init dies
+pub const NS_ADDING: u32 = 1 << 31;
+/// `PidNamespace.alloc`: the count of its pids (Linux pid_allocated)
+pub const NS_PIDS: u32 = NS_ADDING - 1;
+
+/// PID namespace: its level, parent and number bitmap are fixed at
+/// creation; the init state below is locked
 pub struct PidNamespace {
     /// Nesting level (0 = init_pid_ns, increases with each child)
     pub level: u32,
@@ -24,6 +33,21 @@ pub struct PidNamespace {
 
     /// Its numbers (Linux pid_namespace->pidmap)
     pub map: crate::task::pid::PidMap,
+
+    /// Its pids, with `NS_ADDING` (Linux pid_allocated):
+    /// changed under PIDMAP_LOCK (`task::pid`)
+    pub alloc: AtomicU32,
+
+    /// The task its orphans go to (Linux child_reaper): its init, or
+    /// another live thread of init's group once init's thread exits.
+    /// Under TASKLIST (`task::pidns`); set when init joins the task
+    /// list, kept after it dies (nothing is made in the namespace then)
+    pub reaper: TableCell<Option<Weak<crate::task::Task>>>,
+
+    /// Signal its init's group reports, set by reboot(2) inside (Linux
+    /// pid_ns->reboot: SIGHUP to restart, SIGINT to halt), 0 otherwise;
+    /// under TASKLIST
+    pub reboot: TableCell<i32>,
 }
 
 impl PidNamespace {
@@ -34,6 +58,9 @@ impl PidNamespace {
             level: 0,
             parent: None,
             map: crate::task::pid::PidMap::new(),
+            alloc: AtomicU32::new(NS_ADDING),
+            reaper: TableCell::new(None),
+            reboot: TableCell::new(0),
         })
     }
 
@@ -48,6 +75,9 @@ impl PidNamespace {
             level: parent.level + 1,
             parent: Some(parent.clone()),
             map: crate::task::pid::PidMap::new(),
+            alloc: AtomicU32::new(NS_ADDING),
+            reaper: TableCell::new(None),
+            reboot: TableCell::new(0),
         })
         .map_err(|e| e.errno())
     }

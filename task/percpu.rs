@@ -1637,8 +1637,12 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<Tid, &'static str> {
         task_inner,
     ));
 
-    // Add to global table
-    TASKLIST.write().insert(task.clone());
+    // Add to global table, as the root namespace's child reaper
+    {
+        let mut table = TASKLIST.write();
+        table.insert(task.clone());
+        crate::task::pidns::attach_init(&mut table, &task);
+    }
 
     // The boot-allocated stack of the first task is not its own (never
     // freed); its switch frame is saved at its first switch out
@@ -2355,6 +2359,9 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     let child_thread_pid =
         crate::task::pid::alloc_pid_nr(&child_ns.pid_ns, set_tid).map_err(|e| e.errno())?;
     let child_tid = Tid::from(child_thread_pid.nr());
+    // A new process numbered 1 is its namespace's init (Linux
+    // copy_process: is_child_reaper)
+    let child_init = config.flags & CLONE_THREAD == 0 && child_thread_pid.is_child_reaper();
     let child_pid = if config.flags & CLONE_THREAD != 0 {
         parent_pid
     } else {
@@ -2555,17 +2562,33 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     // number stored before the child exists, so a failure leaves
     // neither (Linux copy_process: pidfd_prepare and put_user, EFAULT
     // through bad_fork_put_pidfd)
-    if config.flags & CLONE_PIDFD != 0 {
-        clone_pidfd(
+    let pidfd = if config.flags & CLONE_PIDFD != 0 {
+        Some(clone_pidfd(
             child_thread_pid,
             config.flags & CLONE_THREAD != 0,
             config.pidfd_ptr,
-        )?;
-    }
+        )?)
+    } else {
+        None
+    };
 
     // Add to global task table
     {
         let mut table = TASKLIST.write();
+        // Not into a namespace whose init died meanwhile (Linux
+        // copy_process: PIDNS_ADDING under tasklist_lock, ENOMEM): its
+        // zap walks the list after disabling allocation, so it sees
+        // this child or this sees the namespace dying
+        if !crate::task::pid::ns_adding(child_task.pid_ns()) {
+            drop(table);
+            if let Some(fd) = pidfd {
+                close_pidfd(fd);
+            }
+            return Err(12); // ENOMEM
+        }
+        if child_init {
+            crate::task::pidns::attach_init(&mut table, &child_task);
+        }
         table.inherit_pids(&child_task, &current());
         table.insert(child_task.clone());
         // A new process joins its real parent's children (Linux: only
@@ -2721,7 +2744,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
 /// descriptor closed again). The child does not exist yet: nothing
 /// but the caller's threads can see the descriptor before clone
 /// returns (Linux reserves it and installs it at the end).
-fn clone_pidfd(pid: Arc<crate::task::pid::Pid>, thread: bool, ptr: u64) -> Result<(), i32> {
+fn clone_pidfd(pid: Arc<crate::task::pid::Pid>, thread: bool, ptr: u64) -> Result<i32, i32> {
     use crate::task::pidfd::pidfd_flags::PIDFD_THREAD;
     let flags = if thread { PIDFD_THREAD } else { 0 };
     let file = crate::task::pidfd::pidfd_file(pid, flags).map_err(|e| e.errno())?;
@@ -2735,7 +2758,16 @@ fn clone_pidfd(pid: Arc<crate::task::pid::Pid>, thread: bool, ptr: u64) -> Resul
         files.lock().close(fd);
         return Err(14); // EFAULT
     }
-    Ok(())
+    Ok(fd)
+}
+
+/// A clone whose child was not made after all closes the pidfd
+/// [`clone_pidfd`] gave the caller (Linux bad_fork_put_pidfd)
+fn close_pidfd(fd: i32) {
+    if let Some(files) = crate::task::fdtable::get_task_fd(current_tid()) {
+        // Released after the table lock (FilesGuard)
+        files.lock().close(fd);
+    }
 }
 
 /// Mark the current task exiting (Linux PF_EXITING)
@@ -2751,10 +2783,13 @@ pub fn current_exiting() -> bool {
 /// Hand the current task's children to a new parent before it dies
 /// (Linux forget_original_parent): another live thread of its group,
 /// else a live thread of the nearest PR_SET_CHILD_SUBREAPER ancestor
-/// process, else init
+/// process in its pid namespace, else that namespace's init. A dying
+/// namespace init first kills and reaps the rest of its namespace
+/// (find_child_reaper).
 #[inline(never)]
 fn forget_original_parent() {
     let me = task_ref(&current());
+    crate::task::pidns::find_child_reaper(&me);
     // Room for every child first: nothing allocates under TASKLIST
     let mut moved = Vec::new();
     let mut entry = Entry::default();
@@ -2847,7 +2882,8 @@ fn reparent_children(me: &TaskRef, moved: &mut Vec<TaskRef>, entry: &mut Entry) 
 
 /// `me`'s children's new parent (Linux find_new_reaper): another live
 /// thread of its group, else a live thread of the nearest ancestor
-/// process in its pid namespace that is a child subreaper, else init.
+/// process in its pid namespace that is a child subreaper, else that
+/// namespace's init (its child reaper).
 /// Unlike Linux, every ancestor is checked, with no has_child_subreaper
 /// shortcut: that flag is set on every descendant of a subreaper (fork,
 /// walk_process_tree), and an orphan only moves up, so the walk finds
@@ -2861,8 +2897,9 @@ fn find_reaper(table: &GlobalTaskTable, me: &TaskRef) -> Option<TaskRef> {
     let mut p = v.real_parent.clone();
     while let Some(t) = p.and_then(|w| w.upgrade()) {
         // An ancestor gone from the list, or in another pid namespace,
-        // ends the walk: init adopts (Linux find_new_reaper ends at the
-        // child_reaper, by task_pid(reaper)->level)
+        // ends the walk: the namespace's init adopts (Linux
+        // find_new_reaper ends at the child_reaper, by
+        // task_pid(reaper)->level)
         let Some(v) = table.get(t.tid()) else { break };
         if v.thread_pid.as_ref().map(|p| p.level) != level {
             break;
@@ -2874,12 +2911,12 @@ fn find_reaper(table: &GlobalTaskTable, me: &TaskRef) -> Option<TaskRef> {
         }
         p = v.real_parent.clone();
     }
-    table.task(1)
+    crate::task::pidns::child_reaper(table, me.pid_ns())
 }
 
 /// A thread of process `pid` that has not started exiting (Linux
 /// find_alive_thread: !PF_EXITING)
-fn live_thread(table: &GlobalTaskTable, pid: Pid) -> Option<TaskRef> {
+pub(crate) fn live_thread(table: &GlobalTaskTable, pid: Pid) -> Option<TaskRef> {
     table
         .threads(pid)
         .find(crate::signal::task_live)

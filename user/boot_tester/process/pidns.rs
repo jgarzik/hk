@@ -65,10 +65,11 @@ pub fn run_tests() {
     outer(b"PIDNS_PGRP", pgrp);
     outer(b"PIDNS_SCM", scm);
     outer(b"PIDNS_UNSHARE", unshare);
+    super::pidns_init::run_tests();
 }
 
 /// Run `f` in a forked process X: its exit status is the failing step
-fn outer(name: &[u8], f: fn() -> i32) {
+pub(super) fn outer(name: &[u8], f: fn() -> i32) {
     let pid = sys_fork();
     if pid == 0 {
         sys_exit(f() as u64);
@@ -78,7 +79,7 @@ fn outer(name: &[u8], f: fn() -> i32) {
 
 /// Reap `pid`: its exit code, 100 + a killing signal, 200 if the wait
 /// fails
-fn status(pid: i64) -> i64 {
+pub(super) fn status(pid: i64) -> i64 {
     let mut st = 0;
     if pid <= 0 || sys_wait4(pid, &mut st, 0, 0) != pid {
         return 200;
@@ -92,7 +93,7 @@ fn status(pid: i64) -> i64 {
 
 /// A child Y in a new pid namespace running `f`; its pid as the caller
 /// sees it
-fn ns_child(f: fn() -> i32) -> i64 {
+pub(super) fn ns_child(f: fn() -> i32) -> i64 {
     let pid = sys_clone(CLONE_NEWPID | SIGCHLD, 0, 0, 0, 0);
     if pid == 0 {
         sys_exit(f() as u64);
@@ -101,7 +102,7 @@ fn ns_child(f: fn() -> i32) -> i64 {
 }
 
 /// A forked child running `f`
-fn child(f: fn() -> i32) -> i64 {
+pub(super) fn child(f: fn() -> i32) -> i64 {
     let pid = sys_fork();
     if pid == 0 {
         sys_exit(f() as u64);
@@ -134,7 +135,7 @@ fn take(sig: u32) -> (i64, SigInfo) {
 }
 
 /// The first of `steps` that fails (its 1-based index), 0 if none
-fn first_fail(steps: &[bool]) -> i32 {
+pub(super) fn first_fail(steps: &[bool]) -> i32 {
     steps.iter().position(|ok| !ok).map_or(0, |i| i as i32 + 1)
 }
 

@@ -132,6 +132,12 @@ impl Pid {
     pub fn ns(&self) -> &Arc<PidNamespace> {
         &self.numbers[self.level as usize].ns
     }
+
+    /// It is 1 in the namespace it was made in: its process is that
+    /// namespace's init (Linux is_child_reaper)
+    pub fn is_child_reaper(&self) -> bool {
+        self.numbers[self.level as usize].nr == 1
+    }
 }
 
 /// The bitmap of a namespace's numbers (Linux struct pidmap array)
@@ -327,8 +333,12 @@ pub fn alloc_pid_nr(ns: &Arc<PidNamespace>, set_tid: &[u32]) -> Result<Arc<Pid>,
             pid: AtomicPtr::new(core::ptr::null_mut()),
         });
     }
-    // On failure the unbuilt Pid's Drop gives its numbers back (it was
-    // never hashed)
+    if let Err(e) = admit(&numbers) {
+        free_numbers(&numbers);
+        return Err(e);
+    }
+    // Counted now: on failure the unbuilt Pid's Drop uncounts it and
+    // gives its numbers back (it was never hashed)
     let pid = try_arc(Pid {
         level: numbers.len() as u32 - 1,
         numbers: numbers.into_boxed_slice(),
@@ -348,6 +358,59 @@ pub fn alloc_pid_nr(ns: &Arc<PidNamespace>, set_tid: &[u32]) -> Result<Arc<Pid>,
         b.store(core::ptr::from_ref::<UPid>(u).cast_mut(), Ordering::Release);
     }
     Ok(pid)
+}
+
+/// Count `numbers` in their namespaces (Linux alloc_pid under
+/// pidmap_lock): ENOMEM if one takes no new pids (its init died:
+/// PIDNS_ADDING cleared)
+fn admit(numbers: &[UPid]) -> Result<(), KernelError> {
+    use crate::ns::pid::NS_ADDING;
+    let _g = PIDMAP_LOCK.lock();
+    let state = |u: &UPid| u.ns.alloc.load(Ordering::Relaxed);
+    if numbers.iter().any(|u| state(u) & NS_ADDING == 0) {
+        return Err(KernelError::OutOfMemory);
+    }
+    for u in numbers {
+        u.ns.alloc.fetch_add(1, Ordering::Relaxed);
+    }
+    Ok(())
+}
+
+/// No more pids in `ns` (Linux disable_pid_allocation): its init died
+pub fn disable_pid_allocation(ns: &PidNamespace) {
+    let _g = PIDMAP_LOCK.lock();
+    ns.alloc
+        .fetch_and(!crate::ns::pid::NS_ADDING, Ordering::Relaxed);
+}
+
+/// `ns` and every namespace above it still take new pids (Linux
+/// copy_process: PIDNS_ADDING, checked again under tasklist_lock as a
+/// task joins, so a zap that disabled allocation sees the task or the
+/// fork fails)
+pub fn ns_adding(ns: &PidNamespace) -> bool {
+    let _g = PIDMAP_LOCK.lock();
+    let mut n = Some(ns);
+    while let Some(cur) = n {
+        if cur.alloc.load(Ordering::Relaxed) & crate::ns::pid::NS_ADDING == 0 {
+            return false;
+        }
+        n = cur.parent.as_deref();
+    }
+    true
+}
+
+/// The count of pids numbered in `ns` (Linux pid_allocated)
+pub fn ns_pids(ns: &PidNamespace) -> u32 {
+    let _g = PIDMAP_LOCK.lock();
+    ns.alloc.load(Ordering::Relaxed) & crate::ns::pid::NS_PIDS
+}
+
+/// One pid fewer in `ns` (PIDMAP_LOCK held): true if it is dying and
+/// down to its init's pids (Linux free_pid: pid_allocated 2 or 1)
+fn uncount(ns: &PidNamespace) -> bool {
+    use crate::ns::pid::{NS_ADDING, NS_PIDS};
+    let old = ns.alloc.fetch_sub(1, Ordering::Relaxed);
+    old & NS_ADDING == 0 && (old & NS_PIDS) <= 3
 }
 
 /// The process group and session of the boot task, number 0 (Linux
@@ -456,12 +519,14 @@ impl Pid {
     /// owner, a tty's session), naming no task. Once.
     pub fn release_numbers(&self) {
         let mut weaks = [core::ptr::null_mut::<Pid>(); 33];
+        let mut zapping = false;
         {
             let _g = PIDMAP_LOCK.lock();
             if !self.hashed.swap(false, Ordering::Relaxed) {
                 return;
             }
             for (i, u) in self.numbers.iter().enumerate() {
+                zapping |= uncount(&u.ns);
                 let b = bucket(&u.ns, u.nr);
                 let me = core::ptr::from_ref::<UPid>(u).cast_mut();
                 let mut link = b;
@@ -484,6 +549,11 @@ impl Pid {
         }
         for u in self.numbers.iter() {
             u.ns.map.free(u.nr);
+        }
+        // A dying namespace's init waits for its last pids
+        // (zap_pid_ns_processes; Linux free_pid wakes child_reaper)
+        if zapping {
+            crate::task::proc::CHILD_EXIT_WQ.wake_all();
         }
         for w in weaks.into_iter().filter(|w| !w.is_null()) {
             // SAFETY: the hash's weak references, released once here
