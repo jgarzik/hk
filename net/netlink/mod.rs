@@ -560,7 +560,8 @@ impl NlSock {
         if r != 0 && r >= self.sk.rcvbuf() as usize {
             return false;
         }
-        let mut buf = Vec::new();
+        // One part plus NLMSG_DONE: fill stops at DUMP_SIZE
+        let mut buf = Vec::with_capacity(rtnetlink::DUMP_SIZE + attr::NLMSG_HDRLEN + 4);
         let done = match st.cb.fill(self, &mut buf) {
             Ok(false) => None,
             Ok(true) => Some(0),

@@ -102,10 +102,13 @@ impl Msg {
 
     /// NUL-terminated string attribute
     pub fn str(&mut self, ty: u16, s: &str) -> &mut Self {
-        let mut v = Vec::with_capacity(s.len() + 1);
-        v.extend_from_slice(s.as_bytes());
-        v.push(0);
-        self.attr(ty, &v)
+        let Ok(len) = u16::try_from(NLA_HDRLEN + s.len() + 1) else {
+            return self;
+        };
+        self.buf.extend_from_slice(&len.to_ne_bytes());
+        self.buf.extend_from_slice(&ty.to_ne_bytes());
+        self.buf.extend_from_slice(s.as_bytes());
+        self.put(&[0])
     }
 
     /// Open a nested attribute; returns its offset for `nest_end`
