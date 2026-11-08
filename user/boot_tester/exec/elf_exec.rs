@@ -30,6 +30,8 @@ enum Want {
     /// hk rejects it with this errno; Linux runs into whatever it mapped
     /// and dies of some signal; either passes
     Dies(i64),
+    /// The program runs and exits with this code
+    Runs(i64),
 }
 
 pub fn run_tests() {
@@ -43,7 +45,7 @@ pub fn run_tests() {
         set64(f, 64 + 40, 0x7fff_ffff_0000); // p_memsz
     });
     write_interp(FIXED_INTERP, |_| {}); // ET_EXEC at the program's address
-    let cases: [(&[u8], fn(&mut [u8]) -> usize, Want); 10] = [
+    let cases: [(&[u8], fn(&mut [u8]) -> usize, Want); 12] = [
         (b"ELF_EXEC_TRUNCATED", |_| 20, Want::Errno(8)),
         (
             b"ELF_EXEC_BAD_MACHINE",
@@ -89,6 +91,11 @@ pub fn run_tests() {
             |f| set64(f, 64 + 40, 0x100),
             Want::Fatal(22),
         ),
+        // A PT_LOAD over the stack: Linux's MAP_FIXED_NOREPLACE fails
+        // (EEXIST) after the point of no return
+        (b"ELF_EXEC_STACK_OVERLAP", on_stack, Want::Fatal(17)),
+        // PT_LOADs out of address order run, every page in a VMA
+        (b"ELF_EXEC_UNSORTED", unsorted, Want::Runs(42)),
     ];
     for (name, mutate, want) in cases {
         let mut f = [0u8; LEN];
@@ -259,7 +266,7 @@ fn run(name: &[u8], want: Want) {
     let exited = st & 0x7f == 0;
     let code = ((st >> 8) & 0xff) as i64;
     let ok = match want {
-        Want::Errno(e) => exited && code == e,
+        Want::Errno(e) | Want::Runs(e) => exited && code == e,
         Want::Fatal(e) => (exited && code == e) || st & 0x7f == 11,
         Want::Dies(e) => (exited && code == e) || !exited,
     };
@@ -269,4 +276,69 @@ fn run(name: &[u8], want: Want) {
     } else {
         fail_num(b":FAIL wstatus=", st as i64);
     }
+}
+
+/// Top of user space (Linux TASK_SIZE; the stack sits just below it)
+#[cfg(target_arch = "x86_64")]
+const TASK_TOP: u64 = 0x7fff_ffff_f000;
+#[cfg(target_arch = "aarch64")]
+const TASK_TOP: u64 = 1 << 48;
+
+/// A PT_LOAD over the top 64 GiB of user space, wherever the stack
+/// went in it (Linux randomizes it by up to 16 GiB)
+fn on_stack(f: &mut [u8]) -> usize {
+    const SZ: u64 = 64 << 30;
+    phdr(f, 0, 1, [0, TASK_TOP - SZ, SZ, SZ, 0x1000]);
+    LEN
+}
+
+/// The program of ELF_EXEC_UNSORTED: mprotect(0x400000, 4096,
+/// PROT_READ | PROT_EXEC) on its own text, then exit with the byte at
+/// 0x600010 plus mprotect's result
+#[cfg(target_arch = "x86_64")]
+const UNSORTED_CODE: &[u8] = &[
+    0xbf, 0x00, 0x00, 0x40, 0x00, // mov edi, 0x400000
+    0xbe, 0x00, 0x10, 0x00, 0x00, // mov esi, 0x1000
+    0xba, 0x05, 0x00, 0x00, 0x00, // mov edx, 5
+    0xb8, 0x0a, 0x00, 0x00, 0x00, // mov eax, SYS_mprotect
+    0x0f, 0x05, // syscall
+    0x89, 0xc3, // mov ebx, eax
+    0x0f, 0xb6, 0x3c, 0x25, 0x10, 0x00, 0x60, 0x00, // movzx edi, byte [0x600010]
+    0x01, 0xdf, // add edi, ebx
+    0xb8, 0x3c, 0x00, 0x00, 0x00, // mov eax, SYS_exit
+    0x0f, 0x05, // syscall
+];
+#[cfg(target_arch = "aarch64")]
+const UNSORTED_WORDS: [u32; 13] = [
+    0xd2a0_0800, // mov x0, #0x400000
+    0xd282_0001, // mov x1, #0x1000
+    0xd280_00a2, // mov x2, #5
+    0xd280_1c48, // mov x8, #SYS_mprotect
+    0xd400_0001, // svc #0
+    0xaa00_03e3, // mov x3, x0
+    0xd280_0201, // mov x1, #0x10
+    0xf2a0_0c01, // movk x1, #0x60, lsl #16
+    0x3940_0020, // ldrb w0, [x1]
+    0x0b03_0000, // add w0, w0, w3
+    0xd280_0ba8, // mov x8, #SYS_exit
+    0xd400_0001, // svc #0
+    0xd400_0001, // svc #0 (never reached)
+];
+
+/// Two PT_LOADs in descending address order (legal: Linux maps each
+/// in file order): data at 0x600000 first, then the text at 0x400000
+fn unsorted(f: &mut [u8]) -> usize {
+    set16(f, 56, 2);
+    set64(f, 24, 0x400800); // entry
+    phdr(f, 0, 1, [0x1000, 0x600000, 0x20, 0x2000, 0x1000]);
+    f[64 + 4] = 6; // RW
+    phdr(f, 1, 1, [0, 0x400000, 0x1000, 0x1000, 0x1000]);
+    #[cfg(target_arch = "x86_64")]
+    f[0x800..0x800 + UNSORTED_CODE.len()].copy_from_slice(UNSORTED_CODE);
+    #[cfg(target_arch = "aarch64")]
+    for (i, w) in UNSORTED_WORDS.iter().enumerate() {
+        f[0x800 + i * 4..0x800 + i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+    }
+    f[0x1010] = 42;
+    LEN
 }

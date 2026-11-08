@@ -59,6 +59,7 @@ pub const EFAULT: i32 = 14; // Bad address
 pub const E2BIG: i32 = 7; // Argument list too long
 pub const EAGAIN: i32 = 11; // Try again
 pub const EINVAL: i32 = 22; // Invalid argument
+pub const EEXIST: i32 = 17; // File exists
 pub const ELOOP: i32 = 40; // Too many levels of symbolic links
 pub const ELIBBAD: i32 = 80; // Accessing a corrupted shared library
 
@@ -286,33 +287,56 @@ fn auxv(info: &ExecInfo<'_>, random: u64, execfn: u64, platform: u64) -> [(u64, 
 /// the auxiliary vector, envp, argv and argc at the 16-byte aligned
 /// initial stack pointer.
 ///
-/// Returns (where argv, envp and the SP went, lowest mapped stack
-/// address).
+/// Returns where argv, envp and the SP went.
+/// The initial stack's pages: those the stack image takes (mapped at
+/// exec), and those of its VMA, from RLIMIT_STACK and with room to run
+/// above the image (Linux setup_arg_pages: stack_expand)
+struct StackSize {
+    mapped: usize,
+    pages: usize,
+    /// Words below the strings: argc, the argv and envp pointers with
+    /// their NULLs, the auxiliary vector
+    words: usize,
+}
+
+impl StackSize {
+    fn new(argv: &ArgStrings, envp: &ArgStrings, execfn: &[u8]) -> Self {
+        let stack_limit = crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_STACK);
+        let pages = if stack_limit == crate::task::rlimit::RLIM_INFINITY {
+            USER_STACK_PAGES
+        } else {
+            ((stack_limit / PAGE_SIZE) as usize).clamp(USER_STACK_PAGES, MAX_STACK_PAGES)
+        };
+        // What the image holds: its strings were bounded by copy_args
+        // (Linux bprm_stack_limits), plus a script's interpreter
+        let strings = argv.bytes().len() + envp.bytes().len();
+        let words = 1 + argv.len() + 1 + envp.len() + 1 + 2 * AUXV_LEN;
+        let need = strings + execfn.len() + 64 + 16 + words * 8 + 64;
+        let mapped = need.div_ceil(PAGE_SIZE as usize) + 1;
+        Self {
+            mapped,
+            pages: pages.max(mapped + STACK_EXPAND_PAGES),
+            words,
+        }
+    }
+
+    /// The bottom of the stack VMA
+    fn bottom(&self) -> u64 {
+        STACK_TOP - self.pages as u64 * PAGE_SIZE
+    }
+}
+
 fn setup_user_stack<FA: FrameAlloc<PhysAddr = u64>>(
     page_table: &mut ArchPageTable,
     frame_alloc: &mut FA,
     argv: &ArgStrings,
     envp: &ArgStrings,
     info: &ExecInfo<'_>,
-) -> Result<(MmLayout, u64), i32> {
-    // Calculate stack pages based on RLIMIT_STACK
-    let stack_limit = crate::task::rlimit::rlimit(crate::task::rlimit::RLIMIT_STACK);
-    let stack_pages = if stack_limit == crate::task::rlimit::RLIM_INFINITY {
-        USER_STACK_PAGES
-    } else {
-        ((stack_limit / PAGE_SIZE) as usize).clamp(USER_STACK_PAGES, MAX_STACK_PAGES)
-    };
-    // What the initial stack holds: its strings were bounded by
-    // copy_args (Linux bprm_stack_limits), plus a script's interpreter
-    let strings = argv.bytes().len() + envp.bytes().len();
-    let words = 1 + argv.len() + 1 + envp.len() + 1 + 2 * AUXV_LEN;
-    let need = strings + info.execfn.len() + 64 + 16 + words * 8 + 64;
-
-    // Map only what the arguments use (Linux setup_arg_pages: the rest
-    // of the stack VMA faults in on first touch), and give the VMA room
-    // to run above them (stack_expand)
-    let mapped = need.div_ceil(PAGE_SIZE as usize) + 1;
-    let stack_pages = stack_pages.max(mapped + STACK_EXPAND_PAGES);
+    size: &StackSize,
+) -> Result<MmLayout, i32> {
+    // Map only what the image uses (Linux setup_arg_pages: the rest of
+    // the stack VMA faults in on first touch)
+    let mapped = size.mapped;
     let map_bottom = STACK_TOP - (mapped as u64 * PAGE_SIZE);
     for i in 0..mapped {
         let va = map_bottom + (i as u64 * PAGE_SIZE);
@@ -347,7 +371,7 @@ fn setup_user_stack<FA: FrameAlloc<PhysAddr = u64>>(
 
     // argc, argv[], NULL, envp[], NULL, auxv pairs, streamed to the
     // stack: each string's address found by walking the NULs
-    let sp = (w.top - words as u64 * 8) & !15;
+    let sp = (w.top - size.words as u64 * 8) & !15;
     let mut out = WordWriter::new(&w, sp);
     out.put(argv.len() as u64)?;
     for (strs, start) in [(argv, arg_start), (envp, env_start)] {
@@ -382,7 +406,7 @@ fn setup_user_stack<FA: FrameAlloc<PhysAddr = u64>>(
         start_stack: sp,
         ..MmLayout::default()
     };
-    Ok((area, STACK_TOP - (stack_pages as u64 * PAGE_SIZE)))
+    Ok(area)
 }
 
 /// The highest free page below mmap_base clear of `vmas` (Linux
@@ -453,9 +477,11 @@ fn map_sigpage<FA: FrameAlloc<PhysAddr = u64>>(
 
 /// Every PT_LOAD segment and the entry point must land in mappable
 /// user space: past TASK_SIZE (or overflowing) is EINVAL (Linux
-/// BAD_ADDR), below mmap_min_addr EPERM (security_mmap_addr)
-fn check_segments(elf: &ElfExecutable, base: u64) -> Result<(), i32> {
-    const EINVAL: i32 = 22;
+/// BAD_ADDR), below mmap_min_addr EPERM (security_mmap_addr), on the
+/// stack at or above `stack_bottom` EEXIST (Linux maps the stack first
+/// and an image over it fails its MAP_FIXED_NOREPLACE, after the point
+/// of no return; hk refuses it before)
+fn check_segments(elf: &ElfExecutable, base: u64, stack_bottom: u64) -> Result<(), i32> {
     for seg in &elf.segments {
         let va = seg.vaddr.checked_add(base).ok_or(EINVAL)?;
         let end = va.checked_add(seg.mem_size as u64).ok_or(EINVAL)?;
@@ -464,6 +490,9 @@ fn check_segments(elf: &ElfExecutable, base: u64) -> Result<(), i32> {
         }
         let start = va & !(PAGE_SIZE - 1);
         crate::mm::check_fixed(start, end - start).map_err(|e| e.errno())?;
+        if seg.mem_size > 0 && end > stack_bottom {
+            return Err(EEXIST);
+        }
     }
     if elf
         .entry
@@ -545,57 +574,98 @@ fn anon_vma(start: u64, end: u64, prot: u32) -> crate::mm::Vma {
     )
 }
 
-/// The whole pages of each loaded segment of `elf` at `base` that a
-/// private mapping of `file` supplies (Linux elf_map), with the page
-/// before which a segment's pages belong to the previous one; the same
-/// computation decides what `load_elf_segments` leaves unfilled and
-/// which VMAs are file-backed
-fn file_mapped(elf: &ElfExecutable, base: u64) -> Vec<Option<(u64, u64, u64)>> {
-    let mut prev_end = 0;
-    let mut out = Vec::new();
-    for seg in elf.segments.iter().filter(|s| s.mem_size > 0) {
-        out.push(seg.file_pages(base, prev_end));
-        let end = (seg.vaddr + base + seg.mem_size as u64).next_multiple_of(PAGE_SIZE);
-        prev_end = prev_end.max(end);
-    }
-    out
+/// A run of pages of a loaded image that one PT_LOAD segment owns
+/// (`seg`, its index in `elf.segments`)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Span {
+    start: u64,
+    end: u64,
+    seg: usize,
 }
 
-/// One VMA per loaded segment of `elf` at `base`; with `file` (the
-/// image mapped from the page cache) a segment's whole file pages are a
-/// private file VMA and the rest (the partial last page, the bss) an
-/// anonymous one after it
-fn segment_vmas(elf: &ElfExecutable, base: u64, file: Option<&Arc<File>>) -> Vec<crate::mm::Vma> {
-    use crate::mm::{MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE, Vma};
-    let anon = anon_vma;
-    let mapped = file.map(|_| file_mapped(elf, base));
-    let mut vmas: Vec<Vma> = Vec::new();
-    let mut prev_end = 0;
-    for (k, seg) in elf.segments.iter().filter(|s| s.mem_size > 0).enumerate() {
-        // A page shared with the previous segment stays in its VMA
-        let start = ((seg.vaddr + base) & !(PAGE_SIZE - 1)).max(prev_end);
-        let end = (seg.vaddr + base + seg.mem_size as u64).next_multiple_of(PAGE_SIZE);
-        if start >= end {
+/// The page-aligned [start, end) of segment `seg` loaded `base` higher;
+/// None past u64 (check_segments rules that out for a loaded image)
+fn seg_pages(seg: &crate::util::elf::ElfSegment, base: u64) -> Option<(u64, u64)> {
+    let start = seg.vaddr.checked_add(base)?;
+    let end = start
+        .checked_add(seg.mem_size as u64)?
+        .checked_next_multiple_of(PAGE_SIZE)?;
+    Some((start & !(PAGE_SIZE - 1), end))
+}
+
+/// The pages of `elf` loaded at `base`, sorted and disjoint, each owned
+/// by the last segment in file order that covers it: Linux
+/// load_elf_binary maps every PT_LOAD in file order, each MAP_FIXED
+/// over what the earlier ones mapped, so the segments may come in any
+/// order and overlap (a page shared by two adjacent segments is the
+/// later one's)
+fn image_spans(elf: &ElfExecutable, base: u64) -> Vec<Span> {
+    let mut spans: Vec<Span> = Vec::new();
+    for (k, seg) in elf.segments.iter().enumerate() {
+        if seg.mem_size == 0 {
             continue;
         }
-        let f = &seg.flags;
-        let prot = (u32::from(f.read) * PROT_READ)
-            | (u32::from(f.write) * PROT_WRITE)
-            | (u32::from(f.execute) * PROT_EXEC);
-        let fm = mapped
-            .as_ref()
-            .and_then(|m| m[k])
-            .filter(|&(lo, _, _)| lo == start);
-        match (file, fm) {
-            (Some(f), Some((lo, hi, off))) => {
-                vmas.push(Vma::new_file(lo, hi, prot, MAP_PRIVATE, f.clone(), off));
-                if hi < end {
-                    vmas.push(anon(hi, end, prot));
+        let Some((start, end)) = seg_pages(seg, base) else {
+            continue;
+        };
+        let mut next = Vec::with_capacity(spans.len() + 2);
+        for sp in spans {
+            if sp.end <= start || end <= sp.start {
+                next.push(sp);
+                continue;
+            }
+            if sp.start < start {
+                next.push(Span { end: start, ..sp });
+            }
+            if end < sp.end {
+                next.push(Span { start: end, ..sp });
+            }
+        }
+        next.push(Span { start, end, seg: k });
+        spans = next;
+    }
+    spans.sort_unstable_by_key(|sp| sp.start);
+    spans
+}
+
+/// The part of `sp` a private mapping of the file supplies (Linux
+/// elf_map): its segment's whole file pages within it, as (start, end,
+/// file offset of start)
+fn span_file(elf: &ElfExecutable, base: u64, sp: &Span) -> Option<(u64, u64, u64)> {
+    let (lo, hi, off) = elf.segments[sp.seg].file_pages(base, 0)?;
+    let (a, b) = (lo.max(sp.start), hi.min(sp.end));
+    (a < b).then(|| (a, b, off + (a - lo)))
+}
+
+/// mmap protection of a segment
+fn seg_prot(f: &crate::util::elf::SegmentFlags) -> u32 {
+    use crate::mm::{PROT_EXEC, PROT_READ, PROT_WRITE};
+    (u32::from(f.read) * PROT_READ)
+        | (u32::from(f.write) * PROT_WRITE)
+        | (u32::from(f.execute) * PROT_EXEC)
+}
+
+/// The VMAs of `elf` loaded at `base`, one per span; with `file` (the
+/// image mapped from the page cache) a span's whole file pages are a
+/// private file VMA, the rest (a partial page, the bss) anonymous ones
+/// around it. They cover exactly the pages `load_elf_segments` maps.
+fn segment_vmas(elf: &ElfExecutable, base: u64, file: Option<&Arc<File>>) -> Vec<crate::mm::Vma> {
+    use crate::mm::{MAP_PRIVATE, Vma};
+    let mut vmas: Vec<Vma> = Vec::new();
+    for sp in image_spans(elf, base) {
+        let prot = seg_prot(&elf.segments[sp.seg].flags);
+        match file.zip(span_file(elf, base, &sp)) {
+            Some((f, (a, b, off))) => {
+                if sp.start < a {
+                    vmas.push(anon_vma(sp.start, a, prot));
+                }
+                vmas.push(Vma::new_file(a, b, prot, MAP_PRIVATE, f.clone(), off));
+                if b < sp.end {
+                    vmas.push(anon_vma(b, sp.end, prot));
                 }
             }
-            _ => vmas.push(anon(start, end, prot)),
+            None => vmas.push(anon_vma(sp.start, sp.end, prot)),
         }
-        prev_end = end;
     }
     vmas
 }
@@ -646,7 +716,9 @@ fn interp_base(interp: &ElfExecutable, prog: &ElfExecutable, prog_base: u64) -> 
     Ok(bias)
 }
 
-/// Load ELF segments into a page table
+/// Load ELF segments into a page table: every page of every span
+/// (`image_spans`), but for those a file mapping supplies when `lazy`
+/// (`span_file`), so the VMAs of `segment_vmas` cover each page mapped
 ///
 /// Returns the end address of the highest loaded segment (for setting brk).
 fn load_elf_segments<FA: FrameAlloc<PhysAddr = u64>>(
@@ -657,104 +729,78 @@ fn load_elf_segments<FA: FrameAlloc<PhysAddr = u64>>(
     base_addr: u64,
     lazy: bool,
 ) -> Result<u64, i32> {
-    let mut highest_end: u64 = 0;
-    // Pages the file mapping supplies at fault time (`segment_vmas`)
-    let mapped = if lazy {
-        file_mapped(elf, base_addr)
-    } else {
-        Vec::new()
-    };
-    let mut k = 0;
-
-    for segment in &elf.segments {
-        if segment.mem_size == 0 {
-            continue;
-        }
-        let from_file = mapped.get(k).copied().flatten();
-        k += 1;
-
-        let seg_start = segment.vaddr + base_addr;
-        let seg_end = seg_start + segment.mem_size as u64;
-        let page_start = seg_start & !(PAGE_SIZE - 1);
-        let page_end = (seg_end + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-
-        // Track the highest segment end for brk initialization
-        if seg_end > highest_end {
-            highest_end = seg_end;
-        }
-
-        // Convert ELF flags to PageFlags
+    for sp in image_spans(elf, base_addr) {
+        let seg = &elf.segments[sp.seg];
+        let file = if lazy {
+            span_file(elf, base_addr, &sp)
+        } else {
+            None
+        };
         let mut flags = PageFlags::READ | PageFlags::USER;
-        if segment.flags.write {
+        if seg.flags.write {
             flags |= PageFlags::WRITE;
         }
-        if segment.flags.execute {
+        if seg.flags.execute {
             flags |= PageFlags::EXECUTE;
         }
-
-        let mut va = page_start;
-        while va < page_end {
-            if from_file.is_some_and(|(lo, hi, _)| (lo..hi).contains(&va)) {
-                va += PAGE_SIZE;
-                continue;
-            }
-            // A page shared with the previous segment is filled in place
-            let mapped = page_table.translate(va).map(|p| p & !(PAGE_SIZE - 1));
-            let frame = match mapped {
-                Some(f) => f,
-                None => user_frame()?,
-            };
-
-            // Zero a new frame first (for BSS and partial pages)
-            if mapped.is_none() {
-                unsafe {
-                    ::core::ptr::write_bytes(
-                        crate::arch::phys_to_virt(frame),
-                        0,
-                        PAGE_SIZE as usize,
-                    );
-                }
-            }
-
-            // File bytes for this page, bounds-checked against the page,
-            // the segment and the file (elf::ElfSegment::page_fill), read
-            // straight into the frame (Linux maps the file instead)
-            let size = usize::try_from(image.size).unwrap_or(usize::MAX);
-            if let Some((dst, src, len)) = segment.page_fill(base_addr, va, size) {
-                // SAFETY: our frame, reached through the direct map
-                let page = unsafe {
-                    core::slice::from_raw_parts_mut(
-                        crate::arch::phys_to_virt(frame),
-                        PAGE_SIZE as usize,
-                    )
-                };
-                if let Err(e) = image.read_into(&mut page[dst..dst + len], src as u64) {
-                    if mapped.is_none() {
-                        crate::FRAME_ALLOCATOR.free(frame);
-                    }
-                    return Err(e);
-                }
-            }
-
-            // The kernel wrote it: code reaches the instruction caches
-            // (arm64; Linux __sync_icache_dcache on the exec mapping)
-            crate::arch::paging::sync_page(frame, segment.flags.execute);
-
-            // Map the page (once mapped, the address space frees it)
-            if mapped.is_none()
-                && page_table
+        let mut va = sp.start;
+        while va < sp.end {
+            if !file.is_some_and(|(a, b, _)| (a..b).contains(&va)) {
+                let frame = fill_page(elf, image, base_addr, va)?;
+                // The kernel wrote it: code reaches the instruction
+                // caches (arm64; Linux __sync_icache_dcache)
+                crate::arch::paging::sync_page(frame, seg.flags.execute);
+                // Once mapped, the address space frees it
+                if page_table
                     .map_with_alloc(va, frame, flags, frame_alloc)
                     .is_err()
-            {
-                crate::FRAME_ALLOCATOR.free(frame);
-                return Err(ENOMEM);
+                {
+                    crate::FRAME_ALLOCATOR.free(frame);
+                    return Err(ENOMEM);
+                }
             }
-
             va += PAGE_SIZE;
         }
     }
+    // The highest segment end (Linux elf_brk); check_segments bounded
+    // each below TASK_SIZE
+    Ok(elf
+        .segments
+        .iter()
+        .filter_map(|s| {
+            s.vaddr
+                .checked_add(base_addr)?
+                .checked_add(s.mem_size as u64)
+        })
+        .max()
+        .unwrap_or(0))
+}
 
-    Ok(highest_end)
+/// A new frame for user page `va` of the image: zeroed, then the file
+/// bytes of every segment over it, in file order (each page and file
+/// range bounds-checked by elf::ElfSegment::page_fill), read straight
+/// into it. For the congruent offsets linkers produce this is what the
+/// owning segment's file page holds (Linux maps the file instead).
+fn fill_page(elf: &ElfExecutable, image: &FileImage<'_>, base: u64, va: u64) -> Result<u64, i32> {
+    let frame = user_frame()?;
+    // SAFETY: a fresh frame, ours alone, reached through the direct map
+    let page = unsafe { core::slice::from_raw_parts_mut(phys_to_virt(frame), PAGE_SIZE as usize) };
+    page.fill(0);
+    let size = usize::try_from(image.size).unwrap_or(usize::MAX);
+    for seg in &elf.segments {
+        let covers =
+            seg.mem_size > 0 && seg_pages(seg, base).is_some_and(|(lo, hi)| (lo..hi).contains(&va));
+        if !covers {
+            continue;
+        }
+        if let Some((dst, src, len)) = seg.page_fill(base, va, size)
+            && let Err(e) = image.read_into(&mut page[dst..dst + len], src as u64)
+        {
+            crate::FRAME_ALLOCATOR.free(frame);
+            return Err(e);
+        }
+    }
+    Ok(frame)
 }
 
 /// Apply ELF relocations for PIE binaries
@@ -1086,7 +1132,9 @@ where
     } else {
         0
     };
-    if let Err(e) = check_segments(&elf, base_addr) {
+    // The stack VMA's bottom: the image must stay below it
+    let stack = StackSize::new(&argv, &envp, pathname);
+    if let Err(e) = check_segments(&elf, base_addr, stack.bottom()) {
         return -e;
     }
     let interp_base = match interp.as_ref().map(|ie| interp_base(ie, &elf, base_addr)) {
@@ -1095,7 +1143,7 @@ where
         None => 0,
     };
     if let Some(ie) = &interp
-        && let Err(e) = check_segments(ie, interp_base)
+        && let Err(e) = check_segments(ie, interp_base, stack.bottom())
     {
         return -e;
     }
@@ -1173,15 +1221,21 @@ where
         phnum: elf.phnum,
         execfn: pathname,
     };
-    let (args, stack_bottom) =
-        match setup_user_stack(&mut new_page_table, frame_alloc, &argv, &envp, &info) {
-            Ok(r) => r,
-            Err(e) => return -e,
-        };
+    let args = match setup_user_stack(
+        &mut new_page_table,
+        frame_alloc,
+        &argv,
+        &envp,
+        &info,
+        &stack,
+    ) {
+        Ok(r) => r,
+        Err(e) => return -e,
+    };
     // The new image's VMAs, then the signal page in the free space they
     // leave (Linux arch_setup_additional_pages: get_unmapped_area and a
     // special mapping once the image and stack are in place)
-    let mut vmas = image_vmas(&elf, base_addr, stack_bottom, exe_map);
+    let mut vmas = image_vmas(&elf, base_addr, stack.bottom(), exe_map);
     if let Some(ie) = &interp {
         vmas.extend(segment_vmas(ie, interp_base, interp_map));
     }
@@ -1241,7 +1295,10 @@ where
 
     // Initialize brk for the new process
     // Calculate page-aligned start_brk (end of loaded segments, rounded up)
-    let start_brk = (segments_end + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    // (segments end below TASK_SIZE: check_segments)
+    let start_brk = segments_end
+        .checked_next_multiple_of(PAGE_SIZE)
+        .unwrap_or(crate::mm::TASK_SIZE);
 
     // The new image's VMAs
     {
@@ -1388,7 +1445,7 @@ fn exec_lookup(dirfd: i32, path: &[u8], flags: i32) -> Result<crate::fs::Path, i
 
 #[cfg(test)]
 mod tests {
-    use super::{PAGE_SIZE, highest_gap};
+    use super::{ElfExecutable, PAGE_SIZE, highest_gap, image_spans};
 
     const P: u64 = PAGE_SIZE;
 
@@ -1416,6 +1473,61 @@ mod tests {
         let mut s = [(P, 4 * P), (2 * P, 9 * P)];
         assert_eq!(highest_gap(&mut s, 9 * P, P), None);
         assert_eq!(highest_gap(&mut [], P, P), None);
+    }
+
+    fn elf(segs: &[(u64, usize)]) -> ElfExecutable {
+        use crate::util::elf::{ElfSegment, SegmentFlags};
+        ElfExecutable {
+            entry: 0,
+            segments: segs
+                .iter()
+                .map(|&(vaddr, mem_size)| ElfSegment {
+                    vaddr,
+                    mem_size,
+                    file_size: 0,
+                    flags: SegmentFlags::from_elf_flags(4),
+                    offset: 0,
+                })
+                .collect(),
+            is_pie: false,
+            rela: None,
+            phdr: 0,
+            phent: 56,
+            phnum: segs.len() as u64,
+            align: P,
+            interp: None,
+            end: 0,
+        }
+    }
+
+    fn spans(segs: &[(u64, usize)]) -> Vec<(u64, u64, usize)> {
+        image_spans(&elf(segs), 0)
+            .iter()
+            .map(|s| (s.start, s.end, s.seg))
+            .collect()
+    }
+
+    #[test]
+    fn spans_sorted_whatever_the_file_order() {
+        let s = spans(&[(6 * P, 2 * P as usize), (4 * P, P as usize)]);
+        assert_eq!(s, [(4 * P, 5 * P, 1), (6 * P, 8 * P, 0)]);
+    }
+
+    #[test]
+    fn spans_later_segment_owns_shared_page() {
+        // Text ends mid-page, data starts in that page
+        let s = spans(&[(4 * P, P as usize + 0x10), (5 * P + 0x10, P as usize)]);
+        assert_eq!(s, [(4 * P, 5 * P, 0), (5 * P, 7 * P, 1)]);
+    }
+
+    #[test]
+    fn spans_overlap_goes_to_the_later() {
+        // A later segment inside an earlier one splits it
+        let s = spans(&[(4 * P, 4 * P as usize), (5 * P, P as usize), (0, 0)]);
+        assert_eq!(s, [(4 * P, 5 * P, 0), (5 * P, 6 * P, 1), (6 * P, 8 * P, 0)]);
+        // An earlier one inside a later one vanishes
+        let s = spans(&[(5 * P, P as usize), (4 * P, 4 * P as usize)]);
+        assert_eq!(s, [(4 * P, 8 * P, 1)]);
     }
 
     #[test]

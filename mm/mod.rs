@@ -421,6 +421,17 @@ impl MmStruct {
             .iter()
             .position(|v| v.start > vma.start)
             .unwrap_or(self.vmas.len());
+        // VMAs never overlap: two would own the same pages and free
+        // them twice (callers remove the range first, as Linux
+        // vma_link's callers do)
+        assert!(
+            pos == 0 || self.vmas[pos - 1].end <= vma.start,
+            "insert_vma: overlaps the VMA below"
+        );
+        assert!(
+            self.vmas.get(pos).is_none_or(|v| vma.end <= v.start),
+            "insert_vma: overlaps the VMA above"
+        );
         self.link(&vma);
         // VMA allocation failure is not plumbed to the ~20 callers (the
         // Vec growth beside it cannot fail gracefully either)
